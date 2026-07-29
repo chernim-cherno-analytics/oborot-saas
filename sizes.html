@@ -1,0 +1,519 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+  <title>Chernim Cherno · Размеры</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0 }
+    body { font-family: Helvetica, 'Helvetica Neue', Arial, sans-serif; min-height: 100vh; background: #f3e9e0; color:#1f1f1f; }
+    .gradient-bg { position: fixed; inset: 0; z-index: 0; overflow: hidden; background: #f3e9e0; }
+    .gradient-bg::before, .gradient-bg::after, .b1, .b2, .b3 {
+      position: absolute; border-radius: 50%; filter: blur(90px); opacity: 0.9; }
+    .gradient-bg::before { content: ''; width: 70vw; height: 70vw;
+      background: radial-gradient(circle, #efe5db, transparent 70%);
+      top: -20%; left: -10%; animation: blob1 11s ease-in-out infinite alternate; }
+    .gradient-bg::after { content: ''; width: 60vw; height: 60vw;
+      background: radial-gradient(circle, #e2d8cf, transparent 70%);
+      bottom: -15%; right: -10%; animation: blob2 14s ease-in-out infinite alternate; }
+    .b1 { width: 55vw; height: 55vw; background: radial-gradient(circle, #d3c9c2, transparent 70%);
+      top: 30%; left: 30%; animation: blob3 9s ease-in-out infinite alternate; }
+    .b2 { width: 45vw; height: 45vw; background: radial-gradient(circle, #c1b8b3, transparent 70%);
+      top: -10%; right: 10%; animation: blob4 13s ease-in-out infinite alternate; }
+    .b3 { width: 50vw; height: 50vw; background: radial-gradient(circle, #aba3a0, transparent 70%);
+      bottom: 10%; left: 20%; animation: blob5 16s ease-in-out infinite alternate; }
+    .vignette { position: fixed; inset: 0; z-index: 1; pointer-events: none;
+      background: radial-gradient(ellipse at center, transparent 40%, rgba(171,163,160,0.35) 100%); }
+    .grain { position: fixed; inset: 0; z-index: 2; pointer-events: none; }
+    .grain::before { content: ''; position: absolute; inset: -50%; width: 200%; height: 200%;
+      background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 512 512' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='grain'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.75' numOctaves='4' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23grain)'/%3E%3C/svg%3E");
+      background-size: 200px 200px; opacity: 0.12; mix-blend-mode: overlay;
+      animation: grain-shift 0.15s steps(1) infinite; }
+    @keyframes grain-shift {
+      0%{transform:translate(0,0)} 10%{transform:translate(-3%,-4%)} 20%{transform:translate(4%,2%)}
+      30%{transform:translate(-2%,5%)} 40%{transform:translate(5%,-3%)} 50%{transform:translate(-4%,4%)}
+      60%{transform:translate(3%,-2%)} 70%{transform:translate(-5%,3%)} 80%{transform:translate(2%,-5%)}
+      90%{transform:translate(-3%,2%)} 100%{transform:translate(4%,-4%)} }
+    @keyframes blob1 { 0%{transform:translate(0,0) scale(1)} 33%{transform:translate(8vw,5vh) scale(1.1)} 66%{transform:translate(-5vw,10vh) scale(0.95)} 100%{transform:translate(10vw,-8vh) scale(1.05)} }
+    @keyframes blob2 { 0%{transform:translate(0,0) scale(1)} 33%{transform:translate(-10vw,-6vh) scale(1.08)} 66%{transform:translate(6vw,-12vh) scale(1.12)} 100%{transform:translate(-8vw,5vh) scale(0.92)} }
+    @keyframes blob3 { 0%{transform:translate(0,0) scale(1)} 50%{transform:translate(-12vw,8vh) scale(1.15)} 100%{transform:translate(8vw,-10vh) scale(0.9)} }
+    @keyframes blob4 { 0%{transform:translate(0,0) scale(0.9)} 50%{transform:translate(10vw,12vh) scale(1.1)} 100%{transform:translate(-6vw,6vh) scale(1)} }
+    @keyframes blob5 { 0%{transform:translate(0,0) scale(1.1)} 50%{transform:translate(14vw,-8vh) scale(0.9)} 100%{transform:translate(-10vw,-12vh) scale(1.05)} }
+    .header { position: sticky; top: 0; z-index: 200; padding: 0 28px; height: 56px;
+      display: flex; align-items: center; justify-content: space-between; }
+    .logo { text-decoration: none; font-size: 15px; font-weight: 400; letter-spacing: 0.12em; color: #1f1f1f; }
+    .nav { display: flex; gap: 20px }
+    .nav a { font-size: 13px; font-weight: 400; letter-spacing: 0.05em;
+      color: rgba(31,31,31,0.45); text-decoration: none; transition: color .2s; }
+    .nav a:hover { color: #434446 }
+    .nav a.active { color: #1f1f1f; font-weight: 500; }
+    .main { padding: 20px 28px; max-width: 1000px; margin: 0 auto; position: relative; z-index: 3; }
+
+    .panel { background:rgba(255,255,255,0.6); backdrop-filter:blur(10px);
+      border:1px solid rgba(31,31,31,0.08); border-radius:12px; padding:16px 18px; margin-bottom:16px;
+      position:relative; z-index:50 }
+    .row { display:flex; align-items:center; gap:12px; flex-wrap:wrap }
+    .lbl { font-size:11px; font-weight:600; letter-spacing:.07em; text-transform:uppercase; color:rgba(31,31,31,0.5) }
+    .search-wrap { position:relative; flex:1 1 340px }
+    .search { width:100%; padding:9px 14px; border-radius:10px; font-size:14px;
+      border:1px solid rgba(31,31,31,0.16); background:rgba(255,255,255,0.85); outline:none }
+    .dd { position:absolute; top:calc(100% + 4px); left:0; right:0; z-index:100;
+      background:#fff; border:1px solid rgba(31,31,31,0.12); border-radius:10px;
+      max-height:320px; overflow:auto; box-shadow:0 8px 24px rgba(31,31,31,0.12); display:none }
+    .dd div { padding:8px 14px; font-size:13px; cursor:pointer }
+    .dd div:hover, .dd div.hl { background:rgba(31,31,31,0.07) }
+    .dd .sub { font-size:11px; color:rgba(31,31,31,0.45); margin-left:6px }
+    .qinp { width:110px; padding:9px 12px; border-radius:10px; font-size:15px; font-weight:700; text-align:center;
+      border:1px solid rgba(31,31,31,0.2); background:#fff; outline:none }
+    .seg { display:flex; gap:0; border:1px solid rgba(31,31,31,0.15); border-radius:20px; overflow:hidden }
+    .seg button { font-size:12px; font-weight:500; padding:6px 14px; border:none; background:transparent;
+      color:#434446; cursor:pointer; transition:all .15s }
+    .seg button.active { background:rgba(31,31,31,0.85); color:#f3e9e0 }
+    .hint { font-size:11px; color:rgba(31,31,31,0.45) }
+
+    .cards { display:grid; grid-template-columns:repeat(4,1fr); gap:12px; margin-bottom:16px }
+    .card { background:rgba(255,255,255,0.6); backdrop-filter:blur(10px);
+      border:1px solid rgba(31,31,31,0.08); border-radius:12px; padding:13px 17px }
+    .card .l { font-size:10px; font-weight:600; letter-spacing:.07em; text-transform:uppercase;
+      color:rgba(31,31,31,0.5); margin-bottom:5px }
+    .card .v { font-size:22px; font-weight:700 }
+    .card .s { font-size:11px; color:rgba(31,31,31,0.5); margin-top:3px }
+
+    .table-outer { background:rgba(255,255,255,0.55); backdrop-filter:blur(16px);
+      border:1px solid rgba(31,31,31,0.09); border-radius:12px; overflow:auto }
+    table { width:100%; border-collapse:collapse; font-size:13px }
+    thead th { background:rgba(255,255,255,0.88); padding:10px; text-align:center;
+      font-size:10px; font-weight:500; color:rgba(31,31,31,0.62); letter-spacing:.06em;
+      text-transform:uppercase; position:sticky; top:0; z-index:10;
+      border-bottom:1px solid rgba(31,31,31,0.09) }
+    thead th:first-child { text-align:left; padding-left:16px }
+    tbody td { padding:9px 10px; border-bottom:1px solid rgba(31,31,31,0.06);
+      text-align:center; vertical-align:middle }
+    tbody td:first-child { text-align:left; padding-left:16px; font-weight:700; font-size:14px }
+    tr.total td { font-weight:700; background:rgba(31,31,31,0.05) }
+    .qty { font-weight:700; font-size:15px }
+    .qty.zero { opacity:.3; font-weight:400 }
+    .rec { font-weight:700; font-size:16px }
+    .rec.dim { opacity:.35; font-weight:500; font-size:13px }
+    .sharebar { display:inline-block; width:70px; height:6px; border-radius:3px;
+      background:rgba(31,31,31,0.08); vertical-align:middle; margin-right:7px; overflow:hidden }
+    .sharebar i { display:block; height:100%; background:rgba(31,31,31,0.6); border-radius:3px }
+    .loading { text-align:center; padding:60px; color:rgba(31,31,31,0.45); font-size:13px }
+    .warn { font-size:12px; color:#a15c00; background:rgba(255,204,0,0.15);
+      border:1px solid rgba(255,204,0,0.4); border-radius:10px; padding:9px 14px; margin-bottom:14px }
+    .dl-btn { margin-left:auto; font-size:12px; font-weight:600; padding:8px 18px; border-radius:20px;
+      border:1px solid rgba(31,31,31,0.25); background:#1f1f1f; color:#f3e9e0; cursor:pointer }
+    .dl-btn:hover { background:#3a3a3a }
+    .modecol { background:rgba(76,187,23,0.10) }
+  </style>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
+</head>
+<body>
+<div class="gradient-bg"><div class="b1"></div><div class="b2"></div><div class="b3"></div></div>
+<div class="vignette"></div><div class="grain"></div>
+
+<div class="header">
+  <a class="logo" href="/analytics">Chernim&nbsp;Cherno</a>
+  <nav class="nav">
+    <a href="/analytics">Остатки</a>
+    <a href="/turnover">Оборачиваемость</a>
+    <a href="/order">Заказ</a>
+    <a href="/sizes" class="active">Размеры</a>
+    <a href="/budget">Бюджет</a>
+    <a href="/forecast">Прогноз</a>
+    <a href="/revenue">Оборот</a>
+    <a href="/transfers">Перемещения</a>
+    <a href="/money">Деньги</a>
+    <a href="/paris">Париж</a>
+    <a href="/yandex">Яндекс</a>
+  </nav>
+</div>
+
+<div class="main">
+  <div class="panel">
+    <div class="row" style="margin-bottom:12px">
+      <span class="lbl">Товар</span>
+      <div class="search-wrap">
+        <input class="search" id="prodSearch" placeholder="Начни вводить название... (например «жилет галстук»)" autocomplete="off">
+        <div class="dd" id="dd"></div>
+      </div>
+      <span class="lbl">Заказ, шт</span>
+      <input class="qinp" id="qty" type="number" min="1" value="30">
+    </div>
+    <div class="row">
+      <span class="lbl">Продажи за</span>
+      <div class="seg" id="periodSeg">
+        <button data-p="6">6 мес</button>
+        <button data-p="12" class="active">12 мес</button>
+        <button data-p="0">всё время</button>
+        <button data-p="spring">весна</button>
+        <button data-p="summer">лето</button>
+        <button data-p="autumn">осень</button>
+        <button data-p="winter">зима</button>
+      </div>
+      <span class="lbl" style="margin-left:14px">Режим</span>
+      <div class="seg" id="modeSeg">
+        <button data-m="stock" class="active">с учётом остатков</button>
+        <button data-m="pure">чистая пропорция</button>
+      </div>
+      <span class="hint" id="statusHint">загружаю историю продаж…</span>
+      <button class="dl-btn" id="dlBtn" style="display:none" onclick="downloadOrder()">⬇ Скачать</button>
+    </div>
+  </div>
+
+  <div id="warnBox"></div>
+  <div class="cards" id="cards" style="display:none"></div>
+
+  <div class="table-outer">
+    <table>
+      <thead id="thead"></thead>
+      <tbody id="tb"><tr><td class="loading">Выбери товар — посчитаю распределение по размерам</td></tr></tbody>
+    </table>
+  </div>
+
+  <div class="hint" style="margin-top:12px;line-height:1.6">
+    <b>Как считается.</b> «С учётом остатков»: доля размера в продажах применяется к сумме
+    (текущий остаток + заказ), из результата вычитается то, что уже лежит на складах, — заказ закрывает
+    дыры по размерам, а не дублирует сток. «Чистая пропорция»: количество делится ровно по долям
+    продаж размеров. Продажи — нетто (минус возвраты), по трём торговым складам.
+  </div>
+</div>
+
+<script>
+function mw(name,q){ if(!q) return true; const nl=name.toLowerCase(); return q.split(/\s+/).every(w=>nl.includes(w)); }
+const NON_MERCH = ["сертификат","кошелек","sample","сэмпл","упаковоч","пакет","коробк","вешалк","бирк","кофр","наклейк","кейс для","чехол для","нитк","бумага тишью"];
+function isMerch(n){ const nl=n.toLowerCase(); return !NON_MERCH.some(k=>nl.includes(k)); }
+function fmt(n){ return Math.round(n||0).toLocaleString("ru-RU"); }
+function normSize(s){
+  if(!s) return "One Size";
+  let x=String(s).replace(/^\(|\)$/g,"").trim();
+  if(!x||/^default title$/i.test(x)||/^one ?size$/i.test(x)||/^универсал/i.test(x)) return "One Size";
+  return x.toUpperCase()==="ONE SIZE"?"One Size":x;
+}
+const SIZE_ORDER=["XXS","XS","S","S/M","M","M/L","L","XL","XXL","XXXL","One Size"];
+function sizeSort(a,b){
+  const ia=SIZE_ORDER.indexOf(a), ib=SIZE_ORDER.indexOf(b);
+  if(ia>=0&&ib>=0) return ia-ib;
+  if(ia>=0) return -1;
+  if(ib>=0) return 1;
+  const na=parseFloat(a), nb=parseFloat(b);
+  if(isFinite(na)&&isFinite(nb)) return na-nb;
+  return a.localeCompare(b,"ru");
+}
+
+// ── данные ──
+let MONTHS=[];            // ["2026-07",...] от новых к старым
+let MONTHLY={};           // month -> {base -> {size -> netQty}}
+let STOCK={};             // base -> {size -> qty}
+let PRODUCTS=[];          // [{base, sold, inStock}]
+let SEL=null, PERIOD=12, MODE="stock";
+
+async function loadAll(){
+  const hint=document.getElementById("statusHint");
+  try{
+    const first=await (await fetch("/api/sales-monthly")).json();
+    MONTHS=first.months||[];
+    hint.textContent="загружаю историю продаж… 0/"+MONTHS.length;
+    let done=0;
+    const monthData=await Promise.all(MONTHS.map(m=>
+      fetch("/api/sales-monthly?month="+m).then(r=>r.json()).then(d=>{
+        done++; hint.textContent="загружаю историю продаж… "+done+"/"+MONTHS.length; return d;
+      }).catch(()=>null)
+    ));
+    monthData.forEach((d,i)=>{
+      if(!d) return;
+      const map={};
+      for(const it of (d.items||[])){
+        if(!isMerch(it.base)) continue;
+        const sm={};
+        for(const s of (it.sizes||[])){
+          const k=normSize(s.name);
+          sm[k]=(sm[k]||0)+(s.sale_qty||0)-(s.ret_qty||0);
+        }
+        // Безразмерные товары: sales-monthly не отдаёт sizes у имён без скобок,
+        // из-за чего сумки/аксессуары показывали «продано 0». Берём нетто позиции
+        // целиком как One Size.
+        if(!(it.sizes||[]).length){
+          const q=(it.sale_qty||0)-(it.ret_qty||0);
+          if(q) sm["One Size"]=q;
+        }
+        map[it.base]=sm;
+      }
+      MONTHLY[MONTHS[i]]=map;
+    });
+    const bys=await (await fetch("/api/stocks-bystore")).json();
+    for(const [base,rec] of Object.entries(bys.skus||{})){
+      if(!isMerch(base)) continue;
+      const sm={};
+      for(const [sz,srec] of Object.entries(rec.sizes||{})){
+        sm[normSize(sz)]=(srec.per||[]).reduce((a,b)=>a+(b||0),0);
+      }
+      STOCK[base]=sm;
+    }
+    // список товаров: всё что продавалось + всё что лежит
+    const sold={};
+    for(const m of MONTHS) for(const [b,sm] of Object.entries(MONTHLY[m]||{}))
+      sold[b]=(sold[b]||0)+Object.values(sm).reduce((a,v)=>a+v,0);
+    const names=new Set([...Object.keys(sold),...Object.keys(STOCK)]);
+    PRODUCTS=[...names].map(b=>({
+      base:b, sold:Math.round(sold[b]||0),
+      inStock:Object.values(STOCK[b]||{}).reduce((a,v)=>a+v,0)
+    })).sort((a,b)=>b.sold-a.sold);
+    hint.textContent="продажи с "+MONTHS[MONTHS.length-1]+" · "+PRODUCTS.length+" позиций";
+  }catch(e){
+    hint.textContent="ошибка загрузки: "+e.message;
+  }
+}
+
+// ── подбор товара ──
+const inp=document.getElementById("prodSearch"), dd=document.getElementById("dd");
+let hlIdx=-1, ddItems=[];
+inp.addEventListener("input",()=>{ SEL=null; showDD(); });
+inp.addEventListener("focus",showDD);
+document.addEventListener("click",e=>{ if(!e.target.closest(".search-wrap")) dd.style.display="none"; });
+inp.addEventListener("keydown",e=>{
+  if(dd.style.display==="none") return;
+  if(e.key==="ArrowDown"){ e.preventDefault(); hlIdx=Math.min(hlIdx+1,ddItems.length-1); paintHl(); }
+  else if(e.key==="ArrowUp"){ e.preventDefault(); hlIdx=Math.max(hlIdx-1,0); paintHl(); }
+  else if(e.key==="Enter"){ e.preventDefault(); if(ddItems[hlIdx]) pick(ddItems[hlIdx].base); }
+  else if(e.key==="Escape"){ dd.style.display="none"; }
+});
+function paintHl(){
+  [...dd.children].forEach((el,i)=>el.classList.toggle("hl",i===hlIdx));
+  if(dd.children[hlIdx]) dd.children[hlIdx].scrollIntoView({block:"nearest"});
+}
+function showDD(){
+  const q=(inp.value||"").toLowerCase().trim();
+  if(!q){ dd.style.display="none"; return; }
+  ddItems=PRODUCTS.filter(p=>mw(p.base,q)).slice(0,60);
+  hlIdx=0;
+  dd.innerHTML=ddItems.map(p=>
+    '<div data-b="'+encodeURIComponent(p.base)+'">'+p.base+
+    '<span class="sub">· продано '+fmt(p.sold)+' · на складе '+fmt(p.inStock)+'</span></div>').join("")
+    ||'<div style="color:rgba(31,31,31,0.4)">ничего не нашлось</div>';
+  dd.style.display="block";
+  paintHl();
+  [...dd.children].forEach(el=>el.addEventListener("mousedown",e=>{
+    e.preventDefault();
+    const b=el.getAttribute("data-b"); if(b) pick(decodeURIComponent(b));
+  }));
+}
+function pick(base){
+  SEL=base; inp.value=base; dd.style.display="none"; calc();
+}
+
+// ── переключатели ──
+document.getElementById("periodSeg").addEventListener("click",e=>{
+  const b=e.target.closest("button"); if(!b) return;
+  const p=b.dataset.p;
+  PERIOD=SEASONS[p]?p:+p;
+  [...e.currentTarget.children].forEach(x=>x.classList.toggle("active",x===b));
+  calc();
+});
+document.getElementById("modeSeg").addEventListener("click",e=>{
+  const b=e.target.closest("button"); if(!b) return;
+  MODE=b.dataset.m;
+  [...e.currentTarget.children].forEach(x=>x.classList.toggle("active",x===b));
+  calc();
+});
+document.getElementById("qty").addEventListener("input",()=>calc());
+
+// ── расчёт ──
+// сезоны: месяцы календарного сезона за все годы истории
+const SEASONS={
+  spring:{name:"весна", mm:["03","04","05"]},
+  summer:{name:"лето",  mm:["06","07","08"]},
+  autumn:{name:"осень", mm:["09","10","11"]},
+  winter:{name:"зима",  mm:["12","01","02"]}
+};
+function isSeason(){ return typeof PERIOD==="string" && SEASONS[PERIOD]; }
+function periodMonths(){
+  if(isSeason()) return MONTHS.filter(m=>SEASONS[PERIOD].mm.includes(m.slice(5,7)));
+  // «N мес» = N ПОЛНЫХ месяцев + текущий (неполный): раньше текущий огрызок месяца
+  // занимал один из N слотов, окно было короче обещанного, а темп занижен.
+  return PERIOD===0?MONTHS:MONTHS.slice(0,PERIOD+1);
+}
+// дробное число месяцев в окне: текущий неполный месяц считается долей прошедших дней
+function effMonths(months){
+  if(!months.length) return 0;
+  const now=new Date();
+  const curKey=now.getFullYear()+"-"+String(now.getMonth()+1).padStart(2,"0");
+  const dim=new Date(now.getFullYear(),now.getMonth()+1,0).getDate();
+  const frac=Math.min(1,now.getDate()/dim);
+  return months.includes(curKey)?(months.length-1)+frac:months.length;
+}
+function periodLabel(){
+  if(isSeason()) return SEASONS[PERIOD].name+" · за все годы";
+  return PERIOD===0?"всё время":PERIOD+" мес";
+}
+
+function largestRemainder(weights,total){
+  // веса -> целые, сумма ровно total
+  const sum=weights.reduce((a,b)=>a+b,0);
+  if(sum<=0||total<=0) return weights.map(()=>0);
+  const raw=weights.map(w=>w/sum*total);
+  const fl=raw.map(Math.floor);
+  let rest=total-fl.reduce((a,b)=>a+b,0);
+  const order=raw.map((r,i)=>[r-fl[i],i]).sort((a,b)=>b[0]-a[0]);
+  for(let k=0;k<rest;k++) fl[order[k%order.length][1]]++;
+  return fl;
+}
+
+let LAST=null; // для скачивания
+
+function calc(){
+  if(!SEL) return;
+  const Q=Math.max(0,parseInt(document.getElementById("qty").value,10)||0);
+  const months=periodMonths();
+  const sales={};
+  for(const m of months){
+    const sm=(MONTHLY[m]||{})[SEL];
+    if(!sm) continue;
+    for(const [sz,v] of Object.entries(sm)) sales[sz]=(sales[sz]||0)+v;
+  }
+  for(const k of Object.keys(sales)) sales[k]=Math.max(0,Math.round(sales[k]*10)/10);
+  const stock=STOCK[SEL]||{};
+  // размерная сетка — из ВСЕЙ истории продаж + текущего стока,
+  // чтобы при пустом сезоне показывать нули по существующим размерам
+  const allSales={};
+  for(const m of MONTHS){
+    const sm=(MONTHLY[m]||{})[SEL];
+    if(!sm) continue;
+    for(const [sz,v] of Object.entries(sm)) allSales[sz]=(allSales[sz]||0)+v;
+  }
+  const sizes=[...new Set([...Object.keys(allSales),...Object.keys(stock)])].sort(sizeSort);
+  const warnBox=document.getElementById("warnBox");
+  warnBox.innerHTML="";
+  if(!sizes.length){
+    document.getElementById("tb").innerHTML='<tr><td class="loading">Нет данных по этой позиции</td></tr>';
+    document.getElementById("thead").innerHTML="";
+    document.getElementById("cards").style.display="none";
+    document.getElementById("dlBtn").style.display="none";
+    return;
+  }
+  const totSales=sizes.reduce((a,s)=>a+(sales[s]||0),0);
+  const totStock=sizes.reduce((a,s)=>a+(stock[s]||0),0);
+  let shares, pure, withStock;
+  let usedFallback=false;
+  if(totSales>0){
+    shares=sizes.map(s=>(sales[s]||0)/totSales);
+    pure=largestRemainder(shares,Q);
+    const targets=shares.map(sh=>sh*(Q+totStock));
+    const needs=targets.map((t,i)=>Math.max(0,t-(stock[sizes[i]]||0)));
+    const sumNeeds=needs.reduce((a,b)=>a+b,0);
+    withStock=sumNeeds>0?largestRemainder(needs,Q):pure.slice();
+  }else if(isSeason()){
+    // нет статистики за сезон — показываем нули
+    shares=sizes.map(()=>0);
+    pure=sizes.map(()=>0);
+    withStock=sizes.map(()=>0);
+    warnBox.innerHTML='<div class="warn">За сезон «'+SEASONS[PERIOD].name+'» статистики продаж по этой позиции нет — показываю нули.</div>';
+  }else{
+    shares=sizes.map(()=>1/sizes.length);
+    usedFallback=true;
+    warnBox.innerHTML='<div class="warn">За выбранный период продаж не было — делю поровну по размерам. Попробуй период «всё время».</div>';
+    pure=largestRemainder(shares,Q);
+    const targets=shares.map(sh=>sh*(Q+totStock));
+    const needs=targets.map((t,i)=>Math.max(0,t-(stock[sizes[i]]||0)));
+    const sumNeeds=needs.reduce((a,b)=>a+b,0);
+    withStock=sumNeeds>0?largestRemainder(needs,Q):pure.slice();
+  }
+
+  // карточки: темп = продажи / фактическое число месяцев (неполный текущий — долей),
+  // иначе темп систематически занижался в начале месяца
+  const monthsCnt=months.length;
+  const eff=effMonths(months);
+  const rate=eff>0?totSales/eff:0;
+  document.getElementById("cards").style.display="";
+  document.getElementById("cards").innerHTML=
+    '<div class="card"><div class="l">Продано за период</div><div class="v">'+fmt(totSales)+' шт</div><div class="s">'+periodLabel()+(isSeason()?" · "+monthsCnt+" мес":"")+'</div></div>'+
+    '<div class="card"><div class="l">Темп</div><div class="v">'+(Math.round(rate*10)/10).toLocaleString("ru-RU")+'</div><div class="s">шт / месяц</div></div>'+
+    '<div class="card"><div class="l">Остаток сейчас</div><div class="v">'+fmt(totStock)+' шт</div><div class="s">3 торговых склада</div></div>'+
+    '<div class="card" style="background:rgba(76,187,23,0.2)"><div class="l">Заказ</div><div class="v">'+fmt(Q)+' шт</div><div class="s">'+sizes.length+' размер(а/ов)</div></div>';
+
+  // таблица
+  const stockCol=MODE==="stock";
+  document.getElementById("thead").innerHTML='<tr><th>Размер</th><th>Продажи за период</th><th>Доля продаж</th><th>Остаток сейчас</th>'+
+    '<th'+(stockCol?' class="modecol"':'')+'>Заказать · с учётом остатков</th>'+
+    '<th'+(!stockCol?' class="modecol"':'')+'>Заказать · чистая пропорция</th></tr>';
+  const maxShare=Math.max(...shares,0.0001);
+  let rows="";
+  sizes.forEach((sz,i)=>{
+    const pct=Math.round(shares[i]*100);
+    rows+='<tr><td>'+sz+'</td>'+
+      '<td><span class="qty '+((sales[sz]||0)?'':'zero')+'">'+fmt(sales[sz]||0)+'</span></td>'+
+      '<td><span class="sharebar"><i style="width:'+Math.round(shares[i]/maxShare*100)+'%"></i></span>'+pct+'%</td>'+
+      '<td><span class="qty '+((stock[sz]||0)?'':'zero')+'">'+fmt(stock[sz]||0)+'</span></td>'+
+      '<td'+(stockCol?' class="modecol"':'')+'><span class="rec'+(stockCol?'':' dim')+'">'+withStock[i]+'</span></td>'+
+      '<td'+(!stockCol?' class="modecol"':'')+'><span class="rec'+(!stockCol?'':' dim')+'">'+pure[i]+'</span></td></tr>';
+  });
+  rows+='<tr class="total"><td>Итого</td><td>'+fmt(totSales)+'</td><td>100%</td><td>'+fmt(totStock)+'</td>'+
+    '<td'+(stockCol?' class="modecol"':'')+'>'+withStock.reduce((a,b)=>a+b,0)+'</td>'+
+    '<td'+(!stockCol?' class="modecol"':'')+'>'+pure.reduce((a,b)=>a+b,0)+'</td></tr>';
+  document.getElementById("tb").innerHTML=rows;
+  document.getElementById("dlBtn").style.display="";
+  LAST={base:SEL,Q,sizes,sales,stock,shares,pure,withStock,totSales,totStock,monthsCnt,usedFallback};
+}
+
+// ── скачивание печатной версии ──
+function downloadOrder(){
+  if(!LAST) return;
+  const L=LAST, ds=new Date().toLocaleDateString("ru-RU");
+  const mode=MODE==="stock"?L.withStock:L.pure;
+  const modeName=MODE==="stock"?"с учётом остатков":"чистая пропорция продаж";
+  let body='<table><thead><tr><th>Размер</th><th>Продажи за период</th><th>Доля</th><th>Остаток</th><th>Заказать</th></tr></thead><tbody>';
+  L.sizes.forEach((sz,i)=>{
+    body+='<tr><td><b>'+sz+'</b></td><td>'+fmt(L.sales[sz]||0)+'</td><td>'+Math.round(L.shares[i]*100)+'%</td><td>'+fmt(L.stock[sz]||0)+'</td><td><b>'+mode[i]+'</b></td></tr>';
+  });
+  body+='<tr><td><b>Итого</b></td><td>'+fmt(L.totSales)+'</td><td>100%</td><td>'+fmt(L.totStock)+'</td><td><b>'+mode.reduce((a,b)=>a+b,0)+'</b></td></tr></tbody></table>';
+  const doc='<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8"><title>Размеры · '+L.base+'</title><style>'+
+    'body{font-family:Helvetica,Arial,sans-serif;color:#1f1f1f;padding:32px;max-width:700px;margin:0 auto}'+
+    'h1{font-size:19px;margin-bottom:2px}.sub{color:#888;font-size:12px;margin-bottom:20px}'+
+    'table{width:100%;border-collapse:collapse;font-size:13px}'+
+    'th{background:#1f1f1f;color:#fff;text-align:left;padding:7px 10px;font-size:11px}'+
+    'td{padding:7px 10px;border-bottom:1px solid #e3e3e3}'+
+    'tr:nth-child(even) td{background:#faf7f3}'+
+    '@media print{body{padding:0}}</style></head><body>'+
+    '<h1>'+L.base+' — заказ '+L.Q+' шт по размерам</h1>'+
+    '<div class="sub">сформировано '+ds+' · продажи: '+periodLabel()+
+    ' ('+L.monthsCnt+' мес) · режим: '+modeName+'</div>'+body+'</body></html>';
+  savePdf(doc,"размеры-"+L.base.replace(/[^\wа-яА-ЯёЁ-]+/g,"_")+".pdf");
+}
+async function savePdf(doc, filename){
+  if(typeof html2pdf==="undefined"){
+    const blob=new Blob([doc],{type:"text/html;charset=utf-8"});
+    const a=document.createElement("a");
+    a.href=URL.createObjectURL(blob);
+    a.download=filename.replace(/\.pdf$/i,".html");
+    document.body.appendChild(a); a.click(); a.remove();
+    return;
+  }
+  const ifr=document.createElement("iframe");
+  ifr.style.cssText="position:fixed;left:-10000px;top:0;width:920px;height:1200px;border:0";
+  document.body.appendChild(ifr);
+  ifr.srcdoc=doc;
+  await new Promise(r=>{ ifr.onload=r; });
+  await new Promise(r=>setTimeout(r,150));
+  const dd2=ifr.contentDocument;
+  try{
+    await html2pdf().set({
+      margin:[10,8,12,8], filename:filename,
+      image:{type:"jpeg",quality:0.95},
+      html2canvas:{scale:2,useCORS:true,scrollX:0,scrollY:0},
+      jsPDF:{unit:"mm",format:"a4",orientation:"portrait"},
+      pagebreak:{mode:["css","legacy"]}
+    }).from(dd2.body).save();
+  }catch(e){
+    const blob=new Blob([doc],{type:"text/html;charset=utf-8"});
+    const a=document.createElement("a");
+    a.href=URL.createObjectURL(blob);
+    a.download=filename.replace(/\.pdf$/i,".html");
+    document.body.appendChild(a); a.click(); a.remove();
+  }
+  ifr.remove();
+}
+
+loadAll();
+</script>
+</body>
+</html>

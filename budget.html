@@ -1,0 +1,576 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+  <title>Chernim Cherno · Бюджет</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0 }
+    body { font-family: Helvetica, 'Helvetica Neue', Arial, sans-serif; min-height: 100vh; background: #f3e9e0; color:#1f1f1f; }
+    .gradient-bg { position: fixed; inset: 0; z-index: 0; overflow: hidden; background: #f3e9e0; }
+    .gradient-bg::before, .gradient-bg::after, .b1, .b2, .b3 {
+      position: absolute; border-radius: 50%; filter: blur(90px); opacity: 0.9; }
+    .gradient-bg::before { content: ''; width: 70vw; height: 70vw;
+      background: radial-gradient(circle, #efe5db, transparent 70%);
+      top: -20%; left: -10%; animation: blob1 11s ease-in-out infinite alternate; }
+    .gradient-bg::after { content: ''; width: 60vw; height: 60vw;
+      background: radial-gradient(circle, #e2d8cf, transparent 70%);
+      bottom: -15%; right: -10%; animation: blob2 14s ease-in-out infinite alternate; }
+    .b1 { width: 55vw; height: 55vw; background: radial-gradient(circle, #d3c9c2, transparent 70%);
+      top: 30%; left: 30%; animation: blob3 9s ease-in-out infinite alternate; }
+    .b2 { width: 45vw; height: 45vw; background: radial-gradient(circle, #c1b8b3, transparent 70%);
+      top: -10%; right: 10%; animation: blob4 13s ease-in-out infinite alternate; }
+    .b3 { width: 50vw; height: 50vw; background: radial-gradient(circle, #aba3a0, transparent 70%);
+      bottom: 10%; left: 20%; animation: blob5 16s ease-in-out infinite alternate; }
+    .vignette { position: fixed; inset: 0; z-index: 1; pointer-events: none;
+      background: radial-gradient(ellipse at center, transparent 40%, rgba(171,163,160,0.35) 100%); }
+    .grain { position: fixed; inset: 0; z-index: 2; pointer-events: none; }
+    .grain::before { content: ''; position: absolute; inset: -50%; width: 200%; height: 200%;
+      background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 512 512' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='grain'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.75' numOctaves='4' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23grain)'/%3E%3C/svg%3E");
+      background-size: 200px 200px; opacity: 0.12; mix-blend-mode: overlay;
+      animation: grain-shift 0.15s steps(1) infinite; }
+    @keyframes grain-shift {
+      0%{transform:translate(0,0)} 10%{transform:translate(-3%,-4%)} 20%{transform:translate(4%,2%)}
+      30%{transform:translate(-2%,5%)} 40%{transform:translate(5%,-3%)} 50%{transform:translate(-4%,4%)}
+      60%{transform:translate(3%,-2%)} 70%{transform:translate(-5%,3%)} 80%{transform:translate(2%,-5%)}
+      90%{transform:translate(-3%,2%)} 100%{transform:translate(4%,-4%)} }
+    @keyframes blob1 { 0%{transform:translate(0,0) scale(1)} 33%{transform:translate(8vw,5vh) scale(1.1)} 66%{transform:translate(-5vw,10vh) scale(0.95)} 100%{transform:translate(10vw,-8vh) scale(1.05)} }
+    @keyframes blob2 { 0%{transform:translate(0,0) scale(1)} 33%{transform:translate(-10vw,-6vh) scale(1.08)} 66%{transform:translate(6vw,-12vh) scale(1.12)} 100%{transform:translate(-8vw,5vh) scale(0.92)} }
+    @keyframes blob3 { 0%{transform:translate(0,0) scale(1)} 50%{transform:translate(-12vw,8vh) scale(1.15)} 100%{transform:translate(8vw,-10vh) scale(0.9)} }
+    @keyframes blob4 { 0%{transform:translate(0,0) scale(0.9)} 50%{transform:translate(10vw,12vh) scale(1.1)} 100%{transform:translate(-6vw,6vh) scale(1)} }
+    @keyframes blob5 { 0%{transform:translate(0,0) scale(1.1)} 50%{transform:translate(14vw,-8vh) scale(0.9)} 100%{transform:translate(-10vw,-12vh) scale(1.05)} }
+    .header { position: sticky; top: 0; z-index: 200; padding: 0 28px; height: 56px;
+      display: flex; align-items: center; justify-content: space-between; }
+    .logo { text-decoration: none; font-size: 15px; font-weight: 400; letter-spacing: 0.12em; color: #1f1f1f; }
+    .nav { display: flex; gap: 20px }
+    .nav a { font-size: 13px; font-weight: 400; letter-spacing: 0.05em;
+      color: rgba(31,31,31,0.45); text-decoration: none; transition: color .2s; }
+    .nav a:hover { color: #434446 }
+    .nav a.active { color: #1f1f1f; font-weight: 500; }
+    .main { padding: 20px 28px; max-width: 1250px; margin: 0 auto; position: relative; z-index: 3; }
+
+    .panel { background:rgba(255,255,255,0.6); backdrop-filter:blur(10px);
+      border:1px solid rgba(31,31,31,0.08); border-radius:12px; padding:16px 18px; margin-bottom:16px;
+      position:relative; z-index:50 }
+    .row { display:flex; align-items:center; gap:12px; flex-wrap:wrap }
+    .lbl { font-size:11px; font-weight:600; letter-spacing:.07em; text-transform:uppercase; color:rgba(31,31,31,0.5) }
+    .binp { width:190px; padding:10px 14px; border-radius:10px; font-size:17px; font-weight:700; text-align:right;
+      border:1px solid rgba(31,31,31,0.2); background:#fff; outline:none }
+    .go-btn { font-size:13px; font-weight:600; padding:10px 22px; border-radius:22px;
+      border:1px solid rgba(31,31,31,0.25); background:#1f1f1f; color:#f3e9e0; cursor:pointer }
+    .go-btn:hover { background:#3a3a3a }
+    .hint { font-size:11px; color:rgba(31,31,31,0.45) }
+    .dl-btn { margin-left:auto; font-size:12px; font-weight:600; padding:8px 18px; border-radius:20px;
+      border:1px solid rgba(31,31,31,0.25); background:#1f1f1f; color:#f3e9e0; cursor:pointer }
+    .dl-btn:hover { background:#3a3a3a }
+
+    .cat-bar { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:14px }
+    .cat-btn { font-size:12px; font-weight:500; padding:5px 14px; border-radius:20px;
+      border:1px solid rgba(31,31,31,0.09); background:rgba(255,255,255,0.55);
+      color:#434446; cursor:pointer; transition:all .15s }
+    .cat-btn:hover { background:rgba(31,31,31,0.09) }
+    .cat-btn.on { background:rgba(31,31,31,0.16); color:#1f1f1f; border-color:rgba(31,31,31,0.45) }
+    .cat-btn.off { opacity:.4; text-decoration:line-through }
+
+    .cards { display:grid; grid-template-columns:repeat(5,1fr); gap:12px; margin-bottom:12px }
+    .card { background:rgba(255,255,255,0.6); backdrop-filter:blur(10px);
+      border:1px solid rgba(31,31,31,0.08); border-radius:12px; padding:13px 17px }
+    .card .l { font-size:10px; font-weight:600; letter-spacing:.07em; text-transform:uppercase;
+      color:rgba(31,31,31,0.5); margin-bottom:5px }
+    .card .v { font-size:20px; font-weight:700 }
+    .card .s { font-size:11px; color:rgba(31,31,31,0.5); margin-top:3px }
+    .split { display:flex; gap:12px; margin-bottom:16px; flex-wrap:wrap }
+    .pill { font-size:12px; background:rgba(255,255,255,0.6); border:1px solid rgba(31,31,31,0.09);
+      border-radius:20px; padding:7px 15px }
+    .pill b { font-weight:700 }
+
+    .table-outer { background:rgba(255,255,255,0.55); backdrop-filter:blur(16px);
+      border:1px solid rgba(31,31,31,0.09); border-radius:12px; overflow:auto; margin-bottom:16px }
+    table { width:100%; border-collapse:collapse; font-size:12.5px }
+    thead th { background:rgba(255,255,255,0.88); padding:9px 7px; text-align:center;
+      font-size:10px; font-weight:500; color:rgba(31,31,31,0.62); letter-spacing:.05em;
+      text-transform:uppercase; position:sticky; top:0; z-index:10;
+      border-bottom:1px solid rgba(31,31,31,0.09) }
+    thead th:first-child { text-align:left; padding-left:14px }
+    tbody td { padding:7px 7px; border-bottom:1px solid rgba(31,31,31,0.06);
+      text-align:center; vertical-align:middle }
+    tbody td:first-child { text-align:left; padding-left:14px; font-weight:500 }
+    tr.sect td { background:rgba(31,31,31,0.08); font-weight:700; font-size:10.5px; letter-spacing:.06em;
+      text-transform:uppercase; text-align:left; padding:8px 14px; color:rgba(31,31,31,0.7) }
+    tr.total td { font-weight:700; background:rgba(31,31,31,0.05) }
+    .qty { font-weight:700; font-size:14px }
+    .money { white-space:nowrap }
+    .urgent { color:#b03a2e; font-weight:600 }
+    .soon { color:#a15c00; font-weight:600 }
+    .ok { color:rgba(31,31,31,0.65) }
+    .loading { text-align:center; padding:60px; color:rgba(31,31,31,0.45); font-size:13px }
+    .warn { font-size:12px; color:#a15c00; background:rgba(255,204,0,0.15);
+      border:1px solid rgba(255,204,0,0.4); border-radius:10px; padding:9px 14px; margin-bottom:14px }
+
+    .fold { background:rgba(255,255,255,0.5); backdrop-filter:blur(10px);
+      border:1px solid rgba(31,31,31,0.08); border-radius:12px; margin-bottom:14px; overflow:hidden }
+    .fold-head { display:flex; align-items:center; gap:10px; padding:11px 16px; cursor:pointer; user-select:none }
+    .fold-head .t { font-size:11.5px; font-weight:700; letter-spacing:.06em; text-transform:uppercase }
+    .fold-head .c { font-size:11px; color:rgba(31,31,31,0.5) }
+    .fold-arrow { font-size:10px; color:rgba(31,31,31,0.45) }
+    .fold-body { display:none; border-top:1px solid rgba(31,31,31,0.08); max-height:340px; overflow:auto }
+    .fold.open .fold-body { display:block }
+  </style>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
+</head>
+<body>
+<div class="gradient-bg"><div class="b1"></div><div class="b2"></div><div class="b3"></div></div>
+<div class="vignette"></div><div class="grain"></div>
+
+<div class="header">
+  <a class="logo" href="/analytics">Chernim&nbsp;Cherno</a>
+  <nav class="nav">
+    <a href="/analytics">Остатки</a>
+    <a href="/turnover">Оборачиваемость</a>
+    <a href="/order">Заказ</a>
+    <a href="/sizes">Размеры</a>
+    <a href="/budget" class="active">Бюджет</a>
+    <a href="/forecast">Прогноз</a>
+    <a href="/revenue">Оборот</a>
+    <a href="/transfers">Перемещения</a>
+    <a href="/money">Деньги</a>
+    <a href="/paris">Париж</a>
+    <a href="/yandex">Яндекс</a>
+  </nav>
+</div>
+
+<div class="main">
+  <div class="panel">
+    <div class="row">
+      <span class="lbl">Бюджет, ₽</span>
+      <input class="binp" id="budget" type="text" inputmode="numeric" value="200 000">
+      <span class="lbl">Макс. на позицию</span>
+      <input class="binp" id="capPct" type="number" min="5" max="100" value="30" style="width:80px;text-align:center">
+      <span class="lbl" style="text-transform:none">%</span>
+      <button class="go-btn" onclick="calc()">Распределить</button>
+      <span class="hint" id="statusHint">загружаю данные…</span>
+      <button class="dl-btn" id="dlBtn" style="display:none" onclick="downloadBudget()">⬇ Скачать</button>
+    </div>
+  </div>
+
+  <div class="cat-bar" id="catBar"></div>
+
+  <div id="warnBox"></div>
+  <div class="cards" id="cards" style="display:none"></div>
+  <div class="split" id="split"></div>
+
+  <div class="table-outer" id="tblWrap" style="display:none">
+    <table>
+      <thead id="thead"></thead>
+      <tbody id="tb"></tbody>
+    </table>
+  </div>
+  <div class="loading" id="placeholder">Введи бюджет и нажми «Распределить»</div>
+
+  <div class="fold" id="skippedFold" style="display:none">
+    <div class="fold-head" onclick="this.parentElement.classList.toggle('open')">
+      <span class="fold-arrow">▸</span><span class="t">Не вошло в бюджет</span>
+      <span class="c" id="skippedCnt"></span>
+    </div>
+    <div class="fold-body" id="skippedBody"></div>
+  </div>
+  <div class="fold" id="staleFold" style="display:none">
+    <div class="fold-head" onclick="this.parentElement.classList.toggle('open')">
+      <span class="fold-arrow">▸</span><span class="t">Без продаж 90 дней — исключены</span>
+      <span class="c" id="staleCnt"></span>
+    </div>
+    <div class="fold-body" id="staleBody"></div>
+  </div>
+  <div class="fold" id="nocostFold" style="display:none">
+    <div class="fold-head" onclick="this.parentElement.classList.toggle('open')">
+      <span class="fold-arrow">▸</span><span class="t">Нет себестоимости — пропущены</span>
+      <span class="c" id="nocostCnt"></span>
+    </div>
+    <div class="fold-body" id="nocostBody"></div>
+  </div>
+
+  <div class="hint" style="margin-top:6px;line-height:1.6">
+    <b>Как считается.</b> Приоритет — <b>оборачиваемость</b>, та же метрика и шкала, что на странице
+    Оборачиваемость (нетто-выручка ₽/день за дни в стоке): сначала бюджет получают бестселлеры (тёмно-зелёные,
+    ≥5000), потом хорошие (2000–5000) и так далее. Потребность каждой позиции = темп продаж × 90 дней − остаток −
+    «едет к нам» (из «Заказано»). В расчёт входят только позиции с продажами за последние 90 дней — давно
+    распроданное и неактуальное отсекается (список внизу). Категории можно выключать кнопками — бюджет
+    пересчитается. «Макс. на позицию» ограничивает долю бюджета на одну позицию (по умолчанию 30%) —
+    один бестселлер не съест весь заказ; освободившиеся деньги уходят следующим по оборачиваемости. Лаборатория: себес = ткань + пошив; Китай: цена под ключ; ручные себестоимости имеют
+    приоритет. Архивные позиции исключены.
+  </div>
+</div>
+
+<script>
+const CATEGORIES = {
+  "Верхняя одежда": ["бомбер","куртка","тренч","пальто","ветровка","олимпийка","комбинезон","фрак","меховой пиджак"],
+  "Костюмы": ["пиджак","жилет-галстук","корсетный жилет"],
+  "Брюки": ["брюки","спортивные брюки"],
+  "Рубашки": ["рубашка","рубашка-оригами"],
+  "Свитера": ["свитер"],
+  "Худи и свитшоты": ["худи","свитшот"],
+  "Шорты": ["шорты"],
+  "Майки": ["майка","топ","лонгслив","кроп кольчуга","манишка кольчуга","майка кольчуга","укороченная"],
+  "Футболки": ["футболка"],
+  "Джинсы": ["джинсы"],
+  "Сумки": ["сумка","клатч"],
+  "Аксессуары": ["ремень","шарф","шапка","меховой ворот","воротник","очки"],
+  "Украшения": ["браслет","кольцо","подвеска","кафф","цепь","цепочка","сет из","серьга","серёжка","пирсинг"],
+  "Нижнее белье": ["боксер","боксёр","брифы","комплект нижнег","трусы","носки"],
+  "Прочее": []
+};
+const CAT_ORDER = ["Верхняя одежда","Костюмы","Брюки","Джинсы","Рубашки","Свитера","Худи и свитшоты","Шорты","Майки","Футболки","Сумки","Аксессуары","Украшения","Нижнее белье","Прочее"];
+const NON_MERCH = ["сертификат","кошелек","sample","сэмпл","упаковоч","пакет","коробк","вешалк","бирк","кофр","наклейк","кейс для","чехол для","нитк","бумага тишью"];
+function getCat(n){
+  const nl=n.toLowerCase();
+  if(NON_MERCH.some(k=>nl.includes(k))) return null;
+  for(const [c,kws] of Object.entries(CATEGORIES)){
+    if(c==="Прочее") continue;
+    if(kws.some(k=>nl.includes(k))) return c;
+  }
+  return "Прочее";
+}
+function fmt(n){ return Math.round(n||0).toLocaleString("ru-RU"); }
+function fmtR(n){ return fmt(n)+" ₽"; }
+const HORIZON=90, FRESH_DAYS=90;
+
+let TD=null, CP=null, COSTS=null, CHINA=new Set(), ORDERED={}, HIDDEN=new Set(), LASTSALE={}, RECENT={};
+let OFFCATS=new Set(), READY=false, LAST=null;
+
+async function loadAll(){
+  const hint=document.getElementById("statusHint");
+  try{
+    const [td, cp, costs, china, ordered, hidden, bys] = await Promise.all([
+      fetch("/api/turnover-data").then(r=>r.json()),
+      fetch("/api/cost-prices").then(r=>r.json()),
+      fetch("/api/costs").then(r=>r.json()),
+      fetch("/api/projects/china-global/data").then(r=>r.json()).catch(()=>({added:[]})),
+      fetch("/api/adjustments?project_id=analytics-ordered").then(r=>r.json()).catch(()=>({})),
+      fetch("/api/hidden").then(r=>r.json()).catch(()=>[]),
+      fetch("/api/stocks-bystore").then(r=>r.json()).catch(()=>({skus:{}}))
+    ]);
+    TD=td.skus||{}; CP=cp||{}; COSTS=costs||{};
+    CHINA=new Set(china.added||[]); ORDERED=ordered||{}; HIDDEN=new Set(hidden||[]);
+    const now=Date.now();
+    for(const [base,rec] of Object.entries(bys.skus||{})){
+      let latest=0;
+      for(const s of Object.values(rec.sizes||{}))
+        for(const d of (s.last||[]))
+          if(d){ const t=new Date(d).getTime(); if(isFinite(t)&&t>latest) latest=t; }
+      if(latest) LASTSALE[base]=(now-latest)/86400000;
+    }
+    // вторая проверка свежести: продажи за последние ~3 месяца из sales-monthly
+    // (нужна для распроданных в ноль позиций — их нет в stocks-bystore)
+    try{
+      const first=await (await fetch("/api/sales-monthly")).json();
+      const mm=(first.months||[]).slice(0,4);
+      const monthData=await Promise.all(mm.map(m=>
+        fetch("/api/sales-monthly?month="+m).then(r=>r.json()).catch(()=>null)));
+      for(const d of monthData){
+        if(!d) continue;
+        for(const it of (d.items||[]))
+          RECENT[it.base]=(RECENT[it.base]||0)+((it.sale_qty||0)-(it.ret_qty||0));
+      }
+    }catch(e){}
+    READY=true;
+    renderCatBar();
+    hint.textContent=Object.keys(TD).length+" позиций · приоритет: оборачиваемость · продажи за "+FRESH_DAYS+" дн · горизонт "+HORIZON+" дней";
+  }catch(e){
+    hint.textContent="ошибка загрузки: "+e.message;
+  }
+}
+
+function renderCatBar(){
+  document.getElementById("catBar").innerHTML=CAT_ORDER.map(c=>
+    '<button class="cat-btn '+(OFFCATS.has(c)?'off':'on')+'" data-cat="'+c+'">'+c+'</button>').join("");
+}
+document.getElementById("catBar").addEventListener("click",e=>{
+  const b=e.target.closest(".cat-btn"); if(!b) return;
+  const c=b.dataset.cat;
+  if(OFFCATS.has(c)) OFFCATS.delete(c); else OFFCATS.add(c);
+  renderCatBar();
+  if(LAST) calc();
+});
+
+function parseBudget(){
+  const raw=(document.getElementById("budget").value||"").replace(/[^\d]/g,"");
+  return parseInt(raw,10)||0;
+}
+document.getElementById("budget").addEventListener("input",e=>{
+  const n=parseBudget();
+  e.target.value=n?n.toLocaleString("ru-RU"):"";
+});
+document.getElementById("budget").addEventListener("keydown",e=>{ if(e.key==="Enter") calc(); });
+
+function stripSize(n){ return n.replace(/\s*\([^)]*\)\s*$/,"").trim(); }
+// себес позиции: ручной override → МС → среднее по размерным вариантам (например, очки:
+// себес проставлен у расцветок «(BLACK-GOLD)», а у базового имени — нет)
+function costOf(base){
+  const ov=+COSTS[base]||0;
+  if(ov>0) return ov;
+  const own=+((CP[base]||{}).cost)||0;
+  if(own>0) return own;
+  const vals=[];
+  for(const [k,v] of Object.entries(CP)){
+    if(k!==base&&stripSize(k)===base&&(+v.cost||0)>0) vals.push(+v.cost);
+  }
+  return vals.length?vals.reduce((a,b)=>a+b,0)/vals.length:0;
+}
+function buildItems(){
+  const items=[], nocost=[], stale=[];
+  for(const [base,t] of Object.entries(TD)){
+    // пропускаем размерные варианты «Имя (M)», если базовое имя существует отдельно —
+    // как на /turnover; иначе они задваивают позиции и засоряют «нет себестоимости»
+    const sb=stripSize(base);
+    if(sb!==base&&TD[sb]) continue;
+    const cat=getCat(base);
+    if(!cat||HIDDEN.has(base)||OFFCATS.has(cat)) continue;
+    const dis=t.dis||0, nq=t.nq||0, cs=t.cs||0;
+    if(dis<=0||nq<=0) continue;                      // нет продаж вообще
+    const rate=nq/dis;                               // шт/день, честный темп
+    const turn=(t.nr||0)/dis;                        // оборачиваемость ₽/день — как на /turnover
+    const incoming=ORDERED[base]||0;
+    const stockEff=cs+Math.max(0,incoming);
+    const need=Math.ceil(Math.max(0, rate*HORIZON - stockEff));
+    if(need<3) continue;                             // потребность мизерная
+    const lastDays=LASTSALE[base];
+    const recentQty=RECENT[base]||0;
+    if(!(lastDays<=FRESH_DAYS) && recentQty<=0){     // нет свежих продаж ни по одному источнику
+      stale.push({base, need, days:isFinite(lastDays)?Math.round(lastDays):null, turn});
+      continue;
+    }
+    const cpRec=CP[base]||{};
+    const cost=costOf(base);
+    const isChina=CHINA.has(base);
+    const sew=Math.min(+cpRec.purchase||0, cost);
+    const fabric=Math.max(0, cost-sew);
+    const price=(+t.ap||0)>0?+t.ap:(+cpRec.price||0);
+    if(cost<=0){ nocost.push({base, need, turn}); continue; }
+    const margin=price-cost;
+    const daysLeft=rate>0?stockEff/rate:Infinity;
+    items.push({base,cat,isChina,rate,stockEff,incoming,daysLeft,need,cost,
+      sew:isChina?0:sew,fabric:isChina?0:fabric,price,margin,turn});
+  }
+  items.sort((a,b)=>b.turn-a.turn);
+  nocost.sort((a,b)=>b.turn-a.turn);
+  stale.sort((a,b)=>b.turn-a.turn);
+  return {items,nocost,stale};
+}
+
+function calc(){
+  if(!READY){ alert("Данные ещё загружаются"); return; }
+  const B=parseBudget();
+  if(B<=0){ alert("Введи бюджет"); return; }
+  const {items,nocost,stale}=buildItems();
+  let capPct=parseInt(document.getElementById("capPct").value,10);
+  if(!isFinite(capPct)||capPct<5) capPct=5;
+  if(capPct>100) capPct=100;
+  document.getElementById("capPct").value=capPct;
+  const capSum=B*capPct/100;                        // максимум денег на одну позицию
+  let rest=B;
+  const chosen=[], skipped=[];
+  for(const it of items){
+    const byCap=Math.floor(capSum/it.cost);
+    const q=Math.min(it.need, Math.floor(rest/it.cost), byCap);
+    if(q>=1){
+      chosen.push({...it, qty:q, sum:q*it.cost, profit:q*it.margin,
+        partial:q<it.need, capped:q<it.need&&q===byCap&&byCap<=Math.floor(rest/it.cost), capPct});
+      rest-=q*it.cost;
+    }else{
+      skipped.push(it);
+    }
+  }
+  render(B, rest, chosen, skipped, nocost, stale);
+  LAST={B, rest, chosen, skipped, nocost, stale};
+}
+
+function daysCell(d){
+  if(!isFinite(d)) return '<span class="ok">—</span>';
+  const r=Math.round(d);
+  if(r<=0) return '<span class="urgent">распродано</span>';
+  if(r<30) return '<span class="urgent">'+r+' дн</span>';
+  if(r<60) return '<span class="soon">'+r+' дн</span>';
+  return '<span class="ok">'+r+' дн</span>';
+}
+// цвета шкалы оборачиваемости — как на /turnover
+function turnBadge(t){
+  const v=Math.round(t);
+  let c, w=700;
+  if(v<1000) c='#b03a2e';
+  else if(v<2000) c='#b8860b';
+  else if(v<5000) c='rgb(76,187,23)';
+  else c='#1a6b10';
+  return '<span style="font-weight:'+w+';color:'+c+'">'+fmt(v)+'</span>';
+}
+
+function render(B, rest, chosen, skipped, nocost, stale){
+  document.getElementById("placeholder").style.display="none";
+  document.getElementById("tblWrap").style.display="";
+  document.getElementById("dlBtn").style.display="";
+  const used=B-rest;
+  const profit=chosen.reduce((a,c)=>a+c.profit,0);
+  const units=chosen.reduce((a,c)=>a+c.qty,0);
+  const lab=chosen.filter(c=>!c.isChina), china=chosen.filter(c=>c.isChina);
+  const labFabric=lab.reduce((a,c)=>a+c.fabric*c.qty,0);
+  const labSew=lab.reduce((a,c)=>a+c.sew*c.qty,0);
+  const labSum=lab.reduce((a,c)=>a+c.sum,0);
+  const chinaSum=china.reduce((a,c)=>a+c.sum,0);
+
+  document.getElementById("cards").style.display="";
+  document.getElementById("cards").innerHTML=
+    '<div class="card"><div class="l">Бюджет</div><div class="v">'+fmtR(B)+'</div></div>'+
+    '<div class="card"><div class="l">Использовано</div><div class="v">'+fmtR(used)+'</div><div class="s">'+Math.round(used/B*100)+'% · остаток '+fmtR(rest)+'</div></div>'+
+    '<div class="card"><div class="l">Позиций / штук</div><div class="v">'+chosen.length+' / '+units+'</div></div>'+
+    '<div class="card" style="background:rgba(76,187,23,0.2)"><div class="l">Ожидаемая прибыль</div><div class="v">'+fmtR(profit)+'</div><div class="s">при распродаже по средней цене</div></div>'+
+    '<div class="card"><div class="l">Прибыль / рубль</div><div class="v">'+(used>0?(profit/used).toFixed(2):"—")+'</div><div class="s">₽ прибыли на ₽ вложений</div></div>';
+
+  document.getElementById("split").innerHTML=
+    '<span class="pill">Лаборатория: <b>'+fmtR(labSum)+'</b> · ткань '+fmtR(labFabric)+' + пошив '+fmtR(labSew)+' · '+lab.length+' поз.</span>'+
+    '<span class="pill">Китай: <b>'+fmtR(chinaSum)+'</b> · '+china.length+' поз.</span>';
+
+  document.getElementById("thead").innerHTML='<tr><th>Позиция</th><th>Оборач.<br>₽/день</th><th>Темп, шт/мес</th><th>Остаток+едет</th><th>Запас</th>'+
+    '<th>Заказать</th><th>Ткань/шт</th><th>Пошив/шт</th><th>Себес/шт</th><th>Сумма</th><th>Прибыль</th></tr>';
+
+  let rows="", n=0;
+  const section=(title,list)=>{
+    if(!list.length) return;
+    rows+='<tr class="sect"><td colspan="11">'+title+' · '+list.length+' поз.</td></tr>';
+    for(const c of list){
+      n++;
+      rows+='<tr><td>'+n+'. '+c.base+(c.partial?' <span class="hint">'+(c.capped?'(лимит '+c.capPct+'% бюджета, потребность '+c.need+')':'(частично, потребность '+c.need+')')+'</span>':'')+'</td>'+
+        '<td>'+turnBadge(c.turn)+'</td>'+
+        '<td>'+(c.rate*30).toFixed(1)+'</td>'+
+        '<td>'+fmt(c.stockEff)+(c.incoming?' <span class="hint">(+'+fmt(c.incoming)+' едет)</span>':'')+'</td>'+
+        '<td>'+daysCell(c.daysLeft)+'</td>'+
+        '<td><span class="qty">'+c.qty+'</span></td>'+
+        '<td class="money">'+(c.isChina?'—':fmtR(c.fabric))+'</td>'+
+        '<td class="money">'+(c.isChina?'—':fmtR(c.sew))+'</td>'+
+        '<td class="money">'+fmtR(c.cost)+'</td>'+
+        '<td class="money"><b>'+fmtR(c.sum)+'</b></td>'+
+        '<td class="money">'+fmtR(c.profit)+'</td></tr>';
+    }
+  };
+  section("Лаборатория", lab);
+  section("Китай", china);
+  rows+='<tr class="total"><td>Итого</td><td></td><td></td><td></td><td></td><td>'+units+'</td>'+
+    '<td class="money">'+fmtR(labFabric)+'</td><td class="money">'+fmtR(labSew)+'</td><td></td>'+
+    '<td class="money">'+fmtR(used)+'</td><td class="money">'+fmtR(profit)+'</td></tr>';
+  document.getElementById("tb").innerHTML=rows;
+
+  const sf=document.getElementById("skippedFold");
+  if(skipped.length){
+    sf.style.display="";
+    document.getElementById("skippedCnt").textContent=skipped.length+" поз. — следующие по оборачиваемости";
+    let sh='<table><thead><tr><th style="text-align:left;padding-left:14px">Позиция</th><th>Оборач.</th><th>Потребность</th><th>Себес/шт</th><th>Надо ₽</th><th>Запас</th></tr></thead><tbody>';
+    for(const s of skipped.slice(0,40)){
+      sh+='<tr><td style="text-align:left;padding-left:14px">'+s.base+(s.isChina?' <span class="hint">Китай</span>':'')+'</td>'+
+        '<td>'+turnBadge(s.turn)+'</td><td>'+s.need+' шт</td>'+
+        '<td class="money">'+fmtR(s.cost)+'</td><td class="money">'+fmtR(s.need*s.cost)+'</td><td>'+daysCell(s.daysLeft)+'</td></tr>';
+    }
+    sh+='</tbody></table>';
+    document.getElementById("skippedBody").innerHTML=sh;
+  }else sf.style.display="none";
+
+  const stf=document.getElementById("staleFold");
+  if(stale.length){
+    stf.style.display="";
+    document.getElementById("staleCnt").textContent=stale.length+" поз. — есть потребность по темпу, но продаж за "+FRESH_DAYS+" дн не было";
+    document.getElementById("staleBody").innerHTML='<div style="padding:10px 16px;font-size:12px;line-height:1.9">'+
+      stale.slice(0,60).map(x=>x.base+' <span class="hint">('+(x.days!==null?('последняя продажа '+x.days+' дн назад'):'нет данных о продажах')+' · потребность '+x.need+' шт)</span>').join('<br>')+'</div>';
+  }else stf.style.display="none";
+
+  const nf=document.getElementById("nocostFold");
+  if(nocost.length){
+    nf.style.display="";
+    document.getElementById("nocostCnt").textContent=nocost.length+" поз. — задай себес в МС или на странице Заказ";
+    document.getElementById("nocostBody").innerHTML='<div style="padding:10px 16px;font-size:12px;line-height:1.9">'+
+      nocost.map(x=>x.base+' <span class="hint">(оборач. '+fmt(x.turn)+' · потребность '+x.need+' шт)</span>').join('<br>')+'</div>';
+  }else nf.style.display="none";
+
+  document.getElementById("warnBox").innerHTML = chosen.length?'':'<div class="warn">Ни одна позиция не поместилась в бюджет — попробуй сумму побольше или включи категории.</div>';
+}
+
+function downloadBudget(){
+  if(!LAST) return;
+  const {B, rest, chosen}=LAST;
+  const used=B-rest;
+  const profit=chosen.reduce((a,c)=>a+c.profit,0);
+  const lab=chosen.filter(c=>!c.isChina), china=chosen.filter(c=>c.isChina);
+  const labFabric=lab.reduce((a,c)=>a+c.fabric*c.qty,0);
+  const labSew=lab.reduce((a,c)=>a+c.sew*c.qty,0);
+  const ds=new Date().toLocaleDateString("ru-RU");
+  const sec=(title,list)=>{
+    if(!list.length) return "";
+    let h='<h2>'+title+'</h2><table><thead><tr><th>№</th><th class="l">Позиция</th><th>Шт</th>'+
+      (title==="Лаборатория"?'<th>Ткань/шт</th><th>Пошив/шт</th>':'')+
+      '<th>Себес/шт</th><th>Сумма</th></tr></thead><tbody>';
+    let i=0,sub=0;
+    for(const c of list){
+      i++; sub+=c.sum;
+      h+='<tr><td>'+i+'</td><td class="l">'+c.base+'</td><td><b>'+c.qty+'</b></td>'+
+        (title==="Лаборатория"?'<td>'+fmtR(c.fabric)+'</td><td>'+fmtR(c.sew)+'</td>':'')+
+        '<td>'+fmtR(c.cost)+'</td><td>'+fmtR(c.sum)+'</td></tr>';
+    }
+    h+='</tbody></table><div class="tot">Итого '+title+': <b>'+fmtR(sub)+'</b>'+
+      (title==="Лаборатория"?' (ткань '+fmtR(labFabric)+' + пошив '+fmtR(labSew)+')':'')+'</div>';
+    return h;
+  };
+  const doc='<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8"><title>Бюджет '+ds+'</title><style>'+
+    'body{font-family:Helvetica,Arial,sans-serif;color:#1f1f1f;padding:32px;max-width:800px;margin:0 auto}'+
+    'h1{font-size:20px;margin-bottom:2px}.sub{color:#888;font-size:12px;margin-bottom:20px}'+
+    'h2{font-size:15px;text-transform:uppercase;letter-spacing:.06em;margin:22px 0 6px;border-bottom:2px solid #1f1f1f;padding-bottom:4px}'+
+    'table{width:100%;border-collapse:collapse;font-size:13px}'+
+    'th{background:#1f1f1f;color:#fff;text-align:left;padding:7px 10px;font-size:11px}'+
+    'td{padding:6px 10px;border-bottom:1px solid #e3e3e3;vertical-align:top}'+
+    'tr:nth-child(even) td{background:#faf7f3}'+
+    '.tot{margin:8px 0 16px;font-size:13px;background:#f0ebe4;padding:9px 13px;border-radius:8px}'+
+    '.tot.grand{background:#1f1f1f;color:#f3e9e0;font-size:14px}'+
+    '@media print{body{padding:0}}</style></head><body>'+
+    '<h1>Заказ под бюджет '+fmtR(B)+' · Chernim Cherno</h1>'+
+    '<div class="sub">сформировано '+ds+' · горизонт '+HORIZON+' дней · приоритет: оборачиваемость · только позиции с продажами за '+FRESH_DAYS+' дн · макс. '+(chosen[0]&&chosen[0].capPct?chosen[0].capPct:30)+'% бюджета на позицию</div>'+
+    sec("Лаборатория",lab)+sec("Китай",china)+
+    '<div class="tot grand">Использовано: <b>'+fmtR(used)+'</b> из '+fmtR(B)+' · ожидаемая прибыль: <b>'+fmtR(profit)+'</b></div>'+
+    '</body></html>';
+  savePdf(doc,"бюджет-"+new Date().toISOString().slice(0,10)+".pdf");
+}
+async function savePdf(doc, filename){
+  if(typeof html2pdf==="undefined"){
+    const blob=new Blob([doc],{type:"text/html;charset=utf-8"});
+    const a=document.createElement("a");
+    a.href=URL.createObjectURL(blob);
+    a.download=filename.replace(/\.pdf$/i,".html");
+    document.body.appendChild(a); a.click(); a.remove();
+    return;
+  }
+  const ifr=document.createElement("iframe");
+  ifr.style.cssText="position:fixed;left:-10000px;top:0;width:920px;height:1200px;border:0";
+  document.body.appendChild(ifr);
+  ifr.srcdoc=doc;
+  await new Promise(r=>{ ifr.onload=r; });
+  await new Promise(r=>setTimeout(r,150));
+  const dd=ifr.contentDocument;
+  const extra=dd.createElement("style");
+  extra.textContent="h2{page-break-after:avoid}tr,.tot{page-break-inside:avoid}";
+  dd.head.appendChild(extra);
+  try{
+    await html2pdf().set({
+      margin:[10,8,12,8], filename:filename,
+      image:{type:"jpeg",quality:0.95},
+      html2canvas:{scale:2,useCORS:true,scrollX:0,scrollY:0},
+      jsPDF:{unit:"mm",format:"a4",orientation:"portrait"},
+      pagebreak:{mode:["css","legacy"]}
+    }).from(dd.body).save();
+  }catch(e){
+    const blob=new Blob([doc],{type:"text/html;charset=utf-8"});
+    const a=document.createElement("a");
+    a.href=URL.createObjectURL(blob);
+    a.download=filename.replace(/\.pdf$/i,".html");
+    document.body.appendChild(a); a.click(); a.remove();
+  }
+  ifr.remove();
+}
+
+loadAll();
+</script>
+</body>
+</html>

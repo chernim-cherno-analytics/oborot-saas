@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+python-multipart
+xlrd
+pandas
+openpyxl
+httpx
+psycopg2-binary
+apscheduler

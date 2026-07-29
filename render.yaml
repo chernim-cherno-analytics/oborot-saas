@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: chernimcherno
+    env: python
+    buildCommand: chmod +x build.sh && ./build.sh
+    startCommand: chmod +x start.sh && ./start.sh
+    disk:
+      name: data
+      mountPath: /opt/render/project/src/backend/data
+      sizeGB: 1

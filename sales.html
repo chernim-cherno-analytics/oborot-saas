@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+  <title>Chernim Cherno · Продажи</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0 }
+    body { font-family: Helvetica, 'Helvetica Neue', Arial, sans-serif; min-height: 100vh; background: #f3e9e0; color:#1f1f1f; }
+
+    .gradient-bg { position: fixed; inset: 0; z-index: 0; overflow: hidden; background: #f3e9e0; }
+    .gradient-bg::before, .gradient-bg::after, .b1, .b2, .b3 {
+      position: absolute; border-radius: 50%; filter: blur(90px); opacity: 0.9;
+    }
+    .gradient-bg::before { content: ''; width: 70vw; height: 70vw;
+      background: radial-gradient(circle, #efe5db, transparent 70%);
+      top: -20%; left: -10%; animation: blob1 11s ease-in-out infinite alternate; }
+    .gradient-bg::after { content: ''; width: 60vw; height: 60vw;
+      background: radial-gradient(circle, #e2d8cf, transparent 70%);
+      bottom: -15%; right: -10%; animation: blob2 14s ease-in-out infinite alternate; }
+    .b1 { width: 55vw; height: 55vw; background: radial-gradient(circle, #d3c9c2, transparent 70%);
+      top: 30%; left: 30%; animation: blob3 9s ease-in-out infinite alternate; }
+    .b2 { width: 45vw; height: 45vw; background: radial-gradient(circle, #c1b8b3, transparent 70%);
+      top: -10%; right: 10%; animation: blob4 13s ease-in-out infinite alternate; }
+    .b3 { width: 50vw; height: 50vw; background: radial-gradient(circle, #aba3a0, transparent 70%);
+      bottom: 10%; left: 20%; animation: blob5 16s ease-in-out infinite alternate; }
+    .vignette { position: fixed; inset: 0; z-index: 1; pointer-events: none;
+      background: radial-gradient(ellipse at center, transparent 40%, rgba(171,163,160,0.35) 100%); }
+    .grain { position: fixed; inset: 0; z-index: 2; pointer-events: none; }
+    .grain::before { content: ''; position: absolute; inset: -50%; width: 200%; height: 200%;
+      background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 512 512' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='grain'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.75' numOctaves='4' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23grain)'/%3E%3C/svg%3E");
+      background-size: 200px 200px; opacity: 0.12; mix-blend-mode: overlay;
+      animation: grain-shift 0.15s steps(1) infinite; }
+    @keyframes grain-shift {
+      0%{transform:translate(0,0)} 10%{transform:translate(-3%,-4%)} 20%{transform:translate(4%,2%)}
+      30%{transform:translate(-2%,5%)} 40%{transform:translate(5%,-3%)} 50%{transform:translate(-4%,4%)}
+      60%{transform:translate(3%,-2%)} 70%{transform:translate(-5%,3%)} 80%{transform:translate(2%,-5%)}
+      90%{transform:translate(-3%,2%)} 100%{transform:translate(4%,-4%)} }
+    @keyframes blob1 { 0%{transform:translate(0,0) scale(1)} 33%{transform:translate(8vw,5vh) scale(1.1)} 66%{transform:translate(-5vw,10vh) scale(0.95)} 100%{transform:translate(10vw,-8vh) scale(1.05)} }
+    @keyframes blob2 { 0%{transform:translate(0,0) scale(1)} 33%{transform:translate(-10vw,-6vh) scale(1.08)} 66%{transform:translate(6vw,-12vh) scale(1.12)} 100%{transform:translate(-8vw,5vh) scale(0.92)} }
+    @keyframes blob3 { 0%{transform:translate(0,0) scale(1)} 50%{transform:translate(-12vw,8vh) scale(1.15)} 100%{transform:translate(8vw,-10vh) scale(0.9)} }
+    @keyframes blob4 { 0%{transform:translate(0,0) scale(0.9)} 50%{transform:translate(10vw,12vh) scale(1.1)} 100%{transform:translate(-6vw,6vh) scale(1)} }
+    @keyframes blob5 { 0%{transform:translate(0,0) scale(1.1)} 50%{transform:translate(14vw,-8vh) scale(0.9)} 100%{transform:translate(-10vw,-12vh) scale(1.05)} }
+
+    .header {
+      position: sticky; top: 0; z-index: 200;
+      padding: 0 28px; height: 56px;
+      display: flex; align-items: center; justify-content: space-between;
+    }
+    .logo { text-decoration: none; display:flex; align-items:center;
+      font-family: Helvetica, 'Helvetica Neue', Arial, sans-serif;
+      font-size: 15px; font-weight: 400; letter-spacing: 0.12em; color: #1f1f1f; }
+    .nav { display: flex; gap: 20px }
+    .nav a {
+      font-size: 13px; font-weight: 400; letter-spacing: 0.05em;
+      color: rgba(31,31,31,0.45); text-decoration: none; transition: color .2s;
+    }
+    .nav a:hover { color: #434446 }
+    .nav a.active { color: #1f1f1f; font-weight: 500; }
+
+    /* Month selector bar */
+    .month-bar {
+      position: relative; z-index: 10;
+      padding: 12px 28px; display: flex; gap: 8px; flex-wrap: wrap; align-items: center;
+      border-bottom: 1px solid rgba(31,31,31,0.09);
+      background: rgba(255,255,255,0.55); backdrop-filter: blur(10px);
+    }
+    .month-btn {
+      font-size: 12px; font-weight: 500; padding: 5px 14px; border-radius: 20px;
+      border: 1px solid rgba(31,31,31,0.09); background: rgba(255,255,255,0.55);
+      color: rgba(31,31,31,0.62); cursor: pointer; transition: all .15s; white-space: nowrap;
+      font-family: inherit;
+    }
+    .month-btn:hover { background: rgba(31,31,31,0.09); color:#1f1f1f }
+    .month-btn.active { background: rgba(31,31,31,0.16); color:#1f1f1f; border-color: rgba(31,31,31,0.45) }
+
+    /* Summary cards */
+    .summary {
+      position: relative; z-index: 10;
+      padding: 14px 28px; display: flex; gap: 14px;
+      background: rgba(0,0,0,0.15); border-bottom: 1px solid rgba(31,31,31,0.07);
+    }
+    .scard {
+      background: rgba(255,255,255,0.55); border: 1px solid rgba(31,31,31,0.09);
+      border-radius: 10px; padding: 12px 18px; min-width: 160px;
+    }
+    .scard-label { font-size: 10px; font-weight: 600; color: rgba(31,31,31,0.45);
+      text-transform: uppercase; letter-spacing: .08em; margin-bottom: 6px; }
+    .scard-value { font-size: 22px; font-weight: 700; color: #1f1f1f; font-variant-numeric: tabular-nums; }
+    .scard-sub { font-size: 11px; color: rgba(31,31,31,0.45); margin-top: 3px; }
+    .scard.green { border-color: rgba(75,122,0,0.3); }
+    .scard.green .scard-value { color: #4b7a00; }
+    .scard.red { border-color: rgba(221,0,4,0.3); }
+    .scard.red .scard-value { color: #dd0004; }
+    .scard.gold { border-color: rgba(250,204,21,0.3); }
+    .scard.gold .scard-value { color: rgba(250,204,21,0.95); }
+
+    /* Main content */
+    .main { padding: 16px 28px; position: relative; z-index: 3; }
+
+    /* Table */
+    .table-outer {
+      background: rgba(255,255,255,0.55); backdrop-filter: blur(16px);
+      border: 1px solid rgba(31,31,31,0.09); border-radius: 12px;
+      overflow: auto; max-height: calc(100vh - 240px);
+    }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; min-width: 700px; }
+    thead th {
+      background: rgba(255,255,255,0.85); backdrop-filter: blur(16px);
+      padding: 10px 12px; text-align: right;
+      font-size: 10px; font-weight: 600; color: rgba(31,31,31,0.45);
+      letter-spacing: 0.07em; text-transform: uppercase;
+      white-space: nowrap; position: sticky; top: 0; z-index: 10;
+      border-bottom: 1px solid rgba(31,31,31,0.09);
+    }
+    thead th:first-child { text-align: left; padding-left: 16px; min-width: 280px; width: 40%; }
+    thead th:nth-child(2) { min-width: 70px; }
+
+    /* Base rows */
+    tbody tr.pr td {
+      padding: 9px 12px; border-bottom: 1px solid rgba(31,31,31,0.07);
+      text-align: right; vertical-align: middle; color: #1f1f1f;
+    }
+    tbody tr.pr td:first-child { text-align: left; padding-left: 16px; cursor: pointer; }
+    tbody tr.pr:hover td { background: rgba(255,255,255,0.55); }
+    .pr.expanded > td { border-bottom: none; }
+
+    /* Size sub-rows */
+    tbody tr.sr { display: none; }
+    tbody tr.sr.open { display: table-row; }
+    tbody tr.sr td {
+      padding: 5px 12px; border-bottom: 1px solid rgba(31,31,31,0.07);
+      font-size: 11px; text-align: right; color: rgba(31,31,31,0.62);
+      background: rgba(0,0,0,0.12);
+    }
+    tbody tr.sr td:first-child {
+      padding-left: 36px; text-align: left; color: rgba(31,31,31,0.45); font-style: italic;
+    }
+    tbody tr.sr:last-of-type td { border-bottom: 1px solid rgba(31,31,31,0.09); }
+    tbody tr.sr:hover td { background: rgba(255,255,255,0.55); }
+
+    /* Row rank colours */
+    .r-top td { background: rgba(120,255,80,0.1); }
+    .r-top:hover td { background: rgba(143,233,0,0.35) !important; }
+    .r-high td { background: rgba(75,122,0,0.07); }
+    .r-high:hover td { background: rgba(75,122,0,0.14) !important; }
+    .r-ret td { background: rgba(221,0,4,0.08); }
+    .r-ret:hover td { background: rgba(221,0,4,0.15) !important; }
+
+    .pname { font-weight: 500; font-size: 12px; color: #1f1f1f; }
+    .ei { font-size: 9px; margin-right: 6px; color: rgba(31,31,31,0.45); display:inline-block; transition: transform .15s; }
+    .ei.open { transform: rotate(90deg); color: rgba(31,31,31,0.62); }
+    .nb { font-variant-numeric: tabular-nums; }
+    .ret-val { color: #dd0004; }
+    .net-pos { color: #4b7a00; font-weight: 600; }
+    .net-neg { color: #dd0004; font-weight: 600; }
+    .rank { display: inline-block; font-size: 9px; font-weight: 700;
+      background: rgba(31,31,31,0.09); border-radius: 4px;
+      padding: 1px 5px; margin-right: 7px; color: rgba(31,31,31,0.45); }
+    .loading { text-align:center; padding:60px; color:rgba(31,31,31,0.45); font-size:13px; }
+    .no-data { text-align:center; padding:40px; color:rgba(31,31,31,0.45); font-size:13px; }
+  </style>
+</head>
+<body>
+<div class="gradient-bg"><div class="b1"></div><div class="b2"></div><div class="b3"></div></div>
+<div class="vignette"></div>
+<div class="grain"></div>
+
+<header class="header">
+  <a class="logo" href="/">Chernim Cherno</a>
+  <nav class="nav">
+    <a href="/">Data</a>
+    <a href="/analytics">Остатки</a>
+    <a href="/turnover">Оборачиваемость</a>
+    <a href="/order">Заказ</a>
+    <a href="/forecast">Прогноз</a>
+    <a href="/revenue">Оборот</a>
+    <a href="/transfers">Перемещения</a>
+    <a href="/sales" class="active">Продажи</a>
+    <a href="/yandex">Яндекс</a>
+  </nav>
+</header>
+
+<!-- Month selector -->
+<div class="month-bar" id="monthBar">
+  <div class="loading" style="padding:4px 0; font-size:12px;">Загрузка…</div>
+</div>
+
+<!-- Summary cards -->
+<div class="summary" id="summary" style="display:none;">
+  <div class="scard green">
+    <div class="scard-label">Продажи</div>
+    <div class="scard-value nb" id="sumSales">—</div>
+    <div class="scard-sub" id="sumSalesQty">—</div>
+  </div>
+  <div class="scard red">
+    <div class="scard-label">Возвраты</div>
+    <div class="scard-value nb" id="sumReturns">—</div>
+    <div class="scard-sub" id="sumReturnsQty">—</div>
+  </div>
+  <div class="scard gold">
+    <div class="scard-label">Итого принесло</div>
+    <div class="scard-value nb" id="sumNet">—</div>
+    <div class="scard-sub" id="sumItems">—</div>
+  </div>
+</div>
+
+<div class="main">
+  <div class="table-outer">
+    <table id="tbl">
+      <thead>
+        <tr>
+          <th>Позиция</th>
+          <th>Кол-во</th>
+          <th>Продажи ₽</th>
+          <th>Возвраты ₽</th>
+          <th>Итого ₽</th>
+        </tr>
+      </thead>
+      <tbody id="tbody">
+        <tr><td colspan="5" class="loading">Загрузка…</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+const MONTHS_RU = ['Январь','Февраль','Март','Апрель','Май','Июнь',
+                   'Июль','Август','Сентябрь','Октябрь','Ноябрь','Декабрь'];
+
+function fmt(n) {
+  if (!n && n !== 0) return '—';
+  return Math.round(n).toLocaleString('ru-RU') + ' ₽';
+}
+function fmtNum(n) {
+  if (!n && n !== 0) return '—';
+  return Math.round(n).toLocaleString('ru-RU');
+}
+function monthLabel(m) {
+  // m = "2026-06"
+  const [y, mo] = m.split('-');
+  return MONTHS_RU[parseInt(mo,10)-1] + ' ' + y;
+}
+
+let currentData = null;
+let expandedBases = new Set();
+
+async function loadMonth(month) {
+  const tbody = document.getElementById('tbody');
+  tbody.innerHTML = '<tr><td colspan="5" class="loading">Загрузка…</td></tr>';
+  document.getElementById('summary').style.display = 'none';
+
+  const resp = await fetch('/api/sales-monthly?month=' + month, {cache:'no-store'});
+  const data = await resp.json();
+  currentData = data;
+
+  // Update month buttons
+  document.querySelectorAll('.month-btn').forEach(b => {
+    b.classList.toggle('active', b.dataset.month === data.month);
+  });
+
+  // Summary
+  const s = data.summary;
+  document.getElementById('sumSales').textContent = fmt(s.sales);
+  document.getElementById('sumSalesQty').textContent = fmtNum(s.sales_qty) + ' шт.';
+  document.getElementById('sumReturns').textContent = fmt(s.returns);
+  document.getElementById('sumReturnsQty').textContent = fmtNum(s.returns_qty) + ' шт.';
+  document.getElementById('sumNet').textContent = fmt(s.net);
+  document.getElementById('sumItems').textContent = data.items.length + ' позиций';
+  document.getElementById('summary').style.display = 'flex';
+
+  renderTable(data.items);
+}
+
+function renderTable(items) {
+  const tbody = document.getElementById('tbody');
+  if (!items.length) {
+    tbody.innerHTML = '<tr><td colspan="5" class="no-data">Нет данных за этот месяц</td></tr>';
+    return;
+  }
+
+  const rows = [];
+  items.forEach((item, idx) => {
+    const rank = idx + 1;
+    const hasSizes = item.sizes && item.sizes.length > 0;
+    const netClass = item.net >= 0 ? 'net-pos' : 'net-neg';
+    // Row colour
+    let rowClass = 'pr';
+    if (rank <= 3) rowClass += ' r-top';
+    else if (rank <= Math.ceil(items.length * 0.3)) rowClass += ' r-high';
+    else if (item.net < 0) rowClass += ' r-ret';
+
+    const expandIcon = hasSizes ? `<span class="ei" id="ei-${idx}">▶</span>` : '';
+    const wasExpanded = expandedBases.has(item.base);
+
+    rows.push(`<tr class="${rowClass}" data-idx="${idx}" onclick="toggleRow(${idx})">
+      <td><span class="rank">${rank}</span>${expandIcon}<span class="pname">${esc(item.base)}</span></td>
+      <td class="nb">${fmtNum(item.sale_qty)}</td>
+      <td class="nb">${fmt(item.sale_rev)}</td>
+      <td class="nb ret-val">${item.ret_rev > 0 ? '−' + fmt(item.ret_rev) : '—'}</td>
+      <td class="nb ${netClass}">${fmt(item.net)}</td>
+    </tr>`);
+
+    if (hasSizes) {
+      item.sizes.forEach(sz => {
+        const szNetClass = sz.net >= 0 ? 'net-pos' : 'net-neg';
+        rows.push(`<tr class="sr${wasExpanded ? ' open' : ''}" data-parent="${idx}">
+          <td>${esc(sz.name)}</td>
+          <td class="nb">${fmtNum(sz.sale_qty)}</td>
+          <td class="nb">${fmt(sz.sale_rev)}</td>
+          <td class="nb ret-val">${sz.ret_rev > 0 ? '−' + fmt(sz.ret_rev) : '—'}</td>
+          <td class="nb ${szNetClass}">${fmt(sz.net)}</td>
+        </tr>`);
+      });
+    }
+  });
+
+  tbody.innerHTML = rows.join('');
+
+  // Restore expanded state icons
+  expandedBases.forEach(base => {
+    const item = items.find(i => i.base === base);
+    if (!item) return;
+    const idx = items.indexOf(item);
+    const ei = document.getElementById('ei-' + idx);
+    if (ei) ei.classList.add('open');
+  });
+}
+
+function toggleRow(idx) {
+  const item = currentData?.items[idx];
+  if (!item || !item.sizes?.length) return;
+
+  const subRows = document.querySelectorAll(`tr.sr[data-parent="${idx}"]`);
+  const ei = document.getElementById('ei-' + idx);
+  const isOpen = subRows[0]?.classList.contains('open');
+
+  subRows.forEach(r => r.classList.toggle('open', !isOpen));
+  ei?.classList.toggle('open', !isOpen);
+
+  if (isOpen) expandedBases.delete(item.base);
+  else expandedBases.add(item.base);
+}
+
+function esc(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+async function init() {
+  const resp = await fetch('/api/sales-monthly', {cache:'no-store'});
+  const data = await resp.json();
+
+  // Build month buttons
+  const bar = document.getElementById('monthBar');
+  if (!data.months || !data.months.length) {
+    bar.innerHTML = '<span style="color:rgba(31,31,31,0.45);font-size:12px;">Нет данных о продажах</span>';
+    return;
+  }
+
+  bar.innerHTML = data.months.map(m =>
+    `<button class="month-btn${m === data.month ? ' active' : ''}" data-month="${m}" onclick="loadMonth('${m}')">${monthLabel(m)}</button>`
+  ).join('');
+
+  currentData = data;
+
+  // Summary
+  const s = data.summary;
+  document.getElementById('sumSales').textContent = fmt(s.sales);
+  document.getElementById('sumSalesQty').textContent = fmtNum(s.sales_qty) + ' шт.';
+  document.getElementById('sumReturns').textContent = fmt(s.returns);
+  document.getElementById('sumReturnsQty').textContent = fmtNum(s.returns_qty) + ' шт.';
+  document.getElementById('sumNet').textContent = fmt(s.net);
+  document.getElementById('sumItems').textContent = data.items.length + ' позиций';
+  document.getElementById('summary').style.display = 'flex';
+
+  renderTable(data.items);
+}
+
+init();
+</script>
+</body>
+</html>

@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+  <title>Chernim Cherno · Оборот</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0 }
+    body { font-family: Helvetica, 'Helvetica Neue', Arial, sans-serif; min-height: 100vh; background: #f3e9e0; color:#1f1f1f; }
+    .gradient-bg { position: fixed; inset: 0; z-index: 0; overflow: hidden; background: #f3e9e0; }
+    .gradient-bg::before, .gradient-bg::after, .b1, .b2, .b3 {
+      position: absolute; border-radius: 50%; filter: blur(90px); opacity: 0.9; }
+    .gradient-bg::before { content: ''; width: 70vw; height: 70vw;
+      background: radial-gradient(circle, #efe5db, transparent 70%);
+      top: -20%; left: -10%; animation: blob1 11s ease-in-out infinite alternate; }
+    .gradient-bg::after { content: ''; width: 60vw; height: 60vw;
+      background: radial-gradient(circle, #e2d8cf, transparent 70%);
+      bottom: -15%; right: -10%; animation: blob2 14s ease-in-out infinite alternate; }
+    .b1 { width: 55vw; height: 55vw; background: radial-gradient(circle, #d3c9c2, transparent 70%);
+      top: 30%; left: 30%; animation: blob3 9s ease-in-out infinite alternate; }
+    .b2 { width: 45vw; height: 45vw; background: radial-gradient(circle, #c1b8b3, transparent 70%);
+      top: -10%; right: 10%; animation: blob4 13s ease-in-out infinite alternate; }
+    .b3 { width: 50vw; height: 50vw; background: radial-gradient(circle, #aba3a0, transparent 70%);
+      bottom: 10%; left: 20%; animation: blob5 16s ease-in-out infinite alternate; }
+    .vignette { position: fixed; inset: 0; z-index: 1; pointer-events: none;
+      background: radial-gradient(ellipse at center, transparent 40%, rgba(171,163,160,0.35) 100%); }
+    .grain { position: fixed; inset: 0; z-index: 2; pointer-events: none; }
+    .grain::before { content: ''; position: absolute; inset: -50%; width: 200%; height: 200%;
+      background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 512 512' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='grain'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.75' numOctaves='4' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23grain)'/%3E%3C/svg%3E");
+      background-size: 200px 200px; opacity: 0.12; mix-blend-mode: overlay;
+      animation: grain-shift 0.15s steps(1) infinite; }
+    @keyframes grain-shift {
+      0%{transform:translate(0,0)} 10%{transform:translate(-3%,-4%)} 20%{transform:translate(4%,2%)}
+      30%{transform:translate(-2%,5%)} 40%{transform:translate(5%,-3%)} 50%{transform:translate(-4%,4%)}
+      60%{transform:translate(3%,-2%)} 70%{transform:translate(-5%,3%)} 80%{transform:translate(2%,-5%)}
+      90%{transform:translate(-3%,2%)} 100%{transform:translate(4%,-4%)} }
+    @keyframes blob1 { 0%{transform:translate(0,0) scale(1)} 33%{transform:translate(8vw,5vh) scale(1.1)} 66%{transform:translate(-5vw,10vh) scale(0.95)} 100%{transform:translate(10vw,-8vh) scale(1.05)} }
+    @keyframes blob2 { 0%{transform:translate(0,0) scale(1)} 33%{transform:translate(-10vw,-6vh) scale(1.08)} 66%{transform:translate(6vw,-12vh) scale(1.12)} 100%{transform:translate(-8vw,5vh) scale(0.92)} }
+    @keyframes blob3 { 0%{transform:translate(0,0) scale(1)} 50%{transform:translate(-12vw,8vh) scale(1.15)} 100%{transform:translate(8vw,-10vh) scale(0.9)} }
+    @keyframes blob4 { 0%{transform:translate(0,0) scale(0.9)} 50%{transform:translate(10vw,12vh) scale(1.1)} 100%{transform:translate(-6vw,6vh) scale(1)} }
+    @keyframes blob5 { 0%{transform:translate(0,0) scale(1.1)} 50%{transform:translate(14vw,-8vh) scale(0.9)} 100%{transform:translate(-10vw,-12vh) scale(1.05)} }
+    .header { position: sticky; top: 0; z-index: 200; padding: 0 28px; height: 56px;
+      display: flex; align-items: center; justify-content: space-between; }
+    .logo { text-decoration: none; font-size: 15px; font-weight: 400; letter-spacing: 0.12em; color: #1f1f1f; }
+    .nav { display: flex; gap: 20px }
+    .nav a { font-size: 13px; font-weight: 400; letter-spacing: 0.05em;
+      color: rgba(31,31,31,0.45); text-decoration: none; transition: color .2s; }
+    .nav a:hover { color: #434446 }
+    .nav a.active { color: #1f1f1f; font-weight: 500; }
+    .main { padding: 20px 28px; max-width: 1500px; margin: 0 auto; position: relative; z-index: 3; }
+    .toolbar { display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:16px }
+    .preset { font-size:12px; font-weight:500; padding:6px 14px; border-radius:20px;
+      border:1px solid rgba(31,31,31,0.09); background:rgba(255,255,255,0.55);
+      color:#434446; cursor:pointer; transition:all .15s }
+    .preset:hover { background:rgba(31,31,31,0.09) }
+    .preset.active { background:rgba(31,31,31,0.16); color:#1f1f1f; border-color:rgba(31,31,31,0.45) }
+    .dinp { padding:6px 10px; border-radius:9px; font-size:12px;
+      border:1px solid rgba(31,31,31,0.2); background:#fff; outline:none }
+    .cards { display:grid; grid-template-columns:repeat(4,1fr); gap:12px; margin-bottom:18px }
+    .card { background:rgba(255,255,255,0.6); backdrop-filter:blur(10px);
+      border:1px solid rgba(31,31,31,0.08); border-radius:12px; padding:14px 18px }
+    .card .l { font-size:10px; font-weight:600; letter-spacing:.07em; text-transform:uppercase;
+      color:rgba(31,31,31,0.5); margin-bottom:6px }
+    .card .v { font-size:24px; font-weight:700 }
+    .card .s { font-size:11px; color:rgba(31,31,31,0.5); margin-top:4px }
+    .panel { background:rgba(255,255,255,0.6); backdrop-filter:blur(12px);
+      border:1px solid rgba(31,31,31,0.08); border-radius:14px; padding:18px 22px; margin-bottom:18px }
+    .ptitle { font-size:12px; font-weight:600; letter-spacing:.07em; text-transform:uppercase;
+      color:#434446; margin-bottom:12px }
+    .catrow { display:flex; align-items:center; gap:12px; margin-bottom:8px }
+    .catname { width:150px; font-size:12px; font-weight:600; flex-shrink:0 }
+    .catbar-wrap { flex:1; height:26px; background:rgba(31,31,31,0.05); border-radius:6px; position:relative; overflow:hidden }
+    .catbar { height:100%; border-radius:6px; transition:width .4s }
+    .catval { position:absolute; right:10px; top:0; height:100%; display:flex; align-items:center;
+      font-size:11px; font-weight:700; color:#1f1f1f }
+    .catmeta { width:150px; font-size:11px; color:rgba(31,31,31,0.55); flex-shrink:0; text-align:right }
+    #mchart { width:100%; height:320px; display:block }
+    .ctip { position:fixed; pointer-events:none; display:none; background:#1f1f1f; color:#f3e9e0;
+      font-size:11px; padding:7px 11px; border-radius:8px; z-index:100; white-space:pre; line-height:1.5 }
+    table { width:100%; border-collapse:collapse; font-size:12.5px }
+    th { text-align:left; padding:8px 10px; font-size:10px; font-weight:500; text-transform:uppercase;
+      letter-spacing:.06em; color:rgba(31,31,31,0.55); border-bottom:1px solid rgba(31,31,31,0.1) }
+    th.r, td.r { text-align:right }
+    td { padding:7px 10px; border-bottom:1px solid rgba(31,31,31,0.06) }
+    .minibar { display:inline-block; height:8px; border-radius:4px; background:rgba(76,187,23,0.7); vertical-align:middle; margin-right:8px }
+    .loading { text-align:center; padding:60px; color:rgba(31,31,31,0.45); font-size:13px }
+  </style>
+</head>
+<body>
+<div class="gradient-bg"><div class="b1"></div><div class="b2"></div><div class="b3"></div></div>
+<div class="vignette"></div><div class="grain"></div>
+
+<div class="header">
+  <a class="logo" href="/analytics">Chernim&nbsp;Cherno</a>
+  <nav class="nav">
+    <a href="/analytics">Остатки</a>
+    <a href="/turnover">Оборачиваемость</a>
+    <a href="/order">Заказ</a>
+    <a href="/sizes">Размеры</a>
+    <a href="/budget">Бюджет</a>
+    <a href="/forecast">Прогноз</a>
+    <a href="/revenue" class="active">Оборот</a>
+    <a href="/transfers">Перемещения</a>
+    <a href="/money">Деньги</a> <a href="/paris">Париж</a>
+    <a href="/yandex">Яндекс</a>
+  </nav>
+</div>
+
+<div class="main">
+  <div class="toolbar">
+    <button class="preset" data-days="30">30 дней</button>
+    <button class="preset active" data-days="90">90 дней</button>
+    <button class="preset" data-days="365">Год</button>
+    <button class="preset" data-days="all">Всё время</button>
+    <span style="font-size:11px;color:rgba(31,31,31,0.45);margin-left:8px">или свой период:</span>
+    <input type="date" class="dinp" id="d-from">
+    <input type="date" class="dinp" id="d-to">
+    <button class="preset" id="applyCustom">Показать</button>
+    <input class="dinp" id="search" placeholder="Поиск позиции..." style="margin-left:auto;width:240px">
+  </div>
+
+  <div class="cards">
+    <div class="card"><div class="l">Выручка за период</div><div class="v" id="c-rev">—</div><div class="s" id="c-rev-s"></div></div>
+    <div class="card"><div class="l">Продано</div><div class="v" id="c-qty">—</div><div class="s" id="c-qty-s"></div></div>
+    <div class="card"><div class="l">Средний чек позиции</div><div class="v" id="c-avg">—</div><div class="s">выручка / штуки</div></div>
+    <div class="card"><div class="l">Лучшая категория</div><div class="v" id="c-best" style="font-size:17px">—</div><div class="s" id="c-best-s"></div></div>
+  </div>
+
+  <div class="panel">
+    <div class="ptitle" id="cat-title">Категории за период</div>
+    <div id="catbars"><div class="loading">Загружаю...</div></div>
+  </div>
+
+  <div class="panel">
+    <div class="ptitle">Оборот по месяцам · категории цветом</div>
+    <canvas id="mchart"></canvas>
+    <div id="legend" style="display:flex;gap:14px;flex-wrap:wrap;margin-top:10px"></div>
+  </div>
+
+  <div class="panel">
+    <div class="ptitle" id="top-title">Топ-15 позиций за период</div>
+    <table><thead><tr><th style="width:30px">#</th><th>Название</th><th>Категория</th><th class="r">Шт</th><th class="r">Выручка</th><th class="r">Доля</th></tr></thead>
+    <tbody id="toptb"></tbody></table>
+  </div>
+</div>
+<div class="ctip" id="ctip"></div>
+
+<script>
+function mw(name,q){ if(!q) return true; const nl=name.toLowerCase(); return q.split(/\s+/).every(w=>nl.includes(w)); }
+const CATEGORIES = {
+  "Верхняя одежда": ["бомбер","куртка","тренч","пальто","ветровка","олимпийка","комбинезон","фрак","меховой пиджак"],
+  "Костюмы": ["пиджак","жилет-галстук","корсетный жилет"],
+  "Брюки": ["брюки","спортивные брюки"],
+  "Рубашки": ["рубашка","рубашка-оригами"],
+  "Свитера": ["свитер"],
+  "Худи и свитшоты": ["худи","свитшот"],
+  "Шорты": ["шорты"],
+  "Майки": ["майка","топ","лонгслив","кроп кольчуга","манишка кольчуга","майка кольчуга","укороченная"],
+  "Футболки": ["футболка"],
+  "Джинсы": ["джинсы"],
+  "Сумки": ["сумка","клатч"],
+  "Аксессуары": ["ремень","шарф","шапка","меховой ворот","воротник","очки"],
+  "Украшения": ["браслет","кольцо","подвеска","кафф","цепь","цепочка","сет из","серьга","серёжка","пирсинг"],
+  "Нижнее белье": ["боксер","боксёр","брифы","комплект нижнег","трусы","носки"],
+  "Прочее": []
+};
+const CAT_ORDER = ["Верхняя одежда","Костюмы","Брюки","Джинсы","Рубашки","Свитера","Худи и свитшоты","Шорты","Майки","Футболки","Сумки","Аксессуары","Украшения","Нижнее белье","Прочее"];
+const NON_MERCH = ["сертификат","кошелек","sample","сэмпл","упаковоч","пакет","коробк","вешалк","бирк","кофр","наклейк","кейс для","чехол для","нитк","бумага тишью"];
+const CAT_COLORS = {
+  "Верхняя одежда":"#4a7c59","Костюмы":"#2f4858","Брюки":"#6b8e23","Джинсы":"#33658a",
+  "Рубашки":"#86bbd8","Свитера":"#f6ae2d","Худи и свитшоты":"#f26419","Шорты":"#c9a227",
+  "Майки":"#9c89b8","Футболки":"#b56576","Сумки":"#6d597a","Аксессуары":"#355070",
+  "Украшения":"#e56b6f","Нижнее белье":"#7a9e7e","Прочее":"#8d8d8d"
+};
+function getCat(n){
+  const nl=n.toLowerCase();
+  if(NON_MERCH.some(k=>nl.includes(k))) return null;
+  for(const [c,kws] of Object.entries(CATEGORIES)){
+    if(c==="Прочее") continue;
+    if(kws.some(k=>nl.includes(k))) return c;
+  }
+  return "Прочее";
+}
+function fmt(n){ return Math.round(n||0).toLocaleString("ru-RU"); }
+function fmtM(n){
+  n=n||0;
+  if(Math.abs(n)>=1e6) return (n/1e6).toLocaleString("ru-RU",{maximumFractionDigits:2})+" млн ₽";
+  if(Math.abs(n)>=1e3) return Math.round(n/1e3).toLocaleString("ru-RU")+" тыс ₽";
+  return Math.round(n).toLocaleString("ru-RU")+" ₽";
+}
+
+let SBM=null;   // {base: {"2026-07":[q,r]}}
+let curFrom="", curTo="";
+
+async function loadMonthly(){
+  SBM=await (await fetch("/api/sales-by-month")).json();
+}
+
+function periodLabel(){
+  if(!curFrom&&!curTo) return "за всё время";
+  const f=d=>d?new Date(d).toLocaleDateString("ru-RU",{day:"numeric",month:"short",year:"2-digit"}):"…";
+  return f(curFrom)+" — "+f(curTo);
+}
+
+async function applyPeriod(from,to){
+  curFrom=from; curTo=to;
+  const url="/api/sales-range?date_from="+(from||"")+"&date_to="+(to||"");
+  const data=await (await fetch(url)).json();
+  // агрегируем по категориям
+  const cats={}; let totQ=0, totR=0;
+  const items=[];
+  for(const [base,v] of Object.entries(data)){
+    const cat=getCat(base);
+    if(!cat) continue;
+    const [q,r]=v;
+    if(r===0&&q===0) continue;
+    const c=cats[cat]||(cats[cat]={q:0,r:0,n:0});
+    c.q+=q; c.r+=r; c.n++;
+    totQ+=q; totR+=r;
+    items.push({base,cat,q,r});
+  }
+  document.getElementById("c-rev").textContent=fmtM(totR);
+  document.getElementById("c-rev-s").textContent=periodLabel();
+  document.getElementById("c-qty").textContent=fmt(totQ)+" шт";
+  document.getElementById("c-qty-s").textContent=items.length+" позиций продавалось";
+  document.getElementById("c-avg").textContent=totQ>0?fmt(totR/totQ)+" ₽":"—";
+  const catArr=Object.entries(cats).sort((a,b)=>b[1].r-a[1].r);
+  if(catArr.length){
+    document.getElementById("c-best").textContent=catArr[0][0];
+    document.getElementById("c-best-s").textContent=fmtM(catArr[0][1].r)+" · "+Math.round(catArr[0][1].r/totR*100)+"% оборота";
+  }
+  // бары категорий
+  document.getElementById("cat-title").textContent="Категории · "+periodLabel();
+  const maxR=catArr.length?catArr[0][1].r:1;
+  document.getElementById("catbars").innerHTML=catArr.map(([cat,c])=>{
+    const share=totR>0?c.r/totR*100:0;
+    return `<div class="catrow">
+      <div class="catname">${cat}</div>
+      <div class="catbar-wrap"><div class="catbar" style="width:${Math.max(1,c.r/maxR*100)}%;background:${CAT_COLORS[cat]||'#888'}cc"></div>
+        <div class="catval">${fmtM(c.r)}</div></div>
+      <div class="catmeta">${fmt(c.q)} шт · ${share.toFixed(1)}%</div>
+    </div>`;
+  }).join("")||'<div class="loading">Нет продаж за период</div>';
+  // топ позиций
+  LAST_ITEMS=items.sort((a,b)=>b.r-a.r);
+  LAST_TOTR=totR;
+  renderTop();
+}
+
+let LAST_ITEMS=[], LAST_TOTR=0;
+function renderTop(){
+  const q=(document.getElementById("search").value||"").toLowerCase();
+  const list=q?LAST_ITEMS.filter(it=>mw(it.base,q)).slice(0,50):LAST_ITEMS.slice(0,15);
+  document.getElementById("top-title").textContent=(q?"Найдено: "+list.length+" · ":"Топ-15 позиций · ")+periodLabel();
+  const maxTop=list.length?Math.max(...list.map(x=>x.r)):1;
+  document.getElementById("toptb").innerHTML=list.map((it,i)=>
+    `<tr><td>${i+1}</td><td>${it.base}</td>
+     <td><span style="font-size:11px;color:${CAT_COLORS[it.cat]||'#888'};font-weight:600">${it.cat}</span></td>
+     <td class="r">${fmt(it.q)}</td>
+     <td class="r"><span class="minibar" style="width:${Math.max(2,it.r/maxTop*80)}px;background:${CAT_COLORS[it.cat]||'#888'}b0"></span><b>${fmt(it.r)} ₽</b></td>
+     <td class="r">${LAST_TOTR>0?(it.r/LAST_TOTR*100).toFixed(1):0}%</td></tr>`).join("")
+    ||'<tr><td colspan="6" class="loading">Ничего не найдено</td></tr>';
+}
+document.addEventListener("input",(e)=>{ if(e.target&&e.target.id==="search") renderTop(); });
+
+// ── месячный stacked-бар ──
+let mchartData=null;
+function drawMonthly(){
+  if(!SBM) return;
+  // месяцы: последние 18
+  const monthsSet=new Set();
+  for(const d of Object.values(SBM)) for(const m of Object.keys(d)) monthsSet.add(m);
+  const months=[...monthsSet].sort().slice(-18);
+  // {month: {cat: rev}}
+  const data={};
+  for(const m of months) data[m]={};
+  for(const [base,d] of Object.entries(SBM)){
+    const cat=getCat(base);
+    if(!cat) continue;
+    for(const [m,v] of Object.entries(d)){
+      if(!data[m]) continue;
+      data[m][cat]=(data[m][cat]||0)+v[1];
+    }
+  }
+  mchartData={months,data};
+  const cv=document.getElementById("mchart");
+  const W=cv.offsetWidth||1100, H=320;
+  cv.width=W*devicePixelRatio; cv.height=H*devicePixelRatio;
+  cv.style.height=H+"px";
+  const ctx=cv.getContext("2d");
+  ctx.scale(devicePixelRatio,devicePixelRatio);
+  ctx.clearRect(0,0,W,H);
+  const padL=8,padR=70,padT=16,padB=34;
+  const totals=months.map(m=>Object.values(data[m]).reduce((a,b)=>a+Math.max(0,b),0));
+  const maxV=Math.max(...totals,1)*1.05;
+  const bw=(W-padL-padR)/months.length;
+  const y=v=>H-padB-(v/maxV)*(H-padT-padB);
+  // сетка
+  ctx.font="10px Helvetica,Arial"; ctx.fillStyle="rgba(31,31,31,0.45)";
+  for(let k=0;k<=4;k++){
+    const v=maxV*k/4, yy=y(v);
+    ctx.strokeStyle="rgba(31,31,31,0.07)"; ctx.beginPath(); ctx.moveTo(padL,yy); ctx.lineTo(W-padR,yy); ctx.stroke();
+    ctx.fillText(fmtM(v),W-padR+6,yy+4);
+  }
+  // бары
+  months.forEach((m,i)=>{
+    let acc=0;
+    const x=padL+i*bw+bw*0.14, w=bw*0.72;
+    for(const cat of CAT_ORDER){
+      const v=Math.max(0,data[m][cat]||0);
+      if(!v) continue;
+      const y1=y(acc+v), y2=y(acc);
+      ctx.fillStyle=CAT_COLORS[cat]||"#888";
+      ctx.fillRect(x,y1,w,Math.max(1,y2-y1));
+      acc+=v;
+    }
+    // подпись месяца
+    const [yy,mm]=m.split("-");
+    ctx.fillStyle="rgba(31,31,31,0.5)"; ctx.font="9px Helvetica,Arial";
+    ctx.save(); ctx.translate(x+w/2,H-6); ctx.textAlign="center";
+    ctx.fillText(["янв","фев","мар","апр","май","июн","июл","авг","сен","окт","ноя","дек"][+mm-1]+" "+yy.slice(2),0,0);
+    ctx.restore();
+    // тотал сверху
+    ctx.fillStyle="rgba(31,31,31,0.7)"; ctx.font="bold 9px Helvetica,Arial"; ctx.textAlign="center";
+    ctx.fillText((totals[i]/1e6).toFixed(1),x+w/2,y(totals[i])-4);
+    ctx.textAlign="left";
+  });
+  // легенда
+  const usedCats=CAT_ORDER.filter(c=>months.some(m=>(data[m][c]||0)>0));
+  document.getElementById("legend").innerHTML=usedCats.map(c=>
+    `<span style="font-size:11px;display:flex;align-items:center;gap:5px">
+     <span style="width:10px;height:10px;border-radius:3px;background:${CAT_COLORS[c]};display:inline-block"></span>${c}</span>`).join("");
+  // ховер
+  cv.onmousemove=(ev)=>{
+    const r=cv.getBoundingClientRect();
+    const x=ev.clientX-r.left;
+    const i=Math.floor((x-padL)/bw);
+    const tip=document.getElementById("ctip");
+    if(i<0||i>=months.length){ tip.style.display="none"; return; }
+    const m=months[i];
+    const rows=CAT_ORDER.filter(c=>(data[m][c]||0)>0).map(c=>c+": "+fmtM(data[m][c]));
+    tip.textContent=m+" · "+fmtM(totals[i])+"\n"+rows.join("\n");
+    tip.style.display="block";
+    tip.style.left=(ev.clientX+14)+"px";
+    tip.style.top=(ev.clientY+10)+"px";
+  };
+  cv.onmouseleave=()=>{ document.getElementById("ctip").style.display="none"; };
+}
+
+// ── пресеты ──
+function setPreset(days,btn){
+  document.querySelectorAll(".preset").forEach(b=>b.classList.remove("active"));
+  if(btn) btn.classList.add("active");
+  if(days==="all"){ applyPeriod("",""); return; }
+  const to=new Date().toISOString().slice(0,10);
+  const from=new Date(Date.now()-days*86400000).toISOString().slice(0,10);
+  document.getElementById("d-from").value=from;
+  document.getElementById("d-to").value=to;
+  applyPeriod(from,to);
+}
+document.querySelectorAll(".preset[data-days]").forEach(b=>{
+  b.addEventListener("click",()=>setPreset(b.dataset.days==="all"?"all":+b.dataset.days,b));
+});
+document.getElementById("applyCustom").addEventListener("click",()=>{
+  document.querySelectorAll(".preset").forEach(b=>b.classList.remove("active"));
+  document.getElementById("applyCustom").classList.add("active");
+  applyPeriod(document.getElementById("d-from").value,document.getElementById("d-to").value);
+});
+window.addEventListener("resize",()=>drawMonthly());
+
+(async function(){
+  setPreset(90,document.querySelector('.preset[data-days="90"]'));
+  await loadMonthly();
+  drawMonthly();
+})();
+</script>
+</body>
+</html>

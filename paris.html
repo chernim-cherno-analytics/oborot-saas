@@ -1,0 +1,669 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+  <title>Chernim Cherno · Париж</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0 }
+    body { font-family: Helvetica, 'Helvetica Neue', Arial, sans-serif; min-height: 100vh; background: #f3e9e0; color:#1f1f1f; }
+    .gradient-bg { position: fixed; inset: 0; z-index: 0; overflow: hidden; background: #f3e9e0; }
+    .gradient-bg::before, .gradient-bg::after, .b1, .b2, .b3 {
+      position: absolute; border-radius: 50%; filter: blur(90px); opacity: 0.9; }
+    .gradient-bg::before { content: ''; width: 70vw; height: 70vw;
+      background: radial-gradient(circle, #efe5db, transparent 70%);
+      top: -20%; left: -10%; animation: blob1 11s ease-in-out infinite alternate; }
+    .gradient-bg::after { content: ''; width: 60vw; height: 60vw;
+      background: radial-gradient(circle, #e2d8cf, transparent 70%);
+      bottom: -15%; right: -10%; animation: blob2 14s ease-in-out infinite alternate; }
+    .b1 { width: 55vw; height: 55vw; background: radial-gradient(circle, #d3c9c2, transparent 70%);
+      top: 30%; left: 30%; animation: blob3 9s ease-in-out infinite alternate; }
+    .b2 { width: 45vw; height: 45vw; background: radial-gradient(circle, #c1b8b3, transparent 70%);
+      top: -10%; right: 10%; animation: blob4 13s ease-in-out infinite alternate; }
+    .b3 { width: 50vw; height: 50vw; background: radial-gradient(circle, #aba3a0, transparent 70%);
+      bottom: 10%; left: 20%; animation: blob5 16s ease-in-out infinite alternate; }
+    .vignette { position: fixed; inset: 0; z-index: 1; pointer-events: none;
+      background: radial-gradient(ellipse at center, transparent 40%, rgba(171,163,160,0.35) 100%); }
+    .grain { position: fixed; inset: 0; z-index: 2; pointer-events: none; }
+    .grain::before { content: ''; position: absolute; inset: -50%; width: 200%; height: 200%;
+      background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 512 512' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='grain'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.75' numOctaves='4' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23grain)'/%3E%3C/svg%3E");
+      background-size: 200px 200px; opacity: 0.12; mix-blend-mode: overlay;
+      animation: grain-shift 0.15s steps(1) infinite; }
+    @keyframes grain-shift {
+      0%{transform:translate(0,0)} 10%{transform:translate(-3%,-4%)} 20%{transform:translate(4%,2%)}
+      30%{transform:translate(-2%,5%)} 40%{transform:translate(5%,-3%)} 50%{transform:translate(-4%,4%)}
+      60%{transform:translate(3%,-2%)} 70%{transform:translate(-5%,3%)} 80%{transform:translate(2%,-5%)}
+      90%{transform:translate(-3%,2%)} 100%{transform:translate(4%,-4%)} }
+    @keyframes blob1 { 0%{transform:translate(0,0) scale(1)} 33%{transform:translate(8vw,5vh) scale(1.1)} 66%{transform:translate(-5vw,10vh) scale(0.95)} 100%{transform:translate(10vw,-8vh) scale(1.05)} }
+    @keyframes blob2 { 0%{transform:translate(0,0) scale(1)} 33%{transform:translate(-10vw,-6vh) scale(1.08)} 66%{transform:translate(6vw,-12vh) scale(1.12)} 100%{transform:translate(-8vw,5vh) scale(0.92)} }
+    @keyframes blob3 { 0%{transform:translate(0,0) scale(1)} 50%{transform:translate(-12vw,8vh) scale(1.15)} 100%{transform:translate(8vw,-10vh) scale(0.9)} }
+    @keyframes blob4 { 0%{transform:translate(0,0) scale(0.9)} 50%{transform:translate(10vw,12vh) scale(1.1)} 100%{transform:translate(-6vw,6vh) scale(1)} }
+    @keyframes blob5 { 0%{transform:translate(0,0) scale(1.1)} 50%{transform:translate(14vw,-8vh) scale(0.9)} 100%{transform:translate(-10vw,-12vh) scale(1.05)} }
+    .header { position: sticky; top: 0; z-index: 200; padding: 0 28px; height: 56px;
+      display: flex; align-items: center; justify-content: space-between; }
+    .logo { text-decoration: none; font-size: 15px; font-weight: 400; letter-spacing: 0.12em; color: #1f1f1f; }
+    .nav { display: flex; gap: 20px }
+    .nav a { font-size: 13px; font-weight: 400; letter-spacing: 0.05em;
+      color: rgba(31,31,31,0.45); text-decoration: none; transition: color .2s; }
+    .nav a:hover { color: #434446 }
+    .nav a.active { color: #1f1f1f; font-weight: 500; }
+    .main { padding: 20px 28px; max-width: 1500px; margin: 0 auto; position: relative; z-index: 3; }
+
+    .hero { display:flex; align-items:flex-end; gap:14px; flex-wrap:wrap; margin-bottom:16px }
+    .hero h1 { font-size:22px; font-weight:700; letter-spacing:.03em }
+    .hero .sub { font-size:12px; color:rgba(31,31,31,0.5); padding-bottom:3px }
+    .hero .right { margin-left:auto; display:flex; gap:10px; align-items:center }
+    .search { width:280px; padding:8px 14px; border-radius:10px; font-size:13px;
+      border:1px solid rgba(31,31,31,0.16); background:rgba(255,255,255,0.7); outline:none }
+    .search:focus { border-color:rgba(31,31,31,0.45) }
+    .btn { font-size:12px; font-weight:600; padding:9px 18px; border-radius:20px;
+      border:1px solid rgba(31,31,31,0.25); background:#1f1f1f; color:#f3e9e0; cursor:pointer }
+    .btn:hover { background:#3a3a3a }
+
+    .cards { display:grid; grid-template-columns:repeat(4,1fr); gap:12px; margin-bottom:16px }
+    .card { background:rgba(255,255,255,0.6); backdrop-filter:blur(10px);
+      border:1px solid rgba(31,31,31,0.08); border-radius:12px; padding:13px 17px }
+    .card .l { font-size:10px; font-weight:600; letter-spacing:.07em; text-transform:uppercase;
+      color:rgba(31,31,31,0.5); margin-bottom:5px }
+    .card .v { font-size:22px; font-weight:700 }
+    .card .s { font-size:11px; color:rgba(31,31,31,0.5); margin-top:3px }
+    .card.dark { background:#1f1f1f; border-color:#1f1f1f }
+    .card.dark .l { color:rgba(243,233,224,0.55) }
+    .card.dark .v { color:#f3e9e0 }
+    .card.dark .s { color:rgba(243,233,224,0.5) }
+
+    .cat-bar { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:14px }
+    .cat-btn { font-size:12px; font-weight:500; padding:5px 14px; border-radius:20px;
+      border:1px solid rgba(31,31,31,0.09); background:rgba(255,255,255,0.55);
+      color:#434446; cursor:pointer; transition:all .15s }
+    .cat-btn:hover { background:rgba(31,31,31,0.09) }
+    .cat-btn.active { background:rgba(31,31,31,0.16); color:#1f1f1f; border-color:rgba(31,31,31,0.45) }
+    .cat-btn .cnt { font-size:10px; opacity:.6; margin-left:3px }
+    .cat-btn.newcat { border-color:rgba(31,31,31,0.45); font-weight:700 }
+    .cat-btn.newcat.active { background:#1f1f1f; color:#f3e9e0 }
+
+    .table-outer { background:rgba(255,255,255,0.55); backdrop-filter:blur(16px);
+      border:1px solid rgba(31,31,31,0.09); border-radius:12px; overflow:auto;
+      max-height:calc(100vh - 300px) }
+    table { width:100%; border-collapse:collapse; font-size:12.5px }
+    thead th { background:rgba(255,255,255,0.92); padding:10px; text-align:center;
+      font-size:10px; font-weight:500; color:rgba(31,31,31,0.62); letter-spacing:.06em;
+      text-transform:uppercase; position:sticky; top:0; z-index:10;
+      border-bottom:1px solid rgba(31,31,31,0.09) }
+    thead th:first-child { text-align:left; padding-left:16px }
+    thead th .sub { display:block; font-size:9px; font-weight:400; letter-spacing:0; text-transform:none; opacity:.5; margin-top:2px }
+    tbody td { padding:9px 10px; border-bottom:1px solid rgba(31,31,31,0.06);
+      text-align:center; vertical-align:middle }
+    tbody td:first-child { text-align:left; padding-left:16px }
+    tbody tr:hover td { background:rgba(255,255,255,0.55) }
+    tr.cat-row td { background:rgba(31,31,31,0.07); font-weight:700; font-size:11px;
+      letter-spacing:.07em; text-transform:uppercase; padding:8px 16px; text-align:left;
+      color:rgba(31,31,31,0.75) }
+    tr.cat-row:hover td { background:rgba(31,31,31,0.07) }
+    tr.cat-row.newcat td { background:#1f1f1f; color:#f3e9e0 }
+    tr.cat-row.newcat:hover td { background:#1f1f1f }
+    tr.cat-row td .ccnt { font-weight:400; opacity:.55; margin-left:6px }
+
+    .ru-name { font-weight:600; font-size:13px }
+    .en-name { font-size:11px; color:rgba(31,31,31,0.45); display:block; margin-top:2px }
+    .nomap { color:#7a0002 }
+    .new-badge { display:inline-block; vertical-align:2px; margin-left:8px; padding:2px 8px;
+      border-radius:9px; background:#1f1f1f; color:#f3e9e0; font-size:9px; font-weight:700;
+      letter-spacing:.09em; text-transform:uppercase }
+    .warn { color:#7a5a00; font-size:10.5px }
+
+    .szchips { display:flex; gap:5px; flex-wrap:wrap; justify-content:center }
+    .szc { display:inline-flex; flex-direction:column; align-items:center; min-width:36px;
+      padding:3px 8px; border-radius:9px; background:rgba(255,255,255,0.8);
+      border:1px solid rgba(31,31,31,0.1) }
+    .szc .sn { font-size:9px; color:rgba(31,31,31,0.5); text-transform:uppercase; letter-spacing:.03em }
+    .szc .sq { font-size:13px; font-weight:700; font-variant-numeric:tabular-nums }
+    .szc.zero { opacity:.35; background:transparent; border-style:dashed }
+    .szc.dash { border:none; background:none; opacity:.3; font-size:12px; justify-content:center }
+    .tot { font-weight:700; font-size:14px; font-variant-numeric:tabular-nums }
+    .tot.zero { opacity:.25; font-weight:400 }
+
+    .tinwrap { display:flex; gap:6px; flex-wrap:wrap; justify-content:center; align-items:flex-end }
+    .tincell { display:flex; flex-direction:column; align-items:center; gap:2px }
+    .tinlbl { font-size:9px; color:rgba(31,31,31,0.5); text-transform:uppercase; letter-spacing:.03em }
+    .tin { width:50px; padding:5px 4px; text-align:center; font-size:12.5px; font-weight:700;
+      border:1px solid rgba(31,31,31,0.18); border-radius:8px; background:rgba(255,255,255,0.85); outline:none }
+    .tin:focus { border-color:rgba(31,31,31,0.5); background:#fff }
+    .tin.has { background:rgba(143,233,0,0.3); border-color:rgba(60,99,0,0.4) }
+    .tin::-webkit-outer-spin-button, .tin::-webkit-inner-spin-button { -webkit-appearance:none; margin:0 }
+    .tin[type=number] { -moz-appearance:textfield }
+
+    .loading { text-align:center; padding:60px; color:rgba(31,31,31,0.45); font-size:13px }
+    .errbox { background:#fdeaea; border:1px solid #e7b3b3; color:#7a0002; border-radius:12px;
+      padding:14px 18px; font-size:13px; margin-bottom:16px }
+
+    /* новинки РФ, которых ещё нет в Shopify */
+    .runew { background:rgba(255,255,255,0.6); backdrop-filter:blur(6px); border:1px solid rgba(60,99,0,0.3);
+      border-radius:12px; padding:14px 18px; font-size:13px; margin-bottom:16px }
+    .runew b.t { display:block; font-size:14px; margin-bottom:4px }
+    .runew .itm { display:flex; gap:12px; align-items:center; padding:6px 0; flex-wrap:wrap;
+      border-top:1px dashed rgba(31,31,31,0.12) }
+    .runew .itm:first-of-type { border-top:none }
+    .runew .nm { font-weight:600; min-width:240px }
+    .runew .dt { color:rgba(31,31,31,0.5); font-size:12px }
+    .runew .soldout { color:#7a0002; font-size:12px }
+    .runew .hint { color:rgba(31,31,31,0.55); font-size:12px; margin-top:10px }
+    .runew.old summary { cursor:pointer; list-style:none }
+    .runew.old summary::-webkit-details-marker { display:none }
+    .runew.old { border-color:rgba(31,31,31,0.18) }
+    .runew .ocat { margin-top:12px; font-size:11px; font-weight:700; text-transform:uppercase;
+      letter-spacing:.06em; color:rgba(31,31,31,0.55) }
+    .runew .ocat span { opacity:.6; font-weight:400 }
+  </style>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
+</head>
+<body>
+<div class="gradient-bg"><div class="b1"></div><div class="b2"></div><div class="b3"></div></div>
+<div class="vignette"></div><div class="grain"></div>
+
+<div class="header">
+  <a class="logo" href="/analytics">Chernim&nbsp;Cherno</a>
+  <nav class="nav">
+    <a href="/analytics">Остатки</a>
+    <a href="/turnover">Оборачиваемость</a>
+    <a href="/order">Заказ</a>
+    <a href="/sizes">Размеры</a>
+    <a href="/budget">Бюджет</a>
+    <a href="/forecast">Прогноз</a>
+    <a href="/revenue">Оборот</a>
+    <a href="/transfers">Перемещения</a>
+    <a href="/money">Деньги</a>
+    <a href="/paris" class="active">Париж</a>
+    <a href="/yandex">Яндекс</a>
+  </nav>
+</div>
+
+<div class="main">
+  <div class="hero">
+    <h1>Париж</h1>
+    <span class="sub" id="fetched">склад Chernim Cherno France · загрузка…</span>
+    <div class="right">
+      <input class="search" id="search" placeholder="Поиск по названию...">
+      <button class="btn" onclick="downloadShipment()">⬇ Скачать отгрузку</button>
+      <button class="btn" style="background:#efe9e2;color:#1f1f1f" onclick="toggleHistory()">🕘 История</button>
+    </div>
+  </div>
+
+  <div id="history-panel" style="display:none;background:#fff;border:1px solid #e3e3e3;border-radius:12px;padding:16px;margin-bottom:16px"></div>
+  <div id="err"></div>
+  <div class="cards" id="cards"></div>
+  <div id="ru-new"></div>
+  <div class="cat-bar" id="cat-bar"></div>
+
+  <div class="table-outer">
+    <table>
+      <thead><tr>
+        <th style="min-width:260px">Позиция</th>
+        <th>Россия<br><span class="sub">склад Интернет-магазин — с него едет отгрузка</span></th>
+        <th style="width:64px">РФ<br><span class="sub">всего</span></th>
+        <th>Париж<br><span class="sub">по размерам</span></th>
+        <th style="width:64px">Париж<br><span class="sub">всего</span></th>
+        <th style="min-width:220px">Привезти в Париж<br><span class="sub">шт по размерам</span></th>
+      </tr></thead>
+      <tbody id="tbody"><tr><td colspan="6" class="loading">Загрузка остатков из Shopify и МойСклада...</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+const PT_PID = "paris-transfer";
+const NEW_DAYS = 30;   // новинка = появилась в стоке за последние N дней
+const CATEGORIES = {
+  "Верхняя одежда": ["бомбер","куртка","тренч","пальто","ветровка","олимпийка","комбинезон","фрак","меховой пиджак","trench","bomber","jacket","coat"],
+  "Костюмы": ["пиджак","жилет-галстук","корсетный жилет"],
+  "Брюки": ["брюки","спортивные брюки","trousers","pants"],
+  "Рубашки": ["рубашка","рубашка-оригами","shirt"],
+  "Свитера": ["свитер","sweater"],
+  "Худи и свитшоты": ["худи","свитшот","hoodie","sweatshirt","long sleeve"],
+  "Шорты": ["шорты","shorts"],
+  "Майки": ["майка","топ","лонгслив","кроп кольчуга","манишка кольчуга","майка кольчуга","укороченная","tank top","crop top","bib"],
+  "Футболки": ["футболка","t-shirt","jersey"],
+  "Джинсы": ["джинсы","jeans"],
+  "Сумки": ["сумка","клатч","bag","clutch"],
+  "Аксессуары": ["ремень","шарф","шапка","воротник","очки","belt","scarf","sunglasses"],
+  "Украшения": ["браслет","кольцо","подвеска","кафф","цепь","цепочка","сет из","серьга","bracelet","ring","pendant","necklace","cuff","earring"],
+  "Нижнее белье": ["боксер","боксёр","брифы","трусы","носки","boxer","briefs"],
+  "Прочее": []
+};
+const CAT_ORDER = ["Верхняя одежда","Костюмы","Брюки","Джинсы","Рубашки","Свитера","Худи и свитшоты","Шорты","Майки","Футболки","Сумки","Аксессуары","Украшения","Нижнее белье","Прочее"];
+const GROUP_ORDER = ["Новинки"].concat(CAT_ORDER);
+const SIZE_ORDER = ["xxs","xs","xs-s","s","s-m","s / 168-178","s / 178-188","168-178 / s","178-188 / s","m","m-l","m / 168-178","m / 178-188","168-178 / m","178-188 / m","l","l-xl","l / 168-178","l / 178-188","168-178 / l","178-188 / l","xl","xxl","168-178","178-188","168-178 / one size","178-188 / one size","one size",""];
+
+let SHOP = null;        // ответ /api/paris-stock
+let RU = {};            // /api/stocks-bystore .skus
+let INET_IDX = -1;      // индекс склада «Интернет-магазин» в списке складов
+let PT = {};            // "en||size" -> qty
+let NEWSET = new Set(); // русские базовые имена-новинки
+let NEWFIRST = {};      // base -> дата первого появления в стоке
+const NON_MERCH = ["сертификат","кошелек","sample","сэмпл","упаковоч","пакет","коробк","вешалк","бирк","кофр","наклейк","кейс для","чехол для","нитк","бумага тишью"];
+let currentCat = "all";
+let Q = "";
+
+function mw(name,q){ if(!q) return true; const nl=name.toLowerCase(); return q.split(/\s+/).every(w=>nl.includes(w)); }
+function getCat(n){
+  const nl=(n||"").toLowerCase();
+  for(const c of CAT_ORDER){
+    if(c==="Прочее") continue;
+    if(CATEGORIES[c].some(k=>nl.includes(k))) return c;
+  }
+  return "Прочее";
+}
+function szIdx(s){ const i=SIZE_ORDER.indexOf((s||"").toLowerCase()); return i<0?90:i; }
+function ptKey(en,sz){ return en+"||"+sz; }
+
+async function loadAll(){
+  try{
+    const [pRes,bRes,aRes,adRes] = await Promise.all([
+      fetch("/api/paris-stock"),
+      fetch("/api/stocks-bystore"),
+      fetch("/api/adjustments?project_id="+PT_PID),
+      fetch("/api/analytics-data")
+    ]);
+    SHOP = await pRes.json();
+    if(SHOP.error){
+      document.getElementById("err").innerHTML =
+        '<div class="errbox"><b>Shopify недоступен:</b> '+SHOP.error+
+        '<br>Нужно добавить SHOPIFY_TOKEN в Environment на Render (Влад знает).</div>';
+      document.getElementById("tbody").innerHTML="";
+      return;
+    }
+    try{
+      const b=await bRes.json(); RU=b.skus||{};
+      const stores=b.stores||[];
+      INET_IDX=stores.findIndex(s=>String(s).toLowerCase().includes("интернет"));
+    }catch(e){}
+    try{
+      const o=await aRes.json(); PT={};
+      for(const [k,v] of Object.entries(o||{})) if(v>0) PT[k]=v;
+      // миграция старых ключей безразмерных: "EN||" (пустой размер) → "EN||One Size"
+      for(const k of Object.keys(PT)){
+        if(k.endsWith("||")){ const nk=k+"One Size"; PT[nk]=(PT[nk]||0)+PT[k]; delete PT[k]; }
+      }
+    }catch(e){}
+    // новинки: первое появление в истории остатков за последние NEW_DAYS дней
+    try{
+      const a=await adRes.json();
+      const dates=a.dates||[], stock=a.stock||{};
+      if(dates.length){
+        const ref=new Date(dates[dates.length-1]).getTime();
+        for(const [base,dm] of Object.entries(stock)){
+          // пропускаем размерные ключи «Имя (S)», если есть базовое имя
+          const stripped=base.replace(/\s*\([^)]*\)\s*$/,"").trim();
+          if(base!==stripped&&stock[stripped]) continue;
+          let first=null;
+          for(const d of dates){ if((dm[d]||0)>0){ first=d; break; } }
+          if(!first) continue;
+          NEWFIRST[base]=first;   // дата первого появления — для ВСЕХ позиций (нужна и блоку «давно в РФ»)
+          if((ref-new Date(first).getTime())/86400000 <= NEW_DAYS) NEWSET.add(base);
+        }
+      }
+    }catch(e){}
+    document.getElementById("fetched").textContent =
+      "склад Chernim Cherno France · Shopify на "+(SHOP.fetched||"")+" · Россия — склад Интернет-магазин, живой МойСклад";
+    buildCats(); render(); renderCards(); renderRuNew();
+  }catch(e){
+    document.getElementById("tbody").innerHTML =
+      '<tr><td colspan="6" class="loading">Ошибка загрузки: '+e.message+'</td></tr>';
+  }
+}
+
+// ── Новинки РФ, которых ещё нет в Shopify ──
+// Механизм: «новинка» = позиция впервые появилась в ИСТОРИИ ОСТАТКОВ РФ за последние
+// NEW_DAYS дней (надёжнее даты создания карточки в МойСклад — карточку заводят заранее,
+// а тут виден момент, когда вещь реально пришла на склад). Если её русского имени нет
+// среди привязок PARIS_MAP (= товара нет в Shopify) — показываем в отдельном блоке.
+// Остатки — ТОЛЬКО склад Интернет-магазин (с него идёт отгрузка, просьба Влада).
+// Новинку можно сразу ДОБАВИТЬ В ЗАКАЗ отгрузки: инпуты по размерам, хранение в том же
+// paris-transfer под ключом `RU::<русское имя>||<размер>` — префикс RU:: отличает
+// позиции без Shopify-товара; сервер restore строит ключ из en, поэтому en в отгрузке
+// сохраняется как "RU::имя" и «Вернуть в заказ» работает для новинок без правок бэка.
+const RU_PFX="RU::";
+let RUOLD_OPEN=false;   // раскрыт ли блок «давно в РФ» (переживает перерисовку)
+// готовит данные строки: остатки по Интернет-магазину + размеры для инпутов
+function ruNewRow(base){
+  const ri=RU[base]||null;
+  let tot=0, chips="", szs=[];
+  if(ri&&ri.sizes){
+    szs=[...new Set(Object.keys(ri.sizes).map(normOS))].sort((a,b)=>szIdx(a)-szIdx(b));
+    chips=szs.map(s=>{ const q=ruSizeQty(ri,s); tot+=q; return szChip(s,q); }).join("");
+  }
+  const inSizes=new Set(szs);   // + размеры из уже введённых количеств (могли остаться от restore)
+  for(const kk of Object.keys(PT)){
+    if(kk.startsWith(RU_PFX+base+"||")) inSizes.add(kk.slice(kk.lastIndexOf("||")+2)||"One Size");
+  }
+  szs=[...inSizes].sort((a,b)=>szIdx(a)-szIdx(b));
+  if(!szs.length) szs=["One Size"];
+  return {base, first:NEWFIRST[base]||"", tot, chips, szs};
+}
+function ruItmHtml(r){
+  const inputs=r.szs.map(s=>{
+    const k=ptKey(RU_PFX+r.base,s), v=PT[k]||0;
+    return '<span class="tincell"><span class="tinlbl">'+esc(s)+'</span><input class="tin'+(v>0?' has':'')+
+      '" type="number" min="0" step="1" value="'+v+'" onchange="saveTr(this,\''+jse(RU_PFX+r.base)+'\',\''+jse(s)+'\')"></span>';
+  }).join("");
+  return '<div class="itm"><span class="nm">'+esc(r.base)+'</span>'+
+    '<span class="dt">в стоке с '+(r.first?new Date(r.first).toLocaleDateString("ru-RU",{day:"numeric",month:"long",year:"numeric"}):"—")+'</span>'+
+    (r.chips?'<span class="szchips">'+r.chips+'</span><span class="dt">'+r.tot+' шт на Интернет-магазине</span>'
+            :'<span class="soldout">на Интернет-магазине нет</span>')+
+    '<span class="dt" style="margin-left:auto">привезти:</span>'+inputs+
+    '</div>';
+}
+// ── Позиции РФ, которых нет в Shopify: два блока ──
+// 1) «🆕 Новинки» — первое появление в истории остатков РФ ≤ NEW_DAYS дней;
+// 2) «📦 Давно в РФ» — в стоке дольше NEW_DAYS дней, а товара в Shopify так и нет
+//    (свёрнут по умолчанию — позиций ~119; группировка по категориям).
+// Кандидаты: NEWSET ∪ текущий РФ-сток ∪ уже введённые ключи RU:: (чтобы числа
+// не «висели» невидимо). Пословный поиск страницы действует и на оба блока.
+function renderRuNew(){
+  const box=document.getElementById("ru-new");
+  if(!box) return;
+  const linked=new Set(((SHOP&&SHOP.items)||[]).map(it=>it.ru).filter(Boolean));
+  const cands=new Set([...NEWSET,...Object.keys(RU)]);
+  for(const k of Object.keys(PT)){
+    if(k.startsWith(RU_PFX)){ const sep=k.lastIndexOf("||"); if(sep>=0) cands.add(k.slice(RU_PFX.length,sep)); }
+  }
+  const newRows=[], oldRows=[];
+  for(const base of cands){
+    if(linked.has(base)) continue;
+    const nl=base.toLowerCase();
+    if(NON_MERCH.some(k=>nl.includes(k))) continue;
+    if(Q && !mw(base,Q)) continue;
+    (NEWSET.has(base)?newRows:oldRows).push(ruNewRow(base));
+  }
+  newRows.sort((a,b)=>(b.first||"").localeCompare(a.first||""));
+  oldRows.sort((a,b)=>b.tot-a.tot);
+  let html="";
+  if(newRows.length){
+    html+='<div class="runew"><b class="t">🆕 Новинки в РФ — товара ещё нет в Shopify ('+newRows.length+')</b>'+
+      newRows.map(ruItmHtml).join("")+
+      '<div class="hint">Появились на складах РФ за последние '+NEW_DAYS+' дней, привязки к Shopify нет. Количества «привезти» попадают в общий заказ отгрузки (карточка «К отправке» и PDF — блок «Создать в Shopify»). Не забудь при отгрузке создать товар в Shopify (магазин chernim-cherno) и добавить строку «EN название → русское имя» в PARIS_MAP (файл paris.py) — тогда позиция переедет в основную таблицу.</div></div>';
+  }
+  if(oldRows.length){
+    const byCat={};
+    for(const r of oldRows){ const c=getCat(r.base)||"Прочее"; (byCat[c]=byCat[c]||[]).push(r); }
+    let inner="";
+    for(const c of CAT_ORDER){
+      const arr=byCat[c]; if(!arr||!arr.length) continue;
+      inner+='<div class="ocat">'+c+' <span>'+arr.length+'</span></div>'+arr.map(ruItmHtml).join("");
+    }
+    html+='<details class="runew old"'+(RUOLD_OPEN?' open':'')+' ontoggle="RUOLD_OPEN=this.open">'+
+      '<summary><b class="t" style="display:inline">📦 Давно в РФ, а товара в Shopify нет ('+oldRows.length+') — нажми, чтобы развернуть</b></summary>'+
+      inner+
+      '<div class="hint">В РФ-стоке дольше '+NEW_DAYS+' дней, привязки к Shopify нет. Заказываются так же: количества «привезти» идут в общий заказ отгрузки и PDF (блок «Создать в Shopify»).</div></details>';
+  }
+  box.innerHTML=html;
+}
+
+function itemCat(it){ return getCat(it.ru || it.en); }
+function isNew(it){ return !!(it.ru && NEWSET.has(it.ru)); }
+function itemGroup(it){ return isNew(it)?"Новинки":itemCat(it); }
+function itemVisible(it){
+  if(Q && !mw((it.ru||"")+" "+it.en, Q)) return false;
+  // новинка видна и в своей РОДНОЙ категории тоже (раньше только в «★ Новинки»,
+  // и вещь «пропадала» из своей категории — Влад не находил боксеры в «Нижнем белье»)
+  if(currentCat!=="all" && itemGroup(it)!==currentCat && itemCat(it)!==currentCat) return false;
+  return true;
+}
+
+function buildCats(){
+  const cnt={};
+  for(const it of SHOP.items){
+    const c=itemGroup(it); cnt[c]=(cnt[c]||0)+1;
+    if(c==="Новинки"){ const rc=itemCat(it); cnt[rc]=(cnt[rc]||0)+1; }   // новинка числится и в родной категории
+  }
+  let html='<button class="cat-btn '+(currentCat==="all"?"active":"")+'" onclick="selCat(\'all\')">Все</button>';
+  html+=GROUP_ORDER.filter(c=>cnt[c]>0).map(c=>
+    '<button class="cat-btn '+(c==="Новинки"?"newcat ":"")+(c===currentCat?"active":"")+'" onclick="selCat(\''+c+'\')">'+
+    (c==="Новинки"?"★ Новинки":c)+'<span class="cnt">'+cnt[c]+'</span></button>').join("");
+  document.getElementById("cat-bar").innerHTML=html;
+}
+function selCat(c){ currentCat=c; buildCats(); render(); }
+
+function ruInfo(it){
+  if(!it.ru) return null;
+  return RU[it.ru] || null;
+}
+// нормализация безразмерных: в РФ-остатках (stocks-bystore) безразмерная вещь
+// имеет ключ "" (имя без скобок), в Shopify — "One Size". Это ОДИН И ТОТ ЖЕ размер:
+// без нормализации строка получала два разных размера и РФ-остаток не сопоставлялся.
+function normOS(s){
+  const t=String(s||"").trim().toLowerCase();
+  return (!t||t==="one size"||t==="one-size"||t==="default title"||t==="os")?"One Size":String(s).trim();
+}
+// количество на складе Интернет-магазин по размеру (через нормализацию:
+// запрос "One Size" находит РФ-ключ "" и наоборот)
+function ruSizeQty(ri,s){
+  const want=normOS(s);
+  let t=0;
+  for(const k of Object.keys(ri.sizes||{})){
+    if(normOS(k)!==want) continue;
+    const per=(ri.sizes[k]&&ri.sizes[k].per)||[];
+    t+=(INET_IDX>=0)?(per[INET_IDX]||0):per.reduce((a,b)=>a+(b||0),0);
+  }
+  return t;
+}
+function ruSizeKeys(ri){
+  return [...new Set(Object.keys(ri.sizes||{}).map(normOS))];
+}
+function ruTotal(ri){
+  let t=0;
+  for(const s of ruSizeKeys(ri)) t+=ruSizeQty(ri,s);
+  return t;
+}
+
+function unionSizes(it){
+  const set=new Set(Object.keys(it.sizes||{}).map(normOS));
+  const ri=ruInfo(it);
+  if(ri&&ri.sizes) for(const s of ruSizeKeys(ri)) set.add(s);
+  return [...set].sort((a,b)=>szIdx(a)-szIdx(b));
+}
+
+function render(){
+  const groups={};
+  for(const it of SHOP.items){
+    if(!itemVisible(it)) continue;
+    const c=itemGroup(it);
+    (groups[c]=groups[c]||[]).push(it);
+  }
+  let html="";
+  for(const cat of GROUP_ORDER){
+    const arr=groups[cat]; if(!arr||!arr.length) continue;
+    arr.sort((a,b)=>((a.ru||a.en)).localeCompare(b.ru||b.en,"ru"));
+    html+='<tr class="cat-row'+(cat==="Новинки"?' newcat':'')+'"><td colspan="6">'+
+      (cat==="Новинки"?"★ Новинки — в стоке меньше "+NEW_DAYS+" дней":cat)+
+      '<span class="ccnt">'+arr.length+'</span></td></tr>';
+    for(const it of arr) html+=rowHtml(it);
+  }
+  if(!html) html='<tr><td colspan="6" class="loading">Не найдено</td></tr>';
+  document.getElementById("tbody").innerHTML=html;
+}
+
+function szChip(s,q){
+  return '<span class="szc'+(q?'':' zero')+'"><span class="sn">'+esc(s||'—')+'</span><span class="sq">'+q+'</span></span>';
+}
+
+function rowHtml(it){
+  const ri=ruInfo(it);
+  const badge=isNew(it)?'<span class="new-badge">new</span>':'';
+  const name = it.ru
+    ? '<span class="ru-name">'+esc(it.ru)+'</span>'+badge+'<span class="en-name">'+esc(it.en)+'</span>'
+    : '<span class="ru-name nomap">нет привязки к МойСклад</span><span class="en-name">'+esc(it.en)+'</span>';
+  const warn = (it.ru && !ri) ? '<span class="warn">в РФ нет остатка (0 на всех складах)</span>' : '';
+  // РФ (Интернет-магазин) по размерам
+  let ruChips='<span class="szc dash">—</span>', ruTot=0;
+  if(ri){
+    const szs=ruSizeKeys(ri).sort((a,b)=>szIdx(a)-szIdx(b));
+    ruChips=szs.map(s=>szChip(s,ruSizeQty(ri,s))).join("");
+    ruTot=ruTotal(ri);
+  }
+  // Париж по размерам
+  const psz=Object.keys(it.sizes||{}).sort((a,b)=>szIdx(a)-szIdx(b));
+  const pChips=psz.length?psz.map(s=>szChip(s,it.sizes[s])).join("")
+    :'<span class="szc dash">—</span>';
+  // инпуты «привезти» по объединению размеров
+  const inputs=unionSizes(it).map(s=>{
+    const k=ptKey(it.en,s), v=PT[k]||0;
+    return '<span class="tincell"><span class="tinlbl">'+esc(s||'—')+'</span><input class="tin'+(v>0?' has':'')+
+      '" type="number" min="0" step="1" value="'+v+'" onchange="saveTr(this,\''+jse(it.en)+'\',\''+jse(s)+'\')"></span>';
+  }).join("");
+  return '<tr><td>'+name+(warn?'<br>'+warn:'')+'</td>'+
+    '<td><div class="szchips">'+ruChips+'</div></td>'+
+    '<td class="tot'+(ruTot?'':' zero')+'">'+ruTot+'</td>'+
+    '<td><div class="szchips">'+pChips+'</div></td>'+
+    '<td class="tot'+(it.total?'':' zero')+'">'+it.total+'</td>'+
+    '<td><div class="tinwrap">'+inputs+'</div></td></tr>';
+}
+
+async function saveTr(inp,en,sz){
+  let v=parseInt(inp.value,10);
+  if(!isFinite(v)||v<0) v=0;
+  inp.value=v;
+  const k=ptKey(en,sz);
+  if(v>0){ PT[k]=v; inp.classList.add("has"); }
+  else { delete PT[k]; inp.classList.remove("has"); }
+  renderCards();
+  try{
+    await fetch("/api/adjustments",{method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({project_id:PT_PID,sku_base:k,qty_adj:v})});
+  }catch(e){ alert("Не удалось сохранить: "+e.message); }
+}
+
+function renderCards(){
+  if(!SHOP||!SHOP.items) return;
+  let pPos=0,pQty=0,ruQty=0,newCnt=0;
+  for(const it of SHOP.items){
+    if(it.total>0){ pPos++; pQty+=it.total; }
+    const ri=ruInfo(it); if(ri) ruQty+=ruTotal(ri);
+    if(isNew(it)) newCnt++;
+  }
+  const send=Object.values(PT).reduce((a,b)=>a+b,0);
+  const sendPos=new Set(Object.keys(PT).map(k=>k.split("||")[0])).size;
+  document.getElementById("cards").innerHTML=
+    '<div class="card"><div class="l">В Париже</div><div class="v">'+pQty+' шт</div><div class="s">'+pPos+' позиций в наличии из '+SHOP.items.length+' активных</div></div>'+
+    '<div class="card"><div class="l">Доступно к отправке из РФ</div><div class="v">'+ruQty+' шт</div><div class="s">склад Интернет-магазин</div></div>'+
+    '<div class="card dark"><div class="l">К отправке в Париж</div><div class="v">'+send+' шт</div><div class="s">'+sendPos+' позиций в списке</div></div>'+
+    '<div class="card"><div class="l">★ Новинки</div><div class="v">'+newCnt+'</div><div class="s">в стоке меньше '+NEW_DAYS+' дней</div></div>';
+}
+
+function toggleHistory(){ const p=document.getElementById("history-panel"); const show=p.style.display==="none"; p.style.display=show?"block":"none"; if(show) loadShipmentHistory(); }
+async function loadShipmentHistory(){ const p=document.getElementById("history-panel"); p.innerHTML='<table style="width:100%;border-collapse:collapse;font-size:13px"><thead><tr style="text-align:left;color:#888;font-size:11px;text-transform:uppercase"><th style="padding:6px 10px">Дата</th><th style="padding:6px 10px">Позиций</th><th style="padding:6px 10px">Количество</th><th style="padding:6px 10px"></th></tr></thead><tbody id="history-tbody"><tr><td colspan="4" style="padding:10px;color:#888">Загрузка…</td></tr></tbody></table>'; const tb=document.getElementById("history-tbody"); try{ const list=await (await fetch("/api/paris/list")).json(); if(!list.length){ tb.innerHTML='<tr><td colspan="4" style="padding:10px;color:#888">Пока нет сохранённых отгрузок</td></tr>'; return; } tb.innerHTML=list.map(s=>'<tr><td style="padding:6px 10px">'+s.shipment_date+'</td><td style="padding:6px 10px">'+s.total_positions+'</td><td style="padding:6px 10px">'+s.total_qty+'</td><td style="padding:6px 10px;white-space:nowrap"><button class="btn" style="padding:5px 12px;font-size:11px" onclick="redownloadShipment('+s.id+')">⬇ PDF</button> <button class="btn" style="padding:5px 12px;font-size:11px;background:#efe9e2;color:#1f1f1f" onclick="restoreShipment('+s.id+',\''+s.shipment_date+'\')">↩ Вернуть в заказ</button></td></tr>').join(""); }catch(e){ tb.innerHTML='<tr><td colspan="4" style="padding:10px;color:#c0392b">Ошибка загрузки истории</td></tr>'; } }
+function buildShipmentHtmlFromRows(rows,ds){ let lastCat="",i=0,total=0; rows.forEach(r=>total+=r.qty); const body=rows.map(r=>{let h="";if(r.cat!==lastCat){h+='<tr class="c"><td colspan="4">'+r.cat+'</td></tr>';lastCat=r.cat;}i++;return h+'<tr><td>'+i+'</td><td>'+esc(r.ru||"—")+'<div class="e">'+esc(r.en)+'</div></td><td>'+esc(r.size)+'</td><td><b>'+r.qty+'</b></td></tr>';}).join(""); return '<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8"><title>Отгрузка в Париж '+ds+'</title><style>'+'body{font-family:Helvetica,Arial,sans-serif;color:#1f1f1f;padding:32px;max-width:800px;margin:0 auto}'+'h1{font-size:20px;margin-bottom:2px}.sub{color:#888;font-size:12px;margin-bottom:20px}'+'table{width:100%;border-collapse:collapse;font-size:13px}'+'th{background:#1f1f1f;color:#fff;text-align:left;padding:7px 10px;font-size:11px}'+'td{padding:6px 10px;border-bottom:1px solid #e3e3e3;vertical-align:top}'+'tr.c td{background:#efe9e2;font-weight:700;text-transform:uppercase;font-size:11px;letter-spacing:.05em}'+'.e{color:#999;font-size:11px}.tot{margin-top:16px;font-size:15px;font-weight:700}'+'@media print{body{padding:0}}</style></head><body>'+'<h1>Отгрузка в Париж · Chernim Cherno</h1><div class="sub">сформировано '+ds+' · отгрузка со склада Интернет-магазин → Chernim Cherno France</div>'+'<table><thead><tr><th>№</th><th>Позиция</th><th>Размер</th><th>Кол-во</th></tr></thead><tbody>'+body+'</tbody></table>'+'<div class="tot">Итого: '+total+' шт · '+new Set(rows.map(r=>r.en)).size+' позиций</div>'+'</body></html>'; }
+async function restoreShipment(id, ds){
+  if(!confirm("Вернуть отгрузку от "+ds+" в заказ?\nКоличества добавятся в колонку «Привезти в Париж», запись уйдёт из истории.")) return;
+  try{
+    const r=await fetch("/api/paris/"+id+"/restore",{method:"POST"});
+    if(!r.ok) throw new Error("HTTP "+r.status);
+    const d=await r.json();
+    PT={};
+    for(let [k,v] of Object.entries(d.restored||{})){
+      const q=parseInt(v,10)||0; if(q<=0) continue;
+      if(k.endsWith("||")) k+="One Size";           // миграция старых безразмерных ключей
+      PT[k]=(PT[k]||0)+q;
+    }
+    render(); renderCards(); loadShipmentHistory();
+  }catch(e){ alert("Не удалось восстановить: "+e.message); }
+}
+async function redownloadShipment(id){ try{ const s=await (await fetch("/api/paris/"+id)).json(); const ds=new Date(s.shipment_date).toLocaleDateString("ru-RU"); const html=buildShipmentHtmlFromRows(s.rows,ds); savePdf(html,"отгрузка-париж-"+s.shipment_date+".pdf"); }catch(e){ alert("Не удалось скачать: "+e.message); } }
+  
+function downloadShipment(){
+  if(!SHOP) return;
+  const rows=[];
+  for(const cat of GROUP_ORDER){
+    for(const it of SHOP.items.filter(x=>itemGroup(x)===cat)){
+      const szs=unionSizes(it);
+      for(const s of szs){
+        const q=PT[ptKey(it.en,s)]||0;
+        if(q>0) rows.push({cat, ru:it.ru||"", en:it.en, size:s, qty:q});
+      }
+    }
+  }
+  // новинки без Shopify-товара (ключи RU::имя||размер) — отдельным блоком в конце;
+  // en = "RU::имя", чтобы «Вернуть в заказ» восстанавливал те же ключи
+  for(const [k,v] of Object.entries(PT)){
+    if(!k.startsWith(RU_PFX)||!(v>0)) continue;
+    const sep=k.lastIndexOf("||");
+    if(sep<0) continue;
+    const ru=k.slice(RU_PFX.length,sep), size=k.slice(sep+2)||"One Size";
+    rows.push({cat:"⚠ Создать в Shopify", ru, en:RU_PFX+ru, size, qty:v});
+  }
+  if(!rows.length){ alert("Список пуст — введите количества в колонке «Привезти в Париж»."); return; }
+  const d=new Date(), ds=d.toLocaleDateString("ru-RU");
+  let total=0; rows.forEach(r=>total+=r.qty);
+  let body="", lastCat="", i=0;
+  for(const r of rows){
+    if(r.cat!==lastCat){ body+='<tr class="c"><td colspan="4">'+r.cat+'</td></tr>'; lastCat=r.cat; }
+    i++;
+    const enTxt=r.en&&r.en.startsWith(RU_PFX)?"⚠ товара ещё нет в Shopify — создать при отгрузке":r.en;
+    body+='<tr><td>'+i+'</td><td>'+esc(r.ru||"—")+'<div class="e">'+esc(enTxt)+'</div></td><td>'+esc(r.size)+'</td><td><b>'+r.qty+'</b></td></tr>';
+  }
+  const html='<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8"><title>Отгрузка в Париж '+ds+'</title><style>'+
+    'body{font-family:Helvetica,Arial,sans-serif;color:#1f1f1f;padding:32px;max-width:800px;margin:0 auto}'+
+    'h1{font-size:20px;margin-bottom:2px}.sub{color:#888;font-size:12px;margin-bottom:20px}'+
+    'table{width:100%;border-collapse:collapse;font-size:13px}'+
+    'th{background:#1f1f1f;color:#fff;text-align:left;padding:7px 10px;font-size:11px}'+
+    'td{padding:6px 10px;border-bottom:1px solid #e3e3e3;vertical-align:top}'+
+    'tr.c td{background:#efe9e2;font-weight:700;text-transform:uppercase;font-size:11px;letter-spacing:.05em}'+
+    '.e{color:#999;font-size:11px}.tot{margin-top:16px;font-size:15px;font-weight:700}'+
+    '@media print{body{padding:0}}</style></head><body>'+
+    '<h1>Отгрузка в Париж · Chernim Cherno</h1><div class="sub">сформировано '+ds+' · отгрузка со склада Интернет-магазин → Chernim Cherno France</div>'+
+    '<table><thead><tr><th>№</th><th>Позиция</th><th>Размер</th><th>Кол-во</th></tr></thead><tbody>'+body+'</tbody></table>'+
+    '<div class="tot">Итого: '+total+' шт · '+new Set(rows.map(r=>r.en)).size+' позиций</div>'+
+    '</body></html>';
+  savePdf(html, "отгрузка-париж-"+d.toISOString().slice(0,10)+".pdf");
+fetch("/api/paris/save",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({rows,total})}).then(r=>r.json()).then(()=>{PT={};render();renderCards();loadShipmentHistory();}).catch(e=>alert("PDF скачан, но не удалось сохранить в историю и обнулить таблицу: "+e.message));
+}
+
+// печатная версия → PDF (html2pdf с CDN; если недоступен — HTML как раньше)
+async function savePdf(doc, filename){
+  if(typeof html2pdf==="undefined"){
+    const blob=new Blob([doc],{type:"text/html;charset=utf-8"});
+    const a=document.createElement("a");
+    a.href=URL.createObjectURL(blob);
+    a.download=filename.replace(/\.pdf$/i,".html");
+    document.body.appendChild(a); a.click(); a.remove();
+    return;
+  }
+  const ifr=document.createElement("iframe");
+  ifr.style.cssText="position:fixed;left:-10000px;top:0;width:920px;height:1200px;border:0";
+  document.body.appendChild(ifr);
+  ifr.srcdoc=doc;
+  await new Promise(r=>{ ifr.onload=r; });
+  await new Promise(r=>setTimeout(r,150));
+  const dd=ifr.contentDocument;
+  const extra=dd.createElement("style");
+  extra.textContent="h1{page-break-after:avoid}tr,.tot{page-break-inside:avoid}";
+  dd.head.appendChild(extra);
+  try{
+    await html2pdf().set({
+      margin:[10,8,12,8],
+      filename:filename,
+      image:{type:"jpeg",quality:0.95},
+      html2canvas:{scale:2,useCORS:true,scrollX:0,scrollY:0},
+      jsPDF:{unit:"mm",format:"a4",orientation:"portrait"},
+      pagebreak:{mode:["css","legacy"]}
+    }).from(dd.body).save();
+  }catch(e){
+    alert("PDF не собрался ("+e.message+") — скачиваю HTML");
+    const blob=new Blob([doc],{type:"text/html;charset=utf-8"});
+    const a=document.createElement("a");
+    a.href=URL.createObjectURL(blob);
+    a.download=filename.replace(/\.pdf$/i,".html");
+    document.body.appendChild(a); a.click(); a.remove();
+  }
+  ifr.remove();
+}
+
+function esc(s){ return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;"); }
+function jse(s){ return String(s).replace(/\\/g,"\\\\").replace(/'/g,"\\'").replace(/"/g,"&quot;"); }
+
+document.getElementById("search").addEventListener("input",e=>{ Q=e.target.value.trim().toLowerCase(); render(); renderRuNew(); });
+loadAll();
+</script>
+</body>
+</html>

@@ -1,0 +1,405 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+  <title>Chernim Cherno · Data</title>
+  
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0 }
+    body { font-family: Helvetica, 'Helvetica Neue', Arial, sans-serif; min-height: 100vh; background: #f3e9e0; color:#1f1f1f; }
+    
+    
+    .header {
+      position: sticky; top: 0; z-index: 100;
+      padding: 0 28px; height: 56px;
+      display: flex; align-items: center; justify-content: space-between;
+    }
+    .logo { text-decoration: none; display: flex; align-items: center; }
+    .logo img { height: 26px; display: block; }
+    .hstats { font-size: 11px; color: rgba(31,31,31,0.45) }
+    .nav { display: flex; gap: 20px }
+    .nav a {
+      font-size: 13px; font-weight: 400; letter-spacing: 0.05em;
+      color: rgba(31,31,31,0.45);
+      text-decoration: none; transition: color .2s;
+    }
+    .nav a:hover { color: #434446 }
+    .nav a.active { color: #1f1f1f; font-weight: 500; }
+
+    .main { max-width: 1400px; margin: 0 auto; padding: 28px; display: flex; flex-direction: column; gap: 18px }
+
+    .upload-zone {
+      background: rgba(31,31,31,0.09);
+      backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px);
+      border: 1px dashed rgba(31,31,31,0.45);
+      border-radius: 14px; padding: 36px;
+      text-align: center; cursor: pointer; transition: all .2s;
+    }
+    .upload-zone:hover, .upload-zone.drag {
+      background: rgba(31,31,31,0.45);
+      border-color: #434446;
+    }
+    .upload-zone.uploading { cursor: default; opacity: 0.7 }
+    .upload-icon { font-size: 28px; margin-bottom: 10px; opacity: 0.8 }
+    .upload-zone.uploading .upload-icon { animation: spin 1s linear infinite; display: inline-block }
+    @keyframes spin { to { transform: rotate(360deg) } }
+    .upload-text { font-size: 14px; font-weight: 500; margin-bottom: 6px }
+    .upload-hint { font-size: 12px; color: #434446 }
+
+    .msg { border-radius: 10px; padding: 14px 40px 14px 16px; position: relative; font-size: 12px; display: none }
+    .msg.show { display: block }
+    .msg.ok { background: rgba(31,31,31,0.16); backdrop-filter: blur(12px); border: 1px solid rgba(31,31,31,0.45) }
+    .msg.err { background: rgba(255,80,80,0.2); border: 1px solid rgba(255,100,100,0.3) }
+    .msg-title { font-weight: 600; font-size: 13px; margin-bottom: 6px }
+    .msg-details { color: #434446; line-height: 1.7 }
+    .close-btn { position: absolute; top: 10px; right: 12px; background: none; border: none; color: #434446; cursor: pointer; font-size: 14px }
+
+    .controls { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; flex-wrap: wrap }
+    .date-tabs { display: flex; flex-wrap: wrap; gap: 6px; flex: 1 }
+    .date-tab {
+      background: rgba(31,31,31,0.09); border: 1px solid rgba(31,31,31,0.45);
+      color: #434446; padding: 6px 12px;
+      font-size: 11px; font-weight: 500; cursor: pointer; border-radius: 16px;
+      display: flex; align-items: center; gap: 6px; transition: all .15s;
+      font-family: Helvetica, 'Helvetica Neue', Arial, sans-serif;
+    }
+    .date-tab:hover { background: rgba(31,31,31,0.45); color:#1f1f1f }
+    .date-tab.active { background: white; color: #6a9ab8; border-color:#1f1f1f }
+    .dtc { font-size: 10px; opacity: 0.6 }
+    .date-tab.active .dtc { color: #8ab8d4 }
+
+    .search-wrap { position: relative; min-width: 260px }
+    .search-input {
+      width: 100%;
+      background: rgba(31,31,31,0.09); backdrop-filter: blur(12px);
+      border: 1px solid rgba(31,31,31,0.45); color:#1f1f1f;
+      padding: 8px 32px 8px 14px; font-size: 12px; border-radius: 20px;
+      outline: none; transition: all .2s; font-family: Helvetica, 'Helvetica Neue', Arial, sans-serif;
+    }
+    .search-input:focus { background: rgba(31,31,31,0.16); border-color: #434446 }
+    .search-input::placeholder { color: rgba(31,31,31,0.62) }
+    .search-clear { position: absolute; right: 10px; top: 50%; transform: translateY(-50%); background: none; border: none; color: rgba(31,31,31,0.62); cursor: pointer; font-size: 12px; display: none }
+
+    .table-wrap {
+      background: rgba(31,31,31,0.09);
+      backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px);
+      border: 1px solid rgba(31,31,31,0.16);
+      border-radius: 14px; overflow: hidden;
+    }
+    .table-meta { padding: 12px 18px; border-bottom: 1px solid rgba(31,31,31,0.09); font-size: 12px; color: #434446 }
+    .table-meta b { color:#1f1f1f }
+    table { width: 100%; border-collapse: collapse }
+    th {
+      padding: 10px 18px; text-align: left;
+      font-size: 11px; font-weight: 500; color: rgba(31,31,31,0.62);
+      letter-spacing: 0.08em; text-transform: uppercase;
+      border-bottom: 1px solid rgba(31,31,31,0.09);
+    }
+    td { padding: 9px 18px; border-bottom: 1px solid rgba(31,31,31,0.07); font-size: 13px }
+    tr:last-child td { border-bottom: none }
+    tbody tr:hover td { background: rgba(255,255,255,0.55) }
+    .zero td { opacity: 0.35 }
+    .col-name { width: 100% }
+    .col-qty { white-space: nowrap; text-align: right }
+    .badge {
+      font-size: 12px; font-weight: 500; padding: 2px 10px;
+      border-radius: 10px; background: rgba(31,31,31,0.09);
+    }
+    .badge.zero { opacity: 0.4 }
+    .badge.low { background: rgba(240,150,80,0.3); color: #ffd4a0 }
+    .placeholder { text-align: center; padding: 48px; color: rgba(31,31,31,0.45); font-size: 13px }
+    .pagination {
+      display: flex; align-items: center; justify-content: center;
+      gap: 16px; padding: 14px; border-top: 1px solid rgba(31,31,31,0.09);
+    }
+    .pagination button {
+      background: rgba(31,31,31,0.09); border: 1px solid rgba(31,31,31,0.45);
+      color: #434446; padding: 6px 16px;
+      font-size: 13px; cursor: pointer; border-radius: 16px;
+      font-family: Helvetica, 'Helvetica Neue', Arial, sans-serif; transition: all .15s;
+    }
+    .pagination button:hover:not(:disabled) { background: white; color: #6a9ab8 }
+    .pagination button:disabled { opacity: 0.3; cursor: default }
+    .pagination span { font-size: 12px; color: rgba(31,31,31,0.62) }
+  
+  /* ── Animated mesh blobs ── */
+  .gradient-bg { position: fixed; inset: 0; z-index: 0; overflow: hidden; background: #f3e9e0; }
+  .gradient-bg::before, .gradient-bg::after, .b1, .b2, .b3 {
+    position: absolute; border-radius: 50%; filter: blur(90px); opacity: 0.9;
+  }
+  .gradient-bg::before { content: ''; width: 70vw; height: 70vw;
+    background: radial-gradient(circle, #efe5db, transparent 70%);
+    top: -20%; left: -10%; animation: blob1 11s ease-in-out infinite alternate; }
+  .gradient-bg::after { content: ''; width: 60vw; height: 60vw;
+    background: radial-gradient(circle, #e2d8cf, transparent 70%);
+    bottom: -15%; right: -10%; animation: blob2 14s ease-in-out infinite alternate; }
+  .b1 { width: 55vw; height: 55vw; background: radial-gradient(circle, #d3c9c2, transparent 70%);
+    top: 30%; left: 30%; animation: blob3 9s ease-in-out infinite alternate; }
+  .b2 { width: 45vw; height: 45vw; background: radial-gradient(circle, #c1b8b3, transparent 70%);
+    top: -10%; right: 10%; animation: blob4 13s ease-in-out infinite alternate; }
+  .b3 { width: 50vw; height: 50vw; background: radial-gradient(circle, #aba3a0, transparent 70%);
+    bottom: 10%; left: 20%; animation: blob5 16s ease-in-out infinite alternate; }
+  /* ── Vignette ── */
+  .vignette { position: fixed; inset: 0; z-index: 1; pointer-events: none;
+    background: radial-gradient(ellipse at center, transparent 40%, rgba(171,163,160,0.35) 100%); }
+  /* ── Film grain ── */
+  .grain { position: fixed; inset: 0; z-index: 2; pointer-events: none; }
+  .grain::before { content: ''; position: absolute; inset: -50%; width: 200%; height: 200%;
+    background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 512 512' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='grain'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.75' numOctaves='4' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23grain)'/%3E%3C/svg%3E");
+    background-size: 200px 200px; opacity: 0.12; mix-blend-mode: overlay;
+    animation: grain-shift 0.15s steps(1) infinite; }
+  @keyframes grain-shift {
+    0%{transform:translate(0,0)} 10%{transform:translate(-3%,-4%)} 20%{transform:translate(4%,2%)}
+    30%{transform:translate(-2%,5%)} 40%{transform:translate(5%,-3%)} 50%{transform:translate(-4%,4%)}
+    60%{transform:translate(3%,-2%)} 70%{transform:translate(-5%,3%)} 80%{transform:translate(2%,-5%)}
+    90%{transform:translate(-3%,2%)} 100%{transform:translate(4%,-4%)} }
+  @keyframes blob1 { 0%{transform:translate(0,0) scale(1)} 33%{transform:translate(8vw,5vh) scale(1.1)} 66%{transform:translate(-5vw,10vh) scale(0.95)} 100%{transform:translate(10vw,-8vh) scale(1.05)} }
+  @keyframes blob2 { 0%{transform:translate(0,0) scale(1)} 33%{transform:translate(-10vw,-6vh) scale(1.08)} 66%{transform:translate(6vw,-12vh) scale(1.12)} 100%{transform:translate(-8vw,5vh) scale(0.92)} }
+  @keyframes blob3 { 0%{transform:translate(0,0) scale(1)} 50%{transform:translate(-12vw,8vh) scale(1.15)} 100%{transform:translate(8vw,-10vh) scale(0.9)} }
+  @keyframes blob4 { 0%{transform:translate(0,0) scale(0.9)} 50%{transform:translate(10vw,12vh) scale(1.1)} 100%{transform:translate(-6vw,6vh) scale(1)} }
+  @keyframes blob5 { 0%{transform:translate(0,0) scale(1.1)} 50%{transform:translate(14vw,-8vh) scale(0.9)} 100%{transform:translate(-10vw,-12vh) scale(1.05)} }
+
+</style>
+</head>
+<body>
+<div class="gradient-bg"><div class="b1"></div><div class="b2"></div><div class="b3"></div></div>
+<div class="vignette"></div>
+<div class="grain"></div>
+<div class="header">
+  <a class="logo" href="/" style="font-family:Helvetica,'Helvetica Neue',Arial,sans-serif;font-size:15px;font-weight:400;letter-spacing:0.12em;color:#1f1f1f;text-decoration:none;">Chernim Cherno</a>
+  <div class="hstats" id="hstats"></div>
+  <nav class="nav">
+    <a href="/" class="active">Data</a>
+    <a href="/analytics">Остатки</a>
+    <a href="/turnover">Оборачиваемость</a>
+    <a href="/order">Заказ</a>
+    <a href="/forecast">Прогноз</a>
+    <a href="/revenue">Оборот</a>
+    <a href="/transfers">Перемещения</a>
+    <a href="/yandex">Яндекс</a>
+  </nav>
+</div>
+<div class="main" style="position:relative;z-index:3;">
+
+  <!-- Instructions -->
+  <div style="margin-bottom:16px;padding:16px 20px;background:rgba(255,255,255,0.55);border:1px solid rgba(31,31,31,0.09);border-radius:8px;font-size:12px;color:rgba(31,31,31,0.62);line-height:1.8">
+    Сюда необходимо загрузить остатки из МоегоСклада. Выгрузка остатков происходит по дням — например, если нужно 10 дней, надо выгрузить 10 файлов.<br>
+    Заходим в <a href="https://www.moysklad.ru/" target="_blank" style="color:#434446;text-underline-offset:3px">МойСклад</a>, выбираем нужную нам дату, ставим фильтр по складам: только <b style="color:#434446;font-weight:500">Гороховая</b>, <b style="color:#434446;font-weight:500">Мясницкая</b> и <b style="color:#434446;font-weight:500">Интернет-магазин</b>.<br>
+    Загружаем файлы в поле ниже. Последнюю загруженную дату можно видеть в списке подгруженных дат.
+  </div>
+
+  <div class="upload-zone" id="dropzone">
+    <input type="file" id="file-input" accept=".xls" multiple style="display:none">
+    <div class="upload-icon" id="upload-icon">↑</div>
+    <div class="upload-text" id="upload-text">Перетащите XLS файлы или нажмите для выбора</div>
+    <div class="upload-hint">Отчёты остатков из МоегоСклада · Гороховая, Мясницкая, Интернет-магазин</div>
+  </div>
+  <!-- CSV Sales Upload -->
+  <div style="margin-top:12px;background:rgba(255,255,255,0.55);border:1px solid rgba(31,31,31,0.09);border-radius:8px;padding:14px 18px;display:flex;align-items:center;gap:14px;flex-wrap:wrap">
+    <input type="file" id="csv-input" accept=".csv" multiple style="display:none">
+    <button onclick="document.getElementById('csv-input').click()" style="background:rgba(31,31,31,0.09);border:1px solid rgba(31,31,31,0.45);color:#1f1f1f;padding:7px 16px;border-radius:6px;font-size:12px;font-weight:500;cursor:pointer;font-family:Helvetica,sans-serif;white-space:nowrap;transition:background .15s" onmouseover="this.style.background='rgba(31,31,31,0.45)'" onmouseout="this.style.background='rgba(31,31,31,0.09)'">↑ Загрузить CSV продаж</button>
+    <button onclick="rebuildCache(event)" style="background:rgba(255,255,255,0.55);border:1px solid rgba(31,31,31,0.09);color:rgba(31,31,31,0.62);padding:7px 14px;border-radius:6px;font-size:12px;cursor:pointer;font-family:Helvetica,sans-serif;white-space:nowrap" title="Пересобрать кеш если новые позиции не отображаются">🔄 Пересобрать кеш</button>
+    <button onclick="fixMojibake(event)" style="background:rgba(255,255,255,0.55);border:1px solid rgba(31,31,31,0.09);color:rgba(31,31,31,0.62);padding:7px 14px;border-radius:6px;font-size:12px;cursor:pointer;font-family:Helvetica,sans-serif;white-space:nowrap" title="Удалить сломанные записи с кириллицей и перезалить">🔧 Починить кодировку</button>
+    <input type="file" id="test-xls-input" accept=".xls" style="display:none">
+    <button onclick="document.getElementById('test-xls-input').click()" style="background:rgba(255,255,255,0.55);border:1px solid rgba(31,31,31,0.09);color:rgba(31,31,31,0.62);padding:7px 14px;border-radius:6px;font-size:12px;cursor:pointer;font-family:Helvetica,sans-serif;white-space:nowrap">🔍 Тест кодировки XLS</button>
+    <span style="font-size:12px;color:rgba(31,31,31,0.62);line-height:1.6">
+      Для обновления перейдите по <a href="https://docs.google.com/spreadsheets/d/1mjz4Zjcq86TqkIbjc-s4nZyGUHAR0kLiNY1NH-MnBpk/edit?gid=1082363897#gid=1082363897" target="_blank" style="color:#434446;text-underline-offset:3px">ссылке</a>, нажмите «Экспорт», сохраните CSV. Нужно два листа: <b style="color:#434446;font-weight:500">Продажи</b> и <b style="color:#434446;font-weight:500">Возвраты</b>.
+    </span>
+    <span id="csv-status" style="font-size:11px;color:rgba(31,31,31,0.62);font-family:monospace"></span>
+  </div>
+
+  <div class="msg ok" id="msg-ok"><div class="msg-title" id="msg-title"></div><div class="msg-details" id="msg-details"></div><button class="close-btn" onclick="document.getElementById('msg-ok').classList.remove('show')">✕</button></div>
+  <div class="msg err" id="msg-err"><span id="msg-err-text"></span><button class="close-btn" onclick="document.getElementById('msg-err').classList.remove('show')">✕</button></div>
+  <div class="controls">
+    <div class="date-tabs" id="date-tabs"></div>
+    <div class="search-wrap">
+      <input class="search-input" id="search" placeholder="Поиск по названию...">
+      <button class="search-clear" id="search-clear" onclick="clearSearch()">✕</button>
+    </div>
+  </div>
+  <div class="table-wrap">
+    <div class="table-meta" id="table-meta"></div>
+    <table><thead><tr><th class="col-name">Наименование</th><th class="col-qty">Остаток</th></tr></thead>
+    <tbody id="tbody"></tbody></table>
+    <div class="pagination" id="pagination" style="display:none">
+      <button id="prev-btn" onclick="changePage(-1)">←</button>
+      <span id="page-info"></span>
+      <button id="next-btn" onclick="changePage(1)">→</button>
+    </div>
+  </div>
+</div>
+<script>
+let selectedDate=null, currentPage=1, searchVal="", totalPages=0, searchTimer=null;
+
+async function loadStats(){
+  try{
+    const r=await fetch("/api/stats"); const d=await r.json();
+    if(d.total_dates>0) document.getElementById("hstats").textContent=d.total_skus+" SKU · "+d.total_dates+" дней · "+d.date_from+" — "+d.date_to;
+  }catch(e){}
+}
+async function loadDates(){
+  try{
+    const r=await fetch("/api/dates"); const dates=await r.json();
+    const tabs=document.getElementById("date-tabs"); tabs.innerHTML="";
+    dates.forEach(d=>{
+      const wrap=document.createElement("div"); wrap.style.cssText="display:inline-flex;align-items:center;gap:0";
+      const btn=document.createElement("button"); btn.className="date-tab"+(d.date===selectedDate?" active":"");
+      const p=d.date.split("-"); btn.innerHTML=p[2]+"."+p[1]+"."+p[0]+" <span class='dtc'>"+d.sku_count+"</span>";
+      btn.onclick=()=>{selectedDate=d.date;currentPage=1;loadDates();loadStocks();};
+      const del=document.createElement("button");
+      del.title="Удалить остатки за эту дату"; del.textContent="×";
+      del.style.cssText="padding:2px 6px;border-radius:0 8px 8px 0;border:1px solid rgba(31,31,31,0.09);border-left:none;"+
+        "background:rgba(221,0,4,0.12);color:#dd0004;cursor:pointer;font-size:13px;line-height:1;height:100%";
+      del.onmouseenter=()=>{del.style.background="rgba(221,0,4,0.3)";del.style.color="white"};
+      del.onmouseleave=()=>{del.style.background="rgba(221,0,4,0.12)";del.style.color="#dd0004"};
+      del.onclick=async(e)=>{
+        e.stopPropagation();
+        if(!confirm("Удалить все остатки за "+p[2]+"."+p[1]+"."+p[0]+"?\nПосле этого можно перезалить файлы заново.")) return;
+        const res=await fetch("/api/stocks/date/"+d.date,{method:"DELETE"});
+        if(res.ok){if(selectedDate===d.date)selectedDate=null; loadDates();}
+        else alert("Ошибка удаления");
+      };
+      // Adjust btn border-radius when del button is next to it
+      btn.style.borderRadius="8px 0 0 8px";
+      wrap.appendChild(btn); wrap.appendChild(del);
+      tabs.appendChild(wrap);
+    });
+    if(!selectedDate&&dates.length>0){selectedDate=dates[0].date;loadDates();loadStocks();}
+  }catch(e){}
+}
+async function loadStocks(){
+  if(!selectedDate)return;
+  document.getElementById("tbody").innerHTML="<tr><td colspan='2' class='placeholder'>Загрузка...</td></tr>";
+  try{
+    const params=new URLSearchParams({date:selectedDate,page:currentPage,per_page:50});
+    if(searchVal)params.set("search",searchVal);
+    const r=await fetch("/api/stocks?"+params); const d=await r.json();
+    totalPages=d.pages||0;
+    const p=selectedDate.split("-");
+    document.getElementById("table-meta").innerHTML="Остатки на <b>"+p[2]+"."+p[1]+"."+p[0]+"</b> · "+d.total+" позиций";
+    const tbody=document.getElementById("tbody");
+    if(!d.items||!d.items.length){tbody.innerHTML="<tr><td colspan='2' class='placeholder'>Ничего не найдено</td></tr>";}
+    else{tbody.innerHTML=d.items.map(s=>{
+      const cls=s.stock_qty===0?"zero":s.stock_qty<=3?"low":"";
+      return "<tr class='"+(s.stock_qty===0?"zero":"")+"'><td class='col-name'>"+s.sku_name+"</td><td class='col-qty'><span class='badge "+cls+"'>"+s.stock_qty+"</span></td></tr>";
+    }).join("");}
+    const pg=document.getElementById("pagination");
+    if(totalPages>1){pg.style.display="flex";document.getElementById("page-info").textContent=currentPage+" / "+totalPages;document.getElementById("prev-btn").disabled=currentPage===1;document.getElementById("next-btn").disabled=currentPage===totalPages;}
+    else pg.style.display="none";
+  }catch(e){document.getElementById("tbody").innerHTML="<tr><td colspan='2' class='placeholder'>Ошибка загрузки</td></tr>";}
+}
+function changePage(dir){currentPage+=dir;loadStocks();}
+function clearSearch(){document.getElementById("search").value="";searchVal="";document.getElementById("search-clear").style.display="none";currentPage=1;loadStocks();}
+document.getElementById("search").addEventListener("input",e=>{
+  searchVal=e.target.value;
+  document.getElementById("search-clear").style.display=searchVal?"block":"none";
+  clearTimeout(searchTimer);searchTimer=setTimeout(()=>{currentPage=1;loadStocks();},350);
+});
+async function uploadFiles(files){
+  const xlsFiles=Array.from(files).filter(f=>f.name.toLowerCase().endsWith(".xls"));
+  if(!xlsFiles.length){showErr("Только .xls файлы из МоегоСклада");return;}
+  document.getElementById("upload-icon").textContent="⟳";
+  document.getElementById("upload-text").textContent="Загружаю...";
+  document.getElementById("dropzone").style.pointerEvents="none";
+  let ok=0;const results=[];
+  for(const file of xlsFiles){
+    const fd=new FormData();fd.append("file",file);
+    try{const res=await fetch("/api/upload",{method:"POST",body:fd});const data=await res.json();
+    if(res.ok){const added=(data.inserted||0)+(data.updated||0);const dbg=data._debug_sample&&data._debug_sample.length?" SKU="+JSON.stringify(data._debug_sample[0]):"";results.push("✓ "+data.date+": +"+(data.inserted||0)+" новых"+(data.updated?" +"+data.updated+" обновлено":"")+dbg);ok++;}
+    else{results.push("✗ "+file.name+": "+data.detail);}}
+    catch{results.push("✗ "+file.name+": ошибка сети");}
+  }
+  document.getElementById("upload-icon").textContent="↑";
+  document.getElementById("upload-text").textContent="Перетащите XLS файлы или нажмите для выбора";
+  document.getElementById("dropzone").style.pointerEvents="";
+  document.getElementById("msg-title").textContent="Загружено "+ok+" из "+xlsFiles.length+" файлов";
+  document.getElementById("msg-details").innerHTML=results.join("<br>");
+  document.getElementById("msg-ok").classList.add("show");
+  // Invalidate analytics cache
+  try{localStorage.removeItem('cc_analytics_v2');localStorage.removeItem('cc_analytics_dates_v2');}catch(e){}
+  selectedDate=null;loadStats();loadDates();
+}
+function showErr(msg){document.getElementById("msg-err-text").textContent=msg;document.getElementById("msg-err").classList.add("show");}
+const dz=document.getElementById("dropzone");
+dz.addEventListener("click",()=>document.getElementById("file-input").click());
+dz.addEventListener("dragover",e=>{e.preventDefault();dz.classList.add("drag");});
+dz.addEventListener("dragleave",()=>dz.classList.remove("drag"));
+dz.addEventListener("drop",e=>{e.preventDefault();dz.classList.remove("drag");uploadFiles(e.dataTransfer.files);});
+document.getElementById("file-input").addEventListener("change",e=>uploadFiles(e.target.files));
+// CSV Sales upload
+document.getElementById("csv-input").addEventListener("change", async function(e) {
+  const files = Array.from(e.target.files);
+  if (!files.length) return;
+  const status = document.getElementById("csv-status");
+  status.textContent = "Загружаю...";
+  let ok = 0, errors = [];
+  for (const file of files) {
+    const fd = new FormData(); fd.append("file", file);
+    try {
+      const r = await fetch("/api/upload-sales", {method:"POST", body:fd});
+      const d = await r.json();
+      if (r.ok) { ok++; status.textContent = `✓ ${d.doc_type === "return" ? "Возвраты" : "Продажи"}: ${d.inserted} строк (${d.date_from} — ${d.date_to})`; }
+      else errors.push(file.name + ": " + (d.detail || "ошибка"));
+    } catch(err) { errors.push(file.name + ": сетевая ошибка"); }
+  }
+  if (errors.length) status.textContent = errors.join("; ");
+  else if (ok > 1) status.textContent = `✓ Загружено ${ok} файлов`;
+  e.target.value = "";
+});
+loadStats();loadDates();
+
+document.getElementById('test-xls-input').addEventListener('change', async function(e){
+  const file = e.target.files[0]; if(!file) return;
+  const fd = new FormData(); fd.append('file', file);
+  const btn = this.previousElementSibling;
+  btn.textContent = '⏳ Проверяю...';
+  try {
+    const r = await fetch('/api/debug-parse-xls', {method:'POST', body:fd});
+    const d = await r.json();
+    let msg = 'Результат для ' + file.name + ':\n\n';
+    for(const [enc, res] of Object.entries(d)){
+      msg += 'encoding=' + enc + ': ';
+      if(res.error) msg += 'ОШИБКА: ' + res.error;
+      else if(res.found) msg += 'НАЙДЕНО ' + res.found + ' строк\n  → ' + (res.samples[0]?.value || '');
+      else msg += 'не найдено nowhere';
+      msg += '\n';
+    }
+    alert(msg);
+  } catch(ex){ alert('Ошибка: ' + ex.message); }
+  btn.textContent = '🔍 Тест кодировки XLS';
+  this.value = '';
+});
+
+async function fixMojibake(e){
+  const btn=e.target;
+  const q=prompt("Введи часть названия позиции для удаления из БД (например: nowhere)");
+  if(!q) return;
+  btn.textContent="⏳ Удаляю..."; btn.disabled=true;
+  try{
+    const r=await fetch("/api/debug-delete-sku?q="+encodeURIComponent(q),{method:"DELETE"});
+    const d=await r.json();
+    alert("Удалено "+d.deleted+" записей для '"+q+"'. Теперь перезалей XLS файл и нажми Пересобрать кеш.");
+    btn.textContent="🔧 Починить кодировку"; btn.disabled=false;
+    loadDates();
+  }catch(ex){
+    alert("Ошибка: "+ex.message);
+    btn.textContent="🔧 Починить кодировку"; btn.disabled=false;
+  }
+}
+
+async function rebuildCache(e){
+  const btn=e.target; btn.textContent="⏳ Пересобираю..."; btn.disabled=true;
+  try{
+    const r=await fetch("/api/rebuild-analytics",{method:"POST"});
+    btn.textContent="✓ Готово";
+    setTimeout(()=>{btn.textContent="🔄 Пересобрать кеш";btn.disabled=false;},2000);
+    loadDates(); loadStocks();
+  }catch(ex){
+    btn.textContent="✗ Ошибка";
+    setTimeout(()=>{btn.textContent="🔄 Пересобрать кеш";btn.disabled=false;},2000);
+  }
+}
+</script>
+</body>
+</html>

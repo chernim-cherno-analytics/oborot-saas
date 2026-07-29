@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+  <title>Chernim Cherno · Яндекс</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0 }
+    body { font-family: Helvetica, 'Helvetica Neue', Arial, sans-serif; min-height: 100vh; background: #f3e9e0; color:#1f1f1f; }
+    .gradient-bg { position: fixed; inset: 0; z-index: 0; overflow: hidden; background: #f3e9e0; }
+    .gradient-bg::before, .gradient-bg::after, .b1, .b2, .b3 {
+      position: absolute; border-radius: 50%; filter: blur(90px); opacity: 0.9; }
+    .gradient-bg::before { content: ''; width: 70vw; height: 70vw;
+      background: radial-gradient(circle, #efe5db, transparent 70%);
+      top: -20%; left: -10%; animation: blob1 11s ease-in-out infinite alternate; }
+    .gradient-bg::after { content: ''; width: 60vw; height: 60vw;
+      background: radial-gradient(circle, #e2d8cf, transparent 70%);
+      bottom: -15%; right: -10%; animation: blob2 14s ease-in-out infinite alternate; }
+    .b1 { width: 55vw; height: 55vw; background: radial-gradient(circle, #d3c9c2, transparent 70%);
+      top: 30%; left: 30%; animation: blob3 9s ease-in-out infinite alternate; }
+    .b2 { width: 45vw; height: 45vw; background: radial-gradient(circle, #c1b8b3, transparent 70%);
+      top: -10%; right: 10%; animation: blob4 13s ease-in-out infinite alternate; }
+    .b3 { width: 50vw; height: 50vw; background: radial-gradient(circle, #aba3a0, transparent 70%);
+      bottom: 10%; left: 20%; animation: blob5 16s ease-in-out infinite alternate; }
+    .vignette { position: fixed; inset: 0; z-index: 1; pointer-events: none;
+      background: radial-gradient(ellipse at center, transparent 40%, rgba(171,163,160,0.35) 100%); }
+    .grain { position: fixed; inset: 0; z-index: 2; pointer-events: none; }
+    .grain::before { content: ''; position: absolute; inset: -50%; width: 200%; height: 200%;
+      background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 512 512' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='grain'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.75' numOctaves='4' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23grain)'/%3E%3C/svg%3E");
+      background-size: 200px 200px; opacity: 0.12; mix-blend-mode: overlay;
+      animation: grain-shift 0.15s steps(1) infinite; }
+    @keyframes grain-shift {
+      0%{transform:translate(0,0)} 10%{transform:translate(-3%,-4%)} 20%{transform:translate(4%,2%)}
+      30%{transform:translate(-2%,5%)} 40%{transform:translate(5%,-3%)} 50%{transform:translate(-4%,4%)}
+      60%{transform:translate(3%,-2%)} 70%{transform:translate(-5%,3%)} 80%{transform:translate(2%,-5%)}
+      90%{transform:translate(-3%,2%)} 100%{transform:translate(4%,-4%)} }
+    @keyframes blob1 { 0%{transform:translate(0,0) scale(1)} 33%{transform:translate(8vw,5vh) scale(1.1)} 66%{transform:translate(-5vw,10vh) scale(0.95)} 100%{transform:translate(10vw,-8vh) scale(1.05)} }
+    @keyframes blob2 { 0%{transform:translate(0,0) scale(1)} 33%{transform:translate(-10vw,-6vh) scale(1.08)} 66%{transform:translate(6vw,-12vh) scale(1.12)} 100%{transform:translate(-8vw,5vh) scale(0.92)} }
+    @keyframes blob3 { 0%{transform:translate(0,0) scale(1)} 50%{transform:translate(-12vw,8vh) scale(1.15)} 100%{transform:translate(8vw,-10vh) scale(0.9)} }
+    @keyframes blob4 { 0%{transform:translate(0,0) scale(0.9)} 50%{transform:translate(10vw,12vh) scale(1.1)} 100%{transform:translate(-6vw,6vh) scale(1)} }
+    @keyframes blob5 { 0%{transform:translate(0,0) scale(1.1)} 50%{transform:translate(14vw,-8vh) scale(0.9)} 100%{transform:translate(-10vw,-12vh) scale(1.05)} }
+    .header { position: sticky; top: 0; z-index: 200; padding: 0 28px; height: 56px;
+      display: flex; align-items: center; justify-content: space-between; }
+    .logo { text-decoration: none; font-size: 15px; font-weight: 400; letter-spacing: 0.12em; color: #1f1f1f; }
+    .nav { display: flex; gap: 20px }
+    .nav a { font-size: 13px; font-weight: 400; letter-spacing: 0.05em;
+      color: rgba(31,31,31,0.45); text-decoration: none; transition: color .2s; }
+    .nav a:hover { color: #434446 }
+    .nav a.active { color: #1f1f1f; font-weight: 500; }
+    .main { padding: 20px 28px; max-width: 1400px; margin: 0 auto; position: relative; z-index: 3; }
+    .toolbar { display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:16px }
+    .preset { font-size:12px; font-weight:500; padding:6px 14px; border-radius:20px;
+      border:1px solid rgba(31,31,31,0.09); background:rgba(255,255,255,0.55);
+      color:#434446; cursor:pointer; transition:all .15s }
+    .preset:hover { background:rgba(31,31,31,0.09) }
+    .preset.active { background:rgba(31,31,31,0.16); color:#1f1f1f; border-color:rgba(31,31,31,0.45) }
+    .agent { font-size:11px; color:rgba(31,31,31,0.5); margin-left:auto }
+    .cards { display:grid; grid-template-columns:repeat(4,1fr); gap:12px; margin-bottom:18px }
+    .card { background:rgba(255,255,255,0.6); backdrop-filter:blur(10px);
+      border:1px solid rgba(31,31,31,0.08); border-radius:12px; padding:14px 18px }
+    .card .l { font-size:10px; font-weight:600; letter-spacing:.07em; text-transform:uppercase;
+      color:rgba(31,31,31,0.5); margin-bottom:6px }
+    .card .v { font-size:24px; font-weight:700 }
+    .card .s { font-size:11px; color:rgba(31,31,31,0.5); margin-top:4px }
+    .panel { background:rgba(255,255,255,0.6); backdrop-filter:blur(12px);
+      border:1px solid rgba(31,31,31,0.08); border-radius:14px; padding:18px 22px; margin-bottom:18px }
+    .ptitle { font-size:12px; font-weight:600; letter-spacing:.07em; text-transform:uppercase;
+      color:#434446; margin-bottom:12px }
+    #ychart { width:100%; height:300px; display:block }
+    table { width:100%; border-collapse:collapse; font-size:12.5px }
+    th { text-align:left; padding:8px 10px; font-size:10px; font-weight:500; text-transform:uppercase;
+      letter-spacing:.06em; color:rgba(31,31,31,0.55); border-bottom:1px solid rgba(31,31,31,0.1) }
+    th.r, td.r { text-align:right }
+    td { padding:7px 10px; border-bottom:1px solid rgba(31,31,31,0.06) }
+    .minibar { display:inline-block; height:8px; border-radius:4px; background:rgba(252,204,0,0.9); vertical-align:middle; margin-right:8px }
+    .ctip { position:fixed; pointer-events:none; display:none; background:#1f1f1f; color:#f3e9e0;
+      font-size:11px; padding:7px 11px; border-radius:8px; z-index:100; white-space:pre; line-height:1.5 }
+    .loading { text-align:center; padding:60px; color:rgba(31,31,31,0.45); font-size:13px }
+    .note { font-size:11px; color:rgba(31,31,31,0.45); margin-top:8px }
+  </style>
+</head>
+<body>
+<div class="gradient-bg"><div class="b1"></div><div class="b2"></div><div class="b3"></div></div>
+<div class="vignette"></div><div class="grain"></div>
+
+<div class="header">
+  <a class="logo" href="/analytics">Chernim&nbsp;Cherno</a>
+  <nav class="nav">
+    <a href="/analytics">Остатки</a>
+    <a href="/turnover">Оборачиваемость</a>
+    <a href="/order">Заказ</a>
+    <a href="/sizes">Размеры</a>
+    <a href="/budget">Бюджет</a>
+    <a href="/forecast">Прогноз</a>
+    <a href="/revenue">Оборот</a>
+    <a href="/transfers">Перемещения</a>
+    <a href="/money">Деньги</a> <a href="/paris">Париж</a>
+    <a href="/yandex" class="active">Яндекс</a>
+  </nav>
+</div>
+
+<div class="main">
+  <div class="toolbar">
+    <button class="preset" data-m="3">3 месяца</button>
+    <button class="preset active" data-m="6">6 месяцев</button>
+    <button class="preset" data-m="12">Год</button>
+    <button class="preset" data-m="all">Всё время</button>
+    <input class="preset" id="search" placeholder="Поиск позиции..." style="margin-left:auto;width:240px;cursor:text;text-align:left">
+    <span class="agent" id="agent"></span>
+  </div>
+
+  <div class="cards">
+    <div class="card"><div class="l">Выручка Яндекса</div><div class="v" id="c-rev">—</div><div class="s" id="c-rev-s"></div></div>
+    <div class="card"><div class="l">Продано</div><div class="v" id="c-qty">—</div><div class="s" id="c-qty-s"></div></div>
+    <div class="card"><div class="l">Возвраты</div><div class="v" id="c-ret">—</div><div class="s" id="c-ret-s"></div></div>
+    <div class="card"><div class="l">Валовая прибыль</div><div class="v" id="c-prof">—</div><div class="s">до комиссий Яндекса · по себесам из МС</div></div>
+  </div>
+
+  <div class="panel">
+    <div class="ptitle">Выручка по месяцам</div>
+    <canvas id="ychart"></canvas>
+  </div>
+
+  <div class="panel">
+    <div class="ptitle" id="top-title">Топ позиций</div>
+    <table><thead><tr><th style="width:30px">#</th><th>Название</th><th class="r">Шт</th><th class="r">Выручка</th><th class="r">Доля</th></tr></thead>
+    <tbody id="toptb"><tr><td colspan="5" class="loading">Загружаю из МойСклада...</td></tr></tbody></table>
+    <div class="note">Данные — отгрузки контрагенту-маркетплейсу из МойСклада, обновляются автоматически. Комиссии Яндекса в МС не видны, поэтому прибыль указана валовая (выручка − себестоимость).</div>
+  </div>
+</div>
+<div class="ctip" id="ctip"></div>
+
+<script>
+function mw(name,q){ if(!q) return true; const nl=name.toLowerCase(); return q.split(/\s+/).every(w=>nl.includes(w)); }
+function fmt(n){ return Math.round(n||0).toLocaleString("ru-RU"); }
+function fmtM(n){
+  n=n||0;
+  if(Math.abs(n)>=1e6) return (n/1e6).toLocaleString("ru-RU",{maximumFractionDigits:2})+" млн ₽";
+  if(Math.abs(n)>=1e3) return Math.round(n/1e3).toLocaleString("ru-RU")+" тыс ₽";
+  return Math.round(n).toLocaleString("ru-RU")+" ₽";
+}
+const MONTHS_RU=["янв","фев","мар","апр","май","июн","июл","авг","сен","окт","ноя","дек"];
+
+let DATA=null, COSTP={}, curMonths=6;
+
+async function load(){
+  const [yRes,cRes]=await Promise.all([fetch("/api/yandex-live"),fetch("/api/cost-prices")]);
+  DATA=await yRes.json();
+  try{ COSTP=await cRes.json(); }catch(e){ COSTP={}; }
+  if(DATA.error){
+    document.getElementById("toptb").innerHTML='<tr><td colspan="5" class="loading">'+DATA.error+'</td></tr>';
+    return;
+  }
+  document.getElementById("agent").textContent="контрагент: "+DATA.agent;
+  render();
+}
+
+function monthsList(){
+  const set=new Set();
+  for(const d of Object.values(DATA.skus)) for(const m of Object.keys(d)) set.add(m);
+  for(const m of Object.keys(DATA.returns||{})) set.add(m);
+  return [...set].sort();
+}
+
+function render(){
+  const all=monthsList();
+  const months=curMonths==="all"?all:all.slice(-curMonths);
+  const from=months[0];
+  // агрегаты за период
+  let totQ=0, totR=0, cost=0;
+  const items=[];
+  for(const [base,d] of Object.entries(DATA.skus)){
+    let q=0,r=0;
+    for(const [m,v] of Object.entries(d)){
+      if(m>=from){ q+=v[0]; r+=v[1]; }
+    }
+    if(q===0&&r===0) continue;
+    totQ+=q; totR+=r;
+    cost+=q*((COSTP[base]||{}).cost||0);
+    items.push({base,q,r});
+  }
+  let retQ=0, retR=0;
+  for(const [m,v] of Object.entries(DATA.returns||{})){
+    if(m>=from){ retQ+=v[0]; retR+=v[1]; }
+  }
+  const label=curMonths==="all"?"за всё время":"за "+months.length+" мес";
+  document.getElementById("c-rev").textContent=fmtM(totR-retR);
+  document.getElementById("c-rev-s").textContent="нетто "+label+" · грязными "+fmtM(totR);
+  document.getElementById("c-qty").textContent=fmt(totQ)+" шт";
+  document.getElementById("c-qty-s").textContent=items.length+" позиций";
+  document.getElementById("c-ret").textContent=retQ?fmt(retQ)+" шт":"—";
+  document.getElementById("c-ret-s").textContent=retR?("−"+fmtM(retR)):"";
+  document.getElementById("c-prof").textContent=fmtM(totR-retR-cost);
+
+  // топ
+  const qs=(document.getElementById("search").value||"").toLowerCase();
+  const sorted=items.sort((a,b)=>b.r-a.r);
+  const top=qs?sorted.filter(it=>mw(it.base,qs)).slice(0,50):sorted.slice(0,20);
+  document.getElementById("top-title").textContent=(qs?"Найдено: "+top.length+" · ":"Топ позиций · ")+label;
+  const maxTop=top.length?top[0].r:1;
+  document.getElementById("toptb").innerHTML=top.map((it,i)=>
+    `<tr><td>${i+1}</td><td>${it.base}</td><td class="r">${fmt(it.q)}</td>
+     <td class="r"><span class="minibar" style="width:${Math.max(2,it.r/maxTop*90)}px"></span><b>${fmt(it.r)} ₽</b></td>
+     <td class="r">${totR>0?(it.r/totR*100).toFixed(1):0}%</td></tr>`).join("")
+    ||'<tr><td colspan="5" class="loading">Нет продаж за период</td></tr>';
+
+  drawChart(all.slice(-18));
+}
+
+function drawChart(months){
+  // помесячно: продажи и возвраты
+  const sales=months.map(m=>{
+    let r=0;
+    for(const d of Object.values(DATA.skus)) if(d[m]) r+=d[m][1];
+    return r;
+  });
+  const rets=months.map(m=>(DATA.returns&&DATA.returns[m])?DATA.returns[m][1]:0);
+  const cv=document.getElementById("ychart");
+  const W=cv.offsetWidth||1100, H=300;
+  cv.width=W*devicePixelRatio; cv.height=H*devicePixelRatio;
+  cv.style.height=H+"px";
+  const ctx=cv.getContext("2d");
+  ctx.scale(devicePixelRatio,devicePixelRatio);
+  const padL=8,padR=72,padT=16,padB=30;
+  const maxV=Math.max(...sales,1)*1.08;
+  const bw=(W-padL-padR)/months.length;
+  const y=v=>H-padB-(v/maxV)*(H-padT-padB);
+  ctx.font="10px Helvetica,Arial"; ctx.fillStyle="rgba(31,31,31,0.45)";
+  for(let k=0;k<=4;k++){
+    const v=maxV*k/4, yy=y(v);
+    ctx.strokeStyle="rgba(31,31,31,0.07)"; ctx.beginPath(); ctx.moveTo(padL,yy); ctx.lineTo(W-padR,yy); ctx.stroke();
+    ctx.fillText(fmtM(v),W-padR+6,yy+4);
+  }
+  months.forEach((m,i)=>{
+    const x=padL+i*bw+bw*0.16, w=bw*0.68;
+    // продажи — жёлтый Яндекса
+    ctx.fillStyle="rgba(252,204,0,0.9)";
+    ctx.fillRect(x,y(sales[i]),w,H-padB-y(sales[i]));
+    // возвраты — красная шляпка
+    if(rets[i]>0){
+      ctx.fillStyle="rgba(221,0,4,0.55)";
+      ctx.fillRect(x,y(sales[i]),w,Math.max(2,(rets[i]/maxV)*(H-padT-padB)));
+    }
+    const [yy,mm]=m.split("-");
+    ctx.fillStyle="rgba(31,31,31,0.5)"; ctx.font="9px Helvetica,Arial"; ctx.textAlign="center";
+    ctx.fillText(MONTHS_RU[+mm-1]+" "+yy.slice(2),x+w/2,H-8);
+    ctx.fillStyle="rgba(31,31,31,0.7)"; ctx.font="bold 9px Helvetica,Arial";
+    ctx.fillText((sales[i]/1e6).toFixed(1),x+w/2,y(sales[i])-4);
+    ctx.textAlign="left";
+  });
+  cv.onmousemove=(ev)=>{
+    const r=cv.getBoundingClientRect();
+    const i=Math.floor((ev.clientX-r.left-padL)/bw);
+    const tip=document.getElementById("ctip");
+    if(i<0||i>=months.length){ tip.style.display="none"; return; }
+    tip.textContent=months[i]+"\nпродажи: "+fmtM(sales[i])+(rets[i]?"\nвозвраты: −"+fmtM(rets[i]):"");
+    tip.style.display="block";
+    tip.style.left=(ev.clientX+14)+"px"; tip.style.top=(ev.clientY+10)+"px";
+  };
+  cv.onmouseleave=()=>{ document.getElementById("ctip").style.display="none"; };
+}
+
+// только кнопки с data-m: у поля поиска тоже класс .preset (для стиля), и раньше клик
+// по нему молча переключал период на «всё время» (dataset.m=undefined → NaN → slice(-NaN))
+document.querySelectorAll(".preset[data-m]").forEach(b=>{
+  b.addEventListener("click",()=>{
+    document.querySelectorAll(".preset").forEach(x=>x.classList.remove("active"));
+    b.classList.add("active");
+    curMonths=b.dataset.m==="all"?"all":+b.dataset.m;
+    render();
+  });
+});
+document.addEventListener("input",(e)=>{ if(e.target&&e.target.id==="search"&&DATA&&!DATA.error) render(); });
+window.addEventListener("resize",()=>{ if(DATA&&!DATA.error) render(); });
+load();
+</script>
+</body>
+</html>
