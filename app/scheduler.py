@@ -33,7 +33,7 @@ from sqlalchemy import select
 
 from app import ms_sync, notify
 from app.db import SessionLocal
-from app.models import Connection
+from app.models import Connection, Org
 
 log = logging.getLogger("oborot.scheduler")
 
@@ -53,12 +53,22 @@ def _enabled() -> bool:
 # ── Джоб ─────────────────────────────────────────────────────────────────────
 
 def _orgs_with_active_moysklad() -> list[int]:
-    """org_id всех организаций с активным moysklad-подключением."""
+    """org_id организаций с активным moysklad-подключением.
+
+    Организации со status='suspended' (Uninstall/Suspend приложения из
+    каталога МойСклад — см. routes_ms_vendor) пропускаются: их access_token
+    отозван МС, синк только зря молотил бы ошибки.
+    """
     db = SessionLocal()
     try:
         rows = db.execute(
             select(Connection.org_id)
-            .where(Connection.kind == "moysklad", Connection.status == "active")
+            .join(Org, Org.id == Connection.org_id)
+            .where(
+                Connection.kind == "moysklad",
+                Connection.status == "active",
+                Org.status != "suspended",
+            )
             .order_by(Connection.org_id)
         ).all()
         return [org_id for (org_id,) in rows]

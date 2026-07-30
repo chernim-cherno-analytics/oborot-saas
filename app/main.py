@@ -18,6 +18,8 @@ from app import auth
 from app.api import router as api_router
 from app.routes_connect import router as connect_router
 from app.routes_extra import router as extra_router
+from app.routes_ms_app import router as ms_app_router
+from app.routes_ms_vendor import router as ms_vendor_router
 from app.db import get_db, init_db
 from app.models import Connection, Membership, Org, User
 
@@ -32,6 +34,24 @@ app = FastAPI(title="Оборот", docs_url=None, redoc_url=None)
 app.include_router(api_router)
 app.include_router(connect_router)
 app.include_router(extra_router)
+app.include_router(ms_vendor_router)
+app.include_router(ms_app_router)
+
+
+@app.middleware("http")
+async def _csp_frame_ancestors(request: Request, call_next):
+    """Разрешаем встраивать «Оборот» ТОЛЬКО в сам сервис и в МойСклад.
+
+    Приложение маркетплейса МС работает полностраничным iframe раздела
+    «Приложения» — вместо полного запрета фреймов ограничиваем список
+    предков CSP-директивой frame-ancestors (современная замена X-Frame-Options).
+    """
+    response = await call_next(request)
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "frame-ancestors 'self' https://online.moysklad.ru",
+    )
+    return response
 
 from app import scheduler as _scheduler  # noqa: E402
 _scheduler.attach(app)

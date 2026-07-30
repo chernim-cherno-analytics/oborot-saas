@@ -1,6 +1,52 @@
 {% extends "base.html" %}
 {% block content %}
 
+<style>
+  /* «Здоровье сезона» — sell-through 70/20/10 (локальные стили карточки) */
+  .season-bar {
+    display: flex; height: 28px; border-radius: 7px; overflow: hidden;
+    background: #eceff3; border: 1px solid var(--line-soft);
+  }
+  .season-bar i {
+    display: flex; align-items: center; justify-content: center;
+    height: 100%; min-width: 0; font-style: normal;
+    transition: width .3s;
+  }
+  .season-bar i span {
+    font-family: var(--mono); font-size: 11px; font-weight: 700;
+    font-variant-numeric: tabular-nums; color: #fff; white-space: nowrap;
+    text-shadow: 0 1px 1px rgba(15, 23, 34, .25);
+  }
+  .season-bar .sb-full { background: var(--green-fill); }
+  .season-bar .sb-disc { background: var(--amber-fill); }
+  .season-bar .sb-left { background: #97a1af; }
+  .season-legend { display: flex; gap: 22px; margin-top: 11px; align-items: baseline; flex-wrap: wrap; }
+  .season-legend .sl-item { font-size: 12px; color: var(--ink-2); white-space: nowrap; }
+  .season-legend .sl-item b {
+    font-family: var(--mono); font-size: 13.5px; font-weight: 700;
+    font-variant-numeric: tabular-nums; color: var(--ink); margin: 0 2px;
+  }
+  .season-legend .sl-money { color: var(--ink-3); font-family: var(--mono); font-size: 11.5px; font-variant-numeric: tabular-nums; }
+  .season-legend .sw { display: inline-block; width: 9px; height: 9px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
+  .season-legend .sw.g { background: var(--green-fill); }
+  .season-legend .sw.y { background: var(--amber-fill); }
+  .season-legend .sw.n { background: #97a1af; }
+  .season-norm {
+    margin-left: auto; font-family: var(--mono); font-size: 11.5px; font-weight: 600;
+    font-variant-numeric: tabular-nums; color: var(--ink-3); white-space: nowrap;
+  }
+  .season-msg {
+    margin-top: 12px; padding-top: 10px; border-top: 1px dashed var(--line-soft);
+    font-size: 12.5px; color: var(--ink-2);
+  }
+  .tip-q {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 16px; height: 16px; border-radius: 50%;
+    background: #eceff3; color: var(--ink-3);
+    font-size: 10.5px; font-weight: 700; cursor: help; user-select: none;
+  }
+</style>
+
 <div class="metric-grid" id="metrics" style="grid-template-columns:1.25fr 1fr 1fr 1fr 1fr;">
   <div class="metric alert" id="risk-tile">
     <div class="m-label">Риск стокаута</div>
@@ -51,6 +97,18 @@
     <div class="card-body flush" id="top-box">
       <div class="loading-stub">Загрузка…</div>
     </div>
+  </div>
+</div>
+
+<div class="card" style="margin-top:16px;">
+  <div class="card-head">
+    <h2 id="season-title">Здоровье сезона</h2>
+    <span class="tip-q" title="Методика: окно — с начала календарного сезона по сегодня. «Полная цена» — продажи, где фактическая цена ≥ 95% номинала позиции; остальное — «со скидкой»; возвраты вычитаются из своей корзины. «Остаток» — текущий сток позиций сезона (продавались в сезоне или появились в стоке в сезоне), оценённый по номинальной цене. Доли — от суммы: выручка сезона + остаток. Отраслевой норматив здорового сезона: 70% по полной цене / 20% со скидкой / 10% остаток.">?</span>
+    <div class="spacer"></div>
+    <span class="badge" id="season-badge" style="display:none;"></span>
+  </div>
+  <div class="card-body" id="season-box">
+    <div class="loading-stub">Загрузка…</div>
   </div>
 </div>
 
@@ -163,6 +221,9 @@ document.addEventListener("DOMContentLoaded", function () {
     document.getElementById("cls-good").textContent = fmtInt(c.good || 0);
     document.getElementById("cls-best").textContent = fmtInt(c.best || 0);
 
+    // Здоровье сезона (sell-through 70/20/10)
+    renderSeason(d.season_health);
+
     // Категории
     var cats = d.categories || [];
     document.getElementById("cats-box").innerHTML = cats.length
@@ -175,6 +236,59 @@ document.addEventListener("DOMContentLoaded", function () {
             "</div>";
         }).join("")
       : '<div class="loading-stub">Нет данных по категориям</div>';
+  }
+
+  function pctTxt(x) { return Math.round((x || 0) * 100) + "%"; }
+
+  function renderSeason(sh) {
+    var box = document.getElementById("season-box");
+    if (!sh) {
+      box.innerHTML = '<div class="loading-stub">Нет данных</div>';
+      return;
+    }
+    if (sh.label) {
+      document.getElementById("season-title").textContent = "Здоровье сезона (" + sh.label + ")";
+    }
+    if (sh.status === "no_data") {
+      box.innerHTML = emptyState("Пока нет данных за сезон",
+        "Как только появятся продажи или сток сезонных позиций, здесь будет sell-through против норматива 70 / 20 / 10.", "");
+      return;
+    }
+    var st = { healthy: ["green", "в норме"], warning: ["yellow", "внимание"], alarm: ["red", "тревога"] }[sh.status] || ["gray", sh.status];
+    var badge = document.getElementById("season-badge");
+    badge.style.display = "";
+    badge.className = "badge " + st[0];
+    badge.textContent = st[1];
+
+    var bar = [
+      { cls: "sb-full", share: sh.full_share },
+      { cls: "sb-disc", share: sh.disc_share },
+      { cls: "sb-left", share: sh.leftover_share }
+    ].map(function (s) {
+      var pct = (s.share || 0) * 100;
+      if (pct <= 0) return "";
+      var lbl = pct >= 7 ? "<span>" + Math.round(pct) + "%</span>" : "";
+      return '<i class="' + s.cls + '" style="width:' + pct.toFixed(1) + '%">' + lbl + "</i>";
+    }).join("");
+
+    var msg;
+    if (sh.status === "healthy") {
+      msg = "Сезон идёт здорово: продажи по полной цене держат норматив.";
+    } else if (sh.reason === "leftover") {
+      msg = 'Высокий остаток — риск затоварки к концу сезона. Спланируйте распродажу в <a href="/forecast">Прогнозе</a>.';
+    } else {
+      msg = 'Много продаж со скидкой — проверьте страницу <a href="/discounts">Скидки</a>.';
+    }
+
+    box.innerHTML =
+      '<div class="season-bar">' + bar + "</div>" +
+      '<div class="season-legend">' +
+        '<span class="sl-item"><span class="sw g"></span>Полная цена <b>' + pctTxt(sh.full_share) + '</b> <span class="sl-money">' + fmtMoney(sh.full_price_rev) + "</span></span>" +
+        '<span class="sl-item"><span class="sw y"></span>Со скидкой <b>' + pctTxt(sh.disc_share) + '</b> <span class="sl-money">' + fmtMoney(sh.discounted_rev) + "</span></span>" +
+        '<span class="sl-item"><span class="sw n"></span>Остаток <b>' + pctTxt(sh.leftover_share) + '</b> <span class="sl-money">' + fmtMoney(sh.leftover_value) + "</span></span>" +
+        '<span class="season-norm" title="Отраслевой норматив sell-through сезона">Норматив: 70 / 20 / 10</span>' +
+      "</div>" +
+      '<div class="season-msg">' + msg + "</div>";
   }
 });
 </script>

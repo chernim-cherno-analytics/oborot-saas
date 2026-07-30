@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Оборот — аналитика остатков и заказов на производство для fashion-брендов</title>
-<meta name="description" content="«Оборот» подключается к МойСклад и показывает, что дошить, а что уценить: оборачиваемость по каждой позиции, размерные сетки, готовый заказ на производство. 14 дней бесплатно.">
+<title>Оборот — что дошить, что уценить, что не повторять. Аналитика для брендов одежды и украшений</title>
+<meta name="description" content="«Оборот» подключается к МойСклад и каждое утро отвечает: что дошить и в каких размерах, что уценить, что не повторять. Товарный аналитик за 9 900 ₽/мес для брендов одежды, украшений, обуви и аксессуаров. 14 дней бесплатно.">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Ccircle cx='12' cy='12' r='11' fill='%232563eb'/%3E%3Cpath d='M12 5a7 7 0 1 0 7 7' fill='none' stroke='white' stroke-width='2.4' stroke-linecap='round'/%3E%3Cpath d='M16 2.6l3.4 2.8-4.1 1.8z' fill='white'/%3E%3C/svg%3E">
 <style>
   :root{
@@ -100,7 +100,7 @@
 
   /* ── Секции ─────────────────────────────── */
   section{padding:96px 0}
-  .sec-head{max-width:640px;margin:0 auto 56px;text-align:center}
+  .sec-head{max-width:680px;margin:0 auto 56px;text-align:center}
   .sec-eyebrow{font-size:13px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--blue);margin-bottom:12px}
   h2{font-size:clamp(28px,3.4vw,40px);line-height:1.15;letter-spacing:-.025em;font-weight:800;margin-bottom:14px}
   .sec-sub{font-size:17.5px;color:var(--muted)}
@@ -115,14 +115,16 @@
   .step-time{display:inline-block;margin-top:14px;font-size:12.5px;font-weight:600;color:var(--ink-2);
     background:var(--bg-soft);border:1px solid var(--line);border-radius:999px;padding:5px 12px}
 
-  /* ── Фичи ───────────────────────────────── */
+  /* ── Боли → решения ─────────────────────── */
   .features-sec{background:var(--bg-soft)}
   .features{display:grid;grid-template-columns:repeat(3,1fr);gap:24px}
   .feature{background:#fff;border:1px solid var(--line);border-radius:var(--radius);padding:28px;box-shadow:var(--shadow-card);
     display:flex;flex-direction:column;gap:12px;transition:transform .15s ease, box-shadow .15s ease}
   .feature:hover{transform:translateY(-3px);box-shadow:0 4px 8px rgba(15,23,42,.05),0 16px 36px rgba(15,23,42,.09)}
-  .f-icon{width:44px;height:44px;border-radius:12px;background:var(--blue-soft);color:var(--blue-dark);
-    display:flex;align-items:center;justify-content:center}
+  .pain-q{font-size:15.5px;line-height:1.5;font-weight:600;color:var(--ink);
+    border-left:3px solid var(--red);padding:2px 0 2px 14px}
+  .f-solves{display:inline-flex;align-items:center;gap:7px;font-size:11.5px;font-weight:700;letter-spacing:.06em;
+    text-transform:uppercase;color:var(--green-dark);margin-top:2px}
   .feature h3{font-size:18px;letter-spacing:-.01em}
   .feature p{font-size:14.5px;color:var(--muted)}
   .f-demo{margin-top:auto;padding-top:14px}
@@ -135,10 +137,11 @@
   .alert-line{display:flex;align-items:center;gap:8px;font-size:12px;border:1px solid #fecaca;background:#fef2f2;color:#b91c1c;
     border-radius:9px;padding:8px 10px;font-weight:600}
   .alert-line.soft{border-color:#fde8c0;background:#fffaf0;color:#b45309}
+  .alert-line.ok{border-color:#c9ecc0;background:#f2fbef;color:var(--green-dark)}
   .mini-rows{border:1px solid var(--line);border-radius:10px;overflow:hidden;font-size:12px}
-  .mini-rows>div{display:flex;justify-content:space-between;padding:7px 11px;border-bottom:1px solid #eef2f7;background:#fff}
+  .mini-rows>div{display:flex;justify-content:space-between;gap:10px;padding:7px 11px;border-bottom:1px solid #eef2f7;background:#fff}
   .mini-rows>div:last-child{border-bottom:none}
-  .mini-rows b{font-weight:700}
+  .mini-rows b{font-weight:700;white-space:nowrap}
 
   /* ── Кейс ───────────────────────────────── */
   .case{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:56px;align-items:center}
@@ -156,8 +159,28 @@
   .fact b{display:block;font-size:15.5px;margin-bottom:3px}
   .fact p{font-size:14px;color:var(--muted)}
 
+  /* ── Сравнение с альтернативами ─────────── */
+  .compare-sec{background:var(--bg-soft)}
+  .compare-scroll{overflow-x:auto;-webkit-overflow-scrolling:touch;border-radius:16px;
+    border:1px solid var(--line);box-shadow:var(--shadow-card);background:#fff}
+  table.compare{width:100%;min-width:820px;border-collapse:collapse;font-size:14px;background:#fff}
+  .compare th,.compare td{padding:14px 18px;border-bottom:1px solid #eef2f7;text-align:left;vertical-align:top;line-height:1.45}
+  .compare thead th{font-size:13.5px;font-weight:700;letter-spacing:-.01em;background:#fbfcfe;border-bottom:1px solid var(--line)}
+  .compare thead th small{display:block;font-size:12px;font-weight:600;color:var(--muted);margin-top:2px}
+  .compare tbody tr:last-child td{border-bottom:none}
+  .compare td:first-child,.compare th:first-child{color:var(--muted);font-weight:600;font-size:13px;min-width:130px;
+    position:sticky;left:0;background:#fff;z-index:1;box-shadow:6px 0 8px -6px rgba(15,23,42,.08)}
+  .compare thead th:first-child{background:#fbfcfe}
+  .compare-hint{display:none;text-align:center;font-size:12.5px;color:var(--muted);margin-top:10px}
+  .compare td.ob,.compare th.ob{background:#f0f6ff;color:var(--ink);font-weight:600}
+  .compare thead th.ob{color:var(--blue-dark)}
+  .compare td{color:var(--ink-2)}
+  .compare td:first-child{color:var(--muted)}
+  .compare-note{text-align:center;margin-top:28px;font-size:16.5px;color:var(--ink-2);max-width:38em;margin-left:auto;margin-right:auto}
+  .compare-note b{color:var(--ink)}
+
   /* ── Тарифы ─────────────────────────────── */
-  .pricing-sec{background:var(--bg-soft)}
+  .pricing-sec{background:var(--bg)}
   .plans{display:grid;grid-template-columns:repeat(3,1fr);gap:24px;align-items:stretch}
   .plan{background:#fff;border:1px solid var(--line);border-radius:20px;padding:34px 30px;box-shadow:var(--shadow-card);
     display:flex;flex-direction:column;position:relative}
@@ -179,6 +202,7 @@
   .plans-foot{text-align:center;margin-top:30px;font-size:14.5px;color:var(--muted)}
 
   /* ── FAQ ────────────────────────────────── */
+  .faq-sec{background:var(--bg-soft)}
   .faq{max-width:760px;margin:0 auto;display:grid;gap:12px}
   .faq details{background:#fff;border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow-card);overflow:hidden}
   .faq summary{list-style:none;cursor:pointer;display:flex;justify-content:space-between;align-items:center;gap:16px;
@@ -235,6 +259,7 @@
     .mock-t th,.mock-t td{padding-left:6px;padding-right:6px}
     .final .btn{width:100%;margin:0 0 12px}
     .foot-grid{flex-direction:column}
+    .compare-hint{display:block}
   }
 </style>
 </head>
@@ -258,9 +283,9 @@
 <div class="hero">
   <div class="wrap hero-inner">
     <div>
-      <div class="eyebrow">Аналитика для брендов одежды и украшений</div>
-      <h1>Деньги заморожены в&nbsp;неликвиде, а&nbsp;бестселлеры опять кончились?</h1>
-      <p class="hero-sub">«Оборот» подключается к&nbsp;МойСклад и&nbsp;по&nbsp;каждой позиции — вплоть до&nbsp;размера — показывает, <strong>что дошить на&nbsp;производстве, а&nbsp;что пора уценить</strong>. Без выгрузок в&nbsp;таблицы и&nbsp;ручных расчётов.</p>
+      <div class="eyebrow">Для брендов одежды, украшений, обуви и аксессуаров</div>
+      <h1>Деньги заморожены в&nbsp;остатках, а&nbsp;хит <span class="accent">кончился в&nbsp;разгар сезона?</span></h1>
+      <p class="hero-sub">«Оборот» подключается к&nbsp;вашему МойСклад и&nbsp;каждое утро отвечает на&nbsp;три вопроса владельца: <strong>что дошить, что уценить, а&nbsp;что не&nbsp;повторять</strong>. По&nbsp;каждой модели, вплоть до&nbsp;размера. Без&nbsp;выгрузок и&nbsp;расчётов «на&nbsp;глазок».</p>
       <div class="hero-cta">
         <a class="btn btn-primary btn-lg" href="/register">Попробовать бесплатно</a>
         <a class="btn btn-ghost-dark btn-lg" href="/register">Начать с демо-данными</a>
@@ -295,11 +320,89 @@
             <tr><td><span class="dot dull"></span>Футболка «База»</td><td class="r num">1 480</td><td class="r num">44</td><td class="r num">2 окт</td><td class="r num need">10 шт</td></tr>
           </tbody>
         </table>
-        <div class="mock-foot"><span class="mock-btn">Создать заказ на производство</span></div>
+        <div class="mock-foot"><span class="mock-btn">Создать заказ в МойСклад</span></div>
       </div>
     </div>
   </div>
 </div>
+
+<!-- ═══ Боли → решения ═══ -->
+<section class="features-sec" id="pains">
+  <div class="wrap">
+    <div class="sec-head">
+      <div class="sec-eyebrow">Знакомо?</div>
+      <h2>Пять фраз, которые мы слышим от каждого бренда</h2>
+      <p class="sec-sub">Под каждой — то, что «Оборот» делает вместо вас. Без магии: математика по вашим реальным продажам из МойСклад.</p>
+    </div>
+    <div class="features">
+
+      <div class="feature">
+        <p class="pain-q">«Сколько отшивать и в каких размерах — считали на глазок, пока не затоварились»</p>
+        <div class="f-solves"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>Что делает «Оборот»</div>
+        <h3>Что заказать — с размерами</h3>
+        <p>По каждой модели: сколько штук нужно на 90 дней вперёд и в какой размерной сетке. Не «поровну всех размеров», а как реально покупают — с учётом размеров, которые распродались первыми.</p>
+        <div class="f-demo">
+          <div class="mini-rows">
+            <div><span>Худи «Скетч» — S/M/L/XL</span><b class="num">12 / 24 / 20 / 8</b></div>
+            <div><span>Себестоимость заказа</span><b class="num">148 000 ₽</b></div>
+            <div><span>Ожидаемая выручка</span><b class="num">412 000 ₽</b></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="feature">
+        <p class="pain-q">«Хит раскупили за два дня, а повторить не успели — прибыль упустили»</p>
+        <div class="f-solves"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>Что делает «Оборот»</div>
+        <h3>Сезонность и дыра поставки</h3>
+        <p>Система считает честный темп продаж — только за дни, когда товар был в наличии, — учитывает сезон и срок пошива. И предупреждает заранее: заказывайте сейчас, иначе хит уйдёт в ноль в самый пик.</p>
+        <div class="f-demo">
+          <div class="mini-rows">
+            <div><span>Серьга 12 мм</span><b class="num" style="color:var(--red)">стокаут через 9 дней</b></div>
+            <div><span>Худи «Скетч»</span><b class="num" style="color:var(--amber)">через 13 дней</b></div>
+            <div><span>Брюки «Токио»</span><b class="num">через 49 дней</b></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="feature">
+        <p class="pain-q">«Большие остатки — это замороженные деньги и убыточные скидки»</p>
+        <div class="f-solves"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>Что делает «Оборот»</div>
+        <h3>Скидки и неликвид — вовремя</h3>
+        <p>Стандарт отрасли — 70/20/10: 70% продано по полной цене, 20% в распродажу, 10% остаток. «Оборот» показывает, что уценить уже сейчас — пока хватает небольшой скидки, а не −50% в конце сезона.</p>
+        <div class="f-demo" style="display:grid;gap:8px">
+          <div class="alert-line soft"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 8v4l2.5 2.5"/></svg>Пальто «Норд»: 140 дней без продаж — в уценку</div>
+          <div class="alert-line"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 9v4"/><path d="M12 17h.01"/><path d="M10.3 3.9L1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg>Заморожено в неликвиде: 612 000 ₽</div>
+        </div>
+      </div>
+
+      <div class="feature">
+        <p class="pain-q">«В МойСкладе всё есть, кроме ответа: что и сколько заказывать в цех»</p>
+        <div class="f-solves"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>Что делает «Оборот»</div>
+        <h3>Заказ в один клик в МойСклад</h3>
+        <p>Рекомендация превращается в готовый заказ на производство прямо в вашем МойСклад: позиции, размеры, количества. Ничего не нужно перебивать руками из таблицы в учётку.</p>
+        <div class="f-demo">
+          <div class="mini-rows">
+            <div><span>Рекомендация системы</span><b class="num">14 позиций · 312 шт</b></div>
+            <div><span>Правки руками</span><b>любые, перед отправкой</b></div>
+            <div><span>Заказ в МойСклад</span><b style="color:var(--green-dark)">создан в один клик</b></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="feature">
+        <p class="pain-q">«Поделили прибыль — а на новую коллекцию денег не осталось»</p>
+        <div class="f-solves"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>Что делает «Оборот»</div>
+        <h3>Telegram-дайджест каждое утро</h3>
+        <p>Деньги бренда живут в остатках. Каждое утро — короткое сообщение в Telegram: что горит, что зависло, сколько денег заморожено. Вы видите проблему до того, как неликвид съест прибыль коллекции.</p>
+        <div class="f-demo" style="display:grid;gap:8px">
+          <div class="alert-line"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 9v4"/><path d="M12 17h.01"/><path d="M10.3 3.9L1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg>Бестселлер «Скетч»: остаток на 12 дней</div>
+          <div class="alert-line ok"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>Продажи вчера: 84 200 ₽ · 31 шт</div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</section>
 
 <!-- ═══ Как это работает ═══ -->
 <section id="how">
@@ -325,98 +428,80 @@
       <div class="step">
         <div class="step-n">3</div>
         <h3>Получите рекомендации</h3>
-        <p>Готовая таблица: что заказать на производство, в каких размерах и сколько, что скоро кончится, а что залежалось и просится в уценку.</p>
+        <p>Готовая таблица на каждое утро: что дошить и в каких размерах, что скоро кончится, что уценить, а что не повторять в следующей закупке.</p>
         <span class="step-time">Каждый день, без вашего участия</span>
       </div>
     </div>
   </div>
 </section>
 
-<!-- ═══ Фичи ═══ -->
-<section class="features-sec" id="features">
+<!-- ═══ Сравнение с альтернативами ═══ -->
+<section class="compare-sec" id="compare">
   <div class="wrap">
     <div class="sec-head">
-      <div class="sec-eyebrow">Возможности</div>
-      <h2>Всё, чтобы склад работал на бренд, а не наоборот</h2>
-      <p class="sec-sub">Метрики, которые владелец бренда обычно считает в таблицах ночами, — здесь считаются сами и всегда актуальны.</p>
+      <div class="sec-eyebrow">Альтернативы</div>
+      <h2>Как ещё бренды решают эту задачу</h2>
+      <p class="sec-sub">Все варианты рабочие. Вопрос в цене — и в том, кто делает эту работу каждый день.</p>
     </div>
-    <div class="features">
-
-      <div class="feature">
-        <div class="f-icon"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 8l-9-5-9 5v8l9 5 9-5z"/><path d="M3 8l9 5 9-5"/><line x1="12" y1="13" x2="12" y2="21"/></svg></div>
-        <h3>Что заказать</h3>
-        <p>Готовый заказ на производство на 90 дней вперёд: сколько штук дошить по каждой позиции — с разбивкой по размерам пропорционально реальным продажам.</p>
-        <div class="f-demo">
-          <div class="mini-rows">
-            <div><span>Худи «Скетч» — S/M/L/XL</span><b class="num">12 / 24 / 20 / 8</b></div>
-            <div><span>Себестоимость заказа</span><b class="num">148 000 ₽</b></div>
-            <div><span>Ожидаемая выручка</span><b class="num">412 000 ₽</b></div>
-          </div>
-        </div>
-      </div>
-
-      <div class="feature">
-        <div class="f-icon"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 17 9 11 13 15 21 7"/><polyline points="15 7 21 7 21 13"/></svg></div>
-        <h3>Оборачиваемость в ₽/день</h3>
-        <p>Главная метрика ассортимента: сколько денег в день приносит каждая позиция. Сразу видно бестселлеры, рабочих лошадок и балласт.</p>
-        <div class="f-demo">
-          <div class="bar-row"><span class="dot best"></span><div class="bar"><i style="width:92%"></i></div><span class="num">7 420 ₽</span></div>
-          <div class="bar-row"><span class="dot good"></span><div class="bar"><i style="width:44%;background:var(--green)"></i></div><span class="num">3 140 ₽</span></div>
-          <div class="bar-row"><span class="dot weak"></span><div class="bar"><i style="width:9%;background:var(--red)"></i></div><span class="num">620 ₽</span></div>
-        </div>
-      </div>
-
-      <div class="feature">
-        <div class="f-icon"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="6" width="18" height="13" rx="2"/><path d="M3 10h18"/><path d="M7 15h4"/></svg></div>
-        <h3>Бюджет закупки</h3>
-        <p>Введите сумму, которую готовы вложить в производство, — система соберёт оптимальный заказ: сначала то, что быстрее всего вернёт деньги.</p>
-        <div class="f-demo">
-          <div class="mini-rows">
-            <div><span>Бюджет</span><b class="num">300 000 ₽</b></div>
-            <div><span>Вошло в заказ</span><b class="num">9 позиций · 186 шт</b></div>
-            <div><span>Потенциал выручки</span><b class="num">840 000 ₽</b></div>
-          </div>
-        </div>
-      </div>
-
-      <div class="feature">
-        <div class="f-icon"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 9-9"/><path d="M12 7v5l3 3"/><path d="M3 5v4h4"/></svg></div>
-        <h3>Прогноз стокаутов</h3>
-        <p>По честному темпу продаж — только за дни, когда товар был в наличии, — система считает дату, когда каждая позиция закончится.</p>
-        <div class="f-demo">
-          <div class="mini-rows">
-            <div><span>Серьга 12 мм</span><b class="num" style="color:var(--red)">через 9 дней</b></div>
-            <div><span>Худи «Скетч»</span><b class="num" style="color:var(--amber)">через 13 дней</b></div>
-            <div><span>Брюки «Токио»</span><b class="num">через 49 дней</b></div>
-          </div>
-        </div>
-      </div>
-
-      <div class="feature">
-        <div class="f-icon"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8a6 6 0 1 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/></svg></div>
-        <h3>Алерты по бестселлерам</h3>
-        <p>Система следит за тем, что приносит деньги: бестселлер подходит к нулю — вы узнаёте заранее, пока ещё успеваете дошить, а не после кассового провала.</p>
-        <div class="f-demo" style="display:grid;gap:8px">
-          <div class="alert-line"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 9v4"/><path d="M12 17h.01"/><path d="M10.3 3.9L1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg>Бестселлер «Скетч»: остаток на 12 дней</div>
-          <div class="alert-line soft"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 8v4l2.5 2.5"/></svg>Пальто «Норд»: 140 дней без продаж</div>
-        </div>
-      </div>
-
-      <div class="feature">
-        <div class="f-icon"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20L20 4"/><path d="M4 20h6"/><path d="M4 20v-6"/><path d="M20 4h-6"/><path d="M20 4v6"/></svg></div>
-        <h3>Размерные сетки по продажам</h3>
-        <p>Не «поровну всех размеров», а как реально покупают: сетка каждой модели строится по её собственной статистике продаж, включая распроданные размеры.</p>
-        <div class="f-demo">
-          <div class="size-pills">
-            <span class="size-pill">S · 14%</span>
-            <span class="size-pill hot">M · 38%</span>
-            <span class="size-pill hot">L · 33%</span>
-            <span class="size-pill">XL · 15%</span>
-          </div>
-        </div>
-      </div>
-
+    <div class="compare-scroll">
+      <table class="compare">
+        <thead>
+          <tr>
+            <th></th>
+            <th>Курс по ассортиментной матрице<small>обучение владельца</small></th>
+            <th>Товарный аналитик-фрилансер<small>внешний специалист</small></th>
+            <th>Excel / Google-таблицы<small>своими руками</small></th>
+            <th class="ob">«Оборот»<small>сервис поверх МойСклад</small></th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Цена</td>
+            <td class="num">79 800 ₽ разово</td>
+            <td class="num">20–40 000 ₽/мес</td>
+            <td>Бесплатно — платите вечерами</td>
+            <td class="ob num">от 4 900 ₽/мес</td>
+          </tr>
+          <tr>
+            <td>Кто считает</td>
+            <td>Вы сами, после обучения</td>
+            <td>Специалист, вручную</td>
+            <td>Вы, вручную</td>
+            <td class="ob">Система, автоматически</td>
+          </tr>
+          <tr>
+            <td>Свежесть данных</td>
+            <td>Когда найдёте время сесть</td>
+            <td>Раз в неделю или месяц</td>
+            <td>Когда обновите выгрузку</td>
+            <td class="ob">Каждое утро, из МойСклад</td>
+          </tr>
+          <tr>
+            <td>Размерные сетки</td>
+            <td>Методика — считать самим</td>
+            <td>По договорённости</td>
+            <td>Отдельная формула на каждую модель</td>
+            <td class="ob">По продажам каждой модели</td>
+          </tr>
+          <tr>
+            <td>Заказ в производство</td>
+            <td>—</td>
+            <td>Таблицей на почту</td>
+            <td>Переносить в учётку руками</td>
+            <td class="ob">В один клик в МойСклад</td>
+          </tr>
+          <tr>
+            <td>Отпуска и увольнения</td>
+            <td>—</td>
+            <td>Уходит — уносит методику с собой</td>
+            <td>—</td>
+            <td class="ob">Не болеет и не увольняется</td>
+          </tr>
+        </tbody>
+      </table>
     </div>
+    <p class="compare-hint">Таблица листается вправо →</p>
+    <p class="compare-note">«Оборот» — это <b>товарный аналитик за&nbsp;9&nbsp;900&nbsp;₽ в&nbsp;месяц</b>, который не&nbsp;уволится, не&nbsp;уйдёт в&nbsp;отпуск и&nbsp;не&nbsp;забудет обновить таблицу.</p>
   </div>
 </section>
 
@@ -470,25 +555,25 @@
           <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span>1 организация МойСклад</span></li>
           <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span>Остатки по складам с историей</span></li>
           <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span>Оборачиваемость по каждой позиции</span></li>
-          <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span>Алерты: стокауты и неликвид</span></li>
+          <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span>Что уценить: неликвид и контроль 70/20/10</span></li>
         </ul>
-        <a class="btn btn-ghost" href="/register">Начать бесплатно</a>
+        <a class="btn btn-ghost" href="/register">Попробовать бесплатно</a>
       </div>
 
       <div class="plan hot">
         <div class="plan-badge">Популярный</div>
         <h3>Бренд</h3>
-        <p class="plan-for">Управлять заказами на производство</p>
+        <p class="plan-for">Ваш товарный аналитик на полную ставку</p>
         <div class="price"><b class="num">9 900 ₽</b><span>/мес</span></div>
         <p class="price-note num">7 920 ₽/мес при оплате за год</p>
         <ul>
           <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span>Всё из тарифа «Старт»</span></li>
-          <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span>Заказы на производство с рекомендациями</span></li>
-          <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span>Размерные сетки по продажам</span></li>
-          <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span>Бюджет закупки: сумма → оптимальный заказ</span></li>
-          <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span>Прогноз стокаутов по каждой позиции</span></li>
+          <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span>Что заказать: расчёт с размерными сетками</span></li>
+          <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span>Сезонность и срок производства в прогнозе</span></li>
+          <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span>Заказ в один клик в МойСклад</span></li>
+          <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span>Telegram-дайджест каждое утро</span></li>
         </ul>
-        <a class="btn btn-primary" href="/register">Начать бесплатно</a>
+        <a class="btn btn-primary" href="/register">Попробовать бесплатно</a>
       </div>
 
       <div class="plan">
@@ -502,7 +587,7 @@
           <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span>Доступ к API</span></li>
           <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span>Приоритетная поддержка</span></li>
         </ul>
-        <a class="btn btn-ghost" href="/register">Начать бесплатно</a>
+        <a class="btn btn-ghost" href="/register">Попробовать бесплатно</a>
       </div>
 
     </div>
@@ -511,7 +596,7 @@
 </section>
 
 <!-- ═══ FAQ ═══ -->
-<section id="faq">
+<section class="faq-sec" id="faq">
   <div class="wrap">
     <div class="sec-head">
       <div class="sec-eyebrow">Вопросы и ответы</div>
@@ -520,7 +605,11 @@
     <div class="faq">
       <details>
         <summary>Насколько безопасно передавать токен МойСклад?<span class="pl">+</span></summary>
-        <div class="a">Токен хранится в зашифрованном виде и используется только для чтения данных: остатки, продажи, возвраты, номенклатура. «Оборот» ничего не записывает в ваш МойСклад и не меняет. Токен можно отозвать в настройках МойСклад в любой момент — доступ прекратится сразу.</div>
+        <div class="a">Токен хранится в зашифрованном виде и используется в режиме «только чтение». «Оборот» ничего не меняет в вашем МойСклад без вашей команды: единственная запись — заказ на производство, и он создаётся только когда вы сами нажимаете кнопку. Токен можно отозвать в настройках МойСклад в любой момент — доступ прекратится сразу.</div>
+      </details>
+      <details>
+        <summary>Какие данные вы видите?<span class="pl">+</span></summary>
+        <div class="a">Только товарные: номенклатуру, остатки по складам, продажи, возвраты и закупочные цены — это всё, что нужно для расчётов. Персональные данные ваших покупателей системе не нужны, мы их не запрашиваем и не храним.</div>
       </details>
       <details>
         <summary>Сколько времени занимает подключение?<span class="pl">+</span></summary>
@@ -528,7 +617,11 @@
       </details>
       <details>
         <summary>У нас нет МойСклад — можно подключиться?<span class="pl">+</span></summary>
-        <div class="a">Пока «Оборот» работает только с МойСклад — это самая распространённая учётная система у российских fashion-брендов. Интеграции с 1С и прямые подключения маркетплейсов в разработке. Оставьте почту при регистрации — напишем, когда ваша система появится.</div>
+        <div class="a">Пока «Оборот» работает только с МойСклад — это самая распространённая учётная система у российских fashion-брендов. Интеграции с 1С и прямые подключения маркетплейсов в планах. Оставьте почту при регистрации — напишем, когда ваша система появится. А пока можно посмотреть, как всё устроено, на демо-данных.</div>
+      </details>
+      <details>
+        <summary>Для кого это? У нас не одежда.<span class="pl">+</span></summary>
+        <div class="a">Сейчас мы делаем продукт в первую очередь для брендов одежды, украшений, обуви и аксессуаров — с размерными сетками, сезонностью и заказами на производство. Но математика оборачиваемости универсальна: если у вас любой товарный бизнес со складскими запасами и повторяющимися закупками, «Оборот», скорее всего, подойдёт. Проверьте на своих данных — 14 дней бесплатно.</div>
       </details>
       <details>
         <summary>Что будет после 14 дней бесплатного периода?<span class="pl">+</span></summary>
@@ -549,8 +642,8 @@
 <!-- ═══ Финальный CTA ═══ -->
 <section class="final">
   <div class="wrap">
-    <h2>Узнайте, что заказать на производство, — уже сегодня</h2>
-    <p>Зарегистрируйтесь, вставьте токен МойСклад — и через 10 минут увидите свой ассортимент так, как его видят цифры. Или начните с демо-данных.</p>
+    <h2>Завтра утром уже можно знать, что дошить и что уценить</h2>
+    <p>Регистрация, токен МойСклад, 10 минут синхронизации — и у вас готовые рекомендации по каждой модели. Или посмотрите на демо-данных, ничего не подключая.</p>
     <a class="btn btn-primary btn-lg" href="/register">Попробовать бесплатно — 14 дней</a>
     <a class="btn btn-ghost-dark btn-lg" href="/register">Начать с демо-данными</a>
   </div>
@@ -565,7 +658,7 @@
           <svg width="22" height="22" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="11" fill="#2563eb"/><path d="M12 5a7 7 0 1 0 7 7" stroke="#fff" stroke-width="2.4" stroke-linecap="round"/><path d="M16 2.6l3.4 2.8-4.1 1.8z" fill="#fff"/></svg>
           Оборот
         </div>
-        <p>Аналитика остатков, оборачиваемости и заказов на производство для брендов одежды и украшений. Работает с данными МойСклад.</p>
+        <p>Аналитика остатков, оборачиваемости и заказов на производство для брендов одежды, украшений, обуви и аксессуаров. Работает с данными МойСклад.</p>
       </div>
       <div class="foot-col foot-links">
         <a href="/login">Войти</a>
@@ -581,7 +674,7 @@
       </div>
     </div>
     <div class="foot-bottom">
-      <span>© 2026 «Оборот» · ИП · реквизиты будут опубликованы при запуске</span>
+      <span>© 2026 «Оборот» · ИП Цицилин Владислав Львович · ИНН 366106543188</span>
       <span>Сделано в Санкт-Петербурге</span>
     </div>
   </div>

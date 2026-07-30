@@ -32,6 +32,11 @@ class User(Base):
     pw_hash: Mapped[str] = mapped_column(String(255), nullable=False)
     name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    # Аддитивно (приложение маркетплейса МойСклад): uid сотрудника МС из
+    # контекста Vendor API — SSO-вход через iframe без пароля. NULL у обычных
+    # SaaS-пользователей. Уникальность гарантируется в новых БД; в старых
+    # колонка добавляется ALTER'ом без constraint (SQLite), код ищет по равенству.
+    ms_uid: Mapped[str | None] = mapped_column(String(255), nullable=True, unique=True)
 
 
 class Org(Base):
@@ -43,6 +48,17 @@ class Org(Base):
     trial_ends_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     settings_json: Mapped[str] = mapped_column(Text, nullable=False, default=lambda: json.dumps(DEFAULT_SETTINGS))
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    # ── Аддитивно: приложение маркетплейса МойСклад (Vendor API 1.0) ──────────
+    # ms_account_id — accountId аккаунта МС (NULL у обычных SaaS-организаций);
+    # source — откуда пришла организация: saas (самостоятельная регистрация)
+    #          | ms_app (установка из каталога МойСклад);
+    # status — active | suspended (Uninstall/Suspend из МС; планировщик
+    #          пропускает suspended, вход остаётся);
+    # ms_tariff_name — имя тарифа подписки из каталога МС (как прислал МС).
+    ms_account_id: Mapped[str | None] = mapped_column(String(64), nullable=True, unique=True)
+    source: Mapped[str] = mapped_column(String(16), nullable=False, default="saas", server_default="saas")
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="active", server_default="active")
+    ms_tariff_name: Mapped[str] = mapped_column(String(128), nullable=False, default="", server_default="")
 
     @property
     def settings(self) -> dict:

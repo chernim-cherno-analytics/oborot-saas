@@ -529,6 +529,43 @@ async def entity_purchaseorder_create(request: Request):
     return doc
 
 
+# ── Vendor API 1.0: обмен contextKey (приложение маркетплейса) ───────────────
+#
+# В реальности Vendor API живёт на apps-api.moysklad.ru, но для тестов
+# приложение указывает MS_VENDOR_API_BASE на этот же mock. Эндпоинт проверяет
+# НАШ JWT (HS256 общим секретом, sub=appUid) — так тест ловит и битую подпись,
+# и неправильный sub. Контексты регистрирует тест через VENDOR_CONTEXTS.
+
+VENDOR_APP_ID = "app-oborot-test-0001"
+VENDOR_APP_UID = "oborot.test-vendor"
+VENDOR_SECRET = "vendor-secret-key-for-tests-do-not-use-in-prod"
+VENDOR_ACCOUNT_ID = "acc-11111111-2222-3333-4444-555555555555"
+VENDOR_ACCOUNT_NAME = "ООО «Тест-Бренд» (аккаунт МС)"
+
+VENDOR_CONTEXTS: dict[str, dict] = {}  # contextKey -> {"accountId", "uid", ...}
+
+
+@app.post("/context/{context_key}")
+def vendor_context(context_key: str, request: Request):
+    import jwt as pyjwt
+
+    raw = request.headers.get("Authorization") or ""
+    token = raw[7:].strip() if raw.lower().startswith("bearer ") else raw.strip()
+    try:
+        claims = pyjwt.decode(token, VENDOR_SECRET, algorithms=["HS256"],
+                              options={"require": ["exp", "iat"]})
+    except pyjwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="mock: подпись вендорского JWT не сошлась")
+    if claims.get("sub") != VENDOR_APP_UID:
+        raise HTTPException(status_code=401, detail="mock: sub != appUid")
+    if not claims.get("jti"):
+        raise HTTPException(status_code=401, detail="mock: нет jti")
+    ctx = VENDOR_CONTEXTS.get(context_key)
+    if ctx is None:
+        raise HTTPException(status_code=404, detail="mock: contextKey не найден")
+    return ctx
+
+
 if __name__ == "__main__":
     import uvicorn
 

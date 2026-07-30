@@ -73,16 +73,23 @@ def _serializer() -> URLSafeTimedSerializer:
     return URLSafeTimedSerializer(get_signing_secret(), salt="oborot-session")
 
 
-def set_session(response, user_id: int, org_id: int) -> None:
-    """Ставит подписанную сессионную куку на ответ."""
+def set_session(response, user_id: int, org_id: int, samesite: str = "lax") -> None:
+    """Ставит подписанную сессионную куку на ответ.
+
+    samesite: обычный вход — "lax" (дефолт). Вход из iframe МойСклад
+    (routes_ms_app) на проде передаёт "none": третьесторонняя кука во фрейме
+    требует SameSite=None + Secure. В dev (http) None+Secure браузер отбросил
+    бы — остаётся "lax" (iframe-вход в dev работает только same-site).
+    """
     value = _serializer().dumps({"user_id": user_id, "org_id": org_id})
     response.set_cookie(
         SESSION_COOKIE,
         value,
         max_age=SESSION_MAX_AGE,
         httponly=True,
-        samesite="lax",
-        secure=is_prod(),  # на проде кука только по https
+        samesite=samesite,
+        # на проде кука только по https; SameSite=None без Secure невалидна
+        secure=is_prod() or samesite == "none",
         path="/",
     )
 

@@ -50,6 +50,18 @@ NO_SALES_ALERT_DAYS = 120  # неликвид: столько дней без п
 STOCKOUT_ALERT_DAYS = 21  # алерт: бестселлер/хороший закончится в ближайшие N дней
 OVERSTOCK_WEEKS = 26  # алерт: запаса больше, чем на полгода
 
+# «Здоровье сезона» — отраслевой норматив sell-through 70/20/10:
+# здоровый сезон = ~70% выручки по полной цене, ~20% со скидкой, ~10% остаток.
+# Пороги статусов даём с люфтом относительно норматива:
+SEASON_NORM = (70, 20, 10)  # эталон для подписи «Норматив: 70 / 20 / 10»
+SEASON_FULL_PRICE_FLOOR = 0.95  # «полная цена»: факт. цена за шт >= 95% номинала
+SEASON_HEALTHY_FULL = 0.60  # healthy: полная цена >= 60% И остаток <= 20%
+SEASON_HEALTHY_LEFTOVER = 0.20
+SEASON_WARNING_FULL = 0.40  # warning: полная цена 40–60% ИЛИ остаток 20–35%
+SEASON_WARNING_LEFTOVER = 0.35  # иначе — alarm
+
+_SEASON_NAMES = {3: "весна", 6: "лето", 9: "осень", 12: "зима"}
+
 _cache: dict[int, tuple[float, dict]] = {}
 _cache_lock = threading.Lock()
 
@@ -71,6 +83,31 @@ def get_snapshot(db: Session, org: Org) -> dict:
     with _cache_lock:
         _cache[org.id] = (time.monotonic() + CACHE_TTL, snap)
     return snap
+
+
+def season_bounds(today: date) -> tuple[date, str]:
+    """Начало текущего календарного сезона и человеческая метка («лето 2026»).
+
+    Сезоны: весна мар–май, лето июн–авг, осень сен–ноя, зима дек–фев
+    (в январе-феврале зима началась 1 декабря прошлого года).
+    """
+    m = today.month
+    if m in (3, 4, 5):
+        start = date(today.year, 3, 1)
+    elif m in (6, 7, 8):
+        start = date(today.year, 6, 1)
+    elif m in (9, 10, 11):
+        start = date(today.year, 9, 1)
+    elif m == 12:
+        start = date(today.year, 12, 1)
+    else:  # январь–февраль
+        start = date(today.year - 1, 12, 1)
+    name = _SEASON_NAMES[start.month]
+    if start.month == 12:
+        label = f"{name} {start.year}/{(start.year + 1) % 100:02d}"
+    else:
+        label = f"{name} {start.year}"
+    return start, label
 
 
 def extra_settings(org: Org) -> dict:
@@ -201,6 +238,41 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
     nq90_by_base = _nq_window(cutoff90)
     nq_season_by_base = _nq_window(season_from, season_to)
 
+    # «Здоровье сезона» (sell-through 70/20/10): продажи ТЕКУЩЕГО календарного
+    # сезона в разбивке «полная цена / скидка». Полная цена — факт. цена за шт
+    # >= SEASON_FULL_PRICE_FLOOR от номинала позиции; возвраты (sign_rev < 0)
+    # проходят тот же ценовой тест и вычитаются из своей корзины.
+    cur_season_start, cur_season_label = season_bounds(today)
+    cur_season_iso = cur_season_start.isoformat()
+    is_full_price = and_(
+        Sale.qty > 0,
+        Sale.revenue >= SEASON_FULL_PRICE_FLOOR * Sale.qty * Product.sale_price,
+    )
+    season_split_rows = db.execute(
+        select(
+            Product.base_name,
+            func.sum(case((is_full_price, sign_rev), else_=0.0)),
+            func.sum(case((is_full_price, 0.0), else_=sign_rev)),
+        )
+        .select_from(Sale)
+        .join(Product, join_sales)
+        .where(Sale.org_id == org.id, Sale.date >= cur_season_iso)
+        .group_by(Product.base_name)
+    ).all()
+    season_split = {b: (float(f or 0), float(d or 0)) for b, f, d in season_split_rows}
+
+    # Первое появление позиции в стоке (qty > 0) — чтобы посчитать в остатке
+    # сезона и новинки, которые пришли на склад в сезоне, но ещё не продавались.
+    first_stock_by_base = dict(
+        db.execute(
+            select(Product.base_name, func.min(StockDay.date))
+            .select_from(StockDay)
+            .join(Product, join_products)
+            .where(StockDay.org_id == org.id, StockDay.qty > 0)
+            .group_by(Product.base_name)
+        ).all()
+    )
+
     # Последняя продажа (для алертов о неликвиде).
     last_sale_by_base = dict(
         db.execute(
@@ -265,6 +337,10 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
             "nr": 0.0,
             "ordered": float(ordered_by_base.get(base, 0)),
             "last_sale": last_sale_by_base.get(base),
+            # здоровье сезона: нетто-выручка сезона по корзинам + признак новинки
+            "season_full_rev": season_split.get(base, (0.0, 0.0))[0],
+            "season_disc_rev": season_split.get(base, (0.0, 0.0))[1],
+            "season_new": (first_stock_by_base.get(base) or "") >= cur_season_iso,
             "sizes": {},  # size -> {stock, sold365}
             "wh_stock": {},  # size -> {warehouse_id: qty}
         }
@@ -344,6 +420,8 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
         "latest_date": latest_date,
         "season_from": season_from,
         "season_to": season_to,
+        "cur_season_start": cur_season_iso,
+        "cur_season_label": cur_season_label,
         "settings": settings,
         "items": items,
         "warehouses": [{"id": w.id, "name": w.name, "active": w.active} for w in warehouses],
@@ -396,6 +474,65 @@ def _live_items(snap: dict) -> list[dict]:
         for it in snap["items"].values()
         if not it["archived"] and (it["cs"] > 0 or it["nq"] > 0 or it["dis"] > 0)
     ]
+
+
+def _season_health(snap: dict, items: list[dict]) -> dict:
+    """«Здоровье сезона»: sell-through текущего сезона против норматива 70/20/10.
+
+    - full_price_rev / discounted_rev — нетто-выручка сезона по корзинам
+      «полная цена» (факт. цена >= 95% номинала) и «скидка»; возвраты уже
+      вычтены из своей корзины (см. _compute_snapshot).
+    - leftover_value — текущий сток позиций, участвовавших в сезоне (были
+      продажи в сезоне ИЛИ первое появление в стоке в сезоне), по номиналу.
+    - Доли считаются от (выручка сезона + остаток), статус — по порогам
+      SEASON_* (люфт вокруг норматива 70/20/10).
+    """
+    full = disc = leftover = 0.0
+    for it in items:
+        f = float(it.get("season_full_rev") or 0)
+        d = float(it.get("season_disc_rev") or 0)
+        full += f
+        disc += d
+        if f != 0 or d != 0 or it.get("season_new"):
+            leftover += it["cs"] * it["sale_price"]
+    # Возвраты могли увести корзину в минус — доли не бывают отрицательными.
+    full = max(0.0, full)
+    disc = max(0.0, disc)
+    leftover = max(0.0, leftover)
+    total = full + disc + leftover
+
+    full_share = disc_share = leftover_share = 0.0
+    status, reason = "no_data", None
+    if total > 0:
+        full_share = full / total
+        disc_share = disc / total
+        leftover_share = leftover / total
+        if full_share >= SEASON_HEALTHY_FULL and leftover_share <= SEASON_HEALTHY_LEFTOVER:
+            status = "healthy"
+        elif full_share >= SEASON_WARNING_FULL and leftover_share <= SEASON_WARNING_LEFTOVER:
+            status = "warning"
+        else:
+            status = "alarm"
+        if status != "healthy":
+            # Что выбилось сильнее относительно «здоровых» порогов:
+            discount_gap = SEASON_HEALTHY_FULL - full_share  # мало полной цены → скидки
+            leftover_gap = leftover_share - SEASON_HEALTHY_LEFTOVER  # много остатка
+            reason = "leftover" if leftover_gap >= discount_gap else "discount"
+
+    return {
+        "label": snap.get("cur_season_label", ""),
+        "date_from": snap.get("cur_season_start"),
+        "date_to": snap["today"],
+        "full_price_rev": round(full),
+        "discounted_rev": round(disc),
+        "leftover_value": round(leftover),
+        "full_share": round(full_share, 3),
+        "disc_share": round(disc_share, 3),
+        "leftover_share": round(leftover_share, 3),
+        "status": status,
+        "reason": reason,
+        "norm": list(SEASON_NORM),
+    }
 
 
 def build_summary(snap: dict) -> dict:
@@ -496,6 +633,7 @@ def build_summary(snap: dict) -> dict:
         "classes": classes,
         "top": top,
         "categories": categories,
+        "season_health": _season_health(snap, items),
     }
 
 
