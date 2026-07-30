@@ -209,7 +209,7 @@ class ProductionOrder(Base):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     eta_date: Mapped[str | None] = mapped_column(String(10), nullable=True)
-    status: Mapped[str] = mapped_column(String(16), nullable=False, default="draft")  # draft|sent
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="draft")  # draft|sent|received
     items_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
     # items_json: [{base_name, qty, sizes: {size: qty}, cost}]
 

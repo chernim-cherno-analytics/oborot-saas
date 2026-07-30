@@ -22,8 +22,46 @@ document.addEventListener("DOMContentLoaded", function () {
 
   var STATUS = {
     draft: '<span class="badge gray">Черновик</span>',
-    sent: '<span class="badge blue">Отправлен</span>'
+    sent: '<span class="badge blue">В производстве</span>',
+    received: '<span class="badge green">Принят на склад</span>'
   };
+
+  function reloadAll() {
+    api("/api/orders").then(function (d) {
+      orders = Array.isArray(d) ? d : (d.orders || d.items || []);
+      renderList();
+      if (currentId && orders.some(function (o) { return o.id === currentId; })) {
+        openOrder(currentId);
+      } else if (orders.length) {
+        openOrder(orders[0].id);
+      } else {
+        detail.innerHTML = "";
+      }
+    });
+  }
+
+  function setStatus(id, status, confirmText) {
+    if (confirmText && !confirm(confirmText)) return;
+    api("/api/orders/" + id + "/status", { method: "POST", body: { status: status } })
+      .then(function () {
+        toast(status === "sent"
+          ? "Заказ отправлен в производство — учитывается в «едет к нам»"
+          : "Заказ принят на склад");
+        reloadAll();
+      });
+  }
+
+  function removeOrder(id, status) {
+    var msg = status === "sent"
+      ? "Удалить заказ, который уже в производстве? Его количества будут убраны из «едет к нам»."
+      : "Удалить черновик заказа?";
+    if (!confirm(msg)) return;
+    api("/api/orders/" + id, { method: "DELETE" }).then(function () {
+      toast("Заказ удалён");
+      currentId = null;
+      reloadAll();
+    });
+  }
 
   api("/api/orders").then(function (d) {
     orders = Array.isArray(d) ? d : (d.orders || d.items || []);
@@ -116,10 +154,22 @@ document.addEventListener("DOMContentLoaded", function () {
       '<span style="font-size:12px; color:var(--text-soft);">создан ' + fmtDate(o.created_at) +
       (o.eta_date ? " · готовность " + fmtDate(o.eta_date) : "") + "</span>" +
       '<div class="spacer"></div>' +
+      (o.status === "draft"
+        ? '<button class="btn sm primary no-print" type="button" id="btn-send">В производство</button>'
+        : "") +
+      (o.status === "sent"
+        ? '<button class="btn sm primary no-print" type="button" id="btn-receive">Принят на склад</button>'
+        : "") +
+      (o.status !== "received"
+        ? '<button class="btn sm no-print" type="button" id="btn-delete">Удалить</button>'
+        : "") +
       '<button class="btn sm no-print" type="button" id="btn-print">' +
       '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 6 2 18 2 18 9"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8"/></svg>' +
       " Печать</button>" +
       "</div>" +
+      (o.status === "draft"
+        ? '<div class="page-sub no-print" style="margin:8px 0 0;">Черновик не учитывается в расчётах. Нажмите «В производство», когда заказ реально отправлен — тогда его количества попадут в «едет к нам» и уменьшат рекомендации.</div>'
+        : "") +
       '<div class="tbl-wrap"><table class="tbl">' +
       '<thead><tr><th>Позиция</th><th>Размеры</th><th class="num">Кол-во, шт</th><th class="num">Себес за шт</th><th class="num">Сумма</th></tr></thead>' +
       "<tbody>" + (rows || '<tr><td colspan="5" class="muted">В заказе нет позиций</td></tr>') + "</tbody>" +
@@ -130,6 +180,16 @@ document.addEventListener("DOMContentLoaded", function () {
 
     var btn = document.getElementById("btn-print");
     if (btn) btn.addEventListener("click", function () { window.print(); });
+    var bSend = document.getElementById("btn-send");
+    if (bSend) bSend.addEventListener("click", function () {
+      setStatus(o.id, "sent", "Отправить заказ в производство? Его количества попадут в «едет к нам» и уменьшат рекомендации «Что заказать».");
+    });
+    var bRecv = document.getElementById("btn-receive");
+    if (bRecv) bRecv.addEventListener("click", function () {
+      setStatus(o.id, "received", "Отметить заказ принятым на склад? Количества будут убраны из «едет к нам» (фактические остатки обновит синхронизация).");
+    });
+    var bDel = document.getElementById("btn-delete");
+    if (bDel) bDel.addEventListener("click", function () { removeOrder(o.id, o.status); });
     detail.scrollIntoView({ behavior: "smooth", block: "nearest" });
   }
 });

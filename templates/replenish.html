@@ -36,13 +36,13 @@
           <th style="width:30px;"></th>
           <th data-sort="base_name" data-sort-dir="asc">Позиция</th>
           <th data-sort="cls" style="width:60px;">Класс</th>
-          <th class="num" data-sort="turnover">Оборач., ₽/день</th>
-          <th class="num" data-sort="rate">Темп, шт/день</th>
+          <th class="num" data-sort="turnover" title="Нетто-выручка за год ÷ дни, когда товар был в наличии">Оборач., ₽/день</th>
+          <th class="num" data-sort="rate" title="Продано штук за год ÷ дни в наличии">Темп, шт/день</th>
           <th class="num" data-sort="cs">Остаток</th>
-          <th class="num" data-sort="ordered">Едет</th>
-          <th class="num" data-sort="wos">Покрытие, нед</th>
-          <th data-sort="stockout_date" data-sort-dir="asc">Стокаут</th>
-          <th class="num" data-sort="_need">Заказать, шт</th>
+          <th class="num" data-sort="ordered" title="Уже заказано на производстве и ещё не принято на склад">Едет</th>
+          <th class="num" data-sort="wos" title="На сколько недель хватит остатка при текущем темпе продаж">Покрытие, нед</th>
+          <th data-sort="stockout_date" data-sort-dir="asc" title="Прогнозная дата, когда остаток кончится">Стокаут</th>
+          <th class="num" data-sort="_need" title="Темп × горизонт − остаток − едет (правится в размерной сетке)">Заказать, шт</th>
         </tr>
       </thead>
       <tbody id="tbody">
@@ -75,6 +75,7 @@
         <input class="input" type="date" id="order-eta">
       </div>
       <p style="font-size:12px; color:var(--text-soft); margin:0;" id="order-modal-summary"></p>
+      <p id="order-modal-warning" style="display:none; font-size:12px; color:#b91c1c; font-weight:600; margin:8px 0 0;"></p>
     </div>
     <div class="modal-foot">
       <button class="btn" type="button" id="btn-order-cancel">Отмена</button>
@@ -93,7 +94,11 @@ document.addEventListener("DOMContentLoaded", function () {
   var openRows = {};   // base_name -> true
   var tbody = document.getElementById("tbody");
 
+  var HORIZON = 90;
+  var SENT_ORDERS = [];
   api("/api/replenish").then(function (d) {
+    HORIZON = d.horizon_days || 90;
+    SENT_ORDERS = d.orders_in_production || [];
     document.getElementById("horizon-note").innerHTML =
       "Рекомендации: сколько заказать, чтобы хватило на <b>" + fmtInt(d.horizon_days || 90) +
       " дней</b> с учётом темпа продаж за год, текущих остатков и уже заказанного на производстве.";
@@ -153,6 +158,14 @@ document.addEventListener("DOMContentLoaded", function () {
     });
   }
 
+  function calcFormula(it) {
+    var gross = Math.round(it.rate * HORIZON);
+    return '<p class="muted" style="margin:4px 0 8px; font-size:12px;">Расчёт: ' +
+      fmtNum(it.rate, 2) + ' шт/день × ' + fmtInt(HORIZON) + ' дн = ' + fmtInt(gross) +
+      ' − остаток ' + fmtInt(it.cs) + ' − едет ' + fmtInt(it.ordered || 0) +
+      ' = <b>' + fmtInt(it.need) + ' шт</b></p>';
+  }
+
   function sizeRows(it) {
     var keys = sortSizeKeys(Object.keys(it.sizes || {}));
     if (!keys.length) return "<p class='muted' style='margin:4px 0;'>Безразмерная позиция — количество правится в общей колонке.</p>";
@@ -162,7 +175,7 @@ document.addEventListener("DOMContentLoaded", function () {
         return "<tr><td><b>" + esc(sz) + "</b></td>" +
           '<td class="num' + ((s.stock || 0) === 0 ? " txt-red" : "") + '">' + fmtInt(s.stock || 0) + "</td>" +
           '<td class="num">' + fmtInt(s.sold365 || 0) + "</td>" +
-          '<td class="num"><input class="input sm num size-rec" type="number" min="0" step="1" style="width:90px;" ' +
+          '<td class="num"><input class="input sm num size-rec" type="number" min="0" max="9999" step="1" style="width:90px;" ' +
           'data-base="' + esc(it.base_name) + '" data-size="' + esc(sz) + '" value="' + (Number(it._recs[sz]) || 0) + '"></td></tr>';
       }).join("") + "</tbody></table>";
   }
@@ -172,8 +185,13 @@ document.addEventListener("DOMContentLoaded", function () {
     if (!arr.length) {
       tbody.innerHTML = '<tr><td colspan="11">' + (items.length
         ? emptyState("Ничего не найдено", "Попробуйте изменить запрос или сбросить фильтр категории.", "")
-        : emptyState("Заказывать пока нечего", "По текущему темпу продаж всех позиций хватает на весь горизонт планирования.",
-            '<a class="btn" href="/turnover">Открыть оборачиваемость</a>')) + "</td></tr>";
+        : (SENT_ORDERS.length
+            ? emptyState("Потребность закрыта заказами в производстве",
+                "Учтены заказы: " + SENT_ORDERS.map(function (o) { return esc(o.name); }).join(", ") +
+                ". Когда они придут на склад (или будут удалены), рекомендации пересчитаются.",
+                '<a class="btn primary" href="/orders">Открыть заказы</a>')
+            : emptyState("Заказывать пока нечего", "По текущему темпу продаж всех позиций хватает на весь горизонт планирования.",
+                '<a class="btn" href="/turnover">Открыть оборачиваемость</a>'))) + "</td></tr>";
       return;
     }
     tbody.innerHTML = arr.map(function (it) {
@@ -193,7 +211,7 @@ document.addEventListener("DOMContentLoaded", function () {
         "<td" + (soonOut ? ' class="txt-red"' : "") + ">" + fmtDate(it.stockout_date) + "</td>" +
         '<td class="num"><b style="font-size:14px;">' + fmtInt(it._need) + "</b></td>" +
         "</tr>" +
-        (open ? "<tr class='expand-row'><td colspan='11' style='padding:0;'><div class='sub-panel'>" + sizeRows(it) + "</div></td></tr>" : "");
+        (open ? "<tr class='expand-row'><td colspan='11' style='padding:0;'><div class='sub-panel'>" + calcFormula(it) + sizeRows(it) + "</div></td></tr>" : "");
     }).join("");
 
     tbody.querySelectorAll(".expander").forEach(function (btn) {
@@ -215,7 +233,9 @@ document.addEventListener("DOMContentLoaded", function () {
       inp.addEventListener("input", function () {
         var it = findItem(inp.getAttribute("data-base"));
         if (!it) return;
-        it._recs[inp.getAttribute("data-size")] = Math.max(0, Number(inp.value) || 0);
+        var v = Math.min(9999, Math.max(0, Number(inp.value) || 0));
+        if (String(v) !== inp.value && inp.value !== "") inp.value = v;
+        it._recs[inp.getAttribute("data-size")] = v;
         recalcNeed(it);
         var row = tbody.querySelector("tr[data-base='" + CSS.escape(it.base_name) + "'] td:last-child b");
         if (row) row.textContent = fmtInt(it._need);
@@ -297,9 +317,18 @@ document.addEventListener("DOMContentLoaded", function () {
     var eta = new Date(today.getTime() + 45 * 86400000);
     document.getElementById("order-eta").value = eta.toISOString().slice(0, 10);
     var qty = sel.reduce(function (s, it) { return s + it._need; }, 0);
+    var recQty = sel.reduce(function (s, it) { return s + (it.need || 0); }, 0);
     var cost = sel.reduce(function (s, it) { return s + it._need * (it.cost_price || 0); }, 0);
     document.getElementById("order-modal-summary").textContent =
       "В заказ войдут " + fmtInt(sel.length) + " позиций, " + fmtInt(qty) + " шт, себестоимость ~" + fmtMoney(cost) + ".";
+    var warnEl = document.getElementById("order-modal-warning");
+    if (recQty > 0 && qty > recQty * 3) {
+      warnEl.style.display = "";
+      warnEl.textContent = "⚠ Количество в " + fmtNum(qty / recQty, 1) +
+        " раза выше рекомендации системы (" + fmtInt(recQty) + " шт). Проверьте цифры перед созданием.";
+    } else {
+      warnEl.style.display = "none";
+    }
     modal.classList.add("open");
   });
 

@@ -3,7 +3,7 @@ import json
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -12,7 +12,7 @@ from app.auth import AuthContext, require_auth_api, require_owner_api
 from app.crypto import encrypt_token
 from app.db import get_db
 from app.demo_seed import seed_demo
-from app.models import Connection, Membership, OrderedQty, ProductionOrder, User, Warehouse
+from app.models import Connection, Membership, OrderedQty, Product, ProductionOrder, User, Warehouse
 
 router = APIRouter(prefix="/api")
 
@@ -26,7 +26,15 @@ def api_summary(ctx: AuthContext = Depends(require_auth_api), db: Session = Depe
 
 @router.get("/replenish")
 def api_replenish(ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)):
-    return analytics.build_replenish(analytics.get_snapshot(db, ctx.org))
+    data = analytics.build_replenish(analytics.get_snapshot(db, ctx.org))
+    # Для пустого состояния: какие заказы «В производстве» закрывают потребность.
+    sent = db.execute(
+        select(ProductionOrder.id, ProductionOrder.name)
+        .where(ProductionOrder.org_id == ctx.org.id, ProductionOrder.status == "sent")
+        .order_by(ProductionOrder.created_at.desc())
+    ).all()
+    data["orders_in_production"] = [{"id": o.id, "name": o.name} for o in sent]
+    return data
 
 
 @router.get("/turnover")
@@ -43,9 +51,19 @@ def api_stocks(ctx: AuthContext = Depends(require_auth_api), db: Session = Depen
 
 class OrderItemIn(BaseModel):
     base_name: str
-    qty: int = Field(ge=0)
+    qty: int = Field(ge=0, le=100_000)
     sizes: dict[str, int] = Field(default_factory=dict)
     cost: float = 0.0
+
+    @field_validator("sizes")
+    @classmethod
+    def _sizes_sane(cls, v: dict[str, int]) -> dict[str, int]:
+        for size, q in v.items():
+            if q < 0:
+                raise ValueError(f"Отрицательное количество в размере {size!r}")
+            if q > 100_000:
+                raise ValueError(f"Неправдоподобное количество в размере {size!r}")
+        return v
 
 
 class OrderIn(BaseModel):
@@ -87,24 +105,99 @@ def api_create_order(
     if not items:
         raise HTTPException(status_code=422, detail="В заказе нет позиций с количеством > 0")
     name = body.name.strip() or f"Заказ от {datetime.now():%d.%m.%Y}"
+    # Себестоимость берём из БД (клиентской не доверяем), клиентская — фолбэк.
+    cost_by_base = {
+        p.base_name: float(p.cost_price or 0)
+        for p in db.execute(
+            select(Product).where(Product.org_id == ctx.org.id)
+        ).scalars()
+        if p.cost_price
+    }
+    payload = []
+    for i in items:
+        d = i.model_dump()
+        if cost_by_base.get(i.base_name):
+            d["cost"] = cost_by_base[i.base_name]
+        payload.append(d)
     order = ProductionOrder(
         org_id=ctx.org.id,
         name=name,
         eta_date=body.eta_date,
         status="draft",
-        items_json=json.dumps([i.model_dump() for i in items], ensure_ascii=False),
+        items_json=json.dumps(payload, ensure_ascii=False),
     )
     db.add(order)
-    # Заказанное автоматически попадает в «едет к нам».
-    for item in items:
-        row = db.get(OrderedQty, (ctx.org.id, item.base_name))
-        if row is None:
-            db.add(OrderedQty(org_id=ctx.org.id, base_name=item.base_name, qty=item.qty))
-        else:
-            row.qty += item.qty
+    # ВАЖНО (фикс P0): черновик НЕ попадает в «едет к нам» — рекомендации
+    # «Что заказать» уменьшаются только после перевода заказа «В производство».
     db.commit()
     analytics.invalidate(ctx.org.id)
-    return {"ok": True, "id": order.id}
+    return {"ok": True, "id": order.id, "status": "draft"}
+
+
+def _apply_order_to_incoming(db: Session, org_id: int, order: ProductionOrder, sign: int) -> None:
+    """Прибавляет (sign=+1) или вычитает (sign=-1) позиции заказа из «едет к нам»."""
+    for item in order.items:
+        base, qty = item.get("base_name"), int(item.get("qty") or 0)
+        if not base or qty <= 0:
+            continue
+        row = db.get(OrderedQty, (org_id, base))
+        if row is None:
+            db.add(OrderedQty(org_id=org_id, base_name=base, qty=max(0, sign * qty)))
+        else:
+            row.qty = max(0, row.qty + sign * qty)
+
+
+class OrderStatusIn(BaseModel):
+    status: str
+
+
+@router.post("/orders/{order_id}/status")
+def api_order_status(
+    order_id: int,
+    body: OrderStatusIn,
+    ctx: AuthContext = Depends(require_auth_api),
+    db: Session = Depends(get_db),
+):
+    """Переходы статуса: draft → sent («В производстве») → received («Принят на склад»).
+
+    Семантика «едет к нам»: draft не учитывается; sent прибавляет; received
+    вычитает (пришедшие остатки подтянет синхронизация со складом).
+    """
+    order = db.get(ProductionOrder, order_id)
+    if order is None or order.org_id != ctx.org.id:
+        raise HTTPException(status_code=404, detail="Заказ не найден")
+    allowed = {("draft", "sent"), ("sent", "received")}
+    if (order.status, body.status) not in allowed:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Недопустимый переход статуса: {order.status} → {body.status}",
+        )
+    if body.status == "sent":
+        _apply_order_to_incoming(db, ctx.org.id, order, +1)
+    else:  # received
+        _apply_order_to_incoming(db, ctx.org.id, order, -1)
+    order.status = body.status
+    db.commit()
+    analytics.invalidate(ctx.org.id)
+    return {"ok": True, "status": order.status}
+
+
+@router.delete("/orders/{order_id}")
+def api_order_delete(
+    order_id: int, ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)
+):
+    """Удаление заказа: draft — свободно; sent — с вычетом из «едет»; received — нельзя."""
+    order = db.get(ProductionOrder, order_id)
+    if order is None or order.org_id != ctx.org.id:
+        raise HTTPException(status_code=404, detail="Заказ не найден")
+    if order.status == "received":
+        raise HTTPException(status_code=422, detail="Принятый на склад заказ удалить нельзя")
+    if order.status == "sent":
+        _apply_order_to_incoming(db, ctx.org.id, order, -1)
+    db.delete(order)
+    db.commit()
+    analytics.invalidate(ctx.org.id)
+    return {"ok": True}
 
 
 @router.get("/orders/{order_id}")
