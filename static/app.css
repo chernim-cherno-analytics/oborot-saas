@@ -251,6 +251,45 @@ h1, h2, h3 { margin: 0; font-weight: 700; }
 }
 .trial-strip strong { font-weight: 600; }
 
+/* ============ Встроенный режим (iframe МойСклад) ============
+   Внешнюю шапку/навигацию/логин даёт сам МойСклад — у нас только компактная
+   строка табов + рабочая зона. Без тёмного сайдбара и без топбара. */
+
+body.embed {
+  background: var(--surface);
+  /* iframe уже, чем desktop-минимум: не форсируем 1200px — таблицы скроллятся
+     внутри .tbl-wrap, а страница подстраивается под ширину, что даёт МС. */
+  min-width: 0;
+}
+
+.embed-shell { display: flex; flex-direction: column; min-height: 100vh; min-width: 0; }
+
+.embed-tabs {
+  display: flex; align-items: center; gap: 2px;
+  padding: 7px 14px;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface);
+  overflow-x: auto;
+  position: sticky; top: 0; z-index: 20;
+  scrollbar-width: thin;
+}
+.embed-tabs a {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 6px 12px; border-radius: 7px;
+  color: var(--ink-2); font-size: 13px; font-weight: 600;
+  white-space: nowrap; text-decoration: none;
+}
+.embed-tabs a:hover { background: #f1f4f8; color: var(--ink); text-decoration: none; }
+.embed-tabs a.active { background: var(--blue); color: #fff; }
+.embed-tabs a .pip {
+  font-family: var(--mono); font-size: 10px; font-weight: 700;
+  background: var(--red); color: #fff;
+  border-radius: 9px; padding: 1px 6px;
+}
+.embed-tabs a.active .pip { background: #fff; color: var(--blue); }
+
+.embed-content { padding: 16px 18px 32px; flex: 1; }
+
 /* --- Контент --- */
 
 .content { padding: 18px 22px 40px; flex: 1; }

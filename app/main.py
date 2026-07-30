@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 
 from app import auth
 from app.api import router as api_router
+from app.crypto import is_prod
 from app.routes_connect import router as connect_router
 from app.routes_extra import router as extra_router
 from app.routes_ms_app import router as ms_app_router
@@ -68,10 +69,30 @@ def _startup() -> None:
 
 # ── Помощники ────────────────────────────────────────────────────────────────
 
+def _resolve_embedded(request: Request) -> bool | None:
+    """Встроенный режим (iframe МойСклад): кука oborot_embed, ставится в /ms/app.
+
+    В dev (OBOROT_ENV!=prod) допускаем query-переключатель ?embed=1 / ?embed=0 —
+    чтобы открыть встроенный вид локально без реального МС; при этом он ещё и
+    залипает кукой (возврат True/False), чтобы переходы по табам сохраняли режим.
+    На проде query игнорируется — только кука. None = «переключать куку не надо».
+    """
+    embedded = auth.read_embed(request)
+    override = None
+    if not is_prod():
+        q = request.query_params.get("embed")
+        if q == "1":
+            embedded, override = True, True
+        elif q == "0":
+            embedded, override = False, False
+    return embedded, override
+
+
 def _page(request: Request, ctx: auth.AuthContext, template: str, active: str, page_title: str):
     """Рендер страницы с обязательным контекстом {user, org, active, page_title}."""
     org = ctx.org
-    return templates.TemplateResponse(
+    embedded, override = _resolve_embedded(request)
+    response = templates.TemplateResponse(
         request,
         template,
         {
@@ -79,12 +100,22 @@ def _page(request: Request, ctx: auth.AuthContext, template: str, active: str, p
             "org": {
                 "name": org.name,
                 "plan": org.plan,
+                # source нужен шаблону: не-МС-триалу показываем демо-полоску,
+                # МС-аккаунту (source='ms_app') подписку показывает сам МойСклад.
+                "source": getattr(org, "source", "saas"),
                 "trial_ends_at": org.trial_ends_at.date().isoformat() if org.trial_ends_at else None,
             },
             "active": active,
             "page_title": page_title,
+            "embedded": embedded,
         },
     )
+    # dev-only: ?embed=1/0 залипает кукой, чтобы навигация сохраняла режим.
+    if override is True:
+        auth.set_embed(response)
+    elif override is False:
+        auth.clear_embed(response)
+    return response
 
 
 def _has_active_connection(db: Session, org_id: int) -> bool:

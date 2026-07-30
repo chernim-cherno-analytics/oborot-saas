@@ -8,8 +8,42 @@
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='6' fill='%231554d1'/%3E%3Ctext x='12' y='17' font-family='Arial,sans-serif' font-size='14' font-weight='800' fill='white' text-anchor='middle'%3E%D0%9E%3C/text%3E%3C/svg%3E">
   <script src="/static/app.js" defer></script>
 </head>
-<body class="{% block bodyclass %}{% endblock %}">
+<body class="{% if embedded %}embed {% endif %}{% block bodyclass %}{% endblock %}">
 {% block body %}
+{% if embedded %}
+{# ── Встроенный режим: внутри iframe раздела «Приложения» МойСклад. ──────────
+   МС снаружи даёт свою шапку/навигацию/логин — поэтому НЕ рендерим наш тёмный
+   сайдбар и топбар. Вместо них — компактная строка табов + рабочая область.
+   Флаг embedded приходит из main._page (кука oborot_embed, ставится при входе
+   через /ms/app; в dev — query ?embed=1). #}
+<div class="embed-shell">
+  <nav class="embed-tabs" aria-label="Разделы Оборота">
+    <a href="/" class="{{ 'active' if active == 'dashboard' else '' }}">Показатели</a>
+    <a href="/replenish" class="{{ 'active' if active == 'replenish' else '' }}">Что заказать<span class="pip" id="nav-pip-replenish" style="display:none;"></span></a>
+    <a href="/turnover" class="{{ 'active' if active == 'turnover' else '' }}">Оборачиваемость</a>
+    <a href="/budget" class="{{ 'active' if active == 'budget' else '' }}">Бюджет</a>
+    <a href="/forecast" class="{{ 'active' if active == 'forecast' else '' }}">Прогноз</a>
+    <a href="/sizes" class="{{ 'active' if active == 'sizes' else '' }}">Размеры</a>
+    <a href="/discounts" class="{{ 'active' if active == 'discounts' else '' }}">Скидки</a>
+    <a href="/stocks" class="{{ 'active' if active == 'stocks' else '' }}">Остатки</a>
+    <a href="/orders" class="{{ 'active' if active == 'orders' else '' }}">Заказы</a>
+    <a href="/settings" class="{{ 'active' if active == 'settings' else '' }}">Настройки</a>
+  </nav>
+
+  {# Триал/демо-полоску показываем ТОЛЬКО не-МС-триалу: подписку МС-аккаунта
+     показывает сам МойСклад снаружи (см. задачу, п.3). #}
+  {% if org.plan == 'trial' and org.source != 'ms_app' %}
+  <div class="trial-strip">
+    <strong>Демо-режим:</strong> показаны синтетические данные.
+    Триал до <span data-fmt-date="{{ org.trial_ends_at }}">{{ org.trial_ends_at }}</span>.
+  </div>
+  {% endif %}
+
+  <main class="content embed-content">
+    {{ self.content() }}
+  </main>
+</div>
+{% else %}
 <div class="shell">
 
   <aside class="sidebar">
@@ -90,6 +124,7 @@
   </div>
 
 </div>
+{% endif %}
 {% endblock %}
 <div id="toast-root"></div>
 {% block scripts %}{% endblock %}

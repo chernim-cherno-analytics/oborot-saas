@@ -345,8 +345,51 @@ function hqSyncText(iso) {
   return fmtDate(iso);
 }
 
+/* ---------- Встроенный режим: авто-высота iframe МойСклад ---------- */
+
+/* Родитель (МойСклад) не знает высоту нашего контента внутри iframe — шлём её
+ * через postMessage при загрузке и при каждом изменении размеров (ResizeObserver).
+ *
+ * ФОРМАТ СООБЩЕНИЯ НАДО СОГЛАСОВАТЬ С АКТУАЛЬНОЙ ДОКОЙ Vendor API / iframe МС
+ * при интеграции: в исследовании (RESEARCH_boli_i_MS_app.md) зафиксировано лишь
+ * «высота через postMessage», без точной схемы. Пока используем общепринятый
+ * {type:'oborot:resize', height:N}; если у МС свой контракт (напр. iframe-resizer
+ * или именованное поле) — поправить hqPostHeight(). targetOrigin жёстко задан на
+ * online.moysklad.ru: сообщение уйдёт только настоящему родителю-МС, в чужой
+ * фрейм/в dev без родителя браузер его молча отбросит (без ошибок в консоли). */
+var MS_PARENT_ORIGIN = "https://online.moysklad.ru";
+
+function hqPostHeight() {
+  var doc = document.documentElement;
+  var body = document.body;
+  var h = Math.ceil(Math.max(
+    doc.scrollHeight, doc.offsetHeight,
+    body ? body.scrollHeight : 0, body ? body.offsetHeight : 0
+  ));
+  if (!h) return;
+  try {
+    window.parent.postMessage({ type: "oborot:resize", height: h }, MS_PARENT_ORIGIN);
+  } catch (e) { /* нет родителя / cross-origin отказ — не критично */ }
+}
+
+function hqInitEmbed() {
+  if (!document.body.classList.contains("embed")) return;
+  hqPostHeight();
+  window.addEventListener("load", hqPostHeight);
+  window.addEventListener("resize", hqPostHeight);
+  if (window.ResizeObserver) {
+    try { new ResizeObserver(hqPostHeight).observe(document.body); } catch (e) { /* ignore */ }
+  }
+  // Динамические перерисовки таблиц/карточек не всегда триггерят ResizeObserver
+  // мгновенно — лёгкий добор высоты вскоре после загрузки.
+  setTimeout(hqPostHeight, 400);
+  setTimeout(hqPostHeight, 1500);
+}
+
 function hqBootShell() {
-  if (!document.querySelector(".sidebar")) return; // auth/onboarding — без оболочки
+  // Оболочка есть и в standalone (.sidebar), и во встроенном режиме (.embed-shell);
+  // на auth/onboarding её нет — выходим. Элементы шапки/сайдбара ниже null-безопасны.
+  if (!document.querySelector(".sidebar") && !document.querySelector(".embed-shell")) return;
 
   // Дата в шапке: «Ср, 30 июля 2026 · 10:42»
   var dateEl = document.getElementById("topbar-date");
@@ -398,6 +441,7 @@ document.addEventListener("DOMContentLoaded", function () {
   });
 
   hqBootShell();
+  hqInitEmbed();
 
   // Меню пользователя
   var chip = document.getElementById("user-chip");

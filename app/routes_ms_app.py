@@ -120,6 +120,9 @@ async def ms_app_entry(
 
     response = RedirectResponse("/", status_code=302)
     # В iframe на проде кука должна быть SameSite=None+Secure (см. докстринг).
-    auth.set_session(response, user.id, org.id,
-                     samesite="none" if is_prod() else "lax")
+    samesite = "none" if is_prod() else "lax"
+    auth.set_session(response, user.id, org.id, samesite=samesite)
+    # Помечаем сессию встроенной: base.html отрендерит компактную оболочку без
+    # нашего сайдбара/топбара (их даёт МойСклад снаружи).
+    auth.set_embed(response, samesite=samesite)
     return response

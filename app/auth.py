@@ -19,6 +19,12 @@ from app.models import Membership, Org, User
 SESSION_COOKIE = "oborot_session"
 SESSION_MAX_AGE = 7 * 24 * 3600  # 7 дней
 
+# Лёгкий признак «работаем внутри iframe МойСклад»: ставится вместе с сессией
+# при входе через /ms/app. Не несёт секретов (значение "1") — только переключает
+# оболочку шаблона на встроенную. HttpOnly и SameSite согласованы с основной
+# кукой (в iframe на проде — None+Secure, см. set_session).
+EMBED_COOKIE = "oborot_embed"
+
 
 # ── Rate-limit логина (защита от перебора паролей) ────────────────────────────
 
@@ -97,6 +103,34 @@ def set_session(response, user_id: int, org_id: int, samesite: str = "lax") -> N
 def clear_session(response) -> None:
     """Снимает сессионную куку."""
     response.delete_cookie(SESSION_COOKIE, path="/")
+
+
+def set_embed(response, samesite: str = "lax") -> None:
+    """Ставит признак встроенного режима (iframe МойСклад) на ответ.
+
+    Аддитивно к set_session: /ms/app зовёт обе. samesite согласуется с сессией
+    (в iframe на проде — "none" + Secure, чтобы кука долетела в третьесторонний
+    фрейм; в dev — "lax"). read_embed читает флаг обратно.
+    """
+    response.set_cookie(
+        EMBED_COOKIE,
+        "1",
+        max_age=SESSION_MAX_AGE,
+        httponly=True,
+        samesite=samesite,
+        secure=is_prod() or samesite == "none",
+        path="/",
+    )
+
+
+def clear_embed(response) -> None:
+    """Снимает признак встроенного режима (возврат к полной оболочке)."""
+    response.delete_cookie(EMBED_COOKIE, path="/")
+
+
+def read_embed(request: Request) -> bool:
+    """True, если пользователь работает внутри iframe МойСклад (кука oborot_embed)."""
+    return request.cookies.get(EMBED_COOKIE) == "1"
 
 
 def read_session(request: Request) -> dict | None:
