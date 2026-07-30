@@ -5,7 +5,7 @@
 
 <div class="metric-grid" style="grid-template-columns:repeat(4, 1fr);" id="cls-strip">
   <div class="metric"><div class="m-label"><span class="dot weak"></span>&nbsp; Слабые</div><div class="m-value" id="cnt-weak">—</div><div class="m-sub">&lt; 1 000 ₽/день</div></div>
-  <div class="metric"><div class="m-label"><span class="dot dull"></span>&nbsp; Унылые</div><div class="m-value" id="cnt-dull">—</div><div class="m-sub">1 000 – 2 000 ₽/день</div></div>
+  <div class="metric"><div class="m-label"><span class="dot dull"></span>&nbsp; Медленные</div><div class="m-value" id="cnt-dull">—</div><div class="m-sub">1 000 – 2 000 ₽/день</div></div>
   <div class="metric"><div class="m-label"><span class="dot good"></span>&nbsp; Хорошие</div><div class="m-value" id="cnt-good">—</div><div class="m-sub">2 000 – 5 000 ₽/день</div></div>
   <div class="metric"><div class="m-label"><span class="dot best"></span>&nbsp; Бестселлеры</div><div class="m-value" id="cnt-best">—</div><div class="m-sub">≥ 5 000 ₽/день</div></div>
 </div>
@@ -163,6 +163,8 @@ document.addEventListener("DOMContentLoaded", function () {
     document.getElementById("f-cs").textContent = fmtInt(cs);
   }
 
+    var urlQ = new URLSearchParams(window.location.search).get("q");
+  if (urlQ) { document.getElementById("search").value = urlQ; state.query = urlQ.trim(); }
   document.getElementById("search").addEventListener("input", debounce(function (e) {
     state.query = e.target.value.trim();
     renderTable();

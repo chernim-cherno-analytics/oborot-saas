@@ -34,7 +34,7 @@ FMT_PCT = "0%"
 FMT_NUM1 = "#,##0.0"
 FMT_NUM2 = "#,##0.00"
 
-CLS_RU = {"weak": "Слабый", "dull": "Унылый", "good": "Хороший", "best": "Бестселлер"}
+CLS_RU = {"weak": "Слабый", "dull": "Медленный", "good": "Хороший", "best": "Бестселлер"}
 
 _TITLE_FONT = Font(color="808080", size=9)
 _HEADER_FONT = Font(bold=True, color="FFFFFF", size=10)

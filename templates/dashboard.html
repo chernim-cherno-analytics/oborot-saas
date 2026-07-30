@@ -18,9 +18,9 @@
     <div class="m-sub" id="m-sold-qty">— шт</div>
   </div>
   <div class="metric">
-    <div class="m-label">Оборачиваемость</div>
+    <div class="m-label" title="Сумма оборачиваемостей всех позиций: сколько ₽ выручки в день приносит ассортимент при текущем темпе">Темп продаж</div>
     <div class="m-value" id="m-turnover">—</div>
-    <div class="m-sub">₽/день суммарно за 365 дней</div>
+    <div class="m-sub">₽/день — сумма по всем позициям за год</div>
   </div>
 </div>
 
@@ -54,7 +54,7 @@
     <div class="card-body">
       <div style="display:grid; grid-template-columns:repeat(4,1fr); gap:10px;" id="classes-box">
         <div class="cls-tile weak"><div class="ct-num" id="cls-weak">—</div><div class="ct-label">Слабые</div><div class="ct-sub">до 1&nbsp;тыс&nbsp;₽/день</div></div>
-        <div class="cls-tile dull"><div class="ct-num" id="cls-dull">—</div><div class="ct-label">Унылые</div><div class="ct-sub">1–2&nbsp;тыс&nbsp;₽/день</div></div>
+        <div class="cls-tile dull"><div class="ct-num" id="cls-dull">—</div><div class="ct-label">Медленные</div><div class="ct-sub">1–2&nbsp;тыс&nbsp;₽/день</div></div>
         <div class="cls-tile good"><div class="ct-num" id="cls-good">—</div><div class="ct-label">Хорошие</div><div class="ct-sub">2–5&nbsp;тыс&nbsp;₽/день</div></div>
         <div class="cls-tile best"><div class="ct-num" id="cls-best">—</div><div class="ct-label">Бестселлеры</div><div class="ct-sub">от 5&nbsp;тыс&nbsp;₽/день</div></div>
       </div>
@@ -106,9 +106,10 @@ document.addEventListener("DOMContentLoaded", function () {
       cnt.style.display = "";
       cnt.textContent = alerts.length;
       box.innerHTML = alerts.map(function (a) {
-        return '<div class="alert-item ' + (a.severity === "red" ? "red" : "yellow") + '">' +
+        return '<a class="alert-item ' + (a.severity === "red" ? "red" : "yellow") +
+          '" href="/turnover?q=' + encodeURIComponent(a.base_name) + '" style="text-decoration:none; color:inherit; display:block;">' +
           '<div><div class="a-name">' + esc(a.base_name) + "</div>" +
-          '<div class="a-text">' + esc(a.text) + "</div></div></div>";
+          '<div class="a-text">' + esc(a.text) + "</div></div></a>";
       }).join("");
     }
 

@@ -113,7 +113,7 @@ def login_submit(
     limiter_keys = (f"ip:{ip}", f"acc:{ip}:{email_norm}")
     if not all(auth.login_limiter.check(k) for k in limiter_keys):
         return _render_auth(
-            request, "login.html",
+            request, "login.html", email=email_norm,
             error="Слишком много попыток входа. Подождите несколько минут и попробуйте снова.",
         )
     user = db.execute(
@@ -122,14 +122,14 @@ def login_submit(
     if user is None or not auth.verify_password(password, user.pw_hash):
         for k in limiter_keys:
             auth.login_limiter.hit(k)
-        return _render_auth(request, "login.html", error="Неверный e-mail или пароль")
+        return _render_auth(request, "login.html", email=email_norm, error="Неверный e-mail или пароль")
     for k in limiter_keys:
         auth.login_limiter.reset(k)
     member = db.execute(
         select(Membership).where(Membership.user_id == user.id)
     ).scalars().first()
     if member is None:
-        return _render_auth(request, "login.html", error="У пользователя нет организации")
+        return _render_auth(request, "login.html", email=email_norm, error="У пользователя нет организации")
     response = RedirectResponse("/", status_code=303)
     auth.set_session(response, user.id, member.org_id)
     return response
@@ -151,12 +151,12 @@ def register_submit(
 ):
     email_norm = email.strip().lower()
     if not email_norm or "@" not in email_norm:
-        return _render_auth(request, "register.html", error="Укажите корректный e-mail")
+        return _render_auth(request, "register.html", name=name, org_name=org_name, email=email, error="Укажите корректный e-mail")
     if len(password) < 6:
-        return _render_auth(request, "register.html", error="Пароль — минимум 6 символов")
+        return _render_auth(request, "register.html", name=name, org_name=org_name, email=email, error="Пароль — минимум 6 символов")
     exists = db.execute(select(User.id).where(User.email == email_norm)).first()
     if exists:
-        return _render_auth(request, "register.html", error="Такой e-mail уже зарегистрирован")
+        return _render_auth(request, "register.html", name=name, org_name=org_name, email=email, error="Такой e-mail уже зарегистрирован")
 
     user = User(email=email_norm, pw_hash=auth.hash_password(password), name=name.strip())
     org = Org(

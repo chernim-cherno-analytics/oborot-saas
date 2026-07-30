@@ -44,7 +44,7 @@
       <p style="margin:0 0 14px; font-size:12px; color:var(--text-soft);">
         Классы считаются по выручке в день, когда товар в наличии:
         <span class="cls-badge"><span class="dot weak"></span>слабый</span> ниже первого порога,
-        <span class="cls-badge"><span class="dot dull"></span>унылый</span> и
+        <span class="cls-badge"><span class="dot dull"></span>медленный</span> и
         <span class="cls-badge"><span class="dot good"></span>хороший</span> — между порогами,
         <span class="cls-badge"><span class="dot best"></span>бестселлер</span> — выше третьего.
       </p>
@@ -54,7 +54,7 @@
           <input class="input num" type="number" id="th-weak" min="0" step="100">
         </div>
         <div class="field">
-          <label for="th-dull"><span class="dot dull"></span> Унылый до, ₽/день</label>
+          <label for="th-dull"><span class="dot dull"></span> Медленный до, ₽/день</label>
           <input class="input num" type="number" id="th-dull" min="0" step="100">
         </div>
         <div class="field">
@@ -197,7 +197,7 @@ document.addEventListener("DOMContentLoaded", function () {
     var w = Number(document.getElementById("th-weak").value);
     var d = Number(document.getElementById("th-dull").value);
     var g = Number(document.getElementById("th-good").value);
-    if (!(w < d && d < g)) { toast("Пороги должны возрастать: слабый < унылый < хороший", "error"); return; }
+    if (!(w < d && d < g)) { toast("Пороги должны возрастать: слабый < медленный < хороший", "error"); return; }
     saveSettings(null, "Пороги сохранены. Классы пересчитаются при следующей загрузке.");
   });
   document.getElementById("btn-save-horizon").addEventListener("click", function () {
@@ -306,7 +306,7 @@ document.addEventListener("DOMContentLoaded", function () {
     }
     if (!n.bot_configured) {
       document.getElementById("notify-hint").textContent =
-        "Telegram-бот пока не настроен на сервере — уведомления заработают после настройки OBOROT_TG_BOT_TOKEN.";
+        "Telegram-бот пока не настроен на сервере — уведомления в Telegram появятся после запуска сервиса.";
     }
   }).catch(function () {
     document.getElementById("notify-box").innerHTML =
