@@ -6,3 +6,4 @@ _final_shots.py
 _preview*
 _shots/
 nohup.out
+.env.local
