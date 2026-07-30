@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block bodyclass %}auth-page{% endblock %}
+{% block body %}
+<div class="auth-wrap">
+  <div class="auth-logo">
+    <svg width="30" height="30" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="11" fill="#2563eb"/><path d="M12 5a7 7 0 1 0 7 7" stroke="#fff" stroke-width="2.4" stroke-linecap="round"/><path d="M16 2.6l3.4 2.8-4.1 1.8z" fill="#fff"/></svg>
+    <span class="logo-text">Оборот</span>
+  </div>
+
+  <div class="auth-card">
+    <h1>Вход</h1>
+    <p class="auth-sub">Аналитика остатков и оборачиваемости для вашего бренда</p>
+
+    {% if error %}
+    <div class="form-error">{{ error }}</div>
+    {% endif %}
+
+    <form method="post" action="/login">
+      <div class="field">
+        <label for="email">Электронная почта</label>
+        <input class="input" type="email" id="email" name="email" required autofocus
+               autocomplete="email" placeholder="you@brand.ru" value="{{ email or '' }}">
+      </div>
+      <div class="field">
+        <label for="password">Пароль</label>
+        <input class="input" type="password" id="password" name="password" required
+               autocomplete="current-password" placeholder="••••••••">
+      </div>
+      <button class="btn primary" type="submit" style="width:100%">Войти</button>
+    </form>
+
+    <div class="auth-alt">Нет аккаунта? <a href="/register">Зарегистрироваться</a></div>
+  </div>
+
+  <p class="auth-note">«Оборот» — что заказать на производство, пока бестселлеры ещё в наличии.</p>
+</div>
+{% endblock %}

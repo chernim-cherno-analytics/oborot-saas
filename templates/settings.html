@@ -1,0 +1,260 @@
+{% extends "base.html" %}
+{% block content %}
+
+<div class="settings-grid">
+
+  <div class="card">
+    <div class="card-head"><h2>Организация</h2></div>
+    <div class="card-body">
+      <div class="form-row">
+        <div class="field">
+          <label>Название</label>
+          <input class="input" type="text" value="{{ org.name }}" disabled>
+          <div class="hint">Название задаётся при регистрации. Для изменения напишите в поддержку.</div>
+        </div>
+        <div class="field">
+          <label>Тариф</label>
+          <div style="display:flex; gap:10px; align-items:center; padding-top:3px;">
+            {% if org.plan == 'trial' %}
+              <span class="plan-badge trial">Триал</span>
+              <span style="font-size:12px; color:var(--text-soft);">до <span data-fmt-date="{{ org.trial_ends_at }}">{{ org.trial_ends_at }}</span></span>
+            {% else %}
+              <span class="plan-badge">{{ {'start':'Старт','brand':'Бренд','pro':'Про'}.get(org.plan, org.plan) }}</span>
+            {% endif %}
+            <button class="btn sm" type="button" id="btn-plan">Сменить тариф</button>
+          </div>
+          <div class="hint" id="plan-hint">
+            {% if org.plan == 'trial' %}Триал: полный функционал, до 100 позиций, 1 подключение.
+            {% elif org.plan == 'start' %}Старт: до 300 позиций, 1 склад-источник, 2 пользователя.
+            {% elif org.plan == 'brand' %}Бренд: до 2 000 позиций, все склады, 5 пользователей.
+            {% else %}Про: без ограничений, приоритетная поддержка.{% endif %}
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-head">
+      <h2>Пороги оборачиваемости</h2>
+      <div class="spacer"></div>
+      <button class="btn sm primary" type="button" id="btn-save-thresholds">Сохранить</button>
+    </div>
+    <div class="card-body">
+      <p style="margin:0 0 14px; font-size:12px; color:var(--text-soft);">
+        Классы считаются по выручке в день, когда товар в наличии:
+        <span class="cls-badge"><span class="dot weak"></span>слабый</span> ниже первого порога,
+        <span class="cls-badge"><span class="dot dull"></span>унылый</span> и
+        <span class="cls-badge"><span class="dot good"></span>хороший</span> — между порогами,
+        <span class="cls-badge"><span class="dot best"></span>бестселлер</span> — выше третьего.
+      </p>
+      <div class="form-row">
+        <div class="field">
+          <label for="th-weak"><span class="dot weak"></span> Слабый до, ₽/день</label>
+          <input class="input num" type="number" id="th-weak" min="0" step="100">
+        </div>
+        <div class="field">
+          <label for="th-dull"><span class="dot dull"></span> Унылый до, ₽/день</label>
+          <input class="input num" type="number" id="th-dull" min="0" step="100">
+        </div>
+        <div class="field">
+          <label for="th-good"><span class="dot good"></span> Хороший до, ₽/день</label>
+          <input class="input num" type="number" id="th-good" min="0" step="100">
+        </div>
+        <div class="field">
+          <label for="th-minstock" title="День считается «в стоке», если остаток не ниже этого значения">Мин. остаток «в стоке», шт</label>
+          <input class="input num" type="number" id="th-minstock" min="0" step="1">
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-head">
+      <h2>Горизонт заказа</h2>
+      <div class="spacer"></div>
+      <button class="btn sm primary" type="button" id="btn-save-horizon">Сохранить</button>
+    </div>
+    <div class="card-body">
+      <div class="form-row" style="align-items:flex-end;">
+        <div class="field" style="max-width:220px;">
+          <label for="horizon">Горизонт планирования, дней</label>
+          <input class="input num" type="number" id="horizon" min="7" max="365" step="1">
+        </div>
+        <div class="field">
+          <div class="hint" style="margin-bottom:9px;">На сколько дней продаж должен закрывать потребность заказ на производство. Рекомендация «Что заказать» = темп × горизонт − остаток − уже заказанное.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-head"><h2>Склады</h2></div>
+    <div class="card-body">
+      <p style="margin:0 0 8px; font-size:12px; color:var(--text-soft);">Неактивные склады не участвуют в аналитике: их остатки и продажи не учитываются.</p>
+      <div id="wh-box"><div class="loading-stub">Загрузка…</div></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-head"><h2>Подключение данных</h2></div>
+    <div class="card-body" id="conn-box"><div class="loading-stub">Загрузка…</div></div>
+  </div>
+
+  <div class="card">
+    <div class="card-head">
+      <h2>Команда</h2>
+      <div class="spacer"></div>
+      <button class="btn sm" type="button" id="btn-invite">Пригласить</button>
+    </div>
+    <div class="card-body" id="team-box"><div class="loading-stub">Загрузка…</div></div>
+  </div>
+
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+  var settings = null;
+
+  api("/api/settings").then(function (d) {
+    settings = d || {};
+    var th = settings.thresholds || {};
+    document.getElementById("th-weak").value = th.weak != null ? th.weak : 1000;
+    document.getElementById("th-dull").value = th.dull != null ? th.dull : 2000;
+    document.getElementById("th-good").value = th.good != null ? th.good : 5000;
+    document.getElementById("th-minstock").value = settings.min_stock_days != null ? settings.min_stock_days : 3;
+    document.getElementById("horizon").value = settings.horizon_days != null ? settings.horizon_days : 90;
+    renderWarehouses(settings.warehouses || []);
+    renderConnection(settings.connection || null);
+    renderTeam(settings.members || []);
+  }).catch(function () {
+    document.getElementById("wh-box").innerHTML = '<p class="muted" style="margin:0;">Не удалось загрузить.</p>';
+    document.getElementById("conn-box").innerHTML = '<p class="muted" style="margin:0;">Не удалось загрузить.</p>';
+    document.getElementById("team-box").innerHTML = '<p class="muted" style="margin:0;">Не удалось загрузить.</p>';
+  });
+
+  function saveSettings(extra, doneMsg) {
+    var body = {
+      thresholds: {
+        weak: Number(document.getElementById("th-weak").value) || 0,
+        dull: Number(document.getElementById("th-dull").value) || 0,
+        good: Number(document.getElementById("th-good").value) || 0
+      },
+      min_stock_days: Number(document.getElementById("th-minstock").value) || 0,
+      horizon_days: Number(document.getElementById("horizon").value) || 90
+    };
+    Object.assign(body, extra || {});
+    return api("/api/settings", { method: "POST", body: body }).then(function () {
+      toast(doneMsg || "Настройки сохранены", "success");
+    });
+  }
+
+  document.getElementById("btn-save-thresholds").addEventListener("click", function () {
+    var w = Number(document.getElementById("th-weak").value);
+    var d = Number(document.getElementById("th-dull").value);
+    var g = Number(document.getElementById("th-good").value);
+    if (!(w < d && d < g)) { toast("Пороги должны возрастать: слабый < унылый < хороший", "error"); return; }
+    saveSettings(null, "Пороги сохранены. Классы пересчитаются при следующей загрузке.");
+  });
+  document.getElementById("btn-save-horizon").addEventListener("click", function () {
+    saveSettings(null, "Горизонт заказа сохранён");
+  });
+
+  function renderWarehouses(whs) {
+    var box = document.getElementById("wh-box");
+    if (!whs.length) {
+      box.innerHTML = '<p class="muted" style="margin:0;">Склады появятся после первой синхронизации с источником данных.</p>';
+      return;
+    }
+    box.innerHTML = whs.map(function (w) {
+      return '<div class="wh-row">' +
+        '<label class="switch"><input type="checkbox" class="wh-toggle" data-id="' + esc(w.id) + '"' + (w.active ? " checked" : "") + '><span class="track"></span></label>' +
+        '<div style="flex:1;">' + esc(w.name) + "</div>" +
+        '<span class="badge ' + (w.active ? "green" : "gray") + '">' + (w.active ? "в аналитике" : "выключен") + "</span>" +
+        "</div>";
+    }).join("");
+    box.querySelectorAll(".wh-toggle").forEach(function (cb) {
+      cb.addEventListener("change", function () {
+        var id = cb.getAttribute("data-id");
+        cb.disabled = true;
+        api("/api/warehouses/" + id + "/toggle", { method: "POST", body: {} }).then(function () {
+          var row = cb.closest(".wh-row");
+          var badge = row.querySelector(".badge");
+          badge.className = "badge " + (cb.checked ? "green" : "gray");
+          badge.textContent = cb.checked ? "в аналитике" : "выключен";
+          toast("Склад " + (cb.checked ? "включён в аналитику" : "исключён из аналитики"), "success");
+        }).catch(function () {
+          cb.checked = !cb.checked;
+        }).finally(function () { cb.disabled = false; });
+      });
+    });
+  }
+
+  function renderConnection(conn) {
+    var box = document.getElementById("conn-box");
+    var KIND = { moysklad: "МойСклад", demo: "Демо-данные" };
+    var ST = { active: ["active", "работает"], pending: ["pending", "ожидает синхронизации"], error: ["error", "ошибка"] };
+    var html = "";
+    if (conn) {
+      var st = ST[conn.status] || ST.pending;
+      html += '<div style="display:flex; align-items:center; gap:12px; margin-bottom:14px;">' +
+        '<span class="conn-status ' + st[0] + '"><span class="dot-live"></span>' + (KIND[conn.kind] || esc(conn.kind || "")) + "</span>" +
+        '<span style="font-size:12px; color:var(--text-soft);">' + st[1] +
+        (conn.last_sync_at ? " · синхронизация " + fmtDate(conn.last_sync_at) : "") + "</span></div>";
+      if (conn.kind === "demo") {
+        html += '<p style="margin:0 0 14px; font-size:12px; color:var(--text-soft);">Сейчас показаны синтетические данные. Подключите МойСклад, чтобы работать со своим ассортиментом.</p>';
+      }
+    } else {
+      html += '<p style="margin:0 0 14px; font-size:12px; color:var(--text-soft);">Источник данных не подключён.</p>';
+    }
+    html += '<div class="form-row" style="align-items:flex-end; max-width:520px;">' +
+      '<div class="field" style="flex:1; margin-bottom:0;">' +
+      '<label for="ms-token">API-токен МойСклад</label>' +
+      '<input class="input" type="password" id="ms-token" placeholder="Вставьте токен доступа" autocomplete="off">' +
+      "</div>" +
+      '<button class="btn" type="button" id="btn-connect-ms" style="margin-bottom:1px;">Подключить</button></div>' +
+      '<div class="hint" style="margin-top:6px;">Токен хранится в зашифрованном виде. МойСклад → Настройки → Обмен данными → Токены API.</div>';
+    box.innerHTML = html;
+
+    document.getElementById("btn-connect-ms").addEventListener("click", function () {
+      var token = document.getElementById("ms-token").value.trim();
+      if (!token) { toast("Вставьте API-токен МойСклад", "error"); return; }
+      var btn = this;
+      btn.disabled = true;
+      api("/api/connect/moysklad", { method: "POST", body: { token: token } }).then(function (res) {
+        toast((res && res.note) || "Подключение сохранено", "success");
+        document.getElementById("ms-token").value = "";
+      }).finally(function () { btn.disabled = false; });
+    });
+  }
+
+  function renderTeam(members) {
+    var box = document.getElementById("team-box");
+    var ROLE = { owner: "Владелец", member: "Участник" };
+    if (!members.length) {
+      box.innerHTML = '<div class="member-row"><span class="avatar">{{ (user.name or user.email)[:1]|upper }}</span>' +
+        '<div style="flex:1;"><div style="font-weight:500;">{{ user.name }}</div>' +
+        '<div style="font-size:12px; color:var(--text-soft);">{{ user.email }}</div></div>' +
+        '<span class="badge blue">Владелец</span></div>';
+      return;
+    }
+    box.innerHTML = members.map(function (m) {
+      return '<div class="member-row"><span class="avatar">' + esc((m.name || m.email || "?")[0].toUpperCase()) + "</span>" +
+        '<div style="flex:1;"><div style="font-weight:500;">' + esc(m.name || "") + "</div>" +
+        '<div style="font-size:12px; color:var(--text-soft);">' + esc(m.email || "") + "</div></div>" +
+        '<span class="badge ' + (m.role === "owner" ? "blue" : "gray") + '">' + (ROLE[m.role] || esc(m.role || "")) + "</span></div>";
+    }).join("");
+  }
+
+  document.getElementById("btn-plan").addEventListener("click", function () {
+    toast("Смена тарифа появится после запуска биллинга. Напишите нам — подберём тариф вручную.");
+  });
+  document.getElementById("btn-invite").addEventListener("click", function () {
+    toast("Приглашения в команду скоро появятся. Пока напишите в поддержку — добавим коллег вручную.");
+  });
+});
+</script>
+{% endblock %}

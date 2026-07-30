@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block bodyclass %}auth-page{% endblock %}
+{% block body %}
+<div class="auth-wrap">
+  <div class="auth-logo">
+    <svg width="30" height="30" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="11" fill="#2563eb"/><path d="M12 5a7 7 0 1 0 7 7" stroke="#fff" stroke-width="2.4" stroke-linecap="round"/><path d="M16 2.6l3.4 2.8-4.1 1.8z" fill="#fff"/></svg>
+    <span class="logo-text">Оборот</span>
+  </div>
+
+  <div class="auth-card">
+    <h1>Регистрация</h1>
+    <p class="auth-sub">14 дней бесплатно, карта не нужна</p>
+
+    {% if error %}
+    <div class="form-error">{{ error }}</div>
+    {% endif %}
+
+    <form method="post" action="/register">
+      <div class="field">
+        <label for="name">Ваше имя</label>
+        <input class="input" type="text" id="name" name="name" required autofocus
+               autocomplete="name" placeholder="Анна Смирнова" value="{{ name or '' }}">
+      </div>
+      <div class="field">
+        <label for="org_name">Название бренда или компании</label>
+        <input class="input" type="text" id="org_name" name="org_name" required
+               autocomplete="organization" placeholder="Мой бренд" value="{{ org_name or '' }}">
+      </div>
+      <div class="field">
+        <label for="email">Электронная почта</label>
+        <input class="input" type="email" id="email" name="email" required
+               autocomplete="email" placeholder="you@brand.ru" value="{{ email or '' }}">
+      </div>
+      <div class="field">
+        <label for="password">Пароль</label>
+        <input class="input" type="password" id="password" name="password" required
+               autocomplete="new-password" minlength="8" placeholder="Не менее 8 символов">
+      </div>
+      <button class="btn primary" type="submit" style="width:100%">Создать аккаунт</button>
+    </form>
+
+    <div class="auth-alt">Уже есть аккаунт? <a href="/login">Войти</a></div>
+  </div>
+
+  <p class="auth-note">Регистрируясь, вы соглашаетесь с условиями использования сервиса.</p>
+</div>
+{% endblock %}

@@ -1,0 +1,21 @@
+<!doctype html>
+<!-- ВРЕМЕННАЯ ЗАГЛУШКА backend-агента. Настоящий base.html живёт в templates/. -->
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <title>{{ page_title }} — Оборот</title>
+</head>
+<body>
+  {% if user %}
+  <nav>
+    [{{ active }}] {{ org.name }} ({{ org.plan }}) — {{ user.email }}
+    | <a href="/">Показатели</a> <a href="/replenish">Что заказать</a>
+    <a href="/turnover">Оборачиваемость</a> <a href="/stocks">Остатки</a>
+    <a href="/orders">Заказы</a> <a href="/settings">Настройки</a>
+    <form method="post" action="/logout" style="display:inline"><button>Выйти</button></form>
+  </nav>
+  {% endif %}
+  <h1>{{ page_title }}</h1>
+  {% block content %}{% endblock %}
+</body>
+</html>

@@ -1,0 +1,143 @@
+{% extends "base.html" %}
+{% block bodyclass %}auth-page{% endblock %}
+{% block body %}
+<div class="auth-wrap">
+  <div class="auth-logo">
+    <svg width="30" height="30" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="11" fill="#2563eb"/><path d="M12 5a7 7 0 1 0 7 7" stroke="#fff" stroke-width="2.4" stroke-linecap="round"/><path d="M16 2.6l3.4 2.8-4.1 1.8z" fill="#fff"/></svg>
+    <span class="logo-text">Оборот</span>
+  </div>
+
+  <div class="auth-card onb-card">
+
+    <!-- Шаг 1: выбор источника -->
+    <div id="step-1">
+      <h1>Подключите источник данных</h1>
+      <p class="auth-sub">Откуда «Обороту» брать остатки и продажи {{ org.name }}</p>
+
+      <div class="source-opt" id="opt-ms" role="button" tabindex="0">
+        <div class="so-icon">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 8l-9-5-9 5v8l9 5 9-5z"/><path d="M3 8l9 5 9-5"/></svg>
+        </div>
+        <div>
+          <div class="so-title">МойСклад</div>
+          <div class="so-text">Подключение по API-токену. Синхронизация остатков, продаж и возвратов начнётся автоматически.</div>
+          <div class="ms-token-form" id="ms-token-form" style="display:none; margin-top:12px;">
+            <div class="field" style="margin-bottom:10px;">
+              <label for="ms-token">API-токен МойСклад</label>
+              <input class="input" type="password" id="ms-token" placeholder="Вставьте токен доступа"
+                     autocomplete="off" spellcheck="false">
+              <div class="hint">МойСклад → Настройки → Обмен данными → Токены API</div>
+            </div>
+            <button class="btn primary" type="button" id="btn-connect-ms">Подключить МойСклад</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="source-opt" id="opt-demo" role="button" tabindex="0">
+        <div class="so-icon">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polygon points="6 4 20 12 6 20"/></svg>
+        </div>
+        <div>
+          <div class="so-title">Демо-данные</div>
+          <div class="so-text">Посмотрите сервис на данных синтетического fashion-бренда: 55 позиций, год истории продаж, три склада. Реальные данные можно подключить позже в настройках.</div>
+          <div id="demo-btn-wrap" style="display:none; margin-top:12px;">
+            <button class="btn primary" type="button" id="btn-connect-demo">Загрузить демо-данные</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Шаг 2: прогресс -->
+    <div id="step-2" style="display:none;">
+      <h1 id="progress-title">Готовим данные…</h1>
+      <p class="auth-sub" id="progress-sub">Обычно это занимает меньше минуты</p>
+      <div class="progress-track"><i id="progress-fill"></i></div>
+      <div class="progress-note" id="progress-note">Создаём подключение…</div>
+    </div>
+
+  </div>
+
+  <p class="auth-note">Вы вошли как {{ user.email }} · <a href="/logout" onclick="event.preventDefault(); document.getElementById('logout-form').submit();">выйти</a></p>
+  <form method="post" action="/logout" id="logout-form" style="display:none;"></form>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+  var optMs = document.getElementById("opt-ms");
+  var optDemo = document.getElementById("opt-demo");
+  var msForm = document.getElementById("ms-token-form");
+  var demoWrap = document.getElementById("demo-btn-wrap");
+
+  function select(which) {
+    optMs.classList.toggle("selected", which === "ms");
+    optDemo.classList.toggle("selected", which === "demo");
+    msForm.style.display = which === "ms" ? "block" : "none";
+    demoWrap.style.display = which === "demo" ? "block" : "none";
+  }
+  optMs.addEventListener("click", function () { select("ms"); });
+  optDemo.addEventListener("click", function () { select("demo"); });
+  [optMs, optDemo].forEach(function (el) {
+    el.addEventListener("keydown", function (e) {
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); el.click(); }
+    });
+  });
+  select("demo"); // демо — путь по умолчанию
+
+  var fill = document.getElementById("progress-fill");
+  var note = document.getElementById("progress-note");
+
+  function showProgress(steps, done) {
+    document.getElementById("step-1").style.display = "none";
+    document.getElementById("step-2").style.display = "block";
+    var i = 0;
+    function tick() {
+      if (i < steps.length) {
+        note.textContent = steps[i][0];
+        fill.style.width = steps[i][1] + "%";
+        i++;
+        setTimeout(tick, 550);
+      } else {
+        done();
+      }
+    }
+    tick();
+  }
+
+  document.getElementById("btn-connect-demo").addEventListener("click", function () {
+    var btn = this;
+    btn.disabled = true;
+    api("/api/connect/demo", { method: "POST", body: {} }).then(function () {
+      showProgress([
+        ["Создаём подключение…", 15],
+        ["Генерируем ассортимент и склады…", 40],
+        ["Загружаем историю продаж за год…", 75],
+        ["Считаем оборачиваемость…", 95],
+        ["Готово!", 100]
+      ], function () {
+        window.location.href = "/";
+      });
+    }).catch(function () { btn.disabled = false; });
+  });
+
+  document.getElementById("btn-connect-ms").addEventListener("click", function () {
+    var token = document.getElementById("ms-token").value.trim();
+    if (!token) { toast("Вставьте API-токен МойСклад", "error"); return; }
+    var btn = this;
+    btn.disabled = true;
+    api("/api/connect/moysklad", { method: "POST", body: { token: token } }).then(function (res) {
+      document.getElementById("progress-title").textContent = "Подключение сохранено";
+      document.getElementById("progress-sub").textContent = (res && res.note) || "Синхронизация начнётся автоматически";
+      showProgress([
+        ["Проверяем токен…", 30],
+        ["Ставим синхронизацию в очередь…", 70],
+        ["Готово!", 100]
+      ], function () {
+        window.location.href = "/";
+      });
+    }).catch(function () { btn.disabled = false; });
+  });
+});
+</script>
+{% endblock %}

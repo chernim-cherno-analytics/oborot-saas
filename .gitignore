@@ -1,0 +1,8 @@
+oborot.db
+server.log
+__pycache__/
+_e2e*
+_final_shots.py
+_preview*
+_shots/
+nohup.out

@@ -1,0 +1,137 @@
+{% extends "base.html" %}
+{% block content %}
+
+<div class="no-print">
+  <p class="page-sub">Заказы, созданные из «Что заказать». Выберите заказ, чтобы посмотреть состав и распечатать для производства.</p>
+  <div id="orders-box">
+    <div class="loading-stub">Загрузка…</div>
+  </div>
+</div>
+
+<div id="detail-box" style="margin-top:16px;"></div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+  var orders = [];
+  var currentId = null;
+  var box = document.getElementById("orders-box");
+  var detail = document.getElementById("detail-box");
+
+  var STATUS = {
+    draft: '<span class="badge gray">Черновик</span>',
+    sent: '<span class="badge blue">Отправлен</span>'
+  };
+
+  api("/api/orders").then(function (d) {
+    orders = Array.isArray(d) ? d : (d.orders || d.items || []);
+    renderList();
+    if (orders.length) openOrder(orders[0].id);
+  }).catch(function () {
+    box.innerHTML = emptyState("Не удалось загрузить заказы", "Обновите страницу или попробуйте позже.",
+      '<button class="btn" onclick="location.reload()">Обновить</button>');
+  });
+
+  function orderStats(o) {
+    var items = o.items || [];
+    var pos = items.length, qty = 0, cost = 0;
+    items.forEach(function (it) {
+      qty += it.qty || 0;
+      cost += (it.qty || 0) * (it.cost || 0);
+    });
+    return { pos: pos, qty: qty, cost: cost };
+  }
+
+  function renderList() {
+    if (!orders.length) {
+      box.innerHTML = emptyState(
+        "Заказов на производство пока нет",
+        "Соберите первый заказ из рекомендаций на экране «Что заказать» — система сама разложит его по размерам.",
+        '<a class="btn primary" href="/replenish">Перейти к рекомендациям</a>',
+        '<svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 21V9l5 3V9l5 3V4h6v17z"/><line x1="4" y1="21" x2="20" y2="21"/></svg>');
+      return;
+    }
+    box.innerHTML = '<div class="order-grid">' + orders.map(function (o) {
+      var s = orderStats(o);
+      var statsHtml = o.items
+        ? '<div class="o-stats"><div><b>' + fmtInt(s.pos) + '</b> <span>поз.</span></div>' +
+          '<div><b>' + fmtInt(s.qty) + '</b> <span>шт</span></div>' +
+          '<div><b>' + fmtMoney(s.cost) + '</b> <span>себес</span></div></div>'
+        : "";
+      return '<div class="order-card' + (o.id === currentId ? " active" : "") + '" data-id="' + esc(o.id) + '">' +
+        '<div style="display:flex; align-items:center; gap:8px;"><div class="o-name" style="flex:1;">' + esc(o.name) + "</div>" +
+        (STATUS[o.status] || "") + "</div>" +
+        '<div class="o-meta">Создан ' + fmtDate(o.created_at) + (o.eta_date ? " · готовность " + fmtDate(o.eta_date) : "") + "</div>" +
+        statsHtml +
+        "</div>";
+    }).join("") + "</div>";
+
+    box.querySelectorAll(".order-card").forEach(function (card) {
+      card.addEventListener("click", function () {
+        openOrder(isNaN(Number(card.getAttribute("data-id"))) ? card.getAttribute("data-id") : Number(card.getAttribute("data-id")));
+      });
+    });
+  }
+
+  function openOrder(id) {
+    currentId = id;
+    renderList();
+    detail.innerHTML = '<div class="card"><div class="loading-stub">Загрузка заказа…</div></div>';
+    api("/api/orders/" + id).then(renderDetail).catch(function () {
+      detail.innerHTML = "";
+    });
+  }
+
+  function renderDetail(o) {
+    var items = o.items || [];
+    var s = orderStats(o);
+    var rev = 0;
+
+    var rows = items.map(function (it) {
+      var sizes = it.sizes || {};
+      var szKeys = sortSizeKeys(Object.keys(sizes));
+      var szText = szKeys.length
+        ? szKeys.map(function (k) { return esc(k) + "&thinsp;×&thinsp;" + fmtInt(sizes[k]); }).join(" · ")
+        : "<span class='muted'>без размера</span>";
+      var sum = (it.qty || 0) * (it.cost || 0);
+      return "<tr>" +
+        '<td class="name-cell"><span class="name-main">' + esc(it.base_name) + "</span></td>" +
+        "<td>" + szText + "</td>" +
+        '<td class="num"><b>' + fmtInt(it.qty) + "</b></td>" +
+        '<td class="num">' + fmtMoney(it.cost) + "</td>" +
+        '<td class="num">' + fmtMoney(sum) + "</td>" +
+        "</tr>";
+    }).join("");
+
+    detail.innerHTML =
+      '<div class="card">' +
+      '<div class="print-header"><div class="ph-brand">{{ org.name }} — заказ на производство</div>' +
+      '<div class="ph-meta">' + esc(o.name) + " · создан " + fmtDate(o.created_at) +
+      (o.eta_date ? " · ожидаемая готовность " + fmtDate(o.eta_date) : "") + "</div></div>" +
+      '<div class="card-head">' +
+      "<h2>" + esc(o.name) + "</h2>" +
+      (STATUS[o.status] || "") +
+      '<span style="font-size:12px; color:var(--text-soft);">создан ' + fmtDate(o.created_at) +
+      (o.eta_date ? " · готовность " + fmtDate(o.eta_date) : "") + "</span>" +
+      '<div class="spacer"></div>' +
+      '<button class="btn sm no-print" type="button" id="btn-print">' +
+      '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 6 2 18 2 18 9"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8"/></svg>' +
+      " Печать</button>" +
+      "</div>" +
+      '<div class="tbl-wrap"><table class="tbl">' +
+      '<thead><tr><th>Позиция</th><th>Размеры</th><th class="num">Кол-во, шт</th><th class="num">Себес за шт</th><th class="num">Сумма</th></tr></thead>' +
+      "<tbody>" + (rows || '<tr><td colspan="5" class="muted">В заказе нет позиций</td></tr>') + "</tbody>" +
+      "<tfoot><tr><td>Итого: " + fmtInt(s.pos) + " поз.</td><td></td>" +
+      '<td class="num">' + fmtInt(s.qty) + "</td><td></td>" +
+      '<td class="num">' + fmtMoney(s.cost) + "</td></tr></tfoot>" +
+      "</table></div></div>";
+
+    var btn = document.getElementById("btn-print");
+    if (btn) btn.addEventListener("click", function () { window.print(); });
+    detail.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }
+});
+</script>
+{% endblock %}

@@ -1,0 +1,330 @@
+{% extends "base.html" %}
+{% block content %}
+
+<p class="page-sub" id="horizon-note">Рекомендации: сколько заказать на производство, чтобы хватило на горизонт планирования с учётом темпа продаж, остатков и уже заказанного.</p>
+
+<div class="summary-bar" id="summary-bar" style="display:none;">
+  <div class="s-item"><div class="s-val" id="s-pos">0</div><div class="s-label">позиций к заказу</div></div>
+  <div class="s-item"><div class="s-val" id="s-qty">0</div><div class="s-label">штук</div></div>
+  <div class="s-item"><div class="s-val" id="s-cost">0 ₽</div><div class="s-label">себестоимость</div></div>
+  <div class="s-item"><div class="s-val" id="s-rev">0 ₽</div><div class="s-label">ожидаемая выручка</div></div>
+  <div class="spacer"></div>
+  <button class="btn primary" id="btn-create-order" type="button">
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+    Создать заказ на производство
+  </button>
+</div>
+
+<div class="card">
+  <div class="toolbar">
+    <div class="search-box">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.5" y2="16.5"/></svg>
+      <input class="input" type="search" id="search" placeholder="Поиск по названию…" autocomplete="off">
+    </div>
+    <div class="chips" id="cat-chips"></div>
+  </div>
+  <div class="tbl-wrap">
+    <table class="tbl" id="tbl">
+      <thead id="thead">
+        <tr>
+          <th style="width:30px;"><input type="checkbox" id="check-all" checked title="Выбрать все"></th>
+          <th style="width:30px;"></th>
+          <th data-sort="base_name" data-sort-dir="asc">Позиция</th>
+          <th data-sort="cls" style="width:60px;">Класс</th>
+          <th class="num" data-sort="turnover">Оборач., ₽/день</th>
+          <th class="num" data-sort="rate">Темп, шт/день</th>
+          <th class="num" data-sort="cs">Остаток</th>
+          <th class="num" data-sort="ordered">Едет</th>
+          <th class="num" data-sort="wos">Покрытие, нед</th>
+          <th data-sort="stockout_date" data-sort-dir="asc">Стокаут</th>
+          <th class="num" data-sort="_need">Заказать, шт</th>
+        </tr>
+      </thead>
+      <tbody id="tbody">
+        <tr><td colspan="11"><div class="loading-stub">Загрузка…</div></td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div class="card" id="excluded-card" style="display:none;">
+  <div class="card-head">
+    <h2 id="excluded-title">Не требуют заказа</h2>
+    <div class="spacer"></div>
+    <button class="btn sm" type="button" id="btn-toggle-excluded">Показать</button>
+  </div>
+  <div class="card-body flush" id="excluded-box" style="display:none;"></div>
+</div>
+
+<!-- Модалка создания заказа -->
+<div class="modal-back" id="order-modal">
+  <div class="modal">
+    <div class="modal-head">Новый заказ на производство</div>
+    <div class="modal-body">
+      <div class="field">
+        <label for="order-name">Название заказа</label>
+        <input class="input" type="text" id="order-name" autocomplete="off">
+      </div>
+      <div class="field">
+        <label for="order-eta">Ожидаемая дата готовности (ETA)</label>
+        <input class="input" type="date" id="order-eta">
+      </div>
+      <p style="font-size:12px; color:var(--text-soft); margin:0;" id="order-modal-summary"></p>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" type="button" id="btn-order-cancel">Отмена</button>
+      <button class="btn primary" type="button" id="btn-order-submit">Создать заказ</button>
+    </div>
+  </div>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+  var items = [];
+  var state = { sortKey: "turnover", sortDir: -1, query: "", cat: "" };
+  var openRows = {};   // base_name -> true
+  var tbody = document.getElementById("tbody");
+
+  api("/api/replenish").then(function (d) {
+    document.getElementById("horizon-note").innerHTML =
+      "Рекомендации: сколько заказать, чтобы хватило на <b>" + fmtInt(d.horizon_days || 90) +
+      " дней</b> с учётом темпа продаж за год, текущих остатков и уже заказанного на производстве.";
+
+    items = (d.items || []).map(function (it) {
+      it._checked = true;
+      it._recs = {};
+      Object.keys(it.sizes || {}).forEach(function (sz) {
+        it._recs[sz] = (it.sizes[sz] && it.sizes[sz].rec) || 0;
+      });
+      recalcNeed(it);
+      return it;
+    });
+    renderChips();
+    renderTable();
+    renderExcluded(d.excluded || []);
+    updateSummary();
+    document.getElementById("summary-bar").style.display = items.length ? "" : "none";
+  }).catch(function () {
+    tbody.innerHTML = '<tr><td colspan="11">' +
+      emptyState("Не удалось загрузить данные", "Обновите страницу или попробуйте позже.",
+        '<button class="btn" onclick="location.reload()">Обновить</button>') + "</td></tr>";
+  });
+
+  function recalcNeed(it) {
+    var hasSizes = Object.keys(it._recs).length > 0;
+    it._need = hasSizes
+      ? Object.keys(it._recs).reduce(function (s, k) { return s + (Number(it._recs[k]) || 0); }, 0)
+      : (it.need || 0);
+  }
+
+  function visibleItems() {
+    var arr = items.filter(function (it) {
+      if (state.cat && it.category !== state.cat) return false;
+      return wordMatch(it.base_name, state.query);
+    });
+    return sortItems(arr, state.sortKey, state.sortDir);
+  }
+
+  function renderChips() {
+    var counts = {};
+    items.forEach(function (it) { counts[it.category] = (counts[it.category] || 0) + 1; });
+    var cats = Object.keys(counts).sort(function (a, b) { return a.localeCompare(b, "ru"); });
+    var box = document.getElementById("cat-chips");
+    if (cats.length < 2) { box.innerHTML = ""; return; }
+    box.innerHTML = '<button class="chip active" data-cat="">Все<span class="cnt">' + items.length + "</span></button>" +
+      cats.map(function (c) {
+        return '<button class="chip" data-cat="' + esc(c) + '">' + esc(c) + '<span class="cnt">' + counts[c] + "</span></button>";
+      }).join("");
+    box.querySelectorAll(".chip").forEach(function (chip) {
+      chip.addEventListener("click", function () {
+        state.cat = chip.getAttribute("data-cat");
+        box.querySelectorAll(".chip").forEach(function (x) { x.classList.remove("active"); });
+        chip.classList.add("active");
+        renderTable();
+      });
+    });
+  }
+
+  function sizeRows(it) {
+    var keys = sortSizeKeys(Object.keys(it.sizes || {}));
+    if (!keys.length) return "<p class='muted' style='margin:4px 0;'>Безразмерная позиция — количество правится в общей колонке.</p>";
+    return '<table><thead><tr><th>Размер</th><th class="num">Остаток</th><th class="num">Продано за год</th><th class="num" style="width:110px;">Заказать, шт</th></tr></thead><tbody>' +
+      keys.map(function (sz) {
+        var s = it.sizes[sz] || {};
+        return "<tr><td><b>" + esc(sz) + "</b></td>" +
+          '<td class="num' + ((s.stock || 0) === 0 ? " txt-red" : "") + '">' + fmtInt(s.stock || 0) + "</td>" +
+          '<td class="num">' + fmtInt(s.sold365 || 0) + "</td>" +
+          '<td class="num"><input class="input sm num size-rec" type="number" min="0" step="1" style="width:90px;" ' +
+          'data-base="' + esc(it.base_name) + '" data-size="' + esc(sz) + '" value="' + (Number(it._recs[sz]) || 0) + '"></td></tr>';
+      }).join("") + "</tbody></table>";
+  }
+
+  function renderTable() {
+    var arr = visibleItems();
+    if (!arr.length) {
+      tbody.innerHTML = '<tr><td colspan="11">' + (items.length
+        ? emptyState("Ничего не найдено", "Попробуйте изменить запрос или сбросить фильтр категории.", "")
+        : emptyState("Заказывать пока нечего", "По текущему темпу продаж всех позиций хватает на весь горизонт планирования.",
+            '<a class="btn" href="/turnover">Открыть оборачиваемость</a>')) + "</td></tr>";
+      return;
+    }
+    tbody.innerHTML = arr.map(function (it) {
+      var wosTxt = it.wos === null || it.wos === undefined ? "—" : fmtNum(it.wos, 1);
+      var soonOut = it.wos !== null && it.wos !== undefined && it.wos < 4;
+      var open = !!openRows[it.base_name];
+      return "<tr data-base='" + esc(it.base_name) + "'>" +
+        '<td><input type="checkbox" class="row-check" data-base="' + esc(it.base_name) + '"' + (it._checked ? " checked" : "") + "></td>" +
+        '<td><button class="expander' + (open ? " open" : "") + '" data-base="' + esc(it.base_name) + '" title="Размерная сетка">' + SVG_CHEVRON + "</button></td>" +
+        '<td class="name-cell"><div class="name-main">' + esc(it.base_name) + '</div><div class="name-sub">' + esc(it.category || "") + "</div></td>" +
+        "<td>" + clsDot(it.cls) + "</td>" +
+        '<td class="num">' + fmtInt(it.turnover) + "</td>" +
+        '<td class="num muted">' + fmtNum(it.rate, 2) + "</td>" +
+        '<td class="num' + ((it.cs || 0) === 0 ? " txt-red" : "") + '">' + fmtInt(it.cs) + "</td>" +
+        '<td class="num' + ((it.ordered || 0) > 0 ? "" : " muted") + '">' + fmtInt(it.ordered || 0) + "</td>" +
+        '<td class="num' + (soonOut ? " txt-red" : "") + '">' + wosTxt + "</td>" +
+        "<td" + (soonOut ? ' class="txt-red"' : "") + ">" + fmtDate(it.stockout_date) + "</td>" +
+        '<td class="num"><b style="font-size:14px;">' + fmtInt(it._need) + "</b></td>" +
+        "</tr>" +
+        (open ? "<tr class='expand-row'><td colspan='11' style='padding:0;'><div class='sub-panel'>" + sizeRows(it) + "</div></td></tr>" : "");
+    }).join("");
+
+    tbody.querySelectorAll(".expander").forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        var b = btn.getAttribute("data-base");
+        openRows[b] = !openRows[b];
+        renderTable();
+      });
+    });
+    tbody.querySelectorAll(".row-check").forEach(function (cb) {
+      cb.addEventListener("change", function () {
+        var it = findItem(cb.getAttribute("data-base"));
+        if (it) it._checked = cb.checked;
+        updateSummary();
+        syncCheckAll();
+      });
+    });
+    tbody.querySelectorAll(".size-rec").forEach(function (inp) {
+      inp.addEventListener("input", function () {
+        var it = findItem(inp.getAttribute("data-base"));
+        if (!it) return;
+        it._recs[inp.getAttribute("data-size")] = Math.max(0, Number(inp.value) || 0);
+        recalcNeed(it);
+        var row = tbody.querySelector("tr[data-base='" + CSS.escape(it.base_name) + "'] td:last-child b");
+        if (row) row.textContent = fmtInt(it._need);
+        updateSummary();
+      });
+    });
+    syncCheckAll();
+  }
+
+  function findItem(base) {
+    return items.find(function (x) { return x.base_name === base; });
+  }
+
+  function checkedItems() {
+    return items.filter(function (it) { return it._checked && it._need > 0; });
+  }
+
+  function updateSummary() {
+    var sel = checkedItems();
+    var qty = 0, cost = 0, rev = 0;
+    sel.forEach(function (it) {
+      qty += it._need;
+      cost += it._need * (it.cost_price || 0);
+      rev += it._need * (it.avg_price || 0);
+    });
+    document.getElementById("s-pos").textContent = fmtInt(sel.length);
+    document.getElementById("s-qty").textContent = fmtInt(qty);
+    document.getElementById("s-cost").textContent = "~" + fmtMoney(cost);
+    document.getElementById("s-rev").textContent = fmtMoney(rev);
+    document.getElementById("btn-create-order").disabled = sel.length === 0;
+  }
+
+  function syncCheckAll() {
+    var all = document.getElementById("check-all");
+    var vis = visibleItems();
+    all.checked = vis.length > 0 && vis.every(function (it) { return it._checked; });
+  }
+
+  document.getElementById("check-all").addEventListener("change", function () {
+    var on = this.checked;
+    visibleItems().forEach(function (it) { it._checked = on; });
+    renderTable();
+    updateSummary();
+  });
+
+  function renderExcluded(excluded) {
+    if (!excluded.length) return;
+    var card = document.getElementById("excluded-card");
+    card.style.display = "";
+    document.getElementById("excluded-title").textContent = "Не требуют заказа (" + excluded.length + ")";
+    document.getElementById("excluded-box").innerHTML =
+      '<table class="tbl"><thead><tr><th>Позиция</th><th>Причина</th></tr></thead><tbody>' +
+      excluded.map(function (e) {
+        return "<tr><td class='name-cell'>" + esc(e.base_name) + "</td><td class='muted'>" + esc(e.reason) + "</td></tr>";
+      }).join("") + "</tbody></table>";
+    document.getElementById("btn-toggle-excluded").addEventListener("click", function () {
+      var box = document.getElementById("excluded-box");
+      var show = box.style.display === "none";
+      box.style.display = show ? "" : "none";
+      this.textContent = show ? "Скрыть" : "Показать";
+    });
+  }
+
+  // Поиск и сортировка
+  document.getElementById("search").addEventListener("input", debounce(function (e) {
+    state.query = e.target.value.trim();
+    renderTable();
+  }, 150));
+  initSortHeaders(document.getElementById("thead"), state, renderTable);
+
+  // --- Создание заказа ---
+  var modal = document.getElementById("order-modal");
+
+  document.getElementById("btn-create-order").addEventListener("click", function () {
+    var sel = checkedItems();
+    if (!sel.length) { toast("Отметьте хотя бы одну позицию", "error"); return; }
+    var today = new Date();
+    document.getElementById("order-name").value = "Заказ от " + today.getDate() + " " + MONTHS_SHORT[today.getMonth()];
+    var eta = new Date(today.getTime() + 45 * 86400000);
+    document.getElementById("order-eta").value = eta.toISOString().slice(0, 10);
+    var qty = sel.reduce(function (s, it) { return s + it._need; }, 0);
+    var cost = sel.reduce(function (s, it) { return s + it._need * (it.cost_price || 0); }, 0);
+    document.getElementById("order-modal-summary").textContent =
+      "В заказ войдут " + fmtInt(sel.length) + " позиций, " + fmtInt(qty) + " шт, себестоимость ~" + fmtMoney(cost) + ".";
+    modal.classList.add("open");
+  });
+
+  document.getElementById("btn-order-cancel").addEventListener("click", function () {
+    modal.classList.remove("open");
+  });
+  modal.addEventListener("click", function (e) { if (e.target === modal) modal.classList.remove("open"); });
+
+  document.getElementById("btn-order-submit").addEventListener("click", function () {
+    var btn = this;
+    var name = document.getElementById("order-name").value.trim() || "Заказ на производство";
+    var eta = document.getElementById("order-eta").value || null;
+    var payload = {
+      name: name,
+      eta_date: eta,
+      items: checkedItems().map(function (it) {
+        var sizes = {};
+        Object.keys(it._recs).forEach(function (sz) {
+          var q = Number(it._recs[sz]) || 0;
+          if (q > 0) sizes[sz] = q;
+        });
+        return { base_name: it.base_name, qty: it._need, sizes: sizes, cost: it.cost_price || 0 };
+      })
+    };
+    btn.disabled = true;
+    api("/api/orders", { method: "POST", body: payload }).then(function () {
+      toast("Заказ «" + name + "» создан", "success");
+      setTimeout(function () { window.location.href = "/orders"; }, 400);
+    }).catch(function () { btn.disabled = false; });
+  });
+});
+</script>
+{% endblock %}

@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block content %}
+{% if error %}<p style="color:red">{{ error }}</p>{% endif %}
+<form method="post" action="/register">
+  <input name="name" placeholder="Имя">
+  <input name="org_name" placeholder="Название компании">
+  <input name="email" type="email" placeholder="E-mail" required>
+  <input name="password" type="password" placeholder="Пароль" required>
+  <button>Создать аккаунт</button>
+</form>
+<a href="/login">Вход</a>
+{% endblock %}

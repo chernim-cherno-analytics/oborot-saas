@@ -1,0 +1,147 @@
+{% extends "base.html" %}
+{% block content %}
+
+<div class="metric-grid" id="metrics">
+  <div class="metric">
+    <div class="m-label">Деньги в стоке (розница)</div>
+    <div class="m-value" id="m-retail">—</div>
+    <div class="m-sub" id="m-cost">по себестоимости —</div>
+  </div>
+  <div class="metric">
+    <div class="m-label">Штук на складе</div>
+    <div class="m-value" id="m-units">—</div>
+    <div class="m-sub" id="m-positions">— позиций в ассортименте</div>
+  </div>
+  <div class="metric">
+    <div class="m-label">Продано за 30 дней</div>
+    <div class="m-value" id="m-sold-rev">—</div>
+    <div class="m-sub" id="m-sold-qty">— шт</div>
+  </div>
+  <div class="metric">
+    <div class="m-label">Оборачиваемость</div>
+    <div class="m-value" id="m-turnover">—</div>
+    <div class="m-sub">₽/день суммарно за 365 дней</div>
+  </div>
+</div>
+
+<div class="grid-2">
+  <div class="card">
+    <div class="card-head">
+      <h2>Требуют внимания</h2>
+      <div class="spacer"></div>
+      <span class="badge gray" id="alerts-count" style="display:none;"></span>
+    </div>
+    <div id="alerts-box">
+      <div class="loading-stub">Загрузка…</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-head">
+      <h2>Топ-5 по оборачиваемости</h2>
+      <div class="spacer"></div>
+      <a href="/turnover" style="font-size:12px;">Вся таблица →</a>
+    </div>
+    <div class="card-body flush" id="top-box">
+      <div class="loading-stub">Загрузка…</div>
+    </div>
+  </div>
+</div>
+
+<div class="grid-2" style="margin-top:16px;">
+  <div class="card">
+    <div class="card-head"><h2>Классы оборачиваемости</h2></div>
+    <div class="card-body">
+      <div style="display:grid; grid-template-columns:repeat(4,1fr); gap:10px;" id="classes-box">
+        <div class="cls-tile weak"><div class="ct-num" id="cls-weak">—</div><div class="ct-label">Слабые</div><div class="ct-sub">до 1&nbsp;тыс&nbsp;₽/день</div></div>
+        <div class="cls-tile dull"><div class="ct-num" id="cls-dull">—</div><div class="ct-label">Унылые</div><div class="ct-sub">1–2&nbsp;тыс&nbsp;₽/день</div></div>
+        <div class="cls-tile good"><div class="ct-num" id="cls-good">—</div><div class="ct-label">Хорошие</div><div class="ct-sub">2–5&nbsp;тыс&nbsp;₽/день</div></div>
+        <div class="cls-tile best"><div class="ct-num" id="cls-best">—</div><div class="ct-label">Бестселлеры</div><div class="ct-sub">от 5&nbsp;тыс&nbsp;₽/день</div></div>
+      </div>
+      <p style="margin:12px 0 0; font-size:12px; color:var(--text-faint);">
+        Число позиций в каждом классе. Пороги настраиваются в <a href="/settings">настройках</a>.
+      </p>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-head"><h2>Категории: доля стока</h2></div>
+    <div style="padding:8px 0;" id="cats-box">
+      <div class="loading-stub">Загрузка…</div>
+    </div>
+  </div>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+  api("/api/summary").then(render).catch(function () {
+    document.getElementById("alerts-box").innerHTML =
+      emptyState("Не удалось загрузить данные", "Обновите страницу или попробуйте позже.",
+        '<button class="btn" onclick="location.reload()">Обновить</button>');
+    document.getElementById("top-box").innerHTML = "";
+    document.getElementById("cats-box").innerHTML = "";
+  });
+
+  function render(d) {
+    document.getElementById("m-retail").textContent = fmtMoney(d.stock_value_retail);
+    document.getElementById("m-cost").textContent = "по себестоимости " + fmtMoney(d.stock_value_cost);
+    document.getElementById("m-units").textContent = fmtInt(d.stock_units);
+    document.getElementById("m-positions").textContent = fmtInt(d.positions) + " позиций в ассортименте";
+    document.getElementById("m-sold-rev").textContent = fmtMoney(d.sold_30d_rev);
+    document.getElementById("m-sold-qty").textContent = fmtInt(d.sold_30d_qty) + " шт";
+    document.getElementById("m-turnover").textContent = fmtInt(d.turnover_total);
+
+    // Алерты
+    var alerts = d.alerts || [];
+    var box = document.getElementById("alerts-box");
+    if (!alerts.length) {
+      box.innerHTML = emptyState("Всё спокойно", "Стокаутов и неликвида не видно. Загляните в «Что заказать», чтобы спланировать производство.",
+        '<a class="btn" href="/replenish">Что заказать</a>',
+        '<svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><polyline points="8.5 12.5 11 15 15.5 9.5"/></svg>');
+    } else {
+      var cnt = document.getElementById("alerts-count");
+      cnt.style.display = "";
+      cnt.textContent = alerts.length;
+      box.innerHTML = alerts.map(function (a) {
+        return '<div class="alert-item ' + (a.severity === "red" ? "red" : "yellow") + '">' +
+          '<div><div class="a-name">' + esc(a.base_name) + "</div>" +
+          '<div class="a-text">' + esc(a.text) + "</div></div></div>";
+      }).join("");
+    }
+
+    // Топ-5
+    var top = d.top || [];
+    document.getElementById("top-box").innerHTML = top.length
+      ? '<table class="tbl"><thead><tr><th>Позиция</th><th class="num">Оборачиваемость, ₽/день</th></tr></thead><tbody>' +
+        top.map(function (t) {
+          return "<tr><td class='name-cell'><span class='name-main'>" + esc(t.base_name) + "</span></td>" +
+            "<td class='num'><b>" + fmtInt(t.turnover) + "</b></td></tr>";
+        }).join("") + "</tbody></table>"
+      : emptyState("Пока нет продаж", "Как только появятся продажи, здесь будут лидеры по выручке в день.", "");
+
+    // Классы
+    var c = d.classes || {};
+    document.getElementById("cls-weak").textContent = fmtInt(c.weak || 0);
+    document.getElementById("cls-dull").textContent = fmtInt(c.dull || 0);
+    document.getElementById("cls-good").textContent = fmtInt(c.good || 0);
+    document.getElementById("cls-best").textContent = fmtInt(c.best || 0);
+
+    // Категории
+    var cats = d.categories || [];
+    document.getElementById("cats-box").innerHTML = cats.length
+      ? cats.map(function (cat) {
+          var pct = Math.round((cat.share || 0) * 100);
+          return '<div class="cat-row">' +
+            '<div class="c-name" title="' + esc(cat.name) + '">' + esc(cat.name) + "</div>" +
+            '<div class="c-bar"><i style="width:' + Math.max(pct, 1) + '%"></i></div>' +
+            '<div class="c-val">' + fmtInt(cat.stock_units) + " шт · " + fmtMoney(cat.stock_value) + " · " + pct + "%</div>" +
+            "</div>";
+        }).join("")
+      : '<div class="loading-stub">Нет данных по категориям</div>';
+  }
+});
+</script>
+{% endblock %}

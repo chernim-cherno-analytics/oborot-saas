@@ -1,0 +1,147 @@
+"""Аутентификация: bcrypt-пароли, подписанные cookie-сессии, FastAPI-зависимости.
+
+Кука: HttpOnly, SameSite=Lax, подписана itsdangerous (URLSafeTimedSerializer).
+Внутри — {user_id, org_id}; org_id определяет тенант для всех запросов.
+"""
+import time
+from collections import defaultdict, deque
+from dataclasses import dataclass
+
+import bcrypt
+from fastapi import Depends, HTTPException, Request
+from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
+from sqlalchemy.orm import Session
+
+from app.crypto import get_signing_secret, is_prod
+from app.db import get_db
+from app.models import Membership, Org, User
+
+SESSION_COOKIE = "oborot_session"
+SESSION_MAX_AGE = 7 * 24 * 3600  # 7 дней
+
+
+# ── Rate-limit логина (защита от перебора паролей) ────────────────────────────
+
+class LoginLimiter:
+    """Скользящее окно попыток входа по ключу (ip и ip+email).
+
+    In-memory: при нескольких воркерах лимит действует per-process — для прода
+    с >1 воркером вынести в Redis (см. SECURITY-бэклог).
+    """
+
+    def __init__(self, max_attempts: int = 10, window_sec: int = 300):
+        self.max_attempts = max_attempts
+        self.window_sec = window_sec
+        self._hits: dict[str, deque] = defaultdict(deque)
+
+    def check(self, key: str) -> bool:
+        """True — можно пробовать; False — лимит исчерпан."""
+        now = time.monotonic()
+        q = self._hits[key]
+        while q and now - q[0] > self.window_sec:
+            q.popleft()
+        return len(q) < self.max_attempts
+
+    def hit(self, key: str) -> None:
+        self._hits[key].append(time.monotonic())
+
+    def reset(self, key: str) -> None:
+        self._hits.pop(key, None)
+
+
+login_limiter = LoginLimiter()
+
+
+# ── Пароли ────────────────────────────────────────────────────────────────────
+
+def hash_password(password: str) -> str:
+    """bcrypt-хеш пароля (соль внутри хеша)."""
+    return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+
+
+def verify_password(password: str, pw_hash: str) -> bool:
+    """Проверка пароля против bcrypt-хеша."""
+    try:
+        return bcrypt.checkpw(password.encode(), pw_hash.encode())
+    except ValueError:
+        return False
+
+
+# ── Сессии ────────────────────────────────────────────────────────────────────
+
+def _serializer() -> URLSafeTimedSerializer:
+    return URLSafeTimedSerializer(get_signing_secret(), salt="oborot-session")
+
+
+def set_session(response, user_id: int, org_id: int) -> None:
+    """Ставит подписанную сессионную куку на ответ."""
+    value = _serializer().dumps({"user_id": user_id, "org_id": org_id})
+    response.set_cookie(
+        SESSION_COOKIE,
+        value,
+        max_age=SESSION_MAX_AGE,
+        httponly=True,
+        samesite="lax",
+        secure=is_prod(),  # на проде кука только по https
+        path="/",
+    )
+
+
+def clear_session(response) -> None:
+    """Снимает сессионную куку."""
+    response.delete_cookie(SESSION_COOKIE, path="/")
+
+
+def read_session(request: Request) -> dict | None:
+    """Читает и валидирует сессию из куки; None, если её нет или подпись битая."""
+    raw = request.cookies.get(SESSION_COOKIE)
+    if not raw:
+        return None
+    try:
+        return _serializer().loads(raw, max_age=SESSION_MAX_AGE)
+    except (BadSignature, SignatureExpired):
+        return None
+
+
+# ── Зависимости ───────────────────────────────────────────────────────────────
+
+@dataclass
+class AuthContext:
+    """Аутентифицированный пользователь, его организация и роль в ней."""
+
+    user: User
+    org: Org
+    role: str = "member"
+
+
+def resolve_auth(request: Request, db: Session) -> AuthContext | None:
+    """Восстанавливает пользователя и организацию из сессии (с проверкой членства)."""
+    sess = read_session(request)
+    if not sess:
+        return None
+    user = db.get(User, sess.get("user_id"))
+    if not user:
+        return None
+    org_id = sess.get("org_id")
+    member = db.get(Membership, (user.id, org_id)) if org_id else None
+    if not member:
+        return None
+    org = db.get(Org, org_id)
+    if not org:
+        return None
+    return AuthContext(user=user, org=org, role=member.role or "member")
+
+
+def require_auth_api(request: Request, db: Session = Depends(get_db)) -> AuthContext:
+    """Зависимость для JSON API: 401 без валидной сессии."""
+    ctx = resolve_auth(request, db)
+    if ctx is None:
+        raise HTTPException(status_code=401, detail="Не авторизован")
+    return ctx
+
+
+def require_owner_api(ctx: AuthContext = Depends(require_auth_api)) -> AuthContext:
+    """Зависимость для чувствительных ручек (настройки, подключения): только owner."""
+    if ctx.role != "owner":
+        raise HTTPException(status_code=403, detail="Доступно только владельцу организации")
+    return ctx

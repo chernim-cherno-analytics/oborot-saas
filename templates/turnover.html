@@ -1,0 +1,173 @@
+{% extends "base.html" %}
+{% block content %}
+
+<p class="page-sub">Метрики за скользящие 365 дней. Оборачиваемость — нетто-выручка в расчёте на день, когда товар был в наличии.</p>
+
+<div class="metric-grid" style="grid-template-columns:repeat(4, 1fr);" id="cls-strip">
+  <div class="metric"><div class="m-label"><span class="dot weak"></span>&nbsp; Слабые</div><div class="m-value" id="cnt-weak">—</div><div class="m-sub">&lt; 1 000 ₽/день</div></div>
+  <div class="metric"><div class="m-label"><span class="dot dull"></span>&nbsp; Унылые</div><div class="m-value" id="cnt-dull">—</div><div class="m-sub">1 000 – 2 000 ₽/день</div></div>
+  <div class="metric"><div class="m-label"><span class="dot good"></span>&nbsp; Хорошие</div><div class="m-value" id="cnt-good">—</div><div class="m-sub">2 000 – 5 000 ₽/день</div></div>
+  <div class="metric"><div class="m-label"><span class="dot best"></span>&nbsp; Бестселлеры</div><div class="m-value" id="cnt-best">—</div><div class="m-sub">≥ 5 000 ₽/день</div></div>
+</div>
+
+<div class="card">
+  <div class="toolbar">
+    <div class="search-box">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.5" y2="16.5"/></svg>
+      <input class="input" type="search" id="search" placeholder="Поиск по названию…" autocomplete="off">
+    </div>
+    <div class="chips" id="cat-chips"></div>
+    <div class="spacer" style="flex:1;"></div>
+    <label class="toggle-line" id="arch-wrap" style="display:none;">
+      <input type="checkbox" id="show-archived"> показать архивные
+    </label>
+  </div>
+  <div class="tbl-wrap">
+    <table class="tbl">
+      <thead id="thead">
+        <tr>
+          <th data-sort="base_name" data-sort-dir="asc">Позиция</th>
+          <th data-sort="cls" style="width:60px;">Класс</th>
+          <th class="num" data-sort="dis" title="Дней в стоке за 365 дней (остаток ≥ порога)">Дней в стоке</th>
+          <th class="num" data-sort="nq" title="Нетто продано, шт (минус возвраты)">Продано, шт</th>
+          <th class="num" data-sort="nr" title="Нетто-выручка за 365 дней">Выручка, ₽</th>
+          <th class="num" data-sort="turnover">Оборач., ₽/день</th>
+          <th class="num" data-sort="avg_price" title="Средняя фактическая цена против номинала">Ср. цена / номинал</th>
+          <th class="num" data-sort="discount_fact" title="Фактическая скидка">Скидка</th>
+          <th class="num" data-sort="cs">Остаток</th>
+          <th class="num" data-sort="wos" title="Недель покрытия текущим остатком">Покрытие, нед</th>
+        </tr>
+      </thead>
+      <tbody id="tbody">
+        <tr><td colspan="10"><div class="loading-stub">Загрузка…</div></td></tr>
+      </tbody>
+      <tfoot id="tfoot" style="display:none;">
+        <tr>
+          <td id="f-count"></td><td></td><td></td>
+          <td class="num" id="f-nq"></td>
+          <td class="num" id="f-nr"></td>
+          <td class="num" id="f-turnover"></td>
+          <td></td><td></td>
+          <td class="num" id="f-cs"></td>
+          <td></td>
+        </tr>
+      </tfoot>
+    </table>
+  </div>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+  var items = [];
+  var state = { sortKey: "turnover", sortDir: -1, query: "", cat: "", archived: false };
+  var tbody = document.getElementById("tbody");
+
+  api("/api/turnover").then(function (d) {
+    items = d.items || [];
+    renderClsStrip();
+    renderChips();
+    if (items.some(function (it) { return it.archived; })) {
+      document.getElementById("arch-wrap").style.display = "";
+    }
+    renderTable();
+  }).catch(function () {
+    tbody.innerHTML = '<tr><td colspan="10">' +
+      emptyState("Не удалось загрузить данные", "Обновите страницу или попробуйте позже.",
+        '<button class="btn" onclick="location.reload()">Обновить</button>') + "</td></tr>";
+  });
+
+  function renderClsStrip() {
+    var cnt = { weak: 0, dull: 0, good: 0, best: 0 };
+    items.forEach(function (it) { if (!it.archived && cnt[it.cls] !== undefined) cnt[it.cls]++; });
+    ["weak", "dull", "good", "best"].forEach(function (c) {
+      document.getElementById("cnt-" + c).textContent = fmtInt(cnt[c]);
+    });
+  }
+
+  function renderChips() {
+    var counts = {};
+    items.forEach(function (it) { if (!it.archived) counts[it.category] = (counts[it.category] || 0) + 1; });
+    var cats = Object.keys(counts).sort(function (a, b) { return a.localeCompare(b, "ru"); });
+    var box = document.getElementById("cat-chips");
+    if (cats.length < 2) return;
+    var total = items.filter(function (it) { return !it.archived; }).length;
+    box.innerHTML = '<button class="chip active" data-cat="">Все<span class="cnt">' + total + "</span></button>" +
+      cats.map(function (c) {
+        return '<button class="chip" data-cat="' + esc(c) + '">' + esc(c) + '<span class="cnt">' + counts[c] + "</span></button>";
+      }).join("");
+    box.querySelectorAll(".chip").forEach(function (chip) {
+      chip.addEventListener("click", function () {
+        state.cat = chip.getAttribute("data-cat");
+        box.querySelectorAll(".chip").forEach(function (x) { x.classList.remove("active"); });
+        chip.classList.add("active");
+        renderTable();
+      });
+    });
+  }
+
+  function discountCell(df) {
+    if (df === null || df === undefined) return '<td class="num muted">—</td>';
+    var cls = df >= 0.3 ? "txt-red" : df >= 0.15 ? "txt-yellow" : df <= 0 ? "txt-green" : "";
+    return '<td class="num ' + cls + '">' + fmtPct(df) + "</td>";
+  }
+
+  function renderTable() {
+    var arr = items.filter(function (it) {
+      if (it.archived && !state.archived) return false;
+      if (state.cat && it.category !== state.cat) return false;
+      return wordMatch(it.base_name, state.query);
+    });
+    arr = sortItems(arr, state.sortKey, state.sortDir);
+
+    if (!arr.length) {
+      tbody.innerHTML = '<tr><td colspan="10">' + (items.length
+        ? emptyState("Ничего не найдено", "Попробуйте изменить запрос или сбросить фильтр категории.", "")
+        : emptyState("Данных пока нет", "Подключите источник данных, чтобы увидеть оборачиваемость ассортимента.",
+            '<a class="btn primary" href="/onboarding">Подключить данные</a>')) + "</td></tr>";
+      document.getElementById("tfoot").style.display = "none";
+      return;
+    }
+
+    tbody.innerHTML = arr.map(function (it) {
+      var wosTxt = it.wos === null || it.wos === undefined ? "—" : fmtNum(it.wos, 1);
+      return "<tr>" +
+        '<td class="name-cell"><div class="name-main">' + esc(it.base_name) +
+          (it.archived ? ' <span class="badge gray">архив</span>' : "") +
+          '</div><div class="name-sub">' + esc(it.category || "") + "</div></td>" +
+        "<td>" + clsDot(it.cls) + "</td>" +
+        '<td class="num muted">' + fmtInt(it.dis) + "</td>" +
+        '<td class="num">' + fmtInt(it.nq) + "</td>" +
+        '<td class="num">' + fmtInt(it.nr) + "</td>" +
+        '<td class="num"><b>' + fmtInt(it.turnover) + "</b></td>" +
+        '<td class="num">' + fmtInt(it.avg_price) + ' <span class="muted">/ ' + fmtInt(it.sale_price) + "</span></td>" +
+        discountCell(it.discount_fact) +
+        '<td class="num' + ((it.cs || 0) === 0 && it.nq > 0 ? " txt-red" : "") + '">' + fmtInt(it.cs) + "</td>" +
+        '<td class="num">' + wosTxt + "</td>" +
+        "</tr>";
+    }).join("");
+
+    var nq = 0, nr = 0, cs = 0, turn = 0;
+    arr.forEach(function (it) { nq += it.nq || 0; nr += it.nr || 0; cs += it.cs || 0; turn += it.turnover || 0; });
+    document.getElementById("tfoot").style.display = "";
+    document.getElementById("f-count").textContent = "Итого: " + fmtInt(arr.length) + " поз.";
+    document.getElementById("f-nq").textContent = fmtInt(nq);
+    document.getElementById("f-nr").textContent = fmtInt(nr);
+    document.getElementById("f-turnover").textContent = fmtInt(turn);
+    document.getElementById("f-cs").textContent = fmtInt(cs);
+  }
+
+  document.getElementById("search").addEventListener("input", debounce(function (e) {
+    state.query = e.target.value.trim();
+    renderTable();
+  }, 150));
+  document.getElementById("show-archived").addEventListener("change", function () {
+    state.archived = this.checked;
+    renderTable();
+  });
+  initSortHeaders(document.getElementById("thead"), state, renderTable);
+});
+</script>
+{% endblock %}

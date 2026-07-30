@@ -1,0 +1,185 @@
+{% extends "base.html" %}
+{% block content %}
+
+<p class="page-sub">Текущие остатки по активным складам. Раскройте строку, чтобы увидеть разбивку по размерам.</p>
+
+<div class="card">
+  <div class="toolbar">
+    <div class="search-box">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.5" y2="16.5"/></svg>
+      <input class="input" type="search" id="search" placeholder="Поиск по названию…" autocomplete="off">
+    </div>
+    <div class="chips" id="cat-chips"></div>
+    <div class="spacer" style="flex:1;"></div>
+    <label class="toggle-line">
+      <input type="checkbox" id="only-gaps"> только с пробелами по складам
+    </label>
+  </div>
+  <div class="tbl-wrap">
+    <table class="tbl">
+      <thead id="thead"></thead>
+      <tbody id="tbody">
+        <tr><td colspan="9"><div class="loading-stub">Загрузка…</div></td></tr>
+      </tbody>
+      <tfoot id="tfoot" style="display:none;"></tfoot>
+    </table>
+  </div>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+  var warehouses = [];
+  var items = [];
+  var state = { sortKey: "total", sortDir: -1, query: "", cat: "", onlyGaps: false };
+  var openRows = {};
+  var tbody = document.getElementById("tbody");
+  var thead = document.getElementById("thead");
+
+  api("/api/stocks").then(function (d) {
+    warehouses = d.warehouses || [];
+    items = d.items || [];
+    renderHead();
+    renderChips();
+    renderTable();
+  }).catch(function () {
+    tbody.innerHTML = '<tr><td colspan="9">' +
+      emptyState("Не удалось загрузить данные", "Обновите страницу или попробуйте позже.",
+        '<button class="btn" onclick="location.reload()">Обновить</button>') + "</td></tr>";
+  });
+
+  function colCount() { return warehouses.length + 3; }
+
+  function renderHead() {
+    thead.innerHTML = "<tr>" +
+      '<th style="width:30px;"></th>' +
+      '<th data-sort="base_name" data-sort-dir="asc">Позиция</th>' +
+      warehouses.map(function (w, i) {
+        return '<th class="num" data-sort="wh' + i + '">' + esc(w.name) + "</th>";
+      }).join("") +
+      '<th class="num" data-sort="total">Всего</th>' +
+      "</tr>";
+    initSortHeaders(thead, state, renderTable);
+  }
+
+  function hasGap(it) {
+    return (it.total || 0) > 0 && (it.per_wh || []).some(function (q) { return (q || 0) === 0; });
+  }
+
+  function sortKeyFn(it) {
+    var m = /^wh(\d+)$/.exec(state.sortKey);
+    if (m) return (it.per_wh || [])[Number(m[1])] || 0;
+    return it[state.sortKey];
+  }
+
+  function renderChips() {
+    var counts = {};
+    items.forEach(function (it) { counts[it.category] = (counts[it.category] || 0) + 1; });
+    var cats = Object.keys(counts).sort(function (a, b) { return a.localeCompare(b, "ru"); });
+    var box = document.getElementById("cat-chips");
+    if (cats.length < 2) return;
+    box.innerHTML = '<button class="chip active" data-cat="">Все<span class="cnt">' + items.length + "</span></button>" +
+      cats.map(function (c) {
+        return '<button class="chip" data-cat="' + esc(c) + '">' + esc(c) + '<span class="cnt">' + counts[c] + "</span></button>";
+      }).join("");
+    box.querySelectorAll(".chip").forEach(function (chip) {
+      chip.addEventListener("click", function () {
+        state.cat = chip.getAttribute("data-cat");
+        box.querySelectorAll(".chip").forEach(function (x) { x.classList.remove("active"); });
+        chip.classList.add("active");
+        renderTable();
+      });
+    });
+  }
+
+  function whCells(perWh, total) {
+    return warehouses.map(function (w, i) {
+      var q = (perWh || [])[i] || 0;
+      if (q === 0 && (total || 0) > 0) {
+        return '<td class="num"><span class="badge red" title="Нет на складе «' + esc(w.name) + '»">нет</span></td>';
+      }
+      return '<td class="num' + (q === 0 ? " muted" : "") + '">' + fmtInt(q) + "</td>";
+    }).join("");
+  }
+
+  function sizeRows(it) {
+    if (!(it.sizes || []).length) return "<p class='muted' style='margin:4px 0;'>Безразмерная позиция.</p>";
+    var sizes = it.sizes.slice().sort(function (a, b) { return sizeRank(a.size) - sizeRank(b.size); });
+    return "<table><thead><tr><th>Размер</th>" +
+      warehouses.map(function (w) { return '<th class="num">' + esc(w.name) + "</th>"; }).join("") +
+      '<th class="num">Всего</th></tr></thead><tbody>' +
+      sizes.map(function (s) {
+        return "<tr><td><b>" + esc(s.size) + "</b></td>" +
+          warehouses.map(function (w, i) {
+            var q = (s.per_wh || [])[i] || 0;
+            return '<td class="num' + (q === 0 ? " txt-red" : "") + '">' + fmtInt(q) + "</td>";
+          }).join("") +
+          '<td class="num"><b>' + fmtInt(s.total) + "</b></td></tr>";
+      }).join("") + "</tbody></table>";
+  }
+
+  function renderTable() {
+    var arr = items.filter(function (it) {
+      if (state.cat && it.category !== state.cat) return false;
+      if (state.onlyGaps && !hasGap(it)) return false;
+      return wordMatch(it.base_name, state.query);
+    });
+    arr = sortItems(arr, sortKeyFn, state.sortDir);
+
+    if (!arr.length) {
+      tbody.innerHTML = '<tr><td colspan="' + colCount() + '">' + (items.length
+        ? emptyState("Ничего не найдено", "Попробуйте изменить запрос или снять фильтры.", "")
+        : emptyState("Остатков пока нет", "Подключите источник данных, чтобы видеть остатки по складам.",
+            '<a class="btn primary" href="/onboarding">Подключить данные</a>')) + "</td></tr>";
+      document.getElementById("tfoot").style.display = "none";
+      return;
+    }
+
+    tbody.innerHTML = arr.map(function (it) {
+      var open = !!openRows[it.base_name];
+      var gapNote = hasGap(it)
+        ? '<div class="name-sub txt-red">нет: ' + esc(warehouses.filter(function (w, i) { return ((it.per_wh || [])[i] || 0) === 0; }).map(function (w) { return w.name; }).join(", ")) + "</div>"
+        : '<div class="name-sub">' + esc(it.category || "") + "</div>";
+      return "<tr data-base='" + esc(it.base_name) + "'>" +
+        '<td><button class="expander' + (open ? " open" : "") + '" data-base="' + esc(it.base_name) + '" title="По размерам">' + SVG_CHEVRON + "</button></td>" +
+        '<td class="name-cell"><div class="name-main">' + esc(it.base_name) + "</div>" + gapNote + "</td>" +
+        whCells(it.per_wh, it.total) +
+        '<td class="num"><b>' + fmtInt(it.total) + "</b></td>" +
+        "</tr>" +
+        (open ? "<tr class='expand-row'><td colspan='" + colCount() + "' style='padding:0;'><div class='sub-panel'>" + sizeRows(it) + "</div></td></tr>" : "");
+    }).join("");
+
+    tbody.querySelectorAll(".expander").forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        var b = btn.getAttribute("data-base");
+        openRows[b] = !openRows[b];
+        renderTable();
+      });
+    });
+
+    var totals = warehouses.map(function () { return 0; });
+    var grand = 0;
+    arr.forEach(function (it) {
+      (it.per_wh || []).forEach(function (q, i) { totals[i] += q || 0; });
+      grand += it.total || 0;
+    });
+    var tfoot = document.getElementById("tfoot");
+    tfoot.style.display = "";
+    tfoot.innerHTML = "<tr><td></td><td>Итого: " + fmtInt(arr.length) + " поз.</td>" +
+      totals.map(function (t) { return '<td class="num">' + fmtInt(t) + "</td>"; }).join("") +
+      '<td class="num">' + fmtInt(grand) + "</td></tr>";
+  }
+
+  document.getElementById("search").addEventListener("input", debounce(function (e) {
+    state.query = e.target.value.trim();
+    renderTable();
+  }, 150));
+  document.getElementById("only-gaps").addEventListener("change", function () {
+    state.onlyGaps = this.checked;
+    renderTable();
+  });
+});
+</script>
+{% endblock %}
