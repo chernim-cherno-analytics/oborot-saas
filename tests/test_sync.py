@@ -331,12 +331,57 @@ def run_scenario() -> int:
           hoodie is not None and {s["size"] for s in hoodie["sizes"]} >= {"S", "M", "L"},
           f"got={hoodie and [s['size'] for s in hoodie['sizes']]}")
 
+    print("== «Едет к нам» из заказов поставщику МС ==")
+    exp_inc = mock_ms.expected_incoming()
+    check("mock: seeded-заказы дают ожидания (Худи 14, Кольцо 5)",
+          exp_inc == {"Худи «Скетч»": 14.0, "Кольцо «Грань»": 5.0},
+          f"exp={exp_inc}")
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    ms_rows = {r["base_name"]: r["ms_qty"] for r in con.execute(
+        "SELECT base_name, ms_qty FROM ordered_qty WHERE ms_qty != 0")}
+    check("ordered_qty.ms_qty = эталон (частично принятый: qty−shipped)",
+          ms_rows == exp_inc, f"got={ms_rows}")
+    check("непроведённый, полностью принятый и старый доки не в «едет»",
+          all(b not in ms_rows for b in
+              ("Футболка «Манифест»", "Сумка «Тоут»", "Рубашка «Разворот»")))
+    con.close()
+    check("stats синка: incoming_qty=19 из 2 открытых доков",
+          stats.get("incoming_qty") == 19 and stats.get("incoming_open_docs") == 2,
+          f"got qty={stats.get('incoming_qty')} docs={stats.get('incoming_open_docs')}")
+
+    r = client.post("/api/ordered", json={"base_name": "Худи «Скетч»", "qty": 3})
+    check("ручная правка qty поверх ms_qty принята", r.status_code == 200)
+    repl_inc = client.get("/api/replenish").json()
+    hood_item = next((i for i in repl_inc["items"]
+                      if i["base_name"] == "Худи «Скетч»"), None)
+    hood_excl = next((e for e in repl_inc.get("excluded", [])
+                      if e["base_name"] == "Худи «Скетч»"), None)
+    if hood_item is not None:
+        check("replenish: ordered = ручной qty + ms_qty (3+14)",
+              hood_item["ordered"] == 17, f"got={hood_item['ordered']}")
+    else:
+        check("replenish: позиция закрыта заказом (причина упоминает заказ)",
+              hood_excl is not None and "заказ" in hood_excl.get("reason", ""),
+              f"got={hood_excl}")
+
     print("== Инкрементальный синк ==")
+    # Эмулируем приёмку в МС: размер S принят полностью → у «Скетча» едет 8.
+    mock_ms.PURCHASE_ORDERS[0]["positions"]["rows"][0]["shipped"] = 10.0
     r = client.post("/api/sync/run")
     check("инкрементальный синк запущен", r.status_code == 200 and r.json().get("ok"))
     status = wait_sync_done(client, timeout=120)
     check("инкрементальный синк done", status.get("state") == "done",
           f"state={status.get('state')} error={status.get('error', '')[:120]}")
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    hood = con.execute(
+        "SELECT qty, ms_qty FROM ordered_qty WHERE base_name='Худи «Скетч»'"
+    ).fetchone()
+    check("инкремент пересобрал ms_qty после «приёмки» (14 → 8), qty=3 цел",
+          hood is not None and hood["ms_qty"] == 8 and hood["qty"] == 3,
+          f"got={dict(hood) if hood else None}")
+    con.close()
     summary2 = client.get("/api/summary").json()
     check("после инкремента числа стабильны (остаток не «уехал»)",
           summary2["stock_units"] == summary["stock_units"],

@@ -434,6 +434,117 @@ def entity_salesreturn(request: Request, limit: int = 100, offset: int = 0,
     return _docs_endpoint("salesreturn", request, limit, offset, flt, expand)
 
 
+# ── Заказы поставщику: «едет к нам» (импорт purchaseorder) ───────────────────
+#
+# Seeded-документы для проверки этапа incoming синка. У позиций purchaseorder
+# МойСклад отдаёт quantity (заказано) и shipped (принято по привязанным
+# приёмкам); «едет» = quantity − shipped по проведённым (applicable) докам
+# за окно истории. Кейсы: частично принятый, непроведённый (skip),
+# полностью принятый (0), старый за окном (skip), неизвестный SKU (skip).
+
+def _po_seed():
+    recent = (TODAY - timedelta(days=10)).isoformat()
+    old = (TODAY - timedelta(days=HISTORY_DAYS + 30)).isoformat()
+
+    def pos(ext, qty, shipped=0.0):
+        return {"assortment": {"meta": _asm_meta(ext)},
+                "quantity": qty, "shipped": shipped, "price": 100000}
+
+    return [
+        {  # частично принятый: Худи «Скетч» едет 6 + 8, сумка принята целиком
+            "id": "po-seed-1", "name": "S-0001", "applicable": True,
+            "moment": f"{recent} 12:00:00",
+            "meta": {"href": f"{BASE}/entity/purchaseorder/po-seed-1",
+                     "type": "purchaseorder"},
+            "positions": {"rows": [
+                pos("v-hoodie1-S", 10, 4.0),
+                pos("v-hoodie1-M", 8),
+                pos("p-bag1", 20, 20.0),
+            ], "meta": {"size": 3}},
+        },
+        {  # черновик (непроведённый) — в «едет» не входит
+            "id": "po-seed-2", "name": "S-0002", "applicable": False,
+            "moment": f"{recent} 13:00:00",
+            "meta": {"href": f"{BASE}/entity/purchaseorder/po-seed-2",
+                     "type": "purchaseorder"},
+            "positions": {"rows": [pos("v-tee1-S", 50)], "meta": {"size": 1}},
+        },
+        {  # старше окна истории — отсекается фильтром moment
+            "id": "po-seed-3", "name": "S-0003", "applicable": True,
+            "moment": f"{old} 12:00:00",
+            "meta": {"href": f"{BASE}/entity/purchaseorder/po-seed-3",
+                     "type": "purchaseorder"},
+            "positions": {"rows": [pos("v-shirt1-M", 30)], "meta": {"size": 1}},
+        },
+        {  # позиция с неизвестным SKU — пропускается, док не валится
+            "id": "po-seed-4", "name": "S-0004", "applicable": True,
+            "moment": f"{recent} 14:00:00",
+            "meta": {"href": f"{BASE}/entity/purchaseorder/po-seed-4",
+                     "type": "purchaseorder"},
+            "positions": {"rows": [pos("v-ghost-X", 5), pos("p-ring1", 7, 2.0)],
+                          "meta": {"size": 2}},
+        },
+    ]
+
+
+PURCHASE_ORDERS: list[dict] = _po_seed()
+
+
+def reset_purchase_orders() -> None:
+    PURCHASE_ORDERS.clear()
+    PURCHASE_ORDERS.extend(_po_seed())
+
+
+def expected_incoming() -> dict:
+    """{base_name: «едет» шт} из seeded-заказов поставщику (окно HISTORY_DAYS)."""
+    cutoff = (TODAY - timedelta(days=HISTORY_DAYS - 1)).isoformat()
+    out: dict[str, float] = {}
+    for doc in PURCHASE_ORDERS:
+        if doc.get("applicable") is False or doc["moment"][:10] < cutoff:
+            continue
+        for p in doc["positions"]["rows"]:
+            href = p["assortment"]["meta"]["href"]
+            ext = href.split("?", 1)[0].rstrip("/").rsplit("/", 1)[-1]
+            sku = SKU_BY_EXT.get(ext)
+            if sku is None:
+                continue
+            left = float(p["quantity"]) - float(p.get("shipped") or 0)
+            if left > 0:
+                out[sku["base"]] = out.get(sku["base"], 0.0) + left
+    return {b: q for b, q in out.items() if q > 0}
+
+
+@app.get("/entity/purchaseorder")
+def entity_purchaseorder(request: Request, limit: int = 100, offset: int = 0,
+                         flt: str = Query(default="", alias="filter"),
+                         expand: str = ""):
+    _auth(request)
+    parsed = _parse_filter(flt)
+    m_from = parsed.get("moment>=", "")[:10]
+    rows = []
+    # seeded + созданные writeback'ом (у последних МС проставил бы moment
+    # и applicable сам — эмулируем: сегодня, проведён, shipped=0).
+    for doc in PURCHASE_ORDERS + [
+        {**d,
+         "moment": d.get("moment") or f"{TODAY.isoformat()} 12:00:00",
+         "applicable": d.get("applicable", True),
+         "positions": {"rows": [{**p, "shipped": p.get("shipped", 0.0)}
+                                for p in (d.get("positions") or [])],
+                       "meta": {"size": len(d.get("positions") or [])}}}
+        for d in CREATED_PURCHASE_ORDERS
+    ]:
+        day = doc["moment"][:10]
+        if m_from and day < m_from:
+            continue
+        if "positions" in (expand or "") and limit <= 100:
+            rows.append(doc)
+        else:
+            stripped = dict(doc)
+            stripped["positions"] = {"meta": doc["positions"]["meta"]}
+            rows.append(stripped)
+    return _page(rows, limit, offset)
+
+
 # ── Обратная запись: организация, контрагенты, заказ поставщику ──────────────
 
 ORG_EXT_ID = "org-main"

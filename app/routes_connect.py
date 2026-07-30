@@ -35,6 +35,8 @@ from app.ms_client import MoySkladClient
 # в production_orders нет колонок ms_doc_href/ms_doc_name — добавляем.
 # Свежая БД (таблиц ещё нет) — no-op, колонки создаст init_db из модели.
 ms_writeback.ensure_schema()
+# …и ms_qty в ordered_qty («едет к нам» из заказов поставщику МойСклад).
+ms_sync.ensure_schema()
 
 # app/api.py (демо-скоуп) регистрирует заглушку POST /api/connect/moysklad,
 # а api_router включается в приложение раньше этого роутера — заглушка
@@ -52,7 +54,9 @@ router = APIRouter(prefix="/api")
 # Пометка «идёт отправка в МойСклад» в ms_doc_href: pending:<epoch-старта>.
 # Несёт время → зависшую дольше TTL отправку можно переиграть (воркер умер
 # между захватом лока и сетевым вызовом), не создавая дубль финансового документа.
-_PENDING_PREFIX = "pending:"
+# Константа живёт в ms_writeback: по ней же api.py отличает реально
+# отправленные заказы (is_pushed) от помеченных «идёт отправка».
+_PENDING_PREFIX = ms_writeback.PENDING_PREFIX
 _PENDING_TTL_SEC = 180
 
 TOKEN_HINT = ("МойСклад не принял токен. Проверьте, что токен скопирован целиком: "

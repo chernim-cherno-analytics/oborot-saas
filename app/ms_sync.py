@@ -7,7 +7,10 @@
                            суммарно → stock_days, последняя дата → warehouse_stock;
   sales         (70–95%) — retaildemand + demand + salesreturn c expand=positions
                            за HISTORY_DAYS, фильтр по выбранным складам → sales;
-  finalize      (95–100%)— connection.status='active', сброс кэша аналитики.
+  incoming      (95–97%) — «едет к нам» из МС: entity/purchaseorder за
+                           HISTORY_DAYS, по позициям quantity − shipped
+                           (проведённые доки) → ordered_qty.ms_qty;
+  finalize      (97–100%)— connection.status='active', сброс кэша аналитики.
 
 Инкрементальный синк (mode='incremental'): обновление цен из ассортимента,
 живые остатки на сегодня (+ явные нули), перезапись продаж за последние
@@ -32,13 +35,14 @@ import re
 import threading
 from datetime import date, datetime, timedelta
 
-from sqlalchemy import delete, insert, select
+from sqlalchemy import delete, insert, inspect, select, text, update
 
 from app import analytics, exclusions
 from app.crypto import decrypt_token
-from app.db import SessionLocal
+from app.db import SessionLocal, engine
 from app.models import (
     Connection,
+    OrderedQty,
     Product,
     Sale,
     StockDay,
@@ -58,6 +62,23 @@ _SIZE_SUFFIX_RE = re.compile(r"\s*\(([^)]*)\)\s*$")
 
 _threads: dict[int, threading.Thread] = {}
 _threads_lock = threading.Lock()
+
+
+def ensure_schema() -> None:
+    """Аддитивная мини-миграция: колонка ms_qty в ordered_qty.
+
+    Base.metadata.create_all не изменяет существующие таблицы (паттерн —
+    app.ms_writeback.ensure_schema). Свежая БД получает колонку из модели.
+    """
+    insp = inspect(engine)
+    if not insp.has_table("ordered_qty"):
+        return
+    cols = {c["name"] for c in insp.get_columns("ordered_qty")}
+    if "ms_qty" not in cols:
+        with engine.begin() as conn:
+            conn.execute(text(
+                "ALTER TABLE ordered_qty ADD COLUMN ms_qty FLOAT NOT NULL DEFAULT 0"
+            ))
 
 
 # ── Имена и размеры (как в legacy _canon_name) ───────────────────────────────
@@ -238,8 +259,11 @@ async def _run_sync(org_id: int, mode: str) -> None:
         await _sync_sales(org_id, client, active_wh, sales_days, ext_to_pid,
                           stats, initial=(mode == "initial"))
 
+        # ── Этап 4: «едет к нам» из МС (заказы поставщику) ──────────────────
+        await _sync_incoming(org_id, client, ext_to_pid, stats)
+
     # ── Финализация ─────────────────────────────────────────────────────────
-    _set_state(org_id, stage="finalize", progress=97.0,
+    _set_state(org_id, stage="finalize", progress=98.0,
                detail="Пересчитываем аналитику…")
     db = SessionLocal()
     try:
@@ -528,6 +552,92 @@ async def _sync_stock_history(org_id: int, client: MoySkladClient,
     stats["warehouse_stock_rows"] = len(wh_rows)
     if unmatched:
         stats["stock_unmatched_skus"] = len(unmatched)
+
+
+# ── «Едет к нам» из МС: заказы поставщику ────────────────────────────────────
+
+async def _sync_incoming(org_id: int, client: MoySkladClient,
+                         ext_to_pid: dict[str, int], stats: dict) -> None:
+    """entity/purchaseorder → ordered_qty.ms_qty (полная пересборка вклада МС).
+
+    «Едет» по документу = Σ по позициям (quantity − shipped): shipped растёт
+    с каждой приёмкой, привязанной к заказу, поэтому принятое отпадает само.
+    Учитываются только проведённые (applicable) документы за HISTORY_DAYS —
+    брошенный годовалый заказ не должен вечно занижать рекомендации.
+
+    В ms_qty входят и документы, созданные нашей кнопкой «Отправить в
+    МойСклад»: их локальный вклад в qty снят при отправке (app/ms_writeback),
+    двойного счёта нет.
+    """
+    _set_state(org_id, stage="incoming", progress=95.5,
+               detail="Загружаем заказы поставщику («едет к нам»)…")
+    cutoff = (date.today() - timedelta(days=HISTORY_DAYS - 1)).isoformat()
+    docs = await client.fetch_purchase_orders(cutoff)
+
+    # product_id → base_name (агрегируем «едет» по базовому имени).
+    db = SessionLocal()
+    try:
+        base_by_pid = dict(db.execute(
+            select(Product.id, Product.base_name).where(Product.org_id == org_id)
+        ).all())
+    finally:
+        db.close()
+
+    incoming: dict[str, float] = {}
+    open_docs = 0
+    unmatched: set[str] = set()
+    for doc in docs:
+        if doc.get("applicable") is False:  # черновик/непроведённый — не едет
+            continue
+        doc_qty = 0.0
+        for pos in ((doc.get("positions") or {}).get("rows")) or []:
+            ext = _href_id(((pos.get("assortment") or {}).get("meta") or {}).get("href"))
+            pid = ext_to_pid.get(ext)
+            if pid is None:
+                if ext:
+                    unmatched.add(ext)
+                continue
+            left = float(pos.get("quantity") or 0) - float(pos.get("shipped") or 0)
+            if left <= 0:
+                continue  # позиция принята полностью (или переполучена)
+            base = base_by_pid.get(pid)
+            if not base:
+                continue
+            incoming[base] = incoming.get(base, 0.0) + left
+            doc_qty += left
+        if doc_qty > 0:
+            open_docs += 1
+
+    db = SessionLocal()
+    try:
+        # Полная пересборка вклада МС: обнуляем и пишем свежие значения.
+        db.execute(update(OrderedQty).where(
+            OrderedQty.org_id == org_id, OrderedQty.ms_qty != 0
+        ).values(ms_qty=0.0))
+        existing = {
+            row.base_name: row
+            for row in db.execute(
+                select(OrderedQty).where(OrderedQty.org_id == org_id)
+            ).scalars()
+        }
+        for base, qty in incoming.items():
+            row = existing.get(base)
+            if row is None:
+                db.add(OrderedQty(org_id=org_id, base_name=base, qty=0.0, ms_qty=qty))
+            else:
+                row.ms_qty = qty
+        db.commit()
+    finally:
+        db.close()
+
+    stats["incoming_docs"] = len(docs)
+    stats["incoming_open_docs"] = open_docs
+    stats["incoming_qty"] = round(sum(incoming.values()))
+    if unmatched:
+        stats["incoming_unmatched_skus"] = len(unmatched)
+    _set_state(org_id, stage="incoming", progress=97.0,
+               detail=f"«Едет к нам»: {stats['incoming_qty']} шт "
+                      f"из {open_docs} заказов поставщику")
 
 
 # ── Продажи ──────────────────────────────────────────────────────────────────

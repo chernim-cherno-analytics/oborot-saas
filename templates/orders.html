@@ -51,9 +51,11 @@ document.addEventListener("DOMContentLoaded", function () {
       });
   }
 
-  function removeOrder(id, status) {
+  function removeOrder(id, status, pushed) {
     var msg = status === "sent"
-      ? "Удалить заказ, который уже в производстве? Его количества будут убраны из «едет к нам»."
+      ? (pushed
+        ? "Удалить заказ из «Оборота»? Документ «Заказ поставщику» в МойСклад останется и продолжит учитываться в «едет к нам», пока не будет принят или удалён в МС."
+        : "Удалить заказ, который уже в производстве? Его количества будут убраны из «едет к нам».")
       : "Удалить черновик заказа?";
     if (!confirm(msg)) return;
     api("/api/orders/" + id, { method: "DELETE" }).then(function () {
@@ -114,7 +116,7 @@ document.addEventListener("DOMContentLoaded", function () {
   }
 
   function pushToMs(id) {
-    if (!confirm("Создать в МойСклад документ «Заказ поставщику» с позициями этого заказа?\n\nПозиции лягут по вариантам-размерам, цена за штуку — себестоимость. Позиции, не найденные в ассортименте МС, будут перечислены отдельно.")) return;
+    if (!confirm("Создать в МойСклад документ «Заказ поставщику» с позициями этого заказа?\n\nПозиции лягут по вариантам-размерам, цена за штуку — себестоимость. Позиции, не найденные в ассортименте МС, будут перечислены отдельно.\n\n«Едет к нам» по этому заказу дальше считается по документу МойСклад: приёмки, привязанные к заказу в МС, будут снимать принятое автоматически.")) return;
     api("/api/orders/" + id + "/push-to-ms", { method: "POST" }).then(function (d) {
       if (d.unmatched && d.unmatched.length) {
         toast("Документ «Заказ поставщику» № " + (d.ms_doc_name || "—") + " создан. Не сопоставлено позиций: " +
@@ -196,7 +198,9 @@ document.addEventListener("DOMContentLoaded", function () {
       " Печать</button>" +
       "</div>" +
       (o.status === "draft"
-        ? '<div class="page-sub no-print" style="margin:8px 0 0;">Черновик не учитывается в расчётах. Нажмите «В производство», когда заказ реально отправлен — тогда его количества попадут в «едет к нам» и уменьшат рекомендации.</div>'
+        ? (msdoc && msdoc.ms_doc_href
+          ? '<div class="page-sub no-print" style="margin:8px 0 0;">Заказ создан в МойСклад — его количества уже учитываются в «едет к нам» по документу МС. Нажмите «В производство», чтобы отразить статус и здесь.</div>'
+          : '<div class="page-sub no-print" style="margin:8px 0 0;">Черновик не учитывается в расчётах. Нажмите «В производство», когда заказ реально отправлен — тогда его количества попадут в «едет к нам» и уменьшат рекомендации.</div>')
         : "") +
       '<div class="tbl-wrap"><table class="tbl">' +
       '<thead><tr><th>Позиция</th><th>Размеры</th><th class="num">Кол-во, шт</th><th class="num">Себес за шт</th><th class="num">Сумма</th></tr></thead>' +
@@ -208,16 +212,21 @@ document.addEventListener("DOMContentLoaded", function () {
 
     var btn = document.getElementById("btn-print");
     if (btn) btn.addEventListener("click", function () { window.print(); });
+    var pushed = !!(msdoc && msdoc.ms_doc_href);
     var bSend = document.getElementById("btn-send");
     if (bSend) bSend.addEventListener("click", function () {
-      setStatus(o.id, "sent", "Отправить заказ в производство? Его количества попадут в «едет к нам» и уменьшат рекомендации «Что заказать».");
+      setStatus(o.id, "sent", pushed
+        ? "Отправить заказ в производство? Заказ уже создан в МойСклад — «едет к нам» считается по документу МС."
+        : "Отправить заказ в производство? Его количества попадут в «едет к нам» и уменьшат рекомендации «Что заказать».");
     });
     var bRecv = document.getElementById("btn-receive");
     if (bRecv) bRecv.addEventListener("click", function () {
-      setStatus(o.id, "received", "Отметить заказ принятым на склад? Количества будут убраны из «едет к нам» (фактические остатки обновит синхронизация).");
+      setStatus(o.id, "received", pushed
+        ? "Отметить заказ принятым на склад? «Едет к нам» уменьшится после приёмки по заказу в МойСклад (подтянет синхронизация)."
+        : "Отметить заказ принятым на склад? Количества будут убраны из «едет к нам» (фактические остатки обновит синхронизация).");
     });
     var bDel = document.getElementById("btn-delete");
-    if (bDel) bDel.addEventListener("click", function () { removeOrder(o.id, o.status); });
+    if (bDel) bDel.addEventListener("click", function () { removeOrder(o.id, o.status, pushed); });
     var bPush = document.getElementById("btn-push-ms");
     if (bPush) bPush.addEventListener("click", function () { pushToMs(o.id); });
     detail.scrollIntoView({ behavior: "smooth", block: "nearest" });

@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app import analytics
+from app import analytics, ms_writeback
 from app.auth import AuthContext, require_auth_api, require_owner_api
 from app.crypto import encrypt_token
 from app.db import get_db
@@ -162,6 +162,10 @@ def api_order_status(
 
     Семантика «едет к нам»: draft не учитывается; sent прибавляет; received
     вычитает (пришедшие остатки подтянет синхронизация со складом).
+
+    Заказ, отправленный в МойСклад (ms_doc_href), локальный qty НЕ двигает:
+    его считает импорт purchaseorder (ordered_qty.ms_qty), а принятое снимают
+    приёмки в МС — иначе был бы двойной счёт.
     """
     order = db.get(ProductionOrder, order_id)
     if order is None or order.org_id != ctx.org.id:
@@ -172,10 +176,11 @@ def api_order_status(
             status_code=422,
             detail=f"Недопустимый переход статуса: {order.status} → {body.status}",
         )
-    if body.status == "sent":
-        _apply_order_to_incoming(db, ctx.org.id, order, +1)
-    else:  # received
-        _apply_order_to_incoming(db, ctx.org.id, order, -1)
+    if not ms_writeback.is_pushed(order.ms_doc_href):
+        if body.status == "sent":
+            _apply_order_to_incoming(db, ctx.org.id, order, +1)
+        else:  # received
+            _apply_order_to_incoming(db, ctx.org.id, order, -1)
     order.status = body.status
     db.commit()
     analytics.invalidate(ctx.org.id)
@@ -192,7 +197,9 @@ def api_order_delete(
         raise HTTPException(status_code=404, detail="Заказ не найден")
     if order.status == "received":
         raise HTTPException(status_code=422, detail="Принятый на склад заказ удалить нельзя")
-    if order.status == "sent":
+    if order.status == "sent" and not ms_writeback.is_pushed(order.ms_doc_href):
+        # Отправленный в МС заказ в qty не входил (его считает ms_qty; сам
+        # документ в МойСклад при локальном удалении никуда не девается).
         _apply_order_to_incoming(db, ctx.org.id, order, -1)
     db.delete(order)
     db.commit()

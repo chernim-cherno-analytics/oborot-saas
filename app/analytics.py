@@ -335,10 +335,12 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
         )
     ).one()
 
+    # «Едет к нам» = локальные заказы/ручные правки (qty) + документы
+    # «Заказ поставщику» из МойСклад (ms_qty, пересобирается синком).
     ordered_by_base = dict(
         db.execute(
-            select(OrderedQty.base_name, OrderedQty.qty).where(
-                OrderedQty.org_id == org.id, OrderedQty.qty > 0
+            select(OrderedQty.base_name, OrderedQty.qty + OrderedQty.ms_qty).where(
+                OrderedQty.org_id == org.id, OrderedQty.qty + OrderedQty.ms_qty > 0
             )
         ).all()
     )

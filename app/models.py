@@ -166,13 +166,24 @@ class Sale(Base):
 
 
 class OrderedQty(Base):
-    """«Едет к нам»: заказано на производстве, ещё не оприходовано."""
+    """«Едет к нам»: заказано на производстве, ещё не оприходовано.
+
+    qty    — локальный вклад: заказы «Оборота» в статусе «В производстве»,
+             НЕ отправленные в МойСклад, плюс ручные правки (POST /api/ordered);
+    ms_qty — вклад МойСклад: сумма (quantity − shipped) по позициям проведённых
+             «Заказов поставщику» (entity/purchaseorder); пересобирается каждым
+             синком целиком. Заказ, отправленный из «Оборота» в МС кнопкой
+             push-to-ms, учитывается ТОЛЬКО здесь (дедуп — в app/api.py).
+
+    Аналитика везде использует сумму qty + ms_qty.
+    """
 
     __tablename__ = "ordered_qty"
 
     org_id: Mapped[int] = mapped_column(ForeignKey("orgs.id"), primary_key=True)
     base_name: Mapped[str] = mapped_column(String(255), primary_key=True)
     qty: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    ms_qty: Mapped[float] = mapped_column(Float, nullable=False, default=0.0, server_default="0")
 
 
 class SyncState(Base):

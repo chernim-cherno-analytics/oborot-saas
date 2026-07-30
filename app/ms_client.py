@@ -186,6 +186,25 @@ class MoySkladClient:
             )
         ]
 
+    async def fetch_purchase_orders(self, moment_from: str) -> list[dict]:
+        """«Заказы поставщику» (entity/purchaseorder) с позициями с даты moment_from.
+
+        Для расчёта «едет к нам»: у позиций purchaseorder МойСклад отдаёт
+        quantity (заказано) и shipped (принято по привязанным приёмкам) —
+        остаток «в пути» = quantity − shipped. expand=positions ⇒ страница
+        не больше 100 строк (как у документов продаж).
+        """
+        params: dict[str, Any] = {
+            "filter": f"moment>={moment_from} 00:00:00",
+            "expand": "positions",
+        }
+        return [
+            row
+            async for row in self.paginate(
+                "/entity/purchaseorder", params, page_limit=EXPAND_PAGE_LIMIT
+            )
+        ]
+
     # ── Обратная запись (writeback): «Заказ поставщику» ─────────────────────
 
     async def fetch_organizations(self) -> list[dict]:

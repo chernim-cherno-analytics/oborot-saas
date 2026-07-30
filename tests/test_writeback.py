@@ -19,6 +19,7 @@
 Запуск из корня репозитория:  python tests/test_writeback.py
 """
 import os
+import sqlite3
 import sys
 import threading
 import time
@@ -91,6 +92,16 @@ def wait_sync_done(client: httpx.Client, timeout: float = 240.0) -> dict:
     return last
 
 
+def ordered_map() -> dict:
+    """{base_name: (qty, ms_qty)} из ordered_qty — для проверок «едет к нам»."""
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    rows = {r["base_name"]: (r["qty"], r["ms_qty"]) for r in con.execute(
+        "SELECT base_name, qty, ms_qty FROM ordered_qty")}
+    con.close()
+    return rows
+
+
 def sku_ext(base: str, size: str) -> str | None:
     """ext_id SKU mock-мира по (base_name, size); None, если нет."""
     for sku in mock_ms.SKUS:
@@ -157,6 +168,7 @@ def run_scenario() -> int:
     order_id = r.json()["id"]
 
     print("== Push в МойСклад ==")
+    om0 = ordered_map()
     r = client.post(f"/api/orders/{order_id}/push-to-ms")
     d = r.json()
     check("push вернул 200 ok", r.status_code == 200 and d.get("ok"),
@@ -206,6 +218,27 @@ def run_scenario() -> int:
           r.status_code == 200 and r.json().get("ms_doc_href", "").endswith("po-0001"),
           f"resp={r.text[:150]}")
 
+    print("== «Едет к нам» после push (дедуп) ==")
+    om1 = ordered_map()
+    pushed_by_base = {}
+    for it in payload["items"]:
+        pushed_by_base[it["base_name"]] = (
+            pushed_by_base.get(it["base_name"], 0) + sum(it["sizes"].values()))
+    ms_ok = all(
+        om1.get(b, (0, 0))[1] - om0.get(b, (0, 0))[1] == q
+        for b, q in pushed_by_base.items())
+    qty_ok = all(
+        om1.get(b, (0, 0))[0] == om0.get(b, (0, 0))[0] for b in pushed_by_base)
+    check("push draft: ms_qty вырос на отправленное, локальный qty не тронут",
+          ms_ok and qty_ok,
+          f"pushed={pushed_by_base} om0={om0} om1={om1}")
+
+    om_before = ordered_map()
+    r = client.post(f"/api/orders/{order_id}/status", json={"status": "sent"})
+    check("отправленный в МС заказ переводится в sent", r.status_code == 200)
+    check("…и НЕ двигает локальный qty (дедуп: его считает ms_qty)",
+          ordered_map() == om_before)
+
     print("== Идемпотентность ==")
     r = client.post(f"/api/orders/{order_id}/push-to-ms")
     body = r.json()
@@ -224,9 +257,14 @@ def run_scenario() -> int:
         ],
     })
     order2 = r.json()["id"]
+    hood0 = ordered_map().get("Худи «Скетч»", (0, 0))
     r = client.post(f"/api/orders/{order2}/status", json={"status": "sent"})
     check("заказ переведён в sent (push доступен и для sent)",
           r.status_code == 200 and r.json().get("status") == "sent")
+    hood_sent = ordered_map().get("Худи «Скетч»", (0, 0))
+    check("sent непушенного заказа прибавил qty (+3)",
+          hood_sent[0] == hood0[0] + 3 and hood_sent[1] == hood0[1],
+          f"{hood0} -> {hood_sent}")
     r = client.post(f"/api/orders/{order2}/push-to-ms")
     d = r.json()
     check("push частичного заказа → 200", r.status_code == 200 and d.get("ok"),
@@ -238,6 +276,10 @@ def run_scenario() -> int:
           and len(mock_ms.CREATED_PURCHASE_ORDERS) == 2
           and len(mock_ms.CREATED_PURCHASE_ORDERS[1]["positions"]) == 2,
           f"pushed={d.get('positions_pushed')}")
+    hood_pushed = ordered_map().get("Худи «Скетч»", (0, 0))
+    check("push sent-заказа: вклад переехал из qty в ms_qty (дедуп)",
+          hood_pushed[0] == hood0[0] and hood_pushed[1] == hood0[1] + 3,
+          f"{hood_sent} -> {hood_pushed}")
 
     print("== Заказ целиком из неизвестных позиций ==")
     r = client.post("/api/orders", json={
@@ -252,8 +294,12 @@ def run_scenario() -> int:
     check("документ при 422 не создан", len(mock_ms.CREATED_PURCHASE_ORDERS) == 2)
 
     print("== Статус received ==")
+    om_recv0 = ordered_map()
     r = client.post(f"/api/orders/{order2}/status", json={"status": "received"})
     check("заказ принят на склад", r.status_code == 200)
+    check("received пушенного заказа не двигает qty/ms_qty "
+          "(принятое снимет приёмка в МС через синк)",
+          ordered_map() == om_recv0)
     r = client.post(f"/api/orders/{order2}/push-to-ms")
     check("push received-заказа → 422", r.status_code == 422,
           f"status={r.status_code} body={r.text[:120]}")

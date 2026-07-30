@@ -33,11 +33,25 @@ from sqlalchemy.orm import Session
 
 from app.crypto import decrypt_token
 from app.db import engine
-from app.models import Connection, Product, ProductionOrder
+from app.models import Connection, OrderedQty, Product, ProductionOrder
 from app.ms_client import MoySkladClient
 
 # Имя контрагента-поставщика, на которого оформляется заказ.
 AGENT_NAME = "Производство"
+
+# Пометка «идёт отправка» в ms_doc_href (лок в routes_connect): pending:<epoch>.
+PENDING_PREFIX = "pending:"
+
+
+def is_pushed(href: str | None) -> bool:
+    """Заказ реально отправлен в МойСклад (есть ссылка на документ, не лок).
+
+    Такой заказ учитывается в «едет к нам» ТОЛЬКО через ordered_qty.ms_qty
+    (импорт purchaseorder синком) — статусные переходы в api.py не должны
+    двигать локальный qty, иначе двойной счёт.
+    """
+    h = href or ""
+    return bool(h) and not h.startswith(PENDING_PREFIX)
 
 # Веб-интерфейс МойСклад: ссылка на карточку документа по его uuid.
 MS_UI_DOC_URL = "https://online.moysklad.ru/app/#purchaseorder/edit?id={uuid}"
@@ -133,6 +147,40 @@ def _position_label(base_name: str, size: str) -> str:
     return f"{base_name} ({size})" if size else base_name
 
 
+def _move_incoming_to_ms(db: Session, org_id: int, order: ProductionOrder,
+                         pushed_by_base: dict[str, int]) -> None:
+    """Перенос вклада заказа в «едет к нам» с локального qty на ms_qty.
+
+    С момента отправки источник истины по этому заказу — документ в МойСклад
+    (следующий синк посчитает его из purchaseorder, приёмки снимут принятое).
+    Здесь: (а) если заказ уже был «В производстве» — снимаем его прежний
+    локальный вклад из qty (зеркало _apply_order_to_incoming(+1) в api.py,
+    полное количество позиции — как и добавлялось); (б) отправленные позиции
+    сразу прибавляем к ms_qty, чтобы «едет» не мигал до ближайшего синка.
+    """
+    was_sent = order.status == "sent"
+    touched: dict[str, OrderedQty] = {}
+
+    def _row(base: str) -> OrderedQty:
+        if base not in touched:
+            row = db.get(OrderedQty, (org_id, base))
+            if row is None:
+                row = OrderedQty(org_id=org_id, base_name=base, qty=0.0, ms_qty=0.0)
+                db.add(row)
+            touched[base] = row
+        return touched[base]
+
+    if was_sent:
+        for item in order.items:
+            base, qty = str(item.get("base_name") or ""), int(item.get("qty") or 0)
+            if base and qty > 0:
+                row = _row(base)
+                row.qty = max(0.0, row.qty - qty)
+    for base, qty in pushed_by_base.items():
+        row = _row(base)
+        row.ms_qty = row.ms_qty + qty
+
+
 # ── Основной сценарий ────────────────────────────────────────────────────────
 
 def _get_ms_token(db: Session, org_id: int) -> str:
@@ -183,6 +231,7 @@ async def push_order(db: Session, org_id: int, order: ProductionOrder) -> dict:
         # 2) Позиции документа: base_name+size → product.ext_id → meta МС.
         positions: list[dict] = []
         unmatched: list[str] = []
+        pushed_by_base: dict[str, int] = {}  # для переноса вклада в ms_qty
         for item in order.items:
             base = str(item.get("base_name") or "")
             cost_kopecks = _kopecks_of(item.get("cost"))
@@ -197,6 +246,7 @@ async def push_order(db: Session, org_id: int, order: ProductionOrder) -> dict:
                     "quantity": qty,
                     "price": cost_kopecks,
                 })
+                pushed_by_base[base] = pushed_by_base.get(base, 0) + qty
 
         if not positions:
             raise WritebackError(
@@ -234,6 +284,7 @@ async def push_order(db: Session, org_id: int, order: ProductionOrder) -> dict:
         doc = await client.create_purchase_order(payload)
 
     href = ((doc.get("meta") or {}).get("href")) or ""
+    _move_incoming_to_ms(db, org_id, order, pushed_by_base)
     order.ms_doc_href = href
     order.ms_doc_name = str(doc.get("name") or "")
     return {
