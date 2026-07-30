@@ -61,13 +61,38 @@ def configured() -> bool:
 
 # ── Входящий JWT (МС → нам) ──────────────────────────────────────────────────
 
+# Возраст входящего lifecycle-JWT и анти-replay. Утёкший токен (напр. через
+# прокси-логи) должен быть бесполезен уже через минуты — поэтому требуем свежий
+# iat и запоминаем jti на время его жизни (best-effort, in-memory; при >1 воркере
+# вынести в общий кэш — см. SECURITY-бэклог).
+INCOMING_JWT_MAX_AGE_SEC = 300
+_seen_jti: dict[str, float] = {}
+
+
+def _remember_jti(jti: str, now: float) -> bool:
+    """True — jti новый (запомнили); False — уже видели (replay)."""
+    # чистим протухшие, чтобы словарь не рос без предела
+    for k, exp in list(_seen_jti.items()):
+        if exp < now:
+            _seen_jti.pop(k, None)
+    if jti in _seen_jti:
+        return False
+    _seen_jti[jti] = now + INCOMING_JWT_MAX_AGE_SEC
+    return True
+
+
 def verify_incoming_jwt(authorization: str | None) -> dict:
     """Проверяет JWT из Authorization lifecycle-запроса МойСклад.
 
-    Подпись HS256 нашим secret key; exp/nbf, если присутствуют, проверяет
-    pyjwt. Принимаем и «Bearer <jwt>», и голый токен (в документации МС
-    формат заголовка не фиксирован). Любая невалидность → HTTPException 401.
-    Возвращает claims (для аудита/логов).
+    Модель доверия (по итогам security-ревью):
+    - подпись HS256 нашим secret key (alg зафиксирован — alg:none/RS-confusion
+      не проходят);
+    - ОБЯЗАТЕЛЬНЫ exp и iat (токен без срока больше не «вечный ключ»);
+    - iat не старше INCOMING_JWT_MAX_AGE_SEC — узкое окно для утёкшего токена;
+    - jti одноразовый (анти-replay), если присутствует.
+    Принимаем «Bearer <jwt>» и голый токен. Любая невалидность → 401.
+    Возвращает claims. TODO при интеграции: если МС кладёт accountId в claims —
+    сверять с accountId из пути в вызывающем роуте.
     """
     if not configured():
         raise HTTPException(
@@ -81,9 +106,20 @@ def verify_incoming_jwt(authorization: str | None) -> dict:
     if not token:
         raise HTTPException(status_code=401, detail="Нет JWT в заголовке Authorization")
     try:
-        return jwt.decode(token, app_secret(), algorithms=["HS256"])
+        claims = jwt.decode(
+            token, app_secret(), algorithms=["HS256"],
+            options={"require": ["exp", "iat"]},
+        )
     except jwt.InvalidTokenError:
-        raise HTTPException(status_code=401, detail="Подпись JWT не прошла проверку")
+        raise HTTPException(status_code=401, detail="Подпись или срок JWT не прошли проверку")
+    now = time.time()
+    iat = float(claims.get("iat", 0))
+    if iat <= 0 or now - iat > INCOMING_JWT_MAX_AGE_SEC:
+        raise HTTPException(status_code=401, detail="JWT просрочен или выдан слишком давно")
+    jti = claims.get("jti")
+    if jti and not _remember_jti(str(jti), now):
+        raise HTTPException(status_code=401, detail="JWT уже был использован (replay)")
+    return claims
 
 
 # ── Наш JWT (мы → МС) ────────────────────────────────────────────────────────

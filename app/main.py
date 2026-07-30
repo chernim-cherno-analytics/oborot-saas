@@ -40,13 +40,31 @@ app.include_router(ms_app_router)
 
 
 @app.middleware("http")
-async def _csp_frame_ancestors(request: Request, call_next):
-    """Разрешаем встраивать «Оборот» ТОЛЬКО в сам сервис и в МойСклад.
+async def _security_headers_and_csrf(request: Request, call_next):
+    """CSP frame-ancestors + CSRF-защита изменяющих запросов к /api.
 
-    Приложение маркетплейса МС работает полностраничным iframe раздела
-    «Приложения» — вместо полного запрета фреймов ограничиваем список
-    предков CSP-директивой frame-ancestors (современная замена X-Frame-Options).
+    CSP: приложение маркетплейса МС работает полностраничным iframe — вместо
+    полного запрета фреймов ограничиваем предков (современная замена
+    X-Frame-Options). Ставим и на 500 (обработка исключения ниже).
+
+    CSRF: в embedded-режиме сессионная кука на проде SameSite=None (иначе не
+    долетит в iframe МС), поэтому Lax-защита не работает. Для изменяющих
+    методов на /api/* требуем кастомный заголовок X-Oborot-CSRF: браузер не
+    даст поставить его в кросс-доменном запросе без CORS-preflight, а CORS мы
+    не разрешаем — значит сторонний сайт не сможет дёрнуть наши ручки с
+    кукой пользователя. Свой фронт заголовок шлёт всегда (см. app.js api()).
+    Vendor-lifecycle (/ms/...) сюда не попадает: это server-to-server c JWT,
+    без куки — CSRF там неприменим.
     """
+    if (
+        request.method in ("POST", "PUT", "PATCH", "DELETE")
+        and request.url.path.startswith("/api/")
+        and request.headers.get("X-Oborot-CSRF") is None
+    ):
+        from fastapi.responses import JSONResponse as _JR
+        resp = _JR(status_code=403, content={"detail": "CSRF: запрос отклонён"})
+        resp.headers["Content-Security-Policy"] = "frame-ancestors 'self' https://online.moysklad.ru"
+        return resp
     response = await call_next(request)
     response.headers.setdefault(
         "Content-Security-Policy",

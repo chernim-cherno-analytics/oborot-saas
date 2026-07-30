@@ -152,7 +152,7 @@ def main() -> int:
 
 def run_scenario() -> int:
     base = f"http://127.0.0.1:{APP_PORT}"
-    client = httpx.Client(base_url=base, timeout=60.0)
+    client = httpx.Client(headers={"X-Oborot-CSRF": "1"}, base_url=base, timeout=60.0)
     auth_hdr = {"Authorization": f"Bearer {ms_jwt()}"}
 
     print("== Установка из каталога МС (PUT Install) ==")
@@ -279,7 +279,7 @@ def run_scenario() -> int:
         f"/ms/vendor/api/moysklad/vendor/1.0/apps/other-app/{mock_ms.VENDOR_ACCOUNT_ID}",
         json=install_body("Install", "Оборот Про", False), headers=auth_hdr)
     check("PUT с чужим appId → 404", r.status_code == 404, f"status={r.status_code}")
-    anon = httpx.Client(base_url=f"http://127.0.0.1:{APP_PORT}", timeout=30.0)
+    anon = httpx.Client(headers={"X-Oborot-CSRF": "1"}, base_url=f"http://127.0.0.1:{APP_PORT}", timeout=30.0)
     r = anon.get("/ms/app", params={"contextKey": "ck-unknown"})
     check("левый contextKey → человеческая ошибка, не 500",
           r.status_code in (401, 404) and "МойСклад" in r.text,
@@ -314,7 +314,7 @@ def run_scenario() -> int:
           r.status_code == 200 and row["status"] == "active" and org_id in ids)
 
     print("== Обычный SaaS не сломан ==")
-    saas = httpx.Client(base_url=f"http://127.0.0.1:{APP_PORT}", timeout=120.0)
+    saas = httpx.Client(headers={"X-Oborot-CSRF": "1"}, base_url=f"http://127.0.0.1:{APP_PORT}", timeout=120.0)
     r = saas.post("/register", data={
         "name": "Сааc", "email": "saas@test.io",
         "password": "secret123", "org_name": "Обычный бренд",

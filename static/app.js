@@ -261,6 +261,10 @@ function api(url, opts) {
     });
   }
   var init = { method: opts.method || "GET", headers: {}, credentials: "same-origin" };
+  // CSRF-защита: кастомный заголовок форсит CORS-preflight для кросс-доменных
+  // запросов, а браузер его не пустит (CORS у нас не разрешён никому). Свои
+  // fetch'и заголовок несут всегда — сервер требует его на изменяющих /api.
+  init.headers["X-Oborot-CSRF"] = "1";
   if (opts.body !== undefined) {
     init.headers["Content-Type"] = "application/json";
     init.body = JSON.stringify(opts.body);

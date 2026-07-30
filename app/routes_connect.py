@@ -15,6 +15,7 @@ POST /api/notify/test               — тестовое сообщение «О
 Все ручки — только для владельца организации (require_owner_api).
 """
 import html
+import time as _time
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
@@ -47,6 +48,12 @@ _api_router.routes = [
 ]
 
 router = APIRouter(prefix="/api")
+
+# Пометка «идёт отправка в МойСклад» в ms_doc_href: pending:<epoch-старта>.
+# Несёт время → зависшую дольше TTL отправку можно переиграть (воркер умер
+# между захватом лока и сетевым вызовом), не создавая дубль финансового документа.
+_PENDING_PREFIX = "pending:"
+_PENDING_TTL_SEC = 180
 
 TOKEN_HINT = ("МойСклад не принял токен. Проверьте, что токен скопирован целиком: "
               "МойСклад → Настройки → Обмен данными → Токены API.")
@@ -257,18 +264,21 @@ def _order_of_org(db: Session, org_id: int, order_id: int) -> ProductionOrder:
 
 
 def _release_push_lock(db: Session, order_id: int) -> None:
-    """Снимает временную пометку 'pending' с ms_doc_href при сбое отправки.
+    """Снимает временную пометку отправки (pending:*) при сбое.
 
     Возвращает заказ в состояние «можно отправить», но только если документ
-    не успел создаться (href всё ещё 'pending'), чтобы не затереть реальную
-    ссылку в редком случае гонки.
+    не успел создаться (href всё ещё начинается с pending:) — чтобы не затереть
+    реальную ссылку в редком случае гонки.
     """
     from sqlalchemy import update as _sa_update
     try:
         db.rollback()
         db.execute(
             _sa_update(ProductionOrder)
-            .where(ProductionOrder.id == order_id, ProductionOrder.ms_doc_href == "pending")
+            .where(
+                ProductionOrder.id == order_id,
+                ProductionOrder.ms_doc_href.like(f"{_PENDING_PREFIX}%"),
+            )
             .values(ms_doc_href="")
         )
         db.commit()
@@ -276,11 +286,18 @@ def _release_push_lock(db: Session, order_id: int) -> None:
         db.rollback()
 
 
+def _clean_href(href: str | None) -> str:
+    """Внутренняя пометка pending:* наружу не показывается — только реальная ссылка."""
+    h = href or ""
+    return "" if h.startswith(_PENDING_PREFIX) else h
+
+
 def _ms_doc_out(order: ProductionOrder) -> dict:
+    href = _clean_href(order.ms_doc_href)
     return {
-        "ms_doc_href": order.ms_doc_href,
-        "ms_doc_name": order.ms_doc_name,
-        "ms_doc_ui_url": ms_writeback.ui_url(href=order.ms_doc_href),
+        "ms_doc_href": href,
+        "ms_doc_name": order.ms_doc_name if href else "",
+        "ms_doc_ui_url": ms_writeback.ui_url(href=href) if href else "",
     }
 
 
@@ -312,7 +329,9 @@ async def api_order_push_to_ms(
             status_code=422,
             detail="Заказ уже принят на склад — отправлять его в МойСклад поздно.",
         )
-    if order.ms_doc_href:
+    current = order.ms_doc_href or ""
+    if current and not current.startswith(_PENDING_PREFIX):
+        # Реальная ссылка на документ — уже отправлен.
         name = f" ({order.ms_doc_name})" if order.ms_doc_name else ""
         return JSONResponse(
             status_code=409,
@@ -322,18 +341,37 @@ async def api_order_push_to_ms(
                 **_ms_doc_out(order),
             },
         )
+    now = int(_time.time())
+    if current.startswith(_PENDING_PREFIX):
+        # Идёт отправка. Если пометка свежая — второй клик отклоняем. Если
+        # «зависла» дольше PENDING_TTL (воркер умер между захватом лока и
+        # сетевым вызовом) — считаем сорванной и разрешаем переотправку.
+        try:
+            started = int(current.split(":", 1)[1])
+        except (ValueError, IndexError):
+            started = 0
+        if now - started < _PENDING_TTL_SEC:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "detail": "Заказ уже отправляется в МойСклад — дождитесь "
+                              "завершения и обновите страницу.",
+                    **_ms_doc_out(order),
+                },
+            )
     # Атомарный захват «замка» ДО любых сетевых вызовов: помечаем заказ как
-    # отправляемый одним условным UPDATE. Второй одновременный клик/ретрай не
-    # обновит ни строки (ms_doc_href уже не пуст) и получит 409 — иначе гонка
-    # check-then-act создала бы ДВА финансовых документа в аккаунте клиента.
+    # отправляемый одним условным UPDATE с проверкой прежнего значения (CAS).
+    # Второй одновременный клик/ретрай не обновит ни строки (значение уже
+    # изменилось) и получит 409 — иначе гонка создала бы ДВА финансовых
+    # документа. Метка несёт время старта → возможна переотправка после сбоя.
     from sqlalchemy import update as _sa_update
     lock = db.execute(
         _sa_update(ProductionOrder)
         .where(
             ProductionOrder.id == order.id,
-            ProductionOrder.ms_doc_href == "",
+            ProductionOrder.ms_doc_href == current,  # CAS: ровно то, что прочитали
         )
-        .values(ms_doc_href="pending")
+        .values(ms_doc_href=f"{_PENDING_PREFIX}{now}")
     )
     db.commit()
     if lock.rowcount == 0:

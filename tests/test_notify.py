@@ -138,7 +138,7 @@ def run_scenario() -> int:
     base = f"http://127.0.0.1:{APP_PORT}"
 
     print("== Демо-организация и настройки уведомлений ==")
-    demo = httpx.Client(base_url=base, timeout=120.0)
+    demo = httpx.Client(headers={"X-Oborot-CSRF": "1"}, base_url=base, timeout=120.0)
     r = demo.post("/register", data={
         "name": "Демо", "email": "demo-notify@test.io",
         "password": "secret123", "org_name": "Демо-бренд «Кавычки&Ко»",
@@ -231,7 +231,7 @@ def run_scenario() -> int:
     })
 
     print("== Организация с МойСклад (mock) для планировщика ==")
-    ms = httpx.Client(base_url=base, timeout=120.0)
+    ms = httpx.Client(headers={"X-Oborot-CSRF": "1"}, base_url=base, timeout=120.0)
     r = ms.post("/register", data={
         "name": "МС", "email": "ms-notify@test.io",
         "password": "secret123", "org_name": "МС-бренд",

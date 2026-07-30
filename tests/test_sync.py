@@ -105,7 +105,7 @@ def main() -> int:
 
 def run_scenario() -> int:
     base = f"http://127.0.0.1:{APP_PORT}"
-    client = httpx.Client(base_url=base, timeout=60.0)
+    client = httpx.Client(headers={"X-Oborot-CSRF": "1"}, base_url=base, timeout=60.0)
 
     print("== Онбординг ==")
     r = client.post("/register", data={
@@ -302,7 +302,7 @@ def run_scenario() -> int:
           f"drift={drift[:3]}")
 
     print("== Демо-режим не сломан ==")
-    demo = httpx.Client(base_url=f"http://127.0.0.1:{APP_PORT}", timeout=120.0)
+    demo = httpx.Client(headers={"X-Oborot-CSRF": "1"}, base_url=f"http://127.0.0.1:{APP_PORT}", timeout=120.0)
     r = demo.post("/register", data={
         "name": "Демо", "email": "demo@test.io",
         "password": "secret123", "org_name": "Демо-бренд",
