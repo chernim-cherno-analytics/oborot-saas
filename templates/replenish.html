@@ -3,30 +3,56 @@
 
 <p class="page-sub" id="horizon-note">Рекомендации: сколько заказать на производство, чтобы хватило на горизонт планирования с учётом темпа продаж, остатков и уже заказанного.</p>
 
-<div class="summary-bar" id="summary-bar" style="display:none;">
-  <div class="s-item"><div class="s-val" id="s-pos">0</div><div class="s-label">позиций к заказу</div></div>
-  <div class="s-item"><div class="s-val" id="s-qty">0</div><div class="s-label">штук</div></div>
-  <div class="s-item"><div class="s-val" id="s-cost">0 ₽</div><div class="s-label">себестоимость</div></div>
-  <div class="s-item"><div class="s-val" id="s-rev">0 ₽</div><div class="s-label">ожидаемая выручка</div></div>
-  <div class="spacer"></div>
-  <button class="btn primary" id="btn-create-order" type="button">
-    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
-    Создать заказ на производство
-  </button>
+<div class="metric-grid" id="kpis" style="grid-template-columns:1.25fr 1fr 1fr 1fr 1fr; display:none;">
+  <div class="metric alert" id="risk-tile">
+    <div class="m-label">Риск стокаута</div>
+    <div class="m-value" id="k-risk">0<small>позиций</small></div>
+    <div class="m-sub">покрытие меньше 2 недель</div>
+    <button class="act" type="button" id="btn-show-urgent">Показать</button>
+  </div>
+  <div class="metric">
+    <div class="m-label">К заказу</div>
+    <div class="m-value" id="s-pos">0</div>
+    <div class="m-sub" id="s-pos-sub">по рекомендации системы</div>
+  </div>
+  <div class="metric">
+    <div class="m-label">Объём заказа</div>
+    <div class="m-value" id="s-qty">0</div>
+    <div class="m-sub">шт · по отмеченным позициям</div>
+  </div>
+  <div class="metric">
+    <div class="m-label">Себестоимость</div>
+    <div class="m-value" id="s-cost">—</div>
+    <div class="m-sub">затраты на производство заказа</div>
+  </div>
+  <div class="metric">
+    <div class="m-label">Ожид. выручка</div>
+    <div class="m-value" id="s-rev">—</div>
+    <div class="m-sub" id="s-rev-sub">при продаже по средней цене</div>
+  </div>
 </div>
 
 <div class="card">
   <div class="toolbar">
+    <div class="seg" id="band-seg">
+      <button type="button" data-band="" class="on">Все <span class="c" id="seg-all">0</span></button>
+      <button type="button" data-band="r" class="s-r">Срочно <span class="c" id="seg-r">0</span></button>
+      <button type="button" data-band="y" class="s-y">Скоро <span class="c" id="seg-y">0</span></button>
+      <button type="button" data-band="g" class="s-g">План <span class="c" id="seg-g">0</span></button>
+    </div>
     <div class="search-box">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.5" y2="16.5"/></svg>
       <input class="input" type="search" id="search" placeholder="Поиск по названию…" autocomplete="off">
     </div>
-    <div class="chips" id="cat-chips"></div>
     <div class="spacer" style="flex:1;"></div>
     <a class="btn" href="/api/export/replenish.xlsx" download title="Выгрузить таблицу в Excel">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-      Скачать Excel
+      Excel
     </a>
+    <button class="btn primary" id="btn-create-order" type="button">+ Создать заказ на производство</button>
+  </div>
+  <div class="toolbar" id="cat-toolbar" style="border-top:none; padding-top:0; display:none;">
+    <div class="chips" id="cat-chips"></div>
   </div>
   <div class="tbl-wrap">
     <table class="tbl" id="tbl">
@@ -35,21 +61,41 @@
           <th style="width:30px;"><input type="checkbox" id="check-all" checked title="Выбрать все"></th>
           <th style="width:30px;"></th>
           <th data-sort="base_name" data-sort-dir="asc">Позиция</th>
-          <th data-sort="cls" style="width:60px;">Класс</th>
+          <th data-sort="cls" style="width:52px;" title="Класс позиции: A — бестселлер, B — хороший, C — медленный, D — слабый">Класс</th>
+          <th style="width:76px;" title="Срочно — покрытие < 2 недель, Скоро — 2–4, План — > 4">Статус</th>
           <th class="num" data-sort="turnover" title="Нетто-выручка за год ÷ дни, когда товар был в наличии">Оборач., ₽/день</th>
           <th class="num" data-sort="rate" title="Продано штук за год ÷ дни в наличии">Темп, шт/день</th>
           <th class="num" data-sort="cs">Остаток</th>
           <th class="num" data-sort="ordered" title="Уже заказано на производстве и ещё не принято на склад">Едет</th>
           <th class="num" data-sort="wos" title="На сколько недель хватит остатка при текущем темпе продаж">Покрытие, нед</th>
           <th data-sort="stockout_date" data-sort-dir="asc" title="Прогнозная дата, когда остаток кончится">Стокаут</th>
-          <th class="num" data-sort="_need" title="Темп × горизонт − остаток − едет (правится в размерной сетке)">Заказать, шт</th>
+          <th class="num" data-sort="_need" title="Темп × горизонт − остаток − едет (правится в размерной сетке)">Заказать</th>
         </tr>
       </thead>
       <tbody id="tbody">
-        <tr><td colspan="11"><div class="loading-stub">Загрузка…</div></td></tr>
+        <tr><td colspan="12"><div class="loading-stub">Загрузка…</div></td></tr>
       </tbody>
+      <tfoot id="tfoot" style="display:none;">
+        <tr>
+          <td colspan="5" id="f-count"></td>
+          <td class="num" id="f-turnover"></td>
+          <td></td>
+          <td class="num" id="f-cs"></td>
+          <td class="num" id="f-ordered"></td>
+          <td></td><td></td>
+          <td class="num" id="f-need"></td>
+        </tr>
+      </tfoot>
     </table>
   </div>
+</div>
+
+<div class="legend">
+  <span><span class="sw r"></span>Срочно — покрытие &lt; 2 нед</span>
+  <span><span class="sw y"></span>Скоро — 2–4 нед</span>
+  <span><span class="sw g"></span>План — &gt; 4 нед</span>
+  <div class="grow"></div>
+  <span id="excluded-legend" style="display:none;"></span>
 </div>
 
 <div class="card" id="excluded-card" style="display:none;">
@@ -74,8 +120,8 @@
         <label for="order-eta">Ожидаемая дата готовности (ETA)</label>
         <input class="input" type="date" id="order-eta">
       </div>
-      <p style="font-size:12px; color:var(--text-soft); margin:0;" id="order-modal-summary"></p>
-      <p id="order-modal-warning" style="display:none; font-size:12px; color:#b91c1c; font-weight:600; margin:8px 0 0;"></p>
+      <p style="font-size:12px; color:var(--ink-2); margin:0;" id="order-modal-summary"></p>
+      <p id="order-modal-warning" style="display:none; font-size:12px; color:var(--red); font-weight:600; margin:8px 0 0;"></p>
     </div>
     <div class="modal-foot">
       <button class="btn" type="button" id="btn-order-cancel">Отмена</button>
@@ -90,12 +136,18 @@
 <script>
 document.addEventListener("DOMContentLoaded", function () {
   var items = [];
-  var state = { sortKey: "turnover", sortDir: -1, query: "", cat: "" };
+  var state = { sortKey: "turnover", sortDir: -1, query: "", cat: "", band: "" };
   var openRows = {};   // base_name -> true
   var tbody = document.getElementById("tbody");
+  var NCOLS = 12;
 
   var HORIZON = 90;
   var SENT_ORDERS = [];
+  var EXCLUDED_COUNT = 0;
+
+  // Фильтр «Срочно» из URL (кнопка «Показать» на дашборде)
+  if (new URLSearchParams(window.location.search).get("f") === "urgent") state.band = "r";
+
   api("/api/replenish").then(function (d) {
     HORIZON = d.horizon_days || 90;
     SENT_ORDERS = d.orders_in_production || [];
@@ -105,6 +157,7 @@ document.addEventListener("DOMContentLoaded", function () {
 
     items = (d.items || []).map(function (it) {
       it._checked = true;
+      it._band = wosBand(it.wos);
       it._recs = {};
       Object.keys(it.sizes || {}).forEach(function (sz) {
         it._recs[sz] = (it.sizes[sz] && it.sizes[sz].rec) || 0;
@@ -112,13 +165,23 @@ document.addEventListener("DOMContentLoaded", function () {
       recalcNeed(it);
       return it;
     });
+    EXCLUDED_COUNT = (d.excluded || []).length;
+    renderKpis();
     renderChips();
+    syncSegUI();
     renderTable();
     renderExcluded(d.excluded || []);
     updateSummary();
-    document.getElementById("summary-bar").style.display = items.length ? "" : "none";
+    document.getElementById("kpis").style.display = items.length ? "" : "none";
+
+    // бейдж срочных в меню + общий кэш оболочки
+    var urgent = items.filter(function (it) { return it._band === "r"; }).length;
+    setNavPip(urgent);
+    try {
+      sessionStorage.setItem("hq_urgent_v1", JSON.stringify({ t: Date.now(), v: { urgent: urgent, toOrder: items.length } }));
+    } catch (e) { /* ignore */ }
   }).catch(function () {
-    tbody.innerHTML = '<tr><td colspan="11">' +
+    tbody.innerHTML = '<tr><td colspan="' + NCOLS + '">' +
       emptyState("Не удалось загрузить данные", "Обновите страницу или попробуйте позже.",
         '<button class="btn" onclick="location.reload()">Обновить</button>') + "</td></tr>";
   });
@@ -130,12 +193,67 @@ document.addEventListener("DOMContentLoaded", function () {
       : (it.need || 0);
   }
 
-  function visibleItems() {
-    var arr = items.filter(function (it) {
+  function baseFiltered() {
+    // фильтр категории + поиска (без статуса) — для счётчиков сегментов
+    return items.filter(function (it) {
       if (state.cat && it.category !== state.cat) return false;
       return wordMatch(it.base_name, state.query);
     });
+  }
+
+  function visibleItems() {
+    var arr = baseFiltered().filter(function (it) {
+      return !state.band || it._band === state.band;
+    });
     return sortItems(arr, state.sortKey, state.sortDir);
+  }
+
+  /* ── KPI-плитки ── */
+  function renderKpis() {
+    var urgent = items.filter(function (it) { return it._band === "r"; }).length;
+    var tile = document.getElementById("risk-tile");
+    if (urgent > 0) {
+      tile.className = "metric alert";
+      document.getElementById("k-risk").innerHTML = fmtInt(urgent) +
+        "<small>" + plural(urgent, "позиция", "позиции", "позиций") + "</small>";
+      tile.querySelector(".m-sub").textContent = "покрытие меньше 2 недель";
+      document.getElementById("btn-show-urgent").style.display = "";
+    } else {
+      tile.className = "metric calm";
+      document.getElementById("k-risk").innerHTML = "0<small>позиций</small>";
+      tile.querySelector(".m-sub").textContent = "стокаутов в ближайшие 2 недели не видно";
+      document.getElementById("btn-show-urgent").style.display = "none";
+    }
+  }
+
+  document.getElementById("btn-show-urgent").addEventListener("click", function () {
+    state.band = "r";
+    syncSegUI();
+    renderTable();
+    document.getElementById("tbl").scrollIntoView({ behavior: "smooth", block: "start" });
+  });
+
+  /* ── Сегменты статусов ── */
+  var segBox = document.getElementById("band-seg");
+  segBox.querySelectorAll("button").forEach(function (b) {
+    b.addEventListener("click", function () {
+      state.band = b.getAttribute("data-band");
+      syncSegUI();
+      renderTable();
+    });
+  });
+
+  function syncSegUI() {
+    var base = baseFiltered();
+    var cnt = { "": base.length, r: 0, y: 0, g: 0 };
+    base.forEach(function (it) { cnt[it._band]++; });
+    document.getElementById("seg-all").textContent = cnt[""];
+    document.getElementById("seg-r").textContent = cnt.r;
+    document.getElementById("seg-y").textContent = cnt.y;
+    document.getElementById("seg-g").textContent = cnt.g;
+    segBox.querySelectorAll("button").forEach(function (b) {
+      b.classList.toggle("on", b.getAttribute("data-band") === state.band);
+    });
   }
 
   function renderChips() {
@@ -144,6 +262,7 @@ document.addEventListener("DOMContentLoaded", function () {
     var cats = Object.keys(counts).sort(function (a, b) { return a.localeCompare(b, "ru"); });
     var box = document.getElementById("cat-chips");
     if (cats.length < 2) { box.innerHTML = ""; return; }
+    document.getElementById("cat-toolbar").style.display = "";
     box.innerHTML = '<button class="chip active" data-cat="">Все<span class="cnt">' + items.length + "</span></button>" +
       cats.map(function (c) {
         return '<button class="chip" data-cat="' + esc(c) + '">' + esc(c) + '<span class="cnt">' + counts[c] + "</span></button>";
@@ -153,6 +272,7 @@ document.addEventListener("DOMContentLoaded", function () {
         state.cat = chip.getAttribute("data-cat");
         box.querySelectorAll(".chip").forEach(function (x) { x.classList.remove("active"); });
         chip.classList.add("active");
+        syncSegUI();
         renderTable();
       });
     });
@@ -183,35 +303,40 @@ document.addEventListener("DOMContentLoaded", function () {
   function renderTable() {
     var arr = visibleItems();
     if (!arr.length) {
-      tbody.innerHTML = '<tr><td colspan="11">' + (items.length
-        ? emptyState("Ничего не найдено", "Попробуйте изменить запрос или сбросить фильтр категории.", "")
-        : (SENT_ORDERS.length
-            ? emptyState("Потребность закрыта заказами в производстве",
-                "Учтены заказы: " + SENT_ORDERS.map(function (o) { return esc(o.name); }).join(", ") +
-                ". Когда они придут на склад (или будут удалены), рекомендации пересчитаются.",
-                '<a class="btn primary" href="/orders">Открыть заказы</a>')
-            : emptyState("Заказывать пока нечего", "По текущему темпу продаж всех позиций хватает на весь горизонт планирования.",
-                '<a class="btn" href="/turnover">Открыть оборачиваемость</a>'))) + "</td></tr>";
+      var msg;
+      if (items.length && (state.query || state.cat || state.band)) {
+        msg = emptyState("Ничего не найдено", "Попробуйте изменить запрос, статус или категорию.", "");
+      } else if (SENT_ORDERS.length) {
+        msg = emptyState("Потребность закрыта заказами в производстве",
+          "Учтены заказы: " + SENT_ORDERS.map(function (o) { return esc(o.name); }).join(", ") +
+          ". Когда они придут на склад (или будут удалены), рекомендации пересчитаются.",
+          '<a class="btn primary" href="/orders">Открыть заказы</a>');
+      } else {
+        msg = emptyState("Заказывать пока нечего", "По текущему темпу продаж всех позиций хватает на весь горизонт планирования.",
+          '<a class="btn" href="/turnover">Открыть оборачиваемость</a>');
+      }
+      tbody.innerHTML = '<tr><td colspan="' + NCOLS + '">' + msg + "</td></tr>";
+      document.getElementById("tfoot").style.display = "none";
       return;
     }
     tbody.innerHTML = arr.map(function (it) {
-      var wosTxt = it.wos === null || it.wos === undefined ? "—" : fmtNum(it.wos, 1);
-      var soonOut = it.wos !== null && it.wos !== undefined && it.wos < 4;
       var open = !!openRows[it.base_name];
-      return "<tr data-base='" + esc(it.base_name) + "'>" +
+      var crit = it._band === "r";
+      return "<tr data-base='" + esc(it.base_name) + "'" + (crit ? " class='row-crit'" : "") + ">" +
         '<td><input type="checkbox" class="row-check" data-base="' + esc(it.base_name) + '"' + (it._checked ? " checked" : "") + "></td>" +
-        '<td><button class="expander' + (open ? " open" : "") + '" data-base="' + esc(it.base_name) + '" title="Размерная сетка">' + SVG_CHEVRON + "</button></td>" +
+        '<td><button class="expander' + (open ? " open" : "") + '" data-base="' + esc(it.base_name) + '" title="Размерная сетка и формула расчёта">' + SVG_CHEVRON + "</button></td>" +
         '<td class="name-cell"><div class="name-main">' + esc(it.base_name) + '</div><div class="name-sub">' + esc(it.category || "") + "</div></td>" +
         "<td>" + clsDot(it.cls) + "</td>" +
+        "<td>" + stBadge(it.wos) + "</td>" +
         '<td class="num">' + fmtInt(it.turnover) + "</td>" +
         '<td class="num muted">' + fmtNum(it.rate, 2) + "</td>" +
         '<td class="num' + ((it.cs || 0) === 0 ? " txt-red" : "") + '">' + fmtInt(it.cs) + "</td>" +
         '<td class="num' + ((it.ordered || 0) > 0 ? "" : " muted") + '">' + fmtInt(it.ordered || 0) + "</td>" +
-        '<td class="num' + (soonOut ? " txt-red" : "") + '">' + wosTxt + "</td>" +
-        "<td" + (soonOut ? ' class="txt-red"' : "") + ">" + fmtDate(it.stockout_date) + "</td>" +
-        '<td class="num"><b style="font-size:14px;">' + fmtInt(it._need) + "</b></td>" +
+        '<td class="num">' + covBar(it.wos) + "</td>" +
+        "<td>" + stockoutCell(it.stockout_date, it.wos) + "</td>" +
+        '<td class="num"><span class="need' + (crit ? " r" : "") + '">' + fmtInt(it._need) + " шт</span></td>" +
         "</tr>" +
-        (open ? "<tr class='expand-row'><td colspan='11' style='padding:0;'><div class='sub-panel'>" + calcFormula(it) + sizeRows(it) + "</div></td></tr>" : "");
+        (open ? "<tr class='expand-row'><td colspan='" + NCOLS + "' style='padding:0;'><div class='sub-panel'>" + calcFormula(it) + sizeRows(it) + "</div></td></tr>" : "");
     }).join("");
 
     tbody.querySelectorAll(".expander").forEach(function (btn) {
@@ -237,12 +362,27 @@ document.addEventListener("DOMContentLoaded", function () {
         if (String(v) !== inp.value && inp.value !== "") inp.value = v;
         it._recs[inp.getAttribute("data-size")] = v;
         recalcNeed(it);
-        var row = tbody.querySelector("tr[data-base='" + CSS.escape(it.base_name) + "'] td:last-child b");
-        if (row) row.textContent = fmtInt(it._need);
+        var pill = tbody.querySelector("tr[data-base='" + CSS.escape(it.base_name) + "'] .need");
+        if (pill) pill.textContent = fmtInt(it._need) + " шт";
         updateSummary();
+        renderTotals(visibleItems());
       });
     });
     syncCheckAll();
+    renderTotals(arr);
+  }
+
+  function renderTotals(arr) {
+    var turn = 0, cs = 0, ordered = 0, need = 0;
+    arr.forEach(function (it) {
+      turn += it.turnover || 0; cs += it.cs || 0; ordered += it.ordered || 0; need += it._need || 0;
+    });
+    document.getElementById("tfoot").style.display = "";
+    document.getElementById("f-count").textContent = "ИТОГО: " + fmtInt(arr.length) + " " + plural(arr.length, "позиция", "позиции", "позиций");
+    document.getElementById("f-turnover").textContent = fmtInt(turn) + " ₽/день";
+    document.getElementById("f-cs").textContent = fmtInt(cs);
+    document.getElementById("f-ordered").textContent = ordered ? fmtInt(ordered) : "—";
+    document.getElementById("f-need").textContent = fmtInt(need) + " шт";
   }
 
   function findItem(base) {
@@ -261,11 +401,22 @@ document.addEventListener("DOMContentLoaded", function () {
       cost += it._need * (it.cost_price || 0);
       rev += it._need * (it.avg_price || 0);
     });
-    document.getElementById("s-pos").textContent = fmtInt(sel.length);
+    document.getElementById("s-pos").innerHTML = fmtInt(sel.length) + "<small>из " + fmtInt(items.length + EXCLUDED_COUNT) + "</small>";
     document.getElementById("s-qty").textContent = fmtInt(qty);
-    document.getElementById("s-cost").textContent = "~" + fmtMoney(cost);
-    document.getElementById("s-rev").textContent = fmtMoney(rev);
+    document.getElementById("s-cost").innerHTML = fmtMoneyShort(cost);
+    document.getElementById("s-rev").innerHTML = fmtMoneyShort(rev);
+    document.getElementById("s-rev-sub").innerHTML = cost > 0
+      ? '<span class="trend up">×' + fmtNum(rev / cost, 1) + "</span> к себестоимости"
+      : "при продаже по средней цене";
     document.getElementById("btn-create-order").disabled = sel.length === 0;
+  }
+
+  /** 1 940 000 -> «1,94<small>млн ₽</small>» для KPI-плиток */
+  function fmtMoneyShort(n) {
+    if (n === null || n === undefined || isNaN(n)) return "—";
+    if (Math.abs(n) >= 1e6) return fmtNum(n / 1e6, 2) + "<small>млн ₽</small>";
+    if (Math.abs(n) >= 1e4) return fmtInt(n / 1e3) + "<small>тыс ₽</small>";
+    return fmtInt(n) + "<small>₽</small>";
   }
 
   function syncCheckAll() {
@@ -286,22 +437,33 @@ document.addEventListener("DOMContentLoaded", function () {
     var card = document.getElementById("excluded-card");
     card.style.display = "";
     document.getElementById("excluded-title").textContent = "Не требуют заказа (" + excluded.length + ")";
+    var leg = document.getElementById("excluded-legend");
+    leg.style.display = "";
+    leg.innerHTML = "Ещё " + fmtInt(excluded.length) + " " + plural(excluded.length, "позиция", "позиции", "позиций") +
+      ' не требуют заказа — <a href="#" id="excluded-link">показать</a>';
     document.getElementById("excluded-box").innerHTML =
       '<table class="tbl"><thead><tr><th>Позиция</th><th>Причина</th></tr></thead><tbody>' +
       excluded.map(function (e) {
         return "<tr><td class='name-cell'>" + esc(e.base_name) + "</td><td class='muted'>" + esc(e.reason) + "</td></tr>";
       }).join("") + "</tbody></table>";
-    document.getElementById("btn-toggle-excluded").addEventListener("click", function () {
+    function toggleExcluded(forceShow) {
       var box = document.getElementById("excluded-box");
-      var show = box.style.display === "none";
+      var show = forceShow || box.style.display === "none";
       box.style.display = show ? "" : "none";
-      this.textContent = show ? "Скрыть" : "Показать";
+      document.getElementById("btn-toggle-excluded").textContent = show ? "Скрыть" : "Показать";
+    }
+    document.getElementById("btn-toggle-excluded").addEventListener("click", function () { toggleExcluded(); });
+    document.getElementById("excluded-link").addEventListener("click", function (e) {
+      e.preventDefault();
+      toggleExcluded(true);
+      card.scrollIntoView({ behavior: "smooth", block: "start" });
     });
   }
 
   // Поиск и сортировка
   document.getElementById("search").addEventListener("input", debounce(function (e) {
     state.query = e.target.value.trim();
+    syncSegUI();
     renderTable();
   }, 150));
   initSortHeaders(document.getElementById("thead"), state, renderTable);

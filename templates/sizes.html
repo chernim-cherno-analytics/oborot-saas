@@ -198,7 +198,7 @@ document.addEventListener("DOMContentLoaded", function () {
 
     var sumStock = d.sizes.reduce(function (a, s) { return a + s.order_stock; }, 0);
     var sumPure = d.sizes.reduce(function (a, s) { return a + s.order_pure; }, 0);
-    rows += '<tr style="font-weight:700;background:#f6f7f9;"><td>Итого</td>' +
+    rows += '<tr style="font-weight:700;background:#f6f7f9;"><td>ИТОГО</td>' +
       '<td class="num">' + fmtInt(d.totals.sold_period) + "</td>" +
       '<td class="num">100 %</td>' +
       '<td class="num">' + fmtInt(d.totals.stock) + "</td>" +

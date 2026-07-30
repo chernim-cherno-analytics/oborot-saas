@@ -102,7 +102,7 @@ document.addEventListener("DOMContentLoaded", function () {
     var box = document.getElementById("chart-box");
     if (!weeks.length) { box.innerHTML = '<div class="loading-stub">Нет данных</div>'; return; }
     var W = Math.max(box.clientWidth || 900, 600), H = 260;
-    var padL = 8, padR = 84, padT = 12, padB = 26;
+    var padL = 34, padR = 84, padT = 12, padB = 26;
     var maxV = Math.max.apply(null, weeks.map(function (w) { return w.stock_value; })) * 1.05 || 1;
     var n = weeks.length;
     var x = function (i) { return padL + i * (W - padL - padR) / (n - 1); };

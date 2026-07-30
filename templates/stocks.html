@@ -167,7 +167,7 @@ document.addEventListener("DOMContentLoaded", function () {
     });
     var tfoot = document.getElementById("tfoot");
     tfoot.style.display = "";
-    tfoot.innerHTML = "<tr><td></td><td>Итого: " + fmtInt(arr.length) + " поз.</td>" +
+    tfoot.innerHTML = "<tr><td></td><td>ИТОГО: " + fmtInt(arr.length) + " поз.</td>" +
       totals.map(function (t) { return '<td class="num">' + fmtInt(t) + "</td>"; }).join("") +
       '<td class="num">' + fmtInt(grand) + "</td></tr>";
   }

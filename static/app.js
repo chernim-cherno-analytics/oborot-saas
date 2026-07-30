@@ -61,15 +61,82 @@ function esc(s) {
     .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
 
-/* Классы оборачиваемости */
-var CLS_LABELS = { weak: "Слабый", dull: "Унылый", good: "Хороший", best: "Бестселлер" };
+/* Классы позиций: буквы в квадратиках A/B/C/D (легенда — тултипом) */
+var CLS_LABELS = { weak: "Слабый", dull: "Медленный", good: "Хороший", best: "Бестселлер" };
+var CLS_LETTER = { best: "A", good: "B", dull: "C", weak: "D" };
+var CLS_TIP = {
+  best: "Класс A — бестселлер: оборачиваемость от 5 тыс ₽/день",
+  good: "Класс B — хороший: 2–5 тыс ₽/день",
+  dull: "Класс C — медленный: 1–2 тыс ₽/день",
+  weak: "Класс D — слабый: до 1 тыс ₽/день"
+};
 function clsDot(cls) {
   var c = CLS_LABELS[cls] ? cls : "weak";
-  return '<span class="cls-badge" title="' + esc(CLS_LABELS[c]) + '"><span class="dot ' + c + '"></span></span>';
+  return '<span class="clsq ' + c + '" title="' + esc(CLS_TIP[c]) + '">' + CLS_LETTER[c] + "</span>";
 }
 function clsBadge(cls) {
   var c = CLS_LABELS[cls] ? cls : "weak";
-  return '<span class="cls-badge"><span class="dot ' + c + '"></span>' + CLS_LABELS[c] + "</span>";
+  return '<span class="cls-badge">' + clsDot(c) + CLS_LABELS[c] + "</span>";
+}
+
+/* ---------- Язык статусов «Штаба»: СРОЧНО / СКОРО / ПЛАН ---------- */
+
+/** Полоса статуса по неделям покрытия: 'r' (<2 нед), 'y' (<4), 'g' (остальное/нет данных) */
+function wosBand(wos) {
+  if (wos === null || wos === undefined || isNaN(wos)) return "g";
+  if (wos < 2) return "r";
+  if (wos < 4) return "y";
+  return "g";
+}
+var BAND_LABELS = { r: "СРОЧНО", y: "СКОРО", g: "ПЛАН" };
+var BAND_TIPS = {
+  r: "Срочно: покрытие меньше 2 недель",
+  y: "Скоро: покрытие 2–4 недели",
+  g: "План: покрытие больше 4 недель"
+};
+
+/** Плашка статуса СРОЧНО/СКОРО/ПЛАН по wos */
+function stBadge(wos) {
+  var b = wosBand(wos);
+  return '<span class="st ' + b + '" title="' + esc(BAND_TIPS[b]) + '">' + BAND_LABELS[b] + "</span>";
+}
+
+/** Покрытие: мини-прогресс-бар (цвет по статусу) + число недель. 12 нед = полная шкала. */
+function covBar(wos) {
+  if (wos === null || wos === undefined || isNaN(wos)) {
+    return '<span class="covbar"><span class="val muted">—</span></span>';
+  }
+  var b = wosBand(wos);
+  var pct = Math.max(4, Math.min(100, Math.round(wos / 12 * 100)));
+  return '<span class="covbar" title="' + esc(BAND_TIPS[b]) + '">' +
+    '<span class="track"><span class="fill ' + b + '" style="width:' + pct + '%;"></span></span>' +
+    '<span class="val ' + b + '">' + fmtNum(wos, 1) + "</span></span>";
+}
+
+/** Ячейка стокаута: дата + «через N дней/недель» */
+function stockoutCell(iso, wos) {
+  if (!iso) return '<span class="muted">—</span>';
+  var d = new Date(iso);
+  var days = Math.round((d.getTime() - Date.now()) / 86400000);
+  var inTxt = "";
+  if (!isNaN(days)) {
+    if (days <= 0) inTxt = "остаток исчерпан";
+    else inTxt = days < 42 ? "через " + fmtInt(days) + " " + plural(days, "день", "дня", "дней")
+                           : "через " + fmtInt(Math.round(days / 7)) + " " + plural(Math.round(days / 7), "неделю", "недели", "недель");
+  }
+  var red = wosBand(wos) === "r";
+  return '<span class="dt' + (red ? " r" : "") + '">' + fmtDate(iso) + "</span>" +
+    (inTxt ? '<div class="dt-in">' + inTxt + "</div>" : "");
+}
+
+/** Русские множественные формы: plural(5, "день", "дня", "дней") */
+function plural(n, one, few, many) {
+  n = Math.abs(n) % 100;
+  var n1 = n % 10;
+  if (n > 10 && n < 20) return many;
+  if (n1 > 1 && n1 < 5) return few;
+  if (n1 === 1) return one;
+  return many;
 }
 
 /* ---------- Поиск и сортировка ---------- */
@@ -221,11 +288,116 @@ function api(url, opts) {
 
 /* ---------- Оболочка приложения ---------- */
 
+/** Тихий fetch JSON без тостов (для фоновых данных оболочки). null при любой ошибке. */
+function hqFetchJson(url) {
+  return fetch(url, { credentials: "same-origin" }).then(function (r) {
+    if (!r.ok) return null;
+    return r.json();
+  }).catch(function () { return null; });
+}
+
+/** Кэш в sessionStorage с TTL (мс). fn() -> Promise<data>. */
+function hqCached(key, ttl, fn) {
+  try {
+    var raw = sessionStorage.getItem(key);
+    if (raw) {
+      var obj = JSON.parse(raw);
+      if (obj && Date.now() - obj.t < ttl) return Promise.resolve(obj.v);
+    }
+  } catch (e) { /* ignore */ }
+  return fn().then(function (v) {
+    try { sessionStorage.setItem(key, JSON.stringify({ t: Date.now(), v: v })); } catch (e) { /* ignore */ }
+    return v;
+  });
+}
+
+/** Счётчик срочных позиций (wos < 2 нед) из /api/replenish — для бейджа в меню и плитки риска. */
+function hqUrgentStats() {
+  return hqCached("hq_urgent_v1", 60000, function () {
+    return hqFetchJson("/api/replenish").then(function (d) {
+      if (!d || !d.items) return null;
+      var urgent = 0;
+      d.items.forEach(function (it) { if (wosBand(it.wos) === "r") urgent++; });
+      return { urgent: urgent, toOrder: d.items.length };
+    });
+  });
+}
+
+/** Красный бейдж-счётчик у пункта «Что заказать» */
+function setNavPip(n) {
+  var pip = document.getElementById("nav-pip-replenish");
+  if (!pip) return;
+  if (n > 0) { pip.textContent = n; pip.style.display = ""; }
+  else pip.style.display = "none";
+}
+
+var WEEKDAYS_SHORT = ["Вс", "Пн", "Вт", "Ср", "Чт", "Пт", "Сб"];
+var MONTHS_GEN = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября", "ноября", "декабря"];
+
+function hqSyncText(iso) {
+  var d = new Date(iso);
+  if (isNaN(d.getTime())) return "";
+  var now = new Date();
+  var hm = ("0" + d.getHours()).slice(-2) + ":" + ("0" + d.getMinutes()).slice(-2);
+  if (d.toDateString() === now.toDateString()) return "сегодня в " + hm;
+  var y = new Date(now.getTime() - 86400000);
+  if (d.toDateString() === y.toDateString()) return "вчера в " + hm;
+  return fmtDate(iso);
+}
+
+function hqBootShell() {
+  if (!document.querySelector(".sidebar")) return; // auth/onboarding — без оболочки
+
+  // Дата в шапке: «Ср, 30 июля 2026 · 10:42»
+  var dateEl = document.getElementById("topbar-date");
+  if (dateEl) {
+    var now = new Date();
+    dateEl.textContent = WEEKDAYS_SHORT[now.getDay()] + ", " + now.getDate() + " " +
+      MONTHS_GEN[now.getMonth()] + " " + now.getFullYear() + " · " +
+      ("0" + now.getHours()).slice(-2) + ":" + ("0" + now.getMinutes()).slice(-2);
+  }
+
+  // Бейдж срочных в меню
+  hqUrgentStats().then(function (s) { if (s) setNavPip(s.urgent); });
+
+  // Статус источника: пилюля в шапке + строка внизу сайдбара
+  hqCached("hq_conn_v1", 60000, function () {
+    return hqFetchJson("/api/settings").then(function (d) {
+      return d && d.connection ? d.connection : null;
+    });
+  }).then(function (conn) {
+    var side = document.getElementById("side-sync");
+    var pill = document.getElementById("live-pill");
+    var pillText = document.getElementById("live-pill-text");
+    if (!conn) {
+      if (side) side.innerHTML = '<span style="color:#e89312;">●</span> Источник не подключён';
+      return;
+    }
+    var name = conn.kind === "demo" ? "Демо-данные" : "МойСклад";
+    var syncTxt = conn.last_sync_at ? hqSyncText(conn.last_sync_at) : "ожидается";
+    if (side) {
+      side.innerHTML = '<span class="ok">● ' + esc(name) + "</span> · синхронизация<br>" + esc(syncTxt);
+    }
+    if (pill && pillText) {
+      var fresh = true;
+      if (conn.last_sync_at) {
+        var age = Date.now() - new Date(conn.last_sync_at).getTime();
+        fresh = !isNaN(age) && age < 36 * 3600000;
+      }
+      pillText.textContent = fresh ? "Данные актуальны" : "Данные от " + fmtDate(conn.last_sync_at);
+      pill.classList.toggle("stale", !fresh);
+      pill.style.display = "";
+    }
+  });
+}
+
 document.addEventListener("DOMContentLoaded", function () {
   // Даты, отрендеренные сервером как ISO — форматируем на клиенте
   document.querySelectorAll("[data-fmt-date]").forEach(function (el) {
     el.textContent = fmtDate(el.getAttribute("data-fmt-date"));
   });
+
+  hqBootShell();
 
   // Меню пользователя
   var chip = document.getElementById("user-chip");

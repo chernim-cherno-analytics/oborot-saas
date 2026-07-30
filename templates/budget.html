@@ -38,8 +38,8 @@
         <tr>
           <th>Позиция</th>
           <th style="width:56px;">Класс</th>
-          <th class="num" title="Нетто-выручка ₽ в день в стоке — как на /turnover">Оборач., ₽/день</th>
-          <th class="num" title="Честный темп продаж">Темп, шт/мес</th>
+          <th class="num" title="Оборачиваемость: нетто-выручка ₽ в день в стоке — как на «Оборачиваемости»">Оборач.</th>
+          <th class="num" title="Честный темп продаж, шт в месяц">Темп/мес</th>
           <th class="num" title="Остаток + едет к нам">Остаток+едет</th>
           <th class="num" title="На сколько дней хватит текущего запаса">Запас, дн</th>
           <th class="num" title="Темп × горизонт − остаток − едет">Потребность</th>
@@ -220,7 +220,7 @@ document.addEventListener("DOMContentLoaded", function () {
           "</tr>";
       }).join("");
       document.getElementById("tfoot").style.display = "";
-      document.getElementById("f-count").textContent = "Итого: " + fmtInt(d.items.length) + " поз.";
+      document.getElementById("f-count").textContent = "ИТОГО: " + fmtInt(d.items.length) + " поз.";
       document.getElementById("f-qty").textContent = fmtInt(d.totals.units);
       document.getElementById("f-total").textContent = fmtMoney(d.used);
       document.getElementById("f-profit").textContent = fmtMoney(d.totals.expected_profit);

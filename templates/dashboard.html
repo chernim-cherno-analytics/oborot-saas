@@ -1,7 +1,13 @@
 {% extends "base.html" %}
 {% block content %}
 
-<div class="metric-grid" id="metrics">
+<div class="metric-grid" id="metrics" style="grid-template-columns:1.25fr 1fr 1fr 1fr 1fr;">
+  <div class="metric alert" id="risk-tile">
+    <div class="m-label">Риск стокаута</div>
+    <div class="m-value" id="m-risk">—</div>
+    <div class="m-sub" id="m-risk-sub">покрытие меньше 2 недель</div>
+    <a class="act" href="/replenish?f=urgent" id="btn-show-urgent" style="display:none;">Показать</a>
+  </div>
   <div class="metric">
     <div class="m-label">Деньги в стоке (розница)</div>
     <div class="m-value" id="m-retail">—</div>
@@ -53,10 +59,10 @@
     <div class="card-head"><h2>Классы оборачиваемости</h2></div>
     <div class="card-body">
       <div style="display:grid; grid-template-columns:repeat(4,1fr); gap:10px;" id="classes-box">
-        <div class="cls-tile weak"><div class="ct-num" id="cls-weak">—</div><div class="ct-label">Слабые</div><div class="ct-sub">до 1&nbsp;тыс&nbsp;₽/день</div></div>
-        <div class="cls-tile dull"><div class="ct-num" id="cls-dull">—</div><div class="ct-label">Медленные</div><div class="ct-sub">1–2&nbsp;тыс&nbsp;₽/день</div></div>
-        <div class="cls-tile good"><div class="ct-num" id="cls-good">—</div><div class="ct-label">Хорошие</div><div class="ct-sub">2–5&nbsp;тыс&nbsp;₽/день</div></div>
-        <div class="cls-tile best"><div class="ct-num" id="cls-best">—</div><div class="ct-label">Бестселлеры</div><div class="ct-sub">от 5&nbsp;тыс&nbsp;₽/день</div></div>
+        <div class="cls-tile best" title="Класс A — бестселлер"><div class="ct-num" id="cls-best">—</div><div class="ct-label">A · Бестселлеры</div><div class="ct-sub">от 5&nbsp;тыс&nbsp;₽/день</div></div>
+        <div class="cls-tile good" title="Класс B — хороший"><div class="ct-num" id="cls-good">—</div><div class="ct-label">B · Хорошие</div><div class="ct-sub">2–5&nbsp;тыс&nbsp;₽/день</div></div>
+        <div class="cls-tile dull" title="Класс C — медленный"><div class="ct-num" id="cls-dull">—</div><div class="ct-label">C · Медленные</div><div class="ct-sub">1–2&nbsp;тыс&nbsp;₽/день</div></div>
+        <div class="cls-tile weak" title="Класс D — слабый"><div class="ct-num" id="cls-weak">—</div><div class="ct-label">D · Слабые</div><div class="ct-sub">до 1&nbsp;тыс&nbsp;₽/день</div></div>
       </div>
       <p style="margin:12px 0 0; font-size:12px; color:var(--text-faint);">
         Число позиций в каждом классе. Пороги настраиваются в <a href="/settings">настройках</a>.
@@ -77,6 +83,33 @@
 {% block scripts %}
 <script>
 document.addEventListener("DOMContentLoaded", function () {
+  // Красная плитка риска: срочные позиции (wos < 2 нед) из /api/replenish
+  hqUrgentStats().then(function (s) {
+    var tile = document.getElementById("risk-tile");
+    var val = document.getElementById("m-risk");
+    var sub = document.getElementById("m-risk-sub");
+    var btn = document.getElementById("btn-show-urgent");
+    if (!s) {
+      tile.className = "metric";
+      tile.querySelector(".m-label").textContent = "Риск стокаута";
+      val.textContent = "—";
+      sub.textContent = "нет данных";
+      return;
+    }
+    setNavPip(s.urgent);
+    if (s.urgent > 0) {
+      tile.className = "metric alert";
+      val.innerHTML = fmtInt(s.urgent) + "<small>" + plural(s.urgent, "позиция", "позиции", "позиций") + "</small>";
+      sub.textContent = "покрытие меньше 2 недель";
+      btn.style.display = "";
+    } else {
+      tile.className = "metric calm";
+      val.innerHTML = "0<small>позиций</small>";
+      sub.textContent = "стокаутов в ближайшие 2 недели не видно";
+      btn.style.display = "none";
+    }
+  });
+
   api("/api/summary").then(render).catch(function () {
     document.getElementById("alerts-box").innerHTML =
       emptyState("Не удалось загрузить данные", "Обновите страницу или попробуйте позже.",

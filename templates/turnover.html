@@ -4,10 +4,10 @@
 <p class="page-sub">Метрики за скользящие 365 дней. Оборачиваемость — нетто-выручка в расчёте на день, когда товар был в наличии.</p>
 
 <div class="metric-grid" style="grid-template-columns:repeat(4, 1fr);" id="cls-strip">
-  <div class="metric"><div class="m-label"><span class="dot weak"></span>&nbsp; Слабые</div><div class="m-value" id="cnt-weak">—</div><div class="m-sub">&lt; 1 000 ₽/день</div></div>
-  <div class="metric"><div class="m-label"><span class="dot dull"></span>&nbsp; Медленные</div><div class="m-value" id="cnt-dull">—</div><div class="m-sub">1 000 – 2 000 ₽/день</div></div>
-  <div class="metric"><div class="m-label"><span class="dot good"></span>&nbsp; Хорошие</div><div class="m-value" id="cnt-good">—</div><div class="m-sub">2 000 – 5 000 ₽/день</div></div>
-  <div class="metric"><div class="m-label"><span class="dot best"></span>&nbsp; Бестселлеры</div><div class="m-value" id="cnt-best">—</div><div class="m-sub">≥ 5 000 ₽/день</div></div>
+  <div class="metric"><div class="m-label"><span class="clsq best" style="width:18px;height:18px;font-size:10px;vertical-align:-4px;">A</span>&nbsp; Бестселлеры</div><div class="m-value" id="cnt-best">—</div><div class="m-sub">≥ 5 000 ₽/день</div></div>
+  <div class="metric"><div class="m-label"><span class="clsq good" style="width:18px;height:18px;font-size:10px;vertical-align:-4px;">B</span>&nbsp; Хорошие</div><div class="m-value" id="cnt-good">—</div><div class="m-sub">2 000 – 5 000 ₽/день</div></div>
+  <div class="metric"><div class="m-label"><span class="clsq dull" style="width:18px;height:18px;font-size:10px;vertical-align:-4px;">C</span>&nbsp; Медленные</div><div class="m-value" id="cnt-dull">—</div><div class="m-sub">1 000 – 2 000 ₽/день</div></div>
+  <div class="metric"><div class="m-label"><span class="clsq weak" style="width:18px;height:18px;font-size:10px;vertical-align:-4px;">D</span>&nbsp; Слабые</div><div class="m-value" id="cnt-weak">—</div><div class="m-sub">&lt; 1 000 ₽/день</div></div>
 </div>
 
 <div class="card">
@@ -36,7 +36,7 @@
           <th class="num" data-sort="nq" title="Нетто продано, шт (минус возвраты)">Продано, шт</th>
           <th class="num" data-sort="nr" title="Нетто-выручка за 365 дней">Выручка, ₽</th>
           <th class="num" data-sort="turnover">Оборач., ₽/день</th>
-          <th class="num" data-sort="avg_price" title="Средняя фактическая цена против номинала">Ср. цена / номинал</th>
+          <th class="num" data-sort="avg_price" title="Средняя фактическая цена продажи против номинала">Цена/номинал</th>
           <th class="num" data-sort="discount_fact" title="Фактическая скидка">Скидка</th>
           <th class="num" data-sort="cs">Остаток</th>
           <th class="num" data-sort="wos" title="Недель покрытия текущим остатком">Покрытие, нед</th>
@@ -136,7 +136,6 @@ document.addEventListener("DOMContentLoaded", function () {
     }
 
     tbody.innerHTML = arr.map(function (it) {
-      var wosTxt = it.wos === null || it.wos === undefined ? "—" : fmtNum(it.wos, 1);
       return "<tr>" +
         '<td class="name-cell"><div class="name-main">' + esc(it.base_name) +
           (it.archived ? ' <span class="badge gray">архив</span>' : "") +
@@ -149,14 +148,14 @@ document.addEventListener("DOMContentLoaded", function () {
         '<td class="num">' + fmtInt(it.avg_price) + ' <span class="muted">/ ' + fmtInt(it.sale_price) + "</span></td>" +
         discountCell(it.discount_fact) +
         '<td class="num' + ((it.cs || 0) === 0 && it.nq > 0 ? " txt-red" : "") + '">' + fmtInt(it.cs) + "</td>" +
-        '<td class="num">' + wosTxt + "</td>" +
+        '<td class="num">' + ((it.cs || 0) > 0 ? covBar(it.wos) : '<span class="muted">—</span>') + "</td>" +
         "</tr>";
     }).join("");
 
     var nq = 0, nr = 0, cs = 0, turn = 0;
     arr.forEach(function (it) { nq += it.nq || 0; nr += it.nr || 0; cs += it.cs || 0; turn += it.turnover || 0; });
     document.getElementById("tfoot").style.display = "";
-    document.getElementById("f-count").textContent = "Итого: " + fmtInt(arr.length) + " поз.";
+    document.getElementById("f-count").textContent = "ИТОГО: " + fmtInt(arr.length) + " поз.";
     document.getElementById("f-nq").textContent = fmtInt(nq);
     document.getElementById("f-nr").textContent = fmtInt(nr);
     document.getElementById("f-turnover").textContent = fmtInt(turn);

@@ -11,7 +11,7 @@
   .disc-40 { background:#ffe3d1; color:#bd4a00; }
   .disc-50 { background:#fdecec; color:#d33338; }
   .disc-60 { background:#e5484d; color:#fff; }
-  .reason-cell { max-width:340px; font-size:12px; color:var(--text-soft); white-space:normal; }
+  .reason-cell { min-width:140px; max-width:340px; font-size:12px; color:var(--text-soft); white-space:normal; }
   .old-price { text-decoration:line-through; color:var(--text-faint); }
 
   /* Печатный прайс для магазинов: на экране скрыт, в печати — только он */
@@ -59,13 +59,13 @@
           <th data-sort="base_name" data-sort-dir="asc">Позиция</th>
           <th data-sort="cls" style="width:56px;">Класс</th>
           <th class="num" data-sort="discount_pct">Скидка</th>
-          <th class="num" data-sort="frozen" title="Остаток × себестоимость (нет себеса — по средней цене продажи, отмечено *)">Заморожено, ₽</th>
+          <th class="num" data-sort="frozen" title="Остаток × себестоимость (нет себеса — по средней цене продажи, отмечено *)">Заморож., ₽</th>
           <th class="num" data-sort="cs">Остаток</th>
           <th class="num" data-sort="stock_days_left" title="Остаток / темп продаж">Запас, дн</th>
-          <th class="num" data-sort="days_since_sale" title="Дней с последней продажи">Без продаж, дн</th>
-          <th class="num" data-sort="turnover" title="Нетто-выручка ₽ в день в стоке">Оборач., ₽/день</th>
+          <th class="num" data-sort="days_since_sale" title="Дней с последней продажи">Без продаж</th>
+          <th class="num" data-sort="turnover" title="Оборачиваемость: нетто-выручка ₽ в день в стоке">Оборач.</th>
           <th class="num" data-sort="new_price" title="Средняя цена → новая цена со скидкой (округление до 10 ₽ вниз, «психологическое»)">Цена → новая</th>
-          <th class="num" data-sort="expected_recovery" title="Остаток × новая цена">Вернёт, ₽</th>
+          <th class="num" data-sort="expected_recovery" title="Остаток × новая цена, ₽">Вернёт</th>
           <th>Почему</th>
         </tr>
       </thead>
@@ -219,7 +219,7 @@ document.addEventListener("DOMContentLoaded", function () {
     var frozen = 0, cs = 0, rec = 0;
     arr.forEach(function (it) { frozen += it.frozen || 0; cs += it.cs || 0; rec += it.expected_recovery || 0; });
     document.getElementById("tfoot").style.display = "";
-    document.getElementById("f-count").textContent = "Итого: " + fmtInt(arr.length) + " поз.";
+    document.getElementById("f-count").textContent = "ИТОГО: " + fmtInt(arr.length) + " поз.";
     document.getElementById("f-frozen").textContent = fmtMoney(frozen);
     document.getElementById("f-cs").textContent = fmtInt(cs);
     document.getElementById("f-recovery").textContent = fmtMoney(rec);
