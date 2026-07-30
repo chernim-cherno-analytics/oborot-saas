@@ -103,6 +103,47 @@
 
   <div class="card">
     <div class="card-head">
+      <h2>Уведомления</h2>
+      <div class="spacer"></div>
+      <button class="btn sm primary" type="button" id="btn-save-notify">Сохранить</button>
+    </div>
+    <div class="card-body" id="notify-box">
+      <p style="margin:0 0 10px; font-size:12px; color:var(--text-soft);" id="notify-instruction">
+        Каждое утро после синхронизации бот пришлёт в Telegram дайджест: продажи за вчера,
+        деньги в стоке и алерты (стокауты бестселлеров, неликвид).
+      </p>
+      <ol style="margin:0 0 14px 18px; padding:0; font-size:12px; color:var(--text-soft);">
+        <li>Откройте чат с ботом <b id="notify-bot-name">@…</b> в Telegram и отправьте ему <code>/start</code>.</li>
+        <li>Узнайте свой chat_id (например, через бота @userinfobot) и вставьте его в поле ниже.</li>
+        <li>Нажмите «Отправить тест» — в чат придёт сообщение «Оборот подключён».</li>
+      </ol>
+      <div class="form-row" style="align-items:flex-end; max-width:520px;">
+        <div class="field" style="flex:1; margin-bottom:0;">
+          <label for="notify-chat-id">Chat ID</label>
+          <input class="input" type="text" id="notify-chat-id" placeholder="Например: 123456789" autocomplete="off">
+        </div>
+        <button class="btn" type="button" id="btn-notify-test" style="margin-bottom:1px;">Отправить тест</button>
+      </div>
+      <div class="form-row" style="margin-top:12px; gap:18px; flex-wrap:wrap;">
+        <label style="display:flex; align-items:center; gap:7px; font-size:13px;">
+          <input type="checkbox" id="notify-enabled"> Уведомления включены
+        </label>
+        <label style="display:flex; align-items:center; gap:7px; font-size:13px;">
+          <input type="checkbox" id="notify-digest"> Ежедневный дайджест
+        </label>
+        <label style="display:flex; align-items:center; gap:7px; font-size:13px;">
+          <input type="checkbox" id="notify-stockout"> Алерты о стокаутах <span class="dot weak"></span>
+        </label>
+        <label style="display:flex; align-items:center; gap:7px; font-size:13px;">
+          <input type="checkbox" id="notify-overstock"> Алерты о неликвиде <span class="dot dull"></span>
+        </label>
+      </div>
+      <div class="hint" id="notify-hint" style="margin-top:8px;"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-head">
       <h2>Команда</h2>
       <div class="spacer"></div>
       <button class="btn sm" type="button" id="btn-invite">Пригласить</button>
@@ -248,6 +289,53 @@ document.addEventListener("DOMContentLoaded", function () {
         '<span class="badge ' + (m.role === "owner" ? "blue" : "gray") + '">' + (ROLE[m.role] || esc(m.role || "")) + "</span></div>";
     }).join("");
   }
+
+  // ── Уведомления (Telegram) ────────────────────────────────────────────────
+  api("/api/notify/settings").then(function (n) {
+    n = n || {};
+    document.getElementById("notify-chat-id").value = n.tg_chat_id || "";
+    document.getElementById("notify-enabled").checked = !!n.tg_enabled;
+    document.getElementById("notify-digest").checked = n.digest_enabled !== false;
+    document.getElementById("notify-stockout").checked = n.alerts_stockout !== false;
+    document.getElementById("notify-overstock").checked = n.alerts_overstock !== false;
+    var nameEl = document.getElementById("notify-bot-name");
+    if (n.bot_name) {
+      nameEl.textContent = "@" + n.bot_name;
+    } else {
+      nameEl.textContent = "@…";
+    }
+    if (!n.bot_configured) {
+      document.getElementById("notify-hint").textContent =
+        "Telegram-бот пока не настроен на сервере — уведомления заработают после настройки OBOROT_TG_BOT_TOKEN.";
+    }
+  }).catch(function () {
+    document.getElementById("notify-box").innerHTML =
+      '<p class="muted" style="margin:0;">Настройки уведомлений доступны только владельцу организации.</p>';
+  });
+
+  document.getElementById("btn-save-notify").addEventListener("click", function () {
+    var btn = this;
+    btn.disabled = true;
+    api("/api/notify/settings", { method: "POST", body: {
+      tg_chat_id: document.getElementById("notify-chat-id").value.trim(),
+      tg_enabled: document.getElementById("notify-enabled").checked,
+      digest_enabled: document.getElementById("notify-digest").checked,
+      alerts_stockout: document.getElementById("notify-stockout").checked,
+      alerts_overstock: document.getElementById("notify-overstock").checked
+    }}).then(function () {
+      toast("Настройки уведомлений сохранены", "success");
+    }).finally(function () { btn.disabled = false; });
+  });
+
+  document.getElementById("btn-notify-test").addEventListener("click", function () {
+    var btn = this;
+    btn.disabled = true;
+    api("/api/notify/test", { method: "POST", body: {
+      tg_chat_id: document.getElementById("notify-chat-id").value.trim()
+    }}).then(function () {
+      toast("Тестовое сообщение отправлено — проверьте Telegram", "success");
+    }).finally(function () { btn.disabled = false; });
+  });
 
   document.getElementById("btn-plan").addEventListener("click", function () {
     toast("Смена тарифа появится после запуска биллинга. Напишите нам — подберём тариф вручную.");

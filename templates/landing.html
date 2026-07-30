@@ -1,0 +1,591 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Оборот — аналитика остатков и заказов на производство для fashion-брендов</title>
+<meta name="description" content="«Оборот» подключается к МойСклад и показывает, что дошить, а что уценить: оборачиваемость по каждой позиции, размерные сетки, готовый заказ на производство. 14 дней бесплатно.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Ccircle cx='12' cy='12' r='11' fill='%232563eb'/%3E%3Cpath d='M12 5a7 7 0 1 0 7 7' fill='none' stroke='white' stroke-width='2.4' stroke-linecap='round'/%3E%3Cpath d='M16 2.6l3.4 2.8-4.1 1.8z' fill='white'/%3E%3C/svg%3E">
+<style>
+  :root{
+    --blue:#2563eb; --blue-dark:#1d4ed8; --blue-soft:#dbeafe;
+    --ink:#0f172a; --ink-2:#334155; --muted:#64748b; --line:#e2e8f0;
+    --bg:#ffffff; --bg-soft:#f6f8fb;
+    --night:#0a0f1e; --night-2:#101a33;
+    --red:#e5484d; --amber:#f5a623; --green:#4cbb17; --green-dark:#1a7a2e;
+    --radius:16px;
+    --shadow-card:0 1px 2px rgba(15,23,42,.05),0 8px 24px rgba(15,23,42,.06);
+    --shadow-pop:0 24px 60px -12px rgba(2,8,32,.45);
+  }
+  *{margin:0;padding:0;box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+    color:var(--ink); background:var(--bg);
+    font-size:16px; line-height:1.6;
+    -webkit-font-smoothing:antialiased; text-rendering:optimizeLegibility;
+  }
+  a{color:inherit;text-decoration:none}
+  .wrap{max-width:1160px;margin:0 auto;padding:0 24px}
+  .num{font-variant-numeric:tabular-nums;font-feature-settings:"tnum"}
+
+  /* ── Кнопки ─────────────────────────────── */
+  .btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;
+    font-weight:600;font-size:16px;line-height:1;border-radius:12px;
+    padding:15px 26px;border:1px solid transparent;cursor:pointer;
+    transition:transform .12s ease, box-shadow .12s ease, background .12s ease;white-space:nowrap}
+  .btn:active{transform:translateY(1px)}
+  .btn-primary{background:var(--blue);color:#fff;box-shadow:0 8px 20px -6px rgba(37,99,235,.55)}
+  .btn-primary:hover{background:var(--blue-dark)}
+  .btn-ghost-dark{background:rgba(255,255,255,.06);color:#fff;border-color:rgba(255,255,255,.22)}
+  .btn-ghost-dark:hover{background:rgba(255,255,255,.12)}
+  .btn-ghost{background:#fff;color:var(--ink);border-color:var(--line)}
+  .btn-ghost:hover{border-color:#c7d2e2;background:var(--bg-soft)}
+  .btn-sm{padding:10px 18px;font-size:14.5px;border-radius:10px}
+  .btn-lg{padding:17px 32px;font-size:17px}
+
+  /* ── Хедер ──────────────────────────────── */
+  .top{position:absolute;top:0;left:0;right:0;z-index:10}
+  .top-inner{display:flex;align-items:center;justify-content:space-between;padding-top:22px;padding-bottom:22px}
+  .logo{display:flex;align-items:center;gap:10px;font-weight:700;font-size:20px;letter-spacing:-.02em;color:#fff}
+  .top-actions{display:flex;align-items:center;gap:10px}
+  .link-login{color:rgba(255,255,255,.85);font-weight:600;font-size:14.5px;padding:10px 14px;border-radius:10px}
+  .link-login:hover{color:#fff;background:rgba(255,255,255,.08)}
+
+  /* ── Хиро ───────────────────────────────── */
+  .hero{
+    background:
+      radial-gradient(900px 480px at 82% -10%, rgba(37,99,235,.38), transparent 60%),
+      radial-gradient(700px 420px at -8% 42%, rgba(29,78,216,.22), transparent 55%),
+      linear-gradient(180deg,var(--night) 0%, var(--night-2) 78%, var(--night) 100%);
+    color:#fff; overflow:hidden; position:relative;
+  }
+  .hero-inner{display:grid;grid-template-columns:minmax(0,1.05fr) minmax(0,1fr);gap:56px;align-items:center;
+    padding-top:150px;padding-bottom:110px}
+  .eyebrow{display:inline-flex;align-items:center;gap:8px;font-size:13.5px;font-weight:600;letter-spacing:.04em;
+    color:#93c5fd;background:rgba(37,99,235,.16);border:1px solid rgba(147,197,253,.25);
+    padding:7px 14px;border-radius:999px;margin-bottom:22px}
+  h1{font-size:clamp(34px,4.6vw,54px);line-height:1.08;letter-spacing:-.03em;font-weight:800;margin-bottom:22px}
+  h1 .accent{color:#7fb0ff}
+  .hero-sub{font-size:19px;line-height:1.6;color:rgba(226,232,240,.85);max-width:33em;margin-bottom:32px}
+  .hero-sub strong{color:#fff;font-weight:600}
+  .hero-cta{display:flex;gap:14px;flex-wrap:wrap;margin-bottom:22px}
+  .hero-note{font-size:14px;color:rgba(148,163,184,.9);display:flex;gap:18px;flex-wrap:wrap}
+  .hero-note span{display:inline-flex;align-items:center;gap:7px}
+  .hero-note svg{flex:none}
+
+  /* ── Мок продукта в хиро ────────────────── */
+  .mock{background:#fff;border-radius:18px;box-shadow:var(--shadow-pop);color:var(--ink);
+    overflow:hidden;transform:rotate(.4deg)}
+  .mock-bar{display:flex;align-items:center;gap:6px;padding:12px 16px;border-bottom:1px solid var(--line);background:#fbfcfe}
+  .mock-dot{width:10px;height:10px;border-radius:50%;background:#e2e8f0}
+  .mock-title{margin-left:10px;font-size:12.5px;font-weight:600;color:var(--muted)}
+  .mock-body{padding:18px 18px 20px}
+  .mock-summary{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px}
+  .chip{font-size:12px;font-weight:600;padding:6px 11px;border-radius:8px;background:var(--bg-soft);border:1px solid var(--line);color:var(--ink-2)}
+  .chip.blue{background:var(--blue-soft);border-color:#bfdbfe;color:var(--blue-dark)}
+  table.mock-t{width:100%;border-collapse:collapse;font-size:13px}
+  .mock-t th{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);font-weight:600;
+    text-align:left;padding:8px 10px;border-bottom:1px solid var(--line)}
+  .mock-t td{padding:9px 10px;border-bottom:1px solid #eef2f7;white-space:nowrap}
+  .mock-t td.r,.mock-t th.r{text-align:right}
+  .mock-t tr:last-child td{border-bottom:none}
+  .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:7px;vertical-align:1px}
+  .dot.best{background:var(--green-dark)} .dot.good{background:var(--green)}
+  .dot.dull{background:var(--amber)} .dot.weak{background:var(--red)}
+  .need{font-weight:700;color:var(--blue-dark)}
+  .warn{color:var(--red);font-weight:600}
+  .mock-foot{display:flex;justify-content:flex-end;margin-top:14px}
+  .mock-btn{font-size:13px;font-weight:600;color:#fff;background:var(--blue);border-radius:9px;padding:9px 16px}
+
+  /* ── Секции ─────────────────────────────── */
+  section{padding:96px 0}
+  .sec-head{max-width:640px;margin:0 auto 56px;text-align:center}
+  .sec-eyebrow{font-size:13px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--blue);margin-bottom:12px}
+  h2{font-size:clamp(28px,3.4vw,40px);line-height:1.15;letter-spacing:-.025em;font-weight:800;margin-bottom:14px}
+  .sec-sub{font-size:17.5px;color:var(--muted)}
+
+  /* ── Шаги ───────────────────────────────── */
+  .steps{display:grid;grid-template-columns:repeat(3,1fr);gap:24px}
+  .step{background:#fff;border:1px solid var(--line);border-radius:var(--radius);padding:30px 28px;box-shadow:var(--shadow-card);position:relative}
+  .step-n{font-size:14px;font-weight:700;color:var(--blue);background:var(--blue-soft);
+    width:36px;height:36px;border-radius:10px;display:flex;align-items:center;justify-content:center;margin-bottom:18px}
+  .step h3{font-size:19px;letter-spacing:-.01em;margin-bottom:10px}
+  .step p{font-size:15px;color:var(--muted)}
+  .step-time{display:inline-block;margin-top:14px;font-size:12.5px;font-weight:600;color:var(--ink-2);
+    background:var(--bg-soft);border:1px solid var(--line);border-radius:999px;padding:5px 12px}
+
+  /* ── Фичи ───────────────────────────────── */
+  .features-sec{background:var(--bg-soft)}
+  .features{display:grid;grid-template-columns:repeat(3,1fr);gap:24px}
+  .feature{background:#fff;border:1px solid var(--line);border-radius:var(--radius);padding:28px;box-shadow:var(--shadow-card);
+    display:flex;flex-direction:column;gap:12px;transition:transform .15s ease, box-shadow .15s ease}
+  .feature:hover{transform:translateY(-3px);box-shadow:0 4px 8px rgba(15,23,42,.05),0 16px 36px rgba(15,23,42,.09)}
+  .f-icon{width:44px;height:44px;border-radius:12px;background:var(--blue-soft);color:var(--blue-dark);
+    display:flex;align-items:center;justify-content:center}
+  .feature h3{font-size:18px;letter-spacing:-.01em}
+  .feature p{font-size:14.5px;color:var(--muted)}
+  .f-demo{margin-top:auto;padding-top:14px}
+  .bar-row{display:flex;align-items:center;gap:8px;font-size:11.5px;color:var(--muted);margin-top:6px}
+  .bar-row .bar{height:8px;border-radius:4px;background:var(--blue-soft);position:relative;overflow:hidden;flex:1}
+  .bar-row .bar i{position:absolute;inset:0;border-radius:4px;background:var(--blue)}
+  .size-pills{display:flex;gap:6px;flex-wrap:wrap}
+  .size-pill{font-size:11.5px;font-weight:600;border:1px solid var(--line);border-radius:7px;padding:4px 9px;color:var(--ink-2);background:#fff}
+  .size-pill.hot{background:var(--blue);border-color:var(--blue);color:#fff}
+  .alert-line{display:flex;align-items:center;gap:8px;font-size:12px;border:1px solid #fecaca;background:#fef2f2;color:#b91c1c;
+    border-radius:9px;padding:8px 10px;font-weight:600}
+  .alert-line.soft{border-color:#fde8c0;background:#fffaf0;color:#b45309}
+  .mini-rows{border:1px solid var(--line);border-radius:10px;overflow:hidden;font-size:12px}
+  .mini-rows>div{display:flex;justify-content:space-between;padding:7px 11px;border-bottom:1px solid #eef2f7;background:#fff}
+  .mini-rows>div:last-child{border-bottom:none}
+  .mini-rows b{font-weight:700}
+
+  /* ── Кейс ───────────────────────────────── */
+  .case{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:56px;align-items:center}
+  .case-quote{font-size:clamp(20px,2.4vw,26px);line-height:1.45;letter-spacing:-.015em;font-weight:600;color:var(--ink);margin-bottom:26px}
+  .case-quote em{color:var(--blue);font-style:normal}
+  .case-meta{display:flex;align-items:center;gap:14px}
+  .case-logo{width:52px;height:52px;border-radius:14px;background:var(--night);color:#fff;display:flex;align-items:center;justify-content:center;
+    font-weight:800;font-size:16px;letter-spacing:.02em}
+  .case-meta b{display:block;font-size:15.5px}
+  .case-meta span{font-size:13.5px;color:var(--muted)}
+  .case-facts{display:grid;gap:14px}
+  .fact{display:flex;gap:16px;background:#fff;border:1px solid var(--line);border-radius:14px;padding:20px 22px;box-shadow:var(--shadow-card)}
+  .fact-ico{flex:none;width:40px;height:40px;border-radius:11px;background:var(--bg-soft);border:1px solid var(--line);
+    display:flex;align-items:center;justify-content:center;color:var(--blue-dark)}
+  .fact b{display:block;font-size:15.5px;margin-bottom:3px}
+  .fact p{font-size:14px;color:var(--muted)}
+
+  /* ── Тарифы ─────────────────────────────── */
+  .pricing-sec{background:var(--bg-soft)}
+  .plans{display:grid;grid-template-columns:repeat(3,1fr);gap:24px;align-items:stretch}
+  .plan{background:#fff;border:1px solid var(--line);border-radius:20px;padding:34px 30px;box-shadow:var(--shadow-card);
+    display:flex;flex-direction:column;position:relative}
+  .plan.hot{border:2px solid var(--blue);box-shadow:0 12px 40px -8px rgba(37,99,235,.28)}
+  .plan-badge{position:absolute;top:-13px;left:50%;transform:translateX(-50%);
+    background:var(--blue);color:#fff;font-size:12px;font-weight:700;letter-spacing:.03em;border-radius:999px;padding:5px 14px}
+  .plan h3{font-size:20px;letter-spacing:-.01em}
+  .plan-for{font-size:13.5px;color:var(--muted);margin:4px 0 20px}
+  .price{display:flex;align-items:baseline;gap:6px;margin-bottom:4px}
+  .price b{font-size:38px;font-weight:800;letter-spacing:-.03em}
+  .price span{font-size:14.5px;color:var(--muted)}
+  .price-note{font-size:12.5px;color:var(--muted);margin-bottom:22px}
+  .plan ul{list-style:none;display:grid;gap:11px;margin-bottom:28px;font-size:14.5px;color:var(--ink-2)}
+  .plan li{display:flex;gap:10px;align-items:flex-start}
+  .plan li svg{flex:none;margin-top:3px;color:var(--blue)}
+  .plan li.soon span{color:var(--muted)}
+  .soon-tag{font-size:11px;font-weight:700;color:var(--amber);border:1px solid #f8dfae;background:#fffaf0;border-radius:6px;padding:1px 7px;margin-left:6px;vertical-align:1px}
+  .plan .btn{margin-top:auto;width:100%}
+  .plans-foot{text-align:center;margin-top:30px;font-size:14.5px;color:var(--muted)}
+
+  /* ── FAQ ────────────────────────────────── */
+  .faq{max-width:760px;margin:0 auto;display:grid;gap:12px}
+  .faq details{background:#fff;border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow-card);overflow:hidden}
+  .faq summary{list-style:none;cursor:pointer;display:flex;justify-content:space-between;align-items:center;gap:16px;
+    padding:20px 24px;font-weight:600;font-size:16.5px}
+  .faq summary::-webkit-details-marker{display:none}
+  .faq summary .pl{flex:none;width:26px;height:26px;border-radius:8px;background:var(--bg-soft);border:1px solid var(--line);
+    display:flex;align-items:center;justify-content:center;color:var(--muted);transition:transform .18s ease}
+  .faq details[open] summary .pl{transform:rotate(45deg);color:var(--blue)}
+  .faq .a{padding:0 24px 22px;font-size:15px;color:var(--muted);max-width:60em}
+
+  /* ── Финальный CTA ──────────────────────── */
+  .final{background:
+      radial-gradient(700px 380px at 50% -20%, rgba(37,99,235,.45), transparent 65%),
+      linear-gradient(180deg,var(--night-2),var(--night));
+    color:#fff;text-align:center;border-radius:0}
+  .final h2{color:#fff}
+  .final p{color:rgba(203,213,225,.9);font-size:17.5px;max-width:34em;margin:0 auto 34px}
+  .final .btn-ghost-dark{margin-left:6px}
+
+  /* ── Футер ──────────────────────────────── */
+  footer{background:var(--night);color:#8ea0bd;padding:44px 0 40px;font-size:13.5px}
+  .foot-grid{display:flex;justify-content:space-between;gap:32px;flex-wrap:wrap;align-items:flex-start}
+  .foot-brand{display:flex;align-items:center;gap:10px;color:#fff;font-weight:700;font-size:17px;margin-bottom:10px}
+  .foot-col p{max-width:30em;line-height:1.7}
+  .foot-links{display:grid;gap:9px}
+  .foot-links a:hover{color:#fff}
+  .foot-bottom{border-top:1px solid rgba(148,163,184,.15);margin-top:34px;padding-top:22px;
+    display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap;color:#64748b;font-size:12.5px}
+
+  /* ── Адаптив ────────────────────────────── */
+  @media (max-width:960px){
+    .hero-inner{grid-template-columns:1fr;padding-top:120px;padding-bottom:80px;gap:44px}
+    .mock{transform:none;max-width:640px}
+    .steps,.features,.plans{grid-template-columns:1fr 1fr}
+    .case{grid-template-columns:1fr;gap:36px}
+    section{padding:76px 0}
+  }
+  @media (max-width:640px){
+    .steps,.features,.plans{grid-template-columns:1fr}
+    .plan.hot{order:-1}
+    h1{font-size:32px}
+    .hero-sub{font-size:17px}
+    .btn-lg{width:100%}
+    .hero-cta{flex-direction:column;align-items:stretch}
+    .hero-cta .btn{width:100%}
+    .top-inner{padding-top:16px;padding-bottom:16px}
+    .top-actions{gap:6px}
+    .link-login{padding:10px 8px}
+    .btn-sm{padding:10px 14px;font-size:14px}
+    .mob-hide{display:none}
+    .mock-t th:nth-child(3),.mock-t td:nth-child(3){display:none}
+    .mock-body{padding:14px 12px 16px}
+    .mock-t{font-size:12.5px}
+    .mock-t th,.mock-t td{padding-left:6px;padding-right:6px}
+    .final .btn{width:100%;margin:0 0 12px}
+    .foot-grid{flex-direction:column}
+  }
+</style>
+</head>
+<body>
+
+<!-- ═══ Хедер ═══ -->
+<header class="top">
+  <div class="wrap top-inner">
+    <a class="logo" href="/">
+      <svg width="28" height="28" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="11" fill="#2563eb"/><path d="M12 5a7 7 0 1 0 7 7" stroke="#fff" stroke-width="2.4" stroke-linecap="round"/><path d="M16 2.6l3.4 2.8-4.1 1.8z" fill="#fff"/></svg>
+      Оборот
+    </a>
+    <nav class="top-actions">
+      <a class="link-login" href="/login">Войти</a>
+      <a class="btn btn-primary btn-sm" href="/register">Попробовать<span class="mob-hide"> бесплатно</span></a>
+    </nav>
+  </div>
+</header>
+
+<!-- ═══ Хиро ═══ -->
+<div class="hero">
+  <div class="wrap hero-inner">
+    <div>
+      <div class="eyebrow">Аналитика для брендов одежды и украшений</div>
+      <h1>Деньги заморожены в&nbsp;неликвиде, а&nbsp;бестселлеры опять кончились?</h1>
+      <p class="hero-sub">«Оборот» подключается к&nbsp;МойСклад и&nbsp;по&nbsp;каждой позиции — вплоть до&nbsp;размера — показывает, <strong>что дошить на&nbsp;производстве, а&nbsp;что пора уценить</strong>. Без выгрузок в&nbsp;таблицы и&nbsp;ручных расчётов.</p>
+      <div class="hero-cta">
+        <a class="btn btn-primary btn-lg" href="/register">Попробовать бесплатно</a>
+        <a class="btn btn-ghost-dark btn-lg" href="/register">Посмотреть демо</a>
+      </div>
+      <div class="hero-note">
+        <span><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#4cbb17" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>Подключение к МойСклад за 10 минут</span>
+        <span><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#4cbb17" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>14 дней бесплатно, карта не нужна</span>
+      </div>
+    </div>
+
+    <!-- стилизованный мок экрана «Что заказать» -->
+    <div class="mock" aria-hidden="true">
+      <div class="mock-bar">
+        <span class="mock-dot"></span><span class="mock-dot"></span><span class="mock-dot"></span>
+        <span class="mock-title">Оборот — Что заказать</span>
+      </div>
+      <div class="mock-body">
+        <div class="mock-summary">
+          <span class="chip blue">Горизонт: 90 дней</span>
+          <span class="chip">К заказу: 14 позиций · 312 шт</span>
+          <span class="chip">Себестоимость ≈ 486 000 ₽</span>
+        </div>
+        <table class="mock-t">
+          <thead><tr>
+            <th>Позиция</th><th class="r">₽/день</th><th class="r">Остаток</th><th class="r">Стокаут</th><th class="r">Заказать</th>
+          </tr></thead>
+          <tbody>
+            <tr><td><span class="dot best"></span>Худи «Скетч»</td><td class="r num">7 420</td><td class="r num">18</td><td class="r num warn">12 авг</td><td class="r num need">64 шт</td></tr>
+            <tr><td><span class="dot best"></span>Серьга 12 мм</td><td class="r num">5 880</td><td class="r num">9</td><td class="r num warn">8 авг</td><td class="r num need">120 шт</td></tr>
+            <tr><td><span class="dot good"></span>Рубашка «Рами»</td><td class="r num">3 140</td><td class="r num">27</td><td class="r num">3 сент</td><td class="r num need">38 шт</td></tr>
+            <tr><td><span class="dot good"></span>Брюки «Токио»</td><td class="r num">2 610</td><td class="r num">31</td><td class="r num">17 сент</td><td class="r num need">22 шт</td></tr>
+            <tr><td><span class="dot dull"></span>Футболка «База»</td><td class="r num">1 480</td><td class="r num">44</td><td class="r num">2 окт</td><td class="r num need">10 шт</td></tr>
+          </tbody>
+        </table>
+        <div class="mock-foot"><span class="mock-btn">Создать заказ на производство</span></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ Как это работает ═══ -->
+<section id="how">
+  <div class="wrap">
+    <div class="sec-head">
+      <div class="sec-eyebrow">Как это работает</div>
+      <h2>От токена до готовых рекомендаций — три шага</h2>
+      <p class="sec-sub">Никаких внедрений, консультантов и выгрузок. Все данные уже есть в вашем МойСклад — «Оборот» превращает их в решения.</p>
+    </div>
+    <div class="steps">
+      <div class="step">
+        <div class="step-n">1</div>
+        <h3>Вставьте токен МойСклад</h3>
+        <p>Токен с доступом только на чтение — создаётся в настройках МойСклад за пару минут. Ничего не устанавливается, ваши процессы не меняются.</p>
+        <span class="step-time">≈ 2 минуты</span>
+      </div>
+      <div class="step">
+        <div class="step-n">2</div>
+        <h3>Система восстановит историю</h3>
+        <p>«Оборот» сам загрузит продажи, возвраты и остатки по складам и восстановит историю движения по каждой позиции и размеру.</p>
+        <span class="step-time">≈ 10 минут, автоматически</span>
+      </div>
+      <div class="step">
+        <div class="step-n">3</div>
+        <h3>Получите рекомендации</h3>
+        <p>Готовая таблица: что заказать на производство, в каких размерах и сколько, что скоро кончится, а что залежалось и просится в уценку.</p>
+        <span class="step-time">Каждый день, без вашего участия</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══ Фичи ═══ -->
+<section class="features-sec" id="features">
+  <div class="wrap">
+    <div class="sec-head">
+      <div class="sec-eyebrow">Возможности</div>
+      <h2>Всё, чтобы склад работал на бренд, а не наоборот</h2>
+      <p class="sec-sub">Метрики, которые владелец бренда обычно считает в таблицах ночами, — здесь считаются сами и всегда актуальны.</p>
+    </div>
+    <div class="features">
+
+      <div class="feature">
+        <div class="f-icon"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 8l-9-5-9 5v8l9 5 9-5z"/><path d="M3 8l9 5 9-5"/><line x1="12" y1="13" x2="12" y2="21"/></svg></div>
+        <h3>Что заказать</h3>
+        <p>Готовый заказ на производство на 90 дней вперёд: сколько штук дошить по каждой позиции — с разбивкой по размерам пропорционально реальным продажам.</p>
+        <div class="f-demo">
+          <div class="mini-rows">
+            <div><span>Худи «Скетч» — S/M/L/XL</span><b class="num">12 / 24 / 20 / 8</b></div>
+            <div><span>Себестоимость заказа</span><b class="num">148 000 ₽</b></div>
+            <div><span>Ожидаемая выручка</span><b class="num">412 000 ₽</b></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="feature">
+        <div class="f-icon"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 17 9 11 13 15 21 7"/><polyline points="15 7 21 7 21 13"/></svg></div>
+        <h3>Оборачиваемость в ₽/день</h3>
+        <p>Главная метрика ассортимента: сколько денег в день приносит каждая позиция. Сразу видно бестселлеры, рабочих лошадок и балласт.</p>
+        <div class="f-demo">
+          <div class="bar-row"><span class="dot best"></span><div class="bar"><i style="width:92%"></i></div><span class="num">7 420 ₽</span></div>
+          <div class="bar-row"><span class="dot good"></span><div class="bar"><i style="width:44%;background:var(--green)"></i></div><span class="num">3 140 ₽</span></div>
+          <div class="bar-row"><span class="dot weak"></span><div class="bar"><i style="width:9%;background:var(--red)"></i></div><span class="num">620 ₽</span></div>
+        </div>
+      </div>
+
+      <div class="feature">
+        <div class="f-icon"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="6" width="18" height="13" rx="2"/><path d="M3 10h18"/><path d="M7 15h4"/></svg></div>
+        <h3>Бюджет закупки</h3>
+        <p>Введите сумму, которую готовы вложить в производство, — система соберёт оптимальный заказ: сначала то, что быстрее всего вернёт деньги.</p>
+        <div class="f-demo">
+          <div class="mini-rows">
+            <div><span>Бюджет</span><b class="num">300 000 ₽</b></div>
+            <div><span>Вошло в заказ</span><b class="num">9 позиций · 186 шт</b></div>
+            <div><span>Потенциал выручки</span><b class="num">840 000 ₽</b></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="feature">
+        <div class="f-icon"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 9-9"/><path d="M12 7v5l3 3"/><path d="M3 5v4h4"/></svg></div>
+        <h3>Прогноз стокаутов</h3>
+        <p>По честному темпу продаж — только за дни, когда товар был в наличии, — система считает дату, когда каждая позиция закончится.</p>
+        <div class="f-demo">
+          <div class="mini-rows">
+            <div><span>Серьга 12 мм</span><b class="num" style="color:var(--red)">через 9 дней</b></div>
+            <div><span>Худи «Скетч»</span><b class="num" style="color:var(--amber)">через 13 дней</b></div>
+            <div><span>Брюки «Токио»</span><b class="num">через 49 дней</b></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="feature">
+        <div class="f-icon"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8a6 6 0 1 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/></svg></div>
+        <h3>Алерты по бестселлерам</h3>
+        <p>Система следит за тем, что приносит деньги: бестселлер подходит к нулю — вы узнаёте заранее, пока ещё успеваете дошить, а не после кассового провала.</p>
+        <div class="f-demo" style="display:grid;gap:8px">
+          <div class="alert-line"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 9v4"/><path d="M12 17h.01"/><path d="M10.3 3.9L1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg>Бестселлер «Скетч»: остаток на 12 дней</div>
+          <div class="alert-line soft"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 8v4l2.5 2.5"/></svg>Пальто «Норд»: 140 дней без продаж</div>
+        </div>
+      </div>
+
+      <div class="feature">
+        <div class="f-icon"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20L20 4"/><path d="M4 20h6"/><path d="M4 20v-6"/><path d="M20 4h-6"/><path d="M20 4v6"/></svg></div>
+        <h3>Размерные сетки по продажам</h3>
+        <p>Не «поровну всех размеров», а как реально покупают: сетка каждой модели строится по её собственной статистике продаж, включая распроданные размеры.</p>
+        <div class="f-demo">
+          <div class="size-pills">
+            <span class="size-pill">S · 14%</span>
+            <span class="size-pill hot">M · 38%</span>
+            <span class="size-pill hot">L · 33%</span>
+            <span class="size-pill">XL · 15%</span>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</section>
+
+<!-- ═══ Кейс ═══ -->
+<section id="case">
+  <div class="wrap case">
+    <div>
+      <div class="sec-eyebrow">Проверено на реальном бренде</div>
+      <p class="case-quote">«Оборот» не придуман в переговорке — он <em>вырос внутри действующего бренда одежды</em> и больше двух лет ежедневно управляет его заказами на производство.</p>
+      <div class="case-meta">
+        <div class="case-logo">CC</div>
+        <div>
+          <b>Chernim Cherno</b>
+          <span>Бренд одежды · Санкт-Петербург, Москва, Париж</span>
+        </div>
+      </div>
+    </div>
+    <div class="case-facts">
+      <div class="fact">
+        <div class="fact-ico"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 21V9l5 3V9l5 3V4h6v17z"/><line x1="4" y1="21" x2="20" y2="21"/></svg></div>
+        <div><b>Собственное производство</b><p>Каждый заказ на пошив — от базовых футболок до верхней одежды — рассчитывается системой, а не «на глаз».</p></div>
+      </div>
+      <div class="fact">
+        <div class="fact-ico"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7l9-4 9 4-9 4-9-4z"/><path d="M3 12l9 4 9-4"/><path d="M3 17l9 4 9-4"/></svg></div>
+        <div><b>Розница, шоурумы и онлайн</b><p>Несколько точек продаж и складов в одной картине — та самая конфигурация, в которой живёт большинство растущих брендов.</p></div>
+      </div>
+      <div class="fact">
+        <div class="fact-ico"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/></svg></div>
+        <div><b>2+ года в ежедневной работе</b><p>Формулы оборачиваемости, размерных сеток и потребности обкатаны на живых деньгах, сезонности и возвратах — не на тестовых данных.</p></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══ Тарифы ═══ -->
+<section class="pricing-sec" id="pricing">
+  <div class="wrap">
+    <div class="sec-head">
+      <div class="sec-eyebrow">Тарифы</div>
+      <h2>Дешевле одной ошибки в заказе на производство</h2>
+      <p class="sec-sub">Каждый тариф — 14 дней бесплатно, без карты. Оплата за год — минус 20%.</p>
+    </div>
+    <div class="plans">
+
+      <div class="plan">
+        <h3>Старт</h3>
+        <p class="plan-for">Навести порядок в остатках</p>
+        <div class="price"><b class="num">4 900 ₽</b><span>/мес</span></div>
+        <p class="price-note num">3 920 ₽/мес при оплате за год</p>
+        <ul>
+          <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span>1 организация МойСклад</span></li>
+          <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span>Остатки по складам с историей</span></li>
+          <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span>Оборачиваемость по каждой позиции</span></li>
+          <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span>Алерты: стокауты и неликвид</span></li>
+        </ul>
+        <a class="btn btn-ghost" href="/register">Начать бесплатно</a>
+      </div>
+
+      <div class="plan hot">
+        <div class="plan-badge">Популярный</div>
+        <h3>Бренд</h3>
+        <p class="plan-for">Управлять заказами на производство</p>
+        <div class="price"><b class="num">9 900 ₽</b><span>/мес</span></div>
+        <p class="price-note num">7 920 ₽/мес при оплате за год</p>
+        <ul>
+          <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span>Всё из тарифа «Старт»</span></li>
+          <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span>Заказы на производство с рекомендациями</span></li>
+          <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span>Размерные сетки по продажам</span></li>
+          <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span>Бюджет закупки: сумма → оптимальный заказ</span></li>
+          <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span>Прогноз стокаутов по каждой позиции</span></li>
+        </ul>
+        <a class="btn btn-primary" href="/register">Начать бесплатно</a>
+      </div>
+
+      <div class="plan">
+        <h3>Про</h3>
+        <p class="plan-for">Для растущих и мультиканальных</p>
+        <div class="price"><b class="num">19 900 ₽</b><span>/мес</span></div>
+        <p class="price-note num">15 920 ₽/мес при оплате за год</p>
+        <ul>
+          <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span>Всё из тарифа «Бренд»</span></li>
+          <li class="soon"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span>Маркетплейсы и Shopify<span class="soon-tag">скоро</span></span></li>
+          <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span>Доступ к API</span></li>
+          <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span>Приоритетная поддержка</span></li>
+        </ul>
+        <a class="btn btn-ghost" href="/register">Начать бесплатно</a>
+      </div>
+
+    </div>
+    <p class="plans-foot">Оплата от юрлица или ИП по счёту. Отмена — в любой момент, без штрафов.</p>
+  </div>
+</section>
+
+<!-- ═══ FAQ ═══ -->
+<section id="faq">
+  <div class="wrap">
+    <div class="sec-head">
+      <div class="sec-eyebrow">Вопросы и ответы</div>
+      <h2>Частые вопросы</h2>
+    </div>
+    <div class="faq">
+      <details>
+        <summary>Насколько безопасно передавать токен МойСклад?<span class="pl">+</span></summary>
+        <div class="a">Токен хранится в зашифрованном виде и используется только для чтения данных: остатки, продажи, возвраты, номенклатура. «Оборот» ничего не записывает в ваш МойСклад и не меняет. Токен можно отозвать в настройках МойСклад в любой момент — доступ прекратится сразу.</div>
+      </details>
+      <details>
+        <summary>Сколько времени занимает подключение?<span class="pl">+</span></summary>
+        <div class="a">Создание токена в МойСклад — пара минут, дальше система работает сама: загружает номенклатуру, продажи и остатки и восстанавливает историю. Обычно через 10–15 минут после регистрации у вас уже готовая аналитика. Ничего устанавливать и настраивать вручную не нужно.</div>
+      </details>
+      <details>
+        <summary>У нас нет МойСклад — можно подключиться?<span class="pl">+</span></summary>
+        <div class="a">Пока «Оборот» работает только с МойСклад — это самая распространённая учётная система у российских fashion-брендов. Интеграции с 1С и прямые подключения маркетплейсов в разработке. Оставьте почту при регистрации — напишем, когда ваша система появится.</div>
+      </details>
+      <details>
+        <summary>Что будет после 14 дней бесплатного периода?<span class="pl">+</span></summary>
+        <div class="a">Вы выбираете тариф и оплачиваете — или просто ничего не делаете, и доступ приостановится. Никаких автосписаний нет: карта при регистрации не запрашивается, скрытых платежей не бывает. Данные сохраняются, вернуться можно в любой момент.</div>
+      </details>
+      <details>
+        <summary>Можно ли отменить подписку?<span class="pl">+</span></summary>
+        <div class="a">Да, в любой момент, без объяснения причин и штрафов. При оплате помесячно доступ действует до конца оплаченного месяца. Свои данные вы можете выгрузить перед уходом.</div>
+      </details>
+      <details>
+        <summary>Как оплатить от юрлица или ИП?<span class="pl">+</span></summary>
+        <div class="a">Стандартно для российского B2B: выставляем счёт, вы оплачиваете с расчётного счёта, получаете закрывающие документы. Работаем по договору-оферте. При оплате за год — скидка 20%.</div>
+      </details>
+    </div>
+  </div>
+</section>
+
+<!-- ═══ Финальный CTA ═══ -->
+<section class="final">
+  <div class="wrap">
+    <h2>Узнайте, что заказать на производство, — уже сегодня</h2>
+    <p>Зарегистрируйтесь, вставьте токен МойСклад — и через 10 минут увидите свой ассортимент так, как его видят цифры. Или начните с демо-данных.</p>
+    <a class="btn btn-primary btn-lg" href="/register">Попробовать бесплатно — 14 дней</a>
+    <a class="btn btn-ghost-dark btn-lg" href="/register">Посмотреть демо</a>
+  </div>
+</section>
+
+<!-- ═══ Футер ═══ -->
+<footer>
+  <div class="wrap">
+    <div class="foot-grid">
+      <div class="foot-col">
+        <div class="foot-brand">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="11" fill="#2563eb"/><path d="M12 5a7 7 0 1 0 7 7" stroke="#fff" stroke-width="2.4" stroke-linecap="round"/><path d="M16 2.6l3.4 2.8-4.1 1.8z" fill="#fff"/></svg>
+          Оборот
+        </div>
+        <p>Аналитика остатков, оборачиваемости и заказов на производство для брендов одежды и украшений. Работает с данными МойСклад.</p>
+      </div>
+      <div class="foot-col foot-links">
+        <a href="/login">Войти</a>
+        <a href="/register">Попробовать бесплатно</a>
+        <a href="#pricing">Тарифы</a>
+        <a href="#faq">Вопросы и ответы</a>
+      </div>
+      <div class="foot-col foot-links">
+        <a href="#">Договор-оферта</a>
+        <a href="#">Политика обработки персональных данных</a>
+        <a href="mailto:hello@oborot.app">hello@oborot.app</a>
+        <a href="#">Telegram: @oborot_support</a>
+      </div>
+    </div>
+    <div class="foot-bottom">
+      <span>© 2026 «Оборот» · ИП Цицилин В. В. · ИНН 000000000000</span>
+      <span>Сделано в Санкт-Петербурге</span>
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>

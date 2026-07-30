@@ -1,0 +1,28 @@
+INFO:     Started server process [24455]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8001 (Press CTRL+C to quit)
+INFO:     127.0.0.1:57592 - "POST /register HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57592 - "GET /api/discounts HTTP/1.1" 401 Unauthorized
+INFO:     127.0.0.1:57592 - "POST /login HTTP/1.1" 303 See Other
+INFO:     127.0.0.1:57592 - "GET / HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57592 - "POST /api/connect/demo HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57592 - "GET /api/discounts HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57602 - "POST /register HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57602 - "GET /api/discounts HTTP/1.1" 401 Unauthorized
+INFO:     127.0.0.1:57602 - "POST /login HTTP/1.1" 303 See Other
+INFO:     127.0.0.1:57602 - "GET / HTTP/1.1" 302 Found
+INFO:     127.0.0.1:57602 - "GET /onboarding HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57602 - "GET /api/discounts HTTP/1.1" 200 OK
+INFO:     127.0.0.1:58630 - "GET /login HTTP/1.1" 200 OK
+INFO:     127.0.0.1:58630 - "GET /static/app.css HTTP/1.1" 200 OK
+INFO:     127.0.0.1:58644 - "GET /static/app.js HTTP/1.1" 200 OK
+INFO:     127.0.0.1:58644 - "POST /login HTTP/1.1" 303 See Other
+INFO:     127.0.0.1:58644 - "GET / HTTP/1.1" 200 OK
+INFO:     127.0.0.1:58644 - "GET /api/summary HTTP/1.1" 200 OK
+INFO:     127.0.0.1:58644 - "GET /discounts HTTP/1.1" 200 OK
+INFO:     127.0.0.1:58644 - "GET /api/discounts HTTP/1.1" 200 OK
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [24455]

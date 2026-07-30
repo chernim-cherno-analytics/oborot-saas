@@ -12,7 +12,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
 
-from app import analytics, analytics_extra, auth
+from app import analytics, analytics_extra, analytics_markdown, auth
 from app.auth import AuthContext, require_auth_api
 from app.db import get_db
 
@@ -64,6 +64,11 @@ def sizes_page(request: Request, db: Session = Depends(get_db)):
     return _authed_page(request, db, "sizes.html", "sizes", "Размеры")
 
 
+@router.get("/discounts", response_class=HTMLResponse)
+def discounts_page(request: Request, db: Session = Depends(get_db)):
+    return _authed_page(request, db, "discounts.html", "discounts", "Скидки")
+
+
 # ── JSON API ─────────────────────────────────────────────────────────────────
 
 @router.get("/api/budget")
@@ -85,6 +90,13 @@ def api_forecast(ctx: AuthContext = Depends(require_auth_api), db: Session = Dep
     """Прогноз распродажи стока: карточки, ряд 26 недель, категории, позиции."""
     snap = analytics.get_snapshot(db, ctx.org)
     return analytics_extra.build_forecast(snap)
+
+
+@router.get("/api/discounts")
+def api_discounts(ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)):
+    """Markdown-рекомендации: что уценить и на сколько (см. analytics_markdown)."""
+    snap = analytics.get_snapshot(db, ctx.org)
+    return analytics_markdown.build_discounts(snap)
 
 
 @router.get("/api/sizes/products")

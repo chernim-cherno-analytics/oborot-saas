@@ -6,16 +6,21 @@ POST /api/connect/moysklad/stores   — выбрать склады (Warehouse-�
 POST /api/sync/initial              — фоновая первичная синхронизация
 POST /api/sync/run                  — инкрементальный синк (остатки+цены+продажи 3 дн.)
 GET  /api/sync/status               — прогресс для онбординга (поллинг)
+GET  /api/notify/settings           — Telegram-настройки + имя бота для инструкции
+POST /api/notify/settings           — сохранить chat_id и флаги уведомлений
+POST /api/notify/test               — тестовое сообщение «Оборот подключён»
 
 Все ручки — только для владельца организации (require_owner_api).
 """
+import html
+
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app import ms_sync
+from app import ms_sync, notify
 from app.auth import AuthContext, require_owner_api
 from app.crypto import decrypt_token, encrypt_token
 from app.db import get_db
@@ -232,3 +237,93 @@ def api_sync_run(
 def api_sync_status(ctx: AuthContext = Depends(require_owner_api)):
     """Состояние синхронизации для онбординга (поллинг раз в 1–2 секунды)."""
     return ms_sync.get_status(ctx.org.id)
+
+
+# ── Telegram-уведомления ─────────────────────────────────────────────────────
+
+def _notify_settings_out(row) -> dict:
+    return {
+        "tg_chat_id": row.tg_chat_id,
+        "tg_enabled": row.tg_enabled,
+        "alerts_stockout": row.alerts_stockout,
+        "alerts_overstock": row.alerts_overstock,
+        "digest_enabled": row.digest_enabled,
+        # для инструкции в настройках: имя бота и признак, что токен задан
+        "bot_name": notify.bot_name(),
+        "bot_configured": bool(notify.bot_token()),
+    }
+
+
+@router.get("/notify/settings")
+def api_notify_settings_get(
+    ctx: AuthContext = Depends(require_owner_api), db: Session = Depends(get_db)
+):
+    """Текущие Telegram-настройки организации (создаёт дефолтные при первом заходе)."""
+    return _notify_settings_out(notify.get_settings(db, ctx.org.id))
+
+
+class NotifySettingsIn(BaseModel):
+    tg_chat_id: str = Field(default="", max_length=64)
+    tg_enabled: bool = False
+    alerts_stockout: bool = True
+    alerts_overstock: bool = True
+    digest_enabled: bool = True
+
+
+@router.post("/notify/settings")
+def api_notify_settings_save(
+    body: NotifySettingsIn,
+    ctx: AuthContext = Depends(require_owner_api),
+    db: Session = Depends(get_db),
+):
+    """Сохраняет chat_id и флаги уведомлений."""
+    chat_id = body.tg_chat_id.strip()
+    if body.tg_enabled and not chat_id:
+        raise HTTPException(
+            status_code=422,
+            detail="Чтобы включить уведомления, укажите chat_id чата с ботом.",
+        )
+    row = notify.get_settings(db, ctx.org.id)
+    row.tg_chat_id = chat_id
+    row.tg_enabled = body.tg_enabled
+    row.alerts_stockout = body.alerts_stockout
+    row.alerts_overstock = body.alerts_overstock
+    row.digest_enabled = body.digest_enabled
+    db.commit()
+    return {"ok": True, **_notify_settings_out(row)}
+
+
+class NotifyTestIn(BaseModel):
+    # chat_id можно передать явно — проверить до сохранения настроек
+    tg_chat_id: str = Field(default="", max_length=64)
+
+
+@router.post("/notify/test")
+def api_notify_test(
+    body: NotifyTestIn | None = None,
+    ctx: AuthContext = Depends(require_owner_api),
+    db: Session = Depends(get_db),
+):
+    """Шлёт тестовое сообщение «Оборот подключён» в указанный/сохранённый чат."""
+    if not notify.bot_token():
+        raise HTTPException(
+            status_code=503,
+            detail="Telegram-бот не настроен на сервере (нет OBOROT_TG_BOT_TOKEN). "
+                   "Напишите в поддержку.",
+        )
+    chat_id = (body.tg_chat_id.strip() if body else "") or \
+        notify.get_settings(db, ctx.org.id).tg_chat_id.strip()
+    if not chat_id:
+        raise HTTPException(
+            status_code=422,
+            detail="Укажите chat_id: создайте чат с ботом, отправьте /start "
+                   "и вставьте свой chat_id в поле выше.",
+        )
+    ok, err = notify.send_message(
+        chat_id,
+        f"✅ <b>Оборот подключён</b>\nОрганизация: {html.escape(ctx.org.name)}\n"
+        "Сюда будет приходить ежедневный дайджест по остаткам и продажам.",
+    )
+    if not ok:
+        raise HTTPException(status_code=502, detail=err)
+    return {"ok": True}

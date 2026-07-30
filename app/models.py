@@ -184,6 +184,23 @@ class SyncState(Base):
             return {}
 
 
+class NotifySettings(Base):
+    """Настройки Telegram-уведомлений организации (аддитивно, для notify.py).
+
+    Бот один на весь сервис (env OBOROT_TG_BOT_TOKEN); org хранит только
+    chat_id своего чата с ботом и флаги, что именно присылать.
+    """
+
+    __tablename__ = "notify_settings"
+
+    org_id: Mapped[int] = mapped_column(ForeignKey("orgs.id"), primary_key=True)
+    tg_chat_id: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    tg_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    alerts_stockout: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    alerts_overstock: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    digest_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+
 class ProductionOrder(Base):
     __tablename__ = "production_orders"
 

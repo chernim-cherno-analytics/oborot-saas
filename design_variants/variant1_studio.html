@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Что заказать — Оборот · Студия</title>
+<style>
+  :root{
+    --paper:#f6efe7;
+    --paper-deep:#efe5d9;
+    --ink:#191512;
+    --ink-soft:#6f655a;
+    --ink-faint:#a2968a;
+    --hairline:#d9ccbd;
+    --hairline-strong:#191512;
+    --accent:#e2400f;          /* киноварь — единственный цветной акцент */
+    --accent-ink:#c53608;
+    --serif:"Georgia","Times New Roman",Times,serif;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI","Helvetica Neue",Arial,sans-serif;
+  }
+  *{box-sizing:border-box;margin:0;padding:0;}
+  html,body{height:100%;}
+  body{
+    background:var(--paper);
+    color:var(--ink);
+    font-family:var(--sans);
+    font-size:14px;
+    line-height:1.5;
+    -webkit-font-smoothing:antialiased;
+    min-width:1280px;
+  }
+  .frame{display:flex;min-height:100vh;}
+
+  /* ---------- Навигация ---------- */
+  .rail{
+    width:232px;min-width:232px;
+    border-right:1px solid var(--hairline);
+    padding:36px 0 28px;
+    display:flex;flex-direction:column;
+    position:fixed;inset:0 auto 0 0;
+    background:var(--paper);
+  }
+  .wordmark{padding:0 32px 40px;}
+  .wordmark .brand{
+    font-family:var(--serif);
+    font-size:21px;letter-spacing:.02em;font-weight:400;
+  }
+  .wordmark .brand i{font-style:normal;color:var(--accent);}
+  .wordmark .org{
+    margin-top:6px;
+    font-size:10px;letter-spacing:.22em;text-transform:uppercase;
+    color:var(--ink-soft);
+  }
+  .rail nav{flex:1;}
+  .rail nav a{
+    display:flex;align-items:baseline;justify-content:space-between;
+    padding:9px 32px;
+    color:var(--ink-soft);
+    text-decoration:none;
+    font-size:13px;letter-spacing:.01em;
+  }
+  .rail nav a:hover{color:var(--ink);}
+  .rail nav a.active{
+    color:var(--ink);
+    font-weight:600;
+    position:relative;
+  }
+  .rail nav a.active::before{
+    content:"";position:absolute;left:0;top:8px;bottom:8px;width:2px;background:var(--accent);
+  }
+  .rail nav a .n{
+    font-family:var(--serif);font-size:11px;color:var(--ink-faint);font-style:italic;
+  }
+  .rail nav a.active .n{color:var(--accent);}
+  .rail .foot{
+    padding:20px 32px 0;border-top:1px solid var(--hairline);margin:20px 0 0;
+    font-size:11px;color:var(--ink-faint);line-height:1.7;
+  }
+  .rail .foot b{display:block;color:var(--ink-soft);font-weight:600;font-size:12px;}
+
+  /* ---------- Полотно ---------- */
+  .canvas{flex:1;margin-left:232px;padding:0 56px 72px;}
+  .masthead{
+    display:flex;align-items:flex-end;justify-content:space-between;
+    padding:34px 0 0;
+  }
+  .kicker{
+    font-size:10px;letter-spacing:.26em;text-transform:uppercase;color:var(--ink-soft);
+  }
+  .kicker em{font-style:normal;color:var(--accent);}
+  .stamp{
+    font-size:10px;letter-spacing:.18em;text-transform:uppercase;color:var(--ink-faint);
+    text-align:right;line-height:1.9;
+  }
+  h1{
+    font-family:var(--serif);
+    font-weight:400;
+    font-size:58px;
+    line-height:1.02;
+    letter-spacing:-.01em;
+    margin:14px 0 10px;
+  }
+  h1 .dot{color:var(--accent);}
+  .lede{
+    max-width:640px;
+    font-size:14px;color:var(--ink-soft);line-height:1.65;
+    margin-bottom:34px;
+  }
+  .lede b{color:var(--ink);font-weight:600;}
+
+  /* ---------- Сводка ---------- */
+  .digest{
+    display:grid;grid-template-columns:1fr 1fr 1fr 1fr auto;
+    border-top:1px solid var(--hairline-strong);
+    border-bottom:1px solid var(--hairline);
+  }
+  .digest .cell{
+    padding:22px 28px 24px 0;
+    border-right:1px solid var(--hairline);
+  }
+  .digest .cell + .cell{padding-left:28px;}
+  .digest .cell:last-child{border-right:0;display:flex;align-items:center;padding-right:0;padding-left:36px;}
+  .digest .label{
+    font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:var(--ink-soft);
+    margin-bottom:8px;white-space:nowrap;
+  }
+  .digest .value{
+    font-family:var(--serif);font-size:34px;line-height:1;font-weight:400;letter-spacing:-.01em;
+  }
+  .digest .value small{font-size:16px;color:var(--ink-soft);letter-spacing:0;margin-left:2px;}
+  .digest .note{font-size:11.5px;color:var(--ink-faint);margin-top:7px;}
+  .digest .note i{font-style:normal;color:var(--accent-ink);font-weight:600;}
+  .cta{
+    display:inline-flex;align-items:center;gap:12px;
+    background:var(--ink);color:var(--paper);
+    font-size:12px;letter-spacing:.14em;text-transform:uppercase;
+    padding:16px 26px;
+    text-decoration:none;
+    white-space:nowrap;
+    transition:background .15s;
+  }
+  .cta:hover{background:var(--accent);}
+  .cta .arr{font-family:var(--serif);font-size:15px;}
+
+  /* ---------- Тулбар ---------- */
+  .toolbar{
+    display:flex;align-items:baseline;gap:28px;
+    padding:26px 0 14px;
+  }
+  .toolbar .filters{display:flex;gap:22px;flex:1;}
+  .toolbar .filters a{
+    font-size:12px;letter-spacing:.12em;text-transform:uppercase;
+    color:var(--ink-faint);text-decoration:none;padding-bottom:3px;
+  }
+  .toolbar .filters a:hover{color:var(--ink);}
+  .toolbar .filters a.on{color:var(--ink);border-bottom:1px solid var(--accent);}
+  .search{
+    font-size:13px;color:var(--ink-faint);
+    border-bottom:1px solid var(--hairline);
+    padding:2px 2px 5px;width:230px;
+    display:flex;justify-content:space-between;align-items:center;
+  }
+  .search span:last-child{font-size:11px;letter-spacing:.08em;}
+
+  /* ---------- Таблица ---------- */
+  table{width:100%;border-collapse:collapse;}
+  thead th{
+    font-size:9.5px;letter-spacing:.18em;text-transform:uppercase;
+    color:var(--ink-soft);font-weight:600;
+    text-align:left;
+    padding:12px 14px 12px 0;
+    border-top:1px solid var(--hairline-strong);
+    border-bottom:1px solid var(--hairline);
+    white-space:nowrap;
+  }
+  thead th.num, td.num{text-align:right;}
+  thead th:last-child, td:last-child{padding-right:0;}
+  tbody td{
+    padding:15px 14px 15px 0;
+    border-bottom:1px solid var(--hairline);
+    font-size:13.5px;
+    vertical-align:baseline;
+  }
+  tbody tr:hover td{background:var(--paper-deep);}
+  td.num{
+    font-variant-numeric:tabular-nums;
+    font-size:13.5px;
+  }
+  .pos .nm{font-family:var(--serif);font-size:16.5px;letter-spacing:.005em;}
+  .pos .cat{font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:var(--ink-faint);margin-top:3px;}
+  .cls{
+    font-family:var(--serif);font-style:italic;font-size:15px;color:var(--ink-soft);
+  }
+  .cls.a{color:var(--accent);font-weight:700;font-style:normal;font-family:var(--sans);font-size:12px;letter-spacing:.1em;}
+  .cls.b,.cls.c{font-family:var(--sans);font-style:normal;font-size:12px;letter-spacing:.1em;color:var(--ink-faint);}
+  .rub{color:var(--ink-faint);font-size:11.5px;margin-left:4px;}
+  .soft{color:var(--ink-soft);}
+  .crit{color:var(--accent-ink);font-weight:600;}
+  .crit-flag{
+    display:inline-block;font-size:9px;letter-spacing:.14em;text-transform:uppercase;
+    color:var(--accent-ink);
+    border:1px solid var(--accent-ink);
+    padding:2px 6px;margin-left:10px;vertical-align:2px;
+  }
+  td.need{font-family:var(--serif);font-size:20px;}
+  td.need small{font-family:var(--sans);font-size:10.5px;color:var(--ink-faint);letter-spacing:.06em;margin-left:3px;}
+  .cover{white-space:nowrap;}
+  .cover .bar{
+    display:inline-block;height:1px;background:var(--ink);vertical-align:4px;margin-right:9px;
+  }
+  .cover.low .bar{background:var(--accent);height:2px;}
+
+  .colophon{
+    display:flex;justify-content:space-between;
+    margin-top:26px;
+    font-size:11px;letter-spacing:.08em;color:var(--ink-faint);
+  }
+  .colophon a{color:var(--ink-soft);text-decoration:underline;text-underline-offset:3px;}
+</style>
+</head>
+<body>
+<div class="frame">
+
+  <aside class="rail">
+    <div class="wordmark">
+      <div class="brand">Оборот<i>.</i></div>
+      <div class="org">Chernim&nbsp;Cherno</div>
+    </div>
+    <nav>
+      <a href="#">Показатели</a>
+      <a href="#" class="active">Что заказать <span class="n">11</span></a>
+      <a href="#">Оборачиваемость</a>
+      <a href="#">Бюджет</a>
+      <a href="#">Прогноз</a>
+      <a href="#">Размеры</a>
+      <a href="#">Скидки</a>
+      <a href="#">Остатки</a>
+      <a href="#">Заказы</a>
+      <a href="#">Настройки</a>
+    </nav>
+    <div class="foot">
+      <b>Влад Цицилин</b>
+      Синхронизация с МойСклад<br>сегодня, 07:00
+    </div>
+  </aside>
+
+  <main class="canvas">
+    <div class="masthead">
+      <div class="kicker">Заказ на производство <em>·</em> горизонт 90 дней</div>
+      <div class="stamp">Среда, 30 июля 2026<br>данные на 07:00 мск</div>
+    </div>
+
+    <h1>Что заказать<span class="dot">.</span></h1>
+    <p class="lede">Рекомендации рассчитаны по темпу продаж за год, текущим остаткам
+      и уже размещённым заказам. <b>Пять позиций</b> уйдут в стокаут раньше,
+      чем приедет производство, — они отмечены красным.</p>
+
+    <section class="digest">
+      <div class="cell">
+        <div class="label">Позиций к заказу</div>
+        <div class="value">11</div>
+        <div class="note">из 64 активных в каталоге</div>
+      </div>
+      <div class="cell">
+        <div class="label">Объём заказа</div>
+        <div class="value">1&nbsp;320<small>шт</small></div>
+        <div class="note"><i>5 позиций</i> — критичный срок</div>
+      </div>
+      <div class="cell">
+        <div class="label">Себестоимость</div>
+        <div class="value">1,94<small>млн ₽</small></div>
+        <div class="note">оплата двумя траншами</div>
+      </div>
+      <div class="cell">
+        <div class="label">Ожидаемая выручка</div>
+        <div class="value">5,62<small>млн ₽</small></div>
+        <div class="note">наценка ×2,9 к себестоимости</div>
+      </div>
+      <div class="cell">
+        <a class="cta" href="#">Сформировать заказ <span class="arr">&rarr;</span></a>
+      </div>
+    </section>
+
+    <div class="toolbar">
+      <div class="filters">
+        <a href="#" class="on">Все — 11</a>
+        <a href="#">Критичные — 5</a>
+        <a href="#">Класс A — 4</a>
+        <a href="#">Худи</a>
+        <a href="#">Футболки</a>
+        <a href="#">Верхняя одежда</a>
+      </div>
+      <div class="search"><span>Поиск по названию</span><span>&#8984;K</span></div>
+    </div>
+
+    <table>
+      <thead>
+        <tr>
+          <th style="width:27%;">Позиция</th>
+          <th style="width:7%;">Класс</th>
+          <th class="num" style="width:13%;">Оборач., ₽/день</th>
+          <th class="num" style="width:9%;">Остаток</th>
+          <th class="num" style="width:14%;">Покрытие</th>
+          <th style="width:16%;">Стокаут</th>
+          <th class="num" style="width:14%;">Заказать</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="pos"><div class="nm">Худи «Скетч»</div><div class="cat">Худи · 6 размеров</div></td>
+          <td><span class="cls a">A</span></td>
+          <td class="num">18&nbsp;420<span class="rub">₽</span></td>
+          <td class="num">42</td>
+          <td class="num cover low"><span class="bar" style="width:14px;"></span><span class="crit">1,3&nbsp;нед</span></td>
+          <td><span class="crit">11 августа</span><span class="crit-flag">срочно</span></td>
+          <td class="num need">180<small>шт</small></td>
+        </tr>
+        <tr>
+          <td class="pos"><div class="nm">Футболка «База», белая</div><div class="cat">Футболки · 5 размеров</div></td>
+          <td><span class="cls a">A</span></td>
+          <td class="num">15&nbsp;260<span class="rub">₽</span></td>
+          <td class="num">58</td>
+          <td class="num cover low"><span class="bar" style="width:15px;"></span><span class="crit">1,4&nbsp;нед</span></td>
+          <td><span class="crit">12 августа</span><span class="crit-flag">срочно</span></td>
+          <td class="num need">260<small>шт</small></td>
+        </tr>
+        <tr>
+          <td class="pos"><div class="nm">Футболка «Штрих», чёрная</div><div class="cat">Футболки · 5 размеров</div></td>
+          <td><span class="cls a">A</span></td>
+          <td class="num">14&nbsp;020<span class="rub">₽</span></td>
+          <td class="num">71</td>
+          <td class="num cover low"><span class="bar" style="width:19px;"></span><span class="crit">1,8&nbsp;нед</span></td>
+          <td><span class="crit">17 августа</span><span class="crit-flag">срочно</span></td>
+          <td class="num need">220<small>шт</small></td>
+        </tr>
+        <tr>
+          <td class="pos"><div class="nm">Зип-худи «Монолит»</div><div class="cat">Худи · 6 размеров</div></td>
+          <td><span class="cls a">A</span></td>
+          <td class="num">12&nbsp;940<span class="rub">₽</span></td>
+          <td class="num">96</td>
+          <td class="num cover"><span class="bar" style="width:46px;"></span>4,3&nbsp;нед</td>
+          <td class="soft">27 сентября</td>
+          <td class="num need">120<small>шт</small></td>
+        </tr>
+        <tr>
+          <td class="pos"><div class="nm">Пуховик «Норд»</div><div class="cat">Верхняя одежда · 4 размера</div></td>
+          <td><span class="cls b">B</span></td>
+          <td class="num">11&nbsp;380<span class="rub">₽</span></td>
+          <td class="num">7</td>
+          <td class="num cover low"><span class="bar" style="width:12px;"></span><span class="crit">1,1&nbsp;нед</span></td>
+          <td><span class="crit">5 августа</span><span class="crit-flag">срочно</span></td>
+          <td class="num need">90<small>шт</small></td>
+        </tr>
+        <tr>
+          <td class="pos"><div class="nm">Свитшот «Грань»</div><div class="cat">Свитшоты · 6 размеров</div></td>
+          <td><span class="cls b">B</span></td>
+          <td class="num">8&nbsp;750<span class="rub">₽</span></td>
+          <td class="num">88</td>
+          <td class="num cover"><span class="bar" style="width:56px;"></span>5,2&nbsp;нед</td>
+          <td class="soft">4 октября</td>
+          <td class="num need">95<small>шт</small></td>
+        </tr>
+        <tr>
+          <td class="pos"><div class="nm">Джоггеры «Асфальт»</div><div class="cat">Брюки · 5 размеров</div></td>
+          <td><span class="cls b">B</span></td>
+          <td class="num">7&nbsp;210<span class="rub">₽</span></td>
+          <td class="num">51</td>
+          <td class="num cover"><span class="bar" style="width:43px;"></span>4,0&nbsp;нед</td>
+          <td class="soft">24 сентября</td>
+          <td class="num need">70<small>шт</small></td>
+        </tr>
+        <tr>
+          <td class="pos"><div class="nm">Лонгслив «Тень»</div><div class="cat">Футболки · 5 размеров</div></td>
+          <td><span class="cls b">B</span></td>
+          <td class="num">5&nbsp;940<span class="rub">₽</span></td>
+          <td class="num">33</td>
+          <td class="num cover low"><span class="bar" style="width:17px;"></span><span class="crit">1,6&nbsp;нед</span></td>
+          <td><span class="crit">15 августа</span><span class="crit-flag">срочно</span></td>
+          <td class="num need">140<small>шт</small></td>
+        </tr>
+        <tr>
+          <td class="pos"><div class="nm">Брюки «Карго&nbsp;02»</div><div class="cat">Брюки · 5 размеров</div></td>
+          <td><span class="cls c">C</span></td>
+          <td class="num">4&nbsp;380<span class="rub">₽</span></td>
+          <td class="num">64</td>
+          <td class="num cover"><span class="bar" style="width:64px;"></span>8,3&nbsp;нед</td>
+          <td class="soft">25 ноября</td>
+          <td class="num need">40<small>шт</small></td>
+        </tr>
+        <tr>
+          <td class="pos"><div class="nm">Куртка «Шторм»</div><div class="cat">Верхняя одежда · 4 размера</div></td>
+          <td><span class="cls c">C</span></td>
+          <td class="num">3&nbsp;920<span class="rub">₽</span></td>
+          <td class="num">12</td>
+          <td class="num cover"><span class="bar" style="width:31px;"></span>2,9&nbsp;нед</td>
+          <td class="soft">19 августа</td>
+          <td class="num need">45<small>шт</small></td>
+        </tr>
+        <tr>
+          <td class="pos"><div class="nm">Шоппер «Линия»</div><div class="cat">Аксессуары · без размера</div></td>
+          <td><span class="cls c">C</span></td>
+          <td class="num">2&nbsp;140<span class="rub">₽</span></td>
+          <td class="num">26</td>
+          <td class="num cover"><span class="bar" style="width:29px;"></span>2,7&nbsp;нед</td>
+          <td class="soft">18 августа</td>
+          <td class="num need">60<small>шт</small></td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="colophon">
+      <span>Ещё 8 позиций не требуют заказа — <a href="#">показать</a></span>
+      <span>ОБОРОТ · АНАЛИТИКА СКЛАДА И ПРОДАЖ</span>
+    </div>
+  </main>
+</div>
+</body>
+</html>

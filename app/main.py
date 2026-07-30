@@ -32,6 +32,9 @@ app = FastAPI(title="Оборот", docs_url=None, redoc_url=None)
 app.include_router(api_router)
 app.include_router(connect_router)
 app.include_router(extra_router)
+
+from app import scheduler as _scheduler  # noqa: E402
+_scheduler.attach(app)
 templates = Jinja2Templates(directory=[str(d) for d in TEMPLATE_DIRS])
 
 if STATIC_DIR.is_dir():
@@ -184,7 +187,8 @@ def logout():
 def dashboard_page(request: Request, db: Session = Depends(get_db)):
     ctx = auth.resolve_auth(request, db)
     if ctx is None:
-        return RedirectResponse("/login", status_code=302)
+        # Неавторизованным показываем публичный лендинг (самодостаточный шаблон).
+        return templates.TemplateResponse(request, "landing.html", {})
     if not _has_active_connection(db, ctx.org.id):
         return RedirectResponse("/onboarding", status_code=302)
     return _page(request, ctx, "dashboard.html", "dashboard", "Показатели")

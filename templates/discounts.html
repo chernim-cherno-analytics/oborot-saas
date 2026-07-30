@@ -1,0 +1,265 @@
+{% extends "base.html" %}
+{% block content %}
+
+<style>
+  /* Бейджи скидок: 10 % зелёный → 60 % красный */
+  .disc-badge { display:inline-block; padding:2px 8px; border-radius:999px; font-size:12px; font-weight:700; font-variant-numeric:tabular-nums; white-space:nowrap; }
+  .disc-10 { background:#ebf7e6; color:#1a7a2e; }
+  .disc-15 { background:#e4f3d8; color:#3d7a12; }
+  .disc-20 { background:#fdf4e0; color:#b07300; }
+  .disc-30 { background:#fdeccc; color:#a35f00; }
+  .disc-40 { background:#ffe3d1; color:#bd4a00; }
+  .disc-50 { background:#fdecec; color:#d33338; }
+  .disc-60 { background:#e5484d; color:#fff; }
+  .reason-cell { max-width:340px; font-size:12px; color:var(--text-soft); white-space:normal; }
+  .old-price { text-decoration:line-through; color:var(--text-faint); }
+
+  /* Печатный прайс для магазинов: на экране скрыт, в печати — только он */
+  .print-price { display:none; }
+  @media print {
+    .print-price { display:block !important; }
+    .print-price .tbl th { font-size:11px; }
+    .print-price .tbl td { padding:6px 8px; font-size:12px; }
+    .print-price .p-new { font-weight:700; font-size:13px; }
+    .print-price .p-disc { font-weight:700; }
+    .print-price tr { break-inside: avoid; }
+  }
+</style>
+
+<p class="page-sub no-print">Что уценить и на сколько, чтобы разморозить деньги. Правило скидок — от текущей оборачиваемости и запаса в днях; новинки без затоварки и бестселлеры с малым запасом не уценяются.</p>
+
+<div class="metric-grid no-print" style="grid-template-columns:repeat(4,1fr);">
+  <div class="metric"><div class="m-label">Заморожено в стоке к уценке</div><div class="m-value txt-red" id="m-frozen">—</div><div class="m-sub" id="m-frozen-sub">по себестоимости</div></div>
+  <div class="metric"><div class="m-label">Позиций к уценке</div><div class="m-value" id="m-pos">—</div><div class="m-sub" id="m-pos-sub"></div></div>
+  <div class="metric"><div class="m-label">Вернёт распродажа</div><div class="m-value txt-green" id="m-recovery">—</div><div class="m-sub">по рекомендованным ценам</div></div>
+  <div class="metric"><div class="m-label">Средняя глубина скидки</div><div class="m-value" id="m-depth">—</div><div class="m-sub">взвешенная по остатку</div></div>
+</div>
+
+<div class="card no-print">
+  <div class="toolbar">
+    <div class="search-box">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.5" y2="16.5"/></svg>
+      <input class="input" type="search" id="search" placeholder="Поиск по названию…" autocomplete="off">
+    </div>
+    <div class="chips" id="cat-chips"></div>
+    <div class="spacer" style="flex:1;"></div>
+    <button class="btn primary" id="print-btn" type="button">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:4px;"><path d="M6 9V3h12v6"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="7"/></svg>
+      Скачать список для магазинов
+    </button>
+  </div>
+  <div class="tbl-wrap">
+    <table class="tbl">
+      <thead id="thead">
+        <tr>
+          <th data-sort="base_name" data-sort-dir="asc">Позиция</th>
+          <th data-sort="cls" style="width:56px;">Класс</th>
+          <th class="num" data-sort="discount_pct">Скидка</th>
+          <th class="num" data-sort="frozen" title="Остаток × себестоимость (нет себеса — по средней цене продажи, отмечено *)">Заморожено, ₽</th>
+          <th class="num" data-sort="cs">Остаток</th>
+          <th class="num" data-sort="stock_days_left" title="Остаток / темп продаж">Запас, дн</th>
+          <th class="num" data-sort="days_since_sale" title="Дней с последней продажи">Без продаж, дн</th>
+          <th class="num" data-sort="turnover" title="Нетто-выручка ₽ в день в стоке">Оборач., ₽/день</th>
+          <th class="num" data-sort="new_price" title="Средняя цена → новая цена со скидкой (округление до 10 ₽ вниз, «психологическое»)">Цена → новая</th>
+          <th class="num" data-sort="expected_recovery" title="Остаток × новая цена">Вернёт, ₽</th>
+          <th>Почему</th>
+        </tr>
+      </thead>
+      <tbody id="tbody">
+        <tr><td colspan="11"><div class="loading-stub">Загрузка…</div></td></tr>
+      </tbody>
+      <tfoot id="tfoot" style="display:none;">
+        <tr>
+          <td id="f-count"></td><td></td><td></td>
+          <td class="num" id="f-frozen"></td>
+          <td class="num" id="f-cs"></td>
+          <td></td><td></td><td></td><td></td>
+          <td class="num" id="f-recovery"></td>
+          <td></td>
+        </tr>
+      </tfoot>
+    </table>
+  </div>
+</div>
+
+<p class="page-sub no-print" id="notes" style="margin-top:10px;font-size:12px;">
+  <span id="fresh-note" style="display:none;"></span>
+  <span id="nocost-note" style="display:none;">* — нет себестоимости, заморозка посчитана по средней цене продажи.</span>
+</p>
+
+<!-- Печатная версия: прайс уценки для продавцов -->
+<div class="print-price">
+  <div class="print-header">
+    <div class="ph-brand">Уценка — список для магазинов</div>
+    <div class="ph-meta" id="print-meta"></div>
+  </div>
+  <table class="tbl">
+    <thead>
+      <tr>
+        <th style="width:24px;">№</th>
+        <th>Позиция</th>
+        <th class="num">Старая цена</th>
+        <th class="num">Новая цена</th>
+        <th class="num">Скидка</th>
+      </tr>
+    </thead>
+    <tbody id="print-tbody"></tbody>
+  </table>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+  var items = [];
+  var state = { sortKey: "frozen", sortDir: -1, query: "", cat: "" };
+  var tbody = document.getElementById("tbody");
+
+  api("/api/discounts").then(function (d) {
+    items = d.items || [];
+    renderCards(d);
+    renderChips();
+    renderTable();
+    var fn = document.getElementById("fresh-note");
+    if (d.fresh_excluded_count > 0) {
+      fn.style.display = "";
+      fn.textContent = "Ещё " + fmtInt(d.fresh_excluded_count) +
+        " поз. в наличии без скидки: новинки без затоварки и бестселлеры с малым запасом — им уценка не нужна. ";
+    }
+  }).catch(function () {
+    tbody.innerHTML = '<tr><td colspan="11">' +
+      emptyState("Не удалось загрузить данные", "Обновите страницу или попробуйте позже.",
+        '<button class="btn" onclick="location.reload()">Обновить</button>') + "</td></tr>";
+  });
+
+  function renderCards(d) {
+    var c = d.cards || {};
+    document.getElementById("m-frozen").textContent = fmtMoney(c.frozen_total);
+    if (c.frozen_no_cost > 0) {
+      document.getElementById("m-frozen-sub").textContent =
+        "из них " + fmtMoney(c.frozen_no_cost) + " — по цене продажи (нет себеса)";
+    }
+    document.getElementById("m-pos").textContent = fmtInt(c.positions);
+    var units = items.reduce(function (s, it) { return s + (it.cs || 0); }, 0);
+    document.getElementById("m-pos-sub").textContent = fmtInt(units) + " шт на складе";
+    document.getElementById("m-recovery").textContent = fmtMoney(c.expected_recovery);
+    var wsum = 0;
+    items.forEach(function (it) { wsum += it.discount_pct * (it.cs || 0); });
+    document.getElementById("m-depth").textContent = units ? Math.round(wsum / units) + " %" : "—";
+  }
+
+  function renderChips() {
+    var counts = {};
+    items.forEach(function (it) { counts[it.category] = (counts[it.category] || 0) + 1; });
+    var cats = Object.keys(counts).sort(function (a, b) { return a.localeCompare(b, "ru"); });
+    var box = document.getElementById("cat-chips");
+    if (cats.length < 2) return;
+    box.innerHTML = '<button class="chip active" data-cat="">Все<span class="cnt">' + items.length + "</span></button>" +
+      cats.map(function (c) {
+        return '<button class="chip" data-cat="' + esc(c) + '">' + esc(c) + '<span class="cnt">' + counts[c] + "</span></button>";
+      }).join("");
+    box.querySelectorAll(".chip").forEach(function (chip) {
+      chip.addEventListener("click", function () {
+        state.cat = chip.getAttribute("data-cat");
+        box.querySelectorAll(".chip").forEach(function (x) { x.classList.remove("active"); });
+        chip.classList.add("active");
+        renderTable();
+      });
+    });
+  }
+
+  function discBadge(pct) {
+    return '<span class="disc-badge disc-' + pct + '">−' + pct + '%</span>';
+  }
+
+  function filtered() {
+    return items.filter(function (it) {
+      if (state.cat && it.category !== state.cat) return false;
+      return wordMatch(it.base_name, state.query);
+    });
+  }
+
+  function renderTable() {
+    var arr = sortItems(filtered(), state.sortKey, state.sortDir);
+
+    if (!arr.length) {
+      tbody.innerHTML = '<tr><td colspan="11">' + (items.length
+        ? emptyState("Ничего не найдено", "Попробуйте изменить запрос или сбросить фильтр категории.", "")
+        : emptyState("Уценять нечего", "Весь сток либо продаётся сам, либо распродан. Так держать!", "")) + "</td></tr>";
+      document.getElementById("tfoot").style.display = "none";
+      renderPrint(arr);
+      return;
+    }
+
+    tbody.innerHTML = arr.map(function (it) {
+      var star = it.no_cost
+        ? ' <span class="muted" title="Нет себестоимости — посчитано по средней цене продажи">*</span>' : "";
+      return "<tr>" +
+        '<td class="name-cell"><div class="name-main">' + esc(it.base_name) +
+          '</div><div class="name-sub">' + esc(it.category || "") + "</div></td>" +
+        "<td>" + clsDot(it.cls) + "</td>" +
+        '<td class="num">' + discBadge(it.discount_pct) + "</td>" +
+        '<td class="num"><b>' + fmtInt(it.frozen) + "</b>" + star + "</td>" +
+        '<td class="num">' + fmtInt(it.cs) + "</td>" +
+        '<td class="num">' + (it.stock_days_left === null ? '<span class="muted">∞</span>' : fmtInt(it.stock_days_left)) + "</td>" +
+        '<td class="num' + (it.days_since_sale === null || it.days_since_sale > 120 ? " txt-red" : "") + '">' +
+          (it.days_since_sale === null ? "ни разу" : fmtInt(it.days_since_sale)) + "</td>" +
+        '<td class="num muted">' + fmtInt(it.turnover) + "</td>" +
+        '<td class="num"><span class="old-price">' + fmtInt(it.avg_price) + '</span> → <b>' + fmtInt(it.new_price) + "</b></td>" +
+        '<td class="num">' + fmtInt(it.expected_recovery) + "</td>" +
+        '<td class="reason-cell">' + esc(it.reason) + "</td>" +
+        "</tr>";
+    }).join("");
+
+    var frozen = 0, cs = 0, rec = 0;
+    arr.forEach(function (it) { frozen += it.frozen || 0; cs += it.cs || 0; rec += it.expected_recovery || 0; });
+    document.getElementById("tfoot").style.display = "";
+    document.getElementById("f-count").textContent = "Итого: " + fmtInt(arr.length) + " поз.";
+    document.getElementById("f-frozen").textContent = fmtMoney(frozen);
+    document.getElementById("f-cs").textContent = fmtInt(cs);
+    document.getElementById("f-recovery").textContent = fmtMoney(rec);
+
+    if (items.some(function (it) { return it.no_cost; })) {
+      document.getElementById("nocost-note").style.display = "";
+    }
+    renderPrint(arr);
+  }
+
+  /* Печатный прайс: текущая выборка, сгруппирована по категории, внутри — по имени */
+  function renderPrint(arr) {
+    var list = arr.slice().sort(function (a, b) {
+      var c = String(a.category).localeCompare(String(b.category), "ru");
+      return c !== 0 ? c : String(a.base_name).localeCompare(String(b.base_name), "ru");
+    });
+    var rows = [], lastCat = null, n = 0;
+    list.forEach(function (it) {
+      if (it.category !== lastCat) {
+        lastCat = it.category;
+        rows.push('<tr><td colspan="5" style="font-weight:700;background:#f2f2f2;">' + esc(lastCat) + "</td></tr>");
+      }
+      n++;
+      rows.push("<tr>" +
+        '<td class="num muted">' + n + "</td>" +
+        "<td>" + esc(it.base_name) + "</td>" +
+        '<td class="num"><span class="old-price">' + fmtMoney(it.avg_price) + "</span></td>" +
+        '<td class="num p-new">' + fmtMoney(it.new_price) + "</td>" +
+        '<td class="num p-disc">−' + it.discount_pct + " %</td>" +
+        "</tr>");
+    });
+    document.getElementById("print-tbody").innerHTML = rows.join("");
+    document.getElementById("print-meta").textContent =
+      "Позиций: " + list.length + " · Сформировано: " + fmtDate(new Date().toISOString().slice(0, 10)) +
+      " · Цены указаны за единицу, скидка уже учтена в новой цене";
+  }
+
+  document.getElementById("print-btn").addEventListener("click", function () { window.print(); });
+
+  document.getElementById("search").addEventListener("input", debounce(function (e) {
+    state.query = e.target.value.trim();
+    renderTable();
+  }, 150));
+  initSortHeaders(document.getElementById("thead"), state, renderTable);
+});
+</script>
+{% endblock %}

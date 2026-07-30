@@ -1,0 +1,473 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Что заказать — Оборот · Штаб</title>
+<style>
+  :root{
+    --bg:#e9edf2;
+    --side:#10161f;
+    --side-2:#161e29;
+    --surface:#ffffff;
+    --line:#d7dde5;
+    --line-soft:#e6eaf0;
+    --ink:#0f1722;
+    --ink-2:#4d5a6b;
+    --ink-3:#8593a5;
+    --blue:#1554d1;
+    --red:#d92b2b;
+    --red-bg:#fdeaea;
+    --red-line:#f3b9b9;
+    --amber:#b96e00;
+    --amber-fill:#e89312;
+    --amber-bg:#fdf3e0;
+    --green:#177a3d;
+    --green-fill:#27a35a;
+    --green-bg:#e7f5ec;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI","Helvetica Neue",Arial,sans-serif;
+    --mono:ui-monospace,"SF Mono","Cascadia Mono",Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box;margin:0;padding:0;}
+  html,body{height:100%;}
+  body{
+    background:var(--bg);color:var(--ink);
+    font-family:var(--sans);font-size:13px;line-height:1.45;
+    -webkit-font-smoothing:antialiased;
+    min-width:1280px;
+  }
+  .shell{display:flex;min-height:100vh;}
+
+  /* ---------- Сайдбар ---------- */
+  .side{
+    width:208px;min-width:208px;background:var(--side);
+    color:#aeb9c8;display:flex;flex-direction:column;
+    position:fixed;inset:0 auto 0 0;
+  }
+  .brand{
+    padding:16px 16px 14px;border-bottom:1px solid rgba(255,255,255,.07);
+    display:flex;align-items:center;gap:10px;
+  }
+  .brand .mark{
+    width:28px;height:28px;border-radius:7px;background:var(--blue);
+    display:flex;align-items:center;justify-content:center;
+    color:#fff;font-weight:800;font-size:14px;
+  }
+  .brand .t .nm{color:#fff;font-weight:700;font-size:13.5px;letter-spacing:.01em;}
+  .brand .t .org{font-size:10.5px;color:#7b8798;margin-top:1px;}
+  .side nav{flex:1;padding:10px 8px;}
+  .side nav .grp{
+    font-size:9.5px;letter-spacing:.14em;text-transform:uppercase;color:#5c6878;
+    padding:10px 10px 5px;
+  }
+  .side nav a{
+    display:flex;align-items:center;gap:8px;
+    padding:7px 10px;border-radius:6px;margin-bottom:1px;
+    color:#aeb9c8;text-decoration:none;font-size:13px;font-weight:500;
+  }
+  .side nav a:hover{background:var(--side-2);color:#fff;}
+  .side nav a.active{background:var(--blue);color:#fff;}
+  .side nav a .pip{
+    margin-left:auto;
+    font-family:var(--mono);font-size:10px;font-weight:700;
+    background:var(--red);color:#fff;border-radius:9px;padding:1px 7px;
+  }
+  .side .status{
+    padding:12px 16px;border-top:1px solid rgba(255,255,255,.07);
+    font-size:11px;color:#7b8798;line-height:1.6;
+  }
+  .side .status .ok{color:#4ec581;font-weight:600;}
+
+  /* ---------- Main ---------- */
+  .main{flex:1;margin-left:208px;display:flex;flex-direction:column;}
+  .topbar{
+    height:50px;background:var(--surface);
+    border-bottom:1px solid var(--line);
+    display:flex;align-items:center;gap:14px;padding:0 22px;
+  }
+  .topbar h1{font-size:15.5px;font-weight:700;letter-spacing:-.01em;}
+  .topbar .live{
+    display:flex;align-items:center;gap:6px;
+    font-size:11px;font-weight:600;color:var(--green);
+    background:var(--green-bg);border-radius:20px;padding:3px 10px;
+  }
+  .topbar .live .d{width:6px;height:6px;border-radius:50%;background:var(--green-fill);}
+  .topbar .grow{flex:1;}
+  .topbar .date{font-size:12px;color:var(--ink-3);}
+  .topbar .user{
+    display:flex;align-items:center;gap:8px;font-size:12.5px;font-weight:600;
+  }
+  .topbar .user .av{
+    width:26px;height:26px;border-radius:50%;background:var(--ink);color:#fff;
+    display:flex;align-items:center;justify-content:center;font-size:11px;
+  }
+
+  .content{padding:18px 22px 36px;}
+
+  /* ---------- KPI ---------- */
+  .kpis{display:grid;grid-template-columns:1.25fr 1fr 1fr 1fr 1fr;gap:12px;margin-bottom:14px;}
+  .kpi{
+    background:var(--surface);border:1px solid var(--line);border-radius:10px;
+    padding:13px 16px 14px;position:relative;overflow:hidden;
+  }
+  .kpi .l{font-size:11px;font-weight:600;color:var(--ink-2);letter-spacing:.02em;margin-bottom:6px;}
+  .kpi .v{
+    font-family:var(--mono);font-size:26px;font-weight:700;letter-spacing:-.03em;
+    font-variant-numeric:tabular-nums;line-height:1.05;
+  }
+  .kpi .v small{font-size:13px;font-weight:600;color:var(--ink-3);margin-left:3px;letter-spacing:0;}
+  .kpi .s{font-size:11px;color:var(--ink-3);margin-top:6px;}
+  .kpi .s b{color:var(--ink-2);}
+  .kpi.alert{
+    background:var(--red);border-color:var(--red);color:#fff;
+  }
+  .kpi.alert .l{color:rgba(255,255,255,.85);}
+  .kpi.alert .v{color:#fff;}
+  .kpi.alert .v small{color:rgba(255,255,255,.75);}
+  .kpi.alert .s{color:rgba(255,255,255,.85);}
+  .kpi.alert .act{
+    position:absolute;right:14px;top:50%;transform:translateY(-50%);
+    background:#fff;color:var(--red);font-weight:700;font-size:11.5px;
+    border-radius:7px;padding:7px 12px;text-decoration:none;
+  }
+  .kpi .trend{font-family:var(--mono);font-size:11px;font-weight:700;}
+  .kpi .trend.up{color:var(--green);}
+  .kpi .trend.dn{color:var(--red);}
+
+  /* ---------- Панель таблицы ---------- */
+  .board{background:var(--surface);border:1px solid var(--line);border-radius:10px;overflow:hidden;}
+  .board-bar{
+    display:flex;align-items:center;gap:10px;
+    padding:10px 14px;border-bottom:1px solid var(--line);
+  }
+  .seg{display:flex;background:#eef1f5;border-radius:8px;padding:2px;}
+  .seg a{
+    font-size:12px;font-weight:600;color:var(--ink-2);
+    padding:5px 12px;border-radius:6px;text-decoration:none;
+  }
+  .seg a.on{background:var(--surface);color:var(--ink);box-shadow:0 1px 2px rgba(15,23,34,.12);}
+  .seg a .c{font-family:var(--mono);font-size:10.5px;color:var(--ink-3);margin-left:4px;font-weight:700;}
+  .seg a.crit{color:var(--red);}
+  .seg a.crit .c{color:var(--red);}
+  .board-bar .grow{flex:1;}
+  .srch{
+    display:flex;align-items:center;gap:7px;
+    border:1px solid var(--line);border-radius:8px;padding:6px 10px;
+    color:var(--ink-3);font-size:12px;width:210px;background:#fbfcfe;
+  }
+  .btn-cta{
+    background:var(--blue);color:#fff;font-weight:700;font-size:12.5px;
+    border-radius:8px;padding:8px 14px;text-decoration:none;
+    box-shadow:0 1px 2px rgba(21,84,209,.35);
+  }
+  .btn-cta:hover{background:#0f47b5;}
+
+  table{width:100%;border-collapse:collapse;}
+  thead th{
+    font-size:10px;font-weight:700;letter-spacing:.09em;text-transform:uppercase;
+    color:var(--ink-3);text-align:left;background:#f6f8fa;
+    padding:8px 12px;border-bottom:1px solid var(--line);
+    white-space:nowrap;
+  }
+  thead th.num{text-align:right;}
+  thead th .sort{color:var(--blue);}
+  tbody td{
+    padding:9px 12px;border-bottom:1px solid var(--line-soft);
+    font-size:13px;vertical-align:middle;
+  }
+  tbody tr:hover td{background:#f6f9ff;}
+  tbody tr.crit td{background:#fff7f7;}
+  tbody tr.crit:hover td{background:#fff0f0;}
+  tbody tr.crit td:first-child{box-shadow:inset 3px 0 0 var(--red);}
+  td.num{
+    text-align:right;font-family:var(--mono);font-size:12.5px;font-weight:600;
+    font-variant-numeric:tabular-nums;
+  }
+  td.num .dim{color:var(--ink-3);font-weight:500;}
+  .pname .n{font-weight:600;font-size:13px;}
+  .pname .c{font-size:11px;color:var(--ink-3);margin-top:1px;}
+  .cls{
+    display:inline-flex;align-items:center;justify-content:center;
+    width:22px;height:22px;border-radius:6px;
+    font-size:11.5px;font-weight:800;
+  }
+  .cls.a{background:#dcebdd;color:var(--green);}
+  .cls.b{background:#e3ecfb;color:var(--blue);}
+  .cls.c{background:#eceff3;color:var(--ink-3);}
+  .st{
+    display:inline-flex;align-items:center;gap:6px;
+    font-size:10.5px;font-weight:800;letter-spacing:.05em;
+    border-radius:5px;padding:3px 8px;white-space:nowrap;
+  }
+  .st.r{background:var(--red-bg);color:var(--red);border:1px solid var(--red-line);}
+  .st.y{background:var(--amber-bg);color:var(--amber);border:1px solid #edd3a4;}
+  .st.g{background:var(--green-bg);color:var(--green);border:1px solid #bfe3cc;}
+  .covbar{
+    display:flex;align-items:center;gap:8px;justify-content:flex-end;
+  }
+  .covbar .track{
+    display:block;width:70px;height:5px;border-radius:3px;background:#e8ecf1;overflow:hidden;
+  }
+  .covbar .fill{display:block;height:100%;border-radius:3px;min-width:5px;}
+  .covbar .fill.r{background:var(--red);}
+  .covbar .fill.y{background:var(--amber-fill);}
+  .covbar .fill.g{background:var(--green-fill);}
+  .covbar .val{font-family:var(--mono);font-size:12.5px;font-weight:700;min-width:30px;text-align:right;}
+  .covbar .val.r{color:var(--red);}
+  .covbar .val.y{color:var(--amber);}
+  .covbar .val.g{color:var(--green);}
+  td .dt{font-family:var(--mono);font-size:12px;font-weight:600;color:var(--ink-2);}
+  td .dt.r{color:var(--red);}
+  td .in{font-size:10.5px;color:var(--ink-3);margin-top:1px;}
+  .need{
+    display:inline-block;min-width:64px;text-align:center;
+    font-family:var(--mono);font-size:13px;font-weight:800;
+    background:var(--ink);color:#fff;border-radius:6px;padding:4px 10px;
+  }
+  tr.crit .need{background:var(--red);}
+  tfoot td{
+    padding:9px 12px;background:#f6f8fa;border-top:1px solid var(--line);
+    font-family:var(--mono);font-size:11.5px;font-weight:700;color:var(--ink-2);
+  }
+  tfoot td.num{font-size:12px;}
+  .legend{
+    display:flex;gap:16px;margin-top:12px;
+    font-size:11.5px;color:var(--ink-2);align-items:center;
+  }
+  .legend .sw{display:inline-block;width:9px;height:9px;border-radius:3px;margin-right:5px;vertical-align:-1px;}
+  .legend .grow{flex:1;}
+  .legend a{color:var(--blue);font-weight:600;text-decoration:none;}
+</style>
+</head>
+<body>
+<div class="shell">
+
+  <aside class="side">
+    <div class="brand">
+      <div class="mark">О</div>
+      <div class="t">
+        <div class="nm">Оборот</div>
+        <div class="org">Chernim Cherno</div>
+      </div>
+    </div>
+    <nav>
+      <div class="grp">Аналитика</div>
+      <a href="#">Показатели</a>
+      <a href="#" class="active">Что заказать<span class="pip">5</span></a>
+      <a href="#">Оборачиваемость</a>
+      <a href="#">Бюджет</a>
+      <a href="#">Прогноз</a>
+      <a href="#">Размеры</a>
+      <a href="#">Скидки</a>
+      <div class="grp">Операции</div>
+      <a href="#">Остатки</a>
+      <a href="#">Заказы</a>
+      <a href="#">Настройки</a>
+    </nav>
+    <div class="status">
+      <span class="ok">● МойСклад</span> · синхронизация<br>сегодня в 07:00
+    </div>
+  </aside>
+
+  <div class="main">
+    <header class="topbar">
+      <h1>Что заказать</h1>
+      <span class="live"><span class="d"></span>Данные актуальны</span>
+      <div class="grow"></div>
+      <span class="date">Ср, 30 июля 2026 · 10:42</span>
+      <div class="user"><div class="av">В</div>Влад</div>
+    </header>
+
+    <div class="content">
+      <section class="kpis">
+        <div class="kpi alert">
+          <div class="l">РИСК СТОКАУТА</div>
+          <div class="v">5<small>позиций</small></div>
+          <div class="s">покрытие меньше 2 недель</div>
+          <a class="act" href="#">Показать</a>
+        </div>
+        <div class="kpi">
+          <div class="l">К заказу</div>
+          <div class="v">11<small>из 64</small></div>
+          <div class="s"><span class="trend up">▲ +2</span> за неделю</div>
+        </div>
+        <div class="kpi">
+          <div class="l">Объём заказа</div>
+          <div class="v">1 320<small>шт</small></div>
+          <div class="s">по рекомендации системы</div>
+        </div>
+        <div class="kpi">
+          <div class="l">Себестоимость</div>
+          <div class="v">1,94<small>млн ₽</small></div>
+          <div class="s">бюджет августа: <b>2,5 млн ₽</b></div>
+        </div>
+        <div class="kpi">
+          <div class="l">Ожид. выручка</div>
+          <div class="v">5,62<small>млн ₽</small></div>
+          <div class="s"><span class="trend up">×2,9</span> к себестоимости</div>
+        </div>
+      </section>
+
+      <section class="board">
+        <div class="board-bar">
+          <div class="seg">
+            <a href="#" class="on">Все <span class="c">11</span></a>
+            <a href="#" class="crit">Срочно <span class="c">5</span></a>
+            <a href="#">Скоро <span class="c">2</span></a>
+            <a href="#">План <span class="c">4</span></a>
+          </div>
+          <div class="grow"></div>
+          <div class="srch">🔍&nbsp; Поиск по названию…</div>
+          <a class="btn-cta" href="#">+ Создать заказ на производство</a>
+        </div>
+
+        <table>
+          <thead>
+            <tr>
+              <th style="width:23%;">Позиция</th>
+              <th style="width:5%;">Класс</th>
+              <th style="width:9%;">Статус</th>
+              <th class="num" style="width:12%;">Оборач., ₽/день <span class="sort">▼</span></th>
+              <th class="num" style="width:8%;">Остаток</th>
+              <th class="num" style="width:13%;">Покрытие, нед</th>
+              <th style="width:12%;">Стокаут</th>
+              <th class="num" style="width:10%;">Заказать</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr class="crit">
+              <td class="pname"><div class="n">Пуховик «Норд»</div><div class="c">Верхняя одежда · 4 размера</div></td>
+              <td><span class="cls b">B</span></td>
+              <td><span class="st r">СРОЧНО</span></td>
+              <td class="num">11 380</td>
+              <td class="num">7</td>
+              <td><div class="covbar"><span class="track"><span class="fill r" style="width:9%;"></span></span><span class="val r">1,1</span></div></td>
+              <td><div class="dt r">05.08.2026</div><div class="in">через 6 дней</div></td>
+              <td class="num"><span class="need">90 шт</span></td>
+            </tr>
+            <tr class="crit">
+              <td class="pname"><div class="n">Худи «Скетч»</div><div class="c">Худи · 6 размеров</div></td>
+              <td><span class="cls a">A</span></td>
+              <td><span class="st r">СРОЧНО</span></td>
+              <td class="num">18 420</td>
+              <td class="num">42</td>
+              <td><div class="covbar"><span class="track"><span class="fill r" style="width:11%;"></span></span><span class="val r">1,3</span></div></td>
+              <td><div class="dt r">11.08.2026</div><div class="in">через 12 дней</div></td>
+              <td class="num"><span class="need">180 шт</span></td>
+            </tr>
+            <tr class="crit">
+              <td class="pname"><div class="n">Футболка «База», белая</div><div class="c">Футболки · 5 размеров</div></td>
+              <td><span class="cls a">A</span></td>
+              <td><span class="st r">СРОЧНО</span></td>
+              <td class="num">15 260</td>
+              <td class="num">58</td>
+              <td><div class="covbar"><span class="track"><span class="fill r" style="width:12%;"></span></span><span class="val r">1,4</span></div></td>
+              <td><div class="dt r">12.08.2026</div><div class="in">через 13 дней</div></td>
+              <td class="num"><span class="need">260 шт</span></td>
+            </tr>
+            <tr class="crit">
+              <td class="pname"><div class="n">Лонгслив «Тень»</div><div class="c">Футболки · 5 размеров</div></td>
+              <td><span class="cls b">B</span></td>
+              <td><span class="st r">СРОЧНО</span></td>
+              <td class="num">5 940</td>
+              <td class="num">33</td>
+              <td><div class="covbar"><span class="track"><span class="fill r" style="width:13%;"></span></span><span class="val r">1,6</span></div></td>
+              <td><div class="dt r">15.08.2026</div><div class="in">через 16 дней</div></td>
+              <td class="num"><span class="need">140 шт</span></td>
+            </tr>
+            <tr class="crit">
+              <td class="pname"><div class="n">Футболка «Штрих», чёрная</div><div class="c">Футболки · 5 размеров</div></td>
+              <td><span class="cls a">A</span></td>
+              <td><span class="st r">СРОЧНО</span></td>
+              <td class="num">14 020</td>
+              <td class="num">71</td>
+              <td><div class="covbar"><span class="track"><span class="fill r" style="width:15%;"></span></span><span class="val r">1,8</span></div></td>
+              <td><div class="dt r">17.08.2026</div><div class="in">через 18 дней</div></td>
+              <td class="num"><span class="need">220 шт</span></td>
+            </tr>
+            <tr>
+              <td class="pname"><div class="n">Шоппер «Линия»</div><div class="c">Аксессуары · без размера</div></td>
+              <td><span class="cls c">C</span></td>
+              <td><span class="st y">СКОРО</span></td>
+              <td class="num">2 140</td>
+              <td class="num">26</td>
+              <td><div class="covbar"><span class="track"><span class="fill y" style="width:23%;"></span></span><span class="val y">2,7</span></div></td>
+              <td><div class="dt">18.08.2026</div><div class="in">через 19 дней</div></td>
+              <td class="num"><span class="need">60 шт</span></td>
+            </tr>
+            <tr>
+              <td class="pname"><div class="n">Куртка «Шторм»</div><div class="c">Верхняя одежда · 4 размера</div></td>
+              <td><span class="cls c">C</span></td>
+              <td><span class="st y">СКОРО</span></td>
+              <td class="num">3 920</td>
+              <td class="num">12</td>
+              <td><div class="covbar"><span class="track"><span class="fill y" style="width:24%;"></span></span><span class="val y">2,9</span></div></td>
+              <td><div class="dt">19.08.2026</div><div class="in">через 20 дней</div></td>
+              <td class="num"><span class="need">45 шт</span></td>
+            </tr>
+            <tr>
+              <td class="pname"><div class="n">Джоггеры «Асфальт»</div><div class="c">Брюки · 5 размеров</div></td>
+              <td><span class="cls b">B</span></td>
+              <td><span class="st g">ПЛАН</span></td>
+              <td class="num">7 210</td>
+              <td class="num">51</td>
+              <td><div class="covbar"><span class="track"><span class="fill g" style="width:33%;"></span></span><span class="val g">4,0</span></div></td>
+              <td><div class="dt">24.09.2026</div><div class="in">через 8 недель</div></td>
+              <td class="num"><span class="need">70 шт</span></td>
+            </tr>
+            <tr>
+              <td class="pname"><div class="n">Зип-худи «Монолит»</div><div class="c">Худи · 6 размеров</div></td>
+              <td><span class="cls a">A</span></td>
+              <td><span class="st g">ПЛАН</span></td>
+              <td class="num">12 940</td>
+              <td class="num">96</td>
+              <td><div class="covbar"><span class="track"><span class="fill g" style="width:36%;"></span></span><span class="val g">4,3</span></div></td>
+              <td><div class="dt">27.09.2026</div><div class="in">через 8 недель</div></td>
+              <td class="num"><span class="need">120 шт</span></td>
+            </tr>
+            <tr>
+              <td class="pname"><div class="n">Свитшот «Грань»</div><div class="c">Свитшоты · 6 размеров</div></td>
+              <td><span class="cls b">B</span></td>
+              <td><span class="st g">ПЛАН</span></td>
+              <td class="num">8 750</td>
+              <td class="num">88</td>
+              <td><div class="covbar"><span class="track"><span class="fill g" style="width:43%;"></span></span><span class="val g">5,2</span></div></td>
+              <td><div class="dt">04.10.2026</div><div class="in">через 9 недель</div></td>
+              <td class="num"><span class="need">95 шт</span></td>
+            </tr>
+            <tr>
+              <td class="pname"><div class="n">Брюки «Карго 02»</div><div class="c">Брюки · 5 размеров</div></td>
+              <td><span class="cls c">C</span></td>
+              <td><span class="st g">ПЛАН</span></td>
+              <td class="num">4 380</td>
+              <td class="num">64</td>
+              <td><div class="covbar"><span class="track"><span class="fill g" style="width:69%;"></span></span><span class="val g">8,3</span></div></td>
+              <td><div class="dt">25.11.2026</div><div class="in">через 17 недель</div></td>
+              <td class="num"><span class="need">40 шт</span></td>
+            </tr>
+          </tbody>
+          <tfoot>
+            <tr>
+              <td colspan="3">ИТОГО: 11 позиций</td>
+              <td class="num">104 360 ₽/день</td>
+              <td class="num">548</td>
+              <td></td>
+              <td></td>
+              <td class="num">1 320 шт</td>
+            </tr>
+          </tfoot>
+        </table>
+      </section>
+
+      <div class="legend">
+        <span><span class="sw" style="background:var(--red);"></span>Срочно — покрытие &lt; 2 нед</span>
+        <span><span class="sw" style="background:var(--amber-fill);"></span>Скоро — 2–4 нед</span>
+        <span><span class="sw" style="background:var(--green-fill);"></span>План — &gt; 4 нед</span>
+        <div class="grow"></div>
+        <span>Ещё 8 позиций не требуют заказа — <a href="#">показать</a></span>
+      </div>
+    </div>
+  </div>
+</div>
+</body>
+</html>
