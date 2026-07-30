@@ -156,6 +156,34 @@ class OrderedQty(Base):
     qty: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
 
 
+class SyncState(Base):
+    """Состояние синхронизации МойСклад per-org (прогресс для онбординга).
+
+    state: idle | running | done | error; mode: initial | incremental.
+    progress — проценты 0..100; stats_json — счётчики последнего прогона.
+    """
+
+    __tablename__ = "sync_state"
+
+    org_id: Mapped[int] = mapped_column(ForeignKey("orgs.id"), primary_key=True)
+    state: Mapped[str] = mapped_column(String(16), nullable=False, default="idle")
+    mode: Mapped[str] = mapped_column(String(16), nullable=False, default="")
+    stage: Mapped[str] = mapped_column(String(32), nullable=False, default="")
+    progress: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    detail: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    stats_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    error: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    @property
+    def stats(self) -> dict:
+        try:
+            return json.loads(self.stats_json or "{}")
+        except ValueError:
+            return {}
+
+
 class ProductionOrder(Base):
     __tablename__ = "production_orders"
 

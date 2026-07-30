@@ -1,0 +1,211 @@
+{% extends "base.html" %}
+{% block content %}
+
+<p class="page-sub">Распределение заказа по размерам на основе истории продаж. Продажи — нетто (минус возвраты).</p>
+
+<div class="card">
+  <div class="toolbar" style="flex-wrap:wrap;">
+    <div class="search-box" style="width:340px;position:relative;">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.5" y2="16.5"/></svg>
+      <input class="input" type="search" id="prod-search" placeholder="Начните вводить название товара…" autocomplete="off">
+      <div id="dd" style="position:absolute;top:calc(100% + 4px);left:0;right:0;z-index:100;background:#fff;border:1px solid var(--border-strong,#d7dbe0);border-radius:8px;max-height:320px;overflow:auto;box-shadow:0 8px 24px rgba(31,41,55,.12);display:none;"></div>
+    </div>
+    <label class="toggle-line" style="gap:8px;">Заказ, шт
+      <input class="input" id="qty" type="number" min="0" value="30" style="width:90px;text-align:center;font-weight:600;">
+    </label>
+    <span class="muted" id="status-hint" style="font-size:12px;"></span>
+  </div>
+  <div class="toolbar" style="border-top:none;flex-wrap:wrap;">
+    <span class="muted" style="font-size:12px;">Продажи за:</span>
+    <div class="chips" id="period-seg">
+      <button class="chip" data-p="6m">6 мес</button>
+      <button class="chip active" data-p="12m">12 мес</button>
+      <button class="chip" data-p="all">всё время</button>
+      <button class="chip" data-p="spring">весна</button>
+      <button class="chip" data-p="summer">лето</button>
+      <button class="chip" data-p="autumn">осень</button>
+      <button class="chip" data-p="winter">зима</button>
+    </div>
+    <span class="muted" style="font-size:12px;margin-left:10px;">Режим:</span>
+    <div class="chips" id="mode-seg">
+      <button class="chip active" data-m="stock">с учётом остатков</button>
+      <button class="chip" data-m="pure">чистая пропорция</button>
+    </div>
+  </div>
+</div>
+
+<div id="warn-box"></div>
+
+<div class="metric-grid" id="cards" style="grid-template-columns:repeat(4,1fr);display:none;">
+  <div class="metric"><div class="m-label">Продано за период</div><div class="m-value" id="m-sold">—</div><div class="m-sub" id="m-sold-s"></div></div>
+  <div class="metric"><div class="m-label">Темп</div><div class="m-value" id="m-rate">—</div><div class="m-sub">шт / месяц</div></div>
+  <div class="metric"><div class="m-label">Остаток сейчас</div><div class="m-value" id="m-stock">—</div><div class="m-sub">по активным складам</div></div>
+  <div class="metric"><div class="m-label">Заказ</div><div class="m-value txt-green" id="m-order">—</div><div class="m-sub" id="m-order-s"></div></div>
+</div>
+
+<div class="card">
+  <div class="tbl-wrap">
+    <table class="tbl">
+      <thead id="thead"></thead>
+      <tbody id="tbody"><tr><td><div class="loading-stub">Выберите товар — посчитаем распределение по размерам</div></td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+<p class="page-sub" style="margin-top:12px;">
+  <b>Как считается.</b> «С учётом остатков»: доля размера в продажах применяется к сумме
+  (текущий остаток + заказ), из результата вычитается то, что уже лежит на складе, —
+  заказ закрывает дыры по размерам, а не дублирует сток. «Чистая пропорция»: количество делится
+  ровно по долям продаж размеров. Период «N мес» = N полных месяцев + текущий неполный;
+  сезоны — за все годы истории.
+</p>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+  var PRODUCTS = [];
+  var SEL = null, PERIOD = "12m", MODE = "stock";
+  var hlIdx = -1, ddItems = [];
+
+  var inp = document.getElementById("prod-search");
+  var dd = document.getElementById("dd");
+  var hint = document.getElementById("status-hint");
+
+  hint.textContent = "загружаю список товаров…";
+  api("/api/sizes/products").then(function (d) {
+    PRODUCTS = d.products || [];
+    hint.textContent = PRODUCTS.length + " позиций";
+  }).catch(function () { hint.textContent = "ошибка загрузки"; });
+
+  // ── выпадающий список товара ──
+  function showDD() {
+    var q = (inp.value || "").trim();
+    if (!q) { dd.style.display = "none"; return; }
+    ddItems = PRODUCTS.filter(function (p) { return wordMatch(p.base_name, q); }).slice(0, 50);
+    hlIdx = 0;
+    dd.innerHTML = ddItems.map(function (p, i) {
+      return '<div data-i="' + i + '" style="padding:8px 12px;font-size:13px;cursor:pointer;">' +
+        esc(p.base_name) + ' <span class="muted" style="font-size:11px;">· продано ' + fmtInt(p.sold) +
+        " · на складе " + fmtInt(p.in_stock) + "</span></div>";
+    }).join("") || '<div class="muted" style="padding:8px 12px;font-size:13px;">ничего не нашлось</div>';
+    dd.style.display = "block";
+    paintHl();
+    dd.querySelectorAll("[data-i]").forEach(function (el) {
+      el.addEventListener("mousedown", function (e) {
+        e.preventDefault();
+        pick(ddItems[parseInt(el.getAttribute("data-i"), 10)].base_name);
+      });
+      el.addEventListener("mouseenter", function () { hlIdx = parseInt(el.getAttribute("data-i"), 10); paintHl(); });
+    });
+  }
+  function paintHl() {
+    dd.querySelectorAll("[data-i]").forEach(function (el, i) {
+      el.style.background = i === hlIdx ? "var(--accent-soft, #eaf0fe)" : "";
+    });
+  }
+  function pick(base) {
+    SEL = base;
+    inp.value = base;
+    dd.style.display = "none";
+    calc();
+  }
+  inp.addEventListener("input", function () { SEL = null; showDD(); });
+  inp.addEventListener("focus", showDD);
+  document.addEventListener("click", function (e) {
+    if (!e.target.closest(".search-box")) dd.style.display = "none";
+  });
+  inp.addEventListener("keydown", function (e) {
+    if (dd.style.display === "none") return;
+    if (e.key === "ArrowDown") { e.preventDefault(); hlIdx = Math.min(hlIdx + 1, ddItems.length - 1); paintHl(); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); hlIdx = Math.max(hlIdx - 1, 0); paintHl(); }
+    else if (e.key === "Enter") { e.preventDefault(); if (ddItems[hlIdx]) pick(ddItems[hlIdx].base_name); }
+    else if (e.key === "Escape") { dd.style.display = "none"; }
+  });
+
+  // ── переключатели ──
+  document.getElementById("period-seg").addEventListener("click", function (e) {
+    var b = e.target.closest(".chip"); if (!b) return;
+    PERIOD = b.getAttribute("data-p");
+    this.querySelectorAll(".chip").forEach(function (x) { x.classList.toggle("active", x === b); });
+    calc();
+  });
+  document.getElementById("mode-seg").addEventListener("click", function (e) {
+    var b = e.target.closest(".chip"); if (!b) return;
+    MODE = b.getAttribute("data-m");
+    this.querySelectorAll(".chip").forEach(function (x) { x.classList.toggle("active", x === b); });
+    if (LAST) renderTable(LAST); // режим влияет только на подсветку колонок
+  });
+  document.getElementById("qty").addEventListener("input", debounce(calc, 250));
+
+  var LAST = null;
+
+  function calc() {
+    if (!SEL) return;
+    var q = Math.max(0, parseInt(document.getElementById("qty").value, 10) || 0);
+    api("/api/sizes/calc?product=" + encodeURIComponent(SEL) + "&qty=" + q +
+        "&period=" + encodeURIComponent(PERIOD) + "&mode=" + MODE)
+      .then(function (d) { LAST = d; render(d); })
+      .catch(function () {});
+  }
+
+  function render(d) {
+    var warn = document.getElementById("warn-box");
+    warn.innerHTML = d.warning
+      ? '<div class="card"><div class="card-body"><span class="badge yellow">' + esc(d.warning) + "</span></div></div>"
+      : "";
+
+    if (!d.sizes.length) {
+      document.getElementById("thead").innerHTML = "";
+      document.getElementById("tbody").innerHTML =
+        '<tr><td><div class="loading-stub">Нет данных по этой позиции</div></td></tr>';
+      document.getElementById("cards").style.display = "none";
+      return;
+    }
+
+    document.getElementById("cards").style.display = "";
+    document.getElementById("m-sold").textContent = fmtInt(d.totals.sold_period) + " шт";
+    document.getElementById("m-sold-s").textContent = d.period_label +
+      (d.months_in_period ? " · " + d.months_in_period + " мес" : "");
+    document.getElementById("m-rate").textContent = fmtNum(d.totals.rate_per_month, 1);
+    document.getElementById("m-stock").textContent = fmtInt(d.totals.stock) + " шт";
+    document.getElementById("m-order").textContent = fmtInt(d.totals.order) + " шт";
+    document.getElementById("m-order-s").textContent = d.sizes.length + " размер(а/ов)";
+
+    renderTable(d);
+  }
+
+  function renderTable(d) {
+    var stockCol = MODE === "stock";
+    var hl = ' style="background:var(--green-soft,#e8f6e4);"';
+    document.getElementById("thead").innerHTML = "<tr><th>Размер</th>" +
+      '<th class="num">Продажи за период</th><th class="num">Доля продаж</th><th class="num">Остаток сейчас</th>' +
+      '<th class="num"' + (stockCol ? hl : "") + ">Заказать · с учётом остатков</th>" +
+      '<th class="num"' + (!stockCol ? hl : "") + ">Заказать · чистая пропорция</th></tr>";
+
+    var maxShare = Math.max.apply(null, d.sizes.map(function (s) { return s.share; }).concat([0.0001]));
+    var rows = d.sizes.map(function (s) {
+      var bar = '<span style="display:inline-block;width:64px;height:6px;border-radius:3px;background:#eef0f3;vertical-align:middle;margin-right:7px;overflow:hidden;">' +
+        '<i style="display:block;height:100%;width:' + Math.round(s.share / maxShare * 100) + '%;background:var(--accent,#2563eb);border-radius:3px;"></i></span>';
+      return "<tr><td><b>" + esc(s.size) + "</b></td>" +
+        '<td class="num' + (s.sold ? "" : " muted") + '">' + fmtInt(s.sold) + "</td>" +
+        '<td class="num">' + bar + Math.round(s.share * 100) + " %</td>" +
+        '<td class="num' + (s.stock ? "" : " muted") + '">' + fmtInt(s.stock) + "</td>" +
+        '<td class="num"' + (stockCol ? hl : "") + "><b" + (stockCol ? "" : ' class="muted"') + ">" + fmtInt(s.order_stock) + "</b></td>" +
+        '<td class="num"' + (!stockCol ? hl : "") + "><b" + (!stockCol ? "" : ' class="muted"') + ">" + fmtInt(s.order_pure) + "</b></td></tr>";
+    }).join("");
+
+    var sumStock = d.sizes.reduce(function (a, s) { return a + s.order_stock; }, 0);
+    var sumPure = d.sizes.reduce(function (a, s) { return a + s.order_pure; }, 0);
+    rows += '<tr style="font-weight:700;background:#f6f7f9;"><td>Итого</td>' +
+      '<td class="num">' + fmtInt(d.totals.sold_period) + "</td>" +
+      '<td class="num">100 %</td>' +
+      '<td class="num">' + fmtInt(d.totals.stock) + "</td>" +
+      '<td class="num">' + fmtInt(sumStock) + "</td>" +
+      '<td class="num">' + fmtInt(sumPure) + "</td></tr>";
+    document.getElementById("tbody").innerHTML = rows;
+  }
+});
+</script>
+{% endblock %}

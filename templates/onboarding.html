@@ -20,7 +20,7 @@
         </div>
         <div>
           <div class="so-title">МойСклад</div>
-          <div class="so-text">Подключение по API-токену. Синхронизация остатков, продаж и возвратов начнётся автоматически.</div>
+          <div class="so-text">Подключение по API-токену. Синхронизируем остатки, историю продаж и возвраты по выбранным складам.</div>
           <div class="ms-token-form" id="ms-token-form" style="display:none; margin-top:12px;">
             <div class="field" style="margin-bottom:10px;">
               <label for="ms-token">API-токен МойСклад</label>
@@ -47,12 +47,25 @@
       </div>
     </div>
 
-    <!-- Шаг 2: прогресс -->
+    <!-- Шаг 1.5 (МойСклад): выбор складов -->
+    <div id="step-stores" style="display:none;">
+      <h1>Выберите склады</h1>
+      <p class="auth-sub">Аналитика считается по остаткам и продажам выбранных складов. Обычно это торговые точки и интернет-магазин — сервисные склады (брак, съёмки) лучше не включать.</p>
+      <div id="stores-list" class="stores-list" style="margin:14px 0;"></div>
+      <button class="btn primary" type="button" id="btn-start-sync">Начать синхронизацию</button>
+      <div class="hint" id="stores-estimate" style="margin-top:10px;"></div>
+    </div>
+
+    <!-- Шаг 2: прогресс (демо — анимация; МойСклад — реальный поллинг) -->
     <div id="step-2" style="display:none;">
       <h1 id="progress-title">Готовим данные…</h1>
       <p class="auth-sub" id="progress-sub">Обычно это занимает меньше минуты</p>
       <div class="progress-track"><i id="progress-fill"></i></div>
       <div class="progress-note" id="progress-note">Создаём подключение…</div>
+      <div id="sync-error" style="display:none; margin-top:14px;">
+        <p class="auth-sub" id="sync-error-text" style="color:#e5484d;"></p>
+        <button class="btn" type="button" id="btn-sync-back">Назад</button>
+      </div>
     </div>
 
   </div>
@@ -88,9 +101,14 @@ document.addEventListener("DOMContentLoaded", function () {
   var fill = document.getElementById("progress-fill");
   var note = document.getElementById("progress-note");
 
+  function showStep(id) {
+    ["step-1", "step-stores", "step-2"].forEach(function (s) {
+      document.getElementById(s).style.display = s === id ? "block" : "none";
+    });
+  }
+
   function showProgress(steps, done) {
-    document.getElementById("step-1").style.display = "none";
-    document.getElementById("step-2").style.display = "block";
+    showStep("step-2");
     var i = 0;
     function tick() {
       if (i < steps.length) {
@@ -104,6 +122,8 @@ document.addEventListener("DOMContentLoaded", function () {
     }
     tick();
   }
+
+  /* ── Демо-путь (как был) ─────────────────────────────────────────────── */
 
   document.getElementById("btn-connect-demo").addEventListener("click", function () {
     var btn = this;
@@ -121,22 +141,105 @@ document.addEventListener("DOMContentLoaded", function () {
     }).catch(function () { btn.disabled = false; });
   });
 
+  /* ── Путь МойСклад: токен → склады → первичный синк с поллингом ──────── */
+
   document.getElementById("btn-connect-ms").addEventListener("click", function () {
     var token = document.getElementById("ms-token").value.trim();
     if (!token) { toast("Вставьте API-токен МойСклад", "error"); return; }
     var btn = this;
     btn.disabled = true;
-    api("/api/connect/moysklad", { method: "POST", body: { token: token } }).then(function (res) {
-      document.getElementById("progress-title").textContent = "Подключение сохранено";
-      document.getElementById("progress-sub").textContent = (res && res.note) || "Синхронизация начнётся автоматически";
-      showProgress([
-        ["Проверяем токен…", 30],
-        ["Ставим синхронизацию в очередь…", 70],
-        ["Готово!", 100]
-      ], function () {
-        window.location.href = "/";
-      });
+    api("/api/connect/moysklad", { method: "POST", body: { token: token } }).then(function () {
+      return api("/api/connect/moysklad/stores");
+    }).then(function (res) {
+      renderStores((res && res.stores) || []);
+      showStep("step-stores");
+      btn.disabled = false;
     }).catch(function () { btn.disabled = false; });
+  });
+
+  function renderStores(stores) {
+    var box = document.getElementById("stores-list");
+    box.innerHTML = "";
+    if (!stores.length) {
+      box.innerHTML = '<p class="auth-sub">В аккаунте МойСклад не найдено ни одного склада.</p>';
+      return;
+    }
+    stores.forEach(function (s) {
+      var label = document.createElement("label");
+      label.className = "store-check";
+      label.style.cssText = "display:flex; align-items:center; gap:10px; padding:9px 12px; border:1px solid #e5e7eb; border-radius:8px; margin-bottom:8px; cursor:pointer;";
+      var cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.value = s.ext_id;
+      cb.checked = !!s.selected;
+      var span = document.createElement("span");
+      span.textContent = s.name;
+      label.appendChild(cb);
+      label.appendChild(span);
+      box.appendChild(label);
+    });
+  }
+
+  document.getElementById("btn-start-sync").addEventListener("click", function () {
+    var ids = Array.prototype.slice.call(
+      document.querySelectorAll("#stores-list input[type=checkbox]:checked")
+    ).map(function (cb) { return cb.value; });
+    if (!ids.length) { toast("Выберите хотя бы один склад", "error"); return; }
+    var btn = this;
+    btn.disabled = true;
+    api("/api/connect/moysklad/stores", { method: "POST", body: { ext_ids: ids } }).then(function () {
+      return api("/api/sync/initial", { method: "POST", body: {} });
+    }).then(function (res) {
+      document.getElementById("progress-title").textContent = "Синхронизация с МойСклад";
+      var est = res && res.estimate_minutes;
+      document.getElementById("progress-sub").textContent = est
+        ? "Забираем историю остатков и продаж. Ориентировочно " + Math.max(1, Math.round(est)) + " мин — можно оставить вкладку открытой."
+        : "Забираем историю остатков и продаж из МойСклад";
+      showStep("step-2");
+      pollSync();
+    }).catch(function () { btn.disabled = false; });
+  });
+
+  var STAGE_LABELS = {
+    queued: "Ставим задачу в очередь…",
+    products: "Загружаем ассортимент…",
+    stock_history: "Собираем историю остатков…",
+    stock_today: "Обновляем остатки на сегодня…",
+    sales: "Загружаем продажи и возвраты…",
+    finalize: "Пересчитываем аналитику…",
+    done: "Готово!"
+  };
+
+  function pollSync() {
+    api("/api/sync/status").then(function (st) {
+      st = st || {};
+      var pct = Math.max(2, Math.min(100, st.progress_pct || 0));
+      fill.style.width = pct + "%";
+      note.textContent = st.detail || STAGE_LABELS[st.stage] || "Синхронизируем…";
+      if (st.state === "done") {
+        fill.style.width = "100%";
+        note.textContent = "Готово! Открываем показатели…";
+        setTimeout(function () { window.location.href = "/"; }, 700);
+        return;
+      }
+      if (st.state === "error") {
+        document.getElementById("progress-title").textContent = "Синхронизация не удалась";
+        document.getElementById("sync-error-text").textContent =
+          st.error || "Неизвестная ошибка. Попробуйте ещё раз.";
+        document.getElementById("sync-error").style.display = "block";
+        return;
+      }
+      setTimeout(pollSync, 1500);
+    }).catch(function () {
+      // разовый сбой поллинга не прерывает ожидание
+      setTimeout(pollSync, 3000);
+    });
+  }
+
+  document.getElementById("btn-sync-back").addEventListener("click", function () {
+    document.getElementById("sync-error").style.display = "none";
+    document.getElementById("btn-start-sync").disabled = false;
+    showStep("step-stores");
   });
 });
 </script>

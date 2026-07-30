@@ -1,0 +1,174 @@
+{% extends "base.html" %}
+{% block content %}
+
+<p class="page-sub">Каждая позиция распродаётся своим темпом, пока не закончится; «едет к нам» учтено в остатке. Архивные исключены.</p>
+
+<div class="metric-grid" style="grid-template-columns:repeat(4,1fr);">
+  <div class="metric"><div class="m-label">Сток сейчас</div><div class="m-value" id="c-stock">—</div><div class="m-sub" id="c-stock-s"></div></div>
+  <div class="metric"><div class="m-label">Едет к нам</div><div class="m-value" id="c-inc">—</div><div class="m-sub" id="c-inc-s"></div></div>
+  <div class="metric"><div class="m-label">Темп продаж</div><div class="m-value" id="c-pace">—</div><div class="m-sub" id="c-pace-s"></div></div>
+  <div class="metric"><div class="m-label">Стока хватит примерно</div><div class="m-value" id="c-until">—</div><div class="m-sub" id="c-until-s"></div></div>
+</div>
+
+<div class="card">
+  <div class="card-head"><h2 style="font-size:14px;margin:0;">Стоимость остатка · 26 недель вперёд</h2></div>
+  <div class="card-body">
+    <div id="chart-box" style="width:100%;"><div class="loading-stub">Загрузка…</div></div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="toolbar">
+    <div class="search-box">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.5" y2="16.5"/></svg>
+      <input class="input" type="search" id="search" placeholder="Поиск по позициям…" autocomplete="off">
+    </div>
+    <span class="muted" style="font-size:12px;">введите минимум 2 символа</span>
+  </div>
+  <div class="tbl-wrap" id="items-wrap" style="display:none;">
+    <table class="tbl">
+      <thead><tr>
+        <th>Позиция</th>
+        <th class="num">Сток, шт</th>
+        <th class="num">+ едет</th>
+        <th class="num">Темп, шт/день</th>
+        <th class="num">Темп, ₽/день</th>
+        <th class="num">Распродастся к</th>
+      </tr></thead>
+      <tbody id="items-tbody"></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-head"><h2 style="font-size:14px;margin:0;">Категории: чем богаты и как быстро распродаётся</h2></div>
+  <div class="tbl-wrap">
+    <table class="tbl">
+      <thead><tr>
+        <th>Категория</th>
+        <th class="num">Сток, шт</th>
+        <th class="num">+ едет</th>
+        <th class="num">Потенциал выручки</th>
+        <th class="num">Темп, ₽/день</th>
+        <th class="num">Хватит на</th>
+      </tr></thead>
+      <tbody id="cat-tbody"><tr><td colspan="6"><div class="loading-stub">Загрузка…</div></td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+  var ITEMS = [];
+
+  function fmtShort(n) {
+    n = n || 0;
+    if (Math.abs(n) >= 1e6) return fmtNum(n / 1e6, 2) + " млн ₽";
+    if (Math.abs(n) >= 1e3) return fmtInt(n / 1e3) + " тыс ₽";
+    return fmtMoney(n);
+  }
+
+  api("/api/forecast").then(function (d) {
+    ITEMS = d.items || [];
+    renderCards(d.cards);
+    drawChart(d.weeks || []);
+    renderCats(d.categories || []);
+  }).catch(function () {
+    document.getElementById("chart-box").innerHTML =
+      emptyState("Не удалось загрузить данные", "Обновите страницу или попробуйте позже.", "");
+  });
+
+  function renderCards(c) {
+    document.getElementById("c-stock").textContent = fmtInt(c.stock_units) + " шт";
+    document.getElementById("c-stock-s").textContent = "потенциал " + fmtShort(c.stock_value) + " по ценам продажи";
+    document.getElementById("c-inc").textContent = c.incoming_units ? fmtInt(c.incoming_units) + " шт" : "—";
+    document.getElementById("c-inc-s").textContent = c.incoming_units ? "≈ " + fmtShort(c.incoming_value) : "заказано на производстве";
+    document.getElementById("c-pace").textContent = fmtShort(c.pace_rub) + "/день";
+    document.getElementById("c-pace-s").textContent = "≈ " + fmtShort(c.pace_rub * 30) + " в месяц при текущем темпе";
+    if (c.until_date) {
+      document.getElementById("c-until").textContent = "до " + fmtDate(c.until_date);
+      document.getElementById("c-until-s").textContent =
+        "90 % продаваемого стока распродастся за " + c.until_weeks + " нед";
+    } else {
+      document.getElementById("c-until").textContent = "> 6 месяцев";
+      document.getElementById("c-until-s").textContent = "текущего стока хватает надолго";
+    }
+  }
+
+  function drawChart(weeks) {
+    var box = document.getElementById("chart-box");
+    if (!weeks.length) { box.innerHTML = '<div class="loading-stub">Нет данных</div>'; return; }
+    var W = Math.max(box.clientWidth || 900, 600), H = 260;
+    var padL = 8, padR = 84, padT = 12, padB = 26;
+    var maxV = Math.max.apply(null, weeks.map(function (w) { return w.stock_value; })) * 1.05 || 1;
+    var n = weeks.length;
+    var x = function (i) { return padL + i * (W - padL - padR) / (n - 1); };
+    var y = function (v) { return H - padB - (v / maxV) * (H - padT - padB); };
+
+    var grid = "", labels = "";
+    for (var k = 0; k <= 4; k++) {
+      var v = maxV * k / 4, yy = y(v);
+      grid += '<line x1="' + padL + '" y1="' + yy + '" x2="' + (W - padR) + '" y2="' + yy +
+        '" stroke="#e5e7eb" stroke-width="1"/>';
+      labels += '<text x="' + (W - padR + 6) + '" y="' + (yy + 4) + '" font-size="10" fill="#8b93a1">' +
+        fmtShort(v) + "</text>";
+    }
+    var pts = weeks.map(function (w, i) { return x(i) + "," + y(w.stock_value); }).join(" ");
+    var area = padL + "," + (H - padB) + " " + pts + " " + x(n - 1) + "," + (H - padB);
+    var ticks = "";
+    for (var i = 0; i < n; i += 4) {
+      ticks += '<text x="' + x(i) + '" y="' + (H - 8) + '" font-size="9" fill="#8b93a1" text-anchor="middle">' +
+        fmtDate(weeks[i].date) + "</text>";
+    }
+    box.innerHTML =
+      '<svg viewBox="0 0 ' + W + " " + H + '" width="100%" height="' + H + '" role="img" aria-label="Прогноз стоимости стока">' +
+      grid +
+      '<polygon points="' + area + '" fill="rgba(37,99,235,0.10)"/>' +
+      '<polyline points="' + pts + '" fill="none" stroke="#2563eb" stroke-width="2" stroke-linejoin="round"/>' +
+      labels + ticks +
+      "</svg>";
+  }
+
+  function renderCats(cats) {
+    var tb = document.getElementById("cat-tbody");
+    if (!cats.length) {
+      tb.innerHTML = '<tr><td colspan="6">' + emptyState("Данных пока нет", "Подключите источник данных.", "") + "</td></tr>";
+      return;
+    }
+    tb.innerHTML = cats.map(function (c) {
+      var pill;
+      if (c.status === "none") pill = '<span class="badge gray">нет продаж</span>';
+      else if (c.status === "low") pill = '<span class="badge red">' + fmtInt(c.days_left) + " дн — мало!</span>";
+      else if (c.status === "ok") pill = '<span class="badge green">' + fmtInt(c.days_left) + " дн</span>";
+      else pill = '<span class="badge yellow">' + fmtInt(c.days_left) + " дн — затоварка</span>";
+      return "<tr><td><b>" + esc(c.name) + "</b></td>" +
+        '<td class="num">' + fmtInt(c.stock_units) + "</td>" +
+        '<td class="num">' + (c.incoming ? "+" + fmtInt(c.incoming) : "—") + "</td>" +
+        '<td class="num"><b>' + fmtShort(c.value) + "</b></td>" +
+        '<td class="num">' + fmtShort(c.pace_rub) + "</td>" +
+        '<td class="num">' + pill + "</td></tr>";
+    }).join("");
+  }
+
+  function renderSearch() {
+    var q = (document.getElementById("search").value || "").trim();
+    var wrap = document.getElementById("items-wrap");
+    if (q.length < 2) { wrap.style.display = "none"; return; }
+    var list = ITEMS.filter(function (x) { return wordMatch(x.base_name, q); }).slice(0, 30);
+    wrap.style.display = "";
+    document.getElementById("items-tbody").innerHTML = list.map(function (x) {
+      return "<tr><td><b>" + esc(x.base_name) + '</b> <span class="muted">' + esc(x.category) + "</span></td>" +
+        '<td class="num">' + fmtInt(x.cs) + "</td>" +
+        '<td class="num">' + (x.ordered ? "+" + fmtInt(x.ordered) : "—") + "</td>" +
+        '<td class="num">' + (x.rate > 0 ? fmtNum(x.rate, 2) : "—") + "</td>" +
+        '<td class="num">' + (x.pace_rub ? fmtShort(x.pace_rub) : "—") + "</td>" +
+        '<td class="num">' + (x.sellout_date ? fmtDate(x.sellout_date) + ' <span class="muted">(' + fmtInt(x.sellout_days) + " дн)</span>" : '<span class="muted">нет продаж</span>') + "</td></tr>";
+    }).join("") || '<tr><td colspan="6"><div class="loading-stub">Не найдено</div></td></tr>';
+  }
+  document.getElementById("search").addEventListener("input", debounce(renderSearch, 150));
+});
+</script>
+{% endblock %}

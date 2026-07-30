@@ -16,6 +16,8 @@ from sqlalchemy.orm import Session
 
 from app import auth
 from app.api import router as api_router
+from app.routes_connect import router as connect_router
+from app.routes_extra import router as extra_router
 from app.db import get_db, init_db
 from app.models import Connection, Membership, Org, User
 
@@ -28,6 +30,8 @@ TRIAL_DAYS = 14
 
 app = FastAPI(title="Оборот", docs_url=None, redoc_url=None)
 app.include_router(api_router)
+app.include_router(connect_router)
+app.include_router(extra_router)
 templates = Jinja2Templates(directory=[str(d) for d in TEMPLATE_DIRS])
 
 if STATIC_DIR.is_dir():

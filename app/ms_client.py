@@ -4,22 +4,40 @@
 5 параллельных запросов. При 429 сервер присылает X-Lognex-Retry-TimeInterval
 (миллисекунды до снятия ограничения) — ждём и повторяем.
 
-В демо-скоупе реальная синхронизация не запускается; клиент — рабочий каркас
-для боевого синка (ассортимент, остатки по складам, отгрузки/возвраты).
+Базовый URL берётся из env MS_BASE_URL (для тестов подменяется на mock-сервер).
+
+Важные особенности API, учтённые здесь (проверено на реальном бренде, legacy):
+- в отчёте /report/stock/all параметр moment работает ТОЛЬКО внутри filter
+  (`filter=moment=YYYY-MM-DD 23:59:00;store=<href>`); как отдельный
+  query-параметр МойСклад его игнорирует;
+- при expand=positions максимальный limit страницы — 100 (иначе positions
+  приходят href-ами без строк);
+- цены (salePrices[].value, buyPrice.value, price позиций) — в КОПЕЙКАХ.
 """
 import asyncio
+import os
 import time
 from collections import deque
 from typing import Any, AsyncIterator
 
 import httpx
 
-BASE_URL = "https://api.moysklad.ru/api/remap/1.2"
+DEFAULT_BASE_URL = "https://api.moysklad.ru/api/remap/1.2"
 WINDOW_SECONDS = 3.0
 WINDOW_LIMIT = 45
 MAX_PARALLEL = 5
 MAX_RETRIES = 5
 PAGE_LIMIT = 1000
+EXPAND_PAGE_LIMIT = 100  # с expand МойСклад отдаёт максимум 100 строк на страницу
+
+
+def base_url() -> str:
+    """Базовый URL API: env MS_BASE_URL (тесты) или боевой адрес МойСклад."""
+    return os.environ.get("MS_BASE_URL", DEFAULT_BASE_URL).rstrip("/")
+
+
+# Обратная совместимость со старым импортом (значение вычислено на момент импорта).
+BASE_URL = base_url()
 
 
 class RateLimiter:
@@ -52,18 +70,26 @@ class RateLimiter:
 class MoySkladClient:
     """Асинхронный клиент МойСклад: пагинация, ретраи по 429, Bearer-токен."""
 
-    def __init__(self, token: str, base_url: str = BASE_URL) -> None:
-        self._base_url = base_url
+    def __init__(self, token: str, base: str | None = None) -> None:
+        self._base_url = (base or base_url()).rstrip("/")
         self._limiter = RateLimiter()
         self._client = httpx.AsyncClient(
-            base_url=base_url,
+            base_url=self._base_url,
             headers={
                 "Authorization": f"Bearer {token}",
                 "Accept-Encoding": "gzip",
                 "Accept": "application/json;charset=utf-8",
             },
-            timeout=60.0,
+            timeout=90.0,
         )
+
+    @property
+    def api_base(self) -> str:
+        return self._base_url
+
+    def store_href(self, store_ext_id: str) -> str:
+        """href склада для фильтров отчётов и сопоставления документов."""
+        return f"{self._base_url}/entity/store/{store_ext_id}"
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -89,19 +115,20 @@ class MoySkladClient:
             await asyncio.sleep(delay)
         raise RuntimeError("unreachable")
 
-    async def paginate(self, path: str, params: dict | None = None) -> AsyncIterator[dict]:
+    async def paginate(self, path: str, params: dict | None = None,
+                       page_limit: int = PAGE_LIMIT) -> AsyncIterator[dict]:
         """Итерация по всем строкам списочного эндпоинта (limit/offset)."""
         offset = 0
         while True:
             page_params = dict(params or {})
-            page_params.update({"limit": PAGE_LIMIT, "offset": offset})
+            page_params.update({"limit": page_limit, "offset": offset})
             data = await self.get(path, page_params)
             rows: list[dict] = data.get("rows", [])
             for row in rows:
                 yield row
             offset += len(rows)
             meta_size = data.get("meta", {}).get("size", 0)
-            if not rows or offset >= meta_size:
+            if not rows or (offset >= meta_size and len(rows) < page_limit):
                 return
 
     # ── Типовые выборки для синка ────────────────────────────────────────────
@@ -119,11 +146,41 @@ class MoySkladClient:
         return [row async for row in self.paginate("/entity/store")]
 
     async def fetch_assortment(self) -> list[dict]:
-        """Ассортимент (товары/модификации) с ценами и остатками."""
+        """Ассортимент (товары/модификации) с ценами."""
         return [row async for row in self.paginate("/entity/assortment")]
 
+    async def fetch_stock_on(self, day_iso: str, store_ext_id: str) -> list[dict]:
+        """Остатки по складу на КОНЕЦ дня day_iso из /report/stock/all.
+
+        КРИТИЧНО (из legacy rebuild_history): moment передаётся внутри filter —
+        как отдельный query-параметр МойСклад его молча игнорирует и отдаёт
+        остатки на сейчас.
+        """
+        flt = f"moment={day_iso} 23:59:00;store={self.store_href(store_ext_id)}"
+        params = {"filter": flt, "groupBy": "variant"}
+        return [row async for row in self.paginate("/report/stock/all", params)]
+
+    async def fetch_documents(self, entity: str, moment_from: str,
+                              moment_to: str | None = None) -> list[dict]:
+        """Документы (demand | retaildemand | salesreturn) с позициями.
+
+        filter по moment; expand=positions ⇒ страница не больше 100 строк.
+        """
+        flt = f"moment>={moment_from} 00:00:00"
+        if moment_to:
+            flt += f";moment<={moment_to} 23:59:59"
+        params: dict[str, Any] = {"filter": flt, "expand": "positions"}
+        return [
+            row
+            async for row in self.paginate(
+                f"/entity/{entity}", params, page_limit=EXPAND_PAGE_LIMIT
+            )
+        ]
+
+    # Старые имена (каркас демо-скоупа) — оставлены для совместимости.
+
     async def fetch_stock_by_store(self) -> list[dict]:
-        """Отчёт «Остатки по складам»."""
+        """Отчёт «Остатки по складам» (текущий момент)."""
         return [row async for row in self.paginate("/report/stock/bystore")]
 
     async def fetch_demand_positions(self, updated_from: str | None = None) -> list[dict]:
@@ -131,11 +188,13 @@ class MoySkladClient:
         params: dict[str, Any] = {"expand": "positions"}
         if updated_from:
             params["filter"] = f"moment>={updated_from}"
-        return [row async for row in self.paginate("/entity/demand", params)]
+        return [row async for row in self.paginate("/entity/demand", params,
+                                                   page_limit=EXPAND_PAGE_LIMIT)]
 
     async def fetch_sales_returns(self, updated_from: str | None = None) -> list[dict]:
         """Возвраты покупателей."""
         params: dict[str, Any] = {"expand": "positions"}
         if updated_from:
             params["filter"] = f"moment>={updated_from}"
-        return [row async for row in self.paginate("/entity/salesreturn", params)]
+        return [row async for row in self.paginate("/entity/salesreturn", params,
+                                                   page_limit=EXPAND_PAGE_LIMIT)]

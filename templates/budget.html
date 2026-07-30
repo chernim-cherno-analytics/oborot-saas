@@ -1,0 +1,255 @@
+{% extends "base.html" %}
+{% block content %}
+
+<p class="page-sub">Распределение бюджета закупки по оборачиваемости: сначала деньги получают бестселлеры, затем хорошие и так далее. В расчёте — только позиции с продажами за последние 90 дней.</p>
+
+<div class="card">
+  <div class="toolbar" style="flex-wrap:wrap;">
+    <label class="toggle-line" style="gap:8px;">Бюджет, ₽
+      <input class="input" id="amount" type="text" inputmode="numeric" value="200 000" style="width:130px;text-align:right;font-weight:600;">
+    </label>
+    <label class="toggle-line" style="gap:8px;">Макс. на позицию, %
+      <input class="input" id="max-share" type="number" min="5" max="100" value="30" style="width:70px;text-align:center;">
+    </label>
+    <button class="btn primary" id="calc-btn" type="button">Распределить</button>
+    <span class="muted" id="status-hint" style="font-size:12px;"></span>
+  </div>
+  <div class="toolbar" style="border-top:none;">
+    <span class="muted" style="font-size:12px;">Категории:</span>
+    <div class="chips" id="cat-chips"></div>
+  </div>
+</div>
+
+<div class="metric-grid" id="cards" style="grid-template-columns:repeat(4,1fr);display:none;">
+  <div class="metric"><div class="m-label">Бюджет</div><div class="m-value" id="m-amount">—</div></div>
+  <div class="metric"><div class="m-label">Использовано</div><div class="m-value" id="m-used">—</div><div class="m-sub" id="m-used-sub"></div></div>
+  <div class="metric"><div class="m-label">Позиций / штук</div><div class="m-value" id="m-pos">—</div></div>
+  <div class="metric"><div class="m-label">Ожидаемая прибыль</div><div class="m-value txt-green" id="m-profit">—</div><div class="m-sub">при распродаже по средней цене</div></div>
+</div>
+
+<div class="card" id="tbl-card" style="display:none;">
+  <div class="tbl-wrap">
+    <table class="tbl">
+      <thead>
+        <tr>
+          <th>Позиция</th>
+          <th style="width:56px;">Класс</th>
+          <th class="num" title="Нетто-выручка ₽ в день в стоке — как на /turnover">Оборач., ₽/день</th>
+          <th class="num" title="Честный темп продаж">Темп, шт/мес</th>
+          <th class="num" title="Остаток + едет к нам">Остаток+едет</th>
+          <th class="num" title="На сколько дней хватит текущего запаса">Запас, дн</th>
+          <th class="num" title="Темп × горизонт − остаток − едет">Потребность</th>
+          <th class="num">Заказать</th>
+          <th class="num">Себес/шт</th>
+          <th class="num">Сумма</th>
+          <th class="num">Прибыль</th>
+        </tr>
+      </thead>
+      <tbody id="tbody"></tbody>
+      <tfoot id="tfoot">
+        <tr>
+          <td id="f-count"></td><td></td><td></td><td></td><td></td><td></td><td></td>
+          <td class="num" id="f-qty"></td><td></td>
+          <td class="num" id="f-total"></td>
+          <td class="num" id="f-profit"></td>
+        </tr>
+      </tfoot>
+    </table>
+  </div>
+</div>
+
+<div id="placeholder" class="card"><div class="card-body"><div class="loading-stub">Введите бюджет и нажмите «Распределить»</div></div></div>
+
+<div class="card" id="skipped-card" style="display:none;">
+  <div class="card-head clickable" data-fold="skipped-body"><h2 style="font-size:14px;margin:0;">Не вошло в бюджет <span class="muted" id="skipped-cnt"></span></h2></div>
+  <div class="tbl-wrap" id="skipped-body" style="display:none;">
+    <table class="tbl">
+      <thead><tr><th>Позиция</th><th class="num">Оборач., ₽/день</th><th class="num">Потребность</th><th class="num">Себес/шт</th><th class="num">Надо ₽</th></tr></thead>
+      <tbody id="skipped-tbody"></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="card" id="nocost-card" style="display:none;">
+  <div class="card-head clickable" data-fold="nocost-body"><h2 style="font-size:14px;margin:0;">Нет себестоимости — пропущены <span class="muted" id="nocost-cnt"></span></h2></div>
+  <div class="card-body" id="nocost-body" style="display:none;"></div>
+</div>
+
+<p class="hint" id="fresh-note" style="display:none;margin-top:8px;color:var(--text-soft);font-size:12px;"></p>
+
+<p class="page-sub" style="margin-top:12px;">
+  <b>Как считается.</b> Приоритет — оборачиваемость (нетто-выручка ₽/день, шкала как на «Оборачиваемости»).
+  Потребность = темп продаж × горизонт − остаток − «едет к нам», в расчёт входят позиции с потребностью ≥ 3 шт
+  и продажами за последние 90 дней. «Макс. на позицию» ограничивает долю бюджета на одну позицию;
+  освободившиеся деньги уходят следующим по оборачиваемости. Позиция, чья 1 штука дороже лимита,
+  входит минимум 1 шт с пометкой. Позиции без себестоимости не считаются по нулю — отдельным списком.
+  Архивные исключены.
+</p>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+  var offCats = {};        // выключенные категории
+  var knownCats = [];      // все категории из ответа
+  var loading = false;
+
+  var amountInput = document.getElementById("amount");
+
+  function parseAmount() {
+    var raw = (amountInput.value || "").replace(/[^\d]/g, "");
+    return parseInt(raw, 10) || 0;
+  }
+  amountInput.addEventListener("input", function () {
+    var n = parseAmount();
+    amountInput.value = n ? fmtInt(n) : "";
+  });
+  amountInput.addEventListener("keydown", function (e) { if (e.key === "Enter") calc(); });
+  document.getElementById("max-share").addEventListener("keydown", function (e) { if (e.key === "Enter") calc(); });
+  document.getElementById("calc-btn").addEventListener("click", calc);
+
+  // Сворачиваемые секции
+  document.querySelectorAll("[data-fold]").forEach(function (head) {
+    head.addEventListener("click", function () {
+      var body = document.getElementById(head.getAttribute("data-fold"));
+      body.style.display = body.style.display === "none" ? "" : "none";
+    });
+  });
+
+  function renderChips() {
+    var box = document.getElementById("cat-chips");
+    box.innerHTML = knownCats.map(function (c) {
+      var off = offCats[c];
+      return '<button class="chip' + (off ? "" : " active") + '" data-cat="' + esc(c) + '"' +
+        (off ? ' style="opacity:.5;text-decoration:line-through;"' : "") + '>' + esc(c) + "</button>";
+    }).join("");
+    box.querySelectorAll(".chip").forEach(function (chip) {
+      chip.addEventListener("click", function () {
+        var c = chip.getAttribute("data-cat");
+        offCats[c] = !offCats[c];
+        renderChips();
+        calc();
+      });
+    });
+  }
+
+  function calc() {
+    var amount = parseAmount();
+    if (amount <= 0) { toast("Введите бюджет", "error"); return; }
+    var share = parseInt(document.getElementById("max-share").value, 10);
+    if (!isFinite(share) || share < 5) share = 5;
+    if (share > 100) share = 100;
+    document.getElementById("max-share").value = share;
+    var excl = Object.keys(offCats).filter(function (c) { return offCats[c]; });
+    if (loading) return;
+    loading = true;
+    document.getElementById("status-hint").textContent = "считаю…";
+    api("/api/budget?amount=" + amount + "&max_share=" + share +
+        "&exclude_cats=" + encodeURIComponent(excl.join(",")))
+      .then(render)
+      .catch(function () {})
+      .finally(function () {
+        loading = false;
+        document.getElementById("status-hint").textContent = "";
+      });
+  }
+
+  function noteCell(it) {
+    var notes = [];
+    if (it.over_limit) notes.push('<span class="badge yellow">дорогая позиция — сверх лимита</span>');
+    else if (it.capped && it.cap_reason === "share") notes.push('<span class="badge gray">лимит доли, потребность ' + fmtInt(it.need) + "</span>");
+    else if (it.capped) notes.push('<span class="badge gray">частично, потребность ' + fmtInt(it.need) + "</span>");
+    return notes.join(" ");
+  }
+
+  function daysTxt(d) {
+    if (d === null || d === undefined) return '<span class="muted">—</span>';
+    if (d <= 0) return '<span class="txt-red">распродано</span>';
+    if (d < 30) return '<span class="txt-red">' + fmtInt(d) + "</span>";
+    if (d < 60) return '<span class="txt-yellow">' + fmtInt(d) + "</span>";
+    return fmtInt(d);
+  }
+
+  function render(d) {
+    knownCats = d.categories || [];
+    renderChips();
+
+    document.getElementById("placeholder").style.display = "none";
+    document.getElementById("cards").style.display = "";
+    document.getElementById("m-amount").textContent = fmtMoney(d.amount);
+    document.getElementById("m-used").textContent = fmtMoney(d.used);
+    document.getElementById("m-used-sub").textContent =
+      Math.round(d.used / d.amount * 100) + " % · остаток " + fmtMoney(d.rest);
+    document.getElementById("m-pos").textContent = fmtInt(d.totals.positions) + " / " + fmtInt(d.totals.units);
+    document.getElementById("m-profit").textContent = fmtMoney(d.totals.expected_profit);
+
+    var tbody = document.getElementById("tbody");
+    document.getElementById("tbl-card").style.display = "";
+    if (!d.items.length) {
+      tbody.innerHTML = '<tr><td colspan="11">' +
+        emptyState("Ни одна позиция не поместилась в бюджет",
+          "Попробуйте сумму побольше или включите категории.", "") + "</td></tr>";
+      document.getElementById("tfoot").style.display = "none";
+    } else {
+      tbody.innerHTML = d.items.map(function (it, i) {
+        return "<tr>" +
+          '<td class="name-cell"><div class="name-main">' + (i + 1) + ". " + esc(it.base_name) + " " + noteCell(it) +
+            '</div><div class="name-sub">' + esc(it.category) + "</div></td>" +
+          "<td>" + clsDot(it.cls) + "</td>" +
+          '<td class="num"><b>' + fmtInt(it.turnover) + "</b></td>" +
+          '<td class="num">' + fmtNum(it.rate * 30, 1) + "</td>" +
+          '<td class="num">' + fmtInt(it.stock_eff) +
+            (it.ordered ? ' <span class="muted">(+' + fmtInt(it.ordered) + " едет)</span>" : "") + "</td>" +
+          '<td class="num">' + daysTxt(it.days_left) + "</td>" +
+          '<td class="num muted">' + fmtInt(it.need) + "</td>" +
+          '<td class="num"><b>' + fmtInt(it.qty) + "</b></td>" +
+          '<td class="num">' + fmtMoney(it.cost_price) + "</td>" +
+          '<td class="num"><b>' + fmtMoney(it.total) + "</b></td>" +
+          '<td class="num">' + fmtMoney(it.expected_profit) + "</td>" +
+          "</tr>";
+      }).join("");
+      document.getElementById("tfoot").style.display = "";
+      document.getElementById("f-count").textContent = "Итого: " + fmtInt(d.items.length) + " поз.";
+      document.getElementById("f-qty").textContent = fmtInt(d.totals.units);
+      document.getElementById("f-total").textContent = fmtMoney(d.used);
+      document.getElementById("f-profit").textContent = fmtMoney(d.totals.expected_profit);
+    }
+
+    var sk = document.getElementById("skipped-card");
+    if (d.not_included.length) {
+      sk.style.display = "";
+      document.getElementById("skipped-cnt").textContent =
+        "· " + d.not_included.length + " поз. — следующие по оборачиваемости";
+      document.getElementById("skipped-tbody").innerHTML = d.not_included.map(function (s) {
+        return "<tr><td>" + esc(s.base_name) + "</td>" +
+          '<td class="num">' + fmtInt(s.turnover) + "</td>" +
+          '<td class="num">' + fmtInt(s.need) + " шт</td>" +
+          '<td class="num">' + fmtMoney(s.cost_price) + "</td>" +
+          '<td class="num">' + fmtMoney(s.need_rub) + "</td></tr>";
+      }).join("");
+    } else sk.style.display = "none";
+
+    var nc = document.getElementById("nocost-card");
+    if (d.no_cost.length) {
+      nc.style.display = "";
+      document.getElementById("nocost-cnt").textContent = "· " + d.no_cost.length + " поз. — задайте себестоимость";
+      document.getElementById("nocost-body").innerHTML = d.no_cost.map(function (x) {
+        return esc(x.base_name) + ' <span class="muted">(оборач. ' + fmtInt(x.turnover) +
+          " · потребность " + fmtInt(x.need) + " шт)</span>";
+      }).join("<br>");
+    } else nc.style.display = "none";
+
+    var fn = document.getElementById("fresh-note");
+    if (d.excluded_fresh_count > 0) {
+      fn.style.display = "";
+      fn.textContent = "Без продаж за " + d.fresh_days + " дней — исключено из расчёта: " +
+        d.excluded_fresh_count + " поз.";
+    } else fn.style.display = "none";
+  }
+
+  // первичная загрузка — чтобы сразу показать категории и результат с дефолтами
+  calc();
+});
+</script>
+{% endblock %}
