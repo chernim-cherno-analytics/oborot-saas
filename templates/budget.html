@@ -12,6 +12,10 @@
       <input class="input" id="max-share" type="number" min="5" max="100" value="30" style="width:70px;text-align:center;">
     </label>
     <button class="btn primary" id="calc-btn" type="button">Распределить</button>
+    <a class="btn" id="export-btn" href="/api/export/budget.xlsx?amount=200000&amp;max_share=30" download title="Выгрузить распределение в Excel">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+      Скачать Excel
+    </a>
     <span class="muted" id="status-hint" style="font-size:12px;"></span>
   </div>
   <div class="toolbar" style="border-top:none;">
@@ -174,6 +178,12 @@ document.addEventListener("DOMContentLoaded", function () {
   function render(d) {
     knownCats = d.categories || [];
     renderChips();
+
+    // Ссылка «Скачать Excel» повторяет параметры текущего расчёта
+    var excl = knownCats.filter(function (c) { return offCats[c]; });
+    document.getElementById("export-btn").href =
+      "/api/export/budget.xlsx?amount=" + d.amount + "&max_share=" + d.max_share +
+      "&exclude_cats=" + encodeURIComponent(excl.join(","));
 
     document.getElementById("placeholder").style.display = "none";
     document.getElementById("cards").style.display = "";
