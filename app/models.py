@@ -212,6 +212,15 @@ class ProductionOrder(Base):
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="draft")  # draft|sent|received
     items_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
     # items_json: [{base_name, qty, sizes: {size: qty}, cost}]
+    # Обратная запись в МойСклад (аддитивно): href созданного документа
+    # «Заказ поставщику» (entity/purchaseorder) и его номер в МС.
+    # Пусто = заказ в МойСклад не отправлялся.
+    ms_doc_href: Mapped[str] = mapped_column(
+        String(512), nullable=False, default="", server_default=""
+    )
+    ms_doc_name: Mapped[str] = mapped_column(
+        String(255), nullable=False, default="", server_default=""
+    )
 
     @property
     def items(self) -> list[dict]:

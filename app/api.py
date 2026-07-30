@@ -247,6 +247,7 @@ def api_settings(ctx: AuthContext = Depends(require_auth_api), db: Session = Dep
         .where(Membership.org_id == org.id)
     ).all()
     settings = org.settings
+    extra = analytics.extra_settings(org)
     return {
         "org": {
             "name": org.name,
@@ -256,6 +257,8 @@ def api_settings(ctx: AuthContext = Depends(require_auth_api), db: Session = Dep
         "thresholds": settings["thresholds"],
         "horizon_days": settings["horizon_days"],
         "min_stock_days": settings["min_stock_days"],
+        "rate_window": extra["rate_window"],
+        "lead_time_days": extra["lead_time_days"],
         "warehouses": [{"id": w.id, "name": w.name, "active": w.active} for w in warehouses],
         "connection": (
             {
@@ -280,6 +283,15 @@ class SettingsIn(BaseModel):
     thresholds: ThresholdsIn | None = None
     horizon_days: int | None = Field(default=None, ge=7, le=365)
     min_stock_days: int | None = Field(default=None, ge=0, le=100)
+    rate_window: str | None = None  # 'year' | 'd90' | 'season'
+    lead_time_days: int | None = Field(default=None, ge=1, le=365)
+
+    @field_validator("rate_window")
+    @classmethod
+    def _rate_window_known(cls, v: str | None) -> str | None:
+        if v is not None and v not in analytics.RATE_WINDOWS:
+            raise ValueError("rate_window должен быть 'year', 'd90' или 'season'")
+        return v
 
 
 @router.post("/settings")
@@ -297,6 +309,14 @@ def api_update_settings(
         settings["horizon_days"] = body.horizon_days
     if body.min_stock_days is not None:
         settings["min_stock_days"] = body.min_stock_days
+    # Ключи сверх DEFAULT_SETTINGS (org.settings их не возвращает) — сохраняем,
+    # не затирая при частичных POST'ах (например, только rate_window с /replenish).
+    extra = analytics.extra_settings(org)
+    if body.rate_window is not None:
+        extra["rate_window"] = body.rate_window
+    if body.lead_time_days is not None:
+        extra["lead_time_days"] = body.lead_time_days
+    settings.update(extra)
     org.settings_json = json.dumps(settings, ensure_ascii=False)
     db.commit()
     analytics.invalidate(org.id)

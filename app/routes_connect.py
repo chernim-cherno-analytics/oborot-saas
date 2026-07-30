@@ -6,6 +6,8 @@ POST /api/connect/moysklad/stores   — выбрать склады (Warehouse-�
 POST /api/sync/initial              — фоновая первичная синхронизация
 POST /api/sync/run                  — инкрементальный синк (остатки+цены+продажи 3 дн.)
 GET  /api/sync/status               — прогресс для онбординга (поллинг)
+POST /api/orders/{id}/push-to-ms    — создать «Заказ поставщику» в МойСклад
+GET  /api/orders/{id}/ms-doc        — ссылка на созданный документ МС (если был)
 GET  /api/notify/settings           — Telegram-настройки + имя бота для инструкции
 POST /api/notify/settings           — сохранить chat_id и флаги уведомлений
 POST /api/notify/test               — тестовое сообщение «Оборот подключён»
@@ -16,16 +18,22 @@ import html
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app import ms_sync, notify
-from app.auth import AuthContext, require_owner_api
+from app import ms_sync, ms_writeback, notify
+from app.auth import AuthContext, require_auth_api, require_owner_api
 from app.crypto import decrypt_token, encrypt_token
 from app.db import get_db
-from app.models import Connection, Warehouse
+from app.models import Connection, ProductionOrder, Warehouse
 from app.ms_client import MoySkladClient
+
+# Аддитивная мини-миграция: у баз, созданных до фичи обратной записи,
+# в production_orders нет колонок ms_doc_href/ms_doc_name — добавляем.
+# Свежая БД (таблиц ещё нет) — no-op, колонки создаст init_db из модели.
+ms_writeback.ensure_schema()
 
 # app/api.py (демо-скоуп) регистрирует заглушку POST /api/connect/moysklad,
 # а api_router включается в приложение раньше этого роутера — заглушка
@@ -237,6 +245,80 @@ def api_sync_run(
 def api_sync_status(ctx: AuthContext = Depends(require_owner_api)):
     """Состояние синхронизации для онбординга (поллинг раз в 1–2 секунды)."""
     return ms_sync.get_status(ctx.org.id)
+
+
+# ── Обратная запись заказа в МойСклад ────────────────────────────────────────
+
+def _order_of_org(db: Session, org_id: int, order_id: int) -> ProductionOrder:
+    order = db.get(ProductionOrder, order_id)
+    if order is None or order.org_id != org_id:
+        raise HTTPException(status_code=404, detail="Заказ не найден")
+    return order
+
+
+def _ms_doc_out(order: ProductionOrder) -> dict:
+    return {
+        "ms_doc_href": order.ms_doc_href,
+        "ms_doc_name": order.ms_doc_name,
+        "ms_doc_ui_url": ms_writeback.ui_url(href=order.ms_doc_href),
+    }
+
+
+@router.get("/orders/{order_id}/ms-doc")
+def api_order_ms_doc(
+    order_id: int,
+    ctx: AuthContext = Depends(require_auth_api),
+    db: Session = Depends(get_db),
+):
+    """Ссылка на документ МойСклад, созданный из заказа (пусто, если не было)."""
+    return _ms_doc_out(_order_of_org(db, ctx.org.id, order_id))
+
+
+@router.post("/orders/{order_id}/push-to-ms")
+async def api_order_push_to_ms(
+    order_id: int,
+    ctx: AuthContext = Depends(require_owner_api),
+    db: Session = Depends(get_db),
+):
+    """Создаёт в МойСклад документ «Заказ поставщику» из позиций заказа.
+
+    Идемпотентность: повторная отправка при заполненном ms_doc_href — 409
+    «уже отправлен» со ссылкой на существующий документ. Позиции, не нашедшие
+    вариант в МС, не валят заказ — возвращаются списком unmatched.
+    """
+    order = _order_of_org(db, ctx.org.id, order_id)
+    if order.status not in ("draft", "sent"):
+        raise HTTPException(
+            status_code=422,
+            detail="Заказ уже принят на склад — отправлять его в МойСклад поздно.",
+        )
+    if order.ms_doc_href:
+        name = f" ({order.ms_doc_name})" if order.ms_doc_name else ""
+        return JSONResponse(
+            status_code=409,
+            content={
+                "detail": f"Заказ уже отправлен в МойСклад{name}. "
+                          "Откройте существующий документ по ссылке.",
+                **_ms_doc_out(order),
+            },
+        )
+    try:
+        result = await ms_writeback.push_order(db, ctx.org.id, order)
+    except ms_writeback.WritebackError as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.detail)
+    except httpx.HTTPStatusError as exc:
+        code = exc.response.status_code
+        if code in (401, 403):
+            raise HTTPException(status_code=400, detail=TOKEN_HINT)
+        raise HTTPException(
+            status_code=502,
+            detail=f"МойСклад ответил ошибкой {code}. Документ не создан — "
+                   "попробуйте ещё раз позже.",
+        )
+    except httpx.HTTPError:
+        raise HTTPException(status_code=502, detail=NETWORK_HINT)
+    db.commit()
+    return result
 
 
 # ── Telegram-уведомления ─────────────────────────────────────────────────────

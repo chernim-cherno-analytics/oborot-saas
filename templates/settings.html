@@ -71,7 +71,7 @@
 
   <div class="card">
     <div class="card-head">
-      <h2>Горизонт заказа</h2>
+      <h2>Горизонт заказа и производство</h2>
       <div class="spacer"></div>
       <button class="btn sm primary" type="button" id="btn-save-horizon">Сохранить</button>
     </div>
@@ -81,8 +81,12 @@
           <label for="horizon">Горизонт планирования, дней</label>
           <input class="input num" type="number" id="horizon" min="7" max="365" step="1">
         </div>
+        <div class="field" style="max-width:220px;">
+          <label for="lead-time" title="Сколько дней проходит от заказа до прихода готовой партии на склад">Срок производства, дней</label>
+          <input class="input num" type="number" id="lead-time" min="1" max="365" step="1">
+        </div>
         <div class="field">
-          <div class="hint" style="margin-bottom:9px;">На сколько дней продаж должен закрывать потребность заказ на производство. Рекомендация «Что заказать» = темп × горизонт − остаток − уже заказанное.</div>
+          <div class="hint" style="margin-bottom:9px;">Горизонт — на сколько дней продаж должен закрывать потребность заказ: рекомендация «Что заказать» = темп × горизонт − остаток − уже заказанное. Срок производства — сколько дней от заказа до прихода на склад: влияет на предупреждения о «дыре» поставки, ETA нового заказа и сезонное окно темпа.</div>
         </div>
       </div>
     </div>
@@ -168,6 +172,7 @@ document.addEventListener("DOMContentLoaded", function () {
     document.getElementById("th-good").value = th.good != null ? th.good : 5000;
     document.getElementById("th-minstock").value = settings.min_stock_days != null ? settings.min_stock_days : 3;
     document.getElementById("horizon").value = settings.horizon_days != null ? settings.horizon_days : 90;
+    document.getElementById("lead-time").value = settings.lead_time_days != null ? settings.lead_time_days : 45;
     renderWarehouses(settings.warehouses || []);
     renderConnection(settings.connection || null);
     renderTeam(settings.members || []);
@@ -185,7 +190,8 @@ document.addEventListener("DOMContentLoaded", function () {
         good: Number(document.getElementById("th-good").value) || 0
       },
       min_stock_days: Number(document.getElementById("th-minstock").value) || 0,
-      horizon_days: Number(document.getElementById("horizon").value) || 90
+      horizon_days: Number(document.getElementById("horizon").value) || 90,
+      lead_time_days: Number(document.getElementById("lead-time").value) || 45
     };
     Object.assign(body, extra || {});
     return api("/api/settings", { method: "POST", body: body }).then(function () {
@@ -201,7 +207,7 @@ document.addEventListener("DOMContentLoaded", function () {
     saveSettings(null, "Пороги сохранены. Классы пересчитаются при следующей загрузке.");
   });
   document.getElementById("btn-save-horizon").addEventListener("click", function () {
-    saveSettings(null, "Горизонт заказа сохранён");
+    saveSettings(null, "Горизонт заказа и срок производства сохранены");
   });
 
   function renderWarehouses(whs) {

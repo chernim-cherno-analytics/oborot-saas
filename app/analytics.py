@@ -8,10 +8,24 @@
 - rate = nq/dis, turnover = nr/dis (главная метрика, ₽/день);
 - wos = cs/(rate*7); stockout_date = today + cs/rate; need = rate*horizon − cs − ordered.
 
+Окна темпа продаж (настройка rate_window, влияет на need/wos/stockout):
+- 'year'   — rate_year = nq365/dis365 (как раньше, дефолт);
+- 'd90'    — rate_90 = нетто-продажи за 90 дн / дни в стоке за 90 дн;
+- 'season' — rate_season: аналогичное сезонное окно прошлого года
+  [today+lead−365; today+lead+horizon−365] — темп периода, НА который
+  заказываем (заказ приедет через lead_time_days и будет продаваться horizon
+  дней). Если истории за окно нет — фолбэк на rate_year с season_fallback=True.
+Порог min_stock_days («день в стоке») применяется во всех окнах.
+
+lead_time_days — срок производства (заказ → приход на склад). gap_days —
+«дыра поставки»: на сколько дней остаток кончится РАНЬШЕ прихода заказа,
+max(0, (today+lead) − stockout_date).
+
 Агрегация — SQL (GROUP BY), в Python попадают только свёрнутые строки.
 Снапшот кэшируется в памяти на 10 минут per-org; запись (заказы, настройки,
 переподключение) инвалидирует кэш через invalidate().
 """
+import json
 import threading
 import time
 from datetime import date, timedelta
@@ -30,6 +44,8 @@ from app.models import (
 )
 
 CACHE_TTL = 600  # 10 минут
+RATE_WINDOWS = ("year", "d90", "season")  # окна темпа продаж
+DEFAULT_LEAD_TIME_DAYS = 45  # срок производства: заказ → приход на склад
 NO_SALES_ALERT_DAYS = 120  # неликвид: столько дней без продаж при наличии стока
 STOCKOUT_ALERT_DAYS = 21  # алерт: бестселлер/хороший закончится в ближайшие N дней
 OVERSTOCK_WEEKS = 26  # алерт: запаса больше, чем на полгода
@@ -57,16 +73,42 @@ def get_snapshot(db: Session, org: Org) -> dict:
     return snap
 
 
+def extra_settings(org: Org) -> dict:
+    """Настройки сверх DEFAULT_SETTINGS (org.settings их не мерджит — models.py не трогаем).
+
+    rate_window: 'year' | 'd90' | 'season'; lead_time_days: 1..365 (дефолт 45).
+    """
+    try:
+        data = json.loads(org.settings_json or "{}")
+    except ValueError:
+        data = {}
+    rate_window = data.get("rate_window")
+    if rate_window not in RATE_WINDOWS:
+        rate_window = "year"
+    lead = data.get("lead_time_days")
+    if not isinstance(lead, (int, float)) or not 1 <= int(lead) <= 365:
+        lead = DEFAULT_LEAD_TIME_DAYS
+    return {"rate_window": rate_window, "lead_time_days": int(lead)}
+
+
 # ── Расчёт снапшота ───────────────────────────────────────────────────────────
 
 def _compute_snapshot(db: Session, org: Org) -> dict:
-    settings = org.settings
+    settings = dict(org.settings)
+    settings.update(extra_settings(org))
     min_stock = settings["min_stock_days"]
     horizon = settings["horizon_days"]
     thresholds = settings["thresholds"]
+    rate_window = settings["rate_window"]
+    lead_time = settings["lead_time_days"]
     today = date.today()
     cutoff365 = (today - timedelta(days=365)).isoformat()
+    cutoff90 = (today - timedelta(days=90)).isoformat()
     cutoff30 = (today - timedelta(days=30)).isoformat()
+    # Сезонное окно прошлого года: период, НА который заказываем (заказ приедет
+    # через lead_time и будет продаваться horizon дней), минус год.
+    season_from = (today + timedelta(days=lead_time - 365)).isoformat()
+    season_to = (today + timedelta(days=lead_time + horizon - 365)).isoformat()
 
     latest_date = db.scalar(select(func.max(StockDay.date)).where(StockDay.org_id == org.id))
 
@@ -99,6 +141,25 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
         db.execute(select(day_totals.c.base, func.count()).group_by(day_totals.c.base)).all()
     )
 
+    def _dis_window(date_from: str, date_to: str | None = None) -> dict:
+        """Дни в стоке (sum qty >= min_stock) в окне дат, по базовым именам."""
+        conds = [StockDay.org_id == org.id, StockDay.date >= date_from]
+        if date_to is not None:
+            conds.append(StockDay.date <= date_to)
+        sub = (
+            select(Product.base_name.label("base"), StockDay.date.label("d"))
+            .select_from(StockDay)
+            .join(Product, join_products)
+            .where(*conds)
+            .group_by(Product.base_name, StockDay.date)
+            .having(func.sum(StockDay.qty) >= min_stock)
+            .subquery()
+        )
+        return dict(db.execute(select(sub.c.base, func.count()).group_by(sub.c.base)).all())
+
+    dis90_by_base = _dis_window(cutoff90)
+    dis_season_by_base = _dis_window(season_from, season_to)
+
     # cs: остаток на последнюю дату, по размерам.
     cs_rows: list = []
     if latest_date:
@@ -121,6 +182,24 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
         .where(Sale.org_id == org.id, Sale.date >= cutoff365)
         .group_by(Product.base_name, Product.size)
     ).all()
+
+    # Нетто-продажи в окнах «90 дней» и «сезон прошлого года», по базам.
+    def _nq_window(date_from: str, date_to: str | None = None) -> dict:
+        conds = [Sale.org_id == org.id, Sale.date >= date_from]
+        if date_to is not None:
+            conds.append(Sale.date <= date_to)
+        return dict(
+            db.execute(
+                select(Product.base_name, func.sum(sign_qty))
+                .select_from(Sale)
+                .join(Product, join_sales)
+                .where(*conds)
+                .group_by(Product.base_name)
+            ).all()
+        )
+
+    nq90_by_base = _nq_window(cutoff90)
+    nq_season_by_base = _nq_window(season_from, season_to)
 
     # Последняя продажа (для алертов о неликвиде).
     last_sale_by_base = dict(
@@ -216,17 +295,40 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
         item["wh_stock"].setdefault(size, {})[wh_id] = int(round(qty or 0))
 
     # ── Производные метрики ──────────────────────────────────────────────────
+    arrival = today + timedelta(days=lead_time)  # дата прихода заказа, сделанного сегодня
     for item in items.values():
+        base = item["base_name"]
         dis, cs, nq, nr = item["dis"], item["cs"], item["nq"], item["nr"]
-        rate = nq / dis if dis > 0 else 0.0
+        rate_year = nq / dis if dis > 0 else 0.0
         turnover = nr / dis if dis > 0 else 0.0
-        item["rate"] = round(rate, 4)
+
+        # Темп за 90 дней: нетто-продажи за 90 дн / дни в стоке за 90 дн.
+        dis90 = int(dis90_by_base.get(base, 0))
+        nq90 = float(nq90_by_base.get(base) or 0)
+        rate_90 = max(0.0, nq90 / dis90) if dis90 > 0 else 0.0
+
+        # Сезонный темп: окно прошлого года, на которое придётся заказ.
+        dis_season = int(dis_season_by_base.get(base, 0))
+        nq_season = float(nq_season_by_base.get(base) or 0)
+        season_fallback = dis_season <= 0
+        rate_season = rate_year if season_fallback else max(0.0, nq_season / dis_season)
+
+        rate = {"year": rate_year, "d90": rate_90, "season": rate_season}[rate_window]
+
+        item["rate"] = round(rate_year, 4)  # темп за год (обратная совместимость)
+        item["rate_year"] = round(rate_year, 4)
+        item["rate_90"] = round(rate_90, 4)
+        item["rate_season"] = round(rate_season, 4)
+        item["season_fallback"] = season_fallback
+        item["rate_active"] = round(rate, 4)
         item["turnover"] = round(turnover)
         item["cls"] = classify(turnover, thresholds)
+        # Покрытие/стокаут/потребность — по АКТИВНОМУ окну темпа.
         item["wos"] = round(cs / (rate * 7), 1) if rate > 0 else None
-        item["stockout_date"] = (
-            (today + timedelta(days=int(cs / rate))).isoformat() if rate > 0 else None
-        )
+        stockout = today + timedelta(days=int(cs / rate)) if rate > 0 else None
+        item["stockout_date"] = stockout.isoformat() if stockout else None
+        # «Дыра поставки»: остаток кончится раньше, чем приедет заказ.
+        item["gap_days"] = max(0, (arrival - stockout).days) if stockout else 0
         item["avg_price"] = round(nr / nq) if nq > 0 else None
         sale_price = item["sale_price"]
         item["discount_fact"] = (
@@ -240,6 +342,8 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
         "generated_at": time.time(),
         "today": today.isoformat(),
         "latest_date": latest_date,
+        "season_from": season_from,
+        "season_to": season_to,
         "settings": settings,
         "items": items,
         "warehouses": [{"id": w.id, "name": w.name, "active": w.active} for w in warehouses],
@@ -395,9 +499,23 @@ def build_summary(snap: dict) -> dict:
     }
 
 
+_NO_SALES_REASON = {
+    "year": "нет продаж за 365 дней",
+    "d90": "нет продаж за последние 90 дней",
+    "season": "нет продаж в сезонном окне прошлого года",
+}
+
+
 def build_replenish(snap: dict) -> dict:
-    """GET /api/replenish — потребность в заказе, сортировка по turnover desc."""
-    horizon = snap["settings"]["horizon_days"]
+    """GET /api/replenish — потребность в заказе, сортировка по turnover desc.
+
+    need/wos/stockout/gap считаются по активному окну темпа (settings.rate_window);
+    все три темпа (rate_year / rate_90 / rate_season) отдаются в каждом item.
+    """
+    settings = snap["settings"]
+    horizon = settings["horizon_days"]
+    rate_window = settings.get("rate_window", "year")
+    lead_time = settings.get("lead_time_days", DEFAULT_LEAD_TIME_DAYS)
     result, excluded = [], []
     for it in sorted(snap["items"].values(), key=lambda x: -x["turnover"]):
         base = it["base_name"]
@@ -407,8 +525,11 @@ def build_replenish(snap: dict) -> dict:
         if it["cs"] == 0 and it["nq"] <= 0 and it["dis"] == 0:
             continue  # мусорная запись без активности
         if it["need"] <= 0:
-            if it["rate"] <= 0:
-                reason = "нет продаж за 365 дней"
+            if it["rate_active"] <= 0:
+                if rate_window == "season" and it["season_fallback"]:
+                    reason = _NO_SALES_REASON["year"]  # фолбэк на годовой темп
+                else:
+                    reason = _NO_SALES_REASON.get(rate_window, _NO_SALES_REASON["year"])
             elif it["ordered"] > 0:
                 reason = "потребность закрыта заказом в производстве"
             else:
@@ -423,11 +544,16 @@ def build_replenish(snap: dict) -> dict:
                 "category": it["category"],
                 "cls": it["cls"],
                 "turnover": it["turnover"],
-                "rate": it["rate"],
+                "rate": it["rate_active"],
+                "rate_year": it["rate_year"],
+                "rate_90": it["rate_90"],
+                "rate_season": it["rate_season"],
+                "season_fallback": it["season_fallback"],
                 "cs": it["cs"],
                 "ordered": int(it["ordered"]),
                 "wos": it["wos"],
                 "stockout_date": it["stockout_date"],
+                "gap_days": it["gap_days"],
                 "need": it["need"],
                 "sizes": {
                     s: {
@@ -442,7 +568,15 @@ def build_replenish(snap: dict) -> dict:
                 "profit_potential": round(max(0, avg_price - it["cost_price"]) * it["need"]),
             }
         )
-    return {"horizon_days": horizon, "items": result, "excluded": excluded}
+    return {
+        "horizon_days": horizon,
+        "rate_window": rate_window,
+        "lead_time_days": lead_time,
+        "season_from": snap.get("season_from"),
+        "season_to": snap.get("season_to"),
+        "items": result,
+        "excluded": excluded,
+    }
 
 
 def build_turnover(snap: dict) -> dict:

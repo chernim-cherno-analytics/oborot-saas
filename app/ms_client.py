@@ -100,11 +100,12 @@ class MoySkladClient:
     async def __aexit__(self, *exc) -> None:
         await self.close()
 
-    async def get(self, path: str, params: dict | None = None) -> dict:
-        """GET с rate-limit'ом и ретраями по 429 (X-Lognex-Retry-TimeInterval, мс)."""
+    async def _request(self, method: str, path: str, params: dict | None = None,
+                       json: dict | None = None) -> dict:
+        """Запрос с rate-limit'ом и ретраями по 429 (X-Lognex-Retry-TimeInterval, мс)."""
         for attempt in range(MAX_RETRIES + 1):
             async with self._limiter:
-                resp = await self._client.get(path, params=params)
+                resp = await self._client.request(method, path, params=params, json=json)
             if resp.status_code != 429:
                 resp.raise_for_status()
                 return resp.json()
@@ -114,6 +115,14 @@ class MoySkladClient:
             delay = int(retry_ms) / 1000.0 if retry_ms and retry_ms.isdigit() else 1.0
             await asyncio.sleep(delay)
         raise RuntimeError("unreachable")
+
+    async def get(self, path: str, params: dict | None = None) -> dict:
+        """GET с rate-limit'ом и ретраями по 429."""
+        return await self._request("GET", path, params=params)
+
+    async def post(self, path: str, json: dict) -> dict:
+        """POST (создание сущностей) с тем же rate-limit'ом и ретраями по 429."""
+        return await self._request("POST", path, json=json)
 
     async def paginate(self, path: str, params: dict | None = None,
                        page_limit: int = PAGE_LIMIT) -> AsyncIterator[dict]:
@@ -176,6 +185,37 @@ class MoySkladClient:
                 f"/entity/{entity}", params, page_limit=EXPAND_PAGE_LIMIT
             )
         ]
+
+    # ── Обратная запись (writeback): «Заказ поставщику» ─────────────────────
+
+    async def fetch_organizations(self) -> list[dict]:
+        """Юрлица аккаунта (entity/organization) — нужны для документов."""
+        return [row async for row in self.paginate("/entity/organization")]
+
+    async def find_counterparty_by_name(self, name: str) -> dict | None:
+        """Контрагент по точному имени (filter=name=...); None, если не найден.
+
+        В фильтрах МойСклад точное совпадение по name — оператор `=`;
+        спецсимволы `;` и `=` в значении экранируются не нужны для наших имён.
+        """
+        params = {"filter": f"name={name}"}
+        async for row in self.paginate("/entity/counterparty", params):
+            if (row.get("name") or "").strip() == name:
+                return row
+        return None
+
+    async def create_counterparty(self, name: str) -> dict:
+        """Создаёт контрагента (обязательное поле — только name)."""
+        return await self.post("/entity/counterparty", {"name": name})
+
+    async def create_purchase_order(self, payload: dict) -> dict:
+        """Создаёт документ «Заказ поставщику» (entity/purchaseorder).
+
+        Обязательные поля payload: organization.meta, agent.meta;
+        positions: [{assortment: {meta}, quantity, price(копейки)}].
+        Номер (name) МойСклад присвоит сам, если не передан.
+        """
+        return await self.post("/entity/purchaseorder", payload)
 
     # Старые имена (каркас демо-скоупа) — оставлены для совместимости.
 

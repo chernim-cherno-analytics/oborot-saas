@@ -11,7 +11,13 @@
   отдельный query-параметр moment ИГНОРИРУЕТСЯ (как в реальном МС),
   позиции с нулевым остатком в отчёт не попадают (для явных нулей);
 - entity/retaildemand | demand | salesreturn с positions: при limit > 100
-  и expand positions приходят href-ами без строк (как в реальном МС).
+  и expand positions приходят href-ами без строк (как в реальном МС);
+- обратная запись (writeback): entity/organization (одно юрлицо),
+  GET/POST entity/counterparty (поиск по filter=name=..., создание),
+  POST entity/purchaseorder — валидирует organization/agent/positions,
+  проверяет, что assortment.meta.href указывает на существующий SKU,
+  сохраняет документ в CREATED_PURCHASE_ORDERS и возвращает meta с
+  href и uuidHref (ссылка веб-интерфейса), name — автонумерация.
 
 Данные детерминированные: random.Random(SEED), 60 дней истории.
 Модуль экспортирует expected_*() — эталонные суммы для проверок теста.
@@ -409,6 +415,118 @@ def entity_salesreturn(request: Request, limit: int = 100, offset: int = 0,
                        flt: str = Query(default="", alias="filter"),
                        expand: str = ""):
     return _docs_endpoint("salesreturn", request, limit, offset, flt, expand)
+
+
+# ── Обратная запись: организация, контрагенты, заказ поставщику ──────────────
+
+ORG_EXT_ID = "org-main"
+
+# Изменяемое состояние mock-мира для writeback-тестов.
+COUNTERPARTIES: list[dict] = []          # {"id", "name"}
+CREATED_PURCHASE_ORDERS: list[dict] = [] # тела принятых POST + присвоенные id/name
+
+
+def reset_writeback_state() -> None:
+    COUNTERPARTIES.clear()
+    CREATED_PURCHASE_ORDERS.clear()
+
+
+def _counterparty_row(cp: dict) -> dict:
+    return {
+        "id": cp["id"], "name": cp["name"],
+        "meta": {"href": f"{BASE}/entity/counterparty/{cp['id']}",
+                 "type": "counterparty", "mediaType": "application/json"},
+    }
+
+
+@app.get("/entity/organization")
+def entity_organization(request: Request, limit: int = 1000, offset: int = 0):
+    _auth(request)
+    rows = [{
+        "id": ORG_EXT_ID, "name": "ИП Тестовый",
+        "meta": {"href": f"{BASE}/entity/organization/{ORG_EXT_ID}",
+                 "type": "organization", "mediaType": "application/json"},
+    }]
+    return _page(rows, limit, offset)
+
+
+@app.get("/entity/counterparty")
+def entity_counterparty(request: Request, limit: int = 1000, offset: int = 0,
+                        flt: str = Query(default="", alias="filter")):
+    _auth(request)
+    name = _parse_filter(flt).get("name", "")
+    rows = [_counterparty_row(cp) for cp in COUNTERPARTIES
+            if not name or cp["name"] == name]
+    return _page(rows, limit, offset)
+
+
+@app.post("/entity/counterparty")
+async def entity_counterparty_create(request: Request):
+    _auth(request)
+    body = await request.json()
+    name = str(body.get("name") or "").strip()
+    if not name:
+        raise HTTPException(status_code=412, detail={"errors": [
+            {"error": "Ошибка сохранения объекта: поле 'name' не может быть пустым"}
+        ]})
+    cp = {"id": f"cp-{len(COUNTERPARTIES) + 1:03d}", "name": name}
+    COUNTERPARTIES.append(cp)
+    return _counterparty_row(cp)
+
+
+def _require_meta_href(body: dict, field: str, expected_type: str) -> str:
+    href = str((((body.get(field) or {}).get("meta")) or {}).get("href") or "")
+    if not href or f"/entity/{expected_type}/" not in href:
+        raise HTTPException(status_code=412, detail={"errors": [
+            {"error": f"Ошибка сохранения объекта: поле '{field}' не задано "
+                      f"или не является метаданными {expected_type}"}
+        ]})
+    return href
+
+
+@app.post("/entity/purchaseorder")
+async def entity_purchaseorder_create(request: Request):
+    _auth(request)
+    body = await request.json()
+    org_href = _require_meta_href(body, "organization", "organization")
+    if org_href.rstrip("/").rsplit("/", 1)[-1] != ORG_EXT_ID:
+        raise HTTPException(status_code=412, detail={"errors": [
+            {"error": "Ошибка сохранения объекта: неизвестное юрлицо"}
+        ]})
+    agent_href = _require_meta_href(body, "agent", "counterparty")
+    agent_id = agent_href.rstrip("/").rsplit("/", 1)[-1]
+    if not any(cp["id"] == agent_id for cp in COUNTERPARTIES):
+        raise HTTPException(status_code=412, detail={"errors": [
+            {"error": "Ошибка сохранения объекта: контрагент не найден"}
+        ]})
+    positions = body.get("positions") or []
+    if not isinstance(positions, list) or not positions:
+        raise HTTPException(status_code=412, detail={"errors": [
+            {"error": "Ошибка сохранения объекта: нужны позиции positions"}
+        ]})
+    for pos in positions:
+        href = str((((pos.get("assortment") or {}).get("meta")) or {}).get("href") or "")
+        ext = href.split("?", 1)[0].rstrip("/").rsplit("/", 1)[-1]
+        if ext not in SKU_BY_EXT:
+            raise HTTPException(status_code=412, detail={"errors": [
+                {"error": f"Ошибка сохранения объекта: ассортимент {ext!r} не найден"}
+            ]})
+        if float(pos.get("quantity") or 0) <= 0:
+            raise HTTPException(status_code=412, detail={"errors": [
+                {"error": "Ошибка сохранения объекта: quantity должно быть > 0"}
+            ]})
+    num = len(CREATED_PURCHASE_ORDERS) + 1
+    doc_id = f"po-{num:04d}"
+    doc = dict(body)
+    doc["id"] = doc_id
+    doc["name"] = f"{num:05d}"
+    doc["meta"] = {
+        "href": f"{BASE}/entity/purchaseorder/{doc_id}",
+        "type": "purchaseorder", "mediaType": "application/json",
+        "uuidHref": f"https://online.moysklad.ru/app/#purchaseorder/edit?id={doc_id}",
+    }
+    CREATED_PURCHASE_ORDERS.append(doc)
+    return doc
 
 
 if __name__ == "__main__":

@@ -113,16 +113,35 @@ document.addEventListener("DOMContentLoaded", function () {
     });
   }
 
+  function pushToMs(id) {
+    if (!confirm("Создать в МойСклад документ «Заказ поставщику» с позициями этого заказа?\n\nПозиции лягут по вариантам-размерам, цена за штуку — себестоимость. Позиции, не найденные в ассортименте МС, будут перечислены отдельно.")) return;
+    api("/api/orders/" + id + "/push-to-ms", { method: "POST" }).then(function (d) {
+      if (d.unmatched && d.unmatched.length) {
+        toast("Документ «Заказ поставщику» № " + (d.ms_doc_name || "—") + " создан. Не сопоставлено позиций: " +
+          d.unmatched.length + " — " + d.unmatched.slice(0, 5).join(", ") +
+          (d.unmatched.length > 5 ? "…" : ""));
+      } else {
+        toast("Документ «Заказ поставщику» № " + (d.ms_doc_name || "—") + " создан в МойСклад", "success");
+      }
+      openOrder(id);
+    });
+  }
+
   function openOrder(id) {
     currentId = id;
     renderList();
     detail.innerHTML = '<div class="card"><div class="loading-stub">Загрузка заказа…</div></div>';
-    api("/api/orders/" + id).then(renderDetail).catch(function () {
+    Promise.all([
+      api("/api/orders/" + id),
+      hqFetchJson("/api/orders/" + id + "/ms-doc") // тихо: null, если ручки нет
+    ]).then(function (res) {
+      renderDetail(res[0], res[1]);
+    }).catch(function () {
       detail.innerHTML = "";
     });
   }
 
-  function renderDetail(o) {
+  function renderDetail(o, msdoc) {
     var items = o.items || [];
     var s = orderStats(o);
     var rev = 0;
@@ -160,6 +179,15 @@ document.addEventListener("DOMContentLoaded", function () {
       (o.status === "sent"
         ? '<button class="btn sm primary no-print" type="button" id="btn-receive">Принят на склад</button>'
         : "") +
+      (msdoc && msdoc.ms_doc_href
+        ? '<a class="btn sm no-print" href="' + esc(msdoc.ms_doc_ui_url || msdoc.ms_doc_href) + '" target="_blank" rel="noopener">' +
+          '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>' +
+          " Открыть в МойСклад" + (msdoc.ms_doc_name ? " · № " + esc(msdoc.ms_doc_name) : "") + "</a>"
+        : (o.status === "draft" || o.status === "sent"
+          ? '<button class="btn sm no-print" type="button" id="btn-push-ms">' +
+            '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2L11 13"/><path d="M22 2l-7 20-4-9-9-4z"/></svg>' +
+            " Отправить в МойСклад</button>"
+          : "")) +
       (o.status !== "received"
         ? '<button class="btn sm no-print" type="button" id="btn-delete">Удалить</button>'
         : "") +
@@ -190,6 +218,8 @@ document.addEventListener("DOMContentLoaded", function () {
     });
     var bDel = document.getElementById("btn-delete");
     if (bDel) bDel.addEventListener("click", function () { removeOrder(o.id, o.status); });
+    var bPush = document.getElementById("btn-push-ms");
+    if (bPush) bPush.addEventListener("click", function () { pushToMs(o.id); });
     detail.scrollIntoView({ behavior: "smooth", block: "nearest" });
   }
 });

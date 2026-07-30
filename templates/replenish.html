@@ -40,6 +40,12 @@
       <button type="button" data-band="y" class="s-y">Скоро <span class="c" id="seg-y">0</span></button>
       <button type="button" data-band="g" class="s-g">План <span class="c" id="seg-g">0</span></button>
     </div>
+    <div class="seg" id="rate-seg" title="Окно расчёта темпа продаж: по нему считаются покрытие, стокаут и рекомендация «Заказать»">
+      <span style="align-self:center; font-size:11px; color:var(--text-soft); padding:0 4px 0 8px;">Темп:</span>
+      <button type="button" data-rw="year" title="Темп = нетто-продажи за скользящий год ÷ дни в наличии. Сглаживает сезонность.">Год</button>
+      <button type="button" data-rw="d90" title="Темп по последним 90 дням — быстрее реагирует на текущий тренд спроса">90 дней</button>
+      <button type="button" data-rw="season" id="rw-season" title="Сезонный темп: продажи аналогичного окна прошлого года">Сезон</button>
+    </div>
     <div class="search-box">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.5" y2="16.5"/></svg>
       <input class="input" type="search" id="search" placeholder="Поиск по названию…" autocomplete="off">
@@ -64,16 +70,17 @@
           <th data-sort="cls" style="width:52px;" title="Класс позиции: A — бестселлер, B — хороший, C — медленный, D — слабый">Класс</th>
           <th style="width:76px;" title="Срочно — покрытие < 2 недель, Скоро — 2–4, План — > 4">Статус</th>
           <th class="num" data-sort="turnover" title="Нетто-выручка за год ÷ дни, когда товар был в наличии">Оборач., ₽/день</th>
-          <th class="num" data-sort="rate" title="Продано штук за год ÷ дни в наличии">Темп, шт/день</th>
+          <th class="num" data-sort="rate" id="th-rate" title="Продано штук за год ÷ дни в наличии">Темп, шт/день</th>
           <th class="num" data-sort="cs">Остаток</th>
           <th class="num" data-sort="ordered" title="Уже заказано на производстве и ещё не принято на склад">Едет</th>
           <th class="num" data-sort="wos" title="На сколько недель хватит остатка при текущем темпе продаж">Покрытие, нед</th>
           <th data-sort="stockout_date" data-sort-dir="asc" title="Прогнозная дата, когда остаток кончится">Стокаут</th>
+          <th class="num" data-sort="gap_days" id="th-gap" title="Дыра поставки: остаток кончится ДО прихода заказа с производства">Дыра</th>
           <th class="num" data-sort="_need" title="Темп × горизонт − остаток − едет (правится в размерной сетке)">Заказать</th>
         </tr>
       </thead>
       <tbody id="tbody">
-        <tr><td colspan="12"><div class="loading-stub">Загрузка…</div></td></tr>
+        <tr><td colspan="13"><div class="loading-stub">Загрузка…</div></td></tr>
       </tbody>
       <tfoot id="tfoot" style="display:none;">
         <tr>
@@ -82,7 +89,7 @@
           <td></td>
           <td class="num" id="f-cs"></td>
           <td class="num" id="f-ordered"></td>
-          <td></td><td></td>
+          <td></td><td></td><td></td>
           <td class="num" id="f-need"></td>
         </tr>
       </tfoot>
@@ -139,21 +146,62 @@ document.addEventListener("DOMContentLoaded", function () {
   var state = { sortKey: "turnover", sortDir: -1, query: "", cat: "", band: "" };
   var openRows = {};   // base_name -> true
   var tbody = document.getElementById("tbody");
-  var NCOLS = 12;
+  var NCOLS = 13;
 
   var HORIZON = 90;
+  var LEAD_TIME = 45;
+  var RATE_WINDOW = "year";
+  var SEASON_FROM = null, SEASON_TO = null;
   var SENT_ORDERS = [];
   var EXCLUDED_COUNT = 0;
+
+  var WINDOW_DESC = {
+    year: "темпа продаж за год",
+    d90: "темпа продаж за последние 90 дней",
+    season: "сезонного темпа (аналогичное окно прошлого года)"
+  };
+  var RATE_TH_TIPS = {
+    year: "Продано штук за год ÷ дни в наличии",
+    d90: "Продано штук за последние 90 дней ÷ дни в наличии за 90 дней",
+    season: "Темп аналогичного сезонного окна прошлого года — периода, на который придётся заказ"
+  };
 
   // Фильтр «Срочно» из URL (кнопка «Показать» на дашборде)
   if (new URLSearchParams(window.location.search).get("f") === "urgent") state.band = "r";
 
-  api("/api/replenish").then(function (d) {
+  function load() {
+    tbody.innerHTML = '<tr><td colspan="' + NCOLS + '"><div class="loading-stub">Загрузка…</div></td></tr>';
+    api("/api/replenish").then(applyData).catch(function () {
+      tbody.innerHTML = '<tr><td colspan="' + NCOLS + '">' +
+        emptyState("Не удалось загрузить данные", "Обновите страницу или попробуйте позже.",
+          '<button class="btn" onclick="location.reload()">Обновить</button>') + "</td></tr>";
+      syncRateSeg();
+    });
+  }
+
+  function applyData(d) {
     HORIZON = d.horizon_days || 90;
+    LEAD_TIME = d.lead_time_days || 45;
+    RATE_WINDOW = d.rate_window || "year";
+    SEASON_FROM = d.season_from || null;
+    SEASON_TO = d.season_to || null;
     SENT_ORDERS = d.orders_in_production || [];
     document.getElementById("horizon-note").innerHTML =
-      "Рекомендации: сколько заказать, чтобы хватило на <b>" + fmtInt(d.horizon_days || 90) +
-      " дней</b> с учётом темпа продаж за год, текущих остатков и уже заказанного на производстве.";
+      "Рекомендации: сколько заказать, чтобы хватило на <b>" + fmtInt(HORIZON) +
+      " дней</b> с учётом " + (WINDOW_DESC[RATE_WINDOW] || WINDOW_DESC.year) +
+      ", текущих остатков и уже заказанного на производстве. Срок производства: " +
+      fmtInt(LEAD_TIME) + " дн от заказа до прихода на склад.";
+    document.getElementById("th-rate").title = RATE_TH_TIPS[RATE_WINDOW] || RATE_TH_TIPS.year;
+    document.getElementById("th-gap").title =
+      "Дыра поставки: остаток кончится ДО прихода заказа с производства (срок производства " +
+      fmtInt(LEAD_TIME) + " дн)";
+    document.getElementById("rw-season").title =
+      "Сезонный темп: продажи в окне прошлого года " +
+      (SEASON_FROM ? fmtDate(SEASON_FROM) + " — " + fmtDate(SEASON_TO) : "") +
+      " — то есть темп периода, НА который вы заказываете (заказ приедет через " + fmtInt(LEAD_TIME) +
+      " дн и будет продаваться " + fmtInt(HORIZON) + " дней), а не темп текущего периода. " +
+      "Честная сезонная модель для заказа. Если истории за окно нет — используется темп за год.";
+    syncRateSeg();
 
     items = (d.items || []).map(function (it) {
       it._checked = true;
@@ -180,11 +228,32 @@ document.addEventListener("DOMContentLoaded", function () {
     try {
       sessionStorage.setItem("hq_urgent_v1", JSON.stringify({ t: Date.now(), v: { urgent: urgent, toOrder: items.length } }));
     } catch (e) { /* ignore */ }
-  }).catch(function () {
-    tbody.innerHTML = '<tr><td colspan="' + NCOLS + '">' +
-      emptyState("Не удалось загрузить данные", "Обновите страницу или попробуйте позже.",
-        '<button class="btn" onclick="location.reload()">Обновить</button>') + "</td></tr>";
+  }
+
+  load();
+
+  /* ── Переключатель окна темпа ── */
+  var rateSeg = document.getElementById("rate-seg");
+  rateSeg.querySelectorAll("button").forEach(function (b) {
+    b.addEventListener("click", function () {
+      var rw = b.getAttribute("data-rw");
+      if (rw === RATE_WINDOW) return;
+      rateSeg.querySelectorAll("button").forEach(function (x) { x.disabled = true; });
+      api("/api/settings", { method: "POST", body: { rate_window: rw } }).then(function () {
+        RATE_WINDOW = rw;
+        load();
+      }).catch(function () {
+        syncRateSeg();
+      });
+    });
   });
+
+  function syncRateSeg() {
+    rateSeg.querySelectorAll("button").forEach(function (b) {
+      b.disabled = false;
+      b.classList.toggle("on", b.getAttribute("data-rw") === RATE_WINDOW);
+    });
+  }
 
   function recalcNeed(it) {
     var hasSizes = Object.keys(it._recs).length > 0;
@@ -211,13 +280,17 @@ document.addEventListener("DOMContentLoaded", function () {
   /* ── KPI-плитки ── */
   function renderKpis() {
     var urgent = items.filter(function (it) { return it._band === "r"; }).length;
+    var gaps = items.filter(function (it) { return (it.gap_days || 0) > 0; }).length;
+    var gapTxt = gaps > 0
+      ? " · ⚠ дыра поставки у " + fmtInt(gaps) + " (стокаут раньше прихода заказа)"
+      : "";
     var tile = document.getElementById("risk-tile");
-    if (urgent > 0) {
+    if (urgent > 0 || gaps > 0) {
       tile.className = "metric alert";
       document.getElementById("k-risk").innerHTML = fmtInt(urgent) +
         "<small>" + plural(urgent, "позиция", "позиции", "позиций") + "</small>";
-      tile.querySelector(".m-sub").textContent = "покрытие меньше 2 недель";
-      document.getElementById("btn-show-urgent").style.display = "";
+      tile.querySelector(".m-sub").textContent = "покрытие меньше 2 недель" + gapTxt;
+      document.getElementById("btn-show-urgent").style.display = urgent > 0 ? "" : "none";
     } else {
       tile.className = "metric calm";
       document.getElementById("k-risk").innerHTML = "0<small>позиций</small>";
@@ -263,9 +336,10 @@ document.addEventListener("DOMContentLoaded", function () {
     var box = document.getElementById("cat-chips");
     if (cats.length < 2) { box.innerHTML = ""; return; }
     document.getElementById("cat-toolbar").style.display = "";
-    box.innerHTML = '<button class="chip active" data-cat="">Все<span class="cnt">' + items.length + "</span></button>" +
+    if (state.cat && cats.indexOf(state.cat) === -1) state.cat = "";  // категория пропала после перезагрузки
+    box.innerHTML = '<button class="chip' + (state.cat ? "" : " active") + '" data-cat="">Все<span class="cnt">' + items.length + "</span></button>" +
       cats.map(function (c) {
-        return '<button class="chip" data-cat="' + esc(c) + '">' + esc(c) + '<span class="cnt">' + counts[c] + "</span></button>";
+        return '<button class="chip' + (c === state.cat ? " active" : "") + '" data-cat="' + esc(c) + '">' + esc(c) + '<span class="cnt">' + counts[c] + "</span></button>";
       }).join("");
     box.querySelectorAll(".chip").forEach(function (chip) {
       chip.addEventListener("click", function () {
@@ -278,12 +352,22 @@ document.addEventListener("DOMContentLoaded", function () {
     });
   }
 
+  var WINDOW_SHORT = { year: "год", d90: "90 дней", season: "сезон" };
+
   function calcFormula(it) {
     var gross = Math.round(it.rate * HORIZON);
-    return '<p class="muted" style="margin:4px 0 8px; font-size:12px;">Расчёт: ' +
+    var winTxt = WINDOW_SHORT[RATE_WINDOW] || "год";
+    if (RATE_WINDOW === "season" && it.season_fallback) winTxt = "сезон → фолбэк на год: нет истории за окно";
+    var gapTxt = (it.gap_days || 0) > 0
+      ? ' <span class="txt-red">⚠ Остаток кончится за ' + fmtInt(it.gap_days) +
+        ' дн до прихода заказа (производство ' + fmtInt(LEAD_TIME) + ' дн).</span>'
+      : "";
+    return '<p class="muted" style="margin:4px 0 8px; font-size:12px;">Расчёт (окно темпа: ' + winTxt + '): ' +
       fmtNum(it.rate, 2) + ' шт/день × ' + fmtInt(HORIZON) + ' дн = ' + fmtInt(gross) +
       ' − остаток ' + fmtInt(it.cs) + ' − едет ' + fmtInt(it.ordered || 0) +
-      ' = <b>' + fmtInt(it.need) + ' шт</b></p>';
+      ' = <b>' + fmtInt(it.need) + ' шт</b>.' +
+      ' Темпы: год ' + fmtNum(it.rate_year, 2) + ' · 90 дн ' + fmtNum(it.rate_90, 2) +
+      ' · сезон ' + fmtNum(it.rate_season, 2) + ' шт/день.' + gapTxt + '</p>';
   }
 
   function sizeRows(it) {
@@ -298,6 +382,21 @@ document.addEventListener("DOMContentLoaded", function () {
           '<td class="num"><input class="input sm num size-rec" type="number" min="0" max="9999" step="1" style="width:90px;" ' +
           'data-base="' + esc(it.base_name) + '" data-size="' + esc(sz) + '" value="' + (Number(it._recs[sz]) || 0) + '"></td></tr>';
       }).join("") + "</tbody></table>";
+  }
+
+  function rateCell(it) {
+    var star = (RATE_WINDOW === "season" && it.season_fallback)
+      ? '<span title="Истории за сезонное окно прошлого года нет — использован темп за год" style="cursor:help;">*</span>'
+      : "";
+    return fmtNum(it.rate, 2) + star;
+  }
+
+  function gapCell(it) {
+    var g = it.gap_days || 0;
+    if (g <= 0) return '<span class="muted">—</span>';
+    return '<span class="txt-red" style="font-weight:600; white-space:nowrap; cursor:help;" title="Остаток кончится ДО прихода заказа — разрыв продаж ' +
+      fmtInt(g) + ' ' + plural(g, "день", "дня", "дней") + ' (срок производства ' + fmtInt(LEAD_TIME) + ' дн)">⚠ ' +
+      fmtInt(g) + " дн</span>";
   }
 
   function renderTable() {
@@ -329,11 +428,12 @@ document.addEventListener("DOMContentLoaded", function () {
         "<td>" + clsDot(it.cls) + "</td>" +
         "<td>" + stBadge(it.wos) + "</td>" +
         '<td class="num">' + fmtInt(it.turnover) + "</td>" +
-        '<td class="num muted">' + fmtNum(it.rate, 2) + "</td>" +
+        '<td class="num muted">' + rateCell(it) + "</td>" +
         '<td class="num' + ((it.cs || 0) === 0 ? " txt-red" : "") + '">' + fmtInt(it.cs) + "</td>" +
         '<td class="num' + ((it.ordered || 0) > 0 ? "" : " muted") + '">' + fmtInt(it.ordered || 0) + "</td>" +
         '<td class="num">' + covBar(it.wos) + "</td>" +
         "<td>" + stockoutCell(it.stockout_date, it.wos) + "</td>" +
+        "<td class='num'>" + gapCell(it) + "</td>" +
         '<td class="num"><span class="need' + (crit ? " r" : "") + '">' + fmtInt(it._need) + " шт</span></td>" +
         "</tr>" +
         (open ? "<tr class='expand-row'><td colspan='" + NCOLS + "' style='padding:0;'><div class='sub-panel'>" + calcFormula(it) + sizeRows(it) + "</div></td></tr>" : "");
@@ -433,8 +533,12 @@ document.addEventListener("DOMContentLoaded", function () {
   });
 
   function renderExcluded(excluded) {
-    if (!excluded.length) return;
     var card = document.getElementById("excluded-card");
+    if (!excluded.length) {
+      card.style.display = "none";
+      document.getElementById("excluded-legend").style.display = "none";
+      return;
+    }
     card.style.display = "";
     document.getElementById("excluded-title").textContent = "Не требуют заказа (" + excluded.length + ")";
     var leg = document.getElementById("excluded-legend");
@@ -452,12 +556,14 @@ document.addEventListener("DOMContentLoaded", function () {
       box.style.display = show ? "" : "none";
       document.getElementById("btn-toggle-excluded").textContent = show ? "Скрыть" : "Показать";
     }
-    document.getElementById("btn-toggle-excluded").addEventListener("click", function () { toggleExcluded(); });
-    document.getElementById("excluded-link").addEventListener("click", function (e) {
+    // onclick-присваивание (не addEventListener): renderExcluded зовётся при каждой
+    // перезагрузке данных (смена окна темпа), обработчики не должны накапливаться.
+    document.getElementById("btn-toggle-excluded").onclick = function () { toggleExcluded(); };
+    document.getElementById("excluded-link").onclick = function (e) {
       e.preventDefault();
       toggleExcluded(true);
       card.scrollIntoView({ behavior: "smooth", block: "start" });
-    });
+    };
   }
 
   // Поиск и сортировка
@@ -476,7 +582,7 @@ document.addEventListener("DOMContentLoaded", function () {
     if (!sel.length) { toast("Отметьте хотя бы одну позицию", "error"); return; }
     var today = new Date();
     document.getElementById("order-name").value = "Заказ от " + today.getDate() + " " + MONTHS_SHORT[today.getMonth()];
-    var eta = new Date(today.getTime() + 45 * 86400000);
+    var eta = new Date(today.getTime() + LEAD_TIME * 86400000);  // ETA = сегодня + срок производства
     document.getElementById("order-eta").value = eta.toISOString().slice(0, 10);
     var qty = sel.reduce(function (s, it) { return s + it._need; }, 0);
     var recQty = sel.reduce(function (s, it) { return s + (it.need || 0); }, 0);
