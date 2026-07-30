@@ -76,7 +76,7 @@
           <th class="num" data-sort="wos" title="На сколько недель хватит остатка при текущем темпе продаж">Покрытие, нед</th>
           <th data-sort="stockout_date" data-sort-dir="asc" title="Прогнозная дата, когда остаток кончится">Стокаут</th>
           <th class="num" data-sort="gap_days" id="th-gap" title="Дыра поставки: остаток кончится ДО прихода заказа с производства">Дыра</th>
-          <th class="num" data-sort="_need" title="Темп × горизонт − остаток − едет (правится в размерной сетке)">Заказать</th>
+          <th class="num" data-sort="_need" title="Темп × горизонт − прогнозный остаток к приходу заказа (остаток + едет − продажи за срок производства). Правится в размерной сетке">Заказать</th>
         </tr>
       </thead>
       <tbody id="tbody">
@@ -362,9 +362,13 @@ document.addEventListener("DOMContentLoaded", function () {
       ? ' <span class="txt-red">⚠ Остаток кончится за ' + fmtInt(it.gap_days) +
         ' дн до прихода заказа (производство ' + fmtInt(LEAD_TIME) + ' дн).</span>'
       : "";
+    var proj = it.proj_stock !== undefined ? it.proj_stock : it.cs;
     return '<p class="muted" style="margin:4px 0 8px; font-size:12px;">Расчёт (окно темпа: ' + winTxt + '): ' +
       fmtNum(it.rate, 2) + ' шт/день × ' + fmtInt(HORIZON) + ' дн = ' + fmtInt(gross) +
-      ' − остаток ' + fmtInt(it.cs) + ' − едет ' + fmtInt(it.ordered || 0) +
+      ' − прогнозный остаток к приходу заказа ' + fmtInt(proj) +
+      ' <span title="Остаток ' + fmtInt(it.cs) + ' + едет ' + fmtInt(it.ordered || 0) +
+      ' − продажи за срок производства (' + fmtNum(it.rate, 2) + ' шт/день × ' + fmtInt(LEAD_TIME) +
+      ' дн). Пока заказ шьётся, часть стока продастся — считать от сегодняшнего остатка значило бы занизить заказ.">ⓘ</span>' +
       ' = <b>' + fmtInt(it.need) + ' шт</b>.' +
       ' Темпы: год ' + fmtNum(it.rate_year, 2) + ' · 90 дн ' + fmtNum(it.rate_90, 2) +
       ' · сезон ' + fmtNum(it.rate_season, 2) + ' шт/день.' + gapTxt + '</p>';

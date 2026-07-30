@@ -45,6 +45,10 @@
           <th class="num" data-sort="nq" title="Нетто продано, шт (минус возвраты)">Продано, шт</th>
           <th class="num" data-sort="nr" title="Нетто-выручка за 365 дней">Выручка, ₽</th>
           <th class="num" data-sort="turnover">Оборач., ₽/день</th>
+          <th class="num" data-sort="sea_winter" title="Оборачиваемость в зимние месяцы (дек–фев): выручка этих месяцев / дни в стоке в них. 0 — по сезону нет статистики">Зима</th>
+          <th class="num" data-sort="sea_spring" title="Оборачиваемость в весенние месяцы (мар–май). 0 — по сезону нет статистики">Весна</th>
+          <th class="num" data-sort="sea_summer" title="Оборачиваемость в летние месяцы (июн–авг). 0 — по сезону нет статистики">Лето</th>
+          <th class="num" data-sort="sea_autumn" title="Оборачиваемость в осенние месяцы (сен–ноя). 0 — по сезону нет статистики">Осень</th>
           <th class="num" data-sort="avg_price" title="Средняя фактическая цена продажи против номинала">Цена/номинал</th>
           <th class="num" data-sort="discount_fact" title="Фактическая скидка">Скидка</th>
           <th class="num" data-sort="cs">Остаток</th>
@@ -52,7 +56,7 @@
         </tr>
       </thead>
       <tbody id="tbody">
-        <tr><td colspan="10"><div class="loading-stub">Загрузка…</div></td></tr>
+        <tr><td colspan="14"><div class="loading-stub">Загрузка…</div></td></tr>
       </tbody>
       <tfoot id="tfoot" style="display:none;">
         <tr>
@@ -60,6 +64,7 @@
           <td class="num" id="f-nq"></td>
           <td class="num" id="f-nr"></td>
           <td class="num" id="f-turnover"></td>
+          <td></td><td></td><td></td><td></td>
           <td></td><td></td>
           <td class="num" id="f-cs"></td>
           <td></td>
@@ -92,6 +97,13 @@ document.addEventListener("DOMContentLoaded", function () {
 
   api("/api/turnover").then(function (d) {
     items = d.items || [];
+    // Плоские ключи сезонов — для сортировки по заголовкам.
+    items.forEach(function (it) {
+      var s = it.sea || {};
+      it.sea_winter = s.winter || 0; it.sea_spring = s.spring || 0;
+      it.sea_summer = s.summer || 0; it.sea_autumn = s.autumn || 0;
+    });
+    initClsCards();
     renderClsStrip();
     renderChips();
     if (items.some(function (it) { return it.archived; })) {
@@ -99,13 +111,15 @@ document.addEventListener("DOMContentLoaded", function () {
     }
     renderTable();
   }).catch(function () {
-    tbody.innerHTML = '<tr><td colspan="10">' +
+    tbody.innerHTML = '<tr><td colspan="14">' +
       emptyState("Не удалось загрузить данные", "Обновите страницу или попробуйте позже.",
         '<button class="btn" onclick="location.reload()">Обновить</button>') + "</td></tr>";
   });
 
   // Карточки классов как в исходной таблице CC: остаток шт + денежный запас
-  // (остаток × средняя реальная цена) + число моделей. Клик — фильтр по классу.
+  // (остаток × средняя реальная цена) + число моделей. Считаются по текущей
+  // категории-чипу (правило legacy: сводка и по всему стоку, и по категории).
+  // Клик по карточке — фильтр таблицы по классу.
   function renderClsStrip() {
     var agg = {
       weak: { n: 0, q: 0, m: 0 }, dull: { n: 0, q: 0, m: 0 },
@@ -113,18 +127,23 @@ document.addEventListener("DOMContentLoaded", function () {
     };
     items.forEach(function (it) {
       if (it.archived || groupOf(it) !== "rank" || !agg[it.cls]) return;
+      if (state.cat && it.category !== state.cat) return;
       var a = agg[it.cls];
       a.n++;
       a.q += it.cs || 0;
       a.m += (it.cs || 0) * (it.avg_price || it.sale_price || 0);
     });
+    var scope = state.cat ? " · " + state.cat : "";
     ["weak", "dull", "good", "best"].forEach(function (c) {
       var a = agg[c];
       document.getElementById("cnt-" + c).textContent = fmtInt(a.q) + " шт";
       document.getElementById("sub-" + c).innerHTML =
         '<span class="m-money">≈ ' + fmtMoney(a.m) + "</span><br>" +
-        fmtInt(a.n) + " " + plural(a.n, "модель", "модели", "моделей");
+        fmtInt(a.n) + " " + plural(a.n, "модель", "модели", "моделей") + esc(scope);
     });
+  }
+
+  function initClsCards() {
     document.querySelectorAll(".cls-card").forEach(function (card) {
       card.addEventListener("click", function () {
         var c = card.getAttribute("data-cls");
@@ -153,6 +172,7 @@ document.addEventListener("DOMContentLoaded", function () {
         state.cat = chip.getAttribute("data-cat");
         box.querySelectorAll(".chip").forEach(function (x) { x.classList.remove("active"); });
         chip.classList.add("active");
+        renderClsStrip();
         renderTable();
       });
     });
@@ -162,6 +182,18 @@ document.addEventListener("DOMContentLoaded", function () {
     if (df === null || df === undefined) return '<td class="num muted">—</td>';
     var cls = df >= 0.3 ? "txt-red" : df >= 0.15 ? "txt-yellow" : df <= 0 ? "txt-green" : "";
     return '<td class="num ' + cls + '">' + fmtPct(df) + "</td>";
+  }
+
+  // Сезонная оборачиваемость (правило legacy): 4 колонки Зима/Весна/Лето/Осень.
+  // У шумовых групп числа скрыты (были бы шумом), 0 = «по сезону нет статистики».
+  function seaCells(it) {
+    if (groupOf(it) !== "rank") {
+      return '<td class="num muted">—</td>'.repeat(4);
+    }
+    return ["sea_winter", "sea_spring", "sea_summer", "sea_autumn"].map(function (k) {
+      var v = it[k] || 0;
+      return '<td class="num' + (v ? "" : " muted") + '">' + (v ? fmtInt(v) : "0") + "</td>";
+    }).join("");
   }
 
   function rowHtml(it, dim) {
@@ -174,12 +206,16 @@ document.addEventListener("DOMContentLoaded", function () {
         : it.low_data
         ? '<span class="badge gray" title="Меньше 14 дней в стоке или меньше 3 продаж за год — оборачиваемости пока нельзя доверять">мало данных</span>'
         : clsDot(it.cls)) + "</td>" +
-      '<td class="num muted">' + fmtInt(it.dis) + "</td>" +
+      '<td class="num muted" title="' + (it.dis >= 183
+        ? "Больше полугода в стоке — метрикам можно доверять"
+        : "Меньше полугода в стоке — делайте поправку: вещь, распроданная за пару недель, по цифрам не показательна") + '">' +
+        fmtInt(it.dis) + (it.dis >= 183 ? ' <span class="muted" style="font-size:10px;">✓</span>' : "") + "</td>" +
       '<td class="num">' + fmtInt(it.nq) + "</td>" +
       '<td class="num">' + fmtInt(it.nr) + "</td>" +
       '<td class="num">' + (groupOf(it) === "rank"
         ? "<b>" + fmtInt(it.turnover) + "</b>"
         : '<span class="muted" title="Оборачиваемость не показывается: мало статистики, число было бы шумом">—</span>') + "</td>" +
+      seaCells(it) +
       '<td class="num">' + fmtInt(it.avg_price) + ' <span class="muted">/ ' + fmtInt(it.sale_price) + "</span></td>" +
       discountCell(it.discount_fact) +
       '<td class="num' + ((it.cs || 0) === 0 && it.nq > 0 ? " txt-red" : "") + '">' + fmtInt(it.cs) + "</td>" +
@@ -196,7 +232,7 @@ document.addEventListener("DOMContentLoaded", function () {
     });
 
     if (!arr.length) {
-      tbody.innerHTML = '<tr><td colspan="10">' + (items.length
+      tbody.innerHTML = '<tr><td colspan="14">' + (items.length
         ? emptyState("Ничего не найдено", "Попробуйте изменить запрос или сбросить фильтры.", "")
         : emptyState("Данных пока нет", "Подключите источник данных, чтобы увидеть оборачиваемость ассортимента.",
             '<a class="btn primary" href="/onboarding">Подключить данные</a>')) + "</td></tr>";
@@ -213,7 +249,7 @@ document.addEventListener("DOMContentLoaded", function () {
                            state.sortKey, state.sortDir);
       if (!part.length) return;
       if (g !== "rank") {
-        html += '<tr class="grp-head"><td colspan="10">' + GROUP_TITLES[g] +
+        html += '<tr class="grp-head"><td colspan="14">' + GROUP_TITLES[g] +
           " · " + fmtInt(part.length) + " поз.</td></tr>";
       }
       html += part.map(function (it) { return rowHtml(it, g !== "rank"); }).join("");

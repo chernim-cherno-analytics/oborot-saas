@@ -6,7 +6,13 @@
 - cs   — остаток на ПОСЛЕДНЮЮ имеющуюся дату (нет строки на неё = 0);
 - nq/nr — нетто продано шт / нетто выручка (продажи минус возвраты);
 - rate = nq/dis, turnover = nr/dis (главная метрика, ₽/день);
-- wos = cs/(rate*7); stockout_date = today + cs/rate; need = rate*horizon − cs − ordered.
+- sea — сезонная оборачиваемость (правило legacy): для каждого из 4 сезонов
+  ₽/день = нетто-выручка сезонных месяцев / дни в стоке в эти месяцы (окно 365);
+- wos = cs/(rate*7); stockout_date = today + cs/rate;
+- need = rate*horizon − proj_stock, где proj_stock = max(0, cs + ordered −
+  rate*lead_time) — ПРОГНОЗ остатка на дату прихода заказа (правило legacy
+  /order: за срок производства часть стока продастся; считать потребность от
+  сегодняшнего остатка — значит систематически занижать заказ на rate×lead).
 
 Окна темпа продаж (настройка rate_window, влияет на need/wos/stockout):
 - 'year'   — rate_year = nq365/dis365 (как раньше, дефолт);
@@ -69,6 +75,15 @@ SEASON_WARNING_FULL = 0.40  # warning: полная цена 40–60% ИЛИ о�
 SEASON_WARNING_LEFTOVER = 0.35  # иначе — alarm
 
 _SEASON_NAMES = {3: "весна", 6: "лето", 9: "осень", 12: "зима"}
+
+# Календарные сезоны по месяцу даты (правило legacy: зима = дек–фев).
+_SEASON_OF_MONTH = {
+    "12": "winter", "01": "winter", "02": "winter",
+    "03": "spring", "04": "spring", "05": "spring",
+    "06": "summer", "07": "summer", "08": "summer",
+    "09": "autumn", "10": "autumn", "11": "autumn",
+}
+SEASONS = ("winter", "spring", "summer", "autumn")
 
 _cache: dict[int, tuple[float, dict]] = {}
 _cache_lock = threading.Lock()
@@ -237,6 +252,20 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
     dis90_by_base = _dis_window(cutoff90)
     dis_season_by_base = _dis_window(season_from, season_to)
 
+    # Сезонная оборачиваемость (правило legacy /turnover): дни в стоке и
+    # нетто-выручка по МЕСЯЦАМ сезона внутри окна 365 дней. Реиспользуем
+    # day_totals (пары base×дата, прошедшие порог min_stock).
+    month_of_day = func.substr(day_totals.c.d, 6, 2)
+    sea_dis_by_base: dict[str, dict[str, int]] = {}
+    for base, mm, cnt in db.execute(
+        select(day_totals.c.base, month_of_day, func.count())
+        .group_by(day_totals.c.base, month_of_day)
+    ).all():
+        season = _SEASON_OF_MONTH.get(mm)
+        if season:
+            rec = sea_dis_by_base.setdefault(base, {})
+            rec[season] = rec.get(season, 0) + int(cnt)
+
     # cs: остаток на последнюю дату, по размерам.
     cs_rows: list = []
     if latest_date:
@@ -281,6 +310,21 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
 
     nq90_by_base = _nq_window(cutoff90)
     nq_season_by_base = _nq_window(season_from, season_to)
+
+    # Нетто-выручка по месяцам (для сезонной оборачиваемости), окно 365.
+    sale_month = func.substr(Sale.date, 6, 2)
+    sea_rev_by_base: dict[str, dict[str, float]] = {}
+    for base, mm, rev in db.execute(
+        select(Product.base_name, sale_month, func.sum(sign_rev))
+        .select_from(Sale)
+        .join(Product, join_sales)
+        .where(Sale.org_id == org.id, Sale.date >= cutoff365)
+        .group_by(Product.base_name, sale_month)
+    ).all():
+        season = _SEASON_OF_MONTH.get(mm)
+        if season:
+            rec = sea_rev_by_base.setdefault(base, {})
+            rec[season] = rec.get(season, 0.0) + float(rev or 0)
 
     # «Здоровье сезона» (sell-through 70/20/10): продажи ТЕКУЩЕГО календарного
     # сезона в разбивке «полная цена / скидка». Полная цена — факт. цена за шт
@@ -471,7 +515,18 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
         item["discount_fact"] = (
             round(1 - (nr / nq) / sale_price, 3) if nq > 0 and sale_price > 0 else None
         )
-        item["need"] = max(0, round(rate * horizon) - cs - int(item["ordered"]))
+        # Сезонная оборачиваемость ₽/день (0 = по сезону нет статистики).
+        s_dis = sea_dis_by_base.get(base, {})
+        s_rev = sea_rev_by_base.get(base, {})
+        item["sea"] = {
+            s: (round(s_rev.get(s, 0.0) / s_dis[s]) if s_dis.get(s) else 0)
+            for s in SEASONS
+        }
+        # Прогноз остатка к дате прихода заказа (правило legacy /order):
+        # за lead_time часть стока продастся; «едет» приходуется к той же дате.
+        proj_stock = max(0.0, cs + float(item["ordered"]) - rate * lead_time)
+        item["proj_stock"] = round(proj_stock)
+        item["need"] = max(0, round(rate * horizon) - round(proj_stock))
         item["nq"] = round(nq)
         item["nr"] = round(nr)
 
@@ -812,6 +867,7 @@ def build_replenish(snap: dict) -> dict:
                 "season_fallback": it["season_fallback"],
                 "cs": it["cs"],
                 "ordered": int(it["ordered"]),
+                "proj_stock": int(it.get("proj_stock", it["cs"])),
                 "wos": it["wos"],
                 "stockout_date": it["stockout_date"],
                 "gap_days": it["gap_days"],
@@ -883,6 +939,7 @@ def build_turnover(snap: dict) -> dict:
                 "nq": it["nq"],
                 "nr": it["nr"],
                 "turnover": it["turnover"],
+                "sea": it.get("sea", {}),
                 "cls": it["cls"],
                 "low_data": it.get("low_data", False),
                 "group": turnover_group(it),

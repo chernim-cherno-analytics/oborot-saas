@@ -357,6 +357,32 @@ def run_scenario() -> int:
     check("replenish: «мало данных» не выше значимых позиций",
           repl_ld == sorted(repl_ld),
           f"flags={repl_ld}")
+    # Сезонная оборачиваемость: история mock-мира — 60 дней (конец мая–июль),
+    # т.е. лето (+хвост весны); зимы и осени в данных нет.
+    sea0 = tresp[0].get("sea") or {}
+    check("сезонная оборачиваемость: лето > 0, зима и осень = 0",
+          sea0.get("summer", 0) > 0 and sea0.get("winter", 0) == 0
+          and sea0.get("autumn", 0) == 0,
+          f"sea={sea0}")
+    # Формула заказа (правило legacy): need = темп×горизонт − прогнозный остаток
+    # к приходу заказа; proj_stock = max(0, cs + едет − темп×lead_time).
+    lead = repl.get("lead_time_days")
+    hor = repl.get("horizon_days")
+    check("replenish отдаёт lead_time_days и proj_stock",
+          isinstance(lead, int) and lead > 0
+          and all("proj_stock" in it for it in repl["items"]))
+    bad = [
+        it["base_name"] for it in repl["items"]
+        if abs(it["need"] - max(0, round(it["rate"] * hor) - it["proj_stock"])) > 1
+    ]
+    check("need = темп×горизонт − прогнозный остаток (все позиции)", not bad,
+          f"bad={bad[:3]}")
+    proj_bad = [
+        it["base_name"] for it in repl["items"]
+        if it["proj_stock"] > it["cs"] + it["ordered"]
+    ]
+    check("прогнозный остаток не больше (остаток + едет)", not proj_bad,
+          f"bad={proj_bad[:3]}")
 
     print("== «Едет к нам» из заказов поставщику МС ==")
     exp_inc = mock_ms.expected_incoming()

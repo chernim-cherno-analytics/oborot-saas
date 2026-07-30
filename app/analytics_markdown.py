@@ -33,7 +33,8 @@ from datetime import date
 NEW_DAYS = 30          # новинка: меньше месяца в стоке (dis < 30)
 TOP_TURNOVER = 2000    # legacy: «топ продаж» → 15/20 %
 MID_TURNOVER = 1000    # legacy: середина → 30/40 %
-OVERSTOCK_DAYS = 100   # запас в днях; больше — затоварка, скидка глубже
+OVERSTOCK_DAYS = 90    # запас в днях; больше — затоварка, скидка глубже
+                       # (legacy: zat ≥ 100% от нормы 90 дней = запас ≥ 90 дн)
 NO_SALES_DAYS = 999    # нет продаж → как затоварка (legacy: zat=null → 999)
 PRICE_STEP = 10        # шаг округления новой цены, ₽
 

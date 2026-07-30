@@ -201,12 +201,15 @@ def turnover_workbook(org_name: str, data: dict) -> Workbook:
     """Лист «Оборачиваемость»: все колонки страницы /turnover."""
     headers = [
         "Позиция", "Категория", "Класс", "Дней в стоке", "Продано, шт",
-        "Выручка, ₽", "Оборачиваемость, ₽/день", "Ср. цена, ₽", "Номинал, ₽",
+        "Выручка, ₽", "Оборачиваемость, ₽/день",
+        "Зима, ₽/день", "Весна, ₽/день", "Лето, ₽/день", "Осень, ₽/день",
+        "Ср. цена, ₽", "Номинал, ₽",
         "Скидка факт.", "Остаток, шт", "Покрытие, нед", "Дата стокаута", "Архив",
     ]
     formats = {
-        4: FMT_INT, 5: FMT_INT, 6: FMT_MONEY, 7: FMT_MONEY, 8: FMT_MONEY,
-        9: FMT_MONEY, 10: FMT_PCT, 11: FMT_INT, 12: FMT_NUM1,
+        4: FMT_INT, 5: FMT_INT, 6: FMT_MONEY, 7: FMT_MONEY,
+        8: FMT_MONEY, 9: FMT_MONEY, 10: FMT_MONEY, 11: FMT_MONEY,
+        12: FMT_MONEY, 13: FMT_MONEY, 14: FMT_PCT, 15: FMT_INT, 16: FMT_NUM1,
     }
     wb = Workbook()
     ws = _new_sheet(wb, "Оборачиваемость", org_name, len(headers),
@@ -228,10 +231,16 @@ def turnover_workbook(org_name: str, data: dict) -> Workbook:
         if group == "rank":  # сумма шумовых оборачиваемостей не имеет смысла
             t_turn += it["turnover"]
         t_cs += it["cs"]
+        sea = it.get("sea") or {}
         _write_row(ws, row, [
             it["base_name"], it.get("category") or "", cls_label,
             it["dis"], it["nq"], it["nr"],
-            it["turnover"] if group == "rank" else None, it.get("avg_price"),
+            it["turnover"] if group == "rank" else None,
+            sea.get("winter") if group == "rank" else None,
+            sea.get("spring") if group == "rank" else None,
+            sea.get("summer") if group == "rank" else None,
+            sea.get("autumn") if group == "rank" else None,
+            it.get("avg_price"),
             it.get("sale_price"), it.get("discount_fact"), it["cs"], it.get("wos"),
             _fmt_date_ru(it.get("stockout_date")), "да" if it.get("archived") else "",
         ], formats)
@@ -239,7 +248,7 @@ def turnover_workbook(org_name: str, data: dict) -> Workbook:
 
     _write_total(
         ws, row, len(headers),
-        {5: t_nq, 6: t_nr, 7: t_turn, 11: t_cs}, formats,
+        {5: t_nq, 6: t_nr, 7: t_turn, 15: t_cs}, formats,
         label=f"Итого: {len(data.get('items', []))} поз.",
     )
     _autofit(ws)
