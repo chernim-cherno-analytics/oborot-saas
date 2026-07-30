@@ -216,13 +216,22 @@ def turnover_workbook(org_name: str, data: dict) -> Workbook:
     row = 3
     t_nq = t_nr = t_turn = t_cs = 0
     for it in data.get("items", []):
+        group = it.get("group") or "rank"
+        # Класс — как на странице: шумовые группы вместо класса получают пометку.
+        cls_label = (
+            "мало данных" if group == "low_data"
+            else "без продаж" if group == "no_sales"
+            else CLS_RU.get(it["cls"], it["cls"])
+        )
         t_nq += it["nq"]
         t_nr += it["nr"]
-        t_turn += it["turnover"]
+        if group == "rank":  # сумма шумовых оборачиваемостей не имеет смысла
+            t_turn += it["turnover"]
         t_cs += it["cs"]
         _write_row(ws, row, [
-            it["base_name"], it.get("category") or "", CLS_RU.get(it["cls"], it["cls"]),
-            it["dis"], it["nq"], it["nr"], it["turnover"], it.get("avg_price"),
+            it["base_name"], it.get("category") or "", cls_label,
+            it["dis"], it["nq"], it["nr"],
+            it["turnover"] if group == "rank" else None, it.get("avg_price"),
             it.get("sale_price"), it.get("discount_fact"), it["cs"], it.get("wos"),
             _fmt_date_ru(it.get("stockout_date")), "да" if it.get("archived") else "",
         ], formats)

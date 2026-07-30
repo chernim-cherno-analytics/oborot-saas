@@ -425,7 +425,9 @@ document.addEventListener("DOMContentLoaded", function () {
         '<td><input type="checkbox" class="row-check" data-base="' + esc(it.base_name) + '"' + (it._checked ? " checked" : "") + "></td>" +
         '<td><button class="expander' + (open ? " open" : "") + '" data-base="' + esc(it.base_name) + '" title="Размерная сетка и формула расчёта">' + SVG_CHEVRON + "</button></td>" +
         '<td class="name-cell"><div class="name-main">' + esc(it.base_name) + '</div><div class="name-sub">' + esc(it.category || "") + "</div></td>" +
-        "<td>" + clsDot(it.cls) + "</td>" +
+        "<td>" + (it.low_data
+          ? '<span class="badge gray" title="Меньше 14 дней в стоке или меньше 3 продаж за год — темп продаж оценочный, проверьте количество вручную">мало данных</span>'
+          : clsDot(it.cls)) + "</td>" +
         "<td>" + stBadge(it.wos) + "</td>" +
         '<td class="num">' + fmtInt(it.turnover) + "</td>" +
         '<td class="num muted">' + rateCell(it) + "</td>" +

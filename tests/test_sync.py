@@ -331,6 +331,33 @@ def run_scenario() -> int:
           hoodie is not None and {s["size"] for s in hoodie["sizes"]} >= {"S", "M", "L"},
           f"got={hoodie and [s['size'] for s in hoodie['sizes']]}")
 
+    print("== Рейтинг оборачиваемости: правила legacy-таблицы ==")
+    tresp = client.get("/api/turnover").json()["items"]
+    groups = [it["group"] for it in tresp]
+    order_ok = groups == sorted(groups, key=lambda g: {"rank": 0, "low_data": 1, "no_sales": 2}[g])
+    check("порядок групп: рейтинг → мало данных → без продаж", order_ok,
+          f"groups={groups}")
+    check("первая строка — из рейтинга (шум не наверху)",
+          tresp and tresp[0]["group"] == "rank",
+          f"first={tresp and (tresp[0]['base_name'], tresp[0]['group'])}")
+    cameo = next((it for it in tresp if it["base_name"] == "Бомбер «Камео»"), None)
+    check("крошечный тираж («бомбер Регби»-кейс): low_data, не в рейтинге",
+          cameo is not None and cameo["low_data"] and cameo["group"] == "low_data"
+          and cameo["nq"] > 0,
+          f"got={cameo and (cameo['group'], cameo['dis'], cameo['nq'], cameo['turnover'])}")
+    belt = next((it for it in tresp if it["base_name"] == "Ремень «Ось»"), None)
+    check("неликвид — в группе «без продаж»",
+          belt is not None and belt["group"] == "no_sales")
+    exp_tt = round(sum(it["turnover"] for it in tresp
+                       if not it["archived"] and not it["low_data"]))
+    check("turnover_total на дашборде без low_data-шума",
+          summary["turnover_total"] == exp_tt,
+          f"got={summary['turnover_total']} expected={exp_tt}")
+    repl_ld = [it.get("low_data", False) for it in repl["items"]]
+    check("replenish: «мало данных» не выше значимых позиций",
+          repl_ld == sorted(repl_ld),
+          f"flags={repl_ld}")
+
     print("== «Едет к нам» из заказов поставщику МС ==")
     exp_inc = mock_ms.expected_incoming()
     check("mock: seeded-заказы дают ожидания (Худи 14, Кольцо 5)",

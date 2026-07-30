@@ -737,7 +737,12 @@ def build_summary(snap: dict) -> dict:
         "stock_value_cost": round(stock_value_cost),
         "stock_units": stock_units,
         "positions": len(items),
-        "turnover_total": round(sum(it["turnover"] for it in items)),
+        # «Оборот в день» — только статистически значимые позиции: у low_data
+        # оборачиваемость — шум (1 продажа / 2 дня в стоке = тысячи ₽/день),
+        # он раздувал сумму на дашборде (фидбэк Влада 30.07, п.3 бэклога).
+        "turnover_total": round(
+            sum(it["turnover"] for it in items if not it.get("low_data"))
+        ),
         "sold_30d_qty": snap["sold_30d_qty"],
         "sold_30d_rev": snap["sold_30d_rev"],
         "alerts": alerts[:20],
@@ -766,7 +771,13 @@ def build_replenish(snap: dict) -> dict:
     rate_window = settings.get("rate_window", "year")
     lead_time = settings.get("lead_time_days", DEFAULT_LEAD_TIME_DAYS)
     result, excluded = [], []
-    for it in sorted(snap["items"].values(), key=lambda x: -x["turnover"]):
+    # Правило legacy-таблицы: рейтинг по оборачиваемости, но позиции с малой
+    # статистикой (low_data) — в конце, а не наверху: их темп из 1–2 продаж
+    # завышен, и рекомендация заказа по нему — предположение, а не расчёт.
+    for it in sorted(
+        snap["items"].values(),
+        key=lambda x: (bool(x.get("low_data")), -x["turnover"]),
+    ):
         base = it["base_name"]
         if it["archived"]:
             excluded.append({"base_name": base, "reason": "архивная позиция"})
@@ -792,6 +803,7 @@ def build_replenish(snap: dict) -> dict:
                 "base_name": base,
                 "category": it["category"],
                 "cls": it["cls"],
+                "low_data": it.get("low_data", False),
                 "turnover": it["turnover"],
                 "rate": it["rate_active"],
                 "rate_year": it["rate_year"],
@@ -828,15 +840,37 @@ def build_replenish(snap: dict) -> dict:
     }
 
 
-def build_turnover(snap: dict) -> dict:
-    """GET /api/turnover — все позиции, сортировка по turnover desc.
+def turnover_group(it: dict) -> str:
+    """Группа позиции в рейтинге оборачиваемости (правила legacy-таблицы CC).
 
-    Позиции с low_data (мало дней в стоке/продаж) уходят в конец списка: их
-    «оборачиваемость» — арифметический шум, а не рейтинг.
+    'rank'     — рейтинг: есть продажи и достаточная статистика; ранжируется
+                 по оборачиваемости и получает класс A–D;
+    'low_data' — есть продажи, но статистики мало (MIN_SIGNIF_*): 1–2 продажи
+                 при паре дней в стоке дают «оборачиваемость» в десятки тысяч
+                 ₽/день — это шум, а не рейтинг; в списке всегда ПОСЛЕ рейтинга;
+    'no_sales' — за 365 дней продаж не было (в legacy — серые строки в конце).
+    """
+    if it["nr"] <= 0 and it["nq"] <= 0:
+        return "no_sales"
+    if it.get("low_data"):
+        return "low_data"
+    return "rank"
+
+
+_GROUP_ORDER = {"rank": 0, "low_data": 1, "no_sales": 2}
+
+
+def build_turnover(snap: dict) -> dict:
+    """GET /api/turnover — все позиции тремя группами (как в legacy-таблице):
+
+    рейтинг (по turnover desc) → «мало данных» → «без продаж». Позиции с
+    низкой статистикой никогда не стоят выше рейтинга: их «оборачиваемость» —
+    арифметический шум, а таблица говорит бизнесу об эффективности и перезаказах.
     """
     items = []
     for it in sorted(
-        snap["items"].values(), key=lambda x: (x.get("low_data", False), -x["turnover"])
+        snap["items"].values(),
+        key=lambda x: (_GROUP_ORDER[turnover_group(x)], -x["turnover"], -x["cs"]),
     ):
         if it["cs"] == 0 and it["nq"] <= 0 and it["dis"] == 0 and not it["archived"]:
             continue
@@ -851,6 +885,7 @@ def build_turnover(snap: dict) -> dict:
                 "turnover": it["turnover"],
                 "cls": it["cls"],
                 "low_data": it.get("low_data", False),
+                "group": turnover_group(it),
                 "avg_price": it["avg_price"],
                 "sale_price": it["sale_price"],
                 "discount_fact": it["discount_fact"],

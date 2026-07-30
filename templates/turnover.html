@@ -1,14 +1,23 @@
 {% extends "base.html" %}
 {% block content %}
 
-<p class="page-sub">Метрики за скользящие 365 дней. Оборачиваемость — нетто-выручка в расчёте на день, когда товар был в наличии.</p>
+<p class="page-sub">Метрики за скользящие 365 дней. Оборачиваемость — нетто-выручка в расчёте на день, когда товар был в наличии. Карточка класса — фильтр: клик показывает только её позиции.</p>
 
 <div class="metric-grid" style="grid-template-columns:repeat(4, 1fr);" id="cls-strip">
-  <div class="metric"><div class="m-label"><span class="clsq best" style="width:18px;height:18px;font-size:10px;vertical-align:-4px;">A</span>&nbsp; Бестселлеры</div><div class="m-value" id="cnt-best">—</div><div class="m-sub">≥ 5 000 ₽/день</div></div>
-  <div class="metric"><div class="m-label"><span class="clsq good" style="width:18px;height:18px;font-size:10px;vertical-align:-4px;">B</span>&nbsp; Хорошие</div><div class="m-value" id="cnt-good">—</div><div class="m-sub">2 000 – 5 000 ₽/день</div></div>
-  <div class="metric"><div class="m-label"><span class="clsq dull" style="width:18px;height:18px;font-size:10px;vertical-align:-4px;">C</span>&nbsp; Медленные</div><div class="m-value" id="cnt-dull">—</div><div class="m-sub">1 000 – 2 000 ₽/день</div></div>
-  <div class="metric"><div class="m-label"><span class="clsq weak" style="width:18px;height:18px;font-size:10px;vertical-align:-4px;">D</span>&nbsp; Слабые</div><div class="m-value" id="cnt-weak">—</div><div class="m-sub">&lt; 1 000 ₽/день</div></div>
+  <div class="metric cls-card" data-cls="best" title="Показать только бестселлеры"><div class="m-label"><span class="clsq best" style="width:18px;height:18px;font-size:10px;vertical-align:-4px;">A</span>&nbsp; Бестселлеры</div><div class="m-value" id="cnt-best">—</div><div class="m-sub" id="sub-best">≥ 5 000 ₽/день</div></div>
+  <div class="metric cls-card" data-cls="good" title="Показать только хорошие"><div class="m-label"><span class="clsq good" style="width:18px;height:18px;font-size:10px;vertical-align:-4px;">B</span>&nbsp; Хорошие</div><div class="m-value" id="cnt-good">—</div><div class="m-sub" id="sub-good">2 000 – 5 000 ₽/день</div></div>
+  <div class="metric cls-card" data-cls="dull" title="Показать только медленные"><div class="m-label"><span class="clsq dull" style="width:18px;height:18px;font-size:10px;vertical-align:-4px;">C</span>&nbsp; Медленные</div><div class="m-value" id="cnt-dull">—</div><div class="m-sub" id="sub-dull">1 000 – 2 000 ₽/день</div></div>
+  <div class="metric cls-card" data-cls="weak" title="Показать только слабые"><div class="m-label"><span class="clsq weak" style="width:18px;height:18px;font-size:10px;vertical-align:-4px;">D</span>&nbsp; Слабые</div><div class="m-value" id="cnt-weak">—</div><div class="m-sub" id="sub-weak">&lt; 1 000 ₽/день</div></div>
 </div>
+<style>
+  .cls-card { cursor: pointer; transition: transform .12s, outline-color .12s; outline: 2px solid transparent; }
+  .cls-card:hover { transform: translateY(-2px); }
+  .cls-card.active { outline-color: var(--accent, #7aa2ff); }
+  .cls-card .m-money { font-size: 13px; font-weight: 600; opacity: .8; margin-top: 2px; }
+  tr.grp-head td { padding: 10px 12px 6px; font-size: 11px; font-weight: 600;
+    letter-spacing: .07em; text-transform: uppercase; opacity: .55; border-bottom: none; }
+  tr.row-dim td { opacity: .55; }
+</style>
 
 <div class="card">
   <div class="toolbar">
@@ -66,8 +75,20 @@
 <script>
 document.addEventListener("DOMContentLoaded", function () {
   var items = [];
-  var state = { sortKey: "turnover", sortDir: -1, query: "", cat: "", archived: false };
+  var state = { sortKey: "turnover", sortDir: -1, query: "", cat: "", cls: "", archived: false };
   var tbody = document.getElementById("tbody");
+
+  // Группа позиции (правила legacy-таблицы CC): рейтинг → мало данных → без продаж.
+  function groupOf(it) {
+    if (it.group) return it.group;
+    if ((it.nr || 0) <= 0 && (it.nq || 0) <= 0) return "no_sales";
+    if (it.low_data) return "low_data";
+    return "rank";
+  }
+  var GROUP_TITLES = {
+    low_data: "Мало данных — новинки и единичные продажи: оборачиваемости пока нельзя доверять",
+    no_sales: "Без продаж за 365 дней"
+  };
 
   api("/api/turnover").then(function (d) {
     items = d.items || [];
@@ -83,11 +104,36 @@ document.addEventListener("DOMContentLoaded", function () {
         '<button class="btn" onclick="location.reload()">Обновить</button>') + "</td></tr>";
   });
 
+  // Карточки классов как в исходной таблице CC: остаток шт + денежный запас
+  // (остаток × средняя реальная цена) + число моделей. Клик — фильтр по классу.
   function renderClsStrip() {
-    var cnt = { weak: 0, dull: 0, good: 0, best: 0 };
-    items.forEach(function (it) { if (!it.archived && !it.low_data && cnt[it.cls] !== undefined) cnt[it.cls]++; });
+    var agg = {
+      weak: { n: 0, q: 0, m: 0 }, dull: { n: 0, q: 0, m: 0 },
+      good: { n: 0, q: 0, m: 0 }, best: { n: 0, q: 0, m: 0 }
+    };
+    items.forEach(function (it) {
+      if (it.archived || groupOf(it) !== "rank" || !agg[it.cls]) return;
+      var a = agg[it.cls];
+      a.n++;
+      a.q += it.cs || 0;
+      a.m += (it.cs || 0) * (it.avg_price || it.sale_price || 0);
+    });
     ["weak", "dull", "good", "best"].forEach(function (c) {
-      document.getElementById("cnt-" + c).textContent = fmtInt(cnt[c]);
+      var a = agg[c];
+      document.getElementById("cnt-" + c).textContent = fmtInt(a.q) + " шт";
+      document.getElementById("sub-" + c).innerHTML =
+        '<span class="m-money">≈ ' + fmtMoney(a.m) + "</span><br>" +
+        fmtInt(a.n) + " " + plural(a.n, "модель", "модели", "моделей");
+    });
+    document.querySelectorAll(".cls-card").forEach(function (card) {
+      card.addEventListener("click", function () {
+        var c = card.getAttribute("data-cls");
+        state.cls = state.cls === c ? "" : c;
+        document.querySelectorAll(".cls-card").forEach(function (x) {
+          x.classList.toggle("active", x.getAttribute("data-cls") === state.cls);
+        });
+        renderTable();
+      });
     });
   }
 
@@ -118,44 +164,69 @@ document.addEventListener("DOMContentLoaded", function () {
     return '<td class="num ' + cls + '">' + fmtPct(df) + "</td>";
   }
 
+  function rowHtml(it, dim) {
+    return '<tr class="' + (dim ? "row-dim" : "") + '">' +
+      '<td class="name-cell"><div class="name-main">' + esc(it.base_name) +
+        (it.archived ? ' <span class="badge gray">архив</span>' : "") +
+        '</div><div class="name-sub">' + esc(it.category || "") + "</div></td>" +
+      "<td>" + (groupOf(it) === "no_sales"
+        ? '<span class="badge gray" title="За 365 дней не продано ни одной штуки">без продаж</span>'
+        : it.low_data
+        ? '<span class="badge gray" title="Меньше 14 дней в стоке или меньше 3 продаж за год — оборачиваемости пока нельзя доверять">мало данных</span>'
+        : clsDot(it.cls)) + "</td>" +
+      '<td class="num muted">' + fmtInt(it.dis) + "</td>" +
+      '<td class="num">' + fmtInt(it.nq) + "</td>" +
+      '<td class="num">' + fmtInt(it.nr) + "</td>" +
+      '<td class="num">' + (groupOf(it) === "rank"
+        ? "<b>" + fmtInt(it.turnover) + "</b>"
+        : '<span class="muted" title="Оборачиваемость не показывается: мало статистики, число было бы шумом">—</span>') + "</td>" +
+      '<td class="num">' + fmtInt(it.avg_price) + ' <span class="muted">/ ' + fmtInt(it.sale_price) + "</span></td>" +
+      discountCell(it.discount_fact) +
+      '<td class="num' + ((it.cs || 0) === 0 && it.nq > 0 ? " txt-red" : "") + '">' + fmtInt(it.cs) + "</td>" +
+      '<td class="num">' + ((it.cs || 0) > 0 ? covBar(it.wos) : '<span class="muted">—</span>') + "</td>" +
+      "</tr>";
+  }
+
   function renderTable() {
     var arr = items.filter(function (it) {
       if (it.archived && !state.archived) return false;
       if (state.cat && it.category !== state.cat) return false;
+      if (state.cls && (groupOf(it) !== "rank" || it.cls !== state.cls)) return false;
       return wordMatch(it.base_name, state.query);
     });
-    arr = sortItems(arr, state.sortKey, state.sortDir);
 
     if (!arr.length) {
       tbody.innerHTML = '<tr><td colspan="10">' + (items.length
-        ? emptyState("Ничего не найдено", "Попробуйте изменить запрос или сбросить фильтр категории.", "")
+        ? emptyState("Ничего не найдено", "Попробуйте изменить запрос или сбросить фильтры.", "")
         : emptyState("Данных пока нет", "Подключите источник данных, чтобы увидеть оборачиваемость ассортимента.",
             '<a class="btn primary" href="/onboarding">Подключить данные</a>')) + "</td></tr>";
       document.getElementById("tfoot").style.display = "none";
       return;
     }
 
-    tbody.innerHTML = arr.map(function (it) {
-      return "<tr>" +
-        '<td class="name-cell"><div class="name-main">' + esc(it.base_name) +
-          (it.archived ? ' <span class="badge gray">архив</span>' : "") +
-          '</div><div class="name-sub">' + esc(it.category || "") + "</div></td>" +
-        "<td>" + (it.low_data
-          ? '<span class="badge gray" title="Меньше 14 дней в стоке или меньше 3 продаж за год — оборачиваемости пока нельзя доверять">мало данных</span>'
-          : clsDot(it.cls)) + "</td>" +
-        '<td class="num muted">' + fmtInt(it.dis) + "</td>" +
-        '<td class="num">' + fmtInt(it.nq) + "</td>" +
-        '<td class="num">' + fmtInt(it.nr) + "</td>" +
-        '<td class="num"><b>' + fmtInt(it.turnover) + "</b></td>" +
-        '<td class="num">' + fmtInt(it.avg_price) + ' <span class="muted">/ ' + fmtInt(it.sale_price) + "</span></td>" +
-        discountCell(it.discount_fact) +
-        '<td class="num' + ((it.cs || 0) === 0 && it.nq > 0 ? " txt-red" : "") + '">' + fmtInt(it.cs) + "</td>" +
-        '<td class="num">' + ((it.cs || 0) > 0 ? covBar(it.wos) : '<span class="muted">—</span>') + "</td>" +
-        "</tr>";
-    }).join("");
+    // Правило исходной таблицы CC: рейтинг сверху, «мало данных» и «без продаж» —
+    // всегда в конце, отдельными секциями. Сортировка колонок действует ВНУТРИ
+    // каждой секции и не перемешивает шум с рейтингом.
+    var html = "";
+    ["rank", "low_data", "no_sales"].forEach(function (g) {
+      var part = sortItems(arr.filter(function (it) { return groupOf(it) === g; }),
+                           state.sortKey, state.sortDir);
+      if (!part.length) return;
+      if (g !== "rank") {
+        html += '<tr class="grp-head"><td colspan="10">' + GROUP_TITLES[g] +
+          " · " + fmtInt(part.length) + " поз.</td></tr>";
+      }
+      html += part.map(function (it) { return rowHtml(it, g !== "rank"); }).join("");
+    });
+    tbody.innerHTML = html;
 
+    // ИТОГО: штуки/выручка/остаток — по всему показанному; оборачиваемость —
+    // только по рейтингу (сумма шума не имеет смысла).
     var nq = 0, nr = 0, cs = 0, turn = 0;
-    arr.forEach(function (it) { nq += it.nq || 0; nr += it.nr || 0; cs += it.cs || 0; turn += it.turnover || 0; });
+    arr.forEach(function (it) {
+      nq += it.nq || 0; nr += it.nr || 0; cs += it.cs || 0;
+      if (groupOf(it) === "rank") turn += it.turnover || 0;
+    });
     document.getElementById("tfoot").style.display = "";
     document.getElementById("f-count").textContent = "ИТОГО: " + fmtInt(arr.length) + " поз.";
     document.getElementById("f-nq").textContent = fmtInt(nq);
