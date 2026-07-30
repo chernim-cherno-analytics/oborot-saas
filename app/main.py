@@ -83,6 +83,8 @@ if STATIC_DIR.is_dir():
 @app.on_event("startup")
 def _startup() -> None:
     init_db()
+    from app import exclusions as _exclusions
+    _exclusions.ensure_schema()
 
 
 # ── Помощники ────────────────────────────────────────────────────────────────
@@ -106,10 +108,25 @@ def _resolve_embedded(request: Request) -> bool | None:
     return embedded, override
 
 
-def _page(request: Request, ctx: auth.AuthContext, template: str, active: str, page_title: str):
+def _page(request: Request, ctx: auth.AuthContext, template: str, active: str, page_title: str,
+          db: Session | None = None):
     """Рендер страницы с обязательным контекстом {user, org, active, page_title}."""
     org = ctx.org
     embedded, override = _resolve_embedded(request)
+    # Флаг «данные демо»: слова про синтетические данные показываем только когда
+    # активное подключение — demo. При реальном МойСкладе полоска говорит лишь о триале.
+    is_demo = False
+    if db is not None:
+        is_demo = (
+            db.execute(
+                select(Connection.id).where(
+                    Connection.org_id == org.id,
+                    Connection.status == "active",
+                    Connection.kind == "demo",
+                )
+            ).first()
+            is not None
+        )
     response = templates.TemplateResponse(
         request,
         template,
@@ -121,6 +138,7 @@ def _page(request: Request, ctx: auth.AuthContext, template: str, active: str, p
                 # source нужен шаблону: не-МС-триалу показываем демо-полоску,
                 # МС-аккаунту (source='ms_app') подписку показывает сам МойСклад.
                 "source": getattr(org, "source", "saas"),
+                "demo": is_demo,
                 "trial_ends_at": org.trial_ends_at.date().isoformat() if org.trial_ends_at else None,
             },
             "active": active,
@@ -152,7 +170,7 @@ def _authed_page(request: Request, db: Session, template: str, active: str, page
     ctx = auth.resolve_auth(request, db)
     if ctx is None:
         return RedirectResponse("/login", status_code=302)
-    return _page(request, ctx, template, active, page_title)
+    return _page(request, ctx, template, active, page_title, db=db)
 
 
 # ── Аутентификация ───────────────────────────────────────────────────────────
@@ -221,8 +239,8 @@ def register_submit(
     email_norm = email.strip().lower()
     if not email_norm or "@" not in email_norm:
         return _render_auth(request, "register.html", name=name, org_name=org_name, email=email, error="Укажите корректный e-mail")
-    if len(password) < 6:
-        return _render_auth(request, "register.html", name=name, org_name=org_name, email=email, error="Пароль — минимум 6 символов")
+    if len(password) < 8:
+        return _render_auth(request, "register.html", name=name, org_name=org_name, email=email, error="Пароль — минимум 8 символов")
     exists = db.execute(select(User.id).where(User.email == email_norm)).first()
     if exists:
         return _render_auth(request, "register.html", name=name, org_name=org_name, email=email, error="Такой e-mail уже зарегистрирован")
@@ -260,7 +278,7 @@ def dashboard_page(request: Request, db: Session = Depends(get_db)):
         return templates.TemplateResponse(request, "landing.html", {})
     if not _has_active_connection(db, ctx.org.id):
         return RedirectResponse("/onboarding", status_code=302)
-    return _page(request, ctx, "dashboard.html", "dashboard", "Показатели")
+    return _page(request, ctx, "dashboard.html", "dashboard", "Показатели", db=db)
 
 
 @app.get("/onboarding", response_class=HTMLResponse)
@@ -270,7 +288,7 @@ def onboarding_page(request: Request, db: Session = Depends(get_db)):
         return RedirectResponse("/login", status_code=302)
     if _has_active_connection(db, ctx.org.id):
         return RedirectResponse("/", status_code=302)
-    return _page(request, ctx, "onboarding.html", "onboarding", "Подключение данных")
+    return _page(request, ctx, "onboarding.html", "onboarding", "Подключение данных", db=db)
 
 
 @app.get("/replenish", response_class=HTMLResponse)

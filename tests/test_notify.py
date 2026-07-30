@@ -211,7 +211,7 @@ def run_scenario() -> int:
           "Товара на складе" in text and "₽" in text and "шт" in text)
     check("дайджест: продано за 30 дней", "Продано за 30 дней" in text)
     check("дайджест: красные алерты (стокауты) из демо-данных",
-          "🔴" in text and ("распродан в ноль" in text or "закончится примерно" in text),
+          "🔴" in text and ("распродан, теряем" in text or "пора заказывать" in text),
           f"has_red={'🔴' in text}")
     check("дайджест: жёлтые алерты (неликвид/затоварка) из демо-данных",
           "🟡" in text and ("неликвид" in text or "затоварка" in text),

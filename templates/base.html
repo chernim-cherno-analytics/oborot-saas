@@ -34,8 +34,8 @@
      показывает сам МойСклад снаружи (см. задачу, п.3). #}
   {% if org.plan == 'trial' and org.source != 'ms_app' %}
   <div class="trial-strip">
-    <strong>Демо-режим:</strong> показаны синтетические данные.
-    Триал до <span data-fmt-date="{{ org.trial_ends_at }}">{{ org.trial_ends_at }}</span>.
+    {% if org.demo %}<strong>Демо-режим:</strong> показаны синтетические данные.
+    {% endif %}Триал до <span data-fmt-date="{{ org.trial_ends_at }}">{{ org.trial_ends_at }}</span>.
   </div>
   {% endif %}
 
@@ -113,8 +113,8 @@
 
     {% if org.plan == 'trial' %}
     <div class="trial-strip">
-      <strong>Демо-режим:</strong> показаны синтетические данные.
-      Триал до <span data-fmt-date="{{ org.trial_ends_at }}">{{ org.trial_ends_at }}</span>.
+      {% if org.demo %}<strong>Демо-режим:</strong> показаны синтетические данные.
+      {% endif %}Триал до <span data-fmt-date="{{ org.trial_ends_at }}">{{ org.trial_ends_at }}</span>.
     </div>
     {% endif %}
 

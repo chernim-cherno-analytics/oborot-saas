@@ -206,7 +206,9 @@ def run_scenario() -> int:
           f"got={prow['c']} expected={expected_products}")
 
     all_stores = tuple(s for s, _ in mock_ms.STORES)
-    exp_units = round(sum(mock_ms.expected_stock_today(stores=all_stores).values()))
+    exp_units = round(sum(
+        mock_ms.expected_stock_today(stores=all_stores, include_service=True).values()
+    ))
     srow = q1("SELECT ROUND(SUM(qty)) q FROM warehouse_stock WHERE org_id=?", org_id)
     check("текущий остаток = эталон mock-мира по ВСЕМ складам",
           srow["q"] == exp_units, f"got={srow['q']} expected={exp_units}")

@@ -70,7 +70,7 @@
     <div class="m-sub" id="m-sold-qty">— шт</div>
   </div>
   <div class="metric">
-    <div class="m-label" title="Сумма оборачиваемостей всех позиций: сколько ₽ выручки в день приносит ассортимент при текущем темпе">Темп продаж</div>
+    <div class="m-label" title="Сумма оборачиваемостей всех позиций: сколько ₽ выручки в день приносит ассортимент при текущем темпе">Оборот в день</div>
     <div class="m-value" id="m-turnover">—</div>
     <div class="m-sub">₽/день — сумма по всем позициям за год</div>
   </div>
@@ -196,11 +196,25 @@ document.addEventListener("DOMContentLoaded", function () {
       var cnt = document.getElementById("alerts-count");
       cnt.style.display = "";
       cnt.textContent = alerts.length;
-      box.innerHTML = alerts.map(function (a) {
-        return '<a class="alert-item ' + (a.severity === "red" ? "red" : "yellow") +
-          '" href="/turnover?q=' + encodeURIComponent(a.base_name) + '" style="text-decoration:none; color:inherit; display:block;">' +
-          '<div><div class="a-name">' + esc(a.base_name) + "</div>" +
-          '<div class="a-text">' + esc(a.text) + "</div></div></a>";
+      // Группируем по смыслу: сначала деньги, которые теряем, потом замороженные.
+      var GROUPS = [
+        ["stockout", "Бестселлеры под угрозой — теряем выручку"],
+        ["overstock", "Затоварка — деньги заморожены в запасе"],
+        ["no_sales", "Неликвид — не заказывать больше"]
+      ];
+      box.innerHTML = GROUPS.map(function (g) {
+        var list = alerts.filter(function (a) { return a.type === g[0]; });
+        if (!list.length) return "";
+        return '<div class="a-group-title" style="font-size:11px; font-weight:700; letter-spacing:.06em; text-transform:uppercase; color:var(--text-soft); margin:14px 0 6px;">' + g[1] + "</div>" +
+          list.map(function (a) {
+            // Имя показано отдельной строкой — из текста алерта его убираем.
+            var body = a.text.indexOf(a.base_name + ": ") === 0
+              ? a.text.slice(a.base_name.length + 2) : a.text;
+            return '<a class="alert-item ' + (a.severity === "red" ? "red" : "yellow") +
+              '" href="/turnover?q=' + encodeURIComponent(a.base_name) + '" style="text-decoration:none; color:inherit; display:block;">' +
+              '<div><div class="a-name">' + esc(a.base_name) + "</div>" +
+              '<div class="a-text">' + esc(body) + "</div></div></a>";
+          }).join("");
       }).join("");
     }
 
@@ -260,15 +274,18 @@ document.addEventListener("DOMContentLoaded", function () {
     badge.className = "badge " + st[0];
     badge.textContent = st[1];
 
+    // целые проценты приходят с сервера суммой ровно 100 (full_pct/disc_pct/leftover_pct)
+    var fp = sh.full_pct != null ? sh.full_pct : Math.round((sh.full_share || 0) * 100);
+    var dp = sh.disc_pct != null ? sh.disc_pct : Math.round((sh.disc_share || 0) * 100);
+    var lp = sh.leftover_pct != null ? sh.leftover_pct : Math.round((sh.leftover_share || 0) * 100);
     var bar = [
-      { cls: "sb-full", share: sh.full_share },
-      { cls: "sb-disc", share: sh.disc_share },
-      { cls: "sb-left", share: sh.leftover_share }
+      { cls: "sb-full", pct: fp },
+      { cls: "sb-disc", pct: dp },
+      { cls: "sb-left", pct: lp }
     ].map(function (s) {
-      var pct = (s.share || 0) * 100;
-      if (pct <= 0) return "";
-      var lbl = pct >= 7 ? "<span>" + Math.round(pct) + "%</span>" : "";
-      return '<i class="' + s.cls + '" style="width:' + pct.toFixed(1) + '%">' + lbl + "</i>";
+      if (s.pct <= 0) return "";
+      var lbl = s.pct >= 7 ? "<span>" + s.pct + "%</span>" : "";
+      return '<i class="' + s.cls + '" style="width:' + s.pct + '%">' + lbl + "</i>";
     }).join("");
 
     var msg;
@@ -283,9 +300,9 @@ document.addEventListener("DOMContentLoaded", function () {
     box.innerHTML =
       '<div class="season-bar">' + bar + "</div>" +
       '<div class="season-legend">' +
-        '<span class="sl-item"><span class="sw g"></span>Полная цена <b>' + pctTxt(sh.full_share) + '</b> <span class="sl-money">' + fmtMoney(sh.full_price_rev) + "</span></span>" +
-        '<span class="sl-item"><span class="sw y"></span>Со скидкой <b>' + pctTxt(sh.disc_share) + '</b> <span class="sl-money">' + fmtMoney(sh.discounted_rev) + "</span></span>" +
-        '<span class="sl-item"><span class="sw n"></span>Остаток <b>' + pctTxt(sh.leftover_share) + '</b> <span class="sl-money">' + fmtMoney(sh.leftover_value) + "</span></span>" +
+        '<span class="sl-item"><span class="sw g"></span>Полная цена <b>' + fp + '%</b> <span class="sl-money">' + fmtMoney(sh.full_price_rev) + "</span></span>" +
+        '<span class="sl-item"><span class="sw y"></span>Со скидкой <b>' + dp + '%</b> <span class="sl-money">' + fmtMoney(sh.discounted_rev) + "</span></span>" +
+        '<span class="sl-item"><span class="sw n"></span>Остаток <b>' + lp + '%</b> <span class="sl-money">' + fmtMoney(sh.leftover_value) + "</span></span>" +
         '<span class="season-norm" title="Отраслевой норматив sell-through сезона">Норматив: 70 / 20 / 10</span>' +
       "</div>" +
       '<div class="season-msg">' + msg + "</div>";

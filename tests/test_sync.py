@@ -187,6 +187,51 @@ def run_scenario() -> int:
     row = con.execute("SELECT archived FROM products WHERE ext_id='p-old1'").fetchone()
     check("архивная позиция помечена archived", row and row["archived"] == 1)
 
+    print("== Исключение расходников/сертификатов из аналитики ==")
+    row = con.execute("SELECT excluded FROM products WHERE ext_id='p-pack1'").fetchone()
+    check("упаковка авто-исключена (категория «Расходный материал»)",
+          row and row["excluded"] == 1)
+    row = con.execute("SELECT excluded FROM products WHERE ext_id='p-cert1'").fetchone()
+    check("сертификат авто-исключён (слово в названии)", row and row["excluded"] == 1)
+    row = con.execute("SELECT excluded FROM products WHERE ext_id='p-bag1'").fetchone()
+    check("обычный товар НЕ исключён (эвристика не жадничает)",
+          row and row["excluded"] == 0)
+
+    excl_resp = client.get("/api/exclusions").json()
+    excl_names = {e["base_name"] for e in excl_resp.get("excluded", [])}
+    check("GET /api/exclusions отдаёт оба расходника",
+          {"Брендированный пакет средний", "Подарочный сертификат на десять тысяч"} <= excl_names,
+          f"got={sorted(excl_names)}")
+
+    turno_bases = {it["base_name"] for it in client.get("/api/turnover").json()["items"]}
+    check("исключённые не видны в оборачиваемости",
+          "Брендированный пакет средний" not in turno_bases
+          and "Подарочный сертификат на десять тысяч" not in turno_bases)
+
+    sum_before = client.get("/api/summary").json()
+    r = client.post("/api/exclusions",
+                    json={"base_name": "Брендированный пакет средний", "excluded": False})
+    check("возврат позиции в аналитику работает", r.status_code == 200 and r.json().get("ok"))
+    turno_bases2 = {it["base_name"] for it in client.get("/api/turnover").json()["items"]}
+    check("возвращённая позиция появилась в оборачиваемости (пакет распродан, nq>0)",
+          "Брендированный пакет средний" in turno_bases2)
+    # Сертификат в mock-мире имеет живой остаток — проверяем влияние на сток.
+    r = client.post("/api/exclusions",
+                    json={"base_name": "Подарочный сертификат на десять тысяч", "excluded": False})
+    check("возврат сертификата работает", r.status_code == 200 and r.json().get("ok"))
+    sum_after = client.get("/api/summary").json()
+    check("возврат позиции с остатком увеличил сток",
+          sum_after["stock_units"] > sum_before["stock_units"],
+          f"units {sum_before['stock_units']} -> {sum_after['stock_units']}")
+    for base in ("Брендированный пакет средний", "Подарочный сертификат на десять тысяч"):
+        r = client.post("/api/exclusions", json={"base_name": base, "excluded": True})
+        check(f"повторное исключение работает ({base[:20]}…)",
+              r.status_code == 200 and r.json().get("ok"))
+    sum_back = client.get("/api/summary").json()
+    check("после исключения числа вернулись",
+          sum_back["stock_units"] == sum_before["stock_units"],
+          f"{sum_back['stock_units']} != {sum_before['stock_units']}")
+
     print("== История остатков ==")
     n_stock = con.execute("SELECT COUNT(*) c FROM stock_days").fetchone()["c"]
     n_dates = con.execute("SELECT COUNT(DISTINCT date) c FROM stock_days").fetchone()["c"]

@@ -118,6 +118,9 @@ class Product(Base):
     sale_price: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)  # номинал, ₽
     cost_price: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)  # себестоимость, ₽
     archived: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # Не участвует в аналитике (упаковка, сертификаты, расходники): ставится
+    # авто-эвристикой при первом появлении позиции и руками в настройках.
+    excluded: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
 
 
 class StockDay(Base):

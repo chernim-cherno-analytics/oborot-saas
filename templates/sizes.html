@@ -167,7 +167,7 @@ document.addEventListener("DOMContentLoaded", function () {
     document.getElementById("cards").style.display = "";
     document.getElementById("m-sold").textContent = fmtInt(d.totals.sold_period) + " шт";
     document.getElementById("m-sold-s").textContent = d.period_label +
-      (d.months_in_period ? " · " + d.months_in_period + " мес" : "");
+      (d.period === "all" && d.months_in_period ? " · " + d.months_in_period + " мес данных" : "");
     document.getElementById("m-rate").textContent = fmtNum(d.totals.rate_per_month, 1);
     document.getElementById("m-stock").textContent = fmtInt(d.totals.stock) + " шт";
     document.getElementById("m-order").textContent = fmtInt(d.totals.order) + " шт";

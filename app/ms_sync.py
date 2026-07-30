@@ -34,7 +34,7 @@ from datetime import date, datetime, timedelta
 
 from sqlalchemy import delete, insert, select
 
-from app import analytics
+from app import analytics, exclusions
 from app.crypto import decrypt_token
 from app.db import SessionLocal
 from app.models import (
@@ -366,6 +366,9 @@ def _upsert_products(org_id: int, assortment: list[dict], stats: dict) -> dict[s
             row = existing.get(item["ext_id"])
             if row is None:
                 row = Product(org_id=org_id, ext_id=item["ext_id"])
+                # Авто-эвристика ТОЛЬКО при создании: упаковка/сертификаты/расходники
+                # не участвуют в аналитике. Ручной выбор пользователя не перетираем.
+                row.excluded = exclusions.is_service_item(item["base_name"], item["category"])
                 db.add(row)
                 created += 1
             else:

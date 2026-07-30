@@ -49,6 +49,14 @@ DEFAULT_LEAD_TIME_DAYS = 45  # срок производства: заказ →
 NO_SALES_ALERT_DAYS = 120  # неликвид: столько дней без продаж при наличии стока
 STOCKOUT_ALERT_DAYS = 21  # алерт: бестселлер/хороший закончится в ближайшие N дней
 OVERSTOCK_WEEKS = 26  # алерт: запаса больше, чем на полгода
+# Статистическая значимость: пока позиция не набрала минимум дней в стоке и
+# продаж, её метрики — шум (1 день в стоке + 1 продажа дают «оборачиваемость»
+# в десятки тысяч ₽/день). Такие позиции помечаются low_data: не участвуют в
+# алертах, топах и трактуются в UI как «мало данных», а не как класс A.
+MIN_SIGNIF_DIS = 14  # минимум дней в стоке для доверия метрикам
+MIN_SIGNIF_NQ = 3  # минимум продаж, шт
+STOCKOUT_RECENT_SALE_DAYS = 45  # «упускаем выручку» — только если продажи были недавно
+ALERTS_CAP_PER_TYPE = 8  # каждой группы алертов показываем не больше N (по деньгам)
 
 # «Здоровье сезона» — отраслевой норматив sell-through 70/20/10:
 # здоровый сезон = ~70% выручки по полной цене, ~20% со скидкой, ~10% остаток.
@@ -64,6 +72,30 @@ _SEASON_NAMES = {3: "весна", 6: "лето", 9: "осень", 12: "зима"
 
 _cache: dict[int, tuple[float, dict]] = {}
 _cache_lock = threading.Lock()
+
+
+def _plural_ru(n: int, one: str, few: str, many: str) -> str:
+    """Русская форма слова по числу: 1 неделя / 2 недели / 5 недель."""
+    n = abs(int(n))
+    if n % 10 == 1 and n % 100 != 11:
+        return one
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return few
+    return many
+
+
+def _pct_100(shares: list[float]) -> list[int]:
+    """Целые проценты из долей [0..1], гарантированно суммой ровно 100
+    (метод наибольшего остатка) — чтобы «9 + 36 + 56» не давало 101%."""
+    if not shares or sum(shares) <= 0:
+        return [0 for _ in shares]
+    raw = [s * 100 for s in shares]
+    floors = [int(x) for x in raw]
+    rem = 100 - sum(floors)
+    order = sorted(range(len(raw)), key=lambda i: raw[i] - floors[i], reverse=True)
+    for i in order[:max(0, rem)]:
+        floors[i] += 1
+    return floors
 
 
 def invalidate(org_id: int) -> None:
@@ -139,7 +171,9 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
     rate_window = settings["rate_window"]
     lead_time = settings["lead_time_days"]
     today = date.today()
-    cutoff365 = (today - timedelta(days=365)).isoformat()
+    # Ровно 365 дат в окне (today−364 … today включительно) — иначе «дней в
+    # стоке» доходило до 366 при подписи «за 365 дней».
+    cutoff365 = (today - timedelta(days=364)).isoformat()
     cutoff90 = (today - timedelta(days=90)).isoformat()
     cutoff30 = (today - timedelta(days=30)).isoformat()
     # Сезонное окно прошлого года: период, НА который заказываем (заказ приедет
@@ -149,7 +183,13 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
 
     latest_date = db.scalar(select(func.max(StockDay.date)).where(StockDay.org_id == org.id))
 
-    join_products = and_(Product.id == StockDay.product_id, Product.org_id == org.id)
+    # excluded=False — упаковка/сертификаты/расходники не участвуют в аналитике
+    # (см. app/exclusions.py); фильтр применяется во ВСЕХ запросах снапшота.
+    join_products = and_(
+        Product.id == StockDay.product_id,
+        Product.org_id == org.id,
+        Product.excluded.is_(False),
+    )
 
     # Мета позиций: категория, цены, «архивность» базы (все размеры в архиве).
     meta_rows = db.execute(
@@ -160,7 +200,7 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
             func.max(Product.cost_price),
             func.min(case((Product.archived, 1), else_=0)),
         )
-        .where(Product.org_id == org.id)
+        .where(Product.org_id == org.id, Product.excluded.is_(False))
         .group_by(Product.base_name)
     ).all()
 
@@ -211,7 +251,11 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
     # Нетто-продажи за 365 дней, по размерам.
     sign_qty = case((Sale.is_return, -Sale.qty), else_=Sale.qty)
     sign_rev = case((Sale.is_return, -Sale.revenue), else_=Sale.revenue)
-    join_sales = and_(Product.id == Sale.product_id, Product.org_id == org.id)
+    join_sales = and_(
+        Product.id == Sale.product_id,
+        Product.org_id == org.id,
+        Product.excluded.is_(False),
+    )
     sales_rows = db.execute(
         select(Product.base_name, Product.size, func.sum(sign_qty), func.sum(sign_rev))
         .select_from(Sale)
@@ -314,7 +358,14 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
                 func.sum(WarehouseStock.qty),
             )
             .select_from(WarehouseStock)
-            .join(Product, and_(Product.id == WarehouseStock.product_id, Product.org_id == org.id))
+            .join(
+                Product,
+                and_(
+                    Product.id == WarehouseStock.product_id,
+                    Product.org_id == org.id,
+                    Product.excluded.is_(False),
+                ),
+            )
             .where(
                 WarehouseStock.org_id == org.id,
                 WarehouseStock.warehouse_id.in_(active_wh_ids),
@@ -399,6 +450,9 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
         item["rate_active"] = round(rate, 4)
         item["turnover"] = round(turnover)
         item["cls"] = classify(turnover, thresholds)
+        # «Мало данных»: метрикам нельзя доверять, пока не набралась статистика
+        # (см. MIN_SIGNIF_*). Алерты/топы такие позиции пропускают, UI помечает.
+        item["low_data"] = dis < MIN_SIGNIF_DIS or nq < MIN_SIGNIF_NQ
         # Покрытие/стокаут/потребность — по АКТИВНОМУ окну темпа.
         item["wos"] = round(cs / (rate * 7), 1) if rate > 0 else None
         # Клэмп: у медленной позиции с большим стоком cs/rate может дать
@@ -524,6 +578,7 @@ def _season_health(snap: dict, items: list[dict]) -> dict:
             leftover_gap = leftover_share - SEASON_HEALTHY_LEFTOVER  # много остатка
             reason = "leftover" if leftover_gap >= discount_gap else "discount"
 
+    full_pct, disc_pct, leftover_pct = _pct_100([full_share, disc_share, leftover_share])
     return {
         "label": snap.get("cur_season_label", ""),
         "date_from": snap.get("cur_season_start"),
@@ -534,6 +589,10 @@ def _season_health(snap: dict, items: list[dict]) -> dict:
         "full_share": round(full_share, 3),
         "disc_share": round(disc_share, 3),
         "leftover_share": round(leftover_share, 3),
+        # целые проценты суммой ровно 100 — для подписей на дашборде
+        "full_pct": full_pct,
+        "disc_pct": disc_pct,
+        "leftover_pct": leftover_pct,
         "status": status,
         "reason": reason,
         "norm": list(SEASON_NORM),
@@ -549,62 +608,107 @@ def build_summary(snap: dict) -> dict:
     stock_value_cost = sum(it["cs"] * it["cost_price"] for it in items)
     stock_units = sum(it["cs"] for it in items)
 
-    classes = {"weak": 0, "dull": 0, "good": 0, "best": 0}
+    # Классы считаем только по значимым позициям; «мало данных» — отдельно,
+    # чтобы шумовые новинки не раздували число «бестселлеров».
+    classes = {"weak": 0, "dull": 0, "good": 0, "best": 0, "low_data": 0}
     for it in items:
-        classes[it["cls"]] += 1
+        if it.get("low_data"):
+            classes["low_data"] += 1
+        else:
+            classes[it["cls"]] += 1
 
-    alerts = []
-    for it in sorted(items, key=lambda x: -x["turnover"]):
+    # Алерты: только статистически значимые позиции (без low_data-шума),
+    # каждая группа ранжируется ПО ДЕНЬГАМ и ограничена ALERTS_CAP_PER_TYPE.
+    stockouts: list[dict] = []
+    overstocks: list[dict] = []
+    no_sales: list[dict] = []
+    for it in items:
         base = it["base_name"]
-        if it["cls"] in ("best", "good") and it["stockout_date"] and it["cs"] >= 0:
+        # ── Стокауты: под угрозой реальные продавцы (класс A/B, темп подтверждён).
+        if (
+            not it["low_data"]
+            and it["cls"] in ("best", "good")
+            and it["stockout_date"]
+            and it["cs"] >= 0
+        ):
             days_left = (date.fromisoformat(it["stockout_date"]) - today).days
-            if it["cs"] == 0 and it["rate"] > 0:
-                alerts.append(
+            last_sale = it["last_sale"]
+            sale_recent = (
+                last_sale is not None
+                and (today - date.fromisoformat(last_sale)).days <= STOCKOUT_RECENT_SALE_DAYS
+            )
+            lost_per_day = it["turnover"]  # ₽/день, которые приносит позиция
+            if it["cs"] == 0 and it["rate"] > 0 and sale_recent:
+                stockouts.append(
                     {
                         "type": "stockout",
                         "base_name": base,
-                        "text": f"{base} распродан в ноль, а продажи шли — упускаем выручку",
+                        "money": lost_per_day,
+                        "text": f"{base}: распродан, теряем ≈{lost_per_day:,.0f} ₽/день".replace(",", " "),
                         "severity": "red",
                     }
                 )
-            elif days_left <= STOCKOUT_ALERT_DAYS:
-                alerts.append(
+            elif it["cs"] > 0 and days_left <= STOCKOUT_ALERT_DAYS:
+                stockouts.append(
                     {
                         "type": "stockout",
                         "base_name": base,
-                        "text": f"{base} закончится примерно {it['stockout_date']} — пора заказывать",
+                        "money": lost_per_day,
+                        "text": f"{base}: остатка на {days_left} "
+                                f"{_plural_ru(days_left, 'день', 'дня', 'дней')} "
+                                f"(≈{lost_per_day:,.0f} ₽/день) — пора заказывать".replace(",", " "),
                         "severity": "red",
                     }
                 )
+        # ── Заморозка денег: считаем по цене продажи, ранжируем по сумме.
         if it["cs"] > 0:
+            frozen = round(it["cs"] * it["sale_price"])
             last_sale = it["last_sale"]
             no_sales_days = (
                 (today - date.fromisoformat(last_sale)).days if last_sale else None
             )
-            if last_sale is None or no_sales_days > NO_SALES_ALERT_DAYS:
+            if last_sale is None or (no_sales_days or 0) > NO_SALES_ALERT_DAYS:
                 since = f"{no_sales_days} дн." if no_sales_days is not None else "за всю историю"
-                alerts.append(
+                no_sales.append(
                     {
                         "type": "no_sales",
                         "base_name": base,
-                        "text": f"{base}: {it['cs']} шт на складе, продаж нет ({since}) — неликвид",
+                        "money": frozen,
+                        "text": f"{base}: {it['cs']} шт без продаж ({since}) — "
+                                f"заморожено ≈{frozen:,.0f} ₽, не заказывать".replace(",", " "),
                         "severity": "yellow",
                     }
                 )
-            elif it["wos"] is not None and it["wos"] > OVERSTOCK_WEEKS:
-                alerts.append(
+            elif (
+                not it["low_data"]
+                and it["wos"] is not None
+                and it["wos"] > OVERSTOCK_WEEKS
+            ):
+                overstocks.append(
                     {
                         "type": "overstock",
                         "base_name": base,
-                        "text": f"{base}: запаса на {it['wos']:.0f} недель — затоварка",
+                        "money": frozen,
+                        "text": f"{base}: запаса на {it['wos']:.0f} "
+                                f"{_plural_ru(round(it['wos']), 'неделю', 'недели', 'недель')} — "
+                                f"заморожено ≈{frozen:,.0f} ₽".replace(",", " "),
                         "severity": "yellow",
                     }
                 )
-    alerts.sort(key=lambda a: (a["severity"] != "red"))
+    for group in (stockouts, overstocks, no_sales):
+        group.sort(key=lambda a: -a["money"])
+    alerts = (
+        stockouts[:ALERTS_CAP_PER_TYPE]
+        + overstocks[:ALERTS_CAP_PER_TYPE]
+        + no_sales[:ALERTS_CAP_PER_TYPE]
+    )
 
+    # Топ-5 — только по позициям с достаточной статистикой (без dis=1-шумов).
     top = [
         {"base_name": it["base_name"], "turnover": it["turnover"]}
-        for it in sorted(items, key=lambda x: -x["turnover"])[:5]
+        for it in sorted(
+            (i for i in items if not i["low_data"]), key=lambda x: -x["turnover"]
+        )[:5]
     ]
 
     cat_agg: dict[str, dict] = {}
@@ -723,9 +827,15 @@ def build_replenish(snap: dict) -> dict:
 
 
 def build_turnover(snap: dict) -> dict:
-    """GET /api/turnover — все позиции, сортировка по turnover desc."""
+    """GET /api/turnover — все позиции, сортировка по turnover desc.
+
+    Позиции с low_data (мало дней в стоке/продаж) уходят в конец списка: их
+    «оборачиваемость» — арифметический шум, а не рейтинг.
+    """
     items = []
-    for it in sorted(snap["items"].values(), key=lambda x: -x["turnover"]):
+    for it in sorted(
+        snap["items"].values(), key=lambda x: (x.get("low_data", False), -x["turnover"])
+    ):
         if it["cs"] == 0 and it["nq"] <= 0 and it["dis"] == 0 and not it["archived"]:
             continue
         items.append(
@@ -738,6 +848,7 @@ def build_turnover(snap: dict) -> dict:
                 "nr": it["nr"],
                 "turnover": it["turnover"],
                 "cls": it["cls"],
+                "low_data": it.get("low_data", False),
                 "avg_price": it["avg_price"],
                 "sale_price": it["sale_price"],
                 "discount_fact": it["discount_fact"],

@@ -62,6 +62,9 @@ SIMPLE = [
     ("p-ring1", "Кольцо «Грань»", "Украшения", 2900, 1100, 0.9, ""),
     ("p-cap1", "Кепка «Штамп»", "Аксессуары", 3200, 1300, 0.5, ""),
     ("p-belt1", "Ремень «Ось»", "Аксессуары", 4100, 1700, 0.0, "dead"),
+    # service: расходники/сертификаты — авто-исключаются из аналитики (app/exclusions.py)
+    ("p-pack1", "Брендированный пакет средний", "Расходный материал", 50, 20, 3.0, "service"),
+    ("p-cert1", "Подарочный сертификат на десять тысяч", "Сертификаты", 10000, 0, 0.4, "service"),
 ]
 ARCHIVED_SIMPLE = [
     ("p-old1", "Футболка «Архив 2022»", "Одежда/Футболки", 2500, 1000, 0.0, "archived"),
@@ -210,10 +213,15 @@ SKU_BY_EXT = {s["ext"]: s for s in SKUS}
 # ── Эталонные ожидания для теста ─────────────────────────────────────────────
 
 def expected_net_sales(stores=tuple(TRADE_STORES)) -> dict:
-    """{base_name: [нетто-шт, нетто-₽]} по выбранным складам за всю историю."""
+    """{base_name: [нетто-шт, нетто-₽]} по выбранным складам за всю историю.
+
+    service-позиции пропускаются: они исключены из аналитики продукта by design.
+    """
     out = {}
     for e in SALE_EVENTS:
         if e["store"] not in stores:
+            continue
+        if "service" in SKU_BY_EXT[e["ext"]]["flags"]:
             continue
         base = SKU_BY_EXT[e["ext"]]["base"]
         rec = out.setdefault(base, [0.0, 0.0])
@@ -222,6 +230,8 @@ def expected_net_sales(stores=tuple(TRADE_STORES)) -> dict:
     for e in RETURN_EVENTS:
         if e["store"] not in stores:
             continue
+        if "service" in SKU_BY_EXT[e["ext"]]["flags"]:
+            continue
         base = SKU_BY_EXT[e["ext"]]["base"]
         rec = out.setdefault(base, [0.0, 0.0])
         rec[0] -= e["qty"]
@@ -229,11 +239,18 @@ def expected_net_sales(stores=tuple(TRADE_STORES)) -> dict:
     return out
 
 
-def expected_stock_today(stores=tuple(TRADE_STORES)) -> dict:
-    """{base_name: остаток-шт на конец сегодняшнего дня} по выбранным складам."""
+def expected_stock_today(stores=tuple(TRADE_STORES), include_service: bool = False) -> dict:
+    """{base_name: остаток-шт на конец сегодняшнего дня} по выбранным складам.
+
+    По умолчанию service-позиции пропускаются: они исключены из АНАЛИТИКИ
+    продукта by design. include_service=True — сырой эталон для проверок БД
+    (в warehouse_stock/stock_days исключённые позиции хранятся).
+    """
     out = {}
     for sid in stores:
         for ext, qty in STOCK_BY_DAY[(DATES[-1], sid)].items():
+            if not include_service and "service" in SKU_BY_EXT[ext]["flags"]:
+                continue
             base = SKU_BY_EXT[ext]["base"]
             out[base] = out.get(base, 0.0) + qty
     return out

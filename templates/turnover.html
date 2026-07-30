@@ -85,7 +85,7 @@ document.addEventListener("DOMContentLoaded", function () {
 
   function renderClsStrip() {
     var cnt = { weak: 0, dull: 0, good: 0, best: 0 };
-    items.forEach(function (it) { if (!it.archived && cnt[it.cls] !== undefined) cnt[it.cls]++; });
+    items.forEach(function (it) { if (!it.archived && !it.low_data && cnt[it.cls] !== undefined) cnt[it.cls]++; });
     ["weak", "dull", "good", "best"].forEach(function (c) {
       document.getElementById("cnt-" + c).textContent = fmtInt(cnt[c]);
     });
@@ -140,7 +140,9 @@ document.addEventListener("DOMContentLoaded", function () {
         '<td class="name-cell"><div class="name-main">' + esc(it.base_name) +
           (it.archived ? ' <span class="badge gray">архив</span>' : "") +
           '</div><div class="name-sub">' + esc(it.category || "") + "</div></td>" +
-        "<td>" + clsDot(it.cls) + "</td>" +
+        "<td>" + (it.low_data
+          ? '<span class="badge gray" title="Меньше 14 дней в стоке или меньше 3 продаж за год — оборачиваемости пока нельзя доверять">мало данных</span>'
+          : clsDot(it.cls)) + "</td>" +
         '<td class="num muted">' + fmtInt(it.dis) + "</td>" +
         '<td class="num">' + fmtInt(it.nq) + "</td>" +
         '<td class="num">' + fmtInt(it.nr) + "</td>" +

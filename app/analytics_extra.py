@@ -74,7 +74,7 @@ def _fresh_bases(db: Session, org_id: int, days: int = FRESH_DAYS) -> set[str]:
     rows = db.execute(
         select(Product.base_name, func.sum(_sign_qty))
         .select_from(Sale)
-        .join(Product, and_(Product.id == Sale.product_id, Product.org_id == org_id))
+        .join(Product, and_(Product.id == Sale.product_id, Product.org_id == org_id, Product.excluded.is_(False)))
         .where(Sale.org_id == org_id, Sale.date >= cutoff)
         .group_by(Product.base_name)
     ).all()
@@ -382,7 +382,7 @@ def sizes_products(db: Session, org_id: int, snap: dict) -> dict:
         db.execute(
             select(Product.base_name, func.sum(_sign_qty))
             .select_from(Sale)
-            .join(Product, and_(Product.id == Sale.product_id, Product.org_id == org_id))
+            .join(Product, and_(Product.id == Sale.product_id, Product.org_id == org_id, Product.excluded.is_(False)))
             .where(Sale.org_id == org_id)
             .group_by(Product.base_name)
         ).all()
@@ -460,7 +460,7 @@ def build_sizes_calc(
     rows = db.execute(
         select(month_expr, Product.size, func.sum(_sign_qty))
         .select_from(Sale)
-        .join(Product, and_(Product.id == Sale.product_id, Product.org_id == org_id))
+        .join(Product, and_(Product.id == Sale.product_id, Product.org_id == org_id, Product.excluded.is_(False)))
         .where(Sale.org_id == org_id, Product.base_name == product)
         .group_by(month_expr, Product.size)
     ).all()

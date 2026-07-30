@@ -101,6 +101,21 @@
   </div>
 
   <div class="card">
+    <div class="card-head"><h2>Исключено из аналитики</h2></div>
+    <div class="card-body">
+      <p style="margin:0 0 8px; font-size:12px; color:var(--text-soft);">
+        Упаковка, подарочные сертификаты и расходники не должны попадать в остатки и метрики.
+        Система исключает их автоматически при первой синхронизации; здесь можно поправить вручную.
+      </p>
+      <div style="margin:0 0 10px; max-width:360px;">
+        <input class="input" type="search" id="excl-search" placeholder="Найти позицию, чтобы исключить…" autocomplete="off">
+        <div id="excl-candidates"></div>
+      </div>
+      <div id="excl-box"><div class="loading-stub">Загрузка…</div></div>
+    </div>
+  </div>
+
+  <div class="card">
     <div class="card-head"><h2>Подключение данных</h2></div>
     <div class="card-body" id="conn-box"><div class="loading-stub">Загрузка…</div></div>
   </div>
@@ -176,6 +191,7 @@ document.addEventListener("DOMContentLoaded", function () {
     renderWarehouses(settings.warehouses || []);
     renderConnection(settings.connection || null);
     renderTeam(settings.members || []);
+    loadExclusions();
   }).catch(function () {
     document.getElementById("wh-box").innerHTML = '<p class="muted" style="margin:0;">Не удалось загрузить.</p>';
     document.getElementById("conn-box").innerHTML = '<p class="muted" style="margin:0;">Не удалось загрузить.</p>';
@@ -227,16 +243,98 @@ document.addEventListener("DOMContentLoaded", function () {
       cb.addEventListener("change", function () {
         var id = cb.getAttribute("data-id");
         cb.disabled = true;
-        api("/api/warehouses/" + id + "/toggle", { method: "POST", body: {} }).then(function () {
+        api("/api/warehouses/" + id + "/toggle", { method: "POST", body: {} }).then(function (resp) {
           var row = cb.closest(".wh-row");
           var badge = row.querySelector(".badge");
           badge.className = "badge " + (cb.checked ? "green" : "gray");
           badge.textContent = cb.checked ? "в аналитике" : "выключен";
           toast("Склад " + (cb.checked ? "включён в аналитику" : "исключён из аналитики"), "success");
+          if (resp && resp.needs_resync) showResyncHint();
         }).catch(function () {
           cb.checked = !cb.checked;
         }).finally(function () { cb.disabled = false; });
       });
+    });
+  }
+
+  // ── Исключено из аналитики ────────────────────────────────────────────────
+  function loadExclusions() {
+    api("/api/exclusions").then(function (d) {
+      renderExclusions((d && d.excluded) || []);
+    }).catch(function () {
+      document.getElementById("excl-box").innerHTML = '<p class="muted" style="margin:0;">Не удалось загрузить.</p>';
+    });
+  }
+
+  function renderExclusions(list) {
+    var box = document.getElementById("excl-box");
+    if (!list.length) {
+      box.innerHTML = '<p class="muted" style="margin:0;">Ничего не исключено — все позиции участвуют в аналитике.</p>';
+      return;
+    }
+    box.innerHTML = list.map(function (e) {
+      return '<div class="wh-row">' +
+        '<div style="flex:1;">' + esc(e.base_name) +
+        ' <span class="muted" style="font-size:12px;">' + e.variants + ' вар.</span></div>' +
+        '<button class="btn btn-sm excl-return" data-base="' + esc(e.base_name) + '">Вернуть в аналитику</button>' +
+        "</div>";
+    }).join("");
+    box.querySelectorAll(".excl-return").forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        btn.disabled = true;
+        api("/api/exclusions", { method: "POST", body: { base_name: btn.getAttribute("data-base"), excluded: false } })
+          .then(function () { toast("Позиция вернулась в аналитику", "success"); loadExclusions(); })
+          .catch(function () { btn.disabled = false; });
+      });
+    });
+  }
+
+  var exclSearch = document.getElementById("excl-search");
+  if (exclSearch) {
+    exclSearch.addEventListener("input", debounce(function () {
+      var q = exclSearch.value.trim();
+      var out = document.getElementById("excl-candidates");
+      if (q.length < 2) { out.innerHTML = ""; return; }
+      api("/api/exclusions?q=" + encodeURIComponent(q)).then(function (d) {
+        var cands = (d && d.candidates) || [];
+        out.innerHTML = cands.length
+          ? cands.map(function (n) {
+              return '<div class="wh-row" style="margin-top:6px;">' +
+                '<div style="flex:1; font-size:13px;">' + esc(n) + "</div>" +
+                '<button class="btn btn-sm excl-add" data-base="' + esc(n) + '">Исключить</button></div>';
+            }).join("")
+          : '<p class="muted" style="font-size:12px; margin:6px 0 0;">Не найдено.</p>';
+        out.querySelectorAll(".excl-add").forEach(function (btn) {
+          btn.addEventListener("click", function () {
+            btn.disabled = true;
+            api("/api/exclusions", { method: "POST", body: { base_name: btn.getAttribute("data-base"), excluded: true } })
+              .then(function () {
+                toast("Исключено из аналитики", "success");
+                out.innerHTML = ""; exclSearch.value = "";
+                loadExclusions();
+              })
+              .catch(function () { btn.disabled = false; });
+          });
+        });
+      });
+    }, 250));
+  }
+
+  function showResyncHint() {
+    if (document.getElementById("wh-resync-hint")) return;
+    var box = document.getElementById("wh-box");
+    var div = document.createElement("div");
+    div.id = "wh-resync-hint";
+    div.style.cssText = "margin-top:12px; padding:10px 14px; border:1px solid var(--yellow,#eab308); border-radius:8px; font-size:13px; display:flex; align-items:center; gap:12px; flex-wrap:wrap;";
+    div.innerHTML = '<span>Набор складов изменился — история остатков пересчитается только после полной пересинхронизации.</span>' +
+      '<button class="btn btn-sm" id="wh-resync-btn">Пересобрать историю сейчас</button>';
+    box.appendChild(div);
+    document.getElementById("wh-resync-btn").addEventListener("click", function () {
+      var b = this; b.disabled = true; b.textContent = "Запускаю…";
+      api("/api/sync/initial", { method: "POST", body: {} }).then(function () {
+        b.textContent = "Пересинхронизация запущена";
+        toast("История пересобирается — цифры обновятся через несколько минут", "success");
+      }).catch(function () { b.disabled = false; b.textContent = "Пересобрать историю сейчас"; });
     });
   }
 

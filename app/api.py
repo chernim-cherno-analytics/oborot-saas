@@ -4,7 +4,7 @@ from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app import analytics
@@ -323,6 +323,61 @@ def api_update_settings(
     return {"ok": True, "settings": settings}
 
 
+# ── Исключение позиций из аналитики (упаковка, сертификаты, расходники) ──────
+
+@router.get("/exclusions")
+def api_exclusions(
+    q: str = "", ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)
+):
+    """Список исключённых баз (+ по q — поиск кандидатов среди участвующих)."""
+    excluded = db.execute(
+        select(Product.base_name, func.count(Product.id))
+        .where(Product.org_id == ctx.org.id, Product.excluded.is_(True))
+        .group_by(Product.base_name)
+        .order_by(Product.base_name)
+    ).all()
+    result = {"excluded": [{"base_name": b, "variants": int(n)} for b, n in excluded]}
+    query = (q or "").strip().lower()
+    if len(query) >= 2:
+        candidates = db.execute(
+            select(Product.base_name)
+            .where(
+                Product.org_id == ctx.org.id,
+                Product.excluded.is_(False),
+                func.lower(Product.base_name).like(f"%{query}%"),
+            )
+            .group_by(Product.base_name)
+            .order_by(Product.base_name)
+            .limit(20)
+        ).scalars().all()
+        result["candidates"] = candidates
+    return result
+
+
+class ExclusionIn(BaseModel):
+    base_name: str
+    excluded: bool
+
+
+@router.post("/exclusions")
+def api_set_exclusion(
+    body: ExclusionIn, ctx: AuthContext = Depends(require_owner_api), db: Session = Depends(get_db)
+):
+    """Включить/исключить базовую позицию (все размеры разом)."""
+    rows = db.execute(
+        select(Product).where(
+            Product.org_id == ctx.org.id, Product.base_name == body.base_name
+        )
+    ).scalars().all()
+    if not rows:
+        raise HTTPException(status_code=404, detail="Позиция не найдена")
+    for p in rows:
+        p.excluded = body.excluded
+    db.commit()
+    analytics.invalidate(ctx.org.id)
+    return {"ok": True, "base_name": body.base_name, "excluded": body.excluded, "variants": len(rows)}
+
+
 @router.post("/warehouses/{warehouse_id}/toggle")
 def api_toggle_warehouse(
     warehouse_id: int, ctx: AuthContext = Depends(require_owner_api), db: Session = Depends(get_db)
@@ -333,7 +388,20 @@ def api_toggle_warehouse(
     wh.active = not wh.active
     db.commit()
     analytics.invalidate(ctx.org.id)
-    return {"ok": True, "id": wh.id, "active": wh.active}
+    # История остатков (StockDay) хранится суммой по складам, активным на момент
+    # синка: смена набора складов требует пересборки истории, иначе цифры
+    # остатков/дней-в-стоке молча остаются старыми до полного пересинка.
+    needs_resync = (
+        db.execute(
+            select(Connection.id).where(
+                Connection.org_id == ctx.org.id,
+                Connection.kind == "moysklad",
+                Connection.status == "active",
+            )
+        ).first()
+        is not None
+    )
+    return {"ok": True, "id": wh.id, "active": wh.active, "needs_resync": needs_resync}
 
 
 # ── Подключение источника данных ─────────────────────────────────────────────
