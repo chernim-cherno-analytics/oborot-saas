@@ -256,6 +256,26 @@ def _order_of_org(db: Session, org_id: int, order_id: int) -> ProductionOrder:
     return order
 
 
+def _release_push_lock(db: Session, order_id: int) -> None:
+    """Снимает временную пометку 'pending' с ms_doc_href при сбое отправки.
+
+    Возвращает заказ в состояние «можно отправить», но только если документ
+    не успел создаться (href всё ещё 'pending'), чтобы не затереть реальную
+    ссылку в редком случае гонки.
+    """
+    from sqlalchemy import update as _sa_update
+    try:
+        db.rollback()
+        db.execute(
+            _sa_update(ProductionOrder)
+            .where(ProductionOrder.id == order_id, ProductionOrder.ms_doc_href == "pending")
+            .values(ms_doc_href="")
+        )
+        db.commit()
+    except Exception:  # noqa: BLE001 — освобождение лока не должно маскировать исходную ошибку
+        db.rollback()
+
+
 def _ms_doc_out(order: ProductionOrder) -> dict:
     return {
         "ms_doc_href": order.ms_doc_href,
@@ -302,11 +322,37 @@ async def api_order_push_to_ms(
                 **_ms_doc_out(order),
             },
         )
+    # Атомарный захват «замка» ДО любых сетевых вызовов: помечаем заказ как
+    # отправляемый одним условным UPDATE. Второй одновременный клик/ретрай не
+    # обновит ни строки (ms_doc_href уже не пуст) и получит 409 — иначе гонка
+    # check-then-act создала бы ДВА финансовых документа в аккаунте клиента.
+    from sqlalchemy import update as _sa_update
+    lock = db.execute(
+        _sa_update(ProductionOrder)
+        .where(
+            ProductionOrder.id == order.id,
+            ProductionOrder.ms_doc_href == "",
+        )
+        .values(ms_doc_href="pending")
+    )
+    db.commit()
+    if lock.rowcount == 0:
+        db.refresh(order)
+        return JSONResponse(
+            status_code=409,
+            content={
+                "detail": "Заказ уже отправляется в МойСклад — дождитесь завершения "
+                          "и обновите страницу.",
+                **_ms_doc_out(order),
+            },
+        )
     try:
         result = await ms_writeback.push_order(db, ctx.org.id, order)
     except ms_writeback.WritebackError as exc:
+        _release_push_lock(db, order.id)
         raise HTTPException(status_code=exc.status, detail=exc.detail)
     except httpx.HTTPStatusError as exc:
+        _release_push_lock(db, order.id)
         code = exc.response.status_code
         if code in (401, 403):
             raise HTTPException(status_code=400, detail=TOKEN_HINT)
@@ -316,6 +362,7 @@ async def api_order_push_to_ms(
                    "попробуйте ещё раз позже.",
         )
     except httpx.HTTPError:
+        _release_push_lock(db, order.id)
         raise HTTPException(status_code=502, detail=NETWORK_HINT)
     db.commit()
     return result

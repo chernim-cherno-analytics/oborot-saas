@@ -401,7 +401,12 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
         item["cls"] = classify(turnover, thresholds)
         # Покрытие/стокаут/потребность — по АКТИВНОМУ окну темпа.
         item["wos"] = round(cs / (rate * 7), 1) if rate > 0 else None
-        stockout = today + timedelta(days=int(cs / rate)) if rate > 0 else None
+        # Клэмп: у медленной позиции с большим стоком cs/rate может дать
+        # миллионы дней и уронить timedelta (OverflowError → 500 на дашборде).
+        # 3650 дней (~10 лет) — «дефицита не предвидится», дальше не считаем.
+        stockout = (
+            today + timedelta(days=min(int(cs / rate), 3650)) if rate > 0 else None
+        )
         item["stockout_date"] = stockout.isoformat() if stockout else None
         # «Дыра поставки»: остаток кончится раньше, чем приедет заказ.
         item["gap_days"] = max(0, (arrival - stockout).days) if stockout else 0
