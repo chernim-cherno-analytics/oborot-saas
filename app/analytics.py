@@ -361,6 +361,17 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
         ).all()
     )
 
+    # Последняя дата с положительным остатком по размеру — для «по нулям уже
+    # N дн» на /stocks (правило legacy: видно, сколько дней размер теряет
+    # выручку). Прикрепляется только к уже существующим размерам сетки.
+    last_pos_rows = db.execute(
+        select(Product.base_name, Product.size, func.max(StockDay.date))
+        .select_from(StockDay)
+        .join(Product, join_products)
+        .where(StockDay.org_id == org.id, StockDay.qty > 0)
+        .group_by(Product.base_name, Product.size)
+    ).all()
+
     # Последняя продажа (для алертов о неликвиде).
     last_sale_by_base = dict(
         db.execute(
@@ -466,6 +477,11 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
         if item is None:
             continue
         item["wh_stock"].setdefault(size, {})[wh_id] = int(round(qty or 0))
+
+    for base, size, last_pos in last_pos_rows:
+        item = items.get(base)
+        if item is not None and size in item["sizes"]:
+            item["sizes"][size]["last_pos"] = last_pos
 
     # ── Производные метрики ──────────────────────────────────────────────────
     arrival = today + timedelta(days=lead_time)  # дата прихода заказа, сделанного сегодня
@@ -955,9 +971,15 @@ def build_turnover(snap: dict) -> dict:
 
 
 def build_stocks(snap: dict) -> dict:
-    """GET /api/stocks — остатки по активным складам с разбивкой по размерам."""
+    """GET /api/stocks — остатки по активным складам с разбивкой по размерам.
+
+    У размеров с нулевым суммарным остатком отдаётся zero_days — сколько дней
+    размер «по нулям» (от последней даты с положительным остатком, правило
+    legacy: видно, сколько дней размер теряет выручку).
+    """
     active = [w for w in snap["warehouses"] if w["active"]]
     wh_ids = [w["id"] for w in active]
+    today = date.fromisoformat(snap["today"])
     items = []
     for it in sorted(snap["items"].values(), key=lambda x: -x["cs"]):
         if it["archived"] or (it["cs"] == 0 and not it["wh_stock"]):
@@ -968,7 +990,14 @@ def build_stocks(snap: dict) -> dict:
             per_wh = [int(it["wh_stock"].get(size, {}).get(wid, 0)) for wid in wh_ids]
             for i, q in enumerate(per_wh):
                 totals[i] += q
-            sizes.append({"size": size, "per_wh": per_wh, "total": sum(per_wh)})
+            total = sum(per_wh)
+            zero_days = None
+            if total == 0:
+                last_pos = (it["sizes"].get(size) or {}).get("last_pos")
+                if last_pos:
+                    zero_days = max(0, (today - date.fromisoformat(last_pos)).days)
+            sizes.append({"size": size, "per_wh": per_wh, "total": total,
+                          "zero_days": zero_days})
         items.append(
             {
                 "base_name": it["base_name"],

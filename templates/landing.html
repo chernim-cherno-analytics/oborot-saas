@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Оборот — что дошить, что уценить, что не повторять. Аналитика для брендов одежды и украшений</title>
-<meta name="description" content="«Оборот» подключается к МойСклад и каждое утро отвечает: что дошить и в каких размерах, что уценить, что не повторять. Товарный аналитик за 9 900 ₽/мес для брендов одежды, украшений, обуви и аксессуаров. 14 дней бесплатно.">
+<meta name="description" content="«Оборот» подключается к МойСклад и каждое утро отвечает: что дошить и в каких размерах, что уценить, что не повторять. Аналитика запасов для брендов одежды, украшений, обуви и аксессуаров — от 4 900 ₽/мес, 14 дней бесплатно.">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Ccircle cx='12' cy='12' r='11' fill='%232563eb'/%3E%3Cpath d='M12 5a7 7 0 1 0 7 7' fill='none' stroke='white' stroke-width='2.4' stroke-linecap='round'/%3E%3Cpath d='M16 2.6l3.4 2.8-4.1 1.8z' fill='white'/%3E%3C/svg%3E">
 <style>
   :root{
@@ -117,6 +117,42 @@
 
   /* ── Боли → решения ─────────────────────── */
   .features-sec{background:var(--bg-soft)}
+
+  /* ── История: почему цифры врут + оборачиваемость на пальцах ── */
+  .story-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:24px}
+  .story-card{background:#fff;border:1px solid var(--line);border-radius:var(--radius);
+    padding:28px 26px;box-shadow:var(--shadow-card)}
+  .story-ico{font-size:26px;margin-bottom:14px}
+  .story-card h3{font-size:18px;letter-spacing:-.01em;margin-bottom:9px}
+  .story-card p{font-size:14.5px;color:var(--muted)}
+  .demo-cols{display:grid;grid-template-columns:1.2fr 1fr;gap:24px;margin-bottom:24px}
+  .demo-card{background:#fff;border:1px solid var(--line);border-radius:var(--radius);
+    padding:26px 26px 22px;box-shadow:var(--shadow-card)}
+  .demo-step{font-size:12.5px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;
+    color:var(--blue);margin-bottom:14px}
+  table.demo-t{width:100%;border-collapse:collapse;font-size:14px;margin-bottom:12px}
+  .demo-t th{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);
+    font-weight:600;text-align:left;padding:8px 10px;border-bottom:1px solid var(--line)}
+  .demo-t td{padding:9px 10px;border-bottom:1px solid #eef2f7}
+  .demo-t td.r,.demo-t th.r{text-align:right;white-space:nowrap}
+  .demo-t tr:last-child td{border-bottom:none}
+  .demo-t tr.hl td{background:#fffaeb}
+  .demo-t tr.hl-green td{background:#f0faf0}
+  .demo-t tr.hl-red td{background:#fdf2f2}
+  .demo-note{font-size:11px;color:var(--muted)}
+  .demo-verdict{font-size:14.5px;color:var(--ink-2);margin-top:10px}
+  .demo-verdict+.demo-verdict{margin-top:12px}
+  .demo-wide{margin-top:0}
+  .demo-split{display:grid;grid-template-columns:1fr auto 1fr;gap:18px;align-items:center;margin-bottom:6px}
+  .demo-arrow{font-size:26px;color:var(--blue);font-weight:700}
+  .demo-label{font-size:13px;font-weight:700;margin-bottom:8px;color:var(--ink-2)}
+  .demo-label.good{color:var(--green-dark)}
+  @media (max-width:900px){
+    .story-grid{grid-template-columns:1fr}
+    .demo-cols{grid-template-columns:1fr}
+    .demo-split{grid-template-columns:1fr}
+    .demo-arrow{transform:rotate(90deg);justify-self:center}
+  }
   .features{display:grid;grid-template-columns:repeat(3,1fr);gap:24px}
   .feature{background:#fff;border:1px solid var(--line);border-radius:var(--radius);padding:28px;box-shadow:var(--shadow-card);
     display:flex;flex-direction:column;gap:12px;transition:transform .15s ease, box-shadow .15s ease}
@@ -284,11 +320,11 @@
   <div class="wrap hero-inner">
     <div>
       <div class="eyebrow">Для брендов одежды, украшений, обуви и аксессуаров</div>
-      <h1>Деньги заморожены в&nbsp;остатках, а&nbsp;хит <span class="accent">кончился в&nbsp;разгар сезона?</span></h1>
-      <p class="hero-sub">«Оборот» подключается к&nbsp;вашему МойСклад и&nbsp;каждое утро отвечает на&nbsp;три вопроса владельца: <strong>что дошить, что уценить, а&nbsp;что не&nbsp;повторять</strong>. По&nbsp;каждой модели, вплоть до&nbsp;размера. Без&nbsp;выгрузок и&nbsp;расчётов «на&nbsp;глазок».</p>
+      <h1>Склад забит, а&nbsp;того, что покупают, — <span class="accent">вечно нет?</span></h1>
+      <p class="hero-sub">Деньги заморожены не&nbsp;в&nbsp;тех вещах: хиты кончаются, неликвид лежит. «Оборот» каждое утро говорит, <strong>что дошить, что уценить и&nbsp;что не&nbsp;повторять</strong> — по&nbsp;каждой модели, вплоть до&nbsp;размера.</p>
       <div class="hero-cta">
         <a class="btn btn-primary btn-lg" href="/register">Попробовать бесплатно</a>
-        <a class="btn btn-ghost-dark btn-lg" href="/register">Начать с демо-данными</a>
+        <a class="btn btn-ghost-dark btn-lg" href="#turnover-demo">Посмотреть, как считает</a>
       </div>
       <div class="hero-note">
         <span><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#4cbb17" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>Подключение к МойСклад за 10 минут</span>
@@ -331,7 +367,7 @@
   <div class="wrap">
     <div class="sec-head">
       <div class="sec-eyebrow">Знакомо?</div>
-      <h2>Пять фраз, которые мы слышим от каждого бренда</h2>
+      <h2>Пять фраз, которые мы слышим от брендов чаще всего</h2>
       <p class="sec-sub">Под каждой — то, что «Оборот» делает вместо вас. Без магии: математика по вашим реальным продажам из МойСклад.</p>
     </div>
     <div class="features">
@@ -404,12 +440,111 @@
   </div>
 </section>
 
+<!-- ═══ Почему простые цифры перестают работать ═══ -->
+<section id="why">
+  <div class="wrap">
+    <div class="sec-head">
+      <div class="sec-eyebrow">Почему так получается</div>
+      <h2>Простые цифры перестают работать</h2>
+      <p class="sec-sub">Пока моделей десять — всё видно на глаз. Но когда позиций сотни, они приходили на склад в разное время, в разном количестве и продавались по разным ценам, — отчёт «сколько чего продалось» больше не отвечает на главный вопрос: <b>во что вкладываться при следующем заказе</b>.</p>
+    </div>
+    <div class="story-grid">
+      <div class="story-card">
+        <div class="story-ico">🧾</div>
+        <h3>Сумма продаж обманывает</h3>
+        <p>Вещь, которая полгода лежит на складе, накапливает большую выручку — и выглядит успешной. А настоящий хит распродаётся за две недели, и в отчёте его почти не видно.</p>
+      </div>
+      <div class="story-card">
+        <div class="story-ico">📦</div>
+        <h3>Товары нельзя сравнивать «в лоб»</h3>
+        <p>Один товар лежал 45 дней, другой — 12. Один стоит 1 500 ₽, другой — 14 500 ₽. Сравнивать их по сумме продаж — как сравнивать бегунов, не зная дистанции.</p>
+      </div>
+      <div class="story-card">
+        <div class="story-ico">🧮</div>
+        <h3>Ошибка стоит вдвое</h3>
+        <p>Производство занимает 30–90 дней. Заказали не то — деньги заморожены на сезон вперёд, а хита, который просили покупатели, снова нет. Ошибка в заказе наказывает дважды.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══ Оборачиваемость на пальцах ═══ -->
+<section class="features-sec" id="turnover-demo">
+  <div class="wrap">
+    <div class="sec-head">
+      <div class="sec-eyebrow">Решение — одна метрика</div>
+      <h2>Оборачиваемость: сколько рублей в день приносит товар, пока он есть на складе</h2>
+      <p class="sec-sub">Одна метрика: делим выручку товара на дни, когда он был в наличии. Смотрите, как она переворачивает картину.</p>
+    </div>
+
+    <div class="demo-cols">
+      <div class="demo-card">
+        <div class="demo-step">Шаг 1 · Обычный отчёт за 45 дней</div>
+        <table class="demo-t">
+          <thead><tr><th>Товар</th><th class="r">Цена</th><th class="r">Дней в наличии</th><th class="r">Продано</th><th class="r">Сумма</th></tr></thead>
+          <tbody>
+            <tr><td>Носки с котиками</td><td class="r num">1 500 ₽</td><td class="r num">30</td><td class="r num">32</td><td class="r num">48 000 ₽</td></tr>
+            <tr class="hl"><td>Рубашка парадная</td><td class="r num">12 000 ₽</td><td class="r num">45</td><td class="r num">5</td><td class="r num"><b>60 000 ₽</b></td></tr>
+            <tr><td>Пальто драматичное</td><td class="r num">14 500 ₽</td><td class="r num">12</td><td class="r num">3</td><td class="r num">43 500 ₽</td></tr>
+          </tbody>
+        </table>
+        <p class="demo-verdict">На первый взгляд — рубашка «самый прибыльный товар», в неё и стоит вложиться.</p>
+      </div>
+
+      <div class="demo-card">
+        <div class="demo-step">Шаг 2 · Делим на дни наличия</div>
+        <p class="demo-verdict" style="margin:0 0 10px;"><span class="num" style="font-weight:700;">60 000 ₽ ÷ 45 дней = 1 333 ₽/день</span> — вот и вся формула.</p>
+        <table class="demo-t">
+          <thead><tr><th>Товар</th><th class="r">Оборачиваемость</th></tr></thead>
+          <tbody>
+            <tr class="hl-green"><td>🥇 Пальто драматичное</td><td class="r num"><b>3 625 ₽/день</b></td></tr>
+            <tr><td>🥈 Носки с котиками</td><td class="r num">1 600 ₽/день</td></tr>
+            <tr class="hl-red"><td>🥉 Рубашка парадная</td><td class="r num">1 333 ₽/день</td></tr>
+          </tbody>
+        </table>
+        <p class="demo-verdict">Рейтинг перевернулся: «лидер» оказался последним. Пальто лежало всего 12 дней — и каждый день приносил втрое больше рубашки.</p>
+      </div>
+    </div>
+
+    <div class="demo-card demo-wide">
+      <div class="demo-step">Шаг 3 · Тот же бюджет закупки — по оборачиваемости</div>
+      <div class="demo-split">
+        <div>
+          <div class="demo-label">Было: бюджет 52 875 ₽ «по ощущениям»</div>
+          <div class="mini-rows">
+            <div><span>Носки — 32 шт</span><b class="num">12 000 ₽</b></div>
+            <div><span>Рубашки — 10 шт</span><b class="num">30 000 ₽</b></div>
+            <div><span>Пальто — 3 шт</span><b class="num">10 875 ₽</b></div>
+            <div><span>Продажи за 45 дней</span><b class="num">151 500 ₽</b></div>
+          </div>
+        </div>
+        <div class="demo-arrow">→</div>
+        <div>
+          <div class="demo-label good">Стало: тот же бюджет — по оборачиваемости</div>
+          <div class="mini-rows">
+            <div><span>Пальто — 11 шт</span><b class="num">39 875 ₽</b></div>
+            <div><span>Носки — 35 шт</span><b class="num">13 125 ₽</b></div>
+            <div><span>Рубашки — 0 шт</span><b class="num">0 ₽</b></div>
+            <div><span>Продажи за 45 дней</span><b class="num" style="color:var(--green-dark)">≈ 200 000 ₽ · +треть</b></div>
+          </div>
+        </div>
+      </div>
+      <p class="demo-verdict">Тот же бюджет, ни одной новой модели — продажи на треть выше. И позиций меньше: меньше логистики, склада и рутины. Рубашки при желании можно оставить — но теперь это решение, а не случайность.</p>
+      <p class="demo-verdict"><b>Кто будет считать все эти цифры по сотням позиций — каждый день?</b> Мы. Именно для этого и существует «Оборот»: он находит и лидеров, и скрытых аутсайдеров — те прячутся за большой выручкой просто потому, что вечно лежат на складе.</p>
+      <div style="display:flex; gap:14px; flex-wrap:wrap; margin-top:22px;">
+        <a class="btn btn-primary" href="/register">Посчитать по моим товарам — 14 дней бесплатно</a>
+        <a class="btn btn-ghost" href="/register">Посмотреть на демо-данных</a>
+      </div>
+    </div>
+  </div>
+</section>
+
 <!-- ═══ Как это работает ═══ -->
 <section id="how">
   <div class="wrap">
     <div class="sec-head">
       <div class="sec-eyebrow">Как это работает</div>
-      <h2>От токена до готовых рекомендаций — три шага</h2>
+      <h2>Подключение за 10 минут — три шага</h2>
       <p class="sec-sub">Никаких внедрений, консультантов и выгрузок. Все данные уже есть в вашем МойСклад — «Оборот» превращает их в решения.</p>
     </div>
     <div class="steps">
@@ -530,7 +665,7 @@
       </div>
       <div class="fact">
         <div class="fact-ico"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/></svg></div>
-        <div><b>2+ года в ежедневной работе</b><p>Формулы оборачиваемости, размерных сеток и потребности обкатаны на живых деньгах, сезонности и возвратах — не на тестовых данных.</p></div>
+        <div><b>2+ года в ежедневной работе</b><p>Почти 1 800 позиций, 3 склада, продажи в России и Париже — каждый день пересчитываются системой. Формулы обкатаны на живых деньгах, сезонности и возвратах.</p></div>
       </div>
     </div>
   </div>
@@ -642,7 +777,7 @@
 <!-- ═══ Финальный CTA ═══ -->
 <section class="final">
   <div class="wrap">
-    <h2>Завтра утром уже можно знать, что дошить и что уценить</h2>
+    <h2>Завтра утром вы уже будете знать, что дошить и что уценить</h2>
     <p>Регистрация, токен МойСклад, 10 минут синхронизации — и у вас готовые рекомендации по каждой модели. Или посмотрите на демо-данных, ничего не подключая.</p>
     <a class="btn btn-primary btn-lg" href="/register">Попробовать бесплатно — 14 дней</a>
     <a class="btn btn-ghost-dark btn-lg" href="/register">Начать с демо-данными</a>

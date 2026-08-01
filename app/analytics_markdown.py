@@ -104,13 +104,39 @@ def _reason(
     return f"Слабые продажи ({turn_txt}), {stock_txt} — глубокая уценка {pct}%"
 
 
-def build_discounts(snap: dict) -> dict:
+def default_discounts(snap: dict) -> dict[str, int]:
+    """Скидки по правилу legacy для ВСЕХ живых позиций с остатком ({base: pct>0}).
+
+    Кнопка «Дефолтные скидки»: результат полностью замещает ручные значения
+    (как /api/discounts/bulk в первой таблице).
+    """
+    out: dict[str, int] = {}
+    for it in snap["items"].values():
+        if it["archived"]:
+            continue
+        cs = int(it["cs"])
+        if cs <= 0:
+            continue
+        rate = it["rate"]
+        days_left = round(cs / rate) if rate > 0 else None
+        pct = _recommend(it["cls"], it["dis"], it["turnover"], days_left)
+        if pct > 0:
+            out[it["base_name"]] = pct
+    return out
+
+
+def build_discounts(snap: dict, overrides: dict[str, float] | None = None) -> dict:
     """GET /api/discounts — рекомендации по уценке из снапшота app.analytics.
 
     Возвращает только позиции со скидкой > 0 (остаток есть и уценка нужна),
     отсортированные по замороженным деньгам. Архивные исключены.
+
+    overrides — ручные скидки со страницы «Оборачиваемость» ({base: pct}):
+    имеют приоритет над рекомендацией и попадают в отчёт даже там, где
+    правило дало бы 0 (владелец решил — значит, уценяем).
     """
     today = date.fromisoformat(snap["today"])
+    overrides = overrides or {}
     items = []
     fresh_excluded = 0
 
@@ -128,7 +154,10 @@ def build_discounts(snap: dict) -> dict:
             (today - date.fromisoformat(last_sale)).days if last_sale else None
         )
 
-        pct = _recommend(it["cls"], it["dis"], it["turnover"], days_left)
+        manual = overrides.get(it["base_name"])
+        pct = int(manual) if manual and manual > 0 else _recommend(
+            it["cls"], it["dis"], it["turnover"], days_left
+        )
         if pct <= 0:
             fresh_excluded += 1  # новинка без затоварки / бестселлер с малым запасом
             continue
@@ -139,6 +168,7 @@ def build_discounts(snap: dict) -> dict:
         no_cost = cost <= 0
         frozen = round(cs * (price if no_cost else cost))
         new_price = psych_price(price * (1 - pct / 100))
+        is_manual = bool(manual and manual > 0)
         items.append(
             {
                 "base_name": it["base_name"],
@@ -151,7 +181,12 @@ def build_discounts(snap: dict) -> dict:
                 "frozen": frozen,
                 "no_cost": no_cost,
                 "discount_pct": pct,
-                "reason": _reason(pct, it["dis"], it["turnover"], days_left, days_since_sale),
+                "manual": is_manual,
+                "reason": (
+                    f"Ручная скидка {pct}% (задана на странице «Оборачиваемость»)"
+                    if is_manual
+                    else _reason(pct, it["dis"], it["turnover"], days_left, days_since_sale)
+                ),
                 "avg_price": round(price),
                 "new_price": new_price,
                 "expected_recovery": round(cs * new_price),

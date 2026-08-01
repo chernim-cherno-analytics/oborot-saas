@@ -12,9 +12,13 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
 
+from pydantic import BaseModel, Field
+from sqlalchemy import delete, select
+
 from app import analytics, analytics_extra, analytics_markdown, auth
-from app.auth import AuthContext, require_auth_api
+from app.auth import AuthContext, require_auth_api, require_owner_api
 from app.db import get_db
+from app.models import SkuDiscount
 
 router = APIRouter()
 
@@ -69,6 +73,11 @@ def discounts_page(request: Request, db: Session = Depends(get_db)):
     return _authed_page(request, db, "discounts.html", "discounts", "Скидки")
 
 
+@router.get("/revenue", response_class=HTMLResponse)
+def revenue_page(request: Request, db: Session = Depends(get_db)):
+    return _authed_page(request, db, "revenue.html", "revenue", "Оборот")
+
+
 # ── JSON API ─────────────────────────────────────────────────────────────────
 
 @router.get("/api/budget")
@@ -92,11 +101,90 @@ def api_forecast(ctx: AuthContext = Depends(require_auth_api), db: Session = Dep
     return analytics_extra.build_forecast(snap)
 
 
+def _discount_overrides(db: Session, org_id: int) -> dict[str, float]:
+    return dict(
+        db.execute(
+            select(SkuDiscount.base_name, SkuDiscount.discount).where(
+                SkuDiscount.org_id == org_id, SkuDiscount.discount > 0
+            )
+        ).all()
+    )
+
+
 @router.get("/api/discounts")
 def api_discounts(ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)):
-    """Markdown-рекомендации: что уценить и на сколько (см. analytics_markdown)."""
+    """Markdown-рекомендации: что уценить и на сколько (см. analytics_markdown).
+
+    Ручные скидки со страницы «Оборачиваемость» имеют приоритет.
+    """
     snap = analytics.get_snapshot(db, ctx.org)
-    return analytics_markdown.build_discounts(snap)
+    return analytics_markdown.build_discounts(snap, _discount_overrides(db, ctx.org.id))
+
+
+# ── Ручные скидки (колонка «Скидка %» на /turnover, правило legacy) ──────────
+
+class DiscountIn(BaseModel):
+    base_name: str = Field(min_length=1, max_length=255)
+    discount: float = Field(ge=0, le=99)
+
+
+@router.get("/api/discount-overrides")
+def api_discount_overrides(
+    ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)
+):
+    """{base_name: скидка %} — ручные скидки организации (>0)."""
+    return _discount_overrides(db, ctx.org.id)
+
+
+@router.post("/api/discount-overrides")
+def api_set_discount_override(
+    body: DiscountIn,
+    ctx: AuthContext = Depends(require_auth_api),
+    db: Session = Depends(get_db),
+):
+    """Установить/снять ручную скидку позиции (0 = снять)."""
+    row = db.get(SkuDiscount, (ctx.org.id, body.base_name))
+    if body.discount <= 0:
+        if row is not None:
+            db.delete(row)
+    elif row is None:
+        db.add(SkuDiscount(org_id=ctx.org.id, base_name=body.base_name,
+                           discount=round(body.discount)))
+    else:
+        row.discount = round(body.discount)
+    db.commit()
+    return {"ok": True, "base_name": body.base_name, "discount": round(body.discount)}
+
+
+@router.post("/api/discount-overrides/defaults")
+def api_apply_default_discounts(
+    ctx: AuthContext = Depends(require_owner_api), db: Session = Depends(get_db)
+):
+    """Кнопка «Дефолтные скидки» (правило legacy, только владелец).
+
+    Сбрасывает ВСЕ ручные скидки организации и расставляет заново по правилу
+    от текущей оборачиваемости и запаса (analytics_markdown._recommend).
+    """
+    snap = analytics.get_snapshot(db, ctx.org)
+    defaults = analytics_markdown.default_discounts(snap)
+    db.execute(delete(SkuDiscount).where(SkuDiscount.org_id == ctx.org.id))
+    for base, pct in defaults.items():
+        db.add(SkuDiscount(org_id=ctx.org.id, base_name=base, discount=float(pct)))
+    db.commit()
+    return {"ok": True, "count": len(defaults)}
+
+
+@router.get("/api/revenue")
+def api_revenue(
+    date_from: str = Query(..., pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    date_to: str = Query(..., pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    ctx: AuthContext = Depends(require_auth_api),
+    db: Session = Depends(get_db),
+):
+    """«Оборот» за период: выручка, категории, помесячный ряд, топ позиций."""
+    if date_from > date_to:
+        raise HTTPException(status_code=422, detail="Дата начала позже даты конца")
+    return analytics_extra.build_revenue(db, ctx.org.id, date_from, date_to)
 
 
 @router.get("/api/sizes/products")

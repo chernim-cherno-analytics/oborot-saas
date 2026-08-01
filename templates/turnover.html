@@ -30,6 +30,7 @@
     <label class="toggle-line" id="arch-wrap" style="display:none;">
       <input type="checkbox" id="show-archived"> показать архивные
     </label>
+    <button class="btn" type="button" id="btn-def-disc" title="Сбросит все ручные скидки и расставит заново по правилу от текущей оборачиваемости и запаса">Дефолтные скидки</button>
     <a class="btn" href="/api/export/turnover.xlsx" download title="Выгрузить таблицу в Excel">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
       Скачать Excel
@@ -50,13 +51,14 @@
           <th class="num" data-sort="sea_summer" title="Оборачиваемость в летние месяцы (июн–авг). 0 — по сезону нет статистики">Лето</th>
           <th class="num" data-sort="sea_autumn" title="Оборачиваемость в осенние месяцы (сен–ноя). 0 — по сезону нет статистики">Осень</th>
           <th class="num" data-sort="avg_price" title="Средняя фактическая цена продажи против номинала">Цена/номинал</th>
-          <th class="num" data-sort="discount_fact" title="Фактическая скидка">Скидка</th>
+          <th class="num" data-sort="discount_fact" title="Фактическая скидка: насколько реальная средняя цена продажи ниже номинала">Факт. скидка</th>
+          <th class="num" data-sort="_disc" style="width:76px;" title="Ручная скидка для распродажи, %. Сохраняется и попадает в отчёт «Скидки» с приоритетом над рекомендацией. Кнопка «Дефолтные скидки» расставляет по правилу">Скидка, %</th>
           <th class="num" data-sort="cs">Остаток</th>
           <th class="num" data-sort="wos" title="Недель покрытия текущим остатком">Покрытие, нед</th>
         </tr>
       </thead>
       <tbody id="tbody">
-        <tr><td colspan="14"><div class="loading-stub">Загрузка…</div></td></tr>
+        <tr><td colspan="15"><div class="loading-stub">Загрузка…</div></td></tr>
       </tbody>
       <tfoot id="tfoot" style="display:none;">
         <tr>
@@ -65,7 +67,7 @@
           <td class="num" id="f-nr"></td>
           <td class="num" id="f-turnover"></td>
           <td></td><td></td><td></td><td></td>
-          <td></td><td></td>
+          <td></td><td></td><td></td>
           <td class="num" id="f-cs"></td>
           <td></td>
         </tr>
@@ -95,13 +97,21 @@ document.addEventListener("DOMContentLoaded", function () {
     no_sales: "Без продаж за 365 дней"
   };
 
-  api("/api/turnover").then(function (d) {
+  var DISC = {}; // ручные скидки {base: pct}
+
+  Promise.all([
+    api("/api/turnover"),
+    api("/api/discount-overrides").catch(function () { return {}; })
+  ]).then(function (res) {
+    var d = res[0];
+    DISC = res[1] || {};
     items = d.items || [];
-    // Плоские ключи сезонов — для сортировки по заголовкам.
+    // Плоские ключи: сезоны и ручная скидка — для сортировки по заголовкам.
     items.forEach(function (it) {
       var s = it.sea || {};
       it.sea_winter = s.winter || 0; it.sea_spring = s.spring || 0;
       it.sea_summer = s.summer || 0; it.sea_autumn = s.autumn || 0;
+      it._disc = DISC[it.base_name] || 0;
     });
     initClsCards();
     renderClsStrip();
@@ -111,7 +121,7 @@ document.addEventListener("DOMContentLoaded", function () {
     }
     renderTable();
   }).catch(function () {
-    tbody.innerHTML = '<tr><td colspan="14">' +
+    tbody.innerHTML = '<tr><td colspan="15">' +
       emptyState("Не удалось загрузить данные", "Обновите страницу или попробуйте позже.",
         '<button class="btn" onclick="location.reload()">Обновить</button>') + "</td></tr>";
   });
@@ -218,8 +228,16 @@ document.addEventListener("DOMContentLoaded", function () {
       seaCells(it) +
       '<td class="num">' + fmtInt(it.avg_price) + ' <span class="muted">/ ' + fmtInt(it.sale_price) + "</span></td>" +
       discountCell(it.discount_fact) +
+      '<td class="num"><input class="input sm num disc-in" type="number" min="0" max="99" step="1" ' +
+        'style="width:58px;' + (DISC[it.base_name] ? " background:rgba(122,162,255,.18);" : "") + '" ' +
+        'data-base="' + esc(it.base_name) + '" value="' + (DISC[it.base_name] || "") + '" placeholder="—"></td>' +
       '<td class="num' + ((it.cs || 0) === 0 && it.nq > 0 ? " txt-red" : "") + '">' + fmtInt(it.cs) + "</td>" +
-      '<td class="num">' + ((it.cs || 0) > 0 ? covBar(it.wos) : '<span class="muted">—</span>') + "</td>" +
+      '<td class="num">' + ((it.cs || 0) > 0
+        ? covBar(it.wos) + (it.wos && it.stockout_date
+          ? '<div class="muted" style="font-size:10px; margin-top:2px;" title="Запас в днях при текущем темпе и дата, когда остаток закончится">≈ ' +
+            fmtInt(it.wos * 7) + " дн · до " + fmtDate(it.stockout_date) + "</div>"
+          : "")
+        : '<span class="muted">—</span>') + "</td>" +
       "</tr>";
   }
 
@@ -232,7 +250,7 @@ document.addEventListener("DOMContentLoaded", function () {
     });
 
     if (!arr.length) {
-      tbody.innerHTML = '<tr><td colspan="14">' + (items.length
+      tbody.innerHTML = '<tr><td colspan="15">' + (items.length
         ? emptyState("Ничего не найдено", "Попробуйте изменить запрос или сбросить фильтры.", "")
         : emptyState("Данных пока нет", "Подключите источник данных, чтобы увидеть оборачиваемость ассортимента.",
             '<a class="btn primary" href="/onboarding">Подключить данные</a>')) + "</td></tr>";
@@ -249,7 +267,7 @@ document.addEventListener("DOMContentLoaded", function () {
                            state.sortKey, state.sortDir);
       if (!part.length) return;
       if (g !== "rank") {
-        html += '<tr class="grp-head"><td colspan="14">' + GROUP_TITLES[g] +
+        html += '<tr class="grp-head"><td colspan="15">' + GROUP_TITLES[g] +
           " · " + fmtInt(part.length) + " поз.</td></tr>";
       }
       html += part.map(function (it) { return rowHtml(it, g !== "rank"); }).join("");
@@ -270,6 +288,39 @@ document.addEventListener("DOMContentLoaded", function () {
     document.getElementById("f-turnover").textContent = fmtInt(turn);
     document.getElementById("f-cs").textContent = fmtInt(cs);
   }
+
+  // Ручные скидки: сохранение по change (0/пусто = снять), делегированный обработчик.
+  tbody.addEventListener("change", function (e) {
+    var inp = e.target;
+    if (!inp.classList || !inp.classList.contains("disc-in")) return;
+    var base = inp.getAttribute("data-base");
+    var v = Math.round(Number(inp.value));
+    if (!isFinite(v) || v <= 0) { v = 0; inp.value = ""; }
+    else { v = Math.min(v, 99); inp.value = v; }
+    if (v > 0) DISC[base] = v; else delete DISC[base];
+    items.forEach(function (it) { if (it.base_name === base) it._disc = v; });
+    inp.style.background = v ? "rgba(122,162,255,.18)" : "";
+    api("/api/discount-overrides", { method: "POST", body: { base_name: base, discount: v } })
+      .catch(function () { toast("Не удалось сохранить скидку — проверьте соединение"); });
+  });
+
+  document.getElementById("btn-def-disc").addEventListener("click", function () {
+    if (!confirm("Все ручные скидки будут сброшены и расставлены заново по правилу от текущей оборачиваемости и запаса:\n\n· нет остатка — скидка не ставится\n· новинка (< 30 дн в стоке) — 10%\n· топ продаж (> 2000 ₽/день) — 15% / 20% при затоварке\n· средние (1000–2000) — 30% / 40%\n· слабые и без продаж — 50% / 60%\n\nПродолжить?")) return;
+    var btn = this;
+    btn.disabled = true; btn.textContent = "Сохраняю…";
+    api("/api/discount-overrides/defaults", { method: "POST" }).then(function (r) {
+      return api("/api/discount-overrides");
+    }).then(function (d) {
+      DISC = d || {};
+      items.forEach(function (it) { it._disc = DISC[it.base_name] || 0; });
+      renderTable();
+      btn.textContent = "✓ Скидки расставлены";
+      setTimeout(function () { btn.textContent = "Дефолтные скидки"; btn.disabled = false; }, 2000);
+    }).catch(function () {
+      toast("Не удалось расставить скидки (нужны права владельца)");
+      btn.textContent = "Дефолтные скидки"; btn.disabled = false;
+    });
+  });
 
     var urlQ = new URLSearchParams(window.location.search).get("q");
   if (urlQ) { document.getElementById("search").value = urlQ; state.query = urlQ.trim(); }

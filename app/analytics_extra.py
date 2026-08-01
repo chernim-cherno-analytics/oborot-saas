@@ -586,3 +586,116 @@ def build_sizes_calc(
             for i, s in enumerate(sizes)
         ],
     }
+
+
+# ── «Оборот» за период (порт legacy/revenue.html) ────────────────────────────
+#
+# Аналитическая сводка продаж, НЕ инструмент работы со стоком: выручка за
+# произвольный период, категории с долями, помесячный ряд по категориям
+# (последние REVENUE_MONTHS месяцев, независимо от выбранного периода — как в
+# legacy), топ позиций. Всё нетто (продажи минус возвраты). Исключённые из
+# аналитики позиции (упаковка/сертификаты) не участвуют.
+
+REVENUE_MONTHS = 18
+
+
+def build_revenue(db: Session, org_id: int, date_from: str, date_to: str) -> dict:
+    sign_qty = case((Sale.is_return, -Sale.qty), else_=Sale.qty)
+    sign_rev = case((Sale.is_return, -Sale.revenue), else_=Sale.revenue)
+    join_products = and_(
+        Product.id == Sale.product_id,
+        Product.org_id == org_id,
+        Product.excluded.is_(False),
+    )
+
+    # Позиции за период (нетто по базовым именам).
+    rows = db.execute(
+        select(
+            Product.base_name,
+            func.max(Product.category),
+            func.sum(sign_qty),
+            func.sum(sign_rev),
+        )
+        .select_from(Sale)
+        .join(Product, join_products)
+        .where(Sale.org_id == org_id, Sale.date >= date_from, Sale.date <= date_to)
+        .group_by(Product.base_name)
+    ).all()
+
+    items = []
+    total_qty = total_rev = 0.0
+    cats: dict[str, dict] = {}
+    for base, category, q, r in rows:
+        q = float(q or 0)
+        r = float(r or 0)
+        if q == 0 and r == 0:
+            continue
+        cat = category or "Без категории"
+        items.append({"base_name": base, "category": cat,
+                      "qty": round(q), "rev": round(r)})
+        total_qty += q
+        total_rev += r
+        c = cats.setdefault(cat, {"qty": 0.0, "rev": 0.0})
+        c["qty"] += q
+        c["rev"] += r
+
+    items.sort(key=lambda it: -it["rev"])
+    categories = sorted(
+        (
+            {
+                "category": name,
+                "qty": round(v["qty"]),
+                "rev": round(v["rev"]),
+                "share": round(v["rev"] / total_rev, 3) if total_rev > 0 else 0.0,
+            }
+            for name, v in cats.items()
+        ),
+        key=lambda c: -c["rev"],
+    )
+
+    # Помесячный ряд по категориям за REVENUE_MONTHS месяцев (нетто-выручка;
+    # отрицательные месяцы категория может дать при перевесе возвратов —
+    # клиент клипует в 0 при отрисовке, как в legacy).
+    today = date.today()
+    first = date(today.year, today.month, 1)
+    months = []
+    y, m = first.year, first.month
+    for _ in range(REVENUE_MONTHS):
+        months.append(f"{y:04d}-{m:02d}")
+        m -= 1
+        if m == 0:
+            y, m = y - 1, 12
+    months.reverse()
+    month_col = func.substr(Sale.date, 1, 7)
+    month_rows = db.execute(
+        select(month_col, func.max(Product.category), func.sum(sign_rev))
+        .select_from(Sale)
+        .join(Product, join_products)
+        .where(Sale.org_id == org_id, month_col >= months[0])
+        .group_by(month_col, Product.category)
+    ).all()
+    by_month: dict[str, dict[str, float]] = {mm: {} for mm in months}
+    for mm, category, r in month_rows:
+        if mm in by_month:
+            cat = category or "Без категории"
+            by_month[mm][cat] = by_month[mm].get(cat, 0.0) + float(r or 0)
+    monthly = [
+        {"month": mm,
+         "total": round(sum(by_month[mm].values())),
+         "by_category": {c: round(v) for c, v in by_month[mm].items()}}
+        for mm in months
+    ]
+
+    best_cat = categories[0] if categories else None
+    return {
+        "date_from": date_from,
+        "date_to": date_to,
+        "total_rev": round(total_rev),
+        "total_qty": round(total_qty),
+        "positions": len(items),
+        "avg_check": round(total_rev / total_qty) if total_qty > 0 else 0,
+        "best_category": best_cat,
+        "categories": categories,
+        "monthly": monthly,
+        "items": items[:300],  # топ-300: хватает и для топ-15, и для поиска
+    }

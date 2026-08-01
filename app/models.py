@@ -186,6 +186,22 @@ class OrderedQty(Base):
     ms_qty: Mapped[float] = mapped_column(Float, nullable=False, default=0.0, server_default="0")
 
 
+class SkuDiscount(Base):
+    """Ручная скидка позиции, % (страница «Оборачиваемость», правило legacy).
+
+    Хранятся только значения > 0 (0/пусто = строка удаляется). Кнопка
+    «Дефолтные скидки» перезаписывает ВСЮ таблицу организации по правилу
+    analytics_markdown._recommend. Страница «Скидки» (уценка) показывает
+    ручную скидку с приоритетом над рекомендацией.
+    """
+
+    __tablename__ = "sku_discounts"
+
+    org_id: Mapped[int] = mapped_column(ForeignKey("orgs.id"), primary_key=True)
+    base_name: Mapped[str] = mapped_column(String(255), primary_key=True)
+    discount: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+
+
 class SyncState(Base):
     """Состояние синхронизации МойСклад per-org (прогресс для онбординга).
 

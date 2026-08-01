@@ -418,6 +418,62 @@ def run_scenario() -> int:
               hood_excl is not None and "заказ" in hood_excl.get("reason", ""),
               f"got={hood_excl}")
 
+    print("== «Оборот» за период ==")
+    r = client.get(f"/api/revenue?date_from={mock_ms.DATES[0]}&date_to={mock_ms.DATES[-1]}")
+    check("GET /api/revenue отвечает", r.status_code == 200, f"status={r.status_code}")
+    rev = r.json()
+    exp_sales = mock_ms.expected_net_sales()
+    exp_rev = round(sum(v[1] for v in exp_sales.values()))
+    exp_qty = round(sum(v[0] for v in exp_sales.values()))
+    check("выручка за весь период = эталон mock-мира",
+          abs(rev["total_rev"] - exp_rev) <= 2 and abs(rev["total_qty"] - exp_qty) <= 1,
+          f"got={rev['total_rev']}/{rev['total_qty']} exp={exp_rev}/{exp_qty}")
+    top_base = max(exp_sales.items(), key=lambda kv: kv[1][1])[0]
+    check("топ позиций: первый = максимум по выручке",
+          rev["items"] and rev["items"][0]["base_name"] == top_base,
+          f"got={rev['items'] and rev['items'][0]['base_name']} exp={top_base}")
+    check("категории с долями, сумма долей ≈ 1",
+          rev["categories"] and abs(sum(c["share"] for c in rev["categories"]) - 1) < 0.02)
+    check("помесячный ряд: 18 месяцев, последний не пустой",
+          len(rev["monthly"]) == 18 and rev["monthly"][-1]["total"] > 0,
+          f"n={len(rev['monthly'])} last={rev['monthly'][-1]['total']}")
+    r = client.get("/api/revenue?date_from=2026-01-31&date_to=2026-01-01")
+    check("период задом наперёд → 422", r.status_code == 422)
+
+    print("== Ручные скидки и «Дефолтные скидки» ==")
+    r = client.post("/api/discount-overrides",
+                    json={"base_name": "Худи «Скетч»", "discount": 25})
+    check("ручная скидка сохраняется", r.status_code == 200 and r.json().get("ok"))
+    d_items = {it["base_name"]: it for it in client.get("/api/discounts").json()["items"]}
+    hood_d = d_items.get("Худи «Скетч»")
+    check("отчёт «Скидки»: ручная скидка приоритетна (25%, manual)",
+          hood_d is not None and hood_d["discount_pct"] == 25 and hood_d["manual"]
+          and "Ручная" in hood_d["reason"],
+          f"got={hood_d and (hood_d['discount_pct'], hood_d.get('manual'))}")
+    r = client.post("/api/discount-overrides",
+                    json={"base_name": "Худи «Скетч»", "discount": 0})
+    check("нулевая скидка снимает ручную",
+          r.status_code == 200
+          and "Худи «Скетч»" not in client.get("/api/discount-overrides").json())
+    r = client.post("/api/discount-overrides/defaults")
+    check("«Дефолтные скидки» расставились (owner)",
+          r.status_code == 200 and r.json().get("count", 0) > 0,
+          f"resp={r.text[:80]}")
+    dover = client.get("/api/discount-overrides").json()
+    belt_disc = dover.get("Ремень «Ось»")
+    check("неликвид без продаж → глубокая скидка 60% (правило legacy)",
+          belt_disc == 60, f"got={belt_disc}")
+
+    print("== «По нулям N дн» на остатках ==")
+    stocks_resp = client.get("/api/stocks").json()
+    all_sizes = [s for it in stocks_resp["items"] for s in it["sizes"]]
+    check("у размеров есть поле zero_days",
+          all_sizes and all("zero_days" in s for s in all_sizes))
+    zero_sizes = [s for s in all_sizes if s["total"] == 0]
+    check("размеры «по нулям» несут дни с последнего остатка (или None без истории)",
+          all(s["zero_days"] is None or s["zero_days"] >= 0 for s in zero_sizes),
+          f"n_zero={len(zero_sizes)}")
+
     print("== Инкрементальный синк ==")
     # Эмулируем приёмку в МС: размер S принят полностью → у «Скетча» едет 8.
     mock_ms.PURCHASE_ORDERS[0]["positions"]["rows"][0]["shipped"] = 10.0

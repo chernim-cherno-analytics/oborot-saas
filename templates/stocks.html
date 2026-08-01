@@ -111,7 +111,11 @@ document.addEventListener("DOMContentLoaded", function () {
       warehouses.map(function (w) { return '<th class="num">' + esc(w.name) + "</th>"; }).join("") +
       '<th class="num">Всего</th></tr></thead><tbody>' +
       sizes.map(function (s) {
-        return "<tr><td><b>" + esc(s.size) + "</b></td>" +
+        var zero = (s.total || 0) === 0
+          ? ' <span class="badge red" title="Размер распродан везде — каждый день без него это упущенные продажи">по нулям' +
+            (s.zero_days ? " уже " + fmtInt(s.zero_days) + " дн" : "") + "</span>"
+          : "";
+        return "<tr><td><b>" + esc(s.size) + "</b>" + zero + "</td>" +
           warehouses.map(function (w, i) {
             var q = (s.per_wh || [])[i] || 0;
             return '<td class="num' + (q === 0 ? " txt-red" : "") + '">' + fmtInt(q) + "</td>";

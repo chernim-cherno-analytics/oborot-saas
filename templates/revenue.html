@@ -1,0 +1,209 @@
+{% extends "base.html" %}
+{% block content %}
+
+<p class="page-sub">Аналитика продаж за период: всё нетто (продажи минус возвраты). Это сводка к сведению, а не инструмент работы со стоком — помесячный график всегда показывает последние 18 месяцев.</p>
+
+<div class="card">
+  <div class="toolbar" style="flex-wrap:wrap; gap:8px;">
+    <div class="chips" id="preset-chips">
+      <button class="chip" data-days="30">30 дней</button>
+      <button class="chip active" data-days="90">90 дней</button>
+      <button class="chip" data-days="365">Год</button>
+      <button class="chip" data-days="all">Всё время</button>
+    </div>
+    <span class="muted" style="font-size:12px;">или свой период:</span>
+    <input class="input sm" type="date" id="d-from" style="width:150px;">
+    <input class="input sm" type="date" id="d-to" style="width:150px;">
+    <button class="btn sm" id="btn-apply">Показать</button>
+  </div>
+</div>
+
+<div class="metric-grid" style="grid-template-columns:repeat(4,1fr);">
+  <div class="metric"><div class="m-label">Выручка за период</div><div class="m-value" id="c-rev">—</div><div class="m-sub" id="c-rev-s"></div></div>
+  <div class="metric"><div class="m-label">Продано</div><div class="m-value" id="c-qty">—</div><div class="m-sub" id="c-qty-s"></div></div>
+  <div class="metric"><div class="m-label" title="Выручка периода, делённая на проданные штуки">Средний чек позиции</div><div class="m-value" id="c-avg">—</div><div class="m-sub">выручка / штуки</div></div>
+  <div class="metric"><div class="m-label">Лучшая категория</div><div class="m-value" id="c-best" style="font-size:18px;">—</div><div class="m-sub" id="c-best-s"></div></div>
+</div>
+
+<div class="card">
+  <div class="card-head"><h2 style="font-size:14px;margin:0;" id="cat-title">Категории за период</h2></div>
+  <div class="card-body" id="cat-box"><div class="loading-stub">Загрузка…</div></div>
+</div>
+
+<div class="card">
+  <div class="card-head"><h2 style="font-size:14px;margin:0;">Оборот по месяцам · 18 месяцев</h2></div>
+  <div class="card-body">
+    <div id="month-box" style="width:100%; overflow-x:auto;"><div class="loading-stub">Загрузка…</div></div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="toolbar">
+    <h2 style="font-size:14px;margin:0;" id="top-title">Топ позиций за период</h2>
+    <div class="spacer" style="flex:1;"></div>
+    <div class="search-box">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.5" y2="16.5"/></svg>
+      <input class="input" type="search" id="search" placeholder="Поиск по названию…" autocomplete="off">
+    </div>
+  </div>
+  <div class="tbl-wrap">
+    <table class="tbl">
+      <thead><tr>
+        <th style="width:36px;">#</th>
+        <th>Позиция</th>
+        <th class="num">Продано, шт</th>
+        <th class="num">Выручка, ₽</th>
+        <th class="num" title="Доля от всей выручки периода">Доля</th>
+      </tr></thead>
+      <tbody id="top-tbody"><tr><td colspan="5"><div class="loading-stub">Загрузка…</div></td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+  var DATA = null;
+  var state = { query: "" };
+
+  function fmtShort(n) {
+    n = n || 0;
+    if (Math.abs(n) >= 1e6) return fmtNum(n / 1e6, 2) + " млн ₽";
+    if (Math.abs(n) >= 1e3) return fmtInt(n / 1e3) + " тыс ₽";
+    return fmtMoney(n);
+  }
+  function iso(d) { return d.toISOString().slice(0, 10); }
+
+  function load(from, to) {
+    api("/api/revenue?date_from=" + from + "&date_to=" + to).then(function (d) {
+      DATA = d;
+      renderCards(d);
+      renderCats(d);
+      renderMonths(d.monthly || []);
+      renderTop();
+    }).catch(function () {
+      document.getElementById("cat-box").innerHTML =
+        emptyState("Не удалось загрузить данные", "Обновите страницу или попробуйте позже.", "");
+    });
+  }
+
+  function loadPreset(days) {
+    var to = new Date();
+    var from = days === "all" ? new Date(2000, 0, 1)
+      : new Date(Date.now() - (Number(days) - 1) * 86400000);
+    document.getElementById("d-from").value = iso(from);
+    document.getElementById("d-to").value = iso(to);
+    load(iso(from), iso(to));
+  }
+
+  function periodLabel(d) { return fmtDate(d.date_from) + " — " + fmtDate(d.date_to); }
+
+  function renderCards(d) {
+    document.getElementById("c-rev").textContent = fmtShort(d.total_rev);
+    document.getElementById("c-rev-s").textContent = periodLabel(d);
+    document.getElementById("c-qty").textContent = fmtInt(d.total_qty) + " шт";
+    document.getElementById("c-qty-s").textContent =
+      fmtInt(d.positions) + " " + plural(d.positions, "позиция продавалась", "позиции продавались", "позиций продавалось");
+    document.getElementById("c-avg").textContent = fmtMoney(d.avg_check);
+    var b = d.best_category;
+    document.getElementById("c-best").textContent = b ? b.category : "—";
+    document.getElementById("c-best-s").textContent =
+      b ? fmtShort(b.rev) + " · " + Math.round(b.share * 100) + "% оборота" : "";
+  }
+
+  function renderCats(d) {
+    var cats = d.categories || [];
+    document.getElementById("cat-title").textContent = "Категории · " + periodLabel(d);
+    if (!cats.length) {
+      document.getElementById("cat-box").innerHTML =
+        emptyState("Нет продаж за период", "Попробуйте расширить период.", "");
+      return;
+    }
+    var maxRev = cats[0].rev || 1;
+    document.getElementById("cat-box").innerHTML = cats.map(function (c) {
+      var w = Math.max(2, Math.round(c.rev / maxRev * 100));
+      return '<div style="display:flex; align-items:center; gap:10px; margin:6px 0;">' +
+        '<div style="flex:0 0 150px; font-size:13px;">' + esc(c.category) + "</div>" +
+        '<div style="flex:1;"><div style="height:16px; border-radius:4px; width:' + w +
+          '%; background:linear-gradient(90deg, rgba(122,162,255,.75), rgba(122,162,255,.35));"></div></div>' +
+        '<div style="flex:0 0 220px; text-align:right; font-size:12px;"><b>' + fmtShort(c.rev) +
+          '</b> <span class="muted">· ' + fmtInt(c.qty) + " шт · " +
+          (c.share * 100).toFixed(1) + "%</span></div></div>";
+    }).join("");
+  }
+
+  function renderMonths(monthly) {
+    var box = document.getElementById("month-box");
+    if (!monthly.length) { box.innerHTML = '<div class="loading-stub">Нет данных</div>'; return; }
+    var maxV = Math.max.apply(null, monthly.map(function (m) { return Math.max(0, m.total); })) || 1;
+    var H = 190, bw = Math.max(28, Math.floor(820 / monthly.length) - 8);
+    var html = '<div style="display:flex; align-items:flex-end; gap:8px; height:' + (H + 38) + 'px; min-width:640px;">';
+    monthly.forEach(function (m) {
+      var v = Math.max(0, m.total);
+      var h = Math.round(v / maxV * H);
+      var mm = m.month.slice(5), yy = m.month.slice(2, 4);
+      var tip = m.month + ": " + fmtShort(m.total) + "\n" +
+        Object.entries(m.by_category || {})
+          .sort(function (a, b) { return b[1] - a[1]; })
+          .slice(0, 6)
+          .map(function (e) { return e[0] + " — " + fmtShort(e[1]); }).join("\n");
+      html += '<div style="width:' + bw + 'px; text-align:center;" title="' + esc(tip) + '">' +
+        '<div class="muted" style="font-size:9px; height:12px;">' + (v ? fmtNum(v / 1e6, 1) : "") + "</div>" +
+        '<div style="height:' + h + 'px; border-radius:4px 4px 0 0; background:linear-gradient(180deg, rgba(122,162,255,.85), rgba(122,162,255,.35));"></div>' +
+        '<div class="muted" style="font-size:10px; margin-top:4px;">' + mm + "." + yy + "</div>" +
+        "</div>";
+    });
+    box.innerHTML = html + "</div><div class='muted' style='font-size:11px;'>цифры над столбиками — млн ₽; наведите курсор — разбивка по категориям</div>";
+  }
+
+  function renderTop() {
+    if (!DATA) return;
+    var items = (DATA.items || []).filter(function (it) {
+      return wordMatch(it.base_name, state.query);
+    });
+    var limit = state.query ? 50 : 15;
+    document.getElementById("top-title").textContent =
+      (state.query ? "Найдено · " : "Топ-" + limit + " · ") + periodLabel(DATA);
+    var total = DATA.total_rev || 1;
+    var tb = document.getElementById("top-tbody");
+    if (!items.length) {
+      tb.innerHTML = '<tr><td colspan="5">' +
+        emptyState("Ничего не найдено", "Попробуйте изменить запрос.", "") + "</td></tr>";
+      return;
+    }
+    tb.innerHTML = items.slice(0, limit).map(function (it, i) {
+      return "<tr>" +
+        '<td class="num muted">' + (i + 1) + "</td>" +
+        '<td class="name-cell"><div class="name-main">' + esc(it.base_name) +
+        '</div><div class="name-sub">' + esc(it.category || "") + "</div></td>" +
+        '<td class="num">' + fmtInt(it.qty) + "</td>" +
+        '<td class="num"><b>' + fmtInt(it.rev) + "</b></td>" +
+        '<td class="num muted">' + (it.rev / total * 100).toFixed(1) + "%</td>" +
+        "</tr>";
+    }).join("");
+  }
+
+  document.querySelectorAll("#preset-chips .chip").forEach(function (chip) {
+    chip.addEventListener("click", function () {
+      document.querySelectorAll("#preset-chips .chip").forEach(function (x) { x.classList.remove("active"); });
+      chip.classList.add("active");
+      loadPreset(chip.getAttribute("data-days"));
+    });
+  });
+  document.getElementById("btn-apply").addEventListener("click", function () {
+    var f = document.getElementById("d-from").value, t = document.getElementById("d-to").value;
+    if (!f || !t) return;
+    document.querySelectorAll("#preset-chips .chip").forEach(function (x) { x.classList.remove("active"); });
+    load(f, t);
+  });
+  document.getElementById("search").addEventListener("input", debounce(function (e) {
+    state.query = e.target.value.trim();
+    renderTop();
+  }, 150));
+
+  loadPreset("90");
+});
+</script>
+{% endblock %}
