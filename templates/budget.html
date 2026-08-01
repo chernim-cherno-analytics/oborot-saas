@@ -2,6 +2,7 @@
 {% block content %}
 
 <p class="page-sub">Распределение бюджета закупки по оборачиваемости: сначала деньги получают бестселлеры, затем хорошие и так далее. В расчёте — только позиции с продажами за последние 90 дней.</p>
+<p class="hint-line"><b>Настройки:</b> «Макс. на позицию, %» не даёт одному бестселлеру съесть весь бюджет — урезанное уходит следующим по оборачиваемости. Кнопки категорий выключают категорию из расчёта целиком (перечёркнутая — выключена). Потребность = темп × 90 дней − остаток − «едет к нам»; дорогая позиция сверх лимита входит одной штукой с пометкой.</p>
 
 <div class="card">
   <div class="toolbar" style="flex-wrap:wrap;">
@@ -203,7 +204,7 @@ document.addEventListener("DOMContentLoaded", function () {
       document.getElementById("tfoot").style.display = "none";
     } else {
       tbody.innerHTML = d.items.map(function (it, i) {
-        return "<tr>" +
+        return "<tr" + (rowTint(it) ? ' class="' + rowTint(it) + '"' : "") + ">" +
           '<td class="name-cell"><div class="name-main">' + (i + 1) + ". " + esc(it.base_name) + " " + noteCell(it) +
             '</div><div class="name-sub">' + esc(it.category) + "</div></td>" +
           "<td>" + clsDot(it.cls) + "</td>" +

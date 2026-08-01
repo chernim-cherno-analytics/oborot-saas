@@ -39,6 +39,7 @@ from datetime import date, timedelta
 from sqlalchemy import and_, case, func, select
 from sqlalchemy.orm import Session
 
+from app.categories import ru_category
 from app.models import (
     Org,
     OrderedQty,
@@ -435,7 +436,9 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
     for base, category, sale_price, cost_price, archived in meta_rows:
         items[base] = {
             "base_name": base,
-            "category": category or "",
+            # Категория для отображения: русская (перевод латинских групп МС
+            # или keyword-категоризация по имени — фидбэк «всё по-русски»).
+            "category": ru_category(category, base),
             "sale_price": float(sale_price or 0),
             "cost_price": float(cost_price or 0),
             "archived": bool(archived),

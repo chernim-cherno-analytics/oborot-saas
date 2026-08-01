@@ -33,6 +33,7 @@ from datetime import date, timedelta
 from sqlalchemy import and_, case, func, select
 from sqlalchemy.orm import Session
 
+from app.categories import ru_category
 from app.models import Product, Sale
 
 FRESH_DAYS = 90        # бюджет: окно «свежих» продаж
@@ -630,7 +631,7 @@ def build_revenue(db: Session, org_id: int, date_from: str, date_to: str) -> dic
         r = float(r or 0)
         if q == 0 and r == 0:
             continue
-        cat = category or "Без категории"
+        cat = ru_category(category, base)
         items.append({"base_name": base, "category": cat,
                       "qty": round(q), "rev": round(r)})
         total_qty += q
@@ -677,7 +678,7 @@ def build_revenue(db: Session, org_id: int, date_from: str, date_to: str) -> dic
     by_month: dict[str, dict[str, float]] = {mm: {} for mm in months}
     for mm, category, r in month_rows:
         if mm in by_month:
-            cat = category or "Без категории"
+            cat = ru_category(category)  # разные raw могут слиться в одну русскую
             by_month[mm][cat] = by_month[mm].get(cat, 0.0) + float(r or 0)
     monthly = [
         {"month": mm,

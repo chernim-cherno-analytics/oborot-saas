@@ -1,7 +1,8 @@
 {% extends "base.html" %}
 {% block content %}
 
-<p class="page-sub">Метрики за скользящие 365 дней. Оборачиваемость — нетто-выручка в расчёте на день, когда товар был в наличии. Карточка класса — фильтр: клик показывает только её позиции.</p>
+<p class="page-sub">Оборачиваемость — сколько рублей в день приносит вещь, пока она есть на складе (нетто-выручка ÷ дни в наличии, скользящий год).</p>
+<p class="hint-line"><b>Шкала:</b> до 1 000 ₽/день — слабый · 1 000–2 000 — медленный · 2 000–5 000 — хороший · от 5 000 — бестселлер. Строки подсвечены цветом класса. Карточка класса сверху — фильтр по клику; пороги меняются в Настройках.</p>
 
 <div class="metric-grid" style="grid-template-columns:repeat(4, 1fr);" id="cls-strip">
   <div class="metric cls-card" data-cls="best" title="Показать только бестселлеры"><div class="m-label"><span class="clsq best" style="width:18px;height:18px;font-size:10px;vertical-align:-4px;">A</span>&nbsp; Бестселлеры</div><div class="m-value" id="cnt-best">—</div><div class="m-sub" id="sub-best">≥ 5 000 ₽/день</div></div>
@@ -207,7 +208,7 @@ document.addEventListener("DOMContentLoaded", function () {
   }
 
   function rowHtml(it, dim) {
-    return '<tr class="' + (dim ? "row-dim" : "") + '">' +
+    return '<tr class="' + (dim ? "row-dim" : rowTint(it)) + '">' +
       '<td class="name-cell"><div class="name-main">' + esc(it.base_name) +
         (it.archived ? ' <span class="badge gray">архив</span>' : "") +
         '</div><div class="name-sub">' + esc(it.category || "") + "</div></td>" +

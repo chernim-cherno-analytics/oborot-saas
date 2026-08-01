@@ -418,6 +418,22 @@ def run_scenario() -> int:
               hood_excl is not None and "заказ" in hood_excl.get("reason", ""),
               f"got={hood_excl}")
 
+    print("== Русские категории и sample-исключения (чистые функции) ==")
+    from app.categories import ru_category
+    from app.exclusions import is_service_item
+    check("латинская категория переводится (Shirts → Рубашки)",
+          ru_category("Shirts") == "Рубашки")
+    check("без категории — по имени товара (бомбер → Верхняя одежда)",
+          ru_category("", "Черный бомбер \"Регби\"") == "Верхняя одежда")
+    check("кириллическая категория не трогается",
+          ru_category("Худи и свитшоты", "х") == "Худи и свитшоты")
+    check("нераспознанная латиница остаётся как есть",
+          ru_category("Vintage", "Штука") == "Vintage")
+    check("sample-позиции исключаются эвристикой",
+          is_service_item("Пальто \"Скала\" sample", "Samples")
+          and is_service_item("Молочные брюки сэмпл", "")
+          and not is_service_item("Пальто \"Скала\"", "Одежда"))
+
     print("== «Оборот» за период ==")
     r = client.get(f"/api/revenue?date_from={mock_ms.DATES[0]}&date_to={mock_ms.DATES[-1]}")
     check("GET /api/revenue отвечает", r.status_code == 200, f"status={r.status_code}")

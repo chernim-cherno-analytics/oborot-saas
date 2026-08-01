@@ -477,3 +477,11 @@ function emptyState(title, text, actionHtml, icon) {
 function loadingStub(text) {
   return '<div class="loading-stub">' + esc(text || "Загрузка…") + "</div>";
 }
+
+/** Класс подсветки строки по классу оборачиваемости (пусто для шумовых групп). */
+function rowTint(it) {
+  if (!it || it.low_data || it.archived) return "";
+  // Без продаж — без подсветки (проверяем, только если поля есть в ответе).
+  if (it.nr !== undefined && (it.nr || 0) <= 0 && (it.nq || 0) <= 0) return "";
+  return { best: "rt-best", good: "rt-good", dull: "rt-dull", weak: "rt-weak" }[it.cls] || "";
+}

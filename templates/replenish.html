@@ -2,6 +2,7 @@
 {% block content %}
 
 <p class="page-sub" id="horizon-note">Рекомендации: сколько заказать на производство, чтобы хватило на горизонт планирования с учётом темпа продаж, остатков и уже заказанного.</p>
+<p class="hint-line"><b>Как читать:</b> строки подсвечены классом оборачиваемости — бестселлеры зелёные, слабые красные; красная рамка = стокаут ближе двух недель. <b>Заказать</b> = темп × горизонт − прогнозный остаток к приходу заказа. Переключатель «Темп» меняет окно расчёта: <b>Год</b> сглаживает сезонность, <b>90 дней</b> ловит текущий тренд, <b>Сезон</b> смотрит то же окно прошлого года — то, на которое приедет заказ. Горизонт и срок производства — в Настройках.</p>
 
 <div class="metric-grid" id="kpis" style="grid-template-columns:1.25fr 1fr 1fr 1fr 1fr; display:none;">
   <div class="metric alert" id="risk-tile">
@@ -425,7 +426,8 @@ document.addEventListener("DOMContentLoaded", function () {
     tbody.innerHTML = arr.map(function (it) {
       var open = !!openRows[it.base_name];
       var crit = it._band === "r";
-      return "<tr data-base='" + esc(it.base_name) + "'" + (crit ? " class='row-crit'" : "") + ">" +
+      var rowCls = crit ? "row-crit" : rowTint(it);
+      return "<tr data-base='" + esc(it.base_name) + "'" + (rowCls ? " class='" + rowCls + "'" : "") + ">" +
         '<td><input type="checkbox" class="row-check" data-base="' + esc(it.base_name) + '"' + (it._checked ? " checked" : "") + "></td>" +
         '<td><button class="expander' + (open ? " open" : "") + '" data-base="' + esc(it.base_name) + '" title="Размерная сетка и формула расчёта">' + SVG_CHEVRON + "</button></td>" +
         '<td class="name-cell"><div class="name-main">' + esc(it.base_name) + '</div><div class="name-sub">' + esc(it.category || "") + "</div></td>" +

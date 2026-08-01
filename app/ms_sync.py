@@ -495,40 +495,81 @@ async def _sync_stock_history(org_id: int, client: MoySkladClient,
         db.close()
 
     total_dates = len(dates)
+
+    # ── Фаза 1: ПАРАЛЛЕЛЬНАЯ загрузка всех дат ───────────────────────────────
+    # Раньше даты качались строго последовательно (внутри даты — gather по
+    # складам) и первый синк занимал ~45 минут: фактический темп ~1–2 запроса
+    # в секунду при лимите МойСклад 45 req / 3 c и 5 параллельных. Теперь все
+    # пары дата×склад отдаются пулу сразу — темп ограничивает только
+    # RateLimiter клиента (~12–15 rps), т.е. год истории по 3 складам
+    # (~1100 запросов) — примерно полторы-две минуты.
+    # Явные нули требуют последовательности prev→next, поэтому расчёт нулей
+    # и запись в БД вынесены в фазу 2 (по готовым данным, хронологически).
+    day_results: dict[str, tuple[dict[int, float], dict[int, dict[int, float]]]] = {}
+
+    async def _one_day(day_iso: str):
+        res = await _fetch_day_stock(client, active_wh, day_iso, ext_to_pid, unmatched)
+        return day_iso, res
+
+    tasks = [asyncio.ensure_future(_one_day(d)) for d in dates]
+    done_count = 0
+    for fut in asyncio.as_completed(tasks):
+        day_iso, res = await fut
+        day_results[day_iso] = res
+        done_count += 1
+        if initial and (done_count % 10 == 0 or done_count == total_dates):
+            progress = 8.0 + 55.0 * done_count / total_dates
+            _set_state(org_id, stage="stock_history", progress=progress,
+                       detail=f"История остатков: {done_count}/{total_dates} дат")
+
+    # ── Фаза 2: явные нули + запись (хронологически, батчами) ────────────────
+    _set_state(org_id, stage="stock_history",
+               progress=64.0 if initial else 38.0,
+               detail="Записываем историю остатков…")
     last_by_wh: dict[int, dict[int, float]] = {}
-    for idx, day_iso in enumerate(dates):
-        totals, by_wh = await _fetch_day_stock(client, active_wh, day_iso,
-                                               ext_to_pid, unmatched)
-        rows = [
-            {"org_id": org_id, "product_id": pid, "date": day_iso, "qty": qty}
-            for pid, qty in totals.items()
-        ]
-        # Явный ноль для распроданных: были >0, из отчёта исчезли.
-        for gone in prev_positive - set(totals):
-            rows.append({"org_id": org_id, "product_id": gone, "date": day_iso, "qty": 0.0})
-            zeroed += 1
+    batch: list[dict] = []
+    batch_days: list[str] = []
+
+    def _flush() -> None:
+        nonlocal batch, batch_days
+        if not batch and (initial or not batch_days):
+            batch_days = []
+            return
         db = SessionLocal()
         try:
-            if not initial:
+            if not initial and batch_days:
                 db.execute(delete(StockDay).where(
-                    StockDay.org_id == org_id, StockDay.date == day_iso
+                    StockDay.org_id == org_id, StockDay.date.in_(batch_days)
                 ))
-            if rows:
-                db.execute(insert(StockDay), rows)
+            if batch:
+                db.execute(insert(StockDay), batch)
             db.commit()
         finally:
             db.close()
-        written += len(rows)
+        batch = []
+        batch_days = []
+
+    for day_iso in dates:  # dates уже в хронологическом порядке
+        totals, by_wh = day_results[day_iso]
+        for pid, qty in totals.items():
+            batch.append({"org_id": org_id, "product_id": pid,
+                          "date": day_iso, "qty": qty})
+        # Явный ноль для распроданных: были >0, из отчёта исчезли.
+        for gone in prev_positive - set(totals):
+            batch.append({"org_id": org_id, "product_id": gone,
+                          "date": day_iso, "qty": 0.0})
+            zeroed += 1
+        written += len(totals) + len(prev_positive - set(totals))
+        batch_days.append(day_iso)
         prev_positive = {pid for pid, qty in totals.items() if qty > 0}
         last_by_wh = by_wh
+        if len(batch) >= 20_000:
+            _flush()
+    _flush()
 
-        if initial:
-            progress = 8.0 + 62.0 * (idx + 1) / total_dates
-            _set_state(org_id, stage="stock_history", progress=progress,
-                       detail=f"История остатков: {day_iso} ({idx + 1}/{total_dates})")
-        else:
-            _set_state(org_id, stage="stock_today", progress=40.0,
-                       detail="Остатки на сегодня обновлены")
+    if not initial:
+        _set_state(org_id, stage="stock_today", progress=40.0,
+                   detail="Остатки на сегодня обновлены")
 
     # Текущие остатки по складам — из последней даты (сегодня).
     wh_rows = [
@@ -665,11 +706,16 @@ async def _sync_sales(org_id: int, client: MoySkladClient,
     stats["sales_docs"] = 0
     stats["sales_docs_skipped_store"] = 0
     entities = (("retaildemand", False), ("demand", False), ("salesreturn", True))
-    for step, (entity, is_return) in enumerate(entities):
-        _set_state(org_id, stage="sales",
-                   progress=base_progress + span * step / len(entities),
-                   detail=f"Загружаем документы: {entity}…")
-        docs = await client.fetch_documents(entity, cutoff)
+    # Три типа документов качаются ПАРАЛЛЕЛЬНО (пагинация каждого — последовательная,
+    # но друг друга они не ждут) — ещё минус пара минут первого синка.
+    _set_state(org_id, stage="sales", progress=base_progress,
+               detail="Загружаем документы продаж (розница, отгрузки, возвраты)…")
+    docs_lists = await asyncio.gather(
+        *[client.fetch_documents(entity, cutoff) for entity, _ in entities]
+    )
+    _set_state(org_id, stage="sales", progress=base_progress + span * 0.8,
+               detail="Считаем продажи по документам…")
+    for (entity, is_return), docs in zip(entities, docs_lists):
         for doc in docs:
             store_ext = _href_id(((doc.get("store") or {}).get("meta") or {}).get("href"))
             if store_ext not in active_store_ids:

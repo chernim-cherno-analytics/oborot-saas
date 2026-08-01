@@ -866,3 +866,18 @@ body.auth-page {
 .print-header { display: none; }
 .print-header .ph-brand { font-size: 16px; font-weight: 700; }
 .print-header .ph-meta { font-size: 11px; color: #444; margin-top: 2px; }
+
+/* ── Подсветка строк по классу оборачиваемости (правило legacy-таблицы CC:
+   бестселлеры и слабые видны с первого взгляда, без чтения цифр) ── */
+tr.rt-best > td { background: rgba(26, 122, 46, 0.14); }
+tr.rt-good > td { background: rgba(76, 187, 23, 0.10); }
+tr.rt-dull > td { background: rgba(245, 166, 35, 0.10); }
+tr.rt-weak > td { background: rgba(229, 72, 77, 0.07); }
+tr.rt-best:hover > td { background: rgba(26, 122, 46, 0.22); }
+tr.rt-good:hover > td { background: rgba(76, 187, 23, 0.17); }
+tr.rt-dull:hover > td { background: rgba(245, 166, 35, 0.17); }
+tr.rt-weak:hover > td { background: rgba(229, 72, 77, 0.13); }
+
+/* Короткие пояснения к настройкам страниц (фидбэк: «сопроводить комментариями») */
+.hint-line { font-size: 12px; color: var(--text-soft); margin: -6px 0 12px; line-height: 1.55; }
+.hint-line b { color: var(--text); }

@@ -28,6 +28,9 @@ SERVICE_CATEGORIES = {
     "gift cards",
     "подарочные сертификаты",
     "сертификаты",
+    "samples",
+    "сэмплы",
+    "образцы",
 }
 
 # Подстроки в названии (lower). Слова подобраны так, чтобы не задевать одежду,
@@ -50,6 +53,8 @@ _NAME_PATTERNS = [
     "нитки",
     "нитка",
     "упаковоч",
+    "sample",           # сэмплы моделей: не продаются как товар, шумят в аналитике
+    "сэмпл",
 ]
 _NAME_RE = re.compile("|".join(re.escape(p) for p in _NAME_PATTERNS))
 
@@ -72,13 +77,36 @@ def ensure_schema() -> None:
     if not insp.has_table("products"):
         return
     cols = {c["name"] for c in insp.get_columns("products")}
-    if "excluded" in cols:
-        return
+    if "excluded" not in cols:
+        with engine.begin() as conn:
+            conn.execute(text(
+                "ALTER TABLE products ADD COLUMN excluded BOOLEAN NOT NULL DEFAULT 0"
+            ))
+            rows = conn.execute(text("SELECT id, base_name, category FROM products")).fetchall()
+            service_ids = [r[0] for r in rows if is_service_item(r[1], r[2])]
+            for pid in service_ids:
+                conn.execute(text("UPDATE products SET excluded = 1 WHERE id = :pid"), {"pid": pid})
+    _run_backfill_once("excl_samples_v1")
+
+
+def _run_backfill_once(flag: str) -> None:
+    """Разовый бэкфилл эвристикой для НОВЫХ ключей (например, sample/сэмпл).
+
+    Флаг в migration_flags гарантирует один запуск: пользовательское решение
+    вернуть позицию в аналитику после этого не перетирается.
+    """
     with engine.begin() as conn:
         conn.execute(text(
-            "ALTER TABLE products ADD COLUMN excluded BOOLEAN NOT NULL DEFAULT 0"
+            "CREATE TABLE IF NOT EXISTS migration_flags (name VARCHAR(64) PRIMARY KEY)"
         ))
-        rows = conn.execute(text("SELECT id, base_name, category FROM products")).fetchall()
-        service_ids = [r[0] for r in rows if is_service_item(r[1], r[2])]
-        for pid in service_ids:
+        done = conn.execute(
+            text("SELECT 1 FROM migration_flags WHERE name = :n"), {"n": flag}
+        ).first()
+        if done:
+            return
+        rows = conn.execute(text(
+            "SELECT id, base_name, category FROM products WHERE excluded = 0"
+        )).fetchall()
+        for pid in [r[0] for r in rows if is_service_item(r[1], r[2])]:
             conn.execute(text("UPDATE products SET excluded = 1 WHERE id = :pid"), {"pid": pid})
+        conn.execute(text("INSERT INTO migration_flags (name) VALUES (:n)"), {"n": flag})

@@ -78,6 +78,19 @@ def revenue_page(request: Request, db: Session = Depends(get_db)):
     return _authed_page(request, db, "revenue.html", "revenue", "Оборот")
 
 
+# ── Юридические страницы (публичные, без авторизации) ────────────────────────
+# Тексты — рабочая редакция; перед публичным запуском вычитывает юрист.
+
+@router.get("/legal/offer", response_class=HTMLResponse)
+def legal_offer(request: Request):
+    return _templates.TemplateResponse(request, "legal_offer.html", {})
+
+
+@router.get("/legal/privacy", response_class=HTMLResponse)
+def legal_privacy(request: Request):
+    return _templates.TemplateResponse(request, "legal_privacy.html", {})
+
+
 # ── JSON API ─────────────────────────────────────────────────────────────────
 
 @router.get("/api/budget")
