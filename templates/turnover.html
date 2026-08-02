@@ -1,339 +1,403 @@
-{% extends "base.html" %}
-{% block content %}
-
-<p class="page-sub">Оборачиваемость — сколько рублей в день приносит вещь, пока она есть на складе (нетто-выручка ÷ дни в наличии, скользящий год).</p>
-<p class="hint-line"><b>Шкала:</b> до 1 000 ₽/день — слабый · 1 000–2 000 — медленный · 2 000–5 000 — хороший · от 5 000 — бестселлер. Строки подсвечены цветом класса. Карточка класса сверху — фильтр по клику; пороги меняются в Настройках.</p>
-
-<div class="metric-grid" style="grid-template-columns:repeat(4, 1fr);" id="cls-strip">
-  <div class="metric cls-card" data-cls="best" title="Показать только бестселлеры"><div class="m-label"><span class="clsq best" style="width:18px;height:18px;font-size:10px;vertical-align:-4px;">A</span>&nbsp; Бестселлеры</div><div class="m-value" id="cnt-best">—</div><div class="m-sub" id="sub-best">≥ 5 000 ₽/день</div></div>
-  <div class="metric cls-card" data-cls="good" title="Показать только хорошие"><div class="m-label"><span class="clsq good" style="width:18px;height:18px;font-size:10px;vertical-align:-4px;">B</span>&nbsp; Хорошие</div><div class="m-value" id="cnt-good">—</div><div class="m-sub" id="sub-good">2 000 – 5 000 ₽/день</div></div>
-  <div class="metric cls-card" data-cls="dull" title="Показать только медленные"><div class="m-label"><span class="clsq dull" style="width:18px;height:18px;font-size:10px;vertical-align:-4px;">C</span>&nbsp; Медленные</div><div class="m-value" id="cnt-dull">—</div><div class="m-sub" id="sub-dull">1 000 – 2 000 ₽/день</div></div>
-  <div class="metric cls-card" data-cls="weak" title="Показать только слабые"><div class="m-label"><span class="clsq weak" style="width:18px;height:18px;font-size:10px;vertical-align:-4px;">D</span>&nbsp; Слабые</div><div class="m-value" id="cnt-weak">—</div><div class="m-sub" id="sub-weak">&lt; 1 000 ₽/день</div></div>
-</div>
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>{{ org.name }} · Оборачиваемость — Оборот</title>
 <style>
-  .cls-card { cursor: pointer; transition: transform .12s, outline-color .12s; outline: 2px solid transparent; }
-  .cls-card:hover { transform: translateY(-2px); }
-  .cls-card.active { outline-color: var(--accent, #7aa2ff); }
-  .cls-card .m-money { font-size: 13px; font-weight: 600; opacity: .8; margin-top: 2px; }
-  tr.grp-head td { padding: 10px 12px 6px; font-size: 11px; font-weight: 600;
-    letter-spacing: .07em; text-transform: uppercase; opacity: .55; border-bottom: none; }
-  tr.row-dim td { opacity: .55; }
-</style>
+  /* ── Стиль первой таблицы (legacy CC) ── */
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0 }
+  body { font-family: Helvetica, 'Helvetica Neue', Arial, sans-serif; min-height: 100vh; background: #f3e9e0; color: #1f1f1f; }
+  .gradient-bg { position: fixed; inset: 0; z-index: 0; overflow: hidden; background: #f3e9e0; }
+  .gradient-bg::before, .gradient-bg::after { position: absolute; border-radius: 50%; filter: blur(90px); opacity: .9; content: ''; }
+  .gradient-bg::before { width: 70vw; height: 70vw; background: radial-gradient(circle,#efe5db,transparent 70%); top: -20%; left: -10%; }
+  .gradient-bg::after { width: 60vw; height: 60vw; background: radial-gradient(circle,#e2d8cf,transparent 70%); bottom: -15%; right: -10%; }
+  .header { position: sticky; top: 0; z-index: 200; padding: 0 28px; height: 56px; background: rgba(243,233,224,.85); backdrop-filter: blur(10px);
+    display: flex; align-items: center; justify-content: space-between; }
+  .logo { text-decoration: none; font-size: 15px; font-weight: 700; letter-spacing: .12em; color: #1f1f1f; }
+  .nav { display: flex; gap: 18px; flex-wrap: wrap; }
+  .nav a { font-size: 13px; color: rgba(31,31,31,.45); text-decoration: none; }
+  .nav a:hover { color: #434446 }
+  .nav a.active { color: #1f1f1f; font-weight: 700; }
+  .nav a.primary-page { font-weight: 700; }
+  .main { padding: 8px 28px 24px; max-width: 1560px; margin: 0 auto; position: relative; z-index: 3; }
 
-<div class="card">
-  <div class="toolbar">
-    <div class="search-box">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.5" y2="16.5"/></svg>
-      <input class="input" type="search" id="search" placeholder="Поиск по названию…" autocomplete="off">
+  /* пояснительная записка */
+  details.note { margin: 10px 0 14px; border-radius: 12px; background: rgba(255,255,255,.6);
+    border: 1px solid rgba(31,31,31,.09); backdrop-filter: blur(10px); }
+  details.note summary { cursor: pointer; padding: 10px 16px; font-size: 12.5px; font-weight: 600; color: #434446; list-style: none; }
+  details.note summary::before { content: '▸ '; }
+  details.note[open] summary::before { content: '▾ '; }
+  details.note .body { padding: 0 18px 14px; font-size: 12.5px; color: #434446; line-height: 1.6; }
+  details.note .body p { margin: 6px 0; }
+  details.note .body b { color: #1f1f1f; }
+
+  .cat-bar { position: relative; z-index: 10; padding: 12px 28px 0; display: flex; gap: 8px; flex-wrap: wrap; }
+  .cat-btn { font-size: 12px; font-weight: 500; padding: 5px 14px; border-radius: 20px;
+    border: 1px solid rgba(31,31,31,.09); background: rgba(255,255,255,.55); color: #434446; cursor: pointer; white-space: nowrap; }
+  .cat-btn:hover { background: rgba(31,31,31,.09); color: #1f1f1f }
+  .cat-btn.active { background: rgba(31,31,31,.16); color: #1f1f1f; border-color: rgba(31,31,31,.45) }
+  .cat-btn .cnt { font-size: 10px; opacity: .6; margin-left: 3px }
+
+  .tools { position: relative; z-index: 10; padding: 10px 0; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  .def-disc-btn, .rule-btn { font-size: 12px; font-weight: 600; padding: 7px 14px; border-radius: 10px;
+    border: 1px solid rgba(31,31,31,.22); background: rgba(255,255,255,.6); color: #1f1f1f; cursor: pointer; }
+  .def-disc-btn:hover, .rule-btn:hover { background: rgba(31,31,31,.09); }
+  .tools .hint { font-size: 11px; color: rgba(31,31,31,.62); }
+  .search { flex: 0 0 300px; margin-left: auto; padding: 8px 14px; border-radius: 10px; font-size: 13px;
+    border: 1px solid rgba(31,31,31,.16); background: rgba(255,255,255,.7); color: #1f1f1f; outline: none; }
+  .search:focus { border-color: rgba(31,31,31,.45) }
+
+  .table-outer { background: rgba(255,255,255,.55); backdrop-filter: blur(10px);
+    border: 1px solid rgba(31,31,31,.09); border-radius: 12px; overflow: auto; max-height: calc(100vh - 210px); }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  thead th { background: rgba(255,255,255,.9); backdrop-filter: blur(16px); padding: 9px 8px; text-align: center;
+    font-size: 10px; font-weight: 500; color: rgba(31,31,31,.62); letter-spacing: .07em; text-transform: uppercase;
+    white-space: nowrap; position: sticky; top: 0; z-index: 10; border-bottom: 1px solid rgba(31,31,31,.09); cursor: help; }
+  thead th:first-child { text-align: left; padding-left: 14px; }
+  thead th .sub { display: block; font-size: 9px; font-weight: 400; letter-spacing: 0; text-transform: none; opacity: .45; margin-top: 2px; }
+  tbody td { padding: 8px 8px; border-bottom: 1px solid rgba(31,31,31,.07); text-align: center; vertical-align: middle; color: #1f1f1f; }
+  tbody td:first-child { text-align: left; padding-left: 14px; font-weight: 500; }
+  .rg2 td { background: rgba(143,233,0,.35) } .rg1 td { background: rgba(76,187,23,.3) }
+  .ro td { background: rgba(255,204,0,.32) } .rr td { background: rgba(221,0,4,.1) }
+  .rgr td { background: rgba(255,255,255,.55); opacity: .5 }
+  .rld td { background: rgba(255,255,255,.6); opacity: .72 }
+  .rg2:hover td { background: rgba(143,233,0,.5) } .rg1:hover td { background: rgba(76,187,23,.42) }
+  .ro:hover td { background: rgba(255,204,0,.44) } .rr:hover td { background: rgba(221,0,4,.16) }
+  tr.grp td { background: rgba(255,255,255,.8); font-size: 10.5px; font-weight: 600; letter-spacing: .07em;
+    text-transform: uppercase; color: rgba(31,31,31,.55); text-align: left; padding: 9px 14px; }
+  .nb { font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .nbig { font-weight: 700; font-size: 13px; }
+  .retail { font-size: 9px; opacity: .55; margin-top: 2px; }
+  .subdate { font-size: 9px; opacity: .55; margin-top: 2px; }
+  .zbar { position: relative; width: 84px; height: 20px; border-radius: 4px; overflow: hidden; background: rgba(255,255,255,.7); margin: 0 auto }
+  .zfill { position: absolute; left: 0; top: 0; height: 100%; border-radius: 4px }
+  .ztxt { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 10px; font-weight: 700 }
+  .disc-in { width: 54px; padding: 4px 5px; text-align: center; font-size: 12px; font-weight: 600;
+    border: 1px solid rgba(31,31,31,.16); border-radius: 8px; background: rgba(255,255,255,.7); outline: none; }
+  .disc-in:focus { border-color: rgba(31,31,31,.45); }
+  .disc-in.has { background: rgba(143,233,0,.3); }
+  .arch-btn, .unarch-btn { font-size: 10px; font-weight: 600; padding: 3px 9px; border-radius: 9px;
+    border: 1px solid rgba(31,31,31,.22); background: rgba(255,255,255,.6); color: #434446; cursor: pointer; white-space: nowrap; }
+  .arch-btn:hover { background: rgba(221,0,4,.12); }
+  .unarch-btn:hover { background: rgba(76,187,23,.25); }
+  .arch-title { font-size: 12px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase;
+    color: rgba(31,31,31,.5); margin: 22px 0 8px; cursor: pointer; user-select: none; }
+  .loading { text-align: center; padding: 60px; color: rgba(31,31,31,.45); font-size: 13px }
+  .lowtag { display: inline-block; margin-left: 8px; padding: 1px 8px; border-radius: 10px;
+    background: rgba(31,31,31,.08); color: rgba(31,31,31,.6); font-size: 10px; font-weight: 700; }
+
+  /* модалка правила скидок */
+  .modal-bg { position: fixed; inset: 0; z-index: 300; background: rgba(31,31,31,.35); display: none; align-items: center; justify-content: center; }
+  .modal-bg.open { display: flex; }
+  .modal { background: #f7f0e9; border-radius: 14px; padding: 22px 26px; width: 560px; max-width: 94vw; max-height: 90vh; overflow: auto; }
+  .modal h3 { font-size: 15px; margin-bottom: 4px; }
+  .modal .msub { font-size: 11.5px; color: rgba(31,31,31,.6); margin-bottom: 14px; line-height: 1.5; }
+  .rule-grid { display: grid; grid-template-columns: 1fr 86px 86px; gap: 6px 10px; align-items: center; font-size: 12.5px; }
+  .rule-grid .hd { font-size: 10px; text-transform: uppercase; letter-spacing: .06em; color: rgba(31,31,31,.5); font-weight: 600; text-align: center; }
+  .rule-grid input { width: 100%; padding: 5px 7px; text-align: center; font-size: 12.5px; font-weight: 600;
+    border: 1px solid rgba(31,31,31,.18); border-radius: 8px; background: #fff; outline: none; }
+  .modal .row2 { display: flex; gap: 10px; align-items: center; margin-top: 14px; font-size: 12.5px; flex-wrap: wrap; }
+  .modal .row2 input { width: 70px; padding: 5px 7px; text-align: center; font-weight: 600;
+    border: 1px solid rgba(31,31,31,.18); border-radius: 8px; }
+  .modal .actions { display: flex; gap: 10px; margin-top: 18px; justify-content: flex-end; }
+</style>
+</head>
+<body>
+<div class="gradient-bg"></div>
+<div class="header">
+  <a class="logo" href="/turnover">ОБОРОТ</a>
+  <nav class="nav">
+    <a href="/turnover" class="primary-page active">Оборачиваемость</a>
+    <a href="/stocks">Активный сток</a>
+    <a href="/replenish">Заказ</a>
+    <a href="/sizes">Размеры</a>
+    <a href="/budget">Бюджет</a>
+    <a href="/forecast">Прогноз</a>
+    <a href="/revenue">Оборот</a>
+    <a href="/discounts">Скидки</a>
+    <a href="/orders">Заказы</a>
+    <a href="/settings">Настройки</a>
+  </nav>
+</div>
+
+<div class="cat-bar" id="cat-bar"><span style="font-size:12px;color:rgba(31,31,31,.4)">Загрузка...</span></div>
+
+<div class="main">
+  <details class="note">
+    <summary>Как читать эту таблицу и что означают колонки</summary>
+    <div class="body">
+      <p><b>Оборачиваемость</b> — главный показатель успешности вещи: сколько рублей она приносит в день, когда есть в наличии (нетто-выручка за год ÷ дни в стоке). По ней отсортирована таблица и раскрашены строки: <b>тёмно-зелёный</b> — бестселлер (≥ 5 000 ₽/день), <b>зелёный</b> — хороший (2 000–5 000), <b>жёлтый</b> — медленный (1 000–2 000), <b>красный</b> — слабый (&lt; 1 000). Пороги настраиваются в <a href="/settings">Настройках</a>.</p>
+      <p><b>Дней в стоке</b> — сколько дней вещь реально была в наличии за год. Это индикатор доверия: статистике вещи, пробывшей в стоке больше полугода, можно верить; вещь, распроданная за 15 дней, не показательна.
+      Днём «в стоке» считается день с остатком не меньше <input id="minstock-in" type="number" min="0" max="100" style="width:52px;padding:2px 5px;border:1px solid rgba(31,31,31,.25);border-radius:6px;text-align:center;font-weight:600;"> шт
+      <button class="rule-btn" id="minstock-save" style="padding:3px 10px;font-size:11px;">сохранить</button>.
+      Отсекая дни с последними парой штук, вы видите честный темп: «хвост» из одного размера продаётся медленно и занижал бы показатель. Поставьте 0, чтобы считать любой день наличия.</p>
+      <p><b>Ср. цена продажи</b> — реальная средняя цена (после всех скидок), под ней серым номинал. <b>Факт. скидка</b> — насколько реальная цена ниже номинала: видно, продаётся ли вещь без скидок.</p>
+      <p><b>Зима/Весна/Лето/Осень</b> — оборачиваемость по сезонам (выручка сезонных месяцев ÷ дни в стоке в них). 0 — по этому сезону статистики нет. Так видно, сезонная вещь или круглогодичная.</p>
+      <p><b>Запас</b> — на сколько дней хватит остатка при текущем темпе, и дата, когда он кончится. <b>Сток на 90 дней</b> — запас в процентах от 90-дневной нормы: около 100% — идеально, сильно больше — затоварка, меньше 30% — скоро дефицит. <b>Недостаток</b> — сколько штук не хватает до нормы 90 дней.</p>
+      <p><b>Скидка, %</b> — ручная скидка для распродажи: сохраняется, попадает в отчёт «Скидки» и в печатный прайс. Кнопка <b>«Дефолтные скидки»</b> сбрасывает все ручные и расставляет по правилу (настраивается кнопкой «Правило…»). <b>«в архив»</b> — для вещей, которые больше никогда не переразместятся: они исчезают из рекомендаций заказа, бюджета и прогноза.</p>
+      <p>Позиции с <b>малой статистикой</b> (мало дней в стоке или единичные продажи) и <b>без продаж за год</b> показаны отдельными блоками внизу — их цифры не рейтинг, а справка.</p>
     </div>
-    <div class="chips" id="cat-chips"></div>
-    <div class="spacer" style="flex:1;"></div>
-    <label class="toggle-line" id="arch-wrap" style="display:none;">
-      <input type="checkbox" id="show-archived"> показать архивные
-    </label>
-    <button class="btn" type="button" id="btn-def-disc" title="Сбросит все ручные скидки и расставит заново по правилу от текущей оборачиваемости и запаса">Дефолтные скидки</button>
-    <a class="btn" href="/api/export/turnover.xlsx" download title="Выгрузить таблицу в Excel">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-      Скачать Excel
-    </a>
+  </details>
+
+  <div class="tools">
+    <button class="def-disc-btn" id="defDiscBtn">Дефолтные скидки</button>
+    <button class="rule-btn" id="ruleBtn" title="Изменить проценты и пороги правила дефолтных скидок">Правило…</button>
+    <span class="hint">сбросит ручные скидки и расставит по правилу от текущей оборачиваемости</span>
+    <input class="search" id="search" placeholder="Поиск по всем категориям...">
   </div>
-  <div class="tbl-wrap">
-    <table class="tbl">
-      <thead id="thead">
+
+  <div class="table-outer">
+    <table id="mt">
+      <thead>
         <tr>
-          <th data-sort="base_name" data-sort-dir="asc">Позиция</th>
-          <th data-sort="cls" style="width:60px;">Класс</th>
-          <th class="num" data-sort="dis" title="Дней в стоке за 365 дней (остаток ≥ порога)">Дней в стоке</th>
-          <th class="num" data-sort="nq" title="Нетто продано, шт (минус возвраты)">Продано, шт</th>
-          <th class="num" data-sort="nr" title="Нетто-выручка за 365 дней">Выручка, ₽</th>
-          <th class="num" data-sort="turnover">Оборач., ₽/день</th>
-          <th class="num" data-sort="sea_winter" title="Оборачиваемость в зимние месяцы (дек–фев): выручка этих месяцев / дни в стоке в них. 0 — по сезону нет статистики">Зима</th>
-          <th class="num" data-sort="sea_spring" title="Оборачиваемость в весенние месяцы (мар–май). 0 — по сезону нет статистики">Весна</th>
-          <th class="num" data-sort="sea_summer" title="Оборачиваемость в летние месяцы (июн–авг). 0 — по сезону нет статистики">Лето</th>
-          <th class="num" data-sort="sea_autumn" title="Оборачиваемость в осенние месяцы (сен–ноя). 0 — по сезону нет статистики">Осень</th>
-          <th class="num" data-sort="avg_price" title="Средняя фактическая цена продажи против номинала">Цена/номинал</th>
-          <th class="num" data-sort="discount_fact" title="Фактическая скидка: насколько реальная средняя цена продажи ниже номинала">Факт. скидка</th>
-          <th class="num" data-sort="_disc" style="width:76px;" title="Ручная скидка для распродажи, %. Сохраняется и попадает в отчёт «Скидки» с приоритетом над рекомендацией. Кнопка «Дефолтные скидки» расставляет по правилу">Скидка, %</th>
-          <th class="num" data-sort="cs">Остаток</th>
-          <th class="num" data-sort="wos" title="Недель покрытия текущим остатком">Покрытие, нед</th>
+          <th title="Название позиции. Поиск пословный: «худи скетч» найдёт все худи «Скетч»">Название</th>
+          <th title="Сколько дней вещь была в наличии за год (с остатком не меньше порога). Больше полугода — данным можно доверять">Дней<br><span class="sub">в стоке</span></th>
+          <th title="Средняя реальная цена продажи после скидок; серым — номинальная розничная цена">Ср. цена<br><span class="sub">продажи</span></th>
+          <th title="Главный показатель: нетто-выручка за год ÷ дни в стоке, ₽/день">Оборач.<br><span class="sub">за год</span></th>
+          <th title="Оборачиваемость в декабре–феврале. 0 — нет статистики по сезону">Зима<br><span class="sub">₽/день</span></th>
+          <th title="Оборачиваемость в марте–мае">Весна<br><span class="sub">₽/день</span></th>
+          <th title="Оборачиваемость в июне–августе">Лето<br><span class="sub">₽/день</span></th>
+          <th title="Оборачиваемость в сентябре–ноябре">Осень<br><span class="sub">₽/день</span></th>
+          <th title="Текущий остаток по всем складам, шт">Остаток<br><span class="sub">шт</span></th>
+          <th title="На сколько дней хватит остатка при текущем темпе, и дата окончания">Запас<br><span class="sub">дней</span></th>
+          <th title="Запас в процентах от нормы 90 дней: ~100% идеально, больше — затоварка">Сток на<br><span class="sub">90 дней</span></th>
+          <th title="Сколько штук не хватает, чтобы заполнить сток на следующие 90 дней">Недостаток<br><span class="sub">шт</span></th>
+          <th title="Насколько средняя реальная цена ниже номинала — продаётся ли вещь без скидок">Факт. скидка<br><span class="sub">от розницы</span></th>
+          <th title="Ручная скидка для распродажи. Сохраняется и попадает в отчёт «Скидки»">Скидка<br><span class="sub">%</span></th>
+          <th></th>
         </tr>
       </thead>
-      <tbody id="tbody">
-        <tr><td colspan="15"><div class="loading-stub">Загрузка…</div></td></tr>
-      </tbody>
-      <tfoot id="tfoot" style="display:none;">
-        <tr>
-          <td id="f-count"></td><td></td><td></td>
-          <td class="num" id="f-nq"></td>
-          <td class="num" id="f-nr"></td>
-          <td class="num" id="f-turnover"></td>
-          <td></td><td></td><td></td><td></td>
-          <td></td><td></td><td></td>
-          <td class="num" id="f-cs"></td>
-          <td></td>
-        </tr>
-      </tfoot>
+      <tbody id="tb"><tr><td colspan="15" class="loading">Загружаю данные...</td></tr></tbody>
     </table>
+  </div>
+
+  <div class="arch-title" onclick="var w=document.getElementById('archwrap');var o=w.style.display==='none';w.style.display=o?'':'none';document.getElementById('archarrow').textContent=o?'▾':'▸';"><span id="archarrow">▸</span> Архив <span id="acnt" style="opacity:.6"></span></div>
+  <div id="archwrap" style="display:none">
+    <div class="table-outer" style="max-height:50vh">
+      <table><tbody id="atb"><tr><td class="loading">Архив пуст</td></tr></tbody></table>
+    </div>
   </div>
 </div>
 
-{% endblock %}
+<!-- Модалка «Правило скидок» -->
+<div class="modal-bg" id="rule-modal">
+  <div class="modal">
+    <h3>Правило дефолтных скидок</h3>
+    <div class="msub">Скидка зависит от успешности вещи (оборачиваемость) и от затоварки (запас в днях). Кнопка «Дефолтные скидки» расставляет проценты по этому правилу. Логика: чем хуже продаётся и чем больше запас — тем глубже скидка. Новинки без затоварки и бестселлеры с малым запасом скидку не получают — они продадутся сами.</div>
+    <div class="rule-grid" id="rule-grid">
+      <div></div><div class="hd">запас меньше</div><div class="hd">затоварка</div>
+      <div>Новинка (в стоке меньше <input id="r-new_days" style="width:52px;display:inline-block;"> дн)</div>
+      <div><input id="r-new_pct_zero" value="0" disabled title="Новинка без затоварки не уценяется"></div>
+      <div><input id="r-new_pct"></div>
+      <div>Топ продаж (оборач. больше <input id="r-top_turnover" style="width:64px;display:inline-block;"> ₽/день)</div>
+      <div><input id="r-top_pct"></div>
+      <div><input id="r-top_over_pct"></div>
+      <div>Средние (от <input id="r-mid_turnover" style="width:64px;display:inline-block;"> ₽/день)</div>
+      <div><input id="r-mid_pct"></div>
+      <div><input id="r-mid_over_pct"></div>
+      <div>Слабые и без продаж</div>
+      <div><input id="r-weak_pct"></div>
+      <div><input id="r-weak_over_pct"></div>
+    </div>
+    <div class="row2">Затоварка — это запас от <input id="r-overstock_days"> дней и больше. Нет остатка — скидка не ставится.</div>
+    <div class="actions">
+      <button class="rule-btn" id="rule-reset">Вернуть значения по умолчанию</button>
+      <button class="rule-btn" id="rule-cancel">Отмена</button>
+      <button class="def-disc-btn" id="rule-save">Сохранить правило</button>
+    </div>
+  </div>
+</div>
 
-{% block scripts %}
 <script>
-document.addEventListener("DOMContentLoaded", function () {
-  var items = [];
-  var state = { sortKey: "turnover", sortDir: -1, query: "", cat: "", cls: "", archived: false };
-  var tbody = document.getElementById("tbody");
+let ITEMS = [], DISC = {}, RULE = null, RULE_DEFAULTS = null, MIN_STOCK = 3;
+let currentCat = null, CATS = [];
 
-  // Группа позиции (правила legacy-таблицы CC): рейтинг → мало данных → без продаж.
-  function groupOf(it) {
-    if (it.group) return it.group;
-    if ((it.nr || 0) <= 0 && (it.nq || 0) <= 0) return "no_sales";
-    if (it.low_data) return "low_data";
-    return "rank";
+function mw(name,q){ if(!q) return true; const nl=name.toLowerCase(); return q.toLowerCase().split(/\s+/).every(w=>nl.includes(w)); }
+function fmt(n){ if(!n&&n!==0) return "—"; return Math.round(n).toLocaleString("ru-RU") }
+async function api(url, opts){
+  const o = opts||{};
+  const r = await fetch(url, { method:o.method||"GET",
+    headers:{"Content-Type":"application/json","X-Oborot-CSRF":"1"},
+    body:o.body?JSON.stringify(o.body):undefined });
+  if(!r.ok) throw new Error("HTTP "+r.status);
+  return r.json();
+}
+
+function derive(it){
+  const rate = it.rate||0;
+  it.sup = rate>0 ? Math.round(it.cs/rate) : null;
+  it.zat = it.sup!==null ? Math.round(it.sup/90*100) : null;
+  it.defq = Math.max(0, Math.round(rate*90)-it.cs);
+  return it;
+}
+function rowCls(it){
+  if(it.group==="no_sales") return "rgr";
+  if(it.group==="low_data") return "rld";
+  return {best:"rg2",good:"rg1",dull:"ro",weak:"rr"}[it.cls]||"rr";
+}
+function zatStyle(p){
+  if(p===null) return ["rgba(31,31,31,0.08)","—","rgba(31,31,31,0.4)"];
+  if(p<=30) return ["rgba(221,0,4,0.5)",p+"%","#7a0002"];
+  if(p<=100) return ["#4b7a00",p+"%","#f3e9e0"];
+  if(p<=150) return ["#b99a00",p+"%","#f3e9e0"];
+  return ["#dd0004",p+"%","#f3e9e0"];
+}
+function realDisc(it){
+  if(it.discount_fact===null||it.discount_fact===undefined) return '<span style="opacity:.3">—</span>';
+  const p=Math.round(it.discount_fact*100);
+  let c='#434446'; if(p>=30)c='#a00003'; else if(p>=15)c='#7a6400'; else if(p<=0)c='#2a5c10';
+  return '<span style="font-weight:700;color:'+c+'">'+(p>0?('−'+p+'%'):(p===0?'0%':('+'+(-p)+'%')))+'</span>';
+}
+function esc(s){ return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/"/g,"&quot;"); }
+
+function buildTabs(){
+  const cnt={};
+  for(const it of ITEMS){ if(it.hidden) continue; cnt[it.category]=(cnt[it.category]||0)+1; }
+  CATS = Object.keys(cnt).sort((a,b)=>cnt[b]-cnt[a]);
+  if(currentCat===null||!cnt[currentCat]) currentCat = CATS[0]||null;
+  document.getElementById("cat-bar").innerHTML = CATS.map(c=>
+    '<button class="cat-btn '+(c===currentCat?"active":"")+'" data-cat="'+esc(c)+'">'+esc(c)+'<span class="cnt">'+cnt[c]+'</span></button>'
+  ).join("");
+  document.querySelectorAll("#cat-bar .cat-btn").forEach(b=>b.addEventListener("click",()=>{
+    currentCat=b.getAttribute("data-cat"); buildTabs(); render();
+  }));
+}
+
+function rowHtml(it, arch){
+  const cls=rowCls(it);
+  const [zc,zl,zt]=zatStyle(it.zat);
+  const low = it.group==="low_data";
+  const name = esc(it.base_name) + (low?'<span class="lowtag" title="Меньше '+14+' дней в стоке или меньше 3 продаж — цифрам пока нельзя доверять">мало данных</span>':'');
+  const showTurn = it.group==="rank";
+  const sellDate = it.sup!==null&&it.sup>0&&it.stockout_date
+    ? '<div class="subdate">до '+new Date(it.stockout_date).toLocaleDateString("ru-RU",{day:"numeric",month:"long",year:"numeric"})+'</div>' : '';
+  const dv = DISC[it.base_name];
+  return '<tr class="'+cls+'">'+
+    '<td>'+name+'</td>'+
+    '<td class="nb">'+it.dis+(it.dis>=183?' <span title="Больше полугода в стоке — данным можно доверять" style="opacity:.55;font-size:10px;">✓</span>':'')+'</td>'+
+    '<td class="nb">'+(it.avg_price?fmt(it.avg_price)+' ₽':'—')+'<div class="retail">розн. '+fmt(it.sale_price)+' ₽</div></td>'+
+    '<td class="nb nbig">'+(showTurn?fmt(it.turnover):'<span title="Мало статистики — оборачиваемость была бы шумом" style="opacity:.4">—</span>')+'</td>'+
+    '<td class="nb">'+(showTurn?fmt((it.sea||{}).winter):'—')+'</td>'+
+    '<td class="nb">'+(showTurn?fmt((it.sea||{}).spring):'—')+'</td>'+
+    '<td class="nb">'+(showTurn?fmt((it.sea||{}).summer):'—')+'</td>'+
+    '<td class="nb">'+(showTurn?fmt((it.sea||{}).autumn):'—')+'</td>'+
+    '<td class="nb nbig">'+it.cs+'</td>'+
+    '<td class="nb">'+(it.sup!==null?it.sup+' дн'+sellDate:'—')+'</td>'+
+    '<td><div class="zbar"><div class="zfill" style="width:'+Math.min(it.zat||0,100)+'%;background:'+zc+'"></div><div class="ztxt" style="color:'+zt+'">'+zl+'</div></div></td>'+
+    '<td class="nb"><span style="font-size:11px;font-weight:600">'+it.defq+'</span></td>'+
+    '<td>'+realDisc(it)+'</td>'+
+    '<td><input class="disc-in'+(dv?' has':'')+'" data-base="'+esc(it.base_name)+'" value="'+(dv?Math.round(dv):'')+'" placeholder="—" inputmode="numeric"></td>'+
+    '<td><button class="'+(arch?'unarch-btn':'arch-btn')+'" data-base="'+esc(it.base_name)+'">'+(arch?'вернуть':'в архив')+'</button></td>'+
+    '</tr>';
+}
+
+function render(){
+  const q=(document.getElementById("search").value||"").toLowerCase();
+  const tb=document.getElementById("tb");
+  const items = ITEMS.filter(it=>!it.hidden && (q?mw(it.base_name,q):it.category===currentCat));
+  if(!items.length){ tb.innerHTML='<tr><td colspan="15" class="loading">Нет данных</td></tr>'; return; }
+  const groups = [
+    ["rank", null],
+    ["low_data", "Мало данных — новинки и единичные продажи: цифры справочные"],
+    ["no_sales", "Без продаж за год"],
+  ];
+  let html = "";
+  for(const [g,label] of groups){
+    const part = items.filter(it=>it.group===g);
+    if(!part.length) continue;
+    if(label) html += '<tr class="grp"><td colspan="15">'+label+' · '+part.length+'</td></tr>';
+    html += part.map(it=>rowHtml(it,false)).join("");
   }
-  var GROUP_TITLES = {
-    low_data: "Мало данных — новинки и единичные продажи: оборачиваемости пока нельзя доверять",
-    no_sales: "Без продаж за 365 дней"
-  };
+  tb.innerHTML = html;
+  renderArchive(q);
+}
 
-  var DISC = {}; // ручные скидки {base: pct}
+function renderArchive(q){
+  const atb=document.getElementById("atb");
+  const items = ITEMS.filter(it=>it.hidden && (!q||mw(it.base_name,q)));
+  document.getElementById("acnt").textContent = items.length ? ("· "+items.length+" позиций") : "";
+  atb.innerHTML = items.length ? items.map(it=>rowHtml(it,true)).join("")
+    : '<tr><td class="loading">Архив пуст</td></tr>';
+}
 
-  Promise.all([
-    api("/api/turnover"),
-    api("/api/discount-overrides").catch(function () { return {}; })
-  ]).then(function (res) {
-    var d = res[0];
-    DISC = res[1] || {};
-    items = d.items || [];
-    // Плоские ключи: сезоны и ручная скидка — для сортировки по заголовкам.
-    items.forEach(function (it) {
-      var s = it.sea || {};
-      it.sea_winter = s.winter || 0; it.sea_spring = s.spring || 0;
-      it.sea_summer = s.summer || 0; it.sea_autumn = s.autumn || 0;
-      it._disc = DISC[it.base_name] || 0;
-    });
-    initClsCards();
-    renderClsStrip();
-    renderChips();
-    if (items.some(function (it) { return it.archived; })) {
-      document.getElementById("arch-wrap").style.display = "";
-    }
-    renderTable();
-  }).catch(function () {
-    tbody.innerHTML = '<tr><td colspan="15">' +
-      emptyState("Не удалось загрузить данные", "Обновите страницу или попробуйте позже.",
-        '<button class="btn" onclick="location.reload()">Обновить</button>') + "</td></tr>";
-  });
-
-  // Карточки классов как в исходной таблице CC: остаток шт + денежный запас
-  // (остаток × средняя реальная цена) + число моделей. Считаются по текущей
-  // категории-чипу (правило legacy: сводка и по всему стоку, и по категории).
-  // Клик по карточке — фильтр таблицы по классу.
-  function renderClsStrip() {
-    var agg = {
-      weak: { n: 0, q: 0, m: 0 }, dull: { n: 0, q: 0, m: 0 },
-      good: { n: 0, q: 0, m: 0 }, best: { n: 0, q: 0, m: 0 }
-    };
-    items.forEach(function (it) {
-      if (it.archived || groupOf(it) !== "rank" || !agg[it.cls]) return;
-      if (state.cat && it.category !== state.cat) return;
-      var a = agg[it.cls];
-      a.n++;
-      a.q += it.cs || 0;
-      a.m += (it.cs || 0) * (it.avg_price || it.sale_price || 0);
-    });
-    var scope = state.cat ? " · " + state.cat : "";
-    ["weak", "dull", "good", "best"].forEach(function (c) {
-      var a = agg[c];
-      document.getElementById("cnt-" + c).textContent = fmtInt(a.q) + " шт";
-      document.getElementById("sub-" + c).innerHTML =
-        '<span class="m-money">≈ ' + fmtMoney(a.m) + "</span><br>" +
-        fmtInt(a.n) + " " + plural(a.n, "модель", "модели", "моделей") + esc(scope);
-    });
+/* ── события таблицы ── */
+document.addEventListener("click", async e=>{
+  const t=e.target;
+  if(t.classList&&(t.classList.contains("arch-btn")||t.classList.contains("unarch-btn"))){
+    const base=t.getAttribute("data-base"), hide=t.classList.contains("arch-btn");
+    try{ await api("/api/hidden",{method:"POST",body:{base_name:base,hidden:hide}});
+      ITEMS.forEach(it=>{ if(it.base_name===base) it.hidden=hide; });
+      buildTabs(); render();
+    }catch(err){ alert("Не сохранилось: "+err.message); }
   }
-
-  function initClsCards() {
-    document.querySelectorAll(".cls-card").forEach(function (card) {
-      card.addEventListener("click", function () {
-        var c = card.getAttribute("data-cls");
-        state.cls = state.cls === c ? "" : c;
-        document.querySelectorAll(".cls-card").forEach(function (x) {
-          x.classList.toggle("active", x.getAttribute("data-cls") === state.cls);
-        });
-        renderTable();
-      });
-    });
-  }
-
-  function renderChips() {
-    var counts = {};
-    items.forEach(function (it) { if (!it.archived) counts[it.category] = (counts[it.category] || 0) + 1; });
-    var cats = Object.keys(counts).sort(function (a, b) { return a.localeCompare(b, "ru"); });
-    var box = document.getElementById("cat-chips");
-    if (cats.length < 2) return;
-    var total = items.filter(function (it) { return !it.archived; }).length;
-    box.innerHTML = '<button class="chip active" data-cat="">Все<span class="cnt">' + total + "</span></button>" +
-      cats.map(function (c) {
-        return '<button class="chip" data-cat="' + esc(c) + '">' + esc(c) + '<span class="cnt">' + counts[c] + "</span></button>";
-      }).join("");
-    box.querySelectorAll(".chip").forEach(function (chip) {
-      chip.addEventListener("click", function () {
-        state.cat = chip.getAttribute("data-cat");
-        box.querySelectorAll(".chip").forEach(function (x) { x.classList.remove("active"); });
-        chip.classList.add("active");
-        renderClsStrip();
-        renderTable();
-      });
-    });
-  }
-
-  function discountCell(df) {
-    if (df === null || df === undefined) return '<td class="num muted">—</td>';
-    var cls = df >= 0.3 ? "txt-red" : df >= 0.15 ? "txt-yellow" : df <= 0 ? "txt-green" : "";
-    return '<td class="num ' + cls + '">' + fmtPct(df) + "</td>";
-  }
-
-  // Сезонная оборачиваемость (правило legacy): 4 колонки Зима/Весна/Лето/Осень.
-  // У шумовых групп числа скрыты (были бы шумом), 0 = «по сезону нет статистики».
-  function seaCells(it) {
-    if (groupOf(it) !== "rank") {
-      return '<td class="num muted">—</td>'.repeat(4);
-    }
-    return ["sea_winter", "sea_spring", "sea_summer", "sea_autumn"].map(function (k) {
-      var v = it[k] || 0;
-      return '<td class="num' + (v ? "" : " muted") + '">' + (v ? fmtInt(v) : "0") + "</td>";
-    }).join("");
-  }
-
-  function rowHtml(it, dim) {
-    return '<tr class="' + (dim ? "row-dim" : rowTint(it)) + '">' +
-      '<td class="name-cell"><div class="name-main">' + esc(it.base_name) +
-        (it.archived ? ' <span class="badge gray">архив</span>' : "") +
-        '</div><div class="name-sub">' + esc(it.category || "") + "</div></td>" +
-      "<td>" + (groupOf(it) === "no_sales"
-        ? '<span class="badge gray" title="За 365 дней не продано ни одной штуки">без продаж</span>'
-        : it.low_data
-        ? '<span class="badge gray" title="Меньше 14 дней в стоке или меньше 3 продаж за год — оборачиваемости пока нельзя доверять">мало данных</span>'
-        : clsDot(it.cls)) + "</td>" +
-      '<td class="num muted" title="' + (it.dis >= 183
-        ? "Больше полугода в стоке — метрикам можно доверять"
-        : "Меньше полугода в стоке — делайте поправку: вещь, распроданная за пару недель, по цифрам не показательна") + '">' +
-        fmtInt(it.dis) + (it.dis >= 183 ? ' <span class="muted" style="font-size:10px;">✓</span>' : "") + "</td>" +
-      '<td class="num">' + fmtInt(it.nq) + "</td>" +
-      '<td class="num">' + fmtInt(it.nr) + "</td>" +
-      '<td class="num">' + (groupOf(it) === "rank"
-        ? "<b>" + fmtInt(it.turnover) + "</b>"
-        : '<span class="muted" title="Оборачиваемость не показывается: мало статистики, число было бы шумом">—</span>') + "</td>" +
-      seaCells(it) +
-      '<td class="num">' + fmtInt(it.avg_price) + ' <span class="muted">/ ' + fmtInt(it.sale_price) + "</span></td>" +
-      discountCell(it.discount_fact) +
-      '<td class="num"><input class="input sm num disc-in" type="number" min="0" max="99" step="1" ' +
-        'style="width:58px;' + (DISC[it.base_name] ? " background:rgba(122,162,255,.18);" : "") + '" ' +
-        'data-base="' + esc(it.base_name) + '" value="' + (DISC[it.base_name] || "") + '" placeholder="—"></td>' +
-      '<td class="num' + ((it.cs || 0) === 0 && it.nq > 0 ? " txt-red" : "") + '">' + fmtInt(it.cs) + "</td>" +
-      '<td class="num">' + ((it.cs || 0) > 0
-        ? covBar(it.wos) + (it.wos && it.stockout_date
-          ? '<div class="muted" style="font-size:10px; margin-top:2px;" title="Запас в днях при текущем темпе и дата, когда остаток закончится">≈ ' +
-            fmtInt(it.wos * 7) + " дн · до " + fmtDate(it.stockout_date) + "</div>"
-          : "")
-        : '<span class="muted">—</span>') + "</td>" +
-      "</tr>";
-  }
-
-  function renderTable() {
-    var arr = items.filter(function (it) {
-      if (it.archived && !state.archived) return false;
-      if (state.cat && it.category !== state.cat) return false;
-      if (state.cls && (groupOf(it) !== "rank" || it.cls !== state.cls)) return false;
-      return wordMatch(it.base_name, state.query);
-    });
-
-    if (!arr.length) {
-      tbody.innerHTML = '<tr><td colspan="15">' + (items.length
-        ? emptyState("Ничего не найдено", "Попробуйте изменить запрос или сбросить фильтры.", "")
-        : emptyState("Данных пока нет", "Подключите источник данных, чтобы увидеть оборачиваемость ассортимента.",
-            '<a class="btn primary" href="/onboarding">Подключить данные</a>')) + "</td></tr>";
-      document.getElementById("tfoot").style.display = "none";
-      return;
-    }
-
-    // Правило исходной таблицы CC: рейтинг сверху, «мало данных» и «без продаж» —
-    // всегда в конце, отдельными секциями. Сортировка колонок действует ВНУТРИ
-    // каждой секции и не перемешивает шум с рейтингом.
-    var html = "";
-    ["rank", "low_data", "no_sales"].forEach(function (g) {
-      var part = sortItems(arr.filter(function (it) { return groupOf(it) === g; }),
-                           state.sortKey, state.sortDir);
-      if (!part.length) return;
-      if (g !== "rank") {
-        html += '<tr class="grp-head"><td colspan="15">' + GROUP_TITLES[g] +
-          " · " + fmtInt(part.length) + " поз.</td></tr>";
-      }
-      html += part.map(function (it) { return rowHtml(it, g !== "rank"); }).join("");
-    });
-    tbody.innerHTML = html;
-
-    // ИТОГО: штуки/выручка/остаток — по всему показанному; оборачиваемость —
-    // только по рейтингу (сумма шума не имеет смысла).
-    var nq = 0, nr = 0, cs = 0, turn = 0;
-    arr.forEach(function (it) {
-      nq += it.nq || 0; nr += it.nr || 0; cs += it.cs || 0;
-      if (groupOf(it) === "rank") turn += it.turnover || 0;
-    });
-    document.getElementById("tfoot").style.display = "";
-    document.getElementById("f-count").textContent = "ИТОГО: " + fmtInt(arr.length) + " поз.";
-    document.getElementById("f-nq").textContent = fmtInt(nq);
-    document.getElementById("f-nr").textContent = fmtInt(nr);
-    document.getElementById("f-turnover").textContent = fmtInt(turn);
-    document.getElementById("f-cs").textContent = fmtInt(cs);
-  }
-
-  // Ручные скидки: сохранение по change (0/пусто = снять), делегированный обработчик.
-  tbody.addEventListener("change", function (e) {
-    var inp = e.target;
-    if (!inp.classList || !inp.classList.contains("disc-in")) return;
-    var base = inp.getAttribute("data-base");
-    var v = Math.round(Number(inp.value));
-    if (!isFinite(v) || v <= 0) { v = 0; inp.value = ""; }
-    else { v = Math.min(v, 99); inp.value = v; }
-    if (v > 0) DISC[base] = v; else delete DISC[base];
-    items.forEach(function (it) { if (it.base_name === base) it._disc = v; });
-    inp.style.background = v ? "rgba(122,162,255,.18)" : "";
-    api("/api/discount-overrides", { method: "POST", body: { base_name: base, discount: v } })
-      .catch(function () { toast("Не удалось сохранить скидку — проверьте соединение"); });
-  });
-
-  document.getElementById("btn-def-disc").addEventListener("click", function () {
-    if (!confirm("Все ручные скидки будут сброшены и расставлены заново по правилу от текущей оборачиваемости и запаса:\n\n· нет остатка — скидка не ставится\n· новинка (< 30 дн в стоке) — 10%\n· топ продаж (> 2000 ₽/день) — 15% / 20% при затоварке\n· средние (1000–2000) — 30% / 40%\n· слабые и без продаж — 50% / 60%\n\nПродолжить?")) return;
-    var btn = this;
-    btn.disabled = true; btn.textContent = "Сохраняю…";
-    api("/api/discount-overrides/defaults", { method: "POST" }).then(function (r) {
-      return api("/api/discount-overrides");
-    }).then(function (d) {
-      DISC = d || {};
-      items.forEach(function (it) { it._disc = DISC[it.base_name] || 0; });
-      renderTable();
-      btn.textContent = "✓ Скидки расставлены";
-      setTimeout(function () { btn.textContent = "Дефолтные скидки"; btn.disabled = false; }, 2000);
-    }).catch(function () {
-      toast("Не удалось расставить скидки (нужны права владельца)");
-      btn.textContent = "Дефолтные скидки"; btn.disabled = false;
-    });
-  });
-
-    var urlQ = new URLSearchParams(window.location.search).get("q");
-  if (urlQ) { document.getElementById("search").value = urlQ; state.query = urlQ.trim(); }
-  document.getElementById("search").addEventListener("input", debounce(function (e) {
-    state.query = e.target.value.trim();
-    renderTable();
-  }, 150));
-  document.getElementById("show-archived").addEventListener("change", function () {
-    state.archived = this.checked;
-    renderTable();
-  });
-  initSortHeaders(document.getElementById("thead"), state, renderTable);
 });
+document.addEventListener("change", async e=>{
+  const t=e.target;
+  if(!t.classList||!t.classList.contains("disc-in")) return;
+  const base=t.getAttribute("data-base");
+  let v=Math.round(parseFloat(String(t.value).replace(",",".").replace("%","")));
+  if(!isFinite(v)||v<=0){ v=0; t.value=""; delete DISC[base]; t.classList.remove("has"); }
+  else { v=Math.min(v,99); t.value=v; DISC[base]=v; t.classList.add("has"); }
+  try{ await api("/api/discount-overrides",{method:"POST",body:{base_name:base,discount:v}}); }
+  catch(err){ alert("Скидка не сохранилась — проверьте интернет"); }
+});
+document.getElementById("search").addEventListener("input",render);
+
+/* ── дефолтные скидки ── */
+document.getElementById("defDiscBtn").addEventListener("click", async function(){
+  if(!confirm("Все ручные скидки будут сброшены и расставлены по правилу. Продолжить?")) return;
+  const btn=this; btn.disabled=true; btn.textContent="Сохраняю…";
+  try{
+    await api("/api/discount-overrides/defaults",{method:"POST"});
+    DISC = await api("/api/discount-overrides");
+    render();
+    btn.textContent="✓ Скидки расставлены";
+    setTimeout(()=>{btn.textContent="Дефолтные скидки"; btn.disabled=false;},2000);
+  }catch(err){
+    alert("Не получилось (нужны права владельца)");
+    btn.textContent="Дефолтные скидки"; btn.disabled=false;
+  }
+});
+
+/* ── правило скидок ── */
+const RULE_FIELDS=["new_days","new_pct","top_turnover","top_pct","top_over_pct","mid_turnover","mid_pct","mid_over_pct","weak_pct","weak_over_pct","overstock_days"];
+function fillRule(r){ RULE_FIELDS.forEach(f=>{ document.getElementById("r-"+f).value=r[f]; }); }
+document.getElementById("ruleBtn").addEventListener("click",()=>{ if(RULE) fillRule(RULE); document.getElementById("rule-modal").classList.add("open"); });
+document.getElementById("rule-cancel").addEventListener("click",()=>document.getElementById("rule-modal").classList.remove("open"));
+document.getElementById("rule-reset").addEventListener("click",()=>{ if(RULE_DEFAULTS) fillRule(RULE_DEFAULTS); });
+document.getElementById("rule-save").addEventListener("click", async ()=>{
+  const body={};
+  RULE_FIELDS.forEach(f=>{ body[f]=Math.round(parseFloat(document.getElementById("r-"+f).value)||0); });
+  try{
+    const r=await api("/api/discount-rule",{method:"POST",body});
+    RULE=r.rule; document.getElementById("rule-modal").classList.remove("open");
+  }catch(err){ alert("Не сохранилось (правило меняет только владелец)"); }
+});
+
+/* ── порог «дня в стоке» ── */
+document.getElementById("minstock-save").addEventListener("click", async function(){
+  const v=Math.round(parseFloat(document.getElementById("minstock-in").value)||0);
+  const btn=this; btn.textContent="…";
+  try{
+    await api("/api/settings",{method:"POST",body:{min_stock_days:v}});
+    btn.textContent="✓ пересчитано"; setTimeout(()=>{btn.textContent="сохранить";},1500);
+    await load();
+  }catch(err){ alert("Не сохранилось (настройку меняет владелец)"); btn.textContent="сохранить"; }
+});
+
+async function load(){
+  const [t, d, r, s] = await Promise.all([
+    api("/api/turnover"), api("/api/discount-overrides").catch(()=>({})),
+    api("/api/discount-rule").catch(()=>null), api("/api/settings").catch(()=>null),
+  ]);
+  ITEMS=(t.items||[]).map(derive);
+  DISC=d||{};
+  if(r){ RULE=r.rule; RULE_DEFAULTS=r.defaults; }
+  if(s&&s.min_stock_days!==undefined){ MIN_STOCK=s.min_stock_days; document.getElementById("minstock-in").value=MIN_STOCK; }
+  buildTabs(); render();
+}
+load().catch(e=>{ document.getElementById("tb").innerHTML='<tr><td colspan="15" class="loading">Ошибка загрузки: '+e.message+'</td></tr>'; });
 </script>
-{% endblock %}
+</body>
+</html>

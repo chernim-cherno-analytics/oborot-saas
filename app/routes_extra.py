@@ -15,10 +15,12 @@ from sqlalchemy.orm import Session
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, select
 
+import json
+
 from app import analytics, analytics_extra, analytics_markdown, auth
 from app.auth import AuthContext, require_auth_api, require_owner_api
 from app.db import get_db
-from app.models import SkuDiscount
+from app.models import CategoryMerge, SkuCategoryOverride, SkuDiscount, SkuHidden
 
 router = APIRouter()
 
@@ -222,6 +224,153 @@ def api_sizes_calc(
     if result.get("error"):
         raise HTTPException(status_code=422, detail=result["error"])
     return result
+
+
+# ── «Активный сток» + архив + категории + правило скидок (порт legacy) ───────
+
+@router.get("/api/active-stock")
+def api_active_stock(ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)):
+    """Страница «Активный сток»: классы, склады, размеры, «Заказано», сигналы."""
+    snap = analytics.get_snapshot(db, ctx.org)
+    return analytics.build_active_stock(snap)
+
+
+class HiddenIn(BaseModel):
+    base_name: str = Field(min_length=1, max_length=255)
+    hidden: bool
+
+
+@router.get("/api/hidden")
+def api_hidden(ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)):
+    """Список позиций в архиве «Оборота» (кнопка «в архив» на Оборачиваемости)."""
+    rows = db.execute(
+        select(SkuHidden.base_name).where(SkuHidden.org_id == ctx.org.id)
+    ).scalars().all()
+    return {"hidden": rows}
+
+
+@router.post("/api/hidden")
+def api_set_hidden(
+    body: HiddenIn, ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)
+):
+    """Убрать в архив / вернуть из архива."""
+    row = db.get(SkuHidden, (ctx.org.id, body.base_name))
+    if body.hidden and row is None:
+        db.add(SkuHidden(org_id=ctx.org.id, base_name=body.base_name))
+    elif not body.hidden and row is not None:
+        db.delete(row)
+    db.commit()
+    analytics.invalidate(ctx.org.id)
+    return {"ok": True, "base_name": body.base_name, "hidden": body.hidden}
+
+
+class CategoryOverrideIn(BaseModel):
+    base_name: str = Field(min_length=1, max_length=255)
+    category: str = Field(default="", max_length=128)  # '' = вернуть категорию МС
+
+
+class CategoryMergeIn(BaseModel):
+    from_category: str = Field(min_length=1, max_length=128)
+    to_category: str = Field(default="", max_length=128)  # '' = отменить слияние
+
+
+@router.get("/api/categories")
+def api_categories(ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)):
+    """Пользовательские правила категорий: переносы позиций и слияния."""
+    overrides = dict(db.execute(
+        select(SkuCategoryOverride.base_name, SkuCategoryOverride.category)
+        .where(SkuCategoryOverride.org_id == ctx.org.id)
+    ).all())
+    merges = dict(db.execute(
+        select(CategoryMerge.from_category, CategoryMerge.to_category)
+        .where(CategoryMerge.org_id == ctx.org.id)
+    ).all())
+    return {"overrides": overrides, "merges": merges}
+
+
+@router.post("/api/categories/override")
+def api_category_override(
+    body: CategoryOverrideIn,
+    ctx: AuthContext = Depends(require_auth_api),
+    db: Session = Depends(get_db),
+):
+    """Перенести отдельную позицию в другую категорию ('' = сбросить)."""
+    row = db.get(SkuCategoryOverride, (ctx.org.id, body.base_name))
+    cat = body.category.strip()
+    if not cat:
+        if row is not None:
+            db.delete(row)
+    elif row is None:
+        db.add(SkuCategoryOverride(org_id=ctx.org.id, base_name=body.base_name, category=cat))
+    else:
+        row.category = cat
+    db.commit()
+    analytics.invalidate(ctx.org.id)
+    return {"ok": True, "base_name": body.base_name, "category": cat}
+
+
+@router.post("/api/categories/merge")
+def api_category_merge(
+    body: CategoryMergeIn,
+    ctx: AuthContext = Depends(require_auth_api),
+    db: Session = Depends(get_db),
+):
+    """Влить категорию в другую ('' = отменить слияние этой категории)."""
+    row = db.get(CategoryMerge, (ctx.org.id, body.from_category))
+    to = body.to_category.strip()
+    if not to or to == body.from_category:
+        if row is not None:
+            db.delete(row)
+        to = ""
+    elif row is None:
+        db.add(CategoryMerge(org_id=ctx.org.id, from_category=body.from_category, to_category=to))
+    else:
+        row.to_category = to
+    db.commit()
+    analytics.invalidate(ctx.org.id)
+    return {"ok": True, "from_category": body.from_category, "to_category": to}
+
+
+class DiscountRuleIn(BaseModel):
+    new_days: int = Field(ge=0, le=365)
+    new_pct: int = Field(ge=0, le=99)
+    top_turnover: int = Field(ge=0)
+    top_pct: int = Field(ge=0, le=99)
+    top_over_pct: int = Field(ge=0, le=99)
+    mid_turnover: int = Field(ge=0)
+    mid_pct: int = Field(ge=0, le=99)
+    mid_over_pct: int = Field(ge=0, le=99)
+    weak_pct: int = Field(ge=0, le=99)
+    weak_over_pct: int = Field(ge=0, le=99)
+    overstock_days: int = Field(ge=1, le=365)
+
+
+@router.get("/api/discount-rule")
+def api_discount_rule(ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)):
+    """Правило дефолтных скидок организации (+ дефолты для сброса)."""
+    return {
+        "rule": analytics.extra_settings(ctx.org)["discount_rule"],
+        "defaults": analytics.DEFAULT_DISCOUNT_RULE,
+    }
+
+
+@router.post("/api/discount-rule")
+def api_set_discount_rule(
+    body: DiscountRuleIn,
+    ctx: AuthContext = Depends(require_owner_api),
+    db: Session = Depends(get_db),
+):
+    """Сохранить правило дефолтных скидок (только владелец)."""
+    org = db.merge(ctx.org)
+    try:
+        data = json.loads(org.settings_json or "{}")
+    except ValueError:
+        data = {}
+    data["discount_rule"] = analytics._clean_discount_rule(body.model_dump())
+    org.settings_json = json.dumps(data, ensure_ascii=False)
+    db.commit()
+    analytics.invalidate(org.id)
+    return {"ok": True, "rule": data["discount_rule"]}
 
 
 # ── Экспорт в Excel (.xlsx) ──────────────────────────────────────────────────

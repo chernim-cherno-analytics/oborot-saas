@@ -1,189 +1,368 @@
-{% extends "base.html" %}
-{% block content %}
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>{{ org.name }} · Активный сток — Оборот</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0 }
+  body { font-family: Helvetica, 'Helvetica Neue', Arial, sans-serif; min-height: 100vh; background: #f3e9e0; color: #1f1f1f; }
+  .gradient-bg { position: fixed; inset: 0; z-index: 0; overflow: hidden; background: #f3e9e0; }
+  .gradient-bg::before, .gradient-bg::after { position: absolute; border-radius: 50%; filter: blur(90px); opacity: .9; content: ''; }
+  .gradient-bg::before { width: 70vw; height: 70vw; background: radial-gradient(circle,#efe5db,transparent 70%); top: -20%; left: -10%; }
+  .gradient-bg::after { width: 60vw; height: 60vw; background: radial-gradient(circle,#e2d8cf,transparent 70%); bottom: -15%; right: -10%; }
+  .header { position: sticky; top: 0; z-index: 200; padding: 0 28px; height: 56px; background: rgba(243,233,224,.85); backdrop-filter: blur(10px);
+    display: flex; align-items: center; justify-content: space-between; }
+  .logo { text-decoration: none; font-size: 15px; font-weight: 700; letter-spacing: .12em; color: #1f1f1f; }
+  .nav { display: flex; gap: 18px; flex-wrap: wrap; }
+  .nav a { font-size: 13px; color: rgba(31,31,31,.45); text-decoration: none; }
+  .nav a:hover { color: #434446 }
+  .nav a.active { color: #1f1f1f; font-weight: 700; }
+  .nav a.primary-page { font-weight: 700; }
+  .main { padding: 8px 28px 24px; max-width: 1500px; margin: 0 auto; position: relative; z-index: 3; }
 
-<p class="page-sub">Текущие остатки по активным складам. Раскройте строку, чтобы увидеть разбивку по размерам.</p>
+  details.note { margin: 10px 0 14px; border-radius: 12px; background: rgba(255,255,255,.6);
+    border: 1px solid rgba(31,31,31,.09); backdrop-filter: blur(10px); }
+  details.note summary { cursor: pointer; padding: 10px 16px; font-size: 12.5px; font-weight: 600; color: #434446; list-style: none; }
+  details.note summary::before { content: '▸ '; }
+  details.note[open] summary::before { content: '▾ '; }
+  details.note .body { padding: 0 18px 14px; font-size: 12.5px; color: #434446; line-height: 1.6; }
+  details.note .body p { margin: 6px 0; }
+  details.note .body b { color: #1f1f1f; }
+  .catset-row { display: flex; align-items: center; gap: 8px; margin: 4px 0; font-size: 12.5px; }
+  .catset-row select { padding: 4px 8px; border: 1px solid rgba(31,31,31,.2); border-radius: 8px; background: #fff; font-size: 12px; }
 
-<div class="card">
-  <div class="toolbar">
-    <div class="search-box">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.5" y2="16.5"/></svg>
-      <input class="input" type="search" id="search" placeholder="Поиск по названию…" autocomplete="off">
+  .cat-bar { position: relative; z-index: 10; padding: 12px 28px 0; display: flex; gap: 8px; flex-wrap: wrap; }
+  .cat-btn { font-size: 12px; font-weight: 500; padding: 5px 14px; border-radius: 20px;
+    border: 1px solid rgba(31,31,31,.09); background: rgba(255,255,255,.55); color: #434446; cursor: pointer; white-space: nowrap; }
+  .cat-btn:hover { background: rgba(31,31,31,.09); color: #1f1f1f }
+  .cat-btn.active { background: rgba(31,31,31,.16); color: #1f1f1f; border-color: rgba(31,31,31,.45) }
+  .cat-btn .cnt { font-size: 10px; opacity: .6; margin-left: 3px }
+  .cat-btn .warn-mark { color: #dd0004; font-weight: 700; margin-left: 4px }
+
+  .summary { display: grid; grid-template-columns: repeat(4,1fr); gap: 14px; margin-bottom: 16px; }
+  .sum-card { border-radius: 14px; padding: 16px 20px; backdrop-filter: blur(10px); border: 1px solid rgba(31,31,31,.07); }
+  .sum-card .lbl { font-size: 11px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; margin-bottom: 2px; }
+  .sum-card .cond { font-size: 10px; opacity: .55; margin-bottom: 8px; }
+  .sum-card .val { font-size: 26px; font-weight: 700; line-height: 1; }
+  .sum-card .sub { font-size: 11px; opacity: .55; margin-top: 6px; }
+  .sum-card .money { font-size: 15px; font-weight: 700; margin-top: 7px; }
+  .sc-best { background: rgba(143,233,0,.4) } .sc-good { background: rgba(76,187,23,.34) }
+  .sc-mid { background: rgba(255,204,0,.42) } .sc-bad { background: rgba(221,0,4,.12) }
+  .sc-best .lbl,.sc-best .money{color:#3c6300} .sc-good .lbl,.sc-good .money{color:#4b7a00}
+  .sc-mid .lbl,.sc-mid .money{color:#8a7b00} .sc-bad .lbl,.sc-bad .money{color:#dd0004}
+  .cat-sum-title { font-size: 11px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: rgba(31,31,31,.5); margin: 0 0 8px; }
+  #summary-cat .sum-card { padding: 12px 20px; } #summary-cat .val { font-size: 21px; }
+
+  .tools { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+  .search { flex: 0 0 320px; padding: 8px 14px; border-radius: 10px; font-size: 13px;
+    border: 1px solid rgba(31,31,31,.16); background: rgba(255,255,255,.7); outline: none; }
+  .search:focus { border-color: rgba(31,31,31,.45) }
+  .note-inline { font-size: 11px; color: rgba(31,31,31,.45) }
+
+  .twrap { background: rgba(255,255,255,.55); backdrop-filter: blur(10px);
+    border: 1px solid rgba(31,31,31,.09); border-radius: 12px; overflow: auto; max-height: calc(100vh - 300px); }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  thead th { background: rgba(255,255,255,.9); padding: 10px; text-align: center; font-size: 10px; font-weight: 500;
+    color: rgba(31,31,31,.62); letter-spacing: .07em; text-transform: uppercase; white-space: nowrap;
+    position: sticky; top: 0; z-index: 10; border-bottom: 1px solid rgba(31,31,31,.09); cursor: help; }
+  thead th:first-child { text-align: left; padding-left: 14px; }
+  thead th .sub { display: block; font-size: 9px; font-weight: 400; letter-spacing: 0; text-transform: none; opacity: .45; margin-top: 2px; }
+  tbody td { padding: 8px 10px; border-bottom: 1px solid rgba(31,31,31,.07); text-align: center; vertical-align: middle; }
+  tbody td:first-child { text-align: left; padding-left: 14px; font-weight: 500; }
+  tr.pr { cursor: pointer; }
+  .rg2 td { background: rgba(143,233,0,.35) } .rg1 td { background: rgba(76,187,23,.3) }
+  .ro td { background: rgba(255,204,0,.32) } .rr td { background: rgba(221,0,4,.1) }
+  .rgr td { background: rgba(255,255,255,.55); opacity: .5 }
+  .rg2:hover td { background: rgba(143,233,0,.5) } .rg1:hover td { background: rgba(76,187,23,.42) }
+  .ro:hover td { background: rgba(255,204,0,.44) } .rr:hover td { background: rgba(221,0,4,.16) }
+  tr.sr td { background: rgba(255,255,255,.78); padding: 5px 10px; font-size: 11.5px; color: #434446 }
+  tr.sr td:first-child { padding-left: 38px; font-style: italic; font-weight: 400; }
+  .ei { display: inline-block; width: 14px; font-size: 9px; color: rgba(31,31,31,.4); margin-right: 6px; transition: transform .15s; }
+  tr.pr.open .ei { transform: rotate(90deg); }
+  .qty { font-weight: 700; font-size: 13px; }
+  .qty.zero { opacity: .3; font-weight: 400; }
+  .alert { color: #dd0004; font-weight: 800; margin-left: 5px; font-size: 13px; }
+  .zero-cell { color: #dd0004; font-weight: 700; opacity: 1 }
+  .zd { display: inline-block; margin-left: 8px; padding: 1px 8px; border-radius: 10px;
+    background: rgba(221,0,4,.12); color: #dd0004; font-size: 10px; font-weight: 700; font-style: normal; }
+  .zbar { position: relative; width: 88px; height: 20px; border-radius: 4px; overflow: hidden; background: rgba(255,255,255,.7); margin: 0 auto }
+  .zfill { position: absolute; left: 0; top: 0; height: 100%; }
+  .ztxt { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 10px; font-weight: 700 }
+  .defnum { font-size: 12px; font-weight: 700; }
+  .ordin { width: 64px; padding: 4px 6px; text-align: center; font-size: 12px; font-weight: 600;
+    border: 1px solid rgba(31,31,31,.16); border-radius: 8px; background: rgba(255,255,255,.7); outline: none; }
+  .ordin:focus { border-color: rgba(31,31,31,.45); }
+  .ordin.has { background: rgba(143,233,0,.3); }
+  .msq { display: block; font-size: 9px; color: rgba(31,31,31,.5); margin-top: 2px; }
+  .catsel { font-size: 11px; padding: 3px 7px; border: 1px solid rgba(31,31,31,.2); border-radius: 8px; background: #fff; }
+  .loading { text-align: center; padding: 60px; color: rgba(31,31,31,.45); font-size: 13px }
+  .lowtag { display: inline-block; margin-left: 8px; padding: 1px 8px; border-radius: 10px;
+    background: rgba(31,31,31,.08); color: rgba(31,31,31,.6); font-size: 10px; font-weight: 700; }
+</style>
+</head>
+<body>
+<div class="gradient-bg"></div>
+<div class="header">
+  <a class="logo" href="/turnover">ОБОРОТ</a>
+  <nav class="nav">
+    <a href="/turnover" class="primary-page">Оборачиваемость</a>
+    <a href="/stocks" class="active">Активный сток</a>
+    <a href="/replenish">Заказ</a>
+    <a href="/sizes">Размеры</a>
+    <a href="/budget">Бюджет</a>
+    <a href="/forecast">Прогноз</a>
+    <a href="/revenue">Оборот</a>
+    <a href="/discounts">Скидки</a>
+    <a href="/orders">Заказы</a>
+    <a href="/settings">Настройки</a>
+  </nav>
+</div>
+
+<div class="cat-bar" id="cat-bar"></div>
+
+<div class="main">
+  <details class="note">
+    <summary>Как устроена эта страница: категории, карточки и графа «Заказано»</summary>
+    <div class="body">
+      <p><b>Что это.</b> Общая картина стока по скорости продаж. Верхние четыре карточки — весь склад, разложенный по успешности вещей (по оборачиваемости, ₽/день); карточки ниже — то же по выбранной категории. В штуках и деньгах видно, сколько капитала лежит в бестселлерах, а сколько заморожено в слабых вещах. Заказанное-но-не-пришедшее учитывается в стоке.</p>
+      <p><b>Откуда категории.</b> Категории берутся из групп товаров вашего МойСклада; английские названия автоматически переводятся, товары без группы распознаются по названию. Если в МойСкладе категории ведутся неаккуратно — исправьте здесь, не трогая МойСклад: раскройте «Настроить категории» ниже, чтобы <b>слить категории</b> (например, «Bombers» → «Верхняя одежда»), или раскройте строку товара и смените категорию у него одного.</p>
+      <p><b>Графа «Заказано» — важнейшая ручка страницы.</b> Впишите сюда, сколько штук вы заказали на производстве. Это число попадает в «едет к нам» и влияет на все расчёты: страница <b>Заказ</b> не предложит заказать то, что уже шьётся; <b>Прогноз</b> учтёт эти штуки в будущей выручке; <b>Бюджет</b> не потратит на них деньги. Если вы отправляете заказы в МойСклад из раздела «Заказы» — их количества подтягиваются автоматически (серая пометка «+N из МС» под полем) и уменьшаются по мере приёмок; вручную их дублировать не нужно.</p>
+      <p><b>Красные «!»</b> — размер есть на одном складе и «по нулям» на другом: проверьте, можно ли перебросить. «по нулям уже N дн» — сколько дней размер теряет продажи. Клик по строке раскрывает размеры.</p>
+      <p><b>Сток на 90 дн</b> — запас относительно 90-дневной потребности (по темпу продаж): ~100% идеально, сильно больше — затоварка. <b>Недостаток</b> — сколько штук не хватает до этой нормы.</p>
+      <details style="margin-top:8px;">
+        <summary style="cursor:pointer;font-weight:600;">Настроить категории (слияние)</summary>
+        <div id="merge-box" style="margin-top:6px;"></div>
+      </details>
     </div>
-    <div class="chips" id="cat-chips"></div>
-    <div class="spacer" style="flex:1;"></div>
-    <label class="toggle-line">
-      <input type="checkbox" id="only-gaps"> только с пробелами по складам
-    </label>
+  </details>
+
+  <div class="summary" id="summary">
+    <div class="sum-card sc-best"><div class="lbl">Бестселлеры</div><div class="cond">&gt; 5 000 ₽/день</div><div class="val" id="v-best">—</div><div class="money" id="m-best"></div><div class="sub" id="s-best"></div></div>
+    <div class="sum-card sc-good"><div class="lbl">Хорошие</div><div class="cond">2 000 – 5 000 ₽/день</div><div class="val" id="v-good">—</div><div class="money" id="m-good"></div><div class="sub" id="s-good"></div></div>
+    <div class="sum-card sc-mid"><div class="lbl">Медленные</div><div class="cond">1 000 – 2 000 ₽/день</div><div class="val" id="v-mid">—</div><div class="money" id="m-mid"></div><div class="sub" id="s-mid"></div></div>
+    <div class="sum-card sc-bad"><div class="lbl">Слабые</div><div class="cond">&lt; 1 000 ₽/день</div><div class="val" id="v-bad">—</div><div class="money" id="m-bad"></div><div class="sub" id="s-bad"></div></div>
   </div>
-  <div class="tbl-wrap">
-    <table class="tbl">
+  <div class="cat-sum-title" id="cat-sum-title"></div>
+  <div class="summary" id="summary-cat" style="margin-bottom:14px;"></div>
+
+  <div class="tools">
+    <input class="search" id="search" placeholder="Поиск по названию...">
+    <span class="note-inline" id="note"></span>
+  </div>
+
+  <div class="twrap">
+    <table>
       <thead id="thead"></thead>
-      <tbody id="tbody">
-        <tr><td colspan="9"><div class="loading-stub">Загрузка…</div></td></tr>
-      </tbody>
-      <tfoot id="tfoot" style="display:none;"></tfoot>
+      <tbody id="tb"><tr><td colspan="7" class="loading">Загружаю данные...</td></tr></tbody>
     </table>
   </div>
 </div>
 
-{% endblock %}
-
-{% block scripts %}
 <script>
-document.addEventListener("DOMContentLoaded", function () {
-  var warehouses = [];
-  var items = [];
-  var state = { sortKey: "total", sortDir: -1, query: "", cat: "", onlyGaps: false };
-  var openRows = {};
-  var tbody = document.getElementById("tbody");
-  var thead = document.getElementById("thead");
+let DATA = null, ITEMS = [], WHS = [], currentCat = null, MERGES = {}, ALLCATS = [];
 
-  api("/api/stocks").then(function (d) {
-    warehouses = d.warehouses || [];
-    items = d.items || [];
-    renderHead();
-    renderChips();
-    renderTable();
-  }).catch(function () {
-    tbody.innerHTML = '<tr><td colspan="9">' +
-      emptyState("Не удалось загрузить данные", "Обновите страницу или попробуйте позже.",
-        '<button class="btn" onclick="location.reload()">Обновить</button>') + "</td></tr>";
-  });
+function mw(name,q){ if(!q) return true; const nl=name.toLowerCase(); return q.toLowerCase().split(/\s+/).every(w=>nl.includes(w)); }
+function fmt(n){ return Math.round(n||0).toLocaleString("ru-RU"); }
+function fmtMoney(n){ n=n||0;
+  if(n>=1e6) return (n/1e6).toLocaleString("ru-RU",{maximumFractionDigits:1})+" млн ₽";
+  if(n>=1e3) return Math.round(n/1e3).toLocaleString("ru-RU")+" тыс ₽";
+  return Math.round(n).toLocaleString("ru-RU")+" ₽"; }
+function esc(s){ return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/"/g,"&quot;"); }
+async function api(url,opts){ const o=opts||{};
+  const r=await fetch(url,{method:o.method||"GET",headers:{"Content-Type":"application/json","X-Oborot-CSRF":"1"},body:o.body?JSON.stringify(o.body):undefined});
+  if(!r.ok) throw new Error("HTTP "+r.status); return r.json(); }
 
-  function colCount() { return warehouses.length + 3; }
+function gradeKey(it){
+  if(it.group!=="rank") return "bad";  // как в legacy: none → слабые
+  return {best:"best",good:"good",dull:"mid",weak:"bad"}[it.cls]||"bad";
+}
+const GRADE_CLS={best:"rg2",good:"rg1",mid:"ro",bad:"rr"};
+function rowCls(it){
+  if(it.group==="no_sales") return "rgr";
+  return GRADE_CLS[gradeKey(it)];
+}
+function ordTotal(it){ return (it.ordered_manual||0)+(it.ordered_ms||0); }
+function zatStyle(p){
+  if(p===null||p===undefined) return ["rgba(31,31,31,0.08)","—","rgba(31,31,31,0.4)"];
+  if(p<=30) return ["rgba(221,0,4,0.5)",p+"%","#7a0002"];
+  if(p<=100) return ["#4b7a00",p+"%","#f3e9e0"];
+  if(p<=150) return ["#b99a00",p+"%","#f3e9e0"];
+  return ["#dd0004",p+"%","#f3e9e0"];
+}
 
-  function renderHead() {
-    thead.innerHTML = "<tr>" +
-      '<th style="width:30px;"></th>' +
-      '<th data-sort="base_name" data-sort-dir="asc">Позиция</th>' +
-      warehouses.map(function (w, i) {
-        return '<th class="num" data-sort="wh' + i + '">' + esc(w.name) + "</th>";
-      }).join("") +
-      '<th class="num" data-sort="total">Всего</th>' +
-      "</tr>";
-    initSortHeaders(thead, state, renderTable);
+function sumByGrade(catFilter){
+  const acc={best:{q:0,n:0,m:0,o:0},good:{q:0,n:0,m:0,o:0},mid:{q:0,n:0,m:0,o:0},bad:{q:0,n:0,m:0,o:0}};
+  for(const it of ITEMS){
+    if(catFilter&&it.category!==catFilter) continue;
+    const g=gradeKey(it), o=ordTotal(it), p=it.avg_price||0;
+    acc[g].q+=it.cs+o; acc[g].n++; acc[g].m+=(it.cs+o)*p; acc[g].o+=o;
   }
-
-  function hasGap(it) {
-    return (it.total || 0) > 0 && (it.per_wh || []).some(function (q) { return (q || 0) === 0; });
+  return acc;
+}
+function renderSummary(){
+  const acc=sumByGrade(null);
+  for(const k of ["best","good","mid","bad"]){
+    document.getElementById("v-"+k).textContent=fmt(acc[k].q)+" шт";
+    document.getElementById("m-"+k).textContent="≈ "+fmtMoney(acc[k].m);
+    document.getElementById("s-"+k).textContent=acc[k].n+" моделей"+(acc[k].o?" · в заказе "+fmt(acc[k].o)+" шт":"");
   }
+}
+function renderSummaryCat(){
+  const acc=sumByGrade(currentCat);
+  document.getElementById("cat-sum-title").textContent="Категория · "+(currentCat||"—");
+  const defs=[["best","Бестселлеры","sc-best"],["good","Хорошие","sc-good"],["mid","Медленные","sc-mid"],["bad","Слабые","sc-bad"]];
+  document.getElementById("summary-cat").innerHTML=defs.map(x=>{
+    const a=acc[x[0]];
+    return '<div class="sum-card '+x[2]+'"><div class="lbl">'+x[1]+'</div><div class="val">'+fmt(a.q)+' шт</div>'+
+      '<div class="money">≈ '+fmtMoney(a.m)+'</div><div class="sub">'+a.n+' моделей'+(a.o?' · в заказе '+fmt(a.o)+' шт':'')+'</div></div>';
+  }).join("");
+}
 
-  function sortKeyFn(it) {
-    var m = /^wh(\d+)$/.exec(state.sortKey);
-    if (m) return (it.per_wh || [])[Number(m[1])] || 0;
-    return it[state.sortKey];
+function buildTabs(){
+  const cnt={}, warns={};
+  for(const it of ITEMS){ cnt[it.category]=(cnt[it.category]||0)+1; if(it.row_alert) warns[it.category]=true; }
+  ALLCATS=Object.keys(cnt).sort((a,b)=>cnt[b]-cnt[a]);
+  if(currentCat===null||!cnt[currentCat]) currentCat=ALLCATS[0]||null;
+  document.getElementById("cat-bar").innerHTML=ALLCATS.map(c=>
+    '<button class="cat-btn '+(c===currentCat?"active":"")+'" data-cat="'+esc(c)+'">'+esc(c)+
+    '<span class="cnt">'+cnt[c]+'</span>'+(warns[c]?'<span class="warn-mark" title="В категории есть размеры, которые кончились на одном из складов">!</span>':'')+'</button>').join("");
+  document.querySelectorAll("#cat-bar .cat-btn").forEach(b=>b.addEventListener("click",()=>{
+    currentCat=b.getAttribute("data-cat"); buildTabs(); renderSummaryCat(); render();
+  }));
+}
+
+function renderHead(){
+  let cols='<th title="Клик по строке раскрывает размеры. «!» — на одном из складов позиции нет">Название</th>';
+  for(const w of WHS) cols+='<th title="Остаток на складе «'+esc(w.name)+'»">'+esc(w.name)+'<span class="sub">шт</span></th>';
+  cols+='<th title="Запас в процентах от 90-дневной потребности по темпу продаж: ~100% идеально, больше — затоварка">Сток на 90 дн<span class="sub">запас</span></th>'+
+    '<th title="Сколько штук не хватает до нормы 90 дней">Недостаток<span class="sub">шт на 90 дн</span></th>'+
+    '<th title="Впишите, сколько штук заказано на производстве. Число уходит в «едет к нам»: уменьшает рекомендации Заказа и Бюджета, учитывается Прогнозом. Заказы, отправленные в МойСклад, подтягиваются сами (пометка «+N из МС»)">Заказано<span class="sub">влияет на Заказ и Прогноз</span></th>';
+  document.getElementById("thead").innerHTML='<tr>'+cols+'</tr>';
+}
+
+function rowHtml(it){
+  const [zc,zl,zt]=zatStyle(it.zat);
+  let name='<span class="ei">▶</span>'+esc(it.base_name);
+  if(it.group==="low_data") name+='<span class="lowtag" title="Мало статистики — темп и недостаток оценочные">мало данных</span>';
+  if(it.row_alert) name+='<span class="alert" title="Какой-то размер есть на одном складе и кончился на другом">!</span>';
+  let cells='<td>'+name+'</td>';
+  for(let i=0;i<WHS.length;i++){
+    const v=(it.per_wh||[])[i]||0;
+    cells+='<td><span class="qty '+(v?"":"zero")+'">'+fmt(v)+'</span></td>';
   }
+  cells+='<td><div class="zbar"><div class="zfill" style="width:'+Math.min(it.zat||0,100)+'%;background:'+zc+'"></div><div class="ztxt" style="color:'+zt+'">'+zl+'</div></div></td>';
+  cells+='<td><span class="defnum">'+it.defq+'</span></td>';
+  const ov=it.ordered_manual||0, ms=it.ordered_ms||0;
+  cells+='<td><input class="ordin'+(ov>0?' has':'')+'" type="number" min="0" step="1" value="'+(ov||0)+'" data-base="'+esc(it.base_name)+'" onclick="event.stopPropagation()">'+
+    (ms?'<span class="msq" title="Едет по документам «Заказ поставщику» в МойСкладе — уменьшается по мере приёмок, вручную не дублируйте">+ '+fmt(ms)+' из МС</span>':'')+'</td>';
+  return '<tr class="pr '+rowCls(it)+'" data-base="'+esc(it.base_name)+'">'+cells+'</tr>';
+}
 
-  function renderChips() {
-    var counts = {};
-    items.forEach(function (it) { counts[it.category] = (counts[it.category] || 0) + 1; });
-    var cats = Object.keys(counts).sort(function (a, b) { return a.localeCompare(b, "ru"); });
-    var box = document.getElementById("cat-chips");
-    if (cats.length < 2) return;
-    box.innerHTML = '<button class="chip active" data-cat="">Все<span class="cnt">' + items.length + "</span></button>" +
-      cats.map(function (c) {
-        return '<button class="chip" data-cat="' + esc(c) + '">' + esc(c) + '<span class="cnt">' + counts[c] + "</span></button>";
-      }).join("");
-    box.querySelectorAll(".chip").forEach(function (chip) {
-      chip.addEventListener("click", function () {
-        state.cat = chip.getAttribute("data-cat");
-        box.querySelectorAll(".chip").forEach(function (x) { x.classList.remove("active"); });
-        chip.classList.add("active");
-        renderTable();
-      });
-    });
-  }
-
-  function whCells(perWh, total) {
-    return warehouses.map(function (w, i) {
-      var q = (perWh || [])[i] || 0;
-      if (q === 0 && (total || 0) > 0) {
-        return '<td class="num"><span class="badge red" title="Нет на складе «' + esc(w.name) + '»">нет</span></td>';
-      }
-      return '<td class="num' + (q === 0 ? " muted" : "") + '">' + fmtInt(q) + "</td>";
-    }).join("");
-  }
-
-  function sizeRows(it) {
-    if (!(it.sizes || []).length) return "<p class='muted' style='margin:4px 0;'>Безразмерная позиция.</p>";
-    var sizes = it.sizes.slice().sort(function (a, b) { return sizeRank(a.size) - sizeRank(b.size); });
-    return "<table><thead><tr><th>Размер</th>" +
-      warehouses.map(function (w) { return '<th class="num">' + esc(w.name) + "</th>"; }).join("") +
-      '<th class="num">Всего</th></tr></thead><tbody>' +
-      sizes.map(function (s) {
-        var zero = (s.total || 0) === 0
-          ? ' <span class="badge red" title="Размер распродан везде — каждый день без него это упущенные продажи">по нулям' +
-            (s.zero_days ? " уже " + fmtInt(s.zero_days) + " дн" : "") + "</span>"
-          : "";
-        return "<tr><td><b>" + esc(s.size) + "</b>" + zero + "</td>" +
-          warehouses.map(function (w, i) {
-            var q = (s.per_wh || [])[i] || 0;
-            return '<td class="num' + (q === 0 ? " txt-red" : "") + '">' + fmtInt(q) + "</td>";
-          }).join("") +
-          '<td class="num"><b>' + fmtInt(s.total) + "</b></td></tr>";
-      }).join("") + "</tbody></table>";
-  }
-
-  function renderTable() {
-    var arr = items.filter(function (it) {
-      if (state.cat && it.category !== state.cat) return false;
-      if (state.onlyGaps && !hasGap(it)) return false;
-      return wordMatch(it.base_name, state.query);
-    });
-    arr = sortItems(arr, sortKeyFn, state.sortDir);
-
-    if (!arr.length) {
-      tbody.innerHTML = '<tr><td colspan="' + colCount() + '">' + (items.length
-        ? emptyState("Ничего не найдено", "Попробуйте изменить запрос или снять фильтры.", "")
-        : emptyState("Остатков пока нет", "Подключите источник данных, чтобы видеть остатки по складам.",
-            '<a class="btn primary" href="/onboarding">Подключить данные</a>')) + "</td></tr>";
-      document.getElementById("tfoot").style.display = "none";
-      return;
+function sizeRowsHtml(it){
+  if(!(it.sizes||[]).length) return '';
+  const ncols=WHS.length+4;
+  return it.sizes.map(sz=>{
+    let label=esc(sz.size||"без размера");
+    if(sz.total===0){
+      label+='<span class="zd">по нулям'+(sz.zero_days?" уже "+fmt(sz.zero_days)+" дн":"")+'</span>';
     }
+    let cells='<td>'+label+'</td>';
+    for(let i=0;i<WHS.length;i++){
+      const v=(sz.per_wh||[])[i]||0;
+      if(v===0){
+        const elsewhere=(sz.per_wh||[]).some(x=>x>0);
+        cells+='<td><span class="qty zero'+(elsewhere?' zero-cell':'')+'">0'+(elsewhere?'<span class="alert">!</span>':'')+'</span></td>';
+      } else cells+='<td><span class="qty">'+fmt(v)+'</span></td>';
+    }
+    cells+='<td></td><td></td><td></td>';
+    return '<tr class="sr">'+cells+'</tr>';
+  }).join("")+
+  '<tr class="sr"><td colspan="'+ncols+'" style="font-style:normal;">Категория: '+
+    '<select class="catsel" data-base="'+esc(it.base_name)+'">'+
+    ALLCATS.map(c=>'<option'+(c===it.category?' selected':'')+'>'+esc(c)+'</option>').join("")+
+    '<option value="__new__">другая…</option></select>'+
+    ' <span style="opacity:.55;font-size:10.5px;">перенос действует только в «Обороте», МойСклад не меняется</span></td></tr>';
+}
 
-    tbody.innerHTML = arr.map(function (it) {
-      var open = !!openRows[it.base_name];
-      var gapNote = hasGap(it)
-        ? '<div class="name-sub txt-red">нет: ' + esc(warehouses.filter(function (w, i) { return ((it.per_wh || [])[i] || 0) === 0; }).map(function (w) { return w.name; }).join(", ")) + "</div>"
-        : '<div class="name-sub">' + esc(it.category || "") + "</div>";
-      return "<tr data-base='" + esc(it.base_name) + "'>" +
-        '<td><button class="expander' + (open ? " open" : "") + '" data-base="' + esc(it.base_name) + '" title="По размерам">' + SVG_CHEVRON + "</button></td>" +
-        '<td class="name-cell"><div class="name-main">' + esc(it.base_name) + "</div>" + gapNote + "</td>" +
-        whCells(it.per_wh, it.total) +
-        '<td class="num"><b>' + fmtInt(it.total) + "</b></td>" +
-        "</tr>" +
-        (open ? "<tr class='expand-row'><td colspan='" + colCount() + "' style='padding:0;'><div class='sub-panel'>" + sizeRows(it) + "</div></td></tr>" : "");
-    }).join("");
-
-    tbody.querySelectorAll(".expander").forEach(function (btn) {
-      btn.addEventListener("click", function () {
-        var b = btn.getAttribute("data-base");
-        openRows[b] = !openRows[b];
-        renderTable();
-      });
+function render(){
+  const q=(document.getElementById("search").value||"").toLowerCase();
+  const tb=document.getElementById("tb");
+  const items=ITEMS.filter(it=>q?mw(it.base_name,q):it.category===currentCat);
+  const ncols=WHS.length+4;
+  if(!items.length){ tb.innerHTML='<tr><td colspan="'+ncols+'" class="loading">Нет данных</td></tr>'; return; }
+  const withS=items.filter(it=>it.group!=="no_sales"), noS=items.filter(it=>it.group==="no_sales");
+  tb.innerHTML=[...withS,...noS].map(rowHtml).join("");
+  document.getElementById("note").textContent=items.length+" позиций · клик по строке раскрывает размеры · сортировка по оборачиваемости";
+  document.querySelectorAll("tr.pr").forEach(tr=>{
+    tr.addEventListener("click",()=>{
+      const base=tr.getAttribute("data-base");
+      if(tr.classList.contains("open")){
+        tr.classList.remove("open");
+        let n=tr.nextSibling;
+        while(n&&n.classList&&n.classList.contains("sr")){ const x=n; n=n.nextSibling; x.remove(); }
+        return;
+      }
+      tr.classList.add("open");
+      const it=ITEMS.find(x=>x.base_name===base);
+      tr.insertAdjacentHTML("afterend", sizeRowsHtml(it));
     });
-
-    var totals = warehouses.map(function () { return 0; });
-    var grand = 0;
-    arr.forEach(function (it) {
-      (it.per_wh || []).forEach(function (q, i) { totals[i] += q || 0; });
-      grand += it.total || 0;
-    });
-    var tfoot = document.getElementById("tfoot");
-    tfoot.style.display = "";
-    tfoot.innerHTML = "<tr><td></td><td>ИТОГО: " + fmtInt(arr.length) + " поз.</td>" +
-      totals.map(function (t) { return '<td class="num">' + fmtInt(t) + "</td>"; }).join("") +
-      '<td class="num">' + fmtInt(grand) + "</td></tr>";
-  }
-
-  document.getElementById("search").addEventListener("input", debounce(function (e) {
-    state.query = e.target.value.trim();
-    renderTable();
-  }, 150));
-  document.getElementById("only-gaps").addEventListener("change", function () {
-    state.onlyGaps = this.checked;
-    renderTable();
   });
+}
+
+function renderMerges(){
+  const box=document.getElementById("merge-box");
+  const cats=ALLCATS.slice();
+  box.innerHTML = cats.map(c=>{
+    const to=MERGES[c]||"";
+    return '<div class="catset-row"><span style="flex:0 0 190px;">'+esc(c)+'</span> → '+
+      '<select class="merge-sel" data-from="'+esc(c)+'">'+
+      '<option value="">— не сливать —</option>'+
+      cats.filter(x=>x!==c).map(x=>'<option'+(x===to?' selected':'')+'>'+esc(x)+'</option>').join("")+
+      '</select></div>';
+  }).join("") +
+  '<div style="font-size:11px;opacity:.6;margin-top:6px;">Слияние действует только в «Обороте»: все позиции категории показываются в выбранной. МойСклад не меняется.</div>';
+  box.querySelectorAll(".merge-sel").forEach(sel=>sel.addEventListener("change",async ()=>{
+    try{
+      await api("/api/categories/merge",{method:"POST",body:{from_category:sel.getAttribute("data-from"),to_category:sel.value}});
+      await load();
+    }catch(err){ alert("Не сохранилось: "+err.message); }
+  }));
+}
+
+document.addEventListener("change", async e=>{
+  const t=e.target;
+  if(t.classList&&t.classList.contains("ordin")){
+    const base=t.getAttribute("data-base");
+    let v=parseInt(t.value,10); if(!isFinite(v)||v<0) v=0; t.value=v;
+    t.classList.toggle("has",v>0);
+    try{
+      await api("/api/ordered",{method:"POST",body:{base_name:base,qty:v}});
+      ITEMS.forEach(it=>{ if(it.base_name===base) it.ordered_manual=v; });
+      renderSummary(); renderSummaryCat();
+    }catch(err){ alert("Не удалось сохранить «Заказано»: "+err.message); }
+  }
+  if(t.classList&&t.classList.contains("catsel")){
+    const base=t.getAttribute("data-base");
+    let cat=t.value;
+    if(cat==="__new__"){ cat=prompt("Название новой категории:")||""; if(!cat){ render(); return; } }
+    try{
+      await api("/api/categories/override",{method:"POST",body:{base_name:base,category:cat}});
+      await load();
+    }catch(err){ alert("Не сохранилось: "+err.message); }
+  }
 });
+document.getElementById("search").addEventListener("input",render);
+
+async function load(){
+  const [d, cats] = await Promise.all([
+    api("/api/active-stock"),
+    api("/api/categories").catch(()=>({overrides:{},merges:{}})),
+  ]);
+  DATA=d; ITEMS=d.items||[]; WHS=d.warehouses||[]; MERGES=(cats&&cats.merges)||{};
+  buildTabs(); renderSummary(); renderSummaryCat(); renderHead(); render(); renderMerges();
+}
+load().catch(e=>{ document.getElementById("tb").innerHTML='<tr><td colspan="7" class="loading">Ошибка загрузки: '+e.message+'</td></tr>'; });
 </script>
-{% endblock %}
+</body>
+</html>

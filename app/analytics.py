@@ -41,10 +41,13 @@ from sqlalchemy.orm import Session
 
 from app.categories import ru_category
 from app.models import (
+    CategoryMerge,
     Org,
     OrderedQty,
     Product,
     Sale,
+    SkuCategoryOverride,
+    SkuHidden,
     StockDay,
     Warehouse,
     WarehouseStock,
@@ -158,10 +161,43 @@ def season_bounds(today: date) -> tuple[date, str]:
     return start, label
 
 
+# Правило дефолтных скидок (значения legacy-таблицы CC). Редактируется
+# владельцем на странице «Оборачиваемость» (кнопка «Правило…»).
+DEFAULT_DISCOUNT_RULE = {
+    "new_days": 30,        # новинка: меньше N дней в стоке
+    "new_pct": 10,         # скидка новинки при затоварке
+    "top_turnover": 2000,  # порог «топ продаж», ₽/день
+    "top_pct": 15,         # топ без затоварки
+    "top_over_pct": 20,    # топ при затоварке
+    "mid_turnover": 1000,  # порог «середины», ₽/день
+    "mid_pct": 30,
+    "mid_over_pct": 40,
+    "weak_pct": 50,        # слабые и без продаж
+    "weak_over_pct": 60,
+    "overstock_days": 90,  # затоварка: запас ≥ N дней (legacy: 100% нормы 90 дн)
+}
+
+
+def _clean_discount_rule(raw) -> dict:
+    """Правило скидок из настроек org с дозаполнением дефолтов и клампами."""
+    rule = dict(DEFAULT_DISCOUNT_RULE)
+    if isinstance(raw, dict):
+        for key, default in DEFAULT_DISCOUNT_RULE.items():
+            v = raw.get(key)
+            if isinstance(v, (int, float)):
+                hi = 5000 if key in ("top_turnover", "mid_turnover") else (
+                    365 if key.endswith("_days") else 99)
+                rule[key] = int(min(max(0, v), hi if key != "top_turnover" else 10**9))
+    if rule["mid_turnover"] > rule["top_turnover"]:
+        rule["mid_turnover"] = rule["top_turnover"]
+    return rule
+
+
 def extra_settings(org: Org) -> dict:
     """Настройки сверх DEFAULT_SETTINGS (org.settings их не мерджит — models.py не трогаем).
 
-    rate_window: 'year' | 'd90' | 'season'; lead_time_days: 1..365 (дефолт 45).
+    rate_window: 'year' | 'd90' | 'season'; lead_time_days: 1..365 (дефолт 45);
+    discount_rule — правило дефолтных скидок (см. DEFAULT_DISCOUNT_RULE).
     """
     try:
         data = json.loads(org.settings_json or "{}")
@@ -173,7 +209,11 @@ def extra_settings(org: Org) -> dict:
     lead = data.get("lead_time_days")
     if not isinstance(lead, (int, float)) or not 1 <= int(lead) <= 365:
         lead = DEFAULT_LEAD_TIME_DAYS
-    return {"rate_window": rate_window, "lead_time_days": int(lead)}
+    return {
+        "rate_window": rate_window,
+        "lead_time_days": int(lead),
+        "discount_rule": _clean_discount_rule(data.get("discount_rule")),
+    }
 
 
 # ── Расчёт снапшота ───────────────────────────────────────────────────────────
@@ -393,13 +433,31 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
 
     # «Едет к нам» = локальные заказы/ручные правки (qty) + документы
     # «Заказ поставщику» из МойСклад (ms_qty, пересобирается синком).
-    ordered_by_base = dict(
-        db.execute(
-            select(OrderedQty.base_name, OrderedQty.qty + OrderedQty.ms_qty).where(
-                OrderedQty.org_id == org.id, OrderedQty.qty + OrderedQty.ms_qty > 0
-            )
-        ).all()
-    )
+    # Раздельно — чтобы «Активный сток» показывал ручное поле и МС-часть.
+    ordered_rows = db.execute(
+        select(OrderedQty.base_name, OrderedQty.qty, OrderedQty.ms_qty).where(
+            OrderedQty.org_id == org.id,
+            OrderedQty.qty + OrderedQty.ms_qty > 0,
+        )
+    ).all()
+    ordered_by_base = {b: float(q or 0) + float(m or 0) for b, q, m in ordered_rows}
+    ordered_manual = {b: float(q or 0) for b, q, m in ordered_rows}
+    ordered_ms = {b: float(m or 0) for b, q, m in ordered_rows}
+
+    # Архив («в архив» на Оборачиваемости) и пользовательские категории.
+    hidden_set = {
+        b for b, in db.execute(
+            select(SkuHidden.base_name).where(SkuHidden.org_id == org.id)
+        )
+    }
+    cat_override = dict(db.execute(
+        select(SkuCategoryOverride.base_name, SkuCategoryOverride.category)
+        .where(SkuCategoryOverride.org_id == org.id)
+    ).all())
+    cat_merge = dict(db.execute(
+        select(CategoryMerge.from_category, CategoryMerge.to_category)
+        .where(CategoryMerge.org_id == org.id)
+    ).all())
 
     # Склады и текущие остатки по ним (только активные — для страницы «Остатки»).
     warehouses = db.execute(
@@ -434,11 +492,18 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
     # ── Сборка по базовым именам ─────────────────────────────────────────────
     items: dict[str, dict] = {}
     for base, category, sale_price, cost_price, archived in meta_rows:
+        # Категория для отображения: русская (перевод латинских групп МС или
+        # keyword-категоризация по имени), поверх — пользовательские правила:
+        # слияние категорий и перенос отдельной позиции («ведут МС черти как»).
+        cat = ru_category(category, base)
+        cat = cat_merge.get(cat, cat)
+        cat = cat_override.get(base, cat)
         items[base] = {
             "base_name": base,
-            # Категория для отображения: русская (перевод латинских групп МС
-            # или keyword-категоризация по имени — фидбэк «всё по-русски»).
-            "category": ru_category(category, base),
+            "category": cat,
+            "hidden": base in hidden_set,
+            "ordered_manual": ordered_manual.get(base, 0.0),
+            "ordered_ms": ordered_ms.get(base, 0.0),
             "sale_price": float(sale_price or 0),
             "cost_price": float(cost_price or 0),
             "archived": bool(archived),
@@ -607,7 +672,7 @@ def _live_items(snap: dict) -> list[dict]:
     return [
         it
         for it in snap["items"].values()
-        if not it["archived"] and (it["cs"] > 0 or it["nq"] > 0 or it["dis"] > 0)
+        if not it["archived"] and not it.get("hidden") and (it["cs"] > 0 or it["nq"] > 0 or it["dis"] > 0)
     ]
 
 
@@ -965,12 +1030,79 @@ def build_turnover(snap: dict) -> dict:
                 "avg_price": it["avg_price"],
                 "sale_price": it["sale_price"],
                 "discount_fact": it["discount_fact"],
+                "rate": it["rate_year"],
                 "wos": it["wos"],
                 "stockout_date": it["stockout_date"],
                 "archived": it["archived"],
+                "hidden": it.get("hidden", False),
             }
         )
     return {"items": items}
+
+
+def build_active_stock(snap: dict) -> dict:
+    """GET /api/active-stock — страница «Активный сток» (порт legacy /analytics).
+
+    Все неархивные позиции с активностью: класс/оборачиваемость, остатки по
+    складам, разбивка по размерам с сигналами («!» — размер есть на одном
+    складе и 0 на другом; «по нулям N дн»), сток на 90 дней (%), недостаток
+    на 90 дней (без вычета «Заказано» — как в legacy), «едет к нам» раздельно
+    (ручное поле + документы МойСклад).
+    """
+    active = [w for w in snap["warehouses"] if w["active"]]
+    wh_ids = [w["id"] for w in active]
+    today = date.fromisoformat(snap["today"])
+    items = []
+    for it in snap["items"].values():
+        if it["archived"] or it.get("hidden"):
+            continue
+        if it["cs"] <= 0 and it["nq"] <= 0 and float(it.get("ordered") or 0) <= 0:
+            continue  # ни остатка, ни продаж за год, ни заказанного
+        rate = it["rate_year"]
+        sup = round(it["cs"] / rate) if rate > 0 else None       # запас, дней
+        zat = round(sup / 90 * 100) if sup is not None else None  # сток на 90, %
+        defq = max(0, round(rate * 90) - it["cs"])                # недостаток
+        sizes = []
+        row_alert = False
+        for size in sorted(it["sizes"].keys() | it["wh_stock"].keys(), key=_size_order):
+            per_wh = [int(it["wh_stock"].get(size, {}).get(wid, 0)) for wid in wh_ids]
+            total = sum(per_wh)
+            # «!»: размер есть хотя бы на одном складе и 0 на другом.
+            alert = total > 0 and any(q == 0 for q in per_wh) and len(per_wh) > 1
+            if alert:
+                row_alert = True
+            zero_days = None
+            if total == 0:
+                last_pos = (it["sizes"].get(size) or {}).get("last_pos")
+                if last_pos:
+                    zero_days = max(0, (today - date.fromisoformat(last_pos)).days)
+            sizes.append({"size": size, "per_wh": per_wh, "total": total,
+                          "alert": alert, "zero_days": zero_days})
+        per_wh_totals = [sum(s["per_wh"][i] for s in sizes) for i in range(len(wh_ids))]
+        items.append({
+            "base_name": it["base_name"],
+            "category": it["category"],
+            "cls": it["cls"],
+            "group": turnover_group(it),
+            "low_data": it.get("low_data", False),
+            "turnover": it["turnover"],
+            "nr": it["nr"],
+            "avg_price": it["avg_price"] or it["sale_price"],
+            "cs": it["cs"],
+            "per_wh": per_wh_totals,
+            "zat": zat,
+            "defq": defq,
+            "ordered_manual": round(float(it.get("ordered_manual") or 0)),
+            "ordered_ms": round(float(it.get("ordered_ms") or 0)),
+            "row_alert": row_alert,
+            "sizes": sizes,
+        })
+    # Как в legacy: сортировка по оборачиваемости, без продаж — в конец.
+    items.sort(key=lambda x: (_GROUP_ORDER[x["group"]], -x["turnover"], -x["cs"]))
+    return {
+        "warehouses": [{"id": w["id"], "name": w["name"]} for w in active],
+        "items": items,
+    }
 
 
 def build_stocks(snap: dict) -> dict:

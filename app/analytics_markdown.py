@@ -50,19 +50,29 @@ def psych_price(raw: float) -> int:
     return max(p, 0)
 
 
-def _recommend(cls: str, dis: int, turnover: float, days_left: int | None) -> int:
-    """Рекомендованная скидка, %. 0 — уценка не нужна (в отчёт не попадает)."""
+def _recommend(cls: str, dis: int, turnover: float, days_left: int | None,
+               rule: dict | None = None) -> int:
+    """Рекомендованная скидка, %. 0 — уценка не нужна (в отчёт не попадает).
+
+    rule — правило организации (analytics.DEFAULT_DISCOUNT_RULE, редактируется
+    кнопкой «Правило…» на Оборачиваемости); без него — значения legacy.
+    """
+    r = rule or {}
+    new_days = int(r.get("new_days", NEW_DAYS))
+    top_turnover = float(r.get("top_turnover", TOP_TURNOVER))
+    mid_turnover = float(r.get("mid_turnover", MID_TURNOVER))
+    overstock_days = int(r.get("overstock_days", OVERSTOCK_DAYS))
     eff = NO_SALES_DAYS if days_left is None else days_left
-    over = eff >= OVERSTOCK_DAYS
-    if dis < NEW_DAYS:
-        return 10 if over else 0        # новинка без затоварки — рано скидывать
+    over = eff >= overstock_days
+    if dis < new_days:
+        return int(r.get("new_pct", 10)) if over else 0  # новинка без затоварки — рано
     if cls == "best" and not over:
         return 0                        # бестселлер с малым запасом — сам уйдёт
-    if turnover > TOP_TURNOVER:
-        return 15 if not over else 20
-    if turnover >= MID_TURNOVER:
-        return 30 if not over else 40
-    return 50 if not over else 60
+    if turnover > top_turnover:
+        return int(r.get("top_pct", 15)) if not over else int(r.get("top_over_pct", 20))
+    if turnover >= mid_turnover:
+        return int(r.get("mid_pct", 30)) if not over else int(r.get("mid_over_pct", 40))
+    return int(r.get("weak_pct", 50)) if not over else int(r.get("weak_over_pct", 60))
 
 
 def _days_ru(n: int) -> str:
@@ -110,16 +120,17 @@ def default_discounts(snap: dict) -> dict[str, int]:
     Кнопка «Дефолтные скидки»: результат полностью замещает ручные значения
     (как /api/discounts/bulk в первой таблице).
     """
+    rule = (snap.get("settings") or {}).get("discount_rule")
     out: dict[str, int] = {}
     for it in snap["items"].values():
-        if it["archived"]:
+        if it["archived"] or it.get("hidden"):
             continue
         cs = int(it["cs"])
         if cs <= 0:
             continue
         rate = it["rate"]
         days_left = round(cs / rate) if rate > 0 else None
-        pct = _recommend(it["cls"], it["dis"], it["turnover"], days_left)
+        pct = _recommend(it["cls"], it["dis"], it["turnover"], days_left, rule)
         if pct > 0:
             out[it["base_name"]] = pct
     return out
@@ -137,11 +148,12 @@ def build_discounts(snap: dict, overrides: dict[str, float] | None = None) -> di
     """
     today = date.fromisoformat(snap["today"])
     overrides = overrides or {}
+    rule = (snap.get("settings") or {}).get("discount_rule")
     items = []
     fresh_excluded = 0
 
     for it in snap["items"].values():
-        if it["archived"]:
+        if it["archived"] or it.get("hidden"):
             continue
         cs = int(it["cs"])
         if cs <= 0:
@@ -156,7 +168,7 @@ def build_discounts(snap: dict, overrides: dict[str, float] | None = None) -> di
 
         manual = overrides.get(it["base_name"])
         pct = int(manual) if manual and manual > 0 else _recommend(
-            it["cls"], it["dis"], it["turnover"], days_left
+            it["cls"], it["dis"], it["turnover"], days_left, rule
         )
         if pct <= 0:
             fresh_excluded += 1  # новинка без затоварки / бестселлер с малым запасом

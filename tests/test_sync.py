@@ -490,6 +490,64 @@ def run_scenario() -> int:
           all(s["zero_days"] is None or s["zero_days"] >= 0 for s in zero_sizes),
           f"n_zero={len(zero_sizes)}")
 
+    print("== Активный сток / архив / категории / правило скидок ==")
+    ast = client.get("/api/active-stock").json()
+    check("active-stock: 2 склада и позиции", len(ast["warehouses"]) == 2
+          and len(ast["items"]) > 0)
+    hood_a = next((i for i in ast["items"] if i["base_name"] == "Худи «Скетч»"), None)
+    check("active-stock: «Заказано» раздельно (ручное 3 + из МС 14)",
+          hood_a is not None and hood_a["ordered_manual"] == 3
+          and hood_a["ordered_ms"] == 14,
+          f"got={hood_a and (hood_a['ordered_manual'], hood_a['ordered_ms'])}")
+    check("active-stock: у позиций есть per_wh/zat/defq/sizes",
+          all(k in ast["items"][0] for k in ("per_wh", "zat", "defq", "sizes")))
+    first_groups = [i["group"] for i in ast["items"]]
+    check("active-stock: без продаж — в конце",
+          first_groups == sorted(first_groups,
+                                 key=lambda g: {"rank": 0, "low_data": 1, "no_sales": 2}[g]))
+
+    r = client.post("/api/hidden", json={"base_name": "Ремень «Ось»", "hidden": True})
+    check("архив: позиция убрана", r.status_code == 200)
+    t_items = {i["base_name"]: i for i in client.get("/api/turnover").json()["items"]}
+    check("архив: hidden=true в оборачиваемости",
+          t_items.get("Ремень «Ось»", {}).get("hidden") is True)
+    ast2 = client.get("/api/active-stock").json()
+    check("архив: позиции нет в активном стоке",
+          all(i["base_name"] != "Ремень «Ось»" for i in ast2["items"]))
+    r = client.post("/api/hidden", json={"base_name": "Ремень «Ось»", "hidden": False})
+    check("архив: возврат работает", r.status_code == 200)
+
+    r = client.post("/api/categories/merge",
+                    json={"from_category": "Украшения", "to_category": "Аксессуары"})
+    check("слияние категорий сохраняется", r.status_code == 200)
+    ast3 = client.get("/api/active-stock").json()
+    ring = next((i for i in ast3["items"] if i["base_name"] == "Кольцо «Грань»"), None)
+    check("слияние: Украшения показываются как Аксессуары",
+          ring is not None and ring["category"] == "Аксессуары",
+          f"got={ring and ring['category']}")
+    r = client.post("/api/categories/override",
+                    json={"base_name": "Кольцо «Грань»", "category": "Витрина"})
+    ring2 = next((i for i in client.get("/api/active-stock").json()["items"]
+                  if i["base_name"] == "Кольцо «Грань»"), None)
+    check("перенос позиции приоритетнее слияния",
+          r.status_code == 200 and ring2 and ring2["category"] == "Витрина",
+          f"got={ring2 and ring2['category']}")
+    client.post("/api/categories/override", json={"base_name": "Кольцо «Грань»", "category": ""})
+    client.post("/api/categories/merge", json={"from_category": "Украшения", "to_category": ""})
+
+    r = client.get("/api/discount-rule").json()
+    check("правило скидок отдаётся с дефолтами",
+          r["rule"]["weak_over_pct"] == 60 and r["defaults"]["top_pct"] == 15)
+    new_rule = dict(r["rule"]); new_rule["weak_over_pct"] = 70
+    r = client.post("/api/discount-rule", json=new_rule)
+    check("правило скидок сохраняется (owner)", r.status_code == 200
+          and r.json()["rule"]["weak_over_pct"] == 70)
+    client.post("/api/discount-overrides/defaults")
+    belt2 = client.get("/api/discount-overrides").json().get("Ремень «Ось»")
+    check("дефолтные скидки считаются по новому правилу (60 → 70)",
+          belt2 == 70, f"got={belt2}")
+    client.post("/api/discount-rule", json=dict(r.json()["rule"], weak_over_pct=60))
+
     print("== Инкрементальный синк ==")
     # Эмулируем приёмку в МС: размер S принят полностью → у «Скетча» едет 8.
     mock_ms.PURCHASE_ORDERS[0]["positions"]["rows"][0]["shipped"] = 10.0

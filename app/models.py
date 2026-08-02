@@ -186,6 +186,47 @@ class OrderedQty(Base):
     ms_qty: Mapped[float] = mapped_column(Float, nullable=False, default=0.0, server_default="0")
 
 
+class SkuHidden(Base):
+    """Архив позиций («в архив» на Оборачиваемости, правило legacy).
+
+    Для вещей, которые больше никогда не переразместятся: исключаются из
+    рекомендаций заказа, бюджета, прогноза и уценки; на Оборачиваемости
+    показываются в свёрнутом блоке «Архив» с кнопкой «вернуть».
+    Отличие от Product.archived: archived приходит из МойСклада, hidden —
+    решение владельца внутри «Оборота».
+    """
+
+    __tablename__ = "sku_hidden"
+
+    org_id: Mapped[int] = mapped_column(ForeignKey("orgs.id"), primary_key=True)
+    base_name: Mapped[str] = mapped_column(String(255), primary_key=True)
+
+
+class SkuCategoryOverride(Base):
+    """Пользовательская категория позиции («многие ведут МойСклад черти как»).
+
+    Перенос отдельного товара в другую категорию. Приоритетнее и категории
+    МойСклада, и слияний категорий.
+    """
+
+    __tablename__ = "sku_category_overrides"
+
+    org_id: Mapped[int] = mapped_column(ForeignKey("orgs.id"), primary_key=True)
+    base_name: Mapped[str] = mapped_column(String(255), primary_key=True)
+    category: Mapped[str] = mapped_column(String(128), nullable=False)
+
+
+class CategoryMerge(Base):
+    """Слияние категорий: все позиции категории from_category показываются
+    в to_category (например «Bombers» → «Верхняя одежда»)."""
+
+    __tablename__ = "category_merges"
+
+    org_id: Mapped[int] = mapped_column(ForeignKey("orgs.id"), primary_key=True)
+    from_category: Mapped[str] = mapped_column(String(128), primary_key=True)
+    to_category: Mapped[str] = mapped_column(String(128), nullable=False)
+
+
 class SkuDiscount(Base):
     """Ручная скидка позиции, % (страница «Оборачиваемость», правило legacy).
 

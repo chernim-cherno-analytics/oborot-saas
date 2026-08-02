@@ -303,7 +303,7 @@ def turnover_page(request: Request, db: Session = Depends(get_db)):
 
 @app.get("/stocks", response_class=HTMLResponse)
 def stocks_page(request: Request, db: Session = Depends(get_db)):
-    return _authed_page(request, db, "stocks.html", "stocks", "Остатки")
+    return _authed_page(request, db, "stocks.html", "stocks", "Активный сток")
 
 
 @app.get("/orders", response_class=HTMLResponse)

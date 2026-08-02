@@ -100,7 +100,7 @@ def build_budget(
     all_categories: set[str] = set()
 
     for it in snap["items"].values():
-        if it["archived"]:
+        if it["archived"] or it.get("hidden"):
             continue
         dis, nq = it["dis"], it["nq"]
         if dis <= 0 or nq <= 0:
@@ -227,7 +227,7 @@ def build_forecast(snap: dict) -> dict:
 
     items = []
     for it in snap["items"].values():
-        if it["archived"]:
+        if it["archived"] or it.get("hidden"):
             continue
         cs = it["cs"]
         inc = max(0, int(it["ordered"]))
@@ -390,7 +390,7 @@ def sizes_products(db: Session, org_id: int, snap: dict) -> dict:
     )
     products = []
     for it in snap["items"].values():
-        if it["archived"]:
+        if it["archived"] or it.get("hidden"):
             continue
         sold = round(float(sold_rows.get(it["base_name"]) or 0))
         if sold <= 0 and it["cs"] <= 0:
