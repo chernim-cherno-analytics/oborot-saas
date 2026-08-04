@@ -255,8 +255,9 @@ def run_scenario() -> int:
           mrow is not None and mrow["role"] == "owner")
 
     r2 = client.get("/", follow_redirects=False)  # кука уже в клиенте
-    check("по куке из iframe открывается дашборд", r2.status_code == 200,
-          f"status={r2.status_code}")
+    check("по куке из iframe «/» ведёт в Оборачиваемость (дашборд скрыт)",
+          r2.status_code == 302 and (r2.headers.get("location") or "") == "/turnover",
+          f"status={r2.status_code} loc={r2.headers.get('location')}")
 
     client.get("/ms/app", params={"contextKey": "ck-good"}, follow_redirects=False)
     cnt = q1("SELECT COUNT(*) c FROM users WHERE ms_uid IS NOT NULL")
