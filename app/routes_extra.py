@@ -55,28 +55,43 @@ def _authed_page(request: Request, db: Session, template: str, active: str, page
 
 # ── Страницы ─────────────────────────────────────────────────────────────────
 
+# Скрытые разделы: продукт сфокусирован на Оборачиваемости, Активном стоке и
+# заказах. Код страниц сохранён в репозитории — чтобы вернуть раздел, убери его
+# из этого множества (роуты и API снова откроются, пункт меню — в base.html).
+HIDDEN_PAGES = frozenset({"budget", "forecast", "discounts", "revenue"})
+
+
+def _hidden_404(active: str):
+    if active in HIDDEN_PAGES:
+        raise HTTPException(status_code=404, detail="Раздел отключён")
+
+
 @router.get("/budget", response_class=HTMLResponse)
 def budget_page(request: Request, db: Session = Depends(get_db)):
+    _hidden_404("budget")
     return _authed_page(request, db, "budget.html", "budget", "Бюджет закупки")
 
 
 @router.get("/forecast", response_class=HTMLResponse)
 def forecast_page(request: Request, db: Session = Depends(get_db)):
+    _hidden_404("forecast")
     return _authed_page(request, db, "forecast.html", "forecast", "Прогноз")
 
 
 @router.get("/sizes", response_class=HTMLResponse)
 def sizes_page(request: Request, db: Session = Depends(get_db)):
-    return _authed_page(request, db, "sizes.html", "sizes", "Размеры")
+    return _authed_page(request, db, "sizes.html", "sizes", "Заказ отдельной позиции")
 
 
 @router.get("/discounts", response_class=HTMLResponse)
 def discounts_page(request: Request, db: Session = Depends(get_db)):
+    _hidden_404("discounts")
     return _authed_page(request, db, "discounts.html", "discounts", "Скидки")
 
 
 @router.get("/revenue", response_class=HTMLResponse)
 def revenue_page(request: Request, db: Session = Depends(get_db)):
+    _hidden_404("revenue")
     return _authed_page(request, db, "revenue.html", "revenue", "Оборот")
 
 
@@ -103,6 +118,7 @@ def api_budget(
     ctx: AuthContext = Depends(require_auth_api),
     db: Session = Depends(get_db),
 ):
+    _hidden_404("budget")
     """Бюджет закупки: жадное распределение по оборачиваемости (см. analytics_extra)."""
     snap = analytics.get_snapshot(db, ctx.org)
     excluded = {c.strip() for c in exclude_cats.split(",") if c.strip()}
@@ -111,6 +127,7 @@ def api_budget(
 
 @router.get("/api/forecast")
 def api_forecast(ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)):
+    _hidden_404("forecast")
     """Прогноз распродажи стока: карточки, ряд 26 недель, категории, позиции."""
     snap = analytics.get_snapshot(db, ctx.org)
     return analytics_extra.build_forecast(snap)
@@ -128,6 +145,7 @@ def _discount_overrides(db: Session, org_id: int) -> dict[str, float]:
 
 @router.get("/api/discounts")
 def api_discounts(ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)):
+    _hidden_404("discounts")
     """Markdown-рекомендации: что уценить и на сколько (см. analytics_markdown).
 
     Ручные скидки со страницы «Оборачиваемость» имеют приоритет.
@@ -196,6 +214,7 @@ def api_revenue(
     ctx: AuthContext = Depends(require_auth_api),
     db: Session = Depends(get_db),
 ):
+    _hidden_404("revenue")
     """«Оборот» за период: выручка, категории, помесячный ряд, топ позиций."""
     if date_from > date_to:
         raise HTTPException(status_code=422, detail="Дата начала позже даты конца")
@@ -215,12 +234,18 @@ def api_sizes_calc(
     qty: int = Query(30, ge=0, le=1_000_000),
     period: str = Query("12m"),
     mode: str = Query("stock"),
+    arrival: str = Query("", pattern=r"^(\d{4}-\d{2}-\d{2})?$"),
     ctx: AuthContext = Depends(require_auth_api),
     db: Session = Depends(get_db),
 ):
-    """Распределение заказа позиции по размерам на основе истории продаж."""
+    """Распределение заказа позиции по размерам: темпы по дням наличия,
+    остатки прогнозируются на дату прихода (arrival, иначе today+lead_time)."""
     snap = analytics.get_snapshot(db, ctx.org)
-    result = analytics_extra.build_sizes_calc(db, ctx.org.id, snap, product, qty, period, mode)
+    lead = analytics.extra_settings(ctx.org)["lead_time_days"]
+    result = analytics_extra.build_sizes_calc(
+        db, ctx.org.id, snap, product, qty, period, mode,
+        arrival=arrival or None, lead_time_days=lead,
+    )
     if result.get("error"):
         raise HTTPException(status_code=422, detail=result["error"])
     return result
@@ -404,6 +429,7 @@ def export_turnover_xlsx(
 def export_discounts_xlsx(
     ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)
 ):
+    _hidden_404("discounts")
     """Прайс уценки в Excel: скидки, старая/новая цена, причина."""
     data = analytics_markdown.build_discounts(analytics.get_snapshot(db, ctx.org))
     wb = export_xlsx.discounts_workbook(ctx.org.name, data)
@@ -418,6 +444,7 @@ def export_budget_xlsx(
     ctx: AuthContext = Depends(require_auth_api),
     db: Session = Depends(get_db),
 ):
+    _hidden_404("budget")
     """Распределение бюджета закупки в Excel (параметры — как у /api/budget)."""
     snap = analytics.get_snapshot(db, ctx.org)
     excluded = {c.strip() for c in exclude_cats.split(",") if c.strip()}

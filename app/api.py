@@ -453,3 +453,53 @@ def api_connect_moysklad(
     conn.status = "pending"
     db.commit()
     return {"ok": True, "note": "Синхронизация начнётся автоматически"}
+
+
+# ── Онбординг-инструкции страниц (значок «?») ────────────────────────────────
+
+class HintSeenIn(BaseModel):
+    page: str = Field(min_length=1, max_length=64)
+
+
+@router.get("/hints/seen")
+def api_hints_seen(ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)):
+    """Страницы, инструкции которых пользователь уже видел."""
+    from app.models import UserHintSeen
+    rows = db.execute(
+        select(UserHintSeen.page).where(UserHintSeen.user_id == ctx.user.id)
+    ).scalars().all()
+    return {"seen": list(rows)}
+
+
+@router.post("/hints/seen")
+def api_hint_mark_seen(
+    body: HintSeenIn,
+    ctx: AuthContext = Depends(require_auth_api),
+    db: Session = Depends(get_db),
+):
+    """Отметить инструкцию страницы просмотренной (идемпотентно)."""
+    from app.models import UserHintSeen
+    row = db.get(UserHintSeen, (ctx.user.id, body.page))
+    if row is None:
+        db.add(UserHintSeen(user_id=ctx.user.id, page=body.page))
+        db.commit()
+    return {"ok": True}
+
+
+@router.post("/ordered/add")
+def api_add_ordered(
+    body: OrderedIn, ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)
+):
+    """«Заказ отправлен» со страницы «Заказ отдельной позиции»: ПРИБАВЛЯЕТ
+    количество к «едет к нам» (в отличие от /ordered, который перезаписывает).
+    Приёмка в МойСкладе или received-статус заказа спишут это количество."""
+    row = db.get(OrderedQty, (ctx.org.id, body.base_name))
+    if row is None:
+        db.add(OrderedQty(org_id=ctx.org.id, base_name=body.base_name, qty=max(0, body.qty)))
+        total = max(0, body.qty)
+    else:
+        row.qty = max(0, (row.qty or 0) + body.qty)
+        total = row.qty
+    db.commit()
+    analytics.invalidate(ctx.org.id)
+    return {"ok": True, "base_name": body.base_name, "qty_total": total}

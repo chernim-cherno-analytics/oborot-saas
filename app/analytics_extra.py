@@ -34,7 +34,7 @@ from sqlalchemy import and_, case, func, select
 from sqlalchemy.orm import Session
 
 from app.categories import ru_category
-from app.models import Product, Sale
+from app.models import Product, Sale, StockDay
 
 FRESH_DAYS = 90        # бюджет: окно «свежих» продаж
 NEED_MIN = 3           # бюджет: минимальная потребность, шт
@@ -443,6 +443,60 @@ def _eff_months(months: list[str], today: date) -> float:
     return (len(months) - 1) + frac
 
 
+def _size_presence_days(
+    db: Session, org_id: int, product: str, months: list[str]
+) -> tuple[dict[str, int], int]:
+    """Дни НАЛИЧИЯ каждого размера в окне месяцев (методика оборачиваемости).
+
+    Считаем по stock_days (ежедневные снапшоты остатков per размер, нули пишутся
+    явно): день засчитывается размеру, если его остаток >= 1. Возвращает
+    ({размер: дней_в_наличии}, всего_дат_истории_в_окне, дней_с_любым_размером) —
+    второй элемент нужен как знаменатель-фолбэк для размеров, продажи которых
+    старше истории снапшотов; третий — «дни наличия позиции» для общего темпа.
+    """
+    if not months:
+        return {}, 0, 0
+    month_expr = func.substr(StockDay.date, 1, 7)
+    rows = db.execute(
+        select(Product.size, func.count())
+        .select_from(StockDay)
+        .join(Product, and_(Product.id == StockDay.product_id, Product.org_id == org_id))
+        .where(
+            StockDay.org_id == org_id,
+            Product.base_name == product,
+            StockDay.qty >= 1,
+            month_expr.in_(months),
+        )
+        .group_by(Product.size)
+    ).all()
+    pres: dict[str, int] = {}
+    for size, cnt in rows:
+        k = _norm_size(size)
+        pres[k] = pres.get(k, 0) + int(cnt or 0)
+    window_days = db.scalar(
+        select(func.count(func.distinct(StockDay.date)))
+        .select_from(StockDay)
+        .join(Product, and_(Product.id == StockDay.product_id, Product.org_id == org_id))
+        .where(
+            StockDay.org_id == org_id,
+            Product.base_name == product,
+            month_expr.in_(months),
+        )
+    ) or 0
+    any_days = db.scalar(
+        select(func.count(func.distinct(StockDay.date)))
+        .select_from(StockDay)
+        .join(Product, and_(Product.id == StockDay.product_id, Product.org_id == org_id))
+        .where(
+            StockDay.org_id == org_id,
+            Product.base_name == product,
+            StockDay.qty >= 1,
+            month_expr.in_(months),
+        )
+    ) or 0
+    return pres, int(window_days), int(any_days)
+
+
 def build_sizes_calc(
     db: Session,
     org_id: int,
@@ -451,8 +505,20 @@ def build_sizes_calc(
     qty: int,
     period: str,
     mode: str,
+    arrival: str | None = None,
+    lead_time_days: int = 45,
 ) -> dict:
-    """GET /api/sizes/calc — распределение заказа по размерам."""
+    """GET /api/sizes/calc — распределение заказа по размерам.
+
+    Методика 04.08.2026 («считаем как оборачиваемость»):
+    - темп размера = нетто-продажи за окно / дни РЕАЛЬНОГО наличия размера
+      (раньше делили на календарные месяцы — размер, распроданный в середине
+      окна, систематически недооценивался);
+    - доли заказа считаются от темпов, а не от голых продаж;
+    - остатки прогнозируются на дату прихода заказа (arrival, иначе
+      today + lead_time_days): режим «с учётом остатков» закрывает дыры
+      относительно прогнозного остатка, а не сегодняшнего.
+    """
     today = date.fromisoformat(snap["today"])
     item = snap["items"].get(product)
 
@@ -525,16 +591,45 @@ def build_sizes_calc(
             "mode": mode,
             "warning": "Нет данных по этой позиции",
             "sizes": [],
-            "totals": {"sold_period": 0, "rate_per_month": 0, "stock": 0, "order": qty},
+            "totals": {"sold_period": 0, "rate_per_month": 0, "rate_per_day": 0,
+                       "days_present": 0, "stock": 0, "stock_at_arrival": 0, "order": qty},
             "months_in_period": len(months),
             "eff_months": 0,
         }
 
-    if tot_sales > 0:
-        shares = [sales.get(s, 0.0) / tot_sales for s in sizes]
+    # Дни наличия размеров в окне + прогноз остатков на дату прихода.
+    pres, hist_window_days, pos_any_days = _size_presence_days(db, org_id, product, months)
+    try:
+        arrival_date = date.fromisoformat(arrival) if arrival else None
+    except ValueError:
+        arrival_date = None
+    if arrival_date is None:
+        arrival_date = today + timedelta(days=max(0, int(lead_time_days)))
+    days_to_arrival = max(0, (arrival_date - today).days)
+
+    # Темп размера, шт/день наличия. Если продажи есть, а дней наличия в окне 0
+    # (история снапшотов короче окна) — делим на все даты истории в окне.
+    rates: list[float] = []
+    pres_days_list: list[int] = []
+    for s in sizes:
+        sold = sales.get(s, 0.0)
+        p_days = pres.get(s, 0)
+        pres_days_list.append(p_days)
+        denom = p_days if p_days > 0 else hist_window_days
+        rates.append(sold / denom if sold > 0 and denom > 0 else 0.0)
+    tot_rate = sum(rates)
+
+    # Прогнозный остаток каждого размера на дату прихода.
+    stock_proj = [
+        max(0.0, stock.get(s, 0) - rates[i] * days_to_arrival) for i, s in enumerate(sizes)
+    ]
+    tot_stock_proj = sum(stock_proj)
+
+    if tot_rate > 0:
+        shares = [r / tot_rate for r in rates]
         pure = _largest_remainder(shares, qty)
-        targets = [sh * (qty + tot_stock) for sh in shares]
-        needs = [max(0.0, t - stock.get(sizes[i], 0)) for i, t in enumerate(targets)]
+        targets = [sh * (qty + tot_stock_proj) for sh in shares]
+        needs = [max(0.0, t - stock_proj[i]) for i, t in enumerate(targets)]
         with_stock = _largest_remainder(needs, qty) if sum(needs) > 0 else list(pure)
     elif is_season:
         # нет статистики за сезон — нули с предупреждением (правило legacy)
@@ -546,12 +641,14 @@ def build_sizes_calc(
         shares = [1.0 / len(sizes)] * len(sizes)
         warning = "За выбранный период продаж не было — деление поровну по размерам. Попробуйте период «всё время»."
         pure = _largest_remainder(shares, qty)
-        targets = [sh * (qty + tot_stock) for sh in shares]
-        needs = [max(0.0, t - stock.get(sizes[i], 0)) for i, t in enumerate(targets)]
+        targets = [sh * (qty + tot_stock_proj) for sh in shares]
+        needs = [max(0.0, t - stock_proj[i]) for i, t in enumerate(targets)]
         with_stock = _largest_remainder(needs, qty) if sum(needs) > 0 else list(pure)
 
     eff = _eff_months(months, today)
     rate = tot_sales / eff if eff > 0 else 0.0
+    pos_days = pos_any_days
+    day_rate = tot_sales / pos_days if pos_days > 0 else 0.0
 
     if is_season:
         label = f"{season_name} · за все годы"
@@ -569,18 +666,26 @@ def build_sizes_calc(
         "months_in_period": len(months),
         "eff_months": round(eff, 2),
         "warning": warning,
+        "arrival_date": arrival_date.isoformat(),
+        "days_to_arrival": days_to_arrival,
         "totals": {
             "sold_period": round(tot_sales),
             "rate_per_month": round(rate, 1),
+            "rate_per_day": round(day_rate, 2),
+            "days_present": pos_days,
             "stock": tot_stock,
+            "stock_at_arrival": round(tot_stock_proj),
             "order": qty,
         },
         "sizes": [
             {
                 "size": s,
                 "sold": round(sales.get(s, 0.0), 1),
+                "days_present": pres_days_list[i],
+                "rate_day": round(rates[i], 3),
                 "share": round(shares[i], 4),
                 "stock": stock.get(s, 0),
+                "stock_at_arrival": round(stock_proj[i]),
                 "order_stock": with_stock[i],
                 "order_pure": pure[i],
             }

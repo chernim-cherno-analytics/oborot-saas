@@ -278,7 +278,9 @@ def dashboard_page(request: Request, db: Session = Depends(get_db)):
         return templates.TemplateResponse(request, "landing.html", {})
     if not _has_active_connection(db, ctx.org.id):
         return RedirectResponse("/onboarding", status_code=302)
-    return _page(request, ctx, "dashboard.html", "dashboard", "Показатели", db=db)
+    # Дашборд «Показатели» скрыт (продукт сфокусирован на Оборачиваемости и
+    # Активном стоке) — главная ведёт сразу в Оборачиваемость.
+    return RedirectResponse("/turnover", status_code=302)
 
 
 @app.get("/onboarding", response_class=HTMLResponse)

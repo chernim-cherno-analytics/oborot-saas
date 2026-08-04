@@ -186,6 +186,23 @@ class OrderedQty(Base):
     ms_qty: Mapped[float] = mapped_column(Float, nullable=False, default=0.0, server_default="0")
 
 
+class UserHintSeen(Base):
+    """Просмотренные онбординг-инструкции страниц (значок «?» в шапке).
+
+    Первый заход пользователя на страницу инструмента показывает модалку с
+    инструкцией; после закрытия пишется строка сюда, дальше инструкция
+    открывается только по «?». Храним на сервере (per-user), а не в
+    localStorage: в iframe МойСклада third-party storage может быть недоступен,
+    плюс флаг переживает смену устройства.
+    """
+
+    __tablename__ = "user_hints_seen"
+
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), primary_key=True)
+    page: Mapped[str] = mapped_column(String(64), primary_key=True)
+    seen_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 class SkuHidden(Base):
     """Архив позиций («в архив» на Оборачиваемости, правило legacy).
 
