@@ -111,11 +111,7 @@
     <a href="/turnover" class="primary-page active">Оборачиваемость</a>
     <a href="/stocks">Активный сток</a>
     <a href="/replenish">Заказ</a>
-    <a href="/sizes">Размеры</a>
-    <a href="/budget">Бюджет</a>
-    <a href="/forecast">Прогноз</a>
-    <a href="/revenue">Оборот</a>
-    <a href="/discounts">Скидки</a>
+    <a href="/sizes">Заказ позиции</a>
     <a href="/orders">Заказы</a>
     <a href="/settings">Настройки</a>
   </nav>
@@ -399,5 +395,6 @@ async function load(){
 }
 load().catch(e=>{ document.getElementById("tb").innerHTML='<tr><td colspan="15" class="loading">Ошибка загрузки: '+e.message+'</td></tr>'; });
 </script>
+{% include "_hints.html" %}
 </body>
 </html>

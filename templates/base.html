@@ -20,13 +20,8 @@
   <nav class="embed-tabs" aria-label="Разделы Оборота">
     <a href="/turnover" class="{{ 'active' if active == 'turnover' else '' }}">Оборачиваемость</a>
     <a href="/stocks" class="{{ 'active' if active == 'stocks' else '' }}">Активный сток</a>
-    <a href="/" class="{{ 'active' if active == 'dashboard' else '' }}">Показатели</a>
-    <a href="/replenish" class="{{ 'active' if active == 'replenish' else '' }}">Что заказать<span class="pip" id="nav-pip-replenish" style="display:none;"></span></a>
-    <a href="/budget" class="{{ 'active' if active == 'budget' else '' }}">Бюджет</a>
-    <a href="/forecast" class="{{ 'active' if active == 'forecast' else '' }}">Прогноз</a>
-    <a href="/sizes" class="{{ 'active' if active == 'sizes' else '' }}">Размеры</a>
-    <a href="/discounts" class="{{ 'active' if active == 'discounts' else '' }}">Скидки</a>
-    <a href="/revenue" class="{{ 'active' if active == 'revenue' else '' }}">Оборот</a>
+    <a href="/replenish" class="{{ 'active' if active == 'replenish' else '' }}">Заказ<span class="pip" id="nav-pip-replenish" style="display:none;"></span></a>
+    <a href="/sizes" class="{{ 'active' if active == 'sizes' else '' }}">Заказ позиции</a>
     <a href="/orders" class="{{ 'active' if active == 'orders' else '' }}">Заказы</a>
     <a href="/settings" class="{{ 'active' if active == 'settings' else '' }}">Настройки</a>
   </nav>
@@ -60,14 +55,9 @@
       <div class="nav-grp">Аналитика</div>
       <a href="/turnover" class="{{ 'active' if active == 'turnover' else '' }}" style="font-weight:700;">Оборачиваемость</a>
       <a href="/stocks" class="{{ 'active' if active == 'stocks' else '' }}">Активный сток</a>
-      <a href="/" class="{{ 'active' if active == 'dashboard' else '' }}">Показатели</a>
-      <a href="/replenish" class="{{ 'active' if active == 'replenish' else '' }}">Что заказать<span class="pip" id="nav-pip-replenish" style="display:none;"></span></a>
-      <a href="/budget" class="{{ 'active' if active == 'budget' else '' }}">Бюджет</a>
-      <a href="/forecast" class="{{ 'active' if active == 'forecast' else '' }}">Прогноз</a>
-      <a href="/sizes" class="{{ 'active' if active == 'sizes' else '' }}">Размеры</a>
-      <a href="/discounts" class="{{ 'active' if active == 'discounts' else '' }}">Скидки</a>
-      <a href="/revenue" class="{{ 'active' if active == 'revenue' else '' }}">Оборот</a>
       <div class="nav-grp">Операции</div>
+      <a href="/replenish" class="{{ 'active' if active == 'replenish' else '' }}">Заказ<span class="pip" id="nav-pip-replenish" style="display:none;"></span></a>
+      <a href="/sizes" class="{{ 'active' if active == 'sizes' else '' }}">Заказ позиции</a>
       <a href="/orders" class="{{ 'active' if active == 'orders' else '' }}">Заказы</a>
       <a href="/settings" class="{{ 'active' if active == 'settings' else '' }}">Настройки</a>
     </nav>
@@ -130,5 +120,6 @@
 {% endblock %}
 <div id="toast-root"></div>
 {% block scripts %}{% endblock %}
+{% include "_hints.html" %}
 </body>
 </html>

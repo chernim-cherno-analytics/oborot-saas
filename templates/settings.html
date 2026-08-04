@@ -93,9 +93,15 @@
   </div>
 
   <div class="card">
-    <div class="card-head"><h2>Склады</h2></div>
+    <div class="card-head"><h2>Рабочие склады</h2>
+      <button class="btn" id="wh-refresh" style="margin-left:auto;font-size:12px;">Обновить список из МойСклад</button>
+    </div>
     <div class="card-body">
-      <p style="margin:0 0 8px; font-size:12px; color:var(--text-soft);">Неактивные склады не участвуют в аналитике: их остатки и продажи не учитываются.</p>
+      <p style="margin:0 0 8px; font-size:12px; color:var(--text-soft);">
+        Аналитика считает остатки и продажи <b>только по включённым складам</b>.
+        Норма: торговые точки и склад интернет-магазина — включены; транзитные,
+        производственные, брак и списания — выключены (иначе они искажают остатки и темпы).
+        После изменения набора складов пересоберите историю — кнопка появится ниже.</p>
       <div id="wh-box"><div class="loading-stub">Загрузка…</div></div>
     </div>
   </div>
@@ -224,6 +230,28 @@ document.addEventListener("DOMContentLoaded", function () {
   });
   document.getElementById("btn-save-horizon").addEventListener("click", function () {
     saveSettings(null, "Горизонт заказа и срок производства сохранены");
+  });
+
+  // «Обновить список из МойСклад»: подтягивает склады, появившиеся в МС после
+  // онбординга (GET мержит с текущим выбором, POST апсертит Warehouse-строки).
+  document.getElementById("wh-refresh").addEventListener("click", function () {
+    var btn = this;
+    btn.disabled = true; btn.textContent = "Обновляю…";
+    api("/api/connect/moysklad/stores").then(function (d) {
+      var stores = d.stores || [];
+      var selected = stores.filter(function (s) { return s.selected; }).map(function (s) { return s.ext_id; });
+      if (!selected.length) { toast("В МойСкладе не найдено складов", "error"); throw new Error("no stores"); }
+      return api("/api/connect/moysklad/stores", { method: "POST", body: { ext_ids: selected } })
+        .then(function () {
+          toast("Список складов обновлён (" + stores.length + " в МойСкладе)", "success");
+          return api("/api/settings");
+        })
+        .then(function (s) { renderWarehouses(s.warehouses || []); });
+    }).catch(function () {
+      toast("Не удалось обновить: проверьте подключение МойСклад", "error");
+    }).finally(function () {
+      btn.disabled = false; btn.textContent = "Обновить список из МойСклад";
+    });
   });
 
   function renderWarehouses(whs) {

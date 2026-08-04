@@ -13,7 +13,11 @@
     <label class="toggle-line" style="gap:8px;">Заказ, шт
       <input class="input" id="qty" type="number" min="0" value="30" style="width:90px;text-align:center;font-weight:600;">
     </label>
+    <label class="toggle-line" style="gap:8px;" title="Остатки будут спрогнозированы на эту дату по темпу продаж">Дата прихода
+      <input class="input" id="arrival" type="date" style="width:150px;font-weight:600;">
+    </label>
     <span class="muted" id="status-hint" style="font-size:12px;"></span>
+    <button class="btn primary" id="send-btn" style="display:none;margin-left:auto;">✓ Заказ отправлен</button>
   </div>
   <div class="toolbar" style="border-top:none;flex-wrap:wrap;">
     <span class="muted" style="font-size:12px;">Продажи за:</span>
@@ -38,8 +42,8 @@
 
 <div class="metric-grid" id="cards" style="grid-template-columns:repeat(4,1fr);display:none;">
   <div class="metric"><div class="m-label">Продано за период</div><div class="m-value" id="m-sold">—</div><div class="m-sub" id="m-sold-s"></div></div>
-  <div class="metric"><div class="m-label">Темп</div><div class="m-value" id="m-rate">—</div><div class="m-sub">шт / месяц</div></div>
-  <div class="metric"><div class="m-label">Остаток сейчас</div><div class="m-value" id="m-stock">—</div><div class="m-sub">по активным складам</div></div>
+  <div class="metric"><div class="m-label">Темп</div><div class="m-value" id="m-rate">—</div><div class="m-sub" id="m-rate-s">шт / день наличия</div></div>
+  <div class="metric"><div class="m-label">Остаток сейчас</div><div class="m-value" id="m-stock">—</div><div class="m-sub" id="m-stock-s">по активным складам</div></div>
   <div class="metric"><div class="m-label">Заказ</div><div class="m-value txt-green" id="m-order">—</div><div class="m-sub" id="m-order-s"></div></div>
 </div>
 
@@ -53,11 +57,14 @@
 </div>
 
 <p class="page-sub" style="margin-top:12px;">
-  <b>Как считается.</b> «С учётом остатков»: доля размера в продажах применяется к сумме
-  (текущий остаток + заказ), из результата вычитается то, что уже лежит на складе, —
-  заказ закрывает дыры по размерам, а не дублирует сток. «Чистая пропорция»: количество делится
-  ровно по долям продаж размеров. Период «N мес» = N полных месяцев + текущий неполный;
-  сезоны — за все годы истории.
+  <b>Как считается.</b> Скорость каждого размера — как оборачиваемость: продажи размера делятся
+  на дни, когда он реально был в наличии (размер, кончившийся в середине окна, не выглядит
+  «менее ходовым»). Остатки прогнозируются на дату прихода заказа по этим темпам.
+  «С учётом остатков»: доля темпа размера применяется к сумме (остаток к приходу + заказ),
+  из результата вычитается прогнозный остаток — заказ закрывает дыры по размерам, а не дублирует
+  сток. «Чистая пропорция»: количество делится ровно по долям темпов. Кнопка «Заказ отправлен»
+  добавляет сумму заказа в «Заказано» на Активном стоке. Период «N мес» = N полных месяцев +
+  текущий неполный; сезоны — за все годы истории.
 </p>
 
 {% endblock %}
@@ -138,17 +145,42 @@ document.addEventListener("DOMContentLoaded", function () {
     if (LAST) renderTable(LAST); // режим влияет только на подсветку колонок
   });
   document.getElementById("qty").addEventListener("input", debounce(calc, 250));
+  document.getElementById("arrival").addEventListener("change", function () { calc(); });
 
   var LAST = null;
 
   function calc() {
     if (!SEL) return;
     var q = Math.max(0, parseInt(document.getElementById("qty").value, 10) || 0);
+    var arr = document.getElementById("arrival").value || "";
     api("/api/sizes/calc?product=" + encodeURIComponent(SEL) + "&qty=" + q +
-        "&period=" + encodeURIComponent(PERIOD) + "&mode=" + MODE)
-      .then(function (d) { LAST = d; render(d); })
+        "&period=" + encodeURIComponent(PERIOD) + "&mode=" + MODE +
+        "&arrival=" + encodeURIComponent(arr))
+      .then(function (d) {
+        LAST = d;
+        // первый расчёт: сервер вернул дату прихода по сроку производства —
+        // подставляем её в поле, дальше пользователь правит сам
+        if (!document.getElementById("arrival").value && d.arrival_date) {
+          document.getElementById("arrival").value = d.arrival_date;
+        }
+        render(d);
+      })
       .catch(function () {});
   }
+
+  // «Заказ отправлен»: сумма активного режима → в «Заказано» (Активный сток)
+  document.getElementById("send-btn").addEventListener("click", function () {
+    if (!LAST || !SEL) return;
+    var key = MODE === "stock" ? "order_stock" : "order_pure";
+    var total = LAST.sizes.reduce(function (a, s) { return a + (s[key] || 0); }, 0);
+    if (total <= 0) { toast("Заказ пустой — нечего отправлять", "error"); return; }
+    if (!confirm("Добавить " + total + " шт «" + SEL + "» в «Заказано» на Активном стоке?")) return;
+    api("/api/ordered/add", { method: "POST", body: { base_name: SEL, qty: total } })
+      .then(function (r) {
+        toast("Отправлено: теперь в «Заказано» " + fmtInt(r.qty_total) + " шт", "ok");
+      })
+      .catch(function () { toast("Не удалось сохранить — попробуйте ещё раз", "error"); });
+  });
 
   function render(d) {
     var warn = document.getElementById("warn-box");
@@ -168,10 +200,16 @@ document.addEventListener("DOMContentLoaded", function () {
     document.getElementById("m-sold").textContent = fmtInt(d.totals.sold_period) + " шт";
     document.getElementById("m-sold-s").textContent = d.period_label +
       (d.period === "all" && d.months_in_period ? " · " + d.months_in_period + " мес данных" : "");
-    document.getElementById("m-rate").textContent = fmtNum(d.totals.rate_per_month, 1);
+    document.getElementById("m-rate").textContent = fmtNum(d.totals.rate_per_day, 2);
+    document.getElementById("m-rate-s").textContent =
+      "шт / день наличия · был в наличии " + fmtInt(d.totals.days_present) + " дн.";
     document.getElementById("m-stock").textContent = fmtInt(d.totals.stock) + " шт";
+    document.getElementById("m-stock-s").textContent = d.days_to_arrival > 0
+      ? "к приходу ≈ " + fmtInt(d.totals.stock_at_arrival) + " шт (через " + d.days_to_arrival + " дн.)"
+      : "по активным складам";
     document.getElementById("m-order").textContent = fmtInt(d.totals.order) + " шт";
     document.getElementById("m-order-s").textContent = d.sizes.length + " размер(а/ов)";
+    document.getElementById("send-btn").style.display = "";
 
     renderTable(d);
   }
@@ -180,18 +218,24 @@ document.addEventListener("DOMContentLoaded", function () {
     var stockCol = MODE === "stock";
     var hl = ' style="background:var(--green-soft,#e8f6e4);"';
     document.getElementById("thead").innerHTML = "<tr><th>Размер</th>" +
-      '<th class="num">Продажи за период</th><th class="num">Доля продаж</th><th class="num">Остаток сейчас</th>' +
+      '<th class="num">Продажи за период</th><th class="num" title="дней, когда размер был на складе, в выбранном окне">Дней в наличии</th>' +
+      '<th class="num">Темп шт/день</th><th class="num">Доля темпа</th>' +
+      '<th class="num">Остаток сейчас</th><th class="num" title="прогноз на дату прихода по темпу продаж">Остаток к приходу</th>' +
       '<th class="num"' + (stockCol ? hl : "") + ">Заказать · с учётом остатков</th>" +
       '<th class="num"' + (!stockCol ? hl : "") + ">Заказать · чистая пропорция</th></tr>";
 
     var maxShare = Math.max.apply(null, d.sizes.map(function (s) { return s.share; }).concat([0.0001]));
+    var showProj = d.days_to_arrival > 0;
     var rows = d.sizes.map(function (s) {
       var bar = '<span style="display:inline-block;width:64px;height:6px;border-radius:3px;background:#eef0f3;vertical-align:middle;margin-right:7px;overflow:hidden;">' +
         '<i style="display:block;height:100%;width:' + Math.round(s.share / maxShare * 100) + '%;background:var(--accent,#2563eb);border-radius:3px;"></i></span>';
       return "<tr><td><b>" + esc(s.size) + "</b></td>" +
         '<td class="num' + (s.sold ? "" : " muted") + '">' + fmtInt(s.sold) + "</td>" +
+        '<td class="num' + (s.days_present ? "" : " muted") + '">' + fmtInt(s.days_present) + "</td>" +
+        '<td class="num' + (s.rate_day ? "" : " muted") + '">' + (s.rate_day ? fmtNum(s.rate_day, 2) : "0") + "</td>" +
         '<td class="num">' + bar + Math.round(s.share * 100) + " %</td>" +
         '<td class="num' + (s.stock ? "" : " muted") + '">' + fmtInt(s.stock) + "</td>" +
+        '<td class="num' + (s.stock_at_arrival ? "" : " muted") + '">' + (showProj ? fmtInt(s.stock_at_arrival) : "—") + "</td>" +
         '<td class="num"' + (stockCol ? hl : "") + "><b" + (stockCol ? "" : ' class="muted"') + ">" + fmtInt(s.order_stock) + "</b></td>" +
         '<td class="num"' + (!stockCol ? hl : "") + "><b" + (!stockCol ? "" : ' class="muted"') + ">" + fmtInt(s.order_pure) + "</b></td></tr>";
     }).join("");
@@ -200,8 +244,10 @@ document.addEventListener("DOMContentLoaded", function () {
     var sumPure = d.sizes.reduce(function (a, s) { return a + s.order_pure; }, 0);
     rows += '<tr style="font-weight:700;background:#f6f7f9;"><td>ИТОГО</td>' +
       '<td class="num">' + fmtInt(d.totals.sold_period) + "</td>" +
+      '<td class="num"></td><td class="num"></td>' +
       '<td class="num">100 %</td>' +
       '<td class="num">' + fmtInt(d.totals.stock) + "</td>" +
+      '<td class="num">' + (showProj ? fmtInt(d.totals.stock_at_arrival) : "—") + "</td>" +
       '<td class="num">' + fmtInt(sumStock) + "</td>" +
       '<td class="num">' + fmtInt(sumPure) + "</td></tr>";
     document.getElementById("tbody").innerHTML = rows;
