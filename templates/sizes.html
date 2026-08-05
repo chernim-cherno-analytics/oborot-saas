@@ -1,257 +1,351 @@
-{% extends "base.html" %}
-{% block content %}
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>{{ org.name }} · Заказ отдельной позиции — Оборот</title>
+<style>
+  /* ── Стиль первой таблицы (legacy CC): страница «Заказ позиции» ── */
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0 }
+  body { font-family: Helvetica, 'Helvetica Neue', Arial, sans-serif; min-height: 100vh; background: #f3e9e0; color: #1f1f1f; }
+  .gradient-bg { position: fixed; inset: 0; z-index: 0; overflow: hidden; background: #f3e9e0; }
+  .gradient-bg::before, .gradient-bg::after { position: absolute; border-radius: 50%; filter: blur(90px); opacity: .9; content: ''; }
+  .gradient-bg::before { width: 70vw; height: 70vw; background: radial-gradient(circle,#efe5db,transparent 70%); top: -20%; left: -10%; }
+  .gradient-bg::after { width: 60vw; height: 60vw; background: radial-gradient(circle,#e2d8cf,transparent 70%); bottom: -15%; right: -10%; }
+  .header { position: sticky; top: 0; z-index: 200; padding: 0 28px; height: 56px; background: rgba(243,233,224,.85); backdrop-filter: blur(10px);
+    display: flex; align-items: center; justify-content: space-between; }
+  .logo { text-decoration: none; font-size: 15px; font-weight: 700; letter-spacing: .12em; color: #1f1f1f; }
+  .nav { display: flex; gap: 18px; flex-wrap: wrap; }
+  .nav a { font-size: 13px; color: rgba(31,31,31,.45); text-decoration: none; }
+  .nav a:hover { color: #434446 }
+  .nav a.active { color: #1f1f1f; font-weight: 700; }
+  .main { padding: 8px 28px 24px; max-width: 1100px; margin: 0 auto; position: relative; z-index: 3; }
 
-<p class="page-sub">Распределение заказа по размерам на основе истории продаж. Продажи — нетто (минус возвраты).</p>
+  .panel { background: rgba(255,255,255,.6); backdrop-filter: blur(10px);
+    border: 1px solid rgba(31,31,31,.08); border-radius: 12px; padding: 16px 18px; margin: 10px 0 16px;
+    position: relative; z-index: 50; }
+  .row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  .lbl { font-size: 11px; font-weight: 600; letter-spacing: .07em; text-transform: uppercase; color: rgba(31,31,31,.5); }
+  .search-wrap { position: relative; flex: 1 1 340px; }
+  .search { width: 100%; padding: 9px 14px; border-radius: 10px; font-size: 14px;
+    border: 1px solid rgba(31,31,31,.16); background: rgba(255,255,255,.85); outline: none; }
+  .dd { position: absolute; top: calc(100% + 4px); left: 0; right: 0; z-index: 100;
+    background: #fff; border: 1px solid rgba(31,31,31,.12); border-radius: 10px;
+    max-height: 320px; overflow: auto; box-shadow: 0 8px 24px rgba(31,31,31,.12); display: none; }
+  .dd div { padding: 8px 14px; font-size: 13px; cursor: pointer; }
+  .dd div:hover, .dd div.hl { background: rgba(31,31,31,.07); }
+  .dd .sub { font-size: 11px; color: rgba(31,31,31,.45); margin-left: 6px; }
+  .qinp { width: 110px; padding: 9px 12px; border-radius: 10px; font-size: 15px; font-weight: 700; text-align: center;
+    border: 1px solid rgba(31,31,31,.2); background: #fff; outline: none; }
+  .seg { display: flex; gap: 0; border: 1px solid rgba(31,31,31,.15); border-radius: 20px; overflow: hidden; }
+  .seg button { font-size: 12px; font-weight: 500; padding: 6px 14px; border: none; background: transparent;
+    color: #434446; cursor: pointer; transition: all .15s; }
+  .seg button.active { background: rgba(31,31,31,.85); color: #f3e9e0; }
+  .hint { font-size: 11px; color: rgba(31,31,31,.45); }
+  .dl-btn { margin-left: auto; font-size: 12px; font-weight: 600; padding: 8px 18px; border-radius: 20px;
+    border: 1px solid rgba(31,31,31,.25); background: #2c7a1f; color: #f3e9e0; cursor: pointer; }
+  .dl-btn:hover { background: #3d9430; }
 
-<div class="card">
-  <div class="toolbar" style="flex-wrap:wrap;">
-    <div class="search-box" style="width:340px;position:relative;">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.5" y2="16.5"/></svg>
-      <input class="input" type="search" id="prod-search" placeholder="Начните вводить название товара…" autocomplete="off">
-      <div id="dd" style="position:absolute;top:calc(100% + 4px);left:0;right:0;z-index:100;background:#fff;border:1px solid var(--border-strong,#d7dbe0);border-radius:8px;max-height:320px;overflow:auto;box-shadow:0 8px 24px rgba(31,41,55,.12);display:none;"></div>
-    </div>
-    <label class="toggle-line" style="gap:8px;">Заказ, шт
-      <input class="input" id="qty" type="number" min="0" value="30" style="width:90px;text-align:center;font-weight:600;">
-    </label>
-    <label class="toggle-line" style="gap:8px;" title="Остатки будут спрогнозированы на эту дату по темпу продаж">Дата прихода
-      <input class="input" id="arrival" type="date" style="width:150px;font-weight:600;">
-    </label>
-    <span class="muted" id="status-hint" style="font-size:12px;"></span>
-    <button class="btn primary" id="send-btn" style="display:none;margin-left:auto;">✓ Заказ отправлен</button>
-  </div>
-  <div class="toolbar" style="border-top:none;flex-wrap:wrap;">
-    <span class="muted" style="font-size:12px;">Продажи за:</span>
-    <div class="chips" id="period-seg">
-      <button class="chip" data-p="6m">6 мес</button>
-      <button class="chip active" data-p="12m">12 мес</button>
-      <button class="chip" data-p="all">всё время</button>
-      <button class="chip" data-p="spring">весна</button>
-      <button class="chip" data-p="summer">лето</button>
-      <button class="chip" data-p="autumn">осень</button>
-      <button class="chip" data-p="winter">зима</button>
-    </div>
-    <span class="muted" style="font-size:12px;margin-left:10px;">Режим:</span>
-    <div class="chips" id="mode-seg">
-      <button class="chip active" data-m="stock">с учётом остатков</button>
-      <button class="chip" data-m="pure">чистая пропорция</button>
-    </div>
-  </div>
+  .cards { display: grid; grid-template-columns: repeat(4,1fr); gap: 12px; margin-bottom: 16px; }
+  .card { background: rgba(255,255,255,.6); backdrop-filter: blur(10px);
+    border: 1px solid rgba(31,31,31,.08); border-radius: 12px; padding: 13px 17px; }
+  .card .l { font-size: 10px; font-weight: 600; letter-spacing: .07em; text-transform: uppercase;
+    color: rgba(31,31,31,.5); margin-bottom: 5px; }
+  .card .v { font-size: 22px; font-weight: 700; }
+  .card .s { font-size: 11px; color: rgba(31,31,31,.5); margin-top: 3px; }
+
+  .table-outer { background: rgba(255,255,255,.55); backdrop-filter: blur(16px);
+    border: 1px solid rgba(31,31,31,.09); border-radius: 12px; overflow: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  thead th { background: rgba(255,255,255,.88); padding: 10px; text-align: center;
+    font-size: 10px; font-weight: 500; color: rgba(31,31,31,.62); letter-spacing: .06em;
+    text-transform: uppercase; position: sticky; top: 0; z-index: 10;
+    border-bottom: 1px solid rgba(31,31,31,.09); }
+  thead th:first-child { text-align: left; padding-left: 16px; }
+  tbody td { padding: 9px 10px; border-bottom: 1px solid rgba(31,31,31,.06);
+    text-align: center; vertical-align: middle; }
+  tbody td:first-child { text-align: left; padding-left: 16px; font-weight: 700; font-size: 14px; }
+  tr.total td { font-weight: 700; background: rgba(31,31,31,.05); }
+  .qty { font-weight: 700; font-size: 15px; }
+  .qty.zero { opacity: .3; font-weight: 400; }
+  .rec { font-weight: 700; font-size: 16px; }
+  .rec.dim { opacity: .35; font-weight: 500; font-size: 13px; }
+  .sharebar { display: inline-block; width: 70px; height: 6px; border-radius: 3px;
+    background: rgba(31,31,31,.08); vertical-align: middle; margin-right: 7px; overflow: hidden; }
+  .sharebar i { display: block; height: 100%; background: rgba(31,31,31,.6); border-radius: 3px; }
+  .loading { text-align: center; padding: 60px; color: rgba(31,31,31,.45); font-size: 13px; }
+  .warn { font-size: 12px; color: #a15c00; background: rgba(255,204,0,.15);
+    border: 1px solid rgba(255,204,0,.4); border-radius: 10px; padding: 9px 14px; margin-bottom: 14px; }
+  .modecol { background: rgba(76,187,23,.10); }
+</style>
+</head>
+<body>
+<div class="gradient-bg"></div>
+<div class="header">
+  <a class="logo" href="/turnover">ОБОРОТ</a>
+  <nav class="nav">
+    <a href="/turnover">Оборачиваемость</a>
+    <a href="/stocks">Активный сток</a>
+    <a href="/replenish">Заказ</a>
+    <a href="/sizes" class="active">Заказ позиции</a>
+    <a href="/budget">Бюджет</a>
+    <a href="/forecast">Прогноз</a>
+    <a href="/revenue">Оборот</a>
+    <a href="/settings">Настройки</a>
+  </nav>
 </div>
 
-<div id="warn-box"></div>
+<div class="main">
+  <div class="panel">
+    <div class="row" style="margin-bottom:12px">
+      <span class="lbl">Товар</span>
+      <div class="search-wrap">
+        <input class="search" id="prod-search" placeholder="Начни вводить название... (например «жилет галстук»)" autocomplete="off">
+        <div class="dd" id="dd"></div>
+      </div>
+      <span class="lbl">Заказ, шт</span>
+      <input class="qinp" id="qty" type="number" min="0" value="30">
+      <span class="lbl" title="Остатки будут спрогнозированы на эту дату по темпу продаж">Дата прихода</span>
+      <input class="qinp" id="arrival" type="date" style="width:150px;font-size:13px;font-weight:600">
+    </div>
+    <div class="row">
+      <span class="lbl">Продажи за</span>
+      <div class="seg" id="period-seg">
+        <button data-p="6m">6 мес</button>
+        <button data-p="12m" class="active">12 мес</button>
+        <button data-p="all">всё время</button>
+        <button data-p="spring">весна</button>
+        <button data-p="summer">лето</button>
+        <button data-p="autumn">осень</button>
+        <button data-p="winter">зима</button>
+      </div>
+      <span class="lbl" style="margin-left:14px">Режим</span>
+      <div class="seg" id="mode-seg">
+        <button data-m="stock" class="active">с учётом остатков</button>
+        <button data-m="pure">чистая пропорция</button>
+      </div>
+      <span class="hint" id="status-hint">загружаю список товаров…</span>
+      <button class="dl-btn" id="send-btn" style="display:none">✓ Заказ отправлен</button>
+    </div>
+  </div>
 
-<div class="metric-grid" id="cards" style="grid-template-columns:repeat(4,1fr);display:none;">
-  <div class="metric"><div class="m-label">Продано за период</div><div class="m-value" id="m-sold">—</div><div class="m-sub" id="m-sold-s"></div></div>
-  <div class="metric"><div class="m-label">Темп</div><div class="m-value" id="m-rate">—</div><div class="m-sub" id="m-rate-s">шт / день наличия</div></div>
-  <div class="metric"><div class="m-label">Остаток сейчас</div><div class="m-value" id="m-stock">—</div><div class="m-sub" id="m-stock-s">по активным складам</div></div>
-  <div class="metric"><div class="m-label">Заказ</div><div class="m-value txt-green" id="m-order">—</div><div class="m-sub" id="m-order-s"></div></div>
-</div>
+  <div id="warn-box"></div>
+  <div class="cards" id="cards" style="display:none">
+    <div class="card"><div class="l">Продано за период</div><div class="v" id="m-sold">—</div><div class="s" id="m-sold-s"></div></div>
+    <div class="card"><div class="l">Темп</div><div class="v" id="m-rate">—</div><div class="s" id="m-rate-s">шт / день наличия</div></div>
+    <div class="card"><div class="l">Остаток сейчас</div><div class="v" id="m-stock">—</div><div class="s" id="m-stock-s">по активным складам</div></div>
+    <div class="card" style="background:rgba(76,187,23,0.2)"><div class="l">Заказ</div><div class="v" id="m-order">—</div><div class="s" id="m-order-s"></div></div>
+  </div>
 
-<div class="card">
-  <div class="tbl-wrap">
-    <table class="tbl">
+  <div class="table-outer">
+    <table>
       <thead id="thead"></thead>
-      <tbody id="tbody"><tr><td><div class="loading-stub">Выберите товар — посчитаем распределение по размерам</div></td></tr></tbody>
+      <tbody id="tbody"><tr><td class="loading">Выбери товар — посчитаю распределение по размерам</td></tr></tbody>
     </table>
   </div>
+
+  <div class="hint" style="margin-top:12px;line-height:1.6">
+    <b>Как считается.</b> Скорость каждого размера — как оборачиваемость: продажи размера делятся
+    на дни, когда он реально был в наличии (размер, кончившийся в середине окна, не выглядит
+    «менее ходовым»). Остатки прогнозируются на дату прихода заказа по этим темпам. «С учётом
+    остатков»: доля темпа размера применяется к сумме (остаток к приходу + заказ), из результата
+    вычитается прогнозный остаток — заказ закрывает дыры по размерам, а не дублирует сток.
+    «Чистая пропорция»: количество делится ровно по долям темпов. Кнопка «Заказ отправлен»
+    добавляет сумму заказа в «Заказано» на Активном стоке. Период «N мес» = N полных месяцев +
+    текущий неполный; сезоны — за все годы истории.
+  </div>
 </div>
 
-<p class="page-sub" style="margin-top:12px;">
-  <b>Как считается.</b> Скорость каждого размера — как оборачиваемость: продажи размера делятся
-  на дни, когда он реально был в наличии (размер, кончившийся в середине окна, не выглядит
-  «менее ходовым»). Остатки прогнозируются на дату прихода заказа по этим темпам.
-  «С учётом остатков»: доля темпа размера применяется к сумме (остаток к приходу + заказ),
-  из результата вычитается прогнозный остаток — заказ закрывает дыры по размерам, а не дублирует
-  сток. «Чистая пропорция»: количество делится ровно по долям темпов. Кнопка «Заказ отправлен»
-  добавляет сумму заказа в «Заказано» на Активном стоке. Период «N мес» = N полных месяцев +
-  текущий неполный; сезоны — за все годы истории.
-</p>
-
-{% endblock %}
-
-{% block scripts %}
 <script>
-document.addEventListener("DOMContentLoaded", function () {
-  var PRODUCTS = [];
-  var SEL = null, PERIOD = "12m", MODE = "stock";
-  var hlIdx = -1, ddItems = [];
+(function(){
+  "use strict";
+  function esc(s){ return String(s==null?"":s).replace(/[&<>"']/g,function(c){ return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]; }); }
+  function fmt(n){ return Math.round(n||0).toLocaleString("ru-RU"); }
+  function fmtNum(n,d){ if(n===null||n===undefined||isNaN(n)) return "—"; return Number(n).toLocaleString("ru-RU",{maximumFractionDigits:d===undefined?2:d}); }
+  function mw(name,q){ if(!q) return true; var nl=name.toLowerCase();
+    return q.toLowerCase().split(/\s+/).every(function(w){ return nl.indexOf(w)>=0; }); }
+  function debounce(fn,ms){ var t; return function(){ var a=arguments,self=this;
+    clearTimeout(t); t=setTimeout(function(){ fn.apply(self,a); },ms); }; }
+  async function api(url,opts){ var o=opts||{};
+    var r=await fetch(url,{method:o.method||"GET",
+      headers:{"Content-Type":"application/json","X-Oborot-CSRF":"1"},
+      body:o.body?JSON.stringify(o.body):undefined, credentials:"same-origin"});
+    if(!r.ok) throw new Error("HTTP "+r.status);
+    return r.json();
+  }
 
-  var inp = document.getElementById("prod-search");
-  var dd = document.getElementById("dd");
-  var hint = document.getElementById("status-hint");
+  var PRODUCTS=[];
+  var SEL=null, PERIOD="12m", MODE="stock";
+  var hlIdx=-1, ddItems=[];
+  var inp=document.getElementById("prod-search");
+  var dd=document.getElementById("dd");
+  var hint=document.getElementById("status-hint");
 
-  hint.textContent = "загружаю список товаров…";
-  api("/api/sizes/products").then(function (d) {
-    PRODUCTS = d.products || [];
-    hint.textContent = PRODUCTS.length + " позиций";
-  }).catch(function () { hint.textContent = "ошибка загрузки"; });
+  api("/api/sizes/products").then(function(d){
+    PRODUCTS=d.products||[];
+    hint.textContent=PRODUCTS.length+" позиций";
+  }).catch(function(){ hint.textContent="ошибка загрузки"; });
 
-  // ── выпадающий список товара ──
-  function showDD() {
-    var q = (inp.value || "").trim();
-    if (!q) { dd.style.display = "none"; return; }
-    ddItems = PRODUCTS.filter(function (p) { return wordMatch(p.base_name, q); }).slice(0, 50);
-    hlIdx = 0;
-    dd.innerHTML = ddItems.map(function (p, i) {
-      return '<div data-i="' + i + '" style="padding:8px 12px;font-size:13px;cursor:pointer;">' +
-        esc(p.base_name) + ' <span class="muted" style="font-size:11px;">· продано ' + fmtInt(p.sold) +
-        " · на складе " + fmtInt(p.in_stock) + "</span></div>";
-    }).join("") || '<div class="muted" style="padding:8px 12px;font-size:13px;">ничего не нашлось</div>';
-    dd.style.display = "block";
+  function showDD(){
+    var q=(inp.value||"").trim();
+    if(!q){ dd.style.display="none"; return; }
+    ddItems=PRODUCTS.filter(function(p){ return mw(p.base_name,q); }).slice(0,50);
+    hlIdx=0;
+    dd.innerHTML=ddItems.map(function(p,i){
+      return '<div data-i="'+i+'">'+esc(p.base_name)+
+        '<span class="sub">· продано '+fmt(p.sold)+' · на складе '+fmt(p.in_stock)+'</span></div>';
+    }).join("")||'<div style="color:rgba(31,31,31,0.4)">ничего не нашлось</div>';
+    dd.style.display="block";
     paintHl();
-    dd.querySelectorAll("[data-i]").forEach(function (el) {
-      el.addEventListener("mousedown", function (e) {
+    dd.querySelectorAll("[data-i]").forEach(function(el){
+      el.addEventListener("mousedown",function(e){
         e.preventDefault();
-        pick(ddItems[parseInt(el.getAttribute("data-i"), 10)].base_name);
+        pick(ddItems[parseInt(el.getAttribute("data-i"),10)].base_name);
       });
-      el.addEventListener("mouseenter", function () { hlIdx = parseInt(el.getAttribute("data-i"), 10); paintHl(); });
+      el.addEventListener("mouseenter",function(){ hlIdx=parseInt(el.getAttribute("data-i"),10); paintHl(); });
     });
   }
-  function paintHl() {
-    dd.querySelectorAll("[data-i]").forEach(function (el, i) {
-      el.style.background = i === hlIdx ? "var(--accent-soft, #eaf0fe)" : "";
-    });
+  function paintHl(){
+    dd.querySelectorAll("[data-i]").forEach(function(el,i){ el.classList.toggle("hl",i===hlIdx); });
+    var el=dd.querySelector('[data-i="'+hlIdx+'"]');
+    if(el) el.scrollIntoView({block:"nearest"});
   }
-  function pick(base) {
-    SEL = base;
-    inp.value = base;
-    dd.style.display = "none";
-    calc();
+  function pick(base){
+    SEL=base; inp.value=base; dd.style.display="none"; calc();
   }
-  inp.addEventListener("input", function () { SEL = null; showDD(); });
-  inp.addEventListener("focus", showDD);
-  document.addEventListener("click", function (e) {
-    if (!e.target.closest(".search-box")) dd.style.display = "none";
+  inp.addEventListener("input",function(){ SEL=null; showDD(); });
+  inp.addEventListener("focus",showDD);
+  document.addEventListener("click",function(e){
+    if(!e.target.closest(".search-wrap")) dd.style.display="none";
   });
-  inp.addEventListener("keydown", function (e) {
-    if (dd.style.display === "none") return;
-    if (e.key === "ArrowDown") { e.preventDefault(); hlIdx = Math.min(hlIdx + 1, ddItems.length - 1); paintHl(); }
-    else if (e.key === "ArrowUp") { e.preventDefault(); hlIdx = Math.max(hlIdx - 1, 0); paintHl(); }
-    else if (e.key === "Enter") { e.preventDefault(); if (ddItems[hlIdx]) pick(ddItems[hlIdx].base_name); }
-    else if (e.key === "Escape") { dd.style.display = "none"; }
+  inp.addEventListener("keydown",function(e){
+    if(dd.style.display==="none") return;
+    if(e.key==="ArrowDown"){ e.preventDefault(); hlIdx=Math.min(hlIdx+1,ddItems.length-1); paintHl(); }
+    else if(e.key==="ArrowUp"){ e.preventDefault(); hlIdx=Math.max(hlIdx-1,0); paintHl(); }
+    else if(e.key==="Enter"){ e.preventDefault(); if(ddItems[hlIdx]) pick(ddItems[hlIdx].base_name); }
+    else if(e.key==="Escape"){ dd.style.display="none"; }
   });
 
-  // ── переключатели ──
-  document.getElementById("period-seg").addEventListener("click", function (e) {
-    var b = e.target.closest(".chip"); if (!b) return;
-    PERIOD = b.getAttribute("data-p");
-    this.querySelectorAll(".chip").forEach(function (x) { x.classList.toggle("active", x === b); });
+  document.getElementById("period-seg").addEventListener("click",function(e){
+    var b=e.target.closest("button"); if(!b) return;
+    PERIOD=b.getAttribute("data-p");
+    this.querySelectorAll("button").forEach(function(x){ x.classList.toggle("active",x===b); });
     calc();
   });
-  document.getElementById("mode-seg").addEventListener("click", function (e) {
-    var b = e.target.closest(".chip"); if (!b) return;
-    MODE = b.getAttribute("data-m");
-    this.querySelectorAll(".chip").forEach(function (x) { x.classList.toggle("active", x === b); });
-    if (LAST) renderTable(LAST); // режим влияет только на подсветку колонок
+  document.getElementById("mode-seg").addEventListener("click",function(e){
+    var b=e.target.closest("button"); if(!b) return;
+    MODE=b.getAttribute("data-m");
+    this.querySelectorAll("button").forEach(function(x){ x.classList.toggle("active",x===b); });
+    if(LAST) render(LAST); // режим влияет на подсветку колонок и карточку «Заказ»
   });
-  document.getElementById("qty").addEventListener("input", debounce(calc, 250));
-  document.getElementById("arrival").addEventListener("change", function () { calc(); });
+  document.getElementById("qty").addEventListener("input",debounce(calc,250));
+  document.getElementById("arrival").addEventListener("change",function(){ calc(); });
 
-  var LAST = null;
+  var LAST=null;
 
-  function calc() {
-    if (!SEL) return;
-    var q = Math.max(0, parseInt(document.getElementById("qty").value, 10) || 0);
-    var arr = document.getElementById("arrival").value || "";
-    api("/api/sizes/calc?product=" + encodeURIComponent(SEL) + "&qty=" + q +
-        "&period=" + encodeURIComponent(PERIOD) + "&mode=" + MODE +
-        "&arrival=" + encodeURIComponent(arr))
-      .then(function (d) {
-        LAST = d;
+  function calc(){
+    if(!SEL) return;
+    var q=Math.max(0,parseInt(document.getElementById("qty").value,10)||0);
+    var arr=document.getElementById("arrival").value||"";
+    api("/api/sizes/calc?product="+encodeURIComponent(SEL)+"&qty="+q+
+        "&period="+encodeURIComponent(PERIOD)+"&mode="+MODE+
+        "&arrival="+encodeURIComponent(arr))
+      .then(function(d){
+        LAST=d;
         // первый расчёт: сервер вернул дату прихода по сроку производства —
         // подставляем её в поле, дальше пользователь правит сам
-        if (!document.getElementById("arrival").value && d.arrival_date) {
-          document.getElementById("arrival").value = d.arrival_date;
+        if(!document.getElementById("arrival").value&&d.arrival_date){
+          document.getElementById("arrival").value=d.arrival_date;
         }
         render(d);
       })
-      .catch(function () {});
+      .catch(function(){});
   }
 
   // «Заказ отправлен»: сумма активного режима → в «Заказано» (Активный сток)
-  document.getElementById("send-btn").addEventListener("click", function () {
-    if (!LAST || !SEL) return;
-    var key = MODE === "stock" ? "order_stock" : "order_pure";
-    var total = LAST.sizes.reduce(function (a, s) { return a + (s[key] || 0); }, 0);
-    if (total <= 0) { toast("Заказ пустой — нечего отправлять", "error"); return; }
-    if (!confirm("Добавить " + total + " шт «" + SEL + "» в «Заказано» на Активном стоке?")) return;
-    api("/api/ordered/add", { method: "POST", body: { base_name: SEL, qty: total } })
-      .then(function (r) {
-        toast("Отправлено: теперь в «Заказано» " + fmtInt(r.qty_total) + " шт", "ok");
+  document.getElementById("send-btn").addEventListener("click",function(){
+    if(!LAST||!SEL) return;
+    var key=MODE==="stock"?"order_stock":"order_pure";
+    var total=LAST.sizes.reduce(function(a,s){ return a+(s[key]||0); },0);
+    if(total<=0){ alert("Заказ пустой — нечего отправлять."); return; }
+    if(!confirm("Добавить "+total+" шт «"+SEL+"» в «Заказано» на Активном стоке?")) return;
+    var btn=this;
+    api("/api/ordered/add",{method:"POST",body:{base_name:SEL,qty:total}})
+      .then(function(r){
+        btn.textContent="✓ Отправлено: "+fmt(r.qty_total)+" шт в «Заказано»";
+        setTimeout(function(){ btn.textContent="✓ Заказ отправлен"; },4000);
       })
-      .catch(function () { toast("Не удалось сохранить — попробуйте ещё раз", "error"); });
+      .catch(function(){ alert("Не удалось сохранить — попробуй ещё раз."); });
   });
 
-  function render(d) {
-    var warn = document.getElementById("warn-box");
-    warn.innerHTML = d.warning
-      ? '<div class="card"><div class="card-body"><span class="badge yellow">' + esc(d.warning) + "</span></div></div>"
-      : "";
+  function render(d){
+    var warn=document.getElementById("warn-box");
+    warn.innerHTML=d.warning?'<div class="warn">'+esc(d.warning)+'</div>':"";
 
-    if (!d.sizes.length) {
-      document.getElementById("thead").innerHTML = "";
-      document.getElementById("tbody").innerHTML =
-        '<tr><td><div class="loading-stub">Нет данных по этой позиции</div></td></tr>';
-      document.getElementById("cards").style.display = "none";
+    if(!d.sizes.length){
+      document.getElementById("thead").innerHTML="";
+      document.getElementById("tbody").innerHTML='<tr><td class="loading">Нет данных по этой позиции</td></tr>';
+      document.getElementById("cards").style.display="none";
+      document.getElementById("send-btn").style.display="none";
       return;
     }
 
-    document.getElementById("cards").style.display = "";
-    document.getElementById("m-sold").textContent = fmtInt(d.totals.sold_period) + " шт";
-    document.getElementById("m-sold-s").textContent = d.period_label +
-      (d.period === "all" && d.months_in_period ? " · " + d.months_in_period + " мес данных" : "");
-    document.getElementById("m-rate").textContent = fmtNum(d.totals.rate_per_day, 2);
-    document.getElementById("m-rate-s").textContent =
-      "шт / день наличия · был в наличии " + fmtInt(d.totals.days_present) + " дн.";
-    document.getElementById("m-stock").textContent = fmtInt(d.totals.stock) + " шт";
-    document.getElementById("m-stock-s").textContent = d.days_to_arrival > 0
-      ? "к приходу ≈ " + fmtInt(d.totals.stock_at_arrival) + " шт (через " + d.days_to_arrival + " дн.)"
+    var key=MODE==="stock"?"order_stock":"order_pure";
+    var orderTotal=d.sizes.reduce(function(a,s){ return a+(s[key]||0); },0);
+    document.getElementById("cards").style.display="";
+    document.getElementById("m-sold").textContent=fmt(d.totals.sold_period)+" шт";
+    document.getElementById("m-sold-s").textContent=d.period_label+
+      (d.period==="all"&&d.months_in_period?" · "+d.months_in_period+" мес данных":"");
+    document.getElementById("m-rate").textContent=fmtNum(d.totals.rate_per_day,2);
+    document.getElementById("m-rate-s").textContent=
+      "шт / день наличия · был в наличии "+fmt(d.totals.days_present)+" дн.";
+    document.getElementById("m-stock").textContent=fmt(d.totals.stock)+" шт";
+    document.getElementById("m-stock-s").textContent=d.days_to_arrival>0
+      ? "к приходу ≈ "+fmt(d.totals.stock_at_arrival)+" шт (через "+d.days_to_arrival+" дн.)"
       : "по активным складам";
-    document.getElementById("m-order").textContent = fmtInt(d.totals.order) + " шт";
-    document.getElementById("m-order-s").textContent = d.sizes.length + " размер(а/ов)";
-    document.getElementById("send-btn").style.display = "";
+    document.getElementById("m-order").textContent=fmt(orderTotal)+" шт";
+    document.getElementById("m-order-s").textContent=d.sizes.length+" размер(а/ов)";
+    document.getElementById("send-btn").style.display="";
 
     renderTable(d);
   }
 
-  function renderTable(d) {
-    var stockCol = MODE === "stock";
-    var hl = ' style="background:var(--green-soft,#e8f6e4);"';
-    document.getElementById("thead").innerHTML = "<tr><th>Размер</th>" +
-      '<th class="num">Продажи за период</th><th class="num" title="дней, когда размер был на складе, в выбранном окне">Дней в наличии</th>' +
-      '<th class="num">Темп шт/день</th><th class="num">Доля темпа</th>' +
-      '<th class="num">Остаток сейчас</th><th class="num" title="прогноз на дату прихода по темпу продаж">Остаток к приходу</th>' +
-      '<th class="num"' + (stockCol ? hl : "") + ">Заказать · с учётом остатков</th>" +
-      '<th class="num"' + (!stockCol ? hl : "") + ">Заказать · чистая пропорция</th></tr>";
+  function renderTable(d){
+    var stockCol=MODE==="stock";
+    document.getElementById("thead").innerHTML='<tr><th>Размер</th><th>Продажи за период</th>'+
+      '<th title="дней, когда размер был на складе, в выбранном окне">Дней в наличии</th>'+
+      '<th>Темп шт/день</th><th>Доля темпа</th><th>Остаток сейчас</th>'+
+      '<th title="прогноз на дату прихода по темпу продаж">Остаток к приходу</th>'+
+      '<th'+(stockCol?' class="modecol"':'')+'>Заказать · с учётом остатков</th>'+
+      '<th'+(!stockCol?' class="modecol"':'')+'>Заказать · чистая пропорция</th></tr>';
 
-    var maxShare = Math.max.apply(null, d.sizes.map(function (s) { return s.share; }).concat([0.0001]));
-    var showProj = d.days_to_arrival > 0;
-    var rows = d.sizes.map(function (s) {
-      var bar = '<span style="display:inline-block;width:64px;height:6px;border-radius:3px;background:#eef0f3;vertical-align:middle;margin-right:7px;overflow:hidden;">' +
-        '<i style="display:block;height:100%;width:' + Math.round(s.share / maxShare * 100) + '%;background:var(--accent,#2563eb);border-radius:3px;"></i></span>';
-      return "<tr><td><b>" + esc(s.size) + "</b></td>" +
-        '<td class="num' + (s.sold ? "" : " muted") + '">' + fmtInt(s.sold) + "</td>" +
-        '<td class="num' + (s.days_present ? "" : " muted") + '">' + fmtInt(s.days_present) + "</td>" +
-        '<td class="num' + (s.rate_day ? "" : " muted") + '">' + (s.rate_day ? fmtNum(s.rate_day, 2) : "0") + "</td>" +
-        '<td class="num">' + bar + Math.round(s.share * 100) + " %</td>" +
-        '<td class="num' + (s.stock ? "" : " muted") + '">' + fmtInt(s.stock) + "</td>" +
-        '<td class="num' + (s.stock_at_arrival ? "" : " muted") + '">' + (showProj ? fmtInt(s.stock_at_arrival) : "—") + "</td>" +
-        '<td class="num"' + (stockCol ? hl : "") + "><b" + (stockCol ? "" : ' class="muted"') + ">" + fmtInt(s.order_stock) + "</b></td>" +
-        '<td class="num"' + (!stockCol ? hl : "") + "><b" + (!stockCol ? "" : ' class="muted"') + ">" + fmtInt(s.order_pure) + "</b></td></tr>";
+    var maxShare=Math.max.apply(null,d.sizes.map(function(s){ return s.share; }).concat([0.0001]));
+    var showProj=d.days_to_arrival>0;
+    var rows=d.sizes.map(function(s){
+      var bar='<span class="sharebar"><i style="width:'+Math.round(s.share/maxShare*100)+'%"></i></span>';
+      return '<tr><td>'+esc(s.size)+'</td>'+
+        '<td><span class="qty '+(s.sold?'':'zero')+'">'+fmt(s.sold)+'</span></td>'+
+        '<td><span class="qty '+(s.days_present?'':'zero')+'">'+fmt(s.days_present)+'</span></td>'+
+        '<td>'+(s.rate_day?fmtNum(s.rate_day,2):'<span class="qty zero">0</span>')+'</td>'+
+        '<td>'+bar+Math.round(s.share*100)+'%</td>'+
+        '<td><span class="qty '+(s.stock?'':'zero')+'">'+fmt(s.stock)+'</span></td>'+
+        '<td><span class="qty '+(s.stock_at_arrival?'':'zero')+'">'+(showProj?fmt(s.stock_at_arrival):'—')+'</span></td>'+
+        '<td'+(stockCol?' class="modecol"':'')+'><span class="rec'+(stockCol?'':' dim')+'">'+fmt(s.order_stock)+'</span></td>'+
+        '<td'+(!stockCol?' class="modecol"':'')+'><span class="rec'+(!stockCol?'':' dim')+'">'+fmt(s.order_pure)+'</span></td></tr>';
     }).join("");
 
-    var sumStock = d.sizes.reduce(function (a, s) { return a + s.order_stock; }, 0);
-    var sumPure = d.sizes.reduce(function (a, s) { return a + s.order_pure; }, 0);
-    rows += '<tr style="font-weight:700;background:#f6f7f9;"><td>ИТОГО</td>' +
-      '<td class="num">' + fmtInt(d.totals.sold_period) + "</td>" +
-      '<td class="num"></td><td class="num"></td>' +
-      '<td class="num">100 %</td>' +
-      '<td class="num">' + fmtInt(d.totals.stock) + "</td>" +
-      '<td class="num">' + (showProj ? fmtInt(d.totals.stock_at_arrival) : "—") + "</td>" +
-      '<td class="num">' + fmtInt(sumStock) + "</td>" +
-      '<td class="num">' + fmtInt(sumPure) + "</td></tr>";
-    document.getElementById("tbody").innerHTML = rows;
+    var sumStock=d.sizes.reduce(function(a,s){ return a+s.order_stock; },0);
+    var sumPure=d.sizes.reduce(function(a,s){ return a+s.order_pure; },0);
+    rows+='<tr class="total"><td>Итого</td>'+
+      '<td>'+fmt(d.totals.sold_period)+'</td><td></td><td></td><td>100%</td>'+
+      '<td>'+fmt(d.totals.stock)+'</td>'+
+      '<td>'+(showProj?fmt(d.totals.stock_at_arrival):'—')+'</td>'+
+      '<td'+(stockCol?' class="modecol"':'')+'>'+fmt(sumStock)+'</td>'+
+      '<td'+(!stockCol?' class="modecol"':'')+'>'+fmt(sumPure)+'</td></tr>';
+    document.getElementById("tbody").innerHTML=rows;
   }
-});
+})();
 </script>
-{% endblock %}
+{% include "_hints.html" %}
+</body>
+</html>
