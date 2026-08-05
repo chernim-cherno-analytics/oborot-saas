@@ -1,209 +1,282 @@
-{% extends "base.html" %}
-{% block content %}
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>{{ org.name }} · Оборот — Оборот</title>
+<style>
+  /* ── Стиль первой таблицы (legacy CC): страница «Оборот» ── */
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0 }
+  body { font-family: Helvetica, 'Helvetica Neue', Arial, sans-serif; min-height: 100vh; background: #f3e9e0; color: #1f1f1f; }
+  .gradient-bg { position: fixed; inset: 0; z-index: 0; overflow: hidden; background: #f3e9e0; }
+  .gradient-bg::before, .gradient-bg::after { position: absolute; border-radius: 50%; filter: blur(90px); opacity: .9; content: ''; }
+  .gradient-bg::before { width: 70vw; height: 70vw; background: radial-gradient(circle,#efe5db,transparent 70%); top: -20%; left: -10%; }
+  .gradient-bg::after { width: 60vw; height: 60vw; background: radial-gradient(circle,#e2d8cf,transparent 70%); bottom: -15%; right: -10%; }
+  .header { position: sticky; top: 0; z-index: 200; padding: 0 28px; height: 56px; background: rgba(243,233,224,.85); backdrop-filter: blur(10px);
+    display: flex; align-items: center; justify-content: space-between; }
+  .logo { text-decoration: none; font-size: 15px; font-weight: 700; letter-spacing: .12em; color: #1f1f1f; }
+  .nav { display: flex; gap: 18px; flex-wrap: wrap; }
+  .nav a { font-size: 13px; color: rgba(31,31,31,.45); text-decoration: none; }
+  .nav a:hover { color: #434446 }
+  .nav a.active { color: #1f1f1f; font-weight: 700; }
+  .main { padding: 8px 28px 24px; max-width: 1500px; margin: 0 auto; position: relative; z-index: 3; }
 
-<p class="page-sub">Аналитика продаж за период: всё нетто (продажи минус возвраты). Это сводка к сведению, а не инструмент работы со стоком — помесячный график всегда показывает последние 18 месяцев.</p>
+  .toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 10px 0 16px; }
+  .preset { font-size: 12px; font-weight: 600; padding: 7px 14px; border-radius: 10px;
+    border: 1px solid rgba(31,31,31,.22); background: rgba(255,255,255,.6); color: #1f1f1f; cursor: pointer; }
+  .preset:hover { background: rgba(31,31,31,.09); }
+  .preset.active { background: #1f1f1f; color: #f3e9e0; }
+  .dinp { padding: 7px 10px; border-radius: 10px; font-size: 12.5px;
+    border: 1px solid rgba(31,31,31,.16); background: rgba(255,255,255,.7); outline: none; }
 
-<div class="card">
-  <div class="toolbar" style="flex-wrap:wrap; gap:8px;">
-    <div class="chips" id="preset-chips">
-      <button class="chip" data-days="30">30 дней</button>
-      <button class="chip active" data-days="90">90 дней</button>
-      <button class="chip" data-days="365">Год</button>
-      <button class="chip" data-days="all">Всё время</button>
-    </div>
-    <span class="muted" style="font-size:12px;">или свой период:</span>
-    <input class="input sm" type="date" id="d-from" style="width:150px;">
-    <input class="input sm" type="date" id="d-to" style="width:150px;">
-    <button class="btn sm" id="btn-apply">Показать</button>
-  </div>
+  .cards { display: grid; grid-template-columns: repeat(4,1fr); gap: 12px; margin-bottom: 18px; }
+  .card { background: rgba(255,255,255,.6); backdrop-filter: blur(10px);
+    border: 1px solid rgba(31,31,31,.08); border-radius: 12px; padding: 14px 18px; }
+  .card .l { font-size: 10px; font-weight: 600; letter-spacing: .07em; text-transform: uppercase;
+    color: rgba(31,31,31,.5); margin-bottom: 6px; }
+  .card .v { font-size: 24px; font-weight: 700; }
+  .card .s { font-size: 11px; color: rgba(31,31,31,.5); margin-top: 4px; }
+
+  .panel { background: rgba(255,255,255,.6); backdrop-filter: blur(12px);
+    border: 1px solid rgba(31,31,31,.08); border-radius: 14px; padding: 18px 22px; margin-bottom: 18px; }
+  .ptitle { font-size: 12px; font-weight: 600; letter-spacing: .07em; text-transform: uppercase;
+    color: #434446; margin-bottom: 12px; }
+  .catrow { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; }
+  .catname { width: 160px; font-size: 12px; font-weight: 600; flex-shrink: 0; }
+  .catbar-wrap { flex: 1; height: 26px; background: rgba(31,31,31,.05); border-radius: 6px; position: relative; overflow: hidden; }
+  .catbar { height: 100%; border-radius: 6px; transition: width .4s; }
+  .catval { position: absolute; right: 10px; top: 0; height: 100%; display: flex; align-items: center;
+    font-size: 11px; font-weight: 700; color: #1f1f1f; }
+  .catmeta { width: 150px; font-size: 11px; color: rgba(31,31,31,.55); flex-shrink: 0; text-align: right; }
+  #mchart { width: 100%; height: 320px; display: block; }
+  .ctip { position: fixed; pointer-events: none; display: none; background: #1f1f1f; color: #f3e9e0;
+    font-size: 11px; padding: 7px 11px; border-radius: 8px; z-index: 100; white-space: pre; line-height: 1.5; }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th { text-align: left; padding: 8px 10px; font-size: 10px; font-weight: 500; text-transform: uppercase;
+    letter-spacing: .06em; color: rgba(31,31,31,.55); border-bottom: 1px solid rgba(31,31,31,.1); }
+  th.r, td.r { text-align: right; }
+  td { padding: 7px 10px; border-bottom: 1px solid rgba(31,31,31,.06); }
+  .loading { text-align: center; padding: 60px; color: rgba(31,31,31,.45); font-size: 13px; }
+</style>
+</head>
+<body>
+<div class="gradient-bg"></div>
+<div class="header">
+  <a class="logo" href="/turnover">ОБОРОТ</a>
+  <nav class="nav">
+    <a href="/turnover">Оборачиваемость</a>
+    <a href="/stocks">Активный сток</a>
+    <a href="/replenish">Заказ</a>
+    <a href="/sizes">Заказ позиции</a>
+    <a href="/budget">Бюджет</a>
+    <a href="/forecast">Прогноз</a>
+    <a href="/revenue" class="active">Оборот</a>
+    <a href="/settings">Настройки</a>
+  </nav>
 </div>
 
-<div class="metric-grid" style="grid-template-columns:repeat(4,1fr);">
-  <div class="metric"><div class="m-label">Выручка за период</div><div class="m-value" id="c-rev">—</div><div class="m-sub" id="c-rev-s"></div></div>
-  <div class="metric"><div class="m-label">Продано</div><div class="m-value" id="c-qty">—</div><div class="m-sub" id="c-qty-s"></div></div>
-  <div class="metric"><div class="m-label" title="Выручка периода, делённая на проданные штуки">Средний чек позиции</div><div class="m-value" id="c-avg">—</div><div class="m-sub">выручка / штуки</div></div>
-  <div class="metric"><div class="m-label">Лучшая категория</div><div class="m-value" id="c-best" style="font-size:18px;">—</div><div class="m-sub" id="c-best-s"></div></div>
-</div>
-
-<div class="card">
-  <div class="card-head"><h2 style="font-size:14px;margin:0;" id="cat-title">Категории за период</h2></div>
-  <div class="card-body" id="cat-box"><div class="loading-stub">Загрузка…</div></div>
-</div>
-
-<div class="card">
-  <div class="card-head"><h2 style="font-size:14px;margin:0;">Оборот по месяцам · 18 месяцев</h2></div>
-  <div class="card-body">
-    <div id="month-box" style="width:100%; overflow-x:auto;"><div class="loading-stub">Загрузка…</div></div>
-  </div>
-</div>
-
-<div class="card">
+<div class="main">
   <div class="toolbar">
-    <h2 style="font-size:14px;margin:0;" id="top-title">Топ позиций за период</h2>
-    <div class="spacer" style="flex:1;"></div>
-    <div class="search-box">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.5" y2="16.5"/></svg>
-      <input class="input" type="search" id="search" placeholder="Поиск по названию…" autocomplete="off">
-    </div>
+    <button class="preset" data-days="30">30 дней</button>
+    <button class="preset active" data-days="90">90 дней</button>
+    <button class="preset" data-days="365">Год</button>
+    <button class="preset" data-days="all">Всё время</button>
+    <span style="font-size:11px;color:rgba(31,31,31,0.45);margin-left:8px">или свой период:</span>
+    <input type="date" class="dinp" id="d-from">
+    <input type="date" class="dinp" id="d-to">
+    <button class="preset" id="applyCustom">Показать</button>
+    <input class="dinp" id="search" placeholder="Поиск позиции..." style="margin-left:auto;width:240px">
   </div>
-  <div class="tbl-wrap">
-    <table class="tbl">
-      <thead><tr>
-        <th style="width:36px;">#</th>
-        <th>Позиция</th>
-        <th class="num">Продано, шт</th>
-        <th class="num">Выручка, ₽</th>
-        <th class="num" title="Доля от всей выручки периода">Доля</th>
-      </tr></thead>
-      <tbody id="top-tbody"><tr><td colspan="5"><div class="loading-stub">Загрузка…</div></td></tr></tbody>
-    </table>
+
+  <div class="cards">
+    <div class="card"><div class="l">Выручка за период</div><div class="v" id="c-rev">—</div><div class="s" id="c-rev-s"></div></div>
+    <div class="card"><div class="l">Продано</div><div class="v" id="c-qty">—</div><div class="s" id="c-qty-s"></div></div>
+    <div class="card"><div class="l">Средний чек позиции</div><div class="v" id="c-avg">—</div><div class="s">выручка / штуки</div></div>
+    <div class="card"><div class="l">Лучшая категория</div><div class="v" id="c-best" style="font-size:17px">—</div><div class="s" id="c-best-s"></div></div>
+  </div>
+
+  <div class="panel">
+    <div class="ptitle" id="cat-title">Категории за период</div>
+    <div id="catbars"><div class="loading">Загружаю...</div></div>
+  </div>
+
+  <div class="panel">
+    <div class="ptitle">Оборот по месяцам · категории цветом</div>
+    <canvas id="mchart"></canvas>
+    <div id="legend" style="display:flex;gap:14px;flex-wrap:wrap;margin-top:10px"></div>
+  </div>
+
+  <div class="panel">
+    <div class="ptitle" id="top-title">Топ-15 позиций за период</div>
+    <table><thead><tr><th style="width:30px">#</th><th>Название</th><th>Категория</th><th class="r">Шт</th><th class="r">Выручка</th><th class="r">Доля</th></tr></thead>
+    <tbody id="toptb"><tr><td colspan="6" class="loading">Загружаю...</td></tr></tbody></table>
   </div>
 </div>
+<div class="ctip" id="ctip"></div>
 
-{% endblock %}
-
-{% block scripts %}
 <script>
-document.addEventListener("DOMContentLoaded", function () {
-  var DATA = null;
-  var state = { query: "" };
-
-  function fmtShort(n) {
-    n = n || 0;
-    if (Math.abs(n) >= 1e6) return fmtNum(n / 1e6, 2) + " млн ₽";
-    if (Math.abs(n) >= 1e3) return fmtInt(n / 1e3) + " тыс ₽";
-    return fmtMoney(n);
+(function(){
+  "use strict";
+  function esc(s){ return String(s==null?"":s).replace(/[&<>"']/g,function(c){ return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]; }); }
+  function fmt(n){ return Math.round(n||0).toLocaleString("ru-RU"); }
+  function fmtM(n){
+    n=n||0;
+    if(Math.abs(n)>=1e6) return (n/1e6).toLocaleString("ru-RU",{maximumFractionDigits:2})+" млн ₽";
+    if(Math.abs(n)>=1e3) return Math.round(n/1e3).toLocaleString("ru-RU")+" тыс ₽";
+    return Math.round(n).toLocaleString("ru-RU")+" ₽";
   }
-  function iso(d) { return d.toISOString().slice(0, 10); }
-
-  function load(from, to) {
-    api("/api/revenue?date_from=" + from + "&date_to=" + to).then(function (d) {
-      DATA = d;
-      renderCards(d);
-      renderCats(d);
-      renderMonths(d.monthly || []);
-      renderTop();
-    }).catch(function () {
-      document.getElementById("cat-box").innerHTML =
-        emptyState("Не удалось загрузить данные", "Обновите страницу или попробуйте позже.", "");
-    });
+  function mw(name,q){ if(!q) return true; var nl=name.toLowerCase();
+    return q.toLowerCase().split(/\s+/).every(function(w){ return nl.indexOf(w)>=0; }); }
+  var PALETTE=["#4a7c59","#2f4858","#6b8e23","#33658a","#86bbd8","#f6ae2d","#f26419","#c9a227",
+    "#9c89b8","#b56576","#6d597a","#355070","#e56b6f","#7a9e7e","#8d8d8d","#a26769","#5f7470"];
+  var CAT_COLORS={};
+  function catColor(cat){
+    if(!CAT_COLORS[cat]) CAT_COLORS[cat]=PALETTE[Object.keys(CAT_COLORS).length%PALETTE.length];
+    return CAT_COLORS[cat];
   }
+  var MONTH_NAMES=["янв","фев","мар","апр","май","июн","июл","авг","сен","окт","ноя","дек"];
+  function monthLabel(mm){ var p=mm.split("-"); return MONTH_NAMES[+p[1]-1]+" "+p[0].slice(2); }
+  function iso(d){ return d.toISOString().slice(0,10); }
 
-  function loadPreset(days) {
-    var to = new Date();
-    var from = days === "all" ? new Date(2000, 0, 1)
-      : new Date(Date.now() - (Number(days) - 1) * 86400000);
-    document.getElementById("d-from").value = iso(from);
-    document.getElementById("d-to").value = iso(to);
-    load(iso(from), iso(to));
+  var curFrom="", curTo="";
+  var LAST_ITEMS=[], LAST_TOTR=0;
+
+  function periodLabel(){
+    var f=function(d){ return d?new Date(d).toLocaleDateString("ru-RU",{day:"numeric",month:"short",year:"2-digit"}):"…"; };
+    return f(curFrom)+" — "+f(curTo);
   }
 
-  function periodLabel(d) { return fmtDate(d.date_from) + " — " + fmtDate(d.date_to); }
-
-  function renderCards(d) {
-    document.getElementById("c-rev").textContent = fmtShort(d.total_rev);
-    document.getElementById("c-rev-s").textContent = periodLabel(d);
-    document.getElementById("c-qty").textContent = fmtInt(d.total_qty) + " шт";
-    document.getElementById("c-qty-s").textContent =
-      fmtInt(d.positions) + " " + plural(d.positions, "позиция продавалась", "позиции продавались", "позиций продавалось");
-    document.getElementById("c-avg").textContent = fmtMoney(d.avg_check);
-    var b = d.best_category;
-    document.getElementById("c-best").textContent = b ? b.category : "—";
-    document.getElementById("c-best-s").textContent =
-      b ? fmtShort(b.rev) + " · " + Math.round(b.share * 100) + "% оборота" : "";
+  function applyPeriod(from,to){
+    curFrom=from; curTo=to;
+    fetch("/api/revenue?date_from="+from+"&date_to="+to,{credentials:"same-origin"})
+      .then(function(r){ if(!r.ok) throw new Error("HTTP "+r.status); return r.json(); })
+      .then(function(d){
+        document.getElementById("c-rev").textContent=fmtM(d.total_rev);
+        document.getElementById("c-rev-s").textContent=periodLabel();
+        document.getElementById("c-qty").textContent=fmt(d.total_qty)+" шт";
+        document.getElementById("c-qty-s").textContent=fmt(d.positions)+" позиций продавалось";
+        document.getElementById("c-avg").textContent=d.total_qty>0?fmt(d.avg_check)+" ₽":"—";
+        if(d.best_category){
+          document.getElementById("c-best").textContent=d.best_category.category;
+          document.getElementById("c-best-s").textContent=fmtM(d.best_category.rev)+" · "+
+            Math.round((d.best_category.share||0)*100)+"% оборота";
+        }else{
+          document.getElementById("c-best").textContent="—";
+          document.getElementById("c-best-s").textContent="";
+        }
+        // бары категорий
+        document.getElementById("cat-title").textContent="Категории · "+periodLabel();
+        var cats=d.categories||[];
+        var maxR=cats.length?cats[0].rev:1;
+        document.getElementById("catbars").innerHTML=cats.map(function(c){
+          return '<div class="catrow"><div class="catname">'+esc(c.category)+'</div>'+
+            '<div class="catbar-wrap"><div class="catbar" style="width:'+Math.max(1,c.rev/maxR*100)+'%;background:'+catColor(c.category)+'cc"></div>'+
+            '<div class="catval">'+fmtM(c.rev)+'</div></div>'+
+            '<div class="catmeta">'+fmt(c.qty)+' шт · '+((c.share||0)*100).toFixed(1)+'%</div></div>';
+        }).join("")||'<div class="loading">Нет продаж за период</div>';
+        // помесячный график (не зависит от периода — последние месяцы)
+        drawMonthly(d.monthly||[]);
+        // топ позиций
+        LAST_ITEMS=(d.items||[]).slice();
+        LAST_TOTR=d.total_rev||0;
+        renderTop();
+      }).catch(function(e){
+        document.getElementById("catbars").innerHTML='<div class="loading">Не удалось загрузить: '+esc(e.message)+'</div>';
+      });
   }
 
-  function renderCats(d) {
-    var cats = d.categories || [];
-    document.getElementById("cat-title").textContent = "Категории · " + periodLabel(d);
-    if (!cats.length) {
-      document.getElementById("cat-box").innerHTML =
-        emptyState("Нет продаж за период", "Попробуйте расширить период.", "");
-      return;
+  function renderTop(){
+    var q=(document.getElementById("search").value||"").toLowerCase();
+    var list=q?LAST_ITEMS.filter(function(it){ return mw(it.base_name,q); }).slice(0,50):LAST_ITEMS.slice(0,15);
+    document.getElementById("top-title").textContent=(q?"Найдено: "+list.length+" · ":"Топ-15 позиций · ")+periodLabel();
+    document.getElementById("toptb").innerHTML=list.map(function(it,i){
+      return "<tr><td>"+(i+1)+"</td><td>"+esc(it.base_name)+"</td>"+
+        "<td><span style='font-size:11px;color:"+catColor(it.category)+";font-weight:600'>"+esc(it.category)+"</span></td>"+
+        "<td class='r'>"+fmt(it.qty)+"</td>"+
+        "<td class='r'><b>"+fmtM(it.rev)+"</b></td>"+
+        "<td class='r'>"+(LAST_TOTR>0?((it.rev/LAST_TOTR)*100).toFixed(1)+"%":"—")+"</td></tr>";
+    }).join("")||"<tr><td colspan='6' class='loading'>Нет продаж за период</td></tr>";
+  }
+  document.addEventListener("input",function(e){ if(e.target&&e.target.id==="search") renderTop(); });
+
+  function drawMonthly(monthly){
+    var cv=document.getElementById("mchart");
+    var W=cv.offsetWidth||1100, H=320;
+    cv.width=W*devicePixelRatio; cv.height=H*devicePixelRatio;
+    cv.style.height=H+"px";
+    var ctx=cv.getContext("2d");
+    ctx.scale(devicePixelRatio,devicePixelRatio);
+    var padL=8,padR=76,padT=16,padB=30;
+    var n=monthly.length||1;
+    var maxV=Math.max.apply(null,monthly.map(function(m){ return m.total; }).concat([1]))*1.08;
+    var gw=(W-padL-padR)/n;
+    var y=function(v){ return H-padB-(v/maxV)*(H-padT-padB); };
+    ctx.font="10px Helvetica,Arial"; ctx.fillStyle="rgba(31,31,31,0.45)";
+    for(var k=0;k<=4;k++){
+      var v=maxV*k/4, yy=y(v);
+      ctx.strokeStyle="rgba(31,31,31,0.06)"; ctx.beginPath(); ctx.moveTo(padL,yy); ctx.lineTo(W-padR,yy); ctx.stroke();
+      ctx.fillText(fmtM(v),W-padR+6,yy+4);
     }
-    var maxRev = cats[0].rev || 1;
-    document.getElementById("cat-box").innerHTML = cats.map(function (c) {
-      var w = Math.max(2, Math.round(c.rev / maxRev * 100));
-      return '<div style="display:flex; align-items:center; gap:10px; margin:6px 0;">' +
-        '<div style="flex:0 0 150px; font-size:13px;">' + esc(c.category) + "</div>" +
-        '<div style="flex:1;"><div style="height:16px; border-radius:4px; width:' + w +
-          '%; background:linear-gradient(90deg, rgba(122,162,255,.75), rgba(122,162,255,.35));"></div></div>' +
-        '<div style="flex:0 0 220px; text-align:right; font-size:12px;"><b>' + fmtShort(c.rev) +
-          '</b> <span class="muted">· ' + fmtInt(c.qty) + " шт · " +
-          (c.share * 100).toFixed(1) + "%</span></div></div>";
-    }).join("");
-  }
-
-  function renderMonths(monthly) {
-    var box = document.getElementById("month-box");
-    if (!monthly.length) { box.innerHTML = '<div class="loading-stub">Нет данных</div>'; return; }
-    var maxV = Math.max.apply(null, monthly.map(function (m) { return Math.max(0, m.total); })) || 1;
-    var H = 190, bw = Math.max(28, Math.floor(820 / monthly.length) - 8);
-    var html = '<div style="display:flex; align-items:flex-end; gap:8px; height:' + (H + 38) + 'px; min-width:640px;">';
-    monthly.forEach(function (m) {
-      var v = Math.max(0, m.total);
-      var h = Math.round(v / maxV * H);
-      var mm = m.month.slice(5), yy = m.month.slice(2, 4);
-      var tip = m.month + ": " + fmtShort(m.total) + "\n" +
-        Object.entries(m.by_category || {})
-          .sort(function (a, b) { return b[1] - a[1]; })
-          .slice(0, 6)
-          .map(function (e) { return e[0] + " — " + fmtShort(e[1]); }).join("\n");
-      html += '<div style="width:' + bw + 'px; text-align:center;" title="' + esc(tip) + '">' +
-        '<div class="muted" style="font-size:9px; height:12px;">' + (v ? fmtNum(v / 1e6, 1) : "") + "</div>" +
-        '<div style="height:' + h + 'px; border-radius:4px 4px 0 0; background:linear-gradient(180deg, rgba(122,162,255,.85), rgba(122,162,255,.35));"></div>' +
-        '<div class="muted" style="font-size:10px; margin-top:4px;">' + mm + "." + yy + "</div>" +
-        "</div>";
-    });
-    box.innerHTML = html + "</div><div class='muted' style='font-size:11px;'>цифры над столбиками — млн ₽; наведите курсор — разбивка по категориям</div>";
-  }
-
-  function renderTop() {
-    if (!DATA) return;
-    var items = (DATA.items || []).filter(function (it) {
-      return wordMatch(it.base_name, state.query);
-    });
-    var limit = state.query ? 50 : 15;
-    document.getElementById("top-title").textContent =
-      (state.query ? "Найдено · " : "Топ-" + limit + " · ") + periodLabel(DATA);
-    var total = DATA.total_rev || 1;
-    var tb = document.getElementById("top-tbody");
-    if (!items.length) {
-      tb.innerHTML = '<tr><td colspan="5">' +
-        emptyState("Ничего не найдено", "Попробуйте изменить запрос.", "") + "</td></tr>";
-      return;
+    var legendCats={};
+    for(var i=0;i<monthly.length;i++){
+      var m=monthly[i];
+      var x=padL+i*gw+gw*0.18, bw=gw*0.64;
+      var cats=Object.entries(m.by_category||{}).filter(function(kv){ return kv[1]>0; })
+        .sort(function(a,b){ return b[1]-a[1]; });
+      var acc=0;
+      for(var c=0;c<cats.length;c++){
+        var val=cats[c][1];
+        legendCats[cats[c][0]]=true;
+        ctx.fillStyle=catColor(cats[c][0])+"dd";
+        var y1=y(acc+val), y0=y(acc);
+        ctx.fillRect(x,y1,bw,y0-y1);
+        acc+=val;
+      }
+      ctx.fillStyle="rgba(31,31,31,0.55)"; ctx.textAlign="center"; ctx.font="10px Helvetica,Arial";
+      ctx.fillText(monthLabel(m.month),padL+i*gw+gw/2,H-10);
+      ctx.textAlign="left";
     }
-    tb.innerHTML = items.slice(0, limit).map(function (it, i) {
-      return "<tr>" +
-        '<td class="num muted">' + (i + 1) + "</td>" +
-        '<td class="name-cell"><div class="name-main">' + esc(it.base_name) +
-        '</div><div class="name-sub">' + esc(it.category || "") + "</div></td>" +
-        '<td class="num">' + fmtInt(it.qty) + "</td>" +
-        '<td class="num"><b>' + fmtInt(it.rev) + "</b></td>" +
-        '<td class="num muted">' + (it.rev / total * 100).toFixed(1) + "%</td>" +
-        "</tr>";
+    document.getElementById("legend").innerHTML=Object.keys(legendCats).map(function(cat){
+      return '<span style="font-size:11px;color:rgba(31,31,31,.65)"><span style="display:inline-block;width:10px;height:10px;border-radius:3px;background:'+catColor(cat)+';margin-right:5px;vertical-align:-1px"></span>'+esc(cat)+'</span>';
     }).join("");
+    cv.onmousemove=function(ev){
+      var r=cv.getBoundingClientRect();
+      var i=Math.floor((ev.clientX-r.left-padL)/gw);
+      var tip=document.getElementById("ctip");
+      if(i<0||i>=monthly.length){ tip.style.display="none"; return; }
+      var m=monthly[i];
+      var lines=Object.entries(m.by_category||{}).filter(function(kv){ return kv[1]>0; })
+        .sort(function(a,b){ return b[1]-a[1]; }).slice(0,6)
+        .map(function(kv){ return kv[0]+": "+fmtM(kv[1]); });
+      tip.textContent=monthLabel(m.month)+" · "+fmtM(m.total)+"\n"+lines.join("\n");
+      tip.style.display="block";
+      tip.style.left=(ev.clientX+14)+"px"; tip.style.top=(ev.clientY+10)+"px";
+    };
+    cv.onmouseleave=function(){ document.getElementById("ctip").style.display="none"; };
   }
 
-  document.querySelectorAll("#preset-chips .chip").forEach(function (chip) {
-    chip.addEventListener("click", function () {
-      document.querySelectorAll("#preset-chips .chip").forEach(function (x) { x.classList.remove("active"); });
-      chip.classList.add("active");
-      loadPreset(chip.getAttribute("data-days"));
+  // пресеты периодов
+  document.querySelectorAll(".preset[data-days]").forEach(function(b){
+    b.addEventListener("click",function(){
+      document.querySelectorAll(".preset").forEach(function(x){ x.classList.remove("active"); });
+      b.classList.add("active");
+      var days=b.getAttribute("data-days");
+      var to=new Date();
+      var from=days==="all"?new Date(2000,0,1):new Date(Date.now()-(+days)*86400000);
+      applyPeriod(iso(from),iso(to));
     });
   });
-  document.getElementById("btn-apply").addEventListener("click", function () {
-    var f = document.getElementById("d-from").value, t = document.getElementById("d-to").value;
-    if (!f || !t) return;
-    document.querySelectorAll("#preset-chips .chip").forEach(function (x) { x.classList.remove("active"); });
-    load(f, t);
+  document.getElementById("applyCustom").addEventListener("click",function(){
+    var f=document.getElementById("d-from").value, t=document.getElementById("d-to").value;
+    if(!f||!t){ alert("Укажи обе даты"); return; }
+    document.querySelectorAll(".preset").forEach(function(x){ x.classList.remove("active"); });
+    this.classList.add("active");
+    applyPeriod(f,t);
   });
-  document.getElementById("search").addEventListener("input", debounce(function (e) {
-    state.query = e.target.value.trim();
-    renderTop();
-  }, 150));
 
-  loadPreset("90");
-});
+  applyPeriod(iso(new Date(Date.now()-90*86400000)),iso(new Date()));
+})();
 </script>
-{% endblock %}
+{% include "_hints.html" %}
+</body>
+</html>

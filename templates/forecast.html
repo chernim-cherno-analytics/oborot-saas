@@ -1,176 +1,244 @@
-{% extends "base.html" %}
-{% block content %}
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>{{ org.name }} · Прогноз — Оборот</title>
+<style>
+  /* ── Стиль первой таблицы (legacy CC): страница «Прогноз» ── */
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0 }
+  body { font-family: Helvetica, 'Helvetica Neue', Arial, sans-serif; min-height: 100vh; background: #f3e9e0; color: #1f1f1f; }
+  .gradient-bg { position: fixed; inset: 0; z-index: 0; overflow: hidden; background: #f3e9e0; }
+  .gradient-bg::before, .gradient-bg::after { position: absolute; border-radius: 50%; filter: blur(90px); opacity: .9; content: ''; }
+  .gradient-bg::before { width: 70vw; height: 70vw; background: radial-gradient(circle,#efe5db,transparent 70%); top: -20%; left: -10%; }
+  .gradient-bg::after { width: 60vw; height: 60vw; background: radial-gradient(circle,#e2d8cf,transparent 70%); bottom: -15%; right: -10%; }
+  .header { position: sticky; top: 0; z-index: 200; padding: 0 28px; height: 56px; background: rgba(243,233,224,.85); backdrop-filter: blur(10px);
+    display: flex; align-items: center; justify-content: space-between; }
+  .logo { text-decoration: none; font-size: 15px; font-weight: 700; letter-spacing: .12em; color: #1f1f1f; }
+  .nav { display: flex; gap: 18px; flex-wrap: wrap; }
+  .nav a { font-size: 13px; color: rgba(31,31,31,.45); text-decoration: none; }
+  .nav a:hover { color: #434446 }
+  .nav a.active { color: #1f1f1f; font-weight: 700; }
+  .main { padding: 8px 28px 24px; max-width: 1500px; margin: 0 auto; position: relative; z-index: 3; }
 
-<p class="page-sub">Каждая позиция распродаётся своим темпом, пока не закончится; «едет к нам» учтено в остатке. Архивные исключены.</p>
+  details.note { margin: 10px 0 14px; border-radius: 12px; background: rgba(255,255,255,.6);
+    border: 1px solid rgba(31,31,31,.09); backdrop-filter: blur(10px); }
+  details.note summary { cursor: pointer; padding: 10px 16px; font-size: 12.5px; font-weight: 600; color: #434446; list-style: none; }
+  details.note summary::before { content: '▸ '; }
+  details.note[open] summary::before { content: '▾ '; }
+  details.note .body { padding: 0 18px 14px; font-size: 12.5px; color: #434446; line-height: 1.6; }
+  details.note .body b { color: #1f1f1f; }
 
-<div class="metric-grid" style="grid-template-columns:repeat(4,1fr);">
-  <div class="metric"><div class="m-label">Сток сейчас</div><div class="m-value" id="c-stock">—</div><div class="m-sub" id="c-stock-s"></div></div>
-  <div class="metric"><div class="m-label">Едет к нам</div><div class="m-value" id="c-inc">—</div><div class="m-sub" id="c-inc-s"></div></div>
-  <div class="metric"><div class="m-label">Темп продаж</div><div class="m-value" id="c-pace">—</div><div class="m-sub" id="c-pace-s"></div></div>
-  <div class="metric"><div class="m-label">Стока хватит примерно</div><div class="m-value" id="c-until">—</div><div class="m-sub" id="c-until-s"></div></div>
+  .cards { display: grid; grid-template-columns: repeat(4,1fr); gap: 12px; margin-bottom: 18px; }
+  .card { background: rgba(255,255,255,.6); backdrop-filter: blur(10px);
+    border: 1px solid rgba(31,31,31,.08); border-radius: 12px; padding: 14px 18px; }
+  .card .l { font-size: 10px; font-weight: 600; letter-spacing: .07em; text-transform: uppercase;
+    color: rgba(31,31,31,.5); margin-bottom: 6px; }
+  .card .v { font-size: 24px; font-weight: 700; }
+  .card .s { font-size: 11px; color: rgba(31,31,31,.5); margin-top: 4px; }
+
+  .panel { background: rgba(255,255,255,.6); backdrop-filter: blur(12px);
+    border: 1px solid rgba(31,31,31,.08); border-radius: 14px; padding: 18px 22px; margin-bottom: 18px; }
+  .ptitle { font-size: 12px; font-weight: 600; letter-spacing: .07em; text-transform: uppercase;
+    color: #434446; margin-bottom: 4px; }
+  .psub { font-size: 11px; color: rgba(31,31,31,.45); margin-bottom: 12px; }
+  #fchart { width: 100%; height: 320px; display: block; }
+  .legend { display: flex; gap: 18px; margin-top: 10px; font-size: 11.5px; color: rgba(31,31,31,.6); }
+  .legend .sw { display: inline-block; width: 12px; height: 12px; border-radius: 3px; vertical-align: -2px; margin-right: 6px; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th { text-align: left; padding: 8px 10px; font-size: 10px; font-weight: 500; text-transform: uppercase;
+    letter-spacing: .06em; color: rgba(31,31,31,.55); border-bottom: 1px solid rgba(31,31,31,.1); }
+  th.r, td.r { text-align: right; }
+  td { padding: 7px 10px; border-bottom: 1px solid rgba(31,31,31,.06); }
+  .ctip { position: fixed; pointer-events: none; display: none; background: #1f1f1f; color: #f3e9e0;
+    font-size: 11px; padding: 7px 11px; border-radius: 8px; z-index: 100; white-space: pre; line-height: 1.5; }
+  .loading { text-align: center; padding: 60px; color: rgba(31,31,31,.45); font-size: 13px; }
+  .pill { display: inline-block; padding: 2px 9px; border-radius: 10px; font-size: 10px; font-weight: 700; }
+  .search { width: 320px; padding: 7px 14px; border-radius: 10px; font-size: 13px;
+    border: 1px solid rgba(31,31,31,.16); background: rgba(255,255,255,.85); outline: none; margin-bottom: 10px; }
+</style>
+</head>
+<body>
+<div class="gradient-bg"></div>
+<div class="header">
+  <a class="logo" href="/turnover">ОБОРОТ</a>
+  <nav class="nav">
+    <a href="/turnover">Оборачиваемость</a>
+    <a href="/stocks">Активный сток</a>
+    <a href="/replenish">Заказ</a>
+    <a href="/sizes">Заказ позиции</a>
+    <a href="/budget">Бюджет</a>
+    <a href="/forecast" class="active">Прогноз</a>
+    <a href="/revenue">Оборот</a>
+    <a href="/settings">Настройки</a>
+  </nav>
 </div>
 
-<div class="card">
-  <div class="card-head"><h2 style="font-size:14px;margin:0;">Стоимость остатка · 26 недель вперёд</h2></div>
-  <div class="card-body">
-    <div id="chart-box" style="width:100%;"><div class="loading-stub">Загрузка…</div></div>
-  </div>
-</div>
-
-<div class="card">
-  <div class="toolbar">
-    <div class="search-box">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.5" y2="16.5"/></svg>
-      <input class="input" type="search" id="search" placeholder="Поиск по позициям…" autocomplete="off">
+<div class="main">
+  <details class="note">
+    <summary>Что показывает прогноз</summary>
+    <div class="body">
+      <p><b>Главный график — сток против продаж по месяцам.</b> Для каждого из шести месяцев вперёд две колонки:
+      сколько стока (в деньгах) лежит на начало месяца и сколько он продаст за этот месяц. Каждая позиция
+      продаётся своим темпом, пока не кончится; вещи в пути учтены. Продажи <b>затухают сами собой</b>:
+      бестселлеры распродаются первыми, и без перезаказа каждый следующий месяц продаёт хуже предыдущего —
+      график показывает цену бездействия. Лекарство — страница <a href="/replenish">Заказ</a>.</p>
     </div>
-    <span class="muted" id="search-hint" style="font-size:12px;">введите минимум 2 символа</span>
+  </details>
+
+  <div class="cards">
+    <div class="card"><div class="l">Сток сейчас</div><div class="v" id="c-stock">—</div><div class="s" id="c-stock-s"></div></div>
+    <div class="card"><div class="l">Едет к нам</div><div class="v" id="c-inc">—</div><div class="s">заказы в производстве</div></div>
+    <div class="card"><div class="l">Текущий темп продаж</div><div class="v" id="c-pace">—</div><div class="s" id="c-pace-s"></div></div>
+    <div class="card"><div class="l">Стока хватит примерно</div><div class="v" id="c-until">—</div><div class="s" id="c-until-s"></div></div>
   </div>
-  <div class="tbl-wrap" id="items-wrap" style="display:none;">
-    <table class="tbl">
-      <thead><tr>
-        <th>Позиция</th>
-        <th class="num">Сток, шт</th>
-        <th class="num">+ едет</th>
-        <th class="num">Темп, шт/день</th>
-        <th class="num">Темп, ₽/день</th>
-        <th class="num">Распродастся к</th>
-      </tr></thead>
-      <tbody id="items-tbody"></tbody>
-    </table>
+
+  <div class="panel">
+    <div class="ptitle">Сток и продажи · 6 месяцев вперёд</div>
+    <div class="psub">светлый столбик — сток на начало месяца; зелёный — продажи месяца. Без перезаказа продажи падают: бестселлеры кончаются первыми</div>
+    <canvas id="fchart"></canvas>
+    <div class="legend">
+      <span><span class="sw" style="background:rgba(31,31,31,.28)"></span>Сток на начало месяца, ₽</span>
+      <span><span class="sw" style="background:rgba(76,187,23,.75)"></span>Продажи месяца, ₽</span>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="ptitle">Поиск по позициям</div>
+    <input id="search" class="search" placeholder="Название позиции...">
+    <table id="stbl" style="display:none"><thead><tr>
+      <th>Название</th><th class="r">Сток, шт</th><th class="r">+ в пути</th>
+      <th class="r">Темп, шт/день</th><th class="r">Темп, ₽/день</th><th class="r">Распродастся за</th>
+    </tr></thead><tbody id="stb"></tbody></table>
+  </div>
+
+  <div class="panel">
+    <div class="ptitle">Категории: чем богаты и как быстро распродаётся</div>
+    <table><thead><tr>
+      <th>Категория</th><th class="r">Сток, шт</th><th class="r">+ в пути</th>
+      <th class="r">Потенциал выручки</th><th class="r">Темп, ₽/день</th><th class="r">Хватит на</th>
+    </tr></thead><tbody id="cattb"><tr><td colspan="6" class="loading">Загружаю...</td></tr></tbody></table>
   </div>
 </div>
+<div class="ctip" id="ctip"></div>
 
-<div class="card">
-  <div class="card-head"><h2 style="font-size:14px;margin:0;">Категории: чем богаты и как быстро распродаётся</h2></div>
-  <div class="tbl-wrap">
-    <table class="tbl">
-      <thead><tr>
-        <th>Категория</th>
-        <th class="num">Сток, шт</th>
-        <th class="num">+ едет</th>
-        <th class="num">Потенциал выручки</th>
-        <th class="num">Темп, ₽/день</th>
-        <th class="num">Хватит на</th>
-      </tr></thead>
-      <tbody id="cat-tbody"><tr><td colspan="6"><div class="loading-stub">Загрузка…</div></td></tr></tbody>
-    </table>
-  </div>
-</div>
-
-{% endblock %}
-
-{% block scripts %}
 <script>
-document.addEventListener("DOMContentLoaded", function () {
-  var ITEMS = [];
+(function(){
+  "use strict";
+  function esc(s){ return String(s==null?"":s).replace(/[&<>"']/g,function(c){ return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]; }); }
+  function fmt(n){ return Math.round(n||0).toLocaleString("ru-RU"); }
+  function fmtM(n){
+    n=n||0;
+    if(Math.abs(n)>=1e6) return (n/1e6).toLocaleString("ru-RU",{maximumFractionDigits:2})+" млн ₽";
+    if(Math.abs(n)>=1e3) return Math.round(n/1e3).toLocaleString("ru-RU")+" тыс ₽";
+    return Math.round(n).toLocaleString("ru-RU")+" ₽";
+  }
+  function mw(name,q){ if(!q) return true; var nl=name.toLowerCase();
+    return q.toLowerCase().split(/\s+/).every(function(w){ return nl.indexOf(w)>=0; }); }
+  var MONTH_NAMES=["янв","фев","мар","апр","май","июн","июл","авг","сен","окт","ноя","дек"];
+  function monthLabel(mm){ var p=mm.split("-"); return MONTH_NAMES[+p[1]-1]+" "+p[0].slice(2); }
 
-  function fmtShort(n) {
-    n = n || 0;
-    if (Math.abs(n) >= 1e6) return fmtNum(n / 1e6, 2) + " млн ₽";
-    if (Math.abs(n) >= 1e3) return fmtInt(n / 1e3) + " тыс ₽";
-    return fmtMoney(n);
+  var ITEMS=[];
+
+  function renderSearch(){
+    var q=(document.getElementById("search").value||"").toLowerCase();
+    var tbl=document.getElementById("stbl");
+    if(q.length<2){ tbl.style.display="none"; return; }
+    var list=ITEMS.filter(function(x){ return mw(x.base_name,q); })
+      .sort(function(a,b){ return (b.pace_rub||0)-(a.pace_rub||0); }).slice(0,30);
+    tbl.style.display="";
+    document.getElementById("stb").innerHTML=list.map(function(x){
+      return "<tr><td><b>"+esc(x.base_name)+"</b></td><td class='r'>"+fmt(x.cs)+"</td>"+
+        "<td class='r'>"+(x.ordered?("+"+fmt(x.ordered)):"—")+"</td>"+
+        "<td class='r'>"+(x.rate>0?x.rate.toFixed(2):"—")+"</td>"+
+        "<td class='r'>"+(x.pace_rub?fmtM(x.pace_rub):"—")+"</td>"+
+        "<td class='r'>"+(x.sellout_days!==null&&x.sellout_days!==undefined?fmt(x.sellout_days)+" дн":"нет продаж")+"</td></tr>";
+    }).join("")||"<tr><td colspan='6' class='loading'>Не найдено</td></tr>";
+  }
+  document.addEventListener("input",function(e){ if(e.target&&e.target.id==="search") renderSearch(); });
+
+  function drawChart(months){
+    var cv=document.getElementById("fchart");
+    var W=cv.offsetWidth||1100, H=320;
+    cv.width=W*devicePixelRatio; cv.height=H*devicePixelRatio;
+    cv.style.height=H+"px";
+    var ctx=cv.getContext("2d");
+    ctx.scale(devicePixelRatio,devicePixelRatio);
+    var padL=8,padR=76,padT=16,padB=30;
+    var n=months.length||1;
+    var maxV=Math.max.apply(null,months.map(function(m){ return Math.max(m.stock_value,m.sales_value); }).concat([1]))*1.08;
+    var gw=(W-padL-padR)/n;
+    var y=function(v){ return H-padB-(v/maxV)*(H-padT-padB); };
+    ctx.font="10px Helvetica,Arial"; ctx.fillStyle="rgba(31,31,31,0.45)";
+    for(var k=0;k<=4;k++){
+      var v=maxV*k/4, yy=y(v);
+      ctx.strokeStyle="rgba(31,31,31,0.06)"; ctx.beginPath(); ctx.moveTo(padL,yy); ctx.lineTo(W-padR,yy); ctx.stroke();
+      ctx.fillText(fmtM(v),W-padR+6,yy+4);
+    }
+    for(var i=0;i<months.length;i++){
+      var x0=padL+i*gw;
+      var bw=gw*0.3, gap=gw*0.06;
+      var xs=x0+gw/2-bw-gap/2, xv=x0+gw/2+gap/2;
+      ctx.fillStyle="rgba(31,31,31,0.28)";
+      ctx.fillRect(xs,y(months[i].stock_value),bw,H-padB-y(months[i].stock_value));
+      ctx.fillStyle="rgba(76,187,23,0.75)";
+      ctx.fillRect(xv,y(months[i].sales_value),bw,H-padB-y(months[i].sales_value));
+      ctx.fillStyle="rgba(31,31,31,0.55)"; ctx.textAlign="center"; ctx.font="10px Helvetica,Arial";
+      ctx.fillText(monthLabel(months[i].month),x0+gw/2,H-10);
+      ctx.textAlign="left";
+    }
+    cv.onmousemove=function(ev){
+      var r=cv.getBoundingClientRect();
+      var i=Math.floor((ev.clientX-r.left-padL)/gw);
+      var tip=document.getElementById("ctip");
+      if(i<0||i>=months.length){ tip.style.display="none"; return; }
+      var m=months[i];
+      var share=m.stock_value>0?Math.round(m.sales_value/m.stock_value*100):0;
+      tip.textContent=monthLabel(m.month)+
+        "\nсток на начало: "+fmtM(m.stock_value)+
+        "\nпродажи месяца: "+fmtM(m.sales_value)+
+        "\nпродастся "+share+"% стока";
+      tip.style.display="block";
+      tip.style.left=(ev.clientX+14)+"px"; tip.style.top=(ev.clientY+10)+"px";
+    };
+    cv.onmouseleave=function(){ document.getElementById("ctip").style.display="none"; };
   }
 
-  api("/api/forecast").then(function (d) {
-    ITEMS = d.items || [];
-    renderCards(d.cards);
-    drawChart(d.weeks || []);
-    renderCats(d.categories || []);
-  }).catch(function () {
-    document.getElementById("chart-box").innerHTML =
-      emptyState("Не удалось загрузить данные", "Обновите страницу или попробуйте позже.", "");
+  fetch("/api/forecast",{credentials:"same-origin"}).then(function(r){
+    if(!r.ok) throw new Error("HTTP "+r.status);
+    return r.json();
+  }).then(function(d){
+    ITEMS=d.items||[];
+    var c=d.cards||{};
+    document.getElementById("c-stock").textContent=fmt(c.stock_units)+" шт";
+    document.getElementById("c-stock-s").textContent="потенциал "+fmtM(c.stock_value)+" по ценам продажи";
+    document.getElementById("c-inc").textContent=c.incoming_units?fmt(c.incoming_units)+" шт":"—";
+    document.getElementById("c-pace").textContent=fmtM(c.pace_rub)+"/день";
+    document.getElementById("c-pace-s").textContent="≈ "+fmtM(c.pace_rub*30)+" в месяц при текущем темпе";
+    document.getElementById("c-until").textContent=c.until_date
+      ? "до "+new Date(c.until_date).toLocaleDateString("ru-RU",{day:"numeric",month:"long"})
+      : "> 6 месяцев";
+    document.getElementById("c-until-s").textContent=c.until_weeks
+      ? "90% продаваемого стока распродастся за "+c.until_weeks+" нед"
+      : "текущего стока хватает надолго";
+    drawChart(d.months||[]);
+    var st={none:function(){ return '<span class="pill" style="background:rgba(31,31,31,0.08);color:#666">нет продаж</span>'; },
+      low:function(days){ return '<span class="pill" style="background:rgba(221,0,4,0.15);color:#a00003">'+days+' дн — мало!</span>'; },
+      ok:function(days){ return '<span class="pill" style="background:rgba(76,187,23,0.25);color:#2a5c10">'+days+' дн</span>'; },
+      over:function(days){ return '<span class="pill" style="background:rgba(255,204,0,0.35);color:#7a6400">'+days+' дн — затоварка</span>'; }};
+    document.getElementById("cattb").innerHTML=(d.categories||[]).map(function(cc){
+      return "<tr><td><b>"+esc(cc.name)+"</b></td><td class='r'>"+fmt(cc.stock_units)+"</td>"+
+        "<td class='r'>"+(cc.incoming?("+"+fmt(cc.incoming)):"—")+"</td>"+
+        "<td class='r'><b>"+fmtM(cc.value)+"</b></td>"+
+        "<td class='r'>"+fmtM(cc.pace_rub)+"</td>"+
+        "<td class='r'>"+(st[cc.status]||st.none)(cc.days_left)+"</td></tr>";
+    }).join("")||"<tr><td colspan='6' class='loading'>Нет данных</td></tr>";
+  }).catch(function(e){
+    document.getElementById("cattb").innerHTML="<tr><td colspan='6' class='loading'>Не удалось загрузить: "+esc(e.message)+"</td></tr>";
   });
-
-  function renderCards(c) {
-    document.getElementById("c-stock").textContent = fmtInt(c.stock_units) + " шт";
-    document.getElementById("c-stock-s").textContent = "потенциал " + fmtShort(c.stock_value) + " по ценам продажи";
-    document.getElementById("c-inc").textContent = c.incoming_units ? fmtInt(c.incoming_units) + " шт" : "—";
-    document.getElementById("c-inc-s").textContent = c.incoming_units ? "≈ " + fmtShort(c.incoming_value) : "заказано на производстве";
-    document.getElementById("c-pace").textContent = fmtShort(c.pace_rub) + "/день";
-    document.getElementById("c-pace-s").textContent = "≈ " + fmtShort(c.pace_rub * 30) + " в месяц при текущем темпе";
-    if (c.until_date) {
-      document.getElementById("c-until").textContent = "до " + fmtDate(c.until_date);
-      document.getElementById("c-until-s").textContent =
-        "90 % продаваемого стока распродастся за " + c.until_weeks + " нед";
-    } else {
-      document.getElementById("c-until").textContent = "> 6 месяцев";
-      document.getElementById("c-until-s").textContent = "текущего стока хватает надолго";
-    }
-  }
-
-  function drawChart(weeks) {
-    var box = document.getElementById("chart-box");
-    if (!weeks.length) { box.innerHTML = '<div class="loading-stub">Нет данных</div>'; return; }
-    var W = Math.max(box.clientWidth || 900, 600), H = 260;
-    var padL = 34, padR = 84, padT = 12, padB = 26;
-    var maxV = Math.max.apply(null, weeks.map(function (w) { return w.stock_value; })) * 1.05 || 1;
-    var n = weeks.length;
-    var x = function (i) { return padL + i * (W - padL - padR) / (n - 1); };
-    var y = function (v) { return H - padB - (v / maxV) * (H - padT - padB); };
-
-    var grid = "", labels = "";
-    for (var k = 0; k <= 4; k++) {
-      var v = maxV * k / 4, yy = y(v);
-      grid += '<line x1="' + padL + '" y1="' + yy + '" x2="' + (W - padR) + '" y2="' + yy +
-        '" stroke="#e5e7eb" stroke-width="1"/>';
-      labels += '<text x="' + (W - padR + 6) + '" y="' + (yy + 4) + '" font-size="10" fill="#8b93a1">' +
-        fmtShort(v) + "</text>";
-    }
-    var pts = weeks.map(function (w, i) { return x(i) + "," + y(w.stock_value); }).join(" ");
-    var area = padL + "," + (H - padB) + " " + pts + " " + x(n - 1) + "," + (H - padB);
-    var ticks = "";
-    for (var i = 0; i < n; i += 4) {
-      ticks += '<text x="' + x(i) + '" y="' + (H - 8) + '" font-size="9" fill="#8b93a1" text-anchor="middle">' +
-        fmtDate(weeks[i].date) + "</text>";
-    }
-    box.innerHTML =
-      '<svg viewBox="0 0 ' + W + " " + H + '" width="100%" height="' + H + '" role="img" aria-label="Прогноз стоимости стока">' +
-      grid +
-      '<polygon points="' + area + '" fill="rgba(37,99,235,0.10)"/>' +
-      '<polyline points="' + pts + '" fill="none" stroke="#2563eb" stroke-width="2" stroke-linejoin="round"/>' +
-      labels + ticks +
-      "</svg>";
-  }
-
-  function renderCats(cats) {
-    var tb = document.getElementById("cat-tbody");
-    if (!cats.length) {
-      tb.innerHTML = '<tr><td colspan="6">' + emptyState("Данных пока нет", "Подключите источник данных.", "") + "</td></tr>";
-      return;
-    }
-    tb.innerHTML = cats.map(function (c) {
-      var pill;
-      if (c.status === "none") pill = '<span class="badge gray">нет продаж</span>';
-      else if (c.status === "low") pill = '<span class="badge red">' + fmtInt(c.days_left) + " дн — мало!</span>";
-      else if (c.status === "ok") pill = '<span class="badge green">' + fmtInt(c.days_left) + " дн</span>";
-      else pill = '<span class="badge yellow">' + fmtInt(c.days_left) + " дн — затоварка</span>";
-      return "<tr><td><b>" + esc(c.name) + "</b></td>" +
-        '<td class="num">' + fmtInt(c.stock_units) + "</td>" +
-        '<td class="num">' + (c.incoming ? "+" + fmtInt(c.incoming) : "—") + "</td>" +
-        '<td class="num"><b>' + fmtShort(c.value) + "</b></td>" +
-        '<td class="num">' + fmtShort(c.pace_rub) + "</td>" +
-        '<td class="num">' + pill + "</td></tr>";
-    }).join("");
-  }
-
-  function renderSearch() {
-    var q = (document.getElementById("search").value || "").trim();
-    var wrap = document.getElementById("items-wrap");
-    var hint = document.getElementById("search-hint");
-    if (q.length < 2) { wrap.style.display = "none"; if (hint) hint.style.display = ""; return; }
-    if (hint) hint.style.display = "none";
-    var list = ITEMS.filter(function (x) { return wordMatch(x.base_name, q); }).slice(0, 30);
-    wrap.style.display = "";
-    document.getElementById("items-tbody").innerHTML = list.map(function (x) {
-      return "<tr><td><b>" + esc(x.base_name) + '</b> <span class="muted">' + esc(x.category) + "</span></td>" +
-        '<td class="num">' + fmtInt(x.cs) + "</td>" +
-        '<td class="num">' + (x.ordered ? "+" + fmtInt(x.ordered) : "—") + "</td>" +
-        '<td class="num">' + (x.rate > 0 ? fmtNum(x.rate, 2) : "—") + "</td>" +
-        '<td class="num">' + (x.pace_rub ? fmtShort(x.pace_rub) : "—") + "</td>" +
-        '<td class="num">' + (x.sellout_date ? fmtDate(x.sellout_date) + ' <span class="muted">(' + fmtInt(x.sellout_days) + " дн)</span>" : '<span class="muted">нет продаж</span>') + "</td></tr>";
-    }).join("") || '<tr><td colspan="6"><div class="loading-stub">Не найдено</div></td></tr>';
-  }
-  document.getElementById("search").addEventListener("input", debounce(renderSearch, 150));
-});
+})();
 </script>
-{% endblock %}
+{% include "_hints.html" %}
+</body>
+</html>

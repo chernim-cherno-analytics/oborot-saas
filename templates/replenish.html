@@ -152,7 +152,9 @@
     <a href="/stocks">Активный сток</a>
     <a href="/replenish" class="active">Заказ</a>
     <a href="/sizes">Заказ позиции</a>
-    <a href="/orders">Заказы</a>
+    <a href="/budget">Бюджет</a>
+    <a href="/forecast">Прогноз</a>
+    <a href="/revenue">Оборот</a>
     <a href="/settings">Настройки</a>
   </nav>
 </div>
@@ -232,6 +234,15 @@
           <td></td>
         </tr>
       </tfoot>
+    </table>
+  </div>
+
+  <div class="arch-title" id="orders-title" style="display:none" onclick="void(0)"></div>
+  <div class="table-outer" id="orders-wrap" style="display:none;max-height:40vh">
+    <table>
+      <thead><tr><th style="text-align:left">Заказ</th><th>Создан</th><th>Ожидаемый приход</th>
+        <th>Позиций</th><th>Шт</th><th>Статус</th><th style="width:210px"></th></tr></thead>
+      <tbody id="orders-tb"></tbody>
     </table>
   </div>
 
@@ -340,10 +351,12 @@
   function extraProds(){ return PRODS.filter(function(p){ return !p.is_main; }); }
   function prodOf(base){ return ASSIGN[base]||MAIN_ID; }
 
+  var ORDERS=[];
   function load(){
     tbody.innerHTML='<tr><td colspan="'+NCOLS+'" class="loading">Загрузка…</td></tr>';
-    Promise.all([api("/api/replenish"), api("/api/productions")]).then(function(res){
+    Promise.all([api("/api/replenish"), api("/api/productions"), api("/api/orders").catch(function(){ return {orders:[]}; })]).then(function(res){
       applyProds(res[1]);
+      ORDERS=(res[2].orders||[]).filter(function(o){ return o.status!=="received"; });
       applyData(res[0]);
     }).catch(function(e){
       tbody.innerHTML='<tr><td colspan="'+NCOLS+'"><div class="empty-note">Не удалось загрузить данные — обновите страницу.<br>'+esc(e.message)+'</div></td></tr>';
@@ -389,10 +402,57 @@
     renderChips();
     syncSegUI();
     renderTable();
+    renderOrders();
     renderExcluded();
     updateSummary();
     renderKpis();
     document.getElementById("sumbar").style.display=items.length?"":"none";
+  }
+
+  /* ── заказы в производстве: управление прямо здесь (страницы «Заказы» нет) ── */
+  function renderOrders(){
+    var t=document.getElementById("orders-title");
+    var w=document.getElementById("orders-wrap");
+    if(!ORDERS.length){ t.style.display="none"; w.style.display="none"; return; }
+    t.style.display="";
+    if(w.style.display!=="") w.style.display="";
+    t.innerHTML='Заказы в производстве ('+ORDERS.length+') — учитываются в колонке «Едет»';
+    document.getElementById("orders-tb").innerHTML=ORDERS.map(function(o){
+      var st=o.status==="sent"?"в производстве":"черновик";
+      var btns='';
+      if(o.status==="draft")
+        btns='<button class="mvbtn ord-send" data-id="'+o.id+'">▶ В производство</button> ';
+      if(o.status==="sent")
+        btns='<button class="mvbtn ord-recv" data-id="'+o.id+'" title="Заказ приехал: снимет количество из «Едет», остатки подтянет синхронизация">✓ Принят на склад</button> ';
+      btns+='<button class="mvbtn ord-del" data-id="'+o.id+'" data-name="'+esc(o.name)+'">✕ Удалить</button>';
+      return '<tr><td class="name">'+esc(o.name)+'</td>'+
+        '<td class="nb muted">'+(o.created_at?fmtDate(o.created_at):"—")+'</td>'+
+        '<td class="nb">'+(o.eta_date?fmtDate(o.eta_date):"—")+'</td>'+
+        '<td class="nb">'+fmt(o.positions)+'</td>'+
+        '<td class="nb">'+fmt(o.total_qty)+'</td>'+
+        '<td><span class="stbadge '+(o.status==="sent"?"g":"y")+'">'+st+'</span></td>'+
+        '<td>'+btns+'</td></tr>';
+    }).join("");
+    document.querySelectorAll(".ord-send").forEach(function(b){
+      b.addEventListener("click",function(){
+        api("/api/orders/"+b.getAttribute("data-id")+"/status",{method:"POST",body:{status:"sent"}})
+          .then(load).catch(function(e){ alert("Не удалось: "+e.message); });
+      });
+    });
+    document.querySelectorAll(".ord-recv").forEach(function(b){
+      b.addEventListener("click",function(){
+        if(!confirm("Заказ принят на склад? Его количество будет снято из «Едет».")) return;
+        api("/api/orders/"+b.getAttribute("data-id")+"/status",{method:"POST",body:{status:"received"}})
+          .then(load).catch(function(e){ alert("Не удалось: "+e.message); });
+      });
+    });
+    document.querySelectorAll(".ord-del").forEach(function(b){
+      b.addEventListener("click",function(){
+        if(!confirm("Удалить заказ «"+b.getAttribute("data-name")+"»? Его количество будет снято из «Едет».")) return;
+        api("/api/orders/"+b.getAttribute("data-id"),{method:"DELETE"})
+          .then(load).catch(function(e){ alert("Не удалось: "+e.message); });
+      });
+    });
   }
 
   /* ── производства: вкладки ── */
@@ -622,7 +682,7 @@
         msg="На этом производстве пока нет позиций.<br>Перенесите их из основного — кнопка в последней колонке таблицы.";
       }else if(SENT_ORDERS.length){
         msg="Потребность закрыта заказами в производстве: "+SENT_ORDERS.map(function(o){ return esc(o.name); }).join(", ")+
-          '.<br>Когда они придут на склад, рекомендации пересчитаются. <a href="/orders">Открыть заказы</a>';
+          ".<br>Когда они придут на склад, рекомендации пересчитаются — заказы в блоке под таблицей.";
       }else{
         msg='Заказывать пока нечего — по текущему темпу всех позиций хватает на весь горизонт. <a href="/turnover">Оборачиваемость</a>';
       }
@@ -803,8 +863,14 @@
       return {base_name:it.base_name,qty:it._need,sizes:sizes,cost:it.cost_price||0};
     })};
     btn.disabled=true;
-    api("/api/orders",{method:"POST",body:payload}).then(function(){
-      window.location.href="/orders";
+    // заказ сразу уходит «в производство» (отдельной страницы заказов нет):
+    // его количество попадает в «Едет», управление — в блоке под таблицей
+    api("/api/orders",{method:"POST",body:payload}).then(function(r){
+      return api("/api/orders/"+r.id+"/status",{method:"POST",body:{status:"sent"}});
+    }).then(function(){
+      orderModal.classList.remove("open");
+      btn.disabled=false;
+      load();
     }).catch(function(e){ btn.disabled=false; alert("Не удалось создать заказ: "+e.message); });
   });
 
