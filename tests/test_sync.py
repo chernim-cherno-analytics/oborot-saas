@@ -438,23 +438,11 @@ def run_scenario() -> int:
           and is_service_item("Молочные брюки сэмпл", "")
           and not is_service_item("Пальто \"Скала\"", "Одежда"))
 
-    print("== «Оборот» за период (раздел скрыт, расчёт остаётся в коде) ==")
+    print("== «Оборот» за период (раздел снова открыт) ==")
     r = client.get(f"/api/revenue?date_from={mock_ms.DATES[0]}&date_to={mock_ms.DATES[-1]}")
-    check("скрытый раздел: GET /api/revenue отдаёт 404", r.status_code == 404,
+    check("GET /api/revenue отдаёт 200", r.status_code == 200,
           f"status={r.status_code}")
-    # Сам расчёт проверяем напрямую (код сохранён для возврата раздела).
-    from app import analytics_extra as _ae
-    from app.db import SessionLocal as _SL
-    _con = sqlite3.connect(DB_PATH)
-    _org_id = _con.execute(
-        "SELECT org_id FROM sales GROUP BY org_id ORDER BY COUNT(*) DESC LIMIT 1"
-    ).fetchone()[0]
-    _con.close()
-    _db = _SL()
-    try:
-        rev = _ae.build_revenue(_db, _org_id, mock_ms.DATES[0], mock_ms.DATES[-1])
-    finally:
-        _db.close()
+    rev = r.json()
     exp_sales = mock_ms.expected_net_sales()
     exp_rev = round(sum(v[1] for v in exp_sales.values()))
     exp_qty = round(sum(v[0] for v in exp_sales.values()))
@@ -471,7 +459,17 @@ def run_scenario() -> int:
           len(rev["monthly"]) == 18 and rev["monthly"][-1]["total"] > 0,
           f"n={len(rev['monthly'])} last={rev['monthly'][-1]['total']}")
     r = client.get("/api/revenue?date_from=2026-01-31&date_to=2026-01-01")
-    check("скрытый раздел: и обратный период отдаёт 404", r.status_code == 404)
+    check("обратный период отдаёт 422", r.status_code == 422, f"status={r.status_code}")
+    r = client.get("/orders")
+    check("страница «Заказы» убрана: /orders отдаёт 404", r.status_code == 404,
+          f"status={r.status_code}")
+    for _pg in ("/budget", "/forecast", "/revenue"):
+        r = client.get(_pg)
+        check(f"страница {_pg} открыта (200)", r.status_code == 200, f"status={r.status_code}")
+    r = client.get("/api/forecast")
+    check("прогноз: помесячный ряд «сток vs продажи» на 6 месяцев",
+          r.status_code == 200 and len(r.json().get("months", [])) == 6
+          and all("stock_value" in m and "sales_value" in m for m in r.json()["months"]))
 
     print("== Ручные скидки и «Дефолтные скидки» ==")
     r = client.post("/api/discount-overrides",
@@ -482,7 +480,13 @@ def run_scenario() -> int:
           f"status={r.status_code}")
     # Отчёт скрыт из продукта, но расчёт остаётся в коде — проверяем напрямую.
     from app import analytics as _an, analytics_markdown as _amd
+    from app.db import SessionLocal as _SL
     from app.models import Org as _Org
+    _con = sqlite3.connect(DB_PATH)
+    _org_id = _con.execute(
+        "SELECT org_id FROM sales GROUP BY org_id ORDER BY COUNT(*) DESC LIMIT 1"
+    ).fetchone()[0]
+    _con.close()
     _db = _SL()
     try:
         _org = _db.get(_Org, _org_id)
