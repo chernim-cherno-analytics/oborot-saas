@@ -7,7 +7,7 @@ _stub_templates/ (временные заглушки backend'а) — когда
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, Form, Request
+from fastapi import Depends, FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -310,7 +310,10 @@ def stocks_page(request: Request, db: Session = Depends(get_db)):
 
 @app.get("/orders", response_class=HTMLResponse)
 def orders_page(request: Request, db: Session = Depends(get_db)):
-    return _authed_page(request, db, "orders.html", "orders", "Заказы на производство")
+    # Страница «Заказы» убрана: отдельный реестр со статусами путал («швейка так
+    # не работает»). Заказы создаются и управляются на странице «Заказ» (блок
+    # «Заказы в производстве»); API /api/orders остаётся рабочим.
+    raise HTTPException(status_code=404, detail="Раздел отключён")
 
 
 @app.get("/settings", response_class=HTMLResponse)

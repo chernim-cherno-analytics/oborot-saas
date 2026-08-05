@@ -58,7 +58,9 @@ def _authed_page(request: Request, db: Session, template: str, active: str, page
 # Скрытые разделы: продукт сфокусирован на Оборачиваемости, Активном стоке и
 # заказах. Код страниц сохранён в репозитории — чтобы вернуть раздел, убери его
 # из этого множества (роуты и API снова откроются, пункт меню — в base.html).
-HIDDEN_PAGES = frozenset({"budget", "forecast", "discounts", "revenue"})
+# «Скидки» скрыты (код сохранён); «Заказы» убраны как страница — заказы
+# создаются и управляются прямо на странице «Заказ» (блок «в производстве»).
+HIDDEN_PAGES = frozenset({"discounts", "orders"})
 
 
 def _hidden_404(active: str):
@@ -68,13 +70,11 @@ def _hidden_404(active: str):
 
 @router.get("/budget", response_class=HTMLResponse)
 def budget_page(request: Request, db: Session = Depends(get_db)):
-    _hidden_404("budget")
     return _authed_page(request, db, "budget.html", "budget", "Бюджет закупки")
 
 
 @router.get("/forecast", response_class=HTMLResponse)
 def forecast_page(request: Request, db: Session = Depends(get_db)):
-    _hidden_404("forecast")
     return _authed_page(request, db, "forecast.html", "forecast", "Прогноз")
 
 
@@ -91,7 +91,6 @@ def discounts_page(request: Request, db: Session = Depends(get_db)):
 
 @router.get("/revenue", response_class=HTMLResponse)
 def revenue_page(request: Request, db: Session = Depends(get_db)):
-    _hidden_404("revenue")
     return _authed_page(request, db, "revenue.html", "revenue", "Оборот")
 
 
@@ -118,7 +117,6 @@ def api_budget(
     ctx: AuthContext = Depends(require_auth_api),
     db: Session = Depends(get_db),
 ):
-    _hidden_404("budget")
     """Бюджет закупки: жадное распределение по оборачиваемости (см. analytics_extra)."""
     snap = analytics.get_snapshot(db, ctx.org)
     excluded = {c.strip() for c in exclude_cats.split(",") if c.strip()}
@@ -127,7 +125,6 @@ def api_budget(
 
 @router.get("/api/forecast")
 def api_forecast(ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)):
-    _hidden_404("forecast")
     """Прогноз распродажи стока: карточки, ряд 26 недель, категории, позиции."""
     snap = analytics.get_snapshot(db, ctx.org)
     return analytics_extra.build_forecast(snap)
@@ -214,7 +211,6 @@ def api_revenue(
     ctx: AuthContext = Depends(require_auth_api),
     db: Session = Depends(get_db),
 ):
-    _hidden_404("revenue")
     """«Оборот» за период: выручка, категории, помесячный ряд, топ позиций."""
     if date_from > date_to:
         raise HTTPException(status_code=422, detail="Дата начала позже даты конца")
@@ -444,7 +440,6 @@ def export_budget_xlsx(
     ctx: AuthContext = Depends(require_auth_api),
     db: Session = Depends(get_db),
 ):
-    _hidden_404("budget")
     """Распределение бюджета закупки в Excel (параметры — как у /api/budget)."""
     snap = analytics.get_snapshot(db, ctx.org)
     excluded = {c.strip() for c in exclude_cats.split(",") if c.strip()}

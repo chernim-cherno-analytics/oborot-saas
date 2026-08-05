@@ -39,6 +39,7 @@ from app.models import Product, Sale, StockDay
 FRESH_DAYS = 90        # бюджет: окно «свежих» продаж
 NEED_MIN = 3           # бюджет: минимальная потребность, шт
 FORECAST_WEEKS = 26    # прогноз: горизонт ряда
+FORECAST_MONTHS = 6    # прогноз: месяцы графика «сток vs продажи»
 SELLOUT_SHARE = 0.9    # прогноз: «хватит до» = распродано 90% продаваемого потенциала
 CAT_LOW_DAYS = 45      # прогноз: пилюля «мало»
 CAT_OVER_DAYS = 120    # прогноз: пилюля «затоварка»
@@ -274,6 +275,33 @@ def build_forecast(snap: dict) -> dict:
                 val += rem * x["price"]
         weeks.append({"date": (today + timedelta(days=7 * w)).isoformat(), "stock_value": round(val)})
 
+    # Помесячный ряд «сток vs продажи» (FORECAST_MONTHS месяцев вперёд):
+    # для каждого месяца — стоимость стока на его начало и прогнозная выручка
+    # месяца. Продажи затухают сами собой: бестселлеры распродаются первыми,
+    # и без перезаказа каждый следующий месяц продаёт хуже предыдущего.
+    months_fc = []
+    rem_m = [x["cs"] + x["ordered"] for x in items]
+    my, mm_ = today.year, today.month
+    for _m in range(FORECAST_MONTHS):
+        stock_start = sum(rem_m[i] * x["price"] for i, x in enumerate(items))
+        sales_val = 0.0
+        for i, x in enumerate(items):
+            if x["rate"] <= 0 or rem_m[i] <= 0:
+                continue
+            sold = min(rem_m[i], x["rate"] * 30.44)
+            rem_m[i] -= sold
+            sales_val += sold * x["price"]
+        months_fc.append(
+            {
+                "month": f"{my:04d}-{mm_:02d}",
+                "stock_value": round(stock_start),
+                "sales_value": round(sales_val),
+            }
+        )
+        mm_ += 1
+        if mm_ == 13:
+            my, mm_ = my + 1, 1
+
     # «Хватит до»: 90% ПРОДАВАЕМОГО потенциала (rate>0) — мёртвый сток
     # не должен делать порог недостижимым (правило legacy).
     sellable = sum((x["cs"] + x["ordered"]) * x["price"] for x in items if x["rate"] > 0)
@@ -338,6 +366,7 @@ def build_forecast(snap: dict) -> dict:
             "until_weeks": until_week,
         },
         "weeks": weeks,
+        "months": months_fc,
         "categories": categories,
         "items": [
             {k: v for k, v in x.items() if k != "price"} | {"rate": round(x["rate"], 3)}
