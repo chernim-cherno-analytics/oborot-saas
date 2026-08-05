@@ -486,6 +486,130 @@ def api_hint_mark_seen(
     return {"ok": True}
 
 
+# ── Производства: основное + добавляемые (Китай / Москва / Екатеринбург…) ────
+
+class ProductionIn(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+
+
+class ProductionAssignIn(BaseModel):
+    base_name: str = Field(min_length=1, max_length=255)
+    production_id: int | None = None  # None = вернуть на основное производство
+
+
+def _ensure_main_production(db: Session, org_id: int):
+    """У организации всегда есть основное производство — создаём лениво."""
+    from app.models import Production
+    main = db.execute(
+        select(Production).where(Production.org_id == org_id, Production.is_main.is_(True))
+    ).scalars().first()
+    if main is None:
+        main = Production(org_id=org_id, name="Основное производство", is_main=True)
+        db.add(main)
+        db.commit()
+        db.refresh(main)
+    return main
+
+
+@router.get("/productions")
+def api_productions(ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)):
+    """Список производств + распределение позиций (base_name -> production_id).
+
+    Позиции без записи в assign — на основном производстве."""
+    from app.models import Production, ProductionAssign
+    _ensure_main_production(db, ctx.org.id)
+    prods = db.execute(
+        select(Production).where(Production.org_id == ctx.org.id)
+        .order_by(Production.is_main.desc(), Production.id)
+    ).scalars().all()
+    valid = {p.id for p in prods}
+    assigns = db.execute(
+        select(ProductionAssign).where(ProductionAssign.org_id == ctx.org.id)
+    ).scalars().all()
+    return {
+        "productions": [{"id": p.id, "name": p.name, "is_main": p.is_main} for p in prods],
+        "assign": {a.base_name: a.production_id for a in assigns if a.production_id in valid},
+    }
+
+
+@router.post("/productions")
+def api_production_create(
+    body: ProductionIn, ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)
+):
+    """Добавить дополнительное производство (если заказами занимается другой отдел)."""
+    from app.models import Production
+    _ensure_main_production(db, ctx.org.id)
+    p = Production(org_id=ctx.org.id, name=body.name.strip(), is_main=False)
+    db.add(p)
+    db.commit()
+    db.refresh(p)
+    return {"id": p.id, "name": p.name, "is_main": False}
+
+
+@router.post("/productions/assign")
+def api_production_assign(
+    body: ProductionAssignIn,
+    ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db),
+):
+    """Перенести позицию на производство (production_id=null — на основное)."""
+    from app.models import Production, ProductionAssign
+    row = db.get(ProductionAssign, (ctx.org.id, body.base_name))
+    if body.production_id is None:
+        if row is not None:
+            db.delete(row)
+            db.commit()
+        return {"ok": True}
+    p = db.get(Production, body.production_id)
+    if p is None or p.org_id != ctx.org.id:
+        raise HTTPException(404, "Производство не найдено")
+    if p.is_main:
+        # на основное переносим удалением записи, а не ссылкой на него
+        if row is not None:
+            db.delete(row)
+            db.commit()
+        return {"ok": True}
+    if row is None:
+        db.add(ProductionAssign(org_id=ctx.org.id, base_name=body.base_name, production_id=p.id))
+    else:
+        row.production_id = p.id
+    db.commit()
+    return {"ok": True}
+
+
+@router.post("/productions/{pid}")
+def api_production_rename(
+    pid: int, body: ProductionIn,
+    ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db),
+):
+    """Переименовать производство (основное — тоже можно)."""
+    from app.models import Production
+    p = db.get(Production, pid)
+    if p is None or p.org_id != ctx.org.id:
+        raise HTTPException(404, "Производство не найдено")
+    p.name = body.name.strip()
+    db.commit()
+    return {"id": p.id, "name": p.name, "is_main": p.is_main}
+
+
+@router.delete("/productions/{pid}")
+def api_production_delete(
+    pid: int, ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)
+):
+    """Удалить дополнительное производство; его позиции возвращаются на основное."""
+    from app.models import Production, ProductionAssign
+    p = db.get(Production, pid)
+    if p is None or p.org_id != ctx.org.id:
+        raise HTTPException(404, "Производство не найдено")
+    if p.is_main:
+        raise HTTPException(400, "Основное производство удалить нельзя — его можно переименовать")
+    db.query(ProductionAssign).filter(
+        ProductionAssign.org_id == ctx.org.id, ProductionAssign.production_id == pid
+    ).delete()
+    db.delete(p)
+    db.commit()
+    return {"ok": True}
+
+
 @router.post("/ordered/add")
 def api_add_ordered(
     body: OrderedIn, ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)

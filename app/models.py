@@ -186,6 +186,41 @@ class OrderedQty(Base):
     ms_qty: Mapped[float] = mapped_column(Float, nullable=False, default=0.0, server_default="0")
 
 
+class Production(Base):
+    """Производство (цех / подрядчик / отдел), между которыми распределяются
+    позиции страницы «Заказ».
+
+    У организации всегда одно основное производство (is_main=True) — создаётся
+    лениво при первом обращении и может быть переименовано. Дополнительные
+    (Китай, Москва, Екатеринбург, ...) добавляются вручную, если заказами
+    занимаются разные отделы; позиции переносятся на них прямо из таблицы
+    «Заказа» и возвращаются обратно.
+    """
+
+    __tablename__ = "productions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    org_id: Mapped[int] = mapped_column(ForeignKey("orgs.id"), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    is_main: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class ProductionAssign(Base):
+    """Позиция, закреплённая за ДОПОЛНИТЕЛЬНЫМ производством.
+
+    Отсутствие записи = позиция на основном производстве (дефолт). При
+    удалении производства его записи удаляются — позиции возвращаются
+    на основное автоматически.
+    """
+
+    __tablename__ = "production_assign"
+
+    org_id: Mapped[int] = mapped_column(ForeignKey("orgs.id"), primary_key=True)
+    base_name: Mapped[str] = mapped_column(String(255), primary_key=True)
+    production_id: Mapped[int] = mapped_column(ForeignKey("productions.id"), nullable=False)
+
+
 class UserHintSeen(Base):
     """Просмотренные онбординг-инструкции страниц (значок «?» в шапке).
 
