@@ -8,3 +8,4 @@ _shots/
 nohup.out
 .env.local
 _qa_shots/
+test_*.db

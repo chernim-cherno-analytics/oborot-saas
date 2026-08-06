@@ -890,3 +890,144 @@ def build_revenue(db: Session, org_id: int, date_from: str, date_to: str) -> dic
         "monthly": monthly,
         "items": items[:300],  # топ-300: хватает и для топ-15, и для поиска
     }
+
+
+PULSE_MONTHS = 6  # «Пульс»: сравнение с этим числом ПОЛНЫХ месяцев
+
+
+def _pulse_price_map(db: Session, org_id: int, today: date) -> dict[int, float]:
+    """Цена позиции для оценки склада в ₽.
+
+    Фактическая средняя цена продажи (нетто за 365 дней); если позиция не
+    продавалась — номинальная розница из карточки (sale_price). Ноль остаётся
+    нулём: у позиции без цены стоимость склада честно не оцениваем.
+    """
+    since = (today - timedelta(days=365)).isoformat()
+    sign_qty = case((Sale.is_return, -Sale.qty), else_=Sale.qty)
+    sign_rev = case((Sale.is_return, -Sale.revenue), else_=Sale.revenue)
+    rows = db.execute(
+        select(Sale.product_id, func.sum(sign_qty), func.sum(sign_rev))
+        .where(Sale.org_id == org_id, Sale.date >= since)
+        .group_by(Sale.product_id)
+    ).all()
+    sold: dict[int, float] = {}
+    for pid, q, r in rows:
+        q, r = float(q or 0), float(r or 0)
+        if q >= 1 and r > 0:
+            sold[pid] = r / q
+    prices: dict[int, float] = {}
+    for pid, nominal in db.execute(
+        select(Product.id, Product.sale_price)
+        .where(Product.org_id == org_id, Product.excluded.is_(False))
+    ).all():
+        prices[pid] = sold.get(pid, float(nominal or 0))
+    return prices
+
+
+def build_pulse(db: Session, org_id: int, today: date | None = None) -> dict:
+    """«Пульс»: этот месяц против среднего за 6 полных месяцев.
+
+    Две шкалы, обе в ₽:
+    - продажи: нетто-выручка текущего месяца, экстраполированная на полный
+      месяц по прошедшим дням, против средней нетто-выручки за 6 полных
+      месяцев;
+    - склад: текущая стоимость остатка (шт × цена) против средней стоимости
+      склада за те же 6 месяцев (среднее дневных сумм по StockDay).
+
+    pct = текущее/среднее; 360° на круге = среднее за 6 месяцев.
+    Месяцы без данных в среднее не входят (молодой аккаунт), их число видно
+    по len(months) с v != None.
+    """
+    today = today or date.today()
+    cur_month = f"{today.year:04d}-{today.month:02d}"
+    months: list[str] = []
+    y, m = today.year, today.month
+    for _ in range(PULSE_MONTHS):
+        m -= 1
+        if m == 0:
+            y, m = y - 1, 12
+        months.append(f"{y:04d}-{m:02d}")
+    months.reverse()
+
+    # --- Продажи: помесячная нетто-выручка -------------------------------
+    sign_rev = case((Sale.is_return, -Sale.revenue), else_=Sale.revenue)
+    join_products = and_(
+        Product.id == Sale.product_id,
+        Product.org_id == org_id,
+        Product.excluded.is_(False),
+    )
+    month_col = func.substr(Sale.date, 1, 7)
+    sale_rows = dict(
+        db.execute(
+            select(month_col, func.sum(sign_rev))
+            .select_from(Sale)
+            .join(Product, join_products)
+            .where(Sale.org_id == org_id, month_col >= months[0])
+            .group_by(month_col)
+        ).all()
+    )
+    sales_months = [
+        {"month": mm, "v": round(float(sale_rows[mm]))} if mm in sale_rows
+        else {"month": mm, "v": None}
+        for mm in months
+    ]
+    known_sales = [x["v"] for x in sales_months if x["v"] is not None]
+    sales_avg6 = sum(known_sales) / len(known_sales) if known_sales else 0.0
+
+    mtd = float(sale_rows.get(cur_month, 0) or 0)
+    days_in_month = (
+        (date(today.year + (today.month == 12), today.month % 12 + 1, 1)
+         - date(today.year, today.month, 1)).days
+    )
+    days_passed = today.day
+    projected = mtd / days_passed * days_in_month if days_passed else mtd
+
+    # --- Склад: дневные суммы qty × цена → средние по месяцам -------------
+    prices = _pulse_price_map(db, org_id, today)
+    stock_rows = db.execute(
+        select(StockDay.date, StockDay.product_id, StockDay.qty)
+        .where(StockDay.org_id == org_id,
+               func.substr(StockDay.date, 1, 7) >= months[0])
+    ).all()
+    day_val: dict[str, float] = {}
+    for d, pid, qty in stock_rows:
+        if pid in prices and qty:
+            day_val[d] = day_val.get(d, 0.0) + float(qty) * prices[pid]
+        else:
+            day_val.setdefault(d, 0.0)
+    month_vals: dict[str, list[float]] = {}
+    for d, v in day_val.items():
+        month_vals.setdefault(d[:7], []).append(v)
+    stock_months = [
+        {"month": mm,
+         "v": round(sum(month_vals[mm]) / len(month_vals[mm])) if mm in month_vals else None}
+        for mm in months
+    ]
+    known_stock = [x["v"] for x in stock_months if x["v"] is not None]
+    stock_avg6 = sum(known_stock) / len(known_stock) if known_stock else 0.0
+
+    last_day = max(day_val) if day_val else None
+    stock_now = day_val.get(last_day, 0.0) if last_day else 0.0
+
+    def _pct(cur: float, avg: float):
+        return round(cur / avg, 3) if avg > 0 else None
+
+    return {
+        "months": months,
+        "sales": {
+            "months": sales_months,
+            "avg6": round(sales_avg6),
+            "mtd": round(mtd),
+            "projected": round(projected),
+            "days_passed": days_passed,
+            "days_in_month": days_in_month,
+            "pct": _pct(projected, sales_avg6),
+        },
+        "stock": {
+            "months": stock_months,
+            "avg6": round(stock_avg6),
+            "current": round(stock_now),
+            "as_of": last_day,
+            "pct": _pct(stock_now, stock_avg6),
+        },
+    }

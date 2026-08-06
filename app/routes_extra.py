@@ -219,6 +219,12 @@ def api_revenue(
     return analytics_extra.build_revenue(db, ctx.org.id, date_from, date_to)
 
 
+@router.get("/api/pulse")
+def api_pulse(ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)):
+    """«Пульс»: этот месяц и текущий склад против среднего за 6 полных месяцев."""
+    return analytics_extra.build_pulse(db, ctx.org.id)
+
+
 @router.get("/api/sizes/products")
 def api_sizes_products(ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)):
     """Список позиций для поиска на странице «Размеры»."""

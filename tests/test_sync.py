@@ -471,6 +471,51 @@ def run_scenario() -> int:
           r.status_code == 200 and len(r.json().get("months", [])) == 6
           and all("stock_value" in m and "sales_value" in m for m in r.json()["months"]))
 
+    print("== «Пульс»: этот месяц против среднего за 6 мес ==")
+    r = client.get("/api/pulse")
+    check("GET /api/pulse отвечает", r.status_code == 200, f"status={r.status_code}")
+    pulse = r.json()
+    from datetime import date as _date
+    _cur = f"{_date.today().year:04d}-{_date.today().month:02d}"
+    check("окно пульса: 6 полных месяцев до текущего",
+          len(pulse["months"]) == 6 and pulse["months"][-1] < _cur
+          and pulse["months"][0] < pulse["months"][-1],
+          f"months={pulse['months']}")
+    ps = pulse["sales"]
+    exp_proj = round(ps["mtd"] / ps["days_passed"] * ps["days_in_month"]) \
+        if ps["days_passed"] else ps["mtd"]
+    check("прогноз месяца = продано ÷ прошло дней × дней в месяце",
+          abs(ps["projected"] - exp_proj) <= 1,
+          f"got={ps['projected']} exp={exp_proj}")
+    known = [m["v"] for m in ps["months"] if m["v"] is not None]
+    check("среднее продаж = среднее известных месяцев",
+          known and abs(ps["avg6"] - sum(known) / len(known)) <= 1,
+          f"avg6={ps['avg6']} known={known}")
+    rev_by_month = {m["month"]: m["total"] for m in rev["monthly"]}
+    diverged = [m["month"] for m in ps["months"]
+                if m["v"] is not None and m["month"] in rev_by_month
+                and abs(m["v"] - rev_by_month[m["month"]]) > 2]
+    check("помесячные продажи пульса сходятся с рядом /api/revenue",
+          not diverged, f"расхождение в {diverged}")
+    if ps["avg6"] > 0:
+        check("pct продаж = прогноз/среднее",
+              abs(ps["pct"] - ps["projected"] / ps["avg6"]) < 0.01,
+              f"pct={ps['pct']}")
+    pst = pulse["stock"]
+    check("склад сейчас: положительная стоимость и свежая дата",
+          pst["current"] > 0 and pst["as_of"] is not None
+          and pst["as_of"] >= mock_ms.DATES[-1],
+          f"current={pst['current']} as_of={pst['as_of']}")
+    known_st = [m["v"] for m in pst["months"] if m["v"] is not None]
+    check("средний склад = среднее известных месяцев, все > 0",
+          known_st and all(v > 0 for v in known_st)
+          and abs(pst["avg6"] - sum(known_st) / len(known_st)) <= 1,
+          f"avg6={pst['avg6']} known={known_st}")
+    if pst["avg6"] > 0:
+        check("pct склада = сейчас/среднее",
+              abs(pst["pct"] - pst["current"] / pst["avg6"]) < 0.01,
+              f"pct={pst['pct']}")
+
     print("== Ручные скидки и «Дефолтные скидки» ==")
     r = client.post("/api/discount-overrides",
                     json={"base_name": "Худи «Скетч»", "discount": 25})
