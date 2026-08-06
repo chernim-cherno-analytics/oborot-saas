@@ -127,9 +127,7 @@ def api_budget(
 def api_forecast(ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)):
     """Прогноз распродажи стока: карточки, ряд 26 недель, категории, позиции."""
     snap = analytics.get_snapshot(db, ctx.org)
-    data = analytics_extra.build_forecast(snap)
-    data.update(analytics_extra.forecast_refs(db, ctx.org.id, snap))
-    return data
+    return analytics_extra.build_forecast(snap)
 
 
 def _discount_overrides(db: Session, org_id: int) -> dict[str, float]:

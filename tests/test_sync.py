@@ -467,8 +467,8 @@ def run_scenario() -> int:
         r = client.get(_pg)
         check(f"страница {_pg} открыта (200)", r.status_code == 200, f"status={r.status_code}")
     r = client.get("/api/forecast")
-    check("прогноз: помесячный ряд «сток vs продажи» на 6 месяцев",
-          r.status_code == 200 and len(r.json().get("months", [])) == 6
+    check("прогноз: помесячный ряд «сток vs продажи» на 7 месяцев (текущий + 6 для мини-колец)",
+          r.status_code == 200 and len(r.json().get("months", [])) == 7
           and all("stock_value" in m and "sales_value" in m for m in r.json()["months"]))
 
     print("== «Пульс»: этот месяц против среднего за 6 мес ==")

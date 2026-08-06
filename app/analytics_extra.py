@@ -39,7 +39,7 @@ from app.models import Product, Sale, StockDay
 FRESH_DAYS = 90        # бюджет: окно «свежих» продаж
 NEED_MIN = 3           # бюджет: минимальная потребность, шт
 FORECAST_WEEKS = 26    # прогноз: горизонт ряда
-FORECAST_MONTHS = 6    # прогноз: месяцы графика «сток vs продажи»
+FORECAST_MONTHS = 7    # прогноз: текущий + 6 будущих месяцев (мини-кольца «Пульса» показывают будущие)
 SELLOUT_SHARE = 0.9    # прогноз: «хватит до» = распродано 90% продаваемого потенциала
 CAT_LOW_DAYS = 45      # прогноз: пилюля «мало»
 CAT_OVER_DAYS = 120    # прогноз: пилюля «затоварка»
@@ -221,62 +221,6 @@ def build_budget(
 
 
 # ── Прогноз ──────────────────────────────────────────────────────────────────
-
-def _median(vals: list[float]) -> float | None:
-    vals = sorted(v for v in vals if v > 0)
-    if not vals:
-        return None
-    mid = len(vals) // 2
-    return vals[mid] if len(vals) % 2 else (vals[mid - 1] + vals[mid]) / 2
-
-
-def forecast_refs(db: Session, org_id: int, snap: dict) -> dict:
-    """Референсы градиента графика «сток vs продажи»:
-
-    median_sales_6m — медианный месячный нетто-оборот за последние 6 ПОЛНЫХ
-    месяцев («зелёный верх» столбика продаж: месяц на медиану и выше — зелёный);
-    median_stock_6m — медианная стоимость стока на начало последних 6 месяцев
-    (по истории stock_days и текущим ценам позиций).
-    """
-    sign_rev = case((Sale.is_return, -Sale.revenue), else_=Sale.revenue)
-    month_col = func.substr(Sale.date, 1, 7)
-    cur_month = snap["today"][:7]
-    rows = db.execute(
-        select(month_col, func.sum(sign_rev))
-        .select_from(Sale)
-        .join(Product, and_(Product.id == Sale.product_id,
-                            Product.org_id == org_id,
-                            Product.excluded.is_(False)))
-        .where(Sale.org_id == org_id, month_col < cur_month)
-        .group_by(month_col)
-        .order_by(month_col.desc())
-        .limit(6)
-    ).all()
-    median_sales = _median([float(r or 0) for _m, r in rows])
-
-    # цены по базовым именам — из снапшота (средняя фактическая цена продажи)
-    price_by_base = {it["base_name"]: _item_price(it) for it in snap["items"].values()}
-    # начало каждого из последних 6 месяцев, по которым есть история остатков
-    month_start = db.execute(
-        select(func.substr(StockDay.date, 1, 7), func.min(StockDay.date))
-        .where(StockDay.org_id == org_id)
-        .group_by(func.substr(StockDay.date, 1, 7))
-        .order_by(func.substr(StockDay.date, 1, 7).desc())
-        .limit(6)
-    ).all()
-    stock_vals = []
-    for _m, d in month_start:
-        rows = db.execute(
-            select(Product.base_name, func.sum(StockDay.qty))
-            .select_from(StockDay)
-            .join(Product, Product.id == StockDay.product_id)
-            .where(StockDay.org_id == org_id, StockDay.date == d)
-            .group_by(Product.base_name)
-        ).all()
-        stock_vals.append(sum(float(q or 0) * price_by_base.get(b, 0.0) for b, q in rows))
-    return {"median_sales_6m": round(median_sales) if median_sales else None,
-            "median_stock_6m": round(_median(stock_vals)) if _median(stock_vals) else None}
-
 
 def build_forecast(snap: dict) -> dict:
     """GET /api/forecast — распродажа стока по неделям, карточки, категории."""
