@@ -515,6 +515,21 @@ def run_scenario() -> int:
         check("pct склада = сейчас/среднее",
               abs(pst["pct"] - pst["current"] / pst["avg6"]) < 0.01,
               f"pct={pst['pct']}")
+    check("дни экстраполяции — по данным, не больше календарных",
+          1 <= ps["days_passed"] <= _date.today().day,
+          f"days_passed={ps['days_passed']}")
+
+    print("== Табло свежести данных ==")
+    r = client.get("/api/freshness")
+    fresh = r.json() if r.status_code == 200 else {}
+    check("GET /api/freshness: даты продаж и остатков на месте",
+          r.status_code == 200 and fresh.get("last_sale_date")
+          and fresh.get("last_stock_date")
+          and fresh["last_stock_date"] >= mock_ms.DATES[-1],
+          f"got={fresh}")
+    check("свежесть согласована с пульсом",
+          fresh.get("last_sale_date") == pulse.get("last_sale_date")
+          and fresh.get("last_stock_date") == pulse.get("last_stock_date"))
 
     print("== Ручные скидки и «Дефолтные скидки» ==")
     r = client.post("/api/discount-overrides",
