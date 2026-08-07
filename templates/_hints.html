@@ -142,3 +142,55 @@
   } catch(e){}
 })();
 </script>
+
+{# Табло свежести данных: до какого дня загружены продажи и остатки и не
+   падает ли синк. Всегда видно (левый нижний угол); при ошибке синка —
+   красное, при отставании данных — жёлтое. Клик ведёт в настройки. #}
+<style>
+  .fresh-chip { position: fixed; left: 18px; bottom: 18px; z-index: 900;
+    display: none; align-items: center; gap: 8px; max-width: 46vw;
+    padding: 8px 14px; border-radius: 12px; font: 11.5px/1.45 Helvetica, Arial, sans-serif;
+    text-decoration: none; border: 1px solid rgba(31,31,31,.16);
+    background: rgba(255,255,255,.85); color: rgba(31,31,31,.75);
+    backdrop-filter: blur(8px); box-shadow: 0 4px 14px rgba(31,31,31,.12); }
+  .fresh-chip:hover { border-color: rgba(31,31,31,.35) }
+  .fresh-chip .fd { width: 8px; height: 8px; border-radius: 50%; flex: 0 0 8px; background: #2a5c10 }
+  .fresh-chip.warn { background: rgba(255,214,102,.95); color: #5c4a00 }
+  .fresh-chip.warn .fd { background: #a37f00 }
+  .fresh-chip.bad { background: rgba(221,0,4,.92); color: #fff; border-color: rgba(150,0,0,.6) }
+  .fresh-chip.bad .fd { background: #fff }
+</style>
+<a class="fresh-chip" id="fresh-chip" href="/settings"></a>
+<script>
+(function(){
+  "use strict";
+  var chip = document.getElementById("fresh-chip");
+  if (!chip) return;
+  function dm(iso){ return iso ? iso.slice(8,10) + "." + iso.slice(5,7) : "—"; }
+  function ageDays(iso){
+    if (!iso) return 999;
+    return Math.floor((Date.now() - new Date(iso + "T00:00:00").getTime()) / 86400000);
+  }
+  try {
+    fetch("/api/freshness", {credentials:"same-origin"})
+      .then(function(r){ if (!r.ok) throw 0; return r.json(); })
+      .then(function(d){
+        var last = [d.last_sale_date, d.last_stock_date].filter(Boolean).sort().pop() || null;
+        var stale = Math.min(ageDays(d.last_sale_date), ageDays(d.last_stock_date));
+        var txt = "Данные: продажи по " + dm(d.last_sale_date) + " · склад по " + dm(d.last_stock_date);
+        if (d.sync_state === "error") {
+          chip.classList.add("bad");
+          txt = "⚠ Синхронизация падает — " + (d.sync_error || "ошибка") + " · " + txt +
+            " · нажмите, чтобы исправить в настройках";
+        } else if (stale >= 2) {
+          chip.classList.add("warn");
+          txt = "Данные отстают: продажи по " + dm(d.last_sale_date) +
+            " · склад по " + dm(d.last_stock_date) + " · проверьте синхронизацию";
+        }
+        chip.innerHTML = '<span class="fd"></span><span></span>';
+        chip.lastChild.textContent = txt;
+        chip.style.display = "flex";
+      }).catch(function(){});
+  } catch(e){}
+})();
+</script>
