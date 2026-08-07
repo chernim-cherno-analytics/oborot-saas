@@ -25,6 +25,7 @@
 import logging
 import os
 import time
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -118,6 +119,55 @@ def run_daily_job() -> dict:
     return results
 
 
+CATCHUP_STALE_HOURS = 26  # догонять, если успешного синка не было дольше суток
+
+
+def run_catchup_job() -> dict:
+    """Почасовой «догоняющий» джоб: чинит молчаливое отставание данных.
+
+    Если у организации последний успешный синк старше CATCHUP_STALE_HOURS
+    (упал в 06:00, приложение было в рестарте, токен только что поменяли) —
+    пробуем инкрементальный синк ещё раз. Ошибка (например, всё ещё битый
+    токен) стоит секунды и остаётся видимой в sync_state/на табло свежести;
+    как только причину устранят — данные догонятся в течение часа, а не
+    на следующее утро.
+    """
+    results: dict[int, str] = {}
+    cutoff = datetime.utcnow() - timedelta(hours=CATCHUP_STALE_HOURS)
+    db = SessionLocal()
+    try:
+        rows = db.execute(
+            select(Connection.org_id, Connection.last_sync_at)
+            .join(Org, Org.id == Connection.org_id)
+            .where(
+                Connection.kind == "moysklad",
+                Connection.status == "active",
+                Org.status != "suspended",
+            )
+            .order_by(Connection.org_id)
+        ).all()
+    finally:
+        db.close()
+    stale = [org_id for org_id, ts in rows if ts is None or ts < cutoff]
+    if not stale:
+        return results
+    log.info("догоняющий синк: %d отставших организаций", len(stale))
+    for org_id in stale:
+        try:
+            if not ms_sync.start_sync(org_id, mode="incremental"):
+                results[org_id] = "skipped_already_running"
+                continue
+            status = _wait_sync_finished(org_id)
+            results[org_id] = status.get("state", "unknown")
+            if status.get("state") == "error":
+                log.warning("org=%s: догоняющий синк упал: %s",
+                            org_id, status.get("error", ""))
+        except Exception:  # noqa: BLE001 — одна org не валит остальных
+            results[org_id] = "error"
+            log.exception("org=%s: необработанная ошибка догоняющего синка", org_id)
+    return results
+
+
 # ── Жизненный цикл ───────────────────────────────────────────────────────────
 
 def start() -> None:
@@ -138,9 +188,18 @@ def start() -> None:
         max_instances=1,      # второй запуск не стартует, пока идёт первый
         misfire_grace_time=3600,
     )
+    _scheduler.add_job(
+        run_catchup_job,
+        CronTrigger(minute=30, timezone=MOSCOW_TZ),  # каждый час в :30
+        id="hourly-catchup-sync",
+        name="Догоняющий синк: повтор после сбоя/пропуска ежедневного",
+        coalesce=True,
+        max_instances=1,
+        misfire_grace_time=1800,
+    )
     _scheduler.start()
     _started = True
-    log.info("планировщик запущен: ежедневно в %02d:00 МСК", DAILY_HOUR)
+    log.info("планировщик запущен: ежедневно в %02d:00 МСК + почасовой догон", DAILY_HOUR)
 
 
 def shutdown() -> None:

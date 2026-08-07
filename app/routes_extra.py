@@ -223,6 +223,31 @@ def api_pulse(ctx: AuthContext = Depends(require_auth_api), db: Session = Depend
     return analytics_extra.build_pulse(db, ctx.org.id)
 
 
+@router.get("/api/freshness")
+def api_freshness(ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)):
+    """Табло свежести данных: до какого дня загружены продажи и остатки
+    и чем закончился последний синк. Питает баннер на всех страницах."""
+    from sqlalchemy import func as _f
+
+    from app import ms_sync
+    from app.models import Sale as _Sale, StockDay as _SD
+
+    last_sale = db.execute(
+        select(_f.max(_Sale.date)).where(_Sale.org_id == ctx.org.id)
+    ).scalar()
+    last_stock = db.execute(
+        select(_f.max(_SD.date)).where(_SD.org_id == ctx.org.id)
+    ).scalar()
+    st = ms_sync.get_status(ctx.org.id)
+    return {
+        "last_sale_date": last_sale,
+        "last_stock_date": last_stock,
+        "sync_state": st.get("state"),
+        "sync_error": st.get("error"),
+        "sync_finished_at": st.get("finished_at"),
+    }
+
+
 @router.get("/api/sizes/products")
 def api_sizes_products(ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)):
     """Список позиций для поиска на странице «Размеры»."""

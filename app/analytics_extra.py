@@ -923,7 +923,21 @@ def build_pulse(db: Session, org_id: int, today: date | None = None) -> dict:
         (date(today.year + (today.month == 12), today.month % 12 + 1, 1)
          - date(today.year, today.month, 1)).days
     )
-    days_passed = today.day
+    # Дни для экстраполяции — по ДАННЫМ, а не по календарю: если синк отстал
+    # (последняя продажа/снапшот — 4-е число, а сегодня 7-е), делить на 7
+    # значит занижать прогноз. Берём последний день, за который есть данные
+    # (продажи или остатки) в текущем месяце, но не позже сегодня.
+    last_sale = db.execute(
+        select(func.max(Sale.date)).where(Sale.org_id == org_id)
+    ).scalar()
+    last_stock = db.execute(
+        select(func.max(StockDay.date)).where(StockDay.org_id == org_id)
+    ).scalar()
+    last_data = max(filter(None, [last_sale, last_stock]), default=None)
+    if last_data and last_data[:7] == cur_month:
+        days_passed = min(today.day, int(last_data[8:10]))
+    else:
+        days_passed = today.day
     projected = mtd / days_passed * days_in_month if days_passed else mtd
 
     # --- Склад: дневные суммы qty × цена → средние по месяцам -------------
@@ -958,6 +972,8 @@ def build_pulse(db: Session, org_id: int, today: date | None = None) -> dict:
 
     return {
         "months": months,
+        "last_sale_date": last_sale,
+        "last_stock_date": last_stock,
         "sales": {
             "months": sales_months,
             "avg6": round(sales_avg6),
