@@ -287,6 +287,12 @@
         throw new Error(j.detail || ("HTTP "+r.status)); });
       return r.json(); });
   }
+  // toISOString() переводит в UTC и в плюсовых часовых поясах сдвигает дату
+  // на день назад — поэтому ISO собираем из локальных компонентов.
+  function isoLocal(d){
+    return d.getFullYear() + "-" + String(d.getMonth()+1).padStart(2,"0") +
+           "-" + String(d.getDate()).padStart(2,"0");
+  }
   function dstr(iso){
     if(!iso) return "—";
     var M=["янв","фев","мар","апр","мая","июн","июл","авг","сен","окт","ноя","дек"];
@@ -344,7 +350,7 @@
     if(!p) return;
     var d = new Date(); d.setDate(d.getDate() + p.lead_days);
     var eta = document.getElementById("eta");
-    if(!eta.dataset.touched) eta.value = d.toISOString().slice(0,10);
+    if(!eta.dataset.touched) eta.value = isoLocal(d);
     if(p.cadence_days) { STATE.cadence = p.cadence_days; segInitValue("cadSeg", p.cadence_days); }
     document.getElementById("prodHint").textContent =
       "Срок производства " + p.lead_days + " дн — сумма этапов. " +
@@ -379,8 +385,8 @@
       var today = new Date(); today.setHours(0,0,0,0);
       var late = d < today;
       document.getElementById("etaHint").innerHTML = late
-        ? '<span style="color:#8a0003">Чтобы успеть, заказ надо было разместить ' + dstr(d.toISOString().slice(0,10)) + ' — уже поздно.</span>'
-        : "Разместить заказ нужно " + dstr(d.toISOString().slice(0,10)) + ".";
+        ? '<span style="color:#8a0003">Чтобы успеть, заказ надо было разместить ' + dstr(isoLocal(d)) + ' — уже поздно.</span>'
+        : "Разместить заказ нужно " + dstr(isoLocal(d)) + ".";
     }
   }
 
