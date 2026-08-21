@@ -218,7 +218,34 @@ def _build_world():
              [{"ext": "v-tee1-S", "qty": 999, "price_kop": 100000, "discount": 0}],
              99, applicable=False)
 
+    _apply_stock_shapes(stock_by_day)
     return skus, stock_by_day, docs, sale_events, return_events
+
+
+def _apply_stock_shapes(stock_by_day: dict) -> None:
+    """Формы истории остатков, которых не даёт «монотонный» генератор (ревью 21.08).
+
+    Базовый мир только распродаётся и никогда не пополняется, поэтому тест
+    эквивалентности «прямой проход == обратная загрузка чанками» не проверял
+    самые опасные для граничной заплатки случаи. Добавляем:
+      - ПОЯВЛЕНИЕ ЗАНОВО после дыры ДЛИННЕЕ ЧАНКА (позиция исчезает из отчёта
+        на 15 дат и возвращается);
+      - ПЕРВОЕ ПОЯВЛЕНИЕ В СЕРЕДИНЕ истории (позиции нет в первые 30 дат);
+      - позиция, положительная ТОЛЬКО НА САМОЙ СТАРОЙ дате;
+      - ПУСТОЙ ОТЧЁТ за день (МойСклад вернул ноль строк по всем складам) —
+        все явные нули за этот день и восстановление на следующий.
+    Все эталоны expected_*() читают STOCK_BY_DAY, поэтому остаются верными.
+    """
+    def _drop(ext: str, idx_from: int, idx_to: int) -> None:
+        for day in DATES[idx_from:idx_to]:
+            for sid, _ in STORES:
+                stock_by_day.get((day, sid), {}).pop(ext, None)
+
+    _drop("v-dress1-S", 20, 35)          # дыра длиннее чанка → появление заново
+    _drop("v-pants1-L", 0, 30)           # первое появление в середине истории
+    _drop("v-shirt1-S", 1, len(DATES))   # положителен только на самой старой дате
+    for sid, _ in STORES:                # пустой отчёт за день
+        stock_by_day[(DATES[12], sid)] = {}
 
 
 def _asm_meta(ext: str) -> dict:
@@ -414,17 +441,24 @@ def _parse_filter(flt: str) -> dict:
 #   stock_ok_before — сбои включаются только после N успешных ответов отчёта;
 #   stock_429_burst — следующие N запросов отчёта → 429 с Retry-TimeInterval=200;
 #   stock_429_every — каждый k-й запрос отчёта → 429 (0 — выключено);
-#   stock_500_once  — ровно один ближайший запрос отчёта → 500.
+#   stock_500_once  — ровно один ближайший запрос отчёта → 500;
+#   stock_delay_ms  — задержка каждого удачного ответа отчёта (деплой П1:
+#                     чтобы тест успел увидеть промежуточные состояния синка).
 
 FAULTS: dict = {"stock_ok_before": 0, "stock_429_burst": 0,
                 "stock_429_every": 0, "stock_500_once": False,
-                "assortment_429_burst": 0}  # 429 на /entity/assortment (до истории)
+                "assortment_429_burst": 0,  # 429 на /entity/assortment (до истории)
+                # 429 на документах продаж/возвратов: прерывает синк ровно
+                # на продажах окна быстрого старта (ревью 21.08, мажор 2)
+                "docs_429_burst": 0,
+                "stock_delay_ms": 0}
 FAULT_STATS: dict = {"stock_requests": 0, "stock_ok": 0, "stock_429": 0, "stock_500": 0}
 
 
 def reset_faults() -> None:
     FAULTS.update(stock_ok_before=0, stock_429_burst=0, stock_429_every=0,
-                  stock_500_once=False, assortment_429_burst=0)
+                  stock_500_once=False, assortment_429_burst=0,
+                  docs_429_burst=0, stock_delay_ms=0)
     for k in FAULT_STATS:
         FAULT_STATS[k] = 0
 
@@ -468,12 +502,17 @@ def _maybe_fault_stock():
 
 
 @app.get("/report/stock/all")
-def report_stock_all(request: Request, limit: int = 1000, offset: int = 0,
-                     flt: str = Query(default="", alias="filter")):
+async def report_stock_all(request: Request, limit: int = 1000, offset: int = 0,
+                           flt: str = Query(default="", alias="filter")):
     _auth(request)
     fault = _maybe_fault_stock()
     if fault is not None:
         return fault
+    # Задержка — асинхронная: time.sleep сериализовал ВЕСЬ mock (соседние
+    # даты переставали качаться параллельно, тест мерил не то).
+    if int(FAULTS.get("stock_delay_ms") or 0) > 0:
+        import asyncio as _asyncio
+        await _asyncio.sleep(int(FAULTS["stock_delay_ms"]) / 1000.0)
     parsed = _parse_filter(flt)
     # КРИТИЧНО: moment учитывается ТОЛЬКО из filter; отдельный query-параметр
     # ?moment=... игнорируется — как в реальном МойСкладе.
@@ -496,6 +535,12 @@ def report_stock_all(request: Request, limit: int = 1000, offset: int = 0,
 def _docs_endpoint(entity: str, request: Request, limit: int, offset: int,
                    flt: str, expand: str) -> dict:
     _auth(request)
+    if int(FAULTS.get("docs_429_burst") or 0) > 0:
+        from fastapi.responses import JSONResponse
+        FAULTS["docs_429_burst"] -= 1
+        return JSONResponse(status_code=429,
+                            content={"errors": [{"error": "mock: Превышен лимит запросов"}]},
+                            headers={"X-Lognex-Retry-TimeInterval": "200"})
     parsed = _parse_filter(flt)
     m_from = parsed.get("moment>=", "")[:10]
     m_to = parsed.get("moment<=", "")[:10]

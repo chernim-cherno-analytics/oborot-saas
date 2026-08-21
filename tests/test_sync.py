@@ -15,11 +15,13 @@
 
 Запуск из корня репозитория:  python tests/test_sync.py
 """
+import json
 import os
 import sqlite3
 import sys
 import threading
 import time
+from datetime import date as _dt_date, timedelta as _dt_delta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -37,6 +39,8 @@ os.environ["SYNC_DAYS_BACK"] = "3"
 # Инцидент 21.08: маленькие чанки истории, чтобы проверить прерывание/продолжение.
 os.environ["STOCK_CHUNK_DATES"] = "5"
 os.environ["MS_CHUNK_PAUSE"] = "0.3"
+# Деплой П1: окно быстрого старта — 10 дат, остальные 50 догружаются назад чанками.
+os.environ["INITIAL_WINDOW_DAYS"] = "10"
 
 if DB_PATH.exists():
     DB_PATH.unlink()
@@ -364,13 +368,39 @@ def run_scenario() -> int:
     check("replenish: «мало данных» не выше значимых позиций",
           repl_ld == sorted(repl_ld),
           f"flags={repl_ld}")
-    # Сезонная оборачиваемость: история mock-мира — 60 дней (конец мая–июль),
-    # т.е. лето (+хвост весны); зимы и осени в данных нет.
-    sea0 = tresp[0].get("sea") or {}
-    check("сезонная оборачиваемость: лето > 0, зима и осень = 0",
-          sea0.get("summer", 0) > 0 and sea0.get("winter", 0) == 0
-          and sea0.get("autumn", 0) == 0,
-          f"sea={sea0}")
+    # Ревью 21.08 (минор 9): истории всего 60 дней, НИ ОДИН сезон годового окна
+    # не покрыт целиком — сезонные колонки обязаны быть null, а не 0 (0 читался
+    # как «ничего не продали» и врал в таблице), плюс аналитика отдаёт границу
+    # покрытия, чтобы фронт погасил такие колонки.
+    turno_payload = client.get("/api/turnover").json()
+    sea0 = turno_payload["items"][0].get("sea") or {}
+    check("сезонные колонки при частичном покрытии = null (а не 0)",
+          set(sea0) == {"winter", "spring", "summer", "autumn"}
+          and all(v is None for v in sea0.values()), f"sea={sea0}")
+    check("аналитика отдаёт coverage_start и карту покрытия сезонов",
+          turno_payload.get("coverage_start") == mock_ms.DATES[0]
+          and set(turno_payload.get("season_covered") or {}) == set(sea0)
+          and not any((turno_payload.get("season_covered") or {}).values()),
+          f"coverage_start={turno_payload.get('coverage_start')} "
+          f"covered={turno_payload.get('season_covered')}")
+    from app.analytics import season_bounds as _season_bounds
+    _season_start = _season_bounds(_dt_date.today())[0].isoformat()
+    _season_partial = mock_ms.DATES[0] > _season_start
+    sh = summary["season_health"]
+    check("«здоровье сезона»: покрытие начинается внутри сезона → no_data",
+          (sh.get("status") == "no_data" and sh.get("partial_coverage") is True)
+          if _season_partial else sh.get("partial_coverage") is False,
+          f"partial={_season_partial} health={sh.get('status')}/{sh.get('partial_coverage')}")
+    # Раньше при покрытии, начавшемся внутри сезона, новинкой сезона считалась
+    # КАЖДАЯ позиция (первое появление = первая загруженная дата), и в остаток
+    # сезона попадал весь склад — доля остатка завышалась, статус срывался.
+    _all_new_leftover = round(sum(
+        it["cs"] * it["sale_price"] for it in turno_payload["items"]
+        if not it["archived"] and not it["hidden"]
+        and (it["cs"] > 0 or it["nq"] > 0 or it["dis"] > 0)))
+    check("«новинки сезона» — не разом все позиции (остаток сезона < всего склада)",
+          not _season_partial or sh.get("leftover_value", 0) < _all_new_leftover,
+          f"leftover={sh.get('leftover_value')} всего={_all_new_leftover}")
     # Формула заказа (правило legacy): need = темп×горизонт − прогнозный остаток
     # к приходу заказа; proj_stock = max(0, cs + едет − темп×lead_time).
     lead = repl.get("lead_time_days")
@@ -483,12 +513,37 @@ def run_scenario() -> int:
     r = client.get("/api/pulse")
     check("GET /api/pulse отвечает", r.status_code == 200, f"status={r.status_code}")
     pulse = r.json()
-    from datetime import date as _date
+    _date = _dt_date
     _cur = f"{_date.today().year:04d}-{_date.today().month:02d}"
-    check("окно пульса: 6 полных месяцев до текущего",
-          len(pulse["months"]) == 6 and pulse["months"][-1] < _cur
-          and pulse["months"][0] < pulse["months"][-1],
-          f"months={pulse['months']}")
+    # Ревью 21.08 (мажор 3): в среднее берутся только ПОЛНОСТЬЮ покрытые
+    # прошлые месяцы. У теста истории 60 дней → максимум один такой месяц,
+    # значит partial=true и pct=null («мало истории»), а не выдуманный процент.
+    _cov_start = mock_ms.DATES[0]
+    _all6 = []
+    _y, _m = _date.today().year, _date.today().month
+    for _ in range(6):
+        _m -= 1
+        if _m == 0:
+            _y, _m = _y - 1, 12
+        _all6.append(f"{_y:04d}-{_m:02d}")
+    _all6.reverse()
+    _exp_months = [m for m in _all6 if f"{m}-01" >= _cov_start]
+    check("окно пульса: только полностью покрытые историей месяцы",
+          pulse["months"] == _exp_months
+          and pulse["covered_months"] == len(_exp_months)
+          and pulse.get("coverage_start") == _cov_start
+          and all(m < _cur for m in pulse["months"]),
+          f"months={pulse['months']} exp={_exp_months}")
+    check("мало истории (<2 полных месяцев): partial=true, pct=null у обеих шкал",
+          pulse["partial"] is (len(_exp_months) < 2)
+          and (pulse["sales"]["pct"] is None and pulse["stock"]["pct"] is None
+               if pulse["partial"] else True),
+          f"partial={pulse['partial']} sales_pct={pulse['sales']['pct']} "
+          f"stock_pct={pulse['stock']['pct']}")
+    check("в пульсе нет месяца, начавшегося раньше загруженной истории",
+          all(f"{m['month']}-01" >= _cov_start
+              for m in pulse["sales"]["months"] + pulse["stock"]["months"]),
+          f"coverage_start={_cov_start} months={[m['month'] for m in pulse['sales']['months']]}")
     ps = pulse["sales"]
     exp_proj = round(ps["mtd"] / ps["days_passed"] * ps["days_in_month"]) \
         if ps["days_passed"] else ps["mtd"]
@@ -496,8 +551,8 @@ def run_scenario() -> int:
           abs(ps["projected"] - exp_proj) <= 1,
           f"got={ps['projected']} exp={exp_proj}")
     known = [m["v"] for m in ps["months"] if m["v"] is not None]
-    check("среднее продаж = среднее известных месяцев",
-          known and abs(ps["avg6"] - sum(known) / len(known)) <= 1,
+    check("среднее продаж = среднее известных (покрытых) месяцев",
+          bool(known) and abs(ps["avg6"] - sum(known) / len(known)) <= 1,
           f"avg6={ps['avg6']} known={known}")
     rev_by_month = {m["month"]: m["total"] for m in rev["monthly"]}
     diverged = [m["month"] for m in ps["months"]
@@ -505,7 +560,7 @@ def run_scenario() -> int:
                 and abs(m["v"] - rev_by_month[m["month"]]) > 2]
     check("помесячные продажи пульса сходятся с рядом /api/revenue",
           not diverged, f"расхождение в {diverged}")
-    if ps["avg6"] > 0:
+    if ps["avg6"] > 0 and not pulse["partial"]:
         check("pct продаж = прогноз/среднее",
               abs(ps["pct"] - ps["projected"] / ps["avg6"]) < 0.01,
               f"pct={ps['pct']}")
@@ -515,11 +570,11 @@ def run_scenario() -> int:
           and pst["as_of"] >= mock_ms.DATES[-1],
           f"current={pst['current']} as_of={pst['as_of']}")
     known_st = [m["v"] for m in pst["months"] if m["v"] is not None]
-    check("средний склад = среднее известных месяцев, все > 0",
-          known_st and all(v > 0 for v in known_st)
+    check("средний склад = среднее известных (покрытых) месяцев, все > 0",
+          bool(known_st) and all(v > 0 for v in known_st)
           and abs(pst["avg6"] - sum(known_st) / len(known_st)) <= 1,
           f"avg6={pst['avg6']} known={known_st}")
-    if pst["avg6"] > 0:
+    if pst["avg6"] > 0 and not pulse["partial"]:
         check("pct склада = сейчас/среднее",
               abs(pst["pct"] - pst["current"] / pst["avg6"]) < 0.01,
               f"pct={pst['pct']}")
@@ -720,6 +775,41 @@ def run_scenario() -> int:
         finally:
             c.close()
 
+    def _stock_dates():
+        c = sqlite3.connect(DB_PATH)
+        try:
+            return {d for (d,) in c.execute("SELECT DISTINCT date FROM stock_days")}
+        finally:
+            c.close()
+
+    def _sales_rows():
+        c = sqlite3.connect(DB_PATH)
+        try:
+            return c.execute("SELECT COUNT(*) FROM sales").fetchone()[0]
+        finally:
+            c.close()
+
+    def _clear_sales():
+        """Свежий аккаунт: продаж на диске ещё нет (для проверки мажора 2)."""
+        c = sqlite3.connect(DB_PATH)
+        try:
+            c.execute("DELETE FROM sales")
+            c.commit()
+        finally:
+            c.close()
+
+    def _main_org_id():
+        c = sqlite3.connect(DB_PATH)
+        try:
+            return c.execute("SELECT org_id FROM connections WHERE kind='moysklad' "
+                             "ORDER BY id LIMIT 1").fetchone()[0]
+        finally:
+            c.close()
+
+    def _day(offset: int) -> str:
+        """ISO-дата со сдвигом от сегодня (offset ≤ 0)."""
+        return (_dt_date.today() + _dt_delta(days=offset)).isoformat()
+
     def _sellout_zeros_ok():
         c = sqlite3.connect(DB_PATH)
         c.row_factory = sqlite3.Row
@@ -747,7 +837,24 @@ def run_scenario() -> int:
             _set_faults()
         return st
 
-    exp_until = mock_ms.DATES[9]  # два полных чанка по 5 дат при ok_before=25
+    # Деплой П1: при ok_before=25 удачно проходят «сегодня» (2 запроса) и окно
+    # из 9 дат (18) — первый чанк истории (10 запросов) ловит стойкий 429.
+    # Точка продолжения — самая СТАРАЯ загруженная дата = начало окна.
+    exp_from = mock_ms.DATES[-10]
+
+    def _stock_sets():
+        """Множества строк stock_days и sales — для инварианта П1."""
+        c = sqlite3.connect(DB_PATH)
+        try:
+            sd = set(c.execute(
+                "SELECT p.ext_id, s.date, s.qty FROM stock_days s "
+                "JOIN products p ON p.id = s.product_id").fetchall())
+            sl = set(c.execute(
+                "SELECT p.ext_id, s.date, s.is_return, s.qty, s.revenue FROM sales s "
+                "JOIN products p ON p.id = s.product_id").fetchall())
+            return sd, sl
+        finally:
+            c.close()
 
     # (a) всплеск 429 (12 подряд, затем норма) — и ДЕФОЛТНЫЙ размер чанка (30)
     _mss.STOCK_CHUNK_DATES = 30
@@ -775,7 +882,259 @@ def run_scenario() -> int:
     check("(a) история: 60 дат, дублей нет", n_dates_a == 60 and dups_a == 0,
           f"dates={n_dates_a} dups={dups_a}")
     check("(a) после успеха точка продолжения/отпечаток не хранятся",
-          "stock_loaded_until" not in stats_a and "resume_fp" not in stats_a)
+          "history_loaded_from" not in stats_a and "resume_fp" not in stats_a)
+    check("(a) после успеха coverage_days = HISTORY_DAYS, все месяцы done",
+          status.get("coverage_days") == 60
+          and all(m["state"] == "done" for m in status.get("months", [])),
+          f"coverage={status.get('coverage_days')} months={status.get('months')}")
+
+    print("== Деплой П1: прогрессивная первичная загрузка ==")
+    # (p2) ИНВАРИАНТ: прямой хронологический проход (окно = вся история) даёт
+    # ровно те же строки stock_days/sales, что обратная загрузка чанками.
+    _mss.INITIAL_WINDOW_DAYS = 60
+    try:
+        r = client.post("/api/sync/initial")
+        status = wait_sync_done(client)
+    finally:
+        _mss.INITIAL_WINDOW_DAYS = 10
+    check("(p2) эталонный прямой проход (окно 60 = вся история) done",
+          r.status_code == 200 and status.get("state") == "done"
+          and status.get("stats", {}).get("history_chunks_total") == 0
+          and _stock_day_stats() == (60, 0),
+          f"state={status.get('state')} stats={_stock_day_stats()}")
+    ref_stock, ref_sales = _stock_sets()
+    _mss.STOCK_CHUNK_DATES = 7
+    try:
+        r = client.post("/api/sync/initial")
+        status = wait_sync_done(client)
+    finally:
+        _mss.STOCK_CHUNK_DATES = 5
+    stats_p2 = status.get("stats", {})
+    check("(p2) обратная загрузка (окно 10, чанк 7) done, 8 чанков",
+          status.get("state") == "done" and stats_p2.get("history_chunks_total") == 8
+          and stats_p2.get("window_days") == 10,
+          f"state={status.get('state')} chunks={stats_p2.get('history_chunks_total')}")
+    got_stock, got_sales = _stock_sets()
+    check("(p2) ИНВАРИАНТ: stock_days обратной загрузки == прямому проходу "
+          f"({len(ref_stock)} строк)", got_stock == ref_stock,
+          f"only_ref={len(ref_stock - got_stock)} only_got={len(got_stock - ref_stock)} "
+          f"пример={sorted(ref_stock ^ got_stock)[:3]}")
+    check(f"(p2) ИНВАРИАНТ: sales обратной загрузки == прямому проходу ({len(ref_sales)} строк)",
+          got_sales == ref_sales,
+          f"only_ref={len(ref_sales - got_sales)} only_got={len(got_sales - ref_sales)}")
+    check("(p2) этапы products/today/month/history все done с секундами",
+          [s["key"] for s in status.get("stages", [])] == ["products", "today", "month", "history"]
+          and all(s["state"] == "done" and s["seconds"] is not None
+                  for s in status.get("stages", [])),
+          f"stages={status.get('stages')}")
+    # Нит 14: ВТОРОЙ размер чанка на том же мире — границы чанков ложатся
+    # иначе (в т.ч. на пустой день отчёта и на дыру длиннее чанка).
+    _mss.STOCK_CHUNK_DATES = 13
+    try:
+        r = client.post("/api/sync/initial")
+        status = wait_sync_done(client)
+    finally:
+        _mss.STOCK_CHUNK_DATES = 5
+    check("(p2) ИНВАРИАНТ держится и при другом размере чанка (13)",
+          status.get("state") == "done" and _stock_sets() == (ref_stock, ref_sales)
+          and _stock_day_stats() == (60, 0),
+          f"state={status.get('state')} stats={_stock_day_stats()}")
+
+    # (p3) РЕВЬЮ 21.08 (мажор 2): запуск умирает на ПРОДАЖАХ окна быстрого
+    #      старта — точка продолжения к этому моменту уже опубликована.
+    #      Раньше продолжение пропускало фазу month навсегда: остатки окна
+    #      были, а до 30 дней продаж не загружались НИКОГДА (инкремент лечит
+    #      только SYNC_DAYS_BACK=3 дня), при этом синк рапортовал done и
+    #      coverage_days=HISTORY_DAYS.
+    _clear_sales()  # свежий аккаунт: продаж на диске ещё нет
+    _msc.MAX_RETRIES = 1
+    try:
+        mock_ms.FAULTS["docs_429_burst"] = 100000
+        r = client.post("/api/sync/initial")
+        status = wait_sync_done(client)
+    finally:
+        _msc.MAX_RETRIES = 10
+        mock_ms.reset_faults()
+    stats_p3 = status.get("stats", {})
+    good_fp = stats_p3.get("resume_fp")
+    check("(p3) синк упал на продажах окна: точка есть, окно НЕ помечено закрытым",
+          status.get("state") == "error"
+          and stats_p3.get("history_loaded_from") == exp_from
+          and stats_p3.get("window_done") is None
+          and _sales_rows() == 0,
+          f"state={status.get('state')} from={stats_p3.get('history_loaded_from')} "
+          f"window_done={stats_p3.get('window_done')} sales={_sales_rows()}")
+    r = client.post("/api/sync/run")
+    status = wait_sync_done(client)
+    got_stock, got_sales = _stock_sets()
+    check("(p3) продолжение ДОБРАЛО продажи окна: sales == эталонному полному синку",
+          status.get("state") == "done" and got_sales == ref_sales
+          and got_stock == ref_stock,
+          f"state={status.get('state')} only_ref={len(ref_sales - got_sales)} "
+          f"only_got={len(got_sales - ref_sales)}")
+
+    # (p7) РЕВЬЮ 21.08 (мажор 1): прерванный запуск продолжают НЕ В ТОТ ЖЕ
+    #      ДЕНЬ. Раньше продолжение качало только «сегодня» и уходило назад —
+    #      дни между «сегодня» прерванного прогона и «сегодня» продолжения
+    #      не загружались никогда, а синк заканчивался done с coverage=год.
+    _gap = 3
+    _mss._today = lambda: _dt_date.today() - _dt_delta(days=_gap)
+    try:
+        status = _interrupt_initial()
+    finally:
+        _mss._today = _dt_date.today
+    stats_p7 = status.get("stats", {})
+    _shift_from = _day(-(_gap + 9))  # начало окна «того» дня
+    check("(p7) подготовка: загрузка прервана «три дня назад», оба конца записаны",
+          status.get("state") == "error"
+          and stats_p7.get("history_loaded_from") == _shift_from
+          and stats_p7.get("history_loaded_to") == _day(-_gap),
+          f"from={stats_p7.get('history_loaded_from')} to={stats_p7.get('history_loaded_to')} "
+          f"exp_from={_shift_from}")
+    r = client.post("/api/sync/run")
+    status = wait_sync_done(client)
+    _dates_now = _stock_dates()
+    _missing = [d for d in mock_ms.DATES if d not in _dates_now]
+    check("(p7) продолжение через 3 дня не потеряло НИ ОДНОЙ даты",
+          status.get("state") == "done" and not _missing
+          and status.get("coverage_days") == 60,
+          f"missing={_missing} coverage={status.get('coverage_days')}")
+    check("(p7) ИНВАРИАНТ после продолжения с разрывом: stock_days/sales == эталону",
+          _stock_sets() == (ref_stock, ref_sales),
+          f"diff_stock={len(_stock_sets()[0] ^ ref_stock)} "
+          f"diff_sales={len(_stock_sets()[1] ^ ref_sales)}")
+
+    # (p11) РЕВЬЮ 21.08 (повторное): КОМБИНАЦИЯ p3 и p7 — окно-продажи упали,
+    #       а продолжение случилось не в тот же день. Догон начинался от окна,
+    #       пересчитанного на НОВОЕ «сегодня», поэтому терялось ровно столько
+    #       дней продаж, сколько прошло до продолжения — молча: state=done,
+    #       coverage полный (остатки-то целы), last_sale_date = сегодня.
+    _clear_sales()
+    _gap2 = 4
+    _mss._today = lambda: _dt_date.today() - _dt_delta(days=_gap2)
+    _msc.MAX_RETRIES = 1
+    try:
+        mock_ms.FAULTS["docs_429_burst"] = 100000
+        client.post("/api/sync/initial")
+        status = wait_sync_done(client)
+    finally:
+        _msc.MAX_RETRIES = 10
+        mock_ms.reset_faults()
+        _mss._today = _dt_date.today
+    stats_p11 = status.get("stats", {})
+    check("(p11) подготовка: окно-продажи упали «четыре дня назад»",
+          status.get("state") == "error"
+          and stats_p11.get("window_done") is None and _sales_rows() == 0,
+          f"state={status.get('state')} window_done={stats_p11.get('window_done')} "
+          f"sales={_sales_rows()}")
+    client.post("/api/sync/run")
+    status = wait_sync_done(client)
+    got_stock, got_sales = _stock_sets()
+    _lost = sorted({row[1] for row in (ref_sales - got_sales)})
+    check("(p11) продолжение через 4 дня добрало ВСЕ продажи окна",
+          status.get("state") == "done" and got_sales == ref_sales
+          and got_stock == ref_stock,
+          f"state={status.get('state')} потеряно_дней={len(_lost)} {_lost[:5]}")
+
+    # (p8) РЕВЬЮ 21.08 (минор 7): точка продолжения СТАРШЕ окна («упали на
+    #      самом старом чанке, продолжили назавтра»). Это значит «всё уже
+    #      загружено», а не «пересобрать с нуля» — раньше выбрасывались ~364
+    #      верных дня и год качался заново.
+    con = sqlite3.connect(DB_PATH)
+    con.execute("UPDATE sync_state SET state='error', stats_json=? WHERE org_id=?",
+                (json.dumps({"history_loaded_from": _day(-89),  # старше окна (60)
+                             "history_loaded_to": _day(0),
+                             "resume_fp": good_fp, "coverage_days": 60,
+                             "window_done": True}, ensure_ascii=False), _main_org_id()))
+    con.commit(); con.close()
+    r = client.post("/api/sync/run")
+    status = wait_sync_done(client)
+    stats_p8 = status.get("stats", {})
+    check("(p8) точка старше окна = «всё загружено»: продолжение без чанков и без wipe",
+          status.get("state") == "done" and stats_p8.get("resumed_from") == mock_ms.DATES[0]
+          and stats_p8.get("history_chunks_total") == 0
+          and stats_p8.get("stock_dates") == 1
+          and _stock_day_stats() == (60, 0) and _stock_sets() == (ref_stock, ref_sales),
+          f"state={status.get('state')} resumed={stats_p8.get('resumed_from')} "
+          f"chunks={stats_p8.get('history_chunks_total')} dates={stats_p8.get('stock_dates')}")
+
+    # (p1) порядок фаз и finalize-lite: во время идущего синка подключение уже
+    # active, coverage_days == окну, state всё ещё running.
+    _set_faults(stock_delay_ms=150)
+    seen_lite = None
+    seen_eta = None
+    try:
+        r = client.post("/api/sync/initial")
+        check("(p1) первичный синк запущен (замедленный mock)", r.status_code == 200)
+        deadline = time.time() + 120
+        while time.time() < deadline:
+            st = client.get("/api/sync/status").json()
+            if st.get("state") in ("done", "error"):
+                break
+            if st.get("phase") == "history" and st.get("coverage_days") == 10 and seen_lite is None:
+                conn_st = (client.get("/api/settings").json().get("connection") or {}).get("status")
+                seen_lite = (st.get("state"), conn_st, st.get("coverage_days"),
+                             st.get("history_loaded_from"))
+            if st.get("eta_sec") is not None and seen_eta is None:
+                seen_eta = (st.get("eta_sec"), st.get("stats", {}).get("history_chunks_done"),
+                            [m["state"] for m in st.get("months", [])])
+            time.sleep(0.1)
+        status = wait_sync_done(client)
+    finally:
+        _set_faults()
+    check("(p1) finalize-lite: state=running, подключение active, coverage_days=10, точка = начало окна",
+          seen_lite == ("running", "active", 10, exp_from), f"seen={seen_lite} exp_from={exp_from}")
+    check("(p1) eta_sec появляется после первого чанка, есть месяц running",
+          seen_eta is not None and isinstance(seen_eta[0], int) and seen_eta[1] >= 1
+          and "running" in seen_eta[2], f"seen={seen_eta}")
+    check("(p1) финал: done, coverage_days=60, все месяцы done, eta_sec=None",
+          status.get("state") == "done" and status.get("coverage_days") == 60
+          and all(m["state"] == "done" for m in status.get("months", []))
+          and status.get("eta_sec") is None,
+          f"state={status.get('state')} coverage={status.get('coverage_days')}")
+    check("(p1) после замедленного прогона инвариант держится",
+          _stock_sets() == (ref_stock, ref_sales))
+
+    # (p5/p6) публичный прогресс и свежесть
+    fr = client.get("/api/freshness").json()
+    check("(p6) /api/freshness отдаёт coverage_days и history_days",
+          fr.get("coverage_days") == 60 and fr.get("history_days") == 60, f"got={fr}")
+    anon = httpx.Client(base_url=f"http://127.0.0.1:{APP_PORT}", timeout=10.0)
+    r_anon = anon.get("/api/sync/progress")
+    anon.close()
+    check("(p5) /api/sync/progress без сессии → 401", r_anon.status_code == 401,
+          f"status={r_anon.status_code}")
+    member = httpx.Client(headers={"X-Oborot-CSRF": "1"},
+                          base_url=f"http://127.0.0.1:{APP_PORT}", timeout=30.0)
+    r = member.post("/register", data={
+        "name": "Участник", "email": "member@test.io",
+        "password": "secret123", "org_name": "Временная",
+    })
+    c = sqlite3.connect(DB_PATH)
+    main_org = c.execute("SELECT org_id FROM connections WHERE kind='moysklad' "
+                         "ORDER BY id LIMIT 1").fetchone()[0]
+    mem_uid = c.execute("SELECT id FROM users WHERE email='member@test.io'").fetchone()[0]
+    c.execute("UPDATE memberships SET org_id=?, role='member' WHERE user_id=?", (main_org, mem_uid))
+    c.commit(); c.close()
+    r = member.post("/login", data={"email": "member@test.io", "password": "secret123"})
+    check("(p5) участник (member) залогинен в основную организацию", r.status_code == 303)
+    r_st = member.get("/api/sync/status")
+    r_pr = member.get("/api/sync/progress")
+    prog = r_pr.json() if r_pr.status_code == 200 else {}
+    # Минор 12: полоска должна знать окно быстрого старта (не зашивать «30 дней»)
+    # и режим прогона, чтобы прятаться на обычном инкременте в 06:00.
+    exp_keys = {"state", "mode", "phase", "progress_pct", "detail", "error", "error_cause",
+                "coverage_days", "history_days", "window_days", "months", "stages",
+                "eta_sec", "started_at", "finished_at", "can_manage"}
+    check("(p5) member: /api/sync/status → 403, /api/sync/progress → 200 с нужной формой",
+          r_st.status_code == 403 and r_pr.status_code == 200 and set(prog) == exp_keys
+          and "stats" not in prog and prog.get("can_manage") is False
+          and prog.get("coverage_days") == 60
+          and prog.get("history_days") == 60 and len(prog.get("months", [])) >= 2
+          and prog.get("window_days") == 10 and prog.get("mode") == "initial"
+          and len(prog.get("stages", [])) == 4,
+          f"status={r_st.status_code} progress={r_pr.status_code} keys={sorted(prog)}")
+    member.close()
 
     # (b) одиночный 500 — прозрачный повтор
     _set_faults(stock_500_once=True)
@@ -792,18 +1151,29 @@ def run_scenario() -> int:
     stats_c = status.get("stats", {})
     check("(c) синк упал с state=error", status.get("state") == "error",
           f"state={status.get('state')}")
-    check("(c) текст ошибки: «Загрузка прервана на <дата>…продолжится»",
-          status.get("error", "").startswith(f"Загрузка прервана на {exp_until}")
-          and "ограничил частоту" in status.get("error", "")
-          and "продолжится" in status.get("error", ""),
+    check("(c) текст ошибки: «История загружена за 10 дней из 60 — продолжим автоматически»",
+          status.get("error", "").startswith("История загружена за 10 дней из 60")
+          and "продолжим автоматически" in status.get("error", "")
+          and "ограничил частоту" in status.get("error", ""),
           f"error={status.get('error', '')[:160]}")
-    check("(c) stats.stock_loaded_until = последняя целиком записанная дата, есть отпечаток",
-          stats_c.get("stock_loaded_until") == exp_until and stats_c.get("resume_fp"),
-          f"got={stats_c.get('stock_loaded_until')} exp={exp_until} fp={stats_c.get('resume_fp')}")
+    check("(c) stats.history_loaded_from = начало окна (самая старая дата), есть отпечаток",
+          stats_c.get("history_loaded_from") == exp_from and stats_c.get("resume_fp"),
+          f"got={stats_c.get('history_loaded_from')} exp={exp_from} fp={stats_c.get('resume_fp')}")
+    conn_c = (client.get("/api/settings").json().get("connection") or {})
+    check("(c) подключение осталось active, coverage_days=10 сохранён, phase=history",
+          conn_c.get("status") == "active" and status.get("coverage_days") == 10
+          and status.get("phase") == "history",
+          f"status={conn_c.get('status')} coverage={status.get('coverage_days')} phase={status.get('phase')}")
     check("(c) причина ошибки классифицирована (transient)",
           stats_c.get("error_cause") == "transient", f"cause={stats_c.get('error_cause')}")
+    # Минор 10: сервис работает (подключение active, 10 дн. истории), текст
+    # обещает «продолжим автоматически» — засчитывать это в серию провалов и
+    # слать алерт «синк падает второй раз подряд» нельзя.
+    check("(c) прерывание ФОНОВОЙ истории не увеличивает fail_streak",
+          status.get("fail_streak") == 0 and status.get("alerted_streak") == 0,
+          f"streak={status.get('fail_streak')} alerted={status.get('alerted_streak')}")
     n_dates_c, dups_c = _stock_day_stats()
-    check("(c) в БД частичная новая история (10 дат), старая стёрта первым чанком",
+    check("(c) в БД частичная новая история (10 дат окна), старая стёрта на фазе today",
           n_dates_c == 10 and dups_c == 0, f"dates={n_dates_c} dups={dups_c}")
 
     # (c1) ревью #1: продолжение падает ДО первого чанка — точка не теряется
@@ -819,26 +1189,35 @@ def run_scenario() -> int:
     stats_c1 = status.get("stats", {})
     check("(c1) запуск промотирован в initial и упал на первом запросе",
           status.get("state") == "error" and status.get("mode") == "initial"
-          and stats_c1.get("resumed_from") == exp_until,
+          and stats_c1.get("resumed_from") == exp_from,
           f"state={status.get('state')} mode={status.get('mode')} resumed={stats_c1.get('resumed_from')}")
     check("(c1) точка продолжения сохранена, хотя новый запуск не записал ни чанка",
-          stats_c1.get("stock_loaded_until") == exp_until
-          and status.get("error", "").startswith(f"Загрузка прервана на {exp_until}"),
-          f"until={stats_c1.get('stock_loaded_until')} error={status.get('error', '')[:100]}")
+          stats_c1.get("history_loaded_from") == exp_from
+          and status.get("error", "").startswith("История загружена за 10 дней из 60"),
+          f"from={stats_c1.get('history_loaded_from')} error={status.get('error', '')[:100]}")
     n_dates_c1, _ = _stock_day_stats()
     check("(c1) частичная история не тронута (10 дат)", n_dates_c1 == 10, f"dates={n_dates_c1}")
 
-    # (c2) продолжение через «Синхронизировать» (инкрементный вызов)
-    r = client.post("/api/sync/run")
-    check("(c2) повторный запуск принят", r.status_code == 200)
-    status = wait_sync_done(client)
+    # (c2) продолжение через «Синхронизировать» (инкрементный вызов); размер
+    #      чанка при продолжении ДРУГОЙ, чем у прерванного прогона (нит 14) —
+    #      границы чанков не совпадают, заплатка обязана держаться и так.
+    _mss.STOCK_CHUNK_DATES = 11
+    try:
+        r = client.post("/api/sync/run")
+        check("(c2) повторный запуск принят", r.status_code == 200)
+        status = wait_sync_done(client)
+    finally:
+        _mss.STOCK_CHUNK_DATES = 5
     stats_c2 = status.get("stats", {})
     check("(c2) продолжение завершилось done", status.get("state") == "done",
           f"state={status.get('state')} error={status.get('error', '')[:120]}")
-    check("(c2) продолжение стартовало со следующей даты (resumed_from)",
-          stats_c2.get("resumed_from") == exp_until
-          and stats_c2.get("stock_dates") == 60 - 10,
-          f"resumed_from={stats_c2.get('resumed_from')} dates={stats_c2.get('stock_dates')}")
+    check("(c2) продолжение пошло НАЗАД от точки: 50 дат истории + «сегодня» обновлено",
+          stats_c2.get("resumed_from") == exp_from
+          and stats_c2.get("history_dates") == 60 - 10
+          and stats_c2.get("stock_dates") == 60 - 10 + 1
+          and stats_c2.get("stage_times", {}).get("month", {}).get("skipped") is True,
+          f"resumed_from={stats_c2.get('resumed_from')} history={stats_c2.get('history_dates')} "
+          f"dates={stats_c2.get('stock_dates')}")
     n_dates_c2, dups_c2 = _stock_day_stats()
     check("(c2) после продолжения: 60 дат, дублей (org, product, date) нет",
           n_dates_c2 == 60 and dups_c2 == 0, f"dates={n_dates_c2} dups={dups_c2}")
@@ -849,7 +1228,10 @@ def run_scenario() -> int:
     check("(c2) явные нули распроданных сохранились через границу продолжения",
           _sellout_zeros_ok())
     check("(c2) точка продолжения снята после успеха",
-          "stock_loaded_until" not in stats_c2 and "resume_fp" not in stats_c2)
+          "history_loaded_from" not in stats_c2 and "resume_fp" not in stats_c2)
+    check("(c2) ИНВАРИАНТ: stock_days/sales после продолжения == эталонному проходу",
+          _stock_sets() == (ref_stock, ref_sales),
+          f"diff_stock={len(_stock_sets()[0] ^ ref_stock)} diff_sales={len(_stock_sets()[1] ^ ref_sales)}")
 
     # (c3) ревью #3: «Полная пересборка» после прерывания — с нуля, не продолжение
     status = _interrupt_initial()
@@ -863,9 +1245,10 @@ def run_scenario() -> int:
           and "resumed_from" not in stats_c3 and stats_c3.get("stock_dates") == 60,
           f"state={status.get('state')} stats_keys={sorted(stats_c3)[:8]}")
     n_dates_c3, dups_c3 = _stock_day_stats()
-    check("(c3) после пересборки 60 дат без дублей, остатки = эталон",
+    check("(c3) после пересборки 60 дат без дублей, остатки = эталон, инвариант держится",
           n_dates_c3 == 60 and dups_c3 == 0
-          and client.get("/api/summary").json()["stock_units"] == exp_units,
+          and client.get("/api/summary").json()["stock_units"] == exp_units
+          and _stock_sets() == (ref_stock, ref_sales),
           f"dates={n_dates_c3} dups={dups_c3}")
 
     # (c4) ревью #3: смена набора складов снимает точку продолжения и помечает
@@ -873,13 +1256,13 @@ def run_scenario() -> int:
     status = _interrupt_initial()
     check("(c4) подготовка: первичная прервана, точка есть",
           status.get("state") == "error"
-          and status.get("stats", {}).get("stock_loaded_until") == exp_until)
+          and status.get("stats", {}).get("history_loaded_from") == exp_from)
     wh_list = client.get("/api/settings").json()["warehouses"]
     wh_lab = next(w for w in wh_list if not w["active"])  # сервисный склад st-lab
     r = client.post(f"/api/warehouses/{wh_lab['id']}/toggle", json={})  # включаем
     st_after = client.get("/api/sync/status").json().get("stats", {})
-    check("(c4) toggle склада снял stock_loaded_until и поставил needs_full_rebuild",
-          r.status_code == 200 and "stock_loaded_until" not in st_after
+    check("(c4) toggle склада снял history_loaded_from и поставил needs_full_rebuild",
+          r.status_code == 200 and "history_loaded_from" not in st_after
           and st_after.get("needs_full_rebuild") is True, f"stats={st_after}")
     r = client.post("/api/sync/run")
     status = wait_sync_done(client)
@@ -910,7 +1293,7 @@ def run_scenario() -> int:
     #      точку продолжения; (c7) — то же для флага needs_full_rebuild
     status = _interrupt_initial()
     check("(c6) подготовка: первичная прервана, точка есть",
-          status.get("stats", {}).get("stock_loaded_until") == exp_until)
+          status.get("stats", {}).get("history_loaded_from") == exp_from)
     _msc.MAX_RETRIES = 1
     try:
         _set_faults(assortment_429_burst=100000)
@@ -922,14 +1305,14 @@ def run_scenario() -> int:
     stats_c6 = status.get("stats", {})
     check("(c6) запуск упал на ассортименте (до истории), точка и отпечаток сохранены",
           r.status_code == 200 and status.get("state") == "error"
-          and stats_c6.get("stock_loaded_until") == exp_until and stats_c6.get("resume_fp")
+          and stats_c6.get("history_loaded_from") == exp_from and stats_c6.get("resume_fp")
           and _stock_day_stats()[0] == 10,
           f"state={status.get('state')} stats={stats_c6}")
     r = client.post("/api/sync/run")
     status = wait_sync_done(client)
     stats_c6b = status.get("stats", {})
     check("(c6) следующий запуск корректно продолжил (resumed_from, 60 дат, эталон)",
-          status.get("state") == "done" and stats_c6b.get("resumed_from") == exp_until
+          status.get("state") == "done" and stats_c6b.get("resumed_from") == exp_from
           and _stock_day_stats() == (60, 0)
           and client.get("/api/summary").json()["stock_units"] == exp_units,
           f"state={status.get('state')} resumed={stats_c6b.get('resumed_from')} stats={_stock_day_stats()}")
@@ -994,6 +1377,32 @@ def run_scenario() -> int:
           status.get("state") == "done" and status.get("mode") == "initial"
           and "resumed_from" not in stats_c5 and _stock_day_stats() == (60, 0),
           f"state={status.get('state')} mode={status.get('mode')} stats={_stock_day_stats()}")
+
+    # (c9) деплой П1: почасовой догон подхватывает прерванную историю («продолжим
+    #      автоматически в течение часа»), хотя last_sync_at свежий.
+    #      Ревью 21.08 (мажор 5): и НЕ БЛОКИРУЕТСЯ на ней — первичная загрузка
+    #      легально идёт 30+ минут, а джоб ждал до часа НА КАЖДУЮ организацию
+    #      (после деплоя, убившего несколько фоновых историй, ежедневный джоб
+    #      вставал на часы и задерживал синки и дайджесты остальных).
+    from app import scheduler as _sched_p1
+    status = _interrupt_initial()
+    mock_ms.FAULTS["stock_delay_ms"] = 120  # продолжение заведомо не успеет за секунды
+    try:
+        _t_c9 = time.time()
+        res_c9 = _sched_p1.run_catchup_job()
+        _elapsed_c9 = time.time() - _t_c9
+        st_c9 = client.get("/api/sync/status").json()
+        check("(c9) догон ЗАПУСКАЕТ продолжение и сразу возвращается (не ждёт initial)",
+              list(res_c9.values()) == ["started_initial"] and _elapsed_c9 < 15
+              and st_c9.get("state") == "running" and st_c9.get("mode") == "initial",
+              f"res={res_c9} elapsed={_elapsed_c9:.1f}с state={st_c9.get('state')}")
+    finally:
+        mock_ms.reset_faults()
+    status = wait_sync_done(client)
+    check("(c9) запущенное догоном продолжение доехало: done, 60 дат, инвариант",
+          status.get("state") == "done" and status.get("mode") == "initial"
+          and _stock_day_stats() == (60, 0) and _stock_sets() == (ref_stock, ref_sales),
+          f"res={res_c9} state={status.get('state')} stats={_stock_day_stats()}")
 
     # (d) смена токена при живом подключении: статус не падает в pending, синк стартует
     r = client.post("/api/connect/moysklad", json={"token": mock_ms.TOKEN})
@@ -1104,7 +1513,96 @@ def run_scenario() -> int:
           and "Запустите синхронизацию" in body_n2.get("note", "")
           and newbie.get("/api/sync/status").json().get("state") == "idle",
           f"resp={body_n2} status={conn_n.get('status')}")
+
+    print("== Ревью 21.08 (мажор 4): окно до finalize-lite — демо не должно стирать ==")
+    # Пока идёт первая загрузка, подключение ещё 'pending', last_sync_at пуст:
+    # «/» уводило на онбординг, где по умолчанию выбраны «Демо-данные», и один
+    # клик стирал таблицы организации ПРЯМО ВО ВРЕМЯ записи их синком.
+    def _newbie_counts():
+        c = sqlite3.connect(DB_PATH)
+        try:
+            org = c.execute("SELECT org_id FROM memberships m JOIN users u "
+                            "ON u.id=m.user_id WHERE u.email='newbie@test.io'").fetchone()[0]
+            return (org,
+                    c.execute("SELECT COUNT(*) FROM products WHERE org_id=?", (org,)).fetchone()[0],
+                    c.execute("SELECT COUNT(*) FROM stock_days WHERE org_id=?", (org,)).fetchone()[0])
+        finally:
+            c.close()
+
+    mock_ms.FAULTS["stock_delay_ms"] = 120  # чтобы окно «до finalize-lite» было заметным
+    try:
+        r = newbie.post("/api/sync/initial")
+        check("(p9) первичный синк новой организации запущен", r.status_code == 200,
+              f"status={r.status_code}")
+        deadline = time.time() + 30
+        seen_running = False
+        while time.time() < deadline:
+            pr = newbie.get("/api/sync/progress").json()
+            if pr.get("state") == "running":
+                seen_running = True
+                break
+            if pr.get("state") in ("done", "error"):
+                break
+            time.sleep(0.05)
+        counts_before = _newbie_counts()
+        r_root = newbie.get("/", follow_redirects=False)
+        r_demo = newbie.post("/api/connect/demo")
+        conn_p9 = (newbie.get("/api/settings").json().get("connection") or {})
+        counts_after = _newbie_counts()
+    finally:
+        mock_ms.reset_faults()
+    check("(p9) во время первой загрузки «/» НЕ ведёт на онбординг с демо-кнопкой",
+          seen_running and "/onboarding" not in (r_root.headers.get("location") or ""),
+          f"running={seen_running} status={r_root.status_code} "
+          f"loc={r_root.headers.get('location')}")
+    check("(p9) POST /api/connect/demo во время первой загрузки → 409, данные целы",
+          r_demo.status_code == 409 and counts_after == counts_before
+          and "МойСклад" in r_demo.json().get("detail", ""),
+          f"demo={r_demo.status_code} before={counts_before} after={counts_after} "
+          f"conn={conn_p9.get('status')}")
+    status_n = wait_sync_done(newbie, timeout=180)
+    check("(p9) первичная загрузка новой организации завершилась",
+          status_n.get("state") == "done",
+          f"state={status_n.get('state')} error={status_n.get('error', '')[:120]}")
+    r_demo2 = newbie.post("/api/connect/demo")
+    check("(p9) после успешной загрузки демо тоже запрещено (409)",
+          r_demo2.status_code == 409, f"status={r_demo2.status_code}")
     newbie.close()
+
+    print("== Ревью 21.08 (минор 8): покрытие считается по БД, а не «на доверии» ==")
+    # Первичная загрузка умерла на фазе products (данных нет вовсе), владелец
+    # нажал «Синхронизировать сейчас» — инкремент пишет ОДИН день остатков.
+    # Раньше state=done/mode=incremental давали coverage_days=HISTORY_DAYS,
+    # и таблица считала оборачиваемость по одному дню как «за год».
+    cover = httpx.Client(headers={"X-Oborot-CSRF": "1"},
+                         base_url=f"http://127.0.0.1:{APP_PORT}", timeout=120.0)
+    r = cover.post("/register", data={
+        "name": "Покрытие", "email": "cover@test.io",
+        "password": "secret123", "org_name": "Организация без истории",
+    })
+    check("(p10) регистрация организации для проверки покрытия", r.status_code == 303)
+    cover.post("/api/connect/moysklad", json={"token": mock_ms.TOKEN})
+    cover.post("/api/connect/moysklad/stores", json={"ext_ids": ["st-flag"]})
+    _msc.MAX_RETRIES = 1
+    try:
+        mock_ms.FAULTS["assortment_429_burst"] = 100000
+        cover.post("/api/sync/initial")
+        st_cov = wait_sync_done(cover)
+    finally:
+        _msc.MAX_RETRIES = 10
+        mock_ms.reset_faults()
+    check("(p10) первичная умерла на товарах: coverage_days=0, истории нет",
+          st_cov.get("state") == "error" and st_cov.get("coverage_days") == 0,
+          f"state={st_cov.get('state')} coverage={st_cov.get('coverage_days')}")
+    cover.post("/api/sync/run")
+    st_cov2 = wait_sync_done(cover)
+    pr_cov = cover.get("/api/sync/progress").json()
+    check("(p10) после инкремента над пустотой покрытие = 1 день (а не «за год»)",
+          st_cov2.get("state") == "done" and st_cov2.get("mode") == "incremental"
+          and st_cov2.get("coverage_days") == 1 and pr_cov.get("coverage_days") == 1,
+          f"state={st_cov2.get('state')} mode={st_cov2.get('mode')} "
+          f"coverage={st_cov2.get('coverage_days')}")
+    cover.close()
 
     print("== Демо-режим не сломан ==")
     demo = httpx.Client(headers={"X-Oborot-CSRF": "1"}, base_url=f"http://127.0.0.1:{APP_PORT}", timeout=120.0)
@@ -1120,6 +1618,16 @@ def run_scenario() -> int:
           f"positions={dsum['positions']}")
     check("изоляция тенантов: числа демо ≠ числа МС-организации",
           dsum["stock_units"] != summary["stock_units"])
+    # Обратная сторона мажора 3: у демо 400 дней истории — все 6 месяцев
+    # покрыты, partial=false и проценты считаются как раньше.
+    dpulse = demo.get("/api/pulse").json()
+    check("демо (400 дн. истории): пульс не partial, 6 полных месяцев, pct считается",
+          dpulse["partial"] is False and dpulse["covered_months"] == 6
+          and len(dpulse["months"]) == 6
+          and (dpulse["sales"]["pct"] is not None or dpulse["sales"]["avg6"] == 0)
+          and (dpulse["stock"]["pct"] is not None or dpulse["stock"]["avg6"] == 0),
+          f"partial={dpulse['partial']} covered={dpulse['covered_months']} "
+          f"pct={dpulse['sales']['pct']}/{dpulse['stock']['pct']}")
     demo.close()
     client.close()
 

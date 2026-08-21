@@ -68,13 +68,23 @@ def mk_item(base, *, turnover, cost, price, cs=0, rate=1.0, cls="good",
     }
 
 
-def mk_snap(items):
-    return {
+def mk_snap(items, cov_start=None):
+    """Синтетический снапшот. cov_start — граница загруженной истории (П1);
+    без него снапшот выглядит как у полного/старого аккаунта."""
+    snap = {
         "today": TODAY.isoformat(),
         "settings": {"min_stock_days": 3, "horizon_days": 44, "cover_days": 44,
                      "lead_time_days": 45, "order_cadence_days": 30, "safety_days": 14},
         "items": {i["base_name"]: i for i in items},
     }
+    if cov_start is not None:
+        snap["coverage_start"] = cov_start
+    return snap
+
+
+def cov_days_ago(n: int) -> str:
+    """coverage_start, при котором загружено ровно n дней истории."""
+    return (TODAY - timedelta(days=n - 1)).isoformat()
 
 
 def mk_ctx(snap, cover=44, rate_override=None):
@@ -368,6 +378,102 @@ def main() -> int:
     check("план сообщает, до какой даты закрыт спрос",
           p7["covered_until"] == (TODAY + timedelta(days=45 + 44)).isoformat())
 
+    print("\n14. Покрытие истории (деплой П1: сервис работает, история грузится)")
+    # Слепок ПЛАНА ДО правки (снят на коде HEAD d2072d8 на этих же данных):
+    # на полном покрытии ни порядок, ни количества, ни причины меняться не
+    # должны — иначе правка «честности» тихо переписала бы сам заказ.
+    PLAN_BEFORE = [
+        ("Топ A", 10, 30000, "кончится до прихода заказа; срезано лимитом на позицию"),
+        ("Топ Б", 15, 30000,
+         "кончится до прихода заказа; добор до потребности; срезано лимитом на позицию"),
+        ("Средний", 20, 30000,
+         "кончится до прихода заказа; добор до потребности; срезано лимитом на позицию"),
+    ]
+    cov_items = [
+        mk_item("Топ A", turnover=6000, cost=3000, price=9000, rate=1.0, cls="best"),
+        mk_item("Топ Б", turnover=4000, cost=2000, price=6000, rate=0.8, cls="good"),
+        mk_item("Средний", turnover=1500, cost=1500, price=4000, rate=0.5, cls="dull"),
+    ]
+    snap_full = mk_snap(cov_items, cov_start=cov_days_ago(400))
+    snap_part = mk_snap(cov_items, cov_start=cov_days_ago(30))
+    ctx_cov = mk_ctx(snap_full)
+    ctx_cov["seasonal_rates"] = True     # окно «год назад» загружено
+    ctx_part = mk_ctx(snap_part)         # у новичка сезонных индексов ещё нет
+    p_full = op.plan_order(snap_full, mk_brief(budget=100000), ctx_cov, ONE_STAGE)
+    p_part = op.plan_order(snap_part, mk_brief(budget=100000), ctx_part, ONE_STAGE)
+
+    check("план знает, на какой истории стоит",
+          p_full["coverage"]["days"] == 400 and p_full["coverage"]["start"] == cov_days_ago(400),
+          str(p_full["coverage"]))
+    check("порог покрытия = срок производства + горизонт покрытия",
+          p_full["coverage"]["needed_days"] == op.lead_days(ONE_STAGE) + p_full["cover_days"]
+          == 89, str(p_full["coverage"]))
+    check("(c) полное покрытие: partial=false, упущенная выручка — число",
+          p_full["coverage"]["partial"] is False
+          and isinstance(p_full["lost_revenue"], (int, float))
+          and "provisional" not in p_full and p_full.get("sensitivity"),
+          f"partial={p_full['coverage']['partial']} lost={p_full['lost_revenue']}")
+    check("(c) на полном покрытии план побайтно тот же, что до правки",
+          [(i["base_name"], i["qty"], i["cost_total"], i["why_text"]) for i in p_full["items"]]
+          == PLAN_BEFORE
+          and p_full["totals"] == {"positions": 3, "units": 45,
+                                   "expected_profit": 170000, "expected_revenue": 260000}
+          and p_full["lost_revenue"] == 434000 and p_full["spent"] == 90000,
+          str([(i["base_name"], i["qty"], i["cost_total"]) for i in p_full["items"]]))
+    p_legacy = op.plan_order(mk_snap(cov_items), mk_brief(budget=100000), ctx_cov, ONE_STAGE)
+    check("аккаунт без coverage_start (старый/полный) считается как год истории",
+          p_legacy["coverage"]["days"] == 365 and p_legacy["coverage"]["partial"] is False
+          and {k: v for k, v in p_legacy.items() if k != "coverage"}
+          == {k: v for k, v in p_full.items() if k != "coverage"})
+
+    check("(a) 30 дней истории при нужных 89 — покрытие частичное",
+          p_part["coverage"]["partial"] is True and p_part["coverage"]["days"] == 30,
+          str(p_part["coverage"]))
+    check("(a) на обрезке истории упущенная выручка не выдумывается",
+          p_part["lost_revenue"] is None, f"lost={p_part['lost_revenue']}")
+    check("(a) план помечен предварительным, «а если добавить денег» не отвечаем",
+          p_part.get("provisional") is True and "sensitivity" not in p_part,
+          f"provisional={p_part.get('provisional')}")
+    check("сезонность в темпах заявляется только когда она посчитана",
+          p_full["coverage"]["seasonal_rates"] is True
+          and p_part["coverage"]["seasonal_rates"] is False)
+    ctx_clamped = mk_ctx(snap_part)
+    ctx_clamped["fresh"] = {"Топ A"}          # окно свежести сжалось до покрытия
+    ctx_clamped["fresh_clamped"] = True
+    p_hidden = op.plan_order(snap_part, mk_brief(budget=100000), ctx_clamped, ONE_STAGE)
+    check("позиции, отсеянные сжатым окном свежести, посчитаны отдельно",
+          p_hidden["review"]["hidden_by_coverage"] == 2,
+          str(p_hidden["review"]))
+    check("на полном покрытии скрытых нет",
+          p_full["review"]["hidden_by_coverage"] == 0)
+
+    print("\n14b. Покрытие сезонов: один недостающий день ≠ потерянный сезон")
+    for probe in (date(2026, 8, 21), date(2026, 1, 5), date(2026, 5, 31), date(2026, 11, 30)):
+        c365 = (probe - timedelta(days=364)).isoformat()
+        check(f"(d) завершённый синк: все четыре сезона на {probe.isoformat()}",
+              all(analytics._season_coverage(c365, probe, c365).values())
+              and all(analytics._season_coverage(
+                  c365, probe, (probe - timedelta(days=363)).isoformat()).values()),
+              str(analytics._season_coverage(
+                  c365, probe, (probe - timedelta(days=363)).isoformat())))
+    _lost = []
+    for off in range(0, 371, 7):
+        probe = date(2026, 8, 21) - timedelta(days=off)
+        c365 = (probe - timedelta(days=364)).isoformat()
+        if not all(analytics._season_coverage(
+                c365, probe, (probe - timedelta(days=363)).isoformat()).values()):
+            _lost.append(probe.isoformat())
+    check("(d) на 54 проверенных датах ни один сезон не теряется из-за одного дня",
+          not _lost, f"потеряны на {_lost[:5]}")
+    _probe = date(2026, 8, 21)
+    _c365 = (_probe - timedelta(days=364)).isoformat()
+    _part = analytics._season_coverage(
+        _c365, _probe, (_probe - timedelta(days=100)).isoformat())
+    check("(d) реально не загруженный сезон честно непокрыт",
+          _part["winter"] is False and _part["spring"] is False, str(_part))
+    check("(d) без истории вообще покрытых сезонов нет",
+          not any(analytics._season_coverage(_c365, _probe, None).values()))
+
     api_checks()
 
     print()
@@ -395,6 +501,29 @@ class ServerThread:
     def stop(self):
         self.server.should_exit = True
         self.thread.join(timeout=10)
+
+
+def _truncate_history(days: int) -> None:
+    """Оставить в БД только последние `days` дней истории.
+
+    Имитация первичной прогрессивной загрузки (деплой П1): сервис уже открыт,
+    остатки и продажи за год ещё едут. Как в тестах синка — правкой sqlite
+    напрямую, после чего сбрасываем кэш аналитики.
+    """
+    import sqlite3
+
+    from app import analytics as _an
+
+    cut = (date.today() - timedelta(days=days - 1)).isoformat()
+    con = sqlite3.connect(DB_PATH)
+    try:
+        con.execute("DELETE FROM stock_days WHERE date < ?", (cut,))
+        con.execute("DELETE FROM sales WHERE date < ?", (cut,))
+        con.commit()
+        for (org_id,) in con.execute("SELECT id FROM orgs"):
+            _an.invalidate(org_id)
+    finally:
+        con.close()
 
 
 def api_checks() -> None:
@@ -535,6 +664,46 @@ def api_checks() -> None:
         orders = c.get("/api/orders").json()["orders"]
         check("заказ виден в списке и содержит позиции",
               any(o["name"] == "Осень 2026" for o in orders), str([o["name"] for o in orders]))
+
+        print("\n14c. Мастер заказа на догружаемой истории (деплой П1)")
+        eta_full = (date.today() + timedelta(days=45)).isoformat()
+        body = {"eta_date": eta_full, "budget": 300000, "budget_scope": "full",
+                "strategy": "balance"}
+        before = c.post("/api/order-plan/preview", json=body).json()
+        check("демо-аккаунт: история полная, план уверенный",
+              before["coverage"]["partial"] is False
+              and before["coverage"]["days"] >= before["coverage"]["needed_days"]
+              and isinstance(before["lost_revenue"], (int, float))
+              and "provisional" not in before,
+              f"coverage={before['coverage']} lost={before['lost_revenue']}")
+
+        _truncate_history(30)
+        after = c.post("/api/order-plan/preview", json=body).json()
+        check("(a) превью на 30 днях истории остаётся доступным и честным",
+              after["coverage"]["partial"] is True and after["coverage"]["days"] == 30
+              and after["lost_revenue"] is None and after.get("provisional") is True
+              and "sensitivity" not in after,
+              f"coverage={after['coverage']} lost={after['lost_revenue']}")
+        check("видно, сколько позиций скрыла недогруженная история",
+              after["review"]["hidden_by_coverage"] >= 0
+              and after["review"]["stale_count"] >= after["review"]["hidden_by_coverage"],
+              f"hidden={after['review']['hidden_by_coverage']} "
+              f"stale={after['review']['stale_count']}")
+        check("на обрезке истории план заметно отличается от плана на полной",
+              (after["totals"]["units"], after["totals"]["positions"])
+              != (before["totals"]["units"], before["totals"]["positions"]),
+              f"было {before['totals']} стало {after['totals']}")
+
+        part_saved = c.post("/api/order-plan", json=body).json()
+        deny = c.post(f"/api/order-plan/{part_saved['id']}/apply", json={"name": "Рано"})
+        check("(b) применение плана на неполной истории → 409 с объяснением",
+              deny.status_code == 409 and "истории" in deny.json().get("detail", ""),
+              f"{deny.status_code} {deny.text[:160]}")
+        ok = c.post(f"/api/order-plan/{part_saved['id']}/apply",
+                    json={"name": "Осознанно", "confirm_partial": True})
+        check("(b) с осознанным подтверждением заказ создаётся",
+              ok.status_code == 200 and ok.json().get("order_id"),
+              f"{ok.status_code} {ok.text[:160]}")
     finally:
         c.close()
         srv.stop()
