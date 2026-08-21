@@ -75,7 +75,8 @@ _threads_lock = threading.Lock()
 
 
 def ensure_schema() -> None:
-    """Аддитивные мини-миграции: ordered_qty.ms_qty и sync_state.fail_streak.
+    """Аддитивные мини-миграции: ordered_qty.ms_qty, sync_state.fail_streak,
+    productions.stages_json/moq_units.
 
     Base.metadata.create_all не изменяет существующие таблицы (паттерн —
     app.ms_writeback.ensure_schema). Свежая БД получает колонки из моделей.
@@ -97,6 +98,32 @@ def ensure_schema() -> None:
                     conn.execute(text(
                         f"ALTER TABLE sync_state ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0"
                     ))
+    if insp.has_table("products"):
+        cols = {c["name"] for c in insp.get_columns("products")}
+        # 21.08: полная себестоимость отдельно от закупочной (см. models.Product).
+        if "cost_full" not in cols:
+            with engine.begin() as conn:
+                conn.execute(text(
+                    "ALTER TABLE products ADD COLUMN cost_full FLOAT NOT NULL DEFAULT 0"
+                ))
+    if insp.has_table("productions"):
+        cols = {c["name"] for c in insp.get_columns("productions")}
+        if "cadence_days" not in cols:
+            with engine.begin() as conn:
+                conn.execute(text(
+                    "ALTER TABLE productions ADD COLUMN cadence_days INTEGER NOT NULL DEFAULT 0"
+                ))
+        # Мастер заказа 21.08: этапы производства и минимальная партия.
+        if "stages_json" not in cols:
+            with engine.begin() as conn:
+                conn.execute(text(
+                    "ALTER TABLE productions ADD COLUMN stages_json TEXT NOT NULL DEFAULT ''"
+                ))
+        if "moq_units" not in cols:
+            with engine.begin() as conn:
+                conn.execute(text(
+                    "ALTER TABLE productions ADD COLUMN moq_units INTEGER NOT NULL DEFAULT 0"
+                ))
 
 
 # ── Имена и размеры (как в legacy _canon_name) ───────────────────────────────
@@ -476,6 +503,10 @@ async def _run_sync(org_id: int, mode: str, resume_from: str | None = None,
         _set_state(org_id, stage="products", progress=1.0,
                    detail="Загружаем ассортимент (товары и размеры)…")
         assortment = await client.fetch_assortment()
+        # Какие типы цен считать «ценой продажи» и «полной себестоимостью»:
+        # выбор организации, иначе угадываем по названию (см. _price_by).
+        _load_price_types(org_id)
+        stats["price_types"] = price_type_names(assortment)[:20]
         ext_to_pid = _upsert_products(org_id, assortment, stats)
         _set_state(org_id, stage="products", progress=8.0,
                    detail=f"Товары обновлены: {stats['products_total']} позиций",
@@ -586,7 +617,7 @@ def _has_stock_rows(org_id: int) -> bool:
 
 # ── Товары ───────────────────────────────────────────────────────────────────
 
-def _parse_assortment(rows: list[dict]) -> list[dict]:
+def _parse_assortment(rows: list[dict], org_id: int = 0) -> list[dict]:
     """Строки ассортимента → атрибуты наших products.
 
     product: base_name = имя, size=''; variant: base_name = имя родительского
@@ -600,8 +631,9 @@ def _parse_assortment(rows: list[dict]) -> list[dict]:
             parent_meta[pid] = {
                 "name": row.get("name") or "",
                 "category": _category_of(row),
-                "sale_price": _sale_price_of(row),
+                "sale_price": _sale_price_of(row, org_id),
                 "cost_price": _kopecks((row.get("buyPrice") or {}).get("value")),
+                "cost_full": _cost_full_of(row, org_id),
                 "archived": bool(row.get("archived")),
             }
 
@@ -623,6 +655,7 @@ def _parse_assortment(rows: list[dict]) -> list[dict]:
                 "category": parent["category"],
                 "sale_price": parent["sale_price"],
                 "cost_price": parent["cost_price"],
+                "cost_full": parent["cost_full"],
                 "archived": parent["archived"],
             })
             continue
@@ -637,10 +670,11 @@ def _parse_assortment(rows: list[dict]) -> list[dict]:
         if not size:
             size = parse_size_suffix(name)
         base_name = parent["name"] if parent else strip_size(name)
-        sale_price = _sale_price_of(row) or (parent["sale_price"] if parent else 0.0)
+        sale_price = _sale_price_of(row, org_id) or (parent["sale_price"] if parent else 0.0)
         cost_price = _kopecks((row.get("buyPrice") or {}).get("value")) or (
             parent["cost_price"] if parent else 0.0
         )
+        cost_full = _cost_full_of(row, org_id) or (parent["cost_full"] if parent else 0.0)
         archived = bool(row.get("archived")) or bool(parent and parent["archived"])
         out.append({
             "ext_id": ext_id,
@@ -649,16 +683,87 @@ def _parse_assortment(rows: list[dict]) -> list[dict]:
             "category": parent["category"] if parent else _category_of(row),
             "sale_price": sale_price,
             "cost_price": cost_price,
+            "cost_full": cost_full,
             "archived": archived,
         })
     return out
 
 
-def _sale_price_of(row: dict) -> float:
+# Как понять, какая из цен МойСклада — цена продажи, а какая — себестоимость.
+# Типы цен у каждого аккаунта свои, поэтому: (1) если организация выбрала тип
+# в настройках — берём его по имени; (2) иначе угадываем по названию;
+# (3) иначе цена продажи = первая в списке, себестоимость = не задана
+# (тогда деньги считаются по закупочной цене, как раньше).
+_SALE_HINTS = ("цена продажи", "розниц", "sale", "retail")
+_COST_HINTS = ("себестоим", "cost")
+_PRICE_TYPES: dict[int, dict] = {}  # org_id → {"sale": name, "cost": name}
+
+
+def _load_price_types(org_id: int) -> None:
+    """Читает выбор типов цен из настроек организации в кэш модуля."""
+    db = SessionLocal()
+    try:
+        from app.models import Org as _Org
+        org = db.get(_Org, org_id)
+        data = {}
+        if org is not None:
+            try:
+                data = json.loads(org.settings_json or "{}")
+            except ValueError:
+                data = {}
+        set_price_types(org_id, str(data.get("price_type_sale") or ""),
+                        str(data.get("price_type_cost") or ""))
+    finally:
+        db.close()
+
+
+def set_price_types(org_id: int, sale: str = "", cost: str = "") -> None:
+    """Выбор типов цен организации (вызывается синком из настроек org)."""
+    _PRICE_TYPES[org_id] = {"sale": (sale or "").strip().lower(),
+                            "cost": (cost or "").strip().lower()}
+
+
+def _price_by(row: dict, exact: str, hints: tuple[str, ...]) -> float:
+    prices = row.get("salePrices") or []
+    if exact:
+        for pr in prices:
+            name = str(((pr or {}).get("priceType") or {}).get("name") or "").strip().lower()
+            if name == exact:
+                return _kopecks((pr or {}).get("value"))
+        return 0.0
+    for pr in prices:
+        name = str(((pr or {}).get("priceType") or {}).get("name") or "").strip().lower()
+        if any(h in name for h in hints):
+            return _kopecks((pr or {}).get("value"))
+    return 0.0
+
+
+def price_type_names(rows: list[dict]) -> list[str]:
+    """Все типы цен, встреченные в ассортименте — для выбора в настройках."""
+    seen: dict[str, None] = {}
+    for row in rows:
+        for pr in row.get("salePrices") or []:
+            name = str(((pr or {}).get("priceType") or {}).get("name") or "").strip()
+            if name:
+                seen.setdefault(name, None)
+    return list(seen)
+
+
+def _sale_price_of(row: dict, org_id: int = 0) -> float:
+    cfg = _PRICE_TYPES.get(org_id) or {}
+    val = _price_by(row, cfg.get("sale") or "", _SALE_HINTS)
+    if val:
+        return val
     prices = row.get("salePrices") or []
     if not prices:
         return 0.0
     return _kopecks((prices[0] or {}).get("value"))
+
+
+def _cost_full_of(row: dict, org_id: int = 0) -> float:
+    """Полная себестоимость из выбранного типа цены (0 = не задана)."""
+    cfg = _PRICE_TYPES.get(org_id) or {}
+    return _price_by(row, cfg.get("cost") or "", _COST_HINTS)
 
 
 def _category_of(row: dict) -> str:
@@ -672,7 +777,7 @@ def _category_of(row: dict) -> str:
 
 def _upsert_products(org_id: int, assortment: list[dict], stats: dict) -> dict[str, int]:
     """Создаёт/обновляет products; возвращает карту ext_id → наш product.id."""
-    parsed = _parse_assortment(assortment)
+    parsed = _parse_assortment(assortment, org_id)
     db = SessionLocal()
     try:
         existing = {
@@ -700,6 +805,7 @@ def _upsert_products(org_id: int, assortment: list[dict], stats: dict) -> dict[s
             row.size = item["size"]
             row.category = item["category"]
             row.sale_price = item["sale_price"]
+            row.cost_full = item.get("cost_full") or 0.0
             row.cost_price = item["cost_price"]
             row.archived = item["archived"]
         # Миграция пользовательских данных — ДО commit, в одной транзакции с

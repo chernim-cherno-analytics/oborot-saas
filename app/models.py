@@ -116,7 +116,15 @@ class Product(Base):
     size: Mapped[str] = mapped_column(String(32), nullable=False, default="")  # '' = безразмерный
     category: Mapped[str] = mapped_column(String(128), nullable=False, default="")
     sale_price: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)  # номинал, ₽
-    cost_price: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)  # себестоимость, ₽
+    # ВНИМАНИЕ (выяснено 21.08.2026 у Влада): buyPrice в МойСкладе — это
+    # ЗАКУПОЧНАЯ цена, и у брендов со своим производством там лежит только
+    # стоимость пошива, без ткани. Полная себестоимость живёт отдельным типом
+    # цены (у Chernim Cherno он называется «Себестоимость»). Поэтому храним обе:
+    #   cost_price — закупочная (buyPrice), как её отдаёт МойСклад;
+    #   cost_full  — полная себестоимость из выбранного типа цены, 0 = не задана.
+    # Деньги считаются по cost_full с фолбэком на cost_price (analytics).
+    cost_price: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)  # закупочная, ₽
+    cost_full: Mapped[float] = mapped_column(Float, nullable=False, default=0.0, server_default="0")
     archived: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     # Не участвует в аналитике (упаковка, сертификаты, расходники): ставится
     # авто-эвристикой при первом появлении позиции и руками в настройках.
@@ -204,6 +212,37 @@ class Production(Base):
     name: Mapped[str] = mapped_column(String(120), nullable=False)
     is_main: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    # Периодичность размещения заказов В ЭТОТ канал, дней. Ритм у каналов
+    # разный: своё производство можно догружать хоть еженедельно, Китай —
+    # раз в сезон. 0 = берём общую настройку организации.
+    cadence_days: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    # ── Этапы производства (решение Влада 21.08.2026) ────────────────────────
+    # У разных каналов разные сроки И РАЗНОЕ ЧИСЛО ЭТАПОВ: «под ключ» (Китай) —
+    # один этап заказ→приход; своё производство — сначала закупка ткани, потом
+    # пошив, и пошив стартует только после прихода ткани. Модель универсальная:
+    # список ПОСЛЕДОВАТЕЛЬНЫХ этапов, срок производства = сумма сроков, а доли
+    # себестоимости показывают, когда какие деньги платятся.
+    #   [{"key": "fabric", "name": "Ткань", "lead_days": 40, "cost_share": 0.45,
+    #     "prepay_share": 1.0, "min_units": 50, "min_by_category": {}},
+    #    {"key": "sewing", "name": "Пошив", "lead_days": 25, "cost_share": 0.55,
+    #     "prepay_share": 0.5, "min_units": 0, "min_by_category": {"Пиджаки": 20}}]
+    # prepay_share — доля стоимости этапа, оплачиваемая при его СТАРТЕ (остальное
+    # при завершении): из этого строится календарь платежей и бюджет «сейчас».
+    # min_units / min_by_category — минимальная партия ЭТОГО этапа (у закупки
+    # ткани свой минимум, у пошива — свой, часто по категориям).
+    # Пусто = один этап на весь срок (settings.lead_time_days) — прежнее поведение.
+    stages_json: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default="")
+    # Минимальная партия на модель, шт (0 = без ограничения). В одежде отшить
+    # 4 штуки нельзя — без этого план получается неисполнимым.
+    moq_units: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+
+    @property
+    def stages(self) -> list[dict]:
+        try:
+            data = json.loads(self.stages_json or "[]")
+        except ValueError:
+            return []
+        return data if isinstance(data, list) else []
 
 
 class ProductionAssign(Base):
@@ -374,3 +413,32 @@ class ProductionOrder(Base):
             return json.loads(self.items_json or "[]")
         except ValueError:
             return []
+
+
+class OrderPlan(Base):
+    """План заказа «Мастера» — анкета, вывод системы и результат.
+
+    Хранится ради трёх вещей: (а) предзаполнение следующего брифа («как в
+    прошлый раз»); (б) разбор задним числом «почему в августе заказали так»;
+    (в) будущая сверка план/факт продаж.
+    """
+
+    __tablename__ = "order_plans"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    org_id: Mapped[int] = mapped_column(ForeignKey("orgs.id"), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="draft")  # draft|applied|dropped
+    brief_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    computed_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    result_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    production_order_id: Mapped[int | None] = mapped_column(
+        ForeignKey("production_orders.id"), nullable=True
+    )
+
+    @property
+    def brief(self) -> dict:
+        try:
+            return json.loads(self.brief_json or "{}")
+        except ValueError:
+            return {}

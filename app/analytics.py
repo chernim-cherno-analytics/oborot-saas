@@ -56,6 +56,14 @@ from app.models import (
 CACHE_TTL = 600  # 10 минут
 RATE_WINDOWS = ("year", "d90", "season")  # окна темпа продаж
 DEFAULT_LEAD_TIME_DAYS = 45  # срок производства: заказ → приход на склад
+# Горизонт покрытия заказа (решение Влада 21.08.2026). Раньше был константой
+# horizon_days=90 для всех позиций сразу — это молчаливое допущение «закажу
+# один раз и больше никогда», из-за него идеальный заказ выглядел нереальным.
+# Заказу надо дожить только до прихода СЛЕДУЮЩЕГО заказа: периодичность
+# размещения + страховой запас. См. claude/PLAN_SaaS_assistant_2026-08-21.md §2.1.
+DEFAULT_CADENCE_DAYS = 30  # как часто размещаются заказы
+DEFAULT_SAFETY_DAYS = 14   # страховой запас поверх интервала
+COVER_MIN_DAYS, COVER_MAX_DAYS = 21, 180
 NO_SALES_ALERT_DAYS = 120  # неликвид: столько дней без продаж при наличии стока
 STOCKOUT_ALERT_DAYS = 21  # алерт: бестселлер/хороший закончится в ближайшие N дней
 OVERSTOCK_WEEKS = 26  # алерт: запаса больше, чем на полгода
@@ -209,11 +217,108 @@ def extra_settings(org: Org) -> dict:
     lead = data.get("lead_time_days")
     if not isinstance(lead, (int, float)) or not 1 <= int(lead) <= 365:
         lead = DEFAULT_LEAD_TIME_DAYS
+
+    def _num(key, default, lo, hi):
+        v = data.get(key)
+        if not isinstance(v, (int, float)):
+            return default
+        return int(min(max(lo, v), hi))
+
+    cover_mode = data.get("cover_mode")
+    if cover_mode not in ("cadence", "fixed"):
+        cover_mode = "cadence"
     return {
         "rate_window": rate_window,
         "lead_time_days": int(lead),
         "discount_rule": _clean_discount_rule(data.get("discount_rule")),
+        # Горизонт покрытия: 'cadence' — периодичность + страховой запас (дефолт),
+        # 'fixed' — прежнее поведение по horizon_days.
+        "cover_mode": cover_mode,
+        "order_cadence_days": _num("order_cadence_days", DEFAULT_CADENCE_DAYS, 7, 365),
+        "safety_days": _num("safety_days", DEFAULT_SAFETY_DAYS, 0, 120),
+        # Производственные ограничения по умолчанию (мастер заказа их предзаполняет).
+        "moq_units": _num("moq_units", 0, 0, 10000),
+        "reserve_new_pct": _num("reserve_new_pct", 0, 0, 90),
+        # Какие типы цен МойСклада считать ценой продажи и полной
+        # себестоимостью (у каждого аккаунта они называются по-своему).
+        # Пусто = угадываем по названию, см. ms_sync._price_by.
+        "price_type_sale": str(data.get("price_type_sale") or ""),
+        "price_type_cost": str(data.get("price_type_cost") or ""),
+        # Пиковые периоды продаж бренда (см. order_planner.peak_hints).
+        "peak_periods": data.get("peak_periods") if isinstance(data.get("peak_periods"), list) else [],
     }
+
+
+def cover_days(settings: dict) -> int:
+    """Сколько дней продаж должен закрыть заказ.
+
+    'cadence' (дефолт): периодичность размещения заказов + страховой запас —
+    заказу надо дожить до прихода следующего, а не абстрактные 90 дней.
+    'fixed': прежнее поведение (horizon_days из настроек).
+    """
+    if settings.get("cover_mode") == "fixed":
+        raw = settings.get("horizon_days_setting", settings.get("horizon_days"))
+        try:
+            return max(7, min(365, int(raw or 90)))
+        except (TypeError, ValueError):
+            return 90
+    cadence = int(settings.get("order_cadence_days") or DEFAULT_CADENCE_DAYS)
+    safety = int(settings.get("safety_days") or DEFAULT_SAFETY_DAYS)
+    return max(COVER_MIN_DAYS, min(COVER_MAX_DAYS, cadence + safety))
+
+
+
+# ── Оконные агрегаты (переиспользуются снапшотом и планировщиком заказа) ──────
+
+def _join_products(org_id: int):
+    return and_(
+        Product.id == StockDay.product_id,
+        Product.org_id == org_id,
+        Product.excluded.is_(False),
+    )
+
+
+def window_dis(
+    db: Session, org_id: int, min_stock: float, date_from: str, date_to: str | None = None
+) -> dict[str, int]:
+    """Дни в наличии (сумма остатка базы >= min_stock) в окне дат, по базам."""
+    conds = [StockDay.org_id == org_id, StockDay.date >= date_from]
+    if date_to is not None:
+        conds.append(StockDay.date <= date_to)
+    sub = (
+        select(Product.base_name.label("base"), StockDay.date.label("d"))
+        .select_from(StockDay)
+        .join(Product, _join_products(org_id))
+        .where(*conds)
+        .group_by(Product.base_name, StockDay.date)
+        .having(func.sum(StockDay.qty) >= min_stock)
+        .subquery()
+    )
+    return dict(db.execute(select(sub.c.base, func.count()).group_by(sub.c.base)).all())
+
+
+def window_nq(
+    db: Session, org_id: int, date_from: str, date_to: str | None = None
+) -> dict[str, float]:
+    """Нетто-продажи (шт, минус возвраты) в окне дат, по базовым именам."""
+    conds = [Sale.org_id == org_id, Sale.date >= date_from]
+    if date_to is not None:
+        conds.append(Sale.date <= date_to)
+    sign_qty = case((Sale.is_return, -Sale.qty), else_=Sale.qty)
+    join_sales = and_(
+        Product.id == Sale.product_id,
+        Product.org_id == org_id,
+        Product.excluded.is_(False),
+    )
+    return dict(
+        db.execute(
+            select(Product.base_name, func.sum(sign_qty))
+            .select_from(Sale)
+            .join(Product, join_sales)
+            .where(*conds)
+            .group_by(Product.base_name)
+        ).all()
+    )
 
 
 # ── Расчёт снапшота ───────────────────────────────────────────────────────────
@@ -222,7 +327,13 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
     settings = dict(org.settings)
     settings.update(extra_settings(org))
     min_stock = settings["min_stock_days"]
-    horizon = settings["horizon_days"]
+    # Эффективный горизонт покрытия (см. cover_days). Сырое значение настройки
+    # сохраняем отдельно, а settings["horizon_days"] делаем ЭФФЕКТИВНЫМ — чтобы
+    # все потребители снапшота (заказ, бюджет, экспорт) считали по одному числу.
+    settings["horizon_days_setting"] = settings["horizon_days"]
+    horizon = cover_days(settings)
+    settings["horizon_days"] = horizon
+    settings["cover_days"] = horizon
     thresholds = settings["thresholds"]
     rate_window = settings["rate_window"]
     lead_time = settings["lead_time_days"]
@@ -254,6 +365,7 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
             func.max(Product.category),
             func.max(Product.sale_price),
             func.max(Product.cost_price),
+            func.max(Product.cost_full),
             func.min(case((Product.archived, 1), else_=0)),
         )
         .where(Product.org_id == org.id, Product.excluded.is_(False))
@@ -276,19 +388,7 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
 
     def _dis_window(date_from: str, date_to: str | None = None) -> dict:
         """Дни в стоке (sum qty >= min_stock) в окне дат, по базовым именам."""
-        conds = [StockDay.org_id == org.id, StockDay.date >= date_from]
-        if date_to is not None:
-            conds.append(StockDay.date <= date_to)
-        sub = (
-            select(Product.base_name.label("base"), StockDay.date.label("d"))
-            .select_from(StockDay)
-            .join(Product, join_products)
-            .where(*conds)
-            .group_by(Product.base_name, StockDay.date)
-            .having(func.sum(StockDay.qty) >= min_stock)
-            .subquery()
-        )
-        return dict(db.execute(select(sub.c.base, func.count()).group_by(sub.c.base)).all())
+        return window_dis(db, org.id, min_stock, date_from, date_to)
 
     dis90_by_base = _dis_window(cutoff90)
     dis_season_by_base = _dis_window(season_from, season_to)
@@ -336,18 +436,7 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
 
     # Нетто-продажи в окнах «90 дней» и «сезон прошлого года», по базам.
     def _nq_window(date_from: str, date_to: str | None = None) -> dict:
-        conds = [Sale.org_id == org.id, Sale.date >= date_from]
-        if date_to is not None:
-            conds.append(Sale.date <= date_to)
-        return dict(
-            db.execute(
-                select(Product.base_name, func.sum(sign_qty))
-                .select_from(Sale)
-                .join(Product, join_sales)
-                .where(*conds)
-                .group_by(Product.base_name)
-            ).all()
-        )
+        return window_nq(db, org.id, date_from, date_to)
 
     nq90_by_base = _nq_window(cutoff90)
     nq_season_by_base = _nq_window(season_from, season_to)
@@ -491,7 +580,12 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
 
     # ── Сборка по базовым именам ─────────────────────────────────────────────
     items: dict[str, dict] = {}
-    for base, category, sale_price, cost_price, archived in meta_rows:
+    for base, category, sale_price, cost_purchase, cost_full, archived in meta_rows:
+        # Деньги считаем по ПОЛНОЙ себестоимости; если она не задана — по
+        # закупочной цене (у брендов «под ключ» это одно и то же число, у
+        # брендов со своим производством закупочная = только пошив, и тогда
+        # бюджет занижен вдвое — UI обязан об этом предупреждать).
+        cost_price = float(cost_full or 0) or float(cost_purchase or 0)
         # Категория для отображения: русская (перевод латинских групп МС или
         # keyword-категоризация по имени), поверх — пользовательские правила:
         # слияние категорий и перенос отдельной позиции («ведут МС черти как»).
@@ -506,6 +600,8 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
             "ordered_ms": ordered_ms.get(base, 0.0),
             "sale_price": float(sale_price or 0),
             "cost_price": float(cost_price or 0),
+            "cost_purchase": float(cost_purchase or 0),
+            "cost_is_full": bool(cost_full),
             "archived": bool(archived),
             "dis": int(dis_by_base.get(base, 0)),
             "cs": 0,

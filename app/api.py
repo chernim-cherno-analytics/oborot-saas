@@ -266,6 +266,16 @@ def api_settings(ctx: AuthContext = Depends(require_auth_api), db: Session = Dep
         "min_stock_days": settings["min_stock_days"],
         "rate_window": extra["rate_window"],
         "lead_time_days": extra["lead_time_days"],
+        # Горизонт покрытия заказа: периодичность размещения + страховой запас.
+        "cover_mode": extra["cover_mode"],
+        "order_cadence_days": extra["order_cadence_days"],
+        "safety_days": extra["safety_days"],
+        "cover_days": analytics.cover_days({**settings, **extra}),
+        "moq_units": extra["moq_units"],
+        "reserve_new_pct": extra["reserve_new_pct"],
+        "price_type_sale": extra["price_type_sale"],
+        "price_type_cost": extra["price_type_cost"],
+        "peak_periods": extra["peak_periods"],
         "warehouses": [{"id": w.id, "name": w.name, "active": w.active} for w in warehouses],
         "connection": (
             {
@@ -293,6 +303,21 @@ class SettingsIn(BaseModel):
     min_stock_days: int | None = Field(default=None, ge=0, le=100)
     rate_window: str | None = None  # 'year' | 'd90' | 'season'
     lead_time_days: int | None = Field(default=None, ge=1, le=365)
+    cover_mode: str | None = None  # 'cadence' | 'fixed'
+    order_cadence_days: int | None = Field(default=None, ge=7, le=365)
+    safety_days: int | None = Field(default=None, ge=0, le=120)
+    moq_units: int | None = Field(default=None, ge=0, le=10000)
+    reserve_new_pct: int | None = Field(default=None, ge=0, le=90)
+    price_type_sale: str | None = Field(default=None, max_length=128)
+    price_type_cost: str | None = Field(default=None, max_length=128)
+    peak_periods: list[dict] | None = None
+
+    @field_validator("cover_mode")
+    @classmethod
+    def _cover_mode_known(cls, v: str | None) -> str | None:
+        if v is not None and v not in ("cadence", "fixed"):
+            raise ValueError("cover_mode должен быть 'cadence' или 'fixed'")
+        return v
 
     @field_validator("rate_window")
     @classmethod
@@ -324,6 +349,12 @@ def api_update_settings(
         extra["rate_window"] = body.rate_window
     if body.lead_time_days is not None:
         extra["lead_time_days"] = body.lead_time_days
+    for key in ("cover_mode", "order_cadence_days", "safety_days",
+                "moq_units", "reserve_new_pct", "price_type_sale",
+                "price_type_cost", "peak_periods"):
+        val = getattr(body, key)
+        if val is not None:
+            extra[key] = val
     settings.update(extra)
     org.settings_json = json.dumps(settings, ensure_ascii=False)
     db.commit()
@@ -518,6 +549,10 @@ def api_hint_mark_seen(
 
 class ProductionIn(BaseModel):
     name: str = Field(min_length=1, max_length=120)
+    # Этапы канала сразу при создании: turnkey (Китай под ключ) |
+    # fabric_sewing (своё производство: ткань → пошив). Можно задать позже.
+    preset: str | None = None
+    moq_units: int | None = Field(default=None, ge=0, le=10000)
 
 
 class ProductionAssignIn(BaseModel):
@@ -554,8 +589,9 @@ def api_productions(ctx: AuthContext = Depends(require_auth_api), db: Session = 
     assigns = db.execute(
         select(ProductionAssign).where(ProductionAssign.org_id == ctx.org.id)
     ).scalars().all()
+    fallback_lead = analytics.extra_settings(ctx.org)["lead_time_days"]
     return {
-        "productions": [{"id": p.id, "name": p.name, "is_main": p.is_main} for p in prods],
+        "productions": [_production_out(p, fallback_lead) for p in prods],
         "assign": {a.base_name: a.production_id for a in assigns if a.production_id in valid},
     }
 
@@ -567,11 +603,22 @@ def api_production_create(
     """Добавить дополнительное производство (если заказами занимается другой отдел)."""
     from app.models import Production
     _ensure_main_production(db, ctx.org.id)
+    from app import order_planner
+    fallback_lead = analytics.extra_settings(ctx.org)["lead_time_days"]
     p = Production(org_id=ctx.org.id, name=body.name.strip(), is_main=False)
+    if body.preset:
+        raw = order_planner.STAGE_PRESETS.get(body.preset)
+        if raw is None:
+            raise HTTPException(422, "Неизвестный пресет этапов")
+        p.stages_json = json.dumps(
+            order_planner.normalize_stages(raw, fallback_lead), ensure_ascii=False
+        )
+    if body.moq_units is not None:
+        p.moq_units = int(body.moq_units)
     db.add(p)
     db.commit()
     db.refresh(p)
-    return {"id": p.id, "name": p.name, "is_main": False}
+    return _production_out(p, fallback_lead)
 
 
 @router.post("/productions/assign")
@@ -655,3 +702,195 @@ def api_add_ordered(
     db.commit()
     analytics.invalidate(ctx.org.id)
     return {"ok": True, "base_name": body.base_name, "qty_total": total}
+
+
+# ── Мастер заказа: план под бюджет ───────────────────────────────────────────
+# Анкета → план (волны, MOQ, этапы производства) → заказ. Ядро — чистая функция
+# app/order_planner.py; здесь только транспорт и сохранение.
+
+class OrderPlanIn(BaseModel):
+    production_id: int | None = None
+    eta_date: str | None = None            # когда товар нужен на складе
+    budget: int = Field(default=0, ge=0)   # деньги на этот заказ, ₽
+    budget_scope: str | None = None        # now (первый этап) | full (весь заказ)
+    cadence_days: int | None = None        # как часто размещаются заказы
+    safety_days: int | None = None
+    strategy: str | None = None            # protect | balance | grow
+    max_share_pct: int | None = None
+    moq_units: int | None = None
+    reserve_new_pct: int | None = None
+    exclude_categories: list[str] = Field(default_factory=list)
+    must_have: list[str] = Field(default_factory=list)
+    # Новинки без истории продаж: владелец вписывает их руками
+    # [{"name": "Пальто Осень", "qty": 30, "cost": 9000, "category": "Верхняя одежда"}]
+    new_items: list[dict] = Field(default_factory=list)
+
+
+def _plan(db: Session, ctx: AuthContext, body: OrderPlanIn) -> dict:
+    from app import order_planner
+    snap = analytics.get_snapshot(db, ctx.org)
+    return order_planner.build_plan(db, ctx.org, snap, body.model_dump())
+
+
+@router.post("/order-plan/preview")
+def api_order_plan_preview(
+    body: OrderPlanIn, ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)
+):
+    """Предпросмотр плана: ничего не сохраняет, дергается на каждое изменение анкеты."""
+    return _plan(db, ctx, body)
+
+
+@router.post("/order-plan")
+def api_order_plan_save(
+    body: OrderPlanIn, ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)
+):
+    """Сохранить план (бриф + вывод системы + результат) для истории и предзаполнения."""
+    from app.models import OrderPlan
+    plan = _plan(db, ctx, body)
+    row = OrderPlan(
+        org_id=ctx.org.id,
+        status="draft",
+        brief_json=json.dumps(plan["brief"], ensure_ascii=False),
+        computed_json=json.dumps(
+            {
+                "cover_days": plan["cover_days"],
+                "order_date": plan["order_date"],
+                "covered_until": plan["covered_until"],
+                "stages": plan["stages"],
+                "lead_days": plan["lead_days"],
+            },
+            ensure_ascii=False,
+        ),
+        result_json=json.dumps(
+            {"items": plan["items"], "totals": plan["totals"],
+             "spent": plan["spent"], "lost_revenue": plan["lost_revenue"]},
+            ensure_ascii=False,
+        ),
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return {"ok": True, "id": row.id, "plan": plan}
+
+
+@router.get("/order-plan/last")
+def api_order_plan_last(
+    ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)
+):
+    """Последний бриф — чтобы второй заказ оформлялся в два клика."""
+    from app.models import OrderPlan
+    row = db.execute(
+        select(OrderPlan).where(OrderPlan.org_id == ctx.org.id)
+        .order_by(OrderPlan.created_at.desc(), OrderPlan.id.desc())
+    ).scalars().first()
+    if row is None:
+        return {"brief": None}
+    return {"brief": row.brief, "id": row.id, "created_at": row.created_at.isoformat()}
+
+
+class PlanApplyIn(BaseModel):
+    name: str = Field(default="", max_length=255)
+
+
+@router.post("/order-plan/{plan_id}/apply")
+def api_order_plan_apply(
+    plan_id: int, body: PlanApplyIn,
+    ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db),
+):
+    """План → «Заказ на производство» (дальше существующий путь: в МойСклад, Excel)."""
+    from app.models import OrderPlan
+    row = db.get(OrderPlan, plan_id)
+    if row is None or row.org_id != ctx.org.id:
+        raise HTTPException(404, "План не найден")
+    if row.production_order_id:
+        raise HTTPException(409, "По этому плану заказ уже создан")
+    try:
+        result = json.loads(row.result_json or "{}")
+    except ValueError:
+        result = {}
+    items = [
+        {"base_name": i["base_name"], "qty": int(i["qty"]),
+         "sizes": i.get("sizes") or {}, "cost": float(i.get("cost_price") or 0)}
+        for i in (result.get("items") or []) if int(i.get("qty") or 0) > 0
+    ]
+    # Новинки, вписанные вручную, — такие же строки заказа (в МойСкладе у них
+    # может ещё не быть карточки: писбэк вернёт их в списке unmatched).
+    brief = row.brief
+    for n in (brief.get("new_items") or []):
+        if int(n.get("qty") or 0) > 0:
+            items.append({"base_name": n["name"], "qty": int(n["qty"]),
+                          "sizes": {}, "cost": float(n.get("cost") or 0)})
+    if not items:
+        raise HTTPException(422, "В плане нет позиций с количеством > 0")
+    order = ProductionOrder(
+        org_id=ctx.org.id,
+        name=(body.name.strip() or f"Заказ от {datetime.now():%d.%m.%Y}"),
+        eta_date=brief.get("eta_date"),
+        status="draft",
+        items_json=json.dumps(items, ensure_ascii=False),
+    )
+    db.add(order)
+    db.commit()
+    db.refresh(order)
+    row.production_order_id = order.id
+    row.status = "applied"
+    db.commit()
+    analytics.invalidate(ctx.org.id)
+    return {"ok": True, "order_id": order.id, "status": "draft"}
+
+
+class ProductionSetupIn(BaseModel):
+    """Настройка канала производства: этапы и минимальная партия.
+
+    preset — быстрый выбор в анкете: turnkey (под ключ) | fabric_sewing (ткань → пошив).
+    stages переопределяет preset, если передан.
+    """
+    preset: str | None = None
+    stages: list[dict] | None = None
+    moq_units: int | None = Field(default=None, ge=0, le=10000)
+    # Ритм заказов В ЭТОТ канал (0 = общая настройка организации): своё
+    # производство часто догружают еженедельно, Китай заказывают раз в сезон.
+    cadence_days: int | None = Field(default=None, ge=0, le=365)
+
+
+@router.post("/productions/{pid}/setup")
+def api_production_setup(
+    pid: int, body: ProductionSetupIn,
+    ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db),
+):
+    from app import order_planner
+    from app.models import Production
+    p = db.get(Production, pid)
+    if p is None or p.org_id != ctx.org.id:
+        raise HTTPException(404, "Производство не найдено")
+    raw = body.stages
+    if raw is None and body.preset:
+        raw = order_planner.STAGE_PRESETS.get(body.preset)
+        if raw is None:
+            raise HTTPException(422, "Неизвестный пресет этапов")
+    if raw is not None:
+        stages = order_planner.normalize_stages(
+            raw, analytics.extra_settings(ctx.org)["lead_time_days"]
+        )
+        p.stages_json = json.dumps(stages, ensure_ascii=False)
+    if body.moq_units is not None:
+        p.moq_units = int(body.moq_units)
+    if body.cadence_days is not None:
+        p.cadence_days = int(body.cadence_days)
+    db.commit()
+    analytics.invalidate(ctx.org.id)
+    return _production_out(p, analytics.extra_settings(ctx.org)["lead_time_days"])
+
+
+def _production_out(p, fallback_lead: int) -> dict:
+    from app import order_planner
+    stages = order_planner.normalize_stages(p.stages, fallback_lead)
+    return {
+        "id": p.id, "name": p.name, "is_main": p.is_main,
+        "stages": stages,
+        "lead_days": order_planner.lead_days(stages),
+        "moq_units": int(p.moq_units or 0),
+        "cadence_days": int(p.cadence_days or 0),
+        "prepay_now_share": round(order_planner.prepay_share_total(stages), 4),
+        "staged": len(stages) > 1,
+    }
