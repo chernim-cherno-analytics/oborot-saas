@@ -1,19 +1,40 @@
 """Синхронизация данных МойСклад → БД «Оборота».
 
-Первичный синк (mode='initial'), этапы и доли прогресса:
-  products      (0–8%)   — entity/assortment: товары и модификации, цены;
-  stock_history (8–70%)  — report/stock/all с moment ВНУТРИ filter, по каждой
-                           дате за HISTORY_DAYS × каждому активному складу,
-                           чанками по STOCK_CHUNK_DATES с записью после каждого
-                           (инцидент 21.08: сбой не теряет загруженное, следующий
-                           запуск продолжает с stats.stock_loaded_until);
-                           суммарно → stock_days, последняя дата → warehouse_stock;
-  sales         (70–95%) — retaildemand + demand + salesreturn c expand=positions
-                           за HISTORY_DAYS, фильтр по выбранным складам → sales;
-  incoming      (95–97%) — «едет к нам» из МС: entity/purchaseorder за
-                           HISTORY_DAYS, по позициям quantity − shipped
-                           (проведённые доки) → ordered_qty.ms_qty;
-  finalize      (97–100%)— connection.status='active', сброс кэша аналитики.
+Первичный синк (mode='initial') — ПРОГРЕССИВНЫЙ (деплой П1, 21.08): пользователь
+может работать с сервисом через секунды после подключения, история догружается
+фоном, полоска под шапкой показывает прогресс на всех страницах. Фазы:
+  products  (0–5%)   — entity/assortment: товары и модификации, цены;
+  today     (5–10%)  — остатки ТОЛЬКО на сегодня (1 дата × активные склады)
+                       → warehouse_stock + stock_days(сегодня); при свежей/
+                       принудительной пересборке здесь же стирается старая
+                       история — в одной транзакции с первой записью новой
+                       (инвариант 18.08: никакого wipe до первой удачной загрузки);
+  month     (10–25%) — окно W = INITIAL_WINDOW_DAYS последних дат (хронологически,
+                       с явными нулями), продажи и «едет к нам» за окно; затем
+                       FINALIZE-LITE: connection.status='active', last_sync_at,
+                       сброс кэша аналитики, stats.coverage_days=W,
+                       stats.history_loaded_from=начало окна, stats.phase='history'.
+                       С этого момента все страницы работают на W днях истории;
+  history   (25–98%) — остальные даты от (W_start−1) НАЗАД к (today−HISTORY_DAYS+1)
+                       чанками по STOCK_CHUNK_DATES, новые → старые. Чанк: скачать
+                       остатки → явные нули хронологически внутри чанка → записать;
+                       ГРАНИЧНАЯ ЗАПЛАТКА: день D = chunk_end+1 (уже записан, более
+                       новый сосед) получает qty=0 для позиций, которые были >0 на
+                       chunk_end и не имеют строки на D — ровно то, что дал бы
+                       прямой хронологический проход; затем продажи за даты чанка
+                       (delete+insert диапазона), stats.history_loaded_from=chunk_start,
+                       coverage_days, months[], сброс кэша аналитики;
+  finalize  (98–100%)— как раньше: done, точка продолжения снимается.
+
+Продолжение (resume): точка — ОБА конца загруженного отрезка,
+stats.history_loaded_from (самая старая дата) и stats.history_loaded_to (самая
+новая), плюс stats.resume_fp (отпечаток складов/окна). Прерванный на фазе
+history синк оставляет status='active' и coverage_days; любой следующий запуск
+(ручной, планировщик, почасовой догон) сначала догружает ХРОНОЛОГИЧЕСКИ хвост
+[history_loaded_to+1 … сегодня] (упали 18-го, продолжаем 21-го — 19-е и 20-е
+обязаны появиться), при незакрытом окне (stats.window_done) добирает продажи
+окна и «едет к нам», и только потом идёт назад с history_loaded_from−1.
+Статус подключения никогда не понижается.
 
 Инкрементальный синк (mode='incremental'): обновление цен из ассортимента,
 живые остатки на сегодня (+ явные нули), перезапись продаж за последние
@@ -28,17 +49,17 @@ SYNC_DAYS_BACK дней (окно — так legacy чинил дыры от о�
   имени как в legacy _canon_name.
 
 Прогресс пишется в таблицу sync_state; запуск — фоновым потоком со своим
-event loop (start_sync). APScheduler намеренно не подключён — планировщик
-прода отдельная задача, есть только ручка POST /api/sync/run.
+event loop (start_sync). Планировщик — app/scheduler.py.
 """
 import asyncio
 import json
 import os
 import re
 import threading
+import time
 from datetime import date, datetime, timedelta
 
-from sqlalchemy import delete, insert, inspect, select, text, update
+from sqlalchemy import delete, func, insert, inspect, select, text, update
 
 from app import analytics, exclusions
 from app.crypto import decrypt_token
@@ -57,8 +78,11 @@ from app.ms_client import MoySkladClient, _env_int
 
 HISTORY_DAYS = int(os.environ.get("HISTORY_DAYS", "365"))
 SALES_RESYNC_DAYS = int(os.environ.get("SYNC_DAYS_BACK", "3"))
+# Деплой П1: окно «быстрого старта» — столько последних дат загружается до
+# finalize-lite (пользователь получает рабочие страницы), остальное — фоном.
+INITIAL_WINDOW_DAYS = _env_int("INITIAL_WINDOW_DAYS", 30, minimum=1)
 # Инцидент 21.08: история остатков качается и ПИШЕТСЯ чанками по N дат —
-# сбой на середине года не теряет уже загруженное (см. _sync_stock_history).
+# сбой на середине года не теряет уже загруженное (см. _run_initial).
 STOCK_CHUNK_DATES = _env_int("STOCK_CHUNK_DATES", 30, minimum=1)
 try:
     CHUNK_PAUSE_SECONDS = max(0.0, float(os.environ.get("MS_CHUNK_PAUSE", "2")))
@@ -72,6 +96,14 @@ _SIZE_SUFFIX_RE = re.compile(r"\s*\(([^)]*)\)\s*$")
 
 _threads: dict[int, threading.Thread] = {}
 _threads_lock = threading.Lock()
+
+# Этапы первичной загрузки в порядке выполнения (для /api/sync/progress).
+STAGE_TITLES = (
+    ("products", "Товары и цены"),
+    ("today", "Остатки на сегодня"),
+    ("month", "Продажи и остатки за последние дни"),
+    ("history", "История за год"),
+)
 
 
 def ensure_schema() -> None:
@@ -159,6 +191,36 @@ def _kopecks(value) -> float:
         return 0.0
 
 
+def _iso(d: date) -> str:
+    return d.isoformat()
+
+
+def _today() -> date:
+    """Сегодняшняя дата — ЕДИНСТВЕННЫЙ источник «сегодня» во всём модуле.
+
+    Ревью 21.08: продолжение прерванной загрузки надо уметь проверять на
+    многодневном разрыве («упали 18-го, продолжили 21-го»), а для этого тесту
+    нужен шов — подмена ms_sync._today. Прямых date.today() в модуле нет.
+    """
+    return date.today()
+
+
+def _day_after(day_iso: str) -> str:
+    return _iso(date.fromisoformat(day_iso) + timedelta(days=1))
+
+
+def _dates_between(from_iso: str, to_iso: str) -> list[date]:
+    """Даты [from_iso … to_iso] включительно, хронологически ([] если пусто)."""
+    start, end = date.fromisoformat(from_iso), date.fromisoformat(to_iso)
+    return [start + timedelta(days=i) for i in range((end - start).days + 1)]
+
+
+def _days_since(day_iso: str, today: date | None = None) -> int:
+    """Покрытие в днях: от day_iso до сегодня включительно."""
+    today = today or _today()
+    return max(0, (today - date.fromisoformat(day_iso)).days + 1)
+
+
 # ── Состояние синка (sync_state) ─────────────────────────────────────────────
 
 def _set_state(org_id: int, **fields) -> None:
@@ -175,17 +237,149 @@ def _set_state(org_id: int, **fields) -> None:
         db.close()
 
 
+def _persist(org_id: int, stats: dict, **fields) -> None:
+    """_set_state с сериализацией stats одной строкой (сахар)."""
+    _set_state(org_id, stats_json=json.dumps(stats, ensure_ascii=False), **fields)
+
+
+def _coverage_days(org_id: int) -> int:
+    """Сколько дней истории сейчас на диске — ПО БАЗЕ, а не по stats.
+
+    Ревью 21.08 (минор 8): раньше при state='done' или mode='incremental'
+    возвращалось HISTORY_DAYS «на доверии». Организация, у которой первичная
+    загрузка умерла на фазе products, а потом владелец нажал «Синхронизировать
+    сейчас» (инкремент пишет ровно один день остатков), рапортовала «за год» —
+    и таблица считала оборачиваемость по одному дню как по 365. Считаем
+    честно: сколько РАЗНЫХ дат stock_days лежит у организации (в пределах окна).
+    """
+    db = SessionLocal()
+    try:
+        n = db.execute(
+            select(func.count(func.distinct(StockDay.date)))
+            .where(StockDay.org_id == org_id)
+        ).scalar()
+    finally:
+        db.close()
+    return int(min(HISTORY_DAYS, max(0, int(n or 0))))
+
+
+def months_progress(loaded_from: str | None, running: bool,
+                    today: date | None = None) -> list[dict]:
+    """Полоска месяцев для UI: [{ym, state: done|running|todo}], новые первыми.
+
+    loaded_from — самая старая загруженная дата (None — ничего не загружено).
+    Месяц done, если загружен целиком (в пределах окна HISTORY_DAYS);
+    running — частично загруженный или ближайший к загрузке при идущем синке.
+    """
+    today = today or _today()
+    oldest = today - timedelta(days=HISTORY_DAYS - 1)
+    out: list[dict] = []
+    cur = date(today.year, today.month, 1)
+    while True:
+        m_end = (date(cur.year + (cur.month // 12), cur.month % 12 + 1, 1)
+                 - timedelta(days=1))
+        a = max(cur, oldest)
+        b = min(m_end, today)
+        if a > b:
+            break
+        if loaded_from is None:
+            state = "todo"
+        elif loaded_from <= _iso(a):
+            state = "done"
+        elif loaded_from <= _iso(b + timedelta(days=1)):
+            state = "running" if running else "todo"
+        else:
+            state = "todo"
+        out.append({"ym": f"{cur.year:04d}-{cur.month:02d}", "state": state})
+        if cur <= oldest:
+            break
+        cur = (cur - timedelta(days=1)).replace(day=1)
+    # Идущий синк: первый ещё не начатый месяц тоже «в работе» (ближайший).
+    if running and loaded_from is not None and not any(m["state"] == "running" for m in out):
+        for m in out:
+            if m["state"] == "todo":
+                m["state"] = "running"
+                break
+    return out
+
+
+def _stages_out(state: str, stats: dict) -> list[dict]:
+    """Этапы первичной загрузки с секундами и счётчиками (для панели «Подробнее»)."""
+    times = stats.get("stage_times") or {}
+    wh_names = stats.get("warehouses") or []
+    counts_by_key = {
+        "products": {"products_total": stats.get("products_total")},
+        "today": {"warehouses": len(wh_names), "warehouse_names": wh_names,
+                  "warehouse_stock_rows": stats.get("warehouse_stock_rows")},
+        "month": {"window_days": stats.get("window_days"),
+                  "sales_docs": stats.get("window_sales_docs"),
+                  "sales_rows": stats.get("window_sales_rows"),
+                  "return_rows": stats.get("window_return_rows"),
+                  "incoming_qty": stats.get("incoming_qty")},
+        "history": {"chunks_done": stats.get("history_chunks_done"),
+                    "chunks_total": stats.get("history_chunks_total"),
+                    "dates": stats.get("history_dates"),
+                    "sales_docs": stats.get("sales_docs"),
+                    "stock_rows": stats.get("stock_rows")},
+    }
+    out = []
+    for key, title in STAGE_TITLES:
+        t = times.get(key) or {}
+        start, end = t.get("start"), t.get("end")
+        if end is not None:
+            st, seconds = "done", max(0.0, end - (start or end))
+        elif start is not None and state == "running":
+            st, seconds = "running", max(0.0, time.time() - start)
+        else:
+            st, seconds = "todo", None
+        if key == "month" and stats.get("window_days") and st != "todo":
+            title = f"Продажи и остатки за последние {int(stats['window_days'])} дн."
+        out.append({"key": key, "title": title, "state": st,
+                    "seconds": round(seconds) if seconds is not None else None,
+                    "counts": {k: v for k, v in counts_by_key[key].items() if v is not None}})
+    return out
+
+
+def _eta_sec(state: str, stats: dict) -> int | None:
+    """Оценка остатка: средние секунды на чанк истории × оставшиеся чанки."""
+    if state != "running":
+        return None
+    done = int(stats.get("history_chunks_done") or 0)
+    total = int(stats.get("history_chunks_total") or 0)
+    secs = float(stats.get("history_seconds") or 0.0)
+    if done < 1 or total <= done:
+        return None
+    return int(round(secs / done * (total - done)))
+
+
 def get_status(org_id: int) -> dict:
-    """GET /api/sync/status: текущее состояние синхронизации организации."""
+    """GET /api/sync/status: текущее состояние синхронизации организации.
+
+    Деплой П1: плюс phase, coverage_days, history_loaded_from, months[],
+    stages[], eta_sec — из них же собирается публичный /api/sync/progress.
+    """
     db = SessionLocal()
     try:
         row = db.get(SyncState, org_id)
     finally:
         db.close()
     if row is None:
-        return {"state": "idle", "stage": "", "progress_pct": 0, "detail": "",
+        return {"state": "idle", "mode": "", "stage": "", "progress_pct": 0, "detail": "",
                 "started_at": None, "finished_at": None, "stats": {}, "error": "",
-                "fail_streak": 0, "alerted_streak": 0}
+                "fail_streak": 0, "alerted_streak": 0,
+                "phase": "", "coverage_days": 0, "history_loaded_from": None,
+                "months": months_progress(None, False), "stages": [], "eta_sec": None}
+    stats = row.stats
+    coverage = _coverage_days(org_id)
+    hlf = stats.get("history_loaded_from")
+    if hlf:
+        loaded_from: str | None = str(hlf)
+    elif coverage >= HISTORY_DAYS:
+        loaded_from = _iso(_today() - timedelta(days=HISTORY_DAYS - 1))
+    elif coverage > 0:
+        loaded_from = _iso(_today() - timedelta(days=coverage - 1))
+    else:
+        loaded_from = None
     return {
         "state": row.state,
         "mode": row.mode,
@@ -194,10 +388,41 @@ def get_status(org_id: int) -> dict:
         "detail": row.detail,
         "started_at": row.started_at.isoformat() if row.started_at else None,
         "finished_at": row.finished_at.isoformat() if row.finished_at else None,
-        "stats": row.stats,
+        "stats": stats,
         "error": row.error,
         "fail_streak": int(row.fail_streak or 0),
         "alerted_streak": int(row.alerted_streak or 0),
+        "phase": str(stats.get("phase") or ""),
+        "coverage_days": coverage,
+        "history_loaded_from": hlf,
+        "months": months_progress(loaded_from, row.state == "running"),
+        "stages": _stages_out(row.state, stats) if row.mode == "initial" else [],
+        "eta_sec": _eta_sec(row.state, stats),
+    }
+
+
+def get_progress(org_id: int) -> dict:
+    """GET /api/sync/progress (любой участник организации): без внутренних stats."""
+    st = get_status(org_id)
+    return {
+        "state": st["state"],
+        # mode нужен полоске, чтобы отличить первичную загрузку от обычного
+        # инкремента в 06:00 (у инкремента фаз нет — phase пустая).
+        "mode": st["mode"],
+        "phase": st["phase"],
+        "progress_pct": st["progress_pct"],
+        "detail": st["detail"],
+        "error": st["error"],
+        "error_cause": str((st.get("stats") or {}).get("error_cause") or ""),
+        "coverage_days": st["coverage_days"],
+        "history_days": HISTORY_DAYS,
+        # окно быстрого старта — полоска не должна зашивать «30 дней» в вёрстку
+        "window_days": INITIAL_WINDOW_DAYS,
+        "months": st["months"],
+        "stages": st["stages"],
+        "eta_sec": st["eta_sec"],
+        "started_at": st["started_at"],
+        "finished_at": st["finished_at"],
     }
 
 
@@ -249,8 +474,8 @@ def clear_resume_point(org_id: int) -> None:
         if row is None:
             return
         stats = row.stats
-        if "stock_loaded_until" in stats or "resume_fp" in stats:
-            stats.pop("stock_loaded_until", None)
+        if "history_loaded_from" in stats or "resume_fp" in stats:
+            stats.pop("history_loaded_from", None)
             stats.pop("resume_fp", None)
             # Частичная история уже на диске: молчаливой дыры не оставляем —
             # следующий запуск (даже инкрементный) станет полной пересборкой.
@@ -273,20 +498,27 @@ def reset_stale_running() -> None:
     (деплой, OOM, рестарт хостинга), строка оставалась 'running' навсегда,
     is_running() врал, и авто-/ручные синки организации блокировались до
     ручного вмешательства. На старте живых потоков нет по определению —
-    все 'running' в БД заведомо мёртвые.
+    все 'running' в БД заведомо мёртвые. Точка продолжения (stats) при этом
+    сохраняется — догоняющий джоб продолжит загрузку истории.
     """
     db = SessionLocal()
     try:
-        n = db.execute(
-            update(SyncState).where(SyncState.state == "running").values(
-                state="error",
-                error="Синхронизация прервана перезапуском сервера — запустите ещё раз",
-                finished_at=datetime.utcnow(),
-            )
-        ).rowcount
+        rows = db.execute(
+            select(SyncState).where(SyncState.state == "running")
+        ).scalars().all()
+        for row in rows:
+            row.state = "error"
+            row.error = ("Синхронизация прервана перезапуском сервера — "
+                         "продолжим автоматически")
+            row.finished_at = datetime.utcnow()
+            # Ревью 21.08 (минор 11): без error_cause фронт предлагал не ту
+            # кнопку («проверьте токен» вместо «продолжим сами»).
+            stats = row.stats
+            stats["error_cause"] = "transient"
+            row.stats_json = json.dumps(stats, ensure_ascii=False)
         db.commit()
-        if n:
-            print(f"ms_sync: сброшено зависших состояний running: {n}")
+        if rows:
+            print(f"ms_sync: сброшено зависших состояний running: {len(rows)}")
     finally:
         db.close()
 
@@ -306,25 +538,32 @@ def estimate_minutes(n_dates: int, n_stores: int) -> float:
 
 
 # Ключи stats, переживающие перезапуск синка до успешного done (ревью 21.08).
-_CARRIED_STATS = ("stock_loaded_until", "resume_fp", "needs_full_rebuild")
+# coverage_days — чтобы полоска прогресса не «обнулялась» между запусками;
+# history_loaded_to — САМАЯ НОВАЯ загруженная дата (ревью 21.08, мажор 1):
+# без неё продолжение через сутки теряло дни между «сегодня» прерванного
+# запуска и «сегодня» продолжения; window_done — окно быстрого старта
+# доехало целиком, включая продажи и «едет к нам» (мажор 2).
+_CARRIED_STATS = ("history_loaded_from", "history_loaded_to", "resume_fp",
+                  "needs_full_rebuild", "coverage_days", "window_done")
 
 
 def _pending_resume(org_id: int) -> str | None:
-    """Дата, до которой дошёл прерванный первичный синк (stats.stock_loaded_until).
+    """Самая старая загруженная дата прерванной первичной загрузки
+    (stats.history_loaded_from) — или None, если продолжать нечего.
 
-    Инцидент 21.08: прерванный на середине первичный синк оставляет ЧАСТИЧНУЮ
-    новую историю (старая уже стёрта первым _flush). Пока она не дозагружена,
-    любой следующий запуск — initial ИЛИ incremental (кнопка «Синхронизировать
-    сейчас», планировщик) — продолжает первичную загрузку со следующей даты:
-    инкремент поверх дыры в истории дал бы ложные нули и битую оборачиваемость.
+    Инцидент 21.08 / деплой П1: прерванная первичная загрузка оставляет ЧАСТИЧНУЮ
+    историю (от history_loaded_from до сегодня). Пока она не дозагружена, любой
+    следующий запуск — initial ИЛИ incremental (кнопка «Синхронизировать сейчас»,
+    планировщик, почасовой догон) — продолжает первичную загрузку назад:
+    инкремент поверх короткой истории дал бы битую оборачиваемость «за год».
     Исключение — явная «Полная пересборка» (start_sync(force_full=True)):
     она всегда начинает с нуля и снимает точку продолжения (ревью 21.08).
     """
     st = get_status(org_id)
     if st.get("state") != "error":
         return None
-    until = (st.get("stats") or {}).get("stock_loaded_until")
-    return str(until) if until else None
+    loaded_from = (st.get("stats") or {}).get("history_loaded_from")
+    return str(loaded_from) if loaded_from else None
 
 
 def needs_full_rebuild(org_id: int) -> bool:
@@ -335,6 +574,21 @@ def needs_full_rebuild(org_id: int) -> bool:
 def has_resume_point(org_id: int) -> bool:
     """Есть ли прерванная первичная загрузка, которую надо продолжить."""
     return _pending_resume(org_id) is not None
+
+
+def orgs_with_resume_point() -> list[int]:
+    """org_id с прерванной первичной загрузкой (для почасового догона)."""
+    db = SessionLocal()
+    try:
+        rows = db.execute(
+            select(SyncState.org_id).where(
+                SyncState.state == "error",
+                SyncState.stats_json.like('%"history_loaded_from"%'),
+            )
+        ).all()
+        return [org_id for (org_id,) in rows]
+    finally:
+        db.close()
 
 
 def start_sync(org_id: int, mode: str, *, force_full: bool = False) -> bool:
@@ -360,7 +614,7 @@ def start_sync(org_id: int, mode: str, *, force_full: bool = False) -> bool:
         # Ревью 21.08 (2): переносимые ключи НЕ обнуляем на старте — если запуск
         # упадёт ещё до истории остатков (429/401 на ассортименте), точка
         # продолжения / флаг пересборки обязаны пережить и этот провал. Снимает
-        # их только done (или реально случившийся wipe в _flush).
+        # их только done (или реально случившийся wipe в фазе today).
         carried = {k: prev_stats[k] for k in _CARRIED_STATS if k in prev_stats}
         carried["mode"] = mode
         _set_state(
@@ -393,12 +647,37 @@ def _thread_main(org_id: int, mode: str, resume_from: str | None = None,
             stats_json=json.dumps(stats, ensure_ascii=False),
         )
         try:
-            _bump_fail_streak(org_id)
-            # Алерт шлём отсюда (и ручные, и авто-запуски), планировщик — страховка.
-            from app import notify as _notify
-            _notify.send_sync_failure_alert(org_id, get_status(org_id))
+            if _is_background_history_stop(exc, org_id, stats):
+                # Ревью 21.08 (минор 10): фоновая догрузка истории у РАБОТАЮЩЕГО
+                # сервиса — не «падающий синк». Текст пользователю говорит
+                # «продолжим автоматически», алерт «второй раз подряд» тут врёт.
+                print(f"ms_sync org={org_id}: фоновая история прервана "
+                      f"({exc}) — серия провалов не засчитана")
+            else:
+                _bump_fail_streak(org_id)
+                # Алерт шлём отсюда (и ручные, и авто), планировщик — страховка.
+                from app import notify as _notify
+                _notify.send_sync_failure_alert(org_id, get_status(org_id))
         except Exception:  # noqa: BLE001 — счётчик/алерт не должны маскировать ошибку синка
             pass
+
+
+def _connection_status(org_id: int) -> str:
+    db = SessionLocal()
+    try:
+        return str(db.execute(
+            select(Connection.status).where(
+                Connection.org_id == org_id, Connection.kind == "moysklad")
+        ).scalar() or "")
+    finally:
+        db.close()
+
+
+def _is_background_history_stop(exc: Exception, org_id: int, stats: dict) -> bool:
+    """Сбой фоновой догрузки истории при уже работающем сервисе (минор 10)."""
+    return (isinstance(exc, SyncInterrupted)
+            and str(stats.get("phase") or "") == "history"
+            and _connection_status(org_id) == "active")
 
 
 class SyncInterrupted(Exception):
@@ -456,13 +735,50 @@ def error_cause(exc: Exception) -> str:
     return "internal"
 
 
+def _interrupted_message(exc: Exception, coverage: int) -> SyncInterrupted:
+    """Текст для прерванной прогрессивной загрузки (деплой П1, п. A.6)."""
+    cause = error_cause(exc)
+    head = f"История загружена за {coverage} дней из {HISTORY_DAYS}"
+    if cause == "token":
+        # Ревью 21.08: «нажмите ещё раз» при 401/403 бессмысленно — сначала токен.
+        return SyncInterrupted(
+            f"{head} — МойСклад не принял токен доступа. Проверьте токен в "
+            "настройках: после исправления загрузка продолжится автоматически.",
+            cause)
+    if _is_rate_limited(exc):
+        hint = "МойСклад ограничил частоту запросов."
+    elif cause == "internal":
+        hint = "Внутренняя ошибка — мы уже смотрим."
+    else:
+        hint = _human_error(exc)
+    return SyncInterrupted(
+        f"{head} — продолжим автоматически в течение часа. {hint}", cause)
+
+
+# ── Хронометраж этапов (панель «Подробнее») ──────────────────────────────────
+
+def _stage_begin(stats: dict, key: str) -> None:
+    stats.setdefault("stage_times", {})[key] = {"start": time.time()}
+
+
+def _stage_end(stats: dict, key: str) -> None:
+    t = stats.setdefault("stage_times", {}).setdefault(key, {"start": time.time()})
+    t["end"] = time.time()
+
+
+def _stage_skip(stats: dict, key: str) -> None:
+    """Этап не нужен в этом запуске (продолжение): done с нулевой длительностью."""
+    now = time.time()
+    stats.setdefault("stage_times", {})[key] = {"start": now, "end": now, "skipped": True}
+
+
 # ── Основной прогон ──────────────────────────────────────────────────────────
 
 async def _run_sync(org_id: int, mode: str, resume_from: str | None = None,
                     prev_fp: str = "") -> None:
-    """Полный прогон синка. resume_from — дата, до которой (включительно) история
-    остатков уже записана прерванным первичным синком: качаем дальше без wipe
-    (только если prev_fp — отпечаток складов/окна той загрузки — совпадает).
+    """Полный прогон синка. resume_from — самая старая дата, до которой история
+    остатков уже записана прерванным первичным синком: качаем дальше НАЗАД без
+    wipe (только если prev_fp — отпечаток складов/окна той загрузки — совпадает).
     """
     db = SessionLocal()
     try:
@@ -490,23 +806,25 @@ async def _run_sync(org_id: int, mode: str, resume_from: str | None = None,
     stats: dict = {k: v for k, v in (get_status(org_id).get("stats") or {}).items()
                    if k in _CARRIED_STATS}
     stats["mode"] = mode
+    stats["warehouses"] = [w.name for w in active_wh]
+    initial = mode == "initial"
+    if initial:
+        stats["phase"] = "products"
     # Аудит 18.08: инкремент раньше качал ровно 1 день остатков и 3 дня продаж
     # НЕЗАВИСИМО от того, сколько сервис простоял — простой >3 суток оставлял
     # невосполнимые дыры. Теперь окно растягивается по фактическому разрыву
     # с последнего УСПЕШНОГО синка (+1 день перекрытия), в пределах HISTORY_DAYS.
     gap_days = 0
-    if mode != "initial" and conn.last_sync_at is not None:
-        gap_days = max(0, (date.today() - conn.last_sync_at.date()).days)
-    history_days = HISTORY_DAYS if mode == "initial" else min(HISTORY_DAYS, max(1, gap_days + 1))
-    sales_days = HISTORY_DAYS if mode == "initial" else min(
-        HISTORY_DAYS, max(SALES_RESYNC_DAYS, gap_days + 1))
+    if not initial and conn.last_sync_at is not None:
+        gap_days = max(0, (_today() - conn.last_sync_at.date()).days)
     if gap_days > 1:
         stats["gap_days"] = gap_days
 
     async with MoySkladClient(token) as client:
         # ── Этап 1: товары ──────────────────────────────────────────────────
-        _set_state(org_id, stage="products", progress=1.0,
-                   detail="Загружаем ассортимент (товары и размеры)…")
+        _stage_begin(stats, "products")
+        _persist(org_id, stats, stage="products", progress=1.0,
+                 detail="Загружаем ассортимент (товары и размеры)…")
         assortment = await client.fetch_assortment()
         # Имена контрагентов: в ассортименте у товара только ссылка на
         # поставщика, а правило распределения по производствам работает с именем.
@@ -523,77 +841,51 @@ async def _run_sync(org_id: int, mode: str, resume_from: str | None = None,
         _load_price_types(org_id)
         stats["price_types"] = price_type_names(assortment)[:20]
         ext_to_pid = _upsert_products(org_id, assortment, stats)
-        _set_state(org_id, stage="products", progress=8.0,
-                   detail=f"Товары обновлены: {stats['products_total']} позиций",
-                   stats_json=json.dumps(stats, ensure_ascii=False))
+        _stage_end(stats, "products")
+        _persist(org_id, stats, stage="products", progress=5.0 if initial else 8.0,
+                 detail=f"Товары обновлены: {stats['products_total']} позиций")
 
-        # ── Этап 2: история остатков ────────────────────────────────────────
-        today = date.today()
-        dates = [
-            (today - timedelta(days=offset)).isoformat()
-            for offset in range(history_days - 1, -1, -1)
-        ]
-        fingerprint = _resume_fingerprint(active_wh)
-        if (mode == "initial" and resume_from and _has_stock_rows(org_id)
-                and resume_from >= dates[0] and prev_fp == fingerprint):
-            # Продолжение прерванной загрузки (инцидент 21.08): со следующей
-            # даты после записанной; сегодня перекачиваем всегда — из него
-            # строится warehouse_stock. Ревью 21.08: точка старше окна или
-            # записанная при другом наборе складов/окне — не продолжаем,
-            # а пересобираем с нуля.
-            dates = [d for d in dates if d > resume_from] or [today.isoformat()]
-            stats["resumed_from"] = resume_from
-            # Точку продолжения сохраняем СРАЗУ: если и этот запуск упадёт до
-            # первого чанка (429 на первом запросе, 401 после смены токена),
-            # следующий всё равно продолжит, а не сделает инкремент над дырой.
-            stats["stock_loaded_until"] = resume_from
-            stats["resume_fp"] = fingerprint
-            _set_state(org_id, stats_json=json.dumps(stats, ensure_ascii=False))
-        else:
-            resume_from = None
-        # Свежая/принудительная пересборка: прежние stock_loaded_until/resume_fp/
-        # needs_full_rebuild живут до первого реального wipe в _flush (там и
-        # снимаются), новый отпечаток пишется с первого чанка.
         try:
-            await _sync_stock_history(org_id, client, active_wh, dates, ext_to_pid,
-                                      stats, initial=(mode == "initial"),
-                                      resume_from=resume_from)
-
-            # ── Этап 3: продажи ─────────────────────────────────────────────
-            await _sync_sales(org_id, client, active_wh, sales_days, ext_to_pid,
-                              stats, initial=(mode == "initial"))
-
-            # ── Этап 4: «едет к нам» из МС (заказы поставщику) ──────────────
-            await _sync_incoming(org_id, client, ext_to_pid, stats)
+            if initial:
+                await _run_initial(org_id, client, active_wh, ext_to_pid, stats,
+                                   resume_from, prev_fp)
+            else:
+                await _run_incremental(org_id, client, active_wh, ext_to_pid, stats,
+                                       gap_days)
         except Exception as exc:  # noqa: BLE001 — фиксируем прогресс и пробрасываем
             stats["ms_client"] = dict(client.stats)
-            loaded_until = stats.get("stock_loaded_until") or resume_from
-            if mode != "initial" or not loaded_until:
-                _set_state(org_id, stats_json=json.dumps(stats, ensure_ascii=False))
+            loaded_from = stats.get("history_loaded_from")
+            if not initial or not loaded_from:
+                _persist(org_id, stats)
                 raise
-            # Часть новой истории уже записана — сохраняем точку для продолжения
-            # и объясняем пользователю, что ничего не потеряно.
-            stats["stock_loaded_until"] = loaded_until
-            _set_state(org_id, stats_json=json.dumps(stats, ensure_ascii=False))
-            cause = error_cause(exc)
-            if cause == "token":
-                # Ревью 21.08: «нажмите ещё раз» при 401/403 бессмысленно —
-                # сначала токен; точка продолжения при этом сохранена.
-                raise SyncInterrupted(
-                    f"Загрузка прервана на {loaded_until}: {_human_error(exc)} "
-                    "Загруженное сохранено — после исправления токена загрузка "
-                    "продолжится с этой даты.", cause) from exc
-            reason = ("МойСклад ограничил частоту запросов." if _is_rate_limited(exc)
-                      else _human_error(exc))
-            raise SyncInterrupted(
-                f"Загрузка прервана на {loaded_until}: {reason} Загруженное "
-                "сохранено — нажмите «Синхронизировать» ещё раз, загрузка продолжится.",
-                cause) from exc
+            # Часть новой истории уже записана — точка продолжения (и покрытие)
+            # уже в stats; объясняем пользователю, что ничего не потеряно.
+            _persist(org_id, stats)
+            raise _interrupted_message(exc, _coverage_days(org_id)) from exc
         stats["ms_client"] = dict(client.stats)
 
     # ── Финализация ─────────────────────────────────────────────────────────
     _set_state(org_id, stage="finalize", progress=98.0,
                detail="Пересчитываем аналитику…")
+    _activate_connection(org_id)
+    analytics.invalidate(org_id)
+    stats.pop("history_loaded_from", None)  # всё загружено — точка продолжения не нужна
+    stats.pop("history_loaded_to", None)
+    stats.pop("window_done", None)
+    stats.pop("resume_fp", None)
+    stats.pop("needs_full_rebuild", None)  # (stats_json перезаписывается — флаг снят)
+    if initial:
+        stats["coverage_days"] = HISTORY_DAYS
+    _persist(
+        org_id, stats,
+        state="done", stage="done", progress=100.0,
+        detail="Синхронизация завершена",
+        finished_at=datetime.utcnow(), fail_streak=0, alerted_streak=0,
+    )
+
+
+def _activate_connection(org_id: int) -> None:
+    """connection.status='active' + last_sync_at=now (идемпотентно, статус не понижается)."""
     db = SessionLocal()
     try:
         conn = db.execute(
@@ -607,17 +899,267 @@ async def _run_sync(org_id: int, mode: str, resume_from: str | None = None,
         db.commit()
     finally:
         db.close()
+
+
+def _finalize_lite(org_id: int, stats: dict, loaded_from: str, active_wh: list,
+                   progress: float) -> None:
+    """Деплой П1: сервис открывается на частичной истории.
+
+    Подключение становится active, кэш аналитики сбрасывается, в stats —
+    покрытие и точка продолжения; sync_state остаётся running (stage=history).
+    """
+    _activate_connection(org_id)
     analytics.invalidate(org_id)
-    stats.pop("stock_loaded_until", None)  # всё загружено — точка продолжения не нужна
-    stats.pop("resume_fp", None)
-    stats.pop("needs_full_rebuild", None)  # (stats_json перезаписывается — флаг снят)
-    _set_state(
-        org_id,
-        state="done", stage="done", progress=100.0,
-        detail="Синхронизация завершена",
-        stats_json=json.dumps(stats, ensure_ascii=False),
-        finished_at=datetime.utcnow(), fail_streak=0, alerted_streak=0,
-    )
+    stats["history_loaded_from"] = loaded_from
+    stats["resume_fp"] = _resume_fingerprint(active_wh)
+    stats["coverage_days"] = _days_since(loaded_from)
+    stats["phase"] = "history"
+    _persist(org_id, stats, stage="history", progress=progress,
+             detail=f"Сервис готов: {stats['coverage_days']} дн. истории; "
+                    "догружаем остальное фоном")
+
+
+async def _run_initial(org_id: int, client: MoySkladClient, active_wh: list,
+                       ext_to_pid: dict[str, int], stats: dict,
+                       resume_from: str | None, prev_fp: str) -> None:
+    """Фазы today → month → finalize-lite → history (см. docstring модуля)."""
+    today = _today()
+    today_iso = _iso(today)
+    all_dates = [_iso(today - timedelta(days=off)) for off in range(HISTORY_DAYS - 1, -1, -1)]
+    oldest = all_dates[0]
+    fingerprint = _resume_fingerprint(active_wh)
+    unmatched: set[str] = set()
+    stats["stock_dates"] = 0
+    stats["stock_rows"] = 0
+    stats["stock_zeroed"] = 0
+
+    if resume_from and resume_from < oldest:
+        # Ревью 21.08 (минор 7): точка СТАРШЕ окна («упали на самом старом
+        # чанке, продолжили назавтра») значит «всё окно уже загружено» —
+        # раньше это уводило в полную пересборку и выбрасывало ~364 верных дня.
+        # Прижимаем к началу окна: остаётся обновить сегодня и закрыть загрузку.
+        resume_from = oldest
+    resumed = bool(resume_from and _has_stock_rows(org_id)
+                   and prev_fp == fingerprint)
+    # Ревью 21.08: точка, записанная при другом наборе складов/окне, — не
+    # продолжаем, а пересобираем с нуля (прежние history_loaded_from/
+    # resume_fp/needs_full_rebuild живут до реального wipe в фазе today).
+    activated = False
+    window = min(INITIAL_WINDOW_DAYS, HISTORY_DAYS)
+
+    # ── Фаза today: остатки на сегодня ──────────────────────────────────────
+    stats["phase"] = "today"
+    _stage_begin(stats, "today")
+    if resumed:
+        stats["resumed_from"] = resume_from
+        # Точку продолжения сохраняем СРАЗУ: если и этот запуск упадёт до
+        # первого чанка (429 на первом запросе, 401 после смены токена),
+        # следующий всё равно продолжит, а не сделает инкремент над дырой.
+        stats["history_loaded_from"] = resume_from
+        stats["resume_fp"] = fingerprint
+        # Ревью 21.08 (мажор 1): «сегодня» прерванного запуска могло быть
+        # НЕСКОЛЬКО ДНЕЙ НАЗАД (упали 18-го, продолжаем 21-го). Догружаем весь
+        # хвост [history_loaded_to+1 … сегодня] ХРОНОЛОГИЧЕСКИ — с явными
+        # нулями от последней записанной даты, ровно как прямой проход; раньше
+        # качался только «сегодня», а промежуточные дни терялись навсегда,
+        # хотя загрузка объявляла coverage_days=HISTORY_DAYS и state=done.
+        loaded_to = str(stats.get("history_loaded_to") or today_iso)
+        loaded_to = min(max(loaded_to, resume_from), today_iso)
+        gap_dates = [_iso(d) for d in _dates_between(_day_after(loaded_to), today_iso)]
+        if not gap_dates:
+            gap_dates = [today_iso]
+        _persist(org_id, stats, stage="today", progress=6.0,
+                 detail=("Обновляем остатки на сегодня…" if len(gap_dates) == 1
+                         else f"Догружаем остатки за пропущенные "
+                              f"{len(gap_dates)} дн.…"))
+        day_results = await _fetch_dates(client, active_wh, gap_dates, ext_to_pid, unmatched)
+        prev_positive = _positive_before(org_id, gap_dates[0])
+        batch, zeroed = _rows_for_dates(org_id, gap_dates, day_results, prev_positive)
+        _write_stock_rows(org_id, gap_dates, batch)
+        stats["stock_zeroed"] += zeroed
+        stats["history_loaded_to"] = today_iso
+        stats["stock_dates"] += len(gap_dates) - 1
+    else:
+        stats.pop("resumed_from", None)
+        _persist(org_id, stats, stage="today", progress=6.0,
+                 detail="Загружаем остатки на сегодня…")
+        day_results = await _fetch_dates(client, active_wh, [today_iso], ext_to_pid, unmatched)
+        batch, _ = _rows_for_dates(org_id, [today_iso], day_results, set())
+        # Первая удачная загрузка скачана — только теперь стираем старую историю
+        # (инвариант 18.08) и ставим точку продолжения «с сегодня»: провал на
+        # любой следующей фазе продолжится назад, а не инкрементом над дырой.
+        _write_stock_rows(org_id, [today_iso], batch, wipe=True)
+        stats.pop("needs_full_rebuild", None)
+        stats.pop("window_done", None)  # история стёрта — окно надо набрать заново
+        stats["history_loaded_from"] = today_iso
+        stats["history_loaded_to"] = today_iso
+        stats["resume_fp"] = fingerprint
+        stats["coverage_days"] = 1
+    _, by_wh = day_results[today_iso]
+    _write_warehouse_stock(org_id, by_wh, stats)
+    stats["stock_dates"] += 1
+    stats["stock_rows"] += len(batch)
+    _stage_end(stats, "today")
+    _persist(org_id, stats, stage="today", progress=10.0,
+             detail="Остатки на сегодня обновлены")
+
+    # ── Фаза month: окно быстрого старта ────────────────────────────────────
+    if resumed:
+        _stage_skip(stats, "month")
+        remaining = [d for d in all_dates if d < resume_from]
+        # Ревью 21.08 (мажор 2): продажи окна могли не доехать (запуск упал
+        # между записью остатков окна и продажами) — точка продолжения при
+        # этом уже опубликована, и раньше фаза month пропускалась НАВСЕГДА:
+        # до 30 дней продаж оставались пустыми, а синк рапортовал done.
+        # window_done ставится только после успешных продаж И «едет к нам».
+        heal_from = gap_dates[0] if len(gap_dates) > 1 else None
+        if not stats.get("window_done"):
+            # Ревью 21.08 (повторное): догон начинается от СТАРОГО начала окна
+            # (resume_from), а не от окна, пересчитанного на сегодняшнюю дату.
+            # Иначе при продолжении через N дней терялось ровно N дней продаж:
+            # незагруженным остаётся отрезок [history_loaded_from … today],
+            # а all_dates[-window] за эти дни уехал вперёд. Стоимость догона
+            # ограничена: пустой window_done означает, что ни один чанк ещё не
+            # отработал, то есть resume_from не старше окна на момент падения.
+            heal_from = min(heal_from, resume_from) if heal_from else resume_from
+        if heal_from:
+            _persist(org_id, stats, stage="month", progress=11.0,
+                     detail=f"Догружаем продажи с {heal_from}…")
+            await _sync_sales(org_id, client, active_wh, ext_to_pid, stats,
+                              initial=True, date_from=heal_from, date_to=today_iso,
+                              replace_all=False, progress=(11.0, 20.0))
+            if not stats.get("window_done"):
+                await _sync_incoming(org_id, client, ext_to_pid, stats,
+                                     progress=(20.0, 24.0))
+                stats["window_done"] = True
+        if _days_since(resume_from) >= INITIAL_WINDOW_DAYS or not remaining:
+            _finalize_lite(org_id, stats, resume_from, active_wh, progress=25.0)
+            activated = True
+    else:
+        stats["phase"] = "month"
+        _stage_begin(stats, "month")
+        w_start = all_dates[-window]
+        month_dates = all_dates[-window:]
+        stats["window_days"] = window
+        _persist(org_id, stats, stage="month", progress=11.0,
+                 detail=f"Загружаем остатки за последние {window} дн.…")
+        if len(month_dates) > 1:
+            day_results.update(await _fetch_dates(
+                client, active_wh, month_dates[:-1], ext_to_pid, unmatched))
+        batch, zeroed = _rows_for_dates(org_id, month_dates, day_results, set())
+        _write_stock_rows(org_id, month_dates, batch)  # «сегодня» перезаписывается с нулями
+        stats["stock_dates"] += len(month_dates) - 1
+        stats["stock_rows"] += len(batch)
+        stats["stock_zeroed"] += zeroed
+        stats["history_loaded_from"] = w_start
+        stats["coverage_days"] = window
+        _persist(org_id, stats, stage="month", progress=16.0,
+                 detail=f"Загружаем продажи за последние {window} дн.…")
+        await _sync_sales(org_id, client, active_wh, ext_to_pid, stats, initial=True,
+                          date_from=w_start, date_to=today_iso, replace_all=True,
+                          progress=(16.0, 21.0))
+        stats["window_sales_docs"] = stats.get("sales_docs")
+        stats["window_sales_rows"] = stats.get("sales_rows")
+        stats["window_return_rows"] = stats.get("return_rows")
+        await _sync_incoming(org_id, client, ext_to_pid, stats, progress=(21.0, 24.0))
+        # Мажор 2: окно закрыто ЦЕЛИКОМ (остатки + продажи + «едет») — только
+        # теперь продолжение вправе пропустить фазу month.
+        stats["window_done"] = True
+        _stage_end(stats, "month")
+        _finalize_lite(org_id, stats, w_start, active_wh, progress=25.0)
+        activated = True
+        remaining = [d for d in all_dates if d < w_start]
+
+    # ── Фаза history: назад чанками ─────────────────────────────────────────
+    stats["phase"] = "history"
+    _stage_begin(stats, "history")
+    chunks: list[list[str]] = []
+    end = len(remaining)
+    while end > 0:
+        start = max(0, end - STOCK_CHUNK_DATES)
+        chunks.append(remaining[start:end])  # хронологически внутри, новые чанки первыми
+        end = start
+    stats["history_chunks_total"] = len(chunks)
+    stats["history_chunks_done"] = 0
+    stats["history_dates"] = 0
+    stats["history_seconds"] = 0.0
+    if chunks:
+        _persist(org_id, stats, stage="history", progress=25.0,
+                 detail=f"Загружаем историю: 0/{len(chunks)} частей")
+    for chunk in chunks:
+        t0 = time.monotonic()
+        hits_429_before = client.stats.get("429", 0)
+        day_results = await _fetch_dates(client, active_wh, chunk, ext_to_pid, unmatched)
+        batch, zeroed = _rows_for_dates(org_id, chunk, day_results, set())
+        _write_stock_rows(org_id, chunk, batch, boundary_next=_day_after(chunk[-1]))
+        # Ревью 21.08 (минор 6): сбрасываем кэш СРАЗУ после записи остатков —
+        # продажи чанка качаются ещё десятки секунд, и открытая в этот момент
+        # страница закэшировала бы снапшот «новые дни в стоке + старые продажи»
+        # (заниженная оборачиваемость) до следующего сброса.
+        analytics.invalidate(org_id)
+        await _sync_sales(org_id, client, active_wh, ext_to_pid, stats, initial=True,
+                          date_from=chunk[0], date_to=chunk[-1], replace_all=False)
+        stats["history_loaded_from"] = chunk[0]
+        stats["coverage_days"] = _days_since(chunk[0])
+        stats["history_chunks_done"] += 1
+        stats["history_dates"] += len(chunk)
+        stats["history_seconds"] = round(stats["history_seconds"] + (time.monotonic() - t0), 2)
+        stats["stock_dates"] += len(chunk)
+        stats["stock_rows"] += len(batch)
+        stats["stock_zeroed"] += zeroed
+        analytics.invalidate(org_id)
+        if not activated and stats["coverage_days"] >= INITIAL_WINDOW_DAYS:
+            # Продолжение у ещё не активированного подключения (провал до
+            # finalize-lite): окно набрано — открываем сервис.
+            _activate_connection(org_id)
+            activated = True
+        done_n, total_n = stats["history_chunks_done"], stats["history_chunks_total"]
+        # stats_json пишем каждым чанком: если процесс убьют (деплой, OOM),
+        # reset_stale_running оставит state=error с history_loaded_from —
+        # и следующий запуск продолжит, а не начнёт заново.
+        _persist(org_id, stats, stage="history",
+                 progress=25.0 + 73.0 * done_n / total_n,
+                 detail=f"История: {stats['coverage_days']} дн. из {HISTORY_DAYS} "
+                        f"({done_n}/{total_n} частей)")
+        if (client.stats.get("429", 0) > hits_429_before
+                and done_n < total_n and CHUNK_PAUSE_SECONDS > 0):
+            # Лимит только что закрывался — дадим ему восстановиться,
+            # прежде чем выпускать следующую пачку запросов.
+            await asyncio.sleep(CHUNK_PAUSE_SECONDS)
+    _stage_end(stats, "history")
+    if not activated:
+        _activate_connection(org_id)
+    if unmatched:
+        stats["stock_unmatched_skus"] = len(unmatched)
+
+
+async def _run_incremental(org_id: int, client: MoySkladClient, active_wh: list,
+                           ext_to_pid: dict[str, int], stats: dict, gap_days: int) -> None:
+    """Инкремент: остатки за окно разрыва (обычно сегодня), продажи за SYNC_DAYS_BACK."""
+    today = _today()
+    history_days = min(HISTORY_DAYS, max(1, gap_days + 1))
+    sales_days = min(HISTORY_DAYS, max(SALES_RESYNC_DAYS, gap_days + 1))
+    dates = [_iso(today - timedelta(days=off)) for off in range(history_days - 1, -1, -1)]
+    unmatched: set[str] = set()
+    _set_state(org_id, stage="stock_today", progress=12.0,
+               detail="Обновляем остатки на сегодня…")
+    day_results = await _fetch_dates(client, active_wh, dates, ext_to_pid, unmatched)
+    prev_positive = _positive_before(org_id, dates[0])
+    batch, zeroed = _rows_for_dates(org_id, dates, day_results, prev_positive)
+    _write_stock_rows(org_id, dates, batch)
+    _, by_wh = day_results[dates[-1]]
+    _write_warehouse_stock(org_id, by_wh, stats)
+    stats["stock_dates"] = len(dates)
+    stats["stock_rows"] = len(batch)
+    stats["stock_zeroed"] = zeroed
+    if unmatched:
+        stats["stock_unmatched_skus"] = len(unmatched)
+    _set_state(org_id, stage="stock_today", progress=40.0,
+               detail="Остатки на сегодня обновлены")
+    await _sync_sales(org_id, client, active_wh, ext_to_pid, stats, initial=False,
+                      date_from=_iso(today - timedelta(days=sales_days - 1)),
+                      date_to=None, replace_all=False, progress=(50.0, 90.0))
+    await _sync_incoming(org_id, client, ext_to_pid, stats, progress=(95.5, 97.0))
 
 
 def _has_stock_rows(org_id: int) -> bool:
@@ -993,191 +1535,124 @@ async def _fetch_day_stock(client: MoySkladClient, active_wh: list[Warehouse],
     return totals, by_wh
 
 
-async def _sync_stock_history(org_id: int, client: MoySkladClient,
-                              active_wh: list[Warehouse], dates: list[str],
-                              ext_to_pid: dict[str, int], stats: dict,
-                              initial: bool, resume_from: str | None = None) -> None:
-    """stock_days по датам + warehouse_stock на последнюю дату.
+async def _fetch_dates(client: MoySkladClient, active_wh: list[Warehouse],
+                       dates: list[str], ext_to_pid: dict[str, int],
+                       unmatched: set[str]) -> dict[str, tuple[dict, dict]]:
+    """ПАРАЛЛЕЛЬНАЯ загрузка остатков за список дат: {date: (totals, by_wh)}.
 
-    Явные нули — правило из legacy sync.py: позиция с прошлым остатком >0,
-    отсутствующая в отчёте текущей даты, получает qty=0.
-
-    Инцидент 21.08: раньше ВСЕ даты качались в память и только потом писались.
-    Три подряд падения на ~110-й дате из 365 (429 от МойСклада) каждый раз
-    теряли 4 минуты загрузки целиком. Теперь даты идут хронологическими чанками
-    по STOCK_CHUNK_DATES: чанк скачан (параллельно, под лимитером) → сразу
-    явные нули + запись. Семантика аудита 18.08 сохранена: старая история
-    стирается в первом _flush первого чанка, т.е. только после первой удачной
-    загрузки. СЛЕДСТВИЕ: сбой на середине в initial-режиме оставляет ЧАСТИЧНУЮ
-    новую историю (от начала окна до последнего записанного чанка). Смягчение:
-    при любом исключении в stats фиксируется stock_loaded_until = последняя
-    полностью записанная дата; _run_sync превращает это в понятное сообщение,
-    а следующий запуск (resume_from) продолжает с соседней даты без wipe.
+    Все пары дата×склад отдаются пулу сразу, темп ограничивает RateLimiter
+    клиента (тяжёлые отчёты — через узкий семафор). Один запрос исчерпал
+    ретраи — соседей гасим, а не даём им дальше молотить уже закрытый лимит
+    (инцидент 21.08).
     """
-    unmatched: set[str] = set()
-    written = zeroed = 0
+    async def _one_day(day_iso: str):
+        return day_iso, await _fetch_day_stock(client, active_wh, day_iso, ext_to_pid, unmatched)
 
+    tasks = [asyncio.ensure_future(_one_day(d)) for d in dates]
+    try:
+        return dict(await asyncio.gather(*tasks))
+    except BaseException:
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+
+
+def _positive_before(org_id: int, day_iso: str) -> set[int]:
+    """Позиции с остатком >0 на последнюю записанную дату ДО day_iso (prev для нулей)."""
     db = SessionLocal()
     try:
-        if initial and not resume_from:
-            # Полная пересборка: prev с нуля. Старая история НЕ стирается здесь
-            # (аудит 18.08): раньше delete+commit шли ДО многоминутной загрузки
-            # из МойСклада, и любой сбой (таймаут, 401, 429) оставлял клиента
-            # вовсе без истории. Теперь чистка отложена в первый _flush первого
-            # чанка, когда его данные уже скачаны и лежат в памяти.
-            prev_positive: set[int] = set()
-        else:
-            # Инкремент / продолжение: prev = последняя дата ДО первой из окна.
-            first_day = dates[0]
-            if resume_from:
-                # Защита от дублей: хвост за точкой продолжения (частичный
-                # батч чанка, перекачиваемое «сегодня») перезаписывается.
-                db.execute(delete(StockDay).where(
-                    StockDay.org_id == org_id, StockDay.date >= first_day))
-                db.commit()
-            prev_date = db.execute(
-                select(StockDay.date)
-                .where(StockDay.org_id == org_id, StockDay.date < first_day)
-                .order_by(StockDay.date.desc())
-                .limit(1)
-            ).scalar()
-            prev_positive = set()
-            if prev_date:
-                prev_positive = {
-                    pid
-                    for pid, in db.execute(
-                        select(StockDay.product_id).where(
-                            StockDay.org_id == org_id,
-                            StockDay.date == prev_date,
-                            StockDay.qty > 0,
-                        )
-                    )
-                }
+        prev_date = db.execute(
+            select(StockDay.date)
+            .where(StockDay.org_id == org_id, StockDay.date < day_iso)
+            .order_by(StockDay.date.desc())
+            .limit(1)
+        ).scalar()
+        if not prev_date:
+            return set()
+        return {
+            pid for pid, in db.execute(
+                select(StockDay.product_id).where(
+                    StockDay.org_id == org_id,
+                    StockDay.date == prev_date,
+                    StockDay.qty > 0,
+                )
+            )
+        }
     finally:
         db.close()
 
-    total_dates = len(dates)
 
-    # ── Фаза 1 (внутри чанка): ПАРАЛЛЕЛЬНАЯ загрузка дат чанка ───────────────
-    # Даты качаются параллельно (все пары дата×склад чанка отдаются пулу сразу),
-    # темп ограничивает RateLimiter клиента (~12–15 rps, тяжёлые отчёты — через
-    # узкий семафор). Явные нули требуют последовательности prev→next, поэтому
-    # расчёт нулей и запись идут по готовым данным чанка хронологически.
-    async def _one_day(day_iso: str):
-        res = await _fetch_day_stock(client, active_wh, day_iso, ext_to_pid, unmatched)
-        return day_iso, res
+def _rows_for_dates(org_id: int, dates: list[str], day_results: dict,
+                    prev_positive: set[int]) -> tuple[list[dict], int]:
+    """Строки stock_days за даты (хронологически) с явными нулями.
 
-    async def _fetch_chunk(chunk: list[str]) -> dict:
-        tasks = [asyncio.ensure_future(_one_day(d)) for d in chunk]
-        try:
-            return dict(await asyncio.gather(*tasks))
-        except BaseException:
-            # Один запрос исчерпал ретраи — соседей гасим, а не даём им
-            # дальше молотить уже закрытый лимит (инцидент 21.08).
-            for t in tasks:
-                t.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            raise
-
-    # ── Фаза 2 (внутри чанка): явные нули + запись (хронологически) ──────────
-    last_by_wh: dict[int, dict[int, float]] = {}
+    Явные нули — правило из legacy sync.py: позиция с прошлым остатком >0,
+    отсутствующая в отчёте текущей даты, получает qty=0. prev_positive —
+    положительные позиции на дату перед первой (пустое множество — нулей в
+    первый день не будет; для чанка истории их добавит граничная заплатка
+    следующего чанка).
+    """
     batch: list[dict] = []
-    batch_days: list[str] = []
-    need_wipe = initial and not resume_from  # чистка старой истории — в одной
-    # транзакции с первой вставкой новой (первый чанк уже успешно скачан)
+    zeroed = 0
+    for day_iso in dates:
+        totals, _ = day_results[day_iso]
+        for pid, qty in totals.items():
+            batch.append({"org_id": org_id, "product_id": pid, "date": day_iso, "qty": qty})
+        for gone in prev_positive - set(totals):
+            batch.append({"org_id": org_id, "product_id": gone, "date": day_iso, "qty": 0.0})
+            zeroed += 1
+        prev_positive = {pid for pid, qty in totals.items() if qty > 0}
+    return batch, zeroed
 
-    def _flush() -> None:
-        nonlocal batch, batch_days, need_wipe
-        if not batch and (initial or not batch_days) and not need_wipe:
-            # Ревью 21.08: при need_wipe пустой батч НЕ пропускаем — первый чанк
-            # скачан успешно (инвариант 18.08 соблюдён), а без чистки старые
-            # строки пережили бы запуск и отравили бы точку продолжения.
-            batch_days = []
-            return
-        db = SessionLocal()
-        try:
-            if need_wipe:
-                db.execute(delete(StockDay).where(StockDay.org_id == org_id))
-                # Старая история реально стёрта — прежняя точка продолжения и
-                # флаг пересборки больше не актуальны (новый отпечаток ниже).
-                stats.pop("stock_loaded_until", None)
-                stats.pop("needs_full_rebuild", None)
-            if not initial and batch_days:
-                db.execute(delete(StockDay).where(
-                    StockDay.org_id == org_id, StockDay.date.in_(batch_days)
-                ))
-            if batch:
-                db.execute(insert(StockDay), batch)
-            db.commit()
-            need_wipe = False
-        finally:
-            db.close()
-        batch = []
-        batch_days = []
 
-    done_count = 0
-    # При исключении stock_loaded_until уже указывает на последний целиком
-    # записанный чанк (или отсутствует) — _run_sync сохранит его в stats.
-    for start in range(0, total_dates, STOCK_CHUNK_DATES):
-        chunk = dates[start:start + STOCK_CHUNK_DATES]  # хронологически
-        hits_429_before = client.stats.get("429", 0)
-        day_results = await _fetch_chunk(chunk)
-        for day_iso in chunk:
-            totals, by_wh = day_results[day_iso]
-            for pid, qty in totals.items():
-                batch.append({"org_id": org_id, "product_id": pid,
-                              "date": day_iso, "qty": qty})
-            # Явный ноль для распроданных: были >0, из отчёта исчезли.
-            for gone in prev_positive - set(totals):
-                batch.append({"org_id": org_id, "product_id": gone,
-                              "date": day_iso, "qty": 0.0})
-                zeroed += 1
-            written += len(totals) + len(prev_positive - set(totals))
-            batch_days.append(day_iso)
-            prev_positive = {pid for pid, qty in totals.items() if qty > 0}
-            last_by_wh = by_wh
-            if len(batch) >= 20_000:
-                _flush()
-        _flush()
-        if initial:
-            stats["stock_loaded_until"] = chunk[-1]  # чанк записан целиком
-            stats["resume_fp"] = _resume_fingerprint(active_wh)
-        done_count += len(chunk)
-        if initial:
-            # stats_json пишем каждым чанком: если процесс убьют (деплой, OOM),
-            # reset_stale_running оставит state=error с stock_loaded_until —
-            # и следующий запуск продолжит, а не начнёт заново.
-            progress = 8.0 + 56.0 * done_count / total_dates
-            _set_state(org_id, stage="stock_history", progress=progress,
-                       detail=f"История остатков: {done_count}/{total_dates} дат",
-                       stats_json=json.dumps(stats, ensure_ascii=False))
-        if (client.stats.get("429", 0) > hits_429_before
-                and done_count < total_dates and CHUNK_PAUSE_SECONDS > 0):
-            # Лимит только что закрывался — дадим ему восстановиться,
-            # прежде чем выпускать следующую пачку запросов.
-            await asyncio.sleep(CHUNK_PAUSE_SECONDS)
-    if need_wipe:
-        # Ревью 18.08: все даты всех чанков оказались пустыми (например,
-        # аккаунт МС опустел) — _flush ни разу не вставлял и wipe не сработал. Загрузка
-        # успешна, «пусто» — тоже результат: фиксируем его, иначе останется
-        # смесь старой истории с новыми пустыми продажами/остатками.
-        db = SessionLocal()
-        try:
+def _write_stock_rows(org_id: int, dates: list[str], batch: list[dict], *,
+                      wipe: bool = False, boundary_next: str | None = None) -> None:
+    """Одна транзакция: (wipe всей истории | delete дат) + insert + граничная заплатка.
+
+    wipe=True — полная пересборка: старая история стирается здесь, когда новые
+    данные уже скачаны (инвариант 18.08). Иначе даты диапазона перезаписываются
+    (защита от дублей при продолжении/инкременте).
+
+    boundary_next — дата D = dates[-1]+1, уже записанная более новым чанком
+    (деплой П1): D получает qty=0 для позиций, которые были >0 на dates[-1] и
+    не имеют строки на D — ровно то, что дал бы хронологический проход.
+    """
+    db = SessionLocal()
+    try:
+        if wipe:
             db.execute(delete(StockDay).where(StockDay.org_id == org_id))
-            db.commit()
-            need_wipe = False
-            stats.pop("needs_full_rebuild", None)
-        finally:
-            db.close()
+        elif dates:
+            db.execute(delete(StockDay).where(
+                StockDay.org_id == org_id,
+                StockDay.date >= dates[0], StockDay.date <= dates[-1]))
+        if batch:
+            db.execute(insert(StockDay), batch)
+        if boundary_next and dates:
+            last = dates[-1]
+            positive_last = {r["product_id"] for r in batch
+                             if r["date"] == last and r["qty"] > 0}
+            if positive_last:
+                present = {
+                    pid for pid, in db.execute(
+                        select(StockDay.product_id).where(
+                            StockDay.org_id == org_id, StockDay.date == boundary_next))
+                }
+                patch = [{"org_id": org_id, "product_id": pid, "date": boundary_next, "qty": 0.0}
+                         for pid in positive_last - present]
+                if patch:
+                    db.execute(insert(StockDay), patch)
+        db.commit()
+    finally:
+        db.close()
 
-    if not initial:
-        _set_state(org_id, stage="stock_today", progress=40.0,
-                   detail="Остатки на сегодня обновлены")
 
-    # Текущие остатки по складам — из последней даты (сегодня).
+def _write_warehouse_stock(org_id: int, by_wh: dict[int, dict[int, float]],
+                           stats: dict) -> None:
+    """Текущие остатки по складам — из сегодняшнего отчёта (полная перезапись)."""
     wh_rows = [
         {"org_id": org_id, "product_id": pid, "warehouse_id": wh_id, "qty": qty}
-        for wh_id, wh_map in last_by_wh.items()
+        for wh_id, wh_map in by_wh.items()
         for pid, qty in wh_map.items()
         if qty
     ]
@@ -1189,13 +1664,7 @@ async def _sync_stock_history(org_id: int, client: MoySkladClient,
         db.commit()
     finally:
         db.close()
-
-    stats["stock_dates"] = total_dates
-    stats["stock_rows"] = written
-    stats["stock_zeroed"] = zeroed
     stats["warehouse_stock_rows"] = len(wh_rows)
-    if unmatched:
-        stats["stock_unmatched_skus"] = len(unmatched)
 
 
 # ── «Едет к нам» из МС: заказы поставщику ────────────────────────────────────
@@ -1218,7 +1687,8 @@ async def _full_positions(client: MoySkladClient, entity: str, doc: dict,
 
 
 async def _sync_incoming(org_id: int, client: MoySkladClient,
-                         ext_to_pid: dict[str, int], stats: dict) -> None:
+                         ext_to_pid: dict[str, int], stats: dict,
+                         progress: tuple[float, float] = (95.5, 97.0)) -> None:
     """entity/purchaseorder → ordered_qty.ms_qty (полная пересборка вклада МС).
 
     «Едет» по документу = Σ по позициям (quantity − shipped): shipped растёт
@@ -1230,9 +1700,9 @@ async def _sync_incoming(org_id: int, client: MoySkladClient,
     МойСклад»: их локальный вклад в qty снят при отправке (app/ms_writeback),
     двойного счёта нет.
     """
-    _set_state(org_id, stage="incoming", progress=95.5,
+    _set_state(org_id, stage="incoming", progress=progress[0],
                detail="Загружаем заказы поставщику («едет к нам»)…")
-    cutoff = (date.today() - timedelta(days=HISTORY_DAYS - 1)).isoformat()
+    cutoff = (_today() - timedelta(days=HISTORY_DAYS - 1)).isoformat()
     docs = await client.fetch_purchase_orders(cutoff)
 
     # product_id → base_name (агрегируем «едет» по базовому имени).
@@ -1296,7 +1766,7 @@ async def _sync_incoming(org_id: int, client: MoySkladClient,
     stats["incoming_qty"] = round(sum(incoming.values()))
     if unmatched:
         stats["incoming_unmatched_skus"] = len(unmatched)
-    _set_state(org_id, stage="incoming", progress=97.0,
+    _set_state(org_id, stage="incoming", progress=progress[1],
                detail=f"«Едет к нам»: {stats['incoming_qty']} шт "
                       f"из {open_docs} заказов поставщику")
 
@@ -1304,27 +1774,40 @@ async def _sync_incoming(org_id: int, client: MoySkladClient,
 # ── Продажи ──────────────────────────────────────────────────────────────────
 
 async def _sync_sales(org_id: int, client: MoySkladClient,
-                      active_wh: list[Warehouse], days_back: int,
-                      ext_to_pid: dict[str, int], stats: dict,
-                      initial: bool) -> None:
+                      active_wh: list[Warehouse], ext_to_pid: dict[str, int],
+                      stats: dict, initial: bool, *, date_from: str,
+                      date_to: str | None, replace_all: bool,
+                      progress: tuple[float, float] | None = None) -> None:
     """Продажи и возвраты из документов МойСклад → таблица sales.
 
     Документы: retaildemand (розница) + demand (отгрузки) — продажи,
     salesreturn — возвраты. Фильтр по выбранным складам (store документа).
     Выручка позиции — после скидки: price*qty*(1-discount/100), копейки → ₽.
-    Окно дат перезаписывается целиком (так legacy чинил дыры от опоздавших
-    документов).
+    Диапазон [date_from, date_to] (date_to=None — по сегодня) перезаписывается
+    целиком (так legacy чинил дыры от опоздавших документов); replace_all=True —
+    первичная загрузка окна: таблица очищается полностью.
+
+    Деплой П1: в initial зовётся на каждый чанк истории (диапазон чанка),
+    счётчики sales_docs/sales_rows/return_rows — накопительные за запуск.
     """
-    today = date.today()
-    cutoff = (today - timedelta(days=days_back - 1)).isoformat()
+    cutoff = date_from
     active_store_ids = {w.ext_id for w in active_wh}
 
-    base_progress = 70.0 if initial else 50.0
-    span = 25.0 if initial else 40.0
+    # progress=None — тихий режим (чанк истории): sync_state не трогаем.
+    base_progress, end_progress = progress or (0.0, 0.0)
+    span = end_progress - base_progress
 
     agg: dict[tuple[int, str, bool], list[float]] = {}
-    stats["sales_docs"] = 0
-    stats["sales_docs_skipped_store"] = 0
+    if replace_all or not initial:
+        stats["sales_docs"] = 0
+        stats["sales_docs_skipped_store"] = 0
+        stats["sales_rows"] = 0
+        stats["return_rows"] = 0
+    else:
+        stats.setdefault("sales_docs", 0)
+        stats.setdefault("sales_docs_skipped_store", 0)
+        stats.setdefault("sales_rows", 0)
+        stats.setdefault("return_rows", 0)
     # Аудит 18.08: добавлен retailsalesreturn — возврат по РОЗНИЧНОЙ продаже
     # в МойСкладе отдельная сущность, и без неё розничные возвраты не
     # синхронизировались вовсе (выручка и темп завышались). Тот же баг чинили
@@ -1333,13 +1816,15 @@ async def _sync_sales(org_id: int, client: MoySkladClient,
                 ("salesreturn", True), ("retailsalesreturn", True))
     # Три типа документов качаются ПАРАЛЛЕЛЬНО (пагинация каждого — последовательная,
     # но друг друга они не ждут) — ещё минус пара минут первого синка.
-    _set_state(org_id, stage="sales", progress=base_progress,
-               detail="Загружаем документы продаж (розница, отгрузки, возвраты)…")
+    if span:
+        _set_state(org_id, stage="sales", progress=base_progress,
+                   detail="Загружаем документы продаж (розница, отгрузки, возвраты)…")
     docs_lists = await asyncio.gather(
-        *[client.fetch_documents(entity, cutoff) for entity, _ in entities]
+        *[client.fetch_documents(entity, cutoff, date_to) for entity, _ in entities]
     )
-    _set_state(org_id, stage="sales", progress=base_progress + span * 0.8,
-               detail="Считаем продажи по документам…")
+    if span:
+        _set_state(org_id, stage="sales", progress=base_progress + span * 0.8,
+                   detail="Считаем продажи по документам…")
     for (entity, is_return), docs in zip(entities, docs_lists):
         for doc in docs:
             if doc.get("applicable") is False:
@@ -1352,7 +1837,7 @@ async def _sync_sales(org_id: int, client: MoySkladClient,
                 stats["sales_docs_skipped_store"] += 1
                 continue
             day = str(doc.get("moment") or "")[:10]
-            if not day or day < cutoff:
+            if not day or day < cutoff or (date_to and day > date_to):
                 continue
             positions = await _full_positions(client, entity, doc, stats)
             for pos in positions:
@@ -1378,8 +1863,11 @@ async def _sync_sales(org_id: int, client: MoySkladClient,
     ]
     db = SessionLocal()
     try:
-        if initial:
+        if replace_all:
             db.execute(delete(Sale).where(Sale.org_id == org_id))
+        elif date_to:
+            db.execute(delete(Sale).where(Sale.org_id == org_id, Sale.date >= cutoff,
+                                          Sale.date <= date_to))
         else:
             db.execute(delete(Sale).where(Sale.org_id == org_id, Sale.date >= cutoff))
         if rows:
@@ -1388,9 +1876,10 @@ async def _sync_sales(org_id: int, client: MoySkladClient,
     finally:
         db.close()
 
-    stats["sales_rows"] = sum(1 for r in rows if not r["is_return"])
-    stats["return_rows"] = sum(1 for r in rows if r["is_return"])
+    stats["sales_rows"] += sum(1 for r in rows if not r["is_return"])
+    stats["return_rows"] += sum(1 for r in rows if r["is_return"])
     stats["sales_window_from"] = cutoff
-    _set_state(org_id, stage="sales", progress=base_progress + span,
-               detail=f"Продажи записаны: {len(rows)} строк с {cutoff}",
-               stats_json=json.dumps(stats, ensure_ascii=False))
+    if span:
+        _set_state(org_id, stage="sales", progress=base_progress + span,
+                   detail=f"Продажи записаны: {len(rows)} строк с {cutoff}",
+                   stats_json=json.dumps(stats, ensure_ascii=False))

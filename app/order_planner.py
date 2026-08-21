@@ -376,16 +376,39 @@ def normalize_brief(raw: dict | None, settings: dict, stages: list[dict], today:
 
 # ── Контекст из БД ───────────────────────────────────────────────────────────
 
+def coverage_days(snap: dict) -> int:
+    """Сколько дней истории реально загружено (деплой П1).
+
+    coverage_start кладёт в снапшот analytics (самая старая дата в stock_days).
+    Его нет у старых/полных аккаунтов — тогда считаем, что истории год: ровно
+    столько окон и метрик строит аналитика, и именно так система вела себя
+    до прогрессивной первичной загрузки.
+    """
+    start = snap.get("coverage_start")
+    if not start:
+        return 365
+    try:
+        first = date.fromisoformat(start)
+    except (TypeError, ValueError):
+        return 365
+    today = date.fromisoformat(snap["today"])
+    return max(1, (today - first).days + 1)
+
+
 def _seasonal_rates(
     db: Session, org: Org, snap: dict, min_stock: float,
     date_from: date, date_to: date,
-) -> dict[str, float]:
+) -> tuple[dict[str, float], dict[str, float]]:
     """Темп продаж на будущее окно по статистике того же окна ГОД НАЗАД.
 
     Каскад фолбэков (в одежде половина моделей моложе года):
       1) окно самой позиции, если в нём набралось MIN_WINDOW_DIS дней наличия;
       2) годовой темп позиции × сезонный индекс её КАТЕГОРИИ на это окно;
       3) годовой темп позиции.
+
+    Возвращает (темпы по базам, сезонные индексы категорий). Индексы нужны
+    вызывающему, чтобы честно сказать: сезонность в расчёте участвовала или
+    её не из чего было взять (у нового аккаунта окна «год назад» ещё нет).
     """
     w_from = (date_from - timedelta(days=365)).isoformat()
     w_to = (date_to - timedelta(days=365)).isoformat()
@@ -422,7 +445,7 @@ def _seasonal_rates(
         else:
             idx = cat_index.get(it.get("category") or "Без категории")
             rates[base] = rate_year * idx if idx else rate_year
-    return rates
+    return rates, cat_index
 
 
 def collect_context(db: Session, org: Org, snap: dict, brief: dict) -> dict:
@@ -437,8 +460,21 @@ def collect_context(db: Session, org: Org, snap: dict, brief: dict) -> dict:
     )
     min_stock = snap["settings"]["min_stock_days"]
 
-    rate_lead = _seasonal_rates(db, org, snap, min_stock, today, eta)
-    rate_cover = _seasonal_rates(db, org, snap, min_stock, eta, eta + timedelta(days=cover))
+    rate_lead, idx_lead = _seasonal_rates(db, org, snap, min_stock, today, eta)
+    rate_cover, idx_cover = _seasonal_rates(
+        db, org, snap, min_stock, eta, eta + timedelta(days=cover))
+
+    # Свежесть: «нет продаж за FRESH_DAYS дней» — суждение, которое можно
+    # выносить, только если эти дни ЗАГРУЖЕНЫ. При частичном покрытии окно
+    # свежести молча сжимается до загруженного (запрос просто не видит более
+    # старых продаж), и медленные позиции отсеиваются как «мёртвые».
+    # Решение: отсев оставляем (иначе на 30 днях истории такие позиции пошли
+    # бы в заказ по выдуманному темпу и съели реальные деньги), но клампим
+    # окно явно и считаем отсеянных в review.hidden_by_coverage — чтобы это
+    # было видно, а не молча. На полном покрытии кламп — no-op, план
+    # побайтно тот же.
+    cov_days = coverage_days(snap)
+    fresh_days = min(FRESH_DAYS, cov_days)
 
     assign = {}
     if brief.get("production_id") is not None:
@@ -453,7 +489,11 @@ def collect_context(db: Session, org: Org, snap: dict, brief: dict) -> dict:
         "peak_periods": peaks if isinstance(peaks, list) else [],
         "rate_lead": rate_lead,
         "rate_cover": rate_cover,
-        "fresh": _fresh_bases(db, org.id, FRESH_DAYS),
+        "fresh": _fresh_bases(db, org.id, fresh_days),
+        "fresh_days": fresh_days,
+        "fresh_clamped": fresh_days < FRESH_DAYS,
+        # сезонность в темпах реально участвовала (окно «год назад» загружено)
+        "seasonal_rates": bool(idx_lead or idx_cover),
         "assign": assign,
         "main_production_id": _main_production_id(db, org.id),
     }
@@ -696,12 +736,32 @@ def _allocate(cands: list[dict], brief: dict, ctx: dict, stages: list[dict]) -> 
     }
 
 
+def _coverage(snap: dict, ctx: dict, stages: list[dict]) -> dict:
+    """На какой истории стоит план и хватает ли её (деплой П1).
+
+    Порог — lead_days + cover_days: план экстраполирует спрос ровно на столько
+    дней вперёд (пока заказ едет + пока он должен закрывать спрос), поэтому
+    столько же истории нужно НАЗАД. Меньше — темпы взяты с обрезка, сезонность
+    из окна «год назад» недоступна, и часть позиций отсеялась до расчёта.
+    """
+    cov_days = coverage_days(snap)
+    needed = lead_days(stages) + int(ctx["cover_days"])
+    return {
+        "start": snap.get("coverage_start"),
+        "days": cov_days,
+        "needed_days": needed,
+        "partial": cov_days < needed,
+        "seasonal_rates": bool(ctx.get("seasonal_rates")),
+    }
+
+
 def plan_order(snap: dict, brief: dict, ctx: dict, stages: list[dict],
                with_sensitivity: bool = True) -> dict:
     """Бриф → план заказа. Чистая функция: в БД не ходит."""
     today = date.fromisoformat(snap["today"])
     eta = date.fromisoformat(brief["eta_date"])
     cover = ctx["cover_days"]
+    coverage = _coverage(snap, ctx, stages)
     cands, skipped = _candidates(snap, brief, ctx)
     res = _allocate(cands, brief, ctx, stages)
     alloc, reasons = res["alloc"], res["reasons"]
@@ -790,9 +850,14 @@ def plan_order(snap: dict, brief: dict, ctx: dict, stages: list[dict],
         "new_items_over_budget": res["new_over_budget"],
         "reserve_unassigned": max(0, res["reserve"] - res["new_cost"]),
         "peaks": peak_hints(ctx.get("peak_periods"), today, lead_days(stages)),
+        "coverage": coverage,
         "items": items,
         "not_included": not_included,
-        "lost_revenue": round(lost_revenue),
+        # На обрезанной истории «упущенная выручка» посчитана только по тем
+        # позициям, что дожили до расчёта: отсеянные раньше (stale, small_need)
+        # в cands не попадают, поэтому 0 ₽ здесь означал бы «всё влезло» —
+        # ровно противоположное правде. Честнее не число, а None.
+        "lost_revenue": None if coverage["partial"] else round(lost_revenue),
         "totals": {
             "positions": len(items),
             "units": sum(i["qty"] for i in items),
@@ -811,6 +876,10 @@ def plan_order(snap: dict, brief: dict, ctx: dict, stages: list[dict],
             "stale_count": len(skipped["stale"]),
             "small_need_count": len(skipped["small_need"]),
             "other_production_count": len(skipped["other_production"]),
+            # Сколько позиций скрыто самим фактом недогруженной истории:
+            # окно свежести сжалось до покрытия, и позиции без продаж внутри
+            # него отсеяны как «мёртвые», хотя судить об этом не по чему.
+            "hidden_by_coverage": len(skipped["stale"]) if ctx.get("fresh_clamped") else 0,
         },
         "categories": _by_category(items),
     }
@@ -830,7 +899,12 @@ def plan_order(snap: dict, brief: dict, ctx: dict, stages: list[dict],
                 f"минимальную партию, либо закажите этот канал реже."
             ),
         }
-    if with_sensitivity and brief["budget"] > 0:
+    if coverage["partial"]:
+        # Пометка для UI и для api_order_plan_apply: план предварительный —
+        # not_included неполон, «а если добавить денег» на обрезке истории
+        # ответит «ничего не изменится», что неправда. Лучше не отвечать.
+        plan["provisional"] = True
+    elif with_sensitivity and brief["budget"] > 0:
         plan["sensitivity"] = _sensitivity(snap, brief, ctx, stages, plan)
     return plan
 

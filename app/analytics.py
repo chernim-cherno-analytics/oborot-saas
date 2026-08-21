@@ -96,6 +96,53 @@ _SEASON_OF_MONTH = {
     "09": "autumn", "10": "autumn", "11": "autumn",
 }
 SEASONS = ("winter", "spring", "summer", "autumn")
+# Доля дней сезона внутри окна 365, при которой сезон считается покрытым.
+# Не 100%: самая старая загруженная дата плавает на день-другой (см.
+# _season_coverage), а метрика сезона от потери одного дня не меняется.
+SEASON_COVERED_SHARE = 0.9
+
+
+def _is_season_new(first_stock: str | None, since: str, strict: bool) -> bool:
+    """Новинка сезона: первое появление в стоке позже границы (см. минор 9)."""
+    if not first_stock:
+        return False
+    return first_stock > since if strict else first_stock >= since
+
+
+def _season_coverage(cutoff365: str, today: date,
+                     coverage_start: str | None) -> dict[str, bool]:
+    """Какие сезоны окна 365 дней покрыты историей (минор 9, 21.08).
+
+    Если история загружена не вся (прогрессивная первичная загрузка), сезон,
+    чьи даты начинаются раньше границы покрытия, посчитан по обрезку — раньше
+    это давало «0 ₽/день» (неотличимо от «ничего не продали»). Такой сезон
+    отдаём как None.
+
+    Ревью 21.08: сравнение «coverage_start <= первый день сезона в окне»
+    гасило целый сезон из-за ОДНОГО недостающего дня. Самая старая
+    загруженная дата плавает: она берётся из stock_days, а день без
+    положительных остатков в таблицу не попадает — у завершённого синка
+    coverage_start регулярно оказывается на день-другой позже начала окна.
+    Замер: при coverage_start = сегодня−363 ровно один сезон «терялся» на
+    всех 53 проверенных датах. Поэтому считаем не границу, а ДОЛЮ: сезон
+    покрыт, если загружено >= SEASON_COVERED_SHARE его дней внутри окна.
+    Полная история (coverage_start <= cutoff365) даёт 100% по всем сезонам —
+    поведение завершённого синка не меняется.
+    """
+    if not coverage_start:
+        return {s: False for s in SEASONS}
+    total: dict[str, int] = {s: 0 for s in SEASONS}
+    loaded: dict[str, int] = {s: 0 for s in SEASONS}
+    cur = date.fromisoformat(cutoff365)
+    while cur <= today:
+        season = _SEASON_OF_MONTH.get(f"{cur.month:02d}")
+        if season:
+            total[season] += 1
+            if cur.isoformat() >= coverage_start:
+                loaded[season] += 1
+        cur += timedelta(days=1)
+    return {s: bool(total[s]) and loaded[s] >= total[s] * SEASON_COVERED_SHARE
+            for s in SEASONS}
 
 _cache: dict[int, tuple[float, dict]] = {}
 _cache_lock = threading.Lock()
@@ -349,6 +396,11 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
     season_to = (today + timedelta(days=lead_time + horizon - 365)).isoformat()
 
     latest_date = db.scalar(select(func.max(StockDay.date)).where(StockDay.org_id == org.id))
+    # Ревью 21.08 (минор 9): граница загруженной истории. При прогрессивной
+    # первичной загрузке (деплой П1) её может быть 10 дней вместо года, и
+    # сезонные метрики обязаны различать «не продавалось» и «не загружено».
+    coverage_start = db.scalar(select(func.min(StockDay.date)).where(StockDay.org_id == org.id))
+    season_covered = _season_coverage(cutoff365, today, coverage_start)
 
     # excluded=False — упаковка/сертификаты/расходники не участвуют в аналитике
     # (см. app/exclusions.py); фильтр применяется во ВСЕХ запросах снапшота.
@@ -478,6 +530,14 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
         .group_by(Product.base_name)
     ).all()
     season_split = {b: (float(f or 0), float(d or 0)) for b, f, d in season_split_rows}
+
+    # «Новинка сезона» — по первому появлению в стоке. Если история загружена
+    # ПОЗЖЕ начала сезона, самая ранняя дата в данных ничего не доказывает
+    # (товар мог лежать и до неё), поэтому граница — max(начало сезона,
+    # начало покрытия), и в этом случае сравнение СТРОГОЕ: иначе новинками
+    # становились разом все позиции (минор 9, 21.08).
+    season_new_since = max(cur_season_iso, coverage_start or cur_season_iso)
+    season_new_strict = bool(coverage_start and coverage_start > cur_season_iso)
 
     # Первое появление позиции в стоке (qty > 0) — чтобы посчитать в остатке
     # сезона и новинки, которые пришли на склад в сезоне, но ещё не продавались.
@@ -612,7 +672,8 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
             # здоровье сезона: нетто-выручка сезона по корзинам + признак новинки
             "season_full_rev": season_split.get(base, (0.0, 0.0))[0],
             "season_disc_rev": season_split.get(base, (0.0, 0.0))[1],
-            "season_new": (first_stock_by_base.get(base) or "") >= cur_season_iso,
+            "season_new": _is_season_new(first_stock_by_base.get(base),
+                                         season_new_since, season_new_strict),
             "sizes": {},  # size -> {stock, sold365}
             "wh_stock": {},  # size -> {warehouse_id: qty}
         }
@@ -695,11 +756,13 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
         item["discount_fact"] = (
             round(1 - (nr / nq) / sale_price, 3) if nq > 0 and sale_price > 0 else None
         )
-        # Сезонная оборачиваемость ₽/день (0 = по сезону нет статистики).
+        # Сезонная оборачиваемость ₽/день: 0 = «по сезону нет продаж»,
+        # None = «сезон не покрыт историей» (минор 9 — фронт красит серым).
         s_dis = sea_dis_by_base.get(base, {})
         s_rev = sea_rev_by_base.get(base, {})
         item["sea"] = {
-            s: (round(s_rev.get(s, 0.0) / s_dis[s]) if s_dis.get(s) else 0)
+            s: ((round(s_rev.get(s, 0.0) / s_dis[s]) if s_dis.get(s) else 0)
+                if season_covered.get(s) else None)
             for s in SEASONS
         }
         # Прогноз остатка к дате прихода заказа (правило legacy /order):
@@ -714,6 +777,9 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
         "generated_at": time.time(),
         "today": today.isoformat(),
         "latest_date": latest_date,
+        # деплой П1: с какой даты история загружена (частичное покрытие)
+        "coverage_start": coverage_start,
+        "season_covered": season_covered,
         "season_from": season_from,
         "season_to": season_to,
         "cur_season_start": cur_season_iso,
@@ -799,7 +865,13 @@ def _season_health(snap: dict, items: list[dict]) -> dict:
 
     full_share = disc_share = leftover_share = 0.0
     status, reason = "no_data", None
-    if total > 0:
+    # Минор 9 (21.08): если история начинается ПОЗЖЕ старта сезона, выручка
+    # сезона обрезана, а текущий сток — полный: leftover_share завышался и
+    # здоровье срывалось в alarm/«распродавайте остатки» на ровном месте.
+    # Такой сезон честно помечаем no_data.
+    cov_start = snap.get("coverage_start")
+    season_partial = bool(cov_start and cov_start > (snap.get("cur_season_start") or ""))
+    if total > 0 and not season_partial:
         full_share = full / total
         disc_share = disc / total
         leftover_share = leftover / total
@@ -820,6 +892,8 @@ def _season_health(snap: dict, items: list[dict]) -> dict:
         "label": snap.get("cur_season_label", ""),
         "date_from": snap.get("cur_season_start"),
         "date_to": snap["today"],
+        "coverage_start": cov_start,
+        "partial_coverage": season_partial,
         "full_price_rev": round(full),
         "discounted_rev": round(disc),
         "leftover_value": round(leftover),
@@ -1133,7 +1207,13 @@ def build_turnover(snap: dict) -> dict:
                 "hidden": it.get("hidden", False),
             }
         )
-    return {"items": items}
+    # coverage_start/season_covered — чтобы таблица гасила сезонные колонки,
+    # не покрытые загруженной историей (sea[s] = null), а не рисовала «0 ₽/день».
+    return {
+        "items": items,
+        "coverage_start": snap.get("coverage_start"),
+        "season_covered": snap.get("season_covered", {}),
+    }
 
 
 def build_active_stock(snap: dict) -> dict:

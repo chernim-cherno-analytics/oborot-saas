@@ -3,7 +3,7 @@
 POST /api/connect/moysklad          — проверить токен запросом к МС, сохранить (Fernet)
 GET  /api/connect/moysklad/stores   — склады аккаунта МойСклад
 POST /api/connect/moysklad/stores   — выбрать склады (Warehouse-записи)
-POST /api/sync/initial              — фоновая первичная синхронизация
+POST /api/sync/initial              — фоновая первичная синхронизация (прогрессивная, П1)
 POST /api/sync/run                  — инкрементальный синк (остатки+цены+продажи 3 дн.)
 GET  /api/sync/status               — прогресс для онбординга (поллинг)
 POST /api/orders/{id}/push-to-ms    — создать «Заказ поставщику» в МойСклад
@@ -243,7 +243,12 @@ async def api_moysklad_stores_select(
 def api_sync_initial(
     ctx: AuthContext = Depends(require_owner_api), db: Session = Depends(get_db)
 ):
-    """Фоновый запуск первичной синхронизации (история остатков + продажи)."""
+    """Фоновый запуск первичной синхронизации.
+
+    Деплой П1: загрузка прогрессивная — сервис открывается через секунды
+    (товары, остатки на сегодня, окно INITIAL_WINDOW_DAYS), история за год
+    догружается фоном; прогресс — /api/sync/progress и полоска под шапкой.
+    """
     _require_token(db, ctx.org.id)
     active = db.execute(
         select(Warehouse).where(

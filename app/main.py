@@ -159,6 +159,21 @@ def _page(request: Request, ctx: auth.AuthContext, template: str, active: str, p
     return response
 
 
+def _data_is_loading(org_id: int) -> bool:
+    """Идёт первичная загрузка или её часть уже на диске (деплой П1, мажор 4).
+
+    До finalize-lite подключение ещё 'pending', и «/» уводило на онбординг,
+    где по умолчанию выбраны «Демо-данные» — клик стирал таблицы организации
+    прямо во время записи их синком. Пока синк идёт (или уже есть покрытие),
+    показываем обычные страницы: они работают на загруженной части истории.
+    """
+    from app import ms_sync as _ms_sync
+
+    if _ms_sync.is_running(org_id):
+        return True
+    return _ms_sync.get_status(org_id).get("coverage_days", 0) > 0
+
+
 def _has_active_connection(db: Session, org_id: int) -> bool:
     return (
         db.execute(
@@ -281,7 +296,7 @@ def dashboard_page(request: Request, db: Session = Depends(get_db)):
     if ctx is None:
         # Неавторизованным показываем публичный лендинг (самодостаточный шаблон).
         return templates.TemplateResponse(request, "landing.html", {})
-    if not _has_active_connection(db, ctx.org.id):
+    if not _has_active_connection(db, ctx.org.id) and not _data_is_loading(ctx.org.id):
         return RedirectResponse("/onboarding", status_code=302)
     # Дашборд «Показатели» скрыт (продукт сфокусирован на Оборачиваемости и
     # Активном стоке) — главная ведёт сразу в Оборачиваемость.

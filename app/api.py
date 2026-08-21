@@ -13,7 +13,7 @@ from app.crypto import encrypt_token
 from app.db import get_db
 from app.demo_seed import seed_demo
 from app.models import (Connection, Membership, OrderedQty, Product, Production,
-                        ProductionOrder, User, Warehouse)
+                        ProductionOrder, StockDay, User, Warehouse)
 
 router = APIRouter(prefix="/api")
 
@@ -465,18 +465,32 @@ def api_connect_demo(ctx: AuthContext = Depends(require_owner_api), db: Session 
     # 18.08): строка kind='moysklad' создаётся со status='pending' уже при
     # сохранении токена — до первого синка данных нет, и демо безопасно
     # (пользователь, передумавший на онбординге, не попадает в тупик).
+    # Ревью 21.08 (мажор 4): проверки «active или был синк» НЕ ХВАТАЛО. При
+    # прогрессивной первичной загрузке подключение до finalize-lite ещё
+    # 'pending', last_sync_at пуст, а «/» до этого момента вело на онбординг,
+    # где по умолчанию выбраны «Демо-данные»: один клик стирал таблицы живой
+    # организации ПРЯМО ВО ВРЕМЯ записи их синком. Отказываем и когда синк
+    # идёт, и когда в БД уже есть остатки (сервис работает на них).
+    from app import ms_sync as _ms_sync
+
     ms_conn = db.execute(
         select(Connection).where(Connection.org_id == org.id,
                                  Connection.kind == "moysklad")
     ).scalars().first()
-    if ms_conn is not None and (ms_conn.status == "active"
-                                or ms_conn.last_sync_at is not None):
-        raise HTTPException(
-            status_code=409,
-            detail="У организации уже подключён МойСклад с реальными данными — "
-                   "демо-данные их безвозвратно сотрут (включая заказы на "
-                   "производство и ручное «Заказано»). Если демо всё же нужно, "
-                   "напишите в поддержку — поможем безопасно.")
+    if ms_conn is not None:
+        has_stock = db.execute(
+            select(StockDay.product_id).where(StockDay.org_id == org.id).limit(1)
+        ).first() is not None
+        if (ms_conn.status == "active" or ms_conn.last_sync_at is not None
+                or _ms_sync.is_running(org.id) or has_stock):
+            raise HTTPException(
+                status_code=409,
+                detail="У организации подключён МойСклад — его данные уже "
+                       "загружаются или загружены, а демо-данные сотрут их "
+                       "безвозвратно (включая заказы на производство и ручное "
+                       "«Заказано»). Дождитесь окончания синхронизации; если "
+                       "демо всё же нужно, напишите в поддержку — поможем "
+                       "безопасно.")
     counters = seed_demo(db, org)
     conn = db.execute(
         select(Connection).where(Connection.org_id == org.id, Connection.kind == "demo")
@@ -886,6 +900,9 @@ def api_order_plan_save(
                 "covered_until": plan["covered_until"],
                 "stages": plan["stages"],
                 "lead_days": plan["lead_days"],
+                # На какой истории посчитан план (деплой П1): apply спросит
+                # осознанное подтверждение, если истории было мало.
+                "coverage": plan.get("coverage"),
             },
             ensure_ascii=False,
         ),
@@ -918,6 +935,10 @@ def api_order_plan_last(
 
 class PlanApplyIn(BaseModel):
     name: str = Field(default="", max_length=255)
+    # Осознанное согласие оформить заказ по плану, посчитанному на неполной
+    # истории (первичная загрузка ещё идёт). Предпросмотр остаётся открытым,
+    # но превращение плана в заказ на производство — деньги, тут спрашиваем.
+    confirm_partial: bool = False
 
 
 @router.post("/order-plan/{plan_id}/apply")
@@ -932,6 +953,18 @@ def api_order_plan_apply(
         raise HTTPException(404, "План не найден")
     if row.production_order_id:
         raise HTTPException(409, "По этому плану заказ уже создан")
+    try:
+        computed = json.loads(row.computed_json or "{}")
+    except ValueError:
+        computed = {}
+    cov = computed.get("coverage") or {}
+    if cov.get("partial") and not body.confirm_partial:
+        raise HTTPException(
+            409,
+            f"План посчитан по {cov.get('days')} дн. истории из "
+            f"{cov.get('needed_days')} — она ещё загружается. "
+            f"Дождитесь загрузки или подтвердите осознанно",
+        )
     try:
         result = json.loads(row.result_json or "{}")
     except ValueError:

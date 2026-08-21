@@ -8,6 +8,10 @@
   2) шлём Telegram-дайджест (notify.send_daily_digest — сам молча скипает
      org без настроенного чата).
 
+Ждём завершения ТОЛЬКО инкремента (от него зависит дайджест); прогон,
+промотированный в первичную загрузку (продолжение прерванной истории),
+запускается и оставляется работать фоном — см. _started_as_initial.
+
 Ошибка одной организации не валит остальных: синк пишет свой результат
 в sync_state (state=error + человекочитаемый текст), обход продолжается.
 Если авто-синк упал второй раз подряд (sync_state.fail_streak == 2) —
@@ -42,7 +46,14 @@ log = logging.getLogger("oborot.scheduler")
 
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 DAILY_HOUR = 6  # 06:00 МСК
-SYNC_WAIT_TIMEOUT = 60 * 60  # ждать завершения синка одной org не дольше часа
+SYNC_WAIT_TIMEOUT = 60 * 60  # исторический потолок ожидания (остался для тестов)
+# Ревью 21.08 (мажор 5): ждём только НАСТОЯЩИЙ инкремент — он занимает секунды,
+# и от него зависит дайджест. Первичная загрузка (в т.ч. продолжение прерванной)
+# теперь легально идёт 30+ минут: блокироваться на ней нельзя — обход
+# организаций последовательный, а max_instances=1 просто съедал бы следующие
+# срабатывания (после деплоя, убившего несколько фоновых историй, ежедневный
+# джоб в 06:00 вставал на часы и задерживал синки и дайджесты других org).
+SYNC_WAIT_TIMEOUT_INCREMENTAL = 300
 SYNC_POLL_SEC = 2.0
 
 _scheduler: BackgroundScheduler | None = None
@@ -89,6 +100,15 @@ def _wait_sync_finished(org_id: int, timeout: float = SYNC_WAIT_TIMEOUT) -> dict
     return ms_sync.get_status(org_id)  # таймаут: вернём как есть, идём дальше
 
 
+def _started_as_initial(org_id: int) -> bool:
+    """Запущенный синк промотирован в первичную загрузку (start_sync решает сам).
+
+    Такие прогоны длятся десятки минут (год истории чанками) — джоб их
+    ЗАПУСКАЕТ и идёт дальше, не блокируя обход остальных организаций.
+    """
+    return ms_sync.get_status(org_id).get("mode") == "initial"
+
+
 def _alert_if_failing(org_id: int, status: dict) -> None:
     """Telegram-алерт владельцу на втором провале подряд (инцидент 21.08).
 
@@ -120,11 +140,19 @@ def run_daily_job() -> dict:
                 results[org_id] = "skipped_already_running"
                 log.warning("org=%s: синк уже идёт, пропуск", org_id)
                 continue
-            status = _wait_sync_finished(org_id)
-            results[org_id] = status.get("state", "unknown")
-            if status.get("state") == "error":
-                log.warning("org=%s: синк упал: %s", org_id, status.get("error", ""))
-                _alert_if_failing(org_id, status)
+            if _started_as_initial(org_id):
+                # Первичная загрузка/её продолжение: запустили — идём дальше.
+                # Дайджест уйдёт по тем данным, что уже на диске (сервис на них
+                # и работает), а не через час ожидания.
+                results[org_id] = "started_initial"
+                log.info("org=%s: запущена первичная загрузка, не ждём", org_id)
+            else:
+                # Дайджест считается по свежему инкременту — его дожидаемся.
+                status = _wait_sync_finished(org_id, SYNC_WAIT_TIMEOUT_INCREMENTAL)
+                results[org_id] = status.get("state", "unknown")
+                if status.get("state") == "error":
+                    log.warning("org=%s: синк упал: %s", org_id, status.get("error", ""))
+                    _alert_if_failing(org_id, status)
         except Exception:  # noqa: BLE001 — одна org не валит остальных
             results[org_id] = "error"
             log.exception("org=%s: необработанная ошибка синка", org_id)
@@ -143,7 +171,9 @@ def run_catchup_job() -> dict:
 
     Если у организации последний успешный синк старше CATCHUP_STALE_HOURS
     (упал в 06:00, приложение было в рестарте, токен только что поменяли) —
-    пробуем инкрементальный синк ещё раз. Ошибка (например, всё ещё битый
+    пробуем инкрементальный синк ещё раз. Организации с прерванной первичной
+    загрузкой (деплой П1, stats.history_loaded_from) догоняются всегда:
+    start_sync сам промотирует запуск в продолжение initial. Ошибка (например, всё ещё битый
     токен) стоит секунды и остаётся видимой в sync_state/на табло свежести;
     как только причину устранят — данные догонятся в течение часа, а не
     на следующее утро.
@@ -165,6 +195,12 @@ def run_catchup_job() -> dict:
     finally:
         db.close()
     stale = [org_id for org_id, ts in rows if ts is None or ts < cutoff]
+    # Деплой П1: прерванная прогрессивная загрузка истории («продолжим
+    # автоматически в течение часа») — догоняем независимо от last_sync_at
+    # и от статуса подключения (до finalize-lite оно ещё pending).
+    for org_id in ms_sync.orgs_with_resume_point():
+        if org_id not in stale:
+            stale.append(org_id)
     if not stale:
         return results
     log.info("догоняющий синк: %d отставших организаций", len(stale))
@@ -173,7 +209,14 @@ def run_catchup_job() -> dict:
             if not ms_sync.start_sync(org_id, mode="incremental"):
                 results[org_id] = "skipped_already_running"
                 continue
-            status = _wait_sync_finished(org_id)
+            if _started_as_initial(org_id):
+                # Продолжение прерванной первичной — самый частый случай этого
+                # джоба; ждать его час означало бы не догнать остальных.
+                results[org_id] = "started_initial"
+                log.info("org=%s: продолжение первичной загрузки запущено, не ждём",
+                         org_id)
+                continue
+            status = _wait_sync_finished(org_id, SYNC_WAIT_TIMEOUT_INCREMENTAL)
             results[org_id] = status.get("state", "unknown")
             if status.get("state") == "error":
                 log.warning("org=%s: догоняющий синк упал: %s",

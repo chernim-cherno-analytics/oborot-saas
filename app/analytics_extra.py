@@ -891,6 +891,15 @@ def build_pulse(db: Session, org_id: int, today: date | None = None) -> dict:
     pct = текущее/среднее; 360° на круге = среднее за 6 месяцев.
     Месяцы без данных в среднее не входят (молодой аккаунт), их число видно
     по len(months) с v != None.
+
+    Ревью 21.08 (мажор 3): ПРОШЛЫЙ месяц, покрытый историей лишь частично,
+    в среднее не берём вовсе. Раньше свежий аккаунт с двумя неделями истории
+    получал «продажи против нормы» в 3,6 раза выше правды: неполный месяц
+    считался целым и занижал среднее. Граница покрытия — min(StockDay.date):
+    снапшот остатков пишется на КАЖДУЮ загруженную дату, а продаж в дне может
+    честно не быть, так что min(Sale.date) сдвигал бы границу произвольно
+    (фолбэк на него — только если остатков нет вовсе). Текущий месяц остаётся:
+    он намеренно экстраполируется по прошедшим дням.
     """
     today = today or date.today()
     cur_month = f"{today.year:04d}-{today.month:02d}"
@@ -902,6 +911,21 @@ def build_pulse(db: Session, org_id: int, today: date | None = None) -> dict:
             y, m = y - 1, 12
         months.append(f"{y:04d}-{m:02d}")
     months.reverse()
+
+    coverage_start = db.execute(
+        select(func.min(StockDay.date)).where(StockDay.org_id == org_id)
+    ).scalar() or db.execute(
+        select(func.min(Sale.date)).where(Sale.org_id == org_id)
+    ).scalar()
+    if coverage_start:
+        months = [mm for mm in months if f"{mm}-01" >= coverage_start]
+    covered_months = len(months)
+    # Меньше двух полных месяцев — сравнивать не с чем: страница скажет
+    # «мало истории» вместо выдуманного процента (pct = None).
+    partial = covered_months < 2
+    # Нижняя граница выборок: полные месяцы окна, а если их не осталось —
+    # текущий месяц (нужен для mtd/стока «сейчас»).
+    from_month = months[0] if months else cur_month
 
     # --- Продажи: помесячная нетто-выручка -------------------------------
     sign_rev = case((Sale.is_return, -Sale.revenue), else_=Sale.revenue)
@@ -916,7 +940,7 @@ def build_pulse(db: Session, org_id: int, today: date | None = None) -> dict:
             select(month_col, func.sum(sign_rev))
             .select_from(Sale)
             .join(Product, join_products)
-            .where(Sale.org_id == org_id, month_col >= months[0])
+            .where(Sale.org_id == org_id, month_col >= from_month)
             .group_by(month_col)
         ).all()
     )
@@ -955,7 +979,7 @@ def build_pulse(db: Session, org_id: int, today: date | None = None) -> dict:
     stock_rows = db.execute(
         select(StockDay.date, StockDay.product_id, StockDay.qty)
         .where(StockDay.org_id == org_id,
-               func.substr(StockDay.date, 1, 7) >= months[0])
+               func.substr(StockDay.date, 1, 7) >= from_month)
     ).all()
     day_val: dict[str, float] = {}
     for d, pid, qty in stock_rows:
@@ -978,10 +1002,18 @@ def build_pulse(db: Session, org_id: int, today: date | None = None) -> dict:
     stock_now = day_val.get(last_day, 0.0) if last_day else 0.0
 
     def _pct(cur: float, avg: float):
-        return round(cur / avg, 3) if avg > 0 else None
+        # partial — истории меньше двух ПОЛНЫХ месяцев: процент «против нормы»
+        # был бы выдумкой (фронт показывает «мало истории»).
+        if partial or avg <= 0:
+            return None
+        return round(cur / avg, 3)
 
     return {
         "months": months,
+        # деплой П1: сколько полных месяцев реально покрыто историей
+        "covered_months": covered_months,
+        "partial": partial,
+        "coverage_start": coverage_start,
         "last_sale_date": last_sale,
         "last_stock_date": last_stock,
         "sales": {

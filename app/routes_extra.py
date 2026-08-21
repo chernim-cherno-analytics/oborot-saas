@@ -244,6 +244,9 @@ def api_freshness(ctx: AuthContext = Depends(require_auth_api), db: Session = De
     last_stock = db.execute(
         select(_f.max(_SD.date)).where(_SD.org_id == ctx.org.id)
     ).scalar()
+    first_stock = db.execute(
+        select(_f.min(_SD.date)).where(_SD.org_id == ctx.org.id)
+    ).scalar()
     st = ms_sync.get_status(ctx.org.id)
     return {
         "last_sale_date": last_sale,
@@ -251,7 +254,28 @@ def api_freshness(ctx: AuthContext = Depends(require_auth_api), db: Session = De
         "sync_state": st.get("state"),
         "sync_error": st.get("error"),
         "sync_finished_at": st.get("finished_at"),
+        # Деплой П1: сколько дней истории уже на диске (прогрессивная загрузка)
+        # и с какой даты она начинается — фронт подписывает колонки «за N дн.»
+        # и гасит сезоны, которые ещё не загружены.
+        "coverage_days": st.get("coverage_days", 0),
+        "coverage_start": first_stock,
+        "history_days": ms_sync.HISTORY_DAYS,
     }
+
+
+@router.get("/api/sync/progress")
+def api_sync_progress(ctx: AuthContext = Depends(require_auth_api)):
+    """Прогресс загрузки данных для полоски под шапкой (деплой П1).
+
+    Доступен ЛЮБОМУ участнику организации (в отличие от owner-only
+    /api/sync/status) и не раскрывает внутренние stats: только состояние,
+    фазу, покрытие истории, месяцы, этапы и оценку остатка.
+    """
+    from app import ms_sync
+
+    out = ms_sync.get_progress(ctx.org.id)
+    out["can_manage"] = ctx.role == "owner"  # кнопки «Повторить»/«Исправить» — владельцу
+    return out
 
 
 @router.get("/api/sizes/products")
