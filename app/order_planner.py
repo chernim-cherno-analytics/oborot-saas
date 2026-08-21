@@ -79,7 +79,7 @@ REASON_ORDER = ("must_have", "gap", "base", "deepen", "moq", "capped_share", "ca
 
 REASON_TEXT = {
     "gap": "кончится до прихода заказа",
-    "base": "минимальная партия",
+    "base": "стартовая партия",
     "deepen": "добор до потребности",
     "must_have": "включено вручную",
     "capped_share": "срезано лимитом на позицию",
