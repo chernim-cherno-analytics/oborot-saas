@@ -245,8 +245,18 @@ def main() -> int:
     snap3 = mk_snap([mk_item("Мелочь", turnover=900, cost=1000, price=3000, rate=0.1, cls="dull")])
     p_small = op.plan_order(snap3, mk_brief(budget=300000, moq_units=50),
                             mk_ctx(snap3), ONE_STAGE)
-    check("потребность сильно меньше партии — позицию не навязываем",
-          not p_small["items"], str(p_small["items"]))
+    check("медленная позиция: партия залежится на годы — не берём",
+          not p_small["items"] and p_small["moq_skipped"][0]["days"] == 500,
+          str(p_small["moq_skipped"]))
+    check("пустой план из-за партии объясняется, а не показывается нулями",
+          p_small.get("blocked", {}).get("reason") == "moq"
+          and "минимальную партию" in p_small["blocked"]["text"])
+    snap3b = mk_snap([mk_item("Быстрая", turnover=6000, cost=1000, price=3000, rate=2.0, cls="best")])
+    p_fast = op.plan_order(snap3b, mk_brief(budget=300000, moq_units=50),
+                           mk_ctx(snap3b), ONE_STAGE)
+    check("быстрая позиция берёт партию, даже если потребность меньше неё",
+          p_fast["items"] and p_fast["items"][0]["qty"] >= 50,
+          str([(i["base_name"], i["qty"], i["need"]) for i in p_fast["items"]]))
 
     print("\n7. Лимит доли на позицию")
     p_cap = op.plan_order(snap, mk_brief(budget=100000, max_share_pct=10), ctx, ONE_STAGE)
@@ -453,6 +463,21 @@ def api_checks() -> None:
               applied.status_code == 200 and applied.json().get("order_id"))
         again = c.post(f"/api/order-plan/{saved['id']}/apply", json={"name": "Ещё раз"})
         check("повторное применение плана → 409", again.status_code == 409)
+        page = c.get("/assistant")
+        check("страница мастера отдаётся и содержит анкету",
+              page.status_code == 200 and "Мастер заказа" in page.text
+              and "Как часто вы размещаете заказы" in page.text,
+              f"status={page.status_code}")
+        check("пункт меню «Мастер заказа» появился на других страницах",
+              '/assistant' in c.get("/budget").text and '/assistant' in c.get("/replenish").text)
+        ov = c.post("/api/order-plan", json={
+            "production_id": lab["id"], "eta_date": eta, "budget": 300000,
+            "budget_scope": "now", "strategy": "balance",
+            "overrides": {plan["items"][0]["base_name"]: 7}}).json()
+        first = [i for i in ov["plan"]["items"] if i["base_name"] == plan["items"][0]["base_name"]]
+        check("ручная правка количества переживает сохранение плана",
+              first and first[0]["qty"] == 7 and first[0]["why_text"] == "изменено вручную",
+              str(first[:1]))
         orders = c.get("/api/orders").json()["orders"]
         check("заказ виден в списке и содержит позиции",
               any(o["name"] == "Осень 2026" for o in orders), str([o["name"] for o in orders]))
