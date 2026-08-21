@@ -463,6 +463,60 @@ def api_checks() -> None:
               applied.status_code == 200 and applied.json().get("order_id"))
         again = c.post(f"/api/order-plan/{saved['id']}/apply", json={"name": "Ещё раз"})
         check("повторное применение плана → 409", again.status_code == 409)
+        # ── Правило распределения позиций по производствам ─────────────────
+        from app.db import SessionLocal
+        from app.models import Product as _P
+        db = SessionLocal()
+        try:
+            bases = sorted({r for (r,) in db.query(_P.base_name).distinct().all()})
+            china_bases = set(bases[:5])
+            for row in db.query(_P).filter(_P.base_name.in_(china_bases)).all():
+                row.supplier = "Китай"
+            for row in db.query(_P).filter(~_P.base_name.in_(china_bases)).all():
+                row.supplier = "Своё производство"
+            db.commit()
+        finally:
+            db.close()
+        src = c.get("/api/productions/assign-sources").json()
+        vals = {v["value"]: v["positions"] for v in src["sources"]["supplier"]["values"]}
+        check("источники распределения видят поставщиков со счётчиками",
+              vals.get("Китай") == 5 and vals.get("Своё производство", 0) > 5, str(vals))
+        check("система сама предлагает правило по поставщику",
+              src["suggest"]["assign_source"] == "supplier"
+              and any(ch["value"] == "Китай" and ch["suggest_preset"] == "turnkey"
+                      for ch in src["suggest"]["channels"]), str(src["suggest"]))
+        applied = c.post("/api/productions/assign-rule", json={
+            "assign_source": "supplier",
+            "assign_map": {"Китай": china["id"]}}).json()
+        check("правило применилось: 5 позиций ушли в китайский канал",
+              applied["assigned"] == 5 and applied["by_production"].get(str(china["id"])) == 5,
+              str(applied))
+        prods2 = c.get("/api/productions").json()
+        check("распределение отдаётся вместе с производствами",
+              len(prods2["assign"]) == 5 and prods2["assign_source"] == "supplier")
+        plan_china = c.post("/api/order-plan/preview", json={
+            "production_id": china["id"], "budget": 500000, "strategy": "protect"}).json()
+        china_names = {i["base_name"] for i in plan_china["items"]}
+        check("заказ на Китай берёт только китайские позиции",
+              china_names <= china_bases, str(china_names - china_bases))
+        one = sorted(china_bases)[0]
+        main_id = [p["id"] for p in prods2["productions"] if p["is_main"]][0]
+        c.post("/api/productions/assign", json={"base_name": one, "production_id": main_id})
+        after = c.get("/api/productions").json()["assign"]
+        check("ручное назначение сильнее правила (позиция закреплена за своим)",
+              after.get(one) == main_id, f"{one} → {after.get(one)}")
+        c.post("/api/productions/assign", json={"base_name": one, "production_id": None})
+        after2 = c.get("/api/productions").json()["assign"]
+        check("снятие ручного назначения возвращает позицию под правило",
+              after2.get(one) == china["id"], f"{one} → {after2.get(one)}")
+        c.post("/api/productions/assign-rule", json={"assign_source": "manual", "assign_map": {}})
+        check("правило можно выключить — распределение снова только ручное",
+              c.get("/api/productions").json()["assign_source"] == "manual")
+        check("неизвестное производство в правиле отклоняется",
+              c.post("/api/productions/assign-rule", json={
+                  "assign_source": "supplier",
+                  "assign_map": {"Китай": 9999}}).status_code == 422)
+
         page = c.get("/assistant")
         check("страница мастера отдаётся и содержит анкету",
               page.status_code == 200 and "Мастер заказа" in page.text
