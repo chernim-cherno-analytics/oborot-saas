@@ -492,7 +492,8 @@
     }).join("");
 
     var rows = (p.items||[]).map(function(i){
-      var sizes = Object.keys(i.sizes||{}).map(function(s){ return s+": "+i.sizes[s]; }).join(", ");
+      var sizes = Object.keys(i.sizes||{}).map(function(s){
+        return (s || "One Size")+": "+i.sizes[s]; }).join(", ");
       return '<tr class="'+rowCls(i.turnover)+'" data-b="'+esc(i.base_name)+'">'+
         '<td>'+esc(i.base_name)+'<span class="why">'+esc(i.category)+' · '+esc(i.why_text)+'</span></td>'+
         '<td class="nb">'+fmt(i.turnover)+'</td>'+

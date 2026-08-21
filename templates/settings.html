@@ -93,6 +93,35 @@
   </div>
 
   <div class="card">
+    <div class="card-head">
+      <h2>Распределение позиций по производствам</h2>
+      <div class="spacer"></div>
+      <button class="btn sm primary" type="button" id="btn-save-assign">Сохранить</button>
+    </div>
+    <div class="card-body">
+      <div class="hint" style="margin-bottom:11px;">
+        Если позиции шьются в разных местах, каждая должна попадать в свой заказ. Раскладывать
+        сотни позиций руками не нужно — система берёт признак из МойСклада и раскладывает сама.
+        <b>Поставщик</b> — контрагент в карточке товара (обычно именно там и написано, кто шьёт).
+        <b>Папка</b> — группа товаров МойСклада. Ручной перенос позиции на странице «Заказ»
+        всегда сильнее правила; снять его можно там же, вернув позицию под правило.
+      </div>
+      <div class="form-row" style="align-items:flex-end;">
+        <div class="field" style="max-width:260px;">
+          <label for="assign-source">Признак распределения</label>
+          <select class="input" id="assign-source">
+            <option value="manual">Только вручную</option>
+            <option value="supplier">Поставщик из МойСклада</option>
+            <option value="folder">Папка товара</option>
+          </select>
+        </div>
+        <div class="field"><div class="hint" id="assign-suggest"></div></div>
+      </div>
+      <div id="assign-box"><div class="loading-stub">Загрузка…</div></div>
+    </div>
+  </div>
+
+  <div class="card">
     <div class="card-head"><h2>Рабочие склады</h2>
       <button class="btn" id="wh-refresh" style="margin-left:auto;font-size:12px;">Обновить список из МойСклад</button>
     </div>
@@ -231,6 +260,77 @@ document.addEventListener("DOMContentLoaded", function () {
   document.getElementById("btn-save-horizon").addEventListener("click", function () {
     saveSettings(null, "Горизонт заказа и срок производства сохранены");
   });
+
+
+  // ── Распределение позиций по производствам ────────────────────────────────
+  var ASSIGN_SRC = {}, ASSIGN_PRODS = [], ASSIGN_MAP = {};
+
+  function renderAssign() {
+    var src = document.getElementById("assign-source").value;
+    var box = document.getElementById("assign-box");
+    if (src === "manual") {
+      box.innerHTML = '<div class="hint">Позиции распределяются только вручную — кнопками в последней колонке на странице «Заказ».</div>';
+      return;
+    }
+    var info = ASSIGN_SRC[src] || {values: [], empty: 0};
+    if (!info.values.length) {
+      box.innerHTML = '<div class="hint">В МойСкладе этот признак не заполнен — распределять по нему нечего.</div>';
+      return;
+    }
+    var opts = ASSIGN_PRODS.map(function (p) {
+      return '<option value="' + p.id + '">' + esc(p.name) + '</option>';
+    }).join("");
+    box.innerHTML = '<table class="tbl"><thead><tr><th>Значение из МойСклада</th>' +
+      '<th style="width:110px">Позиций</th><th style="width:260px">Производство</th></tr></thead><tbody>' +
+      info.values.map(function (v) {
+        var cur = ASSIGN_MAP[v.value];
+        return '<tr><td>' + esc(v.value) + '</td><td>' + v.positions + '</td>' +
+          '<td><select class="input assign-pick" data-v="' + esc(v.value) + '">' +
+          '<option value="">— основное —</option>' + opts + '</select></td></tr>';
+      }).join("") + '</tbody></table>' +
+      (info.empty ? '<div class="hint" style="margin-top:9px;">У ' + info.empty +
+        ' позиций признак не заполнен — они остаются на основном производстве.</div>' : "");
+    Array.prototype.forEach.call(box.querySelectorAll(".assign-pick"), function (sel) {
+      var v = sel.dataset.v;
+      if (ASSIGN_MAP[v]) sel.value = String(ASSIGN_MAP[v]);
+      sel.addEventListener("change", function () {
+        if (sel.value) ASSIGN_MAP[v] = parseInt(sel.value, 10);
+        else delete ASSIGN_MAP[v];
+      });
+    });
+  }
+
+  function loadAssign() {
+    Promise.all([api("/api/productions/assign-sources"), api("/api/productions")])
+      .then(function (r) {
+        ASSIGN_SRC = r[0].sources || {};
+        ASSIGN_MAP = Object.assign({}, (r[0].current || {}).assign_map || {});
+        ASSIGN_PRODS = (r[1].productions || []);
+        document.getElementById("assign-source").value = (r[0].current || {}).assign_source || "manual";
+        var sg = r[0].suggest || {};
+        document.getElementById("assign-suggest").textContent = sg.assign_source && sg.assign_source !== "manual"
+          ? ("Подсказка: " + sg.reason + " — предлагаю распределять по признаку «" +
+             (sg.assign_source === "supplier" ? "Поставщик" : "Папка") + "».")
+          : (sg.reason || "");
+        renderAssign();
+      }).catch(function (e) {
+        document.getElementById("assign-box").innerHTML =
+          '<div class="hint">Не удалось загрузить: ' + esc(e.message) + '</div>';
+      });
+  }
+
+  document.getElementById("assign-source").addEventListener("change", renderAssign);
+  document.getElementById("btn-save-assign").addEventListener("click", function () {
+    var src = document.getElementById("assign-source").value;
+    api("/api/productions/assign-rule", {method: "POST", body: {
+      assign_source: src, assign_map: src === "manual" ? {} : ASSIGN_MAP
+    }}).then(function (d) {
+      var n = d.assigned || 0;
+      toast(src === "manual" ? "Распределение только вручную"
+            : ("Правило сохранено: распределено " + n + " позиций"), "success");
+    }).catch(function (e) { toast(e.message, "error"); });
+  });
+  loadAssign();
 
   // «Обновить список из МойСклад»: подтягивает склады, появившиеся в МС после
   // онбординга (GET мержит с текущим выбором, POST апсертит Warehouse-строки).

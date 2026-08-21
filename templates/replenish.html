@@ -535,9 +535,11 @@
     .catch(function(e){ alert("Не удалось удалить: "+e.message); });
   }
   function moveTo(base,pid){
-    api("/api/productions/assign",{method:"POST",body:{base_name:base,production_id:pid===MAIN_ID?null:pid}})
+    /* Всегда отправляем реальный id: перенос на основное — тоже осознанное
+       назначение (при активном правиле распределения иначе позицию не вернуть). */
+    api("/api/productions/assign",{method:"POST",body:{base_name:base,production_id:pid}})
       .then(function(){
-        if(pid===MAIN_ID) delete ASSIGN[base]; else ASSIGN[base]=pid;
+        ASSIGN[base]=pid;
         renderAll();
       }).catch(function(e){ alert("Не удалось перенести: "+e.message); });
   }
