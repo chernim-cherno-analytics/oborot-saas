@@ -195,7 +195,7 @@ document.addEventListener("DOMContentLoaded", function () {
     document.getElementById("horizon").value = settings.horizon_days != null ? settings.horizon_days : 90;
     document.getElementById("lead-time").value = settings.lead_time_days != null ? settings.lead_time_days : 45;
     renderWarehouses(settings.warehouses || []);
-    renderConnection(settings.connection || null);
+    renderConnection(settings.connection || null, settings.role === "owner");
     renderTeam(settings.members || []);
     loadExclusions();
   }).catch(function () {
@@ -366,7 +366,7 @@ document.addEventListener("DOMContentLoaded", function () {
     });
   }
 
-  function renderConnection(conn) {
+  function renderConnection(conn, isOwner) {
     var box = document.getElementById("conn-box");
     var KIND = { moysklad: "МойСклад", demo: "Демо-данные" };
     var ST = { active: ["active", "работает"], pending: ["pending", "ожидает синхронизации"], error: ["error", "ошибка"] };
@@ -390,7 +390,56 @@ document.addEventListener("DOMContentLoaded", function () {
       "</div>" +
       '<button class="btn" type="button" id="btn-connect-ms" style="margin-bottom:1px;">Подключить</button></div>' +
       '<div class="hint" style="margin-top:6px;">Токен хранится в зашифрованном виде. МойСклад → Настройки → Обмен данными → Токены API.</div>';
+    if (conn && conn.kind === "moysklad" && isOwner) {
+      // Инцидент 21.08: после смены токена пользователю негде было запустить
+      // синхронизацию — теперь кнопка здесь же, со строкой прогресса.
+      // Только владельцу: ручки /api/sync/* owner-only, участнику они дали бы 403.
+      html += '<div style="display:flex; align-items:center; gap:10px; margin-top:16px; flex-wrap:wrap;">' +
+        '<button class="btn" type="button" id="btn-sync-now">Синхронизировать сейчас</button>' +
+        '<button class="btn" type="button" id="btn-sync-rebuild" style="font-size:12px;">Полная пересборка истории</button>' +
+        '<span class="hint" id="sync-status-line" style="margin:0;"></span></div>';
+    }
     box.innerHTML = html;
+
+    var syncBtn = document.getElementById("btn-sync-now");
+    var rebuildBtn = document.getElementById("btn-sync-rebuild");
+    var statusLine = document.getElementById("sync-status-line");
+    var pollTimer = null;
+
+    var rebuildArmed = null;
+    function disarmRebuild() {
+      if (rebuildArmed) { clearTimeout(rebuildArmed); rebuildArmed = null; }
+      if (rebuildBtn) rebuildBtn.textContent = "Полная пересборка истории";
+    }
+
+    function showSyncStatus(st) {
+      if (!statusLine) return;
+      var running = st && st.state === "running";
+      if (syncBtn) syncBtn.disabled = running;
+      if (rebuildBtn) rebuildBtn.disabled = running;
+      if (running) disarmRebuild();
+      if (running) {
+        statusLine.style.color = "";
+        statusLine.textContent = (st.detail || "Синхронизация…") + " · " + Math.round(st.progress_pct || 0) + "%";
+      } else if (st && st.state === "error") {
+        statusLine.style.color = "#e5484d";
+        statusLine.textContent = st.error || "Синхронизация завершилась ошибкой";
+      } else if (st && st.state === "done") {
+        statusLine.style.color = "";
+        statusLine.textContent = "Синхронизация завершена" + (st.finished_at ? " · " + fmtDate(st.finished_at) : "");
+      } else {
+        statusLine.textContent = "";
+      }
+    }
+
+    function pollSyncStatus() {
+      if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+      api("/api/sync/status").then(function (st) {
+        showSyncStatus(st);
+        if (st && st.state === "running") pollTimer = setTimeout(pollSyncStatus, 2000);
+        else if (st && st.state === "done") toast("Синхронизация завершена", "success");
+      }).catch(function () { /* статус недоступен — не шумим */ });
+    }
 
     document.getElementById("btn-connect-ms").addEventListener("click", function () {
       var token = document.getElementById("ms-token").value.trim();
@@ -400,8 +449,47 @@ document.addEventListener("DOMContentLoaded", function () {
       api("/api/connect/moysklad", { method: "POST", body: { token: token } }).then(function (res) {
         toast((res && res.note) || "Подключение сохранено", "success");
         document.getElementById("ms-token").value = "";
+        if (res && res.sync_started) pollSyncStatus();
       }).finally(function () { btn.disabled = false; });
     });
+
+    if (syncBtn) {
+      // Текущее состояние при загрузке: если синк уже идёт — сразу показываем прогресс.
+      api("/api/sync/status").then(function (st) {
+        if (st && (st.state === "running" || st.state === "error")) { showSyncStatus(st); }
+        if (st && st.state === "running") pollTimer = setTimeout(pollSyncStatus, 2000);
+      }).catch(function () {});
+
+      syncBtn.addEventListener("click", function () {
+        syncBtn.disabled = true;
+        api("/api/sync/run", { method: "POST", body: {} }).then(function () {
+          statusLine.style.color = ""; statusLine.textContent = "Синхронизация запущена…";
+          pollSyncStatus();
+        }).catch(function (err) {
+          // 409 «уже идёт» — просто подхватываем прогресс идущего синка.
+          if (err && /уже идёт/.test(err.message || "")) { pollSyncStatus(); return; }
+          syncBtn.disabled = false;
+        });
+      });
+
+      // Двухкликовое подтверждение без нативных диалогов: второй клик в течение 5 с.
+      rebuildBtn.addEventListener("click", function () {
+        if (rebuildArmed) {
+          disarmRebuild();
+          rebuildBtn.disabled = true;
+          api("/api/sync/initial", { method: "POST", body: {} }).then(function (res) {
+            toast("История пересобирается" + (res && res.estimate_minutes ? " — примерно " + res.estimate_minutes + " мин" : ""), "success");
+            pollSyncStatus();
+          }).catch(function (err) {
+            if (err && /уже идёт/.test(err.message || "")) { pollSyncStatus(); return; }
+            rebuildBtn.disabled = false;
+          });
+          return;
+        }
+        rebuildBtn.textContent = "Точно пересобрать? Нажмите ещё раз";
+        rebuildArmed = setTimeout(disarmRebuild, 5000);
+      });
+    }
   }
 
   function renderTeam(members) {
