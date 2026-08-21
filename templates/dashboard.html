@@ -264,8 +264,15 @@ document.addEventListener("DOMContentLoaded", function () {
       document.getElementById("season-title").textContent = "Здоровье сезона (" + sh.label + ")";
     }
     if (sh.status === "no_data") {
-      box.innerHTML = emptyState("Пока нет данных за сезон",
-        "Как только появятся продажи или сток сезонных позиций, здесь будет sell-through против норматива 70 / 20 / 10.", "");
+      // Деплой П1: история грузится в фоне. Если сезон начался раньше, чем
+      // первый загруженный день, выручка сезона обрезана — считать нечего,
+      // но и «нет продаж» это не значит: цифры доедут сами.
+      box.innerHTML = sh.partial_coverage
+        ? emptyState("Сезон ещё считается",
+            "История загружена с " + fmtDate(sh.coverage_start) + ", остальное подгружается в фоне. " +
+            "Цифры сезона появятся сами — обновлять ничего не нужно.", "")
+        : emptyState("Пока нет данных за сезон",
+            "Как только появятся продажи или сток сезонных позиций, здесь будет sell-through против норматива 70 / 20 / 10.", "");
       return;
     }
     var st = { healthy: ["green", "в норме"], warning: ["yellow", "внимание"], alarm: ["red", "тревога"] }[sh.status] || ["gray", sh.status];

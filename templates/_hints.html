@@ -3,6 +3,79 @@
    standalone-страницах (turnover.html, stocks.html). Ожидает в контексте
    переменную `active` (ключ страницы). Просмотры хранятся на сервере
    (/api/hints/seen, per-user) — работает и в iframe МойСклада. #}
+
+{# Общий загрузчик состояния синхронизации. Один запрос /api/sync/progress на
+   страницу обслуживает трёх потребителей этого файла: подсказки (не открывать
+   модалку поверх полосы прогресса), чип свежести (не дублировать красный текст
+   полосы) и саму полосу. Здесь же живут общие помощники: русские склонения,
+   признак «это первичная загрузка», окно расчёта в днях. #}
+<script>
+(function(){
+  "use strict";
+  var S = window.OborotSync = window.OborotSync || {};
+
+  // /login, /register, /onboarding (body.auth-page): сессии либо ещё нет, либо
+  // подключать нечего — не поллим вовсе, иначе бесконечный цикл 401.
+  S.silent = !!(document.body && document.body.classList.contains("auth-page"));
+
+  // Русские склонения: 1 день / 2 дня / 5 дней.
+  S.plural = function(n, one, few, many){
+    n = Math.abs(Math.round(Number(n) || 0));
+    var d10 = n % 10, d100 = n % 100;
+    if (d10 === 1 && d100 !== 11) return one;
+    if (d10 >= 2 && d10 <= 4 && (d100 < 10 || d100 >= 20)) return few;
+    return many;
+  };
+  S.plu = function(n, one, few, many){
+    n = Math.round(Number(n) || 0);
+    return n + " " + S.plural(n, one, few, many);
+  };
+
+  // Первичная загрузка (или догон истории) — в отличие от ежедневного
+  // инкремента в 06:00, ради которого полосу показывать не нужно.
+  // Порядок предпочтений: mode → phase → наличие этапов (сервер отдаёт
+  // stages[] только для mode == "initial").
+  S.isFirstSync = function(d){
+    if (!d) return false;
+    if (d.mode) return String(d.mode) === "initial";
+    if (d.phase) return true;
+    return !!(d.stages && d.stages.length);
+  };
+
+  // Окно первичного расчёта (INITIAL_WINDOW_DAYS) — env-настраиваемое.
+  // Верхний уровень ответа, иначе счётчики этапа «month», иначе дефолт 30.
+  S.windowDays = function(d){
+    var w = Number(d && d.window_days);
+    if (w > 0) return w;
+    var st = ((d && d.stages) || []).filter(function(s){ return s.key === "month"; })[0];
+    w = Number(st && st.counts && st.counts.window_days);
+    return w > 0 ? w : 30;
+  };
+
+  // Полоса сейчас показывает ошибку — значит чип свежести молчит про неё.
+  S.barShowsError = function(d){
+    return !!(d && d.state === "error" && S.isFirstSync(d));
+  };
+
+  var cached = null;
+  // Возвращает {auth: bool, data: object|null}. auth:false — сессия истекла
+  // (401/403): потребители обязаны замолчать.
+  S.progress = function(force){
+    if (S.silent) return Promise.resolve({auth: false, data: null});
+    if (force || !cached) {
+      cached = fetch("/api/sync/progress", {credentials: "same-origin"})
+        .then(function(r){
+          if (r.status === 401 || r.status === 403) return {auth: false, data: null};
+          if (!r.ok) return {auth: true, data: null};
+          return r.json().then(function(d){ return {auth: true, data: d || null}; });
+        })
+        .catch(function(){ return {auth: true, data: null}; });
+    }
+    return cached;
+  };
+})();
+</script>
+
 <style>
   .hint-fab { position: fixed; right: 18px; bottom: 18px; z-index: 900;
     width: 40px; height: 40px; border-radius: 50%; border: 1px solid rgba(31,31,31,.18);
@@ -133,12 +206,27 @@
   closeBtn.addEventListener("click", function(){ close(true); });
   overlay.addEventListener("click", function(e){ if(e.target===overlay) close(true); });
 
-  // первый визит: показать инструкцию, если пользователь её ещё не видел
+  // Первый визит: показать инструкцию, если пользователь её ещё не видел.
+  // Ревью: сразу после «Начать синхронизацию» пользователь попадает на
+  // /turnover, где идёт первичная загрузка — модалка (z-index 1000) закрывала
+  // бы полосу прогресса. Пока state === "running", автопоказ откладываем:
+  // «просмотрено» при этом НЕ отмечаем, поэтому после загрузки подсказка
+  // откроется сама при следующем заходе. Кнопка «?» доступна всегда.
   try {
-    fetch("/api/hints/seen", {credentials:"same-origin"})
+    var seenP = fetch("/api/hints/seen", {credentials:"same-origin"})
       .then(function(r){ return r.ok ? r.json() : {seen:[]}; })
-      .then(function(d){ if ((d.seen||[]).indexOf(PAGE) === -1) open(); })
-      .catch(function(){});
+      .catch(function(){ return {seen:[]}; });
+    var progP = window.OborotSync ? window.OborotSync.progress()
+                                  : Promise.resolve({auth:true, data:null});
+    Promise.all([seenP, progP]).then(function(res){
+      var d = res[0] || {seen:[]}, prog = res[1] && res[1].data;
+      if ((d.seen||[]).indexOf(PAGE) !== -1) return;
+      // Не перекрываем полосу первичной загрузки: ни пока она идёт, ни когда
+      // она оборвалась (красная полоса с кнопкой важнее рассказа о странице).
+      if (prog && S.isFirstSync(prog)
+          && (prog.state === "running" || prog.state === "error")) return;
+      open();
+    }).catch(function(){});
   } catch(e){}
 })();
 </script>
@@ -171,14 +259,23 @@
     if (!iso) return 999;
     return Math.floor((Date.now() - new Date(iso + "T00:00:00").getTime()) / 86400000);
   }
+  var S = window.OborotSync;
+  if (S && S.silent) return;
   try {
-    fetch("/api/freshness", {credentials:"same-origin"})
-      .then(function(r){ if (!r.ok) throw 0; return r.json(); })
-      .then(function(d){
-        var last = [d.last_sale_date, d.last_stock_date].filter(Boolean).sort().pop() || null;
+    Promise.all([
+      fetch("/api/freshness", {credentials:"same-origin"})
+        .then(function(r){ if (!r.ok) throw 0; return r.json(); }),
+      S ? S.progress() : Promise.resolve({auth:true, data:null})
+    ])
+      .then(function(res){
+        var d = res[0], prog = res[1] && res[1].data;
+        // Ревью: полоса под шапкой уже показывает ту же ошибку красным —
+        // две красные поверхности с одинаковым текстом. Пока говорит полоса,
+        // чип остаётся нейтральным: только даты данных.
+        var barTalks = S ? S.barShowsError(prog) : false;
         var stale = Math.min(ageDays(d.last_sale_date), ageDays(d.last_stock_date));
         var txt = "Данные: продажи по " + dm(d.last_sale_date) + " · склад по " + dm(d.last_stock_date);
-        if (d.sync_state === "error") {
+        if (d.sync_state === "error" && !barTalks) {
           chip.classList.add("bad");
           txt = "⚠ Синхронизация падает — " + (d.sync_error || "ошибка") + " · " + txt +
             " · нажмите, чтобы исправить в настройках";
@@ -187,10 +284,400 @@
           txt = "Данные отстают: продажи по " + dm(d.last_sale_date) +
             " · склад по " + dm(d.last_stock_date) + " · проверьте синхронизацию";
         }
+        // Деплой П1: пока история догружается фоном — честно пишем покрытие.
+        var cov = Number(d.coverage_days), hd = Number(d.history_days);
+        if (hd > 0 && cov >= 0 && cov < hd) {
+          txt += " · история " + cov + " из " + hd + " дн.";
+        }
         chip.innerHTML = '<span class="fd"></span><span></span>';
         chip.lastChild.textContent = txt;
         chip.style.display = "flex";
       }).catch(function(){});
   } catch(e){}
+})();
+</script>
+
+{# Деплой П1: полоска прогресса первичной загрузки под шапкой (все страницы,
+   владелец и участники). Поллит /api/sync/progress: 2 с пока идёт, 30 с иначе;
+   после done показывает зелёную плашку 5 с и умолкает (sessionStorage).
+   Панель «Подробнее» — этапы, месяцы, счётчики. Все строки сервера — через
+   textContent. Настройки (settings.html) поллят свой /api/sync/status отдельно —
+   полоска с ним не конфликтует. #}
+<style>
+  .syncbar { position: sticky; top: 0; z-index: 190; display: none;
+    background: rgba(255,255,255,.6); border-bottom: 1px solid rgba(31,31,31,.09);
+    backdrop-filter: blur(10px); color: #1f1f1f;
+    font: 12.5px/1.4 Helvetica, 'Helvetica Neue', Arial, sans-serif; }
+  .syncbar.show { display: block }
+  .syncbar.is-error { background: rgba(221,0,4,.08); border-bottom-color: rgba(221,0,4,.25) }
+  .syncbar.is-done { background: rgba(42,92,16,.10); border-bottom-color: rgba(42,92,16,.25) }
+  .syncbar .sb-row { display: flex; align-items: center; gap: 12px; padding: 7px 28px; flex-wrap: wrap; }
+  .syncbar .sb-spin { width: 14px; height: 14px; flex: 0 0 14px; animation: sb-rot 1s linear infinite; }
+  .syncbar.is-error .sb-spin, .syncbar.is-done .sb-spin { animation: none }
+  @keyframes sb-rot { to { transform: rotate(360deg) } }
+  .syncbar .sb-title { font-weight: 600; white-space: nowrap; }
+  .syncbar .sb-track { flex: 1 1 160px; min-width: 120px; height: 6px; border-radius: 3px;
+    background: rgba(31,31,31,.10); overflow: hidden; }
+  .syncbar .sb-fill { height: 100%; width: 0; background: #1f1f1f; border-radius: 3px;
+    transition: width .6s ease; }
+  .syncbar.is-error .sb-fill { background: #dd0004 }
+  .syncbar.is-done .sb-fill { background: #2a5c10 }
+  .syncbar .sb-right { color: rgba(31,31,31,.6); white-space: nowrap; }
+  .syncbar .sb-link { color: #1f1f1f; font-weight: 600; text-decoration: underline; cursor: pointer;
+    background: none; border: none; font: inherit; padding: 0; white-space: nowrap; }
+  .syncbar .sb-link:hover { color: #3a3a3a }
+  .syncbar .sb-wrap { position: relative; }
+  .syncbar .sb-panel { display: none; position: absolute; right: 28px; top: 100%; width: 640px;
+    max-width: calc(100vw - 40px); margin-top: 4px; background: #fbf8f5; color: #1f1f1f;
+    border: 1px solid rgba(31,31,31,.14); border-radius: 14px;
+    box-shadow: 0 18px 50px rgba(31,31,31,.22); padding: 18px 22px 16px; z-index: 195;
+    font-size: 12.5px; line-height: 1.5;
+    /* Панель висит на липкой полосе: на низком экране (≲560px) её низ вместе
+       с кнопкой Telegram уезжал за границу окна и был недостижим. */
+    max-height: calc(100vh - 120px); overflow: auto; }
+  .syncbar .sb-panel.open { display: block }
+  .syncbar .sb-panel h3 { margin: 0 0 2px; font-size: 14px; }
+  .syncbar .sb-panel .sb-sub { color: rgba(31,31,31,.55); margin-bottom: 12px; font-size: 11.5px; }
+  .syncbar .sb-stage { display: flex; gap: 10px; align-items: flex-start; padding: 5px 0;
+    border-top: 1px solid rgba(31,31,31,.07); }
+  .syncbar .sb-stage:first-of-type { border-top: none }
+  .syncbar .sb-ic { width: 16px; height: 16px; flex: 0 0 16px; margin-top: 2px; }
+  .syncbar .sb-ic.run { animation: sb-rot 1s linear infinite }
+  .syncbar .sb-stage .sb-st { font-weight: 600 }
+  .syncbar .sb-stage .sb-sl { color: rgba(31,31,31,.55); font-size: 11.5px; }
+  .syncbar .sb-stage.todo { color: rgba(31,31,31,.45) }
+  .syncbar .sb-months { display: flex; gap: 5px; flex-wrap: wrap; margin: 12px 0 6px; }
+  .syncbar .sb-m { padding: 3px 8px; border-radius: 999px; font-size: 11px; font-weight: 600;
+    border: 1px solid rgba(31,31,31,.12); background: #eee7df; color: rgba(31,31,31,.5); }
+  .syncbar .sb-m.done { background: #1f1f1f; color: #f3e9e0; border-color: #1f1f1f }
+  .syncbar .sb-m.running { background: #ffd666; color: #5c4a00; border-color: #e5b93a }
+  .syncbar .sb-legend { font-size: 11px; color: rgba(31,31,31,.55); margin-bottom: 10px; }
+  .syncbar .sb-legend i { display: inline-block; width: 9px; height: 9px; border-radius: 50%;
+    margin: 0 4px 0 8px; vertical-align: -1px; }
+  .syncbar .sb-note { font-size: 11.5px; color: rgba(31,31,31,.6); margin: 8px 0 12px; }
+  .syncbar .sb-tg { width: 100%; padding: 9px; border-radius: 10px; border: 1px dashed rgba(31,31,31,.25);
+    background: transparent; color: rgba(31,31,31,.45); font: inherit; font-weight: 600; cursor: default; }
+  .syncbar .sb-sr { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0;
+    overflow: hidden; clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap; border: 0; }
+  @media (max-width: 720px) {
+    .syncbar .sb-right { display: none }
+    .syncbar .sb-panel { right: 10px }
+  }
+</style>
+{# aria-live="off" осознанно: заголовок переписывается каждые 2 с в течение часа,
+   и «вежливый» live-регион заставлял скринридер тараторить без остановки.
+   Вслух объявляем только смену фазы — через отдельный .sb-sr ниже. #}
+<div class="syncbar" id="syncbar" role="status" aria-live="off">
+  <div class="sb-sr" id="sb-sr" role="status" aria-live="polite"></div>
+  <div class="sb-wrap">
+    <div class="sb-row">
+      <svg class="sb-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M12 3a9 9 0 1 0 9 9"/></svg>
+      <span class="sb-title" id="sb-title"></span>
+      <div class="sb-track"><div class="sb-fill" id="sb-fill"></div></div>
+      <span class="sb-right" id="sb-right"></span>
+      <a class="sb-link" id="sb-fix" href="/settings" style="display:none">Исправить в настройках</a>
+      <button class="sb-link" type="button" id="sb-retry" style="display:none">Повторить</button>
+      <button class="sb-link" type="button" id="sb-more" aria-expanded="false">Подробнее ▾</button>
+    </div>
+    <div class="sb-panel" id="sb-panel">
+      <h3>Загрузка данных из МойСклада</h3>
+      <div class="sb-sub" id="sb-sub"></div>
+      <div id="sb-stages"></div>
+      <div class="sb-months" id="sb-months"></div>
+      <div class="sb-legend"><i style="background:#1f1f1f"></i>загружено <i style="background:#ffd666"></i>загружается <i style="background:#eee7df;border:1px solid rgba(31,31,31,.15)"></i>в очереди</div>
+      <div class="sb-note">МойСклад ограничивает частоту запросов, поэтому загрузка идёт с паузами. Можно закрыть вкладку — загрузка продолжится на сервере.</div>
+      <button class="sb-tg" type="button" id="sb-tg" title="скоро" disabled>Сообщить в Telegram, когда всё загрузится</button>
+    </div>
+  </div>
+</div>
+<script>
+(function(){
+  "use strict";
+  var bar = document.getElementById("syncbar");
+  if (!bar) return;
+  var elTitle = document.getElementById("sb-title");
+  var elFill = document.getElementById("sb-fill");
+  var elRight = document.getElementById("sb-right");
+  var elFix = document.getElementById("sb-fix");
+  var elRetry = document.getElementById("sb-retry");
+  var elMore = document.getElementById("sb-more");
+  var elPanel = document.getElementById("sb-panel");
+  var elSub = document.getElementById("sb-sub");
+  var elStages = document.getElementById("sb-stages");
+  var elMonths = document.getElementById("sb-months");
+  var elSr = document.getElementById("sb-sr");
+  var timer = null, hideTimer = null, lastData = null;
+  var stopped = false, stopReason = "", lastPhase = null, fixedFallback = false;
+  var S = window.OborotSync || {};
+
+  // Полоса не нужна там, где нет сессии или ещё нечего синхронизировать
+  // (/login, /register, /onboarding — body.auth-page): раньше она вставала
+  // fixed поверх контента и её поллинг бесконечно ловил 401.
+  if (S.silent) { bar.parentNode && bar.parentNode.removeChild(bar); return; }
+
+  // Место: сразу под собственной шапкой страницы.
+  //   legacy-страницы (turnover/stocks/…) — .header, sticky, 56px;
+  //   base.html обычный режим        — header.topbar внутри .main, не sticky;
+  //   встроенный режим МойСклада     — nav.embed-tabs, sticky (высота плавает).
+  // Отступ берём из фактической высоты якоря, а не из константы: 56px «на глаз»
+  // ломались на табах МС. Якоря нет — фиксируем сверху и отодвигаем контент,
+  // иначе полоса легла бы поверх первого экрана.
+  var anchor = document.querySelector(".header")
+            || document.querySelector("header.topbar")
+            || document.querySelector("nav.embed-tabs")
+            || document.querySelector(".embed-tabs");
+  if (anchor) {
+    anchor.insertAdjacentElement("afterend", bar);
+    var pos = "";
+    try { pos = window.getComputedStyle(anchor).position; } catch (e) {}
+    if (pos === "sticky" || pos === "fixed") {
+      var measure = function(){
+        // .nav в legacy-шапке переносится на узких экранах — высоту
+        // перемеряем, а не запоминаем один раз при загрузке.
+        var h = Math.round(anchor.getBoundingClientRect().height);
+        if (h > 0) bar.style.top = h + "px";
+      };
+      measure();
+      window.addEventListener("resize", measure);
+    }
+  } else {
+    bar.style.position = "fixed"; bar.style.top = "0"; bar.style.left = "0"; bar.style.right = "0";
+    document.body.insertBefore(bar, document.body.firstChild);
+    fixedFallback = true;
+  }
+
+  var MONTHS_RU = ["янв","фев","мар","апр","май","июн","июл","авг","сен","окт","ноя","дек"];
+  function ym(s){ var m = parseInt(s.slice(5,7), 10); return MONTHS_RU[m-1] + " " + s.slice(2,4); }
+  function fmtDur(sec){
+    sec = Math.max(0, Math.round(sec || 0));
+    if (sec < 60) return sec + " с";
+    var m = Math.floor(sec / 60), s = sec % 60;
+    if (m < 60) return m + " мин" + (s ? " " + s + " с" : "");
+    return Math.floor(m / 60) + " ч " + (m % 60) + " мин";
+  }
+  function hhmm(iso){
+    if (!iso) return "";
+    var d = new Date(/Z|[+-]\d\d:\d\d$/.test(iso) ? iso : iso + "Z");
+    if (isNaN(d.getTime())) return "";
+    return ("0" + d.getHours()).slice(-2) + ":" + ("0" + d.getMinutes()).slice(-2);
+  }
+  function monthsDone(d){ return (d.months || []).filter(function(m){ return m.state === "done"; }).length; }
+  function setText(el, s){ el.textContent = s == null ? "" : String(s); }
+  function icon(state){
+    var ns = "http://www.w3.org/2000/svg";
+    var svg = document.createElementNS(ns, "svg");
+    svg.setAttribute("viewBox", "0 0 24 24"); svg.setAttribute("fill", "none");
+    svg.setAttribute("stroke", "currentColor"); svg.setAttribute("stroke-width", "2.2");
+    svg.setAttribute("stroke-linecap", "round"); svg.setAttribute("stroke-linejoin", "round");
+    svg.setAttribute("class", "sb-ic" + (state === "running" ? " run" : ""));
+    var p = document.createElementNS(ns, "path");
+    if (state === "done") p.setAttribute("d", "M5 12.5l4.5 4.5L19 7");
+    else if (state === "running") p.setAttribute("d", "M12 3a9 9 0 1 0 9 9");
+    else { p = document.createElementNS(ns, "circle"); p.setAttribute("cx", "12"); p.setAttribute("cy", "12"); p.setAttribute("r", "8"); }
+    svg.appendChild(p);
+    return svg;
+  }
+  function stageSub(st){
+    var c = st.counts || {}, parts = [];
+    if (st.key === "products" && c.products_total != null) parts.push(c.products_total + " позиций");
+    if (st.key === "today") {
+      if (c.warehouses) parts.push(S.plu(c.warehouses, "склад", "склада", "складов")
+        + (c.warehouse_names && c.warehouse_names.length ? ": " + c.warehouse_names.join(", ") : ""));
+    }
+    if (st.key === "month" || st.key === "history") {
+      if (c.sales_docs != null) parts.push(c.sales_docs + " документов продаж");
+      if (c.return_rows != null && c.return_rows > 0) parts.push(c.return_rows + " строк возвратов");
+      if (st.key === "history" && c.chunks_total != null) parts.push("частей: " + (c.chunks_done || 0) + " из " + c.chunks_total);
+    }
+    if (st.seconds != null && st.state !== "todo") parts.push(fmtDur(st.seconds));
+    return parts.join(" · ");
+  }
+  function renderPanel(d){
+    var started = hhmm(d.started_at);
+    var elapsed = "";
+    if (d.started_at) {
+      var s0 = new Date(/Z|[+-]\d\d:\d\d$/.test(d.started_at) ? d.started_at : d.started_at + "Z").getTime();
+      var s1 = d.finished_at ? new Date(/Z|[+-]\d\d:\d\d$/.test(d.finished_at) ? d.finished_at : d.finished_at + "Z").getTime() : Date.now();
+      if (!isNaN(s0) && !isNaN(s1)) elapsed = fmtDur((s1 - s0) / 1000);
+    }
+    setText(elSub, (started ? "началась " + started : "") + (elapsed ? " · прошло " + elapsed : ""));
+    elStages.textContent = "";
+    (d.stages || []).forEach(function(st){
+      var row = document.createElement("div"); row.className = "sb-stage " + st.state;
+      row.appendChild(icon(st.state));
+      var txt = document.createElement("div");
+      var t = document.createElement("div"); t.className = "sb-st"; setText(t, st.title);
+      var sl = document.createElement("div"); sl.className = "sb-sl"; setText(sl, stageSub(st));
+      txt.appendChild(t); if (sl.textContent) txt.appendChild(sl);
+      row.appendChild(txt); elStages.appendChild(row);
+    });
+    elMonths.textContent = "";
+    (d.months || []).forEach(function(m){
+      var pill = document.createElement("span"); pill.className = "sb-m " + m.state;
+      setText(pill, ym(m.ym)); elMonths.appendChild(pill);
+    });
+  }
+  function titleFor(d){
+    if (d.phase === "history") {
+      var total = (d.months || []).length, done = monthsDone(d);
+      return "Загружаем историю: " + done + " из " + total + " "
+        + S.plural(total, "месяца", "месяцев", "месяцев");
+    }
+    if (d.phase === "month") {
+      // Окно env-настраиваемое (INITIAL_WINDOW_DAYS) — не зашиваем «30».
+      return "Считаем за последние " + S.plu(S.windowDays(d), "день", "дня", "дней")
+        + ", дальше качаем историю";
+    }
+    if (d.phase === "products" || d.phase === "today") return "Загружаем ваши данные: товары и остатки на сегодня";
+    return "Обновляем данные из МойСклада";
+  }
+  function doneKey(d){ return "oborot.syncbar.done." + (d.finished_at || ""); }
+  function tms(iso){
+    if (!iso) return 0;
+    var t = new Date(/Z|[+-]\d\d:\d\d$/.test(iso) ? iso : iso + "Z").getTime();
+    return isNaN(t) ? 0 : t;
+  }
+  function fixedPad(){
+    if (!fixedFallback) return;
+    document.body.style.paddingTop = bar.classList.contains("show") ? bar.offsetHeight + "px" : "";
+  }
+  function closePanel(){
+    elPanel.classList.remove("open");
+    elMore.textContent = "Подробнее ▾";
+    elMore.setAttribute("aria-expanded", "false");
+  }
+  function hideBar(){
+    bar.classList.remove("show");
+    closePanel();          // иначе переключатель врал: «Скрыть ▴» / aria-expanded=true
+    fixedPad();
+  }
+  // Скринридеру объявляем только смену фазы (не каждый тик поллинга).
+  function announce(d){
+    var key = String((d && d.state) || "") + "/" + String((d && d.phase) || "");
+    if (key === lastPhase) return;
+    lastPhase = key;
+    setText(elSr, elTitle.textContent);
+  }
+  function render(d){
+    lastData = d;
+    bar.classList.remove("is-error", "is-done");
+    elFix.style.display = "none"; elRetry.style.display = "none";
+    var pct = Math.max(2, Math.min(100, Number(d.progress_pct) || 0));
+    // Ежедневный инкремент (06:00) полосу не показывает: заголовок был бы
+    // безликим, а панель «Подробнее» — пустой (сервер отдаёт stages[] только
+    // для первичной загрузки).
+    var first = S.isFirstSync(d);
+    if (d.state === "running" && first) {
+      setText(elTitle, titleFor(d));
+      elFill.style.width = pct + "%";
+      var r = "можно пользоваться, цифры уточняются";
+      if (d.eta_sec != null) r = "осталось ~" + fmtDur(d.eta_sec) + " · " + r;
+      setText(elRight, r);
+      bar.classList.add("show");
+      fixedPad(); announce(d);
+      return;
+    }
+    if (d.state === "error" && first) {
+      bar.classList.add("is-error", "show");
+      setText(elTitle, d.error || "Загрузка прервана");
+      elFill.style.width = pct + "%";
+      setText(elRight, "");
+      if (d.can_manage) {  // владелец: кнопки действия; участник видит только текст
+        if (d.error_cause === "transient" || d.error_cause === "internal") elRetry.style.display = "";
+        else elFix.style.display = "";
+      }
+      fixedPad(); announce(d);
+      return;
+    }
+    if (d.state === "done" && first) {
+      var key = doneKey(d), shown = false;
+      try { shown = !!sessionStorage.getItem(key); } catch(e) {}
+      var fin = tms(d.finished_at);
+      var fresh = fin && (Date.now() - fin) < 10 * 60 * 1000;
+      if (!shown && fresh) {
+        bar.classList.add("is-done", "show");
+        var wh = Number((((d.stages || []).filter(function(s){ return s.key === "today"; })[0]
+          || {}).counts || {}).warehouses);
+        var months = monthsDone(d), parts = [];
+        if (months > 0) parts.push(S.plu(months, "месяц", "месяца", "месяцев") + " истории");
+        if (wh > 0) parts.push(S.plu(wh, "склад", "склада", "складов"));
+        setText(elTitle, parts.length ? "Всё загружено: " + parts.join(", ") : "Всё загружено");
+        elFill.style.width = "100%";
+        setText(elRight, "");
+        try { sessionStorage.setItem(key, "1"); } catch(e) {}
+        fixedPad(); announce(d);
+        if (hideTimer) clearTimeout(hideTimer);
+        hideTimer = setTimeout(function(){ hideBar(); stop("done"); }, 5000);
+        return;
+      }
+    }
+    hideBar();
+  }
+  function stop(reason){
+    stopped = true; stopReason = reason;
+    if (timer) { clearTimeout(timer); timer = null; }
+  }
+  function schedule(d){
+    if (stopped) return;
+    if (d && d.state === "running" && S.isFirstSync(d)) { timer = setTimeout(poll, 2000); return; }
+    // Ревью: раньше поллинг перевзводился каждые 30 с вечно — на каждой
+    // странице, в каждой вкладке, у любой idle/done/error организации.
+    // Останавливаемся, когда синк не идёт и всё закончилось давно; свежее
+    // окно (10 мин) ещё дослеживаем, а «проснёмся» на visibilitychange.
+    var fin = tms(d && d.finished_at);
+    if (!fin || (Date.now() - fin) > 10 * 60 * 1000) { stop("idle"); return; }
+    timer = setTimeout(poll, 30000);
+  }
+  function poll(){
+    if (stopped) return;
+    if (timer) { clearTimeout(timer); timer = null; }
+    fetch("/api/sync/progress", {credentials:"same-origin"})
+      .then(function(r){
+        // Сессия истекла: полоса иначе застывала бы на «Загружаем историю:
+        // 0 из 13 месяцев» и врала до самой перезагрузки страницы.
+        if (r.status === 401 || r.status === 403) { hideBar(); stop("auth"); return null; }
+        if (!r.ok) throw 0;
+        return r.json();
+      })
+      .then(function(d){
+        if (d === null) return;
+        render(d || {});
+        if (elPanel.classList.contains("open")) renderPanel(d || {});
+        schedule(d);
+      })
+      .catch(function(){ if (!stopped) timer = setTimeout(poll, 30000); });
+  }
+  elMore.addEventListener("click", function(){
+    var open = !elPanel.classList.contains("open");
+    if (!open) { closePanel(); return; }
+    elPanel.classList.add("open");
+    elMore.setAttribute("aria-expanded", "true");
+    elMore.textContent = "Скрыть ▴";
+    if (lastData) renderPanel(lastData);
+  });
+  document.addEventListener("click", function(e){
+    if (elPanel.classList.contains("open") && !bar.contains(e.target)) closePanel();
+  });
+  elRetry.addEventListener("click", function(){
+    elRetry.disabled = true;
+    fetch("/api/sync/run", {method:"POST", credentials:"same-origin",
+      headers:{"Content-Type":"application/json","X-Oborot-CSRF":"1"}, body:"{}"})
+      .then(function(){ stopped = false; stopReason = ""; poll(); })
+      .catch(function(){})
+      .then(function(){ elRetry.disabled = false; });
+  });
+  // Вкладку вернули на передний план — один раз переспрашиваем сервер
+  // (синк мог стартовать из настроек или из соседней вкладки).
+  document.addEventListener("visibilitychange", function(){
+    if (document.visibilityState !== "visible") return;
+    if (!stopped || stopReason === "auth") return;   // после 401 не будим
+    stopped = false; stopReason = ""; poll();
+  });
+  // Первый ответ берём из общего кэша — не дублируем запрос подсказок/чипа.
+  S.progress().then(function(res){
+    if (!res.auth) { hideBar(); stop("auth"); return; }
+    if (res.data) { render(res.data); schedule(res.data); }
+    else if (!stopped) timer = setTimeout(poll, 30000);
+  });
 })();
 </script>

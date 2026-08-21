@@ -51,6 +51,7 @@
   .pcenter { position:absolute; inset:0; display:flex; flex-direction:column;
     align-items:center; justify-content:center; text-align:center }
   .pcenter .big { font-size:26px; font-weight:700 }
+  .pcenter .big.muted { color:rgba(31,31,31,0.35) }
   .pcenter .sub { font-size:9.5px; color:rgba(31,31,31,0.5); line-height:1.3 }
   .pinfo { flex:1; min-width:0; font-size:12.5px }
   .pinfo h3 { font-size:11px; font-weight:600; letter-spacing:.06em; text-transform:uppercase;
@@ -164,6 +165,13 @@
   }
   function mw(name,q){ if(!q) return true; var nl=name.toLowerCase();
     return q.toLowerCase().split(/\s+/).every(function(w){ return nl.indexOf(w)>=0; }); }
+  function plural(n,one,few,many){
+    var a=Math.abs(n)%100, b=a%10;
+    if(a>10&&a<20) return many;
+    if(b>1&&b<5) return few;
+    if(b===1) return one;
+    return many;
+  }
   var MONTH_NAMES=["янв","фев","мар","апр","май","июн","июл","авг","сен","окт","ноя","дек"];
   function monthLabel(mm){ var p=mm.split("-"); return MONTH_NAMES[+p[1]-1]+" "+p[0].slice(2); }
 
@@ -208,10 +216,16 @@
       return '<div class="pm"><span>'+monthLabel(x.month)+'</span><b>'+
         (x.v===null?"нет данных":fmtM(x.v))+'</b></div>';
     }).join("")+'<div class="pm cur"><span>'+o.curLabel+'</span><b>'+fmtM(o.curValue)+'</b></div>';
+    // Деплой П1: пока не набралось двух полных месяцев истории, сравнивать
+    // не с чем — кольцо пустое (нейтральный трек), подпись честно говорит,
+    // сколько месяцев уже покрыто, вместо «0% от среднего».
+    var sub=o.partial
+      ? 'накапливаем историю<br>'+o.covered+' '+plural(o.covered,"месяц","месяца","месяцев")+' из 6'
+      : 'от среднего<br>за 6 мес';
     return '<div class="pulse-cell">'+
-      '<div class="pring-wrap" title="'+esc(o.tip)+'">'+ringHtml(o.pct,o.c1,o.c2,false)+
-        '<div class="pcenter"><div class="big">'+pctTxt+'</div>'+
-        '<div class="sub">от среднего<br>за 6 мес</div></div></div>'+
+      '<div class="pring-wrap" title="'+esc(o.tip)+'">'+ringHtml(o.partial?null:o.pct,o.c1,o.c2,false)+
+        '<div class="pcenter"><div class="big'+(o.partial?" muted":"")+'">'+pctTxt+'</div>'+
+        '<div class="sub">'+sub+'</div></div></div>'+
       '<div class="pinfo"><h3><span class="psw" style="background:'+o.c2+'"></span>'+esc(o.title)+'</h3>'+
         o.lines.map(function(l){
           return '<div class="pline"><span class="k">'+l[0]+'</span><b>'+l[1]+'</b></div>';
@@ -224,27 +238,34 @@
     var s=p.sales, st=p.stock;
     var now=new Date();
     var curM=MONTH_NAMES[now.getMonth()]+" "+String(now.getFullYear()).slice(2);
+    // Деплой П1: partial — покрыто меньше двух полных месяцев. Средние за
+    // 6 месяцев в этом случае не средние ни разу: показываем «—», а не 0 ₽.
+    var part=!!p.partial, cov=p.covered_months||0;
+    var tipPart="История загружена с "+(p.coverage_start||"?")+": полных месяцев — "+cov+
+      " из 6, сравнивать пока не с чем";
     box.innerHTML=pulseCell({
-      pct:s.pct, c1:"#7fc4b3", c2:"#00846b",
+      pct:s.pct, c1:"#7fc4b3", c2:"#00846b", partial:part, covered:cov,
       title:"Продажи · "+curM+" (прогноз)",
-      tip:"Прогноз месяца против среднего за 6 полных месяцев",
+      tip:part?tipPart:"Прогноз месяца против среднего за 6 полных месяцев",
       lines:[["Уже продано ("+s.days_passed+" дн)",fmtM(s.mtd)],
              ["Прогноз на весь месяц",fmtM(s.projected)],
-             ["Средний месяц (6 мес)",fmtM(s.avg6)]],
+             ["Средний месяц (6 мес)",part?"—":fmtM(s.avg6)]],
       months:s.months, curLabel:curM+" · прогноз", curValue:s.projected,
     })+pulseCell({
-      pct:st.pct, c1:"#e0a97e", c2:"#b05212",
+      pct:st.pct, c1:"#e0a97e", c2:"#b05212", partial:part, covered:cov,
       title:"Склад в деньгах",
-      tip:"Стоимость остатка сейчас против средней за 6 полных месяцев",
+      tip:part?tipPart:"Стоимость остатка сейчас против средней за 6 полных месяцев",
       lines:[["Склад сейчас",fmtM(st.current)],
-             ["Средний склад (6 мес)",fmtM(st.avg6)]],
+             ["Средний склад (6 мес)",part?"—":fmtM(st.avg6)]],
       months:st.months, curLabel:"сейчас", curValue:st.current,
     });
 
     // мини-круги: затухание без перезаказа (текущий месяц не показываем — он
     // в больших кольцах фактом), доля того же среднего за 6 месяцев.
     // Два ряда: продажи (бирюзовый) и склад (терракотовый, сток на начало месяца).
-    if(fcMonths&&fcMonths.length>1){
+    // При partial среднее за 6 месяцев ещё не среднее — доли от него были бы
+    // такой же выдумкой, как процент в большом кольце. Ряды прячем.
+    if(fcMonths&&fcMonths.length>1&&!part){
       var mini=document.getElementById("pmini");
       var rowLbl=function(t){
         return '<div style="flex-basis:100%;font-size:10px;font-weight:600;letter-spacing:.06em;'+

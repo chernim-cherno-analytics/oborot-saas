@@ -56,16 +56,12 @@
       <div class="hint" id="stores-estimate" style="margin-top:10px;"></div>
     </div>
 
-    <!-- Шаг 2: прогресс (демо — анимация; МойСклад — реальный поллинг) -->
+    <!-- Шаг 2: прогресс (только демо — анимация; МойСклад уходит сразу в /turnover) -->
     <div id="step-2" style="display:none;">
       <h1 id="progress-title">Готовим данные…</h1>
       <p class="auth-sub" id="progress-sub">Обычно это занимает меньше минуты</p>
       <div class="progress-track"><i id="progress-fill"></i></div>
       <div class="progress-note" id="progress-note">Создаём подключение…</div>
-      <div id="sync-error" style="display:none; margin-top:14px;">
-        <p class="auth-sub" id="sync-error-text" style="color:#e5484d;"></p>
-        <button class="btn" type="button" id="btn-sync-back">Назад</button>
-      </div>
     </div>
 
   </div>
@@ -189,57 +185,11 @@ document.addEventListener("DOMContentLoaded", function () {
     btn.disabled = true;
     api("/api/connect/moysklad/stores", { method: "POST", body: { ext_ids: ids } }).then(function () {
       return api("/api/sync/initial", { method: "POST", body: {} });
-    }).then(function (res) {
-      document.getElementById("progress-title").textContent = "Синхронизация с МойСклад";
-      var est = res && res.estimate_minutes;
-      document.getElementById("progress-sub").textContent = est
-        ? "Забираем историю остатков и продаж. Ориентировочно " + Math.max(1, Math.round(est)) + " мин — можно оставить вкладку открытой."
-        : "Забираем историю остатков и продаж из МойСклад";
-      showStep("step-2");
-      pollSync();
+    }).then(function () {
+      // Деплой П1: прогрессивная загрузка — сервис открывается сразу, прогресс
+      // показывает полоска под шапкой на любой странице (templates/_hints.html).
+      window.location.href = "/turnover";
     }).catch(function () { btn.disabled = false; });
-  });
-
-  var STAGE_LABELS = {
-    queued: "Ставим задачу в очередь…",
-    products: "Загружаем ассортимент…",
-    stock_history: "Собираем историю остатков…",
-    stock_today: "Обновляем остатки на сегодня…",
-    sales: "Загружаем продажи и возвраты…",
-    finalize: "Пересчитываем аналитику…",
-    done: "Готово!"
-  };
-
-  function pollSync() {
-    api("/api/sync/status").then(function (st) {
-      st = st || {};
-      var pct = Math.max(2, Math.min(100, st.progress_pct || 0));
-      fill.style.width = pct + "%";
-      note.textContent = st.detail || STAGE_LABELS[st.stage] || "Синхронизируем…";
-      if (st.state === "done") {
-        fill.style.width = "100%";
-        note.textContent = "Готово! Открываем показатели…";
-        setTimeout(function () { window.location.href = "/"; }, 700);
-        return;
-      }
-      if (st.state === "error") {
-        document.getElementById("progress-title").textContent = "Синхронизация не удалась";
-        document.getElementById("sync-error-text").textContent =
-          st.error || "Неизвестная ошибка. Попробуйте ещё раз.";
-        document.getElementById("sync-error").style.display = "block";
-        return;
-      }
-      setTimeout(pollSync, 1500);
-    }).catch(function () {
-      // разовый сбой поллинга не прерывает ожидание
-      setTimeout(pollSync, 3000);
-    });
-  }
-
-  document.getElementById("btn-sync-back").addEventListener("click", function () {
-    document.getElementById("sync-error").style.display = "none";
-    document.getElementById("btn-start-sync").disabled = false;
-    showStep("step-stores");
   });
 });
 </script>

@@ -86,6 +86,8 @@
   .loading { text-align: center; padding: 60px; color: rgba(31,31,31,.45); font-size: 13px }
   .lowtag { display: inline-block; margin-left: 8px; padding: 1px 8px; border-radius: 10px;
     background: rgba(31,31,31,.08); color: rgba(31,31,31,.6); font-size: 10px; font-weight: 700; }
+  /* Сезон вне загруженного окна истории: не «0», а честный прочерк. */
+  .sea-na { opacity: .4; cursor: help; }
 
   /* модалка правила скидок */
   .modal-bg { position: fixed; inset: 0; z-index: 300; background: rgba(31,31,31,.35); display: none; align-items: center; justify-content: center; }
@@ -132,7 +134,7 @@
       <button class="rule-btn" id="minstock-save" style="padding:3px 10px;font-size:11px;">сохранить</button>.
       Отсекая дни с последними парой штук, вы видите честный темп: «хвост» из одного размера продаётся медленно и занижал бы показатель. Поставьте 0, чтобы считать любой день наличия.</p>
       <p><b>Ср. цена продажи</b> — реальная средняя цена (после всех скидок), под ней серым номинал. <b>Факт. скидка</b> — насколько реальная цена ниже номинала: видно, продаётся ли вещь без скидок.</p>
-      <p><b>Зима/Весна/Лето/Осень</b> — оборачиваемость по сезонам (выручка сезонных месяцев ÷ дни в стоке в них). 0 — по этому сезону статистики нет. Так видно, сезонная вещь или круглогодичная.</p>
+      <p><b>Зима/Весна/Лето/Осень</b> — оборачиваемость по сезонам (выручка сезонных месяцев ÷ дни в стоке в них). <b>0</b> — сезон загружен, но продаж в нём не было; <b>«—»</b> — сезон ещё не загружен (история догружается фоном), цифра появится сама. Так видно, сезонная вещь или круглогодичная.</p>
       <p><b>Запас</b> — на сколько дней хватит остатка при текущем темпе, и дата, когда он кончится. <b>Сток на 90 дней</b> — запас в процентах от 90-дневной нормы: около 100% — идеально, сильно больше — затоварка, меньше 30% — скоро дефицит. <b>Недостаток</b> — сколько штук не хватает до нормы 90 дней.</p>
       <p><b>Скидка, %</b> — ручная скидка для распродажи: сохраняется, попадает в отчёт «Скидки» и в печатный прайс. Кнопка <b>«Дефолтные скидки»</b> сбрасывает все ручные и расставляет по правилу (настраивается кнопкой «Правило…»). <b>«в архив»</b> — для вещей, которые больше никогда не переразместятся: они исчезают из рекомендаций заказа, бюджета и прогноза.</p>
       <p>Позиции с <b>малой статистикой</b> (мало дней в стоке или единичные продажи) и <b>без продаж за год</b> показаны отдельными блоками внизу — их цифры не рейтинг, а справка.</p>
@@ -151,13 +153,13 @@
       <thead>
         <tr>
           <th title="Название позиции. Поиск пословный: «худи скетч» найдёт все худи «Скетч»">Название</th>
-          <th title="Сколько дней вещь была в наличии за год (с остатком не меньше порога). Больше полугода — данным можно доверять">Дней<br><span class="sub">в стоке</span></th>
+          <th id="th-dis" title="Сколько дней вещь была в наличии за год (с остатком не меньше порога). Больше полугода — данным можно доверять">Дней<br><span class="sub">в стоке</span></th>
           <th title="Средняя реальная цена продажи после скидок; серым — номинальная розничная цена">Ср. цена<br><span class="sub">продажи</span></th>
-          <th title="Главный показатель: нетто-выручка за год ÷ дни в стоке, ₽/день">Оборач.<br><span class="sub">за год</span></th>
-          <th title="Оборачиваемость в декабре–феврале. 0 — нет статистики по сезону">Зима<br><span class="sub">₽/день</span></th>
-          <th title="Оборачиваемость в марте–мае">Весна<br><span class="sub">₽/день</span></th>
-          <th title="Оборачиваемость в июне–августе">Лето<br><span class="sub">₽/день</span></th>
-          <th title="Оборачиваемость в сентябре–ноябре">Осень<br><span class="sub">₽/день</span></th>
+          <th id="th-turnover" title="Главный показатель: нетто-выручка за год ÷ дни в стоке, ₽/день">Оборач.<br><span class="sub" id="th-turnover-period">за год</span></th>
+          <th title="Оборачиваемость в декабре–феврале. 0 — продаж в сезоне не было, «—» — сезон ещё не загружен">Зима<br><span class="sub">₽/день</span></th>
+          <th title="Оборачиваемость в марте–мае. 0 — продаж в сезоне не было, «—» — сезон ещё не загружен">Весна<br><span class="sub">₽/день</span></th>
+          <th title="Оборачиваемость в июне–августе. 0 — продаж в сезоне не было, «—» — сезон ещё не загружен">Лето<br><span class="sub">₽/день</span></th>
+          <th title="Оборачиваемость в сентябре–ноябре. 0 — продаж в сезоне не было, «—» — сезон ещё не загружен">Осень<br><span class="sub">₽/день</span></th>
           <th title="Текущий остаток по всем складам, шт">Остаток<br><span class="sub">шт</span></th>
           <th title="На сколько дней хватит остатка при текущем темпе, и дата окончания">Запас<br><span class="sub">дней</span></th>
           <th title="Запас в процентах от нормы 90 дней: ~100% идеально, больше — затоварка">Сток на<br><span class="sub">90 дней</span></th>
@@ -250,6 +252,18 @@ function realDisc(it){
 }
 function esc(s){ return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/"/g,"&quot;"); }
 
+/* Деплой П1: сезон за пределами загруженного окна истории приходит как null.
+   Это не «нет продаж» (0), а «ещё не посчитано» — рисуем серый прочерк с
+   пояснением, чтобы колонка не врала нулём. */
+const SEA_NA = "Сезон ещё не загружен: история за эти месяцы догружается фоном — цифра появится сама";
+function seaCell(it, key, showTurn){
+  if(!showTurn) return '<td class="nb">—</td>';
+  const v = (it.sea||{})[key];
+  if(v===null||v===undefined)
+    return '<td class="nb"><span class="sea-na" title="'+SEA_NA+'">—</span></td>';
+  return '<td class="nb">'+fmt(v)+'</td>';
+}
+
 function buildTabs(){
   const cnt={};
   for(const it of ITEMS){ if(it.hidden) continue; cnt[it.category]=(cnt[it.category]||0)+1; }
@@ -277,10 +291,10 @@ function rowHtml(it, arch){
     '<td class="nb">'+it.dis+(it.dis>=183?' <span title="Больше полугода в стоке — данным можно доверять" style="opacity:.55;font-size:10px;">✓</span>':'')+'</td>'+
     '<td class="nb">'+(it.avg_price?fmt(it.avg_price)+' ₽':'—')+'<div class="retail">розн. '+fmt(it.sale_price)+' ₽</div></td>'+
     '<td class="nb nbig">'+(showTurn?fmt(it.turnover):'<span title="Мало статистики — оборачиваемость была бы шумом" style="opacity:.4">—</span>')+'</td>'+
-    '<td class="nb">'+(showTurn?fmt((it.sea||{}).winter):'—')+'</td>'+
-    '<td class="nb">'+(showTurn?fmt((it.sea||{}).spring):'—')+'</td>'+
-    '<td class="nb">'+(showTurn?fmt((it.sea||{}).summer):'—')+'</td>'+
-    '<td class="nb">'+(showTurn?fmt((it.sea||{}).autumn):'—')+'</td>'+
+    seaCell(it,"winter",showTurn)+
+    seaCell(it,"spring",showTurn)+
+    seaCell(it,"summer",showTurn)+
+    seaCell(it,"autumn",showTurn)+
     '<td class="nb nbig">'+it.cs+'</td>'+
     '<td class="nb">'+(it.sup!==null?it.sup+' дн'+sellDate:'—')+'</td>'+
     '<td><div class="zbar"><div class="zfill" style="width:'+Math.min(it.zat||0,100)+'%;background:'+zc+'"></div><div class="ztxt" style="color:'+zt+'">'+zl+'</div></div></td>'+
@@ -397,6 +411,53 @@ async function load(){
   buildTabs(); render();
 }
 load().catch(e=>{ document.getElementById("tb").innerHTML='<tr><td colspan="15" class="loading">Ошибка загрузки: '+e.message+'</td></tr>'; });
+</script>
+<script>
+// Деплой П1: пока история догружается фоном, «за год» честно становится
+// «за N дн.» — и подсказки колонок говорят то же самое (ревью: раньше подпись
+// менялась, а title всё ещё обещал «за год»).
+(function(){
+  var th = document.getElementById("th-turnover-period");
+  var thTurn = document.getElementById("th-turnover");
+  var thDis = document.getElementById("th-dis");
+  if (!th) return;
+  var TURN_FULL = thTurn ? thTurn.title : "";
+  var DIS_FULL = thDis ? thDis.title : "";
+  function plDays(n){
+    n = Math.abs(Math.round(n)); var a = n % 10, b = n % 100;
+    if (a === 1 && b !== 11) return n + " день";
+    if (a >= 2 && a <= 4 && (b < 10 || b >= 20)) return n + " дня";
+    return n + " дней";
+  }
+  function dm(iso){ return iso ? iso.slice(8,10) + "." + iso.slice(5,7) + "." + iso.slice(0,4) : ""; }
+  function refresh(){
+    fetch("/api/freshness", {credentials:"same-origin"})
+      .then(function(r){ return r.ok ? r.json() : null; })
+      .then(function(d){
+        if (!d) return;
+        var cov = Number(d.coverage_days), hd = Number(d.history_days);
+        var partial = hd > 0 && cov > 0 && cov < hd;
+        th.textContent = partial ? "за " + cov + " дн." : "за год";
+        var since = dm(d.coverage_start || d.history_loaded_from || "");
+        var window_ = plDays(cov) + (since ? " (с " + since + ")" : "");
+        if (thTurn) {
+          thTurn.title = partial
+            ? "Главный показатель: нетто-выручка ÷ дни в стоке, ₽/день. Пока посчитано за "
+              + window_ + " — остальная история догружается фоном, цифры вырастут"
+            : TURN_FULL;
+        }
+        if (thDis) {
+          thDis.title = partial
+            ? "Сколько дней вещь была в наличии за загруженный период — " + window_
+              + ", с остатком не меньше порога. История ещё догружается: «дней в стоке», "
+              + "«Сток на 90 дней», «Недостаток» и цвет строки посчитаны по этому окну"
+            : DIS_FULL;
+        }
+        if (partial && d.sync_state === "running") setTimeout(refresh, 15000);
+      }).catch(function(){});
+  }
+  refresh();
+})();
 </script>
 {% include "_hints.html" %}
 </body>
