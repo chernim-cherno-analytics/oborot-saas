@@ -44,7 +44,11 @@ from app.models import Org, Production, ProductionAssign
 NEED_MIN = 3            # потребность меньше — не заказываем (как в «Бюджете»)
 FRESH_DAYS = 90         # без продаж за N дней позиция неактуальна
 MIN_WINDOW_DIS = 7      # меньше дней в наличии в окне — окну не доверяем
-MOQ_NEED_RATIO = 0.5    # need < moq×ratio → минимальную партию не берём
+# Когда потребность меньше минимальной партии, вопрос не «дотягивает ли она»,
+# а «на сколько дней растянется эта партия». 50 штук при продаже 1,7 шт/день —
+# это месяц запаса, нормально; те же 50 штук при 0,2 шт/день — восемь месяцев
+# мёртвых денег. Поэтому критерий — срок распродажи партии, а не доля need.
+MOQ_MAX_COVER_DAYS = 120  # партия дольше этого срока не окупает минимум
 BASE_WAVE_DAYS = 14     # волна «База» без MOQ: минимум — покрытие двух недель
 SENSITIVITY_STEPS = (1.25, 1.5)  # «а если добавить денег»
 
@@ -75,7 +79,8 @@ STRATEGIES = {
 
 # Порядок причин в подписи строки: сначала зачем позиция в заказе, потом
 # что ограничило количество — так фраза читается как объяснение, а не как лог.
-REASON_ORDER = ("must_have", "gap", "base", "deepen", "moq", "capped_share", "capped_budget")
+REASON_ORDER = ("must_have", "gap", "base", "deepen", "moq", "moq_over_limit",
+                "capped_share", "capped_budget")
 
 REASON_TEXT = {
     "gap": "кончится до прихода заказа",
@@ -85,6 +90,7 @@ REASON_TEXT = {
     "capped_share": "срезано лимитом на позицию",
     "capped_budget": "дальше деньги закончились",
     "moq": "округлено до минимальной партии",
+    "moq_over_limit": "партия больше лимита на позицию",
 }
 
 # Пресеты этапов для анкеты (клиент выбирает, дальше правит сроки).
@@ -577,6 +583,7 @@ def _allocate(cands: list[dict], brief: dict, ctx: dict, stages: list[dict]) -> 
     alloc: dict[str, int] = {}
     reasons: dict[str, list[str]] = {}
     capped: dict[str, str] = {}   # почему позиция не добрана до потребности
+    moq_skipped: dict[str, int] = {}  # позиция → на сколько дней хватило бы партии
     spent = 0.0
 
     def unit_pay(c: dict) -> float:
@@ -614,12 +621,19 @@ def _allocate(cands: list[dict], brief: dict, ctx: dict, stages: list[dict]) -> 
         # производство не берёт, выше — можно любое количество.
         moq = moq_of(c)
         if moq > 0 and qty < moq:
-            if c["need"] < moq * MOQ_NEED_RATIO:
-                return  # потребность не дотягивает до партии — не навязываем
+            rate = c["rate_cover"]
+            if rate > 0 and moq / rate > MOQ_MAX_COVER_DAYS:
+                moq_skipped[base] = int(moq / rate)  # партия залежится — не берём
+                return
+            if rate <= 0:
+                return
             if (moq - have) * unit > rest:
                 return  # партия не по карману
             qty = moq
             reasons.setdefault(base, []).append("moq")
+            if limit is not None and limit > 0 and qty * unit > limit + 1:
+                # Партия физически больше лимита доли — берём, но говорим об этом.
+                reasons.setdefault(base, []).append("moq_over_limit")
         spent += (qty - have) * unit
         alloc[base] = qty
         reasons.setdefault(base, []).append(reason)
@@ -674,7 +688,8 @@ def _allocate(cands: list[dict], brief: dict, ctx: dict, stages: list[dict]) -> 
             take(c, c["need"], "deepen")
 
     return {
-        "alloc": alloc, "reasons": reasons, "capped": capped, "spent": spent,
+        "alloc": alloc, "reasons": reasons, "capped": capped,
+        "moq_skipped": moq_skipped, "spent": spent,
         "reserve": reserve, "new_cost": new_cost, "new_over_budget": over_budget,
         "money": money, "pay_share": pay_share,
         "cap_per_item": cap_per_item,
@@ -709,6 +724,10 @@ def plan_order(snap: dict, brief: dict, ctx: dict, stages: list[dict],
         why = list(reasons.get(c["base_name"], []))
         if unmet > 0:
             why.append(res["capped"].get(c["base_name"], "capped_budget"))
+        # «партия больше лимита» и «срезано лимитом» вместе читаются как
+        # противоречие — оставляем первую, она объясняет и то и другое.
+        if "moq_over_limit" in why and "capped_share" in why:
+            why.remove("capped_share")
         lost_revenue += unmet * c["avg_price"]
         rate = c["rate_cover"]
         # «Хватит до» — до и после заказа (то же в UI показывается полосами).
@@ -780,6 +799,10 @@ def plan_order(snap: dict, brief: dict, ctx: dict, stages: list[dict],
             "expected_profit": sum(i["expected_profit"] for i in items),
             "expected_revenue": sum(i["qty"] * i["avg_price"] for i in items),
         },
+        "moq_skipped": [
+            {"base_name": b, "days": d} for b, d in
+            sorted(res["moq_skipped"].items(), key=lambda kv: kv[1])[:50]
+        ],
         "review": {  # то, что система считать не берётся — решает человек
             "low_data": [_short(r) for r in skipped["low_data"]][:50],
             "no_cost": [_short(r) for r in skipped["no_cost"]][:50],
@@ -791,6 +814,22 @@ def plan_order(snap: dict, brief: dict, ctx: dict, stages: list[dict],
         },
         "categories": _by_category(items),
     }
+    # Честная диагностика вместо пустого экрана: минимальная партия может не
+    # сходиться с ритмом заказов (партия на 50 шт при заказах раз в неделю —
+    # это запас на месяцы). Тогда прямо говорим, что упёрлись именно в неё.
+    if not items and res["moq_skipped"]:
+        need_days = min(res["moq_skipped"].values())
+        plan["blocked"] = {
+            "reason": "moq",
+            "count": len(res["moq_skipped"]),
+            "suggest_cover_days": need_days,
+            "text": (
+                f"Ни одна позиция не набирает минимальную партию: при нынешнем "
+                f"горизонте {cover} дн такая партия — запас на {need_days} дн и "
+                f"дольше. Либо увеличьте интервал между заказами, либо снизьте "
+                f"минимальную партию, либо закажите этот канал реже."
+            ),
+        }
     if with_sensitivity and brief["budget"] > 0:
         plan["sensitivity"] = _sensitivity(snap, brief, ctx, stages, plan)
     return plan

@@ -68,6 +68,12 @@ def _hidden_404(active: str):
         raise HTTPException(status_code=404, detail="Раздел отключён")
 
 
+@router.get("/assistant", response_class=HTMLResponse)
+def assistant_page(request: Request, db: Session = Depends(get_db)):
+    """«Мастер заказа»: анкета → план под бюджет → заказ на производство."""
+    return _authed_page(request, db, "assistant.html", "assistant", "Мастер заказа")
+
+
 @router.get("/budget", response_class=HTMLResponse)
 def budget_page(request: Request, db: Session = Depends(get_db)):
     return _authed_page(request, db, "budget.html", "budget", "Бюджет закупки")

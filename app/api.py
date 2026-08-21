@@ -724,12 +724,78 @@ class OrderPlanIn(BaseModel):
     # Новинки без истории продаж: владелец вписывает их руками
     # [{"name": "Пальто Осень", "qty": 30, "cost": 9000, "category": "Верхняя одежда"}]
     new_items: list[dict] = Field(default_factory=list)
+    # Ручные правки количеств в готовом плане: {base_name: qty}. Применяются
+    # ПОСЛЕ расчёта — владелец всегда сильнее алгоритма.
+    overrides: dict[str, int] = Field(default_factory=dict)
 
 
 def _plan(db: Session, ctx: AuthContext, body: OrderPlanIn) -> dict:
     from app import order_planner
     snap = analytics.get_snapshot(db, ctx.org)
-    return order_planner.build_plan(db, ctx.org, snap, body.model_dump())
+    plan = order_planner.build_plan(db, ctx.org, snap, body.model_dump())
+    if body.overrides:
+        _apply_overrides(plan, body.overrides, snap)
+    return plan
+
+
+def _apply_overrides(plan: dict, overrides: dict, snap: dict) -> None:
+    """Ручные правки количеств поверх расчёта (строки плана и итоги)."""
+    from app.analytics import size_split
+    items = {i["base_name"]: i for i in plan["items"]}
+    for base, qty in overrides.items():
+        try:
+            qty = max(0, int(qty))
+        except (TypeError, ValueError):
+            continue
+        it = items.get(base)
+        if it is None:
+            continue
+        it["qty"] = qty
+        it["unmet"] = max(0, it["need"] - qty)
+        it["cost_total"] = round(qty * it["cost_price"])
+        it["pay_now"] = round(it["cost_total"] * (plan["pay_now"] / plan["cost_total"])) \
+            if plan.get("cost_total") else it["cost_total"]
+        it["expected_profit"] = round(qty * max(0, it["avg_price"] - it["cost_price"]))
+        src = (snap["items"].get(base) or {}).get("sizes") or {}
+        it["sizes"] = size_split(src, qty)
+        it["why"] = list(dict.fromkeys(list(it.get("why") or []) + ["manual"]))
+        it["why_text"] = "изменено вручную"
+    plan["items"] = [i for i in plan["items"] if i["qty"] > 0]
+    plan["cost_total"] = sum(i["cost_total"] for i in plan["items"])
+    plan["pay_now"] = sum(i["pay_now"] for i in plan["items"])
+    plan["pay_later"] = max(0, plan["cost_total"] - plan["pay_now"])
+    plan["spent"] = plan["pay_now"] if plan["budget_scope"] == "now" else plan["cost_total"]
+    plan["rest"] = plan["budget"] - plan["reserve_new"] - plan["spent"]
+    plan["totals"] = {
+        "positions": len(plan["items"]),
+        "units": sum(i["qty"] for i in plan["items"]),
+        "expected_profit": sum(i["expected_profit"] for i in plan["items"]),
+        "expected_revenue": sum(i["qty"] * i["avg_price"] for i in plan["items"]),
+    }
+    plan["manual_edit"] = True
+
+
+@router.get("/order-plan/options")
+def api_order_plan_options(
+    ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)
+):
+    """Справочники для анкеты мастера: категории и позиции без себестоимости."""
+    snap = analytics.get_snapshot(db, ctx.org)
+    cats: dict[str, int] = {}
+    no_cost = 0
+    for it in snap["items"].values():
+        if it.get("archived") or it.get("hidden"):
+            continue
+        cats[it.get("category") or "Без категории"] = cats.get(
+            it.get("category") or "Без категории", 0) + 1
+        if not it.get("cost_price"):
+            no_cost += 1
+    return {
+        "categories": sorted(cats),
+        "no_cost_count": no_cost,
+        "cost_source_full": sum(1 for it in snap["items"].values() if it.get("cost_is_full")),
+        "positions": len(snap["items"]),
+    }
 
 
 @router.post("/order-plan/preview")
