@@ -10,6 +10,8 @@
 
 Ошибка одной организации не валит остальных: синк пишет свой результат
 в sync_state (state=error + человекочитаемый текст), обход продолжается.
+Если авто-синк упал второй раз подряд (sync_state.fail_streak == 2) —
+владельцу уходит Telegram-алерт (notify.send_sync_failure_alert, инцидент 21.08).
 
 Интеграция: main.py (зона оркестратора) вызывает scheduler.attach(app) —
 это вешает startup/shutdown-хендлеры FastAPI. Env SCHEDULER_ENABLED=0
@@ -87,6 +89,19 @@ def _wait_sync_finished(org_id: int, timeout: float = SYNC_WAIT_TIMEOUT) -> dict
     return ms_sync.get_status(org_id)  # таймаут: вернём как есть, идём дальше
 
 
+def _alert_if_failing(org_id: int, status: dict) -> None:
+    """Telegram-алерт владельцу на втором провале подряд (инцидент 21.08).
+
+    Основной вызов — в ms_sync._thread_main (после каждого провала, включая
+    ручные); здесь страховка-no-op: notify.send_sync_failure_alert сам
+    проверяет fail_streak/alerted_streak, настройки чата и глотает ошибки.
+    """
+    try:
+        notify.send_sync_failure_alert(org_id, status)
+    except Exception:  # noqa: BLE001
+        log.exception("org=%s: ошибка отправки алерта о падении синка", org_id)
+
+
 def run_daily_job() -> dict:
     """Тело ежедневного джоба; вызывается и планировщиком, и тестами напрямую.
 
@@ -109,6 +124,7 @@ def run_daily_job() -> dict:
             results[org_id] = status.get("state", "unknown")
             if status.get("state") == "error":
                 log.warning("org=%s: синк упал: %s", org_id, status.get("error", ""))
+                _alert_if_failing(org_id, status)
         except Exception:  # noqa: BLE001 — одна org не валит остальных
             results[org_id] = "error"
             log.exception("org=%s: необработанная ошибка синка", org_id)
@@ -162,6 +178,7 @@ def run_catchup_job() -> dict:
             if status.get("state") == "error":
                 log.warning("org=%s: догоняющий синк упал: %s",
                             org_id, status.get("error", ""))
+                _alert_if_failing(org_id, status)
         except Exception:  # noqa: BLE001 — одна org не валит остальных
             results[org_id] = "error"
             log.exception("org=%s: необработанная ошибка догоняющего синка", org_id)

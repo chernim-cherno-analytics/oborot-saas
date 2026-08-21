@@ -277,6 +277,7 @@ def api_settings(ctx: AuthContext = Depends(require_auth_api), db: Session = Dep
             else None
         ),
         "members": [{"name": n, "email": e, "role": r} for n, e, r in members],
+        "role": ctx.role,  # фронт прячет owner-only кнопки (синк) от участников
     }
 
 
@@ -392,9 +393,17 @@ def api_toggle_warehouse(
     wh = db.get(Warehouse, warehouse_id)
     if wh is None or wh.org_id != ctx.org.id:
         raise HTTPException(status_code=404, detail="Склад не найден")
+    from app import ms_sync as _ms_sync
+    if _ms_sync.is_running(ctx.org.id):
+        # Ревью 21.08: набор складов — вход идущего синка; менять его на лету
+        # значит получить историю, посчитанную по двум разным наборам.
+        raise HTTPException(status_code=409, detail="Дождитесь окончания синхронизации")
     wh.active = not wh.active
     db.commit()
     analytics.invalidate(ctx.org.id)
+    # Ревью 21.08: точка продолжения прерванной первичной загрузки привязана
+    # к набору складов — после его смены продолжать нельзя, только пересборка.
+    _ms_sync.clear_resume_point(ctx.org.id)
     # История остатков (StockDay) хранится суммой по складам, активным на момент
     # синка: смена набора складов требует пересборки истории, иначе цифры
     # остатков/дней-в-стоке молча остаются старыми до полного пересинка.

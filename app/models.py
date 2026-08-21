@@ -314,6 +314,13 @@ class SyncState(Base):
     error: Mapped[str] = mapped_column(Text, nullable=False, default="")
     started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Инцидент 21.08: число подряд упавших синков (сброс в 0 при done) —
+    # по нему планировщик шлёт Telegram-алерт на втором провале подряд.
+    # Колонка добавляется аддитивно (ms_sync.ensure_schema) для старых БД.
+    fail_streak: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Значение fail_streak, на котором алерт уже ушёл (0 — ещё не слали);
+    # вместе с fail_streak сбрасывается при done → «один алерт на серию».
+    alerted_streak: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
     @property
     def stats(self) -> dict:

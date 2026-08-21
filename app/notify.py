@@ -201,3 +201,58 @@ def send_daily_digest(org_id: int) -> bool:
     if not ok:
         log.warning("digest org=%s не отправлен: %s", org_id, err)
     return ok
+
+
+# ── Алерт о падающей синхронизации ───────────────────────────────────────────
+
+SYNC_ALERT_MIN_STREAK = 2  # шлём начиная со второго провала подряд, один раз за серию
+
+_CAUSE_HINT = {
+    "token": "Проверьте токен в Настройках.",
+    "transient": "Повторим автоматически в течение часа.",
+    "internal": "Мы уже разбираемся.",
+}
+
+
+def send_sync_failure_alert(org_id: int, status: dict) -> bool:
+    """Telegram-алерт «синк падает второй раз подряд». False — пропущено/ошибка.
+
+    Инцидент 21.08: синк падал три раза подряд, а владелец узнал об этом,
+    только заметив устаревшие цифры. Один алерт на серию: право на отправку
+    атомарно выдаёт ms_sync.claim_failure_alert (fail_streak >= 2 и ещё не
+    слали); зовётся из _thread_main после КАЖДОГО провала (ручного и авто),
+    планировщик дублирует вызов как страховку. Любая ошибка здесь глотается:
+    уведомление не должно ломать синк.
+    """
+    try:
+        from app import ms_sync
+
+        if not bot_token() or int(status.get("fail_streak") or 0) < SYNC_ALERT_MIN_STREAK:
+            return False  # без бота право на алерт не «сжигаем»
+        db = SessionLocal()
+        try:
+            settings = db.get(NotifySettings, org_id)
+            if settings is None or not settings.tg_enabled or not settings.tg_chat_id.strip():
+                return False
+            chat_id = settings.tg_chat_id.strip()
+            last_sale = db.execute(
+                select(func.max(Sale.date)).where(Sale.org_id == org_id)
+            ).scalar()
+        finally:
+            db.close()
+        if not ms_sync.claim_failure_alert(org_id):
+            return False
+        err = html.escape(str(status.get("error") or "неизвестная ошибка").rstrip(". "))
+        cause = (status.get("stats") or {}).get("error_cause") or "transient"
+        hint = _CAUSE_HINT.get(cause, _CAUSE_HINT["transient"])
+        text = (
+            "⚠️ Оборот: синхронизация с МойСклад падает второй раз подряд — "
+            f"{err}. Данные: продажи по {last_sale or '—'}. {hint}"
+        )
+        ok, send_err = send_message(chat_id, text)
+        if not ok:
+            log.warning("sync-alert org=%s не отправлен: %s", org_id, send_err)
+        return ok
+    except Exception:  # noqa: BLE001 — алерт никогда не должен ронять синк
+        log.exception("sync-alert org=%s: необработанная ошибка", org_id)
+        return False

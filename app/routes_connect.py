@@ -113,13 +113,38 @@ async def api_connect_moysklad(
             raise HTTPException(status_code=502, detail=NETWORK_HINT)
 
     conn = _get_ms_connection(db, ctx.org.id)
+    has_warehouses = conn is not None and db.execute(
+        select(Warehouse.id).where(
+            Warehouse.org_id == ctx.org.id,
+            Warehouse.active.is_(True),
+            Warehouse.ext_id != "",
+        )
+    ).first() is not None
     if conn is None:
         conn = Connection(org_id=ctx.org.id, kind="moysklad", config_json="{}")
         db.add(conn)
     conn.token_enc = encrypt_token(token)
+    resume_pending = has_warehouses and ms_sync.has_resume_point(ctx.org.id)
+    if has_warehouses and (conn.status == "active" or resume_pending
+                           or ms_sync.needs_full_rebuild(ctx.org.id)):
+        # Инцидент 21.08: смена токена из Настроек сбрасывала status в pending —
+        # планировщик синкает только active, кнопки «синхронизировать» в
+        # Настройках не было, и пользователь застревал до ручного /onboarding.
+        # Живое подключение (active) — статус не трогаем и запускаем инкремент;
+        # прерванная первичная загрузка — продолжаем её. Ревью 21.08: орг,
+        # который ещё ни разу не синкался (pending без точки продолжения),
+        # НЕ стартуем — иначе он стал бы active с одним днём истории.
+        db.commit()
+        started = ms_sync.start_sync(
+            ctx.org.id, "initial" if resume_pending else "incremental")
+        note = ("Токен обновлён, синхронизация запущена." if started
+                else "Токен обновлён. Синхронизация уже идёт.")
+        return {"ok": True, "note": note, "sync_started": bool(started)}
     conn.status = "pending"
     db.commit()
-    return {"ok": True, "note": "Токен проверен. Осталось выбрать склады."}
+    note = ("Токен проверен. Запустите синхронизацию." if has_warehouses
+            else "Токен проверен. Осталось выбрать склады.")
+    return {"ok": True, "note": note, "sync_started": False}
 
 
 # ── Склады ───────────────────────────────────────────────────────────────────
@@ -176,6 +201,8 @@ async def api_moysklad_stores_select(
 ):
     """Сохраняет выбор складов: Warehouse на каждый склад МС, выбранные active=1."""
     token = _require_token(db, ctx.org.id)
+    if ms_sync.is_running(ctx.org.id):
+        raise HTTPException(status_code=409, detail="Дождитесь окончания синхронизации")
     async with MoySkladClient(token) as client:
         try:
             stores = await client.fetch_stores()
@@ -204,6 +231,9 @@ async def api_moysklad_stores_select(
         row.name = name
         row.active = ext_id in selected
     db.commit()
+    # Ревью 21.08: частичная история прерванной первичной загрузки считалась
+    # по старому набору складов — продолжать её нельзя.
+    ms_sync.clear_resume_point(ctx.org.id)
     return {"ok": True, "active": len(selected), "total": len(ms_ids)}
 
 
@@ -224,7 +254,8 @@ def api_sync_initial(
     ).scalars().all()
     if not active:
         raise HTTPException(status_code=409, detail="Сначала выберите склады.")
-    if not ms_sync.start_sync(ctx.org.id, mode="initial"):
+    # force_full: настоящая пересборка с нуля, а не продолжение прерванной.
+    if not ms_sync.start_sync(ctx.org.id, mode="initial", force_full=True):
         raise HTTPException(status_code=409, detail="Синхронизация уже идёт.")
     return {
         "ok": True,

@@ -3,7 +3,10 @@
 Первичный синк (mode='initial'), этапы и доли прогресса:
   products      (0–8%)   — entity/assortment: товары и модификации, цены;
   stock_history (8–70%)  — report/stock/all с moment ВНУТРИ filter, по каждой
-                           дате за HISTORY_DAYS × каждому активному складу;
+                           дате за HISTORY_DAYS × каждому активному складу,
+                           чанками по STOCK_CHUNK_DATES с записью после каждого
+                           (инцидент 21.08: сбой не теряет загруженное, следующий
+                           запуск продолжает с stats.stock_loaded_until);
                            суммарно → stock_days, последняя дата → warehouse_stock;
   sales         (70–95%) — retaildemand + demand + salesreturn c expand=positions
                            за HISTORY_DAYS, фильтр по выбранным складам → sales;
@@ -50,10 +53,17 @@ from app.models import (
     Warehouse,
     WarehouseStock,
 )
-from app.ms_client import MoySkladClient
+from app.ms_client import MoySkladClient, _env_int
 
 HISTORY_DAYS = int(os.environ.get("HISTORY_DAYS", "365"))
 SALES_RESYNC_DAYS = int(os.environ.get("SYNC_DAYS_BACK", "3"))
+# Инцидент 21.08: история остатков качается и ПИШЕТСЯ чанками по N дат —
+# сбой на середине года не теряет уже загруженное (см. _sync_stock_history).
+STOCK_CHUNK_DATES = _env_int("STOCK_CHUNK_DATES", 30, minimum=1)
+try:
+    CHUNK_PAUSE_SECONDS = max(0.0, float(os.environ.get("MS_CHUNK_PAUSE", "2")))
+except ValueError:
+    CHUNK_PAUSE_SECONDS = 2.0
 
 # Ожидаемый темп с учётом лимитов МойСклад (45 req / 3 c ≈ 15 rps, берём с запасом).
 EFFECTIVE_RPS = 12.0
@@ -65,20 +75,28 @@ _threads_lock = threading.Lock()
 
 
 def ensure_schema() -> None:
-    """Аддитивная мини-миграция: колонка ms_qty в ordered_qty.
+    """Аддитивные мини-миграции: ordered_qty.ms_qty и sync_state.fail_streak.
 
     Base.metadata.create_all не изменяет существующие таблицы (паттерн —
-    app.ms_writeback.ensure_schema). Свежая БД получает колонку из модели.
+    app.ms_writeback.ensure_schema). Свежая БД получает колонки из моделей.
     """
     insp = inspect(engine)
-    if not insp.has_table("ordered_qty"):
-        return
-    cols = {c["name"] for c in insp.get_columns("ordered_qty")}
-    if "ms_qty" not in cols:
-        with engine.begin() as conn:
-            conn.execute(text(
-                "ALTER TABLE ordered_qty ADD COLUMN ms_qty FLOAT NOT NULL DEFAULT 0"
-            ))
+    if insp.has_table("ordered_qty"):
+        cols = {c["name"] for c in insp.get_columns("ordered_qty")}
+        if "ms_qty" not in cols:
+            with engine.begin() as conn:
+                conn.execute(text(
+                    "ALTER TABLE ordered_qty ADD COLUMN ms_qty FLOAT NOT NULL DEFAULT 0"
+                ))
+    if insp.has_table("sync_state"):
+        cols = {c["name"] for c in insp.get_columns("sync_state")}
+        # Инцидент 21.08: счётчики для алерта о падающем синке.
+        for col in ("fail_streak", "alerted_streak"):
+            if col not in cols:
+                with engine.begin() as conn:
+                    conn.execute(text(
+                        f"ALTER TABLE sync_state ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0"
+                    ))
 
 
 # ── Имена и размеры (как в legacy _canon_name) ───────────────────────────────
@@ -134,7 +152,8 @@ def get_status(org_id: int) -> dict:
         db.close()
     if row is None:
         return {"state": "idle", "stage": "", "progress_pct": 0, "detail": "",
-                "started_at": None, "finished_at": None, "stats": {}, "error": ""}
+                "started_at": None, "finished_at": None, "stats": {}, "error": "",
+                "fail_streak": 0, "alerted_streak": 0}
     return {
         "state": row.state,
         "mode": row.mode,
@@ -145,7 +164,74 @@ def get_status(org_id: int) -> dict:
         "finished_at": row.finished_at.isoformat() if row.finished_at else None,
         "stats": row.stats,
         "error": row.error,
+        "fail_streak": int(row.fail_streak or 0),
+        "alerted_streak": int(row.alerted_streak or 0),
     }
+
+
+def _bump_fail_streak(org_id: int) -> int:
+    """+1 к числу подряд упавших синков; возвращает новое значение."""
+    db = SessionLocal()
+    try:
+        row = db.get(SyncState, org_id)
+        if row is None:
+            return 0
+        row.fail_streak = int(row.fail_streak or 0) + 1
+        db.commit()
+        return row.fail_streak
+    finally:
+        db.close()
+
+
+def claim_failure_alert(org_id: int) -> bool:
+    """Атомарно «забирает» право на алерт о падающей серии (ревью 21.08).
+
+    True ровно один раз за серию: когда fail_streak >= 2 и alerted_streak == 0
+    (после done оба сбрасываются). Считает и ручные, и авто-запуски — раньше
+    планировщик проверял только `== 2` и пропускал серию, если второй провал
+    был ручным.
+    """
+    db = SessionLocal()
+    try:
+        n = db.execute(
+            update(SyncState)
+            .where(SyncState.org_id == org_id, SyncState.fail_streak >= 2,
+                   SyncState.alerted_streak == 0)
+            .values(alerted_streak=SyncState.fail_streak)
+        ).rowcount
+        db.commit()
+        return n == 1
+    finally:
+        db.close()
+
+
+def clear_resume_point(org_id: int) -> None:
+    """Снимает точку продолжения прерванной первичной загрузки (ревью 21.08).
+
+    Зовётся при смене набора складов: история, записанная до прерывания,
+    считалась по старому набору — продолжать её нельзя, нужна полная пересборка.
+    """
+    db = SessionLocal()
+    try:
+        row = db.get(SyncState, org_id)
+        if row is None:
+            return
+        stats = row.stats
+        if "stock_loaded_until" in stats or "resume_fp" in stats:
+            stats.pop("stock_loaded_until", None)
+            stats.pop("resume_fp", None)
+            # Частичная история уже на диске: молчаливой дыры не оставляем —
+            # следующий запуск (даже инкрементный) станет полной пересборкой.
+            stats["needs_full_rebuild"] = True
+            row.stats_json = json.dumps(stats, ensure_ascii=False)
+            db.commit()
+    finally:
+        db.close()
+
+
+def _resume_fingerprint(active_wh: list) -> str:
+    """Отпечаток условий загрузки: активные склады + окно истории."""
+    return ",".join(sorted(w.ext_id for w in active_wh)) + f"|{HISTORY_DAYS}"
 
 
 def reset_stale_running() -> None:
@@ -187,20 +273,73 @@ def estimate_minutes(n_dates: int, n_stores: int) -> float:
     return round(requests / EFFECTIVE_RPS / 60.0, 1)
 
 
-def start_sync(org_id: int, mode: str) -> bool:
-    """Запускает фоновый синк (initial | incremental). False — уже идёт."""
+# Ключи stats, переживающие перезапуск синка до успешного done (ревью 21.08).
+_CARRIED_STATS = ("stock_loaded_until", "resume_fp", "needs_full_rebuild")
+
+
+def _pending_resume(org_id: int) -> str | None:
+    """Дата, до которой дошёл прерванный первичный синк (stats.stock_loaded_until).
+
+    Инцидент 21.08: прерванный на середине первичный синк оставляет ЧАСТИЧНУЮ
+    новую историю (старая уже стёрта первым _flush). Пока она не дозагружена,
+    любой следующий запуск — initial ИЛИ incremental (кнопка «Синхронизировать
+    сейчас», планировщик) — продолжает первичную загрузку со следующей даты:
+    инкремент поверх дыры в истории дал бы ложные нули и битую оборачиваемость.
+    Исключение — явная «Полная пересборка» (start_sync(force_full=True)):
+    она всегда начинает с нуля и снимает точку продолжения (ревью 21.08).
+    """
+    st = get_status(org_id)
+    if st.get("state") != "error":
+        return None
+    until = (st.get("stats") or {}).get("stock_loaded_until")
+    return str(until) if until else None
+
+
+def needs_full_rebuild(org_id: int) -> bool:
+    """Помечена ли организация на полную пересборку (clear_resume_point)."""
+    return bool((get_status(org_id).get("stats") or {}).get("needs_full_rebuild"))
+
+
+def has_resume_point(org_id: int) -> bool:
+    """Есть ли прерванная первичная загрузка, которую надо продолжить."""
+    return _pending_resume(org_id) is not None
+
+
+def start_sync(org_id: int, mode: str, *, force_full: bool = False) -> bool:
+    """Запускает фоновый синк (initial | incremental). False — уже идёт.
+
+    force_full=True — настоящая полная пересборка (кнопка «Полная пересборка»,
+    подсказка после смены складов): точка продолжения игнорируется и снимается.
+    """
     with _threads_lock:
         thread = _threads.get(org_id)
         if thread is not None and thread.is_alive():
             return False
+        resume_from = None if force_full else _pending_resume(org_id)
+        prev_stats = get_status(org_id).get("stats") or {}
+        prev_fp = prev_stats.get("resume_fp", "")
+        if resume_from:
+            mode = "initial"  # дозагрузка прерванной истории (см. _pending_resume)
+        elif prev_stats.get("needs_full_rebuild"):
+            # Набор складов сменился при частичной истории (clear_resume_point):
+            # любой вызов — полная пересборка с нуля; флаг снимается при done.
+            mode = "initial"
+            resume_from = None
+        # Ревью 21.08 (2): переносимые ключи НЕ обнуляем на старте — если запуск
+        # упадёт ещё до истории остатков (429/401 на ассортименте), точка
+        # продолжения / флаг пересборки обязаны пережить и этот провал. Снимает
+        # их только done (или реально случившийся wipe в _flush).
+        carried = {k: prev_stats[k] for k in _CARRIED_STATS if k in prev_stats}
+        carried["mode"] = mode
         _set_state(
             org_id,
             state="running", mode=mode, stage="queued", progress=0.0,
             detail="Синхронизация поставлена в очередь", error="",
-            stats_json="{}", started_at=datetime.utcnow(), finished_at=None,
+            stats_json=json.dumps(carried, ensure_ascii=False),
+            started_at=datetime.utcnow(), finished_at=None,
         )
         thread = threading.Thread(
-            target=_thread_main, args=(org_id, mode),
+            target=_thread_main, args=(org_id, mode, resume_from, prev_fp),
             name=f"ms-sync-{mode}-{org_id}", daemon=True,
         )
         _threads[org_id] = thread
@@ -208,34 +347,91 @@ def start_sync(org_id: int, mode: str) -> bool:
         return True
 
 
-def _thread_main(org_id: int, mode: str) -> None:
+def _thread_main(org_id: int, mode: str, resume_from: str | None = None,
+                 prev_fp: str = "") -> None:
     try:
-        asyncio.run(_run_sync(org_id, mode))
+        asyncio.run(_run_sync(org_id, mode, resume_from, prev_fp))
     except Exception as exc:  # noqa: BLE001 — любой сбой фиксируем в состоянии
+        stats = get_status(org_id).get("stats") or {}
+        stats["error_cause"] = error_cause(exc)  # для подсказки в Telegram-алерте
         _set_state(
             org_id,
             state="error", error=_human_error(exc),
             detail=str(exc)[:500], finished_at=datetime.utcnow(),
+            stats_json=json.dumps(stats, ensure_ascii=False),
         )
+        try:
+            _bump_fail_streak(org_id)
+            # Алерт шлём отсюда (и ручные, и авто-запуски), планировщик — страховка.
+            from app import notify as _notify
+            _notify.send_sync_failure_alert(org_id, get_status(org_id))
+        except Exception:  # noqa: BLE001 — счётчик/алерт не должны маскировать ошибку синка
+            pass
+
+
+class SyncInterrupted(Exception):
+    """Первичная загрузка прервана после того, как часть истории уже записана.
+
+    str(exc) — готовый человеческий текст для sync_state.error (инцидент 21.08);
+    cause — класс причины (token | transient | internal) для подсказок.
+    """
+
+    def __init__(self, message: str, cause: str = "transient") -> None:
+        super().__init__(message)
+        self.cause = cause
+
+
+def _is_rate_limited(exc: Exception) -> bool:
+    import httpx
+    return isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 429
 
 
 def _human_error(exc: Exception) -> str:
     import httpx
 
+    if isinstance(exc, SyncInterrupted):
+        return str(exc)
     if isinstance(exc, httpx.HTTPStatusError):
         code = exc.response.status_code
         if code in (401, 403):
             return ("МойСклад не принял токен доступа. Проверьте токен в настройках "
                     "и запустите синхронизацию заново.")
+        if code == 429:
+            return ("МойСклад ограничил частоту запросов (429). Подождите пару минут "
+                    "и запустите синхронизацию ещё раз.")
         return f"МойСклад ответил ошибкой {code}. Попробуйте повторить синхронизацию позже."
     if isinstance(exc, httpx.HTTPError):
         return "Не удалось связаться с МойСклад: проблема с сетью. Попробуйте позже."
-    return f"Синхронизация прервана: {exc}"
+    if isinstance(exc, RuntimeError):
+        return f"Синхронизация прервана: {exc}"  # наши собственные понятные тексты
+    # Ревью 21.08: внутренности (SQL, KeyError) пользователю не показываем.
+    print(f"ms_sync: внутренняя ошибка синка: {exc!r}")
+    return "Синхронизация прервана внутренней ошибкой — мы уже смотрим."
+
+
+def error_cause(exc: Exception) -> str:
+    """Класс причины для подсказок: token | transient | internal."""
+    import httpx
+
+    if isinstance(exc, SyncInterrupted):
+        return exc.cause
+    if isinstance(exc, httpx.HTTPStatusError):
+        if exc.response.status_code in (401, 403):
+            return "token"
+        return "transient"
+    if isinstance(exc, httpx.HTTPError):
+        return "transient"
+    return "internal"
 
 
 # ── Основной прогон ──────────────────────────────────────────────────────────
 
-async def _run_sync(org_id: int, mode: str) -> None:
+async def _run_sync(org_id: int, mode: str, resume_from: str | None = None,
+                    prev_fp: str = "") -> None:
+    """Полный прогон синка. resume_from — дата, до которой (включительно) история
+    остатков уже записана прерванным первичным синком: качаем дальше без wipe
+    (только если prev_fp — отпечаток складов/окна той загрузки — совпадает).
+    """
     db = SessionLocal()
     try:
         conn = db.execute(
@@ -257,7 +453,11 @@ async def _run_sync(org_id: int, mode: str) -> None:
     finally:
         db.close()
 
-    stats: dict = {"mode": mode}
+    # Стартуем от сохранённых stats (start_sync оставил там переносимые ключи),
+    # чтобы каждый _set_state(stats_json=...) нёс их до самого done.
+    stats: dict = {k: v for k, v in (get_status(org_id).get("stats") or {}).items()
+                   if k in _CARRIED_STATS}
+    stats["mode"] = mode
     # Аудит 18.08: инкремент раньше качал ровно 1 день остатков и 3 дня продаж
     # НЕЗАВИСИМО от того, сколько сервис простоял — простой >3 суток оставлял
     # невосполнимые дыры. Теперь окно растягивается по фактическому разрыву
@@ -287,15 +487,63 @@ async def _run_sync(org_id: int, mode: str) -> None:
             (today - timedelta(days=offset)).isoformat()
             for offset in range(history_days - 1, -1, -1)
         ]
-        await _sync_stock_history(org_id, client, active_wh, dates, ext_to_pid,
-                                  stats, initial=(mode == "initial"))
+        fingerprint = _resume_fingerprint(active_wh)
+        if (mode == "initial" and resume_from and _has_stock_rows(org_id)
+                and resume_from >= dates[0] and prev_fp == fingerprint):
+            # Продолжение прерванной загрузки (инцидент 21.08): со следующей
+            # даты после записанной; сегодня перекачиваем всегда — из него
+            # строится warehouse_stock. Ревью 21.08: точка старше окна или
+            # записанная при другом наборе складов/окне — не продолжаем,
+            # а пересобираем с нуля.
+            dates = [d for d in dates if d > resume_from] or [today.isoformat()]
+            stats["resumed_from"] = resume_from
+            # Точку продолжения сохраняем СРАЗУ: если и этот запуск упадёт до
+            # первого чанка (429 на первом запросе, 401 после смены токена),
+            # следующий всё равно продолжит, а не сделает инкремент над дырой.
+            stats["stock_loaded_until"] = resume_from
+            stats["resume_fp"] = fingerprint
+            _set_state(org_id, stats_json=json.dumps(stats, ensure_ascii=False))
+        else:
+            resume_from = None
+        # Свежая/принудительная пересборка: прежние stock_loaded_until/resume_fp/
+        # needs_full_rebuild живут до первого реального wipe в _flush (там и
+        # снимаются), новый отпечаток пишется с первого чанка.
+        try:
+            await _sync_stock_history(org_id, client, active_wh, dates, ext_to_pid,
+                                      stats, initial=(mode == "initial"),
+                                      resume_from=resume_from)
 
-        # ── Этап 3: продажи ─────────────────────────────────────────────────
-        await _sync_sales(org_id, client, active_wh, sales_days, ext_to_pid,
-                          stats, initial=(mode == "initial"))
+            # ── Этап 3: продажи ─────────────────────────────────────────────
+            await _sync_sales(org_id, client, active_wh, sales_days, ext_to_pid,
+                              stats, initial=(mode == "initial"))
 
-        # ── Этап 4: «едет к нам» из МС (заказы поставщику) ──────────────────
-        await _sync_incoming(org_id, client, ext_to_pid, stats)
+            # ── Этап 4: «едет к нам» из МС (заказы поставщику) ──────────────
+            await _sync_incoming(org_id, client, ext_to_pid, stats)
+        except Exception as exc:  # noqa: BLE001 — фиксируем прогресс и пробрасываем
+            stats["ms_client"] = dict(client.stats)
+            loaded_until = stats.get("stock_loaded_until") or resume_from
+            if mode != "initial" or not loaded_until:
+                _set_state(org_id, stats_json=json.dumps(stats, ensure_ascii=False))
+                raise
+            # Часть новой истории уже записана — сохраняем точку для продолжения
+            # и объясняем пользователю, что ничего не потеряно.
+            stats["stock_loaded_until"] = loaded_until
+            _set_state(org_id, stats_json=json.dumps(stats, ensure_ascii=False))
+            cause = error_cause(exc)
+            if cause == "token":
+                # Ревью 21.08: «нажмите ещё раз» при 401/403 бессмысленно —
+                # сначала токен; точка продолжения при этом сохранена.
+                raise SyncInterrupted(
+                    f"Загрузка прервана на {loaded_until}: {_human_error(exc)} "
+                    "Загруженное сохранено — после исправления токена загрузка "
+                    "продолжится с этой даты.", cause) from exc
+            reason = ("МойСклад ограничил частоту запросов." if _is_rate_limited(exc)
+                      else _human_error(exc))
+            raise SyncInterrupted(
+                f"Загрузка прервана на {loaded_until}: {reason} Загруженное "
+                "сохранено — нажмите «Синхронизировать» ещё раз, загрузка продолжится.",
+                cause) from exc
+        stats["ms_client"] = dict(client.stats)
 
     # ── Финализация ─────────────────────────────────────────────────────────
     _set_state(org_id, stage="finalize", progress=98.0,
@@ -314,13 +562,26 @@ async def _run_sync(org_id: int, mode: str) -> None:
     finally:
         db.close()
     analytics.invalidate(org_id)
+    stats.pop("stock_loaded_until", None)  # всё загружено — точка продолжения не нужна
+    stats.pop("resume_fp", None)
+    stats.pop("needs_full_rebuild", None)  # (stats_json перезаписывается — флаг снят)
     _set_state(
         org_id,
         state="done", stage="done", progress=100.0,
         detail="Синхронизация завершена",
         stats_json=json.dumps(stats, ensure_ascii=False),
-        finished_at=datetime.utcnow(),
+        finished_at=datetime.utcnow(), fail_streak=0, alerted_streak=0,
     )
+
+
+def _has_stock_rows(org_id: int) -> bool:
+    db = SessionLocal()
+    try:
+        return db.execute(
+            select(StockDay.product_id).where(StockDay.org_id == org_id).limit(1)
+        ).first() is not None
+    finally:
+        db.close()
 
 
 # ── Товары ───────────────────────────────────────────────────────────────────
@@ -600,27 +861,45 @@ async def _fetch_day_stock(client: MoySkladClient, active_wh: list[Warehouse],
 async def _sync_stock_history(org_id: int, client: MoySkladClient,
                               active_wh: list[Warehouse], dates: list[str],
                               ext_to_pid: dict[str, int], stats: dict,
-                              initial: bool) -> None:
+                              initial: bool, resume_from: str | None = None) -> None:
     """stock_days по датам + warehouse_stock на последнюю дату.
 
     Явные нули — правило из legacy sync.py: позиция с прошлым остатком >0,
     отсутствующая в отчёте текущей даты, получает qty=0.
+
+    Инцидент 21.08: раньше ВСЕ даты качались в память и только потом писались.
+    Три подряд падения на ~110-й дате из 365 (429 от МойСклада) каждый раз
+    теряли 4 минуты загрузки целиком. Теперь даты идут хронологическими чанками
+    по STOCK_CHUNK_DATES: чанк скачан (параллельно, под лимитером) → сразу
+    явные нули + запись. Семантика аудита 18.08 сохранена: старая история
+    стирается в первом _flush первого чанка, т.е. только после первой удачной
+    загрузки. СЛЕДСТВИЕ: сбой на середине в initial-режиме оставляет ЧАСТИЧНУЮ
+    новую историю (от начала окна до последнего записанного чанка). Смягчение:
+    при любом исключении в stats фиксируется stock_loaded_until = последняя
+    полностью записанная дата; _run_sync превращает это в понятное сообщение,
+    а следующий запуск (resume_from) продолжает с соседней даты без wipe.
     """
     unmatched: set[str] = set()
     written = zeroed = 0
 
     db = SessionLocal()
     try:
-        if initial:
+        if initial and not resume_from:
             # Полная пересборка: prev с нуля. Старая история НЕ стирается здесь
             # (аудит 18.08): раньше delete+commit шли ДО многоминутной загрузки
             # из МойСклада, и любой сбой (таймаут, 401, 429) оставлял клиента
-            # вовсе без истории. Теперь чистка отложена в первый _flush фазы 2,
-            # когда все данные уже скачаны и лежат в памяти.
+            # вовсе без истории. Теперь чистка отложена в первый _flush первого
+            # чанка, когда его данные уже скачаны и лежат в памяти.
             prev_positive: set[int] = set()
         else:
-            # Инкремент: prev = последняя дата ДО сегодняшней.
+            # Инкремент / продолжение: prev = последняя дата ДО первой из окна.
             first_day = dates[0]
+            if resume_from:
+                # Защита от дублей: хвост за точкой продолжения (частичный
+                # батч чанка, перекачиваемое «сегодня») перезаписывается.
+                db.execute(delete(StockDay).where(
+                    StockDay.org_id == org_id, StockDay.date >= first_day))
+                db.commit()
             prev_date = db.execute(
                 select(StockDay.date)
                 .where(StockDay.org_id == org_id, StockDay.date < first_day)
@@ -644,51 +923,50 @@ async def _sync_stock_history(org_id: int, client: MoySkladClient,
 
     total_dates = len(dates)
 
-    # ── Фаза 1: ПАРАЛЛЕЛЬНАЯ загрузка всех дат ───────────────────────────────
-    # Раньше даты качались строго последовательно (внутри даты — gather по
-    # складам) и первый синк занимал ~45 минут: фактический темп ~1–2 запроса
-    # в секунду при лимите МойСклад 45 req / 3 c и 5 параллельных. Теперь все
-    # пары дата×склад отдаются пулу сразу — темп ограничивает только
-    # RateLimiter клиента (~12–15 rps), т.е. год истории по 3 складам
-    # (~1100 запросов) — примерно полторы-две минуты.
-    # Явные нули требуют последовательности prev→next, поэтому расчёт нулей
-    # и запись в БД вынесены в фазу 2 (по готовым данным, хронологически).
-    day_results: dict[str, tuple[dict[int, float], dict[int, dict[int, float]]]] = {}
-
+    # ── Фаза 1 (внутри чанка): ПАРАЛЛЕЛЬНАЯ загрузка дат чанка ───────────────
+    # Даты качаются параллельно (все пары дата×склад чанка отдаются пулу сразу),
+    # темп ограничивает RateLimiter клиента (~12–15 rps, тяжёлые отчёты — через
+    # узкий семафор). Явные нули требуют последовательности prev→next, поэтому
+    # расчёт нулей и запись идут по готовым данным чанка хронологически.
     async def _one_day(day_iso: str):
         res = await _fetch_day_stock(client, active_wh, day_iso, ext_to_pid, unmatched)
         return day_iso, res
 
-    tasks = [asyncio.ensure_future(_one_day(d)) for d in dates]
-    done_count = 0
-    for fut in asyncio.as_completed(tasks):
-        day_iso, res = await fut
-        day_results[day_iso] = res
-        done_count += 1
-        if initial and (done_count % 10 == 0 or done_count == total_dates):
-            progress = 8.0 + 55.0 * done_count / total_dates
-            _set_state(org_id, stage="stock_history", progress=progress,
-                       detail=f"История остатков: {done_count}/{total_dates} дат")
+    async def _fetch_chunk(chunk: list[str]) -> dict:
+        tasks = [asyncio.ensure_future(_one_day(d)) for d in chunk]
+        try:
+            return dict(await asyncio.gather(*tasks))
+        except BaseException:
+            # Один запрос исчерпал ретраи — соседей гасим, а не даём им
+            # дальше молотить уже закрытый лимит (инцидент 21.08).
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
 
-    # ── Фаза 2: явные нули + запись (хронологически, батчами) ────────────────
-    _set_state(org_id, stage="stock_history",
-               progress=64.0 if initial else 38.0,
-               detail="Записываем историю остатков…")
+    # ── Фаза 2 (внутри чанка): явные нули + запись (хронологически) ──────────
     last_by_wh: dict[int, dict[int, float]] = {}
     batch: list[dict] = []
     batch_days: list[str] = []
-    need_wipe = initial  # см. комментарий выше: чистка старой истории — в
-    # одной транзакции с первой вставкой новой (загрузка уже успешна)
+    need_wipe = initial and not resume_from  # чистка старой истории — в одной
+    # транзакции с первой вставкой новой (первый чанк уже успешно скачан)
 
     def _flush() -> None:
         nonlocal batch, batch_days, need_wipe
-        if not batch and (initial or not batch_days):
+        if not batch and (initial or not batch_days) and not need_wipe:
+            # Ревью 21.08: при need_wipe пустой батч НЕ пропускаем — первый чанк
+            # скачан успешно (инвариант 18.08 соблюдён), а без чистки старые
+            # строки пережили бы запуск и отравили бы точку продолжения.
             batch_days = []
             return
         db = SessionLocal()
         try:
             if need_wipe:
                 db.execute(delete(StockDay).where(StockDay.org_id == org_id))
+                # Старая история реально стёрта — прежняя точка продолжения и
+                # флаг пересборки больше не актуальны (новый отпечаток ниже).
+                stats.pop("stock_loaded_until", None)
+                stats.pop("needs_full_rebuild", None)
             if not initial and batch_days:
                 db.execute(delete(StockDay).where(
                     StockDay.org_id == org_id, StockDay.date.in_(batch_days)
@@ -702,26 +980,50 @@ async def _sync_stock_history(org_id: int, client: MoySkladClient,
         batch = []
         batch_days = []
 
-    for day_iso in dates:  # dates уже в хронологическом порядке
-        totals, by_wh = day_results[day_iso]
-        for pid, qty in totals.items():
-            batch.append({"org_id": org_id, "product_id": pid,
-                          "date": day_iso, "qty": qty})
-        # Явный ноль для распроданных: были >0, из отчёта исчезли.
-        for gone in prev_positive - set(totals):
-            batch.append({"org_id": org_id, "product_id": gone,
-                          "date": day_iso, "qty": 0.0})
-            zeroed += 1
-        written += len(totals) + len(prev_positive - set(totals))
-        batch_days.append(day_iso)
-        prev_positive = {pid for pid, qty in totals.items() if qty > 0}
-        last_by_wh = by_wh
-        if len(batch) >= 20_000:
-            _flush()
-    _flush()
+    done_count = 0
+    # При исключении stock_loaded_until уже указывает на последний целиком
+    # записанный чанк (или отсутствует) — _run_sync сохранит его в stats.
+    for start in range(0, total_dates, STOCK_CHUNK_DATES):
+        chunk = dates[start:start + STOCK_CHUNK_DATES]  # хронологически
+        hits_429_before = client.stats.get("429", 0)
+        day_results = await _fetch_chunk(chunk)
+        for day_iso in chunk:
+            totals, by_wh = day_results[day_iso]
+            for pid, qty in totals.items():
+                batch.append({"org_id": org_id, "product_id": pid,
+                              "date": day_iso, "qty": qty})
+            # Явный ноль для распроданных: были >0, из отчёта исчезли.
+            for gone in prev_positive - set(totals):
+                batch.append({"org_id": org_id, "product_id": gone,
+                              "date": day_iso, "qty": 0.0})
+                zeroed += 1
+            written += len(totals) + len(prev_positive - set(totals))
+            batch_days.append(day_iso)
+            prev_positive = {pid for pid, qty in totals.items() if qty > 0}
+            last_by_wh = by_wh
+            if len(batch) >= 20_000:
+                _flush()
+        _flush()
+        if initial:
+            stats["stock_loaded_until"] = chunk[-1]  # чанк записан целиком
+            stats["resume_fp"] = _resume_fingerprint(active_wh)
+        done_count += len(chunk)
+        if initial:
+            # stats_json пишем каждым чанком: если процесс убьют (деплой, OOM),
+            # reset_stale_running оставит state=error с stock_loaded_until —
+            # и следующий запуск продолжит, а не начнёт заново.
+            progress = 8.0 + 56.0 * done_count / total_dates
+            _set_state(org_id, stage="stock_history", progress=progress,
+                       detail=f"История остатков: {done_count}/{total_dates} дат",
+                       stats_json=json.dumps(stats, ensure_ascii=False))
+        if (client.stats.get("429", 0) > hits_429_before
+                and done_count < total_dates and CHUNK_PAUSE_SECONDS > 0):
+            # Лимит только что закрывался — дадим ему восстановиться,
+            # прежде чем выпускать следующую пачку запросов.
+            await asyncio.sleep(CHUNK_PAUSE_SECONDS)
     if need_wipe:
-        # Ревью 18.08: все даты оказались пустыми (например, аккаунт МС
-        # опустел) — _flush ни разу не вставлял и wipe не сработал. Загрузка
+        # Ревью 18.08: все даты всех чанков оказались пустыми (например,
+        # аккаунт МС опустел) — _flush ни разу не вставлял и wipe не сработал. Загрузка
         # успешна, «пусто» — тоже результат: фиксируем его, иначе останется
         # смесь старой истории с новыми пустыми продажами/остатками.
         db = SessionLocal()
@@ -729,6 +1031,7 @@ async def _sync_stock_history(org_id: int, client: MoySkladClient,
             db.execute(delete(StockDay).where(StockDay.org_id == org_id))
             db.commit()
             need_wipe = False
+            stats.pop("needs_full_rebuild", None)
         finally:
             db.close()
 
