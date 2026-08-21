@@ -186,6 +186,17 @@ class MoySkladClient:
             )
         ]
 
+    async def fetch_positions(self, entity: str, doc_id: str) -> list[dict]:
+        """Все позиции ОДНОГО документа постранично (/entity/{e}/{id}/positions).
+
+        Аудит 18.08: expand=positions вкладывает в документ не более ~100
+        строк — хвост длинных документов (заказ на производство 30 моделей ×
+        5 размеров) молча терялся. Позиции здесь читаются без expand: код
+        синка использует только meta.href ассортимента, quantity/shipped/
+        price/discount — всё это есть в дефолтном ответе.
+        """
+        return [row async for row in self.paginate(f"/entity/{entity}/{doc_id}/positions")]
+
     async def fetch_purchase_orders(self, moment_from: str) -> list[dict]:
         """«Заказы поставщику» (entity/purchaseorder) с позициями с даты moment_from.
 

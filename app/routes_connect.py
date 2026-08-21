@@ -407,6 +407,11 @@ async def api_order_push_to_ms(
         _release_push_lock(db, order.id)
         raise HTTPException(status_code=502, detail=NETWORK_HINT)
     db.commit()
+    # Аудит 18.08: push_order переносит вклад заказа между qty и ms_qty
+    # (а при черновике/частичном матче меняет и сумму «едет к нам») — без
+    # инвалидации страницы 10 минут отдавали старый снапшот и потребность.
+    from app import analytics as _an
+    _an.invalidate(ctx.org.id)
     return result
 
 

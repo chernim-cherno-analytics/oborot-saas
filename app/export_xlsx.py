@@ -65,6 +65,7 @@ def _new_sheet(wb: Workbook, sheet_title: str, org_name: str, ncols: int,
         text += f" · {subtitle}"
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=ncols)
     cell = ws.cell(row=1, column=1, value=text)
+    _guard_formula(cell)  # ревью 18.08: org_name — пользовательский ввод
     cell.font = _TITLE_FONT
     cell.alignment = Alignment(vertical="center")
     return ws
@@ -80,6 +81,16 @@ def _write_header(ws: Worksheet, headers: list[str]) -> None:
     ws.freeze_panes = "A3"
 
 
+def _guard_formula(cell) -> None:
+    """Нейтрализация Excel formula injection (аудит 18.08 + ревью): строку,
+    начинающуюся с '=', openpyxl классифицирует как ФОРМУЛУ — имя товара
+    «=CMD(...)» исполнилось бы в Excel у клиента. Принудительный data_type='s'
+    сохраняет текст как есть (без видимого апострофа; +/-/@ формулой в xlsx
+    не становятся — проверено, их не трогаем)."""
+    if cell.data_type == "f" and isinstance(cell.value, str):
+        cell.data_type = "s"
+
+
 def _write_row(ws: Worksheet, row_idx: int, values: list, formats: dict[int, str],
                font: Font | None = None) -> None:
     """Строка данных: values по колонкам (1-based formats), None → пустая ячейка."""
@@ -87,6 +98,7 @@ def _write_row(ws: Worksheet, row_idx: int, values: list, formats: dict[int, str
         if v is None:
             v = ""
         cell = ws.cell(row=row_idx, column=i, value=v)
+        _guard_formula(cell)
         fmt = formats.get(i)
         if fmt and isinstance(v, (int, float)) and not isinstance(v, bool):
             cell.number_format = fmt
@@ -99,6 +111,7 @@ def _write_total(ws: Worksheet, row_idx: int, ncols: int, values: dict[int, obje
     """Итоговая строка: жирным, с верхней границей по всей ширине."""
     for i in range(1, ncols + 1):
         cell = ws.cell(row=row_idx, column=i, value=values.get(i, ""))
+        _guard_formula(cell)
         cell.font = _TOTAL_FONT
         cell.border = _TOTAL_BORDER
         fmt = formats.get(i)

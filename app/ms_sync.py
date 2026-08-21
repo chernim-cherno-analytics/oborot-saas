@@ -148,6 +148,31 @@ def get_status(org_id: int) -> dict:
     }
 
 
+def reset_stale_running() -> None:
+    """Сброс зависших состояний при старте процесса (аудит 18.08).
+
+    'running' снимался только except-веткой _thread_main — если процесс убили
+    (деплой, OOM, рестарт хостинга), строка оставалась 'running' навсегда,
+    is_running() врал, и авто-/ручные синки организации блокировались до
+    ручного вмешательства. На старте живых потоков нет по определению —
+    все 'running' в БД заведомо мёртвые.
+    """
+    db = SessionLocal()
+    try:
+        n = db.execute(
+            update(SyncState).where(SyncState.state == "running").values(
+                state="error",
+                error="Синхронизация прервана перезапуском сервера — запустите ещё раз",
+                finished_at=datetime.utcnow(),
+            )
+        ).rowcount
+        db.commit()
+        if n:
+            print(f"ms_sync: сброшено зависших состояний running: {n}")
+    finally:
+        db.close()
+
+
 def is_running(org_id: int) -> bool:
     with _threads_lock:
         thread = _threads.get(org_id)
@@ -233,8 +258,18 @@ async def _run_sync(org_id: int, mode: str) -> None:
         db.close()
 
     stats: dict = {"mode": mode}
-    history_days = HISTORY_DAYS if mode == "initial" else 1
-    sales_days = HISTORY_DAYS if mode == "initial" else SALES_RESYNC_DAYS
+    # Аудит 18.08: инкремент раньше качал ровно 1 день остатков и 3 дня продаж
+    # НЕЗАВИСИМО от того, сколько сервис простоял — простой >3 суток оставлял
+    # невосполнимые дыры. Теперь окно растягивается по фактическому разрыву
+    # с последнего УСПЕШНОГО синка (+1 день перекрытия), в пределах HISTORY_DAYS.
+    gap_days = 0
+    if mode != "initial" and conn.last_sync_at is not None:
+        gap_days = max(0, (date.today() - conn.last_sync_at.date()).days)
+    history_days = HISTORY_DAYS if mode == "initial" else min(HISTORY_DAYS, max(1, gap_days + 1))
+    sales_days = HISTORY_DAYS if mode == "initial" else min(
+        HISTORY_DAYS, max(SALES_RESYNC_DAYS, gap_days + 1))
+    if gap_days > 1:
+        stats["gap_days"] = gap_days
 
     async with MoySkladClient(token) as client:
         # ── Этап 1: товары ──────────────────────────────────────────────────
@@ -386,6 +421,7 @@ def _upsert_products(org_id: int, assortment: list[dict], stats: dict) -> dict[s
             ).scalars()
         }
         created = updated = 0
+        renames: dict[str, set[str]] = {}  # старое base_name → новые (аудит 18.08)
         for item in parsed:
             row = existing.get(item["ext_id"])
             if row is None:
@@ -397,12 +433,19 @@ def _upsert_products(org_id: int, assortment: list[dict], stats: dict) -> dict[s
                 created += 1
             else:
                 updated += 1
+                if row.base_name and row.base_name != item["base_name"]:
+                    renames.setdefault(row.base_name, set()).add(item["base_name"])
             row.base_name = item["base_name"]
             row.size = item["size"]
             row.category = item["category"]
             row.sale_price = item["sale_price"]
             row.cost_price = item["cost_price"]
             row.archived = item["archived"]
+        # Миграция пользовательских данных — ДО commit, в одной транзакции с
+        # обновлением base_name (ревью 18.08): иначе сбой между коммитами
+        # оставлял товары с новыми именами, а данные — со старыми, навсегда.
+        if renames:
+            _migrate_renames(db, org_id, renames, stats)
         db.commit()
         ext_to_pid = {
             ext: pid
@@ -418,6 +461,109 @@ def _upsert_products(org_id: int, assortment: list[dict], stats: dict) -> dict[s
     stats["products_created"] = created
     stats["products_updated"] = updated
     return ext_to_pid
+
+
+def _migrate_renames(db, org_id: int, renames: dict[str, set[str]],
+                     stats: dict) -> None:
+    """Переносит пользовательские данные при переименовании товара в МС.
+
+    Аудит 18.08: OrderedQty/SkuHidden/SkuDiscount/SkuCategoryOverride/
+    ProductionAssign и items_json заказов ключованы строкой base_name —
+    после переименования в МойСкладе всё это «осиротевало» (ручное
+    «Заказано» пропадало из аналитики, скидки/архив/производства слетали).
+
+    Мигрируем только однозначный случай: ВСЕ товары старого имени переехали
+    на ОДНО новое имя и под старым не осталось ни одного товара. Разъезд по
+    разным именам или частичное переименование — пропускаем (в stats).
+
+    Вызывается ДО db.commit() вызывающего — в одной транзакции с обновлением
+    base_name товаров. Сессия работает с autoflush=False, поэтому: (1) в
+    начале db.flush(), чтобы SELECT'ы видели свежие имена товаров; (2) слияние
+    НЕСКОЛЬКИХ старых имён в одно новое (пользователь схлопнул дубли в МС)
+    агрегируется по новому имени одним проходом — раньше вторая вставка того
+    же PK падала IntegrityError и валила весь синк (ревью 18.08).
+    """
+    from app.models import (ProductionAssign, ProductionOrder, SkuCategoryOverride,
+                            SkuDiscount, SkuHidden)
+    db.flush()  # pending-переименования товаров должны быть видны SELECT'ам
+    migrated, skipped = [], []
+
+    # Однозначные пары old→new; затем группировка по new (N старых → 1 новое).
+    by_new: dict[str, list[str]] = {}
+    for old, news in renames.items():
+        if len(news) != 1:
+            skipped.append(old)
+            continue
+        new = next(iter(news))
+        left = db.execute(
+            select(Product.id).where(Product.org_id == org_id,
+                                     Product.base_name == old).limit(1)
+        ).first()
+        if left is not None:
+            skipped.append(old)  # часть размеров осталась под старым именем
+            continue
+        by_new.setdefault(new, []).append(old)
+
+    for new, olds in by_new.items():
+        # OrderedQty: слить ВСЕ старые строки в одну новую (qty/ms_qty суммой)
+        add_qty = add_ms = 0.0
+        for old in olds:
+            old_oq = db.get(OrderedQty, (org_id, old))
+            if old_oq is not None:
+                add_qty += old_oq.qty
+                add_ms += old_oq.ms_qty
+                db.delete(old_oq)
+        if add_qty or add_ms:
+            db.flush()  # удаления старых строк — до вставки новой
+            new_oq = db.get(OrderedQty, (org_id, new))
+            if new_oq is None:
+                db.add(OrderedQty(org_id=org_id, base_name=new,
+                                  qty=add_qty, ms_qty=add_ms))
+            else:
+                new_oq.qty += add_qty
+                new_oq.ms_qty += add_ms
+            db.flush()
+        # Простые таблицы: под новым именем остаётся ровно одна запись —
+        # существующая, либо первая из переносимых; остальные удаляются.
+        for model in (SkuHidden, SkuDiscount, SkuCategoryOverride, ProductionAssign):
+            taken = db.execute(select(model).where(
+                model.org_id == org_id, model.base_name == new).limit(1)
+            ).scalars().first() is not None
+            for old in olds:
+                old_rows = db.execute(select(model).where(
+                    model.org_id == org_id, model.base_name == old)).scalars().all()
+                for r in old_rows:
+                    if not taken:
+                        r.base_name = new
+                        taken = True
+                    else:
+                        db.delete(r)
+            db.flush()
+        # Заказы на производство: правим items_json незакрытых заказов,
+        # чтобы push-to-ms и просмотр матчились по актуальному имени
+        olds_set = set(olds)
+        orders = db.execute(select(ProductionOrder).where(
+            ProductionOrder.org_id == org_id,
+            ProductionOrder.status != "received")).scalars().all()
+        for order in orders:
+            try:
+                items = json.loads(order.items_json or "[]")
+            except ValueError:
+                continue
+            changed = False
+            for it in items:
+                if it.get("base_name") in olds_set:
+                    it["base_name"] = new
+                    changed = True
+            if changed:
+                order.items_json = json.dumps(items, ensure_ascii=False)
+        migrated.extend(f"{old} → {new}" for old in olds)
+
+    if migrated:
+        stats["renames_migrated"] = migrated
+        print(f"ms_sync org={org_id}: перенесены данные переименованных: {migrated}")
+    if skipped:
+        stats["renames_skipped"] = skipped
 
 
 # ── История остатков ─────────────────────────────────────────────────────────
@@ -466,9 +612,11 @@ async def _sync_stock_history(org_id: int, client: MoySkladClient,
     db = SessionLocal()
     try:
         if initial:
-            # Полная пересборка истории: чистим и пишем заново, prev с нуля.
-            db.execute(delete(StockDay).where(StockDay.org_id == org_id))
-            db.commit()
+            # Полная пересборка: prev с нуля. Старая история НЕ стирается здесь
+            # (аудит 18.08): раньше delete+commit шли ДО многоминутной загрузки
+            # из МойСклада, и любой сбой (таймаут, 401, 429) оставлял клиента
+            # вовсе без истории. Теперь чистка отложена в первый _flush фазы 2,
+            # когда все данные уже скачаны и лежат в памяти.
             prev_positive: set[int] = set()
         else:
             # Инкремент: prev = последняя дата ДО сегодняшней.
@@ -529,14 +677,18 @@ async def _sync_stock_history(org_id: int, client: MoySkladClient,
     last_by_wh: dict[int, dict[int, float]] = {}
     batch: list[dict] = []
     batch_days: list[str] = []
+    need_wipe = initial  # см. комментарий выше: чистка старой истории — в
+    # одной транзакции с первой вставкой новой (загрузка уже успешна)
 
     def _flush() -> None:
-        nonlocal batch, batch_days
+        nonlocal batch, batch_days, need_wipe
         if not batch and (initial or not batch_days):
             batch_days = []
             return
         db = SessionLocal()
         try:
+            if need_wipe:
+                db.execute(delete(StockDay).where(StockDay.org_id == org_id))
             if not initial and batch_days:
                 db.execute(delete(StockDay).where(
                     StockDay.org_id == org_id, StockDay.date.in_(batch_days)
@@ -544,6 +696,7 @@ async def _sync_stock_history(org_id: int, client: MoySkladClient,
             if batch:
                 db.execute(insert(StockDay), batch)
             db.commit()
+            need_wipe = False
         finally:
             db.close()
         batch = []
@@ -566,6 +719,18 @@ async def _sync_stock_history(org_id: int, client: MoySkladClient,
         if len(batch) >= 20_000:
             _flush()
     _flush()
+    if need_wipe:
+        # Ревью 18.08: все даты оказались пустыми (например, аккаунт МС
+        # опустел) — _flush ни разу не вставлял и wipe не сработал. Загрузка
+        # успешна, «пусто» — тоже результат: фиксируем его, иначе останется
+        # смесь старой истории с новыми пустыми продажами/остатками.
+        db = SessionLocal()
+        try:
+            db.execute(delete(StockDay).where(StockDay.org_id == org_id))
+            db.commit()
+            need_wipe = False
+        finally:
+            db.close()
 
     if not initial:
         _set_state(org_id, stage="stock_today", progress=40.0,
@@ -596,6 +761,23 @@ async def _sync_stock_history(org_id: int, client: MoySkladClient,
 
 
 # ── «Едет к нам» из МС: заказы поставщику ────────────────────────────────────
+
+async def _full_positions(client: MoySkladClient, entity: str, doc: dict,
+                          stats: dict) -> list[dict]:
+    """Полный список позиций документа. Аудит 18.08: expand=positions отдаёт
+    не более ~100 вложенных строк (или вовсе одну meta-ссылку) — сверяем с
+    meta.size и при неполноте дочитываем /entity/{e}/{id}/positions."""
+    posmeta = doc.get("positions") or {}
+    rows = posmeta.get("rows") or []
+    try:
+        size = int(((posmeta.get("meta") or {}).get("size")) or 0)
+    except (TypeError, ValueError):
+        size = 0
+    if size > len(rows) and doc.get("id"):
+        rows = await client.fetch_positions(entity, str(doc["id"]))
+        stats["positions_refetched"] = stats.get("positions_refetched", 0) + 1
+    return rows
+
 
 async def _sync_incoming(org_id: int, client: MoySkladClient,
                          ext_to_pid: dict[str, int], stats: dict) -> None:
@@ -631,7 +813,7 @@ async def _sync_incoming(org_id: int, client: MoySkladClient,
         if doc.get("applicable") is False:  # черновик/непроведённый — не едет
             continue
         doc_qty = 0.0
-        for pos in ((doc.get("positions") or {}).get("rows")) or []:
+        for pos in await _full_positions(client, "purchaseorder", doc, stats):
             ext = _href_id(((pos.get("assortment") or {}).get("meta") or {}).get("href"))
             pid = ext_to_pid.get(ext)
             if pid is None:
@@ -705,7 +887,12 @@ async def _sync_sales(org_id: int, client: MoySkladClient,
     agg: dict[tuple[int, str, bool], list[float]] = {}
     stats["sales_docs"] = 0
     stats["sales_docs_skipped_store"] = 0
-    entities = (("retaildemand", False), ("demand", False), ("salesreturn", True))
+    # Аудит 18.08: добавлен retailsalesreturn — возврат по РОЗНИЧНОЙ продаже
+    # в МойСкладе отдельная сущность, и без неё розничные возвраты не
+    # синхронизировались вовсе (выручка и темп завышались). Тот же баг чинили
+    # в оригинале в июле.
+    entities = (("retaildemand", False), ("demand", False),
+                ("salesreturn", True), ("retailsalesreturn", True))
     # Три типа документов качаются ПАРАЛЛЕЛЬНО (пагинация каждого — последовательная,
     # но друг друга они не ждут) — ещё минус пара минут первого синка.
     _set_state(org_id, stage="sales", progress=base_progress,
@@ -717,6 +904,11 @@ async def _sync_sales(org_id: int, client: MoySkladClient,
                detail="Считаем продажи по документам…")
     for (entity, is_return), docs in zip(entities, docs_lists):
         for doc in docs:
+            if doc.get("applicable") is False:
+                # Аудит 18.08: черновики/распроведённые НЕ продажи — зеркально
+                # фильтру в _sync_incoming (раньше черновик отгрузки завышал
+                # выручку, черновик возврата занижал).
+                continue
             store_ext = _href_id(((doc.get("store") or {}).get("meta") or {}).get("href"))
             if store_ext not in active_store_ids:
                 stats["sales_docs_skipped_store"] += 1
@@ -724,7 +916,7 @@ async def _sync_sales(org_id: int, client: MoySkladClient,
             day = str(doc.get("moment") or "")[:10]
             if not day or day < cutoff:
                 continue
-            positions = ((doc.get("positions") or {}).get("rows")) or []
+            positions = await _full_positions(client, entity, doc, stats)
             for pos in positions:
                 ext = _href_id(((pos.get("assortment") or {}).get("meta") or {}).get("href"))
                 pid = ext_to_pid.get(ext)

@@ -98,7 +98,7 @@ async def vendor_lifecycle_activate(
     db: Session = Depends(get_db),
 ):
     """Install | TariffChanged | Resume → провижининг и {"status":"Activated"}."""
-    ms_vendor.verify_incoming_jwt(request.headers.get("Authorization"))
+    ms_vendor.verify_incoming_jwt(request.headers.get("Authorization"), account_id=account_id)
     _check_app_id(path_app_id)
     try:
         body = await request.json()
@@ -174,7 +174,7 @@ async def vendor_lifecycle_deactivate(
     Данные и вход сохраняем (переустановка = Resume вернёт всё как было);
     доступ к API МС и так закрыт — МС отзывает access_token сам.
     """
-    ms_vendor.verify_incoming_jwt(request.headers.get("Authorization"))
+    ms_vendor.verify_incoming_jwt(request.headers.get("Authorization"), account_id=account_id)
     _check_app_id(path_app_id)
     org = db.execute(
         select(Org).where(Org.ms_account_id == account_id)

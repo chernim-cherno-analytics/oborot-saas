@@ -417,6 +417,25 @@ def api_toggle_warehouse(
 def api_connect_demo(ctx: AuthContext = Depends(require_owner_api), db: Session = Depends(get_db)):
     """Создаёт demo-подключение и сеет синтетические данные (детерминированно)."""
     org = ctx.org
+    # Аудит 18.08: seed_demo начинается с clear_org_data — раньше кнопка демо
+    # без всякого предохранителя стирала ВСЕ данные боевой организации,
+    # включая невосстановимые заказы на производство и ручное «Заказано».
+    # Блокируем только подключения, которые РЕАЛЬНО синкали данные (ревью
+    # 18.08): строка kind='moysklad' создаётся со status='pending' уже при
+    # сохранении токена — до первого синка данных нет, и демо безопасно
+    # (пользователь, передумавший на онбординге, не попадает в тупик).
+    ms_conn = db.execute(
+        select(Connection).where(Connection.org_id == org.id,
+                                 Connection.kind == "moysklad")
+    ).scalars().first()
+    if ms_conn is not None and (ms_conn.status == "active"
+                                or ms_conn.last_sync_at is not None):
+        raise HTTPException(
+            status_code=409,
+            detail="У организации уже подключён МойСклад с реальными данными — "
+                   "демо-данные их безвозвратно сотрут (включая заказы на "
+                   "производство и ручное «Заказано»). Если демо всё же нужно, "
+                   "напишите в поддержку — поможем безопасно.")
     counters = seed_demo(db, org)
     conn = db.execute(
         select(Connection).where(Connection.org_id == org.id, Connection.kind == "demo")

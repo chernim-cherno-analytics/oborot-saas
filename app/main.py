@@ -85,6 +85,11 @@ def _startup() -> None:
     init_db()
     from app import exclusions as _exclusions
     _exclusions.ensure_schema()
+    # Аудит 18.08: убитый процессом синк оставался state='running' навсегда
+    # и блокировал все будущие запуски организации.
+    from app import ms_sync as _ms_sync
+    _ms_sync.ensure_schema()
+    _ms_sync.reset_stale_running()
 
 
 # ── Помощники ────────────────────────────────────────────────────────────────

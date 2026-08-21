@@ -67,6 +67,11 @@ def configured() -> bool:
 # вынести в общий кэш — см. SECURITY-бэклог).
 INCOMING_JWT_MAX_AGE_SEC = 300
 _seen_jti: dict[str, float] = {}
+# jti НАШИХ исходящих токенов (аудит 18.08): исходящий и входящий JWT
+# подписаны ОДНИМ HS256-секретом, поэтому наш же токен, перехваченный по
+# дороге к МС, проходил verify_incoming_jwt. Помечаем исходящие клеймом
+# dir=out и помним их jti — отражение отбивается по обоим признакам.
+_issued_jti: dict[str, float] = {}
 
 
 def _remember_jti(jti: str, now: float) -> bool:
@@ -81,7 +86,8 @@ def _remember_jti(jti: str, now: float) -> bool:
     return True
 
 
-def verify_incoming_jwt(authorization: str | None) -> dict:
+def verify_incoming_jwt(authorization: str | None,
+                        account_id: str | None = None) -> dict:
     """Проверяет JWT из Authorization lifecycle-запроса МойСклад.
 
     Модель доверия (по итогам security-ревью):
@@ -119,6 +125,19 @@ def verify_incoming_jwt(authorization: str | None) -> dict:
     jti = claims.get("jti")
     if jti and not _remember_jti(str(jti), now):
         raise HTTPException(status_code=401, detail="JWT уже был использован (replay)")
+    # Аудит 18.08: наш собственный исходящий токен (тот же секрет!) не должен
+    # проходить как входящий — отражение ловим по клейму dir=out и по jti.
+    if claims.get("dir") == "out" or (jti and str(jti) in _issued_jti):
+        raise HTTPException(status_code=401,
+                            detail="Отражён исходящий токен приложения")
+    # Аудит 18.08: если МС кладёт accountId в claims — сверяем с accountId из
+    # пути (закрывает подмену пути при валидном токене). Клейма может не быть —
+    # тогда проверка мягко пропускается (протокол это допускает).
+    if account_id:
+        claim_acc = str(claims.get("accountId") or claims.get("account_id") or "")
+        if claim_acc and claim_acc != str(account_id):
+            raise HTTPException(status_code=401,
+                                detail="accountId токена не совпадает с путём запроса")
     return claims
 
 
@@ -128,14 +147,24 @@ JWT_TTL_SEC = 300  # запас: МС требует лишь актуальны
 
 
 def make_jwt() -> str:
-    """JWT для запросов к Vendor API: HS256 {sub=appUid, iat, exp, jti}."""
+    """JWT для запросов к Vendor API: HS256 {sub=appUid, iat, exp, jti, dir=out}.
+
+    dir=out — направление токена (МС незнакомые клеймы игнорирует); jti
+    запоминается, чтобы отражённый обратно токен не прошёл verify_incoming_jwt.
+    """
     now = int(time.time())
     payload = {
         "sub": app_uid(),
         "iat": now,
         "exp": now + JWT_TTL_SEC,
         "jti": uuid.uuid4().hex,
+        "dir": "out",
     }
+    # чистим протухшие исходящие jti, чтобы словарь не рос
+    for k, exp in list(_issued_jti.items()):
+        if exp < now:
+            _issued_jti.pop(k, None)
+    _issued_jti[payload["jti"]] = now + JWT_TTL_SEC + INCOMING_JWT_MAX_AGE_SEC
     return jwt.encode(payload, app_secret(), algorithm="HS256")
 
 
