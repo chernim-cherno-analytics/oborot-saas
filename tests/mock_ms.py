@@ -347,6 +347,12 @@ def entity_store(request: Request, limit: int = 1000, offset: int = 0):
 @app.get("/entity/assortment")
 def entity_assortment(request: Request, limit: int = 1000, offset: int = 0):
     _auth(request)
+    if int(FAULTS.get("assortment_429_burst") or 0) > 0:
+        from fastapi.responses import JSONResponse
+        FAULTS["assortment_429_burst"] -= 1
+        return JSONResponse(status_code=429,
+                            content={"errors": [{"error": "mock: Превышен лимит запросов"}]},
+                            headers={"X-Lognex-Retry-TimeInterval": "200"})
     rows = []
     # родительские product для вариантных моделей
     for pid, name, path, price, cost, _rate, flags in SIZED:
@@ -401,10 +407,73 @@ def _parse_filter(flt: str) -> dict:
     return out
 
 
+# ── Инъекция сбоев (инцидент 21.08: 429 от /report/stock/all) ────────────────
+#
+# FAULTS управляются тестом напрямую (тот же процесс) или через
+# POST /__test/faults (JSON с теми же ключами; счётчики FAULT_STATS сбрасываются):
+#   stock_ok_before — сбои включаются только после N успешных ответов отчёта;
+#   stock_429_burst — следующие N запросов отчёта → 429 с Retry-TimeInterval=200;
+#   stock_429_every — каждый k-й запрос отчёта → 429 (0 — выключено);
+#   stock_500_once  — ровно один ближайший запрос отчёта → 500.
+
+FAULTS: dict = {"stock_ok_before": 0, "stock_429_burst": 0,
+                "stock_429_every": 0, "stock_500_once": False,
+                "assortment_429_burst": 0}  # 429 на /entity/assortment (до истории)
+FAULT_STATS: dict = {"stock_requests": 0, "stock_ok": 0, "stock_429": 0, "stock_500": 0}
+
+
+def reset_faults() -> None:
+    FAULTS.update(stock_ok_before=0, stock_429_burst=0, stock_429_every=0,
+                  stock_500_once=False, assortment_429_burst=0)
+    for k in FAULT_STATS:
+        FAULT_STATS[k] = 0
+
+
+@app.post("/__test/faults")
+async def test_faults(request: Request):
+    body = await request.json()
+    reset_faults()
+    for key, val in (body or {}).items():
+        if key in FAULTS:
+            FAULTS[key] = val
+    return {"faults": FAULTS, "stats": FAULT_STATS}
+
+
+def _maybe_fault_stock():
+    """Возвращает Response-сбой для /report/stock/all или None."""
+    from fastapi.responses import JSONResponse
+
+    FAULT_STATS["stock_requests"] += 1
+    if FAULTS["stock_500_once"]:
+        FAULTS["stock_500_once"] = False
+        FAULT_STATS["stock_500"] += 1
+        return JSONResponse(status_code=500, content={"errors": [{"error": "mock: 500"}]})
+    if FAULT_STATS["stock_ok"] >= int(FAULTS["stock_ok_before"] or 0):
+        hit_429 = False
+        if int(FAULTS["stock_429_burst"] or 0) > 0:
+            FAULTS["stock_429_burst"] -= 1
+            hit_429 = True
+        elif int(FAULTS["stock_429_every"] or 0) > 0 and \
+                FAULT_STATS["stock_requests"] % int(FAULTS["stock_429_every"]) == 0:
+            hit_429 = True
+        if hit_429:
+            FAULT_STATS["stock_429"] += 1
+            return JSONResponse(
+                status_code=429,
+                content={"errors": [{"error": "mock: Превышен лимит запросов"}]},
+                headers={"X-Lognex-Retry-TimeInterval": "200"},
+            )
+    FAULT_STATS["stock_ok"] += 1
+    return None
+
+
 @app.get("/report/stock/all")
 def report_stock_all(request: Request, limit: int = 1000, offset: int = 0,
                      flt: str = Query(default="", alias="filter")):
     _auth(request)
+    fault = _maybe_fault_stock()
+    if fault is not None:
+        return fault
     parsed = _parse_filter(flt)
     # КРИТИЧНО: moment учитывается ТОЛЬКО из filter; отдельный query-параметр
     # ?moment=... игнорируется — как в реальном МойСкладе.
