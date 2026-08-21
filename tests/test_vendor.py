@@ -282,6 +282,27 @@ def run_scenario() -> int:
         f"/ms/vendor/api/moysklad/vendor/1.0/apps/other-app/{mock_ms.VENDOR_ACCOUNT_ID}",
         json=install_body("Install", "Оборот Про", False), headers=auth_hdr)
     check("PUT с чужим appId → 404", r.status_code == 404, f"status={r.status_code}")
+    # Аудит 18.08 (#11): отражение нашего же исходящего токена (тот же секрет)
+    from app import ms_vendor as _msv
+    r = client.put(LIFECYCLE_URL, json=install_body("Install", "Оборот Про", False),
+                   headers={"Authorization": f"Bearer {_msv.make_jwt()}"})
+    check("отражение нашего исходящего JWT (dir=out) → 401", r.status_code == 401,
+          f"status={r.status_code}")
+    # accountId в claims не совпадает с accountId пути → 401
+    _now = int(time.time())
+    _foreign = pyjwt.encode(
+        {"sub": "moysklad-vendor-api", "iat": _now, "exp": _now + 300,
+         "accountId": "acc-CHUZHOY-0001"},
+        mock_ms.VENDOR_SECRET, algorithm="HS256")
+    r = client.put(LIFECYCLE_URL, json=install_body("Install", "Оборот Про", False),
+                   headers={"Authorization": f"Bearer {_foreign}"})
+    check("JWT с чужим accountId в claims → 401", r.status_code == 401,
+          f"status={r.status_code}")
+    # МС-подобный токен (без dir/jti/accountId) по-прежнему проходит
+    r = client.put(LIFECYCLE_URL, json=install_body("TariffChanged", "Оборот Про", False),
+                   headers={"Authorization": f"Bearer {ms_jwt()}"})
+    check("МС-токен без dir/jti/accountId проходит (200)", r.status_code == 200,
+          f"status={r.status_code}")
     anon = httpx.Client(headers={"X-Oborot-CSRF": "1"}, base_url=f"http://127.0.0.1:{APP_PORT}", timeout=30.0)
     r = anon.get("/ms/app", params={"contextKey": "ck-unknown"})
     check("левый contextKey → человеческая ошибка, не 500",

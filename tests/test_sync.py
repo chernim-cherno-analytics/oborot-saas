@@ -390,8 +390,8 @@ def run_scenario() -> int:
 
     print("== «Едет к нам» из заказов поставщику МС ==")
     exp_inc = mock_ms.expected_incoming()
-    check("mock: seeded-заказы дают ожидания (Худи 14, Кольцо 5)",
-          exp_inc == {"Худи «Скетч»": 14.0, "Кольцо «Грань»": 5.0},
+    check("mock: seeded-заказы дают ожидания (Худи 14, Кольцо 5+150)",
+          exp_inc == {"Худи «Скетч»": 14.0, "Кольцо «Грань»": 155.0},
           f"exp={exp_inc}")
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
@@ -403,9 +403,14 @@ def run_scenario() -> int:
           all(b not in ms_rows for b in
               ("Футболка «Манифест»", "Сумка «Тоут»", "Рубашка «Разворот»")))
     con.close()
-    check("stats синка: incoming_qty=19 из 2 открытых доков",
-          stats.get("incoming_qty") == 19 and stats.get("incoming_open_docs") == 2,
+    # 19 из старых доков + 150 из po-seed-5 (150 позиций, аудит 18.08 —
+    # проверяет дочитывание хвоста >100 позиций через /positions)
+    check("stats синка: incoming_qty=169 из 3 открытых доков",
+          stats.get("incoming_qty") == 169 and stats.get("incoming_open_docs") == 3,
           f"got qty={stats.get('incoming_qty')} docs={stats.get('incoming_open_docs')}")
+    check("документ >100 позиций дочитан пагинацией (positions_refetched ≥ 1)",
+          (stats.get("positions_refetched") or 0) >= 1,
+          f"refetched={stats.get('positions_refetched')}")
 
     r = client.post("/api/ordered", json={"base_name": "Худи «Скетч»", "qty": 3})
     check("ручная правка qty поверх ms_qty принята", r.status_code == 200)
@@ -668,6 +673,30 @@ def run_scenario() -> int:
     drift = [b for b, it in by_base.items() if turno2.get(b) != it["nq"]]
     check("после инкремента нетто-продажи не изменились", not drift,
           f"drift={drift[:3]}")
+
+    print("== Переименование товара в МС мигрирует пользовательские данные ==")
+    # Аудит 18.08: «Заказано»/скидки/архив ключуются base_name — раньше после
+    # переименования в МойСкладе они «осиротевали» и пропадали из аналитики.
+    r = client.post("/api/ordered", json={"base_name": "Кепка «Штамп»", "qty": 7})
+    check("ручное «Заказано» на кепку принято", r.status_code == 200)
+    _cap = mock_ms.SKU_BY_EXT["p-cap1"]
+    _cap["name"] = "Кепка «Штамп-2»"
+    _cap["base"] = "Кепка «Штамп-2»"
+    r = client.post("/api/sync/run")
+    check("синк после переименования запущен", r.status_code == 200 and r.json().get("ok"))
+    status = wait_sync_done(client, timeout=120)
+    check("синк после переименования done", status.get("state") == "done",
+          f"state={status.get('state')} error={status.get('error', '')[:120]}")
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    cap_old = con.execute(
+        "SELECT qty FROM ordered_qty WHERE base_name='Кепка «Штамп»'").fetchone()
+    cap_new = con.execute(
+        "SELECT qty FROM ordered_qty WHERE base_name='Кепка «Штамп-2»'").fetchone()
+    con.close()
+    check("«Заказано» переехало на новое имя (7 шт), старое очищено",
+          cap_old is None and cap_new is not None and cap_new["qty"] == 7,
+          f"old={dict(cap_old) if cap_old else None} new={dict(cap_new) if cap_new else None}")
 
     print("== Демо-режим не сломан ==")
     demo = httpx.Client(headers={"X-Oborot-CSRF": "1"}, base_url=f"http://127.0.0.1:{APP_PORT}", timeout=120.0)

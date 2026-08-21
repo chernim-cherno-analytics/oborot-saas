@@ -168,7 +168,10 @@ def _build_world():
             stock_by_day[(day, sid)] = snapshot
 
     # Документы: retaildemand — розница Флагмана, demand — отгрузки остальных.
-    docs = {"retaildemand": [], "demand": [], "salesreturn": []}
+    # Возвраты: розничные (Флагман) — retailsalesreturn, остальные — salesreturn
+    # (как в реальном МС; аудит 18.08 — retailsalesreturn не синкался вовсе).
+    docs = {"retaildemand": [], "demand": [], "salesreturn": [],
+            "retailsalesreturn": []}
 
     def _positions(events):
         return [
@@ -181,8 +184,8 @@ def _build_world():
             for e in events
         ]
 
-    def _add_doc(entity, day, sid, events, num):
-        docs[entity].append({
+    def _add_doc(entity, day, sid, events, num, applicable=None):
+        doc = {
             "id": f"{entity}-{day}-{sid}-{num}",
             "meta": {"href": f"{BASE}/entity/{entity}/{entity}-{day}-{sid}-{num}",
                      "type": entity},
@@ -191,7 +194,10 @@ def _build_world():
                                "type": "store"}},
             "positions": {"rows": _positions(events),
                           "meta": {"size": len(events)}},
-        })
+        }
+        if applicable is not None:
+            doc["applicable"] = applicable
+        docs[entity].append(doc)
 
     for day in DATES:
         for sid, _ in STORES:
@@ -203,7 +209,14 @@ def _build_world():
             day_rets = [e for e in return_events
                         if e["date"] == day and e["store"] == sid]
             if day_rets:
-                _add_doc("salesreturn", day, sid, day_rets, 0)
+                _add_doc("retailsalesreturn" if sid == "st-flag" else "salesreturn",
+                         day, sid, day_rets, 0)
+
+    # Черновик отгрузки (applicable=false) с большим количеством: синк обязан
+    # его ПРОПУСТИТЬ — иначе эталон нетто-продаж не сойдётся (аудит 18.08).
+    _add_doc("demand", DATES[-1], "st-2",
+             [{"ext": "v-tee1-S", "qty": 999, "price_kop": 100000, "discount": 0}],
+             99, applicable=False)
 
     return skus, stock_by_day, docs, sale_events, return_events
 
@@ -297,6 +310,21 @@ def _page(rows: list, limit: int, offset: int) -> dict:
         "meta": {"size": len(rows), "limit": limit, "offset": offset},
         "rows": rows[offset:offset + limit],
     }
+
+
+@app.get("/entity/{entity}/{doc_id}/positions")
+def entity_doc_positions(entity: str, doc_id: str, request: Request,
+                         limit: int = 1000, offset: int = 0):
+    """Позиции одного документа постранично (аудит 18.08: дочитывание
+    хвоста документов >100 позиций)."""
+    _auth(request)
+    pool = list(DOCS.get(entity, [])) if entity in DOCS else []
+    if entity == "purchaseorder":
+        pool = PURCHASE_ORDERS
+    for doc in pool:
+        if doc.get("id") == doc_id:
+            return _page(doc["positions"]["rows"], limit, offset)
+    raise HTTPException(404, "document not found")
 
 
 @app.get("/context/employee")
@@ -410,6 +438,12 @@ def _docs_endpoint(entity: str, request: Request, limit: int, offset: int,
         if m_to and day > m_to:
             continue
         if "positions" in (expand or "") and limit <= 100:
+            # как в реальном МС: expand вкладывает не более 100 строк позиций
+            full = doc["positions"]["rows"]
+            if len(full) > 100:
+                doc = dict(doc)
+                doc["positions"] = {"rows": full[:100],
+                                    "meta": doc["positions"]["meta"]}
             rows.append(doc)
         else:
             # как в реальном МС: без expand (или при limit > 100)
@@ -439,6 +473,13 @@ def entity_salesreturn(request: Request, limit: int = 100, offset: int = 0,
                        flt: str = Query(default="", alias="filter"),
                        expand: str = ""):
     return _docs_endpoint("salesreturn", request, limit, offset, flt, expand)
+
+
+@app.get("/entity/retailsalesreturn")
+def entity_retailsalesreturn(request: Request, limit: int = 100, offset: int = 0,
+                             flt: str = Query(default="", alias="filter"),
+                             expand: str = ""):
+    return _docs_endpoint("retailsalesreturn", request, limit, offset, flt, expand)
 
 
 # ── Заказы поставщику: «едет к нам» (импорт purchaseorder) ───────────────────
@@ -490,6 +531,15 @@ def _po_seed():
                      "type": "purchaseorder"},
             "positions": {"rows": [pos("v-ghost-X", 5), pos("p-ring1", 7, 2.0)],
                           "meta": {"size": 2}},
+        },
+        {  # аудит 18.08: документ на 150 позиций — expand отдаёт только 100,
+           # синк обязан дочитать хвост через /positions (иначе «едет» -50)
+            "id": "po-seed-5", "name": "S-0005", "applicable": True,
+            "moment": f"{recent} 15:00:00",
+            "meta": {"href": f"{BASE}/entity/purchaseorder/po-seed-5",
+                     "type": "purchaseorder"},
+            "positions": {"rows": [pos("p-ring1", 1) for _ in range(150)],
+                          "meta": {"size": 150}},
         },
     ]
 
@@ -544,6 +594,12 @@ def entity_purchaseorder(request: Request, limit: int = 100, offset: int = 0,
         if m_from and day < m_from:
             continue
         if "positions" in (expand or "") and limit <= 100:
+            # как в реальном МС: expand вкладывает не более 100 строк позиций
+            full = doc["positions"]["rows"]
+            if len(full) > 100:
+                doc = dict(doc)
+                doc["positions"] = {"rows": full[:100],
+                                    "meta": doc["positions"]["meta"]}
             rows.append(doc)
         else:
             stripped = dict(doc)
