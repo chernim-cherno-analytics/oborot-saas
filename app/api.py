@@ -12,7 +12,8 @@ from app.auth import AuthContext, require_auth_api, require_owner_api
 from app.crypto import encrypt_token
 from app.db import get_db
 from app.demo_seed import seed_demo
-from app.models import Connection, Membership, OrderedQty, Product, ProductionOrder, User, Warehouse
+from app.models import (Connection, Membership, OrderedQty, Product, Production,
+                        ProductionOrder, User, Warehouse)
 
 router = APIRouter(prefix="/api")
 
@@ -589,10 +590,16 @@ def api_productions(ctx: AuthContext = Depends(require_auth_api), db: Session = 
     assigns = db.execute(
         select(ProductionAssign).where(ProductionAssign.org_id == ctx.org.id)
     ).scalars().all()
+    from app import assign_rules
     fallback_lead = analytics.extra_settings(ctx.org)["lead_time_days"]
+    rule = assign_rules.rule_of(ctx.org)
     return {
         "productions": [_production_out(p, fallback_lead) for p in prods],
-        "assign": {a.base_name: a.production_id for a in assigns if a.production_id in valid},
+        # Итоговое распределение = правило + ручные назначения (ручные сильнее).
+        "assign": assign_rules.effective_assign(db, ctx.org),
+        "assign_manual": {a.base_name: a.production_id for a in assigns if a.production_id in valid},
+        "assign_source": rule["assign_source"],
+        "assign_map": rule["assign_map"],
     }
 
 
@@ -621,6 +628,61 @@ def api_production_create(
     return _production_out(p, fallback_lead)
 
 
+@router.get("/productions/assign-sources")
+def api_assign_sources(
+    ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)
+):
+    """Чем заполнены данные МойСклада и что предложить в качестве правила."""
+    from app import assign_rules
+    rule = assign_rules.rule_of(ctx.org)
+    return {
+        "current": rule,
+        "sources": assign_rules.source_values(db, ctx.org.id),
+        "suggest": assign_rules.suggest_rule(db, ctx.org.id),
+    }
+
+
+class AssignRuleIn(BaseModel):
+    assign_source: str = Field(default="manual")
+    assign_map: dict[str, int] = Field(default_factory=dict)
+
+    @field_validator("assign_source")
+    @classmethod
+    def _known(cls, v: str) -> str:
+        from app import assign_rules
+        if v not in assign_rules.SOURCES:
+            raise ValueError("assign_source должен быть manual, supplier или folder")
+        return v
+
+
+@router.post("/productions/assign-rule")
+def api_assign_rule(
+    body: AssignRuleIn,
+    ctx: AuthContext = Depends(require_owner_api), db: Session = Depends(get_db),
+):
+    """Правило распределения позиций по производствам."""
+    from app import assign_rules
+    org = db.merge(ctx.org)
+    valid = set(db.execute(
+        select(Production.id).where(Production.org_id == org.id)).scalars())
+    bad = [str(v) for v in body.assign_map.values() if v not in valid]
+    if bad:
+        raise HTTPException(422, "В правиле указаны неизвестные производства: " + ", ".join(bad))
+    settings = org.settings
+    settings.update(analytics.extra_settings(org))
+    settings["assign_source"] = body.assign_source
+    settings["assign_map"] = {str(k): int(v) for k, v in body.assign_map.items()}
+    org.settings_json = json.dumps(settings, ensure_ascii=False)
+    db.commit()
+    analytics.invalidate(org.id)
+    assign = assign_rules.effective_assign(db, org)
+    by_pid: dict[str, int] = {}
+    for pid in assign.values():
+        by_pid[str(pid)] = by_pid.get(str(pid), 0) + 1
+    return {"ok": True, "assign_source": body.assign_source,
+            "assigned": len(assign), "by_production": by_pid}
+
+
 @router.post("/productions/assign")
 def api_production_assign(
     body: ProductionAssignIn,
@@ -629,25 +691,25 @@ def api_production_assign(
     """Перенести позицию на производство (production_id=null — на основное)."""
     from app.models import Production, ProductionAssign
     row = db.get(ProductionAssign, (ctx.org.id, body.base_name))
+    # production_id = null означает «снять ручное назначение»: позиция снова
+    # подчиняется правилу распределения (а если правила нет — основному
+    # производству). Пин НА ОСНОВНОЕ пишется явной записью с его id, иначе при
+    # активном правиле вернуть позицию к себе было бы нечем.
     if body.production_id is None:
         if row is not None:
             db.delete(row)
             db.commit()
+            analytics.invalidate(ctx.org.id)
         return {"ok": True}
     p = db.get(Production, body.production_id)
     if p is None or p.org_id != ctx.org.id:
         raise HTTPException(404, "Производство не найдено")
-    if p.is_main:
-        # на основное переносим удалением записи, а не ссылкой на него
-        if row is not None:
-            db.delete(row)
-            db.commit()
-        return {"ok": True}
     if row is None:
         db.add(ProductionAssign(org_id=ctx.org.id, base_name=body.base_name, production_id=p.id))
     else:
         row.production_id = p.id
     db.commit()
+    analytics.invalidate(ctx.org.id)
     return {"ok": True}
 
 

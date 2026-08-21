@@ -125,6 +125,11 @@ class Product(Base):
     # Деньги считаются по cost_full с фолбэком на cost_price (analytics).
     cost_price: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)  # закупочная, ₽
     cost_full: Mapped[float] = mapped_column(Float, nullable=False, default=0.0, server_default="0")
+    # Поставщик из МойСклада (контрагент в карточке товара). По нему обычно и
+    # видно, кто шьёт позицию: «Китай» — фабрика под ключ, своё производство —
+    # пусто или собственное юрлицо. Используется правилом распределения
+    # позиций по производствам (см. app/assign_rules.py).
+    supplier: Mapped[str] = mapped_column(String(255), nullable=False, default="", server_default="")
     archived: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     # Не участвует в аналитике (упаковка, сертификаты, расходники): ставится
     # авто-эвристикой при первом появлении позиции и руками в настройках.

@@ -37,7 +37,7 @@ from sqlalchemy.orm import Session
 
 from app import analytics
 from app.analytics import size_split, window_dis, window_nq
-from app.models import Org, Production, ProductionAssign
+from app.models import Org, Production
 
 # ── Константы ────────────────────────────────────────────────────────────────
 
@@ -442,8 +442,8 @@ def collect_context(db: Session, org: Org, snap: dict, brief: dict) -> dict:
 
     assign = {}
     if brief.get("production_id") is not None:
-        rows = db.query(ProductionAssign).filter(ProductionAssign.org_id == org.id).all()
-        assign = {r.base_name: r.production_id for r in rows}
+        from app import assign_rules
+        assign = assign_rules.effective_assign(db, org)
     try:
         peaks = json.loads(org.settings_json or "{}").get("peak_periods")
     except (ValueError, AttributeError):

@@ -340,6 +340,11 @@ class MoySkladClient:
 
     # ── Обратная запись (writeback): «Заказ поставщику» ─────────────────────
 
+    async def fetch_counterparties(self) -> list[dict]:
+        """Справочник контрагентов — нужен, чтобы у товара знать ИМЯ поставщика
+        (в ассортименте приходит только ссылка)."""
+        return [row async for row in self.paginate("/entity/counterparty")]
+
     async def fetch_organizations(self) -> list[dict]:
         """Юрлица аккаунта (entity/organization) — нужны для документов."""
         return [row async for row in self.paginate("/entity/organization")]

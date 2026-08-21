@@ -106,6 +106,11 @@ def ensure_schema() -> None:
                 conn.execute(text(
                     "ALTER TABLE products ADD COLUMN cost_full FLOAT NOT NULL DEFAULT 0"
                 ))
+        if "supplier" not in cols:
+            with engine.begin() as conn:
+                conn.execute(text(
+                    "ALTER TABLE products ADD COLUMN supplier VARCHAR(255) NOT NULL DEFAULT ''"
+                ))
     if insp.has_table("productions"):
         cols = {c["name"] for c in insp.get_columns("productions")}
         if "cadence_days" not in cols:
@@ -503,6 +508,16 @@ async def _run_sync(org_id: int, mode: str, resume_from: str | None = None,
         _set_state(org_id, stage="products", progress=1.0,
                    detail="Загружаем ассортимент (товары и размеры)…")
         assortment = await client.fetch_assortment()
+        # Имена контрагентов: в ассортименте у товара только ссылка на
+        # поставщика, а правило распределения по производствам работает с именем.
+        try:
+            _SUPPLIERS[org_id] = {
+                (row.get("id") or ""): str(row.get("name") or "")
+                for row in await client.fetch_counterparties()
+            }
+        except Exception as exc:  # справочник недоступен — не роняем синк
+            _SUPPLIERS[org_id] = {}
+            stats["suppliers_error"] = str(exc)[:200]
         # Какие типы цен считать «ценой продажи» и «полной себестоимостью»:
         # выбор организации, иначе угадываем по названию (см. _price_by).
         _load_price_types(org_id)
@@ -634,6 +649,7 @@ def _parse_assortment(rows: list[dict], org_id: int = 0) -> list[dict]:
                 "sale_price": _sale_price_of(row, org_id),
                 "cost_price": _kopecks((row.get("buyPrice") or {}).get("value")),
                 "cost_full": _cost_full_of(row, org_id),
+                "supplier": _supplier_of(row, org_id),
                 "archived": bool(row.get("archived")),
             }
 
@@ -656,6 +672,7 @@ def _parse_assortment(rows: list[dict], org_id: int = 0) -> list[dict]:
                 "sale_price": parent["sale_price"],
                 "cost_price": parent["cost_price"],
                 "cost_full": parent["cost_full"],
+                "supplier": parent["supplier"],
                 "archived": parent["archived"],
             })
             continue
@@ -675,6 +692,7 @@ def _parse_assortment(rows: list[dict], org_id: int = 0) -> list[dict]:
             parent["cost_price"] if parent else 0.0
         )
         cost_full = _cost_full_of(row, org_id) or (parent["cost_full"] if parent else 0.0)
+        supplier = _supplier_of(row, org_id) or (parent["supplier"] if parent else "")
         archived = bool(row.get("archived")) or bool(parent and parent["archived"])
         out.append({
             "ext_id": ext_id,
@@ -684,6 +702,7 @@ def _parse_assortment(rows: list[dict], org_id: int = 0) -> list[dict]:
             "sale_price": sale_price,
             "cost_price": cost_price,
             "cost_full": cost_full,
+            "supplier": supplier,
             "archived": archived,
         })
     return out
@@ -697,6 +716,15 @@ def _parse_assortment(rows: list[dict], org_id: int = 0) -> list[dict]:
 _SALE_HINTS = ("цена продажи", "розниц", "sale", "retail")
 _COST_HINTS = ("себестоим", "cost")
 _PRICE_TYPES: dict[int, dict] = {}  # org_id → {"sale": name, "cost": name}
+_SUPPLIERS: dict[int, dict] = {}    # org_id → {counterparty_id: name}
+
+
+def _supplier_of(row: dict, org_id: int) -> str:
+    """Имя поставщика товара (контрагент в карточке МойСклада)."""
+    href = ((row.get("supplier") or {}).get("meta") or {}).get("href")
+    if not href:
+        return ""
+    return (_SUPPLIERS.get(org_id) or {}).get(_href_id(href), "")
 
 
 def _load_price_types(org_id: int) -> None:
@@ -806,6 +834,7 @@ def _upsert_products(org_id: int, assortment: list[dict], stats: dict) -> dict[s
             row.category = item["category"]
             row.sale_price = item["sale_price"]
             row.cost_full = item.get("cost_full") or 0.0
+            row.supplier = item.get("supplier") or ""
             row.cost_price = item["cost_price"]
             row.archived = item["archived"]
         # Миграция пользовательских данных — ДО commit, в одной транзакции с
