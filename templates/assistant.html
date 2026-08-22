@@ -113,6 +113,14 @@
   .why { font-size: 10.5px; color: rgba(31,31,31,.5); font-weight: 400; display: block; }
   .qinp { width: 66px; padding: 5px 6px; border-radius: 8px; border: 1px solid rgba(31,31,31,.2);
     background: #fff; text-align: center; font-size: 13px; font-weight: 700; font-family: inherit; }
+  .datafacts { margin: 10px 0 14px; padding: 10px 12px; border: 1px solid #e2d8cc;
+               border-radius: 10px; background: #fbf7f2; }
+  .datafacts .df-head { font-size: 12px; font-weight: 600; color: #6b5f52;
+                        text-transform: uppercase; letter-spacing: .04em; margin-bottom: 6px; }
+  .datafacts .df-list { margin: 0; padding: 0; list-style: none; }
+  .datafacts .df-list li { font-size: 13px; line-height: 1.5; }
+  .datafacts .df-ok { color: #3d6b3d; }
+  .datafacts .df-warn { color: #8a5a00; }
   .warn { font-size: 12px; color: #a15c00; background: rgba(255,204,0,.15);
     border: 1px solid rgba(255,204,0,.4); border-radius: 10px; padding: 10px 14px; margin-bottom: 14px; line-height: 1.5; }
   .err { font-size: 12px; color: #8a0003; background: rgba(221,0,4,.08);
@@ -164,6 +172,9 @@
     <div class="panel">
       <h2>Когда нужен товар и сколько есть денег</h2>
       <div class="sub">Два обязательных поля. Остальное система заполнила сама — поправить можно на следующем шаге.</div>
+
+      <!-- D-23: факты о данных, а не оценка уверенности. Заполняется renderDataFacts. -->
+      <div id="dataFacts" class="datafacts" style="display:none;"></div>
 
       <div class="fld">
         <span class="lbl">Производство</span>
@@ -313,6 +324,13 @@
   }
   function dropDraft(){ try { localStorage.removeItem(LSKEY); } catch(e){} }
 
+  /* Русская форма слова по числу: 1 день / 2 дня / 5 дней. */
+  function plural(n, one, few, many){
+    n = Math.abs(Math.round(n));
+    if(n % 10 === 1 && n % 100 !== 11) return one;
+    if(n % 10 >= 2 && n % 10 <= 4 && !(n % 100 >= 12 && n % 100 <= 14)) return few;
+    return many;
+  }
   function esc(s){ return String(s==null?"":s).replace(/[&<>"']/g, function(c){
     return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]; }); }
   function fmt(n){ n = Math.round(Number(n)||0); return String(n).replace(/\B(?=(\d{3})+(?!\d))/g," "); }
@@ -422,6 +440,57 @@
     box.textContent = "Каждая строка заказа закрывает " + w[STATE.strategy] +
       ". Это единственное, что меняет форму заказа: шире и мельче или уже и глубже. " +
       "Порядок всегда один — по оборачиваемости ₽/день.";
+  }
+
+  // ── «Что известно о данных» (D-23) ────────────────────────────────────────
+  // Решение владельца: когда данных не хватает, система не придумывает число,
+  // а говорит, ЧЕГО не хватает — конкретными фактами, а не оценкой уверенности
+  // в процентах и не буквами HIGH/MEDIUM/LOW. Буква читается как вероятность
+  // и прячет причину; «истории 47 дней» проверяемо и подсказывает, что делать.
+  // Те же самые числа уходят в запись решения (_decision_record.data_quality),
+  // поэтому экран и история никогда не разойдутся.
+  function renderDataFacts(dq){
+    var box = document.getElementById("dataFacts");
+    if(!box) return;
+    if(!dq){ box.style.display = "none"; return; }
+    var rows = [];
+    function row(ok, text){
+      rows.push('<li class="' + (ok ? "df-ok" : "df-warn") + '">' +
+                (ok ? "✓ " : "⚠ ") + esc(text) + "</li>");
+    }
+    var days = dq.coverage_days || 0;
+    var since = dq.coverage_start ? (" (с " + fmtDate(dq.coverage_start) + ")") : "";
+    row(days >= 365, "История продаж и остатков: " + days + " " +
+        plural(days, "день", "дня", "дней") + since +
+        (days >= 365 ? "" : " — для сезонных сравнений нужен полный год"));
+    var total = dq.positions_total || 0, noc = dq.positions_no_cost || 0;
+    row(noc === 0, noc === 0
+        ? ("Себестоимость есть у всех " + total + " " + plural(total, "позиции", "позиций", "позиций"))
+        : ("Себестоимости нет у " + noc + " из " + total +
+           " — эти позиции в заказ не попадают и в деньгах не участвуют"));
+    var full = dq.positions_cost_full;
+    if(total && full != null && full < total){
+      row(false, "Полная себестоимость задана у " + full + " из " + total +
+          " — у остальных считаем по закупочной цене МойСклада");
+    }
+    var st = dq.sync_state, fresh = dq.last_sync_at;
+    row(st === "done" && !!fresh, fresh
+        ? ("Данные из МойСклада на " + fmtDateTime(fresh) +
+           (st === "done" ? "" : " (последняя синхронизация: " + esc(st || "?") + ")"))
+        : "Синхронизация с МойСкладом ещё не завершалась — считаем по тому, что есть");
+    box.innerHTML = '<div class="df-head">Что известно о данных этого расчёта</div>' +
+                    '<ul class="df-list">' + rows.join("") + "</ul>";
+    box.style.display = "";
+  }
+  function fmtDate(iso){
+    var d = new Date(String(iso).slice(0,10) + "T00:00:00");
+    return isNaN(d) ? String(iso) : d.toLocaleDateString("ru-RU");
+  }
+  function fmtDateTime(iso){
+    var d = new Date(iso);
+    return isNaN(d) ? String(iso)
+      : d.toLocaleDateString("ru-RU") + ", " +
+        d.toLocaleTimeString("ru-RU", {hour: "2-digit", minute: "2-digit"});
   }
 
   function updHints(){
@@ -787,20 +856,41 @@
           (r.cost_price?(', себестоимость '+fmtR(r.cost_price)):'')+'. '+note+'</div>';
       }).join("");
     }
+    // D-23: отказ системы считать НЕ запрещает человеку действовать. Поле
+    // количества здесь — единственный способ заказать позицию, по которой
+    // «Оборот» сознательно не даёт рекомендацию. Значение уходит в overrides
+    // и на сервере становится строкой с qty_recommended = null: решение
+    // человека не выдаётся за рекомендацию системы.
+    function noCostList(rows){
+      if(!rows || !rows.length) return '';
+      return rows.map(function(r){
+        var cur = STATE.edits[r.base_name];
+        return '<div class="peak" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">'+
+          '<span style="flex:1 1 200px">'+esc(r.base_name)+' — '+fmt(r.turnover)+' ₽/день'+
+          ', на складе '+fmt(r.cs||0)+' шт</span>'+
+          '<input class="qinp nocost-q" type="number" min="0" step="1" style="width:88px" '+
+          'data-b="'+esc(r.base_name)+'" placeholder="шт" '+
+          (cur ? ('value="'+cur+'"') : '')+'>'+
+          '</div>';
+      }).join("");
+    }
     var revHtml = '<div class="fold"><details><summary>Что система считать не берётся ('+
       ((rev.low_data_count||0)+(rev.no_cost_count||0))+' поз. решаете вы)</summary><div class="body">'+
       (rev.low_data_count ? ('<div class="peak"><b>Мало данных — '+rev.low_data_count+
         ' поз.</b> Темп из одной-двух продаж: считать по нему нельзя, но отметьте — возьмём как есть.</div>'+
         revList(rev.low_data, 'Отметьте, чтобы включить в заказ.', true)) : '')+
       (rev.no_cost_count ? ('<div class="peak"><b>Нет себестоимости — '+rev.no_cost_count+
-        ' поз.</b> Без неё деньги посчитать нечем — заполните в МойСкладе.</div>'+
-        revList(rev.no_cost, 'Заполните себестоимость в МойСкладе.', false)) : '')+
+        ' поз.</b> Деньги по ним «Оборот» посчитать не может и количество не советует. '+
+        'Но решение за вами: впишите штуки — позиция попадёт в заказ как ваше решение, '+
+        'а сумма заказа будет помечена как неполная.</div>'+
+        noCostList(rev.no_cost)) : '')+
       '<div class="peak">Без продаж 90 дней — '+(rev.stale_count||0)+' поз. · потребность меньше 3 шт — '+(rev.small_need_count||0)+' поз.</div>'+
       (rev.other_production_count ? '<div class="peak">На других производствах — '+rev.other_production_count+' поз.: закажите отдельным заказом.</div>' : "")+
       '</div></details></div>';
 
     var op = STATE.open || {orders:[], count:0};
     var openHtml = "";
+    // Обработчик вешается после вставки HTML (см. ниже, после innerHTML).
     if (op.count) {
       var first = op.orders[0];
       openHtml = '<div class="warn" style="margin-bottom:12px">По этому каналу '+
@@ -811,8 +901,21 @@
         '. <a href="/orders">Посмотреть заказы</a></div>';
     }
 
+    // Решение владельца D-23: нельзя молча показывать общий бюджет как полный,
+    // если в заказе есть позиции без себестоимости. Их стоимость равна нулю
+    // не потому, что они бесплатны, а потому что цифры нет.
+    var bi = p.budget_incomplete;
+    var incHtml = bi ? ('<div class="warn" style="margin-bottom:12px">'+
+      '<b>Сумма заказа неполная.</b> В заказе '+bi.positions+' '+
+      plural(bi.positions, "позиция", "позиции", "позиций")+' без себестоимости ('+
+      fmt(bi.units)+' шт): '+esc((bi.names||[]).join(", "))+
+      '. Их стоимость в сумму не входит — не потому, что они бесплатны, а потому '+
+      'что цифры нет. Заполните себестоимость в МойСкладе, чтобы увидеть настоящую сумму.'+
+      '</div>') : "";
+
     document.getElementById("planBox").innerHTML =
       openHtml+
+      incHtml+
       '<div id="budgetWarn"></div>'+
       '<div class="cards" id="cards"></div>'+
       '<div class="panel"><h2>Когда и сколько платить</h2>'+
@@ -891,6 +994,19 @@
     });
     renderCards();
     renderCoverage();
+    // D-23: количество, вписанное у позиции без себестоимости. Пересчитываем
+    // на сервере с сохранением правок (keepEdits=true) — только сервер решает,
+    // существует ли такая позиция у этой организации, и только он строит
+    // строку с qty_recommended = null. Фронт здесь ничего не выдумывает.
+    Array.prototype.forEach.call(document.querySelectorAll(".nocost-q"), function(el){
+      el.addEventListener("change", function(){
+        var b = el.dataset.b, v = Math.max(0, parseInt(el.value, 10) || 0);
+        if(v > 0) STATE.edits[b] = v; else delete STATE.edits[b];
+        STATE.savedEdits = Object.assign({}, STATE.savedEdits || {}, STATE.edits);
+        saveDraft();
+        window.preview(3, true);
+      });
+    });
     // «Взять» у позиций из отсева — решение владельца сильнее алгоритма.
     Array.prototype.forEach.call(document.querySelectorAll(".takebox"), function(el){
       el.addEventListener("change", function(){
@@ -1160,6 +1276,7 @@
         ' <a href="/settings">Указать тип цены для себестоимости</a>';
       document.querySelector("#s1 .panel").prepend(w);
     }
+    renderDataFacts(opt.data_quality);
     var box = document.getElementById("catChips");
     box.innerHTML = cats.map(function(c){
       var name = (typeof c === "string") ? c : (c.name || c.category || "");
