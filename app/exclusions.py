@@ -66,6 +66,21 @@ def is_service_item(name: str, category: str = "") -> bool:
     return bool(_NAME_RE.search((name or "").lower()))
 
 
+def exclude_reason(name: str, category: str = "") -> str:
+    """Почему позиция похожа на расходник — словами, для экрана настроек.
+
+    Пустая строка = правило её не трогало (значит, исключил человек).
+    """
+    cat = (category or "").strip().lower()
+    if cat in SERVICE_CATEGORIES:
+        return f"категория «{category.strip()}» — расходники"
+    low = (name or "").lower()
+    hit = _NAME_RE.search(low)
+    if hit:
+        return f"в названии «{hit.group(0)}»"
+    return ""
+
+
 def ensure_schema() -> None:
     """Аддитивная миграция: products.excluded + разовый бэкфилл эвристикой.
 

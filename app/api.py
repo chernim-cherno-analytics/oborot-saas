@@ -524,6 +524,21 @@ def api_set_ordered(
 
 # ── Настройки ────────────────────────────────────────────────────────────────
 
+def _price_types_seen(db: Session, org_id: int) -> list[str]:
+    """Типы цен, встреченные в ассортименте МойСклада при последнем синке.
+
+    Нужны выпадающему списку в настройках: «какой тип цены считать полной
+    себестоимостью». Своего справочника не заводим — берём то, что синк уже
+    видел (ms_sync кладёт в stats и переносит между прогонами).
+    """
+    from app.models import SyncState
+    row = db.get(SyncState, org_id)
+    if row is None:
+        return []
+    names = (row.stats or {}).get("price_types") or []
+    return [str(x) for x in names if str(x).strip()][:40]
+
+
 @router.get("/settings")
 def api_settings(ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)):
     org = ctx.org
@@ -560,6 +575,9 @@ def api_settings(ctx: AuthContext = Depends(require_auth_api), db: Session = Dep
         "reserve_new_pct": extra["reserve_new_pct"],
         "price_type_sale": extra["price_type_sale"],
         "price_type_cost": extra["price_type_cost"],
+        # Что за типы цен вообще встретились в ассортименте МойСклада —
+        # чтобы выбирать из списка, а не угадывать написание руками.
+        "price_types": _price_types_seen(db, org.id),
         "peak_periods": extra["peak_periods"],
         "warehouses": [{"id": w.id, "name": w.name, "active": w.active} for w in warehouses],
         "connection": (
@@ -663,12 +681,24 @@ def api_exclusions(
 ):
     """Список исключённых баз (+ по q — поиск кандидатов среди участвующих)."""
     excluded = db.execute(
-        select(Product.base_name, func.count(Product.id))
+        select(Product.base_name, func.count(Product.id),
+               func.min(Product.category))
         .where(Product.org_id == ctx.org.id, Product.excluded.is_(True))
         .group_by(Product.base_name)
         .order_by(Product.base_name)
     ).all()
-    result = {"excluded": [{"base_name": b, "variants": int(n)} for b, n in excluded]}
+    # Что отложила эвристика синка, а что руками выбрал владелец. Отдельного
+    # флага в базе нет и заводить его ради этого не стоит: правило —
+    # чистая функция, достаточно переспросить её. Аудит 22.08: пользователь
+    # видел «исключено 47 позиций» без объяснения и без способа вернуть.
+    from app import exclusions as _excl
+    result = {"excluded": [
+        {"base_name": b, "variants": int(n),
+         "by_rule": _excl.is_service_item(b, c or ""),
+         "reason": _excl.exclude_reason(b, c or "")}
+        for b, n, c in excluded
+    ]}
+    result["by_rule_count"] = sum(1 for x in result["excluded"] if x["by_rule"])
     query = (q or "").strip().lower()
     if len(query) >= 2:
         candidates = db.execute(
@@ -1726,8 +1756,11 @@ class ProductionSetupIn(BaseModel):
 
 @router.post("/productions/{pid}/setup")
 def api_production_setup(
-    pid: int, body: ProductionSetupIn,
-    ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db),
+    body: ProductionSetupIn,
+    pid: int = _id_path(),
+    # Этапы, сроки и минимальная партия — это деньги и обязательства перед
+    # подрядчиком: менять их может владелец, как и переименование с удалением.
+    ctx: AuthContext = Depends(require_owner_api), db: Session = Depends(get_db),
 ):
     from app import order_planner
     from app.models import Production
@@ -1740,6 +1773,17 @@ def api_production_setup(
         if raw is None:
             raise HTTPException(422, "Неизвестный пресет этапов")
     if raw is not None:
+        # Минимумы по категориям задаются только через API и в экране настроек
+        # не показываются — не даём форме молча их стереть: если в присланном
+        # этапе поля нет, берём прежнее значение этапа с тем же ключом.
+        if body.stages is not None:
+            prev = {st.get("key"): st.get("min_by_category")
+                    for st in (p.stages or []) if isinstance(st, dict)}
+            raw = [
+                ({**st, "min_by_category": prev.get(st.get("key")) or {}}
+                 if isinstance(st, dict) and "min_by_category" not in st else st)
+                for st in raw
+            ]
         stages = order_planner.normalize_stages(
             raw, analytics.extra_settings(ctx.org)["lead_time_days"]
         )

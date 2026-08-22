@@ -561,7 +561,12 @@ def estimate_minutes(n_dates: int, n_stores: int) -> float:
 # запуска и «сегодня» продолжения; window_done — окно быстрого старта
 # доехало целиком, включая продажи и «едет к нам» (мажор 2).
 _CARRIED_STATS = ("history_loaded_from", "history_loaded_to", "resume_fp",
-                  "needs_full_rebuild", "coverage_days", "window_done")
+                  "needs_full_rebuild", "coverage_days", "window_done",
+                  # Список типов цен МойСклада: его показывает экран настроек
+                  # («какой тип цены считать полной себестоимостью»). Без
+                  # переноса он жил ровно до следующего прогона синка, и
+                  # выпадающий список оказывался пустым.
+                  "price_types")
 
 
 def _pending_resume(org_id: int) -> str | None:

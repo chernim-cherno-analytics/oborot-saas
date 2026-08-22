@@ -655,6 +655,16 @@ def _allocate(cands: list[dict], brief: dict, ctx: dict, stages: list[dict]) -> 
     # размещения (предоплата первого этапа: у своего производства это ткань,
     # пошив оплачивается после её прихода), 'full' — весь заказ целиком.
     pay_share = prepay_share_total(stages) if brief["budget_scope"] == "now" else 1.0
+    # Канал с нулевой предоплатой (подрядчик берёт деньги только по готовности)
+    # ломал режим «деньги на сейчас»: доля = 0 → цена единицы падала до рубля
+    # (max(1.0, ...)) → бюджет переставал ограничивать что-либо и план выходил
+    # в десятки раз выше названной суммы. В такой ситуации «денег на сейчас»
+    # просто не существует как ограничения — считаем по полной стоимости
+    # заказа и говорим об этом словами.
+    budget_basis = brief["budget_scope"]
+    if brief["budget_scope"] == "now" and pay_share <= 1e-9:
+        pay_share = 1.0
+        budget_basis = "full_no_prepay"
 
     alloc: dict[str, int] = {}
     reasons: dict[str, list[str]] = {}
@@ -764,7 +774,7 @@ def _allocate(cands: list[dict], brief: dict, ctx: dict, stages: list[dict]) -> 
         "alloc": alloc, "reasons": reasons, "cap_units": cap_units,
         "moq_skipped": moq_skipped, "moq_over_cap": moq_over_cap, "spent": spent,
         "reserve": reserve, "new_cost": new_cost, "new_over_budget": over_budget,
-        "money": money, "pay_share": pay_share,
+        "money": money, "pay_share": pay_share, "budget_basis": budget_basis,
         "cap_per_item": cap_per_item,
     }
 
@@ -907,6 +917,17 @@ def plan_order(snap: dict, brief: dict, ctx: dict, stages: list[dict],
         "strategy_title": STRATEGIES[brief["strategy"]]["title"],
         "budget": brief["budget"],
         "budget_scope": brief["budget_scope"],
+        # По какой сумме бюджет сравнивался на самом деле. full_no_prepay —
+        # канал ничего не берёт в день размещения, поэтому «деньги на сейчас»
+        # нечем ограничивать и мы считаем по полной стоимости заказа.
+        "budget_basis": res["budget_basis"],
+        "budget_note": (
+            "По этому каналу в день размещения заказа не платится ничего — "
+            f"первый платёж {payments[0]['date'] if payments else '—'}. "
+            "Поэтому бюджет сравниваем с полной стоимостью заказа, "
+            "а не с деньгами «на сейчас»."
+            if res["budget_basis"] == "full_no_prepay" else None
+        ),
         "reserve_new": res["reserve"],
         "spent": round(res["spent"]),
         "rest": round(res["money"] - res["spent"]),
