@@ -1,0 +1,271 @@
+{% extends "base.html" %}
+{% block content %}
+
+<style>
+  .plans-wrap { max-width: 980px; }
+  .plan-now { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+  .plan-now .big { font-size: 20px; font-weight: 800; }
+  .trial-left { font-size: 13px; color: var(--ink-2); }
+  .trial-left b { color: var(--ink); }
+  .plan-cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin: 14px 0 0; }
+  @media (max-width: 900px) { .plan-cards { grid-template-columns: 1fr; } }
+  .pcard { position: relative; border: 1px solid var(--line); border-radius: 10px;
+           background: var(--surface); padding: 16px; display: flex; flex-direction: column; }
+  .pcard.hot { border-color: var(--blue); box-shadow: 0 0 0 1px var(--blue) inset; }
+  .pcard.current { border-color: var(--green); box-shadow: 0 0 0 1px var(--green) inset; }
+  .pcard .tag { position: absolute; top: -9px; left: 16px; font-size: 10.5px; font-weight: 700;
+                text-transform: uppercase; letter-spacing: .04em; padding: 3px 8px; border-radius: 20px; }
+  .pcard .tag.hot { background: var(--blue); color: #fff; }
+  .pcard .tag.cur { background: var(--green); color: #fff; }
+  .pcard h3 { font-size: 15px; font-weight: 800; margin: 2px 0 2px; }
+  .pcard .for { font-size: 12px; color: var(--ink-3); margin: 0 0 10px; min-height: 28px; }
+  .pcard .price { font-size: 22px; font-weight: 800; font-variant-numeric: tabular-nums; }
+  .pcard .price span { font-size: 12px; font-weight: 600; color: var(--ink-3); }
+  .pcard .price-year { font-size: 11.5px; color: var(--ink-3); margin: 2px 0 12px;
+                       font-variant-numeric: tabular-nums; }
+  .pcard ul { list-style: none; margin: 0 0 14px; padding: 0; flex: 1; }
+  .pcard li { font-size: 12.5px; color: var(--ink-2); padding: 4px 0 4px 18px; position: relative; }
+  .pcard li::before { content: "✓"; position: absolute; left: 0; color: var(--green); font-weight: 700; }
+  .steps { counter-reset: st; margin: 0; padding: 0; list-style: none; }
+  .steps li { counter-increment: st; position: relative; padding: 0 0 12px 34px; font-size: 13px; color: var(--ink-2); }
+  .steps li::before { content: counter(st); position: absolute; left: 0; top: -1px; width: 22px; height: 22px;
+                      border-radius: 50%; background: var(--blue-soft); color: var(--blue);
+                      font-weight: 800; font-size: 12px; display: flex; align-items: center; justify-content: center; }
+  .steps li b { color: var(--ink); }
+  .req-done { border: 1px solid var(--green); background: var(--green-bg); border-radius: 10px;
+              padding: 14px 16px; font-size: 13px; color: var(--ink-2); }
+  .req-done b { color: var(--ink); }
+</style>
+
+<div class="plans-wrap">
+
+  <div class="card">
+    <div class="card-head"><h2>Ваш тариф</h2></div>
+    <div class="card-body">
+      <div class="plan-now" id="plan-now"><div class="loading-stub">Загрузка…</div></div>
+      <div class="hint" style="margin-top:10px;" id="plan-now-hint"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-head"><h2>Тарифы</h2>
+      <div class="spacer"></div>
+      <span class="hint">Оплата за год — минус 20%</span>
+    </div>
+    <div class="card-body">
+      <div class="plan-cards" id="plan-cards"><div class="loading-stub">Загрузка…</div></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-head"><h2>Как оплатить</h2></div>
+    <div class="card-body">
+      <ol class="steps" id="pay-steps">
+        <li><b>Вы</b> выбираете тариф и оставляете реквизиты в форме ниже — название организации или ИП, ИНН и почту для документов.</li>
+        <li><b>Мы</b> выставляем счёт и присылаем его на указанную почту — в течение одного рабочего дня.</li>
+        <li><b>Вы</b> оплачиваете счёт с расчётного счёта. Деньги обычно идут 1–3 рабочих дня.</li>
+        <li><b>Мы</b> включаем тариф в день поступления оплаты и присылаем закрывающие документы. Если триал заканчивается раньше — доступ не отключаем, пока идёт оплата.</li>
+      </ol>
+      <div class="hint" style="margin-top:2px;">
+        Автосписаний нет: карта не нужна, продлевается только тем счётом, который вы оплатили.
+        Работаем по <a href="/legal/offer" target="_blank">договору-оферте</a>.
+      </div>
+    </div>
+  </div>
+
+  <div class="card" id="req-card">
+    <div class="card-head"><h2>Заявка на счёт</h2></div>
+    <div class="card-body" id="req-box"><div class="loading-stub">Загрузка…</div></div>
+  </div>
+
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+  var PLAN_TITLES = { trial: "Триал", start: "Старт", brand: "Бренд", pro: "Про" };
+  var data = null;
+
+  function money(n) { return Number(n).toLocaleString("ru-RU") + " ₽"; }
+
+  function plural(n, one, few, many) {
+    var m10 = n % 10, m100 = n % 100;
+    if (m10 === 1 && m100 !== 11) return one;
+    if (m10 >= 2 && m10 <= 4 && (m100 < 10 || m100 >= 20)) return few;
+    return many;
+  }
+
+  api("/api/plans").then(function (d) {
+    data = d || {};
+    renderNow();
+    renderCards();
+    renderRequest();
+  }).catch(function () {
+    document.getElementById("plan-now").innerHTML = '<span class="hint">Не удалось загрузить тарифы.</span>';
+    document.getElementById("plan-cards").innerHTML = "";
+    document.getElementById("req-box").innerHTML = '<span class="hint">Не удалось загрузить.</span>';
+  });
+
+  function renderNow() {
+    var box = document.getElementById("plan-now");
+    var hint = document.getElementById("plan-now-hint");
+    var cur = data.current || "trial";
+    var html = '<span class="big">' + esc(PLAN_TITLES[cur] || cur) + "</span>";
+    if (cur === "trial") {
+      var left = data.trial_days_left;
+      if (left === null || left === undefined) {
+        html += '<span class="trial-left">срок пробного периода не задан</span>';
+      } else if (left > 0) {
+        html += '<span class="trial-left">осталось <b>' + left + " " +
+          plural(left, "день", "дня", "дней") + "</b> — до " +
+          esc(fmtDate(data.trial_ends_at)) + "</span>";
+      } else {
+        html += '<span class="trial-left"><b>пробный период закончился</b> ' +
+          esc(data.trial_ends_at ? fmtDate(data.trial_ends_at) : "") + "</span>";
+      }
+    } else {
+      html += '<span class="trial-left">платный тариф</span>';
+    }
+    box.innerHTML = html;
+    if (cur === "trial") {
+      hint.textContent = "Во время триала работают все функции. Когда триал закончится, " +
+        "данные и настройки сохранятся — но расчёты станут недоступны, пока не выбран тариф. " +
+        "Чтобы не было перерыва, оставьте заявку на счёт заранее.";
+    } else {
+      var p = (data.plans || []).filter(function (x) { return x.code === cur; })[0];
+      hint.textContent = p ? p.tagline + " · " + money(p.price_month) + " в месяц" : "";
+    }
+  }
+
+  function renderCards() {
+    var box = document.getElementById("plan-cards");
+    var cur = data.current || "trial";
+    box.innerHTML = (data.plans || []).map(function (p) {
+      var isCur = p.code === cur;
+      var cls = "pcard" + (isCur ? " current" : (p.popular ? " hot" : ""));
+      var tag = isCur ? '<span class="tag cur">Ваш тариф</span>'
+                      : (p.popular ? '<span class="tag hot">Популярный</span>' : "");
+      return '<div class="' + cls + '">' + tag +
+        "<h3>" + esc(p.name) + "</h3>" +
+        '<p class="for">' + esc(p.tagline) + "</p>" +
+        '<div class="price">' + money(p.price_month) + "<span>/мес</span></div>" +
+        '<div class="price-year">' + money(p.price_year_month) + "/мес при оплате за год</div>" +
+        "<ul>" + p.features.map(function (f) { return "<li>" + esc(f) + "</li>"; }).join("") + "</ul>" +
+        (isCur
+          ? '<button class="btn" type="button" disabled>Подключён</button>'
+          : '<button class="btn' + (p.popular ? " primary" : "") + ' pick-plan" type="button" data-code="' +
+            esc(p.code) + '">Выбрать «' + esc(p.name) + "»</button>") +
+        "</div>";
+    }).join("");
+    box.querySelectorAll(".pick-plan").forEach(function (b) {
+      b.addEventListener("click", function () {
+        var sel = document.getElementById("req-plan");
+        if (sel) {
+          sel.value = b.getAttribute("data-code");
+          document.getElementById("req-card").scrollIntoView({ behavior: "smooth", block: "start" });
+          var c = document.getElementById("req-company");
+          if (c) setTimeout(function () { c.focus(); }, 350);
+        } else {
+          toast("Счёт может запросить только владелец организации", "error");
+        }
+      });
+    });
+  }
+
+  function doneHtml(r) {
+    var period = r.period === "year" ? "на год" : "на месяц";
+    return '<div class="req-done">' +
+      "<b>Заявка получена — №" + r.id + " от " + esc(fmtDate(r.created_at)) + ".</b><br>" +
+      "Тариф «" + esc(r.plan_name) + "» " + period + ", " + money(r.amount) + "/мес. " +
+      "Плательщик: " + esc(r.company) + ", ИНН " + esc(r.inn) + ".<br>" +
+      "Счёт уйдёт на <b>" + esc(r.email) + "</b> в течение " + (data.invoice_days || 1) +
+      " рабочего дня. Если письма нет — проверьте папку «Спам» и напишите нам." +
+      "</div>" +
+      '<div style="margin-top:12px;"><button class="btn" type="button" id="req-again">Оставить другую заявку</button></div>';
+  }
+
+  function renderRequest() {
+    var box = document.getElementById("req-box");
+    if (data.source === "ms_app") {
+      // Подписку такой организации ведёт сам МойСклад — счёт от нас был бы
+      // вторым счётом за одно и то же.
+      box.innerHTML = '<p style="margin:0; font-size:13px;">Ваша подписка оформлена в ' +
+        "маркетплейсе МойСклад" + (data.ms_tariff_name ? " (тариф «" + esc(data.ms_tariff_name) + "»)" : "") +
+        ". Сменить тариф или продлить подписку можно там — в разделе «Приложения» вашего " +
+        "МойСклада. Счёт от нас для этого не нужен.</p>";
+      return;
+    }
+    if (data.role !== "owner") {
+      box.innerHTML = '<p class="hint" style="margin:0;">Счёт запрашивает владелец организации. ' +
+        "Попросите его открыть эту страницу — или напишите нам, поможем.</p>";
+      return;
+    }
+    if (data.request) { box.innerHTML = doneHtml(data.request); bindAgain(); return; }
+    renderForm();
+  }
+
+  function bindAgain() {
+    var b = document.getElementById("req-again");
+    if (b) b.addEventListener("click", function () { renderForm(); });
+  }
+
+  function renderForm(preset) {
+    var box = document.getElementById("req-box");
+    var opts = (data.plans || []).map(function (p) {
+      return '<option value="' + esc(p.code) + '">' + esc(p.name) + " — " + money(p.price_month) + "/мес</option>";
+    }).join("");
+    box.innerHTML =
+      '<p style="margin:0 0 14px; font-size:12px; color:var(--ink-3);">' +
+      "Заполните реквизиты — по ним мы выставим счёт. Ничего не спишется автоматически: " +
+      "тариф включится только после оплаты.</p>" +
+      '<div class="form-row" style="max-width:620px;">' +
+        '<div class="field"><label for="req-plan">Тариф</label>' +
+        '<select class="input" id="req-plan">' + opts + "</select></div>" +
+        '<div class="field"><label for="req-period">Период оплаты</label>' +
+        '<select class="input" id="req-period">' +
+          '<option value="month">Месяц</option>' +
+          '<option value="year">Год (−20%)</option>' +
+        "</select></div>" +
+      "</div>" +
+      '<div class="form-row" style="max-width:620px;">' +
+        '<div class="field"><label for="req-company">Организация или ИП (как в счёте)</label>' +
+        '<input class="input" type="text" id="req-company" placeholder="ООО «Мой бренд»" autocomplete="organization"></div>' +
+        '<div class="field"><label for="req-inn">ИНН</label>' +
+        '<input class="input" type="text" id="req-inn" placeholder="10 цифр у ООО, 12 у ИП" autocomplete="off"></div>' +
+      "</div>" +
+      '<div class="form-row" style="max-width:620px;">' +
+        '<div class="field"><label for="req-email">Почта для счёта и документов</label>' +
+        '<input class="input" type="email" id="req-email" placeholder="buh@brand.ru" value="' + esc(preset || "{{ user.email }}") + '"></div>' +
+        '<div class="field"><label for="req-phone">Телефон (по желанию)</label>' +
+        '<input class="input" type="text" id="req-phone" placeholder="+7 ..." autocomplete="tel"></div>' +
+      "</div>" +
+      '<div class="field" style="max-width:620px;"><label for="req-comment">Комментарий (по желанию)</label>' +
+      '<input class="input" type="text" id="req-comment" placeholder="Например: счёт нужен до конца месяца"></div>' +
+      '<div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">' +
+      '<button class="btn primary" type="button" id="req-send">Запросить счёт</button>' +
+      '<span class="hint">Мы ответим в течение одного рабочего дня.</span></div>';
+
+    document.getElementById("req-send").addEventListener("click", function () {
+      var btn = this;
+      btn.disabled = true;
+      api("/api/plans/request", { method: "POST", body: {
+        plan: document.getElementById("req-plan").value,
+        period: document.getElementById("req-period").value,
+        company: document.getElementById("req-company").value,
+        inn: document.getElementById("req-inn").value,
+        email: document.getElementById("req-email").value,
+        phone: document.getElementById("req-phone").value,
+        comment: document.getElementById("req-comment").value
+      }}).then(function (res) {
+        data.request = res.request;
+        toast("Заявка отправлена — счёт придёт на " + res.request.email, "success");
+        box.innerHTML = doneHtml(res.request);
+        bindAgain();
+      }).catch(function () { btn.disabled = false; });
+    });
+  }
+});
+</script>
+{% endblock %}

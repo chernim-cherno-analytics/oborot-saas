@@ -59,6 +59,7 @@
   .psw { width:10px; height:10px; border-radius:3px; display:inline-block }
   .pline { display:flex; justify-content:space-between; gap:10px; margin:3px 0 }
   .pline .k { color:rgba(31,31,31,0.5) }
+  .pbasis { margin-top:7px; font-size:10.5px; color:rgba(31,31,31,0.45) }
   .pmonths { margin-top:9px; font-size:11px; color:rgba(31,31,31,0.55) }
   .pmonths .pm { display:flex; justify-content:space-between; gap:8px; padding:1px 0 }
   .pmonths .pm.cur { color:#1f1f1f; font-weight:600 }
@@ -117,7 +118,7 @@
 
   <div class="cards">
     <div class="card"><div class="l">Сток сейчас</div><div class="v" id="c-stock">—</div><div class="s" id="c-stock-s"></div></div>
-    <div class="card"><div class="l">Едет к нам</div><div class="v" id="c-inc">—</div><div class="s">заказы в производстве</div></div>
+    <div class="card"><div class="l">Едет к нам</div><div class="v" id="c-inc">—</div><div class="s" id="c-inc-s">заказы в производстве</div></div>
     <div class="card"><div class="l">Текущий темп продаж</div><div class="v" id="c-pace">—</div><div class="s" id="c-pace-s"></div></div>
     <div class="card"><div class="l">Стока хватит примерно</div><div class="v" id="c-until">—</div><div class="s" id="c-until-s"></div></div>
   </div>
@@ -231,7 +232,8 @@
         o.lines.map(function(l){
           return '<div class="pline"><span class="k">'+l[0]+'</span><b>'+l[1]+'</b></div>';
         }).join("")+
-        delta+'<div class="pmonths">'+monthsHtml+'</div></div></div>';
+        delta+(o.basis?'<div class="pbasis">'+esc(o.basis)+'</div>':"")+
+        '<div class="pmonths">'+monthsHtml+'</div></div></div>';
   }
 
   function renderPulse(p, fcMonths){
@@ -258,6 +260,7 @@
       tip:part?tipPart:"Стоимость остатка сейчас против средней за 6 полных месяцев",
       lines:[["Склад сейчас",fmtM(st.current)],
              ["Средний склад (6 мес)",part?"—":fmtM(st.avg6)]],
+      basis:"суммы "+(st.basis||"по средней цене продажи")+"; без товара в пути",
       months:st.months, curLabel:"сейчас", curValue:st.current,
     });
 
@@ -283,7 +286,7 @@
           }).join("");
       }
       if(st.avg6>0){
-        html+=rowLbl("Склад дальше: сток на начало месяца, доля среднего склада")+
+        html+=rowLbl("Склад дальше: сток на начало месяца (без товара в пути), доля среднего склада")+
           fcMonths.slice(1).map(function(m){
             var pp=m.stock_value/st.avg6;
             var tip=monthLabel(m.month)+": сток на начало "+fmtM(m.stock_value)+" ("+Math.round(pp*100)+"% среднего склада)";
@@ -306,11 +309,17 @@
     var d=res[0], pulse=res[1];
     ITEMS=d.items||[];
     var c=d.cards||{};
+    var mb=d.money_basis||{};
+    var basisStock=mb.stock_value||"по средней цене продажи";
     document.getElementById("c-stock").textContent=fmt(c.stock_units)+" шт";
-    document.getElementById("c-stock-s").textContent="потенциал "+fmtM(c.stock_value)+" по ценам продажи";
+    document.getElementById("c-stock-s").textContent="потенциал "+fmtM(c.stock_value)+" "+basisStock;
     document.getElementById("c-inc").textContent=c.incoming_units?fmt(c.incoming_units)+" шт":"—";
+    document.getElementById("c-inc-s").textContent=c.incoming_units
+      ? "заказы в производстве · "+fmtM(c.incoming_value)+" "+(mb.incoming_value||basisStock)
+      : "заказы в производстве";
     document.getElementById("c-pace").textContent=fmtM(c.pace_rub)+"/день";
-    document.getElementById("c-pace-s").textContent="≈ "+fmtM(c.pace_rub*30)+" в месяц при текущем темпе";
+    document.getElementById("c-pace-s").textContent="≈ "+fmtM(c.pace_rub*30)+" в месяц при текущем темпе, "
+      +(mb.pace_rub||basisStock);
     document.getElementById("c-until").textContent=c.until_date
       ? "до "+new Date(c.until_date).toLocaleDateString("ru-RU",{day:"numeric",month:"long"})
       : "> 6 месяцев";

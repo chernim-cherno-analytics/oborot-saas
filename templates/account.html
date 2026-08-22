@@ -1,0 +1,243 @@
+{% extends "base.html" %}
+{% block content %}
+
+<style>
+  .acc-wrap { max-width: 760px; }
+  .acc-id { display: flex; align-items: center; gap: 12px; }
+  .acc-id .avatar { width: 38px; height: 38px; border-radius: 50%; background: var(--blue-soft);
+    color: var(--blue); font-weight: 800; display: flex; align-items: center; justify-content: center; }
+  .acc-id .nm { font-weight: 600; }
+  .acc-id .em { font-size: 12px; color: var(--ink-3); }
+  .danger-card { border-color: var(--red-line); }
+  .danger-card .card-head { background: var(--red-bg); }
+  .danger-card .card-head h2 { color: #9f1d22; }
+  .kill-list { margin: 10px 0 0 0; padding: 0; list-style: none; }
+  .kill-list li { font-size: 12.5px; color: var(--ink-2); padding: 3px 0 3px 18px; position: relative; }
+  .kill-list li::before { content: "—"; position: absolute; left: 0; color: var(--red); font-weight: 700; }
+  .mode-opt { display: flex; gap: 10px; align-items: flex-start; border: 1px solid var(--line);
+    border-radius: 8px; padding: 12px 14px; margin-bottom: 8px; cursor: pointer; }
+  .mode-opt.sel { border-color: var(--red); background: var(--red-row); }
+  .mode-opt .t { font-size: 13px; font-weight: 600; }
+  .mode-opt .d { font-size: 12px; color: var(--ink-3); margin-top: 3px; }
+</style>
+
+<div class="acc-wrap">
+
+  <div class="card">
+    <div class="card-head"><h2>Аккаунт</h2></div>
+    <div class="card-body">
+      <div class="acc-id">
+        <span class="avatar">{{ (user.name or user.email)[:1]|upper }}</span>
+        <div>
+          <div class="nm">{{ user.name or user.email }}</div>
+          <div class="em">{{ user.email }} · <span id="acc-role">…</span> организации «{{ org.name }}»</div>
+        </div>
+      </div>
+      <div class="hint" style="margin-top:12px;">
+        Здесь можно сменить пароль и удалить аккаунт. Настройки аналитики, склады и
+        подключение к данным — на странице <a href="/settings">Настройки</a>,
+        тарифы и оплата — на странице <a href="/plans">Тарифы</a>.
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-head">
+      <h2>Смена пароля</h2>
+      <div class="spacer"></div>
+      <button class="btn sm primary" type="button" id="btn-pw">Сменить пароль</button>
+    </div>
+    <div class="card-body">
+      <div class="form-row" style="max-width:620px;">
+        <div class="field">
+          <label for="pw-cur">Текущий пароль</label>
+          <input class="input" type="password" id="pw-cur" autocomplete="current-password">
+        </div>
+      </div>
+      <div class="form-row" style="max-width:620px;">
+        <div class="field">
+          <label for="pw-new">Новый пароль</label>
+          <input class="input" type="password" id="pw-new" autocomplete="new-password" placeholder="Не менее 8 символов">
+        </div>
+        <div class="field">
+          <label for="pw-new2">Повторите новый пароль</label>
+          <input class="input" type="password" id="pw-new2" autocomplete="new-password">
+        </div>
+      </div>
+      <div class="hint">
+        Минимум 8 символов. Максимум — 72 байта: это примерно 36 русских букв или 72 латинских
+        (кириллица весит два байта на букву).<br>
+        После смены вы останетесь в системе на этом устройстве. Если вы входили с чужого
+        компьютера, вход там продолжит работать, пока не истечёт срок сессии — до 7 дней.
+      </div>
+    </div>
+  </div>
+
+  <div class="card danger-card">
+    <div class="card-head"><h2>Удаление аккаунта</h2></div>
+    <div class="card-body" id="del-box"><div class="loading-stub">Загрузка…</div></div>
+  </div>
+
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+  var acc = null;
+
+  api("/api/account").then(function (d) {
+    acc = d || {};
+    document.getElementById("acc-role").textContent =
+      acc.role === "owner" ? "владелец" : "участник";
+    renderDelete();
+  }).catch(function () {
+    document.getElementById("del-box").innerHTML =
+      '<p class="hint" style="margin:0;">Не удалось загрузить данные аккаунта.</p>';
+  });
+
+  // ── Смена пароля ──────────────────────────────────────────────────────────
+  document.getElementById("btn-pw").addEventListener("click", function () {
+    var btn = this;
+    var cur = document.getElementById("pw-cur").value;
+    var nw = document.getElementById("pw-new").value;
+    var nw2 = document.getElementById("pw-new2").value;
+    if (!cur) { toast("Введите текущий пароль — без него менять пароль нельзя", "error"); return; }
+    if (nw !== nw2) { toast("Новый пароль и подтверждение не совпадают — введите их заново", "error"); return; }
+    if (nw.length < 8) { toast("Новый пароль — минимум 8 символов", "error"); return; }
+    btn.disabled = true;
+    api("/api/account/password", { method: "POST", body: {
+      current_password: cur, new_password: nw, confirm_password: nw2
+    }}).then(function () {
+      document.getElementById("pw-cur").value = "";
+      document.getElementById("pw-new").value = "";
+      document.getElementById("pw-new2").value = "";
+      toast("Пароль изменён. Вход на этом устройстве сохранён.", "success");
+    }).catch(function () { /* текст ошибки уже показан тостом */ })
+      .finally(function () { btn.disabled = false; });
+  });
+
+  // ── Удаление аккаунта ─────────────────────────────────────────────────────
+  function plural(n, one, few, many) {
+    var m10 = n % 10, m100 = n % 100;
+    if (m10 === 1 && m100 !== 11) return one;
+    if (m10 >= 2 && m10 <= 4 && (m100 < 10 || m100 >= 20)) return few;
+    return many;
+  }
+
+  function killList() {
+    var c = acc.counts || {};
+    var pr = c.products || 0, sl = c.sales || 0, or = c.orders || 0;
+    var items = [
+      "товары и их история остатков — " + pr + " " + plural(pr, "позиция", "позиции", "позиций"),
+      "продажи — " + sl + " " + plural(sl, "запись", "записи", "записей"),
+      "заказы на производство — " + or + " " + plural(or, "заказ", "заказа", "заказов"),
+      "пороги, склады, правила скидок и настройки уведомлений"
+    ];
+    if (acc.connection && acc.connection.kind === "demo") {
+      items.push("подключение «Демо-данные» — синтетический набор удаляется вместе с организацией");
+    } else if (acc.connection) {
+      items.push("подключение к МойСкладу" +
+        (acc.connection.has_token ? " вместе с сохранённым API-токеном: токен стирается из базы" : "") +
+        " — «Оборот» перестаёт обращаться к вашему МойСкладу. Сам МойСклад и данные в нём не трогаем");
+    }
+    return '<ul class="kill-list">' + items.map(function (t) {
+      return "<li>" + esc(t) + "</li>";
+    }).join("") + "</ul>";
+  }
+
+  function renderDelete() {
+    var box = document.getElementById("del-box");
+    var others = acc.others || [];
+    var html = "";
+
+    if (acc.role !== "owner") {
+      html += '<p style="margin:0 0 6px; font-size:13px;">Будет удалён <b>только ваш аккаунт</b>: ' +
+        "вход в «Оборот» под " + esc(acc.user.email) + " перестанет работать.</p>" +
+        '<p style="margin:0 0 10px; font-size:13px;">Данные организации «' + esc(acc.org.name) +
+        "» остаются у владельца и других участников — вы их не удаляете.</p>";
+    } else if (!others.length) {
+      html += '<p style="margin:0 0 6px; font-size:13px;">Вы — единственный участник организации «' +
+        esc(acc.org.name) + "». Вместе с аккаунтом <b>безвозвратно удаляется вся организация</b>:</p>" +
+        killList() +
+        '<p style="margin:10px 0 0; font-size:13px;">Восстановить это нельзя — резервных копий ' +
+        "на вашу организацию мы не держим. Если данные могут понадобиться, сначала выгрузите " +
+        'их в Excel со страниц <a href="/turnover">Оборачиваемость</a> и <a href="/replenish">Заказ</a>.</p>';
+    } else {
+      html += '<p style="margin:0 0 10px; font-size:13px;">В организации «' + esc(acc.org.name) +
+        "» кроме вас есть ещё " + others.length + " " +
+        plural(others.length, "участник", "участника", "участников") + ": " +
+        others.map(function (m) { return esc(m.name || m.email); }).join(", ") +
+        ". Выберите, что с ней сделать.</p>";
+      html += '<label class="mode-opt sel" data-mode="transfer">' +
+        '<input type="radio" name="del-mode" value="transfer" checked style="margin-top:3px;">' +
+        '<div><div class="t">Передать организацию коллеге и удалить только мой аккаунт</div>' +
+        '<div class="d">Данные, подключение и заказы остаются. Выбранный человек становится ' +
+        "владельцем и может дальше менять настройки и оплачивать тариф.</div>" +
+        '<div style="margin-top:8px; max-width:320px;"><select class="input" id="del-transfer">' +
+        others.map(function (m) {
+          return '<option value="' + esc(m.email) + '">' + esc(m.name || m.email) +
+            " · " + esc(m.email) + "</option>";
+        }).join("") + "</select></div></div></label>";
+      html += '<label class="mode-opt" data-mode="org">' +
+        '<input type="radio" name="del-mode" value="org" style="margin-top:3px;">' +
+        '<div><div class="t">Удалить организацию целиком</div>' +
+        '<div class="d">Стираются все данные, подключение и токен. Коллеги теряют доступ; ' +
+        "их аккаунты «Оборота» удаляются вместе с организацией, если других организаций " +
+        "у них нет. Предупредите их заранее.</div></div></label>";
+      html += '<div style="margin-top:12px;">' +
+        '<p style="margin:0; font-size:12.5px; color:var(--ink-2);">' +
+        "Если выбрать «Удалить организацию целиком», безвозвратно стирается:</p>" +
+        killList() + "</div>";
+    }
+
+    html += '<div class="form-row" style="max-width:620px; margin-top:16px;">' +
+      '<div class="field"><label for="del-pw">Ваш пароль</label>' +
+      '<input class="input" type="password" id="del-pw" autocomplete="current-password"></div>' +
+      '<div class="field"><label for="del-word">Введите слово ' + esc(acc.confirm_word) + '</label>' +
+      '<input class="input" type="text" id="del-word" autocomplete="off" placeholder="' +
+      esc(acc.confirm_word) + '"></div></div>' +
+      '<button class="btn" type="button" id="btn-del" style="background:var(--red); border-color:var(--red); color:#fff;">' +
+      (acc.role === "owner" && !others.length
+        ? "Удалить аккаунт и организацию"
+        : (others.length ? "Удалить только мой аккаунт" : "Удалить аккаунт")) + "</button>" +
+      '<span class="hint" style="margin-left:10px;">Действие необратимо.</span>';
+
+    box.innerHTML = html;
+
+    box.querySelectorAll(".mode-opt").forEach(function (opt) {
+      opt.addEventListener("click", function () {
+        box.querySelectorAll(".mode-opt").forEach(function (o) { o.classList.remove("sel"); });
+        opt.classList.add("sel");
+        opt.querySelector("input[type=radio]").checked = true;
+        var btn = document.getElementById("btn-del");
+        btn.textContent = opt.getAttribute("data-mode") === "org"
+          ? "Удалить организацию и все данные" : "Удалить только мой аккаунт";
+      });
+    });
+
+    document.getElementById("btn-del").addEventListener("click", function () {
+      var btn = this;
+      var modeEl = box.querySelector("input[name=del-mode]:checked");
+      var mode = modeEl ? modeEl.value : "";
+      var transfer = document.getElementById("del-transfer");
+      var word = document.getElementById("del-word").value;
+      if (word.trim().toUpperCase() !== acc.confirm_word) {
+        toast("Введите слово " + acc.confirm_word + " в поле подтверждения", "error");
+        return;
+      }
+      btn.disabled = true;
+      api("/api/account/delete", { method: "POST", body: {
+        password: document.getElementById("del-pw").value,
+        confirm: word,
+        mode: mode,
+        transfer_to: transfer ? transfer.value : ""
+      }}).then(function (res) {
+        window.location.href = (res && res.redirect) || "/login";
+      }).catch(function () { btn.disabled = false; });
+    });
+  }
+});
+</script>
+{% endblock %}

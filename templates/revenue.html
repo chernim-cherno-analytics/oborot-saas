@@ -138,7 +138,16 @@
   }
   var MONTH_NAMES=["янв","фев","мар","апр","май","июн","июл","авг","сен","окт","ноя","дек"];
   function monthLabel(mm){ var p=mm.split("-"); return MONTH_NAMES[+p[1]-1]+" "+p[0].slice(2); }
-  function iso(d){ return d.toISOString().slice(0,10); }
+  /* Дата в ISO по МЕСТНОМУ календарю: toISOString переводит в UTC и в
+     плюсовых часовых поясах отдаёт вчерашнее число, сдвигая весь период. */
+  function iso(d){
+    return d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+
+           String(d.getDate()).padStart(2,"0");
+  }
+  /* Начало пресета: период включает обе границы, поэтому «30 дней» — это
+     сегодня и ещё 29 дней назад. Без −1 «90 дней» охватывали 91 календарный
+     день, и подпись периода расходилась с названием кнопки. */
+  function presetFrom(days){ return new Date(Date.now()-(days-1)*86400000); }
 
   var curFrom="", curTo="";
   var LAST_ITEMS=[], LAST_TOTR=0;
@@ -161,7 +170,7 @@
         if(d.best_category){
           document.getElementById("c-best").textContent=d.best_category.category;
           document.getElementById("c-best-s").textContent=fmtM(d.best_category.rev)+" · "+
-            Math.round((d.best_category.share||0)*100)+"% оборота";
+            ((d.best_category.share||0)*100).toFixed(1)+"% оборота";
         }else{
           document.getElementById("c-best").textContent="—";
           document.getElementById("c-best-s").textContent="";
@@ -264,7 +273,7 @@
       b.classList.add("active");
       var days=b.getAttribute("data-days");
       var to=new Date();
-      var from=days==="all"?new Date(2000,0,1):new Date(Date.now()-(+days)*86400000);
+      var from=days==="all"?new Date(2000,0,1):presetFrom(+days);
       applyPeriod(iso(from),iso(to));
     });
   });
@@ -276,7 +285,7 @@
     applyPeriod(f,t);
   });
 
-  applyPeriod(iso(new Date(Date.now()-90*86400000)),iso(new Date()));
+  applyPeriod(iso(presetFrom(90)),iso(new Date()));
 })();
 </script>
 {% include "_hints.html" %}

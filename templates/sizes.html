@@ -109,6 +109,7 @@
       <input class="qinp" id="qty" type="number" min="0" value="30">
       <span class="lbl" title="Остатки будут спрогнозированы на эту дату по темпу продаж">Дата прихода</span>
       <input class="qinp" id="arrival" type="date" style="width:150px;font-size:13px;font-weight:600">
+      <span class="hint" id="moq-note" style="display:none;color:#a15c00;font-weight:600"></span>
     </div>
     <div class="row">
       <span class="lbl">Продажи за</span>
@@ -154,7 +155,9 @@
     вычитается прогнозный остаток — заказ закрывает дыры по размерам, а не дублирует сток.
     «Чистая пропорция»: количество делится ровно по долям темпов. Кнопка «Заказ отправлен»
     добавляет сумму заказа в «Заказано» на Активном стоке. Период «N мес» = N полных месяцев +
-    текущий неполный; сезоны — за все годы истории.
+    текущий неполный; сезоны — за все годы истории. Дата прихода по умолчанию — как на «Заказе»:
+    по сроку производства, за которым закреплена позиция (если своего срока у него нет — общий из
+    настроек); если у этого производства есть минимальная партия, она показана рядом с полем «Заказ».
   </div>
 </div>
 
@@ -182,11 +185,47 @@
   var inp=document.getElementById("prod-search");
   var dd=document.getElementById("dd");
   var hint=document.getElementById("status-hint");
+  var moqNote=document.getElementById("moq-note");
 
   api("/api/sizes/products").then(function(d){
     PRODUCTS=d.products||[];
     hint.textContent=PRODUCTS.length+" позиций";
   }).catch(function(){ hint.textContent="ошибка загрузки"; });
+
+  // Условия подрядчика (срок производства, минимальная партия, кратность) —
+  // те же самые, по которым уже считает «Заказ» (/api/productions). Раньше
+  // «Заказ позиции» знал только общий срок из настроек — для позиции,
+  // закреплённой за другим цехом, дата прихода и, как следствие, вся
+  // раскладка по размерам не совпадали с тем, что покажет «Заказ» для той же
+  // позиции. Теперь при выборе товара подставляем срок и минимальную партию
+  // ЕГО производства — числа на двух страницах сходятся.
+  var PRODUCTIONS=[], PROD_ASSIGN={}, DEFAULT_LEAD=45;
+  var productionsReady=api("/api/productions").then(function(d){
+    PRODUCTIONS=d.productions||[];
+    PROD_ASSIGN=d.assign||{};
+    DEFAULT_LEAD=d.default_lead_time_days||45;
+  }).catch(function(){});
+
+  function prodFor(base){
+    if(!PRODUCTIONS.length) return null;
+    var pid=PROD_ASSIGN[base];
+    var byId=pid?PRODUCTIONS.filter(function(p){ return p.id===pid; })[0]:null;
+    return byId||PRODUCTIONS.filter(function(p){ return p.is_main; })[0]||null;
+  }
+  function addDays(iso,n){
+    var d=new Date(iso+"T00:00:00Z");
+    d.setUTCDate(d.getUTCDate()+n);
+    return d.toISOString().slice(0,10);
+  }
+  function renderMoqNote(){
+    var prod=SEL?prodFor(SEL):null;
+    if(!prod||!prod.moq){ moqNote.style.display="none"; return; }
+    var q=Math.max(0,parseInt(document.getElementById("qty").value,10)||0);
+    var extra=prod.pack_multiple>1?(" · кратно "+prod.pack_multiple+" шт"):"";
+    moqNote.textContent="⚠ «"+prod.name+"» не примет меньше "+prod.moq+" шт"+extra+
+      (q&&q<prod.moq?" — сейчас введено "+q:"");
+    moqNote.style.display="";
+  }
 
   function showDD(){
     var q=(inp.value||"").trim();
@@ -213,7 +252,13 @@
     if(el) el.scrollIntoView({block:"nearest"});
   }
   function pick(base){
-    SEL=base; inp.value=base; dd.style.display="none"; calc();
+    SEL=base; inp.value=base; dd.style.display="none";
+    // новая позиция — дата прихода пересчитывается под срок ЕЁ производства,
+    // а не остаётся от предыдущего товара (см. calc(): пустое поле подставит
+    // дату по сроку, дальше пользователь может поправить сам)
+    document.getElementById("arrival").value="";
+    renderMoqNote();
+    productionsReady.then(function(){ renderMoqNote(); calc(); }).catch(calc);
   }
   inp.addEventListener("input",function(){ SEL=null; showDD(); });
   inp.addEventListener("focus",showDD);
@@ -241,6 +286,7 @@
     if(LAST) render(LAST); // режим влияет на подсветку колонок и карточку «Заказ»
   });
   document.getElementById("qty").addEventListener("input",debounce(calc,250));
+  document.getElementById("qty").addEventListener("input",renderMoqNote);
   document.getElementById("arrival").addEventListener("change",function(){ calc(); });
 
   var LAST=null;
@@ -248,16 +294,30 @@
   function calc(){
     if(!SEL) return;
     var q=Math.max(0,parseInt(document.getElementById("qty").value,10)||0);
-    var arr=document.getElementById("arrival").value||"";
+    var arrInput=document.getElementById("arrival");
+    var arr=arrInput.value||"";
+    var wasEmpty=!arr;
     api("/api/sizes/calc?product="+encodeURIComponent(SEL)+"&qty="+q+
         "&period="+encodeURIComponent(PERIOD)+"&mode="+MODE+
         "&arrival="+encodeURIComponent(arr))
       .then(function(d){
         LAST=d;
-        // первый расчёт: сервер вернул дату прихода по сроку производства —
-        // подставляем её в поле, дальше пользователь правит сам
-        if(!document.getElementById("arrival").value&&d.arrival_date){
-          document.getElementById("arrival").value=d.arrival_date;
+        // Поле было пустым — сервер посчитал приход по ОБЩЕМУ сроку из
+        // настроек (d.days_to_arrival == этот срок). Если у позиции есть своё
+        // производство со своим сроком (как на «Заказе») — сдвигаем дату на
+        // разницу и пересчитываем уже с ней, чтобы дата прихода и раскладка
+        // по размерам совпадали с тем, что покажет «Заказ» для этой же
+        // позиции. Пользователь всегда может поправить дату руками дальше.
+        if(wasEmpty&&d.arrival_date){
+          var prod=prodFor(SEL);
+          var prodLead=prod?(prod.lead_time_days||DEFAULT_LEAD):null;
+          var delta=(prodLead!=null)?(prodLead-d.days_to_arrival):0;
+          if(delta){
+            arrInput.value=addDays(d.arrival_date,delta);
+            calc();
+            return;
+          }
+          arrInput.value=d.arrival_date;
         }
         render(d);
       })

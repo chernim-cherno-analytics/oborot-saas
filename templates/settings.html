@@ -21,14 +21,11 @@
             {% else %}
               <span class="plan-badge">{{ {'start':'Старт','brand':'Бренд','pro':'Про'}.get(org.plan, org.plan) }}</span>
             {% endif %}
-            <button class="btn sm" type="button" id="btn-plan">Сменить тариф</button>
+            <a class="btn sm" href="/plans">{% if org.plan == 'trial' %}Выбрать тариф{% else %}Сменить тариф{% endif %}</a>
           </div>
-          <div class="hint" id="plan-hint">
-            {% if org.plan == 'trial' %}Триал: полный функционал, до 100 позиций, 1 подключение.
-            {% elif org.plan == 'start' %}Старт: до 300 позиций, 1 склад-источник, 2 пользователя.
-            {% elif org.plan == 'brand' %}Бренд: до 2 000 позиций, все склады, 5 пользователей.
-            {% else %}Про: без ограничений, приоритетная поддержка.{% endif %}
-          </div>
+          {# Состав тарифов не дублируем: он живёт в одном месте (PLANS в
+             app/routes_extra.py) и приезжает сюда через /api/plans. #}
+          <div class="hint" id="plan-hint">Тарифы и оплата — на <a href="/plans">отдельной странице</a>.</div>
         </div>
       </div>
     </div>
@@ -76,19 +73,20 @@
       <button class="btn sm primary" type="button" id="btn-save-horizon">Сохранить</button>
     </div>
     <div class="card-body">
-      <div class="form-row" style="align-items:flex-end;">
+      <div class="form-row" style="align-items:flex-start;">
         <div class="field" style="max-width:220px;">
           <label for="horizon">Горизонт планирования, дней</label>
           <input class="input num" type="number" id="horizon" min="7" max="365" step="1">
+          <div class="hint">На сколько дней продаж должен хватить заказ.</div>
         </div>
         <div class="field" style="max-width:220px;">
           <label for="lead-time" title="Сколько дней проходит от заказа до прихода готовой партии на склад">Срок производства, дней</label>
           <input class="input num" type="number" id="lead-time" min="1" max="365" step="1">
-        </div>
-        <div class="field">
-          <div class="hint" style="margin-bottom:9px;">Горизонт — на сколько дней продаж должен закрывать потребность заказ: рекомендация «Что заказать» = темп × горизонт − остаток − уже заказанное. Срок производства — сколько дней от заказа до прихода на склад: влияет на предупреждения о «дыре» поставки, ETA нового заказа и сезонное окно темпа.</div>
+          <div class="hint">Сколько дней проходит от заказа до прихода партии на склад. Если у цеха на странице «Заказ» задан свой срок, его позиции считаются по нему, а это значение остаётся общим.</div>
         </div>
       </div>
+      <p class="hint" style="margin:10px 0 4px;"><b>«Заказать»</b> на странице «Заказ» — сколько заказать, чтобы хватило: темп продаж × горизонт − прогнозный остаток к приходу партии. Прогнозный остаток — это сегодняшний остаток плюс то, что уже едет к нам, минус то, что успеет продаться, пока шьётся заказ. Обе настройки работают именно здесь.</p>
+      <p class="hint" style="margin:0;"><b>«Не хватает до нормы»</b> на «Оборачиваемости» и «Активном стоке» — сколько штук не хватает <i>сегодня</i>: темп за год × 90 дней − сегодняшний остаток. Норма в этой колонке всегда 90 дней, горизонт её не меняет, и то, что уже едет к нам, из неё не вычитается: это оценка сегодняшнего склада, а не расчёт заказа. Поэтому «Заказать» обычно больше.</p>
     </div>
   </div>
 
@@ -193,6 +191,17 @@
         </label>
       </div>
       <div class="hint" id="notify-hint" style="margin-top:8px;"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-head"><h2>Аккаунт и безопасность</h2></div>
+    <div class="card-body">
+      <p style="margin:0 0 10px; font-size:12px; color:var(--text-soft);">
+        Пароль от входа в «Оборот» и удаление аккаунта — на отдельной странице,
+        чтобы случайно ничего не нажать.
+      </p>
+      <a class="btn" href="/account">Сменить пароль или удалить аккаунт</a>
     </div>
   </div>
 
@@ -657,9 +666,23 @@ document.addEventListener("DOMContentLoaded", function () {
     }).finally(function () { btn.disabled = false; });
   });
 
-  document.getElementById("btn-plan").addEventListener("click", function () {
-    toast("Смена тарифа появится после запуска биллинга. Напишите нам — подберём тариф вручную.");
-  });
+  // Подсказка о тарифе — из единственного источника состава тарифов (PLANS).
+  api("/api/plans").then(function (p) {
+    var hint = document.getElementById("plan-hint");
+    if (!hint || !p) return;
+    var cur = (p.plans || []).filter(function (x) { return x.code === p.current; })[0];
+    if (cur) {
+      hint.textContent = cur.name + ": " + cur.tagline + " · " +
+        Number(cur.price_month).toLocaleString("ru-RU") + " ₽/мес.";
+    } else if (p.current === "trial" && p.trial_days_left !== null && p.trial_days_left !== undefined) {
+      hint.textContent = "Триал: работают все функции, осталось " + p.trial_days_left + " дн. " +
+        "Выберите тариф заранее, чтобы работа не прервалась.";
+    }
+    if (p.request) {
+      hint.textContent += " Заявка на счёт от " + fmtDate(p.request.created_at) +
+        " принята — счёт придёт на " + p.request.email + ".";
+    }
+  }).catch(function () { /* тариф не критичен для страницы — молчим */ });
   document.getElementById("btn-invite").addEventListener("click", function () {
     toast("Приглашения в команду скоро появятся. Пока напишите в поддержку — добавим коллег вручную.");
   });

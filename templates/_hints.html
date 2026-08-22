@@ -120,24 +120,34 @@
 
 <style>
   .hint-fab { position: fixed; right: 18px; bottom: 18px; z-index: 900;
-    width: 40px; height: 40px; border-radius: 50%; border: 1px solid rgba(31,31,31,.18);
+    width: 44px; height: 44px; border-radius: 50%; border: 1px solid rgba(31,31,31,.18);
     background: #1f1f1f; color: #f3e9e0; font-size: 19px; font-weight: 700;
     cursor: pointer; box-shadow: 0 4px 14px rgba(31,31,31,.25); }
   .hint-fab:hover { background: #3a3a3a }
   .hint-overlay { position: fixed; inset: 0; z-index: 1000; display: none;
     background: rgba(31,31,31,.45); align-items: center; justify-content: center; padding: 20px; }
   .hint-overlay.open { display: flex }
+  {# Модалка — flex-колонка: текст скроллится сам по себе (.hm-scroll), а кнопка
+     закрытия вынесена в отдельный «подвал» вне скролла. На длинных подсказках
+     (страница «Заказ») раньше кнопка уезжала в конец потока — ниже экрана на
+     узком телефоне, и добраться до неё скроллом/тапом было ненадёжно (баг с
+     «запертой» подсказкой). Теперь кнопка закрытия всегда на виду. #}
   .hint-modal { background: #f7f1ea; color: #1f1f1f; border-radius: 16px;
-    max-width: 620px; width: 100%; max-height: 84vh; overflow: auto;
-    padding: 26px 30px; box-shadow: 0 18px 60px rgba(31,31,31,.35);
+    max-width: 620px; width: 100%; max-height: 84vh;
+    display: flex; flex-direction: column; overflow: hidden;
+    box-shadow: 0 18px 60px rgba(31,31,31,.35);
     font: 14px/1.65 Helvetica, 'Helvetica Neue', Arial, sans-serif; }
+  .hint-modal .hm-scroll { overflow-y: auto; -webkit-overflow-scrolling: touch;
+    padding: 26px 30px 10px; flex: 1 1 auto; min-height: 0; }
   .hint-modal h2 { font-size: 18px; margin: 0 0 4px }
   .hint-modal .hm-sub { font-size: 11px; letter-spacing: .07em; text-transform: uppercase;
     color: rgba(31,31,31,.5); margin-bottom: 14px }
   .hint-modal h3 { font-size: 13.5px; margin: 16px 0 4px }
   .hint-modal p { margin: 6px 0 }
   .hint-modal b { font-weight: 700 }
-  .hint-modal .hm-close { margin-top: 18px; width: 100%; padding: 11px;
+  .hint-modal .hm-foot { flex: 0 0 auto; padding: 10px 30px 26px;
+    border-top: 1px solid rgba(31,31,31,.08); }
+  .hint-modal .hm-close { margin: 0; width: 100%; min-height: 44px; padding: 12px;
     border-radius: 12px; border: none; background: #1f1f1f; color: #f3e9e0;
     font-size: 13px; font-weight: 600; cursor: pointer; }
   .hint-modal .hm-close:hover { background: #3a3a3a }
@@ -145,8 +155,8 @@
 
 <div class="hint-overlay" id="hint-overlay" role="dialog" aria-modal="true">
   <div class="hint-modal">
-    <div id="hint-body"></div>
-    <button class="hm-close" id="hint-close">Понятно, приступаю</button>
+    <div class="hm-scroll"><div id="hint-body"></div></div>
+    <div class="hm-foot"><button class="hm-close" id="hint-close">Понятно, приступаю</button></div>
   </div>
 </div>
 <button class="hint-fab" id="hint-fab" title="Как работать с этой страницей" style="display:none">?</button>
@@ -171,7 +181,7 @@
         +"<h3>Размеры</h3>"
         +"<p>Разворот строки показывает остатки по размерам; метка «по нулям N дн.» — размер отсутствует столько дней: это потерянные продажи, если вещь ходовая.</p>"
         +"<h3>Связь с заказом</h3>"
-        +"<p>«Сток на 90 дней» и «Недостаток» считаются от темпа продаж — то, что уходит в ноль, появится в «Заказе» как рекомендация.</p>"
+        +"<p>«Сток на 90 дней» и «Не хватает до нормы» считаются от темпа продаж и отвечают на вопрос «сколько нужно сегодня» — то, что уходит в ноль, появится в «Заказе» как рекомендация. Число в «Заказе» будет больше: там ещё учтено, сколько продастся, пока шьётся партия.</p>"
     },
     replenish: {
       t: "Заказ",
@@ -191,7 +201,7 @@
         +"<h3>Почему доли честные</h3>"
         +"<p>Скорость каждого размера считается как оборачиваемость: продажи размера делятся на дни, когда он <b>был в наличии</b>. Размер, который раскупили в середине окна, не выглядит «менее ходовым» — иначе вы бы систематически недозаказывали самые ходовые размеры.</p>"
         +"<h3>Дата прихода</h3>"
-        +"<p>Остатки прогнозируются на день прихода заказа: то, что продастся до приезда, уже вычтено. Режим «с учётом остатков» закрывает дыры по размерам; «чистая пропорция» — просто делит по долям темпа.</p>"
+        +"<p>Остатки прогнозируются на день прихода заказа: то, что продастся до приезда, уже вычтено. По умолчанию дата подставляется по сроку производства, за которым закреплена позиция, — как на «Заказе»; если у него задана минимальная партия, это видно рядом с полем количества. Режим «с учётом остатков» закрывает дыры по размерам; «чистая пропорция» — просто делит по долям темпа.</p>"
     },
     budget: {
       t: "Бюджет",
@@ -219,11 +229,56 @@
         +"<h3>Рабочие склады — самое важное</h3>"
         +"<p>Аналитика считает остатки и продажи <b>только по включённым складам</b>. Норма: торговые точки и склад интернет-магазина включены; транзитные, производственные, брак и списания — выключены, иначе они искажают остатки и темпы. После изменения набора складов нажмите «Пересобрать историю» — история остатков строится по выбранным складам.</p>"
         +"<h3>Пороги и горизонты</h3>"
-        +"<p>«Срок производства» (лид-тайм) — сколько дней едет заказ: от него считается дата прихода по умолчанию. «Горизонт покрытия» — на сколько дней продаж заказываем. Пороги оборачиваемости делят таблицу на классы (зелёный/жёлтый/красный).</p>"
+        +"<p>«Срок производства» (лид-тайм) — общий срок по умолчанию для позиций без своего производства; от него считается дата прихода. У каждого производства (вкладка на «Заказе») может быть свой срок — он берётся вместо общего для позиций, которые за ним закреплены. «Горизонт покрытия» — на сколько дней продаж заказываем. Пороги оборачиваемости делят таблицу на классы (зелёный/жёлтый/красный).</p>"
     }
   };
 
   var S = window.OborotSync || {};
+  // Кнопка «?» — тот же баг раздутого layout-viewport, что у оверлея ниже,
+  // только без открытой подсказки его никто не замечал: `position:fixed;
+  // right;bottom` считается не от видимой части экрана, а от полной
+  // ширины/высоты документа — кнопка физически уезжает за край (на «Заказе»
+  // левый край был на 525px при экране 390px), и обычным тапом до неё не
+  // дотянуться. Держим её приклеенной к правому нижнему углу РЕАЛЬНО видимой
+  // области, а не документа.
+  // Слияние: раньше этот блок жил ниже `if (!hint) return;` — тогда кнопку
+  // показывала сама модалка. Теперь кнопкой владеет меню помощи (Деплой П2,
+  // ниже по файлу), а оно есть и на страницах без справочника колонок, где
+  // этот блок дальше выходит по return. Поэтому позиционирование поднято сюда
+  // и берёт элемент само.
+  var fab = document.getElementById("hint-fab");
+  function syncFabPosition(){
+    var vv = window.visualViewport;
+    if (!vv || !fab) return;
+    var r = fab.getBoundingClientRect();
+    // Кнопка ещё скрыта (её показывает меню помощи) — двигать нечего.
+    if (!r.width && !r.height) return;
+    fab.style.right = "auto";
+    fab.style.bottom = "auto";
+    fab.style.left = (vv.offsetLeft + vv.width - 18 - r.width) + "px";
+    fab.style.top = (vv.offsetTop + vv.height - 18 - r.height) + "px";
+    // Меню помощи прибито в CSS к правому нижнему углу документа
+    // (right:18px; bottom:66px) — на раздутом layout-viewport оно осталось бы
+    // там, где кнопки уже нет, и оторвалось бы от неё. Ведём его за кнопкой по
+    // той же видимой области. Пока меню закрыто, у него нет размеров —
+    // openMenu() вызывает эту функцию повторно, уже с открытым меню.
+    var menu = document.getElementById("help-menu");
+    if (!menu || !menu.classList.contains("open")) return;
+    menu.style.maxWidth = (vv.width - 36) + "px";
+    var mr = menu.getBoundingClientRect();
+    menu.style.right = "auto";
+    menu.style.bottom = "auto";
+    menu.style.left = Math.max(vv.offsetLeft + 8,
+      vv.offsetLeft + vv.width - 18 - mr.width) + "px";
+    menu.style.top = (vv.offsetTop + vv.height - 66 - mr.height) + "px";
+  }
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener("resize", syncFabPosition);
+    window.visualViewport.addEventListener("scroll", syncFabPosition);
+  }
+  window.addEventListener("resize", syncFabPosition);
+  syncFabPosition();
+
   // Деплой П2: страница «?» стала меню (см. ниже), поэтому справочник может
   // отсутствовать (Мастер заказа, Уценка, Обучение) — сама кнопка всё равно
   // нужна ради пунктов «урок», «тумблер», «все уроки».
@@ -231,6 +286,9 @@
   window.OborotHelp = window.OborotHelp || {};
   window.OborotHelp.page = PAGE;
   window.OborotHelp.hasHint = !!hint;
+  // Меню помощи показывает кнопку и открывает меню — обе точки должны
+  // пересчитать позицию по видимой области (см. syncFabPosition выше).
+  window.OborotHelp.syncFab = syncFabPosition;
   if (!hint) return;
 
   var overlay = document.getElementById("hint-overlay");
@@ -238,9 +296,68 @@
   var closeBtn = document.getElementById("hint-close");
   body.innerHTML = "<h2>" + hint.t + "</h2>" + hint.h;
 
-  function open(){ overlay.classList.add("open"); }
-  function close(markSeen){
+  // На страницах с ещё не адаптированной вёрсткой (широкая нескроллящаяся
+  // таблица и т.п.) документ шире экрана телефона, и `position:fixed;inset:0`
+  // растягивает оверлей на весь этот раздутый layout-viewport — кнопка
+  // закрытия физически уезжает за пределы видимой части экрана, и обычным
+  // тапом до неё не дотянуться (баг «запертой» подсказки). window.visualViewport
+  // всегда даёт РЕАЛЬНО видимую область экрана независимо от ширины документа —
+  // подгоняем оверлей под неё явно, чтобы кнопка была видна и доступна всегда.
+  function syncOverlayViewport(){
+    var vv = window.visualViewport;
+    if (!vv) return;
+    overlay.style.width = vv.width + "px";
+    overlay.style.height = vv.height + "px";
+    overlay.style.left = vv.offsetLeft + "px";
+    overlay.style.top = vv.offsetTop + "px";
+  }
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener("resize", syncOverlayViewport);
+    window.visualViewport.addEventListener("scroll", syncOverlayViewport);
+  }
+  window.addEventListener("resize", syncOverlayViewport);
+
+  // Открытая подсказка запирает страницу: пока она видна, фон не должен
+  // прокручиваться (иначе на телефоне «скролл» ничего не решает, а контент
+  // под подсказкой можно случайно задеть).
+  var savedOverflow = null;
+  function lockScroll(){
+    if (savedOverflow !== null) return;
+    savedOverflow = document.documentElement.style.overflow;
+    document.documentElement.style.overflow = "hidden";
+  }
+  function unlockScroll(){
+    if (savedOverflow === null) return;
+    document.documentElement.style.overflow = savedOverflow;
+    savedOverflow = null;
+  }
+
+  // Кнопка «назад» браузера должна закрывать подсказку, а не уводить со
+  // страницы: при открытии кладём лишнюю запись в историю и снимаем её при
+  // закрытии; если запись снял сам браузер (пользователь нажал «назад») —
+  // просто закрываем модалку без повторного history.back().
+  var pushedHistory = false;
+
+  function open(){
+    if (overlay.classList.contains("open")) return;
+    overlay.classList.add("open");
+    syncOverlayViewport();
+    lockScroll();
+    try {
+      history.pushState({oborotHint: PAGE}, "", location.href);
+      pushedHistory = true;
+    } catch(e){ pushedHistory = false; }
+  }
+  function close(markSeen, fromPopstate){
+    if (!overlay.classList.contains("open")) return;
     overlay.classList.remove("open");
+    unlockScroll();
+    if (pushedHistory && !fromPopstate) {
+      pushedHistory = false;
+      try { history.back(); } catch(e){}
+    } else {
+      pushedHistory = false;
+    }
     if (markSeen) {
       try {
         fetch("/api/hints/seen", {method:"POST",
@@ -254,7 +371,13 @@
   closeBtn.addEventListener("click", function(){ close(true); });
   overlay.addEventListener("click", function(e){ if(e.target===overlay) close(true); });
   document.addEventListener("keydown", function(e){
-    if (e.key === "Escape" && overlay.classList.contains("open")) close(true);
+    // Проверка «модалка открыта» — их правка: Escape слушают ещё меню помощи
+    // и тур, и без неё закрытая подсказка отмечалась бы «просмотренной»
+    // от чужого Escape. "Esc" — старое имя клавиши (наше), оставляем.
+    if ((e.key === "Escape" || e.key === "Esc") && overlay.classList.contains("open")) close(true);
+  });
+  window.addEventListener("popstate", function(){
+    if (overlay.classList.contains("open")) close(true, true);
   });
 
   // Первый визит: показать инструкцию, если пользователь её ещё не видел.
@@ -302,8 +425,20 @@
   .fresh-chip.warn .fd { background: #a37f00 }
   .fresh-chip.bad { background: rgba(221,0,4,.92); color: #fff; border-color: rgba(150,0,0,.6) }
   .fresh-chip.bad .fd { background: #fff }
+
+  {# Узкий экран: чип и кнопка «?» — те же фиксированные элементы, что на
+     десктопе, но там они лежат прямо на последней строке таблиц (телефон
+     короче, строк на экране меньше, а чип с текстом — шире кнопки). Дадим им
+     тач-таргет ≥44px и оставим внизу страницы «пустой хвост», чтобы было
+     куда доскроллить последнюю строку таблицы из-под них. #}
+  @media (max-width: 640px) {
+    .hint-fab { width: 46px; height: 46px; }
+    .fresh-chip { max-width: calc(100vw - 76px); min-height: 44px; padding: 9px 13px; }
+    #hint-bottom-spacer { display: block; height: 76px; }
+  }
 </style>
 <a class="fresh-chip" id="fresh-chip" href="/settings"></a>
+<div id="hint-bottom-spacer" style="display:none" aria-hidden="true"></div>
 <script>
 (function(){
   "use strict";
@@ -314,8 +449,30 @@
     if (!iso) return 999;
     return Math.floor((Date.now() - new Date(iso + "T00:00:00").getTime()) / 86400000);
   }
+  // Полоса прогресса под шапкой и чип — одна и та же информация; на
+  // /login, /register, /onboarding (S.silent) чипу вообще нечего показывать.
   var S = window.OborotSync;
   if (S && S.silent) return;
+
+  // Тот же баг раздутого layout-viewport, что у кнопки «?» (см. syncFabPosition
+  // выше): `left: 18px` и `max-width: calc(100vw - 76px)` считаются от полной
+  // ширины документа, а не от того, что видно на экране. Держим плашку у
+  // левого нижнего угла РЕАЛЬНО видимой области и ограничиваем её ширину тем
+  // же способом.
+  function syncChipPosition(){
+    var vv = window.visualViewport;
+    if (!vv) return;
+    chip.style.maxWidth = (vv.width - 76) + "px";
+    var r = chip.getBoundingClientRect();
+    chip.style.bottom = "auto";
+    chip.style.left = (vv.offsetLeft + 18) + "px";
+    chip.style.top = (vv.offsetTop + vv.height - 18 - r.height) + "px";
+  }
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener("resize", syncChipPosition);
+    window.visualViewport.addEventListener("scroll", syncChipPosition);
+  }
+  window.addEventListener("resize", syncChipPosition);
   try {
     Promise.all([
       fetch("/api/freshness", {credentials:"same-origin"})
@@ -324,10 +481,19 @@
     ])
       .then(function(res){
         var d = res[0], prog = res[1] && res[1].data;
+        // Источник данных не подключён — отставать нечему, не пугаем табло
+        // на пустом аккаунте. Опираемся на явный флаг connected от бэкенда;
+        // если поля ещё нет в ответе (старая версия API), считаем как раньше —
+        // по наличию хоть одной даты.
+        var connected = (typeof d.connected === "boolean")
+          ? d.connected
+          : !!(d.last_sale_date || d.last_stock_date);
+        if (!connected) return;
         // Ревью: полоса под шапкой уже показывает ту же ошибку красным —
         // две красные поверхности с одинаковым текстом. Пока говорит полоса,
         // чип остаётся нейтральным: только даты данных.
         var barTalks = S ? S.barShowsError(prog) : false;
+        var last = [d.last_sale_date, d.last_stock_date].filter(Boolean).sort().pop() || null;
         var stale = Math.min(ageDays(d.last_sale_date), ageDays(d.last_stock_date));
         var txt = "Данные: продажи по " + dm(d.last_sale_date) + " · склад по " + dm(d.last_stock_date);
         if (d.sync_state === "error" && !barTalks) {
@@ -347,6 +513,7 @@
         chip.innerHTML = '<span class="fd"></span><span></span>';
         chip.lastChild.textContent = txt;
         chip.style.display = "flex";
+        syncChipPosition();
       }).catch(function(){});
   } catch(e){}
 })();
@@ -887,9 +1054,14 @@
   fab.setAttribute("aria-haspopup", "menu");
   fab.setAttribute("aria-expanded", "false");
   fab.setAttribute("title", "Помощь и обучение");
+  // Кнопка только что стала видимой — поставить её по видимой области экрана
+  // (на раздутом layout-viewport CSS right/bottom уводят её за край).
+  if (HELP.syncFab) HELP.syncFab();
 
   function openMenu(){
     menu.classList.add("open");
+    // Открытому меню наконец есть что мерить — прижимаем его к кнопке.
+    if (HELP.syncFab) HELP.syncFab();
     fab.setAttribute("aria-expanded", "true");
     var first = menu.querySelector(".hmi:not([hidden])");
     if (first) first.focus();

@@ -56,6 +56,23 @@
     display: flex; align-items: center; justify-content: center; color: rgba(31,31,31,.55); font-size: 13px; font-weight: 600; }
   .bigtab.addtab:hover { border-color: rgba(31,31,31,.5); color: #1f1f1f; }
   .prod-note { font-size: 11.5px; color: rgba(31,31,31,.5); margin: 2px 2px 12px; line-height: 1.5; }
+  .bigtab .bt-cond { font-size: 11px; color: rgba(31,31,31,.45); margin-top: 2px; }
+  .bigtab.active .bt-cond { color: rgba(31,31,31,.6); }
+
+  /* бейджи над таблицей: активное окно темпа, фолбэки, счётчик позиций */
+  .tbl-badges { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; padding: 0 0 8px; }
+  .bdg { font-size: 11.5px; font-weight: 600; padding: 4px 11px; border-radius: 20px; cursor: help;
+    border: 1px solid rgba(31,31,31,.12); background: rgba(255,255,255,.6); color: #434446; white-space: nowrap; }
+  .bdg.warn { background: rgba(255,204,0,.28); border-color: rgba(255,204,0,.55); color: #7a5c00; }
+  .bdg.act { cursor: pointer; }
+  .bdg.act:hover { background: rgba(31,31,31,.09); color: #1f1f1f; }
+  .fbmark { font-size: 10px; font-weight: 700; color: #a15c00; cursor: help; margin-left: 3px; }
+  .moq-sub { display: block; font-size: 10px; font-weight: 400; color: rgba(31,31,31,.55); margin-top: 1px; cursor: help; }
+  .moq-low { display: inline-block; font-size: 9px; font-weight: 700; padding: 1px 6px; border-radius: 8px;
+    background: rgba(255,204,0,.35); color: #7a5c00; cursor: help; margin-top: 2px; }
+  /* правка руками разошлась с условиями подрядчика: число оставляем как есть, но говорим вслух */
+  .moq-warn { display: inline-block; font-size: 9px; font-weight: 700; padding: 1px 6px; border-radius: 8px;
+    background: rgba(221,0,4,.12); color: #a30003; cursor: help; margin-top: 2px; }
 
   .tools { position: relative; z-index: 10; padding: 8px 0 10px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
   .seg { display: flex; gap: 0; border: 1px solid rgba(31,31,31,.15); border-radius: 20px; overflow: hidden; background: rgba(255,255,255,.5); }
@@ -85,6 +102,13 @@
 
   .table-outer { background: rgba(255,255,255,.55); backdrop-filter: blur(10px);
     border: 1px solid rgba(31,31,31,.09); border-radius: 12px; overflow: auto; max-height: calc(100vh - 200px); }
+  {# На узком экране плашка свежести данных и кнопка «?» (_hints.html) лежат
+     внизу поверх страницы — без запаса таблица со своим внутренним скроллом
+     упирается в них нижним краем, и последняя строка наполовину прячется под
+     ними. 76px — тот же запас, что и «хвост» под футером в _hints.html. #}
+  @media (max-width: 640px) {
+    .table-outer { max-height: calc(100vh - 200px - 76px); }
+  }
   table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
   thead th { background: rgba(255,255,255,.9); backdrop-filter: blur(16px); padding: 9px 8px; text-align: center;
     font-size: 10px; font-weight: 500; color: rgba(31,31,31,.62); letter-spacing: .07em; text-transform: uppercase;
@@ -93,8 +117,39 @@
   tbody td { padding: 8px 8px; border-bottom: 1px solid rgba(31,31,31,.07); text-align: center; vertical-align: middle; color: #1f1f1f; }
   tbody td.name { text-align: left; padding-left: 8px; font-weight: 600; font-size: 13px; }
   tbody td.name .csub { display: block; font-size: 10px; font-weight: 400; color: rgba(31,31,31,.5); margin-top: 1px; }
+  {# Залипающая «первая колонка» — только на ГЛАВНОЙ таблице (#tbl-wrap), у
+     заказов и исключённых позиций своя структура столбцов, трогать их незачем.
+     Здесь это не буквально первая ячейка, а чекбокс + раскрывашка + название
+     вместе (первые две — служебные, 30px каждая, их ширину задаёт шапка): без
+     них залипшее название повисло бы с пустой дырой слева при скролле. Фон —
+     сплошной: полупрозрачная rgba построчной подсветки (.rg1/.ro/.rr ниже)
+     пропускала бы сквозь себя цифры колонок, уехавших под неё при скролле —
+     при проверке это было видно буквально. #}
+  #tbl-wrap thead th:nth-child(1), #tbl-wrap thead th:nth-child(2), #tbl-wrap thead th:nth-child(3) {
+    position: sticky; z-index: 20; background: #f7f1ea; }
+  #tbl-wrap thead th:nth-child(1) { left: 0; }
+  #tbl-wrap thead th:nth-child(2) { left: 30px; }
+  #tbl-wrap thead th:nth-child(3) { left: 60px; }
+  #tbl-wrap tbody td:nth-child(1), #tbl-wrap tbody td:nth-child(2) { position: sticky; z-index: 5; }
+  #tbl-wrap tbody td:nth-child(1) { left: 0; }
+  #tbl-wrap tbody td:nth-child(2) { left: 30px; }
+  #tbl-wrap tbody td.name { position: sticky; left: 60px; z-index: 5; box-shadow: 1px 0 0 rgba(31,31,31,.09); }
   .rg1 td { background: rgba(76,187,23,.22) } .ro td { background: rgba(255,204,0,.28) } .rr td { background: rgba(221,0,4,.1) }
   .rg1:hover td { background: rgba(76,187,23,.34) } .ro:hover td { background: rgba(255,204,0,.4) } .rr:hover td { background: rgba(221,0,4,.17) }
+  {# Тот же тон подсветки, что и выше, но над сплошной подложкой — только в
+     залипающих ячейках (см. пояснение у #tbl-wrap выше). #}
+  #tbl-wrap .rg1 td:nth-child(1), #tbl-wrap .rg1 td:nth-child(2), #tbl-wrap .rg1 td.name {
+    background: linear-gradient(rgba(76,187,23,.22),rgba(76,187,23,.22)),#f7f1ea; }
+  #tbl-wrap .ro td:nth-child(1), #tbl-wrap .ro td:nth-child(2), #tbl-wrap .ro td.name {
+    background: linear-gradient(rgba(255,204,0,.28),rgba(255,204,0,.28)),#f7f1ea; }
+  #tbl-wrap .rr td:nth-child(1), #tbl-wrap .rr td:nth-child(2), #tbl-wrap .rr td.name {
+    background: linear-gradient(rgba(221,0,4,.1),rgba(221,0,4,.1)),#f7f1ea; }
+  #tbl-wrap .rg1:hover td:nth-child(1), #tbl-wrap .rg1:hover td:nth-child(2), #tbl-wrap .rg1:hover td.name {
+    background: linear-gradient(rgba(76,187,23,.34),rgba(76,187,23,.34)),#f7f1ea; }
+  #tbl-wrap .ro:hover td:nth-child(1), #tbl-wrap .ro:hover td:nth-child(2), #tbl-wrap .ro:hover td.name {
+    background: linear-gradient(rgba(255,204,0,.4),rgba(255,204,0,.4)),#f7f1ea; }
+  #tbl-wrap .rr:hover td:nth-child(1), #tbl-wrap .rr:hover td:nth-child(2), #tbl-wrap .rr:hover td.name {
+    background: linear-gradient(rgba(221,0,4,.17),rgba(221,0,4,.17)),#f7f1ea; }
   .nb { font-variant-numeric: tabular-nums; white-space: nowrap; }
   .need-pill { font-weight: 700; font-size: 13.5px; white-space: nowrap; }
   .need-pill.r { color: #a30003; }
@@ -113,6 +168,14 @@
   .size-rec { width: 76px; padding: 5px 7px; text-align: center; font-size: 13px; font-weight: 700;
     border: 1.5px solid rgba(44,122,31,.45); border-radius: 8px; background: rgba(76,187,23,.07); outline: none; }
   .size-rec:focus { border-color: #2c7a1f; background: #fff; }
+  /* ручная правка ростовки: значение отличается от расчёта */
+  .size-rec.edited { border-color: #a15c00; background: rgba(255,204,0,.22); }
+  .editmark { font-size: 11px; color: #a15c00; cursor: help; }
+  .size-note { font-size: 11.5px; color: #a15c00; margin: 8px 0 0; line-height: 1.5; }
+  .draft-row { margin-top: 10px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .draft-row .txt { font-size: 11.5px; color: rgba(31,31,31,.55); }
+  .draft-note { font-size: 11.5px; color: rgba(31,31,31,.5); }
+  .draft-note.bad { color: #a30003; }
   .mvbtn { font-size: 10px; font-weight: 600; padding: 3px 9px; border-radius: 9px;
     border: 1px solid rgba(31,31,31,.22); background: rgba(255,255,255,.6); color: #434446; cursor: pointer; white-space: nowrap; }
   .mvbtn:hover { background: rgba(31,31,31,.09); color: #1f1f1f; }
@@ -167,7 +230,8 @@
     <div class="body">
       <p><b>Заказ создаётся на день его прихода.</b> «Заказать» = темп продаж × горизонт покрытия − прогнозный остаток к приходу заказа (остаток + едет − продажи за срок производства). Пока заказ шьётся, часть стока продастся — считать от сегодняшнего остатка значило бы занизить заказ.</p>
       <p><b>Темп</b> считается по методике оборачиваемости: продано штук ÷ дни, когда вещь была в наличии. Переключатель окна: <b>Год</b> сглаживает сезонность, <b>90 дней</b> ловит текущий тренд, <b>Сезон</b> берёт то же окно прошлого года — период, НА который приедет заказ. Срок производства и горизонт — в <a href="/settings">Настройках</a>.</p>
-      <p><b>Производства.</b> Вкладки над таблицей — ваши производства. Основное — одно, его можно переименовать (✎). Если заказами занимаются разные отделы (например, Китай, Москва и Екатеринбург) — добавьте производства и перенесите на них позиции кнопкой в последней колонке; вернуть обратно можно так же. Заказ создаётся из активной вкладки.</p>
+      <p><b>Производства.</b> Вкладки над таблицей — ваши производства. Основное — одно, его можно переименовать (✎). Если шьёте у разных подрядчиков (свой цех, Иваново, Бишкек) — добавьте производства и перенесите на них позиции кнопкой в последней колонке; вернуть обратно можно так же. Заказ создаётся из активной вкладки.</p>
+      <p><b>Условия подрядчика</b> задаются на вкладке (✎): свой <b>срок производства</b>, <b>минимальная партия</b> и <b>кратность</b>. Количество по таким позициям округляется вверх до партии и кратности — в колонке «Заказать» видно, сколько было по расчёту. Если расчётная потребность сильно ниже партии, строка помечена «невыгодно»: решение остаётся за вами.</p>
       <p><b>Статусы</b>: Срочно — покрытие меньше 2 недель, Скоро — 2–4, План — больше 4. ⚠ у стокаута — «дыра поставки»: остаток кончится ДО прихода заказа. Размерная сетка и правка количеств — по ▸ в строке.</p>
     </div>
   </details>
@@ -181,9 +245,9 @@
   </div>
 
   <div class="bigtabs" id="bigtabs"></div>
-  <div class="prod-note">Вы можете добавить разные производства, если ими занимаются разные отделы — например,
-    для Китая, Москвы и Екатеринбурга. Позиции переносятся между производствами кнопкой в последней колонке
-    таблицы; основное производство можно переименовать (✎). Заказ создаётся из активной вкладки.</div>
+  <div class="prod-note">Добавьте производство на каждого подрядчика — у каждого свои условия: срок
+    производства, минимальная партия и кратность (✎ на вкладке). Позиции переносятся между производствами
+    кнопкой в последней колонке таблицы. Заказ создаётся из активной вкладки — по её условиям.</div>
 
   <div class="tools">
     <div class="seg" id="band-seg">
@@ -199,13 +263,17 @@
       <button type="button" data-rw="season" id="rw-season" title="Сезонный темп: продажи аналогичного окна прошлого года">Сезон</button>
     </div>
     <input class="search" id="search" placeholder="Поиск по названию..." autocomplete="off">
-    <a class="abtn" href="/api/export/replenish.xlsx" download title="Выгрузить таблицу в Excel">⬇ Excel</a>
+    <span class="draft-note" id="draft-note"></span>
+    <button class="abtn" id="btn-reset-drafts" type="button" style="display:none">↺ Сбросить правки</button>
+    <button class="abtn" type="button" id="btn-export-xlsx" title="Выгрузить в Excel отмеченные галочкой позиции">⬇ Excel</button>
     <button class="abtn primary" id="btn-create-order" type="button" disabled>+ Создать заказ</button>
   </div>
 
   <div class="cat-bar" id="cat-bar" style="display:none"></div>
 
-  <div class="table-outer">
+  <div class="tbl-badges" id="tbl-badges"></div>
+
+  <div class="table-outer" id="tbl-wrap">
     <table>
       <thead id="thead">
         <tr>
@@ -282,11 +350,23 @@
 <div class="modal-bg" id="prod-modal">
   <div class="modal">
     <h3 id="prod-modal-title">Новое производство</h3>
-    <div class="msub">Добавляйте производства, если заказами занимаются разные отделы —
-      например, для Китая, Москвы и Екатеринбурга. Позиции переносятся на производство
+    <div class="msub">Добавляйте производства, если шьёте у разных подрядчиков или заказами
+      занимаются разные отделы. У каждого свои условия: срок производства, минимальная партия
+      и кратность — по ним считается заказ для его позиций. Позиции переносятся на производство
       из таблицы «Заказа» и возвращаются обратно в одну кнопку.</div>
     <label for="prod-name">Название</label>
     <input type="text" id="prod-name" autocomplete="off" placeholder="Например: Китай">
+    <label for="prod-lead">Срок производства, дней</label>
+    <input type="number" id="prod-lead" min="0" max="365" step="1" autocomplete="off" placeholder="Например: 70">
+    <div class="fieldhint" id="prod-lead-hint">Сколько дней проходит от заказа до прихода на склад у этого
+      подрядчика. Оставьте пустым — возьмём срок из общих настроек.</div>
+    <label for="prod-moq">Минимальная партия, шт</label>
+    <input type="number" id="prod-moq" min="0" max="100000" step="1" autocomplete="off" placeholder="Например: 30">
+    <div class="fieldhint">Меньше этого количества подрядчик не примет — заказ по позиции округлится вверх
+      до партии. Оставьте пустым, если ограничения нет.</div>
+    <label for="prod-pack">Кратность, шт</label>
+    <input type="number" id="prod-pack" min="0" max="10000" step="1" autocomplete="off" placeholder="Например: 6">
+    <div class="fieldhint">Заказ кратен упаковке (рулон, короб, ростовка). Оставьте пустым, если кратности нет.</div>
     <div class="actions">
       <button class="abtn" type="button" id="btn-prod-cancel">Отмена</button>
       <button class="abtn primary" type="button" id="btn-prod-submit">Сохранить</button>
@@ -320,7 +400,15 @@
     var r=await fetch(url,{method:o.method||"GET",
       headers:{"Content-Type":"application/json","X-Oborot-CSRF":"1"},
       body:o.body?JSON.stringify(o.body):undefined, credentials:"same-origin"});
-    if(!r.ok) throw new Error("HTTP "+r.status);
+    if(!r.ok){
+      // Человеку нужен текст ошибки от сервера ("Доступно только владельцу…",
+      // "Товара нет в каталоге…"), а не голый код статуса — иначе он видит
+      // "Не удалось создать заказ: HTTP 403" и не понимает, что произошло.
+      var msg="Ошибка запроса ("+r.status+")";
+      try{ var t=await r.text(); var j=JSON.parse(t);
+        if(j&&typeof j.detail==="string") msg=j.detail; }catch(e){ /* не JSON */ }
+      throw new Error(msg);
+    }
     return r.json();
   }
   var PRIM_ORDER=["xxs","xs","xs-s","s","s-m","m","m-l","l","l-xl","xl","xxl","one size",""];
@@ -341,8 +429,15 @@
   var state={ query:"", cat:"", band:"" };
   var openRows={};
   var HORIZON=90, LEAD_TIME=45, RATE_WINDOW="year", SEASON_FROM=null, SEASON_TO=null;
+  var RATE_WINDOW_LABEL="темп за год", FALLBACK_COUNT=0, DEFAULT_LEAD=45;
   var SENT_ORDERS=[];
   var PRODS=[], ASSIGN={}, ACTIVE_PROD=null;   // ACTIVE_PROD: id производства (main.id по умолчанию)
+  // Оптимистично true до ответа /api/settings, чтобы не мигать кнопками у
+  // владельца (подавляющее большинство визитов); участнику они пропадут
+  // сразу после первого ответа — заметно раньше, чем он успеет кликнуть.
+  var IS_OWNER=true;
+  var DRAFTS={};                              // ручные правки ростовки: {позиция: {размер: шт}}
+  var MAX_SIZE_QTY=9999;                      // потолок на один размер (как в атрибуте max поля)
   var MAIN_ID=null;
   var NCOLS=12;
   var tbody=document.getElementById("tbody");
@@ -356,9 +451,12 @@
   var ORDERS=[];
   function load(){
     tbody.innerHTML='<tr><td colspan="'+NCOLS+'" class="loading">Загрузка…</td></tr>';
-    Promise.all([api("/api/replenish"), api("/api/productions"), api("/api/orders").catch(function(){ return {orders:[]}; })]).then(function(res){
+    Promise.all([api("/api/replenish"), api("/api/productions"),
+                 api("/api/orders").catch(function(){ return {orders:[]}; }),
+                 api("/api/replenish-draft").catch(function(){ return {drafts:{}}; })]).then(function(res){
       applyProds(res[1]);
       ORDERS=(res[2].orders||[]).filter(function(o){ return o.status!=="received"; });
+      DRAFTS=res[3].drafts||{};
       applyData(res[0]);
     }).catch(function(e){
       tbody.innerHTML='<tr><td colspan="'+NCOLS+'"><div class="empty-note">Не удалось загрузить данные — обновите страницу.<br>'+esc(e.message)+'</div></td></tr>';
@@ -368,6 +466,7 @@
   function applyProds(d){
     PRODS=d.productions||[];
     ASSIGN=d.assign||{};
+    DEFAULT_LEAD=d.default_lead_time_days||45;
     var main=mainProd();
     MAIN_ID=main?main.id:null;
     if(ACTIVE_PROD===null||!PRODS.some(function(p){ return p.id===ACTIVE_PROD; })) ACTIVE_PROD=MAIN_ID;
@@ -377,6 +476,8 @@
     HORIZON=d.horizon_days||90;
     LEAD_TIME=d.lead_time_days||45;
     RATE_WINDOW=d.rate_window||"year";
+    RATE_WINDOW_LABEL=d.rate_window_label||"темп за год";
+    FALLBACK_COUNT=d.fallback_count||0;
     SEASON_FROM=d.season_from||null; SEASON_TO=d.season_to||null;
     SENT_ORDERS=d.orders_in_production||[];
     syncRateSeg();
@@ -384,7 +485,14 @@
       it._checked=true;
       it._band=wosBand(it.wos);
       it._recs={};
-      Object.keys(it.sizes||{}).forEach(function(sz){ it._recs[sz]=(it.sizes[sz]&&it.sizes[sz].rec)||0; });
+      it._sizeNote="";
+      // ростовка = расчёт, поверх него — ручные правки этой организации;
+      // правки по размерам, которых уже нет в позиции, просто не подставляются
+      var draft=DRAFTS[it.base_name]||{};
+      Object.keys(it.sizes||{}).forEach(function(sz){
+        it._recs[sz]=Object.prototype.hasOwnProperty.call(draft,sz)
+          ? draft[sz] : ((it.sizes[sz]&&it.sizes[sz].rec)||0);
+      });
       recalcNeed(it);
       return it;
     });
@@ -399,7 +507,175 @@
       : (it.need||0);
   }
 
+  /* ── ручная ростовка: правка полей по размерам ───────────────────────────
+     Значение поля = расчёт, если человек его не трогал. Всё, что отличается
+     от расчёта, хранится на аккаунте (POST /api/replenish-draft) и
+     подставляется при следующем заходе; «вернуть расчёт» стирает правки.
+     В итог и в заказ идут только проверенные числа: целое, 0..9999. */
+
+  function recOf(it,sz){ return (it.sizes&&it.sizes[sz]&&it.sizes[sz].rec)||0; }
+  function draftOf(it){
+    var d={};
+    Object.keys(it._recs||{}).forEach(function(sz){
+      if(Number(it._recs[sz])!==recOf(it,sz)) d[sz]=Number(it._recs[sz]);
+    });
+    return d;
+  }
+  function hasEdits(it){ return Object.keys(draftOf(it)).length>0; }
+
+  /* Приводит введённое к допустимому количеству штук.
+     Возвращает {value, note}: note непустой, если значение пришлось поправить. */
+  function normalizeQty(raw){
+    var s=String(raw==null?"":raw).trim().replace(",",".");
+    if(!s) return {value:0, note:"Пустое поле — считаем 0 шт. Впишите количество, если размер нужен."};
+    if(!/^[+-]?\d+(\.\d*)?$/.test(s))   // «12.» — человек ещё печатает, это не мусор
+      return {value:0, note:"«"+raw+"» — не количество. Впишите целое число штук, например 12."};
+    var n=Number(s);
+    if(n<0) return {value:0, note:"Отрицательного заказа не бывает — поставили 0 шт."};
+    if(n>MAX_SIZE_QTY)
+      return {value:MAX_SIZE_QTY, note:"Больше "+fmt(MAX_SIZE_QTY)+" шт на один размер за раз не заказывают — поставили "+fmt(MAX_SIZE_QTY)+" шт."};
+    if(n!==Math.round(n))
+      return {value:Math.round(n), note:"Штуки — целые: "+String(raw).trim()+" округлили до "+fmt(Math.round(n))+" шт."};
+    return {value:n, note:""};
+  }
+
+  var saveTimers={};
+  function setDraftNote(txt,bad){
+    var el=document.getElementById("draft-note");
+    el.textContent=txt||"";
+    el.classList.toggle("bad",!!bad);
+  }
+  function renderDraftBar(){
+    var n=Object.keys(DRAFTS).length;
+    var b=document.getElementById("btn-reset-drafts");
+    b.style.display=n?"":"none";
+    b.textContent="↺ Сбросить правки ("+fmt(n)+")";
+    b.title="Вернуть расчётную ростовку по всем позициям: правок сохранено "+fmt(n);
+  }
+  function saveDraft(it){
+    clearTimeout(saveTimers[it.base_name]);
+    var d=draftOf(it);
+    return api("/api/replenish-draft",{method:"POST",body:{base_name:it.base_name,sizes:d}})
+      .then(function(){
+        if(Object.keys(d).length) DRAFTS[it.base_name]=d; else delete DRAFTS[it.base_name];
+        setDraftNote("Правки сохранены");
+        renderDraftBar();
+      })
+      .catch(function(e){ setDraftNote("Правка не сохранилась ("+e.message+") — обновите страницу",true); });
+  }
+  function resetDraft(base){
+    var it=findItem(base);
+    return api("/api/replenish-draft/reset",{method:"POST",body:{base_name:base}}).then(function(){
+      delete DRAFTS[base];
+      if(it){
+        it._sizeNote="";
+        Object.keys(it._recs).forEach(function(sz){ it._recs[sz]=recOf(it,sz); });
+        recalcNeed(it);
+      }
+      setDraftNote("Вернули расчёт");
+      renderDraftBar(); renderTabs(); renderTable(); updateSummary(); renderKpis();
+    }).catch(function(e){ alert("Не удалось вернуть расчёт: "+e.message); });
+  }
+
+  /* Правка одного поля. finalize=true — момент, когда значение чинится на
+     глазах у человека (уход из поля, Enter, пауза в наборе). */
+  function onSizeEdit(inp,finalize){
+    var it=findItem(inp.getAttribute("data-base"));
+    if(!it) return;
+    var sz=inp.getAttribute("data-size");
+    var raw=String(inp.value);
+    if(!finalize&&raw.trim()===""&&document.activeElement===inp) return;  // ещё печатают
+    var r=normalizeQty(raw);
+    it._recs[sz]=r.value;
+    if(finalize){
+      if(raw.trim()!==String(r.value)) inp.value=String(r.value);
+      it._sizeNote=r.note||"";
+      var panel=inp.closest(".sub-panel");
+      var noteEl=panel?panel.querySelector(".size-note"):null;
+      if(noteEl){ noteEl.textContent=it._sizeNote; noteEl.style.display=it._sizeNote?"":"none"; }
+    }
+    inp.classList.toggle("edited",r.value!==recOf(it,sz));
+    inp.title=r.value!==recOf(it,sz)?("Правка вручную · расчёт "+fmt(recOf(it,sz))+" шт"):"";
+    recalcNeed(it);
+    refreshNeedCell(it);
+    refreshDraftRow(inp,it);
+    updateSummary(); renderTotals(visibleItems()); renderTabs(); renderKpis();
+    if(finalize) saveDraft(it);
+    else {
+      clearTimeout(saveTimers[it.base_name]);
+      saveTimers[it.base_name]=setTimeout(function(){ onSizeEdit(inp,true); },700);
+    }
+  }
+  /* Условия подрядчика словами: «минимальная партия N шт и кратность M шт». */
+  function moqWhy(it){
+    var why=[];
+    if(it.moq) why.push("минимальная партия "+fmt(it.moq)+" шт");
+    if(it.pack_multiple>1) why.push("кратность "+fmt(it.pack_multiple)+" шт");
+    return why.join(" и ");
+  }
+  /* Из чего выросло количество: расчёт → минимальная партия / кратность →
+     правка руками. Порядок именно такой, и он один и в файле для фабрики:
+     партия округляет РАСЧЁТ, а правка человека кладётся сверху и ничем не
+     переписывается — иначе вписанные 12 шт молча стали бы 30. */
+  function moqNote(it){
+    var edited=hasEdits(it);
+    if(!it.moq_applied&&!edited) return "";
+    var prod=it.production_name?" на производстве «"+it.production_name+"»":"";
+    var steps=[], tip;
+    if(it.moq_applied){
+      steps.push("расчёт "+fmt(it.need_raw), "партия "+fmt(it.need));
+      tip="По расчёту нужно "+fmt(it.need_raw)+" шт, но"+prod+" действует "+
+        (moqWhy(it)||"минимальная партия")+" — количество округлено вверх до "+fmt(it.need)+" шт.";
+    }else{
+      steps.push("расчёт "+fmt(it.need));
+      tip="Расчёт по этой позиции — "+fmt(it.need)+" шт.";
+    }
+    if(edited){
+      steps.push("ваша правка "+fmt(it._need));
+      tip+=" Дальше вы поправили ростовку вручную: в заказ и в выгрузку идёт ваше число, "+
+        fmt(it._need)+" шт. Кнопка «↺ Вернуть расчёт» в раскрытой строке возвращает расчётные количества.";
+    }
+    return '<span class="moq-sub" title="'+esc(tip)+'">'+steps.join(" → ")+'</span>';
+  }
+  /* Правка руками сильнее минимальной партии — но, если она в условия не
+     проходит, человек должен узнать это здесь, а не от фабрики. */
+  function moqConflict(it){
+    if(!hasEdits(it)) return "";      // расчёт условия соблюдает всегда
+    var n=it._need||0;
+    if(n<=0) return "";
+    var bad=[];
+    if(it.moq&&n<it.moq) bad.push("минимальная партия "+fmt(it.moq)+" шт");
+    if(it.pack_multiple>1&&n%it.pack_multiple) bad.push("кратность "+fmt(it.pack_multiple)+" шт");
+    if(!bad.length) return "";
+    var prod=it.production_name?" производства «"+it.production_name+"»":" производства";
+    return '<span class="moq-warn" title="'+esc("Вы заказываете "+fmt(n)+" шт, а условия"+prod+
+      " — "+bad.join(" и ")+". Мы не меняем ваше число: сколько нести на фабрику, решаете вы. "+
+      "Но такой заказ придётся согласовать с подрядчиком или вернуть расчёт.")+
+      '">не проходит по условиям фабрики</span>';
+  }
+  function needCellHtml(it){
+    var low=it.moq_low
+      ?'<span class="moq-low" title="'+esc("Потребность "+fmt(it.need_raw)+" шт — меньше половины минимальной партии ("+
+        fmt(it.moq)+" шт). Заказывать столько ради такого спроса скорее невыгодно: решайте сами — снимите галочку или уменьшите количество в размерной сетке.")+
+        '">заказывать невыгодно</span>':"";
+    var conflict=moqConflict(it);
+    return '<span class="need-pill'+(it._band==="r"?" r":"")+'">'+fmt(it._need)+' шт</span>'+
+      (hasEdits(it)?' <span class="editmark" title="Ростовка правлена вручную — сохранена в вашем аккаунте">✎</span>':"")+
+      moqNote(it)+(conflict?'<br>'+conflict:"")+(low?'<br>'+low:"");
+  }
+  function refreshNeedCell(it){
+    var row=tbody.querySelector("tr[data-base='"+CSS.escape(it.base_name)+"'] .need-cell");
+    if(row) row.innerHTML=needCellHtml(it);
+  }
+  function refreshDraftRow(inp,it){
+    var panel=inp.closest(".sub-panel");
+    if(!panel) return;
+    var row=panel.querySelector(".draft-row");
+    if(row) row.style.display=hasEdits(it)?"":"none";
+  }
+
   function renderAll(){
+    renderDraftBar();
     renderTabs();
     renderChips();
     syncSegUI();
@@ -461,20 +737,34 @@
   function prodItems(pid){
     return items.filter(function(it){ return prodOf(it.base_name)===pid; });
   }
+  /* Срок производства вкладки: свой или общий из настроек. */
+  function leadOf(p){ return (p&&p.lead_time_days)||DEFAULT_LEAD; }
+  /* Подпись условий подрядчика под названием вкладки. */
+  function condText(p){
+    var out=["срок "+fmt(leadOf(p))+" "+plural(leadOf(p),"день","дня","дней")
+      +(p&&p.lead_time_days?"":" (общий)")];
+    if(p&&p.moq) out.push("партия от "+fmt(p.moq)+" шт");
+    if(p&&p.pack_multiple>1) out.push("кратно "+fmt(p.pack_multiple));
+    return out.join(" · ");
+  }
   function renderTabs(){
     var box=document.getElementById("bigtabs");
+    // Заводить, переименовывать и удалять производства может только владелец
+    // организации (см. require_owner_api у /api/productions* в app/api.py) —
+    // участнику эти кнопки не показываем, а не отдаём в лицо 403.
     var html=PRODS.map(function(p){
       var arr=prodItems(p.id);
       var need=arr.reduce(function(s,it){ return s+(it._need||0); },0);
-      var tools='<div class="bt-tools">'
-        +'<button title="Переименовать" data-act="rename" data-id="'+p.id+'">✎</button>'
+      var tools=IS_OWNER?('<div class="bt-tools">'
+        +'<button title="Название и условия: срок производства, минимальная партия, кратность" data-act="rename" data-id="'+p.id+'">✎</button>'
         +(p.is_main?'':'<button title="Удалить (позиции вернутся на основное)" data-act="del" data-id="'+p.id+'">✕</button>')
-        +'</div>';
+        +'</div>'):'';
       return '<div class="bigtab'+(p.id===ACTIVE_PROD?' active':'')+'" data-id="'+p.id+'">'+tools
         +'<div class="bt-name">'+esc(p.name)+'</div>'
-        +'<div class="bt-sub">'+fmt(arr.length)+' '+plural(arr.length,"позиция","позиции","позиций")+' · заказать '+fmt(need)+' шт</div></div>';
+        +'<div class="bt-sub">'+fmt(arr.length)+' '+plural(arr.length,"позиция","позиции","позиций")+' · заказать '+fmt(need)+' шт</div>'
+        +'<div class="bt-cond" title="Условия этого производства — по ним считается заказ его позиций.'+(IS_OWNER?' Изменить: ✎':'')+'">'+esc(condText(p))+'</div></div>';
     }).join("");
-    html+='<div class="bigtab addtab" id="add-prod">+ производство</div>';
+    if(IS_OWNER) html+='<div class="bigtab addtab" id="add-prod">+ производство</div>';
     box.innerHTML=html;
     box.querySelectorAll(".bigtab[data-id]").forEach(function(el){
       el.addEventListener("click",function(e){
@@ -499,10 +789,22 @@
   function openProdModal(id){
     PROD_EDIT=id;
     var p=id!==null?PRODS.find(function(x){ return x.id===id; }):null;
-    document.getElementById("prod-modal-title").textContent=p?("Переименовать «"+p.name+"»"):"Новое производство";
+    document.getElementById("prod-modal-title").textContent=p?("Производство «"+p.name+"»"):"Новое производство";
     document.getElementById("prod-name").value=p?p.name:"";
+    document.getElementById("prod-lead").value=(p&&p.lead_time_days)?p.lead_time_days:"";
+    document.getElementById("prod-moq").value=(p&&p.moq)?p.moq:"";
+    document.getElementById("prod-pack").value=(p&&p.pack_multiple)?p.pack_multiple:"";
+    document.getElementById("prod-lead-hint").textContent=
+      "Сколько дней проходит от заказа до прихода на склад у этого подрядчика. "+
+      "Оставьте пустым — возьмём срок из общих настроек ("+fmt(DEFAULT_LEAD)+" "+
+      plural(DEFAULT_LEAD,"день","дня","дней")+").";
     document.getElementById("prod-modal").classList.add("open");
     setTimeout(function(){ document.getElementById("prod-name").focus(); },50);
+  }
+  /* Число из поля условий: пусто → 0 («не задано»), мусор → 0. */
+  function condValue(id){
+    var v=Math.round(Number(document.getElementById(id).value));
+    return isFinite(v)&&v>0?v:0;
   }
   document.getElementById("btn-prod-cancel").addEventListener("click",function(){
     document.getElementById("prod-modal").classList.remove("open");
@@ -513,17 +815,21 @@
   document.getElementById("btn-prod-submit").addEventListener("click",function(){
     var name=document.getElementById("prod-name").value.trim();
     if(!name) return;
-    var req=PROD_EDIT===null
-      ? api("/api/productions",{method:"POST",body:{name:name}})
-      : api("/api/productions/"+PROD_EDIT,{method:"POST",body:{name:name}});
+    var body={name:name, lead_time_days:condValue("prod-lead"),
+              moq:condValue("prod-moq"), pack_multiple:condValue("prod-pack")};
+    var created=PROD_EDIT===null;
+    var req=created
+      ? api("/api/productions",{method:"POST",body:body})
+      : api("/api/productions/"+PROD_EDIT,{method:"POST",body:body});
     req.then(function(p){
       document.getElementById("prod-modal").classList.remove("open");
-      return api("/api/productions");
-    }).then(function(d){
-      var created=PROD_EDIT===null;
-      applyProds(d);
-      if(created){ var ex=extraProds(); if(ex.length) ACTIVE_PROD=ex[ex.length-1].id; }
-      renderAll();
+      // условия влияют на количества — перезагружаем и таблицу, и вкладки
+      if(created) return api("/api/productions").then(function(d){
+        applyProds(d);
+        var ex=extraProds(); if(ex.length) ACTIVE_PROD=ex[ex.length-1].id;
+        renderAll();
+      });
+      load();
     }).catch(function(e){ alert("Не удалось сохранить: "+e.message); });
   });
   function delProd(id){
@@ -541,7 +847,10 @@
     api("/api/productions/assign",{method:"POST",body:{base_name:base,production_id:pid}})
       .then(function(){
         ASSIGN[base]=pid;
-        renderAll();
+        // у нового производства свои срок и минимальная партия — количество
+        // по позиции пересчитывается на сервере, поэтому перезагружаем данные
+        // (load() заодно перечитает назначения с сервера)
+        load();
       }).catch(function(e){ alert("Не удалось перенести: "+e.message); });
   }
 
@@ -598,6 +907,42 @@
       " — периода, НА который приедет заказ (через "+fmt(LEAD_TIME)+" дн). Если истории за окно нет — темп за год.";
   }
 
+  /* ── бейджи над таблицей: какое окно темпа активно и что отсеяно ──────────
+     Переключатель «Темп» сохраняется на аккаунте и переживает перелогин:
+     без явной пометки человек, однажды выбравший «90 дней», об этом больше
+     не узнает и будет читать заказ как годовой. */
+  function fallbackHint(){
+    return "За выбранное окно ("+RATE_WINDOW_LABEL.replace(/^темп за /,"")+") этих позиций не было на складе — "+
+      "считать по нему не из чего, поэтому темп взят за год.";
+  }
+  function renderBadges(){
+    var box=document.getElementById("tbl-badges");
+    var html="";
+    if(!items.length&&!excluded.length){ box.innerHTML=""; return; }  // пустой аккаунт
+    if(RATE_WINDOW!=="year"){
+      html+='<span class="bdg warn" title="Заказ посчитан не по годовым продажам, а по окну «'+esc(RATE_WINDOW_LABEL)+
+        '». Чтобы вернуться к году — нажмите «Год» в переключателе «Темп» над таблицей.">⚠ '+
+        esc(RATE_WINDOW_LABEL.charAt(0).toUpperCase()+RATE_WINDOW_LABEL.slice(1))+'</span>';
+    }
+    if(FALLBACK_COUNT>0){
+      html+='<span class="bdg" title="'+esc(fallbackHint())+'">'+fmt(FALLBACK_COUNT)+' '+
+        plural(FALLBACK_COUNT,"поз.","поз.","поз.")+' посчитаны по годовому темпу</span>';
+    }
+    var shown=visibleItems().length, total=items.length+excluded.length;
+    html+='<span class="bdg" title="Всего разобрано позиций: '+fmt(total)+
+      '. В таблице — те, которым нужен заказ, на выбранной вкладке и с учётом фильтров.">В таблице '+
+      fmt(shown)+' из '+fmt(total)+' '+plural(total,"позиции","позиций","позиций")+'</span>';
+    if(excluded.length){
+      html+='<span class="bdg act" id="bdg-excl" title="Показать список позиций, которым заказ не нужен, и причину по каждой">'+
+        fmt(excluded.length)+' не требуют заказа — посмотреть</span>';
+    }else{
+      html+='<span class="bdg" title="Каждая разобранная позиция попала в таблицу">ничего не отсеяно</span>';
+    }
+    box.innerHTML=html;
+    var b=document.getElementById("bdg-excl");
+    if(b) b.addEventListener("click",function(){ toggleExcluded(true); });
+  }
+
   function renderChips(){
     var counts={};
     prodItems(ACTIVE_PROD).forEach(function(it){ counts[it.category]=(counts[it.category]||0)+1; });
@@ -625,21 +970,38 @@
     var t=b==="r"?"Срочно":b==="y"?"Скоро":"План";
     return '<span class="stbadge '+b+'">'+t+'</span>';
   }
+  /* Срок, по которому аналитика уже посчитала прогнозный остаток, стокаут и
+     «дыра поставки» этой позиции: свой срок ЕЁ производства, если он задан,
+     иначе общий из настроек (app/analytics.py — правило выбора то же самое,
+     что и здесь). */
+  function calcLead(it){ return it.lead_time_days||LEAD_TIME; }
   function rowTint(it){ return it._band==="r"?"rr":it._band==="y"?"ro":"rg1"; }
   function stockoutCell(it){
     var d=it.stockout_date?fmtDate(it.stockout_date):"—";
     var g=it.gap_days||0;
-    if(g>0) return '<span class="txt-red nb" style="cursor:help" title="Дыра поставки: остаток кончится за '+fmt(g)+' '+plural(g,"день","дня","дней")+' до прихода заказа (производство '+fmt(LEAD_TIME)+' дн)">⚠ '+d+'</span>';
+    if(g>0) return '<span class="txt-red nb" style="cursor:help" title="Дыра поставки: остаток кончится за '+fmt(g)+' '+plural(g,"день","дня","дней")+' до прихода заказа (производство '+fmt(calcLead(it))+' дн)">⚠ '+d+'</span>';
     return '<span class="nb muted">'+d+'</span>';
   }
   function rateCell(it){
-    var star=(RATE_WINDOW==="season"&&it.season_fallback)
-      ?'<span title="Истории за сезонное окно прошлого года нет — использован темп за год" style="cursor:help">*</span>':"";
-    return fmtNum(it.rate,2)+star;
+    // rate_fallback — темп активного окна взят из года: за окно позиции не
+    // было на складе. Помечаем в любом окне, не только в сезонном.
+    var mark=it.rate_fallback
+      ?'<span class="fbmark" title="'+esc(fallbackHint())+'">*&#8202;год</span>':"";
+    return fmtNum(it.rate,2)+mark;
   }
   function prodCell(it){
     var ex=extraProds();
     if(!ex.length) return '<span class="muted" style="font-size:10px">—</span>';
+    if(!IS_OWNER){
+      // Перенос позиции между производствами — тоже owner-only
+      // (require_owner_api у /api/productions/assign): участнику показываем
+      // текущее производство текстом, без кнопки, которой он не сможет воспользоваться.
+      if(prodOf(it.base_name)!==MAIN_ID){
+        var cur=PRODS.find(function(x){ return x.id===prodOf(it.base_name); });
+        return '<span class="muted" style="font-size:10px">'+esc(cur?cur.name:"—")+'</span>';
+      }
+      return '<span class="muted" style="font-size:10px">—</span>';
+    }
     if(prodOf(it.base_name)!==MAIN_ID){
       var m=mainProd();
       return '<button class="mvbtn mv-back" data-base="'+esc(it.base_name)+'" title="Вернуть на '+esc(m?m.name:"основное")+'">← вернуть</button>';
@@ -652,31 +1014,62 @@
   }
   function calcFormula(it){
     var winTxt=WINDOW_DESC[RATE_WINDOW]||"год";
-    if(RATE_WINDOW==="season"&&it.season_fallback) winTxt="сезон → фолбэк на год (нет истории за окно)";
+    if(it.rate_fallback) winTxt=(WINDOW_DESC[RATE_WINDOW]||"год")+" → нет истории за окно, взят год";
     var proj=it.proj_stock!==undefined?it.proj_stock:it.cs;
+    var lead=calcLead(it);
+    // срок этой позиции отличается от общего из настроек — поясняем, откуда
+    // взялось число в формуле выше (расчёт уже идёт по нему, см. calcLead)
+    var leadNote=(it.lead_time_days&&it.lead_time_days!==LEAD_TIME)
+      ?' Срок производства'+(it.production_name?' «'+esc(it.production_name)+'»':'')+' — '+
+        fmt(it.lead_time_days)+' дн (не '+fmt(LEAD_TIME)+' дн из настроек) — по нему уже посчитаны остаток и дата прихода.':"";
     var gap=(it.gap_days||0)>0
       ?' <span class="txt-red">⚠ Остаток кончится за '+fmt(it.gap_days)+' дн до прихода заказа.</span>':"";
+    // округление до партии/кратности показываем отдельным шагом: человек
+    // должен видеть, откуда взялось число больше расчётного
+    var moq=it.moq_applied
+      ?' Минимальная партия'+(it.pack_multiple>1?' и кратность':'')+' производства'+
+        (it.production_name?' «'+esc(it.production_name)+'»':'')+': округлили до <b>'+fmt(it.need)+' шт</b>.'
+      :"";
+    // ростовку правили руками — в заказ идёт правка, и строка обязана
+    // показывать именно её, иначе формула спорит с пилюлей в таблице
+    var manual=hasEdits(it)
+      ?' Ростовка правлена вручную: <b>'+fmt(it._need)+' шт</b> — это число уходит в заказ и в выгрузку.'
+      :"";
     return '<p class="formula">Расчёт (окно темпа: '+winTxt+'): '+fmtNum(it.rate,2)+' шт/день × '+fmt(HORIZON)+
       ' дн = '+fmt(Math.round(it.rate*HORIZON))+' − прогнозный остаток к приходу '+fmt(proj)+
-      ' (остаток '+fmt(it.cs)+' + едет '+fmt(it.ordered||0)+' − продажи за '+fmt(LEAD_TIME)+' дн производства)'+
-      ' = <b>'+fmt(it.need)+' шт</b>. Темпы: год '+fmtNum(it.rate_year,2)+' · 90 дн '+fmtNum(it.rate_90,2)+
+      ' (остаток '+fmt(it.cs)+' + едет '+fmt(it.ordered||0)+' − продажи за '+fmt(lead)+' дн производства)'+
+      ' = <b>'+fmt(it.need_raw!==undefined?it.need_raw:it.need)+' шт</b>.'+leadNote+moq+manual+
+      ' Темпы: год '+fmtNum(it.rate_year,2)+' · 90 дн '+fmtNum(it.rate_90,2)+
       ' · сезон '+fmtNum(it.rate_season,2)+'.'+gap+'</p>';
   }
   function sizeRows(it){
     var keys=sortSizeKeys(Object.keys(it.sizes||{}));
     if(!keys.length) return "<p class='formula'>Безразмерная позиция — количество считается по общей рекомендации.</p>";
-    return '<table><thead><tr><th>Размер</th><th>Остаток</th><th>Продано за год</th><th style="width:100px">Заказать, шт</th></tr></thead><tbody>'+
+    var edited=hasEdits(it);
+    return '<table><thead><tr><th>Размер</th><th>Остаток</th><th>Продано за год</th>'+
+      '<th style="width:100px">Заказать, шт</th><th style="width:90px">Расчёт</th></tr></thead><tbody>'+
       keys.map(function(sz){
         var s=it.sizes[sz]||{};
+        var rec=recOf(it,sz), val=Number(it._recs[sz])||0;
+        var diff=val!==rec;
         return '<tr><td><b>'+esc(sz)+'</b></td>'+
           '<td class="nb'+((s.stock||0)===0?' txt-red':'')+'" style="text-align:center">'+fmt(s.stock||0)+'</td>'+
           '<td class="nb" style="text-align:center">'+fmt(s.sold365||0)+'</td>'+
-          '<td style="text-align:center"><input class="size-rec" type="number" min="0" max="9999" step="1" data-base="'+esc(it.base_name)+'" data-size="'+esc(sz)+'" value="'+(Number(it._recs[sz])||0)+'"></td></tr>';
-      }).join("")+'</tbody></table>';
+          '<td style="text-align:center"><input class="size-rec'+(diff?' edited':'')+'" type="number" min="0" max="'+MAX_SIZE_QTY+'" step="1"'+
+            ' data-base="'+esc(it.base_name)+'" data-size="'+esc(sz)+'" value="'+val+'"'+
+            (diff?' title="Правка вручную · расчёт '+fmt(rec)+' шт"':'')+'></td>'+
+          '<td class="nb muted" style="text-align:center">'+fmt(rec)+'</td></tr>';
+      }).join("")+'</tbody></table>'+
+      '<p class="size-note"'+(it._sizeNote?'':' style="display:none"')+'>'+esc(it._sizeNote||"")+'</p>'+
+      '<div class="draft-row"'+(edited?'':' style="display:none"')+'>'+
+        '<button class="mvbtn draft-reset" type="button" data-base="'+esc(it.base_name)+'">↺ Вернуть расчёт</button>'+
+        '<span class="txt">Ростовка правлена вручную и сохранена — вы увидите её и завтра.</span>'+
+      '</div>';
   }
 
   function renderTable(){
     var arr=visibleItems();
+    renderBadges();  // счётчик «в таблице N из M» обновляется на любом фильтре
     if(!arr.length){
       var msg;
       var total=prodItems(ACTIVE_PROD).length;
@@ -696,7 +1089,6 @@
     }
     tbody.innerHTML=arr.map(function(it){
       var open=!!openRows[it.base_name];
-      var crit=it._band==="r";
       return '<tr class="'+rowTint(it)+'" data-base="'+esc(it.base_name)+'">'+
         '<td><input type="checkbox" class="row-check" data-base="'+esc(it.base_name)+'"'+(it._checked?" checked":"")+'></td>'+
         '<td><button class="expander" data-base="'+esc(it.base_name)+'" title="Размерная сетка и формула расчёта">'+(open?"▾":"▸")+'</button></td>'+
@@ -710,7 +1102,7 @@
         '<td class="nb'+((it.ordered||0)>0?'':' muted')+'">'+fmt(it.ordered||0)+'</td>'+
         '<td class="nb">'+(it.wos===null||it.wos===undefined?"—":fmtNum(it.wos,1))+'</td>'+
         '<td>'+stockoutCell(it)+'</td>'+
-        '<td><span class="need-pill'+(crit?" r":"")+'">'+fmt(it._need)+' шт</span></td>'+
+        '<td class="need-cell">'+needCellHtml(it)+'</td>'+
         '<td>'+prodCell(it)+'</td>'+
         '</tr>'+
         (open?'<tr><td colspan="'+NCOLS+'" style="padding:0"><div class="sub-panel">'+calcFormula(it)+sizeRows(it)+'</div></td></tr>':"");
@@ -731,16 +1123,17 @@
       });
     });
     tbody.querySelectorAll(".size-rec").forEach(function(inp){
-      inp.addEventListener("input",function(){
-        var it=findItem(inp.getAttribute("data-base"));
-        if(!it) return;
-        var v=Math.min(9999,Math.max(0,Number(inp.value)||0));
-        it._recs[inp.getAttribute("data-size")]=v;
-        recalcNeed(it);
-        var pill=tbody.querySelector("tr[data-base='"+CSS.escape(it.base_name)+"'] .need-pill");
-        if(pill) pill.textContent=fmt(it._need)+" шт";
-        updateSummary(); renderTotals(visibleItems()); renderTabs(); renderKpis();
-      });
+      inp.addEventListener("input",function(){ onSizeEdit(inp,false); });
+      inp.addEventListener("change",function(){ onSizeEdit(inp,true); });
+      // Enter = уход из поля, и ничего больше. Раньше он финализировал сам, а
+      // следом браузер слал change с УЖЕ исправленным значением — второй
+      // разбор не находил, что чинить, и стирал только что показанную
+      // подсказку. Теперь Enter просто снимает фокус: срабатывает ровно один
+      // change, и поведение совпадает с уходом мышью.
+      inp.addEventListener("keydown",function(e){ if(e.key==="Enter"){ e.preventDefault(); inp.blur(); } });
+    });
+    tbody.querySelectorAll(".draft-reset").forEach(function(b){
+      b.addEventListener("click",function(){ resetDraft(b.getAttribute("data-base")); });
     });
     tbody.querySelectorAll(".mv-one").forEach(function(b){
       b.addEventListener("click",function(){ moveTo(b.getAttribute("data-base"),Number(b.getAttribute("data-pid"))); });
@@ -789,7 +1182,10 @@
   function updateSummary(){
     var sel=checkedItems();
     var qty=0,cost=0,rev=0;
-    sel.forEach(function(it){ qty+=it._need; cost+=it._need*(it.cost_price||0); rev+=it._need*(it.avg_price||0); });
+    // себестоимость складываем по УЖЕ округлённым строкам — ровно так же, как
+    // считает выгрузка в Excel: иначе итог страницы и итог файла разъезжаются
+    // на копейки, и человек начинает искать ошибку там, где её нет
+    sel.forEach(function(it){ qty+=it._need; cost+=Math.round(it._need*(it.cost_price||0)); rev+=it._need*(it.avg_price||0); });
     document.getElementById("s-pos").textContent=fmt(sel.length);
     document.getElementById("s-pos-sub").textContent="из "+fmt(prodItems(ACTIVE_PROD).length)+" на вкладке";
     document.getElementById("s-qty").textContent=fmt(qty);
@@ -810,21 +1206,80 @@
     renderTable(); updateSummary();
   });
 
+  /* Раскрыть/свернуть список отсеянных позиций (open=true — только раскрыть). */
+  function toggleExcluded(open){
+    var w=document.getElementById("excluded-wrap");
+    var show=open===true?true:w.style.display==="none";
+    w.style.display=show?"":"none";
+    var a=document.getElementById("excl-arrow");
+    if(a) a.textContent=show?"▾":"▸";
+    if(show) w.scrollIntoView({behavior:"smooth",block:"nearest"});
+  }
   function renderExcluded(){
     var t=document.getElementById("excluded-title");
     var w=document.getElementById("excluded-wrap");
     if(!excluded.length){ t.style.display="none"; w.style.display="none"; return; }
     t.style.display="";
     t.innerHTML='<span id="excl-arrow">'+(w.style.display==="none"?"▸":"▾")+'</span> Не требуют заказа ('+excluded.length+')';
-    t.onclick=function(){
-      var show=w.style.display==="none";
-      w.style.display=show?"":"none";
-      document.getElementById("excl-arrow").textContent=show?"▾":"▸";
-    };
+    t.onclick=function(){ toggleExcluded(); };
     document.getElementById("excluded-tb").innerHTML=excluded.map(function(e){
       return '<tr><td class="name">'+esc(e.base_name)+'</td><td class="muted" style="text-align:left">'+esc(e.reason)+'</td></tr>';
     }).join("");
   }
+
+  document.getElementById("btn-reset-drafts").addEventListener("click",function(){
+    var n=Object.keys(DRAFTS).length;
+    if(!n) return;
+    if(!confirm("Вернуть расчётную ростовку по всем позициям? Ручные правки ("+n+") будут удалены.")) return;
+    api("/api/replenish-draft/reset",{method:"POST",body:{base_name:""}}).then(function(){
+      DRAFTS={};
+      setDraftNote("Вернули расчёт по всем позициям");
+      load();
+    }).catch(function(e){ alert("Не удалось сбросить правки: "+e.message); });
+  });
+
+  /* ── выгрузка в Excel: ровно то, что отмечено галочками на странице ──
+     Отмечено всё (состояние по умолчанию) — простой GET без параметров,
+     адрес короткий и его можно сохранить/переслать. Отмечена часть — состав
+     едет в теле POST (не в адресе: у клиента может быть сотни позиций с
+     длинными названиями, в строку адреса такой список не влезает). Ничего
+     не отмечено — выгружать нечего, спрашивать сервер незачем. */
+  function downloadBlob(blob,name){
+    var url=URL.createObjectURL(blob);
+    var a=document.createElement("a");
+    a.href=url; a.download=name;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    setTimeout(function(){ URL.revokeObjectURL(url); },1000);
+  }
+  document.getElementById("btn-export-xlsx").addEventListener("click",function(){
+    var btn=this;
+    var checked=items.filter(function(it){ return it._checked; });
+    if(!items.length||checked.length===items.length){
+      location.href="/api/export/replenish.xlsx";
+      return;
+    }
+    if(!checked.length){
+      alert("Отметьте хотя бы одну позицию — выгружать в Excel пока нечего.");
+      return;
+    }
+    btn.disabled=true;
+    fetch("/api/export/replenish.xlsx",{method:"POST",
+      headers:{"Content-Type":"application/json","X-Oborot-CSRF":"1"},
+      body:JSON.stringify({base_names:checked.map(function(it){ return it.base_name; })}),
+      credentials:"same-origin"
+    }).then(function(r){
+      if(!r.ok) return r.text().then(function(t){
+        var msg="Ошибка выгрузки ("+r.status+")";
+        try{ var j=JSON.parse(t); if(j&&typeof j.detail==="string") msg=j.detail; }catch(e){}
+        throw new Error(msg);
+      });
+      return r.blob();
+    }).then(function(blob){
+      downloadBlob(blob,"Что заказать.xlsx");
+    }).catch(function(e){
+      alert("Не удалось выгрузить файл: "+e.message);
+    }).then(function(){ btn.disabled=false; });
+  });
 
   document.getElementById("search").addEventListener("input",debounce(function(e){
     state.query=e.target.value.trim();
@@ -840,18 +1295,29 @@
     var today=new Date();
     var dstr=today.toLocaleDateString("ru-RU",{day:"numeric",month:"short"});
     document.getElementById("order-name").value=(p&&!p.is_main?p.name+" · ":"")+"Заказ от "+dstr;
-    var eta=new Date(today.getTime()+LEAD_TIME*86400000);
+    // дата прихода — по сроку ЭТОГО производства (свой цех и Бишкек шьют разное время)
+    var lead=leadOf(p);
+    var eta=new Date(today.getTime()+lead*86400000);
     document.getElementById("order-eta").value=eta.toISOString().slice(0,10);
     var qty=sel.reduce(function(s,it){ return s+it._need; },0);
     var recQty=sel.reduce(function(s,it){ return s+(it.need||0); },0);
     var cost=sel.reduce(function(s,it){ return s+it._need*(it.cost_price||0); },0);
+    var moqN=sel.filter(function(it){ return it.moq_applied; }).length;
     document.getElementById("order-modal-summary").textContent=
-      (p?("Производство: "+p.name+". "):"")+
-      "В заказ войдут "+fmt(sel.length)+" "+plural(sel.length,"позиция","позиции","позиций")+", "+fmt(qty)+" шт, себестоимость ~"+fmtMoneyShort(cost)+".";
+      (p?("Производство: "+p.name+", срок "+fmt(lead)+" "+plural(lead,"день","дня","дней")+". "):"")+
+      "В заказ войдут "+fmt(sel.length)+" "+plural(sel.length,"позиция","позиции","позиций")+", "+fmt(qty)+" шт, себестоимость ~"+fmtMoneyShort(cost)+"."+
+      (moqN?(" У "+fmt(moqN)+" "+plural(moqN,"позиции","позиций","позиций")+" количество поднято до минимальной партии."):"");
     var warnEl=document.getElementById("order-modal-warning");
+    var lowN=sel.filter(function(it){ return it.moq_low; }).length;
+    // .warn скрыт в CSS (display:none) — показываем явным block, иначе
+    // предупреждение молча не появляется
     if(recQty>0&&qty>recQty*3){
-      warnEl.style.display="";
+      warnEl.style.display="block";
       warnEl.textContent="⚠ Количество в "+fmtNum(qty/recQty,1)+" раза выше рекомендации системы ("+fmt(recQty)+" шт). Проверьте цифры.";
+    }else if(lowN){
+      warnEl.style.display="block";
+      warnEl.textContent="⚠ У "+fmt(lowN)+" "+plural(lowN,"позиции","позиций","позиций")+
+        " спрос заметно ниже минимальной партии — такой заказ может пролежать на складе. Снимите галочку, если он не нужен.";
     }else warnEl.style.display="none";
     orderModal.classList.add("open");
   });
@@ -870,6 +1336,9 @@
     // заказ сразу уходит «в производство» (отдельной страницы заказов нет):
     // его количество попадает в «Едет», управление — в блоке под таблицей
     api("/api/orders",{method:"POST",body:payload}).then(function(r){
+      // Заказ склеен с уже существующим (защита от случайного повтора) —
+      // об этом надо сказать словами, а не молча показать чужой заказ.
+      if(r.duplicate) alert(r.message);
       return api("/api/orders/"+r.id+"/status",{method:"POST",body:{status:"sent"}});
     }).then(function(){
       orderModal.classList.remove("open");
@@ -878,6 +1347,13 @@
     }).catch(function(e){ btn.disabled=false; alert("Не удалось создать заказ: "+e.message); });
   });
 
+  // Роль — отдельным лёгким запросом, параллельно с load(): нужна только для
+  // того, прятать ли owner-only управление производствами (см. renderTabs,
+  // prodCell). Как эту роль отдаёт /api/settings — см. templates/settings.html.
+  api("/api/settings").then(function(s){
+    IS_OWNER=s.role==="owner";
+    renderTabs();
+  }).catch(function(){ /* не удалось узнать роль — оставляем как есть */ });
   load();
 })();
 </script>

@@ -38,7 +38,16 @@
   .go-btn { font-size: 12px; font-weight: 600; padding: 9px 18px; border-radius: 10px;
     border: 1px solid #1f1f1f; background: #1f1f1f; color: #f3e9e0; cursor: pointer; }
   .go-btn:hover { background: #434446; }
+  .go-btn.off { opacity: .4; cursor: not-allowed; }
   .hint { font-size: 11px; color: rgba(31,31,31,.45); }
+  /* поле с ошибкой ввода: подсветка + пояснение под строкой */
+  .binp.bad { border-color: #a30003; background: #fff4f3; }
+  .ierr { display: none; margin-top: 9px; font-size: 12.5px; line-height: 1.5; color: #a30003; }
+  .ierr.on { display: block; }
+  .stale { display: none; font-size: 12px; color: #a15c00; background: rgba(255,204,0,.15);
+    border: 1px solid rgba(255,204,0,.4); border-radius: 10px; padding: 9px 14px; margin-bottom: 14px; }
+  .stale.on { display: block; }
+  .dimmed { opacity: .4; }
 
   .cat-bar { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
   .cat-btn { font-size: 12px; font-weight: 500; padding: 5px 14px; border-radius: 20px;
@@ -56,6 +65,13 @@
 
   .table-outer { background: rgba(255,255,255,.55); backdrop-filter: blur(10px);
     border: 1px solid rgba(31,31,31,.09); border-radius: 12px; overflow: auto; max-height: calc(100vh - 220px); }
+  {# На узком экране плашка свежести данных и кнопка «?» (_hints.html) лежат
+     внизу поверх страницы — без запаса таблица со своим внутренним скроллом
+     упирается в них нижним краем, и последняя строка наполовину прячется под
+     ними. 76px — тот же запас, что и «хвост» под футером в _hints.html. #}
+  @media (max-width: 640px) {
+    .table-outer { max-height: calc(100vh - 220px - 76px); }
+  }
   table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
   thead th { background: rgba(255,255,255,.9); padding: 9px 8px; text-align: center;
     font-size: 10px; font-weight: 500; color: rgba(31,31,31,.62); letter-spacing: .06em; text-transform: uppercase;
@@ -110,7 +126,10 @@
       «Бюджет» отвечает на вопрос «есть N рублей — на что их потратить, чтобы они отработали лучше всего».
       Деньги распределяются строго по оборачиваемости: сначала бюджет получают бестселлеры, потом хорошие
       и так далее, пока деньги не кончатся.</p>
-      <p>Потребность каждой позиции считается как на «Заказе»: темп продаж × горизонт − остаток − «едет».
+      <p>Потребность каждой позиции считается как на «Заказе»: темп продаж × горизонт − остаток − «едет», но
+      <b>без условий производства</b> — минимальная партия и кратность подрядчика здесь не применяются: бюджет
+      делит деньги и берёт ровно столько, на сколько их хватает, а поднимать до партии, которую всё равно не
+      выкупить, нечестно. Довести заказ до партии для фабрики — на странице «Заказ», её выгрузка и есть заказ.
       В расчёте только позиции с продажами за последние 90 дней. «Макс. на позицию» не даёт одному
       бестселлеру съесть весь бюджет. Категории выключаются кнопками — бюджет пересчитается.</p>
     </div>
@@ -119,16 +138,23 @@
   <div class="panel">
     <div class="row">
       <span class="lbl">Бюджет, ₽</span>
-      <input class="binp" id="budget" type="text" inputmode="numeric" value="200 000">
+      <input class="binp" id="budget" type="text" inputmode="decimal" value="200 000"
+             title="От 1 ₽ до 1 000 000 000 ₽. Пробелы между разрядами можно: 3 500 000">
+      <span class="hint">от 1 до 1 000 000 000 ₽</span>
       <span class="lbl">Макс. на позицию</span>
-      <input class="binp" id="capPct" type="number" min="5" max="100" value="30" style="width:80px;text-align:center">
+      <input class="binp" id="capPct" type="number" min="5" max="100" value="30" style="width:80px;text-align:center"
+             title="Доля бюджета, больше которой не получит одна позиция. От 5 до 100 %">
       <span class="lbl" style="text-transform:none">%</span>
-      <button class="go-btn" onclick="calc()">Распределить</button>
+      <span class="hint">от 5 до 100</span>
+      <button class="go-btn" id="calcBtn" onclick="calc()">Распределить</button>
       <span class="hint" id="statusHint"></span>
       <a class="go-btn" id="xlsxBtn" style="margin-left:auto;text-decoration:none;background:rgba(255,255,255,.6);color:#1f1f1f;border-color:rgba(31,31,31,.25)"
          href="/api/export/budget.xlsx?amount=200000&max_share=30" download>⬇ Excel</a>
     </div>
+    <div class="ierr" id="inpErr"></div>
   </div>
+
+  <div class="stale" id="staleBox"></div>
 
   <div class="cat-bar" id="catBar"></div>
 
@@ -143,7 +169,7 @@
         <th title="Честный темп продаж">Темп, шт/мес</th>
         <th title="Остаток + едет к нам">Остаток+едет</th>
         <th title="На сколько дней хватит текущего запаса">Запас, дн</th>
-        <th title="Как на «Заказе»: темп × горизонт − прогнозный остаток к приходу (остаток + едет − темп × срок производства)">Потребность</th>
+        <th title="Как на «Заказе»: темп × горизонт − прогнозный остаток к приходу (остаток + едет − темп × срок производства), но без округления до минимальной партии подрядчика — оно применяется на «Заказе»">Потребность</th>
         <th>Заказать</th>
         <th>Себес/шт</th>
         <th>Сумма</th>
@@ -184,11 +210,122 @@
   }
   var OFFCATS=new Set(), ALLCATS=[];
 
-  function parseBudget(){
-    return Math.max(1, parseInt((document.getElementById("budget").value||"").replace(/[^\d]/g,""),10)||200000);
+  /* ── Разбор полей: страница не должна врать о том, что посчитано ──
+     Пробелы (в том числе неразрывные) — разделители разрядов, запятая и точка —
+     десятичный разделитель, минус не проглатывается. Всё, что не разобралось, —
+     ошибка с пояснением; таблица при этом НЕ пересчитывается (см. calc). */
+  var MIN_AMOUNT=1, MAX_AMOUNT=1000000000, MIN_CAP=5, MAX_CAP=100;
+  var applied={amount:200000, cap:30};   // по чему реально построена таблица на экране
+  var hasResult=false;
+
+  function parseAmount(raw){
+    var s=String(raw==null?"":raw).trim();
+    if(!s) return {ok:false, error:"введите сумму — например, 3 500 000."};
+    s=s.replace(/[\s\u00A0\u202F\u2009\u2007]/g,"");   // разделители разрядов
+    s=s.replace(/(₽|руб\.?|р\.?)$/i,"");               // хвост валюты из копипасты
+    s=s.replace(",",".");
+    if(!/^[+-]?\d+(\.\d*)?$/.test(s))   // «3.» — человек ещё печатает, это не мусор
+      return {ok:false, error:"это должно быть число. Цифры, пробелы между разрядами, "+
+        "запятая или точка для копеек — например, 3 500 000."};
+    var n=Number(s);
+    if(!isFinite(n)) return {ok:false, error:"не удалось прочитать число. Например: 3 500 000."};
+    if(n<0) return {ok:false, error:"сумма не может быть отрицательной. Введите, сколько готовы "+
+      "потратить, — например, 3 500 000."};
+    n=Math.round(n);
+    if(n<MIN_AMOUNT) return {ok:false, error:"сумма должна быть больше нуля. Введите, сколько "+
+      "готовы потратить, — например, 3 500 000."};
+    if(n>MAX_AMOUNT) return {ok:false, error:"максимум 1 000 000 000 ₽. Проверьте количество нулей."};
+    var warn=n<1000
+      ? "Бюджет прочитан как "+fmt(n)+" ₽ — это меньше тысячи рублей. Если имелись в виду "+
+        "миллионы, пишите разряды полностью: 3 500 000."
+      : "";
+    return {ok:true, value:n, warn:warn};
   }
+
+  function parseCap(raw){
+    var s=String(raw==null?"":raw).trim();
+    if(!s) return {ok:false, error:"укажите долю бюджета, больше которой одна позиция не получит, — "+
+      "от 5 до 100 %."};
+    s=s.replace(/[\s\u00A0\u202F]/g,"").replace("%","").replace(",",".");
+    if(!/^[+-]?\d+(\.\d*)?$/.test(s))
+      return {ok:false, error:"это должно быть число процентов от 5 до 100 — например, 30."};
+    var n=Math.round(Number(s));
+    if(n<MIN_CAP||n>MAX_CAP)
+      return {ok:false, error:"допустимо от 5 до 100 %. Меньше 5 % бюджет размажется по мелочи, "+
+        "больше 100 % не бывает."};
+    return {ok:true, value:n};
+  }
+
+  function catQS(){
+    return OFFCATS.size?("&exclude_cats="+encodeURIComponent([...OFFCATS].join(","))):"";
+  }
+  function xlsxHref(){
+    return "/api/export/budget.xlsx?amount="+applied.amount+"&max_share="+applied.cap+catQS();
+  }
+
+  /* Проверяет оба поля, показывает пояснения и метку «устарело».
+     Возвращает {ok:true, amount, cap} только когда считать МОЖНО. */
+  function validate(){
+    var bEl=document.getElementById("budget"), cEl=document.getElementById("capPct");
+    var a=parseAmount(bEl.value), c=parseCap(cEl.value);
+    bEl.classList.toggle("bad",!a.ok);
+    cEl.classList.toggle("bad",!c.ok);
+    var msgs=[];
+    if(!a.ok) msgs.push("Бюджет: "+a.error);
+    if(!c.ok) msgs.push("Макс. на позицию: "+c.error);
+    var ok=a.ok&&c.ok;
+    if(ok&&a.warn) msgs.push(a.warn);
+    var box=document.getElementById("inpErr");
+    box.innerHTML=msgs.map(esc).join("<br>");
+    box.classList.toggle("on",msgs.length>0);
+    box.style.color=ok?"#a15c00":"#a30003";
+    // выгрузка не должна вести на URL с невалидной суммой
+    var x=document.getElementById("xlsxBtn");
+    x.classList.toggle("off",!ok);
+    if(ok){
+      x.setAttribute("href",xlsxHref());
+      x.style.pointerEvents="";
+      x.title="Выгрузить в Excel то, что показано в таблице";
+    }else{
+      x.removeAttribute("href");
+      x.style.pointerEvents="none";
+      x.title="Сначала исправьте поля — тогда выгрузка снова заработает";
+    }
+    markStale(a,c);
+    return ok?{ok:true, amount:a.value, cap:c.value}:{ok:false};
+  }
+
+  /* Таблица на экране могла быть построена по другой сумме — говорим об этом прямо. */
+  function markStale(a,c){
+    var box=document.getElementById("staleBox");
+    var stale=false, txt="";
+    if(hasResult){
+      if(!a.ok||!c.ok){
+        stale=true;
+        txt="Ниже — прежний расчёт: "+fmtR(applied.amount)+", макс. "+applied.cap+
+            "% на позицию. Новое значение не применено, потому что его не удалось прочитать.";
+      }else if(a.value!==applied.amount||c.value!==applied.cap){
+        stale=true;
+        txt="Ниже — расчёт на "+fmtR(applied.amount)+" (макс. "+applied.cap+"%). "+
+            "Чтобы посчитать на "+fmtR(a.value)+" (макс. "+c.value+"%), нажмите «Распределить».";
+      }
+    }
+    box.textContent=txt;
+    box.classList.toggle("on",stale);
+    ["cards","tblWrap","skippedFold","nocostFold"].forEach(function(id){
+      document.getElementById(id).classList.toggle("dimmed",stale);
+    });
+  }
+
   document.getElementById("budget").addEventListener("blur",function(){
-    this.value=fmt(parseBudget());
+    var a=parseAmount(this.value);
+    if(a.ok) this.value=fmt(a.value);   // невалидное оставляем как есть — человек видит, что ввёл
+    validate();
+  });
+  ["budget","capPct"].forEach(function(id){
+    var el=document.getElementById(id);
+    el.addEventListener("input",function(){ validate(); });
+    el.addEventListener("keydown",function(e){ if(e.key==="Enter") calc(); });
   });
 
   function renderCatBar(){
@@ -204,19 +341,26 @@
   });
 
   window.calc=function(){
-    var amount=parseBudget();
-    var cap=Math.max(5,Math.min(100,parseInt(document.getElementById("capPct").value,10)||30));
+    var v=validate();
     var hint=document.getElementById("statusHint");
+    if(!v.ok){
+      hint.textContent="не посчитано — проверьте поля";
+      return;   // считать по неверной сумме нельзя: на экране остаётся прежний расчёт
+    }
+    var amount=v.amount, cap=v.cap;
     hint.textContent="считаю…";
-    document.getElementById("xlsxBtn").href="/api/export/budget.xlsx?amount="+amount+"&max_share="+cap;
-    var url="/api/budget?amount="+amount+"&max_share="+cap+
-      (OFFCATS.size?("&exclude_cats="+encodeURIComponent([...OFFCATS].join(","))):"");
+    var url="/api/budget?amount="+amount+"&max_share="+cap+catQS();
     fetch(url,{credentials:"same-origin"}).then(function(r){
       if(!r.ok) throw new Error("HTTP "+r.status);
       return r.json();
     }).then(function(d){
       ALLCATS=d.categories||[];
       renderCatBar();
+      applied={amount:amount, cap:cap};   // теперь таблица соответствует полям
+      hasResult=true;
+      document.getElementById("xlsxBtn").setAttribute("href",xlsxHref());
+      markStale(parseAmount(document.getElementById("budget").value),
+                parseCap(document.getElementById("capPct").value));
       hint.textContent="приоритет: оборачиваемость · продажи за "+d.fresh_days+" дн · горизонт "+d.horizon_days+" дней";
       document.getElementById("placeholder").style.display="none";
       // предупреждение о свежести

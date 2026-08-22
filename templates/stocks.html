@@ -54,7 +54,7 @@
   .cat-sum-title { font-size: 11px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: rgba(31,31,31,.5); margin: 0 0 8px; }
   #summary-cat .sum-card { padding: 12px 20px; } #summary-cat .val { font-size: 21px; }
 
-  .tools { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+  .tools { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; flex-wrap: wrap; }
   .search { flex: 0 0 320px; padding: 8px 14px; border-radius: 10px; font-size: 13px;
     border: 1px solid rgba(31,31,31,.16); background: rgba(255,255,255,.7); outline: none; }
   .search:focus { border-color: rgba(31,31,31,.45) }
@@ -62,14 +62,46 @@
 
   .twrap { background: rgba(255,255,255,.55); backdrop-filter: blur(10px);
     border: 1px solid rgba(31,31,31,.09); border-radius: 12px; overflow: auto; max-height: calc(100vh - 300px); }
+  {# На узком экране плашка свежести данных и кнопка «?» (_hints.html) лежат
+     внизу поверх страницы — без запаса таблица со своим внутренним скроллом
+     упирается в них нижним краем, и последняя строка наполовину прячется под
+     ними. 76px — тот же запас, что и «хвост» под футером в _hints.html. #}
+  @media (max-width: 640px) {
+    .twrap { max-height: calc(100vh - 300px - 76px); }
+  }
   table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
   thead th { background: rgba(255,255,255,.9); padding: 10px; text-align: center; font-size: 10px; font-weight: 500;
     color: rgba(31,31,31,.62); letter-spacing: .07em; text-transform: uppercase; white-space: nowrap;
     position: sticky; top: 0; z-index: 10; border-bottom: 1px solid rgba(31,31,31,.09); cursor: help; }
-  thead th:first-child { text-align: left; padding-left: 14px; }
+  {# Залипающая первая колонка — как на «Оборачиваемости»: left добавлен к
+     уже sticky-по-верху ячейке шапки. Фон — сплошной, не полупрозрачный
+     rgba построчной подсветки: иначе цифры колонок, уехавших под неё при
+     скролле, просвечивают сквозь название (проверено — видно буквально). #}
+  thead th:first-child { text-align: left; padding-left: 14px; left: 0; z-index: 20; background: #f7f1ea; }
   thead th .sub { display: block; font-size: 9px; font-weight: 400; letter-spacing: 0; text-transform: none; opacity: .45; margin-top: 2px; }
+  {# Сортируемые заголовки — как на «Оборачиваемости». Бледная стрелка-подсказка
+     лежит абсолютно в правом паддинге и ширины не занимает (иначе таблица
+     выросла бы на ширину стрелки в каждой колонке); стрелка активной колонки —
+     строчная, сразу за подписью, чтобы было видно, по чему отсортировано.
+     position в этом правиле НЕ задаём: у thead th уже sticky (шапка липнет
+     сверху, а первая колонка ещё и слева), и position:relative отменил бы
+     обеих — шапка уезжала бы вместе со строками. #}
+  thead th[data-sk] { cursor: pointer; user-select: none; }
+  thead th[data-sk]:hover { color: #1f1f1f; }
+  thead th .sarr { position: absolute; right: 2px; top: 50%; transform: translateY(-50%);
+    font-size: 9px; line-height: 1; opacity: 0; }
+  thead th[data-sk]:hover .sarr, thead th[data-sk]:focus .sarr { opacity: .45; }
+  thead th.sorted { color: #1f1f1f; font-weight: 700; background: #eee3d7; }
+  thead th.sorted:first-child { background: #eee3d7; }
+  thead th.sorted .sarr { position: static; transform: none; margin-left: 4px; opacity: 1; font-size: 10px; }
+  thead th[data-sk]:focus-visible { outline: 2px solid #1f1f1f; outline-offset: -2px; }
+  /* «Вид изменён» — плашка о том, что таблица показана не в исходном виде */
+  .reset-view { font-size: 11.5px; font-weight: 600; padding: 6px 12px; border-radius: 10px;
+    border: 1px solid rgba(184,140,0,.55); background: rgba(255,204,0,.3); color: #6b5200; cursor: pointer; }
+  .reset-view:hover { background: rgba(255,204,0,.5); }
   tbody td { padding: 8px 10px; border-bottom: 1px solid rgba(31,31,31,.07); text-align: center; vertical-align: middle; }
-  tbody td:first-child { text-align: left; padding-left: 14px; font-weight: 500; }
+  tbody td:first-child { text-align: left; padding-left: 14px; font-weight: 500;
+    position: sticky; left: 0; z-index: 5; box-shadow: 1px 0 0 rgba(31,31,31,.09); }
   tr.pr { cursor: pointer; }
   .rg2 td { background: rgba(143,233,0,.35) } .rg1 td { background: rgba(76,187,23,.3) }
   .ro td { background: rgba(255,204,0,.32) } .rr td { background: rgba(221,0,4,.1) }
@@ -78,6 +110,18 @@
   .ro:hover td { background: rgba(255,204,0,.44) } .rr:hover td { background: rgba(221,0,4,.16) }
   tr.sr td { background: rgba(255,255,255,.78); padding: 5px 10px; font-size: 11.5px; color: #434446 }
   tr.sr td:first-child { padding-left: 38px; font-style: italic; font-weight: 400; }
+  {# Тот же тон подсветки, что и выше, но над сплошной подложкой — только в
+     залипающей колонке (см. пояснение у thead th:first-child). #}
+  .rg2 td:first-child { background: linear-gradient(rgba(143,233,0,.35),rgba(143,233,0,.35)),#f7f1ea; }
+  .rg1 td:first-child { background: linear-gradient(rgba(76,187,23,.3),rgba(76,187,23,.3)),#f7f1ea; }
+  .ro td:first-child { background: linear-gradient(rgba(255,204,0,.32),rgba(255,204,0,.32)),#f7f1ea; }
+  .rr td:first-child { background: linear-gradient(rgba(221,0,4,.1),rgba(221,0,4,.1)),#f7f1ea; }
+  .rgr td:first-child { background: linear-gradient(rgba(255,255,255,.55),rgba(255,255,255,.55)),#f7f1ea; }
+  .rg2:hover td:first-child { background: linear-gradient(rgba(143,233,0,.5),rgba(143,233,0,.5)),#f7f1ea; }
+  .rg1:hover td:first-child { background: linear-gradient(rgba(76,187,23,.42),rgba(76,187,23,.42)),#f7f1ea; }
+  .ro:hover td:first-child { background: linear-gradient(rgba(255,204,0,.44),rgba(255,204,0,.44)),#f7f1ea; }
+  .rr:hover td:first-child { background: linear-gradient(rgba(221,0,4,.16),rgba(221,0,4,.16)),#f7f1ea; }
+  tr.sr td:first-child { background: linear-gradient(rgba(255,255,255,.78),rgba(255,255,255,.78)),#f7f1ea; }
   .ei { display: inline-block; width: 14px; font-size: 9px; color: rgba(31,31,31,.4); margin-right: 6px; transition: transform .15s; }
   tr.pr.open .ei { transform: rotate(90deg); }
   .qty { font-weight: 700; font-size: 13px; }
@@ -99,6 +143,24 @@
   .loading { text-align: center; padding: 60px; color: rgba(31,31,31,.45); font-size: 13px }
   .lowtag { display: inline-block; margin-left: 8px; padding: 1px 8px; border-radius: 10px;
     background: rgba(31,31,31,.08); color: rgba(31,31,31,.6); font-size: 10px; font-weight: 700; }
+  .losstag { display: inline-block; margin-left: 8px; padding: 1px 8px; border-radius: 10px;
+    background: rgba(221,0,4,.16); color: #a00003; font-size: 10px; font-weight: 700; }
+
+  /* деньги: себестоимость и валовая маржа */
+  .sum-card .cost { font-size: 10.5px; color: rgba(31,31,31,.7); margin-top: 4px; line-height: 1.4; }
+  .money-strip { display: grid; grid-template-columns: repeat(auto-fit,minmax(230px,1fr)); gap: 12px; margin: 0 0 14px; }
+  .ms-card { border-radius: 12px; padding: 12px 16px; background: rgba(255,255,255,.62);
+    border: 1px solid rgba(31,31,31,.09); backdrop-filter: blur(10px); }
+  .ms-card.accent { background: rgba(76,187,23,.22); border-color: rgba(76,187,23,.35); }
+  .ms-card .lbl { font-size: 10px; font-weight: 700; letter-spacing: .07em; text-transform: uppercase; color: rgba(31,31,31,.55); }
+  .ms-card .val { font-size: 21px; font-weight: 700; line-height: 1.15; margin-top: 4px; font-variant-numeric: tabular-nums; }
+  .ms-card .sub { font-size: 10.5px; color: rgba(31,31,31,.6); margin-top: 5px; line-height: 1.45; }
+  .loss-line { margin: 0 0 12px; padding: 9px 15px; border-radius: 10px; font-size: 12px; font-weight: 600;
+    color: #a00003; background: rgba(221,0,4,.09); border: 1px solid rgba(221,0,4,.32); }
+  .loss-line a { color: #a00003; }
+  .mneg { color: #a00003; font-weight: 700; }
+  .mnone { opacity: .4; font-size: 11px; }
+  .msub2 { display: block; font-size: 9px; opacity: .55; margin-top: 2px; }
 </style>
 </head>
 <body>
@@ -125,11 +187,12 @@
   <details class="note">
     <summary>Как устроена эта страница: категории, карточки и графа «Заказано»</summary>
     <div class="body">
-      <p><b>Что это.</b> Общая картина стока по скорости продаж. Верхние четыре карточки — весь склад, разложенный по успешности вещей (по оборачиваемости, ₽/день); карточки ниже — то же по выбранной категории. В штуках и деньгах видно, сколько капитала лежит в бестселлерах, а сколько заморожено в слабых вещах. Заказанное-но-не-пришедшее учитывается в стоке.</p>
+      <p><b>Что это.</b> Общая картина стока по скорости продаж. Верхние четыре карточки — весь склад, разложенный по успешности вещей (по оборачиваемости, ₽/день); карточки ниже — то же по выбранной категории. В штуках и деньгах видно, сколько капитала лежит в бестселлерах, а сколько заморожено в слабых вещах. Заказанное-но-не-пришедшее учитывается в стоке. <b>Денежная сумма в карточках</b> — это <b>(остаток + едет к нам)</b> × средняя цена продажи позиции с учётом скидок; это не себестоимость и не розничный прайс, а оценка «за сколько это реально продастся». Товар в пути входит и в штуки карточек, и в их суммы — поэтому четыре карточки складываются не в «Если продать остаток» из полосы выше, а в «Если продать остаток» плюс то, что едет.</p>
       <p><b>Откуда категории.</b> Категории берутся из групп товаров вашего МойСклада; английские названия автоматически переводятся, товары без группы распознаются по названию. Если в МойСкладе категории ведутся неаккуратно — исправьте здесь, не трогая МойСклад: раскройте «Настроить категории» ниже, чтобы <b>слить категории</b> (например, «Bombers» → «Верхняя одежда»), или раскройте строку товара и смените категорию у него одного.</p>
       <p><b>Графа «Заказано» — важнейшая ручка страницы.</b> Впишите сюда, сколько штук вы заказали на производстве. Это число попадает в «едет к нам» и влияет на все расчёты: страница <b>Заказ</b> не предложит заказать то, что уже шьётся; <b>Прогноз</b> учтёт эти штуки в будущей выручке; <b>Бюджет</b> не потратит на них деньги. Если вы отправляете заказы в МойСклад из раздела «Заказы» — их количества подтягиваются автоматически (серая пометка «+N из МС» под полем) и уменьшаются по мере приёмок; вручную их дублировать не нужно.</p>
       <p><b>Красные «!»</b> — размер есть на одном складе и «по нулям» на другом: проверьте, можно ли перебросить. «по нулям уже N дн» — сколько дней размер теряет продажи. Клик по строке раскрывает размеры.</p>
-      <p><b>Сток на 90 дн</b> — запас относительно 90-дневной потребности (по темпу продаж): ~100% идеально, сильно больше — затоварка. <b>Недостаток</b> — сколько штук не хватает до этой нормы.</p>
+      <p><b>Деньги: себестоимость и маржа.</b> Полоса над карточками отвечает на главный вопрос финансиста — <b>сколько ваших денег лежит на складе по себестоимости</b> (а не по цене, за которую вы это когда-нибудь продадите). Рядом — сколько денег едет к вам в заказанных партиях и сколько вы заработаете, когда остаток продастся. В каждой карточке сегмента себестоимость и маржа показаны отдельной строкой, а в таблице есть колонки <b>Себестоимость</b> (за штуку и по всему остатку) и <b>Маржа</b> (за штуку и в процентах от цены продажи). Если себестоимости в МойСкладе нет, стоит «нет с/с»: ноль вместо неё не рисуется и в итоги такая позиция не входит.</p>
+      <p><b>Сток на 90 дн</b> — запас относительно 90-дневной потребности (по темпу продаж): ~100% идеально, сильно больше — затоварка. <b>Не хватает до нормы</b> — сколько штук не хватает <i>сегодня</i>, чтобы дотянуть сток до этой нормы. Это не то же число, что «Заказать» на странице «Заказ»: там оно обычно больше, потому что дополнительно учитывает срок пошива — то, что продастся, пока едет партия.</p>
       <details style="margin-top:8px;">
         <summary style="cursor:pointer;font-weight:600;">Настроить категории (слияние)</summary>
         <div id="merge-box" style="margin-top:6px;"></div>
@@ -137,30 +200,50 @@
     </div>
   </details>
 
+  <div class="money-strip" id="money-strip"></div>
+  <div class="loss-line" id="loss-line" style="display:none"></div>
+  <div id="seg-basis" style="font-size:11px;color:rgba(31,31,31,.45);margin:-2px 0 10px;"></div>
   <div class="summary" id="summary">
-    <div class="sum-card sc-best"><div class="lbl">Бестселлеры</div><div class="cond">&gt; 5 000 ₽/день</div><div class="val" id="v-best">—</div><div class="money" id="m-best"></div><div class="sub" id="s-best"></div></div>
-    <div class="sum-card sc-good"><div class="lbl">Хорошие</div><div class="cond">2 000 – 5 000 ₽/день</div><div class="val" id="v-good">—</div><div class="money" id="m-good"></div><div class="sub" id="s-good"></div></div>
-    <div class="sum-card sc-mid"><div class="lbl">Медленные</div><div class="cond">1 000 – 2 000 ₽/день</div><div class="val" id="v-mid">—</div><div class="money" id="m-mid"></div><div class="sub" id="s-mid"></div></div>
-    <div class="sum-card sc-bad"><div class="lbl">Слабые</div><div class="cond">&lt; 1 000 ₽/день</div><div class="val" id="v-bad">—</div><div class="money" id="m-bad"></div><div class="sub" id="s-bad"></div></div>
+    <div class="sum-card sc-best"><div class="lbl">Бестселлеры</div><div class="cond">&gt; 5 000 ₽/день</div><div class="val" id="v-best">—</div><div class="money" id="m-best" title="(Остаток + едет к нам) × средняя цена продажи с учётом скидок — не себестоимость и не розничный прайс. Товар в пути входит и в штуки, и в сумму"></div><div class="cost" id="c-best" title="Те же штуки по себестоимости и валовая маржа между себестоимостью и ценой продажи"></div><div class="sub" id="s-best"></div></div>
+    <div class="sum-card sc-good"><div class="lbl">Хорошие</div><div class="cond">2 000 – 5 000 ₽/день</div><div class="val" id="v-good">—</div><div class="money" id="m-good" title="(Остаток + едет к нам) × средняя цена продажи с учётом скидок — не себестоимость и не розничный прайс. Товар в пути входит и в штуки, и в сумму"></div><div class="cost" id="c-good" title="Те же штуки по себестоимости и валовая маржа между себестоимостью и ценой продажи"></div><div class="sub" id="s-good"></div></div>
+    <div class="sum-card sc-mid"><div class="lbl">Медленные</div><div class="cond">1 000 – 2 000 ₽/день</div><div class="val" id="v-mid">—</div><div class="money" id="m-mid" title="(Остаток + едет к нам) × средняя цена продажи с учётом скидок — не себестоимость и не розничный прайс. Товар в пути входит и в штуки, и в сумму"></div><div class="cost" id="c-mid" title="Те же штуки по себестоимости и валовая маржа между себестоимостью и ценой продажи"></div><div class="sub" id="s-mid"></div></div>
+    <div class="sum-card sc-bad"><div class="lbl">Слабые</div><div class="cond">&lt; 1 000 ₽/день</div><div class="val" id="v-bad">—</div><div class="money" id="m-bad" title="(Остаток + едет к нам) × средняя цена продажи с учётом скидок — не себестоимость и не розничный прайс. Товар в пути входит и в штуки, и в сумму"></div><div class="cost" id="c-bad" title="Те же штуки по себестоимости и валовая маржа между себестоимостью и ценой продажи"></div><div class="sub" id="s-bad"></div></div>
   </div>
   <div class="cat-sum-title" id="cat-sum-title"></div>
   <div class="summary" id="summary-cat" style="margin-bottom:14px;"></div>
 
   <div class="tools">
     <input class="search" id="search" placeholder="Поиск по названию...">
+    <button class="reset-view" id="resetView" style="display:none"></button>
     <span class="note-inline" id="note"></span>
   </div>
 
   <div class="twrap">
     <table>
       <thead id="thead"></thead>
-      <tbody id="tb"><tr><td colspan="7" class="loading">Загружаю данные...</td></tr></tbody>
+      <tbody id="tb"><tr><td colspan="9" class="loading">Загружаю данные...</td></tr></tbody>
     </table>
   </div>
 </div>
 
 <script>
 let DATA = null, ITEMS = [], WHS = [], currentCat = null, MERGES = {}, ALLCATS = [];
+/* Вкладка «Все категории»: без неё сортировка работает только внутри одной
+   вкладки, а вопрос «где кончается товар» — по всему ассортименту.
+   Значение заведомо не совпадает с названием реальной категории; в разметку
+   его не пишем — в HTML-атрибуте парсер заменил бы его на U+FFFD. */
+const ALL_CAT = "\u0000all";
+/* Какие строки раскрыты по размерам. Держим по названию, а не по узлу DOM:
+   после сортировки таблица перерисовывается, и раскрытое должно остаться
+   раскрытым. */
+const OPEN = new Set();
+let MONEY = null, BELOW = null;
+/* Русская форма слова по числу: 1 позиция / 2 позиции / 5 позиций. */
+function plural(n,one,few,many){ n=Math.abs(Math.round(n));
+  if(n%10===1&&n%100!==11) return one;
+  if(n%10>=2&&n%10<=4&&!(n%100>=12&&n%100<=14)) return few;
+  return many; }
+function ncols(){ return WHS.length+6; }
 
 function mw(name,q){ if(!q) return true; const nl=name.toLowerCase(); return q.toLowerCase().split(/\s+/).every(w=>nl.includes(w)); }
 function fmt(n){ return Math.round(n||0).toLocaleString("ru-RU"); }
@@ -192,76 +275,313 @@ function zatStyle(p){
 }
 
 function sumByGrade(catFilter){
-  const acc={best:{q:0,n:0,m:0,o:0},good:{q:0,n:0,m:0,o:0},mid:{q:0,n:0,m:0,o:0},bad:{q:0,n:0,m:0,o:0}};
+  const acc={best:{q:0,n:0,m:0,o:0,c:0,gm:0,nc:0},good:{q:0,n:0,m:0,o:0,c:0,gm:0,nc:0},
+             mid:{q:0,n:0,m:0,o:0,c:0,gm:0,nc:0},bad:{q:0,n:0,m:0,o:0,c:0,gm:0,nc:0}};
   for(const it of ITEMS){
-    if(catFilter&&it.category!==catFilter) continue;
+    if(catFilter&&catFilter!==ALL_CAT&&it.category!==catFilter) continue;
     const g=gradeKey(it), o=ordTotal(it), p=it.avg_price||0;
     acc[g].q+=it.cs+o; acc[g].n++; acc[g].m+=(it.cs+o)*p; acc[g].o+=o;
+    // Позиции без себестоимости считаем отдельным счётчиком, а не нулём:
+    // иначе «в этом сегменте заморожено N ₽» было бы занижено молча.
+    if(it.no_cost) acc[g].nc++;
+    else { acc[g].c+=(it.cs+o)*it.cost_price; acc[g].gm+=(it.cs+o)*(p-it.cost_price); }
   }
   return acc;
+}
+/* Строка «с/с и маржа» под крупной суммой карточки сегмента. */
+function costLine(a){
+  if(a.nc && !a.c) return '<div class="cost">с/с не указана ('+a.nc+' '+plural(a.nc,"позиция","позиции","позиций")+')</div>';
+  const pct = (a.c+a.gm)>0 ? Math.round(a.gm/(a.c+a.gm)*100)+"%" : "—";
+  return '<div class="cost">с/с '+fmtMoney(a.c)+' · маржа '+fmtMoney(a.gm)+' ('+pct+')'+
+    (a.nc?' · без с/с: '+a.nc:'')+'</div>';
+}
+/* Подпись над карточками сегментов: что именно в них посчитано.
+   Карточки считают сток ВМЕСТЕ с товаром в пути, а «Если продать остаток» в
+   полосе выше и «Сток сейчас» на «Прогнозе» — только склад. Пока в пути ноль,
+   числа совпадают; как только появляется заказ, они расходятся — и человек
+   должен видеть, на сколько именно, а не гадать, какое из них правильное. */
+function renderSegBasis(){
+  const inc=incomingTotals();
+  const el=document.getElementById("seg-basis");
+  if(!el) return;
+  el.textContent="Карточки сегментов считают остаток вместе с товаром в пути: крупная сумма — "+
+    "(остаток + едет к нам) × средняя цена продажи с учётом скидок, строкой ниже те же штуки по "+
+    "себестоимости и маржа между ними."+
+    (inc.units? " Сейчас едет "+fmt(inc.units)+" шт на "+fmtMoney(inc.sale)+
+      " — ровно на столько сумма карточек больше, чем «Если продать остаток» в полосе выше." : "");
 }
 function renderSummary(){
   const acc=sumByGrade(null);
   for(const k of ["best","good","mid","bad"]){
-    document.getElementById("v-"+k).textContent=fmt(acc[k].q)+" шт";
-    document.getElementById("m-"+k).textContent="≈ "+fmtMoney(acc[k].m);
-    document.getElementById("s-"+k).textContent=acc[k].n+" моделей"+(acc[k].o?" · в заказе "+fmt(acc[k].o)+" шт":"");
+    const a=acc[k];
+    document.getElementById("v-"+k).textContent=fmt(a.q)+" шт";
+    document.getElementById("v-"+k).title=a.o
+      ? "Остаток на складах "+fmt(a.q-a.o)+" шт + едет к нам "+fmt(a.o)+" шт"
+      : "Остаток на складах, товара в пути по этому сегменту нет";
+    document.getElementById("m-"+k).textContent="≈ "+fmtMoney(a.m);
+    document.getElementById("c-"+k).innerHTML=costLine(a);
+    document.getElementById("s-"+k).textContent=a.n+" моделей"+(a.o?" · из них едет к нам "+fmt(a.o)+" шт":"");
   }
+  renderSegBasis();
+  renderMoneyStrip();
+}
+
+/* ── Полоса «деньги»: сколько заморожено по себестоимости ──
+   Суммы посчитаны по тем же штукам, что и карточки сегментов (остаток + едет),
+   поэтому четыре карточки складываются ровно в эту полосу. */
+function incomingTotals(){
+  // Считаем «едет» здесь же, из ITEMS: графу «Заказано» правят прямо на
+  // странице без перезагрузки, и серверное число сразу устарело бы —
+  // карточки сегментов и полоса разошлись бы на глазах у пользователя.
+  // sale — те же штуки по средней цене продажи: ровно на эту сумму карточки
+  // сегментов больше, чем «Если продать остаток», и подпись это называет.
+  let units=0, cost=0, sale=0;
+  for(const it of ITEMS){
+    const o=ordTotal(it);
+    units+=o;
+    sale+=o*(it.avg_price||0);
+    if(!it.no_cost) cost+=o*it.cost_price;
+  }
+  return {units:units, cost:Math.round(cost), sale:Math.round(sale)};
+}
+function renderMoneyStrip(){
+  if(!MONEY) return;
+  const m=MONEY, inc=incomingTotals();
+  const pct = v => (v===null||v===undefined) ? "—" : Math.round(v*100)+"%";
+  const nocost = m.no_cost_positions
+    ? '<div class="sub" style="color:#a00003">'+m.no_cost_positions+' '+plural(m.no_cost_positions,"позиция","позиции","позиций")+' без себестоимости ('+fmtMoney(m.no_cost_retail)+' по рознице) — в эти суммы не входят</div>'
+    : '';
+  document.getElementById("money-strip").innerHTML =
+    '<div class="ms-card"><div class="lbl">Заморожено в товаре</div><div class="val">'+fmtMoney(m.stock_cost)+'</div>'+
+      '<div class="sub">'+m.stock_cost_basis+' · '+fmt(m.stock_units)+' шт на складах. Это ваши деньги, а не будущая выручка.</div>'+nocost+'</div>'+
+    '<div class="ms-card"><div class="lbl">Едет к нам</div><div class="val">'+fmtMoney(inc.cost)+'</div>'+
+      '<div class="sub">'+m.stock_cost_basis+' · '+fmt(inc.units)+' шт в заказах на производстве. Эти деньги вы уже потратите.</div></div>'+
+    '<div class="ms-card"><div class="lbl">Если продать остаток</div><div class="val">'+fmtMoney(m.stock_sale)+'</div>'+
+      '<div class="sub">'+m.stock_sale_basis+'. По прайсу без скидок — '+fmtMoney(m.stock_retail)+'.</div></div>'+
+    '<div class="ms-card accent"><div class="lbl">Маржа в остатке</div><div class="val">'+fmtMoney(m.stock_margin)+'</div>'+
+      '<div class="sub">'+pct(m.stock_margin_pct)+' от цены продажи. За год валовая маржа '+fmtMoney(m.gross_margin)+' ('+pct(m.gross_margin_pct)+' от выручки).</div></div>';
+  const box=document.getElementById("loss-line");
+  if(BELOW && BELOW.positions){
+    box.style.display="";
+    box.innerHTML='⚠ Торгуете в минус: '+BELOW.positions+' '+plural(BELOW.positions,"позиция продаётся","позиции продаются","позиций продаются")+
+      ' дешевле себестоимости — за год потеряно ≈ '+fmtMoney(BELOW.loss_total)+
+      ', в остатке ещё на '+fmtMoney(BELOW.loss_stock)+'. Строки помечены «в минус»; разбор — на странице <a href="/turnover">Оборачиваемость</a>.';
+  } else box.style.display="none";
 }
 function renderSummaryCat(){
+  // На вкладке «Все категории» эти карточки повторяли бы верхние — не рисуем.
+  if(currentCat===ALL_CAT){
+    document.getElementById("cat-sum-title").textContent="";
+    document.getElementById("summary-cat").innerHTML="";
+    return;
+  }
   const acc=sumByGrade(currentCat);
   document.getElementById("cat-sum-title").textContent="Категория · "+(currentCat||"—");
   const defs=[["best","Бестселлеры","sc-best"],["good","Хорошие","sc-good"],["mid","Медленные","sc-mid"],["bad","Слабые","sc-bad"]];
   document.getElementById("summary-cat").innerHTML=defs.map(x=>{
     const a=acc[x[0]];
-    return '<div class="sum-card '+x[2]+'"><div class="lbl">'+x[1]+'</div><div class="val">'+fmt(a.q)+' шт</div>'+
-      '<div class="money">≈ '+fmtMoney(a.m)+'</div><div class="sub">'+a.n+' моделей'+(a.o?' · в заказе '+fmt(a.o)+' шт':'')+'</div></div>';
+    return '<div class="sum-card '+x[2]+'"><div class="lbl">'+x[1]+'</div><div class="val" title="'+
+      (a.o?'Остаток на складах '+fmt(a.q-a.o)+' шт + едет к нам '+fmt(a.o)+' шт':'Остаток на складах, товара в пути по этой категории нет')+
+      '">'+fmt(a.q)+' шт</div>'+
+      '<div class="money" title="(Остаток + едет к нам) × средняя цена продажи с учётом скидок — не себестоимость и не розничный прайс. Товар в пути входит и в штуки, и в сумму">≈ '+fmtMoney(a.m)+'</div>'+
+      costLine(a)+'<div class="sub">'+a.n+' моделей'+(a.o?' · из них едет к нам '+fmt(a.o)+' шт':'')+'</div></div>';
   }).join("");
 }
+
+/* ── Сортировка колонок ──
+   Значение берём из данных, а не из текста ячейки: там пробелы между
+   разрядами, «₽», проценты и «нет с/с» — обратно в число это не разобрать.
+   dir — направление ПЕРВОГО клика: −1 «сначала большие» для штук и денег,
+   1 «сначала маленькие» для стока на 90 дней (ищут то, где дефицит).
+   Колонки складов приходят из МойСклада, поэтому таблицу строим после
+   загрузки — и ключ у них по имени склада, а не по номеру: если склад
+   пропал, сохранённая сортировка просто отменится, а не съедет на соседний. */
+let COLS = {};
+let SORT = null;   // {k:"zat", d:1}
+function buildCols(){
+  COLS = { name:{ttl:"названию", txt:true, get:it=>it.base_name, dir:1} };
+  WHS.forEach((w,i)=>{
+    COLS["wh:"+w.name]={ttl:"остатку на складе «"+w.name+"»", get:it=>(it.per_wh||[])[i]||0, dir:-1};
+  });
+  COLS.cost  ={ttl:"себестоимости",     get:it=>it.no_cost?null:it.cost_price,  dir:-1};
+  COLS.margin={ttl:"марже",             get:it=>it.no_cost?null:it.margin_unit, dir:-1};
+  COLS.zat   ={ttl:"стоку на 90 дней",  get:it=>it.zat,   dir: 1};
+  COLS.defq  ={ttl:"нехватке до нормы", get:it=>it.defq,  dir:-1};
+  COLS.ord   ={ttl:"заказанному",       get:it=>ordTotal(it), dir:-1};
+  if(SORT && !COLS[SORT.k]) SORT=null;
+}
+/* Пустые значения и «нет данных» всегда внизу — в обе стороны. */
+function sortRows(arr){
+  if(!SORT || !COLS[SORT.k]) return arr;
+  const c=COLS[SORT.k], d=SORT.d;
+  return arr.slice().sort((x,y)=>{
+    const a=c.get(x), b=c.get(y);
+    const ea=(a===null||a===undefined||a===""), eb=(b===null||b===undefined||b==="");
+    if(ea&&eb) return 0;
+    if(ea) return 1;
+    if(eb) return -1;
+    if(c.txt) return d*String(a).localeCompare(String(b),"ru");
+    return d*((a>b)-(a<b));
+  });
+}
+function sortLabel(){
+  if(!SORT||!COLS[SORT.k]) return "оборачиваемости";
+  const c=COLS[SORT.k];
+  return c.ttl+(c.txt ? (SORT.d>0?", от А до Я":", от Я до А")
+                      : (SORT.d>0?", сначала маленькие":", сначала большие"));
+}
+function paintSort(){
+  document.querySelectorAll("thead th[data-sk]").forEach(th=>{
+    const on = !!(SORT && SORT.k===th.getAttribute("data-sk"));
+    th.classList.toggle("sorted",on);
+    th.setAttribute("aria-sort", on?(SORT.d>0?"ascending":"descending"):"none");
+    const a=th.querySelector(".sarr");
+    if(a) a.textContent = on?(SORT.d>0?"▲":"▼"):"▾";
+  });
+}
+function sortBy(k){
+  if(!COLS[k]) return;
+  SORT = (SORT&&SORT.k===k) ? {k:k,d:-SORT.d} : {k:k,d:COLS[k].dir};
+  paintSort(); saveView(); render();
+}
+function setupSort(){
+  document.querySelectorAll("thead th[data-sk]").forEach(th=>{
+    th.tabIndex=0;
+    const c=COLS[th.getAttribute("data-sk")];
+    if(c) th.title=(th.title?th.title+". ":"")+"Клик — сортировка по "+c.ttl+", второй клик меняет направление";
+    // Стрелку ставим в конец ПЕРВОЙ строки подписи: вторая строка (.sub) —
+    // блочная, и стрелка, дописанная в конец ячейки, уехала бы на третью.
+    const anchor = th.querySelector("br, .sub");
+    if(anchor) anchor.insertAdjacentHTML("beforebegin",'<span class="sarr">▾</span>');
+    else th.insertAdjacentHTML("beforeend",'<span class="sarr">▾</span>');
+    th.addEventListener("click",()=>sortBy(th.getAttribute("data-sk")));
+    th.addEventListener("keydown",e=>{
+      if(e.key==="Enter"||e.key===" "||e.key==="Spacebar"){ e.preventDefault(); sortBy(th.getAttribute("data-sk")); }
+    });
+  });
+  paintSort();
+}
+
+/* ── Память вида: категория, поиск, сортировка ──
+   Ключ привязан к паре «пользователь + организация»: за одним браузером
+   работают разные люди и разные аккаунты, и показывать чужой вид нельзя.
+   Почту в ключ кладём не как есть, а её отпечатком. */
+function vhash(s){ let h=5381; for(let i=0;i<s.length;i++) h=((h*33)^s.charCodeAt(i))>>>0; return h.toString(36); }
+const VIEW_KEY = "oborot.view.stocks."+vhash({{ user.email|tojson }}+"|"+{{ org.name|tojson }});
+function loadView(){
+  // localStorage может быть недоступен (приватный режим, запрет на сайт) —
+  // это не повод ронять страницу: просто покажем вид по умолчанию.
+  try{ return JSON.parse(localStorage.getItem(VIEW_KEY)||"{}")||{}; }catch(e){ return {}; }
+}
+function saveView(){
+  try{
+    localStorage.setItem(VIEW_KEY, JSON.stringify({
+      cat: currentCat, q: document.getElementById("search").value||"", sort: SORT,
+    }));
+  }catch(e){ /* нет места или запрещено — работаем без памяти */ }
+  paintReset();
+}
+function applyView(){
+  const v=loadView();
+  // Категории могли поменяться после синка: сохранённой может уже не быть —
+  // buildTabs() в этом случае сам вернётся на первую вкладку.
+  if(v.cat) currentCat=v.cat;
+  if(typeof v.q==="string") document.getElementById("search").value=v.q;
+  if(v.sort && (v.sort.d===1||v.sort.d===-1)) SORT={k:v.sort.k,d:v.sort.d};  // ключ проверит buildCols()
+}
+/* Видно ли, что таблица показана не в исходном виде, и как это отменить. */
+function paintReset(){
+  const b=document.getElementById("resetView"), parts=[], full=[];
+  const q=document.getElementById("search").value||"";
+  if(ALLCATS.length&&currentCat&&currentCat!==ALLCATS[0]){ parts.push("категория");
+    full.push(currentCat===ALL_CAT?"показаны все категории сразу":"выбрана категория «"+currentCat+"»"); }
+  if(q){ parts.push("поиск"); full.push("включён поиск «"+q+"»"); }
+  if(SORT&&COLS[SORT.k]){ parts.push("сортировка"); full.push("сортировка по "+sortLabel()); }
+  if(!parts.length){ b.style.display="none"; return; }
+  b.style.display="";
+  b.textContent="↺ Сбросить вид · "+parts.join(", ");
+  b.title="Таблица показана не в исходном виде: "+full.join(", ")+". Нажмите, чтобы вернуть всё как было.";
+}
+function resetView(){
+  SORT=null; currentCat=ALLCATS[0]||null;
+  document.getElementById("search").value="";
+  paintSort(); buildTabs(); renderSummaryCat(); saveView(); render();
+}
+document.getElementById("resetView").addEventListener("click", resetView);
 
 function buildTabs(){
   const cnt={}, warns={};
   for(const it of ITEMS){ cnt[it.category]=(cnt[it.category]||0)+1; if(it.row_alert) warns[it.category]=true; }
   ALLCATS=Object.keys(cnt).sort((a,b)=>cnt[b]-cnt[a]);
-  if(currentCat===null||!cnt[currentCat]) currentCat=ALLCATS[0]||null;
-  document.getElementById("cat-bar").innerHTML=ALLCATS.map(c=>
+  // Вкладка «Все категории» нужна, когда категорий больше одной: на пустом
+  // аккаунте и на аккаунте с одной категорией она дублировала бы единственную.
+  const multi = ALLCATS.length>1;
+  if(!multi && currentCat===ALL_CAT) currentCat=ALLCATS[0]||null;
+  if(currentCat!==ALL_CAT && (currentCat===null||!cnt[currentCat])) currentCat=ALLCATS[0]||null;
+  const total=ALLCATS.reduce((n,c)=>n+cnt[c],0);
+  document.getElementById("cat-bar").innerHTML=
+    (multi ? '<button class="cat-btn '+(currentCat===ALL_CAT?"active":"")+'" data-all="1" '+
+      'title="Показать весь ассортимент одним списком — например, чтобы отсортировать по остатку сразу по всем категориям">'+
+      'Все категории<span class="cnt">'+total+'</span></button>' : '') +
+    ALLCATS.map(c=>
     '<button class="cat-btn '+(c===currentCat?"active":"")+'" data-cat="'+esc(c)+'">'+esc(c)+
     '<span class="cnt">'+cnt[c]+'</span>'+(warns[c]?'<span class="warn-mark" title="В категории есть размеры, которые кончились на одном из складов">!</span>':'')+'</button>').join("");
   document.querySelectorAll("#cat-bar .cat-btn").forEach(b=>b.addEventListener("click",()=>{
-    currentCat=b.getAttribute("data-cat"); buildTabs(); renderSummaryCat(); render();
+    currentCat=b.hasAttribute("data-all")?ALL_CAT:b.getAttribute("data-cat");
+    buildTabs(); renderSummaryCat(); saveView(); render();
   }));
 }
 
 function renderHead(){
-  let cols='<th title="Клик по строке раскрывает размеры. «!» — на одном из складов позиции нет">Название</th>';
-  for(const w of WHS) cols+='<th title="Остаток на складе «'+esc(w.name)+'»">'+esc(w.name)+'<span class="sub">шт</span></th>';
-  cols+='<th title="Запас в процентах от 90-дневной потребности по темпу продаж: ~100% идеально, больше — затоварка">Сток на 90 дн<span class="sub">запас</span></th>'+
-    '<th title="Сколько штук не хватает до нормы 90 дней">Недостаток<span class="sub">шт на 90 дн</span></th>'+
-    '<th title="Впишите, сколько штук заказано на производстве. Число уходит в «едет к нам»: уменьшает рекомендации Заказа и Бюджета, учитывается Прогнозом. Заказы, отправленные в МойСклад, подтягиваются сами (пометка «+N из МС»)">Заказано<span class="sub">влияет на Заказ и Прогноз</span></th>';
+  buildCols();
+  let cols='<th data-sk="name" title="Клик по строке раскрывает размеры. «!» — на одном из складов позиции нет">Название</th>';
+  for(const w of WHS) cols+='<th data-sk="wh:'+esc(w.name)+'" title="Остаток на складе «'+esc(w.name)+'»">'+esc(w.name)+'<span class="sub">шт</span></th>';
+  cols+='<th data-sk="cost" title="Закупочная цена из МойСклада за штуку; ниже — во сколько обошёлся весь текущий остаток. «нет с/с» — себестоимость в МойСкладе не заполнена, ноль вместо неё не рисуем">Себестоимость<span class="sub">₽/шт и остаток</span></th>'+
+    '<th data-sk="margin" title="Валовая маржа: средняя цена продажи минус себестоимость, за штуку и в процентах от цены. Красная — позиция продаётся дешевле, чем обошлась">Маржа<span class="sub">₽/шт и %</span></th>'+
+    '<th data-sk="zat" title="Запас в процентах от 90-дневной потребности по темпу продаж: ~100% идеально, больше — затоварка">Сток на 90 дн<span class="sub">запас</span></th>'+
+    '<th data-sk="defq" title="Сколько штук не хватает СЕГОДНЯ, чтобы дотянуть сток до нормы 90 дней. Не путать с колонкой «Заказать» на странице «Заказ» — там число больше, потому что учтён срок пошива">Не хватает<span class="sub">до нормы, шт</span></th>'+
+    '<th data-sk="ord" title="Впишите, сколько штук заказано на производстве. Число уходит в «едет к нам»: уменьшает рекомендации Заказа и Бюджета, учитывается Прогнозом. Заказы, отправленные в МойСклад, подтягиваются сами (пометка «+N из МС»)">Заказано<span class="sub">влияет на Заказ и Прогноз</span></th>';
   document.getElementById("thead").innerHTML='<tr>'+cols+'</tr>';
+  setupSort();
+}
+
+/* Две денежные ячейки строки: себестоимость и валовая маржа.
+   Себестоимости нет — пишем «нет с/с», а не ноль: ноль здесь был бы враньём. */
+function costCells(it){
+  if(it.no_cost){
+    return '<td><span class="mnone" title="Себестоимость не заполнена в карточке товара в МойСкладе">нет с/с</span></td>'+
+           '<td><span class="mnone">—</span></td>';
+  }
+  const pct = (it.margin_pct===null||it.margin_pct===undefined) ? "" : Math.round(it.margin_pct*100)+"%";
+  const neg = it.margin_unit<0;
+  return '<td><span class="qty'+(neg?" mneg":"")+'">'+fmt(it.cost_price)+' ₽</span>'+
+      '<span class="msub2">остаток '+fmtMoney(it.stock_cost)+'</span></td>'+
+    '<td><span class="qty'+(neg?" mneg":"")+'">'+fmt(it.margin_unit)+' ₽</span>'+
+      (pct?'<span class="msub2">'+pct+' от цены</span>':'')+'</td>';
 }
 
 function rowHtml(it){
   const [zc,zl,zt]=zatStyle(it.zat);
   let name='<span class="ei">▶</span>'+esc(it.base_name);
   if(it.group==="low_data") name+='<span class="lowtag" title="Мало статистики — темп и недостаток оценочные">мало данных</span>';
+  if(it.below_cost) name+='<span class="losstag" title="Средняя цена продажи ниже себестоимости — каждая проданная штука приносит убыток">в минус</span>';
   if(it.row_alert) name+='<span class="alert" title="Какой-то размер есть на одном складе и кончился на другом">!</span>';
   let cells='<td>'+name+'</td>';
   for(let i=0;i<WHS.length;i++){
     const v=(it.per_wh||[])[i]||0;
     cells+='<td><span class="qty '+(v?"":"zero")+'">'+fmt(v)+'</span></td>';
   }
+  cells+=costCells(it);
   cells+='<td><div class="zbar"><div class="zfill" style="width:'+Math.min(it.zat||0,100)+'%;background:'+zc+'"></div><div class="ztxt" style="color:'+zt+'">'+zl+'</div></div></td>';
   cells+='<td><span class="defnum">'+it.defq+'</span></td>';
   const ov=it.ordered_manual||0, ms=it.ordered_ms||0;
   cells+='<td><input class="ordin'+(ov>0?' has':'')+'" type="number" min="0" step="1" value="'+(ov||0)+'" data-base="'+esc(it.base_name)+'" onclick="event.stopPropagation()">'+
     (ms?'<span class="msq" title="Едет по документам «Заказ поставщику» в МойСкладе — уменьшается по мере приёмок, вручную не дублируйте">+ '+fmt(ms)+' из МС</span>':'')+'</td>';
-  return '<tr class="pr '+rowCls(it)+'" data-base="'+esc(it.base_name)+'">'+cells+'</tr>';
+  return '<tr class="pr '+rowCls(it)+(OPEN.has(it.base_name)?" open":"")+'" data-base="'+esc(it.base_name)+'">'+cells+'</tr>';
 }
 
 function sizeRowsHtml(it){
   if(!(it.sizes||[]).length) return '';
-  const ncols=WHS.length+4;
   return it.sizes.map(sz=>{
     let label=esc(sz.size||"без размера");
     if(sz.total===0){
@@ -275,10 +595,10 @@ function sizeRowsHtml(it){
         cells+='<td><span class="qty zero'+(elsewhere?' zero-cell':'')+'">0'+(elsewhere?'<span class="alert">!</span>':'')+'</span></td>';
       } else cells+='<td><span class="qty">'+fmt(v)+'</span></td>';
     }
-    cells+='<td></td><td></td><td></td>';
+    cells+='<td></td><td></td><td></td><td></td><td></td>';
     return '<tr class="sr">'+cells+'</tr>';
   }).join("")+
-  '<tr class="sr"><td colspan="'+ncols+'" style="font-style:normal;">Категория: '+
+  '<tr class="sr"><td colspan="'+ncols()+'" style="font-style:normal;">Категория: '+
     '<select class="catsel" data-base="'+esc(it.base_name)+'">'+
     ALLCATS.map(c=>'<option'+(c===it.category?' selected':'')+'>'+esc(c)+'</option>').join("")+
     '<option value="__new__">другая…</option></select>'+
@@ -288,21 +608,26 @@ function sizeRowsHtml(it){
 function render(){
   const q=(document.getElementById("search").value||"").toLowerCase();
   const tb=document.getElementById("tb");
-  const items=ITEMS.filter(it=>q?mw(it.base_name,q):it.category===currentCat);
-  const ncols=WHS.length+4;
-  if(!items.length){ tb.innerHTML='<tr><td colspan="'+ncols+'" class="loading">Нет данных</td></tr>'; return; }
+  const items=ITEMS.filter(it=>q?mw(it.base_name,q):(currentCat===ALL_CAT||it.category===currentCat));
+  if(!items.length){ tb.innerHTML='<tr><td colspan="'+ncols()+'" class="loading">Нет данных</td></tr>';
+    document.getElementById("note").textContent=""; return; }
+  // Позиции без продаж остаются в конце при любой сортировке — это отдельный
+  // блок таблицы, а не просто «строки с маленькими числами».
   const withS=items.filter(it=>it.group!=="no_sales"), noS=items.filter(it=>it.group==="no_sales");
-  tb.innerHTML=[...withS,...noS].map(rowHtml).join("");
-  document.getElementById("note").textContent=items.length+" позиций · клик по строке раскрывает размеры · сортировка по оборачиваемости";
+  tb.innerHTML=[...sortRows(withS),...sortRows(noS)]
+    .map(it=>rowHtml(it)+(OPEN.has(it.base_name)?sizeRowsHtml(it):"")).join("");
+  document.getElementById("note").textContent=items.length+" позиций · клик по строке раскрывает размеры · сортировка по "+sortLabel();
   document.querySelectorAll("tr.pr").forEach(tr=>{
     tr.addEventListener("click",()=>{
       const base=tr.getAttribute("data-base");
       if(tr.classList.contains("open")){
+        OPEN.delete(base);
         tr.classList.remove("open");
         let n=tr.nextSibling;
         while(n&&n.classList&&n.classList.contains("sr")){ const x=n; n=n.nextSibling; x.remove(); }
         return;
       }
+      OPEN.add(base);
       tr.classList.add("open");
       const it=ITEMS.find(x=>x.base_name===base);
       tr.insertAdjacentHTML("afterend", sizeRowsHtml(it));
@@ -352,7 +677,7 @@ document.addEventListener("change", async e=>{
     }catch(err){ alert("Не сохранилось: "+err.message); }
   }
 });
-document.getElementById("search").addEventListener("input",render);
+document.getElementById("search").addEventListener("input",()=>{ saveView(); render(); });
 
 async function load(){
   const [d, cats] = await Promise.all([
@@ -360,9 +685,12 @@ async function load(){
     api("/api/categories").catch(()=>({overrides:{},merges:{}})),
   ]);
   DATA=d; ITEMS=d.items||[]; WHS=d.warehouses||[]; MERGES=(cats&&cats.merges)||{};
+  MONEY=d.money||null; BELOW=d.below_cost||null;
   buildTabs(); renderSummary(); renderSummaryCat(); renderHead(); render(); renderMerges();
+  paintReset();
 }
-load().catch(e=>{ document.getElementById("tb").innerHTML='<tr><td colspan="7" class="loading">Ошибка загрузки: '+e.message+'</td></tr>'; });
+applyView();
+load().catch(e=>{ document.getElementById("tb").innerHTML='<tr><td colspan="'+ncols()+'" class="loading">Ошибка загрузки: '+e.message+'</td></tr>'; });
 </script>
 {% include "_hints.html" %}
 </body>
