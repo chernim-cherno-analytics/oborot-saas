@@ -1519,6 +1519,9 @@ def _plan(db: Session, ctx: AuthContext, body: OrderPlanIn) -> dict:
     # владельца D-25) формально не различались даже там, где всё в порядке.
     for it in plan.get("items") or []:
         it.setdefault("qty_recommended", it.get("qty"))
+    # Ключ есть всегда, а не только после ручных правок: потребитель не должен
+    # гадать, «нет позиций без себестоимости» это или «поле не посчитали».
+    plan["budget_incomplete"] = None
     if body.overrides:
         _apply_overrides(plan, body.overrides, snap)
     plan["record"] = _decision_record(db, ctx, snap)
@@ -1544,29 +1547,109 @@ def _decision_record(db: Session, ctx: AuthContext, snap: dict) -> dict:
     Всё компактное: несколько чисел, не снимок базы. Сырые продажи и остатки
     восстанавливаются из самих таблиц по дате создания плана.
     """
-    from app import order_planner, version
-    from app.models import SyncState
+    from app import version
 
     settings = dict(snap.get("settings") or {})
-    raw_items = snap.get("items") or {}
-    items = list(raw_items.values()) if isinstance(raw_items, dict) else list(raw_items)
     keys = ("rate_window", "cover_mode", "horizon_days", "horizon_days_setting",
             "order_cadence_days", "safety_days", "lead_time_days", "min_stock_days",
             "overhead_pct", "reserve_new_pct", "moq_units", "thresholds")
-    st = db.get(SyncState, ctx.org.id)
     return {
         "algo": version.algo_version(),
         "settings": {k: settings.get(k) for k in keys if k in settings},
-        "data_quality": {
-            "coverage_days": order_planner.coverage_days(snap),
-            "positions_total": len(items),
-            # Себестоимость — вход, без которого позиция вообще не попадает
-            # в заказ. Доля незаполненных объясняет план лучше любой оценки.
-            "positions_no_cost": sum(1 for it in items if it.get("no_cost")),
-            "last_sync_at": (st.finished_at.isoformat()
-                             if st is not None and st.finished_at else None),
-            "sync_state": (st.state if st is not None else None),
-        },
+        "data_quality": _data_quality(db, ctx, snap),
+    }
+
+
+def _data_quality(db: Session, ctx: AuthContext, snap: dict) -> dict:
+    """Факты о данных, на которых посчитан план. Одни и те же на экране и в истории.
+
+    Решение владельца D-23: если данных не хватает, система не придумывает
+    число, а говорит, ЧЕГО не хватает. Значит и «всё в порядке» надо говорить
+    теми же категориями фактов, а не одной обобщающей оценкой.
+    """
+    from app import order_planner
+    from app.models import SyncState
+
+    raw_items = snap.get("items") or {}
+    items = list(raw_items.values()) if isinstance(raw_items, dict) else list(raw_items)
+    st = db.get(SyncState, ctx.org.id)
+    return {
+        "coverage_days": order_planner.coverage_days(snap),
+        # Дата, с которой вообще есть история остатков. Число дней без даты
+        # человеку ничего не говорит: «400 дней» и «с 19 июля прошлого года» —
+        # одно и то же, но проверить можно только второе.
+        "coverage_start": snap.get("coverage_start"),
+        "positions_total": len(items),
+        # Полная себестоимость (из выбранного типа цены МС) против закупочной:
+        # в закупочной у многих брендов нет ткани, и заказ выходит дешевле,
+        # чем на самом деле.
+        "positions_cost_full": sum(1 for it in items if it.get("cost_is_full")),
+        # Себестоимость — вход, без которого позиция вообще не попадает
+        # в заказ. Доля незаполненных объясняет план лучше любой оценки.
+        "positions_no_cost": sum(1 for it in items if it.get("no_cost")),
+        "last_sync_at": (st.finished_at.isoformat()
+                         if st is not None and st.finished_at else None),
+        "sync_state": (st.state if st is not None else None),
+    }
+
+
+def _manual_item(base: str, qty: int, snap: dict, plan: dict) -> dict | None:
+    """Строка заказа, добавленная человеком вручную (D-23).
+
+    Отличается от строк плана одним принципиальным полем: `qty_recommended`
+    здесь **None**. Система эту позицию не рекомендовала — она вообще не
+    смогла её посчитать, — и выдавать решение человека за свою рекомендацию
+    нельзя: именно на этом различии держится вся будущая оценка качества
+    рекомендаций (D-25).
+
+    Возвращает None, если позиции нет в каталоге организации, она в архиве
+    или скрыта. Проверка по снапшоту, а не по присланному имени: снапшот
+    построен по org_id, и это единственное место, где ручное добавление
+    могло бы стать дырой в изоляции арендаторов.
+    """
+    src = (snap.get("items") or {}).get(base)
+    if not src or src.get("archived") or src.get("hidden"):
+        return None
+    cost = float(src.get("cost_price") or 0)
+    price = float(src.get("avg_price") or src.get("sale_price") or 0)
+    margin = max(0.0, price - cost) if cost > 0 else 0.0
+    stages = plan.get("stages") or []
+    pay_share = stages[0].get("cost_share", 1.0) * stages[0].get("prepay_share", 1.0) \
+        if stages else 1.0
+    return {
+        "base_name": base,
+        "category": src.get("category") or "Без категории",
+        "cls": src.get("cls"),
+        "turnover": round(float(src.get("turnover") or 0)),
+        "rate": float(src.get("rate_active") or src.get("rate") or 0),
+        "cs": int(src.get("cs") or 0),
+        "ordered": int(float(src.get("ordered") or 0)),
+        "proj_stock": float(src.get("cs") or 0),
+        "gap_days": None,
+        # Потребности система не считала — ставим 0, а не выдуманное число.
+        # Из этого следует, что вся партия числится «сверх потребности», и
+        # прибыль по ней НЕ обещается: обещать её было бы ровно тем враньём,
+        # против которого написано правило «маржа только по спросу».
+        "need": 0,
+        "qty": qty,
+        "qty_recommended": None,
+        "unmet": 0,
+        "sizes": analytics.size_split(src.get("sizes") or {}, qty),
+        "cost_price": round(cost),
+        "avg_price": round(price),
+        "cost_total": round(qty * cost),
+        "pay_now": round(qty * cost * pay_share),
+        "expected_profit": 0,
+        "over_need_profit": round(qty * margin),
+        "over_need": qty,
+        "days_to_sell": None,
+        "no_supplier": False,
+        "no_cost": cost <= 0,
+        "runs_out": None,
+        "covered_until": None,
+        "why": ["manual_add"],
+        "why_text": ("добавлено вручную; себестоимость не заполнена"
+                     if cost <= 0 else "добавлено вручную"),
     }
 
 
@@ -1588,6 +1671,24 @@ def _apply_overrides(plan: dict, overrides: dict, snap: dict) -> None:
             continue
         it = items.get(base)
         if it is None:
+            # Позиции нет в плане, а человек назвал количество. Решение
+            # владельца (D-23, дополнение 22.08): отказ системы считать —
+            # это не запрет человеку действовать. Классический случай —
+            # позиция без себестоимости: экономику по ней «Оборот» посчитать
+            # не может и рекомендацию не даёт, но заказать её владелец вправе.
+            #
+            # Добавляем ТОЛЬКО то, что реально есть в каталоге этой
+            # организации (snap["items"] уже отфильтрован по org_id) — иначе
+            # через тело запроса можно было бы вписать в заказ что угодно,
+            # включая чужое название.
+            if qty <= 0:
+                continue
+            it = _manual_item(base, qty, snap, plan)
+            if it is None:
+                continue
+            plan["items"].append(it)
+            items[base] = it
+            plan["manual_edit"] = True
             continue
         # Рекомендация системы сохраняется рядом с правкой, а не затирается ею.
         # Без этого исчезает единственный сигнал, ради которого записи решений
@@ -1627,6 +1728,17 @@ def _apply_overrides(plan: dict, overrides: dict, snap: dict) -> None:
         plan["zeroed"] = zeroed
     plan["items"] = [i for i in plan["items"] if i["qty"] > 0]
     plan["cost_total"] = sum(i["cost_total"] for i in plan["items"])
+    # Нельзя молча показывать общий бюджет как полный, если в заказе есть
+    # позиции без себестоимости (решение владельца D-23). Их стоимость равна
+    # нулю не потому, что они бесплатны, а потому что цифры нет — и об этом
+    # обязана говорить сама выдача, а не только подсказка на экране.
+    no_cost_rows = [i for i in plan["items"]
+                    if i.get("no_cost") or float(i.get("cost_price") or 0) <= 0]
+    plan["budget_incomplete"] = ({
+        "positions": len(no_cost_rows),
+        "units": sum(int(i["qty"]) for i in no_cost_rows),
+        "names": [i["base_name"] for i in no_cost_rows[:10]],
+    } if no_cost_rows else None)
     # Календарь платежей пересобираем от новой себестоимости, «сейчас» —
     # снова первый транш календаря, а не отдельная формула.
     stages = plan.get("stages") or []
@@ -1708,6 +1820,12 @@ def api_order_plan_options(
         # иначе человек крутит ручку, а число не меняется.
         "horizon_source": settings.get("cover_mode", "cadence"),
         "horizon_days_effective": settings.get("cover_days"),
+        # D-23: чек-лист «что известно о данных этого расчёта». Ровно те же
+        # факты, что уходят в запись решения (_decision_record.data_quality) —
+        # чтобы на экране и в истории стояло одно и то же. Никаких процентов
+        # уверенности и букв HIGH/MEDIUM/LOW: буква читается как вероятность и
+        # прячет, ЧЕГО именно не хватает.
+        "data_quality": _data_quality(db, ctx, snap),
     }
 
 
@@ -1754,6 +1872,9 @@ def api_order_plan_save(
              # Позиции, которые человек обнулил вручную, вместе с тем, что
              # по ним рекомендовала система (см. _apply_overrides).
              "zeroed": plan.get("zeroed") or [],
+             # Заказ содержит позиции без себестоимости — значит сумма заказа
+             # неполна, и в истории это должно быть видно так же, как на экране.
+             "budget_incomplete": plan.get("budget_incomplete"),
              # ОТКАЗ — ТОЖЕ РЕШЕНИЕ. Раньше сохранялись только строки плана,
              # а «что не вошло и почему» считалось, показывалось на экране и
              # пропадало. Без этого в истории остаются одни лишь товары,

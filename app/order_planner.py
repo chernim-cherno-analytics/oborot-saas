@@ -1159,6 +1159,10 @@ def _short(row: dict) -> dict:
         "base_name": row["base_name"], "category": row["category"],
         "need": row["need"], "turnover": round(row["turnover"]),
         "cost_price": row["cost_price"],
+        # Остаток нужен на экране рядом с полем «сколько заказать вручную»
+        # (D-23): человек решает за систему, и без сегодняшнего остатка
+        # решать не из чего.
+        "cs": int(row.get("cs") or 0),
     }
 
 
