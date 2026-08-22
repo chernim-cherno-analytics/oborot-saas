@@ -435,6 +435,13 @@ class ProductionOrder(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     eta_date: Mapped[str | None] = mapped_column(String(10), nullable=True)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="draft")  # draft|sent|received
+    # Канал производства, на который ушёл заказ. Раньше связь жила только в
+    # тексте названия: при трёх подрядчиках плюс Китай список заказов через
+    # месяц превращался в кашу, а мастер не мог сказать «по этому каналу уже
+    # открыт заказ». 0 = канал не указан (старые заказы).
+    production_id: Mapped[int | None] = mapped_column(
+        ForeignKey("productions.id"), nullable=True
+    )
     items_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
     # items_json: [{base_name, qty, sizes: {size: qty}, cost}]
     # Обратная запись в МойСклад (аддитивно): href созданного документа

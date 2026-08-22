@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app import analytics, lessons, ms_writeback
+from app import analytics, lessons, ms_writeback, order_planner
 from app.auth import AuthContext, require_auth_api, require_owner_api
 from app.crypto import encrypt_token
 from app.db import get_db
@@ -91,7 +91,118 @@ def _order_out(order: ProductionOrder) -> dict:
         "positions": len(items),
         "total_qty": sum(int(i.get("qty") or 0) for i in items),
         "total_cost": round(sum(float(i.get("cost") or 0) * int(i.get("qty") or 0) for i in items)),
+        "production_id": order.production_id,
     }
+
+
+# ── Открытые заказы и календарь денег ────────────────────────────────────────
+# Аудит 22.08.2026: мастер считал заказ так, будто у организации нет других
+# обязательств. На практике «у меня есть 200 000» — это ДО того, как вспомнили
+# про два открытых заказа, по которым на следующей неделе платить остаток.
+# Поэтому: список открытых заказов по каналу (плашка в мастере) и сводный
+# календарь платежей ОРГАНИЗАЦИИ по неделям с накопительным сальдо.
+
+OPEN_STATUSES = ("draft", "sent")
+CASH_WEEKS = 16
+
+
+def _order_stages(db: Session, order: ProductionOrder, settings: dict) -> list[dict]:
+    """Этапы канала заказа (или один этап на общий срок производства)."""
+    raw = None
+    if order.production_id:
+        prod = db.get(Production, order.production_id)
+        if prod is not None:
+            raw = prod.stages
+    return order_planner.normalize_stages(raw, int(settings.get("lead_time_days") or 45))
+
+
+def _order_payments(db: Session, order: ProductionOrder, settings: dict) -> list[dict]:
+    """Календарь платежей по уже существующему заказу."""
+    cost = sum(float(i.get("cost") or 0) * int(i.get("qty") or 0) for i in order.items)
+    if cost <= 0:
+        return []
+    started = (order.created_at or datetime.utcnow()).date()
+    return order_planner.payment_plan(started, _order_stages(db, order, settings), cost)
+
+
+def _open_orders(db: Session, org_id: int) -> list[ProductionOrder]:
+    return db.execute(
+        select(ProductionOrder).where(
+            ProductionOrder.org_id == org_id,
+            ProductionOrder.status.in_(OPEN_STATUSES),
+        ).order_by(ProductionOrder.created_at.desc())
+    ).scalars().all()
+
+
+@router.get("/orders/open")
+def api_orders_open(
+    production_id: int | None = None,
+    ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db),
+):
+    """Что уже заказано и не закрыто — для плашки и колонки «Едет» в мастере.
+
+    production_id — фильтр по каналу; без него отдаём все открытые заказы.
+    by_base — сколько штук каждой модели уже лежит в открытых заказах: мастер
+    помечает такие строки, чтобы не заказать то же самое второй раз.
+    """
+    settings = analytics.extra_settings(ctx.org)
+    rows, out, by_base, total = _open_orders(db, ctx.org.id), [], {}, 0.0
+    for o in rows:
+        if production_id and (o.production_id or 0) != int(production_id):
+            continue
+        pays = _order_payments(db, o, settings)
+        left = sum(p["amount"] for p in pays if p["date"] >= date.today().isoformat())
+        total += left
+        for i in o.items:
+            base = str(i.get("base_name") or "")
+            if base:
+                by_base[base] = by_base.get(base, 0) + int(i.get("qty") or 0)
+        out.append({**_order_out(o), "payments": pays, "left_to_pay": round(left)})
+    return {"orders": out, "by_base": by_base, "left_to_pay": round(total),
+            "count": len(out), "today": date.today().isoformat()}
+
+
+def _week_start(d: date) -> date:
+    return d - timedelta(days=d.weekday())
+
+
+@router.get("/cash-calendar")
+def api_cash_calendar(
+    ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)
+):
+    """Платежи по всем открытым заказам организации, по неделям.
+
+    Текущий (ещё не созданный) заказ мастер добавляет в эту же сетку на клиенте —
+    поэтому здесь только то, что уже есть в базе.
+    """
+    settings = analytics.extra_settings(ctx.org)
+    today = date.today()
+    start = _week_start(today)
+    weeks = [{"start": (start + timedelta(days=7 * i)).isoformat(),
+              "end": (start + timedelta(days=7 * i + 6)).isoformat(),
+              "amount": 0, "items": []} for i in range(CASH_WEEKS)]
+    last = start + timedelta(days=7 * CASH_WEEKS - 1)
+    overdue = {"amount": 0, "items": []}
+    for o in _open_orders(db, ctx.org.id):
+        for p in _order_payments(db, o, settings):
+            d = date.fromisoformat(p["date"])
+            item = {"order_id": o.id, "name": o.name, "label": p["label"],
+                    "date": p["date"], "amount": p["amount"]}
+            if d < start:
+                overdue["amount"] += p["amount"]
+                overdue["items"].append(item)
+                continue
+            if d > last:
+                continue
+            w = weeks[(d - start).days // 7]
+            w["amount"] += p["amount"]
+            w["items"].append(item)
+    running = overdue["amount"]
+    for w in weeks:
+        running += w["amount"]
+        w["cumulative"] = running
+    return {"weeks": weeks, "overdue": overdue, "total": running,
+            "week_start": start.isoformat(), "today": today.isoformat()}
 
 
 @router.get("/orders")
@@ -1128,10 +1239,42 @@ def api_order_plan_last(
 
 class PlanApplyIn(BaseModel):
     name: str = Field(default="", max_length=255)
+    # Явное «да, это новый заказ» — снимает защиту от дубля.
+    force: bool = False
     # Осознанное согласие оформить заказ по плану, посчитанному на неполной
     # истории (первичная загрузка ещё идёт). Предпросмотр остаётся открытым,
     # но превращение плана в заказ на производство — деньги, тут спрашиваем.
     confirm_partial: bool = False
+
+
+DUP_OVERLAP = 0.6      # доля совпадающих позиций, при которой это похоже на дубль
+DUP_WINDOW_DAYS = 14   # и только среди свежих открытых заказов
+
+
+def _find_duplicate_order(db: Session, org_id: int, production_id, bases: set) -> dict | None:
+    """Есть ли уже открытый заказ того же канала с тем же составом."""
+    if not bases:
+        return None
+    since = datetime.utcnow() - timedelta(days=DUP_WINDOW_DAYS)
+    rows = db.execute(
+        select(ProductionOrder).where(
+            ProductionOrder.org_id == org_id,
+            ProductionOrder.status.in_(("draft", "sent")),
+            ProductionOrder.created_at >= since,
+        ).order_by(ProductionOrder.created_at.desc())
+    ).scalars().all()
+    for o in rows:
+        if production_id and o.production_id and o.production_id != int(production_id):
+            continue
+        other = {str(i.get("base_name")) for i in o.items}
+        if not other:
+            continue
+        overlap = len(bases & other)
+        if overlap / max(1, len(bases)) >= DUP_OVERLAP:
+            return {"id": o.id, "name": o.name, "overlap": overlap,
+                    "created": o.created_at.strftime("%d.%m") if o.created_at else "",
+                    "status_text": "черновик" if o.status == "draft" else "в производстве"}
+    return None
 
 
 @router.post("/order-plan/{plan_id}/apply")
@@ -1176,10 +1319,24 @@ def api_order_plan_apply(
                           "sizes": {}, "cost": float(n.get("cost") or 0)})
     if not items:
         raise HTTPException(422, "В плане нет позиций с количеством > 0")
+    pid = brief.get("production_id")
+    # Защита от дубля. Аудит 22.08: кнопку «Создать заказ» можно было нажимать
+    # сколько угодно раз, и каждый клик делал новый заказ — на потоке это
+    # оплаченный дважды заказ. 409 у самого плана защищал только повторное
+    # применение ОДНОГО плана, а мастер каждый раз создавал новый.
+    if not body.force:
+        dup = _find_duplicate_order(db, ctx.org.id, pid, {i["base_name"] for i in items})
+        if dup is not None:
+            raise HTTPException(409, (
+                f"Похоже, такой заказ уже есть: №{dup['id']} «{dup['name']}» от "
+                f"{dup['created']} ({dup['status_text']}), {dup['overlap']} из "
+                f"{len(items)} позиций совпадают. Проверьте его на странице «Заказ» — "
+                f"или подтвердите, что это новый заказ."))
     order = ProductionOrder(
         org_id=ctx.org.id,
         name=(body.name.strip() or f"Заказ от {datetime.now():%d.%m.%Y}"),
         eta_date=brief.get("eta_date"),
+        production_id=int(pid) if pid else None,
         status="draft",
         items_json=json.dumps(items, ensure_ascii=False),
     )
