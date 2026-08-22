@@ -596,9 +596,9 @@
     box.innerHTML = '<div class="table-outer"><table><thead><tr>'+
       '<th>Неделя с</th><th>Открытые заказы</th><th>Этот заказ</th><th>Итого за неделю</th><th>Накопительно</th>'+
       '</tr></thead><tbody>'+
-      ((c.overdue && c.overdue.amount) ? ('<tr><td>Просрочено / раньше</td><td class="nb">'+
-        fmtR(c.overdue.amount)+'</td><td class="nb muted">—</td><td class="nb">'+fmtR(c.overdue.amount)+
-        '</td><td class="nb">'+fmtR(c.overdue.amount)+'</td></tr>') : '')+
+      ((c.overdue && c.overdue.amount) ? ('<tr class="muted"><td>Раньше (даты платежей прошли)</td><td class="nb">'+
+        fmtR(c.overdue.amount)+'</td><td class="nb">—</td><td class="nb">'+fmtR(c.overdue.amount)+
+        '</td><td class="nb">не в сальдо</td></tr>') : '')+
       rowsData.join("")+'</tbody></table></div>';
   }
 
