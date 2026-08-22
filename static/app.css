@@ -881,3 +881,67 @@ tr.rt-weak:hover > td { background: rgba(229, 72, 77, 0.13); }
 /* Короткие пояснения к настройкам страниц (фидбэк: «сопроводить комментариями») */
 .hint-line { font-size: 12px; color: var(--text-soft); margin: -6px 0 12px; line-height: 1.55; }
 .hint-line b { color: var(--text); }
+
+/* ============ Базовая адаптивность (узкий экран) ============
+   Осторожно: только внутри @media — на десктопе (1440 и шире) ничего не
+   меняется. Полный переезд каждой страницы на этот каркас — отдельная
+   задача; здесь только минимум, чтобы страница «Настройки» (единственная
+   пока на этом каркасе — base.html) не «уезжала» вбок и оставалась
+   пригодной для работы с телефона. */
+@media (max-width: 760px) {
+  body { min-width: 0; }
+
+  .shell { flex-direction: column; min-height: 0; }
+
+  /* Сайдбар: из вертикальной колонки слева — в компактную строку сверху,
+     меню становится горизонтальной лентой со своим скроллом (та же идея,
+     что уже применена для встроенного режима в МойСклад, .embed-tabs). */
+  .sidebar {
+    position: relative; inset: auto; width: 100%; min-width: 0;
+    flex-direction: row; align-items: center; gap: 10px;
+    padding: 8px 10px;
+  }
+  .sidebar .brand { padding: 0; border-bottom: none; flex: 0 0 auto; }
+  .sidebar .b-org { max-width: 80px; }
+  .sidebar .nav {
+    display: flex; flex-direction: row; align-items: center; overflow-x: auto;
+    padding: 0; gap: 2px; -webkit-overflow-scrolling: touch; flex: 0 1 auto;
+  }
+  .sidebar .nav .nav-grp { display: none; }
+  .sidebar .nav a { white-space: nowrap; flex: 0 0 auto; }
+  .sidebar .side-status { display: none; }
+
+  .main { margin-left: 0; }
+
+  .topbar { height: auto; flex-wrap: wrap; padding: 10px 14px; row-gap: 6px; }
+  .topbar h1 { font-size: 15px; }
+  .topbar .date { display: none; }
+
+  .content { padding: 14px 14px 32px; }
+
+  .settings-grid { max-width: 100%; }
+
+  /* Поля формы в ряд — на телефоне не помещаются, складываем в столбец. */
+  .form-row { flex-direction: column; gap: 0; }
+  .form-row .field { max-width: none !important; }
+
+  /* Тач-таргеты ≥44px, как рекомендует Apple HIG (жалоба тестировщика —
+     промахи по мелким кнопкам/полям на телефоне). */
+  .btn, .input, select.input, textarea.input, .chip, .seg button {
+    min-height: 44px;
+  }
+  .btn.sm { min-height: 38px; }
+  .nav a, .user-pop button, .user-pop a.up-item { padding-top: 11px; padding-bottom: 11px; }
+
+  /* Таблицы: свой горизонтальный скролл внутри контейнера (.tbl-wrap уже
+     скроллится — overflow-x:auto), а не расширение всей страницы. Здесь
+     просто уменьшаем плотность, чтобы меньше приходилось скроллить. */
+  .tbl th, .tbl td { padding: 8px 7px; }
+  .tbl .name-cell { min-width: 140px; max-width: 220px; }
+
+  .metric-grid { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+  .grid-2 { grid-template-columns: 1fr; }
+
+  .auth-card { padding: 22px; }
+  .onb-card { width: 100%; }
+}
