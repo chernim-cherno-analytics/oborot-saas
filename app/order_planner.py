@@ -386,6 +386,18 @@ def normalize_brief(raw: dict | None, settings: dict, stages: list[dict], today:
         "budget_scope": scope,
         "cadence_days": _int("cadence_days", settings.get("order_cadence_days", 30), 7, 365),
         "safety_days": _int("safety_days", settings.get("safety_days", 14), 0, 120),
+        # Режим горизонта организации (D-27) переносится в бриф, чтобы мастер
+        # считал ТЕМ ЖЕ правилом, что и страница «Заказ». Раньше он строил свой
+        # горизонт из ритма и страховки всегда — то есть режим «фиксированный»
+        # молча игнорировал (BUSINESS_LOGIC §9.4). Пользователь его включить не
+        # мог, поэтому расхождение никого не задевало; включаем режим и правило
+        # одним пакетом, иначе оно задело бы сразу.
+        "cover_mode": (settings.get("cover_mode")
+                       if settings.get("cover_mode") in ("cadence", "fixed") else "cadence"),
+        "horizon_days_fixed": _int(
+            "horizon_days_fixed",
+            settings.get("horizon_days_setting", settings.get("horizon_days", 90)),
+            7, 365),
         "strategy": strategy,
         # Ширина заказа: сколько дней продаж закрывает каждая строка стартовой
         # волной. 0 = сразу до полной потребности. Задаётся профилем стратегии,
@@ -500,10 +512,15 @@ def collect_context(db: Session, org: Org, snap: dict, brief: dict) -> dict:
 
     today = date.fromisoformat(snap["today"])
     eta = date.fromisoformat(brief["eta_date"])
-    cover = max(
-        analytics.COVER_MIN_DAYS,
-        min(analytics.COVER_MAX_DAYS, brief["cadence_days"] + brief["safety_days"]),
-    )
+    # Одна функция на оба места: и страница «Заказ», и мастер спрашивают
+    # analytics.cover_days. Раньше здесь стояла копия формулы «ритм + страховка»,
+    # и режим «фиксированный горизонт» до мастера не доезжал.
+    cover = analytics.cover_days({
+        "cover_mode": brief.get("cover_mode", "cadence"),
+        "horizon_days_setting": brief.get("horizon_days_fixed"),
+        "order_cadence_days": brief["cadence_days"],
+        "safety_days": brief["safety_days"],
+    })
     min_stock = snap["settings"]["min_stock_days"]
 
     rate_lead, idx_lead = _seasonal_rates(db, org, snap, min_stock, today, eta)

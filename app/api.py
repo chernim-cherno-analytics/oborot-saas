@@ -579,7 +579,20 @@ def api_settings(ctx: AuthContext = Depends(require_auth_api), db: Session = Dep
             "trial_ends_at": org.trial_ends_at.isoformat() if org.trial_ends_at else None,
         },
         "thresholds": settings["thresholds"],
+        # Горизонт заказа отдаётся ТРЕМЯ разными именами намеренно (D-27).
+        # Раньше под одним словом `horizon_days` жили два разных числа: здесь —
+        # сырая пользовательская настройка (90), а в снапшоте аналитики — уже
+        # посчитанное эффективное значение (по умолчанию 44). Спорить об этом
+        # можно было бесконечно, потому что оба ответа «правильные».
+        #   horizon_days_fixed     — что человек выставил руками;
+        #   horizon_days_effective — по чему СЕЙЧАС считается заказ;
+        #   horizon_source         — какой режим дал это число.
+        # `horizon_days` оставлен только как устаревший синоним «фиксированного»
+        # для старых клиентов; новый код обязан называть величину явно.
         "horizon_days": settings["horizon_days"],
+        "horizon_days_fixed": settings["horizon_days"],
+        "horizon_days_effective": analytics.cover_days({**settings, **extra}),
+        "horizon_source": extra["cover_mode"],
         "min_stock_days": settings["min_stock_days"],
         "rate_window": extra["rate_window"],
         "lead_time_days": extra["lead_time_days"],
@@ -1684,11 +1697,17 @@ def api_order_plan_options(
             it.get("category") or "Без категории", 0) + 1
         if not it.get("cost_price"):
             no_cost += 1
+    settings = snap.get("settings") or {}
     return {
         "categories": sorted(cats),
         "no_cost_count": no_cost,
         "cost_source_full": sum(1 for it in snap["items"].values() if it.get("cost_is_full")),
         "positions": len(snap["items"]),
+        # D-27: в режиме «фиксированный горизонт» ритм заказов в анкете на
+        # расчёт не влияет, и об этом надо сказать словами прямо в анкете —
+        # иначе человек крутит ручку, а число не меняется.
+        "horizon_source": settings.get("cover_mode", "cadence"),
+        "horizon_days_effective": settings.get("cover_days"),
     }
 
 
