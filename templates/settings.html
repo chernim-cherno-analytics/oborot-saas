@@ -412,12 +412,12 @@ document.addEventListener("DOMContentLoaded", function () {
           '<input class="input num ch-moq" type="number" min="0" max="10000" value="' + (p.moq_units || 0) + '"' + lock + '>' +
           '<div class="hint">0 — ограничения нет</div></div>' +
       "</div>" +
-      '<table class="tbl" style="margin-top:9px;"><thead><tr>' +
+      '<div class="tbl-wrap" style="margin-top:9px;"><table class="tbl"><thead><tr>' +
         "<th>Этап</th><th style=\"width:96px\">Срок, дн</th>" +
         "<th style=\"width:120px\" title=\"какая часть себестоимости приходится на этот этап\">Доля себес., %</th>" +
         "<th style=\"width:130px\" title=\"сколько от стоимости этапа платится при его старте, остальное — по завершении\">Предоплата, %</th>" +
         "<th style=\"width:110px\">Мин. партия</th><th style=\"width:40px\"></th>" +
-      '</tr></thead><tbody data-rows="' + p.id + '">' + stageRows(p) + "</tbody></table>" +
+      '</tr></thead><tbody data-rows="' + p.id + '">' + stageRows(p) + "</tbody></table></div>" +
       '<div class="hint" data-warn="' + p.id + '" style="margin-top:7px;"></div>' +
       "</div>";
   }
@@ -558,14 +558,14 @@ document.addEventListener("DOMContentLoaded", function () {
     var opts = ASSIGN_PRODS.map(function (p) {
       return '<option value="' + p.id + '">' + esc(p.name) + '</option>';
     }).join("");
-    box.innerHTML = '<table class="tbl"><thead><tr><th>Значение из МойСклада</th>' +
+    box.innerHTML = '<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Значение из МойСклада</th>' +
       '<th style="width:110px">Позиций</th><th style="width:260px">Производство</th></tr></thead><tbody>' +
       info.values.map(function (v) {
         var cur = ASSIGN_MAP[v.value];
         return '<tr><td>' + esc(v.value) + '</td><td>' + v.positions + '</td>' +
           '<td><select class="input assign-pick" data-v="' + esc(v.value) + '">' +
           '<option value="">— основное —</option>' + opts + '</select></td></tr>';
-      }).join("") + '</tbody></table>' +
+      }).join("") + '</tbody></table></div>' +
       (info.empty ? '<div class="hint" style="margin-top:9px;">У ' + info.empty +
         ' позиций признак не заполнен — они остаются на основном производстве.</div>' : "");
     Array.prototype.forEach.call(box.querySelectorAll(".assign-pick"), function (sel) {
