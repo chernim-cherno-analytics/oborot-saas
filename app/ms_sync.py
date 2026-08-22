@@ -1023,7 +1023,7 @@ async def _run_initial(org_id: int, client: MoySkladClient, active_wh: list,
         # Первая удачная загрузка скачана — только теперь стираем старую историю
         # (инвариант 18.08) и ставим точку продолжения «с сегодня»: провал на
         # любой следующей фазе продолжится назад, а не инкрементом над дырой.
-        _write_stock_rows(org_id, [today_iso], batch, wipe=True)
+        _write_stock_rows(org_id, [today_iso], batch, wipe=True, wipe_sales=True)
         stats.pop("needs_full_rebuild", None)
         stats.pop("window_done", None)  # история стёрта — окно надо набрать заново
         stats["history_loaded_from"] = today_iso
@@ -1642,12 +1642,24 @@ def _rows_for_dates(org_id: int, dates: list[str], day_results: dict,
 
 
 def _write_stock_rows(org_id: int, dates: list[str], batch: list[dict], *,
-                      wipe: bool = False, boundary_next: str | None = None) -> None:
+                      wipe: bool = False, wipe_sales: bool = False,
+                      boundary_next: str | None = None) -> None:
     """Одна транзакция: (wipe всей истории | delete дат) + insert + граничная заплатка.
 
     wipe=True — полная пересборка: старая история стирается здесь, когда новые
     данные уже скачаны (инвариант 18.08). Иначе даты диапазона перезаписываются
     (защита от дублей при продолжении/инкременте).
+
+    wipe_sales=True — вместе с историей остатков стираются и продажи, В ТОЙ ЖЕ
+    транзакции. Причина: оборачиваемость считается как «нетто-выручка за год /
+    дни в стоке», и эти две величины берутся из РАЗНЫХ таблиц. При полной
+    пересборке остатки обнулялись здесь, а продажи переписывались только на
+    следующей фазе — и падение между этими точками (429, рестарт процесса, OOM)
+    оставляло организацию с одним днём остатков и годом продаж. Метрика при
+    этом не ломалась, а вырастала в десятки раз, и сервис продолжал считаться
+    рабочим: худший вид дефекта — система не падает, а уверенно врёт.
+    Теперь обе таблицы обнуляются вместе: в худшем случае человек видит нули и
+    надпись «история загружается», а не выдуманные цифры.
 
     boundary_next — дата D = dates[-1]+1, уже записанная более новым чанком
     (деплой П1): D получает qty=0 для позиций, которые были >0 на dates[-1] и
@@ -1657,6 +1669,8 @@ def _write_stock_rows(org_id: int, dates: list[str], batch: list[dict], *,
     try:
         if wipe:
             db.execute(delete(StockDay).where(StockDay.org_id == org_id))
+            if wipe_sales:
+                db.execute(delete(Sale).where(Sale.org_id == org_id))
         elif dates:
             db.execute(delete(StockDay).where(
                 StockDay.org_id == org_id,

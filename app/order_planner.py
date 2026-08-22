@@ -1201,6 +1201,13 @@ def build_plan(db: Session, org: Org, snap: dict, raw_brief: dict) -> dict:
         brief["production_id"] = prod.id
         if not brief.get("moq_explicit") and prod.moq_units:
             brief["moq_units"] = int(prod.moq_units)
+    else:
+        # Производство не наше (или его нет). Расчёт его уже игнорирует, но
+        # ЧУЖОЙ id нельзя оставлять в брифе: бриф сохраняется в order_plans, а
+        # оформление плана переносит production_id в заказ — и календарь
+        # платежей начинает читать этапы чужой организации (сроки, доли
+        # себестоимости, размеры предоплат). Затираем здесь, у источника.
+        brief["production_id"] = None
     ctx = collect_context(db, org, snap, brief)
     plan = plan_order(snap, brief, ctx, stages)
     plan["brief"] = brief

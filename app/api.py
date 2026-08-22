@@ -177,7 +177,11 @@ def _order_stages(db: Session, order: ProductionOrder, settings: dict) -> list[d
     raw = None
     if order.production_id:
         prod = db.get(Production, order.production_id)
-        if prod is not None:
+        # Сверка организации обязательна: это единственное место, где
+        # производство берётся по id из ЧУЖИХ данных (id лежит в заказе, а туда
+        # попадает из брифа плана). Без проверки условия подрядчика другой
+        # организации утекли бы в календарь платежей.
+        if prod is not None and prod.org_id == order.org_id:
             raw = prod.stages
     return order_planner.normalize_stages(raw, int(settings.get("lead_time_days") or 45))
 

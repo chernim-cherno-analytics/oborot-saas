@@ -4,6 +4,7 @@
 _stub_templates/ (временные заглушки backend'а) — когда появляются настоящие
 шаблоны, они автоматически перекрывают заглушки.
 """
+import os
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -81,6 +82,51 @@ if STATIC_DIR.is_dir():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
+def _check_single_process() -> None:
+    """Fail-fast при попытке поднять прод в несколько воркеров.
+
+    Кэш аналитики и его сброс, реестр потоков синхронизации, флаг планировщика,
+    лимит попыток входа и защита от повтора внешних JWT живут В ПАМЯТИ процесса.
+    При нескольких воркерах это даёт не «чуть медленнее», а неправильно:
+    пользователь видит разные числа на одной странице (кэш сбрасывается только
+    у того воркера, который обработал запись), ночной синк и дайджест уходят
+    столько раз, сколько воркеров, а синк одной организации может пойти
+    параллельно сам с собой.
+
+    Требование «один воркер» до сих пор жило только в комментариях и README —
+    то есть не существовало. Здесь оно становится проверяемым.
+
+    Число воркеров надёжно из процесса не видно, поэтому смотрим два признака:
+    переменную WEB_CONCURRENCY (её ставят PaaS и gunicorn) и аргументы запуска
+    (`--workers N` / `-w N` у uvicorn). Осознанный многопроцессный запуск можно
+    разрешить, выставив OBOROT_ALLOW_MULTIPROC=1 — но тогда кэш, лимитер и
+    планировщик нужно выносить наружу, а планировщик оставлять на ОДНОМ
+    процессе (SCHEDULER_ENABLED=0 на остальных).
+    """
+    import sys as _sys
+    if os.environ.get("OBOROT_ALLOW_MULTIPROC", "").strip() in ("1", "true", "yes"):
+        return
+    workers = 0
+    raw = (os.environ.get("WEB_CONCURRENCY") or "").strip()
+    if raw.isdigit():
+        workers = int(raw)
+    argv = _sys.argv
+    for i, a in enumerate(argv):
+        if a in ("--workers", "-w") and i + 1 < len(argv) and argv[i + 1].isdigit():
+            workers = max(workers, int(argv[i + 1]))
+        elif a.startswith("--workers=") and a.split("=", 1)[1].isdigit():
+            workers = max(workers, int(a.split("=", 1)[1]))
+    if workers > 1:
+        raise RuntimeError(
+            f"«Оборот» запущен в {workers} воркеров, а рассчитан на один: кэш "
+            "аналитики, лимит входа и планировщик живут в памяти процесса, и "
+            "числа на страницах разъедутся, а ночной синк выполнится несколько "
+            "раз. Уберите --workers/WEB_CONCURRENCY либо, если это осознанно, "
+            "выставьте OBOROT_ALLOW_MULTIPROC=1 и SCHEDULER_ENABLED=1 ровно на "
+            "одном процессе."
+        )
+
+
 @app.on_event("startup")
 def _startup() -> None:
     # Fail-fast, пока сервис ещё не принял ни одного запроса: в проде
@@ -88,6 +134,7 @@ def _startup() -> None:
     # лимит входа по IP молча выключается ровно тогда, когда нужен (см.
     # auth.check_proxy_config).
     auth.check_proxy_config()
+    _check_single_process()
     init_db()
     from app import exclusions as _exclusions
     _exclusions.ensure_schema()
@@ -105,6 +152,53 @@ def _startup() -> None:
     _ms_writeback.ensure_schema()
     from app import ms_vendor as _ms_vendor
     _ms_vendor.ensure_schema()
+    global _STARTUP_DONE
+    _STARTUP_DONE = True
+
+
+# ── Health-эндпоинты ─────────────────────────────────────────────────────────
+#
+# До сих пор единственным способом узнать, что сервису плохо, был Telegram-алерт
+# о втором подряд упавшем синке — то есть о частном случае, и постфактум.
+# Инцидент 03–21.08 (синк молча падал на протухшем токене, данные протухали
+# восемнадцать дней) показал цену этого. Две ручки ниже — минимум, который
+# позволяет хостингу и внешнему мониторингу отличать «процесс жив» от
+# «сервис готов работать»; авторизации не требуют и данных не раскрывают.
+
+_STARTUP_DONE = False
+
+
+@app.get("/health/live", include_in_schema=False)
+def health_live():
+    """Процесс жив и отвечает. Намеренно НЕ трогает базу.
+
+    Liveness обязан отвечать быстро и не зависеть от внешних систем: иначе
+    временная недоступность БД приводит к перезапуску процесса, а перезапуск
+    рвёт фоновую догрузку истории и обнуляет прогресс синхронизации.
+    """
+    return {"status": "ok"}
+
+
+@app.get("/health/ready", include_in_schema=False)
+def health_ready(db: Session = Depends(get_db)):
+    """Готов обслуживать запросы: старт завершён (миграции прошли), БД отвечает.
+
+    Планировщик в готовность НЕ входит: он может быть намеренно выключен
+    (SCHEDULER_ENABLED=0 в dev и на втором процессе), и это не мешает отдавать
+    страницы. Его состояние отдаётся справочно.
+    """
+    from sqlalchemy import text as _text
+    checks: dict = {"startup": _STARTUP_DONE}
+    try:
+        db.execute(_text("SELECT 1"))
+        checks["db"] = True
+    except Exception as exc:  # noqa: BLE001 — наружу отдаём только тип ошибки
+        checks["db"] = False
+        checks["db_error"] = type(exc).__name__
+    checks["scheduler"] = bool(getattr(_scheduler, "_started", False))
+    ok = bool(checks["startup"] and checks["db"])
+    return JSONResponse(status_code=200 if ok else 503,
+                        content={"status": "ok" if ok else "not ready", **checks})
 
 
 # ── Помощники ────────────────────────────────────────────────────────────────
