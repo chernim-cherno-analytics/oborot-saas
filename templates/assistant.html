@@ -288,7 +288,8 @@
 
 <script>
 (function(){
-  var STATE = { production_id: null, prods: [], cadence: 30, scope: "now",
+  var STATE = { horizon_source: "cadence", horizon_fixed: null,
+                production_id: null, prods: [], cadence: 30, scope: "now",
                 strategy: "balance", offcats: [], plan: null, edits: {}, newItems: [], must: [],
                 open: null, cash: null, createdOrder: null,
                 q: "", group: false, sortKey: "turnover", sortDir: -1 };
@@ -425,9 +426,19 @@
 
   function updHints(){
     var p = curProd();
-    var cover = Math.max(21, Math.min(180, STATE.cadence + (STATE.safety||14)));
-    document.getElementById("cadHint").textContent =
-      "Заказ должен закрыть " + cover + " дн продаж — до прихода следующего заказа плюс страховой запас.";
+    // D-27: если в Настройках включён ФИКСИРОВАННЫЙ горизонт, ритм заказов на
+    // расчёт не влияет. Раньше мастер всегда считал по «ритм + страховка» и
+    // молча игнорировал режим; теперь режим существует — значит подпись обязана
+    // говорить правду, иначе человек крутит ручку, а число не меняется.
+    var fixedHz = STATE.horizon_source === "fixed";
+    var cover = fixedHz
+      ? (STATE.horizon_fixed || 90)
+      : Math.max(21, Math.min(180, STATE.cadence + (STATE.safety||14)));
+    document.getElementById("cadHint").textContent = fixedHz
+      ? ("Заказ считается на " + cover + " дн продаж — горизонт задан фиксированно "
+         + "в Настройках, ритм заказов на это число не влияет.")
+      : ("Заказ должен закрыть " + cover + " дн продаж — до прихода следующего "
+         + "заказа плюс страховой запас.");
     document.getElementById("scopeHint").textContent = (p && p.staged && STATE.scope==="now")
       ? "Считаем, что этих денег хватит на первый этап; остальное платится позже — покажу календарём."
       : "Считаем, что эта сумма покрывает весь заказ целиком.";
@@ -1127,6 +1138,9 @@
     updWidthHint();
 
     var opt = r[3] || {};
+    STATE.horizon_source = opt.horizon_source || "cadence";
+    STATE.horizon_fixed = opt.horizon_days_effective || null;
+    updHints();
     var cats = opt.categories || [];
     // Предупреждение про деньги должно стоять на ПЕРВОМ экране: со второго
     // есть кнопка «сразу показать план», и владелец проходил мимо него.

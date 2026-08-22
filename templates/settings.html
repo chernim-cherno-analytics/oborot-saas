@@ -74,8 +74,26 @@
     </div>
     <div class="card-body">
       <div class="form-row" style="align-items:flex-start;">
-        <div class="field" style="max-width:220px;">
-          <label for="horizon">Горизонт планирования, дней</label>
+        <div class="field" style="max-width:340px;">
+          <label>Горизонт заказа</label>
+          <div class="seg" id="horizon-mode" style="display:flex;gap:6px;flex-wrap:wrap;">
+            <button class="btn sm" type="button" data-mode="cadence">Автоматически</button>
+            <button class="btn sm" type="button" data-mode="fixed">Фиксированный</button>
+          </div>
+          <div class="hint" id="horizon-mode-hint" style="margin-top:6px;"></div>
+        </div>
+        <div class="field" style="max-width:200px;" id="horizon-auto-fields">
+          <label for="cadence">Как часто заказываете, дней</label>
+          <input class="input num" type="number" id="cadence" min="7" max="365" step="1">
+          <div class="hint">Через сколько дней вы обычно размещаете следующий заказ.</div>
+        </div>
+        <div class="field" style="max-width:200px;" id="horizon-safety-field">
+          <label for="safety">Страховой запас, дней</label>
+          <input class="input num" type="number" id="safety" min="0" max="120" step="1">
+          <div class="hint">Запас на случай, если следующий заказ задержится.</div>
+        </div>
+        <div class="field" style="max-width:200px;" id="horizon-fixed-field">
+          <label for="horizon">Горизонт, дней</label>
           <input class="input num" type="number" id="horizon" min="7" max="365" step="1">
           <div class="hint">На сколько дней продаж должен хватить заказ.</div>
         </div>
@@ -90,6 +108,7 @@
           <div class="hint">Доставка, таможня, брак, упаковка — то, во что партия обходится сверх цены подрядчика. «Мастер заказа» добавляет этот процент к себестоимости, когда считает деньги заказа; на конкретный заказ его можно поменять в анкете.</div>
         </div>
       </div>
+      <p class="hint" id="horizon-now" style="margin:10px 0 4px;font-weight:600;"></p>
       <p class="hint" style="margin:10px 0 4px;"><b>«Заказать»</b> на странице «Заказ» — сколько заказать, чтобы хватило: темп продаж × горизонт − прогнозный остаток к приходу партии. Прогнозный остаток — это сегодняшний остаток плюс то, что уже едет к нам, минус то, что успеет продаться, пока шьётся заказ. Обе настройки работают именно здесь.</p>
       <p class="hint" style="margin:0;"><b>«Не хватает до нормы»</b> на «Оборачиваемости» и «Активном стоке» — сколько штук не хватает <i>сегодня</i>: темп за год × норму запаса − сегодняшний остаток. Норма задаётся отдельно (на «Оборачиваемости», блок «Затоварка — это запас от … дней», по умолчанию 90); горизонт заказа её не меняет, и то, что уже едет к нам, из неё не вычитается: это оценка сегодняшнего склада, а не расчёт заказа. Поэтому «Заказать» обычно больше.</p>
     </div>
@@ -278,7 +297,18 @@ document.addEventListener("DOMContentLoaded", function () {
     document.getElementById("th-dull").value = th.dull != null ? th.dull : 2000;
     document.getElementById("th-good").value = th.good != null ? th.good : 5000;
     document.getElementById("th-minstock").value = settings.min_stock_days != null ? settings.min_stock_days : 3;
-    document.getElementById("horizon").value = settings.horizon_days != null ? settings.horizon_days : 90;
+    // D-27: у горизонта два режима. Раньше поле «Горизонт планирования» здесь
+    // было, сохранялось и НИ НА ЧТО не влияло — режим по умолчанию считает
+    // горизонт из ритма заказов и страхового запаса, а переключателя не было.
+    HORIZON_MODE = settings.horizon_source === "fixed" ? "fixed" : "cadence";
+    document.getElementById("horizon").value =
+      settings.horizon_days_fixed != null ? settings.horizon_days_fixed
+      : (settings.horizon_days != null ? settings.horizon_days : 90);
+    document.getElementById("cadence").value =
+      settings.order_cadence_days != null ? settings.order_cadence_days : 30;
+    document.getElementById("safety").value =
+      settings.safety_days != null ? settings.safety_days : 14;
+    applyHorizonMode();
     document.getElementById("lead-time").value = settings.lead_time_days != null ? settings.lead_time_days : 45;
     document.getElementById("overhead").value = settings.overhead_pct != null ? settings.overhead_pct : 0;
     renderWarehouses(settings.warehouses || []);
@@ -301,7 +331,10 @@ document.addEventListener("DOMContentLoaded", function () {
         good: Number(document.getElementById("th-good").value) || 0
       },
       min_stock_days: Number(document.getElementById("th-minstock").value) || 0,
+      cover_mode: HORIZON_MODE,
       horizon_days: Number(document.getElementById("horizon").value) || 90,
+      order_cadence_days: Number(document.getElementById("cadence").value) || 30,
+      safety_days: Number(document.getElementById("safety").value) || 0,
       lead_time_days: Number(document.getElementById("lead-time").value) || 45,
       overhead_pct: Number(document.getElementById("overhead").value) || 0
     };
@@ -318,6 +351,58 @@ document.addEventListener("DOMContentLoaded", function () {
     if (!(w < d && d < g)) { toast("Пороги должны возрастать: слабый < медленный < хороший", "error"); return; }
     saveSettings(null, "Пороги сохранены. Классы пересчитаются при следующей загрузке.");
   });
+  // ── Горизонт: два режима (D-27) ───────────────────────────────────────────
+  // Правило то же, что на сервере (analytics.cover_days): авто = ритм +
+  // страховка с клампом 21…180, фиксированный = число пользователя 7…365.
+  // Дублирование формулы здесь осознанное и узкое: показать результат ДО
+  // сохранения, чтобы человек видел, какое число он включает. Считает всё
+  // равно сервер — эта строка только объясняет.
+  var HORIZON_MODE = "cadence";
+  function horizonEffective() {
+    if (HORIZON_MODE === "fixed") {
+      var f = Number(document.getElementById("horizon").value) || 90;
+      return Math.max(7, Math.min(365, f));
+    }
+    var c = Number(document.getElementById("cadence").value) || 30;
+    var sf = Number(document.getElementById("safety").value) || 0;
+    return Math.max(21, Math.min(180, c + sf));
+  }
+  function applyHorizonMode() {
+    var fixed = HORIZON_MODE === "fixed";
+    document.getElementById("horizon-auto-fields").style.display = fixed ? "none" : "";
+    document.getElementById("horizon-safety-field").style.display = fixed ? "none" : "";
+    document.getElementById("horizon-fixed-field").style.display = fixed ? "" : "none";
+    var btns = document.querySelectorAll("#horizon-mode [data-mode]");
+    for (var i = 0; i < btns.length; i++) {
+      var on = btns[i].getAttribute("data-mode") === HORIZON_MODE;
+      btns[i].classList.toggle("primary", on);
+      btns[i].setAttribute("aria-pressed", on ? "true" : "false");
+    }
+    document.getElementById("horizon-mode-hint").textContent = fixed
+      ? "Вы задаёте число дней сами. Ритм заказов и страховой запас на расчёт не влияют."
+      : "«Оборот» считает горизонт сам: как часто вы заказываете + страховой запас.";
+    var n = horizonEffective();
+    document.getElementById("horizon-now").textContent =
+      "Сейчас заказ считается на " + n + " " + plural(n, "день", "дня", "дней") +
+      (fixed ? " (фиксированный горизонт)."
+             : " — это ритм заказов плюс страховой запас.");
+  }
+  function plural(n, one, few, many) {
+    n = Math.abs(Math.round(n));
+    if (n % 10 === 1 && n % 100 !== 11) return one;
+    if (n % 10 >= 2 && n % 10 <= 4 && !(n % 100 >= 12 && n % 100 <= 14)) return few;
+    return many;
+  }
+  document.getElementById("horizon-mode").addEventListener("click", function (e) {
+    var b = e.target.closest("[data-mode]");
+    if (!b) return;
+    HORIZON_MODE = b.getAttribute("data-mode");
+    applyHorizonMode();
+  });
+  ["horizon", "cadence", "safety"].forEach(function (id) {
+    document.getElementById(id).addEventListener("input", applyHorizonMode);
+  });
+
   document.getElementById("btn-save-horizon").addEventListener("click", function () {
     saveSettings(null, "Горизонт заказа и срок производства сохранены");
   });
