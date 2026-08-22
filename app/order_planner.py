@@ -44,6 +44,7 @@ from app.models import Org, Production
 NEED_MIN = 3            # потребность меньше — не заказываем (как в «Бюджете»)
 FRESH_DAYS = 90         # без продаж за N дней позиция неактуальна
 MIN_WINDOW_DIS = 7      # меньше дней в наличии в окне — окну не доверяем
+MIN_WINDOW_NQ = 2       # и меньше продаж в окне — сезонный индекс не строим
 # Когда потребность меньше минимальной партии, вопрос не «дотягивает ли она»,
 # а «на сколько дней растянется эта партия». 50 штук при продаже 1,7 шт/день —
 # это месяц запаса, нормально; те же 50 штук при 0,2 шт/день — восемь месяцев
@@ -52,34 +53,36 @@ MOQ_MAX_COVER_DAYS = 120  # партия дольше этого срока не
 BASE_WAVE_DAYS = 14     # волна «База» без MOQ: минимум — покрытие двух недель
 SENSITIVITY_STEPS = (1.25, 1.5)  # «а если добавить денег»
 
-# Профили стратегии: чем отличается «не потерять продажи» от «заработать максимум».
+# Профили стратегии. Аудит 22.08.2026 показал, что три плитки давали
+# ОДИНАКОВЫЙ план (19 поз / 191 шт / 837 885 ₽ при любом лимите доли): фильтр
+# по классам почти не срезал кандидатов, а base_days не применялся вовсе из-за
+# min(need, moq). Поэтому профиль теперь задаёт ровно две понятные величины:
+#   width_days   — сколько дней продаж закрывает КАЖДАЯ строка в стартовой волне
+#                  (0 = сразу до полной потребности, самый узкий и глубокий заказ);
+#   max_share_pct — сколько бюджета максимум может забрать одна позиция.
+# Ключ сортировки по-прежнему один на всю систему — оборачиваемость ₽/день.
 STRATEGIES = {
     "protect": {
         "title": "Не потерять продажи",
+        "width_days": 7,      # каждому по неделе продаж — максимально широкий заказ
         "max_share_pct": 20,
-        "base_classes": None,                    # база — всем кандидатам
-        "base_days": 21,                         # стартовая партия = 3 недели продаж
-        "deepen_factor": 1.0,
     },
     "balance": {
         "title": "Баланс",
+        "width_days": 21,     # три недели каждому, потом углубление по обороту
         "max_share_pct": 30,
-        "base_classes": ("best", "good", "dull"),
-        "base_days": 14,
-        "deepen_factor": 1.0,
     },
     "grow": {
         "title": "Заработать максимум",
+        "width_days": 0,      # сразу до полной потребности, начиная с топов
         "max_share_pct": 60,
-        "base_classes": ("best", "good"),
-        "base_days": 7,                          # почти без «размазывания» — сразу вглубь
-        "deepen_factor": 1.2,                    # топам можно взять с запасом
     },
 }
+WIDTH_CHOICES = (7, 14, 21, 30, 0)  # 0 = до полной потребности
 
 # Порядок причин в подписи строки: сначала зачем позиция в заказе, потом
 # что ограничило количество — так фраза читается как объяснение, а не как лог.
-REASON_ORDER = ("must_have", "gap", "base", "deepen", "moq", "moq_over_limit",
+REASON_ORDER = ("must_have", "gap", "base", "deepen", "moq",
                 "capped_share", "capped_budget")
 
 REASON_TEXT = {
@@ -90,7 +93,6 @@ REASON_TEXT = {
     "capped_share": "срезано лимитом на позицию",
     "capped_budget": "дальше деньги закончились",
     "moq": "округлено до минимальной партии",
-    "moq_over_limit": "партия больше лимита на позицию",
 }
 
 # Пресеты этапов для анкеты (клиент выбирает, дальше правит сроки).
@@ -214,6 +216,11 @@ def payment_plan(order_date: date, stages: list[dict], cost_total: float) -> lis
             out.append({"date": done.isoformat(), "amount": round(rest),
                         "label": f"{st['name']} — остаток"})
         cursor = done
+    # Последний транш = остаток, а не round своей доли: иначе сумма календаря
+    # расходилась с себестоимостью заказа на рубль и читалась как ошибка.
+    if out:
+        diff = round(cost_total) - sum(x["amount"] for x in out)
+        out[-1]["amount"] += diff
     return out
 
 
@@ -323,6 +330,15 @@ def normalize_brief(raw: dict | None, settings: dict, stages: list[dict], today:
         strategy = "balance"
     profile = STRATEGIES[strategy]
 
+    def _width(value, default):
+        if value is None or value == "":
+            return default
+        try:
+            v = int(value)
+        except (TypeError, ValueError):
+            return default
+        return v if v in WIDTH_CHOICES else default
+
     eta = raw.get("eta_date")
     try:
         eta_date = date.fromisoformat(eta) if eta else today + timedelta(days=lead)
@@ -365,8 +381,16 @@ def normalize_brief(raw: dict | None, settings: dict, stages: list[dict], today:
         "cadence_days": _int("cadence_days", settings.get("order_cadence_days", 30), 7, 365),
         "safety_days": _int("safety_days", settings.get("safety_days", 14), 0, 120),
         "strategy": strategy,
+        # Ширина заказа: сколько дней продаж закрывает каждая строка стартовой
+        # волной. 0 = сразу до полной потребности. Задаётся профилем стратегии,
+        # но пользователь может выставить явно — это единственная ручка,
+        # которая реально меняет форму заказа.
+        "width_days": _width(raw.get("width_days"), profile["width_days"]),
         "max_share_pct": _int("max_share_pct", profile["max_share_pct"], 5, 100),
+        # Ноль здесь — осознанный выбор «партии нет», а не пустое поле:
+        # раньше он считался отсутствием значения и подменялся минимумом канала.
         "moq_units": _int("moq_units", settings.get("moq_units", 0), 0, 10000),
+        "moq_explicit": raw.get("moq_units") is not None and raw.get("moq_units") != "",
         "reserve_new_pct": _int("reserve_new_pct", settings.get("reserve_new_pct", 0), 0, 90),
         "exclude_categories": [str(c) for c in cats if str(c).strip()],
         "must_have": [str(b) for b in must if str(b).strip()],
@@ -399,16 +423,26 @@ def _seasonal_rates(
     db: Session, org: Org, snap: dict, min_stock: float,
     date_from: date, date_to: date,
 ) -> tuple[dict[str, float], dict[str, float]]:
-    """Темп продаж на будущее окно по статистике того же окна ГОД НАЗАД.
+    """Темп продаж на будущее окно = активный темп позиции × сезонный индекс окна.
 
-    Каскад фолбэков (в одежде половина моделей моложе года):
-      1) окно самой позиции, если в нём набралось MIN_WINDOW_DIS дней наличия;
-      2) годовой темп позиции × сезонный индекс её КАТЕГОРИИ на это окно;
-      3) годовой темп позиции.
+    Аудит 22.08.2026: раньше планировщик строил СВОЙ, четвёртый темп (окно того
+    же периода год назад) и полностью игнорировал настройку «окно темпа». Из-за
+    этого страница «Заказ» и мастер давали разные ответы про одну позицию в один
+    день — на боевых настройках (d90) «Заказ» говорил «запаса достаточно», а
+    мастер ставил ту же позицию первой строкой. Теперь база — тот же
+    rate_active, что и на «Заказе», а сезонность применяется как ИНДЕКС:
 
-    Возвращает (темпы по базам, сезонные индексы категорий). Индексы нужны
-    вызывающему, чтобы честно сказать: сезонность в расчёте участвовала или
-    её не из чего было взять (у нового аккаунта окна «год назад» ещё нет).
+      индекс позиции   = темп её окна год назад ÷ её годовой темп
+                         (только если в окне есть и дни наличия, и продажи);
+      индекс категории = то же по всей категории — фолбэк для позиций
+                         моложе года и для тех, у кого окно пустое;
+      нет ни того ни другого → индекс 1.0, сезонность просто не участвует.
+
+    Отдельно чинит тихую дыру: позиция, которая год назад лежала на складе, но
+    не продавалась (только завезли), раньше получала темп 0 и молча выпадала
+    из заказа. Теперь ноль продаж в окне — это «индекса нет», а не «спроса нет».
+
+    Возвращает (темпы по базам, сезонные индексы категорий).
     """
     w_from = (date_from - timedelta(days=365)).isoformat()
     w_to = (date_to - timedelta(days=365)).isoformat()
@@ -437,14 +471,16 @@ def _seasonal_rates(
 
     rates: dict[str, float] = {}
     for base, it in snap["items"].items():
+        base_rate = float(it.get("rate_active") or it.get("rate_year") or 0)
         rate_year = float(it.get("rate_year") or 0)
         dis_b = float(dis_w.get(base) or 0)
         nq_b = float(nq_w.get(base) or 0)
-        if dis_b >= MIN_WINDOW_DIS:
-            rates[base] = max(0.0, nq_b / dis_b)
-        else:
+        idx = None
+        if dis_b >= MIN_WINDOW_DIS and nq_b >= MIN_WINDOW_NQ and rate_year > 0:
+            idx = max(0.2, min(3.0, (nq_b / dis_b) / rate_year))
+        if idx is None:
             idx = cat_index.get(it.get("category") or "Без категории")
-            rates[base] = rate_year * idx if idx else rate_year
+        rates[base] = max(0.0, base_rate * idx) if idx else base_rate
     return rates, cat_index
 
 
@@ -569,6 +605,7 @@ def _candidates(snap: dict, brief: dict, ctx: dict) -> tuple[list[dict], dict]:
             "low_data": bool(it.get("low_data")),
             "turnover": float(it.get("turnover") or 0),
             "rate_cover": round(r_cover, 4),
+            "rate_lead": round(r_lead, 4),
             "cs": int(cs),
             "ordered": int(ordered),
             "proj_stock": int(round(proj_stock)),
@@ -594,9 +631,8 @@ def _candidates(snap: dict, brief: dict, ctx: dict) -> tuple[list[dict], dict]:
 
 def _allocate(cands: list[dict], brief: dict, ctx: dict, stages: list[dict]) -> dict:
     """Волновое распределение бюджета. Возвращает alloc и причины по каждой позиции."""
-    profile = STRATEGIES[brief["strategy"]]
     brief_moq = int(brief["moq_units"] or 0)
-    cover = ctx["cover_days"]
+    width_days = int(brief.get("width_days") or 0)
 
     def moq_of(c: dict) -> int:
         """Минимальная партия позиции: максимум из общей и минимумов этапов
@@ -622,8 +658,14 @@ def _allocate(cands: list[dict], brief: dict, ctx: dict, stages: list[dict]) -> 
 
     alloc: dict[str, int] = {}
     reasons: dict[str, list[str]] = {}
-    capped: dict[str, str] = {}   # почему позиция не добрана до потребности
-    moq_skipped: dict[str, int] = {}  # позиция → на сколько дней хватило бы партии
+    # Сколько штук позиции вообще разрешает лимит доли. Аудит 22.08: подпись
+    # «срезано лимитом на позицию» ставилась, как только лимит срезал ЦЕЛЬ
+    # волны, — даже если фактическое количество упёрлось в деньги, а не в
+    # лимит (11 ложных подписей из 20). Теперь причину определяем по факту:
+    # достигли потолка доли — значит лимит, не достигли — значит деньги.
+    cap_units: dict[str, int] = {}
+    moq_skipped: dict[str, int] = {}   # позиция → на сколько дней хватило бы партии
+    moq_over_cap: dict[str, int] = {}  # позиция → во сколько ₽ обходится партия
     spent = 0.0
 
     def unit_pay(c: dict) -> float:
@@ -639,20 +681,19 @@ def _allocate(cands: list[dict], brief: dict, ctx: dict, stages: list[dict]) -> 
         base = c["base_name"]
         have = alloc.get(base, 0)
         unit = unit_pay(c)
+        if cap_per_item > 0:
+            cap_units[base] = int(math.floor(cap_per_item / unit))
         limit = cap_per_item if (cap is not None and cap < 0) else cap
         if limit is not None and limit > 0:
             by_cap = int(math.floor(limit / unit))
             if target > by_cap:
                 target = by_cap
-                if limit == cap_per_item:
-                    capped[base] = "capped_share"
         if target <= have:
             return
         rest = money - spent
         afford = int(math.floor(rest / unit))
         add = min(target - have, afford)
-        if add < target - have:
-            capped.setdefault(base, "capped_budget")
+
         if add <= 0:
             # Минимальная партия целиком не влезла — позиция остаётся без заказа.
             return
@@ -667,69 +708,61 @@ def _allocate(cands: list[dict], brief: dict, ctx: dict, stages: list[dict]) -> 
                 return
             if rate <= 0:
                 return
+            # Лимит доли на позицию — обещание пользователю, и минимальная
+            # партия его не отменяет (аудит: 60 шт × 4 029 = 80,6% бюджета при
+            # лимите 30%). Проверяем ДО денег: иначе дорогая партия молча
+            # уходила в «не по карману» и человек не понимал, что упёрся
+            # в собственный лимит, а не в бюджет.
+            if cap_per_item > 0 and moq * unit > cap_per_item + 1:
+                moq_over_cap[base] = int(round(moq * unit))
+                return
             if (moq - have) * unit > rest:
                 return  # партия не по карману
             qty = moq
             reasons.setdefault(base, []).append("moq")
-            if limit is not None and limit > 0 and qty * unit > limit + 1:
-                # Партия физически больше лимита доли — берём, но говорим об этом.
-                reasons.setdefault(base, []).append("moq_over_limit")
         spent += (qty - have) * unit
         alloc[base] = qty
         reasons.setdefault(base, []).append(reason)
 
-    allowed = profile["base_classes"]
-
-    def in_focus(c: dict) -> bool:
-        """Позиция в фокусе выбранной стратегии (protect — все классы)."""
-        return allowed is None or c["cls"] in allowed
-
     def base_batch(c: dict) -> int:
-        """Минимально осмысленная партия: MOQ или столько-то дней продаж.
+        """Сколько взять в стартовой волне.
 
-        Сколько дней — задаёт стратегия: «не потерять продажи» даёт стартовую
-        партию шире (3 недели каждому), «заработать максимум» почти не
-        размазывает (неделя) и сразу уходит вглубь топа.
+        Аудит 22.08: раньше было min(need, moq) — минимальная партия становилась
+        ЦЕЛЬЮ, а не полом. Из-за этого три стратегии давали одинаковый план,
+        сезонность стиралась (декабрьский заказ совпадал с июльским), и заказ
+        получался «всем по минимальной партии». Теперь ширину задаёт ручка
+        width_days, а MOQ работает полом внутри take().
         """
-        moq = moq_of(c)
-        if moq > 0:
-            return min(c["need"], moq)
-        days = profile.get("base_days", BASE_WAVE_DAYS)
-        return min(c["need"], max(1, int(math.ceil(c["rate_cover"] * days))))
+        if width_days <= 0:
+            return c["need"]
+        return min(c["need"], max(1, int(math.ceil(c["rate_cover"] * width_days))))
 
     # + must-have: решение владельца выше алгоритма
     for c in cands:
         if c["must_have"]:
             take(c, c["need"], "must_have", cap=None)
-    # Потолок стартовых волн: базовая партия по определению не должна съедать
-    # заметную долю бюджета — иначе три первые позиции забирают всё, и волна
-    # «База» перестаёт делать то, ради чего она есть.
-    focus_n = max(1, sum(1 for c in cands if in_focus(c)))
-    # Лимит доли на позицию — обещание пользователю, его стартовая волна
-    # нарушать не имеет права: берём наиболее строгий из двух потолков.
-    base_cap = min(money / focus_n, cap_per_item) if money > 0 else 0.0
-    # 0. Дыры — позиции, которые кончатся до прихода: сначала останавливаем
-    #    потери (базовая партия), глубину доберём волной 2.
-    for c in cands:
-        if c["gap_days"] > 0 and in_focus(c):
-            take(c, base_batch(c), "gap", cap=base_cap)
-    # 1. База — ассортимент не схлопывается в три модели
-    for c in cands:
-        if in_focus(c):
+    # Потолок стартовых волн: стартовая партия по определению не должна съедать
+    # заметную долю бюджета — иначе первые позиции забирают всё и волна «База»
+    # перестаёт делать то, ради чего она есть. При «до полной потребности»
+    # (width_days = 0) стартовой волны нет — сразу углубляемся по обороту.
+    n_cands = max(1, len(cands))
+    base_cap = min(money / n_cands, cap_per_item) if (money > 0 and width_days > 0) else 0.0
+    if width_days > 0:
+        # 0. Дыры — позиции, которые кончатся до прихода: сначала останавливаем
+        #    потери (стартовая партия), глубину доберём волной 2.
+        for c in cands:
+            if c["gap_days"] > 0:
+                take(c, base_batch(c), "gap", cap=base_cap)
+        # 1. База — ассортимент не схлопывается в три модели
+        for c in cands:
             take(c, base_batch(c), "base", cap=base_cap)
     # 2. Углубление — деньги туда, где быстрее оборот
     for c in cands:
-        if in_focus(c):
-            take(c, int(round(c["need"] * profile["deepen_factor"])), "deepen")
-    # 3. Остаток — если после фокуса стратегии деньги ещё есть, пускаем их
-    #    в остальные позиции по оборачиваемости (бюджет не должен «зависать»).
-    for c in cands:
-        if not in_focus(c):
-            take(c, c["need"], "deepen")
+        take(c, c["need"], "deepen" if width_days > 0 else "gap" if c["gap_days"] > 0 else "deepen")
 
     return {
-        "alloc": alloc, "reasons": reasons, "capped": capped,
-        "moq_skipped": moq_skipped, "spent": spent,
+        "alloc": alloc, "reasons": reasons, "cap_units": cap_units,
+        "moq_skipped": moq_skipped, "moq_over_cap": moq_over_cap, "spent": spent,
         "reserve": reserve, "new_cost": new_cost, "new_over_budget": over_budget,
         "money": money, "pay_share": pay_share,
         "cap_per_item": cap_per_item,
@@ -767,31 +800,38 @@ def plan_order(snap: dict, brief: dict, ctx: dict, stages: list[dict],
     alloc, reasons = res["alloc"], res["reasons"]
 
     items, not_included = [], []
-    lost_revenue = 0.0
+    # Аудит 22.08: «упущено» складывало недобор по позициям, которые В ЗАКАЗЕ,
+    # и показывалось над таблицей, где их нет (4,6 млн над таблицей на 671 тыс).
+    # Считаем две РАЗНЫЕ величины и обе — в марже, а не в выручке.
+    lost_missing = 0.0   # позиции, не вошедшие совсем
+    lost_short = 0.0     # недобор по позициям, которые в заказе
     for c in cands:
         qty = alloc.get(c["base_name"], 0)
         unmet = max(0, c["need"] - qty)
         if qty <= 0:
-            lost_revenue += unmet * c["avg_price"]
+            lost_missing += unmet * c["margin"]
             not_included.append({
                 "base_name": c["base_name"], "category": c["category"], "cls": c["cls"],
                 "turnover": round(c["turnover"]), "need": c["need"],
                 "cost_price": c["cost_price"], "need_rub": c["need"] * c["cost_price"],
-                "lost_revenue": round(unmet * c["avg_price"]),
+                "lost_margin": round(unmet * c["margin"]),
+                "moq_cost": res["moq_over_cap"].get(c["base_name"]),
                 "gap_days": c["gap_days"],
             })
             continue
         why = list(reasons.get(c["base_name"], []))
         if unmet > 0:
-            why.append(res["capped"].get(c["base_name"], "capped_budget"))
-        # «партия больше лимита» и «срезано лимитом» вместе читаются как
-        # противоречие — оставляем первую, она объясняет и то и другое.
-        if "moq_over_limit" in why and "capped_share" in why:
-            why.remove("capped_share")
-        lost_revenue += unmet * c["avg_price"]
+            by_cap = res["cap_units"].get(c["base_name"])
+            why.append("capped_share" if (by_cap is not None and qty >= by_cap > 0)
+                       else "capped_budget")
+        lost_short += unmet * c["margin"]
         rate = c["rate_cover"]
-        # «Хватит до» — до и после заказа (то же в UI показывается полосами).
-        days_now = int((c["cs"] + c["ordered"]) / rate) if rate > 0 else None
+        # «Хватит до» считаем ДО прихода темпом окна до прихода (тем же, каким
+        # считается дыра), а после прихода — темпом окна покрытия. Раньше обе
+        # даты брались из rate_cover, и полоса покрытия противоречила подписи
+        # строки в 17 случаях из 19.
+        rate_now = c.get("rate_lead") or rate
+        days_now = int((c["cs"] + c["ordered"]) / rate_now) if rate_now > 0 else None
         days_after = int((c["proj_stock"] + qty) / rate) if rate > 0 else None
         items.append({
             "base_name": c["base_name"],
@@ -812,6 +852,13 @@ def plan_order(snap: dict, brief: dict, ctx: dict, stages: list[dict],
             "cost_total": round(qty * c["cost_price"]),
             "pay_now": round(qty * c["cost_price"] * res["pay_share"]),
             "expected_profit": round(qty * c["margin"]),
+            # Сколько дней разойдётся заказанная партия. Это защита от ловушки
+            # «дорогая медленная позиция с высокой маржой»: она видна прямо
+            # в строке, а не только в отсеве по минимальной партии.
+            "days_to_sell": int(qty / rate) if rate > 0 else None,
+            # Штуки сверх потребности (следствие минимальной партии) — деньги,
+            # которые лягут в запас, а не отработают в горизонте заказа.
+            "over_need": max(0, qty - c["need"]),
             "runs_out": (today + timedelta(days=min(days_now, 3650))).isoformat()
             if days_now is not None else None,
             "covered_until": (eta + timedelta(days=min(days_after, 3650))).isoformat()
@@ -826,13 +873,36 @@ def plan_order(snap: dict, brief: dict, ctx: dict, stages: list[dict],
         })
 
     cost_total = sum(i["cost_total"] for i in items)
-    pay_now = sum(i["pay_now"] for i in items)
+    order_date = eta - timedelta(days=lead_days(stages))
+    payments = payment_plan(order_date, stages, cost_total)
+    # Единственный источник правды про «сколько платить сейчас» — первый транш
+    # календаря. Раньше карточка считала его по pay_share и при «весь заказ
+    # целиком» показывала «сейчас 299 699 · потом 0» рядом с календарём
+    # 134 865 / 82 417 / 82 417.
+    pay_now = payments[0]["amount"] if payments else cost_total
+    pay_later = max(0, cost_total - pay_now)
+    over_need_cost = sum(round(i["over_need"] * i["cost_price"]) for i in items)
+    over_need_profit = sum(round(i["over_need"] * max(0, i["avg_price"] - i["cost_price"]))
+                           for i in items)
+    # Что из недобора реально теряется, а что закроет следующий заказ: при ритме
+    # 7 дней и окне 21 день до прихода следующего успевает потеряться примерно
+    # треть. Показываем и то и другое, чтобы «упущено» не звало занимать деньги.
+    cadence = int(brief.get("cadence_days") or cover)
+    lost_share = min(1.0, cadence / cover) if cover > 0 else 1.0
     plan = {
         "today": snap["today"],
         "eta_date": brief["eta_date"],
         "order_date": (eta - timedelta(days=lead_days(stages))).isoformat(),
         "cover_days": cover,
-        "covered_until": (eta + timedelta(days=cover)).isoformat(),
+        # «Спрос закрыт до» — по факту строк, а не арифметикой горизонта:
+        # аудит показал, что обещанную дату не доживала НИ ОДНА строка плана.
+        "covered_until": min((i["covered_until"] for i in items if i["covered_until"]),
+                             default=None),
+        "covered_until_target": (eta + timedelta(days=cover)).isoformat(),
+        "covered_full": sum(
+            1 for i in items
+            if i["covered_until"] and i["covered_until"] >= (eta + timedelta(days=cover)).isoformat()
+        ),
         "strategy": brief["strategy"],
         "strategy_title": STRATEGIES[brief["strategy"]]["title"],
         "budget": brief["budget"],
@@ -842,9 +912,11 @@ def plan_order(snap: dict, brief: dict, ctx: dict, stages: list[dict],
         "rest": round(res["money"] - res["spent"]),
         "cost_total": cost_total,
         "pay_now": pay_now,
-        "pay_later": max(0, cost_total - pay_now),
-        "stages": stage_schedule(eta - timedelta(days=lead_days(stages)), stages),
-        "payments": payment_plan(eta - timedelta(days=lead_days(stages)), stages, cost_total),
+        "pay_later": pay_later,
+        "over_need_cost": over_need_cost,
+        "over_need_profit": over_need_profit,
+        "stages": stage_schedule(order_date, stages),
+        "payments": payments,
         "new_items": list(brief.get("new_items") or []),
         "new_items_cost": res["new_cost"],
         "new_items_over_budget": res["new_over_budget"],
@@ -857,7 +929,17 @@ def plan_order(snap: dict, brief: dict, ctx: dict, stages: list[dict],
         # позициям, что дожили до расчёта: отсеянные раньше (stale, small_need)
         # в cands не попадают, поэтому 0 ₽ здесь означал бы «всё влезло» —
         # ровно противоположное правде. Честнее не число, а None.
-        "lost_revenue": None if coverage["partial"] else round(lost_revenue),
+        # Три разных числа вместо одного, которое смешивало всё:
+        #   missing — маржа позиций, не вошедших в заказ совсем (это и есть
+        #             то, что лежит в таблице «не влезло»);
+        #   short   — недобор по позициям, которые в заказе;
+        #   at_risk — та часть обоих, которую НЕ закроет следующий заказ.
+        "lost": None if coverage["partial"] else {
+            "missing": round(lost_missing),
+            "short": round(lost_short),
+            "at_risk": round((lost_missing + lost_short) * lost_share),
+            "next_order_days": cadence,
+        },
         "totals": {
             "positions": len(items),
             "units": sum(i["qty"] for i in items),
@@ -867,6 +949,13 @@ def plan_order(snap: dict, brief: dict, ctx: dict, stages: list[dict],
         "moq_skipped": [
             {"base_name": b, "days": d} for b, d in
             sorted(res["moq_skipped"].items(), key=lambda kv: kv[1])[:50]
+        ],
+        # Партия физически дороже лимита доли на позицию — раньше она молча
+        # его нарушала (80,6% бюджета при лимите 30%), теперь позиция уходит
+        # сюда с ценой партии, и человек решает сам.
+        "moq_over_cap": [
+            {"base_name": b, "batch_cost": v, "limit": round(res["cap_per_item"])}
+            for b, v in sorted(res["moq_over_cap"].items(), key=lambda kv: -kv[1])[:50]
         ],
         "review": {  # то, что система считать не берётся — решает человек
             "low_data": [_short(r) for r in skipped["low_data"]][:50],
@@ -883,22 +972,69 @@ def plan_order(snap: dict, brief: dict, ctx: dict, stages: list[dict],
         },
         "categories": _by_category(items),
     }
-    # Честная диагностика вместо пустого экрана: минимальная партия может не
-    # сходиться с ритмом заказов (партия на 50 шт при заказах раз в неделю —
-    # это запас на месяцы). Тогда прямо говорим, что упёрлись именно в неё.
-    if not items and res["moq_skipped"]:
-        need_days = min(res["moq_skipped"].values())
-        plan["blocked"] = {
-            "reason": "moq",
-            "count": len(res["moq_skipped"]),
-            "suggest_cover_days": need_days,
-            "text": (
-                f"Ни одна позиция не набирает минимальную партию: при нынешнем "
-                f"горизонте {cover} дн такая партия — запас на {need_days} дн и "
-                f"дольше. Либо увеличьте интервал между заказами, либо снизьте "
-                f"минимальную партию, либо закажите этот канал реже."
-            ),
-        }
+    # Честная диагностика вместо пустого экрана. Аудит 22.08: одна и та же
+    # фраза про минимальную партию показывалась в трёх РАЗНЫХ ситуациях, и в
+    # самой частой (позиции не назначены на этот канал — состояние по умолчанию
+    # у нового аккаунта со вторым производством) она была просто неверна.
+    if not items:
+        if brief["budget"] <= 0:
+            plan["blocked"] = {"reason": "no_budget", "text":
+                "Не указан бюджет — вернитесь на первый шаг и напишите, "
+                "сколько денег готовы потратить на этот заказ."}
+        elif res["reserve"] >= brief["budget"] and res["new_cost"] > 0:
+            plan["blocked"] = {"reason": "reserve", "text":
+                f"Новинки заняли весь бюджет ({fmt_rub(res['new_cost'])}), "
+                f"на остальное не осталось ничего. Уменьшите количество новинок "
+                f"или поднимите бюджет."}
+        elif skipped["other_production"] and not cands:
+            plan["blocked"] = {"reason": "no_assignment", "count":
+                len(skipped["other_production"]), "text":
+                f"На это производство не назначена ни одна позиция — все "
+                f"{len(skipped['other_production'])} закреплены за другими. "
+                f"Настройте распределение в разделе «Настройки» или перенесите "
+                f"позиции кнопками на странице «Заказ»."}
+        elif res["moq_skipped"] or res["moq_over_cap"]:
+            days = min(res["moq_skipped"].values()) if res["moq_skipped"] else None
+            reach = min(analytics.COVER_MAX_DAYS, days) if days else None
+            tail = (f"Либо снизьте минимальную партию, либо заказывайте этот канал "
+                    f"реже: чтобы партия окупалась, между заказами нужно около "
+                    f"{days} дн.") if days and days > analytics.COVER_MAX_DAYS else (
+                    f"Либо снизьте минимальную партию, либо увеличьте интервал "
+                    f"между заказами до {reach} дн." if reach else
+                    "Партия дороже лимита на позицию — поднимите лимит или бюджет.")
+            plan["blocked"] = {
+                "reason": "moq",
+                "count": len(res["moq_skipped"]) + len(res["moq_over_cap"]),
+                "suggest_cover_days": days,
+                "text": (f"Ни одна позиция не набирает минимальную партию: при "
+                         f"горизонте {cover} дн такая партия — запас на {days} дн "
+                         f"и дольше. {tail}") if days else
+                        (f"Ни одна позиция не проходит: минимальная партия дороже "
+                         f"лимита на позицию ({fmt_rub(res['cap_per_item'])}). {tail}"),
+            }
+        else:
+            plan["blocked"] = {"reason": "no_candidates", "text":
+                "Ни одна позиция не прошла отбор: нет продаж за последние "
+                f"{ctx.get('fresh_days', FRESH_DAYS)} дн, либо потребность меньше "
+                f"{NEED_MIN} шт, либо не заполнена себестоимость. "
+                "Раскройте блок «Что система считать не берётся» — там видно, кто именно."}
+    # Что мешает нажать «Создать заказ». Блокируем ТОЛЬКО ошибки, а не риски:
+    # предупреждать можно о многом, но не пускать — лишь там, где заказ заведомо
+    # неверен. Неполная себестоимость сюда осознанно НЕ входит: у маленького
+    # бренда её нет почти нигде, и блокировка не дала бы ему сделать ни одного
+    # заказа.
+    stop = []
+    if not items and not plan.get("new_items"):
+        stop.append({"code": "empty", "text": "В плане нет позиций"})
+    if plan["rest"] < 0:
+        stop.append({"code": "over_budget", "text":
+                     f"Заказ выходит за бюджет на {fmt_rub(-plan['rest'])}"})
+    if plan["order_date"] < snap["today"]:
+        stop.append({"code": "past_date", "text":
+                     f"Заказ пришлось бы разместить {plan['order_date']} — "
+                     f"эта дата уже прошла. Сдвиньте дату приёмки."})
+    plan["stop"] = stop
+    plan["can_create"] = not stop
     if coverage["partial"]:
         # Пометка для UI и для api_order_plan_apply: план предварительный —
         # not_included неполон, «а если добавить денег» на обрезке истории
@@ -907,6 +1043,11 @@ def plan_order(snap: dict, brief: dict, ctx: dict, stages: list[dict],
     elif with_sensitivity and brief["budget"] > 0:
         plan["sensitivity"] = _sensitivity(snap, brief, ctx, stages, plan)
     return plan
+
+
+def fmt_rub(value) -> str:
+    """Число рублей строкой с разделителями — для сообщений пользователю."""
+    return f"{round(float(value or 0)):,} ₽".replace(",", " ")
 
 
 def _short(row: dict) -> dict:
@@ -971,7 +1112,7 @@ def build_plan(db: Session, org: Org, snap: dict, raw_brief: dict) -> dict:
     brief = normalize_brief(raw_brief, prod_settings, stages, today)
     if prod is not None:
         brief["production_id"] = prod.id
-        if not (raw_brief or {}).get("moq_units") and prod.moq_units:
+        if not brief.get("moq_explicit") and prod.moq_units:
             brief["moq_units"] = int(prod.moq_units)
     ctx = collect_context(db, org, snap, brief)
     plan = plan_order(snap, brief, ctx, stages)

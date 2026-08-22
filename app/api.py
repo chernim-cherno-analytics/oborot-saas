@@ -1,6 +1,6 @@
 """JSON API. Все эндпоинты — под сессией; данные строго текущей организации."""
 import json
-from datetime import datetime
+from datetime import date, datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field, field_validator
@@ -339,7 +339,15 @@ def api_update_settings(
     body: SettingsIn, ctx: AuthContext = Depends(require_owner_api), db: Session = Depends(get_db)
 ):
     org = db.merge(ctx.org)
-    settings = org.settings
+    # Поверх сырых настроек, а не только известных ключей: Org.settings отдаёт
+    # три поля из DEFAULT_SETTINGS, и любое сохранение затирало бы всё
+    # остальное, что клали туда другие разделы (правило распределения, типы
+    # цен, пики). Сначала берём то, что реально лежит в БД.
+    try:
+        settings = json.loads(org.settings_json or "{}")
+    except ValueError:
+        settings = {}
+    settings.update(org.settings)
     if body.thresholds is not None:
         t = body.thresholds
         if not t.weak < t.dull < t.good:
@@ -810,7 +818,11 @@ def api_assign_rule(
     bad = [str(v) for v in body.assign_map.values() if v not in valid]
     if bad:
         raise HTTPException(422, "В правиле указаны неизвестные производства: " + ", ".join(bad))
-    settings = org.settings
+    try:
+        settings = json.loads(org.settings_json or "{}")
+    except ValueError:
+        settings = {}
+    settings.update(org.settings)
     settings.update(analytics.extra_settings(org))
     settings["assign_source"] = body.assign_source
     settings["assign_map"] = {str(k): int(v) for k, v in body.assign_map.items()}
@@ -920,6 +932,7 @@ class OrderPlanIn(BaseModel):
     cadence_days: int | None = None        # как часто размещаются заказы
     safety_days: int | None = None
     strategy: str | None = None            # protect | balance | grow
+    width_days: int | None = None          # сколько дней продаж закрывает строка (0 = всю потребность)
     max_share_pct: int | None = None
     moq_units: int | None = None
     reserve_new_pct: int | None = None
@@ -943,7 +956,14 @@ def _plan(db: Session, ctx: AuthContext, body: OrderPlanIn) -> dict:
 
 
 def _apply_overrides(plan: dict, overrides: dict, snap: dict) -> None:
-    """Ручные правки количеств поверх расчёта (строки плана и итоги)."""
+    """Ручные правки количеств поверх расчёта.
+
+    Аудит 22.08.2026: раньше пересчитывались только строки и итоги, а календарь
+    платежей, «хватит до», «упущено» и чувствительность оставались от исходного
+    расчёта — после правки 10 → 5000 календарь расходился с планом на 20,1 млн ₽.
+    Теперь правка пересобирает ВСЁ, что зависит от количеств.
+    """
+    from app import order_planner as op
     from app.analytics import size_split
     items = {i["base_name"]: i for i in plan["items"]}
     for base, qty in overrides.items():
@@ -956,26 +976,71 @@ def _apply_overrides(plan: dict, overrides: dict, snap: dict) -> None:
             continue
         it["qty"] = qty
         it["unmet"] = max(0, it["need"] - qty)
+        it["over_need"] = max(0, qty - it["need"])
         it["cost_total"] = round(qty * it["cost_price"])
-        it["pay_now"] = round(it["cost_total"] * (plan["pay_now"] / plan["cost_total"])) \
-            if plan.get("cost_total") else it["cost_total"]
         it["expected_profit"] = round(qty * max(0, it["avg_price"] - it["cost_price"]))
         src = (snap["items"].get(base) or {}).get("sizes") or {}
         it["sizes"] = size_split(src, qty)
+        rate = it.get("rate") or 0
+        it["days_to_sell"] = int(qty / rate) if rate > 0 else None
+        it["covered_until"] = (
+            (date.fromisoformat(plan["eta_date"])
+             + timedelta(days=min(int((it["proj_stock"] + qty) / rate), 3650))).isoformat()
+            if rate > 0 else None
+        )
         it["why"] = list(dict.fromkeys(list(it.get("why") or []) + ["manual"]))
         it["why_text"] = "изменено вручную"
     plan["items"] = [i for i in plan["items"] if i["qty"] > 0]
     plan["cost_total"] = sum(i["cost_total"] for i in plan["items"])
-    plan["pay_now"] = sum(i["pay_now"] for i in plan["items"])
+    # Календарь платежей пересобираем от новой себестоимости, «сейчас» —
+    # снова первый транш календаря, а не отдельная формула.
+    stages = plan.get("stages") or []
+    plan["payments"] = op.payment_plan(
+        date.fromisoformat(plan["order_date"]),
+        [{"name": st["name"], "lead_days": st["lead_days"],
+          "cost_share": st["cost_share"], "prepay_share": st.get("prepay_share", 1.0)}
+         for st in stages],
+        plan["cost_total"],
+    )
+    plan["pay_now"] = plan["payments"][0]["amount"] if plan["payments"] else plan["cost_total"]
     plan["pay_later"] = max(0, plan["cost_total"] - plan["pay_now"])
     plan["spent"] = plan["pay_now"] if plan["budget_scope"] == "now" else plan["cost_total"]
     plan["rest"] = plan["budget"] - plan["reserve_new"] - plan["spent"]
+    plan["over_need_cost"] = sum(round(i["over_need"] * i["cost_price"]) for i in plan["items"])
+    plan["over_need_profit"] = sum(
+        round(i["over_need"] * max(0, i["avg_price"] - i["cost_price"])) for i in plan["items"])
+    plan["covered_until"] = min(
+        (i["covered_until"] for i in plan["items"] if i["covered_until"]), default=None)
+    plan["covered_full"] = sum(
+        1 for i in plan["items"]
+        if i["covered_until"] and i["covered_until"] >= (plan.get("covered_until_target") or ""))
+    if isinstance(plan.get("lost"), dict):
+        short = sum(round(i["unmet"] * max(0, i["avg_price"] - i["cost_price"]))
+                    for i in plan["items"])
+        plan["lost"]["short"] = short
+        cover = plan.get("cover_days") or 1
+        share = min(1.0, (plan["lost"].get("next_order_days") or cover) / cover)
+        plan["lost"]["at_risk"] = round((plan["lost"]["missing"] + short) * share)
     plan["totals"] = {
         "positions": len(plan["items"]),
         "units": sum(i["qty"] for i in plan["items"]),
         "expected_profit": sum(i["expected_profit"] for i in plan["items"]),
         "expected_revenue": sum(i["qty"] * i["avg_price"] for i in plan["items"]),
     }
+    # «А если добавить денег» после ручных правок отвечает на другой вопрос —
+    # честнее не показывать, чем показывать устаревшее.
+    plan.pop("sensitivity", None)
+    stop = []
+    if not plan["items"] and not plan.get("new_items"):
+        stop.append({"code": "empty", "text": "В плане нет позиций"})
+    if plan["rest"] < 0:
+        stop.append({"code": "over_budget", "text":
+                     f"Заказ выходит за бюджет на {op.fmt_rub(-plan['rest'])}"})
+    if plan["order_date"] < plan["today"]:
+        stop.append({"code": "past_date", "text":
+                     f"Заказ пришлось бы разместить {plan['order_date']} — эта дата уже прошла."})
+    plan["stop"] = stop
+    plan["can_create"] = not stop
     plan["manual_edit"] = True
 
 
@@ -1036,7 +1101,7 @@ def api_order_plan_save(
         ),
         result_json=json.dumps(
             {"items": plan["items"], "totals": plan["totals"],
-             "spent": plan["spent"], "lost_revenue": plan["lost_revenue"]},
+             "spent": plan["spent"], "lost": plan.get("lost")},
             ensure_ascii=False,
         ),
     )
