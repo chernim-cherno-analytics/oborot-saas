@@ -266,6 +266,40 @@ def run() -> int:
         check("метка «идёт отправка» снята — повтор возможен, а не залипание",
               r.status_code == 409 and "скопировали" in str((r.json() or {}).get("detail") or ""),
               f"status={r.status_code} body={r.text[:160]}")
+        # Ветка «после сбоя отправки». Через живой сценарий её не достать:
+        # поиск ДО создания уже находит двойников и останавливает отправку,
+        # так что до создания дело не доходит. Проверяем сам контракт —
+        # признак `after_create` и текст, который по нему выбирается.
+        import asyncio
+        from app.ms_writeback import AmbiguousExistingOrder, find_existing_order
+
+        class _TwoDocs:
+            async def search_purchase_orders(self, since):
+                return [{"name": "U-0001", "description": "x [oborot#7]"},
+                        {"name": "U-0002", "description": "x [oborot#7]"}]
+
+        def _raise(after):
+            try:
+                asyncio.run(find_existing_order(_TwoDocs(), "[oborot#7]",
+                                                after_create=after))
+            except AmbiguousExistingOrder as e:
+                return e
+            return None
+
+        e_before, e_after = _raise(False), _raise(True)
+        check("поиск ДО создания поднимает отказ с признаком after_create=False",
+              e_before is not None and e_before.after_create is False,
+              f"got={e_before and e_before.after_create}")
+        check("поиск ПОСЛЕ сбоя — с признаком after_create=True",
+              e_after is not None and e_after.after_create is True,
+              f"got={e_after and e_after.after_create}")
+        check("в отказе перечислены оба документа",
+              str(e_after) == "U-0001, U-0002", f"got={e_after}")
+        page_src = open(ROOT / "app" / "routes_connect.py", encoding="utf-8").read()
+        check("для ветки после сбоя есть отдельный текст, не обещающий «не создан»",
+              "exc.after_create" in page_src
+              and "мог быть только что создан" in page_src
+              and "НЕ отправляйте заказ повторно" in page_src)
     finally:
         for t in twins:
             mock_ms.PURCHASE_ORDERS.remove(t)

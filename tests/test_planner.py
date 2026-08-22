@@ -686,6 +686,11 @@ def _truncate_history(days: int) -> None:
         con.close()
 
 
+def json_dumps(obj) -> str:
+    import json as _j
+    return _j.dumps(obj, ensure_ascii=False)
+
+
 def _sql(query: str, *args):
     import sqlite3
     con = sqlite3.connect(DB_PATH)
@@ -1270,8 +1275,48 @@ def api_checks() -> None:
         check("предпросмотр отправляет ручные правки на сервер",
               "previewBody.overrides" in page_prev,
               "без этого строка без себестоимости не появится в плане")
+        check("правки уходят при ЛЮБОМ пересчёте, а не из одного места",
+              "window.preview = function(step, keepEdits){" in page_prev
+              and "sendEdits" not in page_prev,
+              "иначе соседний пересчёт молча терял добавленную позицию")
         check("браузер не считает маржу там, где нет себестоимости",
               "if(!i.no_cost && i.cost_price > 0) profit" in page_prev)
+        check("анкета возит режим горизонта (иначе «Повторить» считает по-новому)",
+              "cover_mode: STATE.cover_mode" in page_prev
+              and "last.cover_mode" in page_prev)
+
+        # Отказ применить правку обязан быть ВИДЕН, а не молчаливым
+        rej = c.post("/api/order-plan/preview", json=dict(
+            body_hz, overrides={"Пальто «Которого нет»": 10})).json()
+        check("отказ по несуществующей позиции назван явно",
+              any(r.get("reason") == "not_in_catalog" and r.get("count") == 1
+                  for r in (rej.get("overrides_rejected") or [])),
+              f"rejected={rej.get('overrides_rejected')}")
+        check("непроверенное имя НЕ возвращается обратно в ответе",
+              "Которого нет" not in json_dumps(rej.get("overrides_rejected") or []),
+              f"rejected={rej.get('overrides_rejected')}")
+        blocked = c.post("/api/order-plan/preview", json=dict(
+            body_hz, exclude_categories=[plan_auto["items"][0]["category"]],
+            overrides={in_plan_name: 40})).json()
+        check("отказ по бизнес-правилу тоже назван, а не проглочен",
+              any(r.get("base_name") == in_plan_name
+                  and r.get("reason") == "not_offered"
+                  for r in (blocked.get("overrides_rejected") or [])),
+              f"rejected={blocked.get('overrides_rejected')}")
+        check("успешная правка ничего не отклоняет",
+              (manual.get("overrides_rejected") or []) == [],
+              f"rejected={manual.get('overrides_rejected')}")
+
+        # Огромные числа в ЛЮБОМ поле анкеты не должны давать 500
+        for fld in ("budget", "moq_units", "cadence_days", "max_share_pct",
+                    "reserve_new_pct", "safety_days"):
+            rr = c.post("/api/order-plan/preview", json=dict(body_hz, **{fld: 10 ** 400}))
+            check(f"огромное значение в «{fld}» не роняет запрос",
+                  rr.status_code in (200, 422), f"status={rr.status_code}")
+        rr = c.post("/api/order-plan/preview", json=dict(
+            body_hz, new_items=[{"name": "Пальто", "qty": 10 ** 400, "cost": 1000}]))
+        check("огромное количество новинки не роняет запрос",
+              rr.status_code in (200, 422), f"status={rr.status_code}")
 
         # ── «Повторить» старый план не должен менять горизонт ───────────────
         rep = c.post("/api/order-plan/preview",
@@ -1289,18 +1334,24 @@ def api_checks() -> None:
               "история не может быть глубже года — требовать больше нельзя")
 
         # ── Позиция, втащенная галочкой, — решение человека ─────────────────
-        low = (plan_auto.get("review") or {}).get("low_data") or []
-        if low:
-            lb = low[0]["base_name"]
-            forced = c.post("/api/order-plan/preview",
-                            json=dict(body_hz, must_have=[lb])).json()
-            frow = next((i for i in forced["items"] if i["base_name"] == lb), None)
-            check("позиция из «решаете вы» помечена как решение человека",
-                  frow is None or frow.get("forced_by_user") is True,
-                  f"forced_by_user={frow and frow.get('forced_by_user')}")
-        else:
-            check("позиция из «решаете вы» помечена как решение человека",
-                  True, "в демо-данных нет позиций low_data — проверка пропущена")
+        # Позицию из ИСКЛЮЧЁННОЙ категории система сама бы не взяла — значит
+        # галочка «Взять» здесь и есть решение человека. А обычная топовая
+        # позиция помечаться не должна: её система рекомендует и без галочки.
+        top = plan_auto["items"][0]["base_name"]
+        top_cat = plan_auto["items"][0]["category"]
+        fc = c.post("/api/order-plan/preview", json=dict(
+            body_hz, exclude_categories=[top_cat], must_have=[top])).json()
+        frow = next((i for i in fc["items"] if i["base_name"] == top), None)
+        check("позиция, которую без галочки не взяли бы, помечена решением человека",
+              frow is not None and frow.get("forced_by_user") is True,
+              f"forced_by_user={frow and frow.get('forced_by_user')}")
+        plain = c.post("/api/order-plan/preview",
+                       json=dict(body_hz, must_have=[top])).json()
+        prow = next((i for i in plain["items"] if i["base_name"] == top), None)
+        check("а позицию, которую система рекомендует сама, — НЕ помечает",
+              prow is not None and prow.get("forced_by_user") is False,
+              f"forced_by_user={prow and prow.get('forced_by_user')} "
+              f"(наличия имени в must_have для пометки мало)")
 
         print("\n14c. Мастер заказа на догружаемой истории (деплой П1)")
         eta_full = (date.today() + timedelta(days=45)).isoformat()
