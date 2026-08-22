@@ -92,6 +92,49 @@
 
   <div class="card">
     <div class="card-head">
+      <h2>Каналы производства: сроки, этапы и деньги</h2>
+    </div>
+    <div class="card-body">
+      <p style="margin:0 0 10px; font-size:12px; color:var(--text-soft);">
+        У каждого канала свои сроки и свой порядок оплаты. «Под ключ» (обычно Китай) — один этап:
+        заказали, через N дней приехало. Своё производство — сначала закупка ткани, и только после
+        её прихода начинается пошив; значит срок складывается, а деньги уходят частями.
+        Из этих цифр «Мастер заказа» считает <b>дату размещения</b>, <b>календарь платежей</b>
+        и <b>сколько денег нужно прямо сейчас</b>. Доли себестоимости по этапам должны давать 100%.
+      </p>
+      <div id="chan-box"><div class="loading-stub">Загрузка…</div></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-head">
+      <h2>Цены из МойСклада</h2>
+      <div class="spacer"></div>
+      <button class="btn sm primary" type="button" id="btn-save-prices">Сохранить</button>
+    </div>
+    <div class="card-body">
+      <p style="margin:0 0 10px; font-size:12px; color:var(--text-soft);">
+        <b>Закупочная цена</b> в МойСкладе часто содержит не всю себестоимость: например, если ткань
+        закупается отдельно, в ней лежит только пошив — и тогда система считает заказ дешевле,
+        чем он есть. Полную себестоимость обычно держат отдельным <b>типом цены</b>. Укажите, какой
+        именно — и все деньги (заказ, маржа, «заморожено в товаре») будут считаться по нему.
+      </p>
+      <div class="form-row" style="align-items:flex-end;">
+        <div class="field" style="max-width:300px;">
+          <label for="price-cost">Полная себестоимость — тип цены</label>
+          <select class="input" id="price-cost"></select>
+        </div>
+        <div class="field" style="max-width:300px;">
+          <label for="price-sale">Цена продажи — тип цены</label>
+          <select class="input" id="price-sale"></select>
+        </div>
+      </div>
+      <div class="hint" id="price-hint" style="margin-top:9px;"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-head">
       <h2>Распределение позиций по производствам</h2>
       <div class="spacer"></div>
       <button class="btn sm primary" type="button" id="btn-save-assign">Сохранить</button>
@@ -235,6 +278,8 @@ document.addEventListener("DOMContentLoaded", function () {
     renderWarehouses(settings.warehouses || []);
     renderConnection(settings.connection || null, settings.role === "owner");
     renderTeam(settings.members || []);
+    renderPriceTypes(settings);
+    loadChannels(settings.role === "owner");
     loadExclusions();
   }).catch(function () {
     document.getElementById("wh-box").innerHTML = '<p class="muted" style="margin:0;">Не удалось загрузить.</p>';
@@ -273,6 +318,223 @@ document.addEventListener("DOMContentLoaded", function () {
 
   // ── Распределение позиций по производствам ────────────────────────────────
   var ASSIGN_SRC = {}, ASSIGN_PRODS = [], ASSIGN_MAP = {};
+
+
+  // ── Цены из МойСклада ──────────────────────────────────────────────────────
+  function renderPriceTypes(st) {
+    var types = st.price_types || [];
+    var isOwner = st.role === "owner";
+    function fill(id, cur) {
+      var sel = document.getElementById(id);
+      var opts = ['<option value="">— угадывать по названию —</option>'];
+      var seen = false;
+      types.forEach(function (t) {
+        if (String(t).toLowerCase() === String(cur || "").toLowerCase()) seen = true;
+        opts.push('<option value="' + esc(t) + '">' + esc(t) + "</option>");
+      });
+      // Сохранённый тип может не встретиться в текущем ассортименте (например,
+      // после переименования в МС) — не теряем выбор молча.
+      if (cur && !seen) opts.push('<option value="' + esc(cur) + '">' + esc(cur) + " (нет в ассортименте)</option>");
+      sel.innerHTML = opts.join("");
+      sel.value = cur || "";
+      sel.disabled = !isOwner;
+    }
+    fill("price-cost", st.price_type_cost || "");
+    fill("price-sale", st.price_type_sale || "");
+    var btn = document.getElementById("btn-save-prices");
+    if (btn) btn.style.display = isOwner ? "" : "none";
+    var hint = document.getElementById("price-hint");
+    hint.textContent = types.length
+      ? "После смены типа цены запустите синхронизацию — цены пересчитаются при следующем проходе."
+      : "Типы цен появятся здесь после первой синхронизации с МойСкладом.";
+    api("/api/order-plan/options").then(function (o) {
+      var full = o.cost_source_full || 0, all = o.positions || 0, no = o.no_cost_count || 0;
+      var parts = [];
+      if (all) parts.push("Полная себестоимость заполнена у " + full + " позиций из " + all +
+                          "; у остальных считаем по закупочной цене.");
+      if (no) parts.push("Совсем без себестоимости — " + no + " поз.: в деньгах заказа они не участвуют.");
+      if (parts.length) hint.textContent = parts.join(" ") + " " + hint.textContent;
+    }).catch(function () {});
+  }
+
+  document.getElementById("btn-save-prices").addEventListener("click", function () {
+    saveSettings({
+      price_type_cost: document.getElementById("price-cost").value,
+      price_type_sale: document.getElementById("price-sale").value
+    }, "Типы цен сохранены").catch(function (e) { toast(e.message, "error"); });
+  });
+
+  // ── Каналы производства: этапы, сроки, деньги ─────────────────────────────
+  var CHAN = [];          // производства с этапами
+  var CHAN_OWNER = false;
+
+  function stageRows(p, i) {
+    return (p.stages || []).map(function (st, k) {
+      return '<tr data-p="' + p.id + '" data-k="' + k + '">' +
+        '<td><input class="input st-name" value="' + esc(st.name || "") + '"></td>' +
+        '<td><input class="input num st-lead" type="number" min="1" max="365" value="' + (st.lead_days || 1) + '"></td>' +
+        '<td><input class="input num st-cost" type="number" min="0" max="100" value="' +
+          Math.round((st.cost_share || 0) * 100) + '"></td>' +
+        '<td><input class="input num st-pre" type="number" min="0" max="100" value="' +
+          Math.round((st.prepay_share == null ? 1 : st.prepay_share) * 100) + '"></td>' +
+        '<td><input class="input num st-min" type="number" min="0" max="10000" value="' + (st.min_units || 0) + '"></td>' +
+        '<td>' + ((p.stages || []).length > 1
+          ? '<button class="btn sm st-del" type="button" title="Убрать этап">×</button>' : "") + '</td>' +
+        "</tr>";
+    }).join("");
+  }
+
+  function chanCard(p) {
+    var lock = CHAN_OWNER ? "" : " disabled";
+    return '<div class="chan" data-p="' + p.id + '" style="border:1px solid var(--line,#e5e2dc); border-radius:10px; padding:12px; margin-bottom:12px;">' +
+      '<div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-bottom:9px;">' +
+        '<b>' + esc(p.name) + "</b>" +
+        (p.is_main ? '<span class="badge gray">основное</span>' : "") +
+        '<span class="hint" style="margin:0;" data-sum="' + p.id + '"></span>' +
+        (CHAN_OWNER ? '<div class="spacer" style="flex:1"></div>' +
+          '<button class="btn sm ch-preset" data-p="' + p.id + '" data-v="turnkey" type="button">Под ключ</button>' +
+          '<button class="btn sm ch-preset" data-p="' + p.id + '" data-v="fabric_sewing" type="button">Ткань → пошив</button>' +
+          '<button class="btn sm ch-add" data-p="' + p.id + '" type="button">+ этап</button>' +
+          '<button class="btn sm primary ch-save" data-p="' + p.id + '" type="button">Сохранить</button>' : "") +
+      "</div>" +
+      '<div class="form-row" style="align-items:flex-end;">' +
+        '<div class="field" style="max-width:210px;"><label>Ритм заказов, дней</label>' +
+          '<input class="input num ch-cad" type="number" min="0" max="365" value="' + (p.cadence_days || 0) + '"' + lock + '>' +
+          '<div class="hint">0 — как в общих настройках</div></div>' +
+        '<div class="field" style="max-width:210px;"><label>Минимальная партия, шт</label>' +
+          '<input class="input num ch-moq" type="number" min="0" max="10000" value="' + (p.moq_units || 0) + '"' + lock + '>' +
+          '<div class="hint">0 — ограничения нет</div></div>' +
+      "</div>" +
+      '<table class="tbl" style="margin-top:9px;"><thead><tr>' +
+        "<th>Этап</th><th style=\"width:96px\">Срок, дн</th>" +
+        "<th style=\"width:120px\" title=\"какая часть себестоимости приходится на этот этап\">Доля себес., %</th>" +
+        "<th style=\"width:130px\" title=\"сколько от стоимости этапа платится при его старте, остальное — по завершении\">Предоплата, %</th>" +
+        "<th style=\"width:110px\">Мин. партия</th><th style=\"width:40px\"></th>" +
+      '</tr></thead><tbody data-rows="' + p.id + '">' + stageRows(p) + "</tbody></table>" +
+      '<div class="hint" data-warn="' + p.id + '" style="margin-top:7px;"></div>' +
+      "</div>";
+  }
+
+  function chanRecalc(pid) {
+    var wrap = document.querySelector('.chan[data-p="' + pid + '"]');
+    if (!wrap) return;
+    var lead = 0, cost = 0, first = null;
+    Array.prototype.forEach.call(wrap.querySelectorAll("tbody tr"), function (tr, i) {
+      var l = Number(tr.querySelector(".st-lead").value) || 0;
+      var c = Number(tr.querySelector(".st-cost").value) || 0;
+      var pre = Number(tr.querySelector(".st-pre").value) || 0;
+      lead += l; cost += c;
+      if (i === 0) first = c * pre / 100;
+    });
+    var sum = wrap.querySelector('[data-sum="' + pid + '"]');
+    if (sum) sum.textContent = "срок " + lead + " дн · в день размещения платится " +
+      Math.round(first || 0) + "% себестоимости";
+    var warn = wrap.querySelector('[data-warn="' + pid + '"]');
+    if (warn) warn.innerHTML = Math.abs(cost - 100) > 0.5
+      ? '<span style="color:#8a0003">Доли себестоимости дают ' + Math.round(cost) +
+        "% вместо 100% — деньги по этапам разъедутся.</span>"
+      : (Math.round(first || 0) === 0
+        ? "В день размещения по этому каналу не платится ничего — «Мастер заказа» будет сравнивать бюджет с полной стоимостью заказа."
+        : "");
+  }
+
+  function chanWire() {
+    var box = document.getElementById("chan-box");
+    Array.prototype.forEach.call(box.querySelectorAll("input"), function (el) {
+      el.addEventListener("input", function () {
+        var wrap = el.closest(".chan");
+        if (wrap) chanRecalc(Number(wrap.dataset.p));
+      });
+    });
+    Array.prototype.forEach.call(box.querySelectorAll(".st-del"), function (b) {
+      b.addEventListener("click", function () {
+        var tr = b.closest("tr"), pid = Number(tr.dataset.p);
+        tr.parentNode.removeChild(tr);
+        chanRecalc(pid);
+      });
+    });
+    Array.prototype.forEach.call(box.querySelectorAll(".ch-add"), function (b) {
+      b.addEventListener("click", function () {
+        var pid = Number(b.dataset.p);
+        var p = CHAN.filter(function (x) { return x.id === pid; })[0];
+        if (!p) return;
+        p.stages = readStages(pid);
+        p.stages.push({name: "Этап " + (p.stages.length + 1), lead_days: 14,
+                       cost_share: 0, prepay_share: 1, min_units: 0});
+        renderChannels();
+      });
+    });
+    Array.prototype.forEach.call(box.querySelectorAll(".ch-preset"), function (b) {
+      b.addEventListener("click", function () {
+        var pid = Number(b.dataset.p);
+        saveChannel(pid, {preset: b.dataset.v});
+      });
+    });
+    Array.prototype.forEach.call(box.querySelectorAll(".ch-save"), function (b) {
+      b.addEventListener("click", function () {
+        var pid = Number(b.dataset.p);
+        var wrap = document.querySelector('.chan[data-p="' + pid + '"]');
+        var stages = readStages(pid);
+        var total = stages.reduce(function (a, x) { return a + x.cost_share; }, 0);
+        if (!stages.length) { toast("Нужен хотя бы один этап", "error"); return; }
+        if (Math.abs(total - 1) > 0.005 &&
+            !confirm("Доли себестоимости дают " + Math.round(total * 100) +
+                     "% вместо 100%. Система нормализует их сама. Сохранить?")) return;
+        saveChannel(pid, {
+          stages: stages,
+          cadence_days: Number(wrap.querySelector(".ch-cad").value) || 0,
+          moq_units: Number(wrap.querySelector(".ch-moq").value) || 0
+        });
+      });
+    });
+  }
+
+  function readStages(pid) {
+    var wrap = document.querySelector('.chan[data-p="' + pid + '"]');
+    if (!wrap) return [];
+    return Array.prototype.map.call(wrap.querySelectorAll("tbody tr"), function (tr, i) {
+      return {
+        key: "s" + (i + 1),
+        name: (tr.querySelector(".st-name").value || ("Этап " + (i + 1))).trim(),
+        lead_days: Number(tr.querySelector(".st-lead").value) || 1,
+        cost_share: (Number(tr.querySelector(".st-cost").value) || 0) / 100,
+        prepay_share: (Number(tr.querySelector(".st-pre").value) || 0) / 100,
+        min_units: Number(tr.querySelector(".st-min").value) || 0
+      };
+    });
+  }
+
+  function saveChannel(pid, body) {
+    api("/api/productions/" + pid + "/setup", {method: "POST", body: body})
+      .then(function (p) {
+        CHAN = CHAN.map(function (x) { return x.id === p.id ? p : x; });
+        renderChannels();
+        toast("Канал «" + p.name + "» сохранён: срок " + p.lead_days + " дн", "success");
+      }).catch(function (e) { toast(e.message, "error"); });
+  }
+
+  function renderChannels() {
+    var box = document.getElementById("chan-box");
+    if (!CHAN.length) {
+      box.innerHTML = '<div class="hint">Производств пока нет — добавьте их на странице «Заказ».</div>';
+      return;
+    }
+    box.innerHTML = CHAN.map(chanCard).join("") +
+      (CHAN_OWNER ? "" : '<div class="hint">Менять условия производства может только владелец.</div>');
+    chanWire();
+    CHAN.forEach(function (p) { chanRecalc(p.id); });
+  }
+
+  function loadChannels(isOwner) {
+    CHAN_OWNER = !!isOwner;
+    api("/api/productions").then(function (d) {
+      CHAN = d.productions || [];
+      renderChannels();
+    }).catch(function (e) {
+      document.getElementById("chan-box").innerHTML =
+        '<div class="hint">Не удалось загрузить: ' + esc(e.message) + "</div>";
+    });
+  }
 
   function renderAssign() {
     var src = document.getElementById("assign-source").value;
@@ -409,13 +671,29 @@ document.addEventListener("DOMContentLoaded", function () {
       box.innerHTML = '<p class="muted" style="margin:0;">Ничего не исключено — все позиции участвуют в аналитике.</p>';
       return;
     }
-    box.innerHTML = list.map(function (e) {
+    // Разделяем «система решила сама» и «выбрал человек»: аудит 22.08 —
+    // владелец видел общий список без объяснения, почему товар туда попал,
+    // и не понимал, можно ли это трогать.
+    function row(e) {
       return '<div class="wh-row">' +
         '<div style="flex:1;">' + esc(e.base_name) +
-        ' <span class="muted" style="font-size:12px;">' + e.variants + ' вар.</span></div>' +
+        ' <span class="muted" style="font-size:12px;">' + e.variants + ' вар.' +
+        (e.reason ? " · " + esc(e.reason) : "") + "</span></div>" +
         '<button class="btn btn-sm excl-return" data-base="' + esc(e.base_name) + '">Вернуть в аналитику</button>' +
         "</div>";
-    }).join("");
+    }
+    var auto = list.filter(function (e) { return e.by_rule; });
+    var hand = list.filter(function (e) { return !e.by_rule; });
+    box.innerHTML =
+      (auto.length
+        ? '<div class="hint" style="margin:0 0 7px;"><b>Система отложила ' + auto.length +
+          ' поз.</b> при синхронизации — по категории или по слову в названии. ' +
+          'Если что-то попало сюда зря, верните одной кнопкой.</div>' + auto.map(row).join("")
+        : "") +
+      (hand.length
+        ? '<div class="hint" style="margin:' + (auto.length ? "12px" : "0") + ' 0 7px;"><b>Исключено вручную — ' +
+          hand.length + ' поз.</b></div>' + hand.map(row).join("")
+        : "");
     box.querySelectorAll(".excl-return").forEach(function (btn) {
       btn.addEventListener("click", function () {
         btn.disabled = true;

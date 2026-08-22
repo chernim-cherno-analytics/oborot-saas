@@ -377,10 +377,14 @@
     var eta = document.getElementById("eta");
     if(!eta.dataset.touched) eta.value = isoLocal(d);
     if(p.cadence_days) { STATE.cadence = p.cadence_days; segInitValue("cadSeg", p.cadence_days); }
-    document.getElementById("prodHint").textContent =
+    var share = Math.round(p.prepay_now_share*100);
+    document.getElementById("prodHint").innerHTML =
       "Срок производства " + p.lead_days + " дн — сумма этапов. " +
-      (p.staged ? ("Сейчас платится только первый этап — это " + Math.round(p.prepay_now_share*100) + "% себестоимости.")
-                : "Один этап: платится весь заказ.");
+      (share === 0
+        ? "В день размещения по этому каналу не платится ничего — бюджет сравним с полной стоимостью заказа."
+        : p.staged ? ("Сейчас платится только первый этап — это " + share + "% себестоимости.")
+                   : "Один этап: платится весь заказ.") +
+      ' <a href="/settings">Изменить условия канала</a>';
     document.getElementById("moqHint").textContent = p.moq_units
       ? ("0 — берётся минимальная партия производства: " + p.moq_units + " шт")
       : "0 — минимальные партии берутся из этапов производства";
@@ -523,11 +527,13 @@
   function renderCards(){
     var p = STATE.plan, t = liveTotals();
     var budget = p.budget || 0;
-    var spent = (p.budget_scope === "now") ? t.pay_now : t.cost;
+    var spent = (p.budget_basis === "now") ? t.pay_now : t.cost;
     var left = budget - (p.reserve_new||0) - spent;
     var covN = t.covered_full, covAll = t.positions;
     document.getElementById("cards").innerHTML =
-      '<div class="card"><div class="l">Заплатить сейчас</div><div class="v">'+fmtR(t.pay_now)+'</div>'+
+      '<div class="card"><div class="l">'+(p.budget_note
+          ? ('Первый платёж '+dstr((p.payments||[])[0] && p.payments[0].date))
+          : 'Заплатить сейчас')+'</div><div class="v">'+fmtR(t.pay_now)+'</div>'+
         '<div class="s">из бюджета '+fmtR(budget)+
         (p.reserve_new? (" · новинки "+fmtR(p.reserve_new)) : "")+
         ' · свободно '+fmtR(left)+'</div></div>'+
@@ -543,8 +549,16 @@
       '<div class="card"><div class="l">Первая позиция кончится</div><div class="v" style="font-size:16px">'+dstr(t.covered_until)+'</div>'+
         '<div class="s">'+(covAll ? ('полностью закрыто '+covN+' из '+covAll+' · цель '+dstr(p.covered_until_target)) : 'на складе '+dstr(p.eta_date))+'</div></div>';
     var warn = document.getElementById("budgetWarn");
-    warn.innerHTML = (left < 0)
-      ? '<div class="err">Заказ выходит за бюджет на '+fmtR(-left)+' — уменьшите количества или поднимите бюджет.</div>' : "";
+    // budget_note появляется, когда по каналу в день размещения не платится
+    // ничего: «денег на сейчас» как ограничения не существует, и движок
+    // сравнивал бюджет с полной стоимостью заказа. Молчать об этом нельзя —
+    // иначе цифры на карточках выглядят как ошибка.
+    warn.innerHTML =
+      (p.budget_note ? '<div class="warn">'+esc(p.budget_note)+'</div>' : "") +
+      (left < 0
+        ? '<div class="err">Заказ выходит за бюджет на '+fmtR(-left)+
+          ' — уменьшите количества или поднимите бюджет.</div>'
+        : "");
     renderPayments();
     renderCash();
     var btn = document.getElementById("mkOrder");
@@ -952,12 +966,23 @@
 
     var opt = r[3] || {};
     var cats = opt.categories || [];
+    // Предупреждение про деньги должно стоять на ПЕРВОМ экране: со второго
+    // есть кнопка «сразу показать план», и владелец проходил мимо него.
+    var money = [];
+    if(opt.positions && opt.cost_source_full < opt.positions){
+      money.push("Полная себестоимость задана у " + (opt.cost_source_full||0) + " позиций из " +
+        opt.positions + " — у остальных считаем по закупочной цене МойСклада. " +
+        "Если ткань закупается отдельно, в закупочной цене её нет, и заказ выйдет дешевле, чем на самом деле.");
+    }
     if(opt.no_cost_count){
+      money.push("У " + opt.no_cost_count + " позиций себестоимости нет совсем — в деньгах заказа они не участвуют.");
+    }
+    if(money.length){
       var w = document.createElement("div");
       w.className = "warn";
-      w.textContent = "У " + opt.no_cost_count + " позиций нет себестоимости — они не попадут в расчёт бюджета. " +
-        "Проверьте тип цены в настройках или заполните себестоимость в МойСкладе.";
-      document.querySelector("#s2 .panel").prepend(w);
+      w.innerHTML = esc(money.join(" ")) +
+        ' <a href="/settings">Указать тип цены для себестоимости</a>';
+      document.querySelector("#s1 .panel").prepend(w);
     }
     var box = document.getElementById("catChips");
     box.innerHTML = cats.map(function(c){
