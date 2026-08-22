@@ -29,15 +29,18 @@ OBOROT_SUBSCRIPTION_GATE=1. Причина осторожности прозаи
 """
 from __future__ import annotations
 
+import logging
 import os
 from datetime import date, datetime, timedelta
 
 from fastapi import Depends, HTTPException
-from sqlalchemy import inspect, text
+from sqlalchemy import inspect, select, text
 from sqlalchemy.orm import Session
 
 from app.auth import AuthContext, require_auth_api
 from app.db import engine, get_db, run_migration_step
+
+log = logging.getLogger("oborot.subscription")
 
 # Сколько календарных дней клиент работает после отметки «счёт выставлен».
 # Календарных, а не рабочих: решение владельца, 5 дней (D-24).
@@ -154,8 +157,15 @@ def subscription_state(org, db: Session) -> str:
     if paid_until is not None and paid_until >= today:
         return ACTIVE
 
+    # Дата конца триала — НАША запись, клиент её не задаёт, подделать не может.
+    # Поэтому она уважается независимо от названия тарифа: организация, успевшая
+    # переключить `plan` на платный, но ещё не оплатившая, доживает свой триал,
+    # а не выключается на день раньше. Асимметрия ошибок здесь однозначна:
+    # пропустить неплательщика — потерять месяц денег, закрыть плательщика —
+    # потерять клиента (D-24, «название тарифа доказательством не является» —
+    # доказательство оплаты это paid_until, а не plan).
     trial_ends = _as_date(getattr(org, "trial_ends_at", None))
-    if (org.plan or "trial") == "trial" and trial_ends is not None and trial_ends >= today:
+    if trial_ends is not None and trial_ends >= today:
         return ACTIVE
 
     grace_until = _grace_until(db, org.id, today)
@@ -214,3 +224,54 @@ def require_write_access(
     if state == READONLY:
         raise HTTPException(status_code=402, detail=BLOCK_MESSAGE)
     return ctx
+
+
+# ── Предпросмотр перед включением флага ──────────────────────────────────────
+
+def preview(db: Session) -> dict:
+    """Кого закроет гейт, если его включить. Ничего не меняет.
+
+    Существует ради одного сценария: флаг включают, и сервис молча закрывается
+    тем, кого закрывать не собирались. Считается на старте приложения и пишется
+    в лог — так «посмотреть перед тем, как щёлкнуть» не требует ни доступа
+    к базе, ни отдельной ручки.
+    """
+    from app.models import Org
+
+    counts = {ACTIVE: 0, GRACE: 0, READONLY: 0}
+    readonly_ids: list[int] = []
+    for org in db.execute(select(Org)).scalars():
+        state = subscription_state(org, db)
+        counts[state] = counts.get(state, 0) + 1
+        if state == READONLY:
+            readonly_ids.append(org.id)
+    return {"counts": counts, "readonly_org_ids": readonly_ids,
+            "gate_enabled": gate_enabled()}
+
+
+def log_preview() -> None:
+    """Пишет предпросмотр в лог на старте. Ошибки глушит: это диагностика."""
+    from app.db import SessionLocal
+
+    db = SessionLocal()
+    try:
+        info = preview(db)
+        counts = info["counts"]
+        if info["gate_enabled"]:
+            log.warning(
+                "гейт подписки ВКЛЮЧЁН: active=%d grace=%d readonly=%d; "
+                "закрыты организации %s",
+                counts[ACTIVE], counts[GRACE], counts[READONLY],
+                info["readonly_org_ids"] or "—",
+            )
+        else:
+            log.info(
+                "гейт подписки выключен; если включить: active=%d grace=%d "
+                "readonly=%d (закрылись бы %s)",
+                counts[ACTIVE], counts[GRACE], counts[READONLY],
+                info["readonly_org_ids"] or "—",
+            )
+    except Exception:  # noqa: BLE001 — диагностика не имеет права валить старт
+        log.exception("предпросмотр гейта подписки не удался")
+    finally:
+        db.close()

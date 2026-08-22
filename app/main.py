@@ -189,6 +189,10 @@ def _startup() -> None:
     # должна быть готова заранее, иначе включение флага потребует деплоя.
     from app import subscription as _subscription
     _subscription.ensure_schema()
+    # Предпросмотр в лог: кого закроет гейт, если его включить. Читает базу,
+    # ничего не меняет. Нужен ровно затем, чтобы включение флага не оказалось
+    # сюрпризом — «посмотреть перед тем, как щёлкнуть».
+    _subscription.log_preview()
     global _STARTUP_DONE
     _STARTUP_DONE = True
 
