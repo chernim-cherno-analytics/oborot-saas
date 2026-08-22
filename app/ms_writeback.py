@@ -28,6 +28,9 @@ processingorder требует техкарту (processingPlan) и доступ
 Идемпотентность обеспечивает роут: повторная отправка при заполненном
 production_orders.ms_doc_href — 409 «уже отправлен» со ссылкой.
 """
+from datetime import date, timedelta
+
+import httpx
 from sqlalchemy import inspect, select
 from sqlalchemy.orm import Session
 
@@ -215,6 +218,36 @@ def _product_map(db: Session, org_id: int) -> dict[tuple[str, str], Product]:
     return {(p.base_name, p.size): p for p in rows}
 
 
+# Сколько дней назад искать «свой» документ перед созданием. Заказ отправляют
+# в день оформления; две недели — запас на «нажал, не дошло, вернулся завтра».
+LOOKBACK_DAYS = 14
+
+
+def order_marker(order_id: int) -> str:
+    """Метка нашего заказа в описании документа МойСклад.
+
+    Формат намеренно машинный и стабильный: имя заказа человек может
+    переименовать, а метка остаётся. По ней документ узнаётся при повторе.
+    """
+    return f"[oborot#{int(order_id)}]"
+
+
+async def find_existing_order(client, marker: str) -> dict | None:
+    """Ищет в МойСкладе документ, созданный нами по этому заказу.
+
+    Смотрим описания «Заказов поставщику» за последние LOOKBACK_DAYS дней.
+    Фильтровать по подстроке на стороне МС нельзя, поэтому тянем список без
+    позиций (дёшево) и сверяем описания у себя. Ошибку поиска НЕ проглатываем
+    молча наверх: если мы не смогли проверить, лучше не создавать документ
+    вслепую — пусть вызывающий решает.
+    """
+    since = (date.today() - timedelta(days=LOOKBACK_DAYS)).isoformat()
+    for row in await client.search_purchase_orders(since):
+        if marker in str(row.get("description") or ""):
+            return row
+    return None
+
+
 async def push_order(db: Session, org_id: int, order: ProductionOrder) -> dict:
     """Создаёт «Заказ поставщику» в МойСклад из позиций заказа.
 
@@ -282,17 +315,38 @@ async def push_order(db: Session, org_id: int, order: ProductionOrder) -> dict:
             agent = await client.create_counterparty(AGENT_NAME)
         agent_meta = (agent.get("meta") or {})
 
-        # 5) Сам документ.
-        payload: dict = {
-            "organization": {"meta": org_meta},
-            "agent": {"meta": agent_meta},
-            "positions": positions,
-            "description": f"Создано в «Обороте»: заказ «{order.name}»",
-        }
-        if order.eta_date:
-            # Планируемая дата приёмки — из ETA заказа.
-            payload["deliveryPlannedMoment"] = f"{order.eta_date} 00:00:00"
-        doc = await client.create_purchase_order(payload)
+        # 5) Сам документ — но сначала проверяем, не создан ли он уже.
+        #
+        # У JSON API 1.2 нет ключа идемпотентности, а сеть даёт три исхода,
+        # а не два: «создан», «не создан» и «неизвестно» (таймаут, 502, обрыв).
+        # В третьем случае документ у клиента может уже существовать, и вторая
+        # попытка сделала бы ДУБЛЬ заказа поставщику — с деньгами и с обещанием
+        # подрядчику. Поэтому маркер в описании + поиск по нему до создания.
+        marker = order_marker(order.id)
+        existing = await find_existing_order(client, marker)
+        if existing is not None:
+            doc, recovered = existing, True
+        else:
+            payload: dict = {
+                "organization": {"meta": org_meta},
+                "agent": {"meta": agent_meta},
+                "positions": positions,
+                "description": f"Создано в «Обороте»: заказ «{order.name}» {marker}",
+            }
+            if order.eta_date:
+                # Планируемая дата приёмки — из ETA заказа.
+                payload["deliveryPlannedMoment"] = f"{order.eta_date} 00:00:00"
+            recovered = False
+            try:
+                doc = await client.create_purchase_order(payload)
+            except (httpx.HTTPError, httpx.HTTPStatusError):
+                # Ответ не дошёл — «создан или нет» отсюда не видно.
+                # Единственный честный способ узнать: спросить у МойСклада.
+                found = await find_existing_order(client, marker)
+                if found is None:
+                    raise
+                # Документ всё-таки создан — потерялся только ответ.
+                doc, recovered = found, True
 
     href = ((doc.get("meta") or {}).get("href")) or ""
     _move_incoming_to_ms(db, org_id, order, pushed_by_base)
@@ -305,4 +359,8 @@ async def push_order(db: Session, org_id: int, order: ProductionOrder) -> dict:
         "ms_doc_ui_url": ui_url(doc),
         "positions_pushed": len(positions),
         "unmatched": unmatched,
+        # True — документ уже существовал в МойСкладе и был подобран по маркеру,
+        # а не создан заново. Значит, прошлая попытка на самом деле удалась,
+        # просто ответ до нас не дошёл.
+        "recovered": recovered,
     }

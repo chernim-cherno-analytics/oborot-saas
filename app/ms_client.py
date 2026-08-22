@@ -201,13 +201,25 @@ class MoySkladClient:
         return min(MAX_BACKOFF_SECONDS, base * random.uniform(0.8, 1.2))
 
     async def _request(self, method: str, path: str, params: dict | None = None,
-                       json: dict | None = None, heavy: bool = False) -> dict:
+                       json: dict | None = None, heavy: bool = False,
+                       retry_unsafe: bool = True) -> dict:
         """Запрос с rate-limit'ом и ретраями.
 
         Повторяем 429, 5xx (500/502/503/504) и транспортные сбои httpx
         (ConnectError, ReadTimeout, RemoteProtocolError); прочие 4xx — сразу
         наружу (401/403 — токен, 412 — валидация: повтор бессмыслен).
         При 429 дополнительно тормозим весь клиент (limiter.cool_down).
+
+        `retry_unsafe=False` — повторяем ТОЛЬКО 429. Это режим для запросов,
+        которые СОЗДАЮТ документы. Разница принципиальная: 429 означает «мы
+        даже не начали, приходите позже» — повтор безопасен. А таймаут чтения
+        или 502 означают «ответ не дошёл», и создан документ или нет — из
+        нашей позиции неизвестно. Автоматический повтор в такой ситуации
+        создаёт ВТОРОЙ заказ поставщику у клиента в МойСкладе, и заметить это
+        может только он сам. Ключа идемпотентности у JSON API 1.2 нет,
+        поэтому единственная защита — не повторять вслепую: решение
+        принимает вызывающий код, который может сначала поискать документ
+        (см. ms_writeback.find_existing_order).
         """
         for attempt in range(MAX_RETRIES + 1):
             resp: httpx.Response | None = None
@@ -216,7 +228,7 @@ class MoySkladClient:
                     resp = await self._client.request(method, path, params=params, json=json)
             except TRANSPORT_ERRORS:
                 self.stats["transport"] += 1
-                if attempt >= MAX_RETRIES:
+                if attempt >= MAX_RETRIES or not retry_unsafe:
                     raise
             else:
                 if resp.status_code not in RETRY_STATUSES:
@@ -226,6 +238,8 @@ class MoySkladClient:
                     self.stats["429"] += 1
                 else:
                     self.stats["5xx"] += 1
+                    if not retry_unsafe:
+                        resp.raise_for_status()
                 if attempt >= MAX_RETRIES:
                     resp.raise_for_status()
             delay = self._retry_delay(attempt, resp)
@@ -240,9 +254,14 @@ class MoySkladClient:
         """GET с rate-limit'ом и ретраями (heavy — через узкий семафор отчётов)."""
         return await self._request("GET", path, params=params, heavy=heavy)
 
-    async def post(self, path: str, json: dict) -> dict:
-        """POST (создание сущностей) с тем же rate-limit'ом и ретраями."""
-        return await self._request("POST", path, json=json)
+    async def post(self, path: str, json: dict, *, retry_unsafe: bool = False) -> dict:
+        """POST (создание сущностей).
+
+        По умолчанию повторяем ТОЛЬКО 429 — см. докстринг `_request`: слепой
+        повтор после таймаута создаёт второй документ в учёте клиента.
+        `retry_unsafe=True` оставлен для случаев, где дубль безвреден.
+        """
+        return await self._request("POST", path, json=json, retry_unsafe=retry_unsafe)
 
     async def paginate(self, path: str, params: dict | None = None,
                        page_limit: int = PAGE_LIMIT, *,
@@ -318,6 +337,16 @@ class MoySkladClient:
         price/discount — всё это есть в дефолтном ответе.
         """
         return [row async for row in self.paginate(f"/entity/{entity}/{doc_id}/positions")]
+
+    async def search_purchase_orders(self, moment_from: str) -> list[dict]:
+        """«Заказы поставщику» с даты, БЕЗ позиций — для поиска своего документа.
+
+        Отдельный метод, потому что задача другая: не «сколько чего едет», а
+        «не создали ли мы уже этот документ». Без expand=positions страница
+        вмещает 1000 строк вместо 100, и запрос дешевле в десять раз.
+        """
+        params: dict[str, Any] = {"filter": f"moment>={moment_from} 00:00:00"}
+        return [row async for row in self.paginate("/entity/purchaseorder", params)]
 
     async def fetch_purchase_orders(self, moment_from: str) -> list[dict]:
         """«Заказы поставщику» (entity/purchaseorder) с позициями с даты moment_from.

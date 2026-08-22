@@ -452,7 +452,39 @@ async def api_order_push_to_ms(
     except httpx.HTTPError:
         _release_push_lock(db, order.id)
         raise HTTPException(status_code=502, detail=NETWORK_HINT)
-    db.commit()
+    try:
+        db.commit()
+    except Exception:
+        # Документ в МойСкладе УЖЕ создан, а сохранить ссылку не удалось
+        # (обрыв соединения с базой, блокировка файла). Если просто упасть,
+        # заказ останется с меткой «идёт отправка», через три минуты она
+        # протухнет, владелец нажмёт ещё раз — и получит второй документ.
+        # Поэтому: откатываем сессию и записываем ссылку отдельной короткой
+        # транзакцией. Не вышло и это — снимаем метку и отдаём ссылку на
+        # созданный документ прямо в ошибке, чтобы она не потерялась совсем.
+        db.rollback()
+        href = str(result.get("ms_doc_href") or "")
+        name = str(result.get("ms_doc_name") or "")
+        saved = False
+        try:
+            from sqlalchemy import update as _sa_upd
+            db.execute(_sa_upd(ProductionOrder)
+                       .where(ProductionOrder.id == order.id)
+                       .values(ms_doc_href=href, ms_doc_name=name))
+            db.commit()
+            saved = True
+        except Exception:
+            db.rollback()
+            _release_push_lock(db, order.id)
+        if not saved:
+            raise HTTPException(
+                status_code=502,
+                detail=(f"Документ в МойСкладе создан ({name or 'без номера'}), "
+                        "но сохранить ссылку на него не удалось. "
+                        "НЕ отправляйте заказ повторно — откройте документ "
+                        "по ссылке и при необходимости привяжите вручную."),
+                headers={"X-Oborot-Ms-Doc": href[:400]},
+            )
     # Аудит 18.08: push_order переносит вклад заказа между qty и ms_qty
     # (а при черновике/частичном матче меняет и сумму «едет к нам») — без
     # инвалидации страницы 10 минут отдавали старый снапшот и потребность.
