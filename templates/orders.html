@@ -20,6 +20,7 @@ document.addEventListener("DOMContentLoaded", function () {
   var currentId = null;
   var box = document.getElementById("orders-box");
   var prodNames = {};       // production_id -> название канала
+  var authors = {};         // user_id -> кто создал заказ
   var filterPid = "all";    // "all" | "none" | id канала
   var detail = document.getElementById("detail-box");
 
@@ -74,6 +75,7 @@ document.addEventListener("DOMContentLoaded", function () {
   function loadOrders() {
     api("/api/orders").then(function (d) {
       orders = Array.isArray(d) ? d : (d.orders || d.items || []);
+      authors = d.authors || {};
       renderFilter();
       renderList();
       if (currentId && orders.some(function (o) { return o.id === currentId; })) {
@@ -155,7 +157,8 @@ document.addEventListener("DOMContentLoaded", function () {
         '<div style="display:flex; align-items:center; gap:8px;"><div class="o-name" style="flex:1;">' + esc(o.name) + "</div>" +
         (STATUS[o.status] || "") + "</div>" +
         '<div class="o-meta">Создан ' + fmtDate(o.created_at) + (o.eta_date ? " · готовность " + fmtDate(o.eta_date) : "") +
-          (o.production_id ? " · " + esc(chanName(o.production_id)) : "") + "</div>" +
+          (o.production_id ? " · " + esc(chanName(o.production_id)) : "") +
+          (authors[o.created_by] ? " · " + esc(authors[o.created_by]) : "") + "</div>" +
         statsHtml +
         "</div>";
     }).join("") + "</div>";

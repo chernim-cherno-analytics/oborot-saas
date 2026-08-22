@@ -208,6 +208,13 @@
   </div>
 
   <!-- ── Шаг 2 ─────────────────────────────────────────────────────────── -->
+  <div id="history" class="panel" style="display:none;margin-top:14px">
+    <h2>Прошлые заказы</h2>
+    <div class="sub">Что и на какие деньги заказывали раньше. «Повторить» подставит ту же анкету —
+      план пересчитается по сегодняшним остаткам и продажам.</div>
+    <div id="histBox"></div>
+  </div>
+
   <div id="s2" style="display:none">
     <div class="panel">
       <h2>Как распределяем деньги</h2>
@@ -245,6 +252,11 @@
           <input class="binp sm" id="reserve" type="number" min="0" max="90" value="0">
           <div class="hint">Деньги, которые система не распределяет</div>
         </div>
+        <div>
+          <span class="lbl">Накладные, % к себестоимости</span>
+          <input class="binp sm" id="overhead" type="number" min="0" max="200" value="0">
+          <div class="hint">Доставка, таможня, брак, упаковка</div>
+        </div>
       </div>
 
       <div class="fld">
@@ -277,7 +289,8 @@
 (function(){
   var STATE = { production_id: null, prods: [], cadence: 30, scope: "now",
                 strategy: "balance", offcats: [], plan: null, edits: {}, newItems: [], must: [],
-                open: null, cash: null, createdOrder: null };
+                open: null, cash: null, createdOrder: null,
+                q: "", group: false, sortKey: "turnover", sortDir: -1 };
 
   // Правки количеств переживают не только возврат к анкете, но и обновление
   // страницы: владелец правит план по 20 строкам, случайно жмёт F5 — и раньше
@@ -458,10 +471,72 @@
       max_share_pct: parseNum("capPct") || null,
       moq_units: parseNum("moq"),
       reserve_new_pct: parseNum("reserve"),
+      overhead_pct: parseNum("overhead"),
       exclude_categories: STATE.offcats,
       must_have: STATE.must,
       new_items: STATE.newItems.filter(function(n){ return n.name && n.qty>0; })
     };
+  }
+
+  // Прошлые планы: «повторить как в прошлый раз». До этого единственным
+  // следом решения был сам заказ — без бюджета, срока и условий, при которых
+  // он собирался.
+  function renderHistory(plans){
+    var box = document.getElementById("histBox"), wrap = document.getElementById("history");
+    if(!box || !wrap) return;
+    if(!plans.length){ wrap.style.display = "none"; return; }
+    wrap.style.display = "";
+    box.innerHTML = '<div class="table-outer" style="max-height:34vh"><table><thead><tr>'+
+      '<th>Когда</th><th>Канал</th><th class="nb">Бюджет</th><th class="nb">Позиций / штук</th>'+
+      '<th class="nb">Себестоимость</th><th>Кто</th><th>Заказ</th><th></th>'+
+      '</tr></thead><tbody>'+
+      plans.map(function(h){
+        return "<tr><td>"+dstr((h.created_at||"").slice(0,10))+"</td>"+
+          "<td>"+esc(h.production_name||"—")+"</td>"+
+          '<td class="nb">'+fmtR(h.budget)+"</td>"+
+          '<td class="nb">'+fmt(h.positions)+" / "+fmt(h.units)+"</td>"+
+          '<td class="nb">'+fmtR(h.cost)+"</td>"+
+          "<td>"+esc(h.author||"—")+"</td>"+
+          "<td>"+(h.order_id ? '<a href="/orders">№'+h.order_id+"</a>" : '<span class="muted">не оформлен</span>')+"</td>"+
+          '<td><button class="go-btn ghost repeat" type="button" data-id="'+h.id+
+            '" style="padding:4px 10px;font-size:12px">Повторить</button></td></tr>';
+      }).join("")+"</tbody></table></div>";
+    Array.prototype.forEach.call(box.querySelectorAll(".repeat"), function(b){
+      b.addEventListener("click", function(){
+        b.disabled = true;
+        api("/api/order-plan/"+b.dataset.id+"/brief").then(function(d){
+          applyBrief(d.brief || {});
+          b.disabled = false;
+          preview(3);
+        }).catch(function(e){ b.disabled = false; alert(e.message); });
+      });
+    });
+  }
+
+  // Заполнить анкету сохранённым брифом (общий код для «как в прошлый раз»
+  // при загрузке страницы и для кнопки «Повторить» в истории).
+  function applyBrief(last){
+    if(!last) return;
+    STATE.production_id = last.production_id || STATE.production_id || (STATE.prods[0]||{}).id;
+    STATE.cadence = last.cadence_days || STATE.cadence;
+    STATE.scope = last.budget_scope || "now";
+    STATE.strategy = last.strategy || "balance";
+    STATE.offcats = last.exclude_categories || [];
+    STATE.must = last.must_have || [];
+    document.getElementById("budget").value = fmt(last.budget||200000);
+    document.getElementById("capPct").value = last.max_share_pct || 30;
+    document.getElementById("moq").value = last.moq_units || 0;
+    document.getElementById("reserve").value = last.reserve_new_pct || 0;
+    document.getElementById("overhead").value = last.overhead_pct || 0;
+    STATE.newItems = [];
+    document.getElementById("newRows").innerHTML = "";
+    (last.new_items||[]).forEach(function(nn){ addNew(nn.name, nn.qty, nn.cost); });
+    Array.prototype.forEach.call(document.querySelectorAll("#stratTiles .tile"), function(x){
+      x.className = "tile" + (x.dataset.v===STATE.strategy ? " on" : ""); });
+    segInitValue("cadSeg", STATE.cadence);
+    segInitValue("scopeSeg", STATE.scope);
+    renderProds();
+    updWidthHint();
   }
 
   // Что уже заказано и не закрыто + календарь денег организации. Мастер обязан
@@ -647,29 +722,7 @@
                 : 'Разместить заказ до <b>'+dstr(h.order_by)+'</b> ('+h.days_left+' дн).')+'</div>';
     }).join("");
 
-    var openBase = (STATE.open && STATE.open.by_base) || {};
-    var rows = (p.items||[]).map(function(i){
-      var sizes = Object.keys(i.sizes||{}).map(function(s){
-        return (s || "One Size")+": "+i.sizes[s]; }).join(", ");
-      var inOpen = openBase[i.base_name] || 0;
-      return '<tr class="'+rowCls(i.turnover)+'" data-b="'+esc(i.base_name)+'">'+
-        '<td>'+esc(i.base_name)+'<span class="why">'+esc(i.category)+' · '+esc(i.why_text)+
-        (i.over_need ? ' · <b>'+i.over_need+' шт сверх потребности</b>' : '')+
-        (inOpen ? ' · <b>уже в открытом заказе: '+fmt(inOpen)+' шт</b>' : '')+'</span></td>'+
-        '<td class="nb">'+fmt(i.turnover)+'</td>'+
-        '<td class="nb">'+(i.rate!=null?(Math.round(i.rate*100)/100):'—')+'</td>'+
-        '<td class="nb">'+fmt(i.cs)+'</td>'+
-        '<td class="nb'+(i.ordered?'':' muted')+'">'+fmt(i.ordered)+'</td>'+
-        '<td class="nb">'+fmt(i.need)+'</td>'+
-        '<td><input class="qinp" type="number" min="0" value="'+i.qty+'" data-b="'+esc(i.base_name)+'"></td>'+
-        '<td class="nb" data-c="'+esc(i.base_name)+'">'+fmtR(i.cost_total)+'</td>'+
-        '<td class="nb muted" style="font-size:11px">'+esc(sizes)+'</td>'+
-        '<td class="nb">'+dstr(i.covered_until)+
-        (i.days_to_sell!=null?'<span class="why">разойдётся за '+i.days_to_sell+' дн</span>':'')+
-        '</td></tr>';
-    }).join("");
-
-    var notIn = (p.not_included||[]).slice(0,60).map(function(i){
+    var notIn = (p.not_included||[]).map(function(i){
       return '<tr><td><label style="cursor:pointer"><input type="checkbox" class="takebox" '+
         'data-b="'+esc(i.base_name)+'"'+(STATE.must.indexOf(i.base_name)>=0?' checked':'')+'> '+
         esc(i.base_name)+'</label><span class="why">'+esc(i.category)+
@@ -693,19 +746,19 @@
       'Партия дороже лимита на позицию ('+p.moq_over_cap.length+')</summary><div class="body">'+
       '<div class="peak">Минимальная партия этих позиций стоит больше, чем вы разрешили тратить '+
       'на одну позицию. Поднимите лимит на шаге 2 или закажите их отдельно.</div>'+
-      p.moq_over_cap.slice(0,30).map(function(m){
+      p.moq_over_cap.map(function(m){
         return '<div class="peak">'+esc(m.base_name)+' — партия '+fmtR(m.batch_cost)+
           ' при лимите '+fmtR(m.limit)+'</div>'; }).join("")+
       '</div></details></div>') : "";
     var moqHtml = (p.moq_skipped||[]).length ? ('<div class="fold"><details><summary>Не набирают минимальную партию ('+
       p.moq_skipped.length+')</summary><div class="body">'+
-      p.moq_skipped.slice(0,40).map(function(m){ return '<div class="peak">'+esc(m.base_name)+' — партия разошлась бы за '+m.days+' дн</div>'; }).join("")+
+      p.moq_skipped.map(function(m){ return '<div class="peak">'+esc(m.base_name)+' — партия разошлась бы за '+m.days+' дн</div>'; }).join("")+
       '</div></details></div>') : "";
 
     var L = p.lost || null;
-    var lostTitle = L
+    var lostTitle = (L
       ? ('Не вошло в заказ — недополученная маржа ≈'+fmtR(L.missing))
-      : 'Не вошло в заказ';
+      : 'Не вошло в заказ') + ' (' + (p.not_included||[]).length + ')';
     var lostNote = L
       ? ('<div class="peak">Отдельно: по позициям, которые в заказе, недобрано ещё на <b>'+
          fmtR(L.short)+'</b> маржи. Часть этого закроет следующий заказ через '+
@@ -714,7 +767,7 @@
     var rev = p.review||{};
     function revList(rows, note, action){
       if(!rows || !rows.length) return '';
-      return rows.slice(0,30).map(function(r){
+      return rows.map(function(r){
         return '<div class="peak"><label style="cursor:pointer">'+
           (action?'<input type="checkbox" class="takebox" data-b="'+esc(r.base_name)+'"'+
             (STATE.must.indexOf(r.base_name)>=0?' checked':'')+'> ':'')+
@@ -764,13 +817,33 @@
       '<div class="panel"><h2>Покрытие: до какой даты хватит</h2>'+
         '<div class="sub">Серое — насколько хватит того, что есть сейчас. Зелёное — насколько хватит после прихода заказа.</div>'+
         '<div id="cov"></div></div>'+
+      // Панель над таблицей: у каталога на 900 позиций «пролистать глазами»
+      // перестаёт работать. Поиск и сортировка меняют только ВИД — сам план
+      // считается по оборачиваемости и от порядка строк не зависит.
+      ((p.overhead_pct || p.pack_multiple > 1 || p.no_supplier_count)
+        ? '<div class="hint" style="margin:14px 0 0">'+
+          (p.overhead_pct ? 'В себестоимость добавлены накладные <b>'+p.overhead_pct+'%</b>. ' : '')+
+          (p.pack_multiple > 1 ? 'Количества округлены до кратности упаковки <b>'+p.pack_multiple+' шт</b>. ' : '')+
+          (p.no_supplier_count ? ('У '+p.no_supplier_count+' позиций в МойСкладе не заполнен поставщик — '+
+            'в этот канал они попали по умолчанию. ') : '')+
+          '</div>' : '')+
+      '<div class="ptools" style="display:flex;gap:9px;align-items:center;flex-wrap:wrap;margin:14px 0 6px">'+
+        '<input class="binp sm" id="planq" type="search" placeholder="Поиск по названию или категории" style="max-width:280px">'+
+        '<label style="font-size:12px;cursor:pointer"><input type="checkbox" id="plangrp"> группировать по категориям</label>'+
+        '<span class="hint" id="plancount" style="margin:0"></span>'+
+      '</div>'+
       '<div class="table-outer"><table><thead><tr>'+
-        '<th>Позиция</th><th title="Нетто-выручка ÷ дни, когда позиция была в наличии">Оборач. ₽/день</th>'+
-        '<th title="Темп продаж, штук в день — по нему считается «Нужно»">Темп, шт/дн</th>'+
-        '<th>Остаток</th><th title="уже заказано и едет к нам">Едет</th>'+
-        '<th title="темп × горизонт − остаток − едет">Нужно</th>'+
-        '<th>Заказать</th><th>Себестоимость</th><th>Размеры</th><th>Хватит до</th>'+
-        '</tr></thead><tbody>'+ (rows || '<tr><td colspan="10" class="loading">Ни одна позиция не прошла отбор</td></tr>') +'</tbody></table></div>'+
+        '<th class="sortable" data-k="base_name">Позиция</th>'+
+        '<th class="sortable nb" data-k="turnover" title="Нетто-выручка ÷ дни, когда позиция была в наличии">Оборач. ₽/день</th>'+
+        '<th class="sortable nb" data-k="rate" title="Темп продаж, штук в день — по нему считается «Нужно»">Темп, шт/дн</th>'+
+        '<th class="sortable nb" data-k="cs">Остаток</th>'+
+        '<th class="sortable nb" data-k="ordered" title="уже заказано и едет к нам">Едет</th>'+
+        '<th class="sortable nb" data-k="need" title="темп × горизонт − остаток − едет">Нужно</th>'+
+        '<th class="sortable nb" data-k="qty">Заказать</th>'+
+        '<th class="sortable nb" data-k="cost_total">Себестоимость</th>'+
+        '<th>Размеры</th>'+
+        '<th class="sortable nb" data-k="covered_until">Хватит до</th>'+
+        '</tr></thead><tbody id="planBody"></tbody></table></div>'+
       ((p.stop||[]).length ? '<div class="err">'+
         (p.stop||[]).map(function(x){ return esc(x.text); }).join('. ')+'</div>' : '')+
       '<div class="actions" style="margin:14px 0 18px">'+
@@ -784,19 +857,28 @@
         '</tr></thead><tbody>'+notIn+'</tbody></table></div></div></details></div>') : "")+
       overCap + moqHtml + revHtml;
 
-    renderCards();
-    renderCoverage();
-    Array.prototype.forEach.call(document.querySelectorAll(".qinp"), function(el){
-      el.addEventListener("input", function(){
-        var b = el.dataset.b, q = Math.max(0, parseInt(el.value,10)||0);
-        STATE.edits[b] = q;
-        var it = null; (STATE.plan.items||[]).forEach(function(x){ if(x.base_name===b) it=x; });
-        var cell = document.querySelector('[data-c="'+CSS.escape(b)+'"]');
-        if(it && cell) cell.textContent = fmtR(q*it.cost_price);
-        saveDraft();
-        renderCards();
+    renderRows();
+    var qbox = document.getElementById("planq");
+    if(qbox){
+      qbox.value = STATE.q || "";
+      qbox.addEventListener("input", function(){ STATE.q = qbox.value; renderRows(); });
+    }
+    var gbox = document.getElementById("plangrp");
+    if(gbox){
+      gbox.checked = !!STATE.group;
+      gbox.addEventListener("change", function(){ STATE.group = gbox.checked; renderRows(); });
+    }
+    Array.prototype.forEach.call(document.querySelectorAll("th.sortable"), function(th){
+      th.style.cursor = "pointer";
+      th.addEventListener("click", function(){
+        var k = th.dataset.k;
+        if(STATE.sortKey === k) STATE.sortDir = -STATE.sortDir;
+        else { STATE.sortKey = k; STATE.sortDir = (k === "base_name" ? 1 : -1); }
+        renderRows();
       });
     });
+    renderCards();
+    renderCoverage();
     // «Взять» у позиций из отсева — решение владельца сильнее алгоритма.
     Array.prototype.forEach.call(document.querySelectorAll(".takebox"), function(el){
       el.addEventListener("change", function(){
@@ -808,6 +890,96 @@
       });
     });
     document.getElementById("mkOrder").addEventListener("click", createOrder);
+  }
+
+  // Таблица плана: вид (поиск/сортировка/группировка) отделён от расчёта.
+  // Сам план всегда считается по оборачиваемости — порядок строк на состав
+  // заказа не влияет, поэтому пересчёт здесь не нужен.
+  function planQty(i){
+    return (STATE.edits[i.base_name] !== undefined) ? STATE.edits[i.base_name] : i.qty;
+  }
+
+  function planRowHtml(i, openBase){
+    var sizes = Object.keys(i.sizes||{}).map(function(s){
+      return (s || "One Size")+": "+i.sizes[s]; }).join(", ");
+    var inOpen = openBase[i.base_name] || 0;
+    var q = planQty(i);
+    return '<tr class="'+rowCls(i.turnover)+'" data-b="'+esc(i.base_name)+'">'+
+      '<td>'+esc(i.base_name)+'<span class="why">'+esc(i.category)+' · '+esc(i.why_text)+
+      (i.over_need ? ' · <b>'+i.over_need+' шт сверх потребности</b>' : '')+
+      (inOpen ? ' · <b>уже в открытом заказе: '+fmt(inOpen)+' шт</b>' : '')+
+      (i.no_supplier ? ' · <b>нет поставщика в МойСкладе</b>' : '')+'</span></td>'+
+      '<td class="nb">'+fmt(i.turnover)+'</td>'+
+      '<td class="nb">'+(i.rate!=null?(Math.round(i.rate*100)/100):'—')+'</td>'+
+      '<td class="nb">'+fmt(i.cs)+'</td>'+
+      '<td class="nb'+(i.ordered?'':' muted')+'">'+fmt(i.ordered)+'</td>'+
+      '<td class="nb">'+fmt(i.need)+'</td>'+
+      '<td><input class="qinp" type="number" min="0" value="'+q+'" data-b="'+esc(i.base_name)+'"></td>'+
+      '<td class="nb" data-c="'+esc(i.base_name)+'">'+fmtR(q*i.cost_price)+'</td>'+
+      '<td class="nb muted" style="font-size:11px">'+esc(sizes)+'</td>'+
+      '<td class="nb">'+dstr(i.covered_until)+
+      (i.days_to_sell!=null?'<span class="why">разойдётся за '+i.days_to_sell+' дн</span>':'')+
+      '</td></tr>';
+  }
+
+  function renderRows(){
+    var body = document.getElementById("planBody");
+    if(!body) return;
+    var p = STATE.plan, all = p.items || [];
+    var openBase = (STATE.open && STATE.open.by_base) || {};
+    var q = (STATE.q || "").trim().toLowerCase();
+    var list = q
+      ? all.filter(function(i){
+          return (i.base_name||"").toLowerCase().indexOf(q) >= 0 ||
+                 (i.category||"").toLowerCase().indexOf(q) >= 0; })
+      : all.slice();
+    var k = STATE.sortKey || "turnover", dir = STATE.sortDir || -1;
+    list.sort(function(a, b){
+      var x = k === "qty" ? planQty(a) : a[k], y = k === "qty" ? planQty(b) : b[k];
+      if(k === "cost_total"){ x = planQty(a)*a.cost_price; y = planQty(b)*b.cost_price; }
+      if(x == null) x = ""; if(y == null) y = "";
+      if(typeof x === "string" || typeof y === "string")
+        return String(x).localeCompare(String(y), "ru") * dir;
+      return (x - y) * dir;
+    });
+    var html;
+    if(!list.length){
+      html = '<tr><td colspan="10" class="loading">'+
+        (all.length ? "Ничего не найдено — измените поиск" : "Ни одна позиция не прошла отбор")+"</td></tr>";
+    } else if(STATE.group){
+      var by = {}, order = [];
+      list.forEach(function(i){
+        var c = i.category || "Без категории";
+        if(!by[c]){ by[c] = []; order.push(c); }
+        by[c].push(i);
+      });
+      html = order.map(function(c){
+        var rows = by[c], units = 0, cost = 0;
+        rows.forEach(function(i){ units += planQty(i); cost += planQty(i)*i.cost_price; });
+        return '<tr><td colspan="10" style="background:rgba(0,0,0,.05);font-weight:600">'+
+          esc(c)+' <span class="why" style="display:inline">'+rows.length+' поз. · '+
+          fmt(units)+' шт · '+fmtR(cost)+"</span></td></tr>"+
+          rows.map(function(i){ return planRowHtml(i, openBase); }).join("");
+      }).join("");
+    } else {
+      html = list.map(function(i){ return planRowHtml(i, openBase); }).join("");
+    }
+    body.innerHTML = html;
+    var cnt = document.getElementById("plancount");
+    if(cnt) cnt.textContent = (list.length === all.length)
+      ? (all.length + " поз. в плане")
+      : ("показано " + list.length + " из " + all.length);
+    Array.prototype.forEach.call(body.querySelectorAll(".qinp"), function(el){
+      el.addEventListener("input", function(){
+        var b = el.dataset.b, v = Math.max(0, parseInt(el.value,10)||0);
+        STATE.edits[b] = v;
+        var it = null; (STATE.plan.items||[]).forEach(function(x){ if(x.base_name===b) it=x; });
+        var cell = body.querySelector('[data-c="'+CSS.escape(b)+'"]');
+        if(it && cell) cell.textContent = fmtR(v*it.cost_price);
+        saveDraft();
+        renderCards();
+      });
+    });
   }
 
   function renderCoverage(){
@@ -929,7 +1101,8 @@
     api("/api/productions"),
     api("/api/settings"),
     api("/api/order-plan/last").catch(function(){ return {brief:null}; }),
-    api("/api/order-plan/options").catch(function(){ return {categories:[]}; })
+    api("/api/order-plan/options").catch(function(){ return {categories:[]}; }),
+    api("/api/order-plan/history").catch(function(){ return {plans:[]}; })
   ]).then(function(r){
     STATE.prods = r[0].productions || [];
     var st = r[1] || {};
@@ -937,32 +1110,20 @@
     STATE.cadence = st.order_cadence_days || 30;
     document.getElementById("moq").value = st.moq_units || 0;
     document.getElementById("reserve").value = st.reserve_new_pct || 0;
+    document.getElementById("overhead").value = st.overhead_pct || 0;
+    STATE.production_id = (STATE.prods[0]||{}).id;
     var last = (r[2]||{}).brief;
-    if(last){
-      STATE.production_id = last.production_id || (STATE.prods[0]||{}).id;
-      STATE.cadence = last.cadence_days || STATE.cadence;
-      STATE.scope = last.budget_scope || "now";
-      STATE.strategy = last.strategy || "balance";
-      STATE.offcats = last.exclude_categories || [];
-      document.getElementById("budget").value = fmt(last.budget||200000);
-      document.getElementById("capPct").value = last.max_share_pct || 30;
-      document.getElementById("moq").value = last.moq_units || 0;
-      document.getElementById("reserve").value = last.reserve_new_pct || 0;
-      (last.new_items||[]).forEach(function(n){ addNew(n.name, n.qty, n.cost); });
-      Array.prototype.forEach.call(document.querySelectorAll("#stratTiles .tile"), function(x){
-        x.className = "tile" + (x.dataset.v===STATE.strategy ? " on" : ""); });
-    } else {
-      STATE.production_id = (STATE.prods[0]||{}).id;
-    }
+    if(last) applyBrief(last);
+    renderHistory(((r[4]||{}).plans) || []);
     var draft = loadDraft();
     if(draft && draft.pid === STATE.production_id){
       STATE.edits = draft.edits || {};
       STATE.must = draft.must || [];
     }
     segInitValue("cadSeg", STATE.cadence);
-    updWidthHint();
     segInitValue("scopeSeg", STATE.scope);
     renderProds();
+    updWidthHint();
 
     var opt = r[3] || {};
     var cats = opt.categories || [];

@@ -84,6 +84,11 @@
           <input class="input num" type="number" id="lead-time" min="1" max="365" step="1">
           <div class="hint">Сколько дней проходит от заказа до прихода партии на склад. Если у цеха на странице «Заказ» задан свой срок, его позиции считаются по нему, а это значение остаётся общим.</div>
         </div>
+        <div class="field" style="max-width:220px;">
+          <label for="overhead">Накладные, % к себестоимости</label>
+          <input class="input num" type="number" id="overhead" min="0" max="200" step="1">
+          <div class="hint">Доставка, таможня, брак, упаковка — то, во что партия обходится сверх цены подрядчика. «Мастер заказа» добавляет этот процент к себестоимости, когда считает деньги заказа; на конкретный заказ его можно поменять в анкете.</div>
+        </div>
       </div>
       <p class="hint" style="margin:10px 0 4px;"><b>«Заказать»</b> на странице «Заказ» — сколько заказать, чтобы хватило: темп продаж × горизонт − прогнозный остаток к приходу партии. Прогнозный остаток — это сегодняшний остаток плюс то, что уже едет к нам, минус то, что успеет продаться, пока шьётся заказ. Обе настройки работают именно здесь.</p>
       <p class="hint" style="margin:0;"><b>«Не хватает до нормы»</b> на «Оборачиваемости» и «Активном стоке» — сколько штук не хватает <i>сегодня</i>: темп за год × 90 дней − сегодняшний остаток. Норма в этой колонке всегда 90 дней, горизонт её не меняет, и то, что уже едет к нам, из неё не вычитается: это оценка сегодняшнего склада, а не расчёт заказа. Поэтому «Заказать» обычно больше.</p>
@@ -275,6 +280,7 @@ document.addEventListener("DOMContentLoaded", function () {
     document.getElementById("th-minstock").value = settings.min_stock_days != null ? settings.min_stock_days : 3;
     document.getElementById("horizon").value = settings.horizon_days != null ? settings.horizon_days : 90;
     document.getElementById("lead-time").value = settings.lead_time_days != null ? settings.lead_time_days : 45;
+    document.getElementById("overhead").value = settings.overhead_pct != null ? settings.overhead_pct : 0;
     renderWarehouses(settings.warehouses || []);
     renderConnection(settings.connection || null, settings.role === "owner");
     renderTeam(settings.members || []);
@@ -296,7 +302,8 @@ document.addEventListener("DOMContentLoaded", function () {
       },
       min_stock_days: Number(document.getElementById("th-minstock").value) || 0,
       horizon_days: Number(document.getElementById("horizon").value) || 90,
-      lead_time_days: Number(document.getElementById("lead-time").value) || 45
+      lead_time_days: Number(document.getElementById("lead-time").value) || 45,
+      overhead_pct: Number(document.getElementById("overhead").value) || 0
     };
     Object.assign(body, extra || {});
     return api("/api/settings", { method: "POST", body: body }).then(function () {
