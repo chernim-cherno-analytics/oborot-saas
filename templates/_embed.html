@@ -1,0 +1,59 @@
+{# ── Встроенный режим МойСклада для самостоятельных страниц ───────────────────
+   Девять продуктовых страниц (Оборачиваемость, Активный сток, Мастер заказа,
+   Заказ, Заказ позиции, Бюджет, Прогноз, Оборот, Обучение) не наследуют
+   base.html: у каждой свой <style> и своя копия шапки. base.html встроенный
+   режим умеет с самого начала, а эти девять — нет, и внутри iframe раздела
+   «Приложения» МойСклада пользователь получал ДВЕ шапки: свою тёмную поверх
+   шапки МС. То есть якорный канал продаж (каталог приложений МС) наполовину
+   не работал именно на рабочих страницах — на тех, ради которых приложение
+   и ставят.
+
+   Здесь тот же приём, что и в _mobile.html: один общий кусок, подключаемый
+   одной строкой, вместо девяти копий одинакового кода. Правка встроенного
+   режима теперь в одном месте.
+
+   Флаг `embedded` кладёт в контекст main._page (кука oborot_embed ставится при
+   входе через /ms/app; в dev — query ?embed=1). Вне iframe этот файл не даёт
+   ни байта разметки и ни одного правила CSS. #}
+{% if embedded %}
+<style>
+  /* Своя шапка внутри iframe не нужна: логотип, разделы и выход даёт МойСклад
+     снаружи. Прячем её целиком, а разделы отдаём компактной лентой табов —
+     той же, что в base.html, чтобы встроенный режим выглядел одинаково на
+     всех страницах. */
+  .header { display: none !important; }
+  .embed-tabs {
+    display: flex; gap: 4px; flex-wrap: wrap; align-items: center;
+    padding: 8px 18px; border-bottom: 1px solid rgba(31, 31, 31, .10);
+    background: rgba(255, 255, 255, .72); backdrop-filter: blur(10px);
+    position: sticky; top: 0; z-index: 200;
+  }
+  .embed-tabs a {
+    font-size: 12px; line-height: 1; padding: 7px 10px; border-radius: 7px;
+    color: rgba(31, 31, 31, .55); text-decoration: none; white-space: nowrap;
+  }
+  .embed-tabs a:hover { background: rgba(31, 31, 31, .06); color: #1f1f1f; }
+  .embed-tabs a.active { background: #1f1f1f; color: #fff; font-weight: 600; }
+  /* Внутри чужого фрейма вертикаль дорога: снимаем верхний отступ рабочей
+     области, который на своём сайте компенсировал высоту шапки. */
+  .main { padding-top: 6px; }
+  /* Фоновые пятна своего сайта поверх интерфейса МойСклада выглядят чужеродно
+     и на слабых машинах ощутимо тормозят прокрутку внутри iframe. */
+  .gradient-bg { display: none !important; }
+  @media (max-width: 760px) {
+    .embed-tabs { flex-wrap: nowrap; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  }
+</style>
+<nav class="embed-tabs" aria-label="Разделы Оборота">
+  <a href="/turnover"{% if active == 'turnover' %} class="active"{% endif %}>Оборачиваемость</a>
+  <a href="/stocks"{% if active == 'stocks' %} class="active"{% endif %}>Активный сток</a>
+  <a href="/assistant"{% if active == 'assistant' %} class="active"{% endif %}>Мастер заказа</a>
+  <a href="/replenish"{% if active == 'replenish' %} class="active"{% endif %}>Заказ</a>
+  <a href="/sizes"{% if active == 'sizes' %} class="active"{% endif %}>Заказ позиции</a>
+  <a href="/budget"{% if active == 'budget' %} class="active"{% endif %}>Бюджет</a>
+  <a href="/forecast"{% if active == 'forecast' %} class="active"{% endif %}>Прогноз</a>
+  <a href="/revenue"{% if active == 'revenue' %} class="active"{% endif %}>Оборот</a>
+  <a href="/lessons"{% if active == 'lessons' %} class="active"{% endif %}>Обучение</a>
+  <a href="/settings"{% if active == 'settings' %} class="active"{% endif %}>Настройки</a>
+</nav>
+{% endif %}
