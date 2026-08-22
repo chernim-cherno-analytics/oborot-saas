@@ -973,6 +973,82 @@ def api_checks() -> None:
         check("мастер предупреждает про себестоимость на первом экране",
               "#s1 .panel" in c.get("/assistant").text)
 
+        # ── Очередь 3 ─────────────────────────────────────────────────────
+        print("\n25. Очередь 3: накладные, кратность, маржа по спросу, история")
+        base_plan = c.post("/api/order-plan/preview", json={
+            "production_id": lab["id"], "eta_date": eta, "budget": 300000,
+            "budget_scope": "full", "strategy": "balance"}).json()
+        over = c.post("/api/order-plan/preview", json={
+            "production_id": lab["id"], "eta_date": eta, "budget": 300000,
+            "budget_scope": "full", "strategy": "balance", "overhead_pct": 25}).json()
+        check("накладные поднимают себестоимость позиции",
+              over["items"] and base_plan["items"]
+              and over["overhead_pct"] == 25
+              and over["items"][0]["cost_price"] > base_plan["items"][0]["cost_price"],
+              f'{base_plan["items"][0]["cost_price"]} → {over["items"][0]["cost_price"]}')
+        check("с накладными заказ всё равно не выходит за бюджет",
+              sum(i["cost_total"] for i in over["items"]) <= 300000,
+              str(sum(i["cost_total"] for i in over["items"])))
+        check("накладные не меняют потребность в штуках",
+              {i["base_name"]: i["need"] for i in over["items"]}
+              == {i["base_name"]: i["need"] for i in base_plan["items"]
+                  if i["base_name"] in {x["base_name"] for x in over["items"]}},
+              "need изменился")
+
+        check("маржа считается только по спросу",
+              all(i["expected_profit"] <= round(i["need"] * max(0, i["avg_price"] - i["cost_price"])) + 1
+                  for i in base_plan["items"]),
+              str([(i["base_name"], i["qty"], i["need"], i["expected_profit"])
+                   for i in base_plan["items"] if i["over_need"]][:3]))
+        check("штуки сверх потребности вынесены отдельно",
+              all(i["over_need_profit"] >= 0 for i in base_plan["items"]))
+
+        c.post(f"/api/productions/{lab['id']}",
+               json={"name": lab["name"], "pack_multiple": 12})
+        packed = c.post("/api/order-plan/preview", json={
+            "production_id": lab["id"], "eta_date": eta, "budget": 300000,
+            "budget_scope": "full", "strategy": "balance"}).json()
+        check("кратность упаковки применяется к количествам",
+              packed["pack_multiple"] == 12
+              and all(i["qty"] % 12 == 0 for i in packed["items"]),
+              str([(i["base_name"], i["qty"]) for i in packed["items"]][:5]))
+        check("и заказ по-прежнему укладывается в бюджет",
+              sum(i["cost_total"] for i in packed["items"]) <= 300000,
+              str(sum(i["cost_total"] for i in packed["items"])))
+        check("причина «кратность» видна в строке",
+              any("pack" in i["why"] for i in packed["items"]),
+              str([i["why"] for i in packed["items"]][:3]))
+        c.post(f"/api/productions/{lab['id']}",
+               json={"name": lab["name"], "pack_multiple": 0})
+
+        hist = c.get("/api/order-plan/history").json()["plans"]
+        check("история планов отдаётся с деньгами и автором",
+              hist and hist[0]["budget"] > 0 and hist[0]["author"]
+              and hist[0]["cost"] > 0,
+              str(hist[:1]))
+        check("в истории видно, какой план стал заказом",
+              any(h["order_id"] for h in hist), str([h["order_id"] for h in hist]))
+        rep = c.get(f"/api/order-plan/{hist[0]['id']}/brief").json()
+        check("анкету прошлого плана можно поднять для «повторить»",
+              rep["brief"]["budget"] == hist[0]["budget"], str(rep["brief"].get("budget")))
+        check("чужой план не отдаётся", c.get("/api/order-plan/999999/brief").status_code == 404)
+
+        orders_now = c.get("/api/orders").json()
+        made2 = [o for o in orders_now["orders"] if o["name"] == "Осень 2026"][0]
+        check("заказ помнит, кто его создал",
+              made2["created_by"] and orders_now["authors"].get(str(made2["created_by"])),
+              str(orders_now["authors"]))
+
+        page_a = c.get("/assistant").text
+        check("в таблице плана есть поиск, сортировка и группировка",
+              'id="planq"' in page_a and 'class="sortable' in page_a
+              and 'id="plangrp"' in page_a and 'id="planBody"' in page_a)
+        check("списки отсева больше не обрезаются на 30–60 строках",
+              "slice(0,60)" not in page_a and "slice(0,30)" not in page_a
+              and "slice(0,40)" not in page_a)
+        check("в настройках есть поле накладных",
+              'id="overhead"' in c.get("/settings").text)
+
         print("\n14c. Мастер заказа на догружаемой истории (деплой П1)")
         eta_full = (date.today() + timedelta(days=45)).isoformat()
         body = {"eta_date": eta_full, "budget": 300000, "budget_scope": "full",
