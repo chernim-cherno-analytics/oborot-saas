@@ -250,10 +250,15 @@ def run_scenario() -> int:
           len(mock_ms.CREATED_PURCHASE_ORDERS) == 1)
 
     print("== Частичное сопоставление ==")
+    # Позиция вне каталога организации теперь отсекается при создании заказа
+    # (см. api_create_order), поэтому «несопоставленность» здесь моделируем
+    # реальным товаром с размером, которого нет среди синканых вариантов
+    # (в mock-МойСклад у SIZED-товаров только S/M/L) — сам base_name известен,
+    # а вариант «Футболка «Манифест» (XL)» в products нет.
     r = client.post("/api/orders", json={
         "name": "Частичный заказ", "eta_date": None, "items": [
             {"base_name": "Худи «Скетч»", "qty": 3, "sizes": {"S": 2, "M": 1}, "cost": 3900},
-            {"base_name": "Тапки «Фантом»", "qty": 3, "sizes": {"S": 3}, "cost": 100},
+            {"base_name": "Футболка «Манифест»", "qty": 3, "sizes": {"XL": 3}, "cost": 100},
         ],
     })
     order2 = r.json()["id"]
@@ -270,7 +275,7 @@ def run_scenario() -> int:
     check("push частичного заказа → 200", r.status_code == 200 and d.get("ok"),
           f"status={r.status_code} body={r.text[:200]}")
     check("несопоставленная позиция в unmatched",
-          d.get("unmatched") == ["Тапки «Фантом» (S)"], f"unmatched={d.get('unmatched')}")
+          d.get("unmatched") == ["Футболка «Манифест» (XL)"], f"unmatched={d.get('unmatched')}")
     check("в документ попали только сопоставленные позиции",
           d.get("positions_pushed") == 2
           and len(mock_ms.CREATED_PURCHASE_ORDERS) == 2
@@ -282,9 +287,11 @@ def run_scenario() -> int:
           f"{hood_sent} -> {hood_pushed}")
 
     print("== Заказ целиком из неизвестных позиций ==")
+    # Тот же приём: base_name реальный (заказ создастся), а размер — вне
+    # синканых вариантов, так что при push не сопоставится вообще ничего.
     r = client.post("/api/orders", json={
         "name": "Мимо ассортимента", "eta_date": None, "items": [
-            {"base_name": "Пальто «Мираж»", "qty": 2, "sizes": {"L": 2}, "cost": 100},
+            {"base_name": "Брюки «Чертёж»", "qty": 2, "sizes": {"XXL": 2}, "cost": 100},
         ],
     })
     order3 = r.json()["id"]
@@ -325,6 +332,59 @@ def run_scenario() -> int:
     r = demo.post(f"/api/orders/{order_id}/push-to-ms")
     check("чужой заказ → 404 (изоляция тенантов)", r.status_code == 404,
           f"status={r.status_code}")
+
+    print("== Слишком длинный пароль при регистрации (bcrypt: лимит 72 байта) ==")
+    # Отдельный клиент: register переустанавливает сессионную куку на нового
+    # пользователя — на "client" это увело бы владельца из его же организации.
+    pw_client = httpx.Client(headers={"X-Oborot-CSRF": "1"}, base_url=base, timeout=60.0)
+    # Реальный кейс: русская фраза 42 символа = 80 байт в UTF-8 — валила
+    # bcrypt.hashpw необработанным ValueError (голая страница 500).
+    long_pw = "мойоченьнадёжныйпарольдлясервисаоборот2026"
+    check("пароль-репродюсер действительно > 72 байт", len(long_pw.encode("utf-8")) > 72,
+          f"bytes={len(long_pw.encode('utf-8'))}")
+    r = pw_client.post("/register", data={
+        "name": "Длинный", "email": "longpw@wb.io",
+        "password": long_pw, "org_name": "Длинный пароль",
+    })
+    check("длинный пароль → аккуратная 200-форма с ошибкой, не 500",
+          r.status_code == 200 and "72 байт" in r.text,
+          f"status={r.status_code}")
+    r = pw_client.post("/register", data={
+        "name": "Короткий", "email": "shortpw@wb.io",
+        "password": "secret123", "org_name": "Короткий пароль",
+    })
+    check("обычный пароль после этого по-прежнему регистрирует", r.status_code == 303,
+          f"status={r.status_code}")
+    pw_client.close()
+
+    print("== Огромный id в пути не валит сервер (ge/le на Path) ==")
+    huge = "999999999999999999999"
+    r = client.get(f"/api/orders/{huge}")
+    check("GET /api/orders/<огромный> → 422, не 500", r.status_code == 422,
+          f"status={r.status_code}")
+    r = client.get(f"/api/orders/{order_id}")
+    check("обычный id по-прежнему работает", r.status_code == 200,
+          f"status={r.status_code}")
+
+    print("== Rate-limit логина: 5 попыток/300с, чужой аккаунт не страдает ==")
+    lock_client = httpx.Client(headers={"X-Oborot-CSRF": "1"}, base_url=base, timeout=60.0)
+    r = lock_client.post("/register", data={
+        "name": "Жертва перебора", "email": "bruteforced@wb.io",
+        "password": "secret123", "org_name": "Жертва",
+    })
+    check("регистрация аккаунта для теста rate-limit", r.status_code == 303)
+    last = None
+    for _ in range(6):
+        last = lock_client.post("/login", data={"email": "bruteforced@wb.io", "password": "wrong"})
+    check("6-я неудачная попытка подряд → блокировка с точным сроком ожидания",
+          last.status_code == 200 and "Слишком много неудачных попыток" in last.text
+          and "через 5 минут" in last.text,
+          f"status={last.status_code}")
+    r = lock_client.post("/login", data={"email": "shortpw@wb.io", "password": "secret123"})
+    check("другой аккаунт с того же IP всё ещё может войти", r.status_code == 303,
+          f"status={r.status_code}")
+    lock_client.close()
+
     demo.close()
     client.close()
 

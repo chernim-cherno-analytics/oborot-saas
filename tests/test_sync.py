@@ -11,10 +11,14 @@
      товары/размеры, stock_days (включая явные нули у распроданных),
      нетто-продажи по позициям, /api/summary, /api/replenish;
   5) инкрементальный синк POST /api/sync/run — числа не «уезжают»;
-  6) демо-режим второго пользователя (POST /api/connect/demo) не сломан.
+  6) демо-режим второго пользователя (POST /api/connect/demo) не сломан;
+  7) условия производства: аддитивная миграция старой таблицы productions,
+     округление до минимальной партии и кратности (сумма по размерам = итог
+     позиции), изоляция производств между организациями, границы id в пути.
 
 Запуск из корня репозитория:  python tests/test_sync.py
 """
+import io
 import json
 import os
 import sqlite3
@@ -447,6 +451,14 @@ def run_scenario() -> int:
 
     r = client.post("/api/ordered", json={"base_name": "Худи «Скетч»", "qty": 3})
     check("ручная правка qty поверх ms_qty принята", r.status_code == 200)
+    # Контракт не должен врать: раньше «Заказано» на несуществующий товар
+    # отвечало ok, а запись повисала в базе и нигде не показывалась.
+    r = client.post("/api/ordered", json={"base_name": "Пальто «Которого нет»", "qty": 5})
+    check("«Заказано» на товар не из каталога → 404 с объяснением",
+          r.status_code == 404 and "каталоге" in r.text, f"status={r.status_code} {r.text[:90]}")
+    r = client.post("/api/ordered/add", json={"base_name": "Пальто «Которого нет»", "qty": 5})
+    check("«Заказ отправлен» на товар не из каталога → 404", r.status_code == 404,
+          f"status={r.status_code}")
     repl_inc = client.get("/api/replenish").json()
     hood_item = next((i for i in repl_inc["items"]
                       if i["base_name"] == "Худи «Скетч»"), None)
@@ -1604,6 +1616,78 @@ def run_scenario() -> int:
           f"coverage={st_cov2.get('coverage_days')}")
     cover.close()
 
+    print("== Ручная ростовка на «Заказе» (черновик правок по размерам) ==")
+    # Правка ростовки под фабрику должна переживать перезагрузку страницы,
+    # не принимать мусор и не протекать между организациями.
+    r = client.get("/api/replenish-draft")
+    check("черновик ростовки пуст на старте", r.status_code == 200 and r.json()["drafts"] == {},
+          f"got={r.text[:120]}")
+    r = client.post("/api/replenish-draft",
+                    json={"base_name": "Худи «Скетч»", "sizes": {"S": 60, "M": 0}})
+    check("правка ростовки сохранена", r.status_code == 200 and r.json().get("ok"),
+          f"status={r.status_code} body={r.text[:140]}")
+    drafts = client.get("/api/replenish-draft").json()["drafts"]
+    check("правка возвращается следующему заходу (S=60, M=0)",
+          drafts.get("Худи «Скетч»") == {"S": 60, "M": 0}, f"got={drafts}")
+    r = client.post("/api/replenish-draft",
+                    json={"base_name": "Худи «Скетч»", "sizes": {"S": -1}})
+    check("отрицательное количество отклонено (422)", r.status_code == 422,
+          f"status={r.status_code} body={r.text[:140]}")
+    r = client.post("/api/replenish-draft",
+                    json={"base_name": "Худи «Скетч»", "sizes": {"S": 10000}})
+    check("количество больше потолка отклонено (422)", r.status_code == 422,
+          f"status={r.status_code}")
+    r = client.post("/api/replenish-draft",
+                    json={"base_name": "Худи «Скетч»", "sizes": {"S": 12.5}})
+    check("дробное количество отклонено (422)", r.status_code == 422,
+          f"status={r.status_code}")
+    drafts = client.get("/api/replenish-draft").json()["drafts"]
+    check("отклонённые правки не изменили сохранённое",
+          drafts.get("Худи «Скетч»") == {"S": 60, "M": 0}, f"got={drafts}")
+    # Ревью 22.08: раньше правка по несуществующей позиции отвечала {"ok":true},
+    # запись даже появлялась в базе — но следующий GET её тут же вычищал
+    # (_drop_orphan_drafts), и человек считал, что сохранил, а не сохранил.
+    # Теперь base_name сверяется с каталогом ДО записи, как и в /api/ordered.
+    r = client.post("/api/replenish-draft",
+                    json={"base_name": "Позиции такой нет", "sizes": {"S": 5}})
+    check("правка по несуществующей позиции отклонена (404), а не «ok:true» без записи",
+          r.status_code == 404 and "каталоге" in r.json()["detail"],
+          f"status={r.status_code} body={r.text[:140]}")
+    r = client.post("/api/replenish-draft",
+                    json={"base_name": "  Худи «Скетч»  ", "sizes": {"S": 61}})
+    check("имя с пробелами по краям принято, пробелы убраны",
+          r.status_code == 200 and r.json()["base_name"] == "Худи «Скетч»",
+          f"status={r.status_code} body={r.text[:140]}")
+    r = client.post("/api/replenish-draft",
+                    json={"base_name": "Худи «Скетч»", "sizes": {"S": 60, "ZZZ": 4}})
+    check("правка с несуществующим размером принята запросом", r.status_code == 200)
+    drafts = client.get("/api/replenish-draft").json()["drafts"]
+    check("черновик по несуществующей позиции в базу не попал",
+          "Позиции такой нет" not in drafts, f"got={list(drafts)[:5]}")
+    check("черновик по исчезнувшему размеру убран, живой размер цел",
+          drafts.get("Худи «Скетч»") == {"S": 60}, f"got={drafts}")
+    r = client.post("/api/replenish-draft", json={"base_name": "Худи «Скетч»", "sizes": {}})
+    check("пустой набор размеров = правок нет", r.status_code == 200
+          and client.get("/api/replenish-draft").json()["drafts"] == {},
+          f"got={client.get('/api/replenish-draft').text[:120]}")
+    client.post("/api/replenish-draft", json={"base_name": "Худи «Скетч»", "sizes": {"S": 7}})
+    # у безразмерной позиции размер — пустая строка, она тоже допустима
+    client.post("/api/replenish-draft", json={"base_name": "Кепка «Штамп-2»", "sizes": {"": 3}})
+    r = client.post("/api/replenish-draft/reset", json={"base_name": "Худи «Скетч»"})
+    check("сброс одной позиции удалил только её", r.status_code == 200
+          and list(client.get("/api/replenish-draft").json()["drafts"]) == ["Кепка «Штамп-2»"],
+          f"got={client.get('/api/replenish-draft').text[:160]}")
+    r = client.post("/api/replenish-draft/reset", json={"base_name": ""})
+    check("сброс всей таблицы вернул расчёт везде", r.status_code == 200
+          and client.get("/api/replenish-draft").json()["drafts"] == {},
+          f"got={client.get('/api/replenish-draft').text[:120]}")
+    anon = httpx.Client(base_url=f"http://127.0.0.1:{APP_PORT}", timeout=30.0)
+    r = anon.get("/api/replenish-draft")
+    check("черновик без сессии → 401", r.status_code == 401, f"status={r.status_code}")
+    r = anon.post("/api/replenish-draft", json={"base_name": "X", "sizes": {"S": 1}})
+    check("сохранение без заголовка CSRF → 403", r.status_code == 403, f"status={r.status_code}")
+    anon.close()
+
     print("== Демо-режим не сломан ==")
     demo = httpx.Client(headers={"X-Oborot-CSRF": "1"}, base_url=f"http://127.0.0.1:{APP_PORT}", timeout=120.0)
     r = demo.post("/register", data={
@@ -1628,6 +1712,1161 @@ def run_scenario() -> int:
           and (dpulse["stock"]["pct"] is not None or dpulse["stock"]["avg6"] == 0),
           f"partial={dpulse['partial']} covered={dpulse['covered_months']} "
           f"pct={dpulse['sales']['pct']}/{dpulse['stock']['pct']}")
+
+    client.post("/api/replenish-draft", json={"base_name": "Худи «Скетч»", "sizes": {"S": 60}})
+    check("демо-организация не видит чужой черновик ростовки",
+          demo.get("/api/replenish-draft").json()["drafts"] == {},
+          f"got={demo.get('/api/replenish-draft').text[:160]}")
+    demo.post("/api/replenish-draft/reset", json={"base_name": ""})
+    check("сброс в демо-организации не тронул чужие правки",
+          client.get("/api/replenish-draft").json()["drafts"] == {"Худи «Скетч»": {"S": 60}},
+          f"got={client.get('/api/replenish-draft').text[:160]}")
+    client.post("/api/replenish-draft/reset", json={"base_name": ""})
+
+    print("== Окно темпа «90 дней»: распроданное в ноль не выпадает из заказа ==")
+    # У mock-мира истории всего 60 дней, поэтому окно 90 дней там ничего не
+    # меняет; демо-данные — 365 дней и есть позиции, распроданные в ноль.
+    demo.post("/api/settings", json={"rate_window": "year"})
+    r_year = demo.get("/api/replenish").json()
+    year_names = {it["base_name"] for it in r_year["items"]}
+    # «Распродан в ноль и нужен»: остатка нет, но заказать надо.
+    sold_out = {it["base_name"] for it in r_year["items"] if it["cs"] == 0}
+    check("демо: есть распроданные в ноль позиции с потребностью",
+          len(sold_out) > 0, f"n={len(sold_out)}")
+
+    demo.post("/api/settings", json={"rate_window": "d90"})
+    r90 = demo.get("/api/replenish").json()
+    names90 = {it["base_name"] for it in r90["items"]}
+    lost = sorted(sold_out - names90)
+    check("d90: распроданные в ноль остались в заказе (фолбэк на годовой темп)",
+          not lost, f"пропали={lost}")
+    check("d90: заказ не короче, чем был до фолбэка",
+          len(r90["items"]) >= len(sold_out),
+          f"items={len(r90['items'])} sold_out={len(sold_out)}")
+    fb = [it for it in r90["items"] if it.get("rate_fallback")]
+    check("d90: фолбэк помечен флагом rate_fallback и посчитан",
+          len(fb) > 0 and r90.get("fallback_count") == len(fb),
+          f"fallback_count={r90.get('fallback_count')} n={len(fb)}")
+    check("d90: у позиции под фолбэком темп равен годовому",
+          all(abs(it["rate"] - it["rate_year"]) < 1e-9 for it in fb),
+          f"bad={[it['base_name'] for it in fb if abs(it['rate'] - it['rate_year']) >= 1e-9][:3]}")
+    check("d90: под фолбэк попали только позиции без остатка",
+          all(it["cs"] == 0 for it in fb),
+          f"bad={[it['base_name'] for it in fb if it['cs'] > 0][:3]}")
+    # Фолбэк оправдан ровно одним: позиции НЕ БЫЛО на складе, продавать было
+    # нечего. Порог min_stock_days тут ни при чём — проверяем по дням
+    # физического наличия за 90 дней (instock90 в снапшоте).
+    _con_fb = sqlite3.connect(DB_PATH)
+    _demo_org = _con_fb.execute(
+        "SELECT org_id FROM products WHERE base_name=? LIMIT 1", ("Браслет «Звенья»",)
+    ).fetchone()[0]
+    _con_fb.close()
+    _dbf = _SL()
+    try:
+        _snapf = _an.get_snapshot(_dbf, _dbf.get(_Org, _demo_org))
+        bad_fb = [it["base_name"] for it in fb
+                  if _snapf["items"][it["base_name"]]["instock90"] > 0]
+    finally:
+        _dbf.close()
+    check("d90: фолбэк только у позиций, которых не было на складе ни дня",
+          not bad_fb, f"лежали на складе={bad_fb[:3]}")
+    check("d90: подпись активного окна человеческая",
+          r90.get("rate_window_label") == "темп за 90 дней",
+          f"got={r90.get('rate_window_label')}")
+    # Неликвид (лежит на складе, не продаётся) фолбэк подхватывать НЕ должен —
+    # иначе заказ раздуется по мёртвому товару.
+    dturn = demo.get("/api/turnover").json()["items"]
+    dead_demo = {it["base_name"] for it in dturn
+                 if it["cs"] > 0 and it["nq"] <= 0 and not it["archived"]}
+    check("демо: неликвид в данных есть", len(dead_demo) > 0, f"n={len(dead_demo)}")
+    check("d90: неликвид в заказ не попал", not (dead_demo & names90),
+          f"попали={sorted(dead_demo & names90)[:3]}")
+    excl90 = {e["base_name"]: e["reason"] for e in r90["excluded"]}
+    check("d90: у неликвида внятная причина исключения",
+          all(excl90.get(b) for b in dead_demo),
+          f"без причины={[b for b in dead_demo if not excl90.get(b)][:3]}")
+    check("d90: всё, чего нет в заказе, объяснено в excluded",
+          not (year_names - names90 - set(excl90)),
+          f"молча пропали={sorted(year_names - names90 - set(excl90))[:3]}")
+
+    print("== Выгрузка «Что заказать»: окно темпа и лист «Не вошло и почему» ==")
+    import io as _io
+
+    from openpyxl import load_workbook
+
+    xl = demo.get("/api/export/replenish.xlsx")
+    check("выгрузка отдаётся", xl.status_code == 200, f"status={xl.status_code}")
+    wbx = load_workbook(_io.BytesIO(xl.content))
+    check("в книге два листа: заказ и «Не вошло и почему»",
+          wbx.sheetnames == ["Что заказать", "Не вошло и почему"],
+          f"got={wbx.sheetnames}")
+    wsx = wbx["Что заказать"]
+    title = wsx["A1"].value or ""
+    check("шапка листа называет окно темпа и срок производства",
+          "темп за 90 дней" in title and "срок производства" in title,
+          f"A1={title}")
+    xl_names = {wsx.cell(row=i, column=1).value for i in range(3, wsx.max_row + 1)}
+    check("в выгрузке те же позиции, что в API (включая распроданные)",
+          not (names90 - xl_names), f"нет в файле={sorted(names90 - xl_names)[:3]}")
+    # 14 — «Производство» (добавлена, чтобы разложить файл по цехам), 15 — «Примечание»
+    notes = [wsx.cell(row=i, column=15).value for i in range(3, wsx.max_row + 1)]
+    check("позиции по фолбэку помечены в основном листе",
+          sum(1 for n in notes if n) == len(fb),
+          f"пометок={sum(1 for n in notes if n)} ожидалось={len(fb)}")
+    wsx2 = wbx["Не вошло и почему"]
+    xl_excl = {wsx2.cell(row=i, column=1).value for i in range(3, wsx2.max_row + 1)}
+    check("лист «Не вошло и почему» содержит все исключённые позиции",
+          xl_excl == set(excl90), f"лишние/недостающие={xl_excl ^ set(excl90)}")
+
+    print("== «Прогноз»: склад сейчас — одно число в карточке, кольце и графике ==")
+    fc = demo.get("/api/forecast").json()
+    pl = demo.get("/api/pulse").json()
+    check("карточка и старт недельного ряда — одно и то же число",
+          fc["cards"]["stock_value"] == fc["weeks"][0]["stock_value"],
+          f"card={fc['cards']['stock_value']} week0={fc['weeks'][0]['stock_value']}")
+    check("карточка и старт помесячного ряда — одно и то же число",
+          fc["cards"]["stock_value"] == fc["months"][0]["stock_value"],
+          f"card={fc['cards']['stock_value']} month0={fc['months'][0]['stock_value']}")
+    check("кольцо «Склад в деньгах» показывает то же число, что карточка",
+          pl["stock"]["current"] == fc["cards"]["stock_value"],
+          f"pulse={pl['stock']['current']} card={fc['cards']['stock_value']}")
+    # Кольцо «Пульса» считает те же деньги, что карточка «Прогноза», но
+    # называет ещё и набор позиций: скрытые и архивные не входят ни в
+    # «сейчас», ни в шесть прошлых месяцев, и человек должен видеть это
+    # в подписи — иначе скрытие позиции сдвигает всю историю молча.
+    check("у денежных сумм «Прогноза» есть подпись базы",
+          fc.get("money_basis", {}).get("stock_value")
+          and pl["stock"].get("basis", "").startswith(fc["money_basis"]["stock_value"]),
+          f"basis={fc.get('money_basis')} pulse={pl['stock'].get('basis')}")
+    check("подпись кольца «Склад в деньгах» называет набор позиций",
+          "скрыт" in (pl["stock"].get("basis") or "")
+          and "архив" in (pl["stock"].get("basis") or ""),
+          f"basis={pl['stock'].get('basis')}")
+    check("у сумм склада на дашборде есть подпись базы",
+          dsum.get("stock_value_retail_basis") and dsum.get("stock_value_cost_basis"),
+          f"got={(dsum.get('stock_value_retail_basis'), dsum.get('stock_value_cost_basis'))}")
+    print("== Себестоимость и валовая маржа (второй денежный слой) ==")
+    turn = client.get("/api/turnover").json()
+    money = turn.get("money") or {}
+    rows = turn["items"]
+    live = [i for i in rows if not i["archived"] and not i["hidden"]]
+    check("у позиций «Оборачиваемости» есть себестоимость и маржа",
+          all(k in rows[0] for k in ("cost_price", "no_cost", "margin_unit",
+                                     "margin_pct", "gross_margin", "stock_cost")),
+          f"keys={sorted(rows[0])[:12]}")
+    check("сумма замороженного по позициям = итог страницы",
+          sum(i["stock_cost"] or 0 for i in live) == money.get("stock_cost"),
+          f"позиции={sum(i['stock_cost'] or 0 for i in live)} итог={money.get('stock_cost')}")
+    check("сумма валовой маржи по позициям = итог страницы",
+          sum(i["gross_margin"] or 0 for i in live) == money.get("gross_margin"),
+          f"позиции={sum(i['gross_margin'] or 0 for i in live)} итог={money.get('gross_margin')}")
+    cats = turn.get("money_by_category") or []
+    check("сумма по категориям = общий итог (до рубля, без «расхождений округления»)",
+          sum(c["stock_cost"] for c in cats) == money.get("stock_cost")
+          and sum(c["gross_margin"] for c in cats) == money.get("gross_margin")
+          and sum(c["positions"] for c in cats) == money.get("positions"),
+          f"cats={sum(c['stock_cost'] for c in cats)} итог={money.get('stock_cost')}")
+    summ = client.get("/api/summary").json()
+    ast_money = client.get("/api/active-stock").json().get("money") or {}
+    check("«заморожено по себестоимости» одинаково на дашборде, обороте и стоке",
+          summ["stock_value_cost"] == money.get("stock_cost") == ast_money.get("stock_cost"),
+          f"summary={summ['stock_value_cost']} turnover={money.get('stock_cost')} stock={ast_money.get('stock_cost')}")
+    check("себестоимость склада меньше розницы (это разные суммы, а не одна)",
+          0 < money.get("stock_cost", 0) < money.get("stock_retail", 0),
+          f"cost={money.get('stock_cost')} retail={money.get('stock_retail')}")
+    check("у каждой новой суммы есть машиночитаемая подпись базы",
+          money.get("stock_cost_basis") == _an.BASIS_COST
+          and money.get("stock_retail_basis") == _an.BASIS_RETAIL
+          and money.get("stock_sale_basis") == _an.BASIS_AVG_SALE
+          and (turn.get("money_basis") or {}).get("stock_cost") == _an.BASIS_COST,
+          f"got={money.get('stock_cost_basis')}")
+    check("процент маржи в разумных пределах и без деления на ноль",
+          all(i["margin_pct"] is None or -50 <= i["margin_pct"] <= 1 for i in rows)
+          and (money.get("gross_margin_pct") is None
+               or 0 < money["gross_margin_pct"] <= 1),
+          f"pct={money.get('gross_margin_pct')}")
+    no_sales = [i for i in rows if i["nq"] <= 0]
+    check("позиции без продаж не роняют расчёт: маржа от прайса, за год ноль",
+          all(i["gross_margin"] in (0, None) and i["loss_total"] == 0 for i in no_sales),
+          f"n={len(no_sales)}")
+    zero_stock = [i for i in live if i["cs"] == 0]
+    check("позиции с нулевым остатком не морозят денег",
+          all((i["stock_cost"] or 0) == 0 and (i["stock_margin"] or 0) == 0
+              for i in zero_stock),
+          f"n={len(zero_stock)}")
+    check("капитал оборачивается: положительное число раз в год",
+          money.get("capital_turns") and money["capital_turns"] > 0,
+          f"turns={money.get('capital_turns')}")
+
+    print("== «Торгуете в минус» и позиции без себестоимости ==")
+    # Подкручиваем себестоимость прямо в БД: в mock-мире все позиции прибыльны,
+    # а проверить нужно ровно обратный случай (и позицию без себестоимости).
+    _con = sqlite3.connect(DB_PATH)
+    # Именно орг владельца (mock-МС), а не демо-орг второго пользователя.
+    _oid = _con.execute(
+        "SELECT m.org_id FROM memberships m JOIN users u ON u.id = m.user_id "
+        "WHERE u.email = 'owner@test.io'"
+    ).fetchone()[0]
+    _tee = next(i for i in rows if i["base_name"] == "Футболка «Манифест»")
+    _loss_cost = (_tee["avg_price"] or 0) + 500          # заведомо ниже себестоимости
+    _con.execute("UPDATE products SET cost_price=? WHERE org_id=? AND base_name=?",
+                 (_loss_cost, _oid, "Футболка «Манифест»"))
+    _con.execute("UPDATE products SET cost_price=0 WHERE org_id=? AND base_name=?",
+                 (_oid, "Сумка «Тоут»"))
+    _con.commit()
+    _con.close()
+    _an.invalidate(_oid)
+    turn2 = client.get("/api/turnover").json()
+    below = turn2.get("below_cost") or {}
+    rows2 = {i["base_name"]: i for i in turn2["items"]}
+    tee2, bag2 = rows2["Футболка «Манифест»"], rows2["Сумка «Тоут»"]
+    check("позиция дешевле себестоимости помечена и попала в предупреждение",
+          tee2["below_cost"] and any(x["base_name"] == "Футболка «Манифест»"
+                                     for x in below.get("items", [])),
+          f"below_cost={tee2['below_cost']} items={[x['base_name'] for x in below.get('items', [])]}")
+    _lost = next(x for x in below["items"] if x["base_name"] == "Футболка «Манифест»")
+    check("потеря считается как (себестоимость − средняя цена) × продано",
+          _lost["loss_unit"] == round(_loss_cost - tee2["avg_price"])
+          and _lost["loss_total"] == round((_loss_cost - tee2["avg_price"]) * tee2["nq"])
+          and _lost["loss_stock"] == round((_loss_cost - tee2["avg_price"]) * tee2["cs"]),
+          f"unit={_lost['loss_unit']} total={_lost['loss_total']} nq={tee2['nq']}")
+    check("итог предупреждения = сумма потерь по строкам",
+          below["loss_total"] == sum(x["loss_total"] for x in below["items"])
+          and below["positions"] == len(below["items"]),
+          f"итог={below['loss_total']}")
+    check("в минус попадают только значимые позиции (low_data — отдельным счётчиком)",
+          all(not x["low_data"] for x in below["items"])
+          and "low_data_positions" in below,
+          f"got={[(x['base_name'], x['low_data']) for x in below['items']]}")
+    check("у позиции в минусе маржа отрицательная, а не «ноль из ниоткуда»",
+          tee2["margin_unit"] < 0 and tee2["margin_pct"] < 0,
+          f"unit={tee2['margin_unit']} pct={tee2['margin_pct']}")
+    check("позиция без себестоимости помечена no_cost, а не посчитана по нулю",
+          bag2["no_cost"] and bag2["margin_unit"] is None
+          and bag2["margin_pct"] is None and bag2["stock_cost"] is None
+          and bag2["gross_margin"] is None and not bag2["below_cost"],
+          f"got={(bag2['no_cost'], bag2['margin_unit'], bag2['stock_cost'])}")
+    money2 = turn2["money"]
+    live2 = [i for i in turn2["items"] if not i["archived"] and not i["hidden"]]
+    check("позиция без себестоимости не портит агрегаты и видна отдельным счётчиком",
+          money2["no_cost_positions"] >= 1
+          and money2["no_cost_retail"] == sum(i["stock_retail"] for i in live2 if i["no_cost"])
+          and money2["stock_cost"] == sum(i["stock_cost"] or 0 for i in live2)
+          and money2["positions"] == len(live2),
+          f"no_cost={money2['no_cost_positions']} retail={money2['no_cost_retail']}")
+    check("«за сколько продастся» считается по всем позициям, включая без с/с",
+          money2["stock_sale"] == sum(i["stock_sale"] for i in live2),
+          f"итог={money2['stock_sale']}")
+    ast2m = client.get("/api/active-stock").json()
+    check("«Активный сток» показывает то же предупреждение и те же деньги",
+          (ast2m.get("below_cost") or {}).get("loss_total") == below["loss_total"]
+          and (ast2m.get("money") or {}).get("stock_cost") == money2["stock_cost"]
+          and "incoming" in ast2m,
+          f"stock={ast2m.get('money', {}).get('stock_cost')} turnover={money2['stock_cost']}")
+    # Возвращаем себестоимость на место, чтобы дальнейшие проверки видели мир mock-МС.
+    _con = sqlite3.connect(DB_PATH)
+    _con.execute("UPDATE products SET cost_price=1500 WHERE org_id=? AND base_name=?",
+                 (_oid, "Футболка «Манифест»"))
+    _con.execute("UPDATE products SET cost_price=2400 WHERE org_id=? AND base_name=?",
+                 (_oid, "Сумка «Тоут»"))
+    _con.commit()
+    _con.close()
+    _an.invalidate(_oid)
+    turn3 = client.get("/api/turnover").json()
+    check("после возврата себестоимости предупреждение исчезает",
+          turn3["below_cost"]["positions"] == 0
+          and turn3["money"]["no_cost_positions"] == 0,
+          f"below={turn3['below_cost']['positions']}")
+
+    # Порог значимости отдельно: позиция с одной случайной дешёвой продажей
+    # тревогу не поднимает — она уходит в счётчик low_data_*, а не в список.
+    def _fake(name, low):
+        return {"base_name": name, "category": "Тест", "cls": "weak",
+                "low_data": low, "avg_price": 100, "sale_price": 300,
+                "cost_price": 150.0, "discount_fact": 0.5, "nq": 2 if low else 20,
+                "cs": 5, "below_cost": True, "loss_unit": 50,
+                "loss_total": 100 if low else 1000, "loss_stock": 250}
+    _rep = _an.below_cost_report([_fake("Шум", True), _fake("Правда", False)])
+    check("одна случайная продажа не поднимает тревогу «в минус»",
+          _rep["positions"] == 1 and _rep["items"][0]["base_name"] == "Правда"
+          and _rep["loss_total"] == 1000 and _rep["low_data_positions"] == 1
+          and _rep["low_data_loss"] == 100,
+          f"got={( _rep['positions'], _rep['low_data_positions'])}")
+
+    demo.post("/api/settings", json={"rate_window": "year"})
+
+    print("== Условия производства: срок, минимальная партия, кратность ==")
+    # 1) Аддитивная миграция на «старой» базе, где колонок условий ещё нет.
+    import tempfile
+
+    from sqlalchemy import create_engine as _create_engine
+    from sqlalchemy import inspect as _inspect
+    from sqlalchemy import text as _text
+
+    from app import models as _models
+
+    old_db = Path(tempfile.mkdtemp()) / "old_schema.db"
+    old_engine = _create_engine(f"sqlite:///{old_db}", future=True)
+    with old_engine.begin() as conn:
+        conn.execute(_text(
+            "CREATE TABLE productions (id INTEGER PRIMARY KEY, org_id INTEGER NOT NULL, "
+            "name VARCHAR(120) NOT NULL, is_main BOOLEAN NOT NULL, created_at DATETIME)"))
+        conn.execute(_text(
+            "INSERT INTO productions (id, org_id, name, is_main) VALUES (1, 7, 'Старый цех', 1)"))
+    _models.ensure_schema(bind=old_engine)
+    cols = {c["name"] for c in _inspect(old_engine).get_columns("productions")}
+    check("миграция добавила условия в существующую таблицу productions",
+          {"lead_time_days", "moq", "pack_multiple"} <= cols, f"cols={sorted(cols)}")
+    with old_engine.begin() as conn:
+        row = conn.execute(_text(
+            "SELECT name, lead_time_days, moq, pack_multiple FROM productions WHERE id = 1")).first()
+        flags = [r[0] for r in conn.execute(_text("SELECT name FROM migration_flags")).fetchall()]
+        conn.execute(_text("UPDATE productions SET lead_time_days = 21 WHERE id = 1"))
+    check("старое производство уцелело, условия пустые = «как в общих настройках»",
+          tuple(row) == ("Старый цех", None, None, None), f"row={tuple(row)}")
+    check("миграция отмечена флагом (один запуск)",
+          "productions_conditions_v1" in flags, f"flags={flags}")
+    _models.ensure_schema(bind=old_engine)  # повторный запуск — ничего не делает
+    with old_engine.begin() as conn:
+        again = conn.execute(_text("SELECT lead_time_days FROM productions WHERE id = 1")).scalar()
+    check("повторный прогон миграции не затирает заполненные условия",
+          again == 21, f"lead_time_days={again}")
+    old_engine.dispose()
+
+    # 1б) Одновременный старт нескольких процессов на одной старой базе.
+    # Ревью 22.08 (Н1): раньше 2-3 воркера из 4 падали на «duplicate column
+    # name» ещё на импорте app.api — процесс не поднимался вообще.
+    import subprocess
+
+    race_db = Path(tempfile.mkdtemp()) / "race_schema.db"
+    race_engine = _create_engine(f"sqlite:///{race_db}", future=True)
+    with race_engine.begin() as conn:
+        conn.execute(_text(
+            "CREATE TABLE productions (id INTEGER PRIMARY KEY, org_id INTEGER NOT NULL, "
+            "name VARCHAR(120) NOT NULL, is_main BOOLEAN NOT NULL, created_at DATETIME)"))
+        conn.execute(_text(
+            "INSERT INTO productions (id, org_id, name, is_main) VALUES (1, 7, 'Старый цех', 1)"))
+        conn.execute(_text(
+            "CREATE TABLE products (id INTEGER PRIMARY KEY, org_id INTEGER NOT NULL, "
+            "ext_id VARCHAR(64) NOT NULL DEFAULT '', base_name VARCHAR(255) NOT NULL, "
+            "size VARCHAR(32) NOT NULL DEFAULT '', category VARCHAR(128) NOT NULL DEFAULT '', "
+            "sale_price FLOAT NOT NULL DEFAULT 0, cost_price FLOAT NOT NULL DEFAULT 0, "
+            "archived BOOLEAN NOT NULL DEFAULT 0)"))
+        conn.execute(_text(
+            "INSERT INTO products (id, org_id, base_name, category) "
+            "VALUES (1, 7, 'Пакет', 'Упаковка'), (2, 7, 'Худи', 'Одежда')"))
+    race_engine.dispose()
+    # Все процессы ждут одного и того же момента и стартуют вместе.
+    start_at = time.time() + 2.0
+    snippet = (
+        "import os, sys, time\n"
+        f"time.sleep(max(0.0, {start_at!r} - time.time()))\n"
+        f"os.environ['DATABASE_URL'] = 'sqlite:///{race_db}'\n"
+        "os.environ['SCHEDULER_ENABLED'] = '0'\n"
+        f"sys.path.insert(0, {str(ROOT)!r})\n"
+        "from app.db import init_db\n"
+        "from app import exclusions\n"
+        "init_db(); exclusions.ensure_schema()\n"
+        "print('OK')\n"
+    )
+    procs = [subprocess.Popen([sys.executable, "-c", snippet],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+             for _ in range(4)]
+    results = [pr.communicate(timeout=90) for pr in procs]
+    started = sum(1 for out, _ in results if "OK" in out)
+    check("одновременный старт 4 процессов на старой базе: поднялись все",
+          started == 4,
+          "поднялось %d/4; ошибки: %s" % (
+              started, [e.strip().splitlines()[-1][:90] for o, e in results if "OK" not in o]))
+    race_engine = _create_engine(f"sqlite:///{race_db}", future=True)
+    race_cols = {c["name"] for c in _inspect(race_engine).get_columns("productions")}
+    with race_engine.begin() as conn:
+        race_flags = sorted(r[0] for r in conn.execute(
+            _text("SELECT name FROM migration_flags")).fetchall())
+        excl = dict(conn.execute(
+            _text("SELECT base_name, excluded FROM products ORDER BY id")).fetchall())
+        # пользователь вернул упаковку в аналитику — повторный старт не должен
+        # перетереть это решение
+        conn.execute(_text("UPDATE products SET excluded = 0 WHERE base_name = 'Пакет'"))
+    check("после гонки схема корректна и флаги не задвоились",
+          {"lead_time_days", "moq", "pack_multiple"} <= race_cols
+          and race_flags == ["excl_samples_v1", "productions_conditions_v1"],
+          f"cols={sorted(race_cols)} flags={race_flags}")
+    check("бэкфилл эвристики отработал ровно один раз",
+          excl == {"Пакет": 1, "Худи": 0}, f"excluded={excl}")
+    race_engine.dispose()
+    again = subprocess.run([sys.executable, "-c", snippet.replace(repr(start_at), "0.0")],
+                           capture_output=True, text=True, timeout=90)
+    race_engine = _create_engine(f"sqlite:///{race_db}", future=True)
+    with race_engine.begin() as conn:
+        excl2 = dict(conn.execute(
+            _text("SELECT base_name, excluded FROM products ORDER BY id")).fetchall())
+    check("повторный старт на мигрированной базе не перетирает выбор пользователя",
+          "OK" in again.stdout and excl2 == {"Пакет": 0, "Худи": 0},
+          f"excluded={excl2} err={again.stderr.strip()[-90:]}")
+    race_engine.dispose()
+
+    # 1в) Д4 (ревью деплоя 22.08): три оставшиеся миграции — ms_writeback,
+    # ms_sync, ms_vendor — раньше делали голый ALTER TABLE без защиты от
+    # гонки (и две из них вдобавок вызывались на импорте модуля, до старта
+    # приложения). Проверяем то же самое, что и для models/exclusions выше:
+    # «старая» схема без новых колонок, N процессов стартуют одновременно
+    # по общему барьеру, все N обязаны подняться.
+    from app import ms_sync as _ms_sync
+    from app import ms_vendor as _ms_vendor
+    from app import ms_writeback as _ms_writeback
+
+    old3_db = Path(tempfile.mkdtemp()) / "old_schema3.db"
+    old3_engine = _create_engine(f"sqlite:///{old3_db}", future=True)
+    with old3_engine.begin() as conn:
+        # production_orders без ms_doc_href/ms_doc_name (ms_writeback).
+        conn.execute(_text(
+            "CREATE TABLE production_orders (id INTEGER PRIMARY KEY, org_id INTEGER NOT NULL)"))
+        # ordered_qty без ms_qty, sync_state без fail_streak/alerted_streak (ms_sync).
+        conn.execute(_text(
+            "CREATE TABLE ordered_qty (id INTEGER PRIMARY KEY, org_id INTEGER NOT NULL)"))
+        conn.execute(_text(
+            "CREATE TABLE sync_state (id INTEGER PRIMARY KEY, org_id INTEGER NOT NULL)"))
+        # orgs без ms_account_id/source/status/ms_tariff_name, users без ms_uid (ms_vendor).
+        conn.execute(_text(
+            "CREATE TABLE orgs (id INTEGER PRIMARY KEY, name VARCHAR(120) NOT NULL)"))
+        conn.execute(_text(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, email VARCHAR(255) NOT NULL)"))
+    for fn, table, expect_cols in (
+        (_ms_writeback.ensure_schema, "production_orders", {"ms_doc_href", "ms_doc_name"}),
+        (_ms_sync.ensure_schema, "ordered_qty", {"ms_qty"}),
+        (_ms_sync.ensure_schema, "sync_state", {"fail_streak", "alerted_streak"}),
+        (_ms_vendor.ensure_schema, "orgs",
+         {"ms_account_id", "source", "status", "ms_tariff_name"}),
+        (_ms_vendor.ensure_schema, "users", {"ms_uid"}),
+    ):
+        fn(bind=old3_engine)
+        cols = {c["name"] for c in _inspect(old3_engine).get_columns(table)}
+        check(f"миграция добавила недостающие колонки в {table} (одиночный запуск)",
+              expect_cols <= cols, f"table={table} cols={sorted(cols)}")
+    old3_engine.dispose()
+
+    # Barrier-гонка: N процессов запускают ВСЕ пять миграций (models,
+    # exclusions, ms_writeback, ms_sync, ms_vendor) одновременно на одной
+    # старой базе — воспроизводит реальный старт `uvicorn --workers N`.
+    N_RACE = 6
+    race3_db = Path(tempfile.mkdtemp()) / "race_schema3.db"
+    race3_engine = _create_engine(f"sqlite:///{race3_db}", future=True)
+    with race3_engine.begin() as conn:
+        conn.execute(_text(
+            "CREATE TABLE productions (id INTEGER PRIMARY KEY, org_id INTEGER NOT NULL, "
+            "name VARCHAR(120) NOT NULL, is_main BOOLEAN NOT NULL, created_at DATETIME)"))
+        conn.execute(_text(
+            "CREATE TABLE products (id INTEGER PRIMARY KEY, org_id INTEGER NOT NULL, "
+            "ext_id VARCHAR(64) NOT NULL DEFAULT '', base_name VARCHAR(255) NOT NULL, "
+            "size VARCHAR(32) NOT NULL DEFAULT '', category VARCHAR(128) NOT NULL DEFAULT '', "
+            "sale_price FLOAT NOT NULL DEFAULT 0, cost_price FLOAT NOT NULL DEFAULT 0, "
+            "archived BOOLEAN NOT NULL DEFAULT 0)"))
+        conn.execute(_text(
+            "CREATE TABLE production_orders (id INTEGER PRIMARY KEY, org_id INTEGER NOT NULL)"))
+        conn.execute(_text(
+            "CREATE TABLE ordered_qty (id INTEGER PRIMARY KEY, org_id INTEGER NOT NULL)"))
+        conn.execute(_text(
+            "CREATE TABLE sync_state (id INTEGER PRIMARY KEY, org_id INTEGER NOT NULL)"))
+        conn.execute(_text(
+            "CREATE TABLE orgs (id INTEGER PRIMARY KEY, name VARCHAR(120) NOT NULL)"))
+        conn.execute(_text(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, email VARCHAR(255) NOT NULL)"))
+    race3_engine.dispose()
+    start_at3 = time.time() + 2.0
+    snippet3 = (
+        "import os, sys, time\n"
+        f"time.sleep(max(0.0, {start_at3!r} - time.time()))\n"
+        f"os.environ['DATABASE_URL'] = 'sqlite:///{race3_db}'\n"
+        "os.environ['SCHEDULER_ENABLED'] = '0'\n"
+        f"sys.path.insert(0, {str(ROOT)!r})\n"
+        "from app.db import init_db\n"
+        "from app import exclusions, ms_sync, ms_vendor, ms_writeback\n"
+        "init_db(); exclusions.ensure_schema()\n"
+        "ms_writeback.ensure_schema(); ms_sync.ensure_schema(); ms_vendor.ensure_schema()\n"
+        "print('OK')\n"
+    )
+    procs3 = [subprocess.Popen([sys.executable, "-c", snippet3],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+              for _ in range(N_RACE)]
+    results3 = [pr.communicate(timeout=90) for pr in procs3]
+    started3 = sum(1 for out, _ in results3 if "OK" in out)
+    check(f"barrier-гонка {N_RACE} процессов (все пять миграций, старая схема): поднялись все",
+          started3 == N_RACE,
+          "поднялось %d/%d; ошибки: %s" % (
+              started3, N_RACE,
+              [e.strip().splitlines()[-1][:120] for o, e in results3 if "OK" not in o]))
+    race3_engine = _create_engine(f"sqlite:///{race3_db}", future=True)
+    race3_insp = _inspect(race3_engine)
+    race3_ok = (
+        {"ms_doc_href", "ms_doc_name"} <= {c["name"] for c in race3_insp.get_columns("production_orders")}
+        and {"ms_qty"} <= {c["name"] for c in race3_insp.get_columns("ordered_qty")}
+        and {"fail_streak", "alerted_streak"} <= {c["name"] for c in race3_insp.get_columns("sync_state")}
+        and {"ms_account_id", "source", "status", "ms_tariff_name"}
+            <= {c["name"] for c in race3_insp.get_columns("orgs")}
+        and {"ms_uid"} <= {c["name"] for c in race3_insp.get_columns("users")}
+    )
+    check("после гонки во всех пяти таблицах нужные колонки на месте",
+          race3_ok, f"cols={ {t: sorted(c['name'] for c in race3_insp.get_columns(t)) for t in ('production_orders','ordered_qty','sync_state','orgs','users')} }")
+    race3_engine.dispose()
+
+    # То же самое на ЧИСТОЙ базе (create_all создаёт таблицы сразу со всеми
+    # колонками — ensure_schema должен пройти как no-op и не мешать старту).
+    clean3_db = Path(tempfile.mkdtemp()) / "clean_schema3.db"
+    start_at3c = time.time() + 1.5
+    snippet3c = snippet3.replace(str(race3_db), str(clean3_db)).replace(
+        repr(start_at3), repr(start_at3c))
+    procs3c = [subprocess.Popen([sys.executable, "-c", snippet3c],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+               for _ in range(N_RACE)]
+    results3c = [pr.communicate(timeout=90) for pr in procs3c]
+    started3c = sum(1 for out, _ in results3c if "OK" in out)
+    check(f"barrier-гонка {N_RACE} процессов на ЧИСТОЙ базе: поднялись все",
+          started3c == N_RACE,
+          "поднялось %d/%d; ошибки: %s" % (
+              started3c, N_RACE,
+              [e.strip().splitlines()[-1][:120] for o, e in results3c if "OK" not in o]))
+
+    # 2) Округление до минимальной партии и кратности на демо-данных.
+    repl0 = demo.get("/api/replenish").json()
+    check("без условий производства количество равно расчётному",
+          all(not it["moq_applied"] and it["need"] == it["need_raw"] for it in repl0["items"]),
+          f"изменённых={[i['base_name'] for i in repl0['items'] if i['moq_applied']][:3]}")
+    by_need = sorted(repl0["items"], key=lambda x: x["need"])
+    small = by_need[0]                                    # потребность в пару штук
+    # крупная позиция — на ней видно кратность (у мелкой её съедает партия)
+    big = next((it for it in by_need if it["need"] > 60), by_need[-1])
+    r = demo.post("/api/productions", json={
+        "name": "Бишкек", "lead_time_days": 70, "moq": 30, "pack_multiple": 6})
+    pid = r.json().get("id")
+    check("производство с условиями создано",
+          r.status_code == 200 and r.json().get("lead_time_days") == 70
+          and r.json().get("moq") == 30 and r.json().get("pack_multiple") == 6,
+          f"resp={r.text[:160]}")
+    for base in (small["base_name"], big["base_name"]):
+        rr = demo.post("/api/productions/assign", json={"base_name": base, "production_id": pid})
+        check(f"позиция перенесена на «Бишкек»: {base}", rr.status_code == 200,
+              f"status={rr.status_code}")
+    moved = {it["base_name"]: it for it in demo.get("/api/replenish").json()["items"]}
+    s_it = moved[small["base_name"]]
+    b_it = moved[big["base_name"]]
+    # need_raw после переноса пересчитан по сроку «Бишкека» (70 дней против
+    # общих 45): за дольшее ожидание успеет продаться больше, поэтому расчёт
+    # не может стать меньше прежнего. Требовать РАВЕНСТВА старому числу
+    # нельзя — это и была та половина фичи, где срок подрядчика не влиял
+    # ни на что, кроме показанной даты прихода.
+    check("количество поднято до минимальной партии",
+          s_it["need"] == 30 and s_it["need_raw"] >= small["need"] and s_it["moq_applied"],
+          f"{small['need']} → need_raw={s_it['need_raw']} → {s_it['need']}")
+    check("более долгий срок подрядчика не уменьшил расчётную потребность",
+          b_it["need_raw"] >= big["need"],
+          f"{big['need']} → {b_it['need_raw']} (срок 45 → 70 дн)")
+    check("потребность сильно ниже партии помечена «заказывать невыгодно»",
+          s_it["moq_low"] is (small["need"] < 15), f"need={small['need']} moq_low={s_it['moq_low']}")
+    check("крупная позиция округлена вверх до кратности",
+          b_it["need"] % 6 == 0 and b_it["need"] >= b_it["need_raw"] > 0
+          and b_it["need"] - b_it["need_raw"] < 6,
+          f"{b_it['need_raw']} → {b_it['need']}")
+    for it in (s_it, b_it):
+        check(f"сумма по размерам равна итогу позиции: {it['base_name']}",
+              sum(v["rec"] for v in it["sizes"].values()) == it["need"],
+              f"размеры={sum(v['rec'] for v in it['sizes'].values())} итог={it['need']}")
+    check("срок производства отдаётся по позиции",
+          s_it["lead_time_days"] == 70 and b_it["lead_time_days"] == 70,
+          f"got={(s_it['lead_time_days'], b_it['lead_time_days'])}")
+    others = [it for it in moved.values() if it["production_id"] != pid]
+    check("позиции основного производства считаются по общему сроку",
+          all(it["lead_time_days"] == repl0["lead_time_days"] and not it["moq_applied"]
+              for it in others),
+          f"n={len(others)}")
+
+    print("== Ревью 22.08: «Заказ позиции» считает срок и раскладку как «Заказ» ==")
+    from datetime import date as _d2, timedelta as _td2
+    today2 = _d2.today()
+    # Позиция на «Бишкеке» (срок 70): сервер обязан отдать дату прихода по
+    # ЕГО сроку с первого ответа, без второго запроса с поправкой из браузера.
+    sc = demo.get("/api/sizes/calc", params={
+        "product": b_it["base_name"], "qty": b_it["need"], "period": "12m", "mode": "stock"})
+    check("sizes/calc: срок и производство позиции на подрядчике",
+          sc.status_code == 200 and sc.json()["lead_time_days"] == 70
+          and sc.json()["production_id"] == pid and sc.json()["production_name"] == "Бишкек",
+          f"resp={sc.text[:200]}")
+    check("sizes/calc: дата прихода сразу по сроку подрядчика (70 дн), без второго запроса",
+          sc.json()["days_to_arrival"] == 70
+          and sc.json()["arrival_date"] == (today2 + _td2(days=70)).isoformat(),
+          f"got days={sc.json()['days_to_arrival']} arrival={sc.json()['arrival_date']}")
+    # Позиция основного производства — по общему сроку, как и раньше.
+    other_it = others[0]
+    sc_main = demo.get("/api/sizes/calc", params={
+        "product": other_it["base_name"], "qty": 10, "period": "12m", "mode": "stock"})
+    check("sizes/calc: позиция основного производства — общий срок",
+          sc_main.status_code == 200
+          and sc_main.json()["lead_time_days"] == repl0["lead_time_days"],
+          f"resp={sc_main.text[:200]}")
+    # Раскладка по размерам на равном количестве обязана совпасть с «Заказом»
+    # (общая analytics.size_split, а не свой пересчёт по календарным месяцам).
+    order_rec = {s: v["rec"] for s, v in b_it["sizes"].items()}
+    calc_pure = {row["size"]: row["order_pure"] for row in sc.json()["sizes"]}
+    check("sizes/calc: «чистая пропорция» = ростовка «Заказа» на том же количестве",
+          sc.json()["split_matches_order_page"] is True and calc_pure == order_rec,
+          f"заказ={order_rec} sizes/calc={calc_pure}")
+
+    # Заказ уходит с округлёнными числами (как их видит человек на странице).
+    r = demo.post("/api/orders", json={"name": "Проверка партии", "eta_date": None, "items": [
+        {"base_name": s_it["base_name"], "qty": s_it["need"],
+         "sizes": {k: v["rec"] for k, v in s_it["sizes"].items() if v["rec"] > 0},
+         "cost": s_it["cost_price"]}]})
+    check("заказ по позиции с минимальной партией создан", r.status_code == 200, f"resp={r.text[:160]}")
+    order = demo.get(f"/api/orders/{r.json()['id']}").json()
+    check("в заказ ушло округлённое количество",
+          order["total_qty"] == 30 and sum(order["items"][0]["sizes"].values()) == 30,
+          f"qty={order['total_qty']}")
+    demo.delete(f"/api/orders/{order['id']}")
+
+    # 2б) Защита от случайного дубля заказа (ревью 22.08: тройной POST давал
+    # три настоящих заказа на фабрику — двойной тап, ретрай, повтор формы).
+    need_before = sum(it["need"] for it in demo.get("/api/replenish").json()["items"])
+    dup_payload = {"name": "Заказ-дубль", "eta_date": None, "items": [
+        {"base_name": s_it["base_name"], "qty": 12, "sizes": {}, "cost": 100}]}
+    n0 = len(demo.get("/api/orders").json()["orders"])
+    answers = [demo.post("/api/orders", json=dup_payload).json() for _ in range(3)]
+    n1 = len(demo.get("/api/orders").json()["orders"])
+    check("три одинаковых POST /api/orders создают один заказ", n1 - n0 == 1,
+          f"было {n0}, стало {n1}, ответы={[a.get('id') for a in answers]}")
+    check("повторы отмечены duplicate и указывают на тот же заказ",
+          [a.get("duplicate") for a in answers] == [None, True, True]
+          and len({a["id"] for a in answers}) == 1, f"answers={answers}")
+    check("человеку объясняют, как всё-таки заказать второй раз",
+          "измените название" in answers[1].get("message", ""),
+          f"message={answers[1].get('message', '')[:80]}")
+    dup_id = answers[0]["id"]
+    r = demo.post(f"/api/orders/{dup_id}/status", json={"status": "sent"})
+    r2 = demo.post(f"/api/orders/{dup_id}/status", json={"status": "sent"})
+    check("повтор того же статуса не ошибка и ничего не меняет",
+          r.status_code == 200 and r2.status_code == 200 and r2.json().get("unchanged") is True,
+          f"первый={r.status_code} второй={r2.text[:80]}")
+    r = demo.post("/api/orders", json=dict(dup_payload, allow_duplicate=True))
+    forced_id = r.json().get("id")
+    check("осознанный второй такой же заказ (allow_duplicate) проходит",
+          r.status_code == 200 and forced_id != dup_id and not r.json().get("duplicate"),
+          f"resp={r.text[:120]}")
+    r = demo.post("/api/orders", json=dict(dup_payload, name="Заказ-дубль второй"))
+    renamed_id = r.json().get("id")
+    check("другое название — другой заказ", renamed_id not in (dup_id, forced_id),
+          f"id={renamed_id}")
+    for oid in (dup_id, forced_id, renamed_id):
+        demo.delete(f"/api/orders/{oid}")
+    check("после уборки заказов рекомендация вернулась к прежней",
+          sum(it["need"] for it in demo.get("/api/replenish").json()["items"]) == need_before,
+          f"было {need_before}")
+
+    # 2в) Дедуп не должен цепляться к уже ПРИНЯТОМУ на склад заказу — это уже
+    # история, и повтор того же состава после приёмки означает «нужен ещё
+    # такой же», а не случайный повтор формы (ревью деплоя 22.08: раньше
+    # клиент получал обратно received-заказ и падал в 422 на переходе в sent).
+    recv_payload = {"name": "Заказ до приёмки", "eta_date": None, "items": [
+        {"base_name": s_it["base_name"], "qty": 7, "sizes": {}, "cost": 100}]}
+    recv_id = demo.post("/api/orders", json=recv_payload).json()["id"]
+    demo.post(f"/api/orders/{recv_id}/status", json={"status": "sent"})
+    r = demo.post(f"/api/orders/{recv_id}/status", json={"status": "received"})
+    check("заказ принят на склад (подготовка)",
+          r.status_code == 200 and r.json()["status"] == "received", f"resp={r.text[:120]}")
+    r = demo.post("/api/orders", json=recv_payload)
+    repeated = r.json()
+    check("повтор того же состава после приёмки создаёт НОВЫЙ заказ, не склеивается с received",
+          r.status_code == 200 and not repeated.get("duplicate") and repeated["id"] != recv_id,
+          f"resp={repeated}")
+    r2 = demo.post(f"/api/orders/{repeated['id']}/status", json={"status": "sent"})
+    check("новый заказ спокойно переводится в «В производстве» (не 422 недопустимого перехода)",
+          r2.status_code == 200 and r2.json().get("status") == "sent",
+          f"status={r2.status_code} body={r2.text[:150]}")
+    demo.delete(f"/api/orders/{repeated['id']}")
+
+    # Для сравнения: повтор для заказа, который ещё «В производстве» (sent, а
+    # не received), по-прежнему безопасно склеивается — статус можно послать
+    # повторно, ничего не ломается (unchanged).
+    sent_payload = {"name": "Заказ уже в производстве", "eta_date": None, "items": [
+        {"base_name": s_it["base_name"], "qty": 5, "sizes": {}, "cost": 100}]}
+    sent_id = demo.post("/api/orders", json=sent_payload).json()["id"]
+    demo.post(f"/api/orders/{sent_id}/status", json={"status": "sent"})
+    twin = demo.post("/api/orders", json=sent_payload).json()
+    check("повтор для sent-заказа по-прежнему склеивается с ним",
+          twin.get("duplicate") is True and twin.get("id") == sent_id, f"resp={twin}")
+    r2 = demo.post(f"/api/orders/{sent_id}/status", json={"status": "sent"})
+    check("статус sent→sent для склеенного заказа не ошибка (unchanged)",
+          r2.status_code == 200 and r2.json().get("unchanged") is True, f"resp={r2.text[:120]}")
+    demo.delete(f"/api/orders/{sent_id}")
+
+    # 2г) Позиция вне каталога организации: заказ не создаётся вообще, и
+    # заодно проверяем, что сервер никогда не доверяет присланной клиентом
+    # себестоимости (раньше для «призрачных» позиций верил ей ровно потому,
+    # что не знал, что с ними делать иначе — см. п. 2д про 404).
+    r = demo.post("/api/orders", json={"name": "Призрак", "eta_date": None, "items": [
+        {"base_name": "Несуществующий товар XYZ 12345", "qty": 5, "sizes": {}, "cost": 999999}]})
+    check("заказ на товар не из каталога → 404, а не 200 с придуманной ценой",
+          r.status_code == 404 and "каталоге" in r.text, f"status={r.status_code} body={r.text[:150]}")
+    r = demo.post("/api/orders", json={"name": "Наполовину призрак", "eta_date": None, "items": [
+        {"base_name": s_it["base_name"], "qty": 3, "sizes": {}, "cost": 1},
+        {"base_name": "Ещё один призрак", "qty": 2, "sizes": {}, "cost": 1}]})
+    check("даже одна позиция вне каталога отклоняет заказ целиком",
+          r.status_code == 404, f"status={r.status_code}")
+    r = demo.post("/api/orders", json={"name": "Реальный товар, чужая цена", "eta_date": None,
+                                        "items": [{"base_name": s_it["base_name"], "qty": 1,
+                                                    "sizes": {}, "cost": 1}]})
+    check("заказ на реальный товар создаётся", r.status_code == 200, f"resp={r.text[:120]}")
+    trusted_id = r.json()["id"]
+    trusted_order = demo.get(f"/api/orders/{trusted_id}").json()
+    check("присланная клиентом себестоимость (1 ₽) проигнорирована — подставлена своя из каталога",
+          trusted_order["items"][0]["cost"] == s_it["cost_price"]
+          and trusted_order["items"][0]["cost"] != 1,
+          f"cost={trusted_order['items'][0]['cost']} expected={s_it['cost_price']}")
+    demo.delete(f"/api/orders/{trusted_id}")
+
+    # 2д) eta_date — только формат ГГГГ-ММ-ДД; название заказа ограничено
+    # 120 символами (как у названия производства, см. ProductionIn).
+    r = demo.post("/api/orders", json={"name": "Кривая дата", "eta_date": "not-a-date",
+                                        "items": [{"base_name": s_it["base_name"], "qty": 1,
+                                                    "sizes": {}, "cost": 1}]})
+    check("eta_date не в формате ГГГГ-ММ-ДД → 422", r.status_code == 422, f"status={r.status_code}")
+    r = demo.post("/api/orders", json={"name": "д" * 200, "eta_date": None,
+                                        "items": [{"base_name": s_it["base_name"], "qty": 1,
+                                                    "sizes": {}, "cost": 1}]})
+    check("название заказа длиннее 120 символов → 422", r.status_code == 422, f"status={r.status_code}")
+    r = demo.post("/api/orders", json={"name": "Валидные дата и название", "eta_date": "2026-09-01",
+                                        "items": [{"base_name": s_it["base_name"], "qty": 1,
+                                                    "sizes": {}, "cost": 1}]})
+    check("валидная дата и короткое название по-прежнему создают заказ",
+          r.status_code == 200, f"status={r.status_code}")
+    demo.delete(f"/api/orders/{r.json()['id']}")
+    check("после уборки этих заказов рекомендация снова как прежде",
+          sum(it["need"] for it in demo.get("/api/replenish").json()["items"]) == need_before,
+          f"было {need_before}")
+
+    # 3) Изоляция: производства и их условия — строго внутри организации.
+    ms_prods = client.get("/api/productions").json()
+    check("чужое производство не видно другой организации",
+          all(p["name"] != "Бишкек" for p in ms_prods["productions"]),
+          f"got={[p['name'] for p in ms_prods['productions']]}")
+    r = client.post("/api/productions/assign",
+                    json={"base_name": "Худи «Скетч»", "production_id": pid})
+    check("перенос позиции на чужое производство → 404", r.status_code == 404,
+          f"status={r.status_code}")
+    r = client.post(f"/api/productions/{pid}", json={"name": "Взлом", "moq": 999})
+    check("правка чужого производства → 404", r.status_code == 404, f"status={r.status_code}")
+    r = client.delete(f"/api/productions/{pid}")
+    check("удаление чужого производства → 404", r.status_code == 404, f"status={r.status_code}")
+    check("после чужих попыток условия не изменились",
+          demo.get("/api/productions").json()["productions"][-1]["moq"] == 30)
+
+    # 4) Границы id в пути: огромное число — понятная 422, а не 500.
+    for path, method in (("/api/orders/999999999999999999999/ms-doc", "GET"),
+                         ("/api/orders/999999999999999999999/push-to-ms", "POST"),
+                         ("/api/orders/999999999999999999999", "GET")):
+        r = demo.request(method, path)
+        check(f"огромный id в пути → 422 ({path.split('/')[-1]})", r.status_code == 422,
+              f"status={r.status_code}")
+    r = demo.post("/api/productions/assign",
+                  json={"base_name": "Пальто «Кокон»", "production_id": 10 ** 24})
+    check("огромный id производства в теле запроса → 422", r.status_code == 422,
+          f"status={r.status_code}")
+
+    print("== Выгрузка «Что заказать» = то, что человек видит на экране ==")
+    # Файл несут на фабрику: он обязан совпадать со страницей и по условиям
+    # подрядчика (минимальная партия, кратность), и по ручным правкам ростовки.
+    # Раньше выгрузка звала build_replenish напрямую и не знала ни про то, ни
+    # про другое: на экране 17 шт «правлено», в файле 19 шт по расчёту.
+    from openpyxl import load_workbook as _load_wb
+
+    def _xlsx_replenish(cl):
+        """Позиции выгрузки «Что заказать» по ВСЕМ листам производств.
+
+        Книга разложена так же, как страница: лист на каждое производство,
+        со своей шапкой и своим «Итого» (раньше был один лист и один общий
+        итог, который не совпадал ни с одной вкладкой — ревью «экран ≠ файл»).
+        Возвращает {позиция: ...}, {лист: итог} и {лист: шапка A1}.
+        """
+        resp = cl.get("/api/export/replenish.xlsx")
+        wb = _load_wb(io.BytesIO(resp.content))
+        out, totals, titles = {}, {}, {}
+        for ws in wb:
+            if ws.title == "Не вошло и почему":
+                continue
+            titles[ws.title] = ws["A1"].value or ""
+            cur = None
+            for row in ws.iter_rows(min_row=3, values_only=True):
+                name = row[0]
+                if not name:
+                    continue
+                name = str(name)
+                if name.startswith("Итого"):
+                    totals[ws.title] = row[10]
+                    continue
+                if name.startswith("Позиции, не попавшие") or name.startswith("Это итог"):
+                    continue
+                if name.startswith("— "):
+                    if cur:
+                        out[cur]["sizes"][name[2:]] = row[10]
+                        out[cur]["size_notes"][name[2:]] = row[14]
+                    continue
+                cur = name
+                out[name] = {"need": row[10], "prod": row[13], "note": row[14],
+                             "sheet": ws.title, "sizes": {}, "size_notes": {}}
+        return out, totals, titles
+
+    api_items = {it["base_name"]: it for it in demo.get("/api/replenish").json()["items"]}
+    xls, xls_totals, xls_titles = _xlsx_replenish(demo)
+    check("в выгрузке столько же позиций, сколько на странице",
+          len(xls) == len(api_items), f"файл={len(xls)} страница={len(api_items)}")
+    diff = [(n, api_items[n]["need"], xls[n]["need"]) for n in api_items
+            if n in xls and xls[n]["need"] != api_items[n]["need"]]
+    check("количества в файле совпадают со страницей (с минимальной партией)",
+          not diff, f"расходятся={diff[:3]}")
+    check("итог файла равен сумме строк файла",
+          sum(xls_totals.values()) == sum(v["need"] for v in xls.values()),
+          f"итого={xls_totals} сумма={sum(v['need'] for v in xls.values())}")
+    b_name = b_it["base_name"]
+    check("в файле указано производство позиции",
+          xls[b_name]["prod"] == "Бишкек", f"got={xls[b_name]['prod']}")
+
+    # Экран ≠ файл (находка ревью): страница разведена по вкладкам производств,
+    # а книга склеивала их в один лист с одним итогом — «35 поз. / 1 802 шт» не
+    # совпадало ни с одной вкладкой, и шапка обещала общий срок 45 дней над
+    # строкой, которая шьётся 70 дней у другого подрядчика.
+    _tabs = {}
+    for _it in api_items.values():
+        _tabs.setdefault(_it.get("production_name") or "", []).append(_it)
+    check("в книге лист на каждое производство",
+          len(xls_totals) == len(_tabs), f"листов={sorted(xls_totals)} вкладок={sorted(_tabs)}")
+    _bad_tabs = []
+    for _name, _its in _tabs.items():
+        _sheet = next((t for t in xls_totals if t.startswith(_name[:20])), None)
+        _want = sum(i["need"] for i in _its)
+        if _sheet is None or xls_totals[_sheet] != _want:
+            _bad_tabs.append((_name, _want, _sheet and xls_totals[_sheet]))
+    check("итог листа совпадает с итогом своей вкладки на странице",
+          not _bad_tabs, f"расходятся={_bad_tabs}")
+    check("позиции «Бишкека» лежат на своём листе, а не вперемешку",
+          all(xls[i["base_name"]]["sheet"].startswith("Бишкек") for i in _tabs["Бишкек"])
+          and all(not xls[i["base_name"]]["sheet"].startswith("Бишкек")
+                  for i in _tabs["Основное производство"]),
+          f"листы={ {n: v['sheet'] for n, v in list(xls.items())[:3]} }")
+    _t_bish = next(t for t in xls_titles if t.startswith("Бишкек"))
+    check("шапка листа называет срок СВОЕГО подрядчика, а не общий из настроек",
+          "срок производства 70 дней" in xls_titles[_t_bish]
+          and "партия от 30 шт" in xls_titles[_t_bish],
+          f"A1={xls_titles[_t_bish]}")
+    _t_main = next(t for t in xls_titles if not t.startswith("Бишкек"))
+    check("шапка основного листа обещает срок основного производства",
+          "срок производства 45 дней" in xls_titles[_t_main], f"A1={xls_titles[_t_main]}")
+    # Примечание проверяем на мелкой позиции: её партия поднимает гарантированно,
+    # тогда как крупная попадает под кратность только если расчёт на неё не делится
+    # (после того как срок подрядчика стал влиять на расчёт, это уже не гарантия).
+    s_name = s_it["base_name"]
+    check("примечание объясняет, откуда взялось количество больше расчётного",
+          "по расчёту" in (xls[s_name]["note"] or "") and "партия" in (xls[s_name]["note"] or ""),
+          f"note={xls[s_name]['note']}")
+    check("сумма по размерам в файле равна итогу позиции",
+          sum(xls[b_name]["sizes"].values()) == xls[b_name]["need"],
+          f"размеры={sum(xls[b_name]['sizes'].values())} итог={xls[b_name]['need']}")
+
+    # Ручная правка: человек уменьшил один размер под фабрику.
+    b_sizes = {k: v["rec"] for k, v in api_items[b_name]["sizes"].items()}
+    first_size = sorted(b_sizes)[0]
+    manual = {first_size: 1}
+    expect_need = sum(manual.get(k, v) for k, v in b_sizes.items())
+    r = demo.post("/api/replenish-draft", json={"base_name": b_name, "sizes": manual})
+    check("ручная правка ростовки сохранена", r.status_code == 200, f"resp={r.text[:120]}")
+    xls, xls_totals, _ = _xlsx_replenish(demo)
+    check("в файле — правка человека, а не расчёт",
+          xls[b_name]["need"] == expect_need != api_items[b_name]["need"],
+          f"файл={xls[b_name]['need']} ожидали={expect_need} расчёт={api_items[b_name]['need']}")
+    check("правленый размер в файле равен введённому",
+          xls[b_name]["sizes"].get(first_size) == 1,
+          f"got={xls[b_name]['sizes'].get(first_size)}")
+    check("примечание называет и расчёт, и правку",
+          "правлена вручную" in (xls[b_name]["note"] or ""), f"note={xls[b_name]['note']}")
+    check("правленый размер подписан расчётом, от которого отошли",
+          "правлено вручную" in (xls[b_name]["size_notes"].get(first_size) or "")
+          and str(b_sizes[first_size]) in (xls[b_name]["size_notes"].get(first_size) or ""),
+          f"note={xls[b_name]['size_notes'].get(first_size)}")
+    check("итог файла пересчитан по правке",
+          sum(xls_totals.values()) == sum(v["need"] for v in xls.values()),
+          f"итого={xls_totals} сумма={sum(v['need'] for v in xls.values())}")
+    # Ручная правка сильнее минимальной партии — но о нарушении говорим вслух.
+    check("правка ниже минимальной партии не переписана условиями подрядчика",
+          xls[b_name]["need"] == expect_need, f"got={xls[b_name]['need']}")
+    if expect_need < 30 or expect_need % 6:
+        check("файл предупреждает, что заказ не проходит по условиям фабрики",
+              "не проходит по условиям" in (xls[b_name]["note"] or ""),
+              f"note={xls[b_name]['note']}")
+    check("правки одной позиции не задели остальные строки файла",
+          all(xls[n]["need"] == api_items[n]["need"] for n in xls if n != b_name),
+          "расходятся: " + str([n for n in xls if n != b_name
+                                and xls[n]["need"] != api_items[n]["need"]][:3]))
+    demo.post("/api/replenish-draft/reset", json={"base_name": ""})
+    xls, _, _ = _xlsx_replenish(demo)
+    check("после сброса правок файл вернулся к расчёту",
+          xls[b_name]["need"] == api_items[b_name]["need"],
+          f"файл={xls[b_name]['need']} расчёт={api_items[b_name]['need']}")
+    print("== Формульная инъекция в выгрузках Excel ==")
+    import zipfile
+    from datetime import date as _d, timedelta as _td
+
+    # Название организации, позиции, категории и производства задаёт человек,
+    # а файл открывает бухгалтерия клиента. Строка, начинающаяся с '=', '+',
+    # '-' или '@', в Excel исполняется как формула (CWE-1236): «=cmd|"/c
+    # calc"!A1» — это команда операционной системе, а не текст.
+    _EVIL = '=cmd|"/c calc"!A1'
+    evil = httpx.Client(headers={"X-Oborot-CSRF": "1"},
+                        base_url=f"http://127.0.0.1:{APP_PORT}", timeout=120.0)
+    r = evil.post("/register", data={
+        "name": "Вредитель", "email": "evil@test.io",
+        "password": "secret123", "org_name": _EVIL,
+    })
+    check("регистрация с формулой в названии организации", r.status_code == 303,
+          f"status={r.status_code}")
+    evil.post("/api/connect/demo")
+    _con_ev = sqlite3.connect(DB_PATH)
+    _evil_org = _con_ev.execute(
+        "SELECT id FROM orgs WHERE name=?", (_EVIL,)).fetchone()[0]
+    # тот же payload — в название позиции, категорию и производство
+    _con_ev.execute(
+        "UPDATE products SET base_name=?, category=? WHERE org_id=? AND base_name=?",
+        (_EVIL, "@SUM(1+1)", _evil_org, "Худи «Штрих»"))
+    _con_ev.commit()
+    _con_ev.close()
+    r = evil.post("/api/productions", json={"name": '=HYPERLINK("http://evil","Цех")'})
+    _evil_pid = r.json().get("id")
+    evil.post("/api/productions/assign",
+              json={"base_name": _EVIL, "production_id": _evil_pid})
+    _risky, _unprotected, _formulas = 0, [], 0
+    for _url in ("/api/export/replenish.xlsx", "/api/export/turnover.xlsx",
+                 "/api/export/budget.xlsx"):
+        _resp = evil.get(_url)
+        check(f"выгрузка отдаётся: {_url.rsplit('/', 1)[-1]}", _resp.status_code == 200,
+              f"status={_resp.status_code}")
+        _wb = _load_wb(io.BytesIO(_resp.content))
+        for _ws in _wb:
+            for _row in _ws.iter_rows():
+                for _c in _row:
+                    if isinstance(_c.value, str) and _c.value[:1] in ("=", "+", "-", "@"):
+                        _risky += 1
+                        # data_type 'f' — openpyxl записал бы настоящую формулу;
+                        # quotePrefix — тот самый апостроф Excel, невидимый в
+                        # значении и переживающий копирование и CSV
+                        if _c.data_type == "f" or not _c.quotePrefix:
+                            _unprotected.append((_url, _ws.title, _c.coordinate,
+                                                 _c.value[:40]))
+        _formulas += sum(
+            zipfile.ZipFile(io.BytesIO(_resp.content)).read(_n).count(b"<f>")
+            for _n in zipfile.ZipFile(io.BytesIO(_resp.content)).namelist()
+            if _n.startswith("xl/worksheets/")
+        )
+    check("пользовательский текст с '=' долетел до всех выгрузок (тест бьёт в цель)",
+          _risky >= 3, f"опасных ячеек={_risky}")
+    check("ни одна такая ячейка не осталась без защиты",
+          not _unprotected, f"без защиты={_unprotected[:3]}")
+    check("в книгах нет ни одной ячейки-формулы",
+          _formulas == 0, f"формул в xml={_formulas}")
+    evil.close()
+
+    print("== Сезонное эхо: фолбэк не заказывает то, что умерло полгода назад ==")
+    # Фолбэк на годовой темп срабатывал по факту «товара не было на складе» —
+    # и одинаково тянул в заказ и бестселлер, распроданный вчера, и зимнее
+    # пальто, которого нет с января. Разводим три случая на одних данных.
+    _con_e = sqlite3.connect(DB_PATH)
+    _demo_org2 = _con_e.execute(
+        "SELECT org_id FROM products WHERE base_name=? AND org_id<>? LIMIT 1",
+        ("Пальто «Кокон»", _evil_org)).fetchone()[0]
+
+    def _wipe(base, sale_day, born_day=None):
+        """Позиция ушла с полки в sale_day; продажи оставлены одним днём.
+
+        born_day — если задан, вся история ДО этой даты стирается: получается
+        новинка, которой в сезонном окне прошлого года ещё не существовало.
+        """
+        pids = [x[0] for x in _con_e.execute(
+            "SELECT id FROM products WHERE org_id=? AND base_name=?",
+            (_demo_org2, base))]
+        qs = ",".join("?" * len(pids))
+        gone = (_d.fromisoformat(sale_day) + _td(days=1)).isoformat()
+        _con_e.execute(f"UPDATE stock_days SET qty=0 WHERE product_id IN ({qs}) AND date>=?",
+                       pids + [gone])
+        _con_e.execute(f"UPDATE warehouse_stock SET qty=0 WHERE product_id IN ({qs})", pids)
+        _con_e.execute(f"DELETE FROM sales WHERE product_id IN ({qs})", pids)
+        if born_day:
+            _con_e.execute(
+                f"DELETE FROM stock_days WHERE product_id IN ({qs}) AND date<?",
+                pids + [born_day])
+        for pid in pids:
+            _con_e.execute(
+                "INSERT INTO sales (org_id,product_id,date,qty,revenue,is_return)"
+                " VALUES (?,?,?,?,?,0)",
+                (_demo_org2, pid, sale_day, 9.0, 9 * 26000.0))
+
+    _today_e = _d.today()
+    # 1) «Сезонное эхо»: продавалось только в январе, с полки ушло тогда же,
+    #    и в сезонном окне прошлого года (период прихода заказа) продаж нет.
+    _echo_day = (_today_e - _td(days=225)).isoformat()
+    _wipe("Пальто «Кокон»", _echo_day)
+    # 2) Бестселлер, распроданный давно, НО продававшийся в сезонном окне
+    #    прошлого года — ровно в тот период, на который считается заказ.
+    _season_day = (_today_e + _td(days=45 + 10 - 365)).isoformat()
+    _wipe("Платье «Макси чёрное»", _season_day)
+    # 3) Новинка: появилась 120 дней назад, распродана в ноль 100 дней назад —
+    #    сезонного окна у неё нет вовсе, отсекать её не за что.
+    _wipe("Тренч «Классика»", (_today_e - _td(days=100)).isoformat(),
+          born_day=(_today_e - _td(days=120)).isoformat())
+    _con_e.commit()
+    _con_e.close()
+
+    demo.post("/api/settings", json={"rate_window": "d90"})  # заодно сбрасывает кэш
+    _re = demo.get("/api/replenish").json()
+    _in = {x["base_name"]: x for x in _re["items"]}
+    _out = {e["base_name"]: e["reason"] for e in _re["excluded"]}
+    check("d90: распроданное полгода назад и не в сезон в заказ НЕ идёт",
+          "Пальто «Кокон»" not in _in,
+          f"need={_in.get('Пальто «Кокон»', {}).get('need')}")
+    check("d90: причина исключения объясняет, а не отмахивается",
+          "не было на складе" in (_out.get("Пальто «Кокон»") or ""),
+          f"reason={_out.get('Пальто «Кокон»')!r}")
+    check("d90: бестселлер, распроданный давно, но продающийся в сезон заказа, остался",
+          "Платье «Макси чёрное»" in _in and _in["Платье «Макси чёрное»"]["rate_fallback"],
+          f"в заказе={'Платье «Макси чёрное»' in _in} excl={_out.get('Платье «Макси чёрное»')!r}")
+    check("d90: новинку, распроданную в ноль, сезонное окно не отсекает",
+          "Тренч «Классика»" in _in and _in["Тренч «Классика»"]["rate_fallback"],
+          f"в заказе={'Тренч «Классика»' in _in} excl={_out.get('Тренч «Классика»')!r}")
+    _yr = demo.post("/api/settings", json={"rate_window": "year"})
+    _ry = demo.get("/api/replenish").json()
+    check("окно «за год» правкой не задето: там темп настоящий, а не фолбэк",
+          any(x["base_name"] == "Пальто «Кокон»" for x in _ry["items"])
+          and not any(x["rate_fallback"] for x in _ry["items"]),
+          f"в заказе={[x['base_name'] for x in _ry['items'] if x['base_name'] == 'Пальто «Кокон»']}")
+
+    print("== Возвраты не делают деньги отрицательными ==")
+    # Возврат вычитается из выручки. Если за год их больше, чем продаж,
+    # нетто-выручка отрицательна — «средняя цена −4 888 ₽» отравляла и цену,
+    # и маржу, и «заморожено», и кольцо «Склад в деньгах» (находка ревью).
+    _con_r = sqlite3.connect(DB_PATH)
+    _rid = [x[0] for x in _con_r.execute(
+        "SELECT id FROM products WHERE org_id=? AND base_name=?",
+        (_demo_org2, 'Кольцо «Печатка»'))]
+    # Возврат небольшой по штукам, но крупный по деньгам (вернули то, что
+    # продавали по полной, а продажи шли со скидкой): штуки остаются
+    # положительными, а нетто-выручка уходит в минус — ровно случай ревью.
+    for _pid in _rid:
+        _con_r.execute(
+            "INSERT INTO sales (org_id,product_id,date,qty,revenue,is_return)"
+            " VALUES (?,?,?,?,?,1)",
+            (_demo_org2, _pid, (_today_e - _td(days=5)).isoformat(), 5.0, 5 * 900_000.0))
+    _con_r.commit()
+    _con_r.close()
+    demo.post("/api/settings", json={"rate_window": "year"})  # сброс кэша
+    _tn = demo.get("/api/turnover").json()
+    _ring = demo.get("/api/pulse").json()
+    _fc2 = demo.get("/api/forecast").json()
+    _ri = next(x for x in _tn["items"] if x["base_name"] == 'Кольцо «Печатка»')
+    check("возвраты больше продаж: средней цены продажи нет, а не «минус»",
+          _ri["avg_price"] is None and _ri["returns_over_sales"],
+          f"avg_price={_ri['avg_price']} flag={_ri.get('returns_over_sales')}")
+    check("оборачиваемость ₽/день не отрицательная",
+          _ri["turnover"] >= 0 and all(v >= 0 for v in (_ri.get("sea") or {}).values()),
+          f"turnover={_ri['turnover']} sea={_ri.get('sea')}")
+    check("деньги в остатке по такой позиции не ушли в минус",
+          _ri["stock_sale"] >= 0 and (_ri["stock_margin"] is None or _ri["stock_margin"] >= 0
+                                      or _ri["cs"] == 0),
+          f"stock_sale={_ri['stock_sale']} stock_margin={_ri['stock_margin']}")
+    _neg = [x["base_name"] for x in _tn["items"]
+            if x["turnover"] < 0 or (x["stock_sale"] or 0) < 0
+            or (x["avg_price"] is not None and x["avg_price"] < 0)
+            or any(v < 0 for v in (x.get("sea") or {}).values())]
+    check("во всей таблице нет отрицательных цен, ₽/день и сумм",
+          not _neg, f"отрицательные={_neg[:3]}")
+    _tot = _tn.get("totals") or {}
+    check("агрегаты страницы не отрицательные",
+          all(v >= 0 for k, v in _tot.items()
+              if isinstance(v, (int, float)) and k.startswith("stock_")),
+          f"totals={ {k: v for k, v in _tot.items() if isinstance(v, (int, float)) and v < 0} }")
+    check("кольцо «Склад в деньгах» и «Прогноз» тоже без минуса",
+          (_ring.get("stock", {}).get("now", 0) or 0) >= 0
+          and _fc2["cards"]["stock_value"] >= 0,
+          f"кольцо={_ring.get('stock', {}).get('now')} прогноз={_fc2['cards']['stock_value']}")
+    check("сезонные колонки с перевесом возвратов подписаны словами",
+          not _ri.get("sea_returns")
+          or "возвраты" in (_ri.get("sea_returns") and "возвраты" or ""),
+          f"sea_returns={_ri.get('sea_returns')}")
+
+    print("== «Стока хватит до»: заказанный товар не приближает дефицит ==")
+    # Находка бухгалтера: добавление 223 шт «в производство» сдвигало дату
+    # на неделю РАНЬШЕ. Порог считался от «склад + едет», и партия ходового
+    # товара поднимала знаменатель быстрее, чем остаток.
+    _u0 = demo.get("/api/forecast").json()["cards"]
+    _dates = [(0, _u0["until_date"], _u0["until_weeks"])]
+    for _qty in (50, 150, 223, 400):
+        demo.post("/api/ordered", json={"base_name": 'Футболка «Манифест»', "qty": _qty})
+        _c2 = demo.get("/api/forecast").json()["cards"]
+        _dates.append((_qty, _c2["until_date"], _c2["until_weeks"]))
+    _weeks = [(q, w if w is not None else 10 ** 6) for q, _dt, w in _dates]
+    check("дата дефицита не едет назад, сколько бы товара ни заказали",
+          all(_weeks[i][1] <= _weeks[i + 1][1] for i in range(len(_weeks) - 1)),
+          f"недели по заказу={_weeks}")
+    check("карточка объясняет, от чего считается порог",
+          "склад" in (_u0.get("until_basis") or "").lower(),
+          f"until_basis={_u0.get('until_basis')!r}")
+    demo.post("/api/ordered", json={"base_name": 'Футболка «Манифест»', "qty": 0})
+
+    print("== Хвост неликвида (1 шт на полке) фолбэк не подхватывает ==")
+    # Кейс ревью: 1 шт на складе — это МЕНЬШЕ порога min_stock_days (3 шт),
+    # поэтому «дней в стоке» за 90 дней ноль, как и у распроданного в ноль.
+    # Но товар лежал, и продавать его было можно: годовой темп сюда тянуть
+    # нельзя, иначе система предлагает дошить то, что не продаётся.
+    from datetime import date as _d, timedelta as _td
+    _dead = "Браслет «Звенья»"  # позиция из демо-каталога (app/demo_seed.py)
+    _cut120 = (_d.today() - _td(days=120)).isoformat()
+    _con = sqlite3.connect(DB_PATH)
+    _demo_org_id = _con.execute(
+        "SELECT org_id FROM products WHERE base_name=? LIMIT 1", (_dead,)).fetchone()[0]
+    _pids = [r[0] for r in _con.execute(
+        "SELECT id FROM products WHERE org_id=? AND base_name=?", (_demo_org_id, _dead))]
+    _qs = ",".join("?" * len(_pids))
+    # продажи за 120 дней убираем, на полке оставляем ровно 1 шт
+    _con.execute(f"DELETE FROM sales WHERE product_id IN ({_qs}) AND date>=?", _pids + [_cut120])
+    _con.execute(f"UPDATE stock_days SET qty=0 WHERE product_id IN ({_qs}) AND date>=?",
+                 _pids + [_cut120])
+    _con.execute("UPDATE stock_days SET qty=1 WHERE product_id=? AND date>=?", (_pids[0], _cut120))
+    _con.execute(f"UPDATE warehouse_stock SET qty=0 WHERE product_id IN ({_qs})", _pids)
+    _con.execute("UPDATE warehouse_stock SET qty=1 WHERE product_id=?", (_pids[0],))
+    _con.commit()
+    _con.close()
+    for _win in ("year", "d90", "season"):
+        demo.post("/api/settings", json={"rate_window": _win})  # заодно сбрасывает кэш
+        _r = demo.get("/api/replenish").json()
+        _it = next((x for x in _r["items"] if x["base_name"] == _dead), None)
+        _why = {e["base_name"]: e["reason"] for e in _r["excluded"]}.get(_dead)
+        if _win == "d90":
+            check("неликвид (1 шт, нет продаж 90 дн) в заказ по окну «90 дней» не попал",
+                  _it is None and _why == "нет продаж за последние 90 дней",
+                  f"need={_it and _it['need']} reason={_why!r}")
+        else:
+            # В годовом и сезонном окнах продажи были и темп настоящий —
+            # позиция остаётся в заказе, но БЕЗ фолбэка на чужой темп.
+            check(f"{_win}: позиция считается своим темпом, без фолбэка",
+                  _it is None or not _it["rate_fallback"],
+                  f"fallback={_it and _it['rate_fallback']}")
+    # Полный неликвид: лежит 1 шт и не продаётся ВООБЩЕ — ни в одном окне.
+    _con = sqlite3.connect(DB_PATH)
+    _con.execute(f"DELETE FROM sales WHERE product_id IN ({_qs})", _pids)
+    _con.commit()
+    _con.close()
+    for _win in ("year", "d90", "season"):
+        demo.post("/api/settings", json={"rate_window": _win})
+        _r = demo.get("/api/replenish").json()
+        _names = {x["base_name"] for x in _r["items"]}
+        _why = {e["base_name"]: e["reason"] for e in _r["excluded"]}.get(_dead)
+        check(f"{_win}: мало товара + нет продаж → в заказ не попадает",
+              _dead not in _names and _why, f"в заказе={_dead in _names} reason={_why!r}")
+    demo.post("/api/settings", json={"rate_window": "year"})
+
     demo.close()
     client.close()
 
