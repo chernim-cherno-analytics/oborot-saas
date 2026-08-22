@@ -392,8 +392,11 @@ def normalize_brief(raw: dict | None, settings: dict, stages: list[dict], today:
         # молча игнорировал (BUSINESS_LOGIC §9.4). Пользователь его включить не
         # мог, поэтому расхождение никого не задевало; включаем режим и правило
         # одним пакетом, иначе оно задело бы сразу.
-        "cover_mode": (settings.get("cover_mode")
-                       if settings.get("cover_mode") in ("cadence", "fixed") else "cadence"),
+        "cover_mode": (raw.get("cover_mode")
+                       if raw.get("cover_mode") in ("cadence", "fixed")
+                       else (settings.get("cover_mode")
+                             if settings.get("cover_mode") in ("cadence", "fixed")
+                             else "cadence")),
         "horizon_days_fixed": _int(
             "horizon_days_fixed",
             settings.get("horizon_days_setting", settings.get("horizon_days", 90)),
@@ -860,7 +863,14 @@ def _coverage(snap: dict, ctx: dict, stages: list[dict]) -> dict:
     из окна «год назад» недоступна, и часть позиций отсеялась до расчёта.
     """
     cov_days = coverage_days(snap)
-    needed = lead_days(stages) + int(ctx["cover_days"])
+    # Больше, чем система вообще умеет хранить, требовать нельзя. Глубина
+    # истории ограничена HISTORY_DAYS (год), а при фиксированном горизонте
+    # сумма «срок производства + горизонт» легко даёт 410 дней. Тогда план
+    # НАВСЕГДА помечался бы предварительным: блок «упущено» исчезал бы с
+    # экрана, а оформление каждого заказа требовало бы подтверждения с
+    # текстом «история ещё загружается», который никогда не станет правдой.
+    from app.ms_sync import HISTORY_DAYS
+    needed = min(lead_days(stages) + int(ctx["cover_days"]), int(HISTORY_DAYS))
     return {
         "start": snap.get("coverage_start"),
         "days": cov_days,

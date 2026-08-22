@@ -1464,6 +1464,13 @@ class OrderPlanIn(BaseModel):
     budget_scope: str | None = None        # now (первый этап) | full (весь заказ)
     cadence_days: int | None = None        # как часто размещаются заказы
     safety_days: int | None = None
+    # Режим горизонта и фиксированное число дней. Нужны, чтобы «Повторить»
+    # старый план считал его ТЕМ ЖЕ горизонтом, а не сегодняшней настройкой
+    # организации: иначе план, посчитанный на 44 дня, при повторе после
+    # переключения режима вырастает в разы без единой правки в анкете.
+    # None = берём настройку организации (обычное поведение нового плана).
+    cover_mode: str | None = None          # cadence | fixed
+    horizon_days_fixed: int | None = Field(default=None, ge=7, le=365)
     strategy: str | None = None            # protect | balance | grow
     width_days: int | None = None          # сколько дней продаж закрывает строка (0 = всю потребность)
     max_share_pct: int | None = None
@@ -1480,6 +1487,13 @@ class OrderPlanIn(BaseModel):
     # Ручные правки количеств в готовом плане: {base_name: qty}. Применяются
     # ПОСЛЕ расчёта — владелец всегда сильнее алгоритма.
     overrides: dict[str, int] = Field(default_factory=dict)
+
+    @field_validator("cover_mode")
+    @classmethod
+    def _plan_cover_mode_known(cls, v: str | None) -> str | None:
+        if v is not None and v not in ("cadence", "fixed"):
+            raise ValueError("cover_mode должен быть 'cadence' или 'fixed'")
+        return v
 
 
 _EXCLUDED_KEEP = ("base_name", "category", "cls", "turnover", "need",
@@ -1517,11 +1531,20 @@ def _plan(db: Session, ctx: AuthContext, body: OrderPlanIn) -> dict:
     # человек, — то есть у остальных «что советовала система» и «что решил
     # человек» были одним и тем же полем `qty`, и три величины (решение
     # владельца D-25) формально не различались даже там, где всё в порядке.
+    must = set((plan.get("brief") or {}).get("must_have") or [])
     for it in plan.get("items") or []:
         it.setdefault("qty_recommended", it.get("qty"))
+        # Позиция, которую человек втащил галочкой «Взять» из блока «система
+        # считать не берётся», прошла расчёт — но попала в план по решению
+        # ЧЕЛОВЕКА. Без этой пометки она в истории неотличима от честной
+        # рекомендации, и метрика качества рекомендаций (D-25) загрязняется
+        # с первого же дня.
+        if it.get("base_name") in must:
+            it["forced_by_user"] = True
     # Ключ есть всегда, а не только после ручных правок: потребитель не должен
     # гадать, «нет позиций без себестоимости» это или «поле не посчитали».
     plan["budget_incomplete"] = None
+    plan["zeroed"] = []
     if body.overrides:
         _apply_overrides(plan, body.overrides, snap)
     plan["record"] = _decision_record(db, ctx, snap)
@@ -1593,6 +1616,23 @@ def _data_quality(db: Session, ctx: AuthContext, snap: dict) -> dict:
     }
 
 
+MAX_MANUAL_QTY = 1_000_000
+
+
+def _manual_addable(plan: dict) -> set:
+    """Позиции, которые человек вправе вписать в этот план руками.
+
+    Ровно те, по которым система отказалась считать из-за отсутствия
+    себестоимости (`review.no_cost`). Прочие отсеянные — чужой канал
+    производства, исключённая категория, нет продаж — отсеяны бизнес-правилами,
+    а не нехваткой данных, и «последнее слово за пользователем» на них не
+    распространяется: заказ ушёл бы на другое производство с чужими сроками
+    и предоплатой.
+    """
+    rev = (plan.get("review") or {}).get("no_cost") or []
+    return {r.get("base_name") for r in rev if isinstance(r, dict)}
+
+
 def _manual_item(base: str, qty: int, snap: dict, plan: dict) -> dict | None:
     """Строка заказа, добавленная человеком вручную (D-23).
 
@@ -1611,6 +1651,11 @@ def _manual_item(base: str, qty: int, snap: dict, plan: dict) -> dict | None:
     if not src or src.get("archived") or src.get("hidden"):
         return None
     cost = float(src.get("cost_price") or 0)
+    # Накладные (доставка, таможня, брак) плановые строки уже включают
+    # (order_planner). Без этого ручная строка систематически дешевле соседних.
+    overhead = float((plan.get("brief") or {}).get("overhead_pct") or 0)
+    if cost > 0 and overhead:
+        cost = cost * (1 + overhead / 100.0)
     price = float(src.get("avg_price") or src.get("sale_price") or 0)
     margin = max(0.0, price - cost) if cost > 0 else 0.0
     stages = plan.get("stages") or []
@@ -1666,7 +1711,11 @@ def _apply_overrides(plan: dict, overrides: dict, snap: dict) -> None:
     items = {i["base_name"]: i for i in plan["items"]}
     for base, qty in overrides.items():
         try:
-            qty = max(0, int(qty))
+            # Верхняя граница обязательна: без неё целое из JSON произвольной
+            # длины уходит в арифметику с float и роняет запрос OverflowError.
+            # Миллион штук на позицию — заведомо больше любого настоящего
+            # заказа, но не мешает работать.
+            qty = max(0, min(int(qty), MAX_MANUAL_QTY))
         except (TypeError, ValueError):
             continue
         it = items.get(base)
@@ -1682,6 +1731,15 @@ def _apply_overrides(plan: dict, overrides: dict, snap: dict) -> None:
             # через тело запроса можно было бы вписать в заказ что угодно,
             # включая чужое название.
             if qty <= 0:
+                continue
+            if base not in _manual_addable(plan):
+                # Добавить можно ТОЛЬКО то, что система показала в блоке
+                # «нет себестоимости»: по этим позициям она сознательно не даёт
+                # рекомендацию, и решение остаётся за человеком (D-23).
+                # Всё остальное отсеяно по другим правилам — по чужому каналу
+                # производства, по исключённой категории, по отсутствию продаж —
+                # и обходить их через тело запроса нельзя: заказ уехал бы не на
+                # то производство и не с теми сроками и предоплатой.
                 continue
             it = _manual_item(base, qty, snap, plan)
             if it is None:
@@ -1724,8 +1782,7 @@ def _apply_overrides(plan: dict, overrides: dict, snap: dict) -> None:
         for i in plan["items"]
         if i["qty"] <= 0 and (i.get("qty_recommended") or 0) > 0
     ]
-    if zeroed:
-        plan["zeroed"] = zeroed
+    plan["zeroed"] = zeroed
     plan["items"] = [i for i in plan["items"] if i["qty"] > 0]
     plan["cost_total"] = sum(i["cost_total"] for i in plan["items"])
     # Нельзя молча показывать общий бюджет как полный, если в заказе есть

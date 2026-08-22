@@ -1494,23 +1494,30 @@ def _migrate_renames(db, org_id: int, renames: dict[str, set[str]],
         by_new.setdefault(new, []).append(old)
 
     for new, olds in by_new.items():
-        # OrderedQty: слить ВСЕ старые строки в одну новую (qty/ms_qty суммой)
-        add_qty = add_ms = 0.0
+        # OrderedQty: слить ВСЕ старые строки в одну новую (суммой по всем
+        # трём величинам). ms_qty_tracked обязан переезжать вместе с ms_qty:
+        # иначе после переименования позиции её «едет по заказам „Оборота“»
+        # обнуляется, а «едет всего» остаётся — и инвариант tracked ≤ ms_qty
+        # держится только потому, что синк тут же всё пересчитает. Между
+        # этапами (или при обрыве) картина была бы неверной.
+        add_qty = add_ms = add_tracked = 0.0
         for old in olds:
             old_oq = db.get(OrderedQty, (org_id, old))
             if old_oq is not None:
                 add_qty += old_oq.qty
                 add_ms += old_oq.ms_qty
+                add_tracked += (old_oq.ms_qty_tracked or 0.0)
                 db.delete(old_oq)
-        if add_qty or add_ms:
+        if add_qty or add_ms or add_tracked:
             db.flush()  # удаления старых строк — до вставки новой
             new_oq = db.get(OrderedQty, (org_id, new))
             if new_oq is None:
-                db.add(OrderedQty(org_id=org_id, base_name=new,
-                                  qty=add_qty, ms_qty=add_ms))
+                db.add(OrderedQty(org_id=org_id, base_name=new, qty=add_qty,
+                                  ms_qty=add_ms, ms_qty_tracked=add_tracked))
             else:
                 new_oq.qty += add_qty
                 new_oq.ms_qty += add_ms
+                new_oq.ms_qty_tracked = (new_oq.ms_qty_tracked or 0.0) + add_tracked
             db.flush()
         # Простые таблицы: под новым именем остаётся ровно одна запись —
         # существующая, либо первая из переносимых; остальные удаляются.
@@ -1751,7 +1758,13 @@ async def _full_positions(client: MoySkladClient, entity: str, doc: dict,
     return rows
 
 
-_OBOROT_MARKER_RE = re.compile(r"\[oborot#(\d+)\]")
+# Длина числа ограничена намеренно: int() в Python отказывается разбирать
+# строку длиннее 4300 цифр и бросает ValueError, а этот код выполняется в цикле
+# по документам МойСклада, содержимое которых пишет посторонний человек.
+# Строка «[oborot#111…1]» на 4301 цифру в описании любого заказа поставщику
+# роняла бы весь синк организации — ровно тот тихий отказ, из-за которого
+# данные протухают неделями.
+_OBOROT_MARKER_RE = re.compile(r"\[oborot#(\d{1,18})\]")
 
 
 def _is_oborot_doc(doc: dict, our_docs: dict[int, str]) -> bool:
@@ -1927,8 +1940,10 @@ async def _sync_incoming(org_id: int, client: MoySkladClient,
     # Два потока: сколько «едет» по нашим заказам и сколько — по чужим (D-28).
     stats["incoming_open_docs_tracked"] = tracked_docs
     stats["incoming_qty_tracked"] = round(sum(incoming_tracked.values()))
-    stats["incoming_qty_external"] = round(
-        sum(incoming.values()) - sum(incoming_tracked.values()))
+    # Из УЖЕ ОКРУГЛЁННЫХ величин: три независимых округления дают 2 = 0 + 1
+    # на дробных остатках, и тогда две цифры на экране не сходятся с третьей.
+    stats["incoming_qty_external"] = (
+        stats["incoming_qty"] - stats["incoming_qty_tracked"])
     # Шаг 0 модели исполнения: заполняет ли МойСклад поле «отгружено» у этого
     # клиента. Если оно почти везде нулевое при существующих приёмках, значит
     # приёмки заводят отдельными документами — и автоматический учёт исполнения

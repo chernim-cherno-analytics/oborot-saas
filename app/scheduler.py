@@ -122,7 +122,7 @@ def _alert_if_failing(org_id: int, status: dict) -> None:
         log.exception("ошибка отправки алерта о падении синка")
 
 
-def run_daily_job() -> dict:
+def _run_daily_job() -> dict:
     """Тело ежедневного джоба; вызывается и планировщиком, и тестами напрямую.
 
     Возвращает сводку {org_id: 'done'|'error'|'skipped'|...} — удобно в логах
@@ -164,14 +164,13 @@ def run_daily_job() -> dict:
             notify.send_daily_digest(org_id)
         except Exception:  # noqa: BLE001 — дайджест не должен ломать обход
             log.exception("ошибка отправки дайджеста")
-    logging_conf.set_org(None)
     return results
 
 
 CATCHUP_STALE_HOURS = 26  # догонять, если успешного синка не было дольше суток
 
 
-def run_catchup_job() -> dict:
+def _run_catchup_job() -> dict:
     """Почасовой «догоняющий» джоб: чинит молчаливое отставание данных.
 
     Если у организации последний успешный синк старше CATCHUP_STALE_HOURS
@@ -229,8 +228,31 @@ def run_catchup_job() -> dict:
         except Exception:  # noqa: BLE001 — одна org не валит остальных
             results[org_id] = "error"
             log.exception("необработанная ошибка догоняющего синка")
-    logging_conf.set_org(None)
     return results
+
+
+def run_daily_job() -> dict:
+    """Ежедневный джоб. Метка организации в логе снимается в любом случае.
+
+    `finally`, а не строка после цикла: потоки планировщика переиспользуются,
+    и значение contextvar живёт в потоке до его конца. Выход мимо последней
+    строки (BaseException, KeyboardInterrupt при остановке сервиса) оставил бы
+    метку последней организации на всех последующих служебных записях — и
+    разбор инцидента пошёл бы по чужой метке. Это то же свойство, что и
+    изоляция данных, только для логов.
+    """
+    try:
+        return _run_daily_job()
+    finally:
+        logging_conf.set_org(None)
+
+
+def run_catchup_job() -> dict:
+    """Почасовой догоняющий джоб. Метка снимается так же — см. run_daily_job."""
+    try:
+        return _run_catchup_job()
+    finally:
+        logging_conf.set_org(None)
 
 
 # ── Жизненный цикл ───────────────────────────────────────────────────────────

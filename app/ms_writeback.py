@@ -240,15 +240,26 @@ def order_marker(order_id: int) -> str:
 
 
 class AmbiguousExistingOrder(Exception):
-    """Маркер нашёлся больше чем у одного документа — связывать вслепую нельзя."""
+    """Маркер нашёлся больше чем у одного документа — связывать вслепую нельзя.
 
-    def __init__(self, docs: list[dict]):
+    `after_create` различает два очень разных случая:
+      • False — искали ПЕРЕД созданием: нового документа точно нет;
+      • True  — искали ПОСЛЕ неудачной отправки: документ мог быть создан,
+        и обещать «ничего не создано» здесь было бы враньём. Хуже того,
+        совет «уберите метку у лишних» в этом случае опасен: сняв метку с
+        только что созданного (его не отличить), человек получит второй заказ
+        поставщику — ровно тот дубль, ради которого маркер и заведён.
+    """
+
+    def __init__(self, docs: list[dict], after_create: bool = False):
         self.docs = docs
+        self.after_create = after_create
         names = ", ".join(str(d.get("name") or "?") for d in docs[:5])
         super().__init__(names)
 
 
-async def find_existing_order(client, marker: str) -> dict | None:
+async def find_existing_order(client, marker: str, *,
+                              after_create: bool = False) -> dict | None:
     """Ищет в МойСкладе документ, созданный нами по этому заказу.
 
     Смотрим описания «Заказов поставщику» за последние LOOKBACK_DAYS дней.
@@ -269,7 +280,7 @@ async def find_existing_order(client, marker: str) -> dict | None:
     found = [row for row in await client.search_purchase_orders(since)
              if marker in str(row.get("description") or "")]
     if len(found) > 1:
-        raise AmbiguousExistingOrder(found)
+        raise AmbiguousExistingOrder(found, after_create=after_create)
     return found[0] if found else None
 
 
@@ -367,7 +378,7 @@ async def push_order(db: Session, org_id: int, order: ProductionOrder) -> dict:
             except (httpx.HTTPError, httpx.HTTPStatusError):
                 # Ответ не дошёл — «создан или нет» отсюда не видно.
                 # Единственный честный способ узнать: спросить у МойСклада.
-                found = await find_existing_order(client, marker)
+                found = await find_existing_order(client, marker, after_create=True)
                 if found is None:
                     raise
                 # Документ всё-таки создан — потерялся только ответ.
