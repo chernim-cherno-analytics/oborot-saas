@@ -851,6 +851,9 @@ def api_checks() -> None:
         cums = [w["cumulative"] for w in cal["weeks"]]
         check("накопительное сальдо не убывает", cums == sorted(cums), str(cums[:4]))
         check("в календаре есть деньги открытых заказов", cal["total"] > 0, str(cal["total"]))
+        check("накопительное сальдо считает только будущие деньги",
+              cal["weeks"][-1]["cumulative"] == sum(w["amount"] for w in cal["weeks"]),
+              f'{cal["weeks"][-1]["cumulative"]} vs {sum(w["amount"] for w in cal["weeks"])}')
         wk = date.fromisoformat(cal["week_start"])
         check("неделя начинается с понедельника и не позже сегодня",
               wk.weekday() == 0 and wk <= date.today(), cal["week_start"])
