@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>{{ org.name }} · Обучение — Оборот</title>
+<style>
+  /* ── Стиль первой таблицы (legacy CC): страница «Обучение» ── */
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0 }
+  body { font-family: Helvetica, 'Helvetica Neue', Arial, sans-serif; min-height: 100vh; background: #f3e9e0; color: #1f1f1f; }
+  .gradient-bg { position: fixed; inset: 0; z-index: 0; overflow: hidden; background: #f3e9e0; }
+  .gradient-bg::before, .gradient-bg::after { position: absolute; border-radius: 50%; filter: blur(90px); opacity: .9; content: ''; }
+  .gradient-bg::before { width: 70vw; height: 70vw; background: radial-gradient(circle,#efe5db,transparent 70%); top: -20%; left: -10%; }
+  .gradient-bg::after { width: 60vw; height: 60vw; background: radial-gradient(circle,#e2d8cf,transparent 70%); bottom: -15%; right: -10%; }
+  .header { position: sticky; top: 0; z-index: 200; padding: 0 28px; height: 56px; background: rgba(243,233,224,.85); backdrop-filter: blur(10px);
+    display: flex; align-items: center; justify-content: space-between; }
+  .logo { text-decoration: none; font-size: 15px; font-weight: 700; letter-spacing: .12em; color: #1f1f1f; }
+  .nav { display: flex; gap: 18px; flex-wrap: wrap; }
+  .nav a { font-size: 13px; color: rgba(31,31,31,.45); text-decoration: none; }
+  .nav a:hover { color: #434446 }
+  .nav a.active { color: #1f1f1f; font-weight: 700; }
+  .main { padding: 8px 28px 24px; max-width: 1500px; margin: 0 auto; position: relative; z-index: 3; }
+
+  .go-btn { font-size: 12px; font-weight: 600; padding: 9px 18px; border-radius: 10px;
+    border: 1px solid #1f1f1f; background: #1f1f1f; color: #f3e9e0; cursor: pointer; text-decoration: none; white-space: nowrap; display: inline-block; }
+  .go-btn:hover { background: #434446; }
+  .go-btn.ghost { background: rgba(255,255,255,.6); color: #1f1f1f; border-color: rgba(31,31,31,.25); }
+  .go-btn.ghost:hover { background: rgba(255,255,255,.9); }
+  .hint { font-size: 11px; color: rgba(31,31,31,.45); }
+
+  .head-row { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; margin: 14px 0 8px; }
+  .head-row h1 { font-size: 22px; font-weight: 700; letter-spacing: .01em; }
+  .head-row .sub { font-size: 12.5px; color: rgba(31,31,31,.5); }
+  .pbar { height: 6px; border-radius: 6px; background: rgba(31,31,31,.09); overflow: hidden; margin-bottom: 18px; }
+  .pbar i { display: block; height: 100%; width: 0; background: #1f1f1f; border-radius: 6px; transition: width .35s ease; }
+
+  .cols { display: grid; grid-template-columns: minmax(0,1.65fr) minmax(300px,1fr); gap: 16px; align-items: start; }
+  @media (max-width: 1000px) { .cols { grid-template-columns: 1fr } }
+
+  .panel { background: rgba(255,255,255,.6); backdrop-filter: blur(12px);
+    border: 1px solid rgba(31,31,31,.08); border-radius: 14px; padding: 14px 18px; margin-bottom: 14px; }
+  .panel .ptitle { font-size: 11px; font-weight: 700; letter-spacing: .07em; text-transform: uppercase;
+    color: rgba(31,31,31,.5); margin-bottom: 10px; }
+
+  .lesson { display: flex; align-items: center; gap: 14px; padding: 14px 18px; margin-bottom: 10px;
+    background: rgba(255,255,255,.6); backdrop-filter: blur(12px);
+    border: 1px solid rgba(31,31,31,.08); border-radius: 14px; }
+  .lesson .num { flex: 0 0 32px; width: 32px; height: 32px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+    font-size: 13px; font-weight: 700; border: 1px solid rgba(31,31,31,.2); background: rgba(255,255,255,.7); color: rgba(31,31,31,.55); }
+  .lesson.done .num { background: #1f1f1f; border-color: #1f1f1f; color: #f3e9e0; }
+  .lesson .body { flex: 1 1 auto; min-width: 0; }
+  .lesson .t { font-size: 14px; font-weight: 700; }
+  .lesson .t .pg { font-size: 11px; font-weight: 500; color: rgba(31,31,31,.45); margin-left: 8px; white-space: nowrap; }
+  .lesson .d { font-size: 12.5px; color: #434446; line-height: 1.5; margin-top: 3px; }
+  .lesson .st { font-size: 11px; font-weight: 600; letter-spacing: .05em; text-transform: uppercase; color: rgba(31,31,31,.42); margin-top: 6px; }
+  .lesson.done .st { color: #2f7d1f; }
+
+  .allrow { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+  .allrow .t { font-size: 13.5px; font-weight: 700; }
+  .allrow .s { font-size: 12px; color: rgba(31,31,31,.5); }
+
+  .toggle { display: flex; align-items: center; gap: 10px; cursor: pointer; user-select: none; }
+  .toggle input { position: absolute; opacity: 0; width: 0; height: 0; }
+  .toggle .sw { width: 40px; height: 22px; border-radius: 22px; background: rgba(31,31,31,.18);
+    border: 1px solid rgba(31,31,31,.15); position: relative; transition: background .2s ease; flex: 0 0 40px; }
+  .toggle .sw::after { content: ''; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%;
+    background: #fff; transition: transform .2s ease; }
+  .toggle input:checked + .sw { background: #1f1f1f; border-color: #1f1f1f; }
+  .toggle input:checked + .sw::after { transform: translateX(18px); }
+  .toggle .lb { font-size: 13px; font-weight: 600; }
+
+  .faq details { border-top: 1px solid rgba(31,31,31,.08); }
+  .faq details:first-of-type { border-top: none; }
+  .faq summary { cursor: pointer; padding: 10px 0; font-size: 13px; font-weight: 600; color: #1f1f1f; list-style: none; }
+  .faq summary::before { content: '▸ '; color: rgba(31,31,31,.4); }
+  .faq details[open] summary::before { content: '▾ '; }
+  .faq .a { padding: 0 0 12px 14px; font-size: 12.5px; color: #434446; line-height: 1.6; }
+  .faq .a b { color: #1f1f1f; }
+  .faq .a a { color: #1f1f1f; }
+
+  .support .t { font-size: 13.5px; font-weight: 700; margin-bottom: 6px; }
+  .support .s { font-size: 12.5px; color: #434446; line-height: 1.6; margin-bottom: 12px; }
+  .loading { text-align: center; padding: 40px; color: rgba(31,31,31,.45); font-size: 13px; }
+</style>
+</head>
+<body>
+<div class="gradient-bg"></div>
+<div class="header">
+  <a class="logo" href="/turnover">ОБОРОТ</a>
+  <nav class="nav">
+    <a href="/turnover">Оборачиваемость</a>
+    <a href="/stocks">Активный сток</a>
+    <a href="/assistant">Мастер заказа</a>
+    <a href="/replenish">Заказ</a>
+    <a href="/sizes">Заказ позиции</a>
+    <a href="/budget">Бюджет</a>
+    <a href="/forecast">Прогноз</a>
+    <a href="/revenue">Оборот</a>
+    <a href="/lessons" class="active">Обучение</a>
+    <a href="/settings">Настройки</a>
+  </nav>
+</div>
+
+<div class="main">
+  <div class="head-row">
+    <h1>Обучение</h1>
+    <span class="sub" id="progress-txt">Загружаю…</span>
+  </div>
+  <div class="pbar"><i id="progress-bar"></i></div>
+
+  <div class="cols">
+    <div>
+      <div id="list"><div class="loading">Загружаю уроки…</div></div>
+
+      <div class="panel">
+        <div class="allrow">
+          <div style="flex:1 1 auto;min-width:200px">
+            <div class="t">Пройти все уроки подряд</div>
+            <div class="s" id="all-sub">Короткие уроки одной лентой</div>
+          </div>
+          <a class="go-btn" id="btn-all" href="#">Начать</a>
+        </div>
+      </div>
+
+      <div class="panel">
+        <label class="toggle">
+          <input type="checkbox" id="hints-toggle">
+          <span class="sw"></span>
+          <span class="lb">Показывать подсказки на страницах</span>
+        </label>
+        <div class="hint" style="margin-top:8px">Короткие пояснения к таблицам и кнопкам.
+          Выключите, когда всё станет привычным, — уроки останутся здесь и их можно пройти заново в любой момент.</div>
+        <div class="hint" id="hints-status" style="margin-top:6px"></div>
+      </div>
+    </div>
+
+    <div>
+      <div class="panel faq">
+        <div class="ptitle">Частые вопросы</div>
+        <details>
+          <summary>Почему цифры не совпадают с МойСкладом?</summary>
+          <div class="a">«Оборот» считает <b>нетто</b>: продажи минус возвраты. Из аналитики исключены
+            упаковка, сертификаты и расходники, а остаток берётся только по складам, которые вы отметили
+            торговыми в <a href="/settings">Настройках</a>. Поэтому суммы и штуки честно отличаются от
+            «всего, что лежит в базе» — и именно эти цифры отражают продажи, а не склад целиком.</div>
+        </details>
+        <details>
+          <summary>Учитываются ли возвраты и скидки?</summary>
+          <div class="a">Да. И темп продаж, и оборачиваемость считаются по <b>нетто</b>: возврат вычитается
+            из продаж того периода. Выручка берётся по реальной цене чека, то есть уже со скидкой, —
+            поэтому распродажная неделя поднимает темп в штуках, но не поднимает выручку в рублях так же
+            сильно.</div>
+        </details>
+        <details>
+          <summary>Как считается темп и чем отличаются «Год», «90 дней» и «Сезон»?</summary>
+          <div class="a">Темп — это проданные штуки, делённые на дни, когда вещь <b>была в наличии</b>
+            (а не на все дни календаря). Переключатель «Темп:» на странице «Заказ» меняет окно: <b>Год</b>
+            (по умолчанию) сглаживает сезонность, <b>90 дней</b> показывает текущий тренд, <b>Сезон</b> —
+            то же окно годом раньше, то есть период, в который заказ реально приедет.</div>
+        </details>
+        <details>
+          <summary>Почему сезонная вещь просится в заказ не в сезон?</summary>
+          <div class="a">Годовой темп размазывает продажи ровным слоем по всем месяцам, поэтому зимнее
+            пальто выглядит «продающимся» и в августе. Переключите «Темп:» на <b>Сезон</b> — расчёт
+            пойдёт по тому же окну прошлого года. Сам по себе календарь программа не понимает: что
+            сезонное, а что нет, решаете вы.</div>
+        </details>
+        <details>
+          <summary>Что такое «дней в стоке» и почему у новинки их мало?</summary>
+          <div class="a">Это число дней, когда вещь реально была в наличии. Оборачиваемость считается
+            только за эти дни, иначе месяц отсутствия на складе выглядел бы как провал продаж.
+            У новинки таких дней мало по определению: её цифры — <b>справка, а не рейтинг</b>, поэтому
+            позиции с малой статистикой стоят отдельным блоком внизу «Оборачиваемости».</div>
+        </details>
+        <details>
+          <summary>Что делать с новинками, у которых истории ещё нет?</summary>
+          <div class="a">Честный ответ: их считает не программа, а вы. Прогноз строится только на истории
+            продаж, поэтому по вещи с двумя неделями жизни он ничего осмысленного не скажет, и
+            минимальную партию фабрики «Оборот» тоже не знает. Смотрите на первые недели вручную и
+            правьте количество в заказе руками.</div>
+        </details>
+        <details>
+          <summary>Как учитываются несколько складов и то, что «едет к нам»?</summary>
+          <div class="a">Остаток — это сумма по всем складам, которые отмечены торговыми в
+            <a href="/settings">Настройках</a>; транзит, производство, брак и списания в расчёт не идут.
+            Колонка «Едет» — это созданные и ещё не принятые заказы: их количество вычитается из
+            потребности, чтобы вы не заказали одно и то же дважды.</div>
+        </details>
+        <details>
+          <summary>Можно ли удалить или изменить созданный заказ?</summary>
+          <div class="a">Черновик удаляется свободно. Заказ, переведённый «В производство», тоже можно
+            удалить — его количество снимется с «едет к нам». Нельзя удалить только заказ, уже принятый
+            на склад. Количества по размерам правятся в строке под значком ▸ до создания заказа.</div>
+        </details>
+        <details>
+          <summary>Почему «Ожидаемая прибыль» в бюджете больше реальной?</summary>
+          <div class="a">Это цена минус себестоимость в предположении, что <b>всё</b> продастся по вашей
+            средней цене. Скидки, возвраты, комиссии маркетплейсов и непроданный остаток в неё не
+            заложены. Считайте её потолком, а не планом.</div>
+        </details>
+        <details>
+          <summary>Можно ли заказывать, пока история ещё догружается?</summary>
+          <div class="a">Можно, но с оглядкой. Чип свежести внизу слева пишет «история N из M дн.» —
+            пока догрузка идёт, годовые и сезонные цифры посчитаны по неполным данным и будут меняться.
+            Мелкие перезаказы делать нормально, крупные решения лучше отложить до полной истории.</div>
+        </details>
+        <details>
+          <summary>Когда обновляются данные?</summary>
+          <div class="a">Раз в сутки автоматически, плюс вручную — кнопкой «Синхронизировать» в
+            <a href="/settings">Настройках</a>. При первом подключении работать можно почти сразу, а
+            история догружается кусками назад: пока она неполная, годовые и сезонные цифры показаны
+            честно неполными и дополняются сами. Полоса загрузки видна в шапке страниц.</div>
+        </details>
+        <details>
+          <summary>Как убрать упаковку и сертификаты из отчётов?</summary>
+          <div class="a"><a href="/settings">Настройки</a> → блок «Исключено из аналитики». Очевидное —
+            пакеты, коробки, подарочные сертификаты — система убирает сама при первой синхронизации,
+            остальное добавляете вручную поиском. Исключённое перестаёт попадать в остатки, заказы,
+            бюджет и средние цены.</div>
+        </details>
+      </div>
+
+      <div class="panel support">
+        <div class="t">Не нашли ответ?</div>
+        {% if support_url %}
+        <div class="s">Напишите нам — разберёмся вместе и ответим по вашим данным.</div>
+        <a class="go-btn" href="{{ support_url }}" target="_blank" rel="noopener">Написать в поддержку</a>
+        {% elif support_email %}
+        <div class="s">Напишите нам на {{ support_email }} — разберёмся вместе и ответим по вашим данным.</div>
+        <a class="go-btn" href="mailto:{{ support_email }}">Написать в поддержку</a>
+        {% else %}
+        <div class="s">Контакт поддержки появится здесь, как только он будет настроен.
+          Пока задавайте вопросы там, где вы получили доступ к «Обороту».</div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+(function(){
+  "use strict";
+  function esc(s){ return String(s==null?"":s).replace(/[&<>"']/g,function(c){ return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]; }); }
+  function lessonsWord(n){
+    var d=n%10, dd=n%100;
+    if(dd>=11&&dd<=14) return "уроков";
+    if(d===1) return "урок";
+    if(d>=2&&d<=4) return "урока";
+    return "уроков";
+  }
+  function minutesWord(n){
+    var d=n%10, dd=n%100;
+    if(dd>=11&&dd<=14) return "минут";
+    if(d===1) return "минута";
+    if(d>=2&&d<=4) return "минуты";
+    return "минут";
+  }
+  var LESSONS=[], TOTAL=0;
+
+  function render(d){
+    LESSONS=d.lessons||[];
+    TOTAL=d.total||LESSONS.length;
+    var done=d.done_count||0;
+    document.getElementById("progress-txt").textContent="Пройдено "+done+" из "+TOTAL;
+    document.getElementById("progress-bar").style.width=(TOTAL?Math.round(done/TOTAL*100):0)+"%";
+
+    document.getElementById("list").innerHTML=LESSONS.map(function(l,i){
+      var href=l.url+"?lesson="+encodeURIComponent(l.key);
+      return '<div class="lesson'+(l.done?" done":"")+'">'+
+        '<div class="num">'+(l.done?"✓":String(i+1))+'</div>'+
+        '<div class="body">'+
+          '<div class="t">'+esc(l.title)+'<span class="pg">'+esc(l.page)+' · '+esc(l.minutes)+' '+minutesWord(l.minutes)+'</span></div>'+
+          '<div class="d">'+esc(l.desc)+'</div>'+
+          '<div class="st">'+(l.done?"✓ Пройдено":"Не пройдено")+'</div>'+
+        '</div>'+
+        '<a class="go-btn'+(l.done?" ghost":"")+'" href="'+esc(href)+'">'+(l.done?"Пройти заново":"Пройти")+'</a>'+
+        '</div>';
+    }).join("")||'<div class="loading">Уроков пока нет</div>';
+
+    var total=LESSONS.reduce(function(a,l){ return a+(l.minutes||0); },0);
+    document.getElementById("all-sub").textContent=
+      TOTAL+" коротких "+lessonsWord(TOTAL)+" подряд · "+total+" "+minutesWord(total);
+    var first=LESSONS[0];
+    document.getElementById("btn-all").href=first
+      ? first.url+"?lesson="+encodeURIComponent(first.key)+"&all=1" : "#";
+    document.getElementById("btn-all").textContent=done>=TOTAL&&TOTAL?"Пройти заново":"Начать";
+
+    document.getElementById("hints-toggle").checked=!!d.hints_enabled;
+  }
+
+  document.getElementById("hints-toggle").addEventListener("change",function(){
+    var on=this.checked, st=document.getElementById("hints-status");
+    st.textContent="сохраняю…";
+    fetch("/api/prefs/hints",{
+      method:"POST", credentials:"same-origin",
+      headers:{"Content-Type":"application/json","X-Oborot-CSRF":"1"},
+      body:JSON.stringify({enabled:on})
+    }).then(function(r){
+      if(!r.ok) throw new Error("HTTP "+r.status);
+      return r.json();
+    }).then(function(d){
+      st.textContent=d.hints_enabled?"Подсказки включены":"Подсказки выключены";
+    }).catch(function(e){
+      st.textContent="не удалось сохранить: "+e.message;
+    });
+  });
+
+  fetch("/api/lessons",{credentials:"same-origin"}).then(function(r){
+    if(!r.ok) throw new Error("HTTP "+r.status);
+    return r.json();
+  }).then(render).catch(function(e){
+    document.getElementById("list").innerHTML='<div class="loading">Не удалось загрузить уроки: '+esc(e.message)+'</div>';
+    document.getElementById("progress-txt").textContent="";
+  });
+})();
+</script>
+{% include "_hints.html" %}
+</body>
+</html>

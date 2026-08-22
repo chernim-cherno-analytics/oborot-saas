@@ -57,6 +57,48 @@
     return !!(d && d.state === "error" && S.isFirstSync(d));
   };
 
+  // ── Деплой П2: общее для меню «?», уроков и бейджа в навигации ───────────
+  // Параметр строки запроса без URLSearchParams (файл сознательно ES5).
+  S.param = function(name){
+    var m = new RegExp("[?&]" + name + "=([^&#]*)").exec(window.location.search || "");
+    if (!m) return "";
+    try { return decodeURIComponent(m[1].replace(/\+/g, " ")); } catch(e){ return m[1]; }
+  };
+  // Урок запрошен адресом (?lesson=…). Синхронный признак: подсказка первого
+  // визита обязана молчать поверх идущего урока, а решать это надо до того,
+  // как ответит /api/lessons.
+  S.tourWanted = !!S.param("lesson");
+
+  var cachedLessons = null;
+  // /api/lessons — один запрос на страницу на трёх потребителей: бегунок
+  // урока, меню «?» (тумблер подсказок) и счётчик «N/5» в навигации.
+  // Всегда резолвится: {lessons:[], done_count:0, total:5, hints_enabled:true}.
+  S.lessons = function(){
+    if (S.silent) return Promise.resolve(null);
+    if (!cachedLessons) {
+      cachedLessons = fetch("/api/lessons", {credentials: "same-origin"})
+        .then(function(r){ return r.ok ? r.json() : null; })
+        .then(function(d){ return d && d.lessons ? d : null; })
+        .catch(function(){ return null; });
+    }
+    return cachedLessons;
+  };
+  // Тумблер «Показывать подсказки» правит кэш, чтобы соседние потребители
+  // на этой же странице увидели новое значение без перезагрузки.
+  S.setHintsEnabled = function(on){
+    if (!cachedLessons) return;
+    cachedLessons = cachedLessons.then(function(d){
+      if (d) d.hints_enabled = !!on;
+      return d;
+    });
+  };
+  // Русское форматирование чисел — как fmt() на legacy-страницах.
+  S.num = function(n){
+    var v = Number(n);
+    if (!isFinite(v)) return String(n == null ? "" : n);
+    return Math.round(v).toLocaleString("ru-RU");
+  };
+
   var cached = null;
   // Возвращает {auth: bool, data: object|null}. auth:false — сессия истекла
   // (401/403): потребители обязаны замолчать.
@@ -181,14 +223,19 @@
     }
   };
 
+  var S = window.OborotSync || {};
+  // Деплой П2: страница «?» стала меню (см. ниже), поэтому справочник может
+  // отсутствовать (Мастер заказа, Уценка, Обучение) — сама кнопка всё равно
+  // нужна ради пунктов «урок», «тумблер», «все уроки».
   var hint = HINTS[PAGE];
+  window.OborotHelp = window.OborotHelp || {};
+  window.OborotHelp.page = PAGE;
+  window.OborotHelp.hasHint = !!hint;
   if (!hint) return;
 
-  var fab = document.getElementById("hint-fab");
   var overlay = document.getElementById("hint-overlay");
   var body = document.getElementById("hint-body");
   var closeBtn = document.getElementById("hint-close");
-  fab.style.display = "";
   body.innerHTML = "<h2>" + hint.t + "</h2>" + hint.h;
 
   function open(){ overlay.classList.add("open"); }
@@ -202,9 +249,13 @@
       } catch(e){}
     }
   }
-  fab.addEventListener("click", function(){ open(); });
+  // Пункт меню «Что означают колонки» открывает ровно эту же модалку.
+  window.OborotHelp.openModal = open;
   closeBtn.addEventListener("click", function(){ close(true); });
   overlay.addEventListener("click", function(e){ if(e.target===overlay) close(true); });
+  document.addEventListener("keydown", function(e){
+    if (e.key === "Escape" && overlay.classList.contains("open")) close(true);
+  });
 
   // Первый визит: показать инструкцию, если пользователь её ещё не видел.
   // Ревью: сразу после «Начать синхронизацию» пользователь попадает на
@@ -212,18 +263,22 @@
   // бы полосу прогресса. Пока state === "running", автопоказ откладываем:
   // «просмотрено» при этом НЕ отмечаем, поэтому после загрузки подсказка
   // откроется сама при следующем заходе. Кнопка «?» доступна всегда.
+  // Деплой П2: два новых условия молчания — идёт урок (модалка накрыла бы
+  // карточку шага) и пользователь выключил подсказки тумблером в меню «?».
   try {
+    if (S.tourWanted) throw 0;
     var seenP = fetch("/api/hints/seen", {credentials:"same-origin"})
       .then(function(r){ return r.ok ? r.json() : {seen:[]}; })
       .catch(function(){ return {seen:[]}; });
-    var progP = window.OborotSync ? window.OborotSync.progress()
-                                  : Promise.resolve({auth:true, data:null});
-    Promise.all([seenP, progP]).then(function(res){
-      var d = res[0] || {seen:[]}, prog = res[1] && res[1].data;
+    var progP = S.progress ? S.progress() : Promise.resolve({auth:true, data:null});
+    var lessP = S.lessons ? S.lessons() : Promise.resolve(null);
+    Promise.all([seenP, progP, lessP]).then(function(res){
+      var d = res[0] || {seen:[]}, prog = res[1] && res[1].data, less = res[2];
       if ((d.seen||[]).indexOf(PAGE) !== -1) return;
+      if (less && less.hints_enabled === false) return;
       // Не перекрываем полосу первичной загрузки: ни пока она идёт, ни когда
       // она оборвалась (красная полоса с кнопкой важнее рассказа о странице).
-      if (prog && S.isFirstSync(prog)
+      if (prog && S.isFirstSync && S.isFirstSync(prog)
           && (prog.state === "running" || prog.state === "error")) return;
       open();
     }).catch(function(){});
@@ -679,5 +734,638 @@
     if (res.data) { render(res.data); schedule(res.data); }
     else if (!stopped) timer = setTimeout(poll, 30000);
   });
+})();
+</script>
+
+{# ── Деплой П2: меню «?» и бегунок урока ──────────────────────────────────────
+   Кнопка «?» больше не открывает справочник напрямую, а раскрывает компактное
+   меню: урок этой страницы, справочник колонок (та же модалка, что и раньше),
+   тумблер «Показывать подсказки» и ссылка на «Обучение». Ниже — сам ранер
+   уроков: адрес вида /turnover?lesson=turnover[&step=2][&all=1] подсвечивает
+   элементы страницы обводкой и ведёт по шагам. Всё серверное — только через
+   textContent: в названии товара может оказаться разметка. #}
+<style>
+  .help-menu { position: fixed; right: 18px; bottom: 66px; z-index: 901; display: none;
+    width: 268px; max-width: calc(100vw - 36px); padding: 6px;
+    border-radius: 14px; border: 1px solid rgba(31,31,31,.09);
+    background: rgba(255,255,255,.94); backdrop-filter: blur(10px);
+    box-shadow: 0 14px 40px rgba(31,31,31,.22);
+    font: 12.5px/1.45 Helvetica, 'Helvetica Neue', Arial, sans-serif; color: #1f1f1f; }
+  .help-menu.open { display: block }
+  .help-menu .hmi { display: flex; align-items: center; gap: 9px; width: 100%;
+    padding: 9px 10px; border: none; border-radius: 10px; background: none;
+    font: inherit; color: #1f1f1f; text-align: left; text-decoration: none; cursor: pointer; }
+  .help-menu .hmi:hover { background: rgba(31,31,31,.07) }
+  .help-menu .hmi:focus-visible { outline: 2px solid #1f1f1f; outline-offset: -2px }
+  .help-menu .hmi[hidden] { display: none }
+  .help-menu .hmi svg { width: 15px; height: 15px; flex: 0 0 15px; opacity: .55 }
+  .help-menu .hm-sep { height: 1px; margin: 4px 8px; background: rgba(31,31,31,.09) }
+  .help-menu .hm-sw { margin-left: auto; flex: 0 0 30px; width: 30px; height: 17px;
+    border-radius: 999px; background: rgba(31,31,31,.18); position: relative; transition: background .15s; }
+  .help-menu .hm-sw i { position: absolute; top: 2px; left: 2px; width: 13px; height: 13px;
+    border-radius: 50%; background: #fff; box-shadow: 0 1px 3px rgba(31,31,31,.3); transition: left .15s; }
+  .help-menu .hmi.on .hm-sw { background: #1f1f1f }
+  .help-menu .hmi.on .hm-sw i { left: 15px }
+  .help-menu .hm-cnt { margin-left: auto; font-size: 11px; font-weight: 700;
+    color: rgba(31,31,31,.45); font-variant-numeric: tabular-nums; }
+
+  /* Счётчик пройденных уроков внутри ссылки «Обучение» в навигации.
+     Цвет наследуется (currentColor): один и тот же бейдж читается и на светлой
+     legacy-шапке, и на тёмном сайдбаре base.html. */
+  .lesson-badge { display: inline-block; margin-left: 5px; padding: 0 5px;
+    border: 1px solid currentColor; border-radius: 999px; opacity: .6;
+    font-size: 9.5px; line-height: 14px; font-weight: 700;
+    font-variant-numeric: tabular-nums; vertical-align: 1px; }
+
+  .tour-bar { position: sticky; z-index: 188; top: 0;
+    background: rgba(255,255,255,.72); backdrop-filter: blur(10px);
+    border-bottom: 1px solid rgba(31,31,31,.09); color: #1f1f1f;
+    font: 12px/1.4 Helvetica, 'Helvetica Neue', Arial, sans-serif; }
+  .tour-bar[hidden] { display: none }
+  .tour-bar .tb-in { display: flex; align-items: center; gap: 12px;
+    padding: 7px 28px; flex-wrap: wrap; }
+  .tour-bar .tb-kick { font-size: 10px; font-weight: 700; letter-spacing: .09em;
+    text-transform: uppercase; color: rgba(31,31,31,.5); white-space: nowrap; }
+  .tour-bar .tb-chips { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .tour-bar .tb-chip { display: inline-flex; align-items: center; gap: 5px;
+    padding: 3px 10px; border-radius: 999px; text-decoration: none;
+    border: 1px solid rgba(31,31,31,.12); background: rgba(255,255,255,.55);
+    color: rgba(31,31,31,.5); font-size: 11.5px; font-weight: 600; white-space: nowrap; }
+  .tour-bar .tb-chip:hover { border-color: rgba(31,31,31,.35); color: #1f1f1f }
+  .tour-bar .tb-chip .tb-n { font-variant-numeric: tabular-nums; opacity: .75 }
+  .tour-bar .tb-chip.cur { background: #1f1f1f; border-color: #1f1f1f; color: #f3e9e0 }
+  .tour-bar .tb-chip.cur .tb-n { opacity: .7 }
+  .tour-bar .tb-x { margin-left: auto; background: none; border: none; padding: 0;
+    font: inherit; font-size: 11.5px; color: rgba(31,31,31,.6);
+    text-decoration: underline; cursor: pointer; white-space: nowrap; }
+  .tour-bar .tb-x:hover { color: #1f1f1f }
+  @media (max-width: 860px) { .tour-bar .tb-x { margin-left: 0 } }
+
+  /* Обводка цели. Отдельный слой поверх страницы: сам элемент не трогаем
+     (свои стили страницы важнее) и кликам не мешаем — pointer-events:none. */
+  .tour-ring { position: absolute; z-index: 940; pointer-events: none;
+    border: 2px solid #1f1f1f; border-radius: 8px;
+    box-shadow: 0 0 0 3px rgba(243,233,224,.6), 0 6px 22px rgba(31,31,31,.18); }
+  .tour-ring[hidden] { display: none }
+
+  .tour-card { position: absolute; z-index: 950; width: 372px; max-width: calc(100vw - 28px);
+    background: #1f1f1f; color: #f3e9e0; border-radius: 14px; padding: 15px 17px 13px;
+    box-shadow: 0 18px 50px rgba(31,31,31,.4);
+    font: 13px/1.55 Helvetica, 'Helvetica Neue', Arial, sans-serif; }
+  .tour-card:focus { outline: none }
+  .tour-card:focus-visible { outline: 2px solid #f3e9e0; outline-offset: 2px }
+  .tour-card.tc-center { position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%) }
+  .tour-card .tc-arrow { position: absolute; width: 12px; height: 12px; background: #1f1f1f;
+    transform: rotate(45deg); }
+  .tour-card.tc-below .tc-arrow { top: -6px }
+  .tour-card.tc-above .tc-arrow { bottom: -6px }
+  .tour-card.tc-center .tc-arrow { display: none }
+  .tour-card .tc-kick { font-size: 10px; font-weight: 700; letter-spacing: .08em;
+    text-transform: uppercase; color: rgba(243,233,224,.55); margin-bottom: 5px; }
+  .tour-card .tc-title { font-size: 14px; font-weight: 700; margin: 0 0 5px; line-height: 1.35 }
+  .tour-card .tc-text { margin: 0; font-size: 12.5px; line-height: 1.6; color: rgba(243,233,224,.88) }
+  .tour-card .tc-foot { display: flex; align-items: center; gap: 12px; margin-top: 13px }
+  .tour-card .tc-skip { background: none; border: none; padding: 0; font: inherit; font-size: 11.5px;
+    color: rgba(243,233,224,.55); text-decoration: underline; cursor: pointer }
+  .tour-card .tc-skip:hover { color: #f3e9e0 }
+  .tour-card .tc-next { margin-left: auto; padding: 8px 16px; border-radius: 10px; border: none;
+    background: #f3e9e0; color: #1f1f1f; font: inherit; font-size: 12.5px; font-weight: 700;
+    cursor: pointer; white-space: nowrap; }
+  .tour-card .tc-next:hover { background: #fff }
+  .tour-card .tc-link { margin-left: auto; padding: 8px 16px; border-radius: 10px;
+    background: #f3e9e0; color: #1f1f1f; font-size: 12.5px; font-weight: 700;
+    text-decoration: none; white-space: nowrap; }
+  .tour-card .tc-link:hover { background: #fff }
+</style>
+
+<div class="help-menu" id="help-menu" role="menu" aria-label="Помощь">
+  <button class="hmi" type="button" role="menuitem" id="hm-lesson" hidden>
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5.5A1.5 1.5 0 0 1 5.5 4H10a2 2 0 0 1 2 2v14a2 2 0 0 0-2-2H4z"/><path d="M20 5.5A1.5 1.5 0 0 0 18.5 4H14a2 2 0 0 0-2 2v14a2 2 0 0 1 2-2h6z"/></svg>
+    <span>Пройти урок этой страницы</span>
+  </button>
+  <button class="hmi" type="button" role="menuitem" id="hm-cols" hidden>
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16M15 4v16"/></svg>
+    <span>Что означают колонки</span>
+  </button>
+  <div class="hm-sep"></div>
+  <button class="hmi" type="button" role="menuitemcheckbox" id="hm-toggle" aria-checked="true">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 16v-4M12 8h.01"/></svg>
+    <span>Показывать подсказки</span>
+    <span class="hm-sw" aria-hidden="true"><i></i></span>
+  </button>
+  <a class="hmi" role="menuitem" href="/lessons" id="hm-all">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7h18M3 12h18M3 17h11"/></svg>
+    <span>Все уроки</span><span class="hm-cnt" id="hm-cnt"></span>
+  </a>
+</div>
+
+<div class="tour-bar" id="tour-bar" hidden>
+  <div class="tb-in">
+    <span class="tb-kick">Обучение · на ваших данных</span>
+    <span class="tb-chips" id="tour-chips"></span>
+    <button class="tb-x" type="button" id="tour-close">Закрыть — вернуться можно во вкладке «Обучение»</button>
+  </div>
+</div>
+
+<script>
+(function(){
+  "use strict";
+  var S = window.OborotSync || {};
+  var fab = document.getElementById("hint-fab");
+  var menu = document.getElementById("help-menu");
+  if (!fab || !menu) return;
+  // На /login, /register, /onboarding помогать нечем: ни уроков, ни колонок.
+  if (S.silent) { menu.parentNode && menu.parentNode.removeChild(menu); return; }
+
+  var HELP = window.OborotHelp = window.OborotHelp || {};
+  var itLesson = document.getElementById("hm-lesson");
+  var itCols   = document.getElementById("hm-cols");
+  var itToggle = document.getElementById("hm-toggle");
+  var elCnt    = document.getElementById("hm-cnt");
+
+  fab.style.display = "";
+  fab.setAttribute("aria-haspopup", "menu");
+  fab.setAttribute("aria-expanded", "false");
+  fab.setAttribute("title", "Помощь и обучение");
+
+  function openMenu(){
+    menu.classList.add("open");
+    fab.setAttribute("aria-expanded", "true");
+    var first = menu.querySelector(".hmi:not([hidden])");
+    if (first) first.focus();
+  }
+  function closeMenu(back){
+    if (!menu.classList.contains("open")) return;
+    menu.classList.remove("open");
+    fab.setAttribute("aria-expanded", "false");
+    if (back) fab.focus();
+  }
+  fab.addEventListener("click", function(e){
+    e.stopPropagation();
+    if (menu.classList.contains("open")) closeMenu(false); else openMenu();
+  });
+  document.addEventListener("click", function(e){
+    if (!menu.classList.contains("open")) return;
+    if (menu.contains(e.target) || e.target === fab) return;
+    closeMenu(false);
+  });
+  document.addEventListener("keydown", function(e){
+    if (e.key === "Escape" && menu.classList.contains("open")) { closeMenu(true); }
+  });
+
+  // «Что означают колонки» — ровно та же модалка, что открывалась по «?» раньше.
+  if (HELP.hasHint && HELP.openModal) {
+    itCols.hidden = false;
+    itCols.addEventListener("click", function(){ closeMenu(false); HELP.openModal(); });
+  }
+
+  // Тумблер подсказок. Значение приходит из /api/lessons (hints_enabled),
+  // сохраняется в /api/prefs/hints и сразу правит общий кэш — модалка первого
+  // визита на соседних вкладках подчинится при следующем открытии страницы.
+  var hintsOn = true, saving = false;
+  function paintToggle(){
+    itToggle.classList.toggle("on", hintsOn);
+    itToggle.setAttribute("aria-checked", hintsOn ? "true" : "false");
+  }
+  paintToggle();
+  itToggle.addEventListener("click", function(){
+    if (saving) return;
+    saving = true;
+    var next = !hintsOn;
+    hintsOn = next; paintToggle();
+    fetch("/api/prefs/hints", {method: "POST", credentials: "same-origin",
+      headers: {"Content-Type": "application/json", "X-Oborot-CSRF": "1"},
+      body: JSON.stringify({enabled: next})})
+      .then(function(r){
+        if (!r.ok) throw 0;
+        if (S.setHintsEnabled) S.setHintsEnabled(next);
+      })
+      .catch(function(){ hintsOn = !next; paintToggle(); })
+      .then(function(){ saving = false; });
+  });
+
+  function num(n){ return S.num ? S.num(n) : String(n); }
+
+  // Ссылка «Обучение» в навигации получает счётчик «N/5»; когда всё пройдено —
+  // счётчик снимаем, чтобы не мозолил глаза.
+  function paintNav(d){
+    var links = document.querySelectorAll('a[href="/lessons"]');
+    for (var i = 0; i < links.length; i++) {
+      var a = links[i];
+      if (a.closest && a.closest(".help-menu, .tour-card, .tour-bar")) continue;
+      var old = a.querySelector(".lesson-badge");
+      if (old) old.parentNode.removeChild(old);
+      if (Number(d.done_count) >= Number(d.total)) continue;
+      var b = document.createElement("span");
+      b.className = "lesson-badge";
+      b.textContent = num(d.done_count) + "/" + num(d.total);
+      a.appendChild(b);
+    }
+  }
+
+  (S.lessons ? S.lessons() : Promise.resolve(null)).then(function(d){
+    if (!d) return;
+    hintsOn = d.hints_enabled !== false;
+    paintToggle();
+    if (Number(d.done_count) < Number(d.total)) {
+      elCnt.textContent = num(d.done_count) + "/" + num(d.total);
+    }
+    paintNav(d);
+    // Урок этой страницы ищем по адресу, а не по ключу шаблона: у legacy-
+    // страниц переменная active приходит не всегда.
+    var path = window.location.pathname.replace(/\/+$/, "") || "/";
+    var mine = null;
+    (d.lessons || []).forEach(function(l){
+      if (String(l.url).replace(/\/+$/, "") === path) mine = l;
+    });
+    if (!mine) return;
+    itLesson.hidden = false;
+    itLesson.addEventListener("click", function(){
+      closeMenu(false);
+      window.location.href = mine.url + "?lesson=" + encodeURIComponent(mine.key);
+    });
+  }).catch(function(){});
+})();
+</script>
+
+<script>
+(function(){
+  "use strict";
+  var S = window.OborotSync || {};
+  if (S.silent) return;
+  var bar = document.getElementById("tour-bar");
+  if (!bar) return;
+  var KEY = S.param ? S.param("lesson") : "";
+  if (!KEY) { bar.parentNode && bar.parentNode.removeChild(bar); return; }
+
+  var ALL = (S.param("all") === "1");
+  var chips = document.getElementById("tour-chips");
+  var btnClose = document.getElementById("tour-close");
+  var lesson = null, lessons = [], sample = null;
+  var idx = 0, running = false;
+  var ring = null, card = null, target = null, waitToken = 0, rafId = 0;
+
+  function num(n){ return S.num ? S.num(n) : String(n); }
+
+  // ── Место бегунка: под собственной шапкой и под полосой синхронизации ──
+  // Полосу П1 не двигаем и не прячем: во время урока она обязана оставаться
+  // видимой и рабочей, поэтому просто встаём следом и держим её высоту в top.
+  var anchor = document.querySelector(".header")
+            || document.querySelector("header.topbar")
+            || document.querySelector("nav.embed-tabs")
+            || document.querySelector(".embed-tabs");
+  var syncbar = document.getElementById("syncbar");
+  var sticky = false;
+  function mount(){
+    if (syncbar && syncbar.parentNode) syncbar.insertAdjacentElement("afterend", bar);
+    else if (anchor) anchor.insertAdjacentElement("afterend", bar);
+    else { document.body.insertBefore(bar, document.body.firstChild); return; }
+    var pos = "";
+    try { if (anchor) pos = window.getComputedStyle(anchor).position; } catch(e){}
+    sticky = (pos === "sticky" || pos === "fixed");
+    if (!sticky) { bar.style.position = "static"; return; }
+    measureBar();
+    window.addEventListener("resize", measureBar);
+    if (syncbar && window.MutationObserver) {
+      new MutationObserver(measureBar).observe(syncbar, {attributes: true,
+        attributeFilter: ["class", "style"]});
+    }
+  }
+  function measureBar(){
+    if (!sticky) return;
+    var top = 0;
+    if (anchor) top += Math.round(anchor.getBoundingClientRect().height);
+    if (syncbar && syncbar.classList.contains("show")) {
+      top += Math.round(syncbar.getBoundingClientRect().height);
+    }
+    bar.style.top = top + "px";
+  }
+
+  // ── Подстановка живых данных в текст шага ────────────────────────────────
+  // Нет образца или не хватило поля — берём fallback (в нём плейсхолдеров нет).
+  function fill(tpl){
+    if (!sample) return null;
+    var map = {name: sample.name, category: sample.category,
+               rate: num(sample.rate), stock: num(sample.stock),
+               supply: num(sample.supply_days)};
+    var bad = false;
+    var out = String(tpl == null ? "" : tpl)
+      .replace(/\{(name|rate|stock|supply|category)\}/g, function(_, k){
+        var v = map[k];
+        if (v == null || v === "" || v === "NaN") { bad = true; return ""; }
+        return String(v);
+      });
+    return bad ? null : out;
+  }
+
+  // Свёрнутый <details> (например «Как читать эту таблицу» с полем порога)
+  // Chrome раскладывает как content-visibility:hidden: у элемента внутри есть
+  // размеры и координаты, но он не нарисован — обводка встала бы на пустое
+  // место. Поэтому проверяем именно отрисованность, а нужный <details>
+  // раскрываем: урок показывает настройку, до которой пользователю всё равно
+  // пришлось бы дощёлкивать самому. Стили самой цели при этом не трогаем.
+  function shown(el){
+    if (el.checkVisibility) {
+      try {
+        return el.checkVisibility({checkVisibilityCSS: true, contentVisibilityAuto: true,
+                                   opacityProperty: true, visibilityProperty: true});
+      } catch(e){}
+    }
+    return !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+  }
+  function reveal(el){
+    var n = el.parentNode;
+    while (n && n.nodeType === 1) {
+      if (n.tagName === "DETAILS" && !n.open) n.open = true;
+      n = n.parentNode;
+    }
+  }
+  function findEl(sel){
+    if (!sel) return null;
+    var el = null;
+    try { el = document.querySelector(sel); } catch(e){ return null; }
+    if (!el) return null;
+    if (!shown(el)) reveal(el);
+    // Скрытая или пустая цель (display:none, пустой tbody) — это «элемента нет»:
+    // обводка нулевой высоты выглядела бы браком, показываем fallback.
+    if (!shown(el)) return null;
+    var r = el.getBoundingClientRect();
+    if (!(r.width > 0 && r.height > 0)) return null;
+    return el;
+  }
+
+  function clearVisuals(){
+    if (rafId) { cancelAnimationFrame(rafId); rafId = 0; }
+    if (ring && ring.parentNode) ring.parentNode.removeChild(ring);
+    if (card && card.parentNode) card.parentNode.removeChild(card);
+    ring = null; card = null; target = null;
+  }
+
+  function schedulePlace(){
+    if (rafId) return;
+    rafId = requestAnimationFrame(function(){ rafId = 0; place(); });
+  }
+
+  function place(){
+    if (!card) return;
+    if (!target || !shown(target) || !target.getBoundingClientRect().height) {
+      if (ring) ring.hidden = true;
+      card.className = "tour-card tc-center";
+      card.style.left = ""; card.style.top = "";
+      return;
+    }
+    var r = target.getBoundingClientRect();
+    var sx = window.pageXOffset, sy = window.pageYOffset;
+    var vw = document.documentElement.clientWidth;
+    var vh = window.innerHeight;
+    if (ring) {
+      ring.hidden = false;
+      ring.style.left = (r.left + sx - 3) + "px";
+      ring.style.top = (r.top + sy - 3) + "px";
+      ring.style.width = Math.max(0, r.width + 6) + "px";
+      ring.style.height = Math.max(0, r.height + 6) + "px";
+    }
+    card.className = "tour-card";
+    card.style.left = "0px"; card.style.top = "0px";
+    var cw = card.offsetWidth, ch = card.offsetHeight;
+    var below = (r.bottom + 14 + ch <= vh - 8) || (r.top - 14 - ch < 8);
+    var top = below ? (r.bottom + 14) : (r.top - 14 - ch);
+    var left = r.left + r.width / 2 - cw / 2;
+    left = Math.max(12, Math.min(left, vw - cw - 12));
+    card.classList.add(below ? "tc-below" : "tc-above");
+    card.style.left = (left + sx) + "px";
+    card.style.top = (top + sy) + "px";
+    var arrow = card.querySelector(".tc-arrow");
+    if (arrow) {
+      var ax = r.left + r.width / 2 - left;
+      arrow.style.left = Math.max(18, Math.min(ax - 6, cw - 30)) + "px";
+    }
+  }
+
+  // ── Карточка шага ────────────────────────────────────────────────────────
+  function buildCard(o){
+    var c = document.createElement("div");
+    c.className = "tour-card";
+    c.setAttribute("role", "dialog");
+    c.setAttribute("tabindex", "-1");
+    c.setAttribute("aria-label", o.aria);
+    var arrow = document.createElement("div"); arrow.className = "tc-arrow";
+    c.appendChild(arrow);
+    var kick = document.createElement("div"); kick.className = "tc-kick";
+    kick.textContent = o.kick; c.appendChild(kick);
+    var h = document.createElement("div"); h.className = "tc-title";
+    h.textContent = o.title; c.appendChild(h);
+    var p = document.createElement("p"); p.className = "tc-text";
+    p.textContent = o.text; c.appendChild(p);
+    var foot = document.createElement("div"); foot.className = "tc-foot";
+    if (o.skip) {
+      var sk = document.createElement("button");
+      sk.type = "button"; sk.className = "tc-skip"; sk.textContent = o.skip;
+      sk.addEventListener("click", o.onSkip);
+      foot.appendChild(sk);
+    }
+    if (o.href) {
+      var a = document.createElement("a");
+      a.className = "tc-link"; a.href = o.href; a.textContent = o.next;
+      foot.appendChild(a);
+    } else if (o.next) {
+      var b = document.createElement("button");
+      b.type = "button"; b.className = "tc-next"; b.textContent = o.next;
+      b.addEventListener("click", o.onNext);
+      foot.appendChild(b);
+    }
+    c.appendChild(foot);
+    return c;
+  }
+
+  function renderStep(i, el){
+    clearVisuals();
+    var steps = lesson.steps || [];
+    var st = steps[i] || {};
+    target = el || null;
+    var text = target ? fill(st.text) : null;
+    if (text == null) text = st.fallback || st.text || "";
+    if (target) {
+      ring = document.createElement("div");
+      ring.className = "tour-ring";
+      document.body.appendChild(ring);
+    }
+    var last = (i >= steps.length - 1);
+    card = buildCard({
+      kick: "Шаг " + (i + 1) + " из " + steps.length + " · " + (lesson.title || ""),
+      title: st.title || "",
+      text: text,
+      aria: "Обучение: " + (lesson.title || "") + ", шаг " + (i + 1) + " из " + steps.length,
+      next: last ? "Готово" : "Дальше →",
+      onNext: advance,
+      skip: "Пропустить",
+      onSkip: function(){ finishTour(false); }
+    });
+    document.body.appendChild(card);
+    place();
+    try { card.focus({preventScroll: true}); } catch(e){ card.focus(); }
+  }
+
+  function showStep(i){
+    var steps = (lesson && lesson.steps) || [];
+    if (!steps.length) { closingCard(); return; }
+    idx = Math.max(0, Math.min(i, steps.length - 1));
+    var st = steps[idx];
+    var token = ++waitToken;
+    var el = findEl(st.sel);
+    if (el) {
+      try { el.scrollIntoView({block: "center", inline: "nearest"}); } catch(e){ el.scrollIntoView(); }
+      renderStep(idx, el);
+      schedulePlace();
+      return;
+    }
+    // Данные ещё грузятся: карточку показываем сразу (с текстом-заглушкой),
+    // а элемент ждём — появится, подсветим и подставим живые числа.
+    renderStep(idx, null);
+    var t0 = Date.now();
+    (function tick(){
+      if (!running || token !== waitToken) return;
+      var e2 = findEl(st.sel);
+      if (e2) {
+        try { e2.scrollIntoView({block: "center", inline: "nearest"}); } catch(e){ e2.scrollIntoView(); }
+        renderStep(idx, e2);
+        schedulePlace();
+        return;
+      }
+      if (Date.now() - t0 > 4000) return;   // пусто — так и остаёмся на fallback
+      setTimeout(tick, 150);
+    })();
+  }
+
+  function advance(){
+    var steps = (lesson && lesson.steps) || [];
+    if (idx < steps.length - 1) { showStep(idx + 1); return; }
+    markDone().then(function(){
+      if (ALL) {
+        var nxt = nextLesson();
+        if (nxt) {
+          window.location.href = nxt.url + "?lesson=" + encodeURIComponent(nxt.key) + "&all=1";
+          return;
+        }
+      }
+      closingCard();
+    });
+  }
+
+  function markDone(){
+    return fetch("/api/lessons/" + encodeURIComponent(lesson.key) + "/done",
+      {method: "POST", credentials: "same-origin",
+       headers: {"Content-Type": "application/json", "X-Oborot-CSRF": "1"}, body: "{}"})
+      .catch(function(){});
+  }
+
+  function nextLesson(){
+    for (var i = 0; i < lessons.length; i++) {
+      if (lessons[i].key === lesson.key) return lessons[i + 1] || null;
+    }
+    return null;
+  }
+
+  function closingCard(){
+    clearVisuals();
+    waitToken++;
+    card = buildCard({
+      kick: "Обучение",
+      title: "Урок пройден",
+      text: "Остальные уроки — во вкладке «Обучение».",
+      aria: "Урок пройден",
+      next: "Открыть обучение",
+      href: "/lessons",
+      skip: "Закрыть",
+      onSkip: function(){ finishTour(false); }
+    });
+    card.classList.add("tc-center");
+    document.body.appendChild(card);
+    try { card.focus({preventScroll: true}); } catch(e){ card.focus(); }
+  }
+
+  // Убираем ?lesson=… из адреса: перезагрузка страницы не должна снова
+  // запускать урок, который пользователь уже закрыл.
+  function stripQuery(){
+    try {
+      var s = (window.location.search || "")
+        .replace(/([?&])(lesson|step|all)=[^&]*/g, "$1")
+        .replace(/&&+/g, "&").replace(/\?&/, "?").replace(/[?&]$/, "");
+      window.history.replaceState(null, "", window.location.pathname + s + window.location.hash);
+    } catch(e){}
+  }
+
+  function finishTour(){
+    running = false;
+    waitToken++;
+    clearVisuals();
+    bar.hidden = true;
+    window.removeEventListener("scroll", schedulePlace, true);
+    window.removeEventListener("resize", schedulePlace);
+    document.removeEventListener("keydown", onKey, true);
+    stripQuery();
+  }
+
+  function onKey(e){
+    if (!running) return;
+    if (e.key === "Escape") { e.preventDefault(); finishTour(); return; }
+    if (e.key !== "Enter") return;
+    var t = e.target || {};
+    var tag = (t.tagName || "").toUpperCase();
+    // Enter в поле ввода страницы — это ввод пользователя, не «Дальше».
+    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || t.isContentEditable) return;
+    if (tag === "A" || (tag === "BUTTON" && card && card.contains(t))) return;
+    e.preventDefault();
+    advance();
+  }
+
+  function renderChips(){
+    chips.textContent = "";
+    lessons.forEach(function(l, i){
+      var a = document.createElement("a");
+      a.className = "tb-chip" + (l.key === lesson.key ? " cur" : "");
+      a.href = l.url + "?lesson=" + encodeURIComponent(l.key) + (ALL ? "&all=1" : "");
+      if (l.key === lesson.key) a.setAttribute("aria-current", "step");
+      var n = document.createElement("span"); n.className = "tb-n";
+      n.textContent = String(i + 1); a.appendChild(n);
+      var t = document.createElement("span"); t.textContent = l.title || l.page || l.key;
+      a.appendChild(t);
+      chips.appendChild(a);
+    });
+  }
+
+  function start(data, smp){
+    lessons = (data && data.lessons) || [];
+    sample = smp || null;
+    var path = window.location.pathname.replace(/\/+$/, "") || "/";
+    lessons.forEach(function(l){ if (l.key === KEY) lesson = l; });
+    // Урок есть, но адрес чужой (ссылку открыли не на той странице) — молчим.
+    if (!lesson || String(lesson.url).replace(/\/+$/, "") !== path) {
+      bar.parentNode && bar.parentNode.removeChild(bar);
+      return;
+    }
+    running = true;
+    mount();
+    renderChips();
+    bar.hidden = false;
+    measureBar();
+    btnClose.addEventListener("click", function(){ finishTour(); });
+    window.addEventListener("scroll", schedulePlace, true);
+    window.addEventListener("resize", schedulePlace);
+    document.addEventListener("keydown", onKey, true);
+    var st = parseInt(S.param("step"), 10);
+    showStep(isFinite(st) && st > 0 ? st - 1 : 0);
+  }
+
+  Promise.all([
+    S.lessons ? S.lessons() : Promise.resolve(null),
+    fetch("/api/lessons/sample", {credentials: "same-origin"})
+      .then(function(r){ return r.ok ? r.json() : null; })
+      .then(function(d){ return (d && d.sample) || null; })
+      .catch(function(){ return null; })
+  ]).then(function(res){
+    if (!res[0]) { bar.parentNode && bar.parentNode.removeChild(bar); return; }
+    start(res[0], res[1]);
+  }).catch(function(){});
 })();
 </script>
