@@ -9,3 +9,13 @@ nohup.out
 .env.local
 _qa_shots/
 test_*.db
+
+# Сопутствующие файлы WAL: с 22.08 SQLite открывается в режиме WAL, и рядом с
+# базой появляются <база>.db-wal и <база>.db-shm (см. app/db.py).
+oborot.db-wal
+oborot.db-shm
+test_*.db-wal
+test_*.db-shm
+ci_*.db
+ci_*.db-wal
+ci_*.db-shm
