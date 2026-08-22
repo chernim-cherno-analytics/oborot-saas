@@ -255,8 +255,19 @@ def _resolve_embedded(request: Request) -> bool | None:
 
 
 def _page(request: Request, ctx: auth.AuthContext, template: str, active: str, page_title: str,
-          db: Session | None = None):
-    """Рендер страницы с обязательным контекстом {user, org, active, page_title}."""
+          db: Session | None = None, extra: dict | None = None):
+    """Рендер страницы с обязательным контекстом {user, org, active, page_title}.
+
+    extra — дополнительные переменные шаблона (нужны «Обучению»: контакт
+    поддержки берётся из env и в общий контекст страниц не входит).
+
+    Единственная точка рендера страниц под сессией. До 22.08 таких точек было
+    ДВЕ: в routes_extra лежала независимая копия, которая не клала в контекст
+    ни `embedded`, ни признак демо-данных. Следствие: шесть страниц (Мастер
+    заказа, Заказ позиции, Бюджет, Прогноз, Оборот, Обучение) не умели
+    встроенный режим МойСклада вообще — сколько бы его ни поддерживали шаблоны.
+    Копию убрали, routes_extra зовёт эту функцию.
+    """
     org = ctx.org
     embedded, override = _resolve_embedded(request)
     # Флаг «данные демо»: слова про синтетические данные показываем только когда
@@ -290,6 +301,7 @@ def _page(request: Request, ctx: auth.AuthContext, template: str, active: str, p
             "active": active,
             "page_title": page_title,
             "embedded": embedded,
+            **(extra or {}),
         },
     )
     # dev-only: ?embed=1/0 залипает кукой, чтобы навигация сохраняла режим.

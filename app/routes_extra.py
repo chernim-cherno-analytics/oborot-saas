@@ -44,30 +44,23 @@ _templates = Jinja2Templates(
 
 def _authed_page(request: Request, db: Session, template: str, active: str, page_title: str,
                  extra: dict | None = None):
-    """Страница под сессией: без авторизации — redirect /login (как в main.py).
+    """Страница под сессией: без авторизации — redirect /login.
 
-    extra — дополнительные переменные шаблона (нужны «Обучению»: контакт
-    поддержки берётся из env и в общий контекст страниц не входит).
+    Раньше здесь лежала ВТОРАЯ, независимая копия рендера страниц. Она не
+    клала в контекст ни `embedded`, ни признак демо-данных — и шесть страниц
+    (Мастер заказа, Заказ позиции, Бюджет, Прогноз, Оборот, Обучение) не могли
+    работать во встроенном режиме МойСклада в принципе, а демо-полоску не
+    показывали никогда. Копия удалена: рендер один, в main._page.
+
+    Импорт локальный — main импортирует этот модуль, и импорт на уровне файла
+    был бы циклическим.
     """
+    from app.main import _page
+
     ctx = auth.resolve_auth(request, db)
     if ctx is None:
         return RedirectResponse("/login", status_code=302)
-    org = ctx.org
-    return _templates.TemplateResponse(
-        request,
-        template,
-        {
-            "user": {"name": ctx.user.name, "email": ctx.user.email},
-            "org": {
-                "name": org.name,
-                "plan": org.plan,
-                "trial_ends_at": org.trial_ends_at.date().isoformat() if org.trial_ends_at else None,
-            },
-            "active": active,
-            "page_title": page_title,
-            **(extra or {}),
-        },
-    )
+    return _page(request, ctx, template, active, page_title, db=db, extra=extra)
 
 
 # ── Страницы ─────────────────────────────────────────────────────────────────
