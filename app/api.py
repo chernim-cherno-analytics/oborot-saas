@@ -17,6 +17,7 @@ from app.models import (
     Connection,
     Membership,
     OrderedQty,
+    OrderReceipt,
     Org,
     Product,
     Production,
@@ -158,7 +159,21 @@ def _order_out(order: ProductionOrder) -> dict:
         "total_cost": round(sum(float(i.get("cost") or 0) * int(i.get("qty") or 0) for i in items)),
         "production_id": order.production_id,
         "created_by": order.created_by,
+        # D-25: даты переходов и обратная ссылка на расчёт, из которого вырос
+        # заказ. Раньше был только статус — «обещали 45 дней, вышло 62»
+        # система сказать не могла.
+        "sent_at": order.sent_at.isoformat() if order.sent_at else None,
+        "received_at": order.received_at.isoformat() if order.received_at else None,
+        "order_plan_id": order.order_plan_id,
+        "lead_time_fact_days": _lead_time_fact(order),
     }
+
+
+def _lead_time_fact(order: ProductionOrder) -> int | None:
+    """Сколько дней заказ шёл на самом деле. None — ещё не приехал."""
+    if not order.sent_at or not order.received_at:
+        return None
+    return max(0, (order.received_at.date() - order.sent_at.date()).days)
 
 
 # ── Открытые заказы и календарь денег ────────────────────────────────────────
@@ -443,8 +458,124 @@ def _apply_order_to_incoming(db: Session, org_id: int, order: ProductionOrder, s
             row.qty = max(0, row.qty + sign * qty)
 
 
+# ── Исполнение заказа (D-25) ─────────────────────────────────────────────────
+#
+# «Рекомендация → решение человека → исполнение» — три разные величины, и
+# третьей до сих пор не существовало вовсе: у заказа были статусы, но ни дат
+# переходов, ни принятого количества. Диагностика ночного синка 23.08 на
+# боевых данных Chernim Cherno дала неприятный, но решающий факт: из 69 позиций
+# в трёх открытых «Заказах поставщику» поле «отгружено» заполнено у НУЛЯ.
+# Значит, приёмки заводят отдельными документами, а не «на основании» заказа,
+# и автоматический источник исполнения покрывает у этого клиента 0%.
+# Поэтому первым сделан ручной путь, а машинный источник заведён рядом с ним
+# как равноправный — он заработает у клиентов, чьи данные его содержат.
+
+MAX_RECEIPT_QTY = 1_000_000
+
+
+def _receipt_rows(db: Session, org_id: int, order_id: int) -> list[OrderReceipt]:
+    return list(db.execute(
+        select(OrderReceipt)
+        .where(OrderReceipt.org_id == org_id, OrderReceipt.order_id == order_id)
+        .order_by(OrderReceipt.id)
+    ).scalars())
+
+
+def _received_by_base(rows: list[OrderReceipt]) -> dict[str, float]:
+    """Принято по каждой позиции. Складывается, а не берётся последнее:
+    приёмок по одному заказу бывает несколько, и исправление ошибки —
+    компенсирующая строка с минусом, а не правка старой."""
+    out: dict[str, float] = {}
+    for r in rows:
+        out[r.base_name] = out.get(r.base_name, 0.0) + float(r.qty or 0)
+    return out
+
+
+def _receipts_out(db: Session, order: ProductionOrder) -> dict:
+    rows = _receipt_rows(db, order.org_id, order.id)
+    by_base = _received_by_base(rows)
+    ordered = {str(i.get("base_name") or ""): float(i.get("qty") or 0) for i in order.items}
+    lines = []
+    for base, qty in ordered.items():
+        got = by_base.get(base, 0.0)
+        lines.append({
+            "base_name": base,
+            "ordered_qty": round(qty, 3),
+            "received_qty": round(got, 3),
+            "diff": round(got - qty, 3),
+        })
+    # Позиции, которых в заказе не было, а в приёмке есть (подрядчик прислал
+    # не то). Прятать их нельзя: это ровно тот случай, ради которого факт
+    # приёмки хранится отдельно от заказа.
+    for base, got in by_base.items():
+        if base not in ordered:
+            lines.append({"base_name": base, "ordered_qty": 0.0,
+                          "received_qty": round(got, 3), "diff": round(got, 3)})
+    return {
+        "order_id": order.id,
+        "status": order.status,
+        "ordered_total": round(sum(ordered.values()), 3),
+        "received_total": round(sum(by_base.values()), 3),
+        "confirmed": bool(rows),
+        "sources": sorted({r.source for r in rows}),
+        "precisions": sorted({r.precision for r in rows}),
+        "lines": sorted(lines, key=lambda x: x["base_name"]),
+        "receipts": [{
+            "id": r.id,
+            "base_name": r.base_name,
+            "qty": round(float(r.qty or 0), 3),
+            "at": r.at.isoformat() if r.at else None,
+            "source": r.source,
+            "precision": r.precision,
+            "created_by": r.created_by,
+        } for r in rows],
+    }
+
+
+def _add_receipts(
+    db: Session, order: ProductionOrder, items: dict[str, float], *,
+    source: str, precision: str, user_id: int | None = None, source_ref: str = "",
+) -> int:
+    """Дописывает строки приёмки. Только пополнение — ничего не перезаписывает."""
+    now = datetime.utcnow()
+    added = 0
+    for base, qty in items.items():
+        value = float(qty or 0)
+        if value == 0:
+            continue
+        db.add(OrderReceipt(
+            org_id=order.org_id, order_id=order.id, base_name=base,
+            qty=value, at=now, source=source, precision=precision,
+            source_ref=source_ref[:512], created_by=user_id, created_at=now,
+        ))
+        added += 1
+    return added
+
+
+class ReceiptLineIn(BaseModel):
+    base_name: str = Field(min_length=1, max_length=255)
+    qty: float = Field(ge=-MAX_RECEIPT_QTY, le=MAX_RECEIPT_QTY)
+
+
+class ReceiptsIn(BaseModel):
+    """Ручное подтверждение принятого количества.
+
+    Отрицательные значения разрешены намеренно: строку приёмки нельзя
+    исправить правкой (таблица только пополняется), поэтому ошибку гасят
+    компенсирующей строкой — и обе остаются видны в истории.
+    """
+    lines: list[ReceiptLineIn] = Field(default_factory=list, max_length=2000)
+
+
 class OrderStatusIn(BaseModel):
     status: str
+    # Фактически принятое по строкам при переводе в «на складе».
+    # НЕОБЯЗАТЕЛЬНО (решение владельца: ручное подтверждение не должно быть
+    # обязательным шагом). Не передали — считаем, что приехало заказанное,
+    # и помечаем это как допущение (precision = whole_order), а не как
+    # подтверждение. Разница важна: в статистике качества рекомендаций
+    # «пришло 80» и «никто не проверял, считаем что 80» весят по-разному.
+    received: list[ReceiptLineIn] | None = None
 
 
 @router.post("/orders/{order_id}/status")
@@ -482,10 +613,79 @@ def api_order_status(
             _apply_order_to_incoming(db, ctx.org.id, order, +1)
         else:  # received
             _apply_order_to_incoming(db, ctx.org.id, order, -1)
+    now = datetime.utcnow()
+    if body.status == "sent":
+        order.sent_at = now
+    else:  # received
+        order.received_at = now
+        # Факт исполнения. Если человек назвал количества — это подтверждение
+        # (by_position); если просто отметил заказ принятым — допущение
+        # (whole_order, количества из заказа). Обязательным ручное
+        # подтверждение не делаем: решение владельца.
+        if body.received is not None:
+            lines = {}
+            for line in body.received:
+                name = line.base_name.strip()
+                if name:
+                    lines[name] = lines.get(name, 0.0) + float(line.qty)
+            _add_receipts(db, order, lines, source="manual",
+                          precision="by_position", user_id=ctx.user.id)
+        elif not _receipt_rows(db, ctx.org.id, order.id):
+            lines = {str(i.get("base_name") or ""): float(i.get("qty") or 0)
+                     for i in order.items}
+            lines.pop("", None)
+            _add_receipts(db, order, lines, source="manual",
+                          precision="whole_order", user_id=ctx.user.id)
     order.status = body.status
     db.commit()
     analytics.invalidate(ctx.org.id)
-    return {"ok": True, "status": order.status}
+    return {"ok": True, "status": order.status,
+            "received_at": order.received_at.isoformat() if order.received_at else None}
+
+
+@router.get("/orders/{order_id}/receipts")
+def api_order_receipts(
+    order_id: int = _id_path(),
+    ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db),
+):
+    """Что фактически принято по заказу: строки, источники, расхождение с заказом."""
+    order = db.get(ProductionOrder, order_id)
+    if order is None or order.org_id != ctx.org.id:
+        raise HTTPException(status_code=404, detail="Заказ не найден")
+    return _receipts_out(db, order)
+
+
+@router.post("/orders/{order_id}/receipts")
+def api_order_receipts_add(
+    body: ReceiptsIn,
+    order_id: int = _id_path(),
+    ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db),
+):
+    """Дописать факт приёмки (частичный приход, довоз, исправление минусом).
+
+    Гейтом подписки НЕ закрывается сознательно: запись факта о том, что уже
+    произошло, — это бухгалтерия, а не создание новой ценности. Закрывать её
+    значило бы наказывать неплательщика искажением его собственной истории.
+    """
+    order = db.get(ProductionOrder, order_id)
+    if order is None or order.org_id != ctx.org.id:
+        raise HTTPException(status_code=404, detail="Заказ не найден")
+    if order.status == "draft":
+        raise HTTPException(
+            status_code=422,
+            detail="Заказ ещё не отправлен в производство — принимать нечего.",
+        )
+    lines: dict[str, float] = {}
+    for line in body.lines:
+        name = line.base_name.strip()
+        if name:
+            lines[name] = lines.get(name, 0.0) + float(line.qty)
+    if not lines:
+        raise HTTPException(status_code=422, detail="Не переданы позиции приёмки.")
+    added = _add_receipts(db, order, lines, source="manual",
+                          precision="by_position", user_id=ctx.user.id)
+    db.commit()
+    return {"ok": True, "added": added, **_receipts_out(db, order)}
 
 
 @router.delete("/orders/{order_id}")
@@ -2056,6 +2256,90 @@ def api_order_plan_history(
     return {"plans": [_plan_row_out(r, names, prods) for r in rows]}
 
 
+@router.get("/order-plan/{plan_id}/outcome")
+def api_order_plan_outcome(
+    plan_id: int, ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)
+):
+    """Три различимые величины по каждой позиции плана (D-25).
+
+    Что советовала система (`recommended`) · что решил человек (`decided`) ·
+    что фактически принято (`executed`). До сих пор третьей величины не
+    существовало вовсе, а первая хранилась только у строк, которые человек
+    правил, — то есть «три величины» были формальностью.
+
+    Позиции, обнулённые человеком (`zeroed`), включены намеренно: «система
+    советовала 48, человек сказал ноль» — самый ценный сигнал для оценки
+    качества рекомендаций, и без него выборка смещена по построению.
+
+    `executed` равен `null`, пока заказ не принят: ноль означал бы «приехало
+    нисколько», а это разные утверждения.
+    """
+    from app.models import OrderPlan
+    row = db.get(OrderPlan, plan_id)
+    if row is None or row.org_id != ctx.org.id:
+        raise HTTPException(404, "План не найден")
+    try:
+        result = json.loads(row.result_json or "{}")
+    except ValueError:
+        result = {}
+
+    order = None
+    if row.production_order_id:
+        candidate = db.get(ProductionOrder, row.production_order_id)
+        if candidate is not None and candidate.org_id == ctx.org.id:
+            order = candidate
+    received: dict[str, float] = {}
+    confirmed = False
+    if order is not None:
+        rows = _receipt_rows(db, ctx.org.id, order.id)
+        received = _received_by_base(rows)
+        confirmed = bool(rows)
+
+    def _line(base: str, recommended, decided: float) -> dict:
+        return {
+            "base_name": base,
+            "recommended": recommended,      # None = система не рекомендовала
+            "decided": round(float(decided), 3),
+            "executed": round(received.get(base, 0.0), 3) if confirmed else None,
+        }
+
+    lines = []
+    for item in (result.get("items") or []):
+        base = str(item.get("base_name") or "")
+        if not base:
+            continue
+        rec = item.get("qty_recommended")
+        lines.append(_line(base, None if rec is None else int(rec),
+                           float(item.get("qty") or 0)))
+    for item in (result.get("zeroed") or []):
+        base = str(item.get("base_name") or "")
+        if base:
+            rec = item.get("qty_recommended")
+            lines.append(_line(base, None if rec is None else int(rec), 0.0))
+
+    edited = sum(1 for x in lines
+                 if x["recommended"] is not None and x["recommended"] != x["decided"])
+    return {
+        "plan_id": row.id,
+        "order_id": order.id if order is not None else None,
+        "order_status": order.status if order is not None else None,
+        "sent_at": order.sent_at.isoformat() if order is not None and order.sent_at else None,
+        "received_at": (order.received_at.isoformat()
+                        if order is not None and order.received_at else None),
+        "lead_time_fact_days": _lead_time_fact(order) if order is not None else None,
+        "execution_confirmed": confirmed,
+        "positions": len(lines),
+        "edited_by_human": edited,
+        "totals": {
+            "recommended": sum(x["recommended"] or 0 for x in lines),
+            "decided": round(sum(x["decided"] for x in lines), 3),
+            "executed": (round(sum(x["executed"] or 0 for x in lines), 3)
+                         if confirmed else None),
+        },
+        "lines": sorted(lines, key=lambda x: x["base_name"]),
+    }
+
+
 @router.get("/order-plan/{plan_id}/brief")
 def api_order_plan_brief(
     plan_id: int = _id_path(),
@@ -2178,6 +2462,7 @@ def api_order_plan_apply(
     db.commit()
     db.refresh(order)
     row.production_order_id = order.id
+    order.order_plan_id = row.id      # обратная ссылка (D-25)
     row.status = "applied"
     db.commit()
     # Снапшот НЕ инвалидируем: черновик заказа не меняет ни остатков, ни продаж,

@@ -689,6 +689,7 @@ def _purge_org(db: Session, org_id: int) -> None:
         NotifySettings,
         OrderedQty,
         OrderPlan,
+        OrderReceipt,
         Production,
         ProductionAssign,
         ReplenishDraft,
@@ -706,9 +707,11 @@ def _purge_org(db: Session, org_id: int) -> None:
     # обратный порядок упал бы в Postgres. Раньше планов в списке не было
     # вовсе — при удалении организации они оставались осиротевшими строками
     # с чужим org_id, то есть ровно тем, от чего этот список и защищает.
+    # OrderReceipt идёт ПЕРЕД ProductionOrder по той же причине, что и план:
+    # у приёмки внешний ключ на заказ.
     for model in (
         Sale, StockDay, WarehouseStock, OrderedQty, ReplenishDraft,
-        ProductionAssign, OrderPlan, Production, ProductionOrder,
+        ProductionAssign, OrderPlan, OrderReceipt, Production, ProductionOrder,
         SkuHidden, SkuCategoryOverride, CategoryMerge, SkuDiscount,
         NotifySettings, SyncState, BillingRequest,
         Product, Warehouse, Connection, Membership,

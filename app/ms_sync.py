@@ -178,6 +178,18 @@ def ensure_schema(bind=None) -> None:
                 "ALTER TABLE production_orders ADD COLUMN created_by INTEGER",
                 bind=eng,
             )
+        # D-25 (23.08): даты переходов статуса и обратная ссылка на план.
+        # Без дат реальный срок производства не измерить: у заказа был только
+        # статус, а когда он его сменил — не хранилось нигде.
+        for col, ddl in (
+            ("sent_at", "DATETIME"),
+            ("received_at", "DATETIME"),
+            ("order_plan_id", "INTEGER"),
+        ):
+            if col not in cols:
+                run_migration_step(
+                    f"ALTER TABLE production_orders ADD COLUMN {col} {ddl}", bind=eng,
+                )
     if insp.has_table("order_plans"):
         cols = {c["name"] for c in insp.get_columns("order_plans")}
         if "created_by" not in cols:
@@ -1787,14 +1799,27 @@ def _is_oborot_doc(doc: dict, our_docs: dict[int, str]) -> bool:
     «наш» — нет (припишем себе чужое решение и испортим статистику качества
     рекомендаций именно там, где она должна быть честной).
     """
+    return _oborot_order_id(doc, our_docs) is not None
+
+
+def _oborot_order_id(doc: dict, our_docs: dict[int, str]) -> int | None:
+    """id нашего заказа, породившего документ, или None. Условия — см. выше.
+
+    Отдельная функция понадобилась, когда появился учёт исполнения: знать
+    «документ наш» стало мало, нужен конкретный заказ, к которому писать
+    строки приёмки.
+    """
     m = _OBOROT_MARKER_RE.search(str(doc.get("description") or ""))
     if not m:
-        return False
+        return None
     href = ((doc.get("meta") or {}).get("href")) or ""
     if not href:
-        return False
-    saved = our_docs.get(int(m.group(1)))
-    return bool(saved) and _href_id(saved) == _href_id(href)
+        return None
+    order_id = int(m.group(1))
+    saved = our_docs.get(order_id)
+    if not saved or _href_id(saved) != _href_id(href):
+        return None
+    return order_id
 
 
 async def _sync_incoming(org_id: int, client: MoySkladClient,
@@ -1868,6 +1893,8 @@ async def _sync_incoming(org_id: int, client: MoySkladClient,
 
     incoming: dict[str, float] = {}
     incoming_tracked: dict[str, float] = {}
+    # (order_id, href документа) → {base_name: суммарно отгружено по документу}
+    shipped_by_order: dict[tuple[int, str], dict[str, float]] = {}
     open_docs = 0
     tracked_docs = 0
     docs_with_shipped = 0
@@ -1877,7 +1904,9 @@ async def _sync_incoming(org_id: int, client: MoySkladClient,
     for doc in docs:
         if doc.get("applicable") is False:  # черновик/непроведённый — не едет
             continue
-        tracked = _is_oborot_doc(doc, our_docs)
+        tracked_order_id = _oborot_order_id(doc, our_docs)
+        tracked = tracked_order_id is not None
+        doc_href = ((doc.get("meta") or {}).get("href")) or ""
         doc_qty = 0.0
         doc_shipped = False
         for pos in await _full_positions(client, "purchaseorder", doc, stats):
@@ -1891,10 +1920,20 @@ async def _sync_incoming(org_id: int, client: MoySkladClient,
                 if ext:
                     unmatched.add(ext)
                 continue
+            base_of_pos = base_by_pid.get(pid)
+            # Исполнение (D-25): «отгружено» по НАШЕМУ заказу — машинный факт
+            # приёмки. Копим по документу, записываем дельтой после цикла:
+            # синк идёт каждую ночь, а таблица приёмок только пополняется.
+            if tracked_order_id is not None and base_of_pos:
+                shipped_qty = float(pos.get("shipped") or 0)
+                if shipped_qty > 0:
+                    key = (tracked_order_id, doc_href)
+                    bucket = shipped_by_order.setdefault(key, {})
+                    bucket[base_of_pos] = bucket.get(base_of_pos, 0.0) + shipped_qty
             left = float(pos.get("quantity") or 0) - float(pos.get("shipped") or 0)
             if left <= 0:
                 continue  # позиция принята полностью (или переполучена)
-            base = base_by_pid.get(pid)
+            base = base_of_pos
             if not base:
                 continue
             incoming[base] = incoming.get(base, 0.0) + left
@@ -1952,11 +1991,76 @@ async def _sync_incoming(org_id: int, client: MoySkladClient,
     stats["incoming_positions"] = positions_total
     stats["incoming_positions_shipped"] = positions_with_shipped
     stats["incoming_docs_with_shipped"] = docs_with_shipped
+    stats["receipts_added"] = _write_shipped_receipts(org_id, shipped_by_order)
     if unmatched:
         stats["incoming_unmatched_skus"] = len(unmatched)
     _set_state(org_id, stage="incoming", progress=progress[1],
                detail=f"«Едет к нам»: {stats['incoming_qty']} шт "
                       f"из {open_docs} заказов поставщику")
+
+
+def _write_shipped_receipts(
+    org_id: int, shipped_by_order: dict[tuple[int, str], dict[str, float]]
+) -> int:
+    """Пишет факты приёмки по полю «отгружено» наших заказов (D-25).
+
+    Синк идёт каждую ночь и каждый раз видит НАКОПЛЕННОЕ значение `shipped`,
+    а таблица приёмок только пополняется. Поэтому пишется ДЕЛЬТА: сколько
+    отгружено сейчас минус сколько уже записано этим же источником по этому
+    же документу. Пока цифра в МойСкладе не меняется, новых строк не
+    появляется; выросла — появится ровно одна строка на разницу.
+
+    Уменьшение (в МойСкладе исправили приёмку в меньшую сторону) тоже
+    записывается — компенсирующей строкой с минусом. Править существующую
+    строку нельзя: это факт, а не текущее состояние.
+
+    Ручные подтверждения этот код не трогает вовсе: у них другой источник,
+    и человек с машиной не спорят за одну и ту же строку. Их суммы
+    складываются — если человек уже подтвердил приход, а потом МойСклад
+    прислал «отгружено», получится завышение. Это осознанный компромисс:
+    альтернатива — молча отбросить один из двух фактов, а расхождение
+    источников должно быть видно, а не спрятано.
+
+    Возвращает число добавленных строк.
+    """
+    if not shipped_by_order:
+        return 0
+    from app.models import OrderReceipt, ProductionOrder
+
+    added = 0
+    db = SessionLocal()
+    try:
+        for (order_id, doc_href), lines in shipped_by_order.items():
+            order = db.get(ProductionOrder, order_id)
+            if order is None or order.org_id != org_id:
+                continue  # заказ удалили — приписывать некуда
+            already: dict[str, float] = {}
+            for base, qty in db.execute(
+                select(OrderReceipt.base_name, OrderReceipt.qty).where(
+                    OrderReceipt.org_id == org_id,
+                    OrderReceipt.order_id == order_id,
+                    OrderReceipt.source == "ms_order_shipped",
+                    OrderReceipt.source_ref == doc_href[:512],
+                )
+            ).all():
+                already[base] = already.get(base, 0.0) + float(qty or 0)
+            now = datetime.utcnow()
+            for base, total in lines.items():
+                delta = round(float(total) - already.get(base, 0.0), 6)
+                if delta == 0:
+                    continue
+                db.add(OrderReceipt(
+                    org_id=org_id, order_id=order_id, base_name=base,
+                    qty=delta, at=now, source="ms_order_shipped",
+                    precision="by_position", source_ref=doc_href[:512],
+                    created_by=None, created_at=now,
+                ))
+                added += 1
+        if added:
+            db.commit()
+    finally:
+        db.close()
+    return added
 
 
 # ── Продажи ──────────────────────────────────────────────────────────────────

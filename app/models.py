@@ -500,12 +500,81 @@ class ProductionOrder(Base):
         String(255), nullable=False, default="", server_default=""
     )
 
+    # Даты переходов статуса (D-25). Раньше у заказа был только статус: когда
+    # он ушёл в производство и когда приехал — не хранилось нигде, поэтому
+    # реальный срок производства («обещали 45 дней, вышло 62») система
+    # измерить не могла в принципе. NULL у заказов, созданных до этой правки.
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    received_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Обратная ссылка на план «Мастера» (у плана ссылка на заказ уже была).
+    # Без неё найти «из какого расчёта вырос этот заказ» можно только
+    # перебором планов организации.
+    order_plan_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
     @property
     def items(self) -> list[dict]:
         try:
             return json.loads(self.items_json or "[]")
         except ValueError:
             return []
+
+
+class OrderReceipt(Base):
+    """Факт приёмки по заказу — строка на каждое «пришло N штук».
+
+    Почему таблица, а не поле в заказе. Приёмок по одному заказу бывает
+    несколько, приходят они в разное время, и это **факты, которые нельзя
+    перезаписывать**: привычка проекта складывать всё в JSON здесь сыграла бы
+    против — каждый пересчёт затирал бы историю. Таблица только пополняется;
+    ошибка исправляется компенсирующей строкой с отрицательным количеством,
+    а не правкой существующей. Ни один код проекта не делает по ней UPDATE
+    или DELETE (кроме удаления организации целиком).
+
+    `source` хранится ВСЕГДА и обязателен: «принято 80 штук» и «человек
+    сказал, что принято 80 штук» — не одно и то же, и в будущей статистике
+    качества рекомендаций они обязаны быть различимы.
+
+      ms_order_shipped — поле «отгружено» документа МойСклада, к которому мы
+                         доказали принадлежность (маркер + встречная ссылка);
+      ms_supply        — отдельный документ приёмки МС (пока не используется,
+                         значение заведено, чтобы источник не пришлось менять);
+      manual           — сказал человек.
+
+    `precision` уточняет ручной источник, не расширяя список источников:
+      by_position — человек назвал количество по строкам;
+      whole_order — человек отметил заказ принятым целиком, количества взяты
+                    из заказа. Это допущение, а не подтверждение, и в
+                    статистике оно должно весить меньше.
+    """
+
+    __tablename__ = "order_receipts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    org_id: Mapped[int] = mapped_column(ForeignKey("orgs.id"), nullable=False, index=True)
+    order_id: Mapped[int] = mapped_column(
+        ForeignKey("production_orders.id"), nullable=False, index=True
+    )
+    base_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    qty: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    source: Mapped[str] = mapped_column(String(24), nullable=False)
+    precision: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="by_position", server_default="by_position"
+    )
+    # Ссылка на документ МС (для машинных источников) — пусто у ручных.
+    source_ref: Mapped[str] = mapped_column(
+        String(512), nullable=False, default="", server_default=""
+    )
+    created_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        Index("ix_order_receipts_org_order", "org_id", "order_id"),
+    )
+
+
+RECEIPT_SOURCES = ("ms_order_shipped", "ms_supply", "manual")
+RECEIPT_PRECISIONS = ("by_position", "whole_order")
 
 
 class ReplenishDraft(Base):
