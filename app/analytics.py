@@ -1024,7 +1024,15 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
 
         rate = {"year": rate_year, "d90": rate_90, "season": rate_season}[rate_window]
 
-        item["rate"] = round(rate_year, 4)  # темп за год (обратная совместимость)
+        # ── ВНИМАНИЕ: `rate` — СИНОНИМ ГОДОВОГО ТЕМПА, оставленный для обратной
+        # совместимости старого API. Он НЕ меняется вслед за настройкой окна.
+        # Новый код читать его не должен: пиши явно `rate_year` (оценка
+        # сегодняшнего склада) или `rate_active` (сколько заказать / что будет
+        # со складом дальше). Из-за неразличимости этого поля «Прогноз» год
+        # игнорировал настройку организации, и отличить «здесь годовой
+        # намеренно» от «здесь про настройку забыли» было нельзя (DATA-11).
+        # Читатели проверяются тестом: tests/test_planner.py, блок «14h».
+        item["rate"] = round(rate_year, 4)
         item["rate_year"] = round(rate_year, 4)
         item["rate_90"] = round(rate_90, 4)
         item["rate_season"] = round(rate_season, 4)
@@ -1472,7 +1480,14 @@ def build_summary(snap: dict) -> dict:
                 and (today - date.fromisoformat(last_sale)).days <= STOCKOUT_RECENT_SALE_DAYS
             )
             lost_per_day = it["turnover"]  # ₽/день, которые приносит позиция
-            if it["cs"] == 0 and it["rate"] > 0 and sale_recent:
+            # Темп берём АКТИВНЫЙ, а не годовой синоним (DATA-11): алерт
+            # «распродан, теряем деньги» обязан считаться тем же окном, каким
+            # организация меряет спрос. У сезонного бренда зимняя вещь летом
+            # по годовому темпу «продаётся», и алерт звал бы срочно заказывать
+            # пальто в июле. Соседнее условие sale_recent (продажа за последние
+            # 45 дней) от этого не защищает: одна распродажа остатка его
+            # выполняет.
+            if it["cs"] == 0 and it["rate_active"] > 0 and sale_recent:
                 stockouts.append(
                     {
                         "type": "stockout",

@@ -27,8 +27,25 @@
   по рекомендованной цене;
 - каждая строка снабжена человекочитаемой причиной рекомендации;
 - сортировка по замороженным деньгам (frozen) по убыванию.
+
+Какой темп здесь используется и почему (DATA-11, разобрано 22.08.2026).
+Запас в днях считается по ГОДОВОМУ темпу — осознанно, а не по недосмотру.
+Причина: уценка живёт на странице «Оборачиваемость», а там по годовому темпу
+посчитано ВСЁ — и «Оборач. за год», и «Запас, дней», и «Сток на N дней»
+(см. analytics.build_turnover). Возьми здесь активное окно организации — и
+кнопка «Дефолтные скидки» начнёт считать запас не тем числом, которое человек
+видит в соседней колонке той же таблицы. Настройка «окно темпа» действует там,
+где решается «сколько заказать» (Заказ, Бюджет, Мастер, Прогноз), а не там,
+где оценивается сегодняшний склад.
+
+Раньше это читалось как `it["rate"]` — поле-синоним годового темпа, из-за
+которого нельзя было отличить «здесь годовой намеренно» от «здесь забыли про
+настройку». Теперь читается явно `rate_year`, и `rate_window` уходит в ответ
+API, чтобы подпись на экране не расходилась с расчётом.
 """
 from datetime import date
+
+from app.analytics import RATE_WINDOW_RU
 
 NEW_DAYS = 30          # новинка: меньше месяца в стоке (dis < 30)
 TOP_TURNOVER = 2000    # legacy: «топ продаж» → 15/20 %
@@ -128,7 +145,7 @@ def default_discounts(snap: dict) -> dict[str, int]:
         cs = int(it["cs"])
         if cs <= 0:
             continue
-        rate = it["rate"]
+        rate = it["rate_year"]
         days_left = round(cs / rate) if rate > 0 else None
         pct = _recommend(it["cls"], it["dis"], it["turnover"], days_left, rule)
         if pct > 0:
@@ -159,7 +176,7 @@ def build_discounts(snap: dict, overrides: dict[str, float] | None = None) -> di
         if cs <= 0:
             continue  # нет остатка — нечего скидывать (правило legacy)
 
-        rate = it["rate"]
+        rate = it["rate_year"]
         days_left = round(cs / rate) if rate > 0 else None
         last_sale = it["last_sale"]
         days_since_sale = (
@@ -215,4 +232,9 @@ def build_discounts(snap: dict, overrides: dict[str, float] | None = None) -> di
         },
         "items": items,
         "fresh_excluded_count": fresh_excluded,
+        # Запас в днях здесь считается по ГОДОВОМУ темпу — осознанно (см.
+        # докстринг модуля). Отдаём подпись наружу, чтобы страница называла
+        # базу, а не оставляла читателя гадать.
+        "rate_window": "year",
+        "rate_window_label": RATE_WINDOW_RU["year"],
     }

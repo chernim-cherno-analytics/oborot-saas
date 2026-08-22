@@ -266,7 +266,13 @@ def build_forecast(snap: dict) -> dict:
         inc = max(0, int(it["ordered"]))
         if cs + inc <= 0:
             continue
-        rate = it["rate"]
+        # DATA-11: раньше здесь стоял `it["rate"]` — а это ВСЕГДА годовой темп,
+        # поле осталось от старого API. Из-за него настройка организации «окно
+        # темпа» на «Прогнозе» не работала вовсе: владелец выбирал «90 дней»
+        # или «Сезон», а страница продолжала распродавать склад годовым темпом.
+        # Для сезонного бренда это прямая ошибка: зимнее пальто в августе по
+        # годовому темпу «уходит», а по сезонному стоит.
+        rate = float(it.get("rate_active") or 0)
         price = _item_price(it)
         q0 = cs + inc
         sellout_days = round(q0 / rate) if rate > 0 else None
@@ -418,8 +424,15 @@ def build_forecast(snap: dict) -> dict:
         )
 
     items.sort(key=lambda x: -(x["cs"] + x["ordered"]) * x["price"])
+    rate_window = (snap.get("settings") or {}).get("rate_window") or "year"
     return {
         "today": snap["today"],
+        # По какому окну темпа посчитан весь прогноз. Отдаём наружу, потому что
+        # число без базы — это то же самое, что «уверенность 63%»: выглядит
+        # точным и молчит о том, откуда взялось. Страница показывает подпись,
+        # а не выдумывает формулу заново.
+        "rate_window": rate_window,
+        "rate_window_label": RATE_WINDOW_RU.get(rate_window, RATE_WINDOW_RU["year"]),
         "cards": {
             "stock_units": stock_units,
             "stock_value": round(stock_value),
