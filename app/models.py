@@ -12,10 +12,12 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    inspect,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.db import Base
+from app.db import Base, engine, run_migration_once
 
 DEFAULT_SETTINGS = {
     "thresholds": {"weak": 1000, "dull": 2000, "good": 5000},
@@ -208,6 +210,13 @@ class Production(Base):
     (Китай, Москва, Екатеринбург, ...) добавляются вручную, если заказами
     занимаются разные отделы; позиции переносятся на них прямо из таблицы
     «Заказа» и возвращаются обратно.
+
+    Условия у подрядчиков разные (свой цех шьёт 21 день, Иваново 45, Бишкек 70;
+    фабрика не примет заказ меньше минимальной партии), поэтому срок
+    производства, минимальная партия и кратность упаковки живут на самом
+    производстве. Все три поля необязательные: NULL = «как в общих настройках»
+    (срок) или «ограничения нет» (партия, кратность) — организации, которые их
+    не заполняли, считаются ровно как раньше.
     """
 
     __tablename__ = "productions"
@@ -217,6 +226,15 @@ class Production(Base):
     name: Mapped[str] = mapped_column(String(120), nullable=False)
     is_main: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    # Срок производства этого цеха, дней (заказ → приход на склад).
+    # NULL = взять settings.lead_time_days организации.
+    lead_time_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Минимальная партия (MOQ), шт на позицию: «2 штуки пальто» фабрика не примет.
+    # NULL/0 = ограничения нет.
+    moq: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Кратность упаковки, шт: заказ округляется вверх до кратного этому числу.
+    # NULL/0/1 = кратности нет.
+    pack_multiple: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # Периодичность размещения заказов В ЭТОТ канал, дней. Ритм у каналов
     # разный: своё производство можно догружать хоть еженедельно, Китай —
     # раз в сезон. 0 = берём общую настройку организации.
@@ -435,13 +453,6 @@ class ProductionOrder(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     eta_date: Mapped[str | None] = mapped_column(String(10), nullable=True)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="draft")  # draft|sent|received
-    # Канал производства, на который ушёл заказ. Раньше связь жила только в
-    # тексте названия: при трёх подрядчиках плюс Китай список заказов через
-    # месяц превращался в кашу, а мастер не мог сказать «по этому каналу уже
-    # открыт заказ». 0 = канал не указан (старые заказы).
-    production_id: Mapped[int | None] = mapped_column(
-        ForeignKey("productions.id"), nullable=True
-    )
     items_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
     # items_json: [{base_name, qty, sizes: {size: qty}, cost}]
     # Обратная запись в МойСклад (аддитивно): href созданного документа
@@ -460,6 +471,32 @@ class ProductionOrder(Base):
             return json.loads(self.items_json or "[]")
         except ValueError:
             return []
+
+
+class ReplenishDraft(Base):
+    """Ручная правка ростовки на странице «Заказ» (черновик по размерам).
+
+    Производственник почти всегда правит рекомендованную размерную сетку под
+    фабрику (минимальная партия, ткань, ростовка лекал). Раньше правка жила
+    только в памяти вкладки и пропадала при перезагрузке — здесь она хранится
+    на организации и подставляется в поля при следующем заходе.
+
+    Пишутся ТОЛЬКО те размеры, где число отличается от расчёта: если человек
+    вернул размеру расчётное значение, строка удаляется. Благодаря этому
+    неправленые размеры продолжают следовать за пересчётом после синка, а
+    «сбросить к расчёту» — это просто удаление строк позиции.
+
+    Черновик не участвует в аналитике: он подставляется в поля страницы, а в
+    заказ на производство уходят те числа, которые видит человек.
+    """
+
+    __tablename__ = "replenish_drafts"
+
+    org_id: Mapped[int] = mapped_column(ForeignKey("orgs.id"), primary_key=True)
+    base_name: Mapped[str] = mapped_column(String(255), primary_key=True)
+    size: Mapped[str] = mapped_column(String(32), primary_key=True)  # '' = безразмерная
+    qty: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
 class OrderPlan(Base):
@@ -489,3 +526,53 @@ class OrderPlan(Base):
             return json.loads(self.brief_json or "{}")
         except ValueError:
             return {}
+
+
+# ── Аддитивная мини-миграция: условия производств ────────────────────────────
+
+# Колонки, которых нет у баз, созданных до появления условий производства.
+# ALTER TABLE ADD COLUMN одинаково работает в SQLite и Postgres; значения
+# остаются NULL — «как в общих настройках» / «ограничения нет», то есть у
+# организаций, которые ничего не заполняли, расчёт не меняется.
+# Слияние 22.08: ОСТАЛЬНЫЕ новые колонки productions (cadence_days, stages_json,
+# moq_units — этапы и ритм «Мастера заказа») мигрирует app.ms_sync.ensure_schema
+# своим набором ALTER'ов. Наборы колонок не пересекаются, обе миграции проверяют
+# наличие колонки перед ALTER и обе идут через app.db (run_migration_once /
+# run_migration_step), поэтому порядок запуска на старте роли не играет.
+_PRODUCTION_COLUMNS = (
+    ("lead_time_days", "INTEGER"),
+    ("moq", "INTEGER"),
+    ("pack_multiple", "INTEGER"),
+)
+_PRODUCTION_MIGRATION_FLAG = "productions_conditions_v1"
+
+
+def ensure_schema(bind=None) -> None:
+    """Добавляет в productions срок производства, минимальную партию и кратность.
+
+    Base.metadata.create_all не меняет существующие таблицы, поэтому у старых
+    баз (в том числе боевого Postgres) колонок нет — добавляем ALTER'ом.
+    Свежая БД: таблицы ещё нет, выходим без действий — колонки создаст init_db
+    из модели. Флаг в migration_flags гарантирует один запуск.
+
+    Ревью 22.08 (Н1): вызывается из db.init_db() на старте приложения, а не на
+    импорте модуля, и переживает одновременный старт нескольких воркеров —
+    вся работа идёт через run_migration_once (см. app/db.py).
+
+    bind — необязательный engine (нужен тестам, чтобы прогнать миграцию на
+    отдельной базе со «старой» схемой); по умолчанию — engine приложения.
+    """
+    eng = bind or engine
+    insp = inspect(eng)
+    if not insp.has_table("productions"):
+        return
+    cols = {c["name"] for c in insp.get_columns("productions")}
+    missing = [(name, ddl) for name, ddl in _PRODUCTION_COLUMNS if name not in cols]
+    if not missing:
+        return
+
+    def _add_columns(conn) -> None:
+        for name, ddl in missing:
+            conn.execute(text(f"ALTER TABLE productions ADD COLUMN {name} {ddl}"))
+
+    run_migration_once(_PRODUCTION_MIGRATION_FLAG, _add_columns, bind=eng)

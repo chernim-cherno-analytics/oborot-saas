@@ -29,9 +29,9 @@ from datetime import datetime
 import httpx
 import jwt
 from fastapi import HTTPException
-from sqlalchemy import inspect, text
+from sqlalchemy import inspect
 
-from app.db import engine
+from app.db import engine, run_migration_step
 
 DEFAULT_VENDOR_API_BASE = "https://apps-api.moysklad.ru/api/vendor/1.0"
 
@@ -250,7 +250,7 @@ def parse_expiry(moment: str | None) -> datetime | None:
 
 # ── Аддитивная мини-миграция ─────────────────────────────────────────────────
 
-def ensure_schema() -> None:
+def ensure_schema(bind=None) -> None:
     """Добавляет колонки Vendor-фичи в существующие orgs/users.
 
     Base.metadata.create_all не изменяет существующие таблицы. ALTER TABLE
@@ -258,27 +258,42 @@ def ensure_schema() -> None:
     ADD COLUMN SQLite не умеет — в старых БД уникальность ms_account_id/ms_uid
     обеспечивает логика поиска-перед-вставкой; новые БД получают constraint
     из модели. Свежая БД (таблиц нет) — no-op.
+
+    Ревью 22.08 (Д4): раньше ALTER выполнялся напрямую и падал на «duplicate
+    column» при одновременном старте нескольких воркеров. Теперь — через
+    run_migration_step (см. app/db.py), который переживает гонку и на
+    SQLite, и на Postgres. Вызывается из app.main._startup() на старте
+    приложения, а не на импорте модуля (раньше — routes_ms_vendor.py, см. Д4).
+
+    bind — необязательный engine (нужен тестам для «старой» схемы отдельной
+    базы); по умолчанию — engine приложения.
     """
-    insp = inspect(engine)
+    eng = bind or engine
+    insp = inspect(eng)
     if insp.has_table("orgs"):
         cols = {c["name"] for c in insp.get_columns("orgs")}
-        with engine.begin() as conn:
-            if "ms_account_id" not in cols:
-                conn.execute(text("ALTER TABLE orgs ADD COLUMN ms_account_id VARCHAR(64)"))
-            if "source" not in cols:
-                conn.execute(text(
-                    "ALTER TABLE orgs ADD COLUMN source VARCHAR(16) NOT NULL DEFAULT 'saas'"
-                ))
-            if "status" not in cols:
-                conn.execute(text(
-                    "ALTER TABLE orgs ADD COLUMN status VARCHAR(16) NOT NULL DEFAULT 'active'"
-                ))
-            if "ms_tariff_name" not in cols:
-                conn.execute(text(
-                    "ALTER TABLE orgs ADD COLUMN ms_tariff_name VARCHAR(128) NOT NULL DEFAULT ''"
-                ))
+        if "ms_account_id" not in cols:
+            run_migration_step(
+                "ALTER TABLE orgs ADD COLUMN ms_account_id VARCHAR(64)", bind=eng,
+            )
+        if "source" not in cols:
+            run_migration_step(
+                "ALTER TABLE orgs ADD COLUMN source VARCHAR(16) NOT NULL DEFAULT 'saas'",
+                bind=eng,
+            )
+        if "status" not in cols:
+            run_migration_step(
+                "ALTER TABLE orgs ADD COLUMN status VARCHAR(16) NOT NULL DEFAULT 'active'",
+                bind=eng,
+            )
+        if "ms_tariff_name" not in cols:
+            run_migration_step(
+                "ALTER TABLE orgs ADD COLUMN ms_tariff_name VARCHAR(128) NOT NULL DEFAULT ''",
+                bind=eng,
+            )
     if insp.has_table("users"):
         cols = {c["name"] for c in insp.get_columns("users")}
         if "ms_uid" not in cols:
-            with engine.begin() as conn:
-                conn.execute(text("ALTER TABLE users ADD COLUMN ms_uid VARCHAR(255)"))
+            run_migration_step(
+                "ALTER TABLE users ADD COLUMN ms_uid VARCHAR(255)", bind=eng,
+            )

@@ -19,8 +19,9 @@ sizes.html (проверены на реальном бренде):
 
 Прогноз:
 - каждая позиция распродаётся своим темпом до нуля, ряд на 26 недель;
-- «стока хватит до» — порог 90% от ПРОДАВАЕМОГО потенциала (rate>0):
-  мёртвый сток не должен делать порог недостижимым.
+- «стока хватит до» — неделя, к которой продаваемого стока (rate>0) осталось
+  меньше 10% от того, что лежит на складе СЕГОДНЯ: мёртвый сток порог не
+  задирает, а мерка неподвижна — заказанный товар дату только отодвигает.
 
 Размеры:
 - период «N мес» = N ПОЛНЫХ месяцев + текущий неполный; темп делится на
@@ -35,14 +36,22 @@ from datetime import date, timedelta
 from sqlalchemy import and_, case, func, select
 from sqlalchemy.orm import Session
 
+from app.analytics import BASIS_AVG_SALE, RATE_WINDOW_RU
 from app.categories import ru_category
-from app.models import Product, Sale, StockDay
+from app.models import Product, Sale, SkuHidden, StockDay
 
 FRESH_DAYS = 90        # бюджет: окно «свежих» продаж
 NEED_MIN = 3           # бюджет: минимальная потребность, шт
 FORECAST_WEEKS = 26    # прогноз: горизонт ряда
 FORECAST_MONTHS = 7    # прогноз: текущий + 6 будущих месяцев (мини-кольца «Пульса» показывают будущие)
-SELLOUT_SHARE = 0.9    # прогноз: «хватит до» = распродано 90% продаваемого потенциала
+SELLOUT_SHARE = 0.9    # прогноз: «хватит до» = распродано 90% продаваемого стока
+# Подпись карточки «Стока хватит примерно» — что именно посчитано. Мерка
+# неподвижная (сегодняшний склад), поэтому заказанный товар дату только
+# отодвигает; текст отдаётся API, чтобы страница не выдумывала формулу.
+UNTIL_BASIS = (
+    "до этой недели распродаётся 90% продаваемого стока, который лежит на "
+    "складе сегодня; товар в пути считается вместе с остатком"
+)
 CAT_LOW_DAYS = 45      # прогноз: пилюля «мало»
 CAT_OVER_DAYS = 120    # прогноз: пилюля «затоварка»
 
@@ -208,10 +217,15 @@ def build_budget(
         )
 
     used = amount - rest
+    # Потребность (need) берётся из снапшота и зависит от активного окна темпа —
+    # отдаём окно и его подпись, чтобы страница и выгрузка не молчали об этом.
+    rate_window = snap["settings"].get("rate_window", "year")
     return {
         "amount": amount,
         "max_share": max_share,
         "horizon_days": horizon,
+        "rate_window": rate_window,
+        "rate_window_label": RATE_WINDOW_RU.get(rate_window, RATE_WINDOW_RU["year"]),
         "fresh_days": FRESH_DAYS,
         "used": round(used),
         "rest": round(rest),
@@ -233,7 +247,15 @@ def build_budget(
 # ── Прогноз ──────────────────────────────────────────────────────────────────
 
 def build_forecast(snap: dict) -> dict:
-    """GET /api/forecast — распродажа стока по неделям, карточки, категории."""
+    """GET /api/forecast — распродажа стока по неделям, карточки, категории.
+
+    Все денежные суммы — по средней цене продажи (money_basis в ответе).
+    «Склад сейчас» на странице считается один раз: cards.stock_value,
+    weeks[0].stock_value и months[0].stock_value — одно и то же число, и то же
+    самое показывает кольцо «Склад в деньгах» из /api/pulse. Товар в пути в это
+    число НЕ входит: он в отдельной карточке «Едет к нам» и в параллельных
+    рядах stock_incoming_value.
+    """
     today = date.fromisoformat(snap["today"])
 
     items = []
@@ -275,36 +297,56 @@ def build_forecast(snap: dict) -> dict:
     pace_rub = sum(x["rate"] * x["price"] for x in items if x["cs"] > 0)
 
     # Ряд на 26 недель: остаток каждой позиции тает своим темпом до нуля.
+    # stock_value — ТОЛЬКО то, что лежит на складе: нулевая точка ряда обязана
+    # совпадать с карточкой «Сток сейчас» и с кольцом «Склад в деньгах», иначе
+    # на одном экране три разных числа про один и тот же склад (ревью 21.08).
+    # Товар в пути — отдельным рядом stock_incoming_value («сток + едет к нам»).
     weeks = []
-    start_value = sum((x["cs"] + x["ordered"]) * x["price"] for x in items)
     for w in range(FORECAST_WEEKS + 1):
-        val = 0.0
+        val = inc_val = 0.0
         for x in items:
-            rem = (x["cs"] + x["ordered"]) - x["rate"] * 7 * w
+            days = 7 * w
+            rem = x["cs"] - x["rate"] * days
             if rem > 0:
                 val += rem * x["price"]
-        weeks.append({"date": (today + timedelta(days=7 * w)).isoformat(), "stock_value": round(val)})
+            rem_inc = (x["cs"] + x["ordered"]) - x["rate"] * days
+            if rem_inc > 0:
+                inc_val += rem_inc * x["price"]
+        weeks.append(
+            {
+                "date": (today + timedelta(days=7 * w)).isoformat(),
+                "stock_value": round(val),
+                "stock_incoming_value": round(inc_val),
+            }
+        )
 
     # Помесячный ряд «сток vs продажи» (FORECAST_MONTHS месяцев вперёд):
     # для каждого месяца — стоимость стока на его начало и прогнозная выручка
     # месяца. Продажи затухают сами собой: бестселлеры распродаются первыми,
     # и без перезаказа каждый следующий месяц продаёт хуже предыдущего.
     months_fc = []
-    rem_m = [x["cs"] + x["ordered"] for x in items]
+    rem_m = [x["cs"] for x in items]                      # только склад
+    rem_mi = [x["cs"] + x["ordered"] for x in items]      # склад + едет к нам
     my, mm_ = today.year, today.month
     for _m in range(FORECAST_MONTHS):
         stock_start = sum(rem_m[i] * x["price"] for i, x in enumerate(items))
+        stock_start_inc = sum(rem_mi[i] * x["price"] for i, x in enumerate(items))
         sales_val = 0.0
         for i, x in enumerate(items):
-            if x["rate"] <= 0 or rem_m[i] <= 0:
+            if x["rate"] <= 0:
                 continue
-            sold = min(rem_m[i], x["rate"] * 30.44)
-            rem_m[i] -= sold
-            sales_val += sold * x["price"]
+            month_qty = x["rate"] * 30.44
+            if rem_m[i] > 0:  # ряд «только склад» — для линии стока
+                rem_m[i] -= min(rem_m[i], month_qty)
+            if rem_mi[i] > 0:  # продаётся всё, что есть и что приедет
+                sold = min(rem_mi[i], month_qty)
+                rem_mi[i] -= sold
+                sales_val += sold * x["price"]
         months_fc.append(
             {
                 "month": f"{my:04d}-{mm_:02d}",
                 "stock_value": round(stock_start),
+                "stock_incoming_value": round(stock_start_inc),
                 "sales_value": round(sales_val),
             }
         )
@@ -312,19 +354,31 @@ def build_forecast(snap: dict) -> dict:
         if mm_ == 13:
             my, mm_ = my + 1, 1
 
-    # «Хватит до»: 90% ПРОДАВАЕМОГО потенциала (rate>0) — мёртвый сток
-    # не должен делать порог недостижимым (правило legacy).
-    sellable = sum((x["cs"] + x["ordered"]) * x["price"] for x in items if x["rate"] > 0)
-    until_week, cum = None, 0.0
+    # «Хватит до»: неделя, к которой продаваемого стока (rate>0) останется
+    # меньше 10% от того, что лежит на полке СЕГОДНЯ. Мёртвый сток в порог не
+    # входит — иначе он делает его недостижимым (правило legacy).
+    #
+    # Мерка — сегодняшний склад, и это принципиально. Раньше порог считался от
+    # «склад + едет к нам», и добавление товара в производство двигало дату
+    # РАНЬШЕ, а не позже (находка бухгалтера: с 25 декабря на 18-е): партия
+    # ходового товара успевала распродаться до порога и поднимала знаменатель
+    # быстрее, чем остаток. Порог от неподвижной мерки такого не допускает:
+    # заказанный товар может только отодвинуть дату дефицита.
+    # Товар в пути учитывается в остатке — ровно так же, как в ряду
+    # «сток + едет к нам» выше (дата прихода в снапшоте не хранится).
+    shelf_sellable = sum(x["cs"] * x["price"] for x in items if x["rate"] > 0)
+    floor = shelf_sellable * (1 - SELLOUT_SHARE)
+    until_week = None
     rem_q = {i: x["cs"] + x["ordered"] for i, x in enumerate(items)}
     for w in range(1, FORECAST_WEEKS + 1):
+        left = 0.0
         for i, x in enumerate(items):
-            if x["rate"] <= 0 or rem_q[i] <= 0:
+            if x["rate"] <= 0:
                 continue
-            sold = min(rem_q[i], x["rate"] * 7)
-            rem_q[i] -= sold
-            cum += sold * x["price"]
-        if sellable > 0 and cum >= sellable * SELLOUT_SHARE:
+            if rem_q[i] > 0:
+                rem_q[i] = max(0.0, rem_q[i] - x["rate"] * 7)
+            left += rem_q[i] * x["price"]
+        if shelf_sellable > 0 and left <= floor:
             until_week = w
             break
     until_date = (today + timedelta(days=7 * until_week)).isoformat() if until_week else None
@@ -374,7 +428,21 @@ def build_forecast(snap: dict) -> dict:
             "pace_rub": round(pace_rub),
             "until_date": until_date,
             "until_weeks": until_week,
+            # Подпись карточки «Стока хватит примерно»: от чего считается порог.
+            # Шаблон показывает её как есть, чтобы не выдумывать формулу заново.
+            "until_basis": UNTIL_BASIS,
         },
+        # подписи базы для каждой денежной суммы — шаблоны показывают их как есть
+        "money_basis": {
+            "stock_value": BASIS_AVG_SALE,
+            "incoming_value": BASIS_AVG_SALE,
+            "pace_rub": BASIS_AVG_SALE,
+            "categories_value": BASIS_AVG_SALE,
+            "weeks_stock_value": BASIS_AVG_SALE,
+        },
+        # ряды: stock_value — только склад (совпадает с карточкой «Сток сейчас»),
+        # stock_incoming_value — склад вместе с товаром в пути
+        "series_note": "ряд «сток» — без товара в пути; «сток + едет» — вместе с ним",
         "weeks": weeks,
         "months": months_fc,
         "categories": categories,
@@ -847,34 +915,73 @@ def build_revenue(db: Session, org_id: int, date_from: str, date_to: str) -> dic
 
 
 PULSE_MONTHS = 6  # «Пульс»: сравнение с этим числом ПОЛНЫХ месяцев
+# Подпись кольца «Склад в деньгах». Кроме базы цены называет и НАБОР позиций:
+# скрытые и архивные не считаются ни в «сейчас», ни в шести прошлых месяцах,
+# поэтому при скрытии позиции сдвигается весь ряд (см. build_pulse).
+PULSE_STOCK_BASIS = BASIS_AVG_SALE + ", без скрытых и архивных позиций"
 
 
 def _pulse_price_map(db: Session, org_id: int, today: date) -> dict[int, float]:
-    """Цена позиции для оценки склада в ₽.
+    """Цена единицы для оценки склада в ₽ — ТА ЖЕ, что у карточки «Сток сейчас».
 
-    Фактическая средняя цена продажи (нетто за 365 дней); если позиция не
-    продавалась — номинальная розница из карточки (sale_price). Ноль остаётся
-    нулём: у позиции без цены стоимость склада честно не оцениваем.
+    Фактическая средняя цена продажи по БАЗОВОМУ имени (нетто-выручка за 365
+    дней / нетто-штуки, округлённая до рубля — как analytics.avg_price); если
+    база не продавалась — номинальная розница из карточки (sale_price). Ноль
+    остаётся нулём: у позиции без цены стоимость склада честно не оцениваем.
+
+    Ревью 21.08: раньше цена бралась по КАЖДОМУ размеру отдельно и без
+    округления, поэтому «Склад сейчас» в кольце и в карточке на одной странице
+    расходились (на демо — 1 778 ₽ из ниоткуда). База цены и набор позиций
+    теперь общие: архивные и скрытые позиции пропускаем, как и карточка.
     """
-    since = (today - timedelta(days=365)).isoformat()
+    # Ровно 365 дат (today−364 … today) — то же окно, что у снапшота: иначе
+    # средняя цена расходится на копейки, а сумма склада — на десятки рублей.
+    since = (today - timedelta(days=364)).isoformat()
     sign_qty = case((Sale.is_return, -Sale.qty), else_=Sale.qty)
     sign_rev = case((Sale.is_return, -Sale.revenue), else_=Sale.revenue)
-    rows = db.execute(
-        select(Sale.product_id, func.sum(sign_qty), func.sum(sign_rev))
+    join_products = and_(
+        Product.id == Sale.product_id,
+        Product.org_id == org_id,
+        Product.excluded.is_(False),
+    )
+    sold: dict[str, float] = {}
+    for base, q, r in db.execute(
+        select(Product.base_name, func.sum(sign_qty), func.sum(sign_rev))
+        .select_from(Sale)
+        .join(Product, join_products)
         .where(Sale.org_id == org_id, Sale.date >= since)
-        .group_by(Sale.product_id)
-    ).all()
-    sold: dict[int, float] = {}
-    for pid, q, r in rows:
+        .group_by(Product.base_name)
+    ).all():
         q, r = float(q or 0), float(r or 0)
-        if q >= 1 and r > 0:
-            sold[pid] = r / q
+        # r > 0 обязательно: если возвраты за год перевесили продажи,
+        # нетто-выручка отрицательна и «средняя цена» получается со знаком
+        # минус — склад в деньгах уходит в минус целиком (ревью). У такой
+        # базы средней цены продажи просто нет: берём номинал из карточки.
+        if q > 0 and r > 0:
+            sold[base] = float(round(r / q))
+    hidden = set(
+        db.execute(select(SkuHidden.base_name).where(SkuHidden.org_id == org_id))
+        .scalars()
+        .all()
+    )
+    # «Архивной» считается база, у которой в архиве ВСЕ размеры (как в снапшоте).
+    archived = {
+        base
+        for base, flag in db.execute(
+            select(Product.base_name, func.min(case((Product.archived, 1), else_=0)))
+            .where(Product.org_id == org_id, Product.excluded.is_(False))
+            .group_by(Product.base_name)
+        ).all()
+        if flag
+    }
     prices: dict[int, float] = {}
-    for pid, nominal in db.execute(
-        select(Product.id, Product.sale_price)
+    for pid, base, nominal in db.execute(
+        select(Product.id, Product.base_name, Product.sale_price)
         .where(Product.org_id == org_id, Product.excluded.is_(False))
     ).all():
-        prices[pid] = sold.get(pid, float(nominal or 0))
+        if base in hidden or base in archived:
+            continue
+        prices[pid] = float(sold.get(base) or nominal or 0)
     return prices
 
 
@@ -891,6 +998,16 @@ def build_pulse(db: Session, org_id: int, today: date | None = None) -> dict:
     pct = текущее/среднее; 360° на круге = среднее за 6 месяцев.
     Месяцы без данных в среднее не входят (молодой аккаунт), их число видно
     по len(months) с v != None.
+
+    Набор позиций и цены — ОДИН И ТОТ ЖЕ для «сейчас» и для всех шести
+    месяцев (_pulse_price_map): скрытые и архивные не считаются нигде.
+    Поэтому скрытие позиции сегодня сдвигает и прошлые месяцы. Это сделано
+    намеренно: кольцо — отношение «сейчас / среднее за 6 месяцев», и если
+    вычесть позицию только из «сейчас», склад покажет фальшивое падение.
+    Ряд «Пульса» вообще не хранится, а каждый раз пересчитывается из текущих
+    цен и текущего набора позиций — по той же причине он слегка меняется и от
+    новых продаж. Чтобы это не выглядело ошибкой, подпись кольца прямо
+    называет набор позиций (PULSE_STOCK_BASIS).
 
     Ревью 21.08 (мажор 3): ПРОШЛЫЙ месяц, покрытый историей лишь частично,
     в среднее не берём вовсе. Раньше свежий аккаунт с двумя неделями истории
@@ -1031,5 +1148,7 @@ def build_pulse(db: Session, org_id: int, today: date | None = None) -> dict:
             "current": round(stock_now),
             "as_of": last_day,
             "pct": _pct(stock_now, stock_avg6),
+            # подпись базы суммы и набора позиций — шаблон показывает её как есть
+            "basis": PULSE_STOCK_BASIS,
         },
     }

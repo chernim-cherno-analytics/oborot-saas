@@ -28,11 +28,11 @@ processingorder требует техкарту (processingPlan) и доступ
 Идемпотентность обеспечивает роут: повторная отправка при заполненном
 production_orders.ms_doc_href — 409 «уже отправлен» со ссылкой.
 """
-from sqlalchemy import inspect, select, text
+from sqlalchemy import inspect, select
 from sqlalchemy.orm import Session
 
 from app.crypto import decrypt_token
-from app.db import engine
+from app.db import engine, run_migration_step
 from app.models import Connection, OrderedQty, Product, ProductionOrder
 from app.ms_client import MoySkladClient
 
@@ -74,29 +74,40 @@ class WritebackError(Exception):
 
 # ── Аддитивная мини-миграция ─────────────────────────────────────────────────
 
-def ensure_schema() -> None:
+def ensure_schema(bind=None) -> None:
     """Добавляет ms_doc_href/ms_doc_name в существующие production_orders.
 
     Base.metadata.create_all не изменяет существующие таблицы, поэтому у баз,
     созданных до этой фичи, колонок нет. ALTER TABLE ADD COLUMN — аддитивно и
     одинаково работает в SQLite и Postgres. Свежая БД получает колонки из
     модели, тогда таблицы ещё нет — выходим без действий.
+
+    Ревью 22.08 (Д4): раньше ALTER выполнялся напрямую и падал на «duplicate
+    column» при одновременном старте нескольких воркеров. Теперь — через
+    run_migration_step (см. app/db.py), который переживает гонку и на
+    SQLite, и на Postgres. Вызывается из app.main._startup() на старте
+    приложения, а не на импорте модуля (раньше — routes_connect.py, см. Д4).
+
+    bind — необязательный engine (нужен тестам для «старой» схемы отдельной
+    базы); по умолчанию — engine приложения.
     """
-    insp = inspect(engine)
+    eng = bind or engine
+    insp = inspect(eng)
     if not insp.has_table("production_orders"):
         return
     cols = {c["name"] for c in insp.get_columns("production_orders")}
-    with engine.begin() as conn:
-        if "ms_doc_href" not in cols:
-            conn.execute(text(
-                "ALTER TABLE production_orders "
-                "ADD COLUMN ms_doc_href VARCHAR(512) NOT NULL DEFAULT ''"
-            ))
-        if "ms_doc_name" not in cols:
-            conn.execute(text(
-                "ALTER TABLE production_orders "
-                "ADD COLUMN ms_doc_name VARCHAR(255) NOT NULL DEFAULT ''"
-            ))
+    if "ms_doc_href" not in cols:
+        run_migration_step(
+            "ALTER TABLE production_orders "
+            "ADD COLUMN ms_doc_href VARCHAR(512) NOT NULL DEFAULT ''",
+            bind=eng,
+        )
+    if "ms_doc_name" not in cols:
+        run_migration_step(
+            "ALTER TABLE production_orders "
+            "ADD COLUMN ms_doc_name VARCHAR(255) NOT NULL DEFAULT ''",
+            bind=eng,
+        )
 
 
 # ── Вспомогательное ──────────────────────────────────────────────────────────

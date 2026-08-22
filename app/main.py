@@ -8,10 +8,11 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, Form, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from sqlalchemy import select
+from pydantic import BaseModel, Field
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from app import auth
@@ -22,7 +23,7 @@ from app.routes_extra import router as extra_router
 from app.routes_ms_app import router as ms_app_router
 from app.routes_ms_vendor import router as ms_vendor_router
 from app.db import get_db, init_db
-from app.models import Connection, Membership, Org, User
+from app.models import Connection, Membership, Org, Product, ProductionOrder, Sale, User
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 # Порядок важен: настоящие шаблоны перекрывают заглушки; несуществующая
@@ -82,6 +83,11 @@ if STATIC_DIR.is_dir():
 
 @app.on_event("startup")
 def _startup() -> None:
+    # Fail-fast, пока сервис ещё не принял ни одного запроса: в проде
+    # OBOROT_TRUSTED_PROXY_HOPS обязан быть задан явно (0 или больше) — иначе
+    # лимит входа по IP молча выключается ровно тогда, когда нужен (см.
+    # auth.check_proxy_config).
+    auth.check_proxy_config()
     init_db()
     from app import exclusions as _exclusions
     _exclusions.ensure_schema()
@@ -90,6 +96,15 @@ def _startup() -> None:
     from app import ms_sync as _ms_sync
     _ms_sync.ensure_schema()
     _ms_sync.reset_stale_running()
+    # Д4 (ревью 22.08): эти две миграции раньше запускались на импорте
+    # routes_connect.py / routes_ms_vendor.py — до старта приложения и вне
+    # защиты от гонки нескольких воркеров (обращение к базе на импорте
+    # модуля само по себе было опасно). Место — здесь, вместе с остальными
+    # аддитивными миграциями.
+    from app import ms_writeback as _ms_writeback
+    _ms_writeback.ensure_schema()
+    from app import ms_vendor as _ms_vendor
+    _ms_vendor.ensure_schema()
 
 
 # ── Помощники ────────────────────────────────────────────────────────────────
@@ -203,9 +218,49 @@ def _render_auth(request: Request, template: str, **extra):
     )
 
 
+# Прощальные сообщения после удаления аккаунта (?deleted=...): человек должен
+# увидеть подтверждение, что всё действительно стёрто, а не просто «вас выкинуло».
+_DELETED_NOTICES = {
+    "org": "Организация и все её данные удалены: товары, продажи, заказы, "
+           "настройки и подключение к МойСкладу вместе с токеном. Восстановить их нельзя. "
+           "Спасибо, что попробовали «Оборот» — будем рады, если вернётесь.",
+    "account": "Ваш аккаунт удалён. Данные организации остались у её участников. "
+               "Спасибо, что были с нами.",
+}
+
+
 @app.get("/login", response_class=HTMLResponse)
-def login_page(request: Request):
-    return _render_auth(request, "login.html")
+def login_page(request: Request, deleted: str = ""):
+    return _render_auth(request, "login.html", notice=_DELETED_NOTICES.get(deleted))
+
+
+# Почта поддержки: пока нет восстановления пароля, это единственный способ
+# вернуть доступ — значит человек должен видеть её ровно тогда, когда заперт.
+SUPPORT_EMAIL = "tsitsilinvlad@gmail.com"
+
+
+def _minutes_word(n: int) -> str:
+    if n % 10 == 1 and n % 100 != 11:
+        return "минуту"
+    if n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14):
+        return "минуты"
+    return "минут"
+
+
+def _too_many_attempts_error(retry_after_sec: int) -> str:
+    """Текст блокировки: сколько именно ждать и что делать, если пароль забыт.
+
+    Срок здесь ФИКСИРОВАННЫЙ (см. auth.LoginLimiter) — чужие попытки, пока
+    блокировка активна, его не сдвигают, так что название «через N минут»
+    остаётся правдой, сколько бы их ни пришло следом.
+    """
+    mins = max(1, -(-retry_after_sec // 60))
+    return (
+        f"Слишком много неудачных попыток входа в этот аккаунт. "
+        f"Попробуйте снова через {mins} {_minutes_word(mins)} — счётчик обнулится сам. "
+        f"Если вы забыли пароль: восстановления по почте у нас пока нет, "
+        f"напишите на {SUPPORT_EMAIL} с адреса, на который заведён аккаунт, — вернём доступ."
+    )
 
 
 @app.post("/login")
@@ -215,23 +270,63 @@ def login_submit(
     password: str = Form(...),
     db: Session = Depends(get_db),
 ):
-    ip = request.client.host if request.client else "?"
     email_norm = email.strip().lower()
-    limiter_keys = (f"ip:{ip}", f"acc:{ip}:{email_norm}")
-    if not all(auth.login_limiter.check(k) for k in limiter_keys):
-        return _render_auth(
-            request, "login.html", email=email_norm,
-            error="Слишком много попыток входа. Подождите несколько минут и попробуйте снова.",
-        )
+    # Ключ аккаунта не зависит от адреса: подбор пароля к одному аккаунту
+    # блокируется, с каких бы адресов он ни шёл. Ключ по IP считаем только
+    # если адресу можно верить (см. auth.client_ip).
+    ip, ip_trusted = auth.client_ip(request)
+    acc_key, ip_key = f"acc:{email_norm}", f"ip:{ip}"
+    # Оба лимита читаем ДО проверки пароля — сообщение о блокировке (если она
+    # есть) должно отражать состояние на момент запроса, а не то, что успеет
+    # поменяться внутри hit() ниже.
+    acc_retry = auth.login_limiter.retry_after(acc_key)
+    ip_retry = auth.ip_login_limiter.retry_after(ip_key) if ip_trusted else 0
+    # Пароль проверяем ВСЕГДА, независимо от лимитов. Оба лимита — мягкие:
+    # они ограничивают скорость подбора (сколько НЕУДАЧНЫХ попыток пройдёт в
+    # окно), а не запрещают вход владельцу аккаунта. Раньше лимит по
+    # аккаунту был жёстким (проверка стояла до пароля) — значит зная только
+    # чужой e-mail, можно было пятью запросами раз в несколько минут держать
+    # платящего клиента заблокированным бессрочно; восстановления пароля в
+    # продукте нет, обращаться было бы не к кому. «Мягкость» не превращается
+    # в оракул: подбирающий не может по разнице ответов понять, насколько
+    # близко подошёл — сообщения различаются только по состоянию ЛИМИТА
+    # (заблокирован / нет), а единственный сигнал успеха — собственно вход
+    # (редирект), как и раньше.
     user = db.execute(
         select(User).where(User.email == email_norm)
     ).scalars().first()
     if user is None or not auth.verify_password(password, user.pw_hash):
-        for k in limiter_keys:
-            auth.login_limiter.hit(k)
+        # Счётчик аккаунта растёт всегда, даже когда сработал лимит по IP:
+        # иначе подбиратель, сам себя «заблокировавший» по адресу, получил бы
+        # неограниченный оракул «верный пароль / неверный». Пока ключ уже
+        # заперт, hit() — no-op (см. auth.LoginLimiter): чужие неудачные
+        # попытки не продлевают и не переоткрывают блокировку.
+        auth.login_limiter.hit(acc_key)
+        if ip_trusted:
+            auth.ip_login_limiter.hit(ip_key)
+        if acc_retry:
+            return _render_auth(
+                request, "login.html", email=email_norm,
+                error=_too_many_attempts_error(acc_retry),
+            )
+        if ip_retry:
+            return _render_auth(request, "login.html", email=email_norm,
+                                error=_too_many_attempts_error(ip_retry))
+        # Задержки ответа здесь СПЕЦИАЛЬНО нет. Синхронный эндпоинт выполняется
+        # в пуле потоков FastAPI (по умолчанию их немного), и секунда сна
+        # занимает поток целиком: десяток параллельных попыток подбора тормозил
+        # весь сайт для обычных посетителей, а подбирателю стоил максимум трёх
+        # секунд на аккаунт (дальше всё равно срабатывает лимит попыток).
+        # Асинхронный вариант тут тоже не годится: bcrypt и запросы к БД в
+        # async-эндпоинте заблокировали бы уже event loop, то есть все запросы
+        # разом. Защита — лимит попыток выше.
         return _render_auth(request, "login.html", email=email_norm, error="Неверный e-mail или пароль")
-    for k in limiter_keys:
-        auth.login_limiter.reset(k)
+    # Верный пароль пропускает ВСЕГДА, даже если лимит только что был
+    # исчерпан, — и снимает обе блокировки: владелец аккаунта, который их
+    # заслуженно не должен видеть, не должен и ждать их истечения.
+    auth.login_limiter.reset(acc_key)
+    if ip_trusted:
+        auth.ip_login_limiter.reset(ip_key)
     member = db.execute(
         select(Membership).where(Membership.user_id == user.id)
     ).scalars().first()
@@ -261,6 +356,15 @@ def register_submit(
         return _render_auth(request, "register.html", name=name, org_name=org_name, email=email, error="Укажите корректный e-mail")
     if len(password) < 8:
         return _render_auth(request, "register.html", name=name, org_name=org_name, email=email, error="Пароль — минимум 8 символов")
+    if len(password.encode("utf-8")) > 72:
+        # bcrypt физически не хеширует пароль длиннее 72 байт. Длина считается
+        # в байтах, а не в символах: русская буква весит два байта, латинская —
+        # один, поэтому предел — это примерно 36 русских букв или 72 латинских.
+        return _render_auth(
+            request, "register.html", name=name, org_name=org_name, email=email,
+            error="Пароль слишком длинный. Лимит — 72 байта (это примерно 36 русских букв "
+                  "или 72 латинских) — сократите фразу.",
+        )
     exists = db.execute(select(User.id).where(User.email == email_norm)).first()
     if exists:
         return _render_auth(request, "register.html", name=name, org_name=org_name, email=email, error="Такой e-mail уже зарегистрирован")
@@ -285,6 +389,291 @@ def register_submit(
 def logout():
     response = RedirectResponse("/login", status_code=303)
     auth.clear_session(response)
+    return response
+
+
+# ── Аккаунт: пароль и удаление (страница /account) ───────────────────────────
+# Сервис просит доступ к учётной системе клиента — значит обязан показывать
+# «путь назад»: сменить пароль и уйти, забрав данные. Пути /profile и
+# /security раньше давали 404 — теперь ведут сюда же (люди ищут их наугад).
+#
+# Почему удаляем физически, а не помечаем «удалён»: в интерфейсе мы обещаем
+# «данные стираются» — значит они должны быть стёрты, иначе обещание хуже,
+# чем его отсутствие. Плюс: токен МойСклада (даже зашифрованный) не должен
+# лежать в базе после отключения, а e-mail с уникальным индексом не должен
+# мешать человеку зарегистрироваться заново.
+
+# Слово-подтверждение: печатается руками, одной кнопкой аккаунт не удалить.
+DELETE_CONFIRM_WORD = "УДАЛИТЬ"
+
+
+@app.get("/account", response_class=HTMLResponse)
+def account_page(request: Request, db: Session = Depends(get_db)):
+    return _authed_page(request, db, "account.html", "settings", "Аккаунт и безопасность")
+
+
+@app.get("/profile")
+@app.get("/security")
+def account_aliases():
+    """Люди ищут эти адреса наугад — ведём их на настоящую страницу аккаунта."""
+    return RedirectResponse("/account", status_code=302)
+
+
+def _org_members(db: Session, org_id: int) -> list[tuple[User, Membership]]:
+    """Все участники организации: (пользователь, членство)."""
+    return list(
+        db.execute(
+            select(User, Membership)
+            .join(Membership, Membership.user_id == User.id)
+            .where(Membership.org_id == org_id)
+            .order_by(User.id)
+        ).all()
+    )
+
+
+@app.get("/api/account")
+def api_account(
+    ctx: auth.AuthContext = Depends(auth.require_auth_api), db: Session = Depends(get_db)
+):
+    """Что человек увидит перед удалением: кто он, что уйдёт, кто останется."""
+    members = _org_members(db, ctx.org.id)
+    others = [(u, m) for u, m in members if u.id != ctx.user.id]
+    conn = db.execute(
+        select(Connection).where(Connection.org_id == ctx.org.id).order_by(Connection.id.desc())
+    ).scalars().first()
+    products = db.execute(
+        select(func.count()).select_from(Product).where(Product.org_id == ctx.org.id)
+    ).scalar() or 0
+    sales = db.execute(
+        select(func.count()).select_from(Sale).where(Sale.org_id == ctx.org.id)
+    ).scalar() or 0
+    orders = db.execute(
+        select(func.count()).select_from(ProductionOrder).where(ProductionOrder.org_id == ctx.org.id)
+    ).scalar() or 0
+    return {
+        "user": {"name": ctx.user.name, "email": ctx.user.email},
+        "role": ctx.role,
+        "org": {"name": ctx.org.name, "plan": ctx.org.plan},
+        "others": [
+            {"name": u.name, "email": u.email, "role": m.role} for u, m in others
+        ],
+        "connection": (
+            {"kind": conn.kind, "status": conn.status, "has_token": bool(conn.token_enc)}
+            if conn else None
+        ),
+        "counts": {"products": int(products), "sales": int(sales), "orders": int(orders)},
+        "confirm_word": DELETE_CONFIRM_WORD,
+    }
+
+
+class PasswordChangeIn(BaseModel):
+    current_password: str = Field(default="")
+    new_password: str = Field(default="")
+    confirm_password: str = Field(default="")
+
+
+@app.post("/api/account/password")
+def api_change_password(
+    body: PasswordChangeIn,
+    ctx: auth.AuthContext = Depends(auth.require_auth_api),
+    db: Session = Depends(get_db),
+):
+    """Смена пароля: текущий + новый + подтверждение.
+
+    Правила те же, что при регистрации (см. register_submit): минимум 8
+    символов и не длиннее 72 БАЙТ — физический предел bcrypt (русская буква
+    весит два байта, поэтому предел — примерно 36 русских букв).
+    """
+    if not auth.verify_password(body.current_password, ctx.user.pw_hash):
+        raise HTTPException(
+            status_code=403,
+            detail="Текущий пароль не подошёл. Проверьте раскладку и регистр — "
+                   "или выйдите и войдите заново, чтобы убедиться в пароле.",
+        )
+    if body.new_password != body.confirm_password:
+        raise HTTPException(
+            status_code=422, detail="Новый пароль и подтверждение не совпадают — введите их заново"
+        )
+    if len(body.new_password) < 8:
+        raise HTTPException(status_code=422, detail="Новый пароль — минимум 8 символов")
+    if len(body.new_password.encode("utf-8")) > 72:
+        raise HTTPException(
+            status_code=422,
+            detail="Пароль слишком длинный. Лимит — 72 байта (это примерно 36 русских букв "
+                   "или 72 латинских) — сократите фразу.",
+        )
+    if body.new_password == body.current_password:
+        raise HTTPException(
+            status_code=422, detail="Новый пароль совпадает со старым — придумайте другой"
+        )
+    user = db.merge(ctx.user)
+    user.pw_hash = auth.hash_password(body.new_password)
+    db.commit()
+    # Текущую сессию НЕ обрываем: человек только что доказал знание пароля,
+    # выкидывать его на форму входа посреди работы незачем. Куку переставляем
+    # заново (свежий срок жизни). Честная оговорка для интерфейса: сессии на
+    # других устройствах живут по подписанной куке и протухнут сами (до 7
+    # дней) — принудительно погасить их текущая схема сессий не умеет.
+    response = JSONResponse({"ok": True, "note": "Пароль изменён"})
+    auth.set_session(response, user.id, ctx.org.id)
+    return response
+
+
+class AccountDeleteIn(BaseModel):
+    password: str = Field(default="")
+    confirm: str = Field(default="")
+    # Что делать с организацией, если в ней есть другие участники:
+    # transfer — передать её коллеге, org — удалить вместе со всеми данными.
+    mode: str = Field(default="")
+    transfer_to: str = Field(default="", max_length=255)
+
+
+def _purge_org(db: Session, org_id: int) -> None:
+    """Физически стирает ВСЕ данные организации, включая подключение и токен.
+
+    Порядок — от зависимых таблиц к orgs: в Postgres внешние ключи проверяются
+    (в SQLite по умолчанию нет), и обратный порядок упал бы. Список таблиц
+    держим полным: осиротевшая строка с org_id удалённой организации — это и
+    невыполненное обещание «данные стёрты», и мина под следующий org_id.
+    """
+    from app import analytics
+    from app.models import (
+        CategoryMerge,
+        NotifySettings,
+        OrderedQty,
+        Production,
+        ProductionAssign,
+        ReplenishDraft,
+        SkuCategoryOverride,
+        SkuDiscount,
+        SkuHidden,
+        StockDay,
+        SyncState,
+        Warehouse,
+        WarehouseStock,
+    )
+    from app.routes_extra import BillingRequest
+
+    for model in (
+        Sale, StockDay, WarehouseStock, OrderedQty, ReplenishDraft,
+        ProductionAssign, Production, ProductionOrder,
+        SkuHidden, SkuCategoryOverride, CategoryMerge, SkuDiscount,
+        NotifySettings, SyncState, BillingRequest,
+        Product, Warehouse, Connection, Membership,
+    ):
+        db.execute(delete(model).where(model.org_id == org_id))
+    db.execute(delete(Org).where(Org.id == org_id))
+    analytics.invalidate(org_id)
+
+
+def _purge_user(db: Session, user_id: int) -> None:
+    """Стирает пользователя и его личные следы (просмотренные подсказки)."""
+    from app.models import UserHintSeen
+
+    db.execute(delete(UserHintSeen).where(UserHintSeen.user_id == user_id))
+    db.execute(delete(Membership).where(Membership.user_id == user_id))
+    db.execute(delete(User).where(User.id == user_id))
+
+
+@app.post("/api/account/delete")
+def api_delete_account(
+    body: AccountDeleteIn,
+    ctx: auth.AuthContext = Depends(auth.require_auth_api),
+    db: Session = Depends(get_db),
+):
+    """Удаление аккаунта. Подтверждение — пароль + слово «УДАЛИТЬ».
+
+    Три разных случая, и они правда разные:
+      • участник (не владелец) — удаляем только его: организация и данные
+        коллег не трогаются;
+      • владелец-единственный участник — удаляем организацию целиком вместе
+        с подключением, токеном и всей аналитикой;
+      • владелец, у которого есть сотрудники — сам выбирает: передать
+        организацию коллеге (данные и доступ коллег остаются) либо удалить
+        организацию совсем (тогда коллеги теряют доступ, и их аккаунты, если
+        других организаций у них нет, удаляются вместе с ней).
+    """
+    from app import ms_sync
+
+    if not auth.verify_password(body.password, ctx.user.pw_hash):
+        raise HTTPException(
+            status_code=403, detail="Пароль не подошёл — удаление отменено. Попробуйте ещё раз."
+        )
+    if body.confirm.strip().upper() != DELETE_CONFIRM_WORD:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Чтобы подтвердить удаление, введите слово {DELETE_CONFIRM_WORD} "
+                   "в поле подтверждения.",
+        )
+
+    members = _org_members(db, ctx.org.id)
+    others = [(u, m) for u, m in members if u.id != ctx.user.id]
+    org_id, user_id = ctx.org.id, ctx.user.id
+
+    # Участник (не владелец): уходит только он.
+    if ctx.role != "owner":
+        _purge_user(db, user_id)
+        db.commit()
+        return _deleted_response("account", 0)
+
+    if ms_sync.get_status(org_id).get("state") == "running":
+        raise HTTPException(
+            status_code=409,
+            detail="Сейчас идёт синхронизация с МойСкладом. Подождите пару минут "
+                   "и повторите удаление — иначе часть данных успела бы записаться заново.",
+        )
+
+    if others:
+        if body.mode == "transfer":
+            target = None
+            wanted = body.transfer_to.strip().lower()
+            for u, m in others:
+                if u.email == wanted:
+                    target = (u, m)
+                    break
+            if target is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Выберите, кому передать организацию — из списка её участников",
+                )
+            target[1].role = "owner"
+            _purge_user(db, user_id)
+            db.commit()
+            return _deleted_response("account", 0)
+        if body.mode != "org":
+            raise HTTPException(
+                status_code=422,
+                detail="В организации есть другие участники. Выберите, что с ней сделать: "
+                       "передать коллеге или удалить вместе со всеми данными.",
+            )
+
+    # Полное удаление организации (владелец один либо выбрал «удалить всё»).
+    orphans = 0
+    for u, _m in others:
+        other_orgs = db.execute(
+            select(func.count()).select_from(Membership).where(
+                Membership.user_id == u.id, Membership.org_id != org_id
+            )
+        ).scalar() or 0
+        if not other_orgs:
+            _purge_user(db, u.id)
+            orphans += 1
+    _purge_org(db, org_id)
+    _purge_user(db, user_id)
+    db.commit()
+    return _deleted_response("org", orphans)
+
+
+def _deleted_response(scope: str, removed_members: int) -> JSONResponse:
+    """Ответ об удалении + гашение сессионной куки (входить больше некуда)."""
+    response = JSONResponse({
+        "ok": True,
+        "scope": scope,  # account — ушёл только человек; org — организация целиком
+        "removed_members": removed_members,
+        "redirect": "/login?deleted=" + ("org" if scope == "org" else "account"),
+    })
+    auth.clear_session(response)
+    auth.clear_embed(response)
     return response
 
 

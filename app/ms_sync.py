@@ -59,11 +59,11 @@ import threading
 import time
 from datetime import date, datetime, timedelta
 
-from sqlalchemy import delete, func, insert, inspect, select, text, update
+from sqlalchemy import delete, func, insert, inspect, select, update
 
 from app import analytics, exclusions
 from app.crypto import decrypt_token
-from app.db import SessionLocal, engine
+from app.db import SessionLocal, engine, run_migration_step
 from app.models import (
     Connection,
     OrderedQty,
@@ -106,69 +106,70 @@ STAGE_TITLES = (
 )
 
 
-def ensure_schema() -> None:
+def ensure_schema(bind=None) -> None:
     """Аддитивные мини-миграции: ordered_qty.ms_qty, sync_state.fail_streak,
-    productions.stages_json/moq_units.
+    products.cost_full/supplier, productions.cadence_days/stages_json/moq_units.
 
     Base.metadata.create_all не изменяет существующие таблицы (паттерн —
     app.ms_writeback.ensure_schema). Свежая БД получает колонки из моделей.
+
+    Ревью 22.08 (Д4): раньше ALTER выполнялся напрямую и падал на «duplicate
+    column» при одновременном старте нескольких воркеров. Теперь — через
+    run_migration_step (см. app/db.py), который переживает гонку и на
+    SQLite, и на Postgres.
+
+    bind — необязательный engine (нужен тестам для «старой» схемы отдельной
+    базы); по умолчанию — engine приложения.
     """
-    insp = inspect(engine)
+    eng = bind or engine
+    insp = inspect(eng)
     if insp.has_table("ordered_qty"):
         cols = {c["name"] for c in insp.get_columns("ordered_qty")}
         if "ms_qty" not in cols:
-            with engine.begin() as conn:
-                conn.execute(text(
-                    "ALTER TABLE ordered_qty ADD COLUMN ms_qty FLOAT NOT NULL DEFAULT 0"
-                ))
+            run_migration_step(
+                "ALTER TABLE ordered_qty ADD COLUMN ms_qty FLOAT NOT NULL DEFAULT 0",
+                bind=eng,
+            )
     if insp.has_table("sync_state"):
         cols = {c["name"] for c in insp.get_columns("sync_state")}
         # Инцидент 21.08: счётчики для алерта о падающем синке.
         for col in ("fail_streak", "alerted_streak"):
             if col not in cols:
-                with engine.begin() as conn:
-                    conn.execute(text(
-                        f"ALTER TABLE sync_state ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0"
-                    ))
+                run_migration_step(
+                    f"ALTER TABLE sync_state ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0",
+                    bind=eng,
+                )
     if insp.has_table("products"):
         cols = {c["name"] for c in insp.get_columns("products")}
         # 21.08: полная себестоимость отдельно от закупочной (см. models.Product).
         if "cost_full" not in cols:
-            with engine.begin() as conn:
-                conn.execute(text(
-                    "ALTER TABLE products ADD COLUMN cost_full FLOAT NOT NULL DEFAULT 0"
-                ))
+            run_migration_step(
+                "ALTER TABLE products ADD COLUMN cost_full FLOAT NOT NULL DEFAULT 0",
+                bind=eng,
+            )
         if "supplier" not in cols:
-            with engine.begin() as conn:
-                conn.execute(text(
-                    "ALTER TABLE products ADD COLUMN supplier VARCHAR(255) NOT NULL DEFAULT ''"
-                ))
-    if insp.has_table("production_orders"):
-        cols = {c["name"] for c in insp.get_columns("production_orders")}
-        # 22.08: заказ помнит канал производства (см. models.ProductionOrder).
-        if "production_id" not in cols:
-            with engine.begin() as conn:
-                conn.execute(text(
-                    "ALTER TABLE production_orders ADD COLUMN production_id INTEGER"
-                ))
+            run_migration_step(
+                "ALTER TABLE products ADD COLUMN supplier VARCHAR(255) NOT NULL DEFAULT ''",
+                bind=eng,
+            )
     if insp.has_table("productions"):
         cols = {c["name"] for c in insp.get_columns("productions")}
         if "cadence_days" not in cols:
-            with engine.begin() as conn:
-                conn.execute(text(
-                    "ALTER TABLE productions ADD COLUMN cadence_days INTEGER NOT NULL DEFAULT 0"
-                ))
+            run_migration_step(
+                "ALTER TABLE productions ADD COLUMN cadence_days INTEGER NOT NULL DEFAULT 0",
+                bind=eng,
+            )
         # Мастер заказа 21.08: этапы производства и минимальная партия.
         if "stages_json" not in cols:
-            with engine.begin() as conn:
-                conn.execute(text(
-                    "ALTER TABLE productions ADD COLUMN stages_json TEXT NOT NULL DEFAULT ''"
-                ))
+            run_migration_step(
+                "ALTER TABLE productions ADD COLUMN stages_json TEXT NOT NULL DEFAULT ''",
+                bind=eng,
+            )
         if "moq_units" not in cols:
-            with engine.begin() as conn:
-                conn.execute(text(
-                    "ALTER TABLE productions ADD COLUMN moq_units INTEGER NOT NULL DEFAULT 0"
-                ))
+            run_migration_step(
+                "ALTER TABLE productions ADD COLUMN moq_units INTEGER NOT NULL DEFAULT 0",
+                bind=eng,
+            )
 
 
 # ── Имена и размеры (как в legacy _canon_name) ───────────────────────────────

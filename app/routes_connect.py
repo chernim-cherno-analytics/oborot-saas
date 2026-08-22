@@ -18,7 +18,7 @@ import html
 import time as _time
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Path
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select
@@ -31,12 +31,22 @@ from app.db import get_db
 from app.models import Connection, ProductionOrder, Warehouse
 from app.ms_client import MoySkladClient
 
-# Аддитивная мини-миграция: у баз, созданных до фичи обратной записи,
-# в production_orders нет колонок ms_doc_href/ms_doc_name — добавляем.
-# Свежая БД (таблиц ещё нет) — no-op, колонки создаст init_db из модели.
-ms_writeback.ensure_schema()
-# …и ms_qty в ordered_qty («едет к нам» из заказов поставщику МойСклад).
-ms_sync.ensure_schema()
+# Аддитивные мини-миграции ms_writeback.ensure_schema()/ms_sync.ensure_schema()
+# раньше запускались прямо здесь, на импорте модуля — до include_router, то
+# есть до старта приложения. Обращение к базе на импорте было опасно само по
+# себе (Д4, ревью 22.08): достаточно было запустить несколько воркеров разом,
+# чтобы 2-3 из них упали ещё до принятия первого запроса. Теперь обе миграции
+# выполняются в db.init_db() вместе с остальными — см. app/main.py:_startup.
+
+
+# Границы для числовых id в пути: без них слишком большое число (например,
+# /api/orders/999999999999999999999/ms-doc) валит SQLite (OverflowError при
+# попытке положить его в INTEGER-колонку) вместо аккуратного 422.
+# ВАЖНО: один и тот же объект Path(...) нельзя переиспользовать для нескольких
+# параметров — FastAPI мутирует его .alias при разборе сигнатуры. Поэтому —
+# фабрика, отдельный экземпляр на каждый вызов (как в app/api.py).
+def _id_path() -> int:
+    return Path(ge=1, le=2_147_483_647)
 
 # app/api.py (демо-скоуп) регистрирует заглушку POST /api/connect/moysklad,
 # а api_router включается в приложение раньше этого роутера — заглушка
@@ -343,7 +353,7 @@ def _ms_doc_out(order: ProductionOrder) -> dict:
 
 @router.get("/orders/{order_id}/ms-doc")
 def api_order_ms_doc(
-    order_id: int,
+    order_id: int = _id_path(),
     ctx: AuthContext = Depends(require_auth_api),
     db: Session = Depends(get_db),
 ):
@@ -353,7 +363,7 @@ def api_order_ms_doc(
 
 @router.post("/orders/{order_id}/push-to-ms")
 async def api_order_push_to_ms(
-    order_id: int,
+    order_id: int = _id_path(),
     ctx: AuthContext = Depends(require_owner_api),
     db: Session = Depends(get_db),
 ):

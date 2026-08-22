@@ -42,9 +42,12 @@ from app.ms_client import MoySkladClient
 
 log = logging.getLogger("oborot.ms_vendor")
 
-# Аддитивная мини-миграция: колонки orgs/users для баз, созданных до фичи
-# (паттерн routes_connect: вызов на импорте модуля, до include_router).
-ms_vendor.ensure_schema()
+# Аддитивная мини-миграция ms_vendor.ensure_schema() (колонки orgs/users для
+# баз, созданных до фичи) раньше запускалась прямо здесь, на импорте модуля —
+# до include_router, то есть до старта приложения (Д4, ревью 22.08): при
+# нескольких воркерах разом это роняло часть процессов ещё до первого
+# запроса. Теперь выполняется в db.init_db() вместе с остальными миграциями —
+# см. app/main.py:_startup.
 
 router = APIRouter()
 

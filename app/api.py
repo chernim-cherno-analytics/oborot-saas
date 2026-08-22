@@ -1,19 +1,31 @@
 """JSON API. Все эндпоинты — под сессией; данные строго текущей организации."""
+import hashlib
 import json
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Path
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app import analytics, lessons, ms_writeback, order_planner
+from app import analytics, lessons, ms_writeback
 from app.auth import AuthContext, require_auth_api, require_owner_api
 from app.crypto import encrypt_token
 from app.db import get_db
 from app.demo_seed import seed_demo
-from app.models import (Connection, Membership, OrderedQty, Product, Production,
-                        ProductionOrder, StockDay, User, Warehouse)
+from app.models import (
+    Connection,
+    Membership,
+    OrderedQty,
+    Org,
+    Product,
+    Production,
+    ProductionAssign,
+    ProductionOrder,
+    StockDay,
+    User,
+    Warehouse,
+)
 
 router = APIRouter(prefix="/api")
 
@@ -22,6 +34,17 @@ router = APIRouter(prefix="/api")
 # init_db на старте (паттерн — app/routes_connect.py): create_all с
 # checkfirst идемпотентен, свежую БД это не трогает.
 lessons.ensure_schema()
+
+# Границы для числовых id в пути: без них слишком большое число (например,
+# /api/orders/999999999999999999999) валит SQLite (OverflowError при попытке
+# положить его в INTEGER-колонку) вместо аккуратного 422.
+# ВАЖНО: один и тот же объект Path(...) нельзя переиспользовать для нескольких
+# параметров — FastAPI мутирует его .alias при разборе сигнатуры, и все
+# параметры, использующие общий экземпляр, получают alias первого из них
+# (в нашем случае все стали бы «order_id», ломая /warehouses/{warehouse_id}
+# и /productions/{pid}). Поэтому — фабрика, отдельный экземпляр на каждый вызов.
+def _id_path() -> int:
+    return Path(ge=1, le=2_147_483_647)
 
 
 # ── Аналитика ────────────────────────────────────────────────────────────────
@@ -34,6 +57,7 @@ def api_summary(ctx: AuthContext = Depends(require_auth_api), db: Session = Depe
 @router.get("/replenish")
 def api_replenish(ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)):
     data = analytics.build_replenish(analytics.get_snapshot(db, ctx.org))
+    apply_production_rules(db, ctx.org.id, data)
     # Для пустого состояния: какие заказы «В производстве» закрывают потребность.
     sent = db.execute(
         select(ProductionOrder.id, ProductionOrder.name)
@@ -52,6 +76,33 @@ def api_turnover(ctx: AuthContext = Depends(require_auth_api), db: Session = Dep
 @router.get("/stocks")
 def api_stocks(ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)):
     return analytics.build_stocks(analytics.get_snapshot(db, ctx.org))
+
+
+# ── Каталог ──────────────────────────────────────────────────────────────────
+
+def _known_base_names(db: Session, org_id: int, names) -> set[str]:
+    """Из присланных базовых имён — те, что реально есть в каталоге организации."""
+    wanted = {str(n or "").strip() for n in names if str(n or "").strip()}
+    if not wanted:
+        return set()
+    return set(db.execute(
+        select(Product.base_name).where(
+            Product.org_id == org_id, Product.base_name.in_(wanted)
+        ).distinct()
+    ).scalars())
+
+
+def _require_known_base(db: Session, org_id: int, base_name: str) -> str:
+    """Проверяет, что позиция есть в каталоге. Иначе — 404 вместо «ok»: раньше
+    такие запросы отвечали успехом, а запись потом нигде не появлялась."""
+    base = str(base_name or "").strip()
+    if base and base in _known_base_names(db, org_id, [base]):
+        return base
+    raise HTTPException(
+        status_code=404,
+        detail=f"Товара «{base_name}» нет в вашем каталоге. Проверьте название "
+               f"или дождитесь синхронизации со складом.",
+    )
 
 
 # ── Заказы на производство ───────────────────────────────────────────────────
@@ -74,9 +125,23 @@ class OrderItemIn(BaseModel):
 
 
 class OrderIn(BaseModel):
-    name: str = ""
+    name: str = Field(default="", max_length=120)
     eta_date: str | None = None
     items: list[OrderItemIn]
+    # «да, второй такой же заказ нужен» — осознанное повторение состава
+    # в обход защиты от случайного дубля (см. api_create_order).
+    allow_duplicate: bool = False
+
+    @field_validator("eta_date")
+    @classmethod
+    def _eta_date_valid(cls, v: str | None) -> str | None:
+        if v is None or v == "":
+            return None
+        try:
+            datetime.strptime(v, "%Y-%m-%d")
+        except ValueError:
+            raise ValueError("Дата прихода должна быть в формате ГГГГ-ММ-ДД")
+        return v
 
 
 def _order_out(order: ProductionOrder) -> dict:
@@ -91,118 +156,7 @@ def _order_out(order: ProductionOrder) -> dict:
         "positions": len(items),
         "total_qty": sum(int(i.get("qty") or 0) for i in items),
         "total_cost": round(sum(float(i.get("cost") or 0) * int(i.get("qty") or 0) for i in items)),
-        "production_id": order.production_id,
     }
-
-
-# ── Открытые заказы и календарь денег ────────────────────────────────────────
-# Аудит 22.08.2026: мастер считал заказ так, будто у организации нет других
-# обязательств. На практике «у меня есть 200 000» — это ДО того, как вспомнили
-# про два открытых заказа, по которым на следующей неделе платить остаток.
-# Поэтому: список открытых заказов по каналу (плашка в мастере) и сводный
-# календарь платежей ОРГАНИЗАЦИИ по неделям с накопительным сальдо.
-
-OPEN_STATUSES = ("draft", "sent")
-CASH_WEEKS = 16
-
-
-def _order_stages(db: Session, order: ProductionOrder, settings: dict) -> list[dict]:
-    """Этапы канала заказа (или один этап на общий срок производства)."""
-    raw = None
-    if order.production_id:
-        prod = db.get(Production, order.production_id)
-        if prod is not None:
-            raw = prod.stages
-    return order_planner.normalize_stages(raw, int(settings.get("lead_time_days") or 45))
-
-
-def _order_payments(db: Session, order: ProductionOrder, settings: dict) -> list[dict]:
-    """Календарь платежей по уже существующему заказу."""
-    cost = sum(float(i.get("cost") or 0) * int(i.get("qty") or 0) for i in order.items)
-    if cost <= 0:
-        return []
-    started = (order.created_at or datetime.utcnow()).date()
-    return order_planner.payment_plan(started, _order_stages(db, order, settings), cost)
-
-
-def _open_orders(db: Session, org_id: int) -> list[ProductionOrder]:
-    return db.execute(
-        select(ProductionOrder).where(
-            ProductionOrder.org_id == org_id,
-            ProductionOrder.status.in_(OPEN_STATUSES),
-        ).order_by(ProductionOrder.created_at.desc())
-    ).scalars().all()
-
-
-@router.get("/orders/open")
-def api_orders_open(
-    production_id: int | None = None,
-    ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db),
-):
-    """Что уже заказано и не закрыто — для плашки и колонки «Едет» в мастере.
-
-    production_id — фильтр по каналу; без него отдаём все открытые заказы.
-    by_base — сколько штук каждой модели уже лежит в открытых заказах: мастер
-    помечает такие строки, чтобы не заказать то же самое второй раз.
-    """
-    settings = analytics.extra_settings(ctx.org)
-    rows, out, by_base, total = _open_orders(db, ctx.org.id), [], {}, 0.0
-    for o in rows:
-        if production_id and (o.production_id or 0) != int(production_id):
-            continue
-        pays = _order_payments(db, o, settings)
-        left = sum(p["amount"] for p in pays if p["date"] >= date.today().isoformat())
-        total += left
-        for i in o.items:
-            base = str(i.get("base_name") or "")
-            if base:
-                by_base[base] = by_base.get(base, 0) + int(i.get("qty") or 0)
-        out.append({**_order_out(o), "payments": pays, "left_to_pay": round(left)})
-    return {"orders": out, "by_base": by_base, "left_to_pay": round(total),
-            "count": len(out), "today": date.today().isoformat()}
-
-
-def _week_start(d: date) -> date:
-    return d - timedelta(days=d.weekday())
-
-
-@router.get("/cash-calendar")
-def api_cash_calendar(
-    ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)
-):
-    """Платежи по всем открытым заказам организации, по неделям.
-
-    Текущий (ещё не созданный) заказ мастер добавляет в эту же сетку на клиенте —
-    поэтому здесь только то, что уже есть в базе.
-    """
-    settings = analytics.extra_settings(ctx.org)
-    today = date.today()
-    start = _week_start(today)
-    weeks = [{"start": (start + timedelta(days=7 * i)).isoformat(),
-              "end": (start + timedelta(days=7 * i + 6)).isoformat(),
-              "amount": 0, "items": []} for i in range(CASH_WEEKS)]
-    last = start + timedelta(days=7 * CASH_WEEKS - 1)
-    overdue = {"amount": 0, "items": []}
-    for o in _open_orders(db, ctx.org.id):
-        for p in _order_payments(db, o, settings):
-            d = date.fromisoformat(p["date"])
-            item = {"order_id": o.id, "name": o.name, "label": p["label"],
-                    "date": p["date"], "amount": p["amount"]}
-            if d < start:
-                overdue["amount"] += p["amount"]
-                overdue["items"].append(item)
-                continue
-            if d > last:
-                continue
-            w = weeks[(d - start).days // 7]
-            w["amount"] += p["amount"]
-            w["items"].append(item)
-    running = overdue["amount"]
-    for w in weeks:
-        running += w["amount"]
-        w["cumulative"] = running
-    return {"weeks": weeks, "overdue": overdue, "total": running,
-            "week_start": start.isoformat(), "today": today.isoformat()}
 
 
 @router.get("/orders")
@@ -215,28 +169,111 @@ def api_orders(ctx: AuthContext = Depends(require_auth_api), db: Session = Depen
     return {"orders": [_order_out(o) for o in orders]}
 
 
+# Окно защиты от случайного повтора заказа. Двойной тап на телефоне, ретрай
+# при дрожащей связи и повторная отправка формы укладываются в эти минуты, а
+# осознанный второй такой же заказ человек делает не за две минуты — и если
+# всё-таки делает, ему достаточно изменить название (см. ответ ниже).
+ORDER_DEDUP_WINDOW_SEC = 120
+
+_DUPLICATE_ORDER_MESSAGE = (
+    "Такой же заказ уже создан только что — показываем его, чтобы на производство "
+    "не ушёл дубль. Если второй такой заказ нужен на самом деле, измените название "
+    "заказа и отправьте снова."
+)
+
+
+def _order_fingerprint(name: str, eta_date: str | None, items: list[dict]) -> str:
+    """Отпечаток заказа: название, срок и позиции с количествами по размерам.
+
+    Себестоимость в отпечаток не входит — она подставляется из справочника и
+    к вопросу «это тот же самый заказ или другой» отношения не имеет.
+    """
+    rows = sorted(
+        [
+            str(i.get("base_name") or ""),
+            int(i.get("qty") or 0),
+            sorted((str(k), int(v or 0)) for k, v in (i.get("sizes") or {}).items()),
+        ]
+        for i in items
+    )
+    raw = json.dumps([str(name or ""), eta_date or "", rows], ensure_ascii=False)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _find_twin_order(db: Session, org_id: int, fingerprint: str, before_id: int | None = None):
+    """Ищет такой же заказ, созданный в окне защиты от повтора.
+
+    before_id — искать только среди более ранних заказов: так два запроса,
+    пришедшие одновременно, договариваются без блокировок (остаётся заказ с
+    меньшим id).
+
+    Принятый на склад (received) заказ в поиск не входит: это уже история,
+    и повтор того же состава после приёмки почти наверняка значит «нужен
+    новый такой же заказ», а не «я по ошибке продублировал форму». Раньше
+    склейка с received-заказом отдавала клиенту уже принятый заказ, на
+    который дальше пытались перевести статус «В производстве» — переход
+    received → sent запрещён, и человек получал 422 не по делу.
+    """
+    since = datetime.utcnow() - timedelta(seconds=ORDER_DEDUP_WINDOW_SEC)
+    q = select(ProductionOrder).where(
+        ProductionOrder.org_id == org_id,
+        ProductionOrder.created_at >= since,
+        ProductionOrder.status != "received",
+    )
+    if before_id is not None:
+        q = q.where(ProductionOrder.id < before_id)
+    for o in db.execute(q.order_by(ProductionOrder.id)).scalars():
+        if _order_fingerprint(o.name, o.eta_date, o.items) == fingerprint:
+            return o
+    return None
+
+
 @router.post("/orders")
 def api_create_order(
     body: OrderIn, ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)
 ):
+    """Создаёт заказ на производство. Повторная отправка того же заказа в
+    течение пары минут не плодит дубли: возвращается уже созданный заказ.
+
+    Осознанный второй такой же заказ делается либо другим названием, либо
+    полем allow_duplicate=true в теле запроса.
+    """
     items = [i for i in body.items if i.qty > 0]
     if not items:
         raise HTTPException(status_code=422, detail="В заказе нет позиций с количеством > 0")
+    # Позиций, которых нет в каталоге организации, в заказе быть не может —
+    # иначе создаётся «призрачная» позиция, для которой ниже неоткуда взять
+    # свою себестоимость, и сервер был вынужден верить присланной клиентом.
+    known = _known_base_names(db, ctx.org.id, [i.base_name for i in items])
+    unknown = sorted({i.base_name for i in items if i.base_name not in known})
+    if unknown:
+        raise HTTPException(
+            status_code=404,
+            detail="Такого товара нет в вашем каталоге: "
+                   + ", ".join(f"«{b}»" for b in unknown)
+                   + ". Проверьте название или дождитесь синхронизации со складом.",
+        )
     name = body.name.strip() or f"Заказ от {datetime.now():%d.%m.%Y}"
-    # Себестоимость берём из БД (клиентской не доверяем), клиентская — фолбэк.
+    # Себестоимость всегда берём из БД, присланной клиентом не доверяем ни при
+    # каких обстоятельствах (раньше для позиций вне каталога это правило не
+    # действовало — теперь такие позиции отсеяны проверкой выше).
     cost_by_base = {
         p.base_name: float(p.cost_price or 0)
         for p in db.execute(
             select(Product).where(Product.org_id == ctx.org.id)
         ).scalars()
-        if p.cost_price
     }
     payload = []
     for i in items:
         d = i.model_dump()
-        if cost_by_base.get(i.base_name):
-            d["cost"] = cost_by_base[i.base_name]
+        d["cost"] = cost_by_base.get(i.base_name, 0.0)
         payload.append(d)
+    fingerprint = _order_fingerprint(name, body.eta_date, payload)
+    if not body.allow_duplicate:
+        twin = _find_twin_order(db, ctx.org.id, fingerprint)
+        if twin is not None:
+            return {"ok": True, "id": twin.id, "status": twin.status,
+                    "duplicate": True, "message": _DUPLICATE_ORDER_MESSAGE}
     order = ProductionOrder(
         org_id=ctx.org.id,
         name=name,
@@ -248,6 +285,15 @@ def api_create_order(
     # ВАЖНО (фикс P0): черновик НЕ попадает в «едет к нам» — рекомендации
     # «Что заказать» уменьшаются только после перевода заказа «В производство».
     db.commit()
+    if not body.allow_duplicate:
+        # Два одновременных запроса могли не увидеть друг друга до вставки:
+        # тот, у кого id больше, убирает свой заказ и отдаёт чужой.
+        twin = _find_twin_order(db, ctx.org.id, fingerprint, before_id=order.id)
+        if twin is not None:
+            db.delete(order)
+            db.commit()
+            return {"ok": True, "id": twin.id, "status": twin.status,
+                    "duplicate": True, "message": _DUPLICATE_ORDER_MESSAGE}
     analytics.invalidate(ctx.org.id)
     return {"ok": True, "id": order.id, "status": "draft"}
 
@@ -271,8 +317,8 @@ class OrderStatusIn(BaseModel):
 
 @router.post("/orders/{order_id}/status")
 def api_order_status(
-    order_id: int,
     body: OrderStatusIn,
+    order_id: int = _id_path(),
     ctx: AuthContext = Depends(require_auth_api),
     db: Session = Depends(get_db),
 ):
@@ -288,6 +334,11 @@ def api_order_status(
     order = db.get(ProductionOrder, order_id)
     if order is None or order.org_id != ctx.org.id:
         raise HTTPException(status_code=404, detail="Заказ не найден")
+    if body.status == order.status:
+        # Повторная отправка того же статуса (двойной клик, ретрай запроса,
+        # заказ, отданный защитой от дубля) ничего не меняет и не считается
+        # ошибкой — иначе «едет к нам» посчиталось бы дважды.
+        return {"ok": True, "status": order.status, "unchanged": True}
     allowed = {("draft", "sent"), ("sent", "received")}
     if (order.status, body.status) not in allowed:
         raise HTTPException(
@@ -307,7 +358,7 @@ def api_order_status(
 
 @router.delete("/orders/{order_id}")
 def api_order_delete(
-    order_id: int, ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)
+    order_id: int = _id_path(), ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)
 ):
     """Удаление заказа: draft — свободно; sent — с вычетом из «едет»; received — нельзя."""
     order = db.get(ProductionOrder, order_id)
@@ -327,7 +378,7 @@ def api_order_delete(
 
 @router.get("/orders/{order_id}")
 def api_order_detail(
-    order_id: int, ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)
+    order_id: int = _id_path(), ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)
 ):
     order = db.get(ProductionOrder, order_id)
     if order is None or order.org_id != ctx.org.id:
@@ -345,6 +396,7 @@ def api_set_ordered(
     body: OrderedIn, ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)
 ):
     """Ручная правка «едет к нам» (перезапись значения по базовому имени)."""
+    _require_known_base(db, ctx.org.id, body.base_name)
     row = db.get(OrderedQty, (ctx.org.id, body.base_name))
     if row is None:
         db.add(OrderedQty(org_id=ctx.org.id, base_name=body.base_name, qty=body.qty))
@@ -450,15 +502,7 @@ def api_update_settings(
     body: SettingsIn, ctx: AuthContext = Depends(require_owner_api), db: Session = Depends(get_db)
 ):
     org = db.merge(ctx.org)
-    # Поверх сырых настроек, а не только известных ключей: Org.settings отдаёт
-    # три поля из DEFAULT_SETTINGS, и любое сохранение затирало бы всё
-    # остальное, что клали туда другие разделы (правило распределения, типы
-    # цен, пики). Сначала берём то, что реально лежит в БД.
-    try:
-        settings = json.loads(org.settings_json or "{}")
-    except ValueError:
-        settings = {}
-    settings.update(org.settings)
+    settings = org.settings
     if body.thresholds is not None:
         t = body.thresholds
         if not t.weak < t.dull < t.good:
@@ -545,7 +589,7 @@ def api_set_exclusion(
 
 @router.post("/warehouses/{warehouse_id}/toggle")
 def api_toggle_warehouse(
-    warehouse_id: int, ctx: AuthContext = Depends(require_owner_api), db: Session = Depends(get_db)
+    warehouse_id: int = _id_path(), ctx: AuthContext = Depends(require_owner_api), db: Session = Depends(get_db)
 ):
     wh = db.get(Warehouse, warehouse_id)
     if wh is None or wh.org_id != ctx.org.id:
@@ -810,7 +854,17 @@ def api_prefs_hints(
 # ── Производства: основное + добавляемые (Китай / Москва / Екатеринбург…) ────
 
 class ProductionIn(BaseModel):
+    """Производство: имя + необязательные условия подрядчика.
+
+    Все три условия опциональны и «стираемы»: не прислали ключ — значение не
+    трогаем, прислали null или 0 — возвращаем к «как в общих настройках»
+    (срок) / «ограничения нет» (партия, кратность).
+    """
+
     name: str = Field(min_length=1, max_length=120)
+    lead_time_days: int | None = Field(default=None, ge=0, le=365)
+    moq: int | None = Field(default=None, ge=0, le=100_000)
+    pack_multiple: int | None = Field(default=None, ge=0, le=10_000)
     # Этапы канала сразу при создании: turnkey (Китай под ключ) |
     # fabric_sewing (своё производство: ткань → пошив). Можно задать позже.
     preset: str | None = None
@@ -819,7 +873,163 @@ class ProductionIn(BaseModel):
 
 class ProductionAssignIn(BaseModel):
     base_name: str = Field(min_length=1, max_length=255)
-    production_id: int | None = None  # None = вернуть на основное производство
+    # None = вернуть на основное производство; границы — как у id в пути,
+    # иначе слишком большое число валит SQLite (OverflowError) вместо 422
+    production_id: int | None = Field(default=None, ge=1, le=2_147_483_647)
+
+
+# Потребность ниже этой доли минимальной партии — «заказывать невыгодно»:
+# фабрика примет только партию целиком, и человек должен решить сам, стоит ли
+# везти 30 штук ради двух проданных.
+MOQ_LOW_SHARE = 0.5
+
+
+def round_to_batch(qty: int, moq: int = 0, multiple: int = 0) -> int:
+    """Количество к заказу с учётом минимальной партии и кратности упаковки.
+
+    Округляем ТОЛЬКО вверх: меньше минимальной партии фабрика не примет, а
+    некратное упаковке количество придётся добивать всё равно. qty <= 0
+    остаётся нулём — позиции, которую заказывать не нужно, партия не касается.
+    """
+    if qty <= 0:
+        return 0
+    out = max(int(qty), int(moq or 0))
+    step = int(multiple or 0)
+    if step > 1:
+        out = -(-out // step) * step
+    return out
+
+
+def production_conditions(db: Session, org_id: int) -> dict:
+    """Условия производств организации и привязка позиций к ним.
+
+    Возвращает {"main_id", "by_id": {id: производство}, "assign": {позиция: id}}.
+    Позиции без записи в assign (и с записью на удалённое производство) —
+    на основном.
+    """
+    prods = db.execute(
+        select(Production).where(Production.org_id == org_id)
+    ).scalars().all()
+    main = next((p for p in prods if p.is_main), None)
+    by_id = {p.id: p for p in prods}
+    # Привязка берётся ИТОГОВАЯ (правило распределения + ручные назначения
+    # поверх него), а не только ручная: позиция, отданная цеху правилом, должна
+    # считаться по срокам и минимальной партии ЭТОГО цеха, иначе условия
+    # производства расходятся с тем, за каким цехом позиция числится на экране.
+    from app import assign_rules
+
+    org = db.get(Org, org_id)
+    if org is not None:
+        assign = {
+            base: pid
+            for base, pid in assign_rules.effective_assign(db, org).items()
+            if pid in by_id
+        }
+    else:  # организация исчезла — читаем хотя бы ручные записи
+        assign = {
+            a.base_name: a.production_id
+            for a in db.execute(
+                select(ProductionAssign).where(ProductionAssign.org_id == org_id)
+            ).scalars()
+            if a.production_id in by_id
+        }
+    return {"main_id": main.id if main else None, "by_id": by_id, "assign": assign}
+
+
+def apply_production_rules(db: Session, org_id: int, data: dict) -> dict:
+    """Досчитывает ответ «Заказа» по условиям производства каждой позиции.
+
+    Что добавляется каждой позиции:
+      production_id / production_name — за каким цехом она закреплена;
+      lead_time_days — срок ЭТОГО производства (или общий из настроек);
+      moq / pack_multiple — его минимальная партия и кратность (0 = нет);
+      need_raw — сколько было по расчёту ДО округления;
+      need — сколько получилось после округления вверх (в него же приводится
+      размерная сетка: сумма по размерам обязана равняться итогу позиции,
+      поэтому она пересобирается тем же analytics.size_split);
+      moq_applied — число выросло из-за партии/кратности, а не само по себе;
+      moq_low — потребность сильно ниже минимальной партии: заказывать
+      невыгодно, решение за человеком.
+
+    Срок производства на сами метрики (прогнозный остаток, стокаут, «дыра»)
+    пока НЕ влияет: эта математика живёт в app/analytics.py — см. отчёт.
+    """
+    default_lead = int(data.get("lead_time_days") or analytics.DEFAULT_LEAD_TIME_DAYS)
+    cond = production_conditions(db, org_id)
+    items = data.get("items") or []
+    # Считает ли аналитика прогноз остатка/стокаут по сроку КОНКРЕТНОГО
+    # производства: признак — она сама вернула срок у позиции. Пока нет —
+    # страница «Заказа» не выдаёт срок подрядчика за срок, по которому
+    # посчитан прогнозный остаток (см. отчёт: правка в app/analytics.py).
+    data["lead_time_by_production"] = bool(items) and all(
+        "lead_time_days" in it for it in items
+    )
+    for item in items:
+        prod = cond["by_id"].get(cond["assign"].get(item["base_name"], cond["main_id"]))
+        moq = int(getattr(prod, "moq", 0) or 0)
+        step = int(getattr(prod, "pack_multiple", 0) or 0)
+        item["production_id"] = prod.id if prod else None
+        item["production_name"] = prod.name if prod else ""
+        item["lead_time_days"] = int(getattr(prod, "lead_time_days", 0) or 0) or default_lead
+        item["moq"] = moq
+        item["pack_multiple"] = step
+        need_raw = int(item["need"])
+        need = round_to_batch(need_raw, moq, step)
+        item["need_raw"] = need_raw
+        item["need"] = need
+        item["moq_applied"] = need != need_raw
+        item["moq_low"] = bool(moq and need_raw < moq * MOQ_LOW_SHARE)
+        if need != need_raw:
+            # Размерная сетка пересобирается тем же largest-remainder, что и
+            # исходная рекомендация, — иначе сумма по размерам разошлась бы с
+            # итогом позиции (и с итогом страницы).
+            rec = analytics.size_split(item.get("sizes") or {}, need)
+            for size, cell in (item.get("sizes") or {}).items():
+                cell["rec"] = rec.get(size, 0)
+            avg_price = item.get("avg_price") or 0
+            item["profit_potential"] = round(
+                max(0, avg_price - (item.get("cost_price") or 0)) * need
+            )
+    return data
+
+
+def _production_out(p, fallback_lead: int) -> dict:
+    """Производство для фронта: условия подрядчика + этапы «Мастера».
+
+    Слияние 22.08: до слияния было две функции с этим именем — наша (срок,
+    минимальная партия, кратность; пустое отдаём нулями — «не задано») и их
+    (этапы производства, суммарный срок, ритм, предоплата). Ключи не
+    пересекаются, поэтому отдаём один объект с обоими наборами полей:
+    lead_time_days — СОБСТВЕННЫЙ срок цеха (0 = «как в общих настройках»),
+    lead_days — суммарный срок по этапам, уже с подставленным fallback_lead.
+    """
+    from app import order_planner
+    stages = order_planner.normalize_stages(p.stages, fallback_lead)
+    return {
+        "id": p.id,
+        "name": p.name,
+        "is_main": p.is_main,
+        "lead_time_days": int(p.lead_time_days or 0),
+        "moq": int(p.moq or 0),
+        "pack_multiple": int(p.pack_multiple or 0),
+        "stages": stages,
+        "lead_days": order_planner.lead_days(stages),
+        "moq_units": int(p.moq_units or 0),
+        "cadence_days": int(p.cadence_days or 0),
+        "prepay_now_share": round(order_planner.prepay_share_total(stages), 4),
+        "staged": len(stages) > 1,
+    }
+
+
+def _apply_production_in(p, body: ProductionIn) -> None:
+    """Переносит присланные условия в производство (0/null = «не задано»)."""
+    sent = body.model_fields_set
+    if "lead_time_days" in sent:
+        p.lead_time_days = int(body.lead_time_days) if body.lead_time_days else None
+    if "moq" in sent:
+        p.moq = int(body.moq) if body.moq else None
+    if "pack_multiple" in sent:
+        p.pack_multiple = int(body.pack_multiple) if body.pack_multiple else None
 
 
 def _ensure_main_production(db: Session, org_id: int):
@@ -861,19 +1071,25 @@ def api_productions(ctx: AuthContext = Depends(require_auth_api), db: Session = 
         "assign_manual": {a.base_name: a.production_id for a in assigns if a.production_id in valid},
         "assign_source": rule["assign_source"],
         "assign_map": rule["assign_map"],
+        # чем считается позиция, у производства которой срок не задан
+        "default_lead_time_days": fallback_lead,
     }
 
 
 @router.post("/productions")
 def api_production_create(
-    body: ProductionIn, ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)
+    body: ProductionIn, ctx: AuthContext = Depends(require_owner_api), db: Session = Depends(get_db)
 ):
-    """Добавить дополнительное производство (если заказами занимается другой отдел)."""
+    """Добавить дополнительное производство (если заказами занимается другой отдел).
+
+    Только владелец: срок, минимальная партия и кратность нового цеха меняют
+    рекомендации и суммы заказов всей организации — как и настройки."""
     from app.models import Production
     _ensure_main_production(db, ctx.org.id)
     from app import order_planner
     fallback_lead = analytics.extra_settings(ctx.org)["lead_time_days"]
     p = Production(org_id=ctx.org.id, name=body.name.strip(), is_main=False)
+    _apply_production_in(p, body)
     if body.preset:
         raw = order_planner.STAGE_PRESETS.get(body.preset)
         if raw is None:
@@ -886,6 +1102,7 @@ def api_production_create(
     db.add(p)
     db.commit()
     db.refresh(p)
+    analytics.invalidate(ctx.org.id)
     return _production_out(p, fallback_lead)
 
 
@@ -929,11 +1146,7 @@ def api_assign_rule(
     bad = [str(v) for v in body.assign_map.values() if v not in valid]
     if bad:
         raise HTTPException(422, "В правиле указаны неизвестные производства: " + ", ".join(bad))
-    try:
-        settings = json.loads(org.settings_json or "{}")
-    except ValueError:
-        settings = {}
-    settings.update(org.settings)
+    settings = org.settings
     settings.update(analytics.extra_settings(org))
     settings["assign_source"] = body.assign_source
     settings["assign_map"] = {str(k): int(v) for k, v in body.assign_map.items()}
@@ -951,10 +1164,16 @@ def api_assign_rule(
 @router.post("/productions/assign")
 def api_production_assign(
     body: ProductionAssignIn,
-    ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db),
+    ctx: AuthContext = Depends(require_owner_api), db: Session = Depends(get_db),
 ):
-    """Перенести позицию на производство (production_id=null — на основное)."""
+    """Перенести позицию на производство (production_id=null — на основное).
+
+    Вместе с позицией меняются её условия (срок производства, минимальная
+    партия, кратность), поэтому сбрасываем кэш аналитики. Право — как у
+    настроек: только владелец организации.
+    """
     from app.models import Production, ProductionAssign
+    _require_known_base(db, ctx.org.id, body.base_name)
     row = db.get(ProductionAssign, (ctx.org.id, body.base_name))
     # production_id = null означает «снять ручное назначение»: позиция снова
     # подчиняется правилу распределения (а если правила нет — основному
@@ -980,24 +1199,35 @@ def api_production_assign(
 
 @router.post("/productions/{pid}")
 def api_production_rename(
-    pid: int, body: ProductionIn,
-    ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db),
+    body: ProductionIn,
+    pid: int = _id_path(),
+    ctx: AuthContext = Depends(require_owner_api), db: Session = Depends(get_db),
 ):
-    """Переименовать производство (основное — тоже можно)."""
+    """Переименовать производство и задать его условия (основное — тоже можно).
+
+    Срок производства, минимальная партия и кратность влияют на рекомендации
+    «Заказа», поэтому сбрасываем кэш аналитики. Право — как у настроек: менять
+    условия, от которых зависят деньги всей организации, может только владелец.
+    """
     from app.models import Production
     p = db.get(Production, pid)
     if p is None or p.org_id != ctx.org.id:
         raise HTTPException(404, "Производство не найдено")
     p.name = body.name.strip()
+    _apply_production_in(p, body)
     db.commit()
-    return {"id": p.id, "name": p.name, "is_main": p.is_main}
+    analytics.invalidate(ctx.org.id)
+    return _production_out(p, analytics.extra_settings(ctx.org)["lead_time_days"])
 
 
 @router.delete("/productions/{pid}")
 def api_production_delete(
-    pid: int, ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)
+    pid: int = _id_path(), ctx: AuthContext = Depends(require_owner_api), db: Session = Depends(get_db)
 ):
-    """Удалить дополнительное производство; его позиции возвращаются на основное."""
+    """Удалить дополнительное производство; его позиции возвращаются на основное.
+
+    Только владелец: позиции цеха возвращаются на основное производство, то
+    есть меняются условия и суммы заказов всей организации."""
     from app.models import Production, ProductionAssign
     p = db.get(Production, pid)
     if p is None or p.org_id != ctx.org.id:
@@ -1009,6 +1239,8 @@ def api_production_delete(
     ).delete()
     db.delete(p)
     db.commit()
+    # позиции вернулись на основное производство — с его сроком и партией
+    analytics.invalidate(ctx.org.id)
     return {"ok": True}
 
 
@@ -1019,6 +1251,7 @@ def api_add_ordered(
     """«Заказ отправлен» со страницы «Заказ отдельной позиции»: ПРИБАВЛЯЕТ
     количество к «едет к нам» (в отличие от /ordered, который перезаписывает).
     Приёмка в МойСкладе или received-статус заказа спишут это количество."""
+    _require_known_base(db, ctx.org.id, body.base_name)
     row = db.get(OrderedQty, (ctx.org.id, body.base_name))
     if row is None:
         db.add(OrderedQty(org_id=ctx.org.id, base_name=body.base_name, qty=max(0, body.qty)))
@@ -1043,7 +1276,6 @@ class OrderPlanIn(BaseModel):
     cadence_days: int | None = None        # как часто размещаются заказы
     safety_days: int | None = None
     strategy: str | None = None            # protect | balance | grow
-    width_days: int | None = None          # сколько дней продаж закрывает строка (0 = всю потребность)
     max_share_pct: int | None = None
     moq_units: int | None = None
     reserve_new_pct: int | None = None
@@ -1067,14 +1299,7 @@ def _plan(db: Session, ctx: AuthContext, body: OrderPlanIn) -> dict:
 
 
 def _apply_overrides(plan: dict, overrides: dict, snap: dict) -> None:
-    """Ручные правки количеств поверх расчёта.
-
-    Аудит 22.08.2026: раньше пересчитывались только строки и итоги, а календарь
-    платежей, «хватит до», «упущено» и чувствительность оставались от исходного
-    расчёта — после правки 10 → 5000 календарь расходился с планом на 20,1 млн ₽.
-    Теперь правка пересобирает ВСЁ, что зависит от количеств.
-    """
-    from app import order_planner as op
+    """Ручные правки количеств поверх расчёта (строки плана и итоги)."""
     from app.analytics import size_split
     items = {i["base_name"]: i for i in plan["items"]}
     for base, qty in overrides.items():
@@ -1087,71 +1312,26 @@ def _apply_overrides(plan: dict, overrides: dict, snap: dict) -> None:
             continue
         it["qty"] = qty
         it["unmet"] = max(0, it["need"] - qty)
-        it["over_need"] = max(0, qty - it["need"])
         it["cost_total"] = round(qty * it["cost_price"])
+        it["pay_now"] = round(it["cost_total"] * (plan["pay_now"] / plan["cost_total"])) \
+            if plan.get("cost_total") else it["cost_total"]
         it["expected_profit"] = round(qty * max(0, it["avg_price"] - it["cost_price"]))
         src = (snap["items"].get(base) or {}).get("sizes") or {}
         it["sizes"] = size_split(src, qty)
-        rate = it.get("rate") or 0
-        it["days_to_sell"] = int(qty / rate) if rate > 0 else None
-        it["covered_until"] = (
-            (date.fromisoformat(plan["eta_date"])
-             + timedelta(days=min(int((it["proj_stock"] + qty) / rate), 3650))).isoformat()
-            if rate > 0 else None
-        )
         it["why"] = list(dict.fromkeys(list(it.get("why") or []) + ["manual"]))
         it["why_text"] = "изменено вручную"
     plan["items"] = [i for i in plan["items"] if i["qty"] > 0]
     plan["cost_total"] = sum(i["cost_total"] for i in plan["items"])
-    # Календарь платежей пересобираем от новой себестоимости, «сейчас» —
-    # снова первый транш календаря, а не отдельная формула.
-    stages = plan.get("stages") or []
-    plan["payments"] = op.payment_plan(
-        date.fromisoformat(plan["order_date"]),
-        [{"name": st["name"], "lead_days": st["lead_days"],
-          "cost_share": st["cost_share"], "prepay_share": st.get("prepay_share", 1.0)}
-         for st in stages],
-        plan["cost_total"],
-    )
-    plan["pay_now"] = plan["payments"][0]["amount"] if plan["payments"] else plan["cost_total"]
+    plan["pay_now"] = sum(i["pay_now"] for i in plan["items"])
     plan["pay_later"] = max(0, plan["cost_total"] - plan["pay_now"])
     plan["spent"] = plan["pay_now"] if plan["budget_scope"] == "now" else plan["cost_total"]
     plan["rest"] = plan["budget"] - plan["reserve_new"] - plan["spent"]
-    plan["over_need_cost"] = sum(round(i["over_need"] * i["cost_price"]) for i in plan["items"])
-    plan["over_need_profit"] = sum(
-        round(i["over_need"] * max(0, i["avg_price"] - i["cost_price"])) for i in plan["items"])
-    plan["covered_until"] = min(
-        (i["covered_until"] for i in plan["items"] if i["covered_until"]), default=None)
-    plan["covered_full"] = sum(
-        1 for i in plan["items"]
-        if i["covered_until"] and i["covered_until"] >= (plan.get("covered_until_target") or ""))
-    if isinstance(plan.get("lost"), dict):
-        short = sum(round(i["unmet"] * max(0, i["avg_price"] - i["cost_price"]))
-                    for i in plan["items"])
-        plan["lost"]["short"] = short
-        cover = plan.get("cover_days") or 1
-        share = min(1.0, (plan["lost"].get("next_order_days") or cover) / cover)
-        plan["lost"]["at_risk"] = round((plan["lost"]["missing"] + short) * share)
     plan["totals"] = {
         "positions": len(plan["items"]),
         "units": sum(i["qty"] for i in plan["items"]),
         "expected_profit": sum(i["expected_profit"] for i in plan["items"]),
         "expected_revenue": sum(i["qty"] * i["avg_price"] for i in plan["items"]),
     }
-    # «А если добавить денег» после ручных правок отвечает на другой вопрос —
-    # честнее не показывать, чем показывать устаревшее.
-    plan.pop("sensitivity", None)
-    stop = []
-    if not plan["items"] and not plan.get("new_items"):
-        stop.append({"code": "empty", "text": "В плане нет позиций"})
-    if plan["rest"] < 0:
-        stop.append({"code": "over_budget", "text":
-                     f"Заказ выходит за бюджет на {op.fmt_rub(-plan['rest'])}"})
-    if plan["order_date"] < plan["today"]:
-        stop.append({"code": "past_date", "text":
-                     f"Заказ пришлось бы разместить {plan['order_date']} — эта дата уже прошла."})
-    plan["stop"] = stop
-    plan["can_create"] = not stop
     plan["manual_edit"] = True
 
 
@@ -1212,7 +1392,7 @@ def api_order_plan_save(
         ),
         result_json=json.dumps(
             {"items": plan["items"], "totals": plan["totals"],
-             "spent": plan["spent"], "lost": plan.get("lost")},
+             "spent": plan["spent"], "lost_revenue": plan["lost_revenue"]},
             ensure_ascii=False,
         ),
     )
@@ -1239,42 +1419,10 @@ def api_order_plan_last(
 
 class PlanApplyIn(BaseModel):
     name: str = Field(default="", max_length=255)
-    # Явное «да, это новый заказ» — снимает защиту от дубля.
-    force: bool = False
     # Осознанное согласие оформить заказ по плану, посчитанному на неполной
     # истории (первичная загрузка ещё идёт). Предпросмотр остаётся открытым,
     # но превращение плана в заказ на производство — деньги, тут спрашиваем.
     confirm_partial: bool = False
-
-
-DUP_OVERLAP = 0.6      # доля совпадающих позиций, при которой это похоже на дубль
-DUP_WINDOW_DAYS = 14   # и только среди свежих открытых заказов
-
-
-def _find_duplicate_order(db: Session, org_id: int, production_id, bases: set) -> dict | None:
-    """Есть ли уже открытый заказ того же канала с тем же составом."""
-    if not bases:
-        return None
-    since = datetime.utcnow() - timedelta(days=DUP_WINDOW_DAYS)
-    rows = db.execute(
-        select(ProductionOrder).where(
-            ProductionOrder.org_id == org_id,
-            ProductionOrder.status.in_(("draft", "sent")),
-            ProductionOrder.created_at >= since,
-        ).order_by(ProductionOrder.created_at.desc())
-    ).scalars().all()
-    for o in rows:
-        if production_id and o.production_id and o.production_id != int(production_id):
-            continue
-        other = {str(i.get("base_name")) for i in o.items}
-        if not other:
-            continue
-        overlap = len(bases & other)
-        if overlap / max(1, len(bases)) >= DUP_OVERLAP:
-            return {"id": o.id, "name": o.name, "overlap": overlap,
-                    "created": o.created_at.strftime("%d.%m") if o.created_at else "",
-                    "status_text": "черновик" if o.status == "draft" else "в производстве"}
-    return None
 
 
 @router.post("/order-plan/{plan_id}/apply")
@@ -1319,24 +1467,10 @@ def api_order_plan_apply(
                           "sizes": {}, "cost": float(n.get("cost") or 0)})
     if not items:
         raise HTTPException(422, "В плане нет позиций с количеством > 0")
-    pid = brief.get("production_id")
-    # Защита от дубля. Аудит 22.08: кнопку «Создать заказ» можно было нажимать
-    # сколько угодно раз, и каждый клик делал новый заказ — на потоке это
-    # оплаченный дважды заказ. 409 у самого плана защищал только повторное
-    # применение ОДНОГО плана, а мастер каждый раз создавал новый.
-    if not body.force:
-        dup = _find_duplicate_order(db, ctx.org.id, pid, {i["base_name"] for i in items})
-        if dup is not None:
-            raise HTTPException(409, (
-                f"Похоже, такой заказ уже есть: №{dup['id']} «{dup['name']}» от "
-                f"{dup['created']} ({dup['status_text']}), {dup['overlap']} из "
-                f"{len(items)} позиций совпадают. Проверьте его на странице «Заказ» — "
-                f"или подтвердите, что это новый заказ."))
     order = ProductionOrder(
         org_id=ctx.org.id,
         name=(body.name.strip() or f"Заказ от {datetime.now():%d.%m.%Y}"),
         eta_date=brief.get("eta_date"),
-        production_id=int(pid) if pid else None,
         status="draft",
         items_json=json.dumps(items, ensure_ascii=False),
     )
@@ -1392,16 +1526,3 @@ def api_production_setup(
     analytics.invalidate(ctx.org.id)
     return _production_out(p, analytics.extra_settings(ctx.org)["lead_time_days"])
 
-
-def _production_out(p, fallback_lead: int) -> dict:
-    from app import order_planner
-    stages = order_planner.normalize_stages(p.stages, fallback_lead)
-    return {
-        "id": p.id, "name": p.name, "is_main": p.is_main,
-        "stages": stages,
-        "lead_days": order_planner.lead_days(stages),
-        "moq_units": int(p.moq_units or 0),
-        "cadence_days": int(p.cadence_days or 0),
-        "prepay_now_share": round(order_planner.prepay_share_total(stages), 4),
-        "staged": len(stages) > 1,
-    }

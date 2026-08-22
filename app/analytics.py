@@ -9,8 +9,15 @@
 - sea — сезонная оборачиваемость (правило legacy): для каждого из 4 сезонов
   ₽/день = нетто-выручка сезонных месяцев / дни в стоке в эти месяцы (окно 365);
 - wos = cs/(rate*7); stockout_date = today + cs/rate;
+- второй денежный слой (для финансиста, поверх розничного, ничего не заменяет):
+  stock_cost = cs×себестоимость («сколько денег заморожено»), margin_unit /
+  margin_pct — валовая маржа на штуке от средней фактической цены, gross_margin
+  = нетто-выручка − себестоимость проданного. Позиции без себестоимости
+  помечены no_cost, их маржинальные поля = None и в агрегаты они не входят;
+- below_cost/loss_* — «торгуем в минус»: средняя фактическая цена продажи ниже
+  себестоимости; порог значимости — тот же low_data (MIN_SIGNIF_*);
 - need = rate*horizon − proj_stock, где proj_stock = max(0, cs + ordered −
-  rate*lead_time) — ПРОГНОЗ остатка на дату прихода заказа (правило legacy
+  rate*lead) — ПРОГНОЗ остатка на дату прихода заказа (правило legacy
   /order: за срок производства часть стока продастся; считать потребность от
   сегодняшнего остатка — значит систематически занижать заказ на rate×lead).
 
@@ -19,13 +26,35 @@
 - 'd90'    — rate_90 = нетто-продажи за 90 дн / дни в стоке за 90 дн;
 - 'season' — rate_season: аналогичное сезонное окно прошлого года
   [today+lead−365; today+lead+horizon−365] — темп периода, НА который
-  заказываем (заказ приедет через lead_time_days и будет продаваться horizon
-  дней). Если истории за окно нет — фолбэк на rate_year с season_fallback=True.
-Порог min_stock_days («день в стоке») применяется во всех окнах.
+  заказываем (заказ приедет через срок производства и будет продаваться
+  horizon дней).
+Порог min_stock_days («день в стоке») применяется во всех окнах, поэтому
+«дней в стоке = 0» ещё не значит «товара не было»: позиция могла лежать
+ниже порога (1–2 шт при пороге 3). Эти два случая разведены по дням
+ФИЗИЧЕСКОГО наличия в окне (instock90 — дни с остатком хотя бы 1 шт):
+- дней наличия нет вовсе (распродано в ноль) — продавать было нечего, темп
+  окна берётся годовой, позиция помечается d90_fallback/season_fallback:
+  иначе бестселлер, которого сейчас нет, выпадал из «Заказа» с причиной
+  «нет продаж»;
+- дни наличия есть, но ниже порога — темп считается по дням наличия. У
+  неликвида (лежит 1 шт, продаж нет) он честно равен нулю, и в «Заказ» такая
+  позиция не попадает НИ В ОДНОМ окне. Фолбэка здесь нет и быть не должно.
+Флаг rate_fallback у позиции = темп активного окна взят из года, а не из окна.
+И третий случай, появившийся вместе с прогрессивной первичной загрузкой
+(история грузится фоном кусками НАЗАД от сегодня): окна темпа может ещё не
+быть в базе целиком. «Дней наличия нет» тогда значит не «распродали в ноль»,
+а «мы про эти дни ещё не знаем» — фолбэк на годовой темп в этом случае не
+даётся (год посчитан по тем же неполным дням), позиция помечается
+rate_no_history и уходит в «Не вошло и почему» с причиной «история грузится».
+Покрытие окон считается один раз на снапшот от coverage_start (самая ранняя
+загруженная дата) — snap["rate_window_covered"], см. _window_covered.
 
-lead_time_days — срок производства (заказ → приход на склад). gap_days —
-«дыра поставки»: на сколько дней остаток кончится РАНЬШЕ прихода заказа,
-max(0, (today+lead) − stockout_date).
+lead_time_days — срок производства (заказ → приход на склад). Он берётся у
+производства, за которым закреплена позиция (Production.lead_time_days), и
+только при пустом значении — из общей настройки; по нему считаются
+proj_stock, need и gap_days. gap_days — «дыра поставки»: на сколько дней
+остаток кончится РАНЬШЕ прихода заказа, max(0, (today+lead) − stockout_date).
+Сезонное окно темпа остаётся общим (см. _compute_snapshot).
 
 Агрегация — SQL (GROUP BY), в Python попадают только свёрнутые строки.
 Снапшот кэшируется в памяти на 10 минут per-org; запись (заказы, настройки,
@@ -45,6 +74,8 @@ from app.models import (
     Org,
     OrderedQty,
     Product,
+    Production,
+    ProductionAssign,
     Sale,
     SkuCategoryOverride,
     SkuHidden,
@@ -54,7 +85,19 @@ from app.models import (
 )
 
 CACHE_TTL = 600  # 10 минут
+# Подписи базы денежных сумм. Одна и та же «стоимость склада» считается по трём
+# разным ценам и на экране без подписи выглядит как ошибка в расчётах — каждая
+# сумма в API отдаётся вместе с подписью, чтобы шаблоны её не выдумывали.
+BASIS_RETAIL = "по ценам продажи из карточки"
+BASIS_COST = "по себестоимости"
+BASIS_AVG_SALE = "по средней цене продажи"
 RATE_WINDOWS = ("year", "d90", "season")  # окна темпа продаж
+# Человеческие подписи окон темпа — для бейджа на странице и шапки выгрузки.
+RATE_WINDOW_RU = {
+    "year": "темп за год",
+    "d90": "темп за 90 дней",
+    "season": "сезонный темп",
+}
 DEFAULT_LEAD_TIME_DAYS = 45  # срок производства: заказ → приход на склад
 # Горизонт покрытия заказа (решение Влада 21.08.2026). Раньше был константой
 # horizon_days=90 для всех позиций сразу — это молчаливое допущение «закажу
@@ -100,6 +143,10 @@ SEASONS = ("winter", "spring", "summer", "autumn")
 # Не 100%: самая старая загруженная дата плавает на день-другой (см.
 # _season_coverage), а метрика сезона от потери одного дня не меняется.
 SEASON_COVERED_SHARE = 0.9
+# Столько дней в начале окна темпа разрешено «недосчитаться», прежде чем окно
+# признаётся незагруженным (см. _window_covered) — тот же люфт самой ранней
+# даты, из-за которого выше стоит доля, а не граница.
+WINDOW_COVER_SLACK_DAYS = 3
 
 
 def _is_season_new(first_stock: str | None, since: str, strict: bool) -> bool:
@@ -293,13 +340,6 @@ def extra_settings(org: Org) -> dict:
         "price_type_cost": str(data.get("price_type_cost") or ""),
         # Пиковые периоды продаж бренда (см. order_planner.peak_hints).
         "peak_periods": data.get("peak_periods") if isinstance(data.get("peak_periods"), list) else [],
-        # Правило распределения позиций по производствам (app/assign_rules.py).
-        # ВАЖНО: ключ обязан быть здесь. Org.settings возвращает только
-        # thresholds/horizon_days/min_stock_days, а сохранение настроек пишет
-        # `settings.update(extra_settings(org))` — всё, чего нет в этом словаре,
-        # при первом же сохранении настроек стиралось бы из settings_json.
-        "assign_source": data.get("assign_source") or "manual",
-        "assign_map": data.get("assign_map") if isinstance(data.get("assign_map"), dict) else {},
     }
 
 
@@ -320,6 +360,59 @@ def cover_days(settings: dict) -> int:
     safety = int(settings.get("safety_days") or DEFAULT_SAFETY_DAYS)
     return max(COVER_MIN_DAYS, min(COVER_MAX_DAYS, cadence + safety))
 
+
+def _wos_by_rate(cs: float, rate: float) -> float | None:
+    """Покрытие остатка в неделях при заданном темпе (None — темпа нет)."""
+    return round(cs / (rate * 7), 1) if rate > 0 else None
+
+
+def _stockout_by_rate(today_iso: str, cs: float, rate: float) -> str | None:
+    """Дата, когда кончится остаток при заданном темпе (ISO); None — темпа нет.
+
+    Клэмп 3650 дней (~10 лет): у медленной позиции с большим стоком cs/rate
+    даёт миллионы дней и роняет timedelta (OverflowError → 500 на дашборде).
+    Дальше этого срока ответ один — «дефицита не предвидится».
+    """
+    if rate <= 0:
+        return None
+    days = min(int(cs / rate), 3650)
+    return (date.fromisoformat(today_iso) + timedelta(days=days)).isoformat()
+
+
+def _within(today: date, days: int, *dates: str | None) -> bool:
+    """Хотя бы одна из дат (ISO) не старше days дней от today."""
+    for iso in dates:
+        if iso and (today - date.fromisoformat(iso)).days <= days:
+            return True
+    return False
+
+
+def _window_covered(coverage_start: str | None, date_from: str) -> bool:
+    """Загружена ли история на ВСЁ окно, начинающееся с date_from (деплой П1).
+
+    coverage_start — самая ранняя загруженная дата (min stock_days, кладётся
+    в снапшот). Первичная загрузка идёт кусками НАЗАД от сегодня, поэтому
+    свежий конец окна есть всегда, а старый может быть ещё не загружен: окно
+    считается покрытым, только если история начинается не позже его левой
+    границы. Пусто (данных нет вовсе) = не покрыто.
+
+    Допуск WINDOW_COVER_SLACK_DAYS — по той же причине, по которой у
+    _season_coverage порог доля, а не граница: coverage_start берётся из
+    stock_days, а день без положительных остатков в таблицу не попадает, и у
+    ЗАВЕРШЁННОГО синка самая ранняя дата регулярно оказывается на день-другой
+    позже начала окна. Без допуска годовое окно у здорового аккаунта время от
+    времени объявлялось бы незагруженным.
+
+    Зачем: «в окне нет ни одного дня наличия» и «окно ещё не загружено» —
+    разные факты. Первый разрешает фолбэк темпа на год (позицию распродали
+    в ноль, мерить было нечего), второй не разрешает ничего: мы про это
+    окно просто ничего не знаем. См. фолбэк в _compute_snapshot.
+    """
+    if not coverage_start:
+        return False
+    slack = (date.fromisoformat(date_from)
+             + timedelta(days=WINDOW_COVER_SLACK_DAYS)).isoformat()
+    return coverage_start <= slack
 
 
 # ── Оконные агрегаты (переиспользуются снапшотом и планировщиком заказа) ──────
@@ -399,6 +492,11 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
     cutoff30 = (today - timedelta(days=30)).isoformat()
     # Сезонное окно прошлого года: период, НА который заказываем (заказ приедет
     # через lead_time и будет продаваться horizon дней), минус год.
+    # Окно ОБЩЕЕ, по сроку из настроек, даже если у цехов сроки разные: иначе
+    # на каждый срок пришлось бы гонять свою пару SQL-окон по всей истории
+    # продаж и остатков. Сдвиг окна на разницу сроков (недели) меняет сезонный
+    # темп в пределах погрешности самой сезонности, поэтому цена точности
+    # здесь несоизмерима с ценой запросов; в подписи окна это оговорено.
     season_from = (today + timedelta(days=lead_time - 365)).isoformat()
     season_to = (today + timedelta(days=lead_time + horizon - 365)).isoformat()
 
@@ -408,6 +506,14 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
     # сезонные метрики обязаны различать «не продавалось» и «не загружено».
     coverage_start = db.scalar(select(func.min(StockDay.date)).where(StockDay.org_id == org.id))
     season_covered = _season_coverage(cutoff365, today, coverage_start)
+    # Покрыты ли загруженной историей ОКНА ТЕМПА (см. фолбэк в цикле ниже).
+    # Первичная загрузка идёт кусками назад от сегодня, поэтому у клиента,
+    # который синхронизировался вчера, окна «90 дней» и «сезон прошлого года»
+    # могут быть пустыми не потому, что товара не было, а потому что этих дней
+    # ещё нет в базе. Пустое окно и НЕЗАГРУЖЕННОЕ окно — разные вещи, и
+    # фолбэк темпа (годовой темп вместо оконного) полагается только первому.
+    d90_covered = _window_covered(coverage_start, cutoff90)
+    season_win_covered = _window_covered(coverage_start, season_from)
 
     # excluded=False — упаковка/сертификаты/расходники не участвуют в аналитике
     # (см. app/exclusions.py); фильтр применяется во ВСЕХ запросах снапшота.
@@ -445,12 +551,29 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
         db.execute(select(day_totals.c.base, func.count()).group_by(day_totals.c.base)).all()
     )
 
-    def _dis_window(date_from: str, date_to: str | None = None) -> dict:
-        """Дни в стоке (sum qty >= min_stock) в окне дат, по базовым именам."""
-        return window_dis(db, org.id, min_stock, date_from, date_to)
+    def _dis_window(
+        date_from: str, date_to: str | None = None, min_qty: int | None = None
+    ) -> dict:
+        """Дни в стоке (sum qty >= порога) в окне дат, по базовым именам.
+
+        min_qty=None — порог min_stock («день в стоке» по настройке);
+        min_qty=1 — дни ФИЗИЧЕСКОГО наличия: хоть одна штука на полке.
+        Считает общий window_dis (им же пользуется мастер заказа) — порог у
+        него параметр, так что оба режима идут через один и тот же запрос.
+        """
+        floor = min_stock if min_qty is None else min_qty
+        return window_dis(db, org.id, floor, date_from, date_to)
 
     dis90_by_base = _dis_window(cutoff90)
     dis_season_by_base = _dis_window(season_from, season_to)
+    # Дни ФИЗИЧЕСКОГО наличия в тех же окнах (хоть одна штука на складе).
+    # Нужны, чтобы отличить два разных случая с dis = 0: «товара не было ни
+    # дня — продавать было нечего» (фолбэк на годовой темп оправдан) и «товар
+    # лежал, но ниже порога min_stock_days» (хвост неликвида в 1–2 шт —
+    # фолбэк вреден, нулевой темп у такой позиции честный). Те же два
+    # GROUP BY по тем же индексам, что и dis-окна выше.
+    inst90_by_base = _dis_window(cutoff90, min_qty=1)
+    inst_season_by_base = _dis_window(season_from, season_to, min_qty=1)
 
     # Сезонная оборачиваемость (правило legacy /turnover): дни в стоке и
     # нетто-выручка по МЕСЯЦАМ сезона внутри окна 365 дней. Реиспользуем
@@ -569,6 +692,15 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
         .group_by(Product.base_name, Product.size)
     ).all()
 
+    # Последний день, когда позиция ФИЗИЧЕСКИ лежала на складе (по всем
+    # размерам). Отвечает на вопрос «когда товар ушёл с полки» — по нему
+    # видно, распродали позицию только что или её нет уже полгода
+    # (см. фолбэк темпа ниже). Считается из тех же строк, без лишнего запроса.
+    last_instock_by_base: dict[str, str] = {}
+    for base, _size, last_pos in last_pos_rows:
+        if last_pos and last_pos > last_instock_by_base.get(base, ""):
+            last_instock_by_base[base] = last_pos
+
     # Последняя продажа (для алертов о неликвиде).
     last_sale_by_base = dict(
         db.execute(
@@ -599,6 +731,32 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
     ordered_by_base = {b: float(q or 0) + float(m or 0) for b, q, m in ordered_rows}
     ordered_manual = {b: float(q or 0) for b, q, m in ordered_rows}
     ordered_ms = {b: float(m or 0) for b, q, m in ordered_rows}
+
+    # Срок производства по подрядчику. У цехов он разный (свой цех шьёт
+    # 21 день, Иваново 45, Бишкек 70), и от него зависят прогнозный остаток к
+    # приходу партии, «дыра поставки» и сам размер заказа — считать всё по
+    # одному общему сроку значит врать по половине каталога.
+    # Два лёгких запроса (десятки строк) и БЕЗ импорта app.api — иначе цикл
+    # импорта api → analytics → api. Правило выбора срока то же, что в
+    # app/api.py:apply_production_rules, иначе страница «Заказ» показала бы
+    # один срок, а расчёт шёл бы по другому.
+    prod_rows = db.execute(
+        select(Production.id, Production.lead_time_days, Production.is_main)
+        .where(Production.org_id == org.id)
+    ).all()
+    prod_lead_by_id = {int(pid): int(lead or 0) for pid, lead, _m in prod_rows}
+    main_prod_id = next((int(pid) for pid, _l, is_main in prod_rows if is_main), None)
+    # Позиция без записи в production_assign — на основном производстве;
+    # пустой срок у производства = «как в общих настройках».
+    default_lead = prod_lead_by_id.get(main_prod_id) or lead_time
+    lead_by_base = {
+        base: (prod_lead_by_id.get(int(pid)) or lead_time)
+        for base, pid in db.execute(
+            select(ProductionAssign.base_name, ProductionAssign.production_id)
+            .where(ProductionAssign.org_id == org.id)
+        ).all()
+        if int(pid) in prod_lead_by_id  # запись на удалённый цех = основное
+    }
 
     # Архив («в архив» на Оборачиваемости) и пользовательские категории.
     hidden_set = {
@@ -716,23 +874,111 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
             item["sizes"][size]["last_pos"] = last_pos
 
     # ── Производные метрики ──────────────────────────────────────────────────
-    arrival = today + timedelta(days=lead_time)  # дата прихода заказа, сделанного сегодня
     for item in items.values():
         base = item["base_name"]
+        # Срок производства ЭТОЙ позиции и дата прихода заказа, сделанного
+        # сегодня: по ним считаются proj_stock, need и gap_days.
+        lead = lead_by_base.get(base, default_lead)
+        arrival = today + timedelta(days=lead)
+        item["lead_time_days"] = lead
         dis, cs, nq, nr = item["dis"], item["cs"], item["nq"], item["nr"]
         rate_year = nq / dis if dis > 0 else 0.0
-        turnover = nr / dis if dis > 0 else 0.0
+        # Оборачиваемость — скорость, с которой позиция приносит деньги;
+        # отрицательной она не бывает. Если возвраты за период перевесили
+        # продажи, скорость честно нулевая (а сама нетто-выручка остаётся
+        # в «Выручке» со знаком минус — это факт, его не прячем).
+        turnover = max(0.0, nr) / dis if dis > 0 else 0.0
+
+        # Свежесть позиции: когда её последний раз видели на полке и когда
+        # последний раз покупали. Нужны, чтобы отличить «распродали» от
+        # «умерло» (см. фолбэк ниже).
+        last_instock = last_instock_by_base.get(base)
+        last_sale_date = item["last_sale"]
+
+        # Продажи в сезонном окне прошлого года — в ровно том периоде, на
+        # который приедет и будет продаваться этот заказ. Это второй, помимо
+        # свежести, признак «вещь ещё нужна» (см. фолбэк ниже).
+        nq_season = float(nq_season_by_base.get(base) or 0)
+        season_demand = nq_season > 0
+        # Новинка, которой в сезонном окне прошлого года ещё не существовало:
+        # судить по этому окну о ней нельзя, и «в сезон не продавалась» —
+        # не улика. Такую позицию фолбэк подхватывает.
+        # Но «первое появление позже сезонного окна» доказывает новизну ТОЛЬКО
+        # на загруженной истории: при частичной загрузке (деплой П1) самая
+        # ранняя дата в данных — это дата загрузки, а не рождения товара, и
+        # новинками разом становился бы весь каталог, снимая проверку «позиция
+        # жива» со всех позиций сразу. Нет истории — нет и вывода о новизне.
+        first_stock = first_stock_by_base.get(base)
+        season_unknown = season_win_covered and (
+            not first_stock or first_stock > season_to
+        )
 
         # Темп за 90 дней: нетто-продажи за 90 дн / дни в стоке за 90 дн.
+        # dis90 = 0 бывает по двум РАЗНЫМ причинам, и лечатся они по-разному:
+        #   1) товара на складе не было ни дня (распродан в ноль) — продавать
+        #      было нечего, делить не на что. Берём годовой темп и помечаем
+        #      d90_fallback: иначе бестселлер, которого сейчас нет, выпадает
+        #      из «Заказа» с причиной «нет продаж» — ровно тот товар, который
+        #      нужнее всего дозаказать;
+        #   2) товар лежал, но меньше порога min_stock_days (хвост неликвида
+        #      в 1–2 шт). Здесь годовой темп затянул бы мёртвый товар в заказ.
+        #      Дни физического наличия есть — считаем темп по ним, и у
+        #      непродающейся позиции он честно равен нулю.
+        # Случая (1) мало: «товара не было на складе» одинаково верно и для
+        # бестселлера, распроданного на прошлой неделе, и для зимнего пальто,
+        # которого нет с января. Годовой темп годится только для первого —
+        # второму он в августе выписывает заказ на 30 шт (ревью, «сезонное
+        # эхо»). Поэтому фолбэк требует ещё одного из трёх подтверждений:
+        #   • позиция была жива внутри окна (лежала на полке или продавалась)
+        #     — темп мерить было не на чем именно потому, что её раскупили;
+        #   • в сезонном окне прошлого года по ней были продажи — вещь как раз
+        #     входит в свой сезон, и дошить её правильно, даже если на полке
+        #     её нет давно (тот самый бестселлер, распроданный полгода назад,
+        #     из-за которого проверку по свежести и не стали вводить раньше);
+        #   • сезонного окна у позиции просто нет — она новее его: новинку,
+        #     распроданную в ноль, отсекать не за что.
+        # Ни одного подтверждения — темп окна остаётся нулевым, и позиция
+        # уходит в «Не вошло и почему» с объяснением, а не в заказ.
+        # И ещё одно условие, поверх всех трёх: окно должно быть ЗАГРУЖЕНО.
+        # «Ни дня наличия за 90 дней» на клиенте, у которого истории пока 10
+        # дней, не значит «распродали в ноль» — значит «мы ещё не знаем».
+        # Выдавать это за отсутствие товара и заказывать по годовому темпу
+        # нельзя: годовой темп там посчитан по тем же 10 дням. Такие позиции
+        # уходят в «Не вошло и почему» с честной причиной «история грузится».
         dis90 = int(dis90_by_base.get(base, 0))
+        inst90 = int(inst90_by_base.get(base, 0))
         nq90 = float(nq90_by_base.get(base) or 0)
-        rate_90 = max(0.0, nq90 / dis90) if dis90 > 0 else 0.0
+        d90_empty = dis90 <= 0 and inst90 <= 0
+        d90_no_history = d90_empty and not d90_covered
+        d90_fallback = d90_empty and d90_covered and (
+            _within(today, 90, last_instock, last_sale_date)
+            or season_demand
+            or season_unknown
+        )
+        if dis90 > 0:
+            rate_90 = max(0.0, nq90 / dis90)
+        elif inst90 > 0:
+            rate_90 = max(0.0, nq90 / inst90)
+        else:
+            rate_90 = rate_year if d90_fallback else 0.0
 
         # Сезонный темп: окно прошлого года, на которое придётся заказ.
+        # Ровно та же развилка и то же требование подтверждения, что у «90 дней».
         dis_season = int(dis_season_by_base.get(base, 0))
-        nq_season = float(nq_season_by_base.get(base) or 0)
-        season_fallback = dis_season <= 0
-        rate_season = rate_year if season_fallback else max(0.0, nq_season / dis_season)
+        inst_season = int(inst_season_by_base.get(base, 0))
+        season_empty = dis_season <= 0 and inst_season <= 0
+        season_no_history = season_empty and not season_win_covered
+        season_fallback = season_empty and season_win_covered and (
+            _within(today, horizon, last_instock, last_sale_date)
+            or season_demand
+            or season_unknown
+        )
+        if dis_season > 0:
+            rate_season = max(0.0, nq_season / dis_season)
+        elif inst_season > 0:
+            rate_season = max(0.0, nq_season / inst_season)
+        else:
+            rate_season = rate_year if season_fallback else 0.0
 
         rate = {"year": rate_year, "d90": rate_90, "season": rate_season}[rate_window]
 
@@ -741,6 +987,29 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
         item["rate_90"] = round(rate_90, 4)
         item["rate_season"] = round(rate_season, 4)
         item["season_fallback"] = season_fallback
+        item["d90_fallback"] = d90_fallback
+        # Окно активного темпа ещё не загружено целиком (прогрессивная
+        # первичная загрузка): темпа по нему нет и фолбэка не дали — про это
+        # окно мы просто ничего не знаем. Отдельный флаг, чтобы страница
+        # сказала «история грузится», а не «позиции не было на складе».
+        item["rate_no_history"] = {
+            "year": False, "d90": d90_no_history, "season": season_no_history
+        }[rate_window]
+        # Позиции не было на складе всё окно, и фолбэк ей НЕ дали: продаж в
+        # окне нет, на полке давно нет, в сезон заказа не продаётся. Отдельный
+        # признак нужен, чтобы объяснить исключение по-человечески. Окно при
+        # этом обязано быть загружено (иначе это rate_no_history выше).
+        item["rate_stale"] = {
+            "year": False,
+            "d90": d90_empty and d90_covered and not d90_fallback,
+            "season": season_empty and season_win_covered and not season_fallback,
+        }[rate_window]
+        item["dis90"] = dis90
+        item["instock90"] = inst90
+        # Темп активного окна взят не из окна, а из года (данных в окне нет).
+        item["rate_fallback"] = {
+            "year": False, "d90": d90_fallback, "season": season_fallback
+        }[rate_window]
         item["rate_active"] = round(rate, 4)
         item["turnover"] = round(turnover)
         item["cls"] = classify(turnover, thresholds)
@@ -748,33 +1017,100 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
         # (см. MIN_SIGNIF_*). Алерты/топы такие позиции пропускают, UI помечает.
         item["low_data"] = dis < MIN_SIGNIF_DIS or nq < MIN_SIGNIF_NQ
         # Покрытие/стокаут/потребность — по АКТИВНОМУ окну темпа.
-        item["wos"] = round(cs / (rate * 7), 1) if rate > 0 else None
-        # Клэмп: у медленной позиции с большим стоком cs/rate может дать
-        # миллионы дней и уронить timedelta (OverflowError → 500 на дашборде).
-        # 3650 дней (~10 лет) — «дефицита не предвидится», дальше не считаем.
-        stockout = (
-            today + timedelta(days=min(int(cs / rate), 3650)) if rate > 0 else None
+        item["wos"] = _wos_by_rate(cs, rate)
+        item["stockout_date"] = _stockout_by_rate(today.isoformat(), cs, rate)
+        # «Дыра поставки»: остаток кончится раньше, чем приедет заказ
+        # (по сроку производства ЭТОЙ позиции).
+        item["gap_days"] = (
+            max(0, (arrival - date.fromisoformat(item["stockout_date"])).days)
+            if item["stockout_date"] else 0
         )
-        item["stockout_date"] = stockout.isoformat() if stockout else None
-        # «Дыра поставки»: остаток кончится раньше, чем приедет заказ.
-        item["gap_days"] = max(0, (arrival - stockout).days) if stockout else 0
-        item["avg_price"] = round(nr / nq) if nq > 0 else None
+        # Средняя фактическая цена продажи. nr > 0 обязательно: возвраты
+        # вычитаются из выручки, и у базы, где они перевесили продажи,
+        # нетто-выручка отрицательна — «средняя цена −4 888 ₽» отравляла
+        # весь денежный слой (себестоимость, маржу, «заморожено», алерт
+        # «торгуете в минус»). Отрицательной цены не бывает: такой базе
+        # средней цены продажи просто НЕТ (None), деньги считаются по
+        # номиналу из карточки, а сам факт отдаётся флагом returns_over_sales.
+        item["returns_over_sales"] = bool(nq > 0 and nr <= 0)
+        item["avg_price"] = round(nr / nq) if nq > 0 and nr > 0 else None
         sale_price = item["sale_price"]
         item["discount_fact"] = (
-            round(1 - (nr / nq) / sale_price, 3) if nq > 0 and sale_price > 0 else None
+            round(1 - (nr / nq) / sale_price, 3)
+            if nq > 0 and nr > 0 and sale_price > 0
+            else None
         )
+        # ── Себестоимость и валовая маржа (второй денежный слой) ─────────
+        # Розничные цифры выше остаются как были; здесь считается то, о чём
+        # спрашивает финансист: сколько денег вложено (себестоимость) и сколько
+        # на них заработано (маржа). Позиции без себестоимости (её может не
+        # быть в МойСкладе) помечаются no_cost и НЕ считаются по нулю: все
+        # маржинальные поля у них None и в агрегаты они не входят — так же,
+        # как это уже сделано на «Скидках» (analytics_markdown.py).
+        cost = item["cost_price"]
+        no_cost = cost <= 0
+        item["no_cost"] = no_cost
+        # Цена, от которой считаем маржу: фактическая средняя (после скидок),
+        # а если продаж не было ИЛИ возвраты съели всю выручку — номинал из
+        # карточки (средней цены продажи у такой базы нет, см. avg_price).
+        # Цены нет вовсе — маржи просто не существует.
+        avg_price = item["avg_price"]
+        margin_price = float(avg_price if avg_price is not None else (sale_price or 0))
+        price_known = margin_price > 0 or avg_price is not None
+        item["margin_price"] = round(margin_price) if price_known else None
+        # Деньги в остатке: одни и те же штуки в трёх разных ценах.
+        item["stock_retail"] = round(cs * sale_price)
+        item["stock_sale"] = round(cs * margin_price)
+        item["stock_cost"] = None if no_cost else round(cs * cost)
+        if no_cost or not price_known:
+            item["margin_unit"] = None
+            item["margin_pct"] = None
+            item["stock_margin"] = None
+        else:
+            item["margin_unit"] = round(margin_price - cost)
+            # Процент — от цены продажи; при нулевой цене процента не бывает.
+            item["margin_pct"] = (
+                round((margin_price - cost) / margin_price, 3)
+                if margin_price > 0
+                else None
+            )
+            item["stock_margin"] = round(cs * (margin_price - cost))
+        # Валовая маржа за год = нетто-выручка − себестоимость проданного.
+        item["gross_margin"] = None if no_cost else round(nr - nq * cost)
+        # «Торгуем в минус»: средняя фактическая цена ниже себестоимости.
+        item["below_cost"] = bool(
+            not no_cost and avg_price is not None and avg_price < cost
+        )
+        if item["below_cost"]:
+            item["loss_unit"] = round(cost - avg_price)
+            item["loss_total"] = round((cost - avg_price) * nq)
+            item["loss_stock"] = round((cost - avg_price) * cs)
+        else:
+            item["loss_unit"] = 0
+            item["loss_total"] = 0
+            item["loss_stock"] = 0
         # Сезонная оборачиваемость ₽/день: 0 = «по сезону нет продаж»,
-        # None = «сезон не покрыт историей» (минор 9 — фронт красит серым).
+        # None = «сезон не покрыт загруженной историей» (фронт красит серым).
+        # Отрицательной она не бывает: у зимней вещи летом возвраты легко
+        # перевешивают продажи, и «−882 ₽/день» в колонке «Лето» читается как
+        # ошибка расчёта, а не как факт. Сезоны, где так вышло, перечислены
+        # в sea_returns — их подписываем словами. Непокрытый сезон в
+        # sea_returns не попадает: там показано «нет данных», а не ноль.
         s_dis = sea_dis_by_base.get(base, {})
         s_rev = sea_rev_by_base.get(base, {})
         item["sea"] = {
-            s: ((round(s_rev.get(s, 0.0) / s_dis[s]) if s_dis.get(s) else 0)
+            s: ((round(max(0.0, s_rev.get(s, 0.0)) / s_dis[s]) if s_dis.get(s) else 0)
                 if season_covered.get(s) else None)
             for s in SEASONS
         }
-        # Прогноз остатка к дате прихода заказа (правило legacy /order):
-        # за lead_time часть стока продастся; «едет» приходуется к той же дате.
-        proj_stock = max(0.0, cs + float(item["ordered"]) - rate * lead_time)
+        item["sea_returns"] = [
+            s for s in SEASONS
+            if season_covered.get(s) and s_dis.get(s) and s_rev.get(s, 0.0) < 0
+        ]
+        # Прогноз остатка к дате прихода заказа (правило legacy /order): за
+        # срок производства часть стока продастся; «едет» приходуется к той
+        # же дате. Срок — свой у каждого подрядчика (lead выше).
+        proj_stock = max(0.0, cs + float(item["ordered"]) - rate * lead)
         item["proj_stock"] = round(proj_stock)
         item["need"] = max(0, round(rate * horizon) - round(proj_stock))
         item["nq"] = round(nq)
@@ -787,6 +1123,13 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
         # деплой П1: с какой даты история загружена (частичное покрытие)
         "coverage_start": coverage_start,
         "season_covered": season_covered,
+        # Покрыты ли загруженной историей окна темпа: по ним «Заказ» отличает
+        # «позиции не было на складе» от «этих дней ещё нет в базе».
+        "rate_window_covered": {
+            "year": _window_covered(coverage_start, cutoff365),
+            "d90": d90_covered,
+            "season": season_win_covered,
+        },
         "season_from": season_from,
         "season_to": season_to,
         "cur_season_start": cur_season_iso,
@@ -843,6 +1186,137 @@ def _live_items(snap: dict) -> list[dict]:
         for it in snap["items"].values()
         if not it["archived"] and not it.get("hidden") and (it["cs"] > 0 or it["nq"] > 0 or it["dis"] > 0)
     ]
+
+
+def money_totals(items: list[dict]) -> dict:
+    """Денежный свод по списку позиций: розница, себестоимость, валовая маржа.
+
+    Складываются УЖЕ ОКРУГЛЁННЫЕ значения позиций — сумма по строкам таблицы
+    сходится с итогом до рубля, без «расхождений из-за округления».
+
+    Позиции без себестоимости (no_cost) в себестоимость, маржу и проценты НЕ
+    входят вовсе: показать по ним ноль — значит соврать про замороженные деньги.
+    Сколько их и на какую сумму по рознице — отдельными полями, чтобы человек
+    видел, какая часть склада осталась за пределами расчёта.
+    """
+    with_cost = [it for it in items if not it.get("no_cost")]
+    no_cost = [it for it in items if it.get("no_cost")]
+    stock_cost = sum(it["stock_cost"] or 0 for it in with_cost)
+    stock_margin = sum(it["stock_margin"] or 0 for it in with_cost)
+    # «За сколько продастся» считаем по ВСЕМ позициям: для этой суммы
+    # себестоимость не нужна, и молча терять здесь позиции без неё нельзя.
+    # Поэтому stock_sale − stock_cost ≠ stock_margin, когда такие позиции
+    # есть: процент маржи ниже считается от своей базы (с/с + маржа).
+    stock_sale = sum(it["stock_sale"] for it in items)
+    stock_sale_with_cost = stock_cost + stock_margin
+    revenue_with_cost = sum(it["nr"] for it in with_cost)
+    gross_margin = sum(it["gross_margin"] or 0 for it in with_cost)
+    return {
+        "positions": len(items),
+        "stock_units": sum(it["cs"] for it in items),
+        # Розница считается по ВСЕМ позициям — это старая, привычная сумма.
+        "stock_retail": sum(it["stock_retail"] for it in items),
+        "stock_retail_basis": BASIS_RETAIL,
+        "stock_cost": stock_cost,
+        "stock_cost_basis": BASIS_COST,
+        # Потенциальная маржа в остатке: продать по средней фактической цене.
+        "stock_sale": stock_sale,
+        "stock_sale_basis": BASIS_AVG_SALE,
+        "stock_margin": stock_margin,
+        "stock_margin_pct": (
+            round(stock_margin / stock_sale_with_cost, 3)
+            if stock_sale_with_cost > 0
+            else None
+        ),
+        # Заработано за 365 дней: нетто-выручка − себестоимость проданного.
+        "revenue_year": sum(it["nr"] for it in items),
+        "revenue_year_with_cost": revenue_with_cost,
+        "gross_margin": gross_margin,
+        "gross_margin_pct": (
+            round(gross_margin / revenue_with_cost, 3) if revenue_with_cost > 0 else None
+        ),
+        # Себестоимость проданного за 365 дней и оборачиваемость КАПИТАЛА —
+        # профессиональная метрика финансиста (сколько раз за год провернулись
+        # вложенные в товар деньги). Знаменатель — сток по себестоимости
+        # СЕГОДНЯ, а не средний за период: истории себестоимости у нас нет,
+        # поэтому подпись на экране говорит об этом прямо. Метрика добавлена
+        # рядом, «оборачиваемость ₽/день» на страницах не заменяет.
+        "cogs_year": revenue_with_cost - gross_margin,
+        "capital_turns": (
+            round((revenue_with_cost - gross_margin) / stock_cost, 2)
+            if stock_cost > 0
+            else None
+        ),
+        # Позиции, по которым себестоимости нет — расчёт их не касается.
+        "no_cost_positions": len(no_cost),
+        "no_cost_units": sum(it["cs"] for it in no_cost),
+        "no_cost_retail": sum(it["stock_retail"] for it in no_cost),
+    }
+
+
+def _money_by_category(items: list[dict]) -> list[dict]:
+    """Тот же денежный свод в разрезе категорий (сумма по ним = общий итог)."""
+    groups: dict[str, list[dict]] = {}
+    for it in items:
+        groups.setdefault(it["category"] or "Без категории", []).append(it)
+    out = [dict(money_totals(v), name=name) for name, v in groups.items()]
+    out.sort(key=lambda c: -c["stock_cost"])
+    return out
+
+
+def below_cost_report(items: list[dict]) -> dict:
+    """«Торгуете в минус»: средняя фактическая цена продажи ниже себестоимости.
+
+    Как считаем потерю (одна позиция):
+      средняя цена = нетто-выручка за 365 дней ÷ нетто-штуки за 365 дней
+      (то есть уже с учётом скидок и возвратов);
+      потеря на штуке = себестоимость − средняя цена;
+      потеря за год   = потеря на штуке × нетто-штуки;
+      потеря в остатке = потеря на штуке × текущий остаток — столько ещё
+      потеряете, если распродадите остаток по той же цене.
+
+    Шум отсекаем тем же порогом значимости, что и весь продукт (low_data,
+    MIN_SIGNIF_*): одна случайная продажа по бартерной цене тревогу не поднимает.
+    Такие позиции не выбрасываются — они уходят в отдельный счётчик low_data_*,
+    чтобы «мало данных» не превратилось в «мы это скрыли».
+    """
+    strong, weak = [], []
+    for it in items:
+        if not it.get("below_cost"):
+            continue
+        row = {
+            "base_name": it["base_name"],
+            "category": it["category"] or "Без категории",
+            "cls": it["cls"],
+            "low_data": bool(it.get("low_data")),
+            "avg_price": it["avg_price"],
+            "sale_price": round(it["sale_price"]),
+            "cost_price": round(it["cost_price"]),
+            "discount_fact": it["discount_fact"],
+            "nq": int(it["nq"]),
+            "cs": it["cs"],
+            "loss_unit": it["loss_unit"],
+            "loss_total": it["loss_total"],
+            "loss_stock": it["loss_stock"],
+        }
+        (weak if row["low_data"] else strong).append(row)
+    strong.sort(key=lambda x: -x["loss_total"])
+    weak.sort(key=lambda x: -x["loss_total"])
+    return {
+        "items": strong,
+        "positions": len(strong),
+        "loss_total": sum(x["loss_total"] for x in strong),
+        "loss_stock": sum(x["loss_stock"] for x in strong),
+        # позиции в минусе, но со слабой статистикой — показываем числом
+        "low_data_positions": len(weak),
+        "low_data_loss": sum(x["loss_total"] for x in weak),
+        "price_basis": BASIS_AVG_SALE,
+        "cost_basis": BASIS_COST,
+        "method": (
+            "потеря = (себестоимость − средняя цена продажи за 365 дней) × "
+            "проданные штуки; себестоимость берётся текущая из МойСклада"
+        ),
+    }
 
 
 def _season_health(snap: dict, items: list[dict]) -> dict:
@@ -1050,7 +1524,14 @@ def build_summary(snap: dict) -> dict:
 
     return {
         "stock_value_retail": round(stock_value_retail),
+        "stock_value_retail_basis": BASIS_RETAIL,
         "stock_value_cost": round(stock_value_cost),
+        "stock_value_cost_basis": BASIS_COST,
+        # Денежный свод по себестоимости и валовой марже + позиции без с/с
+        # (для карточек «сколько денег заморожено» и «сколько заработано»).
+        "money": money_totals(items),
+        # «Торгуете в минус» — позиции дешевле себестоимости (без low_data-шума).
+        "below_cost": below_cost_report(items),
         "stock_units": stock_units,
         "positions": len(items),
         # «Оборот в день» — только статистически значимые позиции: у low_data
@@ -1075,12 +1556,44 @@ _NO_SALES_REASON = {
     "season": "нет продаж в сезонном окне прошлого года",
 }
 
+# Позиции не было на складе всё окно, но и «распроданным бестселлером» она не
+# является: с полки ушла давно и в сезон, на который считается заказ, не
+# продаётся. Годовой темп ей не даём (см. фолбэк в _compute_snapshot) — и
+# объясняем это словами, а не общим «нет продаж».
+_STALE_REASON = {
+    "d90": "нет продаж за последние 90 дней: позиции не было на складе, "
+           "а в сезон, на который считается заказ, она в прошлом году не продавалась",
+    "season": "в сезонном окне прошлого года позиции не было на складе и продаж "
+              "по ней не было",
+}
+
+# Окно темпа ещё не загружено целиком (прогрессивная первичная загрузка,
+# история идёт кусками назад). Про такую позицию мы не знаем НИЧЕГО — ни что
+# её распродали, ни что она мёртвая; годовой темп ей тоже не считается, потому
+# что посчитан он по тем же неполным дням. Говорим об этом прямо, а не
+# «нет продаж»: цифры появятся сами, когда догрузится история.
+_NO_HISTORY_REASON = {
+    "d90": "история за последние 90 дней ещё загружается — темп за это окно "
+           "появится, когда синхронизация догрузит эти дни",
+    "season": "сезонное окно прошлого года ещё не загружено — темп за него "
+              "появится, когда синхронизация догрузит историю; пока считайте "
+              "по темпу за год",
+}
+
 
 def build_replenish(snap: dict) -> dict:
     """GET /api/replenish — потребность в заказе, сортировка по turnover desc.
 
     need/wos/stockout/gap считаются по активному окну темпа (settings.rate_window);
     все три темпа (rate_year / rate_90 / rate_season) отдаются в каждом item.
+    proj_stock, need и gap_days считаются по сроку производства ТОЙ позиции
+    (у каждого цеха он свой) — он же отдаётся в item.lead_time_days; общий
+    срок из настроек остаётся в корне ответа как дефолт для страницы.
+
+    window_covered/coverage_start/no_history_count — про прогрессивную
+    первичную загрузку: окно активного темпа может быть загружено не целиком,
+    и тогда позиции без данных в нём не «распроданы в ноль», а неизвестны
+    (excluded[].no_history). Страница обязана сказать это словами.
     """
     settings = snap["settings"]
     horizon = settings["horizon_days"]
@@ -1102,15 +1615,33 @@ def build_replenish(snap: dict) -> dict:
             continue  # мусорная запись без активности
         if it["need"] <= 0:
             if it["rate_active"] <= 0:
-                if rate_window == "season" and it["season_fallback"]:
-                    reason = _NO_SALES_REASON["year"]  # фолбэк на годовой темп
+                if it["rate_fallback"]:
+                    # данных за окно нет, темп взят из года — и год тоже пустой
+                    reason = _NO_SALES_REASON["year"]
+                elif it.get("rate_no_history"):
+                    # окно ещё не загружено: это не «нет продаж», это «не знаем»
+                    reason = _NO_HISTORY_REASON.get(
+                        rate_window, _NO_SALES_REASON.get(rate_window, _NO_SALES_REASON["year"])
+                    )
+                elif it.get("rate_stale"):
+                    # окно пустое, но фолбэк на год не дали: товар ушёл с полки
+                    # давно и в сезон заказа не продаётся («сезонное эхо»)
+                    reason = _STALE_REASON.get(
+                        rate_window, _NO_SALES_REASON.get(rate_window, _NO_SALES_REASON["year"])
+                    )
                 else:
                     reason = _NO_SALES_REASON.get(rate_window, _NO_SALES_REASON["year"])
             elif it["ordered"] > 0:
                 reason = "потребность закрыта заказом в производстве"
             else:
                 reason = "запаса достаточно"
-            excluded.append({"base_name": base, "reason": reason})
+            row = {"base_name": base, "reason": reason}
+            # Позиция выпала не по расчёту, а из-за незагруженной истории —
+            # отдельным признаком, чтобы страница могла собрать их вместе
+            # («ждём догрузки», а не «не нужны»).
+            if it.get("rate_no_history") and it["rate_active"] <= 0:
+                row["no_history"] = True
+            excluded.append(row)
             continue
         rec = size_split(it["sizes"], it["need"])
         avg_price = it["avg_price"] or it["sale_price"]
@@ -1126,12 +1657,21 @@ def build_replenish(snap: dict) -> dict:
                 "rate_90": it["rate_90"],
                 "rate_season": it["rate_season"],
                 "season_fallback": it["season_fallback"],
+                # темп посчитан не по активному окну, а по году (данных за окно нет)
+                "rate_fallback": it["rate_fallback"],
                 "cs": it["cs"],
                 "ordered": int(it["ordered"]),
                 "proj_stock": int(it.get("proj_stock", it["cs"])),
                 "wos": it["wos"],
                 "stockout_date": it["stockout_date"],
                 "gap_days": it["gap_days"],
+                # Срок производства ЭТОЙ позиции — тот же, по которому
+                # посчитаны proj_stock, need и gap_days. По наличию поля
+                # страница «Заказ» понимает, что расчёт уже идёт по сроку
+                # подрядчика (ответ lead_time_by_production), и переключает
+                # подписи. Значение совпадает с тем, что подставит
+                # app/api.py:apply_production_rules — правило выбора одно.
+                "lead_time_days": it.get("lead_time_days", lead_time),
                 "need": it["need"],
                 "sizes": {
                     s: {
@@ -1149,9 +1689,25 @@ def build_replenish(snap: dict) -> dict:
     return {
         "horizon_days": horizon,
         "rate_window": rate_window,
+        # подпись активного окна для бейджа и шапки выгрузки
+        "rate_window_label": RATE_WINDOW_RU.get(rate_window, RATE_WINDOW_RU["year"]),
+        # сколько позиций в заказе посчитаны по годовому темпу вместо окна
+        "fallback_count": sum(1 for x in result if x["rate_fallback"]),
         "lead_time_days": lead_time,
         "season_from": snap.get("season_from"),
         "season_to": snap.get("season_to"),
+        # Загружена ли история на всё окно активного темпа (деплой П1). False —
+        # окно считается по неполным данным: страница обязана сказать об этом
+        # словами, а не показывать заказ, посчитанный «по тому, что успело
+        # приехать». coverage_start — с какой даты история есть.
+        "coverage_start": snap.get("coverage_start"),
+        "window_covered": bool(
+            snap.get("rate_window_covered", {}).get(rate_window, True)
+        ),
+        # сколько позиций не посчитаны вовсе: их окно ещё не загружено
+        "no_history_count": sum(
+            1 for e in excluded if e.get("no_history")
+        ),
         "items": result,
         "excluded": excluded,
     }
@@ -1183,6 +1739,13 @@ def build_turnover(snap: dict) -> dict:
     рейтинг (по turnover desc) → «мало данных» → «без продаж». Позиции с
     низкой статистикой никогда не стоят выше рейтинга: их «оборачиваемость» —
     арифметический шум, а таблица говорит бизнесу об эффективности и перезаказах.
+
+    Вся страница считается по ГОДОВОМУ темпу: и «Оборач. за год», и «Запас,
+    дней», и «Сток на 90 дней», и «Не хватает до нормы». Поэтому покрытие
+    (wos) и дата стокаута здесь тоже годовые, а не по активному окну темпа:
+    в ячейке «Запас» стоят рядом «сколько дней хватит» и «до какого числа»,
+    и посчитанные по разным темпам они противоречили друг другу.
+    Активное окно темпа живёт на странице «Заказ» — там оно и влияет на числа.
     """
     items = []
     for it in sorted(
@@ -1201,6 +1764,11 @@ def build_turnover(snap: dict) -> dict:
                 "nr": it["nr"],
                 "turnover": it["turnover"],
                 "sea": it.get("sea", {}),
+                # Периоды, где возвраты перевесили продажи: ₽/день по ним
+                # показаны нулём, и это нужно подписать словами, а не
+                # оставлять читателю гадать (см. export_xlsx._turnover_note).
+                "sea_returns": it.get("sea_returns", []),
+                "returns_over_sales": it.get("returns_over_sales", False),
                 "cls": it["cls"],
                 "low_data": it.get("low_data", False),
                 "group": turnover_group(it),
@@ -1208,18 +1776,57 @@ def build_turnover(snap: dict) -> dict:
                 "sale_price": it["sale_price"],
                 "discount_fact": it["discount_fact"],
                 "rate": it["rate_year"],
-                "wos": it["wos"],
-                "stockout_date": it["stockout_date"],
+                # покрытие и стокаут — по тому же годовому темпу, что и
+                # колонка «Запас, дней» на странице (см. докстринг)
+                "wos": _wos_by_rate(it["cs"], it["rate_year"]),
+                "stockout_date": _stockout_by_rate(
+                    snap["today"], it["cs"], it["rate_year"]
+                ),
                 "archived": it["archived"],
                 "hidden": it.get("hidden", False),
+                # ── второй денежный слой: себестоимость и валовая маржа ──
+                "cost_price": round(it["cost_price"]),
+                "no_cost": it["no_cost"],
+                "margin_unit": it["margin_unit"],
+                "margin_pct": it["margin_pct"],
+                "gross_margin": it["gross_margin"],
+                "stock_cost": it["stock_cost"],
+                "stock_retail": it["stock_retail"],
+                "stock_sale": it["stock_sale"],
+                "stock_margin": it["stock_margin"],
+                "below_cost": it["below_cost"],
+                "loss_unit": it["loss_unit"],
+                "loss_total": it["loss_total"],
             }
         )
-    # coverage_start/season_covered — чтобы таблица гасила сезонные колонки,
-    # не покрытые загруженной историей (sea[s] = null), а не рисовала «0 ₽/день».
+    # Все числа этой страницы (и её выгрузки) — годовые, включая покрытие и
+    # дату стокаута. Отдаём подпись «темп за год», чтобы шапка Excel не
+    # обещала окно, по которому здесь ничего не считается.
+    rate_window = "year"
+    # Итоги считаем по тем же позициям, что и дашборд (_live_items): без архива
+    # и без скрытых — иначе «заморожено по себестоимости» на этой странице и на
+    # главной разошлись бы, и обе цифры перестали бы стоить доверия.
+    live = _live_items(snap)
     return {
         "items": items,
+        "rate_window": rate_window,
+        "rate_window_label": RATE_WINDOW_RU.get(rate_window, RATE_WINDOW_RU["year"]),
+        # coverage_start/season_covered — чтобы таблица гасила сезонные колонки,
+        # не покрытые загруженной историей (sea[s] = null), а не рисовала
+        # «0 ₽/день».
         "coverage_start": snap.get("coverage_start"),
         "season_covered": snap.get("season_covered", {}),
+        # деньги: итог по всем живым позициям и разрез по категориям
+        "money": money_totals(live),
+        "money_by_category": _money_by_category(live),
+        "below_cost": below_cost_report(live),
+        "money_basis": {
+            "stock_retail": BASIS_RETAIL,
+            "stock_cost": BASIS_COST,
+            "stock_margin": BASIS_AVG_SALE,
+            "margin_unit": BASIS_AVG_SALE,
+            "gross_margin": BASIS_AVG_SALE,
+        },
     }
 
 
@@ -1279,12 +1886,54 @@ def build_active_stock(snap: dict) -> dict:
             "ordered_ms": round(float(it.get("ordered_ms") or 0)),
             "row_alert": row_alert,
             "sizes": sizes,
+            # ── второй денежный слой: себестоимость и валовая маржа ──
+            "cost_price": round(it["cost_price"]),
+            "no_cost": it["no_cost"],
+            "margin_unit": it["margin_unit"],
+            "margin_pct": it["margin_pct"],
+            "stock_cost": it["stock_cost"],
+            "stock_retail": it["stock_retail"],
+            "stock_sale": it["stock_sale"],
+            "stock_margin": it["stock_margin"],
+            "below_cost": it["below_cost"],
+            "loss_unit": it["loss_unit"],
+            "loss_total": it["loss_total"],
         })
     # Как в legacy: сортировка по оборачиваемости, без продаж — в конец.
     items.sort(key=lambda x: (_GROUP_ORDER[x["group"]], -x["turnover"], -x["cs"]))
+    # «Едет к нам» карточки страницы считают вместе с остатком — значит и в
+    # шапке эти деньги должны стоять отдельной суммой, иначе итог не сойдётся
+    # с суммой карточек. Заказанное без себестоимости в сумму не идёт.
+    incoming_units = sum(x["ordered_manual"] + x["ordered_ms"] for x in items)
+    incoming_cost = sum(
+        (x["ordered_manual"] + x["ordered_ms"]) * x["cost_price"]
+        for x in items
+        if not x["no_cost"]
+    )
+    incoming_sale = sum(
+        (x["ordered_manual"] + x["ordered_ms"]) * x["avg_price"] for x in items
+    )
+    live = _live_items(snap)
     return {
         "warehouses": [{"id": w["id"], "name": w["name"]} for w in active],
         "items": items,
+        # деньги: тот же свод, что на «Оборачиваемости» (сходится до рубля)
+        "money": money_totals(live),
+        "money_by_category": _money_by_category(live),
+        "below_cost": below_cost_report(live),
+        "incoming": {
+            "units": incoming_units,
+            "cost": round(incoming_cost),
+            "sale": round(incoming_sale),
+        },
+        "money_basis": {
+            "stock_retail": BASIS_RETAIL,
+            "stock_cost": BASIS_COST,
+            "stock_margin": BASIS_AVG_SALE,
+            "margin_unit": BASIS_AVG_SALE,
+            "incoming_cost": BASIS_COST,
+            "incoming_sale": BASIS_AVG_SALE,
+        },
     }
 
 

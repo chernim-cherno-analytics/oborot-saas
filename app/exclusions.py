@@ -18,7 +18,7 @@ import re
 
 from sqlalchemy import inspect, text
 
-from app.db import engine
+from app.db import engine, run_migration_once, run_migration_step
 
 # Категории МойСклад (productFolder), которые почти наверняка не товар для аналитики.
 SERVICE_CATEGORIES = {
@@ -72,21 +72,38 @@ def ensure_schema() -> None:
     ALTER TABLE ADD COLUMN работает в SQLite и Postgres. Бэкфилл выполняется
     только в момент добавления колонки (существующие базы), чтобы не трогать
     последующий ручной выбор пользователя.
+
+    Ревью 22.08: колонка булева, поэтому значения — DEFAULT FALSE и параметры
+    True/False, а не 0/1 (Postgres не сравнивает boolean с integer и на этом
+    месте не давал приложению стартовать вовсе). Шаги выполняются через
+    помощники app/db.py и переживают одновременный старт нескольких воркеров.
     """
     insp = inspect(engine)
     if not insp.has_table("products"):
         return
     cols = {c["name"] for c in insp.get_columns("products")}
     if "excluded" not in cols:
-        with engine.begin() as conn:
-            conn.execute(text(
-                "ALTER TABLE products ADD COLUMN excluded BOOLEAN NOT NULL DEFAULT 0"
-            ))
-            rows = conn.execute(text("SELECT id, base_name, category FROM products")).fetchall()
-            service_ids = [r[0] for r in rows if is_service_item(r[1], r[2])]
-            for pid in service_ids:
-                conn.execute(text("UPDATE products SET excluded = 1 WHERE id = :pid"), {"pid": pid})
+        added = run_migration_step(
+            "ALTER TABLE products ADD COLUMN excluded BOOLEAN NOT NULL DEFAULT FALSE"
+        )
+        if added:
+            # Колонку добавили мы — наш и бэкфилл (если опередил соседний
+            # процесс, бэкфилл делает он, и повторять нечего).
+            with engine.begin() as conn:
+                _mark_service_items(conn)
     _run_backfill_once("excl_samples_v1")
+
+
+def _mark_service_items(conn) -> None:
+    """Помечает excluded=True всё, что эвристика считает не товаром."""
+    rows = conn.execute(text(
+        "SELECT id, base_name, category FROM products WHERE excluded = :no"
+    ), {"no": False}).fetchall()
+    for pid in [r[0] for r in rows if is_service_item(r[1], r[2])]:
+        conn.execute(
+            text("UPDATE products SET excluded = :yes WHERE id = :pid"),
+            {"yes": True, "pid": pid},
+        )
 
 
 def _run_backfill_once(flag: str) -> None:
@@ -95,18 +112,4 @@ def _run_backfill_once(flag: str) -> None:
     Флаг в migration_flags гарантирует один запуск: пользовательское решение
     вернуть позицию в аналитику после этого не перетирается.
     """
-    with engine.begin() as conn:
-        conn.execute(text(
-            "CREATE TABLE IF NOT EXISTS migration_flags (name VARCHAR(64) PRIMARY KEY)"
-        ))
-        done = conn.execute(
-            text("SELECT 1 FROM migration_flags WHERE name = :n"), {"n": flag}
-        ).first()
-        if done:
-            return
-        rows = conn.execute(text(
-            "SELECT id, base_name, category FROM products WHERE excluded = 0"
-        )).fetchall()
-        for pid in [r[0] for r in rows if is_service_item(r[1], r[2])]:
-            conn.execute(text("UPDATE products SET excluded = 1 WHERE id = :pid"), {"pid": pid})
-        conn.execute(text("INSERT INTO migration_flags (name) VALUES (:n)"), {"n": flag})
+    run_migration_once(flag, _mark_service_items)
