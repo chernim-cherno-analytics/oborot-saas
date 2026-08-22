@@ -50,6 +50,7 @@ SUITES = [
     ("wb_dup",      "test_writeback_dup.py",   True,  False),
     ("ops",         "test_ops.py",             False, False),
     ("logging",     "test_logging.py",         False, False),
+    ("subscr",      "test_subscription.py",    False, False),
 ]
 
 TOTAL_RE = re.compile(r"ИТОГО:\s*(\d+)\s*OK,\s*(\d+)\s*FAIL")
