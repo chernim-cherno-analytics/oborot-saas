@@ -188,6 +188,11 @@ def main() -> int:
         check("триал кончился вчера — readonly",
               state_of(org_id) == subscription.READONLY, state_of(org_id))
 
+        set_org(org_id, plan="start", trial_ends_at=f"{D(3)} 00:00:00", paid_until=None)
+        check("тариф переключён, но триал ещё идёт — active (дата триала наша)",
+              state_of(org_id) == subscription.ACTIVE, state_of(org_id))
+        set_org(org_id, trial_ends_at=f"{D(-1)} 00:00:00")
+
         set_org(org_id, plan="start", paid_until=D(30))
         check("оплачено вперёд — active", state_of(org_id) == subscription.ACTIVE, state_of(org_id))
 
@@ -343,6 +348,25 @@ def main() -> int:
         gate(False)
         check("_paid_only при выключенном флаге ничего не трогает",
               scheduler._paid_only([org_id]) == [org_id])
+
+    print("\n== Предпросмотр перед включением флага ==")
+    from app.db import SessionLocal
+
+    gate(False)
+    db = SessionLocal()
+    try:
+        info = subscription.preview(db)
+    finally:
+        db.close()
+    check("предпросмотр считает все три состояния",
+          set(info["counts"]) == {"active", "grace", "readonly"}, str(info)[:160])
+    check("предпросмотр называет тех, кого закроет",
+          org_id in info["readonly_org_ids"], str(info)[:160])
+    check("предпросмотр честно говорит, что флаг сейчас выключен",
+          info["gate_enabled"] is False, str(info)[:160])
+    subscription.log_preview()  # не должен падать и не должен ничего менять
+    check("после предпросмотра состояние не изменилось",
+          state_of(org_id) == subscription.READONLY, state_of(org_id))
 
     print("\n== Сторож по всем пишущим ручкам ==")
     found = gated_routes()
