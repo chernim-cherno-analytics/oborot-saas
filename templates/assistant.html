@@ -632,16 +632,25 @@
     ]).then(function(r){ STATE.open = r[0]; STATE.cash = r[1]; });
   }
 
-  window.preview = function(step, keepEdits){
+  window.preview = function(step, keepEdits, sendEdits){
     go(step||3);
     // Правки количеств переживают пересчёт: раньше любой возврат к анкете
     // (и даже клик по шагу «3») стирал их молча.
     if(!keepEdits && Object.keys(STATE.edits).length) STATE.savedEdits = STATE.edits;
+    // sendEdits: правки уходят НА СЕРВЕР вместе с анкетой. Нужно там, где
+    // правка не просто меняет число в существующей строке, а ДОБАВЛЯЕТ
+    // позицию (позиция без себестоимости, D-23): построить такую строку может
+    // только сервер — он один знает, есть ли эта позиция у организации.
+    // Без этого поле «шт» у такой позиции молча ничего не делало.
+    var pendingEdits = sendEdits
+      ? Object.assign({}, STATE.savedEdits || {}, STATE.edits) : null;
     STATE.edits = {};
     document.getElementById("planBox").innerHTML = '<div class="loading">Считаю план…</div>';
     STATE.createdOrder = null;
+    var previewBody = brief();
+    if(pendingEdits && Object.keys(pendingEdits).length) previewBody.overrides = pendingEdits;
     Promise.all([
-      api("/api/order-plan/preview", brief()),
+      api("/api/order-plan/preview", previewBody),
       loadSideData()
     ]).then(function(rr){
       var p = rr[0];
@@ -664,7 +673,10 @@
       var q = (STATE.edits[i.base_name]!==undefined) ? STATE.edits[i.base_name] : i.qty;
       if(q<=0) return;
       pos++; units += q; cost += q*i.cost_price;
-      profit += q*Math.max(0, i.avg_price - i.cost_price);
+      // Себестоимости нет → маржа неизвестна, а не «равна всей цене продажи».
+      // Сервер по таким строкам ставит прибыль 0 намеренно (см. _manual_item);
+      // без этой проверки карточка «Валовая маржа» показывала выручку целиком.
+      if(!i.no_cost && i.cost_price > 0) profit += q*Math.max(0, i.avg_price - i.cost_price);
     });
     var share = p.cost_total ? (p.pay_now / p.cost_total) : 1;
     var cov = null, covFull = 0;
@@ -1003,8 +1015,9 @@
         var b = el.dataset.b, v = Math.max(0, parseInt(el.value, 10) || 0);
         if(v > 0) STATE.edits[b] = v; else delete STATE.edits[b];
         STATE.savedEdits = Object.assign({}, STATE.savedEdits || {}, STATE.edits);
+        if(v <= 0) delete STATE.savedEdits[b];
         saveDraft();
-        window.preview(3, true);
+        window.preview(3, true, true);
       });
     });
     // «Взять» у позиций из отсева — решение владельца сильнее алгоритма.
@@ -1234,7 +1247,7 @@
   ]).then(function(r){
     STATE.prods = r[0].productions || [];
     var st = r[1] || {};
-    STATE.safety = st.safety_days || 14;
+    STATE.safety = (st.safety_days != null) ? st.safety_days : 14;
     STATE.cadence = st.order_cadence_days || 30;
     document.getElementById("moq").value = st.moq_units || 0;
     document.getElementById("reserve").value = st.reserve_new_pct || 0;

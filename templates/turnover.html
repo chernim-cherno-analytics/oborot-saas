@@ -742,6 +742,11 @@ document.getElementById("rule-save").addEventListener("click", async ()=>{
   try{
     const r=await api("/api/discount-rule",{method:"POST",body});
     RULE=r.rule; document.getElementById("rule-modal").classList.remove("open");
+    // Порог затоварки — это и есть норма запаса (D-15): по ней считаются
+    // «Сток на N дней» и «Не хватает до нормы». Без перезагрузки страница
+    // осталась бы на старом числе и в заголовке колонки, и в расчёте — то
+    // самое расхождение, ради устранения которого норму и вынесли в настройку.
+    await load();
   }catch(err){ alert("Не сохранилось (правило меняет только владелец)"); }
 });
 
