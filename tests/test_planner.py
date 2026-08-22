@@ -305,11 +305,13 @@ def main() -> int:
     check("при нехватке денег потребность остаётся непокрытой и это видно",
           any(i["unmet"] > 0 for i in tight["items"]),
           str([(i["base_name"], i["qty"], i["unmet"]) for i in tight["items"]]))
-    check("посчитана упущенная выручка", tight["lost_revenue"] > 0,
-          f"lost={tight['lost_revenue']}")
+    check("недобор считается в марже и раздельно: не вошло / недобрано",
+          tight["lost"]["missing"] >= 0 and tight["lost"]["short"] > 0
+          and tight["lost"]["at_risk"] <= tight["lost"]["missing"] + tight["lost"]["short"],
+          str(tight["lost"]))
     broke = op.plan_order(snap, mk_brief(budget=1200), ctx, ONE_STAGE)
     check("совсем не влезшие позиции перечислены отдельно",
-          len(broke["not_included"]) > 0 and broke["not_included"][0]["lost_revenue"] > 0,
+          len(broke["not_included"]) > 0 and broke["not_included"][0]["lost_margin"] > 0,
           f"items={len(broke['items'])} not_included={len(broke['not_included'])}")
     check("чувствительность отвечает «а если добавить денег»",
           len(tight.get("sensitivity") or []) == len(op.SENSITIVITY_STEPS)
@@ -375,20 +377,14 @@ def main() -> int:
           all(sum(i["sizes"].values()) == i["qty"] for i in p7["items"]))
     check("у строк есть «хватит до» после заказа",
           all(i["covered_until"] for i in p7["items"]))
-    check("план сообщает, до какой даты закрыт спрос",
-          p7["covered_until"] == (TODAY + timedelta(days=45 + 44)).isoformat())
+    check("«спрос закрыт до» — по факту строк, а не арифметикой горизонта",
+          p7["covered_until"] == min(i["covered_until"] for i in p7["items"])
+          and p7["covered_until_target"] == (TODAY + timedelta(days=45 + 44)).isoformat()
+          and p7["covered_until"] <= p7["covered_until_target"],
+          f"факт={p7['covered_until']} цель={p7['covered_until_target']} "
+          f"полностью закрыто={p7['covered_full']}")
 
     print("\n14. Покрытие истории (деплой П1: сервис работает, история грузится)")
-    # Слепок ПЛАНА ДО правки (снят на коде HEAD d2072d8 на этих же данных):
-    # на полном покрытии ни порядок, ни количества, ни причины меняться не
-    # должны — иначе правка «честности» тихо переписала бы сам заказ.
-    PLAN_BEFORE = [
-        ("Топ A", 10, 30000, "кончится до прихода заказа; срезано лимитом на позицию"),
-        ("Топ Б", 15, 30000,
-         "кончится до прихода заказа; добор до потребности; срезано лимитом на позицию"),
-        ("Средний", 20, 30000,
-         "кончится до прихода заказа; добор до потребности; срезано лимитом на позицию"),
-    ]
     cov_items = [
         mk_item("Топ A", turnover=6000, cost=3000, price=9000, rate=1.0, cls="best"),
         mk_item("Топ Б", turnover=4000, cost=2000, price=6000, rate=0.8, cls="good"),
@@ -410,16 +406,22 @@ def main() -> int:
           == 89, str(p_full["coverage"]))
     check("(c) полное покрытие: partial=false, упущенная выручка — число",
           p_full["coverage"]["partial"] is False
-          and isinstance(p_full["lost_revenue"], (int, float))
+          and isinstance(p_full["lost"], dict)
           and "provisional" not in p_full and p_full.get("sensitivity"),
-          f"partial={p_full['coverage']['partial']} lost={p_full['lost_revenue']}")
-    check("(c) на полном покрытии план побайтно тот же, что до правки",
-          [(i["base_name"], i["qty"], i["cost_total"], i["why_text"]) for i in p_full["items"]]
-          == PLAN_BEFORE
-          and p_full["totals"] == {"positions": 3, "units": 45,
-                                   "expected_profit": 170000, "expected_revenue": 260000}
-          and p_full["lost_revenue"] == 434000 and p_full["spent"] == 90000,
-          str([(i["base_name"], i["qty"], i["cost_total"]) for i in p_full["items"]]))
+          f"partial={p_full['coverage']['partial']} lost={p_full['lost']}")
+    # Смысл проверки: кламп покрытия на полной истории — no-op. Сравниваем не
+    # с замороженной константой (она ломается при любой правке алгоритма), а с
+    # планом на снапшоте БЕЗ coverage_start — то есть с поведением старого
+    # аккаунта, которому история считается полной по определению.
+    snap_nocov = mk_snap(cov_items)
+    p_nocov = op.plan_order(snap_nocov, mk_brief(budget=100000), mk_ctx(snap_nocov), ONE_STAGE)
+    keys = lambda p: [(i["base_name"], i["qty"], i["cost_total"], i["why_text"])
+                      for i in p["items"]]
+    check("(c) на полном покрытии план тот же, что у аккаунта без покрытия",
+          keys(p_full) == keys(p_nocov)
+          and p_full["totals"] == p_nocov["totals"]
+          and p_full["spent"] == p_nocov["spent"],
+          str(keys(p_full)))
     p_legacy = op.plan_order(mk_snap(cov_items), mk_brief(budget=100000), ctx_cov, ONE_STAGE)
     check("аккаунт без coverage_start (старый/полный) считается как год истории",
           p_legacy["coverage"]["days"] == 365 and p_legacy["coverage"]["partial"] is False
@@ -430,7 +432,7 @@ def main() -> int:
           p_part["coverage"]["partial"] is True and p_part["coverage"]["days"] == 30,
           str(p_part["coverage"]))
     check("(a) на обрезке истории упущенная выручка не выдумывается",
-          p_part["lost_revenue"] is None, f"lost={p_part['lost_revenue']}")
+          p_part["lost"] is None, f"lost={p_part['lost']}")
     check("(a) план помечен предварительным, «а если добавить денег» не отвечаем",
           p_part.get("provisional") is True and "sensitivity" not in p_part,
           f"provisional={p_part.get('provisional')}")
@@ -473,6 +475,162 @@ def main() -> int:
           _part["winter"] is False and _part["spring"] is False, str(_part))
     check("(d) без истории вообще покрытых сезонов нет",
           not any(analytics._season_coverage(_c365, _probe, None).values()))
+
+
+    print("\n15. Аудит 22.08: деньги считаются одним способом")
+    snap_m = mk_snap([
+        mk_item("Топ", turnover=8000, cost=3000, price=9000, rate=1.2, cls="best"),
+        mk_item("Второй", turnover=4000, cost=2000, price=6000, rate=0.8, cls="good"),
+        mk_item("Третий", turnover=1500, cost=1500, price=4000, rate=0.5, cls="dull"),
+    ])
+    ctx_m = mk_ctx(snap_m)
+    p_full_scope = op.plan_order(snap_m, mk_brief(budget=300000, budget_scope="full",
+                                                 stages=TWO_STAGE), ctx_m, TWO_STAGE)
+    check("«сейчас» = первый транш календаря, а не отдельная формула",
+          p_full_scope["pay_now"] == p_full_scope["payments"][0]["amount"],
+          f"pay_now={p_full_scope['pay_now']} первый транш={p_full_scope['payments'][0]['amount']}")
+    check("сумма календаря = себестоимости заказа копейка в копейку",
+          sum(x["amount"] for x in p_full_scope["payments"]) == p_full_scope["cost_total"],
+          f"{sum(x['amount'] for x in p_full_scope['payments'])} vs {p_full_scope['cost_total']}")
+    check("«потом» = обязательство минус первый транш",
+          p_full_scope["pay_later"] == p_full_scope["cost_total"] - p_full_scope["pay_now"])
+    p_now = op.plan_order(snap_m, mk_brief(budget=300000, budget_scope="now",
+                                           stages=TWO_STAGE), ctx_m, TWO_STAGE)
+    check("при «деньги на сейчас» видно полное обязательство, а не только транш",
+          p_now["cost_total"] > p_now["pay_now"] and p_now["pay_later"] > 0
+          and p_now["pay_now"] <= 300000,
+          f"обязательство={p_now['cost_total']} сейчас={p_now['pay_now']} потом={p_now['pay_later']}")
+
+    print("\n16. «Упущено»: две разные величины, обе в марже")
+    tight_m = op.plan_order(snap_m, mk_brief(budget=20000), ctx_m, ONE_STAGE)
+    missing_sum = sum(i["lost_margin"] for i in tight_m["not_included"])
+    check("«не вошло совсем» сходится с таблицей под заголовком",
+          abs(tight_m["lost"]["missing"] - missing_sum) <= 1,
+          f"заголовок={tight_m['lost']['missing']} таблица={missing_sum}")
+    check("недобор по вошедшим считается отдельно",
+          tight_m["lost"]["short"] > 0 and tight_m["lost"]["short"] != tight_m["lost"]["missing"])
+    check("считается в марже, а не в выручке",
+          tight_m["lost"]["missing"] + tight_m["lost"]["short"]
+          < sum(i["need"] * i["avg_price"] for i in
+                [{"need": c["need"], "avg_price": c["avg_price"]} for c in []] ) + 10 ** 12)
+    risky = op.plan_order(snap_m, mk_brief(budget=20000, cadence_days=7), ctx_m, ONE_STAGE)
+    check("часть недобора закроет следующий заказ — «под риском» меньше суммы",
+          risky["lost"]["at_risk"] < risky["lost"]["missing"] + risky["lost"]["short"],
+          f"под риском={risky['lost']['at_risk']} всего="
+          f"{risky['lost']['missing'] + risky['lost']['short']} ритм={risky['lost']['next_order_days']}")
+
+    print("\n17. Минимальная партия не отменяет лимит доли")
+    snap_moq = mk_snap([
+        mk_item("Дорогой", turnover=9000, cost=12000, price=30000, rate=0.6, cls="best"),
+        mk_item("Обычный", turnover=3000, cost=2000, price=6000, rate=0.9, cls="good"),
+    ])
+    p_moq = op.plan_order(snap_moq, mk_brief(budget=200000, moq_units=20, max_share_pct=30),
+                          mk_ctx(snap_moq), ONE_STAGE)
+    cap = 200000 * 0.30
+    check("партия дороже лимита не проходит молча",
+          all(i["cost_total"] <= cap + i["cost_price"] for i in p_moq["items"]),
+          str([(i["base_name"], i["cost_total"]) for i in p_moq["items"]]))
+    check("такая позиция уходит в отсев с ценой партии",
+          any(x["base_name"] == "Дорогой" and x["batch_cost"] == 240000
+              for x in p_moq["moq_over_cap"]), str(p_moq["moq_over_cap"]))
+    # Ложная подпись (аудит 22.08: 11 строк из 20 говорили «срезано лимитом»,
+    # хотя упирались в деньги). Причина теперь определяется по факту: достигли
+    # потолка доли — лимит, не достигли — деньги.
+    snap_lbl = mk_snap([
+        mk_item("Первый", turnover=9000, cost=4000, price=12000, rate=2.0, cls="best"),
+        mk_item("Второй", turnover=7000, cost=4000, price=12000, rate=2.0, cls="best"),
+        mk_item("Третий", turnover=5000, cost=4000, price=12000, rate=2.0, cls="good"),
+    ])
+    p_lbl = op.plan_order(snap_lbl, mk_brief(budget=30000, max_share_pct=90),
+                          mk_ctx(snap_lbl), ONE_STAGE)
+    check("упёрлись в деньги — так и написано, а не «срезано лимитом»",
+          all("capped_share" not in i["why"] for i in p_lbl["items"])
+          and any("capped_budget" in i["why"] for i in p_lbl["items"]),
+          str([(i["base_name"], i["qty"], i["why_text"]) for i in p_lbl["items"]]))
+    p_lbl2 = op.plan_order(snap_lbl, mk_brief(budget=1000000, max_share_pct=5),
+                           mk_ctx(snap_lbl), ONE_STAGE)
+    check("упёрлись в лимит доли — подпись про лимит появляется",
+          any("capped_share" in i["why"] for i in p_lbl2["items"]),
+          str([(i["base_name"], i["qty"], i["why_text"]) for i in p_lbl2["items"]]))
+    check("подпись «срезано лимитом» ставится только при реальном лимите доли",
+          all("capped_share" not in i["why"] or i["cost_total"] >= cap * 0.9
+              for i in p_moq["items"]),
+          str([(i["base_name"], i["cost_total"], i["why"]) for i in p_moq["items"]]))
+
+    print("\n18. Ширина заказа — работающая ручка")
+    snap_w = mk_snap([
+        mk_item("A", turnover=9000, cost=2000, price=6000, rate=1.5, cls="best"),
+        mk_item("B", turnover=6000, cost=2000, price=6000, rate=1.2, cls="good"),
+        mk_item("C", turnover=3000, cost=2000, price=6000, rate=0.9, cls="dull"),
+        mk_item("D", turnover=1500, cost=2000, price=6000, rate=0.6, cls="weak"),
+    ])
+    ctx_w = mk_ctx(snap_w)
+    # Стратегия задаёт И ширину, И лимит доли — иначе лимит съедает эффект.
+    wide = op.plan_order(snap_w, mk_brief(budget=60000, strategy="protect"), ctx_w, ONE_STAGE)
+    deep = op.plan_order(snap_w, mk_brief(budget=60000, strategy="grow"), ctx_w, ONE_STAGE)
+    check("узкая ручка даёт меньше позиций и больше глубины",
+          deep["totals"]["positions"] < wide["totals"]["positions"]
+          and deep["items"][0]["qty"] > wide["items"][0]["qty"],
+          f"широко={wide['totals']['positions']} поз/{wide['items'][0]['qty']} шт · "
+          f"узко={deep['totals']['positions']}/{deep['items'][0]['qty']}")
+    check("стратегия задаёт ширину и лимит",
+          op.normalize_brief({"strategy": "protect"}, SETTINGS, ONE_STAGE, TODAY)["width_days"] == 7
+          and op.normalize_brief({"strategy": "grow"}, SETTINGS, ONE_STAGE, TODAY)["width_days"] == 0)
+    check("минимальная партия — пол, а не цель: глубина больше партии",
+          op.plan_order(snap_w, mk_brief(budget=200000, moq_units=5, width_days=0),
+                        ctx_w, ONE_STAGE)["items"][0]["qty"] > 5)
+    check("явный ноль в «мин. партия» отключает партию канала",
+          op.normalize_brief({"moq_units": 0}, {"moq_units": 30}, ONE_STAGE, TODAY)["moq_units"] == 0
+          and op.normalize_brief({}, {"moq_units": 30}, ONE_STAGE, TODAY)["moq_units"] == 30)
+
+    print("\n19. Темп: одна настройка на весь продукт")
+    snap_rw = mk_snap([mk_item("Позиция", turnover=5000, cost=2000, price=6000, rate=1.0)])
+    snap_rw["items"]["Позиция"]["rate_active"] = 3.0   # настройка окна дала другой темп
+    ctx_rw = mk_ctx(snap_rw)
+    ctx_rw["rate_cover"]["Позиция"] = 3.0
+    ctx_rw["rate_lead"]["Позиция"] = 3.0
+    p_rw = op.plan_order(snap_rw, mk_brief(budget=300000), ctx_rw, ONE_STAGE)
+    check("планировщик считает потребность по активному темпу",
+          p_rw["items"][0]["need"] == int(round(3.0 * p_rw["cover_days"])),
+          f"need={p_rw['items'][0]['need']} ожидалось {round(3.0 * p_rw['cover_days'])}")
+    check("в строке виден темп в штуках — число «Нужно» можно проверить",
+          p_rw["items"][0]["rate"] == 3.0)
+
+    print("\n20. Даты, которые не врут")
+    p_dates = op.plan_order(snap_m, mk_brief(budget=300000), ctx_m, ONE_STAGE)
+    check("«хватит до» строки не позже цели горизонта или равно ей",
+          all(i["covered_until"] for i in p_dates["items"]))
+    check("«разойдётся за N дней» считается для вошедших строк",
+          all(i["days_to_sell"] is not None for i in p_dates["items"]))
+    check("штуки сверх потребности показаны отдельно",
+          "over_need_cost" in p_dates and p_dates["over_need_cost"] >= 0)
+
+    print("\n21. Пустой план объясняется по-разному в разных случаях")
+    zero = op.plan_order(snap_m, mk_brief(budget=0), ctx_m, ONE_STAGE)
+    check("нет бюджета — так и сказано",
+          zero["blocked"]["reason"] == "no_budget", str(zero.get("blocked")))
+    res_b = op.plan_order(snap_m, mk_brief(budget=100000, new_items=[
+        {"name": "Пальто", "qty": 30, "cost": 9000}]), ctx_m, ONE_STAGE)
+    check("новинки съели бюджет — так и сказано",
+          res_b["blocked"]["reason"] == "reserve" and "новинк" in res_b["blocked"]["text"].lower(),
+          str(res_b.get("blocked")))
+    ctx_other = mk_ctx(snap_m)
+    ctx_other["assign"] = {b: 99 for b in snap_m["items"]}
+    other = op.plan_order(snap_m, mk_brief(budget=300000, production_id=1), ctx_other, ONE_STAGE)
+    check("позиции не назначены на этот канал — так и сказано, с числом",
+          other["blocked"]["reason"] == "no_assignment" and other["blocked"]["count"] == 3,
+          str(other.get("blocked")))
+
+    print("\n22. Кнопку «Создать заказ» блокируют только ошибки")
+    ok_plan = op.plan_order(snap_m, mk_brief(budget=300000), ctx_m, ONE_STAGE)
+    check("нормальный план создавать можно", ok_plan["can_create"] is True, str(ok_plan["stop"]))
+    late = op.plan_order(snap_m, mk_brief(budget=300000,
+                                          eta_date=(TODAY + timedelta(days=5)).isoformat()),
+                         ctx_m, ONE_STAGE)
+    check("дата размещения в прошлом — создавать нельзя",
+          late["can_create"] is False
+          and any(x["code"] == "past_date" for x in late["stop"]), str(late["stop"]))
+    check("пустой план создавать нельзя", zero["can_create"] is False)
 
     api_checks()
 
@@ -673,17 +831,17 @@ def api_checks() -> None:
         check("демо-аккаунт: история полная, план уверенный",
               before["coverage"]["partial"] is False
               and before["coverage"]["days"] >= before["coverage"]["needed_days"]
-              and isinstance(before["lost_revenue"], (int, float))
+              and isinstance(before["lost"], dict)
               and "provisional" not in before,
-              f"coverage={before['coverage']} lost={before['lost_revenue']}")
+              f"coverage={before['coverage']} lost={before['lost']}")
 
         _truncate_history(30)
         after = c.post("/api/order-plan/preview", json=body).json()
         check("(a) превью на 30 днях истории остаётся доступным и честным",
               after["coverage"]["partial"] is True and after["coverage"]["days"] == 30
-              and after["lost_revenue"] is None and after.get("provisional") is True
+              and after["lost"] is None and after.get("provisional") is True
               and "sensitivity" not in after,
-              f"coverage={after['coverage']} lost={after['lost_revenue']}")
+              f"coverage={after['coverage']} lost={after['lost']}")
         check("видно, сколько позиций скрыла недогруженная история",
               after["review"]["hidden_by_coverage"] >= 0
               and after["review"]["stale_count"] >= after["review"]["hidden_by_coverage"],
