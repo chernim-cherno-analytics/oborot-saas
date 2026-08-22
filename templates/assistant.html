@@ -579,7 +579,10 @@
     }
     var maxV = 1;
     c.weeks.forEach(function(w, i){ if(w.amount + mine[i] > maxV) maxV = w.amount + mine[i]; });
-    var run = (c.overdue && c.overdue.amount) || 0;
+    // Сальдо считаем от нуля: платежи с прошедшими датами показаны отдельной
+    // строкой и в накопительное не входят — иначе календарь открывается
+    // цифрой в 6 млн и читается как «это надо заплатить на следующей неделе».
+    var run = 0;
     for(var i=0; i<=Math.max(last, 3) && i<c.weeks.length; i++){
       var w = c.weeks[i], my = mine[i], tot = w.amount + my;
       run += tot;
