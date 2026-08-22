@@ -1,0 +1,91 @@
+# Проверка каждого изменения до того, как оно попадёт на прод.
+#
+# Раньше единственной проверкой был ручной прогон тестов у того, кто правил код,
+# и никакой гарантии, что он вообще был. Прод при этом обновляется автоматически
+# из main — то есть непроверенное изменение доезжает до клиента само.
+#
+# Четыре шага, ровно как договорились: установка зафиксированных зависимостей →
+# все наборы тестов → smoke старта приложения → smoke миграций.
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Установка зависимостей
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Все наборы тестов
+        # По три набора одновременно: на двухъядерном раннере одиннадцать
+        # параллельных приложений мешают друг другу и дают ложные падения.
+        run: python tests/run_all.py --jobs 3
+        env:
+          OBOROT_COMMIT: ${{ github.sha }}
+
+      - name: Smoke — приложение стартует на чистой базе
+        run: |
+          python - <<'PY'
+          import os
+          os.environ["DATABASE_URL"] = "sqlite:///ci_smoke.db"
+          os.environ["SCHEDULER_ENABLED"] = "0"
+          from fastapi.testclient import TestClient
+          from app.main import app
+          with TestClient(app) as c:
+              live = c.get("/health/live")
+              ready = c.get("/health/ready")
+              assert live.status_code == 200, live.text
+              assert ready.status_code == 200, ready.text
+              body = ready.json()
+              assert body.get("startup") and body.get("db"), body
+              assert c.get("/login").status_code == 200
+              print("smoke старта:", body)
+          PY
+
+      - name: Smoke — миграции на базе прежней схемы
+        # Проверяем не «создаётся ли схема с нуля» (это делает шаг выше), а то,
+        # что приложение поднимается на базе, где новых колонок ещё нет.
+        run: |
+          python - <<'PY'
+          import os, sqlite3
+          db = "ci_old.db"
+          con = sqlite3.connect(db)
+          con.executescript("""
+            CREATE TABLE orgs (id INTEGER PRIMARY KEY, name VARCHAR(255) NOT NULL,
+                               plan VARCHAR(32) NOT NULL DEFAULT 'trial',
+                               settings_json TEXT NOT NULL DEFAULT '{}');
+            CREATE TABLE productions (id INTEGER PRIMARY KEY, org_id INTEGER NOT NULL,
+                               name VARCHAR(120) NOT NULL,
+                               is_main BOOLEAN NOT NULL DEFAULT 0);
+            INSERT INTO orgs (name) VALUES ('Старый бренд');
+            INSERT INTO productions (org_id, name, is_main) VALUES (1, 'Старый цех', 1);
+          """)
+          con.commit(); con.close()
+          os.environ["DATABASE_URL"] = f"sqlite:///{db}"
+          os.environ["SCHEDULER_ENABLED"] = "0"
+          from fastapi.testclient import TestClient
+          from app.main import app
+          with TestClient(app) as c:
+              assert c.get("/health/ready").status_code == 200
+          con = sqlite3.connect(db)
+          cols = {r[1] for r in con.execute("PRAGMA table_info(productions)")}
+          con.close()
+          missing = {"lead_time_days", "moq", "pack_multiple", "stages_json"} - cols
+          assert not missing, f"миграции не добавили колонки: {missing}"
+          print("smoke миграций: колонки на месте, приложение поднялось")
+          PY
