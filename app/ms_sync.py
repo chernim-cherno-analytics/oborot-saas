@@ -160,6 +160,19 @@ def ensure_schema(bind=None) -> None:
                 "ALTER TABLE production_orders ADD COLUMN production_id INTEGER",
                 bind=eng,
             )
+        # 22.08 (очередь 3): кто создал заказ.
+        if "created_by" not in cols:
+            run_migration_step(
+                "ALTER TABLE production_orders ADD COLUMN created_by INTEGER",
+                bind=eng,
+            )
+    if insp.has_table("order_plans"):
+        cols = {c["name"] for c in insp.get_columns("order_plans")}
+        if "created_by" not in cols:
+            run_migration_step(
+                "ALTER TABLE order_plans ADD COLUMN created_by INTEGER",
+                bind=eng,
+            )
     if insp.has_table("productions"):
         cols = {c["name"] for c in insp.get_columns("productions")}
         if "cadence_days" not in cols:

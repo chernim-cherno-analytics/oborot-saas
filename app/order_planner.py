@@ -52,6 +52,11 @@ MIN_WINDOW_NQ = 2       # и меньше продаж в окне — сезо�
 MOQ_MAX_COVER_DAYS = 120  # партия дольше этого срока не окупает минимум
 BASE_WAVE_DAYS = 14     # волна «База» без MOQ: минимум — покрытие двух недель
 SENSITIVITY_STEPS = (1.25, 1.5)  # «а если добавить денег»
+# Сколько строк отдаём в списках отсева. Было 50 «чтобы не раздувать ответ»,
+# но у каталога на 1000+ позиций это молча прятало большую часть отсева, и
+# экран выглядел так, будто система рассмотрела 50 позиций из 900.
+# Полные счётчики отдаются рядом со списком, обрезку видно.
+LIST_CAP = 500
 
 # Профили стратегии. Аудит 22.08.2026 показал, что три плитки давали
 # ОДИНАКОВЫЙ план (19 поз / 191 шт / 837 885 ₽ при любом лимите доли): фильтр
@@ -82,7 +87,7 @@ WIDTH_CHOICES = (7, 14, 21, 30, 0)  # 0 = до полной потребност
 
 # Порядок причин в подписи строки: сначала зачем позиция в заказе, потом
 # что ограничило количество — так фраза читается как объяснение, а не как лог.
-REASON_ORDER = ("must_have", "gap", "base", "deepen", "moq",
+REASON_ORDER = ("must_have", "gap", "base", "deepen", "moq", "pack",
                 "capped_share", "capped_budget")
 
 REASON_TEXT = {
@@ -93,6 +98,7 @@ REASON_TEXT = {
     "capped_share": "срезано лимитом на позицию",
     "capped_budget": "дальше деньги закончились",
     "moq": "округлено до минимальной партии",
+    "pack": "округлено до кратности упаковки",
 }
 
 # Пресеты этапов для анкеты (клиент выбирает, дальше правит сроки).
@@ -392,6 +398,10 @@ def normalize_brief(raw: dict | None, settings: dict, stages: list[dict], today:
         "moq_units": _int("moq_units", settings.get("moq_units", 0), 0, 10000),
         "moq_explicit": raw.get("moq_units") is not None and raw.get("moq_units") != "",
         "reserve_new_pct": _int("reserve_new_pct", settings.get("reserve_new_pct", 0), 0, 90),
+        # Накладные расходы к себестоимости: дефолт — настройка организации,
+        # но на конкретный заказ (растаможка, срочная доставка) их можно
+        # поменять прямо в анкете.
+        "overhead_pct": _int("overhead_pct", settings.get("overhead_pct", 0), 0, 200),
         "exclude_categories": [str(c) for c in cats if str(c).strip()],
         "must_have": [str(b) for b in must if str(b).strip()],
         "new_items": new_items,
@@ -520,8 +530,14 @@ def collect_context(db: Session, org: Org, snap: dict, brief: dict) -> dict:
         peaks = json.loads(org.settings_json or "{}").get("peak_periods")
     except (ValueError, AttributeError):
         peaks = None
+    extra = analytics.extra_settings(org)
     return {
         "cover_days": cover,
+        "overhead_pct": extra["overhead_pct"],
+        # Правило распределения включено — значит «нет признака» это факт,
+        # о котором стоит сказать в строке плана, а не молчание.
+        "assign_source_on": extra["assign_source"] != "manual",
+        "pack_multiple": _pack_multiple(db, brief.get("production_id")),
         "peak_periods": peaks if isinstance(peaks, list) else [],
         "rate_lead": rate_lead,
         "rate_cover": rate_cover,
@@ -533,6 +549,20 @@ def collect_context(db: Session, org: Org, snap: dict, brief: dict) -> dict:
         "assign": assign,
         "main_production_id": _main_production_id(db, org.id),
     }
+
+
+def _pack_multiple(db: Session, pid) -> int:
+    """Кратность упаковки канала: короб, рулон, пачка. 0/1 — кратности нет.
+
+    Заказать 37 футболок, когда подрядчик пакует по 12, нельзя: 37 всё равно
+    превратятся в 48, только про эти 11 штук узнают уже после отгрузки.
+    """
+    if not pid:
+        return 0
+    prod = db.get(Production, int(pid))
+    if prod is None:
+        return 0
+    return max(0, int(getattr(prod, "pack_multiple", 0) or 0))
 
 
 def _main_production_id(db: Session, org_id: int) -> int | None:
@@ -557,6 +587,9 @@ def _candidates(snap: dict, brief: dict, ctx: dict) -> tuple[list[dict], dict]:
     pid = brief.get("production_id")
     assign = ctx.get("assign") or {}
     main_pid = ctx.get("main_production_id")
+    # Анкета сильнее общей настройки: на конкретный заказ накладные могут
+    # отличаться (растаможка, срочная доставка).
+    overhead = float(brief.get("overhead_pct", ctx.get("overhead_pct") or 0) or 0)
 
     rows, skipped = [], {
         "archived": [], "hidden": [], "stale": [], "small_need": [],
@@ -597,6 +630,12 @@ def _candidates(snap: dict, brief: dict, ctx: dict) -> tuple[list[dict], dict]:
             skipped["small_need"].append(base)
             continue
         cost = float(it.get("cost_price") or 0)
+        # Накладные (доставка, таможня, брак, упаковка) — настройка организации.
+        # У многих брендов «себестоимость» в МойСкладе это цена подрядчика,
+        # а партия обходится дороже; без этого мастер систематически занижал
+        # и деньги заказа, и требуемый бюджет.
+        if cost > 0 and overhead > 0:
+            cost = cost * (1.0 + overhead / 100.0)
         price = float(it.get("avg_price") or it.get("sale_price") or 0)
         row = {
             "base_name": base,
@@ -616,6 +655,10 @@ def _candidates(snap: dict, brief: dict, ctx: dict) -> tuple[list[dict], dict]:
             "margin": max(0.0, price - cost),
             "sizes": it.get("sizes") or {},
             "must_have": base in must,
+            # Позиция без признака распределения (поставщик/папка не заполнены):
+            # она попала в этот канал «по умолчанию», а не потому что так решили.
+            "no_supplier": bool(ctx.get("assign_source_on")
+                                and not ctx.get("assign", {}).get(base)),
         }
         if cost <= 0:
             skipped["no_cost"].append(row)   # деньги посчитать нельзя — отдельным списком
@@ -639,6 +682,7 @@ def _allocate(cands: list[dict], brief: dict, ctx: dict, stages: list[dict]) -> 
         (у этапа могут быть свои минимумы по категориям — см. stage_moq)."""
         return max(brief_moq, stage_moq(stages, c["category"]))
 
+    pack = max(0, int(ctx.get("pack_multiple") or 0))
     budget = float(brief["budget"])
     # Резерв на новинки: либо процент от бюджета, либо сумма вписанных вручную
     # новинок — что больше. Эти деньги планировщик не распределяет.
@@ -700,14 +744,25 @@ def _allocate(cands: list[dict], brief: dict, ctx: dict, stages: list[dict]) -> 
                 target = by_cap
         if target <= have:
             return
+        # Кратность упаковки канала: подрядчик отгружает коробами/рулонами,
+        # поэтому цель округляем ВВЕРХ до кратного и деньги считаем уже по ней.
+        # Округлять постфактум нельзя — заказ вылезал бы за бюджет после того,
+        # как план показан.
+        if pack > 1:
+            target = -(-target // pack) * pack
         rest = money - spent
         afford = int(math.floor(rest / unit))
         add = min(target - have, afford)
-
+        if pack > 1 and have + add > 0:
+            # По карману может быть меньше кратного — берём ближайший вниз
+            # полный короб; ноль означает «даже один короб не влезает».
+            add = (((have + add) // pack) * pack) - have
         if add <= 0:
             # Минимальная партия целиком не влезла — позиция остаётся без заказа.
             return
         qty = have + add
+        if pack > 1:
+            reasons.setdefault(base, []).append("pack")
         # Минимальная партия — это МИНИМУМ на модель, а не кратность: меньше неё
         # производство не берёт, выше — можно любое количество.
         moq = moq_of(c)
@@ -728,7 +783,7 @@ def _allocate(cands: list[dict], brief: dict, ctx: dict, stages: list[dict]) -> 
                 return
             if (moq - have) * unit > rest:
                 return  # партия не по карману
-            qty = moq
+            qty = -(-moq // pack) * pack if pack > 1 else moq
             reasons.setdefault(base, []).append("moq")
         spent += (qty - have) * unit
         alloc[base] = qty
@@ -861,7 +916,11 @@ def plan_order(snap: dict, brief: dict, ctx: dict, stages: list[dict],
             "avg_price": c["avg_price"],
             "cost_total": round(qty * c["cost_price"]),
             "pay_now": round(qty * c["cost_price"] * res["pay_share"]),
-            "expected_profit": round(qty * c["margin"]),
+            # Маржа считается ТОЛЬКО по спросу: штуки сверх потребности
+            # горизонта в нём не продадутся, и обещать по ним прибыль —
+            # то же самое, что обещать её по неликвиду.
+            "expected_profit": round(min(qty, c["need"]) * c["margin"]),
+            "over_need_profit": round(max(0, qty - c["need"]) * c["margin"]),
             # Сколько дней разойдётся заказанная партия. Это защита от ловушки
             # «дорогая медленная позиция с высокой маржой»: она видна прямо
             # в строке, а не только в отсеве по минимальной партии.
@@ -869,6 +928,7 @@ def plan_order(snap: dict, brief: dict, ctx: dict, stages: list[dict],
             # Штуки сверх потребности (следствие минимальной партии) — деньги,
             # которые лягут в запас, а не отработают в горизонте заказа.
             "over_need": max(0, qty - c["need"]),
+            "no_supplier": c.get("no_supplier", False),
             "runs_out": (today + timedelta(days=min(days_now, 3650))).isoformat()
             if days_now is not None else None,
             "covered_until": (eta + timedelta(days=min(days_after, 3650))).isoformat()
@@ -892,8 +952,7 @@ def plan_order(snap: dict, brief: dict, ctx: dict, stages: list[dict],
     pay_now = payments[0]["amount"] if payments else cost_total
     pay_later = max(0, cost_total - pay_now)
     over_need_cost = sum(round(i["over_need"] * i["cost_price"]) for i in items)
-    over_need_profit = sum(round(i["over_need"] * max(0, i["avg_price"] - i["cost_price"]))
-                           for i in items)
+    over_need_profit = sum(i["over_need_profit"] for i in items)
     # Что из недобора реально теряется, а что закроет следующий заказ: при ритме
     # 7 дней и окне 21 день до прихода следующего успевает потеряться примерно
     # треть. Показываем и то и другое, чтобы «упущено» не звало занимать деньги.
@@ -936,6 +995,10 @@ def plan_order(snap: dict, brief: dict, ctx: dict, stages: list[dict],
         "pay_later": pay_later,
         "over_need_cost": over_need_cost,
         "over_need_profit": over_need_profit,
+        # Накладные и кратность — чтобы экран мог объяснить, откуда цифры.
+        "overhead_pct": int(brief.get("overhead_pct", ctx.get("overhead_pct") or 0) or 0),
+        "pack_multiple": int(ctx.get("pack_multiple") or 0),
+        "no_supplier_count": sum(1 for i in items if i.get("no_supplier")),
         "stages": stage_schedule(order_date, stages),
         "payments": payments,
         "new_items": list(brief.get("new_items") or []),
@@ -964,23 +1027,26 @@ def plan_order(snap: dict, brief: dict, ctx: dict, stages: list[dict],
         "totals": {
             "positions": len(items),
             "units": sum(i["qty"] for i in items),
+            # Себестоимость заказа в итогах: её читает история планов и
+            # выгрузка — раньше приходилось складывать строки заново.
+            "cost": cost_total,
             "expected_profit": sum(i["expected_profit"] for i in items),
             "expected_revenue": sum(i["qty"] * i["avg_price"] for i in items),
         },
         "moq_skipped": [
             {"base_name": b, "days": d} for b, d in
-            sorted(res["moq_skipped"].items(), key=lambda kv: kv[1])[:50]
+            sorted(res["moq_skipped"].items(), key=lambda kv: kv[1])[:LIST_CAP]
         ],
         # Партия физически дороже лимита доли на позицию — раньше она молча
         # его нарушала (80,6% бюджета при лимите 30%), теперь позиция уходит
         # сюда с ценой партии, и человек решает сам.
         "moq_over_cap": [
             {"base_name": b, "batch_cost": v, "limit": round(res["cap_per_item"])}
-            for b, v in sorted(res["moq_over_cap"].items(), key=lambda kv: -kv[1])[:50]
+            for b, v in sorted(res["moq_over_cap"].items(), key=lambda kv: -kv[1])[:LIST_CAP]
         ],
         "review": {  # то, что система считать не берётся — решает человек
-            "low_data": [_short(r) for r in skipped["low_data"]][:50],
-            "no_cost": [_short(r) for r in skipped["no_cost"]][:50],
+            "low_data": [_short(r) for r in skipped["low_data"]][:LIST_CAP],
+            "no_cost": [_short(r) for r in skipped["no_cost"]][:LIST_CAP],
             "no_cost_count": len(skipped["no_cost"]),
             "low_data_count": len(skipped["low_data"]),
             "stale_count": len(skipped["stale"]),

@@ -157,6 +157,7 @@ def _order_out(order: ProductionOrder) -> dict:
         "total_qty": sum(int(i.get("qty") or 0) for i in items),
         "total_cost": round(sum(float(i.get("cost") or 0) * int(i.get("qty") or 0) for i in items)),
         "production_id": order.production_id,
+        "created_by": order.created_by,
     }
 
 
@@ -281,7 +282,18 @@ def api_orders(ctx: AuthContext = Depends(require_auth_api), db: Session = Depen
         .where(ProductionOrder.org_id == ctx.org.id)
         .order_by(ProductionOrder.created_at.desc())
     ).scalars().all()
-    return {"orders": [_order_out(o) for o in orders]}
+    # Имена авторов одним запросом: в списке заказов «кто это создал» —
+    # первый вопрос, когда с системой работает больше одного человека.
+    ids = {o.created_by for o in orders if o.created_by}
+    authors = {}
+    if ids:
+        authors = {
+            str(uid): (name or email or "")
+            for uid, name, email in db.execute(
+                select(User.id, User.name, User.email).where(User.id.in_(ids))
+            ).all()
+        }
+    return {"orders": [_order_out(o) for o in orders], "authors": authors}
 
 
 # Окно защиты от случайного повтора заказа. Двойной тап на телефоне, ретрай
@@ -409,7 +421,8 @@ def api_create_order(
             db.commit()
             return {"ok": True, "id": twin.id, "status": twin.status,
                     "duplicate": True, "message": _DUPLICATE_ORDER_MESSAGE}
-    analytics.invalidate(ctx.org.id)
+    # Снапшот не роняем: черновик не меняет ни остатков, ни «едет к нам»
+    # (см. api_order_plan_apply) — кэш сбрасывается при переводе в производство.
     return {"ok": True, "id": order.id, "status": "draft"}
 
 
@@ -573,6 +586,7 @@ def api_settings(ctx: AuthContext = Depends(require_auth_api), db: Session = Dep
         "cover_days": analytics.cover_days({**settings, **extra}),
         "moq_units": extra["moq_units"],
         "reserve_new_pct": extra["reserve_new_pct"],
+        "overhead_pct": extra["overhead_pct"],
         "price_type_sale": extra["price_type_sale"],
         "price_type_cost": extra["price_type_cost"],
         # Что за типы цен вообще встретились в ассортименте МойСклада —
@@ -611,6 +625,7 @@ class SettingsIn(BaseModel):
     safety_days: int | None = Field(default=None, ge=0, le=120)
     moq_units: int | None = Field(default=None, ge=0, le=10000)
     reserve_new_pct: int | None = Field(default=None, ge=0, le=90)
+    overhead_pct: int | None = Field(default=None, ge=0, le=200)
     price_type_sale: str | None = Field(default=None, max_length=128)
     price_type_cost: str | None = Field(default=None, max_length=128)
     peak_periods: list[dict] | None = None
@@ -661,7 +676,7 @@ def api_update_settings(
     if body.lead_time_days is not None:
         extra["lead_time_days"] = body.lead_time_days
     for key in ("cover_mode", "order_cadence_days", "safety_days",
-                "moq_units", "reserve_new_pct", "price_type_sale",
+                "moq_units", "reserve_new_pct", "overhead_pct", "price_type_sale",
                 "price_type_cost", "peak_periods"):
         val = getattr(body, key)
         if val is not None:
@@ -1437,6 +1452,9 @@ class OrderPlanIn(BaseModel):
     max_share_pct: int | None = None
     moq_units: int | None = None
     reserve_new_pct: int | None = None
+    # Накладные к себестоимости на ЭТОТ заказ (растаможка, срочная доставка).
+    # None = берём общую настройку организации.
+    overhead_pct: int | None = Field(default=None, ge=0, le=200)
     exclude_categories: list[str] = Field(default_factory=list)
     must_have: list[str] = Field(default_factory=list)
     # Новинки без истории продаж: владелец вписывает их руками
@@ -1479,7 +1497,11 @@ def _apply_overrides(plan: dict, overrides: dict, snap: dict) -> None:
         it["unmet"] = max(0, it["need"] - qty)
         it["over_need"] = max(0, qty - it["need"])
         it["cost_total"] = round(qty * it["cost_price"])
-        it["expected_profit"] = round(qty * max(0, it["avg_price"] - it["cost_price"]))
+        # Маржа — только по спросу (как в планировщике): штуки сверх
+        # потребности в горизонте заказа не продадутся.
+        margin = max(0, it["avg_price"] - it["cost_price"])
+        it["expected_profit"] = round(min(qty, it["need"]) * margin)
+        it["over_need_profit"] = round(max(0, qty - it["need"]) * margin)
         src = (snap["items"].get(base) or {}).get("sizes") or {}
         it["sizes"] = size_split(src, qty)
         rate = it.get("rate") or 0
@@ -1505,11 +1527,13 @@ def _apply_overrides(plan: dict, overrides: dict, snap: dict) -> None:
     )
     plan["pay_now"] = plan["payments"][0]["amount"] if plan["payments"] else plan["cost_total"]
     plan["pay_later"] = max(0, plan["cost_total"] - plan["pay_now"])
-    plan["spent"] = plan["pay_now"] if plan["budget_scope"] == "now" else plan["cost_total"]
+    # Сравниваем с той же базой, что и движок: при нулевой предоплате
+    # «деньги на сейчас» не существуют и бюджет меряется полной стоимостью.
+    plan["spent"] = (plan["pay_now"] if plan.get("budget_basis") == "now"
+                     else plan["cost_total"])
     plan["rest"] = plan["budget"] - plan["reserve_new"] - plan["spent"]
     plan["over_need_cost"] = sum(round(i["over_need"] * i["cost_price"]) for i in plan["items"])
-    plan["over_need_profit"] = sum(
-        round(i["over_need"] * max(0, i["avg_price"] - i["cost_price"])) for i in plan["items"])
+    plan["over_need_profit"] = sum(i.get("over_need_profit", 0) for i in plan["items"])
     plan["covered_until"] = min(
         (i["covered_until"] for i in plan["items"] if i["covered_until"]), default=None)
     plan["covered_full"] = sum(
@@ -1525,6 +1549,7 @@ def _apply_overrides(plan: dict, overrides: dict, snap: dict) -> None:
     plan["totals"] = {
         "positions": len(plan["items"]),
         "units": sum(i["qty"] for i in plan["items"]),
+        "cost": sum(i["cost_total"] for i in plan["items"]),
         "expected_profit": sum(i["expected_profit"] for i in plan["items"]),
         "expected_revenue": sum(i["qty"] * i["avg_price"] for i in plan["items"]),
     }
@@ -1586,6 +1611,7 @@ def api_order_plan_save(
     row = OrderPlan(
         org_id=ctx.org.id,
         status="draft",
+        created_by=ctx.user.id,
         brief_json=json.dumps(plan["brief"], ensure_ascii=False),
         computed_json=json.dumps(
             {
@@ -1625,6 +1651,78 @@ def api_order_plan_last(
     if row is None:
         return {"brief": None}
     return {"brief": row.brief, "id": row.id, "created_at": row.created_at.isoformat()}
+
+
+def _plan_row_out(row, names: dict, prods: dict) -> dict:
+    """Строка истории планов: что решили, на сколько и чем кончилось."""
+    brief = row.brief
+    try:
+        result = json.loads(row.result_json or "{}")
+    except ValueError:
+        result = {}
+    totals = result.get("totals") or {}
+    return {
+        "id": row.id,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "status": row.status,
+        "order_id": row.production_order_id,
+        "author": names.get(row.created_by or 0, ""),
+        "production_id": brief.get("production_id"),
+        "production_name": prods.get(brief.get("production_id") or 0, ""),
+        "budget": int(brief.get("budget") or 0),
+        "eta_date": brief.get("eta_date"),
+        "positions": int(totals.get("positions") or 0),
+        "units": int(totals.get("units") or 0),
+        "cost": int(totals.get("cost") or 0),
+    }
+
+
+@router.get("/order-plan/history")
+def api_order_plan_history(
+    limit: int = 20, ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)
+):
+    """Прошлые планы: «повторить как в прошлый раз» и разбор задним числом.
+
+    Аудит 22.08: единственным следом решения был сам заказ — без бюджета, срока
+    и условий, при которых он собирался. Бриф хранился, но достать его можно
+    было только последним (`/order-plan/last`).
+    """
+    from app.models import OrderPlan
+    rows = db.execute(
+        select(OrderPlan).where(OrderPlan.org_id == ctx.org.id)
+        .order_by(OrderPlan.created_at.desc(), OrderPlan.id.desc())
+        .limit(max(1, min(100, int(limit or 20))))
+    ).scalars().all()
+    ids = {r.created_by for r in rows if r.created_by}
+    names = {}
+    if ids:
+        names = {
+            uid: (name or email or "")
+            for uid, name, email in db.execute(
+                select(User.id, User.name, User.email).where(User.id.in_(ids))
+            ).all()
+        }
+    prods = {
+        p.id: p.name
+        for p in db.execute(
+            select(Production).where(Production.org_id == ctx.org.id)
+        ).scalars()
+    }
+    return {"plans": [_plan_row_out(r, names, prods) for r in rows]}
+
+
+@router.get("/order-plan/{plan_id}/brief")
+def api_order_plan_brief(
+    plan_id: int = _id_path(),
+    ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db),
+):
+    """Анкета прошлого плана — для кнопки «Повторить»."""
+    from app.models import OrderPlan
+    row = db.get(OrderPlan, plan_id)
+    if row is None or row.org_id != ctx.org.id:
+        raise HTTPException(404, "План не найден")
+    return {"brief": row.brief, "id": row.id,
+            "created_at": row.created_at.isoformat() if row.created_at else None}
 
 
 class PlanApplyIn(BaseModel):
@@ -1727,6 +1825,7 @@ def api_order_plan_apply(
         name=(body.name.strip() or f"Заказ от {datetime.now():%d.%m.%Y}"),
         eta_date=brief.get("eta_date"),
         production_id=int(pid) if pid else None,
+        created_by=ctx.user.id,
         status="draft",
         items_json=json.dumps(items, ensure_ascii=False),
     )
@@ -1736,7 +1835,11 @@ def api_order_plan_apply(
     row.production_order_id = order.id
     row.status = "applied"
     db.commit()
-    analytics.invalidate(ctx.org.id)
+    # Снапшот НЕ инвалидируем: черновик заказа не меняет ни остатков, ни продаж,
+    # ни «едет к нам» (это происходит при переводе в «в производстве», там
+    # invalidate и стоит). Раньше каждый созданный заказ ронял кэш, и следующий
+    # экран считался с холодного снапшота — до 30 секунд ожидания на каждый
+    # заказ у менеджера, который оформляет их пачкой.
     return {"ok": True, "order_id": order.id, "status": "draft"}
 
 

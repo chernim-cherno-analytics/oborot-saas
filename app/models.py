@@ -460,6 +460,8 @@ class ProductionOrder(Base):
     production_id: Mapped[int | None] = mapped_column(
         ForeignKey("productions.id"), nullable=True
     )
+    # Кто создал заказ (см. OrderPlan.created_by). NULL — старые заказы.
+    created_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     items_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
     # items_json: [{base_name, qty, sizes: {size: qty}, cost}]
     # Обратная запись в МойСклад (аддитивно): href созданного документа
@@ -526,6 +528,10 @@ class OrderPlan(Base):
     production_order_id: Mapped[int | None] = mapped_column(
         ForeignKey("production_orders.id"), nullable=True
     )
+    # Кто нажал кнопку. В организации с наёмным менеджером «почему заказали
+    # столько» — вопрос к человеку, а не к системе; без этого поля ответить
+    # было нечем. NULL = заказ создан до появления колонки.
+    created_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
 
     @property
     def brief(self) -> dict:
