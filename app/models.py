@@ -282,6 +282,41 @@ class UserHintSeen(Base):
     seen_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
+class UserLesson(Base):
+    """Пройденные уроки обучения (страница «Обучение», каталог — app.lessons).
+
+    Хранение per-user, а не per-org: обучение личное. Новый сотрудник
+    организации начинает с нуля, даже если владелец давно всё прошёл.
+    Строка = «урок пройден»; «Пройти заново» её удаляет, поэтому запись
+    идемпотентна и не копится. Ключ урока — из app.lessons.CATALOGUE;
+    неизвестные ключи API не принимает (404), но если урок из каталога
+    убрали, осиротевшая строка просто перестаёт учитываться.
+    """
+
+    __tablename__ = "user_lessons"
+
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), primary_key=True)
+    lesson: Mapped[str] = mapped_column(String(32), primary_key=True)
+    done_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class UserPrefs(Base):
+    """Личные настройки интерфейса пользователя (по одной строке на человека).
+
+    hints_enabled — тумблер «Показывать подсказки на страницах» с «Обучения».
+    Отсутствие строки = дефолт (подсказки включены): строка создаётся лениво,
+    в момент первого переключения. Как и UserHintSeen, храним на сервере —
+    в iframe МойСклада localStorage может быть недоступен.
+    """
+
+    __tablename__ = "user_prefs"
+
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), primary_key=True)
+    hints_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default="1"
+    )
+
+
 class SkuHidden(Base):
     """Архив позиций («в архив» на Оборачиваемости, правило legacy).
 

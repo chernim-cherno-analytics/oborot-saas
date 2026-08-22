@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import delete, select
 
 import json
+import os
 
 from app import analytics, analytics_extra, analytics_markdown, auth
 from app.auth import AuthContext, require_auth_api, require_owner_api
@@ -31,8 +32,13 @@ _templates = Jinja2Templates(
 )
 
 
-def _authed_page(request: Request, db: Session, template: str, active: str, page_title: str):
-    """Страница под сессией: без авторизации — redirect /login (как в main.py)."""
+def _authed_page(request: Request, db: Session, template: str, active: str, page_title: str,
+                 extra: dict | None = None):
+    """Страница под сессией: без авторизации — redirect /login (как в main.py).
+
+    extra — дополнительные переменные шаблона (нужны «Обучению»: контакт
+    поддержки берётся из env и в общий контекст страниц не входит).
+    """
     ctx = auth.resolve_auth(request, db)
     if ctx is None:
         return RedirectResponse("/login", status_code=302)
@@ -49,6 +55,7 @@ def _authed_page(request: Request, db: Session, template: str, active: str, page
             },
             "active": active,
             "page_title": page_title,
+            **(extra or {}),
         },
     )
 
@@ -77,6 +84,23 @@ def assistant_page(request: Request, db: Session = Depends(get_db)):
 @router.get("/budget", response_class=HTMLResponse)
 def budget_page(request: Request, db: Session = Depends(get_db)):
     return _authed_page(request, db, "budget.html", "budget", "Бюджет закупки")
+
+
+@router.get("/lessons", response_class=HTMLResponse)
+def lessons_page(request: Request, db: Session = Depends(get_db)):
+    """«Обучение»: пять коротких уроков по страницам, прогресс, FAQ.
+
+    Контакт поддержки — из окружения (OBOROT_SUPPORT_URL — ссылка, иначе
+    OBOROT_SUPPORT_EMAIL). Не задан ни один — блок рисуется без кнопки:
+    выдумывать адрес нельзя.
+    """
+    return _authed_page(
+        request, db, "lessons.html", "lessons", "Обучение",
+        extra={
+            "support_url": (os.environ.get("OBOROT_SUPPORT_URL") or "").strip(),
+            "support_email": (os.environ.get("OBOROT_SUPPORT_EMAIL") or "").strip(),
+        },
+    )
 
 
 @router.get("/forecast", response_class=HTMLResponse)

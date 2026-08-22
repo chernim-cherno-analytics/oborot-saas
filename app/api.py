@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app import analytics, ms_writeback
+from app import analytics, lessons, ms_writeback
 from app.auth import AuthContext, require_auth_api, require_owner_api
 from app.crypto import encrypt_token
 from app.db import get_db
@@ -16,6 +16,12 @@ from app.models import (Connection, Membership, OrderedQty, Product, Production,
                         ProductionOrder, StockDay, User, Warehouse)
 
 router = APIRouter(prefix="/api")
+
+# Аддитивная мини-миграция «Обучения»: у баз, созданных до фичи, нет таблиц
+# user_lessons и user_prefs. Создаём их на импорте модуля, не дожидаясь
+# init_db на старте (паттерн — app/routes_connect.py): create_all с
+# checkfirst идемпотентен, свежую БД это не трогает.
+lessons.ensure_schema()
 
 
 # ── Аналитика ────────────────────────────────────────────────────────────────
@@ -558,6 +564,128 @@ def api_hint_mark_seen(
         db.add(UserHintSeen(user_id=ctx.user.id, page=body.page))
         db.commit()
     return {"ok": True}
+
+
+# ── Обучение: пять уроков по страницам (страница /lessons) ───────────────────
+#
+# Уроки личные (per-user, не per-org) и проходятся сколько угодно раз: роль
+# здесь не проверяется — учиться может любой участник организации.
+
+
+class HintsPrefIn(BaseModel):
+    enabled: bool
+
+
+def _lessons_done(db: Session, user_id: int) -> set[str]:
+    """Ключи пройденных уроков пользователя (только те, что есть в каталоге)."""
+    from app.models import UserLesson
+    rows = db.execute(
+        select(UserLesson.lesson).where(UserLesson.user_id == user_id)
+    ).scalars().all()
+    return {k for k in rows if k in lessons.KEYS}
+
+
+def _hints_enabled(db: Session, user_id: int) -> bool:
+    """Тумблер «показывать подсказки»: нет строки — значит включено (дефолт)."""
+    from app.models import UserPrefs
+    row = db.get(UserPrefs, user_id)
+    return True if row is None else bool(row.hints_enabled)
+
+
+def _known_lesson(key: str) -> dict:
+    """Урок каталога или 404 — чтобы опечатка в ключе не копилась в БД."""
+    for lesson in lessons.CATALOGUE:
+        if lesson["key"] == key:
+            return lesson
+    raise HTTPException(status_code=404, detail="Неизвестный урок")
+
+
+@router.get("/lessons")
+def api_lessons(ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)):
+    """Каталог уроков с отметками пройденности + состояние тумблера подсказок."""
+    done = _lessons_done(db, ctx.user.id)
+    items = [dict(lesson, done=lesson["key"] in done) for lesson in lessons.CATALOGUE]
+    return {
+        "lessons": items,
+        "done_count": sum(1 for it in items if it["done"]),
+        "total": lessons.TOTAL,
+        "hints_enabled": _hints_enabled(db, ctx.user.id),
+    }
+
+
+@router.post("/lessons/{key}/done")
+def api_lesson_done(
+    key: str,
+    ctx: AuthContext = Depends(require_auth_api),
+    db: Session = Depends(get_db),
+):
+    """Отметить урок пройденным (идемпотентно: повтор не меняет ничего)."""
+    from app.models import UserLesson
+    _known_lesson(key)
+    if db.get(UserLesson, (ctx.user.id, key)) is None:
+        db.add(UserLesson(user_id=ctx.user.id, lesson=key))
+        db.commit()
+    return {"ok": True, "done_count": len(_lessons_done(db, ctx.user.id))}
+
+
+@router.post("/lessons/reset")
+def api_lessons_reset_all(
+    ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)
+):
+    """Сбросить прогресс целиком («Пройти всё заново»)."""
+    from app.models import UserLesson
+    db.query(UserLesson).filter(UserLesson.user_id == ctx.user.id).delete()
+    db.commit()
+    return {"ok": True, "done_count": 0}
+
+
+@router.post("/lessons/{key}/reset")
+def api_lesson_reset(
+    key: str,
+    ctx: AuthContext = Depends(require_auth_api),
+    db: Session = Depends(get_db),
+):
+    """Снять отметку с одного урока («Пройти заново»); идемпотентно."""
+    from app.models import UserLesson
+    _known_lesson(key)
+    row = db.get(UserLesson, (ctx.user.id, key))
+    if row is not None:
+        db.delete(row)
+        db.commit()
+    return {"ok": True, "done_count": len(_lessons_done(db, ctx.user.id))}
+
+
+@router.get("/lessons/sample")
+def api_lessons_sample(
+    ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)
+):
+    """«Живой» пример для тура: бестселлер с наименьшим запасом в днях.
+
+    Считаем из того же снапшота, что и страница «Оборачиваемость», — цифры в
+    уроке совпадут с тем, что человек видит в таблице. Пока организация
+    синкается (данных ещё нет), возвращаем sample=null: тур покажет fallback
+    и не станет придумывать примеры. Поле rate — оборачиваемость в ₽/день.
+    """
+    snap = analytics.get_snapshot(db, ctx.org)
+    return {"sample": lessons.pick_sample(analytics.build_turnover(snap))}
+
+
+@router.post("/prefs/hints")
+def api_prefs_hints(
+    body: HintsPrefIn,
+    ctx: AuthContext = Depends(require_auth_api),
+    db: Session = Depends(get_db),
+):
+    """Тумблер «Показывать подсказки на страницах» (личный, per-user)."""
+    from app.models import UserPrefs
+    row = db.get(UserPrefs, ctx.user.id)
+    if row is None:
+        row = UserPrefs(user_id=ctx.user.id, hints_enabled=body.enabled)
+        db.add(row)
+    else:
+        row.hints_enabled = body.enabled
+    db.commit()
+    return {"ok": True, "hints_enabled": bool(body.enabled)}
 
 
 # ── Производства: основное + добавляемые (Китай / Москва / Екатеринбург…) ────
