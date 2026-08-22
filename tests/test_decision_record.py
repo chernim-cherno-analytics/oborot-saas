@@ -221,6 +221,41 @@ def run() -> int:
         check("план помечен как правленный вручную",
               bool(res2.get("manual_edit")), f"manual_edit={res2.get('manual_edit')}")
 
+        # Рекомендация — самостоятельная величина, а не «qty, если не трогали».
+        untouched = [i for i in (res2.get("items") or [])
+                     if i.get("base_name") != base_name]
+        check("рекомендация записана У ВСЕХ строк, а не только у правленых",
+              bool(untouched) and all("qty_recommended" in i for i in untouched),
+              f"строк без qty_recommended: "
+              f"{[i.get('base_name') for i in untouched if 'qty_recommended' not in i][:3]}")
+
+    # ── Обнулённая человеком позиция: решение «не заказывать» тоже сохраняется ──
+    print("\n== Обнулённая позиция не исчезает вместе с рекомендацией ==")
+    if items:
+        zero_base = items[0]["base_name"]
+        zero_rec = int(items[0]["qty"])
+        body3 = dict(body, overrides={zero_base: 0})
+        r = c.post("/api/order-plan", json=body3)
+        check("план с обнулённой позицией сохранён", r.status_code == 200,
+              f"status={r.status_code}")
+        pid3 = r.json().get("id") if r.status_code == 200 else None
+        row3 = sql("SELECT result_json FROM order_plans WHERE id=?", pid3)
+        res3 = json.loads(row3[0][0]) if row3 else {}
+        in_items = any(i.get("base_name") == zero_base
+                       for i in (res3.get("items") or []))
+        check("обнулённой позиции нет среди строк заказа", not in_items,
+              f"нашлась среди items: {in_items}")
+        zeroed = res3.get("zeroed") or []
+        z = next((i for i in zeroed if i.get("base_name") == zero_base), None)
+        check("обнулённая позиция сохранена отдельным списком", z is not None,
+              f"zeroed={[i.get('base_name') for i in zeroed][:3]}")
+        check("вместе с тем, что рекомендовала система",
+              z is not None and int(z.get("qty_recommended") or 0) == zero_rec,
+              f"qty_recommended={z and z.get('qty_recommended')} ожидали {zero_rec}")
+        check("итог заказа не учитывает обнулённую позицию",
+              not in_items and (res3.get("totals") or {}).get("units") is not None,
+              f"totals={(res3.get('totals') or {}).get('units')}")
+
     print("\n== Удаление организации не оставляет планов ==")
     before = sql("SELECT COUNT(*) FROM order_plans")[0][0]
     check("планы в базе есть", before > 0, f"строк={before}")

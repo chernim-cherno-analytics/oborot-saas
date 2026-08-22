@@ -720,6 +720,48 @@ def run_scenario() -> int:
           belt2 == 70, f"got={belt2}")
     client.post("/api/discount-rule", json=dict(r.json()["rule"], weak_over_pct=60))
 
+    # ── Норма запаса — настройка организации, а не константа продукта ──
+    # Решение владельца 22.08 (DECISIONS D-15). До этого «Сток на 90 дней» и
+    # «Не хватает до нормы» считались по литералу 90 на сервере и ещё раз по
+    # литералу 90 в браузере — и владелец, поменявший порог затоварки на той же
+    # странице, получал две соседние колонки, живущие по разным числам.
+    print("== Норма запаса берётся из настроек организации ==")
+    base_rule = client.get("/api/discount-rule").json()["rule"]
+    st = client.get("/api/active-stock").json()
+    tu = client.get("/api/turnover").json()
+    check("норма отдаётся вместе с данными (Активный сток)",
+          st.get("stock_norm_days") == 90, f"got={st.get('stock_norm_days')}")
+    check("норма отдаётся вместе с данными (Оборачиваемость)",
+          tu.get("stock_norm_days") == 90, f"got={tu.get('stock_norm_days')}")
+    row90 = next((i for i in st["items"] if i.get("defq")), None)
+    check("есть позиция с недостатком до нормы", row90 is not None,
+          f"позиций={len(st['items'])}")
+    if row90:
+        base_name, defq90, zat90 = row90["base_name"], row90["defq"], row90["zat"]
+        client.post("/api/discount-rule", json=dict(base_rule, overstock_days=180))
+        st2 = client.get("/api/active-stock").json()
+        row180 = next((i for i in st2["items"] if i["base_name"] == base_name), None)
+        check("норма в ответе изменилась вслед за настройкой",
+              st2.get("stock_norm_days") == 180, f"got={st2.get('stock_norm_days')}")
+        # Норма вдвое больше ⇒ недостаток растёт, а «сток в % от нормы» падает.
+        check("«не хватает до нормы» пересчитано по новой норме",
+              row180 is not None and row180["defq"] > defq90,
+              f"было={defq90} стало={row180 and row180['defq']}")
+        check("«сток на N дней» пересчитан по новой норме",
+              row180 is not None and (zat90 is None or row180["zat"] < zat90),
+              f"было={zat90} стало={row180 and row180['zat']}")
+        tu2 = client.get("/api/turnover").json()
+        check("страница «Оборачиваемость» получает ту же норму",
+              tu2.get("stock_norm_days") == 180, f"got={tu2.get('stock_norm_days')}")
+        # Мусор в настройке не должен ронять расчёт — падаем на дефолт.
+        client.post("/api/discount-rule", json=dict(base_rule, overstock_days=90))
+        st3 = client.get("/api/active-stock").json()
+        row_back = next((i for i in st3["items"] if i["base_name"] == base_name), None)
+        check("возврат к 90 даёт прежние числа",
+              st3.get("stock_norm_days") == 90
+              and row_back is not None and row_back["defq"] == defq90,
+              f"norm={st3.get('stock_norm_days')} defq={row_back and row_back['defq']}")
+
     print("== Инкрементальный синк ==")
     # Эмулируем приёмку в МС: размер S принят полностью → у «Скетча» едет 8.
     mock_ms.PURCHASE_ORDERS[0]["positions"]["rows"][0]["shipped"] = 10.0
