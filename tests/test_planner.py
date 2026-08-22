@@ -877,6 +877,102 @@ def api_checks() -> None:
         check("заказ «в производстве» остаётся открытым обязательством",
               op3["count"] == op2["count"], f"{op3['count']} vs {op2['count']}")
 
+        # ── Д4: настройки, которых не было в интерфейсе ────────────────────
+        print("\n24. Настройки канала, типы цен, откат авто-исключений, роли")
+        # Подрядчик, который берёт деньги только по готовности: доля предоплаты
+        # ноль. Раньше это обнуляло цену единицы для бюджета (max(1.0, 0)) и
+        # план вылетал в десятки раз выше названной суммы.
+        p_now = c.post("/api/order-plan/preview", json={
+            "production_id": lab["id"], "eta_date": eta, "budget": 300000,
+            "budget_scope": "now", "strategy": "balance"}).json()
+        check("обычный канал считает бюджет по деньгам «на сейчас»",
+              p_now["budget_basis"] == "now" and p_now["budget_note"] is None,
+              str(p_now["budget_basis"]))
+        zero = c.post(f"/api/productions/{lab['id']}/setup", json={"stages": [
+            {"key": "make", "name": "Пошив", "lead_days": 30,
+             "cost_share": 1.0, "prepay_share": 0.0},
+        ]}).json()
+        check("канал без предоплаты сохраняется",
+              zero["prepay_now_share"] == 0 and zero["lead_days"] == 30, str(zero["prepay_now_share"]))
+        eta_z = (date.today() + timedelta(days=30)).isoformat()
+        pz = c.post("/api/order-plan/preview", json={
+            "production_id": lab["id"], "eta_date": eta_z, "budget": 100000,
+            "budget_scope": "now", "strategy": "balance"}).json()
+        check("нулевая предоплата не отключает бюджет",
+              pz["budget_basis"] == "full_no_prepay"
+              and 0 < pz["cost_total"] <= 100000,
+              f'basis={pz["budget_basis"]} cost={pz["cost_total"]}')
+        check("и объясняет это словами", bool(pz["budget_note"]), str(pz["budget_note"]))
+        # Вернули канал в исходное состояние — дальше тесты считают по нему.
+        c.post(f"/api/productions/{lab['id']}/setup",
+               json={"preset": "fabric_sewing", "moq_units": 10})
+
+        two = c.post(f"/api/productions/{china['id']}/setup", json={"stages": [
+            {"key": "fabric", "name": "Ткань", "lead_days": 20,
+             "cost_share": 0.4, "prepay_share": 1.0, "min_units": 25},
+            {"key": "sew", "name": "Пошив", "lead_days": 15,
+             "cost_share": 0.6, "prepay_share": 0.5},
+        ], "cadence_days": 60, "moq_units": 12}).json()
+        check("этапы из формы: срок = сумма, предоплата = первый этап",
+              two["lead_days"] == 35 and abs(two["prepay_now_share"] - 0.4) < 0.001,
+              f'{two["lead_days"]} / {two["prepay_now_share"]}')
+        check("ритм и минимальная партия канала сохранились",
+              two["cadence_days"] == 60 and two["moq_units"] == 12, str(two))
+        check("минимум по этапу не потерялся",
+              two["stages"][0]["min_units"] == 25, str(two["stages"][0]))
+        norm = c.post(f"/api/productions/{china['id']}/setup", json={"stages": [
+            {"key": "a", "name": "A", "lead_days": 10, "cost_share": 0.3},
+            {"key": "b", "name": "B", "lead_days": 10, "cost_share": 0.3},
+        ]}).json()
+        check("кривые доли себестоимости нормируются к 100%",
+              abs(sum(st["cost_share"] for st in norm["stages"]) - 1.0) < 1e-6,
+              str([st["cost_share"] for st in norm["stages"]]))
+
+        st2 = c.get("/api/settings").json()
+        check("настройки отдают список типов цен МойСклада",
+              isinstance(st2.get("price_types"), list), str(st2.get("price_types")))
+        c.post("/api/settings", json={"price_type_cost": "Себестоимость"})
+        check("выбранный тип цены сохраняется",
+              c.get("/api/settings").json()["price_type_cost"] == "Себестоимость")
+
+        from app.db import SessionLocal as _SL
+        db2 = _SL()
+        try:
+            names = sorted({r for (r,) in db2.query(_P.base_name).distinct().all()})
+            auto_base, hand_base = names[0], names[1]
+            for r in db2.query(_P).filter(_P.base_name == auto_base).all():
+                r.base_name = "Подарочный сертификат 5000"
+                r.excluded = True
+            for r in db2.query(_P).filter(_P.base_name == hand_base).all():
+                r.excluded = True
+            db2.commit()
+        finally:
+            db2.close()
+        ex = c.get("/api/exclusions").json()
+        by_rule = {e["base_name"]: e for e in ex["excluded"] if e["by_rule"]}
+        by_hand = [e for e in ex["excluded"] if not e["by_rule"]]
+        check("видно, что отложила система, а что человек",
+              "Подарочный сертификат 5000" in by_rule
+              and any(e["base_name"] == hand_base for e in by_hand),
+              f'rule={list(by_rule)} hand={[e["base_name"] for e in by_hand]}')
+        check("у авто-исключения написана причина",
+              "сертификат" in by_rule["Подарочный сертификат 5000"]["reason"],
+              by_rule["Подарочный сертификат 5000"]["reason"])
+        check("счётчик авто-исключений отдаётся отдельно",
+              ex["by_rule_count"] == len(by_rule), str(ex["by_rule_count"]))
+        c.post("/api/exclusions", json={"base_name": "Подарочный сертификат 5000",
+                                        "excluded": False})
+        check("авто-исключение возвращается в аналитику одной кнопкой",
+              not any(e["base_name"] == "Подарочный сертификат 5000"
+                      for e in c.get("/api/exclusions").json()["excluded"]))
+
+        page_s = c.get("/settings")
+        check("в настройках есть карточки каналов и типов цен",
+              "Каналы производства" in page_s.text and "Цены из МойСклада" in page_s.text
+              and "chan-box" in page_s.text, f"status={page_s.status_code}")
+        check("мастер предупреждает про себестоимость на первом экране",
+              "#s1 .panel" in c.get("/assistant").text)
+
         print("\n14c. Мастер заказа на догружаемой истории (деплой П1)")
         eta_full = (date.today() + timedelta(days=45)).isoformat()
         body = {"eta_date": eta_full, "budget": 300000, "budget_scope": "full",
