@@ -314,6 +314,12 @@ def run_scenario() -> int:
                           "meta": {"href": href_ok}}, ours) is False)
     check("пустое описание не роняет классификатор",
           _is_oborot_doc({"meta": {"href": href_ok}}, ours) is False)
+    # Описание документа пишет посторонний человек. Число из 4301 цифры
+    # int() разобрать отказывается — без ограничения длины это уронило бы
+    # весь синк организации, а не одну строку.
+    check("абсурдно длинный номер в метке не роняет синк",
+          _is_oborot_doc({"description": "x [oborot#" + "1" * 4301 + "]",
+                          "meta": {"href": href_ok}}, ours) is False)
     # Шаг 0 модели исполнения: диагностика поля shipped доезжает в статус синка.
     check("диагностика shipped посчитана",
           isinstance(stats.get("incoming_positions"), int)

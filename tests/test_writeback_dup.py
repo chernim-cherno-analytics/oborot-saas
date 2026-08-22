@@ -257,6 +257,8 @@ def run() -> int:
         check("текст объясняет причину и что делать",
               "скопировали" in detail and "не создан" in detail,
               f"detail={detail[:200]}")
+        check("это ветка ДО создания — обещание «не создан» здесь правдиво",
+              "мог быть только что создан" not in detail, f"detail={detail[:200]}")
         check("новый документ НЕ создан",
               len(mock_ms.CREATED_PURCHASE_ORDERS) == before,
               f"было={before} стало={len(mock_ms.CREATED_PURCHASE_ORDERS)}")

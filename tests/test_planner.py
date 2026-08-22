@@ -1248,6 +1248,60 @@ def api_checks() -> None:
         check("в мастере есть поле для ручного количества у таких позиций",
               "nocost-q" in c.get("/assistant").text)
 
+        # ── Границы ручного добавления (по итогам ревью критиками) ──────────
+        in_plan_name = plan_auto["items"][0]["base_name"]
+        excl = c.post("/api/order-plan/preview", json=dict(
+            body_hz, exclude_categories=[plan_auto["items"][0]["category"]],
+            overrides={in_plan_name: 40})).json()
+        check("позицию из ИСКЛЮЧЁННОЙ категории через overrides не втащить",
+              not any(i["base_name"] == in_plan_name for i in excl["items"]),
+              "обход бизнес-фильтра через тело запроса")
+        huge = c.post("/api/order-plan/preview",
+                      json=dict(body_hz, overrides={base_nc: 10 ** 400}))
+        check("гигантское количество не роняет расчёт в 500",
+              huge.status_code == 200, f"status={huge.status_code} {huge.text[:120]}")
+        hrow = next((i for i in huge.json()["items"]
+                     if i["base_name"] == base_nc), None) if huge.status_code == 200 else None
+        check("и обрезается разумной верхней границей",
+              hrow is not None and hrow["qty"] <= 1_000_000,
+              f"qty={hrow and hrow['qty']}")
+        # Предпросмотр обязан ОТПРАВЛЯТЬ правки — иначе поле «шт» мертво.
+        page_prev = c.get("/assistant").text
+        check("предпросмотр отправляет ручные правки на сервер",
+              "previewBody.overrides" in page_prev,
+              "без этого строка без себестоимости не появится в плане")
+        check("браузер не считает маржу там, где нет себестоимости",
+              "if(!i.no_cost && i.cost_price > 0) profit" in page_prev)
+
+        # ── «Повторить» старый план не должен менять горизонт ───────────────
+        rep = c.post("/api/order-plan/preview",
+                     json=dict(body_hz, cover_mode="fixed", horizon_days_fixed=200)).json()
+        check("режим горизонта из брифа сильнее сегодняшней настройки",
+              rep["cover_days"] == 200, f"got={rep['cover_days']}")
+        bad = c.post("/api/order-plan/preview",
+                     json=dict(body_hz, cover_mode="что-то"))
+        check("неизвестный режим отклоняется, а не молча подменяется",
+              bad.status_code == 422, f"status={bad.status_code}")
+        check("на большом фиксированном горизонте план не становится вечно предварительным",
+              c.post("/api/order-plan/preview",
+                     json=dict(body_hz, cover_mode="fixed", horizon_days_fixed=365)
+                     ).json()["coverage"]["partial"] is False,
+              "история не может быть глубже года — требовать больше нельзя")
+
+        # ── Позиция, втащенная галочкой, — решение человека ─────────────────
+        low = (plan_auto.get("review") or {}).get("low_data") or []
+        if low:
+            lb = low[0]["base_name"]
+            forced = c.post("/api/order-plan/preview",
+                            json=dict(body_hz, must_have=[lb])).json()
+            frow = next((i for i in forced["items"] if i["base_name"] == lb), None)
+            check("позиция из «решаете вы» помечена как решение человека",
+                  frow is None or frow.get("forced_by_user") is True,
+                  f"forced_by_user={frow and frow.get('forced_by_user')}")
+        else:
+            check("позиция из «решаете вы» помечена как решение человека",
+                  True, "в демо-данных нет позиций low_data — проверка пропущена")
+
         print("\n14c. Мастер заказа на догружаемой истории (деплой П1)")
         eta_full = (date.today() + timedelta(days=45)).isoformat()
         body = {"eta_date": eta_full, "budget": 300000, "budget_scope": "full",
