@@ -38,7 +38,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from sqlalchemy import select
 
-from app import ms_sync, notify
+from app import logging_conf, ms_sync, notify
 from app.db import SessionLocal
 from app.models import Connection, Org
 
@@ -119,7 +119,7 @@ def _alert_if_failing(org_id: int, status: dict) -> None:
     try:
         notify.send_sync_failure_alert(org_id, status)
     except Exception:  # noqa: BLE001
-        log.exception("org=%s: ошибка отправки алерта о падении синка", org_id)
+        log.exception("ошибка отправки алерта о падении синка")
 
 
 def run_daily_job() -> dict:
@@ -133,33 +133,38 @@ def run_daily_job() -> dict:
     org_ids = _orgs_with_active_moysklad()
     log.info("ежедневный синк: %d организаций", len(org_ids))
     for org_id in org_ids:
+        # Планировщик обходит организации ПО ОЧЕРЕДИ в одном потоке, поэтому
+        # метку ставим на каждой итерации, а после цикла снимаем — иначе
+        # последняя организация «прилипла» бы к служебным записям.
+        logging_conf.set_org(org_id)
         # Последовательно, не параллельно: щадим лимиты МойСклад (45 req/3 c
         # на аккаунт, но и общий пул соединений сервиса не раздуваем).
         try:
             if not ms_sync.start_sync(org_id, mode="incremental"):
                 results[org_id] = "skipped_already_running"
-                log.warning("org=%s: синк уже идёт, пропуск", org_id)
+                log.warning("синк уже идёт, пропуск")
                 continue
             if _started_as_initial(org_id):
                 # Первичная загрузка/её продолжение: запустили — идём дальше.
                 # Дайджест уйдёт по тем данным, что уже на диске (сервис на них
                 # и работает), а не через час ожидания.
                 results[org_id] = "started_initial"
-                log.info("org=%s: запущена первичная загрузка, не ждём", org_id)
+                log.info("запущена первичная загрузка, не ждём")
             else:
                 # Дайджест считается по свежему инкременту — его дожидаемся.
                 status = _wait_sync_finished(org_id, SYNC_WAIT_TIMEOUT_INCREMENTAL)
                 results[org_id] = status.get("state", "unknown")
                 if status.get("state") == "error":
-                    log.warning("org=%s: синк упал: %s", org_id, status.get("error", ""))
+                    log.warning("синк упал: %s", status.get("error", ""))
                     _alert_if_failing(org_id, status)
         except Exception:  # noqa: BLE001 — одна org не валит остальных
             results[org_id] = "error"
-            log.exception("org=%s: необработанная ошибка синка", org_id)
+            log.exception("необработанная ошибка синка")
         try:
             notify.send_daily_digest(org_id)
         except Exception:  # noqa: BLE001 — дайджест не должен ломать обход
-            log.exception("org=%s: ошибка отправки дайджеста", org_id)
+            log.exception("ошибка отправки дайджеста")
+    logging_conf.set_org(None)
     return results
 
 
@@ -205,6 +210,7 @@ def run_catchup_job() -> dict:
         return results
     log.info("догоняющий синк: %d отставших организаций", len(stale))
     for org_id in stale:
+        logging_conf.set_org(org_id)
         try:
             if not ms_sync.start_sync(org_id, mode="incremental"):
                 results[org_id] = "skipped_already_running"
@@ -213,18 +219,17 @@ def run_catchup_job() -> dict:
                 # Продолжение прерванной первичной — самый частый случай этого
                 # джоба; ждать его час означало бы не догнать остальных.
                 results[org_id] = "started_initial"
-                log.info("org=%s: продолжение первичной загрузки запущено, не ждём",
-                         org_id)
+                log.info("продолжение первичной загрузки запущено, не ждём")
                 continue
             status = _wait_sync_finished(org_id, SYNC_WAIT_TIMEOUT_INCREMENTAL)
             results[org_id] = status.get("state", "unknown")
             if status.get("state") == "error":
-                log.warning("org=%s: догоняющий синк упал: %s",
-                            org_id, status.get("error", ""))
+                log.warning("догоняющий синк упал: %s", status.get("error", ""))
                 _alert_if_failing(org_id, status)
         except Exception:  # noqa: BLE001 — одна org не валит остальных
             results[org_id] = "error"
-            log.exception("org=%s: необработанная ошибка догоняющего синка", org_id)
+            log.exception("необработанная ошибка догоняющего синка")
+    logging_conf.set_org(None)
     return results
 
 

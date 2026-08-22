@@ -17,7 +17,14 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from app import auth
-from app.api import router as api_router
+from app import logging_conf
+
+# Настраиваем логирование ДО создания приложения и до первого вызова
+# любого log.* — uvicorn к этому моменту уже применил свою конфигурацию
+# (только для своих логгеров), корневой остаётся за нами.
+logging_conf.setup_logging()
+
+from app.api import router as api_router  # noqa: E402
 from app.crypto import is_prod
 from app.routes_connect import router as connect_router
 from app.routes_extra import router as extra_router
@@ -73,6 +80,31 @@ async def _security_headers_and_csrf(request: Request, call_next):
         "frame-ancestors 'self' https://online.moysklad.ru",
     )
     return response
+
+@app.middleware("http")
+async def _log_org_context(request: Request, call_next):
+    """Помечает все записи лога этого запроса идентификатором организации.
+
+    Добавлено последним, поэтому оборачивает остальные middleware — метка
+    стоит и на записях о CSRF-отказе, и на необработанном исключении.
+
+    Организацию берём из ПОДПИСАННОЙ сессионной куки (`auth.read_session`),
+    без обращения к базе: логирование не должно добавлять запрос к БД на
+    каждый чих, а подделать значение нельзя — подпись проверяется. Здесь не
+    проверяется членство пользователя в организации: для отбора строк в логе
+    этого достаточно, а решения о доступе принимает `resolve_auth`.
+
+    `/static` пропускаем: снимать подпись с куки на каждую картинку — трата
+    без пользы, у статики нет своих записей в логе.
+    """
+    if not request.url.path.startswith("/static"):
+        try:
+            sess = auth.read_session(request)
+        except Exception:  # noqa: BLE001 — логирование не имеет права ронять запрос
+            sess = None
+        logging_conf.set_org(sess.get("org_id") if sess else None)
+    return await call_next(request)
+
 
 from app import scheduler as _scheduler  # noqa: E402
 _scheduler.attach(app)

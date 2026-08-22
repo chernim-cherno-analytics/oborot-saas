@@ -20,7 +20,7 @@ from datetime import date, timedelta
 import httpx
 from sqlalchemy import case, func, select
 
-from app import analytics
+from app import analytics, logging_conf
 from app.db import SessionLocal
 from app.models import NotifySettings, Org, Sale
 
@@ -199,7 +199,7 @@ def send_daily_digest(org_id: int) -> bool:
 
     ok, err = send_message(chat_id, text)
     if not ok:
-        log.warning("digest org=%s не отправлен: %s", org_id, err)
+        log.warning("дайджест не отправлен: %s", err)
     return ok
 
 
@@ -251,8 +251,8 @@ def send_sync_failure_alert(org_id: int, status: dict) -> bool:
         )
         ok, send_err = send_message(chat_id, text)
         if not ok:
-            log.warning("sync-alert org=%s не отправлен: %s", org_id, send_err)
+            log.warning("алерт о падении синка не отправлен: %s", send_err)
         return ok
     except Exception:  # noqa: BLE001 — алерт никогда не должен ронять синк
-        log.exception("sync-alert org=%s: необработанная ошибка", org_id)
+        log.exception("алерт о падении синка: необработанная ошибка")
         return False

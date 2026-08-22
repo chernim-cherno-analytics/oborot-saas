@@ -53,6 +53,7 @@ event loop (start_sync). Планировщик — app/scheduler.py.
 """
 import asyncio
 import json
+import logging
 import os
 import re
 import threading
@@ -61,7 +62,7 @@ from datetime import date, datetime, timedelta
 
 from sqlalchemy import delete, func, insert, inspect, select, update
 
-from app import analytics, exclusions
+from app import analytics, exclusions, logging_conf
 from app.crypto import decrypt_token
 from app.db import SessionLocal, engine, run_migration_step
 from app.models import (
@@ -93,6 +94,8 @@ except ValueError:
 EFFECTIVE_RPS = 12.0
 
 _SIZE_SUFFIX_RE = re.compile(r"\s*\(([^)]*)\)\s*$")
+
+log = logging.getLogger("oborot.ms_sync")
 
 _threads: dict[int, threading.Thread] = {}
 _threads_lock = threading.Lock()
@@ -548,7 +551,7 @@ def reset_stale_running() -> None:
             row.stats_json = json.dumps(stats, ensure_ascii=False)
         db.commit()
         if rows:
-            print(f"ms_sync: сброшено зависших состояний running: {len(rows)}")
+            log.warning("сброшено зависших состояний running: %d", len(rows))
     finally:
         db.close()
 
@@ -670,6 +673,10 @@ def start_sync(org_id: int, mode: str, *, force_full: bool = False) -> bool:
 
 def _thread_main(org_id: int, mode: str, resume_from: str | None = None,
                  prev_fp: str = "") -> None:
+    # У нового потока контекст ПУСТОЙ, поэтому метку организации ставим
+    # здесь: иначе все записи многочасового синка ушли бы в лог без
+    # указания, чьи это данные. Восстанавливать нечего — поток наш.
+    logging_conf.set_org(org_id)
     try:
         asyncio.run(_run_sync(org_id, mode, resume_from, prev_fp))
     except Exception as exc:  # noqa: BLE001 — любой сбой фиксируем в состоянии
@@ -686,8 +693,8 @@ def _thread_main(org_id: int, mode: str, resume_from: str | None = None,
                 # Ревью 21.08 (минор 10): фоновая догрузка истории у РАБОТАЮЩЕГО
                 # сервиса — не «падающий синк». Текст пользователю говорит
                 # «продолжим автоматически», алерт «второй раз подряд» тут врёт.
-                print(f"ms_sync org={org_id}: фоновая история прервана "
-                      f"({exc}) — серия провалов не засчитана")
+                log.info("фоновая догрузка истории прервана (%s) — "
+                         "серия провалов не засчитана", exc)
             else:
                 _bump_fail_streak(org_id)
                 # Алерт шлём отсюда (и ручные, и авто), планировщик — страховка.
@@ -751,7 +758,7 @@ def _human_error(exc: Exception) -> str:
     if isinstance(exc, RuntimeError):
         return f"Синхронизация прервана: {exc}"  # наши собственные понятные тексты
     # Ревью 21.08: внутренности (SQL, KeyError) пользователю не показываем.
-    print(f"ms_sync: внутренняя ошибка синка: {exc!r}")
+    log.exception("внутренняя ошибка синка: %r", exc)
     return "Синхронизация прервана внутренней ошибкой — мы уже смотрим."
 
 
@@ -1534,7 +1541,7 @@ def _migrate_renames(db, org_id: int, renames: dict[str, set[str]],
 
     if migrated:
         stats["renames_migrated"] = migrated
-        print(f"ms_sync org={org_id}: перенесены данные переименованных: {migrated}")
+        log.info("перенесены данные переименованных позиций: %s", migrated)
     if skipped:
         stats["renames_skipped"] = skipped
 
