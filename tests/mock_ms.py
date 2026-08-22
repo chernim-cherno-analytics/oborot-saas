@@ -454,6 +454,13 @@ FAULTS: dict = {"stock_ok_before": 0, "stock_429_burst": 0,
                 # 429 на документах продаж/возвратов: прерывает синк ровно
                 # на продажах окна быстрого старта (ревью 21.08, мажор 2)
                 "docs_429_burst": 0,
+                # Заказ поставщику СОЗДАН, но ответ не дошёл (таймаут/502).
+                # Ровно тот случай, ради которого писался маркер и поиск
+                # документа перед созданием: слепой повтор дал бы дубль.
+                "po_create_then_fail": 0,
+                # POST /entity/purchaseorder отвечает 429 N раз подряд:
+                # «мы даже не начали» — повтор безопасен и обязан произойти.
+                "po_429_burst": 0,
                 "stock_delay_ms": 0}
 FAULT_STATS: dict = {"stock_requests": 0, "stock_ok": 0, "stock_429": 0, "stock_500": 0}
 
@@ -461,7 +468,8 @@ FAULT_STATS: dict = {"stock_requests": 0, "stock_ok": 0, "stock_429": 0, "stock_
 def reset_faults() -> None:
     FAULTS.update(stock_ok_before=0, stock_429_burst=0, stock_429_every=0,
                   stock_500_once=False, assortment_429_burst=0,
-                  docs_429_burst=0, stock_delay_ms=0)
+                  docs_429_burst=0, po_create_then_fail=0, po_429_burst=0,
+                  stock_delay_ms=0)
     for k in FAULT_STATS:
         FAULT_STATS[k] = 0
 
@@ -833,7 +841,17 @@ async def entity_purchaseorder_create(request: Request):
         "type": "purchaseorder", "mediaType": "application/json",
         "uuidHref": f"https://online.moysklad.ru/app/#purchaseorder/edit?id={doc_id}",
     }
+    if int(FAULTS.get("po_429_burst") or 0) > 0:
+        # Отказ ДО создания: документа нет, повтор обязателен и безопасен.
+        FAULTS["po_429_burst"] = int(FAULTS["po_429_burst"]) - 1
+        raise HTTPException(status_code=429, detail="rate limited",
+                            headers={"X-Lognex-Retry-TimeInterval": "200"})
     CREATED_PURCHASE_ORDERS.append(doc)
+    if int(FAULTS.get("po_create_then_fail") or 0) > 0:
+        # Документ создан — и только потом «падает» ответ. Именно так
+        # выглядит таймаут на стороне клиента: он не знает, что случилось.
+        FAULTS["po_create_then_fail"] = int(FAULTS["po_create_then_fail"]) - 1
+        raise HTTPException(status_code=502, detail="bad gateway")
     return doc
 
 
