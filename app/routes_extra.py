@@ -1013,6 +1013,20 @@ def plans_page(request: Request, db: Session = Depends(get_db)):
     return _authed_page(request, db, "plans.html", "settings", "Тарифы и оплата")
 
 
+@router.get("/api/subscription")
+def api_subscription(
+    ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)
+):
+    """Состояние подписки организации (D-24): active | grace | readonly.
+
+    Только чтение и никогда не закрывается гейтом: клиент с приостановленной
+    записью обязан видеть, что именно с ним произошло и до какой даты.
+    """
+    from app import subscription
+
+    return subscription.state_info(ctx.org, db)
+
+
 @router.get("/api/plans")
 def api_plans(ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)):
     """Тарифная сетка (из PLANS), текущий тариф организации и последняя заявка."""

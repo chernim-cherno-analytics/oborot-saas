@@ -184,6 +184,11 @@ def _startup() -> None:
     _ms_writeback.ensure_schema()
     from app import ms_vendor as _ms_vendor
     _ms_vendor.ensure_schema()
+    # D-24: orgs.paid_until + billing_requests.invoiced_at. Колонки заводим
+    # всегда, сам гейт включается флагом OBOROT_SUBSCRIPTION_GATE — схема
+    # должна быть готова заранее, иначе включение флага потребует деплоя.
+    from app import subscription as _subscription
+    _subscription.ensure_schema()
     global _STARTUP_DONE
     _STARTUP_DONE = True
 

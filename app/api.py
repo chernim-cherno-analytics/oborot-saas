@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app import analytics, lessons, ms_writeback, order_planner
+from app import analytics, lessons, ms_writeback, order_planner, subscription
 from app.auth import AuthContext, require_auth_api, require_owner_api
 from app.crypto import encrypt_token
 from app.db import get_db
@@ -1912,7 +1912,7 @@ def api_order_plan_options(
     }
 
 
-@router.post("/order-plan/preview")
+@router.post("/order-plan/preview", dependencies=[Depends(subscription.require_write_access)])
 def api_order_plan_preview(
     body: OrderPlanIn, ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)
 ):
@@ -1920,7 +1920,7 @@ def api_order_plan_preview(
     return _plan(db, ctx, body)
 
 
-@router.post("/order-plan")
+@router.post("/order-plan", dependencies=[Depends(subscription.require_write_access)])
 def api_order_plan_save(
     body: OrderPlanIn, ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)
 ):
@@ -2110,7 +2110,7 @@ def _find_duplicate_order(db: Session, org_id: int, production_id, bases: set) -
     return None
 
 
-@router.post("/order-plan/{plan_id}/apply")
+@router.post("/order-plan/{plan_id}/apply", dependencies=[Depends(subscription.require_write_access)])
 def api_order_plan_apply(
     plan_id: int, body: PlanApplyIn,
     ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db),

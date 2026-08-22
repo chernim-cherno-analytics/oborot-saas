@@ -1,9 +1,10 @@
 """ORM-модели. Все бизнес-таблицы несут org_id — мультитенантность обязательна."""
 import json
-from datetime import datetime
+from datetime import date, datetime
 
 from sqlalchemy import (
     Boolean,
+    Date,
     DateTime,
     Float,
     ForeignKey,
@@ -61,6 +62,10 @@ class Org(Base):
     source: Mapped[str] = mapped_column(String(16), nullable=False, default="saas", server_default="saas")
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="active", server_default="active")
     ms_tariff_name: Mapped[str] = mapped_column(String(128), nullable=False, default="", server_default="")
+    # paid_until — «оплачено до» включительно (D-24). NULL = не платили ни разу.
+    # Живёт рядом с trial_ends_at и вместе с ним определяет состояние подписки;
+    # вычисляется состояние ровно в одном месте — app/subscription.py.
+    paid_until: Mapped[date | None] = mapped_column(Date, nullable=True)
 
     @property
     def settings(self) -> dict:

@@ -24,7 +24,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app import ms_sync, ms_writeback, notify
+from app import ms_sync, ms_writeback, notify, subscription
 from app.auth import AuthContext, require_auth_api, require_owner_api
 from app.crypto import decrypt_token, encrypt_token
 from app.db import get_db
@@ -249,7 +249,7 @@ async def api_moysklad_stores_select(
 
 # ── Синхронизация ────────────────────────────────────────────────────────────
 
-@router.post("/sync/initial")
+@router.post("/sync/initial", dependencies=[Depends(subscription.require_write_access)])
 def api_sync_initial(
     ctx: AuthContext = Depends(require_owner_api), db: Session = Depends(get_db)
 ):
@@ -278,7 +278,7 @@ def api_sync_initial(
     }
 
 
-@router.post("/sync/run")
+@router.post("/sync/run", dependencies=[Depends(subscription.require_write_access)])
 def api_sync_run(
     ctx: AuthContext = Depends(require_owner_api), db: Session = Depends(get_db)
 ):
@@ -361,7 +361,7 @@ def api_order_ms_doc(
     return _ms_doc_out(_order_of_org(db, ctx.org.id, order_id))
 
 
-@router.post("/orders/{order_id}/push-to-ms")
+@router.post("/orders/{order_id}/push-to-ms", dependencies=[Depends(subscription.require_write_access)])
 async def api_order_push_to_ms(
     order_id: int = _id_path(),
     ctx: AuthContext = Depends(require_owner_api),

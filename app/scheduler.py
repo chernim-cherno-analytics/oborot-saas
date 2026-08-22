@@ -38,7 +38,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from sqlalchemy import select
 
-from app import logging_conf, ms_sync, notify
+from app import logging_conf, ms_sync, notify, subscription
 from app.db import SessionLocal
 from app.models import Connection, Org
 
@@ -90,6 +90,32 @@ def _orgs_with_active_moysklad() -> list[int]:
         db.close()
 
 
+def _paid_only(org_ids: list[int]) -> list[int]:
+    """Отсекает организации в readonly (D-24), если гейт подписки включён.
+
+    Плановый синк — это работа, которую мы делаем за деньги: гонять её для
+    неоплаченной организации бессмысленно и дорого (лимиты МС общие). Вход,
+    отчёты и экспорт при этом остаются — закрывается только запись и синк.
+    При выключенном флаге список возвращается как есть, без единого запроса.
+    """
+    if not org_ids or not subscription.gate_enabled():
+        return org_ids
+    db = SessionLocal()
+    try:
+        allowed = []
+        for org_id in org_ids:
+            org = db.get(Org, org_id)
+            if org is None:
+                continue
+            if subscription.subscription_state(org, db) == subscription.READONLY:
+                log.info("синк пропущен: подписка не оплачена (org=%s)", org_id)
+                continue
+            allowed.append(org_id)
+        return allowed
+    finally:
+        db.close()
+
+
 def _wait_sync_finished(org_id: int, timeout: float = SYNC_WAIT_TIMEOUT) -> dict:
     """Блокирующе ждёт конца синка org (ms_sync работает в своём потоке)."""
     deadline = time.monotonic() + timeout
@@ -132,7 +158,7 @@ def _run_daily_job() -> dict:
     прерывает обход остальных.
     """
     results: dict[int, str] = {}
-    org_ids = _orgs_with_active_moysklad()
+    org_ids = _paid_only(_orgs_with_active_moysklad())
     log.info("ежедневный синк: %d организаций", len(org_ids))
     for org_id in org_ids:
         # Планировщик обходит организации ПО ОЧЕРЕДИ в одном потоке, поэтому
@@ -207,6 +233,7 @@ def _run_catchup_job() -> dict:
     for org_id in ms_sync.orgs_with_resume_point():
         if org_id not in stale:
             stale.append(org_id)
+    stale = _paid_only(stale)
     if not stale:
         return results
     log.info("догоняющий синк: %d отставших организаций", len(stale))
