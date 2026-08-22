@@ -276,7 +276,27 @@
 <script>
 (function(){
   var STATE = { production_id: null, prods: [], cadence: 30, scope: "now",
-                strategy: "balance", offcats: [], plan: null, edits: {}, newItems: [], must: [] };
+                strategy: "balance", offcats: [], plan: null, edits: {}, newItems: [], must: [],
+                open: null, cash: null, createdOrder: null };
+
+  // Правки количеств переживают не только возврат к анкете, но и обновление
+  // страницы: владелец правит план по 20 строкам, случайно жмёт F5 — и раньше
+  // всё это молча пропадало.
+  var LSKEY = "oborot.assistant.draft";
+  function saveDraft(){
+    try {
+      localStorage.setItem(LSKEY, JSON.stringify({
+        pid: STATE.production_id, edits: STATE.edits, must: STATE.must, ts: Date.now() }));
+    } catch(e){}
+  }
+  function loadDraft(){
+    try {
+      var d = JSON.parse(localStorage.getItem(LSKEY) || "null");
+      if (d && d.ts && (Date.now() - d.ts) < 7*86400000) return d;
+    } catch(e){}
+    return null;
+  }
+  function dropDraft(){ try { localStorage.removeItem(LSKEY); } catch(e){} }
 
   function esc(s){ return String(s==null?"":s).replace(/[&<>"']/g, function(c){
     return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]; }); }
@@ -440,14 +460,31 @@
     };
   }
 
+  // Что уже заказано и не закрыто + календарь денег организации. Мастер обязан
+  // знать про свои же обязательства: «есть 200 000» — это до того, как вспомнили
+  // про остаток по прошлому заказу.
+  function loadSideData(){
+    var pid = STATE.production_id;
+    return Promise.all([
+      api("/api/orders/open" + (pid ? ("?production_id=" + pid) : ""))
+        .catch(function(){ return {orders:[], by_base:{}, left_to_pay:0, count:0}; }),
+      api("/api/cash-calendar").catch(function(){ return null; })
+    ]).then(function(r){ STATE.open = r[0]; STATE.cash = r[1]; });
+  }
+
   window.preview = function(step, keepEdits){
     go(step||3);
     // Правки количеств переживают пересчёт: раньше любой возврат к анкете
     // (и даже клик по шагу «3») стирал их молча.
-    if(!keepEdits) STATE.savedEdits = STATE.edits;
+    if(!keepEdits && Object.keys(STATE.edits).length) STATE.savedEdits = STATE.edits;
     STATE.edits = {};
     document.getElementById("planBox").innerHTML = '<div class="loading">Считаю план…</div>';
-    api("/api/order-plan/preview", brief()).then(function(p){
+    STATE.createdOrder = null;
+    Promise.all([
+      api("/api/order-plan/preview", brief()),
+      loadSideData()
+    ]).then(function(rr){
+      var p = rr[0];
       STATE.plan = p;
       // Возвращаем сохранённые правки тем строкам, которые остались в плане.
       var saved = STATE.savedEdits || {};
@@ -509,6 +546,7 @@
     warn.innerHTML = (left < 0)
       ? '<div class="err">Заказ выходит за бюджет на '+fmtR(-left)+' — уменьшите количества или поднимите бюджет.</div>' : "";
     renderPayments();
+    renderCash();
     var btn = document.getElementById("mkOrder");
     if(btn){
       var stop = [];
@@ -518,6 +556,50 @@
       btn.disabled = stop.length > 0;
       btn.title = stop.length ? ("Нельзя создать заказ: "+stop.join("; ")) : "";
     }
+  }
+
+  function renderCash(){
+    var box = document.getElementById("cash");
+    if(!box) return;
+    var c = STATE.cash, p = STATE.plan;
+    if(!c || !c.weeks){ box.innerHTML = '<div class="muted" style="font-size:12px">нет данных</div>'; return; }
+    var t = liveTotals(), share = p.cost_total ? (t.cost / p.cost_total) : 1;
+    var start = new Date(c.week_start+"T00:00:00");
+    // Текущий (ещё не созданный) заказ кладём в ту же сетку — иначе календарь
+    // показывает вчерашние обязательства и молчит про то, что решается сейчас.
+    var mine = c.weeks.map(function(){ return 0; });
+    (p.payments||[]).forEach(function(x){
+      var idx = Math.floor((new Date(x.date+"T00:00:00") - start)/86400000/7);
+      if(idx >= 0 && idx < mine.length) mine[idx] += Math.round(x.amount * share);
+    });
+    var rowsData = [], last = -1;
+    c.weeks.forEach(function(w, i){ if(w.amount || mine[i]) last = i; });
+    if(last < 0 && !(c.overdue && c.overdue.amount)){
+      box.innerHTML = '<div class="muted" style="font-size:12px">Платежей по открытым заказам нет — в календаре только этот заказ.</div>';
+    }
+    var maxV = 1;
+    c.weeks.forEach(function(w, i){ if(w.amount + mine[i] > maxV) maxV = w.amount + mine[i]; });
+    var run = (c.overdue && c.overdue.amount) || 0;
+    for(var i=0; i<=Math.max(last, 3) && i<c.weeks.length; i++){
+      var w = c.weeks[i], my = mine[i], tot = w.amount + my;
+      run += tot;
+      rowsData.push('<tr'+(i===0?' style="font-weight:600"':'')+'>'+
+        '<td>'+dstr(w.start)+(i===0?' <span class="why">эта неделя</span>':'')+'</td>'+
+        '<td class="nb'+(w.amount?'':' muted')+'" title="'+esc((w.items||[]).map(function(x){
+            return "№"+x.order_id+" "+x.label+" — "+fmt(x.amount)+" ₽"; }).join("\n"))+'">'+fmtR(w.amount)+'</td>'+
+        '<td class="nb'+(my?'':' muted')+'">'+fmtR(my)+'</td>'+
+        '<td class="nb">'+fmtR(tot)+
+          '<span class="why"><i style="display:inline-block;height:4px;border-radius:2px;background:#111;width:'+
+          Math.round(tot/maxV*100)+'%"></i></span></td>'+
+        '<td class="nb">'+fmtR(run)+'</td></tr>');
+    }
+    box.innerHTML = '<div class="table-outer"><table><thead><tr>'+
+      '<th>Неделя с</th><th>Открытые заказы</th><th>Этот заказ</th><th>Итого за неделю</th><th>Накопительно</th>'+
+      '</tr></thead><tbody>'+
+      ((c.overdue && c.overdue.amount) ? ('<tr><td>Просрочено / раньше</td><td class="nb">'+
+        fmtR(c.overdue.amount)+'</td><td class="nb muted">—</td><td class="nb">'+fmtR(c.overdue.amount)+
+        '</td><td class="nb">'+fmtR(c.overdue.amount)+'</td></tr>') : '')+
+      rowsData.join("")+'</tbody></table></div>';
   }
 
   function renderPayments(){
@@ -548,15 +630,19 @@
                 : 'Разместить заказ до <b>'+dstr(h.order_by)+'</b> ('+h.days_left+' дн).')+'</div>';
     }).join("");
 
+    var openBase = (STATE.open && STATE.open.by_base) || {};
     var rows = (p.items||[]).map(function(i){
       var sizes = Object.keys(i.sizes||{}).map(function(s){
         return (s || "One Size")+": "+i.sizes[s]; }).join(", ");
+      var inOpen = openBase[i.base_name] || 0;
       return '<tr class="'+rowCls(i.turnover)+'" data-b="'+esc(i.base_name)+'">'+
         '<td>'+esc(i.base_name)+'<span class="why">'+esc(i.category)+' · '+esc(i.why_text)+
-        (i.over_need ? ' · <b>'+i.over_need+' шт сверх потребности</b>' : '')+'</span></td>'+
+        (i.over_need ? ' · <b>'+i.over_need+' шт сверх потребности</b>' : '')+
+        (inOpen ? ' · <b>уже в открытом заказе: '+fmt(inOpen)+' шт</b>' : '')+'</span></td>'+
         '<td class="nb">'+fmt(i.turnover)+'</td>'+
         '<td class="nb">'+(i.rate!=null?(Math.round(i.rate*100)/100):'—')+'</td>'+
         '<td class="nb">'+fmt(i.cs)+'</td>'+
+        '<td class="nb'+(i.ordered?'':' muted')+'">'+fmt(i.ordered)+'</td>'+
         '<td class="nb">'+fmt(i.need)+'</td>'+
         '<td><input class="qinp" type="number" min="0" value="'+i.qty+'" data-b="'+esc(i.base_name)+'"></td>'+
         '<td class="nb" data-c="'+esc(i.base_name)+'">'+fmtR(i.cost_total)+'</td>'+
@@ -631,7 +717,20 @@
       (rev.other_production_count ? '<div class="peak">На других производствах — '+rev.other_production_count+' поз.: закажите отдельным заказом.</div>' : "")+
       '</div></details></div>';
 
+    var op = STATE.open || {orders:[], count:0};
+    var openHtml = "";
+    if (op.count) {
+      var first = op.orders[0];
+      openHtml = '<div class="warn" style="margin-bottom:12px">По этому каналу '+
+        (op.count === 1 ? 'открыт заказ' : ('открыто заказов: '+op.count+', последний')) + ' ' +
+        '<b>№'+first.id+' «'+esc(first.name)+'»</b> от '+dstr((first.created_at||"").slice(0,10))+
+        ' — '+fmt(first.total_qty)+' шт'+
+        (op.left_to_pay ? (', по всем открытым заказам осталось заплатить <b>'+fmtR(op.left_to_pay)+'</b>') : '')+
+        '. <a href="/orders">Посмотреть заказы</a></div>';
+    }
+
     document.getElementById("planBox").innerHTML =
+      openHtml+
       '<div id="budgetWarn"></div>'+
       '<div class="cards" id="cards"></div>'+
       '<div class="panel"><h2>Когда и сколько платить</h2>'+
@@ -640,6 +739,10 @@
         '<div class="flow" id="payflow"></div>'+
         (peaksHtml ? '<div style="margin-top:4px">'+peaksHtml+'</div>' : "")+
       '</div>'+
+      '<div class="panel"><h2>Календарь денег</h2>'+
+        '<div class="sub">По неделям: платежи по уже открытым заказам плюс этот заказ. '+
+        'Накопительно — сколько всего уйдёт с сегодняшнего дня.</div>'+
+        '<div id="cash"><div class="muted" style="font-size:12px">нет данных</div></div></div>'+
       newHtml+
       '<div class="panel"><h2>Покрытие: до какой даты хватит</h2>'+
         '<div class="sub">Серое — насколько хватит того, что есть сейчас. Зелёное — насколько хватит после прихода заказа.</div>'+
@@ -647,9 +750,10 @@
       '<div class="table-outer"><table><thead><tr>'+
         '<th>Позиция</th><th title="Нетто-выручка ÷ дни, когда позиция была в наличии">Оборач. ₽/день</th>'+
         '<th title="Темп продаж, штук в день — по нему считается «Нужно»">Темп, шт/дн</th>'+
-        '<th>Остаток</th><th title="темп × горизонт − остаток − едет">Нужно</th>'+
+        '<th>Остаток</th><th title="уже заказано и едет к нам">Едет</th>'+
+        '<th title="темп × горизонт − остаток − едет">Нужно</th>'+
         '<th>Заказать</th><th>Себестоимость</th><th>Размеры</th><th>Хватит до</th>'+
-        '</tr></thead><tbody>'+ (rows || '<tr><td colspan="9" class="loading">Ни одна позиция не прошла отбор</td></tr>') +'</tbody></table></div>'+
+        '</tr></thead><tbody>'+ (rows || '<tr><td colspan="10" class="loading">Ни одна позиция не прошла отбор</td></tr>') +'</tbody></table></div>'+
       ((p.stop||[]).length ? '<div class="err">'+
         (p.stop||[]).map(function(x){ return esc(x.text); }).join('. ')+'</div>' : '')+
       '<div class="actions" style="margin:14px 0 18px">'+
@@ -672,6 +776,7 @@
         var it = null; (STATE.plan.items||[]).forEach(function(x){ if(x.base_name===b) it=x; });
         var cell = document.querySelector('[data-c="'+CSS.escape(b)+'"]');
         if(it && cell) cell.textContent = fmtR(q*it.cost_price);
+        saveDraft();
         renderCards();
       });
     });
@@ -681,6 +786,7 @@
         var b = el.dataset.b, i = STATE.must.indexOf(b);
         if(el.checked && i < 0) STATE.must.push(b);
         if(!el.checked && i >= 0) STATE.must.splice(i, 1);
+        saveDraft();
         preview(3);
       });
     });
@@ -716,18 +822,68 @@
     }).join("");
   }
 
+  // После создания кнопка не должна выглядеть как «жми ещё раз»: заказ уже
+  // существует, дальше два осмысленных действия — открыть его и перевести
+  // в производство, не уходя на другую страницу.
+  function orderCreated(id){
+    STATE.createdOrder = id;
+    dropDraft();
+    var btn = document.getElementById("mkOrder");
+    if(!btn) return;
+    var act = btn.parentNode;
+    act.innerHTML =
+      '<a class="go-btn" style="text-decoration:none" href="/orders">Заказ №'+id+' создан → открыть</a>'+
+      '<button class="go-btn ghost" id="toProd">Отправить в производство</button>'+
+      '<button class="go-btn ghost" onclick="go(1)">← Новый заказ</button>'+
+      '<span class="hint" id="mkHint"></span>';
+    document.getElementById("toProd").addEventListener("click", function(){
+      var b2 = this, h2 = document.getElementById("mkHint");
+      if(!confirm("Перевести заказ №"+id+" в статус «В производстве»?\n\n"+
+                  "После этого его позиции считаются «едет к нам» и уменьшают следующие рекомендации.")) return;
+      b2.disabled = true; h2.textContent = "…";
+      api("/api/orders/"+id+"/status", {status:"sent"}).then(function(){
+        b2.outerHTML = '<span class="hint" style="color:#2b6b12">Заказ №'+id+' в производстве</span>';
+        h2.textContent = "";
+        loadSideData().then(function(){ renderCash(); });
+      }).catch(function(e){
+        b2.disabled = false;
+        h2.innerHTML = '<span style="color:#8a0003">'+esc(e.message)+'</span>';
+      });
+    });
+  }
+
   function createOrder(){
     var btn = document.getElementById("mkOrder"), hint = document.getElementById("mkHint");
     btn.disabled = true; hint.textContent = "сохраняю…";
     var b = brief(); b.overrides = STATE.edits;
+    var flags = {force:false, confirm_partial:false};
     api("/api/order-plan", b).then(function(res){
       hint.textContent = "создаю заказ…";
-      var p = curProd();
-      return api("/api/order-plan/"+res.id+"/apply",
-                 {name: (p ? p.name : "Заказ") + " · " + dstr(STATE.plan.eta_date)});
+      var pr = curProd();
+      var name = (pr ? pr.name : "Заказ") + " · " + dstr(STATE.plan.eta_date);
+      // 409 от сервера — это не ошибка, а вопрос: похоже на дубль / история
+      // ещё догружается. Спрашиваем владельца и повторяем с его подтверждением.
+      function attempt(){
+        return api("/api/order-plan/"+res.id+"/apply",
+                   {name:name, force:flags.force, confirm_partial:flags.confirm_partial})
+          .catch(function(e){
+            var m = e.message || "";
+            if(!flags.force && m.indexOf("такой заказ уже есть") >= 0){
+              if(confirm(m + "\n\nВсё равно создать новый заказ?")){ flags.force = true; return attempt(); }
+              throw new Error("Отменено: такой заказ уже есть.");
+            }
+            if(!flags.confirm_partial && m.indexOf("она ещё загружается") >= 0){
+              if(confirm(m + "\n\nВсё равно создать заказ по неполной истории?")){
+                flags.confirm_partial = true; return attempt(); }
+              throw new Error("Отменено: дождитесь загрузки истории.");
+            }
+            throw e;
+          });
+      }
+      return attempt();
     }).then(function(r){
-      hint.innerHTML = '<span style="color:#2b6b12">Заказ создан. Открыть: <a href="/replenish">Заказ → в производстве</a></span>';
-      btn.disabled = false;
+      hint.textContent = "";
+      orderCreated(r.order_id);
     }).catch(function(e){
       hint.innerHTML = '<span style="color:#8a0003">'+esc(e.message)+'</span>';
       btn.disabled = false;
@@ -780,6 +936,11 @@
         x.className = "tile" + (x.dataset.v===STATE.strategy ? " on" : ""); });
     } else {
       STATE.production_id = (STATE.prods[0]||{}).id;
+    }
+    var draft = loadDraft();
+    if(draft && draft.pid === STATE.production_id){
+      STATE.edits = draft.edits || {};
+      STATE.must = draft.must || [];
     }
     segInitValue("cadSeg", STATE.cadence);
     updWidthHint();

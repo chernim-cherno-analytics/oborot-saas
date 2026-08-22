@@ -3,6 +3,7 @@
 
 <div class="no-print">
   <p class="page-sub">Заказы, созданные из «Что заказать». Выберите заказ, чтобы посмотреть состав и распечатать для производства.</p>
+  <div id="orders-filter" style="display:none; gap:6px; flex-wrap:wrap; margin:0 0 10px;"></div>
   <div id="orders-box">
     <div class="loading-stub">Загрузка…</div>
   </div>
@@ -18,6 +19,8 @@ document.addEventListener("DOMContentLoaded", function () {
   var orders = [];
   var currentId = null;
   var box = document.getElementById("orders-box");
+  var prodNames = {};       // production_id -> название канала
+  var filterPid = "all";    // "all" | "none" | id канала
   var detail = document.getElementById("detail-box");
 
   var STATUS = {
@@ -26,9 +29,52 @@ document.addEventListener("DOMContentLoaded", function () {
     received: '<span class="badge green">Принят на склад</span>'
   };
 
+  // Заказы разных каналов живут по разным правилам (сроки, этапы, деньги),
+  // поэтому в общем списке нужен и ярлык канала, и фильтр по нему.
+  function chanName(pid) { return pid ? (prodNames[pid] || ("Канал №" + pid)) : ""; }
+
+  function renderFilter() {
+    var f = document.getElementById("orders-filter");
+    if (!f) return;
+    var used = {};
+    orders.forEach(function (o) { used[o.production_id || "none"] = true; });
+    var keys = Object.keys(used);
+    if (keys.length < 2) { f.style.display = "none"; return; }
+    var opts = [["all", "Все заказы"]];
+    keys.forEach(function (k) {
+      if (k !== "none") opts.push([k, chanName(Number(k))]);
+    });
+    if (used.none) opts.push(["none", "Без канала"]);
+    f.style.display = "flex";
+    f.innerHTML = opts.map(function (o) {
+      return '<button type="button" class="btn' + (filterPid === o[0] ? " primary" : "") +
+        '" data-pid="' + esc(o[0]) + '" style="padding:5px 12px; font-size:13px;">' + esc(o[1]) + "</button>";
+    }).join("");
+    f.querySelectorAll("button").forEach(function (b) {
+      b.addEventListener("click", function () {
+        filterPid = b.getAttribute("data-pid");
+        renderFilter();
+        renderList();
+      });
+    });
+  }
+
+  function visibleOrders() {
+    if (filterPid === "all") return orders;
+    if (filterPid === "none") return orders.filter(function (o) { return !o.production_id; });
+    return orders.filter(function (o) { return String(o.production_id || "") === filterPid; });
+  }
+
   function reloadAll() {
+    api("/api/productions").then(function (d) {
+      (d.productions || []).forEach(function (p) { prodNames[p.id] = p.name; });
+    }).catch(function () {}).then(function () { loadOrders(); });
+  }
+
+  function loadOrders() {
     api("/api/orders").then(function (d) {
       orders = Array.isArray(d) ? d : (d.orders || d.items || []);
+      renderFilter();
       renderList();
       if (currentId && orders.some(function (o) { return o.id === currentId; })) {
         openOrder(currentId);
@@ -85,6 +131,7 @@ document.addEventListener("DOMContentLoaded", function () {
   }
 
   function renderList() {
+    var list = visibleOrders();
     if (!orders.length) {
       box.innerHTML = emptyState(
         "Заказов на производство пока нет",
@@ -93,7 +140,11 @@ document.addEventListener("DOMContentLoaded", function () {
         '<svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 21V9l5 3V9l5 3V4h6v17z"/><line x1="4" y1="21" x2="20" y2="21"/></svg>');
       return;
     }
-    box.innerHTML = '<div class="order-grid">' + orders.map(function (o) {
+    if (!list.length) {
+      box.innerHTML = '<div class="card"><div class="loading-stub">В этом канале заказов нет.</div></div>';
+      return;
+    }
+    box.innerHTML = '<div class="order-grid">' + list.map(function (o) {
       var s = orderStats(o);
       var statsHtml = o.items
         ? '<div class="o-stats"><div><b>' + fmtInt(s.pos) + '</b> <span>поз.</span></div>' +
@@ -103,7 +154,8 @@ document.addEventListener("DOMContentLoaded", function () {
       return '<div class="order-card' + (o.id === currentId ? " active" : "") + '" data-id="' + esc(o.id) + '">' +
         '<div style="display:flex; align-items:center; gap:8px;"><div class="o-name" style="flex:1;">' + esc(o.name) + "</div>" +
         (STATUS[o.status] || "") + "</div>" +
-        '<div class="o-meta">Создан ' + fmtDate(o.created_at) + (o.eta_date ? " · готовность " + fmtDate(o.eta_date) : "") + "</div>" +
+        '<div class="o-meta">Создан ' + fmtDate(o.created_at) + (o.eta_date ? " · готовность " + fmtDate(o.eta_date) : "") +
+          (o.production_id ? " · " + esc(chanName(o.production_id)) : "") + "</div>" +
         statsHtml +
         "</div>";
     }).join("") + "</div>";
