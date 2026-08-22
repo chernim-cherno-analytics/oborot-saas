@@ -216,13 +216,17 @@
       <div class="fld">
         <span class="lbl">Стратегия</span>
         <div class="tiles" id="stratTiles">
-          <div class="tile" data-v="protect"><div class="t">Не потерять продажи</div>
-            <div class="d">Стартовая партия каждому — шире ассортимент, меньше дыр на полке</div></div>
+          <div class="tile" data-v="protect"><div class="t">Шире ассортимент</div>
+            <div class="d">Каждая строка закрывает неделю продаж, лимит на позицию 20% —
+              больше моделей понемногу, меньше дыр на полке</div></div>
           <div class="tile on" data-v="balance"><div class="t">Баланс</div>
-            <div class="d">Слабые не получают стартовую партию, деньги идут в оборачиваемость</div></div>
-          <div class="tile" data-v="grow"><div class="t">Заработать максимум</div>
-            <div class="d">Только бестселлеры и хорошие, глубоко — остальное по остаточному принципу</div></div>
+            <div class="d">Каждая строка закрывает три недели, лимит 30% — потом добор
+              по оборачиваемости</div></div>
+          <div class="tile" data-v="grow"><div class="t">Глубже в топ</div>
+            <div class="d">Сразу до полной потребности, начиная с самых оборачиваемых,
+              лимит 60% — меньше моделей, но закрыты целиком</div></div>
         </div>
+        <div class="hint" id="widthHint" style="margin-top:8px"></div>
       </div>
 
       <div class="fld" style="display:flex;gap:26px;flex-wrap:wrap">
@@ -272,7 +276,7 @@
 <script>
 (function(){
   var STATE = { production_id: null, prods: [], cadence: 30, scope: "now",
-                strategy: "balance", offcats: [], plan: null, edits: {}, newItems: [] };
+                strategy: "balance", offcats: [], plan: null, edits: {}, newItems: [], must: [] };
 
   function esc(s){ return String(s==null?"":s).replace(/[&<>"']/g, function(c){
     return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]; }); }
@@ -372,6 +376,15 @@
     });
   }
 
+  function updWidthHint(){
+    var box = document.getElementById("widthHint");
+    if(!box) return;
+    var w = {protect: "неделю", balance: "три недели", grow: "всю потребность целиком"};
+    box.textContent = "Каждая строка заказа закрывает " + w[STATE.strategy] +
+      ". Это единственное, что меняет форму заказа: шире и мельче или уже и глубже. " +
+      "Порядок всегда один — по оборачиваемости ₽/день.";
+  }
+
   function updHints(){
     var p = curProd();
     var cover = Math.max(21, Math.min(180, STATE.cadence + (STATE.safety||14)));
@@ -422,16 +435,26 @@
       moq_units: parseNum("moq"),
       reserve_new_pct: parseNum("reserve"),
       exclude_categories: STATE.offcats,
+      must_have: STATE.must,
       new_items: STATE.newItems.filter(function(n){ return n.name && n.qty>0; })
     };
   }
 
-  window.preview = function(step){
+  window.preview = function(step, keepEdits){
     go(step||3);
+    // Правки количеств переживают пересчёт: раньше любой возврат к анкете
+    // (и даже клик по шагу «3») стирал их молча.
+    if(!keepEdits) STATE.savedEdits = STATE.edits;
     STATE.edits = {};
     document.getElementById("planBox").innerHTML = '<div class="loading">Считаю план…</div>';
     api("/api/order-plan/preview", brief()).then(function(p){
-      STATE.plan = p; renderPlan();
+      STATE.plan = p;
+      // Возвращаем сохранённые правки тем строкам, которые остались в плане.
+      var saved = STATE.savedEdits || {};
+      (p.items||[]).forEach(function(i){
+        if(saved[i.base_name] !== undefined) STATE.edits[i.base_name] = saved[i.base_name];
+      });
+      renderPlan();
     }).catch(function(e){
       document.getElementById("planBox").innerHTML =
         '<div class="err">Не удалось посчитать план: '+esc(e.message)+'</div>';
@@ -447,9 +470,17 @@
       profit += q*Math.max(0, i.avg_price - i.cost_price);
     });
     var share = p.cost_total ? (p.pay_now / p.cost_total) : 1;
+    var cov = null, covFull = 0;
+    (p.items||[]).forEach(function(i){
+      var q = (STATE.edits[i.base_name]!==undefined) ? STATE.edits[i.base_name] : i.qty;
+      if(q<=0 || !i.covered_until) return;
+      if(cov === null || i.covered_until < cov) cov = i.covered_until;
+      if(p.covered_until_target && i.covered_until >= p.covered_until_target) covFull++;
+    });
     return { cost: Math.round(cost), units: units, positions: pos,
              profit: Math.round(profit), pay_now: Math.round(cost*share),
-             pay_later: Math.round(cost*(1-share)) };
+             pay_later: Math.round(cost - cost*share),
+             covered_until: cov, covered_full: covFull };
   }
 
   function renderCards(){
@@ -457,35 +488,60 @@
     var budget = p.budget || 0;
     var spent = (p.budget_scope === "now") ? t.pay_now : t.cost;
     var left = budget - (p.reserve_new||0) - spent;
+    var covN = t.covered_full, covAll = t.positions;
     document.getElementById("cards").innerHTML =
-      '<div class="card"><div class="l">Бюджет</div><div class="v">'+fmtR(budget)+'</div>'+
-        '<div class="s">'+(p.reserve_new? ("новинки "+fmtR(p.reserve_new)+" · ") : "")+
-        'остаток '+fmtR(left)+'</div></div>'+
-      '<div class="card"><div class="l">Себестоимость заказа</div><div class="v">'+fmtR(t.cost)+'</div>'+
-        '<div class="s">сейчас '+fmtR(t.pay_now)+' · потом '+fmtR(t.pay_later)+'</div></div>'+
+      '<div class="card"><div class="l">Заплатить сейчас</div><div class="v">'+fmtR(t.pay_now)+'</div>'+
+        '<div class="s">из бюджета '+fmtR(budget)+
+        (p.reserve_new? (" · новинки "+fmtR(p.reserve_new)) : "")+
+        ' · свободно '+fmtR(left)+'</div></div>'+
+      '<div class="card"'+(t.pay_later>0?' style="background:rgba(255,204,0,.16)"':'')+'>'+
+        '<div class="l">Полное обязательство</div><div class="v">'+fmtR(t.cost)+'</div>'+
+        '<div class="s">'+(t.pay_later>0
+          ? ('ещё '+fmtR(t.pay_later)+' платится позже')
+          : 'весь заказ оплачивается сразу')+'</div></div>'+
       '<div class="card"><div class="l">Позиций / штук</div><div class="v">'+fmt(t.positions)+' / '+fmt(t.units)+'</div>'+
-        '<div class="s">в заказе</div></div>'+
-      '<div class="card" style="background:rgba(76,187,23,0.18)"><div class="l">Ожидаемая прибыль</div>'+
-        '<div class="v">'+fmtR(t.profit)+'</div><div class="s">по средней цене продажи</div></div>'+
-      '<div class="card"><div class="l">Спрос закрыт до</div><div class="v" style="font-size:16px">'+dstr(p.covered_until)+'</div>'+
-        '<div class="s">на складе '+dstr(p.eta_date)+'</div></div>';
+        '<div class="s">'+(p.over_need_cost ? ('из них '+fmtR(p.over_need_cost)+' — запас сверх потребности') : 'в заказе')+'</div></div>'+
+      '<div class="card" style="background:rgba(76,187,23,0.18)"><div class="l">Валовая маржа</div>'+
+        '<div class="v">'+fmtR(t.profit)+'</div><div class="s">если продать по средней цене, до налогов и логистики</div></div>'+
+      '<div class="card"><div class="l">Первая позиция кончится</div><div class="v" style="font-size:16px">'+dstr(t.covered_until)+'</div>'+
+        '<div class="s">'+(covAll ? ('полностью закрыто '+covN+' из '+covAll+' · цель '+dstr(p.covered_until_target)) : 'на складе '+dstr(p.eta_date))+'</div></div>';
     var warn = document.getElementById("budgetWarn");
-    if(warn) warn.innerHTML = (left < 0)
-      ? '<div class="warn">Правки вышли за бюджет на '+fmtR(-left)+'.</div>' : "";
+    warn.innerHTML = (left < 0)
+      ? '<div class="err">Заказ выходит за бюджет на '+fmtR(-left)+' — уменьшите количества или поднимите бюджет.</div>' : "";
+    renderPayments();
+    var btn = document.getElementById("mkOrder");
+    if(btn){
+      var stop = [];
+      if(left < 0) stop.push("выход за бюджет");
+      if(!t.positions && !(p.new_items||[]).length) stop.push("в плане нет позиций");
+      if(p.order_date < p.today) stop.push("дата размещения уже прошла");
+      btn.disabled = stop.length > 0;
+      btn.title = stop.length ? ("Нельзя создать заказ: "+stop.join("; ")) : "";
+    }
+  }
+
+  function renderPayments(){
+    var p = STATE.plan, box = document.getElementById("payflow");
+    if(!box) return;
+    var t = liveTotals(), share = p.cost_total ? (t.cost / p.cost_total) : 1;
+    box.innerHTML = (p.payments||[]).map(function(x,i){
+      var amount = Math.round(x.amount * share);
+      return '<div class="pay'+(i===0?" now":"")+'"><div class="d">'+dstr(x.date)+'</div>'+
+        '<div class="a">'+fmtR(amount)+'</div><div class="n">'+esc(x.label)+'</div></div>';
+    }).join("");
   }
 
   function renderPlan(){
     var p = STATE.plan;
     if(p.blocked){
+      var extra = (p.blocked.reason === "no_assignment")
+        ? '<a class="go-btn ghost" style="text-decoration:none" href="/settings">Настроить распределение</a>' : '';
       document.getElementById("planBox").innerHTML =
         '<div class="warn">'+esc(p.blocked.text)+'</div>'+
-        '<div class="actions"><button class="go-btn ghost" onclick="go(1)">← Изменить условия</button></div>';
+        '<div class="actions"><button class="go-btn ghost" onclick="go(1)">← Изменить условия</button>'+
+        extra+'</div>';
       return;
     }
-    var payHtml = (p.payments||[]).map(function(x,i){
-      return '<div class="pay'+(i===0?" now":"")+'"><div class="d">'+dstr(x.date)+'</div>'+
-        '<div class="a">'+fmtR(x.amount)+'</div><div class="n">'+esc(x.label)+'</div></div>';
-    }).join("");
     var peaksHtml = (p.peaks||[]).map(function(h){
       return '<div class="peak'+(h.late?" late":"")+'">'+esc(h.name)+' — с '+dstr(h.from)+'. '+
         (h.late ? 'Заказ надо было разместить до '+dstr(h.order_by)+', уже поздно.'
@@ -496,20 +552,27 @@
       var sizes = Object.keys(i.sizes||{}).map(function(s){
         return (s || "One Size")+": "+i.sizes[s]; }).join(", ");
       return '<tr class="'+rowCls(i.turnover)+'" data-b="'+esc(i.base_name)+'">'+
-        '<td>'+esc(i.base_name)+'<span class="why">'+esc(i.category)+' · '+esc(i.why_text)+'</span></td>'+
+        '<td>'+esc(i.base_name)+'<span class="why">'+esc(i.category)+' · '+esc(i.why_text)+
+        (i.over_need ? ' · <b>'+i.over_need+' шт сверх потребности</b>' : '')+'</span></td>'+
         '<td class="nb">'+fmt(i.turnover)+'</td>'+
+        '<td class="nb">'+(i.rate!=null?(Math.round(i.rate*100)/100):'—')+'</td>'+
         '<td class="nb">'+fmt(i.cs)+'</td>'+
         '<td class="nb">'+fmt(i.need)+'</td>'+
         '<td><input class="qinp" type="number" min="0" value="'+i.qty+'" data-b="'+esc(i.base_name)+'"></td>'+
         '<td class="nb" data-c="'+esc(i.base_name)+'">'+fmtR(i.cost_total)+'</td>'+
         '<td class="nb muted" style="font-size:11px">'+esc(sizes)+'</td>'+
-        '<td class="nb">'+dstr(i.covered_until)+'</td></tr>';
+        '<td class="nb">'+dstr(i.covered_until)+
+        (i.days_to_sell!=null?'<span class="why">разойдётся за '+i.days_to_sell+' дн</span>':'')+
+        '</td></tr>';
     }).join("");
 
     var notIn = (p.not_included||[]).slice(0,60).map(function(i){
-      return '<tr><td>'+esc(i.base_name)+'<span class="why">'+esc(i.category)+'</span></td>'+
+      return '<tr><td><label style="cursor:pointer"><input type="checkbox" class="takebox" '+
+        'data-b="'+esc(i.base_name)+'"'+(STATE.must.indexOf(i.base_name)>=0?' checked':'')+'> '+
+        esc(i.base_name)+'</label><span class="why">'+esc(i.category)+
+        (i.moq_cost ? ' · партия стоит '+fmtR(i.moq_cost)+' — дороже лимита на позицию' : '')+'</span></td>'+
         '<td class="nb">'+fmt(i.turnover)+'</td><td class="nb">'+fmt(i.need)+'</td>'+
-        '<td class="nb">'+fmtR(i.need_rub)+'</td><td class="nb">'+fmtR(i.lost_revenue)+'</td></tr>';
+        '<td class="nb">'+fmtR(i.need_rub)+'</td><td class="nb">'+fmtR(i.lost_margin)+'</td></tr>';
     }).join("");
 
     var sens = (p.sensitivity||[]).map(function(s){
@@ -523,15 +586,47 @@
       (p.new_items_over_budget ? '<div class="warn" style="margin-top:9px">Новинки выходят за бюджет на '+fmtR(p.new_items_over_budget)+'.</div>' : "")+
       '</div></details></div>') : "";
 
+    var overCap = (p.moq_over_cap||[]).length ? ('<div class="fold"><details><summary>'+
+      'Партия дороже лимита на позицию ('+p.moq_over_cap.length+')</summary><div class="body">'+
+      '<div class="peak">Минимальная партия этих позиций стоит больше, чем вы разрешили тратить '+
+      'на одну позицию. Поднимите лимит на шаге 2 или закажите их отдельно.</div>'+
+      p.moq_over_cap.slice(0,30).map(function(m){
+        return '<div class="peak">'+esc(m.base_name)+' — партия '+fmtR(m.batch_cost)+
+          ' при лимите '+fmtR(m.limit)+'</div>'; }).join("")+
+      '</div></details></div>') : "";
     var moqHtml = (p.moq_skipped||[]).length ? ('<div class="fold"><details><summary>Не набирают минимальную партию ('+
       p.moq_skipped.length+')</summary><div class="body">'+
       p.moq_skipped.slice(0,40).map(function(m){ return '<div class="peak">'+esc(m.base_name)+' — партия разошлась бы за '+m.days+' дн</div>'; }).join("")+
       '</div></details></div>') : "";
 
+    var L = p.lost || null;
+    var lostTitle = L
+      ? ('Не вошло в заказ — недополученная маржа ≈'+fmtR(L.missing))
+      : 'Не вошло в заказ';
+    var lostNote = L
+      ? ('<div class="peak">Отдельно: по позициям, которые в заказе, недобрано ещё на <b>'+
+         fmtR(L.short)+'</b> маржи. Часть этого закроет следующий заказ через '+
+         L.next_order_days+' дн — без покрытия остаётся примерно <b>'+fmtR(L.at_risk)+'</b>.</div>')
+      : '';
     var rev = p.review||{};
-    var revHtml = '<div class="fold"><details><summary>Что система считать не берётся</summary><div class="body">'+
-      '<div class="peak">Мало данных — '+(rev.low_data_count||0)+' поз.: темп из одной-двух продаж, решайте руками.</div>'+
-      '<div class="peak">Нет себестоимости — '+(rev.no_cost_count||0)+' поз.: без неё деньги не посчитать.</div>'+
+    function revList(rows, note, action){
+      if(!rows || !rows.length) return '';
+      return rows.slice(0,30).map(function(r){
+        return '<div class="peak"><label style="cursor:pointer">'+
+          (action?'<input type="checkbox" class="takebox" data-b="'+esc(r.base_name)+'"'+
+            (STATE.must.indexOf(r.base_name)>=0?' checked':'')+'> ':'')+
+          esc(r.base_name)+'</label> — '+fmt(r.turnover)+' ₽/день, нужно '+fmt(r.need)+' шт'+
+          (r.cost_price?(', себестоимость '+fmtR(r.cost_price)):'')+'. '+note+'</div>';
+      }).join("");
+    }
+    var revHtml = '<div class="fold"><details><summary>Что система считать не берётся ('+
+      ((rev.low_data_count||0)+(rev.no_cost_count||0))+' поз. решаете вы)</summary><div class="body">'+
+      (rev.low_data_count ? ('<div class="peak"><b>Мало данных — '+rev.low_data_count+
+        ' поз.</b> Темп из одной-двух продаж: считать по нему нельзя, но отметьте — возьмём как есть.</div>'+
+        revList(rev.low_data, 'Отметьте, чтобы включить в заказ.', true)) : '')+
+      (rev.no_cost_count ? ('<div class="peak"><b>Нет себестоимости — '+rev.no_cost_count+
+        ' поз.</b> Без неё деньги посчитать нечем — заполните в МойСкладе.</div>'+
+        revList(rev.no_cost, 'Заполните себестоимость в МойСкладе.', false)) : '')+
       '<div class="peak">Без продаж 90 дней — '+(rev.stale_count||0)+' поз. · потребность меньше 3 шт — '+(rev.small_need_count||0)+' поз.</div>'+
       (rev.other_production_count ? '<div class="peak">На других производствах — '+rev.other_production_count+' поз.: закажите отдельным заказом.</div>' : "")+
       '</div></details></div>';
@@ -542,7 +637,7 @@
       '<div class="panel"><h2>Когда и сколько платить</h2>'+
         '<div class="sub">Разместить заказ '+dstr(p.order_date)+' · на складе '+dstr(p.eta_date)+
         ' · заказ закрывает '+p.cover_days+' дн продаж.</div>'+
-        '<div class="flow">'+payHtml+'</div>'+
+        '<div class="flow" id="payflow"></div>'+
         (peaksHtml ? '<div style="margin-top:4px">'+peaksHtml+'</div>' : "")+
       '</div>'+
       newHtml+
@@ -550,19 +645,23 @@
         '<div class="sub">Серое — насколько хватит того, что есть сейчас. Зелёное — насколько хватит после прихода заказа.</div>'+
         '<div id="cov"></div></div>'+
       '<div class="table-outer"><table><thead><tr>'+
-        '<th>Позиция</th><th>Оборач. ₽/день</th><th>Остаток</th><th>Нужно</th>'+
+        '<th>Позиция</th><th title="Нетто-выручка ÷ дни, когда позиция была в наличии">Оборач. ₽/день</th>'+
+        '<th title="Темп продаж, штук в день — по нему считается «Нужно»">Темп, шт/дн</th>'+
+        '<th>Остаток</th><th title="темп × горизонт − остаток − едет">Нужно</th>'+
         '<th>Заказать</th><th>Себестоимость</th><th>Размеры</th><th>Хватит до</th>'+
-        '</tr></thead><tbody>'+ (rows || '<tr><td colspan="8" class="loading">Ни одна позиция не прошла отбор</td></tr>') +'</tbody></table></div>'+
+        '</tr></thead><tbody>'+ (rows || '<tr><td colspan="9" class="loading">Ни одна позиция не прошла отбор</td></tr>') +'</tbody></table></div>'+
+      ((p.stop||[]).length ? '<div class="err">'+
+        (p.stop||[]).map(function(x){ return esc(x.text); }).join('. ')+'</div>' : '')+
       '<div class="actions" style="margin:14px 0 18px">'+
         '<button class="go-btn" id="mkOrder">Создать заказ</button>'+
         '<button class="go-btn ghost" onclick="go(1)">← Изменить условия</button>'+
         '<span class="hint" id="mkHint"></span></div>'+
-      (notIn ? ('<div class="fold"><details><summary>Не влезло в бюджет — теряем ≈'+fmtR(p.lost_revenue)+
-        '</summary><div class="body">'+sens+
+      (notIn ? ('<div class="fold"><details><summary>'+lostTitle+
+        '</summary><div class="body">'+lostNote+sens+
         '<div class="table-outer" style="max-height:40vh;margin-top:9px"><table><thead><tr>'+
-        '<th>Позиция</th><th>Оборач.</th><th>Нужно, шт</th><th>Нужно, ₽</th><th>Упущенная выручка</th>'+
+        '<th>Позиция</th><th>Оборач.</th><th>Нужно, шт</th><th>Нужно, ₽</th><th>Недополученная маржа</th>'+
         '</tr></thead><tbody>'+notIn+'</tbody></table></div></div></details></div>') : "")+
-      moqHtml + revHtml;
+      overCap + moqHtml + revHtml;
 
     renderCards();
     renderCoverage();
@@ -574,6 +673,15 @@
         var cell = document.querySelector('[data-c="'+CSS.escape(b)+'"]');
         if(it && cell) cell.textContent = fmtR(q*it.cost_price);
         renderCards();
+      });
+    });
+    // «Взять» у позиций из отсева — решение владельца сильнее алгоритма.
+    Array.prototype.forEach.call(document.querySelectorAll(".takebox"), function(el){
+      el.addEventListener("change", function(){
+        var b = el.dataset.b, i = STATE.must.indexOf(b);
+        if(el.checked && i < 0) STATE.must.push(b);
+        if(!el.checked && i >= 0) STATE.must.splice(i, 1);
+        preview(3);
       });
     });
     document.getElementById("mkOrder").addEventListener("click", createOrder);
@@ -640,6 +748,7 @@
       el.className = "tile on"; STATE.strategy = el.dataset.v;
       var caps = {protect:20, balance:30, grow:60};
       document.getElementById("capPct").value = caps[STATE.strategy];
+      updWidthHint();
     });
   });
 
@@ -673,6 +782,7 @@
       STATE.production_id = (STATE.prods[0]||{}).id;
     }
     segInitValue("cadSeg", STATE.cadence);
+    updWidthHint();
     segInitValue("scopeSeg", STATE.scope);
     renderProds();
 
