@@ -1051,6 +1051,75 @@ def api_checks() -> None:
         check("в настройках есть поле накладных",
               'id="overhead"' in c.get("/settings").text)
 
+        print("\n14b. Горизонт заказа: два режима (D-27)")
+        # До этой правки поле «Горизонт планирования» в Настройках сохранялось,
+        # показывалось, упоминалось в подсказках — и НЕ влияло ни на что:
+        # режим по умолчанию считает горизонт из ритма и страховки, а
+        # переключателя режима в интерфейсе не было вообще.
+        st0 = c.get("/api/settings").json()
+        check("настройки называют горизонт тремя разными именами",
+              all(k in st0 for k in ("horizon_days_fixed", "horizon_days_effective",
+                                     "horizon_source")),
+              f"keys={[k for k in st0 if 'horizon' in k]}")
+        check("по умолчанию режим автоматический",
+              st0["horizon_source"] == "cadence", f"got={st0['horizon_source']}")
+        check("автоматический горизонт = ритм + страховой запас (с клампом)",
+              st0["horizon_days_effective"]
+              == max(21, min(180, st0["order_cadence_days"] + st0["safety_days"])),
+              f"eff={st0['horizon_days_effective']} ритм={st0['order_cadence_days']} "
+              f"страховка={st0['safety_days']}")
+        check("устаревшее имя horizon_days = пользовательская настройка, а не расчёт",
+              st0["horizon_days"] == st0["horizon_days_fixed"],
+              f"horizon_days={st0['horizon_days']} fixed={st0['horizon_days_fixed']}")
+
+        eta_hz = (date.today() + timedelta(days=45)).isoformat()
+        body_hz = {"eta_date": eta_hz, "budget": 300000, "budget_scope": "full",
+                   "strategy": "balance"}
+        plan_auto = c.post("/api/order-plan/preview", json=body_hz).json()
+        check("мастер считает по тому же автоматическому горизонту",
+              plan_auto["cover_days"] == st0["horizon_days_effective"],
+              f"мастер={plan_auto['cover_days']} настройки={st0['horizon_days_effective']}")
+
+        r = c.post("/api/settings", json={"cover_mode": "fixed", "horizon_days": 120})
+        check("режим «фиксированный» сохраняется", r.status_code == 200,
+              f"status={r.status_code} {r.text[:120]}")
+        st1 = c.get("/api/settings").json()
+        check("эффективный горизонт стал пользовательским числом",
+              st1["horizon_source"] == "fixed" and st1["horizon_days_effective"] == 120,
+              f"source={st1['horizon_source']} eff={st1['horizon_days_effective']}")
+        plan_fixed = c.post("/api/order-plan/preview", json=body_hz).json()
+        check("МАСТЕР уважает фиксированный горизонт (раньше игнорировал)",
+              plan_fixed["cover_days"] == 120,
+              f"мастер={plan_fixed['cover_days']} ожидали 120")
+        # Итоговые ШТУКИ сравнивать нельзя: план ограничен бюджетом, и при
+        # большем горизонте те же деньги уходят в меньшее число более глубоких
+        # позиций. Растёт именно ПОТРЕБНОСТЬ (темп × горизонт) — её и проверяем
+        # по позициям, попавшим в оба плана.
+        need_auto = {i["base_name"]: i["need"] for i in plan_auto["items"]}
+        need_fix = {i["base_name"]: i["need"] for i in plan_fixed["items"]}
+        common = set(need_auto) & set(need_fix)
+        check("на большем горизонте потребность по позиции выше",
+              bool(common) and all(need_fix[b] >= need_auto[b] for b in common)
+              and any(need_fix[b] > need_auto[b] for b in common),
+              f"общих={len(common)} примеры="
+              f"{[(b, need_auto[b], need_fix[b]) for b in list(common)[:3]]}")
+        check("ритм заказов в анкете фиксированный горизонт не сдвигает",
+              c.post("/api/order-plan/preview",
+                     json=dict(body_hz, cadence_days=7)).json()["cover_days"] == 120,
+              "ритм 7 дн не должен менять фиксированные 120")
+        opts = c.get("/api/order-plan/options").json()
+        check("анкета мастера знает, что горизонт фиксированный",
+              opts.get("horizon_source") == "fixed"
+              and opts.get("horizon_days_effective") == 120,
+              f"opts={{k: opts.get(k) for k in ('horizon_source','horizon_days_effective')}}")
+        c.post("/api/settings", json={"cover_mode": "cadence"})
+        check("возврат в автоматический режим восстанавливает прежний горизонт",
+              c.get("/api/settings").json()["horizon_days_effective"]
+              == st0["horizon_days_effective"],
+              f"got={c.get('/api/settings').json()['horizon_days_effective']}")
+        check("в настройках есть переключатель режима горизонта",
+              'id="horizon-mode"' in c.get("/settings").text)
+
         print("\n14c. Мастер заказа на догружаемой истории (деплой П1)")
         eta_full = (date.today() + timedelta(days=45)).isoformat()
         body = {"eta_date": eta_full, "budget": 300000, "budget_scope": "full",
