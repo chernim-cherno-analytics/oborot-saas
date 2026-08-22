@@ -104,6 +104,16 @@ def ordered_map() -> dict:
     return rows
 
 
+def tracked_map() -> dict:
+    """{base_name: (ms_qty, ms_qty_tracked)} — два потока «едет к нам» (D-28)."""
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    rows = {r["base_name"]: (r["ms_qty"], r["ms_qty_tracked"]) for r in con.execute(
+        "SELECT base_name, ms_qty, ms_qty_tracked FROM ordered_qty")}
+    con.close()
+    return rows
+
+
 def sku_ext(base: str, size: str) -> str | None:
     """ext_id SKU mock-мира по (base_name, size); None, если нет."""
     for sku in mock_ms.SKUS:
@@ -234,6 +244,83 @@ def run_scenario() -> int:
     check("push draft: ms_qty вырос на отправленное, локальный qty не тронут",
           ms_ok and qty_ok,
           f"pushed={pushed_by_base} om0={om0} om1={om1}")
+
+    # ── Два потока: наш заказ отделим от чужих (решение владельца D-28) ──
+    # Мок отдаёт и seeded-заказы поставщику (их «Оборот» не создавал), и наш,
+    # созданный кнопкой push-to-ms. Синк обязан развести их по доказуемой
+    # связи и НЕ приписать себе чужие.
+    print("== Два потока «едет к нам»: наш заказ против чужих ==")
+    tr_push = tracked_map()
+    ours = next(iter(pushed_by_base))
+    check("сразу после push наш заказ помечен как свой",
+          tr_push.get(ours, (0, 0))[1] >= pushed_by_base[ours],
+          f"{ours}: ms_qty_tracked={tr_push.get(ours, (0, 0))[1]} "
+          f"отправлено={pushed_by_base[ours]}")
+
+    r = client.post("/api/sync/run")
+    check("инкрементальный синк запущен", r.status_code == 200, f"status={r.status_code}")
+    st = wait_sync_done(client)
+    check("синк завершён", st.get("state") == "done",
+          f"state={st.get('state')} error={str(st.get('error'))[:120]}")
+    stats = st.get("stats") or {}
+    tr = tracked_map()
+    check("после синка наш заказ по-прежнему свой",
+          tr.get(ours, (0, 0))[1] > 0,
+          f"{ours}: ms_qty={tr.get(ours, (0, 0))[0]} tracked={tr.get(ours, (0, 0))[1]}")
+    check("tracked никогда не больше общего «едет»",
+          all(t <= m + 1e-6 for m, t in tr.values()),
+          f"нарушения={[b for b, (m, t) in tr.items() if t > m + 1e-6][:3]}")
+    ext_total = stats.get("incoming_qty_external")
+    check("чужие заказы посчитаны отдельно и не пусты",
+          isinstance(ext_total, (int, float)) and ext_total > 0,
+          f"incoming_qty_external={ext_total}")
+    check("сумма двух потоков равна общему «едет»",
+          (stats.get("incoming_qty_tracked") or 0) + (ext_total or 0)
+          == stats.get("incoming_qty"),
+          f"tracked={stats.get('incoming_qty_tracked')} external={ext_total} "
+          f"total={stats.get('incoming_qty')}")
+    check("наших открытых документов ровно один",
+          stats.get("incoming_open_docs_tracked") == 1,
+          f"got={stats.get('incoming_open_docs_tracked')}")
+    # Главная проверка правила: чужой документ со СКОПИРОВАННЫМ маркером
+    # (po-seed-6: маркер [oborot#1] есть, заказ №1 существует, но ссылка чужая)
+    # не должен считаться нашим. Иначе продукт приписывает себе чужие решения.
+    # po-seed-6: чужой документ на 12 шт с маркером НЕСУЩЕСТВУЮЩЕГО заказа
+    # [oborot#9091]. У этой же позиции есть и наш вклад, поэтому проверяем не
+    # «tracked == 0», а что внешняя часть (ms_qty − tracked) вобрала эти 12.
+    tee = tracked_map().get("Футболка «Манифест»", (0, 0))
+    check("документ с маркером несуществующего заказа посчитан внешним",
+          tee[0] - tee[1] >= 12,
+          f"ms_qty={tee[0]} tracked={tee[1]} внешних={tee[0] - tee[1]} (ждали >=12)")
+
+    # Правило принадлежности — прямыми вызовами, все четыре комбинации.
+    # Через живой сценарий их не проверить: сид с меткой СУЩЕСТВУЮЩЕГО заказа
+    # ломает дедупликацию push-а, которая ищет документ по той же метке.
+    from app.ms_sync import _is_oborot_doc
+    href_ok = "http://x/entity/purchaseorder/po-0001"
+    ours = {1: href_ok}
+    check("маркер + наш заказ + совпадающая ссылка → наш",
+          _is_oborot_doc({"description": "x [oborot#1]",
+                          "meta": {"href": href_ok}}, ours) is True)
+    check("маркер есть, ссылка ЧУЖАЯ (копия документа) → не наш",
+          _is_oborot_doc({"description": "x [oborot#1]",
+                          "meta": {"href": "http://x/entity/purchaseorder/po-9999"}},
+                         ours) is False)
+    check("маркер есть, заказа с таким id у организации нет → не наш",
+          _is_oborot_doc({"description": "x [oborot#42]",
+                          "meta": {"href": href_ok}}, ours) is False)
+    check("маркера нет, ссылка совпадает → не наш",
+          _is_oborot_doc({"description": "обычный заказ",
+                          "meta": {"href": href_ok}}, ours) is False)
+    check("пустое описание не роняет классификатор",
+          _is_oborot_doc({"meta": {"href": href_ok}}, ours) is False)
+    # Шаг 0 модели исполнения: диагностика поля shipped доезжает в статус синка.
+    check("диагностика shipped посчитана",
+          isinstance(stats.get("incoming_positions"), int)
+          and stats["incoming_positions"] > 0
+          and isinstance(stats.get("incoming_positions_shipped"), int),
+          f"positions={stats.get('incoming_positions')} "
+          f"shipped={stats.get('incoming_positions_shipped')}")
 
     om_before = ordered_map()
     r = client.post(f"/api/orders/{order_id}/status", json={"status": "sent"})

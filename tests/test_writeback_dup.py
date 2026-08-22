@@ -227,6 +227,47 @@ def run() -> int:
           order_marker(order2) in str(doc2.get("description") or ""),
           f"description={doc2.get('description')}")
 
+    # ── Скопированный документ: две бумаги с одной меткой ──────────────────
+    # «Копировать документ» в МойСкладе переносит и описание вместе с меткой.
+    # Тогда поиск по метке находит ДВА документа, и взять любой означало бы
+    # привязать наш заказ к чужой бумаге, а потом считать по ней «едет к нам».
+    # Правильное поведение — отказаться и назвать номера: разобраться может
+    # только человек, который эти документы видит.
+    print("\n== Копия документа с той же меткой ==")
+    order3 = make_order(c, "Заказ с двойником")
+    marker3 = order_marker(order3)
+    before = len(mock_ms.CREATED_PURCHASE_ORDERS)
+    twins = [
+        {"id": f"po-twin-{i}", "name": f"T-000{i}", "applicable": True,
+         "moment": f"{mock_ms.TODAY.isoformat()} 10:00:00",
+         "description": f"Создано в «Обороте»: заказ «Двойник» {marker3}",
+         "meta": {"href": f"{mock_ms.BASE}/entity/purchaseorder/po-twin-{i}",
+                  "type": "purchaseorder"},
+         "positions": {"rows": [], "meta": {"size": 0}}}
+        for i in (1, 2)
+    ]
+    mock_ms.PURCHASE_ORDERS.extend(twins)
+    try:
+        r = c.post(f"/api/orders/{order3}/push-to-ms")
+        check("отправка отклонена, а не привязана к случайному документу",
+              r.status_code == 409, f"status={r.status_code} body={r.text[:200]}")
+        detail = str((r.json() or {}).get("detail") or "")
+        check("в тексте названы номера обоих документов",
+              "T-0001" in detail and "T-0002" in detail, f"detail={detail[:200]}")
+        check("текст объясняет причину и что делать",
+              "скопировали" in detail and "не создан" in detail,
+              f"detail={detail[:200]}")
+        check("новый документ НЕ создан",
+              len(mock_ms.CREATED_PURCHASE_ORDERS) == before,
+              f"было={before} стало={len(mock_ms.CREATED_PURCHASE_ORDERS)}")
+        r = c.post(f"/api/orders/{order3}/push-to-ms")
+        check("метка «идёт отправка» снята — повтор возможен, а не залипание",
+              r.status_code == 409 and "скопировали" in str((r.json() or {}).get("detail") or ""),
+              f"status={r.status_code} body={r.text[:160]}")
+    finally:
+        for t in twins:
+            mock_ms.PURCHASE_ORDERS.remove(t)
+
     mock_api.post("/__test/faults", json={})
     c.close()
     mock_api.close()

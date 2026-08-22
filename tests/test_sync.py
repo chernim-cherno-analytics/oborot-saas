@@ -429,8 +429,9 @@ def run_scenario() -> int:
 
     print("== «Едет к нам» из заказов поставщику МС ==")
     exp_inc = mock_ms.expected_incoming()
-    check("mock: seeded-заказы дают ожидания (Худи 14, Кольцо 5+150)",
-          exp_inc == {"Худи «Скетч»": 14.0, "Кольцо «Грань»": 155.0},
+    check("mock: seeded-заказы дают ожидания (Худи 14, Кольцо 5+150, Футболка 12)",
+          exp_inc == {"Худи «Скетч»": 14.0, "Кольцо «Грань»": 155.0,
+                      "Футболка «Манифест»": 12.0},
           f"exp={exp_inc}")
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
@@ -439,13 +440,31 @@ def run_scenario() -> int:
     check("ordered_qty.ms_qty = эталон (частично принятый: qty−shipped)",
           ms_rows == exp_inc, f"got={ms_rows}")
     check("непроведённый, полностью принятый и старый доки не в «едет»",
-          all(b not in ms_rows for b in
-              ("Футболка «Манифест»", "Сумка «Тоут»", "Рубашка «Разворот»")))
+          all(b not in ms_rows for b in ("Сумка «Тоут»", "Рубашка «Разворот»")))
+    # po-seed-6 (D-28): чужой документ с меткой НЕСУЩЕСТВУЮЩЕГО заказа
+    # [oborot#9091]. В «едет» он входит — товар приедет физически, — но
+    # «Оборот» не имеет права считать его своим решением.
+    _con = sqlite3.connect(DB_PATH)
+    tracked = {b: (m, t) for b, m, t in _con.execute(
+        "SELECT base_name, ms_qty, ms_qty_tracked FROM ordered_qty")}
+    _con.close()
+    check("чужой заказ виден в «едет к нам»",
+          ms_rows.get("Футболка «Манифест»") == 12.0,
+          f"got={ms_rows.get('Футболка «Манифест»')}")
+    check("но своим «Оборот» его НЕ считает (маркер без заказа — не связь)",
+          all(t == 0 for _, t in tracked.values()),
+          f"tracked={{b: t for b, (m, t) in tracked.items() if t}}")
+    check("своих заказов у организации нет — значит tracked-поток пуст",
+          stats.get("incoming_qty_tracked") == 0
+          and stats.get("incoming_qty_external") == stats.get("incoming_qty"),
+          f"tracked={stats.get('incoming_qty_tracked')} "
+          f"external={stats.get('incoming_qty_external')}")
     con.close()
     # 19 из старых доков + 150 из po-seed-5 (150 позиций, аудит 18.08 —
     # проверяет дочитывание хвоста >100 позиций через /positions)
-    check("stats синка: incoming_qty=169 из 3 открытых доков",
-          stats.get("incoming_qty") == 169 and stats.get("incoming_open_docs") == 3,
+    # + 12 из po-seed-6 (чужой документ с чужой меткой, D-28)
+    check("stats синка: incoming_qty=181 из 4 открытых доков",
+          stats.get("incoming_qty") == 181 and stats.get("incoming_open_docs") == 4,
           f"got qty={stats.get('incoming_qty')} docs={stats.get('incoming_open_docs')}")
     check("документ >100 позиций дочитан пагинацией (positions_refetched ≥ 1)",
           (stats.get("positions_refetched") or 0) >= 1,
