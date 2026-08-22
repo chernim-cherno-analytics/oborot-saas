@@ -1353,6 +1353,66 @@ def api_checks() -> None:
               f"forced_by_user={prow and prow.get('forced_by_user')} "
               f"(наличия имени в must_have для пометки мало)")
 
+        print("\n14f. Демо-режим показывает то, за что продукт цепляет")
+        # Демо — это витрина. До 22.08 в ней не было ни одной убыточной позиции
+        # и ни одной без себестоимости: алерт «торгуете в минус», предупреждение
+        # про неполную себестоимость и ручное добавление позиции без цены
+        # существовали в коде и молчали ровно там, где на продукт смотрят
+        # перед покупкой.
+        turn_demo = c.get("/api/turnover").json()
+        bc = turn_demo.get("below_cost") or {}
+        check("в демо есть позиции, которые продаются в минус",
+              bc.get("positions", 0) >= 2, f"positions={bc.get('positions')}")
+        check("и это значимые позиции, а не шум из одной продажи",
+              all(not x.get("low_data") for x in bc.get("items") or []),
+              f"items={[(x['base_name'], x.get('low_data')) for x in bc.get('items') or []]}")
+        check("у убытка есть цена в рублях",
+              (bc.get("loss_total") or 0) > 0, f"loss_total={bc.get('loss_total')}")
+        money_demo = turn_demo.get("money") or {}
+        check("в демо есть позиции без себестоимости",
+              money_demo.get("no_cost_positions", 0) >= 2,
+              f"no_cost={money_demo.get('no_cost_positions')}")
+        check("но НЕ у всех — иначе предупреждение висело бы всегда и не значило бы ничего",
+              money_demo.get("no_cost_positions", 0) < (money_demo.get("positions") or 0),
+              f"no_cost={money_demo.get('no_cost_positions')} всего={money_demo.get('positions')}")
+        opt_demo = c.get("/api/order-plan/options").json()
+        check("полная себестоимость задана у большинства, но не у всех",
+              0 < opt_demo["cost_source_full"] < opt_demo["positions"],
+              f"full={opt_demo['cost_source_full']} всего={opt_demo['positions']}")
+        check("мастер показывает позиции без себестоимости отдельным списком",
+              (plan_auto.get("review") or {}).get("no_cost_count", 0) >= 1,
+              f"no_cost_count={(plan_auto.get('review') or {}).get('no_cost_count')}")
+
+        print("\n14g. Встроенный режим МойСклада на рабочих страницах")
+        # Девять продуктовых страниц не наследуют base.html, и встроенного
+        # режима у них не было вовсе: внутри iframe раздела «Приложения»
+        # пользователь получал ДВЕ шапки. Каталог МС — якорный канал продаж,
+        # и не работал он именно на рабочих страницах.
+        for path, title in (("/turnover", "Оборачиваемость"), ("/stocks", "Активный сток"),
+                            ("/assistant", "Мастер заказа"), ("/replenish", "Заказ"),
+                            ("/sizes", "Заказ позиции"), ("/budget", "Бюджет"),
+                            ("/forecast", "Прогноз"), ("/revenue", "Оборот"),
+                            ("/lessons", "Обучение")):
+            emb = c.get(path + "?embed=1")
+            # ?embed=1 залипает кукой (чтобы переходы по табам сохраняли
+            # режим), поэтому обычный вид проверяем явным ?embed=0.
+            plain = c.get(path + "?embed=0")
+            ok = (emb.status_code == 200 and 'class="embed-tabs"' in emb.text
+                  and ".header { display: none !important; }" in emb.text)
+            check(f"{path}: встроенный режим прячет свою шапку и даёт ленту табов",
+                  ok, f"status={emb.status_code}")
+            check(f"{path}: обычный режим не изменился",
+                  plain.status_code == 200 and 'class="embed-tabs"' not in plain.text,
+                  f"status={plain.status_code}")
+        emb_t = c.get("/turnover?embed=1").text
+        c.get("/turnover?embed=0")  # снимаем куку, дальше обычный режим
+        check("активный раздел подсвечен в ленте табов",
+              '<a href="/turnover" class="active">Оборачиваемость</a>' in emb_t)
+        check("в ленте есть все десять разделов",
+              all(('href="%s"' % u) in emb_t for u in
+                  ("/turnover", "/stocks", "/assistant", "/replenish", "/sizes",
+                   "/budget", "/forecast", "/revenue", "/lessons", "/settings")))
+
         print("\n14c. Мастер заказа на догружаемой истории (деплой П1)")
         eta_full = (date.today() + timedelta(days=45)).isoformat()
         body = {"eta_date": eta_full, "budget": 300000, "budget_scope": "full",
