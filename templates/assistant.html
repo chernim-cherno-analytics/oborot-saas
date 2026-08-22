@@ -548,6 +548,10 @@
       budget: parseNum("budget"),
       budget_scope: STATE.scope,
       cadence_days: STATE.cadence,
+      // Горизонт: режим и фиксированное число едут вместе с анкетой, чтобы
+      // сохранённый план знал, каким горизонтом он посчитан (см. STATE выше).
+      cover_mode: STATE.cover_mode || null,
+      horizon_days_fixed: STATE.horizon_days_fixed || null,
       strategy: STATE.strategy,
       max_share_pct: parseNum("capPct") || null,
       moq_units: parseNum("moq"),
@@ -600,6 +604,16 @@
     if(!last) return;
     STATE.production_id = last.production_id || STATE.production_id || (STATE.prods[0]||{}).id;
     STATE.cadence = last.cadence_days || STATE.cadence;
+    // Горизонт восстанавливается из сохранённого брифа: «Повторить» считает
+    // тем же горизонтом, каким план был посчитан. Если ключей нет (план
+    // сохранён до появления режимов) — берём текущую настройку организации,
+    // как и раньше.
+    if(last.cover_mode === "cadence" || last.cover_mode === "fixed"){
+      STATE.cover_mode = last.cover_mode;
+      STATE.horizon_days_fixed = last.horizon_days_fixed || null;
+      STATE.horizon_source = last.cover_mode;
+      STATE.horizon_fixed = last.horizon_days_fixed || STATE.horizon_fixed;
+    }
     STATE.scope = last.budget_scope || "now";
     STATE.strategy = last.strategy || "balance";
     STATE.offcats = last.exclude_categories || [];
@@ -632,23 +646,26 @@
     ]).then(function(r){ STATE.open = r[0]; STATE.cash = r[1]; });
   }
 
-  window.preview = function(step, keepEdits, sendEdits){
+  window.preview = function(step, keepEdits){
     go(step||3);
     // Правки количеств переживают пересчёт: раньше любой возврат к анкете
     // (и даже клик по шагу «3») стирал их молча.
     if(!keepEdits && Object.keys(STATE.edits).length) STATE.savedEdits = STATE.edits;
-    // sendEdits: правки уходят НА СЕРВЕР вместе с анкетой. Нужно там, где
-    // правка не просто меняет число в существующей строке, а ДОБАВЛЯЕТ
-    // позицию (позиция без себестоимости, D-23): построить такую строку может
-    // только сервер — он один знает, есть ли эта позиция у организации.
-    // Без этого поле «шт» у такой позиции молча ничего не делало.
-    var pendingEdits = sendEdits
-      ? Object.assign({}, STATE.savedEdits || {}, STATE.edits) : null;
+    // Правки уходят НА СЕРВЕР при КАЖДОМ пересчёте, а не только из одного
+    // места. Причина: правка бывает не только «поменять число в готовой
+    // строке», но и «добавить позицию, которой в плане нет» (позиция без
+    // себестоимости, D-23) — построить такую строку может только сервер, он
+    // один знает каталог организации. Пока признак передавался лишь из
+    // обработчика поля, любой соседний пересчёт (галочка «Взять», клик по
+    // шагу «3», F5) молча терял добавленную позицию — а потом она так же
+    // молча возвращалась при следующей правке из savedEdits. Из двух зол
+    // «то пропадает, то воскресает» хуже всего.
+    var pendingEdits = Object.assign({}, STATE.savedEdits || {}, STATE.edits);
     STATE.edits = {};
     document.getElementById("planBox").innerHTML = '<div class="loading">Считаю план…</div>';
     STATE.createdOrder = null;
     var previewBody = brief();
-    if(pendingEdits && Object.keys(pendingEdits).length) previewBody.overrides = pendingEdits;
+    if(Object.keys(pendingEdits).length) previewBody.overrides = pendingEdits;
     Promise.all([
       api("/api/order-plan/preview", previewBody),
       loadSideData()
@@ -657,9 +674,20 @@
       STATE.plan = p;
       // Возвращаем сохранённые правки тем строкам, которые остались в плане.
       var saved = STATE.savedEdits || {};
+      var alive = {};
       (p.items||[]).forEach(function(i){
-        if(saved[i.base_name] !== undefined) STATE.edits[i.base_name] = saved[i.base_name];
+        if(saved[i.base_name] !== undefined){
+          STATE.edits[i.base_name] = saved[i.base_name];
+          alive[i.base_name] = saved[i.base_name];
+        }
       });
+      // Правку, которую сервер не принял (позиции нет в каталоге, её нельзя
+      // добавлять), из памяти убираем. Иначе она бы всплывала при каждом
+      // следующем пересчёте и человек видел бы то, чего не просил.
+      Object.keys(saved).forEach(function(b){
+        if(saved[b] === 0) alive[b] = 0;          // осознанный ноль сохраняем
+      });
+      STATE.savedEdits = alive;
       renderPlan();
     }).catch(function(e){
       document.getElementById("planBox").innerHTML =
@@ -1017,7 +1045,7 @@
         STATE.savedEdits = Object.assign({}, STATE.savedEdits || {}, STATE.edits);
         if(v <= 0) delete STATE.savedEdits[b];
         saveDraft();
-        window.preview(3, true, true);
+        window.preview(3, true);
       });
     });
     // «Взять» у позиций из отсева — решение владельца сильнее алгоритма.
@@ -1269,6 +1297,15 @@
     var opt = r[3] || {};
     STATE.horizon_source = opt.horizon_source || "cadence";
     STATE.horizon_fixed = opt.horizon_days_effective || null;
+    // Режим горизонта уходит в бриф и сохраняется вместе с планом: «Повторить»
+    // обязан пересчитать старый план ТЕМ ЖЕ горизонтом, а не сегодняшней
+    // настройкой организации. Иначе план на 44 дня после переключения режима
+    // повторяется на 365 — рост в восемь раз без единой правки в анкете.
+    if(STATE.cover_mode === undefined){
+      STATE.cover_mode = STATE.horizon_source;
+      STATE.horizon_days_fixed = (STATE.horizon_source === "fixed")
+        ? STATE.horizon_fixed : null;
+    }
     updHints();
     var cats = opt.categories || [];
     // Предупреждение про деньги должно стоять на ПЕРВОМ экране: со второго
