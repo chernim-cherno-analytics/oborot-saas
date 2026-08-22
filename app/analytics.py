@@ -280,6 +280,36 @@ DEFAULT_DISCOUNT_RULE = {
 }
 
 
+STOCK_NORM_DEFAULT = 90   # дней; та же величина, что overstock_days в правиле скидок
+
+
+def stock_norm_days(settings: dict | None) -> int:
+    """Норма запаса организации в днях — база колонок «Сток на N дней» и
+    «Не хватает до нормы».
+
+    Решение владельца 22.08.2026 (DECISIONS D-15): фиксированные 90 дней —
+    не универсальное правило продукта. Для Chernim Cherno значение 90
+    остаётся, но как настройка конкретной организации.
+
+    Второй настройки под это НЕ заводим: подходящая уже есть — порог затоварки
+    из правила скидок (`discount_rule.overstock_days`, дефолт 90, редактируется
+    на «Оборачиваемости»: «Затоварка — это запас от ___ дней»). Смысл совпадает
+    буквально: это и есть та норма, от которой `zat` считается в процентах.
+    До этой правки владелец мог выставить там 120 — и плашка «Сток на 90 дней»
+    НА ТОЙ ЖЕ СТРАНИЦЕ продолжала считать по 90.
+
+    Это НЕ горизонт покрытия заказа (`cover_days`): тот отвечает на вопрос
+    «на сколько дней продаж должен хватить заказ до следующего», а норма —
+    «каким должен быть склад сегодня». Разведение принято намеренно (D-4).
+    """
+    rule = (settings or {}).get("discount_rule") or {}
+    try:
+        v = int(rule.get("overstock_days") or STOCK_NORM_DEFAULT)
+    except (TypeError, ValueError):
+        return STOCK_NORM_DEFAULT
+    return v if 1 <= v <= 365 else STOCK_NORM_DEFAULT
+
+
 def _clean_discount_rule(raw) -> dict:
     """Правило скидок из настроек org с дозаполнением дефолтов и клампами."""
     rule = dict(DEFAULT_DISCOUNT_RULE)
@@ -1753,7 +1783,8 @@ def build_turnover(snap: dict) -> dict:
     арифметический шум, а таблица говорит бизнесу об эффективности и перезаказах.
 
     Вся страница считается по ГОДОВОМУ темпу: и «Оборач. за год», и «Запас,
-    дней», и «Сток на 90 дней», и «Не хватает до нормы». Поэтому покрытие
+    дней», и «Сток на N дней», и «Не хватает до нормы» (N — норма запаса
+    организации, см. stock_norm_days). Поэтому покрытие
     (wos) и дата стокаута здесь тоже годовые, а не по активному окну темпа:
     в ячейке «Запас» стоят рядом «сколько дней хватит» и «до какого числа»,
     и посчитанные по разным темпам они противоречили друг другу.
@@ -1823,6 +1854,11 @@ def build_turnover(snap: dict) -> dict:
         "items": items,
         "rate_window": rate_window,
         "rate_window_label": RATE_WINDOW_RU.get(rate_window, RATE_WINDOW_RU["year"]),
+        # Норма запаса организации. «Оборачиваемость» считает «Сток на N дней»
+        # и «Не хватает до нормы» в браузере (BUSINESS_LOGIC §9.12), поэтому
+        # число обязано приехать с сервера — иначе настройка меняется, а
+        # страница продолжает делить на 90.
+        "stock_norm_days": stock_norm_days(snap.get("settings")),
         # coverage_start/season_covered — чтобы таблица гасила сезонные колонки,
         # не покрытые загруженной историей (sea[s] = null), а не рисовала
         # «0 ₽/день».
@@ -1847,13 +1883,14 @@ def build_active_stock(snap: dict) -> dict:
 
     Все неархивные позиции с активностью: класс/оборачиваемость, остатки по
     складам, разбивка по размерам с сигналами («!» — размер есть на одном
-    складе и 0 на другом; «по нулям N дн»), сток на 90 дней (%), недостаток
-    на 90 дней (без вычета «Заказано» — как в legacy), «едет к нам» раздельно
+    складе и 0 на другом; «по нулям N дн»), сток на норму запаса (%), недостаток
+    до нормы (без вычета «Заказано» — как в legacy), «едет к нам» раздельно
     (ручное поле + документы МойСклад).
     """
     active = [w for w in snap["warehouses"] if w["active"]]
     wh_ids = [w["id"] for w in active]
     today = date.fromisoformat(snap["today"])
+    norm = stock_norm_days(snap.get("settings"))
     items = []
     for it in snap["items"].values():
         if it["archived"] or it.get("hidden"):
@@ -1861,9 +1898,9 @@ def build_active_stock(snap: dict) -> dict:
         if it["cs"] <= 0 and it["nq"] <= 0 and float(it.get("ordered") or 0) <= 0:
             continue  # ни остатка, ни продаж за год, ни заказанного
         rate = it["rate_year"]
-        sup = round(it["cs"] / rate) if rate > 0 else None       # запас, дней
-        zat = round(sup / 90 * 100) if sup is not None else None  # сток на 90, %
-        defq = max(0, round(rate * 90) - it["cs"])                # недостаток
+        sup = round(it["cs"] / rate) if rate > 0 else None          # запас, дней
+        zat = round(sup / norm * 100) if sup is not None else None  # сток на норму, %
+        defq = max(0, round(rate * norm) - it["cs"])                # недостаток
         sizes = []
         row_alert = False
         for size in sorted(it["sizes"].keys() | it["wh_stock"].keys(), key=_size_order):
@@ -1929,6 +1966,11 @@ def build_active_stock(snap: dict) -> dict:
     return {
         "warehouses": [{"id": w["id"], "name": w["name"]} for w in active],
         "items": items,
+        # Норма запаса организации: по ней посчитаны zat и defq. Отдаём наружу,
+        # чтобы заголовок колонки не обещал 90 дней, когда считали по другому
+        # числу (иначе получается ровно то, чего мы не хотим: цифра выглядит
+        # точной и при этом не сообщает, от чего она посчитана).
+        "stock_norm_days": norm,
         # деньги: тот же свод, что на «Оборачиваемости» (сходится до рубля)
         "money": money_totals(live),
         "money_by_category": _money_by_category(live),

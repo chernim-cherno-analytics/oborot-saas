@@ -1486,10 +1486,26 @@ def _slim_excluded(rows) -> list:
             for r in rows if isinstance(r, dict)]
 
 
+# Что сохраняем про позицию, которую человек обнулил вручную. Полная строка
+# плана тащит за собой ростовку и календарь — здесь они бессмысленны, а объём
+# result_json растёт на каждой правке.
+_ZEROED_KEEP = (
+    "base_name", "category", "cls", "need", "qty_recommended",
+    "cost_price", "avg_price", "turnover", "why", "why_text",
+)
+
+
 def _plan(db: Session, ctx: AuthContext, body: OrderPlanIn) -> dict:
     from app import order_planner
     snap = analytics.get_snapshot(db, ctx.org)
     plan = order_planner.build_plan(db, ctx.org, snap, body.model_dump())
+    # Рекомендация системы фиксируется ДО правок и у КАЖДОЙ строки.
+    # Раньше `qty_recommended` появлялся только у строк, которых коснулся
+    # человек, — то есть у остальных «что советовала система» и «что решил
+    # человек» были одним и тем же полем `qty`, и три величины (решение
+    # владельца D-25) формально не различались даже там, где всё в порядке.
+    for it in plan.get("items") or []:
+        it.setdefault("qty_recommended", it.get("qty"))
     if body.overrides:
         _apply_overrides(plan, body.overrides, snap)
     plan["record"] = _decision_record(db, ctx, snap)
@@ -1584,6 +1600,18 @@ def _apply_overrides(plan: dict, overrides: dict, snap: dict) -> None:
         )
         it["why"] = list(dict.fromkeys(list(it.get("why") or []) + ["manual"]))
         it["why_text"] = "изменено вручную"
+    # Строки, обнулённые человеком, из плана уходят (в таблице заказа им не
+    # место), но НЕ исчезают: «система советовала 48 — человек сказал ноль» —
+    # самый ценный сигнал качества рекомендаций, и раньше он не сохранялся
+    # нигде. В `not_included` такая позиция тоже не попадала: тот список
+    # собирается раньше, внутри планировщика, и правок не видит.
+    zeroed = [
+        {k: i.get(k) for k in _ZEROED_KEEP if k in i}
+        for i in plan["items"]
+        if i["qty"] <= 0 and (i.get("qty_recommended") or 0) > 0
+    ]
+    if zeroed:
+        plan["zeroed"] = zeroed
     plan["items"] = [i for i in plan["items"] if i["qty"] > 0]
     plan["cost_total"] = sum(i["cost_total"] for i in plan["items"])
     # Календарь платежей пересобираем от новой себестоимости, «сейчас» —
@@ -1704,6 +1732,9 @@ def api_order_plan_save(
             {"items": plan["items"], "totals": plan["totals"],
              "spent": plan["spent"], "lost": plan.get("lost"),
              "manual_edit": bool(plan.get("manual_edit")),
+             # Позиции, которые человек обнулил вручную, вместе с тем, что
+             # по ним рекомендовала система (см. _apply_overrides).
+             "zeroed": plan.get("zeroed") or [],
              # ОТКАЗ — ТОЖЕ РЕШЕНИЕ. Раньше сохранялись только строки плана,
              # а «что не вошло и почему» считалось, показывалось на экране и
              # пропадало. Без этого в истории остаются одни лишь товары,
