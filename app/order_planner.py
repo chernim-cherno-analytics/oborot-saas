@@ -57,6 +57,11 @@ SENSITIVITY_STEPS = (1.25, 1.5)  # «а если добавить денег»
 # экран выглядел так, будто система рассмотрела 50 позиций из 900.
 # Полные счётчики отдаются рядом со списком, обрезку видно.
 LIST_CAP = 500
+# Границы для новинок, которые владелец вписывает руками. Нужны не «на всякий
+# случай»: без них целое произвольной длины из тела запроса роняет расчёт
+# OverflowError, а умеренно большое даёт бессмысленные суммы в истории заказов.
+MAX_NEW_ITEM_QTY = 1_000_000
+MAX_NEW_ITEM_COST = 1e9
 
 # Профили стратегии. Аудит 22.08.2026 показал, что три плитки давали
 # ОДИНАКОВЫЙ план (19 поз / 191 шт / 837 885 ₽ при любом лимите доли): фильтр
@@ -328,6 +333,11 @@ def normalize_brief(raw: dict | None, settings: dict, stages: list[dict], today:
             v = default
         try:
             return int(min(max(lo, float(v)), hi))
+        except OverflowError:
+            # Целое из JSON бывает любой длины: float() от числа в 400 цифр
+            # бросает OverflowError, и запрос падает в 500. Значение заведомо
+            # больше верхней границы — берём её, а не роняем анкету.
+            return int(hi)
         except (TypeError, ValueError):
             return default
 
@@ -370,9 +380,10 @@ def normalize_brief(raw: dict | None, settings: dict, stages: list[dict], today:
         if not name:
             continue
         try:
-            qty = max(0, int(float(it.get("qty") or 0)))
-            cost = max(0.0, float(it.get("cost") or 0))
-        except (TypeError, ValueError):
+            qty = min(MAX_NEW_ITEM_QTY, max(0, int(float(it.get("qty") or 0))))
+            cost = min(MAX_NEW_ITEM_COST, max(0.0, float(it.get("cost") or 0)))
+        except (TypeError, ValueError, OverflowError):
+            # Та же ловушка, что в _int: огромное целое из тела запроса.
             continue
         if qty <= 0:
             continue
@@ -629,9 +640,19 @@ def _candidates(snap: dict, brief: dict, ctx: dict) -> tuple[list[dict], dict]:
                 skipped["other_production"].append(base)
                 continue
         category = it.get("category") or "Без категории"
+        # Позиция проходит дальше ТОЛЬКО потому, что человек отметил её галочкой
+        # «Взять»? Тогда это его решение, а не рекомендация системы, и в записи
+        # решения они обязаны быть различимы (D-25). Без этого признака флаг
+        # ставился по факту наличия имени в must_have — то есть и на позиции,
+        # которые система рекомендует и сама.
+        forced = False
+        if category in exclude and base in must:
+            forced = True
         if category in exclude and base not in must:
             skipped["excluded_category"].append(base)
             continue
+        if base not in ctx["fresh"] and base in must:
+            forced = True
         if base not in ctx["fresh"] and base not in must:
             skipped["stale"].append(base)
             continue
@@ -646,6 +667,8 @@ def _candidates(snap: dict, brief: dict, ctx: dict) -> tuple[list[dict], dict]:
         gap_days = 0
         if r_lead > 0 and cs + ordered < r_lead * days_to_eta:
             gap_days = int(round(days_to_eta - (cs + ordered) / r_lead))
+        if need < NEED_MIN and base in must:
+            forced = True
         if need < NEED_MIN and base not in must:
             skipped["small_need"].append(base)
             continue
@@ -675,6 +698,12 @@ def _candidates(snap: dict, brief: dict, ctx: dict) -> tuple[list[dict], dict]:
             "margin": max(0.0, price - cost),
             "sizes": it.get("sizes") or {},
             "must_have": base in must,
+            # True — позиция дошла до расчёта ТОЛЬКО потому, что человек
+            # отметил её галочкой: сама система её отсеяла бы (нет продаж
+            # в окне свежести, потребность меньше порога, исключённая
+            # категория). Ровно этот признак отличает решение человека от
+            # рекомендации системы; наличия имени в must_have для этого мало.
+            "forced_by_user": forced,
             # Позиция без признака распределения (поставщик/папка не заполнены):
             # она попала в этот канал «по умолчанию», а не потому что так решили.
             "no_supplier": bool(ctx.get("assign_source_on")
@@ -683,6 +712,8 @@ def _candidates(snap: dict, brief: dict, ctx: dict) -> tuple[list[dict], dict]:
         if cost <= 0:
             skipped["no_cost"].append(row)   # деньги посчитать нельзя — отдельным списком
             continue
+        if row["low_data"] and base in must:
+            row["forced_by_user"] = True
         if row["low_data"] and base not in must:
             skipped["low_data"].append(row)  # темп из 1–2 продаж — решает человек
             continue
@@ -956,6 +987,7 @@ def plan_order(snap: dict, brief: dict, ctx: dict, stages: list[dict],
             # которые лягут в запас, а не отработают в горизонте заказа.
             "over_need": max(0, qty - c["need"]),
             "no_supplier": c.get("no_supplier", False),
+            "forced_by_user": bool(c.get("forced_by_user")),
             "runs_out": (today + timedelta(days=min(days_now, 3650))).isoformat()
             if days_now is not None else None,
             "covered_until": (eta + timedelta(days=min(days_after, 3650))).isoformat()

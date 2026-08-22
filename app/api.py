@@ -1531,20 +1531,19 @@ def _plan(db: Session, ctx: AuthContext, body: OrderPlanIn) -> dict:
     # человек, — то есть у остальных «что советовала система» и «что решил
     # человек» были одним и тем же полем `qty`, и три величины (решение
     # владельца D-25) формально не различались даже там, где всё в порядке.
-    must = set((plan.get("brief") or {}).get("must_have") or [])
     for it in plan.get("items") or []:
         it.setdefault("qty_recommended", it.get("qty"))
-        # Позиция, которую человек втащил галочкой «Взять» из блока «система
-        # считать не берётся», прошла расчёт — но попала в план по решению
-        # ЧЕЛОВЕКА. Без этой пометки она в истории неотличима от честной
-        # рекомендации, и метрика качества рекомендаций (D-25) загрязняется
-        # с первого же дня.
-        if it.get("base_name") in must:
-            it["forced_by_user"] = True
+        # `forced_by_user` ставит сам планировщик — и только там, где позиция
+        # без галочки человека в план бы НЕ попала (order_planner._candidates).
+        # Метить всё, что перечислено в must_have, было неверно: туда попадают
+        # и позиции, которые система рекомендует сама, и метрика качества
+        # рекомендаций (D-25) загрязнялась бы с первого дня.
+        it.setdefault("forced_by_user", False)
     # Ключ есть всегда, а не только после ручных правок: потребитель не должен
     # гадать, «нет позиций без себестоимости» это или «поле не посчитали».
     plan["budget_incomplete"] = None
     plan["zeroed"] = []
+    plan["overrides_rejected"] = []
     if body.overrides:
         _apply_overrides(plan, body.overrides, snap)
     plan["record"] = _decision_record(db, ctx, snap)
@@ -1622,15 +1621,30 @@ MAX_MANUAL_QTY = 1_000_000
 def _manual_addable(plan: dict) -> set:
     """Позиции, которые человек вправе вписать в этот план руками.
 
-    Ровно те, по которым система отказалась считать из-за отсутствия
-    себестоимости (`review.no_cost`). Прочие отсеянные — чужой канал
-    производства, исключённая категория, нет продаж — отсеяны бизнес-правилами,
-    а не нехваткой данных, и «последнее слово за пользователем» на них не
-    распространяется: заказ ушёл бы на другое производство с чужими сроками
-    и предоплатой.
+    Разрешено то, что система РАССМОТРЕЛА и не поставила в заказ сама:
+
+      • `review.no_cost` — не смогла посчитать деньги (решение владельца D-23);
+      • `review.low_data` — не доверяет темпу из одной-двух продаж;
+      • `not_included` — посчитала, но не хватило бюджета или лимита доли.
+
+    Не разрешено то, что отсеяно БИЗНЕС-ПРАВИЛОМ, а не нехваткой данных:
+    чужой производственный канал и исключённая категория. Там «последнее слово
+    за пользователем» не применимо — заказ ушёл бы на другое производство,
+    с чужими сроками, предоплатой и минимальной партией.
+
+    Границей служит `base_name`, поэтому позиция, не попавшая в срез LIST_CAP,
+    сюда не попадёт. Молчать об этом нельзя — см. `overrides_rejected`.
     """
-    rev = (plan.get("review") or {}).get("no_cost") or []
-    return {r.get("base_name") for r in rev if isinstance(r, dict)}
+    rev = plan.get("review") or {}
+    out: set = set()
+    for key in ("no_cost", "low_data"):
+        for r in rev.get(key) or []:
+            if isinstance(r, dict) and r.get("base_name"):
+                out.add(r["base_name"])
+    for r in plan.get("not_included") or []:
+        if isinstance(r, dict) and r.get("base_name"):
+            out.add(r["base_name"])
+    return out
 
 
 def _manual_item(base: str, qty: int, snap: dict, plan: dict) -> dict | None:
@@ -1650,12 +1664,12 @@ def _manual_item(base: str, qty: int, snap: dict, plan: dict) -> dict | None:
     src = (snap.get("items") or {}).get(base)
     if not src or src.get("archived") or src.get("hidden"):
         return None
+    # Накладные (доставка, таможня, брак) плановым строкам добавляет
+    # order_planner. Здесь их нет намеренно: сюда попадают ТОЛЬКО позиции
+    # без себестоимости, у них cost = 0, и процент от нуля — тоже ноль.
+    # Ветка «умножить на накладные» была бы недостижимым кодом, а комментарий
+    # рядом с ней — обещанием, которого код не выполняет.
     cost = float(src.get("cost_price") or 0)
-    # Накладные (доставка, таможня, брак) плановые строки уже включают
-    # (order_planner). Без этого ручная строка систематически дешевле соседних.
-    overhead = float((plan.get("brief") or {}).get("overhead_pct") or 0)
-    if cost > 0 and overhead:
-        cost = cost * (1 + overhead / 100.0)
     price = float(src.get("avg_price") or src.get("sale_price") or 0)
     margin = max(0.0, price - cost) if cost > 0 else 0.0
     stages = plan.get("stages") or []
@@ -1709,6 +1723,11 @@ def _apply_overrides(plan: dict, overrides: dict, snap: dict) -> None:
     from app import order_planner as op
     from app.analytics import size_split
     items = {i["base_name"]: i for i in plan["items"]}
+    # Отказ применить правку обязан быть ВИДЕН. Раньше здесь стоял молчаливый
+    # `continue`: человек вписывал количество, оно не применялось, и на экране
+    # не было ни строки, ни объяснения. Тихий отказ хуже честной ошибки.
+    rejected: list[dict] = []
+    unknown = 0
     for base, qty in overrides.items():
         try:
             # Верхняя граница обязательна: без неё целое из JSON произвольной
@@ -1732,17 +1751,21 @@ def _apply_overrides(plan: dict, overrides: dict, snap: dict) -> None:
             # включая чужое название.
             if qty <= 0:
                 continue
-            if base not in _manual_addable(plan):
-                # Добавить можно ТОЛЬКО то, что система показала в блоке
-                # «нет себестоимости»: по этим позициям она сознательно не даёт
-                # рекомендацию, и решение остаётся за человеком (D-23).
-                # Всё остальное отсеяно по другим правилам — по чужому каналу
-                # производства, по исключённой категории, по отсутствию продаж —
-                # и обходить их через тело запроса нельзя: заказ уехал бы не на
-                # то производство и не с теми сроками и предоплатой.
-                continue
+            # Сначала «есть ли вообще такая позиция», потом «можно ли её
+            # добавлять»: иначе выдуманное имя объяснялось бы как «система её
+            # не предлагала», и человек искал бы позицию, которой нет.
             it = _manual_item(base, qty, snap, plan)
             if it is None:
+                # Имя не прошло проверку по каталогу — значит мы про него
+                # ничего не знаем и НЕ возвращаем его обратно: эхо непроверенной
+                # строки из тела запроса в ответе — плохая привычка, с которой
+                # начинаются утечки и XSS. Отдаём только счётчик; сам текст
+                # человек и так видит в своём поле ввода.
+                unknown += 1
+                continue
+            if base not in _manual_addable(plan):
+                rejected.append({"base_name": base, "qty": qty,
+                                 "reason": "not_offered"})
                 continue
             plan["items"].append(it)
             items[base] = it
@@ -1791,6 +1814,9 @@ def _apply_overrides(plan: dict, overrides: dict, snap: dict) -> None:
     # обязана говорить сама выдача, а не только подсказка на экране.
     no_cost_rows = [i for i in plan["items"]
                     if i.get("no_cost") or float(i.get("cost_price") or 0) <= 0]
+    if unknown:
+        rejected.append({"reason": "not_in_catalog", "count": unknown})
+    plan["overrides_rejected"] = rejected
     plan["budget_incomplete"] = ({
         "positions": len(no_cost_rows),
         "units": sum(int(i["qty"]) for i in no_cost_rows),
@@ -1932,6 +1958,10 @@ def api_order_plan_save(
              # Заказ содержит позиции без себестоимости — значит сумма заказа
              # неполна, и в истории это должно быть видно так же, как на экране.
              "budget_incomplete": plan.get("budget_incomplete"),
+             # Правки, которые применить не удалось: в истории должно быть
+             # видно не только то, что человек решил, но и то, чего система
+             # не дала ему сделать.
+             "overrides_rejected": plan.get("overrides_rejected") or [],
              # ОТКАЗ — ТОЖЕ РЕШЕНИЕ. Раньше сохранялись только строки плана,
              # а «что не вошло и почему» считалось, показывалось на экране и
              # пропадало. Без этого в истории остаются одни лишь товары,
