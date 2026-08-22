@@ -152,6 +152,14 @@ def ensure_schema(bind=None) -> None:
                 "ALTER TABLE products ADD COLUMN supplier VARCHAR(255) NOT NULL DEFAULT ''",
                 bind=eng,
             )
+    if insp.has_table("production_orders"):
+        cols = {c["name"] for c in insp.get_columns("production_orders")}
+        # 22.08: заказ помнит канал производства (см. models.ProductionOrder).
+        if "production_id" not in cols:
+            run_migration_step(
+                "ALTER TABLE production_orders ADD COLUMN production_id INTEGER",
+                bind=eng,
+            )
     if insp.has_table("productions"):
         cols = {c["name"] for c in insp.get_columns("productions")}
         if "cadence_days" not in cols:

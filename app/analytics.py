@@ -340,6 +340,13 @@ def extra_settings(org: Org) -> dict:
         "price_type_cost": str(data.get("price_type_cost") or ""),
         # Пиковые периоды продаж бренда (см. order_planner.peak_hints).
         "peak_periods": data.get("peak_periods") if isinstance(data.get("peak_periods"), list) else [],
+        # Правило распределения позиций по производствам (app/assign_rules.py).
+        # ВАЖНО: ключ обязан быть здесь. Org.settings возвращает только
+        # thresholds/horizon_days/min_stock_days, а сохранение настроек пишет
+        # `settings.update(extra_settings(org))` — всё, чего нет в этом словаре,
+        # при первом же сохранении настроек стиралось бы из settings_json.
+        "assign_source": data.get("assign_source") or "manual",
+        "assign_map": data.get("assign_map") if isinstance(data.get("assign_map"), dict) else {},
     }
 
 
