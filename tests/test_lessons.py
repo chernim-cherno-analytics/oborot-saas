@@ -31,7 +31,9 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tests"))
 
 DB_PATH = ROOT / "test_lessons.db"
-APP_PORT = 8805
+# Порты берутся из окружения: так tests/run_all.py разводит наборы и
+# может гонять их параллельно. Значения по умолчанию — прежние.
+APP_PORT = int(os.environ.get("OBOROT_TEST_PORT", "8805"))
 
 # Окружение — ДО импорта приложения (db.py читает DATABASE_URL).
 os.environ["DATABASE_URL"] = f"sqlite:///{DB_PATH}"

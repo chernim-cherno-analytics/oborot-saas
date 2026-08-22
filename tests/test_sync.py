@@ -33,11 +33,13 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tests"))
 
 DB_PATH = ROOT / "test_oborot.db"
-APP_PORT = 8801
+# Порты берутся из окружения: так tests/run_all.py разводит наборы и
+# может гонять их параллельно. Значения по умолчанию — прежние.
+APP_PORT = int(os.environ.get("OBOROT_TEST_PORT", "8801"))
 
 # Окружение — ДО импорта приложения (db.py и ms_client читают env).
 os.environ["DATABASE_URL"] = f"sqlite:///{DB_PATH}"
-os.environ["MS_BASE_URL"] = "http://127.0.0.1:9800"
+os.environ["MS_BASE_URL"] = f"http://127.0.0.1:{os.environ.get('OBOROT_MOCK_PORT', '9800')}"
 os.environ["HISTORY_DAYS"] = "60"
 os.environ["SYNC_DAYS_BACK"] = "3"
 # Инцидент 21.08: маленькие чанки истории, чтобы проверить прерывание/продолжение.

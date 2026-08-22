@@ -32,14 +32,16 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tests"))
 
 DB_PATH = ROOT / "test_vendor.db"
-APP_PORT = 8803
+# Порты берутся из окружения: так tests/run_all.py разводит наборы и
+# может гонять их параллельно. Значения по умолчанию — прежние.
+APP_PORT = int(os.environ.get("OBOROT_TEST_PORT", "8803"))
 
 import mock_ms  # noqa: E402 — констант ниже требует env
 
 # Окружение — ДО импорта приложения (db.py, ms_client и ms_vendor читают env).
 os.environ["DATABASE_URL"] = f"sqlite:///{DB_PATH}"
-os.environ["MS_BASE_URL"] = "http://127.0.0.1:9800"
-os.environ["MS_VENDOR_API_BASE"] = "http://127.0.0.1:9800"
+os.environ["MS_BASE_URL"] = f"http://127.0.0.1:{os.environ.get('OBOROT_MOCK_PORT', '9800')}"
+os.environ["MS_VENDOR_API_BASE"] = f"http://127.0.0.1:{os.environ.get('OBOROT_MOCK_PORT', '9800')}"
 os.environ["MS_APP_ID"] = mock_ms.VENDOR_APP_ID
 os.environ["MS_APP_UID"] = mock_ms.VENDOR_APP_UID
 os.environ["MS_APP_SECRET"] = mock_ms.VENDOR_SECRET

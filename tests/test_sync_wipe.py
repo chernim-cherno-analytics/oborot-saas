@@ -36,8 +36,10 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tests"))
 
 DB_PATH = ROOT / "test_sync_wipe.db"
-APP_PORT = 8807
-MOCK_PORT = 9810
+# Порты берутся из окружения: так tests/run_all.py разводит наборы и
+# может гонять их параллельно. Значения по умолчанию — прежние.
+APP_PORT = int(os.environ.get("OBOROT_TEST_PORT", "8807"))
+MOCK_PORT = int(os.environ.get("OBOROT_MOCK_PORT", "9810"))
 
 os.environ["DATABASE_URL"] = f"sqlite:///{DB_PATH}"
 os.environ["MS_BASE_URL"] = f"http://127.0.0.1:{MOCK_PORT}"

@@ -22,12 +22,15 @@
 Данные детерминированные: random.Random(SEED), 60 дней истории.
 Модуль экспортирует expected_*() — эталонные суммы для проверок теста.
 """
+import os
 import random
 from datetime import date, timedelta
 
 from fastapi import FastAPI, HTTPException, Query, Request
 
-PORT = 9800
+# Порты берутся из окружения: так tests/run_all.py разводит наборы и
+# может гонять их параллельно. Значения по умолчанию — прежние.
+PORT = int(os.environ.get("OBOROT_MOCK_PORT", "9800"))
 BASE = f"http://127.0.0.1:{PORT}"
 TOKEN = "mock-token-correct-1234"
 SEED = 20260730

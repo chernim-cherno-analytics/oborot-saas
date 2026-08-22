@@ -26,13 +26,15 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tests"))
 
 DB_PATH = ROOT / "test_notify.db"
-APP_PORT = 8802
-TG_PORT = 9801
+# Порты берутся из окружения: так tests/run_all.py разводит наборы и
+# может гонять их параллельно. Значения по умолчанию — прежние.
+APP_PORT = int(os.environ.get("OBOROT_TEST_PORT", "8802"))
+TG_PORT = int(os.environ.get("OBOROT_TG_PORT", "9801"))
 TG_TOKEN = "test-tg-token-123"
 
 # Окружение — ДО импорта приложения (db.py, ms_client, notify читают env).
 os.environ["DATABASE_URL"] = f"sqlite:///{DB_PATH}"
-os.environ["MS_BASE_URL"] = "http://127.0.0.1:9800"
+os.environ["MS_BASE_URL"] = f"http://127.0.0.1:{os.environ.get('OBOROT_MOCK_PORT', '9800')}"
 os.environ["HISTORY_DAYS"] = "5"
 os.environ["SYNC_DAYS_BACK"] = "3"
 os.environ["TG_API_BASE"] = f"http://127.0.0.1:{TG_PORT}"
