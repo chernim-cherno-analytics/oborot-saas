@@ -171,6 +171,11 @@ def _move_incoming_to_ms(db: Session, org_id: int, order: ProductionOrder,
     локальный вклад из qty (зеркало _apply_order_to_incoming(+1) в api.py,
     полное количество позиции — как и добавлялось); (б) отправленные позиции
     сразу прибавляем к ms_qty, чтобы «едет» не мигал до ближайшего синка.
+
+    Документ создали мы сами, поэтому та же величина идёт и в ms_qty_tracked
+    (D-28): между отправкой и ближайшим синком «едет по заказам „Оборота“» не
+    должно проваливаться в ноль. Синк потом пересчитает обе величины заново —
+    уже по доказуемой связи, а не по нашему знанию в моменте.
     """
     was_sent = order.status == "sent"
     touched: dict[str, OrderedQty] = {}
@@ -179,7 +184,8 @@ def _move_incoming_to_ms(db: Session, org_id: int, order: ProductionOrder,
         if base not in touched:
             row = db.get(OrderedQty, (org_id, base))
             if row is None:
-                row = OrderedQty(org_id=org_id, base_name=base, qty=0.0, ms_qty=0.0)
+                row = OrderedQty(org_id=org_id, base_name=base, qty=0.0,
+                                 ms_qty=0.0, ms_qty_tracked=0.0)
                 db.add(row)
             touched[base] = row
         return touched[base]
@@ -193,6 +199,7 @@ def _move_incoming_to_ms(db: Session, org_id: int, order: ProductionOrder,
     for base, qty in pushed_by_base.items():
         row = _row(base)
         row.ms_qty = row.ms_qty + qty
+        row.ms_qty_tracked = (row.ms_qty_tracked or 0.0) + qty
 
 
 # ── Основной сценарий ────────────────────────────────────────────────────────
@@ -232,6 +239,15 @@ def order_marker(order_id: int) -> str:
     return f"[oborot#{int(order_id)}]"
 
 
+class AmbiguousExistingOrder(Exception):
+    """Маркер нашёлся больше чем у одного документа — связывать вслепую нельзя."""
+
+    def __init__(self, docs: list[dict]):
+        self.docs = docs
+        names = ", ".join(str(d.get("name") or "?") for d in docs[:5])
+        super().__init__(names)
+
+
 async def find_existing_order(client, marker: str) -> dict | None:
     """Ищет в МойСкладе документ, созданный нами по этому заказу.
 
@@ -240,12 +256,21 @@ async def find_existing_order(client, marker: str) -> dict | None:
     позиций (дёшево) и сверяем описания у себя. Ошибку поиска НЕ проглатываем
     молча наверх: если мы не смогли проверить, лучше не создавать документ
     вслепую — пусть вызывающий решает.
+
+    Найдено НЕСКОЛЬКО — поднимаем AmbiguousExistingOrder вместо того, чтобы
+    взять первый попавшийся. Так бывает не в теории: «Копировать документ»
+    в МойСкладе переносит и описание вместе с маркером, и тогда у двух разных
+    документов одна и та же метка. Взять любой означало бы привязать наш заказ
+    к чужой бумаге и дальше считать по ней «едет к нам». Отказ с перечислением
+    номеров — единственное честное поведение: разобраться может только человек,
+    который эти документы видит.
     """
     since = (date.today() - timedelta(days=LOOKBACK_DAYS)).isoformat()
-    for row in await client.search_purchase_orders(since):
-        if marker in str(row.get("description") or ""):
-            return row
-    return None
+    found = [row for row in await client.search_purchase_orders(since)
+             if marker in str(row.get("description") or "")]
+    if len(found) > 1:
+        raise AmbiguousExistingOrder(found)
+    return found[0] if found else None
 
 
 async def push_order(db: Session, org_id: int, order: ProductionOrder) -> dict:

@@ -436,6 +436,23 @@ async def api_order_push_to_ms(
         )
     try:
         result = await ms_writeback.push_order(db, ctx.org.id, order)
+    except ms_writeback.AmbiguousExistingOrder as exc:
+        # У нескольких документов МойСклада одинаковая наша метка — почти
+        # наверняка чей-то «Копировать документ» вместе с описанием. Привязать
+        # заказ к первому попавшемуся значит начать считать «едет к нам» по
+        # чужой бумаге. Разобраться может только человек, который эти документы
+        # видит, поэтому отдаём номера и ничего не создаём.
+        _release_push_lock(db, order.id)
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"В МойСкладе несколько заказов поставщику с меткой этого "
+                f"заказа ({exc}). Так бывает, если документ скопировали вместе "
+                f"с описанием. Оставьте метку «[oborot#...]» только у нужного "
+                f"документа (или удалите её у лишних) и повторите отправку. "
+                f"Новый документ не создан."
+            ),
+        )
     except ms_writeback.WritebackError as exc:
         _release_push_lock(db, order.id)
         raise HTTPException(status_code=exc.status, detail=exc.detail)

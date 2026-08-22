@@ -60,7 +60,7 @@ import threading
 import time
 from datetime import date, datetime, timedelta
 
-from sqlalchemy import delete, func, insert, inspect, select, update
+from sqlalchemy import delete, func, insert, inspect, or_, select, update
 
 from app import analytics, exclusions, logging_conf
 from app.crypto import decrypt_token
@@ -131,6 +131,15 @@ def ensure_schema(bind=None) -> None:
         if "ms_qty" not in cols:
             run_migration_step(
                 "ALTER TABLE ordered_qty ADD COLUMN ms_qty FLOAT NOT NULL DEFAULT 0",
+                bind=eng,
+            )
+        # D-28: часть «едет к нам», приехавшая по заказам самого «Оборота».
+        # Нулевое значение по умолчанию честное: до первого синка с новым кодом
+        # мы не знаем происхождение документов и не имеем права угадывать.
+        if "ms_qty_tracked" not in cols:
+            run_migration_step(
+                "ALTER TABLE ordered_qty ADD COLUMN ms_qty_tracked "
+                "FLOAT NOT NULL DEFAULT 0",
                 bind=eng,
             )
     if insp.has_table("sync_state"):
@@ -1742,6 +1751,39 @@ async def _full_positions(client: MoySkladClient, entity: str, doc: dict,
     return rows
 
 
+_OBOROT_MARKER_RE = re.compile(r"\[oborot#(\d+)\]")
+
+
+def _is_oborot_doc(doc: dict, our_docs: dict[int, str]) -> bool:
+    """Документ МойСклада создан заказом «Оборота»? Только при ТРЁХ совпадениях.
+
+    Решение владельца D-28: приёмка и заказ засчитываются «Оборотом» себе лишь
+    при доказуемой связи. Одного признака мало ни одного:
+
+      • маркер `[oborot#N]` живёт в описании, а описание человек может
+        скопировать в другой документ вместе с текстом;
+      • ссылка `ms_doc_href` в нашей базе может остаться от документа, который
+        в МойСкладе удалили и пересоздали.
+
+    Поэтому требуется всё сразу: маркер есть, заказ с таким id существует
+    У ЭТОЙ организации (карта строится по org_id) и его сохранённая ссылка
+    совпадает с href пришедшего документа.
+
+    Совпадение SKU, количества, поставщика или даты не рассматривается вовсе.
+    Ошибка в сторону «не наш» безопасна (недосчитаем своё), ошибка в сторону
+    «наш» — нет (припишем себе чужое решение и испортим статистику качества
+    рекомендаций именно там, где она должна быть честной).
+    """
+    m = _OBOROT_MARKER_RE.search(str(doc.get("description") or ""))
+    if not m:
+        return False
+    href = ((doc.get("meta") or {}).get("href")) or ""
+    if not href:
+        return False
+    saved = our_docs.get(int(m.group(1)))
+    return bool(saved) and _href_id(saved) == _href_id(href)
+
+
 async def _sync_incoming(org_id: int, client: MoySkladClient,
                          ext_to_pid: dict[str, int], stats: dict,
                          progress: tuple[float, float] = (95.5, 97.0)) -> None:
@@ -1755,7 +1797,31 @@ async def _sync_incoming(org_id: int, client: MoySkladClient,
     В ms_qty входят и документы, созданные нашей кнопкой «Отправить в
     МойСклад»: их локальный вклад в qty снят при отправке (app/ms_writeback),
     двойного счёта нет.
+
+    Два потока (решение владельца D-28). Здесь же документы РАЗДЕЛЯЮТСЯ на
+    «oborot_tracked» (заказ создал сам «Оборот») и «external» (всё остальное:
+    и заказы, размещённые до подключения, и те, что клиент завёл в МойСкладе
+    сам, уже пользуясь «Оборотом»). Термин «external», а не «legacy»: дело
+    в происхождении решения, а не в дате.
+
+    Принадлежность доказывается ТРЕМЯ условиями одновременно, потому что
+    любого одного мало: маркер `[oborot#N]` можно скопировать вместе с
+    документом, а наша ссылка может остаться от заказа, который в МойСкладе
+    пересоздали. Совпадение SKU, количества, поставщика или даты не
+    учитывается вовсе — угадывать здесь запрещено, и лучше недосчитать своё,
+    чем приписать себе чужое.
+
+    В сумму «едет к нам» идут ОБА потока: товар приедет независимо от того,
+    кто принял решение, и следующий заказ обязан это учитывать. Разделение
+    нужно для другого вопроса — «насколько хорошо рекомендует „Оборот“».
+
+    Здесь же считается диагностика по полю `shipped`: заполняет его сам
+    МойСклад и только из приёмок, созданных «на основании» заказа. От того,
+    заполняется ли оно у конкретного клиента, зависит, возможен ли
+    автоматический учёт исполнения вообще (шаг 0 модели исполнения).
     """
+    from app.models import ProductionOrder
+
     _set_state(org_id, stage="incoming", progress=progress[0],
                detail="Загружаем заказы поставщику («едет к нам»)…")
     cutoff = (_today() - timedelta(days=HISTORY_DAYS - 1)).isoformat()
@@ -1770,14 +1836,42 @@ async def _sync_incoming(org_id: int, client: MoySkladClient,
     finally:
         db.close()
 
+    # Ссылки на документы МойСклада, созданные нашими заказами: id → href.
+    # Нужны для встречной проверки маркера (см. _is_oborot_doc).
+    db = SessionLocal()
+    try:
+        our_docs = {
+            int(oid): href
+            for oid, href in db.execute(
+                select(ProductionOrder.id, ProductionOrder.ms_doc_href).where(
+                    ProductionOrder.org_id == org_id,
+                    ProductionOrder.ms_doc_href.is_not(None),
+                )
+            ).all()
+            if href
+        }
+    finally:
+        db.close()
+
     incoming: dict[str, float] = {}
+    incoming_tracked: dict[str, float] = {}
     open_docs = 0
+    tracked_docs = 0
+    docs_with_shipped = 0
+    positions_with_shipped = 0
+    positions_total = 0
     unmatched: set[str] = set()
     for doc in docs:
         if doc.get("applicable") is False:  # черновик/непроведённый — не едет
             continue
+        tracked = _is_oborot_doc(doc, our_docs)
         doc_qty = 0.0
+        doc_shipped = False
         for pos in await _full_positions(client, "purchaseorder", doc, stats):
+            positions_total += 1
+            if float(pos.get("shipped") or 0) > 0:
+                positions_with_shipped += 1
+                doc_shipped = True
             ext = _href_id(((pos.get("assortment") or {}).get("meta") or {}).get("href"))
             pid = ext_to_pid.get(ext)
             if pid is None:
@@ -1791,16 +1885,23 @@ async def _sync_incoming(org_id: int, client: MoySkladClient,
             if not base:
                 continue
             incoming[base] = incoming.get(base, 0.0) + left
+            if tracked:
+                incoming_tracked[base] = incoming_tracked.get(base, 0.0) + left
             doc_qty += left
+        if doc_shipped:
+            docs_with_shipped += 1
         if doc_qty > 0:
             open_docs += 1
+            if tracked:
+                tracked_docs += 1
 
     db = SessionLocal()
     try:
         # Полная пересборка вклада МС: обнуляем и пишем свежие значения.
         db.execute(update(OrderedQty).where(
-            OrderedQty.org_id == org_id, OrderedQty.ms_qty != 0
-        ).values(ms_qty=0.0))
+            OrderedQty.org_id == org_id,
+            or_(OrderedQty.ms_qty != 0, OrderedQty.ms_qty_tracked != 0),
+        ).values(ms_qty=0.0, ms_qty_tracked=0.0))
         existing = {
             row.base_name: row
             for row in db.execute(
@@ -1808,11 +1909,14 @@ async def _sync_incoming(org_id: int, client: MoySkladClient,
             ).scalars()
         }
         for base, qty in incoming.items():
+            tr = incoming_tracked.get(base, 0.0)
             row = existing.get(base)
             if row is None:
-                db.add(OrderedQty(org_id=org_id, base_name=base, qty=0.0, ms_qty=qty))
+                db.add(OrderedQty(org_id=org_id, base_name=base, qty=0.0,
+                                  ms_qty=qty, ms_qty_tracked=tr))
             else:
                 row.ms_qty = qty
+                row.ms_qty_tracked = tr
         db.commit()
     finally:
         db.close()
@@ -1820,6 +1924,19 @@ async def _sync_incoming(org_id: int, client: MoySkladClient,
     stats["incoming_docs"] = len(docs)
     stats["incoming_open_docs"] = open_docs
     stats["incoming_qty"] = round(sum(incoming.values()))
+    # Два потока: сколько «едет» по нашим заказам и сколько — по чужим (D-28).
+    stats["incoming_open_docs_tracked"] = tracked_docs
+    stats["incoming_qty_tracked"] = round(sum(incoming_tracked.values()))
+    stats["incoming_qty_external"] = round(
+        sum(incoming.values()) - sum(incoming_tracked.values()))
+    # Шаг 0 модели исполнения: заполняет ли МойСклад поле «отгружено» у этого
+    # клиента. Если оно почти везде нулевое при существующих приёмках, значит
+    # приёмки заводят отдельными документами — и автоматический учёт исполнения
+    # для этого workflow не работает в принципе. Цифра нужна, чтобы это был
+    # ФАКТ, а не догадка: без неё мы бы проектировали автоматику вслепую.
+    stats["incoming_positions"] = positions_total
+    stats["incoming_positions_shipped"] = positions_with_shipped
+    stats["incoming_docs_with_shipped"] = docs_with_shipped
     if unmatched:
         stats["incoming_unmatched_skus"] = len(unmatched)
     _set_state(org_id, stage="incoming", progress=progress[1],
