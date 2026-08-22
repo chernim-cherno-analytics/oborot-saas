@@ -635,6 +635,7 @@ def _purge_org(db: Session, org_id: int) -> None:
         CategoryMerge,
         NotifySettings,
         OrderedQty,
+        OrderPlan,
         Production,
         ProductionAssign,
         ReplenishDraft,
@@ -648,9 +649,13 @@ def _purge_org(db: Session, org_id: int) -> None:
     )
     from app.routes_extra import BillingRequest
 
+    # OrderPlan идёт ПЕРЕД ProductionOrder: у плана внешний ключ на заказ,
+    # обратный порядок упал бы в Postgres. Раньше планов в списке не было
+    # вовсе — при удалении организации они оставались осиротевшими строками
+    # с чужим org_id, то есть ровно тем, от чего этот список и защищает.
     for model in (
         Sale, StockDay, WarehouseStock, OrderedQty, ReplenishDraft,
-        ProductionAssign, Production, ProductionOrder,
+        ProductionAssign, OrderPlan, Production, ProductionOrder,
         SkuHidden, SkuCategoryOverride, CategoryMerge, SkuDiscount,
         NotifySettings, SyncState, BillingRequest,
         Product, Warehouse, Connection, Membership,
@@ -661,10 +666,15 @@ def _purge_org(db: Session, org_id: int) -> None:
 
 
 def _purge_user(db: Session, user_id: int) -> None:
-    """Стирает пользователя и его личные следы (просмотренные подсказки)."""
-    from app.models import UserHintSeen
+    """Стирает пользователя и его личные следы (подсказки, уроки, настройки)."""
+    from app.models import UserHintSeen, UserLesson, UserPrefs
 
     db.execute(delete(UserHintSeen).where(UserHintSeen.user_id == user_id))
+    # Прогресс уроков и личный тумблер подсказок раньше оставались после
+    # удаления аккаунта: осиротевшие строки с чужим user_id, которые достались
+    # бы следующему пользователю с тем же идентификатором.
+    db.execute(delete(UserLesson).where(UserLesson.user_id == user_id))
+    db.execute(delete(UserPrefs).where(UserPrefs.user_id == user_id))
     db.execute(delete(Membership).where(Membership.user_id == user_id))
     db.execute(delete(User).where(User.id == user_id))
 

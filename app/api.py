@@ -1469,13 +1469,76 @@ class OrderPlanIn(BaseModel):
     overrides: dict[str, int] = Field(default_factory=dict)
 
 
+_EXCLUDED_KEEP = ("base_name", "category", "cls", "turnover", "need",
+                  "cost_price", "need_rub", "lost_margin", "moq_cost", "gap_days")
+
+
+def _slim_excluded(rows) -> list:
+    """Отсев в сжатом виде: имя, причина и цена отказа, без лишних полей.
+
+    База — один файл SQLite, а каталог у клиента может быть на 1000+ позиций.
+    Хранить полную строку кандидата (вместе с ростовкой) по каждой не вошедшей
+    позиции — это мегабайты на каждый план ни за чем.
+    """
+    if not isinstance(rows, list):
+        return []
+    return [{k: r.get(k) for k in _EXCLUDED_KEEP if k in r}
+            for r in rows if isinstance(r, dict)]
+
+
 def _plan(db: Session, ctx: AuthContext, body: OrderPlanIn) -> dict:
     from app import order_planner
     snap = analytics.get_snapshot(db, ctx.org)
     plan = order_planner.build_plan(db, ctx.org, snap, body.model_dump())
     if body.overrides:
         _apply_overrides(plan, body.overrides, snap)
+    plan["record"] = _decision_record(db, ctx, snap)
     return plan
+
+
+def _decision_record(db: Session, ctx: AuthContext, snap: dict) -> dict:
+    """Обстоятельства решения: версия алгоритма, настройки, качество данных.
+
+    Строки плана и так хранят точечный снимок входов (остаток, товар в пути,
+    оба темпа, себестоимость, цена, потребность). Но три вещи в них не попадают,
+    а без них план через полгода нельзя ни объяснить, ни сравнить с другим:
+
+      • версия алгоритма — иначе разница между двумя планами неотличима от
+        правки кода (см. app/version.py, там же почему версий две);
+      • настройки, которые реально применялись — окно темпа, режим горизонта,
+        ритм, накладные, пороги классов. Они живут в настройках организации и
+        МЕНЯЮТСЯ; через месяц восстановить «а что стояло тогда» нечем;
+      • качество данных на момент расчёта — сколько было истории, у скольких
+        позиций не заполнена себестоимость, когда последний раз синхронизировались.
+        Это же ответ на вопрос «почему тогда посчитали именно так».
+
+    Всё компактное: несколько чисел, не снимок базы. Сырые продажи и остатки
+    восстанавливаются из самих таблиц по дате создания плана.
+    """
+    from app import order_planner, version
+    from app.models import SyncState
+
+    settings = dict(snap.get("settings") or {})
+    raw_items = snap.get("items") or {}
+    items = list(raw_items.values()) if isinstance(raw_items, dict) else list(raw_items)
+    keys = ("rate_window", "cover_mode", "horizon_days", "horizon_days_setting",
+            "order_cadence_days", "safety_days", "lead_time_days", "min_stock_days",
+            "overhead_pct", "reserve_new_pct", "moq_units", "thresholds")
+    st = db.get(SyncState, ctx.org.id)
+    return {
+        "algo": version.algo_version(),
+        "settings": {k: settings.get(k) for k in keys if k in settings},
+        "data_quality": {
+            "coverage_days": order_planner.coverage_days(snap),
+            "positions_total": len(items),
+            # Себестоимость — вход, без которого позиция вообще не попадает
+            # в заказ. Доля незаполненных объясняет план лучше любой оценки.
+            "positions_no_cost": sum(1 for it in items if it.get("no_cost")),
+            "last_sync_at": (st.finished_at.isoformat()
+                             if st is not None and st.finished_at else None),
+            "sync_state": (st.state if st is not None else None),
+        },
+    }
 
 
 def _apply_overrides(plan: dict, overrides: dict, snap: dict) -> None:
@@ -1497,6 +1560,10 @@ def _apply_overrides(plan: dict, overrides: dict, snap: dict) -> None:
         it = items.get(base)
         if it is None:
             continue
+        # Рекомендация системы сохраняется рядом с правкой, а не затирается ею.
+        # Без этого исчезает единственный сигнал, ради которого записи решений
+        # вообще нужны: где человек систематически исправляет алгоритм.
+        it.setdefault("qty_recommended", it["qty"])
         it["qty"] = qty
         it["unmet"] = max(0, it["need"] - qty)
         it["over_need"] = max(0, qty - it["need"])
@@ -1627,12 +1694,28 @@ def api_order_plan_save(
                 # На какой истории посчитан план (деплой П1): apply спросит
                 # осознанное подтверждение, если истории было мало.
                 "coverage": plan.get("coverage"),
+                # Версия алгоритма, применённые настройки и качество данных —
+                # см. _decision_record.
+                **(plan.get("record") or {}),
             },
             ensure_ascii=False,
         ),
         result_json=json.dumps(
             {"items": plan["items"], "totals": plan["totals"],
-             "spent": plan["spent"], "lost": plan.get("lost")},
+             "spent": plan["spent"], "lost": plan.get("lost"),
+             "manual_edit": bool(plan.get("manual_edit")),
+             # ОТКАЗ — ТОЖЕ РЕШЕНИЕ. Раньше сохранялись только строки плана,
+             # а «что не вошло и почему» считалось, показывалось на экране и
+             # пропадало. Без этого в истории остаются одни лишь товары,
+             # прошедшие фильтры: нельзя увидеть ни того, что система
+             # систематически отсеивает целый класс позиций, ни того, во что
+             # обошёлся отказ. Хранится в сжатом виде — без ростовок и
+             # промежуточных полей.
+             "not_included": _slim_excluded(plan.get("not_included")),
+             "review": plan.get("review"),
+             "moq_skipped": plan.get("moq_skipped"),
+             "moq_over_cap": plan.get("moq_over_cap"),
+             "blocked": plan.get("blocked")},
             ensure_ascii=False,
         ),
     )
