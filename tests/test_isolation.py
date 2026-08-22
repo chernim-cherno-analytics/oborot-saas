@@ -34,6 +34,7 @@ import sqlite3
 import sys
 import threading
 import time
+from datetime import date, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -275,6 +276,22 @@ def run_all() -> None:
         leaked = sql("SELECT COUNT(*) FROM products WHERE org_id=? AND base_name=?",
                      org_a, SECRET)[0][0]
         check(f"{title} не создал чужую позицию у себя", leaked == 0, f"rows={leaked}")
+
+    # Ручное добавление позиции в заказ (D-23) — новая точка входа с именем
+    # позиции в теле запроса. Проверка принадлежности идёт по снапшоту
+    # организации, а не по присланной строке; иначе через overrides можно было
+    # бы вписать в свой заказ чужой товар (и увидеть его цену и остаток).
+    eta_iso = (date.today() + timedelta(days=40)).isoformat()
+    r = a.post("/api/order-plan/preview", json={
+        "eta_date": eta_iso, "budget": 100000, "budget_scope": "full",
+        "overrides": {SECRET: 10},
+    })
+    check("ручное добавление чужой позиции в план не срабатывает",
+          r.status_code != 200
+          or not any(i.get("base_name") == SECRET for i in (r.json().get("items") or [])),
+          f"status={r.status_code} {r.text[:160]}")
+    check("и чужое имя не утекает в ответ целиком",
+          r.status_code != 200 or SECRET not in r.text, f"status={r.status_code}")
 
     # ── 3. Утечка в чтении ───────────────────────────────────────────────────
     print("\n== 3. Читающие отчёты организации A не содержат позицию организации B ==")

@@ -686,6 +686,39 @@ def _truncate_history(days: int) -> None:
         con.close()
 
 
+def _sql(query: str, *args):
+    import sqlite3
+    con = sqlite3.connect(DB_PATH)
+    try:
+        cur = con.execute(query, args)
+        con.commit()
+        return cur.fetchall()
+    finally:
+        con.close()
+
+
+def _add_no_cost_item(base: str, qty_on_hand: int = 9) -> None:
+    """Позиция без себестоимости — её в демо-данных нет (это отдельный вопрос
+    к владельцу: демо не показывает как раз те функции, которые цепляют).
+    Кладём напрямую в базу, как это делают тесты синка, и сбрасываем кэш."""
+    from app import analytics as _an
+    org_id = _sql("SELECT id FROM orgs ORDER BY id LIMIT 1")[0][0]
+    _sql("INSERT INTO products (org_id, ext_id, base_name, size, category, "
+         "cost_price, sale_price, archived, excluded) VALUES (?,?,?,?,?,?,?,0,0)",
+         org_id, "nc-1", base, "", "Аксессуары", 0, 2000)
+    pid = _sql("SELECT id FROM products WHERE org_id=? AND ext_id='nc-1'", org_id)[0][0]
+    today = date.today()
+    for i in range(60):
+        d = (today - timedelta(days=i)).isoformat()
+        _sql("INSERT INTO stock_days (org_id, product_id, date, qty) VALUES (?,?,?,?)",
+             org_id, pid, d, qty_on_hand)
+    for i in range(0, 60, 6):
+        d = (today - timedelta(days=i)).isoformat()
+        _sql("INSERT INTO sales (org_id, product_id, date, qty, revenue, is_return) "
+             "VALUES (?,?,?,?,?,0)", org_id, pid, d, 2, 4000)
+    _an.invalidate(org_id)
+
+
 def api_checks() -> None:
     """Сквозной путь на демо-данных: анкета → план → сохранение → заказ."""
     print("\n13. API мастера заказа (демо-организация)")
@@ -1119,6 +1152,101 @@ def api_checks() -> None:
               f"got={c.get('/api/settings').json()['horizon_days_effective']}")
         check("в настройках есть переключатель режима горизонта",
               'id="horizon-mode"' in c.get("/settings").text)
+
+        print("\n14d. Факты о данных на экране, а не оценка уверенности (D-23)")
+        opts_dq = c.get("/api/order-plan/options").json().get("data_quality") or {}
+        for key in ("coverage_days", "coverage_start", "positions_total",
+                    "positions_cost_full", "positions_no_cost",
+                    "last_sync_at", "sync_state"):
+            check(f"анкета знает факт «{key}»", key in opts_dq,
+                  f"есть={sorted(opts_dq)}")
+        check("это ФАКТЫ, а не оценка уверенности",
+              not any(k in opts_dq for k in ("confidence", "score", "level", "grade")),
+              f"лишнее={[k for k in opts_dq if k in ('confidence','score','level','grade')]}")
+        check("глубина истории — число дней, а не буква",
+              isinstance(opts_dq.get("coverage_days"), int)
+              and opts_dq["coverage_days"] > 0,
+              f"got={opts_dq.get('coverage_days')!r}")
+        check("позиции без себестоимости посчитаны отдельно от общего числа",
+              isinstance(opts_dq.get("positions_no_cost"), int)
+              and isinstance(opts_dq.get("positions_total"), int)
+              and opts_dq["positions_no_cost"] <= opts_dq["positions_total"],
+              f"no_cost={opts_dq.get('positions_no_cost')} "
+              f"total={opts_dq.get('positions_total')}")
+        rec_dq = (c.post("/api/order-plan/preview", json=body_hz).json()
+                  .get("record") or {}).get("data_quality") or {}
+        check("на экране и в записи решения — ОДНИ И ТЕ ЖЕ факты",
+              rec_dq == opts_dq, f"экран={opts_dq} запись={rec_dq}")
+        page_dq = c.get("/assistant").text
+        check("на первом экране мастера есть блок фактов о данных",
+              'id="dataFacts"' in page_dq and "Что известно о данных" in page_dq)
+
+        print("\n14e. Позицию без себестоимости решает человек (D-23)")
+        # Дополнение владельца 22.08: отказ системы считать НЕ запрещает
+        # человеку действовать. Раньше такая позиция не попадала в заказ
+        # никогда — её нельзя было втащить даже вручную, в отличие от позиции
+        # с малой статистикой.
+        base_nc = "Пробник «Без цены»"
+        _add_no_cost_item(base_nc)
+
+        plan_nc = c.post("/api/order-plan/preview", json=body_hz).json()
+        in_plan = [i["base_name"] for i in plan_nc["items"]]
+        check("сама система позицию без себестоимости в заказ не берёт",
+              base_nc not in in_plan, f"нашлась: {base_nc in in_plan}")
+        rev_names = [r["base_name"] for r in (plan_nc.get("review") or {}).get("no_cost", [])]
+        check("но показывает её отдельным списком «решаете вы»",
+              base_nc in rev_names, f"список={rev_names[:5]}")
+        check("бюджет без ручных правок помечен полным",
+              plan_nc.get("budget_incomplete") is None,
+              f"got={plan_nc.get('budget_incomplete')}")
+
+        manual = c.post("/api/order-plan/preview",
+                        json=dict(body_hz, overrides={base_nc: 25})).json()
+        row = next((i for i in manual["items"] if i["base_name"] == base_nc), None)
+        check("человек вписал количество — позиция ПОПАЛА в заказ",
+              row is not None and row["qty"] == 25,
+              f"row={row and {k: row[k] for k in ('qty',)}}")
+        check("и не выдаётся за рекомендацию системы (qty_recommended = null)",
+              row is not None and row.get("qty_recommended") is None,
+              f"qty_recommended={row and row.get('qty_recommended')}")
+        check("строка подписана как решение человека",
+              row is not None and "manual_add" in (row.get("why") or [])
+              and "вручную" in (row.get("why_text") or ""),
+              f"why={row and row.get('why')} text={row and row.get('why_text')}")
+        check("прибыль по ней НЕ обещается (спроса система не считала)",
+              row is not None and row.get("expected_profit") == 0
+              and row.get("need") == 0,
+              f"profit={row and row.get('expected_profit')} need={row and row.get('need')}")
+        bi = manual.get("budget_incomplete")
+        check("сумма заказа помечена НЕПОЛНОЙ",
+              bi is not None and bi["positions"] >= 1 and bi["units"] >= 25
+              and base_nc in (bi.get("names") or []),
+              f"budget_incomplete={bi}")
+        check("план помечен как правленный человеком",
+              manual.get("manual_edit") is True, f"got={manual.get('manual_edit')}")
+
+        ghost = c.post("/api/order-plan/preview",
+                       json=dict(body_hz, overrides={"Пальто «Которого нет»": 10})).json()
+        check("несуществующее имя в заказ не добавляется",
+              not any(i["base_name"] == "Пальто «Которого нет»" for i in ghost["items"]),
+              "выдуманное имя не должно создавать строку")
+        check("и не роняет расчёт", isinstance(ghost.get("items"), list))
+
+        saved_nc = c.post("/api/order-plan",
+                          json=dict(body_hz, overrides={base_nc: 25})).json()
+        import json as _json
+        res_nc = _json.loads(_sql("SELECT result_json FROM order_plans WHERE id=?",
+                                  saved_nc["id"])[0][0])
+        check("в истории видно, что сумма была неполной",
+              (res_nc.get("budget_incomplete") or {}).get("positions") >= 1,
+              f"got={res_nc.get('budget_incomplete')}")
+        srow = next((i for i in res_nc["items"] if i["base_name"] == base_nc), None)
+        check("в истории решение человека отличимо от рекомендации",
+              srow is not None and srow.get("qty_recommended") is None
+              and srow.get("qty") == 25,
+              f"row={srow and {k: srow.get(k) for k in ('qty', 'qty_recommended')}}")
+        check("в мастере есть поле для ручного количества у таких позиций",
+              "nocost-q" in c.get("/assistant").text)
 
         print("\n14c. Мастер заказа на догружаемой истории (деплой П1)")
         eta_full = (date.today() + timedelta(days=45)).isoformat()
