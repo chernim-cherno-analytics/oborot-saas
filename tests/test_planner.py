@@ -39,6 +39,8 @@ if DB_PATH.exists():
 import httpx  # noqa: E402
 import uvicorn  # noqa: E402
 
+from sqlalchemy import select as _select  # noqa: E402
+
 from app import analytics, order_planner as op  # noqa: E402
 
 PASS, FAIL = [], []
@@ -1412,6 +1414,90 @@ def api_checks() -> None:
               all(('href="%s"' % u) in emb_t for u in
                   ("/turnover", "/stocks", "/assistant", "/replenish", "/sizes",
                    "/budget", "/forecast", "/revenue", "/lessons", "/settings")))
+
+        print("\n14h. Настройка «окно темпа» действует везде, где обещает (DATA-11)")
+        # `item["rate"]` в снапшоте — синоним ГОДОВОГО темпа, оставленный для
+        # обратной совместимости. Он не меняется вслед за настройкой окна, и
+        # именно из-за него «Прогноз» год игнорировал выбор организации:
+        # владелец ставил «90 дней» или «Сезон», а страница распродавала склад
+        # годовым темпом и об этом молчала.
+        app_dir = ROOT / "app"
+        # Разбираем ДЕРЕВО, а не текст: комментарий или докстринг, где поле
+        # упомянуто словами, нарушением не является, а grep об этом не знает.
+        # Смотрим только модули, которые читают САМ СНАПШОТ. В export_xlsx и
+        # lessons `it` — это строка готового ответа API (там `rate` уже
+        # посчитан по активному окну и означает ровно то, что написано).
+        import ast as _ast
+        SNAPSHOT_READERS = ("analytics.py", "analytics_extra.py",
+                            "analytics_markdown.py", "order_planner.py")
+        offenders = []
+        for fname in SNAPSHOT_READERS:
+            f = app_dir / fname
+            tree = _ast.parse(f.read_text(encoding="utf-8"))
+            assigned = {
+                id(n.value) for n in _ast.walk(tree)
+                if isinstance(n, _ast.Assign) for t in n.targets
+                if isinstance(t, _ast.Subscript)
+            }
+            for node in _ast.walk(tree):
+                if isinstance(node, _ast.Assign):
+                    for t in node.targets:
+                        # `item["rate"] = ...` — единственное законное место:
+                        # строка, которая это поле и создаёт.
+                        if (isinstance(t, _ast.Subscript)
+                                and isinstance(t.value, _ast.Name)
+                                and t.value.id in ("it", "item")
+                                and isinstance(t.slice, _ast.Constant)
+                                and t.slice.value == "rate"):
+                            assigned.add(id(t))
+            for node in _ast.walk(tree):
+                if (isinstance(node, _ast.Subscript)
+                        and isinstance(node.value, _ast.Name)
+                        and node.value.id in ("it", "item")
+                        and isinstance(node.slice, _ast.Constant)
+                        and node.slice.value == "rate"
+                        and id(node) not in assigned):
+                    offenders.append(f"{fname}:{node.lineno}")
+        check("никто из app/ не читает неоднозначное item[\"rate\"]",
+              not offenders, "нашлось: " + "; ".join(offenders[:4]))
+
+        # Прогноз обязан считать по активному окну и называть его.
+        c.post("/api/settings", json={"rate_window": "year"})
+        fc_year = c.get("/api/forecast").json()
+        c.post("/api/settings", json={"rate_window": "d90"})
+        fc_d90 = c.get("/api/forecast").json()
+        check("прогноз называет окно темпа, по которому посчитан",
+              fc_d90.get("rate_window") == "d90"
+              and "90" in (fc_d90.get("rate_window_label") or ""),
+              f"window={fc_d90.get('rate_window')} label={fc_d90.get('rate_window_label')}")
+        r_year = {i["base_name"]: i["rate"] for i in fc_year["items"]}
+        r_d90 = {i["base_name"]: i["rate"] for i in fc_d90["items"]}
+        common_fc = set(r_year) & set(r_d90)
+        check("переключение окна РЕАЛЬНО меняет темп прогноза",
+              bool(common_fc) and any(abs(r_year[b] - r_d90[b]) > 1e-6 for b in common_fc),
+              f"позиций={len(common_fc)} различий="
+              f"{sum(1 for b in common_fc if abs(r_year[b] - r_d90[b]) > 1e-6)}")
+        check("и вместе с темпом меняется дата распродажи склада",
+              fc_year["cards"].get("pace_rub") != fc_d90["cards"].get("pace_rub"),
+              f"год={fc_year['cards'].get('pace_rub')} 90дн={fc_d90['cards'].get('pace_rub')}")
+        check("на странице «Прогноз» есть подпись про окно темпа",
+              'id="fc-window"' in c.get("/forecast").text)
+
+        # Уценка остаётся годовой — но теперь это решение, а не случайность.
+        from app import analytics_markdown as _md
+        from app.db import SessionLocal as _SL
+        from app.models import Org as _Org
+        _dbs = _SL()
+        try:
+            _org = _dbs.execute(_select(_Org)).scalars().first()
+            disc = _md.build_discounts(analytics.get_snapshot(_dbs, _org))
+        finally:
+            _dbs.close()
+        check("уценка честно называет свою базу — годовой темп",
+              disc.get("rate_window") == "year"
+              and "год" in (disc.get("rate_window_label") or ""),
+              f"window={disc.get('rate_window')} label={disc.get('rate_window_label')}")
+        c.post("/api/settings", json={"rate_window": "year"})
 
         print("\n14c. Мастер заказа на догружаемой истории (деплой П1)")
         eta_full = (date.today() + timedelta(days=45)).isoformat()
