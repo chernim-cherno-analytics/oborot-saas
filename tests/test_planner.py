@@ -823,6 +823,57 @@ def api_checks() -> None:
         check("заказ виден в списке и содержит позиции",
               any(o["name"] == "Осень 2026" for o in orders), str([o["name"] for o in orders]))
 
+        # ── Д3: мастер знает про свои заказы ──────────────────────────────
+        print("\n23. Открытые заказы, календарь денег, защита от дубля")
+        made = [o for o in orders if o["name"] == "Осень 2026"][0]
+        check("заказ помнит канал производства",
+              made["production_id"] == lab["id"], str(made["production_id"]))
+        op = c.get("/api/orders/open", params={"production_id": lab["id"]}).json()
+        check("открытые заказы канала видны мастеру",
+              op["count"] >= 1 and any(o["id"] == made["id"] for o in op["orders"]),
+              str(op["count"]))
+        check("по открытым заказам видно, сколько ещё платить",
+              op["left_to_pay"] > 0, str(op["left_to_pay"]))
+        check("открытый заказ отдаёт календарь платежей",
+              op["orders"][0]["payments"] and
+              abs(sum(x["amount"] for x in op["orders"][0]["payments"])
+                  - op["orders"][0]["total_cost"]) <= 1,
+              str(op["orders"][0]["payments"]))
+        check("по позициям открытых заказов видно количество",
+              op["by_base"] and sum(op["by_base"].values()) == made["total_qty"],
+              str(sum(op["by_base"].values())))
+        other = c.get("/api/orders/open", params={"production_id": china["id"]}).json()
+        check("фильтр по каналу не показывает чужие заказы",
+              other["count"] == 0, str(other["count"]))
+
+        cal = c.get("/api/cash-calendar").json()
+        check("календарь денег отдаёт 16 недель", len(cal["weeks"]) == 16)
+        cums = [w["cumulative"] for w in cal["weeks"]]
+        check("накопительное сальдо не убывает", cums == sorted(cums), str(cums[:4]))
+        check("в календаре есть деньги открытых заказов", cal["total"] > 0, str(cal["total"]))
+        wk = date.fromisoformat(cal["week_start"])
+        check("неделя начинается с понедельника и не позже сегодня",
+              wk.weekday() == 0 and wk <= date.today(), cal["week_start"])
+
+        dup_body = {"production_id": lab["id"], "eta_date": eta, "budget": 300000,
+                    "budget_scope": "now", "strategy": "balance"}
+        dup_plan = c.post("/api/order-plan", json=dup_body).json()
+        r_dup = c.post(f"/api/order-plan/{dup_plan['id']}/apply", json={"name": "Осень 2026 (2)"})
+        check("повторный заказ тем же составом требует подтверждения",
+              r_dup.status_code == 409 and "уже есть" in r_dup.json().get("detail", ""),
+              f"{r_dup.status_code} {r_dup.text[:120]}")
+        r_force = c.post(f"/api/order-plan/{dup_plan['id']}/apply",
+                         json={"name": "Осень 2026 (2)", "force": True})
+        check("с явным подтверждением заказ всё-таки создаётся",
+              r_force.status_code == 200 and r_force.json().get("order_id"),
+              f"{r_force.status_code} {r_force.text[:120]}")
+        op2 = c.get("/api/orders/open", params={"production_id": lab["id"]}).json()
+        check("оба заказа считаются открытыми", op2["count"] >= 2, str(op2["count"]))
+        c.post(f"/api/orders/{r_force.json()['order_id']}/status", json={"status": "sent"})
+        op3 = c.get("/api/orders/open", params={"production_id": lab["id"]}).json()
+        check("заказ «в производстве» остаётся открытым обязательством",
+              op3["count"] == op2["count"], f"{op3['count']} vs {op2['count']}")
+
         print("\n14c. Мастер заказа на догружаемой истории (деплой П1)")
         eta_full = (date.today() + timedelta(days=45)).isoformat()
         body = {"eta_date": eta_full, "budget": 300000, "budget_scope": "full",
