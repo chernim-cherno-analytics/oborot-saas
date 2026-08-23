@@ -55,6 +55,7 @@ SUITES = [
     ("consist",     "test_consistency.py",     False, False),
     ("ui",          "test_ui.py",              False, False),
     ("backup",      "test_backup.py",          False, False),
+    ("deploy",      "test_deploy.py",          False, False),
 ]
 
 TOTAL_RE = re.compile(r"ИТОГО:\s*(\d+)\s*OK,\s*(\d+)\s*FAIL")

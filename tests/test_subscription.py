@@ -122,11 +122,11 @@ EXPECTED_OPEN = {
     "/logout": "выход",
     "/api/account/password": "смена пароля",
     "/api/account/delete": "удаление аккаунта",
-    "/api/hints/seen": "состояние подсказок конкретного человека",
-    "/api/prefs/hints": "состояние подсказок конкретного человека",
-    "/api/lessons/{key}/done": "прогресс обучения конкретного человека",
-    "/api/lessons/reset": "прогресс обучения конкретного человека",
-    "/api/lessons/{key}/reset": "прогресс обучения конкретного человека",
+    # Подсказки и уроки ОТСЮДА УБРАНЫ (решение владельца 23.08.2026, строгий
+    # readonly). Довод «это состояние экрана одного человека, а не данные
+    # организации» остаётся верным, но перечень владельца их не содержит, а
+    # строгий режим на то и строгий: список исключений не растёт от здравых
+    # доводов исполнителя. Ниже они проверяются как ЗАКРЫТЫЕ.
     "/ms/vendor/api/moysklad/vendor/1.0/apps/{path_app_id}/{account_id}":
         "lifecycle МойСклада — вызывает сам МС своим JWT",
 }
@@ -253,64 +253,56 @@ def main() -> int:
         check("но чтение состояния при этом НИЧЕГО не пишет в базу",
               stamped is None, f"stamp={stamped}")
 
-        print("\n== «Деньги пришли» — не то же самое, что «счёт выставлен» ==")
-        # Статус `paid` использовался НАРАВНЕ с `invoiced`: просто запускал те же
-        # пять дней. То есть организация, про которую в нашей же базе написано
-        # «оплачено», закрывалась на шестой день — при том, что инструкция
-        # оператору в deploy/README про продление paid_until молчала.
-        exec_sql("UPDATE billing_requests SET status = 'paid', invoiced_at = ? WHERE id = ?",
-                 f"{D(-30)} 10:00:00", req_id)
-        check("отметка «оплачено» держит доступ и через месяц после счёта",
-              state_of(org_id) == subscription.ACTIVE, state_of(org_id))
+        print("\n== Источник истины об оплате — только orgs.paid_until ==")
+        # Решение владельца 23.08.2026. Раньше здесь проверялось обратное: что
+        # отметка `paid` сама по себе даёт «купленный срок» (месяц или год от
+        # даты счёта). Это была моя конструкция, и она неверна: система
+        # назначала доступ по числу, которого никто не вводил. Ошибку оператора
+        # надо показывать оператору, а не превращать в тихое право доступа.
+        # Счёт выставлен ДАВНО: грейс (5 дней от счёта) уже истёк, поэтому
+        # проверяется именно отметка «оплачено», а не соседний механизм.
+        exec_sql("UPDATE billing_requests SET status = 'paid', period = 'year', "
+                 "invoiced_at = ? WHERE id = ?", f"{D(-30)} 10:00:00", req_id)
+        set_org(org_id, paid_until=None)
+        check("отметка «оплачено» БЕЗ paid_until доступа не даёт",
+              state_of(org_id) == subscription.READONLY, state_of(org_id))
+        # Тот же факт через HTTP: этот раздел проверяет машину состояний при
+        # выключенном флаге, поэтому гейт включаем на один запрос и гасим.
+        gate(True)
         r = c.post("/api/sync/run")
-        check("и плательщик не получает 402 на запись", r.status_code != 402,
+        gate(False)
+        check("и на запись отвечает отказом", r.status_code == 402,
               f"status={r.status_code}")
-        # Но именно отметка, а не любая заявка: `invoiced` месячной давности —
-        # по-прежнему отказ, иначе гейт не закрывал бы вообще никого.
-        exec_sql("UPDATE billing_requests SET status = 'invoiced' WHERE id = ?", req_id)
-        check("а «счёт выставлен» месяц назад — по-прежнему readonly",
-              state_of(org_id) == subscription.READONLY, state_of(org_id))
 
-        # Отметка даёт КУПЛЕННЫЙ срок, а не вечность. Первая версия этой правки
-        # смотрела на последнюю заявку и пускала без ограничения по времени —
-        # то есть заплативший однажды не закрывался никогда, ведь продление
-        # делается через UPDATE orgs SET paid_until, новой заявки при этом нет.
-        exec_sql("UPDATE billing_requests SET status = 'paid', period = 'month', "
-                 "invoiced_at = ? WHERE id = ?", f"{D(-400)} 10:00:00", req_id)
-        check("оплата 400 дней назад по месячному тарифу больше не действует",
-              state_of(org_id) == subscription.READONLY, state_of(org_id))
-        exec_sql("UPDATE billing_requests SET period = 'year' WHERE id = ?", req_id)
-        check("а годовой тариф на той же дате ещё действует (400 < 365? нет) —"
-              " и это тоже readonly",
-              state_of(org_id) == subscription.READONLY, state_of(org_id))
-        exec_sql("UPDATE billing_requests SET invoiced_at = ? WHERE id = ?",
-                 f"{D(-200)} 10:00:00", req_id)
-        check("годовой тариф, оплаченный 200 дней назад, действует",
+        # Оператор проставил срок — вот теперь доступ есть, и именно из-за срока.
+        set_org(org_id, paid_until=D(30))
+        check("проставленный paid_until открывает доступ",
               state_of(org_id) == subscription.ACTIVE, state_of(org_id))
-
-        # Заявка на смену тарифа не имеет права запирать оплатившего клиента.
-        # Раньше «последней» считалась заявка с максимальным id: клиент нажимал
-        # «хочу тариф Про», появлялась заявка со статусом new, и право записи
-        # исчезало до ручной обработки оператором.
-        r = c.post("/api/plans/request", json={
-            "plan": "pro", "period": "month", "company": "ООО Тест",
-            "inn": "7700000000", "email": "a@b.io", "phone": "+70000000000",
-        })
-        check("заявка на смену тарифа принята", r.status_code == 200,
-              f"status={r.status_code}")
-        check("и она НЕ отняла доступ у оплатившего",
-              state_of(org_id) == subscription.ACTIVE, state_of(org_id))
+        gate(True)
         r = c.post("/api/sync/run")
-        check("оплативший по-прежнему может писать после заявки на апгрейд",
-              r.status_code != 402, f"status={r.status_code}")
-        exec_sql("DELETE FROM billing_requests WHERE id <> ?", req_id)
+        gate(False)
+        check("и запись проходит", r.status_code != 402, f"status={r.status_code}")
 
-        # Статус правит оператор руками: регистр и пробелы не должны означать
-        # «отметки нет».
-        exec_sql("UPDATE billing_requests SET status = ' Paid ' WHERE id = ?", req_id)
-        check("« Paid » с пробелами и заглавной читается как оплата",
-              state_of(org_id) == subscription.ACTIVE, state_of(org_id))
+        # Срок истёк — отметка `paid` его не продлевает.
+        set_org(org_id, paid_until=D(-1))
+        check("истёкший paid_until закрывает, даже если заявка «оплачено»",
+              state_of(org_id) == subscription.READONLY, state_of(org_id))
 
+        # Диагностика обязана быть: молча закрыть плательщика — худший исход.
+        import io as _io, logging as _logging
+        buf = _io.StringIO()
+        h = _logging.StreamHandler(buf)
+        lg = _logging.getLogger("oborot.subscription")
+        lg.addHandler(h)
+        try:
+            state_of(org_id)
+        finally:
+            lg.removeHandler(h)
+        check("оператор получает предупреждение про непроставленный срок",
+              "paid_until" in buf.getvalue() and "ЗАКРЫТ" in buf.getvalue(),
+              buf.getvalue()[:160] or "(лог пуст)")
+
+        set_org(org_id, paid_until=None)
         exec_sql("UPDATE billing_requests SET status = 'new', invoiced_at = NULL WHERE id = ?",
                  req_id)
 
@@ -394,6 +386,23 @@ def main() -> int:
               "подписк" in blocked["синхронизация (инкрементальная)"].text.lower(),
               blocked["синхронизация (инкрементальная)"].text[:120])
 
+        print("\n== Интерфейс не бьётся о собственный отказ ==")
+        # Строгий режим закрыл отметки подсказок и прогресса обучения. Если
+        # страница продолжит их слать, человек получит 402 при обычном
+        # листании СВОИХ ЖЕ данных — отказ, который ничего не защищает.
+        # Поэтому страница узнаёт о запрете с сервера и просто не шлёт запрос.
+        gate(True)
+        html = c.get("/").text
+        check("при включённом гейте страница знает, что запись закрыта",
+              "window.OBOROT_READONLY = true" in html,
+              [l.strip() for l in html.splitlines() if "OBOROT_READONLY" in l][:1])
+        gate(False)
+        html = c.get("/").text
+        check("при выключенном гейте ничего не гасим — запись-то проходит",
+              "window.OBOROT_READONLY = false" in html,
+              [l.strip() for l in html.splitlines() if "OBOROT_READONLY" in l][:1])
+        gate(True)
+
         print("\n== Флаг включён: чтение остаётся открытым ==")
         # Читающие ручки обязаны не просто «не отдавать 402», а РАБОТАТЬ:
         # проверка «status != 402» проходила бы и на 404 несуществующего
@@ -423,11 +432,12 @@ def main() -> int:
         check("экспорт не блокируется", r.status_code != 402,
               f"status={r.status_code} {r.text[:120]}")
         # Состояние интерфейса конкретного человека — не данные организации.
+        # Строгий readonly: состояние интерфейса — тоже изменение данных.
         for path, body in (("/api/hints/seen", {"key": "turnover"}),
                            ("/api/prefs/hints", {"enabled": True}),
                            ("/api/lessons/reset", None)):
             rr = c.post(path, json=body) if body is not None else c.post(path)
-            check(f"не блокируется: {path}", rr.status_code != 402,
+            check(f"строгий режим закрывает и это: {path}", rr.status_code == 402,
                   f"status={rr.status_code}")
 
         body = c.get("/api/subscription").json()
