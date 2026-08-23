@@ -58,6 +58,41 @@ def strip_comment(line: str) -> str:
     return line.split("#", 1)[0].strip()
 
 
+def vkey(v: str) -> tuple:
+    """Ключ сравнения версий: числовые части релиза, затем метка пред-релиза.
+
+    Достаточно для того, что реально встречается в наших файлах: 0.141.1,
+    2.0.52, 46.0.7. Пред-релиз (rc, b, a) считается МЛАДШЕ финальной версии —
+    это единственная тонкость PEP 440, из-за которой наивное сравнение строк
+    ошибается.
+    """
+    head = re.split(r"[^0-9.]", v, maxsplit=1)[0].rstrip(".")
+    nums = tuple(int(x) for x in head.split(".") if x != "")
+    pre = 0 if head == v else -1
+    return (nums, pre)
+
+
+def satisfies(version: str, op: str, want: str) -> bool:
+    a, b = vkey(version), vkey(want)
+    if op == "==":
+        return version == want or a == b
+    if op == "!=":
+        return not (version == want or a == b)
+    if op == ">=":
+        return a >= b
+    if op == "<=":
+        return a <= b
+    if op == ">":
+        return a > b
+    if op == "<":
+        return a < b
+    if op == "~=":
+        # ~=1.2.3 значит «>=1.2.3 и совпадает по всем частям, кроме последней»
+        head = len(b[0]) - 1
+        return a >= b and a[0][:head] == b[0][:head]
+    return True
+
+
 def read_lock() -> tuple[dict[str, str], list[str], list[str]]:
     """Возвращает (пины, строки-не-пины, имена-дубли)."""
     pins: dict[str, str] = {}
@@ -113,34 +148,48 @@ def main() -> int:
     missing = sorted(direct_names - set(pins))
     check("каждая прямая зависимость есть в lock", not missing, str(missing))
 
-    print("\n== 3. requirements.txt и requirements.lock не спорят ==")
+    print("\n== 3. Сравнение версий (свой компаратор — проверяем его самого) ==")
+    # Компаратор написан здесь же вручную, значит его самого никто не проверяет.
+    # Эти случаи и есть его проверка; главный из них — предпоследний: пред-релиз
+    # МЛАДШЕ финальной версии, и наивное сравнение строк на нём ошибается.
+    cases = [
+        ("0.141.1", ">=", "0.110", True), ("0.141.1", "<", "1", True),
+        ("2.0.52", ">=", "2.0", True), ("2.0.52", "<", "3", True),
+        ("46.0.7", ">=", "42", True), ("46.0.7", "<", "52", True),
+        ("5.0.0", ">=", "6", False), ("0.0.8", ">=", "0.0.9", False),
+        ("3.1.5", "~=", "3.1", True), ("3.0", "~=", "3.1", False),
+        ("1.0.0rc1", "<", "1.0.0", True), ("1.0.0", "<", "1.0.0rc1", False),
+    ]
+    wrong = [f"{v}{op}{w}" for v, op, w, want in cases if satisfies(v, op, w) != want]
+    check("компаратор версий отвечает верно на все известные случаи",
+          not wrong, str(wrong))
+
+    print("\n== 4. requirements.txt и requirements.lock не спорят ==")
     # Эта проверка ловит то, что «имя есть в lock» пропускает: границу, которой
     # зафиксированная версия не удовлетворяет.
-    try:
-        from packaging.requirements import Requirement
-        from packaging.version import Version
-    except Exception as exc:  # pragma: no cover
-        check("packaging доступен для разбора границ", False, repr(exc))
-        Requirement = None  # type: ignore
+    #
+    # Сравнение версий сделано вручную, без `packaging`. Первый вариант его
+    # импортировал — и CI упал: `packaging` вендорится внутрь pip и в чистом
+    # окружении из одного requirements.lock не импортируется. Набор про
+    # «зависимости должны быть объявлены» сам зависел от необъявленной
+    # зависимости. Добавлять её в lock ради теста — хвост виляет собакой.
+    conflicts, unparsed = [], []
+    for line in direct_lines:
+        m = re.fullmatch(r"([A-Za-z0-9_.\-]+)\s*((?:[<>=!~]=?[^,\s]+\s*,?\s*)*)", line)
+        if not m:
+            unparsed.append(line)
+            continue
+        locked = pins.get(norm(m.group(1)))
+        if locked is None:
+            continue
+        for op, want in re.findall(r"([<>=!~]=?)\s*([^,\s]+)", m.group(2)):
+            if not satisfies(locked, op, want):
+                conflicts.append(f"{m.group(1)}: требование «{op}{want}», в lock {locked}")
+    check("все строки requirements.txt разобраны", not unparsed, str(unparsed[:3]))
+    check("зафиксированная версия удовлетворяет требованию из requirements.txt",
+          not conflicts, "; ".join(conflicts[:5]))
 
-    if Requirement is not None:
-        conflicts, unparsed = [], []
-        for line in direct_lines:
-            try:
-                req = Requirement(line)
-            except Exception:
-                unparsed.append(line)
-                continue
-            locked = pins.get(norm(req.name))
-            if locked is None:
-                continue
-            if req.specifier and not req.specifier.contains(Version(locked), prereleases=True):
-                conflicts.append(f"{req.name}: требование «{req.specifier}», в lock {locked}")
-        check("все строки requirements.txt разобраны", not unparsed, str(unparsed[:3]))
-        check("зафиксированная версия удовлетворяет требованию из requirements.txt",
-              not conflicts, "; ".join(conflicts[:5]))
-
-    print("\n== 4. Установленное окружение ==")
+    print("\n== 5. Установленное окружение ==")
     pip = subprocess.run([sys.executable, "-m", "pip", "check"],
                          capture_output=True, text=True)
     check("pip check не находит несовместимостей", pip.returncode == 0,
