@@ -68,6 +68,7 @@ from datetime import date, timedelta
 from sqlalchemy import and_, case, func, select
 from sqlalchemy.orm import Session
 
+from app import assign_rules
 from app.categories import ru_category
 from app.models import (
     CategoryMerge,
@@ -281,6 +282,23 @@ DEFAULT_DISCOUNT_RULE = {
 
 
 STOCK_NORM_DEFAULT = 90   # дней; та же величина, что overstock_days в правиле скидок
+
+
+def stock_thresholds(settings: dict | None) -> dict:
+    """Пороги классов организации с дозаполнением дефолтов.
+
+    Нужны интерфейсу: подписи карточек и легенда классов обязаны называть те
+    числа, по которым позиции реально разложены.
+    """
+    from app.models import DEFAULT_SETTINGS
+
+    base = dict(DEFAULT_SETTINGS["thresholds"])
+    raw = (settings or {}).get("thresholds") or {}
+    for key in base:
+        value = raw.get(key)
+        if isinstance(value, (int, float)) and value >= 0:
+            base[key] = int(value)
+    return base
 
 
 def stock_norm_days(settings: dict | None) -> int:
@@ -754,11 +772,19 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
         ).all()
     )
 
-    # Продажи за 30 дней (сводка дашборда).
+    # Продажи за 30 дней (сводка дашборда и Telegram-дайджест).
+    #
+    # Единственный запрос снапшота, который раньше шёл БЕЗ join'а к товарам —
+    # то есть считал упаковку, сертификаты и пробники, выброшенные отовсюду
+    # ещё (BUSINESS_LOGIC §9.1). На демо-каталоге исключение двух позиций
+    # меняло всё («позиций», «штук на складе», «оборачиваемость»), кроме этой
+    # карточки: в ней оставались 13 шт и 15 353 ₽ несуществующих продаж.
+    # У клиента с сертификатами и пакетами ошибка на порядки больше.
     sold30_qty, sold30_rev = db.execute(
-        select(func.coalesce(func.sum(sign_qty), 0), func.coalesce(func.sum(sign_rev), 0)).where(
-            Sale.org_id == org.id, Sale.date >= cutoff30
-        )
+        select(func.coalesce(func.sum(sign_qty), 0), func.coalesce(func.sum(sign_rev), 0))
+        .select_from(Sale)
+        .join(Product, join_sales)
+        .where(Sale.org_id == org.id, Sale.date >= cutoff30)
     ).one()
 
     # «Едет к нам» = локальные заказы/ручные правки (qty) + документы
@@ -791,12 +817,16 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
     # Позиция без записи в production_assign — на основном производстве;
     # пустой срок у производства = «как в общих настройках».
     default_lead = prod_lead_by_id.get(main_prod_id) or lead_time
+    # Срок берётся по ИТОГОВОМУ распределению — правило плюс ручные пины, — а
+    # не по одним ручным записям. Раньше здесь читался только ProductionAssign,
+    # и позиция, отданная цеху ПРАВИЛОМ, считала прогнозный остаток по общему
+    # сроку организации, показывая при этом на экране срок цеха (BUSINESS_LOGIC
+    # §9.5). Замер на демо-каталоге: 21 позиция из 42, потребность занижена на
+    # 357 815 ₽; на серьге — 96 шт при ручном назначении против 72 при том же
+    # цехе, назначенном правилом. Экран при этом в обоих случаях писал «90 дн».
     lead_by_base = {
         base: (prod_lead_by_id.get(int(pid)) or lead_time)
-        for base, pid in db.execute(
-            select(ProductionAssign.base_name, ProductionAssign.production_id)
-            .where(ProductionAssign.org_id == org.id)
-        ).all()
+        for base, pid in assign_rules.effective_assign(db, org).items()
         if int(pid) in prod_lead_by_id  # запись на удалённый цех = основное
     }
 
@@ -1273,6 +1303,12 @@ def money_totals(items: list[dict]) -> dict:
         "stock_sale": stock_sale,
         "stock_sale_basis": BASIS_AVG_SALE,
         "stock_margin": stock_margin,
+        # База процента — не «Если продать остаток» с соседней карточки, а
+        # сумма по позициям С себестоимостью. Отдаём её числом, чтобы экран
+        # печатал процент от того, что реально в знаменателе: раньше рядом с
+        # «53% от цены продажи» стояла ДРУГАЯ сумма, и деление не сходилось
+        # (D-13: каждая сумма подписана своей базой).
+        "stock_margin_base": stock_sale_with_cost,
         "stock_margin_pct": (
             round(stock_margin / stock_sale_with_cost, 3)
             if stock_sale_with_cost > 0
@@ -1874,6 +1910,9 @@ def build_turnover(snap: dict) -> dict:
         # число обязано приехать с сервера — иначе настройка меняется, а
         # страница продолжает делить на 90.
         "stock_norm_days": stock_norm_days(snap.get("settings")),
+        # Пороги классов организации: значок класса стоит в каждой строке, а
+        # его подсказка называла зашитые в код числа. См. stock_thresholds.
+        "thresholds": stock_thresholds(snap.get("settings")),
         # coverage_start/season_covered — чтобы таблица гасила сезонные колонки,
         # не покрытые загруженной историей (sea[s] = null), а не рисовала
         # «0 ₽/день».
@@ -1986,6 +2025,12 @@ def build_active_stock(snap: dict) -> dict:
         # числу (иначе получается ровно то, чего мы не хотим: цифра выглядит
         # точной и при этом не сообщает, от чего она посчитана).
         "stock_norm_days": norm,
+        # Пороги классов организации. Отдаём по той же причине, что и норму
+        # запаса: они настраиваются, а подписи «> 5 000 ₽/день» были зашиты
+        # в вёрстку. После смены порогов класс менялся у большинства позиций,
+        # а надписи на карточках не двигались ни на символ — экран прямо
+        # противоречил расчёту.
+        "thresholds": stock_thresholds(snap.get("settings")),
         # деньги: тот же свод, что на «Оборачиваемости» (сходится до рубля)
         "money": money_totals(live),
         "money_by_category": _money_by_category(live),

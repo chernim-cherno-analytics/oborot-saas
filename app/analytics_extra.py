@@ -38,7 +38,14 @@ from sqlalchemy.orm import Session
 
 from app.analytics import BASIS_AVG_SALE, RATE_WINDOW_RU
 from app.categories import ru_category
-from app.models import Product, Sale, SkuHidden, StockDay
+from app.models import (
+    CategoryMerge,
+    Product,
+    Sale,
+    SkuCategoryOverride,
+    SkuHidden,
+    StockDay,
+)
 
 FRESH_DAYS = 90        # бюджет: окно «свежих» продаж
 NEED_MIN = 3           # бюджет: минимальная потребность, шт
@@ -825,6 +832,42 @@ def build_sizes_calc(
 REVENUE_MONTHS = 18
 
 
+def _revenue_view(db: Session, org_id: int) -> tuple[dict, dict, set]:
+    """Пользовательский взгляд на каталог: слияния, переносы, ручной архив.
+
+    «Оборот» считал категории напрямую из МойСклада и не знал ни одного из
+    трёх пользовательских механизмов (BUSINESS_LOGIC §9.10). Владелец,
+    разложивший каталог по-своему на «Оборачиваемости», на «Обороте» видел
+    старую разбивку: на демо-данных после слияния «Худи и свитшоты» →
+    «Футболки» вторая категория показывала 6,1 млн ₽ вместо 19,2 млн —
+    расхождение в 3,13 раза, при том что деньги одни и те же.
+
+    Ручной архив («в архив» на «Оборачиваемости») тоже не читался: один клик
+    менял «выручку за год» на дашборде на 644 285 ₽, а на «Обороте» — нет.
+    Архив из МойСклада (`Product.archived`) не исключаем: он про карточку
+    товара, а не про решение владельца, и в дашбордных итогах ведёт себя
+    иначе — здесь важно совпасть с тем, что человек сделал руками.
+    """
+    merge = dict(db.execute(
+        select(CategoryMerge.from_category, CategoryMerge.to_category)
+        .where(CategoryMerge.org_id == org_id)
+    ).all())
+    override = dict(db.execute(
+        select(SkuCategoryOverride.base_name, SkuCategoryOverride.category)
+        .where(SkuCategoryOverride.org_id == org_id)
+    ).all())
+    hidden = {b for b, in db.execute(
+        select(SkuHidden.base_name).where(SkuHidden.org_id == org_id)).all()}
+    return merge, override, hidden
+
+
+def _revenue_category(raw, base: str, merge: dict, override: dict) -> str:
+    """Та же цепочка, что в снапшоте: русская категория → слияние → перенос."""
+    cat = ru_category(raw, base)
+    cat = merge.get(cat, cat)
+    return override.get(base, cat)
+
+
 def build_revenue(db: Session, org_id: int, date_from: str, date_to: str) -> dict:
     sign_qty = case((Sale.is_return, -Sale.qty), else_=Sale.qty)
     sign_rev = case((Sale.is_return, -Sale.revenue), else_=Sale.revenue)
@@ -833,6 +876,7 @@ def build_revenue(db: Session, org_id: int, date_from: str, date_to: str) -> dic
         Product.org_id == org_id,
         Product.excluded.is_(False),
     )
+    cat_merge, cat_override, hidden_set = _revenue_view(db, org_id)
 
     # Позиции за период (нетто по базовым именам).
     rows = db.execute(
@@ -852,11 +896,13 @@ def build_revenue(db: Session, org_id: int, date_from: str, date_to: str) -> dic
     total_qty = total_rev = 0.0
     cats: dict[str, dict] = {}
     for base, category, q, r in rows:
+        if base in hidden_set:
+            continue  # «в архив» руками — позиция выбыла из отчётности везде
         q = float(q or 0)
         r = float(r or 0)
         if q == 0 and r == 0:
             continue
-        cat = ru_category(category, base)
+        cat = _revenue_category(category, base, cat_merge, cat_override)
         items.append({"base_name": base, "category": cat,
                       "qty": round(q), "rev": round(r)})
         total_qty += q
@@ -893,17 +939,21 @@ def build_revenue(db: Session, org_id: int, date_from: str, date_to: str) -> dic
             y, m = y - 1, 12
     months.reverse()
     month_col = func.substr(Sale.date, 1, 7)
+    # Группируем по базовому имени, а не по сырой категории: перенос позиции
+    # (`SkuCategoryOverride`) задан именно по имени, и без него помесячный
+    # график разошёлся бы с блоком категорий на той же странице.
     month_rows = db.execute(
-        select(month_col, func.max(Product.category), func.sum(sign_rev))
+        select(month_col, Product.base_name, func.max(Product.category),
+               func.sum(sign_rev))
         .select_from(Sale)
         .join(Product, join_products)
         .where(Sale.org_id == org_id, month_col >= months[0])
-        .group_by(month_col, Product.category)
+        .group_by(month_col, Product.base_name)
     ).all()
     by_month: dict[str, dict[str, float]] = {mm: {} for mm in months}
-    for mm, category, r in month_rows:
-        if mm in by_month:
-            cat = ru_category(category)  # разные raw могут слиться в одну русскую
+    for mm, base, category, r in month_rows:
+        if mm in by_month and base not in hidden_set:
+            cat = _revenue_category(category, base, cat_merge, cat_override)
             by_month[mm][cat] = by_month[mm].get(cat, 0.0) + float(r or 0)
     monthly = [
         {"month": mm,

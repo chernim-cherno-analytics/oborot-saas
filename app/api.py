@@ -1444,11 +1444,12 @@ def apply_production_rules(db: Session, org_id: int, data: dict) -> dict:
     cond = production_conditions(db, org_id)
     items = data.get("items") or []
     # Считает ли аналитика прогноз остатка/стокаут по сроку КОНКРЕТНОГО
-    # производства: признак — она сама вернула срок у позиции. Пока нет —
-    # страница «Заказа» не выдаёт срок подрядчика за срок, по которому
-    # посчитан прогнозный остаток (см. отчёт: правка в app/analytics.py).
-    data["lead_time_by_production"] = bool(items) and all(
-        "lead_time_days" in it for it in items
+    # производства. Раньше признаком было «аналитика вернула поле срока», а
+    # она возвращает его ВСЕГДА — флаг подтверждал то, чего не было, и
+    # страница по нему переключала подписи. Теперь это правда: аналитика
+    # берёт срок по итоговому распределению (правило + рука), см. §9.5.
+    data["lead_time_by_production"] = bool(items) and any(
+        int(it.get("lead_time_days") or 0) != default_lead for it in items
     )
     for item in items:
         prod = cond["by_id"].get(cond["assign"].get(item["base_name"], cond["main_id"]))

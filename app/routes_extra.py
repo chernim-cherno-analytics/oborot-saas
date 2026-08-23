@@ -846,7 +846,11 @@ def export_replenish_xlsx_selected(
     про галочки вообще). Снятые вручную позиции не пропадают молча — они
     переезжают на лист «Не вошло и почему» со своей причиной.
     """
-    data = _replenish_export_data(db, ctx.org, body.base_names)
+    # Пустой список = «отмечено всё» (полная выгрузка). Раньше в этом случае
+    # страница уходила по location.href на GET-версию, и при истёкшей сессии
+    # человека уносило со страницы на голый JSON вместе с несохранённой
+    # работой. Теперь оба случая идут одним путём — через тело POST.
+    data = _replenish_export_data(db, ctx.org, body.base_names or None)
     wb = export_xlsx.replenish_workbook(ctx.org.name, data)
     return export_xlsx.xlsx_response(wb, "Что заказать.xlsx", "replenish.xlsx")
 
