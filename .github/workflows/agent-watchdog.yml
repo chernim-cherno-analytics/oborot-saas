@@ -18,7 +18,7 @@ jobs:
     permissions:
       actions: write
       issues: write
-      pull-requests: read
+      pull-requests: write
     steps:
       - name: Restart lost or stale handoffs
         uses: actions/github-script@v7
