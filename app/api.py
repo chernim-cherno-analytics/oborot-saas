@@ -482,13 +482,62 @@ def _receipt_rows(db: Session, org_id: int, order_id: int) -> list[OrderReceipt]
     ).scalars())
 
 
-def _received_by_base(rows: list[OrderReceipt]) -> dict[str, float]:
-    """Принято по каждой позиции. Складывается, а не берётся последнее:
-    приёмок по одному заказу бывает несколько, и исправление ошибки —
-    компенсирующая строка с минусом, а не правка старой."""
+def _totals_by_source(
+    rows: list[OrderReceipt], *, precision: str | None = None,
+) -> dict[str, dict[str, float]]:
+    """Накопленные наблюдения каждого источника по каждой позиции.
+
+    Строки одного источника — дельты и складываются. Разные источники здесь
+    намеренно НЕ складываются: ручная приёмка, ``shipped`` заказа и будущий
+    документ supply могут описывать один и тот же физический приход.
+    """
+    out: dict[str, dict[str, float]] = {}
+    for row in rows:
+        if precision is not None and row.precision != precision:
+            continue
+        by_base = out.setdefault(row.source, {})
+        # Нулевой факт важен: явно подтверждённое «приехало 0» отличается от
+        # отсутствия строки, поэтому ключ сохраняется и при qty == 0.
+        by_base[row.base_name] = by_base.get(row.base_name, 0.0) + float(row.qty or 0)
+    return out
+
+
+def _reconciled_received(rows: list[OrderReceipt]) -> tuple[
+    dict[str, float], dict[str, dict[str, float]], list[str], list[str]
+]:
+    """Подтверждённое исполнение без двойного счёта разных источников.
+
+    ``whole_order`` — допущение, а не подтверждение количества, поэтому в
+    executed не входит. Внутри источника складываем дельты; между источниками
+    берём максимум. Это доказуемый нижний предел при неизвестном пересечении:
+    сложить источники означало бы без доказательства объявить одно наблюдение
+    двумя поставками. Пересечение и численное расхождение возвращаются явно.
+    """
+    by_source = _totals_by_source(rows, precision="by_position")
+    observations: dict[str, list[tuple[str, float]]] = {}
+    for source, by_base in by_source.items():
+        for base, qty in by_base.items():
+            observations.setdefault(base, []).append((source, qty))
+
+    reconciled: dict[str, float] = {}
+    overlaps: list[str] = []
+    conflicts: list[str] = []
+    for base, values in observations.items():
+        reconciled[base] = max(qty for _, qty in values)
+        if len(values) > 1:
+            overlaps.append(base)
+            rounded = {round(qty, 6) for _, qty in values}
+            if len(rounded) > 1:
+                conflicts.append(base)
+    return reconciled, by_source, sorted(overlaps), sorted(conflicts)
+
+
+def _assumed_by_base(rows: list[OrderReceipt]) -> dict[str, float]:
+    """Неподтверждённые количества из отметки «заказ получен целиком»."""
     out: dict[str, float] = {}
-    for r in rows:
-        out[r.base_name] = out.get(r.base_name, 0.0) + float(r.qty or 0)
+    for by_base in _totals_by_source(rows, precision="whole_order").values():
+        for base, qty in by_base.items():
+            out[base] = out.get(base, 0.0) + qty
     return out
 
 
@@ -510,7 +559,8 @@ def _ordered_by_base(order: ProductionOrder) -> dict[str, float]:
 
 def _receipts_out(db: Session, order: ProductionOrder) -> dict:
     rows = _receipt_rows(db, order.org_id, order.id)
-    by_base = _received_by_base(rows)
+    by_base, confirmed_by_source, overlaps, conflicts = _reconciled_received(rows)
+    assumed = _assumed_by_base(rows)
     ordered = _ordered_by_base(order)
     lines = []
     for base, qty in ordered.items():
@@ -519,6 +569,7 @@ def _receipts_out(db: Session, order: ProductionOrder) -> dict:
             "base_name": base,
             "ordered_qty": round(qty, 3),
             "received_qty": round(got, 3),
+            "assumed_qty": round(assumed.get(base, 0.0), 3),
             "diff": round(got - qty, 3),
         })
     # Позиции, которых в заказе не было, а в приёмке есть (подрядчик прислал
@@ -527,17 +578,28 @@ def _receipts_out(db: Session, order: ProductionOrder) -> dict:
     for base, got in by_base.items():
         if base not in ordered:
             lines.append({"base_name": base, "ordered_qty": 0.0,
-                          "received_qty": round(got, 3), "diff": round(got, 3)})
-    unknown = ms_writeback.is_pushed(order.ms_doc_href) and not rows
+                          "received_qty": round(got, 3),
+                          "assumed_qty": round(assumed.get(base, 0.0), 3),
+                          "diff": round(got, 3)})
+    # Допущение тоже показываем построчно, даже если подтверждённого факта нет.
+    for base, qty in assumed.items():
+        if base not in ordered and base not in by_base:
+            lines.append({"base_name": base, "ordered_qty": 0.0,
+                          "received_qty": 0.0, "assumed_qty": round(qty, 3),
+                          "diff": 0.0})
+    missing = sorted(base for base in ordered if base not in by_base)
+    fully_confirmed = bool(ordered) and not missing
     return {
         "order_id": order.id,
         "status": order.status,
         "ordered_total": round(sum(ordered.values()), 3),
         "received_total": round(sum(by_base.values()), 3),
-        "confirmed": bool(rows),
-        # Заказ ушёл в МойСклад, приёмок оттуда нет: принятое неизвестно.
-        # Ноль в received_total здесь означает «не знаем», а не «не приехало».
-        "execution_unknown": unknown,
+        "assumed_total": round(sum(assumed.values()), 3),
+        "confirmed": fully_confirmed,
+        "has_confirmed_receipts": bool(by_base),
+        # Ноль без подтверждённой строки — «не знаем», а не «не приехало».
+        "execution_unknown": bool(missing),
+        "unknown_positions": missing,
         "sources": sorted({r.source for r in rows}),
         "precisions": sorted({r.precision for r in rows}),
         # Разбивка по источникам. Сумма двух источников по одной позиции —
@@ -548,6 +610,15 @@ def _receipts_out(db: Session, order: ProductionOrder) -> dict:
             src: round(sum(float(r.qty or 0) for r in rows if r.source == src), 3)
             for src in sorted({r.source for r in rows})
         },
+        "confirmed_by_source": {
+            src: round(sum(by_base.values()), 3)
+            for src, by_base in sorted(confirmed_by_source.items())
+        },
+        "reconciliation_policy": "max_confirmed_per_source",
+        "source_overlap": bool(overlaps),
+        "source_overlap_positions": overlaps,
+        "source_conflict": bool(conflicts),
+        "source_conflict_positions": conflicts,
         "lines": sorted(lines, key=lambda x: x["base_name"]),
         # Сводка (`lines`) считается по ВСЕМ строкам, а список показывается
         # последними MAX_RECEIPTS_OUT: история приёмок растёт линейно, и
@@ -560,6 +631,7 @@ def _receipts_out(db: Session, order: ProductionOrder) -> dict:
             "at": r.at.isoformat() if r.at else None,
             "source": r.source,
             "precision": r.precision,
+            "confirmed": r.precision == "by_position",
             "created_by": r.created_by,
         } for r in rows[-MAX_RECEIPTS_OUT:]],
         "receipts_total": len(rows),
@@ -570,13 +642,14 @@ def _receipts_out(db: Session, order: ProductionOrder) -> dict:
 def _add_receipts(
     db: Session, order: ProductionOrder, items: dict[str, float], *,
     source: str, precision: str, user_id: int | None = None, source_ref: str = "",
+    keep_zero: bool = False,
 ) -> int:
     """Дописывает строки приёмки. Только пополнение — ничего не перезаписывает."""
     now = datetime.utcnow()
     added = 0
     for base, qty in items.items():
         value = float(qty or 0)
-        if value == 0:
+        if value == 0 and not keep_zero:
             continue
         db.add(OrderReceipt(
             org_id=order.org_id, order_id=order.id, base_name=base,
@@ -714,16 +787,19 @@ def _record_execution(db: Session, ctx: AuthContext, order: ProductionOrder,
                 lines[name] = lines.get(name, 0.0) + float(line.qty)
         if lines:
             _add_receipts(db, order, lines, source="manual",
-                          precision="by_position", user_id=ctx.user.id)
+                          precision="by_position", user_id=ctx.user.id,
+                          keep_zero=True)
             return
     # Пустой список — это не «принято ноль», а «количества не назвали»:
     # трактуем как обычную отметку и не оставляем заказ без факта исполнения.
     if ms_writeback.is_pushed(order.ms_doc_href):
         return
-    already = _received_by_base(_receipt_rows(db, ctx.org.id, order.id))
+    rows = _receipt_rows(db, ctx.org.id, order.id)
+    confirmed, _, _, _ = _reconciled_received(rows)
+    assumed = _assumed_by_base(rows)
     rest: dict[str, float] = {}
     for base, qty in _ordered_by_base(order).items():
-        left = round(qty - already.get(base, 0.0), 3)
+        left = round(qty - confirmed.get(base, 0.0) - assumed.get(base, 0.0), 3)
         if left > 0:
             rest[base] = left
     if rest:
@@ -771,7 +847,8 @@ def api_order_receipts_add(
     if not lines:
         raise HTTPException(status_code=422, detail="Не переданы позиции приёмки.")
     added = _add_receipts(db, order, lines, source="manual",
-                          precision="by_position", user_id=ctx.user.id)
+                          precision="by_position", user_id=ctx.user.id,
+                          keep_zero=True)
     db.commit()
     return {"ok": True, "added": added, **_receipts_out(db, order)}
 
@@ -2402,39 +2479,20 @@ def api_order_plan_outcome(
         if candidate is not None and candidate.org_id == ctx.org.id:
             order = candidate
     received: dict[str, float] = {}
-    order_received = False
-    execution_unknown = False
     if order is not None:
         rows = _receipt_rows(db, ctx.org.id, order.id)
-        received = _received_by_base(rows)
-        # Заказ, ушедший в МойСклад, исполняется машинным источником: отметка
-        # «принят» по нему допущения не пишет (иначе двойной счёт). Если при
-        # этом МойСклад ничего не прислал — а на боевых данных «отгружено»
-        # заполнено у нуля позиций из 69, — то принятое нам НЕИЗВЕСТНО.
-        # Показать здесь ноль значило бы утверждать «заказали 65, приехало 0»:
-        # подтверждённую недостачу, которой не было.
-        # Признак «не знаем» действует ПОСТРОЧНО, а не на заказ целиком.
-        # МойСклад заполняет «отгружено» по частям: одна пришедшая позиция
-        # переводила остальные 28 из «неизвестно» в утверждение «приехало
-        # ничего», и итог «2 из 65» читался как факт. Для заказа, ушедшего
-        # в МС, молчание источника по позиции — это молчание, а не ноль.
-        by_machine = ms_writeback.is_pushed(order.ms_doc_href)
-        execution_unknown = by_machine and not rows
-        order_received = order.status == "received" and not by_machine
-    confirmed = bool(received) or order_received
+        received, _, _, _ = _reconciled_received(rows)
 
     def _executed(base: str):
         """Сколько принято ПО ЭТОЙ позиции. None — неизвестно.
 
-        Ноль ставится только тогда, когда заказ закрыт как принятый ЧЕЛОВЕКОМ
-        и исполнение по нему принадлежит нам: тогда «по этой позиции не
-        приехало ничего» — утверждение, а не пробел. Пока заказ едет — и
-        всегда для заказа, исполнение которого приходит из МойСклада, —
-        отсутствие строки означает «ещё не знаем».
+        Ноль существует только как отдельная подтверждённая строка qty=0.
+        Сам статус ``received`` количества не доказывает: отсутствие строки
+        всегда означает «не знаем», независимо от ручного или машинного пути.
         """
         if base in received:
             return round(received[base], 3)
-        return 0.0 if order_received else None
+        return None
 
     def _line(base: str, recommended, decided: float) -> dict:
         return {
@@ -2460,6 +2518,10 @@ def api_order_plan_outcome(
 
     edited = sum(1 for x in lines
                  if x["recommended"] is not None and x["recommended"] != x["decided"])
+    execution_confirmed = bool(lines) and all(x["executed"] is not None for x in lines)
+    execution_unknown = bool(
+        order is not None and order.status == "received" and not execution_confirmed
+    )
     return {
         "plan_id": row.id,
         "order_id": order.id if order is not None else None,
@@ -2468,9 +2530,9 @@ def api_order_plan_outcome(
         "received_at": (order.received_at.isoformat()
                         if order is not None and order.received_at else None),
         "lead_time_fact_days": _lead_time_fact(order) if order is not None else None,
-        "execution_confirmed": confirmed,
-        # Заказ закрыт, но чем он закрыт — мы не знаем: он ушёл в МойСклад,
-        # а «отгружено» оттуда не пришло. Это не «приехало ноль».
+        "execution_confirmed": execution_confirmed,
+        # Статус закрыт, но количество хотя бы одной позиции не подтверждено.
+        # Это не «приехало ноль» и не зависит от источника исполнения.
         "execution_unknown": execution_unknown,
         "positions": len(lines),
         "edited_by_human": edited,
@@ -2677,4 +2739,3 @@ def api_production_setup(
     db.commit()
     analytics.invalidate(ctx.org.id)
     return _production_out(p, analytics.extra_settings(ctx.org)["lead_time_days"])
-

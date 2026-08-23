@@ -20,7 +20,7 @@ sent → received`, но ни дат переходов, ни принятого
   1) даты переходов пишутся, фактический срок производства считается;
   2) обратная ссылка заказ → план (у плана ссылка на заказ уже была);
   3) отметка «принят» без деталей = допущение (precision=whole_order),
-     с деталями = подтверждение (by_position) — и они различимы в выдаче;
+     которое НЕ входит в executed; с деталями = подтверждение (by_position);
   4) таблица приёмок ТОЛЬКО пополняется: исправление — компенсирующая строка
      с минусом, обе остаются в истории;
   5) частичный приход и довоз складываются, а не перезаписываются;
@@ -221,8 +221,8 @@ def run() -> int:  # noqa: C901 — сценарный тест, ветвлен�
     check("outcome отдаёт строки", out.get("positions", 0) > 0, str(out)[:160])
     check("outcome знает заказ", out.get("order_id") == order_id)
     check("строки плана есть", len(out["lines"]) > 0, str(len(out["lines"])))
-    check("исполнение подтверждено — приёмки записаны вручную",
-          out.get("execution_confirmed") is True, str(out.get("execution_confirmed")))
+    check("частичное исполнение не выдаётся за подтверждение всего заказа",
+          out.get("execution_confirmed") is False, str(out.get("execution_confirmed")))
     # Приёмка была записана по ОДНОЙ позиции (и по одной, которой в заказе нет).
     # Остальные позиции ещё едут: у них исполнение обязано быть неизвестно,
     # а не нулём. Раньше одна частичная приёмка обнуляла ВСЕ строки, и цифры
@@ -278,7 +278,12 @@ def run() -> int:  # noqa: C901 — сценарный тест, ветвлен�
     r = c2.post(f"/api/orders/{order2}/status", json={"status": "received"})
     check("заказ принят одним кликом", r.status_code == 200, r.text[:150])
     got2 = c2.get(f"/api/orders/{order2}/receipts").json()
-    check("количества взяты из заказа", got2["received_total"] == 10, str(got2["received_total"]))
+    check("допущение не выдано за фактически принятое",
+          got2["received_total"] == 0, str(got2["received_total"]))
+    check("количество из заказа видно отдельно как допущение",
+          got2["assumed_total"] == 10, str(got2["assumed_total"]))
+    check("исполнение неизвестно, пока количество не подтверждено",
+          got2["execution_unknown"] is True, str(got2["execution_unknown"]))
     check("и помечены как допущение, а не подтверждение",
           got2["precisions"] == ["whole_order"], str(got2["precisions"]))
     body2 = c2.get(f"/api/orders/{order2}").json()
@@ -301,6 +306,24 @@ def run() -> int:  # noqa: C901 — сценарный тест, ветвлен�
           str(got3["precisions"]))
     line3 = got3["lines"][0]
     check("недостача видна в сверке", line3["diff"] == -3, str(line3))
+
+    print("\n== Явно подтверждённый ноль отличается от неизвестного ==")
+    r = c2.post("/api/orders", json={"name": "Нулевая приёмка", "items": [
+        {"base_name": name2, "qty": 10, "sizes": {}, "cost": 100},
+    ]})
+    order_zero = r.json().get("id")
+    c2.post(f"/api/orders/{order_zero}/status", json={"status": "sent"})
+    r = c2.post(f"/api/orders/{order_zero}/status", json={
+        "status": "received", "received": [{"base_name": name2, "qty": 0}]})
+    check("человек может подтвердить, что не приехало ничего",
+          r.status_code == 200, r.text[:150])
+    got_zero = c2.get(f"/api/orders/{order_zero}/receipts").json()
+    check("нулевой факт сохранён отдельной строкой",
+          len(got_zero["receipts"]) == 1 and got_zero["receipts"][0]["qty"] == 0,
+          str(got_zero["receipts"]))
+    check("подтверждённый ноль не помечен как unknown",
+          got_zero["confirmed"] is True and got_zero["execution_unknown"] is False,
+          str(got_zero)[:180])
 
     print("\n== Приёмки не протекают между организациями ==")
     r = c2.get(f"/api/orders/{order_id}/receipts")
@@ -384,6 +407,30 @@ def run() -> int:  # noqa: C901 — сценарный тест, ветвлен�
     check("источники видны раздельно", got["by_source"] == {"ms_order_shipped": 10.0},
           str(got.get("by_source")))
 
+    print("\n== Сверка источников: наблюдения не складываются в поставки ==")
+    c3.post(f"/api/orders/{oid_pushed}/receipts",
+            json={"lines": [{"base_name": name3, "qty": 6}]})
+    con = sqlite3.connect(DB_PATH)
+    try:
+        con.execute(
+            "INSERT INTO order_receipts (org_id, order_id, base_name, qty, at, source,"
+            " precision, source_ref, created_at) VALUES (3,?,?,12,'2026-08-23 00:00:00',"
+            " 'ms_supply','by_position','supply-1','2026-08-23 00:00:00')",
+            (oid_pushed, name3))
+        con.commit()
+    finally:
+        con.close()
+    got = c3.get(f"/api/orders/{oid_pushed}/receipts").json()
+    check("три наблюдения 6, 10 и 12 не превращены в вымышленное 28",
+          got["received_total"] == 12, str(got))
+    check("каждый исходный источник остаётся виден",
+          got["confirmed_by_source"] == {
+              "manual": 6.0, "ms_order_shipped": 10.0, "ms_supply": 12.0},
+          str(got.get("confirmed_by_source")))
+    check("пересечение и расхождение источников названы прямо",
+          got["source_overlap"] is True and got["source_conflict"] is True
+          and got["source_conflict_positions"] == [name3], str(got)[:220])
+
     # (б) Частичный приход, потом «Принят» одним кликом: дописывается ОСТАТОК,
     # а не ноль. Раньше заказ навсегда закрывался недостачей, которой не было.
     oid_part = make_order(c3, 10, "Частичный")
@@ -391,8 +438,10 @@ def run() -> int:  # noqa: C901 — сценарный тест, ветвлен�
             json={"lines": [{"base_name": name3, "qty": 3}]})
     c3.post(f"/api/orders/{oid_part}/status", json={"status": "received"})
     got = c3.get(f"/api/orders/{oid_part}/receipts").json()
-    check("после частичного прихода «принят» дописывает остаток до заказанного",
-          got["received_total"] == 10, str(got["received_total"]))
+    check("подтверждённым остаётся только названное человеком количество",
+          got["received_total"] == 3, str(got["received_total"]))
+    check("остаток до заказанного хранится отдельно как допущение",
+          got["assumed_total"] == 7, str(got["assumed_total"]))
     check("и обе точности видны в истории",
           got["precisions"] == ["by_position", "whole_order"], str(got["precisions"]))
 
@@ -402,8 +451,10 @@ def run() -> int:  # noqa: C901 — сценарный тест, ветвлен�
                 json={"status": "received", "received": []})
     check("пустой список принят", r.status_code == 200, r.text[:120])
     got = c3.get(f"/api/orders/{oid_empty}/receipts").json()
-    check("заказ не остался без факта исполнения", got["received_total"] == 10,
-          str(got["received_total"]))
+    check("пустой список не выдал количество заказа за факт",
+          got["received_total"] == 0, str(got["received_total"]))
+    check("количество заказа осталось видимым как допущение",
+          got["assumed_total"] == 10, str(got["assumed_total"]))
     r = c3.post(f"/api/orders/{oid_empty}/receipts",
                 json={"lines": [{"base_name": "   ", "qty": 5}]})
     check("имя из одних пробелов отклоняется, а не глотается молча",
@@ -418,8 +469,10 @@ def run() -> int:  # noqa: C901 — сценарный тест, ветвлен�
     got = c3.get(f"/api/orders/{oid_race}/receipts").json()
     check("шесть одновременных «Принят» приняты сервером",
           all(x == 200 for x in codes), str(codes))
-    check("двойной клик не удваивает приёмку", got["received_total"] == 10,
-          str(got["received_total"]))
+    check("двойной клик не создаёт подтверждённое количество",
+          got["received_total"] == 0, str(got["received_total"]))
+    check("двойной клик не удваивает допущение",
+          got["assumed_total"] == 10, str(got["assumed_total"]))
     check("и не удваивает строки", len(got["receipts"]) == 1, str(len(got["receipts"])))
 
     # (д) Удаление заказа уносит его приёмки: id в SQLite переиспользуется,
