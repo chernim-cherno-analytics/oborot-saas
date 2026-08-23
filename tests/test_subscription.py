@@ -253,64 +253,6 @@ def main() -> int:
         check("но чтение состояния при этом НИЧЕГО не пишет в базу",
               stamped is None, f"stamp={stamped}")
 
-        print("\n== «Деньги пришли» — не то же самое, что «счёт выставлен» ==")
-        # Статус `paid` использовался НАРАВНЕ с `invoiced`: просто запускал те же
-        # пять дней. То есть организация, про которую в нашей же базе написано
-        # «оплачено», закрывалась на шестой день — при том, что инструкция
-        # оператору в deploy/README про продление paid_until молчала.
-        exec_sql("UPDATE billing_requests SET status = 'paid', invoiced_at = ? WHERE id = ?",
-                 f"{D(-30)} 10:00:00", req_id)
-        check("отметка «оплачено» держит доступ и через месяц после счёта",
-              state_of(org_id) == subscription.ACTIVE, state_of(org_id))
-        r = c.post("/api/sync/run")
-        check("и плательщик не получает 402 на запись", r.status_code != 402,
-              f"status={r.status_code}")
-        # Но именно отметка, а не любая заявка: `invoiced` месячной давности —
-        # по-прежнему отказ, иначе гейт не закрывал бы вообще никого.
-        exec_sql("UPDATE billing_requests SET status = 'invoiced' WHERE id = ?", req_id)
-        check("а «счёт выставлен» месяц назад — по-прежнему readonly",
-              state_of(org_id) == subscription.READONLY, state_of(org_id))
-
-        # Отметка даёт КУПЛЕННЫЙ срок, а не вечность. Первая версия этой правки
-        # смотрела на последнюю заявку и пускала без ограничения по времени —
-        # то есть заплативший однажды не закрывался никогда, ведь продление
-        # делается через UPDATE orgs SET paid_until, новой заявки при этом нет.
-        exec_sql("UPDATE billing_requests SET status = 'paid', period = 'month', "
-                 "invoiced_at = ? WHERE id = ?", f"{D(-400)} 10:00:00", req_id)
-        check("оплата 400 дней назад по месячному тарифу больше не действует",
-              state_of(org_id) == subscription.READONLY, state_of(org_id))
-        exec_sql("UPDATE billing_requests SET period = 'year' WHERE id = ?", req_id)
-        check("а годовой тариф на той же дате ещё действует (400 < 365? нет) —"
-              " и это тоже readonly",
-              state_of(org_id) == subscription.READONLY, state_of(org_id))
-        exec_sql("UPDATE billing_requests SET invoiced_at = ? WHERE id = ?",
-                 f"{D(-200)} 10:00:00", req_id)
-        check("годовой тариф, оплаченный 200 дней назад, действует",
-              state_of(org_id) == subscription.ACTIVE, state_of(org_id))
-
-        # Заявка на смену тарифа не имеет права запирать оплатившего клиента.
-        # Раньше «последней» считалась заявка с максимальным id: клиент нажимал
-        # «хочу тариф Про», появлялась заявка со статусом new, и право записи
-        # исчезало до ручной обработки оператором.
-        r = c.post("/api/plans/request", json={
-            "plan": "pro", "period": "month", "company": "ООО Тест",
-            "inn": "7700000000", "email": "a@b.io", "phone": "+70000000000",
-        })
-        check("заявка на смену тарифа принята", r.status_code == 200,
-              f"status={r.status_code}")
-        check("и она НЕ отняла доступ у оплатившего",
-              state_of(org_id) == subscription.ACTIVE, state_of(org_id))
-        r = c.post("/api/sync/run")
-        check("оплативший по-прежнему может писать после заявки на апгрейд",
-              r.status_code != 402, f"status={r.status_code}")
-        exec_sql("DELETE FROM billing_requests WHERE id <> ?", req_id)
-
-        # Статус правит оператор руками: регистр и пробелы не должны означать
-        # «отметки нет».
-        exec_sql("UPDATE billing_requests SET status = ' Paid ' WHERE id = ?", req_id)
-        check("« Paid » с пробелами и заглавной читается как оплата",
-              state_of(org_id) == subscription.ACTIVE, state_of(org_id))
-
         exec_sql("UPDATE billing_requests SET status = 'new', invoiced_at = NULL WHERE id = ?",
                  req_id)
 

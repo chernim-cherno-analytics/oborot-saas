@@ -145,12 +145,19 @@ def main() -> int:
     live_bk = WORK / "live" / "backups"
     make_live_db(live)
 
+    # Держим writer открытым и отключаем auto-checkpoint: последнее изменение
+    # доказуемо остаётся в -wal во время backup.sh на любой поддерживаемой ОС.
+    wal_writer = sqlite3.connect(live)
+    wal_writer.execute("PRAGMA journal_mode=WAL")
+    wal_writer.execute("PRAGMA wal_autocheckpoint=0")
+    wal_writer.execute("UPDATE orgs SET name='Бэкап-бренд из WAL' WHERE id=1")
+    wal_writer.commit()
+
     print("\n== Снимок работающей базы ==")
-    # Данные лежат в -wal, основной файл почти пуст: именно здесь обычное
-    # копирование файла дало бы снимок без единой организации.
+    # Последнее подтверждённое изменение лежит в -wal: обычный cp его потеряет.
     wal = live.with_name(live.name + "-wal")
     check("база в режиме WAL, данные ещё не слиты в основной файл",
-          wal.exists() and wal.stat().st_size > live.stat().st_size,
+          wal.exists() and wal.stat().st_size > 0,
           f"db={live.stat().st_size} wal={wal.stat().st_size if wal.exists() else 0}")
 
     rc, out = sh(BACKUP, {"OBOROT_DB": live, "BACKUP_DIR": live_bk})
@@ -159,6 +166,7 @@ def main() -> int:
     check("в каталоге ровно один архив", len(gz) == 1, str(ls_dir(live_bk)))
     check("копия видит организацию из -wal", "orgs: 1" in out,
           [l for l in out.splitlines() if "orgs" in l][:1])
+    wal_writer.close()
 
     print("\n== Повреждённая база ==")
     bad = WORK / "bad" / "oborot.db"
@@ -231,9 +239,10 @@ def main() -> int:
           f"{dt:.1f} с")
 
     print("\n== Восстановление: рабочий путь ==")
-    venv = WORK / "venv"
-    (venv / "bin").mkdir(parents=True)
-    (venv / "bin" / "python").symlink_to(sys.executable)
+    # Используем настоящее окружение теста. Symlink одного python binary в
+    # пустой каталог на macOS заставляет interpreter принять каталог за venv,
+    # где нет uvicorn, хотя исходное окружение полностью установлено.
+    venv = Path(sys.executable).parent.parent
     rc, out = sh(RESTORE, {"BACKUP_DIR": live_bk, "OBOROT_VENV": venv,
                            "RESTORE_PORT": next_port()})
     check("копия развёрнута и приложение на ней стартовало", rc == 0, out[-300:])

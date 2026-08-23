@@ -160,18 +160,38 @@ bash deploy/backup.sh
 Ежедневная копия ночью, проверка восстановления — раз в неделю. Проверка
 поднимает приложение на порту 8099 и боевой сервис не трогает.
 
-### Копия вне машины — единственное, что осталось за Владом
+### Зашифрованная копия вне машины
 
-`BACKUP_REMOTE` в `/opt/oborot/env`, например:
+`backup.sh` и `restore_test.sh` оставлены как быстрая локальная страховка перед
+деплоем. От потери VPS защищает отдельная пара:
 
+- `backup_offsite.sh` снимает согласованный SQLite snapshot, проверяет его и
+  отправляет в уже созданный удалённый restic repository;
+- `restore_offsite.sh` действительно скачивает snapshot обратно, запускает на
+  нём приложение и проверяет `/health/ready`, не касаясь production БД;
+- общий lock не даёт backup и restore drill менять repository одновременно;
+- restic шифрует данные до отправки, хранит 14 daily, 8 weekly и 12 monthly.
+
+Одноразовая активация на VPS:
+
+```bash
+apt-get install -y restic sqlite3
+install -m 600 deploy/backup.env.example /opt/oborot/backup.env
+# заполнить RESTIC_REPOSITORY/credentials; repository должен быть вне VPS
+set -a; . /opt/oborot/backup.env; set +a
+restic init  # один раз, осознанно, не из backup script
+install -m 644 deploy/systemd/oborot-*.service deploy/systemd/oborot-*.timer \
+  /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now oborot-backup.timer oborot-restore-drill.timer
+systemctl start oborot-backup.service
+systemctl start oborot-restore-drill.service
 ```
-BACKUP_REMOTE=oborot@backup.example.com:/backups/oborot
-```
 
-Пока переменная не задана, `backup.sh` честно печатает, что копия лежит на том
-же диске, что и база, и от отказа диска не спасает. Нужен любой второй адрес:
-второй VPS, объектное хранилище с scp-совместимым доступом, домашняя машина.
-Плюс ключ без пароля для этого пользователя и права только на запись в каталог.
+Секреты лежат только в `/opt/oborot/backup.env` и password file с правами 600.
+Локальный backend намеренно запрещён: иначе каталог на том же VPS мог бы
+выглядеть как off-site защита. До выбора provider и успешного запуска обоих
+services на VPS операционный риск остаётся открытым.
 
 ### Проверить восстановление
 
@@ -190,7 +210,7 @@ bash deploy/restore_test.sh /path/to/копия.gz  # конкретная
 
 ### Почему у этих скриптов есть тест
 
-`tests/test_backup.py` гоняет оба скрипта по-настоящему: на базе в WAL, на
+`tests/test_backup.py` гоняет локальную пару по-настоящему: на базе в WAL, на
 намеренно повреждённой, на пустой, без клиента `sqlite3`, на битом архиве, на
 копии со старой схемой. Аварийные пути скрипта в обычной жизни не выполняются
 никогда — они нужны ровно в тот день, когда что-то сломалось, и до этого дня
@@ -201,3 +221,7 @@ bash deploy/restore_test.sh /path/to/копия.gz  # конкретная
 убивает скрипт прямо на присваивании) — и оставляла битую копию в ротации.
 Скрипт при этом синтаксически безупречен и на здоровой базе работает идеально.
 Нашлось это только исполнением; тест держит найденное.
+
+`tests/test_backup_offsite.py` отдельно доказывает remote upload, порядок
+retention, полный download, запуск приложения на восстановленной базе, запрет
+перезаписи production и fail-closed поведение при сбое repository.

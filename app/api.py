@@ -492,6 +492,11 @@ def _received_by_source(rows: list[OrderReceipt]) -> dict[str, dict[str, float]]
     """{base_name: {source: сколько принято по этому источнику}}."""
     out: dict[str, dict[str, float]] = {}
     for r in rows:
+        # Старые строки whole_order — это не измерение, а историческое
+        # допущение «раз заказ закрыт, вероятно приехало всё». Они остаются в
+        # журнале для аудита, но никогда не участвуют в фактическом исполнении.
+        if getattr(r, "precision", "by_position") == "whole_order":
+            continue
         per = out.setdefault(r.base_name, {})
         per[r.source] = per.get(r.source, 0.0) + float(r.qty or 0)
     return out
@@ -612,14 +617,17 @@ def _receipts_out(db: Session, order: ProductionOrder) -> dict:
     rows = _receipt_rows(db, order.org_id, order.id)
     by_base = _received_by_base(rows)
     ordered = _ordered_by_base(order)
+    conflicts = _source_conflicts(rows)
+    disputed = {item["base_name"] for item in conflicts}
     lines = []
     for base, qty in ordered.items():
-        got = by_base.get(base, 0.0)
+        known = base in by_base and base not in disputed
+        got = by_base.get(base)
         lines.append({
             "base_name": base,
             "ordered_qty": round(qty, 3),
-            "received_qty": round(got, 3),
-            "diff": round(got - qty, 3),
+            "received_qty": round(got, 3) if known else None,
+            "diff": round(got - qty, 3) if known else None,
         })
     # Позиции, которых в заказе не было, а в приёмке есть (подрядчик прислал
     # не то). Прятать их нельзя: это ровно тот случай, ради которого факт
@@ -627,7 +635,8 @@ def _receipts_out(db: Session, order: ProductionOrder) -> dict:
     for base, got in by_base.items():
         if base not in ordered:
             lines.append({"base_name": base, "ordered_qty": 0.0,
-                          "received_qty": round(got, 3), "diff": round(got, 3)})
+                          "received_qty": None if base in disputed else round(got, 3),
+                          "diff": None if base in disputed else round(got, 3)})
     # «Неизвестно» — это любая заказанная позиция без записанного факта
     # приёмки, независимо от того, ушёл заказ в МойСклад или нет.
     unknown = bool(set(ordered) - set(by_base))
@@ -643,13 +652,16 @@ def _receipts_out(db: Session, order: ProductionOrder) -> dict:
     # съезжаются под одно имя и выглядят как два свидетельства об одном
     # приходе. Считать их спором и сказать «неизвестно» — правильнее, чем
     # уверенно назвать число, которое получилось из склейки.
-    conflicts = _source_conflicts(rows)
     unknown = unknown or bool(conflicts)
     return {
         "order_id": order.id,
         "status": order.status,
         "ordered_total": round(sum(ordered.values()), 3),
-        "received_total": round(sum(by_base.values()), 3),
+        # Нельзя складывать известные позиции с неизвестными и выдавать
+        # частичную сумму за итог заказа. Сырые свидетельства доступны ниже в
+        # by_source/source_conflicts, а подтверждённый итог — либо число, либо
+        # честное null.
+        "received_total": None if unknown else round(sum(by_base.values()), 3),
         "confirmed": bool(rows) and not unknown,
         # Есть заказанные позиции без записанного факта приёмки: по ним
         # принятое НЕИЗВЕСТНО. Ноль в received_total по такой позиции
@@ -2867,4 +2879,3 @@ def api_production_setup(
     db.commit()
     analytics.invalidate(ctx.org.id)
     return _production_out(p, analytics.extra_settings(ctx.org)["lead_time_days"])
-
