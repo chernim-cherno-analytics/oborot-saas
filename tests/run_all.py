@@ -54,6 +54,7 @@ SUITES = [
     ("exec",        "test_execution.py",       False, False),
     ("consist",     "test_consistency.py",     False, False),
     ("ui",          "test_ui.py",              False, False),
+    ("backup",      "test_backup.py",          False, False),
 ]
 
 TOTAL_RE = re.compile(r"ИТОГО:\s*(\d+)\s*OK,\s*(\d+)\s*FAIL")
@@ -63,6 +64,10 @@ def run_one(idx: int, name: str, filename: str, needs_ms: bool, needs_tg: bool,
             timeout: int) -> dict:
     env = dict(os.environ)
     env["OBOROT_TEST_PORT"] = str(8811 + idx)
+    # Набор бэкапов поднимает приложение сам, скриптом restore_test.sh, — свой
+    # порт ему нужен отдельно, иначе при параллельном прогоне он столкнётся с
+    # приложением соседнего набора.
+    env["BACKUP_TEST_PORT"] = str(8861 + idx)
     if needs_ms:
         env["OBOROT_MOCK_PORT"] = str(9821 + idx)
     if needs_tg:

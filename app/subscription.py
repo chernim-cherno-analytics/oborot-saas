@@ -33,11 +33,11 @@ import logging
 import os
 from datetime import date, datetime, timedelta
 
-from fastapi import Depends, HTTPException
+from fastapi import Depends, HTTPException, Request
 from sqlalchemy import inspect, select, text
 from sqlalchemy.orm import Session
 
-from app.auth import AuthContext, require_auth_api
+from app.auth import AuthContext, require_auth_api, resolve_auth
 from app.db import engine, get_db, run_migration_step
 
 log = logging.getLogger("oborot.subscription")
@@ -137,7 +137,9 @@ def _grace_until(
     rows = db.execute(
         text(
             "SELECT id, invoiced_at FROM billing_requests "
-            "WHERE org_id = :org AND status IN ('invoiced', 'paid') "
+            # lower(trim(...)): статус правит оператор руками, и «Paid» или
+            # « paid » не должны означать «нет отметки».
+            "WHERE org_id = :org AND lower(trim(status)) IN ('invoiced', 'paid') "
             "ORDER BY id DESC LIMIT 1"
         ),
         {"org": org_id},
@@ -155,6 +157,60 @@ def _grace_until(
             db.commit()
         marked = today
     return marked + timedelta(days=GRACE_DAYS)
+
+
+def _paid_through(db: Session, org_id: int) -> date | None:
+    """Докуда организация оплачена по НАШИМ ЖЕ отметкам. None — отметок нет.
+
+    Зачем это нужно. Единственным доказательством оплаты для гейта было
+    `orgs.paid_until`, которое проставляется руками отдельной командой. Статус
+    заявки `paid` при этом использовался НАРАВНЕ с `invoiced` — то есть просто
+    запускал те же пять дней грейса. Организация, про которую в нашей же базе
+    написано «оплачено», закрывалась на шестой день; инструкция оператору в
+    deploy/README про продление `paid_until` при этом молчала.
+
+    Почему именно СРОК, а не флаг. Первая версия этой функции смотрела на
+    последнюю заявку и, если та `paid`, пускала без ограничения по времени. Это
+    оказалось хуже исходной ошибки, и ровно по двум причинам:
+
+      1) заплативший однажды не закрывался НИКОГДА — продление делается через
+         `UPDATE orgs SET paid_until`, новой заявки при этом не появляется;
+      2) «последняя заявка» ломалась от безобидного действия клиента: заявка на
+         смену тарифа создаётся со статусом `new` и становилась последней —
+         то есть оплативший клиент, нажав «хочу тариф Про», мгновенно терял
+         право записи.
+
+    Поэтому отметка `paid` даёт ровно тот срок, который клиент купил: месяц или
+    год от даты счёта. Это страховка на случай несведённого `paid_until`, а не
+    замена ему — и она сама истекает.
+    """
+    insp = inspect(db.get_bind())
+    if not insp.has_table("billing_requests"):
+        return None
+    cols = {c["name"] for c in insp.get_columns("billing_requests")}
+    if "invoiced_at" not in cols:
+        return None
+    rows = db.execute(
+        text(
+            "SELECT period, invoiced_at, created_at FROM billing_requests "
+            "WHERE org_id = :org AND lower(trim(status)) = 'paid'"
+        ),
+        {"org": org_id},
+    ).fetchall()
+    best: date | None = None
+    for period, invoiced_raw, created_raw in rows:
+        # Отметка о счёте надёжнее даты создания заявки, но и её оператор мог
+        # не проставить: тогда считаем от создания. Иначе оплаченная заявка без
+        # invoiced_at не давала бы вообще ничего — то есть отметка «оплачено»
+        # молча ничего не значила бы, ровно как раньше.
+        base = _as_date(invoiced_raw) or _as_date(created_raw)
+        if base is None:
+            continue
+        days = 365 if str(period or "").strip().lower() == "year" else 31
+        end = base + timedelta(days=days)
+        if best is None or end > best:
+            best = end
+    return best
 
 
 def _today() -> date:
@@ -201,6 +257,21 @@ def subscription_state(org, db: Session, *, stamp: bool = False) -> str:
     if grace_until is not None and grace_until >= today:
         return GRACE
 
+    # Последний рубеж перед отказом: а не написано ли у нас самих, что эта
+    # организация заплатила? Если написано и оплаченный срок ещё не вышел — не
+    # закрываем и говорим оператору, что `paid_until` не сведён. Молчаливый
+    # отказ плательщику стоил бы дороже любого пропущенного месяца, но и
+    # «бесплатно навсегда» здесь быть не должно: срок кончается сам.
+    paid_through = _paid_through(db, org.id)
+    if paid_through is not None and paid_through >= today:
+        log.warning(
+            "организация %s помечена оплаченной (billing_requests.status='paid'), "
+            "но paid_until не продлён — оставляю доступ до %s. Проставьте срок: "
+            "UPDATE orgs SET paid_until='ГГГГ-ММ-ДД' WHERE id=%s",
+            org.id, paid_through.isoformat(), org.id,
+        )
+        return ACTIVE
+
     return READONLY
 
 
@@ -237,17 +308,65 @@ BLOCK_MESSAGE = (
 
 # ── Зависимость FastAPI ──────────────────────────────────────────────────────
 
+# ── Что остаётся открытым в readonly ─────────────────────────────────────────
+#
+# Список ЗАКРЫТЫХ ручек не ведётся: закрыто всё, что меняет данные. Открыт
+# только этот перечень, и у каждого пути назван смысл. Так новая пишущая ручка
+# по умолчанию оказывается ЗАКРЫТОЙ — а не открытой, как было в первой версии,
+# где перечислялись закрытые и любая забытая проскакивала мимо гейта молча.
+#
+# Смысл списка ровно один: человек, которому приостановили запись, обязан
+# уметь (а) видеть свои данные и выгружать их, (б) заплатить, (в) войти,
+# выйти и распорядиться аккаунтом. Всё остальное — «активные действия»,
+# которые решение D-24 останавливает до оплаты.
+ALWAYS_OPEN_PATHS = frozenset({
+    # Деньги: единственный путь возобновить работу.
+    "/api/plans/request",
+    # Свои данные: выгрузка (чтение по своей природе, POST — только из-за
+    # длины списка позиций, см. ReplenishExportIn).
+    "/api/export/replenish.xlsx",
+    # Вход, выход, аккаунт.
+    "/login", "/register", "/logout",
+    "/api/account/password", "/api/account/delete",
+    # Состояние интерфейса конкретного человека, а не данные организации:
+    # подсказки онбординга и прогресс обучения. Закрыв их, мы получили бы
+    # всплывающий отказ на каждой странице у того, кому и так уже отказали.
+    "/api/hints/seen", "/api/prefs/hints",
+    "/api/lessons/{key}/done", "/api/lessons/reset", "/api/lessons/{key}/reset",
+    # Жизненный цикл приложения МойСклада: эти ручки вызывает САМ МойСклад
+    # своим JWT. Закрыть их значило бы не пустить МС сообщить нам, что
+    # подписку активировали или сняли, — то есть закрыть канал, которым
+    # состояние такой организации и управляется.
+    "/ms/vendor/api/moysklad/vendor/1.0/apps/{path_app_id}/{account_id}",
+})
+
+SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+
 def require_write_access(
-    ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)
+    request: Request,
+    ctx: AuthContext = Depends(require_auth_api),
+    db: Session = Depends(get_db),
 ) -> AuthContext:
     """402, если организация в readonly и гейт включён.
 
-    Вешается через dependencies=[...] в декораторе роута — сигнатуры
-    обработчиков не меняются, роль (require_owner_api) проверяется отдельно
-    и по-прежнему. Состояние grace пропускает запись: счёт выставлен,
-    закрывать доступ до истечения грейса нельзя.
+    Вешается ОДИН раз на приложение (`FastAPI(dependencies=[...])`), а не на
+    каждый роут. Причина — в первой версии перечислялись закрытые ручки, и
+    ревью нашло ровно то, чего такой список не мог не пропустить: сохранение
+    того же токена МойСклада запускало полный синк организации, которой мы
+    только что отказали в записи. Теперь запрещено по умолчанию: чтение и
+    список ALWAYS_OPEN_PATHS проходят, остальное упирается в подписку.
+
+    Роль (require_owner_api) проверяется отдельно и по-прежнему. Состояние
+    grace пропускает запись: счёт выставлен, закрывать доступ нельзя.
     """
     if not gate_enabled():
+        return ctx
+    if request.method in SAFE_METHODS:
+        return ctx
+    route = request.scope.get("route")
+    path = getattr(route, "path", request.url.path)
+    if path in ALWAYS_OPEN_PATHS:
         return ctx
     # stamp=True: это попытка ЗАПИСИ, транзакция здесь ожидается. Отметка
     # «счёт выставлен», забытая оператором, ставится ровно тут и один раз.
@@ -255,6 +374,33 @@ def require_write_access(
     if state == READONLY:
         raise HTTPException(status_code=402, detail=BLOCK_MESSAGE)
     return ctx
+
+
+def gate_dependency():
+    """Зависимость приложения: пускает читающие запросы без сессии.
+
+    Глобальная зависимость выполняется и на /login, и на статике, и на
+    health-ручках, где сессии нет и быть не должно. Поэтому проверка
+    авторизации здесь мягкая: нет сессии — нет и организации, которой можно
+    что-то запретить; такой запрос отдадут 401/403 те, кому положено.
+    """
+
+    def _gate(request: Request, db: Session = Depends(get_db)) -> None:
+        if not gate_enabled():
+            return
+        if request.method in SAFE_METHODS:
+            return
+        route = request.scope.get("route")
+        path = getattr(route, "path", request.url.path)
+        if path in ALWAYS_OPEN_PATHS:
+            return
+        ctx = resolve_auth(request, db)
+        if ctx is None:
+            return  # неавторизованный запрос закроет обычная защита роута
+        if subscription_state(ctx.org, db, stamp=True) == READONLY:
+            raise HTTPException(status_code=402, detail=BLOCK_MESSAGE)
+
+    return Depends(_gate)
 
 
 # ── Предпросмотр перед включением флага ──────────────────────────────────────

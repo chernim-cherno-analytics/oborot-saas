@@ -105,82 +105,30 @@ D = lambda n: (date.today() + timedelta(days=n)).isoformat()  # noqa: E731
 
 # ── Сторож по роутам ─────────────────────────────────────────────────────────
 
-# Ровно те ручки, которым гейт разрешено закрывать. Список — часть решения
-# D-24 («в порядке ценности, а не всё подряд»), поэтому меняется осознанно:
-# правка этого множества обязана сопровождаться правкой BUSINESS_LOGIC §11.
-EXPECTED_GATED = {
-    ("POST", "/api/sync/initial"),
-    ("POST", "/api/sync/run"),
-    ("POST", "/api/orders/{order_id}/push-to-ms"),
-    ("POST", "/api/order-plan/preview"),
-    ("POST", "/api/order-plan"),
-    ("POST", "/api/order-plan/{plan_id}/apply"),
-    # Демо стирает данные организации перед засевом — для readonly это
-    # невосстановимая потеря там, где мы уже ничего не продаём.
-    ("POST", "/api/connect/demo"),
-}
-
-# Пишущие ручки, которые гейт закрывать НЕ должен, с причиной. Список
-# обязателен: первая версия сторожа сверяла только множество ЗАКРЫТЫХ, и
-# новая незакрытая ручка была для неё невидима. Ровно так и проскочило
-# сохранение токена МойСклада, запускавшее полный синк организации, которой
-# мы отказали в записи. Теперь КАЖДАЯ пишущая ручка обязана быть в одном из
-# двух списков — иначе тест падает и требует решения.
+# Гейт теперь запрещает по умолчанию, поэтому списка ЗАКРЫТЫХ ручек больше
+# нет — есть список открытых, и он живёт в коде (subscription.ALWAYS_OPEN_PATHS),
+# а не в тесте. Сторож проверяет три вещи:
+#   1) каждый открытый путь действительно существует в приложении;
+#   2) в открытых нет ничего, чему там не место (список сверяется дословно);
+#   3) представительный набор пишущих ручек в readonly действительно закрыт,
+#      а открытые — действительно открыты. Это проверяется запросами, а не
+#      чтением: первая версия сторожа сверяла только множество закрытых, и
+#      незакрытая ручка была для неё невидима в принципе.
 EXPECTED_OPEN = {
-    # Деньги: клиент обязан иметь возможность заплатить.
-    ("POST", "/api/plans/request"): "заявка на счёт — единственный путь к оплате",
-    # Экспорт и чтение своих данных.
-    ("POST", "/api/export/replenish.xlsx"): "экспорт своих же данных",
-    # Вход, выход, аккаунт.
-    ("POST", "/login"): "вход",
-    ("POST", "/register"): "регистрация",
-    ("POST", "/logout"): "выход",
-    ("POST", "/api/account/password"): "смена пароля",
-    ("POST", "/api/account/delete"): "удаление аккаунта",
-    # Подключение и склады: сам синк закрыт в ms_sync.start_sync — единой
-    # точкой, через которую проходят ВСЕ запуски, включая планировщик.
-    ("POST", "/api/connect/moysklad"): "ввод токена; синк закрыт в start_sync",
-    ("POST", "/api/connect/moysklad/stores"): "выбор складов; синк закрыт в start_sync",
-    ("POST", "/api/warehouses/{warehouse_id}/toggle"): "выбор складов",
-    ("POST", "/api/notify/settings"): "настройки уведомлений",
-    ("POST", "/api/notify/test"): "проверка своего же телеграм-канала",
-    # Заказы и приёмки: бухгалтерия по уже принятым решениям.
-    ("POST", "/api/orders"): "создание заказа вручную",
-    ("POST", "/api/orders/{order_id}/status"): "движение статуса заказа",
-    ("POST", "/api/orders/{order_id}/receipts"): "запись факта о том, что уже пришло",
-    ("DELETE", "/api/orders/{order_id}"): "удаление своего заказа",
-    ("POST", "/api/ordered"): "ручная правка «едет к нам»",
-    ("POST", "/api/ordered/add"): "ручная правка «едет к нам»",
-    # Справочники и вид: ничего не стоит и ничего не создаёт.
-    ("POST", "/api/settings"): "настройки организации",
-    ("POST", "/api/exclusions"): "исключения из аналитики",
-    ("POST", "/api/hidden"): "архив позиции",
-    ("POST", "/api/categories/override"): "перенос категории",
-    ("POST", "/api/categories/merge"): "слияние категорий",
-    ("POST", "/api/discount-rule"): "правило уценки",
-    ("POST", "/api/discount-overrides"): "ручная скидка",
-    ("POST", "/api/discount-overrides/defaults"): "дефолтные скидки",
-    ("POST", "/api/replenish-draft"): "черновик ростовки",
-    ("POST", "/api/replenish-draft/reset"): "сброс черновика ростовки",
-    ("POST", "/api/productions"): "канал производства",
-    ("POST", "/api/productions/{pid}"): "канал производства",
-    ("POST", "/api/productions/{pid}/setup"): "условия канала",
-    ("POST", "/api/productions/assign-rule"): "правило распределения",
-    ("POST", "/api/productions/assign"): "назначение позиции на канал",
-    ("POST", "/api/hints/seen"): "подсказки",
-    ("POST", "/api/prefs/hints"): "подсказки",
-    ("POST", "/api/lessons/{key}/done"): "обучение",
-    ("POST", "/api/lessons/reset"): "обучение",
-    ("POST", "/api/lessons/{key}/reset"): "обучение",
-    ("DELETE", "/api/productions/{pid}"): "удаление своего канала производства",
-    # Ручки жизненного цикла приложения МойСклада: их вызывает САМ МойСклад
-    # по своему JWT, а не пользователь. Закрыть их гейтом значило бы не пустить
-    # МС сообщить нам, что подписку активировали или сняли, — то есть закрыть
-    # ровно тот канал, которым состояние такой организации и управляется.
-    ("PUT", "/ms/vendor/api/moysklad/vendor/1.0/apps/{path_app_id}/{account_id}"):
-        "lifecycle МойСклада (Activate), вызывает МС по своему JWT",
-    ("DELETE", "/ms/vendor/api/moysklad/vendor/1.0/apps/{path_app_id}/{account_id}"):
-        "lifecycle МойСклада (Suspend/Uninstall), вызывает МС по своему JWT",
+    "/api/plans/request": "заявка на счёт — единственный путь к оплате",
+    "/api/export/replenish.xlsx": "выгрузка своих же данных",
+    "/login": "вход",
+    "/register": "регистрация",
+    "/logout": "выход",
+    "/api/account/password": "смена пароля",
+    "/api/account/delete": "удаление аккаунта",
+    "/api/hints/seen": "состояние подсказок конкретного человека",
+    "/api/prefs/hints": "состояние подсказок конкретного человека",
+    "/api/lessons/{key}/done": "прогресс обучения конкретного человека",
+    "/api/lessons/reset": "прогресс обучения конкретного человека",
+    "/api/lessons/{key}/reset": "прогресс обучения конкретного человека",
+    "/ms/vendor/api/moysklad/vendor/1.0/apps/{path_app_id}/{account_id}":
+        "lifecycle МойСклада — вызывает сам МС своим JWT",
 }
 
 
@@ -305,6 +253,64 @@ def main() -> int:
         check("но чтение состояния при этом НИЧЕГО не пишет в базу",
               stamped is None, f"stamp={stamped}")
 
+        print("\n== «Деньги пришли» — не то же самое, что «счёт выставлен» ==")
+        # Статус `paid` использовался НАРАВНЕ с `invoiced`: просто запускал те же
+        # пять дней. То есть организация, про которую в нашей же базе написано
+        # «оплачено», закрывалась на шестой день — при том, что инструкция
+        # оператору в deploy/README про продление paid_until молчала.
+        exec_sql("UPDATE billing_requests SET status = 'paid', invoiced_at = ? WHERE id = ?",
+                 f"{D(-30)} 10:00:00", req_id)
+        check("отметка «оплачено» держит доступ и через месяц после счёта",
+              state_of(org_id) == subscription.ACTIVE, state_of(org_id))
+        r = c.post("/api/sync/run")
+        check("и плательщик не получает 402 на запись", r.status_code != 402,
+              f"status={r.status_code}")
+        # Но именно отметка, а не любая заявка: `invoiced` месячной давности —
+        # по-прежнему отказ, иначе гейт не закрывал бы вообще никого.
+        exec_sql("UPDATE billing_requests SET status = 'invoiced' WHERE id = ?", req_id)
+        check("а «счёт выставлен» месяц назад — по-прежнему readonly",
+              state_of(org_id) == subscription.READONLY, state_of(org_id))
+
+        # Отметка даёт КУПЛЕННЫЙ срок, а не вечность. Первая версия этой правки
+        # смотрела на последнюю заявку и пускала без ограничения по времени —
+        # то есть заплативший однажды не закрывался никогда, ведь продление
+        # делается через UPDATE orgs SET paid_until, новой заявки при этом нет.
+        exec_sql("UPDATE billing_requests SET status = 'paid', period = 'month', "
+                 "invoiced_at = ? WHERE id = ?", f"{D(-400)} 10:00:00", req_id)
+        check("оплата 400 дней назад по месячному тарифу больше не действует",
+              state_of(org_id) == subscription.READONLY, state_of(org_id))
+        exec_sql("UPDATE billing_requests SET period = 'year' WHERE id = ?", req_id)
+        check("а годовой тариф на той же дате ещё действует (400 < 365? нет) —"
+              " и это тоже readonly",
+              state_of(org_id) == subscription.READONLY, state_of(org_id))
+        exec_sql("UPDATE billing_requests SET invoiced_at = ? WHERE id = ?",
+                 f"{D(-200)} 10:00:00", req_id)
+        check("годовой тариф, оплаченный 200 дней назад, действует",
+              state_of(org_id) == subscription.ACTIVE, state_of(org_id))
+
+        # Заявка на смену тарифа не имеет права запирать оплатившего клиента.
+        # Раньше «последней» считалась заявка с максимальным id: клиент нажимал
+        # «хочу тариф Про», появлялась заявка со статусом new, и право записи
+        # исчезало до ручной обработки оператором.
+        r = c.post("/api/plans/request", json={
+            "plan": "pro", "period": "month", "company": "ООО Тест",
+            "inn": "7700000000", "email": "a@b.io", "phone": "+70000000000",
+        })
+        check("заявка на смену тарифа принята", r.status_code == 200,
+              f"status={r.status_code}")
+        check("и она НЕ отняла доступ у оплатившего",
+              state_of(org_id) == subscription.ACTIVE, state_of(org_id))
+        r = c.post("/api/sync/run")
+        check("оплативший по-прежнему может писать после заявки на апгрейд",
+              r.status_code != 402, f"status={r.status_code}")
+        exec_sql("DELETE FROM billing_requests WHERE id <> ?", req_id)
+
+        # Статус правит оператор руками: регистр и пробелы не должны означать
+        # «отметки нет».
+        exec_sql("UPDATE billing_requests SET status = ' Paid ' WHERE id = ?", req_id)
+        check("« Paid » с пробелами и заглавной читается как оплата",
+              state_of(org_id) == subscription.ACTIVE, state_of(org_id))
+
         exec_sql("UPDATE billing_requests SET status = 'new', invoiced_at = NULL WHERE id = ?",
                  req_id)
 
@@ -338,7 +344,12 @@ def main() -> int:
               body.get("gate_enabled") is False and body.get("writes_blocked") is False,
               str(body)[:160])
 
-        print("\n== Флаг включён: readonly закрывает запись ==")
+        print("\n== Флаг включён: readonly закрывает ЛЮБОЕ изменение данных ==")
+        # Проверяем поведение, а не «согласованный список». Первая версия
+        # закрывала три группы и оставляла открытыми заказы, приёмки,
+        # настройки, скидки, категории и производства — это модель «не даём
+        # новую вычислительную ценность, но разрешаем менять данные», а не
+        # read-only. Утверждённое решение D-24 говорит про второе.
         gate(True)
         blocked = {
             "синхронизация (инкрементальная)": c.post("/api/sync/run"),
@@ -347,6 +358,34 @@ def main() -> int:
             "расчёт плана": c.post("/api/order-plan/preview", json={}),
             "сохранение плана": c.post("/api/order-plan", json={}),
             "применение плана": c.post("/api/order-plan/1/apply", json={}),
+            "демо-данные (стирают всё)": c.post("/api/connect/demo"),
+            "создание заказа": c.post("/api/orders", json={"name": "x", "items": []}),
+            "смена статуса заказа": c.post("/api/orders/1/status",
+                                           json={"status": "sent"}),
+            "удаление заказа": c.delete("/api/orders/1"),
+            "запись приёмки": c.post("/api/orders/1/receipts", json={"lines": []}),
+            "ручное «едет к нам»": c.post("/api/ordered",
+                                          json={"base_name": "x", "qty": 1}),
+            "настройки организации": c.post("/api/settings", json={}),
+            "исключения из аналитики": c.post(
+                "/api/exclusions", json={"base_name": "x", "excluded": True}),
+            "архив позиции": c.post("/api/hidden",
+                                    json={"base_name": "x", "hidden": True}),
+            "перенос категории": c.post(
+                "/api/categories/override", json={"base_name": "x", "category": "y"}),
+            "слияние категорий": c.post(
+                "/api/categories/merge", json={"from_category": "a", "to_category": "b"}),
+            "ручная скидка": c.post("/api/discount-overrides",
+                                    json={"base_name": "x", "discount": 10}),
+            "дефолтные скидки": c.post("/api/discount-overrides/defaults"),
+            "черновик ростовки": c.post("/api/replenish-draft", json={}),
+            "канал производства": c.post("/api/productions", json={"name": "Цех"}),
+            "правило распределения": c.post(
+                "/api/productions/assign-rule",
+                json={"assign_source": "supplier", "assign_map": {}}),
+            "ввод токена МойСклада": c.post("/api/connect/moysklad",
+                                            json={"token": "x"}),
+            "настройки уведомлений": c.post("/api/notify/settings", json={}),
         }
         for label, resp in blocked.items():
             check(f"readonly закрывает: {label}", resp.status_code == 402,
@@ -383,6 +422,13 @@ def main() -> int:
         r = c.post("/api/export/replenish.xlsx", json={"rows": []})
         check("экспорт не блокируется", r.status_code != 402,
               f"status={r.status_code} {r.text[:120]}")
+        # Состояние интерфейса конкретного человека — не данные организации.
+        for path, body in (("/api/hints/seen", {"key": "turnover"}),
+                           ("/api/prefs/hints", {"enabled": True}),
+                           ("/api/lessons/reset", None)):
+            rr = c.post(path, json=body) if body is not None else c.post(path)
+            check(f"не блокируется: {path}", rr.status_code != 402,
+                  f"status={rr.status_code}")
 
         body = c.get("/api/subscription").json()
         check("/api/subscription сообщает readonly и блокировку записи",
@@ -475,34 +521,27 @@ def main() -> int:
     exec_sql("UPDATE billing_requests SET status='new', invoiced_at=NULL WHERE org_id=?",
              org_id)
 
-    print("\n== Сторож по всем пишущим ручкам ==")
-    found = gated_routes()
-    mutating = mutating_routes()
-    check("гейт стоит ровно на согласованных ручках", found == EXPECTED_GATED,
-          f"лишние={sorted(found - EXPECTED_GATED)} потерянные={sorted(EXPECTED_GATED - found)}")
-    check("все закрытые ручки действительно пишущие",
-          found <= mutating, f"не-POST={sorted(found - mutating)}")
-    check("гейт не стоит ни на одном GET",
-          not any(m == "GET" for m, _ in found), str(sorted(found))[:200])
-    check("закрыта меньшая часть пишущих ручек (гейт точечный, а не веерный)",
-          len(found) * 2 < len(mutating), f"{len(found)} из {len(mutating)}")
+    print("\n== Сторож: запрещено по умолчанию ==")
+    from app import subscription as _sub
 
-    # Вторая половина сторожа — та, которой не было и из-за которой мимо гейта
-    # проскочило сохранение токена, запускавшее полный синк. Каждая пишущая
-    # ручка приложения обязана быть либо в EXPECTED_GATED, либо в EXPECTED_OPEN
-    # с причиной. Новая ручка роняет тест и требует осознанного решения.
-    classified = set(EXPECTED_GATED) | set(EXPECTED_OPEN)
-    unclassified = mutating - classified
-    check("каждая пишущая ручка осознанно отнесена к закрытым или открытым",
-          not unclassified, f"не классифицированы: {sorted(unclassified)}")
-    check("в списке открытых нет ручек, которых больше нет в приложении",
-          not (set(EXPECTED_OPEN) - mutating),
-          f"лишние: {sorted(set(EXPECTED_OPEN) - mutating)}")
-    check("списки закрытых и открытых не пересекаются",
-          not (set(EXPECTED_GATED) & set(EXPECTED_OPEN)),
-          str(sorted(set(EXPECTED_GATED) & set(EXPECTED_OPEN))))
-    check("у каждой открытой пишущей ручки записана причина",
+    mutating = mutating_routes()
+    mutating_paths = {path for _m, path in mutating}
+    open_paths = set(_sub.ALWAYS_OPEN_PATHS)
+
+    check("список открытых в коде совпадает со списком в тесте",
+          open_paths == set(EXPECTED_OPEN),
+          f"в коде лишние: {sorted(open_paths - set(EXPECTED_OPEN))}; "
+          f"в тесте лишние: {sorted(set(EXPECTED_OPEN) - open_paths)}")
+    check("у каждого открытого пути записана причина",
           all(str(v).strip() for v in EXPECTED_OPEN.values()))
+    check("все открытые пути существуют в приложении",
+          open_paths <= mutating_paths,
+          f"нет таких маршрутов: {sorted(open_paths - mutating_paths)}")
+    check("открыта меньшая часть пишущих ручек",
+          len(open_paths) * 2 < len(mutating_paths),
+          f"{len(open_paths)} из {len(mutating_paths)}")
+    check("гейт не висит поштучно на роутах (он один на приложении)",
+          not gated_routes(), str(sorted(gated_routes()))[:160])
 
     # Синк закрыт не роутом, а единой точкой запуска: роутов, ведущих к нему,
     # больше одного (токен, склады, планировщик, догон), и по-ручечная защита

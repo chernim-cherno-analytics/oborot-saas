@@ -59,7 +59,18 @@ git checkout --detach "$SHA"
 git --no-pager log -1 --format='%h %ad %s' --date=iso
 
 echo "== 5/6 Зависимости и перезапуск =="
-"$VENV/bin/pip" install -q -r requirements.txt
+# Ставим ТОЧНЫЕ версии, на которых зелёный CI (requirements.lock). Без него
+# один и тот же коммит через несколько месяцев собирался бы с другим набором
+# minor/patch — «прод = воспроизводимая сборка» было бы верно наполовину.
+# requirements.txt остаётся запасным путём: старый коммит без lock-файла
+# по-прежнему выкатывается.
+if [ -f requirements.lock ]; then
+  echo "   зависимости: requirements.lock (точные версии)"
+  "$VENV/bin/pip" install -q -r requirements.lock
+else
+  echo "   зависимости: requirements.txt (в этом коммите нет lock-файла)"
+  "$VENV/bin/pip" install -q -r requirements.txt
+fi
 # Версия сборки попадает в записи решений (см. app/version.py): по ней потом
 # можно поднять код, который дал конкретную рекомендацию.
 grep -q '^OBOROT_COMMIT=' "$ENV_FILE" \
