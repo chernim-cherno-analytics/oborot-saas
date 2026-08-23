@@ -8,19 +8,23 @@
 потому, что у сервиса не было ни одного способа сказать наружу «мне плохо».
 
 Проверяется:
-  1) /health/live отвечает всегда и НЕ трогает базу (liveness не должен падать
+  1) lock содержит только точные версии, покрывает прямые зависимости, а CI и
+     production действительно ставят именно его и запускают pip check;
+  2) /health/live отвечает всегда и НЕ трогает базу (liveness не должен падать
      каскадом: перезапуск процесса рвёт фоновую догрузку истории);
-  2) /health/ready отвечает 200, когда старт завершён и база отвечает;
-  3) обе ручки не требуют авторизации и не раскрывают данные организаций;
-  4) приложение отказывается стартовать при нескольких воркерах, потому что
+  3) /health/ready отвечает 200, когда старт завершён и база отвечает;
+  4) обе ручки не требуют авторизации и не раскрывают данные организаций;
+  5) приложение отказывается стартовать при нескольких воркерах, потому что
      кэш аналитики, лимит входа и планировщик живут в памяти процесса;
-  5) осознанный многопроцессный запуск разрешается явным флагом.
+  6) осознанный многопроцессный запуск разрешается явным флагом.
 
 Запуск из корня репозитория:  python tests/test_ops.py
 """
 import os
+import re
 import subprocess
 import sys
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -67,7 +71,49 @@ def _child(env_extra: dict) -> tuple[int, str]:
     return p.returncode, (p.stdout + p.stderr)
 
 
+def _active_requirements(path: Path) -> list[str]:
+    return [line.strip() for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")]
+
+
+def _package_name(requirement: str) -> str:
+    raw = re.split(r"[<>=!~\[]", requirement, maxsplit=1)[0]
+    return raw.strip().lower().replace("_", "-")
+
+
 def main() -> int:
+    print("\n== Точный lock зависимостей ==")
+    source = _active_requirements(ROOT / "requirements.txt")
+    locked = _active_requirements(ROOT / "requirements.lock")
+    bad = [line for line in locked
+           if not re.fullmatch(r"[A-Za-z0-9_.-]+==[^;\s]+", line)]
+    check("каждая устанавливаемая зависимость имеет ровно одну версию",
+          bool(locked) and not bad, str(bad[:5]))
+
+    source_names = {_package_name(line) for line in source}
+    locked_names = {_package_name(line) for line in locked}
+    missing = sorted(source_names - locked_names)
+    check("все прямые зависимости присутствуют в lock", not missing, str(missing))
+
+    drift = []
+    for line in locked:
+        name, wanted = line.split("==", 1)
+        try:
+            actual = version(name)
+        except PackageNotFoundError:
+            actual = "MISSING"
+        if actual != wanted:
+            drift.append(f"{name}: {actual} != {wanted}")
+    check("тесты идут на тех же версиях, которые фиксирует lock",
+          not drift, str(drift[:5]))
+
+    ci = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    deploy = (ROOT / "deploy/deploy.sh").read_text(encoding="utf-8")
+    check("CI ставит lock и проверяет целостность окружения",
+          "pip install -r requirements.lock" in ci and "pip check" in ci)
+    check("production deploy ставит lock и проверяет целостность окружения",
+          "pip\" install -q -r requirements.lock" in deploy and "pip\" check" in deploy)
+
     print("\n== Health-эндпоинты ==")
     with TestClient(oborot_app) as c:
         r = c.get("/health/live")

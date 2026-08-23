@@ -59,7 +59,8 @@ git checkout --detach "$SHA"
 git --no-pager log -1 --format='%h %ad %s' --date=iso
 
 echo "== 5/6 Зависимости и перезапуск =="
-"$VENV/bin/pip" install -q -r requirements.txt
+"$VENV/bin/pip" install -q -r requirements.lock
+"$VENV/bin/pip" check
 # Версия сборки попадает в записи решений (см. app/version.py): по ней потом
 # можно поднять код, который дал конкретную рекомендацию.
 grep -q '^OBOROT_COMMIT=' "$ENV_FILE" \

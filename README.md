@@ -11,9 +11,14 @@ Telegram-уведомления. Дизайн-система «Штаб» (тё�
 
 ## Запуск (dev)
 ```bash
-pip install -r requirements.txt
+python -m venv .venv
+. .venv/bin/activate
+pip install -r requirements.lock
 python run.py            # http://127.0.0.1:8000
 ```
+Поддерживаемая версия Python — 3.11 (CI); lock также проверен на 3.12.
+`requirements.txt` задаёт только допустимые коридоры для осознанного обновления;
+обычный запуск, CI и production всегда используют точный `requirements.lock`.
 Регистрация → онбординг → «Демо-данные» — полный продукт на синтетике.
 Подключение МойСклад: онбординг → вставить API-токен → выбрать склады → синк ~5–10 мин.
 
