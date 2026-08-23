@@ -278,9 +278,12 @@ def run() -> int:  # noqa: C901 — сценарный тест, ветвлен�
     r = c2.post(f"/api/orders/{order2}/status", json={"status": "received"})
     check("заказ принят одним кликом", r.status_code == 200, r.text[:150])
     got2 = c2.get(f"/api/orders/{order2}/receipts").json()
-    check("количества взяты из заказа", got2["received_total"] == 10, str(got2["received_total"]))
-    check("и помечены как допущение, а не подтверждение",
-          got2["precisions"] == ["whole_order"], str(got2["precisions"]))
+    check("никакого количества не выдумано", got2["received_total"] == 0,
+          str(got2["received_total"]))
+    check("и выдача говорит, что принятое неизвестно",
+          got2.get("execution_unknown") is True, str(got2.get("execution_unknown")))
+    check("исполнение НЕ считается подтверждённым",
+          got2.get("confirmed") is False, str(got2.get("confirmed")))
     body2 = c2.get(f"/api/orders/{order2}").json()
     check("дата приёмки записана", bool(body2.get("received_at")))
     check("фактический срок производства посчитан",
@@ -384,17 +387,20 @@ def run() -> int:  # noqa: C901 — сценарный тест, ветвлен�
     check("источники видны раздельно", got["by_source"] == {"ms_order_shipped": 10.0},
           str(got.get("by_source")))
 
-    # (б) Частичный приход, потом «Принят» одним кликом: дописывается ОСТАТОК,
-    # а не ноль. Раньше заказ навсегда закрывался недостачей, которой не было.
+    # (б) Частичный приход, потом «Принят» одним кликом: подтверждённым
+    # остаётся ровно то, что человек назвал. Отметка «принят» закрывает заказ,
+    # но не добавляет к 3 недостающие 7 — это было бы выдуманное число.
     oid_part = make_order(c3, 10, "Частичный")
     c3.post(f"/api/orders/{oid_part}/receipts",
             json={"lines": [{"base_name": name3, "qty": 3}]})
     c3.post(f"/api/orders/{oid_part}/status", json={"status": "received"})
     got = c3.get(f"/api/orders/{oid_part}/receipts").json()
-    check("после частичного прихода «принят» дописывает остаток до заказанного",
-          got["received_total"] == 10, str(got["received_total"]))
-    check("и обе точности видны в истории",
-          got["precisions"] == ["by_position", "whole_order"], str(got["precisions"]))
+    check("подтверждено ровно названное человеком", got["received_total"] == 3,
+          str(got["received_total"]))
+    check("в истории только подтверждение по строкам",
+          got["precisions"] == ["by_position"], str(got["precisions"]))
+    check("недостача видна в сверке, а не спрятана",
+          got["lines"][0]["diff"] == -7, str(got["lines"][0]))
 
     # (в) Пустой список received — это «количества не назвали», а не «принято 0».
     oid_empty = make_order(c3, 10, "Пустой список")
@@ -402,8 +408,11 @@ def run() -> int:  # noqa: C901 — сценарный тест, ветвлен�
                 json={"status": "received", "received": []})
     check("пустой список принят", r.status_code == 200, r.text[:120])
     got = c3.get(f"/api/orders/{oid_empty}/receipts").json()
-    check("заказ не остался без факта исполнения", got["received_total"] == 10,
+    check("пустой список ничего не выдумал", got["received_total"] == 0,
           str(got["received_total"]))
+    body_empty = c3.get(f"/api/orders/{oid_empty}").json()
+    check("но заказ закрыт: дата приёмки стоит", bool(body_empty.get("received_at")),
+          str(body_empty.get("received_at")))
     r = c3.post(f"/api/orders/{oid_empty}/receipts",
                 json={"lines": [{"base_name": "   ", "qty": 5}]})
     check("имя из одних пробелов отклоняется, а не глотается молча",
@@ -416,11 +425,13 @@ def run() -> int:  # noqa: C901 — сценарный тест, ветвлен�
         codes = [r.status_code for r in pool.map(lambda _: c3.post(
             f"/api/orders/{oid_race}/status", json={"status": "received"}), range(6))]
     got = c3.get(f"/api/orders/{oid_race}/receipts").json()
+    body_race = c3.get(f"/api/orders/{oid_race}").json()
     check("шесть одновременных «Принят» приняты сервером",
           all(x == 200 for x in codes), str(codes))
-    check("двойной клик не удваивает приёмку", got["received_total"] == 10,
-          str(got["received_total"]))
-    check("и не удваивает строки", len(got["receipts"]) == 1, str(len(got["receipts"])))
+    check("переход выполнился ровно один раз", body_race.get("status") == "received",
+          str(body_race.get("status")))
+    check("и не наплодил строк приёмки", len(got["receipts"]) == 0,
+          str(len(got["receipts"])))
 
     # (д) Удаление заказа уносит его приёмки: id в SQLite переиспользуется,
     # и осиротевшие строки достались бы следующему заказу.
@@ -563,6 +574,199 @@ def run() -> int:  # noqa: C901 — сценарный тест, ветвлен�
     got = c3.get(f"/api/orders/{oid_legacy}/receipts").json()
     check("принятое осталось прежним", got["received_total"] == 4,
           str(got["received_total"]))
+
+    print("\n== Источники не складываются: приоритет и конфликт ==")
+    # Инвариант заводится ДО подключения ms_supply намеренно: чинить это после
+    # первой автоматической записи пришлось бы уже на испорченных данных.
+    # Человек подтвердил 80, потом МойСклад прислал доказуемую приёмку на те
+    # же 80 — это не 160, это два свидетельства об одном факте.
+    r = c3.post("/api/orders", json={"name": "Два источника", "items": [
+        {"base_name": name3 + " v3", "qty": 80, "sizes": {}, "cost": 100}]})
+    oid_two = r.json().get("id")
+    c3.post(f"/api/orders/{oid_two}/status", json={"status": "sent"})
+    exec_sql_local(oid_two)
+    c3.post(f"/api/orders/{oid_two}/receipts",
+            json={"lines": [{"base_name": name3 + " v3", "qty": 80}]})
+    got = c3.get(f"/api/orders/{oid_two}/receipts").json()
+    check("сначала подтвердил человек — 80", got["received_total"] == 80,
+          str(got["received_total"]))
+    _write_shipped_receipts(3, {(oid_two, f"doc-{oid_two}"): {name3 + " v3": 80.0}})
+    got = c3.get(f"/api/orders/{oid_two}/receipts").json()
+    check("МойСклад прислал те же 80 — итог остался 80, а не стал 160",
+          got["received_total"] == 80, str(got["received_total"]))
+    check("оба источника видны раздельно",
+          got["by_source"] == {"manual": 80.0, "ms_order_shipped": 80.0},
+          str(got.get("by_source")))
+    check("одинаковые числа конфликтом не считаются",
+          got.get("source_conflicts") == [], str(got.get("source_conflicts")))
+
+    # А вот расхождение прятать нельзя: его выносят на разбор человеку.
+    _write_shipped_receipts(3, {(oid_two, f"doc-{oid_two}"): {name3 + " v3": 74.0}})
+    got = c3.get(f"/api/orders/{oid_two}/receipts").json()
+    check("при расхождении побеждает доказуемый источник",
+          got["received_total"] == 74, str(got["received_total"]))
+    conf = got.get("source_conflicts") or []
+    check("расхождение названо прямо, а не сложено", len(conf) == 1, str(conf)[:160])
+    check("и в нём видно, что сказал каждый источник",
+          conf and conf[0]["by_source"] == {"manual": 80.0, "ms_order_shipped": 74.0},
+          str(conf)[:200])
+    # Спор источников — это не факт, это спор. Пока его не разобрал человек,
+    # заказ не имеет права называться подтверждённым: раньше приоритет молча
+    # выбирал победителя, и «80 против 74» выезжало наружу как доказанная
+    # недостача.
+    check("пока источники спорят, заказ НЕ подтверждён",
+          got.get("confirmed") is False, str(got.get("confirmed")))
+    check("и это названо неизвестностью, а не нулём",
+          got.get("execution_unknown") is True, str(got.get("execution_unknown")))
+
+    # Машинный ноль — не свидетельство прихода, а его отсутствие. Так бывает
+    # штатно: в МойСкладе приёмку распровели, и компенсирующая строка схлопнула
+    # машинную сумму в ноль. Раньше приоритет выбирал источник ПО НАЛИЧИЮ строк,
+    # и этот ноль побеждал подтверждённые человеком 80 штук — система переходила
+    # от «не знаем» к уверенному «приехало ноль».
+    _write_shipped_receipts(3, {(oid_two, f"doc-{oid_two}"): {name3 + " v3": 0.0}})
+    got = c3.get(f"/api/orders/{oid_two}/receipts").json()
+    check("машинный ноль НЕ стирает подтверждение человека",
+          got["received_total"] == 80, str(got["received_total"]))
+    check("машинная сумма при этом действительно ноль",
+          (got.get("by_source") or {}).get("ms_order_shipped") == 0.0,
+          str(got.get("by_source")))
+    # И это НЕ спор источников. Первая версия правки считала машинный ноль
+    # полноправным свидетельством в конфликте — заказ уходил в «неизвестно»
+    # навсегда, потому что единственным способом снять расхождение было
+    # согласиться с нулём, то есть испортить данные. «В документах ничего нет»
+    # не спорит с «человек подтвердил 80»: это утверждение и пустота.
+    check("машинный ноль не считается спором с подтверждением человека",
+          got.get("source_conflicts") == [], str(got.get("source_conflicts")))
+    check("и заказ остаётся подтверждённым на 80",
+          got.get("confirmed") is True and got["received_total"] == 80,
+          f"confirmed={got.get('confirmed')} total={got.get('received_total')}")
+
+    # А вот машинный ноль БЕЗ подтверждения человека — это «не знаем», а не
+    # «приехало ноль». Позиции просто нет в сверке.
+    from app.api import _received_by_base as _rbb0
+
+    class _R0:
+        def __init__(self, base, qty, source):
+            self.base_name, self.qty, self.source = base, qty, source
+
+    only_machine = [_R0("Кепка", 80, "ms_order_shipped"),
+                    _R0("Кепка", -80, "ms_order_shipped")]
+    check("схлопнувшийся машинный источник не даёт «приехало ноль»",
+          _rbb0(only_machine) == {}, str(_rbb0(only_machine)))
+    # Но осознанный ноль человека — утверждение, и он остаётся.
+    human_zero = [_R0("Кепка", 0, "manual")]
+    check("ноль, записанный человеком, остаётся фактом",
+          _rbb0(human_zero) == {"Кепка": 0.0}, str(_rbb0(human_zero)))
+
+    # Склейка переименованных позиций: МойСклад объединил два товара в один,
+    # приёмки разных источников съехались под одно имя и выглядят как два
+    # свидетельства об одном приходе. Честный ответ — «не знаем», а не число,
+    # получившееся из склейки.
+    from app.api import _received_by_base as _rbb, _source_conflicts as _sc
+
+    class _Row:
+        def __init__(self, base, qty, source):
+            self.base_name, self.qty, self.source = base, qty, source
+
+    merged = [_Row("NEW", 6, "ms_order_shipped"), _Row("NEW", 4, "manual")]
+    check("склейка объявлена спором, а не недостачей",
+          len(_sc(merged)) == 1, str(_sc(merged))[:160])
+    part = [_Row("Худи", 30, "manual"), _Row("Худи", 50, "manual")]
+    check("частичный приход и довоз одного источника по-прежнему складываются",
+          _rbb(part) == {"Худи": 80.0}, str(_rbb(part)))
+
+    print("\n== Повтор запроса приёмки не удваивает принятое ==")
+    # Таблица приёмок только пополняется, поэтому двойной клик или ретрай
+    # после таймаута дописывал вторую такую же строку. Машинный источник от
+    # этого защищён source_ref; ручному дан тот же механизм — ключ повтора.
+    r = c3.post("/api/orders", json={"name": "Повтор", "items": [
+        {"base_name": name3 + " v3", "qty": 20, "sizes": {}, "cost": 100}]})
+    oid_rep = r.json().get("id")
+    c3.post(f"/api/orders/{oid_rep}/status", json={"status": "sent"})
+    body = {"lines": [{"base_name": name3 + " v3", "qty": 10}],
+            "idempotency_key": "klik-1"}
+    first = c3.post(f"/api/orders/{oid_rep}/receipts", json=body).json()
+    second = c3.post(f"/api/orders/{oid_rep}/receipts", json=body).json()
+    check("первый запрос записал строку", first.get("added") == 1, str(first.get("added")))
+    check("повтор с тем же ключом не записал ничего",
+          second.get("added") == 0 and second.get("repeat") is True,
+          f"added={second.get('added')} repeat={second.get('repeat')}")
+    check("и принятое не удвоилось", second["received_total"] == 10,
+          str(second["received_total"]))
+    # А другой ключ — это другой факт: довоз должен пройти.
+    third = c3.post(f"/api/orders/{oid_rep}/receipts", json={
+        "lines": [{"base_name": name3 + " v3", "qty": 10}],
+        "idempotency_key": "klik-2"}).json()
+    check("довоз с другим ключом записывается", third["received_total"] == 20,
+          str(third["received_total"]))
+    # Без ключа поведение прежнее: ручка остаётся совместимой.
+    fourth = c3.post(f"/api/orders/{oid_rep}/receipts", json={
+        "lines": [{"base_name": name3 + " v3", "qty": 5}]}).json()
+    check("запрос без ключа работает как раньше", fourth["received_total"] == 25,
+          str(fourth["received_total"]))
+    # Ключ привязан к телу запроса. Клиент, который генерирует ключ на сессию
+    # или на заказ, а не на запрос, иначе молча терял бы довоз: тот же ключ с
+    # другими позициями считался бы повтором.
+    fifth = c3.post(f"/api/orders/{oid_rep}/receipts", json={
+        "lines": [{"base_name": name3 + " v3", "qty": 3}],
+        "idempotency_key": "klik-1"}).json()
+    check("тот же ключ с ДРУГИМ телом — новый факт, а не повтор",
+          fifth.get("added") == 1 and fifth["received_total"] == 28,
+          f"added={fifth.get('added')} total={fifth.get('received_total')}")
+
+    print("\n== Две выдачи об одном заказе отвечают одинаково ==")
+    # Сверка приёмок говорила «не знаем» из-за спора источников, а outcome —
+    # тот самый экран, по которому меряют качество рекомендаций, — выдавал
+    # победителя приоритета как факт. Расхождение двух ответов об одном заказе
+    # хуже любого из них по отдельности.
+    # Спор заводим на заказе, ВЫРОСШЕМ ИЗ ПЛАНА: только у такого есть outcome,
+    # и только там расхождение двух ответов имеет цену — по этому экрану потом
+    # меряют качество рекомендаций.
+    rc0 = c.get(f"/api/orders/{order_id}/receipts").json()
+    already = {x["base_name"] for x in rc0.get("source_conflicts") or []}
+    oc0 = c.get(f"/api/order-plan/{plan_id}/outcome").json()
+    in_plan = [x["base_name"] for x in oc0.get("lines", [])]
+    # Позиция должна быть и в приёмке, и в строках плана: спор нужен там, где
+    # его увидят ОБЕ выдачи, иначе проверка сравнивала бы разные вещи.
+    free = [b for b in in_plan if b not in already]
+    check("в плане есть позиция без спора", bool(free), f"уже спорят: {sorted(already)}")
+    spor_base, spor_qty = free[0], 4.0
+    r = c.post(f"/api/orders/{order_id}/receipts",
+               json={"lines": [{"base_name": spor_base, "qty": spor_qty}]})
+    check("человек подтвердил приход по ней", r.status_code == 200, r.text[:120])
+    _write_shipped_receipts(1, {(order_id, f"doc-spor-{order_id}"):
+                                {spor_base: spor_qty + 5}})
+    oc = c.get(f"/api/order-plan/{plan_id}/outcome").json()
+    rc = c.get(f"/api/orders/{order_id}/receipts").json()
+    check("пока источники спорят, обе выдачи говорят «не подтверждено»",
+          oc.get("execution_confirmed") is False and rc.get("confirmed") is False,
+          f"outcome={oc.get('execution_confirmed')} receipts={rc.get('confirmed')}")
+    check("и обе называют это неизвестностью",
+          oc.get("execution_unknown") is True and rc.get("execution_unknown") is True,
+          f"outcome={oc.get('execution_unknown')} receipts={rc.get('execution_unknown')}")
+    check("спорная позиция названа поимённо",
+          spor_base in (oc.get("disputed_bases") or []), str(oc.get("disputed_bases")))
+    disputed_lines = [x for x in oc.get("lines", []) if x["base_name"] == spor_base]
+    check("и по ней executed = null, а не число из спора",
+          disputed_lines and all(x["executed"] is None for x in disputed_lines),
+          str(disputed_lines)[:160])
+
+    print("\n== Ноль, записанный человеком, — это факт, а не пустота ==")
+    # Ручка отвечала `ok: true, added: 0`, строку не писала, и утверждение
+    # пользователя молча исчезало. Соседний путь (перевод в «на складе» с
+    # количествами) нули писал — две ручки отвечали об одном по-разному.
+    r = c3.post("/api/orders", json={"name": "Ноль", "items": [
+        {"base_name": name3 + " v3", "qty": 12, "sizes": {}, "cost": 100}]})
+    oid_zero = r.json().get("id")
+    c3.post(f"/api/orders/{oid_zero}/status", json={"status": "sent"})
+    z = c3.post(f"/api/orders/{oid_zero}/receipts", json={
+        "lines": [{"base_name": name3 + " v3", "qty": 0}]}).json()
+    check("ноль записан строкой, а не проглочен", z.get("added") == 1,
+          str(z.get("added")))
+    check("и это подтверждённый ноль, а не «неизвестно»",
+          z.get("confirmed") is True and z.get("execution_unknown") is False,
+          f"confirmed={z.get('confirmed')} unknown={z.get('execution_unknown')}")
 
     print("\n== Огромный id не роняет outcome ==")
     r = c.get("/api/order-plan/99999999999999999999999999/outcome")
