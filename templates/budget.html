@@ -363,7 +363,14 @@
       document.getElementById("xlsxBtn").setAttribute("href",xlsxHref());
       markStale(parseAmount(document.getElementById("budget").value),
                 parseCap(document.getElementById("capPct").value));
-      hint.textContent="приоритет: оборачиваемость · продажи за "+d.fresh_days+" дн · горизонт "+d.horizon_days+" дней";
+      // Окно темпа называем прямо. Весь расклад бюджета зависит от него
+      // (переключение «год» → «90 дней» на демо-данных меняло потребность
+      // топ-позиции с 63 до 5 шт и состав с 4 позиций на 5), а строка говорила
+      // одно и то же всегда — и «продажи за 90 дн» здесь про ФИЛЬТР СВЕЖЕСТИ,
+      // что читалось как окно темпа и путало вдвойне.
+      hint.textContent="приоритет: оборачиваемость · "+
+        (d.rate_window_label||"темп за год")+" · в расчёт идут продажи за последние "+
+        d.fresh_days+" дн · горизонт "+d.horizon_days+" дней";
       document.getElementById("placeholder").style.display="none";
       // предупреждение о свежести
       document.getElementById("warnBox").innerHTML=d.excluded_fresh_count

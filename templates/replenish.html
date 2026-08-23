@@ -432,6 +432,7 @@
   var openRows={};
   var HORIZON=90, LEAD_TIME=45, RATE_WINDOW="year", SEASON_FROM=null, SEASON_TO=null;
   var RATE_WINDOW_LABEL="темп за год", FALLBACK_COUNT=0, DEFAULT_LEAD=45;
+  var WINDOW_COVERED=true, NO_HISTORY_COUNT=0;
   var SENT_ORDERS=[];
   var PRODS=[], ASSIGN={}, ACTIVE_PROD=null;   // ACTIVE_PROD: id производства (main.id по умолчанию)
   // Оптимистично true до ответа /api/settings, чтобы не мигать кнопками у
@@ -479,6 +480,8 @@
     LEAD_TIME=d.lead_time_days||45;
     RATE_WINDOW=d.rate_window||"year";
     RATE_WINDOW_LABEL=d.rate_window_label||"темп за год";
+    WINDOW_COVERED=(d.window_covered===undefined)?true:!!d.window_covered;
+    NO_HISTORY_COUNT=d.no_history_count||0;
     FALLBACK_COUNT=d.fallback_count||0;
     SEASON_FROM=d.season_from||null; SEASON_TO=d.season_to||null;
     SENT_ORDERS=d.orders_in_production||[];
@@ -929,6 +932,22 @@
     if(FALLBACK_COUNT>0){
       html+='<span class="bdg" title="'+esc(fallbackHint())+'">'+fmt(FALLBACK_COUNT)+' '+
         plural(FALLBACK_COUNT,"поз.","поз.","поз.")+' посчитаны по годовому темпу</span>';
+    }
+    // История ещё грузится: ВСЕ числа на странице посчитаны по неполному окну.
+    // Сервер отдаёт это прямым текстом («страница обязана сказать это словами»),
+    // а страница до сих пор молчала — и предварительные цифры выглядели как
+    // окончательные.
+    if(WINDOW_COVERED===false){
+      html+='<span class="bdg warn" title="Первичная загрузка истории ещё идёт. '+
+        'Окно, по которому считается темп, загружено не целиком, поэтому '+
+        'количества предварительные — они вырастут по мере догрузки.">'+
+        '⚠ история ещё грузится — числа предварительные</span>';
+    }
+    if(NO_HISTORY_COUNT>0){
+      html+='<span class="bdg" title="Эти позиции не «распроданы в ноль» — по ним '+
+        'просто нет данных в загруженной части истории. Появятся после догрузки.">'+
+        fmt(NO_HISTORY_COUNT)+' '+plural(NO_HISTORY_COUNT,"поз.","поз.","поз.")+
+        ' ждут догрузки истории</span>';
     }
     var shown=visibleItems().length, total=items.length+excluded.length;
     html+='<span class="bdg" title="Всего разобрано позиций: '+fmt(total)+
