@@ -1,8 +1,24 @@
+# Сторож канала «Codex ревьюит → Claude чинит».
+#
+# Что он делает и, главное, чего НЕ делает. Он не вызывает ни одну модель: ни
+# OpenAI, ни Anthropic, ни через API, ни через action. Секретов ему не выдают,
+# и просить их незачем — он умеет ровно одно: заметить, что ревью Codex висит
+# без ответа, и сказать об этом в PR.
+#
+# Зачем он нужен при локальном диспетчере. Исправления делает macOS-машина
+# владельца. Она засыпает, уезжает в самолёте, теряет сеть и иногда просто
+# выключена. Со стороны GitHub такая машина неотличима от работающей: ревью
+# лежит, ответа нет, и молчание длится ровно столько, сколько никто не смотрит
+# в PR руками. Этот сторож превращает молчание в одну заметную строку.
+#
+# Порог в 90 минут выбран не «на глаз»: один прогон диспетчера — это `claude`
+# плюс полный набор тестов, а он занимает до получаса. Порог меньше часа давал
+# бы ложные тревоги на каждой длинной правке.
 name: Agent loop - watchdog
 
 on:
   schedule:
-    - cron: "*/10 * * * *"
+    - cron: "17 * * * *"
   workflow_dispatch:
 
 permissions: {}
@@ -16,109 +32,124 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
-      actions: write
+      # Единственное право: написать комментарий. Ни contents, ни actions —
+      # сторож ничего не запускает и ничего не читает из кода.
       issues: write
-      pull-requests: write
+    env:
+      # Логины ревьюеров через запятую. Переопределяется переменной репозитория
+      # AGENT_REVIEWER_LOGINS, если нативный Codex подписывается иначе.
+      REVIEWER_LOGINS: ${{ vars.AGENT_REVIEWER_LOGINS || 'chatgpt-codex-connector[bot]' }}
+      STALE_MINUTES: "90"
     steps:
-      - name: Restart lost or stale handoffs
+      - name: Найти ревью, оставшиеся без ответа
         uses: actions/github-script@v7
         with:
           script: |
             const repoFullName = `${context.repo.owner}/${context.repo.repo}`;
+            const staleMinutes = Number(process.env.STALE_MINUTES);
+            const logins = process.env.REVIEWER_LOGINS
+              .split(',')
+              .map(value => value.trim().toLowerCase())
+              .filter(Boolean)
+              .map(value => value.endsWith('[bot]') ? value.slice(0, -5) : value);
+
+            const isReviewer = (login) => {
+              if (!login) return false;
+              const normalized = login.toLowerCase();
+              const bare = normalized.endsWith('[bot]') ? normalized.slice(0, -5) : normalized;
+              return logins.includes(bare);
+            };
+
             const prs = await github.paginate(github.rest.pulls.list, {
               owner: context.repo.owner,
               repo: context.repo.repo,
               state: 'open',
               per_page: 100,
             });
+
+            // Только свои ветки claude/*. PR из форка не наш: туда мы не пишем
+            // и за его молчание не отвечаем.
             const agentPrs = prs.filter(pr =>
               !pr.draft &&
               pr.head.repo?.full_name === repoFullName &&
               pr.head.ref.startsWith('claude/')
             );
-            const markerPattern = /<!-- oborot-agent:v1 role=(codex|claude|system) status=([A-Z_]+) head=([0-9a-f]{40}) -->/;
+
             const now = Date.now();
+            let flagged = 0;
 
             for (const pr of agentPrs) {
+              const headSha = pr.head.sha;
+
+              const reviews = await github.paginate(github.rest.pulls.listReviews, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: pr.number,
+                per_page: 100,
+              });
+
+              // Ровно текущий HEAD. Ревью прошлого коммита уже неактуально:
+              // если бы оно было проблемой, проблемой был бы и прошлый коммит.
+              const forHead = reviews.filter(review =>
+                isReviewer(review.user?.login) &&
+                review.commit_id === headSha &&
+                ['CHANGES_REQUESTED', 'COMMENTED'].includes((review.state || '').toUpperCase())
+              );
+              if (forHead.length === 0) continue;
+
+              const newest = forHead.reduce((a, b) =>
+                new Date(a.submitted_at) > new Date(b.submitted_at) ? a : b);
+              const ageMinutes = (now - new Date(newest.submitted_at).getTime()) / 60000;
+              if (ageMinutes < staleMinutes) continue;
+
               const comments = await github.paginate(github.rest.issues.listComments, {
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 issue_number: pr.number,
                 per_page: 100,
               });
-              const states = comments.flatMap(comment => {
-                const match = comment.body?.match(markerPattern);
-                return match ? [{
-                  role: match[1],
-                  status: match[2],
-                  head: match[3],
-                  createdAt: new Date(comment.created_at).getTime(),
-                }] : [];
-              });
-              if (states.length === 0) continue;
 
-              const latest = states[states.length - 1];
-              const ageMinutes = (now - latest.createdAt) / 60000;
-              const currentHead = pr.head.sha;
-              if (latest.status === 'APPROVE' || latest.status === 'BLOCKED' ||
-                  latest.status === 'NEEDS_HUMAN') {
-                continue;
-              }
+              // Диспетчер отчитывается маркером с точным SHA. Есть маркер —
+              // значит машина проснулась и ответила, сторожу говорить нечего.
+              const answered = comments.some(comment =>
+                (comment.body || '').includes('<!-- oborot-bridge:v1') &&
+                (comment.body || '').includes(`head=${headSha}`)
+              );
+              if (answered) continue;
 
-              let workflow;
-              let inputs;
-              let reason;
+              const marker = `<!-- oborot-watchdog:v2 status=NO_LOCAL_DISPATCHER head=${headSha} -->`;
+              if (comments.some(comment => (comment.body || '').includes(marker))) continue;
 
-              if (latest.role === 'codex' && latest.status === 'REQUEST_CHANGES' &&
-                  latest.head === currentHead && ageMinutes >= 15) {
-                workflow = 'agent-claude-fix.yml';
-                inputs = { pr_number: String(pr.number), expected_head: currentHead };
-                reason = 'handoff to Claude was not acknowledged for 15 minutes';
-              } else if (latest.role === 'claude' && latest.status === 'DONE' &&
-                         latest.head === currentHead && ageMinutes >= 15) {
-                workflow = 'agent-codex-review.yml';
-                inputs = { pr_number: String(pr.number), expected_head: currentHead };
-                reason = 'new Claude commit was not reviewed for 15 minutes';
-              } else if (latest.status === 'WORKING' && ageMinutes >= 70) {
-                workflow = latest.role === 'claude'
-                  ? 'agent-claude-fix.yml'
-                  : 'agent-codex-review.yml';
-                inputs = { pr_number: String(pr.number), expected_head: currentHead };
-                reason = `${latest.role} remained WORKING for ${Math.floor(ageMinutes)} minutes`;
-              } else if (latest.head !== currentHead && ageMinutes >= 15) {
-                workflow = 'agent-codex-review.yml';
-                inputs = { pr_number: String(pr.number), expected_head: currentHead };
-                reason = 'PR HEAD changed without a matching review state';
-              }
-
-              if (!workflow) continue;
-
-              const matchingStarts = states.filter(state =>
-                state.head === currentHead && state.status === 'WORKING' &&
-                state.role === (workflow.includes('claude') ? 'claude' : 'codex')
-              ).length;
-              const humanMarker = `<!-- oborot-agent:v1 role=system status=NEEDS_HUMAN head=${currentHead} -->`;
-              if (matchingStarts >= 3) {
-                if (!comments.some(comment => comment.body?.includes(humanMarker))) {
-                  await github.rest.issues.createComment({
-                    owner: context.repo.owner,
-                    repo: context.repo.repo,
-                    issue_number: pr.number,
-                    body: [
-                      humanMarker,
-                      `Watchdog остановил автоматические повторы: ${workflow} запускался трижды для ${currentHead}.`,
-                    ].join('\n\n'),
-                  });
-                }
-                continue;
-              }
-
-              core.info(`Dispatching ${workflow} for PR #${pr.number}: ${reason}`);
-              await github.rest.actions.createWorkflowDispatch({
+              await github.rest.issues.createComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                workflow_id: workflow,
-                ref: pr.base.ref,
-                inputs,
+                issue_number: pr.number,
+                body: [
+                  marker,
+                  '',
+                  '**watchdog — ревью Codex без ответа**',
+                  '',
+                  `Замечания к \`${headSha}\` лежат уже ${Math.floor(ageMinutes)} мин, ` +
+                  'а локальный диспетчер на них не ответил.',
+                  '',
+                  'Обычная причина — машина владельца спит, выключена или без сети: ' +
+                  'исправления делает локальный `claude` под подпиской, а не GitHub Actions. ' +
+                  'Этот сторож моделей не вызывает и починить ничего не может.',
+                  '',
+                  'Что проверить на машине:',
+                  '',
+                  '```',
+                  'tools/agent-bridge/run.sh health',
+                  'tools/agent-bridge/run.sh status --remote',
+                  'tools/agent-bridge/run.sh logs -n 100',
+                  '```',
+                  '',
+                  'Если диспетчер уже поставил `NEEDS_HUMAN` для этого SHA — три попытки ' +
+                  'исчерпаны, и дальше нужно решение человека, а не перезапуск.',
+                ].join('\n'),
               });
+              flagged += 1;
+              core.warning(`PR #${pr.number}: ревью для ${headSha.slice(0, 8)} без ответа ${Math.floor(ageMinutes)} мин`);
             }
+
+            core.info(`Проверено PR: ${agentPrs.length}, отмечено без ответа: ${flagged}`);
