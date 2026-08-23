@@ -10,6 +10,10 @@ WorkingDirectory=/opt/oborot/app-src
 ExecStart=/bin/bash /opt/oborot/app-src/deploy/offsite_restore_drill.sh
 # Учение поднимает приложение на восстановленной базе на отдельном порту.
 Environment=RESTORE_PORT=8099
+# OBOROT_SECRET здесь нет и быть не может: учение обязано проверять ОТДЕЛЬНУЮ
+# офсайт-копию секрета (OBOROT_RECOVERY_SECRET_FILE в /opt/oborot/backup.env),
+# а не тот ключ, который и так лежит на этой машине. С секретом в окружении
+# скрипт откажется работать намеренно.
 Nice=15
 IOSchedulingClass=idle
 # Полная проверка данных читает всё хранилище: на медленном канале это долго.

@@ -14,9 +14,15 @@
   2) выгрузка пустой базы. Пустая база проходит integrity_check и любую
      проверку схемы; через две недели ротации в хранилище останутся только
      исправные пустые копии;
-  3) ротация после неудачной загрузки. Если `forget --prune` выполнится, когда
-     новый снимок НЕ доехал, скрипт своими руками удалит последнюю хорошую
-     копию — ровно в тот день, когда что-то пошло не так.
+  3) ротация после неудачной загрузки ИЛИ до проверки хранилища. Если
+     `forget --prune` выполнится, когда новый снимок не доехал или когда
+     `check` ещё не сказал, что хранилище цело, скрипт своими руками удалит
+     последнюю хорошую копию — ровно в тот день, когда что-то пошло не так;
+  4) учение на базе, все токены интеграции в которой нечитаемы. Данные
+     доехали, приложение стартовало, отчёт зелёный — а синхронизация и запись
+     в МойСклад не работают, потому что OBOROT_SECRET в копии нет и не должно
+     быть. Учение обязано расшифровать настоящий токен ОТДЕЛЬНОЙ офсайт-копией
+     секрета, и без неё оно не начинается.
 
 restic в наборе подставной: настоящий требует хранилища, а нам нужно проверить
 поведение скрипта, в том числе при отказах, которые на настоящем хранилище по
@@ -95,6 +101,15 @@ case "$CMD" in
     cp -r "$FAKE_REPO/snapshot/." "$TARGET/"
     echo "restored"
     ;;
+  snapshots)
+    # Как настоящий restic: снимков нет — это УСПЕХ с пустым списком, а не
+    # ошибка. Скрипт обязан отличать одно от другого сам.
+    if [ -d "$FAKE_REPO/snapshot" ]; then
+      echo '[{"id":"подставной","tags":["oborot-db"]}]'
+    else
+      echo '[]'
+    fi
+    ;;
   forget|check|init) echo "$CMD ok" ;;
   *) echo "подставной restic не знает команду $CMD" >&2; exit 1 ;;
 esac
@@ -108,18 +123,36 @@ def write_fake_restic(path: Path) -> None:
     path.chmod(0o755)
 
 
+# Секрет приложения, которым зашифрован токен в подставной боевой базе. В день
+# аварии именно его копию берут с собой — и именно она проверяется учением.
+LIVE_SECRET = "офсайтовый-секрет-приложения-9f3a"
+LIVE_TOKEN = "ms-token-проверочный-0001"
+
+
 def make_live_db(path: Path) -> None:
-    """Боевая база: схему делает само приложение, а не выдуманный SQL."""
+    """Боевая база: схему делает само приложение, а не выдуманный SQL.
+
+    Вместе с организацией кладём НАСТОЯЩИЙ зашифрованный токен интеграции:
+    без него учение проверяло бы расшифрование на пустом множестве и проходило
+    бы на базе, из которой доступ к МойСкладу не восстанавливается.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     code = (
-        "import os\n"
+        "import os, sqlite3\n"
         f"os.environ['DATABASE_URL']='sqlite:///{path}'\n"
         "os.environ['SCHEDULER_ENABLED']='0'\n"
+        f"os.environ['OBOROT_SECRET']={LIVE_SECRET!r}\n"
         "from fastapi.testclient import TestClient\n"
         "from app.main import app\n"
+        "from app.crypto import encrypt_token\n"
         "with TestClient(app, headers={'X-Oborot-CSRF':'1'}) as c:\n"
         "    c.post('/register', data={'name':'v','email':'off@test.io',\n"
         "        'password':'secret123','org_name':'Офсайт-бренд'})\n"
+        f"con = sqlite3.connect({str(path)!r})\n"
+        "con.execute(\"INSERT INTO connections (org_id, kind, token_enc, status,"
+        " config_json) VALUES (1,'moysklad',?,'active','{}')\","
+        f" (encrypt_token({LIVE_TOKEN!r}),))\n"
+        "con.commit(); con.close()\n"
     )
     subprocess.run([sys.executable, "-c", code], cwd=str(ROOT), check=True,
                    capture_output=True, text=True)
@@ -156,6 +189,21 @@ class Env:
         self.restic = self.dir / "bin" / "restic"
         write_fake_restic(self.restic)
         self.repo = repo
+        # Копия секрета приложения — та, что в жизни лежит вне сервера.
+        self.recovery = self.dir / "recovery-secret"
+        self.recovery.write_text(LIVE_SECRET + "\n", encoding="utf-8")
+        # Учение проверяет расшифрование и подъём приложения интерпретатором из
+        # venv приложения: ему нужны и cryptography, и uvicorn, и сам пакет app.
+        #
+        # Здесь не символическая ссылка, а обёртка: ссылка на интерпретатор
+        # ЧУЖОГО venv уводит Python на базовый префикс — свои site-packages он
+        # ищет по pyvenv.cfg рядом с собой, а его в подставном каталоге нет.
+        # Внешне такой venv выглядит рабочим и падает на первом же импорте.
+        self.venv = self.dir / "venv"
+        (self.venv / "bin").mkdir(parents=True, exist_ok=True)
+        shim = self.venv / "bin" / "python"
+        shim.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n', encoding="utf-8")
+        shim.chmod(0o755)
 
     def repo_initialized(self, yes: bool = True) -> None:
         cfg = self.repo_dir / "config"
@@ -175,12 +223,17 @@ class Env:
             "FAKE_REPO": str(self.repo_dir),
             "FAKE_LOG": str(self.log),
             "OBOROT_DRILL_BOOT_APP": "0",
+            "OBOROT_RECOVERY_SECRET_FILE": str(self.recovery),
+            "OBOROT_VENV": str(self.venv),
         }
         e.update({k: str(v) for k, v in extra.items()})
         return e
 
     def run(self, script: Path, args=None, timeout: int = 180, **extra):
         env = dict(os.environ)
+        # Секрет приложения не должен просачиваться из окружения прогона:
+        # учение обязано брать его только из офсайт-копии.
+        env.pop("OBOROT_SECRET", None)
         env.update(self.env(**extra))
         p = subprocess.run(["bash", str(script), *(args or [])],
                            capture_output=True, text=True, env=env,
@@ -239,8 +292,10 @@ def main() -> int:
     check("успех", rc == 0, out.strip().splitlines()[-1] if out.strip() else f"код {rc}")
     calls = e.calls()
     order = [c.split()[0] for c in calls]
-    check("порядок: cat → backup → forget → check",
-          order == ["cat", "backup", "forget", "check"], " → ".join(order))
+    # Порядок и есть проверяемое поведение: сначала убеждаемся, что новый
+    # снимок виден и хранилище цело, и только потом срезаем старое.
+    check("порядок: cat → backup → snapshots → check → forget",
+          order == ["cat", "backup", "snapshots", "check", "forget"], " → ".join(order))
     check("снимок помечен тегом", any("--tag oborot-db" in c for c in calls))
     check("ротация с --prune", any("--prune" in c for c in calls))
     stamp = e.state / "last-offsite-backup"
@@ -297,6 +352,79 @@ def main() -> int:
           " | ".join(e.calls()))
     check("отметки об успехе нет", not (e.state / "last-offsite-backup").exists())
 
+    # ---------------------------------------------------------------- 6а
+    print("\n== 6а. Хранилище не прошло check — ротации НЕ БУДЕТ ==")
+    # Прежний порядок был backup → forget --prune → check. Повреждение
+    # обнаруживалось уже ПОСЛЕ того, как старые снимки срезаны, — то есть в
+    # единственном случае, ради которого проверка существует, копий, которыми
+    # можно пережить повреждение, к этому моменту уже не было.
+    e = Env("check-failed")
+    shutil.copy(seed, _mk(e.db))
+    e.repo_initialized()
+    rc, out = e.run(BACKUP, FAKE_RESTIC_FAIL="check")
+    check("скрипт упал на проверке хранилища", rc != 0, f"код {rc}")
+    calls = e.calls()
+    check("новая копия при этом загружена", any(c.startswith("backup") for c in calls),
+          " | ".join(calls))
+    check("РОТАЦИИ НЕ БЫЛО: forget/prune не вызывался",
+          not any(c.startswith("forget") for c in calls), " | ".join(calls))
+    check("сказано, что старые копии целы", "старые копии целы" in out,
+          out.strip().splitlines()[-1] if out.strip() else "")
+    check("отметки об успехе нет", not (e.state / "last-offsite-backup").exists())
+
+    # ---------------------------------------------------------------- 6б
+    print("\n== 6б. Нового снимка не видно — ротации НЕ БУДЕТ ==")
+    # `restic backup` вернул ноль, а снимка в хранилище нет. Такое бывает при
+    # рассинхронизации кэша и репозитория; удалять старое в этот момент нельзя.
+    e = Env("snapshot-missing")
+    shutil.copy(seed, _mk(e.db))
+    e.repo_initialized()
+    rc, out = e.run(BACKUP, FAKE_RESTIC_FAIL="snapshots")
+    check("скрипт упал", rc != 0, f"код {rc}")
+    check("ротации не было",
+          not any(c.startswith("forget") for c in e.calls()), " | ".join(e.calls()))
+    check("проверки хранилища тоже не было — незачем",
+          not any(c.startswith("check") for c in e.calls()), " | ".join(e.calls()))
+    check("названа причина", "список снимков" in out,
+          out.strip().splitlines()[-1] if out.strip() else "")
+
+    # Отдельный случай, и он опаснее: `restic snapshots` при отсутствии снимков
+    # завершается УСПЕШНО с пустым списком. Скрипт, проверяющий только код
+    # возврата, здесь спокойно пошёл бы удалять старые копии.
+    e = Env("snapshot-empty")
+    shutil.copy(seed, _mk(e.db))
+    e.repo_initialized()
+    # Хранилище «принимает» загрузку, но снимка после неё не появляется.
+    (e.dir / "bin" / "restic").write_text(
+        FAKE_RESTIC.replace('  backup)\n    mkdir -p "$FAKE_REPO/snapshot"',
+                            '  backup)\n    mkdir -p "$FAKE_REPO/пусто"'),
+        encoding="utf-8")
+    (e.dir / "bin" / "restic").chmod(0o755)
+    rc, out = e.run(BACKUP)
+    check("пустой список снимков — это отказ, а не успех", rc != 0, f"код {rc}")
+    check("РОТАЦИИ НЕ БЫЛО",
+          not any(c.startswith("forget") for c in e.calls()), " | ".join(e.calls()))
+    check("сказано, что старые копии целы", "старые копии целы" in out,
+          out.strip().splitlines()[-1] if out.strip() else "")
+
+    # ---------------------------------------------------------------- 6в
+    print("\n== 6в. В хранилище уезжают только база и манифест ==")
+    e = Env("no-secrets")
+    shutil.copy(seed, _mk(e.db))
+    e.repo_initialized()
+    rc, out = e.run(BACKUP)
+    check("копия загружена", rc == 0, f"код {rc}")
+    uploaded = sorted(p.name for p in (e.repo_dir / "snapshot").iterdir())
+    check("в снимке ровно два файла", uploaded == ["manifest.txt", "oborot.db"], str(uploaded))
+    blob = b""
+    for p in e.repo_dir.rglob("*"):
+        if p.is_file():
+            blob += p.read_bytes()
+    check("СЕКРЕТ ПРИЛОЖЕНИЯ В ХРАНИЛИЩЕ НЕ УЕХАЛ",
+          LIVE_SECRET.encode() not in blob)
+    check("пароль restic в хранилище не уехал",
+          "не настоящий пароль".encode() not in blob)
+
     # ---------------------------------------------------------------- 7
     print("\n== 7. Блокировка от одновременного запуска ==")
     e = Env("lock")
@@ -329,8 +457,16 @@ def main() -> int:
     check("порядок: cat → check → restore", order == ["cat", "check", "restore"], " → ".join(order))
     check("проверка читает сами данные", any("--read-data" in c for c in e.calls()),
           " | ".join(e.calls()))
+    check("токен интеграции расшифрован офсайт-копией секрета",
+          "токены расшифровываются" in out,
+          out.strip().splitlines()[-1] if out.strip() else "")
+    check("сам токен нигде не напечатан", LIVE_TOKEN not in out)
+    check("сам секрет нигде не напечатан", LIVE_SECRET not in out)
     drill_stamp = e.state / "last-offsite-drill"
     check("отметка об учении записана", drill_stamp.exists())
+    check("в отметке видно, что токены проверены",
+          "tokens=да" in drill_stamp.read_text(encoding="utf-8"),
+          drill_stamp.read_text(encoding="utf-8").strip() if drill_stamp.exists() else "")
 
     # ---------------------------------------------------------------- 9
     print("\n== 9. Учение: восстановилась пустая база ==")
@@ -406,15 +542,100 @@ def main() -> int:
     shutil.copy(seed, _mk(e.db))
     e.repo_initialized()
     e.run(BACKUP)
-    venv = WORK / "drill-boot" / "venv"
-    (venv / "bin").mkdir(parents=True, exist_ok=True)
-    (venv / "bin" / "python").symlink_to(sys.executable)
     rc, out = e.run(DRILL, timeout=300, OBOROT_DRILL_BOOT_APP="1",
-                    OBOROT_VENV=str(venv), RESTORE_PORT=next(_ports))
+                    RESTORE_PORT=next(_ports))
     check("приложение поднялось на восстановленной базе", rc == 0,
           out.strip().splitlines()[-1] if out.strip() else f"код {rc}")
     check("проверка запуском действительно выполнялась",
           "ВОССТАНОВЛЕНИЕ ПРОВЕРЕНО" in out)
+
+    # --------------------------------------------------------------- 13а
+    print("\n== 13а. Учение без копии секрета не начинается ==")
+    # Fail-closed. Мягкий вариант («секрета нет — просто не проверяем») дал бы
+    # зелёное учение, которое молчит ровно о том, ради чего проводится.
+    e = Env("drill-no-secret")
+    shutil.copy(seed, _mk(e.db))
+    e.repo_initialized()
+    e.run(BACKUP)
+    e.log.write_text("", encoding="utf-8")
+    rc, out = e.run(DRILL, OBOROT_RECOVERY_SECRET_FILE="")
+    check("без OBOROT_RECOVERY_SECRET_FILE учение провалено", rc != 0, f"код {rc}")
+    check("сказано, чего не хватает и почему", "OBOROT_RECOVERY_SECRET_FILE" in out
+          and "расшифров" in out, out.strip().splitlines()[0] if out.strip() else "")
+    check("отказ ДО обращения к хранилищу", e.calls() == [], " | ".join(e.calls()))
+
+    rc, out = e.run(DRILL, OBOROT_RECOVERY_SECRET_FILE=str(e.dir / "нет-такого-файла"))
+    check("несуществующая копия секрета — отказ", rc != 0, f"код {rc}")
+    empty = e.dir / "пустой-секрет"
+    empty.write_text("", encoding="utf-8")
+    rc, out = e.run(DRILL, OBOROT_RECOVERY_SECRET_FILE=str(empty))
+    check("пустая копия секрета — отказ", rc != 0, f"код {rc}")
+    check("названа причина", "пуста" in out, out.strip().splitlines()[-1] if out.strip() else "")
+
+    rc, out = e.run(DRILL, OBOROT_RECOVERY_SECRET_FILE=str(e.password))
+    check("копия секрета и пароль restic не могут быть одним файлом", rc != 0, f"код {rc}")
+
+    # --------------------------------------------------------------- 13б
+    print("\n== 13б. Секрет из окружения проверку не заменяет ==")
+    # С OBOROT_SECRET в окружении учение доказывало бы, что сервер знает свой
+    # собственный ключ. Это не то утверждение, которое нужно в день аварии.
+    rc, out = e.run(DRILL, OBOROT_SECRET=LIVE_SECRET)
+    check("учение с секретом в окружении отказывается идти", rc != 0, f"код {rc}")
+    check("сказано, почему это не проверка", "офсайт-копию секрета" in out,
+          out.strip().splitlines()[-1] if out.strip() else "")
+
+    # --------------------------------------------------------------- 13в
+    print("\n== 13в. Чужая копия секрета — учение провалено ==")
+    # Самый вероятный сценарий из реальных: OBOROT_SECRET на сервере сменили,
+    # а копию для восстановления не обновили. Данные при этом восстанавливаются
+    # полностью, приложение стартует — и интеграция мертва.
+    e = Env("drill-wrong-secret")
+    shutil.copy(seed, _mk(e.db))
+    e.repo_initialized()
+    e.run(BACKUP)
+    wrong = e.dir / "чужой-секрет"
+    wrong.write_text("совсем-другой-секрет\n", encoding="utf-8")
+    rc, out = e.run(DRILL, OBOROT_RECOVERY_SECRET_FILE=str(wrong))
+    check("учение провалено", rc != 0, f"код {rc}")
+    check("названо, что именно не сходится", "не расшифровывает" in out,
+          out.strip().splitlines()[-1] if out.strip() else "")
+    check("отметки об успешном учении нет",
+          not (e.state / "last-offsite-drill").exists())
+
+    # --------------------------------------------------------------- 13г
+    print("\n== 13г. Токенов в копии нет — учение это говорит вслух ==")
+    # Не отказ (у организации может не быть подключения), но и не молчаливый
+    # успех: в отметке остаётся tokens=нечего, а в выводе — прямая оговорка.
+    e = Env("drill-no-tokens")
+    shutil.copy(seed, _mk(e.db))
+    e.repo_initialized()
+    e.run(BACKUP)
+    con = sqlite3.connect(e.repo_dir / "snapshot" / "oborot.db")
+    con.execute("DELETE FROM connections")
+    con.commit()
+    con.close()
+    rc, out = e.run(DRILL)
+    check("учение пройдено", rc == 0, out.strip().splitlines()[-1] if out.strip() else f"код {rc}")
+    check("сказано, что доступ к МойСкладу НЕ проверен",
+          "не сохранность доступа" in out,
+          " / ".join(out.strip().splitlines()[-3:]))
+    check("в отметке это видно",
+          "tokens=нечего" in (e.state / "last-offsite-drill").read_text(encoding="utf-8"))
+
+    # --------------------------------------------------------------- 13д
+    print("\n== 13д. Таймауты у юнитов systemd заданы ==")
+    # Type=oneshot живёт с DefaultTimeoutStartSec (обычно 90 с), если не сказано
+    # иначе: systemd убил бы копию посреди загрузки, а в журнале осталось бы
+    # «timeout» — и никто не узнал бы, что копий нет, до дня аварии.
+    for unit in ("oborot-offsite-backup.service", "oborot-offsite-drill.service"):
+        text = (ROOT / "deploy" / "systemd" / unit).read_text(encoding="utf-8")
+        line = [ln for ln in text.splitlines() if ln.startswith("TimeoutStartSec=")]
+        check(f"{unit}: TimeoutStartSec задан", len(line) == 1, str(line))
+        check(f"{unit}: таймаут не меньше часа",
+              bool(line) and line[0].split("=")[1].strip() in ("1h", "2h", "3h", "4h", "6h")
+              or bool(line) and line[0].split("=")[1].strip().isdigit()
+              and int(line[0].split("=")[1]) >= 3600,
+              line[0] if line else "нет строки")
 
     # --------------------------------------------------------------- 14
     print("\n== 14. Нет пароля — нет работы ==")
