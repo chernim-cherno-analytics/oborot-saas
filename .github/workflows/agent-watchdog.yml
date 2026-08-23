@@ -79,6 +79,93 @@ jobs:
               String.raw`no comments to post|didn't find any)`,
               'i');
 
+            // --- clean-verdict:start ---
+            // Порт `is_clean_verdict` из tools/agent-bridge/bridge.py. Шаблон
+            // применяется НЕ подстрокой: тело «No blocking issues, but the
+            // retry path still loses findings» первыми словами совпадает с
+            // шаблоном, а замечание в нём настоящее. Считая такое тело пустым,
+            // сторож молчал бы ровно там, где обязан кричать.
+            //
+            // Списки слов обязаны совпадать со списками диспетчера дословно —
+            // это проверяется тестом (tests/test_agent_bridge.py). Разойдутся —
+            // сторож и диспетчер снова начнут по-разному понимать «замечаний
+            // нет», а обнаружится это только по потерянному замечанию.
+            const VERDICT_FILLER = new Set([
+              'a', 'an', 'the', 'this', 'that', 'these', 'those', 'it', 'i', 'we', 'you',
+              'my', 'your', 'me', 'us', 'am', 'is', 'are', 'was', 'were', 'be', 'been',
+              'have', 'has', 'had', 'do', 'does', 'did', 'in', 'on', 'of', 'to', 'for',
+              'with', 'from', 'at', 'and', 'here', 'all', 'any', 'so', 'far', 'overall',
+              'again', 'now', 'new', 'latest', 'head', 'current', 'side',
+              'pr', 'prs', 'pull', 'request', 'requests', 'review', 'reviewed',
+              'reviewer', 'codex', 'changes', 'change', 'changeset', 'code', 'diff',
+              'commit', 'commits', 'branch', 'file', 'files', 'patch',
+              'found', 'find', 'see', 'seen', 'look', 'looks', 'looking', 'seems',
+              'good', 'great', 'fine', 'well', 'nice', 'clean', 'ok', 'okay', 'solid',
+              'nothing', 'none', 'no', 'not',
+              'issue', 'issues', 'problem', 'problems', 'concern', 'concerns',
+              'blocker', 'blockers', 'blocking', 'major', 'significant', 'critical',
+              'serious', 'thanks', 'thank',
+              'и', 'в', 'во', 'к', 'ко', 'по', 'у', 'на', 'с', 'со', 'для', 'от', 'из',
+              'это', 'этот', 'этом', 'этому', 'эти', 'тут', 'здесь', 'тот', 'том',
+              'я', 'мы', 'мне', 'меня', 'нет', 'не', 'ничего',
+              'замечание', 'замечания', 'замечаний', 'проблем', 'проблема', 'проблемы',
+              'претензий', 'претензии', 'вопросов', 'вопросы',
+              'нашёл', 'нашел', 'нашлось', 'вижу', 'видно', 'есть',
+              'код', 'коде', 'коду', 'кода', 'изменения', 'изменениям', 'изменениях',
+              'правки', 'правкам', 'ревью', 'коммит', 'коммите', 'ветке', 'ветка',
+              'всё', 'все', 'хорошо', 'отлично', 'порядке', 'порядок', 'ок', 'спасибо',
+              'выглядит', 'выглядят', 'смотрится',
+            ]);
+            const VERDICT_CONTRAST = new Set([
+              'but', 'however', 'though', 'although', 'yet', 'except', 'aside',
+              'besides', 'still', 'nevertheless', 'nonetheless', 'minor', 'nit',
+              'nits', 'nitpick', 'suggestion', 'suggestions', 'consider', 'please',
+              'но', 'однако', 'хотя', 'лишь', 'кроме', 'правда', 'зато', 'впрочем',
+            ]);
+            const BOILERPLATE_LINE = new RegExp(
+              String.raw`(codex review\s*$|about codex|reviewed commit|useful\?\s*react|` +
+              String.raw`react with|automated review suggestions|полезно\?\s*реакция)`,
+              'i');
+            // Новый объект на каждый разбор: у глобального регулярного
+            // выражения в JS есть память (`lastIndex`), и общий экземпляр
+            // молча пропускал бы часть слов через раз.
+            const words = (text) => text.match(/[\p{L}\p{N}'’_-]+/gu) || [];
+
+            const stripReviewDecoration = (body) => {
+              let text = body.replace(/<details[\s\S]*?<\/details>/gi, ' ');
+              text = text.replace(/```[\s\S]*?```/g, ' ');
+              text = text.replace(/!\[[^\]]*\]\([^)]*\)/g, ' ');
+              text = text.replace(/\[([^\]]*)\]\([^)]*\)/g, '$1');
+              text = text.replace(/<[^>]+>/g, ' ');
+              return text
+                .split('\n')
+                .map(line => line.trim().replace(/^#+|#+$/g, '').trim())
+                .filter(line => words(line).length > 0 && !BOILERPLATE_LINE.test(line))
+                .join('\n');
+            };
+
+            const tokens = (text) => words(text.toLowerCase());
+
+            const sentenceIsClean = (sentence) => {
+              if (tokens(sentence).some(token => VERDICT_CONTRAST.has(token))) return false;
+              const match = noopPattern.exec(sentence);
+              if (!match) return false;
+              const rest = sentence.slice(0, match.index) + ' ' +
+                           sentence.slice(match.index + match[0].length);
+              return tokens(rest).every(token => VERDICT_FILLER.has(token));
+            };
+
+            // Тело из одной обвязки чистым НЕ считается: про такое тело мы
+            // ничего не знаем, а незнание должно будить тревогу, а не гасить её.
+            const isCleanVerdict = (body) => {
+              const sentences = stripReviewDecoration(body)
+                .split(/[.!?;\n]+/)
+                .map(part => part.trim())
+                .filter(part => tokens(part).length > 0);
+              return sentences.length > 0 && sentences.every(sentenceIsClean);
+            };
+            // --- clean-verdict:end ---
+
             const prs = await github.paginate(github.rest.pulls.list, {
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -128,8 +215,8 @@ jobs:
               // помечает CLEAN и НИЧЕГО не пишет в PR — маркера не появляется.
               // Сторож, считающий любое COMMENTED заданием, через 90 минут
               // объявлял бы тревогу по чистому SHA. Признак тот же, что у
-              // диспетчера: есть inline-замечания либо непустое тело ревью, не
-              // подпадающее под шаблон «замечаний нет».
+              // диспетчера: есть inline-замечания либо тело ревью, которое
+              // целиком не является чистым вердиктом (см. isCleanVerdict).
               const inlineComments = await github.paginate(github.rest.pulls.listReviewComments, {
                 owner: context.repo.owner,
                 repo: context.repo.repo,
@@ -160,7 +247,7 @@ jobs:
               );
               const actionable = inlineForHead.length > 0 || forHead.some(review => {
                 const body = (review.body || '').trim();
-                return body.length > 0 && !noopPattern.test(body);
+                return body.length > 0 && !isCleanVerdict(body);
               });
               if (!actionable) {
                 core.info(`PR #${pr.number}: ревью для ${headSha.slice(0, 8)} без замечаний, пропускаю`);

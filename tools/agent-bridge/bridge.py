@@ -663,6 +663,123 @@ class GitHub:
                  paginate=False, method="POST", body={"body": redact(body)})
 
 
+# --------------------------------------------------------------------------
+# «Замечаний нет» — целиком, а не по кусочку
+# --------------------------------------------------------------------------
+#
+# Шаблон NOOP_REVIEW_PATTERN раньше применялся подстрокой: любое вхождение
+# похвалы где угодно в теле объявляло всё ревью пустым. Ревьюер пишет иначе.
+# «No blocking issues, but the retry path still loses findings» и «Looks good
+# overall; however …» — это НАСТОЯЩИЕ замечания, у которых первые три слова
+# совпадают с шаблоном. Такое ревью и диспетчер, и сторож молча выбрасывали:
+# один не будил Claude, второй не поднимал тревогу, и замечание не доезжало
+# никуда.
+#
+# Правило теперь противоположное: чистым считается тело, у которого чистый ВЕСЬ
+# смысл. Тело режется на предложения, и каждое обязано быть вердиктом «нечего
+# чинить»: совпасть с шаблоном и не нести вокруг совпадения ничего, кроме слов
+# без собственного содержания. Осталось хоть одно слово с содержанием — тело
+# actionable. Ошибка в эту сторону стоит одного лишнего прогона Claude; ошибка
+# в другую сторону стоит потерянного замечания, и её не видно.
+
+# Слова, которые вокруг вердикта ничего не добавляют: обращения, названия
+# самого ревью, служебные предлоги, синонимы слова «замечание». Список закрытый
+# и намеренно короткий: всё, чего в нём нет, считается содержанием.
+VERDICT_FILLER = {
+    # английский
+    "a", "an", "the", "this", "that", "these", "those", "it", "i", "we", "you",
+    "my", "your", "me", "us", "am", "is", "are", "was", "were", "be", "been",
+    "have", "has", "had", "do", "does", "did", "in", "on", "of", "to", "for",
+    "with", "from", "at", "and", "here", "all", "any", "so", "far", "overall",
+    "again", "now", "new", "latest", "head", "current", "side",
+    "pr", "prs", "pull", "request", "requests", "review", "reviewed",
+    "reviewer", "codex", "changes", "change", "changeset", "code", "diff",
+    "commit", "commits", "branch", "file", "files", "patch",
+    "found", "find", "see", "seen", "look", "looks", "looking", "seems",
+    "good", "great", "fine", "well", "nice", "clean", "ok", "okay", "solid",
+    "nothing", "none", "no", "not",
+    "issue", "issues", "problem", "problems", "concern", "concerns",
+    "blocker", "blockers", "blocking", "major", "significant", "critical",
+    "serious", "thanks", "thank",
+    # русский
+    "и", "в", "во", "к", "ко", "по", "у", "на", "с", "со", "для", "от", "из",
+    "это", "этот", "этом", "этому", "эти", "тут", "здесь", "тот", "том",
+    "я", "мы", "мне", "меня", "нет", "не", "ничего",
+    "замечание", "замечания", "замечаний", "проблем", "проблема", "проблемы",
+    "претензий", "претензии", "вопросов", "вопросы",
+    "нашёл", "нашел", "нашлось", "вижу", "видно", "есть",
+    "код", "коде", "коду", "кода", "изменения", "изменениям", "изменениях",
+    "правки", "правкам", "ревью", "коммит", "коммите", "ветке", "ветка",
+    "всё", "все", "хорошо", "отлично", "порядке", "порядок", "ок", "спасибо",
+    "выглядит", "выглядят", "смотрится",
+}
+
+# Слова-переломы. Если ревьюер вставил хоть одно, дальше идёт оговорка, и
+# вердикт по определению не чистый: именно так выглядят оба примера из ревью.
+VERDICT_CONTRAST = {
+    "but", "however", "though", "although", "yet", "except", "aside",
+    "besides", "still", "nevertheless", "nonetheless", "minor", "nit",
+    "nits", "nitpick", "suggestion", "suggestions", "consider", "please",
+    "но", "однако", "хотя", "лишь", "кроме", "правда", "зато", "впрочем",
+}
+
+# Строки-обвязка вокруг вердикта: заголовок ревью Codex, служебная подпись,
+# ссылка на настройки. Смысла в них нет ни на копейку, но слова в них есть,
+# и без вычистки любое ревью Codex выглядело бы «с содержанием».
+BOILERPLATE_LINE = re.compile(
+    r"(codex review\s*$|about codex|reviewed commit|useful\?\s*react|"
+    r"react with|automated review suggestions|полезно\?\s*реакция)",
+    re.IGNORECASE)
+
+
+def strip_review_decoration(body: str) -> str:
+    """Убрать из тела ревью всё, что не является текстом ревьюера."""
+    text = re.sub(r"<details.*?</details>", " ", body, flags=re.S | re.I)
+    text = re.sub(r"```.*?```", " ", text, flags=re.S)
+    text = re.sub(r"!\[[^\]]*\]\([^)]*\)", " ", text)      # бейджи-картинки
+    text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", text)   # ссылки → их текст
+    text = re.sub(r"<[^>]+>", " ", text)                   # остатки разметки
+    kept = []
+    for raw in text.splitlines():
+        line = raw.strip().strip("#").strip()
+        if not line or not re.search(r"\w", line, re.UNICODE):
+            continue
+        if BOILERPLATE_LINE.search(line):
+            continue
+        kept.append(line)
+    return "\n".join(kept)
+
+
+def _sentence_is_clean(sentence: str, noop_pattern: re.Pattern) -> bool:
+    """Предложение целиком означает «чинить нечего»."""
+    tokens = re.findall(r"[\w'’-]+", sentence.lower(), re.UNICODE)
+    if any(token in VERDICT_CONTRAST for token in tokens):
+        return False
+    match = noop_pattern.search(sentence)
+    if not match:
+        return False
+    rest = sentence[:match.start()] + " " + sentence[match.end():]
+    for token in re.findall(r"[\w'’-]+", rest.lower(), re.UNICODE):
+        if token not in VERDICT_FILLER:
+            return False
+    return True
+
+
+def is_clean_verdict(body: str, noop_pattern: re.Pattern) -> bool:
+    """Тело ревью — чистый вердикт целиком, а не только в первых словах.
+
+    Пустой результат (тело из одной обвязки) чистым НЕ считается: про такое
+    тело мы попросту ничего не знаем, а незнание должно будить работу, а не
+    отменять её.
+    """
+    text = strip_review_decoration(body)
+    sentences = [part.strip() for part in re.split(r"[.!?;\n]+", text)]
+    sentences = [part for part in sentences if re.search(r"\w", part, re.UNICODE)]
+    if not sentences:
+        return False
+    return all(_sentence_is_clean(part, noop_pattern) for part in sentences)
+
+
 def login_matches(login: str, patterns: list[str]) -> bool:
     """Сравнение логина ревьюера.
 
@@ -747,6 +864,9 @@ class ReviewBundle:
         Codex оставляет ревью и тогда, когда замечаний нет. Будить `claude`
         ради «issues not found» — это трата подписки и лишний шум в PR, поэтому
         пустое ревью распознаётся и пропускается.
+
+        Пропускается ровно то, что пустое целиком: см. `is_clean_verdict`.
+        Тело с оговоркой («no blocking issues, but …») — работа, а не похвала.
         """
         if self.inline:
             return True
@@ -754,7 +874,7 @@ class ReviewBundle:
             body = (item.get("body") or "").strip()
             if not body:
                 continue
-            if noop_pattern.search(body):
+            if is_clean_verdict(body, noop_pattern):
                 continue
             return True
         return False
@@ -1114,16 +1234,35 @@ class Bridge:
         prs = self.gh.open_agent_prs(self.cfg.get("BRANCH_PREFIX"))
         self.log.info("открытых PR из веток «{}»: {}".format(self.cfg.get("BRANCH_PREFIX"), len(prs)))
         handled = 0
+        # Упавшие PR запоминаются поимённо. Изоляция по PR остаётся: соседний
+        # PR обработать надо в любом случае. Но раньше цикл после такого
+        # исключения всё равно записывал «успех», и наружу это выходило
+        # враньём: `poll --once` завершался нулём, `status` показывал успешный
+        # цикл, а PR не обработан. Ошибка, которую никто не увидит, повторяется
+        # ровно столько раз, сколько её не видят.
+        failed: list[str] = []
+        failed_numbers: list = []
         for pr in prs:
             try:
                 if self.handle_pr(pr):
                     handled += 1
             except Exception as exc:  # цикл не должен падать из-за одного PR
-                self.log.error("PR #{}: {}".format(pr.get("number"), redact(str(exc))[:800]))
+                message = redact(str(exc))[:800]
+                self.log.error("PR #{}: {}".format(pr.get("number"), message))
+                failed.append("PR #{}: {}".format(pr.get("number"), message))
+                failed_numbers.append(pr.get("number"))
         self.state.prune({pr["number"] for pr in prs})
         self.state.data["cycles"] = int(self.state.data.get("cycles", 0)) + 1
         self.state.data["last_cycle_finished_at"] = datetime.now(timezone.utc).isoformat()
-        self.state.data["last_cycle_ok"] = True
+        self.state.data["last_cycle_ok"] = not failed
+        self.state.data["last_cycle_failed_prs"] = failed_numbers
+        if failed:
+            self.state.data["last_error"] = " | ".join(failed)[:800]
+            self.log.error("цикл неполный: не обработано PR — {}".format(len(failed)))
+        else:
+            # Прошлая ошибка не должна висеть в `status` вечно: цикл прошёл
+            # целиком, и показывать её — такое же враньё, как скрывать свежую.
+            self.state.data.pop("last_error", None)
         self.state.save()
         return handled
 
@@ -1549,12 +1688,22 @@ def cmd_poll(args, cfg: Config) -> int:
 def _one_cycle(bridge: Bridge, log: Log, state: State) -> int:
     try:
         bridge.cycle()
-        return 0
+        # Ноль означает «цикл прошёл целиком». Если хоть один PR не обработан,
+        # цикл неполный, и наружу это выходит ненулевым кодом: launchd пишет
+        # его в журнал, а человек видит его сразу при ручном прогоне.
+        if state.data.get("last_cycle_ok", True):
+            return 0
+        log.error("цикл завершился неполным: " + str(state.data.get("last_error", ""))[:800])
+        return 1
     except Exception as exc:
         message = redact(str(exc))[:800]
         log.error("цикл упал: " + message)
         state.data["last_cycle_ok"] = False
         state.data["last_error"] = message
+        # Список упавших PR — от прошлого цикла, и к этому падению он
+        # отношения не имеет: цикл не дошёл до PR вовсе. Оставить его значило
+        # бы показать в `status` «не обработан PR #7» вместо «цикл упал».
+        state.data["last_cycle_failed_prs"] = []
         state.data["last_cycle_finished_at"] = datetime.now(timezone.utc).isoformat()
         state.save()
         return 1
@@ -1585,9 +1734,20 @@ def cmd_status(args, cfg: Config) -> int:
     print("  каталог состояния : {}".format(root))
     print("  модель исполнителя: {}".format(model_line(cfg)))
     print("  циклов выполнено  : {}".format(state.data.get("cycles", 0)))
+    # «Неполный» и «упал» — разные вещи, и владельцу важно их различать:
+    # первое значит «часть PR не обработана, остальное сделано», второе —
+    # «не сделано ничего». Обобщённое «ошибка» на оба случая скрывало бы, что
+    # именно осталось несделанным.
+    failed_prs = state.data.get("last_cycle_failed_prs") or []
+    if state.data.get("last_cycle_ok", True):
+        verdict = "успех"
+    elif failed_prs:
+        verdict = "неполный: не обработано PR — {}".format(
+            ", ".join("#{}".format(number) for number in failed_prs))
+    else:
+        verdict = "ошибка"
     print("  последний цикл    : {} ({})".format(
-        state.data.get("last_cycle_finished_at") or "никогда",
-        "успех" if state.data.get("last_cycle_ok", True) else "ошибка"))
+        state.data.get("last_cycle_finished_at") or "никогда", verdict))
     if state.data.get("last_error"):
         print("  последняя ошибка  : {}".format(state.data["last_error"]))
 

@@ -11,7 +11,7 @@
 | `bridge.py` | сам диспетчер: опрос, сбор ревью, вызов `claude`, тесты, commit, push, отчёт |
 | `run.sh` | обёртка для launchd: чинит PATH и вызывает `bridge.py` |
 | `install.sh` | ставит per-user LaunchAgent `com.oborot.agent-bridge` |
-| `uninstall.sh` | снимает LaunchAgent; `--purge` убирает и состояние |
+| `uninstall.sh` | снимает LaunchAgent; `--purge` убирает и состояние — но только доказуемо свой каталог, иначе отказ |
 | `config.env.example` | образец настроек, копируется в `~/.config/oborot-agent-bridge/config.env` |
 
 ## Что нужно до запуска

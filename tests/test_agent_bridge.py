@@ -32,7 +32,15 @@
      настройках по умолчанию, обе доезжают до аргументов запуска, обе видны в
      `health` и `status`, и обе переопределяются владельцем;
  12) журнал владельца `OWNER_WORK_LOG.md`: шаблон из шести пунктов соблюдён, а
-     SHA и протокольные слова не подменяют собой человеческий текст.
+     SHA и протокольные слова не подменяют собой человеческий текст;
+ 13) «замечаний нет» распознаётся по всему телу ревью, а не по вхождению
+     похвалы: тело с оговоркой («no blocking issues, but …») остаётся работой —
+     одинаково у диспетчера и у сторожа, и это сверяется исполнением;
+ 14) цикл, в котором упал хотя бы один PR, не выдаёт себя за успешный: код
+     возврата ненулевой, `status` называет номер PR и причину;
+ 15) `uninstall.sh --purge` удаляет только доказанный каталог диспетчера и
+     отказывается от `/`, домашнего каталога, его предков и любых широких
+     путей (в опасных случаях настоящее `rm` подменяется заглушкой).
 
 Запуск из корня репозитория:  python tests/test_agent_bridge.py
 """
@@ -43,9 +51,11 @@ import json
 import os
 import plistlib
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1449,6 +1459,366 @@ def test_nondefault_config_home_reaches_launchd():
               resolve_in(launchd_env(home, blind), "test-python"))
 
 
+# --------------------------------------------------------------------------
+# 13. «Замечаний нет» — про всё тело, а не про первые три слова
+# --------------------------------------------------------------------------
+#
+# Разбираемый дефект. Шаблон пустого ревью применялся подстрокой. Ревьюер же
+# пишет «No blocking issues, but the retry path still loses findings» — первые
+# три слова совпадают с шаблоном, а замечание настоящее. Диспетчер такое ревью
+# помечал CLEAN и не будил Claude; сторож пользовался тем же признаком и тоже
+# молчал. Замечание не доезжало никуда, и выглядело это как «всё чисто».
+
+# Тела, которые ОБЯЗАНЫ считаться работой.
+QUALIFIED_BODIES = [
+    "No blocking issues, but the retry path still loses findings.",
+    "Looks good overall; however, the migration drops the index.",
+    "LGTM. One more thing: the token is written to the log in plain text.",
+    "No major issues — though the lock is released before the file is closed.",
+    "Замечаний нет по стилю, но откат миграции не покрыт тестами.",
+    "Nothing blocking. Please rename the flag before merge.",
+]
+
+# Тела, которые ОБЯЗАНЫ считаться пустыми: иначе каждый чистый прогон ревьюера
+# будит Claude впустую и жжёт попытки для этого SHA.
+CLEAN_BODIES = [
+    "No issues found.",
+    "LGTM",
+    "Looks good overall.",
+    "Codex didn't find any major issues in this pull request.",
+    "Замечаний нет.",
+    "По этому коду замечаний нет, всё в порядке.",
+    "### 💡 Codex Review\n\nLGTM\n\n"
+    "<details><summary>About Codex in GitHub</summary>\n"
+    "Reviews are triggered when you open a pull request.\n</details>\n\n"
+    "Useful? React with 👍 / 👎.",
+]
+
+
+def test_clean_verdict_covers_whole_body():
+    print("\n== Чистый вердикт — это всё тело целиком ==")
+    noop = re.compile(bridge.CONFIG_KEYS["NOOP_REVIEW_PATTERN"], re.IGNORECASE)
+
+    for body in QUALIFIED_BODIES:
+        check(f"с оговоркой — работа: {body[:48]!r}",
+              not bridge.is_clean_verdict(body, noop))
+    for body in CLEAN_BODIES:
+        check(f"чистое — не работа: {body[:48]!r}",
+              bridge.is_clean_verdict(body, noop))
+
+    # То же самое на уровне ревью целиком: именно здесь решение принимается.
+    for body in QUALIFIED_BODIES[:2]:
+        bundle = bridge.ReviewBundle("a" * 40)
+        bundle.reviews = [review(1, "a" * 40, body=body)]
+        check("ревью с оговоркой будит Claude", bundle.is_actionable(noop), body[:48])
+    empty = bridge.ReviewBundle("a" * 40)
+    empty.reviews = [review(1, "a" * 40, body="No issues found.")]
+    check("чистое ревью Claude не будит", not empty.is_actionable(noop))
+
+    # Проверка мутацией: старое поведение (шаблон подстрокой) на этом же
+    # наборе обязано провалиться — иначе тест ничего не стережёт.
+    old_behaviour_clean = [body for body in QUALIFIED_BODIES if noop.search(body)]
+    check("старое правило «подстрокой» на этом наборе действительно ошибалось",
+          len(old_behaviour_clean) >= 4, str(len(old_behaviour_clean)))
+
+
+def js_word_set(text: str, name: str) -> set:
+    """Список слов из JS-набора сторожа."""
+    match = re.search(r"const " + name + r" = new Set\(\[(.*?)\]\);", text, re.S)
+    if not match:
+        return set()
+    return set(re.findall(r"'([^']*)'", match.group(1)))
+
+
+def test_watchdog_shares_clean_verdict():
+    print("\n== Сторож понимает «замечаний нет» так же, как диспетчер ==")
+    text = WATCHDOG_YML.read_text(encoding="utf-8")
+
+    check("сторож больше не проверяет шаблон подстрокой",
+          "noopPattern.test(body)" not in text)
+    check("сторож считает вердикт по всему телу", "isCleanVerdict(body)" in text)
+    # Списки слов у сторожа и диспетчера — копия, и копия обязана совпадать.
+    # Разойдутся молча: сторож начнёт молчать там, где диспетчер работает.
+    check("список слов-заполнителей совпадает",
+          js_word_set(text, "VERDICT_FILLER") == bridge.VERDICT_FILLER,
+          str(sorted(js_word_set(text, "VERDICT_FILLER") ^ bridge.VERDICT_FILLER))[:200])
+    check("список слов-переломов совпадает",
+          js_word_set(text, "VERDICT_CONTRAST") == bridge.VERDICT_CONTRAST,
+          str(sorted(js_word_set(text, "VERDICT_CONTRAST") ^ bridge.VERDICT_CONTRAST))[:200])
+
+    # Совпадения списков мало: сравнивать надо поведение. Код сторожа — это
+    # JavaScript внутри workflow, и он тут же выполняется на том же наборе тел,
+    # что и Python. Движок берётся любой доступный: в Linux CI это node, на
+    # маке владельца — JavaScriptCore через `osascript` (node на маке может и
+    # не стоять, а проверять сторожа на машине, где он чинится, важнее всего).
+    block = re.search(r"// --- clean-verdict:start ---(.*?)// --- clean-verdict:end ---",
+                      text, re.S)
+    check("блок разбора вердикта у сторожа помечен для проверки", bool(block))
+    if not block:
+        return
+    bodies = QUALIFIED_BODIES + CLEAN_BODIES
+    # Отступы YAML снимаются: внутри workflow код лежит с отступом блока `script`.
+    driver = (
+        "const noopPattern = new RegExp({}, 'i');\n".format(
+            json.dumps(bridge.CONFIG_KEYS["NOOP_REVIEW_PATTERN"]))
+        + textwrap.dedent(block.group(1))
+        + "\nconst RESULT = JSON.stringify({}.map(isCleanVerdict));\n".format(
+            json.dumps(bodies, ensure_ascii=False))
+        # node печатает сам; osascript печатает значение последнего выражения.
+        + "if (typeof process !== 'undefined') console.log(RESULT);\nRESULT;\n"
+    )
+    engine = ([shutil.which("node")] if shutil.which("node")
+              else ["/usr/bin/osascript", "-l", "JavaScript"]
+              if Path("/usr/bin/osascript").exists() else [])
+    if not engine:
+        print("  SKIP движка JavaScript нет — поведение сторожа проверит Linux CI")
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        script = Path(tmp) / "verdict.js"
+        script.write_text(driver, encoding="utf-8")
+        result = subprocess.run(engine + [str(script)],
+                                capture_output=True, text=True, timeout=120)
+        check(f"код сторожа выполняется ({Path(engine[0]).name})",
+              result.returncode == 0, result.stderr[-300:])
+        if result.returncode != 0:
+            return
+        got = json.loads(result.stdout.strip())
+        expected = [False] * len(QUALIFIED_BODIES) + [True] * len(CLEAN_BODIES)
+        mismatch = [body[:40] for body, a, b in zip(bodies, got, expected) if a != b]
+        check("сторож и диспетчер отвечают одинаково на всех телах",
+              got == expected, "; ".join(mismatch))
+
+
+# --------------------------------------------------------------------------
+# 14. Неполный цикл не выдаёт себя за успешный
+# --------------------------------------------------------------------------
+#
+# Разбираемый дефект. Исключение в обработке одного PR ловилось и писалось в
+# журнал — это правильно, соседний PR обработать надо. Но дальше цикл
+# безусловно записывал «успех»: `poll --once` возвращал ноль, `status` показывал
+# успешный цикл, а PR оставался необработанным. Ошибка, которой не видно, не
+# чинится: она просто повторяется каждую минуту.
+
+class StubPRList:
+    """GitHub, у которого есть только список открытых PR."""
+
+    def __init__(self, prs):
+        self._prs = prs
+
+    def open_agent_prs(self, prefix):
+        return list(self._prs)
+
+
+def open_pr(number: int, sha: str) -> dict:
+    return {"number": number, "head": {"ref": f"claude/x{number}", "sha": sha}}
+
+
+def test_failed_pr_makes_cycle_degraded():
+    print("\n== Упавший PR виден снаружи ==")
+    sha = "a" * 40
+    with tempfile.TemporaryDirectory() as tmp:
+        state_path = Path(tmp) / "state.json"
+        inst = make_bridge({"REPO": "o/r"}, StubPRList([open_pr(7, sha), open_pr(9, sha)]),
+                           state_path)
+
+        def boom(pr):
+            if pr["number"] == 7:
+                raise RuntimeError("gh api не ответил")
+            return False
+
+        inst.handle_pr = boom
+        inst.cycle()
+
+        # Изоляция по PR сохраняется: сосед обработан, цикл не упал целиком.
+        check("цикл дошёл до конца, соседний PR обработан",
+              inst.state.data.get("cycles") == 1)
+        check("цикл помечен неуспешным", inst.state.data.get("last_cycle_ok") is False)
+        check("запомнен номер упавшего PR",
+              inst.state.data.get("last_cycle_failed_prs") == [7],
+              str(inst.state.data.get("last_cycle_failed_prs")))
+        check("причина сохранена и в ней есть номер PR",
+              "PR #7" in (inst.state.data.get("last_error") or ""),
+              str(inst.state.data.get("last_error")))
+
+        # Код возврата: launchd и человек узнают о неполном цикле только по нему.
+        check("poll --once возвращает ненулевой код",
+              bridge._one_cycle(inst, StubLog(), inst.state) == 1)
+
+        # Следующий чистый цикл обязан снять и отметку, и старую причину:
+        # висящая вечно ошибка врёт ровно так же, как скрытая свежая.
+        inst.handle_pr = lambda pr: False
+        inst.cycle()
+        check("чистый цикл снова успешен", inst.state.data.get("last_cycle_ok") is True)
+        check("старая причина не висит в состоянии",
+              not inst.state.data.get("last_error"))
+        check("чистый цикл возвращает ноль",
+              bridge._one_cycle(inst, StubLog(), inst.state) == 0)
+
+        # Упавший целиком цикл — это не «не обработан PR #7»: до PR он не
+        # дошёл. Список от прошлого цикла обязан очиститься, иначе `status`
+        # покажет чужую причину как свою.
+        inst.state.data["last_cycle_failed_prs"] = [7]
+
+        def cycle_dies():
+            raise RuntimeError("gh недоступен")
+
+        inst.cycle = cycle_dies
+        check("упавший целиком цикл возвращает единицу",
+              bridge._one_cycle(inst, StubLog(), inst.state) == 1)
+        check("список упавших PR от прошлого цикла не остаётся",
+              inst.state.data.get("last_cycle_failed_prs") == [],
+              str(inst.state.data.get("last_cycle_failed_prs")))
+
+
+def test_status_shows_degraded_cycle():
+    print("\n== status показывает неполный цикл честно ==")
+    with tempfile.TemporaryDirectory() as tmp:
+        home = Path(tmp) / "home"
+        home.mkdir()
+        root = Path(tmp) / "state"
+        root.mkdir()
+        (root / "state.json").write_text(json.dumps({
+            "version": 1, "prs": {}, "cycles": 12,
+            "last_cycle_ok": False,
+            "last_cycle_failed_prs": [7],
+            "last_error": "PR #7: gh api не ответил",
+            "last_cycle_finished_at": "2026-08-23T10:00:00+00:00",
+        }, ensure_ascii=False), encoding="utf-8")
+
+        result = subprocess.run(
+            [sys.executable, str(BRIDGE_PY), "--state-dir", str(root), "status"],
+            capture_output=True, text=True, timeout=120, env=bridge_env(home))
+        out = result.stdout
+        check("status не падает", result.returncode == 0, result.stderr[-300:])
+        check("сказано, что цикл неполный", "неполный" in out, out[:400])
+        check("назван PR, который не обработан", "#7" in out, out[:400])
+        check("показана причина", "gh api не ответил" in out, out[:400])
+        check("успехом это не называется", "(успех)" not in out, out[:400])
+
+
+# --------------------------------------------------------------------------
+# 15. `uninstall.sh --purge` удаляет только доказанный каталог диспетчера
+# --------------------------------------------------------------------------
+#
+# Разбираемый дефект. `--purge` брал каталог состояния из настроек и вызывал
+# `rm -rf` без единой проверки. Настройки пишет человек: `STATE_DIR=$HOME` —
+# это одна опечатка, после которой домашний каталог удаляется целиком, а скрипт
+# отчитывается об успехе. Ниже проверяется отказ на широких путях и удаление
+# только там, где принадлежность диспетчеру доказана.
+#
+# Настоящее `rm` в опасных случаях подменяется заглушкой: тест обязан проверять
+# РЕШЕНИЕ скрипта, а не проверять его ценой чужих данных. Если проверка когда-
+# нибудь сломается, заглушка запишет попытку — и тест это увидит, ничего не
+# потеряв. Единственный случай, где удаление настоящее, — временный каталог,
+# созданный этим же тестом.
+
+def purge_sandbox(tmp: Path) -> tuple:
+    """Домашний каталог-однодневка и стойка с заглушками для PATH."""
+    home = tmp / "home"
+    (home / "Documents").mkdir(parents=True)
+    (home / "Documents" / "договор.txt").write_text("ценное", encoding="utf-8")
+    (home / "важное.txt").write_text("ценное", encoding="utf-8")
+
+    stubs = tmp / "bin"
+    stubs.mkdir()
+    # launchctl: настоящий трогать нельзя — на машине владельца в нём живёт
+    # его собственный, ни в чём не виноватый LaunchAgent.
+    (stubs / "launchctl").write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    (stubs / "launchctl").chmod(0o755)
+    return home, stubs
+
+
+def run_purge(home: Path, stubs: Path, rm_log: Path | None = None, **extra):
+    env = bridge_env(home, **extra)
+    env["PATH"] = f"{stubs}:{env['PATH']}"
+    if rm_log is not None:
+        env["OBOROT_TEST_RM_LOG"] = str(rm_log)
+    return subprocess.run(["bash", str(UNINSTALL_SH), "--purge"],
+                          capture_output=True, text=True, timeout=180, env=env)
+
+
+def test_purge_refuses_unsafe_targets():
+    print("\n== --purge отказывается от широких каталогов ==")
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        home, stubs = purge_sandbox(root)
+
+        # Заглушка вместо rm: ничего не удаляет, но записывает, что просили.
+        rm_log = root / "rm.log"
+        (stubs / "rm").write_text(
+            '#!/bin/sh\nprintf \'%s\\n\' "$@" >> "$OBOROT_TEST_RM_LOG"\nexit 0\n',
+            encoding="utf-8")
+        (stubs / "rm").chmod(0o755)
+
+        (root / "просто-каталог").mkdir()
+        dangerous = {
+            "домашний каталог": str(home),
+            "предок домашнего каталога": str(home.parent),
+            "корень файловой системы": "/",
+            "Documents": str(home / "Documents"),
+            "каталог без признаков диспетчера": str(root / "просто-каталог"),
+            "несуществующий путь": str(root / "нет-такого"),
+        }
+        for name, target in dangerous.items():
+            result = run_purge(home, stubs, rm_log,
+                               OBOROT_BRIDGE_STATE_DIR=target)
+            if name == "несуществующий путь":
+                # Нечего удалять — это не отказ, а просто пустая работа.
+                check("несуществующий каталог ошибкой не считается",
+                      result.returncode == 0, result.stderr[-200:])
+                continue
+            check(f"отказ: {name}",
+                  result.returncode == 1 and "Отказ" in result.stderr,
+                  (result.stdout + result.stderr)[-250:])
+            check(f"причина названа словами: {name}",
+                  "причина:" in result.stderr, result.stderr[-250:])
+
+        attempts = rm_log.read_text(encoding="utf-8") if rm_log.exists() else ""
+        check("ни одного удаления при отказе не запрошено",
+              not any(line.strip() in {"/", str(home), str(home.parent),
+                                       str(home / "Documents"),
+                                       str(root / "просто-каталог")}
+                      for line in attempts.splitlines()),
+              attempts[:300])
+        check("ценные файлы на месте",
+              (home / "важное.txt").is_file()
+              and (home / "Documents" / "договор.txt").is_file())
+
+
+def test_purge_removes_only_proven_bridge_dirs():
+    print("\n== --purge удаляет свой каталог и не трогает соседей ==")
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        home, stubs = purge_sandbox(root)
+
+        # Здесь rm настоящий: удаляется каталог, созданный этим же тестом.
+        state = home / ".local" / "state" / "oborot-agent-bridge"
+        (state / "checkout").mkdir(parents=True)
+        (state / "state.json").write_text("{}", encoding="utf-8")
+        config = home / ".config" / "oborot-agent-bridge"
+        config.mkdir(parents=True)
+        (config / "config.env").write_text("# пусто\n", encoding="utf-8")
+
+        result = run_purge(home, stubs)
+        check("зачистка прошла без отказов", result.returncode == 0,
+              (result.stdout + result.stderr)[-250:])
+        check("каталог состояния удалён", not state.exists())
+        check("каталог настроек удалён", not config.exists())
+        check("ничего вокруг не пострадало",
+              (home / "важное.txt").is_file()
+              and (home / "Documents" / "договор.txt").is_file())
+
+        # Свой каталог с непривычным именем: удаляется, только если в нём
+        # лежат файлы диспетчера. Пустой такой каталог — отказ (см. выше).
+        custom = root / "своё-состояние"
+        custom.mkdir()
+        (custom / "bridge.log").write_text("", encoding="utf-8")
+        named = run_purge(home, stubs, OBOROT_BRIDGE_STATE_DIR=str(custom))
+        check("каталог с файлами диспетчера удаляется и под своим именем",
+              named.returncode == 0 and not custom.exists(),
+              (named.stdout + named.stderr)[-250:])
+
+
 def main() -> int:
     print(f"agent-bridge: {BRIDGE_PY.relative_to(ROOT)}")
     test_parse_api_output()
@@ -1477,6 +1847,12 @@ def main() -> int:
     test_model_documented_in_config_example()
     test_owner_log_follows_template()
     test_agents_md_requires_both_logs()
+    test_clean_verdict_covers_whole_body()
+    test_watchdog_shares_clean_verdict()
+    test_failed_pr_makes_cycle_degraded()
+    test_status_shows_degraded_cycle()
+    test_purge_refuses_unsafe_targets()
+    test_purge_removes_only_proven_bridge_dirs()
     print(f"\nИТОГО: {len(PASS)} OK, {len(FAIL)} FAIL")
     return 1 if FAIL else 0
 
