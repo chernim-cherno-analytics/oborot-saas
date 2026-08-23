@@ -44,37 +44,16 @@ jobs:
           pip install -r requirements.lock
 
       - name: Зависимости совместимы и совпадают с lock
-        # Две разные проверки, обе дешёвые.
-        # pip check — нет ли конфликта требований между установленными пакетами.
-        # Сверка с lock — не уехало ли фактическое окружение от записанного:
-        # lock-файл, которому окружение не соответствует, хуже отсутствия
-        # lock-файла, потому что создаёт ложную уверенность.
-        run: |
-          pip check
-          python - <<'PY'
-          import re, sys
-          from importlib.metadata import version, PackageNotFoundError
-          bad = []
-          for line in open("requirements.lock", encoding="utf-8"):
-              line = line.split("#", 1)[0].strip()
-              if not line or "==" not in line:
-                  continue
-              name, want = line.split("==", 1)
-              name, want = name.strip(), want.strip()
-              try:
-                  have = version(name)
-              except PackageNotFoundError:
-                  bad.append(f"{name}: в lock {want}, не установлен")
-                  continue
-              if have != want:
-                  bad.append(f"{name}: в lock {want}, установлено {have}")
-          if bad:
-              print("ОКРУЖЕНИЕ НЕ СОВПАДАЕТ С requirements.lock:")
-              for b in bad:
-                  print("  " + b)
-              sys.exit(1)
-          print("окружение совпадает с lock")
-          PY
+        # Проверка живёт в tests/test_dependencies.py, а не строкой здесь.
+        # Раньше тот же код был скриптом внутри этого файла — то есть локально
+        # не запускался и до пуша не падал. Идея вынести его отдельным набором
+        # взята из ветки codex/p20-integration-publish.
+        #
+        # OBOROT_ENFORCE_LOCK=1: в CI расхождение окружения с lock — падение,
+        # а не предупреждение. Локально у разработчика может стоять другое.
+        run: python tests/test_dependencies.py
+        env:
+          OBOROT_ENFORCE_LOCK: "1"
 
       - name: Все наборы тестов
         # По три набора одновременно: на двухъядерном раннере одиннадцать
