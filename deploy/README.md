@@ -103,5 +103,67 @@ sqlite3 /opt/oborot/data/oborot.db \
 
 `deploy.sh` делает копию **перед каждой выкладкой** — это защита от плохого
 релиза, а не резервное копирование. Отдельно нужны: регулярная копия по
-расписанию, хранение вне этой машины и **хотя бы одна проверка восстановления**.
-Пока восстановление ни разу не проверялось, копию нельзя считать бэкапом.
+расписанию, хранение вне этой машины и проверка восстановления.
+
+Для этого в репозитории есть два независимых сценария:
+
+- `backup_offsite.sh` делает согласованную SQLite `.backup`, запускает
+  `integrity_check`, отправляет её в зашифрованный restic repository, применяет
+  retention 14 daily / 8 weekly / 12 monthly и проверяет repository;
+- `restore_offsite.sh` действительно скачивает snapshot обратно, делает полный
+  `restic check --read-data`, проверяет SQLite и основные таблицы. Без второго
+  аргумента это безопасный drill: production-файл он не трогает никогда.
+
+Restic выбран как транспорт, а не конкретный облачный провайдер: тот же сценарий
+работает с SFTP на второй машине, S3/совместимым storage, B2 и другими backend.
+Repository обязан находиться **вне production VPS**.
+
+### Настройка один раз
+
+1. Установить `restic` на VPS и создать отдельный внешний repository. Пример
+   SFTP (SSH-ключ должен входить без пароля):
+
+   ```bash
+   restic -r sftp:oborot-backup:/srv/restic/oborot init
+   ```
+
+2. Создать случайный пароль repository в `/opt/oborot/restic-password` и
+   сохранить его вторую копию вне VPS. Потеря этого пароля делает backup
+   невосстановимым. Затем:
+
+   ```bash
+   cp deploy/backup.env.example /opt/oborot/backup.env
+   chmod 600 /opt/oborot/backup.env /opt/oborot/restic-password
+   # заполнить RESTIC_REPOSITORY; не использовать путь на этом же VPS
+   ```
+
+3. Поставить таймеры и сразу выполнить оба сценария руками:
+
+   ```bash
+   cp deploy/systemd/oborot-backup.* /etc/systemd/system/
+   cp deploy/systemd/oborot-restore-drill.* /etc/systemd/system/
+   systemctl daemon-reload
+   systemctl enable --now oborot-backup.timer oborot-restore-drill.timer
+   systemctl start oborot-backup.service
+   systemctl start oborot-restore-drill.service
+   cat /opt/oborot/backup-state/last-backup-ok
+   cat /opt/oborot/backup-state/last-restore-ok
+   ```
+
+Backup идёт ежедневно около 03:15 с разбросом до 20 минут. Полный restore drill
+идёт раз в месяц. Оба сервиса завершаются ненулевым кодом при любой неполной
+операции; проверять их надо внешним мониторингом systemd/journal.
+
+### Аварийное восстановление
+
+Сначала скачать и проверить копию в **новый** файл:
+
+```bash
+bash deploy/restore_offsite.sh latest /opt/oborot/restore/oborot.db
+```
+
+Скрипт откажется перезаписывать существующий файл или production DB. После
+проверки результата замена выполняется оператором отдельно: остановить сервис,
+сохранить текущую повреждённую базу, атомарно поставить проверенный файл и
+запустить `/health/ready`. Автоматическая замена сознательно запрещена, чтобы
+ошибка в расписании или параметрах не уничтожила живые данные.

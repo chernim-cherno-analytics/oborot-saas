@@ -49,6 +49,7 @@ SUITES = [
     ("sync_wipe",   "test_sync_wipe.py",       True,  False),
     ("wb_dup",      "test_writeback_dup.py",   True,  False),
     ("ops",         "test_ops.py",             False, False),
+    ("backup",      "test_backup.py",          False, False),
     ("logging",     "test_logging.py",         False, False),
     ("subscr",      "test_subscription.py",    False, False),
     ("exec",        "test_execution.py",       False, False),

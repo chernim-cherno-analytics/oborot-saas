@@ -1,0 +1,13 @@
+[Unit]
+Description=Oborot monthly off-site restore drill
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+EnvironmentFile=/opt/oborot/backup.env
+ExecStart=/bin/bash /opt/oborot/app-src/deploy/restore_offsite.sh
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
