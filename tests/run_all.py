@@ -56,6 +56,7 @@ SUITES = [
     ("ui",          "test_ui.py",              False, False),
     ("backup",      "test_backup.py",          False, False),
     ("backup_remote", "test_backup_offsite.py", False, False),
+    ("deps",        "test_dependencies.py",     False, False),
 ]
 
 TOTAL_RE = re.compile(r"ИТОГО:\s*(\d+)\s*OK,\s*(\d+)\s*FAIL")
