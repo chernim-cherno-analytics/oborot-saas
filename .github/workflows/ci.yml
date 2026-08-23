@@ -27,9 +27,15 @@ jobs:
           cache: pip
 
       - name: Установка зависимостей
+        # Тот же lock-файл, что ставит деплой: иначе «зелёный CI» и «то, что
+        # поехало в бой» — разные наборы версий, и смысл фиксации теряется.
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          if [ -f requirements.lock ]; then
+            pip install -r requirements.lock
+          else
+            pip install -r requirements.txt
+          fi
 
       - name: Все наборы тестов
         # По три набора одновременно: на двухъядерном раннере одиннадцать
