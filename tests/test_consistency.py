@@ -235,6 +235,25 @@ def run() -> int:
           c.get("/api/replenish").json().get("lead_time_by_production") is False,
           str(c.get("/api/replenish").json().get("lead_time_by_production")))
 
+    print("\n== §9.5: срок канала одинаков в мастере и на «Заказе» ==")
+    # Третий способ считать срок: мастер собирал его как сумму сроков этапов,
+    # а запасным значением для канала БЕЗ явных этапов брал общий срок
+    # организации. Канал со сроком 90 давал мастеру lead_days = 45 и дату
+    # прихода «сегодня + 45», хотя «Заказ» для той же позиции писал 90.
+    # Предыдущий блок снимал срок у канала — возвращаем его.
+    c.post(f"/api/productions/{pid}", json={"name": "Китай", "lead_time_days": 90})
+    plan_lead = c.post("/api/order-plan/preview",
+                       json={"budget": 2_000_000, "budget_scope": "full",
+                             "cadence_days": 30, "safety_days": 14,
+                             "production_id": pid}).json()
+    plan_lead = plan_lead.get("plan") or plan_lead
+    page_lead = c.get("/api/replenish").json()["items"][0]["lead_time_days"]
+    check("мастер считает по сроку канала, а не по общему",
+          plan_lead.get("lead_days") == 90, str(plan_lead.get("lead_days")))
+    check("и это тот же срок, что на «Заказе»",
+          plan_lead.get("lead_days") == page_lead,
+          f'мастер {plan_lead.get("lead_days")} vs «Заказ» {page_lead}')
+
     print("\n== §9.6: минимальная партия одна на обоих экранах ==")
     # Два поля с одним смыслом на одной сущности: `moq` вводится на странице
     # «Заказ», `moq_units` — в Настройках. Каждый экран читал своё, и владелец,

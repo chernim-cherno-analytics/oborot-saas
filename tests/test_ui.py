@@ -285,6 +285,29 @@ def run() -> int:  # noqa: C901 — сценарный тест: шагов мн
         else:
             check("без таких позиций подпись обычная", "НЕПОЛНАЯ" not in sub, sub[:80])
 
+        print("\n== «Бюджет»: строка состояния называет окно темпа ==")
+        page.goto(f"{base}/budget")
+        page.wait_for_timeout(3000)
+        page.evaluate("""() => {
+          const b = document.getElementById('calcBtn') || document.querySelector('.go-btn');
+          if (b) b.click();
+        }""")
+        page.wait_for_timeout(3000)
+        hint_year = page.text_content("#statusHint") or ""
+        check("окно темпа названо в строке состояния", "темп" in hint_year, hint_year[:100])
+        c.post("/api/settings", json={"rate_window": "d90"})
+        page.reload()
+        page.wait_for_timeout(3000)
+        page.evaluate("""() => {
+          const b = document.getElementById('calcBtn') || document.querySelector('.go-btn');
+          if (b) b.click();
+        }""")
+        page.wait_for_timeout(3000)
+        hint_90 = page.text_content("#statusHint") or ""
+        check("после смены окна строка изменилась",
+              hint_90 != hint_year, f"{hint_year[:60]} -> {hint_90[:60]}")
+        c.post("/api/settings", json={"rate_window": "year"})
+
         check("ни одной ошибки в консоли за весь проход", not errors, str(errors[:2]))
         browser.close()
 
