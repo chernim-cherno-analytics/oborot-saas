@@ -290,7 +290,7 @@ def run() -> int:  # noqa: C901 — сценарный тест, ветвлен�
     r = c2.post(f"/api/orders/{order2}/status", json={"status": "received"})
     check("заказ принят одним кликом", r.status_code == 200, r.text[:150])
     got2 = c2.get(f"/api/orders/{order2}/receipts").json()
-    check("никакого количества не выдумано", got2["received_total"] == 0,
+    check("никакого количества не выдумано", got2["received_total"] is None,
           str(got2["received_total"]))
     check("и выдача говорит, что принятое неизвестно",
           got2.get("execution_unknown") is True, str(got2.get("execution_unknown")))
@@ -390,7 +390,7 @@ def run() -> int:  # noqa: C901 — сценарный тест, ветвлен�
     c3.post(f"/api/orders/{oid_pushed}/status", json={"status": "received"})
     got = c3.get(f"/api/orders/{oid_pushed}/receipts").json()
     check("по заказу, ушедшему в МойСклад, допущение не пишется",
-          got["received_total"] == 0, str(got["received_total"]))
+          got["received_total"] is None, str(got["received_total"]))
     from app.ms_sync import _write_shipped_receipts
     _write_shipped_receipts(3, {(oid_pushed, f"doc-{oid_pushed}"): {name3: 10.0}})
     got = c3.get(f"/api/orders/{oid_pushed}/receipts").json()
@@ -420,7 +420,7 @@ def run() -> int:  # noqa: C901 — сценарный тест, ветвлен�
                 json={"status": "received", "received": []})
     check("пустой список принят", r.status_code == 200, r.text[:120])
     got = c3.get(f"/api/orders/{oid_empty}/receipts").json()
-    check("пустой список ничего не выдумал", got["received_total"] == 0,
+    check("пустой список ничего не выдумал", got["received_total"] is None,
           str(got["received_total"]))
     body_empty = c3.get(f"/api/orders/{oid_empty}").json()
     check("но заказ закрыт: дата приёмки стоит", bool(body_empty.get("received_at")),
@@ -502,7 +502,8 @@ def run() -> int:  # noqa: C901 — сценарный тест, ветвлен�
     c3.post(f"/api/orders/{oid_ms}/status", json={"status": "sent"})
     c3.post(f"/api/orders/{oid_ms}/status", json={"status": "received"})
     got = c3.get(f"/api/orders/{oid_ms}/receipts").json()
-    check("по такому заказу приёмок нет", got["received_total"] == 0)
+    check("по такому заказу приёмок нет", got["received_total"] is None,
+          str(got["received_total"]))
     check("и выдача честно говорит, что принятое НЕИЗВЕСТНО",
           got.get("execution_unknown") is True, str(got.get("execution_unknown")))
     out_ms = c3.get(f"/api/order-plan/{plan_ms}/outcome").json()
@@ -615,8 +616,15 @@ def run() -> int:  # noqa: C901 — сценарный тест, ветвлен�
     # А вот расхождение прятать нельзя: его выносят на разбор человеку.
     _write_shipped_receipts(3, {(oid_two, f"doc-{oid_two}"): {name3 + " v3": 74.0}})
     got = c3.get(f"/api/orders/{oid_two}/receipts").json()
-    check("при расхождении побеждает доказуемый источник",
-          got["received_total"] == 74, str(got["received_total"]))
+    # Раньше здесь ждали 74 — победителя приоритета. По решению владельца
+    # 23.08.2026 спор источников не даёт числа вовсе: подтверждённый итог null,
+    # а сырые показания обоих источников остаются ниже, в by_source.
+    check("при расхождении подтверждённого числа нет",
+          got["received_total"] is None, str(got["received_total"]))
+    check("но сырые показания источников сохранены",
+          (got.get("by_source") or {}).get("ms_order_shipped") == 74.0
+          and (got.get("by_source") or {}).get("manual") == 80.0,
+          str(got.get("by_source")))
     conf = got.get("source_conflicts") or []
     check("расхождение названо прямо, а не сложено", len(conf) == 1, str(conf)[:160])
     check("и в нём видно, что сказал каждый источник",
@@ -764,6 +772,36 @@ def run() -> int:  # noqa: C901 — сценарный тест, ветвлен�
           disputed_lines and all(x["executed"] is None for x in disputed_lines),
           str(disputed_lines)[:160])
 
+    print("\n== Контракт null: числа нет — значит null, а не ноль ==")
+    # Решение владельца 23.08.2026. Ноль — это утверждение «не приехало»;
+    # null — честное «не знаем». Раньше оба случая выглядели как ноль, и
+    # статистика качества рекомендаций считала нашу неизвестность измерением.
+    r = c3.post("/api/orders", json={"name": "Контракт null", "items": [
+        {"base_name": name3 + " v3", "qty": 9, "sizes": {}, "cost": 100}]})
+    oid_null = r.json().get("id")
+    c3.post(f"/api/orders/{oid_null}/status", json={"status": "sent"})
+    got = c3.get(f"/api/orders/{oid_null}/receipts").json()
+    line = next((x for x in got["lines"] if x["base_name"] == name3 + " v3"), None)
+    check("построчно: received_qty = null, когда факта нет",
+          line is not None and line["received_qty"] is None, str(line))
+    check("построчно: diff тоже null, а не «минус всё заказанное»",
+          line is not None and line["diff"] is None, str(line))
+    check("итог по заказу = null", got["received_total"] is None,
+          str(got["received_total"]))
+    check("заказанное при этом известно и остаётся числом",
+          got["ordered_total"] == 9, str(got["ordered_total"]))
+
+    # Записали факт — числа появляются.
+    c3.post(f"/api/orders/{oid_null}/receipts",
+            json={"lines": [{"base_name": name3 + " v3", "qty": 9}]})
+    got = c3.get(f"/api/orders/{oid_null}/receipts").json()
+    line = next((x for x in got["lines"] if x["base_name"] == name3 + " v3"), None)
+    check("после записи факта число появляется",
+          line["received_qty"] == 9 and line["diff"] == 0, str(line))
+    check("и итог перестаёт быть null", got["received_total"] == 9,
+          str(got["received_total"]))
+    check("заказ подтверждён", got.get("confirmed") is True, str(got.get("confirmed")))
+
     print("\n== Старое допущение whole_order не выдаётся за подтверждение ==")
     # Код перестал ПИСАТЬ такие строки в П20, но в боевой базе они уже лежат с
     # прежних версий и до этой отсечки считались подтверждением количества
@@ -784,7 +822,7 @@ def run() -> int:  # noqa: C901 — сценарный тест, ветвлен�
     )
     got = c3.get(f"/api/orders/{oid_as}/receipts").json()
     check("старое допущение не считается принятым количеством",
-          got["received_total"] == 0, str(got["received_total"]))
+          got["received_total"] is None, str(got["received_total"]))
     check("и заказ честно говорит «не знаем», а не «принято 15»",
           got.get("execution_unknown") is True and got.get("confirmed") is False,
           f"unknown={got.get('execution_unknown')} confirmed={got.get('confirmed')}")

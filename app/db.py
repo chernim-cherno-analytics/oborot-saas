@@ -100,6 +100,13 @@ _ALREADY_DONE_MARKERS = (
     "already exists",          # Postgres: column/relation ... already exists
     "duplicate key",           # Postgres: гонка CREATE TABLE (pg_type_typname_nsp_index)
     "duplicate table",
+    # SQLite: два процесса одновременно проверили «флага нет» и оба пошли его
+    # вставлять — второй получает UNIQUE constraint failed. Это ровно «сосед
+    # уже сделал», а не ошибка: миграция под флагом на то и под флагом.
+    # Маркер НАМЕРЕННО узкий, с именем таблицы: широкое «unique constraint
+    # failed» глушило бы настоящие нарушения уникальности в бизнес-данных,
+    # если такой запрос когда-нибудь пройдёт через этот же помощник.
+    "unique constraint failed: migration_flags",
 )
 _BUSY_MARKERS = ("database is locked", "database table is locked", "deadlock detected")
 _BUSY_RETRIES = 5

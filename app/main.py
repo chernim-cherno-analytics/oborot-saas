@@ -245,6 +245,16 @@ def health_ready(db: Session = Depends(get_db)):
         checks["db"] = False
         checks["db_error"] = type(exc).__name__
     checks["scheduler"] = bool(getattr(_scheduler, "_started", False))
+    # Версия сборки наружу. Раньше «что именно сейчас в бою» нельзя было
+    # спросить у самого прода: OBOROT_COMMIT писался деплоем, но не отдавался
+    # ни одной ручкой, и выкладку приходилось подтверждать косвенно — по тому,
+    # что появился новый эндпоинт. Это доказательство «от отсутствия», и оно
+    # молчит ровно тогда, когда пакет не содержит новых ручек.
+    #
+    # Секрета здесь нет: это хеш публичного коммита публичного репозитория.
+    from app.version import BUILD_COMMIT, DOMAIN_VERSION
+    checks["commit"] = BUILD_COMMIT
+    checks["domain_version"] = DOMAIN_VERSION
     ok = bool(checks["startup"] and checks["db"])
     return JSONResponse(status_code=200 if ok else 503,
                         content={"status": "ok" if ok else "not ready", **checks})
@@ -285,6 +295,8 @@ def _page(request: Request, ctx: auth.AuthContext, template: str, active: str, p
     встроенный режим МойСклада вообще — сколько бы его ни поддерживали шаблоны.
     Копию убрали, routes_extra зовёт эту функцию.
     """
+    from app import subscription as _subscription
+
     org = ctx.org
     embedded, override = _resolve_embedded(request)
     # Флаг «данные демо»: слова про синтетические данные показываем только когда
@@ -318,6 +330,23 @@ def _page(request: Request, ctx: auth.AuthContext, template: str, active: str, p
             "active": active,
             "page_title": page_title,
             "embedded": embedded,
+            # Состояние подписки в контекст страницы. Нужно ровно для одного:
+            # в readonly интерфейс не должен слать служебные POST (отметки
+            # подсказок и прогресса обучения) — по строгому режиму они закрыты,
+            # и человек получал бы 402 при обычном листании СВОИХ ЖЕ страниц.
+            # Считаем здесь, а не отдельным запросом с фронта: страница и так
+            # рендерится под сессией, лишний round-trip на каждую загрузку —
+            # плата за то, что и так известно на сервере.
+            # Именно «запись СЕЙЧАС запрещена», а не просто «состояние
+            # readonly»: при выключенном флаге гейта запись проходит, и гасить
+            # отметки подсказок было бы вредом без причины — человек с
+            # истёкшим триалом перестал бы запоминать закрытые подсказки на
+            # ровном месте.
+            "writes_blocked": (
+                _subscription.gate_enabled()
+                and db is not None
+                and _subscription.subscription_state(org, db) == _subscription.READONLY
+            ),
             **(extra or {}),
         },
     )

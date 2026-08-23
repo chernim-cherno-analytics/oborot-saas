@@ -10,6 +10,16 @@
    полосы) и саму полосу. Здесь же живут общие помощники: русские склонения,
    признак «это первичная загрузка», окно расчёта в днях. #}
 <script>
+  /* Состояние подписки для интерфейса. В readonly служебные POST (отметки
+     подсказок и прогресса обучения) закрыты строгим режимом — по решению
+     владельца 23.08.2026. Слать их всё равно означало бы дарить человеку 402
+     при обычном листании собственных страниц: отказ, который ничего не
+     защищает и только раздражает того, кому и так уже отказали.
+     Значение приходит с сервера, отдельного запроса не делаем. */
+  window.OBOROT_READONLY = {{ writes_blocked | default(false) | tojson }};
+  window.oborotCanWrite = function(){ return !window.OBOROT_READONLY; };
+</script>
+<script>
 (function(){
   "use strict";
   var S = window.OborotSync = window.OborotSync || {};
@@ -358,7 +368,7 @@
     } else {
       pushedHistory = false;
     }
-    if (markSeen) {
+    if (markSeen && window.oborotCanWrite && window.oborotCanWrite()) {
       try {
         fetch("/api/hints/seen", {method:"POST",
           headers:{"Content-Type":"application/json","X-Oborot-CSRF":"1"},
@@ -1105,6 +1115,7 @@
     saving = true;
     var next = !hintsOn;
     hintsOn = next; paintToggle();
+    if (window.oborotCanWrite && !window.oborotCanWrite()) { saving = false; return; }
     fetch("/api/prefs/hints", {method: "POST", credentials: "same-origin",
       headers: {"Content-Type": "application/json", "X-Oborot-CSRF": "1"},
       body: JSON.stringify({enabled: next})})
@@ -1428,6 +1439,9 @@
   }
 
   function markDone(){
+    if (window.oborotCanWrite && !window.oborotCanWrite()) {
+      return Promise.resolve();
+    }
     return fetch("/api/lessons/" + encodeURIComponent(lesson.key) + "/done",
       {method: "POST", credentials: "same-origin",
        headers: {"Content-Type": "application/json", "X-Oborot-CSRF": "1"}, body: "{}"})

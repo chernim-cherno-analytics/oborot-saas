@@ -643,22 +643,32 @@ def _receipts_out(db: Session, order: ProductionOrder) -> dict:
     rows = _receipt_rows(db, order.org_id, order.id)
     by_base = _received_by_base(rows)
     ordered = _ordered_by_base(order)
+    # Позиции, по которым числа НЕТ: либо факта не записано вовсе, либо
+    # источники спорят. По решению владельца 23.08.2026 такие числа отдаются
+    # как null, а не как ноль и не как победитель приоритета. Ноль — это
+    # утверждение «не приехало»; null — честное «не знаем». Разница видна не
+    # в формулировке, а в статистике качества рекомендаций, которая считается
+    # по этим же полям.
+    disputed = {c["base_name"] for c in _source_conflicts(rows)}
     lines = []
     for base, qty in ordered.items():
+        known = base in by_base and base not in disputed
         got = by_base.get(base, 0.0)
         lines.append({
             "base_name": base,
             "ordered_qty": round(qty, 3),
-            "received_qty": round(got, 3),
-            "diff": round(got - qty, 3),
+            "received_qty": round(got, 3) if known else None,
+            "diff": round(got - qty, 3) if known else None,
         })
     # Позиции, которых в заказе не было, а в приёмке есть (подрядчик прислал
     # не то). Прятать их нельзя: это ровно тот случай, ради которого факт
     # приёмки хранится отдельно от заказа.
     for base, got in by_base.items():
         if base not in ordered:
+            known = base not in disputed
             lines.append({"base_name": base, "ordered_qty": 0.0,
-                          "received_qty": round(got, 3), "diff": round(got, 3)})
+                          "received_qty": round(got, 3) if known else None,
+                          "diff": round(got, 3) if known else None})
     # «Неизвестно» — это любая заказанная позиция без записанного факта
     # приёмки, независимо от того, ушёл заказ в МойСклад или нет.
     unknown = bool(set(ordered) - set(by_base))
@@ -680,7 +690,11 @@ def _receipts_out(db: Session, order: ProductionOrder) -> dict:
         "order_id": order.id,
         "status": order.status,
         "ordered_total": round(sum(ordered.values()), 3),
-        "received_total": round(sum(by_base.values()), 3),
+        # Итог тоже null, если хоть по одной позиции числа нет. Сумма с дырой —
+        # это не итог, а полуправда: её легко принять за «принято столько», и
+        # именно так она и читается на экране. Сырые данные при этом никуда не
+        # деваются — они ниже, в by_source и source_conflicts.
+        "received_total": None if unknown else round(sum(by_base.values()), 3),
         "confirmed": bool(rows) and not unknown,
         # Есть заказанные позиции без записанного факта приёмки: по ним
         # принятое НЕИЗВЕСТНО. Ноль в received_total по такой позиции
