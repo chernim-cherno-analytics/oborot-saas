@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Атомарная выкладка «Оборота» на один VPS с systemd.
-set -Eeuo pipefail
+# ERR не наследуется внутрь функций: иначе один failure сначала вызывал trap
+# внутри wait_ready, а затем второй раз на уровне вызова функции. Верхний
+# уровень всё равно видит ненулевой return и выполняет единый rollback ровно
+# один раз.
+set -euo pipefail
 
 APP_DIR="${OBOROT_APP_DIR:-/opt/oborot/app-src}"
 VENV="${OBOROT_VENV:-/opt/oborot/venv}"
@@ -11,8 +15,20 @@ HEALTH_URL="${OBOROT_HEALTH_URL:-http://127.0.0.1:8000/health/ready}"
 STATE_DIR="${OBOROT_STATE_DIR:-/opt/oborot}"
 LOCK_FILE="${OBOROT_LOCK_FILE:-$STATE_DIR/deploy.lock}"
 PREVIOUS_FILE="${OBOROT_PREVIOUS_FILE:-$STATE_DIR/PREVIOUS_SHA}"
+PREVIOUS_VENV_FILE="${OBOROT_PREVIOUS_VENV_FILE:-$STATE_DIR/PREVIOUS_VENV}"
 HEALTH_ATTEMPTS="${OBOROT_HEALTH_ATTEMPTS:-30}"
 HEALTH_DELAY="${OBOROT_HEALTH_DELAY:-2}"
+PYTHON_BIN="${OBOROT_PYTHON:-$VENV/bin/python}"
+
+TRANSACTION_STARTED=0
+VENV_SWAPPED=0
+HANDLING_ERROR=0
+CURRENT=""
+NEW_VENV=""
+OLD_VENV=""
+FAILED_VENV=""
+ENV_BACKUP=""
+STALE_VENV=""
 
 say() { printf '%s\n' "$*"; }
 die() { say "ОШИБКА: $*" >&2; exit 1; }
@@ -43,39 +59,108 @@ wait_ready() {
   return 1
 }
 
-install_requirements() {
-  local sha="$1" req
+prepare_venv() {
+  local sha="$1" destination="$2" req source_file
   req="$(mktemp "$STATE_DIR/requirements.XXXXXX")"
-  git show "$sha:requirements.txt" > "$req" || {
+  if git cat-file -e "$sha:requirements.lock" 2>/dev/null; then
+    source_file="requirements.lock"
+  else
+    source_file="requirements.txt"
+  fi
+  git show "$sha:$source_file" > "$req" || {
     rm -f "$req"
     return 1
   }
-  if ! "$VENV/bin/pip" install -q -r "$req"; then
+  "$PYTHON_BIN" -m venv "$destination" || {
     rm -f "$req"
     return 1
-  fi
+  }
+  "$destination/bin/pip" install -q -r "$req" \
+    && "$destination/bin/pip" check || {
+      rm -f "$req"
+      return 1
+    }
   rm -f "$req"
 }
 
-rollback() {
-  local previous="$1"
-  say "== Автоматический откат на $previous =="
-  git checkout --detach "$previous" || return 1
-  install_requirements "$previous" || return 1
-  set_commit_env "$previous" || return 1
+cleanup() {
+  if [ -n "$NEW_VENV" ] && [ -d "$NEW_VENV" ]; then
+    rm -rf -- "$NEW_VENV"
+  fi
+  if [ -n "$FAILED_VENV" ] && [ -d "$FAILED_VENV" ]; then
+    rm -rf -- "$FAILED_VENV"
+  fi
+  [ -z "$ENV_BACKUP" ] || rm -f -- "$ENV_BACKUP"
+}
+
+rollback_transaction() {
+  say "== Автоматический откат на $CURRENT ==" >&2
+  if [ "$VENV_SWAPPED" = 1 ]; then
+    FAILED_VENV="$VENV.failed.$$"
+    if [ -d "$VENV" ]; then
+      mv "$VENV" "$FAILED_VENV" || return 1
+    fi
+    mv "$OLD_VENV" "$VENV" || return 1
+    VENV_SWAPPED=0
+  fi
+  git checkout --detach "$CURRENT" || return 1
+  cp -p "$ENV_BACKUP" "$ENV_FILE" || return 1
   systemctl restart "$SERVICE" || return 1
   wait_ready
 }
 
+on_error() {
+  local rc="$?"
+  if [ "$HANDLING_ERROR" = 1 ]; then
+    exit 2
+  fi
+  HANDLING_ERROR=1
+  set +e
+  trap - ERR
+  if [ "$TRANSACTION_STARTED" = 1 ]; then
+    journalctl -u "$SERVICE" -n 60 --no-pager >&2 || true
+    if rollback_transaction; then
+      TRANSACTION_STARTED=0
+      say "ОТКАТ ВЫПОЛНЕН: сервис снова работает на $CURRENT" >&2
+      cleanup
+      exit 1
+    fi
+    say "КРИТИЧЕСКАЯ ОШИБКА: релиз и откат не поднялись" >&2
+    journalctl -u "$SERVICE" -n 100 --no-pager >&2 || true
+    cleanup
+    exit 2
+  fi
+  cleanup
+  exit "$rc"
+}
+
+trap on_error ERR
+trap cleanup EXIT
+
 say "== 1/7 Предварительная проверка =="
 for command_name in git curl grep sed sqlite3 systemctl journalctl flock mktemp \
-  seq find sort awk xargs date chmod mv sleep; do
+  seq find sort awk xargs date chmod mv sleep rm cp dirname basename; do
   need "$command_name"
 done
 [ -d "$APP_DIR/.git" ] || die "$APP_DIR не является git-клоном"
-[ -x "$VENV/bin/pip" ] || die "нет исполняемого $VENV/bin/pip"
+[ -x "$PYTHON_BIN" ] || die "нет исполняемого Python: $PYTHON_BIN"
 [ -f "$ENV_FILE" ] || die "нет файла окружения $ENV_FILE"
 mkdir -p "$STATE_DIR" "$DATA_DIR/backups"
+if [ -f "$PREVIOUS_VENV_FILE" ]; then
+  IFS= read -r STALE_VENV < "$PREVIOUS_VENV_FILE" || true
+  if [ -n "$STALE_VENV" ]; then
+    VENV_PARENT="$(dirname "$VENV")"
+    VENV_NAME="$(basename "$VENV")"
+    STALE_PARENT="$(dirname "$STALE_VENV")"
+    STALE_NAME="$(basename "$STALE_VENV")"
+    [ "$STALE_PARENT" = "$VENV_PARENT" ] \
+      || die "небезопасный каталог прошлого venv в $PREVIOUS_VENV_FILE"
+    case "$STALE_NAME" in
+      "$VENV_NAME".rollback.*) ;;
+      *) die "небезопасное имя прошлого venv в $PREVIOUS_VENV_FILE";;
+    esac
+  fi
+fi
 
 # flock держит файловый дескриптор до завершения процесса и освобождается даже
 # после SIGKILL. Второй релиз не ждёт и не вмешивается в первый.
@@ -83,8 +168,8 @@ exec 9>"$LOCK_FILE"
 flock -n 9 || die "другой деплой уже выполняется ($LOCK_FILE)"
 
 cd "$APP_DIR"
-git diff --quiet && git diff --cached --quiet \
-  || die "в рабочей копии есть незакоммиченные изменения"
+STATUS="$(git status --porcelain --untracked-files=all)"
+[ -z "$STATUS" ] || die "рабочая копия не чиста (включая untracked): $STATUS"
 
 say "== 2/7 Получаем и проверяем целевой коммит =="
 git fetch origin --tags --prune
@@ -97,10 +182,13 @@ git merge-base --is-ancestor "$SHA" origin/main \
 say "сейчас: $CURRENT"
 say "цель:   $SHA"
 
-say "== 3/7 Проверяем зависимости целевого релиза =="
-# Сначала подготавливаем зависимости. Текущий процесс уже загрузил свои модули,
-# поэтому ошибка pip не роняет работающий сервис и не переключает код.
-install_requirements "$SHA" || die "не удалось установить зависимости $SHA"
+say "== 3/7 Готовим изолированное окружение целевого релиза =="
+# Никогда не устанавливаем пакеты в live venv: даже частично упавший pip иначе
+# оставлял старый код с наполовину новыми зависимостями.
+NEW_VENV="$VENV.prepare.$SHA.$$"
+[ ! -e "$NEW_VENV" ] || die "staging venv уже существует: $NEW_VENV"
+prepare_venv "$SHA" "$NEW_VENV" \
+  || die "не удалось подготовить изолированные зависимости $SHA"
 
 say "== 4/7 Снимаем согласованную копию SQLite =="
 STAMP="$(date +%Y%m%d-%H%M%S)"
@@ -118,26 +206,30 @@ else
 fi
 
 say "== 5/7 Переключаем код =="
+ENV_BACKUP="$(mktemp "$STATE_DIR/env-backup.XXXXXX")"
+cp -p "$ENV_FILE" "$ENV_BACKUP"
+OLD_VENV="$VENV.rollback.$CURRENT.$$"
+[ ! -e "$OLD_VENV" ] || die "rollback venv уже существует: $OLD_VENV"
+TRANSACTION_STARTED=1
 git checkout --detach "$SHA"
 set_commit_env "$SHA"
+mv "$VENV" "$OLD_VENV"
+VENV_SWAPPED=1
+mv "$NEW_VENV" "$VENV"
+NEW_VENV=""
 
 say "== 6/7 Перезапускаем и проверяем =="
-if systemctl restart "$SERVICE" && wait_ready; then
-  printf '%s\n' "$CURRENT" > "$PREVIOUS_FILE"
-  say "готово: прод = $SHA"
-  say "предыдущий успешный коммит: $CURRENT"
-  exit 0
+systemctl restart "$SERVICE"
+wait_ready
+
+printf '%s\n' "$CURRENT" > "$PREVIOUS_FILE"
+printf '%s\n' "$OLD_VENV" > "$PREVIOUS_VENV_FILE"
+TRANSACTION_STARTED=0
+trap - ERR
+if [ -n "$STALE_VENV" ] && [ "$STALE_VENV" != "$OLD_VENV" ] && [ -d "$STALE_VENV" ]; then
+  rm -rf -- "$STALE_VENV" || say "ПРЕДУПРЕЖДЕНИЕ: не удалён старый venv $STALE_VENV" >&2
 fi
-
-say "Релиз $SHA не прошёл health-check. Последние логи:" >&2
-journalctl -u "$SERVICE" -n 60 --no-pager >&2 || true
-
-say "== 7/7 Возвращаем предыдущий релиз =="
-if rollback "$CURRENT"; then
-  say "ОТКАТ ВЫПОЛНЕН: сервис снова работает на $CURRENT" >&2
-  exit 1
-fi
-
-say "КРИТИЧЕСКАЯ ОШИБКА: не поднялись ни $SHA, ни откат $CURRENT" >&2
-journalctl -u "$SERVICE" -n 100 --no-pager >&2 || true
-exit 2
+say "готово: прод = $SHA"
+say "предыдущий успешный коммит: $CURRENT"
+say "предыдущее окружение: $OLD_VENV"
+exit 0
