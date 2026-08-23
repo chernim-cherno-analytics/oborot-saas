@@ -943,7 +943,29 @@ async def _run_sync(org_id: int, mode: str, resume_from: str | None = None,
         # Какие типы цен считать «ценой продажи» и «полной себестоимостью»:
         # выбор организации, иначе угадываем по названию (см. _price_by).
         _load_price_types(org_id)
-        stats["price_types"] = price_type_names(assortment)[:20]
+        available_price_types = price_type_names(assortment)
+        stats["price_types"] = available_price_types[:20]
+        # DATA-10. Выбранного типа цены нет НИ У ОДНОГО товара — значит его
+        # переименовали или удалили (либо в имени опечатка). Останавливаемся
+        # ДО _upsert_products: там `row.cost_full = item.get("cost_full") or 0.0`
+        # записал бы ноль поверх прежней полной себестоимости по всему
+        # ассортименту, а sale_price откатился бы на первую цену в списке — то
+        # есть на ЧУЖОЙ тип. Тихая порча денег хуже остановки: остановку видно,
+        # подменённую цену — нет. Продажа и себестоимость падают одинаково:
+        # обе публикуются одной операцией, и «одну обновим, другую оставим»
+        # это ровно та несогласованная пара, из-за которой маржа считается
+        # по разным прогонам.
+        gone_price_types = missing_price_types(org_id, available_price_types)
+        if gone_price_types:
+            # Свежий список типов сохраняем ДО подъёма ошибки: его показывает
+            # выпадающий список настроек (api._price_types_seen), а обработчик
+            # в _thread_main перечитывает stats из базы. Без этой строки
+            # владелец видел бы ошибку «тип исчез» и старый список, в котором
+            # исчезнувший тип всё ещё есть, а нового нет. Переносимые ключи
+            # (_CARRIED_STATS) уже лежат в stats и сохраняются вместе с ним.
+            _persist(org_id, stats)
+            raise RuntimeError(price_types_gone_message(gone_price_types,
+                                                        available_price_types))
         ext_to_pid = _upsert_products(org_id, assortment, stats)
         _stage_end(stats, "products")
         _persist(org_id, stats, stage="products", progress=5.0 if initial else 8.0,
@@ -1392,9 +1414,16 @@ def _load_price_types(org_id: int) -> None:
 
 
 def set_price_types(org_id: int, sale: str = "", cost: str = "") -> None:
-    """Выбор типов цен организации (вызывается синком из настроек org)."""
+    """Выбор типов цен организации (вызывается синком из настроек org).
+
+    Сравнение имён идёт в нижнем регистре, а владельцу в сообщении об ошибке
+    нужно ЕГО написание: в тексте «тип «полная себестоимость» исчез» человек
+    не узнаёт свою настройку. Поэтому храним обе формы.
+    """
     _PRICE_TYPES[org_id] = {"sale": (sale or "").strip().lower(),
-                            "cost": (cost or "").strip().lower()}
+                            "cost": (cost or "").strip().lower(),
+                            "sale_raw": (sale or "").strip(),
+                            "cost_raw": (cost or "").strip()}
 
 
 def _price_by(row: dict, exact: str, hints: tuple[str, ...]) -> float:
@@ -1421,6 +1450,51 @@ def price_type_names(rows: list[dict]) -> list[str]:
             if name:
                 seen.setdefault(name, None)
     return list(seen)
+
+
+# Роли типов цен в порядке, в котором они называются владельцу.
+_PRICE_ROLES = (("sale", "цена продажи"), ("cost", "полная себестоимость"))
+
+
+def missing_price_types(org_id: int, available: list[str]) -> list[tuple[str, str]]:
+    """Явно выбранные типы цен, которых нет НИ У ОДНОГО товара: [(имя, роль)].
+
+    available — ПОЛНЫЙ список типов ассортимента (не обрезанный для stats):
+    выбранный тип, не попавший в первую двадцатку, — не пропавший тип.
+    Пустая настройка сюда не попадает: за неё отвечают эвристики (_price_by),
+    и они работают как раньше. Отсутствие типа у ОТДЕЛЬНЫХ карточек — тоже не
+    наш случай: непроставленная цена на части ассортимента это нормальное
+    состояние каталога, а не авария.
+    """
+    cfg = _PRICE_TYPES.get(org_id) or {}
+    have = {str(name).strip().lower() for name in available}
+    out: list[tuple[str, str]] = []
+    for key, role in _PRICE_ROLES:
+        chosen = cfg.get(key) or ""
+        if chosen and chosen not in have:
+            out.append((cfg.get(f"{key}_raw") or chosen, role))
+    return out
+
+
+def price_types_gone_message(missing: list[tuple[str, str]],
+                             available: list[str]) -> str:
+    """Текст остановки: что пропало, почему остановились и из чего выбирать."""
+    what = ", ".join(f"«{name}» ({role})" for name, role in missing)
+    plural = len(missing) > 1
+    shown = [str(n).strip() for n in available if str(n).strip()]
+    if not shown:
+        tail = "Ни одного типа цены в ассортименте МойСклада сейчас нет."
+    else:
+        tail = "Сейчас в ассортименте есть: " + ", ".join(shown[:12])
+        tail += " и другие." if len(shown) > 12 else "."
+    return (
+        f"{'Выбранные типы цен' if plural else 'Выбранный тип цены'} {what} "
+        f"{'больше не встречаются' if plural else 'больше не встречается'} "
+        "в ассортименте МойСклада — тип переименован или удалён. Цены товаров "
+        "оставлены прежними: пересчёт по чужому типу цены исказил бы "
+        "себестоимость и прибыль во всей аналитике. Выберите тип заново в "
+        f"Настройках и запустите синхронизацию. {tail}"
+    )
 
 
 def _sale_price_of(row: dict, org_id: int = 0) -> float:

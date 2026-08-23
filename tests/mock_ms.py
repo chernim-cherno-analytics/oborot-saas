@@ -374,6 +374,65 @@ def entity_store(request: Request, limit: int = 1000, offset: int = 0):
     return _page(rows, limit, offset)
 
 
+# ── Именованные типы цен (DATA-10) ───────────────────────────────────────────
+#
+# По умолчанию ассортимент отдаёт РОВНО ОДНУ безымянную цену — как раньше.
+# Это не осторожность ради осторожности: на числах этого мок-мира стоят
+# денежные ожидания четырёх наборов, и появление второго элемента в
+# salePrices сдвинуло бы _sale_price_of у всех сразу. Набор DATA-10 включает
+# именованные типы явно, через POST /__test/price_types.
+#
+#   enabled    — выдавать ли priceType у цен вообще;
+#   sale       — имя типа для цены продажи ('' — этой цены в карточке нет
+#                вовсе: тип удалили в МойСкладе, и в salePrices осталась
+#                только себестоимость — первой в списке);
+#   cost       — имя типа для второй цены, полной себестоимости
+#                ('' — второй цены в карточке нет вовсе);
+#   cost_ratio — полная себестоимость = закупочная цена × ratio. Отдельное
+#                число нужно, чтобы тест отличал «взяли выбранный тип» от
+#                «взяли buyPrice» и от «взяли первую цену в списке»;
+#   cost_skip  — ext_id, у которых второй цены нет: тип существует в
+#                ассортименте глобально, но не проставлен на этой карточке.
+PRICE_TYPES: dict = {
+    "enabled": False,
+    "sale": "Цена продажи",
+    "cost": "Полная себестоимость",
+    "cost_ratio": 1.5,
+    "cost_skip": [],
+}
+
+
+def reset_price_types() -> None:
+    PRICE_TYPES.update(enabled=False, sale="Цена продажи",
+                       cost="Полная себестоимость", cost_ratio=1.5, cost_skip=[])
+
+
+@app.post("/__test/price_types")
+async def test_price_types(request: Request):
+    body = await request.json()
+    for key, val in (body or {}).items():
+        if key in PRICE_TYPES:
+            PRICE_TYPES[key] = val
+    return dict(PRICE_TYPES)
+
+
+def _sale_prices(ext_id: str, price_rub: int, cost_rub: int) -> list[dict]:
+    """salePrices карточки: без переключателя — та же одна безымянная цена."""
+    if not PRICE_TYPES.get("enabled"):
+        return [{"value": price_rub * 100}]
+    out: list[dict] = []
+    sale_name = str(PRICE_TYPES.get("sale") or "")
+    if sale_name:
+        out.append({"value": price_rub * 100, "priceType": {"name": sale_name}})
+    cost_name = str(PRICE_TYPES.get("cost") or "")
+    if cost_name and ext_id not in (PRICE_TYPES.get("cost_skip") or []):
+        out.append({
+            "value": int(round(cost_rub * float(PRICE_TYPES.get("cost_ratio") or 1.0))) * 100,
+            "priceType": {"name": cost_name},
+        })
+    return out
+
+
 @app.get("/entity/assortment")
 def entity_assortment(request: Request, limit: int = 1000, offset: int = 0):
     _auth(request)
@@ -389,7 +448,7 @@ def entity_assortment(request: Request, limit: int = 1000, offset: int = 0):
         rows.append({
             "id": pid, "name": name, "pathName": path,
             "meta": {"href": f"{BASE}/entity/product/{pid}", "type": "product"},
-            "salePrices": [{"value": price * 100}],
+            "salePrices": _sale_prices(pid, price, cost),
             "buyPrice": {"value": cost * 100},
             "archived": False,
         })
@@ -404,7 +463,7 @@ def entity_assortment(request: Request, limit: int = 1000, offset: int = 0):
                 "characteristics": chars,
                 "product": {"meta": {"href": f"{BASE}/entity/product/{sku['parent']}",
                                      "type": "product"}},
-                "salePrices": [{"value": sku["price"] * 100}],
+                "salePrices": _sale_prices(sku["ext"], sku["price"], sku["cost"]),
                 "buyPrice": {"value": sku["cost"] * 100},
                 "archived": False,
             })
@@ -413,7 +472,7 @@ def entity_assortment(request: Request, limit: int = 1000, offset: int = 0):
                 "id": sku["ext"], "name": sku["name"], "pathName": sku["path"],
                 "meta": {"href": f"{BASE}/entity/product/{sku['ext']}",
                          "type": "product"},
-                "salePrices": [{"value": sku["price"] * 100}],
+                "salePrices": _sale_prices(sku["ext"], sku["price"], sku["cost"]),
                 "buyPrice": {"value": sku["cost"] * 100},
                 "archived": "archived" in sku["flags"],
             })
