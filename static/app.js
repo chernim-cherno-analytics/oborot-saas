@@ -70,6 +70,18 @@ var CLS_TIP = {
   dull: "Класс C — медленный: 1–2 тыс ₽/день",
   weak: "Класс D — слабый: до 1 тыс ₽/день"
 };
+/* Пороги классов настраиваются организацией, а подсказка была зашита в код:
+   после смены порогов класс менялся у большинства позиций, а тултип на каждом
+   значке продолжал называть старые числа. Страница, получившая пороги от API,
+   вызывает это один раз — и подсказка начинает говорить правду. */
+window.setClassTips = function (t) {
+  if (!t) return;
+  var k = function (v) { return v >= 1000 ? (v / 1000).toLocaleString("ru-RU") + " тыс" : v; };
+  CLS_TIP.best = "Класс A — бестселлер: оборачиваемость от " + k(t.good) + " ₽/день";
+  CLS_TIP.good = "Класс B — хороший: " + k(t.dull) + "–" + k(t.good) + " ₽/день";
+  CLS_TIP.dull = "Класс C — медленный: " + k(t.weak) + "–" + k(t.dull) + " ₽/день";
+  CLS_TIP.weak = "Класс D — слабый: до " + k(t.weak) + " ₽/день";
+};
 function clsDot(cls) {
   var c = CLS_LABELS[cls] ? cls : "weak";
   return '<span class="clsq ' + c + '" title="' + esc(CLS_TIP[c]) + '">' + CLS_LETTER[c] + "</span>";
