@@ -446,7 +446,9 @@ def _parse_filter(flt: str) -> dict:
 #   stock_429_every — каждый k-й запрос отчёта → 429 (0 — выключено);
 #   stock_500_once  — ровно один ближайший запрос отчёта → 500;
 #   stock_delay_ms  — задержка каждого удачного ответа отчёта (деплой П1:
-#                     чтобы тест успел увидеть промежуточные состояния синка).
+#                     чтобы тест успел увидеть промежуточные состояния синка);
+#   docs_429_before — документы за периоды, начинающиеся раньше этой даты
+#                     (YYYY-MM-DD), отвечают 429 (DATA-3).
 
 FAULTS: dict = {"stock_ok_before": 0, "stock_429_burst": 0,
                 "stock_429_every": 0, "stock_500_once": False,
@@ -454,6 +456,11 @@ FAULTS: dict = {"stock_ok_before": 0, "stock_429_burst": 0,
                 # 429 на документах продаж/возвратов: прерывает синк ровно
                 # на продажах окна быстрого старта (ревью 21.08, мажор 2)
                 "docs_429_burst": 0,
+                # 429 на документах, чей запрошенный период НАЧИНАЕТСЯ раньше
+                # этой даты (DATA-3): окно и свежие чанки истории грузятся, а
+                # продажи СТАРОГО чанка не доезжают — ровно тот шов, где
+                # остатки чанка уже записаны, а продажи за те же дни ещё нет.
+                "docs_429_before": "",
                 # Заказ поставщику СОЗДАН, но ответ не дошёл (таймаут/502).
                 # Ровно тот случай, ради которого писался маркер и поиск
                 # документа перед созданием: слепой повтор дал бы дубль.
@@ -468,7 +475,8 @@ FAULT_STATS: dict = {"stock_requests": 0, "stock_ok": 0, "stock_429": 0, "stock_
 def reset_faults() -> None:
     FAULTS.update(stock_ok_before=0, stock_429_burst=0, stock_429_every=0,
                   stock_500_once=False, assortment_429_burst=0,
-                  docs_429_burst=0, po_create_then_fail=0, po_429_burst=0,
+                  docs_429_burst=0, docs_429_before="",
+                  po_create_then_fail=0, po_429_burst=0,
                   stock_delay_ms=0)
     for k in FAULT_STATS:
         FAULT_STATS[k] = 0
@@ -546,15 +554,17 @@ async def report_stock_all(request: Request, limit: int = 1000, offset: int = 0,
 def _docs_endpoint(entity: str, request: Request, limit: int, offset: int,
                    flt: str, expand: str) -> dict:
     _auth(request)
-    if int(FAULTS.get("docs_429_burst") or 0) > 0:
-        from fastapi.responses import JSONResponse
-        FAULTS["docs_429_burst"] -= 1
-        return JSONResponse(status_code=429,
-                            content={"errors": [{"error": "mock: Превышен лимит запросов"}]},
-                            headers={"X-Lognex-Retry-TimeInterval": "200"})
     parsed = _parse_filter(flt)
     m_from = parsed.get("moment>=", "")[:10]
     m_to = parsed.get("moment<=", "")[:10]
+    before = str(FAULTS.get("docs_429_before") or "")
+    if int(FAULTS.get("docs_429_burst") or 0) > 0 or (before and m_from and m_from < before):
+        from fastapi.responses import JSONResponse
+        if int(FAULTS.get("docs_429_burst") or 0) > 0:
+            FAULTS["docs_429_burst"] -= 1
+        return JSONResponse(status_code=429,
+                            content={"errors": [{"error": "mock: Превышен лимит запросов"}]},
+                            headers={"X-Lognex-Retry-TimeInterval": "200"})
     rows = []
     for doc in DOCS[entity]:
         day = doc["moment"][:10]
