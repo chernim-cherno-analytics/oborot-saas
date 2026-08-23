@@ -1281,8 +1281,15 @@ def api_checks() -> None:
               "window.preview = function(step, keepEdits){" in page_prev
               and "sendEdits" not in page_prev,
               "иначе соседний пересчёт молча терял добавленную позицию")
+        # Проверка по тексту страницы — грубая, но дешёвая: настоящую сверку
+        # «экран против сервера» делает tests/test_ui.py в браузере. Здесь
+        # достаточно убедиться, что оба защитных условия на месте: без
+        # себестоимости маржа не считается вовсе, а взятое сверх потребности
+        # не выдаётся за прибыль (её в горизонте заказа продать нечем).
         check("браузер не считает маржу там, где нет себестоимости",
-              "if(!i.no_cost && i.cost_price > 0) profit" in page_prev)
+              "if(!i.no_cost && i.cost_price > 0)" in page_prev)
+        check("и не обещает прибыль на штуках сверх потребности",
+              "Math.min(q, need) * margin" in page_prev)
         check("анкета возит режим горизонта (иначе «Повторить» считает по-новому)",
               "cover_mode: STATE.cover_mode" in page_prev
               and "last.cover_mode" in page_prev)
