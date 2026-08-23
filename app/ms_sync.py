@@ -650,12 +650,48 @@ def orgs_with_resume_point() -> list[int]:
         db.close()
 
 
+def _subscription_allows_sync(org_id: int) -> bool:
+    """False — организация в readonly и гейт включён (см. start_sync)."""
+    from app import subscription
+
+    if not subscription.gate_enabled():
+        return True
+    from app.models import Org
+
+    db = SessionLocal()
+    try:
+        org = db.get(Org, org_id)
+        if org is None:
+            return False
+        if subscription.subscription_state(org, db) == subscription.READONLY:
+            log.info("синк не запущен: подписка не оплачена (org=%s)", org_id)
+            return False
+        return True
+    except Exception:  # noqa: BLE001 — гейт не имеет права ронять синк
+        log.exception("проверка подписки перед синком не удалась (org=%s)", org_id)
+        return True
+    finally:
+        db.close()
+
+
 def start_sync(org_id: int, mode: str, *, force_full: bool = False) -> bool:
     """Запускает фоновый синк (initial | incremental). False — уже идёт.
 
     force_full=True — настоящая полная пересборка (кнопка «Полная пересборка»,
     подсказка после смены складов): точка продолжения игнорируется и снимается.
+
+    Гейт подписки (D-24) проверяется ЗДЕСЬ, а не на роутах, и это осознанно.
+    Синк стоит нам денег и общих лимитов МойСклада, а запустить его можно не
+    только кнопкой «Синхронизировать»: его дёргают повторное сохранение токена,
+    выбор складов, ночной планировщик и почасовой догон. Закрывать каждую
+    дверь по отдельности — гарантированно забыть одну (ревью так и нашло
+    открытую: сохранение того же самого токена в Настройках запускало полный
+    синк организации, которой мы уже отказали в записи). Одна проверка в точке,
+    через которую проходят ВСЕ запуски, надёжнее шести проверок на входах.
+    При выключенном флаге не стоит ни одного запроса к базе.
     """
+    if not _subscription_allows_sync(org_id):
+        return False
     with _threads_lock:
         thread = _threads.get(org_id)
         if thread is not None and thread.is_alive():
@@ -1484,8 +1520,8 @@ def _migrate_renames(db, org_id: int, renames: dict[str, set[str]],
     агрегируется по новому имени одним проходом — раньше вторая вставка того
     же PK падала IntegrityError и валила весь синк (ревью 18.08).
     """
-    from app.models import (ProductionAssign, ProductionOrder, SkuCategoryOverride,
-                            SkuDiscount, SkuHidden)
+    from app.models import (OrderReceipt, ProductionAssign, ProductionOrder,
+                            SkuCategoryOverride, SkuDiscount, SkuHidden)
     db.flush()  # pending-переименования товаров должны быть видны SELECT'ам
     migrated, skipped = [], []
 
@@ -1547,12 +1583,18 @@ def _migrate_renames(db, org_id: int, renames: dict[str, set[str]],
                     else:
                         db.delete(r)
             db.flush()
-        # Заказы на производство: правим items_json незакрытых заказов,
-        # чтобы push-to-ms и просмотр матчились по актуальному имени
+        # Заказы на производство: правим items_json, чтобы push-to-ms и
+        # просмотр матчились по актуальному имени.
+        #
+        # Раньше принятые заказы (status == "received") пропускались: их уже
+        # никуда не отправишь, и имя в них никого не волновало. С появлением
+        # приёмок это перестало быть правдой: приёмки переезжают на новое имя,
+        # и заказ, оставшийся со старым, распадался в сверке надвое —
+        # «заказано 11, принято 0» под одним именем и «заказано 0, принято 11»
+        # под другим. Обе половины обязаны жить под одним именем.
         olds_set = set(olds)
         orders = db.execute(select(ProductionOrder).where(
-            ProductionOrder.org_id == org_id,
-            ProductionOrder.status != "received")).scalars().all()
+            ProductionOrder.org_id == org_id)).scalars().all()
         for order in orders:
             try:
                 items = json.loads(order.items_json or "[]")
@@ -1565,6 +1607,19 @@ def _migrate_renames(db, org_id: int, renames: dict[str, set[str]],
                     changed = True
             if changed:
                 order.items_json = json.dumps(items, ensure_ascii=False)
+        # Приёмки (D-25) ключованы тем же base_name. Без переноса переименование
+        # рвало сверку надвое: заказ показывал новое имя с «принято 0», а рядом
+        # висела фантомная строка со старым именем и «заказано 0». Хуже того,
+        # машинный источник считает уже записанное ПО ИМЕНИ — после
+        # переименования он не находил своих строк и записывал всё
+        # накопленное «отгружено» заново, удваивая принятое.
+        for old in olds:
+            db.execute(
+                update(OrderReceipt)
+                .where(OrderReceipt.org_id == org_id, OrderReceipt.base_name == old)
+                .values(base_name=new)
+            )
+        db.flush()
         migrated.extend(f"{old} → {new}" for old in olds)
 
     if migrated:
@@ -1907,6 +1962,11 @@ async def _sync_incoming(org_id: int, client: MoySkladClient,
         tracked_order_id = _oborot_order_id(doc, our_docs)
         tracked = tracked_order_id is not None
         doc_href = ((doc.get("meta") or {}).get("href")) or ""
+        # Ключ дедупликации — нормализованный id документа, а не сырой href:
+        # принадлежность документа проверяется через _href_id (query-параметры
+        # отбрасываются), и сырой href в ключе рассогласовал бы одно с другим —
+        # смена формы ссылки заставила бы записать всё «отгруженное» заново.
+        doc_ref = _href_id(doc_href) or doc_href
         doc_qty = 0.0
         doc_shipped = False
         for pos in await _full_positions(client, "purchaseorder", doc, stats):
@@ -1926,8 +1986,11 @@ async def _sync_incoming(org_id: int, client: MoySkladClient,
             # синк идёт каждую ночь, а таблица приёмок только пополняется.
             if tracked_order_id is not None and base_of_pos:
                 shipped_qty = float(pos.get("shipped") or 0)
-                if shipped_qty > 0:
-                    key = (tracked_order_id, doc_href)
+                # Ноль тоже кладём: если в МойСкладе приёмку исправили или
+                # распровели и «отгружено» вернулось к нулю, дельта обязана
+                # уйти в минус. Пропуская нули, мы бы записали приход навсегда.
+                if shipped_qty >= 0:
+                    key = (tracked_order_id, doc_ref)
                     bucket = shipped_by_order.setdefault(key, {})
                     bucket[base_of_pos] = bucket.get(base_of_pos, 0.0) + shipped_qty
             left = float(pos.get("quantity") or 0) - float(pos.get("shipped") or 0)
@@ -2010,16 +2073,31 @@ def _write_shipped_receipts(
     же документу. Пока цифра в МойСкладе не меняется, новых строк не
     появляется; выросла — появится ровно одна строка на разницу.
 
-    Уменьшение (в МойСкладе исправили приёмку в меньшую сторону) тоже
-    записывается — компенсирующей строкой с минусом. Править существующую
-    строку нельзя: это факт, а не текущее состояние.
+    Уменьшение (в МойСкладе исправили приёмку в меньшую сторону, вплоть до
+    нуля) тоже записывается — компенсирующей строкой с минусом. Править
+    существующую строку нельзя: это факт, а не текущее состояние.
+
+    Чего компенсация НЕ покрывает и почему: документ сняли с проведения
+    (`applicable = false`), удалили или он вышел за окно истории. В этих
+    случаях позиции до нас просто не доезжают, и «отгруженное» остаётся
+    записанным. Отличить «документ исчез» от «синк его не привёз» мы не можем,
+    а списывать факт приёмки по молчанию источника — худший из двух вариантов.
 
     Ручные подтверждения этот код не трогает вовсе: у них другой источник,
-    и человек с машиной не спорят за одну и ту же строку. Их суммы
-    складываются — если человек уже подтвердил приход, а потом МойСклад
-    прислал «отгружено», получится завышение. Это осознанный компромисс:
-    альтернатива — молча отбросить один из двух фактов, а расхождение
-    источников должно быть видно, а не спрятано.
+    и человек с машиной не спорят за одну и ту же строку. Чтобы они не
+    складывались в двойной счёт, отметка «принят целиком» для заказа,
+    ушедшего в МойСклад, вообще не пишется (см. api._record_execution):
+    исполнение по такому заказу принадлежит машинному источнику. Явно
+    названные человеком количества всё же уважаются, и тогда по позиции
+    могут оказаться два источника — поэтому выдача показывает разбивку
+    `by_source`: расхождение между «сказал человек» и «прислал МойСклад»
+    должно быть видно, а не спрятано в одной сумме.
+
+    Чего мы НЕ узнаем: документ, пересозданный в МойСкладе с новой ссылкой,
+    перестаёт опознаваться (`_oborot_order_id` сверяет href), и машинные
+    приёмки по такому заказу просто прекращаются. Двойного счёта здесь нет —
+    только тихая потеря источника; поднять её нечем, пока нет обратной
+    диагностики «наша ссылка ведёт в никуда».
 
     Возвращает число добавленных строк.
     """
@@ -2034,15 +2112,23 @@ def _write_shipped_receipts(
             order = db.get(ProductionOrder, order_id)
             if order is None or order.org_id != org_id:
                 continue  # заказ удалили — приписывать некуда
+            # Сравниваем по НОРМАЛИЗОВАННОЙ ссылке, а не по строке. Ключ
+            # менялся (сначала писался полный href, потом — id документа), и
+            # строгое сравнение не нашло бы своих же прежних строк: всё
+            # накопленное «отгружено» записалось бы заново, удвоив принятое.
+            # Заодно это переживает смену query-параметров и базового адреса.
+            wanted = _href_id(doc_href) or doc_href
             already: dict[str, float] = {}
-            for base, qty in db.execute(
-                select(OrderReceipt.base_name, OrderReceipt.qty).where(
+            for base, qty, ref in db.execute(
+                select(OrderReceipt.base_name, OrderReceipt.qty,
+                       OrderReceipt.source_ref).where(
                     OrderReceipt.org_id == org_id,
                     OrderReceipt.order_id == order_id,
                     OrderReceipt.source == "ms_order_shipped",
-                    OrderReceipt.source_ref == doc_href[:512],
                 )
             ).all():
+                if (_href_id(ref or "") or ref or "") != wanted:
+                    continue
                 already[base] = already.get(base, 0.0) + float(qty or 0)
             now = datetime.utcnow()
             for base, total in lines.items():
@@ -2052,7 +2138,7 @@ def _write_shipped_receipts(
                 db.add(OrderReceipt(
                     org_id=org_id, order_id=order_id, base_name=base,
                     qty=delta, at=now, source="ms_order_shipped",
-                    precision="by_position", source_ref=doc_href[:512],
+                    precision="by_position", source_ref=str(wanted)[:512],
                     created_by=None, created_at=now,
                 ))
                 added += 1

@@ -17,8 +17,115 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.types import TypeDecorator
 
 from app.db import Base, engine, run_migration_once
+
+
+class TolerantDate(TypeDecorator):
+    """DATE, который не падает на человеческом вводе.
+
+    Колонки, которые заполняются руками через UPDATE в проде, обязаны читаться
+    даже при «неправильном» формате: исключение при загрузке строки роняет не
+    одну ручку, а всё, что эту строку читает. Принимаем date, datetime, ISO,
+    «ГГГГ-ММ-ДД ЧЧ:ММ:СС» и «ДД.ММ.ГГГГ»; что не разобралось — None, то есть
+    «не задано», а не отказ обслуживания.
+    """
+
+    impl = Date
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        if value is None or isinstance(value, date) and not isinstance(value, datetime):
+            return value
+        if isinstance(value, datetime):
+            return value.date()
+        return _parse_loose_date(value)
+
+    def process_result_value(self, value, dialect):
+        if value is None or isinstance(value, date) and not isinstance(value, datetime):
+            return value
+        if isinstance(value, datetime):
+            return value.date()
+        return _parse_loose_date(value)
+
+    def result_processor(self, dialect, coltype):
+        """Читает значение, даже если разбор диалекта об него спотыкается.
+
+        SQLAlchemy обычно не велит переопределять этот метод, но здесь без
+        этого никак: процессор диалекта отрабатывает ПЕРВЫМ, и на SQLite
+        (а это прод) `str_to_date` падает на «2026-12-31 00:00:00» ещё до
+        того, как наш снисходительный разбор получит управление. Судья поймал
+        это ровно так: тип был написан, а сценарий, ради которого он написан,
+        по-прежнему давал 500 на каждой странице. Поэтому ошибку внутреннего
+        процессора глушим и пропускаем к разбору сырое значение.
+        """
+        impl_processor = self.impl_instance.result_processor(dialect, coltype)
+
+        def process(value):
+            if impl_processor is not None:
+                try:
+                    value = impl_processor(value)
+                except (ValueError, TypeError):
+                    pass  # сырое значение разберёт process_result_value
+            return self.process_result_value(value, dialect)
+
+        return process
+
+
+class TolerantDateTime(TypeDecorator):
+    """DATETIME с тем же свойством, что TolerantDate: не падает на ручном вводе."""
+
+    impl = DateTime
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        if value is None or isinstance(value, datetime):
+            return value
+        if isinstance(value, date):
+            return datetime(value.year, value.month, value.day)
+        parsed = _parse_loose_date(value)
+        return datetime(parsed.year, parsed.month, parsed.day) if parsed else None
+
+    def process_result_value(self, value, dialect):
+        if value is None or isinstance(value, datetime):
+            return value
+        if isinstance(value, date):
+            return datetime(value.year, value.month, value.day)
+        parsed = _parse_loose_date(value)
+        return datetime(parsed.year, parsed.month, parsed.day) if parsed else None
+
+    def result_processor(self, dialect, coltype):
+        impl_processor = self.impl_instance.result_processor(dialect, coltype)
+
+        def process(value):
+            if impl_processor is not None:
+                try:
+                    value = impl_processor(value)
+                except (ValueError, TypeError):
+                    pass
+            return self.process_result_value(value, dialect)
+
+        return process
+
+
+def _parse_loose_date(value) -> date | None:
+    text_value = str(value or "").strip()
+    if not text_value:
+        return None
+    head = text_value.replace("T", " ").split(" ")[0]
+    # %d/%m/%Y НЕ принимаем намеренно: «01/02/2026» в одной половине мира
+    # первое февраля, в другой второе января, и обе трактовки правдоподобны.
+    # Дата здесь про деньги; лучше прочитать как «не задано» и сказать об этом
+    # в логе, чем молча ошибиться на месяц.
+    for fmt in ("%Y-%m-%d", "%d.%m.%Y"):
+        try:
+            return datetime.strptime(head, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
 
 DEFAULT_SETTINGS = {
     "thresholds": {"weak": 1000, "dull": 2000, "good": 5000},
@@ -48,7 +155,11 @@ class Org(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     plan: Mapped[str] = mapped_column(String(16), nullable=False, default="trial")  # trial|start|brand|pro
-    trial_ends_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Тип снисходительный по той же причине, что и у paid_until: колонку
+    # правят руками (продлить триал пилоту — обычное дело), и «31.12.2026»
+    # вместо «2026-12-31 00:00:00» роняло загрузку строки orgs, то есть все
+    # страницы этой организации. Судья именно так и сделал «битую» строку.
+    trial_ends_at: Mapped[datetime | None] = mapped_column(TolerantDateTime, nullable=True)
     settings_json: Mapped[str] = mapped_column(Text, nullable=False, default=lambda: json.dumps(DEFAULT_SETTINGS))
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     # ── Аддитивно: приложение маркетплейса МойСклад (Vendor API 1.0) ──────────
@@ -65,7 +176,17 @@ class Org(Base):
     # paid_until — «оплачено до» включительно (D-24). NULL = не платили ни разу.
     # Живёт рядом с trial_ends_at и вместе с ним определяет состояние подписки;
     # вычисляется состояние ровно в одном месте — app/subscription.py.
-    paid_until: Mapped[date | None] = mapped_column(Date, nullable=True)
+    #
+    # Тип намеренно снисходительный (см. TolerantDate). Значение попадает сюда
+    # РУКАМИ, командой UPDATE на боевом сервере: своей ручки нет и не
+    # планируется, пока платящих единицы. Соседняя колонка trial_ends_at —
+    # DATETIME, и туда пишут «2026-12-31 00:00:00». Оператор, скопировавший
+    # этот формат сюда, со строгим типом Date получал бы ValueError при ЗАГРУЗКЕ
+    # строки orgs — то есть 500 на каждой странице, включая «Тарифы»: клиент,
+    # который только что заплатил, оставался бы с мёртвым аккаунтом и без
+    # возможности понять, что случилось. Цена снисходительности — ноль,
+    # цена строгости — потерянный клиент.
+    paid_until: Mapped[date | None] = mapped_column(TolerantDate, nullable=True)
 
     @property
     def settings(self) -> dict:
@@ -565,7 +686,12 @@ class OrderReceipt(Base):
     source_ref: Mapped[str] = mapped_column(
         String(512), nullable=False, default="", server_default=""
     )
-    created_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    # Без внешнего ключа на users намеренно. Сотрудник может удалить свой
+    # аккаунт, а факт приёмки удалять вместе с ним нельзя — в Postgres FK
+    # превратил бы «удалить аккаунт» в 500. Поле нужно только чтобы
+    # показать «кто отметил», и на отсутствующего пользователя оно
+    # деградирует до «неизвестно», а не до отказа.
+    created_by: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     __table_args__ = (

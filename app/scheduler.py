@@ -104,12 +104,21 @@ def _paid_only(org_ids: list[int]) -> list[int]:
     try:
         allowed = []
         for org_id in org_ids:
-            org = db.get(Org, org_id)
-            if org is None:
-                continue
-            if subscription.subscription_state(org, db) == subscription.READONLY:
-                log.info("синк пропущен: подписка не оплачена (org=%s)", org_id)
-                continue
+            # Разбор КАЖДОЙ организации отдельно и с перехватом. Иначе одна
+            # битая строка (например, «оплачено до», проставленное руками в
+            # чужом формате) валила бы весь обход — и ночной синк не шёл бы
+            # у всех клиентов сразу, молча: ошибка выше по стеку глушится,
+            # а у остальных организаций страницы при этом живые.
+            try:
+                org = db.get(Org, org_id)
+                if org is None:
+                    continue
+                if subscription.subscription_state(org, db) == subscription.READONLY:
+                    log.info("синк пропущен: подписка не оплачена (org=%s)", org_id)
+                    continue
+            except Exception:  # noqa: BLE001 — сомнение толкуем в пользу синка
+                log.exception("не удалось проверить подписку, синк разрешён (org=%s)",
+                              org_id)
             allowed.append(org_id)
         return allowed
     finally:

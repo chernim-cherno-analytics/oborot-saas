@@ -5,7 +5,7 @@ from datetime import date, datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Path
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session
 
 from app import analytics, lessons, ms_writeback, order_planner, subscription
@@ -471,6 +471,7 @@ def _apply_order_to_incoming(db: Session, org_id: int, order: ProductionOrder, s
 # как равноправный — он заработает у клиентов, чьи данные его содержат.
 
 MAX_RECEIPT_QTY = 1_000_000
+MAX_RECEIPTS_OUT = 500
 
 
 def _receipt_rows(db: Session, org_id: int, order_id: int) -> list[OrderReceipt]:
@@ -491,10 +492,26 @@ def _received_by_base(rows: list[OrderReceipt]) -> dict[str, float]:
     return out
 
 
+def _ordered_by_base(order: ProductionOrder) -> dict[str, float]:
+    """Заказано по каждому базовому имени.
+
+    Складывает, а не берёт последнее: в заказе бывают две строки с одним
+    именем (например, довписали позицию руками поверх плана). Словарь с
+    перезаписью терял первую, и «заказано» расходилось с «едет к нам»,
+    которое считается обходом списка.
+    """
+    out: dict[str, float] = {}
+    for item in order.items:
+        base = str(item.get("base_name") or "").strip()
+        if base:
+            out[base] = out.get(base, 0.0) + float(item.get("qty") or 0)
+    return out
+
+
 def _receipts_out(db: Session, order: ProductionOrder) -> dict:
     rows = _receipt_rows(db, order.org_id, order.id)
     by_base = _received_by_base(rows)
-    ordered = {str(i.get("base_name") or ""): float(i.get("qty") or 0) for i in order.items}
+    ordered = _ordered_by_base(order)
     lines = []
     for base, qty in ordered.items():
         got = by_base.get(base, 0.0)
@@ -511,15 +528,31 @@ def _receipts_out(db: Session, order: ProductionOrder) -> dict:
         if base not in ordered:
             lines.append({"base_name": base, "ordered_qty": 0.0,
                           "received_qty": round(got, 3), "diff": round(got, 3)})
+    unknown = ms_writeback.is_pushed(order.ms_doc_href) and not rows
     return {
         "order_id": order.id,
         "status": order.status,
         "ordered_total": round(sum(ordered.values()), 3),
         "received_total": round(sum(by_base.values()), 3),
         "confirmed": bool(rows),
+        # Заказ ушёл в МойСклад, приёмок оттуда нет: принятое неизвестно.
+        # Ноль в received_total здесь означает «не знаем», а не «не приехало».
+        "execution_unknown": unknown,
         "sources": sorted({r.source for r in rows}),
         "precisions": sorted({r.precision for r in rows}),
+        # Разбивка по источникам. Сумма двух источников по одной позиции —
+        # это не «принято столько», а расхождение между тем, что сказал
+        # человек, и тем, что прислал МойСклад. Прятать его в одном числе
+        # нельзя: именно ради различимости источник и обязателен.
+        "by_source": {
+            src: round(sum(float(r.qty or 0) for r in rows if r.source == src), 3)
+            for src in sorted({r.source for r in rows})
+        },
         "lines": sorted(lines, key=lambda x: x["base_name"]),
+        # Сводка (`lines`) считается по ВСЕМ строкам, а список показывается
+        # последними MAX_RECEIPTS_OUT: история приёмок растёт линейно, и
+        # без потолка ответ рос бы вместе с ней. Обрезка объявлена числом,
+        # а не сделана молча — молчаливое усечение читается как «это всё».
         "receipts": [{
             "id": r.id,
             "base_name": r.base_name,
@@ -528,7 +561,9 @@ def _receipts_out(db: Session, order: ProductionOrder) -> dict:
             "source": r.source,
             "precision": r.precision,
             "created_by": r.created_by,
-        } for r in rows],
+        } for r in rows[-MAX_RECEIPTS_OUT:]],
+        "receipts_total": len(rows),
+        "receipts_hidden": max(0, len(rows) - MAX_RECEIPTS_OUT),
     }
 
 
@@ -555,6 +590,15 @@ def _add_receipts(
 class ReceiptLineIn(BaseModel):
     base_name: str = Field(min_length=1, max_length=255)
     qty: float = Field(ge=-MAX_RECEIPT_QTY, le=MAX_RECEIPT_QTY)
+
+    @field_validator("base_name")
+    @classmethod
+    def _not_blank(cls, v: str) -> str:
+        # min_length=1 пропускает строку из пробелов, а .strip() её гасит:
+        # строка приёмки молча не записывалась бы, а заказ считался принятым.
+        if not v.strip():
+            raise ValueError("Название позиции не может быть пустым")
+        return v
 
 
 class ReceiptsIn(BaseModel):
@@ -608,39 +652,83 @@ def api_order_status(
             status_code=422,
             detail=f"Недопустимый переход статуса: {order.status} → {body.status}",
         )
+    now = datetime.utcnow()
+    # Смена статуса — условным UPDATE, а не присваиванием. Двойной клик по
+    # «Принят» отправляет два одинаковых запроса; проверка `status == order.status`
+    # выше читает состояние ДО коммита, и оба запроса её проходили — в базе
+    # оказывались две строки приёмки на полный заказ (принято 20 при заказанных
+    # 10), а «едет к нам» уменьшалось дважды. Побеждает ровно один запрос: тот,
+    # чей UPDATE увидел прежний статус.
+    changed = db.execute(
+        update(ProductionOrder)
+        .where(ProductionOrder.id == order.id,
+               ProductionOrder.org_id == ctx.org.id,
+               ProductionOrder.status == order.status)
+        .values(status=body.status,
+                **({"sent_at": now} if body.status == "sent" else {"received_at": now}))
+    ).rowcount
+    if not changed:
+        db.rollback()
+        db.expire_all()
+        fresh = db.get(ProductionOrder, order_id)
+        return {"ok": True, "status": fresh.status if fresh else body.status,
+                "unchanged": True}
     if not ms_writeback.is_pushed(order.ms_doc_href):
         if body.status == "sent":
             _apply_order_to_incoming(db, ctx.org.id, order, +1)
         else:  # received
             _apply_order_to_incoming(db, ctx.org.id, order, -1)
-    now = datetime.utcnow()
-    if body.status == "sent":
-        order.sent_at = now
-    else:  # received
-        order.received_at = now
-        # Факт исполнения. Если человек назвал количества — это подтверждение
-        # (by_position); если просто отметил заказ принятым — допущение
-        # (whole_order, количества из заказа). Обязательным ручное
-        # подтверждение не делаем: решение владельца.
-        if body.received is not None:
-            lines = {}
-            for line in body.received:
-                name = line.base_name.strip()
-                if name:
-                    lines[name] = lines.get(name, 0.0) + float(line.qty)
+    if body.status == "received":
+        _record_execution(db, ctx, order, body.received, now)
+    db.commit()
+    db.expire(order)
+    analytics.invalidate(ctx.org.id)
+    return {"ok": True, "status": body.status,
+            "received_at": now.isoformat() if body.status == "received" else None}
+
+
+def _record_execution(db: Session, ctx: AuthContext, order: ProductionOrder,
+                      received: list["ReceiptLineIn"] | None, now: datetime) -> None:
+    """Факт исполнения при переводе заказа в «на складе».
+
+    Три случая, и они разные:
+
+    * человек назвал количества → подтверждение (`by_position`), пишем как есть;
+    * человек просто отметил заказ принятым → допущение (`whole_order`), пишем
+      ОСТАТОК до заказанного. Именно остаток, а не всё количество: если раньше
+      записали частичный приход 3 из 10, «принят» означает «приехали и
+      остальные 7», а не «принято всего 3» — иначе заказ навсегда закрывался
+      подтверждённой недостачей, которой не было;
+    * заказ отправлен в МойСклад (`ms_doc_href`) → допущение НЕ пишем вовсе:
+      исполнение по такому заказу приходит машинным источником из поля
+      «отгружено», и допущение сложилось бы с ним в двойной счёт. Ровно по той
+      же причине строкой выше для таких заказов пропускается «едет к нам».
+      Явно названные человеком количества при этом уважаются: прямое
+      утверждение человека сильнее нашего допущения.
+    """
+    lines: dict[str, float] = {}
+    if received:
+        for line in received:
+            name = line.base_name.strip()
+            if name:
+                lines[name] = lines.get(name, 0.0) + float(line.qty)
+        if lines:
             _add_receipts(db, order, lines, source="manual",
                           precision="by_position", user_id=ctx.user.id)
-        elif not _receipt_rows(db, ctx.org.id, order.id):
-            lines = {str(i.get("base_name") or ""): float(i.get("qty") or 0)
-                     for i in order.items}
-            lines.pop("", None)
-            _add_receipts(db, order, lines, source="manual",
-                          precision="whole_order", user_id=ctx.user.id)
-    order.status = body.status
-    db.commit()
-    analytics.invalidate(ctx.org.id)
-    return {"ok": True, "status": order.status,
-            "received_at": order.received_at.isoformat() if order.received_at else None}
+            return
+    # Пустой список — это не «принято ноль», а «количества не назвали»:
+    # трактуем как обычную отметку и не оставляем заказ без факта исполнения.
+    if ms_writeback.is_pushed(order.ms_doc_href):
+        return
+    already = _received_by_base(_receipt_rows(db, ctx.org.id, order.id))
+    rest: dict[str, float] = {}
+    for base, qty in _ordered_by_base(order).items():
+        left = round(qty - already.get(base, 0.0), 3)
+        if left > 0:
+            rest[base] = left
+    if rest:
+        _add_receipts(db, order, rest, source="manual",
+                      precision="whole_order", user_id=ctx.user.id)
 
 
 @router.get("/orders/{order_id}/receipts")
@@ -702,6 +790,15 @@ def api_order_delete(
         # Отправленный в МС заказ в qty не входил (его считает ms_qty; сам
         # документ в МойСклад при локальном удалении никуда не девается).
         _apply_order_to_incoming(db, ctx.org.id, order, -1)
+    # Приёмки уходят вместе с заказом. Оставлять их нельзя: id в SQLite — это
+    # rowid, он переиспользуется, и следующий созданный заказ получил бы тот же
+    # номер, а вместе с ним — чужие факты приёмки («принято 4 шт» по заказу, по
+    # которому не приезжало ничего). В Postgres тот же путь упирался бы во
+    # внешний ключ и отдавал 500. «Только пополняется» — правило про то, что
+    # факт нельзя ПЕРЕПИСАТЬ; удаление заказа целиком — осознанное действие
+    # человека, и история удаляемого заказа уходит вместе с ним.
+    db.execute(delete(OrderReceipt).where(
+        OrderReceipt.org_id == ctx.org.id, OrderReceipt.order_id == order.id))
     db.delete(order)
     db.commit()
     analytics.invalidate(ctx.org.id)
@@ -1008,7 +1105,11 @@ def api_toggle_warehouse(
 
 # ── Подключение источника данных ─────────────────────────────────────────────
 
-@router.post("/connect/demo")
+# Демо-данные закрыты гейтом: seed_demo начинается с полного стирания данных
+# организации. Ревью нашло сценарий, в котором это невосстановимая потеря —
+# организация, которой мы уже отказали в записи, стирает себе заказы на
+# производство и ручное «Заказано», а восстановить их нечем.
+@router.post("/connect/demo", dependencies=[Depends(subscription.require_write_access)])
 def api_connect_demo(ctx: AuthContext = Depends(require_owner_api), db: Session = Depends(get_db)):
     """Создаёт demo-подключение и сеет синтетические данные (детерминированно)."""
     org = ctx.org
@@ -2258,7 +2359,8 @@ def api_order_plan_history(
 
 @router.get("/order-plan/{plan_id}/outcome")
 def api_order_plan_outcome(
-    plan_id: int, ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)
+    plan_id: int = _id_path(),
+    ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db),
 ):
     """Три различимые величины по каждой позиции плана (D-25).
 
@@ -2289,18 +2391,46 @@ def api_order_plan_outcome(
         if candidate is not None and candidate.org_id == ctx.org.id:
             order = candidate
     received: dict[str, float] = {}
-    confirmed = False
+    order_received = False
+    execution_unknown = False
     if order is not None:
         rows = _receipt_rows(db, ctx.org.id, order.id)
         received = _received_by_base(rows)
-        confirmed = bool(rows)
+        # Заказ, ушедший в МойСклад, исполняется машинным источником: отметка
+        # «принят» по нему допущения не пишет (иначе двойной счёт). Если при
+        # этом МойСклад ничего не прислал — а на боевых данных «отгружено»
+        # заполнено у нуля позиций из 69, — то принятое нам НЕИЗВЕСТНО.
+        # Показать здесь ноль значило бы утверждать «заказали 65, приехало 0»:
+        # подтверждённую недостачу, которой не было.
+        # Признак «не знаем» действует ПОСТРОЧНО, а не на заказ целиком.
+        # МойСклад заполняет «отгружено» по частям: одна пришедшая позиция
+        # переводила остальные 28 из «неизвестно» в утверждение «приехало
+        # ничего», и итог «2 из 65» читался как факт. Для заказа, ушедшего
+        # в МС, молчание источника по позиции — это молчание, а не ноль.
+        by_machine = ms_writeback.is_pushed(order.ms_doc_href)
+        execution_unknown = by_machine and not rows
+        order_received = order.status == "received" and not by_machine
+    confirmed = bool(received) or order_received
+
+    def _executed(base: str):
+        """Сколько принято ПО ЭТОЙ позиции. None — неизвестно.
+
+        Ноль ставится только тогда, когда заказ закрыт как принятый ЧЕЛОВЕКОМ
+        и исполнение по нему принадлежит нам: тогда «по этой позиции не
+        приехало ничего» — утверждение, а не пробел. Пока заказ едет — и
+        всегда для заказа, исполнение которого приходит из МойСклада, —
+        отсутствие строки означает «ещё не знаем».
+        """
+        if base in received:
+            return round(received[base], 3)
+        return 0.0 if order_received else None
 
     def _line(base: str, recommended, decided: float) -> dict:
         return {
             "base_name": base,
             "recommended": recommended,      # None = система не рекомендовала
             "decided": round(float(decided), 3),
-            "executed": round(received.get(base, 0.0), 3) if confirmed else None,
+            "executed": _executed(base),
         }
 
     lines = []
@@ -2328,13 +2458,20 @@ def api_order_plan_outcome(
                         if order is not None and order.received_at else None),
         "lead_time_fact_days": _lead_time_fact(order) if order is not None else None,
         "execution_confirmed": confirmed,
+        # Заказ закрыт, но чем он закрыт — мы не знаем: он ушёл в МойСклад,
+        # а «отгружено» оттуда не пришло. Это не «приехало ноль».
+        "execution_unknown": execution_unknown,
         "positions": len(lines),
         "edited_by_human": edited,
         "totals": {
             "recommended": sum(x["recommended"] or 0 for x in lines),
             "decided": round(sum(x["decided"] for x in lines), 3),
-            "executed": (round(sum(x["executed"] or 0 for x in lines), 3)
-                         if confirmed else None),
+            # Итог исполнения считается, только когда он есть у ВСЕХ строк:
+            # сумма по половине позиций — не «принято столько», а полуправда,
+            # которую легко принять за итог.
+            "executed": (round(sum(x["executed"] for x in lines), 3)
+                         if lines and all(x["executed"] is not None for x in lines)
+                         else None),
         },
         "lines": sorted(lines, key=lambda x: x["base_name"]),
     }

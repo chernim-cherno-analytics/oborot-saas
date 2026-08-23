@@ -147,8 +147,16 @@ async def api_connect_moysklad(
         db.commit()
         started = ms_sync.start_sync(
             ctx.org.id, "initial" if resume_pending else "incremental")
-        note = ("Токен обновлён, синхронизация запущена." if started
-                else "Токен обновлён. Синхронизация уже идёт.")
+        if started:
+            note = "Токен обновлён, синхронизация запущена."
+        elif ms_sync.is_running(ctx.org.id):
+            note = "Токен обновлён. Синхронизация уже идёт."
+        else:
+            # Отказал гейт подписки (см. ms_sync.start_sync). Раньше здесь в
+            # любом случае писалось «синхронизация уже идёт» — человек ждал
+            # данных, которых не будет, и настоящей причины не видел.
+            note = ("Токен обновлён, но синхронизация приостановлена: "
+                    "подписка не оплачена. Данные и отчёты открыты.")
         return {"ok": True, "note": note, "sync_started": bool(started)}
     conn.status = "pending"
     db.commit()

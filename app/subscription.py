@@ -48,6 +48,9 @@ GRACE_DAYS = 5
 
 GATE_ENV = "OBOROT_SUBSCRIPTION_GATE"
 
+# Сколько id показывать в строке предпросмотра (см. log_preview).
+LOG_IDS_LIMIT = 20
+
 ACTIVE = "active"
 GRACE = "grace"
 READONLY = "readonly"
@@ -98,7 +101,9 @@ def _as_date(value) -> date | None:
         return None
 
 
-def _grace_until(db: Session, org_id: int, today: date) -> date | None:
+def _grace_until(
+    db: Session, org_id: int, today: date, *, stamp: bool = False
+) -> date | None:
     """Дата конца грейса по последней отметке «счёт выставлен».
 
     Грейс отсчитывается от момента, когда счёт выставили МЫ, а не от даты
@@ -106,11 +111,22 @@ def _grace_until(db: Session, org_id: int, today: date) -> date | None:
     выставленного счёта.
 
     Тонкость эксплуатации: статус заявки сейчас меняется вручную (UPDATE в
-    базе), и такой UPDATE не проставит invoiced_at. Поэтому при первой
-    встрече заявки со статусом invoiced/paid без отметки времени мы ставим
-    отметку сами — «первое наблюдение». Ошибка тут возможна только в сторону
-    клиента (грейс начнётся позже фактического счёта, то есть дольше), и это
-    сознательно: гейт не должен закрывать доступ из-за нашей же забывчивости.
+    базе), и такой UPDATE не проставит invoiced_at. Поэтому при первой ПОПЫТКЕ
+    ЗАПИСИ мы ставим отметку сами — «первое наблюдение». Ошибка тут возможна
+    только в сторону клиента (грейс начнётся позже фактического счёта, то есть
+    дольше), и это сознательно: гейт не должен закрывать доступ из-за нашей же
+    забывчивости.
+
+    `stamp` по умолчанию ВЫКЛЮЧЕН, и это важно. Раньше отметка ставилась при
+    любом чтении, и функция, объявленная диагностической, писала в боевую базу:
+    предпросмотр на старте проставлял invoiced_at всем таким организациям
+    временем деплоя, а GET /api/subscription делал UPDATE+COMMIT — то есть
+    обычный просмотр страницы запускал отсчёт пяти дней, и он же падал 500,
+    если база в этот момент занята синком или открыта только на чтение.
+    Теперь пишет ровно одно место — проверка права на запись, где транзакция
+    и так ожидается. Читающие пути при NULL считают грейс от сегодняшнего дня
+    БЕЗ записи: они показывают то же состояние, которое клиент получит при
+    первой же попытке что-то сделать.
     """
     insp = inspect(db.get_bind())
     if not insp.has_table("billing_requests"):
@@ -128,21 +144,34 @@ def _grace_until(db: Session, org_id: int, today: date) -> date | None:
     ).fetchall()
     if not rows:
         return None
-    row_id, stamp = rows[0]
-    marked = _as_date(stamp)
+    row_id, marked_raw = rows[0]
+    marked = _as_date(marked_raw)
     if marked is None:
-        db.execute(
-            text("UPDATE billing_requests SET invoiced_at = :ts WHERE id = :id"),
-            {"ts": datetime.utcnow(), "id": row_id},
-        )
-        db.commit()
+        if stamp:
+            db.execute(
+                text("UPDATE billing_requests SET invoiced_at = :ts WHERE id = :id"),
+                {"ts": datetime.utcnow(), "id": row_id},
+            )
+            db.commit()
         marked = today
     return marked + timedelta(days=GRACE_DAYS)
 
 
-def subscription_state(org, db: Session) -> str:
+def _today() -> date:
+    """«Сегодня» в UTC.
+
+    Отметка о счёте пишется datetime.utcnow(), и инструкция в deploy/README
+    предлагает sqlite3 datetime('now') — тоже UTC. Сравнивать это с локальным
+    date.today() значило бы, что счёт, выставленный ночью, штампуется вчерашним
+    числом и грейс выходит на день короче, а состояние организации меняется
+    без единого внешнего события. Одна шкала на запись и на сравнение.
+    """
+    return datetime.utcnow().date()
+
+
+def subscription_state(org, db: Session, *, stamp: bool = False) -> str:
     """active | grace | readonly. Единственное место, где это решается."""
-    today = date.today()
+    today = _today()
 
     # Организации из каталога МойСклад платят внутри МС: их состояние —
     # то, что прислал МС (Activate/Suspend/Uninstall кладут status).
@@ -168,7 +197,7 @@ def subscription_state(org, db: Session) -> str:
     if trial_ends is not None and trial_ends >= today:
         return ACTIVE
 
-    grace_until = _grace_until(db, org.id, today)
+    grace_until = _grace_until(db, org.id, today, stamp=stamp)
     if grace_until is not None and grace_until >= today:
         return GRACE
 
@@ -180,7 +209,7 @@ def state_info(org, db: Session) -> dict:
     state = subscription_state(org, db)
     paid_until = _as_date(getattr(org, "paid_until", None))
     trial_ends = _as_date(getattr(org, "trial_ends_at", None))
-    grace_until = _grace_until(db, org.id, date.today()) if state == GRACE else None
+    grace_until = _grace_until(db, org.id, _today()) if state == GRACE else None
     return {
         "state": state,
         "gate_enabled": gate_enabled(),
@@ -220,7 +249,9 @@ def require_write_access(
     """
     if not gate_enabled():
         return ctx
-    state = subscription_state(ctx.org, db)
+    # stamp=True: это попытка ЗАПИСИ, транзакция здесь ожидается. Отметка
+    # «счёт выставлен», забытая оператором, ставится ровно тут и один раз.
+    state = subscription_state(ctx.org, db, stamp=True)
     if state == READONLY:
         raise HTTPException(status_code=402, detail=BLOCK_MESSAGE)
     return ctx
@@ -240,13 +271,25 @@ def preview(db: Session) -> dict:
 
     counts = {ACTIVE: 0, GRACE: 0, READONLY: 0}
     readonly_ids: list[int] = []
-    for org in db.execute(select(Org)).scalars():
-        state = subscription_state(org, db)
+    broken: list[int] = []
+    org_ids = [row[0] for row in db.execute(select(Org.id)).all()]
+    for org_id in org_ids:
+        # По одной, с перехватом: предпросмотр обязан пережить битую строку,
+        # иначе именно в тот момент, когда оператор готовится включить гейт,
+        # он получает пустой отчёт вместо предупреждения.
+        try:
+            org = db.get(Org, org_id)
+            if org is None:
+                continue
+            state = subscription_state(org, db)
+        except Exception:  # noqa: BLE001
+            broken.append(org_id)
+            continue
         counts[state] = counts.get(state, 0) + 1
         if state == READONLY:
             readonly_ids.append(org.id)
     return {"counts": counts, "readonly_org_ids": readonly_ids,
-            "gate_enabled": gate_enabled()}
+            "broken_org_ids": broken, "gate_enabled": gate_enabled()}
 
 
 def log_preview() -> None:
@@ -257,20 +300,31 @@ def log_preview() -> None:
     try:
         info = preview(db)
         counts = info["counts"]
+        # Список id обрезаем: у сотни организаций строка лога превращалась бы
+        # в килобайты, а читают её глазами перед включением флага.
+        ids = info["readonly_org_ids"]
+        shown = ", ".join(str(x) for x in ids[:LOG_IDS_LIMIT]) or "—"
+        if len(ids) > LOG_IDS_LIMIT:
+            shown += f" и ещё {len(ids) - LOG_IDS_LIMIT}"
         if info["gate_enabled"]:
             log.warning(
                 "гейт подписки ВКЛЮЧЁН: active=%d grace=%d readonly=%d; "
-                "закрыты организации %s",
-                counts[ACTIVE], counts[GRACE], counts[READONLY],
-                info["readonly_org_ids"] or "—",
+                "закрыты организации %s", counts[ACTIVE], counts[GRACE],
+                counts[READONLY], shown,
             )
         else:
             log.info(
                 "гейт подписки выключен; если включить: active=%d grace=%d "
-                "readonly=%d (закрылись бы %s)",
-                counts[ACTIVE], counts[GRACE], counts[READONLY],
-                info["readonly_org_ids"] or "—",
+                "readonly=%d (закрылись бы %s)", counts[ACTIVE], counts[GRACE],
+                counts[READONLY], shown,
             )
+        if info["broken_org_ids"]:
+            # Битая строка = организация, состояние которой мы не смогли
+            # вычислить. Молчать нельзя: при включённом гейте синк ей
+            # разрешается «в пользу клиента», то есть неплательщик с опечаткой
+            # в дате работал бы бесплатно и незаметно.
+            log.warning("состояние подписки не удалось вычислить: организации %s "
+                        "(проверьте формат «оплачено до»)", info["broken_org_ids"])
     except Exception:  # noqa: BLE001 — диагностика не имеет права валить старт
         log.exception("предпросмотр гейта подписки не удался")
     finally:
