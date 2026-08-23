@@ -220,13 +220,20 @@ def run() -> int:  # noqa: C901 — сценарный тест, ветвлен�
     out = c.get(f"/api/order-plan/{plan_id}/outcome").json()
     check("outcome отдаёт строки", out.get("positions", 0) > 0, str(out)[:160])
     check("outcome знает заказ", out.get("order_id") == order_id)
-    for x in out["lines"]:
-        if x["recommended"] is None:
-            check(f"строка без рекомендации помечена честно: {x['base_name']}", True)
-    check("у каждой строки есть решение человека",
-          all(isinstance(x["decided"], (int, float)) for x in out["lines"]))
-    check("исполнение уже подтверждено (приёмки записаны вручную)",
+    check("строки плана есть", len(out["lines"]) > 0, str(len(out["lines"])))
+    check("исполнение подтверждено — приёмки записаны вручную",
           out.get("execution_confirmed") is True, str(out.get("execution_confirmed")))
+    # Приёмка была записана по ОДНОЙ позиции (и по одной, которой в заказе нет).
+    # Остальные позиции ещё едут: у них исполнение обязано быть неизвестно,
+    # а не нулём. Раньше одна частичная приёмка обнуляла ВСЕ строки, и цифры
+    # на середине пути выглядели итоговыми.
+    known = [x for x in out["lines"] if x["executed"] is not None]
+    unknown = [x for x in out["lines"] if x["executed"] is None]
+    check("по принятой позиции исполнение известно", len(known) >= 1, str(known[:1]))
+    check("по остальным — неизвестно, а не ноль", len(unknown) >= 1,
+          str([x["base_name"] for x in out["lines"]][:3]))
+    check("итог исполнения не показывается, пока известны не все строки",
+          out["totals"]["executed"] is None, str(out["totals"]))
 
     print("\n== Обнулённая человеком позиция остаётся в трёх величинах ==")
     prev = c.post("/api/order-plan/preview", json={
@@ -335,6 +342,231 @@ def run() -> int:  # noqa: C901 — сценарный тест, ветвлен�
           added == 0, str(added))
     added = _write_shipped_receipts(1, {(7654321, "https://ms/doc/9"): {first: 5.0}})
     check("несуществующий заказ пропускается молча", added == 0, str(added))
+
+    print("\n== Дефекты, найденные ревью: двойной счёт и потеря фактов ==")
+    c3 = client()
+    c3.post("/register", data={"name": "Третий", "email": "exec3@test.io",
+                              "password": "secret123", "org_name": "Бренд-Э"})
+    c3.post("/api/connect/demo")
+    rows3 = c3.get("/api/turnover").json().get("items") or []
+    name3 = str((rows3[0] if rows3 else {}).get("base_name") or "")
+
+    def make_order(cl, qty=10, name="Заказ", pushed=False):
+        r = cl.post("/api/orders", json={"name": name, "items": [
+            {"base_name": name3, "qty": qty, "sizes": {}, "cost": 100}]})
+        oid = r.json().get("id")
+        if pushed:
+            exec_sql_local(oid)
+        cl.post(f"/api/orders/{oid}/status", json={"status": "sent"})
+        return oid
+
+    def exec_sql_local(oid):
+        con = sqlite3.connect(DB_PATH)
+        try:
+            con.execute("UPDATE production_orders SET ms_doc_href=? WHERE id=?",
+                        (f"https://ms/entity/purchaseorder/doc-{oid}", oid))
+            con.commit()
+        finally:
+            con.close()
+
+    # (а) Заказ, отправленный в МойСклад: допущение не пишем — исполнение по
+    # нему приходит машинным источником, и допущение сложилось бы с ним вдвое.
+    oid_pushed = make_order(c3, 10, "Отправлен в МС", pushed=True)
+    c3.post(f"/api/orders/{oid_pushed}/status", json={"status": "received"})
+    got = c3.get(f"/api/orders/{oid_pushed}/receipts").json()
+    check("по заказу, ушедшему в МойСклад, допущение не пишется",
+          got["received_total"] == 0, str(got["received_total"]))
+    from app.ms_sync import _write_shipped_receipts
+    _write_shipped_receipts(3, {(oid_pushed, f"doc-{oid_pushed}"): {name3: 10.0}})
+    got = c3.get(f"/api/orders/{oid_pushed}/receipts").json()
+    check("машинный источник даёт ровно заказанное, без удвоения",
+          got["received_total"] == 10, str(got["received_total"]))
+    check("источники видны раздельно", got["by_source"] == {"ms_order_shipped": 10.0},
+          str(got.get("by_source")))
+
+    # (б) Частичный приход, потом «Принят» одним кликом: дописывается ОСТАТОК,
+    # а не ноль. Раньше заказ навсегда закрывался недостачей, которой не было.
+    oid_part = make_order(c3, 10, "Частичный")
+    c3.post(f"/api/orders/{oid_part}/receipts",
+            json={"lines": [{"base_name": name3, "qty": 3}]})
+    c3.post(f"/api/orders/{oid_part}/status", json={"status": "received"})
+    got = c3.get(f"/api/orders/{oid_part}/receipts").json()
+    check("после частичного прихода «принят» дописывает остаток до заказанного",
+          got["received_total"] == 10, str(got["received_total"]))
+    check("и обе точности видны в истории",
+          got["precisions"] == ["by_position", "whole_order"], str(got["precisions"]))
+
+    # (в) Пустой список received — это «количества не назвали», а не «принято 0».
+    oid_empty = make_order(c3, 10, "Пустой список")
+    r = c3.post(f"/api/orders/{oid_empty}/status",
+                json={"status": "received", "received": []})
+    check("пустой список принят", r.status_code == 200, r.text[:120])
+    got = c3.get(f"/api/orders/{oid_empty}/receipts").json()
+    check("заказ не остался без факта исполнения", got["received_total"] == 10,
+          str(got["received_total"]))
+    r = c3.post(f"/api/orders/{oid_empty}/receipts",
+                json={"lines": [{"base_name": "   ", "qty": 5}]})
+    check("имя из одних пробелов отклоняется, а не глотается молча",
+          r.status_code == 422, f"status={r.status_code}")
+
+    # (г) Двойной клик по «Принят»: переход выигрывает ровно один запрос.
+    oid_race = make_order(c3, 10, "Двойной клик")
+    import concurrent.futures as _f
+    with _f.ThreadPoolExecutor(max_workers=6) as pool:
+        codes = [r.status_code for r in pool.map(lambda _: c3.post(
+            f"/api/orders/{oid_race}/status", json={"status": "received"}), range(6))]
+    got = c3.get(f"/api/orders/{oid_race}/receipts").json()
+    check("шесть одновременных «Принят» приняты сервером",
+          all(x == 200 for x in codes), str(codes))
+    check("двойной клик не удваивает приёмку", got["received_total"] == 10,
+          str(got["received_total"]))
+    check("и не удваивает строки", len(got["receipts"]) == 1, str(len(got["receipts"])))
+
+    # (д) Удаление заказа уносит его приёмки: id в SQLite переиспользуется,
+    # и осиротевшие строки достались бы следующему заказу.
+    oid_del = make_order(c3, 10, "На удаление")
+    c3.post(f"/api/orders/{oid_del}/receipts",
+            json={"lines": [{"base_name": name3, "qty": 4}]})
+    left_before = sql("SELECT COUNT(*) FROM order_receipts WHERE order_id=?", oid_del)[0][0]
+    check("приёмка записана", left_before == 1, str(left_before))
+    r = c3.delete(f"/api/orders/{oid_del}")
+    check("заказ удалён", r.status_code == 200, r.text[:120])
+    left_after = sql("SELECT COUNT(*) FROM order_receipts WHERE order_id=?", oid_del)[0][0]
+    check("вместе с ним удалены и его приёмки", left_after == 0, str(left_after))
+
+    # (е) Две строки заказа с одним именем: «заказано» складывается.
+    r = c3.post("/api/orders", json={"name": "Дубль имени", "items": [
+        {"base_name": name3, "qty": 5, "sizes": {}, "cost": 100},
+        {"base_name": name3, "qty": 7, "sizes": {}, "cost": 100}]})
+    oid_dup = r.json().get("id")
+    got = c3.get(f"/api/orders/{oid_dup}/receipts").json()
+    check("две строки одного имени складываются, а не затирают друг друга",
+          got["ordered_total"] == 12, str(got["ordered_total"]))
+
+    # (ж) Переименование позиции переносит и приёмки.
+    from app import ms_sync as _ms
+    from app.db import SessionLocal as _SL
+    oid_ren = make_order(c3, 10, "Переименование")
+    c3.post(f"/api/orders/{oid_ren}/receipts",
+            json={"lines": [{"base_name": name3, "qty": 4}]})
+    con = sqlite3.connect(DB_PATH)
+    try:
+        con.execute("UPDATE products SET base_name=? WHERE org_id=3 AND base_name=?",
+                    (name3 + " v2", name3))
+        con.commit()
+    finally:
+        con.close()
+    dbx = _SL()
+    try:
+        _ms._migrate_renames(dbx, 3, {name3: {name3 + " v2"}}, {})
+        dbx.commit()
+    finally:
+        dbx.close()
+    moved = sql("SELECT base_name FROM order_receipts WHERE order_id=?", oid_ren)
+    check("приёмка переехала на новое имя вместе с товаром",
+          moved and moved[0][0] == name3 + " v2", str(moved))
+
+    # (з) Заказ ушёл в МойСклад, «отгружено» пустое, человек жмёт «Принят».
+    # На боевых данных это САМЫЙ частый случай: shipped заполнен у нуля
+    # позиций из 69. Показать здесь ноль значило бы утверждать «заказали 65,
+    # приехало 0» — подтверждённую недостачу, которой не было.
+    r = c3.post("/api/order-plan", json={"budget": 150000, "budget_scope": "now",
+                                         "cadence_days": 30, "safety_days": 14})
+    plan_ms = r.json().get("id")
+    r = c3.post(f"/api/order-plan/{plan_ms}/apply", json={"name": "Уехал в МС"})
+    oid_ms = r.json().get("order_id")
+    exec_sql_local(oid_ms)
+    c3.post(f"/api/orders/{oid_ms}/status", json={"status": "sent"})
+    c3.post(f"/api/orders/{oid_ms}/status", json={"status": "received"})
+    got = c3.get(f"/api/orders/{oid_ms}/receipts").json()
+    check("по такому заказу приёмок нет", got["received_total"] == 0)
+    check("и выдача честно говорит, что принятое НЕИЗВЕСТНО",
+          got.get("execution_unknown") is True, str(got.get("execution_unknown")))
+    out_ms = c3.get(f"/api/order-plan/{plan_ms}/outcome").json()
+    check("исполнение не выдаётся за подтверждённое",
+          out_ms.get("execution_confirmed") is False,
+          str(out_ms.get("execution_confirmed")))
+    check("итог исполнения — не ноль, а «неизвестно»",
+          out_ms["totals"]["executed"] is None, str(out_ms["totals"]))
+    check("и построчно тоже неизвестно, а не ноль",
+          all(x["executed"] is None for x in out_ms["lines"]),
+          str([x for x in out_ms["lines"] if x["executed"] is not None][:2]))
+    check("а признак «не знаем» назван прямо",
+          out_ms.get("execution_unknown") is True, str(out_ms)[:160])
+    # Как только МойСклад пришлёт «отгружено» — цифры появятся.
+    first_ms = sorted({i["base_name"] for i in c3.get(f"/api/orders/{oid_ms}").json()["items"]})[0]
+    _write_shipped_receipts(3, {(oid_ms, f"doc-{oid_ms}"): {first_ms: 5.0}})
+    out_ms = c3.get(f"/api/order-plan/{plan_ms}/outcome").json()
+    line_ms = next(x for x in out_ms["lines"] if x["base_name"] == first_ms)
+    check("после прихода «отгружено» исполнение по позиции известно",
+          line_ms["executed"] == 5.0, str(line_ms))
+    # …а по остальным позициям того же заказа — по-прежнему НЕИЗВЕСТНО.
+    # МойСклад заполняет «отгружено» по частям, и одна пришедшая позиция
+    # не имеет права утверждать «по остальным 28 не приехало ничего».
+    others = [x for x in out_ms["lines"] if x["base_name"] != first_ms]
+    check("одна машинная строка не обнуляет остальные позиции",
+          all(x["executed"] is None for x in others),
+          str([x for x in others if x["executed"] is not None][:2]))
+    check("итог не показывается, пока известны не все строки",
+          out_ms["totals"]["executed"] is None, str(out_ms["totals"]))
+
+    # (и) Переименование у ПРИНЯТОГО заказа: обе половины сверки обязаны
+    # жить под одним именем. Раньше items_json принятых заказов не
+    # переносился, и сверка распадалась надвое.
+    r = c3.post("/api/orders", json={"name": "Принят и переименован", "items": [
+        {"base_name": name3 + " v2", "qty": 10, "sizes": {}, "cost": 100}]})
+    check("заказ на переименованную позицию создан", r.status_code == 200, r.text[:150])
+    oid_rec = r.json().get("id")
+    c3.post(f"/api/orders/{oid_rec}/status", json={"status": "sent"})
+    c3.post(f"/api/orders/{oid_rec}/receipts",
+            json={"lines": [{"base_name": name3 + " v2", "qty": 6}]})
+    c3.post(f"/api/orders/{oid_rec}/status", json={"status": "received"})
+    con = sqlite3.connect(DB_PATH)
+    try:
+        con.execute("UPDATE products SET base_name=? WHERE org_id=3 AND base_name=?",
+                    (name3 + " v3", name3 + " v2"))
+        con.commit()
+    finally:
+        con.close()
+    dbx = _SL()
+    try:
+        _ms._migrate_renames(dbx, 3, {name3 + " v2": {name3 + " v3"}}, {})
+        dbx.commit()
+    finally:
+        dbx.close()
+    got = c3.get(f"/api/orders/{oid_rec}/receipts").json()
+    names = sorted({x["base_name"] for x in got["lines"]})
+    check("сверка принятого заказа не распалась надвое", len(names) == 1, str(names))
+    check("и живёт под новым именем", names == [name3 + " v3"], str(names))
+
+    # (к) Старый формат ключа машинного источника не даёт удвоения.
+    r = c3.post("/api/orders", json={"name": "Старый ключ", "items": [
+        {"base_name": name3 + " v3", "qty": 10, "sizes": {}, "cost": 100}]})
+    check("заказ для проверки старого ключа создан", r.status_code == 200, r.text[:150])
+    oid_legacy = r.json().get("id")
+    c3.post(f"/api/orders/{oid_legacy}/status", json={"status": "sent"})
+    exec_sql_local(oid_legacy)
+    con = sqlite3.connect(DB_PATH)
+    try:
+        con.execute(
+            "INSERT INTO order_receipts (org_id, order_id, base_name, qty, at, source,"
+            " precision, source_ref, created_at) VALUES (3,?,?,4,'2026-08-22 00:00:00',"
+            " 'ms_order_shipped','by_position',?, '2026-08-22 00:00:00')",
+            (oid_legacy, name3 + " v3",
+             f"https://api.moysklad.ru/api/remap/1.2/entity/purchaseorder/doc-{oid_legacy}"))
+        con.commit()
+    finally:
+        con.close()
+    added = _write_shipped_receipts(3, {(oid_legacy, f"doc-{oid_legacy}"): {name3 + " v3": 4.0}})
+    check("строку, записанную прежним ключом, находим и не дублируем",
+          added == 0, str(added))
+    got = c3.get(f"/api/orders/{oid_legacy}/receipts").json()
+    check("принятое осталось прежним", got["received_total"] == 4,
+          str(got["received_total"]))
+
+    print("\n== Огромный id не роняет outcome ==")
+    r = c.get("/api/order-plan/99999999999999999999999999/outcome")
+    check("вместо 500 — аккуратный отказ", r.status_code == 422, f"status={r.status_code}")
 
     print("\n== Проводка машинного источника внутрь синка ==")
     # Дельту проверяем прямыми вызовами (выше), но остаётся вопрос «а вызывают

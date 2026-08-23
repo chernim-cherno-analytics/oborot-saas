@@ -22,6 +22,7 @@
 
 Запуск из корня репозитория:  python tests/test_subscription.py
 """
+import ast
 import os
 import sqlite3
 import sys
@@ -114,6 +115,72 @@ EXPECTED_GATED = {
     ("POST", "/api/order-plan/preview"),
     ("POST", "/api/order-plan"),
     ("POST", "/api/order-plan/{plan_id}/apply"),
+    # Демо стирает данные организации перед засевом — для readonly это
+    # невосстановимая потеря там, где мы уже ничего не продаём.
+    ("POST", "/api/connect/demo"),
+}
+
+# Пишущие ручки, которые гейт закрывать НЕ должен, с причиной. Список
+# обязателен: первая версия сторожа сверяла только множество ЗАКРЫТЫХ, и
+# новая незакрытая ручка была для неё невидима. Ровно так и проскочило
+# сохранение токена МойСклада, запускавшее полный синк организации, которой
+# мы отказали в записи. Теперь КАЖДАЯ пишущая ручка обязана быть в одном из
+# двух списков — иначе тест падает и требует решения.
+EXPECTED_OPEN = {
+    # Деньги: клиент обязан иметь возможность заплатить.
+    ("POST", "/api/plans/request"): "заявка на счёт — единственный путь к оплате",
+    # Экспорт и чтение своих данных.
+    ("POST", "/api/export/replenish.xlsx"): "экспорт своих же данных",
+    # Вход, выход, аккаунт.
+    ("POST", "/login"): "вход",
+    ("POST", "/register"): "регистрация",
+    ("POST", "/logout"): "выход",
+    ("POST", "/api/account/password"): "смена пароля",
+    ("POST", "/api/account/delete"): "удаление аккаунта",
+    # Подключение и склады: сам синк закрыт в ms_sync.start_sync — единой
+    # точкой, через которую проходят ВСЕ запуски, включая планировщик.
+    ("POST", "/api/connect/moysklad"): "ввод токена; синк закрыт в start_sync",
+    ("POST", "/api/connect/moysklad/stores"): "выбор складов; синк закрыт в start_sync",
+    ("POST", "/api/warehouses/{warehouse_id}/toggle"): "выбор складов",
+    ("POST", "/api/notify/settings"): "настройки уведомлений",
+    ("POST", "/api/notify/test"): "проверка своего же телеграм-канала",
+    # Заказы и приёмки: бухгалтерия по уже принятым решениям.
+    ("POST", "/api/orders"): "создание заказа вручную",
+    ("POST", "/api/orders/{order_id}/status"): "движение статуса заказа",
+    ("POST", "/api/orders/{order_id}/receipts"): "запись факта о том, что уже пришло",
+    ("DELETE", "/api/orders/{order_id}"): "удаление своего заказа",
+    ("POST", "/api/ordered"): "ручная правка «едет к нам»",
+    ("POST", "/api/ordered/add"): "ручная правка «едет к нам»",
+    # Справочники и вид: ничего не стоит и ничего не создаёт.
+    ("POST", "/api/settings"): "настройки организации",
+    ("POST", "/api/exclusions"): "исключения из аналитики",
+    ("POST", "/api/hidden"): "архив позиции",
+    ("POST", "/api/categories/override"): "перенос категории",
+    ("POST", "/api/categories/merge"): "слияние категорий",
+    ("POST", "/api/discount-rule"): "правило уценки",
+    ("POST", "/api/discount-overrides"): "ручная скидка",
+    ("POST", "/api/discount-overrides/defaults"): "дефолтные скидки",
+    ("POST", "/api/replenish-draft"): "черновик ростовки",
+    ("POST", "/api/replenish-draft/reset"): "сброс черновика ростовки",
+    ("POST", "/api/productions"): "канал производства",
+    ("POST", "/api/productions/{pid}"): "канал производства",
+    ("POST", "/api/productions/{pid}/setup"): "условия канала",
+    ("POST", "/api/productions/assign-rule"): "правило распределения",
+    ("POST", "/api/productions/assign"): "назначение позиции на канал",
+    ("POST", "/api/hints/seen"): "подсказки",
+    ("POST", "/api/prefs/hints"): "подсказки",
+    ("POST", "/api/lessons/{key}/done"): "обучение",
+    ("POST", "/api/lessons/reset"): "обучение",
+    ("POST", "/api/lessons/{key}/reset"): "обучение",
+    ("DELETE", "/api/productions/{pid}"): "удаление своего канала производства",
+    # Ручки жизненного цикла приложения МойСклада: их вызывает САМ МойСклад
+    # по своему JWT, а не пользователь. Закрыть их гейтом значило бы не пустить
+    # МС сообщить нам, что подписку активировали или сняли, — то есть закрыть
+    # ровно тот канал, которым состояние такой организации и управляется.
+    ("PUT", "/ms/vendor/api/moysklad/vendor/1.0/apps/{path_app_id}/{account_id}"):
+        "lifecycle МойСклада (Activate), вызывает МС по своему JWT",
+    ("DELETE", "/ms/vendor/api/moysklad/vendor/1.0/apps/{path_app_id}/{account_id}"):
+        "lifecycle МойСклада (Suspend/Uninstall), вызывает МС по своему JWT",
 }
 
 
@@ -233,8 +300,10 @@ def main() -> int:
         exec_sql("UPDATE billing_requests SET invoiced_at = NULL WHERE id = ?", req_id)
         st = state_of(org_id)
         stamped = sql("SELECT invoiced_at FROM billing_requests WHERE id = ?", req_id)[0][0]
-        check("отметка invoiced без времени — грейс начинается с первого наблюдения",
-              st == subscription.GRACE and stamped is not None, f"{st} stamp={stamped}")
+        check("отметка invoiced без времени — это грейс, а не отказ",
+              st == subscription.GRACE, f"{st}")
+        check("но чтение состояния при этом НИЧЕГО не пишет в базу",
+              stamped is None, f"stamp={stamped}")
 
         exec_sql("UPDATE billing_requests SET status = 'new', invoiced_at = NULL WHERE id = ?",
                  req_id)
@@ -287,29 +356,33 @@ def main() -> int:
               blocked["синхронизация (инкрементальная)"].text[:120])
 
         print("\n== Флаг включён: чтение остаётся открытым ==")
+        # Читающие ручки обязаны не просто «не отдавать 402», а РАБОТАТЬ:
+        # проверка «status != 402» проходила бы и на 404 несуществующего
+        # маршрута, и на 500. Поэтому здесь ждём именно 200.
         reads = {
             "/api/subscription": c.get("/api/subscription"),
             "/api/plans": c.get("/api/plans"),
             "/plans": c.get("/plans"),
             "/api/settings": c.get("/api/settings"),
-            "/api/stock": c.get("/api/stock"),
             "/api/turnover": c.get("/api/turnover"),
             "/api/orders": c.get("/api/orders"),
             "/api/order-plan/last": c.get("/api/order-plan/last"),
             "/api/sync/status": c.get("/api/sync/status"),
+            "/api/replenish": c.get("/api/replenish"),
             "/": c.get("/"),
         }
         for path, resp in reads.items():
-            check(f"чтение открыто: {path}", resp.status_code != 402,
-                  f"status={resp.status_code}")
+            check(f"чтение работает, а не просто «не 402»: {path}",
+                  resp.status_code == 200, f"status={resp.status_code}")
         r = c.post("/api/plans/request", json={
             "plan": "start", "period": "month", "company": "ООО Тест",
             "inn": "7700000000", "email": "a@b.io", "phone": "+70000000000",
         })
-        check("заявка на счёт не блокируется (иначе платить нечем)",
-              r.status_code != 402, f"status={r.status_code}")
-        r = c.post("/api/export/replenish.xlsx", json={})
-        check("экспорт не блокируется", r.status_code != 402, f"status={r.status_code}")
+        check("заявка на счёт проходит (иначе платить нечем)",
+              r.status_code == 200, f"status={r.status_code} {r.text[:120]}")
+        r = c.post("/api/export/replenish.xlsx", json={"rows": []})
+        check("экспорт не блокируется", r.status_code != 402,
+              f"status={r.status_code} {r.text[:120]}")
 
         body = c.get("/api/subscription").json()
         check("/api/subscription сообщает readonly и блокировку записи",
@@ -351,6 +424,7 @@ def main() -> int:
 
     print("\n== Предпросмотр перед включением флага ==")
     from app.db import SessionLocal
+    from app.models import Org as OrgModel
 
     gate(False)
     db = SessionLocal()
@@ -358,27 +432,190 @@ def main() -> int:
         info = subscription.preview(db)
     finally:
         db.close()
-    check("предпросмотр считает все три состояния",
-          set(info["counts"]) == {"active", "grace", "readonly"}, str(info)[:160])
+    check("предпросмотр посчитал ровно одну организацию",
+          sum(info["counts"].values()) == 1, str(info)[:160])
     check("предпросмотр называет тех, кого закроет",
           org_id in info["readonly_org_ids"], str(info)[:160])
     check("предпросмотр честно говорит, что флаг сейчас выключен",
           info["gate_enabled"] is False, str(info)[:160])
-    subscription.log_preview()  # не должен падать и не должен ничего менять
-    check("после предпросмотра состояние не изменилось",
-          state_of(org_id) == subscription.READONLY, state_of(org_id))
+    # Главное свойство предпросмотра: он НИЧЕГО не пишет. Проверять это надо
+    # там, где писать есть что: заявка со статусом invoiced и пустым временем —
+    # ровно тот случай, в котором прежняя версия делала UPDATE прямо из
+    # диагностики на старте и проставляла отметку временем деплоя.
+    exec_sql("UPDATE billing_requests SET status='invoiced', invoiced_at=NULL "
+             "WHERE org_id=?", org_id)
+    db = SessionLocal()
+    try:
+        subscription.preview(db)
+    finally:
+        db.close()
+    subscription.log_preview()
+    stamp_after = sql("SELECT invoiced_at FROM billing_requests WHERE org_id=?",
+                      org_id)[0][0]
+    check("предпросмотр не проставил отметку «счёт выставлен»",
+          stamp_after is None, str(stamp_after))
+    check("а состояние при этом показывает грейс, а не отказ",
+          state_of(org_id) == subscription.GRACE, state_of(org_id))
+    # И наоборот: попытка ЗАПИСИ отметку ставит — один раз и в одном месте.
+    gate(True)
+    db = SessionLocal()
+    try:
+        db.expire_all()
+        org = db.get(OrgModel, org_id)
+        state = subscription.subscription_state(org, db, stamp=True)
+    finally:
+        db.close()
+    check("при попытке записи состояние по-прежнему грейс",
+          state == subscription.GRACE, state)
+    stamp_after = sql("SELECT invoiced_at FROM billing_requests WHERE org_id=?",
+                      org_id)[0][0]
+    check("отметку ставит именно попытка записи", stamp_after is not None,
+          str(stamp_after))
+    gate(False)
+    exec_sql("UPDATE billing_requests SET status='new', invoiced_at=NULL WHERE org_id=?",
+             org_id)
 
     print("\n== Сторож по всем пишущим ручкам ==")
     found = gated_routes()
+    mutating = mutating_routes()
     check("гейт стоит ровно на согласованных ручках", found == EXPECTED_GATED,
           f"лишние={sorted(found - EXPECTED_GATED)} потерянные={sorted(EXPECTED_GATED - found)}")
     check("все закрытые ручки действительно пишущие",
-          found <= mutating_routes(), f"не-POST={sorted(found - mutating_routes())}")
+          found <= mutating, f"не-POST={sorted(found - mutating)}")
     check("гейт не стоит ни на одном GET",
           not any(m == "GET" for m, _ in found), str(sorted(found))[:200])
-    total_mut = len(mutating_routes())
     check("закрыта меньшая часть пишущих ручек (гейт точечный, а не веерный)",
-          len(found) * 2 < total_mut, f"{len(found)} из {total_mut}")
+          len(found) * 2 < len(mutating), f"{len(found)} из {len(mutating)}")
+
+    # Вторая половина сторожа — та, которой не было и из-за которой мимо гейта
+    # проскочило сохранение токена, запускавшее полный синк. Каждая пишущая
+    # ручка приложения обязана быть либо в EXPECTED_GATED, либо в EXPECTED_OPEN
+    # с причиной. Новая ручка роняет тест и требует осознанного решения.
+    classified = set(EXPECTED_GATED) | set(EXPECTED_OPEN)
+    unclassified = mutating - classified
+    check("каждая пишущая ручка осознанно отнесена к закрытым или открытым",
+          not unclassified, f"не классифицированы: {sorted(unclassified)}")
+    check("в списке открытых нет ручек, которых больше нет в приложении",
+          not (set(EXPECTED_OPEN) - mutating),
+          f"лишние: {sorted(set(EXPECTED_OPEN) - mutating)}")
+    check("списки закрытых и открытых не пересекаются",
+          not (set(EXPECTED_GATED) & set(EXPECTED_OPEN)),
+          str(sorted(set(EXPECTED_GATED) & set(EXPECTED_OPEN))))
+    check("у каждой открытой пишущей ручки записана причина",
+          all(str(v).strip() for v in EXPECTED_OPEN.values()))
+
+    # Синк закрыт не роутом, а единой точкой запуска: роутов, ведущих к нему,
+    # больше одного (токен, склады, планировщик, догон), и по-ручечная защита
+    # уже один раз оказалась дырявой.
+    from app import ms_sync
+    src = (ROOT / "app" / "ms_sync.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    fn = next((n for n in ast.walk(tree)
+               if isinstance(n, ast.FunctionDef) and n.name == "start_sync"), None)
+    calls = {n.func.id for n in ast.walk(fn) if isinstance(n, ast.Call)
+             and isinstance(n.func, ast.Name)} if fn else set()
+    check("запуск синка проверяет подписку в одной точке",
+          "_subscription_allows_sync" in calls, str(sorted(calls))[:200])
+    gate(True)
+    set_org(org_id, source="saas", plan="start", paid_until=D(-30),
+            trial_ends_at=f"{D(-60)} 00:00:00", status="active")
+    exec_sql("UPDATE billing_requests SET status='new', invoiced_at=NULL WHERE org_id=?",
+             org_id)
+    check("readonly не может запустить синк вообще",
+          ms_sync.start_sync(org_id, mode="incremental") is False)
+    gate(False)
+
+    print("\n== «Оплачено до», введённое руками в чужом формате ==")
+    # Колонку заполняет человек командой UPDATE на боевом сервере, а соседняя
+    # trial_ends_at — DATETIME. Оператор, скопировавший её формат, со строгим
+    # типом ронял ЗАГРУЗКУ строки orgs — то есть 500 на каждой странице,
+    # включая «Тарифы»: заплативший клиент оставался с мёртвым аккаунтом.
+    # Проверяем через HTTP, а не через ORM: первая версия защиты работала
+    # только на записи, а падение было на чтении, и тест этого не видел.
+    gate(False)
+    with TestClient(oborot_app, headers={"X-Oborot-CSRF": "1"}) as c:
+        c.post("/login", data={"email": "gate@test.io", "password": "secret123"})
+        for raw, expect_state in (
+            (f"{D(30)} 00:00:00", subscription.ACTIVE),
+            ("31.12.2099", subscription.ACTIVE),
+            (f"{D(30)}T00:00:00", subscription.ACTIVE),
+            ("мусор", subscription.READONLY),
+            ("", subscription.READONLY),
+        ):
+            set_org(org_id, paid_until=raw, plan="start",
+                    trial_ends_at=f"{D(-60)} 00:00:00")
+            pages = {
+                "/": c.get("/"),
+                "/plans": c.get("/plans"),
+                "/api/subscription": c.get("/api/subscription"),
+                "/api/settings": c.get("/api/settings"),
+                "/api/orders": c.get("/api/orders"),
+            }
+            bad = {k: r.status_code for k, r in pages.items() if r.status_code != 200}
+            check(f"«{raw or 'пусто'}» не роняет ни одной страницы", not bad, str(bad))
+            check(f"«{raw or 'пусто'}» даёт состояние {expect_state}",
+                  state_of(org_id) == expect_state, state_of(org_id))
+        # Непонятная дата = «не оплачено», но она НЕ должна ещё и открывать
+        # доступ: fail-open внутри проверки синка превратил бы опечатку
+        # в бесплатную работу.
+        set_org(org_id, paid_until="мусор")
+        gate(True)
+        from app import ms_sync as _msync
+        check("организация с непонятной датой в синк не пускается",
+              _msync.start_sync(org_id, mode="incremental") is False)
+        gate(False)
+
+    print("\n== Одна битая строка не валит обход организаций ==")
+    # Снисходительный тип съедает любой человеческий ввод, поэтому «битую»
+    # организацию делаем честно: подменяем вычисление состояния так, чтобы на
+    # одной из них оно падало. Проверяем ровно то, ради чего стоит перехват:
+    # одна проблемная организация не должна лишать синка ВСЕХ остальных —
+    # именно так ночной синк вставал бы молча, а страницы у всех были живыми.
+    # Заодно: trial_ends_at теперь такой же снисходительный, как paid_until —
+    # его правят руками ровно так же («продлить пилоту триал»), и строгий тип
+    # ронял загрузку строки, то есть все страницы этой организации.
+    exec_sql("INSERT INTO orgs (id, name, plan, settings_json, created_at, "
+             "trial_ends_at, paid_until) VALUES (4242, 'Битая', 'trial', '{}', "
+             "'2026-01-01 00:00:00', '31.12.2099', ?)", D(365))
+    check("триал, введённый руками в формате ДД.ММ.ГГГГ, читается",
+          sql("SELECT trial_ends_at FROM orgs WHERE id=4242")[0][0] == "31.12.2099")
+    db = SessionLocal()
+    try:
+        broken_org = db.get(OrgModel, 4242)
+        check("и не роняет загрузку строки организации",
+              broken_org is not None and broken_org.trial_ends_at is not None,
+              str(getattr(broken_org, "trial_ends_at", "нет строки")))
+    finally:
+        db.close()
+    set_org(org_id, paid_until=D(365), plan="start")
+    gate(True)
+    real_state = subscription.subscription_state
+
+    def _boom(org, db, **kw):
+        if org.id == 4242:
+            raise ValueError("состояние вычислить не удалось")
+        return real_state(org, db, **kw)
+
+    subscription.subscription_state = _boom
+    try:
+        ok_ids = scheduler._paid_only([org_id, 4242])
+        check("обход пережил проблемную организацию", isinstance(ok_ids, list), str(ok_ids))
+        check("здоровая организация из обхода НЕ выпала", org_id in ok_ids, str(ok_ids))
+        check("сомнение толкуется в пользу синка", 4242 in ok_ids, str(ok_ids))
+        db = SessionLocal()
+        try:
+            info = subscription.preview(db)
+        finally:
+            db.close()
+        check("предпросмотр посчитал остальных", info["counts"][subscription.ACTIVE] == 1,
+              str(info)[:200])
+        check("и назвал ту, которую не смог посчитать",
+              info["broken_org_ids"] == [4242], str(info)[:200])
+        subscription.log_preview()  # не должен падать
+    finally:
+        subscription.subscription_state = real_state
+    gate(False)
+    exec_sql("DELETE FROM orgs WHERE id = 4242")
 
     print("\n== Миграция на старой базе ==")
     old_db = ROOT / "test_subscription_old.db"
