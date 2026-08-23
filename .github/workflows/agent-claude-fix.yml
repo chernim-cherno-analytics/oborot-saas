@@ -1,0 +1,253 @@
+name: Agent loop - Claude fixes
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request number
+        required: true
+        type: string
+      expected_head:
+        description: Exact SHA reviewed by Codex
+        required: true
+        type: string
+
+concurrency:
+  group: oborot-claude-fix-${{ inputs.pr_number }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: read
+    outputs:
+      can_run: ${{ steps.context.outputs.can_run }}
+      pr_number: ${{ steps.context.outputs.pr_number }}
+      head_sha: ${{ steps.context.outputs.head_sha }}
+      head_ref: ${{ steps.context.outputs.head_ref }}
+      base_ref: ${{ steps.context.outputs.base_ref }}
+      review_body_b64: ${{ steps.context.outputs.review_body_b64 }}
+    steps:
+      - name: Resolve reviewed PR and enforce retry limit
+        id: context
+        uses: actions/github-script@v7
+        env:
+          PR_NUMBER: ${{ inputs.pr_number }}
+          EXPECTED_HEAD: ${{ inputs.expected_head }}
+        with:
+          script: |
+            const rawNumber = process.env.PR_NUMBER || '';
+            const expectedHead = process.env.EXPECTED_HEAD || '';
+            if (!/^\d+$/.test(rawNumber) || !/^[0-9a-f]{40}$/.test(expectedHead)) {
+              core.setFailed('Invalid PR number or expected_head');
+              return;
+            }
+            const prNumber = Number(rawNumber);
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+            });
+            if (pr.state !== 'open' || pr.draft) {
+              core.setFailed(`PR #${prNumber} is not open and reviewable`);
+              return;
+            }
+            if (pr.head.repo.full_name !== `${context.repo.owner}/${context.repo.repo}` ||
+                !pr.head.ref.startsWith('claude/')) {
+              core.setFailed('Only same-repository Claude executor PRs are allowed');
+              return;
+            }
+
+            core.setOutput('pr_number', String(prNumber));
+            core.setOutput('head_sha', pr.head.sha);
+            core.setOutput('head_ref', pr.head.ref);
+            core.setOutput('base_ref', pr.base.ref);
+
+            if (pr.head.sha !== expectedHead) {
+              core.notice(`Stale fix request ignored: expected ${expectedHead}, current ${pr.head.sha}`);
+              core.setOutput('can_run', 'false');
+              return;
+            }
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              per_page: 100,
+            });
+            const requestMarker = `<!-- oborot-agent:v1 role=codex status=REQUEST_CHANGES head=${expectedHead} -->`;
+            const workMarker = `<!-- oborot-agent:v1 role=claude status=WORKING head=${expectedHead} -->`;
+            const requests = comments.filter(comment => comment.body?.includes(requestMarker));
+            const attempts = comments.filter(comment => comment.body?.includes(workMarker)).length;
+
+            if (requests.length === 0) {
+              core.setFailed(`No Codex REQUEST_CHANGES comment found for ${expectedHead}`);
+              return;
+            }
+            if (attempts >= 3) {
+              const humanMarker = `<!-- oborot-agent:v1 role=system status=NEEDS_HUMAN head=${expectedHead} -->`;
+              if (!comments.some(comment => comment.body?.includes(humanMarker))) {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: prNumber,
+                  body: [
+                    humanMarker,
+                    'Claude трижды запускался для этого SHA, но новый commit не появился. Нужна проверка Владом.',
+                  ].join('\n\n'),
+                });
+              }
+              core.setOutput('can_run', 'false');
+              return;
+            }
+
+            const latestRequest = requests[requests.length - 1];
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body: [
+                workMarker,
+                `Claude получил замечания Codex и начал исправление. Попытка ${attempts + 1}/3.`,
+                `Run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              ].join('\n\n'),
+            });
+
+            core.setOutput('review_body_b64', Buffer.from(latestRequest.body, 'utf8').toString('base64'));
+            core.setOutput('can_run', 'true');
+
+  fix:
+    needs: prepare
+    if: needs.prepare.outputs.can_run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    env:
+      # Agent mode uses this to commit to the existing PR branch even though
+      # the outer event is workflow_dispatch.
+      CLAUDE_BRANCH: ${{ needs.prepare.outputs.head_ref }}
+    outputs:
+      conclusion: ${{ steps.claude.outputs.conclusion }}
+    steps:
+      - name: Checkout exact reviewed commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.head_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Materialize Codex findings outside the repository
+        env:
+          REVIEW_BODY_B64: ${{ needs.prepare.outputs.review_body_b64 }}
+        run: |
+          printf '%s' "$REVIEW_BODY_B64" | base64 --decode > "$RUNNER_TEMP/codex-review.md"
+
+      - name: Prepare Python used by project tests
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install project dependencies before exposing agent credentials
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.lock ]; then
+            pip install -r requirements.lock
+          else
+            pip install -r requirements.txt
+          fi
+
+      - name: Let Claude implement only the requested fixes
+        id: claude
+        # Pinned official anthropics/claude-code-action commit; update deliberately.
+        uses: anthropics/claude-code-action@c81e3bc69d1b18badbb63ba39581218f02421678
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          base_branch: ${{ needs.prepare.outputs.base_ref }}
+          display_report: false
+          show_full_output: false
+          prompt: |
+            You are the only code executor for Oborot SaaS. Codex is the
+            read-only reviewer. Fix the proven findings in
+            ${{ runner.temp }}/codex-review.md for PR
+            #${{ needs.prepare.outputs.pr_number }} at reviewed SHA
+            ${{ needs.prepare.outputs.head_sha }}.
+
+            Mandatory rules:
+            - Read AGENTS.md, PROJECT_STATE.md, DECISIONS.md and TECH_DEBT.md.
+            - Work only on the existing branch ${{ needs.prepare.outputs.head_ref }}.
+            - Fix the review findings with the smallest safe change.
+            - Add or update regression tests when the finding is behavioral.
+            - Run relevant tests and record exact results.
+            - Commit and push the result to the same branch.
+            - Never merge, rebase, force-push, or edit history.
+            - Do not edit .github/workflows/agent-*.yml. A defect in the
+              coordination bridge requires human intervention.
+            - Do not change business logic when the owner has not approved it.
+              If a finding requires such a decision, do not guess: report the
+              blocker without making that change.
+          claude_args: >-
+            --allowedTools
+            "Read,Edit,Write,Glob,Grep,Bash(git:*),Bash(python:*),Bash(pytest:*),Bash(rg:*),Bash(ls:*)"
+
+  finish:
+    needs: [prepare, fix]
+    if: always() && needs.prepare.result == 'success' && needs.prepare.outputs.can_run == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      issues: write
+      pull-requests: read
+    steps:
+      - name: Record result and wake Codex on a new commit
+        uses: actions/github-script@v7
+        env:
+          PR_NUMBER: ${{ needs.prepare.outputs.pr_number }}
+          OLD_HEAD: ${{ needs.prepare.outputs.head_sha }}
+          FIX_JOB_RESULT: ${{ needs.fix.result }}
+          CLAUDE_CONCLUSION: ${{ needs.fix.outputs.conclusion }}
+        with:
+          script: |
+            const prNumber = Number(process.env.PR_NUMBER);
+            const oldHead = process.env.OLD_HEAD;
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+            });
+
+            const succeeded = process.env.FIX_JOB_RESULT === 'success' &&
+              process.env.CLAUDE_CONCLUSION === 'success' &&
+              pr.head.sha !== oldHead;
+            const status = succeeded ? 'DONE' : 'BLOCKED';
+            const explanation = succeeded
+              ? `Claude опубликовал новый commit ${pr.head.sha}. Запускаю повторное ревью Codex.`
+              : `Claude не опубликовал новый commit. Job=${process.env.FIX_JOB_RESULT}, conclusion=${process.env.CLAUDE_CONCLUSION || 'none'}.`;
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body: [
+                `<!-- oborot-agent:v1 role=claude status=${status} head=${succeeded ? pr.head.sha : oldHead} -->`,
+                explanation,
+                `Run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              ].join('\n\n'),
+            });
+
+            if (succeeded) {
+              await github.rest.actions.createWorkflowDispatch({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id: 'agent-codex-review.yml',
+                ref: pr.base.ref,
+                inputs: { pr_number: String(prNumber), expected_head: pr.head.sha },
+              });
+            }
