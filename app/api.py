@@ -482,13 +482,113 @@ def _receipt_rows(db: Session, org_id: int, order_id: int) -> list[OrderReceipt]
     ).scalars())
 
 
-def _received_by_base(rows: list[OrderReceipt]) -> dict[str, float]:
-    """Принято по каждой позиции. Складывается, а не берётся последнее:
-    приёмок по одному заказу бывает несколько, и исправление ошибки —
-    компенсирующая строка с минусом, а не правка старой."""
-    out: dict[str, float] = {}
+# Приоритет источников (D-25). Машинный факт из МойСклада сильнее слов
+# человека: он доказуем. Ручной остаётся способом сказать то, чего источник
+# не знает, и поправить его.
+SOURCE_PRIORITY = ("ms_supply", "ms_order_shipped", "manual")
+
+
+def _received_by_source(rows: list[OrderReceipt]) -> dict[str, dict[str, float]]:
+    """{base_name: {source: сколько принято по этому источнику}}."""
+    out: dict[str, dict[str, float]] = {}
     for r in rows:
-        out[r.base_name] = out.get(r.base_name, 0.0) + float(r.qty or 0)
+        per = out.setdefault(r.base_name, {})
+        per[r.source] = per.get(r.source, 0.0) + float(r.qty or 0)
+    return out
+
+
+def _received_by_base(rows: list[OrderReceipt]) -> dict[str, float]:
+    """Принято по каждой позиции — с УЧЁТОМ приоритета источников.
+
+    Внутри одного источника строки складываются: частичный приход и довоз —
+    это разные факты поставки, а исправление ошибки — компенсирующая строка
+    с минусом, а не правка старой.
+
+    А вот РАЗНЫЕ источники не складываются. Человек подтвердил 80 штук, потом
+    МойСклад прислал доказуемую приёмку на те же 80 — это не 160, это два
+    свидетельства об одном факте. Побеждает более доказуемый (см.
+    SOURCE_PRIORITY); расхождение не прячется, а показывается отдельно
+    (`_receipts_out.source_conflicts`) и ждёт явного разбора.
+
+    Инвариант заведён ДО подключения ms_supply намеренно: чинить это после
+    первой автоматической записи пришлось бы уже на испорченных данных.
+    """
+    out: dict[str, float] = {}
+    for base, by_src in _received_by_source(rows).items():
+        evidence = _evidencing(by_src)
+        if not evidence:
+            # Свидетельств не осталось: единственное, что было, — машинные
+            # строки, схлопнувшиеся в ноль. Позиции в ответе НЕ БУДЕТ вовсе, и
+            # это не потеря: отсутствие в словаре означает «не знаем», а ноль
+            # означал бы «не приехало». Разница между ними — ровно то, ради
+            # чего писался D-25.
+            continue
+        for src in SOURCE_PRIORITY:
+            if src in evidence:
+                out[base] = evidence[src]
+                break
+        else:
+            # Неизвестный источник — берём как есть, но не суммируем с чужим.
+            out[base] = sum(evidence.values())
+    return out
+
+
+MANUAL_SOURCE = "manual"
+
+
+def _evidencing(by_src: dict[str, float]) -> dict[str, float]:
+    """Источники, которые ДЕЙСТВИТЕЛЬНО что-то утверждают.
+
+    Машинный источник с нулевой суммой — не свидетельство прихода, а его
+    отсутствие. Так бывает штатно: `_write_shipped_receipts` пишет
+    компенсирующие строки, и если в МойСкладе приёмку распровели или
+    исправили, машинная сумма по позиции схлопывается в ноль.
+
+    Без этой отсечки приоритет источников выбирал источник ПО НАЛИЧИЮ строк, а
+    не по содержанию: машинный ноль побеждал подтверждённые человеком 80 штук,
+    и система переходила от «не знаем» к утверждению «приехало ноль». Правило
+    проекта запрещает ровно это. Ноль, выдуманный уверенно, хуже догадки: он
+    выглядит как измерение.
+
+    А вот РУЧНАЯ строка остаётся свидетельством всегда, даже нулевая, и это не
+    исключение из правила, а само правило. Машина пишет дельты, которые могут
+    взаимно погаситься, — её ноль означает «в документах ничего нет». Человек,
+    записавший ноль, УТВЕРЖДАЕТ: «по этой позиции не приехало ничего». Первое —
+    пустота, второе — факт, и складывать их в одну корзину значило бы терять
+    ровно ту информацию, которую пользователь дал руками.
+    """
+    return {
+        src: qty for src, qty in by_src.items()
+        if src == MANUAL_SOURCE or abs(qty) > 1e-9
+    }
+
+
+def _source_conflicts(rows: list[OrderReceipt]) -> list[dict]:
+    """Позиции, где источники говорят РАЗНОЕ об одном и том же приходе.
+
+    Молчать нельзя: расхождение между «сказал человек» и «прислал МойСклад» —
+    это либо ошибка ввода, либо непроведённый документ, и разбирать его должен
+    человек. Одинаковые числа из двух источников конфликтом не считаются.
+    """
+    out = []
+    used_all = _received_by_base(rows)
+    for base, by_src in sorted(_received_by_source(rows).items()):
+        # Спорить могут только те, кто что-то утверждает. Машинный ноль — это
+        # «в документах ничего нет», а не «приехало ноль», и спором с ручными
+        # 80 штуками он не является. Считать его спором значило бы загонять
+        # заказ в тупик: снять такое расхождение можно было бы, только
+        # согласившись с нулём, то есть испортив данные.
+        evidence = _evidencing(by_src)
+        if len(evidence) < 2:
+            continue
+        values = {round(v, 3) for v in evidence.values()}
+        if len(values) < 2:
+            continue
+        out.append({
+            "base_name": base,
+            "by_source": {k: round(v, 3) for k, v in sorted(by_src.items())},
+            "used": round(used_all.get(base, 0.0), 3),
+        })
     return out
 
 
@@ -528,26 +628,45 @@ def _receipts_out(db: Session, order: ProductionOrder) -> dict:
         if base not in ordered:
             lines.append({"base_name": base, "ordered_qty": 0.0,
                           "received_qty": round(got, 3), "diff": round(got, 3)})
-    unknown = ms_writeback.is_pushed(order.ms_doc_href) and not rows
+    # «Неизвестно» — это любая заказанная позиция без записанного факта
+    # приёмки, независимо от того, ушёл заказ в МойСклад или нет.
+    unknown = bool(set(ordered) - set(by_base))
+    # ...а также любая позиция, где источники говорят РАЗНОЕ. Раньше расхождение
+    # только показывалось отдельным списком, но итог всё равно объявлялся
+    # подтверждённым: приоритет молча выбирал победителя, и «80 против 10»
+    # выезжало наружу как доказанная недостача в 70 штук. Спор двух источников
+    # — это не факт, это спор; пока его не разобрал человек, честный ответ
+    # ровно один: «не знаем».
+    #
+    # Сюда же попадает случай, ради которого правило и написано: если в
+    # МойСкладе объединили или переименовали позиции, приёмки разных товаров
+    # съезжаются под одно имя и выглядят как два свидетельства об одном
+    # приходе. Считать их спором и сказать «неизвестно» — правильнее, чем
+    # уверенно назвать число, которое получилось из склейки.
+    conflicts = _source_conflicts(rows)
+    unknown = unknown or bool(conflicts)
     return {
         "order_id": order.id,
         "status": order.status,
         "ordered_total": round(sum(ordered.values()), 3),
         "received_total": round(sum(by_base.values()), 3),
-        "confirmed": bool(rows),
-        # Заказ ушёл в МойСклад, приёмок оттуда нет: принятое неизвестно.
-        # Ноль в received_total здесь означает «не знаем», а не «не приехало».
+        "confirmed": bool(rows) and not unknown,
+        # Есть заказанные позиции без записанного факта приёмки: по ним
+        # принятое НЕИЗВЕСТНО. Ноль в received_total по такой позиции
+        # означает «не знаем», а не «не приехало».
         "execution_unknown": unknown,
         "sources": sorted({r.source for r in rows}),
         "precisions": sorted({r.precision for r in rows}),
-        # Разбивка по источникам. Сумма двух источников по одной позиции —
-        # это не «принято столько», а расхождение между тем, что сказал
-        # человек, и тем, что прислал МойСклад. Прятать его в одном числе
-        # нельзя: именно ради различимости источник и обязателен.
+        # Разбивка по источникам. Итог (`received_total`) их НЕ складывает —
+        # два источника об одном приходе это не двойная поставка (см.
+        # _received_by_base); здесь видно, что именно сказал каждый.
         "by_source": {
             src: round(sum(float(r.qty or 0) for r in rows if r.source == src), 3)
             for src in sorted({r.source for r in rows})
         },
+        # Позиции, где источники расходятся: не сложены, а вынесены на разбор.
+        # Наличие хотя бы одной такой позиции снимает `confirmed` — см. выше.
+        "source_conflicts": conflicts,
         "lines": sorted(lines, key=lambda x: x["base_name"]),
         # Сводка (`lines`) считается по ВСЕМ строкам, а список показывается
         # последними MAX_RECEIPTS_OUT: история приёмок растёт линейно, и
@@ -570,13 +689,20 @@ def _receipts_out(db: Session, order: ProductionOrder) -> dict:
 def _add_receipts(
     db: Session, order: ProductionOrder, items: dict[str, float], *,
     source: str, precision: str, user_id: int | None = None, source_ref: str = "",
+    keep_zeros: bool = False,
 ) -> int:
-    """Дописывает строки приёмки. Только пополнение — ничего не перезаписывает."""
+    """Дописывает строки приёмки. Только пополнение — ничего не перезаписывает.
+
+    keep_zeros=True — записывать и нули. «По этой позиции не приехало ничего»,
+    сказанное человеком, — такой же факт, как «приехало 7», и отличается от
+    «мы не знаем». Машинному источнику нули не нужны: там ноль означает лишь
+    «в документе ещё ничего не отгружено».
+    """
     now = datetime.utcnow()
     added = 0
     for base, qty in items.items():
         value = float(qty or 0)
-        if value == 0:
+        if value == 0 and not keep_zeros:
             continue
         db.add(OrderReceipt(
             org_id=order.org_id, order_id=order.id, base_name=base,
@@ -609,16 +735,22 @@ class ReceiptsIn(BaseModel):
     компенсирующей строкой — и обе остаются видны в истории.
     """
     lines: list[ReceiptLineIn] = Field(default_factory=list, max_length=2000)
+    # Ключ повтора. Таблица приёмок только пополняется, поэтому повторный
+    # запрос (двойной клик, ретрай после таймаута) дописывал бы вторую такую
+    # же строку и удваивал принятое. Машинный источник от этого защищён
+    # source_ref; ручному дадим тот же механизм: клиент присылает свой ключ,
+    # и запрос с уже виденным ключом ничего не пишет.
+    idempotency_key: str = Field(default="", max_length=128)
 
 
 class OrderStatusIn(BaseModel):
     status: str
     # Фактически принятое по строкам при переводе в «на складе».
     # НЕОБЯЗАТЕЛЬНО (решение владельца: ручное подтверждение не должно быть
-    # обязательным шагом). Не передали — считаем, что приехало заказанное,
-    # и помечаем это как допущение (precision = whole_order), а не как
-    # подтверждение. Разница важна: в статистике качества рекомендаций
-    # «пришло 80» и «никто не проверял, считаем что 80» весят по-разному.
+    # обязательным шагом). Не передали — заказ просто закрывается, а принятое
+    # количество остаётся НЕИЗВЕСТНЫМ. Раньше здесь подставлялось заказанное
+    # с пометкой «допущение»; от этого отказались: «пришло 80» и «никто не
+    # проверял» — разные утверждения, и второе не должно выглядеть числом.
     received: list[ReceiptLineIn] | None = None
 
 
@@ -694,17 +826,15 @@ def _record_execution(db: Session, ctx: AuthContext, order: ProductionOrder,
     Три случая, и они разные:
 
     * человек назвал количества → подтверждение (`by_position`), пишем как есть;
-    * человек просто отметил заказ принятым → допущение (`whole_order`), пишем
-      ОСТАТОК до заказанного. Именно остаток, а не всё количество: если раньше
-      записали частичный приход 3 из 10, «принят» означает «приехали и
-      остальные 7», а не «принято всего 3» — иначе заказ навсегда закрывался
-      подтверждённой недостачей, которой не было;
-    * заказ отправлен в МойСклад (`ms_doc_href`) → допущение НЕ пишем вовсе:
-      исполнение по такому заказу приходит машинным источником из поля
-      «отгружено», и допущение сложилось бы с ним в двойной счёт. Ровно по той
-      же причине строкой выше для таких заказов пропускается «едет к нам».
-      Явно названные человеком количества при этом уважаются: прямое
-      утверждение человека сильнее нашего допущения.
+    * человек просто отметил заказ принятым → НЕ пишем ничего. Заказ закрыт
+      (status = received, стоит received_at), но сколько именно приехало —
+      неизвестно, и выдумывать это число нельзя даже с пометкой «допущение».
+      Ревью справедливо указало: пометка честная, а число — нет, и будущая
+      статистика качества рекомендаций посчитает наши допущения фактами.
+
+    Ручное подтверждение остаётся НЕобязательным (решение владельца): кнопка
+    «принят на склад» работает одним кликом, как и раньше. Разница в том, что
+    теперь она закрывает заказ, а не сочиняет исполнение.
     """
     lines: dict[str, float] = {}
     if received:
@@ -714,21 +844,19 @@ def _record_execution(db: Session, ctx: AuthContext, order: ProductionOrder,
                 lines[name] = lines.get(name, 0.0) + float(line.qty)
         if lines:
             _add_receipts(db, order, lines, source="manual",
-                          precision="by_position", user_id=ctx.user.id)
-            return
-    # Пустой список — это не «принято ноль», а «количества не назвали»:
-    # трактуем как обычную отметку и не оставляем заказ без факта исполнения.
-    if ms_writeback.is_pushed(order.ms_doc_href):
-        return
-    already = _received_by_base(_receipt_rows(db, ctx.org.id, order.id))
-    rest: dict[str, float] = {}
-    for base, qty in _ordered_by_base(order).items():
-        left = round(qty - already.get(base, 0.0), 3)
-        if left > 0:
-            rest[base] = left
-    if rest:
-        _add_receipts(db, order, rest, source="manual",
-                      precision="whole_order", user_id=ctx.user.id)
+                          precision="by_position", user_id=ctx.user.id,
+                          keep_zeros=True)
+    # Количеств не назвали — НИЧЕГО не пишем. Раньше здесь дописывался
+    # остаток до заказанного с пометкой «допущение» (precision=whole_order),
+    # и это была ошибка: пометка честная, но число — выдуманное. Правило
+    # проекта строже: нет доказуемого факта — хранить «неизвестно», а не
+    # угадывать. Иначе будущая статистика качества рекомендаций будет
+    # считать наши же допущения фактами и покажет точность, которой нет.
+    #
+    # Сам заказ при этом закрыт: status = received и received_at стоят. Это
+    # два разных утверждения — «заказ, по мнению человека, приехал» и
+    # «приехало столько-то штук», — и смешивать их нельзя. Выдача говорит
+    # об этом прямо: execution_unknown.
 
 
 @router.get("/orders/{order_id}/receipts")
@@ -751,9 +879,18 @@ def api_order_receipts_add(
 ):
     """Дописать факт приёмки (частичный приход, довоз, исправление минусом).
 
-    Гейтом подписки НЕ закрывается сознательно: запись факта о том, что уже
-    произошло, — это бухгалтерия, а не создание новой ценности. Закрывать её
-    значило бы наказывать неплательщика искажением его собственной истории.
+    Гейтом подписки ЗАКРЫВАЕТСЯ — как и любое изменение рабочих данных
+    (D-24, deny-by-default). Здесь раньше стояло обратное утверждение, и оно
+    расходилось с кодом: путь не значится в ALWAYS_OPEN_PATHS, то есть гейт
+    его закрывал, а комментарий обещал, что не закрывает.
+
+    Оговорка по существу. Довод «запись факта о том, что уже произошло — это
+    бухгалтерия, а не новая ценность» никуда не делся: у организации,
+    просрочившей оплату посреди поставки, в истории появится дыра ровно там,
+    где потом считается качество рекомендаций. Но это продуктовая развилка, а
+    не решение того, кто правит код: утверждённый D-24 говорит «активные
+    действия прекращаются до оплаты», и до ответа владельца действует он.
+    Развилка вынесена Владиславу отдельным вопросом.
     """
     order = db.get(ProductionOrder, order_id)
     if order is None or order.org_id != ctx.org.id:
@@ -770,8 +907,48 @@ def api_order_receipts_add(
             lines[name] = lines.get(name, 0.0) + float(line.qty)
     if not lines:
         raise HTTPException(status_code=422, detail="Не переданы позиции приёмки.")
+    # Имя позиции здесь НАМЕРЕННО не сверяется с каталогом — в отличие от
+    # api_create_order и api_set_ordered. Это выглядит как забытая проверка, и
+    # соблазн её добавить возникает регулярно; не надо. Смысл этой ручки в том
+    # числе — записать, что подрядчик прислал НЕ ТО: позицию, которой в заказе
+    # не было, а иногда и такую, которой уже нет в каталоге (переименовали,
+    # сдали в архив, сняли с производства). Сверка с каталогом отклоняла бы
+    # ровно эти случаи, то есть именно то искажение истории, от которого
+    # таблица приёмок и бережётся. Незаказанная позиция не прячется: она
+    # выезжает в сверке отдельной строкой с ordered_qty = 0.
+    key = (body.idempotency_key or "").strip()
+    ref = ""
+    if key:
+        # Ключ привязывается к СОДЕРЖИМОМУ запроса, а не только к самому себе.
+        # Иначе клиент, который генерирует ключ на сессию или на заказ (а не на
+        # запрос), молча терял бы довоз: второй запрос с тем же ключом, но
+        # другими позициями, считался бы повтором и не записывался. Повтор —
+        # это тот же ключ И то же тело; тот же ключ с другим телом — новый факт.
+        digest = hashlib.sha256(
+            json.dumps(sorted(lines.items()), ensure_ascii=False).encode("utf-8")
+        ).hexdigest()[:16]
+        ref = f"key:{key}:{digest}"
+        seen = db.execute(
+            select(OrderReceipt.id).where(
+                OrderReceipt.org_id == ctx.org.id,
+                OrderReceipt.order_id == order.id,
+                OrderReceipt.source == "manual",
+                OrderReceipt.source_ref == ref,
+            ).limit(1)
+        ).first()
+        if seen:
+            # Повтор того же запроса — не ошибка и не повод писать второй раз.
+            return {"ok": True, "added": 0, "repeat": True,
+                    **_receipts_out(db, order)}
+    # keep_zeros=True: «по этой позиции не приехало ничего», сказанное
+    # человеком, — такой же факт, как «приехало 7». Без этого ручка отвечала
+    # `ok: true, added: 0`, строку не писала, и утверждение пользователя молча
+    # исчезало — заказ оставался «неизвестно» вместо «подтверждённый ноль».
+    # Соседний путь (перевод в «на складе» с количествами) нули писал, и две
+    # ручки отвечали об одном и том же по-разному.
     added = _add_receipts(db, order, lines, source="manual",
-                          precision="by_position", user_id=ctx.user.id)
+                          precision="by_position", user_id=ctx.user.id,
+                          source_ref=ref, keep_zeros=True)
     db.commit()
     return {"ok": True, "added": added, **_receipts_out(db, order)}
 
@@ -1105,11 +1282,9 @@ def api_toggle_warehouse(
 
 # ── Подключение источника данных ─────────────────────────────────────────────
 
-# Демо-данные закрыты гейтом: seed_demo начинается с полного стирания данных
-# организации. Ревью нашло сценарий, в котором это невосстановимая потеря —
-# организация, которой мы уже отказали в записи, стирает себе заказы на
-# производство и ручное «Заказано», а восстановить их нечем.
-@router.post("/connect/demo", dependencies=[Depends(subscription.require_write_access)])
+# Демо-данные закрыты гейтом (как и всё пишущее): seed_demo начинается с
+# полного стирания данных организации.
+@router.post("/connect/demo")
 def api_connect_demo(ctx: AuthContext = Depends(require_owner_api), db: Session = Depends(get_db)):
     """Создаёт demo-подключение и сеет синтетические данные (детерминированно)."""
     org = ctx.org
@@ -2224,7 +2399,7 @@ def api_order_plan_options(
     }
 
 
-@router.post("/order-plan/preview", dependencies=[Depends(subscription.require_write_access)])
+@router.post("/order-plan/preview")
 def api_order_plan_preview(
     body: OrderPlanIn, ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)
 ):
@@ -2232,7 +2407,7 @@ def api_order_plan_preview(
     return _plan(db, ctx, body)
 
 
-@router.post("/order-plan", dependencies=[Depends(subscription.require_write_access)])
+@router.post("/order-plan")
 def api_order_plan_save(
     body: OrderPlanIn, ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)
 ):
@@ -2404,6 +2579,7 @@ def api_order_plan_outcome(
     received: dict[str, float] = {}
     order_received = False
     execution_unknown = False
+    disputed: set[str] = set()
     if order is not None:
         rows = _receipt_rows(db, ctx.org.id, order.id)
         received = _received_by_base(rows)
@@ -2421,20 +2597,30 @@ def api_order_plan_outcome(
         by_machine = ms_writeback.is_pushed(order.ms_doc_href)
         execution_unknown = by_machine and not rows
         order_received = order.status == "received" and not by_machine
-    confirmed = bool(received) or order_received
+        # Позиции, по которым источники спорят. Эта выдача — та самая, по
+        # которой потом меряют качество рекомендаций, и подавать сюда спорное
+        # число как факт нельзя: сверка приёмок уже говорит «не знаем», а здесь
+        # выезжало уверенное `executed`, и две выдачи об одном заказе отвечали
+        # по-разному.
+        disputed = {c["base_name"] for c in _source_conflicts(rows)}
+    confirmed = (bool(received) or order_received) and not disputed
 
     def _executed(base: str):
         """Сколько принято ПО ЭТОЙ позиции. None — неизвестно.
 
-        Ноль ставится только тогда, когда заказ закрыт как принятый ЧЕЛОВЕКОМ
-        и исполнение по нему принадлежит нам: тогда «по этой позиции не
-        приехало ничего» — утверждение, а не пробел. Пока заказ едет — и
-        всегда для заказа, исполнение которого приходит из МойСклада, —
-        отсутствие строки означает «ещё не знаем».
+        Ноль появляется только если он ЗАПИСАН как факт: человек прямо сказал
+        «по этой позиции не приехало ничего». Вывести ноль из того, что заказ
+        отмечен принятым, нельзя — это разные утверждения.
+
+        Спор источников — тоже «неизвестно». Пока человек не разобрал
+        расхождение, у позиции нет одного фактического количества, и выдать
+        победителя приоритета за факт значило бы посчитать спор измерением.
         """
+        if base in disputed:
+            return None
         if base in received:
             return round(received[base], 3)
-        return 0.0 if order_received else None
+        return None
 
     def _line(base: str, recommended, decided: float) -> dict:
         return {
@@ -2471,7 +2657,11 @@ def api_order_plan_outcome(
         "execution_confirmed": confirmed,
         # Заказ закрыт, но чем он закрыт — мы не знаем: он ушёл в МойСклад,
         # а «отгружено» оттуда не пришло. Это не «приехало ноль».
-        "execution_unknown": execution_unknown,
+        "execution_unknown": execution_unknown or bool(disputed),
+        # Позиции, по которым источники приёмки спорят: у них `executed` = null
+        # не потому, что данных нет, а потому, что данные противоречат друг
+        # другу. Разница видна на экране, а не только в этом комментарии.
+        "disputed_bases": sorted(disputed),
         "positions": len(lines),
         "edited_by_human": edited,
         "totals": {
@@ -2542,7 +2732,7 @@ def _find_duplicate_order(db: Session, org_id: int, production_id, bases: set) -
     return None
 
 
-@router.post("/order-plan/{plan_id}/apply", dependencies=[Depends(subscription.require_write_access)])
+@router.post("/order-plan/{plan_id}/apply")
 def api_order_plan_apply(
     plan_id: int, body: PlanApplyIn,
     ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db),

@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 
 from app import auth
 from app import logging_conf
+from app import subscription
 
 # Настраиваем логирование ДО создания приложения и до первого вызова
 # любого log.* — uvicorn к этому моменту уже применил свою конфигурацию
@@ -40,7 +41,14 @@ TEMPLATE_DIRS = [BASE_DIR / "templates", BASE_DIR / "_stub_templates"]
 STATIC_DIR = BASE_DIR / "static"
 TRIAL_DAYS = 14
 
-app = FastAPI(title="Оборот", docs_url=None, redoc_url=None)
+# Гейт подписки (D-24) — ОДНА зависимость на всё приложение, а не декоратор на
+# каждой пишущей ручке. Запрещено по умолчанию: читающие запросы и явный
+# список subscription.ALWAYS_OPEN_PATHS проходят, остальное упирается в
+# состояние подписки. Первая версия перечисляла ЗАКРЫТЫЕ ручки, и ревью нашло
+# ровно то, чего такой список не мог не пропустить. Выключен, пока нет
+# OBOROT_SUBSCRIPTION_GATE=1 — тогда зависимость не делает ни одного запроса.
+app = FastAPI(title="Оборот", docs_url=None, redoc_url=None,
+              dependencies=[subscription.gate_dependency()])
 app.include_router(api_router)
 app.include_router(connect_router)
 app.include_router(extra_router)

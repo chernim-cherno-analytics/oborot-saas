@@ -257,7 +257,7 @@ async def api_moysklad_stores_select(
 
 # ── Синхронизация ────────────────────────────────────────────────────────────
 
-@router.post("/sync/initial", dependencies=[Depends(subscription.require_write_access)])
+@router.post("/sync/initial")
 def api_sync_initial(
     ctx: AuthContext = Depends(require_owner_api), db: Session = Depends(get_db)
 ):
@@ -286,7 +286,7 @@ def api_sync_initial(
     }
 
 
-@router.post("/sync/run", dependencies=[Depends(subscription.require_write_access)])
+@router.post("/sync/run")
 def api_sync_run(
     ctx: AuthContext = Depends(require_owner_api), db: Session = Depends(get_db)
 ):
@@ -369,7 +369,7 @@ def api_order_ms_doc(
     return _ms_doc_out(_order_of_org(db, ctx.org.id, order_id))
 
 
-@router.post("/orders/{order_id}/push-to-ms", dependencies=[Depends(subscription.require_write_access)])
+@router.post("/orders/{order_id}/push-to-ms")
 async def api_order_push_to_ms(
     order_id: int = _id_path(),
     ctx: AuthContext = Depends(require_owner_api),
