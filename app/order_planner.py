@@ -185,6 +185,31 @@ def normalize_stages(raw: list | None, fallback_lead: int) -> list[dict]:
     return stages
 
 
+def production_moq(prod) -> int:
+    """Минимальная партия КАНАЛА — одно число из двух полей.
+
+    На одной сущности исторически завелись два поля с одним смыслом:
+    `moq` — то, что владелец вводит на странице «Заказ» («Минимальная партия,
+    шт»), и `moq_units` — то, что он вводит в Настройках, в таблице каналов
+    («Мин. партия»). Страница «Заказ» читала только первое, мастер — только
+    второе. Заполнив одно, владелец не влиял на второй экран, и нигде об этом
+    не было сказано.
+
+    Замер на демо-данных (BUSINESS_LOGIC §9.6): тот же канал, тот же бриф,
+    разница только в прочитанном поле — план 2 905 500 ₽ против 3 664 596 ₽
+    (+759 096 ₽, 1,26×), и 15 позиций из 34 из плана исчезают. Против экрана
+    «Заказ» разрыв 3,65 млн ₽. Дело даже не в точности: 29 позиций из 34 шли
+    по 12–36 шт при минимальной партии цеха 50 — такой заказ фабрика просто
+    не примет.
+
+    Берём МАКСИМУМ, а не «одно из»: минимальная партия — это пол, и если
+    владелец назвал два пола, выполнить надо оба. Ноль означает «не задано»
+    и в максимуме не участвует иначе как нейтральный элемент.
+    """
+    return max(int(getattr(prod, "moq", 0) or 0),
+               int(getattr(prod, "moq_units", 0) or 0))
+
+
 def stage_moq(stages: list[dict], category: str) -> int:
     """Минимальная партия модели = максимум минимумов по этапам.
 
@@ -1262,8 +1287,10 @@ def build_plan(db: Session, org: Org, snap: dict, raw_brief: dict) -> dict:
     brief = normalize_brief(raw_brief, prod_settings, stages, today)
     if prod is not None:
         brief["production_id"] = prod.id
-        if not brief.get("moq_explicit") and prod.moq_units:
-            brief["moq_units"] = int(prod.moq_units)
+        if not brief.get("moq_explicit"):
+            channel_moq = production_moq(prod)
+            if channel_moq:
+                brief["moq_units"] = channel_moq
     else:
         # Производство не наше (или его нет). Расчёт его уже игнорирует, но
         # ЧУЖОЙ id нельзя оставлять в брифе: бриф сохраняется в order_plans, а

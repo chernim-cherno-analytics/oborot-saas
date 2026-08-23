@@ -1453,7 +1453,10 @@ def apply_production_rules(db: Session, org_id: int, data: dict) -> dict:
     )
     for item in items:
         prod = cond["by_id"].get(cond["assign"].get(item["base_name"], cond["main_id"]))
-        moq = int(getattr(prod, "moq", 0) or 0)
+        # Минимальная партия — одно эффективное число из двух полей канала
+        # (см. order_planner.production_moq): страница «Заказ» и «Мастер»
+        # обязаны считать по одному и тому же полу.
+        moq = order_planner.production_moq(prod) if prod is not None else 0
         step = int(getattr(prod, "pack_multiple", 0) or 0)
         item["production_id"] = prod.id if prod else None
         item["production_name"] = prod.name if prod else ""
@@ -1497,11 +1500,11 @@ def _production_out(p, fallback_lead: int) -> dict:
         "name": p.name,
         "is_main": p.is_main,
         "lead_time_days": int(p.lead_time_days or 0),
-        "moq": int(p.moq or 0),
+        "moq": order_planner.production_moq(p),
         "pack_multiple": int(p.pack_multiple or 0),
         "stages": stages,
         "lead_days": order_planner.lead_days(stages),
-        "moq_units": int(p.moq_units or 0),
+        "moq_units": order_planner.production_moq(p),
         "cadence_days": int(p.cadence_days or 0),
         "prepay_now_share": round(order_planner.prepay_share_total(stages), 4),
         "staged": len(stages) > 1,
@@ -1514,7 +1517,13 @@ def _apply_production_in(p, body: ProductionIn) -> None:
     if "lead_time_days" in sent:
         p.lead_time_days = int(body.lead_time_days) if body.lead_time_days else None
     if "moq" in sent:
+        # Пишем ОБА поля минимальной партии. Их два по историческим причинам
+        # (см. order_planner.production_moq), читаются они теперь вместе, но
+        # если писать только одно — они снова разъедутся при следующей правке
+        # на соседнем экране, и владелец опять получит два разных «пола» на
+        # одном канале.
         p.moq = int(body.moq) if body.moq else None
+        p.moq_units = int(body.moq or 0)
     if "pack_multiple" in sent:
         p.pack_multiple = int(body.pack_multiple) if body.pack_multiple else None
 
@@ -1586,6 +1595,7 @@ def api_production_create(
         )
     if body.moq_units is not None:
         p.moq_units = int(body.moq_units)
+        p.moq = int(body.moq_units) or None   # см. _apply_production_in
     db.add(p)
     db.commit()
     db.refresh(p)
@@ -2661,6 +2671,7 @@ def api_production_setup(
         p.stages_json = json.dumps(stages, ensure_ascii=False)
     if body.moq_units is not None:
         p.moq_units = int(body.moq_units)
+        p.moq = int(body.moq_units) or None   # см. _apply_production_in
     if body.cadence_days is not None:
         p.cadence_days = int(body.cadence_days)
     db.commit()
