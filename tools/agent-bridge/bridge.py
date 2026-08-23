@@ -33,6 +33,9 @@ GitHub от этого ничего не забудет, и следующий �
   * никогда `merge`, `rebase`, `--force`/`--force-with-lease`;
   * никогда merge Pull Request — решение о слиянии принимает владелец;
   * три попытки на один SHA, дальше `NEEDS_HUMAN` и остановка;
+  * `claude` не запускается, пока Pull Request занят другой сессией: бронь
+    берётся атомарно локальной блокировкой прямо перед вызовом модели и
+    освобождается в `finally` (раздел «Бронь на Pull Request»);
   * `claude` запускается без права выполнять команды: ему разрешены только
     чтение и правка файлов. Тесты и git — на стороне диспетчера;
   * правки в `.github/workflows/**` и в сам `tools/agent-bridge/**` откатываются
@@ -48,20 +51,28 @@ GitHub от этого ничего не забудет, и следующий �
     bridge.py status               что диспетчер помнит и что видит на GitHub
     bridge.py health               проверка окружения, код возврата 0/1
     bridge.py logs -n 100          хвост журнала
+    bridge.py claim run --pr 8 -- claude   взять бронь на PR и позвать команду
+    bridge.py claim list           какие Pull Request заняты прямо сейчас
+    bridge.py claim release --pr 8 снять свою бронь
 
-Код возврата: 0 — цикл прошёл, 1 — цикл или проверка упали.
+Код возврата: 0 — цикл прошёл, 1 — цикл или проверка упали, 75 — Pull Request
+занят другой сессией (`claim`).
 """
 from __future__ import annotations
 
 import argparse
+import contextlib
 import fcntl
 import json
 import os
 import re
 import shutil
+import signal
+import socket
 import subprocess
 import sys
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -123,6 +134,15 @@ CONFIG_KEYS = {
     "GIT_BIN": "",
     "PYTHON_BIN": "",
     "STATE_DIR": "",
+    # Каталог броней. Пусто — <каталог состояния>/claims. Важно, чтобы у
+    # диспетчера и у ручных сессий он был ОДИН: бронь, взятая в другом
+    # каталоге, никого ни от чего не защищает.
+    "CLAIM_DIR": "",
+    # Срок брони, секунды. По умолчанию 5400 — это заведомо больше самого
+    # долгого прогона диспетчера (правка 1800 + тесты 2700 по умолчанию),
+    # иначе собственная бронь протухала бы прямо посреди работы. Срок нужен
+    # только там, где живость владельца доказать нечем (см. класс Claims).
+    "CLAIM_TTL": "5400",
     "NOOP_REVIEW_PATTERN": (
         r"(no (major |significant |blocking )?issues|"
         r"looks good|lgtm|нет замечаний|замечаний нет|"
@@ -281,6 +301,14 @@ def state_dir(cfg: Config) -> Path:
         return Path(configured).expanduser()
     base = Path(os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state"))
     return base / "oborot-agent-bridge"
+
+
+def claims_dir(cfg: Config) -> Path:
+    """Каталог броней. Один на машину, иначе бронь ни от чего не защищает."""
+    configured = cfg.get("CLAIM_DIR")
+    if configured:
+        return Path(configured).expanduser()
+    return state_dir(cfg) / "claims"
 
 
 def venv_python(root: Path) -> Path:
@@ -489,6 +517,503 @@ class Lock:
                 self.handle.close()
                 self.handle = None
         return False
+
+
+# --------------------------------------------------------------------------
+# Бронь на Pull Request: один исполнитель, а не два
+# --------------------------------------------------------------------------
+#
+# Разбираемый случай, настоящий. 23.08.2026 фоновая задача увидела замечания
+# Codex к PR #8 и запустила `claude`, хотя тот же PR в этот момент правила
+# ручная сессия Claude. Дубль остановили руками до push — но остановили потому,
+# что за экраном сидел человек, а не потому, что схема это предусматривала.
+# Двое исполнителей на одной ветке — это встречные правки одних и тех же строк,
+# отклонённый push, сожжённые попытки и, в худшем случае, коммит поверх чужой
+# незаконченной работы.
+#
+# Правило CLAIM в `AGENTS.md` существовало и раньше, но жило в тексте: его
+# соблюдал тот, кто его прочитал. Ниже — то же правило, но исполняемое, и
+# опирается оно на три вещи, каждая из которых нужна отдельно.
+#
+# 1. `Claims._guard()` — файловая блокировка (flock) на весь каталог броней.
+#    Держится микросекунды и делает чтение-и-запись брони неделимыми. Без неё
+#    два процесса, одновременно проверившие «свободно», оба записали бы себя
+#    владельцами: ровно та гонка, из-за которой всё это и пишется.
+#
+# 2. Файл жизни `pr-N.alive` — владелец держит на нём flock ВСЁ время работы.
+#    Это единственное доказательство «процесс ещё жив», которое не врёт: его
+#    снимает ядро, когда процесс умирает любым способом, включая `kill -9` и
+#    закрытое окно терминала. Разбор по `ps` и по строке команды не годится
+#    (просили не полагаться на него, и справедливо): pid переиспользуются,
+#    команда у ручной сессии и у фоновой одинаковая, а сам разбор — это гонка.
+#
+# 3. Срок (TTL) в самой записи — на случай, когда живость доказать НЕЧЕМ:
+#    отсоединённая бронь (`claim acquire` и выход) или потерянный файл жизни.
+#    Без срока такая запись блокировала бы PR навсегда.
+#
+# Отсюда правило занятости, и порядок в нём важен:
+#
+#     занято = запись есть
+#              И она не освобождена
+#              И (владелец жив ЛИБО живость неизвестна и срок не истёк)
+#
+# Живой владелец блокирует PR независимо от срока — специально. Истёкший срок у
+# ЖИВОГО процесса значит «работа затянулась», а не «работы нет»; отобрать у него
+# бронь — это вернуть себе ровно тот дубль, от которого защищаемся. Снять такую
+# бронь можно только руками: `claim release --pr N --force`, и сначала
+# остановить сам процесс.
+#
+# Любое сомнение — «занято» (fail-closed). Каталог не создаётся, запись не
+# читается, JSON повреждён, блокировка не берётся — во всех этих случаях
+# диспетчер модель НЕ зовёт. Цена ошибки несимметрична: лишний пропуск стоит
+# одной минуты до следующего цикла, лишний запуск — двух исполнителей на ветке.
+# Единственное исключение — повреждённая запись, которая старше срока: такую
+# считаем мусором, иначе один битый файл останавливает автоматику навсегда.
+
+CLAIM_SCHEMA = 1
+
+# Код возврата «занято». 75 — это EX_TEMPFAIL из sysexits(3): «временный отказ,
+# повторите позже». Отдельный код нужен, чтобы вызывающий скрипт отличал
+# «сделать нечего, потому что занято» от настоящей ошибки.
+CLAIM_BUSY_EXIT = 75
+
+# Сколько ждать общей блокировки каталога броней. Критическая секция — это
+# несколько операций с файлами, то есть миллисекунды; десять секунд ожидания
+# означают, что что-то не так, и ждать дольше незачем. Бесконечное ожидание под
+# launchd недопустимо: зависший процесс некому снять.
+CLAIM_GUARD_TIMEOUT = 10.0
+
+
+class ClaimBusy(RuntimeError):
+    """Бронь занята кем-то другим — или мы не смогли доказать, что свободна."""
+
+    def __init__(self, pr: int, record: dict | None, reason: str):
+        self.pr = pr
+        self.record = record or {}
+        self.reason = reason
+        super().__init__("PR #{} занят: {}".format(pr, describe_claim(self.record, reason)))
+
+
+class ClaimLost(RuntimeError):
+    """Бронь перестала быть нашей до того, как мы позвали модель."""
+
+
+def describe_claim(record: dict | None, reason: str = "") -> str:
+    """Человеческое описание брони — для журнала, отчёта и `claim list`."""
+    record = record or {}
+    parts = []
+    owner = record.get("owner")
+    if owner:
+        parts.append("владелец {}".format(owner))
+    if record.get("kind"):
+        parts.append("роль {}".format(record["kind"]))
+    if record.get("pid"):
+        parts.append("pid {}".format(record["pid"]))
+    if record.get("sha"):
+        parts.append("SHA {}".format(str(record["sha"])[:8]))
+    if record.get("acquired_at"):
+        parts.append("взята {}".format(record["acquired_at"]))
+    if record.get("expires_at"):
+        parts.append("срок до {}".format(record["expires_at"]))
+    if record.get("note"):
+        parts.append(str(record["note"])[:120])
+    if reason:
+        parts.append(reason)
+    return "; ".join(parts) if parts else (reason or "подробностей нет")
+
+
+def default_claim_owner(kind: str) -> str:
+    """Имя владельца брони по умолчанию.
+
+    Смысл имени — чтобы человек, увидев занятый PR, понял, КОГО останавливать.
+    Переменная `OBOROT_CLAIM_OWNER` даёт назвать сессию явно («codex-chat-3»).
+    Она сознательно не входит в `CONFIG_KEYS`: это не настройка машины, а
+    подпись одного запуска, и в файл настроек ей попадать незачем.
+    """
+    named = os.environ.get("OBOROT_CLAIM_OWNER", "").strip()
+    if named:
+        return named[:120]
+    user = os.environ.get("USER") or os.environ.get("LOGNAME") or "unknown"
+    return "{}:{}@{}".format(kind, user, socket.gethostname())
+
+
+class Claim:
+    """Взятая бронь: машиночитаемая запись плюс удерживаемый файл жизни."""
+
+    def __init__(self, claims: "Claims", record: dict, handle):
+        self.claims = claims
+        self.record = record
+        self.handle = handle
+        self.released = False
+
+    @property
+    def pr(self) -> int:
+        return int(self.record.get("pr", 0))
+
+    @property
+    def token(self) -> str:
+        return str(self.record.get("token", ""))
+
+    @property
+    def sha(self) -> str:
+        return str(self.record.get("sha") or "")
+
+    def verify(self) -> bool:
+        """Наша ли бронь ПРЯМО СЕЙЧАС — проверка перед вызовом модели.
+
+        Между взятием брони и вызовом `claude` проходит время: клон, fetch,
+        checkout. За это время бронь могли снять руками (`--force`), а PR —
+        занять другой сессией. Поэтому перед самым дорогим и самым опасным
+        шагом запись перечитывается и сверяется целиком: номер PR, SHA и
+        одноразовый токен. Токен — потому что «запись на месте» и «запись всё
+        ещё наша» — разные утверждения.
+
+        Срок здесь НЕ проверяется намеренно: пока мы держим файл жизни, отобрать
+        бронь никто не мог, а истёкший срок означает лишь, что работа затянулась.
+        Любая ошибка чтения — «нет»: сомнение решается в пользу тишины.
+        """
+        try:
+            with self.claims.guard():
+                record, problem = self.claims.read(self.pr)
+                if problem or not record:
+                    return False
+                if record.get("released_at"):
+                    return False
+                if str(record.get("token") or "") != self.token:
+                    return False
+                if int(record.get("pr", -1)) != self.pr:
+                    return False
+                if str(record.get("sha") or "") != self.sha:
+                    return False
+                return True
+        except (OSError, ClaimBusy):
+            return False
+
+    def release(self, reason: str = "") -> None:
+        """Освободить бронь. Вызывается из `finally` и повторный вызов безопасен.
+
+        Чужую запись не трогаем: если токен уже не наш, значит бронь у кого-то
+        другого, и «освободить» её означало бы отобрать.
+        """
+        if self.released:
+            return
+        self.released = True
+        try:
+            with self.claims.guard():
+                record, problem = self.claims.read(self.pr)
+                if record and not problem and str(record.get("token") or "") == self.token:
+                    record["released_at"] = datetime.now(timezone.utc).isoformat()
+                    record["released_reason"] = (reason or "работа завершена")[:200]
+                    self.claims.write(self.pr, record)
+        except (OSError, ClaimBusy):
+            # Не сумели пометить запись — не беда: файл жизни ниже всё равно
+            # освобождается, и следующий, кто спросит, увидит мёртвого владельца.
+            pass
+        finally:
+            handle, self.handle = self.handle, None
+            if handle is not None:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                try:
+                    handle.close()
+                except OSError:
+                    pass
+
+
+class Claims:
+    """Каталог броней: одна бронь на Pull Request.
+
+    Почему единица брони — Pull Request, а не пара «PR + SHA». Двое, правящих
+    один PR на разных коммитах, мешают друг другу ровно так же, как на одном:
+    тот, кто допишет первым, сдвинет HEAD, и работа второго окажется поверх
+    устаревшего кода — либо push отклонят. SHA в записи всё равно есть, и он
+    сверяется (`Claim.verify`), но занимается именно PR: это то, за что идёт
+    борьба.
+    """
+
+    def __init__(self, directory: Path, ttl: int = 5400, log: Log | None = None):
+        self.dir = Path(directory)
+        self.ttl = ttl if ttl and ttl > 0 else 5400
+        self.log = log
+
+    # -- пути ------------------------------------------------------------
+
+    def record_path(self, pr: int) -> Path:
+        return self.dir / "pr-{}.json".format(int(pr))
+
+    def alive_path(self, pr: int) -> Path:
+        return self.dir / "pr-{}.alive".format(int(pr))
+
+    # -- общая блокировка каталога ---------------------------------------
+
+    @contextlib.contextmanager
+    def guard(self):
+        """Неделимость чтения-и-записи брони.
+
+        Без неё вся конструкция бессмысленна: два процесса, одновременно
+        прочитавшие «свободно», оба записали бы себя владельцами. Ожидание
+        ограничено: критическая секция — это несколько операций с файлами, и
+        если блокировку не отдали за `CLAIM_GUARD_TIMEOUT`, что-то сломано.
+        Неудача — это `ClaimBusy`, то есть «занято», а не «можно работать».
+        """
+        try:
+            self.dir.mkdir(parents=True, exist_ok=True)
+            handle = (self.dir / ".guard").open("a+", encoding="utf-8")
+        except OSError as exc:
+            raise ClaimBusy(0, None, "каталог броней недоступен: {}".format(exc))
+        deadline = time.monotonic() + CLAIM_GUARD_TIMEOUT
+        while True:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    handle.close()
+                    raise ClaimBusy(0, None, "общая блокировка броней занята "
+                                             "дольше {:.0f} с".format(CLAIM_GUARD_TIMEOUT))
+                time.sleep(0.02)
+        try:
+            yield
+        finally:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            handle.close()
+
+    # -- чтение и запись --------------------------------------------------
+
+    def read(self, pr: int) -> tuple[dict | None, str]:
+        """Запись брони. Возвращает (запись, проблема).
+
+        Непустая «проблема» означает «считать занятым»: мы не смогли доказать,
+        что PR свободен. Пустая запись без проблемы — свободен.
+        """
+        path = self.record_path(pr)
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None, ""
+        except OSError as exc:
+            return None, "запись брони не читается: {}".format(exc)
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            data = None
+        if not isinstance(data, dict):
+            # Повреждённая запись — «занято», но не навсегда: файл старше срока
+            # считается мусором, иначе один битый JSON останавливает автоматику
+            # до прихода человека.
+            if self._file_age(path) > self.ttl:
+                return None, ""
+            return None, "запись брони повреждена"
+        return data, ""
+
+    def write(self, pr: int, record: dict) -> None:
+        """Атомарная запись: сначала во временный файл, потом переименование."""
+        self.dir.mkdir(parents=True, exist_ok=True)
+        path = self.record_path(pr)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(record, ensure_ascii=False, indent=2, sort_keys=True),
+                       encoding="utf-8")
+        os.replace(tmp, path)
+
+    def _file_age(self, path: Path) -> float:
+        try:
+            return max(0.0, time.time() - path.stat().st_mtime)
+        except OSError:
+            return 0.0
+
+    # -- живость владельца и срок ----------------------------------------
+
+    def alive_state(self, pr: int) -> str:
+        """`alive` | `dead` | `unknown` — жив ли процесс, взявший бронь.
+
+        Проверка — попытка взять flock на файле жизни. Не удалось: файл держит
+        живой процесс. Удалось: владельца больше нет, и блокировку снял не он, а
+        ядро — так же, как оно сделало бы после `kill -9` или закрытого окна.
+        Файла нет или он не открывается: доказать нечего, решает срок.
+
+        Файл жизни не удаляется при освобождении. Удаление создавало бы окно, в
+        котором один процесс держит блокировку на уже удалённом файле, а второй
+        спокойно берёт её на новом, — то есть ту же гонку, что и лечим.
+        """
+        path = self.alive_path(pr)
+        if not path.exists():
+            return "unknown"
+        try:
+            handle = path.open("a+", encoding="utf-8")
+        except OSError:
+            return "unknown"
+        try:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                return "alive"
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            return "dead"
+        finally:
+            handle.close()
+
+    def expired(self, record: dict) -> bool:
+        """Истёк ли срок брони.
+
+        Отметку времени пишем мы сами, но прочитать её может не получиться:
+        файл правили руками, версия формата другая. Тогда считаем по времени
+        изменения файла — лишь бы не получить бронь без срока годности.
+        """
+        stamp = record.get("expires_at")
+        if stamp:
+            try:
+                return datetime.now(timezone.utc) >= datetime.fromisoformat(str(stamp))
+            except ValueError:
+                pass
+        ttl = record.get("ttl_seconds")
+        try:
+            ttl = int(ttl)
+        except (TypeError, ValueError):
+            ttl = self.ttl
+        return self._file_age(self.record_path(int(record.get("pr", 0) or 0))) > ttl
+
+    def _state(self, pr: int) -> tuple[bool, dict | None, str]:
+        """Занят ли PR. Вызывается ТОЛЬКО под `guard()`."""
+        record, problem = self.read(pr)
+        if problem:
+            return True, record, problem
+        if record is None:
+            return False, None, "брони нет"
+        if record.get("released_at"):
+            return False, record, "бронь освобождена {}".format(record["released_at"])
+        # Отсоединённая бронь файла жизни не держит по определению: процесс,
+        # который её взял, уже вышел. Для неё срок — единственный судья.
+        alive = "unknown" if record.get("detached") else self.alive_state(pr)
+        if alive == "alive":
+            return True, record, "процесс-владелец жив"
+        if alive == "dead":
+            return False, record, "процесс-владелец больше не работает"
+        if self.expired(record):
+            return False, record, "срок брони истёк"
+        return True, record, "бронь действует"
+
+    # -- публичные операции ----------------------------------------------
+
+    def inspect(self, pr: int) -> tuple[bool, dict | None, str]:
+        """Занят ли PR — без побочных действий. Любой сбой означает «занят»."""
+        try:
+            with self.guard():
+                return self._state(pr)
+        except ClaimBusy as exc:
+            return True, exc.record or None, exc.reason
+        except OSError as exc:
+            return True, None, "каталог броней недоступен: {}".format(exc)
+
+    def acquire(self, pr: int, sha: str = "", owner: str = "", kind: str = "manual",
+                ttl: int | None = None, detached: bool = False,
+                note: str = "") -> Claim:
+        """Взять бронь атомарно. Занято — `ClaimBusy`, и модель не зовётся.
+
+        Порядок внутри критической секции важен: сначала проверка занятости,
+        потом захват файла жизни, и только потом запись. Файл жизни берётся ДО
+        записи затем, что записать себя владельцем, не сумев доказать свою
+        живость, — значит оставить бронь, которую никто не сможет освободить.
+        """
+        seconds = int(ttl) if ttl else self.ttl
+        if seconds <= 0:
+            seconds = self.ttl
+        now = datetime.now(timezone.utc)
+        try:
+            return self._acquire_locked(pr, sha, owner, kind, seconds, detached, note, now)
+        except ClaimBusy as exc:
+            # Отказ самой общей блокировки приходит без номера PR: она одна на
+            # каталог. Подставляем номер здесь, иначе в журнале и в отказе
+            # человеку стояло бы «PR #0 занят», и искать он пошёл бы не то.
+            if exc.pr == 0:
+                raise ClaimBusy(pr, exc.record, exc.reason)
+            raise
+
+    def _acquire_locked(self, pr, sha, owner, kind, seconds, detached, note, now) -> Claim:
+        with self.guard():
+            busy, record, reason = self._state(pr)
+            if busy:
+                raise ClaimBusy(pr, record, reason)
+            handle = None
+            if not detached:
+                try:
+                    handle = self.alive_path(pr).open("a+", encoding="utf-8")
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError as exc:
+                    if handle is not None:
+                        handle.close()
+                    raise ClaimBusy(pr, record, "файл жизни брони занят: {}".format(exc))
+            new = {
+                "schema": CLAIM_SCHEMA,
+                "pr": int(pr),
+                "sha": str(sha or ""),
+                "owner": (owner or default_claim_owner(kind))[:120],
+                "kind": kind,
+                "detached": bool(detached),
+                "pid": os.getpid(),
+                "host": socket.gethostname(),
+                "token": uuid.uuid4().hex,
+                "acquired_at": now.isoformat(),
+                "expires_at": (now + timedelta(seconds=seconds)).isoformat(),
+                "ttl_seconds": seconds,
+                "released_at": None,
+                "note": str(note or "")[:200],
+            }
+            try:
+                self.write(pr, new)
+            except OSError as exc:
+                if handle is not None:
+                    try:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                    except OSError:
+                        pass
+                    handle.close()
+                raise ClaimBusy(pr, record, "бронь не записалась: {}".format(exc))
+            return Claim(self, new, handle)
+
+    def force_release(self, pr: int, reason: str = "снято вручную") -> tuple[bool, str]:
+        """Снять чужую бронь. Возвращает (сняли ли, пояснение).
+
+        Нужно ровно для одного случая: владелец брони завис или его процесс
+        нельзя остановить штатно. Сам процесс это НЕ останавливает — это надо
+        сделать до, иначе снятая бронь просто вернёт двух исполнителей.
+        """
+        try:
+            with self.guard():
+                record, problem = self.read(pr)
+                if problem:
+                    return False, problem
+                if not record:
+                    return False, "брони нет"
+                if record.get("released_at"):
+                    return False, "бронь уже освобождена"
+                record["released_at"] = datetime.now(timezone.utc).isoformat()
+                record["released_reason"] = reason[:200]
+                self.write(pr, record)
+                return True, describe_claim(record)
+        except (OSError, ClaimBusy) as exc:
+            return False, str(exc)
+
+    def entries(self) -> list[dict]:
+        """Все известные брони с посчитанным состоянием — для `claim list`."""
+        out: list[dict] = []
+        if not self.dir.is_dir():
+            return out
+        for path in sorted(self.dir.glob("pr-*.json")):
+            match = re.match(r"pr-(\d+)\.json$", path.name)
+            if not match:
+                continue
+            pr = int(match.group(1))
+            busy, record, reason = self.inspect(pr)
+            out.append({"pr": pr, "busy": busy, "record": record or {}, "reason": reason})
+        return out
 
 
 # --------------------------------------------------------------------------
@@ -1221,6 +1746,10 @@ class Bridge:
         self.noop_pattern = re.compile(cfg.get("NOOP_REVIEW_PATTERN"), re.IGNORECASE)
         self.max_attempts = cfg.get_int("MAX_ATTEMPTS", 3)
         self.coordination_issue = cfg.get_int("COORDINATION_ISSUE", 0)
+        # Брони. Каталог тот же, что у ручного обёрточного скрипта: обе стороны
+        # спрашивают его у одной функции, а не вычисляют каждая по-своему.
+        self.claims = Claims(claims_dir(cfg), cfg.get_int("CLAIM_TTL", 5400), log)
+        self.claim_owner = default_claim_owner("bridge")
         # Маркеры, уже лежащие в issue-канале. Читаются один раз за прогон и
         # только если действительно есть что зеркалить: лишний запрос к API
         # каждую минуту ради «ничего не случилось» не нужен.
@@ -1322,6 +1851,19 @@ class Bridge:
                 number, head_sha[:8], len(bundle.reviews), len(bundle.inline),
                 len(bundle.notes), len(portion.inline), portion.dropped))
 
+        # Занят ли PR кем-то ещё — до всякой работы и до всякой записи в
+        # состояние. Проверка стоит здесь, ПЕРЕД счётчиком попыток, потому что
+        # «занято» не является неудачной попыткой: чинить никто не пробовал.
+        # Потратить на чужую бронь попытку из трёх значило бы приблизить
+        # `NEEDS_HUMAN` там, где человек не нужен.
+        busy, holder, reason = self.claims.inspect(number)
+        if busy:
+            self.mark(entry, "CLAIMED")
+            self.state.save()
+            self.log.warn("PR #{} {}: пропускаю, {}".format(
+                number, head_sha[:8], describe_claim(holder, reason)))
+            return False
+
         prompt = build_prompt(pr, portion)
 
         if self.dry_run:
@@ -1331,9 +1873,24 @@ class Bridge:
             print("-" * 70)
             print(redact(prompt))
             print("-" * 70)
-            print("дальше было бы: тесты «{}», commit, push в {}, комментарий в PR".format(
-                self.cfg.get("TEST_CMD"), branch))
+            print("дальше было бы: бронь на PR #{}, тесты «{}», commit, push в {}, "
+                  "комментарий в PR".format(number, self.cfg.get("TEST_CMD"), branch))
             return True
+
+        # Бронь берётся атомарно и непосредственно перед работой. Проверка выше
+        # от гонки не спасает сама по себе: между «свободно» и «начали» помещается
+        # чужой запуск. Спасает то, что `acquire` — неделимая операция: занять
+        # один и тот же PR двум процессам она не даст.
+        try:
+            claim = self.claims.acquire(
+                number, head_sha, owner=self.claim_owner, kind="bridge",
+                note="правки по ревью Codex")
+        except ClaimBusy as exc:
+            self.mark(entry, "CLAIMED")
+            self.state.save()
+            self.log.warn("PR #{} {}: бронь не взята, пропускаю — {}".format(
+                number, head_sha[:8], describe_claim(exc.record, exc.reason)))
+            return False
 
         # Попытку засчитываем ДО работы, отпечаток порции — тоже: иначе падение
         # посередине оставило бы счётчик нетронутым, и цикл повторялся бы
@@ -1349,12 +1906,23 @@ class Bridge:
         self.state.save()
 
         try:
-            return self.run_fix(pr, portion, entry, prompt)
-        except Exception as exc:
-            if fingerprint in entry.get("processed", []):
-                entry["processed"].remove(fingerprint)
-            entry["processed_ids"] = [item for item in entry.get("processed_ids", [])
-                                      if item not in set(portion_ids)]
+            return self.run_fix(pr, portion, entry, prompt, claim)
+        except ClaimLost as exc:
+            # Бронь увели до вызова модели. Работы не было — значит, и попытки
+            # не было: счётчик возвращается назад, замечания возвращаются в
+            # очередь, а следующий цикл попробует снова, когда PR освободится.
+            self.rollback_portion(entry, fingerprint, portion_ids)
+            entry["attempts"] = max(0, int(entry.get("attempts", 1)) - 1)
+            self.mark(entry, "CLAIMED")
+            self.state.save()
+            self.log.warn("PR #{} {}: {}".format(number, head_sha[:8], redact(str(exc))[:300]))
+            try:
+                self.checkout.discard_all()
+            except Exception:
+                pass
+            return False
+        except Exception:
+            self.rollback_portion(entry, fingerprint, portion_ids)
             self.mark(entry, "ERROR")
             self.state.save()
             try:
@@ -1362,8 +1930,21 @@ class Bridge:
             except Exception:
                 pass
             raise
+        finally:
+            # Освобождение именно здесь: любой исход — успех, красные тесты,
+            # отклонённый push, исключение, — обязан вернуть PR в оборот.
+            # Иначе одна ошибка заперла бы ветку до истечения срока брони.
+            claim.release("цикл диспетчера завершён")
 
-    def run_fix(self, pr: dict, bundle: ReviewBundle, entry: dict, prompt: str) -> bool:
+    def rollback_portion(self, entry: dict, fingerprint: str, portion_ids: list) -> None:
+        """Вернуть порцию замечаний в очередь после неудачи."""
+        if fingerprint in entry.get("processed", []):
+            entry["processed"].remove(fingerprint)
+        entry["processed_ids"] = [item for item in entry.get("processed_ids", [])
+                                  if item not in set(portion_ids)]
+
+    def run_fix(self, pr: dict, bundle: ReviewBundle, entry: dict, prompt: str,
+                claim: "Claim | None" = None) -> bool:
         number = pr["number"]
         branch = pr["head"]["ref"]
         head_sha = bundle.sha
@@ -1375,6 +1956,15 @@ class Bridge:
         if actual != head_sha:
             raise RuntimeError("рабочая копия на {}, ожидался {} — правки не делаю".format(
                 actual[:8], head_sha[:8]))
+
+        # Последняя проверка перед самым дорогим шагом. Между взятием брони и
+        # этой строкой прошли клон, fetch и checkout — секунды или минуты, и за
+        # это время бронь могли снять руками. Проверка стоит именно здесь, а не
+        # выше, потому что защищает она не рабочую копию (она наша), а
+        # единственный ресурс, который нельзя делить, — саму модель и ветку.
+        if claim is not None and not claim.verify():
+            raise ClaimLost("бронь на PR #{} перестала быть нашей до вызова модели "
+                            "— claude не запускаю".format(number))
 
         ok, output = invoke_claude(self.tools, self.cfg, self.checkout.path, prompt, self.log)
         if not ok:
@@ -1759,6 +2349,15 @@ def cmd_status(args, cfg: Config) -> int:
             busy = lock is None
         print("  прогон сейчас     : {}".format("идёт" if busy else "нет"))
 
+    # Занятые Pull Request показываются в `status` намеренно: «диспетчер молчит»
+    # и «диспетчер уступил ручной сессии» выглядят в журнале одинаково тихо, а
+    # означают разное. Не увидев здесь брони, владелец пошёл бы искать поломку.
+    claims = make_claims(cfg)
+    active = [item for item in claims.entries() if item["busy"]]
+    print("  занятые PR        : {}".format(
+        ", ".join("#{} ({})".format(item["pr"], item["record"].get("owner") or "владелец неизвестен")
+                  for item in active) if active else "нет"))
+
     if not state.data.get("prs"):
         print("\nЗапомненных PR нет.")
     else:
@@ -1853,6 +2452,25 @@ def cmd_health(args, cfg: Config) -> int:
           "{} ({})".format(checkout, "готова" if (checkout / ".git").exists()
                            else "будет склонирована при первом цикле"))
 
+    # Каталог броней — это защита от двух исполнителей на одной ветке. Если в
+    # него нельзя писать, диспетчер не сможет доказать, что PR свободен, и
+    # честно не будет звать модель ВООБЩЕ. Автоматика в таком состоянии выглядит
+    # живой и не делает ничего, поэтому здесь полноценная проверка, а не строка
+    # справки: пусть падает установка, а не каждая правка молча.
+    claims = make_claims(cfg)
+    try:
+        with claims.guard():
+            pass
+        check("каталог броней", True, "{} (срок брони {} с)".format(
+            claims.dir, cfg.get_int("CLAIM_TTL", 5400)))
+    except (ClaimBusy, OSError) as exc:
+        check("каталог броней", False, "{}: {}".format(claims.dir, redact(str(exc))[:160]))
+    active = [item for item in claims.entries() if item["busy"]]
+    lines.append("  [--] {:<22} {}".format(
+        "занятые PR",
+        "; ".join("#{} — {}".format(item["pr"], describe_claim(item["record"], item["reason"]))
+                  for item in active) if active else "нет: все Pull Request свободны"))
+
     # Интерпретатор для тестов проверяем отдельно: если в нём нет зависимостей
     # проекта, набор упадёт на импорте, и это выглядит как «правка сломала
     # тесты» — самая дорогая в разборе ложная тревога из возможных. Поэтому
@@ -1934,6 +2552,197 @@ def cmd_logs(args, cfg: Config) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------
+# Команда `claim`: та же бронь, но для рук
+# --------------------------------------------------------------------------
+#
+# Зачем отдельная команда, если бронь и так берёт диспетчер. Затем, что вторым
+# исполнителем становится не диспетчер, а человек: ручная сессия `claude`,
+# запущенная из другого чата, ничего не знает ни про фон, ни про его состояние.
+# Пока способ взять бронь есть только внутри диспетчера, правило «один
+# исполнитель» держится на памяти того, кто читал инструкцию. `claim run`
+# делает его исполняемым: `claude` запускается КАК ДОЧЕРНИЙ процесс уже взятой
+# брони, и другого способа его запустить для правки кода в проекте нет.
+
+def make_claims(cfg: Config) -> Claims:
+    return Claims(claims_dir(cfg), cfg.get_int("CLAIM_TTL", 5400))
+
+
+def resolve_command(cfg: Config, command: list[str]) -> list[str]:
+    """Найти исполняемый файл команды теми же правилами, что и всё остальное.
+
+    Без этого обёртка зависела бы от PATH той оболочки, из которой её позвали, —
+    а он у launchd, у терминала владельца и у чужого чата разный.
+    """
+    head = command[0]
+    if "/" in head:
+        resolved = Path(head).expanduser()
+        if not (resolved.is_file() and os.access(resolved, os.X_OK)):
+            raise RuntimeError("не найден исполняемый файл: {}".format(head))
+        return [str(resolved)] + list(command[1:])
+    configured = cfg.get("CLAUDE_BIN") if head == "claude" else ""
+    found = find_binary(head, configured)
+    if not found:
+        raise RuntimeError("не найден исполняемый файл: {}".format(head))
+    return [found] + list(command[1:])
+
+
+def run_under_claim(argv: list[str], claim: Claim) -> int:
+    """Выполнить команду, пока бронь наша, с наследованием терминала.
+
+    Вывод не перехватывается: `claude` бывает интерактивным, и подменять ему
+    терминал буфером — значит сломать ровно тот сценарий, ради которого обёртка
+    и написана. Сигналы передаются ребёнку, чтобы Ctrl-C останавливал модель, а
+    не оставлял её сиротой при уже снятой брони.
+    """
+    child_env = dict(os.environ)
+    child_env["OBOROT_CLAIM_PR"] = str(claim.pr)
+    child_env["OBOROT_CLAIM_TOKEN"] = claim.token
+    process = subprocess.Popen(argv, env=child_env)
+
+    def forward(signum, frame):
+        try:
+            process.send_signal(signum)
+        except Exception:
+            pass
+
+    previous = {}
+    for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        try:
+            previous[number] = signal.signal(number, forward)
+        except (ValueError, OSError):
+            pass
+    try:
+        return process.wait()
+    finally:
+        for number, handler in previous.items():
+            try:
+                signal.signal(number, handler)
+            except (ValueError, OSError):
+                pass
+
+
+def claim_busy_advice(pr: int, record: dict | None = None) -> str:
+    """Что делать человеку после отказа. Совет зависит от того, чей отказ.
+
+    Отказ бывает двух разных природ, и путать их дорого: «занял кто-то живой» —
+    это подождать, а «механизм брони сломан» — это чинить машину, и ждать тут
+    бессмысленно. Один общий совет на оба случая отправлял бы половину читателей
+    не туда.
+    """
+    if not record:
+        return ("Владелец не назван — значит, отказал сам механизм брони, а не человек.\n"
+                "Проверить: tools/agent-bridge/run.sh health (строка «каталог броней»)\n"
+                "Пока это не починено, модель не зовётся вообще — так задумано.")
+    return ("Что делать: дождаться, пока владелец закончит, или посмотреть, кто это,\n"
+            "  tools/agent-bridge/run.sh claim list\n"
+            "Если владелец завис — сначала остановить его процесс, потом:\n"
+            "  tools/agent-bridge/run.sh claim release --pr {} --force".format(pr))
+
+
+def cmd_claim_run(args, cfg: Config) -> int:
+    command = [part for part in (args.command or [])]
+    if command and command[0] == "--":
+        command = command[1:]
+    if not command:
+        print("Нечего запускать. Пример: claim run --pr 8 -- claude", file=sys.stderr)
+        return 2
+    try:
+        argv = resolve_command(cfg, command)
+    except RuntimeError as exc:
+        print("Отказ: {}".format(exc), file=sys.stderr)
+        return 1
+
+    claims = make_claims(cfg)
+    owner = args.owner or default_claim_owner(args.kind)
+    try:
+        claim = claims.acquire(args.pr, args.sha, owner=owner, kind=args.kind,
+                               ttl=args.ttl, note=args.note)
+    except ClaimBusy as exc:
+        print("Отказ: {}".format(redact(str(exc))), file=sys.stderr)
+        print(claim_busy_advice(args.pr, exc.record), file=sys.stderr)
+        return CLAIM_BUSY_EXIT
+
+    # Сообщения обёртки идут в stderr: stdout принадлежит запущенной команде, и
+    # подмешивать в него своё — значит испортить вывод тому, кто его читает.
+    print("Бронь на PR #{} взята ({}). Освобожу, когда команда завершится.".format(
+        args.pr, owner), file=sys.stderr)
+    try:
+        if not claim.verify():
+            print("Отказ: бронь не подтвердилась сразу после взятия — команду не запускаю.",
+                  file=sys.stderr)
+            return CLAIM_BUSY_EXIT
+        return run_under_claim(argv, claim)
+    finally:
+        claim.release("команда завершилась")
+        print("Бронь на PR #{} освобождена.".format(args.pr), file=sys.stderr)
+
+
+def cmd_claim_acquire(args, cfg: Config) -> int:
+    """Отсоединённая бронь: взял, вышел, PR занят до срока или до release.
+
+    Нужна тому, кто правит не одной командой: например, чат, который сначала
+    думает, потом читает, потом зовёт модель несколько раз. У такой брони нет
+    процесса-владельца, поэтому судья у неё один — срок. Держать её дольше
+    необходимого нельзя: пока она висит, фон к этому PR не подойдёт.
+    """
+    claims = make_claims(cfg)
+    owner = args.owner or default_claim_owner(args.kind)
+    try:
+        claim = claims.acquire(args.pr, args.sha, owner=owner, kind=args.kind,
+                               ttl=args.ttl, detached=True, note=args.note)
+    except ClaimBusy as exc:
+        print("Отказ: {}".format(redact(str(exc))), file=sys.stderr)
+        print(claim_busy_advice(args.pr, exc.record), file=sys.stderr)
+        return CLAIM_BUSY_EXIT
+    print("Бронь на PR #{} взята до {}.".format(args.pr, claim.record["expires_at"]))
+    print("Освободить: run.sh claim release --pr {}".format(args.pr))
+    return 0
+
+
+def cmd_claim_release(args, cfg: Config) -> int:
+    claims = make_claims(cfg)
+    busy, record, reason = claims.inspect(args.pr)
+    if not busy:
+        print("PR #{} и так свободен: {}".format(args.pr, reason))
+        return 0
+    record = record or {}
+    if not args.force and not record.get("detached") and claims.alive_state(args.pr) == "alive":
+        print("Отказ: бронь держит живой процесс — {}".format(describe_claim(record)),
+              file=sys.stderr)
+        print("Снятие брони его не останавливает. Сначала остановите процесс, потом\n"
+              "  run.sh claim release --pr {} --force".format(args.pr), file=sys.stderr)
+        return 1
+    ok, detail = claims.force_release(args.pr, args.reason or "снято командой claim release")
+    if not ok:
+        print("Отказ: {}".format(detail), file=sys.stderr)
+        return 1
+    print("Бронь на PR #{} снята ({}).".format(args.pr, detail))
+    return 0
+
+
+def cmd_claim_list(args, cfg: Config) -> int:
+    claims = make_claims(cfg)
+    entries = claims.entries()
+    print("Каталог броней: {}".format(claims.dir))
+    if not entries:
+        print("Броней нет: ни один Pull Request не занят.")
+        return 0
+    for item in entries:
+        print("  PR #{:<5} {:<9} {}".format(
+            item["pr"], "ЗАНЯТ" if item["busy"] else "свободен",
+            describe_claim(item["record"], item["reason"])))
+    return 0
+
+
+def cmd_claim_check(args, cfg: Config) -> int:
+    """Занят ли PR. Код 0 — свободен, 75 — занят. Для скриптов."""
+    busy, record, reason = make_claims(cfg).inspect(args.pr)
+    print("PR #{}: {} — {}".format(
+        args.pr, "занят" if busy else "свободен", describe_claim(record, reason)))
+    return CLAIM_BUSY_EXIT if busy else 0
+
+
 def resolved_settings(cfg: Config) -> dict:
     """Значения, которые вычисляет диспетчер, — в машиночитаемом виде.
 
@@ -1961,6 +2770,10 @@ def resolved_settings(cfg: Config) -> dict:
         # обнаруживается только по счёту за не ту модель.
         "claude-model": cfg.get("CLAUDE_MODEL").strip(),
         "claude-fallback-model": cfg.get("CLAUDE_FALLBACK_MODEL").strip(),
+        # Каталог броней обязан быть одним у фона и у ручной обёртки: разные
+        # каталоги — это две независимые очереди, то есть отсутствие защиты.
+        "claims-dir": str(claims_dir(cfg)),
+        "claim-ttl": str(cfg.get_int("CLAIM_TTL", 5400)),
     }
 
 
@@ -2010,9 +2823,50 @@ def main(argv: list[str] | None = None) -> int:
     resolve.add_argument("key", nargs="?", default="",
                          help="state-dir | config-file | config-home | env-only-keys | "
                               "checkout | test-cmd | test-python | test-python-source | "
-                              "venv-python | claude-model | claude-fallback-model; "
-                              "без ключа — всё сразу")
+                              "venv-python | claude-model | claude-fallback-model | "
+                              "claims-dir | claim-ttl; без ключа — всё сразу")
     resolve.set_defaults(func=cmd_resolve)
+
+    claim = sub.add_parser(
+        "claim", help="бронь на Pull Request: один исполнитель на PR, а не два")
+    claim_sub = claim.add_subparsers(dest="claim_command", required=True)
+
+    def add_common(parser):
+        parser.add_argument("--pr", type=int, required=True, help="номер Pull Request")
+        parser.add_argument("--sha", default="", help="полный SHA, над которым работаем")
+        parser.add_argument("--ttl", type=int, default=0,
+                            help="срок брони, секунды; 0 — из настроек")
+        parser.add_argument("--owner", default="",
+                            help="кто берёт бронь; по умолчанию роль:пользователь@машина")
+        parser.add_argument("--kind", default="manual", choices=("manual", "bridge"),
+                            help="ручная сессия или фон")
+        parser.add_argument("--note", default="", help="что именно делается")
+        return parser
+
+    claim_run = add_common(claim_sub.add_parser(
+        "run", help="взять бронь и выполнить команду (обычно claude), потом освободить"))
+    claim_run.add_argument("command", nargs=argparse.REMAINDER,
+                           help="команда после --, например: -- claude")
+    claim_run.set_defaults(func=cmd_claim_run)
+
+    claim_acquire = add_common(claim_sub.add_parser(
+        "acquire", help="взять бронь и выйти (освобождать придётся вручную)"))
+    claim_acquire.set_defaults(func=cmd_claim_acquire)
+
+    claim_release = claim_sub.add_parser("release", help="снять бронь с Pull Request")
+    claim_release.add_argument("--pr", type=int, required=True)
+    claim_release.add_argument("--force", action="store_true",
+                               help="снять, даже если процесс-владелец жив")
+    claim_release.add_argument("--reason", default="")
+    claim_release.set_defaults(func=cmd_claim_release)
+
+    claim_list = claim_sub.add_parser("list", help="какие Pull Request заняты сейчас")
+    claim_list.set_defaults(func=cmd_claim_list)
+
+    claim_check = claim_sub.add_parser(
+        "check", help="занят ли PR; код 0 — свободен, 75 — занят")
+    claim_check.add_argument("--pr", type=int, required=True)
+    claim_check.set_defaults(func=cmd_claim_check)
 
     args = parser.parse_args(argv)
     cfg = Config({"REPO": args.repo, "STATE_DIR": args.state_dir})

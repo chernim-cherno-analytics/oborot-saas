@@ -76,7 +76,7 @@ looks_like_bridge_dir() {
         return 0
     fi
     local marker
-    for marker in state.json bridge.log lock config.env checkout venv; do
+    for marker in state.json bridge.log lock config.env checkout venv claims; do
         if [ -e "$dir/$marker" ]; then
             return 0
         fi
@@ -135,7 +135,7 @@ purge_target() {
     if ! looks_like_bridge_dir "$dir"; then
         refuse "$dir" "ничем не подтверждается, что это каталог agent-bridge:
            ни имя oborot-agent-bridge, ни файлы диспетчера (state.json,
-           bridge.log, config.env, checkout, venv)"
+           bridge.log, config.env, checkout, venv, claims)"
         return 1
     fi
     printf '%s\n' "$dir"

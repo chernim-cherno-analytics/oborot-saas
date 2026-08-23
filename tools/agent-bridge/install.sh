@@ -51,7 +51,8 @@ if ! [[ "$INTERVAL" =~ ^[0-9]+$ ]] || [ "$INTERVAL" -lt 30 ]; then
     exit 1
 fi
 
-chmod +x "$SCRIPT_DIR/run.sh" "$SCRIPT_DIR/bridge.py" "$SCRIPT_DIR/uninstall.sh" 2>/dev/null || true
+chmod +x "$SCRIPT_DIR/run.sh" "$SCRIPT_DIR/bridge.py" "$SCRIPT_DIR/uninstall.sh" \
+        "$SCRIPT_DIR/claude-claim.sh" 2>/dev/null || true
 
 # Файл настроек кладём до того, как что-то вычислять: он может задать и каталог
 # состояния, и интерпретатор тестов, и всё дальнейшее должно считаться уже с
@@ -74,6 +75,7 @@ TEST_PYTHON_SOURCE="$("$SCRIPT_DIR/run.sh" resolve test-python-source)"
 VENV_PYTHON="$("$SCRIPT_DIR/run.sh" resolve venv-python)"
 CLAUDE_MODEL="$("$SCRIPT_DIR/run.sh" resolve claude-model)"
 CLAUDE_FALLBACK_MODEL="$("$SCRIPT_DIR/run.sh" resolve claude-fallback-model)"
+CLAIMS_DIR="$("$SCRIPT_DIR/run.sh" resolve claims-dir)"
 
 # Настройки, которых фоновая задача не увидит. launchd не наследует оболочку:
 # фону достаётся ровно то, что перечислено в plist. Каталог состояния и каталог
@@ -260,8 +262,11 @@ echo "  настройки      : $CONFIG_FILE (каталог передан ф
 echo "  модель         : ${CLAUDE_MODEL:-как выбрано в Claude Code}, резервная ${CLAUDE_FALLBACK_MODEL:-нет}"
 echo "  тесты          : ${TEST_CMD:-отключены}"
 echo "  интерпретатор  : ${TEST_PYTHON:-не нужен} ${TEST_PYTHON_SOURCE:+($TEST_PYTHON_SOURCE)}"
+echo "  брони          : $CLAIMS_DIR (один PR — один исполнитель)"
 echo
 echo "Дальше:"
 echo "  $SCRIPT_DIR/run.sh status --remote   что видно на GitHub"
 echo "  $SCRIPT_DIR/run.sh logs -n 100       хвост журнала"
+echo "  $SCRIPT_DIR/run.sh claim list        какие Pull Request заняты"
+echo "  $SCRIPT_DIR/claude-claim.sh --pr N   позвать claude руками (только так)"
 echo "  $SCRIPT_DIR/uninstall.sh             снять автоматику"

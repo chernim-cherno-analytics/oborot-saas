@@ -40,7 +40,12 @@
      возврата ненулевой, `status` называет номер PR и причину;
  15) `uninstall.sh --purge` удаляет только доказанный каталог диспетчера и
      отказывается от `/`, домашнего каталога, его предков и любых широких
-     путей (в опасных случаях настоящее `rm` подменяется заглушкой).
+     путей (в опасных случаях настоящее `rm` подменяется заглушкой);
+ 16) бронь на Pull Request: активная ручная бронь останавливает диспетчер до
+     вызова модели и без траты попытки, протухшая и освобождённая не держат
+     никого, два настоящих процесса не входят в один PR одновременно, бронь
+     снимается после успеха, после ошибки и после убийства процесса, а сбой
+     самого механизма означает «занято», а не «можно работать».
 
 Запуск из корня репозитория:  python tests/test_agent_bridge.py
 """
@@ -56,6 +61,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -63,6 +69,7 @@ BRIDGE_PY = ROOT / "tools" / "agent-bridge" / "bridge.py"
 INSTALL_SH = ROOT / "tools" / "agent-bridge" / "install.sh"
 UNINSTALL_SH = ROOT / "tools" / "agent-bridge" / "uninstall.sh"
 RUN_SH = ROOT / "tools" / "agent-bridge" / "run.sh"
+CLAUDE_CLAIM_SH = ROOT / "tools" / "agent-bridge" / "claude-claim.sh"
 CI_YML = ROOT / ".github" / "workflows" / "ci.yml"
 WATCHDOG_YML = ROOT / ".github" / "workflows" / "agent-watchdog.yml"
 
@@ -179,6 +186,11 @@ def make_bridge(cfg_values, gh, state_path, dry_run=False):
     cfg = bridge.Config.__new__(bridge.Config)
     cfg.values = dict(bridge.CONFIG_KEYS)
     cfg.values.update(cfg_values)
+    # Каталог броней у теста всегда свой, рядом с временным состоянием. Взять
+    # умолчание значило бы читать и занимать НАСТОЯЩИЕ брони на машине
+    # владельца: тест ходил бы туда, где в этот момент работает человек.
+    if not cfg.values.get("CLAIM_DIR"):
+        cfg.values["CLAIM_DIR"] = str(Path(state_path).parent / "claims")
     instance = bridge.Bridge.__new__(bridge.Bridge)
     instance.cfg = cfg
     instance.tools = None
@@ -191,6 +203,8 @@ def make_bridge(cfg_values, gh, state_path, dry_run=False):
     instance.noop_pattern = re.compile(cfg.get("NOOP_REVIEW_PATTERN"), re.IGNORECASE)
     instance.max_attempts = cfg.get_int("MAX_ATTEMPTS", 3)
     instance.coordination_issue = cfg.get_int("COORDINATION_ISSUE", 0)
+    instance.claims = bridge.Claims(bridge.claims_dir(cfg), cfg.get_int("CLAIM_TTL", 5400))
+    instance.claim_owner = "bridge:тест"
     instance._mirror_seen = None
     return instance
 
@@ -335,7 +349,7 @@ def test_dropped_comments_return_next_cycle():
                                    gh, state_path)
             delivered = []
 
-            def fake_run_fix(pr_, bundle_, entry_, prompt_):
+            def fake_run_fix(pr_, bundle_, entry_, prompt_, claim_=None):
                 delivered.extend(comment["id"] for comment in bundle_.inline)
                 return True
 
@@ -1819,6 +1833,458 @@ def test_purge_removes_only_proven_bridge_dirs():
               (named.stdout + named.stderr)[-250:])
 
 
+# --------------------------------------------------------------------------
+# 16. Бронь на Pull Request: два исполнителя не сходятся на одной ветке
+# --------------------------------------------------------------------------
+#
+# Разбираемый дефект, настоящий. 23.08.2026 живой тест показал гонку: фоновая
+# задача увидела замечания Codex к PR #8 и запустила `claude`, хотя тот же PR в
+# этот момент правила ручная сессия из другого чата. Дубль остановили до push —
+# руками, потому что за экраном сидел человек. Правило «одна бронь на PR» в
+# AGENTS.md было, но жило текстом: диспетчер его не проверял.
+#
+# Ниже проверяется то, чем это закрыто, и проверяется исполнением, а не чтением
+# кода: активная ручная бронь останавливает диспетчер ДО модели и БЕЗ траты
+# попытки; протухшая и освобождённая брони никого не держат; два настоящих
+# процесса не входят в один PR одновременно; бронь освобождается после успеха,
+# после ошибки и после убийства процесса; сбой самого механизма означает
+# «занято», а не «можно работать».
+#
+# Проверка идёт двумя способами намеренно. Логику занятости дешевле и точнее
+# проверять в одном процессе, но главное свойство — атомарность — в одном
+# процессе не проверяется вообще: там нет второго процесса, которому можно
+# проиграть гонку. Поэтому конкурентность проверяется настоящими subprocess.
+
+def claims_at(tmp: Path, ttl: int = 5400) -> "bridge.Claims":
+    return bridge.Claims(Path(tmp) / "claims", ttl)
+
+
+def claimed_pr(number: int, sha: str) -> dict:
+    return {"number": number, "head": {"ref": f"claude/x{number}", "sha": sha}}
+
+
+def bridge_for_claim(tmp: Path, gh, sha: str, claims_dir: Path):
+    """Диспетчер, у которого всё готово к работе, кроме разрешения работать."""
+    instance = make_bridge({"REPO": "owner/name", "COORDINATION_ISSUE": "0",
+                            "CLAIM_DIR": str(claims_dir)},
+                           gh, Path(tmp) / "state.json")
+    instance.checkout = StubCheckout(sha, "9" * 40)
+    instance.run_tests = lambda: (True, "", "python3 tests/run_all.py --jobs 3")
+    return instance
+
+
+def claim_cli(root: Path, home: Path, *args, timeout: int = 120):
+    """Запуск `bridge.py claim ...` настоящим процессом."""
+    return subprocess.run([sys.executable, str(BRIDGE_PY), "--state-dir", str(root),
+                           "claim", *args],
+                          capture_output=True, text=True, timeout=timeout,
+                          env=bridge_env(home))
+
+
+def test_manual_claim_blocks_bridge():
+    print("\n== Ручная бронь останавливает диспетчер до вызова модели ==")
+    sha = "a1" * 20
+    pr = claimed_pr(7, sha)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        claims = claims_at(root)
+        gh = StubGitHub(reviews=[review(1, sha)], inline=[inline_comment(10, sha)])
+
+        # Ручная сессия заняла PR — ровно то, что делает обёртка claude-claim.sh.
+        manual = claims.acquire(7, sha, owner="manual:vlad@mac", kind="manual",
+                                note="правлю замечания Codex")
+
+        called = []
+        original = bridge.invoke_claude
+        bridge.invoke_claude = lambda *a, **k: called.append(a) or (True, "")
+        try:
+            instance = bridge_for_claim(root, gh, sha, claims.dir)
+            handled = instance.handle_pr(pr)
+            entry = instance.state.head(7, sha)
+
+            check("диспетчер за работу не взялся", handled is False)
+            check("модель не вызывалась ни разу", called == [], str(called))
+            check("попытка не потрачена", entry.get("attempts", 0) == 0, str(entry))
+            check("замечания остались в очереди",
+                  not entry.get("processed") and not entry.get("processed_ids"), str(entry))
+            check("состояние названо словом, а не тишиной",
+                  entry.get("status") == "CLAIMED", str(entry.get("status")))
+            check("в PR ничего не написано", gh.posted == [], str(gh.posted))
+            check("в журнале сказано, кто занял",
+                  any("manual:vlad@mac" in message for _, message in instance.log.lines),
+                  str(instance.log.lines[-2:]))
+
+            # Ручная сессия закончилась — фон обязан подхватить тот же PR.
+            manual.release("сессия закончилась")
+            after = bridge_for_claim(root, gh, sha, claims.dir)
+            after.run_fix = lambda *a, **k: True
+            check("после освобождения диспетчер берётся за работу",
+                  after.handle_pr(pr) is True)
+            check("и попытка теперь честно потрачена",
+                  after.state.head(7, sha).get("attempts") == 1)
+        finally:
+            bridge.invoke_claude = original
+            manual.release()
+
+
+def test_stale_claims_do_not_block_forever():
+    print("\n== Протухшая, освобождённая и битая бронь никого не держат ==")
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        claims = claims_at(root, ttl=60)
+
+        # Отсоединённая бронь с истёкшим сроком: процесса-владельца нет,
+        # доказать живость нечем — решает срок, иначе PR заперт навсегда.
+        stale = claims.acquire(7, "b" * 40, owner="codex-chat", detached=True, ttl=60)
+        record = dict(stale.record)
+        record["expires_at"] = (bridge.datetime.now(bridge.timezone.utc)
+                                - bridge.timedelta(seconds=1)).isoformat()
+        claims.write(7, record)
+        busy, _, reason = claims.inspect(7)
+        check("протухшая бронь не блокирует", busy is False, reason)
+
+        # Освобождённая бронь: запись остаётся ради истории, но никого не держит.
+        live = claims.acquire(8, "c" * 40, owner="manual:кто-то")
+        check("взятая бронь занимает PR", claims.inspect(8)[0] is True)
+        live.release("готово")
+        check("освобождённая бронь не блокирует", claims.inspect(8)[0] is False,
+              claims.inspect(8)[2])
+        check("запись про освобождение сохранилась",
+              (claims.read(8)[0] or {}).get("released_at"), str(claims.read(8)[0]))
+
+        # Повреждённая запись: пока свежая — «занято» (мы не знаем, чья она),
+        # но старше срока — мусор, иначе один битый файл останавливает
+        # автоматику до прихода человека.
+        claims.record_path(9).write_text("{это не JSON", encoding="utf-8")
+        check("свежая битая запись считается занятой", claims.inspect(9)[0] is True,
+              claims.inspect(9)[2])
+        old = time.time() - 3600
+        os.utime(claims.record_path(9), (old, old))
+        check("битая запись старше срока не блокирует", claims.inspect(9)[0] is False,
+              claims.inspect(9)[2])
+
+
+def test_claim_is_bound_to_pr_and_sha():
+    print("\n== Бронь знает свой PR и свой SHA ==")
+    sha = "d" * 40
+    with tempfile.TemporaryDirectory() as tmp:
+        claims = claims_at(Path(tmp))
+        claim = claims.acquire(8, sha, owner="manual:vlad@mac", kind="manual",
+                               note="PR #8, замечания Codex")
+
+        record = claims.read(8)[0] or {}
+        required = ("schema", "pr", "sha", "owner", "kind", "pid", "host", "token",
+                    "acquired_at", "expires_at", "ttl_seconds", "released_at")
+        missing = [field for field in required if field not in record]
+        check("запись машиночитаемая и полная", not missing, ", ".join(missing))
+        check("в записи ровно наш PR и наш SHA",
+              record.get("pr") == 8 and record.get("sha") == sha, str(record.get("sha")))
+        check("владелец сессии назван", record.get("owner") == "manual:vlad@mac")
+        check("срок посчитан от времени взятия",
+              record.get("ttl_seconds") == 5400 and record.get("expires_at") > record.get("acquired_at"))
+
+        # Бронь на один PR не должна мешать работать над соседним: иначе
+        # защита от гонки превратилась бы в остановку всей автоматики.
+        check("соседний PR остаётся свободным", claims.inspect(7)[0] is False,
+              claims.inspect(7)[2])
+        check("свой PR занят", claims.inspect(8)[0] is True)
+        check("своя бронь подтверждается", claim.verify() is True)
+
+        # Запись подменили: тот же PR, но другой SHA и другой токен — значит,
+        # бронь уже не наша, чем бы она ни выглядела.
+        stolen = dict(record, sha="e" * 40, token="0" * 32, owner="кто-то другой")
+        claims.write(8, stolen)
+        check("подменённая запись своей не признаётся", claim.verify() is False)
+
+        claims.write(8, dict(record, released_at="2026-08-23T00:00:00+00:00"))
+        check("освобождённая запись своей не признаётся", claim.verify() is False)
+
+        claims.write(8, record)
+        check("возвращённая запись снова наша", claim.verify() is True)
+        claim.release()
+
+
+def test_bridge_checks_claim_again_before_model():
+    print("\n== Перед самой моделью бронь перепроверяется ==")
+    sha = "f0" * 20
+    pr = claimed_pr(7, sha)
+
+    class ThievingCheckout(StubCheckout):
+        """Пока диспетчер готовит копию, бронь уводят у него из-под рук."""
+
+        def __init__(self, claims, *args):
+            super().__init__(*args)
+            self.claims = claims
+
+        def sync_to(self, branch, target):
+            super().sync_to(branch, target)
+            self.claims.force_release(7, "снято вручную посреди работы")
+            self.claims.acquire(7, target, owner="manual:другой чат", detached=True)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        claims = claims_at(root)
+        gh = StubGitHub(reviews=[review(1, sha)], inline=[inline_comment(10, sha)])
+
+        called = []
+        original = bridge.invoke_claude
+        bridge.invoke_claude = lambda *a, **k: called.append(a) or (True, "")
+        try:
+            instance = bridge_for_claim(root, gh, sha, claims.dir)
+            instance.checkout = ThievingCheckout(claims, sha, "9" * 40)
+            handled = instance.handle_pr(pr)
+            entry = instance.state.head(7, sha)
+        finally:
+            bridge.invoke_claude = original
+
+        check("модель не вызвана: бронь уже не наша", called == [], str(called))
+        check("работа не засчитана", handled is False)
+        check("попытка возвращена — чинить никто не пробовал",
+              entry.get("attempts", 0) == 0, str(entry.get("attempts")))
+        check("замечания вернулись в очередь",
+              not entry.get("processed_ids"), str(entry.get("processed_ids")))
+        check("состояние названо бронью, а не ошибкой",
+              entry.get("status") == "CLAIMED", str(entry.get("status")))
+        check("в PR ничего не написано", gh.posted == [], str(gh.posted))
+
+
+def test_claim_failure_is_fail_closed():
+    print("\n== Сломанный механизм брони означает «занято», а не «можно» ==")
+    sha = "aa" * 20
+    pr = claimed_pr(7, sha)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        # На месте каталога броней — файл. Каталог не создастся, доказать, что
+        # PR свободен, нечем. Работать в таком состоянии нельзя: именно так
+        # выглядит сломанный диск или чужие права на каталоге.
+        broken = root / "claims"
+        broken.write_text("это файл, а не каталог", encoding="utf-8")
+
+        busy, _, reason = bridge.Claims(broken).inspect(7)
+        check("недоступный каталог броней считается занятостью", busy is True, reason)
+        check("причина названа словами", "каталог броней" in reason, reason)
+
+        gh = StubGitHub(reviews=[review(1, sha)], inline=[inline_comment(10, sha)])
+        called = []
+        original = bridge.invoke_claude
+        bridge.invoke_claude = lambda *a, **k: called.append(a) or (True, "")
+        try:
+            instance = bridge_for_claim(root, gh, sha, broken)
+            handled = instance.handle_pr(pr)
+            entry = instance.state.head(7, sha)
+        finally:
+            bridge.invoke_claude = original
+
+        check("модель не вызвана", called == [] and handled is False)
+        check("попытка не потрачена", entry.get("attempts", 0) == 0, str(entry))
+        check("состояние не испорчено: замечания на месте",
+              not entry.get("processed") and not entry.get("processed_ids"), str(entry))
+
+
+# --- то же самое, но настоящими процессами -------------------------------
+#
+# Атомарность в одном процессе не проверяется: там некому проиграть гонку.
+
+CLAIM_CHILD = textwrap.dedent("""
+    import os, sys, time
+    path, hold = sys.argv[1], float(sys.argv[2])
+    with open(path, 'a') as handle:
+        handle.write('start %d\\n' % os.getpid())
+        handle.flush()
+        time.sleep(hold)
+        handle.write('end %d\\n' % os.getpid())
+""").strip()
+
+
+def overlapped(marks_path: Path) -> bool:
+    """Пересекались ли исполнители во времени."""
+    depth = 0
+    for line in marks_path.read_text(encoding="utf-8").splitlines():
+        if line.startswith("start"):
+            depth += 1
+            if depth > 1:
+                return True
+        elif line.startswith("end"):
+            depth -= 1
+    return False
+
+
+def test_two_processes_never_share_one_pr():
+    print("\n== Два процесса не входят в один Pull Request одновременно ==")
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "state"
+        home = Path(tmp) / "home"
+        home.mkdir()
+        marks = Path(tmp) / "marks.txt"
+        marks.write_text("", encoding="utf-8")
+        script = Path(tmp) / "child.py"
+        script.write_text(CLAIM_CHILD, encoding="utf-8")
+
+        started = [
+            subprocess.Popen(
+                [sys.executable, str(BRIDGE_PY), "--state-dir", str(root),
+                 "claim", "run", "--pr", "8", "--sha", "b" * 40,
+                 "--owner", f"сессия-{index}", "--",
+                 sys.executable, str(script), str(marks), "1.0"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                env=bridge_env(home))
+            for index in range(6)
+        ]
+        results = []
+        for process in started:
+            _, errors = process.communicate(timeout=180)
+            results.append((process.returncode, errors))
+        codes = [code for code, _ in results]
+
+        winners = [code for code in codes if code == 0]
+        busy = [(code, errors) for code, errors in results
+                if code == bridge.CLAIM_BUSY_EXIT]
+
+        check("все шесть процессов завершились понятным кодом",
+              len(winners) + len(busy) == 6, str(codes))
+        check("кто-то работу выполнил", len(winners) >= 1, str(codes))
+        check("остальным честно сказано «занято»", len(busy) >= 1, str(codes))
+        check("исполнители не пересекались во времени", not overlapped(marks),
+              marks.read_text(encoding="utf-8"))
+        check("отказ объяснён человеку и назван владелец",
+              all("Отказ" in errors and "владелец" in errors for _, errors in busy),
+              busy[0][1][-200:] if busy else "")
+
+        # После всего PR обязан быть свободен: иначе одна гонка заперла бы
+        # ветку до истечения срока брони.
+        check("после гонки PR снова свободен",
+              claim_cli(root, home, "check", "--pr", "8").returncode == 0)
+
+
+def test_claim_released_after_success_error_and_kill():
+    print("\n== Бронь освобождается после успеха, ошибки и убийства процесса ==")
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "state"
+        home = Path(tmp) / "home"
+        home.mkdir()
+
+        done = claim_cli(root, home, "run", "--pr", "8", "--", "/bin/echo", "готово")
+        check("успешная команда отдаёт свой код возврата", done.returncode == 0,
+              done.stderr[-200:])
+        check("после успеха PR свободен",
+              claim_cli(root, home, "check", "--pr", "8").returncode == 0)
+
+        failed = claim_cli(root, home, "run", "--pr", "8", "--", "/bin/sh", "-c", "exit 3")
+        check("код возврата команды не подменяется", failed.returncode == 3,
+              failed.stderr[-200:])
+        check("после ошибки PR тоже свободен",
+              claim_cli(root, home, "check", "--pr", "8").returncode == 0)
+
+        # Убийство без шанса прибраться: файл жизни держит ядро, и снимает его
+        # тоже ядро. Ровно это отличает бронь от отметки «занято» в файле.
+        killed = subprocess.Popen(
+            [sys.executable, str(BRIDGE_PY), "--state-dir", str(root),
+             "claim", "run", "--pr", "8", "--", "/bin/sleep", "20"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            env=bridge_env(home))
+        busy_seen = False
+        for _ in range(100):
+            if claim_cli(root, home, "check", "--pr", "8").returncode == bridge.CLAIM_BUSY_EXIT:
+                busy_seen = True
+                break
+            time.sleep(0.05)
+        check("пока команда работает, PR занят", busy_seen)
+        killed.kill()
+        killed.wait(timeout=60)
+        # Дочерний `sleep` мог пережить родителя: он не наш владелец брони, но
+        # оставлять его в системе невежливо, а тест не должен от него зависеть.
+        freed = False
+        for _ in range(100):
+            if claim_cli(root, home, "check", "--pr", "8").returncode == 0:
+                freed = True
+                break
+            time.sleep(0.05)
+        check("после убийства владельца бронь не держится", freed)
+
+        # Явное снятие: живого владельца без --force не трогаем, иначе снятие
+        # брони вернуло бы ровно двух исполнителей, от которых защищаемся.
+        holder = subprocess.Popen(
+            [sys.executable, str(BRIDGE_PY), "--state-dir", str(root),
+             "claim", "run", "--pr", "9", "--", "/bin/sleep", "20"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            env=bridge_env(home))
+        try:
+            for _ in range(100):
+                if claim_cli(root, home, "check", "--pr", "9").returncode == bridge.CLAIM_BUSY_EXIT:
+                    break
+                time.sleep(0.05)
+            polite = claim_cli(root, home, "release", "--pr", "9")
+            check("снять бронь у живого процесса без --force нельзя",
+                  polite.returncode == 1 and "Отказ" in polite.stderr,
+                  (polite.stdout + polite.stderr)[-200:])
+            check("сказано, что процесс надо остановить самому",
+                  "остановите процесс" in polite.stderr, polite.stderr[-200:])
+            forced = claim_cli(root, home, "release", "--pr", "9", "--force")
+            check("с --force бронь снимается", forced.returncode == 0,
+                  (forced.stdout + forced.stderr)[-200:])
+        finally:
+            holder.kill()
+            holder.wait(timeout=60)
+
+
+def test_claim_wrapper_is_the_only_manual_door():
+    print("\n== Обёртка для ручных сессий и правило в инструкции ==")
+    check("обёртка существует", CLAUDE_CLAIM_SH.is_file())
+    if not CLAUDE_CLAIM_SH.is_file():
+        return
+    check("обёртка исполняемая", os.access(CLAUDE_CLAIM_SH, os.X_OK))
+    syntax = subprocess.run(["bash", "-n", str(CLAUDE_CLAIM_SH)],
+                            capture_output=True, text=True, timeout=60)
+    check("обёртка синтаксически цела", syntax.returncode == 0, syntax.stderr[-200:])
+
+    text = CLAUDE_CLAIM_SH.read_text(encoding="utf-8")
+    check("обёртка берёт ту же бронь, что и диспетчер",
+          "claim" in text and "run" in text and "bridge.py" in text)
+    check("claude запускается только после брони",
+          text.index("claim") < text.rindex("claude"))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        home = Path(tmp)
+        no_pr = subprocess.run(["bash", str(CLAUDE_CLAIM_SH), "--", "-p", "правь"],
+                               capture_output=True, text=True, timeout=60,
+                               env=bridge_env(home))
+        check("без номера PR обёртка не запускает ничего",
+              no_pr.returncode == 2 and "--pr" in no_pr.stderr,
+              (no_pr.stdout + no_pr.stderr)[-200:])
+
+    # Каталог броней обязан быть один у фона и у обёртки: два каталога — это
+    # две независимые очереди, то есть отсутствие защиты.
+    with tempfile.TemporaryDirectory() as tmp:
+        home = Path(tmp) / "home"
+        home.mkdir()
+        root = Path(tmp) / "state"
+        resolved = subprocess.run(
+            [sys.executable, str(BRIDGE_PY), "--state-dir", str(root), "resolve", "claims-dir"],
+            capture_output=True, text=True, timeout=120, env=bridge_env(home))
+        check("каталог броней виден в resolve",
+              resolved.returncode == 0 and resolved.stdout.strip() == str(root / "claims"),
+              (resolved.stdout + resolved.stderr)[-200:])
+
+    agents = AGENTS_MD.read_text(encoding="utf-8")
+    check("в инструкции названа сама обёртка",
+          "claude-claim.sh" in agents)
+    check("сказано, что напрямую claude для правки кода звать нельзя",
+          "напрямую" in agents and "claude-claim.sh" in agents)
+    check("сказано, что при живом диспетчере ручные правки по ревью не запускаются",
+          "вручную не запуска" in agents or "вручную не запускаются" in agents)
+    check("правило CLAIM связано с локальной бронью, а не только с Issue",
+          "бронь" in agents.lower() and "Issue" in agents)
+
+    readme = (ROOT / "tools" / "agent-bridge" / "README.md").read_text(encoding="utf-8")
+    check("README рассказывает про бронь и обёртку",
+          "claude-claim.sh" in readme and "бронь" in readme.lower())
+    example = (ROOT / "tools" / "agent-bridge" / "config.env.example").read_text(encoding="utf-8")
+    check("настройки брони описаны в образце конфигурации",
+          "OBOROT_BRIDGE_CLAIM_TTL" in example and "OBOROT_BRIDGE_CLAIM_DIR" in example)
+
+
 def main() -> int:
     print(f"agent-bridge: {BRIDGE_PY.relative_to(ROOT)}")
     test_parse_api_output()
@@ -1853,6 +2319,14 @@ def main() -> int:
     test_status_shows_degraded_cycle()
     test_purge_refuses_unsafe_targets()
     test_purge_removes_only_proven_bridge_dirs()
+    test_manual_claim_blocks_bridge()
+    test_stale_claims_do_not_block_forever()
+    test_claim_is_bound_to_pr_and_sha()
+    test_bridge_checks_claim_again_before_model()
+    test_claim_failure_is_fail_closed()
+    test_two_processes_never_share_one_pr()
+    test_claim_released_after_success_error_and_kill()
+    test_claim_wrapper_is_the_only_manual_door()
     print(f"\nИТОГО: {len(PASS)} OK, {len(FAIL)} FAIL")
     return 1 if FAIL else 0
 
