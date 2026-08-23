@@ -177,8 +177,29 @@
     var r=await fetch(url,{method:o.method||"GET",
       headers:{"Content-Type":"application/json","X-Oborot-CSRF":"1"},
       body:o.body?JSON.stringify(o.body):undefined, credentials:"same-origin"});
-    if(!r.ok) throw new Error("HTTP "+r.status);
+    if(!r.ok){
+      // Причину должен называть сервер: «HTTP 402» человеку не говорит
+      // ничего, а «подписка не оплачена» — говорит.
+      var msg="";
+      try{ var j=await r.json(); msg=detailText(j&&j.detail); }catch(_){}
+      var err=new Error(msg||("HTTP "+r.status)); err.status=r.status; throw err;
+    }
     return r.json();
+  }
+
+  // FastAPI при 422 отдаёт detail СПИСКОМ — наивное склеивание давало
+  // человеку «[object Object]» вместо текста ошибки.
+  function detailText(detail){
+    if(!detail) return "";
+    if(typeof detail==="string") return detail;
+    if(Array.isArray(detail))
+      return detail.map(function(x){ return (x&&x.msg)||String(x); }).join("; ");
+    return String(detail.msg||"");
+  }
+
+  function errText(e){
+    if(e&&e.status===401) return "Сессия истекла — войдите заново.";
+    return (e&&e.message)||"Не удалось загрузить данные.";
   }
 
   var PRODUCTS=[];
@@ -323,12 +344,32 @@
         }
         render(d);
       })
-      .catch(function(){});
+      .catch(function(e){
+        // Раньше здесь было пустое .catch(): расчёт падал (истекла сессия,
+        // 402 от гейта подписки, 500 на позиции), а на экране оставались
+        // карточки и ростовка ПРЕДЫДУЩЕГО товара — при уже переключённом
+        // названии. Кнопка «Заказ отправлен» при этом слала чужие числа под
+        // новым именем: в «Едет» серьги попадала ростовка худи.
+        LAST=null;
+        document.getElementById("cards").style.display="none";
+        document.getElementById("send-btn").style.display="none";
+        document.getElementById("thead").innerHTML="";
+        document.getElementById("tbody").innerHTML=
+          '<tr><td class="loading">'+esc(errText(e))+'</td></tr>';
+        document.getElementById("warn-box").innerHTML="";
+      });
   }
 
   // «Заказ отправлен»: сумма активного режима → в «Заказано» (Активный сток)
   document.getElementById("send-btn").addEventListener("click",function(){
     if(!LAST||!SEL) return;
+    // Страховка второго уровня: расчёт на экране обязан относиться К ТОМУ ЖЕ
+    // товару, который выбран сейчас. Одного гашения в .catch мало — экран
+    // мог устареть и по другой причине (гонка двух запросов подряд).
+    if(LAST.base_name&&LAST.base_name!==SEL){
+      alert("Расчёт на экране относится к другой позиции — пересчитайте.");
+      return;
+    }
     var key=MODE==="stock"?"order_stock":"order_pure";
     var total=LAST.sizes.reduce(function(a,s){ return a+(s[key]||0); },0);
     if(total<=0){ alert("Заказ пустой — нечего отправлять."); return; }
@@ -339,7 +380,7 @@
         btn.textContent="✓ Отправлено: "+fmt(r.qty_total)+" шт в «Заказано»";
         setTimeout(function(){ btn.textContent="✓ Заказ отправлен"; },4000);
       })
-      .catch(function(){ alert("Не удалось сохранить — попробуй ещё раз."); });
+      .catch(function(e){ alert(errText(e)); });
   });
 
   function render(d){

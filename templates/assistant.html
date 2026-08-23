@@ -343,8 +343,18 @@
       opt.body = JSON.stringify(body); }
     return fetch(url, opt).then(function(r){
       if(!r.ok) return r.json().catch(function(){return {};}).then(function(j){
-        throw new Error(j.detail || ("HTTP "+r.status)); });
+        var err = new Error(detailText(j.detail) || ("HTTP "+r.status));
+        err.status = r.status; err.detail = j.detail; throw err; });
       return r.json(); });
+  }
+  // FastAPI при 422 отдаёт detail СПИСКОМ объектов, и наивная склейка
+  // показывала человеку «[object Object]» вместо «значение больше 200».
+  function detailText(detail){
+    if(!detail) return "";
+    if(typeof detail === "string") return detail;
+    if(Array.isArray(detail))
+      return detail.map(function(x){ return (x && x.msg) || String(x); }).join("; ");
+    return String(detail.msg || "");
   }
   // toISOString() переводит в UTC и в плюсовых часовых поясах сдвигает дату
   // на день назад — поэтому ISO собираем из локальных компонентов.
@@ -583,7 +593,7 @@
           '<td class="nb">'+fmt(h.positions)+" / "+fmt(h.units)+"</td>"+
           '<td class="nb">'+fmtR(h.cost)+"</td>"+
           "<td>"+esc(h.author||"—")+"</td>"+
-          "<td>"+(h.order_id ? '<a href="/orders">№'+h.order_id+"</a>" : '<span class="muted">не оформлен</span>')+"</td>"+
+          "<td>"+(h.order_id ? '<a href="/replenish#orders" title="Заказы в производстве — внизу страницы «Заказ»">№'+h.order_id+"</a>" : '<span class="muted">не оформлен</span>')+"</td>"+
           '<td><button class="go-btn ghost repeat" type="button" data-id="'+h.id+
             '" style="padding:4px 10px;font-size:12px">Повторить</button></td></tr>';
       }).join("")+"</tbody></table></div>";
@@ -697,7 +707,7 @@
   };
 
   function liveTotals(){
-    var p = STATE.plan, cost=0, units=0, profit=0, pos=0;
+    var p = STATE.plan, cost=0, units=0, profit=0, overProfit=0, pos=0;
     (p.items||[]).forEach(function(i){
       var q = (STATE.edits[i.base_name]!==undefined) ? STATE.edits[i.base_name] : i.qty;
       if(q<=0) return;
@@ -705,7 +715,18 @@
       // Себестоимости нет → маржа неизвестна, а не «равна всей цене продажи».
       // Сервер по таким строкам ставит прибыль 0 намеренно (см. _manual_item);
       // без этой проверки карточка «Валовая маржа» показывала выручку целиком.
-      if(!i.no_cost && i.cost_price > 0) profit += q*Math.max(0, i.avg_price - i.cost_price);
+      if(!i.no_cost && i.cost_price > 0){
+        // Прибыль — ТОЛЬКО по спросу: штуки, взятые сверх потребности (из-за
+        // минимальной партии или правки руками), в горизонте заказа продать
+        // нечем, и обещать по ним прибыль нельзя. Ровно так считает сервер
+        // (`expected_profit = min(qty, need) × маржа`, излишек — отдельным
+        // `over_need_profit`), а браузер считал по всему количеству и на
+        // правке 14 → 70 расходился с сервером на 20 536 ₽.
+        var margin = Math.max(0, i.avg_price - i.cost_price);
+        var need = (i.need === undefined || i.need === null) ? q : i.need;
+        profit += Math.min(q, need) * margin;
+        overProfit += Math.max(0, q - need) * margin;
+      }
     });
     var share = p.cost_total ? (p.pay_now / p.cost_total) : 1;
     var cov = null, covFull = 0;
@@ -716,7 +737,8 @@
       if(p.covered_until_target && i.covered_until >= p.covered_until_target) covFull++;
     });
     return { cost: Math.round(cost), units: units, positions: pos,
-             profit: Math.round(profit), pay_now: Math.round(cost*share),
+             profit: Math.round(profit), over_profit: Math.round(overProfit),
+             pay_now: Math.round(cost*share),
              pay_later: Math.round(cost - cost*share),
              covered_until: cov, covered_full: covFull };
   }
@@ -742,7 +764,9 @@
       '<div class="card"><div class="l">Позиций / штук</div><div class="v">'+fmt(t.positions)+' / '+fmt(t.units)+'</div>'+
         '<div class="s">'+(p.over_need_cost ? ('из них '+fmtR(p.over_need_cost)+' — запас сверх потребности') : 'в заказе')+'</div></div>'+
       '<div class="card" style="background:rgba(76,187,23,0.18)"><div class="l">Валовая маржа</div>'+
-        '<div class="v">'+fmtR(t.profit)+'</div><div class="s">если продать по средней цене, до налогов и логистики</div></div>'+
+        '<div class="v">'+fmtR(t.profit)+'</div><div class="s">если продать по средней цене, до налогов и логистики'+
+          (t.over_profit>0 ? '<br>ещё '+fmtR(t.over_profit)+' — на штуках сверх потребности: их в этот горизонт продать нечем' : '')+
+          '</div></div>'+
       '<div class="card"><div class="l">Первая позиция кончится</div><div class="v" style="font-size:16px">'+dstr(t.covered_until)+'</div>'+
         '<div class="s">'+(covAll ? ('полностью закрыто '+covN+' из '+covAll+' · цель '+dstr(p.covered_until_target)) : 'на складе '+dstr(p.eta_date))+'</div></div>';
     var warn = document.getElementById("budgetWarn");
@@ -939,7 +963,7 @@
         '<b>№'+first.id+' «'+esc(first.name)+'»</b> от '+dstr((first.created_at||"").slice(0,10))+
         ' — '+fmt(first.total_qty)+' шт'+
         (op.left_to_pay ? (', по всем открытым заказам осталось заплатить <b>'+fmtR(op.left_to_pay)+'</b>') : '')+
-        '. <a href="/orders">Посмотреть заказы</a></div>';
+        '. <a href="/replenish#orders">Посмотреть заказы</a></div>';
     }
 
     // Решение владельца D-23: нельзя молча показывать общий бюджет как полный,
@@ -1191,7 +1215,7 @@
     if(!btn) return;
     var act = btn.parentNode;
     act.innerHTML =
-      '<a class="go-btn" style="text-decoration:none" href="/orders">Заказ №'+id+' создан → открыть</a>'+
+      '<a class="go-btn" style="text-decoration:none" href="/replenish#orders">Заказ №'+id+' создан → открыть</a>'+
       '<button class="go-btn ghost" id="toProd">Отправить в производство</button>'+
       '<button class="go-btn ghost" onclick="go(1)">← Новый заказ</button>'+
       '<span class="hint" id="mkHint"></span>';

@@ -206,10 +206,10 @@
   <div class="loss-line" id="loss-line" style="display:none"></div>
   <div id="seg-basis" style="font-size:11px;color:rgba(31,31,31,.45);margin:-2px 0 10px;"></div>
   <div class="summary" id="summary">
-    <div class="sum-card sc-best"><div class="lbl">Бестселлеры</div><div class="cond">&gt; 5 000 ₽/день</div><div class="val" id="v-best">—</div><div class="money" id="m-best" title="(Остаток + едет к нам) × средняя цена продажи с учётом скидок — не себестоимость и не розничный прайс. Товар в пути входит и в штуки, и в сумму"></div><div class="cost" id="c-best" title="Те же штуки по себестоимости и валовая маржа между себестоимостью и ценой продажи"></div><div class="sub" id="s-best"></div></div>
-    <div class="sum-card sc-good"><div class="lbl">Хорошие</div><div class="cond">2 000 – 5 000 ₽/день</div><div class="val" id="v-good">—</div><div class="money" id="m-good" title="(Остаток + едет к нам) × средняя цена продажи с учётом скидок — не себестоимость и не розничный прайс. Товар в пути входит и в штуки, и в сумму"></div><div class="cost" id="c-good" title="Те же штуки по себестоимости и валовая маржа между себестоимостью и ценой продажи"></div><div class="sub" id="s-good"></div></div>
-    <div class="sum-card sc-mid"><div class="lbl">Медленные</div><div class="cond">1 000 – 2 000 ₽/день</div><div class="val" id="v-mid">—</div><div class="money" id="m-mid" title="(Остаток + едет к нам) × средняя цена продажи с учётом скидок — не себестоимость и не розничный прайс. Товар в пути входит и в штуки, и в сумму"></div><div class="cost" id="c-mid" title="Те же штуки по себестоимости и валовая маржа между себестоимостью и ценой продажи"></div><div class="sub" id="s-mid"></div></div>
-    <div class="sum-card sc-bad"><div class="lbl">Слабые</div><div class="cond">&lt; 1 000 ₽/день</div><div class="val" id="v-bad">—</div><div class="money" id="m-bad" title="(Остаток + едет к нам) × средняя цена продажи с учётом скидок — не себестоимость и не розничный прайс. Товар в пути входит и в штуки, и в сумму"></div><div class="cost" id="c-bad" title="Те же штуки по себестоимости и валовая маржа между себестоимостью и ценой продажи"></div><div class="sub" id="s-bad"></div></div>
+    <div class="sum-card sc-best"><div class="lbl">Бестселлеры</div><div class="cond" id="cond-best">&gt; 5 000 ₽/день</div><div class="val" id="v-best">—</div><div class="money" id="m-best" title="(Остаток + едет к нам) × средняя цена продажи с учётом скидок — не себестоимость и не розничный прайс. Товар в пути входит и в штуки, и в сумму"></div><div class="cost" id="c-best" title="Те же штуки по себестоимости и валовая маржа между себестоимостью и ценой продажи"></div><div class="sub" id="s-best"></div></div>
+    <div class="sum-card sc-good"><div class="lbl">Хорошие</div><div class="cond" id="cond-good">2 000 – 5 000 ₽/день</div><div class="val" id="v-good">—</div><div class="money" id="m-good" title="(Остаток + едет к нам) × средняя цена продажи с учётом скидок — не себестоимость и не розничный прайс. Товар в пути входит и в штуки, и в сумму"></div><div class="cost" id="c-good" title="Те же штуки по себестоимости и валовая маржа между себестоимостью и ценой продажи"></div><div class="sub" id="s-good"></div></div>
+    <div class="sum-card sc-mid"><div class="lbl">Медленные</div><div class="cond" id="cond-mid">1 000 – 2 000 ₽/день</div><div class="val" id="v-mid">—</div><div class="money" id="m-mid" title="(Остаток + едет к нам) × средняя цена продажи с учётом скидок — не себестоимость и не розничный прайс. Товар в пути входит и в штуки, и в сумму"></div><div class="cost" id="c-mid" title="Те же штуки по себестоимости и валовая маржа между себестоимостью и ценой продажи"></div><div class="sub" id="s-mid"></div></div>
+    <div class="sum-card sc-bad"><div class="lbl">Слабые</div><div class="cond" id="cond-bad">&lt; 1 000 ₽/день</div><div class="val" id="v-bad">—</div><div class="money" id="m-bad" title="(Остаток + едет к нам) × средняя цена продажи с учётом скидок — не себестоимость и не розничный прайс. Товар в пути входит и в штуки, и в сумму"></div><div class="cost" id="c-bad" title="Те же штуки по себестоимости и валовая маржа между себестоимостью и ценой продажи"></div><div class="sub" id="s-bad"></div></div>
   </div>
   <div class="cat-sum-title" id="cat-sum-title"></div>
   <div class="summary" id="summary-cat" style="margin-bottom:14px;"></div>
@@ -327,8 +327,27 @@ function renderSummary(){
     document.getElementById("c-"+k).innerHTML=costLine(a);
     document.getElementById("s-"+k).textContent=a.n+" моделей"+(a.o?" · из них едет к нам "+fmt(a.o)+" шт":"");
   }
+  renderThresholdLabels();
   renderSegBasis();
   renderMoneyStrip();
+}
+
+/* Подписи карточек — из ПОРОГОВ ОРГАНИЗАЦИИ, а не из вёрстки.
+   Пороги настраиваются, и после их смены класс менялся у большинства
+   позиций, а надписи «> 5 000 ₽/день» оставались прежними: экран прямо
+   противоречил расчёту, по которому сам же и разложил товар. */
+function renderThresholdLabels(){
+  const t = (DATA && DATA.thresholds) || null;
+  if(!t) return;
+  const m = v => (v>=1000 && v%1000===0) ? (v/1000)+" 000" : fmt(v);
+  const set = (id, text) => {
+    const el = document.getElementById(id);
+    if(el) el.textContent = text;
+  };
+  set("cond-best", "> "+m(t.good)+" ₽/день");
+  set("cond-good", m(t.dull)+" – "+m(t.good)+" ₽/день");
+  set("cond-mid",  m(t.weak)+" – "+m(t.dull)+" ₽/день");
+  set("cond-bad",  "< "+m(t.weak)+" ₽/день");
 }
 
 /* ── Полоса «деньги»: сколько заморожено по себестоимости ──

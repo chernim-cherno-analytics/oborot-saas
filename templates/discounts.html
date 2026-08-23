@@ -120,6 +120,14 @@ document.addEventListener("DOMContentLoaded", function () {
   var state = { sortKey: "frozen", sortDir: -1, query: "", cat: "" };
   var tbody = document.getElementById("tbody");
 
+  // Пороги классов настраиваются организацией, а подсказка на значке A/B/C/D
+  // называла числа, зашитые в код. Подтягиваем настоящие — молча, чтобы
+  // отказ этого запроса не мешал показать сам отчёт.
+  api("/api/settings").then(function (s) {
+    if (s && s.thresholds && window.setClassTips) window.setClassTips(s.thresholds);
+    renderTable();
+  }).catch(function () {});
+
   api("/api/discounts").then(function (d) {
     items = d.items || [];
     renderCards(d);

@@ -339,8 +339,29 @@ async function api(url, opts){
   const r = await fetch(url, { method:o.method||"GET",
     headers:{"Content-Type":"application/json","X-Oborot-CSRF":"1"},
     body:o.body?JSON.stringify(o.body):undefined });
-  if(!r.ok) throw new Error("HTTP "+r.status);
+  if(!r.ok){
+    // Причину называет сервер. Раньше здесь был «HTTP 402», а на экране —
+    // «проверьте интернет» и «нужны права владельца»: заведомо ложные
+    // диагнозы, из-за которых человек искал проблему не там.
+    let msg="";
+    try{ const j=await r.json(); msg=detailText(j && j.detail); }catch(_){}
+    const err=new Error(msg || ("HTTP "+r.status)); err.status=r.status; throw err;
+  }
   return r.json();
+}
+
+// FastAPI при 422 отдаёт detail списком объектов — без разбора человек
+// получал «[object Object]».
+function detailText(detail){
+  if(!detail) return "";
+  if(typeof detail==="string") return detail;
+  if(Array.isArray(detail)) return detail.map(x=>(x&&x.msg)||String(x)).join("; ");
+  return String(detail.msg||"");
+}
+
+function errText(e){
+  if(e && e.status===401) return "Сессия истекла — войдите заново.";
+  return (e && e.message) || "Не удалось выполнить запрос.";
 }
 
 // Норма запаса организации: сколько дней продаж должно лежать на складе.
@@ -605,6 +626,13 @@ function renderMoney(){
   if(!MONEY) return;
   const m=MONEY;
   const pct = v => (v===null||v===undefined) ? "—" : Math.round(v*100)+"%";
+  // Проценты маржи считаются ТОЛЬКО по позициям с себестоимостью, а рядом
+  // раньше печаталась сумма по ВСЕМ — деление не сходилось, и это читалось
+  // как ошибка расчёта. Теперь печатаем ту сумму, которая в знаменателе, и,
+  // если часть каталога в неё не вошла, говорим об этом словами.
+  const moneyNote = mm => mm.no_cost_positions
+    ? ' (только позиции с себестоимостью — их '+(mm.positions-mm.no_cost_positions)+' из '+mm.positions+')'
+    : '';
   const turns = m.capital_turns
     ? 'Капитал оборачивается ≈ '+m.capital_turns.toLocaleString("ru-RU")+' раза в год (себестоимость проданного ÷ сегодняшний сток по себестоимости)'
     : '';
@@ -617,9 +645,9 @@ function renderMoney(){
     '<div class="mb-card"><div class="lbl">Если продать остаток</div><div class="val">'+fmtMoney(m.stock_sale)+'</div>'+
       '<div class="sub">'+m.stock_sale_basis+'. По прайсу без скидок это было бы '+fmtMoney(m.stock_retail)+' ('+m.stock_retail_basis+').</div></div>'+
     '<div class="mb-card accent"><div class="lbl">Маржа в остатке</div><div class="val">'+fmtMoney(m.stock_margin)+'</div>'+
-      '<div class="sub">'+pct(m.stock_margin_pct)+' от цены продажи. Столько заработаете, когда распродадите остаток — это ещё не прибыль.</div></div>'+
+      '<div class="sub">'+pct(m.stock_margin_pct)+' от '+fmtMoney(m.stock_margin_base)+moneyNote(m)+'. Столько заработаете, когда распродадите остаток — это ещё не прибыль.</div></div>'+
     '<div class="mb-card accent"><div class="lbl">Валовая маржа за год</div><div class="val">'+fmtMoney(m.gross_margin)+'</div>'+
-      '<div class="sub">'+pct(m.gross_margin_pct)+' от выручки '+fmtMoney(m.revenue_year)+'. '+turns+'</div></div>';
+      '<div class="sub">'+pct(m.gross_margin_pct)+' от выручки '+fmtMoney(m.revenue_year_with_cost)+moneyNote(m)+'. '+turns+'</div></div>';
   const c = CATMONEY.find(x=>x.name===currentCat);
   document.getElementById("money-cat").innerHTML = c
     ? 'Категория «'+esc(c.name)+'»: заморожено <b>'+fmtMoney(c.stock_cost)+'</b> по себестоимости · маржа в остатке <b>'+fmtMoney(c.stock_margin)+'</b> ('+pct(c.stock_margin_pct)+') · валовая маржа за год <b>'+fmtMoney(c.gross_margin)+'</b> ('+pct(c.gross_margin_pct)+') · '+c.positions+' поз., '+fmt(c.stock_units)+' шт'
@@ -689,18 +717,28 @@ document.addEventListener("click", async e=>{
     try{ await api("/api/hidden",{method:"POST",body:{base_name:base,hidden:hide}});
       ITEMS.forEach(it=>{ if(it.base_name===base) it.hidden=hide; });
       buildTabs(); render();
-    }catch(err){ alert("Не сохранилось: "+err.message); }
+    }catch(err){ alert("Не сохранилось. "+errText(err)); }
   }
 });
 document.addEventListener("change", async e=>{
   const t=e.target;
   if(!t.classList||!t.classList.contains("disc-in")) return;
   const base=t.getAttribute("data-base");
+  // Прежнее значение запоминаем ДО правки: если сервер откажет, экран обязан
+  // вернуться к тому, что реально сохранено. Раньше значение и подсветка
+  // ставились сразу, и не сохранившаяся скидка продолжала стоять в поле и
+  // жить в памяти страницы — после любой перерисовки она выглядела как
+  // сохранённая, хотя на сервере её не было.
+  const prev = DISC[base];
   let v=Math.round(parseFloat(String(t.value).replace(",",".").replace("%","")));
   if(!isFinite(v)||v<=0){ v=0; t.value=""; delete DISC[base]; t.classList.remove("has"); }
   else { v=Math.min(v,99); t.value=v; DISC[base]=v; t.classList.add("has"); }
   try{ await api("/api/discount-overrides",{method:"POST",body:{base_name:base,discount:v}}); }
-  catch(err){ alert("Скидка не сохранилась — проверьте интернет"); }
+  catch(err){
+    if(prev===undefined){ delete DISC[base]; t.value=""; t.classList.remove("has"); }
+    else { DISC[base]=prev; t.value=prev; t.classList.add("has"); }
+    alert("Скидка не сохранилась. "+errText(err));
+  }
 });
 document.getElementById("search").addEventListener("input",()=>{ saveView(); render(); });
 
@@ -726,7 +764,7 @@ document.getElementById("defDiscBtn").addEventListener("click", async function()
     btn.textContent="✓ Скидки расставлены";
     setTimeout(()=>{btn.textContent="Дефолтные скидки"; btn.disabled=false;},2000);
   }catch(err){
-    alert("Не получилось (нужны права владельца)");
+    alert("Не получилось. "+errText(err));
     btn.textContent="Дефолтные скидки"; btn.disabled=false;
   }
 });
@@ -743,7 +781,7 @@ document.getElementById("rule-save").addEventListener("click", async ()=>{
   try{
     const r=await api("/api/discount-rule",{method:"POST",body});
     RULE=r.rule; document.getElementById("rule-modal").classList.remove("open");
-  }catch(err){ alert("Не сохранилось (правило меняет только владелец)"); return; }
+  }catch(err){ alert("Не сохранилось. "+errText(err)); return; }
   // Перезагрузка — ВНЕ try: правило уже сохранено, и споткнувшаяся дозагрузка
   // данных не должна показывать «не сохранилось». Порог затоварки это и есть
   // норма запаса (D-15): по ней считаются «Сток на N дней» и «Не хватает до
@@ -760,7 +798,7 @@ document.getElementById("minstock-save").addEventListener("click", async functio
     await api("/api/settings",{method:"POST",body:{min_stock_days:v}});
     btn.textContent="✓ пересчитано"; setTimeout(()=>{btn.textContent="сохранить";},1500);
     await load();
-  }catch(err){ alert("Не сохранилось (настройку меняет владелец)"); btn.textContent="сохранить"; }
+  }catch(err){ alert("Не сохранилось. "+errText(err)); btn.textContent="сохранить"; }
 });
 
 async function load(){

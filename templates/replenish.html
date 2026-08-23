@@ -242,7 +242,7 @@
     <div class="scard" id="risk-card"><div class="sl">Риск стокаута</div><div class="sv" id="k-risk">0</div><div class="ss" id="k-risk-sub">покрытие меньше 2 недель</div></div>
     <div class="scard"><div class="sl">К заказу</div><div class="sv" id="s-pos">0</div><div class="ss" id="s-pos-sub">по рекомендации системы</div></div>
     <div class="scard"><div class="sl">Объём заказа</div><div class="sv" id="s-qty">0</div><div class="ss">шт · по отмеченным позициям</div></div>
-    <div class="scard"><div class="sl">Себестоимость</div><div class="sv" id="s-cost">—</div><div class="ss">затраты на производство заказа</div></div>
+    <div class="scard"><div class="sl">Себестоимость</div><div class="sv" id="s-cost">—</div><div class="ss" id="s-cost-sub">затраты на производство заказа</div></div>
     <div class="scard"><div class="sl">Ожид. выручка</div><div class="sv" id="s-rev">—</div><div class="ss" id="s-rev-sub">при продаже по средней цене</div></div>
   </div>
 
@@ -309,7 +309,7 @@
     </table>
   </div>
 
-  <div class="arch-title" id="orders-title" style="display:none" onclick="void(0)"></div>
+  <div class="arch-title" id="orders" style="display:none" onclick="void(0)"></div>
   <div class="table-outer" id="orders-wrap" style="display:none;max-height:40vh">
     <table>
       <thead><tr><th style="text-align:left">Заказ</th><th>Создан</th><th>Ожидаемый приход</th>
@@ -691,7 +691,7 @@
 
   /* ── заказы в производстве: управление прямо здесь (страницы «Заказы» нет) ── */
   function renderOrders(){
-    var t=document.getElementById("orders-title");
+    var t=document.getElementById("orders");
     var w=document.getElementById("orders-wrap");
     if(!ORDERS.length){ t.style.display="none"; w.style.display="none"; return; }
     t.style.display="";
@@ -1187,11 +1187,25 @@
     // себестоимость складываем по УЖЕ округлённым строкам — ровно так же, как
     // считает выгрузка в Excel: иначе итог страницы и итог файла разъезжаются
     // на копейки, и человек начинает искать ошибку там, где её нет
-    sel.forEach(function(it){ qty+=it._need; cost+=Math.round(it._need*(it.cost_price||0)); rev+=it._need*(it.avg_price||0); });
+    var noCost=0, noCostQty=0;
+    sel.forEach(function(it){
+      qty+=it._need; rev+=it._need*(it.avg_price||0);
+      // Позиция без себестоимости стоит НЕ ноль — её стоимость просто
+      // неизвестна. Раньше такие строки молча прибавляли к сумме 0, и
+      // «затраты на производство заказа» выходили заниженными без единого
+      // слова об этом; сервер по таким позициям везде отдаёт признак
+      // неполноты (`no_cost`, `budget_incomplete`).
+      if(!(it.cost_price>0)){ noCost++; noCostQty+=it._need; return; }
+      cost+=Math.round(it._need*it.cost_price);
+    });
     document.getElementById("s-pos").textContent=fmt(sel.length);
     document.getElementById("s-pos-sub").textContent="из "+fmt(prodItems(ACTIVE_PROD).length)+" на вкладке";
     document.getElementById("s-qty").textContent=fmt(qty);
     document.getElementById("s-cost").textContent=fmtMoneyShort(cost);
+    document.getElementById("s-cost-sub").textContent = noCost
+      ? "СУММА НЕПОЛНАЯ: "+fmt(noCost)+" поз. ("+fmt(noCostQty)+" шт) без себестоимости"
+      : "затраты на производство заказа";
+    document.getElementById("s-cost-sub").style.color = noCost ? "#a00003" : "";
     document.getElementById("s-rev").textContent=fmtMoneyShort(rev);
     document.getElementById("s-rev-sub").textContent=cost>0?("×"+fmtNum(rev/cost,1)+" к себестоимости"):"при продаже по средней цене";
     document.getElementById("btn-create-order").disabled=sel.length===0;
@@ -1256,18 +1270,20 @@
   document.getElementById("btn-export-xlsx").addEventListener("click",function(){
     var btn=this;
     var checked=items.filter(function(it){ return it._checked; });
-    if(!items.length||checked.length===items.length){
-      location.href="/api/export/replenish.xlsx";
-      return;
-    }
     if(!checked.length){
       alert("Отметьте хотя бы одну позицию — выгружать в Excel пока нечего.");
       return;
     }
+    // Раньше при «отмечено всё» файл забирался через location.href — и при
+    // истёкшей сессии человека уносило со страницы на голый JSON
+    // {"detail":"Не авторизован"}, вместе со всей несохранённой работой.
+    // Один путь на оба случая: качаем blob'ом и остаёмся на странице.
+    var allChecked = !items.length || checked.length===items.length;
     btn.disabled=true;
     fetch("/api/export/replenish.xlsx",{method:"POST",
       headers:{"Content-Type":"application/json","X-Oborot-CSRF":"1"},
-      body:JSON.stringify({base_names:checked.map(function(it){ return it.base_name; })}),
+      body:JSON.stringify(allChecked ? {} :
+        {base_names:checked.map(function(it){ return it.base_name; })}),
       credentials:"same-origin"
     }).then(function(r){
       if(!r.ok) return r.text().then(function(t){
@@ -1303,11 +1319,13 @@
     document.getElementById("order-eta").value=eta.toISOString().slice(0,10);
     var qty=sel.reduce(function(s,it){ return s+it._need; },0);
     var recQty=sel.reduce(function(s,it){ return s+(it.need||0); },0);
-    var cost=sel.reduce(function(s,it){ return s+it._need*(it.cost_price||0); },0);
+    var cost=sel.reduce(function(s,it){ return s+(it.cost_price>0?it._need*it.cost_price:0); },0);
+    var noCost=sel.filter(function(it){ return !(it.cost_price>0); }).length;
     var moqN=sel.filter(function(it){ return it.moq_applied; }).length;
     document.getElementById("order-modal-summary").textContent=
       (p?("Производство: "+p.name+", срок "+fmt(lead)+" "+plural(lead,"день","дня","дней")+". "):"")+
       "В заказ войдут "+fmt(sel.length)+" "+plural(sel.length,"позиция","позиции","позиций")+", "+fmt(qty)+" шт, себестоимость ~"+fmtMoneyShort(cost)+"."+
+      (noCost?(" Сумма НЕПОЛНАЯ: у "+fmt(noCost)+" "+plural(noCost,"позиции","позиций","позиций")+" себестоимость не заполнена."):"")+
       (moqN?(" У "+fmt(moqN)+" "+plural(moqN,"позиции","позиций","позиций")+" количество поднято до минимальной партии."):"");
     var warnEl=document.getElementById("order-modal-warning");
     var lowN=sel.filter(function(it){ return it.moq_low; }).length;

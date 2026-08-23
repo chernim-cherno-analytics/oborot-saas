@@ -162,7 +162,12 @@
   function applyPeriod(from,to){
     curFrom=from; curTo=to;
     fetch("/api/revenue?date_from="+from+"&date_to="+to,{credentials:"same-origin"})
-      .then(function(r){ if(!r.ok) throw new Error("HTTP "+r.status); return r.json(); })
+      .then(function(r){
+        if(!r.ok) return r.json().catch(function(){ return {}; }).then(function(j){
+          var msg=j.detail;
+          if(Array.isArray(msg)) msg=msg.map(function(x){ return (x&&x.msg)||String(x); }).join("; ");
+          var err=new Error(msg||("HTTP "+r.status)); err.status=r.status; throw err; });
+        return r.json(); })
       .then(function(d){
         document.getElementById("c-rev").textContent=fmtM(d.total_rev);
         document.getElementById("c-rev-s").textContent=periodLabel();
@@ -194,7 +199,22 @@
         LAST_TOTR=d.total_rev||0;
         renderTop();
       }).catch(function(e){
-        document.getElementById("catbars").innerHTML='<div class="loading">Не удалось загрузить: '+esc(e.message)+'</div>';
+        // Раньше в .catch обновлялись только «Категории»: карточки, помесячный
+        // график и топ-15 оставались от ПРОШЛОГО периода — с прошлой подписью,
+        // при уже изменённых полях дат. Человек читал старые цифры как новые.
+        var msg = (e && e.status===401)
+          ? "Сессия истекла — войдите заново."
+          : ((e && e.message) || "Не удалось загрузить данные.");
+        ["c-rev","c-qty","c-avg","c-best"].forEach(function(id){
+          document.getElementById(id).textContent="—"; });
+        ["c-rev-s","c-qty-s","c-best-s"].forEach(function(id){
+          document.getElementById(id).textContent=""; });
+        document.getElementById("cat-title").textContent="Категории · "+periodLabel();
+        document.getElementById("catbars").innerHTML=
+          '<div class="loading">'+esc(msg)+'</div>';
+        LAST_ITEMS=[]; LAST_TOTR=0;
+        renderTop();
+        drawMonthly([]);
       });
   }
 
