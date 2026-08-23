@@ -69,6 +69,17 @@ def check(name: str, cond: bool, detail: str = ""):
 # Хранилище — каталог $FAKE_REPO. Отказы задаются через FAKE_RESTIC_FAIL:
 # список команд через запятую, на которых подставной restic вернёт 1.
 # Каждый вызов дописывается в $FAKE_LOG, чтобы проверять порядок шагов.
+#
+# Два отдельных вида вранья, которые настоящим хранилищем по заказу не
+# воспроизвести:
+#   FAKE_BACKUP_SILENT=1              — `backup` возвращает 0 и НИЧЕГО не создаёт;
+#   FAKE_SNAPSHOTS_FAIL_AFTER_BACKUP=1 — `snapshots` отказывает только после того,
+#                                        как снимок появился (то есть на втором,
+#                                        послезагрузочном опросе).
+#
+# Идентификаторы снимков подставной restic выдаёт как настоящий: каждый новый
+# снимок получает НОВЫЙ id (у restic в хеш входит время), даже если данные не
+# изменились. Без этого проверка «появился ли новый снимок» была бы непроверяема.
 # --------------------------------------------------------------------------
 FAKE_RESTIC = r"""#!/usr/bin/env bash
 set -u
@@ -83,10 +94,18 @@ case "$CMD" in
     cat "$FAKE_REPO/config"
     ;;
   backup)
+    # Ложный успех: команда отчиталась, а в хранилище ничего не появилось.
+    if [ "${FAKE_BACKUP_SILENT:-0}" = "1" ]; then
+      echo "snapshot saved"
+      exit 0
+    fi
     mkdir -p "$FAKE_REPO/snapshot"
     for f in oborot.db manifest.txt; do
       [ -f "$f" ] && cp "$f" "$FAKE_REPO/snapshot/$f"
     done
+    N=$(( $(cat "$FAKE_REPO/counter" 2>/dev/null || echo 0) + 1 ))
+    printf '%s' "$N" > "$FAKE_REPO/counter"
+    printf '%040x' "$N" > "$FAKE_REPO/snapshot-id"
     echo "snapshot saved"
     ;;
   restore)
@@ -102,10 +121,16 @@ case "$CMD" in
     echo "restored"
     ;;
   snapshots)
+    if [ "${FAKE_SNAPSHOTS_FAIL_AFTER_BACKUP:-0}" = "1" ] && [ -f "$FAKE_REPO/snapshot-id" ]; then
+      echo "подставной restic: список снимков недоступен" >&2
+      exit 1
+    fi
     # Как настоящий restic: снимков нет — это УСПЕХ с пустым списком, а не
     # ошибка. Скрипт обязан отличать одно от другого сам.
-    if [ -d "$FAKE_REPO/snapshot" ]; then
-      echo '[{"id":"подставной","tags":["oborot-db"]}]'
+    if [ -f "$FAKE_REPO/snapshot-id" ]; then
+      ID="$(cat "$FAKE_REPO/snapshot-id")"
+      printf '[{"time":"2026-08-23T03:00:00Z","tree":"0000","id":"%s","short_id":"%s","tags":["oborot-db"]}]\n' \
+        "$ID" "${ID:0:8}"
     else
       echo '[]'
     fi
@@ -225,6 +250,13 @@ class Env:
             "OBOROT_DRILL_BOOT_APP": "0",
             "OBOROT_RECOVERY_SECRET_FILE": str(self.recovery),
             "OBOROT_VENV": str(self.venv),
+            # Площадка не может смонтировать файловую систему (нужен root), а
+            # учение по умолчанию требует, чтобы копия секрета лежала НЕ на том
+            # же диске, что боевая база. Поэтому здесь стоит осознанное
+            # послабление — то самое, которое пишет в отметку
+            # domain=не-проверен. Само правило проверяется отдельно (13е), и
+            # там же — что без послабления местный файл отвергается.
+            "OBOROT_DRILL_ALLOW_LOCAL_SECRET": "1",
         }
         e.update({k: str(v) for k, v in extra.items()})
         return e
@@ -292,10 +324,16 @@ def main() -> int:
     check("успех", rc == 0, out.strip().splitlines()[-1] if out.strip() else f"код {rc}")
     calls = e.calls()
     order = [c.split()[0] for c in calls]
-    # Порядок и есть проверяемое поведение: сначала убеждаемся, что новый
-    # снимок виден и хранилище цело, и только потом срезаем старое.
-    check("порядок: cat → backup → snapshots → check → forget",
-          order == ["cat", "backup", "snapshots", "check", "forget"], " → ".join(order))
+    # Порядок и есть проверяемое поведение: сначала запоминаем последний снимок
+    # ДО загрузки, потом убеждаемся, что появился НОВЫЙ и что хранилище цело, —
+    # и только потом срезаем старое.
+    check("порядок: cat → snapshots → backup → snapshots → check → forget",
+          order == ["cat", "snapshots", "backup", "snapshots", "check", "forget"],
+          " → ".join(order))
+    stamp_text = (e.state / "last-offsite-backup").read_text(encoding="utf-8")
+    snap_id = (e.repo_dir / "snapshot-id").read_text(encoding="utf-8").strip()
+    check("в отметке записан id снимка, который появился в хранилище",
+          f"snapshot={snap_id}" in stamp_text, stamp_text.strip())
     check("снимок помечен тегом", any("--tag oborot-db" in c for c in calls))
     check("ротация с --prune", any("--prune" in c for c in calls))
     stamp = e.state / "last-offsite-backup"
@@ -373,19 +411,36 @@ def main() -> int:
     check("отметки об успехе нет", not (e.state / "last-offsite-backup").exists())
 
     # ---------------------------------------------------------------- 6б
-    print("\n== 6б. Нового снимка не видно — ротации НЕ БУДЕТ ==")
-    # `restic backup` вернул ноль, а снимка в хранилище нет. Такое бывает при
-    # рассинхронизации кэша и репозитория; удалять старое в этот момент нельзя.
+    print("\n== 6б. Список снимков недоступен — ни загрузки, ни ротации ==")
+    # Хранилище отвечает на `cat config`, но список снимков не отдаёт. Тогда
+    # доказать появление новой копии будет нечем, а решение на этом
+    # доказательстве принимается разрушительное — отказ до отправки.
     e = Env("snapshot-missing")
     shutil.copy(seed, _mk(e.db))
     e.repo_initialized()
     rc, out = e.run(BACKUP, FAKE_RESTIC_FAIL="snapshots")
     check("скрипт упал", rc != 0, f"код {rc}")
+    check("выгрузки не было",
+          not any(c.startswith("backup") for c in e.calls()), " | ".join(e.calls()))
     check("ротации не было",
           not any(c.startswith("forget") for c in e.calls()), " | ".join(e.calls()))
     check("проверки хранилища тоже не было — незачем",
           not any(c.startswith("check") for c in e.calls()), " | ".join(e.calls()))
     check("названа причина", "список снимков" in out,
+          out.strip().splitlines()[-1] if out.strip() else "")
+
+    # То же самое, но опрос ломается ПОСЛЕ загрузки: копия уже уехала, а
+    # проверить её появление нечем. Ротация в этом состоянии запрещена.
+    e = Env("snapshot-list-after")
+    shutil.copy(seed, _mk(e.db))
+    e.repo_initialized()
+    rc, out = e.run(BACKUP, FAKE_SNAPSHOTS_FAIL_AFTER_BACKUP="1")
+    check("скрипт упал уже после загрузки", rc != 0, f"код {rc}")
+    check("копия при этом загружена",
+          any(c.startswith("backup") for c in e.calls()), " | ".join(e.calls()))
+    check("РОТАЦИИ НЕ БЫЛО",
+          not any(c.startswith("forget") for c in e.calls()), " | ".join(e.calls()))
+    check("сказано, что старые копии целы", "старые копии целы" in out,
           out.strip().splitlines()[-1] if out.strip() else "")
 
     # Отдельный случай, и он опаснее: `restic snapshots` при отсутствии снимков
@@ -395,17 +450,47 @@ def main() -> int:
     shutil.copy(seed, _mk(e.db))
     e.repo_initialized()
     # Хранилище «принимает» загрузку, но снимка после неё не появляется.
-    (e.dir / "bin" / "restic").write_text(
-        FAKE_RESTIC.replace('  backup)\n    mkdir -p "$FAKE_REPO/snapshot"',
-                            '  backup)\n    mkdir -p "$FAKE_REPO/пусто"'),
-        encoding="utf-8")
-    (e.dir / "bin" / "restic").chmod(0o755)
-    rc, out = e.run(BACKUP)
+    rc, out = e.run(BACKUP, FAKE_BACKUP_SILENT="1")
     check("пустой список снимков — это отказ, а не успех", rc != 0, f"код {rc}")
     check("РОТАЦИИ НЕ БЫЛО",
           not any(c.startswith("forget") for c in e.calls()), " | ".join(e.calls()))
     check("сказано, что старые копии целы", "старые копии целы" in out,
           out.strip().splitlines()[-1] if out.strip() else "")
+
+    # --------------------------------------------------------------- 6г
+    print("\n== 6г. СТАРЫЙ снимок есть, нового не появилось — ротации НЕ БУДЕТ ==")
+    # Найдено повторным внешним ревью 23.08 и опаснее всех предыдущих случаев,
+    # потому что снаружи выглядит как обычная успешная ночь: `restic backup`
+    # вернул 0 и ничего не создал, а в хранилище лежит вчерашний снимок.
+    # Проверка «список не пуст» на нём проходит — и ротация срезает копии
+    # позавчерашние. День за днём остаётся один устаревающий снимок при зелёном
+    # отчёте. Проверяется появление ИМЕННО НОВОГО снимка: id до и после.
+    e = Env("stale-snapshot")
+    shutil.copy(seed, _mk(e.db))
+    e.repo_initialized()
+    rc, out = e.run(BACKUP)
+    check("подготовка: вчерашний снимок в хранилище есть", rc == 0, f"код {rc}")
+    old_id = (e.repo_dir / "snapshot-id").read_text(encoding="utf-8").strip()
+    check("подготовка: у него есть идентификатор", len(old_id) == 40, old_id)
+    e.log.write_text("", encoding="utf-8")
+    (e.state / "last-offsite-backup").unlink()
+    rc, out = e.run(BACKUP, FAKE_BACKUP_SILENT="1")
+    check("ЛОЖНЫЙ УСПЕХ ЗАГРУЗКИ ПОЙМАН: скрипт упал", rc != 0, f"код {rc}")
+    check("названо, что именно не сошлось", "НОВОГО снимка" in out,
+          " / ".join(out.strip().splitlines()[-4:]))
+    check("в отказе назван тот самый старый id", old_id in out,
+          " / ".join(out.strip().splitlines()[-4:]))
+    calls = e.calls()
+    check("загрузку всё-таки пробовали", any(c.startswith("backup") for c in calls),
+          " | ".join(calls))
+    check("РОТАЦИИ НЕ БЫЛО: forget/prune не вызывался",
+          not any(c.startswith("forget") for c in calls), " | ".join(calls))
+    check("проверки хранилища не было — до неё не дошло",
+          not any(c.startswith("check") for c in calls), " | ".join(calls))
+    check("старый снимок на месте, его никто не тронул",
+          (e.repo_dir / "snapshot" / "oborot.db").exists()
+          and (e.repo_dir / "snapshot-id").read_text(encoding="utf-8").strip() == old_id)
+    check("отметки об успехе нет", not (e.state / "last-offsite-backup").exists())
 
     # ---------------------------------------------------------------- 6в
     print("\n== 6в. В хранилище уезжают только база и манифест ==")
@@ -622,6 +707,104 @@ def main() -> int:
     check("в отметке это видно",
           "tokens=нечего" in (e.state / "last-offsite-drill").read_text(encoding="utf-8"))
 
+    # --------------------------------------------------------------- 13е
+    print("\n== 13е. Копия секрета на диске сервера — учение не начинается ==")
+    # Найдено повторным внешним ревью 23.08. Схема сама себе противоречила:
+    # секрет объявлялся офсайт-копией, а лежал файлом в /opt/oborot — на том же
+    # диске, что и база. Такой файл умирает вместе с машиной ровно так же, как
+    # база, и еженедельное учение с ним доказывает только то, что сервер знает
+    # свой собственный ключ.
+    e = Env("drill-local-secret")
+    shutil.copy(seed, _mk(e.db))
+    e.repo_initialized()
+    e.run(BACKUP)
+    e.log.write_text("", encoding="utf-8")
+    rc, out = e.run(DRILL, OBOROT_DRILL_ALLOW_LOCAL_SECRET="0")
+    check("копия секрета на диске с базой — учение провалено", rc != 0, f"код {rc}")
+    check("названа причина", "той же файловой системе" in out,
+          " / ".join(out.strip().splitlines()[-3:]))
+    check("сказано, чем подать секрет вместо этого", "примонтированный" in out,
+          " / ".join(out.strip().splitlines()[-4:]))
+    check("отказ ДО обращения к хранилищу", e.calls() == [], " | ".join(e.calls()))
+    check("отметки об учении нет", not (e.state / "last-offsite-drill").exists())
+
+    # Осознанное послабление для стенда: не отказ, но и не молчаливый успех.
+    rc, out = e.run(DRILL, OBOROT_DRILL_ALLOW_LOCAL_SECRET="1")
+    check("с явным послаблением учение идёт", rc == 0,
+          out.strip().splitlines()[-1] if out.strip() else f"код {rc}")
+    stamp_text = (e.state / "last-offsite-drill").read_text(encoding="utf-8")
+    check("но в отметке видно, что происхождение ключа НЕ проверено",
+          "domain=не-проверен" in stamp_text, stamp_text.strip())
+    check("и сказано об этом вслух", "НЕ то, что ключ хранится вне этой машины" in out,
+          " / ".join(out.strip().splitlines()[-3:]))
+
+    print("\n== 13ж. Копия секрета, поданная извне, принимается ==")
+    alt = alt_fs_dir()
+    if alt is None:
+        print("  ПРОПУСК: второй файловой системы в этой машине не нашлось.")
+        print("  Смонтировать её тест не может (нужен root), а объявлять проверку")
+        print("  пройденной без проверки — то же самое враньё, против которого весь набор.")
+    else:
+        outside = alt / f"oborot-drill-secret-{os.getpid()}"
+        outside.write_text(LIVE_SECRET + "\n", encoding="utf-8")
+        os.chmod(outside, 0o600)
+        try:
+            rc, out = e.run(DRILL, OBOROT_DRILL_ALLOW_LOCAL_SECRET="0",
+                            OBOROT_RECOVERY_SECRET_FILE=str(outside))
+            check(f"секрет с другой файловой системы ({alt}) принят", rc == 0,
+                  out.strip().splitlines()[-1] if out.strip() else f"код {rc}")
+            stamp_text = (e.state / "last-offsite-drill").read_text(encoding="utf-8")
+            check("в отметке domain=отдельный", "domain=отдельный" in stamp_text,
+                  stamp_text.strip())
+            check("токены при этом расшифрованы", "tokens=да" in stamp_text,
+                  stamp_text.strip())
+            # Честность формулировки: «другая файловая система» — это не
+            # доказательство отдельного домена отказа, и учение так и говорит.
+            check("и прямо сказано, чего это НЕ доказывает",
+                  "физическое размещение доказать не может" in out,
+                  " / ".join(out.strip().splitlines()[-3:]))
+        finally:
+            outside.unlink(missing_ok=True)
+
+    print("\n== 13з. Схема хранения ключа не противоречит сама себе ==")
+    # Документ и юнит — часть той же схемы, и разъехаться им нельзя: образец
+    # конфигурации, юнит по расписанию и текст инструкции должны говорить одно.
+    unit = (ROOT / "deploy" / "systemd" / "oborot-offsite-drill.service").read_text(
+        encoding="utf-8")
+    example = (ROOT / "deploy" / "backup.env.example").read_text(encoding="utf-8")
+    readme = (ROOT / "deploy" / "README.md").read_text(encoding="utf-8")
+    secret_line = [ln for ln in example.splitlines()
+                   if ln.startswith("OBOROT_RECOVERY_SECRET_FILE=")]
+    check("в образце ровно одна строка с путём к копии секрета", len(secret_line) == 1,
+          str(secret_line))
+    secret_path = secret_line[0].split("=", 1)[1].strip() if secret_line else ""
+    check("образец НЕ предлагает файл на диске сервера",
+          not secret_path.startswith("/opt/oborot"), secret_path)
+    mount_lines = [ln for ln in unit.splitlines()
+                   if ln.startswith(("RequiresMountsFor=", "AssertPathIsMountPoint="))]
+    check("юнит учения требует смонтированного каталога", len(mount_lines) == 2,
+          str(mount_lines))
+    check("и это тот самый каталог, что в образце",
+          bool(secret_path) and all(
+              ln.split("=", 1)[1].strip() == os.path.dirname(secret_path)
+              for ln in mount_lines),
+          f"{secret_path} vs {mount_lines}")
+    # Assert*, а не Condition*: пропущенное учение выглядит как успешное.
+    check("отсутствие монтирования РОНЯЕТ учение, а не пропускает его",
+          "AssertPathIsMountPoint=" in unit and "ConditionPathIsMountPoint=" not in unit)
+    # Упомянуть локальный путь можно — ровно затем, чтобы сказать, что он не
+    # годится. Нельзя другое: предлагать его как рецепт или как значение
+    # настройки. Поэтому проверяются готовые команды и присваивания, а не само
+    # наличие строки: иначе тест запрещал бы объяснять, в чём была ошибка.
+    blocks = readme.split("```")[1::2]
+    check("README не предлагает завести файл секрета на диске сервера",
+          not any("/opt/oborot/recovery-secret" in b for b in blocks),
+          "рецепт остался в примере команд")
+    bad_assign = [ln for ln in (readme + "\n" + example).splitlines()
+                  if "OBOROT_RECOVERY_SECRET_FILE" in ln and "/opt/oborot" in ln]
+    check("нигде нет настройки, указывающей на диск сервера", not bad_assign,
+          str(bad_assign))
+
     # --------------------------------------------------------------- 13д
     print("\n== 13д. Таймауты у юнитов systemd заданы ==")
     # Type=oneshot живёт с DefaultTimeoutStartSec (обычно 90 с), если не сказано
@@ -658,6 +841,35 @@ def main() -> int:
 def _mk(p: Path) -> Path:
     p.parent.mkdir(parents=True, exist_ok=True)
     return p
+
+
+def alt_fs_dir():
+    """Каталог на ДРУГОЙ файловой системе, чем площадка теста, или None.
+
+    Нужен ровно для одной проверки: учение с копией секрета, поданной извне,
+    проходит и пишет `domain=отдельный`. Смонтировать файловую систему тест не
+    может — для этого нужен root, — поэтому берётся то, что уже есть в машине:
+    на Linux это обычно tmpfs `/dev/shm`. Не нашлось ничего — проверка
+    пропускается ВСЛУХ. Объявить её пройденной без проверки значило бы то же
+    самое враньё, против которого написан весь этот набор.
+    """
+    try:
+        base = os.stat(WORK).st_dev
+    except OSError:
+        return None
+    seen = []
+    for cand in ("/dev/shm", f"/run/user/{os.getuid()}",
+                 os.environ.get("TMPDIR", ""), "/tmp", "/var/tmp"):
+        if not cand or cand in seen:
+            continue
+        seen.append(cand)
+        p = Path(cand)
+        try:
+            if p.is_dir() and os.access(p, os.W_OK) and os.stat(p).st_dev != base:
+                return p
+        except OSError:
+            continue
+    return None
 
 
 if __name__ == "__main__":
