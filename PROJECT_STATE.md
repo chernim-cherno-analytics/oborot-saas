@@ -10,7 +10,10 @@
 
 ## Архитектура
 
-FastAPI и SQLAlchemy 2 (SQLite в dev, Postgres в prod через `DATABASE_URL`), Jinja2 и vanilla JS без сборки, APScheduler (ежедневный синк 06:00 МСК), Telegram-уведомления. Подробно — `ARCHITECTURE.md`, бизнес-правила — `BUSINESS_LOGIC.md`.
+FastAPI и SQLAlchemy 2; текущий production использует SQLite через
+`DATABASE_URL` (Postgres — не подтверждён). Jinja2 и vanilla JS без сборки,
+APScheduler (ежедневный синк 06:00 МСК), Telegram-уведомления. Подробно —
+`ARCHITECTURE.md`, бизнес-правила — `BUSINESS_LOGIC.md`.
 
 ## Прод
 

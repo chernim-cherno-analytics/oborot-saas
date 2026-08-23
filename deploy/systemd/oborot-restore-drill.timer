@@ -1,0 +1,11 @@
+[Unit]
+Description=Monthly Oborot off-site restore drill
+
+[Timer]
+OnCalendar=monthly
+RandomizedDelaySec=2h
+Persistent=true
+Unit=oborot-restore-drill.service
+
+[Install]
+WantedBy=timers.target

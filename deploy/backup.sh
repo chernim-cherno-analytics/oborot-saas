@@ -44,7 +44,7 @@ drop_out() { rm -f "$OUT" "$OUT-wal" "$OUT-shm"; }
 
 echo "== 1/4 Снимаем копию =="
 sqlite3 "$DB" ".backup '$OUT'"
-SIZE=$(stat -c%s "$OUT")
+SIZE=$(wc -c < "$OUT")
 echo "   $OUT ($((SIZE/1024/1024)) МБ)"
 
 echo "== 2/4 Проверяем копию =="
@@ -67,6 +67,11 @@ for T in orgs users products sales stock_days order_plans production_orders; do
   N=$(sqlite3 "$OUT" "SELECT COUNT(*) FROM $T;" 2>/dev/null || echo "нет таблицы")
   echo "   $T: $N"
 done
+
+# Открытие проверяемого snapshot в WAL-режиме может создать пустые sidecar
+# файлы. Все sqlite3-процессы уже завершились; они не являются частью архива и
+# не должны засорять каталог или ломать retention.
+rm -f "$OUT-wal" "$OUT-shm"
 
 echo "== 3/4 Сжимаем и чистим старые =="
 gzip -f "$OUT"

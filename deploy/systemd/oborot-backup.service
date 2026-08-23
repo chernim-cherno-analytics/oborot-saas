@@ -1,0 +1,13 @@
+[Unit]
+Description=Oborot encrypted off-site database backup
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+EnvironmentFile=/opt/oborot/backup.env
+ExecStart=/bin/bash /opt/oborot/app-src/deploy/backup_offsite.sh
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
