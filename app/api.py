@@ -374,7 +374,7 @@ def _find_twin_order(db: Session, org_id: int, fingerprint: str, before_id: int 
     return None
 
 
-@router.post("/orders")
+@router.post("/orders", dependencies=[Depends(subscription.require_write_access)])
 def api_create_order(
     body: OrderIn, ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)
 ):
@@ -622,7 +622,7 @@ class OrderStatusIn(BaseModel):
     received: list[ReceiptLineIn] | None = None
 
 
-@router.post("/orders/{order_id}/status")
+@router.post("/orders/{order_id}/status", dependencies=[Depends(subscription.require_write_access)])
 def api_order_status(
     body: OrderStatusIn,
     order_id: int = _id_path(),
@@ -743,7 +743,7 @@ def api_order_receipts(
     return _receipts_out(db, order)
 
 
-@router.post("/orders/{order_id}/receipts")
+@router.post("/orders/{order_id}/receipts", dependencies=[Depends(subscription.require_write_access)])
 def api_order_receipts_add(
     body: ReceiptsIn,
     order_id: int = _id_path(),
@@ -776,7 +776,7 @@ def api_order_receipts_add(
     return {"ok": True, "added": added, **_receipts_out(db, order)}
 
 
-@router.delete("/orders/{order_id}")
+@router.delete("/orders/{order_id}", dependencies=[Depends(subscription.require_write_access)])
 def api_order_delete(
     order_id: int = _id_path(), ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)
 ):
@@ -820,7 +820,7 @@ class OrderedIn(BaseModel):
     qty: float = Field(ge=0)
 
 
-@router.post("/ordered")
+@router.post("/ordered", dependencies=[Depends(subscription.require_write_access)])
 def api_set_ordered(
     body: OrderedIn, ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)
 ):
@@ -959,7 +959,7 @@ class SettingsIn(BaseModel):
         return v
 
 
-@router.post("/settings")
+@router.post("/settings", dependencies=[Depends(subscription.require_write_access)])
 def api_update_settings(
     body: SettingsIn, ctx: AuthContext = Depends(require_owner_api), db: Session = Depends(get_db)
 ):
@@ -1050,7 +1050,7 @@ class ExclusionIn(BaseModel):
     excluded: bool
 
 
-@router.post("/exclusions")
+@router.post("/exclusions", dependencies=[Depends(subscription.require_write_access)])
 def api_set_exclusion(
     body: ExclusionIn, ctx: AuthContext = Depends(require_owner_api), db: Session = Depends(get_db)
 ):
@@ -1069,7 +1069,7 @@ def api_set_exclusion(
     return {"ok": True, "base_name": body.base_name, "excluded": body.excluded, "variants": len(rows)}
 
 
-@router.post("/warehouses/{warehouse_id}/toggle")
+@router.post("/warehouses/{warehouse_id}/toggle", dependencies=[Depends(subscription.require_write_access)])
 def api_toggle_warehouse(
     warehouse_id: int = _id_path(), ctx: AuthContext = Depends(require_owner_api), db: Session = Depends(get_db)
 ):
@@ -1164,7 +1164,7 @@ class MoyskladConnectIn(BaseModel):
     token: str = Field(min_length=8)
 
 
-@router.post("/connect/moysklad")
+@router.post("/connect/moysklad", dependencies=[Depends(subscription.require_write_access)])
 def api_connect_moysklad(
     body: MoyskladConnectIn,
     ctx: AuthContext = Depends(require_owner_api),
@@ -1572,7 +1572,7 @@ def api_productions(ctx: AuthContext = Depends(require_auth_api), db: Session = 
     }
 
 
-@router.post("/productions")
+@router.post("/productions", dependencies=[Depends(subscription.require_write_access)])
 def api_production_create(
     body: ProductionIn, ctx: AuthContext = Depends(require_owner_api), db: Session = Depends(get_db)
 ):
@@ -1630,7 +1630,7 @@ class AssignRuleIn(BaseModel):
         return v
 
 
-@router.post("/productions/assign-rule")
+@router.post("/productions/assign-rule", dependencies=[Depends(subscription.require_write_access)])
 def api_assign_rule(
     body: AssignRuleIn,
     ctx: AuthContext = Depends(require_owner_api), db: Session = Depends(get_db),
@@ -1662,7 +1662,7 @@ def api_assign_rule(
             "assigned": len(assign), "by_production": by_pid}
 
 
-@router.post("/productions/assign")
+@router.post("/productions/assign", dependencies=[Depends(subscription.require_write_access)])
 def api_production_assign(
     body: ProductionAssignIn,
     ctx: AuthContext = Depends(require_owner_api), db: Session = Depends(get_db),
@@ -1698,7 +1698,7 @@ def api_production_assign(
     return {"ok": True}
 
 
-@router.post("/productions/{pid}")
+@router.post("/productions/{pid}", dependencies=[Depends(subscription.require_write_access)])
 def api_production_rename(
     body: ProductionIn,
     pid: int = _id_path(),
@@ -1721,7 +1721,7 @@ def api_production_rename(
     return _production_out(p, analytics.extra_settings(ctx.org)["lead_time_days"])
 
 
-@router.delete("/productions/{pid}")
+@router.delete("/productions/{pid}", dependencies=[Depends(subscription.require_write_access)])
 def api_production_delete(
     pid: int = _id_path(), ctx: AuthContext = Depends(require_owner_api), db: Session = Depends(get_db)
 ):
@@ -1745,7 +1745,7 @@ def api_production_delete(
     return {"ok": True}
 
 
-@router.post("/ordered/add")
+@router.post("/ordered/add", dependencies=[Depends(subscription.require_write_access)])
 def api_add_ordered(
     body: OrderedIn, ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)
 ):
@@ -2635,7 +2635,7 @@ class ProductionSetupIn(BaseModel):
     cadence_days: int | None = Field(default=None, ge=0, le=365)
 
 
-@router.post("/productions/{pid}/setup")
+@router.post("/productions/{pid}/setup", dependencies=[Depends(subscription.require_write_access)])
 def api_production_setup(
     body: ProductionSetupIn,
     pid: int = _id_path(),
@@ -2677,4 +2677,3 @@ def api_production_setup(
     db.commit()
     analytics.invalidate(ctx.org.id)
     return _production_out(p, analytics.extra_settings(ctx.org)["lead_time_days"])
-

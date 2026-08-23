@@ -100,7 +100,7 @@ class MoyskladConnectIn(BaseModel):
     token: str = Field(min_length=8)
 
 
-@router.post("/connect/moysklad")
+@router.post("/connect/moysklad", dependencies=[Depends(subscription.require_write_access)])
 async def api_connect_moysklad(
     body: MoyskladConnectIn,
     ctx: AuthContext = Depends(require_owner_api),
@@ -211,7 +211,7 @@ class StoresSelectIn(BaseModel):
     ext_ids: list[str] = Field(min_length=1)
 
 
-@router.post("/connect/moysklad/stores")
+@router.post("/connect/moysklad/stores", dependencies=[Depends(subscription.require_write_access)])
 async def api_moysklad_stores_select(
     body: StoresSelectIn,
     ctx: AuthContext = Depends(require_owner_api),

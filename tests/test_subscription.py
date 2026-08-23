@@ -5,7 +5,7 @@
 работающему клиенту доступ. Цена ошибки несимметрична: пропустить неплательщика
 — потерять деньги за месяц, закрыть плательщика — потерять клиента. Поэтому
 здесь проверяется не только «блокирует», но и, прежде всего, «НЕ блокирует»:
-чтение, экспорт, страницу тарифов и саму заявку на счёт.
+чтение, экспорт, вход/аккаунт, страницу тарифов и саму заявку на счёт.
 
 Проверяется:
   1) выключенный по умолчанию флаг: без OBOROT_SUBSCRIPTION_GATE не блокируется
@@ -13,8 +13,8 @@
   2) машина состояний: триал, paid_until, грейс от отметки «счёт выставлен»,
      организации из каталога МойСклад, suspended;
   3) грейс ровно 5 календарных дней и ни днём больше;
-  4) с включённым флагом readonly закрывает три группы (синк, запись в МС,
-     расчёт и сохранение планов) и НИ ОДНОГО чтения;
+  4) с включённым флагом readonly закрывает все изменения бизнес-данных,
+     синк, запись в МС, расчёт и сохранение планов — и НИ ОДНОГО чтения;
   5) сторож по всем POST-роутам приложения: множество закрытых гейтом ручек
      совпадает с ожидаемым списком — новая пишущая ручка не проскочит молча
      ни внутрь гейта, ни мимо него;
@@ -105,13 +105,42 @@ D = lambda n: (date.today() + timedelta(days=n)).isoformat()  # noqa: E731
 
 # ── Сторож по роутам ─────────────────────────────────────────────────────────
 
-# Ровно те ручки, которым гейт разрешено закрывать. Список — часть решения
-# D-24 («в порядке ценности, а не всё подряд»), поэтому меняется осознанно:
-# правка этого множества обязана сопровождаться правкой BUSINESS_LOGIC §11.
+# Все изменения бизнес-данных организации. Это и есть буквальный смысл
+# readonly по D-24: прежние данные видны, новые действия недоступны. Правка
+# множества обязана сопровождаться правкой BUSINESS_LOGIC §11.
 EXPECTED_GATED = {
+    # Подключение, синк и внешняя запись.
+    ("POST", "/api/connect/moysklad"),
+    ("POST", "/api/connect/moysklad/stores"),
+    ("POST", "/api/warehouses/{warehouse_id}/toggle"),
     ("POST", "/api/sync/initial"),
     ("POST", "/api/sync/run"),
     ("POST", "/api/orders/{order_id}/push-to-ms"),
+    # Заказы, исполнение и фактическое «едет к нам».
+    ("POST", "/api/orders"),
+    ("POST", "/api/orders/{order_id}/status"),
+    ("POST", "/api/orders/{order_id}/receipts"),
+    ("DELETE", "/api/orders/{order_id}"),
+    ("POST", "/api/ordered"),
+    ("POST", "/api/ordered/add"),
+    # Настройки расчётов и пользовательские бизнес-справочники.
+    ("POST", "/api/settings"),
+    ("POST", "/api/exclusions"),
+    ("POST", "/api/hidden"),
+    ("POST", "/api/categories/override"),
+    ("POST", "/api/categories/merge"),
+    ("POST", "/api/discount-rule"),
+    ("POST", "/api/discount-overrides"),
+    ("POST", "/api/discount-overrides/defaults"),
+    ("POST", "/api/replenish-draft"),
+    ("POST", "/api/replenish-draft/reset"),
+    ("POST", "/api/productions"),
+    ("POST", "/api/productions/{pid}"),
+    ("POST", "/api/productions/{pid}/setup"),
+    ("POST", "/api/productions/assign-rule"),
+    ("POST", "/api/productions/assign"),
+    ("DELETE", "/api/productions/{pid}"),
+    # Новые рекомендации и превращение их в заказ.
     ("POST", "/api/order-plan/preview"),
     ("POST", "/api/order-plan"),
     ("POST", "/api/order-plan/{plan_id}/apply"),
@@ -137,42 +166,14 @@ EXPECTED_OPEN = {
     ("POST", "/logout"): "выход",
     ("POST", "/api/account/password"): "смена пароля",
     ("POST", "/api/account/delete"): "удаление аккаунта",
-    # Подключение и склады: сам синк закрыт в ms_sync.start_sync — единой
-    # точкой, через которую проходят ВСЕ запуски, включая планировщик.
-    ("POST", "/api/connect/moysklad"): "ввод токена; синк закрыт в start_sync",
-    ("POST", "/api/connect/moysklad/stores"): "выбор складов; синк закрыт в start_sync",
-    ("POST", "/api/warehouses/{warehouse_id}/toggle"): "выбор складов",
+    # Коммуникационные и интерфейсные предпочтения не меняют бизнес-данные.
     ("POST", "/api/notify/settings"): "настройки уведомлений",
     ("POST", "/api/notify/test"): "проверка своего же телеграм-канала",
-    # Заказы и приёмки: бухгалтерия по уже принятым решениям.
-    ("POST", "/api/orders"): "создание заказа вручную",
-    ("POST", "/api/orders/{order_id}/status"): "движение статуса заказа",
-    ("POST", "/api/orders/{order_id}/receipts"): "запись факта о том, что уже пришло",
-    ("DELETE", "/api/orders/{order_id}"): "удаление своего заказа",
-    ("POST", "/api/ordered"): "ручная правка «едет к нам»",
-    ("POST", "/api/ordered/add"): "ручная правка «едет к нам»",
-    # Справочники и вид: ничего не стоит и ничего не создаёт.
-    ("POST", "/api/settings"): "настройки организации",
-    ("POST", "/api/exclusions"): "исключения из аналитики",
-    ("POST", "/api/hidden"): "архив позиции",
-    ("POST", "/api/categories/override"): "перенос категории",
-    ("POST", "/api/categories/merge"): "слияние категорий",
-    ("POST", "/api/discount-rule"): "правило уценки",
-    ("POST", "/api/discount-overrides"): "ручная скидка",
-    ("POST", "/api/discount-overrides/defaults"): "дефолтные скидки",
-    ("POST", "/api/replenish-draft"): "черновик ростовки",
-    ("POST", "/api/replenish-draft/reset"): "сброс черновика ростовки",
-    ("POST", "/api/productions"): "канал производства",
-    ("POST", "/api/productions/{pid}"): "канал производства",
-    ("POST", "/api/productions/{pid}/setup"): "условия канала",
-    ("POST", "/api/productions/assign-rule"): "правило распределения",
-    ("POST", "/api/productions/assign"): "назначение позиции на канал",
     ("POST", "/api/hints/seen"): "подсказки",
     ("POST", "/api/prefs/hints"): "подсказки",
     ("POST", "/api/lessons/{key}/done"): "обучение",
     ("POST", "/api/lessons/reset"): "обучение",
     ("POST", "/api/lessons/{key}/reset"): "обучение",
-    ("DELETE", "/api/productions/{pid}"): "удаление своего канала производства",
     # Ручки жизненного цикла приложения МойСклада: их вызывает САМ МойСклад
     # по своему JWT, а не пользователь. Закрыть их гейтом значило бы не пустить
     # МС сообщить нам, что подписку активировали или сняли, — то есть закрыть
@@ -341,9 +342,15 @@ def main() -> int:
         print("\n== Флаг включён: readonly закрывает запись ==")
         gate(True)
         blocked = {
+            "подключение МойСклада": c.post("/api/connect/moysklad", json={}),
             "синхронизация (инкрементальная)": c.post("/api/sync/run"),
             "синхронизация (первичная)": c.post("/api/sync/initial"),
             "запись в МойСклад": c.post("/api/orders/1/push-to-ms"),
+            "создание ручного заказа": c.post("/api/orders", json={}),
+            "запись факта приёмки": c.post("/api/orders/1/receipts", json={}),
+            "изменение настроек расчёта": c.post("/api/settings", json={}),
+            "изменение справочника": c.post("/api/productions", json={}),
+            "ручная правка рекомендации": c.post("/api/replenish-draft", json={}),
             "расчёт плана": c.post("/api/order-plan/preview", json={}),
             "сохранение плана": c.post("/api/order-plan", json={}),
             "применение плана": c.post("/api/order-plan/1/apply", json={}),
@@ -484,8 +491,9 @@ def main() -> int:
           found <= mutating, f"не-POST={sorted(found - mutating)}")
     check("гейт не стоит ни на одном GET",
           not any(m == "GET" for m, _ in found), str(sorted(found))[:200])
-    check("закрыта меньшая часть пишущих ручек (гейт точечный, а не веерный)",
-          len(found) * 2 < len(mutating), f"{len(found)} из {len(mutating)}")
+    check("открыты только явно разрешённые служебные и account-ручки",
+          found == mutating - set(EXPECTED_OPEN),
+          f"закрыто {len(found)} из {len(mutating)}")
 
     # Вторая половина сторожа — та, которой не было и из-за которой мимо гейта
     # проскочило сохранение токена, запускавшее полный синк. Каждая пишущая

@@ -19,7 +19,7 @@ from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, delete, sele
 import json
 import os
 
-from app import analytics, analytics_extra, analytics_markdown, auth
+from app import analytics, analytics_extra, analytics_markdown, auth, subscription
 from app.api import _require_known_base, apply_production_rules, production_conditions
 from app.auth import AuthContext, require_auth_api, require_owner_api
 from app.db import Base, get_db
@@ -199,7 +199,7 @@ def api_discount_overrides(
     return _discount_overrides(db, ctx.org.id)
 
 
-@router.post("/api/discount-overrides")
+@router.post("/api/discount-overrides", dependencies=[Depends(subscription.require_write_access)])
 def api_set_discount_override(
     body: DiscountIn,
     ctx: AuthContext = Depends(require_auth_api),
@@ -226,7 +226,7 @@ def api_set_discount_override(
     return {"ok": True, "base_name": base_name, "discount": round(body.discount)}
 
 
-@router.post("/api/discount-overrides/defaults")
+@router.post("/api/discount-overrides/defaults", dependencies=[Depends(subscription.require_write_access)])
 def api_apply_default_discounts(
     ctx: AuthContext = Depends(require_owner_api), db: Session = Depends(get_db)
 ):
@@ -409,7 +409,7 @@ def api_hidden(ctx: AuthContext = Depends(require_auth_api), db: Session = Depen
     return {"hidden": rows}
 
 
-@router.post("/api/hidden")
+@router.post("/api/hidden", dependencies=[Depends(subscription.require_write_access)])
 def api_set_hidden(
     body: HiddenIn, ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)
 ):
@@ -455,7 +455,7 @@ def api_categories(ctx: AuthContext = Depends(require_auth_api), db: Session = D
     return {"overrides": overrides, "merges": merges}
 
 
-@router.post("/api/categories/override")
+@router.post("/api/categories/override", dependencies=[Depends(subscription.require_write_access)])
 def api_category_override(
     body: CategoryOverrideIn,
     ctx: AuthContext = Depends(require_auth_api),
@@ -483,7 +483,7 @@ def api_category_override(
     return {"ok": True, "base_name": base_name, "category": cat}
 
 
-@router.post("/api/categories/merge")
+@router.post("/api/categories/merge", dependencies=[Depends(subscription.require_write_access)])
 def api_category_merge(
     body: CategoryMergeIn,
     ctx: AuthContext = Depends(require_auth_api),
@@ -528,7 +528,7 @@ def api_discount_rule(ctx: AuthContext = Depends(require_auth_api), db: Session 
     }
 
 
-@router.post("/api/discount-rule")
+@router.post("/api/discount-rule", dependencies=[Depends(subscription.require_write_access)])
 def api_set_discount_rule(
     body: DiscountRuleIn,
     ctx: AuthContext = Depends(require_owner_api),
@@ -612,7 +612,7 @@ def api_replenish_draft(
     return {"drafts": drafts}
 
 
-@router.post("/api/replenish-draft")
+@router.post("/api/replenish-draft", dependencies=[Depends(subscription.require_write_access)])
 def api_save_replenish_draft(
     body: ReplenishDraftIn,
     ctx: AuthContext = Depends(require_auth_api),
@@ -648,7 +648,7 @@ def api_save_replenish_draft(
     return {"ok": True, "base_name": base_name, "sizes": clean}
 
 
-@router.post("/api/replenish-draft/reset")
+@router.post("/api/replenish-draft/reset", dependencies=[Depends(subscription.require_write_access)])
 def api_reset_replenish_draft(
     body: ReplenishDraftResetIn,
     ctx: AuthContext = Depends(require_auth_api),
