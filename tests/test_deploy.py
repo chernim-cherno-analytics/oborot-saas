@@ -65,7 +65,18 @@ printf '%s\n' "$4" >> "$PIP_LOG"
         executable(self.fake / "flock", '[ "$FLOCK_FAIL" = 1 ] && exit 1; exit 0\n')
         executable(self.fake / "systemctl", 'printf "restart\\n" >> "$RESTART_LOG"\n')
         executable(self.fake / "journalctl", 'printf "fake journal\\n"\n')
-        executable(self.fake / "sqlite3", 'echo ok\n')
+        executable(self.fake / "sqlite3", """
+case "$2" in
+  .backup*)
+    target=$(printf '%s' "$2" | sed -n "s/^\\.backup '\\(.*\\)'$/\\1/p")
+    cp "$1" "$target"
+    ;;
+  *) echo ok ;;
+esac
+""")
+        # macOS find не поддерживает GNU -printf; ротация не относится к
+        # проверяемой транзакции и здесь имитируется пустым списком удаления.
+        executable(self.fake / "find", "exit 0\n")
         executable(self.fake / "curl", """
 head=$(git -C "$OBOROT_APP_DIR" rev-parse HEAD)
 [ "$head" = "$BAD_SHA" ] && exit 22
@@ -74,6 +85,7 @@ printf '{"status":"ok"}\n'
 
         self.restart_log = self.state / "restarts"
         self.pip_log = self.state / "pip"
+        (self.data / "oborot.db").write_text("fake sqlite source", encoding="utf-8")
 
     def close(self) -> None:
         shutil.rmtree(self.tmp)
@@ -124,6 +136,10 @@ def scenario_success() -> None:
         check("OBOROT_COMMIT обновлён полным SHA", f"OBOROT_COMMIT={box.new}" in
               box.env_file.read_text())
         check("сервис перезапущен один раз", box.restart_log.read_text().count("restart") == 1)
+        backups = list((box.data / "backups").glob("oborot-*.db"))
+        check("перед релизом создана копия базы", len(backups) == 1)
+        check("копия снята с ожидаемого файла",
+              backups[0].read_text(encoding="utf-8") == "fake sqlite source")
     finally:
         box.close()
 
@@ -158,6 +174,8 @@ def scenario_dependency_failure_does_not_switch() -> None:
         check("ошибка pip останавливает релиз", result.returncode != 0)
         check("при ошибке pip код не переключён", box.head() == box.old)
         check("при ошибке pip сервис не перезапущен", not box.restart_log.exists())
+        check("при ошибке pip база ещё не копировалась",
+              not list((box.data / "backups").glob("oborot-*.db")))
     finally:
         box.close()
 
