@@ -26,16 +26,55 @@ jobs:
           python-version: "3.11"
           cache: pip
 
-      - name: Установка зависимостей
+      - name: Установка зависимостей (fail-closed)
         # Тот же lock-файл, что ставит деплой: иначе «зелёный CI» и «то, что
         # поехало в бой» — разные наборы версий, и смысл фиксации теряется.
+        #
+        # FAIL-CLOSED: раньше при отсутствии lock-файла CI тихо откатывался на
+        # requirements.txt с диапазонами и оставался ЗЕЛЁНЫМ. То есть ровно в
+        # том случае, ради которого фиксация и заводилась — файл потеряли, не
+        # обновили, не залили — проверка молчала. Теперь это падение.
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.lock ]; then
-            pip install -r requirements.lock
-          else
-            pip install -r requirements.txt
+          if [ ! -f requirements.lock ]; then
+            echo "НЕТ requirements.lock — сборка невоспроизводима, останавливаюсь."
+            echo "Соберите lock из проверенного окружения и залейте вместе с кодом."
+            exit 1
           fi
+          pip install -r requirements.lock
+
+      - name: Зависимости совместимы и совпадают с lock
+        # Две разные проверки, обе дешёвые.
+        # pip check — нет ли конфликта требований между установленными пакетами.
+        # Сверка с lock — не уехало ли фактическое окружение от записанного:
+        # lock-файл, которому окружение не соответствует, хуже отсутствия
+        # lock-файла, потому что создаёт ложную уверенность.
+        run: |
+          pip check
+          python - <<'PY'
+          import re, sys
+          from importlib.metadata import version, PackageNotFoundError
+          bad = []
+          for line in open("requirements.lock", encoding="utf-8"):
+              line = line.split("#", 1)[0].strip()
+              if not line or "==" not in line:
+                  continue
+              name, want = line.split("==", 1)
+              name, want = name.strip(), want.strip()
+              try:
+                  have = version(name)
+              except PackageNotFoundError:
+                  bad.append(f"{name}: в lock {want}, не установлен")
+                  continue
+              if have != want:
+                  bad.append(f"{name}: в lock {want}, установлено {have}")
+          if bad:
+              print("ОКРУЖЕНИЕ НЕ СОВПАДАЕТ С requirements.lock:")
+              for b in bad:
+                  print("  " + b)
+              sys.exit(1)
+          print("окружение совпадает с lock")
+          PY
 
       - name: Все наборы тестов
         # По три набора одновременно: на двухъядерном раннере одиннадцать
