@@ -149,14 +149,24 @@ tools/agent-bridge/run.sh health   # сводная проверка, код в�
 Тестам нужен интерпретатор с зависимостями проекта. У системного `python3` их
 нет, и набор упал бы на первом импорте — а выглядело бы это как «правка сломала
 тесты», самая дорогая в разборе ложная тревога. Соберите venv из того же
-lock-файла, что ставят CI и деплой, и укажите его в настройках:
+lock-файла, что ставят CI и деплой, — ровно по этому пути:
 
 ```bash
 python3 -m venv ~/.local/state/oborot-agent-bridge/venv
 ~/.local/state/oborot-agent-bridge/venv/bin/pip install -r requirements.lock
-echo 'OBOROT_BRIDGE_TEST_PYTHON=~/.local/state/oborot-agent-bridge/venv/bin/python' \
-  >> ~/.config/oborot-agent-bridge/config.env
 ```
+
+Прописывать путь в настройки не нужно: venv в каталоге состояния диспетчер
+находит сам, и одинаково — фоновая задача, `health` и `install.sh`. Проверить,
+что получилось: `tools/agent-bridge/run.sh resolve test-python`. Если
+интерпретатор лежит в другом месте, задайте `OBOROT_BRIDGE_TEST_PYTHON` — явный
+путь важнее автопоиска.
+
+Пока тесты включены, а интерпретатора нет, `install.sh` автоматику не поставит
+и напечатает эти две команды: фон, который валит на импорте любую правку,
+выглядит работающим, а не пропускает ничего — это хуже, чем отсутствие фона.
+Проверить готовность, ничего не устанавливая: `tools/agent-bridge/install.sh
+--check`.
 
 Venv надо пересобирать при каждом изменении `requirements.lock`.
 
@@ -235,7 +245,7 @@ HEAD:refs/heads/<ветка>`. Отклонённый push не форсится
 |---|---|---|
 | Ревью Codex висит, ответа нет, в PR появился комментарий `oborot-watchdog` | машина спит, выключена или без сети | разбудить машину; `run.sh health` |
 | `run.sh health` ругается на `claude` или `gh` | LaunchAgent не нашёл бинарник или сессия разлогинена | `gh auth login`, переавторизовать `claude`, при нужде задать `OBOROT_BRIDGE_CLAUDE_BIN` / `OBOROT_BRIDGE_GH_BIN` |
-| В PR `TESTS_FAILED`, а в хвосте `ModuleNotFoundError` | у интерпретатора тестов нет зависимостей проекта | пересобрать venv из `requirements.lock` и задать `OBOROT_BRIDGE_TEST_PYTHON` |
+| В PR `TESTS_FAILED`, а в хвосте `ModuleNotFoundError` | у интерпретатора тестов нет зависимостей проекта (venv удалили или он отстал от `requirements.lock`) | пересобрать `<каталог состояния>/venv` из `requirements.lock`; проверить `run.sh resolve test-python` — в журнале прогона тот же путь |
 | В PR `TESTS_FAILED` | правка внесена, но тесты не прошли; в ветку ничего не отправлено | прочитать хвост тестов в комментарии; починить руками или уточнить замечание |
 | В PR `NO_CHANGES` | модель не изменила ни файла — замечание требует решения человека | ответить в PR по существу замечания |
 | В PR `PUSH_REJECTED` | ветка уехала вперёд | ничего; следующий цикл начнёт с актуального SHA |

@@ -21,12 +21,18 @@
   6) команда тестов у диспетчера совпадает с командой CI;
   7) привязка inline-замечания к SHA: у GitHub поле `commit_id` замечания
      переезжает на новый коммит, и по нему старое ревью выглядит как новое;
-  8) после успешного push диспетчер один раз просит ревью нового SHA.
+  8) после успешного push диспетчер один раз просит ревью нового SHA;
+  9) интерпретатор тестов: фон, health и установщик выбирают ОДИН И ТОТ ЖЕ,
+     а установщик отказывается ставить автоматику, которой нечем гонять
+     тесты (настоящий launchd при этом не трогается).
 
 Запуск из корня репозитория:  python tests/test_agent_bridge.py
 """
+import contextlib
 import importlib.util
+import io
 import json
+import os
 import re
 import subprocess
 import sys
@@ -35,6 +41,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 BRIDGE_PY = ROOT / "tools" / "agent-bridge" / "bridge.py"
+INSTALL_SH = ROOT / "tools" / "agent-bridge" / "install.sh"
+UNINSTALL_SH = ROOT / "tools" / "agent-bridge" / "uninstall.sh"
+RUN_SH = ROOT / "tools" / "agent-bridge" / "run.sh"
 CI_YML = ROOT / ".github" / "workflows" / "ci.yml"
 WATCHDOG_YML = ROOT / ".github" / "workflows" / "agent-watchdog.yml"
 
@@ -666,6 +675,340 @@ def test_watchdog_permissions():
           "comment.commit_id === headSha" not in text)
 
 
+# --------------------------------------------------------------------------
+# 9. Интерпретатор тестов: один и тот же у фона, health и установщика
+# --------------------------------------------------------------------------
+#
+# Разбираемый дефект. Тесты диспетчер гоняет тем интерпретатором, который
+# укажут в OBOROT_BRIDGE_TEST_PYTHON. Установщик копировал config.env, где эта
+# строка закомментирована, в plist переменную не клал, а health о пустом
+# значении лишь предупреждал. В итоге фон брал системный python3 без
+# зависимостей проекта: набор падал на первом импорте, диспетчер отчитывался
+# TESTS_FAILED по КАЖДОЙ правке, и автоматика, выглядя живой, не пропускала
+# ничего. Ниже проверяется ровно то, чем это закрыто: путь считает одна
+# функция от каталога состояния, а установщик не ставит фон, которому нечем
+# запускать тесты. Настоящий launchd при этом не трогается.
+
+
+def bare_config(**values):
+    """Config без чтения ~/.config и переменных окружения."""
+    cfg = bridge.Config.__new__(bridge.Config)
+    cfg.values = dict(bridge.CONFIG_KEYS)
+    cfg.values.update(values)
+    return cfg
+
+
+def make_venv(root: Path) -> Path:
+    """Заглушка venv: важно только то, что файл на месте и исполняемый."""
+    path = bridge.venv_python(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("#!/bin/sh\nexec python3 \"$@\"\n", encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
+def make_executable(path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
+def test_test_python_resolution():
+    print("\n== Откуда берётся интерпретатор тестов ==")
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "state"
+        root.mkdir()
+
+        check("без venv и без настройки — ничего",
+              bridge.resolve_test_python(bare_config(STATE_DIR=str(root))) == ("", ""),
+              str(bridge.resolve_test_python(bare_config(STATE_DIR=str(root)))))
+
+        # Файл есть, но не исполняемый — это не интерпретатор. Отдать его
+        # значило бы поменять падение на импорте на падение на exec.
+        blind = bridge.venv_python(root)
+        blind.parent.mkdir(parents=True, exist_ok=True)
+        blind.write_text("", encoding="utf-8")
+        blind.chmod(0o644)
+        check("неисполняемый venv не считается",
+              bridge.resolve_test_python(bare_config(STATE_DIR=str(root))) == ("", ""))
+
+        venv = make_venv(root)
+        found, source = bridge.resolve_test_python(bare_config(STATE_DIR=str(root)))
+        check("venv в каталоге состояния находится сам",
+              (found, source) == (str(venv), "venv"), f"{found!r}, {source!r}")
+
+        # Явная настройка важнее автопоиска: подменить указанный владельцем
+        # интерпретатор на найденный самим — значит гонять тесты не тем.
+        other = make_executable(Path(tmp) / "own" / "python")
+        found, source = bridge.resolve_test_python(
+            bare_config(STATE_DIR=str(root), TEST_PYTHON=str(other)))
+        check("явно заданный путь важнее найденного venv",
+              (found, source) == (str(other), "config"), f"{found!r}, {source!r}")
+
+        # Несуществующий явный путь возвращается как есть: ругаться на него —
+        # дело health и install.sh, у них для этого есть слова.
+        found, source = bridge.resolve_test_python(
+            bare_config(STATE_DIR=str(root), TEST_PYTHON="/nope/python"))
+        check("несуществующий явный путь не подменяется на venv",
+              (found, source) == ("/nope/python", "config"), f"{found!r}, {source!r}")
+
+        found, _ = bridge.resolve_test_python(
+            bare_config(STATE_DIR=str(root), TEST_PYTHON="~/python"))
+        check("тильда в явном пути разворачивается",
+              found == str(Path.home() / "python"), found)
+
+
+def test_run_tests_uses_resolved_interpreter():
+    print("\n== Чем прогон тестов запускается на самом деле ==")
+
+    class StubTools:
+        python = "/usr/bin/python3"
+
+    class StubPath:
+        def __init__(self, path):
+            self.path = path
+
+    def run_with(cfg_values, tmp):
+        instance = make_bridge(cfg_values, StubGitHub(), Path(tmp) / "state.json")
+        instance.tools = StubTools()
+        instance.checkout = StubPath(Path(tmp))
+        seen = {}
+
+        def fake_run(argv, cwd=None, timeout=None, **kwargs):
+            seen["argv"] = list(argv)
+            return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+        original, bridge.run = bridge.run, fake_run
+        try:
+            instance.run_tests()
+        finally:
+            bridge.run = original
+        return seen.get("argv", []), instance.log.lines
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "state"
+        venv = make_venv(root)
+        argv, _ = run_with({"STATE_DIR": str(root)}, tmp)
+        check("тесты идут интерпретатором venv, а не системным",
+              argv[:1] == [str(venv)], str(argv))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "state"
+        root.mkdir()
+        argv, log_lines = run_with({"STATE_DIR": str(root)}, tmp)
+        # venv удалили уже после установки: запрет остаётся у install.sh, а
+        # прогон обязан хотя бы объяснить в журнале, почему всё покраснело.
+        check("без venv остаётся системный python3", argv[:1] == ["/usr/bin/python3"], str(argv))
+        check("отсутствие venv пишется в журнал предупреждением",
+              any(level == "WARN" and "интерпретатор тестов не найден" in message
+                  for level, message in log_lines), str(log_lines))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "state"
+        make_venv(root)
+        own = make_executable(Path(tmp) / "own" / "python")
+        argv, _ = run_with({"STATE_DIR": str(root), "TEST_PYTHON": str(own)}, tmp)
+        check("явная настройка побеждает и в прогоне", argv[:1] == [str(own)], str(argv))
+
+
+def test_health_requires_interpreter():
+    print("\n== health про интерпретатор тестов ==")
+
+    class StubTools:
+        gh = git = claude = python = ""
+
+        def __init__(self, cfg=None):
+            pass
+
+        def missing(self):
+            return ["gh", "git", "claude", "python3"]
+
+    def health_output(cfg):
+        """cmd_health без внешних вызовов: ни gh, ни launchctl, ни сети."""
+        out = io.StringIO()
+        tools_original, bridge.Tools = bridge.Tools, StubTools
+        run_original = bridge.run
+        bridge.run = lambda *a, **k: subprocess.CompletedProcess(["stub"], 1, "", "")
+        try:
+            with contextlib.redirect_stdout(out):
+                code = bridge.cmd_health(None, cfg)
+        finally:
+            bridge.Tools, bridge.run = tools_original, run_original
+        return code, out.getvalue()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "state"
+        root.mkdir()
+
+        code, text = health_output(bare_config(STATE_DIR=str(root)))
+        line = next((l for l in text.splitlines() if "интерпретатор тестов" in l), "")
+        check("без venv health не предупреждает, а заваливается",
+              line.startswith("  [!!]"), line)
+        check("health называет команду сборки venv", "python3 -m venv" in text)
+        check("интерпретатор попал в список проблем",
+              "интерпретатор тестов" in text.split("Проблемы:")[-1] and code == 1)
+
+        venv = make_venv(root)
+        _, text = health_output(bare_config(STATE_DIR=str(root)))
+        line = next((l for l in text.splitlines() if "интерпретатор тестов" in l), "")
+        check("с venv health его показывает и принимает",
+              line.startswith("  [ok]") and str(venv) in line, line)
+
+        _, text = health_output(
+            bare_config(STATE_DIR=str(root), TEST_PYTHON="/nope/python"))
+        line = next((l for l in text.splitlines() if "интерпретатор тестов" in l), "")
+        check("сломанный явный путь health заваливает",
+              line.startswith("  [!!]") and "/nope/python" in line, line)
+
+        # Выключенные тесты — осознанное решение владельца, а не поломка.
+        _, text = health_output(bare_config(STATE_DIR=str(root), TEST_CMD=""))
+        check("при выключенных тестах интерпретатор не требуется",
+              "отключены настройкой TEST_CMD" in text
+              and "интерпретатор тестов" not in text)
+
+
+def bridge_env(home: Path, **extra):
+    """Окружение для запуска скриптов: без наследования настроек этой машины."""
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": str(home),
+        "XDG_STATE_HOME": str(home / ".local" / "state"),
+        "XDG_CONFIG_HOME": str(home / ".config"),
+        "LANG": "ru_RU.UTF-8",
+    }
+    env.update({k: v for k, v in extra.items() if v is not None})
+    return env
+
+
+def install_check(home: Path, **extra):
+    """`install.sh --check`: разбор настроек и запрет на полурабочий фон.
+
+    Настоящей установки нет: до записи plist и до launchctl этот режим не
+    доходит вовсе, поэтому тест безопасен и на машине владельца.
+    """
+    return subprocess.run(
+        ["bash", str(INSTALL_SH), "--check"],
+        capture_output=True, text=True, timeout=180, env=bridge_env(home, **extra))
+
+
+def resolve_value(home: Path, key: str, **extra) -> str:
+    result = subprocess.run(
+        ["bash", str(RUN_SH), "resolve", key],
+        capture_output=True, text=True, timeout=120, env=bridge_env(home, **extra))
+    return result.stdout.strip()
+
+
+def test_installer_refuses_without_interpreter():
+    print("\n== Установщик не ставит фон, которому нечем гонять тесты ==")
+    with tempfile.TemporaryDirectory() as tmp:
+        home = Path(tmp) / "home"
+        home.mkdir()
+
+        result = install_check(home)
+        check("без venv установка обрывается", result.returncode == 1, result.stdout[-300:])
+        check("сказано, чем это чинится",
+              "python3 -m venv" in result.stderr and "requirements.lock" in result.stderr,
+              result.stderr[-300:])
+        check("названа причина, а не просто «ошибка»",
+              "TESTS_FAILED" in result.stderr, result.stderr[-300:])
+        check("настоящий LaunchAgent не появился",
+              not (home / "Library" / "LaunchAgents").exists())
+
+        # Обход health к этой проверке отношения не имеет: обходить нечего,
+        # фон без интерпретатора не работает ни при каких флагах.
+        skipped = install_check(home, OBOROT_BRIDGE_SKIP_HEALTH="1")
+        check("OBOROT_BRIDGE_SKIP_HEALTH проверку не обходит",
+              skipped.returncode == 1, skipped.stdout[-300:])
+
+        # Тесты можно выключить сознательно — тогда интерпретатор не нужен.
+        off = install_check(home, OBOROT_BRIDGE_TEST_CMD="")
+        check("с выключенными тестами установщик не возражает",
+              off.returncode == 0, (off.stdout + off.stderr)[-300:])
+
+
+def test_installer_accepts_venv_and_explicit_path():
+    print("\n== Установщик и найденный интерпретатор ==")
+    with tempfile.TemporaryDirectory() as tmp:
+        home = Path(tmp) / "home"
+        home.mkdir()
+        state = home / ".local" / "state" / "oborot-agent-bridge"
+        venv = make_venv(state)
+
+        result = install_check(home)
+        check("venv в каталоге состояния установщик находит сам",
+              result.returncode == 0 and str(venv) in result.stdout,
+              (result.stdout + result.stderr)[-300:])
+        check("установщик создал файл настроек",
+              (home / ".config" / "oborot-agent-bridge" / "config.env").is_file())
+        # Ради проверки настроек копировать репозиторий в LaunchAgents незачем.
+        check("режим --check ничего не установил",
+              not (home / "Library" / "LaunchAgents").exists())
+
+        own = make_executable(Path(tmp) / "own" / "python")
+        explicit = install_check(home, OBOROT_BRIDGE_TEST_PYTHON=str(own))
+        check("явно заданный интерпретатор принимается",
+              explicit.returncode == 0 and str(own) in explicit.stdout,
+              (explicit.stdout + explicit.stderr)[-300:])
+
+        broken = install_check(home, OBOROT_BRIDGE_TEST_PYTHON=str(Path(tmp) / "nope"))
+        check("явно заданный несуществующий путь установку обрывает",
+              broken.returncode == 1 and "не исполняемый файл" in broken.stderr,
+              (broken.stdout + broken.stderr)[-300:])
+
+
+def test_launchagent_and_health_share_interpreter():
+    print("\n== Фон и health видят один интерпретатор ==")
+    with tempfile.TemporaryDirectory() as tmp:
+        home = Path(tmp) / "home"
+        home.mkdir()
+        state = home / ".local" / "state" / "oborot-agent-bridge"
+        venv = make_venv(state)
+
+        # Так спрашивает установщик, и то же самое видит ручной health.
+        interactive_state = resolve_value(home, "state-dir")
+        interactive = resolve_value(home, "test-python")
+        check("в обычной сессии находится venv", interactive == str(venv), interactive)
+
+        # А так выглядит окружение фоновой задачи: launchd не даёт ни XDG_*,
+        # ни PATH пользователя — только то, что перечислено в plist. Раньше
+        # тут получался пустой путь и молча брался системный python3.
+        launchd = {
+            "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+            "HOME": str(home),
+            "OBOROT_BRIDGE_STATE_DIR": interactive_state,
+            "LANG": "ru_RU.UTF-8",
+        }
+        result = subprocess.run(
+            ["bash", str(RUN_SH), "resolve", "test-python"],
+            capture_output=True, text=True, timeout=120, env=launchd)
+        check("в окружении LaunchAgent находится тот же интерпретатор",
+              result.stdout.strip() == interactive, result.stdout.strip())
+
+        text = INSTALL_SH.read_text(encoding="utf-8")
+        # Каталог состояния установщик обязан спрашивать у диспетчера: своя
+        # реализация XDG в bash — это ровно тот способ разойтись молча.
+        check("plist получает каталог состояния от самого диспетчера",
+              'resolve state-dir' in text
+              and "<key>OBOROT_BRIDGE_STATE_DIR</key>" in text
+              and "XDG_STATE_HOME" not in text)
+        check("файл настроек установщик тоже не вычисляет сам",
+              'resolve config-file' in text and "XDG_CONFIG_HOME" not in text)
+
+        # `--purge` стирает каталог состояния. Считай он путь по-своему — стёр
+        # бы не тот каталог и отчитался бы об успехе.
+        removal = subprocess.run(
+            ["bash", str(UNINSTALL_SH), "--help"],
+            capture_output=True, text=True, timeout=120, env=bridge_env(home))
+        check("uninstall.sh чистит тот же каталог, что видит диспетчер",
+              removal.returncode == 0 and interactive_state in removal.stdout,
+              (removal.stdout + removal.stderr)[-200:])
+        # Проверка интерпретатора должна стоять до всего, что меняет систему.
+        gate = text.index("Тесты включены")
+        check("отказ случается раньше записи plist и launchctl",
+              gate < text.index("launchctl bootstrap") and gate < text.index('cat >"$PLIST"'))
+
+
 def main() -> int:
     print(f"agent-bridge: {BRIDGE_PY.relative_to(ROOT)}")
     test_parse_api_output()
@@ -681,6 +1024,12 @@ def main() -> int:
     test_review_request_guards()
     test_test_cmd_matches_ci()
     test_watchdog_permissions()
+    test_test_python_resolution()
+    test_run_tests_uses_resolved_interpreter()
+    test_health_requires_interpreter()
+    test_installer_refuses_without_interpreter()
+    test_installer_accepts_venv_and_explicit_path()
+    test_launchagent_and_health_share_interpreter()
     print(f"\nИТОГО: {len(PASS)} OK, {len(FAIL)} FAIL")
     return 1 if FAIL else 0
 

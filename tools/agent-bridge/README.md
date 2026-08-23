@@ -25,6 +25,35 @@ helper для git (`gh auth setup-git` — иначе фоновый push поп
 
 Ключей API не нужно ни одного. Диспетчер их не принимает и не читает.
 
+Плюс venv с зависимостями проекта — тем самым `requirements.lock`, которым
+ставятся CI и прод:
+
+```bash
+python3 -m venv ~/.local/state/oborot-agent-bridge/venv
+~/.local/state/oborot-agent-bridge/venv/bin/pip install -r requirements.lock
+```
+
+Прописывать путь никуда не нужно. Диспетчер ищет `<каталог
+состояния>/venv/bin/python` сам, и это одна функция на всех: фоновая задача
+берёт каталог состояния из plist, `health` и `install.sh` — из настроек, путь
+получается один и тот же. Явный `OBOROT_BRIDGE_TEST_PYTHON` важнее автопоиска —
+на случай, когда окружение лежит в другом месте.
+
+Смысл строгости: у системного `python3` зависимостей проекта нет, набор падает
+на первом импорте, и диспетчер отчитывается `TESTS_FAILED` по каждой правке.
+Автоматика при этом выглядит живой — цикл идёт, комментарии пишутся, — но не
+пропускает ничего. Поэтому пока тесты включены (`OBOROT_BRIDGE_TEST_CMD`
+непустая), а интерпретатора нет, `install.sh` отказывается ставить LaunchAgent
+и печатает команды сборки. Проверить, что получилось:
+
+```bash
+tools/agent-bridge/run.sh resolve test-python   # чем пойдут тесты
+tools/agent-bridge/run.sh resolve               # все вычисленные пути сразу
+tools/agent-bridge/install.sh --check           # проверить, ничего не устанавливая
+```
+
+Venv надо пересобирать при каждом изменении `requirements.lock`.
+
 ## Команды
 
 ```bash
@@ -33,6 +62,7 @@ tools/agent-bridge/run.sh poll --once --dry-run   # показать план, �
 tools/agent-bridge/run.sh poll --once         # один настоящий цикл
 tools/agent-bridge/run.sh status --remote     # состояние + что видно на GitHub
 tools/agent-bridge/run.sh logs -n 100         # хвост журнала
+tools/agent-bridge/run.sh resolve             # во что развернулись пути и настройки
 ```
 
 Порядок первого запуска: `health` → `poll --once --dry-run` → `poll --once` →
@@ -41,12 +71,23 @@ tools/agent-bridge/run.sh logs -n 100         # хвост журнала
 ## Установка автоматики
 
 ```bash
-tools/agent-bridge/install.sh      # раз в 60 с; OBOROT_BRIDGE_INTERVAL меняет интервал
-tools/agent-bridge/uninstall.sh    # снять
+tools/agent-bridge/install.sh --check   # только проверить настройки и venv
+tools/agent-bridge/install.sh           # раз в 60 с; OBOROT_BRIDGE_INTERVAL меняет интервал
+tools/agent-bridge/uninstall.sh         # снять
 ```
 
-`install.sh` сначала прогоняет `health` и отказывается ставить автоматику,
-которая заведомо не заработает.
+`install.sh` сначала проверяет интерпретатор тестов, затем прогоняет `health` и
+отказывается ставить автоматику, которая заведомо не заработает.
+`OBOROT_BRIDGE_SKIP_HEALTH=1` обходит второе, но не первое: без интерпретатора
+обходить нечего — не пройдёт ни одна правка.
+
+Каталог состояния и путь к настройкам установщик спрашивает у самого
+диспетчера (`run.sh resolve`), а не вычисляет заново на bash, и кладёт первый в
+plist. Поэтому фоновая задача, у которой нет ни `XDG_*`, ни пользовательского
+`PATH`, работает в том же каталоге и с тем же интерпретатором, что и ручной
+`health`. Путь до интерпретатора в plist намеренно НЕ вписывается: переменная
+окружения перебивает файл настроек, и вписанное однажды значение пережило бы
+правку `OBOROT_BRIDGE_TEST_PYTHON` в `config.env`.
 
 ## Где что лежит
 
@@ -56,6 +97,7 @@ tools/agent-bridge/uninstall.sh    # снять
 * `bridge.log` — журнал;
 * `lock` — блокировка, один прогон за раз;
 * `checkout/` — собственный клон репозитория, в котором диспетчер и работает;
+* `venv/` — окружение для прогона тестов, собирается руками из `requirements.lock`;
 * `launchd.out.log`, `launchd.err.log` — то, что напечатал сам launchd.
 
 Настройки — `~/.config/oborot-agent-bridge/config.env`.

@@ -263,6 +263,42 @@ def state_dir(cfg: Config) -> Path:
     return base / "oborot-agent-bridge"
 
 
+def venv_python(root: Path) -> Path:
+    """Интерпретатор venv, который диспетчер ищет сам, — <каталог состояния>/venv."""
+    return root / "venv" / "bin" / "python"
+
+
+def resolve_test_python(cfg: Config) -> tuple[str, str]:
+    """Каким интерпретатором гонять тесты. Возвращает (путь, источник).
+
+    Источник: `config` — задан явно (переменной окружения или файлом настроек),
+    `venv` — найден автоматически в каталоге состояния, `""` — не нашлось ничего.
+
+    Почему автопоиск, а не «пропишите путь в config.env». Прописанный путь
+    существует ровно в одном месте — в файле настроек той машины, где его
+    прописали руками. Фоновая задача читает окружение launchd, установщик —
+    свою оболочку, health — свой процесс; любой из них может не увидеть
+    настройку, и тогда тесты пойдут системным python3, у которого нет
+    зависимостей проекта. Набор упадёт на первом импорте, диспетчер отчитается
+    `TESTS_FAILED`, и всякая правка по ревью встанет — при том что правка
+    может быть верной. Единственный способ этого избежать — чтобы путь
+    вычисляла одна функция от каталога состояния, а каталог состояния и так
+    известен всем троим.
+
+    Явно заданное значение возвращается как есть, даже если файла нет: молча
+    подменить его на venv значило бы гонять тесты не тем, что просил владелец.
+    Проверку исполняемости делает вызывающий (health и install.sh) — им есть
+    что сказать пользователю, а run_tests обязан работать и без неё.
+    """
+    explicit = cfg.get("TEST_PYTHON").strip()
+    if explicit:
+        return str(Path(explicit).expanduser()), "config"
+    candidate = venv_python(state_dir(cfg))
+    if candidate.is_file() and os.access(candidate, os.X_OK):
+        return str(candidate), "venv"
+    return "", ""
+
+
 class Log:
     """Журнал в файл и на stdout.
 
@@ -1261,13 +1297,24 @@ class Bridge:
         argv = command.split()
         # Тестам нужен интерпретатор С УСТАНОВЛЕННЫМИ зависимостями проекта.
         # Системный python3 их не имеет, и набор упал бы на первом импорте —
-        # причём выглядело бы это как «правка сломала тесты». Поэтому
-        # TEST_PYTHON: путь до venv, собранного из requirements.lock.
-        interpreter = self.cfg.get("TEST_PYTHON") or self.tools.python
+        # причём выглядело бы это как «правка сломала тесты». Откуда берётся
+        # путь — см. resolve_test_python: те же правила у health и install.sh.
+        interpreter, source = resolve_test_python(self.cfg)
+        if not interpreter:
+            # До установки такое состояние ловит install.sh и не даёт поставить
+            # автоматику. Сюда мы попадаем, если venv удалили уже после —
+            # значит, ближайший красный прогон объясняется этой строкой.
+            self.log.warn(
+                "интерпретатор тестов не найден ({} нет): пойдёт системный python3, "
+                "падение на импорте зависимостей вероятно".format(
+                    venv_python(state_dir(self.cfg))))
+            interpreter = self.tools.python
         if argv and argv[0] in ("python", "python3") and interpreter:
             argv[0] = str(Path(interpreter).expanduser())
         timeout = self.cfg.get_int("TEST_TIMEOUT", 2700)
-        self.log.info("запускаю тесты: {} (лимит {} с)".format(command, timeout))
+        self.log.info("запускаю тесты: {} (лимит {} с, интерпретатор {}{})".format(
+            command, timeout, interpreter or "не найден",
+            ", " + source if source else ""))
         try:
             result = run(argv, cwd=self.checkout.path, timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -1576,18 +1623,26 @@ def cmd_health(args, cfg: Config) -> int:
 
     # Интерпретатор для тестов проверяем отдельно: если в нём нет зависимостей
     # проекта, набор упадёт на импорте, и это выглядит как «правка сломала
-    # тесты» — самая дорогая в разборе ложная тревога из возможных.
-    test_python = cfg.get("TEST_PYTHON")
+    # тесты» — самая дорогая в разборе ложная тревога из возможных. Поэтому
+    # здесь не предупреждение, а полноценная проверка: пока тесты включены, а
+    # интерпретатора нет, health красный и install.sh автоматику не поставит.
+    test_python, source = resolve_test_python(cfg)
     if not cfg.get("TEST_CMD").strip():
         lines.append("  [--] {:<22} {}".format("тесты", "отключены настройкой TEST_CMD"))
-    elif test_python:
-        resolved = Path(test_python).expanduser()
-        check("интерпретатор тестов", resolved.is_file() and os.access(resolved, os.X_OK), str(resolved))
+    elif source == "config":
+        resolved = Path(test_python)
+        check("интерпретатор тестов",
+              resolved.is_file() and os.access(resolved, os.X_OK),
+              "{} (задан явно{})".format(
+                  resolved,
+                  "" if resolved.is_file() and os.access(resolved, os.X_OK)
+                  else "; файла нет или он не исполняемый"))
+    elif source == "venv":
+        check("интерпретатор тестов", True, "{} (venv в каталоге состояния)".format(test_python))
     else:
-        lines.append("  [--] {:<22} {}".format(
-            "интерпретатор тестов",
-            "системный python3; если у него нет зависимостей проекта, "
-            "задайте OBOROT_BRIDGE_TEST_PYTHON"))
+        check("интерпретатор тестов", False,
+              "нет {}; соберите: python3 -m venv {} && {} install -r requirements.lock".format(
+                  venv_python(root), root / "venv", root / "venv" / "bin" / "pip"))
 
     plist = Path.home() / "Library" / "LaunchAgents" / "com.oborot.agent-bridge.plist"
     loaded = False
@@ -1647,6 +1702,44 @@ def cmd_logs(args, cfg: Config) -> int:
     return 0
 
 
+def resolved_settings(cfg: Config) -> dict:
+    """Значения, которые вычисляет диспетчер, — в машиночитаемом виде.
+
+    Нужны установщику. Иначе install.sh пришлось бы повторять на bash логику
+    путей (каталог состояния, файл настроек, поиск venv), а любая копия логики
+    рано или поздно расходится с оригиналом: launchd получил бы один каталог
+    состояния, health смотрел бы в другой, и разошлись бы они молча.
+    """
+    root = state_dir(cfg)
+    test_python, source = resolve_test_python(cfg)
+    return {
+        "state-dir": str(root),
+        "config-file": str(Config.config_paths()[0]),
+        "checkout": str(Path(cfg.get("CHECKOUT")).expanduser() if cfg.get("CHECKOUT")
+                        else root / "checkout"),
+        "test-cmd": cfg.get("TEST_CMD").strip(),
+        "test-python": test_python,
+        "test-python-source": source,
+        "venv-python": str(venv_python(root)),
+    }
+
+
+def cmd_resolve(args, cfg: Config) -> int:
+    values = resolved_settings(cfg)
+    if not args.key:
+        width = max(len(key) for key in values)
+        for key, value in values.items():
+            print("{:<{}}  {}".format(key, width, value))
+        return 0
+    if args.key not in values:
+        print("Неизвестный ключ: {}. Известные: {}".format(
+            args.key, ", ".join(values)), file=sys.stderr)
+        return 2
+    # Ровно значение и перевод строки: вывод читает install.sh через $(...).
+    print(values[args.key])
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="bridge.py",
@@ -1671,6 +1764,14 @@ def main(argv: list[str] | None = None) -> int:
     logs = sub.add_parser("logs", help="хвост журнала")
     logs.add_argument("-n", "--number", type=int, default=80)
     logs.set_defaults(func=cmd_logs)
+
+    resolve = sub.add_parser(
+        "resolve", help="во что разворачиваются пути и настройки (для install.sh)")
+    resolve.add_argument("key", nargs="?", default="",
+                         help="state-dir | config-file | checkout | test-cmd | "
+                              "test-python | test-python-source | venv-python; "
+                              "без ключа — всё сразу")
+    resolve.set_defaults(func=cmd_resolve)
 
     args = parser.parse_args(argv)
     cfg = Config({"REPO": args.repo, "STATE_DIR": args.state_dir})

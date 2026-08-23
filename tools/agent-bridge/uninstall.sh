@@ -11,9 +11,14 @@
 set -euo pipefail
 
 LABEL="com.oborot.agent-bridge"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
-STATE_DIR="${OBOROT_BRIDGE_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/oborot-agent-bridge}"
-CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/oborot-agent-bridge"
+# Пути спрашиваем у диспетчера, а не считаем заново: своя реализация XDG в bash
+# не видела бы STATE_DIR из config.env, и `--purge` чистил бы не тот каталог,
+# бодро отчитываясь об успехе.
+STATE_DIR="$("$SCRIPT_DIR/run.sh" resolve state-dir)"
+CONFIG_FILE="$("$SCRIPT_DIR/run.sh" resolve config-file)"
+CONFIG_DIR="$(dirname "$CONFIG_FILE")"
 
 PURGE=0
 for arg in "$@"; do
@@ -48,7 +53,9 @@ fi
 if [ "$PURGE" = "1" ]; then
     # Рабочая копия внутри STATE_DIR — обычный клон: всё, что в нём было
     # ценного, уже отправлено в ветку. Неотправленного там не остаётся:
-    # диспетчер сбрасывает копию после каждого неудачного прогона.
+    # диспетчер сбрасывает копию после каждого неудачного прогона. Вместе с
+    # каталогом уезжает и venv для тестов — перед следующей установкой его
+    # придётся собрать заново, install.sh об этом напомнит.
     for dir in "$STATE_DIR" "$CONFIG_DIR"; do
         if [ -d "$dir" ]; then
             rm -rf "$dir"
