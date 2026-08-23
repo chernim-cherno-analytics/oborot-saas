@@ -215,9 +215,20 @@ class Config:
             self.values.update({k: v for k, v in overrides.items() if v})
 
     @staticmethod
+    def config_home() -> Path:
+        """Каталог, от которого отсчитывается файл настроек.
+
+        Отдельно от `config_paths`, потому что это значение нужно установщику
+        целиком: именно его он кладёт в plist, чтобы фоновая задача читала тот
+        же файл настроек, который проверили при установке. Пустой
+        `XDG_CONFIG_HOME` считается незаданным (так велит сам стандарт XDG) —
+        иначе получился бы относительный путь, а у launchd рабочий каталог свой.
+        """
+        return Path(os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config"))
+
+    @staticmethod
     def config_paths() -> list[Path]:
-        base = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config")))
-        return [base / "oborot-agent-bridge" / "config.env"]
+        return [Config.config_home() / "oborot-agent-bridge" / "config.env"]
 
     @staticmethod
     def _read_file(path: Path) -> dict:
@@ -259,7 +270,7 @@ def state_dir(cfg: Config) -> Path:
     configured = cfg.get("STATE_DIR")
     if configured:
         return Path(configured).expanduser()
-    base = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local" / "state")))
+    base = Path(os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state"))
     return base / "oborot-agent-bridge"
 
 
@@ -297,6 +308,33 @@ def resolve_test_python(cfg: Config) -> tuple[str, str]:
     if candidate.is_file() and os.access(candidate, os.X_OK):
         return str(candidate), "venv"
     return "", ""
+
+
+def env_only_keys() -> list[str]:
+    """Настройки, которые заданы переменной окружения и не подтверждены файлом.
+
+    Зачем это знать. LaunchAgent не наследует ни оболочку владельца, ни её
+    переменные: фоновой задаче достаётся ровно то, что перечислено в plist.
+    Каталог состояния и каталог настроек установщик туда кладёт, поэтому файл
+    настроек фон читает тот же самый. А значение, которое существует ТОЛЬКО в
+    переменной окружения запустившей установку оболочки, до launchd не доедет:
+    установщик проверит одно, а фон возьмёт другое — и разойдутся они молча.
+
+    Считается расхождение, а не сам факт переменной: если значение совпадает с
+    тем, что фон и так получит из файла настроек (или со значением по
+    умолчанию), терять нечего. Возвращаются имена ключей без значений — список
+    попадает в сообщение об ошибке, а значениям в чужих логах делать нечего.
+    """
+    from_file: dict[str, str] = {}
+    for path in Config.config_paths():
+        from_file.update(Config._read_file(path))
+    lost = []
+    for key, default in CONFIG_KEYS.items():
+        env = os.environ.get(ENV_PREFIX + key)
+        if env is None or env == from_file.get(key, default):
+            continue
+        lost.append(key)
+    return sorted(lost)
 
 
 class Log:
@@ -1715,6 +1753,9 @@ def resolved_settings(cfg: Config) -> dict:
     return {
         "state-dir": str(root),
         "config-file": str(Config.config_paths()[0]),
+        "config-home": str(Config.config_home()),
+        # Одной строкой через пробел: это читает `for key in $(...)` в install.sh.
+        "env-only-keys": " ".join(env_only_keys()),
         "checkout": str(Path(cfg.get("CHECKOUT")).expanduser() if cfg.get("CHECKOUT")
                         else root / "checkout"),
         "test-cmd": cfg.get("TEST_CMD").strip(),
@@ -1768,9 +1809,9 @@ def main(argv: list[str] | None = None) -> int:
     resolve = sub.add_parser(
         "resolve", help="во что разворачиваются пути и настройки (для install.sh)")
     resolve.add_argument("key", nargs="?", default="",
-                         help="state-dir | config-file | checkout | test-cmd | "
-                              "test-python | test-python-source | venv-python; "
-                              "без ключа — всё сразу")
+                         help="state-dir | config-file | config-home | env-only-keys | "
+                              "checkout | test-cmd | test-python | test-python-source | "
+                              "venv-python; без ключа — всё сразу")
     resolve.set_defaults(func=cmd_resolve)
 
     args = parser.parse_args(argv)

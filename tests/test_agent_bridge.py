@@ -24,7 +24,10 @@
   8) после успешного push диспетчер один раз просит ревью нового SHA;
   9) интерпретатор тестов: фон, health и установщик выбирают ОДИН И ТОТ ЖЕ,
      а установщик отказывается ставить автоматику, которой нечем гонять
-     тесты (настоящий launchd при этом не трогается).
+     тесты (настоящий launchd при этом не трогается);
+ 10) настройки, проверенные при установке, доезжают до launchd: каталог
+     настроек уходит в plist, а значения, живущие только в переменной
+     окружения, установку обрывают — фон их всё равно не увидит.
 
 Запуск из корня репозитория:  python tests/test_agent_bridge.py
 """
@@ -33,6 +36,7 @@ import importlib.util
 import io
 import json
 import os
+import plistlib
 import re
 import subprocess
 import sys
@@ -881,6 +885,19 @@ def bridge_env(home: Path, **extra):
     return env
 
 
+def write_config(home: Path, *lines: str, config_home: Path | None = None) -> Path:
+    """Файл настроек — единственное место, где значение переживает launchd.
+
+    Переменная окружения существует только в той оболочке, где её задали;
+    фоновая задача её не увидит, и установщик такие значения отвергает.
+    """
+    base = config_home if config_home is not None else home / ".config"
+    path = base / "oborot-agent-bridge" / "config.env"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
 def install_check(home: Path, **extra):
     """`install.sh --check`: разбор настроек и запрет на полурабочий фон.
 
@@ -922,7 +939,10 @@ def test_installer_refuses_without_interpreter():
               skipped.returncode == 1, skipped.stdout[-300:])
 
         # Тесты можно выключить сознательно — тогда интерпретатор не нужен.
-        off = install_check(home, OBOROT_BRIDGE_TEST_CMD="")
+        # Настройка идёт в файл, а не в переменную окружения: фон читает файл,
+        # а переменную оболочки, из которой запускали установку, — нет.
+        write_config(home, "OBOROT_BRIDGE_TEST_CMD=")
+        off = install_check(home)
         check("с выключенными тестами установщик не возражает",
               off.returncode == 0, (off.stdout + off.stderr)[-300:])
 
@@ -945,13 +965,16 @@ def test_installer_accepts_venv_and_explicit_path():
         check("режим --check ничего не установил",
               not (home / "Library" / "LaunchAgents").exists())
 
+        # Явный путь задаётся в файле настроек: только он доедет до launchd.
         own = make_executable(Path(tmp) / "own" / "python")
-        explicit = install_check(home, OBOROT_BRIDGE_TEST_PYTHON=str(own))
+        write_config(home, "OBOROT_BRIDGE_TEST_PYTHON=" + str(own))
+        explicit = install_check(home)
         check("явно заданный интерпретатор принимается",
               explicit.returncode == 0 and str(own) in explicit.stdout,
               (explicit.stdout + explicit.stderr)[-300:])
 
-        broken = install_check(home, OBOROT_BRIDGE_TEST_PYTHON=str(Path(tmp) / "nope"))
+        write_config(home, "OBOROT_BRIDGE_TEST_PYTHON=" + str(Path(tmp) / "nope"))
+        broken = install_check(home)
         check("явно заданный несуществующий путь установку обрывает",
               broken.returncode == 1 and "не исполняемый файл" in broken.stderr,
               (broken.stdout + broken.stderr)[-300:])
@@ -993,7 +1016,8 @@ def test_launchagent_and_health_share_interpreter():
               and "<key>OBOROT_BRIDGE_STATE_DIR</key>" in text
               and "XDG_STATE_HOME" not in text)
         check("файл настроек установщик тоже не вычисляет сам",
-              'resolve config-file' in text and "XDG_CONFIG_HOME" not in text)
+              'resolve config-file' in text and 'resolve config-home' in text
+              and "XDG_CONFIG_HOME:-" not in text and "$HOME/.config" not in text)
 
         # `--purge` стирает каталог состояния. Считай он путь по-своему — стёр
         # бы не тот каталог и отчитался бы об успехе.
@@ -1007,6 +1031,192 @@ def test_launchagent_and_health_share_interpreter():
         gate = text.index("Тесты включены")
         check("отказ случается раньше записи plist и launchctl",
               gate < text.index("launchctl bootstrap") and gate < text.index('cat >"$PLIST"'))
+
+
+# --------------------------------------------------------------------------
+# 10. Настройки, проверенные при установке, доезжают до launchd
+# --------------------------------------------------------------------------
+#
+# Разбираемый дефект. Установщик проверял настройки своей оболочки — явный
+# OBOROT_BRIDGE_TEST_PYTHON, нестандартный XDG_CONFIG_HOME, — а в plist клал
+# только каталог состояния. LaunchAgent оболочку не наследует: фон читал
+# ДРУГОЙ config.env (обычно несуществующий) и работал на значениях по
+# умолчанию. «Проверено при установке» относилось не к тому, что потом
+# работает, и разойтись эти двое могли молча. Закрыто с двух сторон: каталог
+# настроек уходит в plist, а значения, живущие только в переменной окружения,
+# установку обрывают.
+
+
+def render_plist(home: Path, out_dir: Path, **where) -> dict:
+    """Тот самый plist, который напишет install.sh, — но в каталог теста.
+
+    Heredoc берётся из скрипта как есть и выполняется с теми же значениями,
+    которые установщик получает от диспетчера. Сверять текст install.sh глазами
+    недостаточно: разбираемый дефект в том и состоял, что в plist попадало не
+    то, что проверено. Настоящий LaunchAgent не трогается — ни launchctl, ни
+    ~/Library/LaunchAgents здесь нет.
+    """
+    body = (INSTALL_SH.read_text(encoding="utf-8")
+            .split('cat >"$PLIST" <<PLIST_EOF\n', 1)[1]
+            .split("\nPLIST_EOF\n")[0])
+    script = (
+        "set -euo pipefail\n"
+        "LABEL=com.oborot.agent-bridge\n"
+        "INTERVAL=60\n"
+        'SCRIPT_DIR="$1"\nSTATE_DIR="$2"\nCONFIG_HOME="$3"\nPLIST="$4"\n'
+        'cat >"$PLIST" <<PLIST_EOF\n' + body + "\nPLIST_EOF\n")
+    path = out_dir / "com.oborot.agent-bridge.plist"
+    subprocess.run(
+        ["bash", "-c", script, "render", str(INSTALL_SH.parent),
+         resolve_value(home, "state-dir", **where),
+         resolve_value(home, "config-home", **where), str(path)],
+        check=True, capture_output=True, text=True, timeout=120)
+    # plistlib заодно и проверка разметки: развалившийся plist сюда не пройдёт.
+    return plistlib.loads(path.read_bytes())
+
+
+def launchd_env(home: Path, from_plist: dict) -> dict:
+    """Ровно то, что достаётся фоновой задаче: PATH launchd плюс сам plist.
+
+    Ни XDG_*, ни PATH пользователя, ни его rc-файлов launchd не передаёт.
+    """
+    env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": str(home)}
+    env.update(from_plist)
+    return env
+
+
+def outcome(result) -> str:
+    """Однострочная выжимка из процесса: журнал прогона читают глазами."""
+    return "код {}: {}".format(
+        result.returncode, " ".join((result.stdout + result.stderr).split())[-160:])
+
+
+def resolve_in(env: dict, key: str) -> str:
+    result = subprocess.run(
+        ["bash", str(RUN_SH), "resolve", key],
+        capture_output=True, text=True, timeout=120, env=env)
+    return result.stdout.strip()
+
+
+def test_installer_refuses_settings_launchd_will_not_see():
+    print("\n== Установщик не ставит фон на настройках, которых фон не увидит ==")
+    with tempfile.TemporaryDirectory() as tmp:
+        home = Path(tmp) / "home"
+        home.mkdir()
+        make_venv(home / ".local" / "state" / "oborot-agent-bridge")
+        own = make_executable(Path(tmp) / "own" / "python")
+
+        # Раньше это проходило: установщик проверял интерпретатор из своей
+        # оболочки и рапортовал об успехе, а фон о нём ничего не знал.
+        env_only = install_check(home, OBOROT_BRIDGE_TEST_PYTHON=str(own))
+        check("интерпретатор только из окружения — установка обрывается",
+              env_only.returncode == 1, outcome(env_only))
+        check("названа сама настройка, а не просто «ошибка»",
+              "TEST_PYTHON" in env_only.stderr, outcome(env_only))
+        check("сказано, в какой файл её переносить",
+              str(home / ".config" / "oborot-agent-bridge" / "config.env") in env_only.stderr,
+              outcome(env_only))
+        # В сообщение попадают имена ключей, но не значения: оно уходит в
+        # stderr, а оттуда — в чужие журналы и вставки в переписку.
+        check("значение настройки в сообщении не печатается",
+              str(own) not in env_only.stderr, outcome(env_only))
+        check("настоящий LaunchAgent не появился",
+              not (home / "Library" / "LaunchAgents").exists())
+
+        # Правило общее, а не про один ключ.
+        repo = install_check(home, OBOROT_BRIDGE_REPO="chuzhoy/repo")
+        check("любая другая настройка из окружения — тоже отказ",
+              repo.returncode == 1 and "REPO" in repo.stderr,
+              outcome(repo))
+
+        # Каталог состояния — единственное исключение: он уходит в plist
+        # готовым путём, поэтому фон получит именно проверенный каталог.
+        moved_state = Path(tmp) / "own-state"
+        make_venv(moved_state)
+        moved = install_check(home, OBOROT_BRIDGE_STATE_DIR=str(moved_state))
+        check("каталог состояния из окружения установку не обрывает",
+              moved.returncode == 0 and str(moved_state) in moved.stdout,
+              outcome(moved))
+
+        # Совпадающее значение расхождением не является: фон и так его получит
+        # из файла настроек, терять нечего.
+        write_config(home, "OBOROT_BRIDGE_TEST_PYTHON=" + str(own))
+        same = install_check(home, OBOROT_BRIDGE_TEST_PYTHON=str(own))
+        check("переменная, совпадающая с файлом настроек, не мешает",
+              same.returncode == 0 and str(own) in same.stdout,
+              outcome(same))
+
+        text = INSTALL_SH.read_text(encoding="utf-8")
+        gate = text.index("заданы только переменными окружения")
+        check("отказ случается раньше записи plist и launchctl",
+              gate < text.index('cat >"$PLIST"') and gate < text.index("launchctl bootstrap"))
+
+
+def test_nondefault_config_home_reaches_launchd():
+    print("\n== Нестандартный XDG_CONFIG_HOME доезжает до фоновой задачи ==")
+    with tempfile.TemporaryDirectory() as tmp:
+        home = Path(tmp) / "home"
+        home.mkdir()
+        state = home / ".local" / "state" / "oborot-agent-bridge"
+        # venv на месте по умолчанию: если каталог настроек до фона не доедет,
+        # фон не упадёт, а молча возьмёт вот этот интерпретатор — потому дефект
+        # и был незаметен.
+        default_venv = make_venv(state)
+        own = make_executable(Path(tmp) / "own" / "python")
+
+        config_home = home / "xdg"
+        write_config(home, "OBOROT_BRIDGE_TEST_PYTHON=" + str(own), config_home=config_home)
+        where = {"XDG_CONFIG_HOME": str(config_home)}
+
+        check("диспетчер отдаёт установщику каталог настроек",
+              resolve_value(home, "config-home", **where) == str(config_home),
+              resolve_value(home, "config-home", **where))
+        check("файл настроек считается от него же",
+              resolve_value(home, "config-file", **where)
+              == str(config_home / "oborot-agent-bridge" / "config.env"))
+
+        result = install_check(home, **where)
+        check("установщик читает настройки из нестандартного каталога",
+              result.returncode == 0 and str(own) in result.stdout,
+              outcome(result))
+        check("каталог настроек назван в отчёте установщика",
+              str(config_home) in result.stdout, outcome(result))
+
+        interactive = resolve_value(home, "test-python", **where)
+        check("в обычной сессии берётся интерпретатор из файла настроек",
+              interactive == str(own), interactive)
+
+        # Дальше — не пересказ plist, а сам plist: тот, который напишет
+        # install.sh, с теми же значениями от диспетчера.
+        environment = render_plist(home, Path(tmp), **where)["EnvironmentVariables"]
+        check("plist отдаёт фону каталог настроек",
+              environment.get("XDG_CONFIG_HOME") == str(config_home),
+              str(environment))
+        check("и каталог состояния — тоже проверенный",
+              environment.get("OBOROT_BRIDGE_STATE_DIR")
+              == resolve_value(home, "state-dir", **where), str(environment))
+        # Значения настроек в plist не уезжают: место настроек одно — файл, и
+        # правка config.env должна действовать на фон сразу.
+        check("в plist уходят пути, а не сами настройки",
+              [key for key in environment if key.startswith("OBOROT_BRIDGE_")]
+              == ["OBOROT_BRIDGE_STATE_DIR"], str(environment))
+
+        with_plist = launchd_env(home, environment)
+        check("фон с окружением из этого plist видит тот же интерпретатор",
+              resolve_in(with_plist, "test-python") == interactive,
+              resolve_in(with_plist, "test-python"))
+        check("фон читает тот же файл настроек",
+              resolve_in(with_plist, "config-file")
+              == resolve_value(home, "config-file", **where))
+
+        # Проверка мутацией: убрать эту строку из plist — и фон не упадёт, а
+        # молча возьмёт интерпретатор по умолчанию, то есть НЕ проверенный.
+        blind = {key: value for key, value in environment.items()
+                 if key != "XDG_CONFIG_HOME"}
+        check("без этой строки в plist фон брал бы другой интерпретатор",
+              resolve_in(launchd_env(home, blind), "test-python")
+              == str(default_venv) != interactive,
+              resolve_in(launchd_env(home, blind), "test-python"))
 
 
 def main() -> int:
@@ -1030,6 +1240,8 @@ def main() -> int:
     test_installer_refuses_without_interpreter()
     test_installer_accepts_venv_and_explicit_path()
     test_launchagent_and_health_share_interpreter()
+    test_installer_refuses_settings_launchd_will_not_see()
+    test_nondefault_config_home_reaches_launchd()
     print(f"\nИТОГО: {len(PASS)} OK, {len(FAIL)} FAIL")
     return 1 if FAIL else 0
 
