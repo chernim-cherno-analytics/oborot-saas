@@ -488,8 +488,39 @@ def _receipt_rows(db: Session, org_id: int, order_id: int) -> list[OrderReceipt]
 SOURCE_PRIORITY = ("ms_supply", "ms_order_shipped", "manual")
 
 
+ASSUMED_PRECISION = "whole_order"
+
+
+def _confirmed_rows(rows: list[OrderReceipt]) -> list[OrderReceipt]:
+    """Только строки, где количество НАЗВАНО, а не выведено из заказа.
+
+    `precision = whole_order` означает «человек отметил заказ принятым целиком,
+    количества взяты из заказа» — то есть допущение, аккуратно помеченное как
+    допущение. Писать такие строки код перестал (см. `_record_execution`), но в
+    боевой базе они уже лежат с прежних версий, и до этой отсечки продолжали
+    считаться подтверждением количества наравне с названными цифрами.
+
+    Чинить только новые данные — половина работы: статистика качества
+    рекомендаций считается по всей истории, и старое допущение искажает её
+    ровно так же, как искажало бы новое. Строки остаются в истории и видны в
+    выдаче (таблица только пополняется, ничего не прячем), но количеством
+    заказа они больше не распоряжаются.
+    """
+    # Отсекаем ТОЛЬКО явное «whole_order», а не «всё, что не by_position».
+    # Колонка появилась позже самой таблицы, и у строк, созданных до неё,
+    # значение проставил server_default = by_position. Отсекать по принципу
+    # «не равно by_position» значило бы выбросить и их — то есть чинить
+    # выдуманное допущение потерей настоящих данных.
+    return [r for r in rows
+            if getattr(r, "precision", "") != ASSUMED_PRECISION]
+
+
 def _received_by_source(rows: list[OrderReceipt]) -> dict[str, dict[str, float]]:
-    """{base_name: {source: сколько принято по этому источнику}}."""
+    """{base_name: {source: сколько принято по этому источнику}}.
+
+    На вход идут ТОЛЬКО подтверждённые строки: допущения отсекаются раньше,
+    в `_confirmed_rows`.
+    """
     out: dict[str, dict[str, float]] = {}
     for r in rows:
         per = out.setdefault(r.base_name, {})
@@ -514,7 +545,7 @@ def _received_by_base(rows: list[OrderReceipt]) -> dict[str, float]:
     первой автоматической записи пришлось бы уже на испорченных данных.
     """
     out: dict[str, float] = {}
-    for base, by_src in _received_by_source(rows).items():
+    for base, by_src in _received_by_source(_confirmed_rows(rows)).items():
         evidence = _evidencing(by_src)
         if not evidence:
             # Свидетельств не осталось: единственное, что было, — машинные
@@ -572,7 +603,7 @@ def _source_conflicts(rows: list[OrderReceipt]) -> list[dict]:
     """
     out = []
     used_all = _received_by_base(rows)
-    for base, by_src in sorted(_received_by_source(rows).items()):
+    for base, by_src in sorted(_received_by_source(_confirmed_rows(rows)).items()):
         # Спорить могут только те, кто что-то утверждает. Машинный ноль — это
         # «в документах ничего нет», а не «приехало ноль», и спором с ручными
         # 80 штуками он не является. Считать его спором значило бы загонять
