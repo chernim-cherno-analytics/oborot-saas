@@ -18,6 +18,9 @@ set -Eeuo pipefail
 
 APP_DIR="${OBOROT_APP_DIR:-/opt/oborot/app-src}"
 VENV="${OBOROT_VENV:-/opt/oborot/venv}"
+VENV_ROOT="$(dirname "$VENV")"
+VENV_KEEP="${OBOROT_VENV_KEEP:-3}"
+PYTHON_BIN="${OBOROT_PYTHON:-$VENV/bin/python}"
 DATA_DIR="${OBOROT_DATA_DIR:-/opt/oborot/data}"
 ENV_FILE="${OBOROT_ENV_FILE:-/opt/oborot/env}"
 SERVICE="${OBOROT_SERVICE:-oborot}"
@@ -25,6 +28,7 @@ HEALTH_URL="${OBOROT_HEALTH_URL:-http://127.0.0.1:8000/health/ready}"
 STATE_DIR="${OBOROT_STATE_DIR:-/opt/oborot}"
 LOCK_FILE="${OBOROT_LOCK_FILE:-$STATE_DIR/deploy.lock}"
 PREVIOUS_FILE="${OBOROT_PREVIOUS_FILE:-$STATE_DIR/PREVIOUS_SHA}"
+PREVIOUS_VENV_FILE="${OBOROT_PREVIOUS_VENV_FILE:-$STATE_DIR/PREVIOUS_VENV}"
 HEALTH_ATTEMPTS="${OBOROT_HEALTH_ATTEMPTS:-30}"
 HEALTH_DELAY="${OBOROT_HEALTH_DELAY:-2}"
 
@@ -47,19 +51,45 @@ set_commit_env() {
   mv "$tmp" "$ENV_FILE"
 }
 
-# Зависимости ставятся ИЗ ЦЕЛЕВОГО КОММИТА и ДО переключения кода. Порядок тут
-# не косметика: работающий процесс уже загрузил свои модули, поэтому неудачная
-# установка не роняет живой сервис и не оставляет прод с новым кодом и старым
-# набором пакетов. Отличие от PR #3: там ставится requirements.txt с
-# диапазонами — здесь только lock, потому что иначе фиксация версий не значит
+# ОКРУЖЕНИЕ НА РЕЛИЗ. Идея — из ветки Codex codex/ops-3-hardening, и она
+# строго лучше того, что было у меня: я ставил зависимости целевого коммита в
+# ЖИВОЙ venv до переключения кода. Это спасало прод от неудачной установки, но
+# ломало откат: `deploy.sh <прежний-sha>` возвращал код на прежний коммит и
+# оставлял ему НОВЫЕ библиотеки. Откат восстанавливал половину состояния.
+#
+# Теперь окружение каждого релиза собирается отдельно и подставляется целиком.
+# Прежнее не удаляется, а откладывается под именем venv-<прежний-sha>.
+#
+# Своё сверх источника: откат переиспользует отложенное окружение, если оно
+# цело. В аварии сеть — не то, на что стоит рассчитывать, а пересборка venv
+# без сети невозможна. Там, где у источника откат зависел от pip, здесь он
+# сводится к переименованию каталога.
+#
+# Отличие от PR #3 сохраняется: ставится только requirements.lock. Установка
+# requirements.txt с диапазонами означала бы, что фиксация версий не значит
 # ничего (решение владельца 23.08.2026, fail-closed).
-install_requirements() {
-  local sha="$1" req rc=0
+# Годность отложенного окружения проверяется по метке ВНУТРИ него, а не по
+# имени каталога. Имя ставится по коммиту, который был выкачен на момент
+# подмены; если по какой-то причине оно соврало, переиспользование подсунуло бы
+# релизу чужие библиотеки — и молча, потому что снаружи всё выглядит правильно.
+# Метка внутри такого не позволяет: расхождение означает пересборку.
+release_venv_ok() {
+  local dir="$1"
+  local sha="$2"
+  [ -d "$dir" ] || return 1
+  [ -x "$dir/bin/pip" ] || return 1
+  [ -f "$dir/RELEASE_SHA" ] || return 1
+  [ "$(cat "$dir/RELEASE_SHA" 2>/dev/null)" = "$sha" ] || return 1
+  "$dir/bin/pip" check >/dev/null 2>&1
+}
+
+install_into() {
+  local sha="$1" venv="$2" req rc=0
   if git cat-file -e "$sha:requirements.lock" 2>/dev/null; then
     req="$(mktemp "$STATE_DIR/requirements.XXXXXX")"
     git show "$sha:requirements.lock" > "$req"
-    "$VENV/bin/pip" install -q -r "$req" || rc=1
-    [ "$rc" = 0 ] && { "$VENV/bin/pip" check || rc=1; }
+    "$venv/bin/pip" install -q -r "$req" || rc=1
+    [ "$rc" = 0 ] && { "$venv/bin/pip" check || rc=1; }
     rm -f "$req"
     return "$rc"
   fi
@@ -70,9 +100,53 @@ install_requirements() {
   fi
   req="$(mktemp "$STATE_DIR/requirements.XXXXXX")"
   git show "$sha:requirements.txt" > "$req"
-  "$VENV/bin/pip" install -q -r "$req" || rc=1
+  "$venv/bin/pip" install -q -r "$req" || rc=1
   rm -f "$req"
   return "$rc"
+}
+
+prepare_release_venv() {
+  # Раздельные строки не для красоты: bash раскрывает ВСЕ слова команды `local`
+  # до её выполнения, поэтому `local sha="$1" cached="...$sha"` под `set -u`
+  # падает с «unbound variable» — переменная ещё не присвоена в момент подстановки.
+  local sha="$1"
+  local staging="$2"
+  local cached="$VENV_ROOT/venv-$sha"
+  if release_venv_ok "$cached" "$sha"; then
+    echo "   окружение этого релиза уже собрано — сеть не нужна"
+    mv "$cached" "$staging" || return 1
+    return 0
+  fi
+  rm -rf -- "$cached" "$staging"
+  "$PYTHON_BIN" -m venv "$staging" || { rm -rf -- "$staging"; return 1; }
+  install_into "$sha" "$staging" || { rm -rf -- "$staging"; return 1; }
+  printf '%s\n' "$sha" > "$staging/RELEASE_SHA" || { rm -rf -- "$staging"; return 1; }
+  return 0
+}
+
+# Подмена в два переименования. Живой процесс держит свои файлы по inode и
+# переезда каталога не замечает — он в любом случае будет перезапущен ниже.
+swap_release_venv() {
+  local staging="$1" keep="$VENV_ROOT/venv-$CURRENT" held="$VENV_ROOT/.venv-held.$$"
+  mv "$VENV" "$held" || return 1
+  if ! mv "$staging" "$VENV"; then
+    mv "$held" "$VENV" || true
+    return 1
+  fi
+  rm -rf -- "$keep"
+  mv "$held" "$keep" || return 1
+  printf '%s\n' "$keep" > "$PREVIOUS_VENV_FILE"
+  echo "   прежнее окружение отложено: $keep"
+}
+
+# Старые окружения занимают место и нужны только для отката на недавнее.
+prune_release_venvs() {
+  # `|| true` не украшение: под pipefail неудача любого звена убила бы скрипт
+  # уже ПОСЛЕ успешной выкладки — прод был бы жив, а деплой отчитался бы об
+  # ошибке. Уборка старых каталогов не стоит ложной тревоги.
+  find "$VENV_ROOT" -maxdepth 1 -type d -name 'venv-*' -printf '%T@ %p\n' 2>/dev/null \
+    | sort -rn | awk -v k="$VENV_KEEP" 'NR > k {sub(/^[^ ]+ /, ""); print}' \
+    | xargs -r rm -rf -- || true
 }
 
 wait_ready() {
@@ -93,6 +167,8 @@ for c in git curl grep sed sqlite3 systemctl journalctl flock mktemp seq \
          find sort awk xargs date chmod mv sleep; do need "$c"; done
 [ -d "$APP_DIR/.git" ] || die "$APP_DIR не является git-клоном"
 [ -x "$VENV/bin/pip" ] || die "нет исполняемого $VENV/bin/pip"
+[ ! -L "$VENV" ] || die "$VENV — символическая ссылка; подмена окружения рассчитана на обычный каталог"
+[ -x "$PYTHON_BIN" ] || die "нет исполняемого python для сборки окружения: $PYTHON_BIN"
 [ -f "$ENV_FILE" ] || die "нет файла окружения $ENV_FILE"
 cd "$APP_DIR"
 mkdir -p "$STATE_DIR" "$DATA_DIR/backups"
@@ -118,8 +194,17 @@ git merge-base --is-ancestor "$SHA" origin/main \
 echo "сейчас: $CURRENT"
 echo "цель:   $SHA"
 
-echo "== 3/6 Зависимости целевого релиза =="
-install_requirements "$SHA" || die "не удалось поставить зависимости для $SHA"
+echo "== 3/6 Окружение целевого релиза =="
+STAGING_VENV="$VENV_ROOT/.venv-staging.$$"
+cleanup_staging() {
+  if [ -n "${STAGING_VENV:-}" ] && [ -e "$STAGING_VENV" ]; then
+    rm -rf -- "$STAGING_VENV"
+  fi
+  return 0
+}
+trap cleanup_staging EXIT
+prepare_release_venv "$SHA" "$STAGING_VENV" \
+  || die "не удалось собрать окружение для $SHA (прод не тронут)"
 
 echo "== 4/6 Копия базы =="
 STAMP="$(date +%Y%m%d-%H%M%S)"
@@ -143,6 +228,9 @@ echo "== 5/6 Переключаемся на коммит =="
 git checkout --detach "$SHA"
 git --no-pager log -1 --format='%h %ad %s' --date=iso
 set_commit_env "$SHA"
+swap_release_venv "$STAGING_VENV" || die "не удалось подменить окружение"
+STAGING_VENV=""
+prune_release_venvs
 
 echo "== 6/6 Перезапуск и проверка =="
 if systemctl restart "$SERVICE" && wait_ready; then
@@ -159,5 +247,6 @@ echo "ПРИЛОЖЕНИЕ НЕ ПОДНЯЛОСЬ. Логи:" >&2
 journalctl -u "$SERVICE" -n 60 --no-pager >&2 || true
 echo >&2
 echo "ОТКАТ ОДНОЙ КОМАНДОЙ: bash deploy/deploy.sh $CURRENT" >&2
+echo "прежнее окружение цело: $VENV_ROOT/venv-$CURRENT — откат обойдётся без сети" >&2
 echo "копия базы перед этой выкладкой: ${BACKUP:-(базы не было)}" >&2
 exit 1
