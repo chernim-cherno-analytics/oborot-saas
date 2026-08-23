@@ -1,0 +1,307 @@
+# Сторож канала «Codex ревьюит → Claude чинит».
+#
+# Что он делает и, главное, чего НЕ делает. Он не вызывает ни одну модель: ни
+# OpenAI, ни Anthropic, ни через API, ни через action. Секретов ему не выдают,
+# и просить их незачем — он умеет ровно одно: заметить, что ревью Codex висит
+# без ответа, и сказать об этом в PR.
+#
+# Зачем он нужен при локальном диспетчере. Исправления делает macOS-машина
+# владельца. Она засыпает, уезжает в самолёте, теряет сеть и иногда просто
+# выключена. Со стороны GitHub такая машина неотличима от работающей: ревью
+# лежит, ответа нет, и молчание длится ровно столько, сколько никто не смотрит
+# в PR руками. Этот сторож превращает молчание в одну заметную строку.
+#
+# Порог в 90 минут выбран не «на глаз»: один прогон диспетчера — это `claude`
+# плюс полный набор тестов, а он занимает до получаса. Порог меньше часа давал
+# бы ложные тревоги на каждой длинной правке.
+name: Agent loop - watchdog
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: oborot-agent-watchdog
+  cancel-in-progress: true
+
+jobs:
+  watchdog:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      # Написать комментарий — и прочитать PR с ревью, ради которых всё
+      # затевалось. Второе право пришлось выписать явно: как только в workflow
+      # появляется блок `permissions`, всё неперечисленное становится `none`, и
+      # `pulls.list` падал бы с 403 ещё до первой проверки. Ни contents, ни
+      # actions по-прежнему нет: сторож ничего не запускает и код не читает.
+      issues: write
+      pull-requests: read
+    env:
+      # Логины ревьюеров через запятую. Переопределяется переменной репозитория
+      # AGENT_REVIEWER_LOGINS, если нативный Codex подписывается иначе.
+      REVIEWER_LOGINS: ${{ vars.AGENT_REVIEWER_LOGINS || 'chatgpt-codex-connector[bot]' }}
+      STALE_MINUTES: "90"
+      # Шаблон «ревью без замечаний». Пусто — берётся значение по умолчанию из
+      # скрипта, оно совпадает с NOOP_REVIEW_PATTERN диспетчера.
+      NOOP_REVIEW_PATTERN: ${{ vars.AGENT_NOOP_REVIEW_PATTERN || '' }}
+    steps:
+      - name: Найти ревью, оставшиеся без ответа
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const repoFullName = `${context.repo.owner}/${context.repo.repo}`;
+            const staleMinutes = Number(process.env.STALE_MINUTES);
+            const logins = process.env.REVIEWER_LOGINS
+              .split(',')
+              .map(value => value.trim().toLowerCase())
+              .filter(Boolean)
+              .map(value => value.endsWith('[bot]') ? value.slice(0, -5) : value);
+
+            const isReviewer = (login) => {
+              if (!login) return false;
+              const normalized = login.toLowerCase();
+              const bare = normalized.endsWith('[bot]') ? normalized.slice(0, -5) : normalized;
+              return logins.includes(bare);
+            };
+
+            // Тот же шаблон, что у диспетчера (CONFIG_KEYS.NOOP_REVIEW_PATTERN
+            // в tools/agent-bridge/bridge.py). Совпадение обязательное: сторож
+            // и диспетчер должны одинаково понимать, что такое «замечаний нет».
+            // Разойдутся — сторож начнёт ругаться на SHA, к которому у
+            // диспетчера претензий нет, и его перестанут читать.
+            const noopPattern = new RegExp(
+              process.env.NOOP_REVIEW_PATTERN ||
+              String.raw`(no (major |significant |blocking )?issues|` +
+              String.raw`looks good|lgtm|нет замечаний|замечаний нет|` +
+              String.raw`no comments to post|didn't find any)`,
+              'i');
+
+            // --- clean-verdict:start ---
+            // Порт `is_clean_verdict` из tools/agent-bridge/bridge.py. Шаблон
+            // применяется НЕ подстрокой: тело «No blocking issues, but the
+            // retry path still loses findings» первыми словами совпадает с
+            // шаблоном, а замечание в нём настоящее. Считая такое тело пустым,
+            // сторож молчал бы ровно там, где обязан кричать.
+            //
+            // Списки слов обязаны совпадать со списками диспетчера дословно —
+            // это проверяется тестом (tests/test_agent_bridge.py). Разойдутся —
+            // сторож и диспетчер снова начнут по-разному понимать «замечаний
+            // нет», а обнаружится это только по потерянному замечанию.
+            const VERDICT_FILLER = new Set([
+              'a', 'an', 'the', 'this', 'that', 'these', 'those', 'it', 'i', 'we', 'you',
+              'my', 'your', 'me', 'us', 'am', 'is', 'are', 'was', 'were', 'be', 'been',
+              'have', 'has', 'had', 'do', 'does', 'did', 'in', 'on', 'of', 'to', 'for',
+              'with', 'from', 'at', 'and', 'here', 'all', 'any', 'so', 'far', 'overall',
+              'again', 'now', 'new', 'latest', 'head', 'current', 'side',
+              'pr', 'prs', 'pull', 'request', 'requests', 'review', 'reviewed',
+              'reviewer', 'codex', 'changes', 'change', 'changeset', 'code', 'diff',
+              'commit', 'commits', 'branch', 'file', 'files', 'patch',
+              'found', 'find', 'see', 'seen', 'look', 'looks', 'looking', 'seems',
+              'good', 'great', 'fine', 'well', 'nice', 'clean', 'ok', 'okay', 'solid',
+              'nothing', 'none', 'no', 'not',
+              'issue', 'issues', 'problem', 'problems', 'concern', 'concerns',
+              'blocker', 'blockers', 'blocking', 'major', 'significant', 'critical',
+              'serious', 'thanks', 'thank',
+              'и', 'в', 'во', 'к', 'ко', 'по', 'у', 'на', 'с', 'со', 'для', 'от', 'из',
+              'это', 'этот', 'этом', 'этому', 'эти', 'тут', 'здесь', 'тот', 'том',
+              'я', 'мы', 'мне', 'меня', 'нет', 'не', 'ничего',
+              'замечание', 'замечания', 'замечаний', 'проблем', 'проблема', 'проблемы',
+              'претензий', 'претензии', 'вопросов', 'вопросы',
+              'нашёл', 'нашел', 'нашлось', 'вижу', 'видно', 'есть',
+              'код', 'коде', 'коду', 'кода', 'изменения', 'изменениям', 'изменениях',
+              'правки', 'правкам', 'ревью', 'коммит', 'коммите', 'ветке', 'ветка',
+              'всё', 'все', 'хорошо', 'отлично', 'порядке', 'порядок', 'ок', 'спасибо',
+              'выглядит', 'выглядят', 'смотрится',
+            ]);
+            const VERDICT_CONTRAST = new Set([
+              'but', 'however', 'though', 'although', 'yet', 'except', 'aside',
+              'besides', 'still', 'nevertheless', 'nonetheless', 'minor', 'nit',
+              'nits', 'nitpick', 'suggestion', 'suggestions', 'consider', 'please',
+              'но', 'однако', 'хотя', 'лишь', 'кроме', 'правда', 'зато', 'впрочем',
+            ]);
+            const BOILERPLATE_LINE = new RegExp(
+              String.raw`(codex review\s*$|about codex|reviewed commit|useful\?\s*react|` +
+              String.raw`react with|automated review suggestions|полезно\?\s*реакция)`,
+              'i');
+            // Новый объект на каждый разбор: у глобального регулярного
+            // выражения в JS есть память (`lastIndex`), и общий экземпляр
+            // молча пропускал бы часть слов через раз.
+            const words = (text) => text.match(/[\p{L}\p{N}'’_-]+/gu) || [];
+
+            const stripReviewDecoration = (body) => {
+              let text = body.replace(/<details[\s\S]*?<\/details>/gi, ' ');
+              text = text.replace(/```[\s\S]*?```/g, ' ');
+              text = text.replace(/!\[[^\]]*\]\([^)]*\)/g, ' ');
+              text = text.replace(/\[([^\]]*)\]\([^)]*\)/g, '$1');
+              text = text.replace(/<[^>]+>/g, ' ');
+              return text
+                .split('\n')
+                .map(line => line.trim().replace(/^#+|#+$/g, '').trim())
+                .filter(line => words(line).length > 0 && !BOILERPLATE_LINE.test(line))
+                .join('\n');
+            };
+
+            const tokens = (text) => words(text.toLowerCase());
+
+            const sentenceIsClean = (sentence) => {
+              if (tokens(sentence).some(token => VERDICT_CONTRAST.has(token))) return false;
+              const match = noopPattern.exec(sentence);
+              if (!match) return false;
+              const rest = sentence.slice(0, match.index) + ' ' +
+                           sentence.slice(match.index + match[0].length);
+              return tokens(rest).every(token => VERDICT_FILLER.has(token));
+            };
+
+            // Тело из одной обвязки чистым НЕ считается: про такое тело мы
+            // ничего не знаем, а незнание должно будить тревогу, а не гасить её.
+            const isCleanVerdict = (body) => {
+              const sentences = stripReviewDecoration(body)
+                .split(/[.!?;\n]+/)
+                .map(part => part.trim())
+                .filter(part => tokens(part).length > 0);
+              return sentences.length > 0 && sentences.every(sentenceIsClean);
+            };
+            // --- clean-verdict:end ---
+
+            const prs = await github.paginate(github.rest.pulls.list, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              per_page: 100,
+            });
+
+            // Только свои ветки claude/*. PR из форка не наш: туда мы не пишем
+            // и за его молчание не отвечаем.
+            const agentPrs = prs.filter(pr =>
+              !pr.draft &&
+              pr.head.repo?.full_name === repoFullName &&
+              pr.head.ref.startsWith('claude/')
+            );
+
+            const now = Date.now();
+            let flagged = 0;
+
+            for (const pr of agentPrs) {
+              const headSha = pr.head.sha;
+
+              const reviews = await github.paginate(github.rest.pulls.listReviews, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: pr.number,
+                per_page: 100,
+              });
+
+              // Ровно текущий HEAD. Ревью прошлого коммита уже неактуально:
+              // если бы оно было проблемой, проблемой был бы и прошлый коммит.
+              const forHead = reviews.filter(review =>
+                isReviewer(review.user?.login) &&
+                review.commit_id === headSha &&
+                ['CHANGES_REQUESTED', 'COMMENTED'].includes((review.state || '').toUpperCase())
+              );
+              if (forHead.length === 0) continue;
+
+              const newest = forHead.reduce((a, b) =>
+                new Date(a.submitted_at) > new Date(b.submitted_at) ? a : b);
+              const ageMinutes = (now - new Date(newest.submitted_at).getTime()) / 60000;
+              if (ageMinutes < staleMinutes) continue;
+
+              // Есть ли вообще что чинить. Codex оставляет ревью и тогда, когда
+              // замечаний нет: состояние у такого ревью тоже COMMENTED, и по
+              // одному состоянию оно неотличимо от настоящих претензий.
+              // Диспетчер такое ревью распознаёт (ReviewBundle.is_actionable),
+              // помечает CLEAN и НИЧЕГО не пишет в PR — маркера не появляется.
+              // Сторож, считающий любое COMMENTED заданием, через 90 минут
+              // объявлял бы тревогу по чистому SHA. Признак тот же, что у
+              // диспетчера: есть inline-замечания либо тело ревью, которое
+              // целиком не является чистым вердиктом (см. isCleanVerdict).
+              const inlineComments = await github.paginate(github.rest.pulls.listReviewComments, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: pr.number,
+                per_page: 100,
+              });
+              // Привязка та же, что у диспетчера (inline_anchor_sha в
+              // tools/agent-bridge/bridge.py), и по той же причине. У
+              // inline-замечания поле commit_id переезжает: GitHub
+              // переставляет комментарий на новый коммит, если строка в файле
+              // не изменилась. Сравнение commit_id с HEAD выдавало бы
+              // замечания к прошлому коммиту за замечания к текущему — и
+              // сторож объявлял бы тревогу по SHA, к которому у ревьюера
+              // претензий не было. Устойчивы pull_request_review_id (через
+              // commit_id самого ревью, оно не переезжает) и
+              // original_commit_id; commit_id остаётся запасным вариантом.
+              const reviewCommitById = new Map(
+                reviews
+                  .filter(review => isReviewer(review.user?.login) && review.commit_id)
+                  .map(review => [review.id, review.commit_id])
+              );
+              const anchorSha = (comment) =>
+                reviewCommitById.get(comment.pull_request_review_id) ||
+                comment.original_commit_id ||
+                comment.commit_id;
+              const inlineForHead = inlineComments.filter(comment =>
+                isReviewer(comment.user?.login) && anchorSha(comment) === headSha
+              );
+              const actionable = inlineForHead.length > 0 || forHead.some(review => {
+                const body = (review.body || '').trim();
+                return body.length > 0 && !isCleanVerdict(body);
+              });
+              if (!actionable) {
+                core.info(`PR #${pr.number}: ревью для ${headSha.slice(0, 8)} без замечаний, пропускаю`);
+                continue;
+              }
+
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr.number,
+                per_page: 100,
+              });
+
+              // Диспетчер отчитывается маркером с точным SHA. Есть маркер —
+              // значит машина проснулась и ответила, сторожу говорить нечего.
+              const answered = comments.some(comment =>
+                (comment.body || '').includes('<!-- oborot-bridge:v1') &&
+                (comment.body || '').includes(`head=${headSha}`)
+              );
+              if (answered) continue;
+
+              const marker = `<!-- oborot-watchdog:v2 status=NO_LOCAL_DISPATCHER head=${headSha} -->`;
+              if (comments.some(comment => (comment.body || '').includes(marker))) continue;
+
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr.number,
+                body: [
+                  marker,
+                  '',
+                  '**watchdog — ревью Codex без ответа**',
+                  '',
+                  `Замечания к \`${headSha}\` лежат уже ${Math.floor(ageMinutes)} мин, ` +
+                  'а локальный диспетчер на них не ответил.',
+                  '',
+                  'Обычная причина — машина владельца спит, выключена или без сети: ' +
+                  'исправления делает локальный `claude` под подпиской, а не GitHub Actions. ' +
+                  'Этот сторож моделей не вызывает и починить ничего не может.',
+                  '',
+                  'Что проверить на машине:',
+                  '',
+                  '```',
+                  'tools/agent-bridge/run.sh health',
+                  'tools/agent-bridge/run.sh status --remote',
+                  'tools/agent-bridge/run.sh logs -n 100',
+                  '```',
+                  '',
+                  'Если диспетчер уже поставил `NEEDS_HUMAN` для этого SHA — три попытки ' +
+                  'исчерпаны, и дальше нужно решение человека, а не перезапуск.',
+                ].join('\n'),
+              });
+              flagged += 1;
+              core.warning(`PR #${pr.number}: ревью для ${headSha.slice(0, 8)} без ответа ${Math.floor(ageMinutes)} мин`);
+            }
+
+            core.info(`Проверено PR: ${agentPrs.length}, отмечено без ответа: ${flagged}`);
