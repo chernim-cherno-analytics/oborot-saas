@@ -136,8 +136,27 @@ jobs:
                 pull_number: pr.number,
                 per_page: 100,
               });
+              // Привязка та же, что у диспетчера (inline_anchor_sha в
+              // tools/agent-bridge/bridge.py), и по той же причине. У
+              // inline-замечания поле commit_id переезжает: GitHub
+              // переставляет комментарий на новый коммит, если строка в файле
+              // не изменилась. Сравнение commit_id с HEAD выдавало бы
+              // замечания к прошлому коммиту за замечания к текущему — и
+              // сторож объявлял бы тревогу по SHA, к которому у ревьюера
+              // претензий не было. Устойчивы pull_request_review_id (через
+              // commit_id самого ревью, оно не переезжает) и
+              // original_commit_id; commit_id остаётся запасным вариантом.
+              const reviewCommitById = new Map(
+                reviews
+                  .filter(review => isReviewer(review.user?.login) && review.commit_id)
+                  .map(review => [review.id, review.commit_id])
+              );
+              const anchorSha = (comment) =>
+                reviewCommitById.get(comment.pull_request_review_id) ||
+                comment.original_commit_id ||
+                comment.commit_id;
               const inlineForHead = inlineComments.filter(comment =>
-                isReviewer(comment.user?.login) && comment.commit_id === headSha
+                isReviewer(comment.user?.login) && anchorSha(comment) === headSha
               );
               const actionable = inlineForHead.length > 0 || forHead.some(review => {
                 const body = (review.body || '').trim();

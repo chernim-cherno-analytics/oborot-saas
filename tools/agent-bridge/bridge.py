@@ -68,6 +68,9 @@ from pathlib import Path
 VERSION = "1"
 MARKER_PREFIX = "<!-- oborot-bridge:v1"
 MIRROR_PREFIX = "<!-- oborot-bridge-mirror:v1"
+# Маркер просьбы «поревьюй новый SHA». Отдельный от отчётного: отчёт и просьба
+# живут разными жизнями, и защита от дублей у просьбы своя — по новому SHA.
+REVIEW_REQUEST_PREFIX = "<!-- oborot-bridge-review-request:v1"
 
 # Исходы, которые видит не только автор PR, но и второй агент: по ним он решает,
 # ждать ему нового SHA, читать хвост тестов или звать человека. Промежуточные
@@ -120,6 +123,12 @@ CONFIG_KEYS = {
     "LOG_KEEP_BYTES": "5242880",
     # Канонический issue-канал координации агентов. 0 или пусто — не зеркалить.
     "COORDINATION_ISSUE": "2",
+    # Чем будить ревьюера после успешного push. Пусто — не будить.
+    # Наблюдение 23.08.2026: push 1c7d616 в ветку открытого PR нового ревью
+    # Codex НЕ запустил, а ручной комментарий `@codex review` — запустил.
+    # Значит «новый SHA сам разбудит Codex» — предположение, а не факт, и на
+    # нём круг замыкать нельзя.
+    "REVIEW_REQUEST_COMMAND": "@codex review",
 }
 
 ENV_PREFIX = "OBOROT_BRIDGE_"
@@ -668,20 +677,58 @@ class ReviewBundle:
         return False
 
 
+def inline_anchor_sha(comment: dict, review_commits: dict) -> str:
+    """SHA, к которому inline-замечание относилось В МОМЕНТ ревью.
+
+    Поле `commit_id` у inline-замечания для этого не годится, и это не теория.
+    Замечание 3839314973 в PR #7 было оставлено к ревью коммита 193602bf, а
+    после push нового коммита GitHub переписал ему `commit_id` на 1c7d616c —
+    строка в файле никуда не делась, и API «переехал» комментарий на свежий
+    коммит. Диспетчер, сравнивающий `commit_id` с текущим HEAD, из-за этого
+    видел четыре уже отработанных замечания как четыре новых и заново будил
+    Claude чинить то, что уже починено, сжигая попытки для этого SHA.
+
+    Устойчивых полей два. `pull_request_review_id` ведёт к ревью, у которого
+    `commit_id` не переезжает (проверено на том же PR: у ревью 5003117263 он
+    так и остался 193602bf) — это самая надёжная привязка, потому что решение
+    «к какому коммиту относится ревью» принимается один раз. `original_commit_id`
+    хранит коммит, на котором замечание создано, и выручает для одиночных
+    комментариев вне ревью. `commit_id` остаётся последним запасным вариантом:
+    только для payload, где нет ни того, ни другого.
+    """
+    review_id = comment.get("pull_request_review_id")
+    if review_id is not None:
+        anchored = review_commits.get(review_id)
+        if anchored:
+            return anchored
+    return comment.get("original_commit_id") or comment.get("commit_id") or ""
+
+
 def collect_review(gh: GitHub, number: int, head_sha: str, logins: list[str]) -> ReviewBundle:
     """Собрать замечания ревьюера, привязанные ровно к `head_sha`.
 
     «Ровно к SHA» — не придирка. Комментарий к прошлому коммиту мог уже быть
     исправлен, и починка «по устаревшему замечанию» ломает свежий код и жжёт
-    попытки. Поэтому сравнение точное и по полному SHA.
+    попытки. Поэтому сравнение точное и по полному SHA — но сравнивать надо с
+    исходной привязкой замечания, а не с той, куда его переставил GitHub:
+    см. `inline_anchor_sha`.
     """
     bundle = ReviewBundle(head_sha)
     short = head_sha[:7]
 
+    # id ревью → коммит, к которому оно относится. Собирается по всем ревью
+    # ревьюера, включая APPROVED: карта нужна для привязки замечаний, а не для
+    # отбора самих ревью.
+    review_commits: dict = {}
+
     for review in gh.reviews(number):
         if not login_matches((review.get("user") or {}).get("login", ""), logins):
             continue
-        if review.get("commit_id") != head_sha:
+        review_id = review.get("id")
+        review_sha = review.get("commit_id") or ""
+        if review_id is not None and review_sha:
+            review_commits[review_id] = review_sha
+        if review_sha != head_sha:
             continue
         state = (review.get("state") or "").upper()
         if state == "APPROVED":
@@ -693,7 +740,7 @@ def collect_review(gh: GitHub, number: int, head_sha: str, logins: list[str]) ->
     for comment in gh.review_comments(number):
         if not login_matches((comment.get("user") or {}).get("login", ""), logins):
             continue
-        if comment.get("commit_id") != head_sha:
+        if inline_anchor_sha(comment, review_commits) != head_sha:
             continue
         bundle.inline.append(comment)
 
@@ -1169,7 +1216,43 @@ class Bridge:
                     "Изменённые файлы:\n{}".format(
                         head_sha, branch, new_sha, tests_cmd, format_paths(changed)),
                     output)
+        self.request_review(number, new_sha)
         return True
+
+    def request_review(self, number: int, new_sha: str) -> None:
+        """Разбудить ревьюера на новый SHA — один комментарий `@codex review`.
+
+        Круг «Codex ревьюит → Claude чинит → Codex ревьюит снова» держался на
+        предположении, что push сам запускает нативное ревью. 23.08.2026 это
+        предположение не подтвердилось: коммит 1c7d616 уехал в ветку открытого
+        PR #7, и нового ревью не появилось; ручной комментарий `@codex review`
+        его запустил сразу. Пока причина молчания на стороне облака неизвестна,
+        дешевле разбудить явно, чем ждать ревью, которого не будет: без него
+        цикл встаёт, а сторож через 90 минут не скажет ничего — висящего ревью
+        ведь тоже нет.
+
+        Дублей боимся так же, как в зеркале исходов, и защищаемся так же — не
+        памятью процесса, а маркером в самом PR. Диспетчер просыпается раз в
+        минуту и переживает перезапуски; десять одинаковых «@codex review» под
+        PR — это шум, из-за которого перестают читать и остальные комментарии.
+        """
+        command = self.cfg.get("REVIEW_REQUEST_COMMAND").strip()
+        if self.dry_run or not command:
+            return
+        marker = "{} head={} -->".format(REVIEW_REQUEST_PREFIX, new_sha)
+        try:
+            if any(marker in (comment.get("body") or "")
+                   for comment in self.gh.issue_comments(number)):
+                self.log.info("PR #{}: ревью для {} уже запрошено".format(
+                    number, new_sha[:8]))
+                return
+            self.gh.comment(number, "\n".join([marker, "", command]))
+            self.log.info("PR #{}: запросил ревью для {}".format(number, new_sha[:8]))
+        except Exception as exc:
+            # Правка уже в ветке; не сумели позвать ревьюера — это повод для
+            # строки в журнале, а не для падения цикла.
+            self.log.error("не смог запросить ревью в PR #{}: {}".format(
+                number, redact(str(exc))[:400]))
 
     def run_tests(self) -> tuple[bool, str, str]:
         command = self.cfg.get("TEST_CMD").strip()

@@ -18,7 +18,10 @@
      циклом и ровно один раз;
   5) зеркало ключевых исходов в issue-канал: дубль не появляется ни в одном
      процессе, ни после перезапуска (защита живёт в самом issue);
-  6) команда тестов у диспетчера совпадает с командой CI.
+  6) команда тестов у диспетчера совпадает с командой CI;
+  7) привязка inline-замечания к SHA: у GitHub поле `commit_id` замечания
+     переезжает на новый коммит, и по нему старое ревью выглядит как новое;
+  8) после успешного push диспетчер один раз просит ревью нового SHA.
 
 Запуск из корня репозитория:  python tests/test_agent_bridge.py
 """
@@ -106,6 +109,41 @@ class StubGitHub:
              "user": {"login": "oborot-agent-bridge"}})
 
 
+class StubCheckout:
+    """Рабочая копия без git: `run_fix` проверяется целиком, кроме самого git."""
+
+    def __init__(self, head_sha, new_sha):
+        self.path = Path(".")
+        self._head = head_sha
+        self._new = new_sha
+        self.pushed = []
+
+    def ensure(self):
+        pass
+
+    def sync_to(self, branch, sha):
+        self._head = sha
+
+    def head_sha(self):
+        return self._head
+
+    def changed_paths(self):
+        return ["app/x.py"]
+
+    def revert_protected(self, changed):
+        return []
+
+    def commit(self, message, name, email):
+        return self._new
+
+    def push(self, branch):
+        self.pushed.append(branch)
+        return subprocess.CompletedProcess(["git", "push"], 0, "", "")
+
+    def discard_all(self):
+        pass
+
+
 def make_bridge(cfg_values, gh, state_path, dry_run=False):
     """Диспетчер без окружения: ни git, ни gh, ни claude тут не нужны."""
     # Config собирается вручную, БЕЗ чтения ~/.config и переменных окружения:
@@ -135,8 +173,18 @@ def review(id_, sha, body="Найдено: тут ошибка, поправьт
             "user": {"login": "chatgpt-codex-connector[bot]"}}
 
 
-def inline_comment(id_, sha, path="app/x.py", line=1):
-    return {"id": id_, "commit_id": sha, "path": path, "line": line,
+def inline_comment(id_, sha, path="app/x.py", line=1, review_id=1, moved_to=None):
+    """Замечание в той форме, в какой его отдаёт GitHub.
+
+    `sha` — коммит, на котором замечание создано (`original_commit_id`).
+    `moved_to` — коммит, на который GitHub переставил замечание после нового
+    push: поле `commit_id` у inline-замечания не постоянное, и именно на этом
+    диспетчер обжёгся (см. `test_inline_anchored_to_review_commit`).
+    """
+    return {"id": id_, "commit_id": moved_to or sha, "original_commit_id": sha,
+            "pull_request_review_id": review_id, "path": path, "line": line,
+            "original_line": line, "side": "RIGHT", "in_reply_to_id": None,
+            "subject_type": "line",
             "body": f"замечание {id_}", "diff_hunk": "@@ -1 +1 @@",
             "user": {"login": "chatgpt-codex-connector[bot]"}}
 
@@ -391,7 +439,200 @@ def test_mirror_can_be_disabled():
 
 
 # --------------------------------------------------------------------------
-# 4. Команда тестов совпадает с CI
+# 4. Привязка inline-замечания к SHA ревью, а не к переехавшему commit_id
+# --------------------------------------------------------------------------
+
+# Настоящий случай из PR #7, подтверждённый GitHub API 23.08.2026. Замечания
+# оставлены к ревью коммита 193602bf; после push коммита 1c7d616 GitHub
+# переписал им `commit_id` на новый коммит (строки в файлах не изменились),
+# а `original_commit_id` и `pull_request_review_id` остались прежними. У
+# самого ревью `commit_id` не переехал.
+OLD_SHA = "193602bf72b0c3de1acdfa7a5f16ad6a0a7ead09"
+NEW_SHA = "1c7d616cf331cc717aa5e9517384efb16bbafd07"
+OLD_REVIEW_ID = 5003117263
+
+
+def test_inline_anchored_to_review_commit():
+    print("\n== Привязка inline-замечаний: SHA ревью, а не переехавший commit_id ==")
+    logins = ["chatgpt-codex-connector[bot]"]
+
+    # Ровно та форма, которую вернул `gh api .../pulls/comments/3839314973`.
+    moved = {
+        "id": 3839314973,
+        "commit_id": NEW_SHA,
+        "original_commit_id": OLD_SHA,
+        "pull_request_review_id": OLD_REVIEW_ID,
+        "path": ".github/workflows/agent-watchdog.yml",
+        "line": 40, "original_line": 37, "start_line": 34,
+        "side": "RIGHT", "subject_type": "line", "in_reply_to_id": None,
+        "body": "замечание к старому коммиту",
+        "diff_hunk": "@@ -34,4 +34,7 @@",
+        "user": {"login": "chatgpt-codex-connector[bot]"},
+    }
+    old_review = {"id": OLD_REVIEW_ID, "commit_id": OLD_SHA, "state": "COMMENTED",
+                  "body": "Нашёл несколько мест.",
+                  "submitted_at": "2026-08-23T18:53:40Z",
+                  "user": {"login": "chatgpt-codex-connector[bot]"}}
+
+    gh = StubGitHub(reviews=[old_review],
+                    inline=[moved,
+                            inline_comment(3839314974, OLD_SHA, review_id=OLD_REVIEW_ID,
+                                           moved_to=NEW_SHA)])
+
+    for_new = bridge.collect_review(gh, 7, NEW_SHA, logins)
+    check("переехавшие замечания не выдаются за ревью нового HEAD",
+          for_new.is_empty(), f"inline={len(for_new.inline)}")
+
+    for_old = bridge.collect_review(gh, 7, OLD_SHA, logins)
+    check("к своему SHA те же замечания по-прежнему собираются",
+          len(for_old.inline) == 2 and len(for_old.reviews) == 1,
+          f"inline={len(for_old.inline)}, reviews={len(for_old.reviews)}")
+
+    # Настоящее новое ревью к новому HEAD собраться обязано: чинить перестало
+    # бы не хуже, чем чинить лишнее.
+    new_review = {"id": 5003200000, "commit_id": NEW_SHA, "state": "COMMENTED",
+                  "body": "Ещё одно замечание.",
+                  "submitted_at": "2026-08-23T20:10:00Z",
+                  "user": {"login": "chatgpt-codex-connector[bot]"}}
+    fresh = inline_comment(3839400000, NEW_SHA, review_id=5003200000)
+    gh2 = StubGitHub(reviews=[old_review, new_review], inline=[moved, fresh])
+    bundle = bridge.collect_review(gh2, 7, NEW_SHA, logins)
+    check("настоящее ревью нового HEAD собирается целиком",
+          [c["id"] for c in bundle.inline] == [3839400000]
+          and [r["id"] for r in bundle.reviews] == [5003200000],
+          f"inline={[c['id'] for c in bundle.inline]}")
+
+    # Одиночный комментарий вне ревью: `pull_request_review_id` пустой, решает
+    # `original_commit_id`.
+    standalone = dict(moved, id=3839500000, pull_request_review_id=None)
+    gh3 = StubGitHub(reviews=[], inline=[standalone])
+    check("одиночное замечание вне ревью привязано по original_commit_id",
+          bridge.collect_review(gh3, 7, OLD_SHA, logins).inline
+          and not bridge.collect_review(gh3, 7, NEW_SHA, logins).inline)
+
+    # Payload без обоих устойчивых полей: остаётся `commit_id`, иначе замечание
+    # потерялось бы совсем.
+    legacy = {"id": 42, "commit_id": NEW_SHA, "path": "app/x.py", "line": 1,
+              "body": "старая форма", "diff_hunk": "@@ -1 +1 @@",
+              "user": {"login": "chatgpt-codex-connector[bot]"}}
+    gh4 = StubGitHub(reviews=[], inline=[legacy])
+    check("payload без original_commit_id не теряется",
+          [c["id"] for c in bridge.collect_review(gh4, 7, NEW_SHA, logins).inline] == [42])
+
+
+def test_old_review_does_not_wake_claude():
+    print("\n== Старое ревью не будит Claude на новом HEAD ==")
+    pr = {"number": 7, "head": {"ref": "claude/agent-bridge", "sha": NEW_SHA}}
+    old_review = {"id": OLD_REVIEW_ID, "commit_id": OLD_SHA, "state": "COMMENTED",
+                  "body": "Нашёл несколько мест.",
+                  "submitted_at": "2026-08-23T18:53:40Z",
+                  "user": {"login": "chatgpt-codex-connector[bot]"}}
+    gh = StubGitHub(reviews=[old_review],
+                    inline=[inline_comment(n, OLD_SHA, review_id=OLD_REVIEW_ID,
+                                           moved_to=NEW_SHA)
+                            for n in (10, 11, 12, 13)])
+
+    with tempfile.TemporaryDirectory() as tmp:
+        state_path = Path(tmp) / "state.json"
+        instance = make_bridge({"REPO": "owner/name", "COORDINATION_ISSUE": "0"},
+                               gh, state_path)
+        called = []
+        instance.run_fix = lambda *args: called.append(args) or True
+        handled = instance.handle_pr(pr)
+        entry = instance.state.head(7, NEW_SHA)
+
+    check("диспетчер не берётся за работу", handled is False and not called)
+    check("попытка не потрачена", entry.get("attempts", 0) == 0, str(entry))
+    check("в PR ничего не написано", gh.posted == [], str(gh.posted))
+
+
+# --------------------------------------------------------------------------
+# 5. Просьба поревьюить новый SHA
+# --------------------------------------------------------------------------
+
+def test_review_requested_after_push():
+    print("\n== После push диспетчер один раз будит ревьюера ==")
+    old_sha = "f" * 40
+    new_sha = "9" * 40
+    pr = {"number": 7, "head": {"ref": "claude/agent-bridge", "sha": old_sha}}
+    gh = StubGitHub(issue_comments={7: []})
+
+    bundle = bridge.ReviewBundle(old_sha)
+    bundle.reviews = [review(1, old_sha)]
+    bundle.inline = [inline_comment(10, old_sha)]
+
+    original = bridge.invoke_claude
+    bridge.invoke_claude = lambda tools, cfg, path, prompt, log: (True, "готово")
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+
+            def run_once():
+                # Отдельный экземпляр на каждый прогон: так это и выглядит под
+                # LaunchAgent, и так проверяется защита от дублей после
+                # перезапуска.
+                instance = make_bridge({"REPO": "owner/name", "COORDINATION_ISSUE": "0"},
+                                       gh, state_path)
+                instance.checkout = StubCheckout(old_sha, new_sha)
+                instance.run_tests = lambda: (True, "", "python3 tests/run_all.py --jobs 3")
+                entry = instance.state.head(7, old_sha)
+                entry["attempts"] = 1
+                return instance.run_fix(pr, bundle, entry, "запрос")
+
+            first, second = run_once(), run_once()
+    finally:
+        bridge.invoke_claude = original
+
+    bodies = [body for number, body in gh.posted if number == 7]
+    requests = [body for body in bodies if bridge.REVIEW_REQUEST_PREFIX in body]
+
+    check("push прошёл оба раза", first and second)
+    check("ревью нового SHA запрошено ровно один раз", len(requests) == 1,
+          str(len(requests)))
+    check("в просьбе есть команда пробуждения",
+          requests and "@codex review" in requests[0], requests[0] if requests else "")
+    check("маркер просьбы называет новый SHA",
+          requests and f"head={new_sha}" in requests[0])
+    check("сначала отчёт, потом просьба",
+          any(bridge.MARKER_PREFIX in body and "PUSHED" in body for body in bodies)
+          and bodies.index(requests[0]) > 0)
+
+
+def test_review_request_guards():
+    print("\n== Просьба о ревью: отключение, сухой прогон, отказ GitHub ==")
+    new_sha = "8" * 40
+
+    with tempfile.TemporaryDirectory() as tmp:
+        state_path = Path(tmp) / "state.json"
+
+        off = StubGitHub(issue_comments={7: []})
+        make_bridge({"REPO": "owner/name", "REVIEW_REQUEST_COMMAND": ""},
+                    off, state_path).request_review(7, new_sha)
+        check("пустая REVIEW_REQUEST_COMMAND отключает просьбу",
+              off.posted == [], str(off.posted))
+
+        dry = StubGitHub(issue_comments={7: []})
+        make_bridge({"REPO": "owner/name"}, dry, state_path,
+                    dry_run=True).request_review(7, new_sha)
+        check("сухой прогон в PR не пишет", dry.posted == [], str(dry.posted))
+
+        broken = StubGitHub(issue_comments={7: []})
+
+        def fail(number, body):
+            raise RuntimeError("GitHub недоступен")
+
+        broken.comment = fail
+        instance = make_bridge({"REPO": "owner/name"}, broken, state_path)
+        try:
+            instance.request_review(7, new_sha)
+            survived = True
+        except Exception:
+            survived = False
+        check("недоступный GitHub не роняет цикл: правка уже в ветке", survived)
+
+
+# --------------------------------------------------------------------------
+# 6. Команда тестов совпадает с CI
 # --------------------------------------------------------------------------
 
 def test_test_cmd_matches_ci():
@@ -416,6 +657,13 @@ def test_watchdog_permissions():
     check("сторожу разрешено читать PR и ревью", "pull-requests: read" in text)
     check("сторож смотрит и на inline-замечания", "listReviewComments" in text)
     check("сторож знает про пустое ревью", "NOOP_REVIEW_PATTERN" in text)
+    # Та же привязка, что у диспетчера. Сторож, сравнивающий `commit_id`
+    # замечания с HEAD, объявил бы тревогу по SHA, к которому ревью не было:
+    # GitHub переставляет замечания на новый коммит сам.
+    check("сторож привязывает замечания через ревью и original_commit_id",
+          "pull_request_review_id" in text and "original_commit_id" in text)
+    check("сторож не фильтрует замечания по переехавшему commit_id",
+          "comment.commit_id === headSha" not in text)
 
 
 def main() -> int:
@@ -427,6 +675,10 @@ def main() -> int:
     test_failed_attempt_returns_portion()
     test_mirror_to_coordination_issue()
     test_mirror_can_be_disabled()
+    test_inline_anchored_to_review_commit()
+    test_old_review_does_not_wake_claude()
+    test_review_requested_after_push()
+    test_review_request_guards()
     test_test_cmd_matches_ci()
     test_watchdog_permissions()
     print(f"\nИТОГО: {len(PASS)} OK, {len(FAIL)} FAIL")
