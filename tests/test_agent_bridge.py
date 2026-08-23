@@ -27,7 +27,12 @@
      тесты (настоящий launchd при этом не трогается);
  10) настройки, проверенные при установке, доезжают до launchd: каталог
      настроек уходит в plist, а значения, живущие только в переменной
-     окружения, установку обрывают — фон их всё равно не увидит.
+     окружения, установку обрывают — фон их всё равно не увидит;
+ 11) модель исполнителя: основная `opus` и резервная `fable` закреплены в
+     настройках по умолчанию, обе доезжают до аргументов запуска, обе видны в
+     `health` и `status`, и обе переопределяются владельцем;
+ 12) журнал владельца `OWNER_WORK_LOG.md`: шаблон из шести пунктов соблюдён, а
+     SHA и протокольные слова не подменяют собой человеческий текст.
 
 Запуск из корня репозитория:  python tests/test_agent_bridge.py
 """
@@ -872,6 +877,231 @@ def test_health_requires_interpreter():
               and "интерпретатор тестов" not in text)
 
 
+# --------------------------------------------------------------------------
+# 11. Модель исполнителя: закреплена, с резервом, видна в health и status
+# --------------------------------------------------------------------------
+#
+# Разбираемый дефект. `CLAUDE_MODEL` по умолчанию была пустой, то есть фон
+# правил ревью «чем сейчас настроен Claude Code». Модель, переключённую в
+# интерактивной сессии ради другой задачи, фон унаследовал бы молча: ни в
+# журнале, ни в `status` она не печаталась, и отличить «правку сделал opus» от
+# «правку сделал кто угодно» было нечем. Резерва не было вовсе — перегрузка
+# основной модели приходит как обычная ошибка запуска и стоила бы попытки из
+# трёх с исходом `CLAUDE_FAILED`, хотя чинить нечего.
+#
+# Проверяется: значения по умолчанию (opus + fable), то, что обе доезжают до
+# аргументов запуска, что переопределение владельца работает в обе стороны
+# (своя модель и пусто — без флага), и что обе модели видны в `health` и
+# `status`. Плюс сверка с config.env.example: файл настроек, обещающий не то,
+# что делает код, хуже отсутствующего.
+
+
+def claude_argv(cfg):
+    """Аргументы, с которыми диспетчер зовёт локальный claude. Без запуска."""
+
+    class StubTools:
+        claude = "/stub/claude"
+
+    seen = {}
+
+    def fake_run(argv, cwd=None, timeout=None, **kwargs):
+        seen["argv"] = list(argv)
+        return subprocess.CompletedProcess(argv, 0, "готово", "")
+
+    original, bridge.run = bridge.run, fake_run
+    try:
+        bridge.invoke_claude(StubTools(), cfg, Path("."), "запрос", StubLog())
+    finally:
+        bridge.run = original
+    return seen.get("argv", [])
+
+
+def flag_value(argv, flag):
+    return argv[argv.index(flag) + 1] if flag in argv else None
+
+
+def test_model_defaults_and_argv():
+    print("\n== Модель исполнителя: основная и резервная ==")
+    check("по умолчанию основная модель — opus",
+          bridge.CONFIG_KEYS["CLAUDE_MODEL"] == "opus",
+          repr(bridge.CONFIG_KEYS["CLAUDE_MODEL"]))
+    check("по умолчанию резервная модель — fable",
+          bridge.CONFIG_KEYS["CLAUDE_FALLBACK_MODEL"] == "fable",
+          repr(bridge.CONFIG_KEYS["CLAUDE_FALLBACK_MODEL"]))
+    # Алиас, а не полное имя: `claude-opus-5` устареет молча, а alias всегда
+    # указывает на свежую версию.
+    check("модели записаны алиасами, а не полными именами",
+          not bridge.CONFIG_KEYS["CLAUDE_MODEL"].startswith("claude-")
+          and not bridge.CONFIG_KEYS["CLAUDE_FALLBACK_MODEL"].startswith("claude-"))
+
+    argv = claude_argv(bare_config())
+    check("в запуск уходит основная модель", flag_value(argv, "--model") == "opus", str(argv))
+    check("в запуск уходит резервная модель",
+          flag_value(argv, "--fallback-model") == "fable", str(argv))
+    # `--fallback-model` действует только в неинтерактивном режиме: без `-p`
+    # флаг молча ничего не значит, и резерва фактически нет.
+    check("резерв передаётся вместе с неинтерактивным режимом", "-p" in argv, str(argv))
+    check("ключей API в запуске нет",
+          not any(part.startswith("sk-") or "API_KEY" in part for part in argv), str(argv))
+
+    own = claude_argv(bare_config(CLAUDE_MODEL="sonnet", CLAUDE_FALLBACK_MODEL="haiku"))
+    check("владелец может переопределить обе модели",
+          flag_value(own, "--model") == "sonnet"
+          and flag_value(own, "--fallback-model") == "haiku", str(own))
+
+    # Пусто — это осознанный выбор «как настроено в самом Claude Code», а не
+    # повод подставить умолчание: подстановка отняла бы у владельца этот выбор.
+    empty = claude_argv(bare_config(CLAUDE_MODEL="", CLAUDE_FALLBACK_MODEL=""))
+    check("пустая настройка означает «флаг не передавать»",
+          "--model" not in empty and "--fallback-model" not in empty, str(empty))
+
+
+def test_model_visible_in_health_and_status():
+    print("\n== Обе модели видны владельцу ==")
+
+    class StubTools:
+        gh = git = claude = python = ""
+
+        def __init__(self, cfg=None):
+            pass
+
+        def missing(self):
+            return ["gh", "git", "claude", "python3"]
+
+    def output(command, cfg, args=None):
+        """`health`/`status` без внешних вызовов: ни gh, ни launchctl, ни сети."""
+        out = io.StringIO()
+        tools_original, bridge.Tools = bridge.Tools, StubTools
+        run_original = bridge.run
+        bridge.run = lambda *a, **k: subprocess.CompletedProcess(["stub"], 1, "", "")
+        try:
+            with contextlib.redirect_stdout(out):
+                command(args, cfg)
+        finally:
+            bridge.Tools, bridge.run = tools_original, run_original
+        return out.getvalue()
+
+    class StubArgs:
+        remote = False
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "state"
+        root.mkdir()
+
+        for name, command, args in (("health", bridge.cmd_health, None),
+                                    ("status", bridge.cmd_status, StubArgs())):
+            text = output(command, bare_config(STATE_DIR=str(root)), args)
+            line = next((l for l in text.splitlines() if "модель исполнителя" in l), "")
+            check(f"{name} показывает обе модели",
+                  "opus" in line and "fable" in line, line or text)
+
+            text = output(command,
+                          bare_config(STATE_DIR=str(root), CLAUDE_MODEL="sonnet",
+                                      CLAUDE_FALLBACK_MODEL=""),
+                          args)
+            line = next((l for l in text.splitlines() if "модель исполнителя" in l), "")
+            check(f"{name} показывает переопределение владельца, а не умолчание",
+                  "sonnet" in line and "opus" not in line and "fable" not in line,
+                  line or text)
+
+        # Строка одна на две команды: две отдельные формулировки разошлись бы,
+        # и владелец видел бы в разных командах разные модели.
+        cfg = bare_config(STATE_DIR=str(root))
+        health_line = next(l for l in output(bridge.cmd_health, cfg).splitlines()
+                           if "модель исполнителя" in l)
+        status_line = next(l for l in output(bridge.cmd_status, cfg, StubArgs()).splitlines()
+                           if "модель исполнителя" in l)
+        check("health и status говорят одно и то же",
+              bridge.model_line(cfg) in health_line
+              and bridge.model_line(cfg) in status_line,
+              f"{health_line!r} / {status_line!r}")
+
+
+def test_model_documented_in_config_example():
+    print("\n== Файл настроек обещает то же, что делает код ==")
+    example = (ROOT / "tools" / "agent-bridge" / "config.env.example").read_text(encoding="utf-8")
+    for key in ("CLAUDE_MODEL", "CLAUDE_FALLBACK_MODEL"):
+        default = bridge.CONFIG_KEYS[key]
+        check(f"{key} описан в config.env.example с тем же значением",
+              f"OBOROT_BRIDGE_{key}={default}" in example, key)
+    check("в примере настроек нет ключей API",
+          "OPENAI_API_KEY" not in example and "ANTHROPIC_API_KEY" not in example)
+
+
+# --------------------------------------------------------------------------
+# 12. Журнал владельца: шаблон соблюдён и остаётся человеческим
+# --------------------------------------------------------------------------
+#
+# Почему это проверяется тестом, а не вычиткой. Журнал ведут агенты, и портится
+# он ровно одним способом: запись понемногу превращается в протокол — SHA,
+# `PUSHED`, `DEGRADED` вместо человеческого рассказа. Такой журнал формально
+# существует, а по назначению (владелец читает и понимает) не работает.
+# Проверяется структура, а не стиль: шесть обязательных пунктов на месте, а
+# служебные слова и хеши — только в «Технической справке» в конце записи.
+
+OWNER_LOG = ROOT / "OWNER_WORK_LOG.md"
+AGENTS_MD = ROOT / "AGENTS.md"
+
+OWNER_LOG_SECTIONS = (
+    "Какие новые возможности добавили",
+    "Что исправили",
+    "Что это меняет для владельца",
+    "Как проверили",
+    "Что осталось",
+)
+PROTOCOL_WORDS = ("PUSHED", "TESTS_FAILED", "PUSH_REJECTED", "CLAUDE_FAILED",
+                  "NO_CHANGES", "NEEDS_HUMAN", "READY_FOR_REVIEW",
+                  "REVIEW_ACCEPT", "REQUEST_CHANGES", "DEGRADED", "HEALTHY")
+
+
+def test_owner_log_follows_template():
+    print("\n== Журнал владельца ==")
+    check("OWNER_WORK_LOG.md есть в корне репозитория", OWNER_LOG.is_file())
+    if not OWNER_LOG.is_file():
+        return
+    text = OWNER_LOG.read_text(encoding="utf-8")
+
+    # Запись начинается с даты и задачи в самом заголовке: без даты журнал не
+    # читается как история, без задачи — не ищется.
+    entries = re.findall(r"^## (\d{2}\.\d{2}\.\d{4}) — (.+)$", text, re.MULTILINE)
+    check("есть хотя бы одна запись с датой и задачей в заголовке",
+          bool(entries), str(entries))
+
+    bodies = re.split(r"^## \d{2}\.\d{2}\.\d{4} — .+$", text, flags=re.MULTILINE)[1:]
+    for (date, _), body in zip(entries, bodies):
+        missing = [name for name in OWNER_LOG_SECTIONS if name not in body]
+        check(f"запись {date}: все шесть пунктов шаблона на месте",
+              not missing, ", ".join(missing))
+
+        # Служебные слова и хеши допустимы только в справке в конце записи.
+        human = body.split("**Техническая справка**")[0]
+        leaked = [word for word in PROTOCOL_WORDS if word in human]
+        check(f"запись {date}: протокольные слова не в основном тексте",
+              not leaked, ", ".join(leaked))
+        hashes = re.findall(r"\b[0-9a-f]{7,40}\b", human)
+        check(f"запись {date}: голых SHA в основном тексте нет", not hashes, str(hashes))
+
+    check("шаблон записи описан в самом журнале",
+          all(name in text.split("---")[0] for name in OWNER_LOG_SECTIONS))
+
+
+def test_agents_md_requires_both_logs():
+    print("\n== Правило про журналы в AGENTS.md ==")
+    text = AGENTS_MD.read_text(encoding="utf-8")
+    check("правило про журнал владельца обязательное, а не пожелание",
+          "OWNER_WORK_LOG.md" in text and "обязатель" in text.lower())
+    check("названы оба журнала: владельца и параллельный у Codex",
+          "OWNER_WORK_LOG.md" in text and "PROJECT_WORK_LOG.md" in text)
+    check("сказано, что журнал обновляется после каждого законченного блока",
+          "законченного блока" in text)
+    # Issue координации остаётся машиночитаемым: его формат под человеческое
+    # чтение не переделывается, иначе ломается защита от дублей и сторож.
+    check("Issue координации остаётся техническим зеркалом",
+          "техническим зеркалом" in text)
+    check("журнал владельца попал в карту документов",
+          "OWNER_WORK_LOG.md" in (ROOT / "PROJECT_STATE.md").read_text(encoding="utf-8"))
+
+
 def bridge_env(home: Path, **extra):
     """Окружение для запуска скриптов: без наследования настроек этой машины."""
     env = {
@@ -1242,6 +1472,11 @@ def main() -> int:
     test_launchagent_and_health_share_interpreter()
     test_installer_refuses_settings_launchd_will_not_see()
     test_nondefault_config_home_reaches_launchd()
+    test_model_defaults_and_argv()
+    test_model_visible_in_health_and_status()
+    test_model_documented_in_config_example()
+    test_owner_log_follows_template()
+    test_agents_md_requires_both_logs()
     print(f"\nИТОГО: {len(PASS)} OK, {len(FAIL)} FAIL")
     return 1 if FAIL else 0
 

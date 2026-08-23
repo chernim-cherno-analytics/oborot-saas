@@ -108,7 +108,16 @@ CONFIG_KEYS = {
     "TEST_PYTHON": "",
     "CLAUDE_BIN": "",
     "CLAUDE_TIMEOUT": "1800",
-    "CLAUDE_MODEL": "",
+    # Модель исполнителя закреплена в коде, а не оставлена «как получится».
+    # Пустое значение означало «чем сейчас настроен Claude Code», то есть фон
+    # мог месяцами чинить ревью моделью, которую владелец однажды переключил в
+    # интерактивной сессии для другой задачи, — и по журналу это не отличить.
+    # Основная — opus, резервная — fable. Записаны алиасами, а не полными
+    # именами вроде `claude-opus-5`: алиас всегда указывает на свежую версию,
+    # а полное имя устаревает молча. Владелец может переопределить обе
+    # настройки, пустое значение по-прежнему значит «не передавать флаг».
+    "CLAUDE_MODEL": "opus",
+    "CLAUDE_FALLBACK_MODEL": "fable",
     "CLAUDE_EXTRA_ARGS": "",
     "GH_BIN": "",
     "GIT_BIN": "",
@@ -1040,9 +1049,16 @@ def invoke_claude(tools: Tools, cfg: Config, cwd: Path, prompt: str, log: Log) -
         "--permission-mode", "acceptEdits",
         "--allowedTools", "Read,Edit,Write,Glob,Grep",
     ]
-    model = cfg.get("CLAUDE_MODEL")
+    model = cfg.get("CLAUDE_MODEL").strip()
     if model:
         argv += ["--model", model]
+    # Резервная модель — не украшение. Перегрузка основной приходит как обычная
+    # ошибка запуска: диспетчер отчитался бы `CLAUDE_FAILED`, потратил попытку
+    # из трёх и стал бы выглядеть так, будто правка невозможна. `--fallback-model`
+    # действует только в неинтерактивном режиме — здесь он всегда `-p`.
+    fallback = cfg.get("CLAUDE_FALLBACK_MODEL").strip()
+    if fallback:
+        argv += ["--fallback-model", fallback]
     extra = cfg.get("CLAUDE_EXTRA_ARGS").split()
     argv += extra
 
@@ -1544,6 +1560,21 @@ def _one_cycle(bridge: Bridge, log: Log, state: State) -> int:
         return 1
 
 
+def model_line(cfg: Config) -> str:
+    """Одна строка про модель исполнителя — общая для `status` и `health`.
+
+    Общая намеренно: две отдельные формулировки со временем расходятся, и тогда
+    одна команда показывает владельцу одну модель, а другая другую. Проверять
+    доступность алиаса запросом здесь нельзя — это стоило бы обращения к
+    модели на каждой проверке окружения, поэтому строка справочная.
+    """
+    model = cfg.get("CLAUDE_MODEL").strip()
+    fallback = cfg.get("CLAUDE_FALLBACK_MODEL").strip()
+    return "основная {}, резервная {}".format(
+        model or "как выбрано в Claude Code",
+        fallback or "нет")
+
+
 def cmd_status(args, cfg: Config) -> int:
     root = state_dir(cfg)
     log = Log(root / "bridge.log", cfg.get_int("LOG_KEEP_BYTES", 5 * 1024 * 1024), echo=False)
@@ -1552,6 +1583,7 @@ def cmd_status(args, cfg: Config) -> int:
 
     print("agent-bridge — состояние")
     print("  каталог состояния : {}".format(root))
+    print("  модель исполнителя: {}".format(model_line(cfg)))
     print("  циклов выполнено  : {}".format(state.data.get("cycles", 0)))
     print("  последний цикл    : {} ({})".format(
         state.data.get("last_cycle_finished_at") or "никогда",
@@ -1641,6 +1673,8 @@ def cmd_health(args, cfg: Config) -> int:
         result = run([tools.claude, "--version"], timeout=60)
         check("claude отвечает", result.returncode == 0,
               redact(result.stdout.strip() or result.stderr.strip())[:120])
+
+    lines.append("  [--] {:<22} {}".format("модель исполнителя", model_line(cfg)))
 
     repo = cfg.get("REPO") or (detect_repo(tools) if not tools.missing() else "")
     check("репозиторий", bool(repo), repo or "не определён, задайте " + ENV_PREFIX + "REPO")
@@ -1762,6 +1796,11 @@ def resolved_settings(cfg: Config) -> dict:
         "test-python": test_python,
         "test-python-source": source,
         "venv-python": str(venv_python(root)),
+        # Модели здесь затем, что установщик печатает их владельцу при
+        # установке: переопределение, сделанное когда-то в config.env, иначе
+        # обнаруживается только по счёту за не ту модель.
+        "claude-model": cfg.get("CLAUDE_MODEL").strip(),
+        "claude-fallback-model": cfg.get("CLAUDE_FALLBACK_MODEL").strip(),
     }
 
 
@@ -1811,7 +1850,8 @@ def main(argv: list[str] | None = None) -> int:
     resolve.add_argument("key", nargs="?", default="",
                          help="state-dir | config-file | config-home | env-only-keys | "
                               "checkout | test-cmd | test-python | test-python-source | "
-                              "venv-python; без ключа — всё сразу")
+                              "venv-python | claude-model | claude-fallback-model; "
+                              "без ключа — всё сразу")
     resolve.set_defaults(func=cmd_resolve)
 
     args = parser.parse_args(argv)

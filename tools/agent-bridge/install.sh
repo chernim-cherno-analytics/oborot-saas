@@ -72,6 +72,8 @@ TEST_CMD="$("$SCRIPT_DIR/run.sh" resolve test-cmd)"
 TEST_PYTHON="$("$SCRIPT_DIR/run.sh" resolve test-python)"
 TEST_PYTHON_SOURCE="$("$SCRIPT_DIR/run.sh" resolve test-python-source)"
 VENV_PYTHON="$("$SCRIPT_DIR/run.sh" resolve venv-python)"
+CLAUDE_MODEL="$("$SCRIPT_DIR/run.sh" resolve claude-model)"
+CLAUDE_FALLBACK_MODEL="$("$SCRIPT_DIR/run.sh" resolve claude-fallback-model)"
 
 # Настройки, которых фоновая задача не увидит. launchd не наследует оболочку:
 # фону достаётся ровно то, что перечислено в plist. Каталог состояния и каталог
@@ -152,6 +154,7 @@ if [ "$CHECK_ONLY" -eq 1 ]; then
     echo "Проверка настроек (--check), установка не выполнялась."
     echo "  настройки : $CONFIG_FILE"
     echo "  состояние : $STATE_DIR"
+    echo "  модель    : ${CLAUDE_MODEL:-как выбрано в Claude Code}, резервная ${CLAUDE_FALLBACK_MODEL:-нет}"
     # Оба каталога уедут в plist: то, что проверено здесь, увидит и фон.
     echo "  в plist   : OBOROT_BRIDGE_STATE_DIR, XDG_CONFIG_HOME=$CONFIG_HOME"
     exit 0
@@ -254,6 +257,7 @@ echo "  запуск         : $SCRIPT_DIR/run.sh poll --once"
 echo "  интервал       : каждые $INTERVAL с, плюс при входе в систему"
 echo "  состояние      : $STATE_DIR"
 echo "  настройки      : $CONFIG_FILE (каталог передан фону через XDG_CONFIG_HOME)"
+echo "  модель         : ${CLAUDE_MODEL:-как выбрано в Claude Code}, резервная ${CLAUDE_FALLBACK_MODEL:-нет}"
 echo "  тесты          : ${TEST_CMD:-отключены}"
 echo "  интерпретатор  : ${TEST_PYTHON:-не нужен} ${TEST_PYTHON_SOURCE:+($TEST_PYTHON_SOURCE)}"
 echo
