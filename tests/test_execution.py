@@ -278,7 +278,7 @@ def run() -> int:  # noqa: C901 — сценарный тест, ветвлен�
     r = c2.post(f"/api/orders/{order2}/status", json={"status": "received"})
     check("заказ принят одним кликом", r.status_code == 200, r.text[:150])
     got2 = c2.get(f"/api/orders/{order2}/receipts").json()
-    check("никакого количества не выдумано", got2["received_total"] == 0,
+    check("никакого количества не выдумано", got2["received_total"] is None,
           str(got2["received_total"]))
     check("и выдача говорит, что принятое неизвестно",
           got2.get("execution_unknown") is True, str(got2.get("execution_unknown")))
@@ -378,7 +378,7 @@ def run() -> int:  # noqa: C901 — сценарный тест, ветвлен�
     c3.post(f"/api/orders/{oid_pushed}/status", json={"status": "received"})
     got = c3.get(f"/api/orders/{oid_pushed}/receipts").json()
     check("по заказу, ушедшему в МойСклад, допущение не пишется",
-          got["received_total"] == 0, str(got["received_total"]))
+          got["received_total"] is None, str(got["received_total"]))
     from app.ms_sync import _write_shipped_receipts
     _write_shipped_receipts(3, {(oid_pushed, f"doc-{oid_pushed}"): {name3: 10.0}})
     got = c3.get(f"/api/orders/{oid_pushed}/receipts").json()
@@ -408,7 +408,7 @@ def run() -> int:  # noqa: C901 — сценарный тест, ветвлен�
                 json={"status": "received", "received": []})
     check("пустой список принят", r.status_code == 200, r.text[:120])
     got = c3.get(f"/api/orders/{oid_empty}/receipts").json()
-    check("пустой список ничего не выдумал", got["received_total"] == 0,
+    check("пустой список ничего не выдумал", got["received_total"] is None,
           str(got["received_total"]))
     body_empty = c3.get(f"/api/orders/{oid_empty}").json()
     check("но заказ закрыт: дата приёмки стоит", bool(body_empty.get("received_at")),
@@ -490,7 +490,7 @@ def run() -> int:  # noqa: C901 — сценарный тест, ветвлен�
     c3.post(f"/api/orders/{oid_ms}/status", json={"status": "sent"})
     c3.post(f"/api/orders/{oid_ms}/status", json={"status": "received"})
     got = c3.get(f"/api/orders/{oid_ms}/receipts").json()
-    check("по такому заказу приёмок нет", got["received_total"] == 0)
+    check("по такому заказу приёмок нет", got["received_total"] is None)
     check("и выдача честно говорит, что принятое НЕИЗВЕСТНО",
           got.get("execution_unknown") is True, str(got.get("execution_unknown")))
     out_ms = c3.get(f"/api/order-plan/{plan_ms}/outcome").json()
@@ -603,8 +603,8 @@ def run() -> int:  # noqa: C901 — сценарный тест, ветвлен�
     # А вот расхождение прятать нельзя: его выносят на разбор человеку.
     _write_shipped_receipts(3, {(oid_two, f"doc-{oid_two}"): {name3 + " v3": 74.0}})
     got = c3.get(f"/api/orders/{oid_two}/receipts").json()
-    check("при расхождении побеждает доказуемый источник",
-          got["received_total"] == 74, str(got["received_total"]))
+    check("при расхождении итог неизвестен, а не выбран молча",
+          got["received_total"] is None, str(got["received_total"]))
     conf = got.get("source_conflicts") or []
     check("расхождение названо прямо, а не сложено", len(conf) == 1, str(conf)[:160])
     check("и в нём видно, что сказал каждый источник",
@@ -658,6 +658,16 @@ def run() -> int:  # noqa: C901 — сценарный тест, ветвлен�
     human_zero = [_R0("Кепка", 0, "manual")]
     check("ноль, записанный человеком, остаётся фактом",
           _rbb0(human_zero) == {"Кепка": 0.0}, str(_rbb0(human_zero)))
+
+    # До D-25 перевод заказа в received мог сохранить заказанное количество
+    # как precision=whole_order. Такие строки существуют в старых базах, но не
+    # являются подтверждением фактической поставки.
+    class _Legacy(_R0):
+        precision = "whole_order"
+
+    legacy = [_Legacy("Кепка", 80, "manual")]
+    check("старое допущение whole_order не становится фактом исполнения",
+          _rbb0(legacy) == {}, str(_rbb0(legacy)))
 
     # Склейка переименованных позиций: МойСклад объединил два товара в один,
     # приёмки разных источников съехались под одно имя и выглядят как два
@@ -745,6 +755,13 @@ def run() -> int:  # noqa: C901 — сценарный тест, ветвлен�
     check("и обе называют это неизвестностью",
           oc.get("execution_unknown") is True and rc.get("execution_unknown") is True,
           f"outcome={oc.get('execution_unknown')} receipts={rc.get('execution_unknown')}")
+    check("спор не выдаёт приоритетный источник за числовой итог",
+          rc.get("received_total") is None, str(rc.get("received_total")))
+    rc_disputed = [x for x in rc.get("lines", []) if x["base_name"] == spor_base]
+    check("по спорной позиции количество и разница неизвестны",
+          rc_disputed and rc_disputed[0].get("received_qty") is None
+          and rc_disputed[0].get("diff") is None,
+          str(rc_disputed)[:160])
     check("спорная позиция названа поимённо",
           spor_base in (oc.get("disputed_bases") or []), str(oc.get("disputed_bases")))
     disputed_lines = [x for x in oc.get("lines", []) if x["base_name"] == spor_base]

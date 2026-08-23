@@ -159,60 +159,6 @@ def _grace_until(
     return marked + timedelta(days=GRACE_DAYS)
 
 
-def _paid_through(db: Session, org_id: int) -> date | None:
-    """Докуда организация оплачена по НАШИМ ЖЕ отметкам. None — отметок нет.
-
-    Зачем это нужно. Единственным доказательством оплаты для гейта было
-    `orgs.paid_until`, которое проставляется руками отдельной командой. Статус
-    заявки `paid` при этом использовался НАРАВНЕ с `invoiced` — то есть просто
-    запускал те же пять дней грейса. Организация, про которую в нашей же базе
-    написано «оплачено», закрывалась на шестой день; инструкция оператору в
-    deploy/README про продление `paid_until` при этом молчала.
-
-    Почему именно СРОК, а не флаг. Первая версия этой функции смотрела на
-    последнюю заявку и, если та `paid`, пускала без ограничения по времени. Это
-    оказалось хуже исходной ошибки, и ровно по двум причинам:
-
-      1) заплативший однажды не закрывался НИКОГДА — продление делается через
-         `UPDATE orgs SET paid_until`, новой заявки при этом не появляется;
-      2) «последняя заявка» ломалась от безобидного действия клиента: заявка на
-         смену тарифа создаётся со статусом `new` и становилась последней —
-         то есть оплативший клиент, нажав «хочу тариф Про», мгновенно терял
-         право записи.
-
-    Поэтому отметка `paid` даёт ровно тот срок, который клиент купил: месяц или
-    год от даты счёта. Это страховка на случай несведённого `paid_until`, а не
-    замена ему — и она сама истекает.
-    """
-    insp = inspect(db.get_bind())
-    if not insp.has_table("billing_requests"):
-        return None
-    cols = {c["name"] for c in insp.get_columns("billing_requests")}
-    if "invoiced_at" not in cols:
-        return None
-    rows = db.execute(
-        text(
-            "SELECT period, invoiced_at, created_at FROM billing_requests "
-            "WHERE org_id = :org AND lower(trim(status)) = 'paid'"
-        ),
-        {"org": org_id},
-    ).fetchall()
-    best: date | None = None
-    for period, invoiced_raw, created_raw in rows:
-        # Отметка о счёте надёжнее даты создания заявки, но и её оператор мог
-        # не проставить: тогда считаем от создания. Иначе оплаченная заявка без
-        # invoiced_at не давала бы вообще ничего — то есть отметка «оплачено»
-        # молча ничего не значила бы, ровно как раньше.
-        base = _as_date(invoiced_raw) or _as_date(created_raw)
-        if base is None:
-            continue
-        days = 365 if str(period or "").strip().lower() == "year" else 31
-        end = base + timedelta(days=days)
-        if best is None or end > best:
-            best = end
-    return best
-
-
 def _today() -> date:
     """«Сегодня» в UTC.
 
@@ -256,21 +202,6 @@ def subscription_state(org, db: Session, *, stamp: bool = False) -> str:
     grace_until = _grace_until(db, org.id, today, stamp=stamp)
     if grace_until is not None and grace_until >= today:
         return GRACE
-
-    # Последний рубеж перед отказом: а не написано ли у нас самих, что эта
-    # организация заплатила? Если написано и оплаченный срок ещё не вышел — не
-    # закрываем и говорим оператору, что `paid_until` не сведён. Молчаливый
-    # отказ плательщику стоил бы дороже любого пропущенного месяца, но и
-    # «бесплатно навсегда» здесь быть не должно: срок кончается сам.
-    paid_through = _paid_through(db, org.id)
-    if paid_through is not None and paid_through >= today:
-        log.warning(
-            "организация %s помечена оплаченной (billing_requests.status='paid'), "
-            "но paid_until не продлён — оставляю доступ до %s. Проставьте срок: "
-            "UPDATE orgs SET paid_until='ГГГГ-ММ-ДД' WHERE id=%s",
-            org.id, paid_through.isoformat(), org.id,
-        )
-        return ACTIVE
 
     return READONLY
 
