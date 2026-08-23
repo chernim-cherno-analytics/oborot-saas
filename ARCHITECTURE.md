@@ -333,9 +333,10 @@ uvicorn с `--no-proxy-headers`.
 
 В репозитории: `run.py` — `uvicorn` на `127.0.0.1:8000`, один процесс, порт не из env.
 Рекомендуемая прод-команда есть **только в комментарии** к `auth.py`.
-Нет: Dockerfile, compose, Procfile, конфигов nginx/systemd, CI, `docs/`
-(README ссылается на несуществующий `docs/DEPLOY.md`), `.env.example`,
-пинов версий и lock-файла.
+Нет: Dockerfile, compose, Procfile, конфигов nginx/systemd, `.env.example` и
+lock-файла с точными версиями. Есть CI (`.github/workflows/ci.yml`), инструкция
+и скрипт выкладки (`deploy/`), health-check и верхние границы версий. Репозиторная
+часть деплоя тестируется без VPS; реальное подключение сервера ещё не проверено.
 
 **Наблюдаемости практически нет.** Конфигурации логирования нет вообще
 (ни `basicConfig`, ни `dictConfig`) — куда и на каком уровне пишутся
