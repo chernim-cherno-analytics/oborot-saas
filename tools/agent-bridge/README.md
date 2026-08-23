@@ -59,9 +59,19 @@ tools/agent-bridge/uninstall.sh    # снять
 
 Настройки — `~/.config/oborot-agent-bridge/config.env`.
 
+## Отчётность
+
+Каждый ключевой исход (`PUSHED`, `TESTS_FAILED`, `PUSH_REJECTED`,
+`CLAUDE_FAILED`, `NO_CHANGES`, `NEEDS_HUMAN`) уходит комментарием в PR и копией
+в issue-канал координации — по умолчанию issue #2,
+`OBOROT_BRIDGE_COORDINATION_ISSUE=0` отключает копию. От дублей защищает маркер
+в самом issue, поэтому повторный прогон и потеря локального состояния канал не
+засоряют.
+
 ## Границы
 
 Диспетчер никогда не делает merge, rebase и force-push, никогда не сливает
 Pull Request, останавливается после трёх попыток на один SHA, откатывает любые
 правки в `.github/workflows/**` и `tools/agent-bridge/**` и не даёт `claude`
-выполнять команды: тесты, коммит и публикацию делает он сам.
+выполнять команды: тесты, коммит и публикацию делает он сам. Тесты — той же
+командой, что CI: `python3 tests/run_all.py --jobs 3`.

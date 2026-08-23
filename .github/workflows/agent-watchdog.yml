@@ -32,14 +32,21 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
-      # Единственное право: написать комментарий. Ни contents, ни actions —
-      # сторож ничего не запускает и ничего не читает из кода.
+      # Написать комментарий — и прочитать PR с ревью, ради которых всё
+      # затевалось. Второе право пришлось выписать явно: как только в workflow
+      # появляется блок `permissions`, всё неперечисленное становится `none`, и
+      # `pulls.list` падал бы с 403 ещё до первой проверки. Ни contents, ни
+      # actions по-прежнему нет: сторож ничего не запускает и код не читает.
       issues: write
+      pull-requests: read
     env:
       # Логины ревьюеров через запятую. Переопределяется переменной репозитория
       # AGENT_REVIEWER_LOGINS, если нативный Codex подписывается иначе.
       REVIEWER_LOGINS: ${{ vars.AGENT_REVIEWER_LOGINS || 'chatgpt-codex-connector[bot]' }}
       STALE_MINUTES: "90"
+      # Шаблон «ревью без замечаний». Пусто — берётся значение по умолчанию из
+      # скрипта, оно совпадает с NOOP_REVIEW_PATTERN диспетчера.
+      NOOP_REVIEW_PATTERN: ${{ vars.AGENT_NOOP_REVIEW_PATTERN || '' }}
     steps:
       - name: Найти ревью, оставшиеся без ответа
         uses: actions/github-script@v7
@@ -59,6 +66,18 @@ jobs:
               const bare = normalized.endsWith('[bot]') ? normalized.slice(0, -5) : normalized;
               return logins.includes(bare);
             };
+
+            // Тот же шаблон, что у диспетчера (CONFIG_KEYS.NOOP_REVIEW_PATTERN
+            // в tools/agent-bridge/bridge.py). Совпадение обязательное: сторож
+            // и диспетчер должны одинаково понимать, что такое «замечаний нет».
+            // Разойдутся — сторож начнёт ругаться на SHA, к которому у
+            // диспетчера претензий нет, и его перестанут читать.
+            const noopPattern = new RegExp(
+              process.env.NOOP_REVIEW_PATTERN ||
+              String.raw`(no (major |significant |blocking )?issues|` +
+              String.raw`looks good|lgtm|нет замечаний|замечаний нет|` +
+              String.raw`no comments to post|didn't find any)`,
+              'i');
 
             const prs = await github.paginate(github.rest.pulls.list, {
               owner: context.repo.owner,
@@ -101,6 +120,33 @@ jobs:
                 new Date(a.submitted_at) > new Date(b.submitted_at) ? a : b);
               const ageMinutes = (now - new Date(newest.submitted_at).getTime()) / 60000;
               if (ageMinutes < staleMinutes) continue;
+
+              // Есть ли вообще что чинить. Codex оставляет ревью и тогда, когда
+              // замечаний нет: состояние у такого ревью тоже COMMENTED, и по
+              // одному состоянию оно неотличимо от настоящих претензий.
+              // Диспетчер такое ревью распознаёт (ReviewBundle.is_actionable),
+              // помечает CLEAN и НИЧЕГО не пишет в PR — маркера не появляется.
+              // Сторож, считающий любое COMMENTED заданием, через 90 минут
+              // объявлял бы тревогу по чистому SHA. Признак тот же, что у
+              // диспетчера: есть inline-замечания либо непустое тело ревью, не
+              // подпадающее под шаблон «замечаний нет».
+              const inlineComments = await github.paginate(github.rest.pulls.listReviewComments, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: pr.number,
+                per_page: 100,
+              });
+              const inlineForHead = inlineComments.filter(comment =>
+                isReviewer(comment.user?.login) && comment.commit_id === headSha
+              );
+              const actionable = inlineForHead.length > 0 || forHead.some(review => {
+                const body = (review.body || '').trim();
+                return body.length > 0 && !noopPattern.test(body);
+              });
+              if (!actionable) {
+                core.info(`PR #${pr.number}: ревью для ${headSha.slice(0, 8)} без замечаний, пропускаю`);
+                continue;
+              }
 
               const comments = await github.paginate(github.rest.issues.listComments, {
                 owner: context.repo.owner,

@@ -67,6 +67,20 @@ from pathlib import Path
 
 VERSION = "1"
 MARKER_PREFIX = "<!-- oborot-bridge:v1"
+MIRROR_PREFIX = "<!-- oborot-bridge-mirror:v1"
+
+# Исходы, которые видит не только автор PR, но и второй агент: по ним он решает,
+# ждать ему нового SHA, читать хвост тестов или звать человека. Промежуточные
+# состояния (`WORKING`, `CLEAN`, `APPROVED`) в общий канал не идут — там нужна
+# сводка, а не поток.
+MIRRORED_STATUSES = (
+    "PUSHED",
+    "TESTS_FAILED",
+    "PUSH_REJECTED",
+    "CLAUDE_FAILED",
+    "NO_CHANGES",
+    "NEEDS_HUMAN",
+)
 
 # --------------------------------------------------------------------------
 # Конфигурация
@@ -81,7 +95,12 @@ CONFIG_KEYS = {
     "REVIEWER_LOGINS": "chatgpt-codex-connector[bot]",
     "MAX_ATTEMPTS": "3",
     "CHECKOUT": "",
-    "TEST_CMD": "python3 tests/run_all.py",
+    # Ровно та команда, которой проверяет CI (`.github/workflows/ci.yml`).
+    # `--jobs 3` здесь не украшение: без него раннер поднимает все наборы разом,
+    # они мешают друг другу портами и временем, и получаются падения, которых в
+    # CI нет. Диспетчер, который «краснее» CI, бесполезен — его вывод перестают
+    # читать; диспетчер, который «зеленее», опаснее вдвойне.
+    "TEST_CMD": "python3 tests/run_all.py --jobs 3",
     "TEST_TIMEOUT": "2700",
     "TEST_PYTHON": "",
     "CLAUDE_BIN": "",
@@ -99,6 +118,8 @@ CONFIG_KEYS = {
     ),
     "MAX_INLINE_COMMENTS": "60",
     "LOG_KEEP_BYTES": "5242880",
+    # Канонический issue-канал координации агентов. 0 или пусто — не зеркалить.
+    "COORDINATION_ISSUE": "2",
 }
 
 ENV_PREFIX = "OBOROT_BRIDGE_"
@@ -317,6 +338,10 @@ class State:
         return pr["heads"].setdefault(sha, {
             "attempts": 0,
             "processed": [],
+            # Идентификаторы отдельных замечаний, уже ушедших в работу. Нужны
+            # затем, что порция может быть меньше ревью: по отпечатку порции
+            # хвост замечаний не отследить.
+            "processed_ids": [],
             "status": "NEW",
             "status_at": None,
             "needs_human_notified": False,
@@ -450,6 +475,44 @@ class Tools:
 # GitHub: очередь и журнал
 # --------------------------------------------------------------------------
 
+def parse_api_output(text: str):
+    """Разобрать вывод `gh api --paginate`.
+
+    Одного `json.loads` тут мало, и это не теория. При `--paginate` gh печатает
+    КАЖДУЮ страницу отдельным значением JSON, одно за другим: два массива по сто
+    элементов — это не «массив из двухсот», а два массива подряд. `json.loads`
+    на таком тексте падает с «Extra data», и PR, у которого набралось больше ста
+    комментариев, переставал обрабатываться совсем — причём в самый неудобный
+    момент, на долгоживущей ветке.
+
+    Разбираем поток по одному значению (`raw_decode`) и, если все страницы —
+    списки, склеиваем их в один список: вызывающему коду не должно быть видно,
+    сколько страниц отдал GitHub. Разнородный поток (страницы-объекты, как у
+    поиска) возвращаем списком страниц — такие эндпоинты диспетчер не зовёт, но
+    молча склеивать их было бы враньём.
+    """
+    text = (text or "").strip()
+    if not text:
+        return None
+    decoder = json.JSONDecoder()
+    pages = []
+    index = 0
+    while index < len(text):
+        value, end = decoder.raw_decode(text, index)
+        pages.append(value)
+        index = end
+        while index < len(text) and text[index].isspace():
+            index += 1
+    if len(pages) == 1:
+        return pages[0]
+    if all(isinstance(page, list) for page in pages):
+        merged: list = []
+        for page in pages:
+            merged.extend(page)
+        return merged
+    return pages
+
+
 class GitHub:
     def __init__(self, tools: Tools, repo: str, log: Log):
         self.gh = tools.gh
@@ -472,10 +535,7 @@ class GitHub:
         if result.returncode != 0:
             raise RuntimeError("gh api {} -> {}: {}".format(
                 path, result.returncode, redact(result.stderr.strip())[:600]))
-        text = result.stdout.strip()
-        if not text:
-            return None
-        return json.loads(text)
+        return parse_api_output(result.stdout)
 
     def open_agent_prs(self, branch_prefix: str) -> list[dict]:
         """Открытые PR из веток `<prefix>*` этого же репозитория.
@@ -538,6 +598,9 @@ class ReviewBundle:
         self.inline: list[dict] = []
         self.notes: list[dict] = []
         self.approved = False
+        # Сколько inline-замечаний осталось за бортом этого прогона. Считается
+        # при нарезке порции и нужно только для честной строки в запросе.
+        self.dropped = 0
 
     @property
     def ids(self) -> list[str]:
@@ -549,6 +612,42 @@ class ReviewBundle:
     @property
     def fingerprint(self) -> str:
         return ",".join(self.ids)
+
+    def is_empty(self) -> bool:
+        return not (self.reviews or self.inline or self.notes)
+
+    def without(self, done_ids) -> "ReviewBundle":
+        """Копия без уже обработанных замечаний.
+
+        Обработанное отсекается поштучно, а не целым ревью: иначе замечание,
+        которое не поместилось в прошлый прогон, никогда бы не доехало.
+        """
+        done = set(done_ids or ())
+        rest = ReviewBundle(self.sha)
+        rest.approved = self.approved
+        rest.reviews = [r for r in self.reviews if "r{}".format(r["id"]) not in done]
+        rest.inline = [c for c in self.inline if "c{}".format(c["id"]) not in done]
+        rest.notes = [n for n in self.notes if "n{}".format(n["id"]) not in done]
+        return rest
+
+    def portion(self, max_inline: int) -> "ReviewBundle":
+        """Порция на один прогон: не больше `max_inline` inline-замечаний.
+
+        Отрезанные замечания НЕ считаются обработанными — ни в отпечатке, ни в
+        списке идентификаторов. Раньше отпечаток брался со всего ревью целиком,
+        и уже на следующем цикле оно опознавалось как «это мы уже делали», хотя
+        хвост замечаний Claude в глаза не видел. Обещание «остальные придут
+        следующим циклом» в запросе было ложным.
+        """
+        if max_inline <= 0 or len(self.inline) <= max_inline:
+            return self
+        part = ReviewBundle(self.sha)
+        part.approved = self.approved
+        part.reviews = list(self.reviews)
+        part.notes = list(self.notes)
+        part.inline = self.inline[:max_inline]
+        part.dropped = len(self.inline) - max_inline
+        return part
 
     def is_actionable(self, noop_pattern: re.Pattern) -> bool:
         """Есть ли что чинить.
@@ -732,7 +831,13 @@ class Checkout:
 # Вызов Claude Code
 # --------------------------------------------------------------------------
 
-def build_prompt(pr: dict, bundle: ReviewBundle, max_inline: int) -> str:
+def build_prompt(pr: dict, bundle: ReviewBundle) -> str:
+    """Запрос к Claude по УЖЕ нарезанной порции замечаний.
+
+    Нарезкой занимается `ReviewBundle.portion` до вызова: то, что попало в
+    запрос, и то, что диспетчер запишет как обработанное, обязано быть одним и
+    тем же набором.
+    """
     number = pr["number"]
     branch = pr["head"]["ref"]
     lines = [
@@ -774,9 +879,7 @@ def build_prompt(pr: dict, bundle: ReviewBundle, max_inline: int) -> str:
         if body:
             lines += ["", "--- Комментарий ревьюера #{} ---".format(index), body]
 
-    inline = bundle.inline[:max_inline]
-    dropped = len(bundle.inline) - len(inline)
-    for index, comment in enumerate(inline, 1):
+    for index, comment in enumerate(bundle.inline, 1):
         path = comment.get("path", "?")
         line_no = comment.get("line") or comment.get("original_line") or comment.get("position") or "?"
         hunk = (comment.get("diff_hunk") or "").strip()
@@ -785,9 +888,10 @@ def build_prompt(pr: dict, bundle: ReviewBundle, max_inline: int) -> str:
             lines += ["Контекст диффа:", "```diff", hunk[-1500:], "```"]
         lines += [(comment.get("body") or "").strip()]
 
-    if dropped > 0:
+    if bundle.dropped > 0:
         lines += ["", "(ещё {} inline-замечаний не поместились в этот запуск: "
-                      "исправь перечисленные, остальные придут следующим циклом)".format(dropped)]
+                      "исправь перечисленные, остальные придут следующим циклом)".format(
+                          bundle.dropped)]
 
     lines += [
         "",
@@ -859,6 +963,11 @@ class Bridge:
         )
         self.noop_pattern = re.compile(cfg.get("NOOP_REVIEW_PATTERN"), re.IGNORECASE)
         self.max_attempts = cfg.get_int("MAX_ATTEMPTS", 3)
+        self.coordination_issue = cfg.get_int("COORDINATION_ISSUE", 0)
+        # Маркеры, уже лежащие в issue-канале. Читаются один раз за прогон и
+        # только если действительно есть что зеркалить: лишний запрос к API
+        # каждую минуту ради «ничего не случилось» не нужен.
+        self._mirror_seen: set | None = None
 
     # -- один цикл -------------------------------------------------------
 
@@ -889,7 +998,7 @@ class Bridge:
         self.state.data["prs"][str(number)]["branch"] = branch
 
         bundle = collect_review(self.gh, number, head_sha, self.cfg.reviewer_logins())
-        if not bundle.reviews and not bundle.inline and not bundle.notes:
+        if bundle.is_empty():
             if bundle.approved:
                 self.mark(entry, "APPROVED")
                 self.log.info("PR #{} {}: ревью одобрено, делать нечего".format(number, head_sha[:8]))
@@ -902,19 +1011,42 @@ class Bridge:
             self.log.info("PR #{} {}: ревью без замечаний".format(number, head_sha[:8]))
             return False
 
-        fingerprint = bundle.fingerprint
-        if fingerprint in entry.get("processed", []):
+        # Что из этого ревью ещё не отдавали Claude. Учёт поштучный: замечание,
+        # не поместившееся в прошлый прогон, обязано доехать следующим, а не
+        # исчезнуть вместе с отпечатком всего ревью.
+        pending = bundle.without(entry.get("processed_ids", []))
+        if pending.is_empty():
             self.log.info("PR #{} {}: это ревью уже обработано".format(number, head_sha[:8]))
+            return False
+
+        if not pending.is_actionable(self.noop_pattern):
+            # Всё, что требовало работы, уже сделано, а сверху добавилось пустое
+            # ревью. Запоминаем его как обработанное, иначе диспетчер будет
+            # заново приходить к этому выводу каждую минуту.
+            done = entry.setdefault("processed_ids", [])
+            done += [item for item in pending.ids if item not in done]
+            self.state.save()
+            self.log.info("PR #{} {}: новых замечаний нет".format(number, head_sha[:8]))
+            return False
+
+        portion = pending.portion(self.cfg.get_int("MAX_INLINE_COMMENTS", 60))
+        fingerprint = portion.fingerprint
+        if fingerprint in entry.get("processed", []):
+            self.log.info("PR #{} {}: эта порция замечаний уже обработана".format(
+                number, head_sha[:8]))
             return False
 
         if entry.get("attempts", 0) >= self.max_attempts:
             self.stop_for_human(number, head_sha, entry)
             return False
 
-        self.log.info("PR #{} {}: новое ревью — {} итогов, {} inline, {} комментариев".format(
-            number, head_sha[:8], len(bundle.reviews), len(bundle.inline), len(bundle.notes)))
+        self.log.info(
+            "PR #{} {}: новое ревью — {} итогов, {} inline, {} комментариев; "
+            "в этот прогон {} inline, отложено {}".format(
+                number, head_sha[:8], len(bundle.reviews), len(bundle.inline),
+                len(bundle.notes), len(portion.inline), portion.dropped))
 
-        prompt = build_prompt(pr, bundle, self.cfg.get_int("MAX_INLINE_COMMENTS", 60))
+        prompt = build_prompt(pr, portion)
 
         if self.dry_run:
             print("\n=== DRY-RUN: PR #{}, HEAD {} ===".format(number, head_sha))
@@ -927,20 +1059,26 @@ class Bridge:
                 self.cfg.get("TEST_CMD"), branch))
             return True
 
-        # Попытку засчитываем ДО работы, отпечаток ревью — тоже: иначе падение
+        # Попытку засчитываем ДО работы, отпечаток порции — тоже: иначе падение
         # посередине оставило бы счётчик нетронутым, и цикл повторялся бы
         # бесконечно. Если упало не по вине ревью (сеть, git), отпечаток
         # снимается ниже — ревью вернётся в очередь, но уже под потолком попыток.
+        # Обработанными помечаются РОВНО те замечания, что ушли в запрос.
+        portion_ids = portion.ids
         entry["attempts"] = int(entry.get("attempts", 0)) + 1
         entry.setdefault("processed", []).append(fingerprint)
+        processed_ids = entry.setdefault("processed_ids", [])
+        processed_ids += [item for item in portion_ids if item not in processed_ids]
         self.mark(entry, "WORKING")
         self.state.save()
 
         try:
-            return self.run_fix(pr, bundle, entry, prompt)
+            return self.run_fix(pr, portion, entry, prompt)
         except Exception as exc:
             if fingerprint in entry.get("processed", []):
                 entry["processed"].remove(fingerprint)
+            entry["processed_ids"] = [item for item in entry.get("processed_ids", [])
+                                      if item not in set(portion_ids)]
             self.mark(entry, "ERROR")
             self.state.save()
             try:
@@ -1097,6 +1235,59 @@ class Bridge:
         except Exception as exc:
             self.log.error("не смог оставить комментарий в PR #{}: {}".format(
                 number, redact(str(exc))[:400]))
+        self.mirror(number, status, head_sha, attempt, summary)
+
+    def mirror(self, number: int, status: str, head_sha: str, attempt: int,
+               summary: str) -> None:
+        """Копия ключевого исхода в канонический issue-канал координации.
+
+        Зачем дублировать то, что уже написано в PR. Комментарий в PR читает
+        тот, кто в этот PR смотрит; общий канал — это единственное место, где
+        видно состояние всей связки сразу, и по правилам проекта (`AGENTS.md`)
+        ключевые итоги обязаны быть там. Без зеркала канал тихо устаревает, и
+        второй агент делает выводы по протухшей картине.
+
+        Дублей боимся всерьёз: диспетчер просыпается раз в минуту, а исход
+        одного и того же SHA может пересчитаться после перезапуска или потери
+        состояния. Поэтому защита не в памяти процесса, а в самом issue —
+        маркер с номером PR, статусом, SHA и попыткой. Есть маркер — молчим.
+
+        Ошибка зеркалирования не должна ломать цикл: правка уже уехала в ветку,
+        и ронять из-за комментария нечего.
+        """
+        if self.dry_run or status not in MIRRORED_STATUSES:
+            return
+        issue = self.coordination_issue
+        if issue <= 0 or issue == number:
+            return
+        marker = "{} pr={} status={} head={} attempt={} -->".format(
+            MIRROR_PREFIX, number, status, head_sha, attempt)
+        try:
+            if self._mirror_seen is None:
+                self._mirror_seen = {
+                    comment.get("body") or "" for comment in self.gh.issue_comments(issue)
+                }
+            if any(marker in body for body in self._mirror_seen):
+                return
+            first_line = (summary or "").strip().splitlines()[0] if summary.strip() else ""
+            body = [
+                marker,
+                "",
+                "**agent-bridge — {}** · PR #{} · `{}` · попытка {}".format(
+                    status, number, head_sha[:8], attempt),
+                "",
+                first_line,
+                "",
+                "Подробности — в комментарии диспетчера в самом PR #{}.".format(number),
+            ]
+            text = "\n".join(body)
+            self.gh.comment(issue, text)
+            self._mirror_seen.add(text)
+            self.log.info("исход {} для PR #{} продублирован в issue #{}".format(
+                status, number, issue))
+        except Exception as exc:
+            self.log.error("не смог продублировать исход в issue #{}: {}".format(
+                issue, redact(str(exc))[:400]))
 
 
 def format_paths(paths: list[str]) -> str:
