@@ -1,0 +1,339 @@
+name: Agent loop - Codex review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request number
+        required: true
+        type: string
+      expected_head:
+        description: Expected 40-character PR HEAD SHA (optional)
+        required: false
+        type: string
+
+permissions: {}
+
+# A new commit makes an older review obsolete. Keep only the newest review run.
+concurrency:
+  group: oborot-codex-review-${{ github.event.pull_request.number || inputs.pr_number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  prepare:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (
+        github.event.pull_request.head.repo.full_name == github.repository &&
+        startsWith(github.event.pull_request.head.ref, 'claude/') &&
+        github.event.pull_request.draft == false
+      )
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      pr_number: ${{ steps.context.outputs.pr_number }}
+      head_sha: ${{ steps.context.outputs.head_sha }}
+      head_ref: ${{ steps.context.outputs.head_ref }}
+      base_sha: ${{ steps.context.outputs.base_sha }}
+      base_ref: ${{ steps.context.outputs.base_ref }}
+    steps:
+      - name: Resolve and validate PR
+        id: context
+        uses: actions/github-script@v7
+        env:
+          DISPATCH_PR_NUMBER: ${{ inputs.pr_number }}
+          EXPECTED_HEAD: ${{ inputs.expected_head }}
+        with:
+          script: |
+            const rawNumber = context.eventName === 'workflow_dispatch'
+              ? process.env.DISPATCH_PR_NUMBER
+              : String(context.payload.pull_request.number);
+            if (!/^\d+$/.test(rawNumber || '')) {
+              core.setFailed('Invalid pull request number');
+              return;
+            }
+
+            const prNumber = Number(rawNumber);
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+            });
+
+            if (pr.state !== 'open' || pr.draft) {
+              core.setFailed(`PR #${prNumber} is not an open, reviewable PR`);
+              return;
+            }
+            if (pr.head.repo.full_name !== `${context.repo.owner}/${context.repo.repo}`) {
+              core.setFailed('Agent workflows never run with secrets on fork PRs');
+              return;
+            }
+            if (!pr.head.ref.startsWith('claude/')) {
+              core.setFailed(`Only Claude executor branches are accepted, got ${pr.head.ref}`);
+              return;
+            }
+            const expected = process.env.EXPECTED_HEAD || '';
+            if (expected && !/^[0-9a-f]{40}$/.test(expected)) {
+              core.setFailed('expected_head must be a full commit SHA');
+              return;
+            }
+            if (expected && expected !== pr.head.sha) {
+              core.setFailed(`Stale dispatch: expected ${expected}, current HEAD is ${pr.head.sha}`);
+              return;
+            }
+
+            core.setOutput('pr_number', String(prNumber));
+            core.setOutput('head_sha', pr.head.sha);
+            core.setOutput('head_ref', pr.head.ref);
+            core.setOutput('base_sha', pr.base.sha);
+            core.setOutput('base_ref', pr.base.ref);
+
+  announce:
+    needs: prepare
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Mark review as running
+        uses: actions/github-script@v7
+        env:
+          PR_NUMBER: ${{ needs.prepare.outputs.pr_number }}
+          HEAD_SHA: ${{ needs.prepare.outputs.head_sha }}
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: Number(process.env.PR_NUMBER),
+              body: [
+                `<!-- oborot-agent:v1 role=codex status=WORKING head=${process.env.HEAD_SHA} -->`,
+                'Codex начал независимое ревью этого SHA.',
+                `Run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              ].join('\n\n'),
+            });
+
+  review:
+    needs: [prepare, announce]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    outputs:
+      result: ${{ steps.codex.outputs.final-message }}
+    steps:
+      - name: Checkout exact Claude commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.head_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Review without write access
+        id: codex
+        # Pinned official openai/codex-action commit; update deliberately.
+        uses: openai/codex-action@86365089eb2b84e0a8fb0717b304f8bdcb13b20e
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          safety-strategy: drop-sudo
+          permission-profile: ":read-only"
+          effort: high
+          output-schema: |
+            {
+              "type": "object",
+              "properties": {
+                "verdict": {
+                  "type": "string",
+                  "enum": ["APPROVE", "REQUEST_CHANGES"]
+                },
+                "summary": {"type": "string"},
+                "tests": {"type": "string"},
+                "findings": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "severity": {
+                        "type": "string",
+                        "enum": ["P0", "P1", "P2", "P3"]
+                      },
+                      "file": {"type": "string"},
+                      "line": {"type": "string"},
+                      "problem": {"type": "string"},
+                      "risk": {"type": "string"},
+                      "required_fix": {"type": "string"}
+                    },
+                    "required": ["severity", "file", "line", "problem", "risk", "required_fix"],
+                    "additionalProperties": false
+                  }
+                }
+              },
+              "required": ["verdict", "summary", "tests", "findings"],
+              "additionalProperties": false
+            }
+          prompt: |
+            You are the read-only reviewer for Oborot SaaS. Claude is the only
+            executor. Never edit files, create commits, push, merge, or propose
+            doing the implementation yourself.
+
+            Review PR #${{ needs.prepare.outputs.pr_number }} at the exact head
+            ${{ needs.prepare.outputs.head_sha }} against base
+            ${{ needs.prepare.outputs.base_sha }}.
+
+            Read AGENTS.md, PROJECT_STATE.md, DECISIONS.md, and TECH_DEBT.md,
+            then inspect only the PR change with:
+              git diff ${{ needs.prepare.outputs.base_sha }}...${{ needs.prepare.outputs.head_sha }}
+
+            Look for proven correctness bugs, data loss, security or tenant
+            isolation issues, broken business semantics, missing regression
+            coverage, unsafe migrations, and mismatch between UI and formulas.
+            Do not request stylistic cleanup or unrelated refactors. Cite an
+            exact file and line whenever possible. If there are no actionable
+            defects, return APPROVE with an empty findings array. Otherwise
+            return REQUEST_CHANGES. The output must match the supplied JSON
+            schema. Russian text is preferred for summary and findings.
+
+  publish:
+    needs: [prepare, review]
+    if: always() && needs.prepare.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      issues: write
+      pull-requests: read
+    steps:
+      - name: Publish verdict and wake Claude when needed
+        uses: actions/github-script@v7
+        env:
+          PR_NUMBER: ${{ needs.prepare.outputs.pr_number }}
+          REVIEWED_HEAD: ${{ needs.prepare.outputs.head_sha }}
+          REVIEW_RESULT: ${{ needs.review.outputs.result }}
+          REVIEW_JOB_RESULT: ${{ needs.review.result }}
+        with:
+          script: |
+            const prNumber = Number(process.env.PR_NUMBER);
+            const reviewedHead = process.env.REVIEWED_HEAD;
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+            });
+
+            if (pr.head.sha !== reviewedHead) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body: [
+                  `<!-- oborot-agent:v1 role=system status=STALE head=${reviewedHead} -->`,
+                  `Ревью ${reviewedHead} устарело: текущий HEAD — ${pr.head.sha}. Запускаю новое ревью.`,
+                ].join('\n\n'),
+              });
+              await github.rest.actions.createWorkflowDispatch({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id: 'agent-codex-review.yml',
+                ref: pr.base.ref,
+                inputs: { pr_number: String(prNumber), expected_head: pr.head.sha },
+              });
+              return;
+            }
+
+            let parsed;
+            try {
+              if (process.env.REVIEW_JOB_RESULT !== 'success') {
+                throw new Error(`review job result: ${process.env.REVIEW_JOB_RESULT}`);
+              }
+              parsed = JSON.parse(process.env.REVIEW_RESULT || '');
+              if (!['APPROVE', 'REQUEST_CHANGES'].includes(parsed.verdict)) {
+                throw new Error('invalid verdict');
+              }
+              if (!Array.isArray(parsed.findings)) {
+                throw new Error('findings is not an array');
+              }
+              if (parsed.verdict === 'APPROVE' && parsed.findings.length !== 0) {
+                throw new Error('APPROVE must have no findings');
+              }
+              if (parsed.verdict === 'REQUEST_CHANGES' && parsed.findings.length === 0) {
+                throw new Error('REQUEST_CHANGES must include findings');
+              }
+            } catch (error) {
+              const body = [
+                `<!-- oborot-agent:v1 role=codex status=BLOCKED head=${reviewedHead} -->`,
+                'Автоматическое ревью не завершилось корректно.',
+                `Причина: ${error.message}`,
+                `Run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              ].join('\n\n');
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body,
+              });
+              return;
+            }
+
+            const findings = parsed.findings.length
+              ? parsed.findings.map((f, index) => [
+                  `${index + 1}. **${f.severity} — ${f.file}${f.line ? `:${f.line}` : ''}**`,
+                  `   - Проблема: ${f.problem}`,
+                  `   - Риск: ${f.risk}`,
+                  `   - Что исправить: ${f.required_fix}`,
+                ].join('\n')).join('\n')
+              : 'Доказанных блокирующих дефектов не найдено.';
+
+            const body = [
+              `<!-- oborot-agent:v1 role=codex status=${parsed.verdict} head=${reviewedHead} -->`,
+              `### Codex review: ${parsed.verdict}`,
+              `Проверенный SHA: \`${reviewedHead}\``,
+              parsed.summary,
+              findings,
+              `Тесты/проверки: ${parsed.tests}`,
+              `Run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+            ].join('\n\n');
+
+            const reviewComment = await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body,
+            });
+
+            // Human-readable audit mirror. Failure here must not break the loop.
+            try {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: 2,
+                body: [
+                  'FROM: Codex',
+                  'TO: Claude',
+                  `STATUS: ${parsed.verdict === 'APPROVE' ? 'REVIEW_ACCEPT' : 'REQUEST_CHANGES'}`,
+                  `RELATED: ${pr.html_url}#issuecomment-${reviewComment.data.id}`,
+                  'SESSION: github-actions',
+                  `HEAD: ${reviewedHead}`,
+                  `SEEN_THROUGH: ${reviewComment.data.html_url}`,
+                  `SUMMARY: ${parsed.summary}`,
+                  `EVIDENCE: ${parsed.tests}`,
+                  `ACTION_REQUESTED: ${parsed.verdict === 'APPROVE' ? 'Влад может принять решение о merge.' : 'Claude исправляет замечания и публикует новый SHA.'}`,
+                ].join('\n'),
+              });
+            } catch (error) {
+              core.warning(`Could not mirror review to issue #2: ${error.message}`);
+            }
+
+            if (parsed.verdict === 'REQUEST_CHANGES') {
+              await github.rest.actions.createWorkflowDispatch({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id: 'agent-claude-fix.yml',
+                ref: pr.base.ref,
+                inputs: {
+                  pr_number: String(prNumber),
+                  expected_head: reviewedHead,
+                },
+              });
+            }
