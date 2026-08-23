@@ -80,7 +80,11 @@ def make_repo() -> Path:
 def add_commit(app: Path, text: str, lock: bool = True) -> str:
     (app / "app.py").write_text(text + "\n", encoding="utf-8")
     if lock:
-        (app / "requirements.lock").write_text("httpx==0.28.1\n", encoding="utf-8")
+        # Метка релиза в lock-файле — способ различить окружения. Подставной pip
+        # складывает установленный lock внутрь venv, и по этой строке видно, ДЛЯ
+        # КАКОГО коммита собрано окружение, которое сейчас в бою.
+        (app / "requirements.lock").write_text(
+            f"httpx==0.28.1\n# release {text}\n", encoding="utf-8")
     elif (app / "requirements.lock").exists():
         (app / "requirements.lock").unlink()
         (app / "requirements.txt").write_text("httpx\n", encoding="utf-8")
@@ -102,12 +106,45 @@ def make_stubs(bindir: Path, *, health_ok=True, pip_ok=True) -> None:
         f"#!/bin/sh\nprintf '%s' '{body}'\nexit {code}\n", encoding="utf-8")
     for f in ("systemctl", "journalctl", "curl"):
         (bindir / f).chmod(0o755)
+    # Подставные python и pip. Настоящая сборка venv занимала бы секунды на
+    # каждую выкладку и лезла бы в сеть за пакетами; здесь нужно проверить
+    # поведение скрипта, а не работу pip.
+    #
+    # Подставной pip складывает файл требований, который ему дали, внутрь venv
+    # (INSTALLED) и дописывает строку в журнал. По INSTALLED видно, для какого
+    # релиза собрано окружение; по журналу — лазил ли откат в сеть.
+    pip_tpl = bindir / "pip-template"
+    fail = "" if pip_ok else "echo 'pip упал' >&2\nexit 1\n"
+    pip_tpl.write_text(
+        "#!/bin/sh\n"
+        f"{fail}"
+        'echo "$*" >> "$PIP_LOG"\n'
+        'if [ "$1" = "install" ]; then\n'
+        '  for a in "$@"; do req="$a"; done\n'
+        '  cp "$req" "$(dirname "$0")/../INSTALLED" 2>/dev/null || true\n'
+        'fi\n'
+        "exit 0\n", encoding="utf-8")
+    pip_tpl.chmod(0o755)
+
+    py_tpl = bindir / "python-template"
+    py_tpl.write_text(
+        "#!/bin/sh\n"
+        '# умеет ровно одно: python -m venv <каталог>\n'
+        'if [ "$1" = "-m" ] && [ "$2" = "venv" ]; then\n'
+        '  mkdir -p "$3/bin" || exit 1\n'
+        f'  cp "{pip_tpl}" "$3/bin/pip" || exit 1\n'
+        f'  cp "{py_tpl}" "$3/bin/python" || exit 1\n'
+        '  chmod 755 "$3/bin/pip" "$3/bin/python"\n'
+        '  exit 0\n'
+        'fi\n'
+        "exit 0\n", encoding="utf-8")
+    py_tpl.chmod(0o755)
+
     venv_bin = bindir.parent / "venv" / "bin"
     venv_bin.mkdir(parents=True, exist_ok=True)
-    (venv_bin / "pip").write_text(
-        "#!/bin/sh\n" + ("exit 0\n" if pip_ok else "echo 'pip упал' >&2\nexit 1\n"),
-        encoding="utf-8")
-    (venv_bin / "pip").chmod(0o755)
+    for name, tpl in (("pip", pip_tpl), ("python", py_tpl)):
+        shutil.copy(tpl, venv_bin / name)
+        (venv_bin / name).chmod(0o755)
 
 
 def deploy_env(app: Path, extra: dict | None = None) -> dict:
@@ -122,6 +159,7 @@ def deploy_env(app: Path, extra: dict | None = None) -> dict:
         "OBOROT_STATE_DIR": str(WORK / "state"),
         "OBOROT_HEALTH_ATTEMPTS": "2",
         "OBOROT_HEALTH_DELAY": "0",
+        "PIP_LOG": str(WORK / "pip.log"),
     })
     env.update(extra or {})
     return env
@@ -170,6 +208,15 @@ def main() -> int:
     backups = list((WORK / "data" / "backups").glob("oborot-*.db"))
     check("копия базы снята и прошла quick_check", len(backups) == 1,
           str([b.name for b in backups]))
+    installed = (WORK / "venv" / "INSTALLED")
+    check("живое окружение собрано ИЗ ЦЕЛЕВОГО коммита",
+          installed.exists() and "# release v2" in installed.read_text(encoding="utf-8"),
+          installed.read_text(encoding="utf-8").strip() if installed.exists() else "нет файла")
+    kept = list((WORK).glob("venv-*"))
+    check("прежнее окружение отложено, а не затёрто", len(kept) == 1,
+          str([k.name for k in kept]))
+    check("запись о прежнем окружении сделана",
+          (WORK / "state" / "PREVIOUS_VENV").exists())
 
     print("\n== Занятый лок ==")
     lock = WORK / "state" / "deploy.lock"
@@ -221,12 +268,90 @@ def main() -> int:
     v3 = add_commit(app, "v3")
     git(["checkout", "-q", "--detach", nolock], cwd=app)
     before = head_of(app)
+    env_before = (WORK / "venv" / "INSTALLED").read_text(encoding="utf-8")
     make_stubs(WORK / "stub-bin", pip_ok=False)
     rc, out = run(["bash", script, v3], env=deploy_env(app))
     check("выкладка отклонена", rc != 0, f"rc={rc}")
     check("КОД НЕ ПЕРЕКЛЮЧЁН — сервис остался на рабочем коммите",
           head_of(app) == before, f"{head_of(app)[:12]} vs {before[:12]}")
+    live_now = (WORK / "venv" / "INSTALLED")
+    check("ЖИВОЕ ОКРУЖЕНИЕ НЕ ТРОНУТО — собирали в стороне",
+          live_now.read_text(encoding="utf-8") == env_before,
+          live_now.read_text(encoding="utf-8").strip())
+    staging = list(WORK.glob(".venv-staging.*")) + list(WORK.glob(".venv-held.*"))
+    check("недособранное окружение убрано за собой", not staging, str(staging))
     make_stubs(WORK / "stub-bin")
+
+    print("\n== Откат возвращает и код, и окружение ==")
+    # Ради этого раздела и переделано устройство venv. Прежняя схема ставила
+    # зависимости нового релиза в ЖИВОЕ окружение: `deploy.sh <прежний-sha>`
+    # возвращал код, а библиотеки оставлял новые. Прод оказывался в состоянии,
+    # которого не было ни в одном коммите.
+    git(["checkout", "-q", "main"], cwd=app)
+    v4 = add_commit(app, "v4")
+    # Сначала честно выкатываем v2 через сам скрипт: код и окружение должны
+    # совпадать ДО того, как проверять откат. Подмена HEAD руками оставила бы
+    # площадку в состоянии «код от одного релиза, библиотеки от другого» —
+    # именно в том, которого этот раздел и не должен допускать.
+    rc, out = run(["bash", script, v2], env=deploy_env(app))
+    check("подготовка: выкатили v2", rc == 0 and head_of(app) == v2, out[-200:])
+    live = (WORK / "venv" / "INSTALLED").read_text(encoding="utf-8")
+    check("подготовка: в бою окружение v2", "# release v2" in live, live.strip())
+    rc, out = run(["bash", script, v4], env=deploy_env(app))
+    check("выкатили v4", rc == 0 and head_of(app) == v4, out[-200:])
+    live = (WORK / "venv" / "INSTALLED").read_text(encoding="utf-8")
+    check("в бою окружение v4", "# release v4" in live, live.strip())
+    kept_v2 = WORK / f"venv-{v2}"
+    check("окружение прежнего релиза отложено под его именем", kept_v2.is_dir(),
+          str([p.name for p in WORK.glob('venv-*')]))
+
+    # Откат делается в аварии, а в аварии сеть — не то, на что можно
+    # рассчитывать. Ломаем pip: если откат зависит от установки пакетов, он
+    # провалится ровно тогда, когда нужнее всего. Прежняя схема (ставить
+    # зависимости в живой venv) в этом месте оставляла прод на плохом релизе.
+    (WORK / "pip.log").write_text("", encoding="utf-8")
+    make_stubs(WORK / "stub-bin", pip_ok=False)
+    rc, out = run(["bash", script, v2], env=deploy_env(app))
+    make_stubs(WORK / "stub-bin")
+    check("откат выполнен ДАЖЕ БЕЗ РАБОТАЮЩЕГО pip", rc == 0, out[-250:])
+    check("код вернулся на прежний коммит", head_of(app) == v2, head_of(app)[:12])
+    live = (WORK / "venv" / "INSTALLED").read_text(encoding="utf-8")
+    check("ОКРУЖЕНИЕ ТОЖЕ ВЕРНУЛОСЬ, а не осталось от неудачного релиза",
+          "# release v2" in live, live.strip())
+    piplog = (WORK / "pip.log").read_text(encoding="utf-8")
+    check("откат не ставил пакеты: готовое окружение переиспользовано",
+          "install" not in piplog, piplog.strip().replace("\n", " | ") or "пусто")
+    check("окружение неудачного релиза отложено на случай возврата",
+          (WORK / f"venv-{v4}").is_dir())
+
+    print("\n== Отложенное окружение с чужой меткой не переиспользуется ==")
+    # Каталог назван именем релиза, но собран для другого. Снаружи это не видно
+    # ничем — и без метки внутри откат подставил бы релизу чужие библиотеки.
+    git(["checkout", "-q", "main"], cwd=app)
+    vx = add_commit(app, "vx")
+    fake = WORK / f"venv-{vx}"
+    shutil.copytree(WORK / "venv", fake)
+    (fake / "RELEASE_SHA").write_text("0" * 40 + "\n", encoding="utf-8")
+    (fake / "INSTALLED").write_text("подложенное окружение\n", encoding="utf-8")
+    (WORK / "pip.log").write_text("", encoding="utf-8")
+    rc, out = run(["bash", script, vx], env=deploy_env(app))
+    check("выкладка прошла", rc == 0, out[-200:])
+    live = (WORK / "venv" / "INSTALLED").read_text(encoding="utf-8")
+    check("чужое окружение не подставлено, а пересобрано",
+          "# release vx" in live, live.strip())
+    check("пересборка действительно была", "install" in (WORK / "pip.log").read_text(encoding="utf-8"))
+
+    print("\n== Старые окружения не копятся бесконечно ==")
+    for n in ("v5", "v6", "v7"):
+        # Возвращаемся на main перед каждым коммитом: предыдущая выкладка
+        # оставила рабочую копию в detached HEAD, и коммит ушёл бы мимо ветки.
+        git(["checkout", "-q", "main"], cwd=app)
+        sha = add_commit(app, n)
+        rc, out = run(["bash", script, sha], env=deploy_env(app, {"OBOROT_VENV_KEEP": "2"}))
+        check(f"выкладка {n}", rc == 0, out[-200:])
+    kept = sorted(p.name for p in WORK.glob("venv-*"))
+    check("хранится ровно столько прежних окружений, сколько велено",
+          len(kept) == 2, str(kept))
 
     print("\n== Приложение не поднялось ==")
     make_stubs(WORK / "stub-bin", health_ok=False)
@@ -236,6 +361,8 @@ def main() -> int:
     check("названа команда отката", "bash deploy/deploy.sh" in out, out[-300:])
     check("названа копия базы, снятая перед выкладкой",
           "копия базы перед этой выкладкой" in out, out[-300:])
+    check("сказано, что прежнее окружение цело и откат не требует сети",
+          "откат обойдётся без сети" in out, out[-300:])
     make_stubs(WORK / "stub-bin")
 
     shutil.rmtree(WORK, ignore_errors=True)

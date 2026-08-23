@@ -56,6 +56,8 @@ SUITES = [
     ("ui",          "test_ui.py",              False, False),
     ("backup",      "test_backup.py",          False, False),
     ("deploy",      "test_deploy.py",          False, False),
+    ("offsite",     "test_offsite.py",         False, False),
+    ("deps",        "test_dependencies.py",    False, False),
 ]
 
 TOTAL_RE = re.compile(r"ИТОГО:\s*(\d+)\s*OK,\s*(\d+)\s*FAIL")
@@ -69,6 +71,7 @@ def run_one(idx: int, name: str, filename: str, needs_ms: bool, needs_tg: bool,
     # порт ему нужен отдельно, иначе при параллельном прогоне он столкнётся с
     # приложением соседнего набора.
     env["BACKUP_TEST_PORT"] = str(8861 + idx)
+    env["OFFSITE_TEST_PORT"] = str(8881 + idx)
     if needs_ms:
         env["OBOROT_MOCK_PORT"] = str(9821 + idx)
     if needs_tg:
