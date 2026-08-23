@@ -32,6 +32,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -114,11 +115,27 @@ def make_stubs(bindir: Path, *, health_ok=True, pip_ok=True) -> None:
         encoding="utf-8")
     (bindir / "journalctl").write_text("#!/bin/sh\necho '(логи сервиса)'\n",
                                        encoding="utf-8")
+    # Подставной mv. В обычном прогоне прозрачен, при FAIL_MV_KEEP=1 отказывает
+    # РОВНО на одном переименовании — том, которым прежнее окружение
+    # откладывается под именем venv-<sha>. Точечность здесь и есть смысл: общее
+    # «сломай mv» свалило бы выкладку раньше, на другом шаге, и про интересующее
+    # окно («$VENV уже подменён, а функция ещё не вернулась») не сказало бы
+    # ничего. Целевые пути подмены — venv-<sha>; сам $VENV называется venv,
+    # под шаблон не попадает, и возврат окружения при откате работает.
+    (bindir / "mv").write_text(
+        '#!/bin/sh\n'
+        'if [ "${FAIL_MV_KEEP:-0}" = "1" ]; then\n'
+        '  for a in "$@"; do dest="$a"; done\n'
+        '  case "${dest##*/}" in\n'
+        '    venv-*) echo "подставной mv: отказ на $dest" >&2; exit 1;;\n'
+        '  esac\n'
+        'fi\n'
+        'exec /bin/mv "$@"\n', encoding="utf-8")
     body = '{"status":"ok","db":true}' if health_ok else '{"status":"not ready"}'
     code = "0" if health_ok else "1"
     (bindir / "curl").write_text(
         f"#!/bin/sh\nprintf '%s' '{body}'\nexit {code}\n", encoding="utf-8")
-    for f in ("systemctl", "journalctl", "curl"):
+    for f in ("systemctl", "journalctl", "curl", "mv"):
         (bindir / f).chmod(0o755)
     # Подставные python и pip. Настоящая сборка venv занимала бы секунды на
     # каждую выкладку и лезла бы в сеть за пакетами; здесь нужно проверить
@@ -524,6 +541,119 @@ def main() -> int:
         syslog = (WORK / "systemctl.log").read_text(encoding="utf-8")
         check("сервис не перезапускался", "restart" not in syslog,
               syslog.strip().replace("\n", " | ") or "пусто")
+
+    print("\n== Сбой на ПОСЛЕДНЕМ переименовании подмены окружения ==")
+    # Самый тихий сбой из известных, найден повторным внешним ревью 23.08.
+    # `mv $VENV -> держатель` и `mv staging -> $VENV` прошли: в бою уже лежит
+    # окружение НОВОГО релиза. Падает только третье переименование — то, которым
+    # прежнее окружение откладывается под именем venv-<sha>.
+    #
+    # Пока отметку «окружение подменено» ставила строка у вызывающего, функция
+    # успевала вернуть 1 раньше неё, и откат молча пропускал возврат окружения:
+    # код и OBOROT_COMMIT возвращались на прежний релиз, а в $VENV оставались
+    # библиотеки нового. Снаружи это выглядит как честный отказ выкладки.
+    git(["checkout", "-q", "main"], cwd=app)
+    vm = add_commit(app, "vm")
+    git(["checkout", "-q", "--detach", v2], cwd=app)
+    rc, out = run(["bash", script, v2], env=deploy_env(app))
+    check("подготовка: в бою v2", rc == 0 and head_of(app) == v2, out[-200:])
+    (WORK / "systemctl.log").write_text("", encoding="utf-8")
+    before_env = (WORK / "env").read_text(encoding="utf-8")
+    prev_venv_note = (WORK / "state" / "PREVIOUS_VENV").read_text(encoding="utf-8")
+    rc, out = run(["bash", script, vm], env=deploy_env(app, {"FAIL_MV_KEEP": "1"}))
+    check("выкладка отклонена", rc != 0, f"rc={rc}")
+    check("сказано, что сбой до перезапуска", "СБОЙ ДО ПЕРЕЗАПУСКА" in out, out[-500:])
+    check("КОД возвращён на прежний коммит", head_of(app) == v2, head_of(app)[:12])
+    check("OBOROT_COMMIT возвращён",
+          (WORK / "env").read_text(encoding="utf-8") == before_env,
+          (WORK / "env").read_text(encoding="utf-8").strip())
+    live = (WORK / "venv" / "INSTALLED").read_text(encoding="utf-8")
+    check("ОКРУЖЕНИЕ ВЕРНУЛОСЬ, а не осталось от неудачного релиза",
+          "# release v2" in live, live.strip())
+    check("метка живого окружения тоже прежняя",
+          (WORK / "venv" / "RELEASE_SHA").read_text(encoding="utf-8").strip() == v2)
+    rc_py, _ = run([str(WORK / "venv" / "bin" / "python"), "-m", "pip", "--version"],
+                   env=deploy_env(app))
+    check("и окружение в $VENV работоспособно", rc_py == 0, f"rc={rc_py}")
+    syslog = (WORK / "systemctl.log").read_text(encoding="utf-8")
+    check("СЕРВИС НЕ ПЕРЕЗАПУСКАЛСЯ — потому откат и безопасен",
+          "restart" not in syslog, syslog.strip().replace("\n", " | ") or "пусто")
+    check("запись о прежнем окружении не переписана неудачной выкладкой",
+          (WORK / "state" / "PREVIOUS_VENV").read_text(encoding="utf-8") == prev_venv_note)
+    leftovers = list(WORK.glob(".venv-staging.*")) + list(WORK.glob(".venv-held.*")) \
+        + list(WORK.glob(".venv-rollback.*"))
+    check("временных каталогов окружения не осталось", not leftovers, str(leftovers))
+
+    print("\n== Уборка не трогает окружение, которым делается откат ==")
+    # Отложенное окружение переезжает переименованием и сохраняет СТАРЫЙ mtime:
+    # при сортировке по времени оно оказывается в конце списка. Уборка стояла до
+    # перезапуска и при небольшом keep удаляла ровно тот каталог, на который сам
+    # скрипт указывает в подсказке про откат.
+    git(["checkout", "-q", "main"], cwd=app)
+    vp = add_commit(app, "vp")
+    # Возвращаем рабочую копию на v2: цель отката — окружение ТОГО релиза,
+    # который сейчас в бою, а add_commit оставляет копию на вершине main.
+    git(["checkout", "-q", "--detach", v2], cwd=app)
+    old = time.time() - 90 * 24 * 3600
+    os.utime(WORK / "venv", (old, old))       # живое окружение «старое»
+    decoys = []
+    for i in (1, 2, 3):
+        d = WORK / ("venv-" + f"{i:040x}")     # имена как у настоящих: venv-<sha>
+        shutil.rmtree(d, ignore_errors=True)
+        shutil.copytree(WORK / "venv", d)
+        os.utime(d, None)                      # ...а эти — свежие
+        decoys.append(d)
+    rc, out = run(["bash", script, vp], env=deploy_env(app, {"OBOROT_VENV_KEEP": "1"}))
+    check("выкладка прошла", rc == 0 and head_of(app) == vp, out[-250:])
+    target = WORK / f"venv-{v2}"
+    check("ЦЕЛЬ ОТКАТА ПЕРЕЖИЛА УБОРКУ, хотя её mtime самый старый",
+          target.is_dir(), str(sorted(p.name[:16] for p in WORK.glob("venv-*"))))
+    rc_py, _ = run([str(target / "bin" / "python"), "-m", "pip", "--version"],
+                   env=deploy_env(app))
+    check("и это работоспособное окружение, а не пустой каталог", rc_py == 0,
+          f"rc={rc_py}")
+    check("окружение прежнего релиза — именно прежнего",
+          (target / "RELEASE_SHA").exists()
+          and (target / "RELEASE_SHA").read_text(encoding="utf-8").strip() == v2)
+    check("уборка при этом всё-таки была: свежие каталоги удалены",
+          not any(d.exists() for d in decoys),
+          str([d.name[:16] for d in decoys if d.exists()]))
+    check("хранится ровно столько окружений, сколько велено",
+          len(list(WORK.glob("venv-*"))) == 1,
+          str(sorted(p.name[:16] for p in WORK.glob("venv-*"))))
+
+    print("\n== Пока прод не поднялся, уборки нет вовсе ==")
+    # Граница та же, что у отката: до успешного health-check прод может
+    # вернуться на прежний релиз, и окружение для этого возврата обязано быть на
+    # месте. Лишний каталог на диске дешевле отката без окружения.
+    git(["checkout", "-q", "main"], cwd=app)
+    vq = add_commit(app, "vq")
+    git(["checkout", "-q", "--detach", vp], cwd=app)
+    decoys = []
+    for i in (4, 5, 6):
+        d = WORK / ("venv-" + f"{i:040x}")
+        shutil.rmtree(d, ignore_errors=True)
+        shutil.copytree(WORK / "venv", d)
+        os.utime(d, None)
+        decoys.append(d)
+    make_stubs(WORK / "stub-bin", health_ok=False)
+    rc, out = run(["bash", script, vq], env=deploy_env(app, {"OBOROT_VENV_KEEP": "1"}))
+    make_stubs(WORK / "stub-bin")
+    check("выход 1", rc == 1, f"rc={rc}")
+    check("СТАРЫЕ ОКРУЖЕНИЯ НЕ УБРАНЫ: до успешного health-check уборки нет",
+          all(d.exists() for d in decoys),
+          str([d.name[:16] for d in decoys if not d.exists()]))
+    check("окружение прежнего релиза цело — ровно как обещает вывод",
+          (WORK / f"venv-{vp}").is_dir(),
+          str(sorted(p.name[:16] for p in WORK.glob("venv-*"))))
+    check("и в подсказке назван именно этот каталог", f"venv-{vp}" in out, out[-300:])
+    for d in decoys:
+        shutil.rmtree(d, ignore_errors=True)
+    # Площадку возвращаем в согласованное состояние: прод остался на vq с его
+    # окружением, но сервис так и не поднялся. Выкатываем vq заново с рабочим
+    # health-check, чтобы дальше проверять другое, а не последствия этого.
+    rc, out = run(["bash", script, vq], env=deploy_env(app))
+    check("повторная выкладка на исправном сервисе проходит", rc == 0, out[-250:])
 
     print("\n== Приложение не поднялось ==")
     make_stubs(WORK / "stub-bin", health_ok=False)
