@@ -1,0 +1,15 @@
+[Unit]
+Description=Оборот: зашифрованная копия базы вне сервера
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/oborot/app-src
+ExecStart=/bin/bash /opt/oborot/app-src/deploy/offsite_backup.sh
+# Пароль и адрес хранилища читает сам скрипт из /opt/oborot/backup.env.
+# В юните их нет намеренно: systemd показывает окружение юнита кому угодно
+# через `systemctl show`, а права на backup.env — 600.
+Nice=10
+IOSchedulingClass=idle

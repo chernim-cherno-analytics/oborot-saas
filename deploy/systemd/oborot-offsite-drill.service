@@ -1,0 +1,16 @@
+[Unit]
+Description=Оборот: учение по восстановлению из удалённого хранилища
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/oborot/app-src
+ExecStart=/bin/bash /opt/oborot/app-src/deploy/offsite_restore_drill.sh
+# Учение поднимает приложение на восстановленной базе на отдельном порту.
+Environment=RESTORE_PORT=8099
+Nice=15
+IOSchedulingClass=idle
+# Полная проверка данных читает всё хранилище: на медленном канале это долго.
+TimeoutStartSec=3h
