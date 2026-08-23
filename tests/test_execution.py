@@ -39,6 +39,7 @@ import sqlite3
 import sys
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -90,6 +91,17 @@ def check(name: str, cond: bool, detail: str = ""):
     else:
         FAIL.append(name)
         print(f"  FAIL {name}  {detail}")
+
+
+def _raw_sql(query: str, *args):
+    """Пишет в базу напрямую — нужно, чтобы воспроизвести строку в том виде,
+    в каком её создавали ПРЕЖНИЕ версии кода: через API такую уже не записать."""
+    con = sqlite3.connect(DB_PATH)
+    try:
+        con.execute(query, args)
+        con.commit()
+    finally:
+        con.close()
 
 
 def sql(query: str, *args):
@@ -751,6 +763,39 @@ def run() -> int:  # noqa: C901 — сценарный тест, ветвлен�
     check("и по ней executed = null, а не число из спора",
           disputed_lines and all(x["executed"] is None for x in disputed_lines),
           str(disputed_lines)[:160])
+
+    print("\n== Старое допущение whole_order не выдаётся за подтверждение ==")
+    # Код перестал ПИСАТЬ такие строки в П20, но в боевой базе они уже лежат с
+    # прежних версий и до этой отсечки считались подтверждением количества
+    # наравне с названными цифрами. Чинить только новые данные — половина
+    # работы: статистика качества рекомендаций считается по всей истории.
+    r = c3.post("/api/orders", json={"name": "Допущение", "items": [
+        {"base_name": name3 + " v3", "qty": 15, "sizes": {}, "cost": 100}]})
+    oid_as = r.json().get("id")
+    c3.post(f"/api/orders/{oid_as}/status", json={"status": "sent"})
+    # Пишем строку ровно так, как её писали прежние версии кода.
+    _raw_sql(
+        "INSERT INTO order_receipts (org_id, order_id, base_name, qty, at, "
+        "source, precision, source_ref, created_by, created_at) VALUES "
+        "(3, ?, ?, 15, ?, 'manual', 'whole_order', '', 1, ?)",
+        oid_as, name3 + " v3",
+        datetime.utcnow().isoformat(sep=" ", timespec="seconds"),
+        datetime.utcnow().isoformat(sep=" ", timespec="seconds"),
+    )
+    got = c3.get(f"/api/orders/{oid_as}/receipts").json()
+    check("старое допущение не считается принятым количеством",
+          got["received_total"] == 0, str(got["received_total"]))
+    check("и заказ честно говорит «не знаем», а не «принято 15»",
+          got.get("execution_unknown") is True and got.get("confirmed") is False,
+          f"unknown={got.get('execution_unknown')} confirmed={got.get('confirmed')}")
+    check("но сама строка из истории не пропала",
+          "whole_order" in (got.get("precisions") or []), str(got.get("precisions")))
+    # А названное человеком количество по тому же заказу считается как обычно.
+    c3.post(f"/api/orders/{oid_as}/receipts",
+            json={"lines": [{"base_name": name3 + " v3", "qty": 15}]})
+    got = c3.get(f"/api/orders/{oid_as}/receipts").json()
+    check("названное количество поверх допущения считается",
+          got["received_total"] == 15, str(got["received_total"]))
 
     print("\n== Ноль, записанный человеком, — это факт, а не пустота ==")
     # Ручка отвечала `ok: true, added: 0`, строку не писала, и утверждение
