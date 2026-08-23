@@ -418,10 +418,15 @@ def get_status(org_id: int) -> dict:
     finally:
         db.close()
     if row is None:
+        # Строки состояния нет — значит синк ни разу не запускался. Но история
+        # на диске быть МОЖЕТ: демо-данные засеваются напрямую, минуя синк.
+        # Возвращая здесь 0, чип свежести писал «история 0 из 365 дн.» на
+        # аккаунте, где все таблицы честно считали за год. Спрашиваем базу.
         return {"state": "idle", "mode": "", "stage": "", "progress_pct": 0, "detail": "",
                 "started_at": None, "finished_at": None, "stats": {}, "error": "",
                 "fail_streak": 0, "alerted_streak": 0,
-                "phase": "", "coverage_days": 0, "history_loaded_from": None,
+                "phase": "", "coverage_days": _coverage_days(org_id),
+                "history_loaded_from": None,
                 "months": months_progress(None, False), "stages": [], "eta_sec": None}
     stats = row.stats
     coverage = _coverage_days(org_id)

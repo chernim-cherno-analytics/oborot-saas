@@ -1275,8 +1275,16 @@ def build_plan(db: Session, org: Org, snap: dict, raw_brief: dict) -> dict:
         prod = db.get(Production, int(pid))
         if prod is None or prod.org_id != org.id:
             prod = None
+    # Запасной срок для канала БЕЗ явных этапов — срок ЭТОГО канала, а не общий
+    # срок организации (BUSINESS_LOGIC §9.5, третий способ считать срок).
+    # Раньше подставлялся общий: канал со сроком 90 дней давал мастеру
+    # `lead_days: 45` и дату прихода «сегодня + 45», хотя страница «Заказ» для
+    # той же позиции честно показывала 90. Одно и то же обещание подрядчика
+    # превращалось в два разных срока на двух экранах.
+    channel_lead = int(getattr(prod, "lead_time_days", 0) or 0) if prod is not None else 0
     stages = normalize_stages(
-        prod.stages if prod is not None else None, settings.get("lead_time_days")
+        prod.stages if prod is not None else None,
+        channel_lead or settings.get("lead_time_days"),
     )
     today = date.fromisoformat(snap["today"])
     # Ритм заказов — свойство канала: своё производство можно догружать
