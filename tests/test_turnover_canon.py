@@ -62,12 +62,12 @@ YEAR_WINDOW_DAYS = 365
 DEEP_DAYS_AGO = 500
 
 FAILED = []
+PASSED = []
 
 
 def check(name: str, ok: bool, detail: str = "") -> None:
     print(("  OK   " if ok else "  FAIL ") + name + (f"  [{detail}]" if detail and not ok else ""))
-    if not ok:
-        FAILED.append(name)
+    (PASSED if ok else FAILED).append(name)
 
 
 def main() -> int:
@@ -356,8 +356,14 @@ def main() -> int:
           f"TURNOVER_WINDOW_DAYS={analytics.TURNOVER_WINDOW_DAYS}")
 
     db.close()
-    print(f"\nИтого: {'OK' if not FAILED else 'FAIL'} "
-          f"({len(FAILED)} падений)" if FAILED else "\nИтого: все проверки канона зелёные")
+    # Числовой отчёт того же вида, что у остальных наборов: раннер выносит
+    # приговор по нему (D-42). Раньше здесь была фраза без чисел — раннер не
+    # мог её прочитать, откатывался на подсчёт строк и в принципе не отличил
+    # бы оборвавшийся набор от прошедшего целиком.
+    print(f"\nИТОГО: {len(PASSED)} OK, {len(FAILED)} FAIL")
+    if FAILED:
+        for name in FAILED:
+            print(f"  FAIL {name}")
     return 1 if FAILED else 0
 
 
