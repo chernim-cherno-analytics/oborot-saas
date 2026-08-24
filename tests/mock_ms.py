@@ -24,6 +24,7 @@
 """
 import os
 import random
+import re as _re
 from datetime import date, timedelta
 
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -461,6 +462,14 @@ FAULTS: dict = {"stock_ok_before": 0, "stock_429_burst": 0,
                 # POST /entity/purchaseorder отвечает 429 N раз подряд:
                 # «мы даже не начали» — повтор безопасен и обязан произойти.
                 "po_429_burst": 0,
+                # POST /entity/purchaseorder падает 502 N раз, НЕ создав
+                # документ. Смерть попытки ПОСЛЕ T1 (ключ уже в базе), но до
+                # появления документа: повтор обязан идти с ТЕМ ЖЕ syncId.
+                "po_fail_before_create": 0,
+                # Задержка ответа GET /entity/counterparty. Нужна, чтобы два
+                # одновременных push гарантированно оба увидели «агента нет»
+                # и разошлись бы на создание двух контрагентов без syncId.
+                "cp_search_delay_ms": 0,
                 "stock_delay_ms": 0}
 FAULT_STATS: dict = {"stock_requests": 0, "stock_ok": 0, "stock_429": 0, "stock_500": 0}
 
@@ -469,6 +478,7 @@ def reset_faults() -> None:
     FAULTS.update(stock_ok_before=0, stock_429_burst=0, stock_429_every=0,
                   stock_500_once=False, assortment_429_burst=0,
                   docs_429_burst=0, po_create_then_fail=0, po_429_burst=0,
+                  po_fail_before_create=0, cp_search_delay_ms=0,
                   stock_delay_ms=0)
     for k in FAULT_STATS:
         FAULT_STATS[k] = 0
@@ -720,6 +730,7 @@ def entity_purchaseorder(request: Request, limit: int = 100, offset: int = 0,
     _auth(request)
     parsed = _parse_filter(flt)
     m_from = parsed.get("moment>=", "")[:10]
+    want_sync = parsed.get("syncId", "")
     rows = []
     # seeded + созданные writeback'ом (у последних МС проставил бы moment
     # и applicable сам — эмулируем: сегодня, проведён, shipped=0).
@@ -734,6 +745,8 @@ def entity_purchaseorder(request: Request, limit: int = 100, offset: int = 0,
     ]:
         day = doc["moment"][:10]
         if m_from and day < m_from:
+            continue
+        if want_sync and str(doc.get("syncId") or "") != want_sync:
             continue
         if "positions" in (expand or "") and limit <= 100:
             # как в реальном МС: expand вкладывает не более 100 строк позиций
@@ -765,11 +778,14 @@ def reset_writeback_state() -> None:
 
 
 def _counterparty_row(cp: dict) -> dict:
-    return {
+    row = {
         "id": cp["id"], "name": cp["name"],
         "meta": {"href": f"{BASE}/entity/counterparty/{cp['id']}",
                  "type": "counterparty", "mediaType": "application/json"},
     }
+    if cp.get("syncId"):
+        row["syncId"] = cp["syncId"]
+    return row
 
 
 @app.get("/entity/organization")
@@ -784,12 +800,17 @@ def entity_organization(request: Request, limit: int = 1000, offset: int = 0):
 
 
 @app.get("/entity/counterparty")
-def entity_counterparty(request: Request, limit: int = 1000, offset: int = 0,
-                        flt: str = Query(default="", alias="filter")):
+async def entity_counterparty(request: Request, limit: int = 1000, offset: int = 0,
+                              flt: str = Query(default="", alias="filter")):
     _auth(request)
-    name = _parse_filter(flt).get("name", "")
-    rows = [_counterparty_row(cp) for cp in COUNTERPARTIES
-            if not name or cp["name"] == name]
+    parsed = _parse_filter(flt)
+    name, want_sync = parsed.get("name", ""), parsed.get("syncId", "")
+    if int(FAULTS.get("cp_search_delay_ms") or 0) > 0:
+        import asyncio as _asyncio
+        await _asyncio.sleep(int(FAULTS["cp_search_delay_ms"]) / 1000.0)
+    rows = [_counterparty_row(cp) for cp in list(COUNTERPARTIES)
+            if (not name or cp["name"] == name)
+            and (not want_sync or str(cp.get("syncId") or "") == want_sync)]
     return _page(rows, limit, offset)
 
 
@@ -802,9 +823,49 @@ async def entity_counterparty_create(request: Request):
         raise HTTPException(status_code=412, detail={"errors": [
             {"error": "Ошибка сохранения объекта: поле 'name' не может быть пустым"}
         ]})
+    sync_id = _read_sync_id(body)
+    if sync_id:
+        for cp in COUNTERPARTIES:
+            if cp.get("syncId") == sync_id:
+                cp["name"] = name      # upsert: обновили, второго не завели
+                return _counterparty_row(cp)
     cp = {"id": f"cp-{len(COUNTERPARTIES) + 1:03d}", "name": name}
+    if sync_id:
+        cp["syncId"] = sync_id
     COUNTERPARTIES.append(cp)
     return _counterparty_row(cp)
+
+
+_UUID_RE = _re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+def _read_sync_id(body: dict) -> str:
+    """syncId из тела POST — пользовательский идентификатор JSON API 1.2.
+
+    Контракт, который мок закрепляет (и который обязан подтвердить живой
+    тест на боевом аккаунте, см. TECH_DEBT):
+      • syncId — UUID, задаётся клиентом; кривое значение → 412;
+      • он уникален в пределах аккаунта и типа сущности, поэтому POST с уже
+        занятым syncId НЕ создаёт вторую сущность, а обновляет существующую
+        и возвращает ЕЁ (upsert). Это единственный способ сделать создание
+        финансового документа идемпотентным: ответ можно потерять сколько
+        угодно раз, документ останется один.
+    Пустой syncId допустим — так ведёт себя реальный МС. Запрет «POST без
+    syncId» живёт в НАШЕМ коде (app/ms_client.py), а не здесь: мок обязан
+    оставаться честной моделью чужого API, иначе тест доказывал бы правило
+    самим собой.
+    """
+    raw = body.get("syncId")
+    if raw is None or raw == "":
+        return ""
+    val = str(raw)
+    if not _UUID_RE.match(val):
+        raise HTTPException(status_code=412, detail={"errors": [
+            {"error": "Ошибка сохранения объекта: поле 'syncId' не является UUID"}
+        ]})
+    return val
 
 
 def _require_meta_href(body: dict, field: str, expected_type: str) -> str:
@@ -848,22 +909,44 @@ async def entity_purchaseorder_create(request: Request):
             raise HTTPException(status_code=412, detail={"errors": [
                 {"error": "Ошибка сохранения объекта: quantity должно быть > 0"}
             ]})
-    num = len(CREATED_PURCHASE_ORDERS) + 1
-    doc_id = f"po-{num:04d}"
-    doc = dict(body)
-    doc["id"] = doc_id
-    doc["name"] = f"{num:05d}"
-    doc["meta"] = {
-        "href": f"{BASE}/entity/purchaseorder/{doc_id}",
-        "type": "purchaseorder", "mediaType": "application/json",
-        "uuidHref": f"https://online.moysklad.ru/app/#purchaseorder/edit?id={doc_id}",
-    }
+    sync_id = _read_sync_id(body)
     if int(FAULTS.get("po_429_burst") or 0) > 0:
         # Отказ ДО создания: документа нет, повтор обязателен и безопасен.
         FAULTS["po_429_burst"] = int(FAULTS["po_429_burst"]) - 1
         raise HTTPException(status_code=429, detail="rate limited",
                             headers={"X-Lognex-Retry-TimeInterval": "200"})
-    CREATED_PURCHASE_ORDERS.append(doc)
+    if int(FAULTS.get("po_fail_before_create") or 0) > 0:
+        # Отказ ДО создания, но НЕ по частоте: клиент из своей позиции не
+        # отличает его от «создан, ответ потерян» — и обязан вести себя так,
+        # будто документ мог появиться.
+        FAULTS["po_fail_before_create"] = int(FAULTS["po_fail_before_create"]) - 1
+        raise HTTPException(status_code=502, detail="bad gateway")
+    existing = None
+    if sync_id:
+        existing = next((d for d in CREATED_PURCHASE_ORDERS
+                         if str(d.get("syncId") or "") == sync_id), None)
+    if existing is not None:
+        # Upsert по занятому syncId: обновляем существующий документ и
+        # возвращаем ЕГО. Второго документа не появляется — ровно ради
+        # этого свойства ключ и посылается.
+        keep = {k: existing[k] for k in ("id", "name", "meta", "moment",
+                                         "applicable") if k in existing}
+        existing.clear()
+        existing.update(body)
+        existing.update(keep)
+        doc = existing
+    else:
+        num = len(CREATED_PURCHASE_ORDERS) + 1
+        doc_id = f"po-{num:04d}"
+        doc = dict(body)
+        doc["id"] = doc_id
+        doc["name"] = f"{num:05d}"
+        doc["meta"] = {
+            "href": f"{BASE}/entity/purchaseorder/{doc_id}",
+            "type": "purchaseorder", "mediaType": "application/json",
+            "uuidHref": f"https://online.moysklad.ru/app/#purchaseorder/edit?id={doc_id}",
+        }
+        CREATED_PURCHASE_ORDERS.append(doc)
     if int(FAULTS.get("po_create_then_fail") or 0) > 0:
         # Документ создан — и только потом «падает» ответ. Именно так
         # выглядит таймаут на стороне клиента: он не знает, что случилось.

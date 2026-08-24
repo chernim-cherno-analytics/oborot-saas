@@ -48,6 +48,7 @@ SUITES = [
     ("notify",      "test_notify.py",          True,  True),
     ("sync_wipe",   "test_sync_wipe.py",       True,  False),
     ("wb_dup",      "test_writeback_dup.py",   True,  False),
+    ("wb_idem",     "test_writeback_idempotency.py", True, False),
     ("ops",         "test_ops.py",             False, False),
     ("logging",     "test_logging.py",         False, False),
     ("subscr",      "test_subscription.py",    False, False),
