@@ -80,6 +80,11 @@ SUITES = [
     ("exec",        "test_execution.py",       False, False),
     ("consist",     "test_consistency.py",     False, False),
     ("canon",       "test_turnover_canon.py",  False, False),
+    # Замок на формулы потребности и largest-remainder (DATA-11). Стоит рядом
+    # с `canon` намеренно: оба набора ничего не улучшают, оба фиксируют канон
+    # как есть. Ключа --allow-skip у него нет и не будет: набор офлайновый,
+    # ни сети, ни моков ему не нужно, и пропуститься ему не на чем (D-42).
+    ("formula",     "test_formula_contract.py", False, False),
     ("ui",          "test_ui.py",              False, False),
     ("backup",      "test_backup.py",          False, False),
     ("deploy",      "test_deploy.py",          False, False),
