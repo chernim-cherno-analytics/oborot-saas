@@ -233,9 +233,13 @@ def head_of(app: Path) -> str:
 
 def main() -> int:
     if shutil.which("flock") is None or shutil.which("sqlite3") is None:
-        print("ПРОПУСК: нет flock или sqlite3 — проверять нечего.")
-        print("ИТОГО: 0 OK, 0 FAIL")
-        return 0
+        # Код 77 И причина одновременно (D-42): пропуск без причины
+        # неотличим от поломки, а прежние «ИТОГО: 0 OK, 0 FAIL» с кодом 0
+        # выдавали непроверенный деплой за проверенный.
+        missing = [t for t in ("flock", "sqlite3") if shutil.which(t) is None]
+        print(f"ПРОПУЩЕНО: в системе нет {' и '.join(missing)} — "
+              f"deploy.sh проверять нечем (на macOS: brew install util-linux)")
+        return 77
     if WORK.exists():
         shutil.rmtree(WORK)
     WORK.mkdir()

@@ -1,13 +1,36 @@
 """Аналитика оборачиваемости: портировано из legacy (build_turnover_data, order.html).
 
-Все метрики считаются по базовому имени (base_name) за скользящие 365 дней:
+КАНОН ФОРМУЛЫ ОБОРАЧИВАЕМОСТИ — зафиксирован владельцем (Влад, 23.08.2026).
+Формулу НЕ МЕНЯТЬ ни при каких «улучшениях», аудитах и рефакторах: она
+остаётся такой, какой её сделал автор. Любое изменение — только по прямому
+решению владельца, записанному в DECISIONS.md. См. BUSINESS_LOGIC.md §0 и
+AGENTS.md. История вопроса: в legacy-проекте агентский «фикс» 18.08.2026
+(календарные веса дней) незаметно переопределил единицы метрики, обесценил
+откалиброванные пороги, и цифры «улетели в мусор» — откатывали 23.08.
 
-- dis  — «дней в стоке»: даты в stock_days, где суммарный по размерам qty >= min_stock_days;
+Канон: оборачиваемость = (продажи − возвраты) ÷ дни в стоке, где обе части
+считаются ПО ОДНИМ И ТЕМ ЖЕ ДНЯМ:
+- окно — скользящие TURNOVER_WINDOW_DAYS (2 года; дальше вещи неактуальны);
+- «день в стоке» — дата, где суммарный ПО БАЗЕ (все размеры) остаток
+  >= min_stock_days (порог глубины по базе, дефолт 3); день за днём, без
+  каких-либо весов;
+- числитель — нетто-продажи ТОЛЬКО этих дней (nris/nqis): продажи дней,
+  когда вещи не было или глубина была ниже порога, скорость не завышают.
+
+Метрики по базовому имени (base_name):
+
+- dis  — «дней в стоке» в окне канона (см. выше);
 - cs   — остаток на ПОСЛЕДНЮЮ имеющуюся дату (нет строки на неё = 0);
-- nq/nr — нетто продано шт / нетто выручка (продажи минус возвраты);
-- rate = nq/dis, turnover = nr/dis (главная метрика, ₽/день);
+- nq/nr — нетто продано шт / нетто выручка ЗА ГОД (справочный денежный
+  слой: «Продано»/«Выручка», средняя цена, маржа; в оборачиваемость НЕ
+  входят);
+- nris/nqis — нетто-выручка/шт дней «в стоке» (числитель канона);
+- turnover = max(0, nris)/dis (главная метрика, ₽/день);
+- rate_year = nq/dis365 — годовой ТЕМП для планировщика заказа (это НЕ
+  оборачиваемость: окна темпа — отдельный механизм, см. ниже);
 - sea — сезонная оборачиваемость (правило legacy): для каждого из 4 сезонов
-  ₽/день = нетто-выручка сезонных месяцев / дни в стоке в эти месяцы (окно 365);
+  ₽/день = нетто-выручка сезонных месяцев / дни в стоке в эти месяцы
+  (окно канона);
 - wos = cs/(rate*7); stockout_date = today + cs/rate;
 - второй денежный слой (для финансиста, поверх розничного, ничего не заменяет):
   stock_cost = cs×себестоимость («сколько денег заморожено»), margin_unit /
@@ -129,6 +152,11 @@ SEASON_HEALTHY_FULL = 0.60  # healthy: полная цена >= 60% И оста�
 SEASON_HEALTHY_LEFTOVER = 0.20
 SEASON_WARNING_FULL = 0.40  # warning: полная цена 40–60% ИЛИ остаток 20–35%
 SEASON_WARNING_LEFTOVER = 0.35  # иначе — alarm
+
+# Окно канона оборачиваемости (решение владельца 23.08.2026, D-35): 2 года.
+# Вещи старше двух лет для ассортимента неактуальны, а хвост старых дней в
+# знаменателе без числителя занижал скорость. НЕ МЕНЯТЬ без решения владельца.
+TURNOVER_WINDOW_DAYS = 730
 
 _SEASON_NAMES = {3: "весна", 6: "лето", 9: "осень", 12: "зима"}
 
@@ -545,8 +573,13 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
     rate_window = settings["rate_window"]
     lead_time = settings["lead_time_days"]
     today = date.today()
-    # Ровно 365 дат в окне (today−364 … today включительно) — иначе «дней в
-    # стоке» доходило до 366 при подписи «за 365 дней».
+    # Окно КАНОНА оборачиваемости: ровно TURNOVER_WINDOW_DAYS дат
+    # (today−729 … today включительно). По нему считаются dis, nq/nr,
+    # nris/nqis, turnover и сезонная оборачиваемость.
+    cutoff_turn = (today - timedelta(days=TURNOVER_WINDOW_DAYS - 1)).isoformat()
+    # Годовое окно остаётся у ТЕМПА планировщика (rate_year = nq365/dis365) и
+    # у флагов покрытия сезонов. Ровно 365 дат (today−364 … today) — иначе
+    # «дней в стоке» доходило до 366 при подписи «за 365 дней».
     cutoff365 = (today - timedelta(days=364)).isoformat()
     cutoff90 = (today - timedelta(days=90)).isoformat()
     cutoff30 = (today - timedelta(days=30)).isoformat()
@@ -597,12 +630,13 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
         .group_by(Product.base_name)
     ).all()
 
-    # dis: даты, где суммарный остаток базы >= порога.
+    # dis (канон): даты окна TURNOVER_WINDOW_DAYS, где суммарный остаток
+    # базы >= порога. День за днём, без весов.
     day_totals = (
         select(Product.base_name.label("base"), StockDay.date.label("d"))
         .select_from(StockDay)
         .join(Product, join_products)
-        .where(StockDay.org_id == org.id, StockDay.date >= cutoff365)
+        .where(StockDay.org_id == org.id, StockDay.date >= cutoff_turn)
         .group_by(Product.base_name, StockDay.date)
         .having(func.sum(StockDay.qty) >= min_stock)
         .subquery()
@@ -610,6 +644,9 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
     dis_by_base = dict(
         db.execute(select(day_totals.c.base, func.count()).group_by(day_totals.c.base)).all()
     )
+    # Годовые дни в стоке — для темпа планировщика (rate_year = nq/dis365),
+    # НЕ для оборачиваемости. Тот же window_dis, что у мастера заказа.
+    dis365_by_base = window_dis(db, org.id, min_stock, cutoff365)
 
     def _dis_window(
         date_from: str, date_to: str | None = None, min_qty: int | None = None
@@ -636,7 +673,7 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
     inst_season_by_base = _dis_window(season_from, season_to, min_qty=1)
 
     # Сезонная оборачиваемость (правило legacy /turnover): дни в стоке и
-    # нетто-выручка по МЕСЯЦАМ сезона внутри окна 365 дней. Реиспользуем
+    # нетто-выручка по МЕСЯЦАМ сезона внутри окна канона. Реиспользуем
     # day_totals (пары base×дата, прошедшие порог min_stock).
     month_of_day = func.substr(day_totals.c.d, 6, 2)
     sea_dis_by_base: dict[str, dict[str, int]] = {}
@@ -660,7 +697,10 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
             .group_by(Product.base_name, Product.size)
         ).all()
 
-    # Нетто-продажи за 365 дней, по размерам.
+    # Нетто-продажи за ГОД, по размерам (nq/nr и «продано» размеров).
+    # Денежный слой (выручка, средняя цена, маржа, «без продаж») остаётся
+    # годовым, как подписан на страницах: канон D-35 меняет ТОЛЬКО расчёт
+    # оборачиваемости (dis + nris/nqis, окно 2 года), а не отчётные суммы.
     sign_qty = case((Sale.is_return, -Sale.qty), else_=Sale.qty)
     sign_rev = case((Sale.is_return, -Sale.revenue), else_=Sale.revenue)
     join_sales = and_(
@@ -676,6 +716,22 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
         .group_by(Product.base_name, Product.size)
     ).all()
 
+    # Числитель КАНОНА (nris/nqis): нетто-продажи ТОЛЬКО в дни «в стоке» —
+    # join к day_totals по (база, дата). Оборачиваемость = nris/dis, числитель
+    # и знаменатель покрывают одни и те же дни. Именно отсутствие этого
+    # выравнивания в legacy делало turn гибридом «вся выручка ÷ часть дней».
+    instock_sales_rows = db.execute(
+        select(Product.base_name, func.sum(sign_qty), func.sum(sign_rev))
+        .select_from(Sale)
+        .join(Product, join_sales)
+        .join(day_totals, and_(day_totals.c.base == Product.base_name,
+                               day_totals.c.d == Sale.date))
+        .where(Sale.org_id == org.id, Sale.date >= cutoff_turn)
+        .group_by(Product.base_name)
+    ).all()
+    nqis_by_base = {b: float(q or 0) for b, q, _r in instock_sales_rows}
+    nris_by_base = {b: float(r or 0) for b, _q, r in instock_sales_rows}
+
     # Нетто-продажи в окнах «90 дней» и «сезон прошлого года», по базам.
     def _nq_window(date_from: str, date_to: str | None = None) -> dict:
         return window_nq(db, org.id, date_from, date_to)
@@ -683,14 +739,25 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
     nq90_by_base = _nq_window(cutoff90)
     nq_season_by_base = _nq_window(season_from, season_to)
 
-    # Нетто-выручка по месяцам (для сезонной оборачиваемости), окно 365.
+    # Нетто-выручка по месяцам (для сезонной оборачиваемости), окно канона.
+    # Числитель сезона выровнен с сезонными днями ТАК ЖЕ, как nris с dis
+    # (ревью PR #12): join к day_totals — берутся только продажи дней «в
+    # стоке», иначе продажа дня ниже порога попадала бы в сезонную выручку,
+    # а её день — нет, и сезонный ₽/день завышался.
+    # Покрытие сезонов (season_covered) сознательно остаётся по годовому
+    # окну: один полный год закрывает каждый сезон по разу, а сезонный
+    # ₽/день — среднее по загруженным дням «в стоке» и от частичной загрузки
+    # второго года не становится ложным; страница при частичной истории
+    # уже подписывает фактическое окно.
     sale_month = func.substr(Sale.date, 6, 2)
     sea_rev_by_base: dict[str, dict[str, float]] = {}
     for base, mm, rev in db.execute(
         select(Product.base_name, sale_month, func.sum(sign_rev))
         .select_from(Sale)
         .join(Product, join_sales)
-        .where(Sale.org_id == org.id, Sale.date >= cutoff365)
+        .join(day_totals, and_(day_totals.c.base == Product.base_name,
+                               day_totals.c.d == Sale.date))
+        .where(Sale.org_id == org.id, Sale.date >= cutoff_turn)
         .group_by(Product.base_name, sale_month)
     ).all():
         season = _SEASON_OF_MONTH.get(mm)
@@ -901,6 +968,9 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
             "cost_is_full": bool(cost_full),
             "archived": bool(archived),
             "dis": int(dis_by_base.get(base, 0)),
+            "dis365": int(dis365_by_base.get(base, 0)),
+            "nris": nris_by_base.get(base, 0.0),
+            "nqis": nqis_by_base.get(base, 0.0),
             "cs": 0,
             "nq": 0.0,
             "nr": 0.0,
@@ -954,12 +1024,15 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
         arrival = today + timedelta(days=lead)
         item["lead_time_days"] = lead
         dis, cs, nq, nr = item["dis"], item["cs"], item["nq"], item["nr"]
-        rate_year = nq / dis if dis > 0 else 0.0
-        # Оборачиваемость — скорость, с которой позиция приносит деньги;
-        # отрицательной она не бывает. Если возвраты за период перевесили
-        # продажи, скорость честно нулевая (а сама нетто-выручка остаётся
-        # в «Выручке» со знаком минус — это факт, его не прячем).
-        turnover = max(0.0, nr) / dis if dis > 0 else 0.0
+        # Годовой ТЕМП планировщика — по годовому окну (nq за год /
+        # dis365), как и обещает настройка «Год». Окно канона оборачиваемости
+        # (2 года) на темп заказа не влияет.
+        rate_year = nq / item["dis365"] if item["dis365"] > 0 else 0.0
+        # Оборачиваемость — КАНОН (см. докстринг модуля): нетто-выручка дней
+        # «в стоке» (nris) ÷ эти же дни (dis). Отрицательной она не бывает:
+        # если возвраты перевесили продажи, скорость честно нулевая (а сама
+        # нетто-выручка остаётся в «Выручке» со знаком минус — не прячем).
+        turnover = max(0.0, item["nris"]) / dis if dis > 0 else 0.0
 
         # Свежесть позиции: когда её последний раз видели на полке и когда
         # последний раз покупали. Нужны, чтобы отличить «распродали» от
@@ -1314,14 +1387,14 @@ def money_totals(items: list[dict]) -> dict:
             if stock_sale_with_cost > 0
             else None
         ),
-        # Заработано за 365 дней: нетто-выручка − себестоимость проданного.
+        # Заработано за год: нетто-выручка − себестоимость проданного.
         "revenue_year": sum(it["nr"] for it in items),
         "revenue_year_with_cost": revenue_with_cost,
         "gross_margin": gross_margin,
         "gross_margin_pct": (
             round(gross_margin / revenue_with_cost, 3) if revenue_with_cost > 0 else None
         ),
-        # Себестоимость проданного за 365 дней и оборачиваемость КАПИТАЛА —
+        # Себестоимость проданного за год и оборачиваемость КАПИТАЛА —
         # профессиональная метрика финансиста (сколько раз за год провернулись
         # вложенные в товар деньги). Знаменатель — сток по себестоимости
         # СЕГОДНЯ, а не средний за период: истории себестоимости у нас нет,
