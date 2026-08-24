@@ -53,6 +53,7 @@ SUITES = [
     ("subscr",      "test_subscription.py",    False, False),
     ("exec",        "test_execution.py",       False, False),
     ("consist",     "test_consistency.py",     False, False),
+    ("canon",       "test_turnover_canon.py",  False, False),
     ("ui",          "test_ui.py",              False, False),
     ("backup",      "test_backup.py",          False, False),
     ("deploy",      "test_deploy.py",          False, False),

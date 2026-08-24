@@ -1336,11 +1336,22 @@ def api_checks() -> None:
                      json=dict(body_hz, cover_mode="что-то"))
         check("неизвестный режим отклоняется, а не молча подменяется",
               bad.status_code == 422, f"status={bad.status_code}")
-        check("на большом фиксированном горизонте план не становится вечно предварительным",
-              c.post("/api/order-plan/preview",
-                     json=dict(body_hz, cover_mode="fixed", horizon_days_fixed=365)
-                     ).json()["coverage"]["partial"] is False,
-              "история не может быть глубже года — требовать больше нельзя")
+        # D-35 (23.08.2026): окно истории теперь HISTORY_DAYS = 730 (канон
+        # оборачиваемости — 2 года). Инвариант «план не вечно предварительный»
+        # проверяется по требованию, а не по факту: needed_days клэмпится к
+        # HISTORY_DAYS (больше, чем система вообще грузит, требовать нельзя),
+        # а partial честно сравнивает загруженное покрытие с требованием —
+        # на демо (400 дней истории) большой горизонт даёт partial, пока
+        # второй год не загружен, и это правильно.
+        from app.ms_sync import HISTORY_DAYS as _HD
+        cov_big = c.post("/api/order-plan/preview",
+                         json=dict(body_hz, cover_mode="fixed", horizon_days_fixed=365)
+                         ).json()["coverage"]
+        check("требование к истории клэмпится к окну загрузки (не вечно предварительный)",
+              cov_big["needed_days"] <= _HD, f"needed={cov_big['needed_days']} > {_HD}")
+        check("partial честен: сравнивает загруженное покрытие с требованием",
+              cov_big["partial"] is (cov_big["days"] < cov_big["needed_days"]),
+              f"cov={cov_big}")
 
         # ── Позиция, втащенная галочкой, — решение человека ─────────────────
         # Позицию из ИСКЛЮЧЁННОЙ категории система сама бы не взяла — значит
