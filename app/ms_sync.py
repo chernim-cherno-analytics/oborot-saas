@@ -83,6 +83,15 @@ from app.ms_client import MoySkladClient, _env_int
 # нет (точка продолжения снимается при финализации); до пересборки страницы
 # честно подписывают фактическое окно («за N дн.»).
 HISTORY_DAYS = int(os.environ.get("HISTORY_DAYS", "730"))
+# «Едет к нам» НЕ следует за окном истории (ревью PR #12): заказ поставщику
+# старше года — брошенный документ, а не товар в пути (shipped в проде не
+# заполняется, D-26). Двухлетний cutoff молча показывал бы такие заказы как
+# «едет» и занижал потребность. Окно заморожено на прежнем поведении:
+# min(год, HISTORY_DAYS) — короткая история (тесты, HISTORY_DAYS=60) даёт
+# прежние 60 дней, боевые 730 не расширяют окно дальше года.
+INCOMING_ORDERS_DAYS = int(
+    os.environ.get("INCOMING_ORDERS_DAYS", str(min(365, HISTORY_DAYS)))
+)
 SALES_RESYNC_DAYS = int(os.environ.get("SYNC_DAYS_BACK", "3"))
 # Деплой П1: окно «быстрого старта» — столько последних дат загружается до
 # finalize-lite (пользователь получает рабочие страницы), остальное — фоном.
@@ -1927,7 +1936,9 @@ async def _sync_incoming(org_id: int, client: MoySkladClient,
 
     _set_state(org_id, stage="incoming", progress=progress[0],
                detail="Загружаем заказы поставщику («едет к нам»)…")
-    cutoff = (_today() - timedelta(days=HISTORY_DAYS - 1)).isoformat()
+    # Окно заказов поставщику — ГОД (INCOMING_ORDERS_DAYS), не окно истории:
+    # см. комментарий у константы (ревью PR #12).
+    cutoff = (_today() - timedelta(days=INCOMING_ORDERS_DAYS - 1)).isoformat()
     docs = await client.fetch_purchase_orders(cutoff)
 
     # product_id → base_name (агрегируем «едет» по базовому имени).
