@@ -98,6 +98,40 @@ def is_pushed(href: str | None) -> bool:
     h = href or ""
     return bool(h) and not h.startswith(PENDING_PREFIX)
 
+
+# Текст отказа для операций, столкнувшихся с идущей отправкой. Один на всех:
+# 409 обязан звучать одинаково и в статусе, и в удалении — человек читает
+# его в одном и том же месте интерфейса.
+PUSH_IN_PROGRESS = (
+    "По этому заказу сейчас идёт отправка в МойСклад. Дождитесь её "
+    "завершения и обновите страницу: пока документ создаётся, менять "
+    "заказ нельзя — иначе одно и то же уедет дважды."
+)
+
+
+def not_pushing_clause():
+    """SQL-условие «по заказу сейчас НЕ идёт отправка» — для WHERE изменения.
+
+    Почему условием в SQL, а не проверкой перед изменением. Между «прочитали
+    ms_doc_href» и «выполнили UPDATE/DELETE» помещается вся транзакция T1
+    отправки: предварительная проверка честно увидит «отправки нет», а
+    изменение уедет уже поверх захваченного лока (TOCTOU). Тогда у гонки два
+    победителя: статус успевает добавить локальный вклад, которого T2 не
+    ждёт, а удаление оставляет в МойСкладе финансовый документ, к которому у
+    нас больше нет ни заказа, ни ключа для обратной привязки.
+
+    Условие внутри самой изменяющей операции делает исход ОДНИМ: либо строка
+    изменена (значит, отправка не начиналась), либо не изменена ни одна
+    (значит, начиналась) — третьего состояния не существует.
+
+    coalesce — на случай NULL из строк, вставленных до появления колонки:
+    `NULL NOT LIKE …` даёт NULL, то есть строка молча выпала бы из-под
+    изменения и обычное удаление сломалось бы на ровном месте.
+    """
+    return func.coalesce(ProductionOrder.ms_doc_href, "").notlike(
+        f"{PENDING_PREFIX}%")
+
+
 # Веб-интерфейс МойСклад: ссылка на карточку документа по его uuid.
 MS_UI_DOC_URL = "https://online.moysklad.ru/app/#purchaseorder/edit?id={uuid}"
 
@@ -284,7 +318,7 @@ def _position_label(base_name: str, size: str) -> str:
 
 
 def _move_incoming_to_ms(db: Session, org_id: int, order: ProductionOrder,
-                         pushed_by_base: dict[str, int]) -> None:
+                         pushed_by_base: dict[str, int], was_sent: bool) -> None:
     """Перенос вклада заказа в «едет к нам» с локального qty на ms_qty.
 
     С момента отправки источник истины по этому заказу — документ в МойСклад
@@ -298,8 +332,15 @@ def _move_incoming_to_ms(db: Session, org_id: int, order: ProductionOrder,
     (D-28): между отправкой и ближайшим синком «едет по заказам „Оборота“» не
     должно проваливаться в ноль. Синк потом пересчитает обе величины заново —
     уже по доказуемой связи, а не по нашему знанию в моменте.
+
+    `was_sent` приходит СНАРУЖИ и читается из той же транзакции, что и запись
+    ссылки (RETURNING в _commit_push_once). Брать его из order.status нельзя:
+    ORM-объект заказа загружен ДО сети, а за время сетевого окна статус мог
+    измениться. Раньше это спасал только побочный эффект db.rollback() в
+    начале T2 (он обесценивает объект, и следующее обращение перечитывает
+    строку) — то есть корректность держалась на неочевидном поведении сессии,
+    а не на явном чтении.
     """
-    was_sent = order.status == "sent"
     touched: dict[str, OrderedQty] = {}
 
     def _row(base: str) -> OrderedQty:
@@ -594,6 +635,10 @@ def _commit_push_once(db: Session, org_id: int, order: ProductionOrder,
                       pushed_by_base: dict[str, int]) -> bool | None:
     """Одна попытка T2. True — записано, None — лок уже не наш, иначе исключение."""
     db.rollback()
+    # RETURNING отдаёт статус ровно той строки, которую мы сейчас изменили, и
+    # ровно в момент изменения: решение «снимать ли локальный вклад заказа»
+    # обязано опираться на состояние внутри этой транзакции, а не на
+    # ORM-объект, прочитанный до сетевого окна.
     saved = db.execute(
         sa_update(ProductionOrder)
         .where(
@@ -603,11 +648,14 @@ def _commit_push_once(db: Session, org_id: int, order: ProductionOrder,
             ProductionOrder.ms_doc_href.like(f"{PENDING_PREFIX}%"),
         )
         .values(ms_doc_href=href, ms_doc_name=name, ms_lookup_mode=LOOKUP_SYNC)
-    ).rowcount > 0
+        .returning(ProductionOrder.status)
+        .execution_options(synchronize_session=False)
+    ).fetchall()
     if not saved:
         db.rollback()
         return None
-    _move_incoming_to_ms(db, org_id, order, pushed_by_base)
+    _move_incoming_to_ms(db, org_id, order, pushed_by_base,
+                         was_sent=str(saved[0][0] or "") == "sent")
     db.commit()
     return True
 

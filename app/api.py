@@ -830,27 +830,59 @@ def api_order_status(
             detail=f"Недопустимый переход статуса: {order.status} → {body.status}",
         )
     now = datetime.utcnow()
+    # Прежний статус — в локальную переменную. Ниже по ветке отказа сессия
+    # обесценивается (expire_all), а db.get отдаёт ТОТ ЖЕ объект `order` из
+    # identity map: сравнение «order.status == fresh.status» после этого
+    # сравнивало бы значение с самим собой и всегда давало бы истину.
+    prev_status = order.status
     # Смена статуса — условным UPDATE, а не присваиванием. Двойной клик по
     # «Принят» отправляет два одинаковых запроса; проверка `status == order.status`
     # выше читает состояние ДО коммита, и оба запроса её проходили — в базе
     # оказывались две строки приёмки на полный заказ (принято 20 при заказанных
     # 10), а «едет к нам» уменьшалось дважды. Побеждает ровно один запрос: тот,
     # чей UPDATE увидел прежний статус.
+    #
+    # Второе условие того же UPDATE — «по заказу не идёт отправка в МойСклад»
+    # (ревью Codex, раунд 1). Отправка разрезана на T1 (пометка pending) —
+    # сеть — T2 (ссылка + перенос вклада «едет к нам»), и в сетевом окне заказ
+    # выглядит обычным. Перевод draft → sent в этом окне добавляет ПОЛНЫЙ
+    # локальный вклад, которого T2 не ждёт, — и одно и то же едет к нам дважды.
+    # Проверкой перед UPDATE это не лечится: T1 успевает встать между чтением
+    # и записью (TOCTOU), поэтому условие живёт в самом UPDATE — см.
+    # ms_writeback.not_pushing_clause.
+    #
+    # RETURNING отдаёт ms_doc_href той же строки и в тот же момент: решение
+    # «двигать ли локальный qty» обязано читаться из транзакции изменения.
+    # Иначе остаётся зеркальная гонка — запрос прочитал заказ ДО T2, а
+    # изменяет ПОСЛЕ: пометки pending уже нет, UPDATE честно проходит, а
+    # признак «уже отправлен» берётся устаревший, и локальный вклад ложится
+    # ПОВЕРХ перенесённого ms_qty (тест 10б в test_writeback_idempotency).
     changed = db.execute(
         update(ProductionOrder)
         .where(ProductionOrder.id == order.id,
                ProductionOrder.org_id == ctx.org.id,
-               ProductionOrder.status == order.status)
+               ProductionOrder.status == prev_status,
+               ms_writeback.not_pushing_clause())
         .values(status=body.status,
                 **({"sent_at": now} if body.status == "sent" else {"received_at": now}))
-    ).rowcount
+        .returning(ProductionOrder.ms_doc_href)
+        .execution_options(synchronize_session=False)
+    ).fetchall()
     if not changed:
         db.rollback()
         db.expire_all()
         fresh = db.get(ProductionOrder, order_id)
-        return {"ok": True, "status": fresh.status if fresh else body.status,
-                "unchanged": True}
-    if not ms_writeback.is_pushed(order.ms_doc_href):
+        if fresh is None:
+            return {"ok": True, "status": body.status, "unchanged": True}
+        if (str(fresh.ms_doc_href or "").startswith(ms_writeback.PENDING_PREFIX)
+                or fresh.status == prev_status):
+            # Статус не изменился — значит UPDATE отклонило не расхождение
+            # статусов, а идущая отправка. Молчаливое «ok, unchanged» здесь
+            # было бы враньём: человек нажал кнопку, и она не сработала.
+            raise HTTPException(status_code=409,
+                                detail=ms_writeback.PUSH_IN_PROGRESS)
+        return {"ok": True, "status": fresh.status, "unchanged": True}
+    if not ms_writeback.is_pushed(str(changed[0][0] or "")):
         if body.status == "sent":
             _apply_order_to_incoming(db, ctx.org.id, order, +1)
         else:  # received
@@ -1008,10 +1040,6 @@ def api_order_delete(
         raise HTTPException(status_code=404, detail="Заказ не найден")
     if order.status == "received":
         raise HTTPException(status_code=422, detail="Принятый на склад заказ удалить нельзя")
-    if order.status == "sent" and not ms_writeback.is_pushed(order.ms_doc_href):
-        # Отправленный в МС заказ в qty не входил (его считает ms_qty; сам
-        # документ в МойСклад при локальном удалении никуда не девается).
-        _apply_order_to_incoming(db, ctx.org.id, order, -1)
     # Приёмки уходят вместе с заказом. Оставлять их нельзя: id в SQLite — это
     # rowid, он переиспользуется, и следующий созданный заказ получил бы тот же
     # номер, а вместе с ним — чужие факты приёмки («принято 4 шт» по заказу, по
@@ -1019,9 +1047,45 @@ def api_order_delete(
     # внешний ключ и отдавал 500. «Только пополняется» — правило про то, что
     # факт нельзя ПЕРЕПИСАТЬ; удаление заказа целиком — осознанное действие
     # человека, и история удаляемого заказа уходит вместе с ним.
+    #
+    # Приёмки удаляются ПЕРВЫМИ (внешний ключ order_receipts.order_id), и обе
+    # операции — одна транзакция: если сам заказ удалить не дадут, откатится
+    # и это.
     db.execute(delete(OrderReceipt).where(
         OrderReceipt.org_id == ctx.org.id, OrderReceipt.order_id == order.id))
-    db.delete(order)
+    # Удаление — условным DELETE с тем же условием «не идёт отправка», что и
+    # смена статуса (ревью Codex, раунд 1). Удаление между T1 и T2 проходило,
+    # а документ в МойСкладе создавался уже после него: T2 получал rowcount=0,
+    # и в чужом аккаунте оставался ФИНАНСОВЫЙ документ, к которому у нас нет
+    # ни заказа, ни ключа для обратной привязки — ключ удалялся вместе со
+    # строкой. Проверка перед DELETE от этого не спасает (TOCTOU): условие
+    # обязано быть частью самого DELETE.
+    #
+    # RETURNING отдаёт статус и ссылку удалённой строки — тот же приём, что и
+    # в статусном переходе: сколько снимать с «едет к нам», решается по
+    # состоянию внутри транзакции удаления, а не по ORM-объекту, прочитанному
+    # до неё. Иначе повторная отправка уже отправленного заказа успевала бы
+    # перенести вклад в ms_qty, а удаление вычитало бы его ещё раз — из чужой
+    # позиции с тем же base_name.
+    removed = db.execute(
+        delete(ProductionOrder)
+        .where(ProductionOrder.id == order.id,
+               ProductionOrder.org_id == ctx.org.id,
+               ms_writeback.not_pushing_clause())
+        .returning(ProductionOrder.status, ProductionOrder.ms_doc_href)
+        .execution_options(synchronize_session=False)
+    ).fetchall()
+    if not removed:
+        db.rollback()
+        db.expire_all()
+        if db.get(ProductionOrder, order_id) is None:
+            raise HTTPException(status_code=404, detail="Заказ не найден")
+        raise HTTPException(status_code=409, detail=ms_writeback.PUSH_IN_PROGRESS)
+    status_at_delete, href_at_delete = str(removed[0][0] or ""), str(removed[0][1] or "")
+    if status_at_delete == "sent" and not ms_writeback.is_pushed(href_at_delete):
+        # Отправленный в МС заказ в qty не входил (его считает ms_qty; сам
+        # документ в МойСклад при локальном удалении никуда не девается).
+        _apply_order_to_incoming(db, ctx.org.id, order, -1)
     db.commit()
     analytics.invalidate(ctx.org.id)
     return {"ok": True}

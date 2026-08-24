@@ -1966,7 +1966,11 @@ def _backmatch_by_sync_id(org_id: int, docs: list[dict],
             # Прибавка к ms_qty здесь живёт до конца этого же синка (ниже он
             # пересобирает вклад МС начисто), а вот СНЯТИЕ локального qty —
             # ради него всё и делается.
-            ms_writeback._move_incoming_to_ms(db, org_id, order, pushed_by_base)
+            # Заказ прочитан этой же транзакцией, поэтому его статус свежий —
+            # передаём явно (см. ms_writeback._move_incoming_to_ms).
+            ms_writeback._move_incoming_to_ms(
+                db, org_id, order, pushed_by_base,
+                was_sent=str(order.status or "") == "sent")
             linked += 1
             our_docs[int(order.id)] = href
         if linked:

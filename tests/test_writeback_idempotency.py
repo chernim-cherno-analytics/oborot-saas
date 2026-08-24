@@ -911,7 +911,8 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
         detail11 = r11.text
     check("отказ объясняет причину — идёт отправка в МойСклад",
           "отправ" in detail11.lower(), f"detail={detail11[:200]}")
-    check("ЗАКАЗ НЕ УДАЛЁН", order_exists(o11), "строки заказа нет")
+    check("ЗАКАЗ НЕ УДАЛЁН", order_exists(o11),
+          f"строка заказа в базе={order_exists(o11)}")
     check("создан ровно один документ", len(docs_created()) == docs_before11 + 1,
           f"было={docs_before11} стало={len(docs_created())}")
     check("отправка завершилась успехом, а не «неизвестно»",
@@ -930,7 +931,7 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
     check("после отправки удаление снова разрешено", r.status_code == 200,
           f"status={r.status_code} {r.text[:200]}")
     check("…и заказ действительно удалён", not order_exists(o11),
-          "строка заказа осталась")
+          f"строка заказа в базе={order_exists(o11)}")
     o11b = make_order(c, "Обычный черновик под удаление")
     r = c.request("DELETE", f"/api/orders/{o11b}")
     check("удаление обычного черновика не сломано", r.status_code == 200,
