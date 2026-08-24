@@ -132,7 +132,9 @@ def build_budget(
         # как и обещает подпись на самой странице бюджета.
         rate = float(it.get("rate_active") or 0)
         if rate <= 0:
-            rate = nq / dis
+            # Фолбэк — годовой темп (nq365/dis365), как и раньше: nq/dis с
+            # ревизии 23.08 (D-35) — окно канона (2 года), это не темп.
+            rate = float(it.get("rate_year") or 0)
         stock_eff = it["cs"] + max(0, int(it["ordered"]))
         need = int(it.get("need") or 0)
         if need < NEED_MIN:
@@ -997,8 +999,9 @@ def _pulse_price_map(db: Session, org_id: int, today: date) -> dict[int, float]:
     расходились (на демо — 1 778 ₽ из ниоткуда). База цены и набор позиций
     теперь общие: архивные и скрытые позиции пропускаем, как и карточка.
     """
-    # Ровно 365 дат (today−364 … today) — то же окно, что у снапшота: иначе
-    # средняя цена расходится на копейки, а сумма склада — на десятки рублей.
+    # Ровно 365 дат (today−364 … today) — то же окно, что у avg_price
+    # снапшота: иначе средняя цена расходится на копейки, а сумма склада —
+    # на десятки рублей.
     since = (today - timedelta(days=364)).isoformat()
     sign_qty = case((Sale.is_return, -Sale.qty), else_=Sale.qty)
     sign_rev = case((Sale.is_return, -Sale.revenue), else_=Sale.revenue)

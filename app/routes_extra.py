@@ -303,6 +303,10 @@ def api_freshness(ctx: AuthContext = Depends(require_auth_api), db: Session = De
         "coverage_days": st.get("coverage_days", 0),
         "coverage_start": first_stock,
         "history_days": ms_sync.HISTORY_DAYS,
+        # Полнота ОКНА ОБОРАЧИВАЕМОСТИ мерится каноном (ревью PR #12), а не
+        # настройкой синка: при HISTORY_DAYS=365 из env подпись «за 2 года»
+        # без этого поля появлялась бы при загруженном одном годе.
+        "turnover_window_days": analytics.TURNOVER_WINDOW_DAYS,
     }
 
 
