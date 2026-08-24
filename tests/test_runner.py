@@ -19,6 +19,24 @@ sqlite3 или flock. В прогоне CI 32716761631 набор ui показ�
   * подсчёт строк «  OK   » остаётся диагностикой и никогда не выносит
     приговор: по строкам не видно, дошёл набор до конца или оборвался.
 
+Сверх контракта раннера здесь же стоят сторожа на НАСТОЯЩИЕ наборы — те, что
+уже один раз соврали или могли соврать. Приговор выносит настоящий `classify()`
+раннера, а не переписанное здесь правило:
+
+  * каждый набор из `SUITES` обязан уметь напечатать канонический
+    «ИТОГО: N OK, M FAIL» со СЧИТАННЫМИ числами. Возврат прежнего формата
+    («OK: N   FAIL: M» в offsite и deps) роняет этот набор;
+  * `deps` без `requirements.lock` обязан дать канонически посчитанный ПРОВАЛ,
+    а не NO_REPORT: предмет проверки лежит в репозитории, его отсутствие — это
+    поломка, а не «проверить нечем»;
+  * `offsite` и `deploy` без нужных утилит обязаны дать код 77 И причину —
+    и такой пропуск обязан НЕ засчитываться при `--require-all`. Прежние
+    «ИТОГО: 0 OK, 0 FAIL» с кодом 0 у deploy и падение с трассировкой у
+    offsite оба означали «проверок не было», но выглядели по-разному;
+  * `.github/workflows/ci.yml` обязан гонять `--require-all` и не иметь ни
+    одного `--allow-skip`. Исключение здесь заводится только вместе с записью
+    в TECH_DEBT.md — иначе оно переживёт причину, по которой его завели.
+
 Проверяется НАСТОЯЩИЙ раннер на фиктивных наборах из `tests/runner_fixtures/`:
 каждый ведёт себя ровно одним способом, приложение не поднимает и портов не
 занимает. Раннер под проверкой берётся из переменной `OBOROT_RUNNER`
@@ -32,6 +50,9 @@ import contextlib
 import importlib.util
 import io
 import os
+import re
+import shutil
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -128,6 +149,43 @@ def run_main(runner, names, argv) -> tuple:
         except SystemExit as exc:  # argparse на незнакомом ключе
             rc = exc.code if isinstance(exc.code, int) else 2
     return rc, buf.getvalue()
+
+
+# Канонический финал со СЧИТАННЫМИ числами: «ИТОГО: {...} OK, {...} FAIL».
+# Фигурные скобки в шаблоне обязательны намеренно — иначе под правило попадёт
+# и упоминание формата в докстринге, и набор, печатающий заранее известные
+# числа. Регистр слова не важен: четыре набора пишут «Итого».
+CANON_REPORT_RE = re.compile(r"ИТОГО:\s*\{[^{}]+\}\s*OK,\s*\{[^{}]+\}\s*FAIL",
+                             re.IGNORECASE)
+
+CI_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
+
+
+def run_real_suite(runner, script: Path, cwd: Path, env_extra: dict,
+                   timeout: int = 180) -> dict:
+    """Настоящий набор в подставленном окружении; приговор — настоящим classify.
+
+    Здесь не имитируется вывод: набор запускается как есть, а `classify()`
+    берётся из раннера под проверкой. Иначе сторож проверял бы собственное
+    представление о контракте, а не контракт.
+    """
+    env = dict(os.environ)
+    env.update(env_extra)
+    p = subprocess.run([sys.executable, str(script)], cwd=str(cwd), env=env,
+                       capture_output=True, text=True, timeout=timeout)
+    return classify(runner, p.stdout + p.stderr, p.returncode)
+
+
+@contextlib.contextmanager
+def without_tools():
+    """PATH, в котором нет ничего: любой `shutil.which` вернёт None.
+
+    Так проверяется преамбула наборов, гоняющих bash-скрипты. Интерпретатор
+    запускается по абсолютному пути и от пустого PATH не страдает, а до
+    первой внешней команды набор дойти не должен — в этом и смысл преамбулы.
+    """
+    with tempfile.TemporaryDirectory() as empty:
+        yield {"PATH": empty}
 
 
 def main() -> int:  # noqa: C901 — сценарный набор: проверок много, ветвлений мало
@@ -251,6 +309,108 @@ def main() -> int:  # noqa: C901 — сценарный набор: провер
     check("--allow-skip не прощает набор, который не назван", rc == 1, f"код {rc}")
     rc, out = run_main(runner, ["pass", "skip"], ["--require-all", "pass"])
     check("--require-all на части наборов — отказ, а не успех", rc == 2, f"код {rc}")
+
+    print("\n== настоящие наборы: канонический финал у каждого ==")
+    # Сторож против возврата прежнего формата. offsite и deps печатали
+    # «OK: N   FAIL: M»; раннер такой финал не читает вовсе и выносит
+    # NO_REPORT — 127 и 12 выполненных проверок засчитывались как «набора
+    # не было». Правило распространено на ВСЕ наборы: если новый напишет
+    # итог по-своему, узнать об этом лучше здесь, а не из зелёного CI.
+    no_canon = []
+    for name, filename, *_ in runner.SUITES:
+        src_path = ROOT / "tests" / filename
+        if not src_path.is_file():
+            no_canon.append(f"{name}: файла нет")
+            continue
+        if not CANON_REPORT_RE.search(src_path.read_text(encoding="utf-8")):
+            no_canon.append(f"{name} ({filename})")
+    check("каждый набор печатает канонический «ИТОГО: N OK, M FAIL»",
+          not no_canon, "; ".join(no_canon))
+    check("наборов зарегистрировано столько же, сколько файлов в SUITES",
+          len(runner.SUITES) >= 23, f"наборов: {len(runner.SUITES)}")
+
+    registered = {name: filename for name, filename, *_ in runner.SUITES}
+    check("набор offsite зарегистрирован", registered.get("offsite") == "test_offsite.py",
+          str(registered.get("offsite")))
+    check("набор deps зарегистрирован", registered.get("deps") == "test_dependencies.py",
+          str(registered.get("deps")))
+    check("раннер раздаёт OFFSITE_TEST_PORT",
+          "OFFSITE_TEST_PORT" in RUNNER_PATH.read_text(encoding="utf-8"))
+
+    print("\n== deps без requirements.lock: провал, а не NO_REPORT ==")
+    # Ранний отказ раньше печатал «ИТОГО: без lock-файла остальное проверять
+    # нечего.» — слово есть, чисел нет, приговор NO_REPORT. То есть набор
+    # выпадал из отчёта ровно в том случае, ради которого написан.
+    with tempfile.TemporaryDirectory() as tmp:
+        fake_root = Path(tmp)
+        (fake_root / "tests").mkdir()
+        shutil.copy(ROOT / "tests" / "test_dependencies.py", fake_root / "tests")
+        try:
+            r = run_real_suite(runner, fake_root / "tests" / "test_dependencies.py",
+                               fake_root, {}, timeout=120)
+            check("приговор — FAIL, а не NO_REPORT", r.get("verdict") == "FAIL",
+                  f"приговор {r.get('verdict')}")
+            check("канонический отчёт напечатан", r.get("report") is True)
+            check("падение посчитано, а не потеряно", r.get("fail", 0) >= 1,
+                  f"fail={r.get('fail')}")
+            check("пропуском это не притворяется", r.get("rc") != runner.SKIP_RC
+                  and not r.get("reason"), f"rc={r.get('rc')} причина={r.get('reason')!r}")
+            check("прогон не засчитан ни локально, ни в CI",
+                  not runner.is_good(dict(r, name="deps"), False, set())
+                  and not runner.is_good(dict(r, name="deps"), True, set()))
+        except subprocess.SubprocessError as exc:
+            for title in ("приговор — FAIL, а не NO_REPORT", "канонический отчёт напечатан",
+                          "падение посчитано, а не потеряно", "пропуском это не притворяется",
+                          "прогон не засчитан ни локально, ни в CI"):
+                check(title, False, str(exc))
+
+    print("\n== offsite и deploy без инструментов: код 77 И причина ==")
+    # Оба гоняют настоящие bash-скрипты. Без flock проверять нечем — и это
+    # надо сказать вслух. deploy раньше печатал «ИТОГО: 0 OK, 0 FAIL» с кодом
+    # 0 (непроверенный деплой выглядел проверенным), offsite падал с
+    # трассировкой посреди сценария (тот же NO_REPORT, только нечитаемый).
+    for suite_name, filename in (("offsite", "test_offsite.py"),
+                                 ("deploy", "test_deploy.py")):
+        with without_tools() as env_extra:
+            try:
+                r = run_real_suite(runner, ROOT / "tests" / filename, ROOT,
+                                   env_extra, timeout=120)
+            except subprocess.SubprocessError as exc:
+                for suffix in ("честный пропуск", "названа причина", "не выдаёт 0/0 за успех",
+                               "--require-all не прощает"):
+                    check(f"{suite_name}: {suffix}", False, str(exc))
+                continue
+            check(f"{suite_name}: честный пропуск", r.get("verdict") == "SKIP",
+                  f"приговор {r.get('verdict')}, код {r.get('rc')}")
+            check(f"{suite_name}: названа причина", bool(r.get("reason")),
+                  repr(r.get("reason"))[:120])
+            check(f"{suite_name}: не выдаёт 0/0 за успех",
+                  not (r.get("rc") == 0 and r.get("report") and r.get("ok") == 0),
+                  f"rc={r.get('rc')} отчёт={r.get('report')} ok={r.get('ok')}")
+            check(f"{suite_name}: локально пропуск виден, в CI — падение",
+                  runner.is_good(dict(r, name=suite_name), False, set())
+                  and not runner.is_good(dict(r, name=suite_name), True, set()))
+
+    print("\n== CI гоняет --require-all и ни одного --allow-skip ==")
+    # Ослабить контракт проще всего не в раннере, а в workflow: дописать
+    # «--allow-skip ui» после первого же ложного падения. Это вернуло бы ровно
+    # ту дыру, ради которой D-42 написан, поэтому сторож стоит на файле.
+    if CI_WORKFLOW.is_file():
+        ci = CI_WORKFLOW.read_text(encoding="utf-8")
+        run_lines = [ln for ln in ci.splitlines()
+                     if "run_all.py" in ln and not ln.lstrip().startswith("#")]
+        check("workflow вызывает раннер", bool(run_lines), str(run_lines))
+        check("вызов раннера в CI идёт с --require-all",
+              all("--require-all" in ln for ln in run_lines), str(run_lines))
+        check("в вызове раннера нет ни одного --allow-skip",
+              all("--allow-skip" not in ln for ln in run_lines), str(run_lines))
+        check("строгий набор зависимостей вызывается отдельным шагом",
+              "tests/test_dependencies.py" in ci)
+    else:
+        check("workflow вызывает раннер", False, f"нет файла {CI_WORKFLOW}")
+        check("вызов раннера в CI идёт с --require-all", False, "нет файла")
+        check("в вызове раннера нет ни одного --allow-skip", False, "нет файла")
+        check("строгий набор зависимостей вызывается отдельным шагом", False, "нет файла")
 
     print(f"\nИТОГО: {len(PASS)} OK, {len(FAIL)} FAIL")
     if FAIL:

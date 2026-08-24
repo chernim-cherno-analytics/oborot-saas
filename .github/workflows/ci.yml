@@ -52,38 +52,33 @@ jobs:
           fi
           pip install -r requirements.lock
 
-      - name: Зависимости совместимы и совпадают с lock
-        # Две разные проверки, обе дешёвые.
-        # pip check — нет ли конфликта требований между установленными пакетами.
-        # Сверка с lock — не уехало ли фактическое окружение от записанного:
-        # lock-файл, которому окружение не соответствует, хуже отсутствия
-        # lock-файла, потому что создаёт ложную уверенность.
-        run: |
-          pip check
-          python - <<'PY'
-          import re, sys
-          from importlib.metadata import version, PackageNotFoundError
-          bad = []
-          for line in open("requirements.lock", encoding="utf-8"):
-              line = line.split("#", 1)[0].strip()
-              if not line or "==" not in line:
-                  continue
-              name, want = line.split("==", 1)
-              name, want = name.strip(), want.strip()
-              try:
-                  have = version(name)
-              except PackageNotFoundError:
-                  bad.append(f"{name}: в lock {want}, не установлен")
-                  continue
-              if have != want:
-                  bad.append(f"{name}: в lock {want}, установлено {have}")
-          if bad:
-              print("ОКРУЖЕНИЕ НЕ СОВПАДАЕТ С requirements.lock:")
-              for b in bad:
-                  print("  " + b)
-              sys.exit(1)
-          print("окружение совпадает с lock")
-          PY
+      - name: Зависимости совместимы и совпадают с lock (строгий набор)
+        # ЭТОТ ШАГ ЗАМЕНЯЕТ прежний встроенный скрипт `pip check` + сверка
+        # версий с lock, и замена не молчаливая: набор `tests/test_dependencies.py`
+        # делает всё, что делал скрипт (`pip check`, точное совпадение каждого
+        # пина lock с установленной версией), и сверх того — разбор lock на
+        # дубли, полноту замыкания и согласие границ `requirements.txt` с
+        # `requirements.lock`. Смысл шага строго шире прежнего, ничего из
+        # проверявшегося не потеряно.
+        #
+        # Почему набором, а не строкой здесь: строка внутри workflow локально не
+        # запускается и до пуша не падает. Именно так 23.08 в requirements.txt
+        # прожили starlette 1.6.0 и pydantic 2.13.4 — версии, которых не было ни
+        # в lock, ни на сервере. Идея вынести проверку отдельным набором взята
+        # из ветки codex/p20-integration-publish, реализация своя.
+        #
+        # Шаг стоит ДО тестового overlay намеренно: он сверяет прод-замыкание,
+        # и мерить его надо до того, как поверх ляжет playwright.
+        #
+        # OBOROT_ENFORCE_LOCK=1: в CI расхождение окружения с lock — падение,
+        # а не предупреждение. Локально у разработчика может стоять другое.
+        #
+        # Тот же набор ещё раз проходит внутри run_all.py как обязательный
+        # `deps` — здесь он нужен раньше, чтобы не тратить сборку браузера на
+        # заведомо неверном окружении.
+        run: python tests/test_dependencies.py
+        env:
+          OBOROT_ENFORCE_LOCK: "1"
 
       - name: Кэш браузеров playwright
         # Ключ — по dev-lock: обновили playwright, поменялась и сборка браузера,
