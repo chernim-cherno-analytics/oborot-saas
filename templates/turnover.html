@@ -848,7 +848,11 @@ load().catch(e=>{ document.getElementById("tb").innerHTML='<tr><td colspan="'+nc
       .then(function(r){ return r.ok ? r.json() : null; })
       .then(function(d){
         if (!d) return;
-        var cov = Number(d.coverage_days), hd = Number(d.history_days);
+        var cov = Number(d.coverage_days);
+        // Полнота окна оборачиваемости мерится КАНОНОМ (turnover_window_days,
+        // ревью PR #12), а не настройкой глубины синка: при HISTORY_DAYS=365
+        // из env «за 2 года» иначе появлялось бы при одном загруженном годе.
+        var hd = Number(d.turnover_window_days || d.history_days);
         var partial = hd > 0 && cov > 0 && cov < hd;
         th.textContent = partial ? "за " + cov + " дн." : "за 2 года";
         var since = dm(d.coverage_start || d.history_loaded_from || "");
