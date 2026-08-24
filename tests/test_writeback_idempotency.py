@@ -45,6 +45,22 @@ T2 — окна, в котором заказ ещё выглядит обычн
 проверкой и изменением T1 успевает встать (TOCTOU), поэтому условие живёт
 в самой изменяющей SQL-операции.
 
+Раунд 2 ревью Codex довёл это правило до конца — блоки 11б и 12:
+
+  • обратный порядок удаления (11б): DELETE прочитал допустимый заказ, и
+    только ПОСЛЕ этого T1 поставил pending. Блок 11 такой формы не покрывал:
+    он открывал окно первым, то есть проверял уже готовое состояние;
+  • приёмка против удаления (12): запрет «принятый заказ удалить нельзя»
+    жил проверкой ПЕРЕД удалением и держался ровно до первой гонки —
+    sent → received успевает закоммититься между чтением и DELETE, и
+    удаление сносит принятый заказ вместе с фактами приёмки. Зеркальный
+    случай: победило удаление — проигравший переход отвечал «ok, unchanged»,
+    успехом, которого не было.
+
+Отсюда требование к нулевому результату изменяющей операции: он обязан
+РАЗЛИЧАТЬ исходы, а не сводиться к одному коду. Строки нет — 404; стала
+received — 422; идёт отправка — 409.
+
 Мок закрепляет ожидаемое поведение чужого API, но доказательством живого
 контракта НЕ является: живой тест `syncId` на боевом аккаунте — отдельный
 merge gate (см. TECH_DEBT, DATA-1/DATA-2).
@@ -219,6 +235,23 @@ def order_exists(order_id: int) -> bool:
 
 def status_of(order_id: int) -> str:
     return str(col_of(order_id, "status") or "")
+
+
+def receipts_count(order_id: int) -> int:
+    """Сколько строк приёмки лежит по заказу (факты исполнения, D-25).
+
+    Приёмка — факт, а не мнение: она обязана пережить проигранную гонку
+    удаления и обязана НЕ появиться, если переход в «принят» не состоялся.
+    """
+    con = sqlite3.connect(DB_PATH)
+    try:
+        row = con.execute("SELECT COUNT(*) FROM order_receipts WHERE order_id=?",
+                          (order_id,)).fetchone()
+        return int(row[0]) if row else 0
+    except sqlite3.OperationalError:
+        return -1
+    finally:
+        con.close()
 
 
 def wait_sync_done(c: httpx.Client, timeout: float = 240.0) -> dict:
@@ -935,6 +968,268 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
     o11b = make_order(c, "Обычный черновик под удаление")
     r = c.request("DELETE", f"/api/orders/{o11b}")
     check("удаление обычного черновика не сломано", r.status_code == 200,
+          f"status={r.status_code} {r.text[:200]}")
+
+    # ── 11б. Обратный порядок: удаление решается по состоянию, прочитанному
+    #         ДО T1 ──────────────────────────────────────────────────────────
+    #
+    # Ревью Codex, раунд 2, пункт 3. Блок 11 открывает окно отправки ПЕРВЫМ и
+    # только потом зовёт DELETE: он доказывает, что пометка pending учтена в
+    # самом удалении, но не исходную форму TOCTOU — «DELETE прочитал допустимый
+    # заказ → T1 поставил pending → DELETE выполнил изменение». Порядок здесь
+    # обратный и закреплён детерминированно, ровно как блок 10б для статуса:
+    # пауза стоит между чтением заказа и первым изменяющим SQL удаления — в том
+    # промежутке, где предварительная проверка «отправки нет» уже устарела.
+    #
+    # Исход обязан быть один: отправка доводится до конца, удаление получает
+    # честный 409, заказ жив, документ ровно один и связан с заказом ссылкой.
+    print("\n== 11б. Гонка: удаление начато до T1, изменение — после ==")
+    o11c = make_order(c, "Заказ, чьё удаление началось до отправки")
+    docs_before11c = len(docs_created())
+    mock_api.post("/__test/faults", json={"po_create_delay_ms": 1500})
+    _orig_delete = _api.delete
+    armed11c = {"on": False}
+    at_border11c = threading.Event()
+    go11c = threading.Event()
+
+    def _gated_delete11c(*a, **kw):
+        """Первый изменяющий SQL удаления ждёт на границе, пока пройдёт T1."""
+        if armed11c["on"]:
+            armed11c["on"] = False
+            at_border11c.set()
+            go11c.wait(timeout=90)
+        return _orig_delete(*a, **kw)
+
+    del11c: list = []
+
+    def _del11c():
+        with httpx.Client(headers=dict(c.headers), cookies=c.cookies,
+                          base_url=base, timeout=120.0) as cc:
+            del11c.append(cc.request("DELETE", f"/api/orders/{o11c}"))
+
+    push11c: list = []
+
+    def _push11c():
+        with httpx.Client(headers=dict(c.headers), cookies=c.cookies,
+                          base_url=base, timeout=120.0) as cc:
+            push11c.append(cc.post(f"/api/orders/{o11c}/push-to-ms"))
+
+    _api.delete = _gated_delete11c
+    armed11c["on"] = True
+    td11c = threading.Thread(target=_del11c)
+    td11c.start()
+    border11c = at_border11c.wait(timeout=30)
+    try:
+        check("удаление прочитало живой заказ и стоит перед изменением",
+              border11c, f"дошли до границы={border11c}")
+        tp11c = threading.Thread(target=_push11c)
+        tp11c.start()
+        marker11c = wait_pending(o11c)
+        check("T1 встал между чтением и изменением",
+              marker11c.startswith("pending:"), f"ms_doc_href={marker11c!r}")
+    finally:
+        go11c.set()
+        td11c.join(timeout=120)
+        _api.delete = _orig_delete
+        armed11c["on"] = False
+    tp11c.join(timeout=120)
+    mock_api.post("/__test/faults", json={})
+    check("отправка доведена до конца (200)",
+          bool(push11c) and push11c[0].status_code == 200,
+          f"status={push11c[0].status_code if push11c else None} "
+          f"{push11c[0].text[:200] if push11c else ''}")
+    check("УДАЛЕНИЕ, НАЧАТОЕ ДО T1, ОТКЛОНЕНО (409)",
+          bool(del11c) and del11c[0].status_code == 409,
+          f"status={del11c[0].status_code if del11c else None} "
+          f"{del11c[0].text[:200] if del11c else ''}")
+    detail11c = ""
+    if del11c:
+        try:
+            detail11c = str((del11c[0].json() or {}).get("detail") or "")
+        except ValueError:
+            detail11c = del11c[0].text
+    check("отказ объясняет причину — идёт отправка в МойСклад",
+          "отправ" in detail11c.lower(), f"detail={detail11c[:200]}")
+    check("ЗАКАЗ НЕ УДАЛЁН", order_exists(o11c),
+          f"строка заказа в базе={order_exists(o11c)}")
+    check("создан ровно один документ", len(docs_created()) == docs_before11c + 1,
+          f"было={docs_before11c} стало={len(docs_created())}")
+    href11c = str(col_of(o11c, "ms_doc_href") or "")
+    check("ССЫЛКА НА ДОКУМЕНТ СОХРАНЕНА у живого заказа",
+          href11c.startswith("http"), f"ms_doc_href={href11c!r}")
+
+    # ── 12. Приёмка против удаления одного и того же заказа ─────────────────
+    #
+    # Ревью Codex, раунд 2, пункты 1 и 2. Запрет «принятый заказ удалить
+    # нельзя» стоит проверкой ПЕРЕД удалением, а значит держится ровно до
+    # первой гонки: sent → received успевает закоммититься между чтением и
+    # DELETE, и удаление сносит уже принятый заказ вместе с фактами приёмки.
+    # Зеркальный случай не лучше: если победило удаление, проигравший переход
+    # отвечает «ok, unchanged» — успех, которого не было.
+    #
+    # Оба порядка ниже закреплены детерминированно; SQL обязан обеспечивать
+    # оба, а нулевой результат изменения — различать три исхода: строки нет
+    # (404), стала received (422), идёт отправка (409).
+    print("\n== 12. Гонка: «принят на склад» против удаления ==")
+
+    # 12а. Приёмка победила: удаление обязано получить 422, а не снести заказ.
+    o12 = make_order(c, "Заказ, который принимают во время удаления")
+    bases12 = order_bases(c, o12)
+    b12 = next(iter(bases12), "")
+    n12 = bases12.get(b12, 0)
+    before12 = qty_map().get(b12, (0.0, 0.0, 0.0))
+    r = c.post(f"/api/orders/{o12}/status", json={"status": "sent"})
+    check("заказ переведён в «в производстве»", r.status_code == 200,
+          f"status={r.status_code} {r.text[:200]}")
+    armed12 = {"on": False}
+    at_border12 = threading.Event()
+    recv12_done = threading.Event()
+
+    def _gated_delete12(*a, **kw):
+        """Удаление ждёт на границе, пока приёмка не закоммитится."""
+        if armed12["on"]:
+            armed12["on"] = False
+            at_border12.set()
+            recv12_done.wait(timeout=90)
+        return _orig_delete(*a, **kw)
+
+    del12: list = []
+
+    def _del12():
+        with httpx.Client(headers=dict(c.headers), cookies=c.cookies,
+                          base_url=base, timeout=120.0) as cc:
+            del12.append(cc.request("DELETE", f"/api/orders/{o12}"))
+
+    _api.delete = _gated_delete12
+    armed12["on"] = True
+    td12 = threading.Thread(target=_del12)
+    td12.start()
+    border12 = at_border12.wait(timeout=30)
+    r12 = None
+    try:
+        check("удаление прочитало заказ ещё в статусе «в производстве»",
+              border12, f"дошли до границы={border12}")
+        r12 = c.post(f"/api/orders/{o12}/status",
+                     json={"status": "received",
+                           "received": [{"base_name": b12, "qty": n12}]})
+    finally:
+        recv12_done.set()
+        td12.join(timeout=120)
+        _api.delete = _orig_delete
+        armed12["on"] = False
+    check("приёмка прошла (200)", r12 is not None and r12.status_code == 200,
+          f"status={r12.status_code if r12 is not None else None} "
+          f"{r12.text[:200] if r12 is not None else ''}")
+    check("УДАЛЕНИЕ, ПРОИГРАВШЕЕ ПРИЁМКЕ, ОТКЛОНЕНО (422)",
+          bool(del12) and del12[0].status_code == 422,
+          f"status={del12[0].status_code if del12 else None} "
+          f"{del12[0].text[:200] if del12 else ''}")
+    detail12 = ""
+    if del12:
+        try:
+            detail12 = str((del12[0].json() or {}).get("detail") or "")
+        except ValueError:
+            detail12 = del12[0].text
+    check("отказ объясняет причину — заказ принят на склад",
+          "принят" in detail12.lower(), f"detail={detail12[:200]}")
+    check("ПРИНЯТЫЙ ЗАКАЗ НЕ УДАЛЁН", order_exists(o12),
+          f"строка заказа в базе={order_exists(o12)}")
+    check("статус остался «принят на склад»", status_of(o12) == "received",
+          f"status={status_of(o12)!r}")
+    check("ФАКТ ПРИЁМКИ СОХРАНЁН", receipts_count(o12) > 0,
+          f"строк приёмки={receipts_count(o12)}")
+    after12 = qty_map().get(b12, (0.0, 0.0, 0.0))
+    check("«едет к нам» вернулось к исходному: заказано и принято",
+          abs(after12[0] - before12[0]) < 1e-6,
+          f"qty было={before12[0]} стало={after12[0]} вклад заказа={n12}")
+    r = c.post(f"/api/orders/{o12}/status", json={"status": "received"})
+    check("повтор того же статуса по-прежнему идемпотентен (200 unchanged)",
+          r.status_code == 200 and bool((r.json() or {}).get("unchanged")),
+          f"status={r.status_code} {r.text[:200]}")
+
+    # 12б. Удаление победило: проигравший переход обязан ответить 404 и не
+    #      записать приёмку по заказу, которого больше нет.
+    o13 = make_order(c, "Заказ, который удаляют во время приёмки")
+    bases13 = order_bases(c, o13)
+    b13 = next(iter(bases13), "")
+    n13 = bases13.get(b13, 0)
+    before13 = qty_map().get(b13, (0.0, 0.0, 0.0))
+    r = c.post(f"/api/orders/{o13}/status", json={"status": "sent"})
+    check("заказ переведён в «в производстве»", r.status_code == 200,
+          f"status={r.status_code} {r.text[:200]}")
+    sent13 = qty_map().get(b13, (0.0, 0.0, 0.0))
+    check("вклад «едет к нам» учтён локально",
+          abs(sent13[0] - before13[0] - n13) < 1e-6,
+          f"qty было={before13[0]} стало={sent13[0]} вклад={n13}")
+    _orig_update13 = _api.update
+    armed13 = {"on": False}
+    at_border13 = threading.Event()
+    del13_done = threading.Event()
+
+    def _gated_update13(*a, **kw):
+        """Приёмка ждёт на границе, пока удаление не закоммитится."""
+        if armed13["on"]:
+            armed13["on"] = False
+            at_border13.set()
+            del13_done.wait(timeout=90)
+        return _orig_update13(*a, **kw)
+
+    recv13: list = []
+
+    def _recv13():
+        with httpx.Client(headers=dict(c.headers), cookies=c.cookies,
+                          base_url=base, timeout=120.0) as cc:
+            recv13.append(cc.post(
+                f"/api/orders/{o13}/status",
+                json={"status": "received",
+                      "received": [{"base_name": b13, "qty": n13}]}))
+
+    _api.update = _gated_update13
+    armed13["on"] = True
+    tr13 = threading.Thread(target=_recv13)
+    tr13.start()
+    border13 = at_border13.wait(timeout=30)
+    r13d = None
+    try:
+        check("приёмка прочитала живой заказ и стоит перед изменением",
+              border13, f"дошли до границы={border13}")
+        r13d = c.request("DELETE", f"/api/orders/{o13}")
+    finally:
+        del13_done.set()
+        tr13.join(timeout=120)
+        _api.update = _orig_update13
+        armed13["on"] = False
+    check("удаление прошло (200)", r13d is not None and r13d.status_code == 200,
+          f"status={r13d.status_code if r13d is not None else None} "
+          f"{r13d.text[:200] if r13d is not None else ''}")
+    check("заказ действительно удалён", not order_exists(o13),
+          f"строка заказа в базе={order_exists(o13)}")
+    check("ПРОИГРАВШАЯ ПРИЁМКА ОТВЕЧАЕТ 404, а не «ok, unchanged»",
+          bool(recv13) and recv13[0].status_code == 404,
+          f"status={recv13[0].status_code if recv13 else None} "
+          f"{recv13[0].text[:200] if recv13 else ''}")
+    check("ПРИЁМКА НЕ ЗАПИСАНА по удалённому заказу",
+          receipts_count(o13) == 0, f"строк приёмки={receipts_count(o13)}")
+    after13 = qty_map().get(b13, (0.0, 0.0, 0.0))
+    check("вклад «едет к нам» снят удалением ровно один раз",
+          abs(after13[0] - before13[0]) < 1e-6,
+          f"qty было={before13[0]} стало={after13[0]} вклад={n13}")
+
+    # 12в. Те же правила без всякой гонки — обычные пути не сломаны.
+    o14 = make_order(c, "Обычный принятый заказ")
+    c.post(f"/api/orders/{o14}/status", json={"status": "sent"})
+    c.post(f"/api/orders/{o14}/status", json={"status": "received"})
+    r = c.request("DELETE", f"/api/orders/{o14}")
+    check("обычное удаление принятого заказа по-прежнему 422",
+          r.status_code == 422, f"status={r.status_code} {r.text[:200]}")
+    check("…и заказ на месте", order_exists(o14),
+          f"строка заказа в базе={order_exists(o14)}")
+    o15 = make_order(c, "Черновик под обычное удаление")
+    r = c.request("DELETE", f"/api/orders/{o15}")
+    check("обычное удаление черновика не сломано", r.status_code == 200,
+          f"status={r.status_code} {r.text[:200]}")
+    r = c.post(f"/api/orders/{o15}/status", json={"status": "sent"})
+    check("статусный переход по удалённому заказу — 404", r.status_code == 404,
           f"status={r.status_code} {r.text[:200]}")
 
     check("каждый POST заказа поставщику нёс syncId",
