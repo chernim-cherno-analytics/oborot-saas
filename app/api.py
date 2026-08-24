@@ -873,7 +873,13 @@ def api_order_status(
         db.expire_all()
         fresh = db.get(ProductionOrder, order_id)
         if fresh is None:
-            return {"ok": True, "status": body.status, "unchanged": True}
+            # Заказ удалили, пока этот запрос шёл к своему UPDATE. Раньше
+            # здесь отдавалось «ok, unchanged» — успех, которого не было:
+            # запрошенный переход не выполнен и выполнен уже не будет, а
+            # интерфейс на 200 рисует новый статус у заказа, которого нет.
+            # 404 — то же самое, что ответил бы этот же запрос секундой
+            # позже, и ровно то, что произошло на самом деле.
+            raise HTTPException(status_code=404, detail="Заказ не найден")
         if (str(fresh.ms_doc_href or "").startswith(ms_writeback.PENDING_PREFIX)
                 or fresh.status == prev_status):
             # Статус не изменился — значит UPDATE отклонило не расхождение
@@ -1039,6 +1045,10 @@ def api_order_delete(
     if order is None or order.org_id != ctx.org.id:
         raise HTTPException(status_code=404, detail="Заказ не найден")
     if order.status == "received":
+        # Быстрый отказ на прочитанном состоянии — удобство, а не защита:
+        # настоящий запрет живёт в WHERE самого DELETE ниже. Оставлен, чтобы
+        # обычный (негоночный) случай не платил за удаление строк приёмки и
+        # откат транзакции.
         raise HTTPException(status_code=422, detail="Принятый на склад заказ удалить нельзя")
     # Приёмки уходят вместе с заказом. Оставлять их нельзя: id в SQLite — это
     # rowid, он переиспользуется, и следующий созданный заказ получил бы тот же
@@ -1061,6 +1071,18 @@ def api_order_delete(
     # строкой. Проверка перед DELETE от этого не спасает (TOCTOU): условие
     # обязано быть частью самого DELETE.
     #
+    # Второе условие того же DELETE — «заказ не принят на склад» (ревью Codex,
+    # раунд 2). Проверка `order.status == "received"` выше читает состояние ДО
+    # изменения, и между ними помещается целый переход sent → received: тогда
+    # удаление сносило уже ПРИНЯТЫЙ заказ вместе со строками приёмки — то есть
+    # с фактами исполнения, которые по правилу проекта не переписываются. Здесь
+    # это та же ошибка, что и с отправкой, и лечится она так же: условие обязано
+    # быть частью самой операции, а не предисловием к ней.
+    #
+    # Отсюда же требование к нулевому результату: он означает три РАЗНЫХ
+    # события, и человеку они говорят разное — строки нет (404, удалять нечего),
+    # заказ стал принятым (422, удалять нельзя), идёт отправка (409, подождите).
+    #
     # RETURNING отдаёт статус и ссылку удалённой строки — тот же приём, что и
     # в статусном переходе: сколько снимать с «едет к нам», решается по
     # состоянию внутри транзакции удаления, а не по ORM-объекту, прочитанному
@@ -1071,6 +1093,7 @@ def api_order_delete(
         delete(ProductionOrder)
         .where(ProductionOrder.id == order.id,
                ProductionOrder.org_id == ctx.org.id,
+               func.coalesce(ProductionOrder.status, "") != "received",
                ms_writeback.not_pushing_clause())
         .returning(ProductionOrder.status, ProductionOrder.ms_doc_href)
         .execution_options(synchronize_session=False)
@@ -1078,8 +1101,14 @@ def api_order_delete(
     if not removed:
         db.rollback()
         db.expire_all()
-        if db.get(ProductionOrder, order_id) is None:
+        # Нулевой результат означает три РАЗНЫХ события, и сводить их к
+        # одному коду нельзя: человек читает ответ и решает, что делать.
+        fresh = db.get(ProductionOrder, order_id)
+        if fresh is None or fresh.org_id != ctx.org.id:
             raise HTTPException(status_code=404, detail="Заказ не найден")
+        if fresh.status == "received":
+            raise HTTPException(status_code=422,
+                                detail="Принятый на склад заказ удалить нельзя")
         raise HTTPException(status_code=409, detail=ms_writeback.PUSH_IN_PROGRESS)
     status_at_delete, href_at_delete = str(removed[0][0] or ""), str(removed[0][1] or "")
     if status_at_delete == "sent" and not ms_writeback.is_pushed(href_at_delete):
