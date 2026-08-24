@@ -29,6 +29,22 @@ rowid SQLite, который переиспользуется после уда�
   back-match — синк заказов поставщику связывает документ с заказом по
        syncId, если предыдущая отправка закончилась честным unknown.
 
+Раунд 1 ревью Codex добавил сюда две гонки внутри сетевого окна между T1 и
+T2 — окна, в котором заказ ещё выглядит обычным и доступен для правки:
+
+  • draft → sent во время отправки (блок 10). Черновик локально не считался,
+    переход добавляет полный локальный вклад, а T2 идёт со СТАРЫМ status в
+    памяти и вклад не снимает — одно и то же едет к нам дважды, навсегда;
+  • DELETE во время отправки (блок 11). Строка исчезает между T1 и созданием
+    документа, T2 получает rowcount=0 — в МойСкладе остаётся финансовый
+    документ, у которого нет заказа, а ключ для back-match удалён вместе со
+    строкой.
+
+Обе обязаны иметь ОДИН победивший исход и честный 409 проигравшему; простая
+проверка «нет ли pending» перед изменением от этого не спасает — между
+проверкой и изменением T1 успевает встать (TOCTOU), поэтому условие живёт
+в самой изменяющей SQL-операции.
+
 Мок закрепляет ожидаемое поведение чужого API, но доказательством живого
 контракта НЕ является: живой тест `syncId` на боевом аккаунте — отдельный
 merge gate (см. TECH_DEBT, DATA-1/DATA-2).
@@ -175,6 +191,34 @@ def push(c: httpx.Client, order_id: int) -> httpx.Response:
         return c.post(f"/api/orders/{order_id}/push-to-ms")
     except httpx.TransportError:
         return c.post(f"/api/orders/{order_id}/push-to-ms")
+
+
+def wait_pending(order_id: int, timeout: float = 20.0) -> str:
+    """Ждёт, пока T1 закоммитит пометку «идёт отправка», и возвращает её.
+
+    Это точка синхронизации теста, а не sleep наугад: пометка появляется в
+    базе ровно между T1 и сетью, и увидев её, тест знает, что окно открыто.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        href = str(col_of(order_id, "ms_doc_href") or "")
+        if href.startswith("pending:"):
+            return href
+        time.sleep(0.02)
+    return str(col_of(order_id, "ms_doc_href") or "")
+
+
+def order_exists(order_id: int) -> bool:
+    con = sqlite3.connect(DB_PATH)
+    try:
+        return con.execute("SELECT 1 FROM production_orders WHERE id=?",
+                           (order_id,)).fetchone() is not None
+    finally:
+        con.close()
+
+
+def status_of(order_id: int) -> str:
+    return str(col_of(order_id, "status") or "")
 
 
 def wait_sync_done(c: httpx.Client, timeout: float = 240.0) -> dict:
@@ -692,6 +736,205 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
               f"ms_qty={ext9[1]} tracked={ext9[2]} внешних={ext9[1] - ext9[2]}")
     finally:
         unplant(alien9)
+
+    # ── 10. Статусный переход ВО ВРЕМЯ отправки ─────────────────────────────
+    #
+    # Ревью Codex, раунд 1, блокер 1. Заказ был черновиком: его количества в
+    # «едет к нам» локально НЕ считаются. Push прошёл T1 и ждёт ответа сети.
+    # В это окно приходит перевод draft → sent — и добавляет полный локальный
+    # вклад. Push об этом не знает (его ORM-объект помнит status='draft'),
+    # поэтому T2 локальный вклад не снимает, а ms_qty прибавляет. Одно и то же
+    # едет к нам ДВАЖДЫ, и никакой синк это не разведёт: обе величины «свои».
+    print("\n== 10. Гонка: смена статуса во время сетевого окна отправки ==")
+    o10 = make_order(c, "Заказ, которому меняют статус на лету")
+    bases10 = order_bases(c, o10)
+    b10 = next(iter(bases10), "")
+    n10 = bases10.get(b10, 0)
+    before10 = qty_map().get(b10, (0.0, 0.0, 0.0))
+    docs_before10 = len(docs_created())
+    mock_api.post("/__test/faults", json={"po_create_delay_ms": 2500})
+    push10: list = []
+
+    def _push10():
+        with httpx.Client(headers=dict(c.headers), cookies=c.cookies,
+                          base_url=base, timeout=120.0) as cc:
+            push10.append(cc.post(f"/api/orders/{o10}/push-to-ms"))
+
+    t10 = threading.Thread(target=_push10)
+    t10.start()
+    marker10 = wait_pending(o10)
+    check("окно отправки открыто (T1 закоммичен, документа ещё нет)",
+          marker10.startswith("pending:") and len(docs_created()) == docs_before10,
+          f"ms_doc_href={marker10!r} документов={len(docs_created())}")
+    r10 = c.post(f"/api/orders/{o10}/status", json={"status": "sent"})
+    t10.join(timeout=120)
+    mock_api.post("/__test/faults", json={})
+    check("СМЕНА СТАТУСА ВО ВРЕМЯ ОТПРАВКИ ОТКЛОНЕНА (409)",
+          r10.status_code == 409, f"status={r10.status_code} {r10.text[:200]}")
+    detail10 = ""
+    try:
+        detail10 = str((r10.json() or {}).get("detail") or "")
+    except ValueError:
+        detail10 = r10.text
+    check("отказ объясняет причину — идёт отправка в МойСклад",
+          "отправ" in detail10.lower(), f"detail={detail10[:200]}")
+    check("статус заказа не изменился", status_of(o10) == "draft",
+          f"status={status_of(o10)!r}")
+    check("сама отправка при этом прошла",
+          bool(push10) and push10[0].status_code == 200,
+          f"status={push10[0].status_code if push10 else None} "
+          f"{push10[0].text[:200] if push10 else ''}")
+    check("создан ровно один документ", len(docs_created()) == docs_before10 + 1,
+          f"было={docs_before10} стало={len(docs_created())}")
+    after10 = qty_map().get(b10, (0.0, 0.0, 0.0))
+    check("ЛОКАЛЬНЫЙ ВКЛАД НЕ ПОЯВИЛСЯ (нет двойного счёта)",
+          abs(after10[0] - before10[0]) < 1e-6,
+          f"qty было={before10[0]} стало={after10[0]} вклад заказа={n10}")
+    check("вклад «едет к нам» учтён РОВНО ОДИН РАЗ — по документу МС",
+          abs(after10[1] - before10[1] - n10) < 1e-6,
+          f"ms_qty было={before10[1]} стало={after10[1]} отправлено={n10}")
+    # Отправка кончилась — обычный переход обязан работать как прежде.
+    r = c.post(f"/api/orders/{o10}/status", json={"status": "sent"})
+    check("после отправки статусный переход снова разрешён",
+          r.status_code == 200, f"status={r.status_code} {r.text[:200]}")
+    after10b = qty_map().get(b10, (0.0, 0.0, 0.0))
+    check("…и отправленный заказ по-прежнему не двигает локальный qty",
+          abs(after10b[0] - before10[0]) < 1e-6 and abs(after10b[1] - after10[1]) < 1e-6,
+          f"qty={after10b[0]} ms_qty={after10b[1]}")
+
+    # ── 10б. То же окно, обратный порядок: изменение ПОСЛЕ T2 ───────────────
+    #
+    # Здесь двойной счёт возникает по-настоящему и остаётся навсегда.
+    # Статусный запрос успевает ПРОЧИТАТЬ заказ, пока идёт отправка (в памяти
+    # у него ms_doc_href='pending:…'), а свой UPDATE выполняет уже ПОСЛЕ того,
+    # как T2 закоммитил ссылку и перенёс вклад в ms_qty. Решение «двигать ли
+    # локальный qty» принимается по УСТАРЕВШЕМУ значению — и полный вклад
+    # заказа ложится поверх уже учтённого ms_qty. Снять его потом нечем:
+    # обе величины «свои», back-match тут ни при чём.
+    #
+    # Одной пометки pending этот случай не ловит: к моменту UPDATE пометки
+    # уже нет, и запрет по ней пропустил бы запрос. Лечится только тем, что
+    # признак «отправлен» берётся из той же транзакции, что и изменение.
+    #
+    # Задержка честная: пауза стоит ровно между чтением состояния и
+    # изменяющим SQL — в том самом промежутке TOCTOU, который и обсуждается.
+    print("\n== 10б. Гонка: изменение статуса решается по устаревшему признаку ==")
+    import app.api as _api  # noqa: PLC0415 — точка инструментирования, не импорт API
+    o10c = make_order(c, "Заказ, чей статус меняют сразу после T2")
+    bases10c = order_bases(c, o10c)
+    b10c = next(iter(bases10c), "")
+    n10c = bases10c.get(b10c, 0)
+    before10c = qty_map().get(b10c, (0.0, 0.0, 0.0))
+    docs_before10c = len(docs_created())
+    mock_api.post("/__test/faults", json={"po_create_delay_ms": 1200})
+    push10c: list = []
+    t2_done = threading.Event()
+
+    def _push10c():
+        try:
+            with httpx.Client(headers=dict(c.headers), cookies=c.cookies,
+                              base_url=base, timeout=120.0) as cc:
+                push10c.append(cc.post(f"/api/orders/{o10c}/push-to-ms"))
+        finally:
+            t2_done.set()
+
+    _orig_update = _api.update
+    _armed = {"on": False}
+
+    def _gated_update(*a, **kw):
+        """Первый изменяющий SQL после взвода ждёт, пока отправка закончится."""
+        if _armed["on"]:
+            _armed["on"] = False
+            t2_done.wait(timeout=90)
+        return _orig_update(*a, **kw)
+
+    t10c = threading.Thread(target=_push10c)
+    t10c.start()
+    marker10c = wait_pending(o10c)
+    check("окно отправки открыто", marker10c.startswith("pending:"),
+          f"ms_doc_href={marker10c!r}")
+    _api.update = _gated_update
+    _armed["on"] = True
+    try:
+        r10c = c.post(f"/api/orders/{o10c}/status", json={"status": "sent"})
+    finally:
+        _api.update = _orig_update
+        _armed["on"] = False
+    t10c.join(timeout=120)
+    mock_api.post("/__test/faults", json={})
+    check("отправка прошла", bool(push10c) and push10c[0].status_code == 200,
+          f"status={push10c[0].status_code if push10c else None} "
+          f"{push10c[0].text[:200] if push10c else ''}")
+    check("создан ровно один документ", len(docs_created()) == docs_before10c + 1,
+          f"было={docs_before10c} стало={len(docs_created())}")
+    check("статусный переход после завершения отправки разрешён (200)",
+          r10c.status_code == 200, f"status={r10c.status_code} {r10c.text[:200]}")
+    after10c = qty_map().get(b10c, (0.0, 0.0, 0.0))
+    check("ДВОЙНОГО QTY НЕТ: локальный вклад не лёг поверх ms_qty",
+          abs(after10c[0] - before10c[0]) < 1e-6,
+          f"qty было={before10c[0]} стало={after10c[0]} вклад заказа={n10c}")
+    check("вклад «едет к нам» учтён РОВНО ОДИН РАЗ",
+          abs(after10c[1] - before10c[1] - n10c) < 1e-6,
+          f"ms_qty было={before10c[1]} стало={after10c[1]} отправлено={n10c}")
+
+    # ── 11. Удаление ВО ВРЕМЯ отправки ──────────────────────────────────────
+    #
+    # Ревью Codex, раунд 1, блокер 2. Удаление проходит между T1 и T2: строка
+    # исчезает, документ в МойСкладе создаётся уже после этого, а T2 получает
+    # rowcount=0. Остаётся финансовый документ, к которому у нас нет заказа —
+    # и связать его обратно нечем: ключ идемпотентности удалён вместе со строкой.
+    print("\n== 11. Гонка: удаление заказа во время сетевого окна отправки ==")
+    o11 = make_order(c, "Заказ, который удаляют на лету")
+    docs_before11 = len(docs_created())
+    mock_api.post("/__test/faults", json={"po_create_delay_ms": 2500})
+    push11: list = []
+
+    def _push11():
+        with httpx.Client(headers=dict(c.headers), cookies=c.cookies,
+                          base_url=base, timeout=120.0) as cc:
+            push11.append(cc.post(f"/api/orders/{o11}/push-to-ms"))
+
+    t11 = threading.Thread(target=_push11)
+    t11.start()
+    marker11 = wait_pending(o11)
+    check("окно отправки открыто", marker11.startswith("pending:"),
+          f"ms_doc_href={marker11!r}")
+    r11 = c.request("DELETE", f"/api/orders/{o11}")
+    t11.join(timeout=120)
+    mock_api.post("/__test/faults", json={})
+    check("УДАЛЕНИЕ ВО ВРЕМЯ ОТПРАВКИ ОТКЛОНЕНО (409)",
+          r11.status_code == 409, f"status={r11.status_code} {r11.text[:200]}")
+    detail11 = ""
+    try:
+        detail11 = str((r11.json() or {}).get("detail") or "")
+    except ValueError:
+        detail11 = r11.text
+    check("отказ объясняет причину — идёт отправка в МойСклад",
+          "отправ" in detail11.lower(), f"detail={detail11[:200]}")
+    check("ЗАКАЗ НЕ УДАЛЁН", order_exists(o11), "строки заказа нет")
+    check("создан ровно один документ", len(docs_created()) == docs_before11 + 1,
+          f"было={docs_before11} стало={len(docs_created())}")
+    check("отправка завершилась успехом, а не «неизвестно»",
+          bool(push11) and push11[0].status_code == 200,
+          f"status={push11[0].status_code if push11 else None} "
+          f"{push11[0].text[:200] if push11 else ''}")
+    href11 = str(col_of(o11, "ms_doc_href") or "")
+    check("ДОКУМЕНТ НЕ ОСИРОТЕЛ — ссылка сохранена у живого заказа",
+          href11.startswith("http"), f"ms_doc_href={href11!r}")
+    check("документ несёт ключ этого заказа",
+          any(str(d.get("syncId") or "") == str(col_of(o11, "ms_sync_id") or "_")
+              for d in docs_created()),
+          f"ms_sync_id={col_of(o11, 'ms_sync_id')!r}")
+    # Отправка кончилась — удаление снова разрешено (поведение не сломано).
+    r = c.request("DELETE", f"/api/orders/{o11}")
+    check("после отправки удаление снова разрешено", r.status_code == 200,
+          f"status={r.status_code} {r.text[:200]}")
+    check("…и заказ действительно удалён", not order_exists(o11),
+          "строка заказа осталась")
+    o11b = make_order(c, "Обычный черновик под удаление")
+    r = c.request("DELETE", f"/api/orders/{o11b}")
+    check("удаление обычного черновика не сломано", r.status_code == 200,
+          f"status={r.status_code} {r.text[:200]}")
 
     check("каждый POST заказа поставщику нёс syncId",
           all(d.get("syncId") for d in docs_created()),

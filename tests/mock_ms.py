@@ -470,6 +470,12 @@ FAULTS: dict = {"stock_ok_before": 0, "stock_429_burst": 0,
                 # одновременных push гарантированно оба увидели «агента нет»
                 # и разошлись бы на создание двух контрагентов без syncId.
                 "cp_search_delay_ms": 0,
+                # Задержка POST /entity/purchaseorder ДО создания документа.
+                # Открывает то самое «сетевое окно» между T1 и T2, в котором
+                # заказ ещё жив в нашей базе, а документа в МС ещё нет: тест
+                # успевает выполнить параллельный статусный переход или
+                # удаление и увидеть, чем это кончится.
+                "po_create_delay_ms": 0,
                 "stock_delay_ms": 0}
 FAULT_STATS: dict = {"stock_requests": 0, "stock_ok": 0, "stock_429": 0, "stock_500": 0}
 
@@ -479,7 +485,7 @@ def reset_faults() -> None:
                   stock_500_once=False, assortment_429_burst=0,
                   docs_429_burst=0, po_create_then_fail=0, po_429_burst=0,
                   po_fail_before_create=0, cp_search_delay_ms=0,
-                  stock_delay_ms=0)
+                  po_create_delay_ms=0, stock_delay_ms=0)
     for k in FAULT_STATS:
         FAULT_STATS[k] = 0
 
@@ -910,6 +916,10 @@ async def entity_purchaseorder_create(request: Request):
                 {"error": "Ошибка сохранения объекта: quantity должно быть > 0"}
             ]})
     sync_id = _read_sync_id(body)
+    if int(FAULTS.get("po_create_delay_ms") or 0) > 0:
+        # Документ ещё НЕ создан — держим сетевое окно открытым.
+        import asyncio as _asyncio
+        await _asyncio.sleep(int(FAULTS["po_create_delay_ms"]) / 1000.0)
     if int(FAULTS.get("po_429_burst") or 0) > 0:
         # Отказ ДО создания: документа нет, повтор обязателен и безопасен.
         FAULTS["po_429_burst"] = int(FAULTS["po_429_burst"]) - 1
