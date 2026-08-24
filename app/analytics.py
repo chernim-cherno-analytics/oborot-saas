@@ -740,12 +740,23 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
     nq_season_by_base = _nq_window(season_from, season_to)
 
     # Нетто-выручка по месяцам (для сезонной оборачиваемости), окно канона.
+    # Числитель сезона выровнен с сезонными днями ТАК ЖЕ, как nris с dis
+    # (ревью PR #12): join к day_totals — берутся только продажи дней «в
+    # стоке», иначе продажа дня ниже порога попадала бы в сезонную выручку,
+    # а её день — нет, и сезонный ₽/день завышался.
+    # Покрытие сезонов (season_covered) сознательно остаётся по годовому
+    # окну: один полный год закрывает каждый сезон по разу, а сезонный
+    # ₽/день — среднее по загруженным дням «в стоке» и от частичной загрузки
+    # второго года не становится ложным; страница при частичной истории
+    # уже подписывает фактическое окно.
     sale_month = func.substr(Sale.date, 6, 2)
     sea_rev_by_base: dict[str, dict[str, float]] = {}
     for base, mm, rev in db.execute(
         select(Product.base_name, sale_month, func.sum(sign_rev))
         .select_from(Sale)
         .join(Product, join_sales)
+        .join(day_totals, and_(day_totals.c.base == Product.base_name,
+                               day_totals.c.d == Sale.date))
         .where(Sale.org_id == org.id, Sale.date >= cutoff_turn)
         .group_by(Product.base_name, sale_month)
     ).all():
