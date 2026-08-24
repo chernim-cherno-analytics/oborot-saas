@@ -417,22 +417,14 @@ async def api_order_push_to_ms(
                     **_ms_doc_out(order),
                 },
             )
-    # Атомарный захват «замка» ДО любых сетевых вызовов: помечаем заказ как
-    # отправляемый одним условным UPDATE с проверкой прежнего значения (CAS).
-    # Второй одновременный клик/ретрай не обновит ни строки (значение уже
-    # изменилось) и получит 409 — иначе гонка создала бы ДВА финансовых
-    # документа. Метка несёт время старта → возможна переотправка после сбоя.
-    from sqlalchemy import update as _sa_update
-    lock = db.execute(
-        _sa_update(ProductionOrder)
-        .where(
-            ProductionOrder.id == order.id,
-            ProductionOrder.ms_doc_href == current,  # CAS: ровно то, что прочитали
-        )
-        .values(ms_doc_href=f"{_PENDING_PREFIX}{now}")
-    )
-    db.commit()
-    if lock.rowcount == 0:
+    # T1 — единственная транзакция ДО сети: CAS-захват «замка» плюс рождение
+    # ключей идемпотентности (заказа и контрагента). Второй одновременный
+    # клик/ретрай не обновит ни строки (значение уже изменилось) и получит
+    # 409 — иначе гонка создала бы ДВА финансовых документа. Подробности и
+    # причины — в ms_writeback.begin_push.
+    locked = ms_writeback.begin_push(
+        db, ctx.org.id, order.id, current, f"{_PENDING_PREFIX}{now}")
+    if not locked:
         db.refresh(order)
         return JSONResponse(
             status_code=409,
@@ -475,6 +467,35 @@ async def api_order_push_to_ms(
                 f"Новый документ не создан."
             ),
         )
+    except ms_writeback.AmbiguousCounterparty as exc:
+        # Контрагентов «Производство» в аккаунте несколько. Выбрать за
+        # владельца нельзя: заказ поставщику — обещание конкретному
+        # подрядчику, и «какой-нибудь» здесь означает «не тот».
+        _release_push_lock(db, order.id)
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"В МойСкладе несколько контрагентов с именем "
+                f"«{ms_writeback.AGENT_NAME}» ({exc}). Заказ поставщику — "
+                f"финансовый документ, и выбрать за вас, кому он уходит, мы не "
+                f"вправе. Оставьте одного (лишних переименуйте или заархивируйте) "
+                f"и повторите отправку. Документ не создан."
+            ),
+        )
+    except ms_writeback.WritebackUnknown as exc:
+        # Честный третий исход: документ создан, а записать это у себя не
+        # вышло даже со второй попытки. Ни «получилось», ни «не получилось».
+        _release_push_lock(db, order.id)
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"Документ в МойСкладе создан ({exc.doc_name or 'без номера'}), "
+                "но сохранить его у нас не удалось. Откройте документ по ссылке "
+                "и проверьте. Повторная отправка безопасна: она пойдёт с тем же "
+                "ключом и второго документа не создаст."
+            ),
+            headers={"X-Oborot-Ms-Doc": exc.doc_href[:400]},
+        )
     except ms_writeback.WritebackError as exc:
         _release_push_lock(db, order.id)
         raise HTTPException(status_code=exc.status, detail=exc.detail)
@@ -485,45 +506,12 @@ async def api_order_push_to_ms(
             raise HTTPException(status_code=400, detail=TOKEN_HINT)
         raise HTTPException(
             status_code=502,
-            detail=f"МойСклад ответил ошибкой {code}. Документ не создан — "
-                   "попробуйте ещё раз позже.",
+            detail=f"МойСклад ответил ошибкой {code}. Попробуйте ещё раз позже: "
+                   "повтор пойдёт с тем же ключом и документ не задвоит.",
         )
     except httpx.HTTPError:
         _release_push_lock(db, order.id)
         raise HTTPException(status_code=502, detail=NETWORK_HINT)
-    try:
-        db.commit()
-    except Exception:
-        # Документ в МойСкладе УЖЕ создан, а сохранить ссылку не удалось
-        # (обрыв соединения с базой, блокировка файла). Если просто упасть,
-        # заказ останется с меткой «идёт отправка», через три минуты она
-        # протухнет, владелец нажмёт ещё раз — и получит второй документ.
-        # Поэтому: откатываем сессию и записываем ссылку отдельной короткой
-        # транзакцией. Не вышло и это — снимаем метку и отдаём ссылку на
-        # созданный документ прямо в ошибке, чтобы она не потерялась совсем.
-        db.rollback()
-        href = str(result.get("ms_doc_href") or "")
-        name = str(result.get("ms_doc_name") or "")
-        saved = False
-        try:
-            from sqlalchemy import update as _sa_upd
-            db.execute(_sa_upd(ProductionOrder)
-                       .where(ProductionOrder.id == order.id)
-                       .values(ms_doc_href=href, ms_doc_name=name))
-            db.commit()
-            saved = True
-        except Exception:
-            db.rollback()
-            _release_push_lock(db, order.id)
-        if not saved:
-            raise HTTPException(
-                status_code=502,
-                detail=(f"Документ в МойСкладе создан ({name or 'без номера'}), "
-                        "но сохранить ссылку на него не удалось. "
-                        "НЕ отправляйте заказ повторно — откройте документ "
-                        "по ссылке и при необходимости привяжите вручную."),
-                headers={"X-Oborot-Ms-Doc": href[:400]},
-            )
     # Аудит 18.08: push_order переносит вклад заказа между qty и ms_qty
     # (а при черновике/частичном матче меняет и сумму «едет к нам») — без
     # инвалидации страницы 10 минут отдавали старый снапшот и потребность.

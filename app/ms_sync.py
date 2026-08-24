@@ -62,13 +62,14 @@ from datetime import date, datetime, timedelta
 
 from sqlalchemy import delete, func, insert, inspect, or_, select, update
 
-from app import analytics, exclusions, logging_conf
+from app import analytics, exclusions, logging_conf, ms_writeback
 from app.crypto import decrypt_token
 from app.db import SessionLocal, engine, run_migration_step
 from app.models import (
     Connection,
     OrderedQty,
     Product,
+    ProductionOrder,
     Sale,
     StockDay,
     SyncState,
@@ -1896,6 +1897,104 @@ def _oborot_order_id(doc: dict, our_docs: dict[int, str]) -> int | None:
     return order_id
 
 
+def _backmatch_by_sync_id(org_id: int, docs: list[dict],
+                          our_docs: dict[int, str], stats: dict) -> None:
+    """Связывает документ МС с заказом «Оборота» по нашему ключу идемпотентности.
+
+    Зачем это вообще нужно. Отправка заказа поставщику может закончиться
+    ЧЕСТНЫМ unknown: документ в МойСкладе создан, а записать это у себя не
+    удалось (см. ms_writeback.commit_push). Тогда одно и то же едет дважды:
+    локальный вклад заказа остаётся в ordered_qty.qty, а документ МС ложится
+    в ms_qty. Само это не рассасывается — при следующей рекомендации бренд
+    видит вдвое больше товара «в пути», чем едет на самом деле, и не заказывает
+    то, что нужно. Отдельный ночной job для этого не нужен: синк заказов
+    поставщику и так проходит ровно по тем документам, среди которых лежит наш.
+
+    Почему связывать по syncId безопасно, а по метке — нет. syncId мы сами
+    породили uuid4 и закоммитили ДО сети; он живёт в служебном поле, а не в
+    описании, которое человек правит и копирует вместе с документом. Плюс два
+    условия сверх этого:
+      • ключ должен принадлежать заказу ЭТОЙ организации;
+      • документ с таким ключом должен быть в выборке РОВНО ОДИН. Контракт
+        JSON API 1.2 обещает уникальность syncId, но обещание чужой системы —
+        не повод связывать вслепую: два совпадения означают, что реальность
+        разошлась с контрактом, и угадывать здесь запрещено.
+
+    D-28 этим НЕ ослабляется. Правило принадлежности (`_is_oborot_doc`)
+    осталось прежним и проверяет всё те же три признака; back-match лишь
+    восстанавливает ОДИН из них — нашу собственную ссылку, которую мы потеряли
+    по своей вине. Документ, у которого метка чужая или скопированная,
+    tracked не станет: ссылка совпадёт, а маркер — нет.
+    """
+    by_sync: dict[str, list[dict]] = {}
+    for doc in docs:
+        key = str(doc.get("syncId") or "")
+        if key:
+            by_sync.setdefault(key, []).append(doc)
+    unique = {k: v[0] for k, v in by_sync.items() if len(v) == 1}
+    ambiguous = len(by_sync) - len(unique)
+    if ambiguous:
+        stats["incoming_backmatch_ambiguous"] = ambiguous
+    if not unique:
+        return
+
+    db = SessionLocal()
+    linked = 0
+    try:
+        rows = db.execute(
+            select(ProductionOrder).where(
+                ProductionOrder.org_id == org_id,
+                ProductionOrder.ms_sync_id.in_(list(unique)),
+            )
+        ).scalars().all()
+        for order in rows:
+            if ms_writeback.is_pushed(order.ms_doc_href):
+                continue  # ссылка уже сохранена — связывать нечего
+            doc = unique.get(str(order.ms_sync_id or ""))
+            if doc is None:
+                continue
+            href = ((doc.get("meta") or {}).get("href")) or ""
+            if not href:
+                continue
+            pushed_by_base = {
+                base: qty for base, qty in _order_bases(order).items() if qty > 0
+            }
+            order.ms_doc_href = href
+            order.ms_doc_name = str(doc.get("name") or "")
+            order.ms_lookup_mode = ms_writeback.LOOKUP_SYNC
+            # Тот же T2, что и при отправке: ссылка и перенос вклада — вместе.
+            # Прибавка к ms_qty здесь живёт до конца этого же синка (ниже он
+            # пересобирает вклад МС начисто), а вот СНЯТИЕ локального qty —
+            # ради него всё и делается.
+            ms_writeback._move_incoming_to_ms(db, org_id, order, pushed_by_base)
+            linked += 1
+            our_docs[int(order.id)] = href
+        if linked:
+            db.commit()
+    except Exception:  # noqa: BLE001 — связывание не должно ронять синк целиком
+        db.rollback()
+        log.exception("backmatch: не удалось связать документы org=%s", org_id)
+        linked = 0
+    finally:
+        db.close()
+    if linked:
+        stats["incoming_backmatched"] = linked
+
+
+def _order_bases(order) -> dict[str, int]:
+    """{base_name: количество} по позициям заказа — как их считает отправка."""
+    out: dict[str, int] = {}
+    for item in order.items:
+        base = str(item.get("base_name") or "")
+        if not base:
+            continue
+        sizes = item.get("sizes") or {}
+        qty = sum(int(q or 0) for q in sizes.values()) or int(item.get("qty") or 0)
+        if qty > 0:
+            out[base] = out.get(base, 0) + qty
+    return out
+
+
 async def _sync_incoming(org_id: int, client: MoySkladClient,
                          ext_to_pid: dict[str, int], stats: dict,
                          progress: tuple[float, float] = (95.5, 97.0)) -> None:
@@ -1932,8 +2031,6 @@ async def _sync_incoming(org_id: int, client: MoySkladClient,
     заполняется ли оно у конкретного клиента, зависит, возможен ли
     автоматический учёт исполнения вообще (шаг 0 модели исполнения).
     """
-    from app.models import ProductionOrder
-
     _set_state(org_id, stage="incoming", progress=progress[0],
                detail="Загружаем заказы поставщику («едет к нам»)…")
     # Окно заказов поставщику — ГОД (INCOMING_ORDERS_DAYS), не окно истории:
@@ -1966,6 +2063,11 @@ async def _sync_incoming(org_id: int, client: MoySkladClient,
         }
     finally:
         db.close()
+
+    # Отправки, закончившиеся честным unknown: документ есть, ссылки у нас
+    # нет. Связываем до основного цикла, чтобы такой документ уже в ЭТОМ
+    # синке считался нашим, а не ещё сутки числился чужим.
+    _backmatch_by_sync_id(org_id, docs, our_docs, stats)
 
     incoming: dict[str, float] = {}
     incoming_tracked: dict[str, float] = {}

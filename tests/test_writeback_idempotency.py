@@ -243,12 +243,18 @@ def sized_bases() -> list:
         return _BASES
     con = sqlite3.connect(DB_PATH)
     try:
-        rows = con.execute("SELECT base_name, size FROM products "
+        rows = con.execute("SELECT base_name, size, ext_id FROM products "
                            "WHERE ext_id != '' ORDER BY base_name, size").fetchall()
     finally:
         con.close()
     grouped: dict = {}
-    for base, size in rows:
+    for base, size, ext in rows:
+        # Родительский product вариантной модели тоже приезжает в ассортименте,
+        # но заказать его нельзя (МойСклад принимает только вариант) — мок
+        # отвечает на такую позицию 412. В заказ берём только то, что реально
+        # существует как складская позиция.
+        if ext not in mock_ms.SKU_BY_EXT:
+            continue
         grouped.setdefault(base, []).append(size)
     _BASES.extend(sorted(grouped.items()))
     return _BASES
@@ -397,7 +403,8 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
     print("\n== 3. Новый заказ с переиспользованным rowid ==")
     o3 = make_order(c, "Заказ, который потом удалят")
     r = push(c, o3)
-    check("заказ отправлен", r.status_code == 200, f"status={r.status_code}")
+    check("заказ отправлен", r.status_code == 200,
+          f"status={r.status_code} {r.text[:200]}")
     old_href = col_of(o3, "ms_doc_href")
     before = len(docs_created())
     err = exec_sql("DELETE FROM production_orders WHERE id=?", o3)
@@ -571,7 +578,10 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
     def _push(order_id: int):
         with httpx.Client(headers=dict(c.headers), cookies=c.cookies,
                           base_url=base, timeout=120.0) as cc:
-            agent_res.append(cc.post(f"/api/orders/{order_id}/push-to-ms").status_code)
+            rr = cc.post(f"/api/orders/{order_id}/push-to-ms")
+            agent_res.append(rr.status_code)
+            if rr.status_code != 200:
+                print(f"       (агент {order_id}: {rr.status_code} {rr.text[:200]})")
 
     threads = [threading.Thread(target=_push, args=(oid,)) for oid in (o8a, o8b)]
     for t in threads:

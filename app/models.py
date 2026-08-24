@@ -221,6 +221,19 @@ class Connection(Base):
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")  # active|error|pending
     config_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
     last_sync_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Стабильная привязка контрагента-производства (DATA-2). Заказ поставщику
+    # уходит на конкретного агента, и «найти по имени, а если нет — создать»
+    # ломается двумя способами сразу: два одновременных клика создают ДВУХ
+    # агентов, а два одноимённых агента заставляют выбрать первого попавшегося
+    # — то есть отправить финансовый документ наугад. Поэтому у организации
+    # есть собственный uuid4 (уходит в syncId контрагента, делает создание
+    # идемпотентным) и закреплённая ссылка на выбранного агента.
+    ms_agent_sync_id: Mapped[str] = mapped_column(
+        String(36), nullable=False, default="", server_default=""
+    )
+    ms_agent_href: Mapped[str] = mapped_column(
+        String(512), nullable=False, default="", server_default=""
+    )
 
 
 class Warehouse(Base):
@@ -619,6 +632,36 @@ class ProductionOrder(Base):
     )
     ms_doc_name: Mapped[str] = mapped_column(
         String(255), nullable=False, default="", server_default=""
+    )
+    # Ключ идемпотентности отправки (DATA-1). Стабильный uuid4, который
+    # рождается и КОММИТИТСЯ ДО единственного сетевого вызова и уходит в
+    # МойСклад полем `syncId`. Повторная отправка с тем же ключом обновляет
+    # уже созданный документ вместо создания второго — это единственная
+    # защита от дубля финансового документа, которая переживает и потерянный
+    # ответ, и правку описания человеком.
+    #
+    # Почему uuid4, а не uuid5 от id заказа: id — это rowid SQLite, он
+    # переиспользуется после удаления строки, и производный от него ключ
+    # связал бы НОВЫЙ заказ с документом СТАРОГО.
+    ms_sync_id: Mapped[str] = mapped_column(
+        String(36), nullable=False, default="", server_default=""
+    )
+    # Явный дискриминатор способа поиска «своего» документа (DATA-1):
+    #   'sync'   — новый протокол: документ ищется ТОЛЬКО по ms_sync_id;
+    #   'legacy' — строка существовала до этой правки: её документ мог быть
+    #              создан старым кодом, у него нет syncId, и единственный
+    #              след — метка [oborot#N] в описании, поэтому поиск по
+    #              метке ей ещё разрешён;
+    #   ''       — строку вставил процесс со старым кодом уже после ALTER
+    #              TABLE: это тоже legacy, и миграция допишет ей 'legacy'.
+    #
+    # Признак ЯВНЫЙ и persistent намеренно. Правило «ищем по метке, если
+    # какое-то поле непусто» не работает: после T1 у нового заказа ключ уже
+    # непуст, и попытка, умершая ДО POST, при повторе снова уходила бы в
+    # поиск по метке — то есть могла бы усыновить чужой документ на
+    # переиспользованном rowid. См. tests/test_writeback_idempotency.py.
+    ms_lookup_mode: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="sync", server_default=""
     )
 
     # Даты переходов статуса (D-25). Раньше у заказа был только статус: когда

@@ -378,29 +378,85 @@ class MoySkladClient:
         """Юрлица аккаунта (entity/organization) — нужны для документов."""
         return [row async for row in self.paginate("/entity/organization")]
 
-    async def find_counterparty_by_name(self, name: str) -> dict | None:
-        """Контрагент по точному имени (filter=name=...); None, если не найден.
+    async def find_counterparties_by_name(self, name: str) -> list[dict]:
+        """ВСЕ контрагенты с точным именем (filter=name=...).
+
+        Возвращается список, а не первый попавшийся, намеренно: заказ
+        поставщику — финансовый документ, и при двух одноимённых агентах
+        выбор «любого» означает отправить его наугад. Решение (связать,
+        создать или отказаться) принимает вызывающий код.
 
         В фильтрах МойСклад точное совпадение по name — оператор `=`;
-        спецсимволы `;` и `=` в значении экранируются не нужны для наших имён.
+        спецсимволы `;` и `=` в значении экранировать не нужно для наших имён.
         """
         params = {"filter": f"name={name}"}
+        return [row async for row in self.paginate("/entity/counterparty", params)
+                if (row.get("name") or "").strip() == name]
+
+    async def find_counterparty_by_sync_id(self, sync_id: str) -> dict | None:
+        """Контрагент по НАШЕМУ ключу идемпотентности (filter=syncId=...).
+
+        Нужен ровно для одного случая: контрагента мы создали, а ответ до нас
+        не дошёл. Искать его по имени нельзя — одноимённых может быть много;
+        syncId же уникален в аккаунте, поэтому находка здесь однозначна.
+        """
+        if not sync_id:
+            return None
+        params = {"filter": f"syncId={sync_id}"}
         async for row in self.paginate("/entity/counterparty", params):
-            if (row.get("name") or "").strip() == name:
+            if str(row.get("syncId") or "") == sync_id:
                 return row
         return None
 
-    async def create_counterparty(self, name: str) -> dict:
-        """Создаёт контрагента (обязательное поле — только name)."""
-        return await self.post("/entity/counterparty", {"name": name})
+    async def create_counterparty(self, name: str, sync_id: str) -> dict:
+        """Создаёт контрагента идемпотентно: name + наш syncId.
+
+        syncId обязателен и здесь: без него два одновременных клика по
+        «Отправить в МойСклад» заводят клиенту ДВУХ агентов «Производство»,
+        и половина заказов уезжает не на того.
+        """
+        if not sync_id:
+            raise ValueError("create_counterparty без syncId запрещён")
+        return await self.post("/entity/counterparty",
+                               {"name": name, "syncId": sync_id})
+
+    async def find_purchase_orders_by_sync_id(self, sync_id: str) -> list[dict]:
+        """«Заказы поставщику» с нашим ключом идемпотентности.
+
+        Точный, дешёвый и НЕ зависящий от человека способ узнать, создан ли
+        уже наш документ: syncId живёт в служебном поле, а не в описании,
+        которое владелец может переписать или скопировать в другой документ.
+        Окно по дате не нужно — фильтр точный.
+
+        Список, а не одна строка: по контракту JSON API 1.2 syncId уникален,
+        и два ответа означали бы, что реальность разошлась с контрактом.
+        Разбираться в этом молча (взяв первый) здесь нельзя.
+        """
+        if not sync_id:
+            return []
+        params: dict[str, Any] = {"filter": f"syncId={sync_id}"}
+        return [row async for row in self.paginate("/entity/purchaseorder", params)
+                if str(row.get("syncId") or "") == sync_id]
 
     async def create_purchase_order(self, payload: dict) -> dict:
         """Создаёт документ «Заказ поставщику» (entity/purchaseorder).
 
-        Обязательные поля payload: organization.meta, agent.meta;
+        Обязательные поля payload: organization.meta, agent.meta, syncId;
         positions: [{assortment: {meta}, quantity, price(копейки)}].
         Номер (name) МойСклад присвоит сам, если не передан.
+
+        syncId проверяется ЗДЕСЬ и без «мягкой» ветки. Это единственный
+        механизм, который делает создание финансового документа безопасным
+        при потерянном ответе: повторный POST с занятым syncId обновляет уже
+        созданный документ, а не заводит второй. Молчаливый фолбэк «нет
+        ключа — отправим динамически» вернул бы ровно тот дубль, ради
+        которого всё и делается, причём незаметно для нас и для клиента.
         """
+        if not str(payload.get("syncId") or ""):
+            raise ValueError(
+                "create_purchase_order без syncId запрещён: ключ идемпотентности "
+                "обязан быть создан и закоммичен ДО сетевого вызова"
+            )
         return await self.post("/entity/purchaseorder", payload)
 
     # Старые имена (каркас демо-скоупа) — оставлены для совместимости.
