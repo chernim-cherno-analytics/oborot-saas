@@ -33,6 +33,24 @@ restic в наборе подставной: настоящий требует �
 что настоящий restic на настоящем sftp/s3 ведёт себя так же. Это проверяется
 только прогоном на сервере, и до него OPS-4 остаётся открытым.
 
+ПРИГОВОР И ПРОПУСК (D-42). Набор гоняет настоящие bash-скрипты, а те требуют
+`flock`, `sqlite3` и ещё горсть утилит. Нет их в машине — проверять нечем, и
+это надо СКАЗАТЬ, а не изобразить. Поэтому здесь ровно два исхода и ни одного
+третьего:
+
+  * инструменты на месте — набор выполняется и заканчивается каноническим
+    «ИТОГО: N OK, M FAIL». Прежний финал «OK: N   FAIL: M» раннер не читал
+    вовсе: 127 выполненных проверок получали приговор NO_REPORT, то есть
+    «набора не было»;
+  * инструментов нет — код возврата 77 И строка «ПРОПУЩЕНО: <какие именно
+    инструменты>» с начала строки. Локально это честный пропуск, в CI
+    (`--require-all`) — падение: на ubuntu все эти утилиты есть, и их
+    отсутствие там означало бы сломанный раннер, а не особенность машины.
+
+Третьего исхода нет намеренно. До preflight набор без `flock` не пропускался,
+а падал где придётся с трассировкой посреди сценария — то есть тоже
+NO_REPORT, только ещё и нечитаемый.
+
 Запуск из корня репозитория:  python tests/test_offsite.py
 """
 import os
@@ -276,7 +294,31 @@ class Env:
         return [ln for ln in self.log.read_text(encoding="utf-8").splitlines() if ln.strip()]
 
 
+# Утилиты, без которых оба скрипта офсайта проверять НЕЧЕМ. Список — не
+# догадка: `offsite_backup.sh` требует sqlite3 flock mktemp find sed tr,
+# `offsite_restore_drill.sh` — sqlite3 flock mktemp gzip stat, плюс сам bash,
+# которым тест их запускает. GNU-специфичных ключей ни один из них не
+# использует (`find -mindepth/-type/-name`, `stat -c` с откатом на `stat -f`),
+# поэтому проверяется наличие, а не происхождение утилиты.
+NEEDED_TOOLS = ("bash", "sqlite3", "flock", "mktemp", "find", "sed", "tr", "gzip", "stat")
+
+
+def missing_tools() -> list:
+    return [t for t in NEEDED_TOOLS if shutil.which(t) is None]
+
+
 def main() -> int:
+    absent = missing_tools()
+    if absent:
+        # Код 77 И причина одновременно (D-42). Причина называет ИМЕННО те
+        # утилиты, которых не хватает: «нет инструментов» неотличимо от
+        # «поленились посмотреть», а по имени видно, что доставить.
+        names = absent[0] if len(absent) == 1 else \
+            ", ".join(absent[:-1]) + " и " + absent[-1]
+        print(f"ПРОПУЩЕНО: в системе нет {names} — "
+              f"offsite_backup.sh и offsite_restore_drill.sh проверять нечем "
+              f"(на macOS: brew install util-linux)")
+        return 77
     if WORK.exists():
         shutil.rmtree(WORK)
     WORK.mkdir(parents=True)
@@ -830,7 +872,10 @@ def main() -> int:
     check("пароль нигде не напечатан", "не настоящий пароль" not in out)
 
     print("\n" + "=" * 62)
-    print(f"OK: {len(PASS)}   FAIL: {len(FAIL)}")
+    # Канонический финал (D-42): раннер читает ТОЛЬКО этот формат. Прежнее
+    # «OK: N   FAIL: M» он не понимал и выносил NO_REPORT — 127 выполненных
+    # проверок засчитывались как «набора не было».
+    print(f"ИТОГО: {len(PASS)} OK, {len(FAIL)} FAIL")
     if FAIL:
         for f in FAIL:
             print(f"  FAIL {f}")
