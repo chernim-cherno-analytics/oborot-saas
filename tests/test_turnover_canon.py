@@ -67,10 +67,23 @@ def main() -> int:
     def iso(days_ago: int) -> str:
         return (today - timedelta(days=days_ago)).isoformat()
 
-    # Сток: 15 последних дней; дни 5..7 назад — остаток 0 (вещи не было),
-    # остальные 12 дней — остаток 5 (>= порога 3).
-    out_of_stock = {5, 6, 7}
-    for d in range(15):
+    def season_of(days_ago: int) -> str:
+        m = (today - timedelta(days=days_ago)).month
+        return {12: "winter", 1: "winter", 2: "winter",
+                3: "spring", 4: "spring", 5: "spring",
+                6: "summer", 7: "summer", 8: "summer"}.get(m, "autumn")
+
+    # Блок из 15 дат целиком внутри ОДНОГО сезона (иначе сезонные проверки
+    # ниже зависят от календаря запуска). k <= 14 — сдвиг от сегодня.
+    k = 0
+    while len({season_of(k + i) for i in range(15)}) > 1:
+        k += 1
+    test_season = season_of(k)
+
+    # Сток: 15 дат блока; дни k+5..k+7 — остаток 0 (вещи не было),
+    # остальные 12 — остаток 5 (>= порога 3).
+    out_of_stock = {k + 5, k + 6, k + 7}
+    for d in range(k, k + 15):
         db.add(StockDay(org_id=org.id, product_id=prod.id, date=iso(d),
                         qty=0.0 if d in out_of_stock else 5.0))
     # Древний сток вне окна канона (2 года): не должен попасть в dis.
@@ -78,15 +91,15 @@ def main() -> int:
                    analytics.TURNOVER_WINDOW_DAYS + 10):
         db.add(StockDay(org_id=org.id, product_id=prod.id, date=iso(d), qty=5.0))
 
-    # Продажи: 1000 ₽/шт в каждый из 15 дней (включая дни отсутствия),
+    # Продажи: 1000 ₽/шт в каждую из 15 дат блока (включая дни отсутствия),
     # плюс продажа в древнюю эру (вне окна) и один возврат в день «в стоке».
-    for d in range(15):
+    for d in range(k, k + 15):
         db.add(Sale(org_id=org.id, product_id=prod.id, date=iso(d),
                     qty=1, revenue=1000, is_return=False))
     db.add(Sale(org_id=org.id, product_id=prod.id,
                 date=iso(analytics.TURNOVER_WINDOW_DAYS + 6),
                 qty=1, revenue=1000, is_return=False))
-    db.add(Sale(org_id=org.id, product_id=prod.id, date=iso(1),
+    db.add(Sale(org_id=org.id, product_id=prod.id, date=iso(k + 1),
                 qty=1, revenue=1000, is_return=True))
     db.commit()
 
@@ -101,7 +114,7 @@ def main() -> int:
           it["dis365"] == 12, f"dis365={it['dis365']}")
 
     print("== Канон: числитель выровнен со знаменателем ==")
-    # В стоке 12 дней; в день iso(1) продажа 1000 и возврат 1000 → нетто 0.
+    # В стоке 12 дней; в день iso(k+1) продажа 1000 и возврат 1000 → нетто 0.
     # nris = 12×1000 − 1000(возврат) = 11000; продажи дней отсутствия (3×1000)
     # и древняя продажа в числитель не входят.
     check("nris — нетто-продажи только дней «в стоке»",
@@ -111,9 +124,21 @@ def main() -> int:
     check("оборачиваемость = nris/dis, округлённая",
           it["turnover"] == round(11000 / 12), f"turnover={it['turnover']}")
 
+    print("== Сезонная оборачиваемость выровнена так же ==")
+    # Все даты блока — один сезон: сезонный ₽/день обязан совпасть с
+    # turnover (тот же выровненный числитель ÷ те же дни), а не быть выше
+    # него за счёт продаж дней «не в стоке».
+    sea = it.get("sea") or {}
+    check("сезонный ₽/день = nris/dis (числитель сезона тоже выровнен)",
+          sea.get(test_season) == round(11000 / 12),
+          f"sea[{test_season}]={sea.get(test_season)}")
+    check("в остальных сезонах продаж нет (0 или сезон не покрыт)",
+          all(not v for s_, v in sea.items() if s_ != test_season),
+          f"sea={sea}")
+
     print("== Денежный слой остаётся годовым ==")
     # nq/nr за год: 15 продаж − 1 возврат = 14 шт / 14000 ₽ (древняя продажа
-    # старше года и не входит).
+    # старше года и не входит; блок дат k..k+14 всегда внутри года, k <= 14).
     check("nq за год (продажи минус возвраты, дни отсутствия входят)",
           abs(it["nq"] - 14) < 1e-6, f"nq={it['nq']}")
     check("nr за год", abs(it["nr"] - 14000) < 1e-6, f"nr={it['nr']}")
