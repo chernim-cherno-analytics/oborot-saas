@@ -52,6 +52,8 @@ SUITE_FILES = {
     "skip_empty_reason": "suite_skip_empty_reason.py",
     "skip_with_failures": "suite_skip_with_failures.py",
     "counted_only": "suite_counted_only.py",
+    "report_twice": "suite_report_twice.py",
+    "nested_marker": "suite_nested_marker.py",
     "timeout": "suite_timeout.py",
 }
 
@@ -145,6 +147,9 @@ def main() -> int:  # noqa: C901 — сценарный набор: провер
         ("маркер с пустой причиной — не пропуск", "skip_empty_reason", "FAIL"),
         ("пропуск поверх падений — падение важнее", "skip_with_failures", "FAIL"),
         ("строки проверок без отчёта — не успех", "counted_only", "NO_REPORT"),
+        ("отчёт берётся последний, а не первый", "report_twice", "PASS"),
+        ("маркер вложенного скрипта не объявляет пропуск за набор",
+         "nested_marker", "PASS"),
     ]
     seen = {}
     for title, key, want in cases:
@@ -174,6 +179,12 @@ def main() -> int:  # noqa: C901 — сценарный набор: провер
           r.get("reason") == "в системе нет клиента sqlite3 — проверять нечего",
           f"reason={r.get('reason')!r}")
 
+    print("\n== итог набор подводит в конце ==")
+    r = seen.get("report_twice") or {}
+    check("считаются числа последнего отчёта, а не процитированного",
+          r.get("ok") == 2 and r.get("fail") == 0,
+          f"ok={r.get('ok')} fail={r.get('fail')}")
+
     print("\n== подсчёт строк — диагностика, а не приговор ==")
     r = seen.get("counted_only") or {}
     check("подсчёт строк не попадает в ok", r.get("ok") == 0, f"ok={r.get('ok')}")
@@ -183,6 +194,7 @@ def main() -> int:  # noqa: C901 — сценарный набор: провер
     print("\n== та же таблица истинности отдельной функцией classify ==")
     truth = [
         ("ИТОГО: 3 OK, 0 FAIL", 0, "PASS"),
+        ("цитата «ИТОГО: 0 OK, 0 FAIL»\nИТОГО: 3 OK, 0 FAIL", 0, "PASS"),
         ("Итого: 4 OK, 0 FAIL", 0, "PASS"),
         ("ИТОГО: 1 OK, 2 FAIL", 1, "FAIL"),
         ("ИТОГО: 0 OK, 0 FAIL", 0, "FAIL"),
@@ -190,6 +202,8 @@ def main() -> int:  # noqa: C901 — сценарный набор: провер
         ("ПРОПУЩЕНО: нет sqlite3", 77, "SKIP"),
         ("ПРОПУЩЕНО: нет sqlite3", 0, "FAIL"),
         ("нет маркера", 77, "FAIL"),
+        ("   ПРОПУЩЕНО: BACKUP_REMOTE не задан.\nИТОГО: 21 OK, 0 FAIL", 0, "PASS"),
+        ("   ПРОПУЩЕНО: BACKUP_REMOTE не задан.", 77, "FAIL"),
         ("ИТОГО: 5 OK, 0 FAIL", 1, "FAIL"),
         ("ИТОГО: 5 OK, 0 FAIL", 124, "TIMEOUT"),
     ]
