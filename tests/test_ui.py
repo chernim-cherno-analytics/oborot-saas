@@ -29,7 +29,13 @@ HTML» такое не ловит — ловит только запуск ст�
   8) на страницах нет ошибок в консоли.
 
 Запуск из корня репозитория:  python tests/test_ui.py
-(нужен Chromium: PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers)
+
+Нужен Chromium под playwright: `pip install -r requirements-dev.lock` и
+`python -m playwright install chromium`. Каталог браузеров раньше был зашит
+здесь как `/opt/pw-browsers` — путь с машины, которой нет ни у CI, ни на
+macOS: playwright молча искал браузер не там, не находил и набор объявлял
+себя пропущенным. Теперь каталог не навязывается: не задан
+`PLAYWRIGHT_BROWSERS_PATH` — работает штатный кэш playwright.
 """
 import os
 import sys
@@ -45,7 +51,6 @@ APP_PORT = int(os.environ.get("OBOROT_TEST_PORT", "8816"))
 
 os.environ["DATABASE_URL"] = f"sqlite:///{DB_PATH}"
 os.environ["SCHEDULER_ENABLED"] = "0"
-os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "/opt/pw-browsers")
 
 if DB_PATH.exists():
     DB_PATH.unlink()
@@ -92,8 +97,13 @@ def main() -> int:
     try:
         from playwright.sync_api import sync_playwright  # noqa: F401
     except ImportError:
-        print("  SKIP  playwright не установлен — набор пропущен")
-        return 0
+        # Код 77 И причина — оба сигнала сразу, иначе раннер засчитает это
+        # падением (D-42). Раньше здесь стоял return 0, и набор, не открывший
+        # ни одной страницы, выглядел в CI зелёным.
+        print("ПРОПУЩЕНО: playwright не установлен — поставьте "
+              "requirements-dev.lock и выполните `python -m playwright "
+              "install chromium`")
+        return 77
     srv = ServerThread(oborot_app, APP_PORT)
     srv.start()
     try:
@@ -116,7 +126,16 @@ def run() -> int:  # noqa: C901 — сценарный тест: шагов мн
     check("демо-данные загружены", c.post("/api/connect/demo").status_code == 200)
 
     with sync_playwright() as pw:
-        browser = pw.chromium.launch()
+        try:
+            browser = pw.chromium.launch()
+        except Exception as exc:  # noqa: BLE001 — важно имя причины, а не тип
+            # Playwright есть, браузера нет. Это НЕ пропуск: набор обязателен,
+            # а окружение не готово — и сказать об этом надо отчётом, а не
+            # трассировкой, которую раннер прочитает как «нет отчёта».
+            check("Chromium запускается", False,
+                  str(exc).strip().splitlines()[0][:200])
+            print(f"\nИтого: {len(PASS)} OK, {len(FAIL)} FAIL")
+            return 1
         ctx = browser.new_context(viewport={"width": 1400, "height": 900})
         ctx.add_cookies([{"name": k, "value": v, "domain": "127.0.0.1", "path": "/"}
                          for k, v in c.cookies.items()])
