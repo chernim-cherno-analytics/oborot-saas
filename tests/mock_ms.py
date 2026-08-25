@@ -1011,7 +1011,12 @@ async def entity_by_syncid(entity: str, sync_id: str, request: Request):
                     row = {**row, "meta": {**row["meta"], "type": "product"}}
                 return row
     elif entity == "purchaseorder":
-        for doc in CREATED_PURCHASE_ORDERS:
+        # Оба списка, а не только созданные нами: живому API всё равно, кто
+        # завёл документ, и точечный маршрут обязан находить любой. Пока он
+        # смотрел лишь в CREATED_PURCHASE_ORDERS, подставные («чужие»)
+        # документы для него не существовали — и контртест на дубль по
+        # документам молча не проверял ту ветку, ради которой написан.
+        for doc in list(CREATED_PURCHASE_ORDERS) + list(PURCHASE_ORDERS):
             if str(doc.get("syncId") or "") == sync_id:
                 return doc
     raise HTTPException(status_code=404, detail={"errors": [
