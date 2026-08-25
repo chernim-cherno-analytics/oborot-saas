@@ -1,0 +1,22 @@
+[Unit]
+Description=Оборот: зашифрованная копия базы вне сервера
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/oborot/app-src
+ExecStart=/bin/bash /opt/oborot/app-src/deploy/offsite_backup.sh
+# Пароль и адрес хранилища читает сам скрипт из /opt/oborot/backup.env.
+# В юните их нет намеренно: systemd показывает окружение юнита кому угодно
+# через `systemctl show`, а права на backup.env — 600.
+Nice=10
+IOSchedulingClass=idle
+# Без этой строки юнит живёт с DefaultTimeoutStartSec (обычно 90 секунд):
+# systemd убил бы бэкап посреди загрузки, а в журнале осталось бы «timeout» —
+# то есть копии нет, и понять почему можно только вручную. Загрузка идёт на
+# медленный канал и включает проверку хранилища; два часа — это «долго, но
+# правдоподобно», а не «навсегда»: зависший бэкап тоже должен когда-то умереть,
+# иначе он не даст запуститься следующему (общий flock).
+TimeoutStartSec=2h

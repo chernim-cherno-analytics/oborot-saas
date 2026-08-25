@@ -519,8 +519,11 @@ def _seasonal_rates(
         w[0] += float(nq_w.get(base) or 0)
         w[1] += float(dis_w.get(base) or 0)
         y = cat_y.setdefault(cat, [0.0, 0.0])
+        # Годовая база индекса: nq — годовой (денежный слой), а вот дни в
+        # стоке берём ГОДОВЫЕ (dis365): item.dis с ревизии 23.08 (D-35) — окно
+        # канона оборачиваемости (2 года), годовым знаменателем он не является.
         y[0] += float(it.get("nq") or 0)
-        y[1] += float(it.get("dis") or 0)
+        y[1] += float(it.get("dis365") or 0)
     cat_index: dict[str, float] = {}
     for cat, (nq_win, dis_win) in cat_w.items():
         nq_year, dis_year = cat_y.get(cat, (0.0, 0.0))
