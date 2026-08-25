@@ -83,6 +83,7 @@ merge gate (см. TECH_DEBT, DATA-1/DATA-2).
 import asyncio
 import contextlib
 import io
+import json
 import os
 import sqlite3
 import sys
@@ -179,6 +180,15 @@ def exec_sql(query: str, *args) -> str:
         return ""
     except sqlite3.OperationalError as exc:
         return str(exc)
+    finally:
+        con.close()
+
+
+def exec_sql_read(query: str, *args) -> list:
+    """Чтение из той же базы, что и приложение, — списком кортежей."""
+    con = sqlite3.connect(DB_PATH)
+    try:
+        return list(con.execute(query, args).fetchall())
     finally:
         con.close()
 
@@ -2533,6 +2543,193 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
     finally:
         _msc22.MAX_RETRIES = retries22
         mock_api.post("/__test/faults", json={})
+
+    # ── 23. Гонка back-match и T2: вклад не переносится дважды ──────────────
+    #
+    # Ревью Codex, P1 (discussion_r3856604240). _backmatch_by_sync_id был
+    # устроен как read-then-write: SELECT грузил заказы, is_pushed проверялся
+    # по УЖЕ ПРОЧИТАННОМУ значению, дальше шли прямые ORM-присваивания и
+    # БЕЗУСЛОВНЫЙ _move_incoming_to_ms. Параллельная отправка делает свой T2
+    # (_commit_push_once) с CAS'ом по точному токену и тем же переносом —
+    # успей она между чтением и коммитом, вклад переносится ВТОРОЙ раз.
+    #
+    # И это порча данных, а не лишняя арифметика: в _move_incoming_to_ms
+    # стоит `qty = max(0.0, qty - ...)`. Clamp не защищает, а ПРЯЧЕТ — второе
+    # вычитание молча съедает вклад ДРУГОГО отправленного заказа с тем же
+    # base_name. Два заказа по 10: T2 честно делает 20 → 10, поздний
+    # backmatch делает 10 → 0, и второй заказ перестаёт считаться «едет к
+    # нам», никуда не делавшись.
+    #
+    # Гонка воспроизводится ШВОМ В КОДЕ, а не паузами: между чтением и
+    # записью backmatch зовёт _order_bases, и на этом месте подставляется
+    # обёртка, которая из ОТДЕЛЬНОЙ сессии проводит настоящий T2-победитель.
+    # Порядок событий один и тот же на любой машине — ни одного sleep.
+    print("\n== 23. Гонка back-match и T2: перенос вклада ровно один раз ==")
+    from app import ms_sync as _ms_sync  # noqa: PLC0415
+
+    RACE_BASE = "База гонки 23"
+
+    def _setup_race(tag: str, marker: str) -> tuple:
+        """Два отправленных заказа по 10 одного base: qty ровно 20."""
+        a, b = make_order(c, f"Гонка {tag} A"), make_order(c, f"Гонка {tag} Б")
+        items = json.dumps([{"base_name": RACE_BASE, "qty": 10,
+                             "sizes": {"S": 10}, "cost": 100}],
+                           ensure_ascii=False)
+        key = str(uuid.uuid4())
+        for oid, href in ((a, marker), (b, "")):
+            # Колонка называется items_json, а `items` — питоновское свойство
+            # только для чтения. Ошибку exec_sql проверяем: молча промахнуться
+            # мимо имени колонки значит получить холостой контртест, который
+            # зеленеет, ничего не проверив.
+            err = exec_sql(
+                "UPDATE production_orders SET items_json=?, status='sent', "
+                "ms_lookup_mode='sync', ms_doc_href=?, ms_sync_id=? "
+                "WHERE id=?", items, href,
+                key if oid == a else str(uuid.uuid4()), oid)
+            assert err == "", f"подготовка заказа {oid}: {err}"
+        assert exec_sql("DELETE FROM ordered_qty WHERE base_name=?",
+                        RACE_BASE) == ""
+        err = exec_sql(
+            "INSERT INTO ordered_qty (org_id, base_name, qty, ms_qty, "
+            "ms_qty_tracked) VALUES ((SELECT org_id FROM production_orders "
+            "WHERE id=?), ?, 20.0, 0.0, 0.0)", a, RACE_BASE)
+        assert err == "", f"подготовка ordered_qty: {err}"
+        return a, b, key
+
+    def _race_qty() -> tuple:
+        row = exec_sql_read(
+            "SELECT qty, ms_qty FROM ordered_qty WHERE base_name=?", RACE_BASE)
+        return (float(row[0][0]), float(row[0][1])) if row else (None, None)
+
+    def _doc_for(key: str, doc_id: str) -> list:
+        return [{"id": doc_id, "name": doc_id.upper(), "syncId": key,
+                 "meta": {"href": f"{mock_ms.BASE}/entity/purchaseorder/{doc_id}",
+                          "type": "purchaseorder"}}]
+
+    # 23а. ГЛАВНЫЙ: backmatch прочитал заказ в состоянии unknown, а T2 успел.
+    marker23 = f"{ms_writeback.UNKNOWN_PREFIX}{int(time.time())}"
+    a23, b23, key23 = _setup_race("unknown", marker23)
+    check("исходно: два отправленных заказа по 10 дают qty 20",
+          _race_qty() == (20.0, 0.0), f"qty={_race_qty()}")
+
+    WINNER_HREF = f"{mock_ms.BASE}/entity/purchaseorder/po-race-winner"
+    raced: list = []
+    original_bases = _ms_sync._order_bases
+
+    def _bases_with_race(order):
+        """Шов: T2-победитель выполняется МЕЖДУ чтением и записью backmatch."""
+        result = original_bases(order)
+        if not raced and int(getattr(order, "id", 0)) == a23:
+            raced.append(True)
+            db_w = SessionLocal()
+            try:
+                org_w = int(db_w.get(_PO, a23).org_id)
+                pend_w = f"{ms_writeback.PENDING_PREFIX}{int(time.time())}"
+                got = ms_writeback.begin_push(db_w, org_w, a23, marker23, pend_w)
+                assert got, "T2-победитель не смог захватить лок"
+                res = ms_writeback._commit_push_once(
+                    db_w, org_w, db_w.get(_PO, a23), WINNER_HREF, "ПОБЕДИТЕЛЬ",
+                    {RACE_BASE: 10}, pend_w)
+                assert res is True, f"T2-победитель не записал ссылку: {res!r}"
+            finally:
+                db_w.close()
+        return result
+
+    _ms_sync._order_bases = _bases_with_race
+    try:
+        stats23: dict = {}
+        our23: dict = {}
+        _ms_sync._backmatch_by_sync_id(
+            int(exec_sql_read("SELECT org_id FROM production_orders WHERE id=?",
+                              a23)[0][0]),
+            _doc_for(key23, "po-race-late"), our23, stats23)
+    finally:
+        _ms_sync._order_bases = original_bases
+
+    check("шов сработал: T2-победитель прошёл между чтением и записью",
+          bool(raced), f"raced={raced}")
+    qty_after, ms_after = _race_qty()
+    check("ВКЛАД ПЕРЕНЕСЁН РОВНО ОДИН РАЗ: qty ровно 10, а не 0",
+          qty_after == 10.0,
+          f"qty={qty_after} (20 → 10 сделал T2; 0 означало бы, что backmatch "
+          f"вычел второй раз и съел вклад второго заказа)")
+    check("…и вклад ВТОРОГО заказа цел",
+          qty_after == 10.0 and order_exists(b23), f"qty={qty_after}")
+    check("…и ms_qty прибавлен ровно один раз", ms_after == 10.0,
+          f"ms_qty={ms_after}")
+    check("ССЫЛКА ПОБЕДИТЕЛЯ СОХРАНЕНА (backmatch не перезаписал)",
+          col_of(a23, "ms_doc_href") == WINNER_HREF,
+          f"ms_doc_href={col_of(a23, 'ms_doc_href')!r}")
+    check("…и проигравший backmatch не заявил заказ своим",
+          a23 not in our23 and not stats23.get("incoming_backmatched"),
+          f"our_docs={list(our23)} stats={stats23}")
+
+    # 23б. ПОЛОЖИТЕЛЬНЫЙ КОНТРОЛЬ: без конкурента backmatch выигрывает и
+    #      двигает РОВНО один раз. Без него «никогда не двигать» удовлетворяло
+    #      бы проверке выше, а back-match перестал бы лечить unknown вообще.
+    marker23b = f"{ms_writeback.UNKNOWN_PREFIX}{int(time.time())}"
+    a23b, b23b, key23b = _setup_race("победа", marker23b)
+    org23b = int(exec_sql_read("SELECT org_id FROM production_orders WHERE id=?",
+                               a23b)[0][0])
+    stats23b: dict = {}
+    our23b: dict = {}
+    _ms_sync._backmatch_by_sync_id(org23b, _doc_for(key23b, "po-race-win"),
+                                   our23b, stats23b)
+    qty_b, ms_b = _race_qty()
+    check("БЕЗ КОНКУРЕНТА backmatch связал заказ",
+          str(col_of(a23b, "ms_doc_href") or "").endswith("po-race-win"),
+          f"ms_doc_href={col_of(a23b, 'ms_doc_href')!r}")
+    check("…и перенёс вклад РОВНО ОДИН раз (20 → 10)", qty_b == 10.0,
+          f"qty={qty_b}")
+    check("…и заявил заказ своим", our23b.get(a23b) is not None
+          and stats23b.get("incoming_backmatched") == 1,
+          f"our_docs={list(our23b)} stats={stats23b}")
+
+    # 23в. Повторный backmatch по тому же документу уже НЕ двигает: заказ
+    #      связан, is_pushed истинно. Проверка того, что выигрыш одноразовый.
+    _ms_sync._backmatch_by_sync_id(org23b, _doc_for(key23b, "po-race-win"),
+                                   {}, {})
+    check("ПОВТОРНЫЙ backmatch по связанному заказу не двигает вклад снова",
+          _race_qty()[0] == 10.0, f"qty={_race_qty()[0]}")
+
+    # 23г. Наблюдённое состояние — пустая строка (обычный неотправленный
+    #      заказ старого протокола). CAS обязан выигрывать и здесь.
+    a23c, b23c, key23c = _setup_race("пусто", "")
+    org23c = int(exec_sql_read("SELECT org_id FROM production_orders WHERE id=?",
+                               a23c)[0][0])
+    _ms_sync._backmatch_by_sync_id(org23c, _doc_for(key23c, "po-race-empty"),
+                                   {}, {})
+    check("CAS выигрывает и при наблюдённой ПУСТОЙ ссылке",
+          str(col_of(a23c, "ms_doc_href") or "").endswith("po-race-empty")
+          and _race_qty()[0] == 10.0,
+          f"ms_doc_href={col_of(a23c, 'ms_doc_href')!r} qty={_race_qty()[0]}")
+
+    # 23д. Обратный порядок: backmatch выиграл ПЕРВЫМ, а поздний T2 приходит
+    #      со своим прежним токеном. Он обязан проиграть свой CAS и НЕ
+    #      перенести вклад второй раз.
+    marker23d = f"{ms_writeback.PENDING_PREFIX}{int(time.time())}"
+    a23d, b23d, key23d = _setup_race("поздний T2", marker23d)
+    org23d = int(exec_sql_read("SELECT org_id FROM production_orders WHERE id=?",
+                               a23d)[0][0])
+    _ms_sync._backmatch_by_sync_id(org23d, _doc_for(key23d, "po-race-first"),
+                                   {}, {})
+    check("backmatch выиграл первым и перенёс вклад (20 → 10)",
+          _race_qty()[0] == 10.0, f"qty={_race_qty()[0]}")
+    db23 = SessionLocal()
+    try:
+        late = ms_writeback._commit_push_once(
+            db23, org23d, db23.get(_PO, a23d),
+            f"{mock_ms.BASE}/entity/purchaseorder/po-race-late-t2", "ПОЗДНИЙ",
+            {RACE_BASE: 10}, marker23d)
+    finally:
+        db23.close()
+    check("ПОЗДНИЙ T2 ПРОИГРАЛ свой CAS (лок уже не его)", late is None,
+          f"результат={late!r}")
+    check("…и вклад НЕ перенесён второй раз: qty по-прежнему 10",
+          _race_qty()[0] == 10.0, f"qty={_race_qty()[0]}")
+    check("…и ссылка осталась за победившим backmatch",
+          str(col_of(a23d, "ms_doc_href") or "").endswith("po-race-first"),
+          f"ms_doc_href={col_of(a23d, 'ms_doc_href')!r}")
 
     check("каждый POST заказа поставщику нёс syncId",
           all(d.get("syncId") for d in docs_created()),

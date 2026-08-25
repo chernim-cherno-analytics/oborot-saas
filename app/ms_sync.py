@@ -2182,7 +2182,11 @@ def _backmatch_by_sync_id(org_id: int, docs: list[dict],
             )
         ).scalars().all()
         for order in rows:
-            if ms_writeback.is_pushed(order.ms_doc_href):
+            # Значение, КОТОРОЕ МЫ НАБЛЮДАЛИ. Дальше оно становится условием
+            # записи, а не просто основанием для решения: между этим чтением и
+            # нашим коммитом помещается целый T2 параллельной отправки.
+            observed_href = str(order.ms_doc_href or "")
+            if ms_writeback.is_pushed(observed_href):
                 continue  # ссылка уже сохранена — связывать нечего
             doc = unique.get(str(order.ms_sync_id or ""))
             if doc is None:
@@ -2193,18 +2197,61 @@ def _backmatch_by_sync_id(org_id: int, docs: list[dict],
             pushed_by_base = {
                 base: qty for base, qty in _order_bases(order).items() if qty > 0
             }
-            order.ms_doc_href = href
-            order.ms_doc_name = str(doc.get("name") or "")
-            order.ms_lookup_mode = ms_writeback.LOOKUP_SYNC
-            # Тот же T2, что и при отправке: ссылка и перенос вклада — вместе.
-            # Прибавка к ms_qty здесь живёт до конца этого же синка (ниже он
-            # пересобирает вклад МС начисто), а вот СНЯТИЕ локального qty —
-            # ради него всё и делается.
-            # Заказ прочитан этой же транзакцией, поэтому его статус свежий —
-            # передаём явно (см. ms_writeback._move_incoming_to_ms).
+            # ЗАХВАТ ПРАВА СВЯЗАТЬ — условным UPDATE, а не присваиванием.
+            #
+            # Ревью Codex, P1 (discussion_r3856604240). Раньше здесь стояла
+            # последовательность «прочитали → проверили is_pushed по
+            # прочитанному → присвоили href → безусловно перенесли вклад».
+            # Параллельная отправка делает свой T2 (_commit_push_once) с
+            # CAS'ом по точному токену и тем же переносом. Успей она между
+            # нашим чтением и коммитом — вклад заказа переносится ВТОРОЙ раз.
+            #
+            # И это не «лишняя арифметика»: в _move_incoming_to_ms стоит
+            # `qty = max(0.0, qty - ...)`. Clamp не защищает, а ПРЯЧЕТ —
+            # второе вычитание не уходит в минус, оно молча съедает вклад
+            # ДРУГОГО отправленного заказа с тем же base_name. Два заказа по
+            # 10: T2 честно делает 20 → 10, поздний backmatch делает 10 → 0,
+            # и второй заказ перестаёт считаться «едет к нам», никуда не
+            # делавшись. Пользователь видит нехватку, которой нет.
+            #
+            # Условие захвата — ровно наблюдённое состояние: та же
+            # организация, тот же заказ, тот же ключ идемпотентности и
+            # ms_doc_href, РАВНЫЙ прочитанному. Изменилось что угодно из
+            # этого — rowcount=0, и мы не двигаем ничего.
+            #
+            # coalesce — ради строк, вставленных до появления колонки: у них
+            # ms_doc_href может быть NULL, а `NULL = ''` в SQL не истинно, и
+            # такие заказы молча выпали бы из-под связывания навсегда.
+            claimed = db.execute(
+                update(ProductionOrder)
+                .where(
+                    ProductionOrder.id == order.id,
+                    ProductionOrder.org_id == org_id,
+                    ProductionOrder.ms_sync_id == order.ms_sync_id,
+                    func.coalesce(ProductionOrder.ms_doc_href, "") == observed_href,
+                )
+                .values(ms_doc_href=href,
+                        ms_doc_name=str(doc.get("name") or ""),
+                        ms_lookup_mode=ms_writeback.LOOKUP_SYNC)
+                # Статус берётся из ТОЙ ЖЕ операции, что и запись ссылки, а не
+                # из ORM-объекта, прочитанного до окна: за это время заказ мог
+                # стать принятым, и «снимать ли локальный вклад» обязано
+                # решаться по состоянию внутри транзакции (тот же приём, что в
+                # ms_writeback._commit_push_once).
+                .returning(ProductionOrder.status)
+                .execution_options(synchronize_session=False)
+            ).fetchall()
+            if not claimed:
+                # Проиграли: кто-то уже связал этот заказ и уже перенёс вклад.
+                # Это нормальный исход, а не ошибка — повторять за ним нечего.
+                continue
+            # Тот же T2, что и при отправке: ссылка и перенос вклада — вместе,
+            # одной транзакцией. Прибавка к ms_qty живёт до конца этого же
+            # синка (ниже он пересобирает вклад МС начисто), а вот СНЯТИЕ
+            # локального qty — ради него всё и делается.
             ms_writeback._move_incoming_to_ms(
                 db, org_id, order, pushed_by_base,
-                was_sent=str(order.status or "") == "sent")
+                was_sent=str(claimed[0][0] or "") == "sent")
             linked += 1
             our_docs[int(order.id)] = href
         if linked:
