@@ -224,7 +224,7 @@ FILES, DONE_WHEN, RISKS, только релевантные ссылки и CUR
 ```
 FROM: Claude | Codex
 TO: Codex | Claude
-STATUS: PROPOSAL | QUESTION | READY_FOR_REVIEW | REVIEW_ACCEPT | BLOCKED | ACK
+STATUS: CLAIM | PROPOSAL | QUESTION | READY_FOR_REVIEW | REVIEW_ACCEPT | BLOCKED | ACK
 RELATED: PR, issue, commit или NONE
 SUMMARY: сообщение
 EVIDENCE: тесты, файлы, ссылки, наблюдения
