@@ -632,7 +632,8 @@ async def find_own_document(client, keys: PushKeys, marker: str, *,
 
 def _commit_push_once(db: Session, org_id: int, order: ProductionOrder,
                       href: str, name: str,
-                      pushed_by_base: dict[str, int]) -> bool | None:
+                      pushed_by_base: dict[str, int],
+                      pending_href: str) -> bool | None:
     """Одна попытка T2. True — записано, None — лок уже не наш, иначе исключение."""
     db.rollback()
     # RETURNING отдаёт статус ровно той строки, которую мы сейчас изменили, и
@@ -644,8 +645,18 @@ def _commit_push_once(db: Session, org_id: int, order: ProductionOrder,
         .where(
             ProductionOrder.id == order.id,
             ProductionOrder.org_id == org_id,
-            # CAS: пишем ссылку только поверх СВОЕЙ пометки «идёт отправка».
-            ProductionOrder.ms_doc_href.like(f"{PENDING_PREFIX}%"),
+            # CAS: пишем ссылку только поверх СВОЕЙ пометки «идёт отправка» —
+            # ровно того токена, который записал НАШ T1.
+            #
+            # Здесь стоял `LIKE pending:%`, и комментарий обещал «своей», а SQL
+            # обеспечивал «любой». Разница не косметическая: пометка живёт TTL,
+            # и по его истечении её законно перехватывает соседняя попытка.
+            # Попытка, вернувшаяся из сети позже своего TTL, проходила этот CAS
+            # поверх ЧУЖОЙ пометки и записывала свой href — то есть привязывала
+            # заказ к своему документу и снимала локальный вклад, пока законный
+            # владелец ещё был в сети. Равенство делает владение проверяемым
+            # (ревью Codex, раунд 3; воспроизведено на exact HEAD d7792fe0).
+            ProductionOrder.ms_doc_href == pending_href,
         )
         .values(ms_doc_href=href, ms_doc_name=name, ms_lookup_mode=LOOKUP_SYNC)
         .returning(ProductionOrder.status)
@@ -661,7 +672,7 @@ def _commit_push_once(db: Session, org_id: int, order: ProductionOrder,
 
 
 def commit_push(db: Session, org_id: int, order: ProductionOrder, doc: dict,
-                pushed_by_base: dict[str, int]) -> str:
+                pushed_by_base: dict[str, int], pending_href: str) -> str:
     """T2: ссылка на документ и перенос вклада «едет к нам» — либо оба, либо ни один.
 
     Раньше здесь был фолбэк «не вышло целиком — сохраним хотя бы ссылку».
@@ -674,12 +685,18 @@ def commit_push(db: Session, org_id: int, order: ProductionOrder, doc: dict,
     сорвалось снова — WritebackUnknown. Ключ идемпотентности при этом остаётся
     в строке, повтор отправки безопасен, а ближайший синк свяжет документ с
     заказом по syncId сам (см. app/ms_sync._backmatch_by_sync_id).
+
+    `pending_href` — точный токен, записанный НАШИМ T1. Он приходит снаружи, а
+    не выводится здесь из текущего значения строки: смысл проверки в том, чтобы
+    отличить свою пометку от чужой, а значение, прочитанное сейчас, чужим быть
+    как раз и может.
     """
     href = ((doc.get("meta") or {}).get("href")) or ""
     name = str(doc.get("name") or "")
     for attempt in range(2):
         try:
-            if _commit_push_once(db, org_id, order, href, name, pushed_by_base):
+            if _commit_push_once(db, org_id, order, href, name, pushed_by_base,
+                                 pending_href):
                 return href
             # Пометка «идёт отправка» уже не наша: пока мы ходили в сеть, лок
             # протух и его перехватила соседняя попытка. Она шла с ТЕМ ЖЕ
@@ -702,13 +719,18 @@ def commit_push(db: Session, org_id: int, order: ProductionOrder, doc: dict,
     raise WritebackUnknown(name, href)
 
 
-async def push_order(db: Session, org_id: int, order: ProductionOrder) -> dict:
+async def push_order(db: Session, org_id: int, order: ProductionOrder,
+                     pending_href: str) -> dict:
     """Создаёт «Заказ поставщику» в МойСклад из позиций заказа.
 
     Возвращает {ok, ms_doc_name, ms_doc_href, ms_doc_ui_url,
     positions_pushed, unmatched:[...]}. T1 (ключи + лок) обязан быть выполнен
     вызывающим ДО входа сюда; T2 (ссылка + перенос вклада) выполняется здесь
     одной транзакцией — см. commit_push.
+
+    `pending_href` — точный токен пометки, который вызывающий записал в T1.
+    Он проносится через всё сетевое окно и служит доказательством владения
+    локом в T2: за время окна лок мог протухнуть и достаться соседней попытке.
     """
     token = _get_ms_token(db, org_id)
     keys = load_push_keys(db, org_id, order.id)
@@ -821,7 +843,7 @@ async def push_order(db: Session, org_id: int, order: ProductionOrder) -> dict:
                 # Документ всё-таки создан — потерялся только ответ.
                 doc, recovered = found, True
 
-    href = commit_push(db, org_id, order, doc, pushed_by_base)
+    href = commit_push(db, org_id, order, doc, pushed_by_base, pending_href)
     return {
         "ok": True,
         "ms_doc_name": str(doc.get("name") or ""),

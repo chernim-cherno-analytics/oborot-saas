@@ -61,6 +61,19 @@ T2 — окна, в котором заказ ещё выглядит обычн
 РАЗЛИЧАТЬ исходы, а не сводиться к одному коду. Строки нет — 404; стала
 received — 422; идёт отправка — 409.
 
+Раунд 3 ревью Codex закрыл последнее место, где лок был не локом (блок 13).
+Пометка живёт TTL, и по его истечении её ЗАКОННО перехватывает соседняя
+попытка — иначе умерший воркер запирал бы заказ навсегда. Но обе снимающие
+операции сравнивали пометку образцом `LIKE pending:%`, то есть «любая», а не
+«моя»: старый владелец, вернувшийся из сети позже своего TTL, снимал лок
+нового либо коммитил T2 поверх него. Взаимного исключения не оставалось ровно
+там, где оно и нужно. Владение — свойство пары (строка, токен), поэтому токен
+T1 теперь проносится через всё сетевое окно и сравнивается равенством.
+
+Проверки владения детерминированы по построению: ни сети, ни пауз, ни потоков.
+Рядом с ними обязателен положительный контроль — «чужой токен ничего не
+делает» выполняется и у операции, сломанной в вечный no-op.
+
 Мок закрепляет ожидаемое поведение чужого API, но доказательством живого
 контракта НЕ является: живой тест `syncId` на боевом аккаунте — отдельный
 merge gate (см. TECH_DEBT, DATA-1/DATA-2).
@@ -1231,6 +1244,105 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
     r = c.post(f"/api/orders/{o15}/status", json={"status": "sent"})
     check("статусный переход по удалённому заказу — 404", r.status_code == 404,
           f"status={r.status_code} {r.text[:200]}")
+
+    # ── 13. Поздний старый владелец лока после законного takeover ───────────
+    #
+    # Ревью Codex, раунд 3, блокирующий дефект. Пометка «идёт отправка» живёт
+    # TTL (180 c), и по его истечении её ЗАКОННО перехватывает соседняя
+    # попытка — так и задумано: воркер, умерший между T1 и сетью, не должен
+    # запирать заказ навсегда. Но обе операции, которые снимают пометку,
+    # сравнивали её образцом `LIKE pending:%`, то есть «любая пометка», а не
+    # «моя». Отсюда interleaving, воспроизведённый на HEAD d7792fe0:
+    #
+    #   A захватила pending:t0 → провисела дольше TTL → B честно перехватила
+    #   CAS на pending:t1 → поздняя A либо СНИМАЕТ лок B (cleanup при сбое),
+    #   либо КОММИТИТ T2 поверх B (пишет свой href и переносит вклад).
+    #
+    # В первом случае в открытое окно входит третья попытка, пока B ещё в
+    # сети; во втором заказ привязывается к документу проигравшей попытки.
+    # Стабильный ms_sync_id спасает от второго документа НАРУЖУ, но владение
+    # локом у себя он не восстанавливает — это разные гарантии.
+    #
+    # Проверки ниже детерминированные по построению: ни сети, ни пауз, ни
+    # потоков. Владение — свойство пары (строка, токен), а не тайминга,
+    # поэтому и проверяется прямым вызовом на реальной базе.
+    #
+    # Положительный контроль обязателен и стоит рядом. Обе регрессии
+    # доказывают, что ЧУЖОЙ токен ничего не делает; без контроля их прошло бы
+    # и исправление, сломавшее операции насовсем, — «не делает ничего никогда»
+    # тоже удовлетворяет обеим.
+    print("\n== 13. Поздний старый владелец лока после takeover ==")
+    from app import routes_connect  # noqa: PLC0415 — прямой вызов T1/T2, не API
+    from app.db import SessionLocal  # noqa: PLC0415
+    from app.models import ProductionOrder as _PO  # noqa: PLC0415
+
+    o16 = make_order(c, "Заказ, чей лок перехватили после TTL")
+    db16 = SessionLocal()
+    try:
+        org16 = int(db16.get(_PO, o16).org_id)
+        # A: обычный T1 поверх пустого href. Токен намеренно из прошлого —
+        # ровно та ситуация, в которой takeover разрешён.
+        t_a = int(time.time()) - 10_000
+        pend_a = f"{ms_writeback.PENDING_PREFIX}{t_a}"
+        locked_a = ms_writeback.begin_push(db16, org16, o16, "", pend_a)
+        check("A захватила лок (T1)", locked_a and col_of(o16, "ms_doc_href") == pend_a,
+              f"locked={locked_a} ms_doc_href={col_of(o16, 'ms_doc_href')!r}")
+        key_a = str(col_of(o16, "ms_sync_id") or "")
+        # B: законный перехват протухшего лока — CAS по значению A.
+        pend_b = f"{ms_writeback.PENDING_PREFIX}{t_a + 5_000}"
+        locked_b = ms_writeback.begin_push(db16, org16, o16, pend_a, pend_b)
+        check("B законно перехватила протухший лок (CAS по значению A)",
+              locked_b and col_of(o16, "ms_doc_href") == pend_b,
+              f"locked={locked_b} ms_doc_href={col_of(o16, 'ms_doc_href')!r}")
+        check("ключ идемпотентности при перехвате НЕ пересоздан",
+              str(col_of(o16, "ms_sync_id") or "") == key_a and bool(key_a),
+              f"было={key_a!r} стало={col_of(o16, 'ms_sync_id')!r}")
+
+        # 13а. Регрессия: поздний cleanup A не трогает пометку B.
+        routes_connect._release_push_lock(db16, o16, pend_a)
+        check("ПОЗДНИЙ CLEANUP A НЕ СНЯЛ ЛОК B",
+              col_of(o16, "ms_doc_href") == pend_b,
+              f"ms_doc_href={col_of(o16, 'ms_doc_href')!r} ожидалось={pend_b!r}")
+
+        # 13б. Регрессия: поздний T2 A не коммитит поверх пометки B.
+        name_before = col_of(o16, "ms_doc_name")
+        res_a = ms_writeback._commit_push_once(
+            db16, org16, db16.get(_PO, o16),
+            "https://example.invalid/entity/purchaseorder/late-A", "A-late",
+            {}, pend_a)
+        check("ПОЗДНИЙ T2 A ОТКАЗАН (лок уже не его)", res_a is None,
+              f"результат={res_a!r}")
+        check("…и href B не перезаписан документом A",
+              col_of(o16, "ms_doc_href") == pend_b,
+              f"ms_doc_href={col_of(o16, 'ms_doc_href')!r} ожидалось={pend_b!r}")
+        check("…и имя документа не подменено",
+              col_of(o16, "ms_doc_name") == name_before,
+              f"было={name_before!r} стало={col_of(o16, 'ms_doc_name')!r}")
+
+        # 13в. Положительный контроль: законный владелец B своим токеном
+        #      доводит T2 до конца. Без него обе регрессии прошли бы и на
+        #      операциях, сломанных в «никогда ничего не делает».
+        href_b = "https://example.invalid/entity/purchaseorder/owner-B"
+        res_b = ms_writeback._commit_push_once(
+            db16, org16, db16.get(_PO, o16), href_b, "B-owner", {}, pend_b)
+        check("ЗАКОННЫЙ ВЛАДЕЛЕЦ B СВОИМ ТОКЕНОМ T2 ЗАВЕРШИЛ", res_b is True,
+              f"результат={res_b!r}")
+        check("…и ссылка записана именно его документа",
+              col_of(o16, "ms_doc_href") == href_b and col_of(o16, "ms_doc_name") == "B-owner",
+              f"ms_doc_href={col_of(o16, 'ms_doc_href')!r} "
+              f"ms_doc_name={col_of(o16, 'ms_doc_name')!r}")
+
+        # 13г. Положительный контроль для cleanup: свой токен лок снимает.
+        o17 = make_order(c, "Заказ, чью отправку снимает её же владелец")
+        pend_c = f"{ms_writeback.PENDING_PREFIX}{int(time.time())}"
+        locked_c = ms_writeback.begin_push(db16, org16, o17, "", pend_c)
+        check("владелец C захватил лок", locked_c, f"locked={locked_c}")
+        routes_connect._release_push_lock(db16, o17, pend_c)
+        check("CLEANUP СВОИМ ТОКЕНОМ ЛОК СНИМАЕТ (заказ снова отправляем)",
+              (col_of(o17, "ms_doc_href") or "") == "",
+              f"ms_doc_href={col_of(o17, 'ms_doc_href')!r}")
+    finally:
+        db16.close()
 
     check("каждый POST заказа поставщику нёс syncId",
           all(d.get("syncId") for d in docs_created()),
