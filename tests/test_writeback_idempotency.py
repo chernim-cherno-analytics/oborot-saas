@@ -615,9 +615,12 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
               "не создан" not in detail6, f"detail={detail6[:220]}")
         check("документ в МойСкладе всё же создан", len(docs_created()) == before6 + 1,
               f"было={before6} стало={len(docs_created())}")
-        check("ссылка НЕ сохранена (T2 откатился целиком)",
-              (col_of(o6, "ms_doc_href") or "") in ("", MISSING)
-              or str(col_of(o6, "ms_doc_href")).startswith("pending:"),
+        # Ссылки нет, но и пустоты нет: состояние «неизвестно» теперь ЯВНОЕ
+        # (ревью Codex, P1). Пустая строка возвращала заказ в вид
+        # «неотправленный» и открывала удаление вместе с ключом связывания.
+        check("ссылка НЕ сохранена, а состояние помечено как «неизвестно»",
+              ms_writeback.is_unknown(col_of(o6, "ms_doc_href"))
+              and not ms_writeback.is_pushed(col_of(o6, "ms_doc_href")),
               f"ms_doc_href={col_of(o6, 'ms_doc_href')!r}")
         after_fail = qty_map().get(b6, (0.0, 0.0, 0.0))
         check("и перенос вклада тоже НЕ произошёл",
@@ -749,9 +752,9 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
     key9 = col_of(o9, "ms_sync_id")
     check("ключ отправленного документа известен",
           key9 not in ("", None, MISSING), f"ms_sync_id={key9!r}")
-    check("ссылка не сохранена — состояние «unknown»",
-          (col_of(o9, "ms_doc_href") or "") in ("", MISSING)
-          or str(col_of(o9, "ms_doc_href")).startswith("pending:"),
+    check("ссылка не сохранена — состояние «unknown» и оно ЯВНОЕ",
+          ms_writeback.is_unknown(col_of(o9, "ms_doc_href"))
+          and not ms_writeback.is_pushed(col_of(o9, "ms_doc_href")),
           f"ms_doc_href={col_of(o9, 'ms_doc_href')!r}")
 
     # Двойник с ТЕМ ЖЕ ключом: связывать вслепую нельзя даже по своему ключу.
@@ -2296,6 +2299,240 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
         mock_api.post("/__test/faults", json={})
     check("свободный ключ по-прежнему даёт пусто (404 — это отсутствие)",
           free == [], f"найдено={len(free)}")
+
+    # ── 21. «Неизвестно» не удаляется, но лечится ───────────────────────────
+    #
+    # Ревью Codex, P1 (discussion_r3856243666). Цепочка была такая: T2 падает
+    # дважды → routes_connect звал _release_push_lock → ms_doc_href='' → заказ
+    # снова выглядит неотправленным → api_order_delete пускает DELETE (он
+    # смотрел только префикс pending:) → строка уходит вместе с ms_sync_id →
+    # ms_sync._backmatch_by_sync_id ищет заказы ИМЕННО по этому ключу, и без
+    # строки связывать нечем. Финансовый документ в чужом аккаунте остаётся
+    # без владельца навсегда.
+    #
+    # Проверяется весь жизненный цикл, а не одна отдельная проверка: unknown →
+    # удаление отвергнуто → связывание → обычный связанный заказ.
+    print("\n== 21. Заказ с неизвестным исходом: удалить нельзя, вылечить можно ==")
+
+    def _unknown_order(name: str) -> tuple:
+        """Доводит заказ до честного unknown: T2 падает дважды."""
+        oid = make_order(c, name)
+        bases = order_bases(c, oid)
+        base = next(iter(bases), "")
+        rr = c.post(f"/api/orders/{oid}/status", json={"status": "sent"})
+        assert rr.status_code == 200, rr.text
+        before_docs = len(docs_created())
+        ms_writeback._move_incoming_to_ms = _always_fail
+        try:
+            resp = push(c, oid)
+        finally:
+            ms_writeback._move_incoming_to_ms = original_move
+        return oid, base, bases, before_docs, resp
+
+    mock_ms.COUNTERPARTIES.clear()
+    exec_sql("UPDATE connections SET ms_agent_href='', ms_agent_sync_id='' "
+             "WHERE kind='moysklad'")
+    o21, b21, bases21, docs_before21, r21 = _unknown_order("Заказ с неизвестным исходом (21)")
+    check("T2 упал дважды → честный 502 «неизвестно»", r21.status_code == 502,
+          f"status={r21.status_code} {r21.text[:200]}")
+    check("документ в МойСкладе создан", len(docs_created()) == docs_before21 + 1,
+          f"было={docs_before21} стало={len(docs_created())}")
+    href21 = col_of(o21, "ms_doc_href")
+    key21 = str(col_of(o21, "ms_sync_id") or "")
+    check("СОСТОЯНИЕ ПОМЕЧЕНО КАК «НЕИЗВЕСТНО», а не очищено",
+          ms_writeback.is_unknown(href21), f"ms_doc_href={href21!r}")
+    check("…и это НЕ считается отправленным (вклад ещё наш)",
+          not ms_writeback.is_pushed(href21), f"ms_doc_href={href21!r}")
+    check("ключ связывания на месте", bool(key21), f"ms_sync_id={key21!r}")
+    check("наружу пометка не показывается — ссылки нет",
+          (c.get(f"/api/orders/{o21}/ms-doc").json() or {}).get("ms_doc_href") == "",
+          f"ms-doc={c.get(f'/api/orders/{o21}/ms-doc').text[:160]}")
+
+    # 21а. ГЛАВНОЕ: удалить такой заказ нельзя, и попытка не оставляет следов.
+    r = c.delete(f"/api/orders/{o21}")
+    check("УДАЛЕНИЕ ЗАКАЗА С НЕИЗВЕСТНЫМ ИСХОДОМ ОТВЕРГНУТО (409)",
+          r.status_code == 409, f"status={r.status_code} {r.text[:200]}")
+    check("…и текст объясняет, почему именно (не «идёт отправка»)",
+          "неизвестн" in str((r.json() or {}).get("detail") or "").lower(),
+          f"detail={str((r.json() or {}).get('detail'))[:200]}")
+    check("ЗАКАЗ И КЛЮЧ НА МЕСТЕ — связывать будет чем",
+          order_exists(o21) and str(col_of(o21, "ms_sync_id") or "") == key21,
+          f"есть={order_exists(o21)} ms_sync_id={col_of(o21, 'ms_sync_id')!r}")
+    check("…и пометка не изменилась отвергнутым удалением",
+          col_of(o21, "ms_doc_href") == href21,
+          f"ms_doc_href={col_of(o21, 'ms_doc_href')!r}")
+
+    # 21б. Ветка «вылечил повтор»: TTL не держит, повтор идёт с тем же ключом
+    #      и подбирает УЖЕ созданный документ, а не заводит второй.
+    docs_before21b = len(docs_created())
+    r = push(c, o21)
+    check("ПОВТОР ПОВЕРХ «НЕИЗВЕСТНО» РАЗРЕШЁН и связал документ",
+          r.status_code == 200 and (r.json() or {}).get("recovered") is True,
+          f"status={r.status_code} recovered={(r.json() or {}).get('recovered')} "
+          f"{r.text[:160]}")
+    check("…и ВТОРОГО документа не создано",
+          len(docs_created()) == docs_before21b,
+          f"было={docs_before21b} стало={len(docs_created())}")
+    href21b = col_of(o21, "ms_doc_href")
+    check("…и заказ стал ОБЫЧНЫМ СВЯЗАННЫМ (реальная ссылка)",
+          ms_writeback.is_pushed(href21b) and str(href21b).startswith("http"),
+          f"ms_doc_href={href21b!r}")
+    check("…ключ идемпотентности при этом не менялся",
+          str(col_of(o21, "ms_sync_id") or "") == key21,
+          f"было={key21!r} стало={col_of(o21, 'ms_sync_id')!r}")
+    r = c.delete(f"/api/orders/{o21}")
+    check("ПОСЛЕ СВЯЗЫВАНИЯ удаление снова разрешено (состояние обычное)",
+          r.status_code == 200, f"status={r.status_code} {r.text[:200]}")
+
+    # 21в. Ветка «вылечил синк»: back-match по syncId связывает документ сам,
+    #      и до этого момента заказ так же неудаляем.
+    mock_ms.COUNTERPARTIES.clear()
+    exec_sql("UPDATE connections SET ms_agent_href='', ms_agent_sync_id='' "
+             "WHERE kind='moysklad'")
+    o21c, b21c, bases21c, _, r21c = _unknown_order("Заказ, который вылечит синк")
+    check("второй заказ тоже в состоянии «неизвестно»",
+          r21c.status_code == 502
+          and ms_writeback.is_unknown(col_of(o21c, "ms_doc_href")),
+          f"status={r21c.status_code} ms_doc_href={col_of(o21c, 'ms_doc_href')!r}")
+    qty_unknown = qty_map().get(b21c, (0.0, 0.0, 0.0))
+    r = c.delete(f"/api/orders/{o21c}")
+    check("…и он тоже неудаляем до связывания", r.status_code == 409,
+          f"status={r.status_code}")
+    c.post("/api/sync/run")
+    st = wait_sync_done(c)
+    check("синк прошёл", st.get("state") == "done", f"state={st.get('state')}")
+    href21c = col_of(o21c, "ms_doc_href")
+    check("СИНК СВЯЗАЛ документ по syncId — состояние стало обычным",
+          ms_writeback.is_pushed(href21c) and str(href21c).startswith("http"),
+          f"ms_doc_href={href21c!r}")
+    after21c = qty_map().get(b21c, (0.0, 0.0, 0.0))
+    check("…и локальный вклад снят ровно один раз (двойного счёта нет)",
+          abs(after21c[0] - (qty_unknown[0] - bases21c.get(b21c, 0))) < 1e-6,
+          f"qty было={qty_unknown[0]} стало={after21c[0]} "
+          f"вклад={bases21c.get(b21c)}")
+    r = c.delete(f"/api/orders/{o21c}")
+    check("…и после связывания синком удаление разрешено",
+          r.status_code == 200, f"status={r.status_code} {r.text[:200]}")
+
+    # 21г. Владение токеном: переход в «неизвестно» идёт CAS'ом по ТОЧНОМУ
+    #      токену. Чужая пометка не трогается — `LIKE pending:%` не вернулся.
+    o21d = make_order(c, "Заказ, чью пометку перехватили до unknown")
+    db21 = SessionLocal()
+    try:
+        org21 = int(db21.get(_PO, o21d).org_id)
+        t_a = int(time.time()) - 10_000
+        pend_a = f"{ms_writeback.PENDING_PREFIX}{t_a}"
+        pend_b = f"{ms_writeback.PENDING_PREFIX}{t_a + 5_000}"
+        ms_writeback.begin_push(db21, org21, o21d, "", pend_a)
+        ms_writeback.begin_push(db21, org21, o21d, pend_a, pend_b)
+        moved = ms_writeback.mark_unknown(
+            db21, o21d, pend_a, f"{ms_writeback.UNKNOWN_PREFIX}{t_a}")
+        check("ПОЗДНЯЯ ПОПЫТКА A НЕ ПЕРЕВЕЛА В «НЕИЗВЕСТНО» ЧУЖУЮ ПОМЕТКУ B",
+              moved is False and col_of(o21d, "ms_doc_href") == pend_b,
+              f"moved={moved} ms_doc_href={col_of(o21d, 'ms_doc_href')!r}")
+        moved_b = ms_writeback.mark_unknown(
+            db21, o21d, pend_b, f"{ms_writeback.UNKNOWN_PREFIX}{t_a + 5_000}")
+        check("…а ЗАКОННЫЙ владелец B своим токеном перевёл",
+              moved_b is True
+              and ms_writeback.is_unknown(col_of(o21d, "ms_doc_href")),
+              f"moved={moved_b} ms_doc_href={col_of(o21d, 'ms_doc_href')!r}")
+    finally:
+        db21.close()
+
+    # 21д. Соседняя операция не запрещена ЗАОДНО. Неудаляемость сделана
+    #      отдельным условием именно ради этого: расширить not_pushing_clause
+    #      значило бы запретить и «принять на склад» заказ, документ которого
+    #      в МойСкладе есть, — а это уже продуктовое решение, которого finding
+    #      не просил. Заказ здесь настоящий «отправленный» (status=sent),
+    #      иначе проверялось бы правило переходов, а не мой предикат.
+    mock_ms.COUNTERPARTIES.clear()
+    exec_sql("UPDATE connections SET ms_agent_href='', ms_agent_sync_id='' "
+             "WHERE kind='moysklad'")
+    o21e, _, _, _, r21e = _unknown_order("Заказ «неизвестно», который принимают")
+    check("третий заказ в состоянии «неизвестно»",
+          r21e.status_code == 502
+          and ms_writeback.is_unknown(col_of(o21e, "ms_doc_href")),
+          f"status={r21e.status_code} ms_doc_href={col_of(o21e, 'ms_doc_href')!r}")
+    r = c.post(f"/api/orders/{o21e}/status", json={"status": "received"})
+    check("СТАТУСНЫЙ ПЕРЕХОД на заказе «неизвестно» НЕ запрещён заодно",
+          r.status_code == 200, f"status={r.status_code} {r.text[:200]}")
+    check("…и пометка «неизвестно» переходом не стёрта",
+          ms_writeback.is_unknown(col_of(o21e, "ms_doc_href")),
+          f"ms_doc_href={col_of(o21e, 'ms_doc_href')!r}")
+
+    # ── 22. 412 точечного маршрута не отменяет перебор ──────────────────────
+    #
+    # Ревью Codex, P2 (discussion_r3856243671). Точечный запрос задуман как
+    # НЕОБЯЗАТЕЛЬНАЯ подсказка, но 412 пробрасывался наружу — и до перебора
+    # дело не доходило вовсе. То есть необязательная оптимизация становилась
+    # обязательной: ответь живой аккаунт 412 и здесь, отправка упала бы
+    # целиком. Ровно это уже случилось в раунде 7 с filter=syncId.
+    print("\n== 22. Точечный маршрут ответил 412 — перебор всё равно решает ==")
+
+    # 22а. Существующий объект находится перебором, дубль не создаётся.
+    o22 = make_order(c, "Заказ, чей документ ищется при 412 на маршруте")
+    key22 = str(uuid.uuid4())
+    exec_sql("UPDATE production_orders SET ms_sync_id=?, ms_lookup_mode='sync' "
+             "WHERE id=?", key22, o22)
+    planted22 = plant_doc("po-412", "Документ есть, точечный маршрут 412",
+                          sync_id=key22)
+    try:
+        before22 = len(docs_created())
+        mock_api.post("/__test/faults", json={"syncid_route_status": 412})
+        try:
+            r = push(c, o22)
+        finally:
+            mock_api.post("/__test/faults", json={})
+        check("ПРИ 412 НА ТОЧЕЧНОМ МАРШРУТЕ ДОКУМЕНТ НАЙДЕН ПЕРЕБОРОМ",
+              r.status_code == 200 and (r.json() or {}).get("recovered") is True,
+              f"status={r.status_code} recovered={(r.json() or {}).get('recovered')} "
+              f"{r.text[:160]}")
+        check("…и второго документа не создано",
+              len(docs_created()) == before22,
+              f"было={before22} стало={len(docs_created())}")
+    finally:
+        unplant(planted22)
+
+    # 22б. Свободный ключ при 412 остаётся свободным, и отправка проходит.
+    mock_ms.COUNTERPARTIES.clear()
+    exec_sql("UPDATE connections SET ms_agent_href='', ms_agent_sync_id='' "
+             "WHERE kind='moysklad'")
+    o22b = make_order(c, "Обычная отправка при 412 на точечном маршруте")
+    before22b = len(docs_created())
+    mock_api.post("/__test/faults", json={"syncid_route_status": 412})
+    try:
+        r = push(c, o22b)
+    finally:
+        mock_api.post("/__test/faults", json={})
+    check("ОТПРАВКА ПРОХОДИТ ЦЕЛИКОМ, хотя точечный маршрут отвечает 412",
+          r.status_code == 200, f"status={r.status_code} {r.text[:200]}")
+    check("…и создан ровно один документ",
+          len(docs_created()) == before22b + 1,
+          f"было={before22b} стало={len(docs_created())}")
+
+    # 22в. Отрицательный контроль: 401/403/429/5xx по-прежнему fail-closed.
+    #      Без него «глотаем 412» легко превратилось бы в «глотаем всё».
+    from app import ms_client as _msc22  # noqa: PLC0415
+    retries22 = _msc22.MAX_RETRIES
+    _msc22.MAX_RETRIES = 0
+    try:
+        for code in (401, 403, 429, 500):
+            o22c = make_order(c, f"Заказ при {code} на точечном маршруте")
+            before22c = len(docs_created())
+            mock_api.post("/__test/faults", json={"syncid_route_status": code})
+            try:
+                r = push(c, o22c)
+            finally:
+                mock_api.post("/__test/faults", json={})
+            check(f"{code} на точечном маршруте по-прежнему валит отправку "
+                  f"(fail-closed)", r.status_code != 200,
+                  f"status={r.status_code} {r.text[:140]}")
+            check(f"…и документ при {code} не создан",
+                  len(docs_created()) == before22c,
+                  f"было={before22c} стало={len(docs_created())}")
+    finally:
+        _msc22.MAX_RETRIES = retries22
+        mock_api.post("/__test/faults", json={})
 
     check("каждый POST заказа поставщику нёс syncId",
           all(d.get("syncId") for d in docs_created()),

@@ -1094,14 +1094,21 @@ def api_order_delete(
         .where(ProductionOrder.id == order.id,
                ProductionOrder.org_id == ctx.org.id,
                func.coalesce(ProductionOrder.status, "") != "received",
-               ms_writeback.not_pushing_clause())
+               ms_writeback.not_pushing_clause(),
+               # Третье условие того же DELETE — «удаление не осиротит
+               # финансовый документ» (ревью Codex, P1). Заказ с неизвестным
+               # исходом отправки уносит вместе с собой ms_sync_id, а по нему
+               # ближайший синк связывает уже созданный документ обратно. Без
+               # строки связывать нечем: документ остаётся в чужом аккаунте
+               # без владельца навсегда.
+               ms_writeback.not_orphaning_clause())
         .returning(ProductionOrder.status, ProductionOrder.ms_doc_href)
         .execution_options(synchronize_session=False)
     ).fetchall()
     if not removed:
         db.rollback()
         db.expire_all()
-        # Нулевой результат означает три РАЗНЫХ события, и сводить их к
+        # Нулевой результат означает ЧЕТЫРЕ разных события, и сводить их к
         # одному коду нельзя: человек читает ответ и решает, что делать.
         fresh = db.get(ProductionOrder, order_id)
         if fresh is None or fresh.org_id != ctx.org.id:
@@ -1109,6 +1116,9 @@ def api_order_delete(
         if fresh.status == "received":
             raise HTTPException(status_code=422,
                                 detail="Принятый на склад заказ удалить нельзя")
+        if ms_writeback.is_unknown(fresh.ms_doc_href):
+            raise HTTPException(status_code=409,
+                                detail=ms_writeback.ORDER_UNKNOWN_OUTCOME)
         raise HTTPException(status_code=409, detail=ms_writeback.PUSH_IN_PROGRESS)
     status_at_delete, href_at_delete = str(removed[0][0] or ""), str(removed[0][1] or "")
     if status_at_delete == "sent" and not ms_writeback.is_pushed(href_at_delete):

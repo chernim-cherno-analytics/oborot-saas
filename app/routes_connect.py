@@ -67,6 +67,7 @@ router = APIRouter(prefix="/api")
 # Константа живёт в ms_writeback: по ней же api.py отличает реально
 # отправленные заказы (is_pushed) от помеченных «идёт отправка».
 _PENDING_PREFIX = ms_writeback.PENDING_PREFIX
+_UNKNOWN_PREFIX = ms_writeback.UNKNOWN_PREFIX
 _PENDING_TTL_SEC = 180
 
 TOKEN_HINT = ("МойСклад не принял токен. Проверьте, что токен скопирован целиком: "
@@ -359,7 +360,7 @@ def _release_push_lock(db: Session, order_id: int, pending_href: str) -> None:
 def _clean_href(href: str | None) -> str:
     """Внутренняя пометка pending:* наружу не показывается — только реальная ссылка."""
     h = href or ""
-    return "" if h.startswith(_PENDING_PREFIX) else h
+    return "" if ms_writeback.is_internal_href(h) else h
 
 
 def _ms_doc_out(order: ProductionOrder) -> dict:
@@ -400,7 +401,7 @@ async def api_order_push_to_ms(
             detail="Заказ уже принят на склад — отправлять его в МойСклад поздно.",
         )
     current = order.ms_doc_href or ""
-    if current and not current.startswith(_PENDING_PREFIX):
+    if current and not ms_writeback.is_internal_href(current):
         # Реальная ссылка на документ — уже отправлен.
         name = f" ({order.ms_doc_name})" if order.ms_doc_name else ""
         return JSONResponse(
@@ -412,6 +413,12 @@ async def api_order_push_to_ms(
             },
         )
     now = int(_time.time())
+    # Пометка «неизвестно» повтор НЕ запирает и TTL не ждёт — это и есть
+    # штатный выход из такого состояния. Повтор идёт с ТЕМ ЖЕ syncId, поэтому
+    # find_own_document подберёт уже созданный документ, а не заведёт второй;
+    # два одновременных повтора разводит тот же CAS в begin_push. Запереть
+    # заказ до синка было бы лечением хуже болезни: владелец остался бы с
+    # заказом, который нельзя ни отправить, ни удалить.
     if current.startswith(_PENDING_PREFIX):
         # Идёт отправка. Если пометка свежая — второй клик отклоняем. Если
         # «зависла» дольше PENDING_TTL (воркер умер между захватом лока и
@@ -504,7 +511,18 @@ async def api_order_push_to_ms(
     except ms_writeback.WritebackUnknown as exc:
         # Честный третий исход: документ создан, а записать это у себя не
         # вышло даже со второй попытки. Ни «получилось», ни «не получилось».
-        _release_push_lock(db, order.id, pending)
+        #
+        # Пометку НЕ снимаем, а переводим в устойчивое «неизвестно» (ревью
+        # Codex, P1). Пустая строка здесь возвращала заказ в вид
+        # «неотправленный», после чего его можно было удалить — вместе с
+        # ms_sync_id, то есть с единственным ключом, по которому синк связал бы
+        # документ обратно. Финансовый документ в чужом аккаунте остался бы без
+        # владельца навсегда.
+        #
+        # Перевод идёт CAS'ом по нашему точному токену: чужую пометку мы не
+        # трогаем и здесь.
+        ms_writeback.mark_unknown(
+            db, order.id, pending, f"{_UNKNOWN_PREFIX}{now}")
         raise HTTPException(
             status_code=502,
             detail=(
