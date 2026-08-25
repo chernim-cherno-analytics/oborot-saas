@@ -2989,6 +2989,122 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
           str(col_of(o25d, "ms_sync_id") or "") == "",
           f"ms_sync_id={col_of(o25d, 'ms_sync_id')!r}")
 
+    # ── 26. Проигранный T1: три исхода, и ни одного 500 ─────────────────────
+    #
+    # Ревью Codex, P2 (discussion_r3857538139). В ветке locked=False стоял
+    # `db.refresh(order)`. Если конкурентный DELETE закоммитил удаление между
+    # первым чтением маршрута и begin_push, T1 ПРАВИЛЬНО обновляет ноль строк
+    # (предикаты работают), а вот refresh на удалённой строке поднимает
+    # SQLAlchemy InvalidRequestError — и обычная гонка отвечает 500 вместо
+    # 404. То есть «сломались мы», хотя сломались не мы.
+    #
+    # Раунд 12 добавил в эту же ветку разбор исходов, но разобрал ДВА из трёх:
+    # «строки больше нет» не рассматривалось вовсе, хотя соседний
+    # api_order_delete в этом же PR уже показывает правильную форму.
+    #
+    # Гонки воспроизводятся ЯВНЫМ ХУКОМ прямо перед настоящим begin_push, а не
+    # паузами: обёртка меняет состояние отдельным SQL и только потом зовёт
+    # настоящий T1.
+    print("\n== 26. Проигранный T1: удалён / принят / занят — и никаких 500 ==")
+
+    def _race_before_t1(order_id: int, mutate_sql):
+        """Ставит шов прямо перед настоящим T1 и выполняет push."""
+        fired: list = []
+        original = ms_writeback.begin_push
+
+        def _hooked(db_, org_, oid_, expected_, pending_):
+            if not fired and int(oid_) == order_id:
+                fired.append(True)
+                mutate_sql()
+            return original(db_, org_, oid_, expected_, pending_)
+
+        ms_writeback.begin_push = _hooked
+        try:
+            return push(c, order_id), fired
+        finally:
+            ms_writeback.begin_push = original
+
+    # 26а. ГЛАВНЫЙ: заказ удалён между чтением маршрута и T1.
+    o26 = make_order(c, "Заказ, который удаляют перед самым T1")
+    c.post(f"/api/orders/{o26}/status", json={"status": "sent"})
+    docs26 = len(docs_created())
+
+    def _delete_o26():
+        # Порядок как в штатном удалении: сначала приёмки (внешний ключ
+        # order_receipts.order_id), потом сам заказ. Приёмок у этого заказа
+        # нет, но полагаться на это в тесте про удаление — плохая идея.
+        assert exec_sql("DELETE FROM order_receipts WHERE order_id=?", o26) == ""
+        assert exec_sql("DELETE FROM production_orders WHERE id=?", o26) == ""
+
+    r26, fired26 = _race_before_t1(o26, _delete_o26)
+    check("шов сработал: удаление прошло между чтением и T1",
+          bool(fired26), f"fired={fired26}")
+    check("УДАЛЁННЫЙ В ГОНКЕ ЗАКАЗ ДАЁТ 404, а не 500",
+          r26.status_code == 404, f"status={r26.status_code} {r26.text[:200]}")
+    check("…и это НЕ ошибка сервера (обычная гонка не выглядит поломкой)",
+          r26.status_code != 500, f"status={r26.status_code}")
+    check("…и текст «Заказ не найден»",
+          "не найден" in str((r26.json() or {}).get("detail") or "").lower(),
+          f"detail={str((r26.json() or {}).get('detail'))[:160]}")
+    check("НИ ОДНОГО POST В МОЙСКЛАД", len(docs_created()) == docs26,
+          f"было={docs26} стало={len(docs_created())}")
+    check("…и строки заказа в базе действительно нет",
+          not order_exists(o26), f"есть={order_exists(o26)}")
+
+    # 26б. ПОЛОЖИТЕЛЬНЫЙ КОНТРОЛЬ 1: гонка раунда 12 по-прежнему даёт 422.
+    o26b = make_order(c, "Заказ, принятый перед самым T1")
+    c.post(f"/api/orders/{o26b}/status", json={"status": "sent"})
+    docs26b = len(docs_created())
+    r26b, fired26b = _race_before_t1(
+        o26b, lambda: exec_sql(
+            "UPDATE production_orders SET status='received' WHERE id=?", o26b))
+    check("шов сработал (приёмка)", bool(fired26b), f"fired={fired26b}")
+    check("ПРИНЯТЫЙ В ГОНКЕ ЗАКАЗ по-прежнему даёт 422",
+          r26b.status_code == 422, f"status={r26b.status_code} {r26b.text[:200]}")
+    check("…и документ не создан", len(docs_created()) == docs26b,
+          f"было={docs26b} стало={len(docs_created())}")
+
+    # 26в. ПОЛОЖИТЕЛЬНЫЙ КОНТРОЛЬ 2: настоящий конфликт лока даёт 409.
+    #      Чужая пометка появилась после чтения — CAS проигрывает по href,
+    #      строка на месте и статус допустимый.
+    o26c = make_order(c, "Заказ, чей лок перехватили перед самым T1")
+    c.post(f"/api/orders/{o26c}/status", json={"status": "sent"})
+    docs26c = len(docs_created())
+    alien_pending = f"{ms_writeback.PENDING_PREFIX}{int(time.time())}"
+    r26c, fired26c = _race_before_t1(
+        o26c, lambda: exec_sql(
+            "UPDATE production_orders SET ms_doc_href=? WHERE id=?",
+            alien_pending, o26c))
+    check("шов сработал (перехват лока)", bool(fired26c), f"fired={fired26c}")
+    check("ЗАНЯТЫЙ ЧУЖОЙ ОТПРАВКОЙ ЗАКАЗ по-прежнему даёт 409",
+          r26c.status_code == 409, f"status={r26c.status_code} {r26c.text[:200]}")
+    check("…и текст про идущую отправку, а не про удаление или приёмку",
+          "отправля" in str((r26c.json() or {}).get("detail") or "").lower(),
+          f"detail={str((r26c.json() or {}).get('detail'))[:160]}")
+    check("…и наружу отдана пустая ссылка (внутренняя пометка не видна)",
+          (r26c.json() or {}).get("ms_doc_href") == "",
+          f"ms_doc_href={(r26c.json() or {}).get('ms_doc_href')!r}")
+    check("…и документ не создан", len(docs_created()) == docs26c,
+          f"было={docs26c} стало={len(docs_created())}")
+    check("…и чужая пометка не тронута нами",
+          col_of(o26c, "ms_doc_href") == alien_pending,
+          f"ms_doc_href={col_of(o26c, 'ms_doc_href')!r}")
+
+    # 26г. ПОЛОЖИТЕЛЬНЫЙ КОНТРОЛЬ 3: без гонки отправка по-прежнему проходит.
+    o26d = make_order(c, "Обычная отправка после правки ветки проигрыша")
+    docs26d = len(docs_created())
+    r = push(c, o26d)
+    check("ОБЫЧНАЯ ОТПРАВКА по-прежнему проходит", r.status_code == 200,
+          f"status={r.status_code} {r.text[:200]}")
+    check("…и документ создан", len(docs_created()) == docs26d + 1,
+          f"было={docs26d} стало={len(docs_created())}")
+
+    # 26д. Чужая организация: удалять не нужно — достаточно, что заказа этой
+    #      организации нет. Ответ обязан быть 404, а не «что-то другое».
+    r = c.post("/api/orders/99999999/push-to-ms")
+    check("несуществующий заказ даёт 404 и вне гонки",
+          r.status_code == 404, f"status={r.status_code} {r.text[:160]}")
+
     check("каждый POST заказа поставщику нёс syncId",
           all(d.get("syncId") for d in docs_created()),
           f"без ключа={[d.get('id') for d in docs_created() if not d.get('syncId')]}")
