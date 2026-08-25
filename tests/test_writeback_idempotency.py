@@ -1501,19 +1501,36 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
     # Гейт обязан быть ВШИТ в main(), а не просто существовать рядом с ним:
     # чистая функция, которую никто не зовёт, — это ноль защиты. Значения
     # подставляются в модуль явно, чтобы проверка не зависела от окружения
-    # прогона. Сеть недостижима по построению: main() возвращает 2 ДО
-    # asyncio.run(run()), а именно run() ходит в МойСклад.
-    tok_before, conf_before = live.TOKEN, live.CONFIRM
+    # прогона.
+    #
+    # На время проверки run() подменён растяжкой. Это не украшение: на
+    # СЛОМАННОЙ сборке main() дойдёт до `asyncio.run(run())` и начнёт создавать
+    # сущности — то есть тест про «запуск не должен произойти случайно» сам
+    # устроил бы этот запуск. Проверено: первая редакция этой проверки на
+    # восстановленном дефекте свалилась трассировкой ровно оттуда. С растяжкой
+    # сеть недостижима в ЛЮБОЙ сборке, а факт «main() дошёл до run()»
+    # становится обычным FAIL, а не падением набора.
+    tok_before, conf_before, run_before = live.TOKEN, live.CONFIRM, live.run
+    reached_run: list = []
+
+    async def _tripwire() -> int:
+        reached_run.append(True)
+        return 0
+
     try:
+        live.run = _tripwire
         live.TOKEN, live.CONFIRM = "живой-токен", "no"
         rc_bad = live.main()
         check("ГЕЙТ ВШИТ В main(): токен есть, фраза неверна → код 2, "
-              "а не запуск создания сущностей", rc_bad == 2, f"main()={rc_bad}")
+              "а сеть не тронута",
+              rc_bad == 2 and not reached_run,
+              f"main()={rc_bad} дошло до run()={bool(reached_run)}")
         live.CONFIRM = ""
         check("…и пустое подтверждение при живом токене тоже даёт 2",
-              live.main() == 2)
+              live.main() == 2 and not reached_run,
+              f"дошло до run()={bool(reached_run)}")
     finally:
-        live.TOKEN, live.CONFIRM = tok_before, conf_before
+        live.TOKEN, live.CONFIRM, live.run = tok_before, conf_before, run_before
 
     check("каждый POST заказа поставщику нёс syncId",
           all(d.get("syncId") for d in docs_created()),
