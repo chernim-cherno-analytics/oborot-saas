@@ -374,6 +374,98 @@ def entity_store(request: Request, limit: int = 1000, offset: int = 0):
     return _page(rows, limit, offset)
 
 
+# ── Именованные типы цен (DATA-10) ───────────────────────────────────────────
+#
+# По умолчанию ассортимент отдаёт РОВНО ОДНУ безымянную цену — как раньше.
+# Это не осторожность ради осторожности: на числах этого мок-мира стоят
+# денежные ожидания четырёх наборов, и появление второго элемента в
+# salePrices сдвинуло бы _sale_price_of у всех сразу. Набор DATA-10 включает
+# именованные типы явно, через POST /__test/price_types.
+#
+#   enabled    — выдавать ли priceType у цен вообще;
+#   sale       — имя типа для цены продажи ('' — этой цены в карточке нет
+#                вовсе: тип удалили в МойСкладе, и в salePrices осталась
+#                только себестоимость — первой в списке);
+#   cost       — имя типа для второй цены, полной себестоимости
+#                ('' — второй цены в карточке нет вовсе);
+#   cost_ratio — полная себестоимость = закупочная цена × ratio. Отдельное
+#                число нужно, чтобы тест отличал «взяли выбранный тип» от
+#                «взяли buyPrice» и от «взяли первую цену в списке»;
+#   cost_skip  — ext_id, у которых второй цены нет: тип существует в
+#                ассортименте глобально, но не проставлен на этой карточке;
+#   sale_skip  — то же самое для ПЕРВОЙ цены: тип цены продажи есть у других
+#                товаров, но у этих карточек не проставлен. Отдельный ключ, а
+#                не `cost_skip` наоборот: у карточки из `sale_skip` в
+#                salePrices остаётся ровно одна цена — себестоимость, — и
+#                именно она становится «первой в списке». Это и есть подстава
+#                чужого типа, которую ищет проверка (ревью 25.08.2026,
+#                discussion_r3848821144);
+#   service    — [[имя типа, рубли], …] для ОДНОЙ дополнительной строки
+#                ассортимента с meta.type = "service". Пустой список — строки
+#                нет вовсе, как было. Услуга нужна ровно для одного вопроса:
+#                типы цен, которые встречаются ТОЛЬКО у неимпортируемой
+#                строки, товарами не подтверждены, и замок DATA-10 обязан
+#                считать их пропавшими (_parse_assortment услуги не берёт);
+#   extra      — имена ДОПОЛНИТЕЛЬНЫХ типов цен, проставленных на КАЖДОЙ
+#                карточке после первых двух. Нужны, чтобы доступных типов
+#                стало заведомо больше двадцати и больше сорока: ровно на
+#                таком аккаунте годная замена пропавшему типу оказывается за
+#                границей обрезки и перестаёт быть выбираемой в настройках
+#                (ревью 25.08.2026, discussion_r3852672410). Цена i-го типа —
+#                (1000 + i) ₽, одинаковая у всех карточек: число говорит, какой
+#                именно тип прочитали, и не совпадает ни с закупочной ценой,
+#                ни с ценой продажи, ни с себестоимостью мок-мира.
+PRICE_TYPES: dict = {
+    "enabled": False,
+    "sale": "Цена продажи",
+    "cost": "Полная себестоимость",
+    "cost_ratio": 1.5,
+    "cost_skip": [],
+    "sale_skip": [],
+    "service": [],
+    "extra": [],
+}
+
+
+def reset_price_types() -> None:
+    PRICE_TYPES.update(enabled=False, sale="Цена продажи",
+                       cost="Полная себестоимость", cost_ratio=1.5, cost_skip=[],
+                       sale_skip=[], service=[], extra=[])
+
+
+def extra_price_rub(index: int) -> int:
+    """Цена дополнительного типа цен по его порядковому номеру (0-based)."""
+    return 1000 + index
+
+
+@app.post("/__test/price_types")
+async def test_price_types(request: Request):
+    body = await request.json()
+    for key, val in (body or {}).items():
+        if key in PRICE_TYPES:
+            PRICE_TYPES[key] = val
+    return dict(PRICE_TYPES)
+
+
+def _sale_prices(ext_id: str, price_rub: int, cost_rub: int) -> list[dict]:
+    """salePrices карточки: без переключателя — та же одна безымянная цена."""
+    if not PRICE_TYPES.get("enabled"):
+        return [{"value": price_rub * 100}]
+    out: list[dict] = []
+    sale_name = str(PRICE_TYPES.get("sale") or "")
+    if sale_name and ext_id not in (PRICE_TYPES.get("sale_skip") or []):
+        out.append({"value": price_rub * 100, "priceType": {"name": sale_name}})
+    cost_name = str(PRICE_TYPES.get("cost") or "")
+    if cost_name and ext_id not in (PRICE_TYPES.get("cost_skip") or []):
+        out.append({
+            "value": int(round(cost_rub * float(PRICE_TYPES.get("cost_ratio") or 1.0))) * 100,
+            "priceType": {"name": cost_name},
+        })
+    for i, name in enumerate(PRICE_TYPES.get("extra") or []):
+        out.append({"value": extra_price_rub(i) * 100, "priceType": {"name": str(name)}})
+    return out
+
+
 @app.get("/entity/assortment")
 def entity_assortment(request: Request, limit: int = 1000, offset: int = 0):
     _auth(request)
@@ -389,7 +481,7 @@ def entity_assortment(request: Request, limit: int = 1000, offset: int = 0):
         rows.append({
             "id": pid, "name": name, "pathName": path,
             "meta": {"href": f"{BASE}/entity/product/{pid}", "type": "product"},
-            "salePrices": [{"value": price * 100}],
+            "salePrices": _sale_prices(pid, price, cost),
             "buyPrice": {"value": cost * 100},
             "archived": False,
         })
@@ -404,7 +496,7 @@ def entity_assortment(request: Request, limit: int = 1000, offset: int = 0):
                 "characteristics": chars,
                 "product": {"meta": {"href": f"{BASE}/entity/product/{sku['parent']}",
                                      "type": "product"}},
-                "salePrices": [{"value": sku["price"] * 100}],
+                "salePrices": _sale_prices(sku["ext"], sku["price"], sku["cost"]),
                 "buyPrice": {"value": sku["cost"] * 100},
                 "archived": False,
             })
@@ -413,10 +505,23 @@ def entity_assortment(request: Request, limit: int = 1000, offset: int = 0):
                 "id": sku["ext"], "name": sku["name"], "pathName": sku["path"],
                 "meta": {"href": f"{BASE}/entity/product/{sku['ext']}",
                          "type": "product"},
-                "salePrices": [{"value": sku["price"] * 100}],
+                "salePrices": _sale_prices(sku["ext"], sku["price"], sku["cost"]),
                 "buyPrice": {"value": sku["cost"] * 100},
                 "archived": "archived" in sku["flags"],
             })
+    # Услуга: строка ассортимента, которую синк НЕ импортирует. По умолчанию
+    # её нет вовсе, поэтому остальные наборы видят прежний ассортимент.
+    service = PRICE_TYPES.get("service") or []
+    if service:
+        rows.append({
+            "id": "srv-fit", "name": "Подгонка по фигуре",
+            "meta": {"href": f"{BASE}/entity/service/srv-fit", "type": "service"},
+            "salePrices": [{"value": int(round(float(rub) * 100)),
+                            "priceType": {"name": str(name)}}
+                           for name, rub in service],
+            "buyPrice": {"value": 0},
+            "archived": False,
+        })
     return _page(rows, limit, offset)
 
 
