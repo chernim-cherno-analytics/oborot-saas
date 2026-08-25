@@ -1874,8 +1874,7 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
     check("СТАДИЯ ЗАКАЗА НЕ ВЫЗВАНА", cp_lost.calls.count("create_purchase_order") == 0,
           f"вызовов create_purchase_order={cp_lost.calls.count('create_purchase_order')}")
     check("ЖУРНАЛ ВСЁ РАВНО СОДЕРЖИТ СОЗДАННОГО КОНТРАГЕНТА",
-          len(_events(led_lost, "контрагент")) == 1
-          and _events(led_lost, "контрагент")[0]["status"] == live.CREATED
+          [e["status"] for e in _events(led_lost, "контрагент")] == [live.CREATED]
           and _observed_ids(led_lost, "контрагент") == ["cp-1"],
           f"журнал={led_lost}")
     check("…и «ничего не создано» НЕ печатается после реальной записи",
@@ -1908,17 +1907,22 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
     rc_raise, out_raise, led_raise = _live_run(raised)
     check("обрыв на POST → сценарий провален", rc_raise == 1,
           f"код возврата={rc_raise}")
+    # Пустой журнал — ожидаемый исход СЛОМАННОЙ сборки, поэтому индексация
+    # обязана быть безопасной. Иначе проверка падает трассировкой, набор
+    # получает приговор NO_REPORT («набора не было») вместо честного FAIL, и
+    # красный прогон доказывает меньше, чем должен. Ровно на этом первая
+    # редакция блока и споткнулась.
+    ev_raise = led_raise[0] if led_raise else {}
     check("ПОПЫТКА ЗАПИСАНА В ЖУРНАЛ ДО ОТПРАВКИ (она там есть)",
           len(led_raise) == 1, f"событий={len(led_raise)}")
     check("…и помечена ЧЕСТНЫМ «неизвестно, возможно создано», а не провалом",
-          led_raise[0]["status"] == live.UNKNOWN,
-          f"статус={led_raise[0]['status']}")
+          ev_raise.get("status") == live.UNKNOWN,
+          f"статус={ev_raise.get('status')!r}")
     check("…и наблюдений нет — ответа мы не получили",
-          led_raise[0]["observed"] == [], f"наблюдения={led_raise[0]['observed']}")
+          ev_raise.get("observed") == [], f"наблюдения={ev_raise.get('observed')!r}")
     check("…и назван тип сбоя, но не секрет",
-          led_raise[0].get("error") == "ReadTimeout"
-          and "Bearer" not in str(led_raise[0]),
-          f"событие={led_raise[0]}")
+          ev_raise.get("error") == "ReadTimeout" and "Bearer" not in str(ev_raise),
+          f"событие={ev_raise}")
     check("…и «ничего не создано» НЕ печатается после отправленного POST",
           NOTHING not in out_raise)
     check("…и второй попытки/ретрая не было",
