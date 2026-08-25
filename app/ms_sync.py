@@ -806,6 +806,25 @@ def _is_background_history_stop(exc: Exception, org_id: int, stats: dict) -> boo
             and _connection_status(org_id) == "active")
 
 
+class PriceTypesGone(RuntimeError):
+    """Выбранного типа цены нет ни у одного товара — чинит только владелец.
+
+    Ревью 25.08.2026 (PR #10, discussion_r3849074704). Остановка D-40
+    поднималась голым `RuntimeError`, и `error_cause()` относил её к
+    `internal` — к сбоям, в которых пользователю остаётся ждать. Дальше это
+    расходилось с реальностью в двух местах сразу: Telegram-алерт дописывал
+    «Мы уже разбираемся» поверх текста, который зовёт владельца в Настройки, а
+    полоска синка предлагала кнопку «Повторить» — повтор без смены настройки
+    даёт ровно ту же ошибку.
+
+    Отдельный класс, а не переклассификация всех `RuntimeError`: под ним в
+    этом модуле ходят и настоящие внутренние сбои, и для них «мы уже
+    разбираемся» — правда. Наследование от `RuntimeError` сохранено намеренно:
+    `_human_error` показывает такие ошибки владельцу как есть, и текст
+    остановки (`price_types_gone_message`) написан именно для этого.
+    """
+
+
 class SyncInterrupted(Exception):
     """Первичная загрузка прервана после того, как часть истории уже записана.
 
@@ -847,11 +866,18 @@ def _human_error(exc: Exception) -> str:
 
 
 def error_cause(exc: Exception) -> str:
-    """Класс причины для подсказок: token | transient | internal."""
+    """Класс причины для подсказок: token | settings | transient | internal.
+
+    `settings` — ошибка, которую исправляет владелец в Настройках, и никто
+    другой. Отличается от `internal` тем, что ждать нечего, и от `transient`
+    тем, что повтор без вмешательства даст тот же результат.
+    """
     import httpx
 
     if isinstance(exc, SyncInterrupted):
         return exc.cause
+    if isinstance(exc, PriceTypesGone):
+        return "settings"
     if isinstance(exc, httpx.HTTPStatusError):
         if exc.response.status_code in (401, 403):
             return "token"
@@ -986,8 +1012,8 @@ async def _run_sync(org_id: int, mode: str, resume_from: str | None = None,
             # исчезнувший тип всё ещё есть, а нового нет. Переносимые ключи
             # (_CARRIED_STATS) уже лежат в stats и сохраняются вместе с ним.
             _persist(org_id, stats)
-            raise RuntimeError(price_types_gone_message(gone_price_types,
-                                                        available_price_types))
+            raise PriceTypesGone(price_types_gone_message(gone_price_types,
+                                                          available_price_types))
         ext_to_pid = _upsert_products(org_id, assortment, stats)
         _stage_end(stats, "products")
         _persist(org_id, stats, stage="products", progress=5.0 if initial else 8.0,
@@ -1598,9 +1624,29 @@ def price_types_gone_message(missing: list[tuple[str, str]],
 
 
 def _sale_price_of(row: dict, org_id: int = 0) -> float:
+    """Цена продажи карточки (0 = выбранного типа в ней нет).
+
+    Ревью 25.08.2026 (PR #10, discussion_r3848821144). Замок D-40 сверяет
+    ГЛОБАЛЬНОЕ отсутствие типа, и это сознательная граница: непроставленная
+    цена на ЧАСТИ ассортимента — нормальное состояние каталога, останавливать
+    на ней синк нельзя. Но в этом нормальном состоянии откат на «первую цену в
+    списке» записывал карточке ЧУЖОЙ тип: у товара, где выбранной цены продажи
+    нет, а полная себестоимость есть, первой в списке оказывалась именно она.
+    Замок при этом молчал законно, синк рапортовал «завершена» — то есть дыра
+    была уже исходной, но тише.
+
+    Поэтому откат действует ТОЛЬКО там, где выбора нет. Явный выбор означает,
+    что подставлять вместо него нечего: отсутствие представляется нулём, и
+    ноль здесь честнее подмены — ноль видно, чужую цену нет.
+
+    Наследование модификацией цены родителя (`_parse_assortment`) правилом не
+    затрагивается: родитель считается этим же выбранным типом, значит наследуется
+    цена ТОГО ЖЕ типа, а не чужого.
+    """
     cfg = _PRICE_TYPES.get(org_id) or {}
-    val = _price_by(row, cfg.get("sale") or "", _SALE_HINTS)
-    if val:
+    exact = cfg.get("sale") or ""
+    val = _price_by(row, exact, _SALE_HINTS)
+    if val or exact:
         return val
     prices = row.get("salePrices") or []
     if not prices:
