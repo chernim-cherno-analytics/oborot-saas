@@ -1,0 +1,393 @@
+# -*- coding: utf-8 -*-
+"""Полнота удаления арендатора: что именно стирается и почему это полный список.
+
+Зачем отдельный модуль. Удаление организации и пользователя (`app.main._purge_org`,
+`app.main._purge_user`) — это обещание «данные стёрты», и держится оно на ручном
+перечислении моделей. Пока перечисление жило литералом внутри функции, ничто не
+связывало его с реальным набором моделей: новая ORM-модель с `org_id`, забытая в
+списке, оставляла бы осиротевшие строки с чужим `org_id` — и ни один тест этого
+бы не заметил, потому что тесты проверяют таблицы, в которых строки ЕСТЬ.
+
+Поэтому здесь четыре вещи и ничего кроме них:
+  * НАБОРЫ УДАЛЕНИЯ — модели и порядок, в котором их стирают `_purge_org` и
+    `_purge_user`. Порядок значим: от зависимых таблиц к корневым, иначе в
+    Postgres упадёт внешний ключ.
+  * СПИСОК НЕ-ВЛАДЕЮЩИХ ССЫЛОК на `orgs.id` / `users.id` — с причиной у каждой
+    записи. Это исключение ТОЛЬКО из удаления строки вместе с арендатором и
+    НЕ утверждение, что ссылка безопасна: см. предупреждение у самого списка.
+  * СТОРОЖ ПОЛНОТЫ `purge_completeness_violations`: сверяет наборы с фактическим
+    реестром SQLAlchemy. Семантически — по колонкам и внешним ключам, а не по
+    тексту исходников: grep по `org_id` не увидел бы модель, которая
+    ссылается на организацию колонкой с другим именем.
+  * СТОРОЖ ПОРЯДКА `purge_order_violations`: топологическая проверка внешних
+    ключей внутри наборов. Раньше эта проверка жила кодом внутри
+    `tests/test_tenancy.py` и повторно не использовалась; теперь она здесь,
+    рядом с самим порядком, и входит в общий список нарушений.
+
+Сами сторожа вызываются только из тестов (`tests/test_tenancy.py`), в рантайме
+приложения они не работают.
+"""
+from __future__ import annotations
+
+import importlib
+import pkgutil
+
+# Корневые таблицы арендатора. Они не входят в наборы удаления: строку `orgs`
+# стирает отдельный DELETE в конце `_purge_org`, строку `users` — отдельный
+# DELETE в конце `_purge_user`. Ссылки на самих себя у них нет.
+ORG_ROOT_TABLE = "orgs"
+USER_ROOT_TABLE = "users"
+
+
+def org_purge_models() -> tuple:
+    """Модели, удаляемые вместе с организацией. ПОРЯДОК ЗНАЧИМ.
+
+    От зависимых таблиц к `orgs`: в Postgres внешние ключи проверяются
+    (в SQLite по умолчанию нет), и обратный порядок упал бы.
+
+    `OrderPlan` и `OrderReceipt` идут ПЕРЕД `ProductionOrder`: у обеих внешний
+    ключ на заказ. `Production` идёт ПОСЛЕ `ProductionOrder`, а не перед ним:
+    у заказа есть `production_id -> productions.id`, и прежний порядок (сначала
+    `Production`, потом `ProductionOrder`) в Postgres нарушил бы внешний ключ.
+    В SQLite, на котором работает прод, ключи по умолчанию не проверяются,
+    поэтому дефект ничего не ломал и был не виден — его нашёл не отчёт с прода,
+    а `purge_order_violations()`.
+
+    Импорты внутри функции, а не наверху модуля: `app.routes_extra` тянет за
+    собой половину приложения, и импорт на уровне модуля завязал бы порядок
+    импортов приложения на этот вспомогательный файл.
+    """
+    from app.models import (
+        CategoryMerge,
+        Connection,
+        Membership,
+        NotifySettings,
+        OrderedQty,
+        OrderPlan,
+        OrderReceipt,
+        Product,
+        Production,
+        ProductionAssign,
+        ProductionOrder,
+        ReplenishDraft,
+        Sale,
+        SkuCategoryOverride,
+        SkuDiscount,
+        SkuHidden,
+        StockDay,
+        SyncState,
+        Warehouse,
+        WarehouseStock,
+    )
+    from app.routes_extra import BillingRequest
+
+    return (
+        Sale, StockDay, WarehouseStock, OrderedQty, ReplenishDraft,
+        ProductionAssign, OrderPlan, OrderReceipt, ProductionOrder, Production,
+        SkuHidden, SkuCategoryOverride, CategoryMerge, SkuDiscount,
+        NotifySettings, SyncState, BillingRequest,
+        Product, Warehouse, Connection, Membership,
+    )
+
+
+def user_purge_models() -> tuple:
+    """Модели, удаляемые вместе с пользователем. ПОРЯДОК ЗНАЧИМ.
+
+    `Membership` входит и сюда, и в набор организации — это не исключение, а
+    факт: у строки членства есть и `org_id`, и `user_id`, и она обязана уйти
+    в обоих потоках. Саму строку `users` стирает отдельный DELETE после цикла.
+    """
+    from app.models import Membership, UserHintSeen, UserLesson, UserPrefs
+
+    return (UserHintSeen, UserLesson, UserPrefs, Membership)
+
+
+# ── Ссылки, которые владением не являются ────────────────────────────────────
+#
+# ЧТО ЭТИ СПИСКИ ЗНАЧАТ И ЧЕГО НЕ ЗНАЧАТ. Запись здесь говорит ровно одно:
+# «строка этой таблицы принадлежит НЕ этому арендатору, поэтому вместе с ним
+# она не стирается». Это НЕ утверждение, что ссылка безопасна: колонка с
+# настоящим внешним ключом на `users.id` остаётся висеть после удаления
+# пользователя, и у этого есть последствия (в Postgres и в SQLite с
+# `PRAGMA foreign_keys=ON` DELETE пользователя может быть просто запрещён, а в
+# сегодняшнем прод-SQLite остаётся осиротевший идентификатор, который позже
+# может достаться другому человеку). Именно поэтому списки называются
+# NON_OWNING_*_REFERENCES, а не allowlist: разрешено не «всё хорошо», а
+# единственное — не удалять org-owned строку в потоке пользователя.
+# Открытая часть записана в TECH_DEBT.md как SEC-8 и решается отдельно.
+#
+# Ключ — (таблица, колонка), значение — причина. Причина обязательна: запись
+# без объяснения — это не исключение, а забытая модель под другим именем.
+# Список проверяется В ОБЕ СТОРОНЫ: если колонка исчезла или переименована,
+# сторож падает и на устаревшей записи тоже. Иначе список протухнет ровно
+# так же, как протухает текст технического долга.
+
+NON_OWNING_ORG_REFERENCES: dict[tuple[str, str], str] = {
+    # Пусто, и это не заглушка: все таблицы со ссылкой на организацию сегодня
+    # действительно стираются вместе с ней. Пустой список — самое сильное
+    # состояние этого файла, и терять его без причины не следует.
+}
+
+NON_OWNING_USER_REFERENCES: dict[tuple[str, str], str] = {
+    ("production_orders", "created_by"): (
+        "авторство, а не владение: строка заказа принадлежит ОРГАНИЗАЦИИ "
+        "(читается только по org_id) и уходит вместе с ней. Ссылка nullable "
+        "FK на users.id и при удалении автора не зануляется — SEC-8"
+    ),
+    ("order_plans", "created_by"): (
+        "авторство плана заказа; строка org-owned и удаляется в потоке "
+        "организации. Ссылка nullable FK на users.id, не зануляется — SEC-8"
+    ),
+    ("order_receipts", "created_by"): (
+        "авторство приёмки; строка org-owned. Колонка объявлена без внешнего "
+        "ключа на users.id — сторож видит её по имени, см. USER_REF_COLUMN_NAMES. "
+        "Осиротевший идентификатор после удаления автора — SEC-8"
+    ),
+    ("billing_requests", "user_id"): (
+        "кто подал заявку на счёт; заявка принадлежит организации и читается "
+        "только по org_id (app/routes_extra.py), удаляется в потоке организации. "
+        "ВНИМАНИЕ: колонка nullable=False FK на users.id — при живой организации "
+        "удаление автора заявки в Postgres будет ОТКЛОНЕНО внешним ключом, а в "
+        "сегодняшнем SQLite оставит сироту. Это открытый SEC-8, а не безопасность"
+    ),
+}
+
+
+def _reraise_import_error(name: str) -> None:
+    """`onerror` для `walk_packages`: перевозбудить, а не проглотить.
+
+    Без `onerror` `walk_packages` ЛОВИТ И ГЛУШИТ `ImportError`, возникший при
+    импорте подпакета, — то есть сама является fail-open ровно того сорта, от
+    которого лечит этот файл: сломанный `app/<подпакет>/__init__.py` унёс бы
+    вместе с собой все вложенные модули и их модели, а обход прошёл бы молча.
+    Голый `raise` перевозбуждает активное исключение: `walk_packages` зовёт
+    `onerror` внутри `except`.
+    """
+    raise
+
+
+def import_all_models(package: str = "app") -> None:
+    """Импортирует все модули пакета РЕКУРСИВНО, чтобы реестр был полным.
+
+    Обходом, а не перечислением: перечисление пришлось бы поддерживать руками —
+    ровно та болезнь, от которой лечит этот файл.
+
+    ОБХОД РЕКУРСИВНЫЙ. Раньше здесь стоял `pkgutil.iter_modules`, который берёт
+    только ВЕРХНИЙ уровень пакета. Дерево `app` сегодня плоское, поэтому сироты
+    это не создавало, — но модель, добавленная завтра в `app/<подпакет>/<модуль>.py`,
+    просто не попала бы в `Base.registry`, и сторож полноты вернул бы зелёный
+    ответ при отсутствующей в наборах удаления таблице арендатора. Инвариант
+    этого файла — «новая модель обязана уронить сторож, а не исчезнуть», — и
+    обход верхнего уровня его прямо нарушал.
+
+    ОШИБКА ИМПОРТА ВЫХОДИТ НАРУЖУ И НЕ ГЛУШИТСЯ. Раньше здесь стоял
+    `except Exception: continue`, и это делало сторож fail-open: модуль с новой
+    моделью, который перестал импортироваться, просто исчезал бы из реестра —
+    вместе со своей моделью, вместе с её `org_id`, — и сторож полноты зеленел бы
+    именно в тот момент, когда обязан кричать. Зелёный сторож на сломанном
+    импорте хуже отсутствующего: он выдаёт незнание за проверку.
+
+    Исключений сегодня НЕТ, и список исключений здесь не заведён намеренно:
+    все 30 модулей пакета `app` импортируются на чистом окружении (нужны только
+    `DATABASE_URL` и `SCHEDULER_ENABLED`, их выставляет вызывающий тест).
+    Если однажды появится действительно необязательный модуль, разрешать его
+    следует поимённо и с письменной причиной — но не `except Exception`.
+    """
+    pkg = importlib.import_module(package)
+    for info in pkgutil.walk_packages(pkg.__path__, prefix=f"{package}.",
+                                      onerror=_reraise_import_error):
+        importlib.import_module(info.name)
+
+
+# Имена колонок, которые в этом проекте означают ссылку на арендатора даже без
+# объявленного внешнего ключа. Список НАМЕРЕННО крошечный и обоснованный:
+# `order_receipts.created_by` объявлен обычным Integer без ForeignKey
+# (app/models.py), и по одним только внешним ключам сторож его бы не увидел —
+# а это ровно тот случай, ради которого он написан. Все три `created_by` в
+# проекте ссылаются на `users.id` и ни на что другое.
+ORG_REF_COLUMN_NAMES = frozenset({"org_id"})
+USER_REF_COLUMN_NAMES = frozenset({"user_id", "created_by"})
+
+
+def _tenant_refs(table, root_table: str, column_names: frozenset) -> set[str]:
+    """Колонки таблицы, которыми она ссылается на арендатора.
+
+    Две приметы, объединение, а не пересечение:
+      * внешний ключ на `orgs.id` / `users.id` — как бы колонка ни называлась
+        (модель с `organization_id -> orgs.id` такая же org-owned, и сторож,
+        который смотрел бы только на имя, её бы пропустил);
+      * имя колонки из списка выше — для ссылок, у которых внешнего ключа нет.
+    """
+    found = set()
+    for column in table.columns:
+        if column.name in column_names:
+            found.add(column.name)
+            continue
+        for fk in column.foreign_keys:
+            if fk.column.table.name == root_table:
+                found.add(column.name)
+                break
+    return found
+
+
+def _order_violations(models: tuple, root_table: str, setter: str) -> list[str]:
+    """Нарушения порядка внутри ОДНОГО набора удаления.
+
+    Правило одно: если таблица A ссылается внешним ключом на таблицу B и обе
+    стоят в наборе, A обязана удаляться РАНЬШЕ B. Корневая таблица арендатора
+    считается последней: её DELETE выполняется после цикла.
+
+    Ссылки наружу набора (например `production_orders.created_by -> users` в
+    наборе организации) не проверяются: они не удаляются этим потоком, и их
+    судьба — отдельный вопрос (SEC-8), а не вопрос порядка.
+    """
+    order = {m.__tablename__: i for i, m in enumerate(models)}
+    order[root_table] = len(order)
+
+    problems: list[str] = []
+    for model in models:
+        table = model.__table__
+        for column in table.columns:
+            for fk in column.foreign_keys:
+                target = fk.column.table.name
+                if target == table.name or target not in order:
+                    continue
+                if order[table.name] > order[target]:
+                    problems.append(
+                        f"порядок удаления нарушает внешний ключ "
+                        f"{table.name}.{column.name} -> {target}: "
+                        f"{table.name} удаляется ПОСЛЕ {target}, а обязана раньше "
+                        f"— в Postgres (и в SQLite с PRAGMA foreign_keys=ON) "
+                        f"DELETE {target} упал бы на этой ссылке. Переставь "
+                        f"{table.name} выше {target} в app.tenancy.{setter}"
+                    )
+    return sorted(set(problems))
+
+
+def purge_order_violations(org_models=None, user_models=None) -> list[str]:
+    """Список нарушений порядка удаления. Пустой список — порядок исполним.
+
+    Отдельная функция, а не проверка внутри теста: порядок — это то, что
+    ломается молча. В SQLite без `PRAGMA foreign_keys=ON` неверный порядок не
+    проявляется ничем, поэтому проверять его обязан код, а не наблюдение за
+    продом. Аргументы нужны отрицательному контролю: он подсовывает заведомо
+    перевёрнутый набор и требует, чтобы сторож назвал конкретный внешний ключ.
+
+    Цикл внешних ключей (A -> B и B -> A) сегодня в схеме отсутствует; если он
+    появится, топологического порядка не существует и эту функцию придётся
+    учить документированному исключению, а не молчать о нём.
+    """
+    if org_models is None:
+        org_models = org_purge_models()
+    if user_models is None:
+        user_models = user_purge_models()
+    return sorted(
+        _order_violations(tuple(org_models), ORG_ROOT_TABLE, "org_purge_models()")
+        + _order_violations(tuple(user_models), USER_ROOT_TABLE, "user_purge_models()")
+    )
+
+
+def purge_completeness_violations(registry=None) -> list[str]:
+    """Список нарушений полноты удаления. Пустой список — всё объяснено.
+
+    Сверяет фактический реестр SQLAlchemy с наборами удаления и списками
+    не-владеющих ссылок, и заодно проверяет порядок (`purge_order_violations`).
+    Возвращает человеческие строки: сообщение сторожа читает тот, кто добавил
+    модель и не знал про этот файл, — оно обязано говорить, что именно сделать.
+    """
+    if registry is None:
+        import_all_models()
+        from app.db import Base
+
+        registry = Base.registry
+
+    org_models = org_purge_models()
+    user_models = user_purge_models()
+    org_tables = {m.__tablename__: m for m in org_models}
+    user_tables = {m.__tablename__: m for m in user_models}
+
+    problems: list[str] = []
+    seen_org_refs: set[tuple[str, str]] = set()
+    seen_user_refs: set[tuple[str, str]] = set()
+
+    for mapper in registry.mappers:
+        cls = mapper.class_
+        table = mapper.local_table
+        if table is None:
+            continue
+        name = table.name
+        where = f"{cls.__module__}.{cls.__name__} (таблица {name})"
+
+        org_refs = _tenant_refs(table, ORG_ROOT_TABLE, ORG_REF_COLUMN_NAMES)
+        for column in sorted(org_refs):
+            seen_org_refs.add((name, column))
+            if name == ORG_ROOT_TABLE:
+                continue
+            if name in org_tables and column == "org_id":
+                continue
+            if (name, column) in NON_OWNING_ORG_REFERENCES:
+                continue
+            problems.append(
+                f"{where}: колонка {column} ссылается на организацию, но модель "
+                f"не удаляется вместе с организацией. Добавь её в "
+                f"app.tenancy.org_purge_models() в правильном по внешним ключам "
+                f"месте — либо, если строка организации не принадлежит, объясни "
+                f"это записью в NON_OWNING_ORG_REFERENCES"
+            )
+
+        user_refs = _tenant_refs(table, USER_ROOT_TABLE, USER_REF_COLUMN_NAMES)
+        for column in sorted(user_refs):
+            seen_user_refs.add((name, column))
+            if name == USER_ROOT_TABLE:
+                continue
+            if name in user_tables and column == "user_id":
+                continue
+            if (name, column) in NON_OWNING_USER_REFERENCES:
+                continue
+            problems.append(
+                f"{where}: колонка {column} ссылается на пользователя, но модель "
+                f"не удаляется вместе с пользователем. Добавь её в "
+                f"app.tenancy.user_purge_models() — либо, если это авторство "
+                f"org-owned строки, а не личные данные, объясни это записью "
+                f"в NON_OWNING_USER_REFERENCES"
+            )
+
+    # Наборы удаления не должны разъезжаться с реестром в обратную сторону:
+    # модель, которую цикл удаления трогает по несуществующей колонке, упала бы
+    # в рантайме — в момент, когда человек нажал «удалить аккаунт».
+    mapped_tables = {m.local_table.name for m in registry.mappers if m.local_table is not None}
+    for model in org_models:
+        name = getattr(model, "__tablename__", str(model))
+        if name not in mapped_tables:
+            problems.append(f"org_purge_models(): {name} нет в реестре моделей")
+        elif "org_id" not in model.__table__.c:
+            problems.append(
+                f"org_purge_models(): у {name} нет колонки org_id, а цикл удаления "
+                f"обращается к model.org_id — удаление организации упало бы"
+            )
+    for model in user_models:
+        name = getattr(model, "__tablename__", str(model))
+        if name not in mapped_tables:
+            problems.append(f"user_purge_models(): {name} нет в реестре моделей")
+        elif "user_id" not in model.__table__.c:
+            problems.append(
+                f"user_purge_models(): у {name} нет колонки user_id, а цикл удаления "
+                f"обращается к model.user_id — удаление аккаунта упало бы"
+            )
+
+    # Протухший список исключений опаснее отсутствующего: он молча разрешает то,
+    # чего уже нет, и вместе с этим — то, что появится под старым именем.
+    for key, reason in NON_OWNING_ORG_REFERENCES.items():
+        if key not in seen_org_refs:
+            problems.append(
+                f"NON_OWNING_ORG_REFERENCES: записи {key[0]}.{key[1]} больше нет в "
+                f"моделях — удали её (причина была: {reason})"
+            )
+    for key, reason in NON_OWNING_USER_REFERENCES.items():
+        if key not in seen_user_refs:
+            problems.append(
+                f"NON_OWNING_USER_REFERENCES: записи {key[0]}.{key[1]} больше нет в "
+                f"моделях — удали её (причина была: {reason})"
+            )
+
+    return sorted(problems + purge_order_violations(org_models, user_models))

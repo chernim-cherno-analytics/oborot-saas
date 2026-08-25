@@ -10,19 +10,23 @@
                        история — в одной транзакции с первой записью новой
                        (инвариант 18.08: никакого wipe до первой удачной загрузки);
   month     (10–25%) — окно W = INITIAL_WINDOW_DAYS последних дат (хронологически,
-                       с явными нулями), продажи и «едет к нам» за окно; затем
+                       с явными нулями) И продажи окна — ОДНОЙ транзакцией
+                       (D-38), затем «едет к нам»; затем
                        FINALIZE-LITE: connection.status='active', last_sync_at,
                        сброс кэша аналитики, stats.coverage_days=W,
                        stats.history_loaded_from=начало окна, stats.phase='history'.
                        С этого момента все страницы работают на W днях истории;
   history   (25–98%) — остальные даты от (W_start−1) НАЗАД к (today−HISTORY_DAYS+1)
                        чанками по STOCK_CHUNK_DATES, новые → старые. Чанк: скачать
-                       остатки → явные нули хронологически внутри чанка → записать;
-                       ГРАНИЧНАЯ ЗАПЛАТКА: день D = chunk_end+1 (уже записан, более
-                       новый сосед) получает qty=0 для позиций, которые были >0 на
-                       chunk_end и не имеют строки на D — ровно то, что дал бы
-                       прямой хронологический проход; затем продажи за даты чанка
-                       (delete+insert диапазона), stats.history_loaded_from=chunk_start,
+                       остатки → явные нули хронологически внутри чанка → скачать
+                       продажи за даты чанка → ЗАПИСАТЬ ОБЕ ПОЛОВИНЫ ОДНОЙ
+                       ТРАНЗАКЦИЕЙ (D-38: дня остатков без своих продаж в базе не
+                       существует ни на секунду);
+                       ГРАНИЧНАЯ ЗАПЛАТКА в той же транзакции: день D = chunk_end+1
+                       (уже записан, более новый сосед) получает qty=0 для позиций,
+                       которые были >0 на chunk_end и не имеют строки на D — ровно
+                       то, что дал бы прямой хронологический проход;
+                       затем stats.history_loaded_from=chunk_start,
                        coverage_days, months[], сброс кэша аналитики;
   finalize  (98–100%)— как раньше: done, точка продолжения снимается.
 
@@ -37,8 +41,12 @@ history синк оставляет status='active' и coverage_days; любой
 Статус подключения никогда не понижается.
 
 Инкрементальный синк (mode='incremental'): обновление цен из ассортимента,
-живые остатки на сегодня (+ явные нули), перезапись продаж за последние
-SYNC_DAYS_BACK дней (окно — так legacy чинил дыры от опоздавших документов).
+живые остатки на сегодня (+ явные нули) и перезапись продаж за последние
+SYNC_DAYS_BACK дней (окно — так legacy чинил дыры от опоздавших документов) —
+тоже ОДНОЙ транзакцией (D-38). Упавший на документах инкремент не обновляет и
+остатки: свежий остаток при вчерашних продажах — это заниженный темп, а не
+«частично свежие данные». Остатки по складам (warehouse_stock) обновляются
+отдельно и сразу: измерения «день» у них нет, в оборачиваемость они не входят.
 
 Приёмы, портированные из legacy (проверены на реальном бренде):
 - «явный ноль»: позиция с прошлым остатком >0, исчезнувшая из отчёта, получает
@@ -799,6 +807,25 @@ def _is_background_history_stop(exc: Exception, org_id: int, stats: dict) -> boo
             and _connection_status(org_id) == "active")
 
 
+class PriceTypesGone(RuntimeError):
+    """Выбранного типа цены нет ни у одного товара — чинит только владелец.
+
+    Ревью 25.08.2026 (PR #10, discussion_r3849074704). Остановка D-40
+    поднималась голым `RuntimeError`, и `error_cause()` относил её к
+    `internal` — к сбоям, в которых пользователю остаётся ждать. Дальше это
+    расходилось с реальностью в двух местах сразу: Telegram-алерт дописывал
+    «Мы уже разбираемся» поверх текста, который зовёт владельца в Настройки, а
+    полоска синка предлагала кнопку «Повторить» — повтор без смены настройки
+    даёт ровно ту же ошибку.
+
+    Отдельный класс, а не переклассификация всех `RuntimeError`: под ним в
+    этом модуле ходят и настоящие внутренние сбои, и для них «мы уже
+    разбираемся» — правда. Наследование от `RuntimeError` сохранено намеренно:
+    `_human_error` показывает такие ошибки владельцу как есть, и текст
+    остановки (`price_types_gone_message`) написан именно для этого.
+    """
+
+
 class SyncInterrupted(Exception):
     """Первичная загрузка прервана после того, как часть истории уже записана.
 
@@ -840,11 +867,18 @@ def _human_error(exc: Exception) -> str:
 
 
 def error_cause(exc: Exception) -> str:
-    """Класс причины для подсказок: token | transient | internal."""
+    """Класс причины для подсказок: token | settings | transient | internal.
+
+    `settings` — ошибка, которую исправляет владелец в Настройках, и никто
+    другой. Отличается от `internal` тем, что ждать нечего, и от `transient`
+    тем, что повтор без вмешательства даст тот же результат.
+    """
     import httpx
 
     if isinstance(exc, SyncInterrupted):
         return exc.cause
+    if isinstance(exc, PriceTypesGone):
+        return "settings"
     if isinstance(exc, httpx.HTTPStatusError):
         if exc.response.status_code in (401, 403):
             return "token"
@@ -958,7 +992,38 @@ async def _run_sync(org_id: int, mode: str, resume_from: str | None = None,
         # Какие типы цен считать «ценой продажи» и «полной себестоимостью»:
         # выбор организации, иначе угадываем по названию (см. _price_by).
         _load_price_types(org_id)
-        stats["price_types"] = price_type_names(assortment)[:20]
+        available_price_types = price_type_names(assortment)
+        # Сохраняется ТОТ ЖЕ список, по которому работает замок ниже, и целиком.
+        # Ревью 25.08.2026 (discussion_r3852672410): здесь стояла обрезка до
+        # двадцати имён, а экран настроек показывает ровно то, что сохранено.
+        # На аккаунте, где типов цен много, годная замена пропавшему типу
+        # оказывалась за границей обрезки и не выбиралась в продукте вовсе:
+        # синк останавливался правильно, а починить его владельцу было нечем —
+        # ровно тот тупик, который D-40 обещает не допускать. Список типов цен
+        # это справочник уровня аккаунта, а не данные по товарам, и полностью
+        # он всё равно уже посчитан здесь же, в памяти.
+        stats["price_types"] = available_price_types
+        # DATA-10. Выбранного типа цены нет НИ У ОДНОГО товара — значит его
+        # переименовали или удалили (либо в имени опечатка). Останавливаемся
+        # ДО _upsert_products: там `row.cost_full = item.get("cost_full") or 0.0`
+        # записал бы ноль поверх прежней полной себестоимости по всему
+        # ассортименту, а sale_price откатился бы на первую цену в списке — то
+        # есть на ЧУЖОЙ тип. Тихая порча денег хуже остановки: остановку видно,
+        # подменённую цену — нет. Продажа и себестоимость падают одинаково:
+        # обе публикуются одной операцией, и «одну обновим, другую оставим»
+        # это ровно та несогласованная пара, из-за которой маржа считается
+        # по разным прогонам.
+        gone_price_types = missing_price_types(org_id, available_price_types)
+        if gone_price_types:
+            # Свежий список типов сохраняем ДО подъёма ошибки: его показывает
+            # выпадающий список настроек (api._price_types_seen), а обработчик
+            # в _thread_main перечитывает stats из базы. Без этой строки
+            # владелец видел бы ошибку «тип исчез» и старый список, в котором
+            # исчезнувший тип всё ещё есть, а нового нет. Переносимые ключи
+            # (_CARRIED_STATS) уже лежат в stats и сохраняются вместе с ним.
+            _persist(org_id, stats)
+            raise PriceTypesGone(price_types_gone_message(gone_price_types,
+                                                          available_price_types))
         ext_to_pid = _upsert_products(org_id, assortment, stats)
         _stage_end(stats, "products")
         _persist(org_id, stats, stage="products", progress=5.0 if initial else 8.0,
@@ -1094,7 +1159,26 @@ async def _run_initial(org_id: int, client: MoySkladClient, active_wh: list,
         day_results = await _fetch_dates(client, active_wh, gap_dates, ext_to_pid, unmatched)
         prev_positive = _positive_before(org_id, gap_dates[0])
         batch, zeroed = _rows_for_dates(org_id, gap_dates, day_results, prev_positive)
-        _write_stock_rows(org_id, gap_dates, batch)
+        # DATA-3: дни продолжения публикуются вместе со СВОИМИ продажами — тем
+        # же правилом, что окно, кусок истории и инкремент. Раньше остатки gap
+        # коммитились здесь, граница history_loaded_to уезжала на сегодня, а
+        # продажи ехали отдельным вызовом в фазе month. Следствий было два, и
+        # оба тихие. Падение между этими точками оставляло опубликованные дни
+        # остатков без продаж, и починить это было уже нечем: следующий запуск
+        # видел границу продвинутой и пропущенным такой gap не считал. А при
+        # ОДНОДНЕВНОМ gap с window_done=true продажи не грузились здесь вообще
+        # (heal_from оставался None) — новый день остатков попадал в базу с
+        # пустым числителем штатно, без всякого сбоя.
+        _persist(org_id, stats, stage="today", progress=8.0,
+                 detail=(f"Загружаем продажи за {gap_dates[0]}…" if len(gap_dates) == 1
+                         else f"Загружаем продажи за пропущенные "
+                              f"{len(gap_dates)} дн.…"))
+        sales_rows = await _collect_sales(org_id, client, active_wh, ext_to_pid,
+                                          stats, initial=True, date_from=gap_dates[0],
+                                          date_to=gap_dates[-1], replace_all=False)
+        _write_stock_rows(org_id, gap_dates, batch, sales_rows=sales_rows,
+                          sales_from=gap_dates[0], sales_to=gap_dates[-1])
+        _sales_written(org_id, stats, sales_rows, gap_dates[0])
         stats["stock_zeroed"] += zeroed
         stats["history_loaded_to"] = today_iso
         stats["stock_dates"] += len(gap_dates) - 1
@@ -1131,7 +1215,11 @@ async def _run_initial(org_id: int, client: MoySkladClient, active_wh: list,
         # этом уже опубликована, и раньше фаза month пропускалась НАВСЕГДА:
         # до 30 дней продаж оставались пустыми, а синк рапортовал done.
         # window_done ставится только после успешных продаж И «едет к нам».
-        heal_from = gap_dates[0] if len(gap_dates) > 1 else None
+        # DATA-3: продажи самих дней gap здесь больше не догоняются — они уже
+        # опубликованы одной транзакцией с остатками этих дней в фазе today.
+        # Осталась ровно одна причина ходить за продажами здесь: незакрытое
+        # окно быстрого старта.
+        heal_from = None
         if not stats.get("window_done"):
             # Ревью 21.08 (повторное): догон начинается от СТАРОГО начала окна
             # (resume_from), а не от окна, пересчитанного на сегодняшнюю дату.
@@ -1140,7 +1228,7 @@ async def _run_initial(org_id: int, client: MoySkladClient, active_wh: list,
             # а all_dates[-window] за эти дни уехал вперёд. Стоимость догона
             # ограничена: пустой window_done означает, что ни один чанк ещё не
             # отработал, то есть resume_from не старше окна на момент падения.
-            heal_from = min(heal_from, resume_from) if heal_from else resume_from
+            heal_from = resume_from
         if heal_from:
             _persist(org_id, stats, stage="month", progress=11.0,
                      detail=f"Догружаем продажи с {heal_from}…")
@@ -1166,17 +1254,26 @@ async def _run_initial(org_id: int, client: MoySkladClient, active_wh: list,
             day_results.update(await _fetch_dates(
                 client, active_wh, month_dates[:-1], ext_to_pid, unmatched))
         batch, zeroed = _rows_for_dates(org_id, month_dates, day_results, set())
-        _write_stock_rows(org_id, month_dates, batch)  # «сегодня» перезаписывается с нулями
+        _persist(org_id, stats, stage="month", progress=16.0,
+                 detail=f"Загружаем продажи за последние {window} дн.…")
+        # DATA-3: продажи окна СНАЧАЛА скачиваются, и только потом окно
+        # публикуется целиком — остатки и продажи одной транзакцией. Раньше
+        # остатки окна коммитились здесь, а продажи ехали следующим вызовом:
+        # падение между ними оставляло месяц остатков при нуле продаж, что
+        # читается как «товар не продаётся» и обнуляет заказ.
+        sales_rows = await _collect_sales(org_id, client, active_wh, ext_to_pid,
+                                          stats, initial=True, date_from=w_start,
+                                          date_to=today_iso, replace_all=True,
+                                          progress=(16.0, 21.0))
+        _write_stock_rows(org_id, month_dates, batch,  # «сегодня» перезаписывается с нулями
+                          sales_rows=sales_rows, sales_from=w_start,
+                          sales_to=today_iso, sales_replace_all=True)
+        _sales_written(org_id, stats, sales_rows, w_start, (16.0, 21.0))
         stats["stock_dates"] += len(month_dates) - 1
         stats["stock_rows"] += len(batch)
         stats["stock_zeroed"] += zeroed
         stats["history_loaded_from"] = w_start
         stats["coverage_days"] = window
-        _persist(org_id, stats, stage="month", progress=16.0,
-                 detail=f"Загружаем продажи за последние {window} дн.…")
-        await _sync_sales(org_id, client, active_wh, ext_to_pid, stats, initial=True,
-                          date_from=w_start, date_to=today_iso, replace_all=True,
-                          progress=(16.0, 21.0))
         stats["window_sales_docs"] = stats.get("sales_docs")
         stats["window_sales_rows"] = stats.get("sales_rows")
         stats["window_return_rows"] = stats.get("return_rows")
@@ -1210,14 +1307,20 @@ async def _run_initial(org_id: int, client: MoySkladClient, active_wh: list,
         hits_429_before = client.stats.get("429", 0)
         day_results = await _fetch_dates(client, active_wh, chunk, ext_to_pid, unmatched)
         batch, zeroed = _rows_for_dates(org_id, chunk, day_results, set())
-        _write_stock_rows(org_id, chunk, batch, boundary_next=_day_after(chunk[-1]))
-        # Ревью 21.08 (минор 6): сбрасываем кэш СРАЗУ после записи остатков —
-        # продажи чанка качаются ещё десятки секунд, и открытая в этот момент
-        # страница закэшировала бы снапшот «новые дни в стоке + старые продажи»
-        # (заниженная оборачиваемость) до следующего сброса.
-        analytics.invalidate(org_id)
-        await _sync_sales(org_id, client, active_wh, ext_to_pid, stats, initial=True,
-                          date_from=chunk[0], date_to=chunk[-1], replace_all=False)
+        # DATA-3: сначала скачиваем ОБЕ половины куска, потом публикуем их
+        # одной транзакцией. Прежний порядок (коммит остатков → десятки секунд
+        # сети → коммит продаж) на всё это время расширял знаменатель «дней в
+        # стоке» днями, продаж за которые ещё нет: темп занижен, «хватит на N
+        # дней» завышено. Ревью 21.08 (минор 6) лечило здесь кэш аналитики —
+        # это лечило симптом, числа врали и без кэша. Смерть до коммита теперь
+        # оставляет кусок просто не загруженным.
+        sales_rows = await _collect_sales(org_id, client, active_wh, ext_to_pid,
+                                          stats, initial=True, date_from=chunk[0],
+                                          date_to=chunk[-1], replace_all=False)
+        _write_stock_rows(org_id, chunk, batch, boundary_next=_day_after(chunk[-1]),
+                          sales_rows=sales_rows, sales_from=chunk[0],
+                          sales_to=chunk[-1])
+        _sales_written(org_id, stats, sales_rows, chunk[0])
         stats["history_loaded_from"] = chunk[0]
         stats["coverage_days"] = _days_since(chunk[0])
         stats["history_chunks_done"] += 1
@@ -1265,19 +1368,29 @@ async def _run_incremental(org_id: int, client: MoySkladClient, active_wh: list,
     day_results = await _fetch_dates(client, active_wh, dates, ext_to_pid, unmatched)
     prev_positive = _positive_before(org_id, dates[0])
     batch, zeroed = _rows_for_dates(org_id, dates, day_results, prev_positive)
-    _write_stock_rows(org_id, dates, batch)
+    # Остатки по складам к оборачиваемости отношения не имеют (нет измерения
+    # «день»), поэтому обновляются сразу и от продаж не зависят.
     _, by_wh = day_results[dates[-1]]
     _write_warehouse_stock(org_id, by_wh, stats)
+    _set_state(org_id, stage="stock_today", progress=40.0,
+               detail="Остатки на сегодня обновлены")
+    # DATA-3: тот же инвариант, что и в первичной загрузке, — новый день
+    # остатков и продажи за него публикуются одной транзакцией. Иначе каждый
+    # час между записью остатков и приездом документов «дней в стоке» на день
+    # больше, чем дней с продажами.
+    sales_from = _iso(today - timedelta(days=sales_days - 1))
+    sales_rows = await _collect_sales(org_id, client, active_wh, ext_to_pid, stats,
+                                      initial=False, date_from=sales_from,
+                                      date_to=None, replace_all=False,
+                                      progress=(50.0, 90.0))
+    _write_stock_rows(org_id, dates, batch, sales_rows=sales_rows,
+                      sales_from=sales_from, sales_to=None)
+    _sales_written(org_id, stats, sales_rows, sales_from, (50.0, 90.0))
     stats["stock_dates"] = len(dates)
     stats["stock_rows"] = len(batch)
     stats["stock_zeroed"] = zeroed
     if unmatched:
         stats["stock_unmatched_skus"] = len(unmatched)
-    _set_state(org_id, stage="stock_today", progress=40.0,
-               detail="Остатки на сегодня обновлены")
-    await _sync_sales(org_id, client, active_wh, ext_to_pid, stats, initial=False,
-                      date_from=_iso(today - timedelta(days=sales_days - 1)),
-                      date_to=None, replace_all=False, progress=(50.0, 90.0))
     await _sync_incoming(org_id, client, ext_to_pid, stats, progress=(95.5, 97.0))
 
 
@@ -1292,6 +1405,17 @@ def _has_stock_rows(org_id: int) -> bool:
 
 
 # ── Товары ───────────────────────────────────────────────────────────────────
+
+# Строки ассортимента, которые доезжают до products. Список ОДИН на весь
+# модуль, и это не косметика: по нему же считаются типы цен (price_type_names),
+# а на них стоит замок DATA-10. Пока список был литералом в одном месте и
+# отсутствовал в другом, критерий «выбранного типа нет ни у одного ТОВАРА»
+# (D-40) проверялся на строках, которых в products нет вовсе: тип, оставшийся
+# только у услуги, засчитывался как присутствующий, синк проходил, и у
+# импортируемого товара цена продажи откатывалась на чужой тип, а cost_full
+# записывался нулём. Два места разъехаться больше не могут.
+_IMPORTED_TYPES = ("product", "variant")
+
 
 def _parse_assortment(rows: list[dict], org_id: int = 0) -> list[dict]:
     """Строки ассортимента → атрибуты наших products.
@@ -1317,7 +1441,7 @@ def _parse_assortment(rows: list[dict], org_id: int = 0) -> list[dict]:
     out: list[dict] = []
     for row in rows:
         meta_type = (row.get("meta") or {}).get("type")
-        if meta_type not in ("product", "variant"):
+        if meta_type not in _IMPORTED_TYPES:
             continue  # услуги, комплекты и серии в аналитике не участвуют
         ext_id = row.get("id") or _href_id((row.get("meta") or {}).get("href"))
         if not ext_id:
@@ -1407,9 +1531,16 @@ def _load_price_types(org_id: int) -> None:
 
 
 def set_price_types(org_id: int, sale: str = "", cost: str = "") -> None:
-    """Выбор типов цен организации (вызывается синком из настроек org)."""
+    """Выбор типов цен организации (вызывается синком из настроек org).
+
+    Сравнение имён идёт в нижнем регистре, а владельцу в сообщении об ошибке
+    нужно ЕГО написание: в тексте «тип «полная себестоимость» исчез» человек
+    не узнаёт свою настройку. Поэтому храним обе формы.
+    """
     _PRICE_TYPES[org_id] = {"sale": (sale or "").strip().lower(),
-                            "cost": (cost or "").strip().lower()}
+                            "cost": (cost or "").strip().lower(),
+                            "sale_raw": (sale or "").strip(),
+                            "cost_raw": (cost or "").strip()}
 
 
 def _price_by(row: dict, exact: str, hints: tuple[str, ...]) -> float:
@@ -1428,9 +1559,27 @@ def _price_by(row: dict, exact: str, hints: tuple[str, ...]) -> float:
 
 
 def price_type_names(rows: list[dict]) -> list[str]:
-    """Все типы цен, встреченные в ассортименте — для выбора в настройках."""
+    """Типы цен ИМПОРТИРУЕМЫХ строк ассортимента (_IMPORTED_TYPES).
+
+    Два потребителя, и обоим нужен один и тот же список.
+
+    Замок DATA-10 (D-40) спрашивает: «есть ли выбранный тип хоть у одного
+    ТОВАРА». Услуги, комплекты и серии товарами не являются — `_parse_assortment`
+    их не импортирует, в products их нет. Их типы цен были бы ложным
+    свидетельством: выбранный тип, оставшийся только у услуги, у товара
+    отсутствует, и молчание замка заканчивалось бы ровно той тихой порчей
+    денег, ради которой он написан (чужая цена продажи и cost_full = 0).
+
+    Выпадающий список настроек берёт этот же список (stats["price_types"] →
+    api._price_types_seen). Иначе интерфейс предлагал бы к выбору тип, который
+    синк тут же отвергает, — а расхождение показанного и посчитанного само по
+    себе стоп-условие. Сохранённый выбор при этом не теряется: шаблон
+    дорисовывает его отдельной строкой «(нет в ассортименте)».
+    """
     seen: dict[str, None] = {}
     for row in rows:
+        if (row.get("meta") or {}).get("type") not in _IMPORTED_TYPES:
+            continue
         for pr in row.get("salePrices") or []:
             name = str(((pr or {}).get("priceType") or {}).get("name") or "").strip()
             if name:
@@ -1438,10 +1587,76 @@ def price_type_names(rows: list[dict]) -> list[str]:
     return list(seen)
 
 
-def _sale_price_of(row: dict, org_id: int = 0) -> float:
+# Роли типов цен в порядке, в котором они называются владельцу.
+_PRICE_ROLES = (("sale", "цена продажи"), ("cost", "полная себестоимость"))
+
+
+def missing_price_types(org_id: int, available: list[str]) -> list[tuple[str, str]]:
+    """Явно выбранные типы цен, которых нет НИ У ОДНОГО товара: [(имя, роль)].
+
+    available — ПОЛНЫЙ список типов импортируемых товаров (price_type_names),
+    не обрезанный для stats: выбранный тип, не попавший в первую двадцатку, —
+    не пропавший тип.
+    Пустая настройка сюда не попадает: за неё отвечают эвристики (_price_by),
+    и они работают как раньше. Отсутствие типа у ОТДЕЛЬНЫХ карточек — тоже не
+    наш случай: непроставленная цена на части ассортимента это нормальное
+    состояние каталога, а не авария.
+    """
     cfg = _PRICE_TYPES.get(org_id) or {}
-    val = _price_by(row, cfg.get("sale") or "", _SALE_HINTS)
-    if val:
+    have = {str(name).strip().lower() for name in available}
+    out: list[tuple[str, str]] = []
+    for key, role in _PRICE_ROLES:
+        chosen = cfg.get(key) or ""
+        if chosen and chosen not in have:
+            out.append((cfg.get(f"{key}_raw") or chosen, role))
+    return out
+
+
+def price_types_gone_message(missing: list[tuple[str, str]],
+                             available: list[str]) -> str:
+    """Текст остановки: что пропало, почему остановились и из чего выбирать."""
+    what = ", ".join(f"«{name}» ({role})" for name, role in missing)
+    plural = len(missing) > 1
+    shown = [str(n).strip() for n in available if str(n).strip()]
+    if not shown:
+        tail = "Ни одного типа цены в ассортименте МойСклада сейчас нет."
+    else:
+        tail = "Сейчас в ассортименте есть: " + ", ".join(shown[:12])
+        tail += " и другие." if len(shown) > 12 else "."
+    return (
+        f"{'Выбранные типы цен' if plural else 'Выбранный тип цены'} {what} "
+        f"{'больше не встречаются' if plural else 'больше не встречается'} "
+        "в ассортименте МойСклада — тип переименован или удалён. Цены товаров "
+        "оставлены прежними: пересчёт по чужому типу цены исказил бы "
+        "себестоимость и прибыль во всей аналитике. Выберите тип заново в "
+        f"Настройках и запустите синхронизацию. {tail}"
+    )
+
+
+def _sale_price_of(row: dict, org_id: int = 0) -> float:
+    """Цена продажи карточки (0 = выбранного типа в ней нет).
+
+    Ревью 25.08.2026 (PR #10, discussion_r3848821144). Замок D-40 сверяет
+    ГЛОБАЛЬНОЕ отсутствие типа, и это сознательная граница: непроставленная
+    цена на ЧАСТИ ассортимента — нормальное состояние каталога, останавливать
+    на ней синк нельзя. Но в этом нормальном состоянии откат на «первую цену в
+    списке» записывал карточке ЧУЖОЙ тип: у товара, где выбранной цены продажи
+    нет, а полная себестоимость есть, первой в списке оказывалась именно она.
+    Замок при этом молчал законно, синк рапортовал «завершена» — то есть дыра
+    была уже исходной, но тише.
+
+    Поэтому откат действует ТОЛЬКО там, где выбора нет. Явный выбор означает,
+    что подставлять вместо него нечего: отсутствие представляется нулём, и
+    ноль здесь честнее подмены — ноль видно, чужую цену нет.
+
+    Наследование модификацией цены родителя (`_parse_assortment`) правилом не
+    затрагивается: родитель считается этим же выбранным типом, значит наследуется
+    цена ТОГО ЖЕ типа, а не чужого.
+    """
+    cfg = _PRICE_TYPES.get(org_id) or {}
+    exact = cfg.get("sale") or ""
+    val = _price_by(row, exact, _SALE_HINTS)
+    if val or exact:
         return val
     prices = row.get("salePrices") or []
     if not prices:
@@ -1753,7 +1968,11 @@ def _rows_for_dates(org_id: int, dates: list[str], day_results: dict,
 
 def _write_stock_rows(org_id: int, dates: list[str], batch: list[dict], *,
                       wipe: bool = False, wipe_sales: bool = False,
-                      boundary_next: str | None = None) -> None:
+                      boundary_next: str | None = None,
+                      sales_rows: list[dict] | None = None,
+                      sales_from: str | None = None,
+                      sales_to: str | None = None,
+                      sales_replace_all: bool = False) -> None:
     """Одна транзакция: (wipe всей истории | delete дат) + insert + граничная заплатка.
 
     wipe=True — полная пересборка: старая история стирается здесь, когда новые
@@ -1774,6 +1993,18 @@ def _write_stock_rows(org_id: int, dates: list[str], batch: list[dict], *,
     boundary_next — дата D = dates[-1]+1, уже записанная более новым чанком
     (деплой П1): D получает qty=0 для позиций, которые были >0 на dates[-1] и
     не имеют строки на D — ровно то, что дал бы хронологический проход.
+
+    sales_rows (DATA-3) — продажи ЗА ТЕ ЖЕ ДНИ, уже скачанные, но ещё не
+    записанные: попадают в ЭТУ ЖЕ транзакцию. Причина та же, что у wipe_sales,
+    только шов ниже: раньше кусок публиковался в два приёма — остатки коммитом
+    здесь, продажи отдельным коммитом десятками секунд позже. Между этими
+    точками граница загруженной истории (analytics: min(StockDay.date)) уже
+    уехала назад, а продаж за новые дни ещё нет: знаменатель «дней в стоке»
+    шире числителя, темп занижен, «хватит на N дней» завышено. Штатно это
+    видел каждый, кто смотрел на страницу во время пересборки; падение в
+    этом окне (429, OOM, рестарт) оставляло такую базу до следующего прогона.
+    Инвариант: в базе не существует дня остатков, продажи за который не
+    загружены. Смерть до коммита оставляет кусок просто не загруженным.
     """
     db = SessionLocal()
     try:
@@ -1801,6 +2032,9 @@ def _write_stock_rows(org_id: int, dates: list[str], batch: list[dict], *,
                          for pid in positive_last - present]
                 if patch:
                     db.execute(insert(StockDay), patch)
+        if sales_rows is not None:
+            _apply_sales(db, org_id, sales_rows, cutoff=sales_from or (dates[0] if dates else ""),
+                         date_to=sales_to, replace_all=sales_replace_all)
         db.commit()
     finally:
         db.close()
@@ -2278,12 +2512,48 @@ def _write_shipped_receipts(
 
 # ── Продажи ──────────────────────────────────────────────────────────────────
 
-async def _sync_sales(org_id: int, client: MoySkladClient,
-                      active_wh: list[Warehouse], ext_to_pid: dict[str, int],
-                      stats: dict, initial: bool, *, date_from: str,
-                      date_to: str | None, replace_all: bool,
-                      progress: tuple[float, float] | None = None) -> None:
-    """Продажи и возвраты из документов МойСклад → таблица sales.
+def _apply_sales(db, org_id: int, rows: list[dict], *, cutoff: str,
+                 date_to: str | None, replace_all: bool) -> None:
+    """Перезапись диапазона продаж В УЖЕ ОТКРЫТОЙ транзакции, без коммита.
+
+    Вынесено из _sync_sales, чтобы продажи куска истории можно было положить
+    в ту же транзакцию, что и остатки этого куска (DATA-3, _write_stock_rows).
+    """
+    if replace_all:
+        db.execute(delete(Sale).where(Sale.org_id == org_id))
+    elif date_to:
+        db.execute(delete(Sale).where(Sale.org_id == org_id, Sale.date >= cutoff,
+                                      Sale.date <= date_to))
+    else:
+        db.execute(delete(Sale).where(Sale.org_id == org_id, Sale.date >= cutoff))
+    if rows:
+        db.execute(insert(Sale), rows)
+
+
+def _sales_written(org_id: int, stats: dict, rows: list[dict], cutoff: str,
+                   progress: tuple[float, float] | None = None) -> None:
+    """Счётчики и прогресс ПОСЛЕ того, как продажи легли в базу."""
+    stats["sales_rows"] += sum(1 for r in rows if not r["is_return"])
+    stats["return_rows"] += sum(1 for r in rows if r["is_return"])
+    stats["sales_window_from"] = cutoff
+    base_progress, end_progress = progress or (0.0, 0.0)
+    if end_progress - base_progress:
+        _set_state(org_id, stage="sales", progress=end_progress,
+                   detail=f"Продажи записаны: {len(rows)} строк с {cutoff}",
+                   stats_json=json.dumps(stats, ensure_ascii=False))
+
+
+async def _collect_sales(org_id: int, client: MoySkladClient,
+                         active_wh: list[Warehouse], ext_to_pid: dict[str, int],
+                         stats: dict, initial: bool, *, date_from: str,
+                         date_to: str | None, replace_all: bool,
+                         progress: tuple[float, float] | None = None) -> list[dict]:
+    """Продажи и возвраты из документов МойСклад → строки для таблицы sales.
+
+    СКАЧИВАЕТ И СВОРАЧИВАЕТ, НО НЕ ПИШЕТ. Разделение сбора и записи (DATA-3)
+    нужно затем, чтобы вызывающий мог опубликовать продажи куска одной
+    транзакцией с остатками того же куска и не оставить в базе день остатков,
+    продажи за который не загружены.
 
     Документы: retaildemand (розница) + demand (отгрузки) — продажи,
     salesreturn — возвраты. Фильтр по выбранным складам (store документа).
@@ -2361,30 +2631,32 @@ async def _sync_sales(org_id: int, client: MoySkladClient,
                 cur[1] += revenue
             stats["sales_docs"] += 1
 
-    rows = [
+    return [
         {"org_id": org_id, "product_id": pid, "date": day, "qty": qty,
          "revenue": round(revenue, 2), "is_return": is_return}
         for (pid, day, is_return), (qty, revenue) in agg.items()
     ]
+
+
+async def _sync_sales(org_id: int, client: MoySkladClient,
+                      active_wh: list[Warehouse], ext_to_pid: dict[str, int],
+                      stats: dict, initial: bool, *, date_from: str,
+                      date_to: str | None, replace_all: bool,
+                      progress: tuple[float, float] | None = None) -> None:
+    """Скачать и записать продажи диапазона (сбор + собственная транзакция).
+
+    Так продажи грузятся там, где остатков за те же дни никто не пишет:
+    инкремент, догон окна после продолжения. Куски первичной истории ходят
+    другим путём — через _collect_sales + _write_stock_rows (DATA-3).
+    """
+    rows = await _collect_sales(org_id, client, active_wh, ext_to_pid, stats,
+                                initial, date_from=date_from, date_to=date_to,
+                                replace_all=replace_all, progress=progress)
     db = SessionLocal()
     try:
-        if replace_all:
-            db.execute(delete(Sale).where(Sale.org_id == org_id))
-        elif date_to:
-            db.execute(delete(Sale).where(Sale.org_id == org_id, Sale.date >= cutoff,
-                                          Sale.date <= date_to))
-        else:
-            db.execute(delete(Sale).where(Sale.org_id == org_id, Sale.date >= cutoff))
-        if rows:
-            db.execute(insert(Sale), rows)
+        _apply_sales(db, org_id, rows, cutoff=date_from, date_to=date_to,
+                     replace_all=replace_all)
         db.commit()
     finally:
         db.close()
-
-    stats["sales_rows"] += sum(1 for r in rows if not r["is_return"])
-    stats["return_rows"] += sum(1 for r in rows if r["is_return"])
-    stats["sales_window_from"] = cutoff
-    if span:
-        _set_state(org_id, stage="sales", progress=base_progress + span,
-                   detail=f"Продажи записаны: {len(rows)} строк с {cutoff}",
-                   stats_json=json.dumps(stats, ensure_ascii=False))
+    _sales_written(org_id, stats, rows, date_from, progress)

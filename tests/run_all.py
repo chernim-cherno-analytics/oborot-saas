@@ -58,8 +58,8 @@ ROOT = Path(__file__).resolve().parents[1]
 TESTS = ROOT / "tests"
 
 # Порты разведены с запасом: приложение 8811+, моки МойСклада 9821+, телеграм 9841+.
-# Диапазоны намеренно не пересекаются со «своими» портами файлов (8801–8808,
-# 9800, 9801, 9810), чтобы раннер можно было запустить, пока идёт ручной прогон.
+# Диапазоны намеренно не пересекаются со «своими» портами файлов (8801–8809,
+# 9800, 9801, 9810, 9811), чтобы раннер можно было запустить, пока идёт ручной прогон.
 SUITES = [
     # имя,          файл,                     нужен мок МС, нужен мок телеграма
     ("runner",      "test_runner.py",          False, False),
@@ -68,11 +68,14 @@ SUITES = [
     ("account",     "test_account.py",         False, False),
     ("lessons",     "test_lessons.py",         False, False),
     ("isolation",   "test_isolation.py",       False, False),
+    ("tenancy",     "test_tenancy.py",         False, False),
     ("writeback",   "test_writeback.py",       True,  False),
     ("vendor",      "test_vendor.py",          True,  False),
     ("decision",    "test_decision_record.py", False, False),
     ("notify",      "test_notify.py",          True,  True),
     ("sync_wipe",   "test_sync_wipe.py",       True,  False),
+    ("sync_atomic", "test_sync_atomic.py",     True,  False),
+    ("price_types", "test_price_types.py",     True,  False),
     ("wb_dup",      "test_writeback_dup.py",   True,  False),
     ("wb_idem",     "test_writeback_idempotency.py", True, False),
     ("ops",         "test_ops.py",             False, False),

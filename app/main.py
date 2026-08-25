@@ -719,56 +719,36 @@ def _purge_org(db: Session, org_id: int) -> None:
     (в SQLite по умолчанию нет), и обратный порядок упал бы. Список таблиц
     держим полным: осиротевшая строка с org_id удалённой организации — это и
     невыполненное обещание «данные стёрты», и мина под следующий org_id.
+
+    Сам список живёт в `app.tenancy.org_purge_models()` — там же, где сторож,
+    который сверяет его с реестром моделей SQLAlchemy. Раньше список был
+    литералом здесь, и связи между «что мы удаляем» и «что вообще есть в базе»
+    не было никакой: новая модель с org_id, забытая в списке, молча оставляла
+    бы осиротевшие строки. Порядок изменился в одном месте, и это не рефакторинг:
+    `production_orders` теперь стирается ПЕРЕД `productions`, потому что прежний
+    порядок нарушал внешний ключ `production_id` (SEC-9).
     """
     from app import analytics
-    from app.models import (
-        CategoryMerge,
-        NotifySettings,
-        OrderedQty,
-        OrderPlan,
-        OrderReceipt,
-        Production,
-        ProductionAssign,
-        ReplenishDraft,
-        SkuCategoryOverride,
-        SkuDiscount,
-        SkuHidden,
-        StockDay,
-        SyncState,
-        Warehouse,
-        WarehouseStock,
-    )
-    from app.routes_extra import BillingRequest
+    from app.tenancy import org_purge_models
 
-    # OrderPlan идёт ПЕРЕД ProductionOrder: у плана внешний ключ на заказ,
-    # обратный порядок упал бы в Postgres. Раньше планов в списке не было
-    # вовсе — при удалении организации они оставались осиротевшими строками
-    # с чужим org_id, то есть ровно тем, от чего этот список и защищает.
-    # OrderReceipt идёт ПЕРЕД ProductionOrder по той же причине, что и план:
-    # у приёмки внешний ключ на заказ.
-    for model in (
-        Sale, StockDay, WarehouseStock, OrderedQty, ReplenishDraft,
-        ProductionAssign, OrderPlan, OrderReceipt, Production, ProductionOrder,
-        SkuHidden, SkuCategoryOverride, CategoryMerge, SkuDiscount,
-        NotifySettings, SyncState, BillingRequest,
-        Product, Warehouse, Connection, Membership,
-    ):
+    for model in org_purge_models():
         db.execute(delete(model).where(model.org_id == org_id))
     db.execute(delete(Org).where(Org.id == org_id))
     analytics.invalidate(org_id)
 
 
 def _purge_user(db: Session, user_id: int) -> None:
-    """Стирает пользователя и его личные следы (подсказки, уроки, настройки)."""
-    from app.models import UserHintSeen, UserLesson, UserPrefs
+    """Стирает пользователя и его личные следы (подсказки, уроки, настройки).
 
-    db.execute(delete(UserHintSeen).where(UserHintSeen.user_id == user_id))
-    # Прогресс уроков и личный тумблер подсказок раньше оставались после
-    # удаления аккаунта: осиротевшие строки с чужим user_id, которые достались
-    # бы следующему пользователю с тем же идентификатором.
-    db.execute(delete(UserLesson).where(UserLesson.user_id == user_id))
-    db.execute(delete(UserPrefs).where(UserPrefs.user_id == user_id))
-    db.execute(delete(Membership).where(Membership.user_id == user_id))
+    Список — в `app.tenancy.user_purge_models()`, рядом со сторожем полноты.
+    Прогресс уроков и личный тумблер подсказок раньше оставались после удаления
+    аккаунта: осиротевшие строки с чужим user_id, которые достались бы
+    следующему пользователю с тем же идентификатором. Порядок тот же, что был.
+    """
+    from app.tenancy import user_purge_models
+
+    for model in user_purge_models():
+        db.execute(delete(model).where(model.user_id == user_id))
     db.execute(delete(User).where(User.id == user_id))
 
 
