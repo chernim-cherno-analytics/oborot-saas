@@ -1101,7 +1101,26 @@ async def _run_initial(org_id: int, client: MoySkladClient, active_wh: list,
         day_results = await _fetch_dates(client, active_wh, gap_dates, ext_to_pid, unmatched)
         prev_positive = _positive_before(org_id, gap_dates[0])
         batch, zeroed = _rows_for_dates(org_id, gap_dates, day_results, prev_positive)
-        _write_stock_rows(org_id, gap_dates, batch)
+        # DATA-3: дни продолжения публикуются вместе со СВОИМИ продажами — тем
+        # же правилом, что окно, кусок истории и инкремент. Раньше остатки gap
+        # коммитились здесь, граница history_loaded_to уезжала на сегодня, а
+        # продажи ехали отдельным вызовом в фазе month. Следствий было два, и
+        # оба тихие. Падение между этими точками оставляло опубликованные дни
+        # остатков без продаж, и починить это было уже нечем: следующий запуск
+        # видел границу продвинутой и пропущенным такой gap не считал. А при
+        # ОДНОДНЕВНОМ gap с window_done=true продажи не грузились здесь вообще
+        # (heal_from оставался None) — новый день остатков попадал в базу с
+        # пустым числителем штатно, без всякого сбоя.
+        _persist(org_id, stats, stage="today", progress=8.0,
+                 detail=(f"Загружаем продажи за {gap_dates[0]}…" if len(gap_dates) == 1
+                         else f"Загружаем продажи за пропущенные "
+                              f"{len(gap_dates)} дн.…"))
+        sales_rows = await _collect_sales(org_id, client, active_wh, ext_to_pid,
+                                          stats, initial=True, date_from=gap_dates[0],
+                                          date_to=gap_dates[-1], replace_all=False)
+        _write_stock_rows(org_id, gap_dates, batch, sales_rows=sales_rows,
+                          sales_from=gap_dates[0], sales_to=gap_dates[-1])
+        _sales_written(org_id, stats, sales_rows, gap_dates[0])
         stats["stock_zeroed"] += zeroed
         stats["history_loaded_to"] = today_iso
         stats["stock_dates"] += len(gap_dates) - 1
@@ -1138,7 +1157,11 @@ async def _run_initial(org_id: int, client: MoySkladClient, active_wh: list,
         # этом уже опубликована, и раньше фаза month пропускалась НАВСЕГДА:
         # до 30 дней продаж оставались пустыми, а синк рапортовал done.
         # window_done ставится только после успешных продаж И «едет к нам».
-        heal_from = gap_dates[0] if len(gap_dates) > 1 else None
+        # DATA-3: продажи самих дней gap здесь больше не догоняются — они уже
+        # опубликованы одной транзакцией с остатками этих дней в фазе today.
+        # Осталась ровно одна причина ходить за продажами здесь: незакрытое
+        # окно быстрого старта.
+        heal_from = None
         if not stats.get("window_done"):
             # Ревью 21.08 (повторное): догон начинается от СТАРОГО начала окна
             # (resume_from), а не от окна, пересчитанного на сегодняшнюю дату.
@@ -1147,7 +1170,7 @@ async def _run_initial(org_id: int, client: MoySkladClient, active_wh: list,
             # а all_dates[-window] за эти дни уехал вперёд. Стоимость догона
             # ограничена: пустой window_done означает, что ни один чанк ещё не
             # отработал, то есть resume_from не старше окна на момент падения.
-            heal_from = min(heal_from, resume_from) if heal_from else resume_from
+            heal_from = resume_from
         if heal_from:
             _persist(org_id, stats, stage="month", progress=11.0,
                      detail=f"Догружаем продажи с {heal_from}…")

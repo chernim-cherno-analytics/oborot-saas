@@ -31,6 +31,18 @@
      не стоит потерянных данных.
   D. Тот же шов в инкременте: остатки за сегодня не обновляются в одиночку,
      если продажи за тот же день не доехали.
+  E. Тот же шов в ПРОДОЛЖЕНИИ прерванной первичной загрузки с многодневным
+     разрывом: отказ на продажах разрыва не публикует остатки этих дней и не
+     двигает опубликованную границу истории. Сдвинутая граница здесь хуже
+     самой дыры: следующий запуск перестаёт считать эти дни пропущенными.
+  F. Однодневный разрыв при уже закрытом окне (window_done=true). Этот путь
+     не грузил продажи нового дня ВООБЩЕ и не падал при этом: остатки дня
+     публиковались с пустым числителем штатно. Проверяются обе половины —
+     на отказе не публикуется ни одна, на успехе публикуются обе.
+
+Сценарии E и F пришли из независимого ревью Codex на точном HEAD
+(Issue #2, issuecomment-5406490164) — оба контрпримера воспроизведены здесь
+детерминированно, а не приняты на слово.
 
 Свой мок на отдельном порту (9811): файл можно запускать параллельно с
 tests/test_sync.py (9800) и tests/test_sync_wipe.py (9810).
@@ -70,9 +82,10 @@ import httpx  # noqa: E402
 import uvicorn  # noqa: E402
 
 import mock_ms  # noqa: E402
+from app import ms_sync as _mss  # noqa: E402  (подмена _today — см. interrupt_initial)
 from app.db import SessionLocal  # noqa: E402
 from app.main import app as oborot_app  # noqa: E402
-from app.models import Sale, StockDay  # noqa: E402
+from app.models import Product, Sale, StockDay  # noqa: E402
 from sqlalchemy import func, select  # noqa: E402
 
 mock_ms.PORT = MOCK_PORT
@@ -158,6 +171,74 @@ def sales_days() -> int:
         db.close()
 
 
+def newest_stock_date() -> str:
+    """Самая свежая опубликованная дата остатков — та самая «граница» (E, F)."""
+    db = SessionLocal()
+    try:
+        return str(db.execute(select(func.max(StockDay.date))).scalar() or "")
+    finally:
+        db.close()
+
+
+def sale_qty_on(day: str, ext_id: str) -> float:
+    """Сколько штук по этому SKU за этот день лежит в таблице sales."""
+    db = SessionLocal()
+    try:
+        return float(db.execute(
+            select(func.coalesce(func.sum(Sale.qty), 0.0))
+            .select_from(Sale).join(Product, Product.id == Sale.product_id)
+            .where(Sale.date == day, Product.ext_id == ext_id,
+                   Sale.is_return.is_(False))
+        ).scalar() or 0.0)
+    finally:
+        db.close()
+
+
+def mock_sold_on(day: str, ext_id: str) -> float:
+    """Столько же, но ПО МОКУ — эталон, с которым сверяется загруженное.
+
+    Считать эталон по данным мока, а не по константе, обязательно: мир мока
+    случайный (но с фиксированным seed), и «в базе 7 штук» ничего не доказало
+    бы, если в этот день у SKU есть ещё и органическая продажа.
+    """
+    active = {"st-flag", "st-web"}
+    total = 0.0
+    for entity in ("retaildemand", "demand"):
+        for doc in mock_ms.DOCS[entity]:
+            if doc["moment"][:10] != day or doc.get("applicable") is False:
+                continue
+            if doc["store"]["meta"]["href"].rsplit("/", 1)[-1] not in active:
+                continue
+            for pos in doc["positions"]["rows"]:
+                ext = pos["assortment"]["meta"]["href"].rsplit("/", 1)[-1].split("?")[0]
+                if ext == ext_id:
+                    total += float(pos["quantity"])
+    return total
+
+
+def inject_sale(day: str, ext_id: str, qty: float, price_rub: float) -> dict:
+    """Дописать в мок продажу за конкретный день; вернуть документ для отката.
+
+    Нужна затем, чтобы проверка «продажи дня опубликованы» не зависела от
+    того, выпал ли в случайном мире мока документ именно на этот день: пустая
+    таблица за день неотличима от «в этот день просто не продавали».
+    """
+    doc = {
+        "id": f"probe-{day}",
+        "meta": {"href": f"{mock_ms.BASE}/entity/retaildemand/probe-{day}",
+                 "type": "retaildemand"},
+        "moment": f"{day} 09:00:00",
+        "store": {"meta": {"href": f"{mock_ms.BASE}/entity/store/st-flag",
+                           "type": "store"}},
+        "positions": {"rows": [{"assortment": {"meta": mock_ms._asm_meta(ext_id)},
+                                "quantity": qty, "price": int(price_rub * 100),
+                                "discount": 0}],
+                      "meta": {"size": 1}},
+    }
+    mock_ms.DOCS["retaildemand"].append(doc)
+    return doc
+
+
 def wait_sync_done(client: httpx.Client, timeout: float = 300.0) -> dict:
     deadline = time.time() + timeout
     last: dict = {}
@@ -181,6 +262,31 @@ def main() -> int:
         mock_srv.stop()
         if DB_PATH.exists():
             DB_PATH.unlink()
+
+
+def interrupt_initial(c: httpx.Client, mock_api: httpx.Client, *,
+                      shift_days: int, ok_before: int = 20) -> dict:
+    """Прерванная первичная загрузка, «сегодня» которой было shift_days назад.
+
+    ok_before=20 — ровно столько удачных ответов отчёта нужно, чтобы прошли
+    «сегодня» (1 дата × 2 склада) и окно быстрого старта (9 дат × 2 склада).
+    Окно закрывается ЦЕЛИКОМ, window_done становится true, а первый кусок
+    истории ловит стойкий 429. Подмена ms_sync._today отодвигает «сегодня»
+    прерванного запуска назад — так и получается resumed gap ровно в
+    shift_days дней, ради которого написаны E и F.
+    """
+    _mss._today = lambda: TODAY - timedelta(days=shift_days)
+    try:
+        mock_api.post("/__test/faults",
+                      json={"stock_ok_before": ok_before, "stock_429_burst": 100000})
+        r = c.post("/api/sync/initial")
+        check(f"подготовка: прерванная загрузка «{shift_days} дн. назад» запущена",
+              r.status_code == 200, f"status={r.status_code}")
+        st = wait_sync_done(c)
+    finally:
+        _mss._today = date.today
+        mock_api.post("/__test/faults", json={})
+    return st
 
 
 def run() -> int:
@@ -312,6 +418,107 @@ def run() -> int:
           f"state={st.get('state')} error={str(st.get('error'))[:120]}")
     check("данные сошлись обратно", today_qty() == qty_before,
           f"было={qty_before} стало={today_qty()}")
+
+    print("\n== E. Продолжение с многодневным разрывом ==")
+    # Ревью Codex 25.08 (Issue #2, issuecomment-5406490164). Ветка
+    # «продолжение прерванной первичной загрузки» осталась неатомарной, когда
+    # окно, куски истории и инкремент уже починили: остатки пропущенных дней
+    # коммитились, граница history_loaded_to уезжала на сегодня, и только
+    # ПОТОМ отдельным вызовом ехали продажи. Отказ между этими точками
+    # оставлял опубликованные дни в знаменателе «дней в стоке» без своих
+    # продаж — и вылечить это было уже нечем: следующий запуск видел границу
+    # продвинутой и пропущенными эти дни больше не считал.
+    st = interrupt_initial(c, mock_api, shift_days=3)
+    stats_e = st.get("stats") or {}
+    check("(E) подготовка: загрузка прервана «три дня назад», окно закрыто",
+          st.get("state") == "error" and stats_e.get("window_done") is True
+          and stats_e.get("history_loaded_to") == d(3),
+          f"state={st.get('state')} window_done={stats_e.get('window_done')} "
+          f"history_loaded_to={stats_e.get('history_loaded_to')} ожидалось {d(3)}")
+    check("(E) подготовка: опубликованная граница остатков — день падения",
+          newest_stock_date() == d(3),
+          f"max(StockDay.date)={newest_stock_date()}, ожидалось {d(3)}")
+
+    mock_api.post("/__test/faults", json={"docs_429_burst": 100000})
+    r = c.post("/api/sync/run")
+    check("(E) продолжение запущено", r.status_code == 200, f"status={r.status_code}")
+    st = wait_sync_done(c)
+    mock_api.post("/__test/faults", json={})
+    check("(E) продолжение упало на продажах разрыва", st.get("state") == "error",
+          f"state={st.get('state')} error={str(st.get('error'))[:120]}")
+    stats_e2 = st.get("stats") or {}
+    check("(E) ОСТАТКИ ЗА ДНИ РАЗРЫВА НЕ ОПУБЛИКОВАНЫ БЕЗ СВОИХ ПРОДАЖ",
+          newest_stock_date() == d(3),
+          f"самая свежая дата остатков={newest_stock_date()}, ожидалась {d(3)}: "
+          f"продажи за {d(2)}…{d(0)} не доехали, значит и остатков за эти дни "
+          f"в базе быть не должно")
+    check("(E) ОПУБЛИКОВАННАЯ ГРАНИЦА ИСТОРИИ НЕ СДВИНУЛАСЬ",
+          stats_e2.get("history_loaded_to") == d(3),
+          f"history_loaded_to={stats_e2.get('history_loaded_to')}, ожидалось {d(3)}: "
+          f"сдвинутая граница означает, что следующий запуск не сочтёт эти дни "
+          f"пропущенными и продажи за них не догрузит уже никогда")
+
+    r = c.post("/api/sync/run")
+    st = wait_sync_done(c)
+    check("(E) контроль: продолжение без сбоя добирает разрыв до конца",
+          st.get("state") == "done" and newest_stock_date() == d(0),
+          f"state={st.get('state')} max(StockDay.date)={newest_stock_date()} "
+          f"error={str(st.get('error'))[:120]}")
+
+    print("\n== F. Однодневный разрыв при уже закрытом окне ==")
+    # Второй контрпример того же ревью, и он опаснее первого: при разрыве
+    # ровно в один день и выставленном window_done продажи нового дня не
+    # грузились этим путём ВООБЩЕ. Никакого сбоя при этом не происходило —
+    # день остатков штатно ложился в базу с пустым числителем.
+    st = interrupt_initial(c, mock_api, shift_days=1)
+    stats_f = st.get("stats") or {}
+    check("(F) подготовка: загрузка прервана «вчера», окно закрыто",
+          st.get("state") == "error" and stats_f.get("window_done") is True
+          and stats_f.get("history_loaded_to") == d(1),
+          f"state={st.get('state')} window_done={stats_f.get('window_done')} "
+          f"history_loaded_to={stats_f.get('history_loaded_to')} ожидалось {d(1)}")
+    check("(F) подготовка: сегодняшних остатков в базе ещё нет",
+          newest_stock_date() == d(1),
+          f"max(StockDay.date)={newest_stock_date()}, ожидалось {d(1)}")
+
+    mock_api.post("/__test/faults", json={"docs_429_burst": 100000})
+    r = c.post("/api/sync/run")
+    check("(F) продолжение с одним пропущенным днём запущено", r.status_code == 200,
+          f"status={r.status_code}")
+    st = wait_sync_done(c)
+    mock_api.post("/__test/faults", json={})
+    check("(F) продолжение упало на продажах", st.get("state") == "error",
+          f"state={st.get('state')} error={str(st.get('error'))[:120]}")
+    check("(F) ПРИ ОТКАЗЕ ОСТАТКИ ЗА ДЕНЬ НЕ ОПУБЛИКОВАНЫ В ОДИНОЧКУ",
+          newest_stock_date() == d(1),
+          f"самая свежая дата остатков={newest_stock_date()}, ожидалась {d(1)}: "
+          f"продажи за {d(0)} не доехали, значит и остатков за {d(0)} быть не должно")
+
+    probe = next(s for s in mock_ms.SKUS
+                 if s["kind"] == "variant" and "service" not in s["flags"]
+                 and "archived" not in s["flags"])
+    doc = inject_sale(d(0), probe["ext"], 7.0, probe["price"])
+    try:
+        expected = mock_sold_on(d(0), probe["ext"])
+        check("(F) подготовка: продажа за этот день в моке есть, в базе — нет",
+              expected >= 7.0 and sale_qty_on(d(0), probe["ext"]) == 0.0,
+              f"в моке {expected} шт, в базе {sale_qty_on(d(0), probe['ext'])} шт")
+        r = c.post("/api/sync/run")
+        check("(F) продолжение без сбоя запущено", r.status_code == 200,
+              f"status={r.status_code}")
+        st = wait_sync_done(c)
+        check("(F) продолжение без сбоя дошло до done", st.get("state") == "done",
+              f"state={st.get('state')} error={str(st.get('error'))[:120]}")
+        check("(F) остатки за день опубликованы", newest_stock_date() == d(0),
+              f"max(StockDay.date)={newest_stock_date()}, ожидалось {d(0)}")
+        check("(F) ВМЕСТЕ С НИМИ ОПУБЛИКОВАНЫ ПРОДАЖИ ЗА ТОТ ЖЕ ДЕНЬ",
+              sale_qty_on(d(0), probe["ext"]) == expected,
+              f"по {probe['ext']} за {d(0)} в базе {sale_qty_on(d(0), probe['ext'])} шт "
+              f"против {expected} шт в моке: день остатков опубликован с пустым "
+              f"числителем — «дней в стоке» на день больше, чем дней с продажами, "
+              f"темп занижен, «хватит на N дней» завышено")
+    finally:
+        mock_ms.DOCS["retaildemand"].remove(doc)
 
     c.close()
     mock_api.close()
