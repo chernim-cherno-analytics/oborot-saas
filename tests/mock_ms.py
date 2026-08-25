@@ -392,19 +392,27 @@ def entity_store(request: Request, limit: int = 1000, offset: int = 0):
 #                число нужно, чтобы тест отличал «взяли выбранный тип» от
 #                «взяли buyPrice» и от «взяли первую цену в списке»;
 #   cost_skip  — ext_id, у которых второй цены нет: тип существует в
-#                ассортименте глобально, но не проставлен на этой карточке.
+#                ассортименте глобально, но не проставлен на этой карточке;
+#   service    — [[имя типа, рубли], …] для ОДНОЙ дополнительной строки
+#                ассортимента с meta.type = "service". Пустой список — строки
+#                нет вовсе, как было. Услуга нужна ровно для одного вопроса:
+#                типы цен, которые встречаются ТОЛЬКО у неимпортируемой
+#                строки, товарами не подтверждены, и замок DATA-10 обязан
+#                считать их пропавшими (_parse_assortment услуги не берёт).
 PRICE_TYPES: dict = {
     "enabled": False,
     "sale": "Цена продажи",
     "cost": "Полная себестоимость",
     "cost_ratio": 1.5,
     "cost_skip": [],
+    "service": [],
 }
 
 
 def reset_price_types() -> None:
     PRICE_TYPES.update(enabled=False, sale="Цена продажи",
-                       cost="Полная себестоимость", cost_ratio=1.5, cost_skip=[])
+                       cost="Полная себестоимость", cost_ratio=1.5, cost_skip=[],
+                       service=[])
 
 
 @app.post("/__test/price_types")
@@ -476,6 +484,19 @@ def entity_assortment(request: Request, limit: int = 1000, offset: int = 0):
                 "buyPrice": {"value": sku["cost"] * 100},
                 "archived": "archived" in sku["flags"],
             })
+    # Услуга: строка ассортимента, которую синк НЕ импортирует. По умолчанию
+    # её нет вовсе, поэтому остальные наборы видят прежний ассортимент.
+    service = PRICE_TYPES.get("service") or []
+    if service:
+        rows.append({
+            "id": "srv-fit", "name": "Подгонка по фигуре",
+            "meta": {"href": f"{BASE}/entity/service/srv-fit", "type": "service"},
+            "salePrices": [{"value": int(round(float(rub) * 100)),
+                            "priceType": {"name": str(name)}}
+                           for name, rub in service],
+            "buyPrice": {"value": 0},
+            "archived": False,
+        })
     return _page(rows, limit, offset)
 
 
