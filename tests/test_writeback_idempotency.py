@@ -2731,6 +2731,143 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
           str(col_of(a23d, "ms_doc_href") or "").endswith("po-race-first"),
           f"ms_doc_href={col_of(a23d, 'ms_doc_href')!r}")
 
+    # ── 24. Откат back-match: база и память расходиться не должны ──────────
+    #
+    # Ревью Codex (issuecomment-5415981236 → issuecomment-5416265593).
+    # `our_docs[order.id] = href` стоял ВНУТРИ цикла, а общий db.commit —
+    # после него. Исключение на ПОЗДНЕМ заказе откатывало href и перенос
+    # количеств у ВСЕХ, но словарь в памяти уже держал ссылку первого:
+    # `except` делал rollback и обнулял счётчик, а our_docs не трогал вовсе.
+    #
+    # Дальше в этом же прогоне `_oborot_order_id(doc, our_docs)` признавал
+    # документ НАШИМ при несвязанной строке заказа и неснятом локальном qty —
+    # одно и то же считалось дважды.
+    #
+    # Сбой воспроизводится ЯВНЫМ ХУКОМ на втором кандидате, а не таймингом:
+    # подменяется `_move_incoming_to_ms`, и на втором вызове он бросает.
+    print("\n== 24. Откат back-match: ни в базе, ни в памяти ==")
+
+    def _setup_pair(tag: str) -> tuple:
+        """Два кандидата на back-match в одной транзакции, оба unlinked."""
+        a, b = make_order(c, f"Откат {tag} A"), make_order(c, f"Откат {tag} Б")
+        items = json.dumps([{"base_name": RACE_BASE, "qty": 10,
+                             "sizes": {"S": 10}, "cost": 100}],
+                           ensure_ascii=False)
+        keys = {}
+        for oid in (a, b):
+            keys[oid] = str(uuid.uuid4())
+            err = exec_sql(
+                "UPDATE production_orders SET items_json=?, status='sent', "
+                "ms_lookup_mode='sync', ms_doc_href=?, ms_sync_id=? WHERE id=?",
+                items, f"{ms_writeback.UNKNOWN_PREFIX}{int(time.time())}",
+                keys[oid], oid)
+            assert err == "", f"подготовка {oid}: {err}"
+        assert exec_sql("DELETE FROM ordered_qty WHERE base_name=?",
+                        RACE_BASE) == ""
+        err = exec_sql(
+            "INSERT INTO ordered_qty (org_id, base_name, qty, ms_qty, "
+            "ms_qty_tracked) VALUES ((SELECT org_id FROM production_orders "
+            "WHERE id=?), ?, 20.0, 0.0, 0.0)", a, RACE_BASE)
+        assert err == "", f"подготовка ordered_qty: {err}"
+        org = int(exec_sql_read(
+            "SELECT org_id FROM production_orders WHERE id=?", a)[0][0])
+        docs = [{"id": f"po-roll-{oid}", "name": f"PO-ROLL-{oid}",
+                 "syncId": keys[oid],
+                 "meta": {"href": f"{mock_ms.BASE}/entity/purchaseorder/"
+                                  f"po-roll-{oid}", "type": "purchaseorder"}}
+                for oid in (a, b)]
+        return a, b, org, docs
+
+    # 24а. ГЛАВНЫЙ: первый захват и перенос прошли, второй перенос бросил.
+    a24, b24, org24, docs24 = _setup_pair("сбой")
+    href_a_before = col_of(a24, "ms_doc_href")
+    href_b_before = col_of(b24, "ms_doc_href")
+    calls24: list = []
+    original_move24 = ms_writeback._move_incoming_to_ms
+
+    def _move_second_fails(db_, org_, order_, bases_, was_sent):
+        calls24.append(int(order_.id))
+        if len(calls24) >= 2:
+            raise RuntimeError("подставной сбой на втором заказе")
+        return original_move24(db_, org_, order_, bases_, was_sent)
+
+    ms_writeback._move_incoming_to_ms = _move_second_fails
+    try:
+        our24: dict = {}
+        stats24: dict = {}
+        _ms_sync._backmatch_by_sync_id(org24, docs24, our24, stats24)
+    finally:
+        ms_writeback._move_incoming_to_ms = original_move24
+
+    check("хук сработал: перенос вызывался дважды, второй бросил",
+          len(calls24) == 2, f"вызовов={len(calls24)} ids={calls24}")
+    check("ССЫЛКА ПЕРВОГО ЗАКАЗА ОТКАЧЕНА к исходной пометке",
+          col_of(a24, "ms_doc_href") == href_a_before
+          and ms_writeback.is_unknown(col_of(a24, "ms_doc_href")),
+          f"было={href_a_before!r} стало={col_of(a24, 'ms_doc_href')!r}")
+    check("…и второй заказ тоже не связан",
+          col_of(b24, "ms_doc_href") == href_b_before,
+          f"было={href_b_before!r} стало={col_of(b24, 'ms_doc_href')!r}")
+    check("КОЛИЧЕСТВА НЕ ТРОНУТЫ: qty по-прежнему 20",
+          _race_qty() == (20.0, 0.0), f"qty={_race_qty()}")
+    check("OUR_DOCS ПУСТ — память не рекламирует связь, которой нет в базе",
+          our24 == {}, f"our_docs={our24}")
+    check("…и incoming_backmatched в stats отсутствует",
+          "incoming_backmatched" not in stats24, f"stats={stats24}")
+
+    # 24б. ПОЛОЖИТЕЛЬНЫЙ КОНТРОЛЬ: два успешных кандидата коммитятся, и обе
+    #      стадии публикуются. Без него «никогда не публиковать» удовлетворяло
+    #      бы 24а, а back-match перестал бы работать вовсе.
+    a24b, b24b, org24b, docs24b = _setup_pair("успех")
+    our24b: dict = {}
+    stats24b: dict = {}
+    _ms_sync._backmatch_by_sync_id(org24b, docs24b, our24b, stats24b)
+    check("ДВА УСПЕШНЫХ КАНДИДАТА связаны в базе",
+          str(col_of(a24b, "ms_doc_href") or "").endswith(f"po-roll-{a24b}")
+          and str(col_of(b24b, "ms_doc_href") or "").endswith(f"po-roll-{b24b}"),
+          f"a={col_of(a24b, 'ms_doc_href')!r} b={col_of(b24b, 'ms_doc_href')!r}")
+    check("…и ОБЕ стадии опубликованы в our_docs",
+          sorted(our24b) == sorted([a24b, b24b]), f"our_docs={our24b}")
+    check("…и счётчик равен двум",
+          stats24b.get("incoming_backmatched") == 2, f"stats={stats24b}")
+    check("…и вклад снят ровно за два заказа (20 → 0)",
+          _race_qty()[0] == 0.0, f"qty={_race_qty()[0]}")
+
+    # 24в. Падает САМ db.commit — публикации тоже быть не должно. Коммит
+    #      стоит внутри того же try, и это единственное, что делает случай
+    #      отличимым от 24а по механизму, а не по формулировке.
+    a24c, b24c, org24c, docs24c = _setup_pair("коммит")
+    href_a24c = col_of(a24c, "ms_doc_href")
+    original_session = _ms_sync.SessionLocal
+
+    class _FailingCommitSession:
+        """Сессия, у которой падает ровно commit — всё остальное настоящее."""
+
+        def __init__(self) -> None:
+            self._real = original_session()
+
+        def commit(self):
+            raise RuntimeError("подставной сбой коммита")
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    _ms_sync.SessionLocal = _FailingCommitSession
+    try:
+        our24c: dict = {}
+        stats24c: dict = {}
+        _ms_sync._backmatch_by_sync_id(org24c, docs24c, our24c, stats24c)
+    finally:
+        _ms_sync.SessionLocal = original_session
+    check("СБОЙ САМОГО КОММИТА: ссылка не записана",
+          col_of(a24c, "ms_doc_href") == href_a24c,
+          f"было={href_a24c!r} стало={col_of(a24c, 'ms_doc_href')!r}")
+    check("…и our_docs пуст", our24c == {}, f"our_docs={our24c}")
+    check("…и счётчика нет", "incoming_backmatched" not in stats24c,
+          f"stats={stats24c}")
+    check("…и количества не тронуты", _race_qty() == (20.0, 0.0),
+          f"qty={_race_qty()}")
+
     check("каждый POST заказа поставщику нёс syncId",
           all(d.get("syncId") for d in docs_created()),
           f"без ключа={[d.get('id') for d in docs_created() if not d.get('syncId')]}")

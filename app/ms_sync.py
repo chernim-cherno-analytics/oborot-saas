@@ -2173,7 +2173,26 @@ def _backmatch_by_sync_id(org_id: int, docs: list[dict],
         return
 
     db = SessionLocal()
-    linked = 0
+    # Выигранные захваты копятся ЗДЕСЬ, а не публикуются сразу в our_docs.
+    #
+    # Ревью Codex (issuecomment-5415981236 → issuecomment-5416265593). Раньше
+    # `our_docs[order.id] = href` стоял внутри цикла, а общий `db.commit()` —
+    # после него. Исключение на ПОЗДНЕМ заказе откатывало href и перенос
+    # количеств у ВСЕХ, но словарь в памяти уже держал ссылку первого: `except`
+    # делал `rollback` и обнулял счётчик, а `our_docs` не трогал вовсе.
+    #
+    # Дальше в этом же прогоне `_oborot_order_id(doc, our_docs)` признавал
+    # документ НАШИМ (tracked) при несвязанной строке заказа и неснятом
+    # локальном qty — то есть одно и то же считалось дважды. Тот же исход,
+    # если исключение бросал сам `db.commit()`.
+    #
+    # Асимметрия выбрана сознательно: публикуем ПОЗЖЕ, чем пишем в базу.
+    # Если что-то случится между коммитом и публикацией, база окажется
+    # связанной, а память — нет; документ в этом прогоне посчитается внешним,
+    # а не нашим. Это недоучёт нашей метки на один прогон, и ближайший синк
+    # перечитает связь из базы. Обратный порядок давал двойной учёт «едет к
+    # нам», а из двух неточностей выбирается та, что не завышает.
+    staged: list[tuple[int, str]] = []
     try:
         rows = db.execute(
             select(ProductionOrder).where(
@@ -2252,18 +2271,25 @@ def _backmatch_by_sync_id(org_id: int, docs: list[dict],
             ms_writeback._move_incoming_to_ms(
                 db, org_id, order, pushed_by_base,
                 was_sent=str(claimed[0][0] or "") == "sent")
-            linked += 1
-            our_docs[int(order.id)] = href
-        if linked:
+            # В память — НЕ здесь: только в стадию. Публикация ждёт коммита.
+            staged.append((int(order.id), href))
+        if staged:
             db.commit()
     except Exception:  # noqa: BLE001 — связывание не должно ронять синк целиком
         db.rollback()
         log.exception("backmatch: не удалось связать документы org=%s", org_id)
-        linked = 0
+        # Стадия стирается вместе с откатом базы. `db.commit()` стоит ВНУТРИ
+        # того же try, поэтому его собственный сбой попадает сюда же и тоже
+        # не оставляет публикации: «в базе нет — и в памяти нет».
+        staged = []
     finally:
         db.close()
-    if linked:
-        stats["incoming_backmatched"] = linked
+
+    # Публикация — только после УСПЕШНОГО коммита и только целиком.
+    for order_id, href in staged:
+        our_docs[order_id] = href
+    if staged:
+        stats["incoming_backmatched"] = len(staged)
 
 
 def _order_bases(order) -> dict[str, int]:
