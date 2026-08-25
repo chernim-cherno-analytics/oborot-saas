@@ -594,7 +594,14 @@ async def stage_counterparty(client, tag: str, agent_sync: str) -> dict:
          f"id={agent_id} href={agent_href}")
 
     found = await _counterparties_by_sync_id(client, agent_sync)
-    gate("GET filter=syncId= вернул РОВНО ОДНОГО — и это он",
+    # Подпись обязана называть ФАКТИЧЕСКИЙ способ проверки: здесь работает
+    # `find_by_sync_id` — постраничный перебор коллекции с точным сравнением
+    # syncId, тот же самый, которым пользуется продукт. Раньше тут было
+    # написано «GET filter=syncId=», хотя этот фильтр живой аккаунт отвергает
+    # (412/1034) и вызова такого под подписью нет. Ложная подпись хуже
+    # отсутствия подписи: успешный живой прогон отчитался бы в журнал
+    # выпуска о доказательстве, которого не было (ревью Codex, P2).
+    gate("ПЕРЕБОР КОЛЛЕКЦИИ (как в продукте) нашёл РОВНО ОДНОГО — и это он",
          len(found) == 1 and str(found[0].get("id") or "") == agent_id,
          f"найдено={len(found)} ids={[r.get('id') for r in found]}")
 
@@ -613,7 +620,7 @@ async def stage_counterparty(client, tag: str, agent_sync: str) -> dict:
          f"первый={agent_id} второй={again.get('id')}")
 
     after = await _counterparties_by_sync_id(client, agent_sync)
-    gate("после повтора по ключу по-прежнему РОВНО ОДИН контрагент",
+    gate("после повтора ПЕРЕБОР КОЛЛЕКЦИИ снова даёт РОВНО ОДНОГО контрагента",
          len(after) == 1 and str(after[0].get("id") or "") == agent_id,
          f"найдено={len(after)} ids={[r.get('id') for r in after]}")
 
@@ -656,7 +663,9 @@ async def stage_order(client, tag: str, doc_sync: str, pre: dict,
          f"id={doc_id} name={doc.get('name')!r}")
 
     by_sync = await client.find_purchase_orders_by_sync_id(doc_sync)
-    gate("GET filter=syncId= вернул РОВНО ОДИН — и это он",
+    # Та же поправка, что и у контрагента: под подписью — перебор коллекции
+    # (`find_purchase_orders_by_sync_id` → `find_by_sync_id`), а не фильтр.
+    gate("ПЕРЕБОР КОЛЛЕКЦИИ (как в продукте) нашёл РОВНО ОДИН — и это он",
          len(by_sync) == 1 and str(by_sync[0].get("id") or "") == doc_id,
          f"найдено={len(by_sync)} ids={[r.get('id') for r in by_sync]}")
 
@@ -670,7 +679,8 @@ async def stage_order(client, tag: str, doc_sync: str, pre: dict,
          f"первый={doc_id} второй={repeat.get('id')}")
 
     after = await client.find_purchase_orders_by_sync_id(doc_sync)
-    gate("ВТОРОГО ДОКУМЕНТА С ЭТИМ КЛЮЧОМ НЕ ПОЯВИЛОСЬ",
+    gate("ВТОРОГО ДОКУМЕНТА С ЭТИМ КЛЮЧОМ НЕ ПОЯВИЛОСЬ "
+         "(пересчитано перебором коллекции, а не памятью о первом ответе)",
          len(after) == 1 and str(after[0].get("id") or "") == doc_id,
          f"найдено={len(after)} ids={[r.get('id') for r in after]}")
 
