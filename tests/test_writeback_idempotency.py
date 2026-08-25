@@ -80,11 +80,15 @@ merge gate (см. TECH_DEBT, DATA-1/DATA-2).
 
 Запуск из корня репозитория:  python tests/test_writeback_idempotency.py
 """
+import asyncio
+import contextlib
+import io
 import os
 import sqlite3
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1539,6 +1543,262 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
               f"дошло до run()={bool(reached_run)}")
     finally:
         live.TOKEN, live.CONFIRM, live.run = tok_before, conf_before, run_before
+
+    # ── 16. Живой contract-тест: разбор payload до отправки ─────────────────
+    #
+    # Владелец разрешил живой прогон на своём аккаунте, но узко (OWNER_DECISION
+    # 25.08.2026, issuecomment-5413052421 и постоянный мандат
+    # issuecomment-5413066608): непроведённый документ, одна позиция,
+    # количество 1, цена 0, уникальная пометка, существующие юрлицо и позиция,
+    # никакого движения денег и остатков.
+    #
+    # Граница разрешения обязана жить в КОДЕ, а не в намерении исполнителя,
+    # поэтому её проверяет чистая функция — и проверяется она здесь, без сети.
+    print("\n== 16. Живой contract-тест: тело запроса разбирается до отправки ==")
+    ORG = "https://api.example.invalid/entity/organization/org-1"
+    SKU = "https://api.example.invalid/entity/product/sku-1"
+    AGENT = "https://api.example.invalid/entity/counterparty/cp-1"
+    TAG, SYNC = "deadbeef", "11111111-2222-3333-4444-555555555555"
+
+    def _order(**over) -> dict:
+        """Заведомо ДОПУСТИМОЕ тело; over портит ровно одно поле."""
+        body = {
+            "organization": {"meta": {"href": ORG}},
+            "agent": {"meta": {"href": AGENT}},
+            "positions": [{
+                "assortment": {"meta": {"href": SKU, "type": "product"}},
+                "quantity": 1,
+                "price": 0,
+            }],
+            "description": f"{live.marking(TAG)}. Проверка контракта.",
+            "applicable": False,
+            "syncId": SYNC,
+        }
+        body.update(over)
+        return body
+
+    def _verdict(body: dict) -> list:
+        return live.validate_order_payload(
+            body, tag=TAG, sync_id=SYNC, org_href=ORG,
+            assortment_href=SKU, agent_href=AGENT)
+
+    # Положительный контроль стоит ПЕРВЫМ и обязателен: без него валидатор,
+    # который отвергает вообще всё, прошёл бы все проверки ниже — и живой
+    # прогон стал бы невозможен по причине, которую никто не заметил.
+    check("ДОПУСТИМОЕ тело принимается (иначе живой прогон невозможен)",
+          _verdict(_order()) == [], f"замечания={_verdict(_order())}")
+
+    _cases = [
+        ("проведение документа (applicable=True)", _order(applicable=True)),
+        ("applicable=None не считается «непроведённым»", _order(applicable=None)),
+        ("applicable=0 не считается «непроведённым»", _order(applicable=0)),
+        ("ненулевая цена", _order(positions=[{
+            "assortment": {"meta": {"href": SKU, "type": "product"}},
+            "quantity": 1, "price": 15000}])),
+        ("количество не 1", _order(positions=[{
+            "assortment": {"meta": {"href": SKU, "type": "product"}},
+            "quantity": 5, "price": 0}])),
+        ("больше одной позиции", _order(positions=[
+            {"assortment": {"meta": {"href": SKU, "type": "product"}},
+             "quantity": 1, "price": 0},
+            {"assortment": {"meta": {"href": SKU, "type": "product"}},
+             "quantity": 1, "price": 0}])),
+        ("ни одной позиции", _order(positions=[])),
+        ("неверная маркировка в описании",
+         _order(description="Просто заказ")),
+        ("маркировка с чужим tag",
+         _order(description=f"{live.MARK} 00000000. Не наш прогон.")),
+        ("чужое юрлицо", _order(organization={"meta": {"href": ORG + "-другое"}})),
+        ("чужая позиция ассортимента", _order(positions=[{
+            "assortment": {"meta": {"href": SKU + "-другая", "type": "product"}},
+            "quantity": 1, "price": 0}])),
+        ("тип позиции не product/variant", _order(positions=[{
+            "assortment": {"meta": {"href": SKU, "type": "service"}},
+            "quantity": 1, "price": 0}])),
+        ("чужой контрагент", _order(agent={"meta": {"href": AGENT + "-другой"}})),
+        ("другой syncId, чем проверялся на свободу", _order(syncId=str(uuid.uuid4()))),
+        # Лишние поля — по белому списку. Именно ими документ проводят,
+        # двигают склад и заводят деньги, а «мы такого не передаём» — это про
+        # намерение, а не про код.
+        ("лишнее поле moment (дата проведения)", _order(moment="2026-08-25 12:00:00")),
+        ("лишнее поле store (склад)", _order(store={"meta": {"href": "x"}})),
+        ("лишнее поле payments (платежи)", _order(payments=[{"meta": {"href": "x"}}])),
+        ("лишнее поле vatEnabled", _order(vatEnabled=True)),
+        ("лишнее поле в позиции (reserve)", _order(positions=[{
+            "assortment": {"meta": {"href": SKU, "type": "product"}},
+            "quantity": 1, "price": 0, "reserve": 5}])),
+    ]
+    for label, body in _cases:
+        check(f"ВАЛИДАТОР ОТВЕРГАЕТ: {label}", _verdict(body) != [],
+              f"замечаний={_verdict(body)}")
+
+    check("допустимое тело контрагента принимается",
+          live.validate_agent_payload(
+              {"name": live.marking(TAG), "syncId": SYNC},
+              tag=TAG, sync_id=SYNC) == [])
+    check("ВАЛИДАТОР ОТВЕРГАЕТ: имя контрагента без пометки",
+          live.validate_agent_payload({"name": "Производство", "syncId": SYNC},
+                                      tag=TAG, sync_id=SYNC) != [])
+    check("ВАЛИДАТОР ОТВЕРГАЕТ: лишнее поле у контрагента",
+          live.validate_agent_payload(
+              {"name": live.marking(TAG), "syncId": SYNC, "archived": True},
+              tag=TAG, sync_id=SYNC) != [])
+
+    # ── 17. Fail-closed: первая же неожиданность останавливает сценарий ─────
+    #
+    # Тот самый дефект, ради которого этот раунд и делался: check() копил FAIL
+    # и возвращал управление, поэтому после несошедшейся проверки сценарий шёл
+    # к СЛЕДУЮЩЕМУ POST. То есть ровно в момент, когда чужой API повёл себя не
+    # так, как мы думаем, мы продолжали в нём создавать. Мандат владельца
+    # (пункт 8) требует обратного: немедленная остановка без повторных
+    # мутирующих попыток.
+    #
+    # Проверяется подставным клиентом: сети нет, живого аккаунта нет, а
+    # «сколько раз позвали create_*» видно поимённо.
+    print("\n== 17. Живой contract-тест: после первой ошибки записи прекращаются ==")
+
+    class FakeClient:
+        """Подставной МойСклад: считает вызовы и умеет врать по сценарию."""
+
+        def __init__(self, *, cp_dupes: int = 1, cp_repeat_same: bool = True,
+                     doc_dupes: int = 1, orgs: int = 1, sku: bool = True) -> None:
+            self.calls: list = []
+            self.cp_dupes, self.cp_repeat_same = cp_dupes, cp_repeat_same
+            self.doc_dupes, self.n_orgs, self.has_sku = doc_dupes, orgs, sku
+
+        async def fetch_organizations(self) -> list:
+            self.calls.append("fetch_organizations")
+            return [{"name": "ИП", "meta": {"href": ORG, "type": "organization"}}
+                    ] * self.n_orgs
+
+        async def fetch_assortment(self) -> list:
+            self.calls.append("fetch_assortment")
+            if not self.has_sku:
+                return []
+            return [{"name": "Товар", "archived": False,
+                     "meta": {"href": SKU, "type": "product"}}]
+
+        async def paginate(self, path, params=None, **kw):
+            self.calls.append(f"paginate:{path}")
+            sync = str((params or {}).get("filter", "")).split("=", 1)[-1]
+            if "counterparty" in path and self.calls.count("create_counterparty"):
+                for _ in range(self.cp_dupes):
+                    yield {"id": "cp-1", "syncId": sync,
+                           "meta": {"href": AGENT, "type": "counterparty"}}
+
+        async def find_counterparties_by_name(self, name):
+            self.calls.append("find_counterparties_by_name")
+            return []
+
+        async def find_purchase_orders_by_sync_id(self, sync_id):
+            self.calls.append("find_purchase_orders_by_sync_id")
+            if not self.calls.count("create_purchase_order"):
+                return []
+            return [{"id": "po-1", "syncId": sync_id,
+                     "meta": {"href": "https://api.example.invalid/entity/"
+                                      "purchaseorder/po-1"}}] * self.doc_dupes
+
+        async def create_counterparty(self, name, sync_id):
+            self.calls.append("create_counterparty")
+            n = self.calls.count("create_counterparty")
+            cid = "cp-1" if (n == 1 or self.cp_repeat_same) else f"cp-{n}"
+            return {"id": cid, "name": name, "syncId": sync_id,
+                    "meta": {"href": AGENT, "type": "counterparty"}}
+
+        async def create_purchase_order(self, payload):
+            self.calls.append("create_purchase_order")
+            return {"id": "po-1", "name": "00001",
+                    "meta": {"href": "https://api.example.invalid/entity/"
+                                     "purchaseorder/po-1"}}
+
+    def _live_run(fake) -> int:
+        """Прогон сценария на подставном клиенте, с чистым счётом PASS/FAIL.
+
+        Вывод сценария ГЛУШИТСЯ, и это не косметика. `run_contract` печатает
+        свой собственный «ИТОГО: N OK, M FAIL», а раннер по контракту D-42
+        читает ПОСЛЕДНИЙ такой отчёт в выводе набора. Шесть подставных
+        прогонов, печатающих чужие итоги в общий поток, — это шесть шансов
+        подсунуть раннеру не тот приговор.
+        """
+        p_before, f_before = list(live.PASS), list(live.FAIL)
+        live.PASS.clear()
+        live.FAIL.clear()
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                return asyncio.run(live.run_contract(fake))
+        finally:
+            live.PASS[:] = p_before
+            live.FAIL[:] = f_before
+
+    # 17а. Положительный контроль: на честном API сценарий доходит до конца и
+    #      делает РОВНО четыре записи — два создания контрагента (создание +
+    #      доказательство upsert) и два создания заказа. Без него всё ниже
+    #      удовлетворялось бы сценарием «никогда ничего не вызываем».
+    ok_fake = FakeClient()
+    rc_ok = _live_run(ok_fake)
+    check("на честном API сценарий проходит целиком",
+          rc_ok == 0, f"код возврата={rc_ok}")
+    check("…и делает РОВНО два POST контрагента и два POST заказа",
+          ok_fake.calls.count("create_counterparty") == 2
+          and ok_fake.calls.count("create_purchase_order") == 2,
+          f"cp={ok_fake.calls.count('create_counterparty')} "
+          f"po={ok_fake.calls.count('create_purchase_order')}")
+
+    # 17б. ГЛАВНАЯ регрессия: по ключу контрагента вернулось ДВА объекта.
+    #      Контракт нарушен — заказ не должен создаваться вообще.
+    dup_cp = FakeClient(cp_dupes=2)
+    rc_dup = _live_run(dup_cp)
+    check("дубль контрагента по syncId → сценарий провален", rc_dup == 1,
+          f"код возврата={rc_dup}")
+    check("ПОСЛЕ ДУБЛЯ КОНТРАГЕНТА ЗАКАЗ НЕ СОЗДАВАЛСЯ НИ РАЗУ",
+          dup_cp.calls.count("create_purchase_order") == 0,
+          f"вызовов create_purchase_order={dup_cp.calls.count('create_purchase_order')}")
+
+    # 17в. Повторный POST вернул ДРУГОЙ id — upsert не работает. Это худший
+    #      исход: он означает, что второй документ в принципе возможен.
+    other_id = FakeClient(cp_repeat_same=False)
+    rc_other = _live_run(other_id)
+    check("повторный POST с другим id → сценарий провален", rc_other == 1,
+          f"код возврата={rc_other}")
+    check("ПОСЛЕ ПРОВАЛА UPSERT ЗАКАЗ НЕ СОЗДАВАЛСЯ",
+          other_id.calls.count("create_purchase_order") == 0,
+          f"вызовов create_purchase_order={other_id.calls.count('create_purchase_order')}")
+    check("…и контрагент не создавался третий раз «на всякий случай»",
+          other_id.calls.count("create_counterparty") == 2,
+          f"вызовов create_counterparty={other_id.calls.count('create_counterparty')}")
+
+    # 17г. Дубль уже на стадии заказа: второй POST заказа сделан (это и есть
+    #      проверка upsert), но НИ ОДНОЙ попытки сверх сценария быть не должно.
+    dup_doc = FakeClient(doc_dupes=2)
+    rc_ddoc = _live_run(dup_doc)
+    check("дубль заказа по syncId → сценарий провален", rc_ddoc == 1,
+          f"код возврата={rc_ddoc}")
+    check("после дубля заказа лишних POST не было",
+          dup_doc.calls.count("create_purchase_order") <= 2,
+          f"вызовов create_purchase_order={dup_doc.calls.count('create_purchase_order')}")
+
+    # 17д. Не сошлись ПОДГОТОВИТЕЛЬНЫЕ проверки — ни одной записи вообще.
+    for label, fake in (("нет юрлица", FakeClient(orgs=0)),
+                        ("нет неархивной позиции", FakeClient(sku=False))):
+        rc_pre = _live_run(fake)
+        check(f"{label} → сценарий провален до записи", rc_pre == 1,
+              f"код возврата={rc_pre}")
+        check(f"…и НИ ОДНОГО создания не было ({label})",
+              fake.calls.count("create_counterparty") == 0
+              and fake.calls.count("create_purchase_order") == 0,
+              f"cp={fake.calls.count('create_counterparty')} "
+              f"po={fake.calls.count('create_purchase_order')}")
+
+    # 17е. Токен не попадает в вывод ни при каком исходе.
+    tok_save = live.TOKEN
+    try:
+        live.TOKEN = "секретный-токен-abc123"
+        scrubbed = live.scrub(f"Authorization: Bearer {live.TOKEN} — сбой")
+        check("ТОКЕН ВЫРЕЗАЕТСЯ ИЗ ЛЮБОГО ВЫВОДА",
+              live.TOKEN not in scrubbed and "<токен скрыт>" in scrubbed,
+              f"после чистки={scrubbed!r}")
+    finally:
+        live.TOKEN = tok_save
 
     check("каждый POST заказа поставщику нёс syncId",
           all(d.get("syncId") for d in docs_created()),
