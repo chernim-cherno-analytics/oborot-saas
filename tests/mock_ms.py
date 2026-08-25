@@ -602,8 +602,40 @@ FAULTS: dict = {"stock_ok_before": 0, "stock_429_burst": 0,
                 # успевает выполнить параллельный статусный переход или
                 # удаление и увидеть, чем это кончится.
                 "po_create_delay_ms": 0,
+                # ── Исход POST заказа поставщику НЕИЗВЕСТЕН ──────────────────
+                # Три ключа ниже моделируют не «ошибку сети», а состояние, в
+                # котором запрос УЖЕ ушёл, а узнать исход не получается. Ровно
+                # там клиент раньше снимал пометку отправки и делал заказ
+                # удаляемым вместе с ключом связывания.
+                #
+                # po_hide_created — созданные нами документы не видны ни в
+                # выдаче списка, ни точечному маршруту. Это не выдумка: у
+                # свежесозданной сущности выдача списка может отставать, и
+                # принять задержку видимости за «документа нет» — значит
+                # потерять его насовсем.
+                "po_hide_created": 0,
+                # po_list_ok_before / po_list_status — список заказов
+                # поставщику отвечает `po_list_status` ПОСЛЕ N удачных
+                # ответов. Форма взята с уже существующего stock_ok_before:
+                # первый (предварительный) поиск обязан пройти, а вот
+                # восстановительный — упасть. 401 выбран сознательно: он не
+                # входит в RETRY_STATUSES, то есть падает сразу и без пауз,
+                # и тест остаётся детерминированным.
+                "po_list_ok_before": 0,
+                "po_list_status": 0,
+                # po_create_twin_then_fail — документ создан, следом создан
+                # его ДВОЙНИК с тем же syncId, и только потом «падает» ответ.
+                # Так выглядит нарушенное обещание уникальности ключа,
+                # обнаруженное уже после попытки: выбрать один из двух нельзя,
+                # но и считать, что мы ничего не создали, — тоже.
+                "po_create_twin_then_fail": 0,
+                # po_create_refuse — МойСклад ОТВЕТИЛ отказом 412 и документа
+                # не создал. Обратная граница: это не потерянный ответ, и
+                # обходиться с ним как с неизвестным исходом нельзя.
+                "po_create_refuse": 0,
                 "stock_delay_ms": 0}
-FAULT_STATS: dict = {"stock_requests": 0, "stock_ok": 0, "stock_429": 0, "stock_500": 0}
+FAULT_STATS: dict = {"stock_requests": 0, "stock_ok": 0, "stock_429": 0,
+                     "stock_500": 0, "po_list_ok": 0}
 
 
 def reset_faults() -> None:
@@ -614,7 +646,10 @@ def reset_faults() -> None:
                   po_fail_before_create=0, cp_search_delay_ms=0,
                   cp_get_500_burst=0, syncid_route_404=0,
                   syncid_route_wrong_type=0, syncid_route_status=0,
-                  po_create_delay_ms=0, stock_delay_ms=0)
+                  po_create_delay_ms=0, po_hide_created=0,
+                  po_list_ok_before=0, po_list_status=0,
+                  po_create_twin_then_fail=0, po_create_refuse=0,
+                  stock_delay_ms=0)
     for k in FAULT_STATS:
         FAULT_STATS[k] = 0
 
@@ -868,9 +903,17 @@ def entity_purchaseorder(request: Request, limit: int = 100, offset: int = 0,
     parsed = _parse_filter(flt)
     m_from = parsed.get("moment>=", "")[:10]
     _reject_sync_id_filter(parsed)
+    code = int(FAULTS.get("po_list_status") or 0)
+    if code > 0 and FAULT_STATS["po_list_ok"] >= int(FAULTS.get("po_list_ok_before") or 0):
+        # Восстановительный поиск не состоялся. Это НЕ ответ «документа нет».
+        raise HTTPException(status_code=code, detail={"errors": [
+            {"error": f"mock: список ответил {code}, это не «не найдено»"}]})
+    FAULT_STATS["po_list_ok"] += 1
     rows = []
     # seeded + созданные writeback'ом (у последних МС проставил бы moment
     # и applicable сам — эмулируем: сегодня, проведён, shipped=0).
+    created_visible = [] if int(FAULTS.get("po_hide_created") or 0) > 0 \
+        else CREATED_PURCHASE_ORDERS
     for doc in PURCHASE_ORDERS + [
         {**d,
          "moment": d.get("moment") or f"{TODAY.isoformat()} 12:00:00",
@@ -878,7 +921,7 @@ def entity_purchaseorder(request: Request, limit: int = 100, offset: int = 0,
          "positions": {"rows": [{**p, "shipped": p.get("shipped", 0.0)}
                                 for p in (d.get("positions") or [])],
                        "meta": {"size": len(d.get("positions") or [])}}}
-        for d in CREATED_PURCHASE_ORDERS
+        for d in created_visible
     ]:
         day = doc["moment"][:10]
         if m_from and day < m_from:
@@ -1018,7 +1061,13 @@ async def entity_by_syncid(entity: str, sync_id: str, request: Request):
         # смотрел лишь в CREATED_PURCHASE_ORDERS, подставные («чужие»)
         # документы для него не существовали — и контртест на дубль по
         # документам молча не проверял ту ветку, ради которой написан.
-        for doc in list(CREATED_PURCHASE_ORDERS) + list(PURCHASE_ORDERS):
+        #
+        # po_hide_created прячет свежесозданное И ЗДЕСЬ. Иначе «документ ещё
+        # не виден» получалось бы наполовину: перебор его не находит, а
+        # подсказка находит — и проверка задержки видимости была бы холостой.
+        hidden = int(FAULTS.get("po_hide_created") or 0) > 0
+        pool = ([] if hidden else list(CREATED_PURCHASE_ORDERS)) + list(PURCHASE_ORDERS)
+        for doc in pool:
             if str(doc.get("syncId") or "") == sync_id:
                 return doc
     raise HTTPException(status_code=404, detail={"errors": [
@@ -1153,6 +1202,13 @@ async def entity_purchaseorder_create(request: Request):
         FAULTS["po_429_burst"] = int(FAULTS["po_429_burst"]) - 1
         raise HTTPException(status_code=429, detail="rate limited",
                             headers={"X-Lognex-Retry-TimeInterval": "200"})
+    if int(FAULTS.get("po_create_refuse") or 0) > 0:
+        # МойСклад ОТВЕТИЛ про этот запрос: payload отвергнут, документа нет.
+        # Обратная граница неизвестного исхода — см. post_refused_by_ms.
+        FAULTS["po_create_refuse"] = int(FAULTS["po_create_refuse"]) - 1
+        raise HTTPException(status_code=412, detail={"errors": [
+            {"error": "Ошибка сохранения объекта: документ отвергнут",
+             "code": 3006}]})
     if int(FAULTS.get("po_fail_before_create") or 0) > 0:
         # Отказ ДО создания, но НЕ по частоте: клиент из своей позиции не
         # отличает его от «создан, ответ потерян» — и обязан вести себя так,
@@ -1185,6 +1241,24 @@ async def entity_purchaseorder_create(request: Request):
             "uuidHref": f"https://online.moysklad.ru/app/#purchaseorder/edit?id={doc_id}",
         }
         CREATED_PURCHASE_ORDERS.append(doc)
+    if int(FAULTS.get("po_create_twin_then_fail") or 0) > 0:
+        # Документ создан, и рядом с ним — ВТОРОЙ с тем же syncId. Контракт
+        # JSON API 1.2 обещает уникальность ключа; здесь обещание нарушено, и
+        # узнаём мы об этом уже после попытки. Ответ следом «падает».
+        FAULTS["po_create_twin_then_fail"] = \
+            int(FAULTS["po_create_twin_then_fail"]) - 1
+        num = len(CREATED_PURCHASE_ORDERS) + 1
+        twin_id = f"po-{num:04d}"
+        twin = dict(doc)
+        twin["id"] = twin_id
+        twin["name"] = f"{num:05d}"
+        twin["meta"] = {
+            "href": f"{BASE}/entity/purchaseorder/{twin_id}",
+            "type": "purchaseorder", "mediaType": "application/json",
+            "uuidHref": f"https://online.moysklad.ru/app/#purchaseorder/edit?id={twin_id}",
+        }
+        CREATED_PURCHASE_ORDERS.append(twin)
+        raise HTTPException(status_code=502, detail="bad gateway")
     if int(FAULTS.get("po_create_then_fail") or 0) > 0:
         # Документ создан — и только потом «падает» ответ. Именно так
         # выглядит таймаут на стороне клиента: он не знает, что случилось.

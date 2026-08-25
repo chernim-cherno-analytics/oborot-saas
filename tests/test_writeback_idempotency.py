@@ -490,12 +490,25 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
     check("ключ уцелел после сорванной попытки (T1 закоммичен до сети)",
           isinstance(key1, str) and key1 not in ("", MISSING, None),
           f"ms_sync_id={key1!r}")
-    check("лок снят — повтор возможен",
-          (col_of(o1, "ms_doc_href") or "") == "",
+    # Здесь стояло «лок снят — повтор возможен» с проверкой пустого
+    # ms_doc_href, и это утверждение противоречило смыслу самого сбоя.
+    # po_fail_before_create — отказ 502 ДО создания, но комментарий мока
+    # прямо говорит: клиент из своей позиции не отличает его от «создан,
+    # ответ потерян», и обязан вести себя так, будто документ мог появиться.
+    # Пустая строка возвращала заказ в вид «неотправленный», после чего его
+    # можно было удалить — вместе с ms_sync_id (ревью Codex, P1,
+    # discussion_r3858173475). Новое утверждение строже, а не мягче: повтор
+    # по-прежнему обязан пройти, но состояние между попытками — устойчивое
+    # «неизвестно», а не «как будто ничего не было».
+    check("ИСХОД ПОСЛЕ УШЕДШЕГО POST — «НЕИЗВЕСТНО», а не «лок снят»",
+          ms_writeback.is_unknown(col_of(o1, "ms_doc_href")),
           f"ms_doc_href={col_of(o1, 'ms_doc_href')!r}")
+    rdel1 = c.delete(f"/api/orders/{o1}")
+    check("…и такой заказ неудаляем — ключ связывания не выбросить",
+          rdel1.status_code == 409, f"delete={rdel1.status_code}")
     mock_api.post("/__test/faults", json={})
     r = push(c, o1)
-    check("повтор прошёл (200)", r.status_code == 200,
+    check("повтор поверх «неизвестно» прошёл (200)", r.status_code == 200,
           f"status={r.status_code} {r.text[:160]}")
     check("ключ ТОТ ЖЕ, что до смерти попытки", col_of(o1, "ms_sync_id") == key1,
           f"было={key1!r} стало={col_of(o1, 'ms_sync_id')!r}")
@@ -3136,6 +3149,189 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
     check("…и строки заказа в базе действительно нет",
           not order_exists(o26), f"есть={order_exists(o26)}")
 
+
+    # ── 27. Исход POST неизвестен: пометка и ключ обязаны его пережить ──────
+    #
+    # Ревью Codex, P1 (discussion_r3858173475). Ниже — весь класс выходов из
+    # узкого участка «POST уже ушёл, а подтверждения РОВНО ОДНОГО документа
+    # нет». Раньше каждый из них приходил в маршрут обычным httpx.HTTPError,
+    # и общий сетевой обработчик снимал пометку: заказ выглядел
+    # неотправленным и становился УДАЛЯЕМЫМ, хотя финансовый документ мог уже
+    # существовать. Удаление уносит ms_sync_id — единственный ключ, по
+    # которому back-match связал бы документ обратно.
+    #
+    # Проверки детерминированы по построению: ни пауз, ни потоков — состояние
+    # мира задаётся ключами сбоев мока.
+    print("\n== 27. Ответ на POST потерян, а восстановление не подтвердило ==")
+
+    # 27а. Документ создан, ответ потерян, и в выдаче он ещё НЕ ВИДЕН.
+    #      Пустой ответ перебора здесь — не «документа нет», а задержка
+    #      видимости, и принять одно за другое значит потерять документ.
+    docs27a = len(docs_created())
+    o27a = make_order(c, "Заказ: ответ потерян, документ ещё не виден")
+    mock_api.post("/__test/faults", json={"po_create_then_fail": 1,
+                                          "po_hide_created": 1})
+    r27a = push(c, o27a)
+    mock_api.post("/__test/faults", json={})
+    check("исход неизвестен — честный 502", r27a.status_code == 502,
+          f"status={r27a.status_code} {r27a.text[:200]}")
+    # Тришка на случай, если сбой сработает не там: документ ОБЯЗАН быть
+    # создан, иначе проверяется не тот сценарий и «зелёное» ничего не значит.
+    check("POST ДОШЁЛ — документ в МойСкладе создан",
+          len(docs_created()) == docs27a + 1,
+          f"было={docs27a} стало={len(docs_created())}")
+    href27a = col_of(o27a, "ms_doc_href")
+    key27a = str(col_of(o27a, "ms_sync_id") or "")
+    check("СОСТОЯНИЕ УСТОЙЧИВО «НЕИЗВЕСТНО», лок НЕ снят",
+          ms_writeback.is_unknown(href27a), f"ms_doc_href={href27a!r}")
+    check("…и это не считается отправленным (вклад ещё наш)",
+          not ms_writeback.is_pushed(href27a), f"ms_doc_href={href27a!r}")
+    check("КЛЮЧ СВЯЗЫВАНИЯ НА МЕСТЕ", bool(key27a), f"ms_sync_id={key27a!r}")
+    r = c.delete(f"/api/orders/{o27a}")
+    check("УДАЛЕНИЕ ОТВЕРГНУТО (409) — ключ не выбросить",
+          r.status_code == 409, f"status={r.status_code} {r.text[:200]}")
+    check("…и текст объясняет неизвестный исход",
+          "неизвестн" in detail_of(r).lower(), f"detail={detail_of(r)[:200]!r}")
+    check("заказ и ключ пережили отвергнутое удаление",
+          order_exists(o27a) and str(col_of(o27a, "ms_sync_id") or "") == key27a,
+          f"есть={order_exists(o27a)} ms_sync_id={col_of(o27a, 'ms_sync_id')!r}")
+    check("ВТОРОГО POST не было — попытка ровно одна",
+          len(docs_created()) == docs27a + 1,
+          f"создано={len(docs_created())} ожидалось={docs27a + 1}")
+    # Лечение: документ стал виден — синк связывает его по нашему ключу.
+    c.post("/api/sync/run")
+    st27 = wait_sync_done(c)
+    check("синк прошёл", st27.get("state") == "done", f"state={st27.get('state')}")
+    href27a2 = col_of(o27a, "ms_doc_href")
+    check("BACK-MATCH СВЯЗАЛ документ по syncId — состояние стало обычным",
+          ms_writeback.is_pushed(href27a2) and str(href27a2).startswith("http"),
+          f"ms_doc_href={href27a2!r}")
+    check("…ключ при этом не менялся",
+          str(col_of(o27a, "ms_sync_id") or "") == key27a,
+          f"было={key27a!r} стало={col_of(o27a, 'ms_sync_id')!r}")
+
+    # 27б. Документ создан, ответ потерян, а восстановительный ПЕРЕБОР сам
+    #      не состоялся (401). Неудача проверки — не ответ «документа нет».
+    docs27b = len(docs_created())
+    o27b = make_order(c, "Заказ: восстановление не состоялось")
+    mock_api.post("/__test/faults", json={"po_create_then_fail": 1,
+                                          "po_list_ok_before": 1,
+                                          "po_list_status": 401})
+    r27b = push(c, o27b)
+    mock_api.post("/__test/faults", json={})
+    check("исход неизвестен — честный 502", r27b.status_code == 502,
+          f"status={r27b.status_code} {r27b.text[:200]}")
+    check("POST ДОШЁЛ — документ создан (сбой сработал ПОСЛЕ него)",
+          len(docs_created()) == docs27b + 1,
+          f"было={docs27b} стало={len(docs_created())}")
+    href27b = col_of(o27b, "ms_doc_href")
+    key27b = str(col_of(o27b, "ms_sync_id") or "")
+    check("НЕУДАЧА ПРОВЕРКИ НЕ СНЯЛА ЛОК — устойчивое «неизвестно»",
+          ms_writeback.is_unknown(href27b), f"ms_doc_href={href27b!r}")
+    check("ключ связывания на месте", bool(key27b), f"ms_sync_id={key27b!r}")
+    rdel27b = c.delete(f"/api/orders/{o27b}")
+    check("удаление отвергнуто (409)", rdel27b.status_code == 409,
+          f"delete={rdel27b.status_code}")
+    # Лечение повтором: тот же ключ, документ подобран, второго нет.
+    r = push(c, o27b)
+    check("ПОВТОР ПОВЕРХ «НЕИЗВЕСТНО» подобрал уже созданный документ",
+          r.status_code == 200 and (r.json() or {}).get("recovered") is True,
+          f"status={r.status_code} recovered={(r.json() or {}).get('recovered')} "
+          f"{r.text[:160]}")
+    check("…и ВТОРОГО документа не создано",
+          len(docs_created()) == docs27b + 1,
+          f"создано={len(docs_created())} ожидалось={docs27b + 1}")
+    check("…и ключ идемпотентности тот же",
+          str(col_of(o27b, "ms_sync_id") or "") == key27b,
+          f"было={key27b!r} стало={col_of(o27b, 'ms_sync_id')!r}")
+
+    # 27в. После попытки совпадений ДВА. Выбрать нельзя, но и объявить
+    #      «ничего не создано» тоже: один из них только что создан нами.
+    docs27c = len(docs_created())
+    o27c = make_order(c, "Заказ: после попытки совпадений два")
+    mock_api.post("/__test/faults", json={"po_create_twin_then_fail": 1})
+    r27c = push(c, o27c)
+    mock_api.post("/__test/faults", json={})
+    check("неразрешимая двусмысленность — 409", r27c.status_code == 409,
+          f"status={r27c.status_code} {r27c.text[:200]}")
+    check("…и текст ЗАПРЕЩАЕТ повторную отправку, а не советует снять метки",
+          "не отправляйте" in detail_of(r27c).lower(),
+          f"detail={detail_of(r27c)[:200]!r}")
+    key27c = str(col_of(o27c, "ms_sync_id") or "")
+    check("в МойСкладе действительно два документа с нашим ключом",
+          len([d for d in docs_created()
+               if str(d.get("syncId") or "") == key27c]) == 2,
+          f"с ключом={len([d for d in docs_created() if str(d.get('syncId') or '') == key27c])}")
+    href27c = col_of(o27c, "ms_doc_href")
+    check("ДВУСМЫСЛЕННОСТЬ ПОСЛЕ ПОПЫТКИ НЕ СНЯЛА ЛОК",
+          ms_writeback.is_unknown(href27c), f"ms_doc_href={href27c!r}")
+    check("ключ связывания на месте", bool(key27c), f"ms_sync_id={key27c!r}")
+    rdel27c = c.delete(f"/api/orders/{o27c}")
+    check("удаление отвергнуто (409)", rdel27c.status_code == 409,
+          f"delete={rdel27c.status_code}")
+
+    # 27г. Второй вход в ту же дыру, найденный при аудите класса: повтор
+    #      поверх «неизвестно», сорвавшийся ДО POST, не имеет права вернуть
+    #      заказ в «неотправлен» — это стёрло бы знание прошлой попытки.
+    #      Здесь срыв даёт та же неразрешимая пара документов, что и в 27в.
+    docs27d = len(docs_created())
+    r27d = push(c, o27c)
+    check("повтор отклонён (409): пара документов никуда не делась",
+          r27d.status_code == 409, f"status={r27d.status_code} {r27d.text[:200]}")
+    check("НИ ОДНОГО НОВОГО POST", len(docs_created()) == docs27d,
+          f"было={docs27d} стало={len(docs_created())}")
+    check("СНЯТИЕ ЛОКА ВЕРНУЛО «НЕИЗВЕСТНО», а не «неотправлен»",
+          ms_writeback.is_unknown(col_of(o27c, "ms_doc_href")),
+          f"ms_doc_href={col_of(o27c, 'ms_doc_href')!r}")
+    rdel27d = c.delete(f"/api/orders/{o27c}")
+    check("…и заказ по-прежнему неудаляем", rdel27d.status_code == 409,
+          f"delete={rdel27d.status_code}")
+    check("…и ключ связывания на месте",
+          str(col_of(o27c, "ms_sync_id") or "") == key27c,
+          f"ms_sync_id={col_of(o27c, 'ms_sync_id')!r}")
+
+    # 27д. ГРАНИЦА, и она нужна не меньше. МойСклад ОТВЕТИЛ отказом 412 —
+    #      это не потерянный ответ, документа нет. Если и такой исход
+    #      объявить неизвестным, заказ с невалидным payload запирается
+    #      навсегда: удалить нельзя, повтор даёт тот же 412 и снова
+    #      «неизвестно», связывать синку нечего.
+    docs27e = len(docs_created())
+    o27e = make_order(c, "Заказ, который МойСклад отверг")
+    mock_api.post("/__test/faults", json={"po_create_refuse": 1})
+    r27e = push(c, o27e)
+    mock_api.post("/__test/faults", json={})
+    check("отказ МойСклада доходит как ошибка отправки",
+          r27e.status_code in (409, 502),
+          f"status={r27e.status_code} {r27e.text[:200]}")
+    check("ДОКАЗАНО, что документа НЕ создано (это не «неизвестно»)",
+          len(docs_created()) == docs27e,
+          f"было={docs27e} стало={len(docs_created())}")
+    check("ЛОК СНЯТ — заказ обычный, а не запертый",
+          (col_of(o27e, "ms_doc_href") or "") == "",
+          f"ms_doc_href={col_of(o27e, 'ms_doc_href')!r}")
+    rdel27e = c.delete(f"/api/orders/{o27e}")
+    check("…и удалить его можно", rdel27e.status_code == 200,
+          f"delete={rdel27e.status_code} {rdel27e.text[:120]}")
+
+    # 27е. Положительный контроль: определённый сбой ДО POST по-прежнему
+    #      снимает СВОЙ pending. Без него «всё стало неизвестным» выглядело бы
+    #      как исправление, а было бы просто отключением снятия лока.
+    docs27f = len(docs_created())
+    o27f = make_order(c, "Заказ: сеть умерла ДО создания документа")
+    mock_api.post("/__test/faults", json={"syncid_route_status": 401})
+    r27f = push(c, o27f)
+    mock_api.post("/__test/faults", json={})
+    check("сбой ДО POST — обычная ошибка отправки",
+          r27f.status_code in (400, 502),
+          f"status={r27f.status_code} {r27f.text[:200]}")
+    check("документа в МойСкладе НЕ появилось", len(docs_created()) == docs27f,
+          f"было={docs27f} стало={len(docs_created())}")
+    check("ЛОК СНЯТ — заказ снова обычный",
+          (col_of(o27f, "ms_doc_href") or "") == "",
+          f"ms_doc_href={col_of(o27f, 'ms_doc_href')!r}")
+    rdel27f = c.delete(f"/api/orders/{o27f}")
+    check("…и удаление разрешено", rdel27f.status_code == 200,
+          f"delete={rdel27f.status_code} {rdel27f.text[:120]}")
 
     check("каждый POST заказа поставщику нёс syncId",
           all(d.get("syncId") for d in docs_created()),
