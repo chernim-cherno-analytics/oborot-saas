@@ -68,6 +68,7 @@ SUITES = [
     ("account",     "test_account.py",         False, False),
     ("lessons",     "test_lessons.py",         False, False),
     ("isolation",   "test_isolation.py",       False, False),
+    ("tenancy",     "test_tenancy.py",         False, False),
     ("writeback",   "test_writeback.py",       True,  False),
     ("vendor",      "test_vendor.py",          True,  False),
     ("decision",    "test_decision_record.py", False, False),

@@ -293,11 +293,43 @@ def run_scenario() -> int:
     # шифртекст напрямую — проверяем, что удаление его действительно стирает.
     exec_sql("INSERT INTO connections (org_id, kind, token_enc, status, config_json) "
              "VALUES (?, 'moysklad', ?, 'active', '{}')", big_org, encrypt_token("MS-SECRET"))
-    add_member(big_org, "sonya@test.io", "Соня")
+    sonya_id = add_member(big_org, "sonya@test.io", "Соня")
     dual_id = add_member(big_org, "dual@test.io", "Двойной")
     # «Двойной» состоит ещё в одной организации — его аккаунт трогать нельзя.
     exec_sql("INSERT INTO memberships (user_id, org_id, role) VALUES (?, ?, 'member')",
              dual_id, boss_org)
+    big_id = sql("SELECT id FROM users WHERE email = ?", "big@test.io")[0][0]
+
+    # Реальные строки в таблицах, которых в этом сценарии раньше не было.
+    # Проверка «в БД не осталось ни одной строки организации» смотрит только на
+    # таблицы, где строки ЕСТЬ, — то есть про планы заказов и личные следы людей
+    # она молчала. А это ровно те таблицы, из-за которых заводили SEC-6.
+    r = big.post("/api/order-plan", json={"budget": 150000, "budget_scope": "now",
+                                          "cadence_days": 30, "safety_days": 14,
+                                          "strategy": "balance"})
+    check("план заказа сохранён — есть что удалять в order_plans",
+          r.status_code == 200 and sql("SELECT count(*) FROM order_plans WHERE org_id = ?",
+                                       big_org)[0][0] > 0,
+          f"status={r.status_code} {r.text[:120]}")
+
+    def leave_traces(c: httpx.Client) -> None:
+        """Личные следы человека: пройденный урок, тумблер подсказок, инструкция."""
+        c.post("/api/lessons/turnover/done")
+        c.post("/api/prefs/hints", json={"enabled": False})
+        c.post("/api/hints/seen", json={"page": "orders"})
+
+    leave_traces(big)
+    sonya = client()
+    sonya.post("/login", data={"email": "sonya@test.io", "password": "secret123"})
+    leave_traces(sonya)
+    dual = client()
+    dual.post("/login", data={"email": "dual@test.io", "password": "secret123"})
+    leave_traces(dual)
+    PERSONAL = ("user_lessons", "user_prefs", "user_hints_seen")
+    for tbl in PERSONAL:
+        n = sql(f"SELECT count(*) FROM {tbl} WHERE user_id IN (?, ?, ?)",
+                big_id, sonya_id, dual_id)[0][0]
+        check(f"личные следы записались, есть что удалять: {tbl}", n == 3, f"строк={n}")
 
     j = big.get("/api/account").json()
     check("владельцу показано, что именно уйдёт (позиции, продажи, подключение)",
@@ -320,6 +352,17 @@ def run_scenario() -> int:
     check("аккаунт сотрудника с другой организацией сохранён",
           sql("SELECT id FROM users WHERE email = ?", "dual@test.io")
           and sql("SELECT org_id FROM memberships WHERE user_id = ?", dual_id) == [(boss_org,)])
+    # Удаление обязано быть точным в обе стороны: стереть следы ушедших и не
+    # тронуть следы того, кто остался. Ошибка «удалили всё» так же ломает
+    # обещание, как и «удалили не всё», просто у другого человека.
+    for tbl in PERSONAL:
+        gone = sql(f"SELECT count(*) FROM {tbl} WHERE user_id IN (?, ?)",
+                   big_id, sonya_id)[0][0]
+        check(f"личные следы удалённых людей стёрты: {tbl}", gone == 0, f"осталось={gone}")
+        kept = sql(f"SELECT count(*) FROM {tbl} WHERE user_id = ?", dual_id)[0][0]
+        check(f"следы оставшегося коллеги не задеты: {tbl}", kept == 1, f"строк={kept}")
+    sonya.close()
+    dual.close()
     again = client()
     check("после удаления можно зарегистрироваться тем же e-mail",
           register(again, "big@test.io", "Второй заход").status_code == 303)
