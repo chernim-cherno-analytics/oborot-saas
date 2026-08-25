@@ -1031,11 +1031,38 @@ def api_checks() -> None:
         check("с накладными заказ всё равно не выходит за бюджет",
               sum(i["cost_total"] for i in over["items"]) <= 300000,
               str(sum(i["cost_total"] for i in over["items"])))
+        # Инвариант «накладные не меняют потребность» нельзя доказывать на двух
+        # планах, ограниченных одним и тем же бюджетом: накладные повышают
+        # себестоимость, значит на те же деньги влезает другой СОСТАВ, и
+        # сравнивать оказывается нечего. Прежняя проверка это маскировала —
+        # фильтровала левый словарь по именам правого и сравнивала разные
+        # множества позиций несимметрично; на демо-данных она падала на чистом
+        # main. Пересечение составов сюда тоже не годится: если у выпавшей
+        # позиции need поменялся, пересечение этого не увидит.
+        # Поэтому берём два ОТДЕЛЬНЫХ исчерпывающих превью с одинаковым
+        # заведомо достаточным бюджетом — тогда в оба входит весь ассортимент,
+        # состав перестаёт зависеть от денег, и сравнение становится полным.
+        BIG = 10 ** 12
+        base_all = c.post("/api/order-plan/preview", json={
+            "production_id": lab["id"], "eta_date": eta, "budget": BIG,
+            "budget_scope": "full", "strategy": "balance"}).json()
+        over_all = c.post("/api/order-plan/preview", json={
+            "production_id": lab["id"], "eta_date": eta, "budget": BIG,
+            "budget_scope": "full", "strategy": "balance", "overhead_pct": 25}).json()
+        need_base = {i["base_name"]: i["need"] for i in base_all["items"]}
+        need_over = {i["base_name"]: i["need"] for i in over_all["items"]}
+        check("исчерпывающие планы для сравнения непусты",
+              bool(base_all["items"]) and bool(over_all["items"]),
+              f"без накладных={len(base_all['items'])} с накладными={len(over_all['items'])}")
+        check("на достаточном бюджете накладные не меняют состав заказа",
+              set(need_base) == set(need_over),
+              f"только без накладных={sorted(set(need_base) - set(need_over))} "
+              f"только с накладными={sorted(set(need_over) - set(need_base))}")
         check("накладные не меняют потребность в штуках",
-              {i["base_name"]: i["need"] for i in over["items"]}
-              == {i["base_name"]: i["need"] for i in base_plan["items"]
-                  if i["base_name"] in {x["base_name"] for x in over["items"]}},
-              "need изменился")
+              need_base == need_over,
+              str([(b, need_base.get(b), need_over.get(b))
+                   for b in sorted(set(need_base) | set(need_over))
+                   if need_base.get(b) != need_over.get(b)]))
 
         check("маржа считается только по спросу",
               all(i["expected_profit"] <= round(i["need"] * max(0, i["avg_price"] - i["cost_price"])) + 1
@@ -1336,11 +1363,22 @@ def api_checks() -> None:
                      json=dict(body_hz, cover_mode="что-то"))
         check("неизвестный режим отклоняется, а не молча подменяется",
               bad.status_code == 422, f"status={bad.status_code}")
-        check("на большом фиксированном горизонте план не становится вечно предварительным",
-              c.post("/api/order-plan/preview",
-                     json=dict(body_hz, cover_mode="fixed", horizon_days_fixed=365)
-                     ).json()["coverage"]["partial"] is False,
-              "история не может быть глубже года — требовать больше нельзя")
+        # D-35 (23.08.2026): окно истории теперь HISTORY_DAYS = 730 (канон
+        # оборачиваемости — 2 года). Инвариант «план не вечно предварительный»
+        # проверяется по требованию, а не по факту: needed_days клэмпится к
+        # HISTORY_DAYS (больше, чем система вообще грузит, требовать нельзя),
+        # а partial честно сравнивает загруженное покрытие с требованием —
+        # на демо (400 дней истории) большой горизонт даёт partial, пока
+        # второй год не загружен, и это правильно.
+        from app.ms_sync import HISTORY_DAYS as _HD
+        cov_big = c.post("/api/order-plan/preview",
+                         json=dict(body_hz, cover_mode="fixed", horizon_days_fixed=365)
+                         ).json()["coverage"]
+        check("требование к истории клэмпится к окну загрузки (не вечно предварительный)",
+              cov_big["needed_days"] <= _HD, f"needed={cov_big['needed_days']} > {_HD}")
+        check("partial честен: сравнивает загруженное покрытие с требованием",
+              cov_big["partial"] is (cov_big["days"] < cov_big["needed_days"]),
+              f"cov={cov_big}")
 
         # ── Позиция, втащенная галочкой, — решение человека ─────────────────
         # Позицию из ИСКЛЮЧЁННОЙ категории система сама бы не взяла — значит

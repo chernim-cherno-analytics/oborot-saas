@@ -133,9 +133,12 @@ def ls_dir(d: Path) -> list[str]:
 
 def main() -> int:
     if shutil.which("sqlite3") is None:
-        print("ПРОПУСК: в системе нет клиента sqlite3, проверять нечего.")
-        print("ИТОГО: 0 OK, 0 FAIL")
-        return 0
+        # Код 77 И причина одновременно (D-42). «ИТОГО: 0 OK, 0 FAIL» при
+        # нулевом коде возврата отсюда убрано: ровно эта пара и делала
+        # непроверенный бэкап зелёной строкой в CI.
+        print("ПРОПУЩЕНО: в системе нет клиента sqlite3 — "
+              "скрипты бэкапа проверять нечем")
+        return 77
 
     if WORK.exists():
         shutil.rmtree(WORK)

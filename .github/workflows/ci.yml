@@ -4,8 +4,17 @@
 # и никакой гарантии, что он вообще был. Прод при этом обновляется автоматически
 # из main — то есть непроверенное изменение доезжает до клиента само.
 #
-# Четыре шага, ровно как договорились: установка зафиксированных зависимостей →
-# все наборы тестов → smoke старта приложения → smoke миграций.
+# Шаги: зафиксированные зависимости прода → тестовый overlay с браузером →
+# ВСЕ наборы тестов в режиме --require-all → smoke старта → smoke миграций.
+#
+# ПОЧЕМУ --require-all (D-42, 24.08.2026). До этой правки набор, не выполнивший
+# ни одной проверки, считался пройденным: test_ui.py возвращал 0, не найдя
+# playwright, test_backup.py и test_deploy.py печатали «ИТОГО: 0 OK, 0 FAIL»
+# при отсутствии sqlite3 и flock. В прогоне 32716761631 ui показал 0/0 при
+# зелёном итоге. Теперь пропуск в CI считается падением, и ключей --allow-skip
+# здесь НЕТ НИ ОДНОГО: ui, backup и deploy обязаны отработать и дать ok > 0.
+# Заводить исключение можно только вместе с записью в TECH_DEBT.md — иначе
+# исключение переживёт причину, по которой его завели.
 name: tests
 
 on:
@@ -43,43 +52,74 @@ jobs:
           fi
           pip install -r requirements.lock
 
-      - name: Зависимости совместимы и совпадают с lock
-        # Две разные проверки, обе дешёвые.
-        # pip check — нет ли конфликта требований между установленными пакетами.
-        # Сверка с lock — не уехало ли фактическое окружение от записанного:
-        # lock-файл, которому окружение не соответствует, хуже отсутствия
-        # lock-файла, потому что создаёт ложную уверенность.
+      - name: Зависимости совместимы и совпадают с lock (строгий набор)
+        # ЭТОТ ШАГ ЗАМЕНЯЕТ прежний встроенный скрипт `pip check` + сверка
+        # версий с lock, и замена не молчаливая: набор `tests/test_dependencies.py`
+        # делает всё, что делал скрипт (`pip check`, точное совпадение каждого
+        # пина lock с установленной версией), и сверх того — разбор lock на
+        # дубли, полноту замыкания и согласие границ `requirements.txt` с
+        # `requirements.lock`. Смысл шага строго шире прежнего, ничего из
+        # проверявшегося не потеряно.
+        #
+        # Почему набором, а не строкой здесь: строка внутри workflow локально не
+        # запускается и до пуша не падает. Именно так 23.08 в requirements.txt
+        # прожили starlette 1.6.0 и pydantic 2.13.4 — версии, которых не было ни
+        # в lock, ни на сервере. Идея вынести проверку отдельным набором взята
+        # из ветки codex/p20-integration-publish, реализация своя.
+        #
+        # Шаг стоит ДО тестового overlay намеренно: он сверяет прод-замыкание,
+        # и мерить его надо до того, как поверх ляжет playwright.
+        #
+        # OBOROT_ENFORCE_LOCK=1: в CI расхождение окружения с lock — падение,
+        # а не предупреждение. Локально у разработчика может стоять другое.
+        #
+        # Тот же набор ещё раз проходит внутри run_all.py как обязательный
+        # `deps` — здесь он нужен раньше, чтобы не тратить сборку браузера на
+        # заведомо неверном окружении.
+        run: python tests/test_dependencies.py
+        env:
+          OBOROT_ENFORCE_LOCK: "1"
+
+      - name: Кэш браузеров playwright
+        # Ключ — по dev-lock: обновили playwright, поменялась и сборка браузера,
+        # значит кэш обязан протухнуть. Кэшируется каталог, а не факт установки:
+        # шаг ниже всё равно выполняется и молча доскачивает недостающее.
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: pw-${{ runner.os }}-${{ hashFiles('requirements-dev.lock') }}
+
+      - name: Тестовый overlay и браузер (fail-closed)
+        # Тот же fail-closed, что и у прод-lock: нет файла — останавливаемся.
+        # Молчаливый откат на «поставим playwright как получится» уже однажды
+        # дал зелёный CI на наборе, который не открыл ни одной страницы.
         run: |
+          if [ ! -f requirements-dev.lock ]; then
+            echo "НЕТ requirements-dev.lock — набор ui нечем проверять, останавливаюсь."
+            exit 1
+          fi
+          pip install -r requirements-dev.lock
           pip check
+          python -m playwright install --with-deps chromium
+
+      - name: Браузер привязан к playwright, а не к системе
+        # Доказательство версии: печатаем то, чем реально будет ходить ui.
+        run: |
           python - <<'PY'
-          import re, sys
-          from importlib.metadata import version, PackageNotFoundError
-          bad = []
-          for line in open("requirements.lock", encoding="utf-8"):
-              line = line.split("#", 1)[0].strip()
-              if not line or "==" not in line:
-                  continue
-              name, want = line.split("==", 1)
-              name, want = name.strip(), want.strip()
-              try:
-                  have = version(name)
-              except PackageNotFoundError:
-                  bad.append(f"{name}: в lock {want}, не установлен")
-                  continue
-              if have != want:
-                  bad.append(f"{name}: в lock {want}, установлено {have}")
-          if bad:
-              print("ОКРУЖЕНИЕ НЕ СОВПАДАЕТ С requirements.lock:")
-              for b in bad:
-                  print("  " + b)
-              sys.exit(1)
-          print("окружение совпадает с lock")
+          from importlib.metadata import version
+          from playwright.sync_api import sync_playwright
+          with sync_playwright() as pw:
+              b = pw.chromium.launch()
+              print(f"playwright {version('playwright')} · chromium {b.version}")
+              b.close()
           PY
 
-      - name: Все наборы тестов
+      - name: Все наборы тестов (обязательны все, пропуск = падение)
         # По три набора одновременно: на двухъядерном раннере одиннадцать
         # параллельных приложений мешают друг другу и дают ложные падения.
-        run: python tests/run_all.py --jobs 3
+        #
+        # --require-all и НИ ОДНОГО --allow-skip: см. шапку файла.
+        run: python tests/run_all.py --jobs 3 --require-all
         env:
           OBOROT_COMMIT: ${{ github.sha }}
 

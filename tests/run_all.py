@@ -12,13 +12,38 @@
 `OBOROT_TG_PORT`), а этот раннер раздаёт каждому набору свои. Значения по
 умолчанию в самих файлах не изменились — запуск по одному работает как раньше.
 
+ПРИГОВОР ПО НАБОРУ (D-42, 24.08.2026). Раньше набор считался хорошим по правилу
+«код возврата 0 и в отчёте нет FAIL». Под это правило попадал и набор, не
+выполнивший НИ ОДНОЙ проверки: `test_ui.py` возвращал 0, не найдя playwright,
+`test_backup.py` и `test_deploy.py` печатали «ИТОГО: 0 OK, 0 FAIL» при
+отсутствии sqlite3 или flock. В прогоне CI 32716761631 набор ui показал 0/0
+при общем зелёном итоге — то есть проверка, которой не было, выглядела как
+пройденная. Теперь приговор выносит `classify()` и он ровно такой:
+
+  PASS      канонический числовой отчёт «ИТОГО: N OK, M FAIL» (регистр слова
+            не важен: четыре набора пишут «Итого»), ok > 0, fail = 0, rc = 0;
+  SKIP      код возврата 77 И маркер «ПРОПУЩЕНО: <причина>» ОДНОВРЕМЕННО.
+            Один сигнал без второго — не пропуск, а провал: пропуск без
+            причины неотличим от поломки, а причина без кода — от набора,
+            который написал «ПРОПУЩЕНО» про одну свою проверку и продолжил;
+  NO_REPORT отчёта нет вовсе — сказать, что набор сделал, нечем;
+  TIMEOUT   набор не уложился в потолок;
+  FAIL      всё остальное, включая 0 OK / 0 FAIL и падения поверх пропуска.
+
+Подсчёт строк «  OK   » остался, но только как диагностика (`counted_ok`):
+по строкам не видно, дошёл набор до конца или оборвался на середине, поэтому
+приговор он не выносит и в `ok` не попадает.
+
 Запуск:
     python tests/run_all.py              # параллельно, столько же по времени,
                                          # сколько самый долгий набор (~5 мин)
     python tests/run_all.py --serial     # по одному, если нужен чистый вывод
     python tests/run_all.py sync planner # только выбранные наборы
+    python tests/run_all.py --require-all  # как в CI: пропуск = падение
 
-Код возврата: 0 — всё зелёное, 1 — есть падения или набор не завершился.
+Код возврата: 0 — все наборы честно зелёные (локально допускается ЯВНЫЙ
+пропуск, он виден в таблице вместе с причиной), 1 — есть падения, молчание,
+0/0, отсутствие отчёта или незавершённый набор, 2 — ошибка вызова.
 """
 import argparse
 import os
@@ -37,6 +62,7 @@ TESTS = ROOT / "tests"
 # 9800, 9801, 9810), чтобы раннер можно было запустить, пока идёт ручной прогон.
 SUITES = [
     # имя,          файл,                     нужен мок МС, нужен мок телеграма
+    ("runner",      "test_runner.py",          False, False),
     ("sync",        "test_sync.py",            True,  False),
     ("planner",     "test_planner.py",         False, False),
     ("account",     "test_account.py",         False, False),
@@ -54,12 +80,85 @@ SUITES = [
     ("subscr",      "test_subscription.py",    False, False),
     ("exec",        "test_execution.py",       False, False),
     ("consist",     "test_consistency.py",     False, False),
+    ("canon",       "test_turnover_canon.py",  False, False),
+    # Замок на формулы потребности и largest-remainder (DATA-11). Стоит рядом
+    # с `canon` намеренно: оба набора ничего не улучшают, оба фиксируют канон
+    # как есть. Ключа --allow-skip у него нет и не будет: набор офлайновый,
+    # ни сети, ни моков ему не нужно, и пропуститься ему не на чем (D-42).
+    ("formula",     "test_formula_contract.py", False, False),
     ("ui",          "test_ui.py",              False, False),
     ("backup",      "test_backup.py",          False, False),
     ("deploy",      "test_deploy.py",          False, False),
+    ("offsite",     "test_offsite.py",         False, False),
+    ("deps",        "test_dependencies.py",    False, False),
 ]
 
-TOTAL_RE = re.compile(r"ИТОГО:\s*(\d+)\s*OK,\s*(\d+)\s*FAIL")
+# «ИТОГО» и «Итого» — один и тот же отчёт: половина наборов написана так,
+# половина эдак. Регистр слова не должен решать, засчитана работа или нет.
+TOTAL_RE = re.compile(r"ИТОГО:\s*(\d+)\s*OK,\s*(\d+)\s*FAIL", re.IGNORECASE)
+# Причина обязана быть непустой: «ПРОПУЩЕНО:» без текста — это не причина.
+#
+# Маркер читается ТОЛЬКО с начала строки, без отступа: это заявление самого
+# набора, а не строка из вывода вложенного скрипта. Случай живой:
+# `tests/test_backup.py` запускает `deploy/backup.sh`, тот печатает
+# «   ПРОПУЩЕНО: BACKUP_REMOTE не задан.» про свой необязательный шаг — и с
+# отступом-безразличным правилом полностью отработавший набор из 21 проверки
+# получал приговор «маркер при коде возврата 0», то есть падение на ровном
+# месте. Прод-скрипт при этом трогать нечем и незачем: он говорит правду про
+# себя, просто не за набор.
+SKIP_RE = re.compile(r"^ПРОПУЩЕНО:[ \t]*(\S.*?)\s*$", re.MULTILINE)
+OK_LINE_RE = re.compile(r"^ {2}OK {3}", re.MULTILINE)
+FAIL_LINE_RE = re.compile(r"^ {2}FAIL ", re.MULTILINE)
+
+SKIP_RC = 77       # код «набор сознательно не выполнялся»
+TIMEOUT_RC = 124   # код таймаута, как у одноимённой утилиты
+
+PASS = "PASS"
+FAIL = "FAIL"
+SKIP = "SKIP"
+NO_REPORT = "NO_REPORT"
+TIMEOUT = "TIMEOUT"
+
+
+def classify(out: str, rc: int) -> dict:
+    """Приговор по выводу набора и коду возврата. Единственное место, где он есть.
+
+    Функция чистая: ни файлов, ни процессов, ни времени — её и проверяет
+    `tests/test_runner.py` таблицей истинности.
+    """
+    # ПОСЛЕДНИЙ отчёт, а не первый: итог набор подводит в конце. Первый же
+    # найденный — это иногда строка, которую набор разбирает или цитирует
+    # (`tests/test_runner.py` печатает «ИТОГО: 0 OK, 0 FAIL» в названии
+    # проверки, и раннер засчитывал ему 3 OK вместо 42).
+    matches = TOTAL_RE.findall(out)
+    has_report = bool(matches)
+    ok, fail = (int(matches[-1][0]), int(matches[-1][1])) if has_report else (0, 0)
+    sm = SKIP_RE.search(out)
+    reason = sm.group(1) if sm else ""
+    res = {
+        "ok": ok, "fail": fail, "rc": rc, "reason": reason,
+        "report": has_report,
+        # Диагностика: сколько строк проверок видно глазами. Приговора не
+        # выносит — оборванный набор печатает такие же строки, что и целый.
+        "counted_ok": len(OK_LINE_RE.findall(out)),
+        "counted_fail": len(FAIL_LINE_RE.findall(out)),
+    }
+
+    if rc == TIMEOUT_RC:
+        res["verdict"] = TIMEOUT
+    elif fail:
+        # Падение важнее пропуска: набор что-то выполнил и что-то уронил.
+        res["verdict"] = FAIL
+    elif rc == SKIP_RC or reason:
+        # Заявка на пропуск. Засчитывается только целиком: код И причина.
+        res["verdict"] = SKIP if (rc == SKIP_RC and reason) else FAIL
+    elif not has_report:
+        res["verdict"] = NO_REPORT
+    elif rc != 0 or ok == 0:
+        res["verdict"] = FAIL
+    else:
+        res["verdict"] = PASS
+    return res
 
 
 def run_one(idx: int, name: str, filename: str, needs_ms: bool, needs_tg: bool,
@@ -70,6 +169,7 @@ def run_one(idx: int, name: str, filename: str, needs_ms: bool, needs_tg: bool,
     # порт ему нужен отдельно, иначе при параллельном прогоне он столкнётся с
     # приложением соседнего набора.
     env["BACKUP_TEST_PORT"] = str(8861 + idx)
+    env["OFFSITE_TEST_PORT"] = str(8881 + idx)
     if needs_ms:
         env["OBOROT_MOCK_PORT"] = str(9821 + idx)
     if needs_tg:
@@ -83,12 +183,49 @@ def run_one(idx: int, name: str, filename: str, needs_ms: bool, needs_tg: bool,
     except subprocess.TimeoutExpired as exc:
         out = (exc.stdout or "") + (exc.stderr or "") if isinstance(exc.stdout, str) else ""
         out += f"\n[раннер] набор не завершился за {timeout} с"
-        rc = 124
-    m = TOTAL_RE.search(out)
-    ok, fail = (int(m.group(1)), int(m.group(2))) if m else (
-        out.count("\n  OK   "), out.count("\n  FAIL "))
-    return {"name": name, "ok": ok, "fail": fail, "rc": rc,
-            "sec": round(time.time() - started, 1), "out": out}
+        rc = TIMEOUT_RC
+    res = classify(out, rc)
+    res.update({"name": name, "sec": round(time.time() - started, 1), "out": out})
+    return res
+
+
+def is_good(r: dict, require_all: bool, allow_skip: set) -> bool:
+    """Засчитан ли набор.
+
+    Локально явный пропуск не красит прогон в красный — но он и не зелёный:
+    в таблице он стоит как SKIP с причиной. В CI (`--require-all`) пропуск
+    засчитан только если набор назван в `--allow-skip` поимённо.
+    """
+    if r["verdict"] == PASS:
+        return True
+    if r["verdict"] == SKIP:
+        return (not require_all) or (r["name"] in allow_skip)
+    return False
+
+
+def explain(r: dict) -> str:
+    """Короткая приписка к строке таблицы — почему набор не засчитан."""
+    if r["verdict"] == PASS:
+        return ""
+    if r["verdict"] == SKIP:
+        return f"SKIP — ПРОПУЩЕНО: {r['reason']}"
+    if r["verdict"] == TIMEOUT:
+        return "TIMEOUT — набор не завершился"
+    if r["verdict"] == NO_REPORT:
+        return (f"NO_REPORT — канонического «ИТОГО: N OK, M FAIL» нет "
+                f"(строк проверок видно: {r['counted_ok']} OK / "
+                f"{r['counted_fail']} FAIL)")
+    if r["fail"]:
+        # Падения называются первыми: приписка «маркер при коде возврата 1»
+        # поверх пяти настоящих падений уводит читателя не туда.
+        return f"FAIL — падений {r['fail']}, код возврата {r['rc']}"
+    if r["rc"] == SKIP_RC and not r["reason"]:
+        return "FAIL — код 77 без маркера «ПРОПУЩЕНО: <причина>»"
+    if r["reason"] and r["rc"] != SKIP_RC:
+        return f"FAIL — маркер «ПРОПУЩЕНО» при коде возврата {r['rc']}"
+    if r["report"] and r["ok"] == 0 and r["fail"] == 0:
+        return "FAIL — 0 OK, 0 FAIL: не выполнено ни одной проверки"
+    return f"FAIL — код возврата {r['rc']}, падений {r['fail']}"
 
 
 def main() -> int:
@@ -100,21 +237,45 @@ def main() -> int:
                          "машине и в CI ставьте 2-3, иначе наборы мешают друг другу)")
     ap.add_argument("--timeout", type=int, default=1200, help="потолок на набор, с")
     ap.add_argument("-v", "--verbose", action="store_true", help="печатать вывод наборов")
+    ap.add_argument("--require-all", action="store_true",
+                    help="режим CI: обязателен ВЕСЬ набор наборов, каждый должен "
+                         "быть честно зелёным; пропуск считается падением")
+    ap.add_argument("--allow-skip", action="append", default=[], metavar="НАБОР",
+                    help="разрешить ЯВНЫЙ пропуск названного набора при "
+                         "--require-all (можно повторять). В CI «Оборота» не "
+                         "используется ни разу — исключение здесь заводится "
+                         "только вместе с записью в TECH_DEBT.md")
     args = ap.parse_args()
 
-    suites = [s for s in SUITES if not args.only or s[0] in args.only]
-    unknown = set(args.only) - {s[0] for s in SUITES}
+    known = {s[0] for s in SUITES}
+    unknown = set(args.only) - known
     if unknown:
         print(f"Неизвестные наборы: {', '.join(sorted(unknown))}")
         print(f"Доступные: {', '.join(s[0] for s in SUITES)}")
         return 2
+    unknown_skip = set(args.allow_skip) - known
+    if unknown_skip:
+        print(f"--allow-skip называет несуществующие наборы: "
+              f"{', '.join(sorted(unknown_skip))}")
+        return 2
+    if args.require_all and args.only and set(args.only) != known:
+        # «Все зарегистрированные наборы обязательны» и «гоним три штуки» —
+        # несовместимые требования. Молча сузить набор здесь опаснее отказа:
+        # получился бы зелёный CI по трети проверок.
+        print("--require-all требует полного набора наборов, а названы только: "
+              f"{', '.join(sorted(args.only))}")
+        print("Уберите имена наборов или уберите --require-all.")
+        return 2
+
+    suites = [s for s in SUITES if not args.only or s[0] in args.only]
     for pattern in ("test_*.db", "test_*.db-wal", "test_*.db-shm"):
         for f in ROOT.glob(pattern):
             f.unlink()
 
     mode = ("последовательно" if args.serial
             else f"параллельно по {args.jobs}" if args.jobs else "параллельно")
-    print(f"Наборов: {len(suites)} · режим: {mode}\n")
+    strict = " · режим CI: обязательны все наборы" if args.require_all else ""
+    print(f"Наборов: {len(suites)} · режим: {mode}{strict}\n")
     started = time.time()
     jobs = [(i, *s, args.timeout) for i, s in enumerate(suites)]
     if args.serial:
@@ -124,26 +285,39 @@ def main() -> int:
         with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
             results = list(pool.map(lambda j: run_one(*j), jobs))
 
+    allow_skip = set(args.allow_skip)
     total_ok = total_fail = 0
-    print(f"{'набор':<12} {'OK':>6} {'FAIL':>6} {'сек':>7}")
-    print("-" * 34)
+    print(f"{'набор':<12} {'OK':>6} {'FAIL':>6} {'сек':>7}  приговор")
+    print("-" * 44)
     for r in sorted(results, key=lambda x: -x["ok"]):
         total_ok += r["ok"]
         total_fail += r["fail"]
-        mark = "" if r["rc"] == 0 and r["fail"] == 0 else "  ← "
-        mark += "не завершился" if r["rc"] == 124 else ("падения" if r["rc"] else "")
+        note = explain(r)
+        mark = f"  ← {note}" if note else f"  {PASS}"
         print(f"{r['name']:<12} {r['ok']:>6} {r['fail']:>6} {r['sec']:>7}{mark}")
-    print("-" * 34)
-    print(f"{'ВСЕГО':<12} {total_ok:>6} {total_fail:>6} {round(time.time()-started,1):>7}")
+    print("-" * 44)
+    print(f"{'ВСЕГО':<12} {total_ok:>6} {total_fail:>6} "
+          f"{round(time.time()-started,1):>7}")
 
-    bad = [r for r in results if r["rc"] != 0 or r["fail"]]
+    skipped = [r for r in results if r["verdict"] == SKIP]
+    bad = [r for r in results if not is_good(r, args.require_all, allow_skip)]
+
+    if skipped:
+        print("\nПропущено (это НЕ зелёный результат, а отсутствие проверки):")
+        for r in skipped:
+            print(f"  {r['name']}: ПРОПУЩЕНО: {r['reason']}")
+
     for r in bad:
-        print(f"\n===== {r['name']} (код возврата {r['rc']}) =====")
+        print(f"\n===== {r['name']} · {r['verdict']} (код возврата {r['rc']}) =====")
         lines = [ln for ln in r["out"].splitlines() if "FAIL" in ln or "Traceback" in ln]
         print("\n".join(lines[-30:]) or r["out"][-2000:])
     if args.verbose:
         for r in results:
             print(f"\n===== {r['name']} =====\n{r['out']}")
+
+    if bad:
+        print(f"\nНЕ ЗАСЧИТАНО наборов: {len(bad)} — "
+              f"{', '.join(r['name'] + ' (' + r['verdict'] + ')' for r in bad)}")
     return 1 if bad else 0
 
 
