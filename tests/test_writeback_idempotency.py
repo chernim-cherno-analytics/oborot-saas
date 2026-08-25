@@ -3048,33 +3048,6 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
         finally:
             ms_writeback.begin_push = original
 
-    # 26а. ГЛАВНЫЙ: заказ удалён между чтением маршрута и T1.
-    o26 = make_order(c, "Заказ, который удаляют перед самым T1")
-    c.post(f"/api/orders/{o26}/status", json={"status": "sent"})
-    docs26 = len(docs_created())
-
-    def _delete_o26():
-        # Порядок как в штатном удалении: сначала приёмки (внешний ключ
-        # order_receipts.order_id), потом сам заказ. Приёмок у этого заказа
-        # нет, но полагаться на это в тесте про удаление — плохая идея.
-        assert exec_sql("DELETE FROM order_receipts WHERE order_id=?", o26) == ""
-        assert exec_sql("DELETE FROM production_orders WHERE id=?", o26) == ""
-
-    r26, fired26 = _race_before_t1(o26, _delete_o26)
-    check("шов сработал: удаление прошло между чтением и T1",
-          bool(fired26), f"fired={fired26}")
-    check("УДАЛЁННЫЙ В ГОНКЕ ЗАКАЗ ДАЁТ 404, а не 500",
-          r26.status_code == 404, f"status={r26.status_code} {r26.text[:200]}")
-    check("…и это НЕ ошибка сервера (обычная гонка не выглядит поломкой)",
-          r26.status_code != 500, f"status={r26.status_code}")
-    check("…и текст «Заказ не найден»",
-          "не найден" in detail_of(r26).lower(),
-          f"detail={detail_of(r26)[:160]!r} тело={r26.text[:100]!r}")
-    check("НИ ОДНОГО POST В МОЙСКЛАД", len(docs_created()) == docs26,
-          f"было={docs26} стало={len(docs_created())}")
-    check("…и строки заказа в базе действительно нет",
-          not order_exists(o26), f"есть={order_exists(o26)}")
-
     # 26б. ПОЛОЖИТЕЛЬНЫЙ КОНТРОЛЬ 1: гонка раунда 12 по-прежнему даёт 422.
     o26b = make_order(c, "Заказ, принятый перед самым T1")
     c.post(f"/api/orders/{o26b}/status", json={"status": "sent"})
@@ -3128,6 +3101,41 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
     r = c.post("/api/orders/99999999/push-to-ms")
     check("несуществующий заказ даёт 404 и вне гонки",
           r.status_code == 404, f"status={r.status_code} {r.text[:160]}")
+
+    # 26е. ГЛАВНЫЙ СЛУЧАЙ ИДЁТ ПОСЛЕДНИМ В БЛОКЕ, и это не косметика.
+    #      На СЛОМАННОЙ сборке необработанный InvalidRequestError отдаёт 500 и
+    #      рвёт соединение: следующий запрос к приложению падает
+    #      httpx.ReadError, и набор получает приговор NO_REPORT вместо FAIL.
+    #      Поэтому после этой проверки к приложению больше не обращаемся —
+    #      положительные контроли выполнены выше и на мутации остаются
+    #      зелёными, а значит видно, что краснеет ровно гонка с удалением.
+    # 26а. ГЛАВНЫЙ: заказ удалён между чтением маршрута и T1.
+    o26 = make_order(c, "Заказ, который удаляют перед самым T1")
+    c.post(f"/api/orders/{o26}/status", json={"status": "sent"})
+    docs26 = len(docs_created())
+
+    def _delete_o26():
+        # Порядок как в штатном удалении: сначала приёмки (внешний ключ
+        # order_receipts.order_id), потом сам заказ. Приёмок у этого заказа
+        # нет, но полагаться на это в тесте про удаление — плохая идея.
+        assert exec_sql("DELETE FROM order_receipts WHERE order_id=?", o26) == ""
+        assert exec_sql("DELETE FROM production_orders WHERE id=?", o26) == ""
+
+    r26, fired26 = _race_before_t1(o26, _delete_o26)
+    check("шов сработал: удаление прошло между чтением и T1",
+          bool(fired26), f"fired={fired26}")
+    check("УДАЛЁННЫЙ В ГОНКЕ ЗАКАЗ ДАЁТ 404, а не 500",
+          r26.status_code == 404, f"status={r26.status_code} {r26.text[:200]}")
+    check("…и это НЕ ошибка сервера (обычная гонка не выглядит поломкой)",
+          r26.status_code != 500, f"status={r26.status_code}")
+    check("…и текст «Заказ не найден»",
+          "не найден" in detail_of(r26).lower(),
+          f"detail={detail_of(r26)[:160]!r} тело={r26.text[:100]!r}")
+    check("НИ ОДНОГО POST В МОЙСКЛАД", len(docs_created()) == docs26,
+          f"было={docs26} стало={len(docs_created())}")
+    check("…и строки заказа в базе действительно нет",
+          not order_exists(o26), f"есть={order_exists(o26)}")
+
 
     check("каждый POST заказа поставщику нёс syncId",
           all(d.get("syncId") for d in docs_created()),
