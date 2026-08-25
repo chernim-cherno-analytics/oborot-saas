@@ -1005,10 +1005,12 @@ async def entity_by_syncid(entity: str, sync_id: str, request: Request):
             if str(cp.get("syncId") or "") == sync_id:
                 row = _counterparty_row(cp)
                 if int(FAULTS.get("syncid_route_wrong_type") or 0) > 0:
-                    # Маршрут отдал объект «не того сорта». Подсказка такого
-                    # ответа принимать не вправе — вердикт всё равно за
-                    # перебором, поэтому отбросить её безопасно.
-                    row = {**row, "meta": {**row["meta"], "type": "product"}}
+                    # Маршрут отдал объект «не того сорта» — и это ДРУГОЙ
+                    # объект, с другим id. Иначе проверка была бы холостой:
+                    # склейка по id всё равно свела бы его с находкой перебора,
+                    # и «тип не проверяется» выглядело бы как «тип проверен».
+                    row = {**row, "id": "wrong-type-obj",
+                           "meta": {**row["meta"], "type": "product"}}
                 return row
     elif entity == "purchaseorder":
         # Оба списка, а не только созданные нами: живому API всё равно, кто
