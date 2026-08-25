@@ -582,6 +582,10 @@ FAULTS: dict = {"stock_ok_before": 0, "stock_429_burst": 0,
                 # одновременных push гарантированно оба увидели «агента нет»
                 # и разошлись бы на создание двух контрагентов без syncId.
                 "cp_search_delay_ms": 0,
+                # GET /entity/counterparty/{id} отвечает 500 N раз подряд.
+                # Транзиентный сбой ПРОВЕРКИ закреплённой ссылки: он не
+                # означает «контрагента удалили», и привязку сбрасывать нельзя.
+                "cp_get_500_burst": 0,
                 # Задержка POST /entity/purchaseorder ДО создания документа.
                 # Открывает то самое «сетевое окно» между T1 и T2, в котором
                 # заказ ещё жив в нашей базе, а документа в МС ещё нет: тест
@@ -598,6 +602,7 @@ def reset_faults() -> None:
                   docs_429_burst=0, docs_429_before="",
                   po_create_then_fail=0, po_429_burst=0,
                   po_fail_before_create=0, cp_search_delay_ms=0,
+                  cp_get_500_burst=0,
                   po_create_delay_ms=0, stock_delay_ms=0)
     for k in FAULT_STATS:
         FAULT_STATS[k] = 0
@@ -933,6 +938,29 @@ async def entity_counterparty(request: Request, limit: int = 1000, offset: int =
             if (not name or cp["name"] == name)
             and (not want_sync or str(cp.get("syncId") or "") == want_sync)]
     return _page(rows, limit, offset)
+
+
+@app.get("/entity/counterparty/{cp_id}")
+async def entity_counterparty_get(cp_id: str, request: Request):
+    """Карточка одного контрагента: 200 — есть, 404 — удалён.
+
+    Ровно то, что делает живой МС с запросом удалённой сущности, и ровно то,
+    на что опирается проверка закреплённой ссылки (`entity_exists`). Отдельный
+    ключ сбоев здесь не нужен: «контрагента удалили» тест выражает удалением
+    строки из COUNTERPARTIES — то есть состоянием мира, а не инъекцией.
+    """
+    _auth(request)
+    if int(FAULTS.get("cp_get_500_burst") or 0) > 0:
+        # Транзиентный сбой на проверке: он НЕ означает «удалено», и код
+        # обязан отличать одно от другого.
+        FAULTS["cp_get_500_burst"] = int(FAULTS["cp_get_500_burst"]) - 1
+        raise HTTPException(status_code=500, detail="mock: временный сбой")
+    for cp in COUNTERPARTIES:
+        if cp["id"] == cp_id:
+            return _counterparty_row(cp)
+    raise HTTPException(status_code=404, detail={"errors": [
+        {"error": "Ошибка получения объекта: контрагент не найден"}
+    ]})
 
 
 @app.post("/entity/counterparty")

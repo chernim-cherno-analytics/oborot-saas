@@ -1358,6 +1358,163 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
     finally:
         db16.close()
 
+    # ── 14. Удалённый контрагент: вечный отказ вместо самовосстановления ─────
+    #
+    # Ревью Codex, P2 (discussion_r3842533227). Закреплённая ссылка на
+    # контрагента возвращалась вслепую: `if keys.agent_href: return ...`.
+    # Контрагента «Производство» удалили в МойСкладе — и с этого момента КАЖДЫЙ
+    # POST заказа падает валидацией «контрагент не найден», а ссылка у нас
+    # остаётся прежней. Повтор не лечится никогда: следующая отправка снова
+    # достаёт из базы тот же мёртвый href. Восстановить работу мог только
+    # человек, правящий нашу базу руками, — а из интерфейса это выглядит как
+    # «МойСклад сломался».
+    #
+    # Проверки детерминированные: удаление контрагента выражено состоянием
+    # мира (строка убрана из mock_ms.COUNTERPARTIES), а не таймингом.
+    print("\n== 14. Контрагента удалили в МойСкладе: отправка чинит себя сама ==")
+    mock_ms.COUNTERPARTIES.clear()
+    exec_sql("UPDATE connections SET ms_agent_href='', ms_agent_sync_id='' "
+             "WHERE kind='moysklad'")
+    o14 = make_order(c, "Заказ до удаления контрагента")
+    r = push(c, o14)
+    check("первая отправка прошла и закрепила контрагента", r.status_code == 200,
+          f"status={r.status_code} {r.text[:200]}")
+    href14 = str(conn_col("ms_agent_href") or "")
+    check("ссылка на контрагента закреплена в базе", href14.startswith("http"),
+          f"ms_agent_href={href14!r}")
+
+    # Контрагента удаляют в МойСкладе. Наша закреплённая ссылка становится
+    # мёртвой, но в базе остаётся ровно такой же.
+    #
+    # Вместо него в аккаунте оставлен посторонний контрагент — и не для
+    # красоты. Мок раздаёт идентификаторы как `cp-<число строк + 1>`, поэтому
+    # на пустом списке заново созданный контрагент получил бы ТОТ ЖЕ `cp-001`,
+    # и «ссылка изменилась» стало бы неотличимо от «мёртвая ссылка случайно
+    # снова заработала». С посторонней строкой новый контрагент получает
+    # другой идентификатор, и переразрешение видно по факту, а не по вере.
+    # (Найдено этой же проверкой: первая её редакция падала именно так.)
+    gone14 = [cp for cp in mock_ms.COUNTERPARTIES
+              if cp["name"] == ms_writeback.AGENT_NAME]
+    mock_ms.COUNTERPARTIES.clear()
+    mock_ms.COUNTERPARTIES.append({"id": "cp-other", "name": "Посторонний"})
+    check("контрагент удалён в МойСкладе, а ссылка у нас осталась",
+          len(gone14) == 1
+          and not [cp for cp in mock_ms.COUNTERPARTIES
+                   if cp["name"] == ms_writeback.AGENT_NAME]
+          and str(conn_col("ms_agent_href") or "") == href14,
+          f"было контрагентов={len(gone14)} ms_agent_href={conn_col('ms_agent_href')!r}")
+
+    o14b = make_order(c, "Заказ после удаления контрагента")
+    before14 = len(docs_created())
+    r = push(c, o14b)
+    check("ОТПРАВКА ПОСЛЕ УДАЛЕНИЯ КОНТРАГЕНТА ПРОШЛА, а не упала навсегда",
+          r.status_code == 200, f"status={r.status_code} {r.text[:250]}")
+    check("документ действительно создан", len(docs_created()) == before14 + 1,
+          f"было={before14} стало={len(docs_created())}")
+    href14b = str(conn_col("ms_agent_href") or "")
+    check("МЁРТВАЯ ССЫЛКА ЗАМЕНЕНА НА ЖИВУЮ, а не осталась прежней",
+          href14b.startswith("http") and href14b != href14,
+          f"было={href14!r} стало={href14b!r}")
+    live_ids = [cp["id"] for cp in mock_ms.COUNTERPARTIES]
+    check("…и новая ссылка указывает на существующего контрагента",
+          href14b.rsplit("/", 1)[-1] in live_ids,
+          f"ms_agent_href={href14b!r} есть в аккаунте={live_ids}")
+    check("контрагент переразрешён РОВНО ОДИН, а не по одному на попытку",
+          len([cp for cp in mock_ms.COUNTERPARTIES
+               if cp["name"] == ms_writeback.AGENT_NAME]) == 1,
+          f"контрагенты={live_ids}")
+
+    # 14б. Отрицательный контроль, без которого исправление опасно.
+    # «Проверять ссылку» нельзя понимать как «сбрасывать привязку по любому
+    # неудачному ответу»: 429/5xx/таймаут означают «мы не знаем», а не
+    # «удалено». Сброс по ним завёл бы клиенту ВТОРОГО подрядчика — то есть,
+    # починив дубль документа, мы породили бы дубль контрагента.
+    live14 = str(conn_col("ms_agent_href") or "")
+    cps_before = len(mock_ms.COUNTERPARTIES)
+    o14c = make_order(c, "Заказ во время временного сбоя проверки")
+    # Ретраи клиента здесь временно выключены, и только ради времени прогона:
+    # 500 входит в RETRY_STATUSES, десять повторов с backoff до 60 c заняли бы
+    # минуты. Проверяется не число повторов, а исход исчерпанных повторов —
+    # «мы не знаем» обязано остаться «мы не знаем», а не стать «удалено».
+    from app import ms_client as _ms_client  # noqa: PLC0415
+    retries_before = _ms_client.MAX_RETRIES
+    _ms_client.MAX_RETRIES = 0
+    mock_api.post("/__test/faults", json={"cp_get_500_burst": 99})
+    try:
+        r = push(c, o14c)
+    finally:
+        mock_api.post("/__test/faults", json={})
+        _ms_client.MAX_RETRIES = retries_before
+    check("транзиентный сбой проверки НЕ выдан за успех", r.status_code != 200,
+          f"status={r.status_code} {r.text[:200]}")
+    check("ПРИВЯЗКА НЕ СБРОШЕНА транзиентным сбоем",
+          str(conn_col("ms_agent_href") or "") == live14,
+          f"было={live14!r} стало={conn_col('ms_agent_href')!r}")
+    check("…и второго контрагента не появилось",
+          len(mock_ms.COUNTERPARTIES) == cps_before,
+          f"было={cps_before} стало={len(mock_ms.COUNTERPARTIES)}")
+
+    # 14в. Положительный контроль: живая ссылка не пересматривается.
+    # Без него «исправление», которое переразрешает контрагента на КАЖДОЙ
+    # отправке, прошло бы 14а и 14б — и тихо отменило бы решение D-36 о том,
+    # что выбор подрядчика делается один раз.
+    o14d = make_order(c, "Заказ при живом закреплённом контрагенте")
+    r = push(c, o14d)
+    check("отправка при живой ссылке прошла", r.status_code == 200,
+          f"status={r.status_code} {r.text[:200]}")
+    check("ЖИВАЯ ПРИВЯЗКА НЕ ПЕРЕСМОТРЕНА (тот же контрагент)",
+          str(conn_col("ms_agent_href") or "") == live14,
+          f"было={live14!r} стало={conn_col('ms_agent_href')!r}")
+    check("…и нового контрагента не создано",
+          len(mock_ms.COUNTERPARTIES) == cps_before,
+          f"было={cps_before} стало={len(mock_ms.COUNTERPARTIES)}")
+
+    # ── 15. Подтверждение живого contract-теста — точная фраза ──────────────
+    #
+    # Ревью Codex, P2 (discussion_r3848613938). Гейт живого теста стоял на
+    # `if not TOKEN or not CONFIRM`, то есть на «переменная непустая». Под это
+    # подходило ЛЮБОЕ значение, включая `OBOROT_LIVE_MS_CONFIRM=no`: значение,
+    # которым человек пытался запретить запуск, запуск разрешало — и набор
+    # начинал создавать настоящие сущности в живом аккаунте МойСклад.
+    #
+    # Проверяется чистая функция: сети здесь нет ни в одной ветке, поэтому
+    # проверка безопасна сама по себе и не может «случайно сходить» в чужой
+    # аккаунт — что для теста про запуск, создающий документы, обязательно.
+    print("\n== 15. Живой contract-тест: подтверждение сверяется дословно ==")
+    import test_ms_syncid_live as live  # noqa: PLC0415
+
+    check("разрешает ТОЛЬКО точную фразу подтверждения",
+          live.is_authorized("tok", live.CONFIRM_PHRASE) is True,
+          f"фраза={live.CONFIRM_PHRASE!r}")
+    for bad in ("no", "0", "false", "нет", "y", "1",
+                live.CONFIRM_PHRASE[:-1], live.CONFIRM_PHRASE + "!"):
+        check(f"НЕ разрешает подтверждение {bad!r}",
+              live.is_authorized("tok", bad) is False,
+              f"is_authorized('tok', {bad!r})={live.is_authorized('tok', bad)}")
+    check("перевод строки от окружения фразу не ломает",
+          live.is_authorized("tok\n", f" {live.CONFIRM_PHRASE}\n") is True)
+    check("пустое подтверждение не разрешает", not live.is_authorized("tok", ""))
+    check("правильная фраза без токена не разрешает",
+          not live.is_authorized("", live.CONFIRM_PHRASE))
+    check("пробелы вокруг «no» его не спасают",
+          not live.is_authorized("tok", "  no  "))
+    # Гейт обязан быть ВШИТ в main(), а не просто существовать рядом с ним:
+    # чистая функция, которую никто не зовёт, — это ноль защиты. Значения
+    # подставляются в модуль явно, чтобы проверка не зависела от окружения
+    # прогона. Сеть недостижима по построению: main() возвращает 2 ДО
+    # asyncio.run(run()), а именно run() ходит в МойСклад.
+    tok_before, conf_before = live.TOKEN, live.CONFIRM
+    try:
+        live.TOKEN, live.CONFIRM = "живой-токен", "no"
+        rc_bad = live.main()
+        check("ГЕЙТ ВШИТ В main(): токен есть, фраза неверна → код 2, "
+              "а не запуск создания сущностей", rc_bad == 2, f"main()={rc_bad}")
+        live.CONFIRM = ""
+        check("…и пустое подтверждение при живом токене тоже даёт 2",
+              live.main() == 2)
+    finally:
+        live.TOKEN, live.CONFIRM = tok_before, conf_before
+
     check("каждый POST заказа поставщику нёс syncId",
           all(d.get("syncId") for d in docs_created()),
           f"без ключа={[d.get('id') for d in docs_created() if not d.get('syncId')]}")
