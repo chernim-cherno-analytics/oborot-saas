@@ -1084,13 +1084,21 @@ def run_scenario() -> int:
         mock_ms.reset_faults()
     stats_p3 = status.get("stats", {})
     good_fp = stats_p3.get("resume_fp")
+    # DATA-3: точка продолжения теперь «сегодня», а не начало окна. Окно
+    # публикуется одной транзакцией (остатки + продажи), и раз продажи не
+    # доехали, остатков окна в базе тоже нет — объявлять загруженным то, чего
+    # не записали, значит врать самому себе при продолжении. Раньше здесь
+    # стояло exp_from (начало окна), и это было верно только потому, что
+    # остатки окна успевали лечь до падения.
     check("(p3) синк упал на продажах окна: точка есть, окно НЕ помечено закрытым",
           status.get("state") == "error"
-          and stats_p3.get("history_loaded_from") == exp_from
+          and stats_p3.get("history_loaded_from") == _day(0)
           and stats_p3.get("window_done") is None
-          and _sales_rows() == 0,
+          and _sales_rows() == 0
+          and _stock_dates() == {_day(0)},
           f"state={status.get('state')} from={stats_p3.get('history_loaded_from')} "
-          f"window_done={stats_p3.get('window_done')} sales={_sales_rows()}")
+          f"window_done={stats_p3.get('window_done')} sales={_sales_rows()} "
+          f"дат остатков={len(_stock_dates())}")
     r = client.post("/api/sync/run")
     status = wait_sync_done(client)
     got_stock, got_sales = _stock_sets()
