@@ -55,6 +55,38 @@ TRANSPORT_ERRORS = (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolE
 PAGE_LIMIT = 1000
 EXPAND_PAGE_LIMIT = 100  # с expand МойСклад отдаёт максимум 100 строк на страницу
 
+# Потолок точного перебора при поиске по syncId (см. find_by_sync_id).
+# Существует не ради экономии, а ради честности: перебор без границы либо
+# когда-нибудь встанет навсегда, либо будет прерван по таймауту где-то в
+# середине — и тогда «не нашли» окажется неправдой в самую опасную сторону.
+# Исчерпанная граница — это «не знаю», и она поднимает исключение, а не
+# возвращает пустой список.
+SYNC_ID_SCAN_LIMIT = _env_int("MS_SYNCID_SCAN_LIMIT", 20000, minimum=1)
+
+
+class SyncIdLookupUnavailable(Exception):
+    """Достоверно ответить «есть или нет такой syncId» не удалось.
+
+    Отдельный тип, а не пустой результат, ровно потому, что пустой результат
+    здесь читается как разрешение создать документ заново. «Не знаю» и «нет» —
+    разные ответы, и цена их смешения — второй заказ поставщику у клиента.
+    """
+
+    def __init__(self, entity: str, sync_id: str, limit: int) -> None:
+        super().__init__(
+            f"{entity}: просмотрено больше {limit} записей, а ключ {sync_id} "
+            f"так и не найден — ответ недостоверен"
+        )
+        self.entity, self.sync_id, self.limit = entity, sync_id, limit
+
+
+class SyncIdNotUnique(Exception):
+    """Один `syncId` — несколько сущностей: контракт уникальности нарушен."""
+
+    def __init__(self, entity: str, sync_id: str, count: int) -> None:
+        super().__init__(f"{entity}: {count} сущностей с одним syncId {sync_id}")
+        self.entity, self.sync_id, self.count = entity, sync_id, count
+
 
 def base_url() -> str:
     """Базовый URL API: env MS_BASE_URL (тесты) или боевой адрес МойСклад."""
@@ -393,20 +425,96 @@ class MoySkladClient:
         return [row async for row in self.paginate("/entity/counterparty", params)
                 if (row.get("name") or "").strip() == name]
 
-    async def find_counterparty_by_sync_id(self, sync_id: str) -> dict | None:
-        """Контрагент по НАШЕМУ ключу идемпотентности (filter=syncId=...).
+    async def sync_id_point_lookup(self, entity: str, sync_id: str) -> dict | None:
+        """Точечный запрос `/entity/{type}/syncid/{id}` — ТОЛЬКО подтверждающий.
 
-        Нужен ровно для одного случая: контрагента мы создали, а ответ до нас
-        не дошёл. Искать его по имени нельзя — одноимённых может быть много;
-        syncId же уникален в аккаунте, поэтому находка здесь однозначна.
+        Положительный ответ с совпавшим `syncId` — это факт: сущность есть.
+        Любой другой исход означает «не знаю», а НЕ «нет», и здесь проходит
+        граница, ошибка на которой стоит дороже всего.
+
+        Причина. Официальная документация (`md/_general.md`, «Назначение поля
+        syncId») описывает URL такого вида для УДАЛЕНИЯ сущности; поддержка
+        `GET` по нему нигде не описана. Значит, 404 отсюда может означать и
+        «сущности нет», и «такого маршрута нет вовсе» — а спутать их значит
+        решить «ничего не создано» и завести ВТОРОЙ финансовый документ.
+        Отрицательный ответ поэтому ничего не решает: за ним идёт перебор.
+
+        Возвращаемое `None` читается как «не подтвердилось», и вызывающий код
+        обязан выяснить ответ достоверно, а не считать, что не нашлось.
         """
         if not sync_id:
             return None
-        params = {"filter": f"syncId={sync_id}"}
-        async for row in self.paginate("/entity/counterparty", params):
-            if str(row.get("syncId") or "") == sync_id:
-                return row
+        try:
+            row = await self.get(f"/entity/{entity}/syncid/{sync_id}")
+        except (httpx.HTTPStatusError, httpx.HTTPError):
+            return None
+        if isinstance(row, dict) and str(row.get("syncId") or "") == sync_id:
+            return row
         return None
+
+    async def find_by_sync_id(self, entity: str, sync_id: str) -> list[dict]:
+        """ВСЕ сущности с нашим ключом идемпотентности — без `filter=syncId`.
+
+        Почему не фильтром. Документация обещает фильтрацию по `syncId`
+        (в таблицах полей контрагента и заказа поставщику у него стоят
+        операторы `=` и `!=`), но живой аккаунт 25.08.2026 ответил
+        **HTTP 412, code 1034 «неизвестное поле фильтрации syncId»**. Между
+        обещанием документа и наблюдаемым фактом побеждает факт: раньше на
+        этом фильтре держались и поиск своего документа, и поиск контрагента,
+        то есть отправка заказа на боевом API падала целиком.
+
+        Что осталось достоверного и на чём стоит этот метод: `syncId`
+        присутствует в полях самой сущности и приходит в выдаче списка. Значит
+        точное сравнение можно сделать у себя — это не зависит ни от какого
+        необязательного умения чужого API.
+
+        Порядок:
+          1) точечный запрос как ПОДТВЕРЖДЕНИЕ (см. sync_id_point_lookup):
+             сработал — отвечаем сразу и списка не читаем;
+          2) иначе — точный перебор страниц со сравнением в Python.
+
+        Перебор идёт ДО КОНЦА, а не до первого совпадения: контракт обещает
+        уникальность ключа, и два объекта с одним `syncId` означают, что
+        обещание нарушено. Узнать об этом обязаны мы, а не выбрать один из
+        двух молча.
+
+        Граница перебора явная. Исчерпали её — мы НЕ знаем ответа, и метод
+        поднимает `SyncIdLookupUnavailable` вместо пустого списка. Пустой
+        список здесь означал бы «в аккаунте такого нет», то есть разрешение
+        создать документ заново; вернуть его, не досмотрев, — это ровно тот
+        дубль, ради недопущения которого весь механизм и написан.
+        """
+        if not sync_id:
+            return []
+        confirmed = await self.sync_id_point_lookup(entity, sync_id)
+        if confirmed is not None:
+            return [confirmed]
+
+        matches: list[dict] = []
+        seen = 0
+        async for row in self.paginate(f"/entity/{entity}"):
+            seen += 1
+            if seen > SYNC_ID_SCAN_LIMIT:
+                raise SyncIdLookupUnavailable(entity, sync_id, SYNC_ID_SCAN_LIMIT)
+            if str(row.get("syncId") or "") == sync_id:
+                matches.append(row)
+        return matches
+
+    async def find_counterparty_by_sync_id(self, sync_id: str) -> dict | None:
+        """Контрагент по НАШЕМУ ключу идемпотентности.
+
+        Нужен ровно для одного случая: контрагента мы создали, а ответ до нас
+        не дошёл. Искать его по имени нельзя — одноимённых может быть много;
+        `syncId` же уникален в аккаунте, поэтому находка здесь однозначна.
+
+        Больше одного совпадения — нарушенный контракт уникальности, и тихо
+        брать первый нельзя: финансовый документ уйдёт произвольному
+        подрядчику. Здесь это ошибка, а не выбор.
+        """
+        rows = await self.find_by_sync_id("counterparty", sync_id)
+        if len(rows) > 1:
+            raise SyncIdNotUnique("counterparty", sync_id, len(rows))
+        return rows[0] if rows else None
 
     async def entity_exists(self, href: str) -> bool:
         """Жива ли сущность по её href: True — есть, False — её больше нет.
@@ -457,20 +565,19 @@ class MoySkladClient:
     async def find_purchase_orders_by_sync_id(self, sync_id: str) -> list[dict]:
         """«Заказы поставщику» с нашим ключом идемпотентности.
 
-        Точный, дешёвый и НЕ зависящий от человека способ узнать, создан ли
-        уже наш документ: syncId живёт в служебном поле, а не в описании,
-        которое владелец может переписать или скопировать в другой документ.
-        Окно по дате не нужно — фильтр точный.
+        Точный и НЕ зависящий от человека способ узнать, создан ли уже наш
+        документ: `syncId` живёт в служебном поле, а не в описании, которое
+        владелец может переписать или скопировать в другой документ.
 
-        Список, а не одна строка: по контракту JSON API 1.2 syncId уникален,
+        Список, а не одна строка: по контракту JSON API 1.2 `syncId` уникален,
         и два ответа означали бы, что реальность разошлась с контрактом.
         Разбираться в этом молча (взяв первый) здесь нельзя.
+
+        Как именно ищем — см. find_by_sync_id: `filter=syncId` живой API не
+        принимает, поэтому точность обеспечивается сравнением у себя, а не
+        обещанием чужого фильтра.
         """
-        if not sync_id:
-            return []
-        params: dict[str, Any] = {"filter": f"syncId={sync_id}"}
-        return [row async for row in self.paginate("/entity/purchaseorder", params)
-                if str(row.get("syncId") or "") == sync_id]
+        return await self.find_by_sync_id("purchaseorder", sync_id)
 
     async def create_purchase_order(self, payload: dict) -> dict:
         """Создаёт документ «Заказ поставщику» (entity/purchaseorder).

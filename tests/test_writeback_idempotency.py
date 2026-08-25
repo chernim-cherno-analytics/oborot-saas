@@ -1690,15 +1690,33 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
                      "meta": {"href": SKU, "type": "product"}}]
 
         async def paginate(self, path, params=None, **kw):
+            # Разведочный вызов из probe_read_only: живой аккаунт отвечает на
+            # filter=syncId ошибкой 412, и подставной клиент ведёт себя так же.
             self.calls.append(f"paginate:{path}")
-            sync = str((params or {}).get("filter", "")).split("=", 1)[-1]
-            if ("counterparty" in path and self.cp_get_raises
-                    and self.calls.count("create_counterparty")):
-                raise httpx.ReadTimeout("mock: GET после создания не дошёл")
-            if "counterparty" in path and self.calls.count("create_counterparty"):
-                for _ in range(self.cp_dupes):
-                    yield {"id": "cp-1", "syncId": sync,
-                           "meta": {"href": AGENT, "type": "counterparty"}}
+            if "syncId=" in str((params or {}).get("filter", "")):
+                raise httpx.HTTPStatusError(
+                    "mock: неизвестное поле фильтрации syncId",
+                    request=None, response=None)
+            return
+            yield {}  # noqa: PLW0101 — делает функцию асинхронным генератором
+
+        async def sync_id_point_lookup(self, entity, sync_id):
+            # Точечный маршрут ничего не подтверждает: его поддержка не
+            # доказана, и продукт обязан работать, когда его нет.
+            self.calls.append("sync_id_point_lookup")
+            return None
+
+        async def find_by_sync_id(self, entity, sync_id):
+            self.calls.append(f"find_by_sync_id:{entity}")
+            if entity == "purchaseorder":
+                return await self.find_purchase_orders_by_sync_id(sync_id)
+            if self.cp_get_raises and self.calls.count("create_counterparty"):
+                raise httpx.ReadTimeout("mock: поиск после создания не дошёл")
+            if not self.calls.count("create_counterparty"):
+                return []
+            return [{"id": "cp-1", "syncId": sync_id,
+                     "meta": {"href": AGENT, "type": "counterparty"}}
+                    ] * self.cp_dupes
 
         async def find_counterparties_by_name(self, name):
             self.calls.append("find_counterparties_by_name")
@@ -1741,15 +1759,20 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
         подсунуть раннеру не тот приговор.
         """
         p_before, f_before = list(live.PASS), list(live.FAIL)
+        create_before = live.CREATE
         live.PASS.clear()
         live.FAIL.clear()
         buf = io.StringIO()
         try:
+            # Создающая половина включается ЯВНО и только здесь: подставной
+            # клиент никуда не ходит, а проверять надо именно её.
+            live.CREATE = live.CREATE_PHRASE
             with contextlib.redirect_stdout(buf):
                 rc = asyncio.run(live.run_contract(fake))
         finally:
             live.PASS[:] = p_before
             live.FAIL[:] = f_before
+            live.CREATE = create_before
         # Журнал снимается копией: следующий прогон его обнулит, а проверять
         # мы будем СТРУКТУРУ, а не только напечатанную строку. Строку легко
         # подделать формулировкой; список событий — нет.
@@ -1948,6 +1971,172 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
     check("«ничего не создано» печатается, когда попыток действительно НЕ было",
           NOTHING in _out_pre and led_pre == [],
           f"событий={len(led_pre)}")
+
+    # ── 19. Поиск по syncId без filter=syncId ───────────────────────────────
+    #
+    # Живой аккаунт 25.08.2026 отверг первый же read-only preflight:
+    # GET /entity/counterparty?filter=syncId=<uuid> → HTTP 412, code 1034,
+    # «неизвестное поле фильтрации syncId» (Issue #2, issuecomment-5414290329).
+    # На этом фильтре держались и поиск своего документа, и поиск контрагента,
+    # то есть отправка заказа на боевом API падала целиком.
+    #
+    # Мок раньше этот фильтр послушно поддерживал — и потому набор был
+    # зелёным, пока продукт был сломан. Теперь мок моделирует ФАКТ, а не наши
+    # ожидания: `_reject_sync_id_filter` отвечает тем же 412/1034.
+    print("\n== 19. Поиск по syncId не зависит от filter=syncId ==")
+    from app import ms_client as _ms_client  # noqa: PLC0415
+
+    # 19а. Факт зафиксирован: мок отвергает фильтр ровно так, как живой API.
+    r = mock_api.get("/entity/counterparty",
+                     params={"filter": "syncId=" + str(uuid.uuid4())},
+                     headers={"Authorization": f"Bearer {mock_ms.TOKEN}"})
+    body19 = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+    errs19 = ((body19.get("detail") or {}).get("errors") or [{}])[0]
+    check("МОК ОТВЕРГАЕТ filter=syncId так же, как живой МойСклад (412/1034)",
+          r.status_code == 412 and errs19.get("code") == 1034,
+          f"status={r.status_code} body={str(body19)[:160]}")
+
+    # 19б. Продакшн-код этого фильтра больше не строит. Проверка статическая:
+    #      поведенческая поймала бы только те пути, по которым прошёл тест.
+    src19 = (ROOT / "app" / "ms_client.py").read_text(encoding="utf-8")
+    src19 += (ROOT / "app" / "ms_writeback.py").read_text(encoding="utf-8")
+    src19 += (ROOT / "app" / "ms_sync.py").read_text(encoding="utf-8")
+    check("В ПРОДАКШН-КОДЕ НЕТ НИ ОДНОГО filter=syncId",
+          "syncId=" not in src19.replace("filter=syncId`", "").replace(
+              "`filter=syncId=`", "").replace("filter=syncId=", "@"),
+          "найдена сборка фильтра по syncId")
+
+    # 19в. Отправка работает целиком, хотя фильтра нет. Это и есть главный
+    #      контртест: раньше здесь был 502 на первом же поиске.
+    mock_ms.COUNTERPARTIES.clear()
+    exec_sql("UPDATE connections SET ms_agent_href='', ms_agent_sync_id='' "
+             "WHERE kind='moysklad'")
+    o19 = make_order(c, "Заказ без фильтра по syncId")
+    before19 = len(docs_created())
+    r = push(c, o19)
+    check("ОТПРАВКА ПРОХОДИТ БЕЗ filter=syncId", r.status_code == 200,
+          f"status={r.status_code} {r.text[:200]}")
+    check("…и документ создан ровно один",
+          len(docs_created()) == before19 + 1,
+          f"было={before19} стало={len(docs_created())}")
+
+    # 19г. Точечный маршрут /entity/{type}/syncid/{id} может не поддерживаться
+    #      GET'ом — документация описывает его только для удаления. Тогда его
+    #      404 неотличим от «сущности нет», и полагаться на него как на
+    #      отрицательный ответ нельзя. Отправка обязана работать и без него.
+    mock_ms.COUNTERPARTIES.clear()
+    exec_sql("UPDATE connections SET ms_agent_href='', ms_agent_sync_id='' "
+             "WHERE kind='moysklad'")
+    o19b = make_order(c, "Заказ при недоступном точечном маршруте")
+    before19b = len(docs_created())
+    mock_api.post("/__test/faults", json={"syncid_route_404": 1})
+    try:
+        r = push(c, o19b)
+    finally:
+        mock_api.post("/__test/faults", json={})
+    check("ОТПРАВКА ПРОХОДИТ, даже если точечный syncid-маршрут отвечает 404",
+          r.status_code == 200, f"status={r.status_code} {r.text[:200]}")
+    check("…и документ создан ровно один, без дубля",
+          len(docs_created()) == before19b + 1,
+          f"было={before19b} стало={len(docs_created())}")
+
+    # 19д. Восстановление: документ с нашим ключом уже создан, ответ потерян.
+    #      Перебор обязан его найти и НЕ создать второй.
+    o19c = make_order(c, "Заказ, чей ответ потерялся")
+    key19 = str(uuid.uuid4())
+    exec_sql("UPDATE production_orders SET ms_sync_id=?, ms_lookup_mode='sync' "
+             "WHERE id=?", key19, o19c)
+    planted19 = plant_doc("po-lost-19", "Документ прошлой попытки", sync_id=key19)
+    try:
+        before19c = len(docs_created())
+        r = push(c, o19c)
+        check("ПОТЕРЯННЫЙ ОТВЕТ: документ найден перебором, а не создан заново",
+              r.status_code == 200 and (r.json() or {}).get("recovered") is True,
+              f"status={r.status_code} recovered={(r.json() or {}).get('recovered')}")
+        check("…и второго документа не появилось",
+              len(docs_created()) == before19c,
+              f"было={before19c} стало={len(docs_created())}")
+    finally:
+        unplant(planted19)
+
+    # 19е. ГЛАВНАЯ граница. Перебор исчерпал потолок — ответ НЕДОСТОВЕРЕН.
+    #      Пустой список здесь означал бы «в аккаунте такого нет» и разрешал
+    #      создать документ заново. Обязателен честный отказ и НОЛЬ созданий.
+    mock_ms.COUNTERPARTIES.clear()
+    mock_ms.COUNTERPARTIES.extend([
+        {"id": f"cp-bulk-{i}", "name": f"Посторонний {i}"} for i in range(5)])
+    exec_sql("UPDATE connections SET ms_agent_href='', ms_agent_sync_id='' "
+             "WHERE kind='moysklad'")
+    o19d = make_order(c, "Заказ при исчерпанной границе перебора")
+    before19d = len(docs_created())
+    cps_before19 = len(mock_ms.COUNTERPARTIES)
+    limit_save = _ms_client.SYNC_ID_SCAN_LIMIT
+    _ms_client.SYNC_ID_SCAN_LIMIT = 2
+    try:
+        r = push(c, o19d)
+    finally:
+        _ms_client.SYNC_ID_SCAN_LIMIT = limit_save
+    check("ИСЧЕРПАННАЯ ГРАНИЦА ПЕРЕБОРА → ОТКАЗ, а не «не нашли»",
+          r.status_code != 200, f"status={r.status_code} {r.text[:200]}")
+    check("…и текст объясняет, что проверить не удалось",
+          "достоверно" in str((r.json() or {}).get("detail") or ""),
+          f"detail={str((r.json() or {}).get('detail'))[:200]}")
+    check("…и НИ ОДНОГО документа не создано",
+          len(docs_created()) == before19d,
+          f"было={before19d} стало={len(docs_created())}")
+    check("…и НИ ОДНОГО контрагента не заведено",
+          len(mock_ms.COUNTERPARTIES) == cps_before19,
+          f"было={cps_before19} стало={len(mock_ms.COUNTERPARTIES)}")
+    check("…и лок снят — заказ можно отправить снова, когда станет достоверно",
+          (col_of(o19d, "ms_doc_href") or "") == "",
+          f"ms_doc_href={col_of(o19d, 'ms_doc_href')!r}")
+
+    # 19з. Две стадии живого теста. Первый запуск обязан доказать ЧИТАЮЩУЮ
+    #      половину контракта и остановиться: 25.08.2026 живой аккаунт отверг
+    #      самый первый read-only preflight, и хорошо, что до создания дело не
+    #      дошло. Один запуск не должен уметь и «посмотреть», и завести
+    #      документы.
+    create_save = live.CREATE
+    try:
+        for label, value in (("переменная не задана", ""),
+                             ("«yes» вместо фразы", "yes"),
+                             ("фраза подтверждения запуска, а не создания",
+                              live.CONFIRM_PHRASE),
+                             ("опечатка в фразе", live.CREATE_PHRASE + "!")):
+            live.CREATE = value
+            check(f"создание НЕ разрешено: {label}", not live.may_create(),
+                  f"CREATE={value!r}")
+            ro_fake = FakeClient()
+            p_b, f_b = list(live.PASS), list(live.FAIL)
+            live.PASS.clear()
+            live.FAIL.clear()
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    asyncio.run(live.run_contract(ro_fake))
+            finally:
+                live.PASS[:] = p_b
+                live.FAIL[:] = f_b
+            check(f"…и прогон НИЧЕГО не создал ({label})",
+                  ro_fake.calls.count("create_counterparty") == 0
+                  and ro_fake.calls.count("create_purchase_order") == 0,
+                  f"cp={ro_fake.calls.count('create_counterparty')} "
+                  f"po={ro_fake.calls.count('create_purchase_order')}")
+        live.CREATE = live.CREATE_PHRASE
+        check("создание разрешено ТОЛЬКО дословной отдельной фразой",
+              live.may_create())
+        check("…и фраза создания отличается от фразы подтверждения запуска",
+              live.CREATE_PHRASE != live.CONFIRM_PHRASE)
+    finally:
+        live.CREATE = create_save
+
+    # 19ж. Положительный контроль границы: при достаточном потолке та же
+    #      отправка проходит. Без него «отказ всегда» удовлетворял бы 19е.
+    r = push(c, o19d)
+    check("ПРИ ДОСТАТОЧНОМ ПОТОЛКЕ та же отправка проходит",
+          r.status_code == 200, f"status={r.status_code} {r.text[:200]}")
+    check("…и создаёт ровно один документ",
+          len(docs_created()) == before19d + 1,
+          f"было={before19d} стало={len(docs_created())}")
 
     check("каждый POST заказа поставщику нёс syncId",
           all(d.get("syncId") for d in docs_created()),

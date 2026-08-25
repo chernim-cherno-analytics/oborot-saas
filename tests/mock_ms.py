@@ -586,6 +586,10 @@ FAULTS: dict = {"stock_ok_before": 0, "stock_429_burst": 0,
                 # Транзиентный сбой ПРОВЕРКИ закреплённой ссылки: он не
                 # означает «контрагента удалили», и привязку сбрасывать нельзя.
                 "cp_get_500_burst": 0,
+                # Точечный маршрут /entity/{type}/syncid/{id} отвечает 404,
+                # как если бы GET по нему не поддерживался вовсе. Тогда 404
+                # «нет такого URL» неотличим от 404 «нет сущности».
+                "syncid_route_404": 0,
                 # Задержка POST /entity/purchaseorder ДО создания документа.
                 # Открывает то самое «сетевое окно» между T1 и T2, в котором
                 # заказ ещё жив в нашей базе, а документа в МС ещё нет: тест
@@ -602,7 +606,7 @@ def reset_faults() -> None:
                   docs_429_burst=0, docs_429_before="",
                   po_create_then_fail=0, po_429_burst=0,
                   po_fail_before_create=0, cp_search_delay_ms=0,
-                  cp_get_500_burst=0,
+                  cp_get_500_burst=0, syncid_route_404=0,
                   po_create_delay_ms=0, stock_delay_ms=0)
     for k in FAULT_STATS:
         FAULT_STATS[k] = 0
@@ -856,7 +860,7 @@ def entity_purchaseorder(request: Request, limit: int = 100, offset: int = 0,
     _auth(request)
     parsed = _parse_filter(flt)
     m_from = parsed.get("moment>=", "")[:10]
-    want_sync = parsed.get("syncId", "")
+    _reject_sync_id_filter(parsed)
     rows = []
     # seeded + созданные writeback'ом (у последних МС проставил бы moment
     # и applicable сам — эмулируем: сегодня, проведён, shipped=0).
@@ -871,8 +875,6 @@ def entity_purchaseorder(request: Request, limit: int = 100, offset: int = 0,
     ]:
         day = doc["moment"][:10]
         if m_from and day < m_from:
-            continue
-        if want_sync and str(doc.get("syncId") or "") != want_sync:
             continue
         if "positions" in (expand or "") and limit <= 100:
             # как в реальном МС: expand вкладывает не более 100 строк позиций
@@ -903,6 +905,31 @@ def reset_writeback_state() -> None:
     CREATED_PURCHASE_ORDERS.clear()
 
 
+def _reject_sync_id_filter(parsed: dict) -> None:
+    """`filter=syncId` отвергается ровно так, как это делает живой МойСклад.
+
+    Это не выдумка и не перестраховка, а зафиксированный факт: 25.08.2026 на
+    боевом аккаунте первый же read-only preflight
+    `GET /entity/counterparty?filter=syncId=<uuid>` вернул **HTTP 412, code
+    1034, «неизвестное поле фильтрации syncId»** (журнал выпуска, Issue #2,
+    issuecomment-5414290329).
+
+    Раньше мок этот фильтр послушно поддерживал — и именно поэтому набор был
+    зелёным, пока отправка на боевом API падала целиком. Мок обязан быть
+    моделью ЧУЖОГО API, а не наших ожиданий от него: поддерживая то, чего у
+    оригинала нет, он не ловит регрессию, а прячет её.
+
+    Документация МойСклада, к слову, обещает обратное — в таблицах полей
+    контрагента и заказа поставщику у `syncId` стоят операторы `=` и `!=`.
+    Между обещанием документа и наблюдаемым ответом здесь выбран ответ.
+    """
+    if "syncId" in parsed:
+        raise HTTPException(status_code=412, detail={"errors": [{
+            "error": "неизвестное поле фильтрации syncId",
+            "code": 1034,
+        }]})
+
+
 def _counterparty_row(cp: dict) -> dict:
     row = {
         "id": cp["id"], "name": cp["name"],
@@ -930,14 +957,47 @@ async def entity_counterparty(request: Request, limit: int = 1000, offset: int =
                               flt: str = Query(default="", alias="filter")):
     _auth(request)
     parsed = _parse_filter(flt)
-    name, want_sync = parsed.get("name", ""), parsed.get("syncId", "")
+    name = parsed.get("name", "")
+    _reject_sync_id_filter(parsed)
     if int(FAULTS.get("cp_search_delay_ms") or 0) > 0:
         import asyncio as _asyncio
         await _asyncio.sleep(int(FAULTS["cp_search_delay_ms"]) / 1000.0)
     rows = [_counterparty_row(cp) for cp in list(COUNTERPARTIES)
-            if (not name or cp["name"] == name)
-            and (not want_sync or str(cp.get("syncId") or "") == want_sync)]
+            if (not name or cp["name"] == name)]
     return _page(rows, limit, offset)
+
+
+@app.get("/entity/{entity}/syncid/{sync_id}")
+async def entity_by_syncid(entity: str, sync_id: str, request: Request):
+    """Точечный запрос по syncId — маршрут, поддержка которого НЕ доказана.
+
+    Официальная документация описывает URL такого вида только для удаления
+    сущности; работает ли на нём `GET`, нигде не сказано, и живьём мы этого
+    ещё не наблюдали. Поэтому мок умеет оба мира, и переключатель тут не для
+    удобства, а чтобы проверять оба:
+
+      * `syncid_route_404=1` — маршрута нет, сервер отвечает 404. Ровно тот
+        случай, где 404 «нет такого URL» неотличим от 404 «нет сущности», и
+        код обязан НЕ считать это ответом «не найдено»;
+      * по умолчанию — маршрут есть и отдаёт сущность.
+
+    Наш код пользуется этим запросом только как подтверждением: положительный
+    ответ — факт, любой другой — «не знаю».
+    """
+    _auth(request)
+    if int(FAULTS.get("syncid_route_404") or 0) > 0:
+        raise HTTPException(status_code=404, detail={"errors": [
+            {"error": "mock: маршрут не поддерживается", "code": 1006}]})
+    if entity == "counterparty":
+        for cp in COUNTERPARTIES:
+            if str(cp.get("syncId") or "") == sync_id:
+                return _counterparty_row(cp)
+    elif entity == "purchaseorder":
+        for doc in CREATED_PURCHASE_ORDERS:
+            if str(doc.get("syncId") or "") == sync_id:
+                return doc
+    raise HTTPException(status_code=404, detail={"errors": [
+        {"error": "mock: сущность с таким syncId не найдена"}]})
 
 
 @app.get("/entity/counterparty/{cp_id}")

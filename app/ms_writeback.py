@@ -63,7 +63,11 @@ from sqlalchemy.orm import Session
 from app.crypto import decrypt_token
 from app.db import engine, run_migration_step
 from app.models import Connection, OrderedQty, Product, ProductionOrder
-from app.ms_client import MoySkladClient
+from app.ms_client import (
+    MoySkladClient,
+    SyncIdLookupUnavailable,
+    SyncIdNotUnique,
+)
 
 # Имя контрагента-поставщика, на которого оформляется заказ.
 AGENT_NAME = "Производство"
@@ -620,7 +624,26 @@ async def resolve_agent(db: Session, org_id: int, client, keys: PushKeys) -> dic
         raise WritebackError(
             500, "Внутренняя ошибка: ключ контрагента не создан до отправки.",
         )
-    found = await client.find_counterparty_by_sync_id(keys.agent_sync_id)
+    try:
+        found = await client.find_counterparty_by_sync_id(keys.agent_sync_id)
+    except SyncIdLookupUnavailable as exc:
+        # «Не знаю, есть ли уже наш контрагент» — не повод создавать ещё
+        # одного: у клиента появился бы второй «Производство», и половина
+        # заказов уехала бы не на того.
+        raise WritebackError(
+            502,
+            "Не удалось достоверно проверить, заведён ли уже контрагент "
+            f"«{AGENT_NAME}» в МойСкладе ({exc}). Отправка остановлена, "
+            "документ не создан — повторите позже.",
+        ) from exc
+    except SyncIdNotUnique as exc:
+        raise WritebackError(
+            409,
+            f"В МойСкладе несколько контрагентов с нашим служебным ключом "
+            f"({exc}). Это нарушение уникальности на стороне МойСклада: "
+            "выбрать за вас, кому уходит заказ, мы не вправе. Документ не "
+            "создан — обратитесь в поддержку.",
+        ) from exc
     if found is None:
         rows = await client.find_counterparties_by_name(AGENT_NAME)
         if len(rows) > 1:
@@ -653,7 +676,20 @@ async def find_own_document(client, keys: PushKeys, marker: str, *,
     Поэтому признак legacy — ЯВНЫЙ и записанный миграцией, а не выведенный из
     «какое-то поле непусто»: после T1 непустое поле есть и у нового заказа.
     """
-    docs = await client.find_purchase_orders_by_sync_id(keys.sync_id)
+    try:
+        docs = await client.find_purchase_orders_by_sync_id(keys.sync_id)
+    except SyncIdLookupUnavailable as exc:
+        # Самое опасное место всего механизма. Пустой ответ здесь означает
+        # «нашего документа нет» и разрешает создать его заново. Недосмотренный
+        # перебор выдать за пустой ответ нельзя: это и есть тот второй заказ
+        # поставщику, ради недопущения которого написан весь syncId.
+        raise WritebackError(
+            502,
+            f"Не удалось достоверно проверить, создан ли уже этот заказ в "
+            f"МойСкладе ({exc}). Отправка остановлена, чтобы не создать "
+            "второй документ. Повторите позже — повтор пойдёт с тем же "
+            "ключом.",
+        ) from exc
     if len(docs) > 1:
         # Контракт JSON API 1.2 обещает уникальность syncId. Если обещание
         # нарушено, выбирать «какой-нибудь» нельзя тем более.
