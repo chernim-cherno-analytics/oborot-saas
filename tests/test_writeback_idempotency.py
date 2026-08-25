@@ -184,6 +184,30 @@ def exec_sql(query: str, *args) -> str:
         con.close()
 
 
+def body_of(r) -> dict:
+    """Тело ответа словарём — или пустой словарь, если это не JSON.
+
+    Нужно ровно для проверок про СЛОМАННЫЕ сборки. FastAPI на необработанное
+    исключение отвечает `500 Internal Server Error` обычным текстом, и прямой
+    `r.json()` на таком ответе поднимает JSONDecodeError. Проверка тогда падает
+    трассировкой, набор получает приговор NO_REPORT — «набора не было» — вместо
+    честного FAIL, а по контракту D-42 это разные вещи.
+
+    Поймано мутационным прогоном раунда 13: восстановленный дефект давал 500,
+    и мой же контртест на нём разваливался вместо того, чтобы покраснеть.
+    """
+    try:
+        value = r.json()
+    except Exception:  # noqa: BLE001 — «не JSON» здесь нормальный исход
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def detail_of(r) -> str:
+    """Поле detail ответа строкой — безопасно к не-JSON телу."""
+    return str(body_of(r).get("detail") or "")
+
+
 def exec_sql_read(query: str, *args) -> list:
     """Чтение из той же базы, что и приложение, — списком кортежей."""
     con = sqlite3.connect(DB_PATH)
@@ -2922,8 +2946,8 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
     check("ОТВЕТ 422 «заказ уже принят», а не 409 и не 200",
           r25.status_code == 422, f"status={r25.status_code} {r25.text[:200]}")
     check("…и текст про принятый заказ, а не «дождитесь завершения»",
-          "принят" in str((r25.json() or {}).get("detail") or "").lower(),
-          f"detail={str((r25.json() or {}).get('detail'))[:200]}")
+          "принят" in detail_of(r25).lower(),
+          f"detail={detail_of(r25)[:200]!r} тело={r25.text[:100]!r}")
     check("НИ ОДНОГО POST В МОЙСКЛАД — документ не создан",
           len(docs_created()) == docs25_before,
           f"было={docs25_before} стало={len(docs_created())}")
@@ -3044,8 +3068,8 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
     check("…и это НЕ ошибка сервера (обычная гонка не выглядит поломкой)",
           r26.status_code != 500, f"status={r26.status_code}")
     check("…и текст «Заказ не найден»",
-          "не найден" in str((r26.json() or {}).get("detail") or "").lower(),
-          f"detail={str((r26.json() or {}).get('detail'))[:160]}")
+          "не найден" in detail_of(r26).lower(),
+          f"detail={detail_of(r26)[:160]!r} тело={r26.text[:100]!r}")
     check("НИ ОДНОГО POST В МОЙСКЛАД", len(docs_created()) == docs26,
           f"было={docs26} стало={len(docs_created())}")
     check("…и строки заказа в базе действительно нет",
@@ -3079,11 +3103,11 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
     check("ЗАНЯТЫЙ ЧУЖОЙ ОТПРАВКОЙ ЗАКАЗ по-прежнему даёт 409",
           r26c.status_code == 409, f"status={r26c.status_code} {r26c.text[:200]}")
     check("…и текст про идущую отправку, а не про удаление или приёмку",
-          "отправля" in str((r26c.json() or {}).get("detail") or "").lower(),
-          f"detail={str((r26c.json() or {}).get('detail'))[:160]}")
+          "отправля" in detail_of(r26c).lower(),
+          f"detail={detail_of(r26c)[:160]!r}")
     check("…и наружу отдана пустая ссылка (внутренняя пометка не видна)",
-          (r26c.json() or {}).get("ms_doc_href") == "",
-          f"ms_doc_href={(r26c.json() or {}).get('ms_doc_href')!r}")
+          body_of(r26c).get("ms_doc_href") == "",
+          f"ms_doc_href={body_of(r26c).get('ms_doc_href')!r}")
     check("…и документ не создан", len(docs_created()) == docs26c,
           f"было={docs26c} стало={len(docs_created())}")
     check("…и чужая пометка не тронута нами",
