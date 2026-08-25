@@ -1799,7 +1799,7 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
                     "meta": {"href": "https://api.example.invalid/entity/"
                                      "purchaseorder/po-1"}}
 
-    def _live_run(fake) -> tuple:
+    def _live_run(fake, *, create: bool = True) -> tuple:
         """Прогон сценария на подставном клиенте, с чистым счётом PASS/FAIL.
 
         Вывод сценария ГЛУШИТСЯ, и это не косметика. `run_contract` печатает
@@ -1807,6 +1807,11 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
         читает ПОСЛЕДНИЙ такой отчёт в выводе набора. Шесть подставных
         прогонов, печатающих чужие итоги в общий поток, — это шесть шансов
         подсунуть раннеру не тот приговор.
+
+        `create=False` гоняет ЧИТАЮЩУЮ стадию — ту самую, чей приговор
+        проверяет блок 28. Переменная подставляется в модуль, а не в
+        окружение: стадия обязана определяться разрешением, а не тем, как
+        запущен набор.
         """
         p_before, f_before = list(live.PASS), list(live.FAIL)
         create_before = live.CREATE
@@ -1816,7 +1821,7 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
         try:
             # Создающая половина включается ЯВНО и только здесь: подставной
             # клиент никуда не ходит, а проверять надо именно её.
-            live.CREATE = live.CREATE_PHRASE
+            live.CREATE = live.CREATE_PHRASE if create else ""
             with contextlib.redirect_stdout(buf):
                 rc = asyncio.run(live.run_contract(fake))
         finally:
@@ -3332,6 +3337,131 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
     rdel27f = c.delete(f"/api/orders/{o27f}")
     check("…и удаление разрешено", rdel27f.status_code == 200,
           f"delete={rdel27f.status_code} {rdel27f.text[:120]}")
+
+    # ── 28. Приговор живого гейта: «прочитал» ≠ «доказал» ───────────────────
+    #
+    # Ревью Codex, P1 (discussion_r3858423224). Читающая стадия живого
+    # контракта возвращала 0 и печатала «ИТОГО: N OK, 0 FAIL» — ровно то же,
+    # что полностью доказанный контракт. Разницы не было ни в коде возврата,
+    # ни в форме последней строки, а читает этот вывод не человек, а
+    # автоматика и журнал выпуска. Достаточно было один раз запустить
+    # разведку, чтобы в журнале появилось «живой контракт пройден», хотя ни
+    # одного обязательного POST/upsert/пересчёта уникальности не выполнялось:
+    # гейт слияния закрывался бы на бумаге, оставаясь открытым.
+    #
+    # Проверяется тем же подставным клиентом, что и блоки 17-18: сети нет,
+    # живого аккаунта нет, а «сколько раз позвали create_*» видно поимённо.
+    print("\n== 28. Живой гейт: читающая стадия не выдаёт себя за пройденный ==")
+
+    check("коды возврата попарно различны — приговор, а не одно число",
+          len({live.EXIT_PASS, live.EXIT_FAIL, live.EXIT_NOT_AUTHORIZED,
+               live.EXIT_NOT_COMPLETE}) == 4,
+          f"pass={live.EXIT_PASS} fail={live.EXIT_FAIL} "
+          f"noauth={live.EXIT_NOT_AUTHORIZED} partial={live.EXIT_NOT_COMPLETE}")
+    check("…и прежние три значения не переехали",
+          (live.EXIT_PASS, live.EXIT_FAIL, live.EXIT_NOT_AUTHORIZED) == (0, 1, 2),
+          f"{(live.EXIT_PASS, live.EXIT_FAIL, live.EXIT_NOT_AUTHORIZED)}")
+
+    # 28а. ГЛАВНОЕ: читающая стадия на честном API.
+    ro_fake = FakeClient()
+    rc_ro, out_ro, led_ro = _live_run(ro_fake, create=False)
+    check("ЧИТАЮЩАЯ СТАДИЯ НЕ ВОЗВРАЩАЕТ УСПЕХ", rc_ro != live.EXIT_PASS,
+          f"код возврата={rc_ro}")
+    check("…и приговор у неё отдельный — «не выполнен»",
+          rc_ro == live.EXIT_NOT_COMPLETE, f"код возврата={rc_ro}")
+    check("…и в выводе НЕТ терминального «ИТОГО: N OK, 0 FAIL»",
+          "0 FAIL" not in out_ro and "ИТОГО" not in out_ro,
+          f"«0 FAIL» есть={'0 FAIL' in out_ro} «ИТОГО» есть={'ИТОГО' in out_ro}")
+    check("…а сказано прямо: контракт не доказан и гейт не закрыт",
+          "НЕ ВЫПОЛНЕН" in out_ro and "ГЕЙТ СЛИЯНИЯ" in out_ro
+          and "НЕ ЗАКРЫТ" in out_ro,
+          f"хвост={out_ro.strip()[-200:]!r}")
+    check("…и названо, чего именно не выполнялось (POST/повтор/уникальность)",
+          "POST" in out_ro and "syncId" in out_ro,
+          f"хвост={out_ro.strip()[-260:]!r}")
+    check("НИ ОДНОЙ ИЗМЕНЯЮЩЕЙ ПОПЫТКИ на читающей стадии",
+          ro_fake.calls.count("create_counterparty") == 0
+          and ro_fake.calls.count("create_purchase_order") == 0,
+          f"cp={ro_fake.calls.count('create_counterparty')} "
+          f"po={ro_fake.calls.count('create_purchase_order')}")
+    check("…и журнал пуст, поэтому «ничего не создано» — правда",
+          led_ro == [] and NOTHING in out_ro, f"событий={len(led_ro)}")
+    check("…но читающая половина при этом реально отработала (не пустышка)",
+          ro_fake.calls.count("fetch_organizations") >= 1
+          and any(c.startswith("paginate:") for c in ro_fake.calls),
+          f"вызовы={ro_fake.calls}")
+
+    # 28б. Полная стадия — единственная, которой позволено вернуть ноль.
+    full_fake = FakeClient()
+    rc_full, out_full, _led_full = _live_run(full_fake, create=True)
+    check("ПОЛНЫЙ ПРОГОН НА ЧЕСТНОМ API — ноль и «ПРОЙДЕН»",
+          rc_full == live.EXIT_PASS and "ВЕРДИКТ: ПРОЙДЕН" in out_full,
+          f"код возврата={rc_full} хвост={out_full.strip()[-160:]!r}")
+    check("…и терминальное «ИТОГО» у него есть", "ИТОГО" in out_full,
+          f"хвост={out_full.strip()[-160:]!r}")
+    check("…и обязательные записи действительно выполнялись",
+          full_fake.calls.count("create_counterparty") == 2
+          and full_fake.calls.count("create_purchase_order") == 2,
+          f"cp={full_fake.calls.count('create_counterparty')} "
+          f"po={full_fake.calls.count('create_purchase_order')}")
+
+    # 28в. Fail-closed на читающей стадии СОХРАНЁН: провал остаётся провалом,
+    #      а не превращается в мягкое «не выполнено».
+    bad_ro = FakeClient(orgs=0)
+    rc_bad_ro, out_bad_ro, led_bad_ro = _live_run(bad_ro, create=False)
+    check("ПРОВАЛ НА ЧИТАЮЩЕЙ СТАДИИ — это провал, а не «частично»",
+          rc_bad_ro == live.EXIT_FAIL, f"код возврата={rc_bad_ro}")
+    check("…и вывод называет его провалом",
+          "ПРОВАЛЕН" in out_bad_ro, f"хвост={out_bad_ro.strip()[-160:]!r}")
+    check("…и записей по-прежнему ноль",
+          led_bad_ro == [] and bad_ro.calls.count("create_counterparty") == 0,
+          f"событий={len(led_bad_ro)}")
+
+    # 28г. Ноль обязан означать «контракт доказан целиком», а не «список
+    #      провалов пуст». Сценарий обрывается ПОСЛЕ контрагента и ДО заказа,
+    #      не записав ни одного FAIL, — раньше это дало бы ровно ноль.
+    stage_order_before = live.stage_order
+
+    async def _abort_without_fail(*a, **kw):
+        raise live.LiveStop("оборвано без единой записи FAIL")
+
+    try:
+        live.stage_order = _abort_without_fail
+        cut_fake = FakeClient()
+        rc_cut, out_cut, _led_cut = _live_run(cut_fake, create=True)
+    finally:
+        live.stage_order = stage_order_before
+    check("ОБРЫВ БЕЗ ЕДИНОГО FAIL НЕ ДАЁТ УСПЕХА", rc_cut != live.EXIT_PASS,
+          f"код возврата={rc_cut}")
+    check("…и приговор — «не выполнен»", rc_cut == live.EXIT_NOT_COMPLETE,
+          f"код возврата={rc_cut}")
+    check("…и названа незавершённая стадия",
+          live.STAGE_ORDER in out_cut, f"хвост={out_cut.strip()[-220:]!r}")
+    check("…и терминального «ИТОГО» здесь тоже нет", "ИТОГО" not in out_cut,
+          f"хвост={out_cut.strip()[-220:]!r}")
+    check("…а контрагент при этом успел создаться — обрыв настоящий",
+          cut_fake.calls.count("create_counterparty") >= 1,
+          f"cp={cut_fake.calls.count('create_counterparty')}")
+
+    # 28д. Прежние гарантии никуда не делись: разрешение на запуск и
+    #      разрешение на создание — по-прежнему ДВЕ разные фразы.
+    check("фраза запуска и фраза создания не совпадают",
+          live.CONFIRM_PHRASE != live.CREATE_PHRASE,
+          f"confirm={live.CONFIRM_PHRASE!r} create={live.CREATE_PHRASE!r}")
+    # Проверяется САМ предикат, а не то, что фраза выглядит непохожей на «да»:
+    # сравнение строк здесь никогда бы не упало и защищало бы ноль.
+    create_before28 = live.CREATE
+    try:
+        for bad in ("", "1", "yes", "true", "да", live.CONFIRM_PHRASE,
+                    live.CREATE_PHRASE[:-1], live.CREATE_PHRASE + "!"):
+            live.CREATE = bad
+            check(f"«непустое значение» {bad!r} создание НЕ разрешает",
+                  live.may_create() is False, f"may_create()={live.may_create()}")
+        live.CREATE = f"  {live.CREATE_PHRASE}\n"
+        check("…а ровно та фраза (с пробелами от окружения) — разрешает",
+              live.may_create() is True, f"may_create()={live.may_create()}")
+    finally:
+        live.CREATE = create_before28
 
     check("каждый POST заказа поставщику нёс syncId",
           all(d.get("syncId") for d in docs_created()),
