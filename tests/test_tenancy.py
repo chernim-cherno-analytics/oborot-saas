@@ -47,6 +47,7 @@
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -197,6 +198,65 @@ def fail_open(package="app"):
 tenancy.import_all_models = fail_open
 print("СТОРОЖ ВЕРНУЛ ОТВЕТ, нарушений:", len(tenancy.purge_completeness_violations()))
 '''
+
+
+# --- Вложенный обход (раздел 6а) -------------------------------------------
+# Пакет-зонд собирается во ВРЕМЕННОМ каталоге, а не в реальном дереве `app`:
+# параллельные наборы не должны видеть чужой probe, а продуктовый пакет —
+# обрастать файлами ради теста. Проверяется ФАКТ посещения листа (модуль в
+# `sys.modules` и его побочный эффект), а не строка исходника обхода.
+NESTED_PKG = "probe_nested_pkg"
+NESTED_LEAF = f"{NESTED_PKG}.sub.leaf"
+NESTED_MARKER = "вложенный лист действительно выполнен"
+NESTED_BOOM = "сломанный вложенный лист"
+
+NESTED_LEAF_OK = f'MARKER = {NESTED_MARKER!r}\n'
+NESTED_LEAF_BOOM = f'raise ImportError({NESTED_BOOM!r})\n'
+
+# `mode`: "new" — текущая реализация; "old" — прежний обход верхнего уровня,
+# воспроизведённый здесь дословно, чтобы отрицательный контроль доказывал
+# именно правку, а не соседнее изменение.
+NESTED_PROBE = '''
+import importlib, os, pkgutil, sys
+sys.path.insert(0, {root!r})
+sys.path.insert(0, {pkgroot!r})
+os.environ["DATABASE_URL"] = "sqlite:///:memory:"
+os.environ["SCHEDULER_ENABLED"] = "0"
+
+from app import tenancy
+
+if {mode!r} == "old":
+    def old_top_level_only(package):
+        pkg = importlib.import_module(package)
+        for info in pkgutil.iter_modules(pkg.__path__):
+            importlib.import_module(f"{{package}}.{{info.name}}")
+    old_top_level_only({pkg!r})
+else:
+    tenancy.import_all_models({pkg!r})
+
+leaf = sys.modules.get({leaf!r})
+print("ЛИСТ ПОСЕЩЁН:", leaf is not None)
+print("ПОБОЧНЫЙ ЭФФЕКТ ЛИСТА:", getattr(leaf, "MARKER", None))
+print("ОБХОД ЗАВЕРШИЛСЯ БЕЗ ОШИБКИ")
+'''
+
+
+def _build_nested_pkg(root: Path, leaf_source: str) -> Path:
+    """Собирает `<root>/probe_nested_pkg/sub/leaf.py` и возвращает `<root>`."""
+    sub = root / NESTED_PKG / "sub"
+    sub.mkdir(parents=True)
+    (root / NESTED_PKG / "__init__.py").write_text("", encoding="utf-8")
+    (sub / "__init__.py").write_text("", encoding="utf-8")
+    (sub / "leaf.py").write_text(leaf_source, encoding="utf-8")
+    return root
+
+
+def run_nested_probe(pkgroot: Path, mode: str) -> subprocess.CompletedProcess:
+    """Гоняет обход по временному пакету в отдельном процессе."""
+    script = NESTED_PROBE.format(root=str(ROOT), pkgroot=str(pkgroot),
+                                 mode=mode, pkg=NESTED_PKG, leaf=NESTED_LEAF)
+    return subprocess.run([sys.executable, "-c", script], cwd=str(ROOT),
+                          capture_output=True, text=True, timeout=300)
 
 
 def run_control(model_source: str) -> str:
@@ -417,6 +477,71 @@ def main() -> int:
     check("подставной модуль убран с диска",
           not BROKEN_MODULE_PATH.exists(), str(BROKEN_MODULE_PATH))
     check("после контроля сторож снова чист",
+          not tenancy.purge_completeness_violations())
+
+    print("\n== 6а. Вложенный модуль обязан быть посещён ==")
+    # Раздел 6 доказывает fail-loud только на модуле ВЕРХНЕГО уровня. Обход
+    # `iter_modules` в него и заходил — а в `app/<подпакет>/<модуль>.py` не
+    # заходил вовсе. Дерево `app` сегодня плоское, живого сироты нет, но
+    # инвариант «новая модель роняет сторож, а не исчезает из реестра» держится
+    # именно рекурсией. Пакет-зонд — во временном каталоге вне дерева `app`.
+    with tempfile.TemporaryDirectory(prefix="oborot_nested_probe_") as tmp:
+        # Два РАЗНЫХ корня, а не перезапись одного файла: иначе одинаковый mtime
+        # в пределах секунды позволил бы подобрать устаревший __pycache__.
+        ok_root = _build_nested_pkg(Path(tmp) / "ok", NESTED_LEAF_OK)
+        boom_root = _build_nested_pkg(Path(tmp) / "boom", NESTED_LEAF_BOOM)
+
+        green = run_nested_probe(ok_root, "new")
+        old_ok = run_nested_probe(ok_root, "old")
+        red = run_nested_probe(boom_root, "new")
+        old_boom = run_nested_probe(boom_root, "old")
+
+        probe_dir_existed = (ok_root / NESTED_PKG / "sub" / "leaf.py").exists()
+
+    # ЗЕЛЁНОЕ: лист реально импортирован, а не просто перечислен.
+    check("вложенный лист посещён текущим обходом",
+          "ЛИСТ ПОСЕЩЁН: True" in green.stdout,
+          f"stdout={green.stdout.strip()[:200]}")
+    check("побочный эффект вложенного листа наблюдаем — модуль исполнен",
+          NESTED_MARKER in green.stdout,
+          f"stdout={green.stdout.strip()[:200]}")
+    check("обход исправного вложенного пакета завершился без ошибки",
+          green.returncode == 0
+          and "ОБХОД ЗАВЕРШИЛСЯ БЕЗ ОШИБКИ" in green.stdout,
+          f"код={green.returncode}")
+
+    # ОТРИЦАТЕЛЬНЫЙ КОНТРОЛЬ: прежний обход на ТОМ ЖЕ пакете лист пропускал.
+    check("прежний обход верхнего уровня вложенный лист НЕ посещал",
+          "ЛИСТ ПОСЕЩЁН: False" in old_ok.stdout,
+          f"stdout={old_ok.stdout.strip()[:200]}")
+    check("и делал это молча — ни ошибки, ни ненулевого кода",
+          old_ok.returncode == 0
+          and "ОБХОД ЗАВЕРШИЛСЯ БЕЗ ОШИБКИ" in old_ok.stdout,
+          f"код={old_ok.returncode}")
+
+    # КРАСНОЕ: ошибка из вложенного листа обязана выйти наружу.
+    combined_red = red.stdout + red.stderr
+    check("сломанный вложенный лист роняет обход ненулевым кодом",
+          red.returncode != 0, f"код={red.returncode}")
+    check("ошибка вложенного листа вышла наружу и названа по имени",
+          NESTED_BOOM in combined_red and "leaf" in combined_red,
+          f"вывод={combined_red.strip()[-300:]}")
+    check("на сломанном вложенном листе обход не объявляет себя успешным",
+          "ОБХОД ЗАВЕРШИЛСЯ БЕЗ ОШИБКИ" not in red.stdout,
+          f"stdout={red.stdout.strip()[:200]}")
+    check("прежний обход тот же сломанный лист проглатывал — контроль "
+          "проверяет именно правку",
+          old_boom.returncode == 0
+          and "ОБХОД ЗАВЕРШИЛСЯ БЕЗ ОШИБКИ" in old_boom.stdout,
+          f"код={old_boom.returncode}")
+
+    # Зонд не оставил следов ни во временном каталоге, ни в дереве `app`.
+    check("временный пакет-зонд существовал во время проверки и убран после",
+          probe_dir_existed and not (Path(tmp) / "ok").exists(), tmp)
+    check("в реальном дереве app зонда не появилось",
+          not (ROOT / "app" / NESTED_PKG).exists(),
+          str(ROOT / "app" / NESTED_PKG))
+    check("после вложенного контроля сторож снова чист",
           not tenancy.purge_completeness_violations())
 
     print("\n== 7. Список не-владеющих ссылок не имеет права протухнуть ==")
