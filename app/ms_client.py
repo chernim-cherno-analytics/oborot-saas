@@ -63,6 +63,12 @@ EXPAND_PAGE_LIMIT = 100  # с expand МойСклад отдаёт максим�
 # возвращает пустой список.
 SYNC_ID_SCAN_LIMIT = _env_int("MS_SYNCID_SCAN_LIMIT", 20000, minimum=1)
 
+# Коды, которые точечный запрос по syncId вправе считать «этого нет».
+# Список узкий намеренно: 401/403 — «нет доступа», 429 — «слишком часто»,
+# 5xx и транспорт — «не дошло». Ни одно из них не означает «не найдено», и
+# превращать их в отсутствие значит разрешить создание вслепую.
+POINT_LOOKUP_ABSENT = frozenset({404, 405, 410})
+
 
 class SyncIdLookupUnavailable(Exception):
     """Достоверно ответить «есть или нет такой syncId» не удалось.
@@ -72,12 +78,15 @@ class SyncIdLookupUnavailable(Exception):
     разные ответы, и цена их смешения — второй заказ поставщику у клиента.
     """
 
-    def __init__(self, entity: str, sync_id: str, limit: int) -> None:
+    def __init__(self, entity: str, sync_id: str, limit: int,
+                 reason: str = "") -> None:
         super().__init__(
+            f"{entity}: {reason}" if reason else
             f"{entity}: просмотрено больше {limit} записей, а ключ {sync_id} "
             f"так и не найден — ответ недостоверен"
         )
         self.entity, self.sync_id, self.limit = entity, sync_id, limit
+        self.reason = reason
 
 
 class SyncIdNotUnique(Exception):
@@ -426,31 +435,50 @@ class MoySkladClient:
                 if (row.get("name") or "").strip() == name]
 
     async def sync_id_point_lookup(self, entity: str, sync_id: str) -> dict | None:
-        """Точечный запрос `/entity/{type}/syncid/{id}` — ТОЛЬКО подтверждающий.
+        """Точечный запрос `/entity/{type}/syncid/{id}` — НЕОБЯЗАТЕЛЬНАЯ подсказка.
 
-        Положительный ответ с совпавшим `syncId` — это факт: сущность есть.
-        Любой другой исход означает «не знаю», а НЕ «нет», и здесь проходит
-        граница, ошибка на которой стоит дороже всего.
+        Не доказательство. Ни отсутствия, ни — что важнее — единственности.
 
-        Причина. Официальная документация (`md/_general.md`, «Назначение поля
-        syncId») описывает URL такого вида для УДАЛЕНИЯ сущности; поддержка
-        `GET` по нему нигде не описана. Значит, 404 отсюда может означать и
-        «сущности нет», и «такого маршрута нет вовсе» — а спутать их значит
-        решить «ничего не создано» и завести ВТОРОЙ финансовый документ.
-        Отрицательный ответ поэтому ничего не решает: за ним идёт перебор.
+        Официальная документация (`md/_general.md`, «Назначение поля syncId»)
+        описывает URL такого вида для УДАЛЕНИЯ сущности; поддержка `GET` по
+        нему нигде не описана. Значит, 404 отсюда может означать и «сущности
+        нет», и «такого маршрута нет вовсе».
 
-        Возвращаемое `None` читается как «не подтвердилось», и вызывающий код
-        обязан выяснить ответ достоверно, а не считать, что не нашлось.
+        Но и положительный ответ доказывает меньше, чем кажется, и на этом
+        ревью поймало ошибку в прежней редакции. Если ключ по какой-то причине
+        занят ДВУМЯ объектами, точечный маршрут вернёт один из них — и, будь
+        его ответ терминальным, второй не увидел бы никто: ни проверка дублей
+        в клиенте, ни `AmbiguousExistingOrder`, ни живой гейт. Поэтому
+        результат отсюда лишь ДОПОЛНЯЕТ полный перебор, а вердикт выносит
+        перебор (см. find_by_sync_id).
+
+        Положительный ответ проверяется строго — дословный `syncId`, ожидаемый
+        `meta.type` и непустой `id`. Не сошлось — подсказка не используется
+        вовсе; отбросить её безопасно ровно потому, что вердикт даёт не она.
+
+        Отсутствием считаются ТОЛЬКО 404/405/410 — семейство «нет такого
+        объекта или маршрута». Всё остальное (401/403/412/429/5xx, транспорт)
+        летит наружу: «нет доступа» и «слишком часто» — это не «не найдено», и
+        превращать их в отсутствие значит разрешить создание вслепую.
         """
         if not sync_id:
             return None
         try:
             row = await self.get(f"/entity/{entity}/syncid/{sync_id}")
-        except (httpx.HTTPStatusError, httpx.HTTPError):
+        except httpx.HTTPStatusError as exc:
+            resp = getattr(exc, "response", None)
+            if resp is not None and resp.status_code in POINT_LOOKUP_ABSENT:
+                return None
+            raise
+        if not isinstance(row, dict):
             return None
-        if isinstance(row, dict) and str(row.get("syncId") or "") == sync_id:
-            return row
-        return None
+        if str(row.get("syncId") or "") != sync_id:
+            return None
+        if str(((row.get("meta") or {}).get("type")) or "") != entity:
+            return None
+        if not str(row.get("id") or ""):
+            return None
+        return row
 
     async def find_by_sync_id(self, entity: str, sync_id: str) -> list[dict]:
         """ВСЕ сущности с нашим ключом идемпотентности — без `filter=syncId`.
@@ -468,10 +496,32 @@ class MoySkladClient:
         точное сравнение можно сделать у себя — это не зависит ни от какого
         необязательного умения чужого API.
 
-        Порядок:
-          1) точечный запрос как ПОДТВЕРЖДЕНИЕ (см. sync_id_point_lookup):
-             сработал — отвечаем сразу и списка не читаем;
-          2) иначе — точный перебор страниц со сравнением в Python.
+        Порядок, и он важнее, чем кажется:
+
+          1) точечный запрос — НЕОБЯЗАТЕЛЬНАЯ подсказка. Он НЕ прекращает
+             работу метода;
+          2) полный ограниченный перебор страниц со сравнением в Python —
+             выполняется ВСЕГДА и именно он выносит вердикт;
+          3) подсказка и находки перебора склеиваются по `id` сущности.
+
+        Почему шага «нашли точечно — на этом всё» здесь больше нет (ревью
+        Codex, P1, discussion_r3855902789). Метод обещает ВСЕ совпадения, и на
+        этом обещании стоит вся проверка дублей: `find_counterparty_by_sync_id`
+        смотрит `len(rows) > 1`, `find_own_document` — `len(docs) > 1`, живой
+        гейт после повторного POST — «ровно один». Терминальный ответ из
+        точечного запроса делал все три недостижимыми ровно тогда, когда
+        недокументированный маршрут отвечает 200: два объекта с одним ключом
+        он вернул бы как один, и живой сценарий объявил бы «второго документа
+        нет», не просмотрев коллекцию вообще. То есть ровно то свойство,
+        которое живой тест и обязан доказывать, доказывалось бы само собой.
+
+        Почему подсказку всё же не выбросили. Перебор — единственный
+        достоверный источник, но его полнота опирается на предположение, что
+        нужная сущность вообще попадает в выдачу списка (архив, корзина и иные
+        режимы живьём не проверялись). Лишняя находка ведёт к отказу по дублю,
+        пропущенная — к созданию второго финансового документа; из двух ошибок
+        выбрана та, что останавливает. Ложного дубля подсказка дать не может:
+        склейка идёт по `id`.
 
         Перебор идёт ДО КОНЦА, а не до первого совпадения: контракт обещает
         уникальность ключа, и два объекта с одним `syncId` означают, что
@@ -486,18 +536,35 @@ class MoySkladClient:
         """
         if not sync_id:
             return []
-        confirmed = await self.sync_id_point_lookup(entity, sync_id)
-        if confirmed is not None:
-            return [confirmed]
 
         matches: list[dict] = []
-        seen = 0
+        seen_ids: set[str] = set()
+
+        hint = await self.sync_id_point_lookup(entity, sync_id)
+        if hint is not None:
+            matches.append(hint)
+            seen_ids.add(str(hint.get("id") or ""))
+
+        scanned = 0
         async for row in self.paginate(f"/entity/{entity}"):
-            seen += 1
-            if seen > SYNC_ID_SCAN_LIMIT:
+            scanned += 1
+            if scanned > SYNC_ID_SCAN_LIMIT:
                 raise SyncIdLookupUnavailable(entity, sync_id, SYNC_ID_SCAN_LIMIT)
-            if str(row.get("syncId") or "") == sync_id:
-                matches.append(row)
+            if str(row.get("syncId") or "") != sync_id:
+                continue
+            row_id = str(row.get("id") or "")
+            if not row_id:
+                # Совпало по ключу, но склеить не с чем: без `id` мы не отличим
+                # «тот же объект» от «второго такого же». Это «не знаю», а не
+                # находка, и молча включать её в результат нельзя.
+                raise SyncIdLookupUnavailable(
+                    entity, sync_id, SYNC_ID_SCAN_LIMIT,
+                    reason="в выдаче есть совпадение по ключу без id — "
+                           "отличить дубль от того же объекта нечем")
+            if row_id in seen_ids:
+                continue
+            seen_ids.add(row_id)
+            matches.append(row)
         return matches
 
     async def find_counterparty_by_sync_id(self, sync_id: str) -> dict | None:

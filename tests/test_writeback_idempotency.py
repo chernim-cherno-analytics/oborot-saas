@@ -2168,6 +2168,135 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
           len(docs_created()) == before19d + 1,
           f"было={before19d} стало={len(docs_created())}")
 
+    # ── 20. Точечный ответ не заменяет полный перебор ───────────────────────
+    #
+    # Ревью Codex, P1 (discussion_r3855902789). find_by_sync_id обещает ВСЕ
+    # совпадения, и на этом обещании стоит вся проверка дублей: клиент смотрит
+    # len(rows) > 1, find_own_document — len(docs) > 1, живой гейт после
+    # повторного POST — «ровно один». Терминальный ответ из точечного запроса
+    # делал все три недостижимыми ровно тогда, когда недокументированный
+    # маршрут отвечает 200: два объекта с одним ключом он вернул бы как один.
+    #
+    # Проверяется НЕ формулировка, а достижимость: в аккаунте два объекта с
+    # одним syncId, точечный маршрут отдаёт первый — и результат обязан быть
+    # дублем, а не единицей.
+    print("\n== 20. Дубль по syncId виден, даже когда точечный маршрут ответил ==")
+    from app.ms_client import MoySkladClient as _Client  # noqa: PLC0415
+    from app import ms_client as _msc  # noqa: PLC0415
+
+    def _lookup(entity: str, sync_id: str):
+        """Прямой вызов продуктового поиска на моке — без веб-слоя."""
+        async def _run():
+            async with _Client(mock_ms.TOKEN) as cl:
+                return await cl.find_by_sync_id(entity, sync_id)
+        return asyncio.run(_run())
+
+    def _cp_lookup(sync_id: str):
+        async def _run():
+            async with _Client(mock_ms.TOKEN) as cl:
+                return await cl.find_counterparty_by_sync_id(sync_id)
+        return asyncio.run(_run())
+
+    # 20а. ГЛАВНЫЙ контртест: точечный GET отдаёт ОДИН объект, а в коллекции
+    #      их ДВА с тем же ключом.
+    dup_key = str(uuid.uuid4())
+    mock_ms.COUNTERPARTIES.clear()
+    mock_ms.COUNTERPARTIES.extend([
+        {"id": "cp-dup-a", "name": "Дубль А", "syncId": dup_key},
+        {"id": "cp-dup-b", "name": "Дубль Б", "syncId": dup_key},
+    ])
+    point20 = _lookup("counterparty", dup_key)
+    check("ТОЧЕЧНЫЙ ОТВЕТ НЕ ПРЕКРАЩАЕТ ПОИСК: найдены ОБА объекта",
+          len(point20) == 2
+          and sorted(str(r.get("id")) for r in point20) == ["cp-dup-a", "cp-dup-b"],
+          f"найдено={len(point20)} ids={[r.get('id') for r in point20]}")
+    try:
+        _cp_lookup(dup_key)
+        check("ДУБЛЬ КОНТРАГЕНТА ОТВЕРГНУТ (SyncIdNotUnique), а не «нашёлся один»",
+              False, "исключения не было")
+    except _msc.SyncIdNotUnique as exc:
+        check("ДУБЛЬ КОНТРАГЕНТА ОТВЕРГНУТ (SyncIdNotUnique), а не «нашёлся один»",
+              exc.count == 2, f"count={exc.count}")
+
+    # 20б. То же на документе, через продуктовый путь отправки: заказ обязан
+    #      получить fail-closed отказ, а не «уже создан, вот он».
+    o20 = make_order(c, "Заказ, у чьего ключа в МС два документа")
+    key20 = str(uuid.uuid4())
+    exec_sql("UPDATE production_orders SET ms_sync_id=?, ms_lookup_mode='sync' "
+             "WHERE id=?", key20, o20)
+    twin_a = plant_doc("po-dup-a", "Документ А", sync_id=key20)
+    twin_b = plant_doc("po-dup-b", "Документ Б", sync_id=key20)
+    try:
+        docs20 = _lookup("purchaseorder", key20)
+        check("по ключу документа перебор видит ОБА",
+              len(docs20) == 2, f"найдено={len(docs20)}")
+        before20 = len(docs_created())
+        r = push(c, o20)
+        check("ДВА ДОКУМЕНТА С ОДНИМ КЛЮЧОМ → ОТКАЗ (409), а не молчаливый выбор",
+              r.status_code == 409, f"status={r.status_code} {r.text[:200]}")
+        check("…и третьего документа не создано",
+              len(docs_created()) == before20,
+              f"было={before20} стало={len(docs_created())}")
+    finally:
+        unplant(twin_a)
+        unplant(twin_b)
+
+    # 20в. Ложного дубля подсказка дать не может: тот же объект, найденный и
+    #      точечно, и перебором, склеивается по id.
+    solo_key = str(uuid.uuid4())
+    mock_ms.COUNTERPARTIES.clear()
+    mock_ms.COUNTERPARTIES.append(
+        {"id": "cp-solo", "name": "Один", "syncId": solo_key})
+    solo = _lookup("counterparty", solo_key)
+    check("ОДИН объект не превращается в два (склейка по id)",
+          len(solo) == 1 and str(solo[0].get("id")) == "cp-solo",
+          f"найдено={len(solo)} ids={[r.get('id') for r in solo]}")
+
+    # 20г. Ответ не того сорта подсказкой не является. Вердикт всё равно даёт
+    #      перебор, поэтому отбросить её безопасно — и результат не удваивается.
+    mock_api.post("/__test/faults", json={"syncid_route_wrong_type": 1})
+    try:
+        typed = _lookup("counterparty", solo_key)
+    finally:
+        mock_api.post("/__test/faults", json={})
+    check("ОТВЕТ ЧУЖОГО ТИПА НЕ ЗАСЧИТАН, но перебор находит настоящий",
+          len(typed) == 1 and str(typed[0].get("id")) == "cp-solo",
+          f"найдено={len(typed)} ids={[r.get('id') for r in typed]}")
+
+    # 20д. Чужие ошибки не маскируются под отсутствие. 401/403/429/5xx — это
+    #      «нет доступа», «слишком часто», «не дошло», но НЕ «не найдено»:
+    #      превратить их в отсутствие значит разрешить создание вслепую.
+    retries_save = _msc.MAX_RETRIES
+    _msc.MAX_RETRIES = 0
+    try:
+        for code in (401, 403, 429, 500):
+            mock_api.post("/__test/faults", json={"syncid_route_status": code})
+            raised, returned = None, None
+            try:
+                returned = _lookup("counterparty", solo_key)
+            except Exception as exc:  # noqa: BLE001 — важен сам факт отказа
+                raised = exc
+            finally:
+                mock_api.post("/__test/faults", json={})
+            check(f"ОТВЕТ {code} НЕ ВЫДАН ЗА «не найдено» — поиск отказал",
+                  raised is not None,
+                  f"вернулось {returned if returned is None else len(returned)} "
+                  f"записей вместо отказа")
+    finally:
+        _msc.MAX_RETRIES = retries_save
+        mock_api.post("/__test/faults", json={})
+
+    # 20е. Положительный контроль: 404 точечного маршрута отсутствием ЯВЛЯЕТСЯ,
+    #      и свободный ключ по-прежнему находится нулём раз. Без него все
+    #      проверки выше удовлетворялись бы «отказом на любой ответ».
+    mock_api.post("/__test/faults", json={"syncid_route_404": 1})
+    try:
+        free = _lookup("counterparty", str(uuid.uuid4()))
+    finally:
+        mock_api.post("/__test/faults", json={})
+    check("свободный ключ по-прежнему даёт пусто (404 — это отсутствие)",
+          free == [], f"найдено={len(free)}")
+
     check("каждый POST заказа поставщику нёс syncId",
           all(d.get("syncId") for d in docs_created()),
           f"без ключа={[d.get('id') for d in docs_created() if not d.get('syncId')]}")

@@ -590,6 +590,12 @@ FAULTS: dict = {"stock_ok_before": 0, "stock_429_burst": 0,
                 # как если бы GET по нему не поддерживался вовсе. Тогда 404
                 # «нет такого URL» неотличим от 404 «нет сущности».
                 "syncid_route_404": 0,
+                # Точечный маршрут отвечает объектом не того сорта (meta.type).
+                "syncid_route_wrong_type": 0,
+                # Точечный маршрут отвечает кодом, который отсутствием НЕ
+                # является: 401/403/429/5xx. Такой ответ нельзя молча
+                # превратить в «не найдено».
+                "syncid_route_status": 0,
                 # Задержка POST /entity/purchaseorder ДО создания документа.
                 # Открывает то самое «сетевое окно» между T1 и T2, в котором
                 # заказ ещё жив в нашей базе, а документа в МС ещё нет: тест
@@ -607,6 +613,7 @@ def reset_faults() -> None:
                   po_create_then_fail=0, po_429_burst=0,
                   po_fail_before_create=0, cp_search_delay_ms=0,
                   cp_get_500_burst=0, syncid_route_404=0,
+                  syncid_route_wrong_type=0, syncid_route_status=0,
                   po_create_delay_ms=0, stock_delay_ms=0)
     for k in FAULT_STATS:
         FAULT_STATS[k] = 0
@@ -988,10 +995,21 @@ async def entity_by_syncid(entity: str, sync_id: str, request: Request):
     if int(FAULTS.get("syncid_route_404") or 0) > 0:
         raise HTTPException(status_code=404, detail={"errors": [
             {"error": "mock: маршрут не поддерживается", "code": 1006}]})
+    code = int(FAULTS.get("syncid_route_status") or 0)
+    if code > 0:
+        # Ответ, который отсутствием НЕ является: нет доступа, лимит, сбой.
+        raise HTTPException(status_code=code, detail={"errors": [
+            {"error": f"mock: ответ {code}, это не «не найдено»"}]})
     if entity == "counterparty":
         for cp in COUNTERPARTIES:
             if str(cp.get("syncId") or "") == sync_id:
-                return _counterparty_row(cp)
+                row = _counterparty_row(cp)
+                if int(FAULTS.get("syncid_route_wrong_type") or 0) > 0:
+                    # Маршрут отдал объект «не того сорта». Подсказка такого
+                    # ответа принимать не вправе — вердикт всё равно за
+                    # перебором, поэтому отбросить её безопасно.
+                    row = {**row, "meta": {**row["meta"], "type": "product"}}
+                return row
     elif entity == "purchaseorder":
         for doc in CREATED_PURCHASE_ORDERS:
             if str(doc.get("syncId") or "") == sync_id:
