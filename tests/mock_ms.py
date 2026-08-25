@@ -405,7 +405,16 @@ def entity_store(request: Request, limit: int = 1000, offset: int = 0):
 #                нет вовсе, как было. Услуга нужна ровно для одного вопроса:
 #                типы цен, которые встречаются ТОЛЬКО у неимпортируемой
 #                строки, товарами не подтверждены, и замок DATA-10 обязан
-#                считать их пропавшими (_parse_assortment услуги не берёт).
+#                считать их пропавшими (_parse_assortment услуги не берёт);
+#   extra      — имена ДОПОЛНИТЕЛЬНЫХ типов цен, проставленных на КАЖДОЙ
+#                карточке после первых двух. Нужны, чтобы доступных типов
+#                стало заведомо больше двадцати и больше сорока: ровно на
+#                таком аккаунте годная замена пропавшему типу оказывается за
+#                границей обрезки и перестаёт быть выбираемой в настройках
+#                (ревью 25.08.2026, discussion_r3852672410). Цена i-го типа —
+#                (1000 + i) ₽, одинаковая у всех карточек: число говорит, какой
+#                именно тип прочитали, и не совпадает ни с закупочной ценой,
+#                ни с ценой продажи, ни с себестоимостью мок-мира.
 PRICE_TYPES: dict = {
     "enabled": False,
     "sale": "Цена продажи",
@@ -414,13 +423,19 @@ PRICE_TYPES: dict = {
     "cost_skip": [],
     "sale_skip": [],
     "service": [],
+    "extra": [],
 }
 
 
 def reset_price_types() -> None:
     PRICE_TYPES.update(enabled=False, sale="Цена продажи",
                        cost="Полная себестоимость", cost_ratio=1.5, cost_skip=[],
-                       sale_skip=[], service=[])
+                       sale_skip=[], service=[], extra=[])
+
+
+def extra_price_rub(index: int) -> int:
+    """Цена дополнительного типа цен по его порядковому номеру (0-based)."""
+    return 1000 + index
 
 
 @app.post("/__test/price_types")
@@ -446,6 +461,8 @@ def _sale_prices(ext_id: str, price_rub: int, cost_rub: int) -> list[dict]:
             "value": int(round(cost_rub * float(PRICE_TYPES.get("cost_ratio") or 1.0))) * 100,
             "priceType": {"name": cost_name},
         })
+    for i, name in enumerate(PRICE_TYPES.get("extra") or []):
+        out.append({"value": extra_price_rub(i) * 100, "priceType": {"name": str(name)}})
     return out
 
 
