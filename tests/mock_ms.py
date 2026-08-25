@@ -393,6 +393,13 @@ def entity_store(request: Request, limit: int = 1000, offset: int = 0):
 #                «взяли buyPrice» и от «взяли первую цену в списке»;
 #   cost_skip  — ext_id, у которых второй цены нет: тип существует в
 #                ассортименте глобально, но не проставлен на этой карточке;
+#   sale_skip  — то же самое для ПЕРВОЙ цены: тип цены продажи есть у других
+#                товаров, но у этих карточек не проставлен. Отдельный ключ, а
+#                не `cost_skip` наоборот: у карточки из `sale_skip` в
+#                salePrices остаётся ровно одна цена — себестоимость, — и
+#                именно она становится «первой в списке». Это и есть подстава
+#                чужого типа, которую ищет проверка (ревью 25.08.2026,
+#                discussion_r3848821144);
 #   service    — [[имя типа, рубли], …] для ОДНОЙ дополнительной строки
 #                ассортимента с meta.type = "service". Пустой список — строки
 #                нет вовсе, как было. Услуга нужна ровно для одного вопроса:
@@ -405,6 +412,7 @@ PRICE_TYPES: dict = {
     "cost": "Полная себестоимость",
     "cost_ratio": 1.5,
     "cost_skip": [],
+    "sale_skip": [],
     "service": [],
 }
 
@@ -412,7 +420,7 @@ PRICE_TYPES: dict = {
 def reset_price_types() -> None:
     PRICE_TYPES.update(enabled=False, sale="Цена продажи",
                        cost="Полная себестоимость", cost_ratio=1.5, cost_skip=[],
-                       service=[])
+                       sale_skip=[], service=[])
 
 
 @app.post("/__test/price_types")
@@ -430,7 +438,7 @@ def _sale_prices(ext_id: str, price_rub: int, cost_rub: int) -> list[dict]:
         return [{"value": price_rub * 100}]
     out: list[dict] = []
     sale_name = str(PRICE_TYPES.get("sale") or "")
-    if sale_name:
+    if sale_name and ext_id not in (PRICE_TYPES.get("sale_skip") or []):
         out.append({"value": price_rub * 100, "priceType": {"name": sale_name}})
     cost_name = str(PRICE_TYPES.get("cost") or "")
     if cost_name and ext_id not in (PRICE_TYPES.get("cost_skip") or []):

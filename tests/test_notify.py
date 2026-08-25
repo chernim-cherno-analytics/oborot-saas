@@ -272,6 +272,60 @@ def run_scenario() -> int:
           digests and "Продано вчера" in digests[0]["text"],
           f"text={digests and digests[0]['text'][:200]}")
 
+    print("== Алерт о падающем синке: подсказка соответствует причине ==")
+    # Ревью 25.08.2026, discussion_r3849074704 (PR #10, DATA-10). Остановка
+    # «выбранный тип цены исчез» — ошибка НАСТРОЙКИ: исправить её может только
+    # владелец, и текст ошибки прямо зовёт его в Настройки. Пока она
+    # поднималась голым RuntimeError, error_cause() относил её к `internal`, и
+    # алерт дописывал «Мы уже разбираемся» — обещание работы там, где сервис
+    # ничего сделать не может. Владелец, прочитав такое, ждёт починки вместо
+    # того чтобы поменять настройку, и синк стоит все эти дни.
+    con = sqlite3.connect(DB_PATH)
+    ms_org_id = con.execute(
+        "SELECT org_id FROM connections WHERE kind='moysklad'").fetchone()[0]
+    con.close()
+
+    def alert_text(cause: str, error: str) -> str:
+        """Текст одного алерта серии на подставном состоянии (или '')."""
+        # Право на алерт выдаётся атомарно и ровно один раз за серию
+        # (ms_sync.claim_failure_alert): fail_streak >= 2 и alerted_streak == 0.
+        # Поэтому перед каждым вызовом состояние возвращается в начало серии.
+        con = sqlite3.connect(DB_PATH)
+        con.execute("UPDATE sync_state SET fail_streak=2, alerted_streak=0 "
+                    "WHERE org_id=?", (ms_org_id,))
+        con.commit()
+        con.close()
+        seen = len(TG_RECEIVED)
+        notify.send_sync_failure_alert(ms_org_id, {
+            "fail_streak": 2, "error": error, "stats": {"error_cause": cause},
+        })
+        fresh = TG_RECEIVED[seen:]
+        return str(fresh[0]["text"]) if fresh else ""
+
+    PRICE_ERR = ("Синхронизация прервана: выбранный тип цены «Полная "
+                 "себестоимость» больше не встречается в ассортименте "
+                 "МойСклада — тип переименован или удалён")
+    txt_settings = alert_text("settings", PRICE_ERR)
+    check("алерт по ошибке настройки вообще ушёл", txt_settings != "",
+          "send_sync_failure_alert вернул False — алерт не отправлен")
+    check("алерт по ошибке настройки НЕ обещает «мы уже разбираемся»",
+          txt_settings and "разбираемся" not in txt_settings,
+          f"text={txt_settings[:240]}")
+    check("алерт по ошибке настройки зовёт владельца в Настройки",
+          txt_settings and "Настройк" in txt_settings, f"text={txt_settings[:240]}")
+    check("алерт по ошибке настройки называет пропавший тип цены",
+          txt_settings and "Полная себестоимость" in txt_settings,
+          f"text={txt_settings[:240]}")
+
+    # Контроль обратной стороны: переклассификация не поехала дальше своего
+    # случая. Для настоящего внутреннего сбоя «мы уже разбираемся» — правда.
+    txt_internal = alert_text("internal", "Синхронизация прервана внутренней ошибкой")
+    check("при внутреннем сбое подсказка осталась прежней",
+          "Мы уже разбираемся" in txt_internal, f"text={txt_internal[:240]}")
+    txt_token = alert_text("token", "МойСклад не принял токен доступа")
+    check("при отказе токена подсказка осталась прежней",
+          "Проверьте токен в Настройках" in txt_token, f"text={txt_token[:240]}")
+
     ms.close()
     demo.close()
 
