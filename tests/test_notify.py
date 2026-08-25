@@ -286,7 +286,12 @@ def run_scenario() -> int:
     con.close()
 
     def alert_text(cause: str, error: str) -> str:
-        """Текст одного алерта серии на подставном состоянии (или '')."""
+        """Текст одного алерта серии на подставном состоянии (или '').
+
+        cause подаётся строкой намеренно: это проверка ТАБЛИЦЫ подсказок,
+        ответственность самого notify. Сцепку «настоящее исключение → причина»
+        проверяет отдельный вызов ниже, через ms_sync.error_cause.
+        """
         # Право на алерт выдаётся атомарно и ровно один раз за серию
         # (ms_sync.claim_failure_alert): fail_streak >= 2 и alerted_streak == 0.
         # Поэтому перед каждым вызовом состояние возвращается в начало серии.
@@ -325,6 +330,18 @@ def run_scenario() -> int:
     txt_token = alert_text("token", "МойСклад не принял токен доступа")
     check("при отказе токена подсказка осталась прежней",
           "Проверьте токен в Настройках" in txt_token, f"text={txt_token[:240]}")
+
+    # Сцепка целиком, без подставленной руками причины: настоящее исключение
+    # остановки → error_cause() → подсказка. Без этой проверки набор молчал бы
+    # о том самом дефекте, ради которого написан: подать сюда «settings»
+    # руками можно и на коде, где error_cause() возвращает «internal».
+    from app import ms_sync as _ms_sync  # noqa: PLC0415 — только для этой проверки
+    gone = getattr(_ms_sync, "PriceTypesGone", None)
+    real_cause = _ms_sync.error_cause(gone(PRICE_ERR)) if gone is not None else "internal"
+    txt_real = alert_text(real_cause, PRICE_ERR)
+    check("настоящая остановка по типу цены доходит до владельца как ЕГО действие",
+          "разбираемся" not in txt_real and "Настройк" in txt_real,
+          f"cause={real_cause} text={txt_real[:240]}")
 
     ms.close()
     demo.close()
