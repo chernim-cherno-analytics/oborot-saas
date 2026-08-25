@@ -395,10 +395,14 @@ async def api_order_push_to_ms(
     вариант в МС, не валят заказ — возвращаются списком unmatched.
     """
     order = _order_of_org(db, ctx.org.id, order_id)
-    if order.status not in ("draft", "sent"):
+    # Быстрый и понятный ответ пользователю — но НЕ единственная защита:
+    # между этим чтением и T1 помещается чужой коммит `sent → received`.
+    # Настоящая защита стоит условием внутри самого T1
+    # (ms_writeback.pushable_status_clause).
+    if order.status not in ms_writeback.PUSHABLE_STATUSES:
         raise HTTPException(
             status_code=422,
-            detail="Заказ уже принят на склад — отправлять его в МойСклад поздно.",
+            detail=ms_writeback.ORDER_ALREADY_RECEIVED,
         )
     current = order.ms_doc_href or ""
     if current and not ms_writeback.is_internal_href(current):
@@ -451,7 +455,18 @@ async def api_order_push_to_ms(
     locked = ms_writeback.begin_push(
         db, ctx.org.id, order.id, current, pending)
     if not locked:
+        # Проигранный CAS — это НЕ одно событие, и сводить их к одному коду
+        # нельзя (ревью Codex, P1). Теперь в условии T1 стоит и допустимый
+        # статус, поэтому «не захватили» может означать как идущую соседнюю
+        # отправку, так и то, что заказ за это время приняли на склад.
+        # Ответ читает человек: «дождитесь завершения отправки» для принятого
+        # заказа было бы неправдой, и ждать ему нечего.
         db.refresh(order)
+        if order.status not in ms_writeback.PUSHABLE_STATUSES:
+            raise HTTPException(
+                status_code=422,
+                detail=ms_writeback.ORDER_ALREADY_RECEIVED,
+            )
         return JSONResponse(
             status_code=409,
             content={

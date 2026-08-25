@@ -2868,6 +2868,127 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
     check("…и количества не тронуты", _race_qty() == (20.0, 0.0),
           f"qty={_race_qty()}")
 
+    # ── 25. Гонка «приняли на склад» против T1 отправки ─────────────────────
+    #
+    # Ревью Codex, P1 (discussion_r3857277070). Маршрут читает status и
+    # отвечает 422, если заказ уже принят, — но это проверка ПО ПРОЧИТАННОМУ
+    # значению. CAS в begin_push проверял только id, org и точный ms_doc_href;
+    # статуса в условии не было вовсе.
+    #
+    # Значит между чтением и T1 помещается чужой коммит `sent → received`:
+    # предварительная проверка честно видела «ещё не принят», лок
+    # захватывался, и сетевое окно создавало «Заказ поставщику» для УЖЕ
+    # ПРИНЯТОГО заказа. Дальше T2 читал свежий received, локальный qty не
+    # снимал (верно), но документ МойСклада попадал в ms_qty ближайшим синком —
+    # принятый товар воскресал как «едет к нам».
+    #
+    # Гонка воспроизводится ЯВНЫМ ХУКОМ прямо перед настоящим begin_push, а не
+    # паузами: обёртка сначала переводит статус отдельным SQL, и только потом
+    # зовёт настоящий T1.
+    print("\n== 25. «Принят на склад» против захвата лока отправки ==")
+
+    o25 = make_order(c, "Заказ, который принимают во время T1")
+    r = c.post(f"/api/orders/{o25}/status", json={"status": "sent"})
+    check("заказ переведён «в производство»", r.status_code == 200,
+          f"status={r.status_code} {r.text[:160]}")
+    href25_before = col_of(o25, "ms_doc_href") or ""
+    key25_before = str(col_of(o25, "ms_sync_id") or "")
+    docs25_before = len(docs_created())
+    check("исходно: лока нет и ключ ещё не создан",
+          not str(href25_before).startswith(ms_writeback.PENDING_PREFIX)
+          and key25_before == "",
+          f"ms_doc_href={href25_before!r} ms_sync_id={key25_before!r}")
+
+    original_begin = ms_writeback.begin_push
+    hooked25: list = []
+
+    def _receive_then_begin(db_, org_, order_id_, expected_, pending_):
+        """Шов: приёмка коммитится МЕЖДУ чтением маршрута и настоящим T1."""
+        if not hooked25 and int(order_id_) == o25:
+            hooked25.append(True)
+            err = exec_sql("UPDATE production_orders SET status='received' "
+                           "WHERE id=?", o25)
+            assert err == "", f"подставная приёмка: {err}"
+        return original_begin(db_, org_, order_id_, expected_, pending_)
+
+    ms_writeback.begin_push = _receive_then_begin
+    try:
+        r25 = push(c, o25)
+    finally:
+        ms_writeback.begin_push = original_begin
+
+    check("шов сработал: приёмка прошла между чтением и T1",
+          bool(hooked25), f"hooked={hooked25}")
+    check("ОТВЕТ 422 «заказ уже принят», а не 409 и не 200",
+          r25.status_code == 422, f"status={r25.status_code} {r25.text[:200]}")
+    check("…и текст про принятый заказ, а не «дождитесь завершения»",
+          "принят" in str((r25.json() or {}).get("detail") or "").lower(),
+          f"detail={str((r25.json() or {}).get('detail'))[:200]}")
+    check("НИ ОДНОГО POST В МОЙСКЛАД — документ не создан",
+          len(docs_created()) == docs25_before,
+          f"было={docs25_before} стало={len(docs_created())}")
+    check("ЛОК НЕ ЗАХВАЧЕН: ms_doc_href не стал pending",
+          not str(col_of(o25, "ms_doc_href") or "").startswith(
+              ms_writeback.PENDING_PREFIX),
+          f"ms_doc_href={col_of(o25, 'ms_doc_href')!r}")
+    check("КЛЮЧ ИДЕМПОТЕНТНОСТИ проигравшей попыткой НЕ создан",
+          str(col_of(o25, "ms_sync_id") or "") == key25_before,
+          f"было={key25_before!r} стало={col_of(o25, 'ms_sync_id')!r}")
+    check("…и состояние заказа не испорчено: он принят",
+          col_of(o25, "status") == "received",
+          f"status={col_of(o25, 'status')!r}")
+
+    # 25а. Та же проверка БЕЗ гонки: принятый заказ отсекается предварительной
+    #      проверкой и в сеть тоже не ходит. Быстрый ответ остался на месте.
+    o25a = make_order(c, "Заказ, принятый заранее")
+    c.post(f"/api/orders/{o25a}/status", json={"status": "sent"})
+    assert exec_sql("UPDATE production_orders SET status='received' WHERE id=?",
+                    o25a) == ""
+    docs25a = len(docs_created())
+    r = push(c, o25a)
+    check("принятый заранее заказ по-прежнему даёт 422",
+          r.status_code == 422, f"status={r.status_code} {r.text[:160]}")
+    check("…и тоже не ходит в сеть", len(docs_created()) == docs25a,
+          f"было={docs25a} стало={len(docs_created())}")
+
+    # 25б. ПОЛОЖИТЕЛЬНЫЙ КОНТРОЛЬ: обычная отправка draft/sent по-прежнему
+    #      захватывает лок и создаёт документ. Без него «никогда не
+    #      захватывать» удовлетворяло бы всем проверкам выше, а отправка
+    #      перестала бы работать вовсе.
+    o25b = make_order(c, "Обычная отправка после правки статуса")
+    docs25b = len(docs_created())
+    r = push(c, o25b)
+    check("ОБЫЧНАЯ ОТПРАВКА (draft) по-прежнему проходит",
+          r.status_code == 200, f"status={r.status_code} {r.text[:200]}")
+    check("…и документ создан", len(docs_created()) == docs25b + 1,
+          f"было={docs25b} стало={len(docs_created())}")
+    o25c = make_order(c, "Обычная отправка из «в производстве»")
+    c.post(f"/api/orders/{o25c}/status", json={"status": "sent"})
+    docs25c = len(docs_created())
+    r = push(c, o25c)
+    check("ОБЫЧНАЯ ОТПРАВКА (sent) по-прежнему проходит",
+          r.status_code == 200, f"status={r.status_code} {r.text[:200]}")
+    check("…и документ создан", len(docs_created()) == docs25c + 1,
+          f"было={docs25c} стало={len(docs_created())}")
+
+    # 25в. Прямой контроль самого предиката: T1 на принятом заказе не
+    #      захватывает лок и не создаёт ключ даже при вызове напрямую.
+    o25d = make_order(c, "Заказ для прямой проверки предиката T1")
+    assert exec_sql("UPDATE production_orders SET status='received' WHERE id=?",
+                    o25d) == ""
+    db25 = SessionLocal()
+    try:
+        org25 = int(db25.get(_PO, o25d).org_id)
+        got25 = ms_writeback.begin_push(
+            db25, org25, o25d, "", f"{ms_writeback.PENDING_PREFIX}{int(time.time())}")
+    finally:
+        db25.close()
+    check("T1 НА ПРИНЯТОМ ЗАКАЗЕ НЕ ЗАХВАТЫВАЕТ ЛОК", got25 is False,
+          f"locked={got25}")
+    check("…и ключ идемпотентности не создан",
+          str(col_of(o25d, "ms_sync_id") or "") == "",
+          f"ms_sync_id={col_of(o25d, 'ms_sync_id')!r}")
+
     check("каждый POST заказа поставщику нёс syncId",
           all(d.get("syncId") for d in docs_created()),
           f"без ключа={[d.get('id') for d in docs_created() if not d.get('syncId')]}")
