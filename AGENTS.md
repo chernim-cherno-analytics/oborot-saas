@@ -224,12 +224,17 @@ FILES, DONE_WHEN, RISKS, только релевантные ссылки и CUR
 ```
 FROM: Claude | Codex
 TO: Codex | Claude
-STATUS: PROPOSAL | QUESTION | READY_FOR_REVIEW | BLOCKED | ACK
+STATUS: PROPOSAL | QUESTION | READY_FOR_REVIEW | REVIEW_ACCEPT | BLOCKED | ACK
 RELATED: PR, issue, commit или NONE
 SUMMARY: сообщение
 EVIDENCE: тесты, файлы, ссылки, наблюдения
 ACTION_REQUESTED: что ожидается от второго агента
 ```
+
+`REVIEW_ACCEPT` — терминальный вердикт ревьюера на полный точный HEAD. Он есть
+в грамматике потому, что §2 шаг 9 его требует: без него принятие пакета нечем
+было бы записать по форме. Смысл, условия и границы этого вердикта заданы там
+же, в §2 шаге 9, и этой строкой не расширяются.
 
 ## 5. Спорные решения
 
