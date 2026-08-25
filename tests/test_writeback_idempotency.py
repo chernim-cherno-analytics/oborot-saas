@@ -1656,15 +1656,26 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
     # Проверяется подставным клиентом: сети нет, живого аккаунта нет, а
     # «сколько раз позвали create_*» видно поимённо.
     print("\n== 17. Живой contract-тест: после первой ошибки записи прекращаются ==")
+    # Фраза, которую разрешено печатать ТОЛЬКО при нулевом числе изменяющих
+    # попыток. Берётся из вывода, а не переписывается здесь руками: проверка
+    # должна ловить смысл, а не совпадение формулировок.
+    NOTHING = "В аккаунте ничего не создано"
 
     class FakeClient:
         """Подставной МойСклад: считает вызовы и умеет врать по сценарию."""
 
         def __init__(self, *, cp_dupes: int = 1, cp_repeat_same: bool = True,
-                     doc_dupes: int = 1, orgs: int = 1, sku: bool = True) -> None:
+                     doc_dupes: int = 1, orgs: int = 1, sku: bool = True,
+                     cp_get_raises: bool = False, doc_get_raises: bool = False,
+                     cp_create_raises: bool = False) -> None:
             self.calls: list = []
             self.cp_dupes, self.cp_repeat_same = cp_dupes, cp_repeat_same
             self.doc_dupes, self.n_orgs, self.has_sku = doc_dupes, orgs, sku
+            # Сбои ПОСЛЕ успешного создания: ровно тот случай, из-за которого
+            # прежний отчёт говорил «ничего не создано» поверх реальной записи.
+            self.cp_get_raises = cp_get_raises
+            self.doc_get_raises = doc_get_raises
+            self.cp_create_raises = cp_create_raises
 
         async def fetch_organizations(self) -> list:
             self.calls.append("fetch_organizations")
@@ -1681,6 +1692,9 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
         async def paginate(self, path, params=None, **kw):
             self.calls.append(f"paginate:{path}")
             sync = str((params or {}).get("filter", "")).split("=", 1)[-1]
+            if ("counterparty" in path and self.cp_get_raises
+                    and self.calls.count("create_counterparty")):
+                raise httpx.ReadTimeout("mock: GET после создания не дошёл")
             if "counterparty" in path and self.calls.count("create_counterparty"):
                 for _ in range(self.cp_dupes):
                     yield {"id": "cp-1", "syncId": sync,
@@ -1694,12 +1708,18 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
             self.calls.append("find_purchase_orders_by_sync_id")
             if not self.calls.count("create_purchase_order"):
                 return []
+            if self.doc_get_raises:
+                raise httpx.ReadTimeout("mock: GET после создания не дошёл")
             return [{"id": "po-1", "syncId": sync_id,
                      "meta": {"href": "https://api.example.invalid/entity/"
                                       "purchaseorder/po-1"}}] * self.doc_dupes
 
         async def create_counterparty(self, name, sync_id):
             self.calls.append("create_counterparty")
+            if self.cp_create_raises:
+                # Обрыв ПОСЛЕ отправки: создана сущность или нет — из нашей
+                # позиции не видно. Это не «не получилось», это «неизвестно».
+                raise httpx.ReadTimeout("mock: ответ на POST не дошёл")
             n = self.calls.count("create_counterparty")
             cid = "cp-1" if (n == 1 or self.cp_repeat_same) else f"cp-{n}"
             return {"id": cid, "name": name, "syncId": sync_id,
@@ -1711,7 +1731,7 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
                     "meta": {"href": "https://api.example.invalid/entity/"
                                      "purchaseorder/po-1"}}
 
-    def _live_run(fake) -> int:
+    def _live_run(fake) -> tuple:
         """Прогон сценария на подставном клиенте, с чистым счётом PASS/FAIL.
 
         Вывод сценария ГЛУШИТСЯ, и это не косметика. `run_contract` печатает
@@ -1723,19 +1743,24 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
         p_before, f_before = list(live.PASS), list(live.FAIL)
         live.PASS.clear()
         live.FAIL.clear()
+        buf = io.StringIO()
         try:
-            with contextlib.redirect_stdout(io.StringIO()):
-                return asyncio.run(live.run_contract(fake))
+            with contextlib.redirect_stdout(buf):
+                rc = asyncio.run(live.run_contract(fake))
         finally:
             live.PASS[:] = p_before
             live.FAIL[:] = f_before
+        # Журнал снимается копией: следующий прогон его обнулит, а проверять
+        # мы будем СТРУКТУРУ, а не только напечатанную строку. Строку легко
+        # подделать формулировкой; список событий — нет.
+        return rc, buf.getvalue(), [dict(e) for e in live.LEDGER]
 
     # 17а. Положительный контроль: на честном API сценарий доходит до конца и
     #      делает РОВНО четыре записи — два создания контрагента (создание +
     #      доказательство upsert) и два создания заказа. Без него всё ниже
     #      удовлетворялось бы сценарием «никогда ничего не вызываем».
     ok_fake = FakeClient()
-    rc_ok = _live_run(ok_fake)
+    rc_ok, _out_ok, led_ok = _live_run(ok_fake)
     check("на честном API сценарий проходит целиком",
           rc_ok == 0, f"код возврата={rc_ok}")
     check("…и делает РОВНО два POST контрагента и два POST заказа",
@@ -1747,7 +1772,7 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
     # 17б. ГЛАВНАЯ регрессия: по ключу контрагента вернулось ДВА объекта.
     #      Контракт нарушен — заказ не должен создаваться вообще.
     dup_cp = FakeClient(cp_dupes=2)
-    rc_dup = _live_run(dup_cp)
+    rc_dup, _out_dup, _led_dup = _live_run(dup_cp)
     check("дубль контрагента по syncId → сценарий провален", rc_dup == 1,
           f"код возврата={rc_dup}")
     check("ПОСЛЕ ДУБЛЯ КОНТРАГЕНТА ЗАКАЗ НЕ СОЗДАВАЛСЯ НИ РАЗУ",
@@ -1757,7 +1782,7 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
     # 17в. Повторный POST вернул ДРУГОЙ id — upsert не работает. Это худший
     #      исход: он означает, что второй документ в принципе возможен.
     other_id = FakeClient(cp_repeat_same=False)
-    rc_other = _live_run(other_id)
+    rc_other, _out_other, _led_other = _live_run(other_id)
     check("повторный POST с другим id → сценарий провален", rc_other == 1,
           f"код возврата={rc_other}")
     check("ПОСЛЕ ПРОВАЛА UPSERT ЗАКАЗ НЕ СОЗДАВАЛСЯ",
@@ -1770,7 +1795,7 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
     # 17г. Дубль уже на стадии заказа: второй POST заказа сделан (это и есть
     #      проверка upsert), но НИ ОДНОЙ попытки сверх сценария быть не должно.
     dup_doc = FakeClient(doc_dupes=2)
-    rc_ddoc = _live_run(dup_doc)
+    rc_ddoc, _out_ddoc, _led_ddoc = _live_run(dup_doc)
     check("дубль заказа по syncId → сценарий провален", rc_ddoc == 1,
           f"код возврата={rc_ddoc}")
     check("после дубля заказа лишних POST не было",
@@ -1780,7 +1805,7 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
     # 17д. Не сошлись ПОДГОТОВИТЕЛЬНЫЕ проверки — ни одной записи вообще.
     for label, fake in (("нет юрлица", FakeClient(orgs=0)),
                         ("нет неархивной позиции", FakeClient(sku=False))):
-        rc_pre = _live_run(fake)
+        rc_pre, _out_pre, led_pre = _live_run(fake)
         check(f"{label} → сценарий провален до записи", rc_pre == 1,
               f"код возврата={rc_pre}")
         check(f"…и НИ ОДНОГО создания не было ({label})",
@@ -1788,6 +1813,9 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
               and fake.calls.count("create_purchase_order") == 0,
               f"cp={fake.calls.count('create_counterparty')} "
               f"po={fake.calls.count('create_purchase_order')}")
+        check(f"…и журнал пуст, поэтому «ничего не создано» — правда ({label})",
+              led_pre == [] and NOTHING in _out_pre,
+              f"событий={len(led_pre)}")
 
     # 17е. Токен не попадает в вывод ни при каком исходе.
     tok_save = live.TOKEN
@@ -1799,6 +1827,123 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
               f"после чистки={scrubbed!r}")
     finally:
         live.TOKEN = tok_save
+
+    # ── 18. Журнал изменяющих попыток: не терять уже созданное ──────────────
+    #
+    # Ревью Codex, P1 (discussion_r3855229584). Остановиться на первой
+    # неожиданности мало — надо ещё честно сказать, что мы к этому моменту УЖЕ
+    # отправили. Прежний список созданного пополнялся только после полного
+    # возврата стадии, поэтому «POST прошёл, следующий GET упал» давал пустой
+    # список и отчёт «в аккаунте ничего не создано» поверх реальной записи в
+    # чужом аккаунте. Владелец такую сущность не найдёт: он не знает, что её
+    # надо искать.
+    #
+    # Проверяется СТРУКТУРА журнала и число изменяющих вызовов, а не строка
+    # вывода: формулировку легко подправить так, чтобы тест позеленел, ничего
+    # не починив.
+    print("\n== 18. Журнал: созданное не теряется при остановке ==")
+
+    def _events(led, stage_part: str) -> list:
+        return [e for e in led if stage_part in e["stage"]]
+
+    def _observed_ids(led, stage_part: str) -> list:
+        return [o["id"] for e in _events(led, stage_part) for o in e["observed"]]
+
+    # 18а. Положительный сценарий: журнал описывает ровно четыре отправленные
+    #      попытки и обе созданные сущности, а запрещённой фразы в отчёте нет.
+    check("журнал честного прогона содержит РОВНО 4 изменяющие попытки",
+          len(led_ok) == 4, f"событий={len(led_ok)} стадии={[e['stage'] for e in led_ok]}")
+    check("…все четыре помечены как созданные по ответу API",
+          all(e["status"] == live.CREATED for e in led_ok),
+          f"статусы={[e['status'] for e in led_ok]}")
+    check("…и у каждой записан наблюдённый id/href",
+          all(e["observed"] and e["observed"][0]["id"] and e["observed"][0]["href"]
+              for e in led_ok),
+          f"наблюдения={[e['observed'] for e in led_ok]}")
+    check("…и «ничего не создано» в честном прогоне НЕ печатается",
+          NOTHING not in _out_ok)
+    check("…и в журнале нет ни токена, ни заголовков",
+          "Bearer" not in str(led_ok) and "Authorization" not in str(led_ok))
+
+    # 18б. ГЛАВНАЯ регрессия finding'а: контрагент СОЗДАН, следующий GET упал.
+    #      Заказ не трогаем, но созданного контрагента обязаны назвать.
+    cp_lost = FakeClient(cp_get_raises=True)
+    rc_lost, out_lost, led_lost = _live_run(cp_lost)
+    check("создан контрагент + упавший GET → сценарий провален", rc_lost == 1,
+          f"код возврата={rc_lost}")
+    check("СТАДИЯ ЗАКАЗА НЕ ВЫЗВАНА", cp_lost.calls.count("create_purchase_order") == 0,
+          f"вызовов create_purchase_order={cp_lost.calls.count('create_purchase_order')}")
+    check("ЖУРНАЛ ВСЁ РАВНО СОДЕРЖИТ СОЗДАННОГО КОНТРАГЕНТА",
+          len(_events(led_lost, "контрагент")) == 1
+          and _events(led_lost, "контрагент")[0]["status"] == live.CREATED
+          and _observed_ids(led_lost, "контрагент") == ["cp-1"],
+          f"журнал={led_lost}")
+    check("…и «ничего не создано» НЕ печатается после реальной записи",
+          NOTHING not in out_lost)
+    check("…а отчёт требует проверить аккаунт чтением",
+          "ПРОВЕРЬТЕ ЧТЕНИЕМ" in out_lost)
+    check("…и повторного POST контрагента не было (upsert не проверялся)",
+          cp_lost.calls.count("create_counterparty") == 1,
+          f"вызовов create_counterparty={cp_lost.calls.count('create_counterparty')}")
+
+    # 18в. То же на стадии заказа: заказ СОЗДАН, следующий GET упал.
+    #      В журнале обязаны быть и контрагент, и заказ.
+    doc_lost = FakeClient(doc_get_raises=True)
+    rc_dlost, out_dlost, led_dlost = _live_run(doc_lost)
+    check("создан заказ + упавший GET → сценарий провален", rc_dlost == 1,
+          f"код возврата={rc_dlost}")
+    check("ЖУРНАЛ СОДЕРЖИТ И КОНТРАГЕНТА, И ЗАКАЗ",
+          _observed_ids(led_dlost, "контрагент") == ["cp-1", "cp-1"]
+          and _observed_ids(led_dlost, "заказ") == ["po-1"],
+          f"контрагент={_observed_ids(led_dlost, 'контрагент')} "
+          f"заказ={_observed_ids(led_dlost, 'заказ')}")
+    check("…и «ничего не создано» НЕ печатается", NOTHING not in out_dlost)
+    check("…и лишних POST заказа не было",
+          doc_lost.calls.count("create_purchase_order") == 1,
+          f"вызовов={doc_lost.calls.count('create_purchase_order')}")
+
+    # 18г. Обрыв НА ОТПРАВКЕ: ответа нет, создана сущность или нет — неизвестно.
+    #      «Не получилось» здесь было бы враньём в самую опасную сторону.
+    raised = FakeClient(cp_create_raises=True)
+    rc_raise, out_raise, led_raise = _live_run(raised)
+    check("обрыв на POST → сценарий провален", rc_raise == 1,
+          f"код возврата={rc_raise}")
+    check("ПОПЫТКА ЗАПИСАНА В ЖУРНАЛ ДО ОТПРАВКИ (она там есть)",
+          len(led_raise) == 1, f"событий={len(led_raise)}")
+    check("…и помечена ЧЕСТНЫМ «неизвестно, возможно создано», а не провалом",
+          led_raise[0]["status"] == live.UNKNOWN,
+          f"статус={led_raise[0]['status']}")
+    check("…и наблюдений нет — ответа мы не получили",
+          led_raise[0]["observed"] == [], f"наблюдения={led_raise[0]['observed']}")
+    check("…и назван тип сбоя, но не секрет",
+          led_raise[0].get("error") == "ReadTimeout"
+          and "Bearer" not in str(led_raise[0]),
+          f"событие={led_raise[0]}")
+    check("…и «ничего не создано» НЕ печатается после отправленного POST",
+          NOTHING not in out_raise)
+    check("…и второй попытки/ретрая не было",
+          raised.calls.count("create_counterparty") == 1,
+          f"вызовов create_counterparty={raised.calls.count('create_counterparty')}")
+    check("…и стадия заказа не начиналась",
+          raised.calls.count("create_purchase_order") == 0)
+
+    # 18д. Повтор вернул ДРУГОЙ id: в аккаунте два объекта, и назвать обязаны
+    #      ОБА — иначе владелец пойдёт искать один.
+    check("при разошедшихся id повтора в журнале записаны ОБА наблюдения",
+          _observed_ids(_led_other, "контрагент") == ["cp-1", "cp-2"],
+          f"наблюдения={_observed_ids(_led_other, 'контрагент')}")
+    check("…и оба события помечены как созданные по ответу API",
+          [e["status"] for e in _events(_led_other, "контрагент")]
+          == [live.CREATED, live.CREATED],
+          f"статусы={[e['status'] for e in _events(_led_other, 'контрагент')]}")
+    check("…и «ничего не создано» НЕ печатается", NOTHING not in _out_other)
+
+    # 18е. Отрицательный контроль на саму фразу: она разрешена РОВНО тогда,
+    #      когда изменяющих попыток не было. Иначе проверки выше можно было бы
+    #      удовлетворить, просто перестав её печатать когда бы то ни было.
+    check("«ничего не создано» печатается, когда попыток действительно НЕ было",
+          NOTHING in _out_pre and led_pre == [],
+          f"событий={len(led_pre)}")
 
     check("каждый POST заказа поставщику нёс syncId",
           all(d.get("syncId") for d in docs_created()),

@@ -61,6 +61,19 @@
 существует, позиция существует и не в архиве, оба наших ключа в аккаунте
 свободны, а имени с нашей пометкой ещё нет.
 
+── Журнал изменяющих попыток ────────────────────────────────────────────────
+
+Остановиться на первой неожиданности мало: надо ещё честно сказать, что мы к
+этому моменту УЖЕ отправили. Каждая изменяющая попытка ложится в append-only
+журнал ДО вызова, наблюдённый ответ дописывается СРАЗУ после — раньше любой
+проверки, которая может остановить сценарий.
+
+Поэтому отчёт не может соврать в самую опасную сторону. Фраза «в аккаунте
+ничего не создано» допустима ровно в одном случае: изменяющих попыток не было
+ни одной. Во всех прочих печатается полный журнал и требование проверить
+аккаунт чтением по пометке и syncId — включая случай, когда ответ не дошёл и
+сущность могла быть создана без нашего ведома.
+
 ── Запуск (только вручную, только осознанно) ────────────────────────────────
 
     OBOROT_LIVE_MS_TOKEN=<токен аккаунта> \\
@@ -122,6 +135,31 @@ ASSORTMENT_TYPES = frozenset({"product", "variant"})
 
 PASS, FAIL = [], []
 
+# ── Журнал изменяющих попыток (append-only) ──────────────────────────────────
+#
+# Ревью Codex, P1 (discussion_r3855229584). Раньше список созданного
+# пополнялся ТОЛЬКО после полного возврата стадии. Значит, при успешном POST и
+# упавшем следом GET (или repeat, или финальной проверке уникальности) стадия
+# бросала LiveStop ДО возврата, список оставался пустым — и отчёт заявлял
+# «в аккаунте ничего не создано», хотя сущность в чужом аккаунте уже была.
+# При обрыве связи после отправки было ещё хуже: ответ неизвестен, а мы
+# уверенно сообщали, что не создали ничего.
+#
+# Это прямо нарушало мандат владельца: оставить сущности и записать их
+# безопасные имена, id и ссылки для ручного контроля. Потерянная запись о
+# созданном объекте — это объект, который владелец не найдёт, потому что не
+# знает, что его надо искать.
+#
+# Отсюда правило: попытка попадает в журнал ДО отправки, наблюдённый ответ —
+# СРАЗУ после, и ни одна запись отсюда не удаляется и не переписывается.
+# Журнал ведётся вокруг ВСЕХ изменяющих вызовов, включая повторные: у повтора
+# свой ответ, и если id разошлись, в журнале обязаны остаться ОБА.
+LEDGER: list[dict] = []
+
+ATTEMPTED = "ПОПЫТКА_ОТПРАВЛЕНА"
+CREATED = "СОЗДАНО_ПО_ОТВЕТУ_API"
+UNKNOWN = "НЕИЗВЕСТНО_ВОЗМОЖНО_СОЗДАНО"
+
 
 class LiveStop(Exception):
     """Первая же неожиданность: сценарий останавливается до следующей записи."""
@@ -158,6 +196,108 @@ def scrub(text: object) -> str:
 
 def say(text: object = "") -> None:
     print(scrub(text))
+
+
+def safe_view(obj: dict) -> dict:
+    """Из ответа API берутся ТОЛЬКО безопасные поля: id, name, href.
+
+    Списком разрешённого, а не «уберём лишнее»: ответ чужого API — не наша
+    структура, и складывать его в журнал целиком значит однажды положить туда
+    поле, о котором мы не думали. В Issue этот журнал читают люди, у которых
+    доступа к аккаунту нет.
+    """
+    return {
+        "id": str((obj or {}).get("id") or ""),
+        "name": str((obj or {}).get("name") or ""),
+        "href": str((((obj or {}).get("meta") or {}).get("href")) or ""),
+    }
+
+
+def ledger_reset() -> None:
+    """Журнал заводится ДО первой изменяющей попытки — и только здесь."""
+    LEDGER.clear()
+
+
+def mutating_attempts() -> int:
+    """Сколько изменяющих вызовов было ОТПРАВЛЕНО (а не сколько удалось)."""
+    return len(LEDGER)
+
+
+async def mutate(stage: str, tag: str, name: str, sync_id: str, call,
+                 *, note: str = ""):
+    """Единственный путь к изменяющему вызову — и он ведёт журнал сам.
+
+    Порядок здесь и есть смысл функции:
+      1) запись «попытка отправлена» ложится в журнал ДО вызова. Если процесс
+         умрёт на сетевом вызове, запись уже существует;
+      2) вызов делается РОВНО ОДИН раз. Ни ретрая, ни второго POST здесь нет
+         и быть не должно: повтор после неизвестного ответа — это ровно тот
+         способ завести в чужом аккаунте вторую сущность;
+      3) ответ разбирается на безопасные поля и дописывается СРАЗУ, до любой
+         проверки. Проверка может не сойтись и остановить сценарий — запись о
+         созданном объекте обязана пережить эту остановку;
+      4) исключение помечает попытку как НЕИЗВЕСТНО_ВОЗМОЖНО_СОЗДАНО и летит
+         дальше. «Не получилось» и «неизвестно» — разные вещи: при обрыве
+         после отправки сущность в аккаунте может быть.
+
+    `call` — функция без аргументов, возвращающая корутину. Так вызов заведомо
+    не начинается раньше, чем о нём записано.
+    """
+    event: dict = {"stage": stage, "tag": tag, "name": name,
+                   "sync_id": sync_id, "note": note,
+                   "status": ATTEMPTED, "observed": []}
+    LEDGER.append(event)
+    try:
+        result = await call()
+    except BaseException as exc:  # noqa: BLE001 — статус честный, тип называем
+        event["status"] = UNKNOWN
+        event["error"] = type(exc).__name__
+        raise
+    event["status"] = CREATED
+    event["observed"].append(safe_view(result))
+    return result
+
+
+def ledger_lines() -> list[str]:
+    """Журнал в виде безопасных строк. Секретов здесь нет по построению."""
+    out: list[str] = []
+    for i, ev in enumerate(LEDGER, 1):
+        head = (f"  {i}. [{ev['status']}] {ev['stage']}"
+                + (f" ({ev['note']})" if ev.get("note") else ""))
+        if ev.get("error"):
+            head += f" — прервано: {ev['error']}"
+        out.append(head)
+        out.append(f"       имя: {ev['name']}")
+        out.append(f"       syncId: {ev['sync_id']}")
+        for obs in ev["observed"]:
+            out.append(f"       наблюдалось: id={obs['id']} "
+                       f"name={obs['name']} href={obs['href']}")
+        if not ev["observed"]:
+            out.append("       наблюдалось: ответ не получен — "
+                       "проверьте вручную, сущность могла быть создана")
+    return out
+
+
+def report_ledger(tag: str) -> None:
+    """Финальный отчёт о том, что мы трогали в чужом аккаунте.
+
+    «В аккаунте ничего не создано» разрешено ровно в одном случае: не было НИ
+    ОДНОЙ изменяющей попытки. Во всех остальных печатается полный журнал и
+    требование проверить аккаунт чтением — даже если каждая попытка закончилась
+    исключением. Мы не вправе утверждать про чужую систему больше, чем
+    наблюдали.
+    """
+    if mutating_attempts() == 0:
+        say("\nВ аккаунте ничего не создано: изменяющих попыток не было ни одной.")
+        return
+    say(f"\nЖУРНАЛ ИЗМЕНЯЮЩИХ ПОПЫТОК (append-only, попыток: "
+        f"{mutating_attempts()}). Ничего не удаляем — всё остаётся в аккаунте "
+        f"для ручной проверки владельцем:")
+    for line in ledger_lines():
+        say(line)
+    say(f"\nПРОВЕРЬТЕ ЧТЕНИЕМ в МойСкладе по пометке «{marking(tag)}» и по "
+        f"syncId из журнала выше. Если хоть одна попытка помечена "
+        f"{UNKNOWN} — сущность могла быть создана, даже когда ответ не дошёл.")
 
 
 def check(name: str, cond: bool, detail: str = "") -> bool:
@@ -340,7 +480,8 @@ async def stage_counterparty(client, tag: str, agent_sync: str) -> dict:
     bad = validate_agent_payload(payload, tag=tag, sync_id=agent_sync)
     gate("тело контрагента прошло разбор до отправки", not bad, "; ".join(bad))
 
-    agent = await client.create_counterparty(name, agent_sync)
+    agent = await mutate("контрагент: создание", tag, name, agent_sync,
+                         lambda: client.create_counterparty(name, agent_sync))
     agent_id = str(agent.get("id") or "")
     agent_href = str(((agent.get("meta") or {}).get("href")) or "")
     gate("POST /entity/counterparty ПРИНЯЛ syncId", bool(agent_id and agent_href),
@@ -354,7 +495,13 @@ async def stage_counterparty(client, tag: str, agent_sync: str) -> dict:
     # Повтор идёт ТЕМ ЖЕ телом и тем же ключом. Другого повтора здесь не
     # предусмотрено: «попробуем иначе» на живом аккаунте — это и есть способ
     # завести второй объект.
-    again = await client.create_counterparty(name, agent_sync)
+    # Ответ повтора попадает в журнал ДО сверки id. Если контракт нарушен и
+    # ответ пришёл с другим id, в аккаунте лежат ДВА объекта — и оба обязаны
+    # быть названы, иначе владелец пойдёт искать один.
+    again = await mutate("контрагент: повтор с тем же syncId", tag, name,
+                         agent_sync,
+                         lambda: client.create_counterparty(name, agent_sync),
+                         note="проверка upsert")
     gate("ПОВТОРНЫЙ POST с тем же syncId вернул ТОТ ЖЕ id (upsert)",
          str(again.get("id") or "") == agent_id,
          f"первый={agent_id} второй={again.get('id')}")
@@ -395,7 +542,8 @@ async def stage_order(client, tag: str, doc_sync: str, pre: dict,
          "(непроведённый, одна позиция, кол-во 1, цена 0, пометка на месте)",
          not bad, "; ".join(bad))
 
-    doc = await client.create_purchase_order(payload)
+    doc = await mutate("заказ поставщику: создание", tag, marking(tag), doc_sync,
+                       lambda: client.create_purchase_order(payload))
     doc_id = str(doc.get("id") or "")
     doc_href = str(((doc.get("meta") or {}).get("href")) or "")
     gate("POST /entity/purchaseorder ПРИНЯЛ syncId", bool(doc_id),
@@ -406,7 +554,10 @@ async def stage_order(client, tag: str, doc_sync: str, pre: dict,
          len(by_sync) == 1 and str(by_sync[0].get("id") or "") == doc_id,
          f"найдено={len(by_sync)} ids={[r.get('id') for r in by_sync]}")
 
-    repeat = await client.create_purchase_order(payload)
+    repeat = await mutate("заказ поставщику: повтор с тем же syncId", tag,
+                          marking(tag), doc_sync,
+                          lambda: client.create_purchase_order(payload),
+                          note="проверка upsert")
     gate("ПОВТОРНЫЙ POST с тем же syncId вернул ТОТ ЖЕ документ "
          "(upsert, а не второй заказ поставщику)",
          str(repeat.get("id") or "") == doc_id,
@@ -430,17 +581,17 @@ async def run_contract(client) -> int:
     tag = uuid.uuid4().hex[:8]
     agent_sync = str(uuid.uuid4())
     doc_sync = str(uuid.uuid4())
-    created: list[str] = []
+
+    # Журнал заводится ДО первой изменяющей попытки, а не по её итогам.
+    # Прежний список «созданного» пополнялся после полного возврата стадии, и
+    # успешный POST с упавшей следом проверкой в него не попадал вовсе.
+    ledger_reset()
 
     say(f"\nПометка этого прогона: {marking(tag)}")
     try:
         pre = await prerequisites(client, tag, agent_sync, doc_sync)
         agent = await stage_counterparty(client, tag, agent_sync)
-        created.append(f"контрагент «{agent['name']}» id={agent['id']} "
-                       f"href={agent['href']}")
-        doc = await stage_order(client, tag, doc_sync, pre, agent)
-        created.append(f"заказ поставщику «{doc['name']}» id={doc['id']} "
-                       f"href={doc['href']}")
+        await stage_order(client, tag, doc_sync, pre, agent)
     except LiveStop as stop:
         say(f"\nОСТАНОВЛЕНО на проверке: {stop}")
         say("Дальнейшие изменяющие запросы НЕ выполнялись — это правило, а не "
@@ -453,13 +604,10 @@ async def run_contract(client) -> int:
         FAIL.append(f"{type(exc).__name__} в сценарии")
         say("Дальнейшие изменяющие запросы НЕ выполнялись.")
 
-    if created:
-        say("\nСоздано в аккаунте и ОСТАВЛЕНО для ручной проверки владельцем "
-            "(ничего не удаляем):")
-        for item in created:
-            say(f"  • {item}")
-    else:
-        say("\nВ аккаунте ничего не создано.")
+    # Отчёт о трогнутом в чужом аккаунте печатается ВСЕГДА и по журналу, а не
+    # по тому, чем кончился сценарий. Успех и провал отличаются приговором
+    # проверок, а не тем, признаём ли мы факт отправленных POST.
+    report_ledger(tag)
 
     say(f"\nИТОГО: {len(PASS)} OK, {len(FAIL)} FAIL")
     return 1 if FAIL else 0
