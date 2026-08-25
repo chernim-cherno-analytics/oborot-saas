@@ -14,12 +14,43 @@ processingorder требует техкарту (processingPlan) и доступ
 Используемые эндпоинты JSON API 1.2:
   GET  /entity/assortment          — резолв href/type по ext_id наших products;
   GET  /entity/organization        — юрлицо (первое) для поля organization;
-  GET  /entity/counterparty?filter=syncId=… / filter=name=… — поиск агента;
+  GET  /entity/counterparty/{id}   — жива ли ЗАКРЕПЛЁННАЯ ссылка на агента;
+                                     404/410 — забыть привязку и переразрешить;
+  GET  /entity/counterparty        — постраничный перебор для поиска агента по
+                                     нашему syncId (см. «Как ищется ключ»);
+  GET  /entity/counterparty?filter=name=… — одноимённые агенты «Производство»:
+                                     0 — создаём, 1 — закрепляем, >1 — 409;
   POST /entity/counterparty        — создание агента (идемпотентно, syncId);
-  GET  /entity/purchaseorder?filter=syncId=… — «не создан ли уже наш документ»;
+  GET  /entity/purchaseorder       — постраничный перебор для поиска НАШЕГО
+                                     документа по syncId (там же);
+  GET  /entity/purchaseorder?filter=moment>=… — ТОЛЬКО legacy-путь: список без
+                                     позиций за последние LOOKBACK_DAYS, метка
+                                     `[oborot#N]` сверяется у нас (по подстроке
+                                     описания МойСклад фильтровать не умеет);
   POST /entity/purchaseorder       — сам документ (organization, agent, syncId,
                                      positions[{assortment.meta, quantity,
                                      price-в-копейках}], deliveryPlannedMoment).
+
+Как ищется ключ — и почему не фильтром. Раньше в этом перечне стояли
+`GET /entity/counterparty?filter=syncId=…` и
+`GET /entity/purchaseorder?filter=syncId=…`, и это было неправдой: живой
+аккаунт отвечает на такой фильтр **HTTP 412, code 1034, «неизвестное поле
+фильтрации syncId»** (Issue координации, issuecomment-5414290329), а
+документация МойСклада обещает обратное. Между обещанием документа и
+наблюдаемым ответом выбран ответ.
+
+Поиск по `syncId` целиком живёт в `MoySkladClient.find_by_sync_id`, и он —
+единственный источник правды о способе:
+  • необязательная точечная подсказка `GET /entity/{type}/syncid/{id}`
+    (поддержка `GET` по этому URL НЕ документирована, поэтому подсказка ничего
+    не решает и ничем не заменяет перебор);
+  • авторитетный ограниченный постраничный перебор коллекции с ТОЧНЫМ
+    сравнением `syncId` у себя; исчерпанная граница — типизированный отказ, а
+    не пустой ответ.
+
+Этот перечень описывает фактические вызовы. Если он разойдётся с кодом — верить
+коду: ложный обзор модуля опаснее отсутствующего, потому что уводит
+сопровождающего обратно на отвергнутый путь.
 
 Маппинг позиций: item заказа {base_name, sizes:{size: qty}} → products
 текущей org по (base_name, size) → product.ext_id → meta из ассортимента МС.
