@@ -86,6 +86,7 @@ SUITES = [
     ("account",     "test_account.py",         False, False),
     ("lessons",     "test_lessons.py",         False, False),
     ("isolation",   "test_isolation.py",       False, False),
+    ("auth_csrf",   "test_auth_csrf.py",       False, False),
     ("tenancy",     "test_tenancy.py",         False, False),
     ("writeback",   "test_writeback.py",       True,  False),
     ("vendor",      "test_vendor.py",          True,  False),

@@ -67,7 +67,9 @@
   </div>
 
   <p class="auth-note">Вы вошли как {{ user.email }} · <a href="/logout" onclick="event.preventDefault(); document.getElementById('logout-form').submit();">выйти</a></p>
-  <form method="post" action="/logout" id="logout-form" style="display:none;"></form>
+  <form method="post" action="/logout" id="logout-form" style="display:none;">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  </form>
 </div>
 {% endblock %}
 

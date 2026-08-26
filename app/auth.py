@@ -3,8 +3,10 @@
 Кука: HttpOnly, SameSite=Lax, подписана itsdangerous (URLSafeTimedSerializer).
 Внутри — {user_id, org_id}; org_id определяет тенант для всех запросов.
 """
+import hmac
 import logging
 import os
+import secrets
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -14,7 +16,7 @@ from fastapi import Depends, HTTPException, Request
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from sqlalchemy.orm import Session
 
-from app.crypto import get_signing_secret, is_prod
+from app.crypto import get_csrf_signing_secret, get_signing_secret, is_prod
 from app.db import get_db
 from app.models import Membership, Org, User
 
@@ -441,6 +443,91 @@ def read_session(request: Request) -> dict | None:
         return _serializer().loads(raw, max_age=SESSION_MAX_AGE)
     except (BadSignature, SignatureExpired):
         return None
+
+
+# ── CSRF форм вне /api (SEC-5) ────────────────────────────────────────────────
+#
+# /login, /register, /logout — обычные HTML-формы, а не fetch() из app.js:
+# браузер отправляет их сам, без JS и без кастомных заголовков, поэтому
+# заголовок X-Oborot-CSRF (см. main._security_headers_and_csrf) им не защита.
+# Схема — подписанный double-submit: сервер выдаёт куку со случайным
+# значением и то же значение кладёт в скрытое поле формы. Кука HttpOnly
+# (сравнение целиком серверное, JS её никогда не читает), сравнение —
+# hmac.compare_digest, подпись — отдельный от сессии ключ (см.
+# get_csrf_signing_secret). Сторонняя форма не может ни прочитать куку
+# (чужой origin), ни поставить её сама с валидной подписью (не знает ключ) —
+# значит не может подобрать значение, совпадающее со скрытым полем.
+CSRF_COOKIE = "oborot_csrf"
+CSRF_FORM_FIELD = "csrf_token"
+CSRF_MAX_AGE = 6 * 3600  # 6 часов
+# Пути, где сессия ставится/снимается формой, а не /api — им нужна эта, а не
+# заголовочная защита.
+CSRF_FORM_PATHS = frozenset({"/login", "/register", "/logout"})
+
+
+def _csrf_serializer() -> URLSafeTimedSerializer:
+    return URLSafeTimedSerializer(get_csrf_signing_secret(), salt="oborot-csrf")
+
+
+def get_csrf_token(request: Request) -> str:
+    """Значение для скрытого поля формы.
+
+    Переиспользует уже выставленную куку, если она ещё валидна — токен НЕ
+    перевыпускается на каждый рендер. Иначе несколько открытых вкладок и
+    кнопка «назад» держали бы в разметке устаревшее скрытое поле, пока кука
+    (общая на браузер) уже сменилась на новую, и легитимная отправка стала
+    бы падать наравне с поддельной.
+    """
+    raw = request.cookies.get(CSRF_COOKIE)
+    if raw:
+        try:
+            _csrf_serializer().loads(raw, max_age=CSRF_MAX_AGE)
+            return raw
+        except (BadSignature, SignatureExpired):
+            pass
+    return _csrf_serializer().dumps(secrets.token_urlsafe(32))
+
+
+def set_csrf_cookie(response, token: str, samesite: str = "lax") -> None:
+    """Ставит/продлевает CSRF-куку на ответ, где показана форма.
+
+    samesite согласован с сессионной кукой (см. set_session): встроенный
+    режим на проде — "none" + Secure, иначе кука не долетит до формы logout
+    внутри iframe МойСклад и double-submit станет невыполним для настоящего
+    пользователя, а не только для атакующего.
+    """
+    response.set_cookie(
+        CSRF_COOKIE,
+        token,
+        max_age=CSRF_MAX_AGE,
+        httponly=True,
+        samesite=samesite,
+        secure=is_prod() or samesite == "none",
+        path="/",
+    )
+
+
+def verify_csrf_form(request: Request, form_token) -> bool:
+    """True, если скрытое поле формы совпадает с подписанной CSRF-кукой.
+
+    Дважды: значения должны совпасть БУКВАЛЬНО (constant-time compare — не
+    течёт тайминг совпадения символов) И кука должна быть подписана нашим
+    ключом и не просрочена. Только совпадения недостаточно: без подписи
+    сторонний, кто как-то смог поставить куку с тем же значением, что и
+    угаданное/подсмотренное поле, тоже прошёл бы.
+    """
+    if not isinstance(form_token, str) or not form_token:
+        return False
+    cookie_val = request.cookies.get(CSRF_COOKIE)
+    if not cookie_val:
+        return False
+    if not hmac.compare_digest(cookie_val, form_token):
+        return False
+    try:
+        _csrf_serializer().loads(cookie_val, max_age=CSRF_MAX_AGE)
+    except (BadSignature, SignatureExpired):
+        return False
+    return True
 
 
 # ── Зависимости ───────────────────────────────────────────────────────────────

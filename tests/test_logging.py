@@ -95,7 +95,7 @@ def _test_log_route():
     return {"ok": True}
 
 
-client = TestClient(oborot_app)
+client = TestClient(oborot_app, headers={"X-Oborot-CSRF": "1"})
 # Вход в контекст запускает события startup приложения (создание таблиц и
 # аддитивные миграции) — без этого первый же /register упал бы на
 # «no such table: users».
