@@ -1385,7 +1385,7 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
         res_a = ms_writeback._commit_push_once(
             db16, org16, db16.get(_PO, o16),
             "https://example.invalid/entity/purchaseorder/late-A", "A-late",
-            {}, pend_a)
+            {}, pend_a, col_of(o16, "items_json"))
         check("ПОЗДНИЙ T2 A ОТКАЗАН (лок уже не его)", res_a is None,
               f"результат={res_a!r}")
         check("…и href B не перезаписан документом A",
@@ -1400,7 +1400,8 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
         #      операциях, сломанных в «никогда ничего не делает».
         href_b = "https://example.invalid/entity/purchaseorder/owner-B"
         res_b = ms_writeback._commit_push_once(
-            db16, org16, db16.get(_PO, o16), href_b, "B-owner", {}, pend_b)
+            db16, org16, db16.get(_PO, o16), href_b, "B-owner", {}, pend_b,
+            col_of(o16, "items_json"))
         check("ЗАКОННЫЙ ВЛАДЕЛЕЦ B СВОИМ ТОКЕНОМ T2 ЗАВЕРШИЛ", res_b is True,
               f"результат={res_b!r}")
         check("…и ссылка записана именно его документа",
@@ -2608,8 +2609,30 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
     # Порядок событий один и тот же на любой машине — ни одного sleep.
     print("\n== 23. Гонка back-match и T2: перенос вклада ровно один раз ==")
     from app import ms_sync as _ms_sync  # noqa: PLC0415
+    from app.ms_client import MoySkladClient as _Client23  # noqa: PLC0415
 
     RACE_BASE = "База гонки 23"
+    # DATA-7 backmatch: _backmatch_by_sync_id теперь читает РЕАЛЬНЫЕ позиции
+    # документа (см. ms_writeback.positions_pushed_by_base), а не полное
+    # локальное количество заказа (_order_bases — удалён). Фиктивный
+    # ext_id/product_id ниже — карта «ассортимент → base_name» ровно для
+    # ОДНОЙ позиции, которую несут документы этого блока (см. _doc_for):
+    # без неё позиции документа не сопоставились бы ни с чем, и перенесённый
+    # вклад стал бы 0 вместо 10 — гонки блока проверяют СУММЫ, поэтому карта
+    # обязана давать те же числа, что раньше давал _order_bases.
+    RACE_EXT = "race-ext-23"
+    RACE_PID = 900023
+    _RACE_EXT_TO_PID = {RACE_EXT: RACE_PID}
+    _RACE_BASE_BY_PID = {RACE_PID: RACE_BASE}
+
+    def _run_backmatch(org_id: int, docs: list, our_docs: dict, stats: dict) -> None:
+        """Прямой вызов back-match'а на моке — без полного синка вокруг."""
+        async def _run():
+            async with _Client23(mock_ms.TOKEN) as cl:
+                await _ms_sync._backmatch_by_sync_id(
+                    org_id, docs, our_docs, stats, cl,
+                    _RACE_EXT_TO_PID, _RACE_BASE_BY_PID)
+        asyncio.run(_run())
 
     def _setup_race(tag: str, marker: str) -> tuple:
         """Два отправленных заказа по 10 одного base: qty ровно 20."""
@@ -2643,10 +2666,18 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
             "SELECT qty, ms_qty FROM ordered_qty WHERE base_name=?", RACE_BASE)
         return (float(row[0][0]), float(row[0][1])) if row else (None, None)
 
-    def _doc_for(key: str, doc_id: str) -> list:
+    def _doc_for(key: str, doc_id: str, qty: int = 10) -> list:
         return [{"id": doc_id, "name": doc_id.upper(), "syncId": key,
                  "meta": {"href": f"{mock_ms.BASE}/entity/purchaseorder/{doc_id}",
-                          "type": "purchaseorder"}}]
+                          "type": "purchaseorder"},
+                 "positions": {
+                     "rows": [{
+                         "assortment": {"meta": {
+                             "href": f"{mock_ms.BASE}/entity/assortment/{RACE_EXT}"}},
+                         "quantity": qty, "shipped": 0.0,
+                     }],
+                     "meta": {"size": 1},
+                 }}]
 
     # 23а. ГЛАВНЫЙ: backmatch прочитал заказ в состоянии unknown, а T2 успел.
     marker23 = f"{ms_writeback.UNKNOWN_PREFIX}{int(time.time())}"
@@ -2656,12 +2687,18 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
 
     WINNER_HREF = f"{mock_ms.BASE}/entity/purchaseorder/po-race-winner"
     raced: list = []
-    original_bases = _ms_sync._order_bases
+    original_full_positions = _ms_sync._full_positions
 
-    def _bases_with_race(order):
-        """Шов: T2-победитель выполняется МЕЖДУ чтением и записью backmatch."""
-        result = original_bases(order)
-        if not raced and int(getattr(order, "id", 0)) == a23:
+    async def _positions_with_race(client, entity, doc, stats):
+        """Шов: T2-победитель выполняется МЕЖДУ чтением и записью backmatch.
+
+        Позиции документа — это то место, где back-match теперь узнаёт
+        «сколько реально уехало» (см. ms_writeback.positions_pushed_by_base),
+        поэтому шов встал сюда же, а не в _order_bases — той функции больше
+        нет.
+        """
+        result = await original_full_positions(client, entity, doc, stats)
+        if not raced and doc.get("id") == "po-race-late":
             raced.append(True)
             db_w = SessionLocal()
             try:
@@ -2671,22 +2708,22 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
                 assert got, "T2-победитель не смог захватить лок"
                 res = ms_writeback._commit_push_once(
                     db_w, org_w, db_w.get(_PO, a23), WINNER_HREF, "ПОБЕДИТЕЛЬ",
-                    {RACE_BASE: 10}, pend_w)
+                    {RACE_BASE: 10}, pend_w, col_of(a23, "items_json"))
                 assert res is True, f"T2-победитель не записал ссылку: {res!r}"
             finally:
                 db_w.close()
         return result
 
-    _ms_sync._order_bases = _bases_with_race
+    _ms_sync._full_positions = _positions_with_race
     try:
         stats23: dict = {}
         our23: dict = {}
-        _ms_sync._backmatch_by_sync_id(
+        _run_backmatch(
             int(exec_sql_read("SELECT org_id FROM production_orders WHERE id=?",
                               a23)[0][0]),
             _doc_for(key23, "po-race-late"), our23, stats23)
     finally:
-        _ms_sync._order_bases = original_bases
+        _ms_sync._full_positions = original_full_positions
 
     check("шов сработал: T2-победитель прошёл между чтением и записью",
           bool(raced), f"raced={raced}")
@@ -2715,8 +2752,8 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
                                a23b)[0][0])
     stats23b: dict = {}
     our23b: dict = {}
-    _ms_sync._backmatch_by_sync_id(org23b, _doc_for(key23b, "po-race-win"),
-                                   our23b, stats23b)
+    _run_backmatch(org23b, _doc_for(key23b, "po-race-win"),
+                  our23b, stats23b)
     qty_b, ms_b = _race_qty()
     check("БЕЗ КОНКУРЕНТА backmatch связал заказ",
           str(col_of(a23b, "ms_doc_href") or "").endswith("po-race-win"),
@@ -2729,8 +2766,7 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
 
     # 23в. Повторный backmatch по тому же документу уже НЕ двигает: заказ
     #      связан, is_pushed истинно. Проверка того, что выигрыш одноразовый.
-    _ms_sync._backmatch_by_sync_id(org23b, _doc_for(key23b, "po-race-win"),
-                                   {}, {})
+    _run_backmatch(org23b, _doc_for(key23b, "po-race-win"), {}, {})
     check("ПОВТОРНЫЙ backmatch по связанному заказу не двигает вклад снова",
           _race_qty()[0] == 10.0, f"qty={_race_qty()[0]}")
 
@@ -2739,8 +2775,7 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
     a23c, b23c, key23c = _setup_race("пусто", "")
     org23c = int(exec_sql_read("SELECT org_id FROM production_orders WHERE id=?",
                                a23c)[0][0])
-    _ms_sync._backmatch_by_sync_id(org23c, _doc_for(key23c, "po-race-empty"),
-                                   {}, {})
+    _run_backmatch(org23c, _doc_for(key23c, "po-race-empty"), {}, {})
     check("CAS выигрывает и при наблюдённой ПУСТОЙ ссылке",
           str(col_of(a23c, "ms_doc_href") or "").endswith("po-race-empty")
           and _race_qty()[0] == 10.0,
@@ -2753,8 +2788,7 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
     a23d, b23d, key23d = _setup_race("поздний T2", marker23d)
     org23d = int(exec_sql_read("SELECT org_id FROM production_orders WHERE id=?",
                                a23d)[0][0])
-    _ms_sync._backmatch_by_sync_id(org23d, _doc_for(key23d, "po-race-first"),
-                                   {}, {})
+    _run_backmatch(org23d, _doc_for(key23d, "po-race-first"), {}, {})
     check("backmatch выиграл первым и перенёс вклад (20 → 10)",
           _race_qty()[0] == 10.0, f"qty={_race_qty()[0]}")
     db23 = SessionLocal()
@@ -2762,7 +2796,7 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
         late = ms_writeback._commit_push_once(
             db23, org23d, db23.get(_PO, a23d),
             f"{mock_ms.BASE}/entity/purchaseorder/po-race-late-t2", "ПОЗДНИЙ",
-            {RACE_BASE: 10}, marker23d)
+            {RACE_BASE: 10}, marker23d, col_of(a23d, "items_json"))
     finally:
         db23.close()
     check("ПОЗДНИЙ T2 ПРОИГРАЛ свой CAS (лок уже не его)", late is None,
@@ -2816,7 +2850,15 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
         docs = [{"id": f"po-roll-{oid}", "name": f"PO-ROLL-{oid}",
                  "syncId": keys[oid],
                  "meta": {"href": f"{mock_ms.BASE}/entity/purchaseorder/"
-                                  f"po-roll-{oid}", "type": "purchaseorder"}}
+                                  f"po-roll-{oid}", "type": "purchaseorder"},
+                 "positions": {
+                     "rows": [{
+                         "assortment": {"meta": {
+                             "href": f"{mock_ms.BASE}/entity/assortment/{RACE_EXT}"}},
+                         "quantity": 10, "shipped": 0.0,
+                     }],
+                     "meta": {"size": 1},
+                 }}
                 for oid in (a, b)]
         return a, b, org, docs
 
@@ -2837,7 +2879,7 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
     try:
         our24: dict = {}
         stats24: dict = {}
-        _ms_sync._backmatch_by_sync_id(org24, docs24, our24, stats24)
+        _run_backmatch(org24, docs24, our24, stats24)
     finally:
         ms_writeback._move_incoming_to_ms = original_move24
 
@@ -2863,7 +2905,7 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
     a24b, b24b, org24b, docs24b = _setup_pair("успех")
     our24b: dict = {}
     stats24b: dict = {}
-    _ms_sync._backmatch_by_sync_id(org24b, docs24b, our24b, stats24b)
+    _run_backmatch(org24b, docs24b, our24b, stats24b)
     check("ДВА УСПЕШНЫХ КАНДИДАТА связаны в базе",
           str(col_of(a24b, "ms_doc_href") or "").endswith(f"po-roll-{a24b}")
           and str(col_of(b24b, "ms_doc_href") or "").endswith(f"po-roll-{b24b}"),
@@ -2898,7 +2940,7 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
     try:
         our24c: dict = {}
         stats24c: dict = {}
-        _ms_sync._backmatch_by_sync_id(org24c, docs24c, our24c, stats24c)
+        _run_backmatch(org24c, docs24c, our24c, stats24c)
     finally:
         _ms_sync.SessionLocal = original_session
     check("СБОЙ САМОГО КОММИТА: ссылка не записана",
@@ -3466,6 +3508,439 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
     check("каждый POST заказа поставщику нёс syncId",
           all(d.get("syncId") for d in docs_created()),
           f"без ключа={[d.get('id') for d in docs_created() if not d.get('syncId')]}")
+
+    # ── 29. T2 CAS: конкурентное переименование не теряет маркер pushed_by_base
+    #      (DATA-7 Package A, Codex corrective issuecomment-5427535755) ────────
+    #
+    # Матчинг позиций (order.items + products, БЕЗ сети) отрабатывает сразу
+    # после T1, задолго до сетевого окна создания документа. Между этим
+    # матчингом и записью T2 (после ответа МойСклада) окно открыто секундами —
+    # ровно там ms_sync._migrate_renames может переписать items_json ЭТОГО ЖЕ
+    # заказа в отдельной сессии. Раньше T2 писал маркер безусловным UPDATE
+    # поверх ЛЮБОГО items_json: rename, случившийся в этом окне, либо
+    # затирался маркером с устаревшими (дорененными) items, либо T2 писал
+    # pushed_by_base под СТАРЫМ ключом поверх УЖЕ переименованных items —
+    # расхождение между items[].base_name и ключом маркера, которое на
+    # sent→received даёт ровно ту потерю остатка/задвоение, ради которого
+    # весь Package A и написан.
+    print("\n== 29. T2: rename во время сетевого окна push не теряет маркер (CAS) ==")
+    bases29 = sized_bases()
+    base29, sizes29 = next((b, s) for b, s in bases29 if len(s) >= 2)
+    new_base29 = base29 + " (rename-race)"
+    picked29 = {s: 1 for s in sizes29[:2]}
+    qty29 = sum(picked29.values())
+    r = c.post("/api/orders", json={
+        "name": "Гонка rename/push", "eta_date": None,
+        "items": [{"base_name": base29, "qty": qty29, "sizes": picked29, "cost": 100}],
+        "allow_duplicate": True,
+    })
+    check("заказ для гонки rename/push создан", r.status_code == 200, r.text[:150])
+    o29 = int(r.json()["id"])
+    r = c.post(f"/api/orders/{o29}/status", json={"status": "sent"})
+    check("заказ для гонки переведён в sent", r.status_code == 200)
+    before29 = qty_map().get(base29, (0.0, 0.0, 0.0))
+
+    mock_api.post("/__test/faults", json={"po_create_delay_ms": 3000})
+    push29: list = []
+
+    def _push29():
+        with httpx.Client(headers=dict(c.headers), cookies=c.cookies,
+                          base_url=base, timeout=120.0) as cc:
+            push29.append(cc.post(f"/api/orders/{o29}/push-to-ms"))
+
+    t29 = threading.Thread(target=_push29)
+    t29.start()
+    marker29 = wait_pending(o29)
+    check("окно отправки открыто (T1 закоммичен, документа ещё нет)",
+          marker29.startswith("pending:"), f"ms_doc_href={marker29!r}")
+    # Матчинг не делает сетевых вызовов и отрабатывает почти мгновенно после
+    # T1 — 300 мс с огромным запасом (окно po_create_delay_ms — 3с) дают ему
+    # заведомо завершиться ДО переименования.
+    time.sleep(0.3)
+    exec_sql("UPDATE products SET base_name=? WHERE org_id=1 AND base_name=?",
+             new_base29, base29)
+    from app import ms_sync as _ms29
+    from app.db import SessionLocal as _SL29
+    dbx29 = _SL29()
+    try:
+        _ms29._migrate_renames(dbx29, 1, {base29: {new_base29}}, {})
+        dbx29.commit()
+    finally:
+        dbx29.close()
+    t29.join(timeout=120)
+    mock_api.post("/__test/faults", json={})
+    check("push несмотря на гонку с rename завершился успехом",
+          bool(push29) and push29[0].status_code == 200 and body_of(push29[0]).get("ok"),
+          f"status={push29[0].status_code if push29 else None} "
+          f"body={push29[0].text[:200] if push29 else None}")
+
+    from app.models import parse_items_payload as _parse29
+    items29, pushed29 = _parse29(col_of(o29, "items_json"))
+    check("rename применился к items заказа (base_name — новый)",
+          bool(items29) and all(it.get("base_name") == new_base29 for it in items29),
+          f"items={items29}")
+    check("DATA-7 CAS: маркер pushed_by_base НЕ ПОТЕРЯН и стоит под НОВЫМ именем "
+          "(а не под старым, которого в items больше нет)",
+          pushed29 == {new_base29: qty29},
+          f"pushed_by_base={pushed29} (ждали {{{new_base29!r}: {qty29}}})")
+
+    after29 = qty_map().get(new_base29, (0.0, 0.0, 0.0))
+    # before29 снят ПОСЛЕ sent (уже несёт +qty29 от статусного перехода) —
+    # push полностью сопоставленного заказа обязан перенести ЭТУ же величину
+    # из qty в ms_qty: qty-qty29, ms_qty+qty29.
+    check("push (несмотря на гонку) перенёс ПОЛНОЕ количество из qty в ms_qty "
+          "под новым именем — заказ был полностью сопоставлен",
+          after29[0] == before29[0] - qty29 and after29[1] == before29[1] + qty29,
+          f"{before29} -> {after29} (ждали qty-{qty29}, ms_qty+{qty29})")
+
+    recv_before29 = qty_map().get(new_base29, (0.0, 0.0, 0.0))
+    r = c.post(f"/api/orders/{o29}/status", json={"status": "received"})
+    check("заказ из гонки rename/push принят на склад", r.status_code == 200)
+    recv_after29 = qty_map().get(new_base29, (0.0, 0.0, 0.0))
+    check("DATA-7: заказ полностью сопоставлен — receive ничего не снимает "
+          "(remainder=0 под правильным именем, а не «весь qty под потерянным маркером»)",
+          recv_after29 == recv_before29,
+          f"{recv_before29} -> {recv_after29}")
+
+    mock_api.post("/__test/faults", json={})
+
+    # ── 30. DATA-7 Package B: recovered/backmatch по РЕАЛЬНЫМ позициям ──────
+    #
+    # Package A закрыл push обычного пути: pushed_by_base считался против
+    # ассортимента в момент ЭТОЙ попытки, и unmatched-остаток честно оставался
+    # в qty. Package B закрывает два места, где это же число раньше бралось
+    # не из документа, а из текущего локального состояния:
+    #   30а — push_order.recovered: документ уже существует, а pushed_by_base
+    #         брался из локального матчинга ЭТОЙ (второй) попытки — если
+    #         ассортимент успел разойтись с тем, что было на момент СОЗДАНИЯ
+    #         документа, маркер и перенос вклада получались по ЧУЖОМУ, более
+    #         новому сопоставлению;
+    #   30б — ms_sync._backmatch_by_sync_id: pushed_by_base брался из
+    #         `_order_bases(order)` — ПОЛНОГО локального количества, включая
+    #         unmatched-остаток, которого в документе никогда не было, и
+    #         маркер DATA-7 при этом не писался вовсе.
+    print("\n== 30. Recovered/backmatch считают вклад по ДОКУМЕНТУ (DATA-7 Package B) ==")
+
+    # 30а. Recovered документ отличается от ТЕКУЩЕГО локального сопоставления.
+    #      (base29 исключён: блок 29 переименовал его в products, под старым
+    #      именем товара там больше нет — заказ на нём вообще не сопоставился
+    #      бы, и тест проверял бы не то расхождение.)
+    #
+    # Расхождение смоделировано напрямую в items_json — между «документ
+    # создан» и «повтор нашёл его» окно СЕТЕВОЕ, а не редакторское (заказ уже
+    # sent, обычный маршрут его не меняет), поэтому проверяется ИНВАРИАНТ, а
+    # не бытовой сценарий: локальное состояние заказа МОГЛО разойтись с тем,
+    # что реально уехало в документ (гонка синка, ручная правка в базе), и
+    # recovered-путь обязан пережить это, читая правду из документа, а не из
+    # текущего items_json.
+    bases30 = sized_bases()
+    base30a, sizes30a = next((b, s) for b, s in bases30
+                             if len(s) >= 2 and b != base29)
+    size30a_a, size30a_b = sizes30a[0], sizes30a[1]
+    r = c.post("/api/orders", json={
+        "name": "Recovered ≠ текущий матч (DATA-7 Package B)", "eta_date": None,
+        "items": [{"base_name": base30a, "qty": 2,
+                  "sizes": {size30a_a: 1, size30a_b: 1}, "cost": 100}],
+        "allow_duplicate": True,
+    })
+    check("заказ 30а создан", r.status_code == 200, r.text[:150])
+    o30a = int(r.json()["id"])
+    r = c.post(f"/api/orders/{o30a}/status", json={"status": "sent"})
+    check("заказ 30а переведён в sent", r.status_code == 200)
+    after_sent30a = qty_map().get(base30a, (0.0, 0.0, 0.0))
+
+    mock_api.post("/__test/faults", json={"po_create_then_fail": 1,
+                                          "po_hide_created": 1})
+    r = push(c, o30a)
+    mock_api.post("/__test/faults", json={})
+    check("первая попытка 30а даёт честный «неизвестно» (502)",
+          r.status_code == 502, f"status={r.status_code} {r.text[:160]}")
+    check("состояние 30а — unknown, вклад ещё не тронут",
+          ms_writeback.is_unknown(col_of(o30a, "ms_doc_href"))
+          and qty_map().get(base30a, (0.0, 0.0, 0.0)) == after_sent30a,
+          f"ms_doc_href={col_of(o30a, 'ms_doc_href')!r}")
+    doc30a = doc_with_marker(order_marker(o30a))
+    check("документ 30а реально создан (скрыт от перебора, не отсутствует), "
+          "и несёт РОВНО те 2 позиции, что были сопоставлены на момент POST",
+          doc30a is not None and len(doc30a.get("positions") or []) == 2
+          and sum(float(p.get("quantity") or 0)
+                  for p in (doc30a.get("positions") or [])) == 2,
+          f"doc={doc30a}")
+
+    # Локальный items_json «портится» ПОСЛЕ того, как документ уже создан:
+    # количество первого размера подменяется на заведомо большее. Продукты и
+    # ассортимент не трогаем — ТЕКУЩИЙ локальный матч по-прежнему сопоставит
+    # ОБА размера (unmatched будет пуст), только с чужими количествами.
+    corrupt_json30a = json.dumps(
+        [{"base_name": base30a, "qty": 9,
+         "sizes": {size30a_a: 9, size30a_b: 1}, "cost": 100}],
+        ensure_ascii=False)
+    assert exec_sql("UPDATE production_orders SET items_json=? WHERE id=?",
+                    corrupt_json30a, o30a) == ""
+
+    r = push(c, o30a)
+    body30a = r.json() if r.status_code == 200 else {}
+    check("повтор 30а подобрал уже созданный документ (recovered)",
+          r.status_code == 200 and body30a.get("recovered") is True,
+          f"status={r.status_code} recovered={body30a.get('recovered')} {r.text[:160]}")
+    check("ТЕКУЩИЙ локальный матч в ЭТОЙ попытке сопоставляет ОБА размера "
+          "(unmatched пуст) — расхождение в количестве, не в сопоставимости: "
+          "будь дело в матче, старый код тоже бы промахнулся мимо",
+          body30a.get("unmatched") == [], f"unmatched={body30a.get('unmatched')}")
+    after_retry30a = qty_map().get(base30a, (0.0, 0.0, 0.0))
+    check("DATA-7 Package B: перенесено РОВНО количество ДОКУМЕНТА (2), а не "
+          "испорченного локального items_json (было бы 10)",
+          after_retry30a[0] == after_sent30a[0] - 2
+          and after_retry30a[1] == after_sent30a[1] + 2,
+          f"{after_sent30a} -> {after_retry30a} (ждали qty-2, ms_qty+2, "
+          f"НЕ qty-10/ms_qty+10)")
+    from app.models import parse_items_payload as _parse30a
+    _, pushed30a = _parse30a(col_of(o30a, "items_json"))
+    check("…и маркер DATA-7 несёт количество ДОКУМЕНТА (2), а не "
+          "испорченного items_json (10)",
+          pushed30a == {base30a: 2}, f"pushed_by_base={pushed30a}")
+
+    # 30б. Частично сопоставленный заказ + честный unknown → backmatch:
+    #      remainder обязан остаться РОВНО unmatched-частью, а не полным qty
+    #      и не нулём, и маркер обязан появиться атомарно со связыванием.
+    base30b, sizes30b = next(
+        (b, s) for b, s in bases30 if b not in (base30a, base29) and s)
+    size30b = sizes30b[0]
+    r = c.post("/api/orders", json={
+        "name": "Частично сопоставлен + unknown→backmatch (DATA-7 Package B)",
+        "eta_date": None,
+        "items": [{"base_name": base30b, "qty": 5,
+                  "sizes": {size30b: 2, "XL": 3}, "cost": 100}],
+        "allow_duplicate": True,
+    })
+    check("заказ 30б создан", r.status_code == 200, r.text[:150])
+    o30b = int(r.json()["id"])
+    r = c.post(f"/api/orders/{o30b}/status", json={"status": "sent"})
+    check("заказ 30б переведён в sent (+5 локально: 2 сопоставится, 3 — нет)",
+          r.status_code == 200)
+    before_bm30b = qty_map().get(base30b, (0.0, 0.0, 0.0))
+
+    mock_api.post("/__test/faults", json={"po_create_then_fail": 1,
+                                          "po_hide_created": 1})
+    r = push(c, o30b)
+    mock_api.post("/__test/faults", json={})
+    check("push 30б честно неизвестен (502)", r.status_code == 502,
+          f"status={r.status_code} {r.text[:160]}")
+    check("документ 30б создан, но НЕСЁТ ТОЛЬКО сопоставленную позицию (1, "
+          "не 2) — XL в него не попал",
+          (doc_with_marker(order_marker(o30b)) or {}).get("positions")
+          and len(doc_with_marker(order_marker(o30b))["positions"]) == 1,
+          f"doc={doc_with_marker(order_marker(o30b))}")
+    check("вклад 30б ещё не тронут: unknown не двигает qty",
+          qty_map().get(base30b, (0.0, 0.0, 0.0)) == before_bm30b,
+          f"qty_map={qty_map().get(base30b)}")
+
+    c.post("/api/sync/run")
+    st30b = wait_sync_done(c)
+    check("синк 30б завершился", st30b.get("state") == "done",
+          f"state={st30b.get('state')}")
+    href30b = col_of(o30b, "ms_doc_href")
+    check("BACK-MATCH СВЯЗАЛ документ 30б по syncId",
+          ms_writeback.is_pushed(href30b) and str(href30b).startswith("http"),
+          f"ms_doc_href={href30b!r}")
+    from app.models import parse_items_payload as _parse30b
+    _, pushed30b = _parse30b(col_of(o30b, "items_json"))
+    check("DATA-7 Package B: backmatch записал МАРКЕР — сопоставленную часть "
+          "(2), а не «неизвестно» и не полный локальный вклад (5)",
+          pushed30b == {base30b: 2}, f"pushed_by_base={pushed30b}")
+    after_bm30b = qty_map().get(base30b, (0.0, 0.0, 0.0))
+    check("backmatch снял РОВНО сопоставленную часть (2), unmatched-остаток "
+          "(3, XL) остался в qty",
+          after_bm30b[0] == before_bm30b[0] - 2,
+          f"{before_bm30b} -> {after_bm30b} (ждали qty-2)")
+    # ms_qty здесь НЕ проверяем числом: это ПОЛНАЯ пересборка синком по ВСЕМ
+    # открытым документам этого base_name (а не только по нашему), и её
+    # прирост зависит от документов прежних блоков, не только от нашего —
+    # проверять здесь нечего сверх того, что уже доказали marker (=2, не 5) и
+    # qty (-2, не -5): маркер и есть источник истины, из которого другой код
+    # (например receive ниже) считает remainder.
+
+    # Повторный синк не двигает вклад снова (лечится один раз).
+    c.post("/api/sync/run")
+    st30b2 = wait_sync_done(c)
+    check("повторный синк 30б завершился", st30b2.get("state") == "done",
+          f"state={st30b2.get('state')}")
+    check("повторный синк не двигает вклад снова",
+          qty_map().get(base30b, (0.0, 0.0, 0.0))[0] == after_bm30b[0],
+          f"qty_map={qty_map().get(base30b)}")
+
+    # Приёмка после лечения снимает РОВНО unmatched-остаток (3), один раз.
+    r = c.post(f"/api/orders/{o30b}/status", json={"status": "received"})
+    check("заказ 30б принят на склад", r.status_code == 200, f"{r.text[:150]}")
+    after_recv30b = qty_map().get(base30b, (0.0, 0.0, 0.0))
+    check("DATA-7 Package B: receive снял РОВНО unmatched-остаток (3, XL), "
+          "не все 5 и не 0 — маркер backmatch'а прочитан верно",
+          after_recv30b[0] == after_bm30b[0] - 3
+          and after_recv30b[1] == after_bm30b[1],
+          f"{after_bm30b} -> {after_recv30b} (ждали qty-3, ms_qty без изменений)")
+
+    recv_repeat30b = qty_map().get(base30b, (0.0, 0.0, 0.0))
+    r = c.post(f"/api/orders/{o30b}/status", json={"status": "received"})
+    check("повторный received заказа 30б — unchanged, а не повторное снятие",
+          r.status_code == 200 and r.json().get("unchanged") is True,
+          f"status={r.status_code} body={r.text[:150]}")
+    check("…remainder снят РОВНО ОДИН РАЗ (повтор ничего не меняет)",
+          qty_map().get(base30b, (0.0, 0.0, 0.0)) == recv_repeat30b,
+          f"qty_map={qty_map().get(base30b)}")
+
+    # ── 31. Corrective (issuecomment-5428103206): capping/fail-closed по
+    #        реальным позициям документа ─────────────────────────────────────
+    #
+    # positions_pushed_by_base раньше слепо суммировал ВСЕ сопоставившиеся
+    # позиции документа и округлял дробные количества (int(round(...))).
+    # Документ мог отдать БОЛЬШЕ, чем заказывал ЭТОТ заказ (лишняя строка
+    # того же товара, ручная правка в МС, пересозданная позиция) — перенос
+    # тогда съедал общий/чужой qty того же base_name; либо содержать позицию,
+    # которую текущий ассортимент вообще не опознаёт, — округление/пропуск
+    # тихо теряло или добавляло единицы. Четыре блока ниже проверяют
+    # исправленный контракт прямой мутацией уже созданного документа (тот же
+    # приём, что у 30а/30б, без догадок о внутреннем состоянии мока): капинг
+    # сверху заказа, исключение чужого base, fail-closed на несопоставленной
+    # позиции и на дробном количестве.
+    print("\n== 31. Capping/fail-closed по реальным позициям документа "
+          "(corrective issuecomment-5428103206) ==")
+
+    base31, sizes31 = next((b, s) for b, s in bases30
+                           if len(s) >= 2 and b not in (base29, base30a, base30b))
+    size31a, size31b = sizes31[0], sizes31[1]
+    base31w, sizes31w = next(
+        (b, s) for b, s in bases30
+        if s and b not in (base29, base30a, base30b, base31))
+    ext31w = exec_sql_read(
+        "SELECT ext_id FROM products WHERE base_name=? AND size=?",
+        base31w, sizes31w[0])[0][0]
+    from app.models import parse_items_payload as _parse31  # noqa: PLC0415
+
+    def _setup31(name: str) -> tuple:
+        """Заказ на base31 (qty 2, оба размера сопоставятся) → скрытый recovered."""
+        r = c.post("/api/orders", json={
+            "name": name, "eta_date": None,
+            "items": [{"base_name": base31, "qty": 2,
+                      "sizes": {size31a: 1, size31b: 1}, "cost": 100}],
+            "allow_duplicate": True,
+        })
+        check(f"{name}: заказ создан", r.status_code == 200, r.text[:150])
+        oid = int(r.json()["id"])
+        r = c.post(f"/api/orders/{oid}/status", json={"status": "sent"})
+        check(f"{name}: переведён в sent", r.status_code == 200)
+        before = qty_map().get(base31, (0.0, 0.0, 0.0))
+        mock_api.post("/__test/faults", json={"po_create_then_fail": 1,
+                                              "po_hide_created": 1})
+        r = push(c, oid)
+        mock_api.post("/__test/faults", json={})
+        check(f"{name}: первая попытка честно неизвестна (502)",
+              r.status_code == 502, f"status={r.status_code} {r.text[:160]}")
+        check(f"{name}: вклад ещё не тронут (unknown не двигает qty)",
+              qty_map().get(base31, (0.0, 0.0, 0.0)) == before,
+              f"qty_map={qty_map().get(base31)}")
+        doc = doc_with_marker(order_marker(oid))
+        check(f"{name}: документ создан и несёт ровно 2 сопоставленные позиции",
+              doc is not None and len(doc.get("positions") or []) == 2
+              and sum(float(p.get("quantity") or 0)
+                      for p in (doc.get("positions") or [])) == 2,
+              f"doc={doc}")
+        return oid, doc, before
+
+    # 31а. Over-quantity: документ несёт БОЛЬШЕ, чем заказывал ЭТОТ заказ —
+    #      перенос обязан обрезаться до заказанного (2), а не до документа (7).
+    o31a, doc31a, before31a = _setup31("Over-quantity capped (DATA-7 corrective)")
+    doc31a["positions"][0]["quantity"] = 6  # было 1 → сумма позиций 6+1=7
+    r = push(c, o31a)
+    body31a = r.json() if r.status_code == 200 else {}
+    check("31а: повтор подобрал документ (recovered)",
+          r.status_code == 200 and body31a.get("recovered") is True,
+          f"status={r.status_code} {r.text[:160]}")
+    _, pushed31a = _parse31(col_of(o31a, "items_json"))
+    check("31а: маркер несёт РОВНО заказанное (2), а не документное (7)",
+          pushed31a == {base31: 2}, f"pushed_by_base={pushed31a}")
+    after31a = qty_map().get(base31, (0.0, 0.0, 0.0))
+    check("31а: перенесено РОВНО 2 (не 7): qty-2, ms_qty+2",
+          after31a[0] == before31a[0] - 2 and after31a[1] == before31a[1] + 2,
+          f"{before31a} -> {after31a}")
+
+    # 31б. Extra mapped base: документ несёт ПОСТОРОННЮЮ (для этого заказа)
+    #      позицию другого товара — она не должна попасть в маркер и не
+    #      должна списать локальный qty base31w другого заказа (ручная правка
+    #      в МС/пересоздание позиции не делают её вкладом ИМЕННО этого заказа).
+    rw = c.post("/api/orders", json={
+        "name": "Донор qty base31w (DATA-7 corrective)", "eta_date": None,
+        "items": [{"base_name": base31w, "qty": 3,
+                  "sizes": {sizes31w[0]: 3}, "cost": 100}],
+        "allow_duplicate": True,
+    })
+    check("31б: заказ-донор создан", rw.status_code == 200, rw.text[:150])
+    ow31b = int(rw.json()["id"])
+    rw = c.post(f"/api/orders/{ow31b}/status", json={"status": "sent"})
+    check("31б: заказ-донор переведён в sent (даёт локальный qty base31w)",
+          rw.status_code == 200)
+    donor_before = qty_map().get(base31w, (0.0, 0.0, 0.0))
+    check("31б: у донора есть локальный qty base31w", donor_before[0] > 0,
+          f"donor_before={donor_before}")
+
+    o31b, doc31b, before31b = _setup31("Extra mapped base (DATA-7 corrective)")
+    doc31b["positions"].append({
+        "assortment": {"meta": {
+            "href": f"{mock_ms.BASE}/entity/assortment/{ext31w}"}},
+        "quantity": 3, "price": 100,
+    })
+    r = push(c, o31b)
+    body31b = r.json() if r.status_code == 200 else {}
+    check("31б: повтор подобрал документ (recovered)",
+          r.status_code == 200 and body31b.get("recovered") is True,
+          f"status={r.status_code} {r.text[:160]}")
+    _, pushed31b = _parse31(col_of(o31b, "items_json"))
+    check("31б: маркер несёт ТОЛЬКО base31 (2) — посторонний base31w не попал",
+          pushed31b == {base31: 2}, f"pushed_by_base={pushed31b}")
+    after31b = qty_map().get(base31, (0.0, 0.0, 0.0))
+    check("31б: base31 перенесён как обычно (qty-2, ms_qty+2)",
+          after31b[0] == before31b[0] - 2 and after31b[1] == before31b[1] + 2,
+          f"{before31b} -> {after31b}")
+    donor_after = qty_map().get(base31w, (0.0, 0.0, 0.0))
+    check("31б: ПОСТОРОННИЙ base31w (донора) НЕ тронут — ни qty, ни ms_qty",
+          donor_after == donor_before, f"{donor_before} -> {donor_after}")
+
+    # 31в. Unmapped positive line: позиция документа не сопоставляется ни с
+    #      одним base текущего ассортимента (посторонний/удалённый ext-id) —
+    #      recovered обязан fail-closed: остаться unknown, не звать T2.
+    o31c, doc31c, before31c = _setup31(
+        "Unmapped ext-id fail-closed (DATA-7 corrective)")
+    doc31c["positions"].append({
+        "assortment": {"meta": {
+            "href": f"{mock_ms.BASE}/entity/assortment/no-such-ext-31c"}},
+        "quantity": 1, "price": 100,
+    })
+    r = push(c, o31c)
+    check("31в: повтор с несопоставленной позицией — снова честно неизвестен (502)",
+          r.status_code == 502, f"status={r.status_code} {r.text[:160]}")
+    href31c_after = col_of(o31c, "ms_doc_href")
+    check("31в: ссылка осталась в состоянии unknown (T2 не вызывался)",
+          ms_writeback.is_unknown(str(href31c_after or "")),
+          f"ms_doc_href={href31c_after!r}")
+    check("31в: qty/ms_qty НЕ тронуты повторной попыткой",
+          qty_map().get(base31, (0.0, 0.0, 0.0)) == before31c,
+          f"qty_map={qty_map().get(base31)}")
+
+    # 31г. Fractional quantity: позиция документа сопоставляется, но несёт
+    #      дробное количество — контракт «fail-closed на дробном», не
+    #      int(round(...)): та же гарантия, что и у unmapped-строки.
+    o31d, doc31d, before31d = _setup31(
+        "Fractional qty fail-closed (DATA-7 corrective)")
+    doc31d["positions"][0]["quantity"] = 1.5
+    r = push(c, o31d)
+    check("31г: повтор с дробным количеством — честно неизвестен (502)",
+          r.status_code == 502, f"status={r.status_code} {r.text[:160]}")
+    href31d_after = col_of(o31d, "ms_doc_href")
+    check("31г: ссылка осталась в состоянии unknown (T2 не вызывался)",
+          ms_writeback.is_unknown(str(href31d_after or "")),
+          f"ms_doc_href={href31d_after!r}")
+    check("31г: qty/ms_qty НЕ тронуты повторной попыткой",
+          qty_map().get(base31, (0.0, 0.0, 0.0)) == before31d,
+          f"qty_map={qty_map().get(base31)}")
 
     mock_api.post("/__test/faults", json={})
     c.close()

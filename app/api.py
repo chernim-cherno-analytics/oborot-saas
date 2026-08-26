@@ -26,6 +26,7 @@ from app.models import (
     StockDay,
     User,
     Warehouse,
+    parse_items_payload,
 )
 
 router = APIRouter(prefix="/api")
@@ -445,9 +446,17 @@ def api_create_order(
     return {"ok": True, "id": order.id, "status": "draft"}
 
 
-def _apply_order_to_incoming(db: Session, org_id: int, order: ProductionOrder, sign: int) -> None:
+def _items_and_pushed(items_json) -> tuple[list[dict], dict[str, float] | None]:
+    """Безопасный parse_items_payload — та же деградация, что у ProductionOrder.items/.pushed_by_base."""
+    try:
+        return parse_items_payload(items_json)
+    except ValueError:
+        return [], None
+
+
+def _apply_order_to_incoming(db: Session, org_id: int, items: list[dict], sign: int) -> None:
     """Прибавляет (sign=+1) или вычитает (sign=-1) позиции заказа из «едет к нам»."""
-    for item in order.items:
+    for item in items:
         base, qty = item.get("base_name"), int(item.get("qty") or 0)
         if not base or qty <= 0:
             continue
@@ -456,6 +465,48 @@ def _apply_order_to_incoming(db: Session, org_id: int, order: ProductionOrder, s
             db.add(OrderedQty(org_id=org_id, base_name=base, qty=max(0, sign * qty)))
         else:
             row.qty = max(0, row.qty + sign * qty)
+
+
+def _apply_remainder_to_incoming(db: Session, org_id: int, items: list[dict],
+                                 pushed_by_base: dict[str, float] | None, sign: int) -> None:
+    """Как _apply_order_to_incoming, но только для part заказа, НЕ уехавшей в МС.
+
+    Заказ, отправленный в МойСклад, переносит matched-часть каждой позиции из
+    qty в ms_qty уже при push (DATA-7, ms_writeback._move_incoming_to_ms) — тот
+    вклад qty больше не двигает. Но unmatched-остаток (позиция/размер без пары
+    в ассортименте МС) в МойСклад не уехал и остался в qty; sent→received и
+    удаление такого заказа обязаны снять/вернуть РОВНО его, а не 0 (иначе
+    остаток навсегда зависает в «едет к нам») и не qty целиком (иначе
+    задваивается уже перенесённая в ms_qty часть).
+
+    pushed_by_base=None — заказ отправлялся до появления маркера (legacy):
+    какая часть уехала, неизвестно, и гадать нельзя — remainder не трогаем.
+
+    Считает по base_name СНАЧАЛА суммарный заказанный qty, и лишь потом
+    вычитает pushed_by_base[base] ОДИН раз. Раньше вычитание шло построчно
+    (per item), и при двух строках одного base_name (см. D-25 «дубль имени»)
+    одно и то же агрегированное pushed_by_base[base] вычиталось из КАЖДОЙ
+    строки — занижая остаток при нескольких строках и заодно расходясь с тем,
+    что pushed_by_base сам агрегирован по base_name на пуше (ms_writeback:
+    `pushed_by_base[base] = pushed_by_base.get(base, 0) + qty`), а не per-item.
+    """
+    if pushed_by_base is None:
+        return
+    totals: dict[str, int] = {}
+    for item in items:
+        base, qty = item.get("base_name"), int(item.get("qty") or 0)
+        if not base or qty <= 0:
+            continue
+        totals[base] = totals.get(base, 0) + qty
+    for base, qty in totals.items():
+        remainder = qty - int(pushed_by_base.get(base, 0) or 0)
+        if remainder <= 0:
+            continue
+        row = db.get(OrderedQty, (org_id, base))
+        if row is None:
+            db.add(OrderedQty(org_id=org_id, base_name=base, qty=max(0, sign * remainder)))
+        else:
+            row.qty = max(0, row.qty + sign * remainder)
 
 
 # ── Исполнение заказа (D-25) ─────────────────────────────────────────────────
@@ -851,12 +902,18 @@ def api_order_status(
     # и записью (TOCTOU), поэтому условие живёт в самом UPDATE — см.
     # ms_writeback.not_pushing_clause.
     #
-    # RETURNING отдаёт ms_doc_href той же строки и в тот же момент: решение
-    # «двигать ли локальный qty» обязано читаться из транзакции изменения.
-    # Иначе остаётся зеркальная гонка — запрос прочитал заказ ДО T2, а
-    # изменяет ПОСЛЕ: пометки pending уже нет, UPDATE честно проходит, а
-    # признак «уже отправлен» берётся устаревший, и локальный вклад ложится
-    # ПОВЕРХ перенесённого ms_qty (тест 10б в test_writeback_idempotency).
+    # RETURNING отдаёт ms_doc_href И items_json той же строки и в тот же
+    # момент: решение «двигать ли локальный qty» и то, ЧТО именно двигать,
+    # обязаны читаться из транзакции изменения. Иначе остаётся зеркальная
+    # гонка — запрос прочитал заказ ДО T2, а изменяет ПОСЛЕ: пометки pending
+    # уже нет, UPDATE честно проходит, а признак «уже отправлен» берётся
+    # устаревший, и локальный вклад ложится ПОВЕРХ перенесённого ms_qty
+    # (тест 10б в test_writeback_idempotency). items_json — по той же
+    # причине: ORM-объект `order` прочитан ДО этого UPDATE и не видит ни T2
+    # (маркер pushed_by_base появляется атомарно вместе с href), ни
+    # конкурентное переименование (ms_sync._migrate_renames переписывает
+    # items_json отдельной транзакцией) — подставить в них устаревшие items
+    # значило бы посчитать remainder по позициям/маркеру, которых уже нет.
     changed = db.execute(
         update(ProductionOrder)
         .where(ProductionOrder.id == order.id,
@@ -865,7 +922,7 @@ def api_order_status(
                ms_writeback.not_pushing_clause())
         .values(status=body.status,
                 **({"sent_at": now} if body.status == "sent" else {"received_at": now}))
-        .returning(ProductionOrder.ms_doc_href)
+        .returning(ProductionOrder.ms_doc_href, ProductionOrder.items_json)
         .execution_options(synchronize_session=False)
     ).fetchall()
     if not changed:
@@ -888,11 +945,16 @@ def api_order_status(
             raise HTTPException(status_code=409,
                                 detail=ms_writeback.PUSH_IN_PROGRESS)
         return {"ok": True, "status": fresh.status, "unchanged": True}
+    items_at_change, pushed_at_change = _items_and_pushed(changed[0][1])
     if not ms_writeback.is_pushed(str(changed[0][0] or "")):
         if body.status == "sent":
-            _apply_order_to_incoming(db, ctx.org.id, order, +1)
+            _apply_order_to_incoming(db, ctx.org.id, items_at_change, +1)
         else:  # received
-            _apply_order_to_incoming(db, ctx.org.id, order, -1)
+            _apply_order_to_incoming(db, ctx.org.id, items_at_change, -1)
+    elif body.status == "received":
+        # DATA-7: matched-часть уже в ms_qty (снята из qty при push) — здесь
+        # снимается только unmatched-остаток, который push не тронул.
+        _apply_remainder_to_incoming(db, ctx.org.id, items_at_change, pushed_at_change, -1)
     if body.status == "received":
         _record_execution(db, ctx, order, body.received, now)
     db.commit()
@@ -1083,12 +1145,14 @@ def api_order_delete(
     # события, и человеку они говорят разное — строки нет (404, удалять нечего),
     # заказ стал принятым (422, удалять нельзя), идёт отправка (409, подождите).
     #
-    # RETURNING отдаёт статус и ссылку удалённой строки — тот же приём, что и
-    # в статусном переходе: сколько снимать с «едет к нам», решается по
-    # состоянию внутри транзакции удаления, а не по ORM-объекту, прочитанному
-    # до неё. Иначе повторная отправка уже отправленного заказа успевала бы
-    # перенести вклад в ms_qty, а удаление вычитало бы его ещё раз — из чужой
-    # позиции с тем же base_name.
+    # RETURNING отдаёт статус, ссылку И items_json удалённой строки — тот же
+    # приём, что и в статусном переходе: сколько снимать с «едет к нам» и по
+    # каким позициям/маркеру, решается по состоянию внутри транзакции
+    # удаления, а не по ORM-объекту, прочитанному до неё. Иначе повторная
+    # отправка уже отправленного заказа успевала бы перенести вклад в ms_qty
+    # (и записать маркер, и, возможно, конкурентное переименование —
+    # переписать items_json), а удаление читало бы устаревший снимок и
+    # вычитало бы не то и не туда.
     removed = db.execute(
         delete(ProductionOrder)
         .where(ProductionOrder.id == order.id,
@@ -1102,7 +1166,8 @@ def api_order_delete(
                # строки связывать нечем: документ остаётся в чужом аккаунте
                # без владельца навсегда.
                ms_writeback.not_orphaning_clause())
-        .returning(ProductionOrder.status, ProductionOrder.ms_doc_href)
+        .returning(ProductionOrder.status, ProductionOrder.ms_doc_href,
+                   ProductionOrder.items_json)
         .execution_options(synchronize_session=False)
     ).fetchall()
     if not removed:
@@ -1121,10 +1186,15 @@ def api_order_delete(
                                 detail=ms_writeback.ORDER_UNKNOWN_OUTCOME)
         raise HTTPException(status_code=409, detail=ms_writeback.PUSH_IN_PROGRESS)
     status_at_delete, href_at_delete = str(removed[0][0] or ""), str(removed[0][1] or "")
-    if status_at_delete == "sent" and not ms_writeback.is_pushed(href_at_delete):
-        # Отправленный в МС заказ в qty не входил (его считает ms_qty; сам
-        # документ в МойСклад при локальном удалении никуда не девается).
-        _apply_order_to_incoming(db, ctx.org.id, order, -1)
+    if status_at_delete == "sent":
+        items_at_delete, pushed_at_delete = _items_and_pushed(removed[0][2])
+        if not ms_writeback.is_pushed(href_at_delete):
+            _apply_order_to_incoming(db, ctx.org.id, items_at_delete, -1)
+        else:
+            # DATA-7: отправленный в МС заказ снимает из qty только
+            # unmatched-остаток — matched-часть уже в ms_qty (сам документ в
+            # МойСклад при локальном удалении никуда не девается).
+            _apply_remainder_to_incoming(db, ctx.org.id, items_at_delete, pushed_at_delete, -1)
     db.commit()
     analytics.invalidate(ctx.org.id)
     return {"ok": True}

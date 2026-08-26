@@ -83,6 +83,7 @@ from app.models import (
     SyncState,
     Warehouse,
     WarehouseStock,
+    encode_items_payload,
 )
 from app.ms_client import MoySkladClient, _env_int
 
@@ -1756,9 +1757,80 @@ def _migrate_renames(db, org_id: int, renames: dict[str, set[str]],
     же PK падала IntegrityError и валила весь синк (ревью 18.08).
     """
     from app.models import (OrderReceipt, ProductionAssign, ProductionOrder,
-                            SkuCategoryOverride, SkuDiscount, SkuHidden)
+                            SkuCategoryOverride, SkuDiscount, SkuHidden,
+                            encode_items_payload, parse_items_payload)
     db.flush()  # pending-переименования товаров должны быть видны SELECT'ам
     migrated, skipped = [], []
+
+    _RENAME_ITEMS_CAS_ATTEMPTS = 4
+
+    def _rename_order_items(order: "ProductionOrder", olds_set: set[str], new: str) -> None:
+        """CAS-перезапись items_json одного заказа при переименовании.
+
+        Раньше это была ORM-мутация order.items_json (обычное присваивание
+        атрибуту, сброшенное в БД позже, при flush/commit) — SQLAlchemy
+        сводит её к безусловному `UPDATE ... WHERE id=?`, без проверки
+        прежнего значения. Окно между чтением строки (выше или в предыдущей
+        итерации) и этой записью — реальное: T2 (ms_writeback.
+        _commit_push_once) в отдельной сессии может как раз в это время
+        писать маркер pushed_by_base в тот же items_json. Безусловный UPDATE
+        тогда затирал бы СВЕЖИЙ маркер значением, посчитанным по снимку ДО
+        push, — маркер терялся бы молча, без единого следа. CAS на items_json
+        (+ переснятие снимка и повтор при расхождении) гарантирует: rename
+        либо применяется к последнему снимку строки (в т.ч. увидит только
+        что записанный маркер и перенесёт его тоже), либо явно проигрывает
+        гонку и повторяет — но никогда не откатывает конкурентную запись.
+        """
+        for _ in range(_RENAME_ITEMS_CAS_ATTEMPTS):
+            current_json = db.execute(
+                select(ProductionOrder.items_json)
+                .where(ProductionOrder.id == order.id, ProductionOrder.org_id == org_id)
+            ).scalar()
+            if current_json is None:
+                return  # заказ удалён параллельно — переименовывать нечего
+            try:
+                items, pushed_by_base = parse_items_payload(current_json)
+            except ValueError:
+                return
+            changed = False
+            for it in items:
+                if it.get("base_name") in olds_set:
+                    it["base_name"] = new
+                    changed = True
+            # Маркер DATA-7 (pushed_by_base) ключован тем же base_name, что и
+            # items — без переноса он остался бы указывать на старое имя, и
+            # sent→received/удаление после переименования считали бы ВЕСЬ
+            # вклад позиции unmatched-остатком (снимали бы лишнее, дважды).
+            if pushed_by_base:
+                remapped: dict[str, float] = {}
+                for base, qty in pushed_by_base.items():
+                    key = new if base in olds_set else base
+                    remapped[key] = remapped.get(key, 0) + qty
+                    if base in olds_set:
+                        changed = True
+                pushed_by_base = remapped
+            if not changed:
+                return
+            result = db.execute(
+                update(ProductionOrder)
+                .where(ProductionOrder.id == order.id,
+                      ProductionOrder.org_id == org_id,
+                      ProductionOrder.items_json == current_json)
+                .values(items_json=encode_items_payload(items, pushed_by_base))
+                .execution_options(synchronize_session=False)
+            )
+            if result.rowcount:
+                # `order` (ORM-объект из select(ProductionOrder) выше в этой
+                # же функции) мог держать в identity map устаревший
+                # items_json — экспирим, чтобы следующее чтение атрибута
+                # внутри той же сессии не отдало снимок ДО этой записи.
+                db.expire(order, ["items_json"])
+                return
+            # items_json изменился между SELECT и UPDATE (конкурентный T2 или
+            # другая гонка) — перечитываем и повторяем на актуальном снимке.
+        raise RuntimeError(
+            "rename: items_json меняется быстрее, чем CAS успевает "
+            "перенести маркер DATA-7")
 
     # Однозначные пары old→new; затем группировка по new (N старых → 1 новое).
     by_new: dict[str, list[str]] = {}
@@ -1831,17 +1903,7 @@ def _migrate_renames(db, org_id: int, renames: dict[str, set[str]],
         orders = db.execute(select(ProductionOrder).where(
             ProductionOrder.org_id == org_id)).scalars().all()
         for order in orders:
-            try:
-                items = json.loads(order.items_json or "[]")
-            except ValueError:
-                continue
-            changed = False
-            for it in items:
-                if it.get("base_name") in olds_set:
-                    it["base_name"] = new
-                    changed = True
-            if changed:
-                order.items_json = json.dumps(items, ensure_ascii=False)
+            _rename_order_items(order, olds_set, new)
         # Приёмки (D-25) ключованы тем же base_name. Без переноса переименование
         # рвало сверку надвое: заказ показывал новое имя с «принято 0», а рядом
         # висела фантомная строка со старым именем и «заказано 0». Хуже того,
@@ -2131,8 +2193,11 @@ def _oborot_order_id(doc: dict, our_docs: dict[int, str]) -> int | None:
     return order_id
 
 
-def _backmatch_by_sync_id(org_id: int, docs: list[dict],
-                          our_docs: dict[int, str], stats: dict) -> None:
+async def _backmatch_by_sync_id(org_id: int, docs: list[dict],
+                                our_docs: dict[int, str], stats: dict,
+                                client: MoySkladClient,
+                                ext_to_pid: dict[str, int],
+                                base_by_pid: dict[int, str]) -> None:
     """Связывает документ МС с заказом «Оборота» по нашему ключу идемпотентности.
 
     Зачем это вообще нужно. Отправка заказа поставщику может закончиться
@@ -2159,6 +2224,33 @@ def _backmatch_by_sync_id(org_id: int, docs: list[dict],
     восстанавливает ОДИН из них — нашу собственную ссылку, которую мы потеряли
     по своей вине. Документ, у которого метка чужая или скопированная,
     tracked не станет: ссылка совпадёт, а маркер — нет.
+
+    Сколько РЕАЛЬНО уехало (DATA-7). Раньше перенос вклада считался по
+    `_order_bases(order)` — ПОЛНОМУ количеству локальных items, включая
+    позиции/размеры, у которых на момент push'а не было пары в ассортименте
+    МС. Это тот же класс ошибки, который DATA-7 уже закрыл для самого push
+    (`ms_writeback.push_order`): unmatched-остаток в документе не появляется,
+    а `_order_bases` списывал его из qty как будто появился — то есть
+    занижал/зануливал «едет к нам» и делал это тихо, ошибкой в СТОРОНУ
+    занижения, которую труднее заметить, чем переизбыток. Источник истины —
+    сами позиции документа (`ms_writeback.positions_pushed_by_base`,
+    сопоставленные по ext_id ассортимента, а не по имени), с той же
+    дочиткой хвоста через `_full_positions`, которой уже пользуется основной
+    цикл `_sync_incoming` ниже — лишнего сетевого вызова на документ с
+    ≤100 позициями (обычный случай) это не добавляет: у `docs` они уже
+    вложены expand'ом.
+
+    Маркер DATA-7 (`pushed_by_base` в items_json) раньше здесь не писался
+    вовсе: ссылка чинилась, а сайдкар — нет, и `order.pushed_by_base`
+    оставался `None` («неизвестно, гадать нельзя») даже после связывания.
+    Дальнейшие sent→received/удаление такого заказа не трогали remainder
+    совсем (см. api._apply_remainder_to_incoming) — unmatched-остаток
+    зависал в qty навсегда. Теперь маркер пишется В ТОЙ ЖЕ CAS-операции,
+    что и href, вторым условием на `items_json` (тот же приём, что у
+    `ms_writeback._commit_push_once`): чужой конкурентный rename между
+    чтением и записью не клобберится, а проигрывает CAS целиком — заказ
+    останется unknown до следующего прогона синка, что безопасно и лечится
+    само.
     """
     by_sync: dict[str, list[dict]] = {}
     for doc in docs:
@@ -2192,6 +2284,10 @@ def _backmatch_by_sync_id(org_id: int, docs: list[dict],
     # а не нашим. Это недоучёт нашей метки на один прогон, и ближайший синк
     # перечитает связь из базы. Обратный порядок давал двойной учёт «едет к
     # нам», а из двух неточностей выбирается та, что не завышает.
+    ext_id_to_base: dict[str, str] = {
+        ext: base_by_pid[pid] for ext, pid in ext_to_pid.items()
+        if base_by_pid.get(pid)
+    }
     staged: list[tuple[int, str]] = []
     try:
         rows = db.execute(
@@ -2213,9 +2309,31 @@ def _backmatch_by_sync_id(org_id: int, docs: list[dict],
             href = ((doc.get("meta") or {}).get("href")) or ""
             if not href:
                 continue
-            pushed_by_base = {
-                base: qty for base, qty in _order_bases(order).items() if qty > 0
-            }
+            # Снимок items_json РОВНО в момент наблюдения — тот же приём, что
+            # и у `observed_href`: CAS ниже обязан ловить конкурентный rename
+            # между этим чтением и записью, а не сравнивать «текущее» само с
+            # собой (см. ms_writeback._commit_push_once — тот же класс гонки).
+            observed_items_json = str(order.items_json or "")
+            # order.items — та же безопасная деградация на битом JSON, что и
+            # у ProductionOrder.pushed_by_base ([] вместо необработанного
+            # ValueError): строка со сломанным items_json не должна ронять
+            # весь батч back-match'а из-за одного заказа.
+            items = order.items
+            # Верхняя граница переноса (см. ms_writeback.positions_pushed_by_base) —
+            # ТОТ ЖЕ снимок items, что и observed_items_json выше.
+            order_totals = ms_writeback._order_base_totals(items)
+            # Источник истины про «сколько реально уехало» — сами позиции
+            # документа, а не локальные items заказа (см. докстринг функции).
+            positions = await _full_positions(client, "purchaseorder", doc, stats)
+            pushed_by_base = ms_writeback.positions_pushed_by_base(
+                positions, ext_id_to_base, order_totals)
+            if pushed_by_base is None:
+                # Fail-closed: хотя бы одна положительная позиция документа не
+                # сопоставилась ни с одним base текущего ассортимента, либо
+                # несёт дробное количество. Гадать нельзя — не связываем, не
+                # переносим вклад, не пишем маркер; заказ остаётся unknown до
+                # следующего прогона синка, который перечитает документ сам.
+                continue
             # ЗАХВАТ ПРАВА СВЯЗАТЬ — условным UPDATE, а не присваиванием.
             #
             # Ревью Codex, P1 (discussion_r3856604240). Раньше здесь стояла
@@ -2241,6 +2359,14 @@ def _backmatch_by_sync_id(org_id: int, docs: list[dict],
             # coalesce — ради строк, вставленных до появления колонки: у них
             # ms_doc_href может быть NULL, а `NULL = ''` в SQL не истинно, и
             # такие заказы молча выпали бы из-под связывания навсегда.
+            #
+            # Второй CAS — на items_json, тем же приёмом, что у
+            # `ms_writeback._commit_push_once`: маркер DATA-7 (pushed_by_base)
+            # пишется в ТОЙ ЖЕ строке того же UPDATE, что и href, и только
+            # поверх ТОГО снимка items, против которого он посчитан. Без него
+            # конкурентный `_migrate_renames` между чтением и этой записью
+            # клобберился бы нашим старым снимком — маркер остался бы под
+            # именами, которых для заказа уже нет.
             claimed = db.execute(
                 update(ProductionOrder)
                 .where(
@@ -2248,10 +2374,12 @@ def _backmatch_by_sync_id(org_id: int, docs: list[dict],
                     ProductionOrder.org_id == org_id,
                     ProductionOrder.ms_sync_id == order.ms_sync_id,
                     func.coalesce(ProductionOrder.ms_doc_href, "") == observed_href,
+                    ProductionOrder.items_json == observed_items_json,
                 )
                 .values(ms_doc_href=href,
                         ms_doc_name=str(doc.get("name") or ""),
-                        ms_lookup_mode=ms_writeback.LOOKUP_SYNC)
+                        ms_lookup_mode=ms_writeback.LOOKUP_SYNC,
+                        items_json=encode_items_payload(items, pushed_by_base))
                 # Статус берётся из ТОЙ ЖЕ операции, что и запись ссылки, а не
                 # из ORM-объекта, прочитанного до окна: за это время заказ мог
                 # стать принятым, и «снимать ли локальный вклад» обязано
@@ -2261,8 +2389,11 @@ def _backmatch_by_sync_id(org_id: int, docs: list[dict],
                 .execution_options(synchronize_session=False)
             ).fetchall()
             if not claimed:
-                # Проиграли: кто-то уже связал этот заказ и уже перенёс вклад.
-                # Это нормальный исход, а не ошибка — повторять за ним нечего.
+                # Проиграли: либо кто-то уже связал этот заказ и перенёс
+                # вклад (href разошёлся), либо items_json успел смениться
+                # конкурентным rename'ом. В обоих случаях — не гадаем и не
+                # клобберим: заказ останется unknown до следующего прогона
+                # синка, который перечитает актуальный снимок сам.
                 continue
             # Тот же T2, что и при отправке: ссылка и перенос вклада — вместе,
             # одной транзакцией. Прибавка к ms_qty живёт до конца этого же
@@ -2290,20 +2421,6 @@ def _backmatch_by_sync_id(org_id: int, docs: list[dict],
         our_docs[order_id] = href
     if staged:
         stats["incoming_backmatched"] = len(staged)
-
-
-def _order_bases(order) -> dict[str, int]:
-    """{base_name: количество} по позициям заказа — как их считает отправка."""
-    out: dict[str, int] = {}
-    for item in order.items:
-        base = str(item.get("base_name") or "")
-        if not base:
-            continue
-        sizes = item.get("sizes") or {}
-        qty = sum(int(q or 0) for q in sizes.values()) or int(item.get("qty") or 0)
-        if qty > 0:
-            out[base] = out.get(base, 0) + qty
-    return out
 
 
 async def _sync_incoming(org_id: int, client: MoySkladClient,
@@ -2378,7 +2495,8 @@ async def _sync_incoming(org_id: int, client: MoySkladClient,
     # Отправки, закончившиеся честным unknown: документ есть, ссылки у нас
     # нет. Связываем до основного цикла, чтобы такой документ уже в ЭТОМ
     # синке считался нашим, а не ещё сутки числился чужим.
-    _backmatch_by_sync_id(org_id, docs, our_docs, stats)
+    await _backmatch_by_sync_id(org_id, docs, our_docs, stats, client,
+                                ext_to_pid, base_by_pid)
 
     incoming: dict[str, float] = {}
     incoming_tracked: dict[str, float] = {}

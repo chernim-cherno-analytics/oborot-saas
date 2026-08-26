@@ -349,9 +349,23 @@ def entity_doc_positions(entity: str, doc_id: str, request: Request,
     """Позиции одного документа постранично (аудит 18.08: дочитывание
     хвоста документов >100 позиций)."""
     _auth(request)
-    pool = list(DOCS.get(entity, [])) if entity in DOCS else []
     if entity == "purchaseorder":
-        pool = PURCHASE_ORDERS
+        for doc in PURCHASE_ORDERS:
+            if doc.get("id") == doc_id:
+                return _page(doc["positions"]["rows"], limit, offset)
+        # CREATED_PURCHASE_ORDERS хранит "positions" как СЫРОЙ список из тела
+        # POST (см. entity_purchaseorder_create), а не {"rows": [...]} — той
+        # же формы, которую отдаёт listing-эндпоинт /entity/purchaseorder
+        # (см. entity_purchaseorder ниже). Нужно back-match'у и recovered-пути
+        # push_order: оба дочитывают позиции СОЗДАННОГО нами документа через
+        # этот маршрут, а не только через seed-мир.
+        for doc in CREATED_PURCHASE_ORDERS:
+            if doc.get("id") == doc_id:
+                rows = [{**p, "shipped": p.get("shipped", 0.0)}
+                       for p in (doc.get("positions") or [])]
+                return _page(rows, limit, offset)
+        raise HTTPException(404, "document not found")
+    pool = list(DOCS.get(entity, [])) if entity in DOCS else []
     for doc in pool:
         if doc.get("id") == doc_id:
             return _page(doc["positions"]["rows"], limit, offset)

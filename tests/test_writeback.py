@@ -447,18 +447,223 @@ def run_scenario() -> int:
           f"status={r.status_code} body={r.text[:150]}")
     check("документ при 422 не создан", len(mock_ms.CREATED_PURCHASE_ORDERS) == 3)
 
-    print("== Статус received ==")
-    om_recv0 = ordered_map()
+    print("== Статус received: снятие unmatched-остатка (DATA-7 Package A) ==")
+    # order2 («Частичный заказ»): «Худи «Скетч»» сопоставлен целиком — его
+    # вклад уже переехал из qty в ms_qty на push, receive его трогать не
+    # должен. «Футболка «Манифест» (XL)» НЕ сопоставлена вовсе (pushed_by_base
+    # для неё пуст) — весь вклад (3) остался в qty, и receive обязан снять
+    # РОВНО его: не 0 (иначе остаток навсегда зависает в «едет к нам») и не
+    # qty целиком (задвоило бы уже перенесённую часть — здесь её и нет).
+    tee_before_recv = ordered_map().get("Футболка «Манифест»", (0, 0))
+    hood_before_recv = ordered_map().get("Худи «Скетч»", (0, 0))
     r = client.post(f"/api/orders/{order2}/status", json={"status": "received"})
-    check("заказ принят на склад", r.status_code == 200)
-    check("received пушенного заказа не двигает qty/ms_qty "
-          "(принятое снимет приёмка в МС через синк)",
-          ordered_map() == om_recv0)
+    check("заказ принят на склад", r.status_code == 200, f"status={r.status_code}")
+    tee_after_recv = ordered_map().get("Футболка «Манифест»", (0, 0))
+    check("DATA-7: receive снял РОВНО несопоставленный остаток (3)",
+          tee_after_recv[0] == tee_before_recv[0] - 3
+          and tee_after_recv[1] == tee_before_recv[1],
+          f"{tee_before_recv} -> {tee_after_recv} (ждали qty-3, ms_qty без изменений)")
+    check("…сопоставленную позицию того же заказа (Худи «Скетч») receive не тронул "
+          "(её вклад давно переехал в ms_qty при push)",
+          ordered_map().get("Худи «Скетч»", (0, 0)) == hood_before_recv,
+          f"{hood_before_recv} -> {ordered_map().get('Худи «Скетч»')}")
+
+    print("== Повторный received — идемпотентность ==")
+    om_recv_repeat0 = ordered_map()
+    r = client.post(f"/api/orders/{order2}/status", json={"status": "received"})
+    check("повторный received того же заказа отвечает unchanged",
+          r.status_code == 200 and r.json().get("unchanged") is True,
+          f"status={r.status_code} body={r.text[:150]}")
+    check("…и НЕ снимает остаток второй раз",
+          ordered_map() == om_recv_repeat0, "ordered_map изменился на повторе")
+
+    print("== Статус received: частичный размерный ряд (order2b, DATA-7) ==")
+    # order2b («Частичные размеры»): «Худи «Штрих»» S+M=3 шт сопоставлены и
+    # уже в ms_qty, XL=4 шт остались в qty как unmatched. receive обязан
+    # снять РОВНО эти 4, а не все 7 (задвоило бы matched-часть) и не 0.
+    strih_before_recv = ordered_map().get("Худи «Штрих»", (0, 0))
+    r = client.post(f"/api/orders/{order2b}/status", json={"status": "received"})
+    check("частично сопоставленный заказ принят на склад", r.status_code == 200)
+    strih_after_recv = ordered_map().get("Худи «Штрих»", (0, 0))
+    check("DATA-7: receive снял РОВНО unmatched-остаток (4), не все 7 и не 0",
+          strih_after_recv[0] == strih_before_recv[0] - 4
+          and strih_after_recv[1] == strih_before_recv[1],
+          f"{strih_before_recv} -> {strih_after_recv} (ждали qty-4, ms_qty без изменений)")
+
     r = client.post(f"/api/orders/{order2}/push-to-ms")
     check("push received-заказа → 422", r.status_code == 422,
           f"status={r.status_code} body={r.text[:120]}")
 
+    print("== Дубль имени: агрегированный remainder, не построчный (DATA-7) ==")
+    # Две строки заказа с ОДНИМ base_name (D-25 «дубль имени»): первая (S=2)
+    # сопоставляется, вторая (XL=2) — нет. push агрегирует pushed_by_base по
+    # base_name (см. ms_writeback.push_order: `pushed_by_base[base] += qty`),
+    # а не по строке — remainder обязан считаться так же: СНАЧАЛА суммарный
+    # заказанный qty по base_name (2+2=4), ПОТОМ вычесть агрегированный
+    # pushed (2) ОДИН раз. Старый построчный код вычитал agg-pushed (2) из
+    # КАЖДОЙ строки (2-2=0 и 2-2=0) и терял остаток (2 шт) насовсем.
+    r = client.post("/api/orders", json={
+        "name": "Дубль имени — remainder (DATA-7)", "eta_date": None, "items": [
+            {"base_name": "Худи «Скетч»", "qty": 2, "sizes": {"S": 2}, "cost": 3900},
+            {"base_name": "Худи «Скетч»", "qty": 2, "sizes": {"XL": 2}, "cost": 3900},
+        ],
+    })
+    order_dup = r.json()["id"]
+    check("заказ-дубль создан", r.status_code == 200 and order_dup, r.text[:150])
+    dup0 = ordered_map().get("Худи «Скетч»", (0, 0))
+    r = client.post(f"/api/orders/{order_dup}/status", json={"status": "sent"})
+    check("заказ-дубль переведён в sent", r.status_code == 200)
+    dup_sent = ordered_map().get("Худи «Скетч»", (0, 0))
+    check("sent прибавил ПОЛНОЕ количество обеих строк (2+2=4)",
+          dup_sent[0] == dup0[0] + 4 and dup_sent[1] == dup0[1],
+          f"{dup0} -> {dup_sent}")
+    r = client.post(f"/api/orders/{order_dup}/push-to-ms")
+    d = r.json()
+    check("push заказа-дубля → 200", r.status_code == 200 and d.get("ok"),
+          f"status={r.status_code} body={r.text[:200]}")
+    check("несопоставленный размер второй строки (XL) в unmatched",
+          d.get("unmatched") == ["Худи «Скетч» (XL)"], f"unmatched={d.get('unmatched')}")
+    dup_pushed = ordered_map().get("Худи «Скетч»", (0, 0))
+    check("push перенёс в ms_qty только сопоставленную часть первой строки (2)",
+          dup_pushed[0] == dup_sent[0] - 2 and dup_pushed[1] == dup_sent[1] + 2,
+          f"{dup_sent} -> {dup_pushed}")
+    dup_before_recv = ordered_map().get("Худи «Скетч»", (0, 0))
+    r = client.post(f"/api/orders/{order_dup}/status", json={"status": "received"})
+    check("заказ-дубль принят на склад", r.status_code == 200)
+    dup_after_recv = ordered_map().get("Худи «Скетч»", (0, 0))
+    check("DATA-7: агрегированный remainder = 4 (заказано) − 2 (pushed) = 2, "
+          "не 0 (как дал бы построчный вычет)",
+          dup_after_recv[0] == dup_before_recv[0] - 2
+          and dup_after_recv[1] == dup_before_recv[1],
+          f"{dup_before_recv} -> {dup_after_recv} (ждали qty-2, ms_qty без изменений)")
+
+    print("== Удаление после частичного push снимает ровно remainder (DATA-7) ==")
+    r = client.post("/api/orders", json={
+        "name": "Удаление после частичного push (DATA-7)", "eta_date": None, "items": [
+            {"base_name": "Худи «Скетч»", "qty": 5, "sizes": {"M": 2, "XL": 3}, "cost": 3900},
+        ],
+    })
+    order_del = r.json()["id"]
+    check("заказ на удаление создан", r.status_code == 200 and order_del, r.text[:150])
+    r = client.post(f"/api/orders/{order_del}/status", json={"status": "sent"})
+    check("заказ на удаление переведён в sent", r.status_code == 200)
+    r = client.post(f"/api/orders/{order_del}/push-to-ms")
+    d = r.json()
+    check("push заказа на удаление → 200", r.status_code == 200 and d.get("ok"),
+          f"status={r.status_code} body={r.text[:200]}")
+    check("несопоставленный XL в unmatched",
+          d.get("unmatched") == ["Худи «Скетч» (XL)"], f"unmatched={d.get('unmatched')}")
+    del_before = ordered_map().get("Худи «Скетч»", (0, 0))
+    r = client.delete(f"/api/orders/{order_del}")
+    check("удаление отправленного частично-сопоставленного заказа → 200",
+          r.status_code == 200, f"status={r.status_code} body={r.text[:150]}")
+    del_after = ordered_map().get("Худи «Скетч»", (0, 0))
+    check("DATA-7: удаление сняло РОВНО unmatched-остаток (3), не все 5 и не 0",
+          del_after[0] == del_before[0] - 3 and del_after[1] == del_before[1],
+          f"{del_before} -> {del_after} (ждали qty-3, ms_qty без изменений)")
+
+    print("== Legacy без маркера (до DATA-7): no-guess, remainder не трогаем ==")
+    # Заказ отправлялся до появления маркера pushed_by_base — items_json
+    # остаётся ГОЛЫМ списком (в проде такой ряд возник бы до этой фичи; здесь
+    # он смоделирован прямой записью ms_doc_href мимо push, items_json при
+    # этом никто не трогал и marker в нём никогда не было). Какая часть
+    # реально уехала — неизвестно, и receive НЕ ИМЕЕТ ПРАВА гадать: qty/ms_qty
+    # обязаны остаться как есть, а не «предположить всё» или «предположить 0».
+    r = client.post("/api/orders", json={
+        "name": "Legacy без маркера (DATA-7 no-guess)", "eta_date": None, "items": [
+            {"base_name": "Худи «Скетч»", "qty": 4, "sizes": {"S": 4}, "cost": 3900},
+        ],
+    })
+    order_legacy = r.json()["id"]
+    check("legacy-заказ создан", r.status_code == 200 and order_legacy, r.text[:150])
+    r = client.post(f"/api/orders/{order_legacy}/status", json={"status": "sent"})
+    check("legacy-заказ переведён в sent", r.status_code == 200)
+    con = sqlite3.connect(DB_PATH)
+    try:
+        con.execute(
+            "UPDATE production_orders SET ms_doc_href=?, ms_lookup_mode='sync' "
+            "WHERE id=?",
+            ("http://127.0.0.1:9800/entity/purchaseorder/legacy-po-no-marker",
+             order_legacy))
+        con.commit()
+    finally:
+        con.close()
+    legacy_before_recv = ordered_map().get("Худи «Скетч»", (0, 0))
+    r = client.post(f"/api/orders/{order_legacy}/status", json={"status": "received"})
+    check("legacy-заказ (без маркера) принят на склад", r.status_code == 200)
+    legacy_after_recv = ordered_map().get("Худи «Скетч»", (0, 0))
+    check("DATA-7 no-guess: legacy без маркера — receive НЕ трогает qty/ms_qty",
+          legacy_after_recv == legacy_before_recv,
+          f"{legacy_before_recv} -> {legacy_after_recv}")
+
+    print("== Переименование переносит маркер pushed_by_base (DATA-7 rename) ==")
+    # После push «Худи «Скетч»» несёт маркер {"Худи «Скетч»": 2} (см. дубль
+    # выше — но берём отдельный свежий заказ, чтобы не путать с уже принятым
+    # order_dup). Переименование товара обязано перенести И base_name внутри
+    # items, И ключ в маркере — иначе remainder на будущем receive считался
+    # бы по имени, которого в заказе больше нет, и вся сопоставленная часть
+    # ошибочно превратилась бы в «unmatched» (задвоение).
+    r = client.post("/api/orders", json={
+        "name": "На переименование (DATA-7 rename)", "eta_date": None, "items": [
+            {"base_name": "Худи «Скетч»", "qty": 3, "sizes": {"S": 1, "M": 1, "XL": 1},
+             "cost": 3900},
+        ],
+    })
+    order_ren = r.json()["id"]
+    check("заказ на переименование создан", r.status_code == 200 and order_ren,
+          r.text[:150])
+    r = client.post(f"/api/orders/{order_ren}/status", json={"status": "sent"})
+    check("заказ на переименование переведён в sent", r.status_code == 200)
+    r = client.post(f"/api/orders/{order_ren}/push-to-ms")
+    d = r.json()
+    check("push заказа на переименование → 200", r.status_code == 200 and d.get("ok"),
+          f"status={r.status_code} body={r.text[:200]}")
+    check("несопоставленный XL в unmatched (перед переименованием)",
+          d.get("unmatched") == ["Худи «Скетч» (XL)"], f"unmatched={d.get('unmatched')}")
+
+    from app import ms_sync as _ms
+    from app.db import SessionLocal as _SL
+    con = sqlite3.connect(DB_PATH)
+    try:
+        con.execute(
+            "UPDATE products SET base_name=? WHERE org_id=1 AND base_name=?",
+            ("Худи «Скетч» v2", "Худи «Скетч»"))
+        con.commit()
+    finally:
+        con.close()
+    dbx = _SL()
+    try:
+        _ms._migrate_renames(dbx, 1, {"Худи «Скетч»": {"Худи «Скетч» v2"}}, {})
+        dbx.commit()
+    finally:
+        dbx.close()
+    con = sqlite3.connect(DB_PATH)
+    try:
+        items_json_ren = con.execute(
+            "SELECT items_json FROM production_orders WHERE id=?",
+            (order_ren,)).fetchone()[0]
+    finally:
+        con.close()
+    from app.models import parse_items_payload as _parse_items_payload
+    items_ren, pushed_ren = _parse_items_payload(items_json_ren)
+    check("rename перенёс base_name внутри items заказа",
+          all(it.get("base_name") == "Худи «Скетч» v2" for it in items_ren),
+          f"items={items_ren}")
+    check("rename перенёс КЛЮЧ маркера pushed_by_base на новое имя, значение (2) сохранено",
+          pushed_ren == {"Худи «Скетч» v2": 2},
+          f"pushed_by_base={pushed_ren}")
+
+    ren_before_recv = ordered_map().get("Худи «Скетч» v2", (0, 0))
+    r = client.post(f"/api/orders/{order_ren}/status", json={"status": "received"})
+    check("переименованный заказ принят на склад", r.status_code == 200)
+    ren_after_recv = ordered_map().get("Худи «Скетч» v2", (0, 0))
+    check("DATA-7: remainder под НОВЫМ именем посчитан верно (3 заказано − 2 pushed = 1)",
+          ren_after_recv[0] == ren_before_recv[0] - 1
+          and ren_after_recv[1] == ren_before_recv[1],
+          f"{ren_before_recv} -> {ren_after_recv} (ждали qty-1, ms_qty без изменений)")
+
     print("== Демо-режим и изоляция ==")
+    docs_before_demo = len(mock_ms.CREATED_PURCHASE_ORDERS)
     demo = httpx.Client(headers={"X-Oborot-CSRF": "1"}, base_url=base, timeout=120.0)
     r = demo.post("/register", data={
         "name": "Демо", "email": "demo@wb.io",
@@ -475,7 +680,9 @@ def run_scenario() -> int:
     check("демо-организация: 409 «доступно после подключения МойСклад»",
           r.status_code == 409 and "подключения МойСклад" in r.json().get("detail", ""),
           f"status={r.status_code} body={r.text[:160]}")
-    check("демо-push не создал документов", len(mock_ms.CREATED_PURCHASE_ORDERS) == 3)
+    check("демо-push не создал документов",
+          len(mock_ms.CREATED_PURCHASE_ORDERS) == docs_before_demo,
+          f"было={docs_before_demo} стало={len(mock_ms.CREATED_PURCHASE_ORDERS)}")
     r = demo.post(f"/api/orders/{order_id}/push-to-ms")
     check("чужой заказ → 404 (изоляция тенантов)", r.status_code == 404,
           f"status={r.status_code}")

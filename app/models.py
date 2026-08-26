@@ -604,6 +604,40 @@ class NotifySettings(Base):
     digest_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
 
+def parse_items_payload(items_json: str) -> tuple[list[dict], dict[str, float] | None]:
+    """Разбирает production_orders.items_json: (items, pushed_by_base).
+
+    Формат аддитивный, без новой колонки. Legacy-строки (до DATA-7) хранят
+    голый список позиций — для них pushed_by_base это None: сколько уехало в
+    МойСклад, не записано нигде, и None не значит «ничего», а значит
+    «неизвестно» (см. ProductionOrder.pushed_by_base). Новый формат —
+    словарь {"items": [...], "pushed_by_base": {base_name: qty}}; его пишет
+    ms_writeback._commit_push_once ОДНИМ UPDATE вместе со ссылкой на документ.
+
+    ValueError (битый JSON) намеренно не глушится здесь — вызывающие решают
+    сами, чем заменить нечитаемую строку (см. использования в ms_sync).
+    """
+    parsed = json.loads(items_json or "[]")
+    if isinstance(parsed, dict):
+        items = parsed.get("items")
+        marker = parsed.get("pushed_by_base")
+        return (items if isinstance(items, list) else []), (marker or {})
+    return (parsed if isinstance(parsed, list) else []), None
+
+
+def encode_items_payload(items: list[dict], pushed_by_base: dict[str, float] | None) -> str:
+    """Обратная операция к parse_items_payload.
+
+    pushed_by_base=None сохраняет legacy-форму (голый список) — заказ, который
+    ещё не отправлялся, не обязан обрастать сайдкаром раньше времени.
+    """
+    if pushed_by_base is None:
+        return json.dumps(items, ensure_ascii=False)
+    return json.dumps(
+        {"items": items, "pushed_by_base": dict(pushed_by_base)}, ensure_ascii=False
+    )
+
+
 class ProductionOrder(Base):
     __tablename__ = "production_orders"
 
@@ -678,9 +712,25 @@ class ProductionOrder(Base):
     @property
     def items(self) -> list[dict]:
         try:
-            return json.loads(self.items_json or "[]")
+            items, _marker = parse_items_payload(self.items_json)
+            return items
         except ValueError:
             return []
+
+    @property
+    def pushed_by_base(self) -> dict[str, float] | None:
+        """Маркер DATA-7: сколько из каждого base_name реально уехало в МойСклад.
+
+        None — заказ ещё не отправлялся или отправлялся до появления маркера
+        (items_json хранится голым списком): какая часть попала в документ,
+        неизвестно, и гадать нельзя. {} возможен только теоретически (push
+        всегда сопоставляет хотя бы одну позицию).
+        """
+        try:
+            _items, marker = parse_items_payload(self.items_json)
+            return marker
+        except ValueError:
+            return None
 
 
 class OrderReceipt(Base):

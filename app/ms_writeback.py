@@ -93,7 +93,14 @@ from sqlalchemy.orm import Session
 
 from app.crypto import decrypt_token
 from app.db import engine, run_migration_step
-from app.models import Connection, OrderedQty, Product, ProductionOrder
+from app.models import (
+    Connection,
+    OrderedQty,
+    Product,
+    ProductionOrder,
+    encode_items_payload,
+    parse_items_payload,
+)
 from app.ms_client import (
     MoySkladClient,
     SyncIdLookupUnavailable,
@@ -538,8 +545,90 @@ def _position_label(base_name: str, size: str) -> str:
     return f"{base_name} ({size})" if size else base_name
 
 
+def _order_base_totals(items: list[dict]) -> dict[str, int]:
+    """Локальный total qty по base_name из ТОЧНОГО снимка items заказа.
+
+    Тот же способ счёта, что у `app.api._apply_remainder_to_incoming`: сумма
+    по base_name из ВСЕХ строк заказа (сопоставленных и нет), а не то, что
+    сопоставилось при матчинге. Общий для push_order (recovered-путь) и
+    `ms_sync._backmatch_by_sync_id` — верхняя граница, которую перенос вклада
+    «едет к нам» не имеет права превышать, даже если сам документ содержит
+    больше (см. `positions_pushed_by_base`).
+    """
+    totals: dict[str, int] = {}
+    for item in items:
+        base, qty = item.get("base_name"), int(item.get("qty") or 0)
+        if not base or qty <= 0:
+            continue
+        totals[base] = totals.get(base, 0) + qty
+    return totals
+
+
+def positions_pushed_by_base(positions: list[dict],
+                             ext_id_to_base: dict[str, str],
+                             order_totals: dict[str, int]) -> dict[str, float] | None:
+    """Фактические позиции ДОКУМЕНТА МойСклад → {base_name: qty}, обрезано заказом.
+
+    Источник истины для recovered-документа (см. push_order) и для
+    back-match'а (см. ms_sync._backmatch_by_sync_id): что РЕАЛЬНО лежит в
+    документе, а не что СЕЙЧАС сопоставляют локальные items с ассортиментом.
+    Сопоставление между попытками могло измениться (переименование, замена
+    SKU, удалённый вариант) — локальный матч в момент recovery доказывает
+    только «что мы сопоставили бы, если бы создавали заново», а не то, что
+    реально уехало в уже существующий документ.
+
+    `ext_id_to_base` — обратная карта Product.ext_id → base_name, построенная
+    вызывающим по ТЕКУЩЕМУ ассортименту организации (стабильный признак:
+    ext_id живёт в самой позиции документа, а не в её порядке или тексте).
+
+    `order_totals` (см. `_order_base_totals`) — ВЕРХНЯЯ ГРАНИЦА переноса на
+    base: документ мог получить лишнее относительно ЭТОГО заказа (посторонняя
+    строка того же товара, ручная правка в МС, дубль позиции) — списывать
+    больше, чем сам заказ когда-либо заявлял по base, нельзя, иначе перенос
+    вклада (`_move_incoming_to_ms`) съедает общий/чужой qty того же base_name
+    (Codex corrective, issuecomment-5428103206). База документа, которой нет
+    в `order_totals` вовсе — не наш вклад, и исключается целиком, а не
+    обрезается до нуля молча где-то ниже по цепочке.
+
+    Возвращает None, если хотя бы одна ПОЛОЖИТЕЛЬНАЯ позиция документа не
+    сопоставилась ни с одним base текущего ассортимента (ext-id неизвестен),
+    либо её количество дробное. Оба случая — fail-closed: подтвердить, что
+    РЕАЛЬНО относится к этому заказу, нельзя, а угадывать (округлять,
+    пропускать) запрещено — тем же контрактом, что и у `int(round(...))`,
+    который здесь раньше стоял и тихо терял/добавлял единицы. Вызывающий
+    обязан считать это неизвестным исходом, а не частичным успехом (см.
+    push_order.recovered и ms_sync._backmatch_by_sync_id).
+    """
+    raw: dict[str, float] = {}
+    for pos in positions:
+        try:
+            qty = float(pos.get("quantity") or 0)
+        except (TypeError, ValueError):
+            return None
+        if qty <= 0:
+            continue
+        if qty != int(qty):
+            # Локальная модель заказа — целые единицы (_order_base_totals);
+            # дробную позицию документа обрезать/перенести без округления
+            # нельзя — fail-closed, не int(round(...)).
+            return None
+        href = (((pos.get("assortment") or {}).get("meta")) or {}).get("href") or ""
+        ext = _href_uuid(href)
+        base = ext_id_to_base.get(ext)
+        if not base:
+            return None
+        raw[base] = raw.get(base, 0.0) + qty
+    out: dict[str, float] = {}
+    for base, qty in raw.items():
+        cap = order_totals.get(base, 0)
+        if cap <= 0:
+            continue
+        out[base] = min(qty, float(cap))
+    return out
+
+
 def _move_incoming_to_ms(db: Session, org_id: int, order: ProductionOrder,
-                         pushed_by_base: dict[str, int], was_sent: bool) -> None:
+                         pushed_by_base: dict[str, float], was_sent: bool) -> None:
     """Перенос вклада заказа в «едет к нам» с локального qty на ms_qty.
 
     С момента отправки источник истины по этому заказу — документ в МойСклад
@@ -940,49 +1029,155 @@ async def find_own_document(client, keys: PushKeys, marker: str, *,
 
 # ── T2: ссылка и перенос вклада — одной транзакцией ──────────────────────────
 
+# Сколько раз T2 переснимает items_json при гонке с переименованием, прежде
+# чем сдаться и отдать исключение обычному пути повтора (commit_push сам
+# перезапускает T2 целиком). Ренейм — редкое фоновое событие синка, не
+# состязание в горячем цикле, поэтому пары попыток с запасом достаточно —
+# граница нужна только чтобы не крутиться бесконечно при патологической
+# гонке.
+_T2_ITEMS_CAS_ATTEMPTS = 4
+
+
+def _remap_pushed_by_base(old_items: list[dict], new_items: list[dict],
+                          pushed_by_base: dict[str, float]) -> dict[str, float]:
+    """Переносит ключи pushed_by_base через конкурентное переименование.
+
+    Между чтением items (для сопоставления с ассортиментом МС) и записью T2
+    конкурентный ms_sync._migrate_renames мог переписать items_json —
+    ренейм меняет `it["base_name"]` НА МЕСТЕ, не трогая состав и порядок
+    строк, поэтому старое и новое имя одной и той же позиции находятся по
+    индексу. Если длина/состав разошлись сильнее простого rename (что не
+    должно происходить конкурентно с этим же T2 — заказ ещё не помечен
+    отправленным, ms_sync его строки не трогает), маркер безопаснее оставить
+    как есть, чем гадать: несовпавшие ключи просто не найдут пары в новых
+    items и останутся в remainder нетронутыми в ту же сторону, что и
+    отсутствующий маркер (см. app.api._apply_remainder_to_incoming).
+    """
+    if len(old_items) != len(new_items):
+        return pushed_by_base
+    mapping: dict[str, str] = {}
+    for old_it, new_it in zip(old_items, new_items):
+        old_b, new_b = old_it.get("base_name"), new_it.get("base_name")
+        if old_b and new_b and old_b != new_b:
+            mapping[old_b] = new_b
+    if not mapping:
+        return pushed_by_base
+    remapped: dict[str, int] = {}
+    for base, qty in pushed_by_base.items():
+        key = mapping.get(base, base)
+        remapped[key] = remapped.get(key, 0) + qty
+    return remapped
+
+
 def _commit_push_once(db: Session, org_id: int, order: ProductionOrder,
                       href: str, name: str,
-                      pushed_by_base: dict[str, int],
-                      pending_href: str) -> bool | None:
+                      pushed_by_base: dict[str, float],
+                      pending_href: str,
+                      matched_items_json: str) -> bool | None:
     """Одна попытка T2. True — записано, None — лок уже не наш, иначе исключение."""
     db.rollback()
-    # RETURNING отдаёт статус ровно той строки, которую мы сейчас изменили, и
-    # ровно в момент изменения: решение «снимать ли локальный вклад заказа»
-    # обязано опираться на состояние внутри этой транзакции, а не на
-    # ORM-объект, прочитанный до сетевого окна.
-    saved = db.execute(
-        sa_update(ProductionOrder)
-        .where(
-            ProductionOrder.id == order.id,
-            ProductionOrder.org_id == org_id,
-            # CAS: пишем ссылку только поверх СВОЕЙ пометки «идёт отправка» —
-            # ровно того токена, который записал НАШ T1.
-            #
-            # Здесь стоял `LIKE pending:%`, и комментарий обещал «своей», а SQL
-            # обеспечивал «любой». Разница не косметическая: пометка живёт TTL,
-            # и по его истечении её законно перехватывает соседняя попытка.
-            # Попытка, вернувшаяся из сети позже своего TTL, проходила этот CAS
-            # поверх ЧУЖОЙ пометки и записывала свой href — то есть привязывала
-            # заказ к своему документу и снимала локальный вклад, пока законный
-            # владелец ещё был в сети. Равенство делает владение проверяемым
-            # (ревью Codex, раунд 3; воспроизведено на exact HEAD d7792fe0).
-            ProductionOrder.ms_doc_href == pending_href,
-        )
-        .values(ms_doc_href=href, ms_doc_name=name, ms_lookup_mode=LOOKUP_SYNC)
-        .returning(ProductionOrder.status)
-        .execution_options(synchronize_session=False)
-    ).fetchall()
-    if not saved:
+    # `matched_items_json` — снимок items_json РОВНО в момент матчинга (см.
+    # push_order), а не текущее состояние строки. pushed_by_base посчитан
+    # именно против этого снимка, и CAS обязан ловить ЛЮБОЙ rename между
+    # матчингом и этой записью — включая тот, что успел закоммититься ЗАДОЛГО
+    # до входа сюда, за время сетевого окна (rename — фоновая операция синка,
+    # а не гонка в доли миллисекунды: типичный случай — именно этот). Более
+    # ранняя версия читала `order.items_json` заново прямо здесь, СРАЗУ после
+    # `db.rollback()`, которое экспирит ORM-объект, — а если rename уже
+    # закоммитился к этому моменту (обычное дело после многосекундного
+    # сетевого ожидания), такое чтение как раз и ВИДЕЛО его: локальный CAS
+    # сверял «текущее» само с собой, находил их равными и писал
+    # pushed_by_base под СТАРЫМИ ключами поверх УЖЕ переименованных items —
+    # маркер и items расходились молча (Codex corrective,
+    # issuecomment-5427535755; воспроизведено гонкой в тесте «29»
+    # test_writeback_idempotency.py). Ремап должен сравнивать с тем, ПРОТИВ
+    # ЧЕГО реально считали pushed_by_base, а не с тем, что случайно лежит в
+    # строке в момент вызова.
+    items_json = matched_items_json
+    items, _matched_marker = parse_items_payload(items_json)
+    for _ in range(_T2_ITEMS_CAS_ATTEMPTS):
+        # RETURNING отдаёт статус ровно той строки, которую мы сейчас изменили,
+        # и ровно в момент изменения: решение «снимать ли локальный вклад
+        # заказа» обязано опираться на состояние внутри этой транзакции, а не
+        # на ORM-объект, прочитанный до сетевого окна.
+        saved = db.execute(
+            sa_update(ProductionOrder)
+            .where(
+                ProductionOrder.id == order.id,
+                ProductionOrder.org_id == org_id,
+                # CAS: пишем ссылку только поверх СВОЕЙ пометки «идёт отправка» —
+                # ровно того токена, который записал НАШ T1.
+                #
+                # Здесь стоял `LIKE pending:%`, и комментарий обещал «своей», а SQL
+                # обеспечивал «любой». Разница не косметическая: пометка живёт TTL,
+                # и по его истечении её законно перехватывает соседняя попытка.
+                # Попытка, вернувшаяся из сети позже своего TTL, проходила этот CAS
+                # поверх ЧУЖОЙ пометки и записывала свой href — то есть привязывала
+                # заказ к своему документу и снимала локальный вклад, пока законный
+                # владелец ещё был в сети. Равенство делает владение проверяемым
+                # (ревью Codex, раунд 3; воспроизведено на exact HEAD d7792fe0).
+                ProductionOrder.ms_doc_href == pending_href,
+                # Второй CAS — на items_json: пишем маркер только поверх ТОГО
+                # снимка позиций, по которому pushed_by_base посчитан. Без
+                # него T2 клобберил бы конкурентную запись переименования
+                # (ms_sync._migrate_renames переписывает items_json отдельной
+                # транзакцией) своим старым снимком — маркер остался бы под
+                # именами, которых для этого заказа уже нет, и remainder на
+                # sent→received/удалении считался бы по позициям, которых
+                # больше не существует (Codex corrective, DATA-7 PR #25,
+                # issuecomment-5427535755).
+                ProductionOrder.items_json == items_json,
+            )
+            .values(
+                ms_doc_href=href, ms_doc_name=name, ms_lookup_mode=LOOKUP_SYNC,
+                # Маркер DATA-7 (см. models.encode_items_payload) уходит в той же
+                # строке того же UPDATE, что и href: sent→received и удаление
+                # обязаны увидеть его РОВНО тогда же, когда заказ становится
+                # is_pushed, иначе есть окно, где заказ уже "отправлен", а какая
+                # часть — неизвестно (см. app.api._apply_remainder_to_incoming).
+                items_json=encode_items_payload(items, pushed_by_base),
+            )
+            .returning(ProductionOrder.status)
+            .execution_options(synchronize_session=False)
+        ).fetchall()
+        if saved:
+            _move_incoming_to_ms(db, org_id, order, pushed_by_base,
+                                 was_sent=str(saved[0][0] or "") == "sent")
+            db.commit()
+            return True
         db.rollback()
-        return None
-    _move_incoming_to_ms(db, org_id, order, pushed_by_base,
-                         was_sent=str(saved[0][0] or "") == "sent")
-    db.commit()
-    return True
+        current = db.execute(
+            select(ProductionOrder.ms_doc_href, ProductionOrder.items_json)
+            .where(ProductionOrder.id == order.id, ProductionOrder.org_id == org_id)
+        ).one_or_none()
+        if current is None or str(current[0] or "") != pending_href:
+            # Лок уже не наш: пометка протухла, или заказа больше нет.
+            return None
+        current_items_json = current[1]
+        if current_items_json == items_json:
+            # href совпал, items_json не изменился — но UPDATE всё равно
+            # ничего не задел. При SQLite/Postgres READ COMMITTED такое не
+            # должно происходить без внешнего изменения строки; повторяем тем
+            # же снимком, не тратя это на remap.
+            continue
+        # items_json разошёлся при живом pending_href — переименование
+        # опередило нас. Переносим маркер на новые имена той же строки и
+        # повторяем CAS уже с актуальным снимком, вместо того чтобы затереть
+        # rename своим старым.
+        fresh_items, _marker = parse_items_payload(current_items_json)
+        pushed_by_base = _remap_pushed_by_base(items, fresh_items, pushed_by_base)
+        items = fresh_items
+        items_json = current_items_json
+    # Границы гонки исчерпаны — не гадаем и не клобберим: отдаём исключение
+    # обычному пути повтора (commit_push перезапускает T2 целиком; исчерпал —
+    # WritebackUnknown, честный отказ вместо тихой порчи).
+    raise RuntimeError(
+        "T2: items_json меняется быстрее, чем CAS успевает записать маркер DATA-7")
 
 
 def commit_push(db: Session, org_id: int, order: ProductionOrder, doc: dict,
-                pushed_by_base: dict[str, int], pending_href: str) -> str:
+                pushed_by_base: dict[str, float], pending_href: str,
+                matched_items_json: str) -> str:
     """T2: ссылка на документ и перенос вклада «едет к нам» — либо оба, либо ни один.
 
     Раньше здесь был фолбэк «не вышло целиком — сохраним хотя бы ссылку».
@@ -1000,13 +1195,18 @@ def commit_push(db: Session, org_id: int, order: ProductionOrder, doc: dict,
     не выводится здесь из текущего значения строки: смысл проверки в том, чтобы
     отличить свою пометку от чужой, а значение, прочитанное сейчас, чужим быть
     как раз и может.
+
+    `matched_items_json` — снимок items_json РОВНО в момент, когда push_order
+    матчил позиции и считал pushed_by_base (см. _commit_push_once). Пробрасывается
+    насквозь, а не перечитывается здесь: значение нужно ИМЕННО с той стороны
+    сети, до которой могло случиться переименование.
     """
     href = ((doc.get("meta") or {}).get("href")) or ""
     name = str(doc.get("name") or "")
     for attempt in range(2):
         try:
             if _commit_push_once(db, org_id, order, href, name, pushed_by_base,
-                                 pending_href):
+                                 pending_href, matched_items_json):
                 return href
             # Пометка «идёт отправка» уже не наша: пока мы ходили в сеть, лок
             # протух и его перехватила соседняя попытка. Она шла с ТЕМ ЖЕ
@@ -1056,6 +1256,11 @@ async def push_order(db: Session, org_id: int, order: ProductionOrder,
             "отправки. Документ не отправлен — сообщите в поддержку.",
         )
     products = _product_map(db, org_id)
+    # Обратная карта для recovered-документов (см. positions_pushed_by_base):
+    # ext_id → base_name, по ТЕКУЩЕМУ ассортименту организации.
+    ext_id_to_base: dict[str, str] = {
+        p.ext_id: p.base_name for p in products.values() if p.ext_id
+    }
 
     async with MoySkladClient(token) as client:
         # 1) Ассортимент МС: ext_id → meta (точный href и type variant/product).
@@ -1073,9 +1278,19 @@ async def push_order(db: Session, org_id: int, order: ProductionOrder,
                 }
 
         # 2) Позиции документа: base_name+size → product.ext_id → meta МС.
+        #
+        # Снимок items_json ИМЕННО отсюда (а не перечитанный позже, в T2,
+        # после сетевого окна) — база для CAS в commit_push/_commit_push_once:
+        # pushed_by_base ниже считается против ЭТОГО состояния строки, и
+        # ремап конкурентного переименования обязан сравнивать с ним, а не с
+        # тем, что окажется в строке к моменту записи T2.
+        matched_items_json = order.items_json
+        # Верхняя граница переноса на recovered-пути (см. positions_pushed_by_base):
+        # ТОТ ЖЕ снимок items, что и matched_items_json выше.
+        order_totals = _order_base_totals(order.items)
         positions: list[dict] = []
         unmatched: list[str] = []
-        pushed_by_base: dict[str, int] = {}  # для переноса вклада в ms_qty
+        pushed_by_base: dict[str, float] = {}  # для переноса вклада в ms_qty
         for item in order.items:
             base = str(item.get("base_name") or "")
             cost_kopecks = _kopecks_of(item.get("cost"))
@@ -1128,6 +1343,34 @@ async def push_order(db: Session, org_id: int, order: ProductionOrder,
         existing = await find_own_document(client, keys, marker)
         if existing is not None:
             doc, recovered = existing, True
+            # Документ уже существует — прошлая попытка (или legacy-документ)
+            # могла сопоставить позиции ДРУГИМ ассортиментом, чем сопоставляет
+            # СЕЙЧАС локальный матч выше (шаг 2): вариант могли пересоздать,
+            # переименовать в МС, у нас — заменить ext_id. Источник истины про
+            # то, что РЕАЛЬНО уехало, — сам документ, а не свежий локальный
+            # матч, который вообще не создавал ни одной сетевой сущности этой
+            # попытки. pushed_by_base отсюда идёт напрямую в commit_push и в
+            # маркер DATA-7 — подменяем его на фактические позиции документа.
+            doc_id = str(doc.get("id")
+                        or _href_uuid(((doc.get("meta") or {}).get("href")) or ""))
+            real_positions = await client.fetch_positions("purchaseorder", doc_id) \
+                if doc_id else []
+            resolved = positions_pushed_by_base(real_positions, ext_id_to_base,
+                                                order_totals)
+            if resolved is None:
+                # Fail-closed (см. docstring positions_pushed_by_base): хотя бы
+                # одна положительная позиция документа не сопоставилась ни с
+                # одним base текущего ассортимента, либо несёт дробное
+                # количество. Подтвердить, какая часть реально относится к
+                # ЭТОМУ заказу, нельзя — гадать (списывать по неполной карте)
+                # запрещено так же, как и раньше округлять. T2 не вызываем:
+                # заказ остаётся в устойчивом «неизвестно», ключ и документ
+                # целы, следующая отправка (или backmatch синка) повторит
+                # попытку сама.
+                doc_href = ((doc.get("meta") or {}).get("href")) or ""
+                doc_name = str(doc.get("name") or "")
+                raise WritebackUnknown(doc_name, doc_href)
+            pushed_by_base = resolved
         else:
             payload: dict = {
                 "organization": {"meta": org_meta},
@@ -1190,7 +1433,8 @@ async def push_order(db: Session, org_id: int, order: ProductionOrder,
                 # Документ всё-таки создан — потерялся только ответ.
                 doc, recovered = found, True
 
-    href = commit_push(db, org_id, order, doc, pushed_by_base, pending_href)
+    href = commit_push(db, org_id, order, doc, pushed_by_base, pending_href,
+                       matched_items_json)
     return {
         "ok": True,
         "ms_doc_name": str(doc.get("name") or ""),
