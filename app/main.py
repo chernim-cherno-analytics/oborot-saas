@@ -56,32 +56,57 @@ app.include_router(ms_vendor_router)
 app.include_router(ms_app_router)
 
 
+def _csrf_reject():
+    from fastapi.responses import JSONResponse as _JR
+    resp = _JR(status_code=403, content={"detail": "CSRF: запрос отклонён"})
+    resp.headers["Content-Security-Policy"] = "frame-ancestors 'self' https://online.moysklad.ru"
+    return resp
+
+
 @app.middleware("http")
 async def _security_headers_and_csrf(request: Request, call_next):
-    """CSP frame-ancestors + CSRF-защита изменяющих запросов к /api.
+    """CSP frame-ancestors + CSRF-защита изменяющих запросов.
 
     CSP: приложение маркетплейса МС работает полностраничным iframe — вместо
     полного запрета фреймов ограничиваем предков (современная замена
     X-Frame-Options). Ставим и на 500 (обработка исключения ниже).
 
-    CSRF: в embedded-режиме сессионная кука на проде SameSite=None (иначе не
-    долетит в iframe МС), поэтому Lax-защита не работает. Для изменяющих
+    CSRF /api: в embedded-режиме сессионная кука на проде SameSite=None (иначе
+    не долетит в iframe МС), поэтому Lax-защита не работает. Для изменяющих
     методов на /api/* требуем кастомный заголовок X-Oborot-CSRF: браузер не
     даст поставить его в кросс-доменном запросе без CORS-preflight, а CORS мы
     не разрешаем — значит сторонний сайт не сможет дёрнуть наши ручки с
     кукой пользователя. Свой фронт заголовок шлёт всегда (см. app.js api()).
     Vendor-lifecycle (/ms/...) сюда не попадает: это server-to-server c JWT,
     без куки — CSRF там неприменим.
+
+    CSRF /login /register /logout (SEC-5): это обычные HTML-формы, браузер
+    шлёт их сам — заголовок на них не поставить. Проверяем double-submit
+    токен (auth.verify_csrf_form): скрытое поле формы должно совпасть с
+    подписанной кукой сессии. X-Oborot-CSRF остаётся допустимой
+    альтернативой и здесь — ровно то же свойство (сторонняя форма не может
+    поставить кастомный заголовок), которым уже держится защита /api; это
+    и сохраняет совместимость с машинными клиентами тестов, которые шлют
+    этот заголовок глобально, не заходя на GET-страницу формы за токеном.
+
+    Тело читаем через request.body(), а не request.form(): BaseHTTPMiddleware
+    реплеит вниз по стеку то, что закешировал сам объект Request (в
+    self._body — только после body()); form() читает через stream() и вниз
+    уходит уже пустое тело, и Form(...) в самой ручке получил бы None вместо
+    email/password. Формы без файлов — простого urlencoded-парсинга хватает.
     """
-    if (
-        request.method in ("POST", "PUT", "PATCH", "DELETE")
-        and request.url.path.startswith("/api/")
-        and request.headers.get("X-Oborot-CSRF") is None
-    ):
-        from fastapi.responses import JSONResponse as _JR
-        resp = _JR(status_code=403, content={"detail": "CSRF: запрос отклонён"})
-        resp.headers["Content-Security-Policy"] = "frame-ancestors 'self' https://online.moysklad.ru"
-        return resp
+    path = request.url.path
+    if request.method in ("POST", "PUT", "PATCH", "DELETE"):
+        if path.startswith("/api/"):
+            if request.headers.get("X-Oborot-CSRF") is None:
+                return _csrf_reject()
+        elif path in auth.CSRF_FORM_PATHS:
+            if request.headers.get("X-Oborot-CSRF") is None:
+                from urllib.parse import parse_qsl
+                raw = await request.body()
+                fields = dict(parse_qsl(raw.decode("utf-8", errors="replace"), keep_blank_values=True))
+                if not auth.verify_csrf_form(request, fields.get(auth.CSRF_FORM_FIELD)):
+                    return _csrf_reject()
     response = await call_next(request)
     response.headers.setdefault(
         "Content-Security-Policy",
@@ -313,6 +338,7 @@ def _page(request: Request, ctx: auth.AuthContext, template: str, active: str, p
             ).first()
             is not None
         )
+    csrf_token = auth.get_csrf_token(request)
     response = templates.TemplateResponse(
         request,
         template,
@@ -348,8 +374,13 @@ def _page(request: Request, ctx: auth.AuthContext, template: str, active: str, p
                 and _subscription.subscription_state(org, db) == _subscription.READONLY
             ),
             **(extra or {}),
+            "csrf_token": csrf_token,
         },
     )
+    # CSRF-кука формы logout (SEC-5): в iframe МойСклад на проде нужна
+    # SameSite=None+Secure — иначе браузер отбросит куку в третьесторонней
+    # рамке, и double-submit станет невозможен для легитимного пользователя.
+    auth.set_csrf_cookie(response, csrf_token, samesite=("none" if (embedded and is_prod()) else "lax"))
     # dev-only: ?embed=1/0 залипает кукой, чтобы навигация сохраняла режим.
     if override is True:
         auth.set_embed(response)
@@ -395,11 +426,15 @@ def _authed_page(request: Request, db: Session, template: str, active: str, page
 # ── Аутентификация ───────────────────────────────────────────────────────────
 
 def _render_auth(request: Request, template: str, **extra):
-    return templates.TemplateResponse(
+    token = auth.get_csrf_token(request)
+    response = templates.TemplateResponse(
         request,
         template,
-        {"user": None, "org": None, "active": "", "page_title": "Оборот", **extra},
+        {"user": None, "org": None, "active": "", "page_title": "Оборот",
+         **extra, "csrf_token": token},
     )
+    auth.set_csrf_cookie(response, token)
+    return response
 
 
 # Прощальные сообщения после удаления аккаунта (?deleted=...): человек должен

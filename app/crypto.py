@@ -40,6 +40,16 @@ def get_signing_secret() -> str:
     return _derive("session-signing").hex()
 
 
+def get_csrf_signing_secret() -> str:
+    """Ключ подписи double-submit CSRF-токена форм /login, /register, /logout.
+
+    Отдельный от сессионного: подпись CSRF-куки не должна быть переносима на
+    сессионную куку и обратно (тот же принцип domain separation, что и у
+    Fernet-ключа интеграций выше).
+    """
+    return _derive("csrf-signing").hex()
+
+
 def _fernet() -> Fernet:
     key = base64.urlsafe_b64encode(_derive("integration-tokens"))
     return Fernet(key)

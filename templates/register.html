@@ -16,6 +16,7 @@
     {% endif %}
 
     <form method="post" action="/register">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <div class="field">
         <label for="name">Ваше имя</label>
         <input class="input" type="text" id="name" name="name" required autofocus
