@@ -36,10 +36,14 @@
 
 Запуск:
     python tests/run_all.py              # параллельно, столько же по времени,
-                                         # сколько самый долгий набор (~5 мин)
+                                         # сколько самый долгий набор
     python tests/run_all.py --serial     # по одному, если нужен чистый вывод
     python tests/run_all.py sync planner # только выбранные наборы
     python tests/run_all.py --require-all  # как в CI: пропуск = падение
+
+Набор `sync` разрезан на четыре шарда (`sync`, `sync_p1`, `sync_resume`,
+`sync_rebuild`) плюс обязательный сторож полноты `sync_parity`. Весь сценарий
+целиком по-прежнему запускается одной командой: `python tests/test_sync.py`.
 
 Код возврата: 0 — все наборы честно зелёные (локально допускается ЯВНЫЙ
 пропуск, он виден в таблице вместе с причиной), 1 — есть падения, молчание,
@@ -60,10 +64,24 @@ TESTS = ROOT / "tests"
 # Порты разведены с запасом: приложение 8811+, моки МойСклада 9821+, телеграм 9841+.
 # Диапазоны намеренно не пересекаются со «своими» портами файлов (8801–8809,
 # 9800, 9801, 9810, 9811), чтобы раннер можно было запустить, пока идёт ручной прогон.
+#
+# Пятое поле (необязательное) — аргументы командной строки набора. Оно есть
+# ровно ради одного случая: `test_sync.py` — единственный сценарий на 413
+# проверок, который в CI шёл 448.9 с и в одиночку задавал критический путь
+# (прогон 32953333557: остальные 27 наборов вместе весят столько же, но идут по
+# трём дорожкам). Сценарий разрезан на шарды: каждый исполняется своим
+# процессом, со своей базой `test_oborot_<шард>.db` и своими портами отсюда,
+# а недостающую подготовку доигрывает сам. Ни одна проверка при этом не
+# потеряна и не выполняется дважды в зачёт: замок — `test_sync_shards.py`,
+# он же обязательный набор `sync_parity`.
 SUITES = [
     # имя,          файл,                     нужен мок МС, нужен мок телеграма
     ("runner",      "test_runner.py",          False, False),
-    ("sync",        "test_sync.py",            True,  False),
+    ("sync",        "test_sync.py",            True,  False, ("--shard", "sync")),
+    ("sync_p1",     "test_sync.py",            True,  False, ("--shard", "sync_p1")),
+    ("sync_resume", "test_sync.py",            True,  False, ("--shard", "sync_resume")),
+    ("sync_rebuild", "test_sync.py",           True,  False, ("--shard", "sync_rebuild")),
+    ("sync_parity", "test_sync_shards.py",     False, False),
     ("planner",     "test_planner.py",         False, False),
     ("account",     "test_account.py",         False, False),
     ("lessons",     "test_lessons.py",         False, False),
@@ -165,7 +183,7 @@ def classify(out: str, rc: int) -> dict:
 
 
 def run_one(idx: int, name: str, filename: str, needs_ms: bool, needs_tg: bool,
-            timeout: int) -> dict:
+            timeout: int, extra_args: tuple = ()) -> dict:
     env = dict(os.environ)
     env["OBOROT_TEST_PORT"] = str(8811 + idx)
     # Набор бэкапов поднимает приложение сам, скриптом restore_test.sh, — свой
@@ -180,7 +198,8 @@ def run_one(idx: int, name: str, filename: str, needs_ms: bool, needs_tg: bool,
     env["SCHEDULER_ENABLED"] = "0"
     started = time.time()
     try:
-        p = subprocess.run([sys.executable, str(TESTS / filename)], cwd=str(ROOT),
+        p = subprocess.run([sys.executable, str(TESTS / filename), *extra_args],
+                           cwd=str(ROOT),
                            env=env, capture_output=True, text=True, timeout=timeout)
         out, rc = p.stdout + p.stderr, p.returncode
     except subprocess.TimeoutExpired as exc:
@@ -280,7 +299,11 @@ def main() -> int:
     strict = " · режим CI: обязательны все наборы" if args.require_all else ""
     print(f"Наборов: {len(suites)} · режим: {mode}{strict}\n")
     started = time.time()
-    jobs = [(i, *s, args.timeout) for i, s in enumerate(suites)]
+    # Пятое поле необязательное: старые записи из четырёх полей продолжают
+    # работать (ими же подменяет реестр tests/test_runner.py).
+    jobs = [(i, s[0], s[1], s[2], s[3], args.timeout,
+             tuple(s[4]) if len(s) > 4 else ())
+            for i, s in enumerate(suites)]
     if args.serial:
         results = [run_one(*j) for j in jobs]
     else:
