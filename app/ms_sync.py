@@ -1683,6 +1683,16 @@ def _category_of(row: dict) -> str:
 def _upsert_products(org_id: int, assortment: list[dict], stats: dict) -> dict[str, int]:
     """Создаёт/обновляет products; возвращает карту ext_id → наш product.id."""
     parsed = _parse_assortment(assortment, org_id)
+    # DATA-8: если справочник контрагентов в этом прогоне не прочитался
+    # (stats["suppliers_error"] выставляется в run_sync на исключении
+    # fetch_counterparties), _supplier_of() для КАЖДОГО товара вернёт "" —
+    # это неотличимо от «МойСклад авторитетно подтвердил, что поставщика
+    # нет». Затирать products.supplier таким сигналом нельзя: значение,
+    # проверенное на прошлом успешном синке, — это факт, а сбой справочника —
+    # это отсутствие факта. Поэтому при сбое поле НЕ трогаем вовсе: у
+    # существующих товаров остаётся последнее подтверждённое имя, у новых —
+    # пустое (не догадка, а тот же дефолт колонки, что и раньше).
+    suppliers_ok = "suppliers_error" not in stats
     db = SessionLocal()
     try:
         existing = {
@@ -1711,7 +1721,8 @@ def _upsert_products(org_id: int, assortment: list[dict], stats: dict) -> dict[s
             row.category = item["category"]
             row.sale_price = item["sale_price"]
             row.cost_full = item.get("cost_full") or 0.0
-            row.supplier = item.get("supplier") or ""
+            if suppliers_ok:
+                row.supplier = item.get("supplier") or ""
             row.cost_price = item["cost_price"]
             row.archived = item["archived"]
         # Миграция пользовательских данных — ДО commit, в одной транзакции с

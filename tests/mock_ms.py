@@ -493,13 +493,17 @@ def entity_assortment(request: Request, limit: int = 1000, offset: int = 0):
     rows = []
     # родительские product для вариантных моделей
     for pid, name, path, price, cost, _rate, flags in SIZED:
-        rows.append({
+        row = {
             "id": pid, "name": name, "pathName": path,
             "meta": {"href": f"{BASE}/entity/product/{pid}", "type": "product"},
             "salePrices": _sale_prices(pid, price, cost),
             "buyPrice": {"value": cost * 100},
             "archived": False,
-        })
+        }
+        sup = _supplier_meta(pid)
+        if sup:
+            row["supplier"] = sup
+        rows.append(row)
     for sku in SKUS:
         if sku["kind"] == "variant":
             chars = ([] if "nochar" in sku["flags"]
@@ -516,14 +520,18 @@ def entity_assortment(request: Request, limit: int = 1000, offset: int = 0):
                 "archived": False,
             })
         else:
-            rows.append({
+            row = {
                 "id": sku["ext"], "name": sku["name"], "pathName": sku["path"],
                 "meta": {"href": f"{BASE}/entity/product/{sku['ext']}",
                          "type": "product"},
                 "salePrices": _sale_prices(sku["ext"], sku["price"], sku["cost"]),
                 "buyPrice": {"value": sku["cost"] * 100},
                 "archived": "archived" in sku["flags"],
-            })
+            }
+            sup = _supplier_meta(sku["ext"])
+            if sup:
+                row["supplier"] = sup
+            rows.append(row)
     # Услуга: строка ассортимента, которую синк НЕ импортирует. По умолчанию
     # её нет вовсе, поэтому остальные наборы видят прежний ассортимент.
     service = PRICE_TYPES.get("service") or []
@@ -600,6 +608,12 @@ FAULTS: dict = {"stock_ok_before": 0, "stock_429_burst": 0,
                 # Транзиентный сбой ПРОВЕРКИ закреплённой ссылки: он не
                 # означает «контрагента удалили», и привязку сбрасывать нельзя.
                 "cp_get_500_burst": 0,
+                # GET /entity/counterparty БЕЗ фильтра (справочник целиком —
+                # ровно то, чем пользуется fetch_counterparties при синке)
+                # отвечает 500 N раз подряд. Отдельно от cp_get_500_burst
+                # (тот бьёт точечный /entity/counterparty/{id}) и не задевает
+                # поиск с filter=name=... (writeback ищет контрагента иначе).
+                "cp_list_500_burst": 0,
                 # Точечный маршрут /entity/{type}/syncid/{id} отвечает 404,
                 # как если бы GET по нему не поддерживался вовсе. Тогда 404
                 # «нет такого URL» неотличим от 404 «нет сущности».
@@ -670,7 +684,7 @@ def reset_faults() -> None:
                   docs_429_burst=0, docs_429_before="",
                   po_create_then_fail=0, po_429_burst=0,
                   po_fail_before_create=0, cp_search_delay_ms=0,
-                  cp_get_500_burst=0, syncid_route_404=0,
+                  cp_get_500_burst=0, cp_list_500_burst=0, syncid_route_404=0,
                   syncid_route_wrong_type=0, syncid_route_status=0,
                   po_create_delay_ms=0, po_hide_created=0,
                   po_list_ok_before=0, po_list_status=0,
@@ -977,10 +991,53 @@ ORG_EXT_ID = "org-main"
 COUNTERPARTIES: list[dict] = []          # {"id", "name"}
 CREATED_PURCHASE_ORDERS: list[dict] = [] # тела принятых POST + присвоенные id/name
 
+# Ссылка «товар → контрагент-поставщик» (DATA-8, ext_id продукта → id
+# контрагента из COUNTERPARTIES). Пусто по умолчанию — существующие наборы
+# не видят supplier в ассортименте вовсе, как раньше.
+SUPPLIER_LINKS: dict[str, str] = {}
+
 
 def reset_writeback_state() -> None:
     COUNTERPARTIES.clear()
     CREATED_PURCHASE_ORDERS.clear()
+    SUPPLIER_LINKS.clear()
+
+
+def _supplier_meta(ext_id: str) -> dict | None:
+    cp_id = SUPPLIER_LINKS.get(ext_id)
+    if not cp_id:
+        return None
+    return {"meta": {"href": f"{BASE}/entity/counterparty/{cp_id}"}}
+
+
+def _find_or_create_counterparty(name: str) -> dict:
+    for cp in COUNTERPARTIES:
+        if cp["name"] == name:
+            return cp
+    cp = {"id": f"cp-{len(COUNTERPARTIES) + 1:03d}", "name": name}
+    COUNTERPARTIES.append(cp)
+    return cp
+
+
+@app.post("/__test/supplier_links")
+async def test_supplier_links(request: Request):
+    """Тестовое управление ссылкой «товар (ext_id) → контрагент-поставщик».
+
+    Тело — {"<ext_id>": "<имя поставщика>", ...}. Пустое имя снимает привязку
+    (в ассортименте у товара тогда вообще нет поля supplier — как у товара,
+    для которого поставщик не указан). Непустое имя заводит/переиспользует
+    контрагента в COUNTERPARTIES (тем же способом, что и POST
+    /entity/counterparty) и связывает его id с ext_id в SUPPLIER_LINKS.
+    """
+    body = await request.json()
+    for ext_id, supplier_name in (body or {}).items():
+        name = str(supplier_name or "").strip()
+        if not name:
+            SUPPLIER_LINKS.pop(ext_id, None)
+            continue
+        cp = _find_or_create_counterparty(name)
+        SUPPLIER_LINKS[ext_id] = cp["id"]
+    return {"links": dict(SUPPLIER_LINKS), "counterparties": list(COUNTERPARTIES)}
 
 
 def _reject_sync_id_filter(parsed: dict) -> None:
@@ -1037,6 +1094,11 @@ async def entity_counterparty(request: Request, limit: int = 1000, offset: int =
     parsed = _parse_filter(flt)
     name = parsed.get("name", "")
     _reject_sync_id_filter(parsed)
+    if not name and int(FAULTS.get("cp_list_500_burst") or 0) > 0:
+        FAULTS["cp_list_500_burst"] = int(FAULTS["cp_list_500_burst"]) - 1
+        raise HTTPException(status_code=500, detail={"errors": [
+            {"error": "mock: временный сбой справочника контрагентов"}
+        ]})
     if int(FAULTS.get("cp_search_delay_ms") or 0) > 0:
         import asyncio as _asyncio
         await _asyncio.sleep(int(FAULTS["cp_search_delay_ms"]) / 1000.0)
