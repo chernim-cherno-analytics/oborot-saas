@@ -17,7 +17,16 @@
      позиции), изоляция производств между организациями, границы id в пути.
 
 Запуск из корня репозитория:  python tests/test_sync.py
+
+Сценарий длинный: в CI он один шёл 448.9 с (прогон 32953333557) и в одиночку
+задавал критический путь всего строгого набора. Поэтому он разложен на ШАРДЫ —
+`python tests/test_sync.py --shard <имя>` исполняет и засчитывает только свою
+часть, а недостающую подготовку доигрывает сам, теми же запросами и теми же
+реальными ожиданиями. Без аргументов работает как раньше: весь сценарий,
+413 проверок. Ни одно ожидание не сокращено, ни одна проверка не выброшена и не
+сделана необязательной; замок полноты — `tests/test_sync_shards.py`.
 """
+import argparse
 import io
 import json
 import os
@@ -33,7 +42,29 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tests"))
 
-DB_PATH = ROOT / "test_oborot.db"
+from test_sync_shards import ACTS, ALL, load_baseline, plan_for  # noqa: E402
+
+# ── Шарды ────────────────────────────────────────────────────────────────────
+# Сценарий один и тот же; `--shard` говорит, какую его часть ЗАПИСЫВАТЬ. Всё,
+# что шарду нужно для этой части (организация, эталонный проход истории), он
+# доигрывает сам — теми же запросами и теми же реальными ожиданиями, только
+# не засчитывая чужие проверки. Без аргументов — весь сценарий, как раньше.
+# Разбиение и замок полноты — в tests/test_sync_shards.py.
+_ap = argparse.ArgumentParser(description="Интеграционный тест синхронизации МойСклад")
+_ap.add_argument("--shard", default=ALL,
+                 help="часть сценария (по умолчанию весь сценарий целиком)")
+_ap.add_argument("--dump-baseline", action="store_true",
+                 help="напечатать эталон полноты (акт + имена проверок) вместо "
+                      "сверки с ним; годится только с полным сценарием. Файл "
+                      "tests/sync_baseline_checks.txt не переписывается сам: "
+                      "обновление эталона обязано быть видно в diff")
+_args = _ap.parse_args()
+SHARD, DUMP = _args.shard, _args.dump_baseline
+_PLAN = plan_for(SHARD)
+
+# Своя база на шард: иначе параллельные шарды перепишут файл друг другу.
+# Имя остаётся под маской test_*.db — её чистит tests/run_all.py перед прогоном.
+DB_PATH = ROOT / ("test_oborot.db" if SHARD == ALL else f"test_oborot_{SHARD}.db")
 # Порты берутся из окружения: так tests/run_all.py разводит наборы и
 # может гонять их параллельно. Значения по умолчанию — прежние.
 APP_PORT = int(os.environ.get("OBOROT_TEST_PORT", "8801"))
@@ -83,15 +114,87 @@ class ServerThread:
 
 
 PASS, FAIL = [], []
+RECORDED: list[tuple[str, str]] = []   # (акт, имя) засчитанных проверок по порядку
+_RECORDING = False         # идёт записываемый акт, а не подготовка соседнего
+_CUR_ACT = ""
+
+
+def begin(name: str) -> bool:
+    """Открыть акт сценария. False — в этом шарде акт не исполняется.
+
+    Акт, попавший в план как подготовка, исполняется полностью (те же запросы,
+    те же паузы и повторы), но его проверки не идут в отчёт: иначе одна и та же
+    проверка попала бы в общий итог из нескольких шардов и «413» перестало бы
+    что-либо доказывать. Провал в подготовке всё равно красит шард — молчаливая
+    подготовка опаснее лишней строки в выводе.
+    """
+    global _RECORDING, _CUR_ACT
+    _RECORDING = _PLAN.get(name, False)
+    _CUR_ACT = name
+    return name in _PLAN
 
 
 def check(name: str, cond: bool, detail: str = ""):
+    if not _RECORDING:
+        if cond:
+            print(f"  ..   {name}")
+        else:
+            FAIL.append(f"[подготовка] {name}")
+            print(f"  FAIL [подготовка] {name}  {detail}")
+        return
+    RECORDED.append((_CUR_ACT, name))
     if cond:
         PASS.append(name)
         print(f"  OK   {name}" + (f"  [{detail}]" if detail else ""))
     else:
         FAIL.append(name)
         print(f"  FAIL {name}  {detail}")
+
+
+def finish() -> int:
+    """Сверка с замороженным эталоном и канонический итог.
+
+    Проверяется УПОРЯДОЧЕННЫЙ список фактически выполненных проверок против
+    среза эталона по актам этого шарда. Пропала проверка, переехала в другой
+    акт, поменялся порядок — шард красный. Успешная сверка своей строки OK не
+    добавляет: сумма OK по всем шардам обязана дать ровно 413 legacy-проверок.
+    """
+    got = [n for _, n in RECORDED]
+    if DUMP:
+        print("\n===== эталон полноты (в tests/sync_baseline_checks.txt) =====")
+        seen = ""
+        for a, n in RECORDED:
+            if a != seen:
+                print(f"# акт: {a}")
+                seen = a
+            print(n)
+        print("===== конец эталона =====")
+        print()
+        print(f"ИТОГО: {len(PASS)} OK, {len(FAIL)} FAIL")
+        return 1 if FAIL else 0
+    base = load_baseline()
+    want = [n for a in ACTS if _PLAN.get(a) for n in base.get(a, ())]
+    same_order = got == want
+    if not same_order:
+        first = next((i for i in range(max(len(want), len(got)))
+                      if want[i:i + 1] != got[i:i + 1]), 0)
+        FAIL.append(
+            f"[полнота] шард {SHARD}: выполнено {len(got)} проверок, "
+            f"эталон требует {len(want)}; первое расхождение №{first + 1}: "
+            f"ожидалось {want[first:first + 1] or ['—']}, "
+            f"выполнено {got[first:first + 1] or ['—']}")
+    stray = [(a, n) for a, n in RECORDED if n not in base.get(a, ())]
+    if stray:
+        FAIL.append(f"[полнота] проверка выполнена не в своём акте: {stray[:3]}")
+    if same_order and not stray:
+        print(f"\n  ..   полнота шарда {SHARD}: {len(got)} проверок "
+              f"совпали с эталоном по составу, порядку и актам")
+    print()
+    print(f"ИТОГО: {len(PASS)} OK, {len(FAIL)} FAIL")
+    if FAIL:
+        print("Провалены:", *FAIL, sep="\n  - ")
+        return 1
+    return 0
 
 
 def wait_sync_done(client: httpx.Client, timeout: float = 240.0) -> dict:
@@ -172,6 +275,9 @@ def run_scenario() -> int:
     base = f"http://127.0.0.1:{APP_PORT}"
     client = httpx.Client(headers={"X-Oborot-CSRF": "1"}, base_url=base, timeout=60.0)
 
+    # Ядро исполняется в любом шарде: остальным оно нужно как подготовка —
+    # организация, подключение, склады и первичная история берутся отсюда.
+    begin("core")
     print("== Онбординг ==")
     r = client.post("/register", data={
         "name": "Владелец", "email": "owner@test.io",
@@ -883,7 +989,6 @@ def run_scenario() -> int:
           cap_old is None and cap_new is not None and cap_new["qty"] == 7,
           f"old={dict(cap_old) if cap_old else None} new={dict(cap_new) if cap_new else None}")
 
-    print("== Инцидент 21.08: устойчивость к 429/5xx ==")
     from app import ms_client as _msc, ms_sync as _mss
     mock_api = httpx.Client(base_url=mock_ms.BASE, timeout=10.0)
 
@@ -983,647 +1088,675 @@ def run_scenario() -> int:
         finally:
             c.close()
 
-    # (a) всплеск 429 (12 подряд, затем норма) — и ДЕФОЛТНЫЙ размер чанка (30)
-    _mss.STOCK_CHUNK_DATES = 30
-    try:
-        _set_faults(stock_429_burst=12)
-        r = client.post("/api/sync/initial")
-        check("(a) первичный синк при всплеске 429 запущен", r.status_code == 200)
-        status = wait_sync_done(client)
-    finally:
-        _mss.STOCK_CHUNK_DATES = 5
-        _set_faults()
-    stats_a = status.get("stats", {})
-    check("(a) синк (чанк=30) завершился done несмотря на 12×429",
-          status.get("state") == "done",
-          f"state={status.get('state')} error={status.get('error', '')[:120]}")
-    check("(a) клиент зафиксировал 429 и повторы (stats.ms_client)",
-          (stats_a.get("ms_client") or {}).get("429", 0) > 0
-          and (stats_a.get("ms_client") or {}).get("retries", 0) > 0,
-          f"ms_client={stats_a.get('ms_client')}")
-    summary_a = client.get("/api/summary").json()
-    check("(a) остатки после синка = эталон mock-мира",
-          summary_a["stock_units"] == exp_units,
-          f"got={summary_a['stock_units']} expected={exp_units}")
-    n_dates_a, dups_a = _stock_day_stats()
-    check("(a) история: 60 дат, дублей нет", n_dates_a == 60 and dups_a == 0,
-          f"dates={n_dates_a} dups={dups_a}")
-    check("(a) после успеха точка продолжения/отпечаток не хранятся",
-          "history_loaded_from" not in stats_a and "resume_fp" not in stats_a)
-    check("(a) после успеха coverage_days = HISTORY_DAYS, все месяцы done",
-          status.get("coverage_days") == 60
-          and all(m["state"] == "done" for m in status.get("months", [])),
-          f"coverage={status.get('coverage_days')} months={status.get('months')}")
+    if begin("a"):
+        print("== Инцидент 21.08: устойчивость к 429/5xx ==")
+        # (a) всплеск 429 (12 подряд, затем норма) — и ДЕФОЛТНЫЙ размер чанка (30)
+        _mss.STOCK_CHUNK_DATES = 30
+        try:
+            _set_faults(stock_429_burst=12)
+            r = client.post("/api/sync/initial")
+            check("(a) первичный синк при всплеске 429 запущен", r.status_code == 200)
+            status = wait_sync_done(client)
+        finally:
+            _mss.STOCK_CHUNK_DATES = 5
+            _set_faults()
+        stats_a = status.get("stats", {})
+        check("(a) синк (чанк=30) завершился done несмотря на 12×429",
+              status.get("state") == "done",
+              f"state={status.get('state')} error={status.get('error', '')[:120]}")
+        check("(a) клиент зафиксировал 429 и повторы (stats.ms_client)",
+              (stats_a.get("ms_client") or {}).get("429", 0) > 0
+              and (stats_a.get("ms_client") or {}).get("retries", 0) > 0,
+              f"ms_client={stats_a.get('ms_client')}")
+        summary_a = client.get("/api/summary").json()
+        check("(a) остатки после синка = эталон mock-мира",
+              summary_a["stock_units"] == exp_units,
+              f"got={summary_a['stock_units']} expected={exp_units}")
+        n_dates_a, dups_a = _stock_day_stats()
+        check("(a) история: 60 дат, дублей нет", n_dates_a == 60 and dups_a == 0,
+              f"dates={n_dates_a} dups={dups_a}")
+        check("(a) после успеха точка продолжения/отпечаток не хранятся",
+              "history_loaded_from" not in stats_a and "resume_fp" not in stats_a)
+        check("(a) после успеха coverage_days = HISTORY_DAYS, все месяцы done",
+              status.get("coverage_days") == 60
+              and all(m["state"] == "done" for m in status.get("months", [])),
+              f"coverage={status.get('coverage_days')} months={status.get('months')}")
 
-    print("== Деплой П1: прогрессивная первичная загрузка ==")
-    # (p2) ИНВАРИАНТ: прямой хронологический проход (окно = вся история) даёт
-    # ровно те же строки stock_days/sales, что обратная загрузка чанками.
-    _mss.INITIAL_WINDOW_DAYS = 60
-    try:
-        r = client.post("/api/sync/initial")
-        status = wait_sync_done(client)
-    finally:
-        _mss.INITIAL_WINDOW_DAYS = 10
-    check("(p2) эталонный прямой проход (окно 60 = вся история) done",
-          r.status_code == 200 and status.get("state") == "done"
-          and status.get("stats", {}).get("history_chunks_total") == 0
-          and _stock_day_stats() == (60, 0),
-          f"state={status.get('state')} stats={_stock_day_stats()}")
-    ref_stock, ref_sales = _stock_sets()
-    _mss.STOCK_CHUNK_DATES = 7
-    try:
-        r = client.post("/api/sync/initial")
-        status = wait_sync_done(client)
-    finally:
-        _mss.STOCK_CHUNK_DATES = 5
-    stats_p2 = status.get("stats", {})
-    check("(p2) обратная загрузка (окно 10, чанк 7) done, 8 чанков",
-          status.get("state") == "done" and stats_p2.get("history_chunks_total") == 8
-          and stats_p2.get("window_days") == 10,
-          f"state={status.get('state')} chunks={stats_p2.get('history_chunks_total')}")
-    got_stock, got_sales = _stock_sets()
-    check("(p2) ИНВАРИАНТ: stock_days обратной загрузки == прямому проходу "
-          f"({len(ref_stock)} строк)", got_stock == ref_stock,
-          f"only_ref={len(ref_stock - got_stock)} only_got={len(got_stock - ref_stock)} "
-          f"пример={sorted(ref_stock ^ got_stock)[:3]}")
-    check(f"(p2) ИНВАРИАНТ: sales обратной загрузки == прямому проходу ({len(ref_sales)} строк)",
-          got_sales == ref_sales,
-          f"only_ref={len(ref_sales - got_sales)} only_got={len(got_sales - ref_sales)}")
-    check("(p2) этапы products/today/month/history все done с секундами",
-          [s["key"] for s in status.get("stages", [])] == ["products", "today", "month", "history"]
-          and all(s["state"] == "done" and s["seconds"] is not None
-                  for s in status.get("stages", [])),
-          f"stages={status.get('stages')}")
-    # Нит 14: ВТОРОЙ размер чанка на том же мире — границы чанков ложатся
-    # иначе (в т.ч. на пустой день отчёта и на дыру длиннее чанка).
-    _mss.STOCK_CHUNK_DATES = 13
-    try:
-        r = client.post("/api/sync/initial")
-        status = wait_sync_done(client)
-    finally:
-        _mss.STOCK_CHUNK_DATES = 5
-    check("(p2) ИНВАРИАНТ держится и при другом размере чанка (13)",
-          status.get("state") == "done" and _stock_sets() == (ref_stock, ref_sales)
-          and _stock_day_stats() == (60, 0),
-          f"state={status.get('state')} stats={_stock_day_stats()}")
+    if begin("p2ref"):
+        print("== Деплой П1: прогрессивная первичная загрузка ==")
+        # (p2) ИНВАРИАНТ: прямой хронологический проход (окно = вся история) даёт
+        # ровно те же строки stock_days/sales, что обратная загрузка чанками.
+        _mss.INITIAL_WINDOW_DAYS = 60
+        try:
+            r = client.post("/api/sync/initial")
+            status = wait_sync_done(client)
+        finally:
+            _mss.INITIAL_WINDOW_DAYS = 10
+        check("(p2) эталонный прямой проход (окно 60 = вся история) done",
+              r.status_code == 200 and status.get("state") == "done"
+              and status.get("stats", {}).get("history_chunks_total") == 0
+              and _stock_day_stats() == (60, 0),
+              f"state={status.get('state')} stats={_stock_day_stats()}")
+        ref_stock, ref_sales = _stock_sets()
+    if begin("p2back"):
+        _mss.STOCK_CHUNK_DATES = 7
+        try:
+            r = client.post("/api/sync/initial")
+            status = wait_sync_done(client)
+        finally:
+            _mss.STOCK_CHUNK_DATES = 5
+        stats_p2 = status.get("stats", {})
+        check("(p2) обратная загрузка (окно 10, чанк 7) done, 8 чанков",
+              status.get("state") == "done" and stats_p2.get("history_chunks_total") == 8
+              and stats_p2.get("window_days") == 10,
+              f"state={status.get('state')} chunks={stats_p2.get('history_chunks_total')}")
+        got_stock, got_sales = _stock_sets()
+        check("(p2) ИНВАРИАНТ: stock_days обратной загрузки == прямому проходу "
+              f"({len(ref_stock)} строк)", got_stock == ref_stock,
+              f"only_ref={len(ref_stock - got_stock)} only_got={len(got_stock - ref_stock)} "
+              f"пример={sorted(ref_stock ^ got_stock)[:3]}")
+        check(f"(p2) ИНВАРИАНТ: sales обратной загрузки == прямому проходу ({len(ref_sales)} строк)",
+              got_sales == ref_sales,
+              f"only_ref={len(ref_sales - got_sales)} only_got={len(got_sales - ref_sales)}")
+        check("(p2) этапы products/today/month/history все done с секундами",
+              [s["key"] for s in status.get("stages", [])] == ["products", "today", "month", "history"]
+              and all(s["state"] == "done" and s["seconds"] is not None
+                      for s in status.get("stages", [])),
+              f"stages={status.get('stages')}")
+        # Нит 14: ВТОРОЙ размер чанка на том же мире — границы чанков ложатся
+        # иначе (в т.ч. на пустой день отчёта и на дыру длиннее чанка).
+        _mss.STOCK_CHUNK_DATES = 13
+        try:
+            r = client.post("/api/sync/initial")
+            status = wait_sync_done(client)
+        finally:
+            _mss.STOCK_CHUNK_DATES = 5
+        check("(p2) ИНВАРИАНТ держится и при другом размере чанка (13)",
+              status.get("state") == "done" and _stock_sets() == (ref_stock, ref_sales)
+              and _stock_day_stats() == (60, 0),
+              f"state={status.get('state')} stats={_stock_day_stats()}")
 
-    # (p3) РЕВЬЮ 21.08 (мажор 2): запуск умирает на ПРОДАЖАХ окна быстрого
-    #      старта — точка продолжения к этому моменту уже опубликована.
-    #      Раньше продолжение пропускало фазу month навсегда: остатки окна
-    #      были, а до 30 дней продаж не загружались НИКОГДА (инкремент лечит
-    #      только SYNC_DAYS_BACK=3 дня), при этом синк рапортовал done и
-    #      coverage_days=HISTORY_DAYS.
-    _clear_sales()  # свежий аккаунт: продаж на диске ещё нет
-    _msc.MAX_RETRIES = 1
-    try:
-        mock_ms.FAULTS["docs_429_burst"] = 100000
-        r = client.post("/api/sync/initial")
-        status = wait_sync_done(client)
-    finally:
-        _msc.MAX_RETRIES = 10
-        mock_ms.reset_faults()
-    stats_p3 = status.get("stats", {})
-    good_fp = stats_p3.get("resume_fp")
-    # DATA-3: точка продолжения теперь «сегодня», а не начало окна. Окно
-    # публикуется одной транзакцией (остатки + продажи), и раз продажи не
-    # доехали, остатков окна в базе тоже нет — объявлять загруженным то, чего
-    # не записали, значит врать самому себе при продолжении. Раньше здесь
-    # стояло exp_from (начало окна), и это было верно только потому, что
-    # остатки окна успевали лечь до падения.
-    check("(p3) синк упал на продажах окна: точка есть, окно НЕ помечено закрытым",
-          status.get("state") == "error"
-          and stats_p3.get("history_loaded_from") == _day(0)
-          and stats_p3.get("window_done") is None
-          and _sales_rows() == 0
-          and _stock_dates() == {_day(0)},
-          f"state={status.get('state')} from={stats_p3.get('history_loaded_from')} "
-          f"window_done={stats_p3.get('window_done')} sales={_sales_rows()} "
-          f"дат остатков={len(_stock_dates())}")
-    r = client.post("/api/sync/run")
-    status = wait_sync_done(client)
-    got_stock, got_sales = _stock_sets()
-    check("(p3) продолжение ДОБРАЛО продажи окна: sales == эталонному полному синку",
-          status.get("state") == "done" and got_sales == ref_sales
-          and got_stock == ref_stock,
-          f"state={status.get('state')} only_ref={len(ref_sales - got_sales)} "
-          f"only_got={len(got_sales - ref_sales)}")
-
-    # (p7) РЕВЬЮ 21.08 (мажор 1): прерванный запуск продолжают НЕ В ТОТ ЖЕ
-    #      ДЕНЬ. Раньше продолжение качало только «сегодня» и уходило назад —
-    #      дни между «сегодня» прерванного прогона и «сегодня» продолжения
-    #      не загружались никогда, а синк заканчивался done с coverage=год.
-    _gap = 3
-    _mss._today = lambda: _dt_date.today() - _dt_delta(days=_gap)
-    try:
-        status = _interrupt_initial()
-    finally:
-        _mss._today = _dt_date.today
-    stats_p7 = status.get("stats", {})
-    _shift_from = _day(-(_gap + 9))  # начало окна «того» дня
-    check("(p7) подготовка: загрузка прервана «три дня назад», оба конца записаны",
-          status.get("state") == "error"
-          and stats_p7.get("history_loaded_from") == _shift_from
-          and stats_p7.get("history_loaded_to") == _day(-_gap),
-          f"from={stats_p7.get('history_loaded_from')} to={stats_p7.get('history_loaded_to')} "
-          f"exp_from={_shift_from}")
-    r = client.post("/api/sync/run")
-    status = wait_sync_done(client)
-    _dates_now = _stock_dates()
-    _missing = [d for d in mock_ms.DATES if d not in _dates_now]
-    check("(p7) продолжение через 3 дня не потеряло НИ ОДНОЙ даты",
-          status.get("state") == "done" and not _missing
-          and status.get("coverage_days") == 60,
-          f"missing={_missing} coverage={status.get('coverage_days')}")
-    check("(p7) ИНВАРИАНТ после продолжения с разрывом: stock_days/sales == эталону",
-          _stock_sets() == (ref_stock, ref_sales),
-          f"diff_stock={len(_stock_sets()[0] ^ ref_stock)} "
-          f"diff_sales={len(_stock_sets()[1] ^ ref_sales)}")
-
-    # (p11) РЕВЬЮ 21.08 (повторное): КОМБИНАЦИЯ p3 и p7 — окно-продажи упали,
-    #       а продолжение случилось не в тот же день. Догон начинался от окна,
-    #       пересчитанного на НОВОЕ «сегодня», поэтому терялось ровно столько
-    #       дней продаж, сколько прошло до продолжения — молча: state=done,
-    #       coverage полный (остатки-то целы), last_sale_date = сегодня.
-    _clear_sales()
-    _gap2 = 4
-    _mss._today = lambda: _dt_date.today() - _dt_delta(days=_gap2)
-    _msc.MAX_RETRIES = 1
-    try:
-        mock_ms.FAULTS["docs_429_burst"] = 100000
-        client.post("/api/sync/initial")
-        status = wait_sync_done(client)
-    finally:
-        _msc.MAX_RETRIES = 10
-        mock_ms.reset_faults()
-        _mss._today = _dt_date.today
-    stats_p11 = status.get("stats", {})
-    check("(p11) подготовка: окно-продажи упали «четыре дня назад»",
-          status.get("state") == "error"
-          and stats_p11.get("window_done") is None and _sales_rows() == 0,
-          f"state={status.get('state')} window_done={stats_p11.get('window_done')} "
-          f"sales={_sales_rows()}")
-    client.post("/api/sync/run")
-    status = wait_sync_done(client)
-    got_stock, got_sales = _stock_sets()
-    _lost = sorted({row[1] for row in (ref_sales - got_sales)})
-    check("(p11) продолжение через 4 дня добрало ВСЕ продажи окна",
-          status.get("state") == "done" and got_sales == ref_sales
-          and got_stock == ref_stock,
-          f"state={status.get('state')} потеряно_дней={len(_lost)} {_lost[:5]}")
-
-    # (p8) РЕВЬЮ 21.08 (минор 7): точка продолжения СТАРШЕ окна («упали на
-    #      самом старом чанке, продолжили назавтра»). Это значит «всё уже
-    #      загружено», а не «пересобрать с нуля» — раньше выбрасывались ~364
-    #      верных дня и год качался заново.
-    con = sqlite3.connect(DB_PATH)
-    con.execute("UPDATE sync_state SET state='error', stats_json=? WHERE org_id=?",
-                (json.dumps({"history_loaded_from": _day(-89),  # старше окна (60)
-                             "history_loaded_to": _day(0),
-                             "resume_fp": good_fp, "coverage_days": 60,
-                             "window_done": True}, ensure_ascii=False), _main_org_id()))
-    con.commit(); con.close()
-    r = client.post("/api/sync/run")
-    status = wait_sync_done(client)
-    stats_p8 = status.get("stats", {})
-    check("(p8) точка старше окна = «всё загружено»: продолжение без чанков и без wipe",
-          status.get("state") == "done" and stats_p8.get("resumed_from") == mock_ms.DATES[0]
-          and stats_p8.get("history_chunks_total") == 0
-          and stats_p8.get("stock_dates") == 1
-          and _stock_day_stats() == (60, 0) and _stock_sets() == (ref_stock, ref_sales),
-          f"state={status.get('state')} resumed={stats_p8.get('resumed_from')} "
-          f"chunks={stats_p8.get('history_chunks_total')} dates={stats_p8.get('stock_dates')}")
-
-    # (p1) порядок фаз и finalize-lite: во время идущего синка подключение уже
-    # active, coverage_days == окну, state всё ещё running.
-    _set_faults(stock_delay_ms=150)
-    seen_lite = None
-    seen_eta = None
-    try:
-        r = client.post("/api/sync/initial")
-        check("(p1) первичный синк запущен (замедленный mock)", r.status_code == 200)
-        deadline = time.time() + 120
-        while time.time() < deadline:
-            st = client.get("/api/sync/status").json()
-            if st.get("state") in ("done", "error"):
-                break
-            if st.get("phase") == "history" and st.get("coverage_days") == 10 and seen_lite is None:
-                conn_st = (client.get("/api/settings").json().get("connection") or {}).get("status")
-                seen_lite = (st.get("state"), conn_st, st.get("coverage_days"),
-                             st.get("history_loaded_from"))
-            if st.get("eta_sec") is not None and seen_eta is None:
-                seen_eta = (st.get("eta_sec"), st.get("stats", {}).get("history_chunks_done"),
-                            [m["state"] for m in st.get("months", [])])
-            time.sleep(0.1)
-        status = wait_sync_done(client)
-    finally:
-        _set_faults()
-    check("(p1) finalize-lite: state=running, подключение active, coverage_days=10, точка = начало окна",
-          seen_lite == ("running", "active", 10, exp_from), f"seen={seen_lite} exp_from={exp_from}")
-    check("(p1) eta_sec появляется после первого чанка, есть месяц running",
-          seen_eta is not None and isinstance(seen_eta[0], int) and seen_eta[1] >= 1
-          and "running" in seen_eta[2], f"seen={seen_eta}")
-    check("(p1) финал: done, coverage_days=60, все месяцы done, eta_sec=None",
-          status.get("state") == "done" and status.get("coverage_days") == 60
-          and all(m["state"] == "done" for m in status.get("months", []))
-          and status.get("eta_sec") is None,
-          f"state={status.get('state')} coverage={status.get('coverage_days')}")
-    check("(p1) после замедленного прогона инвариант держится",
-          _stock_sets() == (ref_stock, ref_sales))
-
-    # (p5/p6) публичный прогресс и свежесть
-    fr = client.get("/api/freshness").json()
-    check("(p6) /api/freshness отдаёт coverage_days и history_days",
-          fr.get("coverage_days") == 60 and fr.get("history_days") == 60, f"got={fr}")
-    anon = httpx.Client(base_url=f"http://127.0.0.1:{APP_PORT}", timeout=10.0)
-    r_anon = anon.get("/api/sync/progress")
-    anon.close()
-    check("(p5) /api/sync/progress без сессии → 401", r_anon.status_code == 401,
-          f"status={r_anon.status_code}")
-    member = httpx.Client(headers={"X-Oborot-CSRF": "1"},
-                          base_url=f"http://127.0.0.1:{APP_PORT}", timeout=30.0)
-    r = member.post("/register", data={
-        "name": "Участник", "email": "member@test.io",
-        "password": "secret123", "org_name": "Временная",
-    })
-    c = sqlite3.connect(DB_PATH)
-    main_org = c.execute("SELECT org_id FROM connections WHERE kind='moysklad' "
-                         "ORDER BY id LIMIT 1").fetchone()[0]
-    mem_uid = c.execute("SELECT id FROM users WHERE email='member@test.io'").fetchone()[0]
-    c.execute("UPDATE memberships SET org_id=?, role='member' WHERE user_id=?", (main_org, mem_uid))
-    c.commit(); c.close()
-    r = member.post("/login", data={"email": "member@test.io", "password": "secret123"})
-    check("(p5) участник (member) залогинен в основную организацию", r.status_code == 303)
-    r_st = member.get("/api/sync/status")
-    r_pr = member.get("/api/sync/progress")
-    prog = r_pr.json() if r_pr.status_code == 200 else {}
-    # Минор 12: полоска должна знать окно быстрого старта (не зашивать «30 дней»)
-    # и режим прогона, чтобы прятаться на обычном инкременте в 06:00.
-    exp_keys = {"state", "mode", "phase", "progress_pct", "detail", "error", "error_cause",
-                "coverage_days", "history_days", "window_days", "months", "stages",
-                "eta_sec", "started_at", "finished_at", "can_manage"}
-    check("(p5) member: /api/sync/status → 403, /api/sync/progress → 200 с нужной формой",
-          r_st.status_code == 403 and r_pr.status_code == 200 and set(prog) == exp_keys
-          and "stats" not in prog and prog.get("can_manage") is False
-          and prog.get("coverage_days") == 60
-          and prog.get("history_days") == 60 and len(prog.get("months", [])) >= 2
-          and prog.get("window_days") == 10 and prog.get("mode") == "initial"
-          and len(prog.get("stages", [])) == 4,
-          f"status={r_st.status_code} progress={r_pr.status_code} keys={sorted(prog)}")
-    member.close()
-
-    # (b) одиночный 500 — прозрачный повтор
-    _set_faults(stock_500_once=True)
-    r = client.post("/api/sync/run")
-    status = wait_sync_done(client, timeout=120)
-    stats_b = status.get("stats", {})
-    check("(b) одиночный 500 повторён прозрачно (инкремент done, 5xx=1)",
-          status.get("state") == "done"
-          and (stats_b.get("ms_client") or {}).get("5xx") == 1,
-          f"state={status.get('state')} ms_client={stats_b.get('ms_client')}")
-
-    # (c) стойкий 429 после 25 удачных отчётов (2,5 чанка по 5 дат × 2 склада)
-    status = _interrupt_initial()
-    stats_c = status.get("stats", {})
-    check("(c) синк упал с state=error", status.get("state") == "error",
-          f"state={status.get('state')}")
-    check("(c) текст ошибки: «История загружена за 10 дней из 60 — продолжим автоматически»",
-          status.get("error", "").startswith("История загружена за 10 дней из 60")
-          and "продолжим автоматически" in status.get("error", "")
-          and "ограничил частоту" in status.get("error", ""),
-          f"error={status.get('error', '')[:160]}")
-    check("(c) stats.history_loaded_from = начало окна (самая старая дата), есть отпечаток",
-          stats_c.get("history_loaded_from") == exp_from and stats_c.get("resume_fp"),
-          f"got={stats_c.get('history_loaded_from')} exp={exp_from} fp={stats_c.get('resume_fp')}")
-    conn_c = (client.get("/api/settings").json().get("connection") or {})
-    check("(c) подключение осталось active, coverage_days=10 сохранён, phase=history",
-          conn_c.get("status") == "active" and status.get("coverage_days") == 10
-          and status.get("phase") == "history",
-          f"status={conn_c.get('status')} coverage={status.get('coverage_days')} phase={status.get('phase')}")
-    check("(c) причина ошибки классифицирована (transient)",
-          stats_c.get("error_cause") == "transient", f"cause={stats_c.get('error_cause')}")
-    # Минор 10: сервис работает (подключение active, 10 дн. истории), текст
-    # обещает «продолжим автоматически» — засчитывать это в серию провалов и
-    # слать алерт «синк падает второй раз подряд» нельзя.
-    check("(c) прерывание ФОНОВОЙ истории не увеличивает fail_streak",
-          status.get("fail_streak") == 0 and status.get("alerted_streak") == 0,
-          f"streak={status.get('fail_streak')} alerted={status.get('alerted_streak')}")
-    n_dates_c, dups_c = _stock_day_stats()
-    check("(c) в БД частичная новая история (10 дат окна), старая стёрта на фазе today",
-          n_dates_c == 10 and dups_c == 0, f"dates={n_dates_c} dups={dups_c}")
-
-    # (c1) ревью #1: продолжение падает ДО первого чанка — точка не теряется
-    _msc.MAX_RETRIES = 1
-    try:
-        _set_faults(stock_429_burst=100000)
-        r = client.post("/api/sync/run")  # инкрементный вызов → продолжение initial
-        check("(c1) «Синхронизировать» при прерванной загрузке принят", r.status_code == 200)
-        status = wait_sync_done(client)
-    finally:
-        _msc.MAX_RETRIES = 10
-        _set_faults()
-    stats_c1 = status.get("stats", {})
-    check("(c1) запуск промотирован в initial и упал на первом запросе",
-          status.get("state") == "error" and status.get("mode") == "initial"
-          and stats_c1.get("resumed_from") == exp_from,
-          f"state={status.get('state')} mode={status.get('mode')} resumed={stats_c1.get('resumed_from')}")
-    check("(c1) точка продолжения сохранена, хотя новый запуск не записал ни чанка",
-          stats_c1.get("history_loaded_from") == exp_from
-          and status.get("error", "").startswith("История загружена за 10 дней из 60"),
-          f"from={stats_c1.get('history_loaded_from')} error={status.get('error', '')[:100]}")
-    n_dates_c1, _ = _stock_day_stats()
-    check("(c1) частичная история не тронута (10 дат)", n_dates_c1 == 10, f"dates={n_dates_c1}")
-
-    # (c2) продолжение через «Синхронизировать» (инкрементный вызов); размер
-    #      чанка при продолжении ДРУГОЙ, чем у прерванного прогона (нит 14) —
-    #      границы чанков не совпадают, заплатка обязана держаться и так.
-    _mss.STOCK_CHUNK_DATES = 11
-    try:
-        r = client.post("/api/sync/run")
-        check("(c2) повторный запуск принят", r.status_code == 200)
-        status = wait_sync_done(client)
-    finally:
-        _mss.STOCK_CHUNK_DATES = 5
-    stats_c2 = status.get("stats", {})
-    check("(c2) продолжение завершилось done", status.get("state") == "done",
-          f"state={status.get('state')} error={status.get('error', '')[:120]}")
-    check("(c2) продолжение пошло НАЗАД от точки: 50 дат истории + «сегодня» обновлено",
-          stats_c2.get("resumed_from") == exp_from
-          and stats_c2.get("history_dates") == 60 - 10
-          and stats_c2.get("stock_dates") == 60 - 10 + 1
-          and stats_c2.get("stage_times", {}).get("month", {}).get("skipped") is True,
-          f"resumed_from={stats_c2.get('resumed_from')} history={stats_c2.get('history_dates')} "
-          f"dates={stats_c2.get('stock_dates')}")
-    n_dates_c2, dups_c2 = _stock_day_stats()
-    check("(c2) после продолжения: 60 дат, дублей (org, product, date) нет",
-          n_dates_c2 == 60 and dups_c2 == 0, f"dates={n_dates_c2} dups={dups_c2}")
-    summary_c = client.get("/api/summary").json()
-    check("(c2) остатки после продолжения = эталон mock-мира",
-          summary_c["stock_units"] == exp_units,
-          f"got={summary_c['stock_units']} expected={exp_units}")
-    check("(c2) явные нули распроданных сохранились через границу продолжения",
-          _sellout_zeros_ok())
-    check("(c2) точка продолжения снята после успеха",
-          "history_loaded_from" not in stats_c2 and "resume_fp" not in stats_c2)
-    check("(c2) ИНВАРИАНТ: stock_days/sales после продолжения == эталонному проходу",
-          _stock_sets() == (ref_stock, ref_sales),
-          f"diff_stock={len(_stock_sets()[0] ^ ref_stock)} diff_sales={len(_stock_sets()[1] ^ ref_sales)}")
-
-    # (c3) ревью #3: «Полная пересборка» после прерывания — с нуля, не продолжение
-    status = _interrupt_initial()
-    check("(c3) подготовка: первичная снова прервана на 10 датах",
-          status.get("state") == "error" and _stock_day_stats()[0] == 10)
-    r = client.post("/api/sync/initial")
-    status = wait_sync_done(client)
-    stats_c3 = status.get("stats", {})
-    check("(c3) POST /api/sync/initial — настоящая пересборка (без resumed_from)",
-          r.status_code == 200 and status.get("state") == "done"
-          and "resumed_from" not in stats_c3 and stats_c3.get("stock_dates") == 60,
-          f"state={status.get('state')} stats_keys={sorted(stats_c3)[:8]}")
-    n_dates_c3, dups_c3 = _stock_day_stats()
-    check("(c3) после пересборки 60 дат без дублей, остатки = эталон, инвариант держится",
-          n_dates_c3 == 60 and dups_c3 == 0
-          and client.get("/api/summary").json()["stock_units"] == exp_units
-          and _stock_sets() == (ref_stock, ref_sales),
-          f"dates={n_dates_c3} dups={dups_c3}")
-
-    # (c4) ревью #3: смена набора складов снимает точку продолжения и помечает
-    #      needs_full_rebuild — следующий ИНКРЕМЕНТНЫЙ вызов делает полную пересборку
-    status = _interrupt_initial()
-    check("(c4) подготовка: первичная прервана, точка есть",
-          status.get("state") == "error"
-          and status.get("stats", {}).get("history_loaded_from") == exp_from)
-    wh_list = client.get("/api/settings").json()["warehouses"]
-    wh_lab = next(w for w in wh_list if not w["active"])  # сервисный склад st-lab
-    r = client.post(f"/api/warehouses/{wh_lab['id']}/toggle", json={})  # включаем
-    st_after = client.get("/api/sync/status").json().get("stats", {})
-    check("(c4) toggle склада снял history_loaded_from и поставил needs_full_rebuild",
-          r.status_code == 200 and "history_loaded_from" not in st_after
-          and st_after.get("needs_full_rebuild") is True, f"stats={st_after}")
-    r = client.post("/api/sync/run")
-    status = wait_sync_done(client)
-    stats_c4 = status.get("stats", {})
-    exp_units_3 = round(sum(mock_ms.expected_stock_today(
-        stores=("st-flag", "st-web", "st-lab")).values()))
-    sum_c4 = client.get("/api/summary").json()
-    check("(c4) POST /api/sync/run → полная initial без resumed_from, 60 дат по НОВОМУ набору",
-          r.status_code == 200 and status.get("state") == "done"
-          and status.get("mode") == "initial" and "resumed_from" not in stats_c4
-          and "needs_full_rebuild" not in stats_c4
-          and _stock_day_stats() == (60, 0) and sum_c4["stock_units"] == exp_units_3,
-          f"state={status.get('state')} mode={status.get('mode')} "
-          f"dates={_stock_day_stats()} units={sum_c4['stock_units']} exp={exp_units_3}")
-    check("(c4) новый набор складов действительно другой (эталон 3 складов ≠ 2)",
-          exp_units_3 != exp_units)
-    client.post(f"/api/warehouses/{wh_lab['id']}/toggle", json={})  # вернуть как было
-    r = client.post("/api/connect/moysklad/stores", json={"ext_ids": ["st-flag", "st-web"]})
-    check("(c4) выбор складов прежним набором работает", r.status_code == 200)
-    r = client.post("/api/sync/initial")
-    status = wait_sync_done(client)
-    check("(c4) полная пересборка по прежнему набору done, 60 дат, эталон 2 складов",
-          status.get("state") == "done" and _stock_day_stats() == (60, 0)
-          and client.get("/api/summary").json()["stock_units"] == exp_units,
-          f"state={status.get('state')} stats={_stock_day_stats()}")
-
-    # (c6) ревью (2) #1: провал ДО истории остатков (429 на ассортименте) не теряет
-    #      точку продолжения; (c7) — то же для флага needs_full_rebuild
-    status = _interrupt_initial()
-    check("(c6) подготовка: первичная прервана, точка есть",
-          status.get("stats", {}).get("history_loaded_from") == exp_from)
-    _msc.MAX_RETRIES = 1
-    try:
-        _set_faults(assortment_429_burst=100000)
+    if begin("p3"):
+        # (p3) РЕВЬЮ 21.08 (мажор 2): запуск умирает на ПРОДАЖАХ окна быстрого
+        #      старта — точка продолжения к этому моменту уже опубликована.
+        #      Раньше продолжение пропускало фазу month навсегда: остатки окна
+        #      были, а до 30 дней продаж не загружались НИКОГДА (инкремент лечит
+        #      только SYNC_DAYS_BACK=3 дня), при этом синк рапортовал done и
+        #      coverage_days=HISTORY_DAYS.
+        _clear_sales()  # свежий аккаунт: продаж на диске ещё нет
+        _msc.MAX_RETRIES = 1
+        try:
+            mock_ms.FAULTS["docs_429_burst"] = 100000
+            r = client.post("/api/sync/initial")
+            status = wait_sync_done(client)
+        finally:
+            _msc.MAX_RETRIES = 10
+            mock_ms.reset_faults()
+        stats_p3 = status.get("stats", {})
+        good_fp = stats_p3.get("resume_fp")
+        # DATA-3: точка продолжения теперь «сегодня», а не начало окна. Окно
+        # публикуется одной транзакцией (остатки + продажи), и раз продажи не
+        # доехали, остатков окна в базе тоже нет — объявлять загруженным то, чего
+        # не записали, значит врать самому себе при продолжении. Раньше здесь
+        # стояло exp_from (начало окна), и это было верно только потому, что
+        # остатки окна успевали лечь до падения.
+        check("(p3) синк упал на продажах окна: точка есть, окно НЕ помечено закрытым",
+              status.get("state") == "error"
+              and stats_p3.get("history_loaded_from") == _day(0)
+              and stats_p3.get("window_done") is None
+              and _sales_rows() == 0
+              and _stock_dates() == {_day(0)},
+              f"state={status.get('state')} from={stats_p3.get('history_loaded_from')} "
+              f"window_done={stats_p3.get('window_done')} sales={_sales_rows()} "
+              f"дат остатков={len(_stock_dates())}")
         r = client.post("/api/sync/run")
         status = wait_sync_done(client)
-    finally:
-        _msc.MAX_RETRIES = 10
-        _set_faults()
-    stats_c6 = status.get("stats", {})
-    check("(c6) запуск упал на ассортименте (до истории), точка и отпечаток сохранены",
-          r.status_code == 200 and status.get("state") == "error"
-          and stats_c6.get("history_loaded_from") == exp_from and stats_c6.get("resume_fp")
-          and _stock_day_stats()[0] == 10,
-          f"state={status.get('state')} stats={stats_c6}")
-    r = client.post("/api/sync/run")
-    status = wait_sync_done(client)
-    stats_c6b = status.get("stats", {})
-    check("(c6) следующий запуск корректно продолжил (resumed_from, 60 дат, эталон)",
-          status.get("state") == "done" and stats_c6b.get("resumed_from") == exp_from
-          and _stock_day_stats() == (60, 0)
-          and client.get("/api/summary").json()["stock_units"] == exp_units,
-          f"state={status.get('state')} resumed={stats_c6b.get('resumed_from')} stats={_stock_day_stats()}")
+        got_stock, got_sales = _stock_sets()
+        check("(p3) продолжение ДОБРАЛО продажи окна: sales == эталонному полному синку",
+              status.get("state") == "done" and got_sales == ref_sales
+              and got_stock == ref_stock,
+              f"state={status.get('state')} only_ref={len(ref_sales - got_sales)} "
+              f"only_got={len(got_sales - ref_sales)}")
 
-    status = _interrupt_initial()
-    wh_list = client.get("/api/settings").json()["warehouses"]
-    wh_lab = next(w for w in wh_list if not w["active"])
-    client.post(f"/api/warehouses/{wh_lab['id']}/toggle", json={})  # → needs_full_rebuild
-    client.post(f"/api/warehouses/{wh_lab['id']}/toggle", json={})  # набор прежний, флаг стоит
-    check("(c7) подготовка: needs_full_rebuild выставлен",
-          client.get("/api/sync/status").json().get("stats", {}).get("needs_full_rebuild") is True)
-    _msc.MAX_RETRIES = 1
-    try:
-        _set_faults(assortment_429_burst=100000)
+    if begin("p7"):
+        # (p7) РЕВЬЮ 21.08 (мажор 1): прерванный запуск продолжают НЕ В ТОТ ЖЕ
+        #      ДЕНЬ. Раньше продолжение качало только «сегодня» и уходило назад —
+        #      дни между «сегодня» прерванного прогона и «сегодня» продолжения
+        #      не загружались никогда, а синк заканчивался done с coverage=год.
+        _gap = 3
+        _mss._today = lambda: _dt_date.today() - _dt_delta(days=_gap)
+        try:
+            status = _interrupt_initial()
+        finally:
+            _mss._today = _dt_date.today
+        stats_p7 = status.get("stats", {})
+        _shift_from = _day(-(_gap + 9))  # начало окна «того» дня
+        check("(p7) подготовка: загрузка прервана «три дня назад», оба конца записаны",
+              status.get("state") == "error"
+              and stats_p7.get("history_loaded_from") == _shift_from
+              and stats_p7.get("history_loaded_to") == _day(-_gap),
+              f"from={stats_p7.get('history_loaded_from')} to={stats_p7.get('history_loaded_to')} "
+              f"exp_from={_shift_from}")
+        r = client.post("/api/sync/run")
+        status = wait_sync_done(client)
+        _dates_now = _stock_dates()
+        _missing = [d for d in mock_ms.DATES if d not in _dates_now]
+        check("(p7) продолжение через 3 дня не потеряло НИ ОДНОЙ даты",
+              status.get("state") == "done" and not _missing
+              and status.get("coverage_days") == 60,
+              f"missing={_missing} coverage={status.get('coverage_days')}")
+        check("(p7) ИНВАРИАНТ после продолжения с разрывом: stock_days/sales == эталону",
+              _stock_sets() == (ref_stock, ref_sales),
+              f"diff_stock={len(_stock_sets()[0] ^ ref_stock)} "
+              f"diff_sales={len(_stock_sets()[1] ^ ref_sales)}")
+
+    if begin("p11"):
+        # (p11) РЕВЬЮ 21.08 (повторное): КОМБИНАЦИЯ p3 и p7 — окно-продажи упали,
+        #       а продолжение случилось не в тот же день. Догон начинался от окна,
+        #       пересчитанного на НОВОЕ «сегодня», поэтому терялось ровно столько
+        #       дней продаж, сколько прошло до продолжения — молча: state=done,
+        #       coverage полный (остатки-то целы), last_sale_date = сегодня.
+        _clear_sales()
+        _gap2 = 4
+        _mss._today = lambda: _dt_date.today() - _dt_delta(days=_gap2)
+        _msc.MAX_RETRIES = 1
+        try:
+            mock_ms.FAULTS["docs_429_burst"] = 100000
+            client.post("/api/sync/initial")
+            status = wait_sync_done(client)
+        finally:
+            _msc.MAX_RETRIES = 10
+            mock_ms.reset_faults()
+            _mss._today = _dt_date.today
+        stats_p11 = status.get("stats", {})
+        check("(p11) подготовка: окно-продажи упали «четыре дня назад»",
+              status.get("state") == "error"
+              and stats_p11.get("window_done") is None and _sales_rows() == 0,
+              f"state={status.get('state')} window_done={stats_p11.get('window_done')} "
+              f"sales={_sales_rows()}")
         client.post("/api/sync/run")
         status = wait_sync_done(client)
-    finally:
-        _msc.MAX_RETRIES = 10
-        _set_faults()
-    stats_c7 = status.get("stats", {})
-    check("(c7) провал на ассортименте: флаг needs_full_rebuild пережил запуск",
-          status.get("state") == "error" and stats_c7.get("needs_full_rebuild") is True,
-          f"state={status.get('state')} stats={stats_c7}")
-    r = client.post("/api/sync/run")
-    status = wait_sync_done(client)
-    stats_c7b = status.get("stats", {})
-    check("(c7) следующий запуск — полная initial, флаг снят, 60 дат, эталон",
-          status.get("state") == "done" and status.get("mode") == "initial"
-          and "resumed_from" not in stats_c7b and "needs_full_rebuild" not in stats_c7b
-          and _stock_day_stats() == (60, 0)
-          and client.get("/api/summary").json()["stock_units"] == exp_units,
-          f"state={status.get('state')} mode={status.get('mode')} stats={_stock_day_stats()}")
+        got_stock, got_sales = _stock_sets()
+        _lost = sorted({row[1] for row in (ref_sales - got_sales)})
+        check("(p11) продолжение через 4 дня добрало ВСЕ продажи окна",
+              status.get("state") == "done" and got_sales == ref_sales
+              and got_stock == ref_stock,
+              f"state={status.get('state')} потеряно_дней={len(_lost)} {_lost[:5]}")
 
-    # (c8) ревью (2) #3: смена складов во время идущего синка → 409, склад не изменён
-    r = client.post("/api/sync/initial")
-    check("(c8) первичный синк запущен", r.status_code == 200)
-    r_t = client.post(f"/api/warehouses/{wh_lab['id']}/toggle", json={})
-    r_s = client.post("/api/connect/moysklad/stores", json={"ext_ids": ["st-flag"]})
-    wh_now = next(w for w in client.get("/api/settings").json()["warehouses"]
-                  if w["id"] == wh_lab["id"])
-    check("(c8) toggle и выбор складов во время синка → 409 «Дождитесь», склад не изменён",
-          r_t.status_code == 409 and "Дождитесь" in r_t.json().get("detail", "")
-          and r_s.status_code == 409 and wh_now["active"] is False,
-          f"toggle={r_t.status_code} stores={r_s.status_code} active={wh_now['active']}")
-    status = wait_sync_done(client)
-    check("(c8) синк завершился done, 60 дат", status.get("state") == "done"
-          and _stock_day_stats() == (60, 0))
+    if begin("p8"):
+        # (p8) РЕВЬЮ 21.08 (минор 7): точка продолжения СТАРШЕ окна («упали на
+        #      самом старом чанке, продолжили назавтра»). Это значит «всё уже
+        #      загружено», а не «пересобрать с нуля» — раньше выбрасывались ~364
+        #      верных дня и год качался заново.
+        con = sqlite3.connect(DB_PATH)
+        con.execute("UPDATE sync_state SET state='error', stats_json=? WHERE org_id=?",
+                    (json.dumps({"history_loaded_from": _day(-89),  # старше окна (60)
+                                 "history_loaded_to": _day(0),
+                                 "resume_fp": good_fp, "coverage_days": 60,
+                                 "window_done": True}, ensure_ascii=False), _main_org_id()))
+        con.commit(); con.close()
+        r = client.post("/api/sync/run")
+        status = wait_sync_done(client)
+        stats_p8 = status.get("stats", {})
+        check("(p8) точка старше окна = «всё загружено»: продолжение без чанков и без wipe",
+              status.get("state") == "done" and stats_p8.get("resumed_from") == mock_ms.DATES[0]
+              and stats_p8.get("history_chunks_total") == 0
+              and stats_p8.get("stock_dates") == 1
+              and _stock_day_stats() == (60, 0) and _stock_sets() == (ref_stock, ref_sales),
+              f"state={status.get('state')} resumed={stats_p8.get('resumed_from')} "
+              f"chunks={stats_p8.get('history_chunks_total')} dates={stats_p8.get('stock_dates')}")
 
-    # (c5) ревью #3: несовпадающий отпечаток (другой набор/окно) → свежая initial
-    status = _interrupt_initial()
-    c = sqlite3.connect(DB_PATH)
-    c.execute("UPDATE sync_state SET stats_json = REPLACE(stats_json, ?, ?)",
-              (f"|{mock_ms.HISTORY_DAYS}\"", "|999\""))
-    c.commit(); c.close()
-    st_fp = client.get("/api/sync/status").json().get("stats", {})
-    check("(c5) подготовка: отпечаток подменён", st_fp.get("resume_fp", "").endswith("|999"),
-          f"fp={st_fp.get('resume_fp')}")
-    r = client.post("/api/sync/run")
-    status = wait_sync_done(client)
-    stats_c5 = status.get("stats", {})
-    check("(c5) при чужом отпечатке — полная initial (без resumed_from), 60 дат",
-          status.get("state") == "done" and status.get("mode") == "initial"
-          and "resumed_from" not in stats_c5 and _stock_day_stats() == (60, 0),
-          f"state={status.get('state')} mode={status.get('mode')} stats={_stock_day_stats()}")
+    if begin("p1"):
+        # (p1) порядок фаз и finalize-lite: во время идущего синка подключение уже
+        # active, coverage_days == окну, state всё ещё running.
+        _set_faults(stock_delay_ms=150)
+        seen_lite = None
+        seen_eta = None
+        try:
+            r = client.post("/api/sync/initial")
+            check("(p1) первичный синк запущен (замедленный mock)", r.status_code == 200)
+            deadline = time.time() + 120
+            while time.time() < deadline:
+                st = client.get("/api/sync/status").json()
+                if st.get("state") in ("done", "error"):
+                    break
+                if st.get("phase") == "history" and st.get("coverage_days") == 10 and seen_lite is None:
+                    conn_st = (client.get("/api/settings").json().get("connection") or {}).get("status")
+                    seen_lite = (st.get("state"), conn_st, st.get("coverage_days"),
+                                 st.get("history_loaded_from"))
+                if st.get("eta_sec") is not None and seen_eta is None:
+                    seen_eta = (st.get("eta_sec"), st.get("stats", {}).get("history_chunks_done"),
+                                [m["state"] for m in st.get("months", [])])
+                time.sleep(0.1)
+            status = wait_sync_done(client)
+        finally:
+            _set_faults()
+        check("(p1) finalize-lite: state=running, подключение active, coverage_days=10, точка = начало окна",
+              seen_lite == ("running", "active", 10, exp_from), f"seen={seen_lite} exp_from={exp_from}")
+        check("(p1) eta_sec появляется после первого чанка, есть месяц running",
+              seen_eta is not None and isinstance(seen_eta[0], int) and seen_eta[1] >= 1
+              and "running" in seen_eta[2], f"seen={seen_eta}")
+        check("(p1) финал: done, coverage_days=60, все месяцы done, eta_sec=None",
+              status.get("state") == "done" and status.get("coverage_days") == 60
+              and all(m["state"] == "done" for m in status.get("months", []))
+              and status.get("eta_sec") is None,
+              f"state={status.get('state')} coverage={status.get('coverage_days')}")
+        check("(p1) после замедленного прогона инвариант держится",
+              _stock_sets() == (ref_stock, ref_sales))
 
-    # (c9) деплой П1: почасовой догон подхватывает прерванную историю («продолжим
-    #      автоматически в течение часа»), хотя last_sync_at свежий.
-    #      Ревью 21.08 (мажор 5): и НЕ БЛОКИРУЕТСЯ на ней — первичная загрузка
-    #      легально идёт 30+ минут, а джоб ждал до часа НА КАЖДУЮ организацию
-    #      (после деплоя, убившего несколько фоновых историй, ежедневный джоб
-    #      вставал на часы и задерживал синки и дайджесты остальных).
-    from app import scheduler as _sched_p1
-    status = _interrupt_initial()
-    mock_ms.FAULTS["stock_delay_ms"] = 120  # продолжение заведомо не успеет за секунды
-    try:
-        _t_c9 = time.time()
-        res_c9 = _sched_p1.run_catchup_job()
-        _elapsed_c9 = time.time() - _t_c9
-        st_c9 = client.get("/api/sync/status").json()
-        check("(c9) догон ЗАПУСКАЕТ продолжение и сразу возвращается (не ждёт initial)",
-              list(res_c9.values()) == ["started_initial"] and _elapsed_c9 < 15
-              and st_c9.get("state") == "running" and st_c9.get("mode") == "initial",
-              f"res={res_c9} elapsed={_elapsed_c9:.1f}с state={st_c9.get('state')}")
-    finally:
-        mock_ms.reset_faults()
-    status = wait_sync_done(client)
-    check("(c9) запущенное догоном продолжение доехало: done, 60 дат, инвариант",
-          status.get("state") == "done" and status.get("mode") == "initial"
-          and _stock_day_stats() == (60, 0) and _stock_sets() == (ref_stock, ref_sales),
-          f"res={res_c9} state={status.get('state')} stats={_stock_day_stats()}")
+    if begin("p5p6"):
+        # (p5/p6) публичный прогресс и свежесть
+        fr = client.get("/api/freshness").json()
+        check("(p6) /api/freshness отдаёт coverage_days и history_days",
+              fr.get("coverage_days") == 60 and fr.get("history_days") == 60, f"got={fr}")
+        anon = httpx.Client(base_url=f"http://127.0.0.1:{APP_PORT}", timeout=10.0)
+        r_anon = anon.get("/api/sync/progress")
+        anon.close()
+        check("(p5) /api/sync/progress без сессии → 401", r_anon.status_code == 401,
+              f"status={r_anon.status_code}")
+        member = httpx.Client(headers={"X-Oborot-CSRF": "1"},
+                              base_url=f"http://127.0.0.1:{APP_PORT}", timeout=30.0)
+        r = member.post("/register", data={
+            "name": "Участник", "email": "member@test.io",
+            "password": "secret123", "org_name": "Временная",
+        })
+        c = sqlite3.connect(DB_PATH)
+        main_org = c.execute("SELECT org_id FROM connections WHERE kind='moysklad' "
+                             "ORDER BY id LIMIT 1").fetchone()[0]
+        mem_uid = c.execute("SELECT id FROM users WHERE email='member@test.io'").fetchone()[0]
+        c.execute("UPDATE memberships SET org_id=?, role='member' WHERE user_id=?", (main_org, mem_uid))
+        c.commit(); c.close()
+        r = member.post("/login", data={"email": "member@test.io", "password": "secret123"})
+        check("(p5) участник (member) залогинен в основную организацию", r.status_code == 303)
+        r_st = member.get("/api/sync/status")
+        r_pr = member.get("/api/sync/progress")
+        prog = r_pr.json() if r_pr.status_code == 200 else {}
+        # Минор 12: полоска должна знать окно быстрого старта (не зашивать «30 дней»)
+        # и режим прогона, чтобы прятаться на обычном инкременте в 06:00.
+        exp_keys = {"state", "mode", "phase", "progress_pct", "detail", "error", "error_cause",
+                    "coverage_days", "history_days", "window_days", "months", "stages",
+                    "eta_sec", "started_at", "finished_at", "can_manage"}
+        check("(p5) member: /api/sync/status → 403, /api/sync/progress → 200 с нужной формой",
+              r_st.status_code == 403 and r_pr.status_code == 200 and set(prog) == exp_keys
+              and "stats" not in prog and prog.get("can_manage") is False
+              and prog.get("coverage_days") == 60
+              and prog.get("history_days") == 60 and len(prog.get("months", [])) >= 2
+              and prog.get("window_days") == 10 and prog.get("mode") == "initial"
+              and len(prog.get("stages", [])) == 4,
+              f"status={r_st.status_code} progress={r_pr.status_code} keys={sorted(prog)}")
+        member.close()
 
-    # (d) смена токена при живом подключении: статус не падает в pending, синк стартует
-    r = client.post("/api/connect/moysklad", json={"token": mock_ms.TOKEN})
-    body_d = r.json() if r.status_code == 200 else {}
-    check("(d) POST /api/connect/moysklad при активном подключении запускает синк",
-          r.status_code == 200 and body_d.get("sync_started") is True
-          and "запущена" in body_d.get("note", ""), f"resp={body_d}")
-    r = client.post("/api/connect/moysklad", json={"token": mock_ms.TOKEN})
-    body_d2 = r.json() if r.status_code == 200 else {}
-    check("(d) повторная смена токена во время синка: sync_started=false, «уже идёт»",
-          r.status_code == 200 and body_d2.get("sync_started") is False
-          and "уже идёт" in body_d2.get("note", ""), f"resp={body_d2}")
-    st_d = client.get("/api/sync/status").json()
-    check("(d) статус синка после смены токена — running/done",
-          st_d.get("state") in ("running", "done"), f"state={st_d.get('state')}")
-    status = wait_sync_done(client, timeout=120)
-    conn_d = (client.get("/api/settings").json().get("connection") or {})
-    check("(d) подключение осталось active, синк done (incremental)",
-          conn_d.get("status") == "active" and status.get("state") == "done"
-          and status.get("mode") == "incremental",
-          f"status={conn_d.get('status')} state={status.get('state')} mode={status.get('mode')}")
-    check("(d) /api/settings отдаёт роль (owner) для owner-only кнопок",
-          client.get("/api/settings").json().get("role") == "owner")
+    if begin("b"):
+        # (b) одиночный 500 — прозрачный повтор
+        _set_faults(stock_500_once=True)
+        r = client.post("/api/sync/run")
+        status = wait_sync_done(client, timeout=120)
+        stats_b = status.get("stats", {})
+        check("(b) одиночный 500 повторён прозрачно (инкремент done, 5xx=1)",
+              status.get("state") == "done"
+              and (stats_b.get("ms_client") or {}).get("5xx") == 1,
+              f"state={status.get('state')} ms_client={stats_b.get('ms_client')}")
 
-    # (e) fail_streak и Telegram-алерт: один раз на серию, считая ручные провалы
-    from app import notify as _notify, scheduler as _sched
-    tg_calls = []
-    _orig_send = _notify.send_message
-    _notify.send_message = lambda chat_id, text: (tg_calls.append((chat_id, text)) or (True, ""))
-    os.environ["OBOROT_TG_BOT_TOKEN"] = "test-bot-token"
-    try:
-        # digest_enabled=False: иначе планировщик шлёт ещё и дайджест через тот
-        # же патченый send_message, и счётчик алертов «плывёт».
-        r = client.post("/api/notify/settings",
-                        json={"tg_chat_id": "4242", "tg_enabled": True, "digest_enabled": False})
-        check("(e) Telegram-настройки сохранены", r.status_code == 200)
+    if begin("c"):
+        # (c) стойкий 429 после 25 удачных отчётов (2,5 чанка по 5 дат × 2 склада)
+        status = _interrupt_initial()
+        stats_c = status.get("stats", {})
+        check("(c) синк упал с state=error", status.get("state") == "error",
+              f"state={status.get('state')}")
+        check("(c) текст ошибки: «История загружена за 10 дней из 60 — продолжим автоматически»",
+              status.get("error", "").startswith("История загружена за 10 дней из 60")
+              and "продолжим автоматически" in status.get("error", "")
+              and "ограничил частоту" in status.get("error", ""),
+              f"error={status.get('error', '')[:160]}")
+        check("(c) stats.history_loaded_from = начало окна (самая старая дата), есть отпечаток",
+              stats_c.get("history_loaded_from") == exp_from and stats_c.get("resume_fp"),
+              f"got={stats_c.get('history_loaded_from')} exp={exp_from} fp={stats_c.get('resume_fp')}")
+        conn_c = (client.get("/api/settings").json().get("connection") or {})
+        check("(c) подключение осталось active, coverage_days=10 сохранён, phase=history",
+              conn_c.get("status") == "active" and status.get("coverage_days") == 10
+              and status.get("phase") == "history",
+              f"status={conn_c.get('status')} coverage={status.get('coverage_days')} phase={status.get('phase')}")
+        check("(c) причина ошибки классифицирована (transient)",
+              stats_c.get("error_cause") == "transient", f"cause={stats_c.get('error_cause')}")
+        # Минор 10: сервис работает (подключение active, 10 дн. истории), текст
+        # обещает «продолжим автоматически» — засчитывать это в серию провалов и
+        # слать алерт «синк падает второй раз подряд» нельзя.
+        check("(c) прерывание ФОНОВОЙ истории не увеличивает fail_streak",
+              status.get("fail_streak") == 0 and status.get("alerted_streak") == 0,
+              f"streak={status.get('fail_streak')} alerted={status.get('alerted_streak')}")
+        n_dates_c, dups_c = _stock_day_stats()
+        check("(c) в БД частичная новая история (10 дат окна), старая стёрта на фазе today",
+              n_dates_c == 10 and dups_c == 0, f"dates={n_dates_c} dups={dups_c}")
+
+    if begin("c1"):
+        # (c1) ревью #1: продолжение падает ДО первого чанка — точка не теряется
         _msc.MAX_RETRIES = 1
-        _set_faults(stock_429_burst=100000)
-        client.post("/api/sync/run"); st1 = wait_sync_done(client)
-        check("(e) 1-й РУЧНОЙ провал: fail_streak=1, алерта нет",
-              st1.get("state") == "error" and st1.get("fail_streak") == 1 and not tg_calls,
-              f"state={st1.get('state')} streak={st1.get('fail_streak')} calls={len(tg_calls)}")
-        client.post("/api/sync/run"); st2 = wait_sync_done(client)
-        check("(e) 2-й РУЧНОЙ провал: fail_streak=2, алерт отправлен один раз",
-              st2.get("fail_streak") == 2 and st2.get("alerted_streak") == 2
-              and len(tg_calls) == 1 and tg_calls[0][0] == "4242"
-              and "второй раз подряд" in tg_calls[0][1],
-              f"streak={st2.get('fail_streak')} alerted={st2.get('alerted_streak')} calls={tg_calls[:1]}")
-        check("(e) алерт: текст ошибки, дата продаж, подсказка по причине (429 → повторим)",
-              tg_calls and "429" in tg_calls[0][1]
-              and str(fresh.get("last_sale_date")) in tg_calls[0][1]
-              and "Повторим автоматически" in tg_calls[0][1],
-              f"text={tg_calls[0][1][:220] if tg_calls else ''}")
-        res3 = _sched.run_daily_job()
-        st3 = client.get("/api/sync/status").json()
-        check("(e) 3-й провал (планировщик): fail_streak=3, повторного алерта нет",
-              list(res3.values()) == ["error"] and st3.get("fail_streak") == 3
-              and len(tg_calls) == 1,
-              f"res={res3} streak={st3.get('fail_streak')} calls={len(tg_calls)}")
-        _set_faults()
-        _msc.MAX_RETRIES = 10
-        res4 = _sched.run_daily_job()
-        st4 = client.get("/api/sync/status").json()
-        check("(e) успешный синк сбрасывает fail_streak и alerted_streak в 0",
-              list(res4.values()) == ["done"] and st4.get("fail_streak") == 0
-              and st4.get("alerted_streak") == 0 and len(tg_calls) == 1,
-              f"res={res4} streak={st4.get('fail_streak')} alerted={st4.get('alerted_streak')}")
+        try:
+            _set_faults(stock_429_burst=100000)
+            r = client.post("/api/sync/run")  # инкрементный вызов → продолжение initial
+            check("(c1) «Синхронизировать» при прерванной загрузке принят", r.status_code == 200)
+            status = wait_sync_done(client)
+        finally:
+            _msc.MAX_RETRIES = 10
+            _set_faults()
+        stats_c1 = status.get("stats", {})
+        check("(c1) запуск промотирован в initial и упал на первом запросе",
+              status.get("state") == "error" and status.get("mode") == "initial"
+              and stats_c1.get("resumed_from") == exp_from,
+              f"state={status.get('state')} mode={status.get('mode')} resumed={stats_c1.get('resumed_from')}")
+        check("(c1) точка продолжения сохранена, хотя новый запуск не записал ни чанка",
+              stats_c1.get("history_loaded_from") == exp_from
+              and status.get("error", "").startswith("История загружена за 10 дней из 60"),
+              f"from={stats_c1.get('history_loaded_from')} error={status.get('error', '')[:100]}")
+        n_dates_c1, _ = _stock_day_stats()
+        check("(c1) частичная история не тронута (10 дат)", n_dates_c1 == 10, f"dates={n_dates_c1}")
+
+    if begin("c2"):
+        # (c2) продолжение через «Синхронизировать» (инкрементный вызов); размер
+        #      чанка при продолжении ДРУГОЙ, чем у прерванного прогона (нит 14) —
+        #      границы чанков не совпадают, заплатка обязана держаться и так.
+        _mss.STOCK_CHUNK_DATES = 11
+        try:
+            r = client.post("/api/sync/run")
+            check("(c2) повторный запуск принят", r.status_code == 200)
+            status = wait_sync_done(client)
+        finally:
+            _mss.STOCK_CHUNK_DATES = 5
+        stats_c2 = status.get("stats", {})
+        check("(c2) продолжение завершилось done", status.get("state") == "done",
+              f"state={status.get('state')} error={status.get('error', '')[:120]}")
+        check("(c2) продолжение пошло НАЗАД от точки: 50 дат истории + «сегодня» обновлено",
+              stats_c2.get("resumed_from") == exp_from
+              and stats_c2.get("history_dates") == 60 - 10
+              and stats_c2.get("stock_dates") == 60 - 10 + 1
+              and stats_c2.get("stage_times", {}).get("month", {}).get("skipped") is True,
+              f"resumed_from={stats_c2.get('resumed_from')} history={stats_c2.get('history_dates')} "
+              f"dates={stats_c2.get('stock_dates')}")
+        n_dates_c2, dups_c2 = _stock_day_stats()
+        check("(c2) после продолжения: 60 дат, дублей (org, product, date) нет",
+              n_dates_c2 == 60 and dups_c2 == 0, f"dates={n_dates_c2} dups={dups_c2}")
+        summary_c = client.get("/api/summary").json()
+        check("(c2) остатки после продолжения = эталон mock-мира",
+              summary_c["stock_units"] == exp_units,
+              f"got={summary_c['stock_units']} expected={exp_units}")
+        check("(c2) явные нули распроданных сохранились через границу продолжения",
+              _sellout_zeros_ok())
+        check("(c2) точка продолжения снята после успеха",
+              "history_loaded_from" not in stats_c2 and "resume_fp" not in stats_c2)
+        check("(c2) ИНВАРИАНТ: stock_days/sales после продолжения == эталонному проходу",
+              _stock_sets() == (ref_stock, ref_sales),
+              f"diff_stock={len(_stock_sets()[0] ^ ref_stock)} diff_sales={len(_stock_sets()[1] ^ ref_sales)}")
+
+    if begin("c3"):
+        # (c3) ревью #3: «Полная пересборка» после прерывания — с нуля, не продолжение
+        status = _interrupt_initial()
+        check("(c3) подготовка: первичная снова прервана на 10 датах",
+              status.get("state") == "error" and _stock_day_stats()[0] == 10)
+        r = client.post("/api/sync/initial")
+        status = wait_sync_done(client)
+        stats_c3 = status.get("stats", {})
+        check("(c3) POST /api/sync/initial — настоящая пересборка (без resumed_from)",
+              r.status_code == 200 and status.get("state") == "done"
+              and "resumed_from" not in stats_c3 and stats_c3.get("stock_dates") == 60,
+              f"state={status.get('state')} stats_keys={sorted(stats_c3)[:8]}")
+        n_dates_c3, dups_c3 = _stock_day_stats()
+        check("(c3) после пересборки 60 дат без дублей, остатки = эталон, инвариант держится",
+              n_dates_c3 == 60 and dups_c3 == 0
+              and client.get("/api/summary").json()["stock_units"] == exp_units
+              and _stock_sets() == (ref_stock, ref_sales),
+              f"dates={n_dates_c3} dups={dups_c3}")
+
+    if begin("c4"):
+        # (c4) ревью #3: смена набора складов снимает точку продолжения и помечает
+        #      needs_full_rebuild — следующий ИНКРЕМЕНТНЫЙ вызов делает полную пересборку
+        status = _interrupt_initial()
+        check("(c4) подготовка: первичная прервана, точка есть",
+              status.get("state") == "error"
+              and status.get("stats", {}).get("history_loaded_from") == exp_from)
+        wh_list = client.get("/api/settings").json()["warehouses"]
+        wh_lab = next(w for w in wh_list if not w["active"])  # сервисный склад st-lab
+        r = client.post(f"/api/warehouses/{wh_lab['id']}/toggle", json={})  # включаем
+        st_after = client.get("/api/sync/status").json().get("stats", {})
+        check("(c4) toggle склада снял history_loaded_from и поставил needs_full_rebuild",
+              r.status_code == 200 and "history_loaded_from" not in st_after
+              and st_after.get("needs_full_rebuild") is True, f"stats={st_after}")
+        r = client.post("/api/sync/run")
+        status = wait_sync_done(client)
+        stats_c4 = status.get("stats", {})
+        exp_units_3 = round(sum(mock_ms.expected_stock_today(
+            stores=("st-flag", "st-web", "st-lab")).values()))
+        sum_c4 = client.get("/api/summary").json()
+        check("(c4) POST /api/sync/run → полная initial без resumed_from, 60 дат по НОВОМУ набору",
+              r.status_code == 200 and status.get("state") == "done"
+              and status.get("mode") == "initial" and "resumed_from" not in stats_c4
+              and "needs_full_rebuild" not in stats_c4
+              and _stock_day_stats() == (60, 0) and sum_c4["stock_units"] == exp_units_3,
+              f"state={status.get('state')} mode={status.get('mode')} "
+              f"dates={_stock_day_stats()} units={sum_c4['stock_units']} exp={exp_units_3}")
+        check("(c4) новый набор складов действительно другой (эталон 3 складов ≠ 2)",
+              exp_units_3 != exp_units)
+        client.post(f"/api/warehouses/{wh_lab['id']}/toggle", json={})  # вернуть как было
+        r = client.post("/api/connect/moysklad/stores", json={"ext_ids": ["st-flag", "st-web"]})
+        check("(c4) выбор складов прежним набором работает", r.status_code == 200)
+        r = client.post("/api/sync/initial")
+        status = wait_sync_done(client)
+        check("(c4) полная пересборка по прежнему набору done, 60 дат, эталон 2 складов",
+              status.get("state") == "done" and _stock_day_stats() == (60, 0)
+              and client.get("/api/summary").json()["stock_units"] == exp_units,
+              f"state={status.get('state')} stats={_stock_day_stats()}")
+
+    if begin("c6c7"):
+        # (c6) ревью (2) #1: провал ДО истории остатков (429 на ассортименте) не теряет
+        #      точку продолжения; (c7) — то же для флага needs_full_rebuild
+        status = _interrupt_initial()
+        check("(c6) подготовка: первичная прервана, точка есть",
+              status.get("stats", {}).get("history_loaded_from") == exp_from)
         _msc.MAX_RETRIES = 1
-        _set_faults(stock_429_burst=100000)
-        _sched.run_daily_job(); _sched.run_daily_job()
-        st5 = client.get("/api/sync/status").json()
-        check("(e) новая серия провалов (планировщик ×2) → второй алерт",
-              st5.get("fail_streak") == 2 and len(tg_calls) == 2,
-              f"streak={st5.get('fail_streak')} calls={len(tg_calls)}")
-        _set_faults()
-        _msc.MAX_RETRIES = 10
-        res6 = _sched.run_daily_job()
-        check("(e) восстановление после серии", list(res6.values()) == ["done"])
-    finally:
-        _notify.send_message = _orig_send
-        os.environ.pop("OBOROT_TG_BOT_TOKEN", None)
-        _msc.MAX_RETRIES = 10
-        _set_faults()
-        client.post("/api/notify/settings", json={"tg_chat_id": "", "tg_enabled": False})
+        try:
+            _set_faults(assortment_429_burst=100000)
+            r = client.post("/api/sync/run")
+            status = wait_sync_done(client)
+        finally:
+            _msc.MAX_RETRIES = 10
+            _set_faults()
+        stats_c6 = status.get("stats", {})
+        check("(c6) запуск упал на ассортименте (до истории), точка и отпечаток сохранены",
+              r.status_code == 200 and status.get("state") == "error"
+              and stats_c6.get("history_loaded_from") == exp_from and stats_c6.get("resume_fp")
+              and _stock_day_stats()[0] == 10,
+              f"state={status.get('state')} stats={stats_c6}")
+        r = client.post("/api/sync/run")
+        status = wait_sync_done(client)
+        stats_c6b = status.get("stats", {})
+        check("(c6) следующий запуск корректно продолжил (resumed_from, 60 дат, эталон)",
+              status.get("state") == "done" and stats_c6b.get("resumed_from") == exp_from
+              and _stock_day_stats() == (60, 0)
+              and client.get("/api/summary").json()["stock_units"] == exp_units,
+              f"state={status.get('state')} resumed={stats_c6b.get('resumed_from')} stats={_stock_day_stats()}")
+
+        status = _interrupt_initial()
+        wh_list = client.get("/api/settings").json()["warehouses"]
+        wh_lab = next(w for w in wh_list if not w["active"])
+        client.post(f"/api/warehouses/{wh_lab['id']}/toggle", json={})  # → needs_full_rebuild
+        client.post(f"/api/warehouses/{wh_lab['id']}/toggle", json={})  # набор прежний, флаг стоит
+        check("(c7) подготовка: needs_full_rebuild выставлен",
+              client.get("/api/sync/status").json().get("stats", {}).get("needs_full_rebuild") is True)
+        _msc.MAX_RETRIES = 1
+        try:
+            _set_faults(assortment_429_burst=100000)
+            client.post("/api/sync/run")
+            status = wait_sync_done(client)
+        finally:
+            _msc.MAX_RETRIES = 10
+            _set_faults()
+        stats_c7 = status.get("stats", {})
+        check("(c7) провал на ассортименте: флаг needs_full_rebuild пережил запуск",
+              status.get("state") == "error" and stats_c7.get("needs_full_rebuild") is True,
+              f"state={status.get('state')} stats={stats_c7}")
+        r = client.post("/api/sync/run")
+        status = wait_sync_done(client)
+        stats_c7b = status.get("stats", {})
+        check("(c7) следующий запуск — полная initial, флаг снят, 60 дат, эталон",
+              status.get("state") == "done" and status.get("mode") == "initial"
+              and "resumed_from" not in stats_c7b and "needs_full_rebuild" not in stats_c7b
+              and _stock_day_stats() == (60, 0)
+              and client.get("/api/summary").json()["stock_units"] == exp_units,
+              f"state={status.get('state')} mode={status.get('mode')} stats={_stock_day_stats()}")
+
+    if begin("c8"):
+        # (c8) ревью (2) #3: смена складов во время идущего синка → 409, склад не изменён
+        r = client.post("/api/sync/initial")
+        check("(c8) первичный синк запущен", r.status_code == 200)
+        r_t = client.post(f"/api/warehouses/{wh_lab['id']}/toggle", json={})
+        r_s = client.post("/api/connect/moysklad/stores", json={"ext_ids": ["st-flag"]})
+        wh_now = next(w for w in client.get("/api/settings").json()["warehouses"]
+                      if w["id"] == wh_lab["id"])
+        check("(c8) toggle и выбор складов во время синка → 409 «Дождитесь», склад не изменён",
+              r_t.status_code == 409 and "Дождитесь" in r_t.json().get("detail", "")
+              and r_s.status_code == 409 and wh_now["active"] is False,
+              f"toggle={r_t.status_code} stores={r_s.status_code} active={wh_now['active']}")
+        status = wait_sync_done(client)
+        check("(c8) синк завершился done, 60 дат", status.get("state") == "done"
+              and _stock_day_stats() == (60, 0))
+
+    if begin("c5"):
+        # (c5) ревью #3: несовпадающий отпечаток (другой набор/окно) → свежая initial
+        status = _interrupt_initial()
+        c = sqlite3.connect(DB_PATH)
+        c.execute("UPDATE sync_state SET stats_json = REPLACE(stats_json, ?, ?)",
+                  (f"|{mock_ms.HISTORY_DAYS}\"", "|999\""))
+        c.commit(); c.close()
+        st_fp = client.get("/api/sync/status").json().get("stats", {})
+        check("(c5) подготовка: отпечаток подменён", st_fp.get("resume_fp", "").endswith("|999"),
+              f"fp={st_fp.get('resume_fp')}")
+        r = client.post("/api/sync/run")
+        status = wait_sync_done(client)
+        stats_c5 = status.get("stats", {})
+        check("(c5) при чужом отпечатке — полная initial (без resumed_from), 60 дат",
+              status.get("state") == "done" and status.get("mode") == "initial"
+              and "resumed_from" not in stats_c5 and _stock_day_stats() == (60, 0),
+              f"state={status.get('state')} mode={status.get('mode')} stats={_stock_day_stats()}")
+
+    if begin("c9"):
+        # (c9) деплой П1: почасовой догон подхватывает прерванную историю («продолжим
+        #      автоматически в течение часа»), хотя last_sync_at свежий.
+        #      Ревью 21.08 (мажор 5): и НЕ БЛОКИРУЕТСЯ на ней — первичная загрузка
+        #      легально идёт 30+ минут, а джоб ждал до часа НА КАЖДУЮ организацию
+        #      (после деплоя, убившего несколько фоновых историй, ежедневный джоб
+        #      вставал на часы и задерживал синки и дайджесты остальных).
+        from app import scheduler as _sched_p1
+        status = _interrupt_initial()
+        mock_ms.FAULTS["stock_delay_ms"] = 120  # продолжение заведомо не успеет за секунды
+        try:
+            _t_c9 = time.time()
+            res_c9 = _sched_p1.run_catchup_job()
+            _elapsed_c9 = time.time() - _t_c9
+            st_c9 = client.get("/api/sync/status").json()
+            check("(c9) догон ЗАПУСКАЕТ продолжение и сразу возвращается (не ждёт initial)",
+                  list(res_c9.values()) == ["started_initial"] and _elapsed_c9 < 15
+                  and st_c9.get("state") == "running" and st_c9.get("mode") == "initial",
+                  f"res={res_c9} elapsed={_elapsed_c9:.1f}с state={st_c9.get('state')}")
+        finally:
+            mock_ms.reset_faults()
+        status = wait_sync_done(client)
+        check("(c9) запущенное догоном продолжение доехало: done, 60 дат, инвариант",
+              status.get("state") == "done" and status.get("mode") == "initial"
+              and _stock_day_stats() == (60, 0) and _stock_sets() == (ref_stock, ref_sales),
+              f"res={res_c9} state={status.get('state')} stats={_stock_day_stats()}")
+
+    if begin("d"):
+        # (d) смена токена при живом подключении: статус не падает в pending, синк стартует
+        r = client.post("/api/connect/moysklad", json={"token": mock_ms.TOKEN})
+        body_d = r.json() if r.status_code == 200 else {}
+        check("(d) POST /api/connect/moysklad при активном подключении запускает синк",
+              r.status_code == 200 and body_d.get("sync_started") is True
+              and "запущена" in body_d.get("note", ""), f"resp={body_d}")
+        r = client.post("/api/connect/moysklad", json={"token": mock_ms.TOKEN})
+        body_d2 = r.json() if r.status_code == 200 else {}
+        check("(d) повторная смена токена во время синка: sync_started=false, «уже идёт»",
+              r.status_code == 200 and body_d2.get("sync_started") is False
+              and "уже идёт" in body_d2.get("note", ""), f"resp={body_d2}")
+        st_d = client.get("/api/sync/status").json()
+        check("(d) статус синка после смены токена — running/done",
+              st_d.get("state") in ("running", "done"), f"state={st_d.get('state')}")
+        status = wait_sync_done(client, timeout=120)
+        conn_d = (client.get("/api/settings").json().get("connection") or {})
+        check("(d) подключение осталось active, синк done (incremental)",
+              conn_d.get("status") == "active" and status.get("state") == "done"
+              and status.get("mode") == "incremental",
+              f"status={conn_d.get('status')} state={status.get('state')} mode={status.get('mode')}")
+        check("(d) /api/settings отдаёт роль (owner) для owner-only кнопок",
+              client.get("/api/settings").json().get("role") == "owner")
+
+    if begin("e"):
+        # (e) fail_streak и Telegram-алерт: один раз на серию, считая ручные провалы
+        from app import notify as _notify, scheduler as _sched
+        tg_calls = []
+        _orig_send = _notify.send_message
+        _notify.send_message = lambda chat_id, text: (tg_calls.append((chat_id, text)) or (True, ""))
+        os.environ["OBOROT_TG_BOT_TOKEN"] = "test-bot-token"
+        try:
+            # digest_enabled=False: иначе планировщик шлёт ещё и дайджест через тот
+            # же патченый send_message, и счётчик алертов «плывёт».
+            r = client.post("/api/notify/settings",
+                            json={"tg_chat_id": "4242", "tg_enabled": True, "digest_enabled": False})
+            check("(e) Telegram-настройки сохранены", r.status_code == 200)
+            _msc.MAX_RETRIES = 1
+            _set_faults(stock_429_burst=100000)
+            client.post("/api/sync/run"); st1 = wait_sync_done(client)
+            check("(e) 1-й РУЧНОЙ провал: fail_streak=1, алерта нет",
+                  st1.get("state") == "error" and st1.get("fail_streak") == 1 and not tg_calls,
+                  f"state={st1.get('state')} streak={st1.get('fail_streak')} calls={len(tg_calls)}")
+            client.post("/api/sync/run"); st2 = wait_sync_done(client)
+            check("(e) 2-й РУЧНОЙ провал: fail_streak=2, алерт отправлен один раз",
+                  st2.get("fail_streak") == 2 and st2.get("alerted_streak") == 2
+                  and len(tg_calls) == 1 and tg_calls[0][0] == "4242"
+                  and "второй раз подряд" in tg_calls[0][1],
+                  f"streak={st2.get('fail_streak')} alerted={st2.get('alerted_streak')} calls={tg_calls[:1]}")
+            check("(e) алерт: текст ошибки, дата продаж, подсказка по причине (429 → повторим)",
+                  tg_calls and "429" in tg_calls[0][1]
+                  and str(fresh.get("last_sale_date")) in tg_calls[0][1]
+                  and "Повторим автоматически" in tg_calls[0][1],
+                  f"text={tg_calls[0][1][:220] if tg_calls else ''}")
+            res3 = _sched.run_daily_job()
+            st3 = client.get("/api/sync/status").json()
+            check("(e) 3-й провал (планировщик): fail_streak=3, повторного алерта нет",
+                  list(res3.values()) == ["error"] and st3.get("fail_streak") == 3
+                  and len(tg_calls) == 1,
+                  f"res={res3} streak={st3.get('fail_streak')} calls={len(tg_calls)}")
+            _set_faults()
+            _msc.MAX_RETRIES = 10
+            res4 = _sched.run_daily_job()
+            st4 = client.get("/api/sync/status").json()
+            check("(e) успешный синк сбрасывает fail_streak и alerted_streak в 0",
+                  list(res4.values()) == ["done"] and st4.get("fail_streak") == 0
+                  and st4.get("alerted_streak") == 0 and len(tg_calls) == 1,
+                  f"res={res4} streak={st4.get('fail_streak')} alerted={st4.get('alerted_streak')}")
+            _msc.MAX_RETRIES = 1
+            _set_faults(stock_429_burst=100000)
+            _sched.run_daily_job(); _sched.run_daily_job()
+            st5 = client.get("/api/sync/status").json()
+            check("(e) новая серия провалов (планировщик ×2) → второй алерт",
+                  st5.get("fail_streak") == 2 and len(tg_calls) == 2,
+                  f"streak={st5.get('fail_streak')} calls={len(tg_calls)}")
+            _set_faults()
+            _msc.MAX_RETRIES = 10
+            res6 = _sched.run_daily_job()
+            check("(e) восстановление после серии", list(res6.values()) == ["done"])
+        finally:
+            _notify.send_message = _orig_send
+            os.environ.pop("OBOROT_TG_BOT_TOKEN", None)
+            _msc.MAX_RETRIES = 10
+            _set_faults()
+            client.post("/api/notify/settings", json={"tg_chat_id": "", "tg_enabled": False})
     mock_api.close()
     summary = client.get("/api/summary").json()
+
+    # Хвост сценария терминален: шарду, которому он не достался, дальше делать
+    # нечего — поэтому здесь обычный выход, а не ещё один уровень отступа.
+    if not begin("tail"):
+        client.close()
+        return finish()
 
     print("== Новая организация: смена токена без складов не запускает синк ==")
     newbie = httpx.Client(headers={"X-Oborot-CSRF": "1"},
@@ -2981,12 +3114,7 @@ def run_scenario() -> int:
     demo.close()
     client.close()
 
-    print()
-    print(f"ИТОГО: {len(PASS)} OK, {len(FAIL)} FAIL")
-    if FAIL:
-        print("Провалены:", *FAIL, sep="\n  - ")
-        return 1
-    return 0
+    return finish()
 
 
 if __name__ == "__main__":
