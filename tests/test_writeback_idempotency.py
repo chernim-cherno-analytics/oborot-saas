@@ -731,7 +731,8 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
         with httpx.Client(headers=dict(c.headers), cookies=c.cookies,
                           base_url=base, timeout=120.0) as cc:
             rr = cc.post(f"/api/orders/{order_id}/push-to-ms")
-            agent_res.append(rr.status_code)
+            agent_res.append({"order_id": order_id, "status": rr.status_code,
+                              "body": body_of(rr)})
             if rr.status_code != 200:
                 print(f"       (агент {order_id}: {rr.status_code} {rr.text[:200]})")
 
@@ -741,14 +742,44 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
     for t in threads:
         t.join(timeout=120)
     mock_api.post("/__test/faults", json={})
+    statuses8 = sorted(r["status"] for r in agent_res)
+    check("один пуш принят, второй отклонён org-локом синка (DATA-6)",
+          statuses8 == [200, 409], f"статусы={statuses8}")
+    losers8 = [r for r in agent_res if r["status"] == 409]
+    detail8a = str(losers8[0]["body"].get("detail") or "") if losers8 else ""
+    check("409 назван честно — идёт синхронизация, а не иная причина",
+          "Идёт синхронизация" in detail8a, f"detail={detail8a[:200]}")
+    loser_id8 = losers8[0]["order_id"] if losers8 else None
+    check("у отклонённого заказа ms_doc_href пуст — лок не оставил пометки",
+          loser_id8 is not None and (col_of(loser_id8, "ms_doc_href") or "") == "",
+          f"order={loser_id8} ms_doc_href="
+          f"{col_of(loser_id8, 'ms_doc_href') if loser_id8 is not None else None!r}")
+    loser_key8 = col_of(loser_id8, "ms_sync_id") if loser_id8 is not None else None
+    check("ни один созданный документ не несёт ключ отклонённого заказа",
+          not loser_key8 or all(str(d.get("syncId") or "") != str(loser_key8)
+                                for d in docs_created()),
+          f"ключ={loser_key8!r}")
+    r_retry8 = push(c, loser_id8)
+    check("отклонённый заказ отправлен синхронно после снятия фолтов — 200",
+          r_retry8.status_code == 200, f"status={r_retry8.status_code} {r_retry8.text[:200]}")
+
     prod = [cp for cp in mock_ms.COUNTERPARTIES if cp["name"] == ms_writeback.AGENT_NAME]
-    check("обе отправки прошли", sorted(agent_res) == [200, 200],
-          f"статусы={sorted(agent_res)}")
     check("КОНТРАГЕНТ СОЗДАН РОВНО ОДИН, а не по одному на клик",
           len(prod) == 1, f"контрагентов «{ms_writeback.AGENT_NAME}»={len(prod)}")
     check("привязка контрагента закреплена в базе",
           str(conn_col("ms_agent_href") or "").startswith("http"),
           f"ms_agent_href={conn_col('ms_agent_href')!r}")
+    href_a8 = str(col_of(o8a, "ms_doc_href") or "")
+    href_b8 = str(col_of(o8b, "ms_doc_href") or "")
+    check("оба заказа получили настоящую ссылку на документ, а не пометку",
+          href_a8.startswith("http") and href_b8.startswith("http")
+          and not ms_writeback.is_internal_href(href_a8)
+          and not ms_writeback.is_internal_href(href_b8),
+          f"o8a={href_a8!r} o8b={href_b8!r}")
+    created_hrefs8 = {d["meta"]["href"] for d in docs_created()}
+    check("это ДВА РАЗНЫХ созданных документа, а не один на двоих",
+          href_a8 != href_b8 and {href_a8, href_b8} <= created_hrefs8,
+          f"o8a={href_a8!r} o8b={href_b8!r} created={created_hrefs8}")
 
     mock_ms.COUNTERPARTIES.clear()
     mock_ms.COUNTERPARTIES.extend([

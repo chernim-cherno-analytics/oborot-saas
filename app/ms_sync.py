@@ -124,6 +124,51 @@ log = logging.getLogger("oborot.ms_sync")
 _threads: dict[int, threading.Thread] = {}
 _threads_lock = threading.Lock()
 
+# DATA-6: гонка между импортом «Заказов поставщику» (_sync_incoming) и
+# отправкой заказа (ms_writeback.push_order → routes_connect.api_order_push_to_ms).
+# _sync_incoming читает purchaseorder из МойСклада, а затем ОДНОЙ транзакцией
+# обнуляет и переписывает ordered_qty.ms_qty/ms_qty_tracked по прочитанному
+# снимку; если между чтением и записью push успел создать документ и
+# зафиксировать свой локальный вклад, перезапись стирает его до следующего
+# синка. Лок — процесс-локальный (D-17: прод — один воркер, то же допущение,
+# на котором уже стоят `_threads` выше, кэш и лимитер), по одному на
+# организацию.
+#
+# Синк держит его БЛОКИРУЮЩИМ захватом от чтения purchaseorder до конца
+# перезаписи (см. _sync_incoming) — это безопасно, потому что синк целиком
+# выполняется на своём собственном фоновом потоке (_thread_main), где и так
+# уже полно синхронных блокирующих вызовов (SessionLocal() внутри async).
+# Push захватывает его НЕБЛОКИРУЮЩИМ образом (см. routes_connect) — иначе
+# HTTP-запрос владельца завис бы на время фонового синка — и при занятости
+# отдаёт 409 «дождитесь синхронизации», как и соседние ручки. Если лок
+# держит push, синк дожидается его завершения и только потом читает
+# purchaseorder — тогда только что созданный документ гарантированно попадёт
+# в снимок, а не потеряется до следующего цикла.
+_incoming_locks: dict[int, threading.Lock] = {}
+_incoming_locks_meta_lock = threading.Lock()
+
+
+def _incoming_lock(org_id: int) -> threading.Lock:
+    with _incoming_locks_meta_lock:
+        lock = _incoming_locks.get(org_id)
+        if lock is None:
+            lock = threading.Lock()
+            _incoming_locks[org_id] = lock
+        return lock
+
+
+def try_acquire_incoming_lock(org_id: int) -> bool:
+    """Неблокирующий захват (со стороны push). False — синк уже владеет локом."""
+    return _incoming_lock(org_id).acquire(blocking=False)
+
+
+def release_incoming_lock(org_id: int) -> None:
+    try:
+        _incoming_lock(org_id).release()
+    except RuntimeError:  # уже снят — не маскируем повторным падением
+        pass
+
+
 # Этапы первичной загрузки в порядке выполнения (для /api/sync/progress).
 STAGE_TITLES = (
     ("products", "Товары и цены"),
@@ -2549,6 +2594,25 @@ async def _backmatch_by_sync_id(org_id: int, docs: list[dict],
 async def _sync_incoming(org_id: int, client: MoySkladClient,
                          ext_to_pid: dict[str, int], stats: dict,
                          progress: tuple[float, float] = (95.5, 97.0)) -> None:
+    """Обёртка _sync_incoming_locked под организационным локом (см. DATA-6).
+
+    Блокирующий захват безопасен: вся функция выполняется на собственном
+    фоновом потоке синка (см. _thread_main), где ничего другого параллельно
+    не крутится. Если лок в этот момент держит push (routes_connect),
+    ждём его завершения — тогда чтение purchaseorder ниже гарантированно
+    увидит документ, который push мог только что создать.
+    """
+    lock = _incoming_lock(org_id)
+    lock.acquire()
+    try:
+        await _sync_incoming_locked(org_id, client, ext_to_pid, stats, progress)
+    finally:
+        lock.release()
+
+
+async def _sync_incoming_locked(org_id: int, client: MoySkladClient,
+                                ext_to_pid: dict[str, int], stats: dict,
+                                progress: tuple[float, float]) -> None:
     """entity/purchaseorder → ordered_qty.ms_qty (полная пересборка вклада МС).
 
     «Едет» по документу = Σ по позициям (quantity − shipped): shipped растёт

@@ -343,6 +343,19 @@ def _page(rows: list, limit: int, offset: int) -> dict:
     }
 
 
+def _race_hook(name: str) -> None:
+    """DATA-6: точка инструментирования для детерминированной блокировки
+    синхронного маршрута (см. tests/test_writeback_race.py). По умолчанию —
+    no-op; тест подменяет `mock_ms._race_hook` на время сценария."""
+    return None
+
+
+async def _race_hook_async(name: str) -> None:
+    """То же самое для async-маршрутов: подмена ждёт через await, не блокируя
+    event loop мока (см. entity_purchaseorder_create)."""
+    return None
+
+
 @app.get("/entity/{entity}/{doc_id}/positions")
 def entity_doc_positions(entity: str, doc_id: str, request: Request,
                          limit: int = 1000, offset: int = 0):
@@ -350,6 +363,7 @@ def entity_doc_positions(entity: str, doc_id: str, request: Request,
     хвоста документов >100 позиций)."""
     _auth(request)
     if entity == "purchaseorder":
+        _race_hook("po_positions")
         for doc in PURCHASE_ORDERS:
             if doc.get("id") == doc_id:
                 return _page(doc["positions"]["rows"], limit, offset)
@@ -1316,6 +1330,7 @@ def _require_meta_href(body: dict, field: str, expected_type: str) -> str:
 async def entity_purchaseorder_create(request: Request):
     _auth(request)
     body = await request.json()
+    await _race_hook_async("po_create")
     org_href = _require_meta_href(body, "organization", "organization")
     if org_href.rstrip("/").rsplit("/", 1)[-1] != ORG_EXT_ID:
         raise HTTPException(status_code=412, detail={"errors": [

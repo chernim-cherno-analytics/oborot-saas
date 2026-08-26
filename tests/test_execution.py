@@ -865,9 +865,11 @@ def run() -> int:  # noqa: C901 — сценарный тест, ветвлен�
     import ast as _ast
 
     tree = _ast.parse((ROOT / "app" / "ms_sync.py").read_text(encoding="utf-8"))
+    # DATA-6: `_sync_incoming` теперь тонкая обёртка организационного лока,
+    # тело переехало в `_sync_incoming_locked` — искать вызовы нужно там же.
     fn = next((n for n in _ast.walk(tree)
                if isinstance(n, (_ast.FunctionDef, _ast.AsyncFunctionDef))
-               and n.name == "_sync_incoming"), None)
+               and n.name == "_sync_incoming_locked"), None)
     calls = {n.func.id for n in _ast.walk(fn) if isinstance(n, _ast.Call)
              and isinstance(n.func, _ast.Name)} if fn else set()
     check("синк заказов поставщику пишет приёмки по «отгружено»",
