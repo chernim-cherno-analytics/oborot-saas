@@ -2734,10 +2734,10 @@ def run_scenario() -> int:
           r.status_code == 200 and r.json().get("lead_time_days") == 70
           and r.json().get("moq") == 30 and r.json().get("pack_multiple") == 6,
           f"resp={r.text[:160]}")
-    for base in (small["base_name"], big["base_name"]):
+    for label, base in (("малая", small["base_name"]), ("крупная", big["base_name"])):
         rr = demo.post("/api/productions/assign", json={"base_name": base, "production_id": pid})
-        check(f"позиция перенесена на «Бишкек»: {base}", rr.status_code == 200,
-              f"status={rr.status_code}")
+        check(f"позиция перенесена на «Бишкек»: {label}", rr.status_code == 200,
+              f"base={base} status={rr.status_code}")
     moved = {it["base_name"]: it for it in demo.get("/api/replenish").json()["items"]}
     s_it = moved[small["base_name"]]
     b_it = moved[big["base_name"]]
@@ -2758,10 +2758,11 @@ def run_scenario() -> int:
           b_it["need"] % 6 == 0 and b_it["need"] >= b_it["need_raw"] > 0
           and b_it["need"] - b_it["need_raw"] < 6,
           f"{b_it['need_raw']} → {b_it['need']}")
-    for it in (s_it, b_it):
-        check(f"сумма по размерам равна итогу позиции: {it['base_name']}",
+    for label, it in (("малая", s_it), ("крупная", b_it)):
+        check(f"сумма по размерам равна итогу позиции: {label}",
               sum(v["rec"] for v in it["sizes"].values()) == it["need"],
-              f"размеры={sum(v['rec'] for v in it['sizes'].values())} итог={it['need']}")
+              f"base={it['base_name']} размеры={sum(v['rec'] for v in it['sizes'].values())} "
+              f"итог={it['need']}")
     check("срок производства отдаётся по позиции",
           s_it["lead_time_days"] == 70 and b_it["lead_time_days"] == 70,
           f"got={(s_it['lead_time_days'], b_it['lead_time_days'])}")
