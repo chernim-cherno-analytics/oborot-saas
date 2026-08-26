@@ -3942,6 +3942,105 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
           qty_map().get(base31, (0.0, 0.0, 0.0)) == before31d,
           f"qty_map={qty_map().get(base31)}")
 
+    # ── 32. Corrective (discussion_r3865067879): in-attempt post-create
+    #        lost-response recovery must use ACTUAL document positions ──────
+    #
+    # discussion_r3865067879 / issuecomment-5428606310: create_purchase_order
+    # raises, and find_own_document(..., after_create=True) finds the SAME
+    # document WITHIN the SAME push_order() call — one push(), not a retry.
+    # Before the fix, this branch fell through to commit_push with
+    # pushed_by_base still computed from the pre-POST local match: the
+    # actual-position attribution step (fetch_positions + positions_pushed_by_base
+    # + fail-closed) ran only for the pre-existing-document branch (30а/31).
+    # The mock models "document edited/normalized in the same network window
+    # the lost response happened in" directly inside
+    # entity_purchaseorder_create, via po_create_then_fail_mutate_qty /
+    # po_create_then_fail_extra_unmapped — no second push() call, no manual
+    # mutation between attempts, so the divergence is provably in-attempt.
+    print("\n== 32. In-attempt post-create lost-response recovery reads "
+          "ACTUAL document positions (discussion_r3865067879) ==")
+
+    base32, sizes32 = next((b, s) for b, s in bases30
+                           if s and b not in (base29, base30a, base30b, base31,
+                                              base31w))
+    size32 = sizes32[0]
+
+    def _order32(name: str, qty: int) -> tuple:
+        r = c.post("/api/orders", json={
+            "name": name, "eta_date": None,
+            "items": [{"base_name": base32, "qty": qty,
+                      "sizes": {size32: qty}, "cost": 100}],
+            "allow_duplicate": True,
+        })
+        check(f"{name}: заказ создан", r.status_code == 200, r.text[:150])
+        oid = int(r.json()["id"])
+        r = c.post(f"/api/orders/{oid}/status", json={"status": "sent"})
+        check(f"{name}: переведён в sent", r.status_code == 200)
+        return oid, qty_map().get(base32, (0.0, 0.0, 0.0))
+
+    # 32а. Divergence: actual document quantity (2) differs from pre-POST
+    #      local match (3) — ONE push() call must recover in-attempt and use
+    #      the actual quantity, not the local match.
+    o32a, before32a = _order32("In-attempt divergence (discussion_r3865067879)", 3)
+    mock_api.post("/__test/faults", json={
+        "po_create_then_fail": 1, "po_create_then_fail_mutate_qty": 2,
+    })
+    r = push(c, o32a)
+    mock_api.post("/__test/faults", json={})
+    body32a = r.json() if r.status_code == 200 else {}
+    check("32а: одна попытка push() сама восстановила документ (recovered), "
+          "без второго вызова",
+          r.status_code == 200 and body32a.get("recovered") is True,
+          f"status={r.status_code} recovered={body32a.get('recovered')} {r.text[:160]}")
+    after32a = qty_map().get(base32, (0.0, 0.0, 0.0))
+    check("32а: перенесено ФАКТИЧЕСКОЕ количество документа (2), а не "
+          "pre-POST локальный матч (3): qty-2, ms_qty+2",
+          after32a[0] == before32a[0] - 2 and after32a[1] == before32a[1] + 2,
+          f"{before32a} -> {after32a} (ждали qty-2/ms_qty+2, НЕ qty-3/ms_qty+3)")
+    from app.models import parse_items_payload as _parse32a  # noqa: PLC0415
+    _, pushed32a = _parse32a(col_of(o32a, "items_json"))
+    check("32а: маркер несёт ФАКТИЧЕСКОЕ количество документа (2), не "
+          "pre-POST локальный матч (3)",
+          pushed32a == {base32: 2}, f"pushed_by_base={pushed32a}")
+
+    # 32б. Unmapped positive line, same in-attempt recovery: fail-closed,
+    #      no link/move/marker, single push() call.
+    o32b, before32b = _order32("In-attempt unmapped fail-closed "
+                               "(discussion_r3865067879)", 2)
+    mock_api.post("/__test/faults", json={
+        "po_create_then_fail": 1, "po_create_then_fail_extra_unmapped": 1,
+    })
+    r = push(c, o32b)
+    mock_api.post("/__test/faults", json={})
+    check("32б: несопоставленная позиция при самом создании — одна попытка "
+          "честно неизвестна (502), не 200",
+          r.status_code == 502, f"status={r.status_code} {r.text[:160]}")
+    href32b = col_of(o32b, "ms_doc_href")
+    check("32б: ссылка осталась unknown (T2 не вызывался)",
+          ms_writeback.is_unknown(str(href32b or "")), f"ms_doc_href={href32b!r}")
+    check("32б: qty/ms_qty НЕ тронуты",
+          qty_map().get(base32, (0.0, 0.0, 0.0)) == before32b,
+          f"qty_map={qty_map().get(base32)}")
+
+    # 32в. Fractional actual quantity, same in-attempt recovery: fail-closed,
+    #      no link/move/marker, single push() call.
+    o32c, before32c = _order32("In-attempt fractional fail-closed "
+                               "(discussion_r3865067879)", 2)
+    mock_api.post("/__test/faults", json={
+        "po_create_then_fail": 1, "po_create_then_fail_mutate_qty": 1.5,
+    })
+    r = push(c, o32c)
+    mock_api.post("/__test/faults", json={})
+    check("32в: дробное фактическое количество при самом создании — одна "
+          "попытка честно неизвестна (502), не 200",
+          r.status_code == 502, f"status={r.status_code} {r.text[:160]}")
+    href32c = col_of(o32c, "ms_doc_href")
+    check("32в: ссылка осталась unknown (T2 не вызывался)",
+          ms_writeback.is_unknown(str(href32c or "")), f"ms_doc_href={href32c!r}")
+    check("32в: qty/ms_qty НЕ тронуты",
+          qty_map().get(base32, (0.0, 0.0, 0.0)) == before32c,
+          f"qty_map={qty_map().get(base32)}")
+
     mock_api.post("/__test/faults", json={})
     c.close()
     mock_api.close()

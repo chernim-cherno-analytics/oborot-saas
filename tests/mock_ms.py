@@ -647,6 +647,18 @@ FAULTS: dict = {"stock_ok_before": 0, "stock_429_burst": 0,
                 # не создал. Обратная граница: это не потерянный ответ, и
                 # обходиться с ним как с неизвестным исходом нельзя.
                 "po_create_refuse": 0,
+                # po_create_then_fail_mutate_qty — вместе с po_create_then_fail:
+                # ПЕРЕД тем, как ответ на создание «падает», первая позиция
+                # уже созданного документа получает ЭТО количество вместо
+                # того, что было в теле запроса (моделирует правку/нормализацию
+                # документа за то же сетевое окно, в котором создание случилось
+                # раньше ответа). 0 — выключено; дробное значение допустимо.
+                "po_create_then_fail_mutate_qty": 0,
+                # po_create_then_fail_extra_unmapped — вместе с
+                # po_create_then_fail: документу перед «падением» ответа
+                # дописывается позиция с ext-id, которого нет ни в одном
+                # текущем base (несопоставимая положительная позиция).
+                "po_create_then_fail_extra_unmapped": 0,
                 "stock_delay_ms": 0}
 FAULT_STATS: dict = {"stock_requests": 0, "stock_ok": 0, "stock_429": 0,
                      "stock_500": 0, "po_list_ok": 0}
@@ -663,6 +675,8 @@ def reset_faults() -> None:
                   po_create_delay_ms=0, po_hide_created=0,
                   po_list_ok_before=0, po_list_status=0,
                   po_create_twin_then_fail=0, po_create_refuse=0,
+                  po_create_then_fail_mutate_qty=0,
+                  po_create_then_fail_extra_unmapped=0,
                   stock_delay_ms=0)
     for k in FAULT_STATS:
         FAULT_STATS[k] = 0
@@ -1277,6 +1291,19 @@ async def entity_purchaseorder_create(request: Request):
         # Документ создан — и только потом «падает» ответ. Именно так
         # выглядит таймаут на стороне клиента: он не знает, что случилось.
         FAULTS["po_create_then_fail"] = int(FAULTS["po_create_then_fail"]) - 1
+        mutate_qty = float(FAULTS.get("po_create_then_fail_mutate_qty") or 0)
+        if mutate_qty > 0 and doc.get("positions"):
+            # Документ мог быть нормализован/отредактирован за то же
+            # сетевое окно, в котором создание случилось раньше ответа —
+            # то, что действительно уехало в МС, отличается от того, что
+            # POST-запрос вёз в pushed_by_base.
+            doc["positions"][0]["quantity"] = mutate_qty
+        if int(FAULTS.get("po_create_then_fail_extra_unmapped") or 0) > 0:
+            doc.setdefault("positions", []).append({
+                "assortment": {"meta": {
+                    "href": f"{BASE}/entity/assortment/no-such-ext-in-attempt"}},
+                "quantity": 1, "price": 100,
+            })
         raise HTTPException(status_code=502, detail="bad gateway")
     return doc
 

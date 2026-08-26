@@ -627,6 +627,40 @@ def positions_pushed_by_base(positions: list[dict],
     return out
 
 
+async def _resolve_recovered_pushed_by_base(client: MoySkladClient, doc: dict,
+                                            ext_id_to_base: dict[str, str],
+                                            order_totals: dict[str, int],
+                                            ) -> dict[str, float]:
+    """Общий шаг attribution для ЛЮБОГО recovered-документа (см. push_order).
+
+    Оба пути, где `recovered=True` (документ уже существовал до POST, и
+    документ создан этой же попыткой, но её ответ потерялся — after_create),
+    обязаны пройти через ЭТУ функцию, а не через локальный pre-POST матч:
+    источник истины — фактические позиции документа, не то, что попытка
+    сопоставила локально до сети (Codex, discussion_r3865067879).
+    """
+    doc_id = str(doc.get("id")
+                or _href_uuid(((doc.get("meta") or {}).get("href")) or ""))
+    real_positions = await client.fetch_positions("purchaseorder", doc_id) \
+        if doc_id else []
+    resolved = positions_pushed_by_base(real_positions, ext_id_to_base,
+                                        order_totals)
+    if resolved is None:
+        # Fail-closed (см. docstring positions_pushed_by_base): хотя бы
+        # одна положительная позиция документа не сопоставилась ни с
+        # одним base текущего ассортимента, либо несёт дробное
+        # количество. Подтвердить, какая часть реально относится к
+        # ЭТОМУ заказу, нельзя — гадать (списывать по неполной карте)
+        # запрещено так же, как и раньше округлять. T2 не вызываем:
+        # заказ остаётся в устойчивом «неизвестно», ключ и документ
+        # целы, следующая отправка (или backmatch синка) повторит
+        # попытку сама.
+        doc_href = ((doc.get("meta") or {}).get("href")) or ""
+        doc_name = str(doc.get("name") or "")
+        raise WritebackUnknown(doc_name, doc_href)
+    return resolved
+
+
 def _move_incoming_to_ms(db: Session, org_id: int, order: ProductionOrder,
                          pushed_by_base: dict[str, float], was_sent: bool) -> None:
     """Перенос вклада заказа в «едет к нам» с локального qty на ms_qty.
@@ -1350,27 +1384,10 @@ async def push_order(db: Session, org_id: int, order: ProductionOrder,
             # то, что РЕАЛЬНО уехало, — сам документ, а не свежий локальный
             # матч, который вообще не создавал ни одной сетевой сущности этой
             # попытки. pushed_by_base отсюда идёт напрямую в commit_push и в
-            # маркер DATA-7 — подменяем его на фактические позиции документа.
-            doc_id = str(doc.get("id")
-                        or _href_uuid(((doc.get("meta") or {}).get("href")) or ""))
-            real_positions = await client.fetch_positions("purchaseorder", doc_id) \
-                if doc_id else []
-            resolved = positions_pushed_by_base(real_positions, ext_id_to_base,
-                                                order_totals)
-            if resolved is None:
-                # Fail-closed (см. docstring positions_pushed_by_base): хотя бы
-                # одна положительная позиция документа не сопоставилась ни с
-                # одним base текущего ассортимента, либо несёт дробное
-                # количество. Подтвердить, какая часть реально относится к
-                # ЭТОМУ заказу, нельзя — гадать (списывать по неполной карте)
-                # запрещено так же, как и раньше округлять. T2 не вызываем:
-                # заказ остаётся в устойчивом «неизвестно», ключ и документ
-                # целы, следующая отправка (или backmatch синка) повторит
-                # попытку сама.
-                doc_href = ((doc.get("meta") or {}).get("href")) or ""
-                doc_name = str(doc.get("name") or "")
-                raise WritebackUnknown(doc_name, doc_href)
-            pushed_by_base = resolved
+            # маркер DATA-7 — подменяем его на фактические позиции документа
+            # через общий шаг (см. _resolve_recovered_pushed_by_base).
+            pushed_by_base = await _resolve_recovered_pushed_by_base(
+                client, doc, ext_id_to_base, order_totals)
         else:
             payload: dict = {
                 "organization": {"meta": org_meta},
@@ -1430,8 +1447,15 @@ async def push_order(db: Session, org_id: int, order: ProductionOrder,
                         f"ответ на создание документа не получен ({exc}), "
                         "а поиск по ключу его пока не видит"
                     ) from exc
-                # Документ всё-таки создан — потерялся только ответ.
+                # Документ всё-таки создан — потерялся только ответ. Как и
+                # для pre-POST existing-документа, источник истины про то,
+                # что РЕАЛЬНО уехало, — сам документ (после create он мог
+                # быть нормализован/отредактирован в МС до того, как этот
+                # запрос его нашёл), а не локальный pre-POST матч выше:
+                # общий шаг attribution (см. _resolve_recovered_pushed_by_base).
                 doc, recovered = found, True
+                pushed_by_base = await _resolve_recovered_pushed_by_base(
+                    client, doc, ext_id_to_base, order_totals)
 
     href = commit_push(db, org_id, order, doc, pushed_by_base, pending_href,
                        matched_items_json)
