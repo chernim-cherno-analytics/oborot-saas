@@ -28,6 +28,7 @@ double-submit токен (кука + скрытое поле, `auth.get_csrf_tok
 
 Запуск из корня репозитория:  python tests/test_auth_csrf.py
 """
+import io
 import os
 import re
 import sqlite3
@@ -93,11 +94,53 @@ def check(name: str, cond: bool, detail: str = ""):
 
 
 TOKEN_RE = re.compile(r'name="csrf_token" value="([^"]*)"')
+COOKIE_VALUE_RE = re.compile(r'^oborot_csrf=([^;]*)')
+
+# Реальные значения токенов/кук, сгенерированные сервером за время прогона.
+# Нужны только для того, чтобы после теста доказать: ни одно из них не попало
+# в захваченный stdout — см. раздел 7 ниже (SEC-5, corrective).
+SECRET_VALUES = set()
+MIN_LEAK_LEN = 8
+
+
+def remember_secret(value: str) -> str:
+    if value and len(value) >= MIN_LEAK_LEN:
+        SECRET_VALUES.add(value)
+    return value
+
+
+def leaked_secrets(text: str, secrets) -> list:
+    """Значения из secrets, чей префикс (или сами целиком) нашёлся в text."""
+    return [s for s in secrets if s and len(s) >= MIN_LEAK_LEN and s[:MIN_LEAK_LEN] in text]
+
+
+class _Tee:
+    """Пишет одновременно в реальный stdout и в буфер для последующей проверки."""
+
+    def __init__(self, *streams):
+        self._streams = streams
+
+    def write(self, s):
+        for st in self._streams:
+            st.write(s)
+        return len(s)
+
+    def flush(self):
+        for st in self._streams:
+            st.flush()
 
 
 def extract_token(html: str) -> str:
     m = TOKEN_RE.search(html)
-    return m.group(1) if m else ""
+    return remember_secret(m.group(1) if m else "")
+
+
+def cookie_attr_summary(header: str) -> str:
+    """Только имена атрибутов Set-Cookie (path, samesite, secure…) — без значения куки."""
+    if not header:
+        return "cookie отсутствует"
+    attrs = [part.strip().split("=", 1)[0].lower() for part in header.split(";")[1:]]
+    return "атрибуты=" + ",".join(a for a in attrs if a)
 
 
 def count_users() -> int:
@@ -124,11 +167,47 @@ def main() -> int:
 def run() -> int:
     base = f"http://127.0.0.1:{APP_PORT}"
 
+    # Разделы 1–6 идут под перехватом stdout: реальный вывод не меняется
+    # (пишем и в него тоже), но копия остаётся в captured — по ней ниже
+    # (раздел 7) доказываем отсутствие утечки реальных значений токена/куки.
+    real_stdout = sys.stdout
+    captured = io.StringIO()
+    sys.stdout = _Tee(real_stdout, captured)
+    try:
+        _run_sections_1_to_6(base)
+    finally:
+        sys.stdout = real_stdout
+    captured_output = captured.getvalue()
+
+    print("\n== 7. Контроль: захваченный вывод не содержит значений/префиксов реальных csrf-токенов и кук ==")
+    leaks = leaked_secrets(captured_output, SECRET_VALUES)
+    check("вывод разделов 1–6 не содержит фактические значения сгенерированных csrf-токенов/кук",
+          not leaks, f"совпадений={len(leaks)}" if leaks else "")
+
+    print("\n== 8. Контроль: детектор утечки действительно ловит старый формат диагностики (red control) ==")
+    sample = next(iter(SECRET_VALUES), "")
+    if sample:
+        old_style_a_b = f"a={sample[:12]}… b={sample[:12]}…"
+        check("детектор ловит префикс реального токена в формате старой диагностики (a=…/b=…, tab1=…/tab2=…)",
+              bool(leaked_secrets(old_style_a_b, SECRET_VALUES)))
+        old_style_cookie = f"set-cookie: oborot_csrf={sample}; Path=/; SameSite=None; Secure"
+        check("детектор ловит значение куки в формате старой диагностики (полный Set-Cookie)",
+              bool(leaked_secrets(old_style_cookie, SECRET_VALUES)))
+    else:
+        check("red control пропущен — не набралось реальных секретов для проверки детектора", False)
+    check("детектор не ложно-срабатывает на нейтральный текст без токенов/кук",
+          not leaked_secrets("status=403 no secret material here", SECRET_VALUES))
+
+    print(f"\nИТОГО: {len(PASS)} OK, {len(FAIL)} FAIL")
+    return 1 if FAIL else 0
+
+
+def _run_sections_1_to_6(base: str) -> None:
     print("\n== 1. Настоящий браузер (без заголовка-обхода) проходит формы ==")
     browser = httpx.Client(base_url=base, timeout=30.0)
     r = browser.get("/register")
     reg_token = extract_token(r.text)
-    check("страница регистрации содержит скрытый csrf_token", bool(reg_token), f"len={len(reg_token)}")
+    check("страница регистрации содержит скрытый csrf_token", bool(reg_token))
     check("кука oborot_csrf выставлена GET-ом", "oborot_csrf" in browser.cookies,
           f"cookies={sorted(browser.cookies.keys())}")
 
@@ -206,8 +285,7 @@ def run() -> int:
     b = httpx.Client(base_url=base, timeout=30.0)
     token_a = extract_token(a.get("/register").text)
     token_b = extract_token(b.get("/register").text)
-    check("у двух независимых браузеров разные токены", bool(token_a) and bool(token_b) and token_a != token_b,
-          f"a={token_a[:12]}… b={token_b[:12]}…")
+    check("у двух независимых браузеров разные токены", bool(token_a) and bool(token_b) and token_a != token_b)
     r = b.post("/register", data={
         "name": "Б", "email": "cross-browser@test.io", "password": "secret123", "org_name": "Б",
         "csrf_token": token_a,
@@ -222,7 +300,7 @@ def run() -> int:
     token_tab1 = extract_token(tabs.get("/register").text)
     token_tab2 = extract_token(tabs.get("/register").text)  # «вторая вкладка», тот же браузер
     check("повторный GET не меняет токен (иначе первая вкладка / back-button сломались бы)",
-          bool(token_tab1) and token_tab1 == token_tab2, f"tab1={token_tab1[:12]}… tab2={token_tab2[:12]}…")
+          bool(token_tab1) and token_tab1 == token_tab2)
     r = tabs.post("/register", data={
         "name": "Вкладка", "email": "multi-tab@test.io", "password": "secret123", "org_name": "Т",
         "csrf_token": token_tab1,  # поле «застрявшей» после back-button первой загрузки страницы
@@ -246,10 +324,12 @@ def run() -> int:
         set_cookie_headers = [v for k, v in r.headers.raw if k.lower() == b"set-cookie"]
         set_cookie_headers = [v.decode("latin-1") for v in set_cookie_headers]
         csrf_cookie_header = next((h for h in set_cookie_headers if h.startswith("oborot_csrf=")), "")
+        cookie_value_match = COOKIE_VALUE_RE.match(csrf_cookie_header)
+        remember_secret(cookie_value_match.group(1) if cookie_value_match else "")
         check("во встроенном режиме на проде CSRF-кука ставится SameSite=None",
-              "samesite=none" in csrf_cookie_header.lower(), csrf_cookie_header)
+              "samesite=none" in csrf_cookie_header.lower(), cookie_attr_summary(csrf_cookie_header))
         check("во встроенном режиме на проде CSRF-кука ставится Secure",
-              "secure" in csrf_cookie_header.lower(), csrf_cookie_header)
+              "secure" in csrf_cookie_header.lower(), cookie_attr_summary(csrf_cookie_header))
     finally:
         if prev_env is None:
             os.environ.pop("OBOROT_ENV", None)
@@ -265,9 +345,6 @@ def run() -> int:
     check("машинный клиент без какого-либо csrf-токена проходит по заголовку",
           r.status_code in (302, 303), f"status={r.status_code}")
     machine.close()
-
-    print(f"\nИТОГО: {len(PASS)} OK, {len(FAIL)} FAIL")
-    return 1 if FAIL else 0
 
 
 if __name__ == "__main__":
