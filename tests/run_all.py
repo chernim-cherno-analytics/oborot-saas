@@ -77,6 +77,7 @@ SUITES = [
     ("sync_atomic", "test_sync_atomic.py",     True,  False),
     ("price_types", "test_price_types.py",     True,  False),
     ("wb_dup",      "test_writeback_dup.py",   True,  False),
+    ("wb_idem",     "test_writeback_idempotency.py", True, False),
     ("ops",         "test_ops.py",             False, False),
     ("logging",     "test_logging.py",         False, False),
     ("subscr",      "test_subscription.py",    False, False),

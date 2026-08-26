@@ -14,30 +14,91 @@ processingorder требует техкарту (processingPlan) и доступ
 Используемые эндпоинты JSON API 1.2:
   GET  /entity/assortment          — резолв href/type по ext_id наших products;
   GET  /entity/organization        — юрлицо (первое) для поля organization;
-  GET  /entity/counterparty?filter=name=Производство — поиск агента;
-  POST /entity/counterparty        — создание агента, если его нет;
-  POST /entity/purchaseorder       — сам документ (organization, agent,
+  GET  /entity/counterparty/{id}   — жива ли ЗАКРЕПЛЁННАЯ ссылка на агента;
+                                     404/410 — забыть привязку и переразрешить;
+  GET  /entity/counterparty        — постраничный перебор для поиска агента по
+                                     нашему syncId (см. «Как ищется ключ»);
+  GET  /entity/counterparty?filter=name=… — одноимённые агенты «Производство»:
+                                     0 — создаём, 1 — закрепляем, >1 — 409;
+  POST /entity/counterparty        — создание агента (идемпотентно, syncId);
+  GET  /entity/purchaseorder       — постраничный перебор для поиска НАШЕГО
+                                     документа по syncId (там же);
+  GET  /entity/purchaseorder?filter=moment>=… — ТОЛЬКО legacy-путь: список без
+                                     позиций за последние LOOKBACK_DAYS, метка
+                                     `[oborot#N]` сверяется у нас (по подстроке
+                                     описания МойСклад фильтровать не умеет);
+  POST /entity/purchaseorder       — сам документ (organization, agent, syncId,
                                      positions[{assortment.meta, quantity,
                                      price-в-копейках}], deliveryPlannedMoment).
+
+Как ищется ключ — и почему не фильтром. Раньше в этом перечне стояли
+`GET /entity/counterparty?filter=syncId=…` и
+`GET /entity/purchaseorder?filter=syncId=…`, и это было неправдой: живой
+аккаунт отвечает на такой фильтр **HTTP 412, code 1034, «неизвестное поле
+фильтрации syncId»** (Issue координации, issuecomment-5414290329), а
+документация МойСклада обещает обратное. Между обещанием документа и
+наблюдаемым ответом выбран ответ.
+
+Поиск по `syncId` целиком живёт в `MoySkladClient.find_by_sync_id`, и он —
+единственный источник правды о способе:
+  • необязательная точечная подсказка `GET /entity/{type}/syncid/{id}`
+    (поддержка `GET` по этому URL НЕ документирована, поэтому подсказка ничего
+    не решает и ничем не заменяет перебор);
+  • авторитетный ограниченный постраничный перебор коллекции с ТОЧНЫМ
+    сравнением `syncId` у себя; исчерпанная граница — типизированный отказ, а
+    не пустой ответ.
+
+Этот перечень описывает фактические вызовы. Если он разойдётся с кодом — верить
+коду: ложный обзор модуля опаснее отсутствующего, потому что уводит
+сопровождающего обратно на отвергнутый путь.
 
 Маппинг позиций: item заказа {base_name, sizes:{size: qty}} → products
 текущей org по (base_name, size) → product.ext_id → meta из ассортимента МС.
 Позиции, не нашедшие вариант, не валят весь заказ — возвращаются списком
 `unmatched` в ответе.
 
-Идемпотентность обеспечивает роут: повторная отправка при заполненном
-production_orders.ms_doc_href — 409 «уже отправлен» со ссылкой.
+── Как здесь устроена безопасность (DATA-1/DATA-2) ──────────────────────────
+
+Отправка — это создание ФИНАНСОВОГО документа, у которого три исхода, а не
+два: «создан», «не создан» и «НЕИЗВЕСТНО». Поэтому она разрезана на две
+транзакции с сетью строго между ними:
+
+  T1 (begin_push) — до сети. CAS-пометка «идёт отправка» плюс рождение двух
+     ключей: ms_sync_id заказа и ms_agent_sync_id организации. Оба уходят в
+     МойСклад полем `syncId`; повторный POST с занятым ключом ОБНОВЛЯЕТ уже
+     созданную сущность, а не заводит вторую. Ключ обязан быть закоммичен
+     раньше сети — иначе смерть процесса между POST и записью снова даёт
+     дубль. Ветки «отправить без ключа» нет (ms_client её запрещает).
+
+  сеть  — ровно один POST документа, без слепых повторов на таймаутах.
+
+  T2 (commit_push) — после сети. Ссылка на документ и перенос вклада
+     «едет к нам» с локального qty на ms_qty — ОДНОЙ транзакцией. Прежний
+     фолбэк «сохраним хотя бы ссылку» убран: он превращал сбой в вечный
+     двойной счёт без следа в логах. Не вышло дважды — WritebackUnknown,
+     честный третий исход; ближайший синк свяжет документ с заказом по
+     syncId сам (app/ms_sync._backmatch_by_sync_id).
+
+Поиск «своего» документа по метке `[oborot#N]` в описании остался ТОЛЬКО у
+строк, явно помеченных миграцией как legacy: `N` — это переиспользуемый rowid
+SQLite, а описание правит человек. См. find_own_document.
 """
+import uuid
 from datetime import date, timedelta
 
 import httpx
-from sqlalchemy import inspect, select
+from sqlalchemy import case, func, inspect, select
+from sqlalchemy import update as sa_update
 from sqlalchemy.orm import Session
 
 from app.crypto import decrypt_token
 from app.db import engine, run_migration_step
 from app.models import Connection, OrderedQty, Product, ProductionOrder
-from app.ms_client import MoySkladClient
+from app.ms_client import (
+    MoySkladClient,
+    SyncIdLookupUnavailable,
+    SyncIdNotUnique,
+)
 
 # Имя контрагента-поставщика, на которого оформляется заказ.
 AGENT_NAME = "Производство"
@@ -45,16 +106,199 @@ AGENT_NAME = "Производство"
 # Пометка «идёт отправка» в ms_doc_href (лок в routes_connect): pending:<epoch>.
 PENDING_PREFIX = "pending:"
 
+# Пометка «исход неизвестен»: unknown:<epoch>. Документ в МойСкладе, скорее
+# всего, СОЗДАН, а записать это у себя не удалось (D-37, WritebackUnknown).
+#
+# Ревью Codex, P1 (discussion_r3856243666). Раньше на этом месте оставалась
+# ПУСТАЯ строка: лок снимался, и заказ снова выглядел неотправленным. Дальше
+# цепочка складывалась так: `api_order_delete` пускает удаление по
+# `not_pushing_clause()`, а тот смотрит только на префикс `pending:` — значит
+# заказ можно удалить, и вместе со строкой уходит `ms_sync_id`. А
+# `ms_sync._backmatch_by_sync_id` ищет заказы именно по этому ключу в нашей
+# базе: нет строки — нечем и некого связывать. Финансовый документ в чужом
+# аккаунте оставался бы без владельца НАВСЕГДА, и это ровно та потеря, которую
+# back-match и был обязан предотвращать.
+#
+# Поэтому состояние стало ЯВНЫМ и живёт в том же поле — новой колонки и
+# миграции не нужно. Свойства пометки:
+#   • `is_pushed` для неё ЛОЖНО — это не ссылка на документ. Отсюда и то, что
+#     локальный вклад заказа продолжает считаться в qty (двойного счёта нет),
+#     и то, что back-match такой заказ по-прежнему видит и лечит;
+#   • удаление по ней запрещено (см. not_orphaning_clause) — до связывания;
+#   • ПОВТОР отправки поверх неё разрешён и безопасен: он идёт с тем же
+#     syncId, и find_own_document подберёт уже созданный документ, а не заведёт
+#     второй. Запирать заказ навсегда здесь было бы лечением хуже болезни.
+UNKNOWN_PREFIX = "unknown:"
+
+# Оба служебных значения поля `ms_doc_href`. Всё, что не начинается ни с
+# одного из них и непусто, — настоящая ссылка на документ.
+INTERNAL_HREF_PREFIXES = (PENDING_PREFIX, UNKNOWN_PREFIX)
+
+
+def is_internal_href(href: str | None) -> bool:
+    """Служебная пометка (`pending:` / `unknown:`), а не ссылка на документ."""
+    return str(href or "").startswith(INTERNAL_HREF_PREFIXES)
+
+
+def is_unknown(href: str | None) -> bool:
+    """Заказ в состоянии «документ создан, а записать не удалось»."""
+    return str(href or "").startswith(UNKNOWN_PREFIX)
+
+# Способ поиска «своего» документа в МойСкладе (production_orders.ms_lookup_mode).
+LOOKUP_SYNC = "sync"      # только по ms_sync_id — новый протокол
+LOOKUP_LEGACY = "legacy"  # ещё разрешён поиск по метке [oborot#N] в описании
+
+
+def is_legacy_lookup(mode: str | None) -> bool:
+    """Разрешён ли этой строке поиск документа по метке в описании.
+
+    Правило намеренно «всё, что не sync — legacy», а не наоборот. Пустое
+    значение бывает ровно в одном случае: строку вставил процесс со старым
+    кодом уже после ALTER TABLE, то есть это действительно заказ старого
+    протокола. Новый код НИКОГДА не вставляет пустое: у модели питоновский
+    default='sync', и INSERT всегда несёт колонку явно.
+    """
+    return (mode or "") != LOOKUP_SYNC
+
 
 def is_pushed(href: str | None) -> bool:
-    """Заказ реально отправлен в МойСклад (есть ссылка на документ, не лок).
+    """Заказ реально отправлен в МойСклад (есть ссылка на документ, не пометка).
 
     Такой заказ учитывается в «едет к нам» ТОЛЬКО через ordered_qty.ms_qty
     (импорт purchaseorder синком) — статусные переходы в api.py не должны
     двигать локальный qty, иначе двойной счёт.
+
+    Пометка «неизвестно» ссылкой НЕ является, и это не формальность: пока
+    документ не связан, его вклад считает наш локальный qty, а не ms_qty.
+    Признать такой заказ отправленным значило бы потерять вклад целиком —
+    товар исчез бы из «едет к нам» у обеих сторон сразу.
     """
     h = href or ""
-    return bool(h) and not h.startswith(PENDING_PREFIX)
+    return bool(h) and not is_internal_href(h)
+
+
+# Текст отказа для операций, столкнувшихся с идущей отправкой. Один на всех:
+# 409 обязан звучать одинаково и в статусе, и в удалении — человек читает
+# его в одном и том же месте интерфейса.
+PUSH_IN_PROGRESS = (
+    "По этому заказу сейчас идёт отправка в МойСклад. Дождитесь её "
+    "завершения и обновите страницу: пока документ создаётся, менять "
+    "заказ нельзя — иначе одно и то же уедет дважды."
+)
+
+
+def not_pushing_clause():
+    """SQL-условие «по заказу сейчас НЕ идёт отправка» — для WHERE изменения.
+
+    Почему условием в SQL, а не проверкой перед изменением. Между «прочитали
+    ms_doc_href» и «выполнили UPDATE/DELETE» помещается вся транзакция T1
+    отправки: предварительная проверка честно увидит «отправки нет», а
+    изменение уедет уже поверх захваченного лока (TOCTOU). Тогда у гонки два
+    победителя: статус успевает добавить локальный вклад, которого T2 не
+    ждёт, а удаление оставляет в МойСкладе финансовый документ, к которому у
+    нас больше нет ни заказа, ни ключа для обратной привязки.
+
+    Условие внутри самой изменяющей операции делает исход ОДНИМ: либо строка
+    изменена (значит, отправка не начиналась), либо не изменена ни одна
+    (значит, начиналась) — третьего состояния не существует.
+
+    coalesce — на случай NULL из строк, вставленных до появления колонки:
+    `NULL NOT LIKE …` даёт NULL, то есть строка молча выпала бы из-под
+    изменения и обычное удаление сломалось бы на ровном месте.
+    """
+    return func.coalesce(ProductionOrder.ms_doc_href, "").notlike(
+        f"{PENDING_PREFIX}%")
+
+
+# Текст отказа удалить заказ, исход отправки которого неизвестен.
+ORDER_UNKNOWN_OUTCOME = (
+    "По этому заказу отправка в МойСклад закончилась неизвестным исходом: "
+    "документ там, скорее всего, создан, а сохранить ссылку у нас не вышло. "
+    "Удалить заказ сейчас нельзя — вместе с ним пропадёт ключ, по которому "
+    "ближайшая синхронизация свяжет документ обратно. Повторите отправку: "
+    "она пойдёт с тем же ключом и второго документа не создаст."
+)
+
+
+# Статусы, из которых заказ вообще можно отправлять в МойСклад.
+#
+# ОДНА константа на маршрут и на SQL-условие T1 намеренно. Два независимых
+# списка разъехались бы при первой же правке — и разъехались бы молча: маршрут
+# отказывал бы там, где CAS пропускает, или наоборот. Здесь цена расхождения —
+# финансовый документ на принятом заказе.
+PUSHABLE_STATUSES = ("draft", "sent")
+
+# Текст отказа отправить уже принятый заказ. Один и тот же и для быстрой
+# проверки в маршруте, и для проигранной гонки: с точки зрения человека это
+# одно и то же событие, и звучать оно обязано одинаково.
+ORDER_ALREADY_RECEIVED = (
+    "Заказ уже принят на склад — отправлять его в МойСклад поздно."
+)
+
+
+def pushable_status_clause():
+    """SQL-условие «заказ ещё можно отправлять» — для WHERE самого T1.
+
+    Существует по той же причине, что и not_pushing_clause: проверка ПЕРЕД
+    операцией отвечает на вопрос о прошлом. Между ней и захватом лока
+    помещается чужой коммит `sent → received`, и тогда сеть создаёт
+    финансовый документ на заказ, который уже приняли на склад.
+
+    coalesce — на случай NULL: `NULL IN (...)` даёт NULL, то есть строка молча
+    выпала бы из-под захвата, и отправка сломалась бы на ровном месте.
+    """
+    return func.coalesce(ProductionOrder.status, "").in_(PUSHABLE_STATUSES)
+
+
+def not_orphaning_clause():
+    """SQL-условие «удаление не осиротит финансовый документ» — только для DELETE.
+
+    Ревью Codex, P1 (discussion_r3856243666). Удаление заказа в состоянии
+    «неизвестно» уносит `ms_sync_id`, а вместе с ним — единственную возможность
+    связать уже созданный документ обратно (`ms_sync._backmatch_by_sync_id`
+    ищет заказы именно по этому ключу). Документ остаётся в чужом аккаунте
+    навсегда без владельца.
+
+    Условие отдельное, а не расширение `not_pushing_clause()`, и это осознанно.
+    Тот же предикат стоит в СТАТУСНОМ переходе, и расширить его значило бы
+    заодно запретить «принять на склад» заказ, документ которого в МойСкладе
+    есть. Это уже продуктовое решение, а finding просит другого: запрещается
+    ровно удаление и ровно до связывания.
+
+    Как и `not_pushing_clause`, живёт внутри самой изменяющей операции: между
+    чтением и DELETE помещается и T2 отправки, и back-match синка, поэтому
+    предварительная проверка ловила бы состояние, которого уже нет (TOCTOU).
+    """
+    return func.coalesce(ProductionOrder.ms_doc_href, "").notlike(
+        f"{UNKNOWN_PREFIX}%")
+
+
+def mark_unknown(db: Session, order_id: int, pending_href: str,
+                 unknown_href: str) -> bool:
+    """Переводит СВОЮ пометку отправки в состояние «исход неизвестен».
+
+    CAS по ТОЧНОМУ токену нашей попытки — тому самому, который записал наш T1.
+    `LIKE pending:%` сюда не возвращается ни в каком виде: пометка живёт TTL,
+    по его истечении её законно перехватывает соседняя попытка, и трогать
+    чужое владение мы не вправе (ревью Codex, раунд 3). Не наша пометка —
+    rowcount=0 и молчание.
+
+    Возвращает True, если перевели именно мы.
+    """
+    if not pending_href or not unknown_href:
+        return False
+    db.rollback()
+    changed = db.execute(
+        sa_update(ProductionOrder)
+        .where(
+            ProductionOrder.id == order_id,
+            ProductionOrder.ms_doc_href == pending_href,  # ТОЧНЫЙ токен T1
+        )
+        .values(ms_doc_href=unknown_href)
+    ).rowcount > 0
+    db.commit()
+    return changed
+
 
 # Веб-интерфейс МойСклад: ссылка на карточку документа по его uuid.
 MS_UI_DOC_URL = "https://online.moysklad.ru/app/#purchaseorder/edit?id={uuid}"
@@ -73,6 +317,94 @@ class WritebackError(Exception):
         super().__init__(detail)
         self.status = status
         self.detail = detail
+
+
+class WritebackUnknown(Exception):
+    """Документ в МойСкладе создан, а сохранить это у себя не удалось.
+
+    Третий исход, который нельзя называть ни успехом, ни отказом. Документ
+    существует (мы держим в руках его номер и ссылку), но наша транзакция
+    T2 — «записать ссылку и перенести вклад „едет к нам“» — не прошла ни с
+    первого раза, ни с повтора. Утверждать «документ не создан» здесь было бы
+    прямым враньём, а молча считать успехом — потерять деньги в отчётах.
+
+    Ключ идемпотентности при этом остаётся в строке заказа, поэтому повтор
+    отправки безопасен: он пойдёт с тем же syncId и не задвоит документ.
+    """
+
+    def __init__(self, doc_name: str, doc_href: str) -> None:
+        super().__init__(doc_name or doc_href)
+        self.doc_name = doc_name
+        self.doc_href = doc_href
+
+
+class PushOutcomeUnknown(Exception):
+    """Запрос на создание документа УШЁЛ, а исход установить не удалось.
+
+    Родственник `WritebackUnknown`, но из другой точки и с другим знанием.
+    Там документ точно создан и у нас на руках его номер — не записалась
+    только наша сторона. Здесь мы не знаем даже этого: POST мог дойти и
+    создать «Заказ поставщику», а мог не дойти вовсе.
+
+    Почему у этого исхода отдельное имя, а не «сетевая ошибка» (ревью Codex,
+    P1, discussion_r3858173475). Сорванный запрос ДО попытки создания —
+    честный локальный отказ: документа нет, лок надо снять, заказ обычный.
+    Сорванная попытка ПОСЛЕ POST — совсем другое событие с тем же текстом
+    исключения. Раньше оба уходили в маршрут одним `httpx.HTTPError`, и общий
+    обработчик снимал пометку: заказ выглядел неотправленным и становился
+    УДАЛЯЕМЫМ. Удаление уносит `ms_sync_id` — единственный ключ, по которому
+    `ms_sync._backmatch_by_sync_id` связал бы документ обратно, — и
+    финансовый документ оставался в чужом аккаунте без владельца навсегда.
+
+    Поэтому исход называется своим именем и ведёт туда же, куда ведёт
+    `WritebackUnknown`: в устойчивое `unknown:` (см. `mark_unknown`), где
+    ключ сохранён, удаление запрещено (`not_orphaning_clause`), а повтор с
+    тем же `syncId` разрешён и второго документа не создаёт.
+
+    `reason` — короткая причина для человека: почему исход остался неизвестным.
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+def post_refused_by_ms(exc: BaseException) -> bool:
+    """Ответил ли сам МойСклад окончательным отказом на наш POST (4xx).
+
+    Граница между «неизвестно» и «точно не создан», и она проведена по
+    единственному достоверному признаку: сервер ОТВЕТИЛ про этот запрос.
+    412 «поле не задано», 401/403 «нет доступа», 429 «мы даже не начали» —
+    это не потерянный ответ, а отказ, и документа за ним нет.
+
+    Почему не «всё после POST считаем неизвестным». Такой заказ уходил бы в
+    `unknown:` навсегда: удалить нельзя, повтор даёт тот же 4xx и снова
+    `unknown:`, связывать синку нечего. Владелец остаётся с заказом, который
+    нельзя ни отправить, ни удалить, — лечение хуже болезни.
+
+    Асимметрия рисков сохранена в нужную сторону: неизвестным считается ВСЁ,
+    кроме прямого отказа сервера — 5xx, таймаут, обрыв соединения и любая
+    неудача восстановительного поиска.
+    """
+    resp = getattr(exc, "response", None)
+    code = getattr(resp, "status_code", None)
+    return isinstance(code, int) and 400 <= code < 500
+
+
+class AmbiguousCounterparty(Exception):
+    """Контрагентов с именем «Производство» несколько — выбрать нельзя.
+
+    Автоматический выбор (первый попавшийся, старейший, любой) отклонён
+    сознательно: заказ поставщику — финансовый документ и обещание конкретному
+    подрядчику. Отправить его «какому-нибудь Производству» хуже, чем не
+    отправить вовсе, потому что ошибка обнаружится у контрагента, а не у нас.
+    """
+
+    def __init__(self, rows: list[dict]) -> None:
+        self.rows = rows
+        self.names = [str(r.get("name") or "?") for r in rows[:5]]
+        self.ids = [str(r.get("id") or "") for r in rows[:5]]
+        super().__init__(", ".join(f"{n} ({i})" for n, i in zip(self.names, self.ids)))
 
 
 # ── Аддитивная мини-миграция ─────────────────────────────────────────────────
@@ -111,6 +443,51 @@ def ensure_schema(bind=None) -> None:
             "ADD COLUMN ms_doc_name VARCHAR(255) NOT NULL DEFAULT ''",
             bind=eng,
         )
+    # DATA-1: ключ идемпотентности и ЯВНЫЙ дискриминатор способа поиска.
+    if "ms_sync_id" not in cols:
+        run_migration_step(
+            "ALTER TABLE production_orders "
+            "ADD COLUMN ms_sync_id VARCHAR(36) NOT NULL DEFAULT ''",
+            bind=eng,
+        )
+    if "ms_lookup_mode" not in cols:
+        run_migration_step(
+            "ALTER TABLE production_orders "
+            "ADD COLUMN ms_lookup_mode VARCHAR(16) NOT NULL DEFAULT ''",
+            bind=eng,
+        )
+    # Каждая существующая строка получает ЯВНУЮ пометку legacy: её документ
+    # мог быть создан старым кодом, без syncId, и единственный его след —
+    # метка в описании. Отнять у таких строк поиск по метке значит создать им
+    # дубль при следующей отправке.
+    #
+    # Шаг выполняется на КАЖДОМ старте, а не один раз рядом с ALTER, и в этом
+    # весь смысл. Деплой без простоя означает, что рядом ещё живёт процесс со
+    # старым кодом: строка, вставленная им через секунду после ALTER, придёт
+    # с пустым ms_lookup_mode — и это действительно заказ старого протокола,
+    # который обязан получить 'legacy'. Обратная ошибка (пометить legacy
+    # НОВУЮ строку) здесь невозможна: новый код всегда вставляет 'sync' явно,
+    # поэтому под WHERE ms_lookup_mode='' новая строка не попадает НИКОГДА.
+    run_migration_step(
+        "UPDATE production_orders SET ms_lookup_mode='legacy' "
+        "WHERE ms_lookup_mode IS NULL OR ms_lookup_mode=''",
+        bind=eng,
+    )
+    # DATA-2: стабильная привязка контрагента-производства к организации.
+    if insp.has_table("connections"):
+        conn_cols = {c["name"] for c in insp.get_columns("connections")}
+        if "ms_agent_sync_id" not in conn_cols:
+            run_migration_step(
+                "ALTER TABLE connections "
+                "ADD COLUMN ms_agent_sync_id VARCHAR(36) NOT NULL DEFAULT ''",
+                bind=eng,
+            )
+        if "ms_agent_href" not in conn_cols:
+            run_migration_step(
+                "ALTER TABLE connections "
+                "ADD COLUMN ms_agent_href VARCHAR(512) NOT NULL DEFAULT ''",
+                bind=eng,
+            )
 
 
 # ── Вспомогательное ──────────────────────────────────────────────────────────
@@ -162,7 +539,7 @@ def _position_label(base_name: str, size: str) -> str:
 
 
 def _move_incoming_to_ms(db: Session, org_id: int, order: ProductionOrder,
-                         pushed_by_base: dict[str, int]) -> None:
+                         pushed_by_base: dict[str, int], was_sent: bool) -> None:
     """Перенос вклада заказа в «едет к нам» с локального qty на ms_qty.
 
     С момента отправки источник истины по этому заказу — документ в МойСклад
@@ -176,8 +553,15 @@ def _move_incoming_to_ms(db: Session, org_id: int, order: ProductionOrder,
     (D-28): между отправкой и ближайшим синком «едет по заказам „Оборота“» не
     должно проваливаться в ноль. Синк потом пересчитает обе величины заново —
     уже по доказуемой связи, а не по нашему знанию в моменте.
+
+    `was_sent` приходит СНАРУЖИ и читается из той же транзакции, что и запись
+    ссылки (RETURNING в _commit_push_once). Брать его из order.status нельзя:
+    ORM-объект заказа загружен ДО сети, а за время сетевого окна статус мог
+    измениться. Раньше это спасал только побочный эффект db.rollback() в
+    начале T2 (он обесценивает объект, и следующее обращение перечитывает
+    строку) — то есть корректность держалась на неочевидном поведении сессии,
+    а не на явном чтении.
     """
-    was_sent = order.status == "sent"
     touched: dict[str, OrderedQty] = {}
 
     def _row(base: str) -> OrderedQty:
@@ -284,13 +668,388 @@ async def find_existing_order(client, marker: str, *,
     return found[0] if found else None
 
 
-async def push_order(db: Session, org_id: int, order: ProductionOrder) -> dict:
+# ── T1: ключи идемпотентности рождаются ДО сети ──────────────────────────────
+
+class PushKeys:
+    """Что должно существовать в базе ДО единственного сетевого вызова."""
+
+    __slots__ = ("sync_id", "lookup_mode", "agent_sync_id", "agent_href")
+
+    def __init__(self, sync_id: str, lookup_mode: str,
+                 agent_sync_id: str, agent_href: str) -> None:
+        self.sync_id = sync_id
+        self.lookup_mode = lookup_mode
+        self.agent_sync_id = agent_sync_id
+        self.agent_href = agent_href
+
+
+def load_push_keys(db: Session, org_id: int, order_id: int) -> PushKeys:
+    """Читает ключи из БАЗЫ, а не из ORM-объекта в памяти.
+
+    Сессия проекта живёт с expire_on_commit=False: после коммита T1 объект
+    заказа в памяти всё ещё помнит СТАРЫЕ значения. Читать ключ оттуда значит
+    отправить документ со старым (пустым) ключом — то есть потерять всю
+    идемпотентность на ровном месте.
+    """
+    row = db.execute(
+        select(ProductionOrder.ms_sync_id, ProductionOrder.ms_lookup_mode)
+        .where(ProductionOrder.id == order_id, ProductionOrder.org_id == org_id)
+    ).first()
+    conn = db.execute(
+        select(Connection.ms_agent_sync_id, Connection.ms_agent_href)
+        .where(Connection.org_id == org_id, Connection.kind == "moysklad")
+    ).first()
+    return PushKeys(
+        sync_id=str((row[0] if row else "") or ""),
+        lookup_mode=str((row[1] if row else "") or ""),
+        agent_sync_id=str((conn[0] if conn else "") or ""),
+        agent_href=str((conn[1] if conn else "") or ""),
+    )
+
+
+def begin_push(db: Session, org_id: int, order_id: int,
+               expected_href: str, pending_href: str) -> bool:
+    """T1: захват лока и рождение ключей — ОДНОЙ транзакцией, до сети.
+
+    Три вещи обязаны стать фактом в базе раньше, чем мы тронем сеть:
+      • пометка «идёт отправка» (CAS по прежнему значению ms_doc_href —
+        второй одновременный клик не обновит ни строки и получит 409);
+      • ms_sync_id заказа — ключ идемпотентности документа;
+      • ms_agent_sync_id организации — ключ идемпотентности контрагента.
+
+    Ключи выставляются УСЛОВНО в самом SQL (`CASE WHEN ... = ''`), а не
+    сравнением в Python: повтор отправки обязан идти с ТЕМ ЖЕ ключом, иначе
+    вторая попытка создаст второй документ. Условие в SQL делает это правдой
+    и при гонке двух процессов.
+
+    Допустимый статус — тоже УСЛОВИЕ ЭТОГО ЖЕ UPDATE, а не проверка перед ним
+    (ревью Codex, P1, discussion_r3857277070). Маршрут читает статус до
+    сетевого окна, и между его чтением и этим T1 помещается чужой коммит
+    `sent → received`. Предварительная проверка честно видела «ещё не принят»,
+    CAS отрабатывал по одному лишь href — и отправка создавала «Заказ
+    поставщику» для УЖЕ ПРИНЯТОГО заказа. Дальше T2 читал свежий `received`,
+    локальный qty не снимал (верно), но документ МойСклада попадал в ms_qty
+    ближайшим синком: принятый товар воскресал как «едет к нам». Интерфейс
+    показывал в пути то, что уже лежит на складе.
+
+    Это ровно тот же приём, что в `not_pushing_clause` и `not_orphaning_clause`:
+    условие живёт внутри самой изменяющей операции, и третьего состояния между
+    «проверили» и «записали» не существует.
+
+    Возвращает True, если лок захвачен именно нами.
+    """
+    fresh_doc_key = str(uuid.uuid4())
+    locked = db.execute(
+        sa_update(ProductionOrder)
+        .where(
+            ProductionOrder.id == order_id,
+            ProductionOrder.org_id == org_id,
+            ProductionOrder.ms_doc_href == expected_href,  # CAS
+            pushable_status_clause(),
+        )
+        .values(
+            ms_doc_href=pending_href,
+            ms_sync_id=case(
+                (func.coalesce(ProductionOrder.ms_sync_id, "") == "", fresh_doc_key),
+                else_=ProductionOrder.ms_sync_id,
+            ),
+        )
+    ).rowcount > 0
+    if locked:
+        # Ключ контрагента — на организацию, а не на заказ: агент один, и
+        # два одновременных push обязаны создать ОДНОГО.
+        db.execute(
+            sa_update(Connection)
+            .where(
+                Connection.org_id == org_id,
+                Connection.kind == "moysklad",
+                func.coalesce(Connection.ms_agent_sync_id, "") == "",
+            )
+            .values(ms_agent_sync_id=str(uuid.uuid4()))
+        )
+    db.commit()
+    return locked
+
+
+# ── Контрагент ───────────────────────────────────────────────────────────────
+
+def _agent_meta_of(href: str) -> dict:
+    return {"meta": {"href": href, "type": "counterparty",
+                     "mediaType": "application/json"}}
+
+
+def _remember_agent(db: Session, org_id: int, href: str) -> None:
+    """Закрепляет выбранного контрагента за организацией (отдельной транзакцией).
+
+    Отдельная короткая транзакция намеренно: к моменту вызова заказ держит
+    пометку pending, и подмешивать привязку агента в будущий T2 значило бы
+    терять её при каждом откате T2. Агент — факт про организацию, а не про
+    конкретную отправку.
+    """
+    if not href:
+        return
+    db.rollback()
+    db.execute(
+        sa_update(Connection)
+        .where(Connection.org_id == org_id, Connection.kind == "moysklad")
+        .values(ms_agent_href=href)
+    )
+    db.commit()
+
+
+def _forget_agent(db: Session, org_id: int, stale_href: str) -> None:
+    """Снимает закрепление контрагента, которого в МойСкладе больше нет.
+
+    Условием в самом UPDATE стоит ТОТ href, который мы только что проверили и
+    признали мёртвым. Между проверкой и этой записью помещается чужая
+    отправка, успевшая закрепить нового живого контрагента, — и затирать её
+    работу мы не вправе. Та же логика, что у CAS-пометки отправки: не наше
+    значение — не наша строка.
+    """
+    if not stale_href:
+        return
+    db.rollback()
+    db.execute(
+        sa_update(Connection)
+        .where(Connection.org_id == org_id, Connection.kind == "moysklad",
+               func.coalesce(Connection.ms_agent_href, "") == stale_href)
+        .values(ms_agent_href="")
+    )
+    db.commit()
+
+
+async def resolve_agent(db: Session, org_id: int, client, keys: PushKeys) -> dict:
+    """Контрагент «Производство»: стабильная привязка, а не «найти или создать».
+
+    Порядок ровно такой и по одной причине на шаг:
+      1) уже закреплённая ссылка — используем её, если сущность ещё
+         существует: решение про то, КОМУ уходит финансовый документ,
+         принимается один раз и не пересматривается при каждой отправке;
+      2) поиск по НАШЕМУ syncId — закрывает случай «создали, ответ потеряли»:
+         по имени такого агента не отличить от одноимённого чужого;
+      3) поиск по имени: ноль — создаём идемпотентно (тот же syncId, поэтому
+         два одновременных клика дают ОДНОГО агента); ровно один — закрепляем;
+         больше одного — отказ с перечислением.
+
+    Автоматический выбор при нескольких совпадениях (первый, старейший)
+    отклонён владельцем решения: см. AmbiguousCounterparty.
+
+    Почему шаг 1 всё-таки ходит в сеть — ревью Codex, P2. Закреплённая ссылка
+    возвращалась вслепую, а контрагента в МойСкладе могли удалить. С этого
+    момента КАЖДЫЙ POST заказа падал валидацией «контрагент не найден», ссылка
+    у нас оставалась прежней, и повтор не лечился никогда — даже когда в
+    аккаунте есть подходящий контрагент и достаточно было бы его найти. Один
+    дешёвый GET на отправку (а отправка — ручное действие человека, не горячий
+    путь) превращает вечный отказ в самовосстановление.
+
+    Пересмотром решения это не является: проверяется существование ИМЕННО той
+    сущности, которую выбрали, а не «не появился ли кто-то лучше». И забываем
+    привязку только по ответу «её нет» (404/410) — граница проведена в
+    MoySkladClient.entity_exists, и она односторонняя намеренно: транзиентный
+    сбой, сброшенный как «удалено», завёл бы клиенту второго подрядчика.
+    """
+    if keys.agent_href:
+        if await client.entity_exists(keys.agent_href):
+            return _agent_meta_of(keys.agent_href)
+        _forget_agent(db, org_id, keys.agent_href)
+    if not keys.agent_sync_id:
+        raise WritebackError(
+            500, "Внутренняя ошибка: ключ контрагента не создан до отправки.",
+        )
+    try:
+        found = await client.find_counterparty_by_sync_id(keys.agent_sync_id)
+    except SyncIdLookupUnavailable as exc:
+        # «Не знаю, есть ли уже наш контрагент» — не повод создавать ещё
+        # одного: у клиента появился бы второй «Производство», и половина
+        # заказов уехала бы не на того.
+        raise WritebackError(
+            502,
+            "Не удалось достоверно проверить, заведён ли уже контрагент "
+            f"«{AGENT_NAME}» в МойСкладе ({exc}). Отправка остановлена, "
+            "документ не создан — повторите позже.",
+        ) from exc
+    except SyncIdNotUnique as exc:
+        raise WritebackError(
+            409,
+            f"В МойСкладе несколько контрагентов с нашим служебным ключом "
+            f"({exc}). Это нарушение уникальности на стороне МойСклада: "
+            "выбрать за вас, кому уходит заказ, мы не вправе. Документ не "
+            "создан — обратитесь в поддержку.",
+        ) from exc
+    if found is None:
+        rows = await client.find_counterparties_by_name(AGENT_NAME)
+        if len(rows) > 1:
+            raise AmbiguousCounterparty(rows)
+        found = rows[0] if rows else await client.create_counterparty(
+            AGENT_NAME, keys.agent_sync_id)
+    href = ((found.get("meta") or {}).get("href")) or ""
+    _remember_agent(db, org_id, href)
+    return {"meta": found.get("meta") or {}}
+
+
+# ── Поиск «своего» документа ─────────────────────────────────────────────────
+
+async def find_own_document(client, keys: PushKeys, marker: str, *,
+                            after_create: bool = False) -> dict | None:
+    """Уже созданный нами документ этого заказа — или None.
+
+    Единственный признак для НОВЫХ заказов — ms_sync_id: он наш, машинный,
+    уникален в аккаунте МойСклад и не живёт в тексте, который правит человек.
+    Поиск по метке `[oborot#N]` в описании остаётся ТОЛЬКО у явно помеченных
+    legacy-строк, и вот почему это не «перестраховка»:
+
+      • `N` — это rowid SQLite, он переиспользуется после удаления строки.
+        Новый заказ на освободившемся rowid находил по метке документ
+        УДАЛЁННОГО заказа и «усыновлял» его: своего документа не создавалось,
+        а «едет к нам» считалось по чужой бумаге;
+      • попытка, умершая после T1, но до POST, при повторе идёт этим же
+        путём — то есть тоже могла усыновить чужое.
+
+    Поэтому признак legacy — ЯВНЫЙ и записанный миграцией, а не выведенный из
+    «какое-то поле непусто»: после T1 непустое поле есть и у нового заказа.
+    """
+    try:
+        docs = await client.find_purchase_orders_by_sync_id(keys.sync_id)
+    except SyncIdLookupUnavailable as exc:
+        # Самое опасное место всего механизма. Пустой ответ здесь означает
+        # «нашего документа нет» и разрешает создать его заново. Недосмотренный
+        # перебор выдать за пустой ответ нельзя: это и есть тот второй заказ
+        # поставщику, ради недопущения которого написан весь syncId.
+        raise WritebackError(
+            502,
+            f"Не удалось достоверно проверить, создан ли уже этот заказ в "
+            f"МойСкладе ({exc}). Отправка остановлена, чтобы не создать "
+            "второй документ. Повторите позже — повтор пойдёт с тем же "
+            "ключом.",
+        ) from exc
+    if len(docs) > 1:
+        # Контракт JSON API 1.2 обещает уникальность syncId. Если обещание
+        # нарушено, выбирать «какой-нибудь» нельзя тем более.
+        raise AmbiguousExistingOrder(docs, after_create=after_create)
+    if docs:
+        return docs[0]
+    if is_legacy_lookup(keys.lookup_mode):
+        return await find_existing_order(client, marker, after_create=after_create)
+    return None
+
+
+# ── T2: ссылка и перенос вклада — одной транзакцией ──────────────────────────
+
+def _commit_push_once(db: Session, org_id: int, order: ProductionOrder,
+                      href: str, name: str,
+                      pushed_by_base: dict[str, int],
+                      pending_href: str) -> bool | None:
+    """Одна попытка T2. True — записано, None — лок уже не наш, иначе исключение."""
+    db.rollback()
+    # RETURNING отдаёт статус ровно той строки, которую мы сейчас изменили, и
+    # ровно в момент изменения: решение «снимать ли локальный вклад заказа»
+    # обязано опираться на состояние внутри этой транзакции, а не на
+    # ORM-объект, прочитанный до сетевого окна.
+    saved = db.execute(
+        sa_update(ProductionOrder)
+        .where(
+            ProductionOrder.id == order.id,
+            ProductionOrder.org_id == org_id,
+            # CAS: пишем ссылку только поверх СВОЕЙ пометки «идёт отправка» —
+            # ровно того токена, который записал НАШ T1.
+            #
+            # Здесь стоял `LIKE pending:%`, и комментарий обещал «своей», а SQL
+            # обеспечивал «любой». Разница не косметическая: пометка живёт TTL,
+            # и по его истечении её законно перехватывает соседняя попытка.
+            # Попытка, вернувшаяся из сети позже своего TTL, проходила этот CAS
+            # поверх ЧУЖОЙ пометки и записывала свой href — то есть привязывала
+            # заказ к своему документу и снимала локальный вклад, пока законный
+            # владелец ещё был в сети. Равенство делает владение проверяемым
+            # (ревью Codex, раунд 3; воспроизведено на exact HEAD d7792fe0).
+            ProductionOrder.ms_doc_href == pending_href,
+        )
+        .values(ms_doc_href=href, ms_doc_name=name, ms_lookup_mode=LOOKUP_SYNC)
+        .returning(ProductionOrder.status)
+        .execution_options(synchronize_session=False)
+    ).fetchall()
+    if not saved:
+        db.rollback()
+        return None
+    _move_incoming_to_ms(db, org_id, order, pushed_by_base,
+                         was_sent=str(saved[0][0] or "") == "sent")
+    db.commit()
+    return True
+
+
+def commit_push(db: Session, org_id: int, order: ProductionOrder, doc: dict,
+                pushed_by_base: dict[str, int], pending_href: str) -> str:
+    """T2: ссылка на документ и перенос вклада «едет к нам» — либо оба, либо ни один.
+
+    Раньше здесь был фолбэк «не вышло целиком — сохраним хотя бы ссылку».
+    Он превращал сбой в ТИХУЮ порчу данных: ссылка есть, значит заказ считается
+    отправленным и его локальный вклад в «едет к нам» больше никто не снимет,
+    а документ МойСклада прибавит свой — двойной счёт навсегда, без единого
+    следа в логе. Половина правды здесь хуже честного отказа.
+
+    Поэтому: обе записи в ОДНОЙ транзакции; сорвалось — повторяем T2 ЦЕЛИКОМ;
+    сорвалось снова — WritebackUnknown. Ключ идемпотентности при этом остаётся
+    в строке, повтор отправки безопасен, а ближайший синк свяжет документ с
+    заказом по syncId сам (см. app/ms_sync._backmatch_by_sync_id).
+
+    `pending_href` — точный токен, записанный НАШИМ T1. Он приходит снаружи, а
+    не выводится здесь из текущего значения строки: смысл проверки в том, чтобы
+    отличить свою пометку от чужой, а значение, прочитанное сейчас, чужим быть
+    как раз и может.
+    """
+    href = ((doc.get("meta") or {}).get("href")) or ""
+    name = str(doc.get("name") or "")
+    for attempt in range(2):
+        try:
+            if _commit_push_once(db, org_id, order, href, name, pushed_by_base,
+                                 pending_href):
+                return href
+            # Пометка «идёт отправка» уже не наша: пока мы ходили в сеть, лок
+            # протух и его перехватила соседняя попытка. Она шла с ТЕМ ЖЕ
+            # syncId, значит документ один и тот же.
+            current = db.execute(
+                select(ProductionOrder.ms_doc_href)
+                .where(ProductionOrder.id == order.id,
+                       ProductionOrder.org_id == org_id)
+            ).scalar()
+            if is_pushed(current):
+                return str(current)
+            raise WritebackUnknown(name, href)
+        except WritebackUnknown:
+            raise
+        except Exception:  # noqa: BLE001 — второй шанс дороже точного типа сбоя
+            db.rollback()
+            if attempt == 0:
+                continue
+            raise WritebackUnknown(name, href)
+    raise WritebackUnknown(name, href)
+
+
+async def push_order(db: Session, org_id: int, order: ProductionOrder,
+                     pending_href: str) -> dict:
     """Создаёт «Заказ поставщику» в МойСклад из позиций заказа.
 
     Возвращает {ok, ms_doc_name, ms_doc_href, ms_doc_ui_url,
-    positions_pushed, unmatched:[...]}. Коммит БД — на вызывающей стороне.
+    positions_pushed, unmatched:[...]}. T1 (ключи + лок) обязан быть выполнен
+    вызывающим ДО входа сюда; T2 (ссылка + перенос вклада) выполняется здесь
+    одной транзакцией — см. commit_push.
+
+    `pending_href` — точный токен пометки, который вызывающий записал в T1.
+    Он проносится через всё сетевое окно и служит доказательством владения
+    локом в T2: за время окна лок мог протухнуть и достаться соседней попытке.
     """
     token = _get_ms_token(db, org_id)
+    keys = load_push_keys(db, org_id, order.id)
+    if not keys.sync_id:
+        # Ни одной ветки «отправим без ключа» здесь нет и быть не должно:
+        # динамический POST без syncId — это ровно тот дубль финансового
+        # документа, ради которого весь механизм и написан. Пустой ключ
+        # означает, что T1 не отработал, и это наша ошибка, а не ситуация,
+        # из которой надо выкручиваться в момент отправки.
+        raise WritebackError(
+            500,
+            "Внутренняя ошибка: ключ идемпотентности заказа не создан до "
+            "отправки. Документ не отправлен — сообщите в поддержку.",
+        )
     products = _product_map(db, org_id)
 
     async with MoySkladClient(token) as client:
@@ -345,21 +1104,23 @@ async def push_order(db: Session, org_id: int, order: ProductionOrder) -> dict:
             )
         org_meta = (orgs[0].get("meta") or {})
 
-        # 4) Контрагент «Производство»: найти или создать.
-        agent = await client.find_counterparty_by_name(AGENT_NAME)
-        if agent is None:
-            agent = await client.create_counterparty(AGENT_NAME)
-        agent_meta = (agent.get("meta") or {})
+        # 4) Контрагент «Производство»: стабильная привязка (см. resolve_agent).
+        agent_meta = (await resolve_agent(db, org_id, client, keys)).get("meta") or {}
 
         # 5) Сам документ — но сначала проверяем, не создан ли он уже.
         #
-        # У JSON API 1.2 нет ключа идемпотентности, а сеть даёт три исхода,
-        # а не два: «создан», «не создан» и «неизвестно» (таймаут, 502, обрыв).
-        # В третьем случае документ у клиента может уже существовать, и вторая
-        # попытка сделала бы ДУБЛЬ заказа поставщику — с деньгами и с обещанием
-        # подрядчику. Поэтому маркер в описании + поиск по нему до создания.
+        # Сеть даёт три исхода, а не два: «создан», «не создан» и «неизвестно»
+        # (таймаут, 502, обрыв). В третьем случае документ у клиента может уже
+        # существовать, и вторая попытка сделала бы ДУБЛЬ заказа поставщику —
+        # с деньгами и с обещанием подрядчику.
+        #
+        # Защита — пользовательский идентификатор syncId (JSON API 1.2):
+        # повторный POST с занятым ключом обновляет уже созданный документ,
+        # а не заводит второй. Метка `[oborot#N]` в описании остаётся, но её
+        # работа теперь другая: она читаема человеком, нужна диагностике и
+        # правилу принадлежности D-28 в синке — а идемпотентность держит ключ.
         marker = order_marker(order.id)
-        existing = await find_existing_order(client, marker)
+        existing = await find_own_document(client, keys, marker)
         if existing is not None:
             doc, recovered = existing, True
         else:
@@ -368,6 +1129,7 @@ async def push_order(db: Session, org_id: int, order: ProductionOrder) -> dict:
                 "agent": {"meta": agent_meta},
                 "positions": positions,
                 "description": f"Создано в «Обороте»: заказ «{order.name}» {marker}",
+                "syncId": keys.sync_id,
             }
             if order.eta_date:
                 # Планируемая дата приёмки — из ETA заказа.
@@ -375,28 +1137,64 @@ async def push_order(db: Session, org_id: int, order: ProductionOrder) -> dict:
             recovered = False
             try:
                 doc = await client.create_purchase_order(payload)
-            except (httpx.HTTPError, httpx.HTTPStatusError):
-                # Ответ не дошёл — «создан или нет» отсюда не видно.
-                # Единственный честный способ узнать: спросить у МойСклада.
-                found = await find_existing_order(client, marker, after_create=True)
-                if found is None:
+            except (httpx.HTTPError, httpx.HTTPStatusError) as exc:
+                # ── Граница «до попытки» / «после попытки» ────────────────
+                #
+                # Ревью Codex, P1 (discussion_r3858173475). Ниже начинается
+                # участок, где запрос на создание финансового документа УЖЕ
+                # ушёл. Всё, что здесь не кончилось подтверждённым РОВНО
+                # ОДНИМ документом, — исход НЕИЗВЕСТНЫЙ, а не «безопасный
+                # сетевой сбой». Разница не в словах: неизвестный исход
+                # обязан сохранить пометку и ключ, а «сбой» снимал пометку,
+                # после чего заказ становился удаляемым — вместе с
+                # `ms_sync_id`, то есть с единственным ключом back-match'а.
+                #
+                # Исключение ровно одно и оно проверяемое: МойСклад ОТВЕТИЛ
+                # отказом на этот запрос (4xx) — см. post_refused_by_ms.
+                if post_refused_by_ms(exc):
                     raise
+                # Ответ не дошёл — «создан или нет» отсюда не видно.
+                # Единственный честный способ узнать: спросить у МойСклада
+                # по ключу, который мы записали ДО отправки.
+                try:
+                    found = await find_own_document(client, keys, marker,
+                                                    after_create=True)
+                except AmbiguousExistingOrder:
+                    # Совпадений несколько. Исключение само несёт
+                    # after_create=True, и маршрут обязан обойтись с ним как с
+                    # неизвестным исходом — но текст у него свой, поэтому
+                    # подменять его здесь нельзя.
+                    raise
+                except Exception as probe_exc:
+                    # Восстановление не состоялось: перебор упал транспортом
+                    # или статусом, либо исчерпал границу (SyncIdLookupUnavailable
+                    # приходит сюда уже как WritebackError). Ни одна из этих
+                    # неудач НЕ является ответом «документа нет».
+                    raise PushOutcomeUnknown(
+                        f"проверить исход не удалось: {probe_exc}"
+                    ) from probe_exc
+                if found is None:
+                    # Перебор отработал и не нашёл — но это тоже не «нет».
+                    # Свежесозданный документ может быть ещё не виден в
+                    # выдаче списка, и принять задержку видимости за
+                    # отсутствие значит потерять документ насовсем.
+                    raise PushOutcomeUnknown(
+                        f"ответ на создание документа не получен ({exc}), "
+                        "а поиск по ключу его пока не видит"
+                    ) from exc
                 # Документ всё-таки создан — потерялся только ответ.
                 doc, recovered = found, True
 
-    href = ((doc.get("meta") or {}).get("href")) or ""
-    _move_incoming_to_ms(db, org_id, order, pushed_by_base)
-    order.ms_doc_href = href
-    order.ms_doc_name = str(doc.get("name") or "")
+    href = commit_push(db, org_id, order, doc, pushed_by_base, pending_href)
     return {
         "ok": True,
-        "ms_doc_name": order.ms_doc_name,
+        "ms_doc_name": str(doc.get("name") or ""),
         "ms_doc_href": href,
         "ms_doc_ui_url": ui_url(doc),
         "positions_pushed": len(positions),
         "unmatched": unmatched,
-        # True — документ уже существовал в МойСкладе и был подобран по маркеру,
-        # а не создан заново. Значит, прошлая попытка на самом деле удалась,
-        # просто ответ до нас не дошёл.
+        # True — документ уже существовал в МойСкладе и был подобран по ключу
+        # (или, у legacy-строки, по маркеру), а не создан заново. Значит,
+        # прошлая попытка на самом деле удалась, просто ответ до нас не дошёл.
         "recovered": recovered,
     }

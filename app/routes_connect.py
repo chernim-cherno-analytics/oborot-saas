@@ -67,6 +67,7 @@ router = APIRouter(prefix="/api")
 # Константа живёт в ms_writeback: по ней же api.py отличает реально
 # отправленные заказы (is_pushed) от помеченных «идёт отправка».
 _PENDING_PREFIX = ms_writeback.PENDING_PREFIX
+_UNKNOWN_PREFIX = ms_writeback.UNKNOWN_PREFIX
 _PENDING_TTL_SEC = 180
 
 TOKEN_HINT = ("МойСклад не принял токен. Проверьте, что токен скопирован целиком: "
@@ -321,12 +322,40 @@ def _order_of_org(db: Session, org_id: int, order_id: int) -> ProductionOrder:
     return order
 
 
-def _release_push_lock(db: Session, order_id: int) -> None:
-    """Снимает временную пометку отправки (pending:*) при сбое.
+def _release_push_lock(db: Session, order_id: int, pending_href: str,
+                       restore_href: str = "") -> None:
+    """Снимает СВОЮ временную пометку отправки при сбое.
 
-    Возвращает заказ в состояние «можно отправить», но только если документ
-    не успел создаться (href всё ещё начинается с pending:) — чтобы не затереть
-    реальную ссылку в редком случае гонки.
+    Возвращает заказ в состояние «можно отправить», но только если пометка всё
+    ещё ровно та, которую поставил наш собственный T1 (`pending_href`).
+    Сравнение — равенством, а не `LIKE pending:%`.
+
+    `restore_href` — значение, КОТОРОЕ БЫЛО до нашего T1, и по умолчанию оно
+    пустое. Непустым оно бывает ровно в одном случае: попытка началась поверх
+    устойчивого «неизвестно». Тогда снятие лока обязано вернуть заказ в ТО ЖЕ
+    «неизвестно», а не в чистое «неотправлен».
+
+    Это второй вход в ту же дыру, что и discussion_r3858173475, и я нашёл его
+    сам, когда проверял, чем кончается повтор. Заказ уже в `unknown:` (документ
+    в МойСкладе, скорее всего, есть), владелец жмёт «отправить» ещё раз, и
+    попытка срывается ДО POST — например, в аккаунте нашлись два документа с
+    нашим ключом, или упала сеть. Пустая строка здесь стирала знание, добытое
+    прошлой попыткой: заказ снова выглядел неотправленным и становился
+    удаляемым, а удаление уносило `ms_sync_id`. Сбой ДО POST по-прежнему
+    снимает свой точный токен — он просто больше не выдумывает состояние
+    чище того, что было.
+
+    Ревью Codex, раунд 3, блокер. `LIKE` снимал ЛЮБУЮ пометку, в том числе
+    чужую. Пометка живёт TTL, и по истечении TTL её законно перехватывает
+    соседняя попытка — так и задумано. Отсюда воспроизведённое interleaving:
+    A взяла `pending:t0`, провисела дольше TTL, B честно перехватила CAS на
+    `pending:t1` — и поздний сбой A снимал лок B. После этого в открытое окно
+    входила третья попытка, пока B ещё была в сети: взаимное исключение
+    исчезало ровно там, где оно и нужно. Стабильный `ms_sync_id` спасал от
+    второго документа НАРУЖУ, но владение локом у себя он не восстанавливает.
+
+    Не наша пометка — не наш лок: rowcount=0 и молчание. Это не
+    перестраховка: чужую идущую отправку мы отменять не вправе.
     """
     from sqlalchemy import update as _sa_update
     try:
@@ -335,9 +364,9 @@ def _release_push_lock(db: Session, order_id: int) -> None:
             _sa_update(ProductionOrder)
             .where(
                 ProductionOrder.id == order_id,
-                ProductionOrder.ms_doc_href.like(f"{_PENDING_PREFIX}%"),
+                ProductionOrder.ms_doc_href == pending_href,  # ТОЧНЫЙ токен T1
             )
-            .values(ms_doc_href="")
+            .values(ms_doc_href=restore_href or "")
         )
         db.commit()
     except Exception:  # noqa: BLE001 — освобождение лока не должно маскировать исходную ошибку
@@ -347,7 +376,7 @@ def _release_push_lock(db: Session, order_id: int) -> None:
 def _clean_href(href: str | None) -> str:
     """Внутренняя пометка pending:* наружу не показывается — только реальная ссылка."""
     h = href or ""
-    return "" if h.startswith(_PENDING_PREFIX) else h
+    return "" if ms_writeback.is_internal_href(h) else h
 
 
 def _ms_doc_out(order: ProductionOrder) -> dict:
@@ -382,13 +411,17 @@ async def api_order_push_to_ms(
     вариант в МС, не валят заказ — возвращаются списком unmatched.
     """
     order = _order_of_org(db, ctx.org.id, order_id)
-    if order.status not in ("draft", "sent"):
+    # Быстрый и понятный ответ пользователю — но НЕ единственная защита:
+    # между этим чтением и T1 помещается чужой коммит `sent → received`.
+    # Настоящая защита стоит условием внутри самого T1
+    # (ms_writeback.pushable_status_clause).
+    if order.status not in ms_writeback.PUSHABLE_STATUSES:
         raise HTTPException(
             status_code=422,
-            detail="Заказ уже принят на склад — отправлять его в МойСклад поздно.",
+            detail=ms_writeback.ORDER_ALREADY_RECEIVED,
         )
     current = order.ms_doc_href or ""
-    if current and not current.startswith(_PENDING_PREFIX):
+    if current and not ms_writeback.is_internal_href(current):
         # Реальная ссылка на документ — уже отправлен.
         name = f" ({order.ms_doc_name})" if order.ms_doc_name else ""
         return JSONResponse(
@@ -400,6 +433,12 @@ async def api_order_push_to_ms(
             },
         )
     now = int(_time.time())
+    # Пометка «неизвестно» повтор НЕ запирает и TTL не ждёт — это и есть
+    # штатный выход из такого состояния. Повтор идёт с ТЕМ ЖЕ syncId, поэтому
+    # find_own_document подберёт уже созданный документ, а не заведёт второй;
+    # два одновременных повтора разводит тот же CAS в begin_push. Запереть
+    # заказ до синка было бы лечением хуже болезни: владелец остался бы с
+    # заказом, который нельзя ни отправить, ни удалить.
     if current.startswith(_PENDING_PREFIX):
         # Идёт отправка. Если пометка свежая — второй клик отклоняем. Если
         # «зависла» дольше PENDING_TTL (воркер умер между захватом лока и
@@ -417,44 +456,87 @@ async def api_order_push_to_ms(
                     **_ms_doc_out(order),
                 },
             )
-    # Атомарный захват «замка» ДО любых сетевых вызовов: помечаем заказ как
-    # отправляемый одним условным UPDATE с проверкой прежнего значения (CAS).
-    # Второй одновременный клик/ретрай не обновит ни строки (значение уже
-    # изменилось) и получит 409 — иначе гонка создала бы ДВА финансовых
-    # документа. Метка несёт время старта → возможна переотправка после сбоя.
-    from sqlalchemy import update as _sa_update
-    lock = db.execute(
-        _sa_update(ProductionOrder)
-        .where(
-            ProductionOrder.id == order.id,
-            ProductionOrder.ms_doc_href == current,  # CAS: ровно то, что прочитали
-        )
-        .values(ms_doc_href=f"{_PENDING_PREFIX}{now}")
-    )
-    db.commit()
-    if lock.rowcount == 0:
-        db.refresh(order)
+    # T1 — единственная транзакция ДО сети: CAS-захват «замка» плюс рождение
+    # ключей идемпотентности (заказа и контрагента). Второй одновременный
+    # клик/ретрай не обновит ни строки (значение уже изменилось) и получит
+    # 409 — иначе гонка создала бы ДВА финансовых документа. Подробности и
+    # причины — в ms_writeback.begin_push.
+    #
+    # Токен запоминается в переменной и дальше ходит по всей попытке: и снятие
+    # лока при сбое, и T2 обязаны сравнивать пометку с НИМ, а не с образцом
+    # `pending:%`. Пометка живёт TTL и после него законно достаётся соседней
+    # попытке; попытка, вернувшаяся из сети позже своего TTL, обязана узнать
+    # чужое владение и ничего не трогать (ревью Codex, раунд 3).
+    pending = f"{_PENDING_PREFIX}{now}"
+    # Куда возвращать заказ, если попытка сорвётся ДО создания документа.
+    # Обычно — в «неотправлен». Но повтор поверх устойчивого «неизвестно»
+    # обязан вернуться именно в «неизвестно»: прошлая попытка уже узнала, что
+    # документ мог быть создан, и терять это знание нельзя (см.
+    # _release_push_lock).
+    release_to = current if ms_writeback.is_unknown(current) else ""
+    locked = ms_writeback.begin_push(
+        db, ctx.org.id, order.id, current, pending)
+    if not locked:
+        # Проигранный CAS — это НЕ одно событие, и сводить их к одному коду
+        # нельзя (ревью Codex, P1). В условии T1 стоят и точный ms_doc_href, и
+        # допустимый статус, поэтому «не захватили» означает ТРИ разных
+        # события, и человек по ответу решает разное:
+        #   • строки больше нет — заказ удалили, пока мы читали;
+        #   • заказ приняли на склад — отправлять поздно, ждать нечего;
+        #   • идёт соседняя отправка — вот тут и правда стоит подождать.
+        #
+        # Перезагрузка обязана переживать ОТСУТСТВИЕ строки (ревью Codex, P2,
+        # discussion_r3857538139). Здесь стоял `db.refresh(order)`, и на
+        # удалённой строке он поднимал InvalidRequestError: обычная гонка
+        # отвечала 500, то есть «сломались мы», хотя сломались не мы.
+        #
+        # Форма взята с уже корректного пути условного удаления в
+        # `api.api_order_delete`: завершить состояние транзакции, сбросить
+        # identity map, перечитать заново. Проверка организации в перезагрузке
+        # обязательна: без неё чужой заказ получил бы ответ, отличный от 404,
+        # и это выдало бы сам факт существования строки.
+        db.rollback()
+        db.expire_all()
+        fresh = db.get(ProductionOrder, order_id)
+        if fresh is None or fresh.org_id != ctx.org.id:
+            raise HTTPException(status_code=404, detail="Заказ не найден")
+        if fresh.status not in ms_writeback.PUSHABLE_STATUSES:
+            raise HTTPException(
+                status_code=422,
+                detail=ms_writeback.ORDER_ALREADY_RECEIVED,
+            )
         return JSONResponse(
             status_code=409,
             content={
                 "detail": "Заказ уже отправляется в МойСклад — дождитесь завершения "
                           "и обновите страницу.",
-                **_ms_doc_out(order),
+                # Данные документа — из СВЕЖЕЙ строки: устаревший ORM-объект
+                # тем и плох, что описывает состояние до гонки.
+                **_ms_doc_out(fresh),
             },
         )
     try:
-        result = await ms_writeback.push_order(db, ctx.org.id, order)
+        result = await ms_writeback.push_order(db, ctx.org.id, order, pending)
     except ms_writeback.AmbiguousExistingOrder as exc:
         # У нескольких документов МойСклада одинаковая наша метка — почти
         # наверняка чей-то «Копировать документ» вместе с описанием. Привязать
         # заказ к первому попавшемуся значит начать считать «едет к нам» по
         # чужой бумаге. Разобраться может только человек, который эти документы
         # видит, поэтому отдаём номера и ничего не создаём.
-        _release_push_lock(db, order.id)
         if exc.after_create:
             # Отправка уже сорвалась, и мы не знаем, создался ли документ.
             # Обещать «ничего не создано» нельзя, и советовать снимать метки —
             # тоже: сняв её с только что созданного, человек получит дубль.
+            #
+            # Пометку здесь НЕ снимаем (ревью Codex, P1,
+            # discussion_r3858173475). Раньше `_release_push_lock` стоял выше
+            # развилки — то есть выполнялся и на этой ветке. Заказ,
+            # собственный текст ответа которому говорит «один из документов
+            # мог быть только что создан нами», становился удаляемым, и
+            # удаление уносило `ms_sync_id`. Исход неизвестен — значит
+            # состояние устойчиво неизвестное, как и на соседних ветках.
+            ms_writeback.mark_unknown(
+                db, order.id, pending, f"{_UNKNOWN_PREFIX}{now}")
             raise HTTPException(
                 status_code=409,
                 detail=(
@@ -465,6 +547,8 @@ async def api_order_push_to_ms(
                     f"какой из них настоящий."
                 ),
             )
+        # Искали ПЕРЕД созданием: нового документа точно нет, лок наш и снимается.
+        _release_push_lock(db, order.id, pending, release_to)
         raise HTTPException(
             status_code=409,
             detail=(
@@ -475,55 +559,90 @@ async def api_order_push_to_ms(
                 f"Новый документ не создан."
             ),
         )
+    except ms_writeback.AmbiguousCounterparty as exc:
+        # Контрагентов «Производство» в аккаунте несколько. Выбрать за
+        # владельца нельзя: заказ поставщику — обещание конкретному
+        # подрядчику, и «какой-нибудь» здесь означает «не тот».
+        _release_push_lock(db, order.id, pending, release_to)
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"В МойСкладе несколько контрагентов с именем "
+                f"«{ms_writeback.AGENT_NAME}» ({exc}). Заказ поставщику — "
+                f"финансовый документ, и выбрать за вас, кому он уходит, мы не "
+                f"вправе. Оставьте одного (лишних переименуйте или заархивируйте) "
+                f"и повторите отправку. Документ не создан."
+            ),
+        )
+    except ms_writeback.WritebackUnknown as exc:
+        # Честный третий исход: документ создан, а записать это у себя не
+        # вышло даже со второй попытки. Ни «получилось», ни «не получилось».
+        #
+        # Пометку НЕ снимаем, а переводим в устойчивое «неизвестно» (ревью
+        # Codex, P1). Пустая строка здесь возвращала заказ в вид
+        # «неотправленный», после чего его можно было удалить — вместе с
+        # ms_sync_id, то есть с единственным ключом, по которому синк связал бы
+        # документ обратно. Финансовый документ в чужом аккаунте остался бы без
+        # владельца навсегда.
+        #
+        # Перевод идёт CAS'ом по нашему точному токену: чужую пометку мы не
+        # трогаем и здесь.
+        ms_writeback.mark_unknown(
+            db, order.id, pending, f"{_UNKNOWN_PREFIX}{now}")
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"Документ в МойСкладе создан ({exc.doc_name or 'без номера'}), "
+                "но сохранить его у нас не удалось. Откройте документ по ссылке "
+                "и проверьте. Повторная отправка безопасна: она пойдёт с тем же "
+                "ключом и второго документа не создаст."
+            ),
+            headers={"X-Oborot-Ms-Doc": exc.doc_href[:400]},
+        )
+    except ms_writeback.PushOutcomeUnknown as exc:
+        # Запрос на создание документа ушёл, а исход установить не удалось:
+        # ответ потерян и восстановительный поиск его не подтвердил — либо не
+        # нашёл (задержка видимости), либо сам не состоялся.
+        #
+        # Ревью Codex, P1 (discussion_r3858173475). Раньше такой исход
+        # приходил сюда обычным `httpx.HTTPError`, и общий сетевой обработчик
+        # снимал пометку. Заказ выглядел неотправленным и становился
+        # УДАЛЯЕМЫМ, хотя финансовый документ мог существовать; удаление
+        # уносило `ms_sync_id` — единственный ключ, по которому back-match
+        # связал бы документ обратно.
+        #
+        # Обращаемся с ним ровно так же, как с уже признанным третьим исходом
+        # T2: CAS в устойчивое «неизвестно» по СВОЕМУ точному токену. Ключ
+        # остаётся, удаление запрещено, повтор идёт с тем же syncId и второго
+        # документа не создаёт.
+        ms_writeback.mark_unknown(
+            db, order.id, pending, f"{_UNKNOWN_PREFIX}{now}")
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"Отправка прервалась после того, как запрос на создание "
+                f"документа уже ушёл в МойСклад ({exc}). Документ там мог быть "
+                "создан, поэтому руками его не заводите: повторите отправку — "
+                "она пойдёт с тем же ключом и второго документа не создаст. "
+                "Пока исход неизвестен, удалить заказ нельзя."
+            ),
+        )
     except ms_writeback.WritebackError as exc:
-        _release_push_lock(db, order.id)
+        _release_push_lock(db, order.id, pending, release_to)
         raise HTTPException(status_code=exc.status, detail=exc.detail)
     except httpx.HTTPStatusError as exc:
-        _release_push_lock(db, order.id)
+        _release_push_lock(db, order.id, pending, release_to)
         code = exc.response.status_code
         if code in (401, 403):
             raise HTTPException(status_code=400, detail=TOKEN_HINT)
         raise HTTPException(
             status_code=502,
-            detail=f"МойСклад ответил ошибкой {code}. Документ не создан — "
-                   "попробуйте ещё раз позже.",
+            detail=f"МойСклад ответил ошибкой {code}. Попробуйте ещё раз позже: "
+                   "повтор пойдёт с тем же ключом и документ не задвоит.",
         )
     except httpx.HTTPError:
-        _release_push_lock(db, order.id)
+        _release_push_lock(db, order.id, pending, release_to)
         raise HTTPException(status_code=502, detail=NETWORK_HINT)
-    try:
-        db.commit()
-    except Exception:
-        # Документ в МойСкладе УЖЕ создан, а сохранить ссылку не удалось
-        # (обрыв соединения с базой, блокировка файла). Если просто упасть,
-        # заказ останется с меткой «идёт отправка», через три минуты она
-        # протухнет, владелец нажмёт ещё раз — и получит второй документ.
-        # Поэтому: откатываем сессию и записываем ссылку отдельной короткой
-        # транзакцией. Не вышло и это — снимаем метку и отдаём ссылку на
-        # созданный документ прямо в ошибке, чтобы она не потерялась совсем.
-        db.rollback()
-        href = str(result.get("ms_doc_href") or "")
-        name = str(result.get("ms_doc_name") or "")
-        saved = False
-        try:
-            from sqlalchemy import update as _sa_upd
-            db.execute(_sa_upd(ProductionOrder)
-                       .where(ProductionOrder.id == order.id)
-                       .values(ms_doc_href=href, ms_doc_name=name))
-            db.commit()
-            saved = True
-        except Exception:
-            db.rollback()
-            _release_push_lock(db, order.id)
-        if not saved:
-            raise HTTPException(
-                status_code=502,
-                detail=(f"Документ в МойСкладе создан ({name or 'без номера'}), "
-                        "но сохранить ссылку на него не удалось. "
-                        "НЕ отправляйте заказ повторно — откройте документ "
-                        "по ссылке и при необходимости привяжите вручную."),
-                headers={"X-Oborot-Ms-Doc": href[:400]},
-            )
     # Аудит 18.08: push_order переносит вклад заказа между qty и ms_qty
     # (а при черновике/частичном матче меняет и сумму «едет к нам») — без
     # инвалидации страницы 10 минут отдавали старый снапшот и потребность.

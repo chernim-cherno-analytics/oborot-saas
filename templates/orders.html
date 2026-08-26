@@ -96,7 +96,12 @@ document.addEventListener("DOMContentLoaded", function () {
           ? "Заказ отправлен в производство — учитывается в «едет к нам»"
           : "Заказ принят на склад");
         reloadAll();
-      });
+      })
+      // Отказ (409 «идёт отправка в МойСклад», 422 недопустимый переход,
+      // 404 заказ удалён параллельно) уже показан ошибкой из api().
+      // Перечитываем список: на экране должно остаться то, что в базе, а не
+      // состояние, которого сервер не принял.
+      .catch(function () { reloadAll(); });
   }
 
   function removeOrder(id, status, pushed) {
@@ -110,7 +115,7 @@ document.addEventListener("DOMContentLoaded", function () {
       toast("Заказ удалён");
       currentId = null;
       reloadAll();
-    });
+    }).catch(function () { reloadAll(); });
   }
 
   api("/api/orders").then(function (d) {

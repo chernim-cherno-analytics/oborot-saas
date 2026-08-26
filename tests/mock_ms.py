@@ -24,6 +24,7 @@
 """
 import os
 import random
+import re as _re
 from datetime import date, timedelta
 
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -573,8 +574,68 @@ FAULTS: dict = {"stock_ok_before": 0, "stock_429_burst": 0,
                 # POST /entity/purchaseorder отвечает 429 N раз подряд:
                 # «мы даже не начали» — повтор безопасен и обязан произойти.
                 "po_429_burst": 0,
+                # POST /entity/purchaseorder падает 502 N раз, НЕ создав
+                # документ. Смерть попытки ПОСЛЕ T1 (ключ уже в базе), но до
+                # появления документа: повтор обязан идти с ТЕМ ЖЕ syncId.
+                "po_fail_before_create": 0,
+                # Задержка ответа GET /entity/counterparty. Нужна, чтобы два
+                # одновременных push гарантированно оба увидели «агента нет»
+                # и разошлись бы на создание двух контрагентов без syncId.
+                "cp_search_delay_ms": 0,
+                # GET /entity/counterparty/{id} отвечает 500 N раз подряд.
+                # Транзиентный сбой ПРОВЕРКИ закреплённой ссылки: он не
+                # означает «контрагента удалили», и привязку сбрасывать нельзя.
+                "cp_get_500_burst": 0,
+                # Точечный маршрут /entity/{type}/syncid/{id} отвечает 404,
+                # как если бы GET по нему не поддерживался вовсе. Тогда 404
+                # «нет такого URL» неотличим от 404 «нет сущности».
+                "syncid_route_404": 0,
+                # Точечный маршрут отвечает объектом не того сорта (meta.type).
+                "syncid_route_wrong_type": 0,
+                # Точечный маршрут отвечает кодом, который отсутствием НЕ
+                # является: 401/403/429/5xx. Такой ответ нельзя молча
+                # превратить в «не найдено».
+                "syncid_route_status": 0,
+                # Задержка POST /entity/purchaseorder ДО создания документа.
+                # Открывает то самое «сетевое окно» между T1 и T2, в котором
+                # заказ ещё жив в нашей базе, а документа в МС ещё нет: тест
+                # успевает выполнить параллельный статусный переход или
+                # удаление и увидеть, чем это кончится.
+                "po_create_delay_ms": 0,
+                # ── Исход POST заказа поставщику НЕИЗВЕСТЕН ──────────────────
+                # Три ключа ниже моделируют не «ошибку сети», а состояние, в
+                # котором запрос УЖЕ ушёл, а узнать исход не получается. Ровно
+                # там клиент раньше снимал пометку отправки и делал заказ
+                # удаляемым вместе с ключом связывания.
+                #
+                # po_hide_created — созданные нами документы не видны ни в
+                # выдаче списка, ни точечному маршруту. Это не выдумка: у
+                # свежесозданной сущности выдача списка может отставать, и
+                # принять задержку видимости за «документа нет» — значит
+                # потерять его насовсем.
+                "po_hide_created": 0,
+                # po_list_ok_before / po_list_status — список заказов
+                # поставщику отвечает `po_list_status` ПОСЛЕ N удачных
+                # ответов. Форма взята с уже существующего stock_ok_before:
+                # первый (предварительный) поиск обязан пройти, а вот
+                # восстановительный — упасть. 401 выбран сознательно: он не
+                # входит в RETRY_STATUSES, то есть падает сразу и без пауз,
+                # и тест остаётся детерминированным.
+                "po_list_ok_before": 0,
+                "po_list_status": 0,
+                # po_create_twin_then_fail — документ создан, следом создан
+                # его ДВОЙНИК с тем же syncId, и только потом «падает» ответ.
+                # Так выглядит нарушенное обещание уникальности ключа,
+                # обнаруженное уже после попытки: выбрать один из двух нельзя,
+                # но и считать, что мы ничего не создали, — тоже.
+                "po_create_twin_then_fail": 0,
+                # po_create_refuse — МойСклад ОТВЕТИЛ отказом 412 и документа
+                # не создал. Обратная граница: это не потерянный ответ, и
+                # обходиться с ним как с неизвестным исходом нельзя.
+                "po_create_refuse": 0,
                 "stock_delay_ms": 0}
-FAULT_STATS: dict = {"stock_requests": 0, "stock_ok": 0, "stock_429": 0, "stock_500": 0}
+FAULT_STATS: dict = {"stock_requests": 0, "stock_ok": 0, "stock_429": 0,
+                     "stock_500": 0, "po_list_ok": 0}
 
 
 def reset_faults() -> None:
@@ -582,6 +643,12 @@ def reset_faults() -> None:
                   stock_500_once=False, assortment_429_burst=0,
                   docs_429_burst=0, docs_429_before="",
                   po_create_then_fail=0, po_429_burst=0,
+                  po_fail_before_create=0, cp_search_delay_ms=0,
+                  cp_get_500_burst=0, syncid_route_404=0,
+                  syncid_route_wrong_type=0, syncid_route_status=0,
+                  po_create_delay_ms=0, po_hide_created=0,
+                  po_list_ok_before=0, po_list_status=0,
+                  po_create_twin_then_fail=0, po_create_refuse=0,
                   stock_delay_ms=0)
     for k in FAULT_STATS:
         FAULT_STATS[k] = 0
@@ -835,9 +902,18 @@ def entity_purchaseorder(request: Request, limit: int = 100, offset: int = 0,
     _auth(request)
     parsed = _parse_filter(flt)
     m_from = parsed.get("moment>=", "")[:10]
+    _reject_sync_id_filter(parsed)
+    code = int(FAULTS.get("po_list_status") or 0)
+    if code > 0 and FAULT_STATS["po_list_ok"] >= int(FAULTS.get("po_list_ok_before") or 0):
+        # Восстановительный поиск не состоялся. Это НЕ ответ «документа нет».
+        raise HTTPException(status_code=code, detail={"errors": [
+            {"error": f"mock: список ответил {code}, это не «не найдено»"}]})
+    FAULT_STATS["po_list_ok"] += 1
     rows = []
     # seeded + созданные writeback'ом (у последних МС проставил бы moment
     # и applicable сам — эмулируем: сегодня, проведён, shipped=0).
+    created_visible = [] if int(FAULTS.get("po_hide_created") or 0) > 0 \
+        else CREATED_PURCHASE_ORDERS
     for doc in PURCHASE_ORDERS + [
         {**d,
          "moment": d.get("moment") or f"{TODAY.isoformat()} 12:00:00",
@@ -845,7 +921,7 @@ def entity_purchaseorder(request: Request, limit: int = 100, offset: int = 0,
          "positions": {"rows": [{**p, "shipped": p.get("shipped", 0.0)}
                                 for p in (d.get("positions") or [])],
                        "meta": {"size": len(d.get("positions") or [])}}}
-        for d in CREATED_PURCHASE_ORDERS
+        for d in created_visible
     ]:
         day = doc["moment"][:10]
         if m_from and day < m_from:
@@ -879,12 +955,40 @@ def reset_writeback_state() -> None:
     CREATED_PURCHASE_ORDERS.clear()
 
 
+def _reject_sync_id_filter(parsed: dict) -> None:
+    """`filter=syncId` отвергается ровно так, как это делает живой МойСклад.
+
+    Это не выдумка и не перестраховка, а зафиксированный факт: 25.08.2026 на
+    боевом аккаунте первый же read-only preflight
+    `GET /entity/counterparty?filter=syncId=<uuid>` вернул **HTTP 412, code
+    1034, «неизвестное поле фильтрации syncId»** (журнал выпуска, Issue #2,
+    issuecomment-5414290329).
+
+    Раньше мок этот фильтр послушно поддерживал — и именно поэтому набор был
+    зелёным, пока отправка на боевом API падала целиком. Мок обязан быть
+    моделью ЧУЖОГО API, а не наших ожиданий от него: поддерживая то, чего у
+    оригинала нет, он не ловит регрессию, а прячет её.
+
+    Документация МойСклада, к слову, обещает обратное — в таблицах полей
+    контрагента и заказа поставщику у `syncId` стоят операторы `=` и `!=`.
+    Между обещанием документа и наблюдаемым ответом здесь выбран ответ.
+    """
+    if "syncId" in parsed:
+        raise HTTPException(status_code=412, detail={"errors": [{
+            "error": "неизвестное поле фильтрации syncId",
+            "code": 1034,
+        }]})
+
+
 def _counterparty_row(cp: dict) -> dict:
-    return {
+    row = {
         "id": cp["id"], "name": cp["name"],
         "meta": {"href": f"{BASE}/entity/counterparty/{cp['id']}",
                  "type": "counterparty", "mediaType": "application/json"},
     }
+    if cp.get("syncId"):
+        row["syncId"] = cp["syncId"]
+    return row
 
 
 @app.get("/entity/organization")
@@ -899,13 +1003,98 @@ def entity_organization(request: Request, limit: int = 1000, offset: int = 0):
 
 
 @app.get("/entity/counterparty")
-def entity_counterparty(request: Request, limit: int = 1000, offset: int = 0,
-                        flt: str = Query(default="", alias="filter")):
+async def entity_counterparty(request: Request, limit: int = 1000, offset: int = 0,
+                              flt: str = Query(default="", alias="filter")):
     _auth(request)
-    name = _parse_filter(flt).get("name", "")
-    rows = [_counterparty_row(cp) for cp in COUNTERPARTIES
-            if not name or cp["name"] == name]
+    parsed = _parse_filter(flt)
+    name = parsed.get("name", "")
+    _reject_sync_id_filter(parsed)
+    if int(FAULTS.get("cp_search_delay_ms") or 0) > 0:
+        import asyncio as _asyncio
+        await _asyncio.sleep(int(FAULTS["cp_search_delay_ms"]) / 1000.0)
+    rows = [_counterparty_row(cp) for cp in list(COUNTERPARTIES)
+            if (not name or cp["name"] == name)]
     return _page(rows, limit, offset)
+
+
+@app.get("/entity/{entity}/syncid/{sync_id}")
+async def entity_by_syncid(entity: str, sync_id: str, request: Request):
+    """Точечный запрос по syncId — маршрут, поддержка которого НЕ доказана.
+
+    Официальная документация описывает URL такого вида только для удаления
+    сущности; работает ли на нём `GET`, нигде не сказано, и живьём мы этого
+    ещё не наблюдали. Поэтому мок умеет оба мира, и переключатель тут не для
+    удобства, а чтобы проверять оба:
+
+      * `syncid_route_404=1` — маршрута нет, сервер отвечает 404. Ровно тот
+        случай, где 404 «нет такого URL» неотличим от 404 «нет сущности», и
+        код обязан НЕ считать это ответом «не найдено»;
+      * по умолчанию — маршрут есть и отдаёт сущность.
+
+    Наш код пользуется этим запросом только как подтверждением: положительный
+    ответ — факт, любой другой — «не знаю».
+    """
+    _auth(request)
+    if int(FAULTS.get("syncid_route_404") or 0) > 0:
+        raise HTTPException(status_code=404, detail={"errors": [
+            {"error": "mock: маршрут не поддерживается", "code": 1006}]})
+    code = int(FAULTS.get("syncid_route_status") or 0)
+    if code > 0:
+        # Ответ, который отсутствием НЕ является: нет доступа, лимит, сбой.
+        raise HTTPException(status_code=code, detail={"errors": [
+            {"error": f"mock: ответ {code}, это не «не найдено»"}]})
+    if entity == "counterparty":
+        for cp in COUNTERPARTIES:
+            if str(cp.get("syncId") or "") == sync_id:
+                row = _counterparty_row(cp)
+                if int(FAULTS.get("syncid_route_wrong_type") or 0) > 0:
+                    # Маршрут отдал объект «не того сорта» — и это ДРУГОЙ
+                    # объект, с другим id. Иначе проверка была бы холостой:
+                    # склейка по id всё равно свела бы его с находкой перебора,
+                    # и «тип не проверяется» выглядело бы как «тип проверен».
+                    row = {**row, "id": "wrong-type-obj",
+                           "meta": {**row["meta"], "type": "product"}}
+                return row
+    elif entity == "purchaseorder":
+        # Оба списка, а не только созданные нами: живому API всё равно, кто
+        # завёл документ, и точечный маршрут обязан находить любой. Пока он
+        # смотрел лишь в CREATED_PURCHASE_ORDERS, подставные («чужие»)
+        # документы для него не существовали — и контртест на дубль по
+        # документам молча не проверял ту ветку, ради которой написан.
+        #
+        # po_hide_created прячет свежесозданное И ЗДЕСЬ. Иначе «документ ещё
+        # не виден» получалось бы наполовину: перебор его не находит, а
+        # подсказка находит — и проверка задержки видимости была бы холостой.
+        hidden = int(FAULTS.get("po_hide_created") or 0) > 0
+        pool = ([] if hidden else list(CREATED_PURCHASE_ORDERS)) + list(PURCHASE_ORDERS)
+        for doc in pool:
+            if str(doc.get("syncId") or "") == sync_id:
+                return doc
+    raise HTTPException(status_code=404, detail={"errors": [
+        {"error": "mock: сущность с таким syncId не найдена"}]})
+
+
+@app.get("/entity/counterparty/{cp_id}")
+async def entity_counterparty_get(cp_id: str, request: Request):
+    """Карточка одного контрагента: 200 — есть, 404 — удалён.
+
+    Ровно то, что делает живой МС с запросом удалённой сущности, и ровно то,
+    на что опирается проверка закреплённой ссылки (`entity_exists`). Отдельный
+    ключ сбоев здесь не нужен: «контрагента удалили» тест выражает удалением
+    строки из COUNTERPARTIES — то есть состоянием мира, а не инъекцией.
+    """
+    _auth(request)
+    if int(FAULTS.get("cp_get_500_burst") or 0) > 0:
+        # Транзиентный сбой на проверке: он НЕ означает «удалено», и код
+        # обязан отличать одно от другого.
+        FAULTS["cp_get_500_burst"] = int(FAULTS["cp_get_500_burst"]) - 1
+        raise HTTPException(status_code=500, detail="mock: временный сбой")
+    for cp in COUNTERPARTIES:
+        if cp["id"] == cp_id:
+            return _counterparty_row(cp)
+    raise HTTPException(status_code=404, detail={"errors": [
+        {"error": "Ошибка получения объекта: контрагент не найден"}
+    ]})
 
 
 @app.post("/entity/counterparty")
@@ -917,9 +1106,49 @@ async def entity_counterparty_create(request: Request):
         raise HTTPException(status_code=412, detail={"errors": [
             {"error": "Ошибка сохранения объекта: поле 'name' не может быть пустым"}
         ]})
+    sync_id = _read_sync_id(body)
+    if sync_id:
+        for cp in COUNTERPARTIES:
+            if cp.get("syncId") == sync_id:
+                cp["name"] = name      # upsert: обновили, второго не завели
+                return _counterparty_row(cp)
     cp = {"id": f"cp-{len(COUNTERPARTIES) + 1:03d}", "name": name}
+    if sync_id:
+        cp["syncId"] = sync_id
     COUNTERPARTIES.append(cp)
     return _counterparty_row(cp)
+
+
+_UUID_RE = _re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+def _read_sync_id(body: dict) -> str:
+    """syncId из тела POST — пользовательский идентификатор JSON API 1.2.
+
+    Контракт, который мок закрепляет (и который обязан подтвердить живой
+    тест на боевом аккаунте, см. TECH_DEBT):
+      • syncId — UUID, задаётся клиентом; кривое значение → 412;
+      • он уникален в пределах аккаунта и типа сущности, поэтому POST с уже
+        занятым syncId НЕ создаёт вторую сущность, а обновляет существующую
+        и возвращает ЕЁ (upsert). Это единственный способ сделать создание
+        финансового документа идемпотентным: ответ можно потерять сколько
+        угодно раз, документ останется один.
+    Пустой syncId допустим — так ведёт себя реальный МС. Запрет «POST без
+    syncId» живёт в НАШЕМ коде (app/ms_client.py), а не здесь: мок обязан
+    оставаться честной моделью чужого API, иначе тест доказывал бы правило
+    самим собой.
+    """
+    raw = body.get("syncId")
+    if raw is None or raw == "":
+        return ""
+    val = str(raw)
+    if not _UUID_RE.match(val):
+        raise HTTPException(status_code=412, detail={"errors": [
+            {"error": "Ошибка сохранения объекта: поле 'syncId' не является UUID"}
+        ]})
+    return val
 
 
 def _require_meta_href(body: dict, field: str, expected_type: str) -> str:
@@ -963,22 +1192,73 @@ async def entity_purchaseorder_create(request: Request):
             raise HTTPException(status_code=412, detail={"errors": [
                 {"error": "Ошибка сохранения объекта: quantity должно быть > 0"}
             ]})
-    num = len(CREATED_PURCHASE_ORDERS) + 1
-    doc_id = f"po-{num:04d}"
-    doc = dict(body)
-    doc["id"] = doc_id
-    doc["name"] = f"{num:05d}"
-    doc["meta"] = {
-        "href": f"{BASE}/entity/purchaseorder/{doc_id}",
-        "type": "purchaseorder", "mediaType": "application/json",
-        "uuidHref": f"https://online.moysklad.ru/app/#purchaseorder/edit?id={doc_id}",
-    }
+    sync_id = _read_sync_id(body)
+    if int(FAULTS.get("po_create_delay_ms") or 0) > 0:
+        # Документ ещё НЕ создан — держим сетевое окно открытым.
+        import asyncio as _asyncio
+        await _asyncio.sleep(int(FAULTS["po_create_delay_ms"]) / 1000.0)
     if int(FAULTS.get("po_429_burst") or 0) > 0:
         # Отказ ДО создания: документа нет, повтор обязателен и безопасен.
         FAULTS["po_429_burst"] = int(FAULTS["po_429_burst"]) - 1
         raise HTTPException(status_code=429, detail="rate limited",
                             headers={"X-Lognex-Retry-TimeInterval": "200"})
-    CREATED_PURCHASE_ORDERS.append(doc)
+    if int(FAULTS.get("po_create_refuse") or 0) > 0:
+        # МойСклад ОТВЕТИЛ про этот запрос: payload отвергнут, документа нет.
+        # Обратная граница неизвестного исхода — см. post_refused_by_ms.
+        FAULTS["po_create_refuse"] = int(FAULTS["po_create_refuse"]) - 1
+        raise HTTPException(status_code=412, detail={"errors": [
+            {"error": "Ошибка сохранения объекта: документ отвергнут",
+             "code": 3006}]})
+    if int(FAULTS.get("po_fail_before_create") or 0) > 0:
+        # Отказ ДО создания, но НЕ по частоте: клиент из своей позиции не
+        # отличает его от «создан, ответ потерян» — и обязан вести себя так,
+        # будто документ мог появиться.
+        FAULTS["po_fail_before_create"] = int(FAULTS["po_fail_before_create"]) - 1
+        raise HTTPException(status_code=502, detail="bad gateway")
+    existing = None
+    if sync_id:
+        existing = next((d for d in CREATED_PURCHASE_ORDERS
+                         if str(d.get("syncId") or "") == sync_id), None)
+    if existing is not None:
+        # Upsert по занятому syncId: обновляем существующий документ и
+        # возвращаем ЕГО. Второго документа не появляется — ровно ради
+        # этого свойства ключ и посылается.
+        keep = {k: existing[k] for k in ("id", "name", "meta", "moment",
+                                         "applicable") if k in existing}
+        existing.clear()
+        existing.update(body)
+        existing.update(keep)
+        doc = existing
+    else:
+        num = len(CREATED_PURCHASE_ORDERS) + 1
+        doc_id = f"po-{num:04d}"
+        doc = dict(body)
+        doc["id"] = doc_id
+        doc["name"] = f"{num:05d}"
+        doc["meta"] = {
+            "href": f"{BASE}/entity/purchaseorder/{doc_id}",
+            "type": "purchaseorder", "mediaType": "application/json",
+            "uuidHref": f"https://online.moysklad.ru/app/#purchaseorder/edit?id={doc_id}",
+        }
+        CREATED_PURCHASE_ORDERS.append(doc)
+    if int(FAULTS.get("po_create_twin_then_fail") or 0) > 0:
+        # Документ создан, и рядом с ним — ВТОРОЙ с тем же syncId. Контракт
+        # JSON API 1.2 обещает уникальность ключа; здесь обещание нарушено, и
+        # узнаём мы об этом уже после попытки. Ответ следом «падает».
+        FAULTS["po_create_twin_then_fail"] = \
+            int(FAULTS["po_create_twin_then_fail"]) - 1
+        num = len(CREATED_PURCHASE_ORDERS) + 1
+        twin_id = f"po-{num:04d}"
+        twin = dict(doc)
+        twin["id"] = twin_id
+        twin["name"] = f"{num:05d}"
+        twin["meta"] = {
+            "href": f"{BASE}/entity/purchaseorder/{twin_id}",
+            "type": "purchaseorder", "mediaType": "application/json",
+            "uuidHref": f"https://online.moysklad.ru/app/#purchaseorder/edit?id={twin_id}",
+        }
+        CREATED_PURCHASE_ORDERS.append(twin)
+        raise HTTPException(status_code=502, detail="bad gateway")
     if int(FAULTS.get("po_create_then_fail") or 0) > 0:
         # Документ создан — и только потом «падает» ответ. Именно так
         # выглядит таймаут на стороне клиента: он не знает, что случилось.

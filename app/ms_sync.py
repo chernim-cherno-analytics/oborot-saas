@@ -70,13 +70,14 @@ from datetime import date, datetime, timedelta
 
 from sqlalchemy import delete, func, insert, inspect, or_, select, update
 
-from app import analytics, exclusions, logging_conf
+from app import analytics, exclusions, logging_conf, ms_writeback
 from app.crypto import decrypt_token
 from app.db import SessionLocal, engine, run_migration_step
 from app.models import (
     Connection,
     OrderedQty,
     Product,
+    ProductionOrder,
     Sale,
     StockDay,
     SyncState,
@@ -2130,6 +2131,181 @@ def _oborot_order_id(doc: dict, our_docs: dict[int, str]) -> int | None:
     return order_id
 
 
+def _backmatch_by_sync_id(org_id: int, docs: list[dict],
+                          our_docs: dict[int, str], stats: dict) -> None:
+    """Связывает документ МС с заказом «Оборота» по нашему ключу идемпотентности.
+
+    Зачем это вообще нужно. Отправка заказа поставщику может закончиться
+    ЧЕСТНЫМ unknown: документ в МойСкладе создан, а записать это у себя не
+    удалось (см. ms_writeback.commit_push). Тогда одно и то же едет дважды:
+    локальный вклад заказа остаётся в ordered_qty.qty, а документ МС ложится
+    в ms_qty. Само это не рассасывается — при следующей рекомендации бренд
+    видит вдвое больше товара «в пути», чем едет на самом деле, и не заказывает
+    то, что нужно. Отдельный ночной job для этого не нужен: синк заказов
+    поставщику и так проходит ровно по тем документам, среди которых лежит наш.
+
+    Почему связывать по syncId безопасно, а по метке — нет. syncId мы сами
+    породили uuid4 и закоммитили ДО сети; он живёт в служебном поле, а не в
+    описании, которое человек правит и копирует вместе с документом. Плюс два
+    условия сверх этого:
+      • ключ должен принадлежать заказу ЭТОЙ организации;
+      • документ с таким ключом должен быть в выборке РОВНО ОДИН. Контракт
+        JSON API 1.2 обещает уникальность syncId, но обещание чужой системы —
+        не повод связывать вслепую: два совпадения означают, что реальность
+        разошлась с контрактом, и угадывать здесь запрещено.
+
+    D-28 этим НЕ ослабляется. Правило принадлежности (`_is_oborot_doc`)
+    осталось прежним и проверяет всё те же три признака; back-match лишь
+    восстанавливает ОДИН из них — нашу собственную ссылку, которую мы потеряли
+    по своей вине. Документ, у которого метка чужая или скопированная,
+    tracked не станет: ссылка совпадёт, а маркер — нет.
+    """
+    by_sync: dict[str, list[dict]] = {}
+    for doc in docs:
+        key = str(doc.get("syncId") or "")
+        if key:
+            by_sync.setdefault(key, []).append(doc)
+    unique = {k: v[0] for k, v in by_sync.items() if len(v) == 1}
+    ambiguous = len(by_sync) - len(unique)
+    if ambiguous:
+        stats["incoming_backmatch_ambiguous"] = ambiguous
+    if not unique:
+        return
+
+    db = SessionLocal()
+    # Выигранные захваты копятся ЗДЕСЬ, а не публикуются сразу в our_docs.
+    #
+    # Ревью Codex (issuecomment-5415981236 → issuecomment-5416265593). Раньше
+    # `our_docs[order.id] = href` стоял внутри цикла, а общий `db.commit()` —
+    # после него. Исключение на ПОЗДНЕМ заказе откатывало href и перенос
+    # количеств у ВСЕХ, но словарь в памяти уже держал ссылку первого: `except`
+    # делал `rollback` и обнулял счётчик, а `our_docs` не трогал вовсе.
+    #
+    # Дальше в этом же прогоне `_oborot_order_id(doc, our_docs)` признавал
+    # документ НАШИМ (tracked) при несвязанной строке заказа и неснятом
+    # локальном qty — то есть одно и то же считалось дважды. Тот же исход,
+    # если исключение бросал сам `db.commit()`.
+    #
+    # Асимметрия выбрана сознательно: публикуем ПОЗЖЕ, чем пишем в базу.
+    # Если что-то случится между коммитом и публикацией, база окажется
+    # связанной, а память — нет; документ в этом прогоне посчитается внешним,
+    # а не нашим. Это недоучёт нашей метки на один прогон, и ближайший синк
+    # перечитает связь из базы. Обратный порядок давал двойной учёт «едет к
+    # нам», а из двух неточностей выбирается та, что не завышает.
+    staged: list[tuple[int, str]] = []
+    try:
+        rows = db.execute(
+            select(ProductionOrder).where(
+                ProductionOrder.org_id == org_id,
+                ProductionOrder.ms_sync_id.in_(list(unique)),
+            )
+        ).scalars().all()
+        for order in rows:
+            # Значение, КОТОРОЕ МЫ НАБЛЮДАЛИ. Дальше оно становится условием
+            # записи, а не просто основанием для решения: между этим чтением и
+            # нашим коммитом помещается целый T2 параллельной отправки.
+            observed_href = str(order.ms_doc_href or "")
+            if ms_writeback.is_pushed(observed_href):
+                continue  # ссылка уже сохранена — связывать нечего
+            doc = unique.get(str(order.ms_sync_id or ""))
+            if doc is None:
+                continue
+            href = ((doc.get("meta") or {}).get("href")) or ""
+            if not href:
+                continue
+            pushed_by_base = {
+                base: qty for base, qty in _order_bases(order).items() if qty > 0
+            }
+            # ЗАХВАТ ПРАВА СВЯЗАТЬ — условным UPDATE, а не присваиванием.
+            #
+            # Ревью Codex, P1 (discussion_r3856604240). Раньше здесь стояла
+            # последовательность «прочитали → проверили is_pushed по
+            # прочитанному → присвоили href → безусловно перенесли вклад».
+            # Параллельная отправка делает свой T2 (_commit_push_once) с
+            # CAS'ом по точному токену и тем же переносом. Успей она между
+            # нашим чтением и коммитом — вклад заказа переносится ВТОРОЙ раз.
+            #
+            # И это не «лишняя арифметика»: в _move_incoming_to_ms стоит
+            # `qty = max(0.0, qty - ...)`. Clamp не защищает, а ПРЯЧЕТ —
+            # второе вычитание не уходит в минус, оно молча съедает вклад
+            # ДРУГОГО отправленного заказа с тем же base_name. Два заказа по
+            # 10: T2 честно делает 20 → 10, поздний backmatch делает 10 → 0,
+            # и второй заказ перестаёт считаться «едет к нам», никуда не
+            # делавшись. Пользователь видит нехватку, которой нет.
+            #
+            # Условие захвата — ровно наблюдённое состояние: та же
+            # организация, тот же заказ, тот же ключ идемпотентности и
+            # ms_doc_href, РАВНЫЙ прочитанному. Изменилось что угодно из
+            # этого — rowcount=0, и мы не двигаем ничего.
+            #
+            # coalesce — ради строк, вставленных до появления колонки: у них
+            # ms_doc_href может быть NULL, а `NULL = ''` в SQL не истинно, и
+            # такие заказы молча выпали бы из-под связывания навсегда.
+            claimed = db.execute(
+                update(ProductionOrder)
+                .where(
+                    ProductionOrder.id == order.id,
+                    ProductionOrder.org_id == org_id,
+                    ProductionOrder.ms_sync_id == order.ms_sync_id,
+                    func.coalesce(ProductionOrder.ms_doc_href, "") == observed_href,
+                )
+                .values(ms_doc_href=href,
+                        ms_doc_name=str(doc.get("name") or ""),
+                        ms_lookup_mode=ms_writeback.LOOKUP_SYNC)
+                # Статус берётся из ТОЙ ЖЕ операции, что и запись ссылки, а не
+                # из ORM-объекта, прочитанного до окна: за это время заказ мог
+                # стать принятым, и «снимать ли локальный вклад» обязано
+                # решаться по состоянию внутри транзакции (тот же приём, что в
+                # ms_writeback._commit_push_once).
+                .returning(ProductionOrder.status)
+                .execution_options(synchronize_session=False)
+            ).fetchall()
+            if not claimed:
+                # Проиграли: кто-то уже связал этот заказ и уже перенёс вклад.
+                # Это нормальный исход, а не ошибка — повторять за ним нечего.
+                continue
+            # Тот же T2, что и при отправке: ссылка и перенос вклада — вместе,
+            # одной транзакцией. Прибавка к ms_qty живёт до конца этого же
+            # синка (ниже он пересобирает вклад МС начисто), а вот СНЯТИЕ
+            # локального qty — ради него всё и делается.
+            ms_writeback._move_incoming_to_ms(
+                db, org_id, order, pushed_by_base,
+                was_sent=str(claimed[0][0] or "") == "sent")
+            # В память — НЕ здесь: только в стадию. Публикация ждёт коммита.
+            staged.append((int(order.id), href))
+        if staged:
+            db.commit()
+    except Exception:  # noqa: BLE001 — связывание не должно ронять синк целиком
+        db.rollback()
+        log.exception("backmatch: не удалось связать документы org=%s", org_id)
+        # Стадия стирается вместе с откатом базы. `db.commit()` стоит ВНУТРИ
+        # того же try, поэтому его собственный сбой попадает сюда же и тоже
+        # не оставляет публикации: «в базе нет — и в памяти нет».
+        staged = []
+    finally:
+        db.close()
+
+    # Публикация — только после УСПЕШНОГО коммита и только целиком.
+    for order_id, href in staged:
+        our_docs[order_id] = href
+    if staged:
+        stats["incoming_backmatched"] = len(staged)
+
+
+def _order_bases(order) -> dict[str, int]:
+    """{base_name: количество} по позициям заказа — как их считает отправка."""
+    out: dict[str, int] = {}
+    for item in order.items:
+        base = str(item.get("base_name") or "")
+        if not base:
+            continue
+        sizes = item.get("sizes") or {}
+        qty = sum(int(q or 0) for q in sizes.values()) or int(item.get("qty") or 0)
+        if qty > 0:
+            out[base] = out.get(base, 0) + qty
+    return out
+
+
 async def _sync_incoming(org_id: int, client: MoySkladClient,
                          ext_to_pid: dict[str, int], stats: dict,
                          progress: tuple[float, float] = (95.5, 97.0)) -> None:
@@ -2166,8 +2342,6 @@ async def _sync_incoming(org_id: int, client: MoySkladClient,
     заполняется ли оно у конкретного клиента, зависит, возможен ли
     автоматический учёт исполнения вообще (шаг 0 модели исполнения).
     """
-    from app.models import ProductionOrder
-
     _set_state(org_id, stage="incoming", progress=progress[0],
                detail="Загружаем заказы поставщику («едет к нам»)…")
     # Окно заказов поставщику — ГОД (INCOMING_ORDERS_DAYS), не окно истории:
@@ -2200,6 +2374,11 @@ async def _sync_incoming(org_id: int, client: MoySkladClient,
         }
     finally:
         db.close()
+
+    # Отправки, закончившиеся честным unknown: документ есть, ссылки у нас
+    # нет. Связываем до основного цикла, чтобы такой документ уже в ЭТОМ
+    # синке считался нашим, а не ещё сутки числился чужим.
+    _backmatch_by_sync_id(org_id, docs, our_docs, stats)
 
     incoming: dict[str, float] = {}
     incoming_tracked: dict[str, float] = {}
