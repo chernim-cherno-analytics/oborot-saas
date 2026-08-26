@@ -94,6 +94,7 @@ SUITES = [
     ("notify",      "test_notify.py",          True,  True),
     ("sync_wipe",   "test_sync_wipe.py",       True,  False),
     ("sync_supplier", "test_sync_supplier.py", True,  False),
+    ("sync_late",   "test_sync_late_product.py", True, False),
     ("sync_atomic", "test_sync_atomic.py",     True,  False),
     ("price_types", "test_price_types.py",     True,  False),
     ("wb_dup",      "test_writeback_dup.py",   True,  False),

@@ -545,6 +545,24 @@ def entity_assortment(request: Request, limit: int = 1000, offset: int = 0):
             "buyPrice": {"value": 0},
             "archived": False,
         })
+    if LATE_PRODUCT.get("ext"):
+        if int(LATE_PRODUCT.get("hidden_calls") or 0) > 0:
+            LATE_PRODUCT["hidden_calls"] = int(LATE_PRODUCT["hidden_calls"]) - 1
+        else:
+            ext = LATE_PRODUCT["ext"]
+            row = {
+                "id": ext, "name": LATE_PRODUCT.get("name") or ext,
+                "pathName": "Одежда/Поздний",
+                "meta": {"href": f"{BASE}/entity/product/{ext}", "type": "product"},
+                "salePrices": _sale_prices(ext, int(LATE_PRODUCT.get("price_rub") or 0),
+                                           int(LATE_PRODUCT.get("cost_rub") or 0)),
+                "buyPrice": {"value": int(LATE_PRODUCT.get("cost_rub") or 0) * 100},
+                "archived": False,
+            }
+            sup = _supplier_meta(ext)
+            if sup:
+                row["supplier"] = sup
+            rows.append(row)
     return _page(rows, limit, offset)
 
 
@@ -762,6 +780,13 @@ async def report_stock_all(request: Request, limit: int = 1000, offset: int = 0,
         {"meta": _asm_meta(ext), "name": SKU_BY_EXT[ext]["name"], "stock": qty}
         for ext, qty in sorted(snapshot.items())
     ]
+    late_ext = LATE_PRODUCT.get("ext")
+    late_qty = float(LATE_PRODUCT.get("qty") or 0)
+    if late_ext and late_qty > 0 and sid == LATE_PRODUCT.get("store"):
+        rows.append({
+            "meta": {"href": f"{BASE}/entity/product/{late_ext}", "type": "product"},
+            "name": LATE_PRODUCT.get("name") or late_ext, "stock": late_qty,
+        })
     return _page(rows, limit, offset)
 
 
@@ -996,6 +1021,24 @@ CREATED_PURCHASE_ORDERS: list[dict] = [] # тела принятых POST + пр
 # не видят supplier в ассортименте вовсе, как раньше.
 SUPPLIER_LINKS: dict[str, str] = {}
 
+# DATA-8 (первый сценарий): товар, СОЗДАННЫЙ в МойСкладе между чтением
+# ассортимента и отчётом остатков ОДНОГО И ТОГО ЖЕ прогона синка. Пока
+# hidden_calls > 0, /entity/assortment этот товар не отдаёт вовсе (как будто
+# он ещё не существовал на момент чтения), а /report/stock/all отдаёт его
+# остаток с самого начала (товар уже физически создан и продаётся). Каждый
+# вызов /entity/assortment уменьшает счётчик на 1, пока не дойдёт до нуля —
+# дальше товар виден. ext="" (по умолчанию) — функция выключена целиком,
+# остальные наборы её не видят. `supplier_hidden_calls` — тот же приём,
+# применённый к справочнику контрагентов: пока > 0, контрагент, привязанный
+# к этому ext_id через SUPPLIER_LINKS, не отдаётся НЕФИЛЬТРОВАННЫМ
+# GET /entity/counterparty (тем самым списком, которым пользуется
+# fetch_counterparties), как будто и поставщик появился в том же окне
+# гонки, что и сам товар. По умолчанию 0 — существующие наборы поведения
+# справочника не видят.
+LATE_PRODUCT: dict = {"ext": "", "name": "", "price_rub": 0, "cost_rub": 0,
+                     "qty": 0.0, "store": "st-flag", "hidden_calls": 0,
+                     "supplier_hidden_calls": 0}
+
 
 def reset_writeback_state() -> None:
     COUNTERPARTIES.clear()
@@ -1038,6 +1081,20 @@ async def test_supplier_links(request: Request):
         cp = _find_or_create_counterparty(name)
         SUPPLIER_LINKS[ext_id] = cp["id"]
     return {"links": dict(SUPPLIER_LINKS), "counterparties": list(COUNTERPARTIES)}
+
+
+@app.post("/__test/late_product")
+async def test_late_product(request: Request):
+    """Тестовое управление LATE_PRODUCT (DATA-8, первый сценарий).
+
+    Тело — частичное обновление LATE_PRODUCT, например
+    {"ext": "p-late1", "name": "...", "qty": 7.0, "hidden_calls": 1}.
+    """
+    body = await request.json()
+    for key, val in (body or {}).items():
+        if key in LATE_PRODUCT:
+            LATE_PRODUCT[key] = val
+    return dict(LATE_PRODUCT)
 
 
 def _reject_sync_id_filter(parsed: dict) -> None:
@@ -1102,8 +1159,12 @@ async def entity_counterparty(request: Request, limit: int = 1000, offset: int =
     if int(FAULTS.get("cp_search_delay_ms") or 0) > 0:
         import asyncio as _asyncio
         await _asyncio.sleep(int(FAULTS["cp_search_delay_ms"]) / 1000.0)
+    hidden_cp_id = None
+    if not name and int(LATE_PRODUCT.get("supplier_hidden_calls") or 0) > 0:
+        LATE_PRODUCT["supplier_hidden_calls"] = int(LATE_PRODUCT["supplier_hidden_calls"]) - 1
+        hidden_cp_id = SUPPLIER_LINKS.get(LATE_PRODUCT.get("ext") or "")
     rows = [_counterparty_row(cp) for cp in list(COUNTERPARTIES)
-            if (not name or cp["name"] == name)]
+            if (not name or cp["name"] == name) and cp["id"] != hidden_cp_id]
     return _page(rows, limit, offset)
 
 

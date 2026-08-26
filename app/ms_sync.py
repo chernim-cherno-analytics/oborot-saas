@@ -1158,6 +1158,11 @@ async def _run_initial(org_id: int, client: MoySkladClient, active_wh: list,
                          else f"Догружаем остатки за пропущенные "
                               f"{len(gap_dates)} дн.…"))
         day_results = await _fetch_dates(client, active_wh, gap_dates, ext_to_pid, unmatched)
+        if unmatched and await _reconcile_late_products(client, org_id, ext_to_pid,
+                                                        unmatched, stats):
+            unmatched = set()
+            day_results = await _fetch_dates(client, active_wh, gap_dates, ext_to_pid,
+                                             unmatched)
         prev_positive = _positive_before(org_id, gap_dates[0])
         batch, zeroed = _rows_for_dates(org_id, gap_dates, day_results, prev_positive)
         # DATA-3: дни продолжения публикуются вместе со СВОИМИ продажами — тем
@@ -1188,6 +1193,11 @@ async def _run_initial(org_id: int, client: MoySkladClient, active_wh: list,
         _persist(org_id, stats, stage="today", progress=6.0,
                  detail="Загружаем остатки на сегодня…")
         day_results = await _fetch_dates(client, active_wh, [today_iso], ext_to_pid, unmatched)
+        if unmatched and await _reconcile_late_products(client, org_id, ext_to_pid,
+                                                        unmatched, stats):
+            unmatched = set()
+            day_results = await _fetch_dates(client, active_wh, [today_iso], ext_to_pid,
+                                             unmatched)
         batch, _ = _rows_for_dates(org_id, [today_iso], day_results, set())
         # Первая удачная загрузка скачана — только теперь стираем старую историю
         # (инвариант 18.08) и ставим точку продолжения «с сегодня»: провал на
@@ -1367,6 +1377,10 @@ async def _run_incremental(org_id: int, client: MoySkladClient, active_wh: list,
     _set_state(org_id, stage="stock_today", progress=12.0,
                detail="Обновляем остатки на сегодня…")
     day_results = await _fetch_dates(client, active_wh, dates, ext_to_pid, unmatched)
+    if unmatched and await _reconcile_late_products(client, org_id, ext_to_pid,
+                                                    unmatched, stats):
+        unmatched = set()
+        day_results = await _fetch_dates(client, active_wh, dates, ext_to_pid, unmatched)
     prev_positive = _positive_before(org_id, dates[0])
     batch, zeroed = _rows_for_dates(org_id, dates, day_results, prev_positive)
     # Остатки по складам к оборачиваемости отношения не имеют (нет измерения
@@ -1695,6 +1709,90 @@ def _category_of(row: dict) -> str:
     return str(folder or "").strip()
 
 
+def _apply_product_fields(row: Product, item: dict, suppliers_ok: bool) -> None:
+    """Общие поля из строки ассортимента → products (создание и обновление)."""
+    row.base_name = item["base_name"]
+    row.size = item["size"]
+    row.category = item["category"]
+    row.sale_price = item["sale_price"]
+    row.cost_full = item.get("cost_full") or 0.0
+    if suppliers_ok or not item.get("supplier_link"):
+        row.supplier = item.get("supplier") or ""
+    row.cost_price = item["cost_price"]
+    row.archived = item["archived"]
+
+
+async def _reconcile_late_products(client: MoySkladClient, org_id: int,
+                                    ext_to_pid: dict[str, int],
+                                    unmatched: set[str], stats: dict) -> bool:
+    """DATA-8 (первый сценарий): товар, СОЗДАННЫЙ в МойСкладе МЕЖДУ чтением
+    ассортимента и отчётом остатков ЭТОГО прогона, не попадает в ext_to_pid
+    (тот строится один раз, сразу после ассортимента, в `_upsert_products`) —
+    `_fetch_day_stock` находит остаток по ext_id, которого нет ни у одного
+    известного товара, молча добавляет его в `unmatched` и теряет остаток на
+    весь прогон.
+
+    Один ограниченный дополнительный проход: перечитываем ассортимент ЕЩЁ
+    РАЗ (сейчас в МойСкладе товар уже виден, если он и правда только что
+    создан), заводим товары для той части `unmatched`, что нашлась,
+    расширяем `ext_to_pid` и возвращаем True — вызывающий код обязан
+    перечитать остатки ЕЩЁ РАЗ теми же датами с расширенным `ext_to_pid`.
+
+    Если повторное чтение ассортимента само упало (сеть/лимит), или ext_id
+    так и не нашёлся (реального совпадения не случилось — не гонка, а
+    нераспознанный SKU), — молчим и возвращаем False: вызывающий код
+    оставляет остаток исключённым, как и раньше (fail-closed: без
+    фабрикации данных и без второй попытки).
+
+    Второй заход (discussion_r3866367449): поставщик-контрагент товара мог
+    быть создан в МойСкладе В ТОМ ЖЕ окне гонки, что и сам товар. Справочник
+    контрагентов (`_SUPPLIERS[org_id]`) на этот момент прочитан ДО окна, в
+    `_run_sync`, — его не обновляем, и `_parse_assortment` ниже резолвил бы
+    имя поставщика по устаревшему кэшу, теряя ссылку, которая уже есть в
+    свежем ассортименте. Поэтому справочник обновляется ЕЩЁ ОДНИМ
+    ограниченным запросом ПЕРЕД разбором свежего ассортимента — тем же
+    try/except, что и первое чтение в `_run_sync`: без второй попытки, без
+    фабрикации имени при сбое.
+    """
+    try:
+        fresh = await client.fetch_assortment()
+    except Exception as exc:  # noqa: BLE001 — сеть/лимит: не роняем синк
+        stats["late_products_error"] = str(exc)[:200]
+        return False
+    try:
+        _SUPPLIERS[org_id] = {
+            (row.get("id") or ""): str(row.get("name") or "")
+            for row in await client.fetch_counterparties()
+        }
+        suppliers_ok = True
+    except Exception as exc:  # noqa: BLE001 — сеть/лимит: не роняем синк
+        suppliers_ok = False
+        stats["late_products_suppliers_error"] = str(exc)[:200]
+    candidates = [item for item in _parse_assortment(fresh, org_id)
+                  if item["ext_id"] in unmatched and item["ext_id"] not in ext_to_pid]
+    if not candidates:
+        return False
+    db = SessionLocal()
+    try:
+        for item in candidates:
+            row = Product(org_id=org_id, ext_id=item["ext_id"])
+            row.excluded = exclusions.is_service_item(item["base_name"], item["category"])
+            _apply_product_fields(row, item, suppliers_ok)
+            db.add(row)
+        db.commit()
+        for item in candidates:
+            ext_to_pid[item["ext_id"]] = db.execute(
+                select(Product.id).where(Product.org_id == org_id,
+                                         Product.ext_id == item["ext_id"])
+            ).scalar_one()
+    finally:
+        db.close()
+    stats["late_products_recovered"] = stats.get("late_products_recovered", 0) + len(candidates)
+    stats["products_total"] = stats.get("products_total", 0) + len(candidates)
+    stats["products_created"] = stats.get("products_created", 0) + len(candidates)
+    return True
+
+
 def _upsert_products(org_id: int, assortment: list[dict], stats: dict) -> dict[str, int]:
     """Создаёт/обновляет products; возвращает карту ext_id → наш product.id."""
     parsed = _parse_assortment(assortment, org_id)
@@ -1738,15 +1836,7 @@ def _upsert_products(org_id: int, assortment: list[dict], stats: dict) -> dict[s
                 updated += 1
                 if row.base_name and row.base_name != item["base_name"]:
                     renames.setdefault(row.base_name, set()).add(item["base_name"])
-            row.base_name = item["base_name"]
-            row.size = item["size"]
-            row.category = item["category"]
-            row.sale_price = item["sale_price"]
-            row.cost_full = item.get("cost_full") or 0.0
-            if suppliers_ok or not item.get("supplier_link"):
-                row.supplier = item.get("supplier") or ""
-            row.cost_price = item["cost_price"]
-            row.archived = item["archived"]
+            _apply_product_fields(row, item, suppliers_ok)
         # Миграция пользовательских данных — ДО commit, в одной транзакции с
         # обновлением base_name (ревью 18.08): иначе сбой между коммитами
         # оставлял товары с новыми именами, а данные — со старыми, навсегда.
