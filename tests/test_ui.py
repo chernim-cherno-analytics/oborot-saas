@@ -255,7 +255,50 @@ def run() -> int:  # noqa: C901 — сценарный тест: шагов мн
         }""")
         check("план построен и таблица отрисована", row is not None, str(row))
         if row:
-            bumped = row["qty"] + 60
+            # Сценарий обязан сам создать свою предпосылку. Излишек считается
+            # как «введено минус потребность» — и сервером, и страницей, — а
+            # прежнее qty + 60 брало число с потолка. 26.08 первая строка
+            # демо-плана дала qty=15 при need=75: qty + 60 — это ровно 75,
+            # то есть вровень с потребностью, а не сверх неё. Излишка нет,
+            # строки на экране закономерно нет, и обязательный набор ui падал
+            # не на регрессе продукта, а на своём допущении (post-merge CI
+            # 32917949907, оба прогона 2594 OK / 1 FAIL).
+            #
+            # Потребность спрашиваем у сервера, а не считываем с экрана:
+            # сверяем экран с источником, а не сам с собой — тем же приёмом,
+            # что и «Что заказать» ниже.
+            plan_params = {"budget": 300000, "budget_scope": "now",
+                           "cadence_days": 30, "safety_days": 14}
+            plan_src = c.post("/api/order-plan/preview", json=plan_params).json()
+            plan_src = plan_src.get("plan") or plan_src
+            item = next((i for i in plan_src.get("items", [])
+                         if i.get("base_name") == row["base"]), None)
+            check("правим ту же строку, что построил сервер",
+                  item is not None and item.get("qty") == row["qty"],
+                  f"экран {row}, сервер "
+                  + str(None if item is None
+                        else {"qty": item.get("qty"), "need": item.get("need")}))
+            # need может не прийти вовсе (строка, вписанная руками, — см.
+            # _manual_item) или прийти null. Страница в этом случае считает
+            # потребность равной введённому количеству (liveTotals в
+            # assistant.html), то есть излишка не бывает ни при каком вводе.
+            # Молчать об этом нельзя: иначе сценарий снова проверяет не то,
+            # что обещает названием.
+            need = item.get("need") if item else None
+            need = int(need) if isinstance(need, (int, float)) else None
+            margin = max(0, (item.get("avg_price") or 0)
+                         - (item.get("cost_price") or 0)) if item else 0
+            check("потребность строки известна числом", need is not None,
+                  f'{row["base"]}: need={None if item is None else item.get("need")!r}')
+            # Строго больше потребности — не «на 60 больше». Прежнее qty + 60
+            # остаётся нижней границей: правка руками должна быть заметной,
+            # иначе она не проверяет и расчёт маржи.
+            bumped = max(row["qty"] + 60, need + 1) if need is not None \
+                else row["qty"] + 60
+            check("ручной ввод строго больше потребности и излишку есть маржа",
+                  need is not None and bumped > need and margin > 0,
+                  f'{row["base"]}: ввод {bumped} шт против потребности {need} шт, '
+                  f"маржа {margin} ₽/шт")
             page.evaluate("""(v) => {
               const el = document.querySelector('.qinp');
               el.value = String(v);
@@ -273,9 +316,7 @@ def run() -> int:  # noqa: C901 — сценарный тест: шагов мн
             }""")
             check("карточка «Валовая маржа» на экране есть", shown is not None,
                   str(shown))
-            plan_body = {"budget": 300000, "budget_scope": "now",
-                         "cadence_days": 30, "safety_days": 14,
-                         "overrides": {row["base"]: bumped}}
+            plan_body = dict(plan_params, overrides={row["base"]: bumped})
             srv = c.post("/api/order-plan/preview", json=plan_body).json()
             srv = srv.get("plan") or srv
             srv_profit = srv["totals"]["expected_profit"]
@@ -284,9 +325,24 @@ def run() -> int:  # noqa: C901 — сценарный тест: шагов мн
             check("маржа на экране совпадает с серверной до рубля",
                   abs(ui_profit - srv_profit) <= 1,
                   f"экран {ui_profit} vs сервер {srv_profit}")
+            # Спрашиваем подпись самой карточки маржи, а не весь экран: слова
+            # «сверх потребности» есть на странице и по другим поводам —
+            # в карточке «Позиций / штук» и в пояснении строки, — и проверка
+            # по всему #s3 могла бы пройти, ни разу не увидев, назван ли
+            # излишек ОТДЕЛЬНО ОТ МАРЖИ. Именно это обещает название проверки.
+            over_note = page.evaluate("""() => {
+              const cards = document.querySelectorAll('#cards .card');
+              for (const c of cards) {
+                const lbl = c.querySelector('.l');
+                if (lbl && /Валовая маржа/i.test(lbl.textContent))
+                  return (c.querySelector('.s') || {}).textContent || "";
+              }
+              return null;
+            }""")
             check("излишек сверх потребности назван отдельно, а не влит в маржу",
-                  "сверх потребности" in (page.text_content("#s3") or ""),
-                  "строки нет")
+                  "сверх потребности" in (over_note or ""),
+                  "карточки маржи нет" if over_note is None
+                  else f"подпись карточки: {over_note[:120]}")
 
         print("\n== «Что заказать»: позиции без себестоимости не бесплатны ==")
         page.goto(f"{base}/replenish")
