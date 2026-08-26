@@ -1786,16 +1786,248 @@ def run_scenario() -> int:
     # Пока идёт первая загрузка, подключение ещё 'pending', last_sync_at пуст:
     # «/» уводило на онбординг, где по умолчанию выбраны «Демо-данные», и один
     # клик стирал таблицы организации ПРЯМО ВО ВРЕМЯ записи их синком.
-    def _newbie_counts():
-        c = sqlite3.connect(DB_PATH)
+    # ЧТО ЗДЕСЬ ЗНАЧИТ «ДАННЫЕ ЦЕЛЫ». Равенство счётчиков до/после им НЕ
+    # является: ровно в этот момент фоновая первичная загрузка ЗАКОННО пишет
+    # строки, и совпадение счётчиков означает лишь, что оба снимка случайно
+    # попали в паузу между коммитами. Профиль на этом же сценарии (сэмплер
+    # раз в 30 мс, 180 снимков): окно между снимками — 0.039 с и приходится
+    # на +0.021…+0.059 с от старта синка, а фон коммитит products 0→41 на
+    # +0.075 с, stock_days 0→1580 двенадцатью коммитами, sales 0→396, и
+    # warehouse_stock 0→23. За весь первичный синк не исчезла НИ ОДНА строка.
+    #
+    # Поэтому проверяется то, что демо действительно сломало бы. Успешный
+    # POST /api/connect/demo зовёт seed_demo, а тот начинается с
+    # clear_org_data (app/demo_seed.py): DELETE по sales, stock_days,
+    # warehouse_stock, ordered_qty, production_orders, products, warehouses
+    # организации — и добавляет строку connections(kind='demo').
+    #
+    # Идентичность, а не версия строки: диапазонные перезаписи остатков и
+    # продаж (_write_stock_rows/_apply_sales) делают DELETE+INSERT внутри
+    # ОДНОЙ транзакции, поэтому на закоммиченных состояниях они невидимы и
+    # ложной тревоги не дают.
+    # Идентичность, а не наличие id: Product.id в SQLite — переиспользуемый
+    # rowid, и после стирания строка «с тем же id» может оказаться уже другим
+    # товаром. Отсюда сверка отображения id → ext_id, а не набора id.
+    def _org_snapshot(db_path, email):
+        """Снимок бизнес-данных организации: идентичности, а не количества."""
+        c = sqlite3.connect(db_path, timeout=15.0)
         try:
             org = c.execute("SELECT org_id FROM memberships m JOIN users u "
-                            "ON u.id=m.user_id WHERE u.email='newbie@test.io'").fetchone()[0]
-            return (org,
-                    c.execute("SELECT COUNT(*) FROM products WHERE org_id=?", (org,)).fetchone()[0],
-                    c.execute("SELECT COUNT(*) FROM stock_days WHERE org_id=?", (org,)).fetchone()[0])
+                            "ON u.id=m.user_id WHERE u.email=?", (email,)).fetchone()[0]
+
+            def _multiset(sql):
+                out = {}
+                for key in c.execute(sql, (org,)):
+                    out[key] = out.get(key, 0) + 1
+                return out
+
+            return {
+                "org": org,
+                "connections": set(c.execute(
+                    "SELECT id, kind FROM connections WHERE org_id=?", (org,))),
+                "warehouses": dict(c.execute(
+                    "SELECT id, ext_id FROM warehouses WHERE org_id=?", (org,))),
+                "products": dict(c.execute(
+                    "SELECT id, ext_id FROM products WHERE org_id=?", (org,))),
+                # Ключ — ext_id ТОВАРА, а не его product_id: после стирания
+                # SQLite переиспользует rowid, и «строка про товар 4» легко
+                # оказывается строкой про совсем другой товар с тем же
+                # номером. По сырому product_id такая подмена не видна —
+                # проверено контролем (2) ниже, он на этом и ловил меня.
+                # COALESCE отдельно называет строку, товар которой исчез.
+                "stock_days": _multiset(
+                    "SELECT COALESCE(p.ext_id, '<товара нет>'), s.date "
+                    "FROM stock_days s LEFT JOIN products p "
+                    "ON p.id = s.product_id AND p.org_id = s.org_id "
+                    "WHERE s.org_id=?"),
+                "sales": _multiset(
+                    "SELECT COALESCE(p.ext_id, '<товара нет>'), s.date, s.is_return "
+                    "FROM sales s LEFT JOIN products p "
+                    "ON p.id = s.product_id AND p.org_id = s.org_id "
+                    "WHERE s.org_id=?"),
+                "warehouse_stock": _multiset(
+                    "SELECT COALESCE(p.ext_id, '<товара нет>'), "
+                    "COALESCE(w.ext_id, '<склада нет>') "
+                    "FROM warehouse_stock ws "
+                    "LEFT JOIN products p ON p.id = ws.product_id AND p.org_id = ws.org_id "
+                    "LEFT JOIN warehouses w ON w.id = ws.warehouse_id AND w.org_id = ws.org_id "
+                    "WHERE ws.org_id=?"),
+            }
         finally:
             c.close()
+
+    def _newbie_snapshot():
+        return _org_snapshot(DB_PATH, "newbie@test.io")
+
+    def _counts3(snap):
+        """ПРЕЖНЕЕ условие проверки: (org, товаров, дней остатков).
+
+        Оставлено намеренно: на нём держатся контроли ниже. Оно обязано
+        падать при законном прогрессе и обязано пропускать перепривязку —
+        иначе контроль ничего не доказывает.
+        """
+        return (snap["org"], len(snap["products"]), sum(snap["stock_days"].values()))
+
+    def _data_loss(before, after):
+        """Что из УЖЕ СУЩЕСТВОВАВШЕГО пропало, подменено или перепривязано.
+
+        Новые строки фонового синка нарушением не считаются — они и есть
+        законный прогресс. Пустой список = данные целы.
+        """
+        bad = []
+        if after["org"] != before["org"]:
+            bad.append(f"организация подменена: {before['org']} → {after['org']}")
+        for cid, kind in sorted(before["connections"] - after["connections"]):
+            bad.append(f"подключение исчезло: id={cid} kind={kind}")
+        # Новое подключение — это подпись демо: seed_demo заводит kind='demo'
+        # и делает его активным. Статус в идентичность не входит: переход
+        # pending → active на finalize-lite законен и измерен в профиле.
+        for cid, kind in sorted(after["connections"] - before["connections"]):
+            bad.append(f"появилось подключение: id={cid} kind={kind}")
+        for table in ("warehouses", "products"):
+            for row_id, ext in sorted(before[table].items()):
+                now = after[table].get(row_id, "<строки нет>")
+                if now != ext:
+                    bad.append(f"{table}: id={row_id} было ext_id={ext!r}, "
+                               f"стало {now!r}")
+        for table in ("stock_days", "sales", "warehouse_stock"):
+            for key, was in sorted(before[table].items()):
+                now = after[table].get(key, 0)
+                if now < was:
+                    bad.append(f"{table}: {key} было строк {was}, стало {now}")
+        return bad
+
+    def _p9_controls():
+        """Контроли предиката: песочница на диске, настоящая схема и
+        настоящая продуктовая функция стирания.
+
+        От таймингов не зависят ничем. Проверяют ровно тот код, которым
+        проверяется живой случай (_org_snapshot / _counts3 / _data_loss):
+
+          1) ЗАКОННЫЙ ПРОГРЕСС — только новые строки: ПРЕЖНЕЕ равенство
+             счётчиков обязано упасть, новый инвариант обязан молчать;
+          2) СТИРАНИЕ — настоящий clear_org_data + строка connections
+             (kind='demo') + строк добавлено БОЛЬШЕ, чем удалено: и старое
+             равенство, и ослабление «счётчики не уменьшились» порчу
+             пропускают, новый инвариант её ловит;
+          3) ПЕРЕПРИВЯЗКА — у существующего id меняется ext_id (в SQLite так
+             выглядит переиспользованный rowid): счётчики совпадают побайтно,
+             прежнее условие ПРОХОДИТ, новый инвариант ловит.
+        """
+        from sqlalchemy import create_engine as _create_engine, update as _update
+        from sqlalchemy.orm import Session as _SASession
+
+        from app import models as _m
+        from app.demo_seed import clear_org_data as _clear_org_data
+
+        email = "p9control@test.io"
+        path = ROOT / f"test_oborot_p9control_{SHARD}.db"
+        for suffix in ("", "-wal", "-shm"):
+            p = Path(str(path) + suffix)
+            if p.exists():
+                p.unlink()
+        eng = _create_engine(f"sqlite:///{path}", future=True)
+        try:
+            _m.Base.metadata.create_all(eng)
+            with _SASession(eng) as s:
+                org, user = _m.Org(name="Контроль p9"), _m.User(
+                    email=email, pw_hash="x", name="Контроль")
+                s.add_all([org, user])
+                s.flush()
+                org_id = org.id
+                s.add(_m.Membership(user_id=user.id, org_id=org_id, role="owner"))
+                s.add(_m.Connection(org_id=org_id, kind="moysklad",
+                                    token_enc="", status="pending"))
+                whs = [_m.Warehouse(org_id=org_id, ext_id=f"st-{i}", name=f"Склад {i}")
+                       for i in range(2)]
+                prods = [_m.Product(org_id=org_id, ext_id=f"ms-{i}",
+                                    base_name=f"Товар {i}", size="M") for i in range(3)]
+                s.add_all(whs + prods)
+                s.flush()
+                for p in prods:
+                    s.add(_m.StockDay(org_id=org_id, product_id=p.id,
+                                      date="2026-08-01", qty=1.0))
+                    s.add(_m.Sale(org_id=org_id, product_id=p.id, date="2026-08-01",
+                                  qty=1.0, revenue=100.0))
+                    s.add(_m.WarehouseStock(org_id=org_id, product_id=p.id,
+                                            warehouse_id=whs[0].id, qty=1.0))
+                s.commit()
+            base = _org_snapshot(path, email)
+
+            # (1) Законный прогресс фонового синка: только новые строки.
+            with _SASession(eng) as s:
+                p = _m.Product(org_id=org_id, ext_id="ms-new",
+                               base_name="Новый", size="M")
+                s.add(p)
+                s.flush()
+                for d in ("2026-08-02", "2026-08-03"):
+                    s.add(_m.StockDay(org_id=org_id, product_id=p.id, date=d, qty=2.0))
+                s.add(_m.Sale(org_id=org_id, product_id=p.id, date="2026-08-02",
+                              qty=1.0, revenue=50.0))
+                s.commit()
+            grown = _org_snapshot(path, email)
+            old_progress = _counts3(grown) == _counts3(base)
+            new_progress = _data_loss(base, grown)
+
+            # (2) Стирание настоящей продуктовой функцией + подпись демо,
+            #     причём новых строк БОЛЬШЕ, чем удалённых.
+            with _SASession(eng) as s:
+                _clear_org_data(s, org_id)
+                s.add(_m.Connection(org_id=org_id, kind="demo",
+                                    token_enc="", status="active"))
+                for i in range(9):
+                    p = _m.Product(org_id=org_id, ext_id=f"demo-{i:03d}-M",
+                                   base_name=f"Демо {i}", size="M")
+                    s.add(p)
+                    s.flush()
+                    for d in ("2026-08-01", "2026-08-02", "2026-08-03"):
+                        s.add(_m.StockDay(org_id=org_id, product_id=p.id,
+                                          date=d, qty=3.0))
+                s.commit()
+            wiped = _org_snapshot(path, email)
+            old_wipe = _counts3(wiped) == _counts3(grown)
+            weak_wipe = (_counts3(wiped)[1] >= _counts3(grown)[1]
+                         and _counts3(wiped)[2] >= _counts3(grown)[2])
+            new_wipe = _data_loss(grown, wiped)
+
+            # (3) Перепривязка: id тот же, товар за ним другой.
+            with _SASession(eng) as s:
+                s.execute(_update(_m.Product)
+                          .where(_m.Product.org_id == org_id,
+                                 _m.Product.ext_id == "demo-000-M")
+                          .values(ext_id="demo-999-M"))
+                s.commit()
+            repointed = _org_snapshot(path, email)
+            old_repoint = _counts3(repointed) == _counts3(wiped)
+            new_repoint = _data_loss(wiped, repointed)
+        finally:
+            eng.dispose()
+            for suffix in ("", "-wal", "-shm"):
+                p = Path(str(path) + suffix)
+                if p.exists():
+                    p.unlink()
+
+        verdicts = {
+            "прогресс: старое равенство падает": old_progress is False,
+            "прогресс: новый инвариант молчит": new_progress == [],
+            "стирание: старое равенство падает": old_wipe is False,
+            "стирание: «счётчики не уменьшились» обмануто": weak_wipe is True,
+            "стирание: инвариант видит потерю товаров": any(
+                v.startswith("products: ") for v in new_wipe),
+            "стирание: инвариант видит потерю складов": any(
+                v.startswith("warehouses: ") for v in new_wipe),
+            "стирание: инвариант видит подключение демо": any(
+                v.startswith("появилось подключение") for v in new_wipe),
+            "стирание: инвариант видит потерю остатков и продаж": (
+                any(v.startswith("stock_days: ") for v in new_wipe)
+                and any(v.startswith("sales: ") for v in new_wipe)),
+            "перепривязка: старое равенство ПРОХОДИТ": old_repoint is True,
+            "перепривязка: новый инвариант ловит": any(
+                v.startswith("products: ") for v in new_repoint),
+        }
+        broken = [name for name, ok in verdicts.items() if not ok]
+        return not broken, (f"{len(verdicts)}/{len(verdicts)} сработали"
+                            if not broken else f"НЕ СРАБОТАЛИ {broken}")
 
     mock_ms.FAULTS["stock_delay_ms"] = 120  # чтобы окно «до finalize-lite» было заметным
     try:
@@ -1812,22 +2044,37 @@ def run_scenario() -> int:
             if pr.get("state") in ("done", "error"):
                 break
             time.sleep(0.05)
-        counts_before = _newbie_counts()
+        snap_before = _newbie_snapshot()
         r_root = newbie.get("/", follow_redirects=False)
         r_demo = newbie.post("/api/connect/demo")
         conn_p9 = (newbie.get("/api/settings").json().get("connection") or {})
-        counts_after = _newbie_counts()
+        snap_after = _newbie_snapshot()
     finally:
         mock_ms.reset_faults()
     check("(p9) во время первой загрузки «/» НЕ ведёт на онбординг с демо-кнопкой",
           seen_running and "/onboarding" not in (r_root.headers.get("location") or ""),
           f"running={seen_running} status={r_root.status_code} "
           f"loc={r_root.headers.get('location')}")
+    loss_p9 = _data_loss(snap_before, snap_after)
+    # «Ничего не пропало» обязано быть содержательным утверждением: если бы у
+    # организации в этот момент не было ни одной строки, оно выполнялось бы
+    # даром. Склады и строка подключения существуют ЗАДОЛГО до этой точки —
+    # они заводятся при выборе складов, до POST /api/sync/initial (в профиле
+    # три склада не менялись ни разу за весь прогон). Товары и остатки в этот
+    # момент могут быть ещё не записаны — это и есть та самая гонка.
+    had_data = bool(snap_before["warehouses"]) and bool(snap_before["connections"])
+    ctl_ok, ctl_note = _p9_controls()
     check("(p9) POST /api/connect/demo во время первой загрузки → 409, данные целы",
-          r_demo.status_code == 409 and counts_after == counts_before
-          and "МойСклад" in r_demo.json().get("detail", ""),
-          f"demo={r_demo.status_code} before={counts_before} after={counts_after} "
-          f"conn={conn_p9.get('status')}")
+          r_demo.status_code == 409 and had_data and not loss_p9
+          and conn_p9.get("kind") == "moysklad"
+          and "МойСклад" in r_demo.json().get("detail", "") and ctl_ok,
+          f"demo={r_demo.status_code} потери={loss_p9[:3]} "
+          f"было={_counts3(snap_before)} стало={_counts3(snap_after)} "
+          f"прежнее_равенство={_counts3(snap_before) == _counts3(snap_after)} "
+          f"было_что_терять: складов={len(snap_before['warehouses'])} "
+          f"подключений={len(snap_before['connections'])} "
+          f"conn={conn_p9.get('kind')}/{conn_p9.get('status')} "
+          f"контроли: {ctl_note}")
     status_n = wait_sync_done(newbie, timeout=180)
     check("(p9) первичная загрузка новой организации завершилась",
           status_n.get("state") == "done",
