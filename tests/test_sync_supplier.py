@@ -250,6 +250,44 @@ def run() -> int:
     check("ПОВТОР ПОСЛЕ ВОССТАНОВЛЕНИЯ СХОДИТСЯ К ТЕКУЩЕЙ ИСТИНЕ",
           sup_a3 == "Поставщик Б", f"было={sup_a2!r} стало={sup_a3!r}")
 
+    print("\n== Снятие привязки ОДНОВРЕМЕННО со сбоем справочника — обнуляет ==")
+    # Второй заход (discussion_r3865732915): отсутствие ссылки на поставщика
+    # в самом ассортименте известно БЕЗ участия справочника контрагентов — и
+    # должно обнулять поле, даже если в этом же прогоне справочник упал.
+    # Затирать нельзя только присутствующую, но не резолвящуюся ссылку.
+    mock_api.post("/__test/faults", json={"cp_list_500_burst": 1000})
+    mock_api.post("/__test/supplier_links", json={P1: ""})  # снять привязку у A
+    r = a.post("/api/sync/run")
+    check("инкремент A (снятие + сбой справочника одновременно) запущен",
+          r.status_code == 200, f"status={r.status_code}")
+    st = wait_sync_done(a)
+    check("инкремент A доходит до done несмотря на сбой справочника",
+          st.get("state") == "done",
+          f"state={st.get('state')} error={str(st.get('error'))[:150]}")
+    stats = st.get("stats") or {}
+    check("честный сигнал сбоя справочника снова записан",
+          bool(stats.get("suppliers_error")), f"suppliers_error={stats.get('suppliers_error')!r}")
+
+    sup_a4 = supplier_of("Организация A", P1)
+    check("ОТСУТСТВИЕ ССЫЛКИ В АССОРТИМЕНТЕ ОБНУЛЯЕТ ПОСТАВЩИКА ДАЖЕ ПРИ СБОЕ СПРАВОЧНИКА",
+          sup_a4 == "", f"было={sup_a3!r} стало={sup_a4!r}")
+
+    sup_b_after_removal = supplier_of("Организация B", P2)
+    check("ИЗОЛЯЦИЯ: снятие привязки + сбой справочника у A не задели B",
+          sup_b_after_removal == sup_b1, f"было={sup_b1!r} стало={sup_b_after_removal!r}")
+
+    print("\n== Справочник восстанавливается после снятия+сбоя — остаётся пустым ==")
+    mock_api.post("/__test/faults", json={})  # сбросить сбой
+    r = a.post("/api/sync/run")
+    check("инкремент A (восстановление после снятия+сбоя) запущен",
+          r.status_code == 200, f"status={r.status_code}")
+    st = wait_sync_done(a)
+    check("инкремент A доходит до done", st.get("state") == "done",
+          f"state={st.get('state')} error={str(st.get('error'))[:150]}")
+    sup_a5 = supplier_of("Организация A", P1)
+    check("ОСТАЁТСЯ ПУСТЫМ ПОСЛЕ ВОССТАНОВЛЕНИЯ СПРАВОЧНИКА (авторитетно нет ссылки)",
+          sup_a5 == "", f"supplier={sup_a5!r}")
+
     print("\n== B продолжает работать штатно (не задета всей чехардой A) ==")
     r = b.post("/api/sync/run")
     check("инкремент B запущен", r.status_code == 200, f"status={r.status_code}")

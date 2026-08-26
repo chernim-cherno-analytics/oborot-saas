@@ -1436,6 +1436,7 @@ def _parse_assortment(rows: list[dict], org_id: int = 0) -> list[dict]:
                 "cost_price": _kopecks((row.get("buyPrice") or {}).get("value")),
                 "cost_full": _cost_full_of(row, org_id),
                 "supplier": _supplier_of(row, org_id),
+                "supplier_link": _supplier_link_present(row),
                 "archived": bool(row.get("archived")),
             }
 
@@ -1459,6 +1460,7 @@ def _parse_assortment(rows: list[dict], org_id: int = 0) -> list[dict]:
                 "cost_price": parent["cost_price"],
                 "cost_full": parent["cost_full"],
                 "supplier": parent["supplier"],
+                "supplier_link": parent["supplier_link"],
                 "archived": parent["archived"],
             })
             continue
@@ -1479,6 +1481,11 @@ def _parse_assortment(rows: list[dict], org_id: int = 0) -> list[dict]:
         )
         cost_full = _cost_full_of(row, org_id) or (parent["cost_full"] if parent else 0.0)
         supplier = _supplier_of(row, org_id) or (parent["supplier"] if parent else "")
+        # DATA-8 (второй заход): своя ссылка на поставщика важнее унаследованной
+        # даже если она не резолвится в имя (см. _upsert_products) — только
+        # ПОЛНОЕ отсутствие ссылки и у варианта, и у родителя означает
+        # «поставщика авторитетно нет».
+        supplier_link = _supplier_link_present(row) or bool(parent and parent["supplier_link"])
         archived = bool(row.get("archived")) or bool(parent and parent["archived"])
         out.append({
             "ext_id": ext_id,
@@ -1489,6 +1496,7 @@ def _parse_assortment(rows: list[dict], org_id: int = 0) -> list[dict]:
             "cost_price": cost_price,
             "cost_full": cost_full,
             "supplier": supplier,
+            "supplier_link": supplier_link,
             "archived": archived,
         })
     return out
@@ -1511,6 +1519,13 @@ def _supplier_of(row: dict, org_id: int) -> str:
     if not href:
         return ""
     return (_SUPPLIERS.get(org_id) or {}).get(_href_id(href), "")
+
+
+def _supplier_link_present(row: dict) -> bool:
+    """Есть ли у строки ассортимента ссылка на поставщика вообще — независимо
+    от того, резолвится ли она в имя через кэш `_SUPPLIERS[org_id]` (DATA-8:
+    сбой справочника контрагентов не должен маскировать её отсутствие)."""
+    return bool(((row.get("supplier") or {}).get("meta") or {}).get("href"))
 
 
 def _load_price_types(org_id: int) -> None:
@@ -1689,9 +1704,16 @@ def _upsert_products(org_id: int, assortment: list[dict], stats: dict) -> dict[s
     # это неотличимо от «МойСклад авторитетно подтвердил, что поставщика
     # нет». Затирать products.supplier таким сигналом нельзя: значение,
     # проверенное на прошлом успешном синке, — это факт, а сбой справочника —
-    # это отсутствие факта. Поэтому при сбое поле НЕ трогаем вовсе: у
+    # это отсутствие факта. Поэтому при сбое поле по умолчанию НЕ трогаем: у
     # существующих товаров остаётся последнее подтверждённое имя, у новых —
     # пустое (не догадка, а тот же дефолт колонки, что и раньше).
+    #
+    # Второй заход (discussion_r3865732915): это рассуждение верно только
+    # когда у товара В АССОРТИМЕНТЕ есть ссылка на поставщика, которую сбой
+    # справочника не дал резолвить в имя. Если ссылки нет вообще —
+    # `item["supplier_link"]` — это известно ИЗ САМОГО ассортимента, без
+    # участия справочника контрагентов, и сбой справочника такому факту не
+    # мешает: отсутствие ссылки обнуляет поле даже в прогоне со сбоем.
     suppliers_ok = "suppliers_error" not in stats
     db = SessionLocal()
     try:
@@ -1721,7 +1743,7 @@ def _upsert_products(org_id: int, assortment: list[dict], stats: dict) -> dict[s
             row.category = item["category"]
             row.sale_price = item["sale_price"]
             row.cost_full = item.get("cost_full") or 0.0
-            if suppliers_ok:
+            if suppliers_ok or not item.get("supplier_link"):
                 row.supplier = item.get("supplier") or ""
             row.cost_price = item["cost_price"]
             row.archived = item["archived"]
