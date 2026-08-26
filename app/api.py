@@ -951,6 +951,17 @@ def api_order_status(
             _apply_order_to_incoming(db, ctx.org.id, items_at_change, +1)
         else:  # received
             _apply_order_to_incoming(db, ctx.org.id, items_at_change, -1)
+    elif body.status == "sent":
+        # DATA-7 corrective: заказ уехал в МойСклад ещё черновиком — push
+        # (ms_writeback._move_incoming_to_ms, was_sent=False) перенёс
+        # matched-часть сразу в ms_qty, а draft никогда не вносил свой вклад
+        # в qty вовсе (это делает только эта ветка, при первом переходе в
+        # sent). Поэтому unmatched-остаток на этот момент не лежит нигде —
+        # добавляем РОВНО его, иначе следующий received снимет остаток,
+        # которого в «едет к нам» никогда не было, и заберёт чужой вклад по
+        # тому же base_name. Полностью сопоставленный черновик здесь не
+        # меняется: remainder = qty − pushed_by_base = 0.
+        _apply_remainder_to_incoming(db, ctx.org.id, items_at_change, pushed_at_change, +1)
     elif body.status == "received":
         # DATA-7: matched-часть уже в ms_qty (снята из qty при push) — здесь
         # снимается только unmatched-остаток, который push не тронул.

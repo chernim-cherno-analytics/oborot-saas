@@ -562,6 +562,102 @@ def run_scenario() -> int:
           del_after[0] == del_before[0] - 3 and del_after[1] == del_before[1],
           f"{del_before} -> {del_after} (ждали qty-3, ms_qty без изменений)")
 
+    print("== DATA-7 corrective: пушенный черновик с частичным сопоставлением, "
+          "draft→sent добавляет remainder ==")
+    # «Рубашка «Разворот»» нигде выше в этом файле не используется — свежий
+    # base_name, чтобы не путать вклад с уже накопленным состоянием других
+    # секций теста.
+    #
+    # Сначала — НЕСВЯЗАННЫЙ заказ на тот же base_name (обычный sent, без
+    # push). Его вклад в qty обязан пережить весь сценарий ниже: движение
+    # remainder ОДНОГО заказа не должно трогать чужой вклад по тому же
+    # base_name — OrderedQty агрегирован по base_name, а не по заказу.
+    r = client.post("/api/orders", json={
+        "name": "Другой заказ на той же базе (DATA-7 isolation)", "eta_date": None,
+        "items": [{"base_name": "Рубашка «Разворот»", "qty": 2, "sizes": {"S": 2},
+                   "cost": 2800}],
+    })
+    order_other = r.json()["id"]
+    check("несвязанный заказ создан", r.status_code == 200 and order_other, r.text[:150])
+    r = client.post(f"/api/orders/{order_other}/status", json={"status": "sent"})
+    check("несвязанный заказ переведён в sent", r.status_code == 200)
+    other_contrib = ordered_map().get("Рубашка «Разворот»", (0, 0))
+    check("несвязанный заказ дал вклад +2 в qty", other_contrib[0] >= 2, f"{other_contrib}")
+
+    # Черновик с частичным сопоставлением (M есть среди синканых вариантов,
+    # XL — нет). Пушим его СРАЗУ, пока он ещё draft (push доступен и без
+    # перевода в sent — см. ms_writeback.PUSHABLE_STATUSES) — это и есть
+    # сценарий бага: matched-часть уедет в ms_qty ДО первого прихода заказа
+    # в «едет к нам».
+    r = client.post("/api/orders", json={
+        "name": "Черновик с частичным push (DATA-7 corrective)", "eta_date": None,
+        "items": [{"base_name": "Рубашка «Разворот»", "qty": 5,
+                   "sizes": {"M": 2, "XL": 3}, "cost": 2800}],
+    })
+    order_pd = r.json()["id"]
+    check("черновик для частичного push создан", r.status_code == 200 and order_pd,
+          r.text[:150])
+    before_push = ordered_map().get("Рубашка «Разворот»", (0, 0))
+    check("черновик перед push не тронул qty/ms_qty (заказ ещё draft)",
+          before_push == other_contrib, f"{other_contrib} -> {before_push}")
+
+    r = client.post(f"/api/orders/{order_pd}/push-to-ms")
+    d = r.json()
+    check("push черновика с частичным сопоставлением → 200",
+          r.status_code == 200 and d.get("ok"), f"status={r.status_code} body={r.text[:200]}")
+    check("несопоставленный XL в unmatched",
+          d.get("unmatched") == ["Рубашка «Разворот» (XL)"], f"unmatched={d.get('unmatched')}")
+    after_push = ordered_map().get("Рубашка «Разворот»", (0, 0))
+    check("push черновика: matched-часть (2) сразу в ms_qty, локальный qty НЕ тронут "
+          "(draft ещё ничего не вносил в «едет»)",
+          after_push[0] == before_push[0] and after_push[1] == before_push[1] + 2,
+          f"{before_push} -> {after_push} (ждали qty без изменений, ms_qty+2)")
+
+    r = client.post(f"/api/orders/{order_pd}/status", json={"status": "sent"})
+    check("пушенный черновик переведён в sent",
+          r.status_code == 200 and r.json().get("status") == "sent",
+          f"status={r.status_code} body={r.text[:150]}")
+    after_sent = ordered_map().get("Рубашка «Разворот»", (0, 0))
+    check("DATA-7 corrective: draft→sent добавил РОВНО unmatched-остаток (5-2=3), "
+          "не 0 (старый баг — remainder терялся навсегда) и не 5 (задвоило бы "
+          "уже перенесённую в ms_qty часть)",
+          after_sent[0] == after_push[0] + 3 and after_sent[1] == after_push[1],
+          f"{after_push} -> {after_sent} (ждали qty+3, ms_qty без изменений)")
+    check("чужой вклад по тому же base_name не пострадал (delta ровно +3)",
+          after_sent[0] - other_contrib[0] == 3,
+          f"other={other_contrib} after_sent={after_sent}")
+
+    print("== Идемпотентность: повтор draft→sent не задваивает remainder ==")
+    r = client.post(f"/api/orders/{order_pd}/status", json={"status": "sent"})
+    check("повторный sent того же заказа отвечает unchanged",
+          r.status_code == 200 and r.json().get("unchanged") is True,
+          f"status={r.status_code} body={r.text[:150]}")
+    check("…и НЕ прибавляет remainder второй раз",
+          ordered_map().get("Рубашка «Разворот»") == after_sent,
+          "ordered_map изменился на повторе")
+
+    print("== sent→received снимает тот же remainder ровно один раз ==")
+    r = client.post(f"/api/orders/{order_pd}/status", json={"status": "received"})
+    check("пушенный частично сопоставленный заказ принят на склад", r.status_code == 200)
+    after_recv = ordered_map().get("Рубашка «Разворот»", (0, 0))
+    check("DATA-7 corrective: received снял РОВНО тот же remainder (3) — qty "
+          "вернулся к уровню сразу после push, ms_qty не изменился",
+          after_recv == after_push,
+          f"{after_sent} -> {after_recv} (ждали {after_push})")
+    check("чужой вклад по тому же base_name пережил весь цикл push→sent→received "
+          "без единого изменения",
+          after_recv[0] == other_contrib[0],
+          f"other={other_contrib} after_recv={after_recv}")
+
+    print("== Идемпотентность: повтор received не снимает remainder второй раз ==")
+    r = client.post(f"/api/orders/{order_pd}/status", json={"status": "received"})
+    check("повторный received отвечает unchanged",
+          r.status_code == 200 and r.json().get("unchanged") is True,
+          f"status={r.status_code} body={r.text[:150]}")
+    check("…и НЕ снимает остаток второй раз",
+          ordered_map().get("Рубашка «Разворот»") == after_recv,
+          "ordered_map изменился на повторе")
+
     print("== Legacy без маркера (до DATA-7): no-guess, remainder не трогаем ==")
     # Заказ отправлялся до появления маркера pushed_by_base — items_json
     # остаётся ГОЛЫМ списком (в проде такой ряд возник бы до этой фичи; здесь
