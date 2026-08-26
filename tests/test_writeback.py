@@ -358,13 +358,18 @@ def run_scenario() -> int:
     })
     order2 = r.json()["id"]
     hood0 = ordered_map().get("Худи «Скетч»", (0, 0))
+    tee0 = ordered_map().get("Футболка «Манифест»", (0, 0))
     r = client.post(f"/api/orders/{order2}/status", json={"status": "sent"})
     check("заказ переведён в sent (push доступен и для sent)",
           r.status_code == 200 and r.json().get("status") == "sent")
     hood_sent = ordered_map().get("Худи «Скетч»", (0, 0))
+    tee_sent = ordered_map().get("Футболка «Манифест»", (0, 0))
     check("sent непушенного заказа прибавил qty (+3)",
           hood_sent[0] == hood0[0] + 3 and hood_sent[1] == hood0[1],
           f"{hood0} -> {hood_sent}")
+    check("sent прибавил qty и несопоставленной пока позиции (+3)",
+          tee_sent[0] == tee0[0] + 3 and tee_sent[1] == tee0[1],
+          f"{tee0} -> {tee_sent}")
     r = client.post(f"/api/orders/{order2}/push-to-ms")
     d = r.json()
     check("push частичного заказа → 200", r.status_code == 200 and d.get("ok"),
@@ -377,9 +382,56 @@ def run_scenario() -> int:
           and len(mock_ms.CREATED_PURCHASE_ORDERS[1]["positions"]) == 2,
           f"pushed={d.get('positions_pushed')}")
     hood_pushed = ordered_map().get("Худи «Скетч»", (0, 0))
-    check("push sent-заказа: вклад переехал из qty в ms_qty (дедуп)",
+    check("push sent-заказа: сопоставленный base_name — вклад переехал из qty в ms_qty (дедуп)",
           hood_pushed[0] == hood0[0] and hood_pushed[1] == hood0[1] + 3,
           f"{hood_sent} -> {hood_pushed}")
+    tee_pushed = ordered_map().get("Футболка «Манифест»", (0, 0))
+    # DATA-7: base_name БЕЗ единого сопоставления в документ не попал вообще
+    # (pushed_by_base для него пуст) — снимать из qty нечего, весь вклад
+    # обязан остаться локальным, а ms_qty не должен вырасти ни на штуку.
+    # Старый код вычитал здесь item["qty"]=3 безусловно и обнулял «едет».
+    check("DATA-7: несопоставленный base_name НЕ теряет вклад при push "
+          "(qty остаётся, ms_qty не растёт)",
+          tee_pushed[0] == tee_sent[0] and tee_pushed[1] == tee_sent[1],
+          f"{tee_sent} -> {tee_pushed} (ожидали без изменений)")
+
+    print("== Частичное сопоставление размеров ВНУТРИ одного base_name (DATA-7) ==")
+    # «Худи «Штрих»» — тоже sized-товар с вариантами S/M/L в mock-МойСкладе.
+    # XL среди них нет: 2 позиции этого base_name сопоставятся (S,M=3 шт),
+    # одна (XL=4 шт) — нет. All-or-nothing per base_name замаскировал бы это:
+    # тут в отличие от Футболки выше сопоставляется ЧАСТЬ размеров одного
+    # и того же товара, а не товар целиком.
+    r = client.post("/api/orders", json={
+        "name": "Частичные размеры", "eta_date": None, "items": [
+            {"base_name": "Худи «Штрих»", "qty": 7,
+             "sizes": {"S": 2, "M": 1, "XL": 4}, "cost": 3600},
+        ],
+    })
+    order2b = r.json()["id"]
+    strih0 = ordered_map().get("Худи «Штрих»", (0, 0))
+    r = client.post(f"/api/orders/{order2b}/status", json={"status": "sent"})
+    check("заказ с частичным размерным рядом переведён в sent",
+          r.status_code == 200 and r.json().get("status") == "sent")
+    strih_sent = ordered_map().get("Худи «Штрих»", (0, 0))
+    check("sent прибавил ПОЛНОЕ количество заказа (+7, все размеры)",
+          strih_sent[0] == strih0[0] + 7 and strih_sent[1] == strih0[1],
+          f"{strih0} -> {strih_sent}")
+    r = client.post(f"/api/orders/{order2b}/push-to-ms")
+    d = r.json()
+    check("push с частичным размерным рядом → 200", r.status_code == 200 and d.get("ok"),
+          f"status={r.status_code} body={r.text[:200]}")
+    check("несопоставленный размер (XL) в unmatched, сопоставленные — нет",
+          d.get("unmatched") == ["Худи «Штрих» (XL)"], f"unmatched={d.get('unmatched')}")
+    check("в документ попали только 2 сопоставленных размера (S, M)",
+          d.get("positions_pushed") == 2, f"positions_pushed={d.get('positions_pushed')}")
+    strih_pushed = ordered_map().get("Худи «Штрих»", (0, 0))
+    # Точная арифметика, а не all-or-nothing: снято РОВНО 3 (S+M), а не 7
+    # (весь заказ) и не 0 (полный отказ от вычитания). 4 шт непринятого XL
+    # обязаны остаться в qty — в МойСкладе документа на них нет.
+    check("DATA-7: снята РОВНО сопоставленная часть (3), несопоставленные "
+          "4 шт (XL) остались в qty",
+          strih_pushed[0] == strih_sent[0] - 3 and strih_pushed[1] == strih_sent[1] + 3,
+          f"{strih_sent} -> {strih_pushed} (ожидали qty-3, ms_qty+3)")
 
     print("== Заказ целиком из неизвестных позиций ==")
     # Тот же приём: base_name реальный (заказ создастся), а размер — вне
@@ -393,7 +445,7 @@ def run_scenario() -> int:
     r = client.post(f"/api/orders/{order3}/push-to-ms")
     check("ничего не сопоставилось → 422", r.status_code == 422,
           f"status={r.status_code} body={r.text[:150]}")
-    check("документ при 422 не создан", len(mock_ms.CREATED_PURCHASE_ORDERS) == 2)
+    check("документ при 422 не создан", len(mock_ms.CREATED_PURCHASE_ORDERS) == 3)
 
     print("== Статус received ==")
     om_recv0 = ordered_map()
@@ -423,7 +475,7 @@ def run_scenario() -> int:
     check("демо-организация: 409 «доступно после подключения МойСклад»",
           r.status_code == 409 and "подключения МойСклад" in r.json().get("detail", ""),
           f"status={r.status_code} body={r.text[:160]}")
-    check("демо-push не создал документов", len(mock_ms.CREATED_PURCHASE_ORDERS) == 2)
+    check("демо-push не создал документов", len(mock_ms.CREATED_PURCHASE_ORDERS) == 3)
     r = demo.post(f"/api/orders/{order_id}/push-to-ms")
     check("чужой заказ → 404 (изоляция тенантов)", r.status_code == 404,
           f"status={r.status_code}")
