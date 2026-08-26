@@ -1743,13 +1743,31 @@ async def _reconcile_late_products(client: MoySkladClient, org_id: int,
     нераспознанный SKU), — молчим и возвращаем False: вызывающий код
     оставляет остаток исключённым, как и раньше (fail-closed: без
     фабрикации данных и без второй попытки).
+
+    Второй заход (discussion_r3866367449): поставщик-контрагент товара мог
+    быть создан в МойСкладе В ТОМ ЖЕ окне гонки, что и сам товар. Справочник
+    контрагентов (`_SUPPLIERS[org_id]`) на этот момент прочитан ДО окна, в
+    `_run_sync`, — его не обновляем, и `_parse_assortment` ниже резолвил бы
+    имя поставщика по устаревшему кэшу, теряя ссылку, которая уже есть в
+    свежем ассортименте. Поэтому справочник обновляется ЕЩЁ ОДНИМ
+    ограниченным запросом ПЕРЕД разбором свежего ассортимента — тем же
+    try/except, что и первое чтение в `_run_sync`: без второй попытки, без
+    фабрикации имени при сбое.
     """
     try:
         fresh = await client.fetch_assortment()
     except Exception as exc:  # noqa: BLE001 — сеть/лимит: не роняем синк
         stats["late_products_error"] = str(exc)[:200]
         return False
-    suppliers_ok = "suppliers_error" not in stats
+    try:
+        _SUPPLIERS[org_id] = {
+            (row.get("id") or ""): str(row.get("name") or "")
+            for row in await client.fetch_counterparties()
+        }
+        suppliers_ok = True
+    except Exception as exc:  # noqa: BLE001 — сеть/лимит: не роняем синк
+        suppliers_ok = False
+        stats["late_products_suppliers_error"] = str(exc)[:200]
     candidates = [item for item in _parse_assortment(fresh, org_id)
                   if item["ext_id"] in unmatched and item["ext_id"] not in ext_to_pid]
     if not candidates:

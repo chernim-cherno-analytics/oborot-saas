@@ -550,7 +550,7 @@ def entity_assortment(request: Request, limit: int = 1000, offset: int = 0):
             LATE_PRODUCT["hidden_calls"] = int(LATE_PRODUCT["hidden_calls"]) - 1
         else:
             ext = LATE_PRODUCT["ext"]
-            rows.append({
+            row = {
                 "id": ext, "name": LATE_PRODUCT.get("name") or ext,
                 "pathName": "Одежда/Поздний",
                 "meta": {"href": f"{BASE}/entity/product/{ext}", "type": "product"},
@@ -558,7 +558,11 @@ def entity_assortment(request: Request, limit: int = 1000, offset: int = 0):
                                            int(LATE_PRODUCT.get("cost_rub") or 0)),
                 "buyPrice": {"value": int(LATE_PRODUCT.get("cost_rub") or 0) * 100},
                 "archived": False,
-            })
+            }
+            sup = _supplier_meta(ext)
+            if sup:
+                row["supplier"] = sup
+            rows.append(row)
     return _page(rows, limit, offset)
 
 
@@ -1024,9 +1028,16 @@ SUPPLIER_LINKS: dict[str, str] = {}
 # остаток с самого начала (товар уже физически создан и продаётся). Каждый
 # вызов /entity/assortment уменьшает счётчик на 1, пока не дойдёт до нуля —
 # дальше товар виден. ext="" (по умолчанию) — функция выключена целиком,
-# остальные наборы её не видят.
+# остальные наборы её не видят. `supplier_hidden_calls` — тот же приём,
+# применённый к справочнику контрагентов: пока > 0, контрагент, привязанный
+# к этому ext_id через SUPPLIER_LINKS, не отдаётся НЕФИЛЬТРОВАННЫМ
+# GET /entity/counterparty (тем самым списком, которым пользуется
+# fetch_counterparties), как будто и поставщик появился в том же окне
+# гонки, что и сам товар. По умолчанию 0 — существующие наборы поведения
+# справочника не видят.
 LATE_PRODUCT: dict = {"ext": "", "name": "", "price_rub": 0, "cost_rub": 0,
-                     "qty": 0.0, "store": "st-flag", "hidden_calls": 0}
+                     "qty": 0.0, "store": "st-flag", "hidden_calls": 0,
+                     "supplier_hidden_calls": 0}
 
 
 def reset_writeback_state() -> None:
@@ -1148,8 +1159,12 @@ async def entity_counterparty(request: Request, limit: int = 1000, offset: int =
     if int(FAULTS.get("cp_search_delay_ms") or 0) > 0:
         import asyncio as _asyncio
         await _asyncio.sleep(int(FAULTS["cp_search_delay_ms"]) / 1000.0)
+    hidden_cp_id = None
+    if not name and int(LATE_PRODUCT.get("supplier_hidden_calls") or 0) > 0:
+        LATE_PRODUCT["supplier_hidden_calls"] = int(LATE_PRODUCT["supplier_hidden_calls"]) - 1
+        hidden_cp_id = SUPPLIER_LINKS.get(LATE_PRODUCT.get("ext") or "")
     rows = [_counterparty_row(cp) for cp in list(COUNTERPARTIES)
-            if (not name or cp["name"] == name)]
+            if (not name or cp["name"] == name) and cp["id"] != hidden_cp_id]
     return _page(rows, limit, offset)
 
 

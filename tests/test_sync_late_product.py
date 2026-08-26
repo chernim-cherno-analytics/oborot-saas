@@ -21,14 +21,30 @@ SKU.
 разрешилась, а не появление товара) — остаток остаётся исключён, как и
 раньше: без фабрикации данных и без второй попытки (fail-closed).
 
-Два сценария на ОДНОЙ организации:
-  1) первичный синк (`_run_initial`, ветка "свежий" фазы today) с товаром,
-     скрытым РОВНО на первый вызов /entity/assortment — синк обязан завести
-     товар и записать его остаток;
-  2) следующий инкремент (`_run_incremental`) с ДРУГИМ новым товаром, который
-     не находится НИКОГДА (hidden_calls достаточно большой) — синк обязан
-     дойти до done, ничего не выдумать и honестно посчитать его в
-     stock_unmatched_skus, как и раньше.
+Корректировка (discussion_r3866367449): `_reconcile_late_products` перечитывает
+ассортимент, но резолвит имя поставщика по `_SUPPLIERS[org_id]`, прочитанному
+ДО окна гонки (в `_run_sync`, сразу после первого чтения ассортимента). Если
+поставщик-контрагент товара тоже создан в этом окне, справочник, прочитанный
+раньше, его не видит — восстановленный товар заводится с пустым supplier,
+хотя ссылка на поставщика в свежем ассортименте уже есть. Теперь реконсиляция
+обновляет `_SUPPLIERS[org_id]` ОДНИМ дополнительным запросом
+(`fetch_counterparties`) ПЕРЕД разбором свежего ассортимента — тем же
+try/except, без второй попытки; при сбое обновления имя не выдумывается
+(`stats["late_products_suppliers_error"]`, поле оставлено дефолтным).
+
+Три сценария на ОДНОЙ организации:
+  1) первичный синк (`_run_initial`, ветка "свежий" фазы today) с товаром И
+     его поставщиком-контрагентом, ОБА скрыты РОВНО на первый вызов —
+     товар скрыт на первый /entity/assortment, контрагент скрыт на первый
+     нефильтрованный /entity/counterparty — синк обязан завести товар,
+     верно резолвить поставщика и записать остаток в warehouse_stock И в
+     аналитический stock_days;
+  2) следующий инкремент (`_run_incremental`) с ДРУГИМ новым товаром, скрытым
+     РОВНО на первый вызов — синк обязан завести товар и записать остаток
+     тем же способом на инкрементном пути (не только на первичном);
+  3) ещё один инкремент с товаром, который не находится НИКОГДА (hidden_calls
+     достаточно большой) — синк обязан дойти до done, ничего не выдумать и
+     честно посчитать его в stock_unmatched_skus, как и раньше.
 
 Свой мок на отдельном порту (9815), чтобы файл можно было запускать, пока
 идут другие наборы.
@@ -39,6 +55,7 @@ import os
 import sys
 import threading
 import time
+from datetime import date
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -67,7 +84,7 @@ import uvicorn  # noqa: E402
 import mock_ms  # noqa: E402
 from app.db import SessionLocal  # noqa: E402
 from app.main import app as oborot_app  # noqa: E402
-from app.models import Org, Product, WarehouseStock  # noqa: E402
+from app.models import Org, Product, StockDay, WarehouseStock  # noqa: E402
 from sqlalchemy import select  # noqa: E402
 
 mock_ms.PORT = MOCK_PORT
@@ -147,6 +164,23 @@ def warehouse_qty_total(org_name: str, product_id: int) -> float:
         db.close()
 
 
+def stockday_qty(org_name: str, product_id: int, day_iso: str) -> float | None:
+    """qty из stock_days на дату; None, если строки нет (см. docstring StockDay)."""
+    db = SessionLocal()
+    try:
+        org = db.execute(select(Org).where(Org.name == org_name)).scalar_one_or_none()
+        if org is None:
+            return None
+        return db.execute(
+            select(StockDay.qty).where(
+                StockDay.org_id == org.id, StockDay.product_id == product_id,
+                StockDay.date == day_iso,
+            )
+        ).scalar_one_or_none()
+    finally:
+        db.close()
+
+
 def register_and_connect(c: httpx.Client, email: str, org_name: str) -> None:
     r = c.post("/register", data={"name": "Владелец", "email": email,
                                   "password": "secret123", "org_name": org_name})
@@ -177,11 +211,15 @@ def run() -> int:
     a = httpx.Client(headers={"X-Oborot-CSRF": "1"}, base_url=base, timeout=120.0)
     mock_api = httpx.Client(base_url=f"http://127.0.0.1:{MOCK_PORT}", timeout=30.0)
 
-    print("\n== Первичный синк: товар появился МЕЖДУ ассортиментом и остатками ==")
+    today_iso = date.today().isoformat()
+
+    print("\n== Первичный синк: товар И его поставщик появились МЕЖДУ "
+          "ассортиментом и остатками ==")
+    mock_api.post("/__test/supplier_links", json={"p-late1": "ООО Свежий Поставщик"})
     mock_api.post("/__test/late_product", json={
         "ext": "p-late1", "name": "Худи «Только что приехало»",
         "price_rub": 5900, "cost_rub": 2200, "qty": 7.0,
-        "store": "st-flag", "hidden_calls": 1,
+        "store": "st-flag", "hidden_calls": 1, "supplier_hidden_calls": 1,
     })
     register_and_connect(a, "owner-a@test.io", "Организация A")
 
@@ -198,6 +236,12 @@ def run() -> int:
         qty = warehouse_qty_total("Организация A", row.id)
         check("ЕГО ОСТАТОК НЕ ПОТЕРЯН (записан в warehouse_stock)",
               qty == 7.0, f"qty={qty}")
+        sd = stockday_qty("Организация A", row.id, today_iso)
+        check("ЕГО ОСТАТОК ОТРАЖЁН В АНАЛИТИКЕ (stock_days)",
+              sd == 7.0, f"stock_days.qty={sd}")
+        check("ЕГО ПОСТАВЩИК, СОЗДАННЫЙ В ТОМ ЖЕ ОКНЕ, ВЕРНО РЕЗОЛВЛЕН "
+              "(не пуст, справочник контрагентов обновлён реконсиляцией)",
+              row.supplier == "ООО Свежий Поставщик", f"supplier={row.supplier!r}")
 
     stats = st.get("stats") or {}
     check("реконсиляция отражена в stats (late_products_recovered)",
@@ -206,6 +250,43 @@ def run() -> int:
     check("этот товар НЕ попал в stock_unmatched_skus (разрешился)",
           not stats.get("stock_unmatched_skus"),
           f"stock_unmatched_skus={stats.get('stock_unmatched_skus')}")
+    check("обновление справочника контрагентов внутри реконсиляции прошло "
+          "без сбоя",
+          not stats.get("late_products_suppliers_error"),
+          f"late_products_suppliers_error={stats.get('late_products_suppliers_error')}")
+
+    print("\n== Инкремент: товар появился МЕЖДУ ассортиментом и остатками — "
+          "тот же путь, но на инкременте ==")
+    mock_api.post("/__test/late_product", json={
+        "ext": "p-late-inc", "name": "Свитшот «Только что приехало»",
+        "price_rub": 4500, "cost_rub": 1800, "qty": 3.0,
+        "store": "st-flag", "hidden_calls": 1, "supplier_hidden_calls": 0,
+    })
+    r = a.post("/api/sync/run")
+    check("инкремент (поздний товар) запущен", r.status_code == 200,
+          f"status={r.status_code}")
+    st_inc = wait_sync_done(a)
+    check("инкремент дошёл до done", st_inc.get("state") == "done",
+          f"state={st_inc.get('state')} error={str(st_inc.get('error'))[:150]}")
+
+    row_inc = product_row("Организация A", "p-late-inc")
+    check("ТОВАР, ПОЯВИВШИЙСЯ В ОКНЕ ГОНКИ НА ИНКРЕМЕНТЕ, ЗАВЕДЁН",
+          row_inc is not None, f"row={row_inc}")
+    if row_inc is not None:
+        qty_inc = warehouse_qty_total("Организация A", row_inc.id)
+        check("ЕГО ОСТАТОК НЕ ПОТЕРЯН НА ИНКРЕМЕНТЕ (warehouse_stock)",
+              qty_inc == 3.0, f"qty={qty_inc}")
+        sd_inc = stockday_qty("Организация A", row_inc.id, today_iso)
+        check("ЕГО ОСТАТОК ОТРАЖЁН В АНАЛИТИКЕ НА ИНКРЕМЕНТЕ (stock_days)",
+              sd_inc == 3.0, f"stock_days.qty={sd_inc}")
+
+    stats_inc = st_inc.get("stats") or {}
+    check("реконсиляция на инкременте отражена в stats",
+          stats_inc.get("late_products_recovered") == 1,
+          f"late_products_recovered={stats_inc.get('late_products_recovered')}")
+    check("этот товар НЕ попал в stock_unmatched_skus на инкременте",
+          not stats_inc.get("stock_unmatched_skus"),
+          f"stock_unmatched_skus={stats_inc.get('stock_unmatched_skus')}")
 
     print("\n== Инкремент: товар, который так и не находится — fail-closed ==")
     mock_api.post("/__test/late_product", json={
