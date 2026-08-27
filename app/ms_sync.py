@@ -130,43 +130,117 @@ _threads_lock = threading.Lock()
 # обнуляет и переписывает ordered_qty.ms_qty/ms_qty_tracked по прочитанному
 # снимку; если между чтением и записью push успел создать документ и
 # зафиксировать свой локальный вклад, перезапись стирает его до следующего
-# синка. Лок — процесс-локальный (D-17: прод — один воркер, то же допущение,
-# на котором уже стоят `_threads` выше, кэш и лимитер), по одному на
-# организацию.
+# синка.
 #
-# Синк держит его БЛОКИРУЮЩИМ захватом от чтения purchaseorder до конца
-# перезаписи (см. _sync_incoming) — это безопасно, потому что синк целиком
-# выполняется на своём собственном фоновом потоке (_thread_main), где и так
-# уже полно синхронных блокирующих вызовов (SessionLocal() внутри async).
-# Push захватывает его НЕБЛОКИРУЮЩИМ образом (см. routes_connect) — иначе
-# HTTP-запрос владельца завис бы на время фонового синка — и при занятости
-# отдаёт 409 «дождитесь синхронизации», как и соседние ручки. Если лок
-# держит push, синк дожидается его завершения и только потом читает
-# purchaseorder — тогда только что созданный документ гарантированно попадёт
-# в снимок, а не потеряется до следующего цикла.
-_incoming_locks: dict[int, threading.Lock] = {}
-_incoming_locks_meta_lock = threading.Lock()
+# Первый заход закрыл это одним ОБЩИМ `threading.Lock` на организацию,
+# разделяемым между синком и КАЖДЫМ push, — и пережал: два РАЗНЫХ push'а
+# одной организации, отправленные параллельно, начали конкурировать за один
+# и тот же мьютекс, и один получал ложную 409 «Идёт синхронизация», хотя
+# никакого синка не было (независимое ревью, issuecomment-5432267185).
+#
+# Корректирующая версия — writer-preferring read/write гейт на организацию
+# (`_IncomingGate`, процесс-локальный: D-17, то же допущение, на котором уже
+# стоят `_threads` выше, кэш и лимитер):
+#   * push — «читатель»: НЕСКОЛЬКО РАЗНЫХ push одновременно держат гейт
+#     открытым (try_acquire_incoming_lock — неблокирующий, со стороны
+#     routes_connect; иначе HTTP-запрос владельца завис бы на время фонового
+#     синка);
+#   * синк — «писатель»: _acquire_incoming_write_lock немедленно помечает
+#     гейт «ожидает записи» — это одно уже отклоняет НОВЫЕ push (writer
+#     preference: иначе непрерывный поток push мог бы никогда не выпустить
+#     синк), — затем БЛОКИРУЮЩЕ (безопасно: синк выполняется на своём
+#     собственном фоновом потоке, _thread_main, где и так уже полно
+#     синхронных блокирующих вызовов внутри async) ждёт завершения ВСЕХ уже
+#     активных push, и только тогда становится единоличным владельцем.
+#     К этому моменту push уже закоммитил свой локальный вклад, поэтому
+#     свежее чтение purchaseorder синка гарантированно увидит его документ.
+# Синк владеет гейтом → любой push (новый или бы-параллельный) получает
+# прежнюю 409 «дождитесь синхронизации» немедленно, без сети и без CAS.
+#
+# Ownership-инварианты (снятие ресурса без владения) — это дефект
+# вызывающего кода, а не штатный случай: оба метода снятия ниже поднимают
+# RuntimeError, а не глотают его — маскировать такую ошибку молчаливым
+# `pass` означало бы прятать баг вместо того, чтобы его увидеть.
+class _IncomingGate:
+    __slots__ = ("_cond", "_active_pushes", "_sync_pending", "_sync_owned")
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition()
+        self._active_pushes = 0
+        self._sync_pending = False
+        self._sync_owned = False
 
 
-def _incoming_lock(org_id: int) -> threading.Lock:
-    with _incoming_locks_meta_lock:
-        lock = _incoming_locks.get(org_id)
-        if lock is None:
-            lock = threading.Lock()
-            _incoming_locks[org_id] = lock
-        return lock
+_incoming_gates: dict[int, _IncomingGate] = {}
+_incoming_gates_meta_lock = threading.Lock()
+
+
+def _incoming_gate(org_id: int) -> _IncomingGate:
+    with _incoming_gates_meta_lock:
+        gate = _incoming_gates.get(org_id)
+        if gate is None:
+            gate = _IncomingGate()
+            _incoming_gates[org_id] = gate
+        return gate
 
 
 def try_acquire_incoming_lock(org_id: int) -> bool:
-    """Неблокирующий захват (со стороны push). False — синк уже владеет локом."""
-    return _incoming_lock(org_id).acquire(blocking=False)
+    """Неблокирующий вход push'а (читатель). False — синк уже владеет гейтом
+    ИЛИ уже встал в очередь на запись (writer preference: новый push не
+    пройдёт, даже если другие push ещё активны)."""
+    gate = _incoming_gate(org_id)
+    with gate._cond:
+        if gate._sync_pending or gate._sync_owned:
+            return False
+        gate._active_pushes += 1
+        gate._cond.notify_all()
+        return True
 
 
 def release_incoming_lock(org_id: int) -> None:
-    try:
-        _incoming_lock(org_id).release()
-    except RuntimeError:  # уже снят — не маскируем повторным падением
-        pass
+    """Освобождение push-слота. Вызывающий код (routes_connect) обязан
+    парно вызывать это РОВНО ОДИН раз на каждый успешный
+    try_acquire_incoming_lock (try/finally) — несбалансированный вызов
+    является дефектом вызывающего кода и не маскируется."""
+    gate = _incoming_gate(org_id)
+    with gate._cond:
+        if gate._active_pushes <= 0:
+            raise RuntimeError(
+                f"release_incoming_lock: нет активного push-слота для org {org_id}"
+            )
+        gate._active_pushes -= 1
+        gate._cond.notify_all()
+
+
+def _acquire_incoming_write_lock(org_id: int) -> None:
+    """Блокирующий вход синка (писатель). Немедленно запрещает новые push
+    (writer preference), дожидается завершения уже активных push, затем
+    становится эксклюзивным владельцем."""
+    gate = _incoming_gate(org_id)
+    with gate._cond:
+        if gate._sync_pending or gate._sync_owned:
+            raise RuntimeError(
+                f"_acquire_incoming_write_lock: гейт org {org_id} уже занят "
+                "синком — одновременно может идти только один синк на организацию"
+            )
+        gate._sync_pending = True
+        gate._cond.notify_all()
+        while gate._active_pushes > 0:
+            gate._cond.wait()
+        gate._sync_pending = False
+        gate._sync_owned = True
+        gate._cond.notify_all()
+
+
+def _release_incoming_write_lock(org_id: int) -> None:
+    gate = _incoming_gate(org_id)
+    with gate._cond:
+        if not gate._sync_owned:
+            raise RuntimeError(
+                f"_release_incoming_write_lock: синк не владеет гейтом org {org_id}"
+            )
+        gate._sync_owned = False
+        gate._cond.notify_all()
 
 
 # Этапы первичной загрузки в порядке выполнения (для /api/sync/progress).
@@ -2594,20 +2668,19 @@ async def _backmatch_by_sync_id(org_id: int, docs: list[dict],
 async def _sync_incoming(org_id: int, client: MoySkladClient,
                          ext_to_pid: dict[str, int], stats: dict,
                          progress: tuple[float, float] = (95.5, 97.0)) -> None:
-    """Обёртка _sync_incoming_locked под организационным локом (см. DATA-6).
+    """Обёртка _sync_incoming_locked под организационным гейтом (см. DATA-6).
 
-    Блокирующий захват безопасен: вся функция выполняется на собственном
+    Блокирующий вход безопасен: вся функция выполняется на собственном
     фоновом потоке синка (см. _thread_main), где ничего другого параллельно
-    не крутится. Если лок в этот момент держит push (routes_connect),
-    ждём его завершения — тогда чтение purchaseorder ниже гарантированно
-    увидит документ, который push мог только что создать.
+    не крутится. Гейт немедленно отказывает новым push (writer preference) и
+    дожидается завершения уже активных — тогда чтение purchaseorder ниже
+    гарантированно увидит документы, которые эти push успели создать.
     """
-    lock = _incoming_lock(org_id)
-    lock.acquire()
+    _acquire_incoming_write_lock(org_id)
     try:
         await _sync_incoming_locked(org_id, client, ext_to_pid, stats, progress)
     finally:
-        lock.release()
+        _release_incoming_write_lock(org_id)
 
 
 async def _sync_incoming_locked(org_id: int, client: MoySkladClient,

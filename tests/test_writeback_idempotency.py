@@ -743,25 +743,13 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
         t.join(timeout=120)
     mock_api.post("/__test/faults", json={})
     statuses8 = sorted(r["status"] for r in agent_res)
-    check("один пуш принят, второй отклонён org-локом синка (DATA-6)",
-          statuses8 == [200, 409], f"статусы={statuses8}")
-    losers8 = [r for r in agent_res if r["status"] == 409]
-    detail8a = str(losers8[0]["body"].get("detail") or "") if losers8 else ""
-    check("409 назван честно — идёт синхронизация, а не иная причина",
-          "Идёт синхронизация" in detail8a, f"detail={detail8a[:200]}")
-    loser_id8 = losers8[0]["order_id"] if losers8 else None
-    check("у отклонённого заказа ms_doc_href пуст — лок не оставил пометки",
-          loser_id8 is not None and (col_of(loser_id8, "ms_doc_href") or "") == "",
-          f"order={loser_id8} ms_doc_href="
-          f"{col_of(loser_id8, 'ms_doc_href') if loser_id8 is not None else None!r}")
-    loser_key8 = col_of(loser_id8, "ms_sync_id") if loser_id8 is not None else None
-    check("ни один созданный документ не несёт ключ отклонённого заказа",
-          not loser_key8 or all(str(d.get("syncId") or "") != str(loser_key8)
-                                for d in docs_created()),
-          f"ключ={loser_key8!r}")
-    r_retry8 = push(c, loser_id8)
-    check("отклонённый заказ отправлен синхронно после снятия фолтов — 200",
-          r_retry8.status_code == 200, f"status={r_retry8.status_code} {r_retry8.text[:200]}")
+    # DATA-6 (corrective round, issuecomment-5432267185): push — «читатель»
+    # writer-preferring гейта (app/ms_sync._IncomingGate), а не общий с синком
+    # мьютекс. Два РАЗНЫХ заказа одной организации обязаны оба пройти
+    # одновременно; единственная защита от гонки здесь — CAS/idempotency
+    # самого контрагента «Производство» (D-36), а не org-лок синка.
+    check("ОБА ПУША ПРИНЯТЫ (200) — DATA-6 гейт не сериализует РАЗНЫЕ заказы",
+          statuses8 == [200, 200], f"статусы={statuses8}")
 
     prod = [cp for cp in mock_ms.COUNTERPARTIES if cp["name"] == ms_writeback.AGENT_NAME]
     check("КОНТРАГЕНТ СОЗДАН РОВНО ОДИН, а не по одному на клик",
