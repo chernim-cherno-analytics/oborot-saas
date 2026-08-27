@@ -100,7 +100,33 @@ def run(cmd, cwd=None, env=None, timeout=120):
         # отвергает так же, как отсутствующий файл (ENOENT). Для проверок ниже
         # это не исключение, а результат: «обёртка после переезда не работает».
         return 127, f"не запускается: {exc}"
+    except subprocess.TimeoutExpired as exc:
+        # Зависшая выкладка обязана выглядеть как ПАДЕНИЕ проверки, а не как
+        # молчащий набор. Раньше такой случай улетал исключением наружу и
+        # прогон вставал без единой строки о причине — то есть выглядел ровно
+        # так же, как зависший CI. Возвращаем распознаваемый код и текст.
+        out = ""
+        for part in (exc.stdout, exc.stderr):
+            if part:
+                out += part if isinstance(part, str) else part.decode("utf-8", "replace")
+        return 124, f"ЗАВИСЛО: не уложилось в {timeout} с — {cmd}\n{out}"
     return p.returncode, p.stdout + p.stderr
+
+
+def wait_for(path: Path, limit: float = 60.0) -> bool:
+    """Дождаться появления файла-отметки, но НИКОГДА не ждать вечно.
+
+    Ожидание условия точнее паузы «на глазок»: сцена ниже требует, чтобы вторая
+    выкладка стартовала, пока первая заведомо держит лок. Верхняя граница нужна
+    ровно за тем, чтобы поломка превращалась в падение проверки, а не в
+    зависший прогон.
+    """
+    deadline = time.monotonic() + limit
+    while time.monotonic() < deadline:
+        if path.exists():
+            return True
+        time.sleep(0.05)
+    return False
 
 
 def git(args, cwd, **kw):
@@ -283,7 +309,7 @@ def make_stubs(bindir: Path, *, health_ok=True, pip_ok=True) -> None:
     (shim / "pip" / "MODE").write_text("ok" if pip_ok else "broken", encoding="utf-8")
     (shim / "pip" / "__init__.py").write_text(
         "# -*- coding: utf-8 -*-\n"
-        "import os, shutil, sys\n"
+        "import os, shutil, sys, time\n"
         "\n"
         "\n"
         "def _refuse(msg):\n"
@@ -315,6 +341,17 @@ def make_stubs(bindir: Path, *, health_ok=True, pip_ok=True) -> None:
         "    if log:\n"
         "        with open(log, 'a', encoding='utf-8') as fh:\n"
         "            fh.write(' '.join(args) + '\\n')\n"
+        # PIP_GATE останавливает выкладку на сборке окружения — то есть ПОСЛЕ
+        # взятия лока и ДО `git checkout`. Точка выбрана не для красоты: в этот
+        # момент лок заведомо занят, а на диске всё ещё лежит СТАРЫЙ драйвер,
+        # поэтому вторая выкладка обязана сначала подставить себе актуальный и
+        # только потом упереться в лок. Ворота убирают из сцены время: «обычно
+        # успевает» проверкой не является.
+        "    gate = os.environ.get('PIP_GATE')\n"
+        "    if gate and args[:1] == ['install']:\n"
+        "        open(gate + '.reached', 'w', encoding='utf-8').close()\n"
+        "        while not os.path.exists(gate):\n"
+        "            time.sleep(0.05)\n"
         "    if args and args[0] == 'install':\n"
         "        try:\n"
         "            shutil.copyfile(args[-1], os.path.join(venv, 'INSTALLED'))\n"
@@ -1182,6 +1219,79 @@ def main() -> int:
     check("временный файл драйвера убран и в этом случае",
           not list((WORK / "state").glob(".deploy-driver.*")),
           str([p.name for p in (WORK / "state").glob(".deploy-driver.*")]))
+
+    print("\n== Две одновременные выкладки после подстановки сходятся на одном локе ==")
+    # Требование внешнего ревью к этому пакету: подстановка драйвера стоит ДО
+    # блокировки, значит надо доказать, что от неё не появляется второй полосы
+    # деплоя. `exec` заменяет процесс (PID тот же), поэтому лок берёт ровно
+    # один — а проигравшая выкладка обязана не тронуть ни код, ни env, ни
+    # окружение, ни базу, ни службу.
+    #
+    # Времени в этой сцене нет вовсе: первая выкладка останавливается воротами
+    # на сборке окружения — она уже ДЕРЖИТ лок, но ещё НЕ делала `git checkout`,
+    # то есть на диске по-прежнему старый драйвер. Только тогда запускается
+    # вторая, и подставить себе актуальный драйвер ей придётся по-настоящему.
+    git(["checkout", "-q", "--detach", vquiet], cwd=app)
+    check("подготовка: на диске старый драйвер",
+          OLD_DRIVER_MARK in (app / "deploy" / "deploy.sh").read_text(encoding="utf-8"))
+    # Окружение цели убирается намеренно: с готовым кэшем сборки не будет, а
+    # значит не будет и ворот — сцена молча выродилась бы в последовательную.
+    shutil.rmtree(WORK / f"venv-{vnew2}", ignore_errors=True)
+    gate = WORK / "build-gate"
+    gate_reached = WORK / "build-gate.reached"
+    for g in (gate, gate_reached):
+        if g.exists():
+            g.unlink()
+    (WORK / "systemctl.log").write_text("", encoding="utf-8")
+    (WORK / "pip.log").write_text("", encoding="utf-8")
+    backups_before = sorted(p.name for p in (WORK / "data" / "backups").glob("oborot-*.db"))
+    gate_env = deploy_env(app, {"PIP_GATE": str(gate)})
+    first = subprocess.Popen(["bash", str(app / "deploy" / "deploy.sh"), vnew2],
+                             env=gate_env, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, text=True)
+    out1, rc1 = "", None
+    try:
+        check("первая выкладка взяла лок и остановлена ДО git checkout",
+              wait_for(gate_reached, 90))
+        check("а на диске всё ещё старый драйвер — второй придётся подставлять",
+              OLD_DRIVER_MARK in (app / "deploy" / "deploy.sh").read_text(encoding="utf-8"))
+        rc2, out2 = run(["bash", str(app / "deploy" / "deploy.sh"), vnew2],
+                        env=gate_env, timeout=90)
+    finally:
+        gate.write_text("иди\n", encoding="utf-8")
+        try:
+            out1 = first.communicate(timeout=120)[0] or ""
+        except subprocess.TimeoutExpired:
+            first.kill()
+            out1 = first.communicate()[0] or ""
+        rc1 = first.returncode
+    check("первая выкладка завершилась успешно", rc1 == 0, f"rc={rc1} " + out1[-300:])
+    check("первая шла актуальным драйвером, а не тем, что на диске",
+          OLD_DRIVER_MARK not in out1, out1[-300:])
+    check("ВТОРАЯ отклонена именно локом", rc2 != 0 and "другой деплой" in out2,
+          f"rc={rc2} " + out2[-300:])
+    check("и до лока она дошла УЖЕ подставленным драйвером",
+          "перезапускаюсь на нём" in out2, out2[-400:])
+    syslog = (WORK / "systemctl.log").read_text(encoding="utf-8")
+    check("служба перезапущена РОВНО ОДИН раз", syslog.count("restart") == 1,
+          syslog.strip().replace("\n", " | ") or "пусто")
+    new_backups = [p.name for p in (WORK / "data" / "backups").glob("oborot-*.db")
+                   if p.name not in backups_before]
+    check("копия базы снята ровно одна", len(new_backups) == 1, str(new_backups))
+    piplog = (WORK / "pip.log").read_text(encoding="utf-8")
+    check("окружение собрано ровно один раз",
+          len([ln for ln in piplog.splitlines() if ln.startswith("install")]) == 1,
+          piplog.strip().replace("\n", " | ") or "пусто")
+    check("проигравшая ничего не тронула: код и OBOROT_COMMIT — от победившей",
+          head_of(app) == vnew2
+          and f"OBOROT_COMMIT={vnew2}" in (WORK / "env").read_text(encoding="utf-8"),
+          head_of(app)[:12])
+    check("временных файлов драйвера не осталось ни от одной из двух",
+          not list((WORK / "state").glob(".deploy-driver.*")),
+          str([p.name for p in (WORK / "state").glob(".deploy-driver.*")]))
+    for g in (gate, gate_reached):
+        if g.exists():
+            g.unlink()
 
     print("\n== Отказ git fetch останавливает выкладку до любых мутаций ==")
     # Подстановка драйвера добавила выкладке новую внешнюю причину падать, и
