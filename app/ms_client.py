@@ -129,6 +129,13 @@ class RateLimiter:
     (REPORT_PARALLEL) для /report/stock/all — инцидент 21.08. После 429 любой
     задачи выставляется pause_until: до этого момента новые запросы из окна
     не выпускаются, чтобы соседние задачи не добивали и без того закрытый лимит.
+
+    У потолков общий бюджет (OPS-6): heavy-слот держит ОБА разрешения сразу —
+    общее и узкое, — а не только узкое. Иначе normal (до MAX_PARALLEL) и heavy
+    (до REPORT_PARALLEL) независимы и суммарно могут идти одновременно до
+    MAX_PARALLEL + REPORT_PARALLEL запросов, превышая лимит МойСклад на
+    параллельность. Порядок захвата в `_Slot` всегда общее -> узкое; обратного
+    порядка нигде нет, поэтому циклического ожидания не возникает.
     """
 
     def __init__(self, limit: int = WINDOW_LIMIT, window: float = WINDOW_SECONDS,
@@ -144,8 +151,14 @@ class RateLimiter:
         self.pause_until = 0.0  # monotonic; общий cool-down после 429
 
     def slot(self, heavy: bool = False) -> "_Slot":
-        """Контекст «один запрос»: heavy=True — через узкий семафор отчётов."""
-        return _Slot(self, self._report_semaphore if heavy else self._semaphore)
+        """Контекст «один запрос».
+
+        heavy=True держит ОБА разрешения: общее (доля в MAX_PARALLEL) и узкое
+        отчётное (доля в REPORT_PARALLEL) — см. докстринг класса (OPS-6).
+        """
+        if heavy:
+            return _Slot(self, self._semaphore, self._report_semaphore)
+        return _Slot(self, self._semaphore)
 
     def cool_down(self, seconds: float) -> None:
         """Притормозить ВСЕ задачи клиента (зовётся при 429)."""
@@ -182,20 +195,42 @@ class RateLimiter:
 
 
 class _Slot:
-    def __init__(self, limiter: RateLimiter, semaphore: asyncio.Semaphore) -> None:
+    """Один слот запроса: 1-2 разрешения (общее и, для heavy, ещё узкое).
+
+    Порядок захвата — всегда общее, потом узкое; освобождение — в обратном
+    порядке. Другого порядка захвата в коде нет нигде (normal берёт только
+    общее), поэтому цикла ожидания между normal и heavy не возникает.
+    """
+
+    def __init__(self, limiter: RateLimiter, semaphore: asyncio.Semaphore,
+                 extra_semaphore: asyncio.Semaphore | None = None) -> None:
         self._limiter = limiter
         self._semaphore = semaphore
+        self._extra_semaphore = extra_semaphore
+        self._extra_acquired = False
 
     async def __aenter__(self) -> "_Slot":
         await self._semaphore.acquire()
         try:
+            if self._extra_semaphore is not None:
+                await self._extra_semaphore.acquire()
+                self._extra_acquired = True
             await self._limiter._wait_window()
         except BaseException:
+            # Отмена или падение между захватом общего и узкого разрешения
+            # (или на ожидании окна) не должны оставлять общее захваченным
+            # навсегда — иначе это утечка permit и постепенный deadlock для
+            # normal-запросов.
+            if self._extra_acquired:
+                self._extra_semaphore.release()
+                self._extra_acquired = False
             self._semaphore.release()
             raise
         return self
 
     async def __aexit__(self, *exc) -> None:
+        if self._extra_acquired:
+            self._extra_semaphore.release()
         self._semaphore.release()
 
 
