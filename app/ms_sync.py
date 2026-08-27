@@ -587,11 +587,15 @@ def get_status(org_id: int) -> dict:
     Деплой П1: плюс phase, coverage_days, history_loaded_from, months[],
     stages[], eta_sec — из них же собирается публичный /api/sync/progress.
 
-    DATA-8 (третий сценарий): плюс `diagnostics` — узкий именованный
-    owner-only контракт поверх уже существующего `stats.sales_docs_skipped_store`
-    (документы продаж, чей склад не распознан или не входит в выбранные).
-    Не влияет на отбор продаж и не публикуется в /api/sync/progress —
-    см. `_bounded_diagnostic_count` и `get_progress`.
+    DATA-8 (третий сценарий + corrective): плюс `diagnostics` — узкий
+    именованный owner-only контракт поверх sticky `stats.
+    sales_docs_skipped_store_unresolved` (документы продаж, чей склад не
+    распознан или не входит в выбранные — ПОСЛЕДНИЙ известный факт, не
+    обязательно счётчик текущего прогона: см. `_apply_skip_diagnostic_lifecycle`
+    в `_run_sync` — инкремент и resumed-первичка сохраняют его нетронутым,
+    снять в 0 может только полный нерезюмированный прогон). Не влияет на
+    отбор продаж и не публикуется в /api/sync/progress — см.
+    `_bounded_diagnostic_count` и `get_progress`.
     """
     db = SessionLocal()
     try:
@@ -609,7 +613,7 @@ def get_status(org_id: int) -> dict:
                 "phase": "", "coverage_days": _coverage_days(org_id),
                 "history_loaded_from": None,
                 "months": months_progress(None, False), "stages": [], "eta_sec": None,
-                "diagnostics": {"sales_docs_skipped_store": None}}
+                "diagnostics": {"sales_docs_skipped_store_unresolved": None}}
     stats = row.stats
     coverage = _coverage_days(org_id)
     hlf = stats.get("history_loaded_from")
@@ -640,8 +644,8 @@ def get_status(org_id: int) -> dict:
         "stages": _stages_out(row.state, stats) if row.mode == "initial" else [],
         "eta_sec": _eta_sec(row.state, stats),
         "diagnostics": {
-            "sales_docs_skipped_store": _bounded_diagnostic_count(
-                stats.get("sales_docs_skipped_store")
+            "sales_docs_skipped_store_unresolved": _bounded_diagnostic_count(
+                stats.get("sales_docs_skipped_store_unresolved")
             ),
         },
     }
@@ -795,7 +799,19 @@ _CARRIED_STATS = ("history_loaded_from", "history_loaded_to", "resume_fp",
                   # («какой тип цены считать полной себестоимостью»). Без
                   # переноса он жил ровно до следующего прогона синка, и
                   # выпадающий список оказывался пустым.
-                  "price_types")
+                  "price_types",
+                  # DATA-8 corrective (BLOCKED issuecomment-5438193835): sticky
+                  # факт «синхронизация пропускала документы продаж без
+                  # распознанного склада» обязан пережить КАЖДЫЙ новый запуск
+                  # синка (в т.ч. инкремент), иначе владелец видит проблему
+                  # ровно до следующего успешного инкремента — а инкремент
+                  # перечитывает только свой узкий хвост (DATA-4) и не
+                  # доказывает, что старые пропуски исчезли. Раздельное имя
+                  # от ephemeral-счётчика `sales_docs_skipped_store` —
+                  # намеренно: последний каждый прогон честно считает заново
+                  # (см. `_collect_sales`), а sticky-факт обновляет только
+                  # `_apply_skip_diagnostic_lifecycle` в `_run_sync`.
+                  "sales_docs_skipped_store_unresolved")
 
 
 def _pending_resume(org_id: int) -> str | None:
@@ -1089,6 +1105,43 @@ def _stage_skip(stats: dict, key: str) -> None:
     stats.setdefault("stage_times", {})[key] = {"start": now, "end": now, "skipped": True}
 
 
+def _apply_skip_diagnostic_lifecycle(stats: dict, initial: bool) -> None:
+    """DATA-8 corrective: обновляет sticky `sales_docs_skipped_store_unresolved`
+    ПОСЛЕ успешного `done`, а не на каждом `_collect_sales`.
+
+    Вызывается ровно один раз, из финализации `_run_sync`, ДО которой прогон
+    обязан дойти без исключения — упавший/частичный прогон сюда не попадает
+    (`except` в `_run_sync` персистит `stats` как есть и пробрасывает
+    исключение дальше), и sticky остаётся нетронутым: требование «failed or
+    partial rebuild must preserve» выполняется самой структурой вызова, а не
+    отдельной проверкой состояния.
+
+    Правила (BLOCKED issuecomment-5438193835):
+      * инкремент перечитывает только свой узкий хвост (DATA-4 — старые
+        документы никогда не перечитываются), поэтому его собственный
+        честный ноль НЕ доказывает, что прежние пропуски исчезли — sticky
+        не трогаем;
+      * RESUMED первичная загрузка (`stats["resumed_from"]` выставлен в
+        `_run_initial`) тоже не авторитетна: её `sales_docs_skipped_store`
+        считает только чанки, докачанные в ЭТОМ прогоне, а не всю историю
+        с начала — sticky не трогаем;
+      * снять факт в 0 может только НЕрезюмированный `initial` (первая
+        синхронизация организации или явная «Полная пересборка истории»,
+        `force_full=True`): он один проходит по всей истории заново, и его
+        `done` подтверждает 0 авторитетно;
+      * новый ПОЛОЖИТЕЛЬНЫЙ прогон любого типа обновляет sticky на свежее
+        значение — свежая находка не должна прятаться за старым числом.
+    """
+    raw = stats.get("sales_docs_skipped_store")
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+        return
+    if raw > 0:
+        stats["sales_docs_skipped_store_unresolved"] = raw
+        return
+    if initial and not stats.get("resumed_from"):
+        stats["sales_docs_skipped_store_unresolved"] = 0
+
+
 # ── Основной прогон ──────────────────────────────────────────────────────────
 
 async def _run_sync(org_id: int, mode: str, resume_from: str | None = None,
@@ -1222,6 +1275,7 @@ async def _run_sync(org_id: int, mode: str, resume_from: str | None = None,
     stats.pop("window_done", None)
     stats.pop("resume_fp", None)
     stats.pop("needs_full_rebuild", None)  # (stats_json перезаписывается — флаг снят)
+    _apply_skip_diagnostic_lifecycle(stats, initial)
     if initial:
         stats["coverage_days"] = HISTORY_DAYS
     _persist(

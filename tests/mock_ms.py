@@ -1159,6 +1159,58 @@ async def test_late_product(request: Request):
     return dict(LATE_PRODUCT)
 
 
+_SKIP_DOC_PREFIX = "__test-skip-"
+
+
+@app.post("/__test/skip_store_doc")
+async def test_skip_store_doc(request: Request):
+    """Внедряет N документов продаж на склад, который тест сознательно НЕ
+    выбирает активным (DATA-8, третий сценарий/lifecycle corrective —
+    `sales_docs_skipped_store`/`sales_docs_skipped_store_unresolved`).
+
+    Тело: {"entity": "demand", "store": "st-ghost-test", "date": "2026-08-01",
+    "count": 3}. Позиции документа не важны — `_collect_sales` отбрасывает
+    такие документы ДО чтения позиций (проверка склада раньше
+    `_full_positions`), поэтому годится любой существующий SKU минимальным
+    количеством. `store` НЕ обязан существовать в `entity/store`: синк судит
+    по членству в активном наборе организации, а не по каталогу складов.
+    """
+    body = await request.json()
+    entity = str(body.get("entity") or "demand")
+    store = str(body["store"])
+    day = str(body["date"])
+    count = int(body.get("count", 1))
+    ext = SKUS[0]["ext"]
+    added = 0
+    for i in range(count):
+        doc_id = f"{_SKIP_DOC_PREFIX}{entity}-{store}-{day}-{i}"
+        DOCS.setdefault(entity, []).append({
+            "id": doc_id,
+            "meta": {"href": f"{BASE}/entity/{entity}/{doc_id}", "type": entity},
+            "moment": f"{day} 10:00:00",
+            "store": {"meta": {"href": f"{BASE}/entity/store/{store}",
+                               "type": "store"}},
+            "positions": {"rows": [{"assortment": {"meta": _asm_meta(ext)},
+                                     "quantity": 1, "price": 100, "discount": 0}],
+                          "meta": {"size": 1}},
+        })
+        added += 1
+    return {"ok": True, "added": added}
+
+
+@app.post("/__test/reset_skip_store_docs")
+def test_reset_skip_store_docs():
+    """Убирает документы, добавленные `/__test/skip_store_doc` (эмулирует
+    «проблемные документы устранены» для теста авторитетной очистки)."""
+    removed = 0
+    for entity, rows in DOCS.items():
+        before = len(rows)
+        DOCS[entity] = [d for d in rows
+                        if not str(d.get("id", "")).startswith(_SKIP_DOC_PREFIX)]
+        removed += before - len(DOCS[entity])
+    return {"ok": True, "removed": removed}
+
+
 def _reject_sync_id_filter(parsed: dict) -> None:
     """`filter=syncId` отвергается ровно так, как это делает живой МойСклад.
 

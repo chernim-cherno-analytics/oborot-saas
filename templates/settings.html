@@ -914,19 +914,27 @@ document.addEventListener("DOMContentLoaded", function () {
     }
 
     function showSyncDiagnostics(st) {
-      // DATA-8: owner-only факт из st.diagnostics.sales_docs_skipped_store —
-      // документы продаж, чей склад не распознан или не входит в выбранные.
-      // Только точный положительный int считается тревогой; ноль,
-      // отсутствие поля или некорректное значение (fail-closed на сервере,
-      // см. app/ms_sync.py:_bounded_diagnostic_count) — тишина, а не «0 из 0».
+      // DATA-8 corrective: owner-only факт из
+      // st.diagnostics.sales_docs_skipped_store_unresolved — ЭТО НЕ счётчик
+      // текущего прогона, а ПОСЛЕДНИЙ известный факт (sticky, см.
+      // app/ms_sync.py:_apply_skip_diagnostic_lifecycle): обычный инкремент
+      // перечитывает только свой узкий хвост и не доказывает, что старые
+      // пропуски исчезли, поэтому его честный ноль сообщение НЕ гасит.
+      // Гасит только авторитетный ноль полной пересборки истории. Текст
+      // поэтому говорит «пропускала» и «данные могут быть неполными», а не
+      // утверждает точное текущее число нерешённых документов. Только точный
+      // положительный int показывается; ноль, отсутствие поля или
+      // некорректное значение (fail-closed на сервере, см.
+      // app/ms_sync.py:_bounded_diagnostic_count) — тишина, а не «0 из 0».
       var box = document.getElementById("sync-diag-hint");
       if (!box) return;
-      var n = st && st.diagnostics && st.diagnostics.sales_docs_skipped_store;
+      var n = st && st.diagnostics && st.diagnostics.sales_docs_skipped_store_unresolved;
       if (typeof n === "number" && n > 0) {
         box.style.display = "";
-        box.textContent = "Пропущено документов продаж: " + n +
+        box.textContent = "Синхронизация пропускала документы продаж: " + n +
           ". Склад документа не распознан или не входит в выбранные склады — " +
-          "такие документы не учитываются в продажах и оборачиваемости.";
+          "данные за эту историю могут быть неполными. Полная пересборка " +
+          "истории (после проверки выбора складов) перепроверит их.";
       } else {
         box.style.display = "none";
         box.textContent = "";
