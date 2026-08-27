@@ -209,8 +209,30 @@ def make_stubs(bindir: Path, *, health_ok=True, pip_ok=True) -> None:
     # systemctl ведёт журнал вызовов: по нему проверяется, что при сбое ДО
     # перезапуска сервис не трогали вообще. Без журнала «откат безопасен,
     # потому что перезапуска не было» остаётся утверждением, а не проверкой.
+    #
+    # Подставной systemctl вдобавок ВЕДЁТ СЕБЯ как systemd в одном, решающем
+    # отношении: перезапуск переносит `OBOROT_COMMIT` из файла окружения в
+    # «коммит живого процесса». Пока этого не было, площадка не умела отличить
+    # «служба отвечает» от «служба отвечает ПРЕЖНИМ релизом» — а вся разница
+    # между исправной повторной выкладкой и молчаливым враньём именно здесь.
+    #
+    # FAIL_RESTART — перезапуск не удался: код, env и окружение уже целевые, а в
+    # бою остался прежний процесс. SIGNAL_ON_RESTART — сигнал приходит ВНУТРИ
+    # самого перезапуска, то есть ровно в тот шов, где отката уже быть не может,
+    # а бросать выкладку недоделанной нельзя.
     (bindir / "systemctl").write_text(
-        '#!/bin/sh\necho "$*" >> "${SYSTEMCTL_LOG:-/dev/null}"\nexit 0\n',
+        '#!/bin/sh\n'
+        'echo "$*" >> "${SYSTEMCTL_LOG:-/dev/null}"\n'
+        'if [ "$1" != "restart" ]; then exit 0; fi\n'
+        'if [ "${FAIL_RESTART:-0}" = "1" ]; then exit 1; fi\n'
+        'if [ -n "${SIGNAL_ON_RESTART:-}" ] && [ ! -e "$SIGNAL_ON_RESTART" ]; then\n'
+        '  : > "$SIGNAL_ON_RESTART"\n'
+        '  kill -TERM "$PPID" 2>/dev/null || true\n'
+        'fi\n'
+        'if [ -n "${RUNNING_COMMIT_FILE:-}" ] && [ -f "${OBOROT_ENV_FILE:-}" ]; then\n'
+        '  sed -n "s/^OBOROT_COMMIT=//p" "$OBOROT_ENV_FILE" > "$RUNNING_COMMIT_FILE"\n'
+        'fi\n'
+        'exit 0\n',
         encoding="utf-8")
     (bindir / "journalctl").write_text("#!/bin/sh\necho '(логи сервиса)'\n",
                                        encoding="utf-8")
@@ -266,10 +288,24 @@ def make_stubs(bindir: Path, *, health_ok=True, pip_ok=True) -> None:
         '  esac\n'
         'fi\n'
         'exec /bin/mv "$@"\n', encoding="utf-8")
-    body = '{"status":"ok","db":true}' if health_ok else '{"status":"not ready"}'
-    code = "0" if health_ok else "1"
-    (bindir / "curl").write_text(
-        f"#!/bin/sh\nprintf '%s' '{body}'\nexit {code}\n", encoding="utf-8")
+    # Готовность отдаёт КОММИТ ЖИВОГО ПРОЦЕССА — как настоящая `/health/ready`
+    # (`app/main.py`, поле `commit` из `app.version.BUILD_COMMIT`). Это не
+    # украшение: без коммита в ответе «служба отвечает» и «служба отвечает тем
+    # релизом, который мы выкатываем» неразличимы, а разница между ними и есть
+    # предмет проверки ниже.
+    if health_ok:
+        (bindir / "curl").write_text(
+            '#!/bin/sh\n'
+            'c=""\n'
+            'if [ -n "${RUNNING_COMMIT_FILE:-}" ] && [ -f "$RUNNING_COMMIT_FILE" ]; then\n'
+            '  c=$(cat "$RUNNING_COMMIT_FILE")\n'
+            'fi\n'
+            'printf \'{"status":"ok","db":true,"commit":"%s"}\' "$c"\n'
+            'exit 0\n', encoding="utf-8")
+    else:
+        (bindir / "curl").write_text(
+            "#!/bin/sh\nprintf '%s' '{\"status\":\"not ready\"}'\nexit 1\n",
+            encoding="utf-8")
     for f in ("systemctl", "journalctl", "curl", "mv"):
         (bindir / f).chmod(0o755)
     # Подставные python и pip. Настоящая сборка venv занимала бы секунды на
@@ -427,6 +463,9 @@ def deploy_env(app: Path, extra: dict | None = None) -> dict:
         "OBOROT_HEALTH_DELAY": "0",
         "PIP_LOG": str(WORK / "pip.log"),
         "SYSTEMCTL_LOG": str(WORK / "systemctl.log"),
+        # Коммит, которым отвечает ЖИВОЙ процесс. Двигает его только перезапуск,
+        # а не запись в файл окружения — как на сервере.
+        "RUNNING_COMMIT_FILE": str(WORK / "running-commit"),
         # Подставные модули `pip` и `venv` заслоняют настоящие. Заслоняют именно
         # для процессов выкладки: сам тест их не импортирует.
         "PYTHONPATH": str(WORK / "stub-bin" / "pyshim"),
@@ -1484,6 +1523,163 @@ def main() -> int:
           and (WORK / "state" / "PREVIOUS_VENV").read_text(encoding="utf-8").strip()
           == prev_venv)
     check("код остался на том же коммите", head_of(app) == vcur, head_of(app)[:12])
+
+    # ------------------------------------------------------------------
+    # OPS-8 corrective #1: то, что нашло внешнее ревью на HEAD e17002e.
+    # ------------------------------------------------------------------
+    running_commit = WORK / "running-commit"
+
+    print("\n== Неудачная готовность не разводит PREVIOUS_SHA и PREVIOUS_VENV ==")
+    # Последовательность Z → A → неудавшийся B. Прежний код записывал
+    # PREVIOUS_VENV=venv-A ДО перезапуска, а PREVIOUS_SHA — только ПОСЛЕ
+    # успешной готовности. Значит после провала готовности на диске оставалась
+    # пара «откатывайся на Z, окружение вот от A»: два маркера про разные
+    # релизы. Повтор той же цели читал эту пару целиком и печатал Z, теряя
+    # настоящего предшественника A.
+    git(["checkout", "-q", "main"], cwd=app)
+    vz = add_commit(app, "vz")
+    git(["checkout", "-q", "main"], cwd=app)
+    va = add_commit(app, "va")
+    git(["checkout", "-q", "main"], cwd=app)
+    vb = add_commit(app, "vb")
+    git(["checkout", "-q", "--detach", vcur], cwd=app)
+    rc, out = run(["bash", script, vz], env=deploy_env(app))
+    check("подготовка: выкатили Z", rc == 0 and head_of(app) == vz, out[-250:])
+    rc, out = run(["bash", script, va], env=deploy_env(app))
+    check("подготовка: выкатили A, цель отката — Z", rc == 0
+          and (WORK / "state" / "PREVIOUS_SHA").read_text(encoding="utf-8").strip() == vz,
+          out[-250:])
+    make_stubs(WORK / "stub-bin", health_ok=False)
+    rc, out = run(["bash", script, vb], env=deploy_env(app))
+    make_stubs(WORK / "stub-bin")
+    check("выкладка B отклонена по готовности", rc == 1, f"rc={rc}")
+    check("но служба уже перезапущена — откат назад делает человек",
+          running_commit.read_text(encoding="utf-8").strip() == vb,
+          running_commit.read_text(encoding="utf-8").strip()[:12])
+    pair_sha = (WORK / "state" / "PREVIOUS_SHA").read_text(encoding="utf-8").strip()
+    pair_venv = (WORK / "state" / "PREVIOUS_VENV").read_text(encoding="utf-8").strip()
+    check("PREVIOUS_SHA после провала готовности — НАСТОЯЩИЙ предшественник A",
+          pair_sha == va, f"{pair_sha[:12]} (ожидали {va[:12]})")
+    check("PREVIOUS_VENV — окружение того же самого A", pair_venv == str(WORK / f"venv-{va}"),
+          pair_venv)
+    check("ПАРА СОГЛАСОВАНА: метка внутри каталога совпадает с записанным SHA",
+          Path(pair_venv, "RELEASE_SHA").exists()
+          and Path(pair_venv, "RELEASE_SHA").read_text(encoding="utf-8").strip() == pair_sha,
+          f"{pair_sha[:12]} vs {pair_venv}")
+    # Повтор той же цели: подсказка обязана назвать A, а не Z.
+    rc, out = run(["bash", script, vb], env=deploy_env(app))
+    check("повтор той же цели прошёл", rc == 0, f"rc={rc} " + out[-300:])
+    check("откат назван на A — настоящего предшественника не потеряли",
+          f"deploy/deploy.sh {va}" in out, out[-300:])
+    check("и НЕ на Z, который к этому релизу отношения уже не имеет",
+          f"deploy/deploy.sh {vz}" not in out, out[-300:])
+    check("пара маркеров повтором не тронута",
+          (WORK / "state" / "PREVIOUS_SHA").read_text(encoding="utf-8").strip() == va
+          and (WORK / "state" / "PREVIOUS_VENV").read_text(encoding="utf-8").strip()
+          == str(WORK / f"venv-{va}"))
+
+    print("\n== Обрыв между двумя записями маркеров не склеивает чужую пару ==")
+    # Два файла атомарно не записать: обрыв между ними оставляет SHA от одного
+    # релиза и путь от другого. Склеивать их нельзя — иначе скрипт сам сочинит
+    # несуществующий релиз. Годность определяется меткой ВНУТРИ каталога, ровно
+    # как в D-44, и по ней же пара восстанавливается.
+    (WORK / "state" / "PREVIOUS_SHA").write_text(va + "\n", encoding="utf-8")
+    (WORK / "state" / "PREVIOUS_VENV").write_text(str(WORK / f"venv-{vz}") + "\n",
+                                                  encoding="utf-8")
+    decoys = []
+    for i in (21, 22, 23):
+        d = WORK / ("venv-" + f"{i:040x}")
+        shutil.rmtree(d, ignore_errors=True)
+        shutil.copytree(WORK / "venv", d, symlinks=True)
+        os.utime(d, None)
+        decoys.append(d)
+    old = time.time() - 90 * 24 * 3600
+    os.utime(WORK / f"venv-{va}", (old, old))
+    rc, out = run(["bash", script, vb], env=deploy_env(app, {"OBOROT_VENV_KEEP": "1"}))
+    check("выкладка прошла", rc == 0, f"rc={rc} " + out[-300:])
+    check("откат по-прежнему назван на A", f"deploy/deploy.sh {va}" in out, out[-300:])
+    check("сказано, что запись не сошлась и окружение найдено по метке",
+          "по метке" in out, out[-400:])
+    check("ОКРУЖЕНИЕ A ПЕРЕЖИЛО УБОРКУ — защита досталась ему, а не чужому каталогу",
+          (WORK / f"venv-{va}").is_dir(),
+          str(sorted(p.name[:16] for p in WORK.glob("venv-*"))))
+    check("и оно работоспособно",
+          run([str(WORK / f"venv-{va}" / "bin" / "python"), "-m", "pip", "--version"],
+              env=deploy_env(app))[0] == 0)
+    check("уборка при этом была: приманки удалены",
+          not any(d.exists() for d in decoys),
+          str([d.name[:16] for d in decoys if d.exists()]))
+
+    print("\n== Сигнал ВНУТРИ самого перезапуска не бросает выкладку недоделанной ==")
+    # Шов, найденный ревью: отметка «перезапуск начат» становится видимой
+    # обработчику раньше, чем bash входит в `systemctl restart`. Сигнал в этом
+    # промежутке пропускал обязательный откат, а сигнал во время самого
+    # перезапуска бросал выкладку на полпути — служба уже перезапущена, а
+    # скрипт отчитался отказом. Шов закрыт не отметкой, а тем, что на время
+    # перехода сигналы ИГНОРИРУЮТСЯ: обработчику неоткуда увидеть отметку рано,
+    # потому что он в этом окне не запускается вовсе.
+    git(["checkout", "-q", "main"], cwd=app)
+    vsg = add_commit(app, "vsg")
+    git(["checkout", "-q", "--detach", vb], cwd=app)
+    rc, out = run(["bash", script, vb], env=deploy_env(app))
+    check("подготовка: в бою B", rc == 0 and head_of(app) == vb, out[-250:])
+    (WORK / "systemctl.log").write_text("", encoding="utf-8")
+    once = WORK / "restart-signal-once"
+    if once.exists():
+        once.unlink()
+    rc, out = run(["bash", script, vsg],
+                  env=deploy_env(app, {"SIGNAL_ON_RESTART": str(once)}))
+    check("сигнал действительно доставлен внутри перезапуска — иначе раздел пуст",
+          once.exists())
+    check("ВЫКЛАДКА ДОВЕДЕНА ДО КОНЦА, а не брошена на полпути", rc == 0,
+          f"rc={rc} " + out[-400:])
+    check("код на цели", head_of(app) == vsg, head_of(app)[:12])
+    check("и в бою именно цель",
+          running_commit.read_text(encoding="utf-8").strip() == vsg,
+          running_commit.read_text(encoding="utf-8").strip()[:12])
+    check("служба перезапущена ровно один раз",
+          (WORK / "systemctl.log").read_text(encoding="utf-8").count("restart") == 1)
+    # Окно игнорирования обязано быть ровно вокруг перезапуска, а не шире:
+    # иначе Ctrl-C переставал бы работать на всё ожидание готовности.
+    src = (ROOT / "deploy" / "deploy.sh").read_text(encoding="utf-8").splitlines()
+    off = [i for i, ln in enumerate(src) if ln.strip() == "trap '' INT TERM HUP"]
+    back = [i for i, ln in enumerate(src) if ln.strip() == "trap 'on_signal INT' INT"]
+    window = []
+    if off and back:
+        after = [i for i in back if i > off[0]]
+        if after:
+            window = src[off[0] + 1:after[0]]
+    check("сигналы глушатся ровно на переход, и в окне — только перезапуск",
+          bool(window)
+          and len([ln for ln in window if "systemctl restart" in ln]) == 1
+          and not any("wait_ready" in ln for ln in window),
+          " | ".join(ln.strip()[:40] for ln in window) or "окно не найдено")
+
+    print("\n== Повтор не засчитывает ЧУЖОЙ живой процесс за перезапущенный ==")
+    # Самый тихий из трёх. `systemctl restart` не удался: код, env и окружение
+    # уже целевые, а в бою по-прежнему прежний процесс. Повтор той же цели
+    # видел «status: ok» и объявлял релиз развёрнутым, ни разу его не запустив.
+    # Готовность отдаёт коммит живого процесса — его и надо спрашивать.
+    git(["checkout", "-q", "main"], cwd=app)
+    vr = add_commit(app, "vr")
+    git(["checkout", "-q", "--detach", vsg], cwd=app)
+    (WORK / "systemctl.log").write_text("", encoding="utf-8")
+    rc, out = run(["bash", script, vr], env=deploy_env(app, {"FAIL_RESTART": "1"}))
+    check("выкладка с неудавшимся перезапуском отклонена", rc == 1, f"rc={rc}")
+    check("подготовка: код уже на цели", head_of(app) == vr, head_of(app)[:12])
+    check("подготовка: а в бою по-прежнему ПРЕЖНИЙ процесс",
+          running_commit.read_text(encoding="utf-8").strip() == vsg,
+          running_commit.read_text(encoding="utf-8").strip()[:12])
+    (WORK / "systemctl.log").write_text("", encoding="utf-8")
+    rc, out = run(["bash", script, vr], env=deploy_env(app))
+    check("повтор НЕ объявил цель развёрнутой без перезапуска",
+          "перезапуск не нужен" not in out, out[-400:])
+    check("служба перезапущена", "restart" in (WORK / "systemctl.log").read_text(encoding="utf-8"),
+          (WORK / "systemctl.log").read_text(encoding="utf-8").strip() or "пусто")
+    check("и в бою теперь именно цель, а не прежний релиз",
+          running_commit.read_text(encoding="utf-8").strip() == vr,
+          running_commit.read_text(encoding="utf-8").strip()[:12])
+    check("повтор завершился успешно", rc == 0, f"rc={rc} " + out[-300:])
 
     shutil.rmtree(WORK, ignore_errors=True)
     print(f"\nИТОГО: {len(PASS)} OK, {len(FAIL)} FAIL")
