@@ -1244,7 +1244,6 @@ def main() -> int:
             g.unlink()
     (WORK / "systemctl.log").write_text("", encoding="utf-8")
     (WORK / "pip.log").write_text("", encoding="utf-8")
-    backups_before = sorted(p.name for p in (WORK / "data" / "backups").glob("oborot-*.db"))
     gate_env = deploy_env(app, {"PIP_GATE": str(gate)})
     first = subprocess.Popen(["bash", str(app / "deploy" / "deploy.sh"), vnew2],
                              env=gate_env, stdout=subprocess.PIPE,
@@ -1275,9 +1274,14 @@ def main() -> int:
     syslog = (WORK / "systemctl.log").read_text(encoding="utf-8")
     check("служба перезапущена РОВНО ОДИН раз", syslog.count("restart") == 1,
           syslog.strip().replace("\n", " | ") or "пусто")
-    new_backups = [p.name for p in (WORK / "data" / "backups").glob("oborot-*.db")
-                   if p.name not in backups_before]
-    check("копия базы снята ровно одна", len(new_backups) == 1, str(new_backups))
+    # Считается по выводу каждого процесса, а не по именам файлов в каталоге.
+    # Имя копии — `oborot-<дата>-<время>.db` с точностью до секунды, и в CI весь
+    # этот набор укладывается в десяток секунд: две копии подряд попадают в одну
+    # секунду и вторая перезаписывает первую. Сравнение множества имён на таком
+    # прогоне доказывало бы не «копия одна», а «часы медленнее набора».
+    check("копию базы сняла только победившая, и ровно одну",
+          out1.count("копия: ") == 1 and "копия: " not in out2,
+          f"первая={out1.count('копия: ')} вторая={out2.count('копия: ')}")
     piplog = (WORK / "pip.log").read_text(encoding="utf-8")
     check("окружение собрано ровно один раз",
           len([ln for ln in piplog.splitlines() if ln.startswith("install")]) == 1,
