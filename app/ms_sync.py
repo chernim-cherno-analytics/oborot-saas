@@ -334,6 +334,21 @@ def ensure_schema(bind=None) -> None:
                 run_migration_step(
                     f"ALTER TABLE production_orders ADD COLUMN {col} {ddl}", bind=eng,
                 )
+        # DATA-6 (round 4): персистентный исход точечной проверки missing-
+        # документа (см. models.ProductionOrder.ms_reconcile_state). Пустая
+        # строка по умолчанию — единственно честный бэкфилл для СУЩЕСТВУЮЩИХ
+        # строк: до первой точечной проверки новым кодом состояние документа
+        # неизвестно, и молчаливо считать его «уже проверенным» было бы
+        # угадыванием (fail-closed) — такая строка просто пройдёт точечную
+        # проверку заново при следующем синке, как и раньше.
+        for col, ddl in (
+            ("ms_reconcile_state", "VARCHAR(16) NOT NULL DEFAULT ''"),
+            ("ms_reconcile_href", "VARCHAR(512) NOT NULL DEFAULT ''"),
+        ):
+            if col not in cols:
+                run_migration_step(
+                    f"ALTER TABLE production_orders ADD COLUMN {col} {ddl}", bind=eng,
+                )
     if insp.has_table("order_plans"):
         cols = {c["name"] for c in insp.get_columns("order_plans")}
         if "created_by" not in cols:
@@ -2684,6 +2699,24 @@ async def _sync_incoming(org_id: int, client: MoySkladClient,
         _release_incoming_write_lock(org_id)
 
 
+def _set_order_reconcile(order_id: int, state: str, href: str) -> None:
+    """Персистентный исход точечной проверки заказа (DATA-6 round 4).
+
+    Короткая, отдельная от остальной пересборки транзакция — тумбстоун
+    одного заказа не обязан ждать коммита ordered_qty ниже и обязан пережить
+    исключение на КАКОМ-ТО ДРУГОМ документе того же прогона (ambiguous по
+    соседней ссылке не должен стирать уже подтверждённый факт по этой).
+    """
+    db = SessionLocal()
+    try:
+        db.execute(update(ProductionOrder).where(
+            ProductionOrder.id == order_id,
+        ).values(ms_reconcile_state=state, ms_reconcile_href=href))
+        db.commit()
+    finally:
+        db.close()
+
+
 async def _sync_incoming_locked(org_id: int, client: MoySkladClient,
                                 ext_to_pid: dict[str, int], stats: dict,
                                 progress: tuple[float, float]) -> None:
@@ -2742,12 +2775,24 @@ async def _sync_incoming_locked(org_id: int, client: MoySkladClient,
     db = SessionLocal()
     try:
         order_rows = db.execute(
-            select(ProductionOrder.id, ProductionOrder.ms_doc_href).where(
+            select(
+                ProductionOrder.id,
+                ProductionOrder.ms_doc_href,
+                ProductionOrder.ms_reconcile_state,
+                ProductionOrder.ms_reconcile_href,
+            ).where(
                 ProductionOrder.org_id == org_id,
                 ProductionOrder.ms_doc_href.is_not(None),
             )
         ).all()
-        our_docs = {int(oid): href for oid, href in order_rows if href}
+        our_docs = {int(oid): href for oid, href, _, _ in order_rows if href}
+        # DATA-6 (round 4): последний известный исход точечной проверки —
+        # см. models.ProductionOrder.ms_reconcile_state и комментарий у
+        # цикла реконсиляции ниже.
+        reconcile_cache = {
+            int(oid): (state or "", rhref or "")
+            for oid, href, state, rhref in order_rows if href
+        }
     finally:
         db.close()
 
@@ -2806,16 +2851,48 @@ async def _sync_incoming_locked(org_id: int, client: MoySkladClient,
     # не бывает — либо пересборка целиком на подтверждённых данных, либо не
     # начинается), поэтому ms_qty/ms_qty_tracked остаются прежними, и чистый
     # повторный синк проходит обычным путём до done.
+    #
+    # Round 4 (BLOCKED issuecomment-5433247516, discussion_r3868006778):
+    # логика выше проверяет ВСЕ отсутствующие привязанные документы без
+    # исключения по локальной дате — но без памяти между синками это же
+    # самое «без исключения» означает, что действительно старый заказ (вне
+    # INCOMING_ORDERS_DAYS) или документ, чьё 404 уже подтверждено, ловил бы
+    # точечный GET на КАЖДОМ синке НАВСЕГДА. На долгоживущей организации это
+    # неограниченно растущее число сериализованных rate-limited вызовов
+    # МойСклада, не связанных с годовым окном синка.
+    #
+    # Решение — persistent per-order исход (ProductionOrder.ms_reconcile_state
+    # /ms_reconcile_href, см. models.py): 'absent' или 'excluded' по ТОЙ ЖЕ
+    # ссылке пропускает точечную проверку без сети. Это НЕ ослабляет round 3:
+    # ambiguous-исход (сетевая/HTTP ошибка, нераспознаваемый moment) по-прежнему
+    # НИЧЕГО не пишет в тумбстоун — следующий синк обязан проверить заново, а
+    # не унаследовать неопределённость как решённую. Смена ms_doc_href (заказ
+    # пересвязан на другой документ) тоже обнуляет актуальность кэша: тумбстоун
+    # сверяется с ТЕКУЩИМ href, а не только с order_id. А если ссылка внезапно
+    # снова видна в свежем списке при ранее тумбстонутом 'absent' (документ
+    # восстановили) — тумбстоун здесь же снимается, чтобы будущее исчезновение
+    # той же ссылки не унаследовало устаревший вердикт по молчанию.
     def _doc_ref(d: dict) -> str:
         href = ((d.get("meta") or {}).get("href")) or ""
         return _href_id(href) or href
 
     present_refs = {_doc_ref(d) for d in docs}
-    for href in our_docs.values():
+    for order_id, href in our_docs.items():
         if not ms_writeback.is_pushed(href):
             continue  # "pending:"/"unknown:" — служебная пометка, не документ
         ref = _href_id(href) or href
-        if not ref or ref in present_refs:
+        if not ref:
+            continue
+        cached_state, cached_href = reconcile_cache.get(order_id, ("", ""))
+        if ref in present_refs:
+            if cached_state and cached_href == href:
+                _set_order_reconcile(order_id, "", "")
+            continue
+        if cached_state in ("absent", "excluded") and cached_href == href:
+            # Уже проверено точечным чтением РАНЕЕ для ЭТОЙ ЖЕ ссылки —
+            # доверяем сохранённому вердикту без нового сетевого вызова.
+            stats["incoming_reconcile_skipped_cached"] = stats.get(
+                "incoming_reconcile_skipped_cached", 0) + 1
             continue
         try:
             recovered = await client.fetch_purchase_order_by_id(ref)
@@ -2827,6 +2904,7 @@ async def _sync_incoming_locked(org_id: int, client: MoySkladClient,
         if recovered is None:
             stats["incoming_reconcile_confirmed_absent"] = stats.get(
                 "incoming_reconcile_confirmed_absent", 0) + 1
+            _set_order_reconcile(order_id, "absent", href)
             continue
         moment_day = str(recovered.get("moment") or "")[:10]
         try:
@@ -2846,11 +2924,14 @@ async def _sync_incoming_locked(org_id: int, client: MoySkladClient,
             # moment честно вне окна синка — не воскрешаем.
             stats["incoming_reconcile_recovered_excluded"] = stats.get(
                 "incoming_reconcile_recovered_excluded", 0) + 1
+            _set_order_reconcile(order_id, "excluded", href)
             continue
         docs.append(recovered)
         present_refs.add(ref)
         stats["incoming_reconcile_recovered"] = stats.get(
             "incoming_reconcile_recovered", 0) + 1
+        if cached_state:
+            _set_order_reconcile(order_id, "", "")
 
     incoming: dict[str, float] = {}
     incoming_tracked: dict[str, float] = {}

@@ -216,6 +216,15 @@ def order_href(order_id: int) -> str:
     return str(row[0]) if row else ""
 
 
+def reconcile_state(order_id: int) -> tuple:
+    """(ms_reconcile_state, ms_reconcile_href) заказа — DATA-6 round 4."""
+    row = query_one(
+        "SELECT ms_reconcile_state, ms_reconcile_href FROM production_orders "
+        "WHERE id=?", order_id,
+    )
+    return (str(row[0]), str(row[1])) if row else ("", "")
+
+
 def local_qty(org_id: int, base_name: str) -> float:
     row = query_one(
         "SELECT qty FROM ordered_qty WHERE org_id=? AND base_name=?",
@@ -874,6 +883,10 @@ def run() -> int:
     check("НЕОДНОЗНАЧНОСТЬ ТОЧЕЧНОГО ЧТЕНИЯ ЗАФИКСИРОВАНА ЧЕСТНО",
           stats7.get("incoming_reconcile_ambiguous", 0) >= 1,
           f"stats={stats7.get('incoming_reconcile_ambiguous')}")
+    check("ROUND 4: НЕОДНОЗНАЧНЫЙ ИСХОД НЕ ЗАПИСАН КАК ТУМБСТОУН "
+          "(ms_reconcile_state пуст)",
+          reconcile_state(order_j_id) == ("", ""),
+          f"reconcile_state={reconcile_state(order_j_id)}")
     after_sync_j = ms_qty_pair(org_id, base_j)
     check("ИЗВЕСТНЫЙ ВКЛАД ПОСЛЕ PUSH НЕ ОБНУЛЁН — пересборка прервана целиком",
           after_sync_j == after_push_j,
@@ -905,6 +918,202 @@ def run() -> int:
     check("last_sync_at ОБНОВИЛСЯ НА ЧИСТОМ ПОВТОРЕ",
           last_sync_after_retry != last_sync_before_j,
           f"было={last_sync_before_j} стало={last_sync_after_retry}")
+
+    # ── 8. Round 4 (BLOCKED issuecomment-5433247516, discussion_r3868006778):
+    # подтверждённое отсутствие (404) проверяется точечным чтением РОВНО ОДИН
+    # раз, а не на каждом синке навсегда ─────────────────────────────────────
+    print("\n== 8. Подтверждённое отсутствие документа: точечный GET один раз, "
+          "следующий синк берёт вердикт из базы, без нового сетевого вызова ==")
+    order_m_id, item_m = make_order(c, "Заказ: 404 не долбит МойСклад вечно")
+    base_m = item_m["base_name"]
+    before_ms_m = ms_qty_pair(org_id, base_m)
+
+    r8push = c.post(f"/api/orders/{order_m_id}/push-to-ms")
+    check("push прошёл", r8push.status_code == 200, f"status={r8push.status_code}")
+    href_m = order_href(order_m_id)
+    doc_id_m = ms_sync._href_id(href_m)
+    check("документ создан и привязан",
+          bool(href_m) and not ms_writeback.is_internal_href(href_m),
+          f"href={href_m!r}")
+
+    mock_ms.CREATED_PURCHASE_ORDERS[:] = [
+        d for d in mock_ms.CREATED_PURCHASE_ORDERS if d.get("id") != doc_id_m
+    ]
+
+    get_calls_before_8a = mock_ms.FAULT_STATS["po_get_ok"]
+    r = c.post("/api/sync/run")
+    check("синк #1 запущен", r.status_code == 200, f"status={r.status_code}")
+    st8a = wait_sync_done(c)
+    check("синк #1 дошёл до done", st8a.get("state") == "done",
+          f"state={st8a.get('state')} error={str(st8a.get('error'))[:120]}")
+    get_calls_after_8a = mock_ms.FAULT_STATS["po_get_ok"]
+    check("СИНК #1 ДЕЙСТВИТЕЛЬНО СХОДИЛ ТОЧЕЧНЫМ GET (не взял вердикт из ниоткуда)",
+          get_calls_after_8a == get_calls_before_8a + 1,
+          f"до={get_calls_before_8a} после={get_calls_after_8a}")
+    stats8a = st8a.get("stats", {}) or {}
+    check("СИНК #1 ЧЕСТНО ЗАФИКСИРОВАЛ ПОДТВЕРЖДЁННОЕ ОТСУТСТВИЕ",
+          stats8a.get("incoming_reconcile_confirmed_absent", 0) >= 1,
+          f"stats={stats8a.get('incoming_reconcile_confirmed_absent')}")
+    check("ROUND 4: ВЕРДИКТ 'absent' СОХРАНЁН В БАЗЕ ПО ТЕКУЩЕЙ ССЫЛКЕ",
+          reconcile_state(order_m_id) == ("absent", href_m),
+          f"reconcile_state={reconcile_state(order_m_id)} href={href_m!r}")
+    after_sync_m1 = ms_qty_pair(org_id, base_m)
+    check("вклад удалённого документа снят",
+          after_sync_m1[0] == before_ms_m[0],
+          f"было={before_ms_m[0]} стало={after_sync_m1[0]}")
+
+    get_calls_before_8b = mock_ms.FAULT_STATS["po_get_ok"]
+    r = c.post("/api/sync/run")
+    check("синк #2 запущен", r.status_code == 200, f"status={r.status_code}")
+    st8b = wait_sync_done(c)
+    check("синк #2 дошёл до done", st8b.get("state") == "done",
+          f"state={st8b.get('state')} error={str(st8b.get('error'))[:120]}")
+    get_calls_after_8b = mock_ms.FAULT_STATS["po_get_ok"]
+    check("СИНК #2 НЕ СДЕЛАЛ НИ ОДНОГО НОВОГО ТОЧЕЧНОГО GET — "
+          "ВЕРДИКТ ВЗЯТ ИЗ БАЗЫ (округа не растёт бесконечно)",
+          get_calls_after_8b == get_calls_before_8b,
+          f"до={get_calls_before_8b} после={get_calls_after_8b}")
+    stats8b = st8b.get("stats", {}) or {}
+    check("СИНК #2 ОТМЕТИЛ ПРОПУСК ПО КЭШИРОВАННОМУ ВЕРДИКТУ",
+          stats8b.get("incoming_reconcile_skipped_cached", 0) >= 1,
+          f"stats={stats8b.get('incoming_reconcile_skipped_cached')}")
+    after_sync_m2 = ms_qty_pair(org_id, base_m)
+    check("вклад по-прежнему не воскрешён",
+          after_sync_m2[0] == before_ms_m[0],
+          f"стало={after_sync_m2[0]}")
+
+    # ── 9. Round 4: документ, подтверждённо существующий, но с честно старым
+    # remote moment («excluded»), тоже проверяется точечным чтением ОДИН раз ──
+    print("\n== 9. Документ вне окна синка (excluded): точечный GET один раз, "
+          "следующий синк берёт вердикт из базы ==")
+    order_n_id, item_n = make_order(c, "Заказ: excluded не долбит МойСклад вечно")
+    base_n = item_n["base_name"]
+    before_ms_n = ms_qty_pair(org_id, base_n)
+
+    r9push = c.post(f"/api/orders/{order_n_id}/push-to-ms")
+    check("push прошёл", r9push.status_code == 200, f"status={r9push.status_code}")
+    href_n = order_href(order_n_id)
+    doc_id_n = ms_sync._href_id(href_n)
+    check("документ создан и привязан",
+          bool(href_n) and not ms_writeback.is_internal_href(href_n),
+          f"href={href_n!r}")
+
+    matched_n = [d for d in mock_ms.CREATED_PURCHASE_ORDERS if d.get("id") == doc_id_n]
+    check("документ найден в состоянии мока перед подменой moment",
+          len(matched_n) == 1, f"найдено={len(matched_n)} id={doc_id_n!r}")
+    matched_n[0]["moment"] = (mock_ms.TODAY - timedelta(days=400)).isoformat() + " 12:00:00"
+
+    # Умышленно БЕЗ po_hide_created: 400-дневный moment сам по себе исключает
+    # документ из списка (мок фильтрует список по moment>=cutoff — реальное
+    # поведение сервера, см. entity_purchaseorder в tests/mock_ms.py), список
+    # синка не трогает НИКАКИЕ другие документы. po_hide_created прячет ВЕСЬ
+    # список сразу и загрязнил бы счётчик точечных GET чужими заказами —
+    # см. сценарий 10, где это учтено отдельно.
+    get_calls_before_9a = mock_ms.FAULT_STATS["po_get_ok"]
+    r = c.post("/api/sync/run")
+    check("синк #1 запущен", r.status_code == 200, f"status={r.status_code}")
+    st9a = wait_sync_done(c)
+    check("синк #1 дошёл до done", st9a.get("state") == "done",
+          f"state={st9a.get('state')} error={str(st9a.get('error'))[:120]}")
+    get_calls_after_9a = mock_ms.FAULT_STATS["po_get_ok"]
+    check("СИНК #1 ДЕЙСТВИТЕЛЬНО СХОДИЛ ТОЧЕЧНЫМ GET",
+          get_calls_after_9a == get_calls_before_9a + 1,
+          f"до={get_calls_before_9a} после={get_calls_after_9a}")
+    stats9a = st9a.get("stats", {}) or {}
+    check("СИНК #1 ПОДТВЕРДИЛ ДОКУМЕНТ, НО ИСКЛЮЧИЛ ПО СТАРОМУ MOMENT",
+          stats9a.get("incoming_reconcile_recovered_excluded", 0) >= 1,
+          f"stats={stats9a.get('incoming_reconcile_recovered_excluded')}")
+    check("ROUND 4: ВЕРДИКТ 'excluded' СОХРАНЁН В БАЗЕ ПО ТЕКУЩЕЙ ССЫЛКЕ",
+          reconcile_state(order_n_id) == ("excluded", href_n),
+          f"reconcile_state={reconcile_state(order_n_id)} href={href_n!r}")
+
+    # Тот же 400-дневный moment по-прежнему исключает документ из списка сам
+    # по себе — без кэша это была бы вторая точечная проверка.
+    get_calls_before_9b = mock_ms.FAULT_STATS["po_get_ok"]
+    r = c.post("/api/sync/run")
+    check("синк #2 запущен", r.status_code == 200, f"status={r.status_code}")
+    st9b = wait_sync_done(c)
+    check("синк #2 дошёл до done", st9b.get("state") == "done",
+          f"state={st9b.get('state')} error={str(st9b.get('error'))[:120]}")
+    get_calls_after_9b = mock_ms.FAULT_STATS["po_get_ok"]
+    check("СИНК #2 НЕ СДЕЛАЛ НИ ОДНОГО НОВОГО ТОЧЕЧНОГО GET",
+          get_calls_after_9b == get_calls_before_9b,
+          f"до={get_calls_before_9b} после={get_calls_after_9b}")
+    stats9b = st9b.get("stats", {}) or {}
+    check("СИНК #2 ОТМЕТИЛ ПРОПУСК ПО КЭШИРОВАННОМУ ВЕРДИКТУ",
+          stats9b.get("incoming_reconcile_skipped_cached", 0) >= 1,
+          f"stats={stats9b.get('incoming_reconcile_skipped_cached')}")
+    after_sync_n2 = ms_qty_pair(org_id, base_n)
+    check("документ вне окна по-прежнему не воскрешён",
+          after_sync_n2[0] == before_ms_n[0],
+          f"было={before_ms_n[0]} стало={after_sync_n2[0]}")
+
+    # ── 10. Round 4: неоднозначный исход остаётся ретраибельным — ЧИСТЫЙ
+    # повтор при ПРЕЖНЕМ отставании списка обязан ПРОБОВАТЬ ЗАНОВО (не взять
+    # ложный тумбстоун) и восстановить документ ──────────────────────────────
+    print("\n== 10. Точечное чтение падает неоднозначно (список всё ещё "
+          "отстаёт): повтор без ошибки обязан СНОВА сходить точечным GET "
+          "(не унаследовать несуществующий тумбстоун) и восстановить документ ==")
+    order_o_id, item_o = make_order(c, "Заказ: ambiguous остаётся ретраибельным")
+    base_o = item_o["base_name"]
+    qty_o = float(item_o["qty"])
+    before_ms_o = ms_qty_pair(org_id, base_o)
+
+    r10push = c.post(f"/api/orders/{order_o_id}/push-to-ms")
+    check("push прошёл", r10push.status_code == 200, f"status={r10push.status_code}")
+    after_push_o = ms_qty_pair(org_id, base_o)
+    check("push добавил вклад локально",
+          after_push_o[0] == before_ms_o[0] + qty_o,
+          f"было={before_ms_o} стало={after_push_o}")
+
+    mock_ms.FAULTS["po_hide_created"] = 1
+    mock_ms.FAULTS["po_get_status"] = 401
+    st10a: dict = {}
+    try:
+        r = c.post("/api/sync/run")
+        check("синк #1 (неоднозначный) запущен", r.status_code == 200,
+              f"status={r.status_code}")
+        st10a = wait_sync_done(c)
+    finally:
+        mock_ms.FAULTS["po_get_status"] = 0
+        # po_hide_created ОСТАВЛЯЕМ включённым — список для повтора всё ещё
+        # не покажет документ, точно так же, как реальная задержка индекса.
+    check("синк #1 честно завершился error", st10a.get("state") == "error",
+          f"state={st10a.get('state')}")
+    check("ROUND 4: НЕОДНОЗНАЧНЫЙ ИСХОД НЕ ЗАПИСАН КАК ТУМБСТОУН",
+          reconcile_state(order_o_id) == ("", ""),
+          f"reconcile_state={reconcile_state(order_o_id)}")
+
+    get_calls_before_10b = mock_ms.FAULT_STATS["po_get_ok"]
+    try:
+        r = c.post("/api/sync/run")
+        check("синк #2 (чистый повтор) запущен", r.status_code == 200,
+              f"status={r.status_code}")
+        st10b = wait_sync_done(c)
+    finally:
+        mock_ms.FAULTS["po_hide_created"] = 0
+    check("СИНК #2 ДОХОДИТ ДО DONE", st10b.get("state") == "done",
+          f"state={st10b.get('state')} error={str(st10b.get('error'))[:120]}")
+    get_calls_after_10b = mock_ms.FAULT_STATS["po_get_ok"]
+    # >= а не ==+1: po_hide_created здесь глобальный (прячет список ЦЕЛИКОМ,
+    # см. entity_purchaseorder в tests/mock_ms.py), поэтому заодно с order_o
+    # из виду пропадают и все остальные, уже нормально видимые заказы
+    # предыдущих сценариев (у них НЕТ тумбстоуна — не за что зацепиться
+    # кэшу), и повтор честно проверяет точечным чтением их всех тоже. Что
+    # именно ПРОБЕЖАЛО ПО order_o, доказывает не сырой счётчик, а совпадение
+    # его ms_qty ниже — тумбстоун-подмена дала бы 0, а не qty_o.
+    check("ПОВТОР ДЕЙСТВИТЕЛЬНО СХОДИЛ ТОЧЕЧНЫМ GET ЗАНОВО "
+          "(ложный тумбстоун не проглотил проверку)",
+          get_calls_after_10b >= get_calls_before_10b + 1,
+          f"до={get_calls_before_10b} после={get_calls_after_10b}")
+    stats10b = st10b.get("stats", {}) or {}
+    check("ПОВТОР ВОССТАНОВИЛ ДОКУМЕНТ ТОЧЕЧНЫМ ЧТЕНИЕМ (не пропуском)",
+          stats10b.get("incoming_reconcile_recovered", 0) >= 1,
+          f"stats={stats10b.get('incoming_reconcile_recovered')}")
+    after_retry_o = ms_qty_pair(org_id, base_o)
+    check("ВКЛАД ПОСЛЕ ПОВТОРА РАВЕН ВКЛАДУ СРАЗУ ПОСЛЕ PUSH",
+          after_retry_o == after_push_o,
+          f"после push={after_push_o} после повтора={after_retry_o}")
 
     c.close()
     print(f"\nИТОГО: {len(PASS)} OK, {len(FAIL)} FAIL")
