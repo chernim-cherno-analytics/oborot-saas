@@ -229,6 +229,36 @@ def run_concurrent_password_changes(clients_and_passwords):
     return results
 
 
+def patch_session_version_seeds(sequence):
+    """Test-only: подставляет ФИКСИРОВАННУЮ последовательность вместо
+    auth.new_session_version_seed, чтобы delete→register тест доказывал
+    отсутствие коллизии версий ДЕТЕРМИНИРОВАННО, а не полагался на то, что
+    два независимых случайных сида не совпадут (вероятность коллизии мала,
+    но не ноль — «детерминированный» тест не имеет права полагаться на неё).
+
+    Патчит, только если helper вообще существует: на BASE-коммите до SEC-3
+    corrective (166c725) его ещё нет, и тогда патч не устанавливается вовсе
+    — там новый пользователь получает version=0 прямо из server_default
+    модели (без какой-либо случайности), и исходный delete→register дефект
+    воспроизводится как и раньше, RED на том коммите не теряется.
+
+    Возвращает (restore, patched): restore — функция отката, ОБЯЗАНА быть
+    вызвана в finally; patched — True, если подмена реально произошла (это
+    определяет, какого рода assert имеет смысл делать дальше — точное
+    зафиксированное значение или общий факт «есть версия, не 0»).
+    """
+    if not hasattr(auth, "new_session_version_seed"):
+        return (lambda: None), False
+    orig = auth.new_session_version_seed
+    it = iter(sequence)
+    auth.new_session_version_seed = lambda: next(it)
+
+    def _restore():
+        auth.new_session_version_seed = orig
+
+    return _restore, True
+
+
 def main() -> int:
     srv = ServerThread(oborot_app, APP_PORT)
     srv.start()
@@ -451,6 +481,32 @@ def run_scenario() -> int:
           cols2.count("session_version") == 1, f"cols={cols2}")
     old_engine2.dispose()
 
+    print("== Границы сида версии сессии не переполняют Postgres INTEGER (SEC-3 corrective #3) ==")
+    if not hasattr(auth, "new_session_version_seed"):
+        # BASE-коммит до SEC-3 corrective (166c725) — хелпера ещё нет, сама
+        # проверка неприменима. Не падаем: остальной сценарий (в частности,
+        # delete→register ниже) обязан продолжить выполняться и честно
+        # показать RED старого дефекта, а не потеряться в трейсбеке отсюда.
+        print("  SKIP auth.new_session_version_seed отсутствует на этом коммите — проверка неприменима")
+    else:
+        # Postgres INTEGER — знаковый 32-битный, потолок 2**31-1. Смена пароля
+        # инкрементирует session_version (см. api_change_password), поэтому сид
+        # обязан оставлять существенный гарантированный запас инкрементов ДО
+        # этого потолка, а не только не совпадать с ним в моменте выдачи.
+        _PG_INT32_MAX = 2**31 - 1
+        seed_samples = [auth.new_session_version_seed() for _ in range(3000)]
+        check("сид всегда положительный (никогда не 0 — легаси-версия зарезервирована за миграцией)",
+              min(seed_samples) >= 1, f"min={min(seed_samples)}")
+        check("сид никогда не достигает потолка Postgres INTEGER",
+              max(seed_samples) < _PG_INT32_MAX, f"max={max(seed_samples)}")
+        check("верхняя граница диапазона сида (auth._SESSION_VERSION_SEED_MAX) оставляет "
+              "не менее 2**30 гарантированных инкрементов до потолка Postgres INTEGER",
+              _PG_INT32_MAX - auth._SESSION_VERSION_SEED_MAX >= 2**30,
+              f"headroom={_PG_INT32_MAX - auth._SESSION_VERSION_SEED_MAX}")
+        check("ни один сэмпл не вышел за задокументированную границу диапазона",
+              max(seed_samples) <= auth._SESSION_VERSION_SEED_MAX,
+              f"max={max(seed_samples)} bound={auth._SESSION_VERSION_SEED_MAX}")
+
     print("== Гонка: два одновременных POST /api/account/password (SEC-3 corrective #1) ==")
     c_race_a = client()
     register(c_race_a, "sec3-race@test.io", "Гонка-бренд")
@@ -489,47 +545,62 @@ def run_scenario() -> int:
               older_resp.status_code == 401, f"status={older_resp.status_code}")
 
     print("== Delete → register: переиспользованный id не воскрешает старую куку (SEC-3 corrective #2) ==")
-    c_reuse = client()
-    register(c_reuse, "sec3-reuse@test.io", "Реюз-бренд")
-    reuse_uid1 = sql("SELECT id FROM users WHERE email = ?", "sec3-reuse@test.io")[0][0]
-    old_cookie_raw = c_reuse.cookies.get(auth.SESSION_COOKIE)
-    check("кука первого владельца слота захвачена для дальнейшей проверки", bool(old_cookie_raw))
+    # Фиксируем сиды ДЕТЕРМИНИРОВАННО (см. patch_session_version_seeds) —
+    # тест не должен полагаться на то, что два независимых случайных сида
+    # просто не совпадут. На BASE-коммите до 166c725 хелпера ещё нет,
+    # seeds_patched будет False, и сценарий честно идёт по старому пути
+    # (version=0 из server_default для обоих пользователей).
+    restore_seeds, seeds_patched = patch_session_version_seeds([424242, 555555])
+    try:
+        c_reuse = client()
+        register(c_reuse, "sec3-reuse@test.io", "Реюз-бренд")
+        reuse_uid1 = sql("SELECT id FROM users WHERE email = ?", "sec3-reuse@test.io")[0][0]
+        old_cookie_raw = c_reuse.cookies.get(auth.SESSION_COOKIE)
+        check("кука первого владельца слота захвачена для дальнейшей проверки", bool(old_cookie_raw))
 
-    r = c_reuse.post("/api/account/password", json={
-        "current_password": "secret123", "new_password": "реюз-новый-пароль",
-        "confirm_password": "реюз-новый-пароль",
-    })
-    check("смена пароля перед удалением — 200", r.status_code == 200, f"status={r.status_code}")
+        r = c_reuse.post("/api/account/password", json={
+            "current_password": "secret123", "new_password": "реюз-новый-пароль",
+            "confirm_password": "реюз-новый-пароль",
+        })
+        check("смена пароля перед удалением — 200", r.status_code == 200, f"status={r.status_code}")
 
-    old_cookie_client = cookie_client_raw(old_cookie_raw)
-    check("старая (версия 0) кука отозвана сразу после смены пароля",
-          old_cookie_client.get("/api/account").status_code == 401)
+        old_cookie_client = cookie_client_raw(old_cookie_raw)
+        check("старая (дореволюционная) кука отозвана сразу после смены пароля",
+              old_cookie_client.get("/api/account").status_code == 401)
 
-    r = c_reuse.post("/api/account/delete", json={"password": "реюз-новый-пароль", "confirm": "УДАЛИТЬ"})
-    check("владелец-одиночка удалил аккаунт и организацию целиком — 200",
-          r.status_code == 200 and r.json()["scope"] == "org", f"resp={r.text[:140]}")
-    check("строка пользователя удалена из БД",
-          not sql("SELECT id FROM users WHERE id = ?", reuse_uid1))
+        r = c_reuse.post("/api/account/delete", json={"password": "реюз-новый-пароль", "confirm": "УДАЛИТЬ"})
+        check("владелец-одиночка удалил аккаунт и организацию целиком — 200",
+              r.status_code == 200 and r.json()["scope"] == "org", f"resp={r.text[:140]}")
+        check("строка пользователя удалена из БД",
+              not sql("SELECT id FROM users WHERE id = ?", reuse_uid1))
 
-    c_reuse2 = client()
-    r = register(c_reuse2, "sec3-reuse@test.io", "Реюз-бренд-2")
-    check("тот же e-mail снова доступен для регистрации после удаления — 303",
-          r.status_code == 303, f"status={r.status_code}")
+        c_reuse2 = client()
+        r = register(c_reuse2, "sec3-reuse@test.io", "Реюз-бренд-2")
+        check("тот же e-mail снова доступен для регистрации после удаления — 303",
+              r.status_code == 303, f"status={r.status_code}")
 
-    reuse_uid2 = sql("SELECT id FROM users WHERE email = ?", "sec3-reuse@test.io")[0][0]
-    check("id действительно переиспользован (SQLite: max(id)+1 после удаления последней строки)",
-          reuse_uid2 == reuse_uid1, f"old={reuse_uid1} new={reuse_uid2}")
+        reuse_uid2 = sql("SELECT id FROM users WHERE email = ?", "sec3-reuse@test.io")[0][0]
+        check("id действительно переиспользован (SQLite: max(id)+1 после удаления последней строки)",
+              reuse_uid2 == reuse_uid1, f"old={reuse_uid1} new={reuse_uid2}")
 
-    new_seed = sql("SELECT session_version FROM users WHERE id = ?", reuse_uid2)[0][0]
-    check("новый пользователь на переиспользованном id получил положительную непредсказуемую версию, не 0",
-          new_seed > 0, f"session_version={new_seed}")
+        new_seed = sql("SELECT session_version FROM users WHERE id = ?", reuse_uid2)[0][0]
+        if seeds_patched:
+            check("новый пользователь на переиспользованном id получил ВТОРОЙ зафиксированный "
+                  "тестом сид (детерминированно, не унаследовал версию первого)",
+                  new_seed == 555555, f"session_version={new_seed}")
+        else:
+            check("новый пользователь на переиспользованном id получил положительную версию, не 0",
+                  new_seed > 0, f"session_version={new_seed}")
 
-    resurrect_client = cookie_client_raw(old_cookie_raw)
-    check("старая кука (версия 0, тот же user_id) НЕ воскрешает доступ к новому пользователю на том же id",
-          resurrect_client.get("/api/account").status_code == 401,
-          f"status={resurrect_client.get('/api/account').status_code}")
-    check("новый владелец слота нормально авторизован собственной свежей сессией",
-          c_reuse2.get("/api/account").status_code == 200)
+        resurrect_client = cookie_client_raw(old_cookie_raw)
+        resurrect_status = resurrect_client.get("/api/account").status_code
+        check("старая кука (тот же user_id, ПЕРВЫЙ сид) НЕ воскрешает доступ к новому пользователю "
+              "на том же id (ВТОРОЙ сид, гарантированно другой, а не просто «не совпал в этот раз»)",
+              resurrect_status == 401, f"status={resurrect_status}")
+        check("новый владелец слота нормально авторизован собственной свежей сессией",
+              c_reuse2.get("/api/account").status_code == 200)
+    finally:
+        restore_seeds()
 
     print("== Удаление: участник организации ==")
     owner = client()
