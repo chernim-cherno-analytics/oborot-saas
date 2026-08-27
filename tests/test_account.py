@@ -236,6 +236,154 @@ def run_scenario() -> int:
     check("смена пароля защищена от CSRF (нет заголовка — 403)", r.status_code == 403,
           f"status={r.status_code}")
 
+    print("== Гашение сессий после смены пароля (SEC-3) ==")
+    c1 = client()
+    register(c1, "sec3@test.io", "Сек-бренд")
+    c2 = client()
+    r = c2.post("/login", data={"email": "sec3@test.io", "password": "secret123"})
+    check("второе устройство вошло тем же паролем", r.status_code == 303, f"status={r.status_code}")
+    check("оба устройства видят защищённые данные до смены пароля",
+          c1.get("/api/account").status_code == 200 and c2.get("/api/account").status_code == 200)
+
+    c3 = client()
+    register(c3, "sec3-other@test.io", "Другой-бренд")
+    check("сторонний пользователь тоже авторизован", c3.get("/api/account").status_code == 200)
+
+    r = c1.post("/api/account/password", json={
+        "current_password": "secret123", "new_password": "новыйпароль-sec3",
+        "confirm_password": "новыйпароль-sec3",
+    })
+    check("смена пароля с первого устройства — 200", r.status_code == 200, f"status={r.status_code}")
+
+    check("первое устройство (сменившее пароль) осталось авторизовано",
+          c1.get("/api/account").status_code == 200)
+
+    r2 = c2.get("/api/account")
+    check("второе устройство отозвано сразу после смены пароля (401)",
+          r2.status_code == 401, f"status={r2.status_code}")
+
+    r2_page = c2.get("/account", follow_redirects=False)
+    check("второе устройство на HTML-странице получает редирект на вход",
+          r2_page.status_code == 302 and r2_page.headers.get("location") == "/login",
+          f"status={r2_page.status_code} loc={r2_page.headers.get('location')}")
+
+    check("сторонний пользователь не задет чужой сменой пароля",
+          c3.get("/api/account").status_code == 200)
+
+    c_old = client()
+    r = c_old.post("/login", data={"email": "sec3@test.io", "password": "secret123"})
+    check("старый пароль после смены больше не пускает (SEC-3)",
+          r.status_code == 200 and "Неверный" in r.text)
+
+    c_new = client()
+    r = c_new.post("/login", data={"email": "sec3@test.io", "password": "новыйпароль-sec3"},
+                   follow_redirects=False)
+    check("новый пароль пускает", r.status_code == 303, f"status={r.status_code}")
+    check("вход новым паролем даёт рабочую сессию", c_new.get("/api/account").status_code == 200)
+
+    print("== Кука без версии (пред-миграционный формат) и битая версия (SEC-3) ==")
+
+    def cookie_client(payload: dict) -> httpx.Client:
+        raw = auth._serializer().dumps(payload)
+        cl = httpx.Client(headers={"X-Oborot-CSRF": "1"}, base_url=BASE, timeout=30.0)
+        cl.cookies.set(auth.SESSION_COOKIE, raw)
+        return cl
+
+    c_legacy = client()
+    register(c_legacy, "sec3-legacy@test.io", "Легаси-бренд")
+    legacy_uid = sql("SELECT id FROM users WHERE email = ?", "sec3-legacy@test.io")[0][0]
+    legacy_org = org_of("sec3-legacy@test.io")
+
+    legacy_cookie_client = cookie_client({"user_id": legacy_uid, "org_id": legacy_org})
+    check("кука без поля версии (довыпущенный формат) работает при DB version 0",
+          legacy_cookie_client.get("/api/account").status_code == 200)
+
+    r = c_legacy.post("/api/account/password", json={
+        "current_password": "secret123", "new_password": "легаси-новый-пароль",
+        "confirm_password": "легаси-новый-пароль",
+    })
+    check("смена пароля у легаси-пользователя — 200", r.status_code == 200, f"status={r.status_code}")
+
+    check("та же кука без версии отозвана после первого инкремента версии",
+          legacy_cookie_client.get("/api/account").status_code == 401)
+
+    bad_str = cookie_client({"user_id": legacy_uid, "org_id": legacy_org, "v": "1"})
+    check("нечисловая (строковая) версия в куке — fail-closed 401",
+          bad_str.get("/api/account").status_code == 401)
+
+    bad_float = cookie_client({"user_id": legacy_uid, "org_id": legacy_org, "v": 1.0})
+    check("дробная версия в куке — fail-closed 401",
+          bad_float.get("/api/account").status_code == 401)
+
+    bad_bool = cookie_client({"user_id": legacy_uid, "org_id": legacy_org, "v": True})
+    check("булева версия в куке — fail-closed 401",
+          bad_bool.get("/api/account").status_code == 401)
+
+    print("== UI /account больше не обещает 7 дней на других устройствах (SEC-3) ==")
+    acc_html = c_new.get("/account").text
+    check("страница «Аккаунт» не утверждает, что чужой вход держится до 7 дней",
+          "до 7 дней" not in acc_html, "текст с ложным сроком всё ещё в разметке")
+
+    print("== Аддитивная миграция users.session_version (SEC-3) ==")
+    import tempfile
+    from concurrent.futures import ThreadPoolExecutor
+
+    from sqlalchemy import create_engine as _create_engine
+    from sqlalchemy import inspect as _inspect
+    from sqlalchemy import text as _text
+
+    from app import models as _models
+
+    old_db = Path(tempfile.mkdtemp()) / "old_users_schema.db"
+    old_engine = _create_engine(f"sqlite:///{old_db}", future=True,
+                                connect_args={"check_same_thread": False})
+    with old_engine.begin() as conn:
+        conn.execute(_text(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, email VARCHAR(255) NOT NULL, "
+            "pw_hash VARCHAR(255) NOT NULL, name VARCHAR(255) NOT NULL, created_at DATETIME)"))
+        conn.execute(_text(
+            "INSERT INTO users (id, email, pw_hash, name) VALUES (1, 'old@test.io', 'x', 'Старый')"))
+    _models.ensure_schema(bind=old_engine)
+    cols = {c["name"] for c in _inspect(old_engine).get_columns("users")}
+    check("миграция добавила session_version в существующую таблицу users",
+          "session_version" in cols, f"cols={sorted(cols)}")
+    with old_engine.begin() as conn:
+        row = conn.execute(_text(
+            "SELECT email, session_version FROM users WHERE id = 1")).first()
+    check("старый пользователь уцелел, session_version по умолчанию = 0",
+          tuple(row) == ("old@test.io", 0), f"row={tuple(row) if row else None}")
+    _models.ensure_schema(bind=old_engine)  # повторный прогон — идемпотентно
+    with old_engine.begin() as conn:
+        again = conn.execute(_text("SELECT session_version FROM users WHERE id = 1")).scalar()
+    check("повторный прогон миграции не меняет значение", again == 0, f"session_version={again}")
+    old_engine.dispose()
+
+    # Конкурентный старт нескольких воркеров: миграция не должна падать и не
+    # должна добавить колонку дважды.
+    old_db2 = Path(tempfile.mkdtemp()) / "old_users_schema_concurrent.db"
+    old_engine2 = _create_engine(f"sqlite:///{old_db2}", future=True,
+                                 connect_args={"check_same_thread": False})
+    with old_engine2.begin() as conn:
+        conn.execute(_text(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, email VARCHAR(255) NOT NULL, "
+            "pw_hash VARCHAR(255) NOT NULL, name VARCHAR(255) NOT NULL, created_at DATETIME)"))
+    errors = []
+
+    def _run_migration():
+        try:
+            _models.ensure_schema(bind=old_engine2)
+        except Exception as exc:  # noqa: BLE001 — конкурентная гонка не должна ронять воркер
+            errors.append(exc)
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        list(pool.map(lambda _: _run_migration(), range(6)))
+    check("конкурентный запуск миграции на нескольких воркерах не падает",
+          not errors, f"errors={errors}")
+    cols2 = [c["name"] for c in _inspect(old_engine2).get_columns("users")]
+    check("конкурентная миграция добавила колонку ровно один раз (без дублей)",
+          cols2.count("session_version") == 1, f"cols={cols2}")
+    old_engine2.dispose()
+
     print("== Удаление: участник организации ==")
     owner = client()
     register(owner, "boss@test.io", "Ателье Шов")

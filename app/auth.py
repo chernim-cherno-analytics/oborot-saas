@@ -380,15 +380,23 @@ def _serializer() -> URLSafeTimedSerializer:
     return URLSafeTimedSerializer(get_signing_secret(), salt="oborot-session")
 
 
-def set_session(response, user_id: int, org_id: int, samesite: str = "lax") -> None:
+def set_session(response, user_id: int, org_id: int, session_version: int, samesite: str = "lax") -> None:
     """Ставит подписанную сессионную куку на ответ.
+
+    session_version — версия сессии пользователя НА МОМЕНТ ВЫДАЧИ (SEC-3),
+    обязательный параметр без дефолта: молчаливый дефолт здесь — источник
+    самого дефекта, который эта версия закрывает (перевыпуск куки со старой
+    версией после смены пароля отозвал бы собственную свежую сессию).
+    Все call site'ы обязаны передавать актуальное `user.session_version`.
+    resolve_auth сравнивает её с текущей записью пользователя и отзывает
+    куку, чья версия отстала (смена пароля увеличивает её на 1).
 
     samesite: обычный вход — "lax" (дефолт). Вход из iframe МойСклад
     (routes_ms_app) на проде передаёт "none": третьесторонняя кука во фрейме
     требует SameSite=None + Secure. В dev (http) None+Secure браузер отбросил
     бы — остаётся "lax" (iframe-вход в dev работает только same-site).
     """
-    value = _serializer().dumps({"user_id": user_id, "org_id": org_id})
+    value = _serializer().dumps({"user_id": user_id, "org_id": org_id, "v": session_version})
     response.set_cookie(
         SESSION_COOKIE,
         value,
@@ -548,6 +556,16 @@ def resolve_auth(request: Request, db: Session) -> AuthContext | None:
         return None
     user = db.get(User, sess.get("user_id"))
     if not user:
+        return None
+    # SEC-3: гашение сессий после смены пароля. Кука без поля версии — это
+    # довыпущенный формат (до этой правки): трактуем как версию 0, чтобы сам
+    # деплой миграции никого не разлогинил (у старых строк users тоже 0 — см.
+    # models._ensure_users_session_version). Любое НЕЦЕЛОЕ значение
+    # (строка, дробь, bool — bool в Python является подклассом int, поэтому
+    # исключён явно через type()) — fail-closed отказ, а не «как ноль»: это
+    # не легитимный формат ни старой, ни новой куки.
+    cookie_version = sess.get("v", 0)
+    if type(cookie_version) is not int or cookie_version != user.session_version:
         return None
     org_id = sess.get("org_id")
     member = db.get(Membership, (user.id, org_id)) if org_id else None

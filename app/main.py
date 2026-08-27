@@ -560,7 +560,7 @@ def login_submit(
     if member is None:
         return _render_auth(request, "login.html", email=email_norm, error="У пользователя нет организации")
     response = RedirectResponse("/", status_code=303)
-    auth.set_session(response, user.id, member.org_id)
+    auth.set_session(response, user.id, member.org_id, user.session_version)
     return response
 
 
@@ -608,7 +608,7 @@ def register_submit(
     db.commit()
 
     response = RedirectResponse("/", status_code=303)
-    auth.set_session(response, user.id, org.id)
+    auth.set_session(response, user.id, org.id, user.session_version)
     return response
 
 
@@ -735,14 +735,19 @@ def api_change_password(
         )
     user = db.merge(ctx.user)
     user.pw_hash = auth.hash_password(body.new_password)
+    # SEC-3: версия сессии растёт одной транзакцией с хешем пароля — куки,
+    # выпущенные до этого момента (в том числе на других устройствах), несут
+    # старую версию и перестанут проходить auth.resolve_auth со следующего
+    # запроса.
+    user.session_version = (user.session_version or 0) + 1
     db.commit()
     # Текущую сессию НЕ обрываем: человек только что доказал знание пароля,
     # выкидывать его на форму входа посреди работы незачем. Куку переставляем
-    # заново (свежий срок жизни). Честная оговорка для интерфейса: сессии на
-    # других устройствах живут по подписанной куке и протухнут сами (до 7
-    # дней) — принудительно погасить их текущая схема сессий не умеет.
+    # заново — с новой версией, иначе собственная свежая сессия отозвала бы
+    # сама себя следующим запросом. Сессии на других устройствах отзываются
+    # немедленно (см. auth.resolve_auth), а не «протухают сами до 7 дней».
     response = JSONResponse({"ok": True, "note": "Пароль изменён"})
-    auth.set_session(response, user.id, ctx.org.id)
+    auth.set_session(response, user.id, ctx.org.id, user.session_version)
     return response
 
 

@@ -147,6 +147,11 @@ class User(Base):
     # SaaS-пользователей. Уникальность гарантируется в новых БД; в старых
     # колонка добавляется ALTER'ом без constraint (SQLite), код ищет по равенству.
     ms_uid: Mapped[str | None] = mapped_column(String(255), nullable=True, unique=True)
+    # SEC-3: монотонная версия сессии. Растёт на 1 при каждой смене пароля;
+    # подписанная сессионная кука несёт версию на момент выдачи, и
+    # auth.resolve_auth отзывает куку, чья версия отстала (см. auth.py).
+    # Аддитивно для старых БД — миграция ensure_schema ниже.
+    session_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
 
 
 class Org(Base):
@@ -896,14 +901,18 @@ _PRODUCTION_COLUMNS = (
 )
 _PRODUCTION_MIGRATION_FLAG = "productions_conditions_v1"
 
+# SEC-3: колонка версии сессии у старых баз, где её ещё нет.
+_USERS_SESSION_VERSION_MIGRATION_FLAG = "users_session_version_v1"
+
 
 def ensure_schema(bind=None) -> None:
-    """Добавляет в productions срок производства, минимальную партию и кратность.
+    """Прогоняет все аддитивные ALTER-миграции моделей этого файла.
 
     Base.metadata.create_all не меняет существующие таблицы, поэтому у старых
-    баз (в том числе боевого Postgres) колонок нет — добавляем ALTER'ом.
-    Свежая БД: таблицы ещё нет, выходим без действий — колонки создаст init_db
-    из модели. Флаг в migration_flags гарантирует один запуск.
+    баз (в том числе боевого Postgres) новых колонок нет — добавляем ALTER'ом.
+    Каждая под-миграция сама проверяет, нужна ли она (таблица/колонка уже
+    есть — молча выходит), и защищена своим флагом в migration_flags через
+    run_migration_once, поэтому порядок и повторный вызов роли не играют.
 
     Ревью 22.08 (Н1): вызывается из db.init_db() на старте приложения, а не на
     импорте модуля, и переживает одновременный старт нескольких воркеров —
@@ -913,6 +922,12 @@ def ensure_schema(bind=None) -> None:
     отдельной базе со «старой» схемой); по умолчанию — engine приложения.
     """
     eng = bind or engine
+    _ensure_productions_conditions(eng)
+    _ensure_users_session_version(eng)
+
+
+def _ensure_productions_conditions(eng) -> None:
+    """Добавляет в productions срок производства, минимальную партию и кратность."""
     insp = inspect(eng)
     if not insp.has_table("productions"):
         return
@@ -926,3 +941,27 @@ def ensure_schema(bind=None) -> None:
             conn.execute(text(f"ALTER TABLE productions ADD COLUMN {name} {ddl}"))
 
     run_migration_once(_PRODUCTION_MIGRATION_FLAG, _add_columns, bind=eng)
+
+
+def _ensure_users_session_version(eng) -> None:
+    """SEC-3: добавляет users.session_version (NOT NULL DEFAULT 0) у старых баз.
+
+    Свежая БД получает колонку прямо из модели (create_all); здесь — только
+    старые базы, где её ещё нет. Значение по умолчанию 0 у существующих строк
+    совпадает с версией, которую несёт довыпущенная кука без поля версии
+    (auth.resolve_auth трактует отсутствие поля как 0) — сам факт выката этой
+    миграции никого не разлогинивает.
+    """
+    insp = inspect(eng)
+    if not insp.has_table("users"):
+        return
+    cols = {c["name"] for c in insp.get_columns("users")}
+    if "session_version" in cols:
+        return
+
+    def _add_column(conn) -> None:
+        conn.execute(text(
+            "ALTER TABLE users ADD COLUMN session_version INTEGER NOT NULL DEFAULT 0"
+        ))
+
+    run_migration_once(_USERS_SESSION_VERSION_MIGRATION_FLAG, _add_column, bind=eng)
