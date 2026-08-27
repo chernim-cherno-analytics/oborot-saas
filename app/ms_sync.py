@@ -647,8 +647,19 @@ def _commit_skip_ids(stats: dict) -> None:
     транзакцией) и после каждого закоммиченного чанка истории. Упавший
     посреди чанк просто не доходит до своего вызова — его находки не
     коммитятся и корректно пересчитаются при следующем resume того же чанка.
+
+    DATA-8 corrective #6 (P2 discussion_r3872698356): transient-буфер
+    (`_SKIP_DOC_IDS_KEY`) ЗАБИРАЕТСЯ (`stats.pop`, а не `stats.get`) — на
+    КАЖДОМ пути, включая no-new-ids. `committed_ids` — единственный
+    durable dedup-набор логической пересборки; `_collect_sales` только
+    ДОПИСЫВАЕТ в transient-буфер (`setdefault(...).append(...)`) и никогда
+    его не читает и не чистит сам, поэтому без явного `pop` здесь буфер
+    рос бы БЕЗ ГРАНИЦ на каждом дальнейшем чанке одной пересборки — и
+    каждый `_persist` сериализовал бы обе (растущие) копии в `stats_json`,
+    который читает и owner-only `/api/sync/status`, пока Настройки его
+    поллят.
     """
-    found = stats.get(_SKIP_DOC_IDS_KEY) or []
+    found = stats.pop(_SKIP_DOC_IDS_KEY, None) or []
     if not found:
         return
     committed_ids = set(stats.get(_SKIP_COMMITTED_IDS_KEY) or [])

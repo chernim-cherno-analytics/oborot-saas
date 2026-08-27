@@ -74,13 +74,26 @@ Corrective #5 (P2, discussion_r3872223834) уточняет: «raw текуще�
 ПОСЛЕ того, как `_collect_sales` увеличил raw для чанка, но ДО того, как
 для этого чанка продвинулась `history_loaded_from`, — следующий resume
 перечитает ТОТ ЖЕ чанк заново (пример независимого ревью: checkpoint 8 +
-partial 3 + retried 3 = 14 вместо 11). `_run_initial` теперь считает
-`sales_docs_skipped_store_committed` построчно — только то, что РЕАЛЬНО
-закоммитилось (чанк истории сразу после продвижения его собственной
-`history_loaded_from`; фаза today на резюме — только если `history_
-loaded_to` действительно продвинулась, то есть разрыв был настоящим), и
-именно этот counted-committed вклад, а не голый raw, участвует в
-`_rebuild_total` (`_skip_segment_contribution`).
+partial 3 + retried 3 = 14 вместо 11). Первая попытка (границы дат/
+`history_loaded_to`) провалила собственный regression на генуинно новом
+документе той же даты — решение: `_collect_sales` пишет id каждого
+пропущенного документа в `sales_docs_skipped_store_ids`, а `_commit_
+skip_ids` (вызывается из `_run_initial` в тех точках, где найденное больше
+НЕ перечитается в рамках этого прогона) дедуплицирует по id против
+`sales_docs_skipped_store_committed_ids` (переносится между прогонами) —
+именно этот committed-вклад, а не голый raw, участвует в `_rebuild_total`
+(`_skip_segment_contribution`).
+
+Corrective #6 (P2, discussion_r3872698356) чинит утечку самого механизма:
+`_commit_skip_ids` переносил id из transient-буфера в committed-набор, но
+НИКОГДА не очищал сам transient-буфер (`sales_docs_skipped_store_ids`) —
+ни когда были новые id, ни (тем более) на no-new-ids пути. Раз `_collect_
+sales` только дописывает в него (`setdefault(...).append(...)`), он рос
+БЕЗ ГРАНИЦ на каждом дальнейшем чанке одной пересборки: каждый `_persist`
+сериализовал обе копии (transient и committed) в `stats_json`, который
+читает и owner-only `/api/sync/status`, пока Настройки его поллят. Теперь
+`_commit_skip_ids` ЗАБИРАЕТ transient-буфер (`stats.pop`, не `stats.get`)
+и не возвращает его — на КАЖДОМ пути, включая no-new-ids.
 
 Запуск из корня репозитория:  python tests/test_sync_diag_store.py
 """
@@ -898,6 +911,10 @@ def run_part2_committed_boundary() -> None:
           f"state={st1.get('state')}")
     check("раунд 1: СВОЙ raw == 8", (st1.get("stats") or {}).get(
         "sales_docs_skipped_store") == 8, f"stats={st1.get('stats')}")
+    check("раунд 1: transient id-буфер (corrective #6) НЕ протекает в "
+          "status/persist после коммита month-фазы",
+          "sales_docs_skipped_store_ids" not in (st1.get("stats") or {}),
+          f"stats={st1.get('stats')}")
 
     print("\n== [часть 2, committed-boundary] Раунд 2 (resume): чанк истории "
           "находит 3 пропуска (retaildemand), затем падает на дочитке "
@@ -949,6 +966,9 @@ def run_part2_committed_boundary() -> None:
     checkpoint3 = (st3.get("stats") or {}).get("sales_docs_skipped_store_rebuild_checkpoint")
     check("checkpoint снят после успешного завершения",
           checkpoint3 is None, f"checkpoint={checkpoint3}")
+    check("раунд 3: transient id-буфер тоже снят после успешного завершения",
+          "sales_docs_skipped_store_ids" not in (st3.get("stats") or {}),
+          f"stats={st3.get('stats')}")
 
     mock_api.post("/__test/reset_skip_store_docs")
     c.close()
@@ -1147,6 +1167,63 @@ def run_part3_unit_lifecycle() -> None:
               {"sales_docs_skipped_store": 7,
                "sales_docs_skipped_store_committed": 3,
                "sales_docs_skipped_store_rebuild_checkpoint": 8}) == 11)
+
+    print("\n== [часть 3] _commit_skip_ids: transient-буфер очищается "
+          "(corrective #6, P2 discussion_r3872698356) ==")
+
+    s = {"sales_docs_skipped_store_ids": ["a:1", "a:2"]}
+    _mss._commit_skip_ids(s)
+    check("после коммита с НОВЫМИ id transient-буфер удалён из stats",
+          "sales_docs_skipped_store_ids" not in s, f"stats={s}")
+    check("committed == 2 (оба id новые)",
+          s.get("sales_docs_skipped_store_committed") == 2, f"stats={s}")
+
+    s2 = {"sales_docs_skipped_store_ids": ["a:1", "a:2"],
+          "sales_docs_skipped_store_committed_ids": ["a:1", "a:2"]}
+    _mss._commit_skip_ids(s2)
+    check("no-new-ids путь: transient-буфер ВСЁ РАВНО удалён (не только "
+          "когда были новые id)",
+          "sales_docs_skipped_store_ids" not in s2, f"stats={s2}")
+    check("no-new-ids путь: committed не появился (новых не было)",
+          "sales_docs_skipped_store_committed" not in s2, f"stats={s2}")
+    check("no-new-ids путь: committed_ids не изменился",
+          s2.get("sales_docs_skipped_store_committed_ids") == ["a:1", "a:2"],
+          f"stats={s2}")
+
+    s3 = {}
+    _mss._commit_skip_ids(s3)
+    check("буфер отсутствует вовсе (ничего не находили) -> no-op, ничего "
+          "не создаётся",
+          "sales_docs_skipped_store_ids" not in s3
+          and "sales_docs_skipped_store_committed" not in s3, f"stats={s3}")
+
+    print("\n== [часть 3] _commit_skip_ids: серия коммитов — новые id "
+          "засчитываются РОВНО один раз, дубликаты не задваиваются ==")
+
+    s4 = {}
+    s4["sales_docs_skipped_store_ids"] = ["x:1"]
+    _mss._commit_skip_ids(s4)
+    check("коммит 1 (новый x:1): committed == 1",
+          s4.get("sales_docs_skipped_store_committed") == 1, f"stats={s4}")
+    check("коммит 1: transient-буфер очищен",
+          "sales_docs_skipped_store_ids" not in s4, f"stats={s4}")
+
+    s4["sales_docs_skipped_store_ids"] = ["x:1"]  # тот же id — имитация повторного скана
+    _mss._commit_skip_ids(s4)
+    check("коммит 2 (повтор x:1): committed НЕ увеличился (остался 1)",
+          s4.get("sales_docs_skipped_store_committed") == 1, f"stats={s4}")
+    check("коммит 2: transient-буфер очищен (no-new-ids путь)",
+          "sales_docs_skipped_store_ids" not in s4, f"stats={s4}")
+
+    s4["sales_docs_skipped_store_ids"] = ["x:2"]  # генуинно новый id
+    _mss._commit_skip_ids(s4)
+    check("коммит 3 (новый x:2): committed увеличился до 2",
+          s4.get("sales_docs_skipped_store_committed") == 2, f"stats={s4}")
+    check("коммит 3: transient-буфер очищен",
+          "sales_docs_skipped_store_ids" not in s4, f"stats={s4}")
+    check("committed_ids содержит оба id (x:1, x:2), не растёт бесконечно",
+          set(s4.get("sales_docs_skipped_store_committed_ids") or []) == {"x:1", "x:2"},
+          f"stats={s4}")
 
 
 def run() -> int:
