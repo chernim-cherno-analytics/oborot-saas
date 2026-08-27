@@ -31,12 +31,6 @@ from app.models import (
 
 router = APIRouter(prefix="/api")
 
-# Аддитивная мини-миграция «Обучения»: у баз, созданных до фичи, нет таблиц
-# user_lessons и user_prefs. Создаём их на импорте модуля, не дожидаясь
-# init_db на старте (паттерн — app/routes_connect.py): create_all с
-# checkfirst идемпотентен, свежую БД это не трогает.
-lessons.ensure_schema()
-
 # Границы для числовых id в пути: без них слишком большое число (например,
 # /api/orders/999999999999999999999) валит SQLite (OverflowError при попытке
 # положить его в INTEGER-колонку) вместо аккуратного 422.

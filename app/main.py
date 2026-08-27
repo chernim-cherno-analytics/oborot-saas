@@ -201,6 +201,11 @@ def _startup() -> None:
     auth.check_proxy_config()
     _check_single_process()
     init_db()
+    # OPS-6: последняя migration-on-import. Раньше вызывалась на импорте
+    # app/api.py — до старта приложения и вне защиты от гонки нескольких
+    # воркеров, тем же классом дефекта, что и ms_writeback/ms_vendor ниже.
+    from app import lessons as _lessons
+    _lessons.ensure_schema()
     from app import exclusions as _exclusions
     _exclusions.ensure_schema()
     # Аудит 18.08: убитый процессом синк оставался state='running' навсегда
