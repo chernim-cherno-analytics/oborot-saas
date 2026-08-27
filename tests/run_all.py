@@ -101,6 +101,7 @@ SUITES = [
     ("wb_idem",     "test_writeback_idempotency.py", True, False),
     ("wb_race",     "test_writeback_race.py",  True,  False),
     ("ms_client",   "test_ms_client.py",       False, False),
+    ("sync_env",    "test_sync_env_parsing.py", False, False),
     ("ops",         "test_ops.py",             False, False),
     ("startup",     "test_startup_lifecycle.py", False, False),
     ("logging",     "test_logging.py",         False, False),

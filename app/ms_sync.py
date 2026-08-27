@@ -93,7 +93,7 @@ from app.ms_client import TRANSPORT_ERRORS, MoySkladClient, _env_int
 # год «Полной пересборкой» — автоматической дозагрузки назад у done-аккаунтов
 # нет (точка продолжения снимается при финализации); до пересборки страницы
 # честно подписывают фактическое окно («за N дн.»).
-HISTORY_DAYS = int(os.environ.get("HISTORY_DAYS", "730"))
+HISTORY_DAYS = _env_int("HISTORY_DAYS", 730, minimum=1)
 # «Едет к нам» НЕ следует за окном истории (ревью PR #12): заказ поставщику
 # старше года — брошенный документ, а не товар в пути (shipped в проде не
 # заполняется, D-26). Двухлетний cutoff молча показывал бы такие заказы как
@@ -103,7 +103,7 @@ HISTORY_DAYS = int(os.environ.get("HISTORY_DAYS", "730"))
 INCOMING_ORDERS_DAYS = int(
     os.environ.get("INCOMING_ORDERS_DAYS", str(min(365, HISTORY_DAYS)))
 )
-SALES_RESYNC_DAYS = int(os.environ.get("SYNC_DAYS_BACK", "3"))
+SALES_RESYNC_DAYS = _env_int("SYNC_DAYS_BACK", 3, minimum=1)
 # Деплой П1: окно «быстрого старта» — столько последних дат загружается до
 # finalize-lite (пользователь получает рабочие страницы), остальное — фоном.
 INITIAL_WINDOW_DAYS = _env_int("INITIAL_WINDOW_DAYS", 30, minimum=1)
