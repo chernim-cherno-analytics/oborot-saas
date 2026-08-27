@@ -26,7 +26,10 @@ HTML» такое не ловит — ловит только запуск ст�
      правку количества выше потребности;
   7) сумма заказа на «Что заказать» не выдаёт позиции без себестоимости
      за бесплатные;
-  8) на страницах нет ошибок в консоли.
+  8) DATA-8 (третий сценарий): на «Настройках» владелец видит положительный
+     счётчик документов продаж, пропущенных из-за нераспознанного/невыбранного
+     склада, понятным текстом; при нуле тревожного сообщения нет;
+  9) на страницах нет ошибок в консоли.
 
 Запуск из корня репозитория:  python tests/test_ui.py
 
@@ -444,6 +447,65 @@ def run() -> int:  # noqa: C901 — сценарный тест: шагов мн
               hint_90 != hint_year, f"{hint_year[:60]} -> {hint_90[:60]}")
         post_settings(c, {"rate_window": "year"},
                       "возврат окна темпа к дефолту после сценария")
+
+        print("\n== «Настройки»: диагностика пропущенных документов продаж (DATA-8) ==")
+        # /api/settings подмешивается (fetch реального ответа + подмена только
+        # connection/role), а не заменяется целиком: страница читает из него
+        # много несвязанных настроек, ломать их не нужно и незачем — нас
+        # интересует ровно ветка owner+moysklad, которая рисует кнопки синка
+        # и рядом с ними диагностику.
+        def _mock_settings_moysklad(route):
+            resp = route.fetch()
+            data = resp.json()
+            data["connection"] = {"kind": "moysklad", "status": "active", "last_sync_at": None}
+            data["role"] = "owner"
+            route.fulfill(response=resp, json=data)
+
+        def _sync_status_with(diag_value):
+            def handler(route):
+                route.fulfill(json={
+                    "state": "done", "mode": "incremental", "phase": "",
+                    "progress_pct": 100, "detail": "", "error": "",
+                    "started_at": None, "finished_at": None,
+                    "diagnostics": {"sales_docs_skipped_store": diag_value},
+                })
+            return handler
+
+        def diag_hint_visible():
+            # evaluate, а не locator/text_content: элемент до правки НЕ существует
+            # вовсе, а не просто скрыт — text_content на отсутствующем селекторе
+            # ждёт полный таймаут вместо честного FAIL здесь и сейчас.
+            return page.evaluate(
+                "() => { var b = document.getElementById('sync-diag-hint'); "
+                "return b ? getComputedStyle(b).display !== 'none' : null; }")
+
+        def diag_hint_text():
+            return page.evaluate(
+                "() => { var b = document.getElementById('sync-diag-hint'); "
+                "return b ? b.textContent : null; }") or ""
+
+        page.route("**/api/settings", _mock_settings_moysklad)
+        page.route("**/api/sync/status", _sync_status_with(12))
+        page.goto(f"{base}/settings")
+        page.wait_for_timeout(1500)
+        check("владельцу с МС-подключением видна кнопка «Синхронизировать сейчас»",
+              page.locator("#btn-sync-now").count() > 0)
+        diag_text = diag_hint_text()
+        check("положительный точный счётчик (12) показан понятным текстом",
+              diag_hint_visible() is True and "12" in diag_text,
+              f"visible={diag_hint_visible()} text={diag_text[:160]}")
+        check("текст называет причину человеческим языком (склад)",
+              "склад" in diag_text.lower(), diag_text[:160])
+
+        page.unroute("**/api/sync/status")
+        page.route("**/api/sync/status", _sync_status_with(0))
+        page.reload()
+        page.wait_for_timeout(1500)
+        check("при нуле тревожного сообщения нет",
+              diag_hint_visible() is False, f"visible={diag_hint_visible()}")
+
+        page.unroute("**/api/sync/status")
+        page.unroute("**/api/settings")
 
         check("ни одной ошибки в консоли за весь проход", not errors, str(errors[:2]))
         browser.close()

@@ -565,11 +565,33 @@ def _eta_sec(state: str, stats: dict) -> int | None:
     return int(round(secs / done * (total - done)))
 
 
+def _bounded_diagnostic_count(value: object) -> int | None:
+    """Fail-closed валидация owner-only диагностического счётчика (DATA-8).
+
+    Контракт узкий: только точный неотрицательный `int` из `stats` проходит
+    как есть. Отсутствие поля, `bool` (в Python подтип `int`, поэтому
+    проверяется отдельно ДО `isinstance(..., int)`), отрицательное число,
+    строка, float или что-то ещё — `None`, а не 0: подмена malformed-значения
+    нулём выглядела бы как «всё хорошо», хотя на самом деле «не проверяли».
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int) and value >= 0:
+        return value
+    return None
+
+
 def get_status(org_id: int) -> dict:
     """GET /api/sync/status: текущее состояние синхронизации организации.
 
     Деплой П1: плюс phase, coverage_days, history_loaded_from, months[],
     stages[], eta_sec — из них же собирается публичный /api/sync/progress.
+
+    DATA-8 (третий сценарий): плюс `diagnostics` — узкий именованный
+    owner-only контракт поверх уже существующего `stats.sales_docs_skipped_store`
+    (документы продаж, чей склад не распознан или не входит в выбранные).
+    Не влияет на отбор продаж и не публикуется в /api/sync/progress —
+    см. `_bounded_diagnostic_count` и `get_progress`.
     """
     db = SessionLocal()
     try:
@@ -586,7 +608,8 @@ def get_status(org_id: int) -> dict:
                 "fail_streak": 0, "alerted_streak": 0,
                 "phase": "", "coverage_days": _coverage_days(org_id),
                 "history_loaded_from": None,
-                "months": months_progress(None, False), "stages": [], "eta_sec": None}
+                "months": months_progress(None, False), "stages": [], "eta_sec": None,
+                "diagnostics": {"sales_docs_skipped_store": None}}
     stats = row.stats
     coverage = _coverage_days(org_id)
     hlf = stats.get("history_loaded_from")
@@ -616,6 +639,11 @@ def get_status(org_id: int) -> dict:
         "months": months_progress(loaded_from, row.state == "running"),
         "stages": _stages_out(row.state, stats) if row.mode == "initial" else [],
         "eta_sec": _eta_sec(row.state, stats),
+        "diagnostics": {
+            "sales_docs_skipped_store": _bounded_diagnostic_count(
+                stats.get("sales_docs_skipped_store")
+            ),
+        },
     }
 
 

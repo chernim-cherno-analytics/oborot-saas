@@ -876,7 +876,9 @@ document.addEventListener("DOMContentLoaded", function () {
       html += '<div style="display:flex; align-items:center; gap:10px; margin-top:16px; flex-wrap:wrap;">' +
         '<button class="btn" type="button" id="btn-sync-now">Синхронизировать сейчас</button>' +
         '<button class="btn" type="button" id="btn-sync-rebuild" style="font-size:12px;">Полная пересборка истории</button>' +
-        '<span class="hint" id="sync-status-line" style="margin:0;"></span></div>';
+        '<span class="hint" id="sync-status-line" style="margin:0;"></span></div>' +
+        '<div id="sync-diag-hint" style="display:none; margin-top:10px; padding:10px 14px; ' +
+        'border:1px solid var(--yellow,#eab308); border-radius:8px; font-size:13px;"></div>';
     }
     box.innerHTML = html;
 
@@ -911,10 +913,31 @@ document.addEventListener("DOMContentLoaded", function () {
       }
     }
 
+    function showSyncDiagnostics(st) {
+      // DATA-8: owner-only факт из st.diagnostics.sales_docs_skipped_store —
+      // документы продаж, чей склад не распознан или не входит в выбранные.
+      // Только точный положительный int считается тревогой; ноль,
+      // отсутствие поля или некорректное значение (fail-closed на сервере,
+      // см. app/ms_sync.py:_bounded_diagnostic_count) — тишина, а не «0 из 0».
+      var box = document.getElementById("sync-diag-hint");
+      if (!box) return;
+      var n = st && st.diagnostics && st.diagnostics.sales_docs_skipped_store;
+      if (typeof n === "number" && n > 0) {
+        box.style.display = "";
+        box.textContent = "Пропущено документов продаж: " + n +
+          ". Склад документа не распознан или не входит в выбранные склады — " +
+          "такие документы не учитываются в продажах и оборачиваемости.";
+      } else {
+        box.style.display = "none";
+        box.textContent = "";
+      }
+    }
+
     function pollSyncStatus() {
       if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
       api("/api/sync/status").then(function (st) {
         showSyncStatus(st);
+        showSyncDiagnostics(st);
         if (st && st.state === "running") pollTimer = setTimeout(pollSyncStatus, 2000);
         else if (st && st.state === "done") toast("Синхронизация завершена", "success");
       }).catch(function () { /* статус недоступен — не шумим */ });
@@ -934,8 +957,11 @@ document.addEventListener("DOMContentLoaded", function () {
 
     if (syncBtn) {
       // Текущее состояние при загрузке: если синк уже идёт — сразу показываем прогресс.
+      // Диагностика (showSyncDiagnostics) — независимо от state: факт последнего
+      // прогона, а не только идущего.
       api("/api/sync/status").then(function (st) {
         if (st && (st.state === "running" || st.state === "error")) { showSyncStatus(st); }
+        showSyncDiagnostics(st);
         if (st && st.state === "running") pollTimer = setTimeout(pollSyncStatus, 2000);
       }).catch(function () {});
 
