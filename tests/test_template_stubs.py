@@ -13,20 +13,37 @@ AGENTS.md §3, только на уровне вёрстки. Теперь `_stu
   1) путь поиска обоих Jinja2Templates — ровно templates/, без второй
      директории;
   2) `_stub_templates/` не существует на диске и не числится в `git ls-files`;
-  3) временно спрятанный настоящий шаблон даёт TemplateNotFound у обоих
-     loader'ов (fail-fast), а не успешный рендер чем-то другим;
+  3) missing-real-template => TemplateNotFound и отсутствие stub-фолбэка — на
+     ИЗОЛИРОВАННОМ temp-дереве (MAINT-4 corrective #1, discussion_r3874885288):
+     первая версия этой проверки временно перемещала настоящие tracked-файлы
+     прямо в templates/ — общем каталоге, которым при параллельном
+     `tests/run_all.py` пользуются другие наборы (`planner` рендерит
+     /settings, `lessons` читает templates/settings.html напрямую).
+     Совпадение по времени с чужим рендером ловило постороннюю
+     `TemplateNotFound`/`FileNotFoundError`, а аварийное завершение процесса
+     между `shutil.move` и `finally` могло оставить чекаут повреждённым.
+     Теперь сценарий воспроизводится целиком в приватном
+     `tempfile.TemporaryDirectory()` — ни один tracked-файл в templates/ не
+     трогается вообще, и это проверяется отдельно (пункт 3а);
+  3а) хеш содержимого templates/ до и после проверки (3) совпадает —
+      включая путь с ИНЪЕКТИРОВАННЫМ сбоем после TemplateNotFound внутри
+      изолированного блока, эквивалентным аварийному завершению: даже он не
+      меняет ни одного байта в общем каталоге, потому что блок физически не
+      обращается к templates/;
   4) все текущие *.html из templates/ по-прежнему грузятся обоими loader'ами
-     (ничего не сломано изъятием второй директории);
+     (ничего не сломано изъятием второй директории) — только чтение, без
+     перемещений;
   5) живые публичные роуты, использующие оба loader'а (/login — app.main,
      /legal/offer и /legal/privacy — app.routes_extra), отвечают 200 и не
      превращаются в 500 из-за конфигурации шаблонов.
 
 Запуск из корня репозитория: python tests/test_template_stubs.py
 """
+import hashlib
 import os
-import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -39,6 +56,7 @@ if DB_PATH.exists():
     DB_PATH.unlink()
 
 import jinja2  # noqa: E402
+from fastapi.templating import Jinja2Templates  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 import app.main as main_mod  # noqa: E402
@@ -89,24 +107,70 @@ def check_stub_dir_gone() -> None:
     check("_stub_templates/ не числится в git ls-files", tracked == "", f"tracked={tracked!r}")
 
 
-def _hide_and_check_not_found(label: str, templates_obj, name: str) -> None:
-    real = TEMPLATES_DIR / name
-    backup = TEMPLATES_DIR / f"{name}.maint4-redproof-bak"
-    shutil.move(str(real), str(backup))
-    try:
-        try:
-            templates_obj.env.loader.get_source(templates_obj.env, name)
-            check(f"{label}: спрятанный {name} — TemplateNotFound", False,
-                  "loader нашёл шаблон, хотя настоящий файл спрятан")
-        except jinja2.TemplateNotFound:
-            check(f"{label}: спрятанный {name} — TemplateNotFound", True)
-    finally:
-        shutil.move(str(backup), str(real))
+def _hash_production_templates() -> dict:
+    """Снимок содержимого templates/ — байт-в-байт, для доказательства
+    «не тронуто», а не только «не сдвинулось по времени модификации»."""
+    return {
+        p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+        for p in sorted(TEMPLATES_DIR.glob("*.html"))
+    }
 
 
 def check_missing_real_template_fails_fast() -> None:
-    _hide_and_check_not_found("app.main.templates", main_mod.templates, "dashboard.html")
-    _hide_and_check_not_found("app.routes_extra._templates", routes_extra_mod._templates, "settings.html")
+    """Изолированная замена MAINT-4 corrective #1 (discussion_r3874885288):
+    воспроизводит именно ту конфигурацию, что и production (Jinja2Templates
+    на единственную директорию, без stub-соседа в пути поиска), но целиком
+    внутри приватного tempfile.TemporaryDirectory — ни одного tracked-файла
+    из templates/ не читаем на запись и не перемещаем."""
+    before = _hash_production_templates()
+
+    with tempfile.TemporaryDirectory(prefix="maint4-iso-") as tmp_str:
+        tmp = Path(tmp_str)
+        iso_templates = tmp / "templates"
+        iso_stub = tmp / "_stub_templates"
+        iso_templates.mkdir()
+        iso_stub.mkdir()
+        (iso_templates / "known.html").write_text("REAL-ISOLATED-CONTENT", encoding="utf-8")
+        # Одноимённый файл-«заглушка» лежит РЯДОМ, вне пути поиска loader'а —
+        # если бы конфигурация случайно вернула второй каталог в searchpath,
+        # эта проверка поймала бы фолбэк по содержимому, а не по факту падения.
+        (iso_stub / "known.html").write_text("STUB-ISOLATED-CONTENT", encoding="utf-8")
+
+        iso_env = Jinja2Templates(directory=str(iso_templates))
+        search_path = [str(Path(p).resolve()) for p in iso_env.env.loader.searchpath]
+        check("изолированный loader: путь поиска — ровно iso templates/, без stub-соседа",
+              search_path == [str(iso_templates.resolve())], f"searchpath={search_path}")
+
+        src, _, _ = iso_env.env.loader.get_source(iso_env.env, "known.html")
+        check("изолированный loader грузит REAL-содержимое, не STUB-соседа",
+              src == "REAL-ISOLATED-CONTENT", f"src={src!r}")
+
+        (iso_templates / "known.html").unlink()  # синтетический файл, не tracked, не общий
+        raised_not_found = False
+        injected_failure_observed = False
+        try:
+            try:
+                iso_env.env.loader.get_source(iso_env.env, "known.html")
+                check("изолированный missing template => TemplateNotFound", False,
+                      "loader нашёл шаблон, хотя изолированный файл удалён")
+            except jinja2.TemplateNotFound:
+                raised_not_found = True
+                # Эмулируем аварийное завершение ПОСЛЕ TemplateNotFound, но
+                # ДО штатного выхода из блока — ровно тот путь, который
+                # discussion_r3874885288 называет риском для общего каталога.
+                # Здесь он безопасен по конструкции: единственный тронутый
+                # каталог — tmp, который tempfile уберёт сам.
+                raise RuntimeError("MAINT4-INJECTED-TERMINATION-EQUIVALENT")
+        except RuntimeError as exc:
+            injected_failure_observed = "MAINT4-INJECTED-TERMINATION-EQUIVALENT" in str(exc)
+        check("изолированный missing template => TemplateNotFound (fail-fast, без stub-фолбэка)",
+              raised_not_found)
+        check("инъектированный сбой сразу после TemplateNotFound воспроизведён (терминация-эквивалент)",
+              injected_failure_observed)
+
+    after = _hash_production_templates()
+    check("templates/ (production) не изменились даже при инъектированном сбое в изолированном блоке",
+          before == after, "OK" if before == after else "hash mismatch — production templates затронуты")
 
 
 def check_all_real_templates_still_load() -> None:
