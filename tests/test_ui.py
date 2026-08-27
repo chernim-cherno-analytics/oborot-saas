@@ -72,6 +72,54 @@ def check(name: str, cond: bool, detail: str = ""):
         print(f"  FAIL {name}  {detail}")
 
 
+SETTINGS_BODY_LIMIT = 300
+
+
+def _require_2xx(status_code: int, body_text: str, context: str) -> None:
+    """Fail-closed guard для ответов POST /api/settings.
+
+    Ниже по сценарию UI-проверки читают состояние, которое обязан был
+    создать этот POST (новые пороги, окно темпа). Молчаливое 4xx/5xx здесь
+    раньше означало, что сценарий проверяет несуществующую предпосылку и
+    списывает разницу на флак браузера, а не на реальный отказ настроек.
+    Диагностика режется по длине, чтобы не разлить тело ответа целиком.
+    """
+    if 200 <= status_code < 300:
+        return
+    detail = (body_text or "")[:SETTINGS_BODY_LIMIT]
+    raise RuntimeError(
+        f"{context}: POST /api/settings -> HTTP {status_code}: {detail}")
+
+
+def post_settings(client: "httpx.Client", payload: dict, context: str):
+    resp = client.post("/api/settings", json=payload)
+    _require_2xx(resp.status_code, resp.text, context)
+    return resp
+
+
+def _selfcheck_settings_guard() -> None:
+    """Узкий self-check: synthetic non-2xx действительно ловится.
+
+    Тест-локальный вызов на выдуманных status/body — без сети, без браузера
+    и без прод-хуков, — доказывает, что `_require_2xx` реально fail-closed,
+    а не просто выглядит так по чтению кода.
+    """
+    secret_like = "token=SHOULD-NOT-LEAK-" + ("x" * 500)
+    try:
+        _require_2xx(500, secret_like, "synthetic-guard")
+    except RuntimeError as exc:
+        msg = str(exc)
+        check("guard: synthetic non-2xx POST /api/settings отклонён",
+              "500" in msg, msg[:120])
+        check("guard: диагностика ограничена по длине и не льёт тело целиком",
+              len(msg) < len(secret_like), f"len={len(msg)}")
+    else:
+        check("guard: synthetic non-2xx POST /api/settings отклонён", False,
+              "исключение не брошено")
+        check("guard: диагностика ограничена по длине и не льёт тело целиком",
+              False, "исключение не брошено")
+
+
 class ServerThread:
     def __init__(self, asgi_app, port: int):
         self.config = uvicorn.Config(asgi_app, host="127.0.0.1", port=port,
@@ -117,7 +165,9 @@ def main() -> int:
 
 
 def run() -> int:  # noqa: C901 — сценарный тест: шагов много, ветвлений мало
-    from playwright.sync_api import sync_playwright
+    from playwright.sync_api import sync_playwright, expect, TimeoutError as PWTimeoutError
+
+    _selfcheck_settings_guard()
 
     base = f"http://127.0.0.1:{APP_PORT}"
     c = httpx.Client(headers={"X-Oborot-CSRF": "1"}, base_url=base, timeout=120.0)
@@ -210,14 +260,25 @@ def run() -> int:  # noqa: C901 — сценарный тест: шагов мн
         page.wait_for_timeout(2500)
         before = [page.text_content(f"#cond-{k}") for k in ("best", "good", "mid", "bad")]
         check("подписи отрисованы", all(before), str(before))
-        c.post("/api/settings", json={"thresholds": {"weak": 500, "dull": 1500, "good": 3000}})
+        post_settings(c, {"thresholds": {"weak": 500, "dull": 1500, "good": 3000}},
+                      "смена порогов на 3 000 перед проверкой подписей")
         page.reload()
-        page.wait_for_timeout(2500)
+        try:
+            # Ждём КОНКРЕТНУЮ новую подпись, а не фиксированную паузу: JS
+            # красит #cond-best новым порогом асинхронно после reload, и
+            # только это ожидание — доказательство готовности (TECH_DEBT
+            # OPS-7, «test_ui.py ждёт фиксированными паузами»). Таймаут
+            # ограничен: если условие не наступит, ниже это честно упадёт
+            # через check(), а не зависнет.
+            expect(page.locator("#cond-best")).to_contain_text("3 000", timeout=5000)
+        except PWTimeoutError:
+            pass
         after = [page.text_content(f"#cond-{k}") for k in ("best", "good", "mid", "bad")]
         check("после смены порогов подписи изменились", before != after,
               f"{before[0]} -> {after[0]}")
         check("и называют новые числа", "3 000" in (after[0] or ""), str(after[0]))
-        c.post("/api/settings", json={"thresholds": {"weak": 1000, "dull": 2000, "good": 5000}})
+        post_settings(c, {"thresholds": {"weak": 1000, "dull": 2000, "good": 5000}},
+                      "возврат порогов к дефолту после сценария")
 
         print("\n== «Оборот»: ошибка гасит устаревшие карточки ==")
         page.goto(f"{base}/revenue")
@@ -370,7 +431,7 @@ def run() -> int:  # noqa: C901 — сценарный тест: шагов мн
         page.wait_for_timeout(3000)
         hint_year = page.text_content("#statusHint") or ""
         check("окно темпа названо в строке состояния", "темп" in hint_year, hint_year[:100])
-        c.post("/api/settings", json={"rate_window": "d90"})
+        post_settings(c, {"rate_window": "d90"}, "смена окна темпа на d90")
         page.reload()
         page.wait_for_timeout(3000)
         page.evaluate("""() => {
@@ -381,7 +442,8 @@ def run() -> int:  # noqa: C901 — сценарный тест: шагов мн
         hint_90 = page.text_content("#statusHint") or ""
         check("после смены окна строка изменилась",
               hint_90 != hint_year, f"{hint_year[:60]} -> {hint_90[:60]}")
-        c.post("/api/settings", json={"rate_window": "year"})
+        post_settings(c, {"rate_window": "year"},
+                      "возврат окна темпа к дефолту после сценария")
 
         check("ни одной ошибки в консоли за весь проход", not errors, str(errors[:2]))
         browser.close()
