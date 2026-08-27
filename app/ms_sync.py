@@ -1579,6 +1579,27 @@ async def _run_initial(org_id: int, client: MoySkladClient, active_wh: list,
     # Ревью 21.08: точка, записанная при другом наборе складов/окне, — не
     # продолжаем, а пересобираем с нуля (прежние history_loaded_from/
     # resume_fp/needs_full_rebuild живут до реального wipe в фазе today).
+    if resume_from and not resumed:
+        # DATA-8 corrective #8 (P2 discussion_r3873297171): start_sync/
+        # _run_sync уже вызвали _carry_stats(..., resuming=True) на одном
+        # лишь факте, что _pending_resume нашёл точку (resume_from truthy)
+        # — rebuild-checkpoint и committed-id набор ПРЕДЫДУЩЕГО сегмента уже
+        # перенесены в stats ДО того, как этот прогон вообще начался. Только
+        # здесь, после РЕАЛЬНОЙ проверки (стоки на диске + отпечаток
+        # складов/окна совпадает), выясняется, что резюме на самом деле
+        # НЕДЕЙСТВИТЕЛЬНО — прогон идёт веткой fresh (else ниже) как НОВАЯ
+        # логическая пересборка. Без явной очистки здесь стухшая бухгалтерия
+        # прежней (недействительной) пересборки пережила бы честный
+        # авторитетный проход с raw/committed=0: _rebuild_total прибавлял бы
+        # стухший checkpoint к нулю нового сегмента, total оставался бы > 0,
+        # и `_apply_skip_diagnostic_lifecycle` не смог бы очистить sticky в
+        # 0, хотя пересборка честно нашла ноль пропусков с самого начала.
+        # Прежний sticky (_SKIP_STICKY_KEY, часть _CARRIED_STATS) НЕ трогаем
+        # — он остаётся видимым владельцу до успешной финализации ЭТОГО
+        # прогона (initial и не резюмированный + total==0 в
+        # `_apply_skip_diagnostic_lifecycle`).
+        stats.pop(_SKIP_CHECKPOINT_KEY, None)
+        stats.pop(_SKIP_COMMITTED_IDS_KEY, None)
     activated = False
     window = min(INITIAL_WINDOW_DAYS, HISTORY_DAYS)
 

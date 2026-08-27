@@ -116,6 +116,27 @@ sales-коммита и СТРОГО ДО публикации соответс�
 сразу после её возврата поднимает исключение, что и воспроизводит момент
 kill сразу после network-persist.
 
+Corrective #8 (P2 discussion_r3873297171) закрывает соседний случай той же
+природы, но НЕ про упорядочивание внутри одного прогона (это уже закрыто
+corrective #7), а про ДВЕ независимые оценки валидности резюме на границе
+между прогонами: `start_sync`/`_run_sync` вызывают `_carry_stats(...,
+resuming=True)` (перенося checkpoint и committed-id набор) на одном лишь
+факте, что `_pending_resume` вернул точку продолжения — а `_run_initial`
+уже ПОСЛЕ этого независимо проверяет `_has_stock_rows(org_id)` и
+`prev_fp == fingerprint`, и может отвергнуть резюме, уходя веткой fresh.
+До фикса стухшая бухгалтерия отвергнутого резюме не снималась: честная
+авторитетная пересборка с нуля находила raw/committed=0, но
+`_rebuild_total` всё равно прибавлял стухший checkpoint — sticky никогда
+не очищался в 0 (пример независимого ревью: «5 remains after finding
+zero»). Фикс — в `_run_initial`, сразу после вычисления `resumed`: если
+`resume_from` был (резюме ожидалось), а `resumed` всё равно False (обе
+проверки независимо его отвергли), `_SKIP_CHECKPOINT_KEY` и
+`_SKIP_COMMITTED_IDS_KEY` явно снимаются ДО начала fresh-ветки — прежний
+sticky при этом НЕ трогается (остаётся видимым владельцу до успешной
+финализации именно этого прогона, как и раньше). Два новых сценария
+покрывают обе независимые причины отказа — пустой `stock_days` и
+несовпадающий `resume_fp` — по отдельности.
+
 Запуск из корня репозитория:  python tests/test_sync_diag_store.py
 """
 import json
@@ -1191,6 +1212,173 @@ def run_part2_boundary_before_commit_today() -> None:
     mock_api.close()
 
 
+def run_part2_stale_checkpoint_missing_stock() -> None:
+    """Corrective #8, сценарий A (P2 discussion_r3873297171): `_pending_resume`
+    находит точку продолжения (history_loaded_from от упавшего раунда 1), но
+    к моменту раунда 2 таблица остатков (`stock_days`) для организации ПУСТА
+    — `_has_stock_rows` возвращает False, и `_run_initial` независимо решает
+    `resumed = False`, уходя веткой fresh (полная пересборка с нуля).
+
+    `start_sync`/`_run_sync` УЖЕ вызвали `_carry_stats(..., resuming=True)`
+    на одном лишь факте, что `_pending_resume` вернул точку — checkpoint (8)
+    и committed-id набор упавшего раунда 1 уже перенесены в stats ДО того,
+    как `_run_initial` вообще успел проверить `_has_stock_rows`. До фикса
+    эта стухшая бухгалтерия НЕ снималась, когда прогон уходил веткой fresh:
+    честный авторитетный раунд 2 (пропуски убраны, raw/committed=0) всё
+    равно финализировался с `_rebuild_total` == 0 + checkpoint(8) == 8 > 0,
+    и sticky НИКОГДА не очищался в 0, хотя пересборка честно нашла ноль
+    пропусков с самого начала.
+    """
+    c = client()
+    mock_api = httpx.Client(base_url=f"http://127.0.0.1:{MOCK_PORT}", timeout=30.0)
+    all_stores = [sid for sid, _ in mock_ms.STORES]
+    org_id = register_and_connect_ms(c, "owner-m@diag.test",
+                                     "Организация M (stale-checkpoint-missing-stock)",
+                                     all_stores)
+
+    window_days = int(os.environ["INITIAL_WINDOW_DAYS"])
+    w_start = (date.today() - timedelta(days=window_days - 1)).isoformat()
+    SKIP_STORE = "st-ghost-test-m"
+    mock_api.post("/__test/skip_store_doc", json={
+        "entity": "demand", "store": SKIP_STORE, "date": w_start, "count": 8,
+    })
+    mock_api.post("/__test/faults", json={"docs_429_before": w_start})
+
+    print("\n== [часть 2, stale-checkpoint-missing-stock] Раунд 1: month "
+          "находит 8, падает в фазе history (checkpoint-eligible) ==")
+    r = c.post("/api/sync/initial")
+    check("раунд 1 запущен", r.status_code == 200, f"status={r.status_code}")
+    st1 = wait_sync_done(c)
+    check("раунд 1 честно упал (error)", st1.get("state") == "error",
+          f"state={st1.get('state')}")
+    check("раунд 1: history_loaded_from сохранён (точка продолжения есть)",
+          (st1.get("stats") or {}).get("history_loaded_from") == w_start,
+          f"stats={st1.get('stats')}")
+    check("раунд 1: committed == 8 (checkpoint-eligible для раунда 2)",
+          (st1.get("stats") or {}).get("sales_docs_skipped_store_committed") == 8,
+          f"stats={st1.get('stats')}")
+
+    print("\n== [часть 2, stale-checkpoint-missing-stock] Раунд 2 (resume "
+          "точка ЕСТЬ, но stock_days организации ПУСТ -> resumed=False, "
+          "честный fresh-скан находит 0) ==")
+    mock_api.post("/__test/faults", json={})
+    mock_api.post("/__test/reset_skip_store_docs")
+    exec_sql("DELETE FROM stock_days WHERE org_id=?", org_id)
+    stock_left = sql("SELECT COUNT(*) FROM stock_days WHERE org_id=?", org_id)
+    check("подготовка: stock_days организации действительно пуст",
+          stock_left[0][0] == 0, f"rows={stock_left}")
+    r = c.post("/api/sync/run")
+    check("раунд 2 (попытка резюме) запущен", r.status_code == 200,
+          f"status={r.status_code}")
+    st2 = wait_sync_done(c)
+    check("раунд 2 успешно завершился (честный fresh-скан не падает)",
+          st2.get("state") == "done", f"state={st2.get('state')} error={st2.get('error')}")
+    check("раунд 2 реально пошёл веткой initial (mode)",
+          st2.get("mode") == "initial", f"mode={st2.get('mode')}")
+    stats2 = st2.get("stats") or {}
+    check("раунд 2: resumed_from НЕ выставлен — резюме было отвергнуто, "
+          "фактически это НЕрезюмированная пересборка",
+          "resumed_from" not in stats2, f"stats={stats2}")
+    check("раунд 2: собственный raw == 0 (пропуски убраны, честная находка)",
+          stats2.get("sales_docs_skipped_store") == 0, f"stats={stats2}")
+    check("ИТОГ: sticky == 0 — стухший checkpoint (8) НЕ помешал "
+          "авторитетному нулю очистить sticky",
+          diag(st2) == 0, f"diagnostics={st2.get('diagnostics')}")
+    check("раунд 2: rebuild-checkpoint снят из финального stats",
+          "sales_docs_skipped_store_rebuild_checkpoint" not in stats2,
+          f"stats={stats2}")
+    check("раунд 2: committed-id набор снят из финального stats",
+          "sales_docs_skipped_store_committed_ids" not in stats2,
+          f"stats={stats2}")
+
+    c.close()
+    mock_api.close()
+
+
+def run_part2_stale_checkpoint_fingerprint_mismatch() -> None:
+    """Corrective #8, сценарий B (P2 discussion_r3873297171): та же стухшая
+    rebuild-бухгалтерия, но вторая причина отказа резюме — `prev_fp !=
+    fingerprint`. `stock_days` при этом НЕ пуст (валидные остатки на диске),
+    изолируя именно fingerprint-ветку независимой проверки `_run_initial` от
+    сценария A (пустой stock_days).
+
+    `prev_fp` читается в `start_sync` из `stats["resume_fp"]` ДО начала
+    прогона (обычно совпадает — меняется явным выбором складов через
+    `/api/connect/moysklad/stores`, но тот путь сам снимает точку
+    продолжения через `clear_resume_point`, поэтому напрямую этот сценарий
+    им не воспроизвести). Правим `resume_fp` напрямую в БД — так, как его
+    увидело бы устаревшее отпечатанное состояние после операционного
+    изменения конфигурации складов/окна в обход обычного экрана настроек.
+    """
+    c = client()
+    mock_api = httpx.Client(base_url=f"http://127.0.0.1:{MOCK_PORT}", timeout=30.0)
+    all_stores = [sid for sid, _ in mock_ms.STORES]
+    org_id = register_and_connect_ms(c, "owner-n@diag.test",
+                                     "Организация N (stale-checkpoint-fp-mismatch)",
+                                     all_stores)
+
+    window_days = int(os.environ["INITIAL_WINDOW_DAYS"])
+    w_start = (date.today() - timedelta(days=window_days - 1)).isoformat()
+    SKIP_STORE = "st-ghost-test-n"
+    mock_api.post("/__test/skip_store_doc", json={
+        "entity": "demand", "store": SKIP_STORE, "date": w_start, "count": 8,
+    })
+    mock_api.post("/__test/faults", json={"docs_429_before": w_start})
+
+    print("\n== [часть 2, stale-checkpoint-fp-mismatch] Раунд 1: month "
+          "находит 8, падает в фазе history (checkpoint-eligible) ==")
+    r = c.post("/api/sync/initial")
+    check("раунд 1 запущен", r.status_code == 200, f"status={r.status_code}")
+    st1 = wait_sync_done(c)
+    check("раунд 1 честно упал (error)", st1.get("state") == "error",
+          f"state={st1.get('state')}")
+    check("раунд 1: committed == 8 (checkpoint-eligible для раунда 2)",
+          (st1.get("stats") or {}).get("sales_docs_skipped_store_committed") == 8,
+          f"stats={st1.get('stats')}")
+    stock_before = sql("SELECT COUNT(*) FROM stock_days WHERE org_id=?", org_id)[0][0]
+    check("подготовка: stock_days НЕ пуст (изолируем именно fp-ветку)",
+          stock_before > 0, f"rows={stock_before}")
+
+    print("\n== [часть 2, stale-checkpoint-fp-mismatch] Раунд 2 (resume "
+          "точка ЕСТЬ, stock_days ЕСТЬ, но resume_fp испорчен -> resumed="
+          "False, честный fresh-скан находит 0) ==")
+    mock_api.post("/__test/faults", json={})
+    mock_api.post("/__test/reset_skip_store_docs")
+    row = sql("SELECT stats_json FROM sync_state WHERE org_id=?", org_id)
+    raw_stats = json.loads(row[0][0])
+    check("подготовка: resume_fp присутствует до порчи",
+          bool(raw_stats.get("resume_fp")), f"stats={raw_stats}")
+    raw_stats["resume_fp"] = "stale-mismatch-fingerprint|999"
+    exec_sql("UPDATE sync_state SET stats_json=? WHERE org_id=?",
+             json.dumps(raw_stats, ensure_ascii=False), org_id)
+    r = c.post("/api/sync/run")
+    check("раунд 2 (попытка резюме) запущен", r.status_code == 200,
+          f"status={r.status_code}")
+    st2 = wait_sync_done(c)
+    check("раунд 2 успешно завершился (честный fresh-скан не падает)",
+          st2.get("state") == "done", f"state={st2.get('state')} error={st2.get('error')}")
+    check("раунд 2 реально пошёл веткой initial (mode)",
+          st2.get("mode") == "initial", f"mode={st2.get('mode')}")
+    stats2 = st2.get("stats") or {}
+    check("раунд 2: resumed_from НЕ выставлен — резюме было отвергнуто по "
+          "несовпадению отпечатка складов/окна",
+          "resumed_from" not in stats2, f"stats={stats2}")
+    check("раунд 2: собственный raw == 0 (пропуски убраны, честная находка)",
+          stats2.get("sales_docs_skipped_store") == 0, f"stats={stats2}")
+    check("ИТОГ: sticky == 0 — стухший checkpoint (8) НЕ помешал "
+          "авторитетному нулю очистить sticky",
+          diag(st2) == 0, f"diagnostics={st2.get('diagnostics')}")
+    check("раунд 2: rebuild-checkpoint снят из финального stats",
+          "sales_docs_skipped_store_rebuild_checkpoint" not in stats2,
+          f"stats={stats2}")
+    check("раунд 2: committed-id набор снят из финального stats",
+          "sales_docs_skipped_store_committed_ids" not in stats2,
+          f"stats={stats2}")
+
+    c.close()
+    mock_api.close()
+
+
 def run_part3_unit_lifecycle() -> None:
     """Прямая проверка чистой функции `_apply_skip_diagnostic_lifecycle` —
     быстрое точное покрытие всей таблицы решений без сетевого прогона синка.
@@ -1453,6 +1641,8 @@ def run() -> int:
     run_part2_committed_boundary()
     run_part2_boundary_before_commit_month()
     run_part2_boundary_before_commit_today()
+    run_part2_stale_checkpoint_missing_stock()
+    run_part2_stale_checkpoint_fingerprint_mismatch()
     run_part3_unit_lifecycle()
     print(f"\nИТОГО: {len(PASS)} OK, {len(FAIL)} FAIL")
     return 1 if FAIL else 0
