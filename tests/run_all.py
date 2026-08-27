@@ -100,6 +100,7 @@ SUITES = [
     ("wb_dup",      "test_writeback_dup.py",   True,  False),
     ("wb_idem",     "test_writeback_idempotency.py", True, False),
     ("wb_race",     "test_writeback_race.py",  True,  False),
+    ("ms_client",   "test_ms_client.py",       False, False),
     ("ops",         "test_ops.py",             False, False),
     ("logging",     "test_logging.py",         False, False),
     ("subscr",      "test_subscription.py",    False, False),

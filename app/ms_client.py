@@ -129,6 +129,27 @@ class RateLimiter:
     (REPORT_PARALLEL) для /report/stock/all — инцидент 21.08. После 429 любой
     задачи выставляется pause_until: до этого момента новые запросы из окна
     не выпускаются, чтобы соседние задачи не добивали и без того закрытый лимит.
+
+    У потолков общий бюджет (OPS-6): heavy-слот держит ОБА разрешения сразу —
+    общее и узкое, — а не только узкое. Иначе normal (до MAX_PARALLEL) и heavy
+    (до REPORT_PARALLEL) независимы и суммарно могут идти одновременно до
+    MAX_PARALLEL + REPORT_PARALLEL запросов, превышая лимит МойСклад на
+    параллельность.
+
+    Порядок захвата в `_Slot` — узкое, потом общее (round 2, OPS-6 corrective,
+    discussion_r3868519391). Первая редакция брала их в обратном порядке
+    (общее, потом узкое) и из-за этого резервировала общий permit ещё ДО того,
+    как задача могла пройти узкие отчётные ворота: насыщенная очередь heavy
+    (например 5 heavy при parallel=5/report=3) занимала ВСЕ общие permit'ы, а
+    реально проходили узкие ворота только 3 — normal при этом не получал ни
+    одного места, хотя фактическая параллельность была равна REPORT_PARALLEL.
+    Узкое разрешение само по себе точный потолок: держать его может не больше
+    REPORT_PARALLEL задач одновременно, поэтому запрашивать общий permit имеет
+    смысл только ПОСЛЕ того, как узкие ворота гарантированно пройдены — тогда
+    normal всегда может использовать оставшиеся MAX_PARALLEL-REPORT_PARALLEL
+    общих permit'ов. Normal узкое разрешение никогда не держит, поэтому во всём
+    коде остаётся ровно один порядок захвата и циклического ожидания не
+    возникает.
     """
 
     def __init__(self, limit: int = WINDOW_LIMIT, window: float = WINDOW_SECONDS,
@@ -144,8 +165,14 @@ class RateLimiter:
         self.pause_until = 0.0  # monotonic; общий cool-down после 429
 
     def slot(self, heavy: bool = False) -> "_Slot":
-        """Контекст «один запрос»: heavy=True — через узкий семафор отчётов."""
-        return _Slot(self, self._report_semaphore if heavy else self._semaphore)
+        """Контекст «один запрос».
+
+        heavy=True держит ОБА разрешения: общее (доля в MAX_PARALLEL) и узкое
+        отчётное (доля в REPORT_PARALLEL) — см. докстринг класса (OPS-6).
+        """
+        if heavy:
+            return _Slot(self, self._semaphore, self._report_semaphore)
+        return _Slot(self, self._semaphore)
 
     def cool_down(self, seconds: float) -> None:
         """Притормозить ВСЕ задачи клиента (зовётся при 429)."""
@@ -182,21 +209,65 @@ class RateLimiter:
 
 
 class _Slot:
-    def __init__(self, limiter: RateLimiter, semaphore: asyncio.Semaphore) -> None:
+    """Один слот запроса: 1-2 разрешения (общее и, для heavy, ещё узкое).
+
+    Порядок захвата для heavy — ВСЕГДА узкое, потом общее (round 2, OPS-6
+    corrective, discussion_r3868519391); освобождение — в обратном порядке.
+    Normal берёт только общее и узкое не держит никогда, поэтому во всём коде
+    остаётся ровно один порядок захвата и цикла ожидания между normal и heavy
+    не возникает. Захват общего РАНЬШЕ узкого (round 1) резервировал общий
+    permit ещё до того, как задача могла пройти узкие ворота, и насыщенная
+    heavy-очередь полностью останавливала normal — см. докстринг
+    `RateLimiter`.
+
+    Владение каждым разрешением отслеживается отдельным флагом
+    (`_acquired`/`_extra_acquired`) и сбрасывается СРАЗУ после каждого
+    release — как в штатном `__aexit__`, так и на любой ветке отмены/ошибки
+    (round 2, discussion_r3868519606). Иначе повторное использование одного
+    и того же объекта `_Slot` (второй `async with` на нём же) после отмены на
+    следующем acquire освободило бы permit, которым эта попытка не владела,
+    и раздуло бы семафор выше настоящей ёмкости.
+    """
+
+    def __init__(self, limiter: RateLimiter, semaphore: asyncio.Semaphore,
+                 extra_semaphore: asyncio.Semaphore | None = None) -> None:
         self._limiter = limiter
         self._semaphore = semaphore
+        self._extra_semaphore = extra_semaphore
+        self._acquired = False
+        self._extra_acquired = False
 
     async def __aenter__(self) -> "_Slot":
-        await self._semaphore.acquire()
+        if self._extra_semaphore is not None:
+            await self._extra_semaphore.acquire()
+            self._extra_acquired = True
         try:
-            await self._limiter._wait_window()
+            await self._semaphore.acquire()
+            self._acquired = True
+            try:
+                await self._limiter._wait_window()
+            except BaseException:
+                self._semaphore.release()
+                self._acquired = False
+                raise
         except BaseException:
-            self._semaphore.release()
+            # Отмена или падение между захватом узкого и общего разрешения
+            # (или на ожидании окна) не должны оставлять узкое захваченным
+            # навсегда — иначе это утечка permit и постепенный deadlock для
+            # других heavy-запросов.
+            if self._extra_acquired:
+                self._extra_semaphore.release()
+                self._extra_acquired = False
             raise
         return self
 
     async def __aexit__(self, *exc) -> None:
-        self._semaphore.release()
+        if self._acquired:
+            self._semaphore.release()
+            self._acquired = False
+        if self._extra_acquired:
+            self._extra_semaphore.release()
+            self._extra_acquired = False
 
 
 class MoySkladClient:
