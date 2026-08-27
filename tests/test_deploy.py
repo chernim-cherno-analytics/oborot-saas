@@ -23,11 +23,26 @@
      OBOROT_ALLOW_NO_LOCK=1;
   6) падение pip НЕ переключает код: прод остаётся на прежнем коммите;
   7) приложение не поднялось — выход 1, логи, команда отката, имя копии базы;
-  8) копия базы снимается и проверяется до переключения кода.
+  8) копия базы снимается и проверяется до переключения кода;
+  9) консольные обёртки (`bin/pip` и прочие) работают ПОСЛЕ переезда каталога
+     окружения — и у свежесобранного, и у переиспользованного кэшированного;
+ 10) сбой починки или сбой запуска обёртки на финальном пути откатывают выкладку
+     ДО перезапуска службы.
+
+Про пункты 9–10 отдельно (OPS-6). Поломка настоящая и проверена на НАСТОЯЩЕМ
+venv, а не только здесь: `python -m venv /tmp/x/.venv-staging.12345`, затем
+`mv .venv-staging.12345 venv` — и `venv/bin/pip --version` даёт
+`bad interpreter: /tmp/x/.venv-staging.12345/bin/python3.14: no such file or
+directory`, код 127, тогда как `venv/bin/python -m pip --version` в том же
+каталоге отвечает нормально. Ровно это и было на проде:
+`/opt/oborot/venv/bin/pip` начинался с `#!/opt/oborot/.venv-staging.588121/...`.
+Площадка обязана воспроизводить это сама — иначе проверки ниже ничего не стоят,
+поэтому её честность доказывается отдельным разделом, независимым от deploy.sh.
 
 Запуск из корня репозитория:  python tests/test_deploy.py
 """
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -122,12 +137,32 @@ def make_stubs(bindir: Path, *, health_ok=True, pip_ok=True) -> None:
     # окно («$VENV уже подменён, а функция ещё не вернулась») не сказало бы
     # ничего. Целевые пути подмены — venv-<sha>; сам $VENV называется venv,
     # под шаблон не попадает, и возврат окружения при откате работает.
+    #
+    # FAIL_MV_SHEBANG отказывает на другом переименовании — том, которым
+    # починка консольной обёртки ставит исправленный файл на место `bin/pip`.
+    # Это инъекция «починка не удалась»: скрипт обязан не чинить дальше, не
+    # перезапускать службу и откатить всё до прежнего релиза.
     (bindir / "mv").write_text(
         '#!/bin/sh\n'
+        'for a in "$@"; do dest="$a"; done\n'
         'if [ "${FAIL_MV_KEEP:-0}" = "1" ]; then\n'
-        '  for a in "$@"; do dest="$a"; done\n'
         '  case "${dest##*/}" in\n'
         '    venv-*) echo "подставной mv: отказ на $dest" >&2; exit 1;;\n'
+        '  esac\n'
+        'fi\n'
+        'if [ "${FAIL_MV_SHEBANG:-0}" = "1" ]; then\n'
+        '  case "${dest##*/}" in\n'
+        '    pip) echo "подставной mv: отказ на починке $dest" >&2; exit 1;;\n'
+        '  esac\n'
+        'fi\n'
+        # FAIL_MV_SILENT — сбой хуже явного отказа: переименование ТИХО не
+        # происходит, а код возврата 0. Починка отчитывается об успехе, файл
+        # остаётся прежним. Это единственный способ проверить, что проверка
+        # обёрток действительно независима от починки, а не пересказывает её
+        # отчёт: поймать такое обязана именно она.
+        'if [ "${FAIL_MV_SILENT:-0}" = "1" ]; then\n'
+        '  case "${dest##*/}" in\n'
+        '    pip) rm -f "$1"; exit 0;;\n'
         '  esac\n'
         'fi\n'
         'exec /bin/mv "$@"\n', encoding="utf-8")
@@ -141,71 +176,130 @@ def make_stubs(bindir: Path, *, health_ok=True, pip_ok=True) -> None:
     # каждую выкладку и лезла бы в сеть за пакетами; здесь нужно проверить
     # поведение скрипта, а не работу pip.
     #
-    # Подставной pip складывает файл требований, который ему дали, внутрь venv
-    # (INSTALLED) и дописывает строку в журнал. По INSTALLED видно, для какого
-    # релиза собрано окружение; по журналу — лазил ли откат в сеть.
+    # Устроено это так же, как настоящий venv, и по одной причине: иначе
+    # площадка проверяет не тот venv, который бывает на сервере.
     #
-    # ГЛАВНОЕ в этой площадке — первая строка `bin/pip`. У настоящего venv в
-    # консольных обёртках зашит АБСОЛЮТНЫЙ путь интерпретатора того каталога, в
-    # котором venv создавали; после переименования каталога обёртка перестаёт
-    # запускаться («bad interpreter»). Площадка обязана это воспроизводить,
-    # иначе она проверяет не тот venv, который бывает на сервере: скрипт,
-    # дёргающий `bin/pip` после переезда, проходил бы тест и ломался в бою.
-    # `bin/python` переезд переживает — у настоящего venv это ссылка на
-    # системный интерпретатор.
-    fail = "" if pip_ok else "echo 'pip упал' >&2\nexit 1\n"
-    pip_body = (
-        f"{fail}"
-        # Управляемый сбой окружения ИМЕННО на финальном пути: до подмены тот же
-        # самый venv лежит по адресу staging и отвечает нормально.
-        'LIVE="$(cd "${OBOROT_VENV:-/нет}" 2>/dev/null && pwd || echo /нет)"\n'
-        'HERE="$(cd "$(dirname "$0")/.." 2>/dev/null && pwd || echo /тоже-нет)"\n'
-        'if [ "${FAIL_VENV_VERIFY:-0}" != "0" ] && [ "$HERE" = "$LIVE" ]; then\n'
-        '  if [ "$FAIL_VENV_VERIFY" = "2" ] && [ -n "${SABOTAGE_DIR:-}" ]; then\n'
-        '    rm -rf "$SABOTAGE_DIR"\n'
-        '  fi\n'
-        '  echo "подставной pip: окружение на финальном пути неисправно" >&2\n'
-        '  exit 1\n'
-        'fi\n'
-        'echo "$*" >> "$PIP_LOG"\n'
-        'if [ "$1" = "install" ]; then\n'
-        '  for a in "$@"; do req="$a"; done\n'
-        '  cp "$req" "$(dirname "$0")/../INSTALLED" 2>/dev/null || true\n'
-        'fi\n'
-        "exit 0\n")
-    pip_body_file = bindir / "pip-body"
-    pip_body_file.write_text(pip_body, encoding="utf-8")
+    #   * `bin/python` — СИМВОЛИЧЕСКАЯ ССЫЛКА на настоящий интерпретатор. Не
+    #     копия и не скрипт: ядро не умеет исполнять шебанг, указывающий на
+    #     другой скрипт (ENOEXEC), а у настоящего venv там ссылка на бинарник.
+    #     Подставным скриптом здесь площадка молча меняла бы предмет проверки:
+    #     «обёртка не запустилась» значило бы «интерпретатор не бинарник»,
+    #     а не «каталог переехал».
+    #   * `pyvenv.cfg` — чтобы интерпретатор считал каталог окружением и
+    #     выставлял `sys.prefix` на него. По `sys.prefix` подставной pip и
+    #     понимает, в КАКОМ окружении его позвали.
+    #   * `bin/pip` — обычный текстовый файл, в первой строке которого зашит
+    #     АБСОЛЮТНЫЙ путь `bin/python` того каталога, где venv «собирали».
+    #     После переименования каталога такая обёртка не запускается вовсе
+    #     («bad interpreter», код 127) — ровно то, что было на проде.
+    #
+    # Сам pip подменён модулями `pip` и `venv`, которые лежат на PYTHONPATH и
+    # потому заслоняют настоящие: сборка окружения мгновенна, установка пакетов
+    # никуда не ходит. Подставной pip складывает поданный ему файл требований
+    # внутрь venv (INSTALLED) и дописывает строку в журнал: по INSTALLED видно,
+    # для какого релиза собрано окружение, по журналу — лазил ли откат в сеть.
+    #
+    # Модульный вызов (`python -m pip`) и запуск консольной обёртки различаются
+    # честно, а не по метке в окружении: у них разные точки входа. На этом
+    # держится инъекция FAIL_CONSOLE_PIP — настоящая форма дефекта OPS-6, где
+    # `python -m pip` работает, а обёртка нет.
+    shim = bindir / "pyshim"
+    (shim / "pip").mkdir(parents=True, exist_ok=True)
+    (shim / "venv").mkdir(parents=True, exist_ok=True)
+    (shim / "pip" / "MODE").write_text("ok" if pip_ok else "broken", encoding="utf-8")
+    (shim / "pip" / "__init__.py").write_text(
+        "# -*- coding: utf-8 -*-\n"
+        "import os, shutil, sys\n"
+        "\n"
+        "\n"
+        "def _refuse(msg):\n"
+        "    print(msg, file=sys.stderr)\n"
+        "    return 1\n"
+        "\n"
+        "\n"
+        "def run(console):\n"
+        "    args = sys.argv[1:]\n"
+        "    venv = os.path.realpath(sys.prefix)\n"
+        "    # Режим «pip сломан» баковался в окружение в момент его сборки —\n"
+        "    # как и раньше, когда тело pip копировалось внутрь venv. Иначе\n"
+        "    # проверка «откат переиспользует готовое окружение без сети»\n"
+        "    # ломалась бы: у отложенного окружения pip обязан остаться рабочим.\n"
+        "    if os.path.exists(os.path.join(venv, 'STUB_PIP_BROKEN')):\n"
+        "        return _refuse('pip упал')\n"
+        "    # Управляемый сбой ИМЕННО на финальном пути: до подмены тот же самый\n"
+        "    # venv лежит по адресу staging и отвечает нормально.\n"
+        "    live = os.path.realpath(os.environ.get('OBOROT_VENV', '/нет'))\n"
+        "    on_final_path = venv == live\n"
+        "    verify = os.environ.get('FAIL_VENV_VERIFY', '0')\n"
+        "    if verify != '0' and on_final_path:\n"
+        "        if verify == '2' and os.environ.get('SABOTAGE_DIR'):\n"
+        "            shutil.rmtree(os.environ['SABOTAGE_DIR'], ignore_errors=True)\n"
+        "        return _refuse('подставной pip: окружение на финальном пути неисправно')\n"
+        "    if os.environ.get('FAIL_CONSOLE_PIP', '0') != '0' and console and on_final_path:\n"
+        "        return _refuse('подставной pip: консольная обёртка на финальном пути неисправна')\n"
+        "    log = os.environ.get('PIP_LOG')\n"
+        "    if log:\n"
+        "        with open(log, 'a', encoding='utf-8') as fh:\n"
+        "            fh.write(' '.join(args) + '\\n')\n"
+        "    if args and args[0] == 'install':\n"
+        "        try:\n"
+        "            shutil.copyfile(args[-1], os.path.join(venv, 'INSTALLED'))\n"
+        "        except OSError:\n"
+        "            pass\n"
+        "    if args[:1] == ['--version']:\n"
+        "        # Печатаем окружение, в котором нас исполнили. Снаружи это\n"
+        "        # единственный способ увидеть, ЧЕРЕЗ КАКОЙ интерпретатор\n"
+        "        # запустилась обёртка: шебанг на чужой, но живой python\n"
+        "        # выглядит совершенно рабочим и об ошибке не говорит ничем.\n"
+        "        print(venv)\n"
+        "    return 0\n", encoding="utf-8")
+    (shim / "pip" / "__main__.py").write_text(
+        "import sys\nfrom pip import run\nsys.exit(run(False))\n", encoding="utf-8")
+    (shim / "venv" / "__init__.py").write_text(
+        "# -*- coding: utf-8 -*-\n"
+        "import os, sys\n"
+        "\n"
+        "\n"
+        "def create(target):\n"
+        "    \"\"\"Собрать подставной venv так, как его собирает настоящий `-m venv`.\"\"\"\n"
+        "    target = os.path.abspath(target)\n"
+        "    bindir = os.path.join(target, 'bin')\n"
+        "    os.makedirs(bindir, exist_ok=True)\n"
+        "    real = os.path.realpath(sys.executable)\n"
+        "    link = os.path.join(bindir, 'python')\n"
+        "    if os.path.islink(link) or os.path.exists(link):\n"
+        "        os.remove(link)\n"
+        "    os.symlink(real, link)\n"
+        "    with open(os.path.join(target, 'pyvenv.cfg'), 'w', encoding='utf-8') as fh:\n"
+        "        fh.write('home = %s\\n' % os.path.dirname(real))\n"
+        "        fh.write('include-system-site-packages = false\\n')\n"
+        "    mode = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),\n"
+        "                        'pip', 'MODE')\n"
+        "    broken = os.path.join(target, 'STUB_PIP_BROKEN')\n"
+        "    if open(mode, encoding='utf-8').read().strip() == 'broken':\n"
+        "        open(broken, 'w', encoding='utf-8').write('1\\n')\n"
+        "    elif os.path.exists(broken):\n"
+        "        os.remove(broken)\n"
+        "    # Первая строка — абсолютный путь ЭТОГО каталога. Именно она и не\n"
+        "    # переживает переезда, как у настоящих консольных обёрток.\n"
+        "    pip = os.path.join(bindir, 'pip')\n"
+        "    with open(pip, 'w', encoding='utf-8') as fh:\n"
+        "        fh.write('#!%s\\n' % link)\n"
+        "        fh.write('import sys\\n')\n"
+        "        fh.write('from pip import run\\n')\n"
+        "        fh.write('sys.exit(run(True))\\n')\n"
+        "    os.chmod(pip, 0o755)\n"
+        "    return target\n", encoding="utf-8")
+    (shim / "venv" / "__main__.py").write_text(
+        "import sys\nfrom venv import create\ncreate(sys.argv[1])\n", encoding="utf-8")
 
-    py_tpl = bindir / "python-template"
-    py_tpl.write_text(
-        "#!/bin/sh\n"
-        '# умеет ровно два вызова: python -m venv <каталог> и python -m pip ...\n'
-        'if [ "$1" = "-m" ] && [ "$2" = "venv" ]; then\n'
-        '  mkdir -p "$3/bin" || exit 1\n'
-        # Обёртка pip с шебангом на СВОЙ каталог — как у настоящего venv.
-        '  printf "#!%s/bin/python\\n" "$3" > "$3/bin/pip" || exit 1\n'
-        f'  cat "{pip_body_file}" >> "$3/bin/pip" || exit 1\n'
-        f'  cp "{py_tpl}" "$3/bin/python" || exit 1\n'
-        '  chmod 755 "$3/bin/pip" "$3/bin/python"\n'
-        '  exit 0\n'
-        'fi\n'
-        'if [ "$1" = "-m" ] && [ "$2" = "pip" ]; then\n'
-        '  shift 2\n'
-        # Через `sh <файл>`, а не запуском обёртки: настоящий `python -m pip`
-        # импортирует пакет, а не исполняет консольный скрипт, и потому
-        # переезду каталога не подвержен.
-        '  exec sh "$(dirname "$0")/pip" "$@"\n'
-        'fi\n'
-        "exit 0\n", encoding="utf-8")
-    py_tpl.chmod(0o755)
-
-    venv_bin = bindir.parent / "venv" / "bin"
-    venv_bin.mkdir(parents=True, exist_ok=True)
-    shutil.copy(py_tpl, venv_bin / "python")
-    (venv_bin / "pip").write_text(
-        f"#!{venv_bin}/python\n" + pip_body, encoding="utf-8")
-    for name in ("python", "pip"):
-        (venv_bin / name).chmod(0o755)
+    # Живое окружение площадки собирается тем же подставным `-m venv`, что и
+    # окружения релизов: двух разных способов собрать venv в тесте быть не должно.
+    live = bindir.parent / "venv"
+    shim_env = dict(os.environ)
+    shim_env["PYTHONPATH"] = str(shim)
+    subprocess.run([sys.executable, "-m", "venv", str(live)], env=shim_env, check=True,
+                   capture_output=True)
 
 
 def deploy_env(app: Path, extra: dict | None = None) -> dict:
@@ -222,6 +316,9 @@ def deploy_env(app: Path, extra: dict | None = None) -> dict:
         "OBOROT_HEALTH_DELAY": "0",
         "PIP_LOG": str(WORK / "pip.log"),
         "SYSTEMCTL_LOG": str(WORK / "systemctl.log"),
+        # Подставные модули `pip` и `venv` заслоняют настоящие. Заслоняют именно
+        # для процессов выкладки: сам тест их не импортирует.
+        "PYTHONPATH": str(WORK / "stub-bin" / "pyshim"),
     })
     env.update(extra or {})
     return env
@@ -284,23 +381,73 @@ def main() -> int:
     check("запись о прежнем окружении сделана",
           (WORK / "state" / "PREVIOUS_VENV").exists())
 
+    print("\n== Площадка честна: непереносимый шебанг воспроизводится ==")
+    # Сначала — доказательство, что площадка ломает обёртку так же, как ломает
+    # её настоящий venv. Оно СОЗНАТЕЛЬНО не зависит от deploy.sh: собираем venv
+    # подставным python по одному адресу, переносим каталог и смотрим на
+    # обёртку. Перестанет площадка воспроизводить поломку — всё, что проверяется
+    # ниже, станет ничего не значащим, и знать об этом надо сразу и отдельно.
+    probe_src = WORK / "probe-staging.111"
+    probe_dst = WORK / "probe-moved"
+    for d in (probe_src, probe_dst):
+        shutil.rmtree(d, ignore_errors=True)
+    rc, out = run([str(WORK / "venv" / "bin" / "python"), "-m", "venv", str(probe_src)],
+                  env=deploy_env(app))
+    check("подставной venv собран", rc == 0 and (probe_src / "bin" / "pip").exists(),
+          out[-200:])
+    rc_probe, out_probe = run([str(probe_src / "bin" / "pip"), "--version"],
+                              env=deploy_env(app))
+    check("ДО переезда консольная обёртка запускается", rc_probe == 0,
+          f"rc={rc_probe} {out_probe.strip()[:80]}")
+    os.rename(probe_src, probe_dst)
+    rc_probe, out_probe = run([str(probe_dst / "bin" / "pip"), "--version"],
+                              env=deploy_env(app))
+    check("ПОСЛЕ переезда — не запускается (как настоящий venv: bad interpreter, 127)",
+          rc_probe != 0, f"rc={rc_probe} {out_probe.strip()[:100]}")
+    rc_probe, _ = run([str(probe_dst / "bin" / "python"), "-m", "pip", "--version"],
+                      env=deploy_env(app))
+    check("а `python -m pip` переезд переживает — потому дефект и был не виден",
+          rc_probe == 0, f"rc={rc_probe}")
+    shutil.rmtree(probe_dst, ignore_errors=True)
+
     print("\n== Окружение живо на ФИНАЛЬНОМ пути, а не только на staging ==")
-    # Сначала убеждаемся, что площадка честная: обёртка bin/pip после переезда
-    # каталога действительно не запускается. Если это перестанет быть правдой,
-    # все проверки ниже станут ничего не значащими, и знать об этом надо сразу.
-    rc_pip, out_pip = run([str(WORK / "venv" / "bin" / "pip"), "--version"])
-    check("площадка воспроизводит настоящую поломку: bin/pip после переезда не запускается",
-          rc_pip != 0, f"rc={rc_pip} {out_pip.strip()[:80]}")
     rc_py, out_py = run([str(WORK / "venv" / "bin" / "python"), "-m", "pip", "--version"],
                         env=deploy_env(app))
-    check("а `python -m pip` переезд переживает", rc_py == 0, out_py.strip()[:80])
+    check("`python -m pip` работает в живом окружении", rc_py == 0, out_py.strip()[:80])
+    # OPS-6. Ровно то, что до сих пор не проверялось и потому доехало до прода:
+    # выкладка зелёная, `python -m pip` работает, а прямой вызов обёртки — 127.
+    rc_pip, out_pip = run([str(WORK / "venv" / "bin" / "pip"), "--version"],
+                          env=deploy_env(app))
+    check("ПРЯМОЙ bin/pip работает после выкладки — обёртка починена на финальном пути",
+          rc_pip == 0, f"rc={rc_pip} {out_pip.strip()[:120]}")
+    first_line = (WORK / "venv" / "bin" / "pip").read_text(encoding="utf-8").splitlines()[0]
+    check("и её шебанг указывает на ФИНАЛЬНЫЙ путь, а не на staging",
+          first_line == f"#!{WORK / 'venv'}/bin/python", first_line)
+    check("временных файлов починки за собой не осталось",
+          not list((WORK / "venv" / "bin").glob("*.oborot-shebang.*")),
+          str([p.name for p in (WORK / "venv" / "bin").glob("*.oborot-shebang.*")]))
     check("метка релиза лежит в живом окружении",
           (WORK / "venv" / "RELEASE_SHA").read_text(encoding="utf-8").strip() == v2)
     src = (ROOT / "deploy" / "deploy.sh").read_text(encoding="utf-8")
     code_lines = [ln for ln in src.splitlines() if not ln.lstrip().startswith("#")]
-    check("скрипт нигде не зовёт консольную обёртку bin/pip напрямую",
-          not any("bin/pip" in ln for ln in code_lines),
-          " | ".join(ln.strip()[:60] for ln in code_lines if "bin/pip" in ln))
+    # Сторож D-44 не снят, а сужен. Запрет был содержательный: зависимости не
+    # ставятся и не проверяются консольной обёрткой, потому что она не переживает
+    # переезда. Он остаётся. Появился ровно один прямой вызов обёртки — и он
+    # проверочный: `--version` ничего не ставит и ничего не меняет.
+    pip_wrapper_lines = [ln for ln in code_lines if re.search(r"bin/pip\b", ln)]
+    check("зависимости по-прежнему ставятся и проверяются ТОЛЬКО через `python -m pip`",
+          not any(re.search(r"bin/pip\"?\s+(install|check)\b", ln)
+                  for ln in pip_wrapper_lines),
+          " | ".join(ln.strip()[:60] for ln in pip_wrapper_lines))
+    exec_lines = [ln for ln in code_lines if re.search(r'^\s*"\$VENV/bin/pip"', ln)]
+    check("прямой вызов обёртки в скрипте ровно один", len(exec_lines) == 1,
+          " | ".join(ln.strip()[:60] for ln in exec_lines))
+    check("и он проверочный (--version)",
+          bool(exec_lines) and "--version" in exec_lines[0],
+          exec_lines[0].strip()[:80] if exec_lines else "нет строки")
+    check("проверка `python -m pip` не ослаблена: остались и --version, и check",
+          any("-m pip --version" in ln for ln in code_lines)
+          and any("-m pip check" in ln for ln in code_lines))
 
     print("\n== Занятый лок ==")
     lock = WORK / "state" / "deploy.lock"
@@ -434,7 +581,7 @@ def main() -> int:
     git(["checkout", "-q", "main"], cwd=app)
     vx = add_commit(app, "vx")
     fake = WORK / f"venv-{vx}"
-    shutil.copytree(WORK / "venv", fake)
+    shutil.copytree(WORK / "venv", fake, symlinks=True)
     (fake / "RELEASE_SHA").write_text("0" * 40 + "\n", encoding="utf-8")
     (fake / "INSTALLED").write_text("подложенное окружение\n", encoding="utf-8")
     (WORK / "pip.log").write_text("", encoding="utf-8")
@@ -444,6 +591,66 @@ def main() -> int:
     check("чужое окружение не подставлено, а пересобрано",
           "# release vx" in live, live.strip())
     check("пересборка действительно была", "install" in (WORK / "pip.log").read_text(encoding="utf-8"))
+
+    print("\n== Переиспользованное кэшированное окружение: без сети и с живым entrypoint ==")
+    # Второй путь переезда, и он не теоретический. Отложенное окружение едет
+    # venv-<sha> → staging → $VENV, а на проде такие каталоги остались от
+    # ПРЕЖНЕЙ версии скрипта — со ссылкой на давно исчезнувший staging внутри.
+    # Требование двойное и оба половины одинаково важны: сеть не нужна (иначе
+    # рушится D-44, ради которого кэш и заведён) И обёртка после переезда
+    # работает.
+    git(["checkout", "-q", "main"], cwd=app)
+    vcache = add_commit(app, "vcache")
+    git(["checkout", "-q", "--detach", vx], cwd=app)
+    cached = WORK / f"venv-{vcache}"
+    shutil.rmtree(cached, ignore_errors=True)
+    shutil.copytree(WORK / "venv", cached, symlinks=True)
+    (cached / "RELEASE_SHA").write_text(vcache + "\n", encoding="utf-8")
+    (cached / "INSTALLED").write_text("httpx==0.28.1\n# release vcache\n", encoding="utf-8")
+    # Обёртка с шебангом на несуществующий staging — ровно то, что оставляла
+    # прежняя версия скрипта.
+    stale = WORK / ".venv-staging.000000"
+    cached_pip = cached / "bin" / "pip"
+    cached_pip.write_text(
+        f"#!{stale}/bin/python\n"
+        + cached_pip.read_text(encoding="utf-8").split("\n", 1)[1], encoding="utf-8")
+    cached_pip.chmod(0o755)
+    # Соседи, которых починка трогать НЕ имеет права: рабочий чужой шебанг,
+    # сломанный НЕ-python шебанг и симлинк.
+    (cached / "bin" / "helper.sh").write_text("#!/bin/sh\necho ok\n", encoding="utf-8")
+    (cached / "bin" / "helper.sh").chmod(0o755)
+    (cached / "bin" / "чужой").write_text("#!/нет-такого/bin/notpython\n", encoding="utf-8")
+    (cached / "bin" / "чужой").chmod(0o755)
+    (cached / "bin" / "python3").symlink_to("python")
+    (WORK / "pip.log").write_text("", encoding="utf-8")
+    rc, out = run(["bash", script, vcache], env=deploy_env(app))
+    check("выкладка на кэшированном окружении прошла", rc == 0 and head_of(app) == vcache,
+          out[-300:])
+    check("кэш действительно переиспользован, а не пересобран",
+          "уже собрано" in out, out[-300:])
+    piplog = (WORK / "pip.log").read_text(encoding="utf-8")
+    check("СЕТИ НЕ ПОНАДОБИЛОСЬ: пакеты не ставились",
+          "install" not in piplog, piplog.strip().replace("\n", " | ") or "пусто")
+    live = (WORK / "venv" / "INSTALLED").read_text(encoding="utf-8")
+    check("в бою именно кэшированное окружение", "# release vcache" in live, live.strip())
+    rc_pip, out_pip = run([str(WORK / "venv" / "bin" / "pip"), "--version"],
+                          env=deploy_env(app))
+    check("ПРЯМОЙ bin/pip работает и после переезда КЭШИРОВАННОГО окружения",
+          rc_pip == 0, f"rc={rc_pip} {out_pip.strip()[:120]}")
+    first_line = (WORK / "venv" / "bin" / "pip").read_text(encoding="utf-8").splitlines()[0]
+    check("шебанг переписан на финальный путь", first_line == f"#!{WORK / 'venv'}/bin/python",
+          first_line)
+    check("рабочий чужой шебанг починка не тронула",
+          (WORK / "venv" / "bin" / "helper.sh").read_text(encoding="utf-8").splitlines()[0]
+          == "#!/bin/sh")
+    check("сломанный НЕ-python шебанг починка тоже не тронула — это чужая ответственность",
+          (WORK / "venv" / "bin" / "чужой").read_text(encoding="utf-8").splitlines()[0]
+          == "#!/нет-такого/bin/notpython")
+    check("симлинк остался симлинком, а не стал обычным файлом",
+          (WORK / "venv" / "bin" / "python3").is_symlink())
+    check("временных файлов починки не осталось",
+          not list((WORK / "venv" / "bin").glob("*.oborot-shebang.*")),
+          str([p.name for p in (WORK / "venv" / "bin").glob("*.oborot-shebang.*")]))
 
     print("\n== Старые окружения не копятся бесконечно ==")
     for n in ("v5", "v6", "v7"):
@@ -588,6 +795,70 @@ def main() -> int:
         + list(WORK.glob(".venv-rollback.*"))
     check("временных каталогов окружения не осталось", not leftovers, str(leftovers))
 
+    # Общая часть двух инъекций ниже. Требование к обеим одно и то же и взято не
+    # из вкуса, а из D-46: сбой в окне «код переключён, служба ещё старая»
+    # обязан вернуть прод целиком и не трогать службу. Разница только в том, что
+    # именно сломано — сама починка или её результат.
+    def check_rolled_back_to(sha, out, rc, before_env, marker):
+        check("выкладка отклонена", rc != 0, f"rc={rc}")
+        check("сказано, что сбой ДО перезапуска", "СБОЙ ДО ПЕРЕЗАПУСКА" in out, out[-500:])
+        check("КОД возвращён на прежний коммит", head_of(app) == sha, head_of(app)[:12])
+        check("OBOROT_COMMIT возвращён",
+              (WORK / "env").read_text(encoding="utf-8") == before_env,
+              (WORK / "env").read_text(encoding="utf-8").strip())
+        live_now = (WORK / "venv" / "INSTALLED").read_text(encoding="utf-8")
+        check("ОКРУЖЕНИЕ возвращено, а не осталось от неудачного релиза",
+              marker in live_now, live_now.strip())
+        check("метка живого окружения тоже прежняя",
+              (WORK / "venv" / "RELEASE_SHA").read_text(encoding="utf-8").strip() == sha)
+        syslog_now = (WORK / "systemctl.log").read_text(encoding="utf-8")
+        check("СЛУЖБА НЕ ПЕРЕЗАПУСКАЛАСЬ — потому откат и безопасен",
+              "restart" not in syslog_now,
+              syslog_now.strip().replace("\n", " | ") or "пусто")
+        rc_ok, _ = run([str(WORK / "venv" / "bin" / "python"), "-m", "pip", "--version"],
+                       env=deploy_env(app))
+        check("вернувшееся окружение работоспособно", rc_ok == 0, f"rc={rc_ok}")
+        check("временных файлов починки в $VENV не осталось",
+              not list((WORK / "venv" / "bin").glob("*.oborot-shebang.*")),
+              str([p.name for p in (WORK / "venv" / "bin").glob("*.oborot-shebang.*")]))
+        junk = list(WORK.glob(".venv-staging.*")) + list(WORK.glob(".venv-held.*")) \
+            + list(WORK.glob(".venv-rollback.*"))
+        check("временных каталогов окружения не осталось", not junk, str(junk))
+
+    print("\n== Инъекция: ПОЧИНКА обёрток не удалась — fail-closed до перезапуска ==")
+    # Починка правит файлы внутри живого окружения, значит умеет падать сама.
+    # Отказ ровно на том переименовании, которым исправленная обёртка ставится
+    # на место: скрипт обязан не идти дальше и вернуть прод на прежний релиз.
+    git(["checkout", "-q", "main"], cwd=app)
+    vs1 = add_commit(app, "vs1")
+    git(["checkout", "-q", "--detach", v2], cwd=app)
+    rc, out = run(["bash", script, v2], env=deploy_env(app))
+    check("подготовка: в бою v2", rc == 0 and head_of(app) == v2, out[-250:])
+    (WORK / "systemctl.log").write_text("", encoding="utf-8")
+    before_env = (WORK / "env").read_text(encoding="utf-8")
+    rc, out = run(["bash", script, vs1], env=deploy_env(app, {"FAIL_MV_SHEBANG": "1"}))
+    check("названа причина — консольные обёртки", "консольные обёртки" in out, out[-500:])
+    check_rolled_back_to(v2, out, rc, before_env, "# release v2")
+
+    print("\n== Инъекция: обёртка не запускается на финальном пути — fail-closed ==")
+    # Тоньше предыдущей и ближе к настоящему дефекту: починка отработала, шебанг
+    # переписан, `python -m pip` в том же окружении отвечает нормально — и
+    # только прямой запуск обёртки не работает. Прежний код такое пропускал
+    # молча и выкатывал на прод; теперь это отказ до перезапуска.
+    git(["checkout", "-q", "main"], cwd=app)
+    vs2 = add_commit(app, "vs2")
+    git(["checkout", "-q", "--detach", v2], cwd=app)
+    rc, out = run(["bash", script, v2], env=deploy_env(app))
+    check("подготовка: в бою v2", rc == 0 and head_of(app) == v2, out[-250:])
+    (WORK / "systemctl.log").write_text("", encoding="utf-8")
+    before_env = (WORK / "env").read_text(encoding="utf-8")
+    rc, out = run(["bash", script, vs2], env=deploy_env(app, {"FAIL_CONSOLE_PIP": "1"}))
+    check("названо, что не запускается именно консольная обёртка",
+          "bin/pip не запускается на финальном пути" in out, out[-500:])
+    check("а модульная проверка прошла — поймала ИМЕННО новая, а не старая",
+          "-m pip не работает" not in out, out[-500:])
+    check_rolled_back_to(v2, out, rc, before_env, "# release v2")
+
     print("\n== Уборка не трогает окружение, которым делается откат ==")
     # Отложенное окружение переезжает переименованием и сохраняет СТАРЫЙ mtime:
     # при сортировке по времени оно оказывается в конце списка. Уборка стояла до
@@ -604,7 +875,7 @@ def main() -> int:
     for i in (1, 2, 3):
         d = WORK / ("venv-" + f"{i:040x}")     # имена как у настоящих: venv-<sha>
         shutil.rmtree(d, ignore_errors=True)
-        shutil.copytree(WORK / "venv", d)
+        shutil.copytree(WORK / "venv", d, symlinks=True)
         os.utime(d, None)                      # ...а эти — свежие
         decoys.append(d)
     rc, out = run(["bash", script, vp], env=deploy_env(app, {"OBOROT_VENV_KEEP": "1"}))
@@ -637,7 +908,7 @@ def main() -> int:
     for i in (4, 5, 6):
         d = WORK / ("venv-" + f"{i:040x}")
         shutil.rmtree(d, ignore_errors=True)
-        shutil.copytree(WORK / "venv", d)
+        shutil.copytree(WORK / "venv", d, symlinks=True)
         os.utime(d, None)
         decoys.append(d)
     make_stubs(WORK / "stub-bin", health_ok=False)
@@ -670,6 +941,83 @@ def main() -> int:
     check("сказано, что прежнее окружение цело и откат не требует сети",
           "откат обойдётся без сети" in out, out[-300:])
     make_stubs(WORK / "stub-bin")
+
+    # Два раздела ниже добавлены correctivе-циклом по внешнему ревью и стоят
+    # последними намеренно: они оставляют площадку в другом релизе, и разделы
+    # выше пришлось бы приводить в согласованное состояние ради порядка чтения.
+    # После них площадка сразу разбирается, поэтому убирать за собой нечего.
+    print("\n== Чужой, но ЖИВОЙ интерпретатор в шебанге ==")
+    # Худший случай, и первая версия правила его пропускала: шебанг указывает не
+    # в никуда, а на НАСТОЯЩИЙ, запускаемый интерпретатор соседнего релиза.
+    # Обёртка при этом работает — и потому не выглядит сломанной ничем, — но
+    # исполняется чужим окружением: чужие библиотеки, чужие версии.
+    #
+    # Сосед здесь не выдуман: `venv-<CURRENT>` создаёт сама подмена окружения,
+    # он же цель отката, и уборка его не трогает. На сервере рядом живут ещё и
+    # отложенные окружения прежних релизов — `OBOROT_VENV_KEEP` их и держит.
+    git(["checkout", "-q", "main"], cwd=app)
+    vlive = add_commit(app, "vlive")
+    git(["checkout", "-q", "--detach", v3], cwd=app)
+    foreign = WORK / f"venv-{v3}"
+    cached_live = WORK / f"venv-{vlive}"
+    shutil.rmtree(cached_live, ignore_errors=True)
+    shutil.copytree(WORK / "venv", cached_live, symlinks=True)
+    (cached_live / "RELEASE_SHA").write_text(vlive + "\n", encoding="utf-8")
+    (cached_live / "INSTALLED").write_text("httpx==0.28.1\n# release vlive\n",
+                                           encoding="utf-8")
+    live_pip = cached_live / "bin" / "pip"
+    live_pip.write_text(
+        f"#!{foreign}/bin/python\n"
+        + live_pip.read_text(encoding="utf-8").split("\n", 1)[1], encoding="utf-8")
+    live_pip.chmod(0o755)
+    (WORK / "pip.log").write_text("", encoding="utf-8")
+    rc, out = run(["bash", script, vlive], env=deploy_env(app))
+    check("выкладка прошла", rc == 0 and head_of(app) == vlive, out[-300:])
+    check("сеть не понадобилась: кэшированное окружение переиспользовано",
+          "install" not in (WORK / "pip.log").read_text(encoding="utf-8"))
+    # Без этой проверки весь раздел ничего не значит: если сосед не пережил
+    # выкладку, случай выродился бы в прежний «пути больше нет».
+    check("ЧУЖОЙ интерпретатор при этом жив и запускается",
+          (foreign / "bin" / "python").exists()
+          and run([str(foreign / "bin" / "python"), "-m", "pip", "--version"],
+                  env=deploy_env(app))[0] == 0,
+          str(foreign.name[:16]))
+    first_line = (WORK / "venv" / "bin" / "pip").read_text(encoding="utf-8").splitlines()[0]
+    check("шебанг приведён к интерпретатору ЭТОГО окружения, а не оставлен чужим",
+          first_line == f"#!{WORK / 'venv'}/bin/python", first_line)
+    rc_pip, out_pip = run([str(WORK / "venv" / "bin" / "pip"), "--version"],
+                          env=deploy_env(app))
+    check("и обёртка ИСПОЛНЯЕТСЯ окружением этого релиза, а не соседнего",
+          rc_pip == 0
+          and os.path.realpath(out_pip.strip()) == os.path.realpath(WORK / "venv"),
+          f"rc={rc_pip} {out_pip.strip()[:120]}")
+
+    print("\n== Починка отчиталась об успехе, а шебанг остался чужим ==")
+    # Проверка обёрток обязана быть независимой от починки, а не пересказывать
+    # её отчёт. Подставной mv тихо не выполняет переименование и возвращает 0:
+    # починка считает, что справилась, файл при этом прежний. Поймать это может
+    # только проверка — и обязана поймать ДО перезапуска службы.
+    git(["checkout", "-q", "main"], cwd=app)
+    vsil = add_commit(app, "vsil")
+    git(["checkout", "-q", "--detach", vlive], cwd=app)
+    foreign2 = WORK / f"venv-{vlive}"
+    cached_sil = WORK / f"venv-{vsil}"
+    shutil.rmtree(cached_sil, ignore_errors=True)
+    shutil.copytree(WORK / "venv", cached_sil, symlinks=True)
+    (cached_sil / "RELEASE_SHA").write_text(vsil + "\n", encoding="utf-8")
+    (cached_sil / "INSTALLED").write_text("httpx==0.28.1\n# release vsil\n",
+                                          encoding="utf-8")
+    sil_pip = cached_sil / "bin" / "pip"
+    sil_pip.write_text(
+        f"#!{foreign2}/bin/python\n"
+        + sil_pip.read_text(encoding="utf-8").split("\n", 1)[1], encoding="utf-8")
+    sil_pip.chmod(0o755)
+    (WORK / "systemctl.log").write_text("", encoding="utf-8")
+    before_env = (WORK / "env").read_text(encoding="utf-8")
+    rc, out = run(["bash", script, vsil], env=deploy_env(app, {"FAIL_MV_SILENT": "1"}))
+    check("названо, что обёртка указывает не на интерпретатор этого окружения",
+          "указывают не на" in out, out[-500:])
+    check_rolled_back_to(vlive, out, rc, before_env, "# release vlive")
 
     shutil.rmtree(WORK, ignore_errors=True)
     print(f"\nИТОГО: {len(PASS)} OK, {len(FAIL)} FAIL")
