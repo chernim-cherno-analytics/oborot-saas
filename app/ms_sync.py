@@ -1775,7 +1775,6 @@ async def _run_initial(org_id: int, client: MoySkladClient, active_wh: list,
         _write_stock_rows(org_id, month_dates, batch,  # «сегодня» перезаписывается с нулями
                           sales_rows=sales_rows, sales_from=w_start,
                           sales_to=today_iso, sales_replace_all=True)
-        _sales_written(org_id, stats, sales_rows, w_start, (16.0, 21.0))
         stats["stock_dates"] += len(month_dates) - 1
         stats["stock_rows"] += len(batch)
         stats["stock_zeroed"] += zeroed
@@ -1784,21 +1783,37 @@ async def _run_initial(org_id: int, client: MoySkladClient, active_wh: list,
         stats["window_sales_docs"] = stats.get("sales_docs")
         stats["window_sales_rows"] = stats.get("sales_rows")
         stats["window_return_rows"] = stats.get("return_rows")
+        # DATA-8 corrective #9 (P2 discussion_r3873573203): коммитим id ДО
+        # `_sales_written` — та вызывает СОБСТВЕННЫЙ ПРЯМОЙ `_set_state(
+        # stats_json=...)`, минуя `_persist`, и это и есть ПЕРВЫЙ snapshot,
+        # в котором граница уже продвинута до `w_start` (см. присвоение
+        # выше) и raw/transient id этого месяца уже посчитаны — а ДАЛЬШЕ
+        # идёт сетевой `_sync_incoming`. Раньше `_commit_skip_ids` стоял
+        # ПОСЛЕ `_sync_incoming`: смерть в этом интервале оставляла ИМЕННО
+        # такой snapshot — новая граница УЖЕ опубликована (резюме её больше
+        # не перечитает как «пропущенное»), а committed так и остался 0.
+        # На резюме БЕЗ большого разрыва это раньше маскировалось широким
+        # chunked reread фазы history (remaining считается от `resume_from`,
+        # который в таком снимке — ещё старая точка ДО этого прогона, и
+        # перечитка попутно находит и досчитывает те же id) — но при разрыве
+        # ДОЛЬШЕ HISTORY_DAYS «точка СТАРШЕ окна» (минор 7) схлопывает
+        # `resume_from` к `oldest`, решив «всё окно уже загружено»: и
+        # `heal_from` от `oldest` НЕ достаёт до `w_start` ЭТОГО месяца —
+        # находка терялась НАВСЕГДА (sticky не остаётся даже на стухшем
+        # числе — падает в None, поскольку `_carry_stats(resuming=True)`
+        # строит carry из committed/checkpoint, а не из bootstrap-эвристики
+        # голого raw, которую использует только owner-facing get_status).
+        # Коммитим здесь, ДО `_sales_written`: теперь ЛЮБОЙ snapshot начиная
+        # с публикации новой границы несёт вместе с ней и уже подтверждённый
+        # committed — независимо от того, когда и через какой разрыв
+        # случится следующий resume.
+        _commit_skip_ids(stats)
+        _sales_written(org_id, stats, sales_rows, w_start, (16.0, 21.0))
         await _sync_incoming(org_id, client, ext_to_pid, stats, progress=(21.0, 24.0))
         # Мажор 2: окно закрыто ЦЕЛИКОМ (остатки + продажи + «едет») — только
         # теперь продолжение вправе пропустить фазу month.
         stats["window_done"] = True
         _stage_end(stats, "month")
-        # DATA-8 corrective #7 (P2 discussion_r3872928035): коммитим ДО
-        # `_finalize_lite` — она публикует history_loaded_from/window_done
-        # через свой `_persist`. Прогон, убитый МЕЖДУ публикацией границы и
-        # коммитом id, раньше оставлял snapshot с положительным raw и
-        # непотреблёнными transient id, но committed=0 (инициализирован в
-        # начале `_run_initial`, а не отсутствует, поэтому fallback на raw в
-        # `_skip_segment_contribution` не срабатывал) — следующий resume
-        # пропускал уже закрытое окно (window_done=True) и НАВСЕГДА терял
-        # находку месячного окна ДО первого чанка истории.
-        _commit_skip_ids(stats)
         _finalize_lite(org_id, stats, w_start, active_wh, progress=25.0)
         activated = True
         remaining = [d for d in all_dates if d < w_start]

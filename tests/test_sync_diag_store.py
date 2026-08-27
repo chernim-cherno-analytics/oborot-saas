@@ -137,6 +137,30 @@ sticky при этом НЕ трогается (остаётся видимым 
 покрывают обе независимые причины отказа — пустой `stock_days` и
 несовпадающий `resume_fp` — по отдельности.
 
+Corrective #9 (P2 discussion_r3873573203) закрывает crash-consistency щель
+на fresh-ветке месячной фазы: `_write_stock_rows` (реальный DB-коммит
+остатков+продаж месяца) уже состоялся, но `_sales_written` следом делает
+СОБСТВЕННЫЙ ПРЯМОЙ `_set_state(stats_json=...)` (в обход `_persist`) — а
+ДАЛЬШЕ идёт сетевой `_sync_incoming`. До фикса `_commit_skip_ids`/
+`_finalize_lite` откладывались до ПОСЛЕ `_sync_incoming` — значит снимок
+`_sales_written` был ПЕРВЫМ, где новая граница (`history_loaded_from=
+w_start`) уже опубликована, а committed для найденных в этом месяце
+пропусков — ещё нет. При резюме в тот же день эту щель маскировал
+widened-reread фазы history (corrective #5/#7) — но при разрыве ДОЛЬШЕ
+HISTORY_DAYS «точка старше окна» (ревью 21.08, минор 7) схлопывает
+`resume_from` к `oldest`, решив «всё окно уже загружено», а `heal_from` от
+`oldest` не достаёт до `w_start` того месяца — находка терялась НАВСЕГДА
+(sticky падает не в стухшее число, а в `None`, поскольку `_carry_stats(
+resuming=True)` строит carry из committed/checkpoint, а не из bootstrap-
+эвристики голого raw). Фикс — `_commit_skip_ids` теперь вызывается СРАЗУ
+после `_write_stock_rows`, ДО `_sales_written`: любой snapshot начиная с
+публикации новой границы несёт вместе с ней и уже подтверждённый
+committed. RED-тест воспроизводит настоящий kill (исключение,
+унаследованное от `BaseException` напрямую, минуя все `except Exception`
+по стеку синка, включая честный persist самого `_run_sync`) и
+восстановление через `reset_stale_running()` — тот же путь, которым
+продакшн поднимает зависший `running` после рестарта процесса.
+
 Запуск из корня репозитория:  python tests/test_sync_diag_store.py
 """
 import json
@@ -1379,6 +1403,146 @@ def run_part2_stale_checkpoint_fingerprint_mismatch() -> None:
     mock_api.close()
 
 
+def run_part2_month_checkpoint_before_boundary_leak() -> None:
+    """Corrective #9 (P2 discussion_r3873573203): в fresh month-ветке
+    `_write_stock_rows` (реальный DB-коммит остатков+продаж месяца) уже
+    состоялся, но `_sales_written` следом делает СОБСТВЕННЫЙ ПРЯМОЙ
+    `_set_state(stats_json=...)` (В ОБХОД `_persist`) — а ДАЛЬШЕ идёт
+    сетевой `await _sync_incoming`. До фикса `_commit_skip_ids`/
+    `_finalize_lite` откладывались ДО ПОСЛЕ `_sync_incoming` — значит
+    `_sales_written`'s снимок был ПЕРВЫМ, где новая граница
+    (`history_loaded_from=w_start`) УЖЕ опубликована, а committed для
+    найденных в этом месяце пропусков — ещё нет.
+
+    Настоящий SIGKILL здесь не сымитировать обычным `raise` — `_run_sync`
+    ловит `except Exception` и САМ честно персистит текущий `stats` (это
+    смягчает потерю). Вместо этого поднимаем исключение, унаследованное
+    от `BaseException` НАПРЯМУЮ (не от `Exception`) — оно проходит МИМО
+    ВСЕХ `except Exception` по стеку (`_run_initial` → `_run_sync` →
+    `_thread_main`), и фоновый поток просто умирает без единой строки
+    cleanup-кода — ровно то, что оставил бы настоящий kill. Восстановление
+    — `reset_stale_running()`, тот же путь, которым ПРОДАКШН реально
+    поднимает зависший `running` после рестарта процесса (см.
+    `tests/test_startup_lifecycle.py`), сохраняя `stats` ровно как он был
+    последний раз ЧЕСТНО записан.
+
+    Разрыв ДОЛЬШЕ HISTORY_DAYS между падением и резюме нужен, чтобы вскрыть
+    находку: при резюме В ТОТ ЖЕ день widened-reread фазы history (см.
+    corrective #5/#7) СЛУЧАЙНО перечитывает застрявшую границу и находит
+    пропуски заново — маскируя баг. При разрыве ДОЛЬШЕ HISTORY_DAYS «точка
+    СТАРШЕ окна» (ревью 21.08, минор 7) схлопывает `resume_from` к
+    `oldest`, решив «всё окно уже загружено» — а `heal_from` от `oldest` НЕ
+    достаёт до `w_start` того месяца: находка исчезает НАВСЕГДА (sticky
+    падает даже не в стухшее число, а в `None` — `_carry_stats(resuming=
+    True)` строит carry из committed/checkpoint, а НЕ из bootstrap-
+    эвристики голого raw, которой пользуется только owner-facing
+    get_status).
+    """
+    from app import ms_sync as mss
+
+    class _HardKill(BaseException):
+        """НЕ Exception — обходит `except Exception` по всему стеку синка,
+        как настоящий kill процесса (см. docstring функции выше)."""
+
+    c = client()
+    mock_api = httpx.Client(base_url=f"http://127.0.0.1:{MOCK_PORT}", timeout=30.0)
+    all_stores = [sid for sid, _ in mock_ms.STORES]
+    org_id = register_and_connect_ms(c, "owner-o@diag.test",
+                                     "Организация O (month-checkpoint-before-boundary-leak)",
+                                     all_stores)
+
+    window_days = int(os.environ["INITIAL_WINDOW_DAYS"])
+    history_days = int(os.environ["HISTORY_DAYS"])
+    real_today_fn = mss._today
+    gap = history_days + 2  # больше HISTORY_DAYS -> resume_from схлопнется к oldest
+    crash_today = date.today() - timedelta(days=gap)
+    w_start_at_crash = (crash_today - timedelta(days=window_days - 1)).isoformat()
+    SKIP_STORE = "st-ghost-test-o"
+    mock_api.post("/__test/skip_store_doc", json={
+        "entity": "demand", "store": SKIP_STORE, "date": w_start_at_crash, "count": 8,
+    })
+
+    real_sync_incoming = mss._sync_incoming
+
+    async def _hardkill_after_real_sync_incoming(*args, **kwargs):
+        await real_sync_incoming(*args, **kwargs)
+        raise _HardKill("DATA-8 corrective #9 RED: имитация настоящего kill "
+                        "после _sync_incoming, в обход except Exception")
+
+    print(f"\n== [часть 2, month-checkpoint-before-boundary-leak] Раунд 1: "
+          f"fresh month {gap} дн. назад, реальный _write_stock_rows коммитит "
+          f"месяц, затем настоящий kill ДО commit_skip_ids/_finalize_lite ==")
+    mss._today = lambda: crash_today
+    mss._sync_incoming = _hardkill_after_real_sync_incoming
+    try:
+        r = c.post("/api/sync/initial")
+        check("раунд 1 запущен", r.status_code == 200, f"status={r.status_code}")
+        deadline = time.time() + 30.0
+        thread_died = False
+        while time.time() < deadline:
+            with mss._threads_lock:
+                th = mss._threads.get(org_id)
+            if th is not None and not th.is_alive():
+                thread_died = True
+                break
+            time.sleep(0.1)
+        check("раунд 1: фоновый поток действительно умер (настоящий kill, "
+              "не мягкое исключение)", thread_died, f"thread_died={thread_died}")
+    finally:
+        mss._sync_incoming = real_sync_incoming
+
+    stuck = c.get("/api/sync/status").json()
+    check("раунд 1: строка состояния зависла в running (ни один except её "
+          "не поймал — ровно то, что оставляет настоящий kill)",
+          stuck.get("state") == "running", f"state={stuck.get('state')}")
+
+    mss.reset_stale_running()  # тот же путь, которым продакшн поднимает зависший running
+    st1 = c.get("/api/sync/status").json()
+    mss._today = real_today_fn
+    check("раунд 1 (после reset_stale_running) честно в error",
+          st1.get("state") == "error", f"state={st1.get('state')}")
+    stats1 = st1.get("stats") or {}
+    check("раунд 1: history_loaded_from == w_start месяца (граница уже "
+          "продвинута ДО что коммит id, не осталась старой)",
+          stats1.get("history_loaded_from") == w_start_at_crash,
+          f"history_loaded_from={stats1.get('history_loaded_from')} "
+          f"exp={w_start_at_crash}")
+    check("раунд 1: committed == 8 СРАЗУ в первом же snapshot с новой "
+          "границей — не 0",
+          stats1.get("sales_docs_skipped_store_committed") == 8, f"stats={stats1}")
+    check("раунд 1: transient id-буфер не протекает (уже потреблён коммитом "
+          "до kill)",
+          "sales_docs_skipped_store_ids" not in stats1, f"stats={stats1}")
+
+    print(f"\n== [часть 2, month-checkpoint-before-boundary-leak] Раунд 2 "
+          f"(резюме через {gap} дн. реального разрыва — resume_from "
+          f"схлопнется к oldest, минор 7) ==")
+    mock_api.post("/__test/faults", json={})
+    mock_api.post("/__test/reset_skip_store_docs")
+    r = c.post("/api/sync/run")
+    check("раунд 2 (резюме) запущен", r.status_code == 200, f"status={r.status_code}")
+    st2 = wait_sync_done(c, timeout=90.0)
+    check("раунд 2 дошёл до done", st2.get("state") == "done",
+          f"state={st2.get('state')} error={st2.get('error')}")
+    check("раунд 2 реально пошёл веткой initial (resume_from)",
+          st2.get("mode") == "initial", f"mode={st2.get('mode')}")
+    stats2 = st2.get("stats") or {}
+    check("раунд 2: точка продолжения СХЛОПНУЛАСЬ к oldest (минор 7) — "
+          "подтверждение, что мы действительно бьём именно эту ветку, а "
+          "не widened-reread фазы history",
+          stats2.get("history_chunks_total") == 0, f"stats={stats2}")
+    check("раунд 2: heal_from от oldest честно НЕ достаёт до w_start того "
+          "месяца — свой raw в этом раунде 0",
+          stats2.get("sales_docs_skipped_store") == 0, f"stats={stats2}")
+    check("ИТОГ: sticky == 8 — checkpoint, зафиксированный ДО boundary-"
+          "leak в раунде 1, пережил схлопывание resume_from к oldest и не "
+          "потерялся в None",
+          diag(st2) == 8, f"diagnostics={st2.get('diagnostics')}")
+
+    c.close()
+    mock_api.close()
+
+
 def run_part3_unit_lifecycle() -> None:
     """Прямая проверка чистой функции `_apply_skip_diagnostic_lifecycle` —
     быстрое точное покрытие всей таблицы решений без сетевого прогона синка.
@@ -1643,6 +1807,7 @@ def run() -> int:
     run_part2_boundary_before_commit_today()
     run_part2_stale_checkpoint_missing_stock()
     run_part2_stale_checkpoint_fingerprint_mismatch()
+    run_part2_month_checkpoint_before_boundary_leak()
     run_part3_unit_lifecycle()
     print(f"\nИТОГО: {len(PASS)} OK, {len(FAIL)} FAIL")
     return 1 if FAIL else 0
