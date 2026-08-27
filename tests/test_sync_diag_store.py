@@ -95,6 +95,27 @@ sales` только дописывает в него (`setdefault(...).append(..
 `_commit_skip_ids` ЗАБИРАЕТ transient-буфер (`stats.pop`, не `stats.get`)
 и не возвращает его — на КАЖДОМ пути, включая no-new-ids.
 
+Corrective #7 (P2, discussion_r3872928035) чинит УПОРЯДОЧИВАНИЕ, а не то,
+ЧТО именно коммитится (это уже закрыто corrective #5/#6): в `_run_initial`
+`_commit_skip_ids` вызывался ПОСЛЕ `_finalize_lite`/после общего `_persist`
+today-фазы — а ИМЕННО эти вызовы публикуют resume boundary
+(`history_loaded_from`, `history_loaded_to`, `window_done`), после которой
+следующий resume уже НЕ перечитает соответствующий диапазон. Прогон,
+убитый МЕЖДУ реальной публикацией границы (сетевой персист уже произошёл)
+и коммитом id, оставлял snapshot с положительным raw и непотреблёнными
+transient id, но `sales_docs_skipped_store_committed` так и оставался 0
+(поле присутствует — инициализировано в начале `_run_initial`, — поэтому
+fallback на raw в `_skip_segment_contribution` не срабатывал): следующий
+resume пропускал уже закрытый диапазон и НАВСЕГДА терял находку. Фикс —
+`_commit_skip_ids` теперь вызывается СРАЗУ после каждого успешного
+sales-коммита и СТРОГО ДО публикации соответствующей ему resume-границы
+(today-фаза, resumed heal_from месячной фазы, fresh месячная фаза);
+упорядочивание по чанкам истории уже было верным и не менялось. RED-тесты
+не ждут настоящего SIGKILL — monkeypatch на `_finalize_lite`/`_persist`
+вызывает РЕАЛЬНУЮ реализацию (граница ДЕЙСТВИТЕЛЬНО публикуется в БД), а
+сразу после её возврата поднимает исключение, что и воспроизводит момент
+kill сразу после network-persist.
+
 Запуск из корня репозитория:  python tests/test_sync_diag_store.py
 """
 import json
@@ -975,6 +996,201 @@ def run_part2_committed_boundary() -> None:
     mock_api.close()
 
 
+def run_part2_boundary_before_commit_month() -> None:
+    """Corrective #7, сценарий A (P2 discussion_r3872928035): worker убит
+    ПОСЛЕ того, как `_finalize_lite` уже опубликовал resume boundary
+    (`history_loaded_from`, `window_done` — реальный `_persist` внутри неё
+    ДЕЙСТВИТЕЛЬНО выполняется), но ДО коммита id пропущенных документов.
+
+    До corrective #7 `_commit_skip_ids` вызывался ПОСЛЕ `_finalize_lite` —
+    значит именно в этом окне убитый прогон оставлял snapshot с raw=8,
+    непотреблёнными transient id, но `sales_docs_skipped_store_committed`
+    так и остался 0 (поле УЖЕ присутствует — инициализировано в начале
+    `_run_initial`, — поэтому fallback на raw в `_skip_segment_contribution`
+    не срабатывал: `_SKIP_COMMITTED_KEY in stats` было True). Следующий
+    resume пропускал уже закрытое (`window_done=True`) окно и НАВСЕГДА
+    терял находку.
+
+    Тест НЕ ждёт настоящего SIGKILL — вместо этого monkeypatch'ит
+    `_finalize_lite` так, что РЕАЛЬНАЯ реализация отрабатывает целиком
+    (граница ДЕЙСТВИТЕЛЬНО публикуется в БД), а сразу после её возврата
+    поднимается исключение — это ТОЧНО то состояние БД, которое оставил бы
+    процесс, убитый в момент после network-return persist'а.
+    """
+    from app import ms_sync as mss
+
+    c = client()
+    mock_api = httpx.Client(base_url=f"http://127.0.0.1:{MOCK_PORT}", timeout=30.0)
+    all_stores = [sid for sid, _ in mock_ms.STORES]
+    org_id = register_and_connect_ms(c, "owner-k@diag.test",
+                                     "Организация K (boundary-before-commit-month)",
+                                     all_stores)
+
+    window_days = int(os.environ["INITIAL_WINDOW_DAYS"])
+    w_start = (date.today() - timedelta(days=window_days - 1)).isoformat()
+    SKIP_STORE = "st-ghost-test-k"
+    mock_api.post("/__test/skip_store_doc", json={
+        "entity": "demand", "store": SKIP_STORE, "date": w_start, "count": 8,
+    })
+
+    real_finalize_lite = mss._finalize_lite
+
+    def _crash_after_real_finalize_lite(*args, **kwargs):
+        real_finalize_lite(*args, **kwargs)  # граница РЕАЛЬНО опубликована в БД
+        raise RuntimeError("DATA-8 corrective #7 RED: имитация kill сразу "
+                           "после публикации resume boundary")
+
+    mss._finalize_lite = _crash_after_real_finalize_lite
+
+    print("\n== [часть 2, boundary-before-commit-month] Раунд 1: "
+          "_finalize_lite реально публикует границу, затем имитируем kill "
+          "ДО коммита id ==")
+    try:
+        r = c.post("/api/sync/initial")
+        check("раунд 1 запущен", r.status_code == 200, f"status={r.status_code}")
+        st1 = wait_sync_done(c)
+    finally:
+        mss._finalize_lite = real_finalize_lite  # снять monkeypatch немедленно
+
+    check("раунд 1 честно упал (error) — имитированный kill",
+          st1.get("state") == "error", f"state={st1.get('state')}")
+    stats1 = st1.get("stats") or {}
+    check("boundary РЕАЛЬНО опубликована в БД (history_loaded_from == w_start)",
+          stats1.get("history_loaded_from") == w_start,
+          f"history_loaded_from={stats1.get('history_loaded_from')}")
+    check("window_done РЕАЛЬНО опубликован (True)",
+          stats1.get("window_done") is True, f"window_done={stats1.get('window_done')}")
+    check("раунд 1: СВОЙ raw == 8 (found до kill)",
+          stats1.get("sales_docs_skipped_store") == 8, f"stats={stats1}")
+    check("раунд 1: committed == 8 СРАЗУ ПОСЛЕ публикации границы, НЕ 0 — "
+          "commit теперь происходит ДО _finalize_lite, а не после",
+          stats1.get("sales_docs_skipped_store_committed") == 8, f"stats={stats1}")
+    check("раунд 1: transient id-буфер не протекает (уже потреблён коммитом "
+          "ДО падения)",
+          "sales_docs_skipped_store_ids" not in stats1, f"stats={stats1}")
+
+    print("\n== [часть 2, boundary-before-commit-month] Раунд 2 (resume, "
+          "фолт снят): подтверждаем, что находка НЕ потеряна навсегда ==")
+    mock_api.post("/__test/faults", json={})
+    mock_api.post("/__test/reset_skip_store_docs")
+    r = c.post("/api/sync/run")
+    check("раунд 2 (резюме) запущен", r.status_code == 200, f"status={r.status_code}")
+    st2 = wait_sync_done(c)
+    check("раунд 2 дошёл до done", st2.get("state") == "done",
+          f"state={st2.get('state')} error={st2.get('error')}")
+    check("раунд 2 реально пошёл веткой initial (resume_from)",
+          st2.get("mode") == "initial", f"mode={st2.get('mode')}")
+    check("ИТОГ: sticky == 8 — находка месячного окна пережила имитацию kill "
+          "и не потерялась навсегда",
+          diag(st2) == 8, f"diagnostics={st2.get('diagnostics')}")
+
+    c.close()
+    mock_api.close()
+
+
+def run_part2_boundary_before_commit_today() -> None:
+    """Corrective #7, сценарий B («тот же класс упорядочивания в resumed
+    today», явно названный в CLAIM): worker убит ПОСЛЕ того, как фаза today
+    на резюме опубликовала свою границу (`history_loaded_to` через
+    `_persist`), но ДО коммита id, найденных её собственным
+    (принудительным) перечитыванием «сегодня».
+
+    Раунд 1 (fresh, без пропусков) падает в фазе history — устанавливает
+    resume point без единого пропуска. Раунд 2 (resume): подкладываем
+    пропуски на «сегодня» (диапазон, который фаза today на резюме читает
+    ВСЕГДА), затем monkeypatch на `_persist` поднимает исключение СРАЗУ
+    ПОСЛЕ того, как реальный вызов уже опубликовал `history_loaded_to`
+    именно для этого шага (различаем по уникальному `detail`).
+    """
+    from app import ms_sync as mss
+
+    c = client()
+    mock_api = httpx.Client(base_url=f"http://127.0.0.1:{MOCK_PORT}", timeout=30.0)
+    all_stores = [sid for sid, _ in mock_ms.STORES]
+    org_id = register_and_connect_ms(c, "owner-l@diag.test",
+                                     "Организация L (boundary-before-commit-today)",
+                                     all_stores)
+
+    window_days = int(os.environ["INITIAL_WINDOW_DAYS"])
+    w_start = (date.today() - timedelta(days=window_days - 1)).isoformat()
+    today_iso = date.today().isoformat()
+    mock_api.post("/__test/faults", json={"docs_429_before": w_start})
+
+    print("\n== [часть 2, boundary-before-commit-today] Раунд 1: fresh, "
+          "без пропусков, падает в фазе history (устанавливает resume point) ==")
+    r = c.post("/api/sync/initial")
+    check("раунд 1 запущен", r.status_code == 200, f"status={r.status_code}")
+    st1 = wait_sync_done(c)
+    check("раунд 1 честно упал (error)", st1.get("state") == "error",
+          f"state={st1.get('state')}")
+    check("раунд 1: resume point сохранён (history_loaded_from == w_start)",
+          (st1.get("stats") or {}).get("history_loaded_from") == w_start,
+          f"stats={st1.get('stats')}")
+
+    SKIP_STORE = "st-ghost-test-l"
+    mock_api.post("/__test/skip_store_doc", json={
+        "entity": "demand", "store": SKIP_STORE, "date": today_iso, "count": 4,
+    })
+    # docs_429_before остаётся активным — история по-прежнему заблокирована,
+    # но нас интересует именно ФАЗА TODAY резюме, которая идёт раньше неё.
+
+    real_persist = mss._persist
+    TARGET_DETAIL = "Остатки на сегодня обновлены"
+
+    def _crash_after_today_persist(org_id_, stats_, **kwargs):
+        real_persist(org_id_, stats_, **kwargs)  # граница РЕАЛЬНО опубликована
+        if kwargs.get("detail") == TARGET_DETAIL:
+            raise RuntimeError("DATA-8 corrective #7 RED: имитация kill "
+                               "сразу после публикации границы фазы today")
+
+    mss._persist = _crash_after_today_persist
+
+    print("\n== [часть 2, boundary-before-commit-today] Раунд 2 (resume): "
+          "фаза today публикует history_loaded_to, затем имитируем kill "
+          "ДО коммита id ==")
+    try:
+        r = c.post("/api/sync/run")
+        check("раунд 2 (резюме) запущен", r.status_code == 200, f"status={r.status_code}")
+        st2 = wait_sync_done(c)
+    finally:
+        mss._persist = real_persist  # снять monkeypatch немедленно
+
+    check("раунд 2 честно упал (error) — имитированный kill",
+          st2.get("state") == "error", f"state={st2.get('state')}")
+    stats2 = st2.get("stats") or {}
+    check("раунд 2 реально пошёл веткой initial (resume_from)",
+          st2.get("mode") == "initial", f"mode={st2.get('mode')}")
+    check("boundary фазы today РЕАЛЬНО опубликована (history_loaded_to == сегодня)",
+          stats2.get("history_loaded_to") == today_iso,
+          f"history_loaded_to={stats2.get('history_loaded_to')}")
+    check("раунд 2: СВОЙ raw == 4 (найдено на форсированной перечитке "
+          "«сегодня» до kill)",
+          stats2.get("sales_docs_skipped_store") == 4, f"stats={stats2}")
+    check("раунд 2: committed == 4 СРАЗУ ПОСЛЕ публикации границы фазы "
+          "today, НЕ 0",
+          stats2.get("sales_docs_skipped_store_committed") == 4, f"stats={stats2}")
+    check("раунд 2: transient id-буфер не протекает",
+          "sales_docs_skipped_store_ids" not in stats2, f"stats={stats2}")
+    check("sticky == 4 сразу после имитированного kill",
+          diag(st2) == 4, f"diagnostics={st2.get('diagnostics')}")
+
+    print("\n== [часть 2, boundary-before-commit-today] Раунд 3 (resume, "
+          "фолты сняты): подтверждаем, что находка НЕ потеряна навсегда ==")
+    mock_api.post("/__test/faults", json={})
+    mock_api.post("/__test/reset_skip_store_docs")
+    r = c.post("/api/sync/run")
+    check("раунд 3 (резюме) запущен", r.status_code == 200, f"status={r.status_code}")
+    st3 = wait_sync_done(c)
+    check("раунд 3 дошёл до done", st3.get("state") == "done",
+          f"state={st3.get('state')} error={st3.get('error')}")
+    check("ИТОГ: sticky == 4 — находка резюмированной фазы today пережила "
+          "имитацию kill и не потерялась навсегда",
+          diag(st3) == 4, f"diagnostics={st3.get('diagnostics')}")
+
+    c.close()
+    mock_api.close()
+
+
 def run_part3_unit_lifecycle() -> None:
     """Прямая проверка чистой функции `_apply_skip_diagnostic_lifecycle` —
     быстрое точное покрытие всей таблицы решений без сетевого прогона синка.
@@ -1235,6 +1451,8 @@ def run() -> int:
     run_part2_rebuild_accumulator()
     run_part2_no_overlap_today_reread()
     run_part2_committed_boundary()
+    run_part2_boundary_before_commit_month()
+    run_part2_boundary_before_commit_today()
     run_part3_unit_lifecycle()
     print(f"\nИТОГО: {len(PASS)} OK, {len(FAIL)} FAIL")
     return 1 if FAIL else 0

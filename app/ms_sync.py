@@ -1670,16 +1670,21 @@ async def _run_initial(org_id: int, client: MoySkladClient, active_wh: list,
     _write_warehouse_stock(org_id, by_wh, stats)
     stats["stock_dates"] += 1
     stats["stock_rows"] += len(batch)
+    # DATA-8 corrective #7 (P2 discussion_r3872928035): коммитим ДО
+    # `_persist` ниже — та строка публикует history_loaded_to (и на
+    # fresh-ветке history_loaded_from) в БД, после чего резюме на разрыве
+    # больше не перечитает эти даты. Убитый МЕЖДУ публикацией границы и
+    # коммитом id прогон раньше терял свежую находку безвозвратно: границе
+    # это уже не важно (она продвинута), а committed так и остался бы 0.
+    # Фаза today на резюме форсированно перечитывает «сегодня»
+    # (gap_dates=[today_iso] даже без реального разрыва) — _commit_skip_ids
+    # дедуплицирует по id документа, поэтому те же самые документы повторно
+    # не засчитаются, а генуинно новый документ на той же дате (появился
+    # между прогонами) — засчитается.
+    _commit_skip_ids(stats)
     _stage_end(stats, "today")
     _persist(org_id, stats, stage="today", progress=10.0,
              detail="Остатки на сегодня обновлены")
-
-    # DATA-8 corrective #5: фаза today на резюме форсированно перечитывает
-    # «сегодня» (см. gap_dates=[today_iso] выше) даже без реального разрыва —
-    # _commit_skip_ids дедуплицирует по id документа, поэтому те же самые
-    # документы повторно не засчитаются, а генуинно новый документ на той
-    # же дате (появился между прогонами) — засчитается.
-    _commit_skip_ids(stats)
 
     # ── Фаза month: окно быстрого старта ────────────────────────────────────
     if resumed:
@@ -1714,6 +1719,12 @@ async def _run_initial(org_id: int, client: MoySkladClient, active_wh: list,
                 await _sync_incoming(org_id, client, ext_to_pid, stats,
                                      progress=(20.0, 24.0))
                 stats["window_done"] = True
+        # DATA-8 corrective #7 (P2 discussion_r3872928035): коммитим ДО
+        # `_finalize_lite` — она публикует history_loaded_from/window_done
+        # через свой `_persist`, после чего heal_from на будущем резюме
+        # больше не перечитает этот догон. Без heal_from `_collect_sales`
+        # здесь не вызывался — коммитить нечего, вызов no-op.
+        _commit_skip_ids(stats)
         if _days_since(resume_from) >= INITIAL_WINDOW_DAYS or not remaining:
             _finalize_lite(org_id, stats, resume_from, active_wh, progress=25.0)
             activated = True
@@ -1757,15 +1768,19 @@ async def _run_initial(org_id: int, client: MoySkladClient, active_wh: list,
         # теперь продолжение вправе пропустить фазу month.
         stats["window_done"] = True
         _stage_end(stats, "month")
+        # DATA-8 corrective #7 (P2 discussion_r3872928035): коммитим ДО
+        # `_finalize_lite` — она публикует history_loaded_from/window_done
+        # через свой `_persist`. Прогон, убитый МЕЖДУ публикацией границы и
+        # коммитом id, раньше оставлял snapshot с положительным raw и
+        # непотреблёнными transient id, но committed=0 (инициализирован в
+        # начале `_run_initial`, а не отсутствует, поэтому fallback на raw в
+        # `_skip_segment_contribution` не срабатывал) — следующий resume
+        # пропускал уже закрытое окно (window_done=True) и НАВСЕГДА терял
+        # находку месячного окна ДО первого чанка истории.
+        _commit_skip_ids(stats)
         _finalize_lite(org_id, stats, w_start, active_wh, progress=25.0)
         activated = True
         remaining = [d for d in all_dates if d < w_start]
-
-    # DATA-8 corrective #5: month-фаза (несрезюмированный прогон) публикует
-    # окно ОДНОЙ транзакцией и больше никогда не перечитывается в рамках
-    # этой пересборки — безопасно закоммичено. На резюме без heal_from
-    # _collect_sales здесь не вызывался — коммитить нечего, вызов no-op.
-    _commit_skip_ids(stats)
 
     # ── Фаза history: назад чанками ─────────────────────────────────────────
     stats["phase"] = "history"
