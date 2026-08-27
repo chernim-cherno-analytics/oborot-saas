@@ -155,6 +155,16 @@ def make_stubs(bindir: Path, *, health_ok=True, pip_ok=True) -> None:
         '    pip) echo "подставной mv: отказ на починке $dest" >&2; exit 1;;\n'
         '  esac\n'
         'fi\n'
+        # FAIL_MV_SILENT — сбой хуже явного отказа: переименование ТИХО не
+        # происходит, а код возврата 0. Починка отчитывается об успехе, файл
+        # остаётся прежним. Это единственный способ проверить, что проверка
+        # обёрток действительно независима от починки, а не пересказывает её
+        # отчёт: поймать такое обязана именно она.
+        'if [ "${FAIL_MV_SILENT:-0}" = "1" ]; then\n'
+        '  case "${dest##*/}" in\n'
+        '    pip) rm -f "$1"; exit 0;;\n'
+        '  esac\n'
+        'fi\n'
         'exec /bin/mv "$@"\n', encoding="utf-8")
     body = '{"status":"ok","db":true}' if health_ok else '{"status":"not ready"}'
     code = "0" if health_ok else "1"
@@ -236,6 +246,12 @@ def make_stubs(bindir: Path, *, health_ok=True, pip_ok=True) -> None:
         "            shutil.copyfile(args[-1], os.path.join(venv, 'INSTALLED'))\n"
         "        except OSError:\n"
         "            pass\n"
+        "    if args[:1] == ['--version']:\n"
+        "        # Печатаем окружение, в котором нас исполнили. Снаружи это\n"
+        "        # единственный способ увидеть, ЧЕРЕЗ КАКОЙ интерпретатор\n"
+        "        # запустилась обёртка: шебанг на чужой, но живой python\n"
+        "        # выглядит совершенно рабочим и об ошибке не говорит ничем.\n"
+        "        print(venv)\n"
         "    return 0\n", encoding="utf-8")
     (shim / "pip" / "__main__.py").write_text(
         "import sys\nfrom pip import run\nsys.exit(run(False))\n", encoding="utf-8")
@@ -925,6 +941,83 @@ def main() -> int:
     check("сказано, что прежнее окружение цело и откат не требует сети",
           "откат обойдётся без сети" in out, out[-300:])
     make_stubs(WORK / "stub-bin")
+
+    # Два раздела ниже добавлены correctivе-циклом по внешнему ревью и стоят
+    # последними намеренно: они оставляют площадку в другом релизе, и разделы
+    # выше пришлось бы приводить в согласованное состояние ради порядка чтения.
+    # После них площадка сразу разбирается, поэтому убирать за собой нечего.
+    print("\n== Чужой, но ЖИВОЙ интерпретатор в шебанге ==")
+    # Худший случай, и первая версия правила его пропускала: шебанг указывает не
+    # в никуда, а на НАСТОЯЩИЙ, запускаемый интерпретатор соседнего релиза.
+    # Обёртка при этом работает — и потому не выглядит сломанной ничем, — но
+    # исполняется чужим окружением: чужие библиотеки, чужие версии.
+    #
+    # Сосед здесь не выдуман: `venv-<CURRENT>` создаёт сама подмена окружения,
+    # он же цель отката, и уборка его не трогает. На сервере рядом живут ещё и
+    # отложенные окружения прежних релизов — `OBOROT_VENV_KEEP` их и держит.
+    git(["checkout", "-q", "main"], cwd=app)
+    vlive = add_commit(app, "vlive")
+    git(["checkout", "-q", "--detach", v3], cwd=app)
+    foreign = WORK / f"venv-{v3}"
+    cached_live = WORK / f"venv-{vlive}"
+    shutil.rmtree(cached_live, ignore_errors=True)
+    shutil.copytree(WORK / "venv", cached_live, symlinks=True)
+    (cached_live / "RELEASE_SHA").write_text(vlive + "\n", encoding="utf-8")
+    (cached_live / "INSTALLED").write_text("httpx==0.28.1\n# release vlive\n",
+                                           encoding="utf-8")
+    live_pip = cached_live / "bin" / "pip"
+    live_pip.write_text(
+        f"#!{foreign}/bin/python\n"
+        + live_pip.read_text(encoding="utf-8").split("\n", 1)[1], encoding="utf-8")
+    live_pip.chmod(0o755)
+    (WORK / "pip.log").write_text("", encoding="utf-8")
+    rc, out = run(["bash", script, vlive], env=deploy_env(app))
+    check("выкладка прошла", rc == 0 and head_of(app) == vlive, out[-300:])
+    check("сеть не понадобилась: кэшированное окружение переиспользовано",
+          "install" not in (WORK / "pip.log").read_text(encoding="utf-8"))
+    # Без этой проверки весь раздел ничего не значит: если сосед не пережил
+    # выкладку, случай выродился бы в прежний «пути больше нет».
+    check("ЧУЖОЙ интерпретатор при этом жив и запускается",
+          (foreign / "bin" / "python").exists()
+          and run([str(foreign / "bin" / "python"), "-m", "pip", "--version"],
+                  env=deploy_env(app))[0] == 0,
+          str(foreign.name[:16]))
+    first_line = (WORK / "venv" / "bin" / "pip").read_text(encoding="utf-8").splitlines()[0]
+    check("шебанг приведён к интерпретатору ЭТОГО окружения, а не оставлен чужим",
+          first_line == f"#!{WORK / 'venv'}/bin/python", first_line)
+    rc_pip, out_pip = run([str(WORK / "venv" / "bin" / "pip"), "--version"],
+                          env=deploy_env(app))
+    check("и обёртка ИСПОЛНЯЕТСЯ окружением этого релиза, а не соседнего",
+          rc_pip == 0
+          and os.path.realpath(out_pip.strip()) == os.path.realpath(WORK / "venv"),
+          f"rc={rc_pip} {out_pip.strip()[:120]}")
+
+    print("\n== Починка отчиталась об успехе, а шебанг остался чужим ==")
+    # Проверка обёрток обязана быть независимой от починки, а не пересказывать
+    # её отчёт. Подставной mv тихо не выполняет переименование и возвращает 0:
+    # починка считает, что справилась, файл при этом прежний. Поймать это может
+    # только проверка — и обязана поймать ДО перезапуска службы.
+    git(["checkout", "-q", "main"], cwd=app)
+    vsil = add_commit(app, "vsil")
+    git(["checkout", "-q", "--detach", vlive], cwd=app)
+    foreign2 = WORK / f"venv-{vlive}"
+    cached_sil = WORK / f"venv-{vsil}"
+    shutil.rmtree(cached_sil, ignore_errors=True)
+    shutil.copytree(WORK / "venv", cached_sil, symlinks=True)
+    (cached_sil / "RELEASE_SHA").write_text(vsil + "\n", encoding="utf-8")
+    (cached_sil / "INSTALLED").write_text("httpx==0.28.1\n# release vsil\n",
+                                          encoding="utf-8")
+    sil_pip = cached_sil / "bin" / "pip"
+    sil_pip.write_text(
+        f"#!{foreign2}/bin/python\n"
+        + sil_pip.read_text(encoding="utf-8").split("\n", 1)[1], encoding="utf-8")
+    sil_pip.chmod(0o755)
+    (WORK / "systemctl.log").write_text("", encoding="utf-8")
+    before_env = (WORK / "env").read_text(encoding="utf-8")
+    rc, out = run(["bash", script, vsil], env=deploy_env(app, {"FAIL_MV_SILENT": "1"}))
+    check("названо, что обёртка указывает не на интерпретатор этого окружения",
+          "указывают не на" in out, out[-500:])
+    check_rolled_back_to(vlive, out, rc, before_env, "# release vlive")
 
     shutil.rmtree(WORK, ignore_errors=True)
     print(f"\nИТОГО: {len(PASS)} OK, {len(FAIL)} FAIL")
