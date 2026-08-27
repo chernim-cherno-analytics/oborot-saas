@@ -101,6 +101,9 @@ async def ms_app_entry(
             pw_hash=auth.hash_password(secrets.token_urlsafe(24)),
             name=str(ctx.get("fullName") or ctx.get("name") or uid),
             ms_uid=uid,
+            # SEC-3 corrective: непредсказуемый положительный старт версии
+            # сессии — не 0 из server_default (см. auth.new_session_version_seed).
+            session_version=auth.new_session_version_seed(),
         )
         db.add(user)
         db.flush()
@@ -121,7 +124,7 @@ async def ms_app_entry(
     response = RedirectResponse("/", status_code=302)
     # В iframe на проде кука должна быть SameSite=None+Secure (см. докстринг).
     samesite = "none" if is_prod() else "lax"
-    auth.set_session(response, user.id, org.id, samesite=samesite)
+    auth.set_session(response, user.id, org.id, user.session_version, samesite=samesite)
     # Помечаем сессию встроенной: base.html отрендерит компактную оболочку без
     # нашего сайдбара/топбара (их даёт МойСклад снаружи).
     auth.set_embed(response, samesite=samesite)

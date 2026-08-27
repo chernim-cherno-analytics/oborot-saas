@@ -380,15 +380,60 @@ def _serializer() -> URLSafeTimedSerializer:
     return URLSafeTimedSerializer(get_signing_secret(), salt="oborot-session")
 
 
-def set_session(response, user_id: int, org_id: int, samesite: str = "lax") -> None:
+# Верхняя граница стартового сида версии сессии. НЕ 2**31-1 (знаковый предел
+# Postgres INTEGER): секунду проведи в этом дне — сид может выпасть равным
+# самому потолку, и тогда первая же смена пароля (session_version + 1, см.
+# api_change_password) переполнила бы 32-битный INTEGER на проде. Потолок сида
+# — 2**30-1, то есть от ЛЮБОГО возможного сида до потолка INTEGER остаётся
+# гарантированный запас минимум 2**30 (≈миллиард) последовательных
+# инкрементов — для одного пользователя это менять пароль миллиард раз,
+# на практике недостижимо, а до bigint-миграции есть большой запас времени
+# среагировать. SQLite конфликта не создаёт: у него integer динамической
+# ширины до 8 байт, потолок здесь — только про Postgres.
+_SESSION_VERSION_SEED_MAX = 2**30 - 1
+
+
+def new_session_version_seed() -> int:
+    """SEC-3 corrective: непредсказуемый ПОЛОЖИТЕЛЬНЫЙ старт session_version.
+
+    КАЖДЫЙ новый User, которого создаёт приложение (обычная регистрация,
+    вход из iframe МойСклад), обязан вызвать это при создании — а не
+    полагаться на server_default=0 модели. default=0 остаётся только для
+    АДДИТИВНОЙ миграции существующих строк (см.
+    models._ensure_users_session_version) — там 0 обязателен для обратной
+    совместимости с довыпущенными куками без поля версии.
+
+    Если этот сид не задать явно, свежесозданный пользователь получит те же
+    0/1/2..., что и любая нормальная последовательность версий. SQLite
+    `INTEGER PRIMARY KEY` без AUTOINCREMENT переиспользует id удалённой
+    строки, как только она была последней (max(id)+1 после удаления
+    последней строки с этим id == тот же id): новый владелец слота с версией
+    0 совпал бы с любой ДЕЙСТВИТЕЛЬНО существовавшей ранее (и уже отозванной)
+    кукой того же user_id, воскрешая чужой доступ. Случайный положительный
+    сид из широкого диапазона (см. _SESSION_VERSION_SEED_MAX про запас до
+    переполнения) делает такое совпадение криптографически ничтожным:
+    secrets.randbelow — CSPRNG, а не random/hash от времени.
+    """
+    return secrets.randbelow(_SESSION_VERSION_SEED_MAX) + 1
+
+
+def set_session(response, user_id: int, org_id: int, session_version: int, samesite: str = "lax") -> None:
     """Ставит подписанную сессионную куку на ответ.
+
+    session_version — версия сессии пользователя НА МОМЕНТ ВЫДАЧИ (SEC-3),
+    обязательный параметр без дефолта: молчаливый дефолт здесь — источник
+    самого дефекта, который эта версия закрывает (перевыпуск куки со старой
+    версией после смены пароля отозвал бы собственную свежую сессию).
+    Все call site'ы обязаны передавать актуальное `user.session_version`.
+    resolve_auth сравнивает её с текущей записью пользователя и отзывает
+    куку, чья версия отстала (смена пароля увеличивает её на 1).
 
     samesite: обычный вход — "lax" (дефолт). Вход из iframe МойСклад
     (routes_ms_app) на проде передаёт "none": третьесторонняя кука во фрейме
     требует SameSite=None + Secure. В dev (http) None+Secure браузер отбросил
     бы — остаётся "lax" (iframe-вход в dev работает только same-site).
     """
-    value = _serializer().dumps({"user_id": user_id, "org_id": org_id})
+    value = _serializer().dumps({"user_id": user_id, "org_id": org_id, "v": session_version})
     response.set_cookie(
         SESSION_COOKIE,
         value,
@@ -548,6 +593,16 @@ def resolve_auth(request: Request, db: Session) -> AuthContext | None:
         return None
     user = db.get(User, sess.get("user_id"))
     if not user:
+        return None
+    # SEC-3: гашение сессий после смены пароля. Кука без поля версии — это
+    # довыпущенный формат (до этой правки): трактуем как версию 0, чтобы сам
+    # деплой миграции никого не разлогинил (у старых строк users тоже 0 — см.
+    # models._ensure_users_session_version). Любое НЕЦЕЛОЕ значение
+    # (строка, дробь, bool — bool в Python является подклассом int, поэтому
+    # исключён явно через type()) — fail-closed отказ, а не «как ноль»: это
+    # не легитимный формат ни старой, ни новой куки.
+    cookie_version = sess.get("v", 0)
+    if type(cookie_version) is not int or cookie_version != user.session_version:
         return None
     org_id = sess.get("org_id")
     member = db.get(Membership, (user.id, org_id)) if org_id else None

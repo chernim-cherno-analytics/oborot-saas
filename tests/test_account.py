@@ -167,6 +167,98 @@ def org_rows(org_id: int) -> dict[str, int]:
         con.close()
 
 
+def cookie_client(payload: dict) -> httpx.Client:
+    """Клиент с вручную выставленной сессионной кукой (для legacy/битых версий)."""
+    raw = auth._serializer().dumps(payload)
+    cl = httpx.Client(headers={"X-Oborot-CSRF": "1"}, base_url=BASE, timeout=30.0)
+    cl.cookies.set(auth.SESSION_COOKIE, raw)
+    return cl
+
+
+def cookie_client_raw(raw: str) -> httpx.Client:
+    """Клиент с вручную выставленной СЫРОЙ (уже подписанной) сессионной кукой."""
+    cl = httpx.Client(headers={"X-Oborot-CSRF": "1"}, base_url=BASE, timeout=30.0)
+    cl.cookies.set(auth.SESSION_COOKIE, raw)
+    return cl
+
+
+def cookie_version(resp: httpx.Response):
+    """Версия (поле 'v') из Set-Cookie ответа; None, если куки не было."""
+    raw = resp.cookies.get(auth.SESSION_COOKIE)
+    if not raw:
+        return None
+    return auth._serializer().loads(raw).get("v", 0)
+
+
+def run_concurrent_password_changes(clients_and_passwords):
+    """Гоняет несколько POST /api/account/password ПОДЛИННО параллельно.
+
+    Тестовый барьер (НЕ production sleep/hook): monkeypatch'ит auth.hash_password
+    так, что все параллельные запросы гарантированно оказываются внутри
+    обработчика ОДНОВРЕМЕННО, непосредственно перед записью в БД. Без барьера
+    гонка была бы вероятностной — можно было бы годами не поймать её на быстрой
+    машине. Патч живёт ровно на время этого вызова и снимается в finally.
+    """
+    n = len(clients_and_passwords)
+    barrier = threading.Barrier(n)
+    orig_hash = auth.hash_password
+
+    def _barrier_hash(password):
+        barrier.wait(timeout=10)
+        return orig_hash(password)
+
+    results = [None] * n
+
+    def _worker(i, cl, new_pw):
+        results[i] = cl.post("/api/account/password", json={
+            "current_password": "secret123", "new_password": new_pw, "confirm_password": new_pw,
+        })
+
+    auth.hash_password = _barrier_hash
+    try:
+        threads = [
+            threading.Thread(target=_worker, args=(i, cl, pw))
+            for i, (cl, pw) in enumerate(clients_and_passwords)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=20)
+    finally:
+        auth.hash_password = orig_hash
+    return results
+
+
+def patch_session_version_seeds(sequence):
+    """Test-only: подставляет ФИКСИРОВАННУЮ последовательность вместо
+    auth.new_session_version_seed, чтобы delete→register тест доказывал
+    отсутствие коллизии версий ДЕТЕРМИНИРОВАННО, а не полагался на то, что
+    два независимых случайных сида не совпадут (вероятность коллизии мала,
+    но не ноль — «детерминированный» тест не имеет права полагаться на неё).
+
+    Патчит, только если helper вообще существует: на BASE-коммите до SEC-3
+    corrective (166c725) его ещё нет, и тогда патч не устанавливается вовсе
+    — там новый пользователь получает version=0 прямо из server_default
+    модели (без какой-либо случайности), и исходный delete→register дефект
+    воспроизводится как и раньше, RED на том коммите не теряется.
+
+    Возвращает (restore, patched): restore — функция отката, ОБЯЗАНА быть
+    вызвана в finally; patched — True, если подмена реально произошла (это
+    определяет, какого рода assert имеет смысл делать дальше — точное
+    зафиксированное значение или общий факт «есть версия, не 0»).
+    """
+    if not hasattr(auth, "new_session_version_seed"):
+        return (lambda: None), False
+    orig = auth.new_session_version_seed
+    it = iter(sequence)
+    auth.new_session_version_seed = lambda: next(it)
+
+    def _restore():
+        auth.new_session_version_seed = orig
+
+    return _restore, True
+
+
 def main() -> int:
     srv = ServerThread(oborot_app, APP_PORT)
     srv.start()
@@ -235,6 +327,286 @@ def run_scenario() -> int:
     r = httpx.post(f"{BASE}/api/account/password", json={}, timeout=30.0)
     check("смена пароля защищена от CSRF (нет заголовка — 403)", r.status_code == 403,
           f"status={r.status_code}")
+
+    print("== Гашение сессий после смены пароля (SEC-3) ==")
+    c1 = client()
+    register(c1, "sec3@test.io", "Сек-бренд")
+    c2 = client()
+    r = c2.post("/login", data={"email": "sec3@test.io", "password": "secret123"})
+    check("второе устройство вошло тем же паролем", r.status_code == 303, f"status={r.status_code}")
+    check("оба устройства видят защищённые данные до смены пароля",
+          c1.get("/api/account").status_code == 200 and c2.get("/api/account").status_code == 200)
+
+    c3 = client()
+    register(c3, "sec3-other@test.io", "Другой-бренд")
+    check("сторонний пользователь тоже авторизован", c3.get("/api/account").status_code == 200)
+
+    r = c1.post("/api/account/password", json={
+        "current_password": "secret123", "new_password": "новыйпароль-sec3",
+        "confirm_password": "новыйпароль-sec3",
+    })
+    check("смена пароля с первого устройства — 200", r.status_code == 200, f"status={r.status_code}")
+
+    check("первое устройство (сменившее пароль) осталось авторизовано",
+          c1.get("/api/account").status_code == 200)
+
+    r2 = c2.get("/api/account")
+    check("второе устройство отозвано сразу после смены пароля (401)",
+          r2.status_code == 401, f"status={r2.status_code}")
+
+    r2_page = c2.get("/account", follow_redirects=False)
+    check("второе устройство на HTML-странице получает редирект на вход",
+          r2_page.status_code == 302 and r2_page.headers.get("location") == "/login",
+          f"status={r2_page.status_code} loc={r2_page.headers.get('location')}")
+
+    check("сторонний пользователь не задет чужой сменой пароля",
+          c3.get("/api/account").status_code == 200)
+
+    c_old = client()
+    r = c_old.post("/login", data={"email": "sec3@test.io", "password": "secret123"})
+    check("старый пароль после смены больше не пускает (SEC-3)",
+          r.status_code == 200 and "Неверный" in r.text)
+
+    c_new = client()
+    r = c_new.post("/login", data={"email": "sec3@test.io", "password": "новыйпароль-sec3"},
+                   follow_redirects=False)
+    check("новый пароль пускает", r.status_code == 303, f"status={r.status_code}")
+    check("вход новым паролем даёт рабочую сессию", c_new.get("/api/account").status_code == 200)
+
+    print("== Кука без версии (пред-миграционный формат) и битая версия (SEC-3) ==")
+
+    c_legacy = client()
+    register(c_legacy, "sec3-legacy@test.io", "Легаси-бренд")
+    legacy_uid = sql("SELECT id FROM users WHERE email = ?", "sec3-legacy@test.io")[0][0]
+    legacy_org = org_of("sec3-legacy@test.io")
+    # Свежая регистрация теперь сама минтит случайный положительный сид
+    # (SEC-3 corrective #2, см. auth.new_session_version_seed) — она больше не
+    # представляет «старую» строку. Довыпущенная/мигрированная строка
+    # получает version=0 из ALTER'а с DEFAULT 0 (models._ensure_users_session_version),
+    # а не из этого пути создания пользователя — сводим строку к такому виду
+    # руками, чтобы честно проверить именно легаси-сценарий.
+    exec_sql("UPDATE users SET session_version = 0 WHERE id = ?", legacy_uid)
+    # c_legacy сам получил куку со случайным сидом при регистрации — без
+    # переиздания она разойдётся с только что подставленной DB version=0.
+    c_legacy.cookies.set(auth.SESSION_COOKIE,
+                          auth._serializer().dumps({"user_id": legacy_uid, "org_id": legacy_org, "v": 0}))
+
+    legacy_cookie_client = cookie_client({"user_id": legacy_uid, "org_id": legacy_org})
+    check("кука без поля версии (довыпущенный формат) работает при DB version 0",
+          legacy_cookie_client.get("/api/account").status_code == 200)
+
+    r = c_legacy.post("/api/account/password", json={
+        "current_password": "secret123", "new_password": "легаси-новый-пароль",
+        "confirm_password": "легаси-новый-пароль",
+    })
+    check("смена пароля у легаси-пользователя — 200", r.status_code == 200, f"status={r.status_code}")
+
+    check("та же кука без версии отозвана после первого инкремента версии",
+          legacy_cookie_client.get("/api/account").status_code == 401)
+
+    bad_str = cookie_client({"user_id": legacy_uid, "org_id": legacy_org, "v": "1"})
+    check("нечисловая (строковая) версия в куке — fail-closed 401",
+          bad_str.get("/api/account").status_code == 401)
+
+    bad_float = cookie_client({"user_id": legacy_uid, "org_id": legacy_org, "v": 1.0})
+    check("дробная версия в куке — fail-closed 401",
+          bad_float.get("/api/account").status_code == 401)
+
+    bad_bool = cookie_client({"user_id": legacy_uid, "org_id": legacy_org, "v": True})
+    check("булева версия в куке — fail-closed 401",
+          bad_bool.get("/api/account").status_code == 401)
+
+    print("== UI /account больше не обещает 7 дней на других устройствах (SEC-3) ==")
+    acc_html = c_new.get("/account").text
+    check("страница «Аккаунт» не утверждает, что чужой вход держится до 7 дней",
+          "до 7 дней" not in acc_html, "текст с ложным сроком всё ещё в разметке")
+
+    print("== Аддитивная миграция users.session_version (SEC-3) ==")
+    import tempfile
+    from concurrent.futures import ThreadPoolExecutor
+
+    from sqlalchemy import create_engine as _create_engine
+    from sqlalchemy import inspect as _inspect
+    from sqlalchemy import text as _text
+
+    from app import models as _models
+
+    old_db = Path(tempfile.mkdtemp()) / "old_users_schema.db"
+    old_engine = _create_engine(f"sqlite:///{old_db}", future=True,
+                                connect_args={"check_same_thread": False})
+    with old_engine.begin() as conn:
+        conn.execute(_text(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, email VARCHAR(255) NOT NULL, "
+            "pw_hash VARCHAR(255) NOT NULL, name VARCHAR(255) NOT NULL, created_at DATETIME)"))
+        conn.execute(_text(
+            "INSERT INTO users (id, email, pw_hash, name) VALUES (1, 'old@test.io', 'x', 'Старый')"))
+    _models.ensure_schema(bind=old_engine)
+    cols = {c["name"] for c in _inspect(old_engine).get_columns("users")}
+    check("миграция добавила session_version в существующую таблицу users",
+          "session_version" in cols, f"cols={sorted(cols)}")
+    with old_engine.begin() as conn:
+        row = conn.execute(_text(
+            "SELECT email, session_version FROM users WHERE id = 1")).first()
+    check("старый пользователь уцелел, session_version по умолчанию = 0",
+          tuple(row) == ("old@test.io", 0), f"row={tuple(row) if row else None}")
+    _models.ensure_schema(bind=old_engine)  # повторный прогон — идемпотентно
+    with old_engine.begin() as conn:
+        again = conn.execute(_text("SELECT session_version FROM users WHERE id = 1")).scalar()
+    check("повторный прогон миграции не меняет значение", again == 0, f"session_version={again}")
+    old_engine.dispose()
+
+    # Конкурентный старт нескольких воркеров: миграция не должна падать и не
+    # должна добавить колонку дважды.
+    old_db2 = Path(tempfile.mkdtemp()) / "old_users_schema_concurrent.db"
+    old_engine2 = _create_engine(f"sqlite:///{old_db2}", future=True,
+                                 connect_args={"check_same_thread": False})
+    with old_engine2.begin() as conn:
+        conn.execute(_text(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, email VARCHAR(255) NOT NULL, "
+            "pw_hash VARCHAR(255) NOT NULL, name VARCHAR(255) NOT NULL, created_at DATETIME)"))
+    errors = []
+
+    def _run_migration():
+        try:
+            _models.ensure_schema(bind=old_engine2)
+        except Exception as exc:  # noqa: BLE001 — конкурентная гонка не должна ронять воркер
+            errors.append(exc)
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        list(pool.map(lambda _: _run_migration(), range(6)))
+    check("конкурентный запуск миграции на нескольких воркерах не падает",
+          not errors, f"errors={errors}")
+    cols2 = [c["name"] for c in _inspect(old_engine2).get_columns("users")]
+    check("конкурентная миграция добавила колонку ровно один раз (без дублей)",
+          cols2.count("session_version") == 1, f"cols={cols2}")
+    old_engine2.dispose()
+
+    print("== Границы сида версии сессии не переполняют Postgres INTEGER (SEC-3 corrective #3) ==")
+    if not hasattr(auth, "new_session_version_seed"):
+        # BASE-коммит до SEC-3 corrective (166c725) — хелпера ещё нет, сама
+        # проверка неприменима. Не падаем: остальной сценарий (в частности,
+        # delete→register ниже) обязан продолжить выполняться и честно
+        # показать RED старого дефекта, а не потеряться в трейсбеке отсюда.
+        print("  SKIP auth.new_session_version_seed отсутствует на этом коммите — проверка неприменима")
+    else:
+        # Postgres INTEGER — знаковый 32-битный, потолок 2**31-1. Смена пароля
+        # инкрементирует session_version (см. api_change_password), поэтому сид
+        # обязан оставлять существенный гарантированный запас инкрементов ДО
+        # этого потолка, а не только не совпадать с ним в моменте выдачи.
+        _PG_INT32_MAX = 2**31 - 1
+        seed_samples = [auth.new_session_version_seed() for _ in range(3000)]
+        check("сид всегда положительный (никогда не 0 — легаси-версия зарезервирована за миграцией)",
+              min(seed_samples) >= 1, f"min={min(seed_samples)}")
+        check("сид никогда не достигает потолка Postgres INTEGER",
+              max(seed_samples) < _PG_INT32_MAX, f"max={max(seed_samples)}")
+        check("верхняя граница диапазона сида (auth._SESSION_VERSION_SEED_MAX) оставляет "
+              "не менее 2**30 гарантированных инкрементов до потолка Postgres INTEGER",
+              _PG_INT32_MAX - auth._SESSION_VERSION_SEED_MAX >= 2**30,
+              f"headroom={_PG_INT32_MAX - auth._SESSION_VERSION_SEED_MAX}")
+        check("ни один сэмпл не вышел за задокументированную границу диапазона",
+              max(seed_samples) <= auth._SESSION_VERSION_SEED_MAX,
+              f"max={max(seed_samples)} bound={auth._SESSION_VERSION_SEED_MAX}")
+
+    print("== Гонка: два одновременных POST /api/account/password (SEC-3 corrective #1) ==")
+    c_race_a = client()
+    register(c_race_a, "sec3-race@test.io", "Гонка-бренд")
+    c_race_b = client()
+    r = c_race_b.post("/login", data={"email": "sec3-race@test.io", "password": "secret123"})
+    check("второй клиент гонки вошёл тем же паролем", r.status_code == 303, f"status={r.status_code}")
+    race_uid = sql("SELECT id FROM users WHERE email = ?", "sec3-race@test.io")[0][0]
+
+    r_a, r_b = run_concurrent_password_changes([
+        (c_race_a, "гонка-пароль-a1"),
+        (c_race_b, "гонка-пароль-b1"),
+    ])
+    check("оба параллельных запроса на смену пароля успешны (200) — гонка не должна превращаться в 409",
+          r_a.status_code == 200 and r_b.status_code == 200,
+          f"a={r_a.status_code} b={r_b.status_code}")
+
+    va, vb = cookie_version(r_a), cookie_version(r_b)
+    check("версии в куках двух параллельных успешных ответов различны (не потерянный инкремент)",
+          va is not None and vb is not None and va != vb, f"va={va} vb={vb}")
+
+    db_version = sql("SELECT session_version FROM users WHERE id = ?", race_uid)[0][0]
+    check("итоговая версия в БД равна максимуму из двух полученных версий",
+          va is not None and vb is not None and db_version == max(va, vb),
+          f"db={db_version} va={va} vb={vb}")
+
+    resp_a2 = c_race_a.get("/api/account")
+    resp_b2 = c_race_b.get("/api/account")
+    check("не обе куки-версии остаются рабочими одновременно после гонки",
+          not (resp_a2.status_code == 200 and resp_b2.status_code == 200),
+          f"a2={resp_a2.status_code} b2={resp_b2.status_code}")
+    if va is not None and vb is not None:
+        newer_resp, older_resp = (resp_a2, resp_b2) if va > vb else (resp_b2, resp_a2)
+        check("клиент с последней зафиксированной версией куки остался авторизован",
+              newer_resp.status_code == 200, f"status={newer_resp.status_code}")
+        check("клиент со старой (перебитой гонкой) версией куки отклонён (401)",
+              older_resp.status_code == 401, f"status={older_resp.status_code}")
+
+    print("== Delete → register: переиспользованный id не воскрешает старую куку (SEC-3 corrective #2) ==")
+    # Фиксируем сиды ДЕТЕРМИНИРОВАННО (см. patch_session_version_seeds) —
+    # тест не должен полагаться на то, что два независимых случайных сида
+    # просто не совпадут. На BASE-коммите до 166c725 хелпера ещё нет,
+    # seeds_patched будет False, и сценарий честно идёт по старому пути
+    # (version=0 из server_default для обоих пользователей).
+    restore_seeds, seeds_patched = patch_session_version_seeds([424242, 555555])
+    try:
+        c_reuse = client()
+        register(c_reuse, "sec3-reuse@test.io", "Реюз-бренд")
+        reuse_uid1 = sql("SELECT id FROM users WHERE email = ?", "sec3-reuse@test.io")[0][0]
+        old_org_id = org_of("sec3-reuse@test.io")
+        old_cookie_raw = c_reuse.cookies.get(auth.SESSION_COOKIE)
+        check("кука первого владельца слота захвачена для дальнейшей проверки", bool(old_cookie_raw))
+
+        r = c_reuse.post("/api/account/password", json={
+            "current_password": "secret123", "new_password": "реюз-новый-пароль",
+            "confirm_password": "реюз-новый-пароль",
+        })
+        check("смена пароля перед удалением — 200", r.status_code == 200, f"status={r.status_code}")
+
+        old_cookie_client = cookie_client_raw(old_cookie_raw)
+        check("старая (дореволюционная) кука отозвана сразу после смены пароля",
+              old_cookie_client.get("/api/account").status_code == 401)
+
+        r = c_reuse.post("/api/account/delete", json={"password": "реюз-новый-пароль", "confirm": "УДАЛИТЬ"})
+        check("владелец-одиночка удалил аккаунт и организацию целиком — 200",
+              r.status_code == 200 and r.json()["scope"] == "org", f"resp={r.text[:140]}")
+        check("строка пользователя удалена из БД",
+              not sql("SELECT id FROM users WHERE id = ?", reuse_uid1))
+
+        c_reuse2 = client()
+        r = register(c_reuse2, "sec3-reuse@test.io", "Реюз-бренд-2")
+        check("тот же e-mail снова доступен для регистрации после удаления — 303",
+              r.status_code == 303, f"status={r.status_code}")
+
+        reuse_uid2 = sql("SELECT id FROM users WHERE email = ?", "sec3-reuse@test.io")[0][0]
+        check("id действительно переиспользован (SQLite: max(id)+1 после удаления последней строки)",
+              reuse_uid2 == reuse_uid1, f"old={reuse_uid1} new={reuse_uid2}")
+
+        new_org_id = org_of("sec3-reuse@test.io")
+        check("org_id тоже переиспользован (подписанная кука несёт И user_id, И org_id — "
+              "иначе 401 ниже мог бы объясняться несовпадением организации, а не версии сессии)",
+              new_org_id == old_org_id, f"old_org={old_org_id} new_org={new_org_id}")
+
+        new_seed = sql("SELECT session_version FROM users WHERE id = ?", reuse_uid2)[0][0]
+        if seeds_patched:
+            check("новый пользователь на переиспользованном id получил ВТОРОЙ зафиксированный "
+                  "тестом сид (детерминированно, не унаследовал версию первого)",
+                  new_seed == 555555, f"session_version={new_seed}")
+        else:
+            check("новый пользователь на переиспользованном id получил положительную версию, не 0",
+                  new_seed > 0, f"session_version={new_seed}")
+
+        resurrect_client = cookie_client_raw(old_cookie_raw)
+        resurrect_status = resurrect_client.get("/api/account").status_code
+        check("старая кука (тот же user_id, ПЕРВЫЙ сид) НЕ воскрешает доступ к новому пользователю "
+              "на том же id (ВТОРОЙ сид, гарантированно другой, а не просто «не совпал в этот раз»)",
+              resurrect_status == 401, f"status={resurrect_status}")
+        check("новый владелец слота нормально авторизован собственной свежей сессией",
+              c_reuse2.get("/api/account").status_code == 200)
+    finally:
+        restore_seeds()
 
     print("== Удаление: участник организации ==")
     owner = client()
