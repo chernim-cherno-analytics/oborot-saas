@@ -632,6 +632,41 @@ RED/GREEN на два случая (частичный матч между дв�
   корректном `sales_docs=12`. GREEN после разделения — 240/0, включая
   hard-kill сценарий девятого corrective и все сценарии correctives
   #1–#9 без единой правки их ожидаемых чисел.
+
+  **Одиннадцатый corrective (независимое ревью, P2 discussion_r3874208948,
+  release convergence, 27.08.2026): дедуп ВНУТРИ одного batch
+  `_commit_skip_ids`.** `new_ids = [id for id in found if id not in
+  committed_ids]` фильтрует только против durable `committed_ids` (набора
+  ИЗ ПРОШЛЫХ коммитов) — если ОДИН И ТОТ ЖЕ id встречается ДВАЖДЫ внутри
+  `found` (достижимо в реальности: `fetch_documents` — offset pagination
+  без snapshot/stable order/dedup, `_collect_sales` append-ит каждый
+  вернувшийся row без проверки на повтор — сдвиг offset между страницами,
+  пока документы создаются, может вернуть тот же документ дважды), обе
+  копии проходят фильтр одинаково: `len(new_ids)` считает ИХ ОБЕ, а
+  `committed_ids.update(new_ids)` схлопывает их в ОДИН элемент множества
+  — `sales_docs_skipped_store_committed` расходится с фактическим числом
+  уникальных id в `committed_ids` НАВСЕГДА (owner-facing счётчик
+  становится фактически неверным — не временно неточным, а неверным по
+  построению).
+
+  Правка — одна строка: `found` дедуплицируется (`dict.fromkeys`,
+  сохраняя порядок) ПЕРЕД построением `new_ids`, так что `len(new_ids)`
+  всегда равен числу уникальных НОВЫХ id, добавленных в `committed_ids`
+  этим вызовом. Transient pop (corrective #6), sorted durable set,
+  существующее int-bounding и lifecycle (corrective #5) не менялись.
+
+  Регрессия: два прямых юнит-сценария `_commit_skip_ids` — batch из
+  ОДНОГО id, повторённого дважды (`[demand:dup, demand:dup]`), и
+  смешанный batch (id, повторённый трижды + уже закоммиченный ранее id +
+  генуинно новый id), плюс проверка, что повторный across-checkpoint скан
+  того же id по-прежнему не задваивает счёт (corrective #5 не сломан).
+  RED на версии десятого corrective (`dbd5a6f`) — 244 OK/5 FAIL:
+  дубликат-only batch даёт `committed=2` вместо 1 при `committed_ids`
+  ровно с одним элементом; смешанный batch даёт `committed=5` вместо 3
+  (было бы 1+4, а не 1+2 уникальных). GREEN после дедупа внутри batch —
+  249/0, включая hard-kill сценарий corrective #9, window-counters
+  corrective #10 и все сценарии correctives #1–#10 без единой правки их
+  ожидаемых чисел.
 * ~~ошибка справочника контрагентов **затирает всех поставщиков** пустыми
   значениями — после такого синка правило распределения по производствам
   перестаёт работать.~~ **Закрыто.** `_upsert_products` писал

@@ -175,6 +175,23 @@ Corrective #10 (P2 discussion_r3873996582) чинит побочный эффе�
 `coverage_days`/`window_sales_docs`/`_commit_skip_ids` остаются ДО неё
 (corrective #9's crash-safety не переоткрывается).
 
+Corrective #11 (P2 discussion_r3874208948, release convergence) чинит
+дедуп ВНУТРИ одного batch `_commit_skip_ids`: `new_ids = [id for id in
+found if id not in committed_ids]` фильтрует только против durable
+`committed_ids` (набора ИЗ ПРОШЛЫХ коммитов) — если ОДИН И ТОТ ЖЕ id
+встречается ДВАЖДЫ внутри `found` (`fetch_documents` — offset pagination
+без snapshot/stable order/dedup, `_collect_sales` append-ит каждый
+вернувшийся row без проверки на повтор — сдвиг offset между страницами,
+пока документы создаются, реально может вернуть тот же документ дважды),
+обе копии проходят фильтр одинаково: `len(new_ids)` считает ИХ ОБЕ, а
+`committed_ids.update(new_ids)` схлопывает их в ОДИН элемент множества —
+`sales_docs_skipped_store_committed` расходится с фактическим числом
+уникальных id в `committed_ids` НАВСЕГДА (owner-facing счётчик становится
+фактически неверным, не просто временно неточным). Фикс — одна строка:
+`found` дедуплицируется (`dict.fromkeys`, сохраняя порядок) ПЕРЕД
+построением `new_ids`, так что `len(new_ids)` всегда равен числу
+уникальных НОВЫХ id, добавленных в `committed_ids` этим вызовом.
+
 Запуск из корня репозитория:  python tests/test_sync_diag_store.py
 """
 import json
@@ -1878,6 +1895,70 @@ def run_part3_unit_lifecycle() -> None:
     check("committed_ids содержит оба id (x:1, x:2), не растёт бесконечно",
           set(s4.get("sales_docs_skipped_store_committed_ids") or []) == {"x:1", "x:2"},
           f"stats={s4}")
+
+    print("\n== [часть 3] _commit_skip_ids: дедуп ВНУТРИ одного batch "
+          "(corrective #11, P2 discussion_r3874208948) ==")
+    # Достижимо в реальности: fetch_documents — offset pagination без
+    # snapshot/stable order/dedup, _collect_sales append-ит КАЖДЫЙ вернувшийся
+    # row в transient-буфер без проверки на повтор — сдвиг offset между
+    # страницами (документ создан прямо во время скана) может вернуть ОДИН И
+    # ТОТ ЖЕ документ дважды в рамках одного batch, ДО того как он попадёт в
+    # durable committed_ids. Старый код: `new_ids = [id for id in found if id
+    # not in committed_ids]` — фильтрует ТОЛЬКО против committed_ids (набора
+    # ИЗ ПРОШЛЫХ коммитов), не против самого себя внутри comprehension —
+    # обе копии дубликата проходят фильтр одинаково, `len(new_ids)` считает
+    # ИХ ОБЕ, а `committed_ids.update(new_ids)` схлопывает их в ОДИН элемент
+    # множества — count и durable set расходятся НАВСЕГДА.
+
+    s5 = {"sales_docs_skipped_store_ids": ["demand:dup", "demand:dup"]}
+    _mss._commit_skip_ids(s5)
+    check("batch из ОДНОГО дубликата (id встречается дважды): committed == 1, "
+          "НЕ 2",
+          s5.get("sales_docs_skipped_store_committed") == 1, f"stats={s5}")
+    check("committed_ids содержит РОВНО один элемент",
+          s5.get("sales_docs_skipped_store_committed_ids") == ["demand:dup"],
+          f"stats={s5}")
+    check("committed == len(committed_ids) — счётчик и durable-набор не "
+          "разошлись",
+          s5.get("sales_docs_skipped_store_committed")
+          == len(s5.get("sales_docs_skipped_store_committed_ids") or []),
+          f"stats={s5}")
+
+    # Смешанный batch: "b:dup" повторяется ТРИЖДЫ внутри batch (генуинно
+    # новый), "a:already" уже в committed_ids (из прошлого коммита — должен
+    # полностью отфильтроваться, не всплыть снова ни в счёте, ни задвоенным
+    # в наборе), "c:new" — генуинно новый, встречается один раз.
+    s6 = {"sales_docs_skipped_store_ids": ["b:dup", "a:already", "b:dup",
+                                           "c:new", "b:dup"],
+          "sales_docs_skipped_store_committed": 1,
+          "sales_docs_skipped_store_committed_ids": ["a:already"]}
+    _mss._commit_skip_ids(s6)
+    check("смешанный batch: committed увеличился РОВНО на 2 уникальных "
+          "новых id (b:dup, c:new) — 1+2=3, не 1+4=5 (b:dup не задвоен, "
+          "a:already не пересчитан)",
+          s6.get("sales_docs_skipped_store_committed") == 3, f"stats={s6}")
+    check("смешанный batch: committed_ids == {a:already, b:dup, c:new} — "
+          "ровно 3 уникальных элемента",
+          set(s6.get("sales_docs_skipped_store_committed_ids") or [])
+          == {"a:already", "b:dup", "c:new"}, f"stats={s6}")
+    check("смешанный batch: committed == len(committed_ids) — счётчик и "
+          "durable-набор согласованы",
+          s6.get("sales_docs_skipped_store_committed")
+          == len(s6.get("sales_docs_skipped_store_committed_ids") or []),
+          f"stats={s6}")
+    check("смешанный batch: transient-буфер очищен как обычно",
+          "sales_docs_skipped_store_ids" not in s6, f"stats={s6}")
+
+    # Повторный коммит с ТЕМ ЖЕ самым дублирующимся id — across-checkpoint
+    # дедуп (уже закрыт corrective #5) не должен был пострадать от фикса.
+    s6["sales_docs_skipped_store_ids"] = ["b:dup", "b:dup"]
+    _mss._commit_skip_ids(s6)
+    check("across-checkpoint: повторный скан того же id (уже в committed_"
+          "ids) НЕ увеличивает committed повторно",
+          s6.get("sales_docs_skipped_store_committed") == 3, f"stats={s6}")
+    check("across-checkpoint: committed_ids не изменился по составу",
+          set(s6.get("sales_docs_skipped_store_committed_ids") or [])
+          == {"a:already", "b:dup", "c:new"}, f"stats={s6}")
 
 
 def run() -> int:

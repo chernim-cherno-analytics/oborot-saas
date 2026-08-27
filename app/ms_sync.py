@@ -663,7 +663,17 @@ def _commit_skip_ids(stats: dict) -> None:
     if not found:
         return
     committed_ids = set(stats.get(_SKIP_COMMITTED_IDS_KEY) or [])
-    new_ids = [doc_id for doc_id in found if doc_id not in committed_ids]
+    # DATA-8 corrective #11 (P2 discussion_r3874208948): `found` дедуплицируем
+    # ПЕРЕД фильтром — `fetch_documents` (offset pagination без snapshot/
+    # stable order/dedup) может вернуть один и тот же документ дважды внутри
+    # ОДНОГО batch (сдвиг offset между страницами, пока документы создаются),
+    # а `_collect_sales` дописывает transient-буфер без проверки на повтор.
+    # Без дедупа здесь обе копии проходят фильтр `not in committed_ids`
+    # одинаково — `len(new_ids)` считал бы их ОБЕ, а `committed_ids.update`
+    # ниже схлопнул бы их в ОДИН элемент множества: committed расходился бы
+    # с фактическим числом уникальных id в committed_ids навсегда.
+    new_ids = list(dict.fromkeys(
+        doc_id for doc_id in found if doc_id not in committed_ids))
     if not new_ids:
         return
     stats[_SKIP_COMMITTED_KEY] = int(stats.get(_SKIP_COMMITTED_KEY) or 0) + len(new_ids)
