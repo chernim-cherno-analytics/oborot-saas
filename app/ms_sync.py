@@ -565,11 +565,178 @@ def _eta_sec(state: str, stats: dict) -> int | None:
     return int(round(secs / done * (total - done)))
 
 
+def _bounded_diagnostic_count(value: object) -> int | None:
+    """Fail-closed валидация owner-only диагностического счётчика (DATA-8).
+
+    Контракт узкий: только точный неотрицательный `int` из `stats` проходит
+    как есть. Отсутствие поля, `bool` (в Python подтип `int`, поэтому
+    проверяется отдельно ДО `isinstance(..., int)`), отрицательное число,
+    строка, float или что-то ещё — `None`, а не 0: подмена malformed-значения
+    нулём выглядела бы как «всё хорошо», хотя на самом деле «не проверяли».
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int) and value >= 0:
+        return value
+    return None
+
+
+_SKIP_STICKY_KEY = "sales_docs_skipped_store_unresolved"
+_SKIP_LEGACY_KEY = "sales_docs_skipped_store"
+_SKIP_CHECKPOINT_KEY = "sales_docs_skipped_store_rebuild_checkpoint"
+# DATA-8 corrective #5 (P2 discussion_r3872223834) — см. _skip_segment_contribution
+# и _commit_skip_ids. _SKIP_COMMITTED_KEY — сколько РАЗНЫХ (по id документа)
+# пропусков этот прогон безопасно подтвердил; _SKIP_DOC_IDS_KEY — id,
+# найденные ЭТИМ прогоном (per-run, никогда не переносится); _SKIP_
+# COMMITTED_IDS_KEY — id, УЖЕ подтверждённые (переносится между прогонами
+# через _CARRIED_STATS) — дедуп против него не даёт задвоить один и тот же
+# документ МойСклада при повторном сканировании одного диапазона дат.
+_SKIP_COMMITTED_KEY = "sales_docs_skipped_store_committed"
+_SKIP_DOC_IDS_KEY = "sales_docs_skipped_store_ids"
+_SKIP_COMMITTED_IDS_KEY = "sales_docs_skipped_store_committed_ids"
+
+
+def _resolve_skip_diagnostic(stats: dict) -> int | None:
+    """DATA-8 rollout bootstrap (BLOCKED issuecomment-5438529547).
+
+    Прод уже писал ephemeral `stats["sales_docs_skipped_store"]` ДО того,
+    как появился sticky-ключ `sales_docs_skipped_store_unresolved`. Если
+    sticky-ключ уже был записан хоть раз (даже malformed-значением) — он
+    приоритетен: новый код уже принял решение по этому прогону, и legacy
+    его не подменяет. Если ключа нет вовсе — единственный законный
+    bootstrap: точный ПОЛОЖИТЕЛЬНЫЙ int в legacy-счётчике прежней строки.
+    Ноль/отсутствие/`bool`/отрицательное/строка/float в legacy ничего не
+    авторизуют и не считаются очисткой — так же fail-closed, как раньше.
+    """
+    if _SKIP_STICKY_KEY in stats:
+        return _bounded_diagnostic_count(stats.get(_SKIP_STICKY_KEY))
+    legacy = _bounded_diagnostic_count(stats.get(_SKIP_LEGACY_KEY))
+    return legacy if legacy is not None and legacy > 0 else None
+
+
+def _commit_skip_ids(stats: dict) -> None:
+    """DATA-8 corrective #5 (P2 discussion_r3872223834): переносит НОВЫЕ (по
+    id документа МойСклада, ещё не отражённые в `_SKIP_COMMITTED_IDS_KEY`)
+    находки из `_SKIP_DOC_IDS_KEY` (их пишет `_collect_sales` рядом с
+    ephemeral-счётчиком, см. код там) в подтверждённый набор, увеличивая
+    `_SKIP_COMMITTED_KEY` ровно на число НОВЫХ id.
+
+    Голый raw-счётчик переоценивает находки в двух конкретных случаях:
+    (1) на резюме ТОГО ЖЕ дня фаза today принудительно перечитывает
+    «сегодня» (`gap_dates=[today_iso]` в `_run_initial`, даже когда
+    реального разрыва нет) — документ, уже посчитанный месячным окном ДО
+    падения, посчитается ещё раз тем же raw-счётчиком; (2) если прогон
+    падает ПОСЛЕ того, как `_collect_sales` увеличил счётчик для чанка, но
+    ДО того, как для этого чанка продвинулась `history_loaded_from`
+    (например, `_full_positions` упал на документе ПОСЛЕ уже посчитанного
+    в том же чанке пропуска), следующий resume перечитает ТОТ ЖЕ чанк
+    заново — раньше (диапазонная/boundary-эвристика) это давало 8
+    (чекпоинт) + 3 (недокоммиченный partial) + 3 (тот же чанк, докачанный
+    повторно) = 14 вместо 11.
+
+    Дедуп ИМЕННО по id документа (а не по диапазону дат/boundary) решает
+    ОБА случая одним механизмом и не путает их с генуинно НОВЫМ документом
+    на той же дате (появившимся между прогонами, DATA-8 corrective #4,
+    тест `run_part2_rebuild_accumulator`): диапазон дат при форсированной
+    перечитке «сегодня» не меняется в обоих случаях, а id документа —
+    меняется только во втором.
+
+    Вызывается из `_run_initial` в точках, где найденное больше НЕ
+    перечитается заново В РАМКАХ ЭТОГО прогона: после фазы today, после
+    фазы month (несрезюмированный прогон — окно публикуется целиком одной
+    транзакцией) и после каждого закоммиченного чанка истории. Упавший
+    посреди чанк просто не доходит до своего вызова — его находки не
+    коммитятся и корректно пересчитаются при следующем resume того же чанка.
+
+    DATA-8 corrective #6 (P2 discussion_r3872698356): transient-буфер
+    (`_SKIP_DOC_IDS_KEY`) ЗАБИРАЕТСЯ (`stats.pop`, а не `stats.get`) — на
+    КАЖДОМ пути, включая no-new-ids. `committed_ids` — единственный
+    durable dedup-набор логической пересборки; `_collect_sales` только
+    ДОПИСЫВАЕТ в transient-буфер (`setdefault(...).append(...)`) и никогда
+    его не читает и не чистит сам, поэтому без явного `pop` здесь буфер
+    рос бы БЕЗ ГРАНИЦ на каждом дальнейшем чанке одной пересборки — и
+    каждый `_persist` сериализовал бы обе (растущие) копии в `stats_json`,
+    который читает и owner-only `/api/sync/status`, пока Настройки его
+    поллят.
+    """
+    found = stats.pop(_SKIP_DOC_IDS_KEY, None) or []
+    if not found:
+        return
+    committed_ids = set(stats.get(_SKIP_COMMITTED_IDS_KEY) or [])
+    # DATA-8 corrective #11 (P2 discussion_r3874208948): `found` дедуплицируем
+    # ПЕРЕД фильтром — `fetch_documents` (offset pagination без snapshot/
+    # stable order/dedup) может вернуть один и тот же документ дважды внутри
+    # ОДНОГО batch (сдвиг offset между страницами, пока документы создаются),
+    # а `_collect_sales` дописывает transient-буфер без проверки на повтор.
+    # Без дедупа здесь обе копии проходят фильтр `not in committed_ids`
+    # одинаково — `len(new_ids)` считал бы их ОБЕ, а `committed_ids.update`
+    # ниже схлопнул бы их в ОДИН элемент множества: committed расходился бы
+    # с фактическим числом уникальных id в committed_ids навсегда.
+    new_ids = list(dict.fromkeys(
+        doc_id for doc_id in found if doc_id not in committed_ids))
+    if not new_ids:
+        return
+    stats[_SKIP_COMMITTED_KEY] = int(stats.get(_SKIP_COMMITTED_KEY) or 0) + len(new_ids)
+    committed_ids.update(new_ids)
+    stats[_SKIP_COMMITTED_IDS_KEY] = sorted(committed_ids)
+
+
+def _skip_segment_contribution(stats: dict) -> int | None:
+    """DATA-8 corrective #5 (P2 discussion_r3872223834): сколько ИЗ находок
+    ЭТОГО сегмента безопасно засчитать в checkpoint — `_SKIP_COMMITTED_KEY`
+    (см. `_commit_skip_ids`), если он присутствует; иначе (инкремент,
+    падение до `_run_initial`, например на ассортименте) — голый raw
+    ephemeral-счётчик, как раньше.
+    """
+    if _SKIP_COMMITTED_KEY in stats:
+        return _bounded_diagnostic_count(stats.get(_SKIP_COMMITTED_KEY))
+    return _bounded_diagnostic_count(stats.get(_SKIP_LEGACY_KEY))
+
+
+def _rebuild_total(stats: dict) -> int | None:
+    """DATA-8 corrective #4 (P2 discussion_r3871933011) + corrective #5
+    (P2 discussion_r3872223834): безопасный вклад ЭТОГО сегмента
+    (`_skip_segment_contribution`) + checkpoint уже завершённых/упавших
+    сегментов ТОЙ ЖЕ логической пересборки.
+
+    Прерванная пересборка может распасться на НЕСКОЛЬКО прогонов
+    (изначальный + один или несколько resume): чанки истории, обработанные
+    ДО очередного падения, никогда не перечитываются заново (тот же принцип
+    DATA-4, что и у обычного инкремента), поэтому их находки обязаны
+    складываться, а не теряться и не подменяться последним сегментом — но
+    и не удваиваться там, где resume ЧАСТИЧНО перечитывает уже посчитанное
+    (см. `_skip_segment_contribution`). `checkpoint` хранит сумму ВСЕХ
+    сегментов, предшествующих текущему. Отсутствующий/некорректный
+    `checkpoint` — 0 (обычный несрезюмированный случай: пересборка ещё не
+    имела предыдущих сегментов). Некорректный вклад сегмента — fail-closed
+    `None`: на malformed ephemeral-счётчике никакой total не строится вовсе.
+    """
+    contribution = _skip_segment_contribution(stats)
+    if contribution is None:
+        return None
+    checkpoint = _bounded_diagnostic_count(stats.get(_SKIP_CHECKPOINT_KEY)) or 0
+    return contribution + checkpoint
+
+
 def get_status(org_id: int) -> dict:
     """GET /api/sync/status: текущее состояние синхронизации организации.
 
     Деплой П1: плюс phase, coverage_days, history_loaded_from, months[],
     stages[], eta_sec — из них же собирается публичный /api/sync/progress.
+
+    DATA-8 (третий сценарий + два corrective): плюс `diagnostics` — узкий
+    именованный owner-only контракт поверх sticky `stats.
+    sales_docs_skipped_store_unresolved` (документы продаж, чей склад не
+    распознан или не входит в выбранные — ПОСЛЕДНИЙ известный факт, не
+    обязательно счётчик текущего прогона: см. `_apply_skip_diagnostic_lifecycle`
+    в `_run_sync` — инкремент и resumed-первичка с раскопкой нуля сохраняют
+    его нетронутым, снять в 0 может только полный нерезюмированный прогон).
+    Пока sticky-ключ ещё ни разу не записан (rollout поверх прод-строки,
+    где раньше жил только ephemeral `sales_docs_skipped_store`) —
+    `_resolve_skip_diagnostic` bootstrap-ит его из валидного ПОЛОЖИТЕЛЬНОГО
+    legacy-значения, fail-closed на всём остальном. Не влияет на отбор
+    продаж и не публикуется в /api/sync/progress — см.
+    `_bounded_diagnostic_count`, `_resolve_skip_diagnostic` и `get_progress`.
     """
     db = SessionLocal()
     try:
@@ -586,7 +753,8 @@ def get_status(org_id: int) -> dict:
                 "fail_streak": 0, "alerted_streak": 0,
                 "phase": "", "coverage_days": _coverage_days(org_id),
                 "history_loaded_from": None,
-                "months": months_progress(None, False), "stages": [], "eta_sec": None}
+                "months": months_progress(None, False), "stages": [], "eta_sec": None,
+                "diagnostics": {"sales_docs_skipped_store_unresolved": None}}
     stats = row.stats
     coverage = _coverage_days(org_id)
     hlf = stats.get("history_loaded_from")
@@ -616,6 +784,9 @@ def get_status(org_id: int) -> dict:
         "months": months_progress(loaded_from, row.state == "running"),
         "stages": _stages_out(row.state, stats) if row.mode == "initial" else [],
         "eta_sec": _eta_sec(row.state, stats),
+        "diagnostics": {
+            "sales_docs_skipped_store_unresolved": _resolve_skip_diagnostic(stats),
+        },
     }
 
 
@@ -767,7 +938,100 @@ _CARRIED_STATS = ("history_loaded_from", "history_loaded_to", "resume_fp",
                   # («какой тип цены считать полной себестоимостью»). Без
                   # переноса он жил ровно до следующего прогона синка, и
                   # выпадающий список оказывался пустым.
-                  "price_types")
+                  "price_types",
+                  # DATA-8 corrective (BLOCKED issuecomment-5438193835): sticky
+                  # факт «синхронизация пропускала документы продаж без
+                  # распознанного склада» обязан пережить КАЖДЫЙ новый запуск
+                  # синка (в т.ч. инкремент), иначе владелец видит проблему
+                  # ровно до следующего успешного инкремента — а инкремент
+                  # перечитывает только свой узкий хвост (DATA-4) и не
+                  # доказывает, что старые пропуски исчезли. Раздельное имя
+                  # от ephemeral-счётчика `sales_docs_skipped_store` —
+                  # намеренно: последний каждый прогон честно считает заново
+                  # (см. `_collect_sales`), а sticky-факт обновляют ровно два
+                  # места: `_carry_stats` — свежее положительное evidence из
+                  # ПРЕДЫДУЩЕЙ (в т.ч. упавшей) строки при старте нового
+                  # прогона (P2 discussion_r3871610382), и
+                  # `_apply_skip_diagnostic_lifecycle` — итог ТЕКУЩЕГО
+                  # прогона в финализации `_run_sync`.
+                  "sales_docs_skipped_store_unresolved",
+                  # DATA-8 corrective #4 (P2 discussion_r3871933011):
+                  # rebuild-checkpoint обязан пережить БАЗОВЫМ копированием
+                  # (как и sticky выше) в т.ч. повторный вызов `_carry_stats`
+                  # внутри одного и того же старта прогона (`start_sync`
+                  # пишет queued-строку, `_run_sync` тут же перечитывает её
+                  # заново) — на этом втором вызове ephemeral `sales_docs_
+                  # skipped_store` уже отсутствует (он никогда не входит в
+                  # этот кортеж), `_rebuild_total` честно возвращает None, и
+                  # без базового копирования checkpoint терялся бы уже на
+                  # старте, а не только между прогонами.
+                  "sales_docs_skipped_store_rebuild_checkpoint",
+                  # DATA-8 corrective #5 (P2 discussion_r3872223834): набор id
+                  # уже подтверждённых пропущенных документов — та же причина,
+                  # что и для checkpoint выше (должен пережить повторный
+                  # внутренний вызов `_carry_stats`), плюс он нужен КАЖДОМУ
+                  # resumed-прогону, чтобы дедуплицировать против НЕГО, а не
+                  # против пустого набора.
+                  "sales_docs_skipped_store_committed_ids")
+
+
+def _carry_stats(prev_stats: dict, *, resuming: bool) -> dict:
+    """`_CARRIED_STATS` keys из `prev_stats` — плюс DATA-8 rollout/resume/
+    rebuild-checkpoint bootstrap (BLOCKED issuecomment-5438529547, P2
+    discussion_r3871610382, P2 discussion_r3871933011).
+
+    Единственная точка, где новый прогон строит свежий `stats` с нуля из
+    прежней строки — и поэтому единственная точка, где положительное
+    evidence обязано попасть в sticky-ключ (и, при резюме, в
+    rebuild-checkpoint) ПЕРЕД тем, как carried-словарь заменит собой всю
+    строку целиком.
+
+    `resuming=True` — этот прогон продолжает ПРЕРВАННУЮ первичную загрузку
+    (`_pending_resume` нашёл точку продолжения; `force_full`/`needs_full_
+    rebuild` этот флаг НЕ поднимают — это НОВАЯ логическая пересборка).
+    В этом случае используем `_rebuild_total(prev_stats)` — сумму
+    БЕЗОПАСНОГО вклада ПРЕДЫДУЩЕГО (только что упавшего) сегмента
+    (`_skip_segment_contribution`, corrective #5 — НЕ голый raw: то, что
+    рискует быть перечитано следующим resume, в total не входит) и уже
+    накопленного им checkpoint: чанки истории, обработанные ДО падения,
+    никогда не перечитываются заново, поэтому их находки обязаны
+    СКЛАДЫВАТЬСЯ через сколько угодно повторных падений/резюме, а не
+    подменяться последним сегментом (P2 discussion_r3871933011) и не
+    теряться вовсе (P2 discussion_r3871610382) — и не удваиваться там, где
+    resume частично перечитывает уже посчитанное (P2 discussion_r3872223834).
+    Total становится и новым checkpoint (базой для ЕЩЁ одного возможного
+    падения), и, если положителен, sticky — немедленная видимость на
+    queued/running снимке.
+
+    `resuming=False` — новая логическая пересборка (первый прогон
+    организации, явная «Полная пересборка», смена складов) или обычный
+    инкремент без ожидающего продолжения: checkpoint прежней (уже
+    неактуальной) пересборки НЕ наследуется. Валидный ПОЛОЖИТЕЛЬНЫЙ
+    ephemeral `sales_docs_skipped_store` предыдущей строки всё ещё
+    бутстрапит sticky, если сам sticky-ключ отсутствовал (rollout, BLOCKED
+    issuecomment-5438529547) — для уже присутствующего sticky это то же
+    значение, что и так туда попадёт на финализации предыдущего успешного
+    прогона, поэтому переопределение здесь не расходится с ним.
+
+    Ноль/отсутствие/`bool`/отрицательное/строка/float в legacy ничего не
+    авторизуют и не считаются очисткой — существующий sticky (в том числе
+    malformed) при этом просто переносится как есть базовым словарём выше:
+    `_SKIP_STICKY_KEY` — часть `_CARRIED_STATS`.
+    """
+    carried = {k: prev_stats[k] for k in _CARRIED_STATS if k in prev_stats}
+    if resuming:
+        total = _rebuild_total(prev_stats)
+        if total is not None:
+            carried[_SKIP_CHECKPOINT_KEY] = total
+            if total > 0:
+                carried[_SKIP_STICKY_KEY] = total
+        return carried
+    carried.pop(_SKIP_CHECKPOINT_KEY, None)
+    carried.pop(_SKIP_COMMITTED_IDS_KEY, None)
+    fresh_positive = _skip_segment_contribution(prev_stats)
+    if fresh_positive is not None and fresh_positive > 0:
+        carried[_SKIP_STICKY_KEY] = fresh_positive
+    return carried
 
 
 def _pending_resume(org_id: int) -> str | None:
@@ -874,7 +1138,7 @@ def start_sync(org_id: int, mode: str, *, force_full: bool = False) -> bool:
         # упадёт ещё до истории остатков (429/401 на ассортименте), точка
         # продолжения / флаг пересборки обязаны пережить и этот провал. Снимает
         # их только done (или реально случившийся wipe в фазе today).
-        carried = {k: prev_stats[k] for k in _CARRIED_STATS if k in prev_stats}
+        carried = _carry_stats(prev_stats, resuming=bool(resume_from))
         carried["mode"] = mode
         _set_state(
             org_id,
@@ -1061,6 +1325,65 @@ def _stage_skip(stats: dict, key: str) -> None:
     stats.setdefault("stage_times", {})[key] = {"start": now, "end": now, "skipped": True}
 
 
+def _apply_skip_diagnostic_lifecycle(stats: dict, initial: bool) -> None:
+    """DATA-8 corrective: обновляет sticky `sales_docs_skipped_store_unresolved`
+    ПОСЛЕ успешного `done`, а не на каждом `_collect_sales`.
+
+    Вызывается ровно один раз, из финализации `_run_sync`, ДО которой прогон
+    обязан дойти без исключения — упавший/частичный прогон сюда не попадает
+    (`except` в `_run_sync` персистит `stats` как есть и пробрасывает
+    исключение дальше), и sticky остаётся нетронутым: требование «failed or
+    partial rebuild must preserve» выполняется самой структурой вызова, а не
+    отдельной проверкой состояния.
+
+    Правила (BLOCKED issuecomment-5438193835, уточнено issuecomment-5438529547
+    и P2 discussion_r3871933011 — «свежее значение» ЭТОГО прогона — это
+    `_rebuild_total(stats)` = собственный raw + checkpoint уже завершённых/
+    упавших сегментов ТОЙ ЖЕ логической пересборки, а не голый raw: иначе
+    успешное завершение резюмированного прогона подменяло бы sticky своим
+    последним сегментом, теряя находки более ранних, уже необратимо
+    непрочитываемых чанков — «не трогаем» относится ТОЛЬКО к очистке нулём):
+      * ЛЮБОЙ прогон (инкремент, resumed-первичка, полная пересборка) с
+        положительным `_rebuild_total` обновляет sticky на это значение —
+        свежая находка не должна прятаться за старым числом, независимо от
+        того, покрыл ли этот прогон всю историю; для обычного инкремента и
+        для нерезюмированной пересборки checkpoint всегда 0 (он появляется
+        только на `resuming=True` в `_carry_stats`), поэтому total здесь
+        равен голому raw — старое правило не меняется по факту, только по
+        источнику числа;
+      * инкремент перечитывает только свой узкий хвост (DATA-4 — старые
+        документы никогда не перечитываются), поэтому total==0 НЕ доказывает,
+        что прежние пропуски исчезли — sticky в этом случае не очищаем
+        (положительный случай — правило выше);
+      * RESUMED первичная загрузка (`stats["resumed_from"]` выставлен в
+        `_run_initial`) тем же способом не авторитетна для очистки: total==0
+        доказывает лишь то, что ни завершённые ДО падения, ни докачанные
+        ПОСЛЕ резюме чанки пропусков не нашли — но не то, что пересборка
+        покрыла ВСЮ историю с начала (`force_full`) — sticky тоже не
+        очищаем (положительный случай — то же правило выше);
+      * очистить факт в 0 может только НЕрезюмированный `initial` (первая
+        синхронизация организации или явная «Полная пересборка истории»,
+        `force_full=True`) со своим `_rebuild_total`==0: он один проходит по
+        всей истории заново, и его `done` подтверждает 0 авторитетно;
+      * checkpoint и committed-трекер (corrective #5) не переживают
+        УСПЕШНОЕ завершение (снимаются здесь же): логическая пересборка
+        закончилась, следующий прогон (обычный инкремент или новая
+        пересборка) не наследует её бухгалтерию.
+    """
+    total = _rebuild_total(stats)
+    if total is None:
+        return
+    stats.pop(_SKIP_CHECKPOINT_KEY, None)
+    stats.pop(_SKIP_COMMITTED_KEY, None)
+    stats.pop(_SKIP_COMMITTED_IDS_KEY, None)
+    stats.pop(_SKIP_DOC_IDS_KEY, None)
+    if total > 0:
+        stats[_SKIP_STICKY_KEY] = total
+        return
+    if initial and not stats.get("resumed_from"):
+        stats[_SKIP_STICKY_KEY] = 0
+
+
 # ── Основной прогон ──────────────────────────────────────────────────────────
 
 async def _run_sync(org_id: int, mode: str, resume_from: str | None = None,
@@ -1090,10 +1413,11 @@ async def _run_sync(org_id: int, mode: str, resume_from: str | None = None,
     finally:
         db.close()
 
-    # Стартуем от сохранённых stats (start_sync оставил там переносимые ключи),
-    # чтобы каждый _set_state(stats_json=...) нёс их до самого done.
-    stats: dict = {k: v for k, v in (get_status(org_id).get("stats") or {}).items()
-                   if k in _CARRIED_STATS}
+    # Стартуем от сохранённых stats (start_sync оставил там переносимые ключи,
+    # включая rollout/rebuild-checkpoint bootstrap — см. _carry_stats), чтобы
+    # каждый _set_state(stats_json=...) нёс их до самого done.
+    stats: dict = _carry_stats(get_status(org_id).get("stats") or {},
+                               resuming=bool(resume_from))
     stats["mode"] = mode
     stats["warehouses"] = [w.name for w in active_wh]
     initial = mode == "initial"
@@ -1194,6 +1518,7 @@ async def _run_sync(org_id: int, mode: str, resume_from: str | None = None,
     stats.pop("window_done", None)
     stats.pop("resume_fp", None)
     stats.pop("needs_full_rebuild", None)  # (stats_json перезаписывается — флаг снят)
+    _apply_skip_diagnostic_lifecycle(stats, initial)
     if initial:
         stats["coverage_days"] = HISTORY_DAYS
     _persist(
@@ -1264,8 +1589,36 @@ async def _run_initial(org_id: int, client: MoySkladClient, active_wh: list,
     # Ревью 21.08: точка, записанная при другом наборе складов/окне, — не
     # продолжаем, а пересобираем с нуля (прежние history_loaded_from/
     # resume_fp/needs_full_rebuild живут до реального wipe в фазе today).
+    if resume_from and not resumed:
+        # DATA-8 corrective #8 (P2 discussion_r3873297171): start_sync/
+        # _run_sync уже вызвали _carry_stats(..., resuming=True) на одном
+        # лишь факте, что _pending_resume нашёл точку (resume_from truthy)
+        # — rebuild-checkpoint и committed-id набор ПРЕДЫДУЩЕГО сегмента уже
+        # перенесены в stats ДО того, как этот прогон вообще начался. Только
+        # здесь, после РЕАЛЬНОЙ проверки (стоки на диске + отпечаток
+        # складов/окна совпадает), выясняется, что резюме на самом деле
+        # НЕДЕЙСТВИТЕЛЬНО — прогон идёт веткой fresh (else ниже) как НОВАЯ
+        # логическая пересборка. Без явной очистки здесь стухшая бухгалтерия
+        # прежней (недействительной) пересборки пережила бы честный
+        # авторитетный проход с raw/committed=0: _rebuild_total прибавлял бы
+        # стухший checkpoint к нулю нового сегмента, total оставался бы > 0,
+        # и `_apply_skip_diagnostic_lifecycle` не смог бы очистить sticky в
+        # 0, хотя пересборка честно нашла ноль пропусков с самого начала.
+        # Прежний sticky (_SKIP_STICKY_KEY, часть _CARRIED_STATS) НЕ трогаем
+        # — он остаётся видимым владельцу до успешной финализации ЭТОГО
+        # прогона (initial и не резюмированный + total==0 в
+        # `_apply_skip_diagnostic_lifecycle`).
+        stats.pop(_SKIP_CHECKPOINT_KEY, None)
+        stats.pop(_SKIP_COMMITTED_IDS_KEY, None)
     activated = False
     window = min(INITIAL_WINDOW_DAYS, HISTORY_DAYS)
+
+    # DATA-8 corrective #5 (P2 discussion_r3872223834): sales_docs_skipped_
+    # store_committed — сколько РАЗНЫХ (по id документа) пропусков этот
+    # прогон безопасно подтвердил; см. _commit_skip_ids, которая дедуплицирует
+    # находки против sales_docs_skipped_store_committed_ids (переносится
+    # между прогонами через _CARRIED_STATS).
+    stats[_SKIP_COMMITTED_KEY] = 0
 
     # ── Фаза today: остатки на сегодня ──────────────────────────────────────
     stats["phase"] = "today"
@@ -1348,6 +1701,18 @@ async def _run_initial(org_id: int, client: MoySkladClient, active_wh: list,
     _write_warehouse_stock(org_id, by_wh, stats)
     stats["stock_dates"] += 1
     stats["stock_rows"] += len(batch)
+    # DATA-8 corrective #7 (P2 discussion_r3872928035): коммитим ДО
+    # `_persist` ниже — та строка публикует history_loaded_to (и на
+    # fresh-ветке history_loaded_from) в БД, после чего резюме на разрыве
+    # больше не перечитает эти даты. Убитый МЕЖДУ публикацией границы и
+    # коммитом id прогон раньше терял свежую находку безвозвратно: границе
+    # это уже не важно (она продвинута), а committed так и остался бы 0.
+    # Фаза today на резюме форсированно перечитывает «сегодня»
+    # (gap_dates=[today_iso] даже без реального разрыва) — _commit_skip_ids
+    # дедуплицирует по id документа, поэтому те же самые документы повторно
+    # не засчитаются, а генуинно новый документ на той же дате (появился
+    # между прогонами) — засчитается.
+    _commit_skip_ids(stats)
     _stage_end(stats, "today")
     _persist(org_id, stats, stage="today", progress=10.0,
              detail="Остатки на сегодня обновлены")
@@ -1385,6 +1750,12 @@ async def _run_initial(org_id: int, client: MoySkladClient, active_wh: list,
                 await _sync_incoming(org_id, client, ext_to_pid, stats,
                                      progress=(20.0, 24.0))
                 stats["window_done"] = True
+        # DATA-8 corrective #7 (P2 discussion_r3872928035): коммитим ДО
+        # `_finalize_lite` — она публикует history_loaded_from/window_done
+        # через свой `_persist`, после чего heal_from на будущем резюме
+        # больше не перечитает этот догон. Без heal_from `_collect_sales`
+        # здесь не вызывался — коммитить нечего, вызов no-op.
+        _commit_skip_ids(stats)
         if _days_since(resume_from) >= INITIAL_WINDOW_DAYS or not remaining:
             _finalize_lite(org_id, stats, resume_from, active_wh, progress=25.0)
             activated = True
@@ -1414,13 +1785,50 @@ async def _run_initial(org_id: int, client: MoySkladClient, active_wh: list,
         _write_stock_rows(org_id, month_dates, batch,  # «сегодня» перезаписывается с нулями
                           sales_rows=sales_rows, sales_from=w_start,
                           sales_to=today_iso, sales_replace_all=True)
-        _sales_written(org_id, stats, sales_rows, w_start, (16.0, 21.0))
         stats["stock_dates"] += len(month_dates) - 1
         stats["stock_rows"] += len(batch)
         stats["stock_zeroed"] += zeroed
         stats["history_loaded_from"] = w_start
         stats["coverage_days"] = window
+        # DATA-8 corrective #10 (P2 discussion_r3873996582): window_sales_docs
+        # можно снять уже здесь — его инкрементирует сам `_collect_sales`
+        # (выше), который к этой строке уже отработал. window_sales_rows/
+        # window_return_rows — НЕЛЬЗЯ: их инкрементирует `_sales_written`
+        # (ниже), а не `_collect_sales` — если снять их тут же, они попадут
+        # в owner-facing панель «Подробнее» (`_stages_out`) ещё до того, как
+        # продажи и возвраты месяца в них учтены, и честный fresh-синк с
+        # ненулевыми продажами покажет владельцу stale 0. Снимаем их СРАЗУ
+        # ПОСЛЕ `_sales_written`, ниже.
         stats["window_sales_docs"] = stats.get("sales_docs")
+        # DATA-8 corrective #9 (P2 discussion_r3873573203): коммитим id ДО
+        # `_sales_written` — та вызывает СОБСТВЕННЫЙ ПРЯМОЙ `_set_state(
+        # stats_json=...)`, минуя `_persist`, и это и есть ПЕРВЫЙ snapshot,
+        # в котором граница уже продвинута до `w_start` (см. присвоение
+        # выше) и raw/transient id этого месяца уже посчитаны — а ДАЛЬШЕ
+        # идёт сетевой `_sync_incoming`. Раньше `_commit_skip_ids` стоял
+        # ПОСЛЕ `_sync_incoming`: смерть в этом интервале оставляла ИМЕННО
+        # такой snapshot — новая граница УЖЕ опубликована (резюме её больше
+        # не перечитает как «пропущенное»), а committed так и остался 0.
+        # На резюме БЕЗ большого разрыва это раньше маскировалось широким
+        # chunked reread фазы history (remaining считается от `resume_from`,
+        # который в таком снимке — ещё старая точка ДО этого прогона, и
+        # перечитка попутно находит и досчитывает те же id) — но при разрыве
+        # ДОЛЬШЕ HISTORY_DAYS «точка СТАРШЕ окна» (минор 7) схлопывает
+        # `resume_from` к `oldest`, решив «всё окно уже загружено»: и
+        # `heal_from` от `oldest` НЕ достаёт до `w_start` ЭТОГО месяца —
+        # находка терялась НАВСЕГДА (sticky не остаётся даже на стухшем
+        # числе — падает в None, поскольку `_carry_stats(resuming=True)`
+        # строит carry из committed/checkpoint, а не из bootstrap-эвристики
+        # голого raw, которую использует только owner-facing get_status).
+        # Коммитим здесь, ДО `_sales_written`: теперь ЛЮБОЙ snapshot начиная
+        # с публикации новой границы несёт вместе с ней и уже подтверждённый
+        # committed — независимо от того, когда и через какой разрыв
+        # случится следующий resume.
+        _commit_skip_ids(stats)
+        _sales_written(org_id, stats, sales_rows, w_start, (16.0, 21.0))
+        # DATA-8 corrective #10 (P2 discussion_r3873996582): снимаем ПОСЛЕ
+        # `_sales_written` — она только что увеличила sales_rows/return_rows
+        # на находки ЭТОГО окна; до неё они ещё не отражали продажи месяца.
         stats["window_sales_rows"] = stats.get("sales_rows")
         stats["window_return_rows"] = stats.get("return_rows")
         await _sync_incoming(org_id, client, ext_to_pid, stats, progress=(21.0, 24.0))
@@ -1468,6 +1876,15 @@ async def _run_initial(org_id: int, client: MoySkladClient, active_wh: list,
                           sales_to=chunk[-1])
         _sales_written(org_id, stats, sales_rows, chunk[0])
         stats["history_loaded_from"] = chunk[0]
+        # DATA-8 corrective #5: ЭТОТ чанк только что закоммитился (граница
+        # продвинулась) — то, что _collect_sales насчитал для него, больше
+        # никогда не перечитается в рамках этой пересборки, безопасно
+        # закоммичено. Если прогон упадёт НА этом чанке (id уже попали в
+        # sales_docs_skipped_store_ids, а до этой строки исполнение не
+        # дошло), его вклад НЕ засчитывается — следующий resume перечитает
+        # тот же чанк с нуля, и повторный вызов здесь корректно засчитает те
+        # же документы как новые (P2 discussion_r3872223834).
+        _commit_skip_ids(stats)
         stats["coverage_days"] = _days_since(chunk[0])
         stats["history_chunks_done"] += 1
         stats["history_dates"] += len(chunk)
@@ -3236,6 +3653,12 @@ async def _collect_sales(org_id: int, client: MoySkladClient,
             store_ext = _href_id(((doc.get("store") or {}).get("meta") or {}).get("href"))
             if store_ext not in active_store_ids:
                 stats["sales_docs_skipped_store"] += 1
+                # DATA-8 corrective #5 (P2 discussion_r3872223834): id
+                # документа рядом со счётчиком — не меняет сам отбор/счёт,
+                # только даёт _commit_skip_ids дедуплицировать повторное
+                # сканирование ОДНОГО И ТОГО ЖЕ документа (см. там).
+                stats.setdefault(_SKIP_DOC_IDS_KEY, []).append(
+                    f"{entity}:{doc.get('id') or ''}")
                 continue
             day = str(doc.get("moment") or "")[:10]
             if not day or day < cutoff or (date_to and day > date_to):
