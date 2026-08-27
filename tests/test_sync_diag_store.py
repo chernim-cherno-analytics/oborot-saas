@@ -203,6 +203,17 @@ def stats_with(value_json: str) -> str:
             '"sales_docs_skipped_store_unresolved": ' + value_json + "}")
 
 
+def stats_legacy_only(value_json: str | None) -> str:
+    """Валидный по форме JSON stats БЕЗ sticky-ключа, с ОДНИМ legacy полем
+    sales_docs_skipped_store=<value_json> — симулирует прод-строку ДО
+    появления sticky (rollout bootstrap, corrective #2, BLOCKED
+    issuecomment-5438529547)."""
+    if value_json is None:
+        return json.dumps({"sales_docs": 10, "sales_rows": 8})
+    return ('{"sales_docs": 10, "sales_rows": 8, "sales_docs_skipped_store": '
+            + value_json + "}")
+
+
 def register_and_connect_ms(c: httpx.Client, email: str, org_name: str,
                             store_ids: list[str]) -> int:
     """Регистрация + подключение МС мока + выбор складов (часть 2, реальный синк)."""
@@ -297,6 +308,46 @@ def run_part1_schema() -> None:
     check("diagnostics — словарь ровно с одним ключом sales_docs_skipped_store_unresolved",
           isinstance(d, dict) and set(d.keys()) == {"sales_docs_skipped_store_unresolved"},
           f"diagnostics={d}")
+
+    print("\n== [часть 1, rollout] Sticky отсутствует — валидный ПОЛОЖИТЕЛЬНЫЙ "
+          "legacy бутстрапится немедленно ==")
+    set_stats(org_a, stats_legacy_only("9"))
+    st_legacy = a.get("/api/sync/status").json()
+    check("bootstrap: legacy positive (9) виден владельцу, пока sticky не записан",
+          diag(st_legacy) == 9, f"diagnostics={st_legacy.get('diagnostics')}")
+
+    print("\n== [часть 1, rollout] Fail-closed таблица: legacy сам по себе "
+          "НИЧЕГО не авторизует ==")
+    legacy_cases = [
+        ("legacy отсутствует вовсе", None),
+        ("legacy == 0", "0"),
+        ("legacy отрицательный", "-1"),
+        ("legacy bool true", "true"),
+        ("legacy bool false", "false"),
+        ("legacy строка", '"3"'),
+        ("legacy float", "3.5"),
+        ("legacy null", "null"),
+    ]
+    for title, raw in legacy_cases:
+        set_stats(org_a, stats_legacy_only(raw))
+        st_lbad = a.get("/api/sync/status").json()
+        check(f"rollout fail-closed ({title}) -> diagnostics is None, не 0/подделка",
+              diag(st_lbad) is None, f"diagnostics={st_lbad.get('diagnostics')}")
+
+    print("\n== [часть 1, rollout] Присутствующий sticky приоритетнее legacy, "
+          "даже если сам sticky некорректен ==")
+    set_stats(org_a, '{"sales_docs_skipped_store": 9, '
+                     '"sales_docs_skipped_store_unresolved": "bad"}')
+    st_priority = a.get("/api/sync/status").json()
+    check("malformed sticky НЕ подменяется валидным положительным legacy",
+          diag(st_priority) is None, f"diagnostics={st_priority.get('diagnostics')}")
+
+    set_stats(org_a, '{"sales_docs_skipped_store": 9, '
+                     '"sales_docs_skipped_store_unresolved": 0}')
+    st_priority0 = a.get("/api/sync/status").json()
+    check("валидный sticky==0 (авторитетная очистка) НЕ подменяется "
+          "положительным legacy",
+          diag(st_priority0) == 0, f"diagnostics={st_priority0.get('diagnostics')}")
 
     print("\n== [часть 1] Организация A не видит значение организации B ==")
     set_stats(org_a, stats_with("7"))
@@ -421,9 +472,169 @@ def run_part2_lifecycle() -> None:
     mock_api.close()
 
 
+def run_part2_saved_resume_point() -> None:
+    """Corrective #2 (BLOCKED issuecomment-5438529547): настоящая ЧАСТИЧНАЯ
+    первичная загрузка, реально сохранившая resume point (history_loaded_from
+    записан фазой month/finalize-lite — см. app/ms_sync.py:_run_initial),
+    падает ВНУТРИ фазы history — а не на ассортименте, как в первой версии
+    corrective. Затем обычная кнопка «Синхронизировать сейчас» резюмирует
+    прерванную загрузку, и её собственный ЧЕСТНЫЙ ноль истории (в организации
+    нет ни одного skip-документа) не авторитетен — sticky остаётся нетронутым.
+    """
+    c = client()
+    mock_api = httpx.Client(base_url=f"http://127.0.0.1:{MOCK_PORT}", timeout=30.0)
+    all_stores = [sid for sid, _ in mock_ms.STORES]
+    org_id = register_and_connect_ms(c, "owner-d@diag.test", "Организация D (resume)",
+                                     all_stores)
+
+    # Источник sticky тут не важен — важно, что RESUMED-прогон со своим
+    # честным нулём его не почеркнёт.
+    set_stats(org_id, stats_with("5"), state="done")
+
+    window_days = int(os.environ["INITIAL_WINDOW_DAYS"])
+    w_start = (date.today() - timedelta(days=window_days - 1)).isoformat()
+    # docs_429_before блокирует ТОЛЬКО документы старше начала окна
+    # (m_from < w_start) — ровно фаза history, идущая ПОСЛЕ month/
+    # finalize-lite, где history_loaded_from уже сохранён и персистирован.
+    mock_api.post("/__test/faults", json={"docs_429_before": w_start})
+
+    print("\n== [часть 2, resume] Первичная загрузка реально сохраняет resume "
+          "point и падает ВНУТРИ фазы history ==")
+    r = c.post("/api/sync/initial")
+    check("первичная загрузка (будущий partial) запущена", r.status_code == 200,
+          f"status={r.status_code}")
+    st_partial = wait_sync_done(c)
+    check("прогон честно упал (error), не завис и не выдумал done",
+          st_partial.get("state") == "error", f"state={st_partial.get('state')}")
+    saved_from = (st_partial.get("stats") or {}).get("history_loaded_from")
+    check("resume point РЕАЛЬНО сохранён (history_loaded_from == начало окна)",
+          saved_from == w_start, f"history_loaded_from={saved_from} ожидалось {w_start}")
+    check("sticky факт после partial-провала остался 5 (carried, не потерян)",
+          diag(st_partial) == 5, f"diagnostics={st_partial.get('diagnostics')}")
+
+    print("\n== [часть 2, resume] Обычная кнопка «Синхронизировать сейчас» "
+          "резюмирует прерванную загрузку (веткой initial, а не с нуля) ==")
+    mock_api.post("/__test/faults", json={})  # снять фолт — резюме обязано дойти до done
+    r = c.post("/api/sync/run")  # обычный инкремент-эндпоинт — см. _pending_resume
+    check("резюме запущено", r.status_code == 200, f"status={r.status_code}")
+    st_resumed = wait_sync_done(c)
+    check("резюме дошло до done", st_resumed.get("state") == "done",
+          f"state={st_resumed.get('state')} error={st_resumed.get('error')}")
+    check("резюме реально пошло веткой initial (resume_from), не голым инкрементом",
+          st_resumed.get("mode") == "initial", f"mode={st_resumed.get('mode')}")
+    raw_resumed = (st_resumed.get("stats") or {}).get("sales_docs_skipped_store")
+    check("СВОЙ счётчик резюмированного прогона честно 0 (в org D нет skip-документов)",
+          raw_resumed == 0, f"raw={raw_resumed}")
+    check("sticky факт == 5 — RESUMED-прогон со своим честным нулём его НЕ очистил",
+          diag(st_resumed) == 5, f"diagnostics={st_resumed.get('diagnostics')}")
+
+    c.close()
+    mock_api.close()
+
+
+def run_part2_rollout_carry() -> None:
+    """Corrective #2: legacy-only positive (rollout-состояние строки) видна
+    владельцу немедленно и переживает первый ОБЫЧНЫЙ инкремент — и на
+    queued/running снимке, и на честном нуле завершения (org E не имеет
+    skip-документов вовсе).
+    """
+    c = client()
+    mock_api = httpx.Client(base_url=f"http://127.0.0.1:{MOCK_PORT}", timeout=30.0)
+    all_stores = [sid for sid, _ in mock_ms.STORES]
+    org_id = register_and_connect_ms(c, "owner-e@diag.test", "Организация E (rollout)",
+                                     all_stores)
+
+    # Прод-строка ДО появления sticky-ключа: только legacy, state=done.
+    set_stats(org_id, stats_legacy_only("6"), state="done")
+
+    print("\n== [часть 2, rollout] Немедленная видимость legacy-факта до "
+          "любого нового прогона ==")
+    st_before = c.get("/api/sync/status").json()
+    check("owner видит bootstrap-факт (6) ДО нового прогона",
+          diag(st_before) == 6, f"diagnostics={st_before.get('diagnostics')}")
+
+    print("\n== [часть 2, rollout] Обычный инкремент: bootstrap переносится "
+          "в queued/running снимок и переживает честный ноль ==")
+    mock_api.post("/__test/faults", json={"stock_delay_ms": 300})
+    r = c.post("/api/sync/run")
+    check("инкремент запущен", r.status_code == 200, f"status={r.status_code}")
+    st_start = c.get("/api/sync/status").json()
+    check("сразу после старта факт всё ещё == 6 (bootstrap перенесён в carried)",
+          diag(st_start) == 6,
+          f"state={st_start.get('state')} diagnostics={st_start.get('diagnostics')}")
+
+    st_done = wait_sync_done(c)
+    mock_api.post("/__test/faults", json={})
+    check("инкремент дошёл до done", st_done.get("state") == "done",
+          f"state={st_done.get('state')} error={st_done.get('error')}")
+    raw_done = (st_done.get("stats") or {}).get("sales_docs_skipped_store")
+    check("СВОЙ счётчик инкремента честно 0 (в org E нет skip-документов)",
+          raw_done == 0, f"raw={raw_done}")
+    check("факт остался 6 после честного нуля обычного инкремента",
+          diag(st_done) == 6, f"diagnostics={st_done.get('diagnostics')}")
+
+    c.close()
+    mock_api.close()
+
+
+def run_part3_unit_lifecycle() -> None:
+    """Прямая проверка чистой функции `_apply_skip_diagnostic_lifecycle` —
+    быстрое точное покрытие всей таблицы решений без сетевого прогона синка.
+    Части 2 доказывают end-to-end поведение через настоящий синк; здесь —
+    что сама функция реализует ИМЕННО эту таблицу, включая ключевой пункт
+    corrective #2: RESUMED + положительный СВОЙ счётчик — это ОБНОВЛЕНИЕ
+    sticky, а не «resumed ничего не трогает» (именно так и была
+    сформулирована — неточно — прежняя версия TECH_DEBT.md).
+    """
+    from app import ms_sync as _mss
+
+    print("\n== [часть 3] _apply_skip_diagnostic_lifecycle: таблица решений ==")
+
+    s = {"sales_docs_skipped_store": 4}
+    _mss._apply_skip_diagnostic_lifecycle(s, initial=True)
+    check("non-resumed initial, raw=4>0 -> sticky обновлён на 4",
+          s.get("sales_docs_skipped_store_unresolved") == 4, f"stats={s}")
+
+    s = {"sales_docs_skipped_store": 0, "sales_docs_skipped_store_unresolved": 9}
+    _mss._apply_skip_diagnostic_lifecycle(s, initial=True)
+    check("non-resumed initial, raw=0 -> authoritative clear (0)",
+          s.get("sales_docs_skipped_store_unresolved") == 0, f"stats={s}")
+
+    s = {"sales_docs_skipped_store": 4, "resumed_from": "2026-01-01",
+         "sales_docs_skipped_store_unresolved": 9}
+    _mss._apply_skip_diagnostic_lifecycle(s, initial=True)
+    check("RESUMED initial, raw=4>0 -> sticky ОБНОВЛЯЕТСЯ на 4 (не «не трогаем»)",
+          s.get("sales_docs_skipped_store_unresolved") == 4, f"stats={s}")
+
+    s = {"sales_docs_skipped_store": 0, "resumed_from": "2026-01-01",
+         "sales_docs_skipped_store_unresolved": 9}
+    _mss._apply_skip_diagnostic_lifecycle(s, initial=True)
+    check("RESUMED initial, raw=0 -> sticky сохранён (9), НЕ авторитетный ноль",
+          s.get("sales_docs_skipped_store_unresolved") == 9, f"stats={s}")
+
+    s = {"sales_docs_skipped_store": 0, "sales_docs_skipped_store_unresolved": 9}
+    _mss._apply_skip_diagnostic_lifecycle(s, initial=False)
+    check("incremental, raw=0 -> sticky сохранён (9)",
+          s.get("sales_docs_skipped_store_unresolved") == 9, f"stats={s}")
+
+    s = {"sales_docs_skipped_store": 2, "sales_docs_skipped_store_unresolved": 9}
+    _mss._apply_skip_diagnostic_lifecycle(s, initial=False)
+    check("incremental, raw=2>0 -> sticky обновлён на 2",
+          s.get("sales_docs_skipped_store_unresolved") == 2, f"stats={s}")
+
+    for bad in (None, -1, True, "3", 3.5):
+        s = {"sales_docs_skipped_store": bad, "sales_docs_skipped_store_unresolved": 9}
+        _mss._apply_skip_diagnostic_lifecycle(s, initial=True)
+        check(f"malformed raw ({bad!r}) -> sticky не тронут (9)",
+              s.get("sales_docs_skipped_store_unresolved") == 9, f"stats={s}")
+
+
 def run() -> int:
     run_part1_schema()
     run_part2_lifecycle()
+    run_part2_saved_resume_point()
+    run_part2_rollout_carry()
+    run_part3_unit_lifecycle()
     print(f"\nИТОГО: {len(PASS)} OK, {len(FAIL)} FAIL")
     return 1 if FAIL else 0
 

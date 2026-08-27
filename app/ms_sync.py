@@ -581,21 +581,47 @@ def _bounded_diagnostic_count(value: object) -> int | None:
     return None
 
 
+_SKIP_STICKY_KEY = "sales_docs_skipped_store_unresolved"
+_SKIP_LEGACY_KEY = "sales_docs_skipped_store"
+
+
+def _resolve_skip_diagnostic(stats: dict) -> int | None:
+    """DATA-8 rollout bootstrap (BLOCKED issuecomment-5438529547).
+
+    Прод уже писал ephemeral `stats["sales_docs_skipped_store"]` ДО того,
+    как появился sticky-ключ `sales_docs_skipped_store_unresolved`. Если
+    sticky-ключ уже был записан хоть раз (даже malformed-значением) — он
+    приоритетен: новый код уже принял решение по этому прогону, и legacy
+    его не подменяет. Если ключа нет вовсе — единственный законный
+    bootstrap: точный ПОЛОЖИТЕЛЬНЫЙ int в legacy-счётчике прежней строки.
+    Ноль/отсутствие/`bool`/отрицательное/строка/float в legacy ничего не
+    авторизуют и не считаются очисткой — так же fail-closed, как раньше.
+    """
+    if _SKIP_STICKY_KEY in stats:
+        return _bounded_diagnostic_count(stats.get(_SKIP_STICKY_KEY))
+    legacy = _bounded_diagnostic_count(stats.get(_SKIP_LEGACY_KEY))
+    return legacy if legacy is not None and legacy > 0 else None
+
+
 def get_status(org_id: int) -> dict:
     """GET /api/sync/status: текущее состояние синхронизации организации.
 
     Деплой П1: плюс phase, coverage_days, history_loaded_from, months[],
     stages[], eta_sec — из них же собирается публичный /api/sync/progress.
 
-    DATA-8 (третий сценарий + corrective): плюс `diagnostics` — узкий
+    DATA-8 (третий сценарий + два corrective): плюс `diagnostics` — узкий
     именованный owner-only контракт поверх sticky `stats.
     sales_docs_skipped_store_unresolved` (документы продаж, чей склад не
     распознан или не входит в выбранные — ПОСЛЕДНИЙ известный факт, не
     обязательно счётчик текущего прогона: см. `_apply_skip_diagnostic_lifecycle`
-    в `_run_sync` — инкремент и resumed-первичка сохраняют его нетронутым,
-    снять в 0 может только полный нерезюмированный прогон). Не влияет на
-    отбор продаж и не публикуется в /api/sync/progress — см.
-    `_bounded_diagnostic_count` и `get_progress`.
+    в `_run_sync` — инкремент и resumed-первичка с раскопкой нуля сохраняют
+    его нетронутым, снять в 0 может только полный нерезюмированный прогон).
+    Пока sticky-ключ ещё ни разу не записан (rollout поверх прод-строки,
+    где раньше жил только ephemeral `sales_docs_skipped_store`) —
+    `_resolve_skip_diagnostic` bootstrap-ит его из валидного ПОЛОЖИТЕЛЬНОГО
+    legacy-значения, fail-closed на всём остальном. Не влияет на отбор
+    продаж и не публикуется в /api/sync/progress — см.
+    `_bounded_diagnostic_count`, `_resolve_skip_diagnostic` и `get_progress`.
     """
     db = SessionLocal()
     try:
@@ -644,9 +670,7 @@ def get_status(org_id: int) -> dict:
         "stages": _stages_out(row.state, stats) if row.mode == "initial" else [],
         "eta_sec": _eta_sec(row.state, stats),
         "diagnostics": {
-            "sales_docs_skipped_store_unresolved": _bounded_diagnostic_count(
-                stats.get("sales_docs_skipped_store_unresolved")
-            ),
+            "sales_docs_skipped_store_unresolved": _resolve_skip_diagnostic(stats),
         },
     }
 
@@ -814,6 +838,27 @@ _CARRIED_STATS = ("history_loaded_from", "history_loaded_to", "resume_fp",
                   "sales_docs_skipped_store_unresolved")
 
 
+def _carry_stats(prev_stats: dict) -> dict:
+    """`_CARRIED_STATS` keys из `prev_stats` — плюс DATA-8 rollout bootstrap
+    (BLOCKED issuecomment-5438529547).
+
+    Единственная точка, где новый прогон строит свежий `stats` с нуля из
+    прежней строки — и поэтому единственная точка, где legacy-факт обязан
+    попасть в sticky-ключ, если сам ключ ещё ни разу не был записан.
+    `get_status()`/`_resolve_skip_diagnostic` бутстрапят значение только
+    ДЛЯ ЧТЕНИЯ; без этой копии оно необратимо терялось бы уже на первом
+    `start_sync` после рассылки правки — carried-словарь заменяет собой всю
+    строку целиком, а `sales_docs_skipped_store` (ephemeral) в
+    `_CARRIED_STATS` никогда не входил и не должен.
+    """
+    carried = {k: prev_stats[k] for k in _CARRIED_STATS if k in prev_stats}
+    if _SKIP_STICKY_KEY not in prev_stats:
+        bootstrapped = _resolve_skip_diagnostic(prev_stats)
+        if bootstrapped is not None:
+            carried[_SKIP_STICKY_KEY] = bootstrapped
+    return carried
+
+
 def _pending_resume(org_id: int) -> str | None:
     """Самая старая загруженная дата прерванной первичной загрузки
     (stats.history_loaded_from) — или None, если продолжать нечего.
@@ -918,7 +963,7 @@ def start_sync(org_id: int, mode: str, *, force_full: bool = False) -> bool:
         # упадёт ещё до истории остатков (429/401 на ассортименте), точка
         # продолжения / флаг пересборки обязаны пережить и этот провал. Снимает
         # их только done (или реально случившийся wipe в фазе today).
-        carried = {k: prev_stats[k] for k in _CARRIED_STATS if k in prev_stats}
+        carried = _carry_stats(prev_stats)
         carried["mode"] = mode
         _set_state(
             org_id,
@@ -1116,30 +1161,36 @@ def _apply_skip_diagnostic_lifecycle(stats: dict, initial: bool) -> None:
     partial rebuild must preserve» выполняется самой структурой вызова, а не
     отдельной проверкой состояния.
 
-    Правила (BLOCKED issuecomment-5438193835):
+    Правила (BLOCKED issuecomment-5438193835, уточнено issuecomment-5438529547
+    — resumed-положительный ОБНОВЛЯЕТ факт, а не «не трогает» его целиком;
+    «не трогаем» относится ТОЛЬКО к очистке нулём):
+      * ЛЮБОЙ прогон (инкремент, resumed-первичка, полная пересборка) с
+        собственным ПОЛОЖИТЕЛЬНЫМ `sales_docs_skipped_store` обновляет
+        sticky на это свежее значение — свежая находка не должна прятаться
+        за старым числом, независимо от того, покрыл ли этот прогон всю
+        историю;
       * инкремент перечитывает только свой узкий хвост (DATA-4 — старые
         документы никогда не перечитываются), поэтому его собственный
-        честный ноль НЕ доказывает, что прежние пропуски исчезли — sticky
-        не трогаем;
+        честный НОЛЬ НЕ доказывает, что прежние пропуски исчезли — sticky
+        в этом случае не очищаем (положительный случай — правило выше);
       * RESUMED первичная загрузка (`stats["resumed_from"]` выставлен в
-        `_run_initial`) тоже не авторитетна: её `sales_docs_skipped_store`
-        считает только чанки, докачанные в ЭТОМ прогоне, а не всю историю
-        с начала — sticky не трогаем;
-      * снять факт в 0 может только НЕрезюмированный `initial` (первая
+        `_run_initial`) тем же способом не авторитетна для очистки: её
+        `sales_docs_skipped_store` считает только чанки, докачанные в ЭТОМ
+        прогоне, а не всю историю с начала, — собственный честный НОЛЬ
+        sticky тоже не очищает (положительный случай — то же правило выше);
+      * очистить факт в 0 может только НЕрезюмированный `initial` (первая
         синхронизация организации или явная «Полная пересборка истории»,
-        `force_full=True`): он один проходит по всей истории заново, и его
-        `done` подтверждает 0 авторитетно;
-      * новый ПОЛОЖИТЕЛЬНЫЙ прогон любого типа обновляет sticky на свежее
-        значение — свежая находка не должна прятаться за старым числом.
+        `force_full=True`) со СВОИМ нулём: он один проходит по всей истории
+        заново, и его `done` подтверждает 0 авторитетно.
     """
-    raw = stats.get("sales_docs_skipped_store")
+    raw = stats.get(_SKIP_LEGACY_KEY)
     if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
         return
     if raw > 0:
-        stats["sales_docs_skipped_store_unresolved"] = raw
+        stats[_SKIP_STICKY_KEY] = raw
         return
     if initial and not stats.get("resumed_from"):
-        stats["sales_docs_skipped_store_unresolved"] = 0
+        stats[_SKIP_STICKY_KEY] = 0
 
 
 # ── Основной прогон ──────────────────────────────────────────────────────────
@@ -1171,10 +1222,10 @@ async def _run_sync(org_id: int, mode: str, resume_from: str | None = None,
     finally:
         db.close()
 
-    # Стартуем от сохранённых stats (start_sync оставил там переносимые ключи),
-    # чтобы каждый _set_state(stats_json=...) нёс их до самого done.
-    stats: dict = {k: v for k, v in (get_status(org_id).get("stats") or {}).items()
-                   if k in _CARRIED_STATS}
+    # Стартуем от сохранённых stats (start_sync оставил там переносимые ключи,
+    # включая rollout bootstrap — см. _carry_stats), чтобы каждый
+    # _set_state(stats_json=...) нёс их до самого done.
+    stats: dict = _carry_stats(get_status(org_id).get("stats") or {})
     stats["mode"] = mode
     stats["warehouses"] = [w.name for w in active_wh]
     initial = mode == "initial"
