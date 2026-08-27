@@ -555,6 +555,7 @@ def run_scenario() -> int:
         c_reuse = client()
         register(c_reuse, "sec3-reuse@test.io", "Реюз-бренд")
         reuse_uid1 = sql("SELECT id FROM users WHERE email = ?", "sec3-reuse@test.io")[0][0]
+        old_org_id = org_of("sec3-reuse@test.io")
         old_cookie_raw = c_reuse.cookies.get(auth.SESSION_COOKIE)
         check("кука первого владельца слота захвачена для дальнейшей проверки", bool(old_cookie_raw))
 
@@ -582,6 +583,11 @@ def run_scenario() -> int:
         reuse_uid2 = sql("SELECT id FROM users WHERE email = ?", "sec3-reuse@test.io")[0][0]
         check("id действительно переиспользован (SQLite: max(id)+1 после удаления последней строки)",
               reuse_uid2 == reuse_uid1, f"old={reuse_uid1} new={reuse_uid2}")
+
+        new_org_id = org_of("sec3-reuse@test.io")
+        check("org_id тоже переиспользован (подписанная кука несёт И user_id, И org_id — "
+              "иначе 401 ниже мог бы объясняться несовпадением организации, а не версии сессии)",
+              new_org_id == old_org_id, f"old_org={old_org_id} new_org={new_org_id}")
 
         new_seed = sql("SELECT session_version FROM users WHERE id = ?", reuse_uid2)[0][0]
         if seeds_patched:
