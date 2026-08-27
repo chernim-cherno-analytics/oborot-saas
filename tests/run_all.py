@@ -102,6 +102,7 @@ SUITES = [
     ("wb_race",     "test_writeback_race.py",  True,  False),
     ("ms_client",   "test_ms_client.py",       False, False),
     ("ops",         "test_ops.py",             False, False),
+    ("startup",     "test_startup_lifecycle.py", False, False),
     ("logging",     "test_logging.py",         False, False),
     ("subscr",      "test_subscription.py",    False, False),
     ("exec",        "test_execution.py",       False, False),

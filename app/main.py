@@ -228,6 +228,9 @@ def _startup() -> None:
     _subscription.log_preview()
     global _STARTUP_DONE
     _STARTUP_DONE = True
+    # OPS-6: планировщик стартует последним статементом, ПОСЛЕ того как все
+    # миграции/ensure_schema выше завершились успешно — см. scheduler.attach.
+    _scheduler.start()
 
 
 # ── Health-эндпоинты ─────────────────────────────────────────────────────────
