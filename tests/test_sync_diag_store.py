@@ -55,6 +55,17 @@ Corrective #3 (P2, discussion_r3871610382) закрывает более узк�
 перечитывающий уже обработанные чанки) навсегда теряет находку упавшего
 прогона.
 
+Corrective #4 (P2, discussion_r3871933011) закрывает последний оставшийся
+случай той же природы, но на уровне ОДНОЙ логической пересборки, распавшейся
+на несколько прогонов: завершённые ДО падения чанки нашли 8 пропусков,
+резюмированный остаток нашёл ЕЩЁ 3 disjoint (непересекающихся) — итог
+обязан быть 11, а не 3 (последний сегмент подменял бы более ранние).
+`_rebuild_total` = raw текущего сегмента + `sales_docs_skipped_store_
+rebuild_checkpoint` (сумма всех предыдущих сегментов той же пересборки,
+переносится и накапливается в `_carry_stats` при `resuming=True`,
+снимается при успешном завершении и при старте новой — НЕ резюмированной —
+логической пересборки).
+
 Запуск из корня репозитория:  python tests/test_sync_diag_store.py
 """
 import json
@@ -667,6 +678,100 @@ def run_part2_fresh_evidence_overrides_sticky() -> None:
     mock_api.close()
 
 
+def run_part2_rebuild_accumulator() -> None:
+    """Corrective #4 (P2 discussion_r3871933011): один логический full
+    rebuild, распавшийся на ТРИ прогона (изначальный + два resume), обязан
+    СКЛАДЫВАТЬ находки disjoint-сегментов, а не подменять их последним.
+
+    Раунд 1 (fresh, non-resumed): фаза month находит 8 пропусков, история
+    заблокирована — падает СО СВОИМ raw=8.
+    Раунд 2 (resume №1): чекпоинт=8 унаследован; фаза «сегодня» (догон
+    разрыва при резюме) находит ЕЩЁ 2 — история по-прежнему заблокирована —
+    падает СО СВОИМ raw=2 (не 10: чекпоинт живёт отдельно от raw).
+    Раунд 3 (resume №2, всё расчищено): чекпоинт=10 (8+2) унаследован;
+    свой raw=0 — завершается успешно с total=10.
+
+    Каждый резюмированный прогон не перечитывает чанки, обработанные ДО
+    своего старта (тот же принцип DATA-4, что и у обычного инкремента) —
+    поэтому 8 и 2 не пересекаются и обязаны дать именно 10, а не 2 (последний
+    сегмент) и не 8 (первый, забытый).
+    """
+    c = client()
+    mock_api = httpx.Client(base_url=f"http://127.0.0.1:{MOCK_PORT}", timeout=30.0)
+    all_stores = [sid for sid, _ in mock_ms.STORES]
+    org_id = register_and_connect_ms(c, "owner-g@diag.test",
+                                     "Организация G (rebuild-accumulator)", all_stores)
+
+    window_days = int(os.environ["INITIAL_WINDOW_DAYS"])
+    w_start = (date.today() - timedelta(days=window_days - 1)).isoformat()
+    today_iso = date.today().isoformat()
+    SKIP_STORE = "st-ghost-test-g"
+    mock_api.post("/__test/skip_store_doc", json={
+        "entity": "demand", "store": SKIP_STORE, "date": w_start, "count": 8,
+    })
+    mock_api.post("/__test/faults", json={"docs_429_before": w_start})
+
+    print("\n== [часть 2, rebuild-accumulator] Раунд 1: fresh-прогон находит "
+          "raw=8 в фазе month, падает в фазе history ==")
+    r = c.post("/api/sync/initial")
+    check("раунд 1 запущен", r.status_code == 200, f"status={r.status_code}")
+    st1 = wait_sync_done(c)
+    check("раунд 1 честно упал (error)", st1.get("state") == "error",
+          f"state={st1.get('state')}")
+    check("resume point сохранён (месяц/finalize-lite отработали)",
+          (st1.get("stats") or {}).get("history_loaded_from") == w_start,
+          f"history_loaded_from={(st1.get('stats') or {}).get('history_loaded_from')}")
+    raw1 = (st1.get("stats") or {}).get("sales_docs_skipped_store")
+    check("раунд 1: СВОЙ raw == 8", raw1 == 8, f"raw={raw1}")
+
+    print("\n== [часть 2, rebuild-accumulator] Раунд 2 (resume №1): чекпоинт "
+          "8 унаследован, свой raw=2 (найдено на догоне «сегодня»), падает "
+          "СНОВА (история всё ещё заблокирована) ==")
+    mock_api.post("/__test/skip_store_doc", json={
+        "entity": "demand", "store": SKIP_STORE, "date": today_iso, "count": 2,
+    })
+    r = c.post("/api/sync/run")
+    check("раунд 2 (резюме) запущен", r.status_code == 200, f"status={r.status_code}")
+    st2 = wait_sync_done(c)
+    check("раунд 2 тоже честно упал (error) — история по-прежнему заблокирована",
+          st2.get("state") == "error", f"state={st2.get('state')}")
+    check("раунд 2 реально пошёл веткой initial (resume_from)",
+          st2.get("mode") == "initial", f"mode={st2.get('mode')}")
+    raw2 = (st2.get("stats") or {}).get("sales_docs_skipped_store")
+    check("раунд 2: СВОЙ raw == 2 (только догон «сегодня», НЕ 8+2)",
+          raw2 == 2, f"raw={raw2}")
+    checkpoint2 = (st2.get("stats") or {}).get("sales_docs_skipped_store_rebuild_checkpoint")
+    check("раунд 2: унаследованный checkpoint == 8 (раунда 1)",
+          checkpoint2 == 8, f"checkpoint={checkpoint2}")
+    check("раунд 2: sticky на этом снимке == 8 (checkpoint раунда 1; свои "
+          "2 ещё не финализированы — раунд 2 сам упал, не дошёл до done)",
+          diag(st2) == 8, f"diagnostics={st2.get('diagnostics')}")
+
+    print("\n== [часть 2, rebuild-accumulator] Раунд 3 (resume №2, всё "
+          "расчищено): чекпоинт 10 (8+2) унаследован, свой raw=0, "
+          "завершается total=10 ==")
+    mock_api.post("/__test/faults", json={})
+    mock_api.post("/__test/reset_skip_store_docs")
+    r = c.post("/api/sync/run")
+    check("раунд 3 (резюме) запущен", r.status_code == 200, f"status={r.status_code}")
+    st3 = wait_sync_done(c)
+    check("раунд 3 дошёл до done", st3.get("state") == "done",
+          f"state={st3.get('state')} error={st3.get('error')}")
+    check("раунд 3 реально пошёл веткой initial (resume_from)",
+          st3.get("mode") == "initial", f"mode={st3.get('mode')}")
+    raw3 = (st3.get("stats") or {}).get("sales_docs_skipped_store")
+    check("раунд 3: СВОЙ raw == 0 (все документы убраны)", raw3 == 0, f"raw={raw3}")
+    check("ИТОГ: sticky == 10 == 8 (раунд 1) + 2 (раунд 2) + 0 (раунд 3) — "
+          "disjoint-сегменты сложились, а не заменили друг друга",
+          diag(st3) == 10, f"diagnostics={st3.get('diagnostics')}")
+    checkpoint3 = (st3.get("stats") or {}).get("sales_docs_skipped_store_rebuild_checkpoint")
+    check("checkpoint снят после успешного завершения (пересборка закончилась)",
+          checkpoint3 is None, f"checkpoint={checkpoint3}")
+
+    c.close()
+    mock_api.close()
+
+
 def run_part3_unit_lifecycle() -> None:
     """Прямая проверка чистой функции `_apply_skip_diagnostic_lifecycle` —
     быстрое точное покрытие всей таблицы решений без сетевого прогона синка.
@@ -718,14 +823,40 @@ def run_part3_unit_lifecycle() -> None:
         check(f"malformed raw ({bad!r}) -> sticky не тронут (9)",
               s.get("sales_docs_skipped_store_unresolved") == 9, f"stats={s}")
 
-    print("\n== [часть 3] _carry_stats: свежее evidence против старого sticky ==")
+    print("\n== [часть 3] _apply_skip_diagnostic_lifecycle: checkpoint "
+          "(corrective #4, P2 discussion_r3871933011) ==")
+
+    s = {"sales_docs_skipped_store": 3, "resumed_from": "2026-01-01",
+         "sales_docs_skipped_store_rebuild_checkpoint": 8}
+    _mss._apply_skip_diagnostic_lifecycle(s, initial=True)
+    check("RESUMED, свой raw=3 + checkpoint=8 -> sticky == 11 (8+3, не 3)",
+          s.get("sales_docs_skipped_store_unresolved") == 11, f"stats={s}")
+    check("checkpoint снят после успешного завершения",
+          "sales_docs_skipped_store_rebuild_checkpoint" not in s, f"stats={s}")
+
+    s = {"sales_docs_skipped_store": 0, "resumed_from": "2026-01-01",
+         "sales_docs_skipped_store_rebuild_checkpoint": 8}
+    _mss._apply_skip_diagnostic_lifecycle(s, initial=True)
+    check("RESUMED, свой raw=0 + checkpoint=8 -> sticky == 8 (не очищен, "
+          "не резюмированный-и-нулевой)",
+          s.get("sales_docs_skipped_store_unresolved") == 8, f"stats={s}")
+
+    s = {"sales_docs_skipped_store": 0,
+         "sales_docs_skipped_store_rebuild_checkpoint": 5}  # не resumed
+    _mss._apply_skip_diagnostic_lifecycle(s, initial=True)
+    check("НЕрезюмированный initial, raw=0, checkpoint=5 (аномалия) -> total=5>0, "
+          "sticky == 5, а не авторитетный 0 — checkpoint честно участвует в total",
+          s.get("sales_docs_skipped_store_unresolved") == 5, f"stats={s}")
+
+    print("\n== [часть 3] _carry_stats: свежее evidence против старого sticky "
+          "(resuming=False) ==")
 
     c1 = _mss._carry_stats({"sales_docs_skipped_store": 8,
-                            "sales_docs_skipped_store_unresolved": 5})
+                            "sales_docs_skipped_store_unresolved": 5}, resuming=False)
     check("fresh legacy positive (8) ПОБЕЖДАЕТ существующий sticky (5)",
           c1.get("sales_docs_skipped_store_unresolved") == 8, f"carried={c1}")
 
-    c2 = _mss._carry_stats({"sales_docs_skipped_store": 8})
+    c2 = _mss._carry_stats({"sales_docs_skipped_store": 8}, resuming=False)
     check("fresh legacy positive (8) бутстрапит отсутствующий sticky (rollout)",
           c2.get("sales_docs_skipped_store_unresolved") == 8, f"carried={c2}")
 
@@ -733,14 +864,83 @@ def run_part3_unit_lifecycle() -> None:
         prev = {"sales_docs_skipped_store_unresolved": 5}
         if bad is not None:
             prev["sales_docs_skipped_store"] = bad
-        c3 = _mss._carry_stats(prev)
+        c3 = _mss._carry_stats(prev, resuming=False)
         check(f"malformed/non-positive legacy ({bad!r}) НЕ подменяет sticky (5)",
               c3.get("sales_docs_skipped_store_unresolved") == 5, f"carried={c3}")
 
-    c4 = _mss._carry_stats({"sales_docs_skipped_store": 0})
+    c4 = _mss._carry_stats({"sales_docs_skipped_store": 0}, resuming=False)
     check("legacy==0 без sticky -> carried не содержит sticky-ключ вовсе "
           "(не подделывает 0)",
           "sales_docs_skipped_store_unresolved" not in c4, f"carried={c4}")
+
+    c5 = _mss._carry_stats({"sales_docs_skipped_store": 8,
+                            "sales_docs_skipped_store_rebuild_checkpoint": 3},
+                           resuming=False)
+    check("resuming=False -> унаследованный checkpoint (3) НЕ переносится "
+          "(новая логическая пересборка не наследует старую бухгалтерию)",
+          "sales_docs_skipped_store_rebuild_checkpoint" not in c5, f"carried={c5}")
+
+    print("\n== [часть 3] _carry_stats: rebuild-checkpoint (resuming=True, "
+          "corrective #4) ==")
+
+    c6 = _mss._carry_stats({"sales_docs_skipped_store": 3,
+                            "sales_docs_skipped_store_rebuild_checkpoint": 8,
+                            "sales_docs_skipped_store_unresolved": 8},
+                           resuming=True)
+    check("resuming=True: checkpoint СКЛАДЫВАЕТСЯ (8+3=11), не заменяется 3",
+          c6.get("sales_docs_skipped_store_rebuild_checkpoint") == 11, f"carried={c6}")
+    check("resuming=True: sticky сразу становится 11 (immediate visibility)",
+          c6.get("sales_docs_skipped_store_unresolved") == 11, f"carried={c6}")
+
+    c7 = _mss._carry_stats({"sales_docs_skipped_store": 0,
+                            "sales_docs_skipped_store_rebuild_checkpoint": 8,
+                            "sales_docs_skipped_store_unresolved": 8},
+                           resuming=True)
+    check("resuming=True, свой raw=0: checkpoint остаётся 8 (не сброшен в 0)",
+          c7.get("sales_docs_skipped_store_rebuild_checkpoint") == 8, f"carried={c7}")
+    check("resuming=True, свой raw=0: sticky остаётся 8 (total=8>0)",
+          c7.get("sales_docs_skipped_store_unresolved") == 8, f"carried={c7}")
+
+    # Три последовательных падения/резюме подряд: 5 -> 5+3=8 -> 8+2=10.
+    chained = {"sales_docs_skipped_store": 5}
+    chained = _mss._carry_stats(chained, resuming=True)
+    check("цепочка шаг 1 (первое падение, checkpoint ещё не было): 0+5=5",
+          chained.get("sales_docs_skipped_store_rebuild_checkpoint") == 5,
+          f"chained={chained}")
+    chained["sales_docs_skipped_store"] = 3
+    chained = _mss._carry_stats(chained, resuming=True)
+    check("цепочка шаг 2 (второе падение): 5+3=8",
+          chained.get("sales_docs_skipped_store_rebuild_checkpoint") == 8,
+          f"chained={chained}")
+    chained["sales_docs_skipped_store"] = 2
+    chained = _mss._carry_stats(chained, resuming=True)
+    check("цепочка шаг 3 (третье падение): 8+2=10 — сколько угодно повторных "
+          "падений/резюме складываются, а не теряются",
+          chained.get("sales_docs_skipped_store_rebuild_checkpoint") == 10,
+          f"chained={chained}")
+
+    c8 = _mss._carry_stats({"sales_docs_skipped_store": True,
+                            "sales_docs_skipped_store_rebuild_checkpoint": 8,
+                            "sales_docs_skipped_store_unresolved": 8},
+                           resuming=True)
+    check("resuming=True, malformed raw (bool) -> total не строится, checkpoint "
+          "и sticky остаются нетронутыми (carried через базовый _CARRIED_STATS)",
+          c8.get("sales_docs_skipped_store_rebuild_checkpoint") == 8
+          and c8.get("sales_docs_skipped_store_unresolved") == 8, f"carried={c8}")
+
+    print("\n== [часть 3] _rebuild_total: raw + checkpoint напрямую ==")
+
+    check("raw=3, checkpoint=8 -> 11",
+          _mss._rebuild_total({"sales_docs_skipped_store": 3,
+                               "sales_docs_skipped_store_rebuild_checkpoint": 8}) == 11)
+    check("raw=3, checkpoint отсутствует -> 3 (как обычный несрезюмированный случай)",
+          _mss._rebuild_total({"sales_docs_skipped_store": 3}) == 3)
+    check("raw malformed -> None (fail-closed, total не строится вовсе)",
+          _mss._rebuild_total({"sales_docs_skipped_store": "3",
+                               "sales_docs_skipped_store_rebuild_checkpoint": 8}) is None)
+    check("checkpoint malformed, raw=3 -> 3 (malformed checkpoint трактуется как 0)",
+          _mss._rebuild_total({"sales_docs_skipped_store": 3,
+                               "sales_docs_skipped_store_rebuild_checkpoint": "x"}) == 3)
 
 
 def run() -> int:
@@ -749,6 +949,7 @@ def run() -> int:
     run_part2_saved_resume_point()
     run_part2_rollout_carry()
     run_part2_fresh_evidence_overrides_sticky()
+    run_part2_rebuild_accumulator()
     run_part3_unit_lifecycle()
     print(f"\nИТОГО: {len(PASS)} OK, {len(FAIL)} FAIL")
     return 1 if FAIL else 0

@@ -583,6 +583,7 @@ def _bounded_diagnostic_count(value: object) -> int | None:
 
 _SKIP_STICKY_KEY = "sales_docs_skipped_store_unresolved"
 _SKIP_LEGACY_KEY = "sales_docs_skipped_store"
+_SKIP_CHECKPOINT_KEY = "sales_docs_skipped_store_rebuild_checkpoint"
 
 
 def _resolve_skip_diagnostic(stats: dict) -> int | None:
@@ -601,6 +602,30 @@ def _resolve_skip_diagnostic(stats: dict) -> int | None:
         return _bounded_diagnostic_count(stats.get(_SKIP_STICKY_KEY))
     legacy = _bounded_diagnostic_count(stats.get(_SKIP_LEGACY_KEY))
     return legacy if legacy is not None and legacy > 0 else None
+
+
+def _rebuild_total(stats: dict) -> int | None:
+    """DATA-8 corrective #4 (P2 discussion_r3871933011): raw ЭТОГО сегмента
+    + checkpoint уже завершённых/упавших сегментов ТОЙ ЖЕ логической
+    пересборки.
+
+    Прерванная пересборка может распасться на НЕСКОЛЬКО прогонов
+    (изначальный + один или несколько resume): чанки истории, обработанные
+    ДО очередного падения, никогда не перечитываются заново (тот же принцип
+    DATA-4, что и у обычного инкремента), поэтому их находки обязаны
+    складываться, а не теряться и не подменяться последним сегментом.
+    `checkpoint` хранит сумму ВСЕХ сегментов, предшествующих текущему;
+    `raw` — то, что нашёл ТЕКУЩИЙ сегмент (ещё идущий или только что
+    завершившийся). Отсутствующий/некорректный `checkpoint` — 0 (обычный
+    несрезюмированный случай: пересборка ещё не имела предыдущих
+    сегментов). Некорректный `raw` — fail-closed `None`: на malformed
+    ephemeral-счётчике никакой total не строится вовсе.
+    """
+    raw = _bounded_diagnostic_count(stats.get(_SKIP_LEGACY_KEY))
+    if raw is None:
+        return None
+    checkpoint = _bounded_diagnostic_count(stats.get(_SKIP_CHECKPOINT_KEY)) or 0
+    return raw + checkpoint
 
 
 def get_status(org_id: int) -> dict:
@@ -839,30 +864,53 @@ _CARRIED_STATS = ("history_loaded_from", "history_loaded_to", "resume_fp",
                   # прогона (P2 discussion_r3871610382), и
                   # `_apply_skip_diagnostic_lifecycle` — итог ТЕКУЩЕГО
                   # прогона в финализации `_run_sync`.
-                  "sales_docs_skipped_store_unresolved")
+                  "sales_docs_skipped_store_unresolved",
+                  # DATA-8 corrective #4 (P2 discussion_r3871933011):
+                  # rebuild-checkpoint обязан пережить БАЗОВЫМ копированием
+                  # (как и sticky выше) в т.ч. повторный вызов `_carry_stats`
+                  # внутри одного и того же старта прогона (`start_sync`
+                  # пишет queued-строку, `_run_sync` тут же перечитывает её
+                  # заново) — на этом втором вызове ephemeral `sales_docs_
+                  # skipped_store` уже отсутствует (он никогда не входит в
+                  # этот кортеж), `_rebuild_total` честно возвращает None, и
+                  # без базового копирования checkpoint терялся бы уже на
+                  # старте, а не только между прогонами.
+                  "sales_docs_skipped_store_rebuild_checkpoint")
 
 
-def _carry_stats(prev_stats: dict) -> dict:
-    """`_CARRIED_STATS` keys из `prev_stats` — плюс DATA-8 rollout/resume
-    bootstrap (BLOCKED issuecomment-5438529547, P2 discussion_r3871610382).
+def _carry_stats(prev_stats: dict, *, resuming: bool) -> dict:
+    """`_CARRIED_STATS` keys из `prev_stats` — плюс DATA-8 rollout/resume/
+    rebuild-checkpoint bootstrap (BLOCKED issuecomment-5438529547, P2
+    discussion_r3871610382, P2 discussion_r3871933011).
 
     Единственная точка, где новый прогон строит свежий `stats` с нуля из
     прежней строки — и поэтому единственная точка, где положительное
-    evidence обязано попасть в sticky-ключ ПЕРЕД тем, как carried-словарь
-    заменит собой всю строку целиком.
+    evidence обязано попасть в sticky-ключ (и, при резюме, в
+    rebuild-checkpoint) ПЕРЕД тем, как carried-словарь заменит собой всю
+    строку целиком.
 
-    Валидный ПОЛОЖИТЕЛЬНЫЙ ephemeral `sales_docs_skipped_store` из
-    ПРЕДЫДУЩЕЙ строки — это observed evidence СВЕЖЕЕ, чем что бы то ни было
-    в sticky, даже валидный положительный sticky: прерванный (упавший)
-    прогон мог найти raw=8 уже ПОСЛЕ того, как sticky был 5 (частично
-    обработал историю, `_collect_sales` накопил счётчик, потом упал на
-    следующем чанке) — 8 обязано победить 5, иначе следующий resume
-    навсегда потеряет находку упавшего прогона: он не перечитывает уже
-    обработанные чанки (тот же принцип DATA-4, что и для обычного
-    инкремента). Именно поэтому проверка не условна на «sticky ещё не
-    записан» — она безусловна: свежий положительный legacy всегда
-    материализуется, покрывая заодно и исходный rollout-случай (сам sticky
-    ключ отсутствует вовсе).
+    `resuming=True` — этот прогон продолжает ПРЕРВАННУЮ первичную загрузку
+    (`_pending_resume` нашёл точку продолжения; `force_full`/`needs_full_
+    rebuild` этот флаг НЕ поднимают — это НОВАЯ логическая пересборка).
+    В этом случае используем `_rebuild_total(prev_stats)` — сумму raw
+    ПРЕДЫДУЩЕГО (только что упавшего) сегмента и уже накопленного им
+    checkpoint: чанки истории, обработанные ДО падения, никогда не
+    перечитываются заново, поэтому их находки обязаны СКЛАДЫВАТЬСЯ через
+    сколько угодно повторных падений/резюме, а не подменяться последним
+    сегментом (P2 discussion_r3871933011) и не теряться вовсе (P2
+    discussion_r3871610382). Total становится и новым checkpoint (базой
+    для ЕЩЁ одного возможного падения), и, если положителен, sticky —
+    немедленная видимость на queued/running снимке.
+
+    `resuming=False` — новая логическая пересборка (первый прогон
+    организации, явная «Полная пересборка», смена складов) или обычный
+    инкремент без ожидающего продолжения: checkpoint прежней (уже
+    неактуальной) пересборки НЕ наследуется. Валидный ПОЛОЖИТЕЛЬНЫЙ
+    ephemeral `sales_docs_skipped_store` предыдущей строки всё ещё
+    бутстрапит sticky, если сам sticky-ключ отсутствовал (rollout, BLOCKED
+    issuecomment-5438529547) — для уже присутствующего sticky это то же
+    значение, что и так туда попадёт на финализации предыдущего успешного
+    прогона, поэтому переопределение здесь не расходится с ним.
 
     Ноль/отсутствие/`bool`/отрицательное/строка/float в legacy ничего не
     авторизуют и не считаются очисткой — существующий sticky (в том числе
@@ -870,6 +918,14 @@ def _carry_stats(prev_stats: dict) -> dict:
     `_SKIP_STICKY_KEY` — часть `_CARRIED_STATS`.
     """
     carried = {k: prev_stats[k] for k in _CARRIED_STATS if k in prev_stats}
+    if resuming:
+        total = _rebuild_total(prev_stats)
+        if total is not None:
+            carried[_SKIP_CHECKPOINT_KEY] = total
+            if total > 0:
+                carried[_SKIP_STICKY_KEY] = total
+        return carried
+    carried.pop(_SKIP_CHECKPOINT_KEY, None)
     fresh_positive = _bounded_diagnostic_count(prev_stats.get(_SKIP_LEGACY_KEY))
     if fresh_positive is not None and fresh_positive > 0:
         carried[_SKIP_STICKY_KEY] = fresh_positive
@@ -980,7 +1036,7 @@ def start_sync(org_id: int, mode: str, *, force_full: bool = False) -> bool:
         # упадёт ещё до истории остатков (429/401 на ассортименте), точка
         # продолжения / флаг пересборки обязаны пережить и этот провал. Снимает
         # их только done (или реально случившийся wipe в фазе today).
-        carried = _carry_stats(prev_stats)
+        carried = _carry_stats(prev_stats, resuming=bool(resume_from))
         carried["mode"] = mode
         _set_state(
             org_id,
@@ -1179,32 +1235,44 @@ def _apply_skip_diagnostic_lifecycle(stats: dict, initial: bool) -> None:
     отдельной проверкой состояния.
 
     Правила (BLOCKED issuecomment-5438193835, уточнено issuecomment-5438529547
-    — resumed-положительный ОБНОВЛЯЕТ факт, а не «не трогает» его целиком;
-    «не трогаем» относится ТОЛЬКО к очистке нулём):
+    и P2 discussion_r3871933011 — «свежее значение» ЭТОГО прогона — это
+    `_rebuild_total(stats)` = собственный raw + checkpoint уже завершённых/
+    упавших сегментов ТОЙ ЖЕ логической пересборки, а не голый raw: иначе
+    успешное завершение резюмированного прогона подменяло бы sticky своим
+    последним сегментом, теряя находки более ранних, уже необратимо
+    непрочитываемых чанков — «не трогаем» относится ТОЛЬКО к очистке нулём):
       * ЛЮБОЙ прогон (инкремент, resumed-первичка, полная пересборка) с
-        собственным ПОЛОЖИТЕЛЬНЫМ `sales_docs_skipped_store` обновляет
-        sticky на это свежее значение — свежая находка не должна прятаться
-        за старым числом, независимо от того, покрыл ли этот прогон всю
-        историю;
+        положительным `_rebuild_total` обновляет sticky на это значение —
+        свежая находка не должна прятаться за старым числом, независимо от
+        того, покрыл ли этот прогон всю историю; для обычного инкремента и
+        для нерезюмированной пересборки checkpoint всегда 0 (он появляется
+        только на `resuming=True` в `_carry_stats`), поэтому total здесь
+        равен голому raw — старое правило не меняется по факту, только по
+        источнику числа;
       * инкремент перечитывает только свой узкий хвост (DATA-4 — старые
-        документы никогда не перечитываются), поэтому его собственный
-        честный НОЛЬ НЕ доказывает, что прежние пропуски исчезли — sticky
-        в этом случае не очищаем (положительный случай — правило выше);
+        документы никогда не перечитываются), поэтому total==0 НЕ доказывает,
+        что прежние пропуски исчезли — sticky в этом случае не очищаем
+        (положительный случай — правило выше);
       * RESUMED первичная загрузка (`stats["resumed_from"]` выставлен в
-        `_run_initial`) тем же способом не авторитетна для очистки: её
-        `sales_docs_skipped_store` считает только чанки, докачанные в ЭТОМ
-        прогоне, а не всю историю с начала, — собственный честный НОЛЬ
-        sticky тоже не очищает (положительный случай — то же правило выше);
+        `_run_initial`) тем же способом не авторитетна для очистки: total==0
+        доказывает лишь то, что ни завершённые ДО падения, ни докачанные
+        ПОСЛЕ резюме чанки пропусков не нашли — но не то, что пересборка
+        покрыла ВСЮ историю с начала (`force_full`) — sticky тоже не
+        очищаем (положительный случай — то же правило выше);
       * очистить факт в 0 может только НЕрезюмированный `initial` (первая
         синхронизация организации или явная «Полная пересборка истории»,
-        `force_full=True`) со СВОИМ нулём: он один проходит по всей истории
-        заново, и его `done` подтверждает 0 авторитетно.
+        `force_full=True`) со своим `_rebuild_total`==0: он один проходит по
+        всей истории заново, и его `done` подтверждает 0 авторитетно;
+      * checkpoint не переживает УСПЕШНОЕ завершение (снимается здесь же):
+        логическая пересборка закончилась, следующий прогон (обычный
+        инкремент или новая пересборка) не наследует её бухгалтерию.
     """
-    raw = stats.get(_SKIP_LEGACY_KEY)
-    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+    total = _rebuild_total(stats)
+    if total is None:
         return
-    if raw > 0:
-        stats[_SKIP_STICKY_KEY] = raw
+    stats.pop(_SKIP_CHECKPOINT_KEY, None)
+    if total > 0:
+        stats[_SKIP_STICKY_KEY] = total
         return
     if initial and not stats.get("resumed_from"):
         stats[_SKIP_STICKY_KEY] = 0
@@ -1240,9 +1308,10 @@ async def _run_sync(org_id: int, mode: str, resume_from: str | None = None,
         db.close()
 
     # Стартуем от сохранённых stats (start_sync оставил там переносимые ключи,
-    # включая rollout bootstrap — см. _carry_stats), чтобы каждый
-    # _set_state(stats_json=...) нёс их до самого done.
-    stats: dict = _carry_stats(get_status(org_id).get("stats") or {})
+    # включая rollout/rebuild-checkpoint bootstrap — см. _carry_stats), чтобы
+    # каждый _set_state(stats_json=...) нёс их до самого done.
+    stats: dict = _carry_stats(get_status(org_id).get("stats") or {},
+                               resuming=bool(resume_from))
     stats["mode"] = mode
     stats["warehouses"] = [w.name for w in active_wh]
     initial = mode == "initial"
