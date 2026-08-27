@@ -1,4 +1,0 @@
-{% extends "base.html" %}
-{% block content %}<pre id="out"></pre>
-<script>fetch('/api/summary').then(r=>r.json()).then(d=>out.textContent=JSON.stringify(d,null,2))</script>
-{% endblock %}

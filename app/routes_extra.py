@@ -36,10 +36,8 @@ from app.models import (
 router = APIRouter()
 
 _BASE_DIR = Path(__file__).resolve().parent.parent
-# Тот же порядок, что в main.py: настоящие шаблоны перекрывают заглушки.
-_templates = Jinja2Templates(
-    directory=[str(_BASE_DIR / "templates"), str(_BASE_DIR / "_stub_templates")]
-)
+# Тот же путь поиска, что в main.py: только templates/ (MAINT-4).
+_templates = Jinja2Templates(directory=str(_BASE_DIR / "templates"))
 
 
 def _authed_page(request: Request, db: Session, template: str, active: str, page_title: str,

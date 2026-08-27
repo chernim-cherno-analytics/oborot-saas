@@ -1,8 +1,7 @@
 """Приложение FastAPI: страницы (Jinja2), маршруты аутентификации, подключение API.
 
-Шаблоны ищутся сначала в templates/ (зона frontend-агента), затем в
-_stub_templates/ (временные заглушки backend'а) — когда появляются настоящие
-шаблоны, они автоматически перекрывают заглушки.
+Шаблоны ищутся только в templates/. Отсутствующий шаблон — ошибка
+(jinja2.TemplateNotFound), а не молчаливый фолбэк на заглушку (MAINT-4).
 """
 import os
 from datetime import datetime, timedelta
@@ -35,9 +34,7 @@ from app.db import get_db, init_db
 from app.models import Connection, Membership, Org, Product, ProductionOrder, Sale, User
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-# Порядок важен: настоящие шаблоны перекрывают заглушки; несуществующая
-# директория для FileSystemLoader не ошибка — templates/ подхватится, как появится.
-TEMPLATE_DIRS = [BASE_DIR / "templates", BASE_DIR / "_stub_templates"]
+TEMPLATE_DIRS = [BASE_DIR / "templates"]
 STATIC_DIR = BASE_DIR / "static"
 TRIAL_DAYS = 14
 
