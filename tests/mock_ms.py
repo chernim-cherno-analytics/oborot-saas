@@ -669,10 +669,14 @@ FAULTS: dict = {"stock_ok_before": 0, "stock_429_burst": 0,
                 # удаляемым вместе с ключом связывания.
                 #
                 # po_hide_created — созданные нами документы не видны ни в
-                # выдаче списка, ни точечному маршруту. Это не выдумка: у
-                # свежесозданной сущности выдача списка может отставать, и
-                # принять задержку видимости за «документа нет» — значит
-                # потерять его насовсем.
+                # выдаче списка, ни точечной ПОДСКАЗКЕ по syncId
+                # (/entity/{entity}/syncid/{id}). Это не выдумка: у
+                # свежесозданной сущности выдача списка/поискового индекса
+                # может отставать, и принять задержку видимости за
+                # «документа нет» — значит потерять его насовсем. Прямой GET
+                # по id (/entity/purchaseorder/{id}, DATA-6 round 2, ниже)
+                # этим флагом СОЗНАТЕЛЬНО не гасится — это чтение по ключу,
+                # а не по индексу, разница ровно в этом.
                 "po_hide_created": 0,
                 # po_list_ok_before / po_list_status — список заказов
                 # поставщику отвечает `po_list_status` ПОСЛЕ N удачных
@@ -683,6 +687,13 @@ FAULTS: dict = {"stock_ok_before": 0, "stock_429_burst": 0,
                 # и тест остаётся детерминированным.
                 "po_list_ok_before": 0,
                 "po_list_status": 0,
+                # po_get_ok_before / po_get_status — та же форма, что у
+                # po_list_*, но для ТОЧЕЧНОГО GET одного документа по id
+                # (DATA-6 round 2): транзиентный сбой ИМЕННО точечного
+                # чтения, независимый от po_hide_created (задержка списка) и
+                # от «документа нет» (тот отвечает честной 404, без сбоя).
+                "po_get_ok_before": 0,
+                "po_get_status": 0,
                 # po_create_twin_then_fail — документ создан, следом создан
                 # его ДВОЙНИК с тем же syncId, и только потом «падает» ответ.
                 # Так выглядит нарушенное обещание уникальности ключа,
@@ -707,7 +718,7 @@ FAULTS: dict = {"stock_ok_before": 0, "stock_429_burst": 0,
                 "po_create_then_fail_extra_unmapped": 0,
                 "stock_delay_ms": 0}
 FAULT_STATS: dict = {"stock_requests": 0, "stock_ok": 0, "stock_429": 0,
-                     "stock_500": 0, "po_list_ok": 0}
+                     "stock_500": 0, "po_list_ok": 0, "po_get_ok": 0}
 
 
 def reset_faults() -> None:
@@ -720,6 +731,7 @@ def reset_faults() -> None:
                   syncid_route_wrong_type=0, syncid_route_status=0,
                   po_create_delay_ms=0, po_hide_created=0,
                   po_list_ok_before=0, po_list_status=0,
+                  po_get_ok_before=0, po_get_status=0,
                   po_create_twin_then_fail=0, po_create_refuse=0,
                   po_create_then_fail_mutate_qty=0,
                   po_create_then_fail_extra_unmapped=0,
@@ -976,6 +988,20 @@ def expected_incoming() -> dict:
     return {b: q for b, q in out.items() if q > 0}
 
 
+def _po_visible_doc(d: dict) -> dict:
+    """Тело CREATED_PURCHASE_ORDERS (сырое, из POST) → форма, в которой МС
+    отдал бы его в выдаче: moment/applicable проставлены, positions —
+    {"rows": [...], "meta": {"size": n}} вместо сырого списка. Общий
+    нормализатор для списка (ниже) и точечного GET по id (DATA-6, round 2) —
+    оба обязаны видеть один и тот же документ одинаково."""
+    return {**d,
+            "moment": d.get("moment") or f"{TODAY.isoformat()} 12:00:00",
+            "applicable": d.get("applicable", True),
+            "positions": {"rows": [{**p, "shipped": p.get("shipped", 0.0)}
+                                   for p in (d.get("positions") or [])],
+                          "meta": {"size": len(d.get("positions") or [])}}}
+
+
 @app.get("/entity/purchaseorder")
 def entity_purchaseorder(request: Request, limit: int = 100, offset: int = 0,
                          flt: str = Query(default="", alias="filter"),
@@ -995,15 +1021,7 @@ def entity_purchaseorder(request: Request, limit: int = 100, offset: int = 0,
     # и applicable сам — эмулируем: сегодня, проведён, shipped=0).
     created_visible = [] if int(FAULTS.get("po_hide_created") or 0) > 0 \
         else CREATED_PURCHASE_ORDERS
-    for doc in PURCHASE_ORDERS + [
-        {**d,
-         "moment": d.get("moment") or f"{TODAY.isoformat()} 12:00:00",
-         "applicable": d.get("applicable", True),
-         "positions": {"rows": [{**p, "shipped": p.get("shipped", 0.0)}
-                                for p in (d.get("positions") or [])],
-                       "meta": {"size": len(d.get("positions") or [])}}}
-        for d in created_visible
-    ]:
+    for doc in PURCHASE_ORDERS + [_po_visible_doc(d) for d in created_visible]:
         day = doc["moment"][:10]
         if m_from and day < m_from:
             continue
@@ -1020,6 +1038,36 @@ def entity_purchaseorder(request: Request, limit: int = 100, offset: int = 0,
             stripped["positions"] = {"meta": doc["positions"]["meta"]}
             rows.append(stripped)
     return _page(rows, limit, offset)
+
+
+@app.get("/entity/purchaseorder/{doc_id}")
+def entity_purchaseorder_get(doc_id: str, request: Request):
+    """Точечный GET ОДНОГО «Заказа поставщику» по id (DATA-6, round 2).
+
+    Сознательно НЕ проверяет po_hide_created: тот флаг моделирует задержку
+    видимости СПИСКА/поискового индекса (см. его же докстринг выше и у
+    точечного /entity/{entity}/syncid/{id} — там прячет намеренно, это
+    поиск), а не первичного ключа. Прямой GET по id читает конкретную
+    строку, а не индекс, и в реальном МойСкладе такому отставанию не
+    подвержен — ровно ради этой разницы маршрут и понадобился синку.
+
+    po_get_status/po_get_ok_before — отдельный, независимый от po_list_*/
+    po_hide_created набор сбоев: транзиентная ошибка ИМЕННО точечного
+    чтения (429/5xx), а не «список отстал» и не «документа нет».
+    """
+    _auth(request)
+    code = int(FAULTS.get("po_get_status") or 0)
+    if code > 0 and FAULT_STATS["po_get_ok"] >= int(FAULTS.get("po_get_ok_before") or 0):
+        raise HTTPException(status_code=code, detail={"errors": [
+            {"error": f"mock: точечный GET заказа поставщику ответил {code}"}]})
+    FAULT_STATS["po_get_ok"] += 1
+    for doc in PURCHASE_ORDERS + [_po_visible_doc(d) for d in CREATED_PURCHASE_ORDERS]:
+        if str(doc.get("id")) == doc_id:
+            stripped = dict(doc)
+            stripped["positions"] = {"meta": doc["positions"]["meta"]}
+            return stripped
+    raise HTTPException(status_code=404, detail={"errors": [
+        {"error": "mock: заказ поставщику не найден"}]})
 
 
 # ── Обратная запись: организация, контрагенты, заказ поставщику ──────────────

@@ -68,6 +68,7 @@ import threading
 import time
 from datetime import date, datetime, timedelta
 
+import httpx
 from sqlalchemy import delete, func, insert, inspect, or_, select, update
 
 from app import analytics, exclusions, logging_conf, ms_writeback
@@ -85,7 +86,7 @@ from app.models import (
     WarehouseStock,
     encode_items_payload,
 )
-from app.ms_client import MoySkladClient, _env_int
+from app.ms_client import TRANSPORT_ERRORS, MoySkladClient, _env_int
 
 # Окно загружаемой истории = окну канона оборачиваемости (D-35, 23.08.2026):
 # 2 года. Аккаунты, загруженные до этого решения (365 дней), добирают второй
@@ -2723,7 +2724,8 @@ async def _sync_incoming_locked(org_id: int, client: MoySkladClient,
                detail="Загружаем заказы поставщику («едет к нам»)…")
     # Окно заказов поставщику — ГОД (INCOMING_ORDERS_DAYS), не окно истории:
     # см. комментарий у константы (ревью PR #12).
-    cutoff = (_today() - timedelta(days=INCOMING_ORDERS_DAYS - 1)).isoformat()
+    cutoff_date = _today() - timedelta(days=INCOMING_ORDERS_DAYS - 1)
+    cutoff = cutoff_date.isoformat()
     docs = await client.fetch_purchase_orders(cutoff)
 
     # product_id → base_name (агрегируем «едет» по базовому имени).
@@ -2736,18 +2738,21 @@ async def _sync_incoming_locked(org_id: int, client: MoySkladClient,
         db.close()
 
     # Ссылки на документы МойСклада, созданные нашими заказами: id → href.
-    # Нужны для встречной проверки маркера (см. _is_oborot_doc).
+    # Нужны для встречной проверки маркера (см. _is_oborot_doc). created_at
+    # тоже нужен ниже (DATA-6, round 2) — граница «стоит ли перепроверять
+    # точечным чтением».
     db = SessionLocal()
     try:
-        our_docs = {
-            int(oid): href
-            for oid, href in db.execute(
-                select(ProductionOrder.id, ProductionOrder.ms_doc_href).where(
-                    ProductionOrder.org_id == org_id,
-                    ProductionOrder.ms_doc_href.is_not(None),
-                )
-            ).all()
-            if href
+        order_rows = db.execute(
+            select(ProductionOrder.id, ProductionOrder.ms_doc_href,
+                   ProductionOrder.created_at).where(
+                ProductionOrder.org_id == org_id,
+                ProductionOrder.ms_doc_href.is_not(None),
+            )
+        ).all()
+        our_docs = {int(oid): href for oid, href, _ in order_rows if href}
+        order_created_at = {
+            int(oid): created for oid, href, created in order_rows if href
         }
     finally:
         db.close()
@@ -2757,6 +2762,69 @@ async def _sync_incoming_locked(org_id: int, client: MoySkladClient,
     # синке считался нашим, а не ещё сутки числился чужим.
     await _backmatch_by_sync_id(org_id, docs, our_docs, stats, client,
                                 ext_to_pid, base_by_pid)
+
+    # DATA-6 (round 2, независимое ревью discussion_r3867655979): успешный
+    # push может закоммитить локальный вклад и снять слот РАНЬШЕ, чем
+    # МойСклад покажет свежесозданный документ в выдаче/поиске
+    # (см. po_hide_created в tests/mock_ms.py — задержка видимости индекса,
+    # а не выдумка). Следующий синк тогда видит СТАРЫЙ снимок без этого
+    # документа, и пересборка ниже обнулила бы уже подтверждённый вклад до
+    # следующего цикла — тот же user-visible провал, что и исходная гонка,
+    # но уже без одновременного выполнения (гейт из round 1 здесь ни при
+    # чём: push и синк здесь НЕ пересекались по времени вовсе).
+    #
+    # Поэтому каждый локально привязанный (our_docs) документ, отсутствующий
+    # в СВЕЖЕМ снимке `docs`, проверяется ТОЧЕЧНЫМ чтением ПЕРЕД
+    # разрушительной пересборкой ниже — тем же fail-closed контрактом, что
+    # у entity_exists/fetch_purchase_order_by_id (app/ms_client.py):
+    # подтверждённые 404/410 — документа действительно нет, обнуление
+    # законно; любой другой ответ (429/5xx/транспорт) — «не знаю», и
+    # обнулять уже подтверждённый вклад по «не знаю» нельзя — весь синк
+    # входящих документов в этом прогоне прерывается ДО пересборки,
+    # известные ms_qty/ms_qty_tracked не трогаются вовсе (частичной
+    # перезаписи не бывает — либо пересборка целиком, либо не начинается).
+    #
+    # Проверяются не ВСЕ href из production_orders за всё время (МойСклад
+    # хранит документы годами, а окно синка — год, см. cutoff выше), а
+    # только те, чей ЛОКАЛЬНЫЙ заказ создан не раньше cutoff: документ не
+    # может появиться в МойСкладе раньше локального заказа, который его
+    # породил, — поэтому граница не теряет ни одного документа, который
+    # список обязан был бы показать в этом окне, и не воскрешает годами
+    # закрытые заказы, для которых исключение из окна — уже принятое,
+    # отдельное поведение (тот же cutoff, что и у самого списка).
+    def _doc_ref(d: dict) -> str:
+        href = ((d.get("meta") or {}).get("href")) or ""
+        return _href_id(href) or href
+
+    present_refs = {_doc_ref(d) for d in docs}
+    for order_id, href in our_docs.items():
+        if not ms_writeback.is_pushed(href):
+            continue  # "pending:"/"unknown:" — служебная пометка, не документ
+        ref = _href_id(href) or href
+        if not ref or ref in present_refs:
+            continue
+        created = order_created_at.get(order_id)
+        if created is None or created.date() < cutoff_date:
+            continue
+        try:
+            recovered = await client.fetch_purchase_order_by_id(ref)
+        except (httpx.HTTPStatusError, *TRANSPORT_ERRORS):
+            stats["incoming_reconcile_ambiguous"] = stats.get(
+                "incoming_reconcile_ambiguous", 0) + 1
+            _set_state(
+                org_id, stage="incoming", progress=progress[1],
+                detail="«Едет к нам»: точечная проверка не подтвердила "
+                       "статус документа — пересборка пропущена в этом синке",
+            )
+            return
+        if recovered is None:
+            stats["incoming_reconcile_confirmed_absent"] = stats.get(
+                "incoming_reconcile_confirmed_absent", 0) + 1
+            continue
+        docs.append(recovered)
+        present_refs.add(ref)
+        stats["incoming_reconcile_recovered"] = stats.get(
+            "incoming_reconcile_recovered", 0) + 1
 
     incoming: dict[str, float] = {}
     incoming_tracked: dict[str, float] = {}

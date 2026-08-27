@@ -47,6 +47,33 @@ Condition, а не сном:
      синка (исключение в `ms_sync._sync_incoming_locked`, без единой сетевой
      подмены — монки-патч самой функции).
 
+Round 2 (независимое ревью, BLOCKED issuecomment-5432584117 /
+discussion_r3867655979): гейт выше закрывает ОДНОВРЕМЕННОЕ выполнение push и
+синка, но не закрывает случай, где push и синк НЕ пересекаются вовсе, а
+выдача `entity/purchaseorder` МойСклада просто ОТСТАЁТ от уже успешно
+завершённого push (`po_hide_created` в tests/mock_ms.py — задержка
+видимости индекса, а не выдумка). Разрушительная пересборка ниже тогда
+обнуляет уже подтверждённый вклад до следующего цикла. Три новых сценария:
+
+  5. push 200 (список ещё не тронут) → `po_hide_created` включён → синк:
+     ТОЧЕЧНЫЙ GET `/entity/purchaseorder/{id}` (новый маршрут, не гасится
+     `po_hide_created`) находит документ, финальные ms_qty/ms_qty_tracked
+     точно равны значению сразу после push — не обнулены и не задвоены.
+
+  6. push 200 → документ РЕАЛЬНО удалён из состояния мока (не спрятан, а
+     убран целиком — и из списка, и из точечного GET) → синк корректно
+     снимает вклад ОДИН раз; повторный синк не воскрешает документ снова.
+
+  7. push 200 (вклад уже закоммичен локально) → `po_hide_created` ВМЕСТЕ с
+     `po_get_status=401` (точечное чтение само падает неоднозначно; 401,
+     как и у уже существующего po_list_status/syncid_route_status — код вне
+     RETRY_STATUSES, падает сразу без пауз, тест остаётся детерминированным
+     и быстрым, а не гоняет реальный backoff клиента на 5xx/429) → синк
+     обязан прервать пересборку входящих ДО записи: ms_qty/ms_qty_tracked
+     остаются РОВНО на значении сразу после push, сам синк при этом честно
+     доходит до `done` (это признанный, обработанный случай, а не падение
+     всего прогона — та же философия, что у существующего `suppliers_error`).
+
 Свой мок на отдельном порту — можно гонять параллельно с соседними
 writeback-наборами (tests/test_writeback_dup.py: 9812, .../idempotency: 9813).
 
@@ -570,6 +597,140 @@ def run() -> int:
     check("PUSH ПРОХОДИТ СРАЗУ ПОСЛЕ — ГЕЙТ ПОЛНОСТЬЮ СВОБОДЕН",
           ms_sync.try_acquire_incoming_lock(org_id))
     ms_sync.release_incoming_lock(org_id)
+
+    # ── 5. po_hide_created: push 200, список синка устарел ──────────────────
+    print("\n== 5. po_hide_created: push 200, список синка устарел, "
+          "точечное чтение находит документ ==")
+    order_h_id, item_h = make_order(c, "Заказ: список устарел после push")
+    base_h = item_h["base_name"]
+    qty_h = float(item_h["qty"])
+    before_ms_h = ms_qty_pair(org_id, base_h)
+    created_before_s5 = len(mock_ms.CREATED_PURCHASE_ORDERS)
+
+    r5push = c.post(f"/api/orders/{order_h_id}/push-to-ms")
+    check("push прошёл нормально (список ещё не тронут)", r5push.status_code == 200,
+          f"status={r5push.status_code} body={r5push.text[:160]}")
+    href_h = order_href(order_h_id)
+    check("документ создан и привязан",
+          bool(href_h) and not ms_writeback.is_internal_href(href_h),
+          f"href={href_h!r}")
+    after_push_h = ms_qty_pair(org_id, base_h)
+    check("push УЖЕ добавил вклад локально (аддитивно, до всякого синка)",
+          after_push_h[0] == before_ms_h[0] + qty_h
+          and after_push_h[1] == before_ms_h[1] + qty_h,
+          f"было={before_ms_h} стало={after_push_h} ожидали +{qty_h}")
+
+    mock_ms.FAULTS["po_hide_created"] = 1
+    st5: dict = {}
+    try:
+        r = c.post("/api/sync/run")
+        check("инкрементальный синк запущен", r.status_code == 200,
+              f"status={r.status_code}")
+        st5 = wait_sync_done(c)
+    finally:
+        mock_ms.FAULTS["po_hide_created"] = 0
+    check("синк дошёл до done несмотря на устаревший список",
+          st5.get("state") == "done",
+          f"state={st5.get('state')} error={str(st5.get('error'))[:120]}")
+
+    stats5 = st5.get("stats", {}) or {}
+    check("СИНК ПОДТВЕРДИЛ ТОЧЕЧНЫМ ЧТЕНИЕМ И ВОССТАНОВИЛ СКРЫТЫЙ ДОКУМЕНТ",
+          stats5.get("incoming_reconcile_recovered", 0) >= 1,
+          f"stats={stats5.get('incoming_reconcile_recovered')}")
+    after_sync_h = ms_qty_pair(org_id, base_h)
+    check("ms_qty/ms_qty_tracked НЕ ОБНУЛЕНЫ — равны значению сразу после push",
+          after_sync_h == after_push_h,
+          f"после push={after_push_h} после синка={after_sync_h}")
+    check("документов в МойСкладе по-прежнему РОВНО ОДИН новый (не задвоился)",
+          len(mock_ms.CREATED_PURCHASE_ORDERS) == created_before_s5 + 1,
+          f"было={created_before_s5} стало={len(mock_ms.CREATED_PURCHASE_ORDERS)}")
+
+    # ── 6. Документ реально удалён — не воскрешается ────────────────────────
+    print("\n== 6. Документ реально удалён из МойСклада: вклад снят один раз, "
+          "не воскрешается повторным синком ==")
+    order_i_id, item_i = make_order(c, "Заказ: документ удалят по-настоящему")
+    base_i = item_i["base_name"]
+    qty_i = float(item_i["qty"])
+    before_ms_i = ms_qty_pair(org_id, base_i)
+
+    r6push = c.post(f"/api/orders/{order_i_id}/push-to-ms")
+    check("push прошёл", r6push.status_code == 200, f"status={r6push.status_code}")
+    href_i = order_href(order_i_id)
+    doc_id_i = ms_sync._href_id(href_i)
+    after_push_i = ms_qty_pair(org_id, base_i)
+    check("push реально добавил вклад локально",
+          after_push_i[0] == before_ms_i[0] + qty_i,
+          f"было={before_ms_i} стало={after_push_i}")
+
+    matching = [d for d in mock_ms.CREATED_PURCHASE_ORDERS if d.get("id") == doc_id_i]
+    check("документ найден в состоянии мока перед удалением", len(matching) == 1,
+          f"найдено={len(matching)} id={doc_id_i!r}")
+    # Настоящее удаление — документ убирается ЦЕЛИКОМ (список И точечный GET),
+    # в отличие от po_hide_created, который лишь задерживает видимость.
+    mock_ms.CREATED_PURCHASE_ORDERS[:] = [
+        d for d in mock_ms.CREATED_PURCHASE_ORDERS if d.get("id") != doc_id_i
+    ]
+
+    r = c.post("/api/sync/run")
+    check("синк запущен", r.status_code == 200, f"status={r.status_code}")
+    st6 = wait_sync_done(c)
+    check("синк дошёл до done", st6.get("state") == "done",
+          f"state={st6.get('state')} error={str(st6.get('error'))[:120]}")
+    stats6 = st6.get("stats", {}) or {}
+    check("СИНК ЧЕСТНО ЗАФИКСИРОВАЛ ПОДТВЕРЖДЁННОЕ ОТСУТСТВИЕ (404)",
+          stats6.get("incoming_reconcile_confirmed_absent", 0) >= 1,
+          f"stats={stats6.get('incoming_reconcile_confirmed_absent')}")
+    after_sync_i = ms_qty_pair(org_id, base_i)
+    check("ВКЛАД УДАЛЁННОГО ДОКУМЕНТА КОРРЕКТНО СНЯТ",
+          after_sync_i[0] == before_ms_i[0],
+          f"было={before_ms_i[0]} стало={after_sync_i[0]}")
+
+    r = c.post("/api/sync/run")
+    st6b = wait_sync_done(c)
+    check("повторный синк тоже дошёл до done", st6b.get("state") == "done",
+          f"state={st6b.get('state')}")
+    after_sync_i2 = ms_qty_pair(org_id, base_i)
+    check("ПОВТОРНЫЙ СИНК НЕ ВОСКРЕШАЕТ УДАЛЁННЫЙ ДОКУМЕНТ (не фабрикуется бесконечно)",
+          after_sync_i2[0] == before_ms_i[0],
+          f"стало={after_sync_i2[0]}")
+
+    # ── 7. Точечное чтение падает неоднозначно — пересборка прерывается ─────
+    print("\n== 7. Точечное чтение падает 401 (неоднозначно): пересборка "
+          "входящих прервана, известный вклад НЕ обнулён ==")
+    order_j_id, item_j = make_order(c, "Заказ: точечное чтение падает неоднозначно")
+    base_j = item_j["base_name"]
+    qty_j = float(item_j["qty"])
+    before_ms_j = ms_qty_pair(org_id, base_j)
+
+    r7push = c.post(f"/api/orders/{order_j_id}/push-to-ms")
+    check("push прошёл", r7push.status_code == 200, f"status={r7push.status_code}")
+    after_push_j = ms_qty_pair(org_id, base_j)
+    check("push добавил вклад локально",
+          after_push_j[0] == before_ms_j[0] + qty_j,
+          f"было={before_ms_j} стало={after_push_j}")
+
+    mock_ms.FAULTS["po_hide_created"] = 1
+    mock_ms.FAULTS["po_get_status"] = 401
+    st7: dict = {}
+    try:
+        r = c.post("/api/sync/run")
+        check("инкрементальный синк запущен", r.status_code == 200,
+              f"status={r.status_code}")
+        st7 = wait_sync_done(c)
+    finally:
+        mock_ms.FAULTS["po_hide_created"] = 0
+        mock_ms.FAULTS["po_get_status"] = 0
+    check("СИНК ЧЕСТНО ДОШЁЛ ДО DONE (обработанный, а не фатальный случай)",
+          st7.get("state") == "done",
+          f"state={st7.get('state')} error={str(st7.get('error'))[:120]}")
+    stats7 = st7.get("stats", {}) or {}
+    check("НЕОДНОЗНАЧНОСТЬ ТОЧЕЧНОГО ЧТЕНИЯ ЗАФИКСИРОВАНА ЧЕСТНО",
+          stats7.get("incoming_reconcile_ambiguous", 0) >= 1,
+          f"stats={stats7.get('incoming_reconcile_ambiguous')}")
+    after_sync_j = ms_qty_pair(org_id, base_j)
+    check("ИЗВЕСТНЫЙ ВКЛАД ПОСЛЕ PUSH НЕ ОБНУЛЁН — пересборка прервана целиком",
+          after_sync_j == after_push_j,
+          f"после push={after_push_j} после синка={after_sync_j}")
 
     c.close()
     print(f"\nИТОГО: {len(PASS)} OK, {len(FAIL)} FAIL")
