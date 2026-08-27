@@ -27,7 +27,33 @@
   9) консольные обёртки (`bin/pip` и прочие) работают ПОСЛЕ переезда каталога
      окружения — и у свежесобранного, и у переиспользованного кэшированного;
  10) сбой починки или сбой запуска обёртки на финальном пути откатывают выкладку
-     ДО перезапуска службы.
+     ДО перезапуска службы;
+ 11) выкладку исполняет драйвер из защищённого `origin/main`, а не тот, что
+     лежит на диске: старый скрипт не доигрывает выкладку сам, откат на старый
+     коммит драйвер не понижает, подстановка не зацикливается, временный файл
+     убирается, отказ `git fetch` и сигнал не оставляют прод в промежутке;
+ 12) повторная выкладка ТОГО ЖЕ коммита не затирает различающиеся
+     `PREVIOUS_SHA`/`PREVIOUS_VENV`, не печатает откат на самого себя и не
+     позволяет уборке удалить настоящее окружение отката;
+ 13) такая повторная выкладка при исправном окружении сводится к починке и
+     проверке: без пересборки venv, без копии базы и без перезапуска службы.
+
+Про пункты 11–13 отдельно (OPS-8). Оба дефекта доказаны выпуском 27.08.2026, а
+не выведены из рассуждений. `bash` читает скрипт из открытого дескриптора, и
+`git checkout` в середине выкладки заменяет файл новым inode — прежний
+дескриптор остаётся на старом содержимом, поэтому весь прогон доигрывает
+ПРЕЖНЯЯ реализация. На проде это дало зелёный первый заход, на котором починка
+консольных обёрток не исполнялась вовсе. Второй, вынужденный, заход тем же SHA
+записал `PREVIOUS_SHA` равным выкладываемому коммиту: подсказка стала предлагать
+откат на самого себя, а настоящая цель отката осталась в живых только потому,
+что в квоте `OBOROT_VENV_KEEP` случайно было место.
+
+Площадка это воспроизводит честно и потому обязана быть устроена как сервер:
+подставной репозиторий несёт СВОЙ `deploy/deploy.sh`, выкладка запускается из
+него, а «старый драйвер» — это тот же самый скрипт с наблюдаемой пометкой,
+закоммиченный в более ранний коммит. Проверить, что пометка вообще попала в
+файл, обязан отдельный раздел: иначе «старого драйвера не видно в выводе» стало
+бы правдой по причине, к предмету проверки отношения не имеющей.
 
 Про пункты 9–10 отдельно (OPS-6). Поломка настоящая и проверена на НАСТОЯЩЕМ
 venv, а не только здесь: `python -m venv /tmp/x/.venv-staging.12345`, затем
@@ -92,6 +118,12 @@ def make_repo() -> Path:
         git(["config", k, v], cwd=app)
     (app / "requirements.lock").write_text("httpx==0.28.1\n", encoding="utf-8")
     (app / "app.py").write_text("v1\n", encoding="utf-8")
+    # Как на сервере: драйвер выкладки лежит В САМОМ репозитории и едет вместе с
+    # кодом. Без этого проверить bootstrap нечем — а именно на этом «скрипт
+    # обновляется тем же checkout'ом, который он же и выполняет» и построен
+    # первый дефект OPS-8.
+    (app / "deploy").mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(ROOT / "deploy" / "deploy.sh", app / "deploy" / "deploy.sh")
     # Как на сервере: рядом с кодом живут файлы, которые в git не входят
     # осознанно. Проверка на неотслеживаемое обязана их пропускать.
     (app / ".gitignore").write_text("*.log\n", encoding="utf-8")
@@ -117,6 +149,32 @@ def add_commit(app: Path, text: str, lock: bool = True) -> str:
     git(["commit", "-qm", text], cwd=app)
     git(["push", "-q", "origin", "main"], cwd=app)
     return git(["rev-parse", "HEAD"], cwd=app)[1].strip()
+
+
+# «Старый драйвер» — не выдуманный скрипт, а РОВНО тот же самый, с одной
+# наблюдаемой пометкой. Так и бывает на сервере: на диске лежит предыдущая
+# редакция того же файла. Пометка вставляется после разбора аргументов —
+# то есть заведомо ПОЗЖЕ того места, где актуальный драйвер обязан подставить
+# себя, и заведомо РАНЬШЕ любой мутации: если она напечаталась, значит выкладку
+# доигрывал старый скрипт.
+OLD_DRIVER_ANCHOR = 'TARGET="${1:-origin/main}"'
+OLD_DRIVER_MARK = "СТАРЫЙ ДРАЙВЕР ВЫПОЛНЯЕТСЯ"
+
+
+def old_driver(text: str, *, sabotage: bool) -> str:
+    """Тот же драйвер плюс пометка; при sabotage — ещё и отказ сразу после неё."""
+    inject = f'echo "{OLD_DRIVER_MARK}"\n'
+    if sabotage:
+        # Отказ ровно здесь превращает проверку в однозначную: выкладка проходит
+        # ТОЛЬКО если тело старого скрипта не исполнялось вовсе.
+        inject += "exit 3\n"
+    return text.replace(OLD_DRIVER_ANCHOR, OLD_DRIVER_ANCHOR + "\n" + inject, 1)
+
+
+def commit_driver(app: Path, text: str, body: str) -> str:
+    """Коммит, который меняет сам драйвер выкладки, и push в origin/main."""
+    (app / "deploy" / "deploy.sh").write_text(body, encoding="utf-8")
+    return add_commit(app, text)
 
 
 def make_stubs(bindir: Path, *, health_ok=True, pip_ok=True) -> None:
@@ -163,6 +221,22 @@ def make_stubs(bindir: Path, *, health_ok=True, pip_ok=True) -> None:
         'if [ "${FAIL_MV_SILENT:-0}" = "1" ]; then\n'
         '  case "${dest##*/}" in\n'
         '    pip) rm -f "$1"; exit 0;;\n'
+        '  esac\n'
+        'fi\n'
+        # FAIL_MV_SIGNAL — не сбой, а СИГНАЛ, и точка его доставки выбрана не
+        # случайно. Он приходит выкладке в тот момент, когда код уже переключён,
+        # env переписан, окружение подменено, отложенное окружение уже лежит под
+        # своим именем — и служба ещё не перезапускалась. Это ровно то окно, в
+        # котором D-46 требует полного отката. Раньше (на подмене окружения)
+        # сигнал застал бы скрипт с недосведёнными указателями и проверял бы не
+        # то. Сторож-файл нужен, чтобы сигнал пришёл РОВНО ОДИН раз и не мешал
+        # самому откату.
+        'if [ "${FAIL_MV_SIGNAL:-0}" = "1" ]; then\n'
+        '  case "${dest##*/}" in\n'
+        '    pip) if [ ! -e "${FAIL_MV_SIGNAL_ONCE:-/несуществующий}" ]; then\n'
+        '           : > "$FAIL_MV_SIGNAL_ONCE"\n'
+        '           kill -TERM "$PPID" 2>/dev/null || true\n'
+        '         fi;;\n'
         '  esac\n'
         'fi\n'
         'exec /bin/mv "$@"\n', encoding="utf-8")
@@ -1018,6 +1092,284 @@ def main() -> int:
     check("названо, что обёртка указывает не на интерпретатор этого окружения",
           "указывают не на" in out, out[-500:])
     check_rolled_back_to(vlive, out, rc, before_env, "# release vlive")
+
+    # ------------------------------------------------------------------
+    # OPS-8: драйвер выкладки и повторная выкладка того же коммита.
+    # ------------------------------------------------------------------
+    print("\n== Площадка честна: подставной репозиторий несёт свой драйвер ==")
+    # Без этого раздела всё, что ниже, ничего не стоит: «старого драйвера не
+    # видно в выводе» стало бы правдой просто потому, что пометка никуда не
+    # попала, а «выкладка прошла» — потому что старый драйвер ничем не отличался.
+    real_driver = (ROOT / "deploy" / "deploy.sh").read_text(encoding="utf-8")
+    check("драйвер лежит в самом репозитории, как на сервере",
+          (app / "deploy" / "deploy.sh").read_text(encoding="utf-8") == real_driver)
+    check("якорь для пометки в драйвере есть", OLD_DRIVER_ANCHOR in real_driver)
+    marked = old_driver(real_driver, sabotage=True)
+    check("пометка попала в текст старого драйвера, и он отличается от актуального",
+          OLD_DRIVER_MARK in marked and marked != real_driver)
+    check("пометка стоит ПОСЛЕ начала работы скрипта, а не в первой строке файла",
+          marked.index(OLD_DRIVER_MARK) > marked.index("== 1/"))
+
+    print("\n== Драйвер: на диске старый, в origin/main актуальный ==")
+    # Настоящая форма первого дефекта OPS-8. Скрипт обновляется тем же
+    # checkout'ом, который сам же и выполняет, поэтому первая выкладка после
+    # правки драйвера доигрывалась ПРЕЖНЕЙ реализацией — со всеми проверками,
+    # которых в ней ещё нет. Здесь старый драйвер вдобавок отказывает сразу
+    # после пометки: выкладка проходит только если его тело не исполнялось.
+    git(["checkout", "-q", "main"], cwd=app)
+    vold = commit_driver(app, "vold", old_driver(real_driver, sabotage=True))
+    git(["checkout", "-q", "main"], cwd=app)
+    vnew = commit_driver(app, "vnew", real_driver)
+    git(["checkout", "-q", "--detach", vold], cwd=app)
+    check("на диске действительно старый драйвер",
+          OLD_DRIVER_MARK in (app / "deploy" / "deploy.sh").read_text(encoding="utf-8"))
+    (WORK / "systemctl.log").write_text("", encoding="utf-8")
+    (WORK / "pip.log").write_text("", encoding="utf-8")
+    rc, out = run(["bash", str(app / "deploy" / "deploy.sh"), vnew], env=deploy_env(app))
+    check("ВЫКЛАДКА ВЫПОЛНЕНА, хотя на диске лежал старый драйвер", rc == 0,
+          f"rc={rc} " + out[-400:])
+    check("старый драйвер не исполнялся вовсе", OLD_DRIVER_MARK not in out, out[-400:])
+    check("код переключён на целевой коммит", head_of(app) == vnew, head_of(app)[:12])
+    syslog = (WORK / "systemctl.log").read_text(encoding="utf-8")
+    check("служба перезапущена РОВНО ОДИН раз — второй полосы деплоя не появилось",
+          syslog.count("restart") == 1, syslog.strip().replace("\n", " | ") or "пусто")
+    piplog = (WORK / "pip.log").read_text(encoding="utf-8")
+    check("окружение собрано один раз, а не дважды",
+          len([ln for ln in piplog.splitlines() if ln.startswith("install")]) == 1,
+          piplog.strip().replace("\n", " | ") or "пусто")
+    check("временный файл драйвера убран за собой",
+          not list((WORK / "state").glob(".deploy-driver.*")),
+          str([p.name for p in (WORK / "state").glob(".deploy-driver.*")]))
+    rc_pip, out_pip = run([str(WORK / "venv" / "bin" / "pip"), "--version"],
+                          env=deploy_env(app))
+    check("проверки актуального драйвера отработали: обёртка запускается",
+          rc_pip == 0, f"rc={rc_pip} {out_pip.strip()[:120]}")
+
+    print("\n== Откат на коммит со старым драйвером драйвер не понижает ==")
+    # После отката на диске снова окажется старый драйвер — это неизбежно и
+    # нормально. Требование в другом: сам откат обязан исполняться актуальным
+    # драйвером, а следующая выкладка — снова подняться до актуального.
+    rc, out = run(["bash", str(app / "deploy" / "deploy.sh"), vold], env=deploy_env(app))
+    check("откат выполнен", rc == 0 and head_of(app) == vold, f"rc={rc} " + out[-300:])
+    check("исполнялся актуальный драйвер, а не тот, что лежит в целевом коммите",
+          OLD_DRIVER_MARK not in out, out[-400:])
+    check("на диске после отката действительно старый драйвер — иначе проверка ниже пуста",
+          OLD_DRIVER_MARK in (app / "deploy" / "deploy.sh").read_text(encoding="utf-8"))
+    rc, out = run(["bash", str(app / "deploy" / "deploy.sh"), vnew], env=deploy_env(app))
+    check("СЛЕДУЮЩАЯ выкладка с понижённого диска снова идёт актуальным драйвером",
+          rc == 0 and OLD_DRIVER_MARK not in out and head_of(app) == vnew,
+          f"rc={rc} " + out[-400:])
+
+    print("\n== Подстановка драйвера не зацикливается ==")
+    # Счётчик глубины уже израсходован, а драйвер всё ещё расходится. Единственно
+    # правильный исход — отказ до любых изменений: новый круг подстановки в этом
+    # состоянии означал бы бесконечный цикл на боевом сервере.
+    git(["checkout", "-q", "main"], cwd=app)
+    vquiet = commit_driver(app, "vquiet", old_driver(real_driver, sabotage=False))
+    git(["checkout", "-q", "main"], cwd=app)
+    vnew2 = commit_driver(app, "vnew2", real_driver)
+    git(["checkout", "-q", "--detach", vquiet], cwd=app)
+    head_before = head_of(app)
+    (WORK / "systemctl.log").write_text("", encoding="utf-8")
+    rc, out = run(["bash", str(app / "deploy" / "deploy.sh"), vnew2],
+                  env=deploy_env(app, {"OBOROT_DEPLOY_BOOTSTRAP_DEPTH": "1"}))
+    check("вторая несходимость драйвера — отказ, а не новый круг", rc != 0, f"rc={rc}")
+    check("названа причина", "драйвер не сошёлся" in out, out[-400:])
+    check("до мутаций дело не дошло: код не переключён", head_of(app) == head_before,
+          head_of(app)[:12])
+    check("и служба не тронута",
+          "restart" not in (WORK / "systemctl.log").read_text(encoding="utf-8"))
+    check("временный файл драйвера убран и в этом случае",
+          not list((WORK / "state").glob(".deploy-driver.*")),
+          str([p.name for p in (WORK / "state").glob(".deploy-driver.*")]))
+
+    print("\n== Отказ git fetch останавливает выкладку до любых мутаций ==")
+    # Подстановка драйвера добавила выкладке новую внешнюю причину падать, и
+    # цена этого решения проверяется здесь: худший исход обязан быть «выкладка
+    # не начата», а не «прод в промежуточном состоянии».
+    git(["checkout", "-q", "--detach", vquiet], cwd=app)
+    rc, out = run(["bash", script, vnew2], env=deploy_env(app))
+    check("подготовка: в бою vnew2", rc == 0 and head_of(app) == vnew2, out[-250:])
+    (WORK / "systemctl.log").write_text("", encoding="utf-8")
+    (WORK / "pip.log").write_text("", encoding="utf-8")
+    head_before = head_of(app)
+    env_before = (WORK / "env").read_text(encoding="utf-8")
+    live_before = (WORK / "venv" / "INSTALLED").read_text(encoding="utf-8")
+    os.rename(WORK / "origin.git", WORK / "origin.git.hidden")
+    try:
+        rc, out = run(["bash", script, vquiet], env=deploy_env(app))
+    finally:
+        os.rename(WORK / "origin.git.hidden", WORK / "origin.git")
+    check("без origin выкладка не начинается", rc != 0, f"rc={rc}")
+    check("код не переключён", head_of(app) == head_before, head_of(app)[:12])
+    check("OBOROT_COMMIT не тронут",
+          (WORK / "env").read_text(encoding="utf-8") == env_before)
+    check("живое окружение не тронуто",
+          (WORK / "venv" / "INSTALLED").read_text(encoding="utf-8") == live_before)
+    check("служба не перезапускалась",
+          "restart" not in (WORK / "systemctl.log").read_text(encoding="utf-8"))
+    check("пакеты не ставились",
+          "install" not in (WORK / "pip.log").read_text(encoding="utf-8"))
+    check("временный файл драйвера не остался",
+          not list((WORK / "state").glob(".deploy-driver.*")),
+          str([p.name for p in (WORK / "state").glob(".deploy-driver.*")]))
+
+    print("\n== Сигнал в окне до перезапуска: полный откат, а не брошенный прод ==")
+    # SIGTERM (обрыв ssh, `systemctl stop` соседнего юнита, Ctrl-C) убивал bash
+    # мимо всех трапов: откат не делался, и прод оставался в состоянии «код
+    # новый, окружение новое, служба старая и живая» — ровно в том, против
+    # которого написан D-46, и незаметном снаружи.
+    git(["checkout", "-q", "main"], cwd=app)
+    vsig = add_commit(app, "vsig")
+    git(["checkout", "-q", "--detach", vnew2], cwd=app)
+    (WORK / "systemctl.log").write_text("", encoding="utf-8")
+    before_env = (WORK / "env").read_text(encoding="utf-8")
+    sentinel = WORK / "signal-once"
+    if sentinel.exists():
+        sentinel.unlink()
+    rc, out = run(["bash", script, vsig], env=deploy_env(app, {
+        "FAIL_MV_SIGNAL": "1", "FAIL_MV_SIGNAL_ONCE": str(sentinel)}))
+    check("сигнал действительно доставлен — иначе раздел не проверяет ничего",
+          sentinel.exists())
+    check("сказано, что это сигнал", "сигнал" in out, out[-500:])
+    check_rolled_back_to(vnew2, out, rc, before_env, "# release vnew2")
+
+    print("\n== Повторная выкладка того же коммита: цель отката не затирается ==")
+    # Второй дефект OPS-8 целиком. Повторный заход тем же SHA штатен — им
+    # доигрывают выкладку, начатую старым драйвером, — и прежний код на нём
+    # записывал цель отката равной выкладываемому релизу.
+    git(["checkout", "-q", "main"], cwd=app)
+    vprev = add_commit(app, "vprev")
+    git(["checkout", "-q", "main"], cwd=app)
+    vcur = add_commit(app, "vcur")
+    git(["checkout", "-q", "--detach", vnew2], cwd=app)
+    rc, out = run(["bash", script, vprev], env=deploy_env(app))
+    check("подготовка: выкатили vprev", rc == 0 and head_of(app) == vprev, out[-250:])
+    rc, out = run(["bash", script, vcur], env=deploy_env(app))
+    check("подготовка: выкатили vcur", rc == 0 and head_of(app) == vcur, out[-250:])
+    prev_sha = (WORK / "state" / "PREVIOUS_SHA").read_text(encoding="utf-8").strip()
+    prev_venv = (WORK / "state" / "PREVIOUS_VENV").read_text(encoding="utf-8").strip()
+    check("подготовка: цель отката — vprev", prev_sha == vprev, prev_sha[:12])
+    check("подготовка: окружение отката рядом и работоспособно",
+          Path(prev_venv).is_dir()
+          and run([str(Path(prev_venv) / "bin" / "python"), "-m", "pip", "--version"],
+                  env=deploy_env(app))[0] == 0, prev_venv)
+
+    # Ровно то состояние, ради которого повторный заход и делают: обёртка в
+    # живом окружении испорчена, всё остальное на месте.
+    live_pip = WORK / "venv" / "bin" / "pip"
+    live_pip.write_text(f"#!{WORK / 'нет-такого'}/bin/python\n"
+                        + live_pip.read_text(encoding="utf-8").split("\n", 1)[1],
+                        encoding="utf-8")
+    live_pip.chmod(0o755)
+    (WORK / "systemctl.log").write_text("", encoding="utf-8")
+    (WORK / "pip.log").write_text("", encoding="utf-8")
+    backups_before = sorted(p.name for p in (WORK / "data" / "backups").glob("oborot-*.db"))
+    rc, out = run(["bash", script, vcur], env=deploy_env(app))
+    check("повторная выкладка того же коммита прошла", rc == 0, f"rc={rc} " + out[-400:])
+    check("PREVIOUS_SHA НЕ ЗАТЁРТ выкладываемым коммитом",
+          (WORK / "state" / "PREVIOUS_SHA").read_text(encoding="utf-8").strip() == vprev,
+          (WORK / "state" / "PREVIOUS_SHA").read_text(encoding="utf-8").strip()[:12])
+    check("PREVIOUS_VENV по-прежнему указывает на окружение прежнего релиза",
+          (WORK / "state" / "PREVIOUS_VENV").read_text(encoding="utf-8").strip() == prev_venv,
+          (WORK / "state" / "PREVIOUS_VENV").read_text(encoding="utf-8").strip())
+    check("подсказка называет РЕАЛЬНЫЙ прежний релиз",
+          f"deploy/deploy.sh {vprev}" in out, out[-300:])
+    check("и не предлагает откат на самого себя",
+          f"deploy/deploy.sh {vcur}" not in out, out[-300:])
+    check("СЛУЖБА НЕ ПЕРЕЗАПУСКАЛАСЬ: менять было нечего",
+          "restart" not in (WORK / "systemctl.log").read_text(encoding="utf-8"),
+          (WORK / "systemctl.log").read_text(encoding="utf-8").strip() or "пусто")
+    check("КОПИЯ БАЗЫ НЕ СНИМАЛАСЬ: ни код, ни env, ни библиотеки не менялись",
+          "копия: " not in out
+          and sorted(p.name for p in (WORK / "data" / "backups").glob("oborot-*.db"))
+          == backups_before, out[-300:])
+    check("ОКРУЖЕНИЕ НЕ ПЕРЕСОБИРАЛОСЬ",
+          "install" not in (WORK / "pip.log").read_text(encoding="utf-8"),
+          (WORK / "pip.log").read_text(encoding="utf-8").strip().replace("\n", " | ")
+          or "пусто")
+    check("а испорченная обёртка при этом ПОЧИНЕНА и запускается",
+          run([str(live_pip), "--version"], env=deploy_env(app))[0] == 0)
+    check("шебанг приведён к интерпретатору живого окружения",
+          live_pip.read_text(encoding="utf-8").splitlines()[0]
+          == f"#!{WORK / 'venv'}/bin/python",
+          live_pip.read_text(encoding="utf-8").splitlines()[0])
+    check("окружение отката цело", Path(prev_venv).is_dir(), prev_venv)
+
+    print("\n== Уборка не может удалить цель отката и при повторной выкладке ==")
+    # Тот же дефект, что уборка ловила раньше, но в его новой форме: при
+    # повторной выкладке `venv-$CURRENT` и «отложенное этой выкладкой» указывают
+    # на один и тот же каталог текущего релиза, а настоящая цель отката остаётся
+    # без защиты — и уезжает первой, потому что её mtime самый старый.
+    decoys = []
+    for i in (11, 12, 13):
+        d = WORK / ("venv-" + f"{i:040x}")
+        shutil.rmtree(d, ignore_errors=True)
+        shutil.copytree(WORK / "venv", d, symlinks=True)
+        os.utime(d, None)
+        decoys.append(d)
+    old = time.time() - 90 * 24 * 3600
+    os.utime(Path(prev_venv), (old, old))
+    rc, out = run(["bash", script, vcur], env=deploy_env(app, {"OBOROT_VENV_KEEP": "1"}))
+    check("повторная выкладка прошла", rc == 0, f"rc={rc} " + out[-300:])
+    check("ЦЕЛЬ ОТКАТА ПЕРЕЖИЛА УБОРКУ, хотя её mtime самый старый",
+          Path(prev_venv).is_dir(),
+          str(sorted(p.name[:16] for p in WORK.glob("venv-*"))))
+    check("и это работоспособное окружение, а не пустой каталог",
+          Path(prev_venv).is_dir()
+          and run([str(Path(prev_venv) / "bin" / "python"), "-m", "pip", "--version"],
+                  env=deploy_env(app))[0] == 0)
+    check("уборка при этом всё-таки была: свежие каталоги удалены",
+          not any(d.exists() for d in decoys),
+          str([d.name[:16] for d in decoys if d.exists()]))
+
+    print("\n== Повторная выкладка при негодном окружении: полный путь, маркеры целы ==")
+    # Метка окружения врёт про релиз — починкой обёрток такое не лечится, и
+    # маршрут обязан стать обычным: пересборка, подмена, перезапуск. Правило про
+    # маркеры отката при этом остаётся ровно тем же.
+    (WORK / "venv" / "RELEASE_SHA").write_text("0" * 40 + "\n", encoding="utf-8")
+    (WORK / "systemctl.log").write_text("", encoding="utf-8")
+    (WORK / "pip.log").write_text("", encoding="utf-8")
+    rc, out = run(["bash", script, vcur], env=deploy_env(app))
+    check("выкладка прошла", rc == 0, f"rc={rc} " + out[-400:])
+    # Проверяется результат, а не способ: годное окружение могло и найтись в
+    # кэше. Важно, что в $VENV снова лежит окружение с ВЕРНОЙ меткой релиза, —
+    # то есть маршрут был полным, с подменой, а не «починили строку и ушли».
+    check("окружение подменено заново — метка снова верна",
+          (WORK / "venv" / "RELEASE_SHA").read_text(encoding="utf-8").strip() == vcur,
+          (WORK / "venv" / "RELEASE_SHA").read_text(encoding="utf-8").strip()[:12])
+    check("служба перезапущена: окружение действительно менялось",
+          "restart" in (WORK / "systemctl.log").read_text(encoding="utf-8"))
+    check("PREVIOUS_SHA всё равно не затёрт",
+          (WORK / "state" / "PREVIOUS_SHA").read_text(encoding="utf-8").strip() == vprev,
+          (WORK / "state" / "PREVIOUS_SHA").read_text(encoding="utf-8").strip()[:12])
+    check("PREVIOUS_VENV всё равно не затёрт",
+          (WORK / "state" / "PREVIOUS_VENV").read_text(encoding="utf-8").strip() == prev_venv,
+          (WORK / "state" / "PREVIOUS_VENV").read_text(encoding="utf-8").strip())
+    check("и подсказка про откат по-прежнему честна",
+          f"deploy/deploy.sh {vprev}" in out, out[-300:])
+    check("окружение отката цело и здесь", Path(prev_venv).is_dir(), prev_venv)
+
+    print("\n== Повторная выкладка: сбой проверки обёрток — отказ без перезапуска ==")
+    # Маршрут «только починка и проверка» обязан быть таким же fail-closed, как
+    # обычный: проверка не прошла — служба не трогается, маркеры отката не
+    # трогаются, и об этом сказано вслух.
+    (WORK / "systemctl.log").write_text("", encoding="utf-8")
+    before_env = (WORK / "env").read_text(encoding="utf-8")
+    rc, out = run(["bash", script, vcur], env=deploy_env(app, {"FAIL_CONSOLE_PIP": "1"}))
+    check("выкладка отклонена", rc != 0, f"rc={rc}")
+    check("названо, что не запускается именно консольная обёртка",
+          "bin/pip не запускается на финальном пути" in out, out[-500:])
+    check("СЛУЖБА НЕ ПЕРЕЗАПУСКАЛАСЬ",
+          "restart" not in (WORK / "systemctl.log").read_text(encoding="utf-8"),
+          (WORK / "systemctl.log").read_text(encoding="utf-8").strip() or "пусто")
+    check("OBOROT_COMMIT не тронут",
+          (WORK / "env").read_text(encoding="utf-8") == before_env)
+    check("маркеры отката не тронуты",
+          (WORK / "state" / "PREVIOUS_SHA").read_text(encoding="utf-8").strip() == vprev
+          and (WORK / "state" / "PREVIOUS_VENV").read_text(encoding="utf-8").strip()
+          == prev_venv)
+    check("код остался на том же коммите", head_of(app) == vcur, head_of(app)[:12])
 
     shutil.rmtree(WORK, ignore_errors=True)
     print(f"\nИТОГО: {len(PASS)} OK, {len(FAIL)} FAIL")
