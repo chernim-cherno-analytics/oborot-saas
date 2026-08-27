@@ -1780,9 +1780,16 @@ async def _run_initial(org_id: int, client: MoySkladClient, active_wh: list,
         stats["stock_zeroed"] += zeroed
         stats["history_loaded_from"] = w_start
         stats["coverage_days"] = window
+        # DATA-8 corrective #10 (P2 discussion_r3873996582): window_sales_docs
+        # можно снять уже здесь — его инкрементирует сам `_collect_sales`
+        # (выше), который к этой строке уже отработал. window_sales_rows/
+        # window_return_rows — НЕЛЬЗЯ: их инкрементирует `_sales_written`
+        # (ниже), а не `_collect_sales` — если снять их тут же, они попадут
+        # в owner-facing панель «Подробнее» (`_stages_out`) ещё до того, как
+        # продажи и возвраты месяца в них учтены, и честный fresh-синк с
+        # ненулевыми продажами покажет владельцу stale 0. Снимаем их СРАЗУ
+        # ПОСЛЕ `_sales_written`, ниже.
         stats["window_sales_docs"] = stats.get("sales_docs")
-        stats["window_sales_rows"] = stats.get("sales_rows")
-        stats["window_return_rows"] = stats.get("return_rows")
         # DATA-8 corrective #9 (P2 discussion_r3873573203): коммитим id ДО
         # `_sales_written` — та вызывает СОБСТВЕННЫЙ ПРЯМОЙ `_set_state(
         # stats_json=...)`, минуя `_persist`, и это и есть ПЕРВЫЙ snapshot,
@@ -1809,6 +1816,11 @@ async def _run_initial(org_id: int, client: MoySkladClient, active_wh: list,
         # случится следующий resume.
         _commit_skip_ids(stats)
         _sales_written(org_id, stats, sales_rows, w_start, (16.0, 21.0))
+        # DATA-8 corrective #10 (P2 discussion_r3873996582): снимаем ПОСЛЕ
+        # `_sales_written` — она только что увеличила sales_rows/return_rows
+        # на находки ЭТОГО окна; до неё они ещё не отражали продажи месяца.
+        stats["window_sales_rows"] = stats.get("sales_rows")
+        stats["window_return_rows"] = stats.get("return_rows")
         await _sync_incoming(org_id, client, ext_to_pid, stats, progress=(21.0, 24.0))
         # Мажор 2: окно закрыто ЦЕЛИКОМ (остатки + продажи + «едет») — только
         # теперь продолжение вправе пропустить фазу month.

@@ -161,6 +161,20 @@ committed. RED-тест воспроизводит настоящий kill (ис
 восстановление через `reset_stale_running()` — тот же путь, которым
 продакшн поднимает зависший `running` после рестарта процесса.
 
+Corrective #10 (P2 discussion_r3873996582) чинит побочный эффект самого
+фикса corrective #9: перенос `history_loaded_from`/`_commit_skip_ids`
+ДО `_sales_written` заодно утащил за собой и `window_sales_rows`/
+`window_return_rows` — owner-facing счётчики месяца в панели «Подробнее»
+(`_stages_out`) — а инкрементирует их именно `_sales_written` (не
+`_collect_sales`), которая теперь идёт ПОСЛЕ. Итог — оба поля стали stale
+(обычно 0) сразу после честного fresh-синка с ненулевыми продажами и
+возвратами месяца. `window_sales_docs` эту болезнь не разделяет: его
+инкрементирует сам `_collect_sales`, отработавший ДО снимка, поэтому его
+позиция не менялась. Фикс — `window_sales_rows`/`window_return_rows`
+теперь читаются ПОСЛЕ `_sales_written`, а `history_loaded_from`/
+`coverage_days`/`window_sales_docs`/`_commit_skip_ids` остаются ДО неё
+(corrective #9's crash-safety не переоткрывается).
+
 Запуск из корня репозитория:  python tests/test_sync_diag_store.py
 """
 import json
@@ -1543,6 +1557,78 @@ def run_part2_month_checkpoint_before_boundary_leak() -> None:
     mock_api.close()
 
 
+def run_part2_window_counters_after_sales_written() -> None:
+    """Corrective #10 (P2 discussion_r3873996582): corrective #9 переставил
+    `history_loaded_from`/`_commit_skip_ids` ДО `_sales_written` (правильно
+    — иначе снова открывается crash window). Но `window_sales_rows`/
+    `window_return_rows` (owner-facing счётчики месяца в панели «Подробнее»,
+    отдаются через `_stages_out`) копировались из `stats["sales_rows"]`/
+    `stats["return_rows"]` ТОЙ ЖЕ строкой — а инкрементирует их именно
+    `_sales_written` (не `_collect_sales`), которая теперь идёт ПОСЛЕ. Итог
+    — эти два поля стали stale (обычно 0) сразу после честного fresh-синка
+    с ненулевыми продажами и возвратами месяца. `window_sales_docs` эту
+    болезнь не разделяет — его инкрементирует сам `_collect_sales`, который
+    уже отработал к моменту снимка, поэтому его позиция не менялась.
+
+    Проверка: обычный fresh-синк (никаких фолтов/подмен не нужно — дефолтные
+    мок-данные месяца уже содержат и продажи, и возвраты), сравниваем
+    `stages[month].counts.sales_rows/return_rows` из /api/sync/status с
+    ФАКТИЧЕСКИМ числом строк `sales` за окно, посчитанным напрямую по БД
+    (окно публикуется `replace_all=True` ОДИН раз и больше в этом прогоне
+    не трогается — история идёт СТАРШЕ окна, `replace_all=False`, так что
+    дальнейшие чанки истории эти же даты не переписывают).
+    """
+    c = client()
+    all_stores = [sid for sid, _ in mock_ms.STORES]
+    org_id = register_and_connect_ms(c, "owner-p@diag.test",
+                                     "Организация P (window-counters-after-sales-written)",
+                                     all_stores)
+
+    window_days = int(os.environ["INITIAL_WINDOW_DAYS"])
+    w_start = (date.today() - timedelta(days=window_days - 1)).isoformat()
+
+    print("\n== [часть 2, window-counters-after-sales-written] Fresh синк: "
+          "окно месяца содержит и продажи, и возвраты ==")
+    r = c.post("/api/sync/initial")
+    check("синк запущен", r.status_code == 200, f"status={r.status_code}")
+    st = wait_sync_done(c)
+    check("синк дошёл до done", st.get("state") == "done",
+          f"state={st.get('state')} error={st.get('error')}")
+
+    expected_sales = sql(
+        "SELECT COUNT(*) FROM sales WHERE org_id=? AND date>=? AND is_return=0",
+        org_id, w_start)[0][0]
+    expected_returns = sql(
+        "SELECT COUNT(*) FROM sales WHERE org_id=? AND date>=? AND is_return=1",
+        org_id, w_start)[0][0]
+    check("подготовка: окно месяца честно содержит продажи (> 0) — иначе "
+          "проверка вырождена",
+          expected_sales > 0, f"expected_sales={expected_sales}")
+    check("подготовка: окно месяца честно содержит возвраты (> 0) — иначе "
+          "проверка вырождена",
+          expected_returns > 0, f"expected_returns={expected_returns}")
+
+    month_stage = next((s for s in (st.get("stages") or []) if s.get("key") == "month"), None)
+    check("stages содержит запись month", month_stage is not None,
+          f"stages={st.get('stages')}")
+    counts = (month_stage or {}).get("counts") or {}
+    check("owner-facing month.counts.sales_rows == фактическому числу "
+          "продаж окна в БД, НЕ stale/0",
+          counts.get("sales_rows") == expected_sales,
+          f"counts={counts} expected_sales={expected_sales}")
+    check("owner-facing month.counts.return_rows == фактическому числу "
+          "возвратов окна в БД, НЕ stale/0",
+          counts.get("return_rows") == expected_returns,
+          f"counts={counts} expected_returns={expected_returns}")
+    check("owner-facing month.counts.sales_docs по-прежнему корректен "
+          "(его инкрементирует _collect_sales, позиция не менялась)",
+          counts.get("sales_docs") == (st.get("stats") or {}).get("window_sales_docs"),
+          f"counts={counts} stats_window_sales_docs="
+          f"{(st.get('stats') or {}).get('window_sales_docs')}")
+
+    c.close()
+
+
 def run_part3_unit_lifecycle() -> None:
     """Прямая проверка чистой функции `_apply_skip_diagnostic_lifecycle` —
     быстрое точное покрытие всей таблицы решений без сетевого прогона синка.
@@ -1808,6 +1894,7 @@ def run() -> int:
     run_part2_stale_checkpoint_missing_stock()
     run_part2_stale_checkpoint_fingerprint_mismatch()
     run_part2_month_checkpoint_before_boundary_leak()
+    run_part2_window_counters_after_sales_written()
     run_part3_unit_lifecycle()
     print(f"\nИТОГО: {len(PASS)} OK, {len(FAIL)} FAIL")
     return 1 if FAIL else 0
