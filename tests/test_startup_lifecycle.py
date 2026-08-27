@@ -2,9 +2,9 @@
 """Порядок жизненного цикла приложения: планировщик стартует ПОСЛЕ миграций.
 
 TECH_DEBT OPS-6: «Планировщик стартует до миграций». `scheduler.attach(app)`
-вызывался в main.py раньше регистрации `_startup` (init_db + шесть
-`ensure_schema`/`reset_stale_running`/`log_preview`), а FastAPI выполняет
-`on_event("startup")`-хендлеры строго в порядке регистрации (см.
+вызывался в main.py раньше регистрации `_startup` (init_db + восемь шагов
+`ensure_schema`/`reset_stale_running`/`log_preview` суммарно), а FastAPI
+выполняет `on_event("startup")`-хендлеры строго в порядке регистрации (см.
 `fastapi.routing.APIRouter._startup`, `for handler in self.on_startup`).
 Значит планировщик реально поднимался ДО того, как гарантированно применены
 все аддитивные миграции — молчаливая гонка на холодном старте.
@@ -15,11 +15,13 @@ TECH_DEBT OPS-6: «Планировщик стартует до миграций
 `scheduler.attach()` и `from app.db import init_db` разрешают имена в момент
 импорта `app.main`, а не при вызове.
 
-  1) реальный порядок: все семь шагов старта (init_db, exclusions,
-     ms_sync.ensure_schema, reset_stale_running, ms_writeback, ms_vendor,
-     subscription.ensure_schema, subscription.log_preview) завершаются ДО
-     scheduler.start;
-  2) инъекция сбоя в любой из шагов старта — планировщик не стартует вообще;
+  1) реальный порядок: все восемь шагов старта (init_db,
+     exclusions.ensure_schema, ms_sync.ensure_schema,
+     ms_sync.reset_stale_running, ms_writeback.ensure_schema,
+     ms_vendor.ensure_schema, subscription.ensure_schema,
+     subscription.log_preview) завершаются ДО scheduler.start;
+  2) инъекция сбоя в КАЖДЫЙ из восьми шагов старта — планировщик не
+     стартует вообще;
   3) повторный shutdown безопасен (идемпотентен), в т.ч. после ASGI-цикла.
 
 Запуск из корня репозитория: python tests/test_startup_lifecycle.py
@@ -55,7 +57,7 @@ STEPS = [
     "subscription.log_preview",
 ]
 
-# Общий пролог дочернего процесса: подменяет семь шагов старта и
+# Общий пролог дочернего процесса: подменяет восемь шагов старта и
 # scheduler.start/shutdown ДО импорта app.main (см. докстринг файла — почему
 # именно до, а не после).
 _CHILD_PREAMBLE = """
@@ -147,7 +149,7 @@ def _fresh_db(name: str) -> Path:
 
 
 def check_order() -> None:
-    """Проверка 1: реальный порядок семи шагов старта и scheduler.start."""
+    """Проверка 1: реальный порядок восьми шагов старта и scheduler.start."""
     db = _fresh_db("test_startup_order.db")
     code = _CHILD_PREAMBLE.format(root=str(ROOT), db=str(db)) + """
 from fastapi.testclient import TestClient
@@ -176,20 +178,23 @@ for step in order:
 
 
 def check_failure_prevents_scheduler_start() -> None:
-    """Проверка 2: сбой на любом шаге старта — планировщик не стартует."""
-    for failing_step in ("init_db", "exclusions.ensure_schema", "ms_vendor.ensure_schema",
-                          "subscription.log_preview"):
+    """Проверка 2: сбой на КАЖДОМ из восьми шагов старта — планировщик не стартует."""
+    for failing_step in STEPS:
         db = _fresh_db(f"test_startup_fail_{failing_step.replace('.', '_')}.db")
         # init_db разрешается в app.main через `from app.db import ... init_db`
         # ПРИ ИМПОРТЕ — патчить app.db.init_db ПОСЛЕ import app.main бесполезно,
         # у app.main уже своя копия имени. Патчим саму копию — m.init_db.
-        # Остальные три читаются внутри _startup() заново на каждый вызов
+        # Остальные семь читаются внутри _startup() заново на каждый вызов
         # (`from app import X as _x; _x.метод()`) — патч атрибута субмодуля
         # после импорта app.main их ловит как положено.
         target_var = {
             "init_db": "m.init_db",
             "exclusions.ensure_schema": "_excl.ensure_schema",
+            "ms_sync.ensure_schema": "_mssync.ensure_schema",
+            "ms_sync.reset_stale_running": "_mssync.reset_stale_running",
+            "ms_writeback.ensure_schema": "_mswb.ensure_schema",
             "ms_vendor.ensure_schema": "_msv.ensure_schema",
+            "subscription.ensure_schema": "_sub.ensure_schema",
             "subscription.log_preview": "_sub.log_preview",
         }[failing_step]
         code = _CHILD_PREAMBLE.format(root=str(ROOT), db=str(db)) + f"""
