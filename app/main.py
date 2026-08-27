@@ -13,7 +13,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session
 
 from app import auth
@@ -596,7 +596,12 @@ def register_submit(
     if exists:
         return _render_auth(request, "register.html", name=name, org_name=org_name, email=email, error="Такой e-mail уже зарегистрирован")
 
-    user = User(email=email_norm, pw_hash=auth.hash_password(password), name=name.strip())
+    user = User(
+        email=email_norm, pw_hash=auth.hash_password(password), name=name.strip(),
+        # SEC-3 corrective: непредсказуемый положительный старт версии сессии —
+        # не 0 из server_default (см. auth.new_session_version_seed).
+        session_version=auth.new_session_version_seed(),
+    )
     org = Org(
         name=org_name.strip() or "Моя компания",
         plan="trial",
@@ -733,13 +738,31 @@ def api_change_password(
         raise HTTPException(
             status_code=422, detail="Новый пароль совпадает со старым — придумайте другой"
         )
-    user = db.merge(ctx.user)
-    user.pw_hash = auth.hash_password(body.new_password)
-    # SEC-3: версия сессии растёт одной транзакцией с хешем пароля — куки,
-    # выпущенные до этого момента (в том числе на других устройствах), несут
-    # старую версию и перестанут проходить auth.resolve_auth со следующего
-    # запроса.
-    user.session_version = (user.session_version or 0) + 1
+    new_pw_hash = auth.hash_password(body.new_password)
+    # SEC-3 corrective: инкремент версии сессии — атомарное DB-side выражение
+    # `session_version = session_version + 1` ОДНИМ UPDATE, а не Python-side
+    # read-modify-write (было: user.session_version = user.session_version + 1
+    # на объекте, загруженном в начале запроса). Под двумя одновременными
+    # сменами пароля, стартовавшими от одного и того же значения, ORM-вариант
+    # терял инкремент — оба запроса читали одну и ту же версию и оба писали
+    # одно и то же +1. Здесь СЛОЖЕНИЕ выполняет сама БД поверх её АКТУАЛЬНОГО
+    # значения на момент записи: SQLite (busy_timeout, см. app/db.py) и
+    # Postgres (row lock при READ COMMITTED) обе сериализуют конкурентные
+    # UPDATE той же строки — вторая транзакция ждёт коммита первой и видит уже
+    # инкрементированное значение, поэтому конкурентные успешные смены пароля
+    # гарантированно получают РАЗНЫЕ версии, а не теряют инкремент друг друга.
+    # synchronize_session=False: мы намеренно не трогаем атрибуты ctx.user в
+    # identity map — актуальная версия для куки берётся отдельным SELECT ниже,
+    # читающим значение внутри той же (ещё не закоммиченной) транзакции.
+    db.execute(
+        update(User)
+        .where(User.id == ctx.user.id)
+        .values(pw_hash=new_pw_hash, session_version=User.session_version + 1)
+        .execution_options(synchronize_session=False)
+    )
+    new_version = db.execute(
+        select(User.session_version).where(User.id == ctx.user.id)
+    ).scalar_one()
     db.commit()
     # Текущую сессию НЕ обрываем: человек только что доказал знание пароля,
     # выкидывать его на форму входа посреди работы незачем. Куку переставляем
@@ -747,7 +770,7 @@ def api_change_password(
     # сама себя следующим запросом. Сессии на других устройствах отзываются
     # немедленно (см. auth.resolve_auth), а не «протухают сами до 7 дней».
     response = JSONResponse({"ok": True, "note": "Пароль изменён"})
-    auth.set_session(response, user.id, ctx.org.id, user.session_version)
+    auth.set_session(response, ctx.user.id, ctx.org.id, new_version)
     return response
 
 

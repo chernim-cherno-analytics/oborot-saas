@@ -380,6 +380,35 @@ def _serializer() -> URLSafeTimedSerializer:
     return URLSafeTimedSerializer(get_signing_secret(), salt="oborot-session")
 
 
+# Верхняя граница стартового сида версии сессии — умещается знаковым INTEGER
+# и в SQLite, и в Postgres (обе БД используют минимум 32-битный знаковый диапазон
+# под этот тип) без перехода на bigint.
+_SESSION_VERSION_SEED_MAX = 2**31 - 1
+
+
+def new_session_version_seed() -> int:
+    """SEC-3 corrective: непредсказуемый ПОЛОЖИТЕЛЬНЫЙ старт session_version.
+
+    КАЖДЫЙ новый User, которого создаёт приложение (обычная регистрация,
+    вход из iframe МойСклад), обязан вызвать это при создании — а не
+    полагаться на server_default=0 модели. default=0 остаётся только для
+    АДДИТИВНОЙ миграции существующих строк (см.
+    models._ensure_users_session_version) — там 0 обязателен для обратной
+    совместимости с довыпущенными куками без поля версии.
+
+    Если этот сид не задать явно, свежесозданный пользователь получит те же
+    0/1/2..., что и любая нормальная последовательность версий. SQLite
+    `INTEGER PRIMARY KEY` без AUTOINCREMENT переиспользует id удалённой
+    строки, как только она была последней (max(id)+1 после удаления
+    последней строки с этим id == тот же id): новый владелец слота с версией
+    0 совпал бы с любой ДЕЙСТВИТЕЛЬНО существовавшей ранее (и уже отозванной)
+    кукой того же user_id, воскрешая чужой доступ. Случайный положительный
+    сид из широкого диапазона делает такое совпадение криптографически
+    ничтожным: secrets.randbelow — CSPRNG, а не random/hash от времени.
+    """
+    return secrets.randbelow(_SESSION_VERSION_SEED_MAX) + 1
+
+
 def set_session(response, user_id: int, org_id: int, session_version: int, samesite: str = "lax") -> None:
     """Ставит подписанную сессионную куку на ответ.
 

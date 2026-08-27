@@ -101,6 +101,9 @@ async def ms_app_entry(
             pw_hash=auth.hash_password(secrets.token_urlsafe(24)),
             name=str(ctx.get("fullName") or ctx.get("name") or uid),
             ms_uid=uid,
+            # SEC-3 corrective: непредсказуемый положительный старт версии
+            # сессии — не 0 из server_default (см. auth.new_session_version_seed).
+            session_version=auth.new_session_version_seed(),
         )
         db.add(user)
         db.flush()

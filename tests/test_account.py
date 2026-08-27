@@ -167,6 +167,68 @@ def org_rows(org_id: int) -> dict[str, int]:
         con.close()
 
 
+def cookie_client(payload: dict) -> httpx.Client:
+    """Клиент с вручную выставленной сессионной кукой (для legacy/битых версий)."""
+    raw = auth._serializer().dumps(payload)
+    cl = httpx.Client(headers={"X-Oborot-CSRF": "1"}, base_url=BASE, timeout=30.0)
+    cl.cookies.set(auth.SESSION_COOKIE, raw)
+    return cl
+
+
+def cookie_client_raw(raw: str) -> httpx.Client:
+    """Клиент с вручную выставленной СЫРОЙ (уже подписанной) сессионной кукой."""
+    cl = httpx.Client(headers={"X-Oborot-CSRF": "1"}, base_url=BASE, timeout=30.0)
+    cl.cookies.set(auth.SESSION_COOKIE, raw)
+    return cl
+
+
+def cookie_version(resp: httpx.Response):
+    """Версия (поле 'v') из Set-Cookie ответа; None, если куки не было."""
+    raw = resp.cookies.get(auth.SESSION_COOKIE)
+    if not raw:
+        return None
+    return auth._serializer().loads(raw).get("v", 0)
+
+
+def run_concurrent_password_changes(clients_and_passwords):
+    """Гоняет несколько POST /api/account/password ПОДЛИННО параллельно.
+
+    Тестовый барьер (НЕ production sleep/hook): monkeypatch'ит auth.hash_password
+    так, что все параллельные запросы гарантированно оказываются внутри
+    обработчика ОДНОВРЕМЕННО, непосредственно перед записью в БД. Без барьера
+    гонка была бы вероятностной — можно было бы годами не поймать её на быстрой
+    машине. Патч живёт ровно на время этого вызова и снимается в finally.
+    """
+    n = len(clients_and_passwords)
+    barrier = threading.Barrier(n)
+    orig_hash = auth.hash_password
+
+    def _barrier_hash(password):
+        barrier.wait(timeout=10)
+        return orig_hash(password)
+
+    results = [None] * n
+
+    def _worker(i, cl, new_pw):
+        results[i] = cl.post("/api/account/password", json={
+            "current_password": "secret123", "new_password": new_pw, "confirm_password": new_pw,
+        })
+
+    auth.hash_password = _barrier_hash
+    try:
+        threads = [
+            threading.Thread(target=_worker, args=(i, cl, pw))
+            for i, (cl, pw) in enumerate(clients_and_passwords)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=20)
+    finally:
+        auth.hash_password = orig_hash
+    return results
+
+
 def main() -> int:
     srv = ServerThread(oborot_app, APP_PORT)
     srv.start()
@@ -283,16 +345,21 @@ def run_scenario() -> int:
 
     print("== Кука без версии (пред-миграционный формат) и битая версия (SEC-3) ==")
 
-    def cookie_client(payload: dict) -> httpx.Client:
-        raw = auth._serializer().dumps(payload)
-        cl = httpx.Client(headers={"X-Oborot-CSRF": "1"}, base_url=BASE, timeout=30.0)
-        cl.cookies.set(auth.SESSION_COOKIE, raw)
-        return cl
-
     c_legacy = client()
     register(c_legacy, "sec3-legacy@test.io", "Легаси-бренд")
     legacy_uid = sql("SELECT id FROM users WHERE email = ?", "sec3-legacy@test.io")[0][0]
     legacy_org = org_of("sec3-legacy@test.io")
+    # Свежая регистрация теперь сама минтит случайный положительный сид
+    # (SEC-3 corrective #2, см. auth.new_session_version_seed) — она больше не
+    # представляет «старую» строку. Довыпущенная/мигрированная строка
+    # получает version=0 из ALTER'а с DEFAULT 0 (models._ensure_users_session_version),
+    # а не из этого пути создания пользователя — сводим строку к такому виду
+    # руками, чтобы честно проверить именно легаси-сценарий.
+    exec_sql("UPDATE users SET session_version = 0 WHERE id = ?", legacy_uid)
+    # c_legacy сам получил куку со случайным сидом при регистрации — без
+    # переиздания она разойдётся с только что подставленной DB version=0.
+    c_legacy.cookies.set(auth.SESSION_COOKIE,
+                          auth._serializer().dumps({"user_id": legacy_uid, "org_id": legacy_org, "v": 0}))
 
     legacy_cookie_client = cookie_client({"user_id": legacy_uid, "org_id": legacy_org})
     check("кука без поля версии (довыпущенный формат) работает при DB version 0",
@@ -383,6 +450,86 @@ def run_scenario() -> int:
     check("конкурентная миграция добавила колонку ровно один раз (без дублей)",
           cols2.count("session_version") == 1, f"cols={cols2}")
     old_engine2.dispose()
+
+    print("== Гонка: два одновременных POST /api/account/password (SEC-3 corrective #1) ==")
+    c_race_a = client()
+    register(c_race_a, "sec3-race@test.io", "Гонка-бренд")
+    c_race_b = client()
+    r = c_race_b.post("/login", data={"email": "sec3-race@test.io", "password": "secret123"})
+    check("второй клиент гонки вошёл тем же паролем", r.status_code == 303, f"status={r.status_code}")
+    race_uid = sql("SELECT id FROM users WHERE email = ?", "sec3-race@test.io")[0][0]
+
+    r_a, r_b = run_concurrent_password_changes([
+        (c_race_a, "гонка-пароль-a1"),
+        (c_race_b, "гонка-пароль-b1"),
+    ])
+    check("оба параллельных запроса на смену пароля успешны (200) — гонка не должна превращаться в 409",
+          r_a.status_code == 200 and r_b.status_code == 200,
+          f"a={r_a.status_code} b={r_b.status_code}")
+
+    va, vb = cookie_version(r_a), cookie_version(r_b)
+    check("версии в куках двух параллельных успешных ответов различны (не потерянный инкремент)",
+          va is not None and vb is not None and va != vb, f"va={va} vb={vb}")
+
+    db_version = sql("SELECT session_version FROM users WHERE id = ?", race_uid)[0][0]
+    check("итоговая версия в БД равна максимуму из двух полученных версий",
+          va is not None and vb is not None and db_version == max(va, vb),
+          f"db={db_version} va={va} vb={vb}")
+
+    resp_a2 = c_race_a.get("/api/account")
+    resp_b2 = c_race_b.get("/api/account")
+    check("не обе куки-версии остаются рабочими одновременно после гонки",
+          not (resp_a2.status_code == 200 and resp_b2.status_code == 200),
+          f"a2={resp_a2.status_code} b2={resp_b2.status_code}")
+    if va is not None and vb is not None:
+        newer_resp, older_resp = (resp_a2, resp_b2) if va > vb else (resp_b2, resp_a2)
+        check("клиент с последней зафиксированной версией куки остался авторизован",
+              newer_resp.status_code == 200, f"status={newer_resp.status_code}")
+        check("клиент со старой (перебитой гонкой) версией куки отклонён (401)",
+              older_resp.status_code == 401, f"status={older_resp.status_code}")
+
+    print("== Delete → register: переиспользованный id не воскрешает старую куку (SEC-3 corrective #2) ==")
+    c_reuse = client()
+    register(c_reuse, "sec3-reuse@test.io", "Реюз-бренд")
+    reuse_uid1 = sql("SELECT id FROM users WHERE email = ?", "sec3-reuse@test.io")[0][0]
+    old_cookie_raw = c_reuse.cookies.get(auth.SESSION_COOKIE)
+    check("кука первого владельца слота захвачена для дальнейшей проверки", bool(old_cookie_raw))
+
+    r = c_reuse.post("/api/account/password", json={
+        "current_password": "secret123", "new_password": "реюз-новый-пароль",
+        "confirm_password": "реюз-новый-пароль",
+    })
+    check("смена пароля перед удалением — 200", r.status_code == 200, f"status={r.status_code}")
+
+    old_cookie_client = cookie_client_raw(old_cookie_raw)
+    check("старая (версия 0) кука отозвана сразу после смены пароля",
+          old_cookie_client.get("/api/account").status_code == 401)
+
+    r = c_reuse.post("/api/account/delete", json={"password": "реюз-новый-пароль", "confirm": "УДАЛИТЬ"})
+    check("владелец-одиночка удалил аккаунт и организацию целиком — 200",
+          r.status_code == 200 and r.json()["scope"] == "org", f"resp={r.text[:140]}")
+    check("строка пользователя удалена из БД",
+          not sql("SELECT id FROM users WHERE id = ?", reuse_uid1))
+
+    c_reuse2 = client()
+    r = register(c_reuse2, "sec3-reuse@test.io", "Реюз-бренд-2")
+    check("тот же e-mail снова доступен для регистрации после удаления — 303",
+          r.status_code == 303, f"status={r.status_code}")
+
+    reuse_uid2 = sql("SELECT id FROM users WHERE email = ?", "sec3-reuse@test.io")[0][0]
+    check("id действительно переиспользован (SQLite: max(id)+1 после удаления последней строки)",
+          reuse_uid2 == reuse_uid1, f"old={reuse_uid1} new={reuse_uid2}")
+
+    new_seed = sql("SELECT session_version FROM users WHERE id = ?", reuse_uid2)[0][0]
+    check("новый пользователь на переиспользованном id получил положительную непредсказуемую версию, не 0",
+          new_seed > 0, f"session_version={new_seed}")
+
+    resurrect_client = cookie_client_raw(old_cookie_raw)
+    check("старая кука (версия 0, тот же user_id) НЕ воскрешает доступ к новому пользователю на том же id",
+          resurrect_client.get("/api/account").status_code == 401,
+          f"status={resurrect_client.get('/api/account').status_code}")
+    check("новый владелец слота нормально авторизован собственной свежей сессией",
+          c_reuse2.get("/api/account").status_code == 200)
 
     print("== Удаление: участник организации ==")
     owner = client()
