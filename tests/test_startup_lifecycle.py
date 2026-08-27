@@ -2,27 +2,40 @@
 """Порядок жизненного цикла приложения: планировщик стартует ПОСЛЕ миграций.
 
 TECH_DEBT OPS-6: «Планировщик стартует до миграций». `scheduler.attach(app)`
-вызывался в main.py раньше регистрации `_startup` (init_db + восемь шагов
+вызывался в main.py раньше регистрации `_startup` (init_db + девять шагов
 `ensure_schema`/`reset_stale_running`/`log_preview` суммарно), а FastAPI
 выполняет `on_event("startup")`-хендлеры строго в порядке регистрации (см.
 `fastapi.routing.APIRouter._startup`, `for handler in self.on_startup`).
 Значит планировщик реально поднимался ДО того, как гарантированно применены
 все аддитивные миграции — молчаливая гонка на холодном старте.
 
+Этим же набором закрыта последняя migration-on-import: `lessons.ensure_schema()`
+вызывался прямо на импорте `app/api.py`, до старта приложения и вне защиты от
+гонки нескольких воркеров, — тем же классом дефекта, что и уже закрытые
+`ms_writeback`/`ms_vendor` (см. Д4 в `app/main.py`). Теперь это девятый шаг
+`_startup()`, сразу после `init_db()`.
+
 Каждая проверка запускает НАСТОЯЩИЙ ASGI-цикл через `fastapi.testclient.TestClient`
 (он сам дёргает startup/shutdown) в отдельном процессе — подмена функций
 модулей обязана случиться ДО `import app.main`, потому что
 `scheduler.attach()` и `from app.db import init_db` разрешают имена в момент
-импорта `app.main`, а не при вызове.
+импорта `app.main`, а не при вызове. Патч `lessons.ensure_schema` ставится ещё
+раньше — до `import app.main`, — потому что до фикса именно импорт `app.api`
+(которого требует `app.main`) вызывал миграцию; если бы патч ставился позже,
+проверка ловила бы ложный успех: старый вызов уже случился бы мимо счётчика.
 
-  1) реальный порядок: все восемь шагов старта (init_db,
-     exclusions.ensure_schema, ms_sync.ensure_schema,
+  1) реальный порядок: все девять шагов старта (init_db,
+     lessons.ensure_schema, exclusions.ensure_schema, ms_sync.ensure_schema,
      ms_sync.reset_stale_running, ms_writeback.ensure_schema,
      ms_vendor.ensure_schema, subscription.ensure_schema,
-     subscription.log_preview) завершаются ДО scheduler.start;
-  2) инъекция сбоя в КАЖДЫЙ из восьми шагов старта — планировщик не
-     стартует вообще;
-  3) повторный shutdown безопасен (идемпотентен), в т.ч. после ASGI-цикла.
+     subscription.log_preview) завершаются ДО scheduler.start, каждый — ровно
+     один раз, а lessons.ensure_schema — немедленно после init_db;
+  2) инъекция сбоя в КАЖДЫЙ из девяти шагов старта — планировщик не
+     стартует вообще, и ни один из последующих по порядку шагов не выполняется;
+  3) import app.api и import app.main САМИ ПО СЕБЕ (без запуска ASGI-цикла)
+     не вызывают lessons.ensure_schema — миграция не должна случаться на
+     импорте модуля;
+  4) повторный shutdown безопасен (идемпотентен), в т.ч. после ASGI-цикла.
 
 Запуск из корня репозитория: python tests/test_startup_lifecycle.py
 """
@@ -48,6 +61,7 @@ def check(name: str, cond: bool, detail: str = ""):
 
 STEPS = [
     "init_db",
+    "lessons.ensure_schema",
     "exclusions.ensure_schema",
     "ms_sync.ensure_schema",
     "ms_sync.reset_stale_running",
@@ -57,9 +71,11 @@ STEPS = [
     "subscription.log_preview",
 ]
 
-# Общий пролог дочернего процесса: подменяет восемь шагов старта и
+# Общий пролог дочернего процесса: подменяет девять шагов старта и
 # scheduler.start/shutdown ДО импорта app.main (см. докстринг файла — почему
-# именно до, а не после).
+# именно до, а не после). lessons.ensure_schema патчится первым из
+# ensure_schema-шагов и раньше `import app.main`, чтобы поймать и старый
+# вызов на импорте app.api, если он ещё есть.
 _CHILD_PREAMBLE = """
 import os, sys
 sys.path.insert(0, {root!r})
@@ -77,6 +93,13 @@ def _w_init_db():
     return _orig_init_db()
 _db_mod.init_db = _w_init_db
 
+import app.lessons as _lessons
+_orig_lessons = _lessons.ensure_schema
+def _w_lessons():
+    order.append("lessons.ensure_schema")
+    return _orig_lessons()
+_lessons.ensure_schema = _w_lessons
+
 import app.scheduler as scheduler_mod
 _orig_start = scheduler_mod.start
 def _w_start():
@@ -84,7 +107,9 @@ def _w_start():
     return _orig_start()
 scheduler_mod.start = _w_start
 
-import app.main as m  # attach() и `from app.db import init_db` резолвятся здесь
+import app.main as m  # attach() и `from app.db import init_db` резолвятся здесь;
+                      # если lessons.ensure_schema ещё вызывается на импорте
+                      # app.api — он случится прямо на этой строке.
 
 import app.exclusions as _excl
 _orig_excl = _excl.ensure_schema
@@ -149,7 +174,7 @@ def _fresh_db(name: str) -> Path:
 
 
 def check_order() -> None:
-    """Проверка 1: реальный порядок восьми шагов старта и scheduler.start."""
+    """Проверка 1: реальный порядок девяти шагов старта и scheduler.start."""
     db = _fresh_db("test_startup_order.db")
     code = _CHILD_PREAMBLE.format(root=str(ROOT), db=str(db)) + """
 from fastapi.testclient import TestClient
@@ -162,8 +187,17 @@ for step in order:
     rc, out = _run_child(code)
     check("дочерний процесс завершился успешно (проверка порядка)", rc == 0, out[-400:])
     order = [ln.split("ORDER:", 1)[1] for ln in out.splitlines() if ln.startswith("ORDER:")]
-    check("зафиксированы все восемь шагов старта",
+    check("зафиксированы все девять шагов старта",
           set(STEPS + ["scheduler.start"]) <= set(order), f"order={order}")
+    check("lessons.ensure_schema вызван РОВНО ОДИН раз",
+          order.count("lessons.ensure_schema") == 1, f"order={order}")
+    if "init_db" in order and "lessons.ensure_schema" in order:
+        idx_init = order.index("init_db")
+        idx_lessons = order.index("lessons.ensure_schema")
+        check("lessons.ensure_schema идёт СРАЗУ после init_db",
+              idx_lessons == idx_init + 1, f"order={order}")
+    else:
+        check("lessons.ensure_schema идёт СРАЗУ после init_db", False, f"order={order}")
     if "scheduler.start" in order:
         idx_sched = order.index("scheduler.start")
         idx_last_step = max((order.index(s) for s in STEPS if s in order), default=-1)
@@ -178,17 +212,19 @@ for step in order:
 
 
 def check_failure_prevents_scheduler_start() -> None:
-    """Проверка 2: сбой на КАЖДОМ из восьми шагов старта — планировщик не стартует."""
+    """Проверка 2: сбой на КАЖДОМ из девяти шагов старта — планировщик не стартует,
+    и ни один из шагов, идущих ПОСЛЕ упавшего по порядку, не выполняется."""
     for failing_step in STEPS:
         db = _fresh_db(f"test_startup_fail_{failing_step.replace('.', '_')}.db")
         # init_db разрешается в app.main через `from app.db import ... init_db`
         # ПРИ ИМПОРТЕ — патчить app.db.init_db ПОСЛЕ import app.main бесполезно,
         # у app.main уже своя копия имени. Патчим саму копию — m.init_db.
-        # Остальные семь читаются внутри _startup() заново на каждый вызов
+        # Остальные восемь читаются внутри _startup() заново на каждый вызов
         # (`from app import X as _x; _x.метод()`) — патч атрибута субмодуля
         # после импорта app.main их ловит как положено.
         target_var = {
             "init_db": "m.init_db",
+            "lessons.ensure_schema": "_lessons.ensure_schema",
             "exclusions.ensure_schema": "_excl.ensure_schema",
             "ms_sync.ensure_schema": "_mssync.ensure_schema",
             "ms_sync.reset_stale_running": "_mssync.reset_stale_running",
@@ -225,12 +261,59 @@ print("RAISED_FLAG", raised)
         check(f"планировщик НЕ стартовал при сбое в {failing_step}",
               "STARTED_FLAG False" in out and "SCHEDULER_START_CALLED False" in out,
               out[-300:])
+        order_lines = [ln.split("ORDER:", 1)[1] for ln in out.splitlines() if ln.startswith("ORDER:")]
+        idx_fail = STEPS.index(failing_step)
+        later_steps = STEPS[idx_fail + 1:]
+        check(f"ни один шаг ПОСЛЕ {failing_step} не выполнился",
+              not any(s in order_lines for s in later_steps),
+              f"order={order_lines}")
         if db.exists():
             db.unlink()
 
 
+def check_import_has_no_schema_side_effect() -> None:
+    """Проверка 3: import app.api и import app.main САМИ ПО СЕБЕ (без ASGI-цикла)
+    не вызывают lessons.ensure_schema.
+
+    Патч ставится ДО первого импорта app.api/app.main в ЧИСТОМ дочернем
+    процессе: если бы патч ставился после импорта в этом же интерпретаторе,
+    уже случившийся на импорте вызов прошёл бы мимо счётчика, и проверка
+    ловила бы ложный успех вместо реального дефекта.
+    """
+    db = _fresh_db("test_startup_import_side_effect.db")
+    code = f"""
+import os, sys
+sys.path.insert(0, {str(ROOT)!r})
+os.environ["DATABASE_URL"] = "sqlite:///" + {str(db)!r}
+os.environ["SCHEDULER_ENABLED"] = "1"
+os.environ.pop("WEB_CONCURRENCY", None)
+os.environ.pop("OBOROT_ALLOW_MULTIPROC", None)
+
+calls = []
+import app.lessons as _lessons
+_orig = _lessons.ensure_schema
+def _w():
+    calls.append(1)
+    return _orig()
+_lessons.ensure_schema = _w
+
+import app.api  # noqa: F401 — сам факт импорта не должен трогать схему
+print("CALLS_AFTER_API_IMPORT", len(calls))
+import app.main  # noqa: F401 — main импортирует api заново (уже в sys.modules)
+print("CALLS_AFTER_MAIN_IMPORT", len(calls))
+"""
+    rc, out = _run_child(code)
+    check("дочерний процесс завершился успешно (импорт без побочного эффекта)", rc == 0, out[-400:])
+    check("import app.api НЕ вызывает lessons.ensure_schema",
+          "CALLS_AFTER_API_IMPORT 0" in out, out[-300:])
+    check("import app.main НЕ вызывает lessons.ensure_schema",
+          "CALLS_AFTER_MAIN_IMPORT 0" in out, out[-300:])
+    if db.exists():
+        db.unlink()
+
+
 def check_repeated_shutdown_safe() -> None:
-    """Проверка 3: повторный shutdown идемпотентен и не роняет процесс."""
+    """Проверка 4: повторный shutdown идемпотентен и не роняет процесс."""
     db = _fresh_db("test_startup_shutdown.db")
     code = _CHILD_PREAMBLE.format(root=str(ROOT), db=str(db)) + """
 from fastapi.testclient import TestClient
@@ -262,6 +345,9 @@ def main() -> int:
 
     print("\n== Инъекция сбоя старта — планировщик не должен стартовать ==")
     check_failure_prevents_scheduler_start()
+
+    print("\n== Импорт модулей без ASGI-цикла не мутирует схему lessons ==")
+    check_import_has_no_schema_side_effect()
 
     print("\n== Повторный shutdown безопасен ==")
     check_repeated_shutdown_safe()
