@@ -66,6 +66,22 @@ rebuild_checkpoint` (сумма всех предыдущих сегментов
 снимается при успешном завершении и при старте новой — НЕ резюмированной —
 логической пересборки).
 
+Corrective #5 (P2, discussion_r3872223834) уточняет: «raw текущего
+сегмента» из corrective #4 переоценивал находки в двух конкретных случаях —
+(A) резюме ТОГО ЖЕ дня форсированно перечитывает «сегодня»
+(`gap_dates=[today_iso]` в `_run_initial`, даже без реального разрыва) —
+документ, уже посчитанный ДО падения, посчитается ещё раз; (B) падение
+ПОСЛЕ того, как `_collect_sales` увеличил raw для чанка, но ДО того, как
+для этого чанка продвинулась `history_loaded_from`, — следующий resume
+перечитает ТОТ ЖЕ чанк заново (пример независимого ревью: checkpoint 8 +
+partial 3 + retried 3 = 14 вместо 11). `_run_initial` теперь считает
+`sales_docs_skipped_store_committed` построчно — только то, что РЕАЛЬНО
+закоммитилось (чанк истории сразу после продвижения его собственной
+`history_loaded_from`; фаза today на резюме — только если `history_
+loaded_to` действительно продвинулась, то есть разрыв был настоящим), и
+именно этот counted-committed вклад, а не голый raw, участвует в
+`_rebuild_total` (`_skip_segment_contribution`).
+
 Запуск из корня репозитория:  python tests/test_sync_diag_store.py
 """
 import json
@@ -772,6 +788,173 @@ def run_part2_rebuild_accumulator() -> None:
     mock_api.close()
 
 
+def run_part2_no_overlap_today_reread() -> None:
+    """Corrective #5, сценарий A (P2 discussion_r3872223834): резюме ТОГО ЖЕ
+    дня форсированно перечитывает «сегодня» (`gap_dates=[today_iso]` в
+    `_run_initial`, даже когда реального разрыва нет) — документы, уже
+    посчитанные фазой month ДО падения, НЕ должны посчитаться ещё раз.
+
+    Раунд 1 (fresh): 8 skip-документов датированы «сегодня» (внутри окна) —
+    фаза month находит их, падает в фазе history. Раунд 2 (resume): фаза
+    today форсированно перечитывает «сегодня», находит ТЕ ЖЕ 8 документов
+    (их не убирали) — но это НЕ новое покрытие (history_loaded_to не
+    продвинулась). Итог обязан остаться 8, а не удвоиться до 16.
+    """
+    c = client()
+    mock_api = httpx.Client(base_url=f"http://127.0.0.1:{MOCK_PORT}", timeout=30.0)
+    all_stores = [sid for sid, _ in mock_ms.STORES]
+    org_id = register_and_connect_ms(c, "owner-h@diag.test",
+                                     "Организация H (today-reread)", all_stores)
+
+    today_iso = date.today().isoformat()
+    w_start = (date.today() - timedelta(
+        days=int(os.environ["INITIAL_WINDOW_DAYS"]) - 1)).isoformat()
+    SKIP_STORE = "st-ghost-test-h"
+    # Дата — «сегодня»: внутри окна month (в него входит today_iso), и это
+    # ровно та дата, которую резюме форсированно перечитывает независимо
+    # от наличия реального разрыва.
+    mock_api.post("/__test/skip_store_doc", json={
+        "entity": "demand", "store": SKIP_STORE, "date": today_iso, "count": 8,
+    })
+    mock_api.post("/__test/faults", json={"docs_429_before": w_start})
+
+    print("\n== [часть 2, no-overlap] Раунд 1: month находит 8 «сегодняшних» "
+          "пропусков, падает в фазе history ==")
+    r = c.post("/api/sync/initial")
+    check("раунд 1 запущен", r.status_code == 200, f"status={r.status_code}")
+    st1 = wait_sync_done(c)
+    check("раунд 1 честно упал (error)", st1.get("state") == "error",
+          f"state={st1.get('state')}")
+    raw1 = (st1.get("stats") or {}).get("sales_docs_skipped_store")
+    check("раунд 1: СВОЙ raw == 8 (найдено фазой month)", raw1 == 8, f"raw={raw1}")
+
+    print("\n== [часть 2, no-overlap] Раунд 2 (resume): форсированная "
+          "перечитка «сегодня» находит ТЕ ЖЕ 8 — total остаётся 8, не 16 ==")
+    mock_api.post("/__test/faults", json={})  # снять docs_429_before — история пройдёт
+    r = c.post("/api/sync/run")
+    check("раунд 2 (резюме) запущен", r.status_code == 200, f"status={r.status_code}")
+    st2 = wait_sync_done(c)
+    check("раунд 2 дошёл до done", st2.get("state") == "done",
+          f"state={st2.get('state')} error={st2.get('error')}")
+    check("раунд 2 реально пошёл веткой initial (resume_from)",
+          st2.get("mode") == "initial", f"mode={st2.get('mode')}")
+    raw2 = (st2.get("stats") or {}).get("sales_docs_skipped_store")
+    check("раунд 2: СВОЙ raw == 8 (форсированная перечитка «сегодня» "
+          "нашла ТЕ ЖЕ 8 документов заново)",
+          raw2 == 8, f"raw={raw2}")
+    check("ИТОГ: sticky == 8, а НЕ 16 — форсированная перечитка «сегодня» "
+          "без реального разрыва не даёт нового покрытия",
+          diag(st2) == 8, f"diagnostics={st2.get('diagnostics')}")
+    checkpoint2 = (st2.get("stats") or {}).get("sales_docs_skipped_store_rebuild_checkpoint")
+    check("checkpoint снят после успешного завершения",
+          checkpoint2 is None, f"checkpoint={checkpoint2}")
+
+    mock_api.post("/__test/reset_skip_store_docs")
+    c.close()
+    mock_api.close()
+
+
+def run_part2_committed_boundary() -> None:
+    """Corrective #5, сценарий B (P2 discussion_r3872223834, дословный
+    численный пример независимого ревью): падение ПОСЛЕ того, как
+    `_collect_sales` увеличил raw для чанка, но ДО того, как для этого
+    чанка продвинулась `history_loaded_from` — следующий resume перечитает
+    ТОТ ЖЕ чанк заново. Раньше: checkpoint(8) + partial(3) + retried(3) = 14.
+    Правильно: checkpoint(8) + committed(3) = 11 — partial НЕ засчитывается,
+    committed — находка ТОГО ЖЕ чанка, но только когда он ДЕЙСТВИТЕЛЬНО
+    закоммитился.
+
+    Раунд 1 (fresh): 8 skip-документов при w_start устанавливают
+    checkpoint=8 (тот же приём, что и в rebuild_accumulator). Раунд 2
+    (resume): в единственном чанке истории — 3 skip-документа (считаются
+    ПЕРВЫМИ, entity=retaildemand) и документ с рассинхронизированным
+    `positions.meta.size` (entity=demand, обрабатывается ПОСЛЕ) —
+    `_full_positions` дочитывает его хвост и падает на `positions_429_burst`
+    — raw=3 уже посчитан, но `history_loaded_from` для этого чанка ещё не
+    продвинулась. Раунд 3 (resume, фолт снят): тот же чанк перечитывается
+    заново с нуля, те же 3 документа считаются и НА ЭТОТ РАЗ коммитятся.
+    """
+    c = client()
+    mock_api = httpx.Client(base_url=f"http://127.0.0.1:{MOCK_PORT}", timeout=30.0)
+    all_stores = [sid for sid, _ in mock_ms.STORES]
+    org_id = register_and_connect_ms(c, "owner-j@diag.test",
+                                     "Организация J (committed-boundary)", all_stores)
+
+    window_days = int(os.environ["INITIAL_WINDOW_DAYS"])
+    w_start = (date.today() - timedelta(days=window_days - 1)).isoformat()
+    oldest_history_date = (date.today() - timedelta(days=window_days + 4)).isoformat()
+    SKIP_STORE = "st-ghost-test-j"
+    mock_api.post("/__test/skip_store_doc", json={
+        "entity": "demand", "store": SKIP_STORE, "date": w_start, "count": 8,
+    })
+    mock_api.post("/__test/faults", json={"docs_429_before": w_start})
+
+    print("\n== [часть 2, committed-boundary] Раунд 1: month находит 8, "
+          "падает в фазе history (checkpoint становится 8) ==")
+    r = c.post("/api/sync/initial")
+    check("раунд 1 запущен", r.status_code == 200, f"status={r.status_code}")
+    st1 = wait_sync_done(c)
+    check("раунд 1 честно упал (error)", st1.get("state") == "error",
+          f"state={st1.get('state')}")
+    check("раунд 1: СВОЙ raw == 8", (st1.get("stats") or {}).get(
+        "sales_docs_skipped_store") == 8, f"stats={st1.get('stats')}")
+
+    print("\n== [часть 2, committed-boundary] Раунд 2 (resume): чанк истории "
+          "находит 3 пропуска (retaildemand), затем падает на дочитке "
+          "позиций ДРУГОГО документа (demand) ДО коммита чанка ==")
+    mock_api.post("/__test/faults", json={})  # снять docs_429_before — чанк дойдёт до счёта
+    mock_api.post("/__test/skip_store_doc", json={
+        "entity": "retaildemand", "store": SKIP_STORE,
+        "date": oldest_history_date, "count": 3,
+    })
+    mock_api.post("/__test/positions_refetch_doc", json={
+        "entity": "demand", "store": all_stores[0], "date": oldest_history_date,
+    })
+    mock_api.post("/__test/faults", json={"positions_429_burst": 5})
+    r = c.post("/api/sync/run")
+    check("раунд 2 (резюме) запущен", r.status_code == 200, f"status={r.status_code}")
+    st2 = wait_sync_done(c)
+    check("раунд 2 честно упал (error) — дочитка позиций не прошла",
+          st2.get("state") == "error", f"state={st2.get('state')}")
+    check("раунд 2 реально пошёл веткой initial (resume_from)",
+          st2.get("mode") == "initial", f"mode={st2.get('mode')}")
+    raw2 = (st2.get("stats") or {}).get("sales_docs_skipped_store")
+    check("раунд 2: СВОЙ raw == 3 (посчитан ДО падения на дочитке позиций)",
+          raw2 == 3, f"raw={raw2}")
+    loaded_from2 = (st2.get("stats") or {}).get("history_loaded_from")
+    check("раунд 2: history_loaded_from НЕ продвинулась для этого чанка "
+          "(остался на границе окна w_start — чанк не закоммитился)",
+          loaded_from2 == w_start, f"history_loaded_from={loaded_from2}")
+    check("раунд 2: sticky остался 8 — partial 3 ещё НЕ перенесён в checkpoint "
+          "(перенос происходит на carry СЛЕДУЮЩЕГО прогона)",
+          diag(st2) == 8, f"diagnostics={st2.get('diagnostics')}")
+
+    print("\n== [часть 2, committed-boundary] Раунд 3 (resume, фолт снят): "
+          "тот же чанк перечитывается заново — 8 + 3 = 11, НЕ 14 ==")
+    mock_api.post("/__test/faults", json={})  # снять positions_429_burst
+    r = c.post("/api/sync/run")
+    check("раунд 3 (резюме) запущен", r.status_code == 200, f"status={r.status_code}")
+    st3 = wait_sync_done(c)
+    check("раунд 3 дошёл до done", st3.get("state") == "done",
+          f"state={st3.get('state')} error={st3.get('error')}")
+    check("раунд 3 реально пошёл веткой initial (resume_from)",
+          st3.get("mode") == "initial", f"mode={st3.get('mode')}")
+    raw3 = (st3.get("stats") or {}).get("sales_docs_skipped_store")
+    check("раунд 3: СВОЙ raw == 3 (тот же чанк, те же 3 документа, "
+          "пересчитаны заново и НА ЭТОТ РАЗ закоммичены)",
+          raw3 == 3, f"raw={raw3}")
+    check("ИТОГ: sticky == 11 == 8 (checkpoint раунда 1) + 3 (раунд 3, "
+          "committed) — partial раунда 2 НЕ задвоился (не 14)",
+          diag(st3) == 11, f"diagnostics={st3.get('diagnostics')}")
+    checkpoint3 = (st3.get("stats") or {}).get("sales_docs_skipped_store_rebuild_checkpoint")
+    check("checkpoint снят после успешного завершения",
+          checkpoint3 is None, f"checkpoint={checkpoint3}")
+
+    mock_api.post("/__test/reset_skip_store_docs")
+    c.close()
+    mock_api.close()
+
+
 def run_part3_unit_lifecycle() -> None:
     """Прямая проверка чистой функции `_apply_skip_diagnostic_lifecycle` —
     быстрое точное покрытие всей таблицы решений без сетевого прогона синка.
@@ -942,6 +1125,29 @@ def run_part3_unit_lifecycle() -> None:
           _mss._rebuild_total({"sales_docs_skipped_store": 3,
                                "sales_docs_skipped_store_rebuild_checkpoint": "x"}) == 3)
 
+    print("\n== [часть 3] _skip_segment_contribution / _rebuild_total: "
+          "committed вместо голого raw (corrective #5) ==")
+
+    check("committed присутствует (3) -> используется ОН, не raw (7, "
+          "включает недокоммиченный partial)",
+          _mss._skip_segment_contribution(
+              {"sales_docs_skipped_store": 7,
+               "sales_docs_skipped_store_committed": 3}) == 3)
+    check("committed отсутствует -> голый raw, как раньше (обычный путь: "
+          "инкремент, падение до _run_initial)",
+          _mss._skip_segment_contribution({"sales_docs_skipped_store": 7}) == 7)
+    check("committed malformed -> None (fail-closed, тот же контракт, что и raw)",
+          _mss._skip_segment_contribution(
+              {"sales_docs_skipped_store": 7,
+               "sales_docs_skipped_store_committed": "x"}) is None)
+
+    check("total = checkpoint(8) + committed(3), НЕ checkpoint + raw(7) — "
+          "partial (raw−committed=4) не задваивается",
+          _mss._rebuild_total(
+              {"sales_docs_skipped_store": 7,
+               "sales_docs_skipped_store_committed": 3,
+               "sales_docs_skipped_store_rebuild_checkpoint": 8}) == 11)
+
 
 def run() -> int:
     run_part1_schema()
@@ -950,6 +1156,8 @@ def run() -> int:
     run_part2_rollout_carry()
     run_part2_fresh_evidence_overrides_sticky()
     run_part2_rebuild_accumulator()
+    run_part2_no_overlap_today_reread()
+    run_part2_committed_boundary()
     run_part3_unit_lifecycle()
     print(f"\nИТОГО: {len(PASS)} OK, {len(FAIL)} FAIL")
     return 1 if FAIL else 0

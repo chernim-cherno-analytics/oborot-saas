@@ -362,6 +362,14 @@ def entity_doc_positions(entity: str, doc_id: str, request: Request,
     """Позиции одного документа постранично (аудит 18.08: дочитывание
     хвоста документов >100 позиций)."""
     _auth(request)
+    if entity != "purchaseorder" and int(FAULTS.get("positions_429_burst") or 0) > 0:
+        from fastapi.responses import JSONResponse
+        FAULTS["positions_429_burst"] -= 1
+        return JSONResponse(
+            status_code=429,
+            content={"errors": [{"error": "mock: Превышен лимит запросов"}]},
+            headers={"X-Lognex-Retry-TimeInterval": "200"},
+        )
     if entity == "purchaseorder":
         _race_hook("po_positions")
         for doc in PURCHASE_ORDERS:
@@ -621,6 +629,14 @@ FAULTS: dict = {"stock_ok_before": 0, "stock_429_burst": 0,
                 # продажи СТАРОГО чанка не доезжают — ровно тот шов, где
                 # остатки чанка уже записаны, а продажи за те же дни ещё нет.
                 "docs_429_before": "",
+                # 429 на /entity/{entity}/{id}/positions — дочитка хвоста
+                # документа >100 позиций (DATA-8 corrective #5, P2
+                # discussion_r3872223834): падает ПОСЛЕ того, как счётчик
+                # пропусков уже увеличился для более раннего документа в том
+                # же чанке, но ДО того, как для чанка продвинулась
+                # history_loaded_from — ровно шов, на котором старая версия
+                # чекпоинта задваивала находку при повторном резюме.
+                "positions_429_burst": 0,
                 # Заказ поставщику СОЗДАН, но ответ не дошёл (таймаут/502).
                 # Ровно тот случай, ради которого писался маркер и поиск
                 # документа перед созданием: слепой повтор дал бы дубль.
@@ -724,7 +740,7 @@ FAULT_STATS: dict = {"stock_requests": 0, "stock_ok": 0, "stock_429": 0,
 def reset_faults() -> None:
     FAULTS.update(stock_ok_before=0, stock_429_burst=0, stock_429_every=0,
                   stock_500_once=False, assortment_429_burst=0,
-                  docs_429_burst=0, docs_429_before="",
+                  docs_429_burst=0, docs_429_before="", positions_429_burst=0,
                   po_create_then_fail=0, po_429_burst=0,
                   po_fail_before_create=0, cp_search_delay_ms=0,
                   cp_get_500_burst=0, cp_list_500_burst=0, syncid_route_404=0,
@@ -1200,8 +1216,10 @@ async def test_skip_store_doc(request: Request):
 
 @app.post("/__test/reset_skip_store_docs")
 def test_reset_skip_store_docs():
-    """Убирает документы, добавленные `/__test/skip_store_doc` (эмулирует
-    «проблемные документы устранены» для теста авторитетной очистки)."""
+    """Убирает документы, добавленные `/__test/skip_store_doc` и
+    `/__test/positions_refetch_doc` (эмулирует «проблемные документы
+    устранены» для теста авторитетной очистки — оба используют один
+    префикс id)."""
     removed = 0
     for entity, rows in DOCS.items():
         before = len(rows)
@@ -1209,6 +1227,35 @@ def test_reset_skip_store_docs():
                         if not str(d.get("id", "")).startswith(_SKIP_DOC_PREFIX)]
         removed += before - len(DOCS[entity])
     return {"ok": True, "removed": removed}
+
+
+@app.post("/__test/positions_refetch_doc")
+async def test_positions_refetch_doc(request: Request):
+    """Внедряет ОБЫЧНЫЙ (не skip-store) документ с `positions.meta.size`
+    БОЛЬШЕ, чем `len(rows)` — форсирует `_full_positions` (`app/ms_sync.py`)
+    на дочитку через `GET /entity/{entity}/{id}/positions`, которую можно
+    уронить фолтом `positions_429_burst` (DATA-8 corrective #5, P2
+    discussion_r3872223834). Склад — АКТИВНЫЙ (документ не пропускается
+    фильтром склада, до дочитки позиций доходит).
+
+    Тело: {"entity": "demand", "store": "st-flag", "date": "2026-08-01"}.
+    """
+    body = await request.json()
+    entity = str(body.get("entity") or "demand")
+    store = str(body["store"])
+    day = str(body["date"])
+    ext = SKUS[0]["ext"]
+    doc_id = f"{_SKIP_DOC_PREFIX}refetch-{entity}-{store}-{day}"
+    DOCS.setdefault(entity, []).append({
+        "id": doc_id,
+        "meta": {"href": f"{BASE}/entity/{entity}/{doc_id}", "type": entity},
+        "moment": f"{day} 12:00:00",
+        "store": {"meta": {"href": f"{BASE}/entity/store/{store}", "type": "store"}},
+        "positions": {"rows": [{"assortment": {"meta": _asm_meta(ext)},
+                                 "quantity": 1, "price": 100, "discount": 0}],
+                      "meta": {"size": 2}},  # size(2) > len(rows)(1) -> дочитка
+    })
+    return {"ok": True, "id": doc_id}
 
 
 def _reject_sync_id_filter(parsed: dict) -> None:
