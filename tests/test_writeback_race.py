@@ -70,9 +70,38 @@ discussion_r3867655979): гейт выше закрывает ОДНОВРЕМЕ
      RETRY_STATUSES, падает сразу без пауз, тест остаётся детерминированным
      и быстрым, а не гоняет реальный backoff клиента на 5xx/429) → синк
      обязан прервать пересборку входящих ДО записи: ms_qty/ms_qty_tracked
-     остаются РОВНО на значении сразу после push, сам синк при этом честно
-     доходит до `done` (это признанный, обработанный случай, а не падение
-     всего прогона — та же философия, что у существующего `suppliers_error`).
+     остаются РОВНО на значении сразу после push. См. round 3 ниже — этот
+     сценарий переписан: раньше синк в такой ситуации честно доходил до
+     `done`, что и оказалось дефектом FINDING_2.
+
+Round 3 (BLOCKED issuecomment-5432922544, exact HEAD
+2b8ae1e25bead453b3e80ec673a9c90007b8ee99) — два исправления той же точечной
+проверки, оба покрыты новыми сценариями:
+
+  5b. FINDING_1: точечная проверка раньше пропускалась для документов, чей
+      ЛОКАЛЬНЫЙ заказ создан раньше cutoff — предполагалось, что документ не
+      может появиться в МойСкладе раньше заказа. Заказ, заведённый год
+      назад локально и отправленный только СЕГОДНЯ, ломает это допущение:
+      его remote-документ свежий и обязан попасть в окно, а старая проверка
+      его бы пропустила. `production_orders.created_at` искусственно
+      состаривается напрямую в БД, `po_hide_created` прячет документ из
+      списка — синк обязан всё равно восстановить его точечным чтением, по
+      REMOTE moment документа, а не по локальной дате заказа.
+
+  6b. FINDING_1, обратный случай: точечное чтение подтверждает, что
+      документ СУЩЕСТВУЕТ, но его remote moment ЧЕСТНО старше cutoff (не
+      просто local created_at, а сам документ). Такой документ не
+      воскрешается — исключается из пересборки так же, как список исключил
+      бы его сам, будь он в нём виден.
+
+  7 (переписан). FINDING_2: ambiguous-исход (сетевая ошибка точечного
+      чтения ИЛИ нераспознаваемый remote moment) обязан завершить синк
+      состоянием `error`, а не `done` — раньше он молча проглатывался, и
+      внешний вызывающий код доводил синк до успешного финала с обновлённым
+      `last_sync_at`, хотя входящие документы остались нерасчитанными.
+      ms_qty/ms_qty_tracked после такого прогона остаются РОВНО на значении
+      сразу после push, `last_sync_at` не обновляется, а последующий ЧИСТЫЙ
+      повтор (без неоднозначности) обязан пройти нормально до `done`.
 
 Свой мок на отдельном порту — можно гонять параллельно с соседними
 writeback-наборами (tests/test_writeback_dup.py: 9812, .../idempotency: 9813).
@@ -84,6 +113,7 @@ import os
 import sqlite3
 import sys
 import threading
+from datetime import timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -159,6 +189,18 @@ def query_one(sql: str, *args):
     con = sqlite3.connect(DB_PATH)
     try:
         return con.execute(sql, args).fetchone()
+    finally:
+        con.close()
+
+
+def exec_sql(sql: str, *args) -> str:
+    con = sqlite3.connect(DB_PATH)
+    try:
+        con.execute(sql, args)
+        con.commit()
+        return ""
+    except sqlite3.OperationalError as exc:
+        return str(exc)
     finally:
         con.close()
 
@@ -645,6 +687,57 @@ def run() -> int:
           len(mock_ms.CREATED_PURCHASE_ORDERS) == created_before_s5 + 1,
           f"было={created_before_s5} стало={len(mock_ms.CREATED_PURCHASE_ORDERS)}")
 
+    # ── 5b. FINDING_1: старый ЛОКАЛЬНЫЙ created_at не блокирует точечную
+    # проверку — решает СВЕЖИЙ remote moment, а не дата локального заказа ───
+    print("\n== 5b. Локальный заказ создан год назад, push — сегодня, список "
+          "устарел: синк всё равно восстанавливает документ по свежему "
+          "remote moment ==")
+    order_k_id, item_k = make_order(c, "Заказ: старый локальный created_at")
+    base_k = item_k["base_name"]
+    qty_k = float(item_k["qty"])
+    before_ms_k = ms_qty_pair(org_id, base_k)
+
+    err_k = exec_sql(
+        "UPDATE production_orders SET created_at=? WHERE id=?",
+        "2024-01-01 00:00:00", order_k_id,
+    )
+    check("локальный created_at заказа искусственно состарен", not err_k, err_k)
+
+    r5bpush = c.post(f"/api/orders/{order_k_id}/push-to-ms")
+    check("push прошёл (старый локальный created_at пушу не мешает)",
+          r5bpush.status_code == 200, f"status={r5bpush.status_code}")
+    href_k = order_href(order_k_id)
+    check("документ создан и привязан",
+          bool(href_k) and not ms_writeback.is_internal_href(href_k),
+          f"href={href_k!r}")
+    after_push_k = ms_qty_pair(org_id, base_k)
+    check("push добавил вклад локально",
+          after_push_k[0] == before_ms_k[0] + qty_k,
+          f"было={before_ms_k} стало={after_push_k}")
+
+    mock_ms.FAULTS["po_hide_created"] = 1
+    st5b: dict = {}
+    try:
+        r = c.post("/api/sync/run")
+        check("инкрементальный синк запущен", r.status_code == 200,
+              f"status={r.status_code}")
+        st5b = wait_sync_done(c)
+    finally:
+        mock_ms.FAULTS["po_hide_created"] = 0
+    check("синк дошёл до done несмотря на устаревший список и старый "
+          "локальный created_at",
+          st5b.get("state") == "done",
+          f"state={st5b.get('state')} error={str(st5b.get('error'))[:120]}")
+    stats5b = st5b.get("stats", {}) or {}
+    check("СИНК ВСЁ РАВНО ВОССТАНОВИЛ ДОКУМЕНТ ТОЧЕЧНЫМ ЧТЕНИЕМ "
+          "(старый local created_at её больше не гасит)",
+          stats5b.get("incoming_reconcile_recovered", 0) >= 1,
+          f"stats={stats5b.get('incoming_reconcile_recovered')}")
+    after_sync_k = ms_qty_pair(org_id, base_k)
+    check("ms_qty/ms_qty_tracked НЕ ОБНУЛЕНЫ — равны значению сразу после push",
+          after_sync_k == after_push_k,
+          f"после push={after_push_k} после синка={after_sync_k}")
+
     # ── 6. Документ реально удалён — не воскрешается ────────────────────────
     print("\n== 6. Документ реально удалён из МойСклада: вклад снят один раз, "
           "не воскрешается повторным синком ==")
@@ -694,9 +787,55 @@ def run() -> int:
           after_sync_i2[0] == before_ms_i[0],
           f"стало={after_sync_i2[0]}")
 
-    # ── 7. Точечное чтение падает неоднозначно — пересборка прерывается ─────
-    print("\n== 7. Точечное чтение падает 401 (неоднозначно): пересборка "
-          "входящих прервана, известный вклад НЕ обнулён ==")
+    # ── 6b. FINDING_1: точечное чтение подтверждает документ, но его
+    # СОБСТВЕННЫЙ remote moment честно старше окна синка — не воскрешается ──
+    print("\n== 6b. Точечное чтение находит документ с честно старым remote "
+          "moment (не просто старым локальным created_at): не воскрешается ==")
+    order_l_id, item_l = make_order(c, "Заказ: remote moment честно старый")
+    base_l = item_l["base_name"]
+    qty_l = float(item_l["qty"])
+    before_ms_l = ms_qty_pair(org_id, base_l)
+
+    r6bpush = c.post(f"/api/orders/{order_l_id}/push-to-ms")
+    check("push прошёл", r6bpush.status_code == 200, f"status={r6bpush.status_code}")
+    href_l = order_href(order_l_id)
+    doc_id_l = ms_sync._href_id(href_l)
+    after_push_l = ms_qty_pair(org_id, base_l)
+    check("push добавил вклад локально",
+          after_push_l[0] == before_ms_l[0] + qty_l,
+          f"было={before_ms_l} стало={after_push_l}")
+
+    matched_l = [d for d in mock_ms.CREATED_PURCHASE_ORDERS if d.get("id") == doc_id_l]
+    check("документ найден в состоянии мока перед подменой moment",
+          len(matched_l) == 1, f"найдено={len(matched_l)} id={doc_id_l!r}")
+    old_moment = (mock_ms.TODAY - timedelta(days=400)).isoformat() + " 12:00:00"
+    matched_l[0]["moment"] = old_moment
+
+    mock_ms.FAULTS["po_hide_created"] = 1
+    st6c: dict = {}
+    try:
+        r = c.post("/api/sync/run")
+        check("инкрементальный синк запущен", r.status_code == 200,
+              f"status={r.status_code}")
+        st6c = wait_sync_done(c)
+    finally:
+        mock_ms.FAULTS["po_hide_created"] = 0
+    check("синк дошёл до done", st6c.get("state") == "done",
+          f"state={st6c.get('state')} error={str(st6c.get('error'))[:120]}")
+    stats6c = st6c.get("stats", {}) or {}
+    check("СИНК ПОДТВЕРДИЛ ДОКУМЕНТ, НО ИСКЛЮЧИЛ ЕГО ПО ЧЕСТНО СТАРОМУ MOMENT",
+          stats6c.get("incoming_reconcile_recovered_excluded", 0) >= 1,
+          f"stats={stats6c.get('incoming_reconcile_recovered_excluded')}")
+    after_sync_l = ms_qty_pair(org_id, base_l)
+    check("ДОКУМЕНТ С ЧЕСТНО СТАРЫМ REMOTE MOMENT НЕ ВОСКРЕШЁН",
+          after_sync_l[0] == before_ms_l[0],
+          f"было={before_ms_l[0]} стало={after_sync_l[0]}")
+
+    # ── 7. Точечное чтение падает неоднозначно — синк обязан завершиться
+    # error, а не done (FINDING_2, round 3); чистый повтор восстанавливает ──
+    print("\n== 7. Точечное чтение падает 401 (неоднозначно): синк обязан "
+          "завершиться error (не done), известный вклад НЕ обнулён, "
+          "last_sync_at не обновлён, чистый повтор проходит нормально ==")
     order_j_id, item_j = make_order(c, "Заказ: точечное чтение падает неоднозначно")
     base_j = item_j["base_name"]
     qty_j = float(item_j["qty"])
@@ -709,6 +848,11 @@ def run() -> int:
           after_push_j[0] == before_ms_j[0] + qty_j,
           f"было={before_ms_j} стало={after_push_j}")
 
+    last_sync_before_j = query_one(
+        "SELECT last_sync_at FROM connections WHERE kind='moysklad' AND org_id=?",
+        org_id,
+    )
+
     mock_ms.FAULTS["po_hide_created"] = 1
     mock_ms.FAULTS["po_get_status"] = 401
     st7: dict = {}
@@ -720,9 +864,12 @@ def run() -> int:
     finally:
         mock_ms.FAULTS["po_hide_created"] = 0
         mock_ms.FAULTS["po_get_status"] = 0
-    check("СИНК ЧЕСТНО ДОШЁЛ ДО DONE (обработанный, а не фатальный случай)",
-          st7.get("state") == "done",
-          f"state={st7.get('state')} error={str(st7.get('error'))[:120]}")
+    check("СИНК ЧЕСТНО ЗАВЕРШИЛСЯ ERROR (неоднозначность не выдаётся за успех)",
+          st7.get("state") == "error",
+          f"state={st7.get('state')} detail={str(st7.get('detail'))[:120]}")
+    check("DETAIL НЕ ПОДМЕНЁН УСПЕШНЫМ ТЕКСТОМ ЗАВЕРШЕНИЯ",
+          st7.get("detail") != "Синхронизация завершена",
+          f"detail={st7.get('detail')!r}")
     stats7 = st7.get("stats", {}) or {}
     check("НЕОДНОЗНАЧНОСТЬ ТОЧЕЧНОГО ЧТЕНИЯ ЗАФИКСИРОВАНА ЧЕСТНО",
           stats7.get("incoming_reconcile_ambiguous", 0) >= 1,
@@ -731,6 +878,33 @@ def run() -> int:
     check("ИЗВЕСТНЫЙ ВКЛАД ПОСЛЕ PUSH НЕ ОБНУЛЁН — пересборка прервана целиком",
           after_sync_j == after_push_j,
           f"после push={after_push_j} после синка={after_sync_j}")
+    last_sync_after_j = query_one(
+        "SELECT last_sync_at FROM connections WHERE kind='moysklad' AND org_id=?",
+        org_id,
+    )
+    check("last_sync_at НЕ ОБНОВЛЁН — терминальный успех не опубликован",
+          last_sync_after_j == last_sync_before_j,
+          f"до={last_sync_before_j} после={last_sync_after_j}")
+
+    # Чистый повтор без неоднозначности обязан пройти нормально до done.
+    r = c.post("/api/sync/run")
+    check("повторный (чистый) синк запущен", r.status_code == 200,
+          f"status={r.status_code}")
+    st7b = wait_sync_done(c)
+    check("ЧИСТЫЙ ПОВТОР ДОХОДИТ ДО DONE",
+          st7b.get("state") == "done",
+          f"state={st7b.get('state')} error={str(st7b.get('error'))[:120]}")
+    after_retry_j = ms_qty_pair(org_id, base_j)
+    check("ЧИСТЫЙ ПОВТОР СОХРАНЯЕТ/ПОДТВЕРЖДАЕТ ТОТ ЖЕ ВКЛАД",
+          after_retry_j == after_push_j,
+          f"после push={after_push_j} после повтора={after_retry_j}")
+    last_sync_after_retry = query_one(
+        "SELECT last_sync_at FROM connections WHERE kind='moysklad' AND org_id=?",
+        org_id,
+    )
+    check("last_sync_at ОБНОВИЛСЯ НА ЧИСТОМ ПОВТОРЕ",
+          last_sync_after_retry != last_sync_before_j,
+          f"было={last_sync_before_j} стало={last_sync_after_retry}")
 
     c.close()
     print(f"\nИТОГО: {len(PASS)} OK, {len(FAIL)} FAIL")

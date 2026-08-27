@@ -2738,22 +2738,16 @@ async def _sync_incoming_locked(org_id: int, client: MoySkladClient,
         db.close()
 
     # Ссылки на документы МойСклада, созданные нашими заказами: id → href.
-    # Нужны для встречной проверки маркера (см. _is_oborot_doc). created_at
-    # тоже нужен ниже (DATA-6, round 2) — граница «стоит ли перепроверять
-    # точечным чтением».
+    # Нужны для встречной проверки маркера (см. _is_oborot_doc).
     db = SessionLocal()
     try:
         order_rows = db.execute(
-            select(ProductionOrder.id, ProductionOrder.ms_doc_href,
-                   ProductionOrder.created_at).where(
+            select(ProductionOrder.id, ProductionOrder.ms_doc_href).where(
                 ProductionOrder.org_id == org_id,
                 ProductionOrder.ms_doc_href.is_not(None),
             )
         ).all()
-        our_docs = {int(oid): href for oid, href, _ in order_rows if href}
-        order_created_at = {
-            int(oid): created for oid, href, created in order_rows if href
-        }
+        our_docs = {int(oid): href for oid, href in order_rows if href}
     finally:
         db.close()
 
@@ -2773,53 +2767,85 @@ async def _sync_incoming_locked(org_id: int, client: MoySkladClient,
     # но уже без одновременного выполнения (гейт из round 1 здесь ни при
     # чём: push и синк здесь НЕ пересекались по времени вовсе).
     #
-    # Поэтому каждый локально привязанный (our_docs) документ, отсутствующий
+    # Поэтому КАЖДЫЙ локально привязанный (our_docs) документ, отсутствующий
     # в СВЕЖЕМ снимке `docs`, проверяется ТОЧЕЧНЫМ чтением ПЕРЕД
     # разрушительной пересборкой ниже — тем же fail-closed контрактом, что
     # у entity_exists/fetch_purchase_order_by_id (app/ms_client.py):
     # подтверждённые 404/410 — документа действительно нет, обнуление
     # законно; любой другой ответ (429/5xx/транспорт) — «не знаю», и
-    # обнулять уже подтверждённый вклад по «не знаю» нельзя — весь синк
-    # входящих документов в этом прогоне прерывается ДО пересборки,
-    # известные ms_qty/ms_qty_tracked не трогаются вовсе (частичной
-    # перезаписи не бывает — либо пересборка целиком, либо не начинается).
+    # обнулять уже подтверждённый вклад по «не знаю» нельзя.
     #
-    # Проверяются не ВСЕ href из production_orders за всё время (МойСклад
-    # хранит документы годами, а окно синка — год, см. cutoff выше), а
-    # только те, чей ЛОКАЛЬНЫЙ заказ создан не раньше cutoff: документ не
-    # может появиться в МойСкладе раньше локального заказа, который его
-    # породил, — поэтому граница не теряет ни одного документа, который
-    # список обязан был бы показать в этом окне, и не воскрешает годами
-    # закрытые заказы, для которых исключение из окна — уже принятое,
-    # отдельное поведение (тот же cutoff, что и у самого списка).
+    # Round 3 (ревью issuecomment-5432922544, FINDING_1): раньше точечное
+    # чтение пропускалось для документов, у чьего ЛОКАЛЬНОГО заказа
+    # created_at старше cutoff — расчёт был на то, что документ не может
+    # появиться в МойСкладе раньше заказа, который его породил. Это не
+    # доказывает обратного: заказ, заведённый локально год назад, может быть
+    # отправлен в МойСклад только сегодня, и его свежий remote-документ
+    # обязан попасть в текущее окно — created_at заказа тут ни при чём,
+    # проверять нужно ВСЕ отсутствующие привязанные документы без исключения
+    # по локальной дате.
+    #
+    # Включение решает не факт восстановления, а MOMENT самого восстановленного
+    # документа относительно того же cutoff, что у списка: moment внутри
+    # окна — документ дописывается в `docs` и идёт в пересборку наравне со
+    # всеми; moment честно старше cutoff — документ подтверждённо существует,
+    # но вне окна синка, и не воскрешается (то же исключение, что уже
+    # применяется к списку). Отсутствующий или нераспознаваемый moment не
+    # угадывается в ту или другую сторону — это тот же «не знаю», что и
+    # сетевая ошибка ниже.
+    #
+    # FINDING_2: раньше ambiguous-исход (сетевая ошибка ИЛИ нераспознаваемый
+    # moment) ловился и функция просто возвращалась — внешний _run_sync не
+    # видел исключения и доводил синк до state=done с обновлённым
+    # last_sync_at, как будто входящие документы синхронизированы успешно.
+    # Теперь ambiguous-исход поднимает исключение дальше по стеку — тем же
+    # путём, что уже сегодня работает для сбоя самого списка
+    # (fetch_purchase_orders выше ничем не оборачивается) — и `_thread_main`
+    # фиксирует state=error, не вызывая _activate_connection/last_sync_at.
+    # Пересборка ниже к этому моменту ещё не началась (частичной перезаписи
+    # не бывает — либо пересборка целиком на подтверждённых данных, либо не
+    # начинается), поэтому ms_qty/ms_qty_tracked остаются прежними, и чистый
+    # повторный синк проходит обычным путём до done.
     def _doc_ref(d: dict) -> str:
         href = ((d.get("meta") or {}).get("href")) or ""
         return _href_id(href) or href
 
     present_refs = {_doc_ref(d) for d in docs}
-    for order_id, href in our_docs.items():
+    for href in our_docs.values():
         if not ms_writeback.is_pushed(href):
             continue  # "pending:"/"unknown:" — служебная пометка, не документ
         ref = _href_id(href) or href
         if not ref or ref in present_refs:
-            continue
-        created = order_created_at.get(order_id)
-        if created is None or created.date() < cutoff_date:
             continue
         try:
             recovered = await client.fetch_purchase_order_by_id(ref)
         except (httpx.HTTPStatusError, *TRANSPORT_ERRORS):
             stats["incoming_reconcile_ambiguous"] = stats.get(
                 "incoming_reconcile_ambiguous", 0) + 1
-            _set_state(
-                org_id, stage="incoming", progress=progress[1],
-                detail="«Едет к нам»: точечная проверка не подтвердила "
-                       "статус документа — пересборка пропущена в этом синке",
-            )
-            return
+            _persist(org_id, stats)
+            raise
         if recovered is None:
             stats["incoming_reconcile_confirmed_absent"] = stats.get(
                 "incoming_reconcile_confirmed_absent", 0) + 1
+            continue
+        moment_day = str(recovered.get("moment") or "")[:10]
+        try:
+            date.fromisoformat(moment_day)
+        except ValueError:
+            moment_day = ""
+        if not moment_day:
+            stats["incoming_reconcile_ambiguous"] = stats.get(
+                "incoming_reconcile_ambiguous", 0) + 1
+            _persist(org_id, stats)
+            raise RuntimeError(
+                "«Едет к нам»: точечная проверка вернула документ без "
+                "распознаваемой даты (moment) — пересборка остановлена, "
+                "угадывать нельзя")
+        if moment_day < cutoff:
+            # Документ подтверждённо существует, но его собственный remote
+            # moment честно вне окна синка — не воскрешаем.
+            stats["incoming_reconcile_recovered_excluded"] = stats.get(
+                "incoming_reconcile_recovered_excluded", 0) + 1
             continue
         docs.append(recovered)
         present_refs.add(ref)
