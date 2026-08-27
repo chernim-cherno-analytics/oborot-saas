@@ -731,7 +731,8 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
         with httpx.Client(headers=dict(c.headers), cookies=c.cookies,
                           base_url=base, timeout=120.0) as cc:
             rr = cc.post(f"/api/orders/{order_id}/push-to-ms")
-            agent_res.append(rr.status_code)
+            agent_res.append({"order_id": order_id, "status": rr.status_code,
+                              "body": body_of(rr)})
             if rr.status_code != 200:
                 print(f"       (агент {order_id}: {rr.status_code} {rr.text[:200]})")
 
@@ -741,14 +742,32 @@ def run() -> int:  # noqa: C901 — сценарный набор, читает�
     for t in threads:
         t.join(timeout=120)
     mock_api.post("/__test/faults", json={})
+    statuses8 = sorted(r["status"] for r in agent_res)
+    # DATA-6 (corrective round, issuecomment-5432267185): push — «читатель»
+    # writer-preferring гейта (app/ms_sync._IncomingGate), а не общий с синком
+    # мьютекс. Два РАЗНЫХ заказа одной организации обязаны оба пройти
+    # одновременно; единственная защита от гонки здесь — CAS/idempotency
+    # самого контрагента «Производство» (D-36), а не org-лок синка.
+    check("ОБА ПУША ПРИНЯТЫ (200) — DATA-6 гейт не сериализует РАЗНЫЕ заказы",
+          statuses8 == [200, 200], f"статусы={statuses8}")
+
     prod = [cp for cp in mock_ms.COUNTERPARTIES if cp["name"] == ms_writeback.AGENT_NAME]
-    check("обе отправки прошли", sorted(agent_res) == [200, 200],
-          f"статусы={sorted(agent_res)}")
     check("КОНТРАГЕНТ СОЗДАН РОВНО ОДИН, а не по одному на клик",
           len(prod) == 1, f"контрагентов «{ms_writeback.AGENT_NAME}»={len(prod)}")
     check("привязка контрагента закреплена в базе",
           str(conn_col("ms_agent_href") or "").startswith("http"),
           f"ms_agent_href={conn_col('ms_agent_href')!r}")
+    href_a8 = str(col_of(o8a, "ms_doc_href") or "")
+    href_b8 = str(col_of(o8b, "ms_doc_href") or "")
+    check("оба заказа получили настоящую ссылку на документ, а не пометку",
+          href_a8.startswith("http") and href_b8.startswith("http")
+          and not ms_writeback.is_internal_href(href_a8)
+          and not ms_writeback.is_internal_href(href_b8),
+          f"o8a={href_a8!r} o8b={href_b8!r}")
+    created_hrefs8 = {d["meta"]["href"] for d in docs_created()}
+    check("это ДВА РАЗНЫХ созданных документа, а не один на двоих",
+          href_a8 != href_b8 and {href_a8, href_b8} <= created_hrefs8,
+          f"o8a={href_a8!r} o8b={href_b8!r} created={created_hrefs8}")
 
     mock_ms.COUNTERPARTIES.clear()
     mock_ms.COUNTERPARTIES.extend([

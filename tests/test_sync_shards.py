@@ -42,7 +42,10 @@ WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 
 # Столько проверок сценарий выполнял на BASE и обязан выполнять после разреза.
 # Число зафиксировано по CI 32953333557 (sync 413 OK / 0 FAIL / 448.9 сек).
-LEGACY_TOTAL = 413
+# +1 (DATA-6 round 4, discussion_r3868006778): миграция production_orders
+# получила отдельную ALTER TABLE-проверку в акте «tail» (ms_reconcile_state/
+# ms_reconcile_href), см. tests/test_sync.py и tests/sync_baseline_checks.txt.
+LEGACY_TOTAL = 414
 
 # Акты в порядке исполнения сценария. `core` — онбординг, первичный синк,
 # аналитика, инкремент и переименование (исполняется всегда, он же пролог всех
@@ -181,7 +184,8 @@ def main() -> int:
           list(base) == list(ACTS),
           f"эталон={list(base)[:4]}… реестр={list(ACTS)[:4]}…")
     total = sum(len(v) for v in base.values())
-    check(f"в эталоне ровно {LEGACY_TOTAL} проверок (CI 32953333557: sync 413/0)",
+    check(f"в эталоне ровно {LEGACY_TOTAL} проверок "
+          f"(CI 32953333557: sync 413/0, +1 DATA-6 round 4)",
           total == LEGACY_TOTAL, f"в файле={total}")
     names = [n for v in base.values() for n in v]
     dups = sorted({n for n in names if names.count(n) > 1})

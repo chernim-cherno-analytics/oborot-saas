@@ -23,8 +23,9 @@
 `python tests/test_sync.py --shard <имя>` исполняет и засчитывает только свою
 часть, а недостающую подготовку доигрывает сам, теми же запросами и теми же
 реальными ожиданиями. Без аргументов работает как раньше: весь сценарий,
-413 проверок. Ни одно ожидание не сокращено, ни одна проверка не выброшена и не
-сделана необязательной; замок полноты — `tests/test_sync_shards.py`.
+414 проверок (413 на BASE + 1, DATA-6 round 4). Ни одно ожидание не сокращено,
+ни одна проверка не выброшена и не сделана необязательной; замок полноты —
+`tests/test_sync_shards.py`.
 """
 import argparse
 import io
@@ -157,7 +158,8 @@ def finish() -> int:
     Проверяется УПОРЯДОЧЕННЫЙ список фактически выполненных проверок против
     среза эталона по актам этого шарда. Пропала проверка, переехала в другой
     акт, поменялся порядок — шард красный. Успешная сверка своей строки OK не
-    добавляет: сумма OK по всем шардам обязана дать ровно 413 legacy-проверок.
+    добавляет: сумма OK по всем шардам обязана дать ровно LEGACY_TOTAL проверок
+    (tests/test_sync_shards.py).
     """
     got = [n for _, n in RECORDED]
     if DUMP:
@@ -2631,17 +2633,25 @@ def run_scenario() -> int:
             "CREATE TABLE orgs (id INTEGER PRIMARY KEY, name VARCHAR(120) NOT NULL)"))
         conn.execute(_text(
             "CREATE TABLE users (id INTEGER PRIMARY KEY, email VARCHAR(255) NOT NULL)"))
-    for fn, table, expect_cols in (
-        (_ms_writeback.ensure_schema, "production_orders", {"ms_doc_href", "ms_doc_name"}),
-        (_ms_sync.ensure_schema, "ordered_qty", {"ms_qty"}),
-        (_ms_sync.ensure_schema, "sync_state", {"fail_streak", "alerted_streak"}),
+    for fn, table, expect_cols, label in (
+        (_ms_writeback.ensure_schema, "production_orders",
+         {"ms_doc_href", "ms_doc_name"}, "production_orders"),
+        # DATA-6 round 4: персистентный исход точечной проверки (см.
+        # models.ProductionOrder.ms_reconcile_state) — та же additive-миграция,
+        # что и у остальных колонок production_orders выше; отдельная метка,
+        # чтобы имя проверки не задваивалось с предыдущей строкой.
+        (_ms_sync.ensure_schema, "production_orders",
+         {"ms_reconcile_state", "ms_reconcile_href"}, "production_orders (DATA-6 reconcile)"),
+        (_ms_sync.ensure_schema, "ordered_qty", {"ms_qty"}, "ordered_qty"),
+        (_ms_sync.ensure_schema, "sync_state", {"fail_streak", "alerted_streak"},
+         "sync_state"),
         (_ms_vendor.ensure_schema, "orgs",
-         {"ms_account_id", "source", "status", "ms_tariff_name"}),
-        (_ms_vendor.ensure_schema, "users", {"ms_uid"}),
+         {"ms_account_id", "source", "status", "ms_tariff_name"}, "orgs"),
+        (_ms_vendor.ensure_schema, "users", {"ms_uid"}, "users"),
     ):
         fn(bind=old3_engine)
         cols = {c["name"] for c in _inspect(old3_engine).get_columns(table)}
-        check(f"миграция добавила недостающие колонки в {table} (одиночный запуск)",
+        check(f"миграция добавила недостающие колонки в {label} (одиночный запуск)",
               expect_cols <= cols, f"table={table} cols={sorted(cols)}")
     old3_engine.dispose()
 

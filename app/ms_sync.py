@@ -68,6 +68,7 @@ import threading
 import time
 from datetime import date, datetime, timedelta
 
+import httpx
 from sqlalchemy import delete, func, insert, inspect, or_, select, update
 
 from app import analytics, exclusions, logging_conf, ms_writeback
@@ -85,7 +86,7 @@ from app.models import (
     WarehouseStock,
     encode_items_payload,
 )
-from app.ms_client import MoySkladClient, _env_int
+from app.ms_client import TRANSPORT_ERRORS, MoySkladClient, _env_int
 
 # Окно загружаемой истории = окну канона оборачиваемости (D-35, 23.08.2026):
 # 2 года. Аккаунты, загруженные до этого решения (365 дней), добирают второй
@@ -123,6 +124,125 @@ log = logging.getLogger("oborot.ms_sync")
 
 _threads: dict[int, threading.Thread] = {}
 _threads_lock = threading.Lock()
+
+# DATA-6: гонка между импортом «Заказов поставщику» (_sync_incoming) и
+# отправкой заказа (ms_writeback.push_order → routes_connect.api_order_push_to_ms).
+# _sync_incoming читает purchaseorder из МойСклада, а затем ОДНОЙ транзакцией
+# обнуляет и переписывает ordered_qty.ms_qty/ms_qty_tracked по прочитанному
+# снимку; если между чтением и записью push успел создать документ и
+# зафиксировать свой локальный вклад, перезапись стирает его до следующего
+# синка.
+#
+# Первый заход закрыл это одним ОБЩИМ `threading.Lock` на организацию,
+# разделяемым между синком и КАЖДЫМ push, — и пережал: два РАЗНЫХ push'а
+# одной организации, отправленные параллельно, начали конкурировать за один
+# и тот же мьютекс, и один получал ложную 409 «Идёт синхронизация», хотя
+# никакого синка не было (независимое ревью, issuecomment-5432267185).
+#
+# Корректирующая версия — writer-preferring read/write гейт на организацию
+# (`_IncomingGate`, процесс-локальный: D-17, то же допущение, на котором уже
+# стоят `_threads` выше, кэш и лимитер):
+#   * push — «читатель»: НЕСКОЛЬКО РАЗНЫХ push одновременно держат гейт
+#     открытым (try_acquire_incoming_lock — неблокирующий, со стороны
+#     routes_connect; иначе HTTP-запрос владельца завис бы на время фонового
+#     синка);
+#   * синк — «писатель»: _acquire_incoming_write_lock немедленно помечает
+#     гейт «ожидает записи» — это одно уже отклоняет НОВЫЕ push (writer
+#     preference: иначе непрерывный поток push мог бы никогда не выпустить
+#     синк), — затем БЛОКИРУЮЩЕ (безопасно: синк выполняется на своём
+#     собственном фоновом потоке, _thread_main, где и так уже полно
+#     синхронных блокирующих вызовов внутри async) ждёт завершения ВСЕХ уже
+#     активных push, и только тогда становится единоличным владельцем.
+#     К этому моменту push уже закоммитил свой локальный вклад, поэтому
+#     свежее чтение purchaseorder синка гарантированно увидит его документ.
+# Синк владеет гейтом → любой push (новый или бы-параллельный) получает
+# прежнюю 409 «дождитесь синхронизации» немедленно, без сети и без CAS.
+#
+# Ownership-инварианты (снятие ресурса без владения) — это дефект
+# вызывающего кода, а не штатный случай: оба метода снятия ниже поднимают
+# RuntimeError, а не глотают его — маскировать такую ошибку молчаливым
+# `pass` означало бы прятать баг вместо того, чтобы его увидеть.
+class _IncomingGate:
+    __slots__ = ("_cond", "_active_pushes", "_sync_pending", "_sync_owned")
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition()
+        self._active_pushes = 0
+        self._sync_pending = False
+        self._sync_owned = False
+
+
+_incoming_gates: dict[int, _IncomingGate] = {}
+_incoming_gates_meta_lock = threading.Lock()
+
+
+def _incoming_gate(org_id: int) -> _IncomingGate:
+    with _incoming_gates_meta_lock:
+        gate = _incoming_gates.get(org_id)
+        if gate is None:
+            gate = _IncomingGate()
+            _incoming_gates[org_id] = gate
+        return gate
+
+
+def try_acquire_incoming_lock(org_id: int) -> bool:
+    """Неблокирующий вход push'а (читатель). False — синк уже владеет гейтом
+    ИЛИ уже встал в очередь на запись (writer preference: новый push не
+    пройдёт, даже если другие push ещё активны)."""
+    gate = _incoming_gate(org_id)
+    with gate._cond:
+        if gate._sync_pending or gate._sync_owned:
+            return False
+        gate._active_pushes += 1
+        gate._cond.notify_all()
+        return True
+
+
+def release_incoming_lock(org_id: int) -> None:
+    """Освобождение push-слота. Вызывающий код (routes_connect) обязан
+    парно вызывать это РОВНО ОДИН раз на каждый успешный
+    try_acquire_incoming_lock (try/finally) — несбалансированный вызов
+    является дефектом вызывающего кода и не маскируется."""
+    gate = _incoming_gate(org_id)
+    with gate._cond:
+        if gate._active_pushes <= 0:
+            raise RuntimeError(
+                f"release_incoming_lock: нет активного push-слота для org {org_id}"
+            )
+        gate._active_pushes -= 1
+        gate._cond.notify_all()
+
+
+def _acquire_incoming_write_lock(org_id: int) -> None:
+    """Блокирующий вход синка (писатель). Немедленно запрещает новые push
+    (writer preference), дожидается завершения уже активных push, затем
+    становится эксклюзивным владельцем."""
+    gate = _incoming_gate(org_id)
+    with gate._cond:
+        if gate._sync_pending or gate._sync_owned:
+            raise RuntimeError(
+                f"_acquire_incoming_write_lock: гейт org {org_id} уже занят "
+                "синком — одновременно может идти только один синк на организацию"
+            )
+        gate._sync_pending = True
+        gate._cond.notify_all()
+        while gate._active_pushes > 0:
+            gate._cond.wait()
+        gate._sync_pending = False
+        gate._sync_owned = True
+        gate._cond.notify_all()
+
+
+def _release_incoming_write_lock(org_id: int) -> None:
+    gate = _incoming_gate(org_id)
+    with gate._cond:
+        if not gate._sync_owned:
+            raise RuntimeError(
+                f"_release_incoming_write_lock: синк не владеет гейтом org {org_id}"
+            )
+        gate._sync_owned = False
+        gate._cond.notify_all()
+
 
 # Этапы первичной загрузки в порядке выполнения (для /api/sync/progress).
 STAGE_TITLES = (
@@ -209,6 +329,21 @@ def ensure_schema(bind=None) -> None:
             ("sent_at", "DATETIME"),
             ("received_at", "DATETIME"),
             ("order_plan_id", "INTEGER"),
+        ):
+            if col not in cols:
+                run_migration_step(
+                    f"ALTER TABLE production_orders ADD COLUMN {col} {ddl}", bind=eng,
+                )
+        # DATA-6 (round 4): персистентный исход точечной проверки missing-
+        # документа (см. models.ProductionOrder.ms_reconcile_state). Пустая
+        # строка по умолчанию — единственно честный бэкфилл для СУЩЕСТВУЮЩИХ
+        # строк: до первой точечной проверки новым кодом состояние документа
+        # неизвестно, и молчаливо считать его «уже проверенным» было бы
+        # угадыванием (fail-closed) — такая строка просто пройдёт точечную
+        # проверку заново при следующем синке, как и раньше.
+        for col, ddl in (
+            ("ms_reconcile_state", "VARCHAR(16) NOT NULL DEFAULT ''"),
+            ("ms_reconcile_href", "VARCHAR(512) NOT NULL DEFAULT ''"),
         ):
             if col not in cols:
                 run_migration_step(
@@ -2549,6 +2684,42 @@ async def _backmatch_by_sync_id(org_id: int, docs: list[dict],
 async def _sync_incoming(org_id: int, client: MoySkladClient,
                          ext_to_pid: dict[str, int], stats: dict,
                          progress: tuple[float, float] = (95.5, 97.0)) -> None:
+    """Обёртка _sync_incoming_locked под организационным гейтом (см. DATA-6).
+
+    Блокирующий вход безопасен: вся функция выполняется на собственном
+    фоновом потоке синка (см. _thread_main), где ничего другого параллельно
+    не крутится. Гейт немедленно отказывает новым push (writer preference) и
+    дожидается завершения уже активных — тогда чтение purchaseorder ниже
+    гарантированно увидит документы, которые эти push успели создать.
+    """
+    _acquire_incoming_write_lock(org_id)
+    try:
+        await _sync_incoming_locked(org_id, client, ext_to_pid, stats, progress)
+    finally:
+        _release_incoming_write_lock(org_id)
+
+
+def _set_order_reconcile(order_id: int, state: str, href: str) -> None:
+    """Персистентный исход точечной проверки заказа (DATA-6 round 4).
+
+    Короткая, отдельная от остальной пересборки транзакция — тумбстоун
+    одного заказа не обязан ждать коммита ordered_qty ниже и обязан пережить
+    исключение на КАКОМ-ТО ДРУГОМ документе того же прогона (ambiguous по
+    соседней ссылке не должен стирать уже подтверждённый факт по этой).
+    """
+    db = SessionLocal()
+    try:
+        db.execute(update(ProductionOrder).where(
+            ProductionOrder.id == order_id,
+        ).values(ms_reconcile_state=state, ms_reconcile_href=href))
+        db.commit()
+    finally:
+        db.close()
+
+
+async def _sync_incoming_locked(org_id: int, client: MoySkladClient,
+                                ext_to_pid: dict[str, int], stats: dict,
+                                progress: tuple[float, float]) -> None:
     """entity/purchaseorder → ordered_qty.ms_qty (полная пересборка вклада МС).
 
     «Едет» по документу = Σ по позициям (quantity − shipped): shipped растёт
@@ -2586,7 +2757,8 @@ async def _sync_incoming(org_id: int, client: MoySkladClient,
                detail="Загружаем заказы поставщику («едет к нам»)…")
     # Окно заказов поставщику — ГОД (INCOMING_ORDERS_DAYS), не окно истории:
     # см. комментарий у константы (ревью PR #12).
-    cutoff = (_today() - timedelta(days=INCOMING_ORDERS_DAYS - 1)).isoformat()
+    cutoff_date = _today() - timedelta(days=INCOMING_ORDERS_DAYS - 1)
+    cutoff = cutoff_date.isoformat()
     docs = await client.fetch_purchase_orders(cutoff)
 
     # product_id → base_name (агрегируем «едет» по базовому имени).
@@ -2602,15 +2774,24 @@ async def _sync_incoming(org_id: int, client: MoySkladClient,
     # Нужны для встречной проверки маркера (см. _is_oborot_doc).
     db = SessionLocal()
     try:
-        our_docs = {
-            int(oid): href
-            for oid, href in db.execute(
-                select(ProductionOrder.id, ProductionOrder.ms_doc_href).where(
-                    ProductionOrder.org_id == org_id,
-                    ProductionOrder.ms_doc_href.is_not(None),
-                )
-            ).all()
-            if href
+        order_rows = db.execute(
+            select(
+                ProductionOrder.id,
+                ProductionOrder.ms_doc_href,
+                ProductionOrder.ms_reconcile_state,
+                ProductionOrder.ms_reconcile_href,
+            ).where(
+                ProductionOrder.org_id == org_id,
+                ProductionOrder.ms_doc_href.is_not(None),
+            )
+        ).all()
+        our_docs = {int(oid): href for oid, href, _, _ in order_rows if href}
+        # DATA-6 (round 4): последний известный исход точечной проверки —
+        # см. models.ProductionOrder.ms_reconcile_state и комментарий у
+        # цикла реконсиляции ниже.
+        reconcile_cache = {
+            int(oid): (state or "", rhref or "")
+            for oid, href, state, rhref in order_rows if href
         }
     finally:
         db.close()
@@ -2620,6 +2801,137 @@ async def _sync_incoming(org_id: int, client: MoySkladClient,
     # синке считался нашим, а не ещё сутки числился чужим.
     await _backmatch_by_sync_id(org_id, docs, our_docs, stats, client,
                                 ext_to_pid, base_by_pid)
+
+    # DATA-6 (round 2, независимое ревью discussion_r3867655979): успешный
+    # push может закоммитить локальный вклад и снять слот РАНЬШЕ, чем
+    # МойСклад покажет свежесозданный документ в выдаче/поиске
+    # (см. po_hide_created в tests/mock_ms.py — задержка видимости индекса,
+    # а не выдумка). Следующий синк тогда видит СТАРЫЙ снимок без этого
+    # документа, и пересборка ниже обнулила бы уже подтверждённый вклад до
+    # следующего цикла — тот же user-visible провал, что и исходная гонка,
+    # но уже без одновременного выполнения (гейт из round 1 здесь ни при
+    # чём: push и синк здесь НЕ пересекались по времени вовсе).
+    #
+    # Поэтому КАЖДЫЙ локально привязанный (our_docs) документ, отсутствующий
+    # в СВЕЖЕМ снимке `docs`, проверяется ТОЧЕЧНЫМ чтением ПЕРЕД
+    # разрушительной пересборкой ниже — тем же fail-closed контрактом, что
+    # у entity_exists/fetch_purchase_order_by_id (app/ms_client.py):
+    # подтверждённые 404/410 — документа действительно нет, обнуление
+    # законно; любой другой ответ (429/5xx/транспорт) — «не знаю», и
+    # обнулять уже подтверждённый вклад по «не знаю» нельзя.
+    #
+    # Round 3 (ревью issuecomment-5432922544, FINDING_1): раньше точечное
+    # чтение пропускалось для документов, у чьего ЛОКАЛЬНОГО заказа
+    # created_at старше cutoff — расчёт был на то, что документ не может
+    # появиться в МойСкладе раньше заказа, который его породил. Это не
+    # доказывает обратного: заказ, заведённый локально год назад, может быть
+    # отправлен в МойСклад только сегодня, и его свежий remote-документ
+    # обязан попасть в текущее окно — created_at заказа тут ни при чём,
+    # проверять нужно ВСЕ отсутствующие привязанные документы без исключения
+    # по локальной дате.
+    #
+    # Включение решает не факт восстановления, а MOMENT самого восстановленного
+    # документа относительно того же cutoff, что у списка: moment внутри
+    # окна — документ дописывается в `docs` и идёт в пересборку наравне со
+    # всеми; moment честно старше cutoff — документ подтверждённо существует,
+    # но вне окна синка, и не воскрешается (то же исключение, что уже
+    # применяется к списку). Отсутствующий или нераспознаваемый moment не
+    # угадывается в ту или другую сторону — это тот же «не знаю», что и
+    # сетевая ошибка ниже.
+    #
+    # FINDING_2: раньше ambiguous-исход (сетевая ошибка ИЛИ нераспознаваемый
+    # moment) ловился и функция просто возвращалась — внешний _run_sync не
+    # видел исключения и доводил синк до state=done с обновлённым
+    # last_sync_at, как будто входящие документы синхронизированы успешно.
+    # Теперь ambiguous-исход поднимает исключение дальше по стеку — тем же
+    # путём, что уже сегодня работает для сбоя самого списка
+    # (fetch_purchase_orders выше ничем не оборачивается) — и `_thread_main`
+    # фиксирует state=error, не вызывая _activate_connection/last_sync_at.
+    # Пересборка ниже к этому моменту ещё не началась (частичной перезаписи
+    # не бывает — либо пересборка целиком на подтверждённых данных, либо не
+    # начинается), поэтому ms_qty/ms_qty_tracked остаются прежними, и чистый
+    # повторный синк проходит обычным путём до done.
+    #
+    # Round 4 (BLOCKED issuecomment-5433247516, discussion_r3868006778):
+    # логика выше проверяет ВСЕ отсутствующие привязанные документы без
+    # исключения по локальной дате — но без памяти между синками это же
+    # самое «без исключения» означает, что действительно старый заказ (вне
+    # INCOMING_ORDERS_DAYS) или документ, чьё 404 уже подтверждено, ловил бы
+    # точечный GET на КАЖДОМ синке НАВСЕГДА. На долгоживущей организации это
+    # неограниченно растущее число сериализованных rate-limited вызовов
+    # МойСклада, не связанных с годовым окном синка.
+    #
+    # Решение — persistent per-order исход (ProductionOrder.ms_reconcile_state
+    # /ms_reconcile_href, см. models.py): 'absent' или 'excluded' по ТОЙ ЖЕ
+    # ссылке пропускает точечную проверку без сети. Это НЕ ослабляет round 3:
+    # ambiguous-исход (сетевая/HTTP ошибка, нераспознаваемый moment) по-прежнему
+    # НИЧЕГО не пишет в тумбстоун — следующий синк обязан проверить заново, а
+    # не унаследовать неопределённость как решённую. Смена ms_doc_href (заказ
+    # пересвязан на другой документ) тоже обнуляет актуальность кэша: тумбстоун
+    # сверяется с ТЕКУЩИМ href, а не только с order_id. А если ссылка внезапно
+    # снова видна в свежем списке при ранее тумбстонутом 'absent' (документ
+    # восстановили) — тумбстоун здесь же снимается, чтобы будущее исчезновение
+    # той же ссылки не унаследовало устаревший вердикт по молчанию.
+    def _doc_ref(d: dict) -> str:
+        href = ((d.get("meta") or {}).get("href")) or ""
+        return _href_id(href) or href
+
+    present_refs = {_doc_ref(d) for d in docs}
+    for order_id, href in our_docs.items():
+        if not ms_writeback.is_pushed(href):
+            continue  # "pending:"/"unknown:" — служебная пометка, не документ
+        ref = _href_id(href) or href
+        if not ref:
+            continue
+        cached_state, cached_href = reconcile_cache.get(order_id, ("", ""))
+        if ref in present_refs:
+            if cached_state and cached_href == href:
+                _set_order_reconcile(order_id, "", "")
+            continue
+        if cached_state in ("absent", "excluded") and cached_href == href:
+            # Уже проверено точечным чтением РАНЕЕ для ЭТОЙ ЖЕ ссылки —
+            # доверяем сохранённому вердикту без нового сетевого вызова.
+            stats["incoming_reconcile_skipped_cached"] = stats.get(
+                "incoming_reconcile_skipped_cached", 0) + 1
+            continue
+        try:
+            recovered = await client.fetch_purchase_order_by_id(ref)
+        except (httpx.HTTPStatusError, *TRANSPORT_ERRORS):
+            stats["incoming_reconcile_ambiguous"] = stats.get(
+                "incoming_reconcile_ambiguous", 0) + 1
+            _persist(org_id, stats)
+            raise
+        if recovered is None:
+            stats["incoming_reconcile_confirmed_absent"] = stats.get(
+                "incoming_reconcile_confirmed_absent", 0) + 1
+            _set_order_reconcile(order_id, "absent", href)
+            continue
+        moment_day = str(recovered.get("moment") or "")[:10]
+        try:
+            date.fromisoformat(moment_day)
+        except ValueError:
+            moment_day = ""
+        if not moment_day:
+            stats["incoming_reconcile_ambiguous"] = stats.get(
+                "incoming_reconcile_ambiguous", 0) + 1
+            _persist(org_id, stats)
+            raise RuntimeError(
+                "«Едет к нам»: точечная проверка вернула документ без "
+                "распознаваемой даты (moment) — пересборка остановлена, "
+                "угадывать нельзя")
+        if moment_day < cutoff:
+            # Документ подтверждённо существует, но его собственный remote
+            # moment честно вне окна синка — не воскрешаем.
+            stats["incoming_reconcile_recovered_excluded"] = stats.get(
+                "incoming_reconcile_recovered_excluded", 0) + 1
+            _set_order_reconcile(order_id, "excluded", href)
+            continue
+        docs.append(recovered)
+        present_refs.add(ref)
+        stats["incoming_reconcile_recovered"] = stats.get(
+            "incoming_reconcile_recovered", 0) + 1
+        if cached_state:
+            _set_order_reconcile(order_id, "", "")
 
     incoming: dict[str, float] = {}
     incoming_tracked: dict[str, float] = {}

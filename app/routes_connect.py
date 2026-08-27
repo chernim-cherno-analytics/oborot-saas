@@ -432,6 +432,36 @@ async def api_order_push_to_ms(
                 **_ms_doc_out(order),
             },
         )
+    if not ms_sync.try_acquire_incoming_lock(ctx.org.id):
+        # DATA-6 (corrective round, issuecomment-5432267185): гейт org-scoped,
+        # writer-preferring (см. ms_sync._IncomingGate) — push — «читатель»,
+        # синк — «писатель». Отказ здесь означает, что синк либо уже владеет
+        # гейтом, либо уже встал в очередь на запись (в последнем случае
+        # новые push отклоняются немедленно, даже если другие push ещё
+        # активны — иначе синк мог бы никогда не дождаться тишины). Другой
+        # ПАРАЛЛЕЛЬНЫЙ push той же организации отказом не является — гейт
+        # пускает несколько РАЗНЫХ push одновременно. Неблокирующий отказ —
+        # тот же текст 409, что и у соседних ручек при активном синке
+        # (см. api_moysklad_stores_select).
+        return JSONResponse(
+            status_code=409,
+            content={
+                "detail": "Идёт синхронизация с МойСкладом — дождитесь "
+                          "завершения и повторите отправку.",
+                **_ms_doc_out(order),
+            },
+        )
+    try:
+        return await _push_order_locked(db, ctx, order, order_id, current)
+    finally:
+        ms_sync.release_incoming_lock(ctx.org.id)
+
+
+async def _push_order_locked(
+    db: Session, ctx: AuthContext, order: ProductionOrder, order_id: int,
+    current: str,
+):
+    """Тело отправки под захваченным org-локом синка (см. DATA-6 выше)."""
     now = int(_time.time())
     # Пометка «неизвестно» повтор НЕ запирает и TTL не ждёт — это и есть
     # штатный выход из такого состояния. Повтор идёт с ТЕМ ЖЕ syncId, поэтому
