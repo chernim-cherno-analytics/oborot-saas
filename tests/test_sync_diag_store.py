@@ -41,6 +41,20 @@ member-visible /api/sync/progress).
 документ на склад, которого нет в активном наборе организации, не трогая
 сид сценария остальных наборов синка.
 
+Corrective #2 (rollout, BLOCKED issuecomment-5438529547) добавил проверку
+`_carry_stats`/`_resolve_skip_diagnostic`: если у организации уже был
+положительный `sales_docs_skipped_store` ДО появления sticky-ключа (прод
+до выпуска), owner должен увидеть его немедленно, а он обязан пережить
+carry в первый прогон новой версии.
+
+Corrective #3 (P2, discussion_r3871610382) закрывает более узкий случай
+той же природы: прерванный прогон, у которого УЖЕ был sticky (например 5),
+находит НОВОЕ положительное raw (например 8) до собственного падения —
+это evidence обязано материализоваться в sticky на carry СЛЕДУЮЩЕГО
+прогона, даже когда старый sticky уже существовал, иначе resume (не
+перечитывающий уже обработанные чанки) навсегда теряет находку упавшего
+прогона.
+
 Запуск из корня репозитория:  python tests/test_sync_diag_store.py
 """
 import json
@@ -577,6 +591,82 @@ def run_part2_rollout_carry() -> None:
     mock_api.close()
 
 
+def run_part2_fresh_evidence_overrides_sticky() -> None:
+    """Corrective #3 (P2, discussion_r3871610382): прерванный прогон находит
+    НОВОЕ положительное evidence (raw=8) ПОСЛЕ того, как sticky уже был 5.
+    Это evidence обязано материализоваться в sticky на СЛЕДУЮЩЕМ прогоне (при
+    carry), даже когда старый sticky уже существовал — иначе находка
+    упавшего прогона теряется навсегда: resume не перечитывает уже
+    обработанные чанки (тот же принцип DATA-4, что и для инкремента).
+    """
+    c = client()
+    mock_api = httpx.Client(base_url=f"http://127.0.0.1:{MOCK_PORT}", timeout=30.0)
+    all_stores = [sid for sid, _ in mock_ms.STORES]
+    org_id = register_and_connect_ms(c, "owner-f@diag.test",
+                                     "Организация F (fresh-evidence)", all_stores)
+
+    set_stats(org_id, stats_with("5"), state="done")
+
+    window_days = int(os.environ["INITIAL_WINDOW_DAYS"])
+    w_start = (date.today() - timedelta(days=window_days - 1)).isoformat()
+    SKIP_STORE = "st-ghost-test-f"
+    # Документы кладём В ОКНО (date == w_start, самый старый день окна): их
+    # считает фаза month, которая идёт ДО фазы history — раньше, чем
+    # сработает fault ниже, и раньше, чем прогон вообще может упасть.
+    mock_api.post("/__test/skip_store_doc", json={
+        "entity": "demand", "store": SKIP_STORE, "date": w_start, "count": 8,
+    })
+    mock_api.post("/__test/faults", json={"docs_429_before": w_start})
+
+    print("\n== [часть 2, fresh-evidence] Прерванный прогон находит НОВОЕ "
+          "raw=8 поверх старого sticky=5, падает ВНУТРИ фазы history ==")
+    r = c.post("/api/sync/initial")
+    check("первичная загрузка (fresh evidence) запущена", r.status_code == 200,
+          f"status={r.status_code}")
+    st_partial = wait_sync_done(c)
+    check("прогон честно упал (error)", st_partial.get("state") == "error",
+          f"state={st_partial.get('state')}")
+    saved_from = (st_partial.get("stats") or {}).get("history_loaded_from")
+    check("resume point реально сохранён (месяц/finalize-lite отработали)",
+          saved_from == w_start, f"history_loaded_from={saved_from} ожидалось {w_start}")
+    raw_partial = (st_partial.get("stats") or {}).get("sales_docs_skipped_store")
+    check("error snapshot: СВОЙ raw счётчик прерванного прогона == 8 "
+          "(найдено фазой month до падения в фазе history)",
+          raw_partial == 8, f"raw={raw_partial}")
+    check("старый sticky (5) в error snapshot ещё не тронут "
+          "(перенос происходит на carry СЛЕДУЮЩЕГО прогона)",
+          diag(st_partial) == 5, f"diagnostics={st_partial.get('diagnostics')}")
+
+    print("\n== [часть 2, fresh-evidence] Resume материализует свежие 8 "
+          "поверх старого sticky=5, не теряет находку ==")
+    mock_api.post("/__test/faults", json={"stock_delay_ms": 300})
+    mock_api.post("/__test/reset_skip_store_docs")  # чтобы resume нашёл СВОЙ raw=0
+    r = c.post("/api/sync/run")  # обычная кнопка — резюмирует через _pending_resume
+    check("резюме запущено", r.status_code == 200, f"status={r.status_code}")
+    st_start = c.get("/api/sync/status").json()
+    check("сразу после старта резюме sticky УЖЕ == 8 (carry сработал до "
+          "первого _collect_sales этого прогона)",
+          diag(st_start) == 8,
+          f"state={st_start.get('state')} diagnostics={st_start.get('diagnostics')}")
+
+    st_resumed = wait_sync_done(c)
+    mock_api.post("/__test/faults", json={})
+    check("резюме дошло до done", st_resumed.get("state") == "done",
+          f"state={st_resumed.get('state')} error={st_resumed.get('error')}")
+    check("резюме реально пошло веткой initial (resume_from)",
+          st_resumed.get("mode") == "initial", f"mode={st_resumed.get('mode')}")
+    raw_resumed = (st_resumed.get("stats") or {}).get("sales_docs_skipped_store")
+    check("СВОЙ счётчик резюмированного прогона честно 0 (документы убраны, "
+          "уже обработанные чанки НЕ перечитываются)",
+          raw_resumed == 0, f"raw={raw_resumed}")
+    check("sticky факт == 8 — свежее evidence прерванного прогона победило "
+          "старый sticky=5, а не потерялось",
+          diag(st_resumed) == 8, f"diagnostics={st_resumed.get('diagnostics')}")
+
+    c.close()
+    mock_api.close()
+
+
 def run_part3_unit_lifecycle() -> None:
     """Прямая проверка чистой функции `_apply_skip_diagnostic_lifecycle` —
     быстрое точное покрытие всей таблицы решений без сетевого прогона синка.
@@ -628,12 +718,37 @@ def run_part3_unit_lifecycle() -> None:
         check(f"malformed raw ({bad!r}) -> sticky не тронут (9)",
               s.get("sales_docs_skipped_store_unresolved") == 9, f"stats={s}")
 
+    print("\n== [часть 3] _carry_stats: свежее evidence против старого sticky ==")
+
+    c1 = _mss._carry_stats({"sales_docs_skipped_store": 8,
+                            "sales_docs_skipped_store_unresolved": 5})
+    check("fresh legacy positive (8) ПОБЕЖДАЕТ существующий sticky (5)",
+          c1.get("sales_docs_skipped_store_unresolved") == 8, f"carried={c1}")
+
+    c2 = _mss._carry_stats({"sales_docs_skipped_store": 8})
+    check("fresh legacy positive (8) бутстрапит отсутствующий sticky (rollout)",
+          c2.get("sales_docs_skipped_store_unresolved") == 8, f"carried={c2}")
+
+    for bad in (0, None, -1, True, "3", 3.5):
+        prev = {"sales_docs_skipped_store_unresolved": 5}
+        if bad is not None:
+            prev["sales_docs_skipped_store"] = bad
+        c3 = _mss._carry_stats(prev)
+        check(f"malformed/non-positive legacy ({bad!r}) НЕ подменяет sticky (5)",
+              c3.get("sales_docs_skipped_store_unresolved") == 5, f"carried={c3}")
+
+    c4 = _mss._carry_stats({"sales_docs_skipped_store": 0})
+    check("legacy==0 без sticky -> carried не содержит sticky-ключ вовсе "
+          "(не подделывает 0)",
+          "sales_docs_skipped_store_unresolved" not in c4, f"carried={c4}")
+
 
 def run() -> int:
     run_part1_schema()
     run_part2_lifecycle()
     run_part2_saved_resume_point()
     run_part2_rollout_carry()
+    run_part2_fresh_evidence_overrides_sticky()
     run_part3_unit_lifecycle()
     print(f"\nИТОГО: {len(PASS)} OK, {len(FAIL)} FAIL")
     return 1 if FAIL else 0

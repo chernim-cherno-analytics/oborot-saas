@@ -833,29 +833,46 @@ _CARRIED_STATS = ("history_loaded_from", "history_loaded_to", "resume_fp",
                   # доказывает, что старые пропуски исчезли. Раздельное имя
                   # от ephemeral-счётчика `sales_docs_skipped_store` —
                   # намеренно: последний каждый прогон честно считает заново
-                  # (см. `_collect_sales`), а sticky-факт обновляет только
-                  # `_apply_skip_diagnostic_lifecycle` в `_run_sync`.
+                  # (см. `_collect_sales`), а sticky-факт обновляют ровно два
+                  # места: `_carry_stats` — свежее положительное evidence из
+                  # ПРЕДЫДУЩЕЙ (в т.ч. упавшей) строки при старте нового
+                  # прогона (P2 discussion_r3871610382), и
+                  # `_apply_skip_diagnostic_lifecycle` — итог ТЕКУЩЕГО
+                  # прогона в финализации `_run_sync`.
                   "sales_docs_skipped_store_unresolved")
 
 
 def _carry_stats(prev_stats: dict) -> dict:
-    """`_CARRIED_STATS` keys из `prev_stats` — плюс DATA-8 rollout bootstrap
-    (BLOCKED issuecomment-5438529547).
+    """`_CARRIED_STATS` keys из `prev_stats` — плюс DATA-8 rollout/resume
+    bootstrap (BLOCKED issuecomment-5438529547, P2 discussion_r3871610382).
 
     Единственная точка, где новый прогон строит свежий `stats` с нуля из
-    прежней строки — и поэтому единственная точка, где legacy-факт обязан
-    попасть в sticky-ключ, если сам ключ ещё ни разу не был записан.
-    `get_status()`/`_resolve_skip_diagnostic` бутстрапят значение только
-    ДЛЯ ЧТЕНИЯ; без этой копии оно необратимо терялось бы уже на первом
-    `start_sync` после рассылки правки — carried-словарь заменяет собой всю
-    строку целиком, а `sales_docs_skipped_store` (ephemeral) в
-    `_CARRIED_STATS` никогда не входил и не должен.
+    прежней строки — и поэтому единственная точка, где положительное
+    evidence обязано попасть в sticky-ключ ПЕРЕД тем, как carried-словарь
+    заменит собой всю строку целиком.
+
+    Валидный ПОЛОЖИТЕЛЬНЫЙ ephemeral `sales_docs_skipped_store` из
+    ПРЕДЫДУЩЕЙ строки — это observed evidence СВЕЖЕЕ, чем что бы то ни было
+    в sticky, даже валидный положительный sticky: прерванный (упавший)
+    прогон мог найти raw=8 уже ПОСЛЕ того, как sticky был 5 (частично
+    обработал историю, `_collect_sales` накопил счётчик, потом упал на
+    следующем чанке) — 8 обязано победить 5, иначе следующий resume
+    навсегда потеряет находку упавшего прогона: он не перечитывает уже
+    обработанные чанки (тот же принцип DATA-4, что и для обычного
+    инкремента). Именно поэтому проверка не условна на «sticky ещё не
+    записан» — она безусловна: свежий положительный legacy всегда
+    материализуется, покрывая заодно и исходный rollout-случай (сам sticky
+    ключ отсутствует вовсе).
+
+    Ноль/отсутствие/`bool`/отрицательное/строка/float в legacy ничего не
+    авторизуют и не считаются очисткой — существующий sticky (в том числе
+    malformed) при этом просто переносится как есть базовым словарём выше:
+    `_SKIP_STICKY_KEY` — часть `_CARRIED_STATS`.
     """
     carried = {k: prev_stats[k] for k in _CARRIED_STATS if k in prev_stats}
-    if _SKIP_STICKY_KEY not in prev_stats:
-        bootstrapped = _resolve_skip_diagnostic(prev_stats)
-        if bootstrapped is not None:
-            carried[_SKIP_STICKY_KEY] = bootstrapped
+    fresh_positive = _bounded_diagnostic_count(prev_stats.get(_SKIP_LEGACY_KEY))
+    if fresh_positive is not None and fresh_positive > 0:
+        carried[_SKIP_STICKY_KEY] = fresh_positive
     return carried
 
 
