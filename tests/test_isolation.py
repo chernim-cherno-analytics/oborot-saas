@@ -228,17 +228,35 @@ def iter_routes(routes):
 def id_route_inventory() -> dict:
     """{(шаблон пути, метод): маршрут} для всех маршрутов с параметром в пути.
 
-    HEAD и OPTIONS не считаются: их FastAPI и Starlette добавляют сами, своей
-    ручки за ними нет.
+    Из методов отбрасывается ровно один вид шума — HEAD, который Starlette
+    дописывает к каждому GET сам. За таким HEAD не стоит отдельной ручки: это
+    тот же обработчик, и проба GET его уже проходит.
+
+    Отбрасывать HEAD и OPTIONS безусловно, «потому что их добавляет фреймворк»,
+    нельзя. У маршрута, объявленного явно через `@router.head(...)` или
+    `@router.options(...)`, других методов нет вовсе, и такой фильтр вычёркивал
+    бы из инвентаря ВЕСЬ обработчик: §7 остался бы зелёным на арендаторской
+    ручке, которую никто не пробовал и не исключал (ревью PR #42,
+    discussion_r3879412309). Признак происхождения ровно один и он надёжен:
+    автоматический HEAD всегда идёт в паре с GET на том же маршруте, а явный
+    приходит один. OPTIONS Starlette не добавляет вовсе — preflight отвечал бы
+    CORS-middleware, которого в приложении нет и появление которого сторожит
+    §5, — поэтому любой OPTIONS в таблице объявлен руками и считается.
+
+    Маршрут, у которого GET и HEAD объявлены руками одной строкой
+    (`methods=["GET", "HEAD"]`), от автоматической пары неотличим, и HEAD у
+    него тоже отбрасывается. Потери покрытия здесь нет: обработчик один и тот
+    же, и проба GET доходит до него.
     """
     found = {}
     for route in iter_routes(oborot_app.routes):
         path = getattr(route, "path", "") or ""
         if "{" not in path:
             continue
-        for method in (getattr(route, "methods", None) or ()):
-            if method in ("HEAD", "OPTIONS"):
-                continue
+        methods = set(getattr(route, "methods", None) or ())
+        if "GET" in methods:
+            methods.discard("HEAD")
+        for method in methods:
             found[(path, method)] = route
     return found
 
