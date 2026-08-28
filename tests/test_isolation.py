@@ -34,6 +34,10 @@
      с живой таблицы маршрутов FastAPI, покрытие регистрируется самим фактом
      выполнения пробы, и каждый маршрут с параметром пути обязан быть либо
      пройден пробой, либо внесён в узкий реестр исключений с причиной.
+     Проба не принимает готовый URL: он собирается из зарегистрированного
+     шаблона и резолвится обратно в тот же маршрут — иначе шаблон и URL были
+     бы двумя источниками правды, и скопированная проба с новым шаблоном при
+     старом URL записала бы покрытие на невызванную ручку.
 
 Запуск из корня репозитория:  python tests/test_isolation.py
 """
@@ -45,6 +49,7 @@ import threading
 import time
 from datetime import date, timedelta
 from pathlib import Path
+from urllib.parse import quote
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -63,6 +68,7 @@ if DB_PATH.exists():
 
 import httpx  # noqa: E402
 import uvicorn  # noqa: E402
+from starlette.routing import Match  # noqa: E402
 
 from app.main import app as oborot_app  # noqa: E402
 
@@ -252,18 +258,67 @@ def int_path_params(route) -> list:
     return sorted(n for n in names if hints.get(n) in (int, "int"))
 
 
-def probe_foreign(c: httpx.Client, route: str, method: str, url: str,
-                  body=None) -> httpx.Response:
+def concrete_url(route: str, params: dict) -> str:
+    """Подставить значения в ЗАРЕГИСТРИРОВАННЫЙ шаблон маршрута.
+
+    URL пробе отдельной строкой не передаётся, и это не удобство, а требование.
+    Отдельная строка — второй источник правды рядом с шаблоном, и разойтись
+    они могут молча: скопированная проба, у которой шаблон поменяли на новый
+    маршрут, а URL оставили от соседнего, уходит на СТАРЫЙ endpoint, честно
+    получает 403/404 и регистрирует покрытие на маршрут, который никто не
+    вызывал. Тогда §7 зеленеет на непроверенной ручке — то есть сторож полноты
+    даёт ровно ту ложную уверенность, ради устранения которой заведён
+    (ревью PR #42, discussion_r3879252953). Здесь URL — функция от шаблона,
+    и разъехаться им негде.
+    """
+    url = route
+    for name, value in params.items():
+        url = url.replace("{" + name + "}", quote(str(value), safe=""))
+    return url
+
+
+def probe_foreign(c: httpx.Client, route: str, method: str, params: dict,
+                  body=None):
     """Дёрнуть чужой объект по идентификатору — и этим же зарегистрировать обход.
 
-    Покрытие записывается здесь, побочным продуктом исполнения: «маршрут
-    пройден» и «маршрут числится пройденным» — одно событие, и разъехаться им
-    негде. Приговор fail-closed: только 403 или 404. 2xx — утечка, 5xx — тоже
-    дефект (чужой объект долетел до кода и упал уже внутри).
+    Покрытие записывается здесь, побочным продуктом исполнения, и только после
+    того, как запрос фактически ушёл: «маршрут пройден» и «маршрут числится
+    пройденным» — одно событие. Приговор fail-closed: только 403 или 404.
+    2xx — утечка, 5xx — тоже дефект (чужой объект долетел до кода и упал уже
+    внутри).
+
+    Перед регистрацией покрытия проверяется ещё и обратное направление:
+    собранный URL резолвится по живой таблице маршрутов и обязан попасть
+    ровно в тот же маршрут, под которым покрытие записывается. Одной сборки
+    URL из шаблона для этого мало — шаблон, которого в приложении нет вовсе,
+    так бы не поймался.
     """
-    PROBED_ID_ROUTES.add((route, method))
+    names = set(re.findall(r"\{([^}:]+)", route))
+    if set(params) != names:
+        check(f"{method} {route}: параметры пробы отвечают шаблону маршрута",
+              False, f"в шаблоне {sorted(names)}, в пробе {sorted(params)}")
+        return None
+    absent = sorted(n for n, v in params.items() if v is None)
+    if absent:
+        # Проба не выполнена — покрытия нет. Регистрировать его тут было бы
+        # враньём, поэтому §7 назовёт маршрут непокрытым, а заметка объяснит.
+        NOTES.append(f"{method} {route}: не с чем проверять (нет объекта в B: {absent})")
+        return None
+
+    url = concrete_url(route, params)
+    target = id_route_inventory().get((route, method))
+    scope = {"type": "http", "method": method, "path": url,
+             "path_params": {}, "root_path": "", "headers": []}
+    if target is None or target.matches(scope)[0] is not Match.FULL:
+        check(f"{method} {route}: собранный URL ведёт ровно в этот маршрут",
+              False,
+              f"url={url}; маршрута в таблице приложения "
+              f"{'нет' if target is None else 'не достигает этот URL'}")
+        return None
+
     r = (c.request(method, url, json=body) if body is not None
          else c.request(method, url))
+    PROBED_ID_ROUTES.add((route, method))
     check(f"{method} {route} из чужой организации отклонён",
           r.status_code in (403, 404), f"status={r.status_code} {r.text[:100]}")
     return r
@@ -397,36 +452,34 @@ def run_all() -> None:
 
     # ── 1. Прямой доступ по чужому идентификатору ────────────────────────────
     print("\n== 1. Чужой идентификатор в пути: ожидаем 403/404, никогда 200 и никогда 5xx ==")
-    # Шаблон маршрута в первом столбце — не подпись для человека, а ключ, по
-    # которому §7 сверяет обход с таблицей маршрутов приложения. Он обязан
-    # совпадать с зарегистрированным путём буква в букву, иначе сторож полноты
-    # честно скажет, что такого маршрута нет.
+    # Первый столбец — ЗАРЕГИСТРИРОВАННЫЙ шаблон маршрута, третий — значения
+    # его параметров. Готового URL здесь нет намеренно: его собирает из шаблона
+    # сам `probe_foreign` и проверяет, что собранное резолвится обратно в этот
+    # же маршрут. Иначе шаблон и URL — два источника правды, и скопированная
+    # проба с новым шаблоном и старым URL зарегистрировала бы покрытие на
+    # ручку, которую никто не вызывал.
     receipts_before = receipt_counts(org_a, org_b)
     cases = [
-        ("/api/orders/{order_id}",                "GET",    f"/api/orders/{order_b}", None),
-        ("/api/orders/{order_id}/status",         "POST",   f"/api/orders/{order_b}/status", {"status": "sent"}),
-        ("/api/orders/{order_id}",                "DELETE", f"/api/orders/{order_b}", None),
-        ("/api/orders/{order_id}/ms-doc",         "GET",    f"/api/orders/{order_b}/ms-doc", None),
-        ("/api/orders/{order_id}/push-to-ms",     "POST",   f"/api/orders/{order_b}/push-to-ms", {}),
-        ("/api/orders/{order_id}/receipts",       "GET",    f"/api/orders/{order_b}/receipts", None),
-        ("/api/orders/{order_id}/receipts",       "POST",   f"/api/orders/{order_b}/receipts",
+        ("/api/orders/{order_id}",                "GET",    {"order_id": order_b}, None),
+        ("/api/orders/{order_id}/status",         "POST",   {"order_id": order_b}, {"status": "sent"}),
+        ("/api/orders/{order_id}",                "DELETE", {"order_id": order_b}, None),
+        ("/api/orders/{order_id}/ms-doc",         "GET",    {"order_id": order_b}, None),
+        ("/api/orders/{order_id}/push-to-ms",     "POST",   {"order_id": order_b}, {}),
+        ("/api/orders/{order_id}/receipts",       "GET",    {"order_id": order_b}, None),
+        ("/api/orders/{order_id}/receipts",       "POST",   {"order_id": order_b},
          {"lines": [{"base_name": INTRUSION, "qty": 7}]}),
-        ("/api/order-plan/{plan_id}/outcome",     "GET",    f"/api/order-plan/{plan_b}/outcome", None),
-        ("/api/order-plan/{plan_id}/brief",       "GET",    f"/api/order-plan/{plan_b}/brief", None),
-        ("/api/warehouses/{warehouse_id}/toggle", "POST",   f"/api/warehouses/{wh_b}/toggle", {"active": False}),
-        ("/api/productions/{pid}",                "POST",   f"/api/productions/{prod_b}", {"name": "Захвачено"}),
-        ("/api/productions/{pid}",                "DELETE", f"/api/productions/{prod_b}", None),
-        ("/api/productions/{pid}/setup",          "POST",   f"/api/productions/{prod_b}/setup", {"preset": "turnkey"}),
+        ("/api/order-plan/{plan_id}/outcome",     "GET",    {"plan_id": plan_b}, None),
+        ("/api/order-plan/{plan_id}/brief",       "GET",    {"plan_id": plan_b}, None),
+        ("/api/warehouses/{warehouse_id}/toggle", "POST",   {"warehouse_id": wh_b}, {"active": False}),
+        ("/api/productions/{pid}",                "POST",   {"pid": prod_b}, {"name": "Захвачено"}),
+        ("/api/productions/{pid}",                "DELETE", {"pid": prod_b}, None),
+        ("/api/productions/{pid}/setup",          "POST",   {"pid": prod_b}, {"preset": "turnkey"}),
     ]
     answers = {}
-    for route, method, url, body in cases:
-        if "None" in url:
-            # Проба не выполнена — значит и покрытия нет. Регистрировать его
-            # тут было бы враньём, поэтому §7 такой маршрут назовёт непокрытым,
-            # а заметка объяснит, почему.
-            NOTES.append(f"{method} {route}: не с чем проверять (нет объекта в B)")
-            continue
-        answers[(route, method)] = probe_foreign(a, route, method, url, body)
+    for route, method, params, body in cases:
+        r = probe_foreign(a, route, method, params, body)
+        if r is not None:
+            answers[(route, method)] = r
 
     # ── 1а. Отказ не должен ни раскрывать, ни менять ─────────────────────────
     # Один только код ответа доказывает меньше, чем кажется: 404 с чужими
@@ -563,9 +616,8 @@ def run_all() -> None:
     # Чужой план заказа нельзя применить. План организации B создан в
     # подготовке — он же цель проб outcome и brief в §1, и проба идёт через
     # общий helper, чтобы маршрут `apply` числился пройденным у сторожа §7.
-    if plan_b:
-        probe_foreign(a, "/api/order-plan/{plan_id}/apply", "POST",
-                      f"/api/order-plan/{plan_b}/apply", {"name": "Чужой план"})
+    probe_foreign(a, "/api/order-plan/{plan_id}/apply", "POST",
+                  {"plan_id": plan_b}, {"name": "Чужой план"})
 
     # ── 5. Сторож CSRF ───────────────────────────────────────────────────────
     print("\n== 5. Сторож: защита изменяющих запросов держится на отсутствии CORS ==")
