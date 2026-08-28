@@ -261,6 +261,31 @@ def id_route_inventory() -> dict:
     return found
 
 
+def dispatch_route(scope: dict):
+    """Какой маршрут ФАКТИЧЕСКИ обработает запрос — по порядку, как роутер.
+
+    Starlette перебирает маршруты в порядке регистрации и отдаёт запрос
+    ПЕРВОМУ, совпавшему целиком. Поэтому спросить `target.matches(scope)` мало:
+    это вопрос «может ли ЭТОТ маршрут принять URL», а не «кто его примет».
+    Два шаблона способны совпасть с одним concrete URL — у FastAPI аннотация
+    `int` в сигнатуре в регулярное выражение пути не попадает, и
+    `/api/x/{order_id}` и `/api/x/{other}` компилируются в одно и то же
+    `[^/]+`; литеральный `/api/orders/open` тоже перекрывает
+    `/api/orders/{order_id}`. Тогда запрос уходит в маршрут, объявленный
+    раньше, а покрытие записалось бы на тот, который никто не вызывал
+    (ревью PR #42, discussion_r3879544096). Возвращается ровно тот объект
+    маршрута, который выберет роутер, — сравнивать с целью нужно по
+    идентичности, а не по совпадению пути.
+    """
+    for route in iter_routes(oborot_app.routes):
+        matches = getattr(route, "matches", None)
+        if matches is None:
+            continue
+        if matches(scope)[0] is Match.FULL:
+            return route
+    return None
+
+
 def int_path_params(route) -> list:
     """Параметры пути маршрута, объявленные целым числом.
 
@@ -306,10 +331,14 @@ def probe_foreign(c: httpx.Client, route: str, method: str, params: dict,
     внутри).
 
     Перед регистрацией покрытия проверяется ещё и обратное направление:
-    собранный URL резолвится по живой таблице маршрутов и обязан попасть
-    ровно в тот же маршрут, под которым покрытие записывается. Одной сборки
-    URL из шаблона для этого мало — шаблон, которого в приложении нет вовсе,
-    так бы не поймался.
+    собранный URL прогоняется через РЕАЛЬНЫЙ порядок диспетчеризации, и
+    выбранный роутером маршрут обязан быть тем же самым объектом, под которым
+    покрытие записывается. Одной сборки URL из шаблона для этого мало —
+    шаблон, которого в приложении нет вовсе, так бы не поймался. Спросить
+    `target.matches(scope)` тоже мало: это проверяет, может ли цель принять
+    URL, а не то, достанется ли он ей. Совпасть с одним concrete URL способны
+    два шаблона, и тогда запрос уйдёт в объявленный раньше, а кредит достался
+    бы невызванному (ревью PR #42, discussion_r3879544096).
     """
     names = set(re.findall(r"\{([^}:]+)", route))
     if set(params) != names:
@@ -327,11 +356,19 @@ def probe_foreign(c: httpx.Client, route: str, method: str, params: dict,
     target = id_route_inventory().get((route, method))
     scope = {"type": "http", "method": method, "path": url,
              "path_params": {}, "root_path": "", "headers": []}
-    if target is None or target.matches(scope)[0] is not Match.FULL:
-        check(f"{method} {route}: собранный URL ведёт ровно в этот маршрут",
-              False,
-              f"url={url}; маршрута в таблице приложения "
-              f"{'нет' if target is None else 'не достигает этот URL'}")
+    chosen = dispatch_route(scope)
+    if target is None or chosen is not target:
+        if target is None:
+            why = "такого шаблона с таким методом нет в таблице приложения"
+        elif chosen is None:
+            why = "этот URL не принимает ни один маршрут приложения"
+        else:
+            why = (f"запрос достанется другому маршруту: "
+                   f"{sorted(getattr(chosen, 'methods', None) or ())} "
+                   f"{getattr(chosen, 'path', '?')} — он объявлен раньше и "
+                   f"перекрывает цель на этом URL")
+        check(f"{method} {route}: запрос по собранному URL достаётся именно "
+              f"этому маршруту", False, f"url={url}; {why}")
         return None
 
     r = (c.request(method, url, json=body) if body is not None
