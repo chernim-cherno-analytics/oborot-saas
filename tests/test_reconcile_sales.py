@@ -39,6 +39,7 @@ import hashlib
 import importlib.util  # noqa: F401 — оставлено намеренно: см. load_tool ниже
 import io
 import json
+import math
 import os
 import shutil
 import socket
@@ -761,35 +762,118 @@ def test_sales_monthly_summary_guard():
 
 
 def test_tolerance_cannot_hide():
-    """Допуск обязан оставаться узким: это сторож, а не лазейка."""
-    check("денежный допуск не шире копейки", rc.MONEY_TOLERANCE <= 0.01,
-          str(rc.MONEY_TOLERANCE))
-    check("допуск по штукам не шире 1e-6", rc.QTY_TOLERANCE <= 1e-6, str(rc.QTY_TOLERANCE))
-    check("относительный допуск не шире 1e-9", rc.RELATIVE_TOLERANCE <= 1e-9,
-          str(rc.RELATIVE_TOLERANCE))
+    """Допуск обязан оставаться узким: это сторож, а не лазейка.
 
-    # Ровно копейка как ГРАНИЦА не проверяется намеренно: 0,01 в double не
-    # представимо точно, и `100.01 − 100.0` даёт чуть больше копейки, а
-    # `0.01 − 0.0` — ровно её. Утверждать поведение «на границе» значило бы
-    # закреплять артефакт представления, а не правило. Закрепляется то, что
-    # правилом действительно является: заметно меньше копейки — прощается,
-    # копейка и больше — нет.
-    forgiven = (0.0, 1e-9, 1e-6, 0.001, 0.009)
-    rejected = (0.02, 0.5, 1.0, 500.0)
-    check("шум заметно меньше копейки прощается на любом масштабе",
-          all(rc._agrees(value + diff, value, rc.MONEY_TOLERANCE)
-              for value in (0.0, 100.0, 1e5, 1e7) for diff in forgiven))
-    check("две копейки и больше не прощаются ни на каком масштабе",
-          all(not rc._agrees(value + diff, value, rc.MONEY_TOLERANCE)
-              for value in (0.0, 100.0, 1e5, 1e7) for diff in rejected))
-    check("на сумме в 10 млн допуск остаётся копейкой",
-          rc._tolerance(1e7, 1e7, rc.MONEY_TOLERANCE) == 0.01,
-          str(rc._tolerance(1e7, 1e7, rc.MONEY_TOLERANCE)))
-    check("рубль на сумме в 10 млн не прощается",
-          rc._agrees(1e7 + 1.0, 1e7, rc.MONEY_TOLERANCE) is False)
+    Регрессия на найденный ревью дефект (discussion_r3877349893 и
+    r3877357949): прежняя ОТНОСИТЕЛЬНАЯ добавка росла вместе с оборотом и на
+    25 млн прощала две копейки, на миллиарде — полтинник, хотя документация
+    обещала «не больше копейки». Теперь допуск абсолютный и ограничен сверху.
+    """
+    check("денежный потолок не шире копейки", rc.MONEY_TOLERANCE <= 0.01,
+          str(rc.MONEY_TOLERANCE))
+    check("потолок по штукам не шире 1e-6", rc.QTY_TOLERANCE <= 1e-6, str(rc.QTY_TOLERANCE))
+    check("относительного допуска больше нет вовсе",
+          not hasattr(rc, "RELATIVE_TOLERANCE"))
+
+    # Именно тот масштаб и то расхождение, которые ревью назвало поимённо.
+    check("25 000 000 против 25 000 000.02 — расхождение, а не совпадение",
+          rc._agrees(25_000_000.02, 25_000_000.0, rc.MONEY_TOLERANCE) is False)
+    check("на 25 млн допуск меньше двух копеек",
+          rc._tolerance(25_000_000.0, 25_000_000.02, rc.MONEY_TOLERANCE) < 0.02,
+          str(rc._tolerance(25_000_000.0, 25_000_000.02, rc.MONEY_TOLERANCE)))
+    check("на миллиарде полтинник не прощается",
+          rc._agrees(1_000_000_000.5, 1_000_000_000.0, rc.MONEY_TOLERANCE) is False)
+
+    magnitudes = (0.0, 100.0, 1e5, 1e7, 25_000_000.0, 1e9, 1e12)
+    check("допуск НИКОГДА не превышает документированный потолок",
+          all(rc._tolerance(value, value, rc.MONEY_TOLERANCE) <= rc.MONEY_TOLERANCE
+              for value in magnitudes),
+          str([(v, rc._tolerance(v, v, rc.MONEY_TOLERANCE)) for v in magnitudes]))
+    check("две копейки не прощаются ни на одном из масштабов",
+          all(not rc._agrees(value + 0.02, value, rc.MONEY_TOLERANCE)
+              for value in magnitudes),
+          str([v for v in magnitudes if rc._agrees(v + 0.02, v, rc.MONEY_TOLERANCE)]))
     check("материальная разница не прощается ни на каком масштабе",
           all(rc._agrees(value * 1.0001, value, rc.MONEY_TOLERANCE) is False
               for value in (1e3, 1e5, 1e7, 1e9)))
+
+    # Ради чего допуск вообще существует: два ПРАВИЛЬНЫХ сложения одних и тех
+    # же слагаемых в разном порядке. Проверяется не рассуждением, а сложением.
+    parts = [round(7.77 + i * 0.13, 2) for i in range(5000)]
+    forward = 0.0
+    for part in parts:
+        forward += part
+    backward = 0.0
+    for part in reversed(parts):
+        backward += part
+    check("реальный шум сложения 5000 слагаемых прощается",
+          rc._agrees(forward, backward, rc.MONEY_TOLERANCE),
+          f"разница {abs(forward - backward)!r}")
+    check("и этот шум на порядки меньше копейки",
+          abs(forward - backward) < 0.001, str(abs(forward - backward)))
+    check("шум в несколько шагов float прощается на любом масштабе",
+          all(rc._agrees(value + math.ulp(value) * 10, value, rc.MONEY_TOLERANCE)
+              for value in (100.0, 1e5, 1e7, 25_000_000.0, 1e9)))
+
+
+def test_non_finite_reference():
+    """NaN, Infinity и переполнение — эталон непригоден, а не «ноль».
+
+    Регрессия на discussion_r3877212862. `json.loads` принимает литералы
+    `NaN`/`Infinity`, а `1e309` превращает в бесконечность; огромное целое
+    роняло `float()` с `OverflowError` мимо обработчика — трассировкой вместо
+    обещанного кода 1.
+    """
+    for label, value in (("NaN", float("nan")), ("Infinity", float("inf")),
+                         ("-Infinity", float("-inf")), ("1e309", float("1e309")),
+                         ("огромное целое", 10 ** 400)):
+        check(f"эталон с {label} отклонён",
+              raises(lambda v=value: rc._number(v, "проба"), rc.ReconcileError))
+
+    check("NaN в позиции sales-monthly — отказ закрытым",
+          raises(lambda: rc.parse_reference(
+              sales_monthly(items=sales_monthly_item(0, sale_rev=float("nan"))), MONTH),
+              rc.ReconcileError))
+    check("Infinity в summary — отказ закрытым",
+          raises(lambda: rc.parse_reference(
+              sales_monthly(summary=dict(SALES_MONTHLY_SUMMARY, sales=float("inf"))), MONTH),
+              rc.ReconcileError))
+    check("огромное целое в формате A — отказ закрытым",
+          raises(lambda: rc.parse_reference({"Худи": {"2026-05": [1, 10 ** 400]}}, MONTH),
+                 rc.ReconcileError))
+    check("Infinity в формате B — отказ закрытым",
+          raises(lambda: rc.parse_reference(
+              {"month": MONTH, "bases": {"Худи": {"net_qty": 1, "net_rev": float("inf")}}},
+              MONTH), rc.ReconcileError))
+
+    # Разбор идёт через json.loads, который эти литералы принимает молча.
+    check("литералы NaN/Infinity из настоящего JSON тоже отклоняются",
+          all(raises(lambda t=text: rc.parse_reference(json.loads(t), MONTH),
+                     rc.ReconcileError)
+              for text in ('{"Худи": {"2026-05": [1, NaN]}}',
+                           '{"Худи": {"2026-05": [1, Infinity]}}',
+                           '{"Худи": {"2026-05": [1, 1e309]}}')))
+
+    check("_agrees не считает не-числа совпадающими",
+          not rc._agrees(float("nan"), 0.0, rc.MONEY_TOLERANCE)
+          and not rc._agrees(float("inf"), float("inf"), rc.MONEY_TOLERANCE))
+
+
+def test_threshold_validation():
+    """Порог, который сам себя выключает или выворачивает, — отказ закрытым.
+
+    Регрессия на discussion_r3877212859: `nan` делал `exceeds` ложным для
+    любого расхождения, отрицательный порог — истинным даже для нулевого.
+    """
+    rep = report()
+    for bad in (float("nan"), float("inf"), float("-inf"), -0.01, -1, -1e9):
+        check(f"порог {bad!r} отклонён",
+              raises(lambda b=bad: rc.check_threshold(b), rc.ReconcileError))
+        check(f"exceeds с порогом {bad!r} не отвечает молча",
+              raises(lambda b=bad: rc.exceeds(rep, b), rc.ReconcileError))
+    check("нулевой порог по-прежнему допустим", rc.check_threshold(0) == 0.0)
+    check("положительный порог по-прежнему допустим", rc.check_threshold(500) == 500.0)
+    check("отсутствие порога по-прежнему допустимо", rc.check_threshold(None) is None)
 
 
 def test_shapes_preserved():
@@ -1014,6 +1098,50 @@ def test_cli():
             check(f"при отказе отчёт не печатается: {title}", text == "", repr(text[:80]))
 
 
+def test_cli_exit_contract():
+    """Код 2 значит РОВНО одно — подтверждённое расхождение.
+
+    Регрессия на discussion_r3877212853 и r3877212859. Штатный `argparse`
+    выходит на ошибке вызова кодом 2, а этот код здесь занят: автоматика,
+    которая по нему заводит расследование, на опечатке заводила бы его на
+    пустом месте. Негодный порог отдельной строкой: он ломает гейт в обе
+    стороны сразу.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        tmpdir = Path(tmp)
+        ref_file = write_json(tmpdir, "ref.json", REFERENCE_BY_MONTH)
+        base = ["--db", str(DB_PATH), "--org", str(ORG_ID), "--month", MONTH,
+                "--reference-file", ref_file]
+
+        misuse = {
+            "нечисловой --org": ["--db", str(DB_PATH), "--org", "не-число",
+                                 "--month", MONTH, "--reference-file", ref_file],
+            "нечисловой --top": base + ["--top", "много"],
+            "нечисловой --fail-on-delta": base + ["--fail-on-delta", "порог"],
+            "неизвестный ключ": base + ["--выдумка", "1"],
+            "нет обязательного --org": ["--db", str(DB_PATH), "--month", MONTH,
+                                        "--reference-file", ref_file],
+            "нет источника эталона": ["--db", str(DB_PATH), "--org", str(ORG_ID),
+                                      "--month", MONTH],
+            "два источника эталона": base + ["--reference-url", "https://example.invalid/x"],
+            "неизвестная база сравнения": base + ["--basis", "выдумка"],
+        }
+        for title, args in misuse.items():
+            code, text = run_cli(args)
+            check(f"ошибка вызова — код 1, а не 2: {title}",
+                  code == rc.EXIT_ERROR, f"код {code}")
+            check(f"и отчёта при этом нет: {title}", text == "", repr(text[:80]))
+
+        for bad in ("nan", "-1", "inf", "-inf"):
+            code, text = run_cli(base + ["--fail-on-delta", bad])
+            check(f"негодный порог {bad!r} — код 1, а не молчаливый 0 или 2",
+                  code == rc.EXIT_ERROR, f"код {code}")
+            check(f"и отчёта при негодном пороге нет: {bad!r}", text == "", repr(text[:80]))
+
+        code, _ = run_cli(base + ["--top", "-1"])
+        check("отрицательный --top — код 1", code == rc.EXIT_ERROR, f"код {code}")
+
+
 def test_no_persistence():
     """Инструмент ничего не сохраняет: ни рядом с собой, ни рядом с базой."""
     with tempfile.TemporaryDirectory() as tmp:
@@ -1113,7 +1241,8 @@ def _probe_number(mod) -> bool:
                   mod.ReconcileError)
 
 
-def _probe_threshold(mod) -> bool:
+def _probe_strict_threshold(mod) -> bool:
+    """Порог строгий: расхождение, равное порогу, кодом возврата не наказывается."""
     conn = mod.open_readonly(str(DB_PATH))
     try:
         rep = mod.compare(mod.load_saas_month(conn, ORG_ID, MONTH),
@@ -1146,6 +1275,34 @@ def _probe_fold(mod) -> bool:
     """Две позиции одного канонического имени складываются, а не затирают друг друга."""
     folded = mod.parse_reference(SALES_MONTHLY_FOLDED, MONTH)
     return folded["bases"]["Худи"]["gross_rev"] == 15000.0
+
+
+def _probe_absolute_tolerance(mod) -> bool:
+    """Две копейки на 25 млн — расхождение, а не совпадение."""
+    return mod._agrees(25_000_000.02, 25_000_000.0, mod.MONEY_TOLERANCE) is False
+
+
+def _probe_finite_numbers(mod) -> bool:
+    """NaN, Infinity и переполнение отвергаются как непригодный эталон."""
+    return all(raises(lambda v=value: mod._number(v, "проба"), mod.ReconcileError)
+               for value in (float("nan"), float("inf"), 10 ** 400))
+
+
+def _probe_threshold(mod) -> bool:
+    """Негодный порог отвергается, а не выключает и не выворачивает гейт."""
+    return all(raises(lambda b=bad: mod.check_threshold(b), mod.ReconcileError)
+               for bad in (float("nan"), -1))
+
+
+def _probe_argparse_exit(mod) -> bool:
+    """Ошибка вызова даёт код 1, а не занятый код 2."""
+    out = io.StringIO()
+    try:
+        code = mod.run(["--db", str(DB_PATH), "--org", "не-число", "--month", MONTH,
+                        "--reference-file", "/несуществующий.json"], stdout=out)
+    except SystemExit as exc:
+        return exc.code == mod.EXIT_ERROR
+    return code == mod.EXIT_ERROR
 
 
 def _probe_empty_month(mod) -> bool:
@@ -1189,9 +1346,8 @@ MUTATIONS = [
        "if False:", 1)],
      _probe_number),
     ("порог расхождения становится нестрогим",
-     [('return abs(report["deltas"]["net_rev"]) > float(threshold)',
-       'return abs(report["deltas"]["net_rev"]) >= float(threshold)', 1)],
-     _probe_threshold),
+     [("    return abs(delta) > value", "    return abs(delta) >= value", 1)],
+     _probe_strict_threshold),
     ("месяц без продаж отдаёт нули вместо отказа",
      [("if not total_rows:", "if False:", 1)],
      _probe_empty_month),
@@ -1214,6 +1370,23 @@ MUTATIONS = [
     ("свёртка по каноническому имени затирает вместо сложения",
      [('cur["gross_rev"] += values["sale_rev"]', 'cur["gross_rev"] = values["sale_rev"]', 1)],
      _probe_fold),
+    # Возврат к прежней относительной добавке — ровно тот дефект, который
+    # нашло ревью: на 25 млн она прощает две копейки.
+    ("допуск снова становится относительным",
+     [("    return min(absolute, SUMMATION_STEPS * math.ulp(magnitude))",
+       "    return max(absolute, magnitude * 1e-9)", 1)],
+     _probe_absolute_tolerance),
+    ("эталон снова принимает не конечные числа",
+     [("    if not math.isfinite(number):", "    if False:", 1)],
+     _probe_finite_numbers),
+    ("порог перестаёт проверяться",
+     [("    if not math.isfinite(value):", "    if False:", 1),
+      ("    if value < 0:", "    if False:", 1)],
+     _probe_threshold),
+    ("ошибка вызова снова уходит в занятый код 2",
+     [("        raise ReconcileError(f\"неверный вызов: {message}\")",
+       "        super().error(message)", 1)],
+     _probe_argparse_exit),
 ]
 
 
@@ -1261,6 +1434,8 @@ def main() -> int:
     block("== 5д. sales-monthly: битые позиции ==", test_sales_monthly_items_guard)
     block("== 5е. sales-monthly: summary против items ==", test_sales_monthly_summary_guard)
     block("== 5ж. Допуск не прячет материальную разницу ==", test_tolerance_cannot_hide)
+    block("== 5ж-1. Не конечные числа эталона ==", test_non_finite_reference)
+    block("== 5ж-2. Порог --fail-on-delta ==", test_threshold_validation)
     block("== 5з. Три формата не перехватывают друг друга ==", test_shapes_preserved)
     block("== 5и. sales-monthly целиком: классификация DATA-5 ==", test_sales_monthly_end_to_end)
     block("== 5к. Эталон: файл и сеть ==", test_reference_transport)
@@ -1268,6 +1443,7 @@ def main() -> int:
     block("== 6а. Возвраты сходятся, валовые нет ==", test_returns_reconcile_gross_diverges)
     block("== 7. Порог расхождения ==", test_exit_policy)
     block("== 7а. Командная строка ==", test_cli)
+    block("== 7а-1. Контракт кодов возврата ==", test_cli_exit_contract)
     block("== 7б. Ничего не сохраняется ==", test_no_persistence)
     block("== 8. Мутации ==", test_mutations)
 
