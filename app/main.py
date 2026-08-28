@@ -30,7 +30,7 @@ from app.routes_connect import router as connect_router
 from app.routes_extra import router as extra_router
 from app.routes_ms_app import router as ms_app_router
 from app.routes_ms_vendor import router as ms_vendor_router
-from app.db import get_db, init_db, record_migration_step
+from app.db import get_db, init_db, record_migration_step, validate_migration_step
 from app.models import Connection, Membership, Org, Product, ProductionOrder, Sale, User
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -216,15 +216,62 @@ STARTUP_SCHEMA_STEPS: tuple[tuple[str, int], ...] = (
 _STARTUP_STEP_ORDER = dict(STARTUP_SCHEMA_STEPS)
 
 
+def _validate_startup_order() -> None:
+    """Сверяет ВЕСЬ объявленный порядок с журналом до первого шага.
+
+    Сначала проверяется сам список: два одинаковых id или две одинаковые
+    позиции в `STARTUP_SCHEMA_STEPS` — ошибка объявления, и ловить её на
+    середине старта поздно. Затем каждая пара сверяется с журналом базы.
+
+    Проверка всего списка целиком, а не только очередного шага, нужна ровно
+    затем, зачем заведён замок: перестановка почти никогда не задевает один
+    шаг. Если конфликт объявлен на позиции 6, то на этой базе не должен
+    выполниться и первый шаг — иначе процесс успевает поработать по порядку,
+    который уже признан противоречивым.
+    """
+    seen_ids: set[str] = set()
+    seen_orders: set[int] = set()
+    for step_id, step_order in STARTUP_SCHEMA_STEPS:
+        if step_id in seen_ids or step_order in seen_orders:
+            raise RuntimeError(
+                f"объявление шагов старта противоречиво: {step_id!r}/{step_order} "
+                "встречается дважды в STARTUP_SCHEMA_STEPS"
+            )
+        seen_ids.add(step_id)
+        seen_orders.add(step_order)
+        validate_migration_step(step_id, step_order)
+
+
 def _record_startup_step(step_id: str) -> None:
     """Отмечает в журнале шаг старта, который ТОЛЬКО ЧТО успешно завершился.
 
     Вызывается строго после соответствующего шага: упавший шаг записи не
-    получает. Конфликт объявленного порядка с журналом базы поднимается наверх
-    и валит старт — до `scheduler.start()` дело не доходит, как и при сбое
-    любого другого шага.
+    получает.
     """
     record_migration_step(step_id, _STARTUP_STEP_ORDER[step_id])
+
+
+def _startup_step(step_id: str, run) -> None:
+    """Один шаг старта: preflight → сам шаг → запись успеха.
+
+    Порядок этих трёх действий — предмет ревью жизненного цикла 28.08.2026
+    (PR #44, discussion_r3884250490). Пока конфликт ловился только на записи,
+    fail-closed срабатывал ПОСЛЕ того, как шаг отработал: с чужим шагом на
+    позиции 1 старт падал, но `init_db()` уже успевал создать схему. Для
+    сегодняшних аддитивных шагов это безобидно, но замок заводился как раз
+    на случай переставленного НЕАДДИТИВНОГО шага — а для него «сначала
+    выполнили, потом заметили» означает, что замка нет.
+
+    Поэтому preflight стоит ПЕРЕД `run()`. Записать успех до шага нельзя по
+    той же логике с другого конца: журнал обязан говорить о том, что
+    действительно случилось.
+
+    `run` передаётся уже разрешённым значением, а не именем: тесты подменяют
+    шаги атрибутами модулей, и подмена обязана долетать.
+    """
+    validate_migration_step(step_id, _STARTUP_STEP_ORDER[step_id])
+    run()
+    _record_startup_step(step_id)
 
 
 @app.on_event("startup")
@@ -235,46 +282,41 @@ def _startup() -> None:
     # auth.check_proxy_config).
     auth.check_proxy_config()
     _check_single_process()
-    init_db()
-    _record_startup_step("init_db")
+    # Замок порядка проверяется ДО первого шага и повторно перед каждым (см.
+    # _startup_step): единственное, что при этом заводится на базе без
+    # журнала, — сама таблица журнала и её индекс.
+    _validate_startup_order()
+    _startup_step("init_db", init_db)
     # OPS-6: последняя migration-on-import. Раньше вызывалась на импорте
     # app/api.py — до старта приложения и вне защиты от гонки нескольких
     # воркеров, тем же классом дефекта, что и ms_writeback/ms_vendor ниже.
     from app import lessons as _lessons
-    _lessons.ensure_schema()
-    _record_startup_step("lessons.ensure_schema")
+    _startup_step("lessons.ensure_schema", _lessons.ensure_schema)
     from app import exclusions as _exclusions
-    _exclusions.ensure_schema()
-    _record_startup_step("exclusions.ensure_schema")
+    _startup_step("exclusions.ensure_schema", _exclusions.ensure_schema)
     # Аудит 18.08: убитый процессом синк оставался state='running' навсегда
     # и блокировал все будущие запуски организации.
     from app import ms_sync as _ms_sync
-    _ms_sync.ensure_schema()
-    _record_startup_step("ms_sync.ensure_schema")
-    _ms_sync.reset_stale_running()
-    _record_startup_step("ms_sync.reset_stale_running")
+    _startup_step("ms_sync.ensure_schema", _ms_sync.ensure_schema)
+    _startup_step("ms_sync.reset_stale_running", _ms_sync.reset_stale_running)
     # Д4 (ревью 22.08): эти две миграции раньше запускались на импорте
     # routes_connect.py / routes_ms_vendor.py — до старта приложения и вне
     # защиты от гонки нескольких воркеров (обращение к базе на импорте
     # модуля само по себе было опасно). Место — здесь, вместе с остальными
     # аддитивными миграциями.
     from app import ms_writeback as _ms_writeback
-    _ms_writeback.ensure_schema()
-    _record_startup_step("ms_writeback.ensure_schema")
+    _startup_step("ms_writeback.ensure_schema", _ms_writeback.ensure_schema)
     from app import ms_vendor as _ms_vendor
-    _ms_vendor.ensure_schema()
-    _record_startup_step("ms_vendor.ensure_schema")
+    _startup_step("ms_vendor.ensure_schema", _ms_vendor.ensure_schema)
     # D-24: orgs.paid_until + billing_requests.invoiced_at. Колонки заводим
     # всегда, сам гейт включается флагом OBOROT_SUBSCRIPTION_GATE — схема
     # должна быть готова заранее, иначе включение флага потребует деплоя.
     from app import subscription as _subscription
-    _subscription.ensure_schema()
-    _record_startup_step("subscription.ensure_schema")
+    _startup_step("subscription.ensure_schema", _subscription.ensure_schema)
     # Предпросмотр в лог: кого закроет гейт, если его включить. Читает базу,
     # ничего не меняет. Нужен ровно затем, чтобы включение флага не оказалось
     # сюрпризом — «посмотреть перед тем, как щёлкнуть».
-    _subscription.log_preview()
-    _record_startup_step("subscription.log_preview")
+    _startup_step("subscription.log_preview", _subscription.log_preview)
     global _STARTUP_DONE
     _STARTUP_DONE = True
     # OPS-6: планировщик стартует последним статементом, ПОСЛЕ того как все

@@ -54,10 +54,21 @@ TECH_DEBT OPS-5 («Миграции без журнала и порядка»): 
      первой записи НЕ переписан, и при этом все девять шагов выполнились
      снова — журнал не служит основанием их пропустить;
   8) сбой шага: упавший шаг и все последующие записи в журнал не получают;
-  9) конфликт id↔позиция и позиция↔id валит старт (fail closed), планировщик
-     не стартует, и «уже применено» вместо конфликта не выдаётся; плюс
-     ограниченная проверка гонки: четыре потока пишут один и тот же шаг —
-     ровно одна строка, ровно один True, ни одного исключения.
+  9) конфликт id↔позиция и позиция↔id валит старт (fail closed) ДО того, как
+     защищаемый шаг успел что-либо сделать: таблиц приложения не появилось,
+     `orgs` нет, ни один шаг не выполнился, планировщик не стартует, и «уже
+     применено» вместо конфликта не выдаётся. Отдельно — часовой: на место
+     шага позиции 6 подставлена функция, создающая таблицу-метку, и её
+     отсутствие доказывает, что шага НЕ БЫЛО (а не только что журнал цел).
+     Плюс ограниченная проверка гонки: четыре потока пишут один и тот же
+     шаг — ровно одна строка, ровно один True, ни одного исключения.
+
+Пункт 9 в этой форме — прямое следствие ревью жизненного цикла 28.08.2026
+(PR #44, discussion_r3884250490). Прежняя версия проверяла только неизменность
+строк журнала и потому пропускала настоящий дефект: конфликт ловился на ЗАПИСИ,
+то есть уже ПОСЛЕ того, как шаг отработал, и `init_db()` успевал создать схему
+(в синтетической базе становилось 27 таблиц). Проверка, которая не смотрит на
+схему, такой замок считает исправным.
 
 Запуск из корня репозитория: python tests/test_startup_lifecycle.py
 """
@@ -405,6 +416,19 @@ def _read_ledger(db: Path) -> list[tuple[str, int, str]]:
     return [(r[0], int(r[1]), r[2]) for r in rows]
 
 
+def _tables(db: Path) -> set[str]:
+    """Имена таблиц синтетической базы (без служебных sqlite_*)."""
+    if not db.exists():
+        return set()
+    con = sqlite3.connect(str(db))
+    try:
+        return {r[0] for r in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")
+            if not r[0].startswith("sqlite_")}
+    finally:
+        con.close()
+
+
 def _seed_ledger(db: Path, rows: list[tuple[str, int, str]]) -> None:
     """Кладёт в синтетическую базу заранее заданные строки журнала."""
     con = sqlite3.connect(str(db))
@@ -613,7 +637,62 @@ def check_ledger_conflict_fails_closed() -> None:
         rows = _read_ledger(db)
         check(f"журнал остался ровно таким, каким был до старта: {title}",
               rows == seeded, f"rows={rows} seeded={seeded}")
+        # Ревью 28.08.2026 (discussion_r3884250490): проверять неизменность
+        # строк журнала мало. Пока конфликт ловился только на ЗАПИСИ, init_db
+        # успевал создать схему до отказа — таблиц становилось 27, и `orgs`
+        # существовала. Замок обязан останавливать процесс ДО этого.
+        tables = _tables(db)
+        check(f"конфликт не дал создать таблицы приложения: {title}",
+              tables <= {"migration_ledger"}, f"tables={sorted(tables)}")
+        check(f"таблицы orgs после отказа не появилось: {title}",
+              "orgs" not in tables, f"tables={sorted(tables)}")
+        check(f"ни один шаг старта не выполнился при конфликте: {title}",
+              not [st for st in order if st in STEPS], f"order={order}")
         _purge_db(name)
+
+
+def check_ledger_conflict_blocks_mutation() -> None:
+    """Проверка 9в: защищаемый шаг НЕ выполняется, если его пара конфликтует.
+
+    Прямое следствие ревью жизненного цикла 28.08.2026 (PR #44,
+    discussion_r3884250490). Проверяется не «журнал не изменился», а то, что
+    шага НЕ БЫЛО: на его место подставлен часовой — функция, которая создаёт
+    таблицу `sentinel_ops5_must_not_exist`. Если конфликт останавливает
+    процесс слишком поздно, часовой успеет отработать и таблица появится.
+
+    Конфликт объявлен на позиции 6 (`ms_writeback.ensure_schema`), то есть
+    в СЕРЕДИНЕ списка: раньше это был как раз тот случай, когда пять
+    предыдущих шагов уже отработали, прежде чем замок сработал.
+    """
+    db = _purge_db("test_startup_ledger_sentinel.db")
+    _seed_ledger(db, [("legacy.step", 6, "2026-01-01T00:00:00Z")])
+    extra = """
+import sqlalchemy as _sa
+import app.db as _dbm
+def _sentinel(*a, **kw):
+    order.append("SENTINEL:ms_writeback.ensure_schema")
+    with _dbm.engine.begin() as conn:
+        conn.execute(_sa.text("CREATE TABLE sentinel_ops5_must_not_exist (x INTEGER)"))
+_mswb.ensure_schema = _sentinel
+"""
+    rc, out, order = _boot(db, extra)
+    check("дочерний процесс завершился (часовой на конфликтном шаге)", rc == 0, out[-400:])
+    check("старт упал на конфликте позиции 6",
+          "RAISED MigrationLedgerConflict" in out, out[-400:])
+    tables = _tables(db)
+    check("часовой НЕ выполнился: таблицы-метки нет",
+          "sentinel_ops5_must_not_exist" not in tables, f"tables={sorted(tables)}")
+    check("часовой не отметился в порядке вызовов",
+          not any(st.startswith("SENTINEL:") for st in order), f"order={order}")
+    check("конфликт на позиции 6 не дал выполниться и предыдущим шагам",
+          not [st for st in order if st in STEPS], f"order={order}")
+    check("таблиц приложения не создано (конфликт на позиции 6)",
+          tables <= {"migration_ledger"}, f"tables={sorted(tables)}")
+    check("журнал не пополнился ни одной строкой",
+          _read_ledger(db) == [("legacy.step", 6, "2026-01-01T00:00:00Z")],
+          f"rows={_read_ledger(db)}")
+    check("планировщик не стартовал", "SCHEDULER_START_CALLED False" in out, out[-300:])
+    _purge_db("test_startup_ledger_sentinel.db")
 
 
 def check_ledger_helper_contract() -> None:
@@ -779,6 +858,9 @@ def main() -> int:
 
     print("\n== OPS-5: конфликт порядка валит старт (fail closed) ==")
     check_ledger_conflict_fails_closed()
+
+    print("\n== OPS-5: конфликтный шаг не успевает тронуть базу ==")
+    check_ledger_conflict_blocks_mutation()
 
     print("\n== OPS-5: контракт помощника журнала и ограниченная гонка ==")
     check_ledger_helper_contract()
