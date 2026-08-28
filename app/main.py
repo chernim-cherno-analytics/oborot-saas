@@ -30,7 +30,7 @@ from app.routes_connect import router as connect_router
 from app.routes_extra import router as extra_router
 from app.routes_ms_app import router as ms_app_router
 from app.routes_ms_vendor import router as ms_vendor_router
-from app.db import get_db, init_db
+from app.db import get_db, init_db, record_migration_step
 from app.models import Connection, Membership, Org, Product, ProductionOrder, Sale, User
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -189,6 +189,44 @@ def _check_single_process() -> None:
         )
 
 
+# ── OPS-5: объявленный порядок шагов старта ──────────────────────────────────
+#
+# Единственное место, где порядок шагов старта записан как данные, а не как
+# порядок строк кода. Сам код ниже не изменился: те же девять вызовов, в том же
+# порядке, с теми же ленивыми импортами — таблица не исполняет шаги, а даёт им
+# стабильный идентификатор и позицию для журнала (app/db.record_migration_step).
+#
+# Список APPEND-ONLY. Новая миграция дописывается В КОНЕЦ с новым id и новой
+# позицией; менять id или позицию уже выпущенного шага нельзя — на базах, где
+# он записан, старт после такой правки упадёт с MigrationLedgerConflict, и это
+# не дефект, а тот самый замок (AGENTS.md §1: «только новая миграция сверху»).
+# Если смысл шага изменился настолько, что прежнее свидетельство больше не
+# годится, заводится НОВЫЙ шаг с новым id, а старая строка остаётся как есть.
+STARTUP_SCHEMA_STEPS: tuple[tuple[str, int], ...] = (
+    ("init_db", 1),
+    ("lessons.ensure_schema", 2),
+    ("exclusions.ensure_schema", 3),
+    ("ms_sync.ensure_schema", 4),
+    ("ms_sync.reset_stale_running", 5),
+    ("ms_writeback.ensure_schema", 6),
+    ("ms_vendor.ensure_schema", 7),
+    ("subscription.ensure_schema", 8),
+    ("subscription.log_preview", 9),
+)
+_STARTUP_STEP_ORDER = dict(STARTUP_SCHEMA_STEPS)
+
+
+def _record_startup_step(step_id: str) -> None:
+    """Отмечает в журнале шаг старта, который ТОЛЬКО ЧТО успешно завершился.
+
+    Вызывается строго после соответствующего шага: упавший шаг записи не
+    получает. Конфликт объявленного порядка с журналом базы поднимается наверх
+    и валит старт — до `scheduler.start()` дело не доходит, как и при сбое
+    любого другого шага.
+    """
+    record_migration_step(step_id, _STARTUP_STEP_ORDER[step_id])
+
+
 @app.on_event("startup")
 def _startup() -> None:
     # Fail-fast, пока сервис ещё не принял ни одного запроса: в проде
@@ -198,18 +236,23 @@ def _startup() -> None:
     auth.check_proxy_config()
     _check_single_process()
     init_db()
+    _record_startup_step("init_db")
     # OPS-6: последняя migration-on-import. Раньше вызывалась на импорте
     # app/api.py — до старта приложения и вне защиты от гонки нескольких
     # воркеров, тем же классом дефекта, что и ms_writeback/ms_vendor ниже.
     from app import lessons as _lessons
     _lessons.ensure_schema()
+    _record_startup_step("lessons.ensure_schema")
     from app import exclusions as _exclusions
     _exclusions.ensure_schema()
+    _record_startup_step("exclusions.ensure_schema")
     # Аудит 18.08: убитый процессом синк оставался state='running' навсегда
     # и блокировал все будущие запуски организации.
     from app import ms_sync as _ms_sync
     _ms_sync.ensure_schema()
+    _record_startup_step("ms_sync.ensure_schema")
     _ms_sync.reset_stale_running()
+    _record_startup_step("ms_sync.reset_stale_running")
     # Д4 (ревью 22.08): эти две миграции раньше запускались на импорте
     # routes_connect.py / routes_ms_vendor.py — до старта приложения и вне
     # защиты от гонки нескольких воркеров (обращение к базе на импорте
@@ -217,17 +260,21 @@ def _startup() -> None:
     # аддитивными миграциями.
     from app import ms_writeback as _ms_writeback
     _ms_writeback.ensure_schema()
+    _record_startup_step("ms_writeback.ensure_schema")
     from app import ms_vendor as _ms_vendor
     _ms_vendor.ensure_schema()
+    _record_startup_step("ms_vendor.ensure_schema")
     # D-24: orgs.paid_until + billing_requests.invoiced_at. Колонки заводим
     # всегда, сам гейт включается флагом OBOROT_SUBSCRIPTION_GATE — схема
     # должна быть готова заранее, иначе включение флага потребует деплоя.
     from app import subscription as _subscription
     _subscription.ensure_schema()
+    _record_startup_step("subscription.ensure_schema")
     # Предпросмотр в лог: кого закроет гейт, если его включить. Читает базу,
     # ничего не меняет. Нужен ровно затем, чтобы включение флага не оказалось
     # сюрпризом — «посмотреть перед тем, как щёлкнуть».
     _subscription.log_preview()
+    _record_startup_step("subscription.log_preview")
     global _STARTUP_DONE
     _STARTUP_DONE = True
     # OPS-6: планировщик стартует последним статементом, ПОСЛЕ того как все

@@ -37,11 +37,36 @@ TECH_DEBT OPS-6: «Планировщик стартует до миграций
      импорте модуля;
   4) повторный shutdown безопасен (идемпотентен), в т.ч. после ASGI-цикла.
 
+TECH_DEBT OPS-5 («Миграции без журнала и порядка»): те же девять шагов теперь
+после успешного завершения пишут строку в журнал `migration_ledger`
+(`app/db.record_migration_step`) — стабильный id, числовая позиция, applied_at.
+Журнал НИЧЕГО не пропускает: шаги идемпотентны и выполняются на каждом старте
+как раньше, а таблица служит свидетельством и замком на порядок. Отсюда ещё
+пять проверок, и каждая работает на СИНТЕТИЧЕСКОЙ базе (пустой файл или
+руками собранная прежняя схема), без боевых данных:
+
+  5) чистая база: журнал содержит ровно девять объявленных шагов, позиции
+     1..9 идут по возрастанию и совпадают с фактическим порядком вызовов;
+  6) прежняя схема: (а) база старой формы, где новых колонок ещё нет, и
+     (б) уже мигрированная база, где журнала ещё нет вовсе, — приложение
+     поднимается, миграции доезжают, журнал заполняется целиком;
+  7) повторный старт идемпотентен: строк по-прежнему девять, applied_at
+     первой записи НЕ переписан, и при этом все девять шагов выполнились
+     снова — журнал не служит основанием их пропустить;
+  8) сбой шага: упавший шаг и все последующие записи в журнал не получают;
+  9) конфликт id↔позиция и позиция↔id валит старт (fail closed), планировщик
+     не стартует, и «уже применено» вместо конфликта не выдаётся; плюс
+     ограниченная проверка гонки: четыре потока пишут один и тот же шаг —
+     ровно одна строка, ровно один True, ни одного исключения.
+
 Запуск из корня репозитория: python tests/test_startup_lifecycle.py
 """
 import os
+import re
+import sqlite3
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -339,6 +364,394 @@ print("NO_EXCEPTION", True)
           "STARTED_AFTER_DOUBLE_SHUTDOWN False" in out, out[-300:])
 
 
+# ── OPS-5: журнал применённых шагов старта ───────────────────────────────────
+#
+# Объявленный порядок продублирован здесь НАМЕРЕННО: тест не импортирует
+# app.main, чтобы сверяться с той же переменной, которую проверяет. Если
+# app.main.STARTUP_SCHEMA_STEPS разойдётся с этим списком, проверка 5 упадёт —
+# ровно этого от неё и ждут.
+LEDGER_STEPS = [(name, pos) for pos, name in enumerate(STEPS, 1)]
+
+_LEDGER_DDL = (
+    "CREATE TABLE IF NOT EXISTS migration_ledger ("
+    "step_id VARCHAR(128) NOT NULL PRIMARY KEY, "
+    "step_order INTEGER NOT NULL, "
+    "applied_at VARCHAR(32) NOT NULL)"
+)
+
+
+def _purge_db(name: str) -> Path:
+    """Свежий путь синтетической базы: убирает и файл, и хвосты WAL."""
+    p = ROOT / name
+    for suffix in ("", "-wal", "-shm"):
+        f = Path(str(p) + suffix)
+        if f.exists():
+            f.unlink()
+    return p
+
+
+def _read_ledger(db: Path) -> list[tuple[str, int, str]]:
+    """Журнал синтетической базы как список (step_id, step_order, applied_at)."""
+    con = sqlite3.connect(str(db))
+    try:
+        rows = con.execute(
+            "SELECT step_id, step_order, applied_at FROM migration_ledger "
+            "ORDER BY step_order"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []                      # таблицы нет вовсе — это тоже ответ
+    finally:
+        con.close()
+    return [(r[0], int(r[1]), r[2]) for r in rows]
+
+
+def _seed_ledger(db: Path, rows: list[tuple[str, int, str]]) -> None:
+    """Кладёт в синтетическую базу заранее заданные строки журнала."""
+    con = sqlite3.connect(str(db))
+    try:
+        con.execute(_LEDGER_DDL)
+        con.executemany(
+            "INSERT INTO migration_ledger (step_id, step_order, applied_at) "
+            "VALUES (?, ?, ?)", rows)
+        con.commit()
+    finally:
+        con.close()
+
+
+_BOOT_CHILD = """
+from fastapi.testclient import TestClient
+raised = ""
+try:
+    with TestClient(m.app) as c:
+        c.get("/health/ready")
+except Exception as exc:
+    raised = type(exc).__name__ + ": " + str(exc)
+print("RAISED", raised)
+print("SCHEDULER_START_CALLED", "scheduler.start" in order)
+for step in order:
+    print("ORDER:" + step)
+"""
+
+
+def _boot(db: Path, extra: str = "") -> tuple[int, str, list[str]]:
+    """Поднимает приложение на указанной базе в отдельном процессе."""
+    code = _CHILD_PREAMBLE.format(root=str(ROOT), db=str(db)) + extra + _BOOT_CHILD
+    rc, out = _run_child(code)
+    order = [ln.split("ORDER:", 1)[1] for ln in out.splitlines() if ln.startswith("ORDER:")]
+    return rc, out, order
+
+
+def check_ledger_clean_db() -> None:
+    """Проверка 5: на чистой базе журнал содержит ровно девять объявленных шагов."""
+    db = _purge_db("test_startup_ledger_clean.db")
+    rc, out, order = _boot(db)
+    check("дочерний процесс завершился успешно (журнал, чистая база)", rc == 0, out[-400:])
+    check("старт на чистой базе не упал", "RAISED \n" in out or "RAISED\n" in out, out[-300:])
+    rows = _read_ledger(db)
+    check("журнал содержит ровно девять строк", len(rows) == 9, f"rows={rows}")
+    check("id и позиции журнала совпадают с объявленным порядком",
+          [(r[0], r[1]) for r in rows] == LEDGER_STEPS, f"rows={rows}")
+    check("позиции идут 1..9 по возрастанию без пропусков",
+          [r[1] for r in rows] == list(range(1, 10)), f"rows={rows}")
+    check("у каждой строки непустой applied_at",
+          all(r[2] and r[2].endswith("Z") for r in rows), f"rows={rows}")
+    exec_order = [st for st in order if st in STEPS]
+    check("порядок в журнале совпадает с фактическим порядком вызовов",
+          [r[0] for r in rows] == exec_order, f"ledger={[r[0] for r in rows]} exec={exec_order}")
+    check("scheduler.start вызван ПОСЛЕ последней записи в журнал",
+          order and order[-1] == "scheduler.start", f"order={order}")
+    _purge_db("test_startup_ledger_clean.db")
+
+
+def check_ledger_legacy_db() -> None:
+    """Проверка 6: база прежней схемы и база без журнала поднимаются и журналируются.
+
+    (а) синтетическая база СТАРОЙ формы — те же таблицы, что в smoke-шаге CI
+        «миграции на базе прежней схемы»: новых колонок ещё нет;
+    (б) уже мигрированная база, у которой журнала ещё нет вовсе, — это ровно
+        то, что увидит прод в момент выката: схема на месте, таблицы журнала
+        не существует.
+    """
+    # (а) прежняя схема
+    db = _purge_db("test_startup_ledger_legacy.db")
+    con = sqlite3.connect(str(db))
+    con.executescript("""
+      CREATE TABLE orgs (id INTEGER PRIMARY KEY, name VARCHAR(255) NOT NULL,
+                         plan VARCHAR(32) NOT NULL DEFAULT 'trial',
+                         settings_json TEXT NOT NULL DEFAULT '{}');
+      CREATE TABLE productions (id INTEGER PRIMARY KEY, org_id INTEGER NOT NULL,
+                         name VARCHAR(120) NOT NULL,
+                         is_main BOOLEAN NOT NULL DEFAULT 0);
+      INSERT INTO orgs (name) VALUES ('Синтетическая организация');
+      INSERT INTO productions (org_id, name, is_main) VALUES (1, 'Синтетический цех', 1);
+    """)
+    con.commit()
+    con.close()
+    check("до старта журнала на базе прежней схемы нет", _read_ledger(db) == [])
+    rc, out, order = _boot(db)
+    check("дочерний процесс завершился успешно (база прежней схемы)", rc == 0, out[-400:])
+    check("приложение поднялось на базе прежней схемы",
+          "SCHEDULER_START_CALLED True" in out, out[-300:])
+    con = sqlite3.connect(str(db))
+    cols = {r[1] for r in con.execute("PRAGMA table_info(productions)")}
+    con.close()
+    missing = {"lead_time_days", "moq", "pack_multiple", "stages_json"} - cols
+    check("аддитивные миграции доехали на базе прежней схемы (колонки на месте)",
+          not missing, f"missing={missing}")
+    check("журнал заполнен целиком на базе прежней схемы",
+          [(r[0], r[1]) for r in _read_ledger(db)] == LEDGER_STEPS,
+          f"rows={_read_ledger(db)}")
+    _purge_db("test_startup_ledger_legacy.db")
+
+    # (б) мигрированная база без журнала — что увидит прод в момент выката
+    db2 = _purge_db("test_startup_ledger_dropped.db")
+    rc, out, _ = _boot(db2)
+    check("дочерний процесс завершился успешно (подготовка базы без журнала)",
+          rc == 0, out[-400:])
+    con = sqlite3.connect(str(db2))
+    try:
+        con.execute("DROP TABLE migration_ledger")
+        con.commit()
+        dropped = ""
+    except sqlite3.OperationalError as exc:
+        dropped = str(exc)     # таблицы нет вовсе — журнал не ведётся
+    finally:
+        con.close()
+    check("журнал у подготовленной базы удалён",
+          not dropped and _read_ledger(db2) == [], dropped)
+    rc, out, order = _boot(db2)
+    check("дочерний процесс завершился успешно (база без журнала)", rc == 0, out[-400:])
+    check("приложение поднялось на мигрированной базе без журнала",
+          "SCHEDULER_START_CALLED True" in out, out[-300:])
+    check("журнал восстановлен целиком и в объявленном порядке",
+          [(r[0], r[1]) for r in _read_ledger(db2)] == LEDGER_STEPS,
+          f"rows={_read_ledger(db2)}")
+    check("все девять шагов выполнились и на базе без журнала",
+          [st for st in order if st in STEPS] == STEPS, f"order={order}")
+    _purge_db("test_startup_ledger_dropped.db")
+
+
+def check_ledger_repeat_startup() -> None:
+    """Проверка 7: повторный старт — no-op для журнала, но НЕ пропуск шагов."""
+    db = _purge_db("test_startup_ledger_repeat.db")
+    rc, out, order_first = _boot(db)
+    check("дочерний процесс завершился успешно (первый старт)", rc == 0, out[-400:])
+    first = _read_ledger(db)
+    # applied_at пишется с секундной точностью: без паузы повторная запись
+    # (если бы она случилась) могла бы совпасть по времени с первой, и
+    # проверка «время не переписано» ничего бы не доказала.
+    time.sleep(1.1)
+    rc, out, order_second = _boot(db)
+    check("дочерний процесс завершился успешно (повторный старт)", rc == 0, out[-400:])
+    second = _read_ledger(db)
+    check("повторный старт не добавил строк в журнал", len(second) == 9, f"rows={second}")
+    check("повторный старт не переписал journal (строки идентичны первым)",
+          second == first, f"first={first} second={second}")
+    check("повторный старт не изменил applied_at ни одной строки",
+          [r[2] for r in second] == [r[2] for r in first],
+          f"first={[r[2] for r in first]} second={[r[2] for r in second]}")
+    check("повторный старт ВЫПОЛНИЛ все девять шагов (журнал не повод пропускать)",
+          [st for st in order_second if st in STEPS] == STEPS, f"order={order_second}")
+    check("повторный старт довёл дело до планировщика",
+          "scheduler.start" in order_second, f"order={order_second}")
+    check("порядок шагов на повторном старте тот же, что на первом",
+          [st for st in order_second if st in STEPS] ==
+          [st for st in order_first if st in STEPS])
+    _purge_db("test_startup_ledger_repeat.db")
+
+
+def check_ledger_not_recorded_on_failure() -> None:
+    """Проверка 8: упавший шаг и все следующие за ним записи в журнал не получают."""
+    for failing_step in ("init_db", "ms_writeback.ensure_schema", "subscription.log_preview"):
+        db = _purge_db(f"test_startup_ledger_fail_{failing_step.replace('.', '_')}.db")
+        target_var = {
+            "init_db": "m.init_db",
+            "ms_writeback.ensure_schema": "_mswb.ensure_schema",
+            "subscription.log_preview": "_sub.log_preview",
+        }[failing_step]
+        extra = f"""
+def _boom(*a, **kw):
+    order.append("BOOM:{failing_step}")
+    raise RuntimeError("injected startup failure: {failing_step}")
+{target_var} = _boom
+"""
+        rc, out, order = _boot(db, extra)
+        check(f"дочерний процесс завершился (журнал, сбой в {failing_step})",
+              rc == 0, out[-400:])
+        check(f"планировщик НЕ стартовал при сбое в {failing_step} (журнал)",
+              "SCHEDULER_START_CALLED False" in out, out[-300:])
+        idx = STEPS.index(failing_step)
+        expected = [(name, pos) for name, pos in LEDGER_STEPS if pos <= idx]
+        rows = [(r[0], r[1]) for r in _read_ledger(db)]
+        check(f"в журнале ровно шаги ДО {failing_step} и ни одного после",
+              rows == expected, f"rows={rows} expected={expected}")
+        _purge_db(f"test_startup_ledger_fail_{failing_step.replace('.', '_')}.db")
+
+
+def check_ledger_conflict_fails_closed() -> None:
+    """Проверка 9: конфликт объявленного порядка и журнала валит старт.
+
+    Два направления конфликта, оба обязаны падать, а не выдаваться за
+    «уже применено»:
+      * тот же id записан на ДРУГОЙ позиции (шаг переставили);
+      * та же позиция занята ДРУГИМ id (на место шага встал чужой).
+    """
+    cases = [
+        ("id на чужой позиции", [("init_db", 99, "2026-01-01T00:00:00Z")], "init_db"),
+        ("позиция под чужим id", [("legacy.step", 1, "2026-01-01T00:00:00Z")], "legacy.step"),
+    ]
+    for idx, (title, seeded, _marker) in enumerate(cases, 1):
+        name = f"test_startup_ledger_conflict_{idx}.db"
+        db = _purge_db(name)
+        _seed_ledger(db, seeded)
+        rc, out, order = _boot(db)
+        check(f"дочерний процесс завершился ({title})", rc == 0, out[-400:])
+        check(f"старт упал на конфликте: {title}",
+              "RAISED MigrationLedgerConflict" in out, out[-400:])
+        check(f"конфликт не выдан за «уже применено» (старт не дошёл до конца): {title}",
+              "SCHEDULER_START_CALLED False" in out, out[-300:])
+        rows = _read_ledger(db)
+        check(f"журнал остался ровно таким, каким был до старта: {title}",
+              rows == seeded, f"rows={rows} seeded={seeded}")
+        _purge_db(name)
+
+
+def check_ledger_helper_contract() -> None:
+    """Проверка 9б: контракт помощника напрямую — повтор, оба конфликта, гонка.
+
+    Работает на отдельной синтетической базе и без ASGI-цикла: проверяется
+    сам `app.db.record_migration_step`, а не старт приложения. Гонка —
+    ограниченная и внутрипроцессная (четыре потока, один и тот же шаг): это
+    тот случай, который реально бывает на проде при одновременном старте
+    воркеров, и он проверяется без расширения границ пакета.
+    """
+    db = _purge_db("test_startup_ledger_helper.db")
+    code = f"""
+import os, sys, threading
+sys.path.insert(0, {str(ROOT)!r})
+os.environ["DATABASE_URL"] = "sqlite:///" + {str(db)!r}
+
+from app.db import (MigrationLedgerConflict, read_migration_ledger,
+                    record_migration_step)
+
+print("FIRST", record_migration_step("step.one", 1))
+print("REPEAT", record_migration_step("step.one", 1))
+
+try:
+    record_migration_step("step.one", 2)
+    print("CONFLICT_ID_POS none")
+except MigrationLedgerConflict:
+    print("CONFLICT_ID_POS raised")
+except Exception as exc:
+    print("CONFLICT_ID_POS wrong:" + type(exc).__name__)
+
+try:
+    record_migration_step("step.other", 1)
+    print("CONFLICT_POS_ID none")
+except MigrationLedgerConflict:
+    print("CONFLICT_POS_ID raised")
+except Exception as exc:
+    print("CONFLICT_POS_ID wrong:" + type(exc).__name__)
+
+print("ROWS_AFTER_CONFLICTS", read_migration_ledger())
+
+results, errors = [], []
+barrier = threading.Barrier(4)
+def worker():
+    barrier.wait()
+    try:
+        results.append(record_migration_step("step.concurrent", 2))
+    except Exception as exc:
+        errors.append(type(exc).__name__ + ": " + str(exc))
+threads = [threading.Thread(target=worker) for _ in range(4)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+print("CONC_TRUE", results.count(True))
+print("CONC_FALSE", results.count(False))
+print("CONC_ERRORS", errors)
+print("CONC_ROWS", read_migration_ledger())
+"""
+    rc, out = _run_child(code)
+    # Детализация — только строки-маркеры дочернего процесса: полный хвост
+    # вывода здесь печатался бы и при успехе и утопил бы отчёт.
+    marks = " | ".join(ln for ln in out.splitlines()
+                       if ln.startswith(("FIRST", "REPEAT", "CONFLICT", "CONC", "ROWS_")))
+    check("дочерний процесс завершился успешно (контракт помощника)", rc == 0, out[-400:])
+    check("первая запись шага возвращает True", "FIRST True" in out, marks)
+    check("повторная запись той же пары — no-op (False)", "REPEAT False" in out, marks)
+    check("тот же id на другой позиции — MigrationLedgerConflict",
+          "CONFLICT_ID_POS raised" in out, marks)
+    check("та же позиция под другим id — MigrationLedgerConflict",
+          "CONFLICT_POS_ID raised" in out, marks)
+    check("конфликты ничего не записали в журнал",
+          "ROWS_AFTER_CONFLICTS [('step.one', 1, " in out, marks)
+    check("гонка четырёх потоков: ровно одна запись сделана этим процессом",
+          "CONC_TRUE 1" in out, marks)
+    check("гонка четырёх потоков: три остальных получили no-op",
+          "CONC_FALSE 3" in out, marks)
+    check("гонка четырёх потоков: ни одного исключения",
+          "CONC_ERRORS []" in out, marks)
+    check("гонка четырёх потоков: в журнале ровно одна строка шага",
+          out.count("'step.concurrent', 2") == 1, marks)
+    _purge_db("test_startup_ledger_helper.db")
+
+
+def check_ledger_sql_is_portable() -> None:
+    """Проверка 10: в SQL журнала нет конструкций одного диалекта.
+
+    ЧЕСТНАЯ ГРАНИЦА: это проверка ПО КОНСТРУКЦИИ, а не прогон на живом
+    PostgreSQL — сервера и драйвера в окружении нет, а заводить их значило бы
+    новую зависимость, которой этот пакет не предусматривает. Проверяется то,
+    что проверить можно: весь SQL журнала состоит из общих для SQLite и
+    PostgreSQL конструкций, время подставляется из Python, а не из
+    `CURRENT_TIMESTAMP`/`now()` (разный формат и зона), и никакой
+    UPSERT/`ON CONFLICT`/`INSERT OR IGNORE` не маскирует конфликт под
+    «уже применено». Сторож нужен на будущее: он падает, если такую
+    конструкцию однажды впишут в помощник.
+    """
+    import app.db as db_mod
+
+    sql_sources = [db_mod._LEDGER_TABLE_DDL, db_mod._LEDGER_ORDER_INDEX_DDL]
+    src = Path(db_mod.__file__).read_text(encoding="utf-8")
+    ledger_src = src[src.index("_LEDGER_TABLE_DDL"):src.index("def init_db()")]
+    # Сканируются ВСЕ строковые литералы этого участка, а не питон вокруг них:
+    # `time.strftime` в Python переносим и как раз является правильным ответом,
+    # а `strftime(` внутри SQL — sqlite-специфика. Брать только литералы с
+    # ключевым словом нельзя: длинный запрос в коде разрезан на несколько
+    # строк, и хвост `"VALUES (...)"` тогда не проверялся бы вовсе — на этом
+    # первая версия сторожа и попалась (подмешанный `ON CONFLICT DO NOTHING`
+    # прошёл мимо).
+    sql_text = " ".join(re.findall(r'"([^"\n]*)"', ledger_src))
+
+    forbidden = [
+        "AUTOINCREMENT",          # только SQLite
+        "SERIAL",                 # только PostgreSQL
+        "ON CONFLICT",            # синтаксис расходится, и маскирует конфликт
+        "INSERT OR IGNORE",       # только SQLite, и маскирует конфликт
+        "INSERT OR REPLACE",
+        "ON DUPLICATE KEY",
+        "RETURNING",              # в SQLite появился только с 3.35
+        "CURRENT_TIMESTAMP",      # разный формат и зона
+        "PRAGMA",
+        "now()",
+        "datetime(",
+        "strftime(",              # в SQL — sqlite-специфично (в Python можно)
+    ]
+    upper = sql_text.upper()
+    hits = [f for f in forbidden if f.upper() in upper]
+    check("в SQL журнала нет диалект-специфичных конструкций",
+          not hits and sql_text, f"найдено: {hits}; sql={sql_text[:200]}")
+    check("DDL журнала использует только переносимые типы",
+          all(("VARCHAR" in q or "INTEGER" in q) for q in sql_sources[:1]),
+          f"ddl={sql_sources[0]}")
+    check("таблица и индекс журнала создаются идемпотентно (IF NOT EXISTS)",
+          all("IF NOT EXISTS" in q for q in sql_sources), f"sql={sql_sources}")
+    check("applied_at подставляется из Python, а не из SQL-функции времени",
+          "time.strftime(" in ledger_src, "")
+
+
 def main() -> int:
     print("\n== Реальный порядок старта: миграции/схемы ДО планировщика ==")
     check_order()
@@ -351,6 +764,27 @@ def main() -> int:
 
     print("\n== Повторный shutdown безопасен ==")
     check_repeated_shutdown_safe()
+
+    print("\n== OPS-5: журнал шагов старта на чистой базе ==")
+    check_ledger_clean_db()
+
+    print("\n== OPS-5: база прежней схемы и база без журнала ==")
+    check_ledger_legacy_db()
+
+    print("\n== OPS-5: повторный старт идемпотентен и шагов не пропускает ==")
+    check_ledger_repeat_startup()
+
+    print("\n== OPS-5: упавший шаг записи в журнал не получает ==")
+    check_ledger_not_recorded_on_failure()
+
+    print("\n== OPS-5: конфликт порядка валит старт (fail closed) ==")
+    check_ledger_conflict_fails_closed()
+
+    print("\n== OPS-5: контракт помощника журнала и ограниченная гонка ==")
+    check_ledger_helper_contract()
+
+    print("\n== OPS-5: переносимость SQL журнала (по конструкции) ==")
+    check_ledger_sql_is_portable()
 
     print(f"\nИТОГО: {len(PASS)} OK, {len(FAIL)} FAIL")
     return 1 if FAIL else 0
