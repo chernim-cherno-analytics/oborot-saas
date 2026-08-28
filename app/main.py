@@ -215,6 +215,19 @@ STARTUP_SCHEMA_STEPS: tuple[tuple[str, int], ...] = (
 )
 _STARTUP_STEP_ORDER = dict(STARTUP_SCHEMA_STEPS)
 
+# Курсор фактически выполненных шагов текущего старта. Обнуляется в
+# _validate_startup_order() — то есть в начале каждого прохода `_startup()`.
+_STARTUP_CURSOR = 0
+
+
+class StartupOrderViolation(RuntimeError):
+    """Фактический порядок шагов старта разошёлся с объявленным.
+
+    Отдельный тип, а не голый RuntimeError: это стоп-условие того же рода, что
+    MigrationLedgerConflict, и вызывающая сторона обязана уметь отличить его от
+    сбоя самого шага, не разбирая текст сообщения.
+    """
+
 
 def _validate_startup_order() -> None:
     """Сверяет ВЕСЬ объявленный порядок с журналом до первого шага.
@@ -229,6 +242,8 @@ def _validate_startup_order() -> None:
     выполниться и первый шаг — иначе процесс успевает поработать по порядку,
     который уже признан противоречивым.
     """
+    global _STARTUP_CURSOR
+    _STARTUP_CURSOR = 0
     seen_ids: set[str] = set()
     seen_orders: set[int] = set()
     for step_id, step_order in STARTUP_SCHEMA_STEPS:
@@ -268,10 +283,52 @@ def _startup_step(step_id: str, run) -> None:
 
     `run` передаётся уже разрешённым значением, а не именем: тесты подменяют
     шаги атрибутами модулей, и подмена обязана долетать.
+
+    Первым делом проверяется, что это ДЕЙСТВИТЕЛЬНО очередной шаг объявленного
+    списка. Это вторая претензия того же ревью (discussion_r3884257316), и она
+    про другое, чем первая: пара (id, позиция) статична и не меняется, если
+    будущая правка переставит два вызова ВМЕСТЕ с их идентификаторами. Журнал
+    в таком случае принимает все строки как уже знакомые, старт проходит
+    целиком — а миграции выполнились в другом порядке. Курсор привязывает
+    фактическую последовательность вызовов к единственному объявленному
+    порядку: шаг не на своём месте не выполняется вовсе.
     """
-    validate_migration_step(step_id, _STARTUP_STEP_ORDER[step_id])
+    global _STARTUP_CURSOR
+    if _STARTUP_CURSOR >= len(STARTUP_SCHEMA_STEPS):
+        raise StartupOrderViolation(
+            f"шаг старта {step_id!r} выполняется после того, как объявленный "
+            f"список из {len(STARTUP_SCHEMA_STEPS)} шагов уже исчерпан"
+        )
+    expected_id, expected_order = STARTUP_SCHEMA_STEPS[_STARTUP_CURSOR]
+    if step_id != expected_id:
+        raise StartupOrderViolation(
+            f"фактический порядок шагов старта разошёлся с объявленным: "
+            f"на позиции {expected_order} ожидался {expected_id!r}, "
+            f"а выполняется {step_id!r}. Порядок задаётся одним списком "
+            "STARTUP_SCHEMA_STEPS; переставлять вызовы в _startup() нельзя"
+        )
+    validate_migration_step(step_id, expected_order)
     run()
     _record_startup_step(step_id)
+    _STARTUP_CURSOR += 1
+
+
+def _finish_startup_steps() -> None:
+    """Убеждается, что выполнены ВСЕ объявленные шаги, и ни одного сверх.
+
+    Курсор ловит перестановку и лишний вызов, но сам по себе не заметил бы
+    пропуска: список, оборванный на восьмом шаге, монотонен. Эта проверка
+    закрывает разницу — и стоит она перед `scheduler.start()`, чтобы
+    планировщик не поднялся над недоделанным стартом.
+    """
+    done = _STARTUP_CURSOR
+    total = len(STARTUP_SCHEMA_STEPS)
+    if done != total:
+        missing = [sid for sid, _pos in STARTUP_SCHEMA_STEPS[done:]]
+        raise StartupOrderViolation(
+            f"выполнено {done} шагов старта из объявленных {total}; "
+            f"не выполнены: {', '.join(missing)}"
+        )
 
 
 @app.on_event("startup")
@@ -317,6 +374,8 @@ def _startup() -> None:
     # ничего не меняет. Нужен ровно затем, чтобы включение флага не оказалось
     # сюрпризом — «посмотреть перед тем, как щёлкнуть».
     _startup_step("subscription.log_preview", _subscription.log_preview)
+    # Замок на пропуск: все объявленные шаги выполнены, и ровно они.
+    _finish_startup_steps()
     global _STARTUP_DONE
     _STARTUP_DONE = True
     # OPS-6: планировщик стартует последним статементом, ПОСЛЕ того как все

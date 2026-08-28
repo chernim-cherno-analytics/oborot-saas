@@ -63,12 +63,29 @@ TECH_DEBT OPS-5 («Миграции без журнала и порядка»): 
      Плюс ограниченная проверка гонки: четыре потока пишут один и тот же
      шаг — ровно одна строка, ровно один True, ни одного исключения.
 
+ 10) сторож переносимости SQL журнала (по конструкции, не прогон на живом
+     PostgreSQL);
+ 11) фактическая последовательность вызовов привязана к объявленному списку:
+     объявленный порядок проходит целиком, два шага, переставленные ВМЕСТЕ со
+     своими id, отвергаются ДО выполнения переставленного шага, а пропуск шага
+     не даёт объявить старт завершённым.
+
 Пункт 9 в этой форме — прямое следствие ревью жизненного цикла 28.08.2026
 (PR #44, discussion_r3884250490). Прежняя версия проверяла только неизменность
 строк журнала и потому пропускала настоящий дефект: конфликт ловился на ЗАПИСИ,
 то есть уже ПОСЛЕ того, как шаг отработал, и `init_db()` успевал создать схему
 (в синтетической базе становилось 27 таблиц). Проверка, которая не смотрит на
 схему, такой замок считает исправным.
+
+Пункт 11 — следствие второй претензии того же ревью (discussion_r3884257316), и
+она про другое. Пара (id, позиция) СТАТИЧНА: если будущая правка переставит два
+вызова ВМЕСТЕ с их идентификаторами, каждая пара по-прежнему совпадёт с
+журналом, `record_migration_step` вернёт False, и старт пройдёт целиком — при
+том что миграции выполнились в другом порядке. Замок защищал бы отображение
+«id → позиция», а не ту последовательность, ради которой заведён. Проверка
+работает с контрактом `_startup_step`, а не с телом `_startup()`: тело — это и
+есть то, что может однажды переставить правка, подделывать его в тесте
+бессмысленно.
 
 Запуск из корня репозитория: python tests/test_startup_lifecycle.py
 """
@@ -777,6 +794,115 @@ print("CONC_ROWS", read_migration_ledger())
     _purge_db("test_startup_ledger_helper.db")
 
 
+def check_startup_order_is_enforced_at_runtime() -> None:
+    """Проверка 11: фактическая последовательность вызовов привязана к объявлению.
+
+    Дефект, который ловит эта проверка (ревью 28.08.2026, PR #44,
+    discussion_r3884257316). Замок на журнале сверял СТАТИЧЕСКУЮ пару
+    (id, позиция) — а она не меняется, если будущая правка переставит два
+    вызова `_startup_step` ВМЕСТЕ с их идентификаторами. Тогда каждая пара
+    по-прежнему совпадает с журналом, `record_migration_step` возвращает
+    False, старт проходит целиком — и при этом миграции выполнились в другом
+    порядке. То есть замок защищал отображение «id → позиция», а не ту
+    последовательность, ради которой заводился.
+
+    Проверяется контракт `_startup_step`, а не тело `_startup()`: тело — это
+    и есть то, что может однажды переставить будущая правка, и подделывать
+    его в тесте бессмысленно. Шаги подменены безобидными функциями-метками,
+    настоящие миграции не выполняются, база синтетическая.
+
+    Три сценария:
+      * шаги, вызванные в объявленном порядке, проходят целиком;
+      * два шага, переставленные ВМЕСТЕ со своими id, отвергаются — и
+        отвергаются ДО того, как переставленный шаг успел отработать;
+      * пропущенный шаг не даёт объявить старт завершённым.
+    """
+    db = _purge_db("test_startup_order_runtime.db")
+    code = f"""
+import os, sys
+sys.path.insert(0, {str(ROOT)!r})
+os.environ["DATABASE_URL"] = "sqlite:///" + {str(db)!r}
+os.environ["SCHEDULER_ENABLED"] = "0"
+os.environ.pop("WEB_CONCURRENCY", None)
+os.environ.pop("OBOROT_ALLOW_MULTIPROC", None)
+
+import app.main as m
+from app.db import read_migration_ledger
+
+STEPS = [sid for sid, _pos in m.STARTUP_SCHEMA_STEPS]
+ran = []
+def mk(name):
+    def _f():
+        ran.append(name)
+    return _f
+
+# 1) объявленный порядок проходит целиком
+# `_finish_startup_steps` берётся через getattr НАМЕРЕННО: на коде до этой
+# правки его нет, и RED-прогон должен показывать сам дефект (перестановка
+# принята), а не падать раньше на отсутствующем имени.
+finish = getattr(m, "_finish_startup_steps", None)
+print("HAS_FINISH_HOOK", finish is not None)
+
+m._validate_startup_order()
+for sid in STEPS:
+    m._startup_step(sid, mk(sid))
+if finish:
+    finish()
+print("DECLARED_OK", ran == STEPS)
+print("DECLARED_LEDGER", [(r[0], r[1]) for r in read_migration_ledger()] ==
+      list(m.STARTUP_SCHEMA_STEPS))
+
+# 2) перестановка ДВУХ шагов вместе с их id: пары (id, позиция) те же,
+#    журнал те же строки принимает — ловить обязана проверка порядка
+swapped = list(STEPS)
+swapped[5], swapped[6] = swapped[6], swapped[5]
+ran2 = []
+def mk2(name):
+    def _f():
+        ran2.append(name)
+    return _f
+m._validate_startup_order()
+verdict = "ACCEPTED"
+for sid in swapped:
+    try:
+        m._startup_step(sid, mk2(sid))
+    except Exception as exc:
+        verdict = "REJECTED:" + type(exc).__name__
+        break
+print("SWAP_VERDICT", verdict)
+print("SWAP_RAN", ran2)
+print("SWAP_MISPLACED_RAN", swapped[5] in ran2)
+
+# 3) пропуск шага не даёт объявить старт завершённым
+m._validate_startup_order()
+for sid in STEPS[:-1]:
+    m._startup_step(sid, mk(sid))
+if finish is None:
+    print("SKIP_VERDICT ACCEPTED")     # проверять нечем — замка нет
+else:
+    try:
+        finish()
+        print("SKIP_VERDICT ACCEPTED")
+    except Exception as exc:
+        print("SKIP_VERDICT REJECTED:" + type(exc).__name__)
+"""
+    rc, out = _run_child(code)
+    marks = " | ".join(ln for ln in out.splitlines()
+                       if ln.startswith(("HAS_FINISH", "DECLARED_", "SWAP_", "SKIP_")))
+    check("дочерний процесс завершился успешно (порядок в рантайме)", rc == 0, out[-500:])
+    check("объявленный порядок исполняется целиком и попадает в журнал",
+          "DECLARED_OK True" in out and "DECLARED_LEDGER True" in out, marks)
+    check("перестановка двух шагов вместе с их id ОТВЕРГНУТА",
+          "SWAP_VERDICT REJECTED:" in out, marks)
+    check("переставленный шаг НЕ успел выполниться",
+          "SWAP_MISPLACED_RAN False" in out, marks)
+    check("до перестановки шаги успели отработать в объявленном порядке",
+          "SWAP_RAN " in out and "SWAP_VERDICT ACCEPTED" not in out, marks)
+    check("пропуск шага не даёт объявить старт завершённым",
+          "SKIP_VERDICT REJECTED:" in out, marks)
+    _purge_db("test_startup_order_runtime.db")
+
+
 def check_ledger_sql_is_portable() -> None:
     """Проверка 10: в SQL журнала нет конструкций одного диалекта.
 
@@ -864,6 +990,9 @@ def main() -> int:
 
     print("\n== OPS-5: контракт помощника журнала и ограниченная гонка ==")
     check_ledger_helper_contract()
+
+    print("\n== OPS-5: фактический порядок вызовов привязан к объявлению ==")
+    check_startup_order_is_enforced_at_runtime()
 
     print("\n== OPS-5: переносимость SQL журнала (по конструкции) ==")
     check_ledger_sql_is_portable()
