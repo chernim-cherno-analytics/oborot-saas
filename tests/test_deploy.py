@@ -279,6 +279,16 @@ def make_stubs(bindir: Path, *, health_ok=True, pip_ok=True) -> None:
         # сигнал застал бы скрипт с недосведёнными указателями и проверял бы не
         # то. Сторож-файл нужен, чтобы сигнал пришёл РОВНО ОДИН раз и не мешал
         # самому откату.
+        # FAIL_MV_MARKER — отказ РОВНО на втором переименовании пары маркеров
+        # отката. Точечность здесь и есть смысл: первое переименование уже
+        # прошло, то есть на диске лежит новый SHA и прежний путь, и от скрипта
+        # требуется вернуть прежний SHA, а не оставить запись, указывающую на
+        # тот самый релиз, на который выкладку сейчас откатят.
+        'if [ "${FAIL_MV_MARKER:-0}" = "1" ]; then\n'
+        '  case "${dest##*/}" in\n'
+        '    PREVIOUS_VENV) echo "подставной mv: отказ на записи пары" >&2; exit 1;;\n'
+        '  esac\n'
+        'fi\n'
         'if [ "${FAIL_MV_SIGNAL:-0}" = "1" ]; then\n'
         '  case "${dest##*/}" in\n'
         '    pip) if [ ! -e "${FAIL_MV_SIGNAL_ONCE:-/несуществующий}" ]; then\n'
@@ -476,6 +486,10 @@ def deploy_env(app: Path, extra: dict | None = None) -> dict:
 
 def head_of(app: Path) -> str:
     return git(["rev-parse", "HEAD"], cwd=app)[1].strip()
+
+
+def is_forty(sha: str) -> bool:
+    return len(sha) == 40 and all(c in "0123456789abcdef" for c in sha)
 
 
 def main() -> int:
@@ -1680,6 +1694,82 @@ def main() -> int:
           running_commit.read_text(encoding="utf-8").strip() == vr,
           running_commit.read_text(encoding="utf-8").strip()[:12])
     check("повтор завершился успешно", rc == 0, f"rc={rc} " + out[-300:])
+
+    print("\n== Сбой на второй записи пары не уничтожает одну команду отката ==")
+    # Пара пишется в два приёма, и второй приём умеет падать. Если после этого
+    # оставить новый SHA, запись укажет ровно на тот релиз, на который выкладку
+    # сейчас и откатят: читатель честно сочтёт её бесполезной («это тот же
+    # коммит»), и НЕУДАЧНАЯ выкладка уничтожит ту самую одну команду отката,
+    # ради которой пара и пишется.
+    #
+    # Проверяется здесь ИНВАРИАНТ, а не способ записи: чем бы ни кончилась
+    # попытка, на диске обязана остаться согласованная пара, называющая релиз,
+    # ОТЛИЧНЫЙ от того, что сейчас в бою. Проверка способа сузила бы её до одной
+    # реализации и молчала бы на любой другой.
+    def check_rollback_survives(label: str) -> None:
+        live = head_of(app)
+        sha_now = (WORK / "state" / "PREVIOUS_SHA").read_text(encoding="utf-8").strip()
+        venv_now = (WORK / "state" / "PREVIOUS_VENV").read_text(encoding="utf-8").strip()
+        check(f"{label}: цель отката есть и она НЕ равна тому, что в бою",
+              is_forty(sha_now) and sha_now != live,
+              f"записано {sha_now[:12]}, в бою {live[:12]}")
+        check(f"{label}: пара согласована по метке ВНУТРИ каталога",
+              Path(venv_now, "RELEASE_SHA").exists()
+              and Path(venv_now, "RELEASE_SHA").read_text(encoding="utf-8").strip()
+              == sha_now, f"{sha_now[:12]} vs {venv_now}")
+        check(f"{label}: временных файлов маркеров не осталось",
+              not list((WORK / "state").glob("PREVIOUS_*.??????")),
+              str([p.name for p in (WORK / "state").glob("PREVIOUS_*.??????")]))
+        probe_rc, probe_out = run(["bash", script, live], env=deploy_env(app))
+        check(f"{label}: одна команда отката по-прежнему существует",
+              probe_rc == 0 and f"deploy/deploy.sh {sha_now}" in probe_out,
+              f"rc={probe_rc} " + probe_out[-250:])
+
+    git(["checkout", "-q", "main"], cwd=app)
+    vt = add_commit(app, "vt")
+    git(["checkout", "-q", "--detach", vr], cwd=app)
+    before_sha = (WORK / "state" / "PREVIOUS_SHA").read_text(encoding="utf-8").strip()
+    check("подготовка: записанная цель отката отличается от того, что в бою",
+          is_forty(before_sha) and before_sha != vr, before_sha[:12])
+
+    # Инъекция 1 — от реализации не зависит: файл второго маркера недоступен на
+    # запись. Под root права не создают сбоя, и тогда раздел честно пропускается.
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        print("  ПРОПУСК: запущено под root, права файла сбой не создадут")
+    else:
+        (WORK / "state" / "PREVIOUS_VENV").chmod(0o444)
+        try:
+            rc, out = run(["bash", script, vt], env=deploy_env(app))
+        finally:
+            (WORK / "state" / "PREVIOUS_VENV").chmod(0o644)
+        check_rollback_survives("второй маркер не записать")
+
+    # Инъекция 2 — точно в окно между двумя переименованиями пары.
+    # Что в бою, запоминается ДО перехода на main: иначе целью выкладки оказался
+    # бы тот же самый коммит, маршрут ушёл бы в повторную выкладку и записи пары
+    # не случилось бы вовсе — инъекция молча не сработала бы.
+    live_before = head_of(app)
+    git(["checkout", "-q", "main"], cwd=app)
+    vu = add_commit(app, "vu")
+    git(["checkout", "-q", "--detach", live_before], cwd=app)
+    (WORK / "systemctl.log").write_text("", encoding="utf-8")
+    before_env = (WORK / "env").read_text(encoding="utf-8")
+    prev_pair = ((WORK / "state" / "PREVIOUS_SHA").read_text(encoding="utf-8"),
+                 (WORK / "state" / "PREVIOUS_VENV").read_text(encoding="utf-8"))
+    rc, out = run(["bash", script, vu], env=deploy_env(app, {"FAIL_MV_MARKER": "1"}))
+    check("выкладка отклонена", rc != 0, f"rc={rc}")
+    check("названа причина", "цель отката" in out, out[-400:])
+    check("сказано, что сбой ДО перезапуска", "СБОЙ ДО ПЕРЕЗАПУСКА" in out, out[-400:])
+    check("код возвращён", head_of(app) == live_before, head_of(app)[:12])
+    check("OBOROT_COMMIT возвращён",
+          (WORK / "env").read_text(encoding="utf-8") == before_env)
+    check("служба не перезапускалась",
+          "restart" not in (WORK / "systemctl.log").read_text(encoding="utf-8"))
+    check("ПРЕЖНЯЯ ПАРА ВЕРНУЛАСЬ ЦЕЛИКОМ",
+          ((WORK / "state" / "PREVIOUS_SHA").read_text(encoding="utf-8"),
+           (WORK / "state" / "PREVIOUS_VENV").read_text(encoding="utf-8")) == prev_pair,
+          (WORK / "state" / "PREVIOUS_SHA").read_text(encoding="utf-8").strip()[:12])
+    check_rollback_survives("сбой между переименованиями")
 
     shutil.rmtree(WORK, ignore_errors=True)
     print(f"\nИТОГО: {len(PASS)} OK, {len(FAIL)} FAIL")
