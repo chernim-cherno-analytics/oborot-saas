@@ -187,6 +187,187 @@ def run_migration_once(flag: str, work, bind=None) -> bool:
     return False
 
 
+# ── OPS-5: журнал успешно применённых шагов старта ───────────────────────────
+#
+# Что это НЕ такое. Это не механизм «применять или пропускать миграцию»: шаги
+# старта (init_db и восемь ensure_schema/reset_stale_running/log_preview)
+# остаются идемпотентными и выполняются на КАЖДОМ старте как сейчас. Состояние
+# схемы по-прежнему определяется интроспекцией самой схемы, а не этой таблицей,
+# и ни один шаг по журналу не пропускается. Иначе журнал стал бы единственным
+# источником правды о схеме — а он ведётся приложением и может отстать от базы
+# (восстановление из бэкапа, ручная правка), и тогда «в журнале записано» тихо
+# отменило бы настоящую миграцию.
+#
+# Что это такое. Машиночитаемое свидетельство «шаг с таким идентификатором и
+# такой позицией на этой базе успешно завершился» — плюс замок на порядок.
+# До сих пор состояние миграций боевой базы восстанавливалось только
+# интроспекцией, а порядок шагов существовал лишь как порядок строк в
+# `app/main.py` и ничем не проверялся.
+#
+# Правила журнала:
+#   * объявленная пара (id, позиция) сверяется с журналом ДО шага
+#     (validate_migration_step), а запись делается ТОЛЬКО после успешного
+#     возврата самого шага (record_migration_step). Порядок именно такой:
+#     иначе конфликт обнаруживался бы уже после того, как шаг отработал —
+#     см. докстринг validate_migration_step;
+#   * повторный старт — no-op: та же пара (id, позиция) ничего не меняет,
+#     applied_at первой записи сохраняется;
+#   * тот же id на другой позиции ИЛИ та же позиция под другим id — это
+#     конфликт, и он валит старт (fail closed). Такое расхождение означает,
+#     что порядок шагов переписали задним числом (AGENTS.md §1: «только новая
+#     миграция сверху»), и делать вид, что «уже применено», здесь нельзя;
+#   * append-only: новый шаг получает НОВЫЙ id и НОВУЮ позицию, старая строка
+#     не переписывается.
+#
+# Портируемость. Ни одного SQLite- или Postgres-специфичного выражения:
+# `CREATE TABLE IF NOT EXISTS` и `CREATE UNIQUE INDEX IF NOT EXISTS` понимают
+# оба (Postgres — с 9.5), типы VARCHAR/INTEGER общие, время подставляется
+# из Python, а не из `CURRENT_TIMESTAMP`/`now()` (у них разный формат и разная
+# зона). ON CONFLICT/UPSERT намеренно не используется: он различается диалектами
+# и, главное, замаскировал бы конфликт под «уже сделано».
+
+_LEDGER_TABLE_DDL = (
+    "CREATE TABLE IF NOT EXISTS migration_ledger ("
+    "step_id VARCHAR(128) NOT NULL PRIMARY KEY, "
+    "step_order INTEGER NOT NULL, "
+    "applied_at VARCHAR(32) NOT NULL)"
+)
+_LEDGER_ORDER_INDEX_DDL = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_migration_ledger_order "
+    "ON migration_ledger (step_order)"
+)
+
+
+class MigrationLedgerConflict(RuntimeError):
+    """Журнал старта противоречит объявленному порядку шагов.
+
+    Отдельный тип, а не голый RuntimeError: это стоп-условие («миграции
+    переписали задним числом»), и вызывающая сторона обязана иметь возможность
+    отличить его от временной ошибки базы, не разбирая текст сообщения.
+    """
+
+
+def ensure_migration_ledger(bind=None) -> None:
+    """Создаёт таблицу журнала и уникальный индекс позиции (идемпотентно)."""
+    run_migration_step(_LEDGER_TABLE_DDL, bind=bind)
+    run_migration_step(_LEDGER_ORDER_INDEX_DDL, bind=bind)
+
+
+def read_migration_ledger(bind=None) -> list[tuple[str, int, str]]:
+    """Возвращает журнал как список (step_id, step_order, applied_at) по позиции."""
+    eng = bind or engine
+    ensure_migration_ledger(eng)
+    with eng.connect() as conn:
+        rows = conn.execute(
+            text("SELECT step_id, step_order, applied_at FROM migration_ledger "
+                 "ORDER BY step_order")
+        ).all()
+    return [(r[0], int(r[1]), r[2]) for r in rows]
+
+
+def _ledger_rows_for(conn, step_id: str, step_order: int):
+    """Строки журнала, конкурирующие за этот id или эту позицию."""
+    by_id = conn.execute(
+        text("SELECT step_id, step_order FROM migration_ledger WHERE step_id = :i"),
+        {"i": step_id},
+    ).first()
+    by_order = conn.execute(
+        text("SELECT step_id, step_order FROM migration_ledger WHERE step_order = :o"),
+        {"o": step_order},
+    ).first()
+    return by_id, by_order
+
+
+def _check_ledger_conflict(by_id, by_order, step_id: str, step_order: int) -> bool:
+    """True, если пара (id, позиция) уже записана ровно так же.
+
+    Бросает MigrationLedgerConflict, если id занят другой позицией или позиция
+    занята другим id. Возвращаемый False означает «записи ещё нет, вставляем».
+    """
+    if by_id is not None and int(by_id[1]) != step_order:
+        raise MigrationLedgerConflict(
+            f"шаг старта {step_id!r} уже записан на позиции {int(by_id[1])}, "
+            f"а объявлен на позиции {step_order}: порядок миграций изменён "
+            "задним числом"
+        )
+    if by_order is not None and by_order[0] != step_id:
+        raise MigrationLedgerConflict(
+            f"позиция {step_order} уже занята шагом {by_order[0]!r}, "
+            f"а объявлена за {step_id!r}: порядок миграций изменён задним числом"
+        )
+    return by_id is not None
+
+
+def validate_migration_step(step_id: str, step_order: int, bind=None) -> None:
+    """Сверяет объявленную пару (id, позиция) с журналом ДО выполнения шага.
+
+    Зачем отдельная функция, а не проверка внутри записи. Ревью жизненного
+    цикла 28.08.2026 (PR #44, discussion_r3884250490) показало на
+    воспроизведении: если конфликт обнаруживается только в момент ЗАПИСИ, то
+    сам шаг к этому времени уже отработал. С журналом, где позицию 1 занимает
+    чужой шаг, старт действительно падал — но `init_db()` успевал создать
+    схему, и число таблиц в синтетической базе вырастало до 27. Для аддитивных
+    шагов это безобидно, а для переставленного НЕАДДИТИВНОГО шага замок
+    опаздывал бы ровно на ту операцию, ради которой он заведён.
+
+    Поэтому порядок теперь такой: preflight (эта функция) → сам шаг → запись
+    успеха. Единственное, что preflight меняет на базе без журнала, — заводит
+    саму таблицу журнала и её индекс: это аддитивно и без этого проверять
+    нечем.
+
+    Ничего не возвращает: «конфликта нет» — это отсутствие исключения.
+    Отметка «шаг уже был записан» здесь намеренно не используется как решение
+    пропустить шаг — шаги остаются идемпотентными и выполняются всегда.
+    """
+    eng = bind or engine
+    ensure_migration_ledger(eng)
+    with eng.connect() as conn:
+        by_id, by_order = _ledger_rows_for(conn, step_id, step_order)
+    _check_ledger_conflict(by_id, by_order, step_id, step_order)
+
+
+def record_migration_step(step_id: str, step_order: int, bind=None) -> bool:
+    """Отмечает успешно завершённый шаг старта в журнале.
+
+    Вызывается ТОЛЬКО после того, как сам шаг вернул управление без ошибки.
+    Возвращает True, если строку записал этот процесс, и False, если она уже
+    была (повторный старт или соседний воркер). Конфликт id↔позиция поднимает
+    MigrationLedgerConflict и старт не продолжается.
+    """
+    eng = bind or engine
+    ensure_migration_ledger(eng)
+    applied_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    for attempt in range(_BUSY_RETRIES):
+        try:
+            with eng.begin() as conn:
+                by_id, by_order = _ledger_rows_for(conn, step_id, step_order)
+                if _check_ledger_conflict(by_id, by_order, step_id, step_order):
+                    return False           # уже записано ровно так же — no-op
+                conn.execute(
+                    text("INSERT INTO migration_ledger (step_id, step_order, applied_at) "
+                         "VALUES (:i, :o, :a)"),
+                    {"i": step_id, "o": step_order, "a": applied_at},
+                )
+            return True
+        except MigrationLedgerConflict:
+            raise
+        except SQLAlchemyError as exc:
+            if _is_busy_error(exc) and attempt + 1 < _BUSY_RETRIES:
+                time.sleep(_BUSY_PAUSE_SEC * (attempt + 1))
+                continue
+            # Гонка вставки: соседний воркер записал ту же строку между нашим
+            # SELECT и INSERT. Молча «уже сделано» тут отвечать нельзя — та же
+            # ошибка уникальности возникает и когда сосед занял НАШУ позицию
+            # ЧУЖИМ шагом. Поэтому перечитываем и судим по фактическим строкам:
+            # совпало — no-op, разошлось — конфликт.
+            with eng.connect() as conn:
+                by_id, by_order = _ledger_rows_for(conn, step_id, step_order)
+            if _check_ledger_conflict(by_id, by_order, step_id, step_order):
+                return False
+            raise
+    return False
+
+
 def init_db() -> None:
     """Создаёт таблицы и прогоняет аддитивные миграции. Вызывается на старте.
 

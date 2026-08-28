@@ -30,7 +30,7 @@ from app.routes_connect import router as connect_router
 from app.routes_extra import router as extra_router
 from app.routes_ms_app import router as ms_app_router
 from app.routes_ms_vendor import router as ms_vendor_router
-from app.db import get_db, init_db
+from app.db import get_db, init_db, record_migration_step, validate_migration_step
 from app.models import Connection, Membership, Org, Product, ProductionOrder, Sale, User
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -189,6 +189,148 @@ def _check_single_process() -> None:
         )
 
 
+# ── OPS-5: объявленный порядок шагов старта ──────────────────────────────────
+#
+# Единственное место, где порядок шагов старта записан как данные, а не как
+# порядок строк кода. Сам код ниже не изменился: те же девять вызовов, в том же
+# порядке, с теми же ленивыми импортами — таблица не исполняет шаги, а даёт им
+# стабильный идентификатор и позицию для журнала (app/db.record_migration_step).
+#
+# Список APPEND-ONLY. Новая миграция дописывается В КОНЕЦ с новым id и новой
+# позицией; менять id или позицию уже выпущенного шага нельзя — на базах, где
+# он записан, старт после такой правки упадёт с MigrationLedgerConflict, и это
+# не дефект, а тот самый замок (AGENTS.md §1: «только новая миграция сверху»).
+# Если смысл шага изменился настолько, что прежнее свидетельство больше не
+# годится, заводится НОВЫЙ шаг с новым id, а старая строка остаётся как есть.
+STARTUP_SCHEMA_STEPS: tuple[tuple[str, int], ...] = (
+    ("init_db", 1),
+    ("lessons.ensure_schema", 2),
+    ("exclusions.ensure_schema", 3),
+    ("ms_sync.ensure_schema", 4),
+    ("ms_sync.reset_stale_running", 5),
+    ("ms_writeback.ensure_schema", 6),
+    ("ms_vendor.ensure_schema", 7),
+    ("subscription.ensure_schema", 8),
+    ("subscription.log_preview", 9),
+)
+_STARTUP_STEP_ORDER = dict(STARTUP_SCHEMA_STEPS)
+
+# Курсор фактически выполненных шагов текущего старта. Обнуляется в
+# _validate_startup_order() — то есть в начале каждого прохода `_startup()`.
+_STARTUP_CURSOR = 0
+
+
+class StartupOrderViolation(RuntimeError):
+    """Фактический порядок шагов старта разошёлся с объявленным.
+
+    Отдельный тип, а не голый RuntimeError: это стоп-условие того же рода, что
+    MigrationLedgerConflict, и вызывающая сторона обязана уметь отличить его от
+    сбоя самого шага, не разбирая текст сообщения.
+    """
+
+
+def _validate_startup_order() -> None:
+    """Сверяет ВЕСЬ объявленный порядок с журналом до первого шага.
+
+    Сначала проверяется сам список: два одинаковых id или две одинаковые
+    позиции в `STARTUP_SCHEMA_STEPS` — ошибка объявления, и ловить её на
+    середине старта поздно. Затем каждая пара сверяется с журналом базы.
+
+    Проверка всего списка целиком, а не только очередного шага, нужна ровно
+    затем, зачем заведён замок: перестановка почти никогда не задевает один
+    шаг. Если конфликт объявлен на позиции 6, то на этой базе не должен
+    выполниться и первый шаг — иначе процесс успевает поработать по порядку,
+    который уже признан противоречивым.
+    """
+    global _STARTUP_CURSOR
+    _STARTUP_CURSOR = 0
+    seen_ids: set[str] = set()
+    seen_orders: set[int] = set()
+    for step_id, step_order in STARTUP_SCHEMA_STEPS:
+        if step_id in seen_ids or step_order in seen_orders:
+            raise RuntimeError(
+                f"объявление шагов старта противоречиво: {step_id!r}/{step_order} "
+                "встречается дважды в STARTUP_SCHEMA_STEPS"
+            )
+        seen_ids.add(step_id)
+        seen_orders.add(step_order)
+        validate_migration_step(step_id, step_order)
+
+
+def _record_startup_step(step_id: str) -> None:
+    """Отмечает в журнале шаг старта, который ТОЛЬКО ЧТО успешно завершился.
+
+    Вызывается строго после соответствующего шага: упавший шаг записи не
+    получает.
+    """
+    record_migration_step(step_id, _STARTUP_STEP_ORDER[step_id])
+
+
+def _startup_step(step_id: str, run) -> None:
+    """Один шаг старта: preflight → сам шаг → запись успеха.
+
+    Порядок этих трёх действий — предмет ревью жизненного цикла 28.08.2026
+    (PR #44, discussion_r3884250490). Пока конфликт ловился только на записи,
+    fail-closed срабатывал ПОСЛЕ того, как шаг отработал: с чужим шагом на
+    позиции 1 старт падал, но `init_db()` уже успевал создать схему. Для
+    сегодняшних аддитивных шагов это безобидно, но замок заводился как раз
+    на случай переставленного НЕАДДИТИВНОГО шага — а для него «сначала
+    выполнили, потом заметили» означает, что замка нет.
+
+    Поэтому preflight стоит ПЕРЕД `run()`. Записать успех до шага нельзя по
+    той же логике с другого конца: журнал обязан говорить о том, что
+    действительно случилось.
+
+    `run` передаётся уже разрешённым значением, а не именем: тесты подменяют
+    шаги атрибутами модулей, и подмена обязана долетать.
+
+    Первым делом проверяется, что это ДЕЙСТВИТЕЛЬНО очередной шаг объявленного
+    списка. Это вторая претензия того же ревью (discussion_r3884257316), и она
+    про другое, чем первая: пара (id, позиция) статична и не меняется, если
+    будущая правка переставит два вызова ВМЕСТЕ с их идентификаторами. Журнал
+    в таком случае принимает все строки как уже знакомые, старт проходит
+    целиком — а миграции выполнились в другом порядке. Курсор привязывает
+    фактическую последовательность вызовов к единственному объявленному
+    порядку: шаг не на своём месте не выполняется вовсе.
+    """
+    global _STARTUP_CURSOR
+    if _STARTUP_CURSOR >= len(STARTUP_SCHEMA_STEPS):
+        raise StartupOrderViolation(
+            f"шаг старта {step_id!r} выполняется после того, как объявленный "
+            f"список из {len(STARTUP_SCHEMA_STEPS)} шагов уже исчерпан"
+        )
+    expected_id, expected_order = STARTUP_SCHEMA_STEPS[_STARTUP_CURSOR]
+    if step_id != expected_id:
+        raise StartupOrderViolation(
+            f"фактический порядок шагов старта разошёлся с объявленным: "
+            f"на позиции {expected_order} ожидался {expected_id!r}, "
+            f"а выполняется {step_id!r}. Порядок задаётся одним списком "
+            "STARTUP_SCHEMA_STEPS; переставлять вызовы в _startup() нельзя"
+        )
+    validate_migration_step(step_id, expected_order)
+    run()
+    _record_startup_step(step_id)
+    _STARTUP_CURSOR += 1
+
+
+def _finish_startup_steps() -> None:
+    """Убеждается, что выполнены ВСЕ объявленные шаги, и ни одного сверх.
+
+    Курсор ловит перестановку и лишний вызов, но сам по себе не заметил бы
+    пропуска: список, оборванный на восьмом шаге, монотонен. Эта проверка
+    закрывает разницу — и стоит она перед `scheduler.start()`, чтобы
+    планировщик не поднялся над недоделанным стартом.
+    """
+    done = _STARTUP_CURSOR
+    total = len(STARTUP_SCHEMA_STEPS)
+    if done != total:
+        missing = [sid for sid, _pos in STARTUP_SCHEMA_STEPS[done:]]
+        raise StartupOrderViolation(
+            f"выполнено {done} шагов старта из объявленных {total}; "
+            f"не выполнены: {', '.join(missing)}"
+        )
+
+
 @app.on_event("startup")
 def _startup() -> None:
     # Fail-fast, пока сервис ещё не принял ни одного запроса: в проде
@@ -197,37 +339,43 @@ def _startup() -> None:
     # auth.check_proxy_config).
     auth.check_proxy_config()
     _check_single_process()
-    init_db()
+    # Замок порядка проверяется ДО первого шага и повторно перед каждым (см.
+    # _startup_step): единственное, что при этом заводится на базе без
+    # журнала, — сама таблица журнала и её индекс.
+    _validate_startup_order()
+    _startup_step("init_db", init_db)
     # OPS-6: последняя migration-on-import. Раньше вызывалась на импорте
     # app/api.py — до старта приложения и вне защиты от гонки нескольких
     # воркеров, тем же классом дефекта, что и ms_writeback/ms_vendor ниже.
     from app import lessons as _lessons
-    _lessons.ensure_schema()
+    _startup_step("lessons.ensure_schema", _lessons.ensure_schema)
     from app import exclusions as _exclusions
-    _exclusions.ensure_schema()
+    _startup_step("exclusions.ensure_schema", _exclusions.ensure_schema)
     # Аудит 18.08: убитый процессом синк оставался state='running' навсегда
     # и блокировал все будущие запуски организации.
     from app import ms_sync as _ms_sync
-    _ms_sync.ensure_schema()
-    _ms_sync.reset_stale_running()
+    _startup_step("ms_sync.ensure_schema", _ms_sync.ensure_schema)
+    _startup_step("ms_sync.reset_stale_running", _ms_sync.reset_stale_running)
     # Д4 (ревью 22.08): эти две миграции раньше запускались на импорте
     # routes_connect.py / routes_ms_vendor.py — до старта приложения и вне
     # защиты от гонки нескольких воркеров (обращение к базе на импорте
     # модуля само по себе было опасно). Место — здесь, вместе с остальными
     # аддитивными миграциями.
     from app import ms_writeback as _ms_writeback
-    _ms_writeback.ensure_schema()
+    _startup_step("ms_writeback.ensure_schema", _ms_writeback.ensure_schema)
     from app import ms_vendor as _ms_vendor
-    _ms_vendor.ensure_schema()
+    _startup_step("ms_vendor.ensure_schema", _ms_vendor.ensure_schema)
     # D-24: orgs.paid_until + billing_requests.invoiced_at. Колонки заводим
     # всегда, сам гейт включается флагом OBOROT_SUBSCRIPTION_GATE — схема
     # должна быть готова заранее, иначе включение флага потребует деплоя.
     from app import subscription as _subscription
-    _subscription.ensure_schema()
+    _startup_step("subscription.ensure_schema", _subscription.ensure_schema)
     # Предпросмотр в лог: кого закроет гейт, если его включить. Читает базу,
     # ничего не меняет. Нужен ровно затем, чтобы включение флага не оказалось
     # сюрпризом — «посмотреть перед тем, как щёлкнуть».
-    _subscription.log_preview()
+    _startup_step("subscription.log_preview", _subscription.log_preview)
+    # Замок на пропуск: все объявленные шаги выполнены, и ровно они.
+    _finish_startup_steps()
     global _STARTUP_DONE
     _STARTUP_DONE = True
     # OPS-6: планировщик стартует последним статементом, ПОСЛЕ того как все
