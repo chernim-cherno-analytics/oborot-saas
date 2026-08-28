@@ -292,7 +292,39 @@ def int_path_params(route) -> list:
     В этом приложении целочисленный параметр пути означает первичный ключ
     строки в базе (`_id_path()` в `app/api.py` — `Path(ge=1, le=2_147_483_647)`),
     то есть ровно тот случай, ради которого §1 и существует.
+
+    Тип берётся из РАЗОБРАННОГО FastAPI маршрута — `route.dependant.path_params`,
+    поле `field_info.annotation`, — а не из сырых `__annotations__` функции.
+    Сырая аннотация зависит от того, как её написали: `order_id: int` даёт
+    `int`, а равносильный `order_id: Annotated[int, Path(ge=1)]` даёт объект
+    `Annotated[...]`, который на `int` не похож и мимо сравнения проходит.
+    Тогда арендаторский id считался бы не-целочисленным, и сторож реестра
+    исключений (§7) пропустил бы в исключения ручку с настоящим id объекта —
+    то есть проверка, которая должна закрывать самый опасный вид ошибки в
+    реестре, зависела бы от стиля записи аннотации. FastAPI обе формы уже
+    свёл к одному разрешённому типу, и здесь берётся именно он.
+
+    Строковые ключи справочников (`/api/lessons/{key}`) и внешние
+    идентификаторы (`{account_id}` у вендора МойСклад) остаются не-целыми при
+    любой форме записи — у них разрешённый тип `str`.
+
+    Если у маршрута разобранного `dependant` нет вовсе (обычный
+    starlette-`Route`, добавленный в обход FastAPI), тип берётся из
+    `__annotations__` как раньше. Это не запасной путь «на всякий случай»:
+    без него такой маршрут молча получал бы пустой список, и исключение для
+    него прошло бы проверку просто потому, что тип не удалось прочитать.
     """
+    dependant = getattr(route, "dependant", None)
+    fields = getattr(dependant, "path_params", None)
+    if fields:
+        names = []
+        for field in fields:
+            annotation = getattr(getattr(field, "field_info", None),
+                                 "annotation", None)
+            if annotation is int:
+                names.append(getattr(field, "name", ""))
+        return sorted(n for n in names if n)
+
     endpoint = getattr(route, "endpoint", None)
     if endpoint is None:
         return []
