@@ -279,6 +279,66 @@ REFERENCE_MATCHING = {
     "bases": {k: v for k, v in REFERENCE_EXPLICIT["bases"].items() if k != "Ремень"},
 }
 
+# Штатный ответ публичной ручки первой таблицы
+# `GET /api/sales-monthly?month=YYYY-MM` (legacy/main.py::get_sales_monthly).
+# Числа синтетические и подобраны так, чтобы воспроизвести рисунок DATA-5:
+# возвраты сходятся с базой до копейки (5 000), а всё расхождение сидит в
+# валовых (28 000 у «Оборота» против 28 500 здесь).
+SALES_MONTHLY_ITEMS = [
+    {"base": "Худи", "sale_rev": 15000, "sale_qty": 5, "ret_rev": 3000,
+     "ret_qty": 1, "net": 12000, "sizes": []},
+    {"base": "Футболка", "sale_rev": 8000, "sale_qty": 4, "ret_rev": 2000,
+     "ret_qty": 1, "net": 6000, "sizes": []},
+    {"base": "Свеча", "sale_rev": 4000, "sale_qty": 2, "ret_rev": 0,
+     "ret_qty": 0, "net": 4000, "sizes": []},
+    {"base": "Пробник", "sale_rev": 1000, "sale_qty": 5, "ret_rev": 0,
+     "ret_qty": 0, "net": 1000, "sizes": []},
+    {"base": "Ремень", "sale_rev": 500, "sale_qty": 1, "ret_rev": 0,
+     "ret_qty": 0, "net": 500, "sizes": []},
+]
+SALES_MONTHLY_SUMMARY = {"sales": 28500, "returns": 5000, "net": 23500,
+                         "sales_qty": 17, "returns_qty": 2}
+SALES_MONTHLY = {
+    "months": ["2026-07", "2026-05", "2026-04"],
+    "month": "2026-05",
+    "summary": dict(SALES_MONTHLY_SUMMARY),
+    "items": [dict(item) for item in SALES_MONTHLY_ITEMS],
+}
+
+# Тот же месяц, но «Худи» приехало двумя позициями, схлопывающимися в одно
+# каноническое имя. Итоги обязаны совпасть с предыдущим payload'ом до цифры:
+# свёртка не имеет права ни потерять позицию, ни посчитать её дважды.
+SALES_MONTHLY_FOLDED = {
+    "months": ["2026-05"],
+    "month": "2026-05",
+    "summary": dict(SALES_MONTHLY_SUMMARY),
+    "items": [
+        {"base": "Худи (S)", "sale_rev": 9000, "sale_qty": 3, "ret_rev": 3000,
+         "ret_qty": 1, "net": 6000, "sizes": []},
+        {"base": "Худи (M)", "sale_rev": 6000, "sale_qty": 2, "ret_rev": 0,
+         "ret_qty": 0, "net": 6000, "sizes": []},
+    ] + [dict(item) for item in SALES_MONTHLY_ITEMS if item["base"] != "Худи"],
+}
+
+
+def sales_monthly(*, summary=None, items=None, **top) -> dict:
+    """Копия штатного payload'а с точечной подменой — фикстура не мутируется."""
+    payload = {
+        "months": list(SALES_MONTHLY["months"]),
+        "month": SALES_MONTHLY["month"],
+        "summary": dict(SALES_MONTHLY_SUMMARY) if summary is None else summary,
+        "items": [dict(item) for item in SALES_MONTHLY_ITEMS] if items is None else items,
+    }
+    payload.update(top)
+    return payload
+
+
+def sales_monthly_item(index: int = 0, **fields) -> list:
+    """Список позиций с изменённой одной позицией."""
+    items = [dict(item) for item in SALES_MONTHLY_ITEMS]
+    items[index] = {**items[index], **fields}
+    return items
+
 
 def write_json(tmpdir: Path, name: str, payload) -> str:
     path = tmpdir / name
@@ -585,6 +645,184 @@ def test_reference_explicit():
     check("нетто при этом остаётся известным", part["totals"]["net_rev"] == 150.0)
 
 
+def test_reference_sales_monthly():
+    """Штатный публичный payload первой таблицы разбирается напрямую."""
+    ref = rc.parse_reference(SALES_MONTHLY, MONTH)
+    check("формат опознан как sales_monthly", ref["shape"] == "sales_monthly")
+    check("валовые эталона известны", ref["totals"]["gross_rev"] == 28500.0,
+          str(ref["totals"]["gross_rev"]))
+    check("возвраты эталона известны", ref["totals"]["return_rev"] == 5000.0)
+    check("нетто эталона = валовые − возвраты", ref["totals"]["net_rev"] == 23500.0)
+    check("штуки эталона нетто = 17 − 2", ref["totals"]["net_qty"] == 15.0)
+    check("позиции разобраны все", set(ref["bases"]) ==
+          {"Худи", "Футболка", "Свеча", "Пробник", "Ремень"}, str(sorted(ref["bases"])))
+    check("у позиции известен весь разрез",
+          ref["bases"]["Худи"] == {"net_qty": 4.0, "net_rev": 12000.0,
+                                   "gross_rev": 15000.0, "return_rev": 3000.0},
+          str(ref["bases"]["Худи"]))
+
+    folded = rc.parse_reference(SALES_MONTHLY_FOLDED, MONTH)
+    check("две позиции одного канонического имени свёрнуты в одну",
+          set(folded["bases"]) == set(ref["bases"]), str(sorted(folded["bases"])))
+    check("свёртка ничего не посчитала дважды и ничего не потеряла",
+          folded["bases"] == ref["bases"] and folded["totals"] == ref["totals"])
+
+
+def test_sales_monthly_month_guard():
+    """Ручка молча подменяет месяц — это обязано быть отказом, а не сверкой."""
+    check("ответ за другой месяц — отказ закрытым",
+          raises(lambda: rc.parse_reference(sales_monthly(month="2026-07"), MONTH),
+                 rc.ReconcileError))
+    check("пустая база эталона (months=[], month=null) — отказ закрытым",
+          raises(lambda: rc.parse_reference(
+              {"months": [], "month": None,
+               "summary": {"sales": 0, "returns": 0, "net": 0,
+                           "sales_qty": 0, "returns_qty": 0},
+               "items": []}, MONTH), rc.ReconcileError))
+    check("month не месяц — отказ закрытым",
+          raises(lambda: rc.parse_reference(sales_monthly(month="май"), MONTH),
+                 rc.ReconcileError))
+    check("запрошенного месяца нет в списке months — отказ закрытым",
+          raises(lambda: rc.parse_reference(sales_monthly(months=["2026-07"]), MONTH),
+                 rc.ReconcileError))
+    check("months не список — отказ закрытым",
+          raises(lambda: rc.parse_reference(sales_monthly(months="2026-05"), MONTH),
+                 rc.ReconcileError))
+    check("months с мусором — отказ закрытым",
+          raises(lambda: rc.parse_reference(sales_monthly(months=["2026-05", 7]), MONTH),
+                 rc.ReconcileError))
+    payload = sales_monthly()
+    payload.pop("months")
+    check("без необязательного months разбор проходит",
+          rc.parse_reference(payload, MONTH)["totals"]["net_rev"] == 23500.0)
+
+
+def test_sales_monthly_items_guard():
+    bad_items = {
+        "items не список": sales_monthly(items={"Худи": 1}),
+        "items пуст": sales_monthly(items=[]),
+        "позиция не объект": sales_monthly(items=["Худи"]),
+        "нет base": sales_monthly(items=[{"sale_rev": 1, "sale_qty": 1,
+                                          "ret_rev": 0, "ret_qty": 0, "net": 1}]),
+        "base не строка": sales_monthly(items=sales_monthly_item(0, base=42)),
+        "base пуст": sales_monthly(items=sales_monthly_item(0, base="   ")),
+        "выручка строкой": sales_monthly(items=sales_monthly_item(0, sale_rev="15000")),
+        "количество булевым": sales_monthly(items=sales_monthly_item(0, sale_qty=True)),
+        "возврат null": sales_monthly(items=sales_monthly_item(0, ret_rev=None)),
+        "net противоречит sale_rev − ret_rev":
+            sales_monthly(items=sales_monthly_item(0, net=999999)),
+    }
+    for title, payload in bad_items.items():
+        check(f"битая позиция отклонена: {title}",
+              raises(lambda p=payload: rc.parse_reference(p, MONTH), rc.ReconcileError))
+
+    for field in ("sale_rev", "sale_qty", "ret_rev", "ret_qty", "net"):
+        items = [dict(item) for item in SALES_MONTHLY_ITEMS]
+        items[0].pop(field)
+        check(f"позиция без поля {field!r} отклонена",
+              raises(lambda p=sales_monthly(items=items): rc.parse_reference(p, MONTH),
+                     rc.ReconcileError))
+
+
+def test_sales_monthly_summary_guard():
+    """summary считается отдельно от items и потому проверяется ими."""
+    check("summary не объект — отказ закрытым",
+          raises(lambda: rc.parse_reference(sales_monthly(summary=[]), MONTH),
+                 rc.ReconcileError))
+    for field in ("sales", "returns", "net", "sales_qty", "returns_qty"):
+        summary = dict(SALES_MONTHLY_SUMMARY)
+        summary.pop(field)
+        check(f"summary без поля {field!r} — отказ закрытым",
+              raises(lambda p=sales_monthly(summary=summary): rc.parse_reference(p, MONTH),
+                     rc.ReconcileError))
+        contradiction = dict(SALES_MONTHLY_SUMMARY)
+        contradiction[field] = contradiction[field] + 500
+        check(f"summary.{field} расходится с items на 500 — отказ закрытым",
+              raises(lambda p=sales_monthly(summary=contradiction): rc.parse_reference(p, MONTH),
+                     rc.ReconcileError))
+
+    money_off = dict(SALES_MONTHLY_SUMMARY, sales=28500.02)
+    check("расхождение в две копейки уже не прощается",
+          raises(lambda: rc.parse_reference(sales_monthly(summary=money_off), MONTH),
+                 rc.ReconcileError))
+    qty_off = dict(SALES_MONTHLY_SUMMARY, sales_qty=17.001)
+    check("расхождение по штукам не прощается",
+          raises(lambda: rc.parse_reference(sales_monthly(summary=qty_off), MONTH),
+                 rc.ReconcileError))
+    check("summary строкой — отказ закрытым",
+          raises(lambda: rc.parse_reference(
+              sales_monthly(summary=dict(SALES_MONTHLY_SUMMARY, sales="28500")), MONTH),
+              rc.ReconcileError))
+
+    noise = dict(SALES_MONTHLY_SUMMARY, sales=28500.0 + 1e-9, net=23500.0 - 1e-9)
+    check("шум сложения float внутри допуска не роняет разбор",
+          rc.parse_reference(sales_monthly(summary=noise), MONTH)["totals"]["net_rev"]
+          == 23500.0)
+
+
+def test_tolerance_cannot_hide():
+    """Допуск обязан оставаться узким: это сторож, а не лазейка."""
+    check("денежный допуск не шире копейки", rc.MONEY_TOLERANCE <= 0.01,
+          str(rc.MONEY_TOLERANCE))
+    check("допуск по штукам не шире 1e-6", rc.QTY_TOLERANCE <= 1e-6, str(rc.QTY_TOLERANCE))
+    check("относительный допуск не шире 1e-9", rc.RELATIVE_TOLERANCE <= 1e-9,
+          str(rc.RELATIVE_TOLERANCE))
+
+    # Ровно копейка как ГРАНИЦА не проверяется намеренно: 0,01 в double не
+    # представимо точно, и `100.01 − 100.0` даёт чуть больше копейки, а
+    # `0.01 − 0.0` — ровно её. Утверждать поведение «на границе» значило бы
+    # закреплять артефакт представления, а не правило. Закрепляется то, что
+    # правилом действительно является: заметно меньше копейки — прощается,
+    # копейка и больше — нет.
+    forgiven = (0.0, 1e-9, 1e-6, 0.001, 0.009)
+    rejected = (0.02, 0.5, 1.0, 500.0)
+    check("шум заметно меньше копейки прощается на любом масштабе",
+          all(rc._agrees(value + diff, value, rc.MONEY_TOLERANCE)
+              for value in (0.0, 100.0, 1e5, 1e7) for diff in forgiven))
+    check("две копейки и больше не прощаются ни на каком масштабе",
+          all(not rc._agrees(value + diff, value, rc.MONEY_TOLERANCE)
+              for value in (0.0, 100.0, 1e5, 1e7) for diff in rejected))
+    check("на сумме в 10 млн допуск остаётся копейкой",
+          rc._tolerance(1e7, 1e7, rc.MONEY_TOLERANCE) == 0.01,
+          str(rc._tolerance(1e7, 1e7, rc.MONEY_TOLERANCE)))
+    check("рубль на сумме в 10 млн не прощается",
+          rc._agrees(1e7 + 1.0, 1e7, rc.MONEY_TOLERANCE) is False)
+    check("материальная разница не прощается ни на каком масштабе",
+          all(rc._agrees(value * 1.0001, value, rc.MONEY_TOLERANCE) is False
+              for value in (1e3, 1e5, 1e7, 1e9)))
+
+
+def test_shapes_preserved():
+    """Три формата различаются, и новый не перехватил старые."""
+    check("формат A остаётся A",
+          rc.parse_reference(REFERENCE_BY_MONTH, MONTH)["shape"] == "sales_by_month")
+    check("формат B остаётся B",
+          rc.parse_reference(REFERENCE_EXPLICIT, MONTH)["shape"] == "explicit")
+    check("формат C опознан", rc.parse_reference(SALES_MONTHLY, MONTH)["shape"] == "sales_monthly")
+    # Позиция с именем «items» одна, без «summary», форматом C не является.
+    quirky = dict(REFERENCE_BY_MONTH, items={"2026-05": [1, 100]})
+    parsed = rc.parse_reference(quirky, MONTH)
+    check("одного поля 'items' для опознания формата C мало",
+          parsed["shape"] == "sales_by_month"
+          and parsed["totals"]["net_rev"] == REFERENCE_NET_REV + 100)
+
+
+def test_sales_monthly_end_to_end():
+    """Классификация DATA-5 воспроизводится прямо из штатного payload'а."""
+    rep = rc.compare(saas_month(), rc.parse_reference(SALES_MONTHLY, MONTH))
+    d = rep["deltas"]
+    check("формат эталона попал в отчёт", rep["reference_shape"] == "sales_monthly")
+    check("возвраты сошлись в ноль", d["return_rev_raw"] == 0.0, str(d["return_rev_raw"]))
+    check("валовые разошлись на −500", d["gross_rev_raw"] == -500.0, str(d["gross_rev_raw"]))
+    check("всё расхождение нетто объясняется валовыми",
+          d["net_rev_raw"] == d["gross_rev_raw"] - d["return_rev_raw"])
+    check("расхождение по штукам = −1", d["net_qty_raw"] == -1.0)
+    check("позиция только у эталона названа", rep["only_in_reference"] == ["Ремень"])
+    text = rc.render_text(rep)
+    check("в тексте отчёта валовые и возвраты — числа, а не прочерк",
+          "28 500.00" in text and "5 000.00" in text)
+
+
 def test_reference_transport():
     with tempfile.TemporaryDirectory() as tmp:
         tmpdir = Path(tmp)
@@ -739,6 +977,15 @@ def test_cli():
         code, _ = run_cli(base_args + ["--fail-on-delta", "500"])
         check("порог 500 при расхождении 500 — код 0", code == rc.EXIT_OK, f"код {code}")
 
+        monthly_file = write_json(tmpdir, "sales_monthly.json", SALES_MONTHLY)
+        code, payload = run_cli(["--db", str(DB_PATH), "--org", str(ORG_ID), "--month", MONTH,
+                                 "--reference-file", monthly_file, "--json"])
+        parsed = json.loads(payload)
+        check("штатный payload ручки проходит весь путь CLI",
+              code == rc.EXIT_OK and parsed["reference_shape"] == "sales_monthly"
+              and parsed["deltas"]["return_rev_raw"] == 0.0
+              and parsed["deltas"]["gross_rev_raw"] == -500.0, f"код {code}")
+
         matching_file = write_json(tmpdir, "matching.json", REFERENCE_MATCHING)
         code, _ = run_cli(["--db", str(DB_PATH), "--org", str(ORG_ID), "--month", MONTH,
                            "--reference-file", matching_file, "--fail-on-delta", "0"])
@@ -876,6 +1123,31 @@ def _probe_threshold(mod) -> bool:
     return mod.exceeds(rep, 500) is False
 
 
+def _probe_month_guard(mod) -> bool:
+    """Ответ ручки за ДРУГОЙ месяц отвергается."""
+    return raises(lambda: mod.parse_reference(sales_monthly(month="2026-07"), MONTH),
+                  mod.ReconcileError)
+
+
+def _probe_summary_guard(mod) -> bool:
+    """summary, противоречащий сумме items, отвергается."""
+    contradiction = dict(SALES_MONTHLY_SUMMARY, sales=29000)
+    return raises(lambda: mod.parse_reference(sales_monthly(summary=contradiction), MONTH),
+                  mod.ReconcileError)
+
+
+def _probe_item_net_guard(mod) -> bool:
+    """Позиция, у которой net не равен sale_rev − ret_rev, отвергается."""
+    return raises(lambda: mod.parse_reference(
+        sales_monthly(items=sales_monthly_item(0, net=999999)), MONTH), mod.ReconcileError)
+
+
+def _probe_fold(mod) -> bool:
+    """Две позиции одного канонического имени складываются, а не затирают друг друга."""
+    folded = mod.parse_reference(SALES_MONTHLY_FOLDED, MONTH)
+    return folded["bases"]["Худи"]["gross_rev"] == 15000.0
+
+
 def _probe_empty_month(mod) -> bool:
     conn = mod.open_readonly(str(DB_PATH))
     try:
@@ -923,6 +1195,25 @@ MUTATIONS = [
     ("месяц без продаж отдаёт нули вместо отказа",
      [("if not total_rows:", "if False:", 1)],
      _probe_empty_month),
+    ("подмена месяца ручкой перестаёт быть отказом",
+     [('    if ref_month != month:\n        raise ReconcileError(\n'
+       '            f"эталон ответил за',
+       '    if False:\n        raise ReconcileError(\n'
+       '            f"эталон ответил за', 1)],
+     _probe_month_guard),
+    ("summary перестаёт сверяться с items",
+     [("if not _agrees(got, value, absolute):", "if False:", 1)],
+     _probe_summary_guard),
+    ("net позиции перестаёт сверяться с sale_rev − ret_rev",
+     [('if not _agrees(values["net"], values["sale_rev"] - values["ret_rev"], MONEY_TOLERANCE):',
+       "if False:", 1)],
+     _probe_item_net_guard),
+    ("денежный допуск расширен до неразличимости",
+     [("MONEY_TOLERANCE = 0.01      # ₽, копейка", "MONEY_TOLERANCE = 1000.0", 1)],
+     _probe_summary_guard),
+    ("свёртка по каноническому имени затирает вместо сложения",
+     [('cur["gross_rev"] += values["sale_rev"]', 'cur["gross_rev"] = values["sale_rev"]', 1)],
+     _probe_fold),
 ]
 
 
@@ -965,7 +1256,14 @@ def main() -> int:
     block("== 5. Эталон: формат первой таблицы ==", test_reference_by_month)
     block("== 5а. Эталон: битые данные ==", test_reference_malformed)
     block("== 5б. Эталон: явный формат ==", test_reference_explicit)
-    block("== 5в. Эталон: файл и сеть ==", test_reference_transport)
+    block("== 5в. Эталон: штатный payload /api/sales-monthly ==", test_reference_sales_monthly)
+    block("== 5г. sales-monthly: подмена месяца ==", test_sales_monthly_month_guard)
+    block("== 5д. sales-monthly: битые позиции ==", test_sales_monthly_items_guard)
+    block("== 5е. sales-monthly: summary против items ==", test_sales_monthly_summary_guard)
+    block("== 5ж. Допуск не прячет материальную разницу ==", test_tolerance_cannot_hide)
+    block("== 5з. Три формата не перехватывают друг друга ==", test_shapes_preserved)
+    block("== 5и. sales-monthly целиком: классификация DATA-5 ==", test_sales_monthly_end_to_end)
+    block("== 5к. Эталон: файл и сеть ==", test_reference_transport)
     block("== 6. Сравнение ==", test_compare)
     block("== 6а. Возвраты сходятся, валовые нет ==", test_returns_reconcile_gross_diverges)
     block("== 7. Порог расхождения ==", test_exit_policy)

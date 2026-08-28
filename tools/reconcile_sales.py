@@ -73,10 +73,34 @@ stdout и нигде не сохраняется. Это существенно:
      `{"month": "YYYY-MM", "bases": {"<база>": {"net_qty": .., "net_rev": ..,
        "gross_rev": .., "return_rev": ..}}}` — поля `gross_rev`/`return_rev`
      необязательные.
+  C. Штатный публичный ответ `GET /api/sales-monthly?month=YYYY-MM`
+     (`legacy/main.py::get_sales_monthly`):
+     `{"months": [...], "month": "YYYY-MM",
+       "summary": {"sales": .., "returns": .., "net": .., "sales_qty": ..,
+                   "returns_qty": ..},
+       "items": [{"base": .., "sale_rev": .., "sale_qty": .., "ret_rev": ..,
+                  "ret_qty": .., "net": .., "sizes": [...]}]}`
+     Это ЕДИНСТВЕННЫЙ формат, который отдаёт разрез «валовые/возвраты» сам,
+     без ручной перекладки данных оператором. Ради этого он и поддержан
+     напрямую: перекладка боевых цифр руками — лишний повод их где-нибудь
+     сохранить, а сохранять их нельзя.
 
 Чего эталон не сообщил — то остаётся `null`, а не нулём (D-30/D-34:
 отсутствие факта не выдаётся за факт). Формат A физически не может
 подтвердить, что сходятся именно возвраты, — в отчёте это так и написано.
+
+ДВЕ ЛОВУШКИ ФОРМАТА C, из-за которых он проверяется строже прочих.
+
+* **Ручка молча подменяет месяц.** `get_sales_monthly` при неизвестном ей
+  `month` возвращает САМЫЙ СВЕЖИЙ месяц и тот же HTTP 200. Оператор спросил
+  май, получил июль и не узнал бы об этом ни из кода ответа, ни из чисел.
+  Поэтому `month` ответа сверяется с запрошенным, и несовпадение — отказ
+  закрытым, а не тихая сверка не того месяца.
+* **Ответ может противоречить сам себе.** `summary` считается отдельно от
+  `items`, поэтому он проверяется суммой позиций: расхождение — отказ
+  закрытым. Допуск при этом узкий и существует ровно ради шума сложения
+  float (см. `MONEY_TOLERANCE`), а не ради того, чтобы «почти сошлось»
+  считалось «сошлось».
 
 ОТКАЗ ЗАКРЫТЫМ. Недоступная или битая база, отсутствующая организация,
 месяц, за который у организации нет ни одной строки продаж, недоступный или
@@ -100,8 +124,8 @@ stdout и нигде не сохраняется. Это существенно:
         --month 2026-05 --reference-file /path/to/reference.json
 
     python tools/reconcile_sales.py --db /path/to/copy.db --org 1 \\
-        --month 2026-05 --reference-url https://example.invalid/api/sales-by-month \\
-        --json --top 20 --fail-on-delta 0
+        --month 2026-05 --json --top 20 --fail-on-delta 0 \\
+        --reference-url 'https://example.invalid/api/sales-monthly?month=2026-05'
 
 Копию базы оператор делает сам; инструмент работает и на живом файле, но
 копия — правильная привычка: она снимает вопрос о блокировках и о том, что
@@ -131,6 +155,22 @@ EXIT_DELTA = 2
 SIZE_SUFFIX_RE = re.compile(r"\s*\(([^)]*)\)\s*$")
 
 MONTH_RE = re.compile(r"^\d{4}-\d{2}$")
+
+# Допуск сверки `summary` с суммой `items` в формате C. Он существует ровно
+# ради одного: обе стороны — суммы float, и порядок слагаемых у эталона свой,
+# поэтому последний бит результата у двух правильных сложений может не
+# совпасть. Он НЕ существует ради того, чтобы «почти сошлось» считалось
+# «сошлось»: копейка — это меньше, чем самая мелкая настоящая ошибка учёта,
+# какую вообще можно допустить в документе, и любое расхождение крупнее
+# копейки означает, что ответ противоречит сам себе.
+#
+# Относительная добавка нужна только на очень больших суммах, где шаг float64
+# сам по себе может превысить абсолютный допуск: 1e-9 от суммы — это всё ещё
+# доли копейки на любых мыслимых оборотах, то есть материальную разницу она
+# спрятать не способна. Проверка на границе — в tests/test_reconcile_sales.py.
+MONEY_TOLERANCE = 0.01      # ₽, копейка
+QTY_TOLERANCE = 1e-6        # шт
+RELATIVE_TOLERANCE = 1e-9
 
 # Печатается рядом с числами всегда. Формулировка сознательно не выбирает
 # правильную сторону: это вопрос владельца (AGENTS.md §3).
@@ -332,6 +372,17 @@ def load_saas_month(conn: sqlite3.Connection, org_id: int, month: str) -> dict:
 
 # ── эталон ───────────────────────────────────────────────────────────────────
 
+def _tolerance(expected: float, got: float, absolute: float) -> float:
+    """Предел, внутри которого две суммы одних и тех же слагаемых считаются равными."""
+    return max(absolute,
+               abs(expected) * RELATIVE_TOLERANCE,
+               abs(got) * RELATIVE_TOLERANCE)
+
+
+def _agrees(got: float, expected: float, absolute: float) -> bool:
+    return abs(got - expected) <= _tolerance(expected, got, absolute)
+
+
 def _number(value, where: str) -> float:
     """Число из полезной нагрузки эталона. `True` числом не считается."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -350,14 +401,127 @@ def parse_reference(payload, month: str) -> dict:
     if not isinstance(payload, dict):
         raise ReconcileError("эталон: ожидался JSON-объект верхнего уровня")
 
-    # Явный формат опознаётся по ДВУМ служебным полям сразу. Одного `bases`
+    # Каждый служебный формат опознаётся по ДВУМ полям сразу. Одного поля
     # мало: формат A — это словарь имён позиций, и позиция с таким именем
     # хоть и невероятна, но опознание не должно зависеть от её отсутствия.
+    # Порядок важен: формат C проверяется первым, потому что он единственный
+    # штатный ответ живой ручки, и ошибиться в нём дороже всего.
+    if "items" in payload and "summary" in payload:
+        return _parse_reference_sales_monthly(payload, month)
     if "bases" in payload and "month" in payload:
         if not isinstance(payload["bases"], dict):
             raise ReconcileError("эталон: поле 'bases' должно быть объектом")
         return _parse_reference_explicit(payload, month)
     return _parse_reference_by_month(payload, month)
+
+
+# Поля позиции формата C. `net` требуется наравне с остальными: он приходит
+# всегда, и если однажды перестанет — это изменение контракта источника, и
+# узнать о нём лучше отказом, чем молча посчитанной по-своему выручкой.
+_SALES_MONTHLY_ITEM_FIELDS = ("sale_rev", "sale_qty", "ret_rev", "ret_qty", "net")
+
+
+def _parse_reference_sales_monthly(payload: dict, month: str) -> dict:
+    """Штатный ответ `GET /api/sales-monthly?month=YYYY-MM` первой таблицы.
+
+    Единственный формат, который сам отдаёт разрез «валовые/возвраты», —
+    ради него он и поддержан напрямую: иначе оператору пришлось бы руками
+    перекладывать боевые цифры в промежуточный файл, а это лишний повод их
+    где-нибудь сохранить.
+
+    Проверяется строже прочих по двум причинам, названным в докстринге
+    модуля: ручка молча подменяет неизвестный ей месяц самым свежим, а
+    `summary` считается отдельно от `items` и потому может им противоречить.
+    Итоги берутся из СВЁРНУТЫХ позиций, а не из `summary`: отчёт обязан
+    раскладываться по позициям, иначе крупнейшие расхождения не сойдутся с
+    общим числом. `summary` при этом не игнорируется — он служит контролем.
+    """
+    ref_month = payload.get("month")
+    if not isinstance(ref_month, str) or not MONTH_RE.match(ref_month):
+        raise ReconcileError(
+            f"эталон: поле 'month' обязано быть YYYY-MM, получено {ref_month!r}")
+    if ref_month != month:
+        raise ReconcileError(
+            f"эталон ответил за {ref_month}, а запрошен {month}: ручка отдаёт самый "
+            "свежий месяц, когда запрошенного у неё нет, и делает это тем же HTTP 200")
+
+    months = payload.get("months")
+    if months is not None:
+        if not isinstance(months, list) or not all(
+                isinstance(m, str) and MONTH_RE.match(m) for m in months):
+            raise ReconcileError("эталон: поле 'months' должно быть списком месяцев YYYY-MM")
+        if month not in months:
+            raise ReconcileError(f"эталон: месяца {month} нет среди доступных ему месяцев")
+
+    items = payload.get("items")
+    if not isinstance(items, list):
+        raise ReconcileError(
+            f"эталон: поле 'items' должно быть списком, получено {type(items).__name__}")
+    if not items:
+        raise ReconcileError(f"эталон: за {month} нет ни одной позиции — сверять не с чем")
+
+    bases: dict[str, dict] = {}
+    agg = {"sale_rev": 0.0, "ret_rev": 0.0, "sale_qty": 0.0, "ret_qty": 0.0}
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise ReconcileError(
+                f"эталон: items[{index}] — ожидался объект, получено {type(item).__name__}")
+        raw_base = item.get("base")
+        if not isinstance(raw_base, str) or not canon_base(raw_base):
+            raise ReconcileError(
+                f"эталон: items[{index}] — поле 'base' должно быть непустой строкой")
+        values = {}
+        for field in _SALES_MONTHLY_ITEM_FIELDS:
+            if field not in item:
+                raise ReconcileError(
+                    f"эталон: items[{index}] ({raw_base!r}) — нет поля {field!r}")
+            values[field] = _number(item[field], f"items[{index}] ({raw_base!r}) {field}")
+        if not _agrees(values["net"], values["sale_rev"] - values["ret_rev"], MONEY_TOLERANCE):
+            raise ReconcileError(
+                f"эталон противоречит сам себе: у items[{index}] ({raw_base!r}) "
+                "net не равен sale_rev − ret_rev")
+
+        # Свёртка по каноническому имени. Ручка и так отдаёт канонические
+        # базы, но складывать одноимённые позиции обязан сам инструмент:
+        # положиться на то, что дублей не будет, значит однажды посчитать
+        # позицию дважды и не заметить.
+        cur = bases.setdefault(canon_base(raw_base), {
+            "net_qty": 0.0, "net_rev": 0.0, "gross_rev": 0.0, "return_rev": 0.0})
+        cur["gross_rev"] += values["sale_rev"]
+        cur["return_rev"] += values["ret_rev"]
+        cur["net_rev"] += values["sale_rev"] - values["ret_rev"]
+        cur["net_qty"] += values["sale_qty"] - values["ret_qty"]
+        for field in ("sale_rev", "ret_rev", "sale_qty", "ret_qty"):
+            agg[field] += values[field]
+
+    summary = payload.get("summary")
+    if not isinstance(summary, dict):
+        raise ReconcileError(
+            f"эталон: поле 'summary' должно быть объектом, получено {type(summary).__name__}")
+    expected = (
+        ("sales", agg["sale_rev"], MONEY_TOLERANCE),
+        ("returns", agg["ret_rev"], MONEY_TOLERANCE),
+        ("net", agg["sale_rev"] - agg["ret_rev"], MONEY_TOLERANCE),
+        ("sales_qty", agg["sale_qty"], QTY_TOLERANCE),
+        ("returns_qty", agg["ret_qty"], QTY_TOLERANCE),
+    )
+    for field, value, absolute in expected:
+        if field not in summary:
+            raise ReconcileError(f"эталон: в summary нет поля {field!r}")
+        got = _number(summary[field], f"summary.{field}")
+        if not _agrees(got, value, absolute):
+            raise ReconcileError(
+                f"эталон противоречит сам себе: summary.{field} не сходится с суммой items — "
+                f"расхождение {abs(got - value):.6g} при допуске "
+                f"{_tolerance(value, got, absolute):.6g}")
+
+    totals = {
+        "net_qty": sum(v["net_qty"] for v in bases.values()),
+        "net_rev": sum(v["net_rev"] for v in bases.values()),
+        "gross_rev": sum(v["gross_rev"] for v in bases.values()),
+        "return_rev": sum(v["return_rev"] for v in bases.values()),
+    }
+    return {"month": month, "shape": "sales_monthly", "bases": bases, "totals": totals}
 
 
 def _parse_reference_by_month(payload: dict, month: str) -> dict:
