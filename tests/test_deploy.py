@@ -229,6 +229,12 @@ def make_stubs(bindir: Path, *, health_ok=True, pip_ok=True) -> None:
         '  : > "$SIGNAL_ON_RESTART"\n'
         '  kill -TERM "$PPID" 2>/dev/null || true\n'
         'fi\n'
+        # Список копий базы НА МОМЕНТ перезапуска. Без него «копия снята» и
+        # «копия снята ДО того, как стартовал новый код» неразличимы, а нужен
+        # именно порядок: копия, сделанная после старта миграций, защищает не то.
+        'if [ -n "${BACKUPS_AT_RESTART:-}" ]; then\n'
+        '  ls "${OBOROT_DATA_DIR}/backups" > "$BACKUPS_AT_RESTART" 2>/dev/null || true\n'
+        'fi\n'
         'if [ -n "${RUNNING_COMMIT_FILE:-}" ] && [ -f "${OBOROT_ENV_FILE:-}" ]; then\n'
         '  sed -n "s/^OBOROT_COMMIT=//p" "$OBOROT_ENV_FILE" > "$RUNNING_COMMIT_FILE"\n'
         'fi\n'
@@ -287,6 +293,19 @@ def make_stubs(bindir: Path, *, health_ok=True, pip_ok=True) -> None:
         'if [ "${FAIL_MV_MARKER:-0}" = "1" ]; then\n'
         '  case "${dest##*/}" in\n'
         '    PREVIOUS_VENV) echo "подставной mv: отказ на записи пары" >&2; exit 1;;\n'
+        '  esac\n'
+        'fi\n'
+        # FAIL_MV_MARKER_SIGNAL — сигнал приходит РОВНО после первого
+        # переименования пары маркеров. Обработка отказа внутри записи здесь
+        # ни при чём: управление уходит в откат асинхронно, мимо неё.
+        'if [ "${FAIL_MV_MARKER_SIGNAL:-0}" = "1" ]; then\n'
+        '  case "${dest##*/}" in\n'
+        '    PREVIOUS_SHA) if [ ! -e "${FAIL_MV_SIGNAL_ONCE:-/несуществующий}" ]; then\n'
+        '                    : > "$FAIL_MV_SIGNAL_ONCE"\n'
+        '                    /bin/mv "$@" || exit 1\n'
+        '                    kill -TERM "$PPID" 2>/dev/null || true\n'
+        '                    exit 0\n'
+        '                  fi;;\n'
         '  esac\n'
         'fi\n'
         'if [ "${FAIL_MV_SIGNAL:-0}" = "1" ]; then\n'
@@ -1669,43 +1688,11 @@ def main() -> int:
           and not any("wait_ready" in ln for ln in window),
           " | ".join(ln.strip()[:40] for ln in window) or "окно не найдено")
 
-    print("\n== Повтор не засчитывает ЧУЖОЙ живой процесс за перезапущенный ==")
-    # Самый тихий из трёх. `systemctl restart` не удался: код, env и окружение
-    # уже целевые, а в бою по-прежнему прежний процесс. Повтор той же цели
-    # видел «status: ok» и объявлял релиз развёрнутым, ни разу его не запустив.
-    # Готовность отдаёт коммит живого процесса — его и надо спрашивать.
-    git(["checkout", "-q", "main"], cwd=app)
-    vr = add_commit(app, "vr")
-    git(["checkout", "-q", "--detach", vsg], cwd=app)
-    (WORK / "systemctl.log").write_text("", encoding="utf-8")
-    rc, out = run(["bash", script, vr], env=deploy_env(app, {"FAIL_RESTART": "1"}))
-    check("выкладка с неудавшимся перезапуском отклонена", rc == 1, f"rc={rc}")
-    check("подготовка: код уже на цели", head_of(app) == vr, head_of(app)[:12])
-    check("подготовка: а в бою по-прежнему ПРЕЖНИЙ процесс",
-          running_commit.read_text(encoding="utf-8").strip() == vsg,
-          running_commit.read_text(encoding="utf-8").strip()[:12])
-    (WORK / "systemctl.log").write_text("", encoding="utf-8")
-    rc, out = run(["bash", script, vr], env=deploy_env(app))
-    check("повтор НЕ объявил цель развёрнутой без перезапуска",
-          "перезапуск не нужен" not in out, out[-400:])
-    check("служба перезапущена", "restart" in (WORK / "systemctl.log").read_text(encoding="utf-8"),
-          (WORK / "systemctl.log").read_text(encoding="utf-8").strip() or "пусто")
-    check("и в бою теперь именно цель, а не прежний релиз",
-          running_commit.read_text(encoding="utf-8").strip() == vr,
-          running_commit.read_text(encoding="utf-8").strip()[:12])
-    check("повтор завершился успешно", rc == 0, f"rc={rc} " + out[-300:])
-
-    print("\n== Сбой на второй записи пары не уничтожает одну команду отката ==")
-    # Пара пишется в два приёма, и второй приём умеет падать. Если после этого
-    # оставить новый SHA, запись укажет ровно на тот релиз, на который выкладку
-    # сейчас и откатят: читатель честно сочтёт её бесполезной («это тот же
-    # коммит»), и НЕУДАЧНАЯ выкладка уничтожит ту самую одну команду отката,
-    # ради которой пара и пишется.
-    #
-    # Проверяется здесь ИНВАРИАНТ, а не способ записи: чем бы ни кончилась
-    # попытка, на диске обязана остаться согласованная пара, называющая релиз,
-    # ОТЛИЧНЫЙ от того, что сейчас в бою. Проверка способа сузила бы её до одной
-    # реализации и молчала бы на любой другой.
+    # Инвариант пары маркеров, общий для трёх сцен ниже: чем бы ни кончилась
+    # попытка выкладки, на диске обязана остаться СОГЛАСОВАННАЯ пара, называющая
+    # релиз, ОТЛИЧНЫЙ от того, что сейчас в бою, и одна команда отката обязана
+    # продолжать существовать. Проверять способ записи вместо инварианта значило
+    # бы привязать проверку к одной реализации и промолчать на любой другой.
     def check_rollback_survives(label: str) -> None:
         live = head_of(app)
         sha_now = (WORK / "state" / "PREVIOUS_SHA").read_text(encoding="utf-8").strip()
@@ -1725,6 +1712,97 @@ def main() -> int:
               probe_rc == 0 and f"deploy/deploy.sh {sha_now}" in probe_out,
               f"rc={probe_rc} " + probe_out[-250:])
 
+    print("\n== Повтор не засчитывает ЧУЖОЙ живой процесс за перезапущенный ==")
+    # Самый тихий из трёх. `systemctl restart` не удался: код, env и окружение
+    # уже целевые, а в бою по-прежнему прежний процесс. Повтор той же цели
+    # видел «status: ok» и объявлял релиз развёрнутым, ни разу его не запустив.
+    # Готовность отдаёт коммит живого процесса — его и надо спрашивать.
+    git(["checkout", "-q", "main"], cwd=app)
+    vr = add_commit(app, "vr")
+    git(["checkout", "-q", "--detach", vsg], cwd=app)
+    (WORK / "systemctl.log").write_text("", encoding="utf-8")
+    rc, out = run(["bash", script, vr], env=deploy_env(app, {"FAIL_RESTART": "1"}))
+    check("выкладка с неудавшимся перезапуском отклонена", rc == 1, f"rc={rc}")
+    check("подготовка: код уже на цели", head_of(app) == vr, head_of(app)[:12])
+    check("подготовка: а в бою по-прежнему ПРЕЖНИЙ процесс",
+          running_commit.read_text(encoding="utf-8").strip() == vsg,
+          running_commit.read_text(encoding="utf-8").strip()[:12])
+    (WORK / "systemctl.log").write_text("", encoding="utf-8")
+    at_restart = WORK / "backups-at-restart"
+    if at_restart.exists():
+        at_restart.unlink()
+    backups_before = {p.name for p in (WORK / "data" / "backups").glob("oborot-*.db")}
+    rc, out = run(["bash", script, vr],
+                  env=deploy_env(app, {"BACKUPS_AT_RESTART": str(at_restart)}))
+    check("повтор НЕ объявил цель развёрнутой без перезапуска",
+          "перезапуск не нужен" not in out, out[-400:])
+    check("служба перезапущена", "restart" in (WORK / "systemctl.log").read_text(encoding="utf-8"),
+          (WORK / "systemctl.log").read_text(encoding="utf-8").strip() or "пусто")
+    check("и в бою теперь именно цель, а не прежний релиз",
+          running_commit.read_text(encoding="utf-8").strip() == vr,
+          running_commit.read_text(encoding="utf-8").strip()[:12])
+    check("повтор завершился успешно", rc == 0, f"rc={rc} " + out[-300:])
+    # Шаг «копия базы» этот заход пропустил — менять было нечего. Но раз ниже
+    # выяснилось, что перезапуск всё-таки нужен, копия обязана быть СВЕЖЕЙ:
+    # прежний релиз продолжал принимать записи между попытками, а новый код
+    # сразу за перезапуском может выполнить миграции.
+    fresh = [p.name for p in (WORK / "data" / "backups").glob("oborot-*.db")
+             if p.name not in backups_before]
+    check("СВЕЖАЯ КОПИЯ БАЗЫ снята перед возвратным перезапуском",
+          "копия: " in out and len(fresh) == 1, f"{out.count('копия: ')} новых={fresh}")
+    check("и снята она ДО перезапуска, а не после",
+          at_restart.exists() and fresh and fresh[0] in at_restart.read_text(encoding="utf-8"),
+          at_restart.read_text(encoding="utf-8").strip()[-200:] if at_restart.exists()
+          else "список на момент перезапуска не снят")
+
+    print("\n== Сигнал во время записи пары маркеров не теряет цель отката ==")
+    # Обработка отказа внутри самой записи тут ни при чём: сигнал приходит
+    # асинхронно сразу после первого успешного переименования и уводит
+    # управление в откат мимо неё. Код, env и окружение возвращаются на прежний
+    # релиз — значит и пара маркеров обязана вернуться к прежней, иначе
+    # PREVIOUS_SHA окажется равным восстановленному релизу и одна команда
+    # отката пропадёт.
+    git(["checkout", "-q", "main"], cwd=app)
+    vw = add_commit(app, "vw")
+    live_before = vr
+    git(["checkout", "-q", "--detach", live_before], cwd=app)
+    pair_before = ((WORK / "state" / "PREVIOUS_SHA").read_text(encoding="utf-8"),
+                   (WORK / "state" / "PREVIOUS_VENV").read_text(encoding="utf-8"))
+    check("подготовка: записанная цель отката отличается от того, что в бою",
+          pair_before[0].strip() != live_before and is_forty(pair_before[0].strip()),
+          pair_before[0].strip()[:12])
+    (WORK / "systemctl.log").write_text("", encoding="utf-8")
+    before_env = (WORK / "env").read_text(encoding="utf-8")
+    once2 = WORK / "marker-signal-once"
+    if once2.exists():
+        once2.unlink()
+    rc, out = run(["bash", script, vw], env=deploy_env(app, {
+        "FAIL_MV_MARKER_SIGNAL": "1", "FAIL_MV_SIGNAL_ONCE": str(once2)}))
+    check("сигнал доставлен после первой записи — иначе раздел пуст", once2.exists())
+    check("выкладка отклонена", rc != 0, f"rc={rc}")
+    check("сказано, что сбой ДО перезапуска", "СБОЙ ДО ПЕРЕЗАПУСКА" in out, out[-500:])
+    check("код возвращён", head_of(app) == live_before, head_of(app)[:12])
+    check("OBOROT_COMMIT возвращён",
+          (WORK / "env").read_text(encoding="utf-8") == before_env)
+    check("служба не перезапускалась",
+          "restart" not in (WORK / "systemctl.log").read_text(encoding="utf-8"))
+    check("ПАРА МАРКЕРОВ ВЕРНУЛАСЬ — одна команда отката не потеряна",
+          ((WORK / "state" / "PREVIOUS_SHA").read_text(encoding="utf-8"),
+           (WORK / "state" / "PREVIOUS_VENV").read_text(encoding="utf-8")) == pair_before,
+          (WORK / "state" / "PREVIOUS_SHA").read_text(encoding="utf-8").strip()[:12])
+    check_rollback_survives("сигнал во время записи пары")
+
+    print("\n== Сбой на второй записи пары не уничтожает одну команду отката ==")
+    # Пара пишется в два приёма, и второй приём умеет падать. Если после этого
+    # оставить новый SHA, запись укажет ровно на тот релиз, на который выкладку
+    # сейчас и откатят: читатель честно сочтёт её бесполезной («это тот же
+    # коммит»), и НЕУДАЧНАЯ выкладка уничтожит ту самую одну команду отката,
+    # ради которой пара и пишется.
+    #
+    # Проверяется здесь ИНВАРИАНТ, а не способ записи: чем бы ни кончилась
+    # попытка, на диске обязана остаться согласованная пара, называющая релиз,
+    # ОТЛИЧНЫЙ от того, что сейчас в бою. Проверка способа сузила бы её до одной
+    # реализации и молчала бы на любой другой.
     git(["checkout", "-q", "main"], cwd=app)
     vt = add_commit(app, "vt")
     git(["checkout", "-q", "--detach", vr], cwd=app)

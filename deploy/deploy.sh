@@ -81,6 +81,15 @@ MARKER_HAD_SHA=0
 MARKER_HAD_VENV=0
 MARKER_OLD_SHA=""
 MARKER_OLD_VENV=""
+# Ставится ровно перед первой мутацией маркеров. Нужен потому, что сигнал
+# приходит асинхронно и уводит управление в rollback_release мимо разбора
+# ошибок внутри write_rollback_markers.
+MARKERS_TOUCHED=0
+# Временные файлы пары. Убирает их EXIT-трап, а не только сама функция: сигнал
+# приходит асинхронно и может увести управление из середины записи, откуда
+# функция уже не вернётся и за собой не приберёт.
+MARKER_TMP_SHA=""
+MARKER_TMP_VENV=""
 
 # Запись OBOROT_COMMIT во временный файл и mv поверх. Прежняя версия правила
 # env через `sed -i`: обрыв посреди правки оставлял бы урезанный файл
@@ -445,6 +454,20 @@ rollback_release() {
   echo >&2
   echo "СБОЙ ДО ПЕРЕЗАПУСКА: $reason" >&2
   echo "Сервис ещё не перезапускался, данные не менялись — возвращаю прод на $CURRENT." >&2
+  # Маркеры отката возвращаются здесь, а не только внутри write_rollback_markers
+  # (найдено внешним ревью). Своё восстановление та функция делает лишь при
+  # ошибке `mv`; сигнал же приходит АСИНХРОННО — например сразу после первого
+  # успешного переименования, — и уводит управление сюда, минуя её обработку
+  # отказа. Тогда код, env и окружение возвращались на $CURRENT, а PREVIOUS_SHA
+  # оставался равным этому же $CURRENT со старым путём: следующая выкладка того
+  # же коммита считала такую запись бесполезной и теряла одну команду отката.
+  if [ "$MARKERS_TOUCHED" = 1 ]; then
+    if restore_rollback_markers; then
+      echo "   цель отката возвращена к прежней записи" >&2
+    else
+      ok=0
+    fi
+  fi
   if [ "$VENV_SWAPPED" = 1 ]; then
     if restore_previous_venv; then
       echo "   окружение возвращено: $VENV снова от $CURRENT" >&2
@@ -517,6 +540,35 @@ prune_release_venvs() {
     rm -rf -- "$path" || true
   done < <(find "$VENV_ROOT" -maxdepth 1 -type d -name 'venv-*' -printf '%T@ %p\n' \
              2>/dev/null | sort -rn)
+  return 0
+}
+
+# Копия базы перед тем, как новый код получит к ней доступ. Вынесена в функцию
+# не ради красоты: точек, после которых стартует новый код, стало две — обычная
+# выкладка и повторный заход, у которого прежний `systemctl restart` не удался.
+# У второй точки копии не было вовсе (найдено внешним ревью): шаг 5 её
+# пропускал, потому что «менять нечего», а прежняя копия к этому моменту уже
+# устарела — прежний релиз продолжал принимать записи между попытками. Новый код
+# мог выполнить миграции без актуального предрелизного снимка.
+take_backup() {
+  local stamp
+  if [ ! -f "$DATA_DIR/oborot.db" ]; then
+    echo "файла базы нет — первый запуск?"
+    return 0
+  fi
+  stamp="$(date +%Y%m%d-%H%M%S)"
+  BACKUP="$DATA_DIR/backups/oborot-$stamp.db"
+  sqlite3 "$DATA_DIR/oborot.db" ".backup '$BACKUP'" \
+    || die "не удалось снять копию базы перед выкладкой"
+  # Непроверенная копия — не копия. Дешёвый quick_check здесь уместнее полного
+  # integrity_check: он ловит структурные повреждения, а выкладку не тормозит.
+  sqlite3 "$BACKUP" 'PRAGMA quick_check;' | grep -qx 'ok' \
+    || die "копия базы не прошла quick_check: $BACKUP"
+  echo "копия: $BACKUP"
+  # find/sort/awk вместо `ls | tail`: устойчиво к необычным именам файлов.
+  find "$DATA_DIR/backups" -maxdepth 1 -type f -name 'oborot-*.db' \
+    -printf '%T@ %p\n' | sort -rn | awk 'NR > 14 {sub(/^[^ ]+ /, ""); print}' \
+    | xargs -r rm --
   return 0
 }
 
@@ -636,13 +688,18 @@ write_rollback_markers() {
   local sha="$1" venv="$2" tmp_sha tmp_venv
   save_rollback_markers
   tmp_sha="$(mktemp "$STATE_DIR/PREVIOUS_SHA.XXXXXX")" || return 1
+  MARKER_TMP_SHA="$tmp_sha"
   tmp_venv="$(mktemp "$STATE_DIR/PREVIOUS_VENV.XXXXXX")" || { rm -f "$tmp_sha"; return 1; }
+  MARKER_TMP_VENV="$tmp_venv"
   if ! printf '%s\n' "$sha" > "$tmp_sha" || ! printf '%s\n' "$venv" > "$tmp_venv"; then
     rm -f "$tmp_sha" "$tmp_venv"
     return 1
   fi
   # До этой строки на диске не менялось ничего. Дальше — два переименования, и
-  # неудача любого из них возвращает прежнюю пару целиком.
+  # неудача любого из них возвращает прежнюю пару целиком. Отметка ставится
+  # ЗДЕСЬ, до первой мутации: сигнал в любой момент дальше уводит управление в
+  # rollback_release, и вернуть пару должен уже он.
+  MARKERS_TOUCHED=1
   if ! mv "$tmp_sha" "$PREVIOUS_FILE"; then
     rm -f "$tmp_sha" "$tmp_venv"
     restore_rollback_markers || true
@@ -762,7 +819,8 @@ on_exit() {
   # у `exec` EXIT-трап предыдущего не выполняется вовсе. Удалять файл,
   # исполняемый прямо сейчас, безопасно: сюда управление приходит уже на выходе,
   # и дочитывать скрипт оболочка не будет.
-  for cand in "${DRIVER_TMP:-}" "${DRIVER_TMP_PARENT:-}"; do
+  for cand in "${DRIVER_TMP:-}" "${DRIVER_TMP_PARENT:-}" \
+              "${MARKER_TMP_SHA:-}" "${MARKER_TMP_VENV:-}"; do
     [ -n "$cand" ] && [ -e "$cand" ] && rm -f "$cand"
   done
   if [ -n "${STAGING_VENV:-}" ] && [ -e "$STAGING_VENV" ]; then
@@ -905,26 +963,14 @@ else
 fi
 
 echo "== 5/7 Копия базы =="
-STAMP="$(date +%Y%m%d-%H%M%S)"
 if [ "$REPAIR_ONLY" = 1 ]; then
   # Копия перед выкладкой защищает от плохого релиза. Релиза здесь нет: код,
   # env и библиотеки остаются те же самые, база не может пострадать от того,
-  # чего не произошло.
+  # чего не произошло. Если ниже окажется, что перезапуск всё-таки нужен, копия
+  # будет снята там — свежая, а не эта.
   echo "менять нечего — копия перед выкладкой не нужна"
-elif [ -f "$DATA_DIR/oborot.db" ]; then
-  BACKUP="$DATA_DIR/backups/oborot-$STAMP.db"
-  sqlite3 "$DATA_DIR/oborot.db" ".backup '$BACKUP'"
-  # Непроверенная копия — не копия. Дешёвый quick_check здесь уместнее полного
-  # integrity_check: он ловит структурные повреждения, а выкладку не тормозит.
-  sqlite3 "$BACKUP" 'PRAGMA quick_check;' | grep -qx 'ok' \
-    || die "копия базы не прошла quick_check: $BACKUP"
-  echo "копия: $BACKUP"
-  # find/sort/awk вместо `ls | tail`: устойчиво к необычным именам файлов.
-  find "$DATA_DIR/backups" -maxdepth 1 -type f -name 'oborot-*.db' \
-    -printf '%T@ %p\n' | sort -rn | awk 'NR > 14 {sub(/^[^ ]+ /, ""); print}' \
-    | xargs -r rm --
 else
-  echo "файла базы нет — первый запуск?"
+  take_backup
 fi
 
 echo "== 6/7 Переключаемся на коммит =="
@@ -996,6 +1042,12 @@ if [ "$REPAIR_ONLY" = 1 ]; then
   fi
   echo "служба не подтверждает $SHA на /health/ready — перезапускаю;" >&2
   echo "   код, env и библиотеки при этом не менялись" >&2
+  # Копия — ЗДЕСЬ и свежая. Шаг 5 её пропустил, потому что менять было нечего,
+  # но сейчас выяснилось обратное: в бою чужой процесс, и сразу за этой строкой
+  # стартует новый код, который может выполнить миграции. Прежняя копия к этому
+  # моменту уже устарела — прежний релиз продолжал принимать записи между
+  # попытками, и защищать ими нечего.
+  take_backup
 fi
 # Точка невозврата: после перезапуска новый код мог тронуть базу, и решение об
 # откате принимает человек (D-44, deploy/README.md «Почему откат ручной»).
