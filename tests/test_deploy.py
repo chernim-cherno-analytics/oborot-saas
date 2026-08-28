@@ -242,6 +242,20 @@ def make_stubs(bindir: Path, *, health_ok=True, pip_ok=True) -> None:
         encoding="utf-8")
     (bindir / "journalctl").write_text("#!/bin/sh\necho '(логи сервиса)'\n",
                                        encoding="utf-8")
+    # Подставной `date`. В обычном прогоне прозрачен и зовёт настоящий, при
+    # FREEZE_DATE отдаёт заданный штамп на любой формат.
+    #
+    # Нужен ровно для одного: имя копии базы имеет точность до СЕКУНДЫ, и на
+    # быстрой машине две копии подряд попадают в одну секунду. Без заморозки
+    # проверка «вторая копия не затёрла первую» зависит от того, успели ли
+    # часы тикнуть, — то есть краснеет и зеленеет по причине, к коду отношения
+    # не имеющей. Строгий CI поймал этим ровно один настоящий дефект и поймал
+    # дважды; здесь то же условие воспроизводится намеренно и всегда.
+    (bindir / "date").write_text(
+        '#!/bin/sh\n'
+        'if [ -n "${FREEZE_DATE:-}" ]; then echo "$FREEZE_DATE"; exit 0; fi\n'
+        'exec /bin/date "$@"\n',
+        encoding="utf-8")
     # Подставной mv. В обычном прогоне прозрачен, при FAIL_MV_KEEP=1 отказывает
     # РОВНО на одном переименовании — том, которым прежнее окружение
     # откладывается под именем venv-<sha>. Точечность здесь и есть смысл: общее
@@ -335,7 +349,7 @@ def make_stubs(bindir: Path, *, health_ok=True, pip_ok=True) -> None:
         (bindir / "curl").write_text(
             "#!/bin/sh\nprintf '%s' '{\"status\":\"not ready\"}'\nexit 1\n",
             encoding="utf-8")
-    for f in ("systemctl", "journalctl", "curl", "mv"):
+    for f in ("systemctl", "journalctl", "curl", "mv", "date"):
         (bindir / f).chmod(0o755)
     # Подставные python и pip. Настоящая сборка venv занимала бы секунды на
     # каждую выкладку и лезла бы в сеть за пакетами; здесь нужно проверить
@@ -1721,7 +1735,15 @@ def main() -> int:
     vr = add_commit(app, "vr")
     git(["checkout", "-q", "--detach", vsg], cwd=app)
     (WORK / "systemctl.log").write_text("", encoding="utf-8")
-    rc, out = run(["bash", script, vr], env=deploy_env(app, {"FAIL_RESTART": "1"}))
+    # Часы заморожены на обе попытки НАМЕРЕННО. Имя копии имеет точность до
+    # секунды, и на быстрой машине обе попытки попадают в одну секунду: вторая
+    # копия молча перезаписывала первую, и «свежий предрелизный снимок» терялся
+    # ровно там, где он единственный и нужен. Строгий CI поймал это дважды
+    # подряд (прогон 33134587309), а локально на медленной машине не ловилось
+    # вовсе. Заморозка превращает «повезло с тиком часов» в постоянное условие.
+    frozen = {"FREEZE_DATE": "20260101-000000"}
+    rc, out = run(["bash", script, vr],
+                  env=deploy_env(app, {"FAIL_RESTART": "1", **frozen}))
     check("выкладка с неудавшимся перезапуском отклонена", rc == 1, f"rc={rc}")
     check("подготовка: код уже на цели", head_of(app) == vr, head_of(app)[:12])
     check("подготовка: а в бою по-прежнему ПРЕЖНИЙ процесс",
@@ -1732,8 +1754,10 @@ def main() -> int:
     if at_restart.exists():
         at_restart.unlink()
     backups_before = {p.name for p in (WORK / "data" / "backups").glob("oborot-*.db")}
+    check("подготовка: копия первой попытки лежит под замороженным именем",
+          "oborot-20260101-000000.db" in backups_before, str(sorted(backups_before)))
     rc, out = run(["bash", script, vr],
-                  env=deploy_env(app, {"BACKUPS_AT_RESTART": str(at_restart)}))
+                  env=deploy_env(app, {"BACKUPS_AT_RESTART": str(at_restart), **frozen}))
     check("повтор НЕ объявил цель развёрнутой без перезапуска",
           "перезапуск не нужен" not in out, out[-400:])
     check("служба перезапущена", "restart" in (WORK / "systemctl.log").read_text(encoding="utf-8"),
@@ -1754,6 +1778,17 @@ def main() -> int:
           at_restart.exists() and fresh and fresh[0] in at_restart.read_text(encoding="utf-8"),
           at_restart.read_text(encoding="utf-8").strip()[-200:] if at_restart.exists()
           else "список на момент перезапуска не снят")
+    # И прежняя копия при этом ЖИВА: занятое имя дополняется счётчиком, а не
+    # перезаписывается. Обе попытки шли в одну и ту же (замороженную) секунду,
+    # поэтому проверка адресует именно тот шов, где копия терялась.
+    same_second = sorted(p.name for p in (WORK / "data" / "backups").glob("oborot-20260101-000000*.db"))
+    check("две копии в одну секунду остались ДВУМЯ разными файлами",
+          len(same_second) == 2 and len(set(same_second)) == 2, str(same_second))
+    check("копия первой попытки не затёрта второй",
+          "oborot-20260101-000000.db" in same_second, str(same_second))
+    check("новая копия — именно та, что видна перезапуску",
+          fresh and fresh[0] in same_second and fresh[0] != "oborot-20260101-000000.db",
+          f"новая={fresh} все={same_second}")
 
     print("\n== Сигнал во время записи пары маркеров не теряет цель отката ==")
     # Обработка отказа внутри самой записи тут ни при чём: сигнал приходит

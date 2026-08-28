@@ -116,6 +116,11 @@ SUITES = [
     # как есть. Ключа --allow-skip у него нет и не будет: набор офлайновый,
     # ни сети, ни моков ему не нужно, и пропуститься ему не на чем (D-42).
     ("formula",     "test_formula_contract.py", False, False),
+    # Операторская сверка месяца продаж с эталоном первой таблицы
+    # (DATA-4/DATA-5). Набор офлайновый: ни мока МойСклада, ни телеграма ему
+    # не нужно — эталон он поднимает сам локальным сервером на эфемерном
+    # порту, поэтому раздавать ему порт не требуется.
+    ("reconcile",   "test_reconcile_sales.py", False, False),
     ("ui",          "test_ui.py",              False, False),
     ("backup",      "test_backup.py",          False, False),
     ("deploy",      "test_deploy.py",          False, False),
