@@ -72,7 +72,10 @@ stdout и нигде не сохраняется. Это существенно:
   B. Явный формат сверки:
      `{"month": "YYYY-MM", "bases": {"<база>": {"net_qty": .., "net_rev": ..,
        "gross_rev": .., "return_rev": ..}}}` — поля `gross_rev`/`return_rev`
-     необязательные.
+     необязательные, но если даны оба, то `net_rev` обязан равняться их
+     разности: разрез, противоречащий сам себе, — не разрез. Необязательное
+     поле `returns_coverage: "full"` объявляет, что охват возвратов у эталона
+     совпадает с «Оборотом» (по умолчанию это НЕ предполагается).
   C. Штатный публичный ответ `GET /api/sales-monthly?month=YYYY-MM`
      (`legacy/main.py::get_sales_monthly`):
      `{"months": [...], "month": "YYYY-MM",
@@ -105,12 +108,33 @@ stdout и нигде не сохраняется. Это существенно:
   добавка росла вместе с суммой и на 25 млн прощала две копейки — ровно то
   ложное согласие, ради предотвращения которого проверка и написана.
 
+ДВЕ ВЕЩИ, КОТОРЫЕ ИНСТРУМЕНТ НАЗЫВАЕТ, А НЕ СГЛАЖИВАЕТ.
+
+* **Округление публикации формата A.** `sales_by_month` отдаёт выручку
+  позиции округлённой до рубля, «Оборот» держит копейки. На ОДНИХ И ТЕХ ЖЕ
+  исходных строках это даёт до полурубля на позицию — и это разрешение
+  публикации, а не расхождение данных. Величина считается заранее
+  (`FORMAT_A_REV_ROUNDING`), печатается отдельной строкой и вычитается только
+  при решении «сработал ли `--fail-on-delta`». Само расхождение при этом
+  остаётся в отчёте числом: прятать его нечем и незачем. У форматов B и C
+  неопределённость нулевая, то есть их поведение прежнее.
+* **Разный охват возвратов.** «Оборот» грузит `salesreturn` И
+  `retailsalesreturn`, зеркало первой таблицы — только `salesreturn`. На
+  месяце с розничными возвратами строки «валовые» и «возвраты» у двух сторон
+  считают РАЗНЫЕ множества документов, поэтому классификация «возвраты
+  сошлись, разница в валовых» по ним не доказывается. Отчёт помечает обе
+  строки справочными (`returns_comparable: false`), пока охват не выровнен
+  или не объявлен полным явным полем `returns_coverage`.
+
 ОТКАЗ ЗАКРЫТЫМ. Недоступная или битая база, отсутствующая организация,
-месяц, за который у организации нет ни одной строки продаж, недоступный или
-непонятный эталон, месяц, которого нет в эталоне, база, открывшаяся на
-запись, нечисловое или НЕ КОНЕЧНОЕ значение в эталоне (`NaN`, `Infinity`,
-целое вне диапазона float), негодный порог `--fail-on-delta` и просто
-неверный вызов — всё это ошибка с кодом 1, а не «ноль» и не «сошлось».
+месяц, за который у организации нет ни одной строки продаж, строки продаж
+без товара этой организации (их деньги выпадают из всех итогов, поэтому
+сверка не выполняется вовсе), недоступный или непонятный эталон, месяц,
+которого нет в эталоне, самопротиворечивый разрез `net`/`gross`/`return`,
+база, открывшаяся на запись, нечисловое или НЕ КОНЕЧНОЕ значение в эталоне
+(`NaN`, `Infinity`, целое вне диапазона float), негодные `--fail-on-delta`
+и `--timeout` и просто неверный вызов — всё это ошибка с кодом 1, а не
+«ноль» и не «сошлось».
 
 КОДЫ ВОЗВРАТА.
   0 — сверка выполнена (расхождение может быть любым, если не задан порог);
@@ -190,6 +214,31 @@ MONTH_RE = re.compile(r"^\d{4}-\d{2}$")
 MONEY_TOLERANCE = 0.01      # ₽, копейка — ПОТОЛОК, а не типичное значение
 QTY_TOLERANCE = 1e-6        # шт — тот же потолок для количеств
 SUMMATION_STEPS = 1_000_000  # верхняя оценка числа слагаемых в сумме эталона
+
+# Неопределённость округления формата A. `legacy/rebuild_history.py`
+# (`sales_by_month`) публикует выручку позиции уже округлённой до РУБЛЯ
+# (`round(v[1])`), а количество — до одного знака (`round(v[0], 1)`). «Оборот»
+# держит копейки, поэтому даже на идентичных исходных строках сравнение
+# «в лоб» даёт до полурубля расхождения на позицию — и это не расхождение
+# данных, а разрешение публикации (найдено ревью, discussion_r3877357940).
+#
+# Величина хранится рядом с числами и вычитается из расхождения при решении
+# «сработал ли порог», но НЕ прячется: и текстовый отчёт, и JSON называют её
+# отдельно. Спрятать её было бы ровно тем же классом ошибки, что и прощать
+# две копейки на 25 млн, только с другой стороны.
+FORMAT_A_REV_ROUNDING = 0.5   # ₽ на позицию: round() до рубля
+FORMAT_A_QTY_ROUNDING = 0.05  # шт на позицию: round(..., 1)
+
+# Охват возвратов у эталона. «Оборот» грузит и `salesreturn`, и
+# `retailsalesreturn` (`app/ms_sync.py::_collect_sales`), а зеркало первой
+# таблицы — только `salesreturn` (`legacy/sync.py::sync_sales`, SCHEMA).
+# Значит у месяца с розничными возвратами разница по возвратам ОЖИДАЕМА и
+# ничего не говорит о качестве загрузки (найдено ревью,
+# discussion_r3877357928). Инструмент обязан сказать это структурно, а не
+# молча выдать известное расхождение охвата за расхождение данных.
+COVERAGE_FULL = "full"                # обе стороны считают одни и те же документы
+COVERAGE_LEGACY_PARTIAL = "legacy_partial"  # у эталона нет розничных возвратов
+COVERAGE_UNKNOWN = "unknown"          # происхождение эталона не объявлено
 
 # Печатается рядом с числами всегда. Формулировка сознательно не выбирает
 # правильную сторону: это вопрос владельца (AGENTS.md §3).
@@ -374,6 +423,31 @@ def load_saas_month(conn: sqlite3.Connection, org_id: int, month: str) -> dict:
         for k in totals:
             totals[k] += v[k]
 
+    # Строки продаж, у которых не нашлось товара ЭТОЙ организации, — отказ
+    # закрытым, а не примечание в конце отчёта (найдено ревью,
+    # discussion_r3877357936).
+    #
+    # Внутреннее соединение таких строк не возвращает, поэтому их деньги
+    # выпадают из ВСЕХ итогов, включая «сырое нетто». Прежняя версия честно
+    # печатала счётчик — и этого мало: «сырое» переставало означать «все
+    # продажи организации», а `--fail-on-delta` считался по неполной сумме,
+    # то есть прогон мог с одинаковым успехом ложно согласиться с эталоном и
+    # ложно с ним разойтись. Ни одно из двух чисел, между которыми выбирает
+    # оператор, при этом не было бы верным.
+    #
+    # Внешнее соединение вместо отказа не годится: у такой строки нет ни
+    # базового имени, ни категории, ни признака исключения — её деньги
+    # нельзя ни разложить по позициям, ни сопоставить с эталоном. Появился бы
+    # итог, который не раскладывается. Отказ честнее: состояние ненормальное
+    # (foreign keys в приложении выключены осознанно, `app/db.py`), и
+    # разбираться с ним нужно до сверки, а не во время неё.
+    orphan_rows = int(total_rows) - joined_rows
+    if orphan_rows:
+        raise ReconcileError(
+            f"у организации id={org_id} за {month} есть {orphan_rows} строк продаж без "
+            "товара этой организации: их деньги не попадают ни в один итог, поэтому "
+            "сверка не выполняется — сначала разобраться с этими строками")
+
     return {
         "org_id": org_id,
         "month": month,
@@ -382,9 +456,7 @@ def load_saas_month(conn: sqlite3.Connection, org_id: int, month: str) -> dict:
         "totals": totals,
         "bases": bases,
         "rows": int(total_rows),
-        # Строки продаж, у которых не нашлось товара этой же организации.
-        # Это не норма и не ноль: такие деньги не попадают ни в один экран.
-        "orphan_rows": int(total_rows) - joined_rows,
+        "orphan_rows": orphan_rows,
         "archived_bases": sorted(hidden & set(bases)),
     }
 
@@ -410,6 +482,12 @@ def _agrees(got: float, expected: float, absolute: float) -> bool:
     if not (math.isfinite(got) and math.isfinite(expected)):
         return False
     return abs(got - expected) <= _tolerance(expected, got, absolute)
+
+
+def _no_rounding() -> dict:
+    """Эталон отдаёт копейки как есть — неопределённости публикации нет."""
+    return {"per_base_rev": 0.0, "per_base_qty": 0.0,
+            "total_rev": 0.0, "total_qty": 0.0, "source": ""}
 
 
 def _number(value, where: str) -> float:
@@ -570,7 +648,13 @@ def _parse_reference_sales_monthly(payload: dict, month: str) -> dict:
         "gross_rev": sum(v["gross_rev"] for v in bases.values()),
         "return_rev": sum(v["return_rev"] for v in bases.values()),
     }
-    return {"month": month, "shape": "sales_monthly", "bases": bases, "totals": totals}
+    return {
+        "month": month, "shape": "sales_monthly", "bases": bases, "totals": totals,
+        # Копейки эталон здесь не режет — округления публикации нет.
+        "rounding": _no_rounding(),
+        # Но источник тот же: у зеркала первой таблицы розничных возвратов нет.
+        "returns_coverage": COVERAGE_LEGACY_PARTIAL,
+    }
 
 
 def _parse_reference_by_month(payload: dict, month: str) -> dict:
@@ -605,7 +689,19 @@ def _parse_reference_by_month(payload: dict, month: str) -> dict:
         "gross_rev": None,
         "return_rev": None,
     }
-    return {"month": month, "shape": "sales_by_month", "bases": bases, "totals": totals}
+    # Формат A публикует выручку позиции округлённой до рубля — неопределённость
+    # известна заранее и переносится в отчёт вместе с числами.
+    return {
+        "month": month, "shape": "sales_by_month", "bases": bases, "totals": totals,
+        "rounding": {"per_base_rev": FORMAT_A_REV_ROUNDING,
+                     "per_base_qty": FORMAT_A_QTY_ROUNDING,
+                     "total_rev": FORMAT_A_REV_ROUNDING * len(bases),
+                     "total_qty": FORMAT_A_QTY_ROUNDING * len(bases),
+                     "source": "формат A округляет выручку позиции до рубля"},
+        # Тот же источник, что и у формата C: зеркало первой таблицы, где
+        # розничных возвратов нет вовсе.
+        "returns_coverage": COVERAGE_LEGACY_PARTIAL,
+    }
 
 
 def _parse_reference_explicit(payload: dict, month: str) -> dict:
@@ -630,16 +726,31 @@ def _parse_reference_explicit(payload: dict, month: str) -> dict:
         cur = bases.setdefault(canon_base(raw_base),
                                {"net_qty": 0.0, "net_rev": 0.0,
                                 "gross_rev": 0.0, "return_rev": 0.0})
+        net_rev = _number(item["net_rev"], f"{raw_base!r} net_rev")
         cur["net_qty"] += _number(item["net_qty"], f"{raw_base!r} net_qty")
-        cur["net_rev"] += _number(item["net_rev"], f"{raw_base!r} net_rev")
+        cur["net_rev"] += net_rev
+        gross_rev = return_rev = None
         if "gross_rev" in item:
-            cur["gross_rev"] += _number(item["gross_rev"], f"{raw_base!r} gross_rev")
+            gross_rev = _number(item["gross_rev"], f"{raw_base!r} gross_rev")
+            cur["gross_rev"] += gross_rev
         else:
             has_gross = False
         if "return_rev" in item:
-            cur["return_rev"] += _number(item["return_rev"], f"{raw_base!r} return_rev")
+            return_rev = _number(item["return_rev"], f"{raw_base!r} return_rev")
+            cur["return_rev"] += return_rev
         else:
             has_return = False
+        # Разрез, который сам себе противоречит, — не разрез (найдено ревью,
+        # discussion_r3877357945). Ровно ради классификации «возвраты сошлись,
+        # разница в валовых» этот формат и существует; если net не равен
+        # gross − return, отчёт печатает нетто-расхождение, противоречащее
+        # собственному разрезу, — то есть отвечает не на тот вопрос, ради
+        # которого его читают. Допуск тот же ограниченный, что и у живой ручки.
+        if gross_rev is not None and return_rev is not None:
+            if not _agrees(net_rev, gross_rev - return_rev, MONEY_TOLERANCE):
+                raise ReconcileError(
+                    f"эталон противоречит сам себе: у позиции {raw_base!r} "
+                    "net_rev не равен gross_rev − return_rev")
 
     # Частично заполненный разрез — это не разрез: складывать известное с
     # неизвестным и печатать сумму значило бы выдать домысел за факт.
@@ -655,7 +766,18 @@ def _parse_reference_explicit(payload: dict, month: str) -> dict:
         "gross_rev": sum(v["gross_rev"] for v in bases.values()) if has_gross and bases else None,
         "return_rev": sum(v["return_rev"] for v in bases.values()) if has_return and bases else None,
     }
-    return {"month": month, "shape": "explicit", "bases": bases, "totals": totals}
+    # Происхождение этого формата инструменту неизвестно: его готовит человек.
+    # Поэтому охват возвратов по умолчанию НЕ считается доказанным, но может
+    # быть объявлен явно — тогда классификация возвратов сравнима.
+    declared = payload.get("returns_coverage", COVERAGE_UNKNOWN)
+    if declared not in (COVERAGE_FULL, COVERAGE_LEGACY_PARTIAL, COVERAGE_UNKNOWN):
+        raise ReconcileError(
+            f"эталон: неизвестное значение 'returns_coverage': {declared!r}")
+    return {
+        "month": month, "shape": "explicit", "bases": bases, "totals": totals,
+        "rounding": _no_rounding(),
+        "returns_coverage": declared,
+    }
 
 
 def load_reference_file(path: str, month: str) -> dict:
@@ -677,6 +799,9 @@ def load_reference_url(url: str, month: str, timeout: float = 30.0) -> dict:
     данными отклоняется до сети — иначе секрет утёк бы в историю команд и в
     журналы сервера.
     """
+    # Таймаут проверяется ЗДЕСЬ, а не только в `run`: функция публичная, и
+    # вызвать её мимо CLI ничто не мешает — та же причина, что у `exceeds`.
+    timeout = check_timeout(timeout)
     parsed = urllib.parse.urlparse(str(url))
     if parsed.scheme not in ("http", "https"):
         raise ReconcileError(f"эталон: поддерживаются только http и https, получено {parsed.scheme!r}")
@@ -694,7 +819,11 @@ def load_reference_url(url: str, month: str, timeout: float = 30.0) -> dict:
             raw = response.read()
     except ReconcileError:
         raise
-    except (urllib.error.URLError, OSError, ValueError) as exc:
+    # OverflowError здесь не теоретический: на негодном таймауте его бросает
+    # сам слой сокетов. Таймаут уже проверен выше, но перечень оставлен
+    # полным — отказ закрытым не должен зависеть от того, что проверка выше
+    # осталась на месте.
+    except (urllib.error.URLError, OSError, ValueError, OverflowError) as exc:
         raise ReconcileError(f"эталон: {url} недоступен: {exc}") from exc
     try:
         payload = json.loads(raw.decode("utf-8"))
@@ -704,6 +833,19 @@ def load_reference_url(url: str, month: str, timeout: float = 30.0) -> dict:
 
 
 # ── сравнение ────────────────────────────────────────────────────────────────
+
+def _excess(delta, allowance: float) -> float:
+    """Часть расхождения, которую НЕЛЬЗЯ объяснить заявленной неопределённостью.
+
+    Ноль означает «целиком объяснимо», а не «расхождения нет»: само
+    расхождение остаётся в отчёте отдельным числом. Скидка применяется только
+    к решению «сработал ли порог» — и только на ту величину, которая честно
+    вытекает из округления публикации эталона.
+    """
+    if delta is None:
+        return 0.0
+    return max(0.0, abs(delta) - max(0.0, float(allowance)))
+
 
 def _delta(left, right):
     """Разность там, где известны обе стороны; иначе None (а не ноль)."""
@@ -753,6 +895,16 @@ def compare(saas: dict, reference: dict, *, basis: str = "raw", top: int = 10) -
     deltas["net_rev"] = deltas["net_rev_raw"] if basis == "raw" else deltas["net_rev_included"]
     deltas["net_qty"] = deltas["net_qty_raw"] if basis == "raw" else deltas["net_qty_included"]
 
+    # Неопределённость публикации эталона и та часть расхождения, которую ею
+    # объяснить НЕЛЬЗЯ. Порог `--fail-on-delta` смотрит именно на вторую: у
+    # формата A обе стороны могут иметь одни и те же исходные строки и всё
+    # равно разойтись на полурубль по позиции, и объявлять это расхождением
+    # значит поднимать ложную тревогу. Прятать её при этом нечем: и число, и
+    # его происхождение печатаются рядом.
+    rounding = reference.get("rounding") or _no_rounding()
+    deltas["net_rev_excess"] = _excess(deltas["net_rev"], rounding["total_rev"])
+    deltas["net_qty_excess"] = _excess(deltas["net_qty"], rounding["total_qty"])
+
     saas_bases, ref_bases = saas["bases"], reference["bases"]
     per_base = []
     for base in sorted(set(saas_bases) | set(ref_bases)):
@@ -772,11 +924,49 @@ def compare(saas: dict, reference: dict, *, basis: str = "raw", top: int = 10) -
             "saas_net_qty": saas_qty,
             "reference_net_qty": ref_qty,
             "delta_qty": saas_qty - ref_qty,
+            # Часть расхождения, объяснимая округлением публикации эталона:
+            # у позиции, которой у эталона нет, объяснять нечего.
+            "rounding_rev": rounding["per_base_rev"] if right else 0.0,
+            "rounding_qty": rounding["per_base_qty"] if right else 0.0,
         })
+    for item in per_base:
+        item["delta_rev_excess"] = _excess(item["delta_rev"], item["rounding_rev"])
+        item["delta_qty_excess"] = _excess(item["delta_qty"], item["rounding_qty"])
+        item["within_reference_rounding"] = item["delta_rev_excess"] == 0.0
 
-    # Детерминированный порядок: по модулю расхождения, при равенстве — по имени.
-    ranked = sorted(per_base, key=lambda it: (-abs(it["delta_rev"]), it["base_name"]))
+    # Детерминированный порядок: по НЕОБЪЯСНЁННОЙ части расхождения, затем по
+    # модулю расхождения, затем по имени. Ранжировать по сырому расхождению
+    # значило бы поднимать наверх позиции, вся разница которых — округление
+    # публикации эталона (найдено ревью, discussion_r3877357940).
+    ranked = sorted(per_base, key=lambda it: (-it["delta_rev_excess"],
+                                              -abs(it["delta_rev"]), it["base_name"]))
     top_n = max(0, int(top))
+
+    # Охват возвратов. «Оборот» грузит и обычные, и РОЗНИЧНЫЕ возвраты, а
+    # зеркало первой таблицы — только обычные. Значит на месяце с розничными
+    # возвратами строки «валовые» и «возвраты» у двух сторон считают разные
+    # множества документов, и разность по ним — известная разница охвата, а не
+    # вывод о качестве загрузки. Инструмент говорит это структурно и не
+    # выдаёт классификацию за доказанную (discussion_r3877357928).
+    coverage = reference.get("returns_coverage", COVERAGE_UNKNOWN)
+    comparable = coverage == COVERAGE_FULL
+    notes = []
+    if not comparable:
+        notes.append(
+            "Возвраты сторон посчитаны по РАЗНЫМ множествам документов: «Оборот» "
+            "берёт salesreturn и retailsalesreturn, зеркало первой таблицы — только "
+            "salesreturn. "
+            + ("Охват эталона не объявлен, поэтому равным он не считается. "
+               if coverage == COVERAGE_UNKNOWN else "")
+            + "Строки «валовые» и «возвраты» поэтому справочные: классифицировать "
+              "расхождение как «возвраты сошлись, разница в валовых» по ним нельзя, "
+              "пока охват не выровнен или не доказан.")
+    if rounding["total_rev"]:
+        notes.append(
+            f"{rounding['source']}: до {rounding['per_base_rev']:g} ₽ на позицию и до "
+            f"{rounding['total_rev']:g} ₽ на итог — это неопределённость публикации "
+            "эталона, а не расхождение данных. Порог --fail-on-delta смотрит на "
+            "необъяснённую ею часть.")
 
     return {
         "org_id": saas["org_id"],
@@ -798,7 +988,13 @@ def compare(saas: dict, reference: dict, *, basis: str = "raw", top: int = 10) -
         "saas_rows": saas["rows"],
         "orphan_rows": saas["orphan_rows"],
         "archived_bases": saas["archived_bases"],
-        "scope_notes": list(SCOPE_NOTES),
+        "reference_rounding": dict(rounding),
+        "returns_coverage": coverage,
+        # Сравнимы ли строки «валовые» и «возвраты» между сторонами. Ложь
+        # означает не «числа неверны», а «их разность включает известную
+        # разницу охвата документов», то есть классифицировать по ней нельзя.
+        "returns_comparable": comparable,
+        "scope_notes": list(SCOPE_NOTES) + notes,
     }
 
 
@@ -825,6 +1021,29 @@ def check_threshold(threshold):
     return value
 
 
+def check_timeout(timeout):
+    """Таймаут запроса эталона: конечный и строго положительный, иначе отказ.
+
+    Найдено ревью (discussion_r3877540672). `argparse` с `type=float`
+    принимает `inf`, а `urlopen` на нём падает `OverflowError: timestamp out
+    of range for platform time_t` — и этот класс исключения не ловился
+    обработчиком, то есть вместо обещанного «ОТКАЗ» и кода 1 инструмент
+    выдавал трассировку. Тот же дефект, что у `--fail-on-delta nan`, только с
+    другой стороны: негодное число доезжает до места, где его уже некому
+    проверить.
+
+    Ноль и отрицательные тоже отвергаются: «ждать не дольше нуля секунд» —
+    это не таймаут, а другое поведение (неблокирующий сокет), и просить его
+    ключом с таким именем нельзя.
+    """
+    value = float(timeout)
+    if not math.isfinite(value):
+        raise ReconcileError(f"--timeout должен быть конечным числом, получено {timeout!r}")
+    if value <= 0:
+        raise ReconcileError(f"--timeout должен быть больше нуля, получено {timeout!r}")
+    return value
+
+
 def exceeds(report: dict, threshold) -> bool:
     """Расхождение по выбранной базе строго больше порога? Порога нет — нет.
 
@@ -834,7 +1053,11 @@ def exceeds(report: dict, threshold) -> bool:
     value = check_threshold(threshold)
     if value is None:
         return False
-    delta = report["deltas"]["net_rev"]
+    # Сравнивается НЕОБЪЯСНЁННАЯ часть расхождения: та, которую не покрывает
+    # округление публикации эталона. У форматов B и C неопределённость нулевая,
+    # и это ровно прежнее поведение; у формата A иначе `--fail-on-delta 0`
+    # срабатывал бы на идентичных исходных строках (discussion_r3877357940).
+    delta = report["deltas"].get("net_rev_excess", report["deltas"]["net_rev"])
     if not math.isfinite(delta):
         raise ReconcileError("расхождение не является конечным числом")
     return abs(delta) > value
@@ -857,9 +1080,11 @@ def render_text(report: dict) -> str:
         f"База сравнения: {report['basis']}; формат эталона: {report['reference_shape']}",
         "",
         f"  валовые продажи      «Оборот» {_money(t['saas_gross_rev'])}"
-        f"   эталон {_money(t['reference_gross_rev'])}   Δ {_money(d['gross_rev_raw'])}",
+        f"   эталон {_money(t['reference_gross_rev'])}   Δ {_money(d['gross_rev_raw'])}"
+        f"{'' if report['returns_comparable'] else '   [охват возвратов разный — справочно]'}",
         f"  возвраты             «Оборот» {_money(t['saas_return_rev'])}"
-        f"   эталон {_money(t['reference_return_rev'])}   Δ {_money(d['return_rev_raw'])}",
+        f"   эталон {_money(t['reference_return_rev'])}   Δ {_money(d['return_rev_raw'])}"
+        f"{'' if report['returns_comparable'] else '   [охват возвратов разный — справочно]'}",
         f"  сырое нетто          «Оборот» {_money(t['saas_net_rev'])}"
         f"   эталон {_money(t['reference_net_rev'])}   Δ {_money(d['net_rev_raw'])}",
         f"  нетто интерфейса     «Оборот» {_money(t['saas_included_net_rev'])}"
@@ -875,15 +1100,22 @@ def render_text(report: dict) -> str:
     ]
     if report["archived_bases"]:
         lines.append(f"  в ручном архиве организации: {len(report['archived_bases'])} позиц.")
+    if report["reference_rounding"]["total_rev"]:
+        lines.append(
+            f"  неопределённость публикации эталона: до "
+            f"{_money(report['reference_rounding']['total_rev'])} на итог; "
+            f"необъяснённая ею часть расхождения: {_money(d['net_rev_excess'])}")
     if report["top_base_deltas"]:
         lines.append("")
         lines.append("  Крупнейшие расхождения по позициям:")
         for item in report["top_base_deltas"]:
             where = "обе" if item["in_saas"] and item["in_reference"] else (
                 "только «Оборот»" if item["in_saas"] else "только эталон")
+            mark = "  [в пределах округления эталона]" if (
+                item["within_reference_rounding"] and item["delta_rev"]) else ""
             lines.append(
                 f"    {_money(item['delta_rev']):>18}   {item['base_name']}   "
-                f"(«Оборот» {_money(item['saas_net_rev'])}, эталон {_money(item['reference_net_rev'])}, {where})")
+                f"(«Оборот» {_money(item['saas_net_rev'])}, эталон {_money(item['reference_net_rev'])}, {where}){mark}")
     lines.append("")
     for note in report["scope_notes"]:
         lines.append(f"  ! {note}")
@@ -948,6 +1180,10 @@ def run(argv: list[str] | None = None, *, stdout=None) -> int:
         if args.top < 0:
             raise ReconcileError("--top не может быть отрицательным")
         threshold = check_threshold(args.fail_on_delta)
+        # Таймаут проверяется всегда, а не только при `--reference-url`:
+        # бессмысленное значение — это сломанный вызов независимо от того,
+        # дойдёт ли дело до сети.
+        check_timeout(args.timeout)
         conn = open_readonly(args.db)
         saas = load_saas_month(conn, args.org, args.month)
         if args.reference_file:

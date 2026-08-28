@@ -876,6 +876,25 @@ def test_threshold_validation():
     check("отсутствие порога по-прежнему допустимо", rc.check_threshold(None) is None)
 
 
+def test_timeout_validation():
+    """Негодный таймаут — отказ закрытым, а не трассировка.
+
+    Регрессия на discussion_r3877540672: `--timeout inf` доезжал до слоя
+    сокетов и падал там `OverflowError`, который не ловился обработчиком, —
+    вместо обещанных «ОТКАЗ» и кода 1 пользователь получал трассировку.
+    """
+    for bad in (float("inf"), float("-inf"), float("nan"), 0, -1, -0.5):
+        check(f"таймаут {bad!r} отклонён",
+              raises(lambda b=bad: rc.check_timeout(b), rc.ReconcileError))
+    check("обычный таймаут допустим", rc.check_timeout(30) == 30.0)
+    check("дробный таймаут допустим", rc.check_timeout(0.5) == 0.5)
+
+    # Тот же путь целиком: функция публичная и вызывается мимо CLI.
+    check("load_reference_url с бесконечным таймаутом — ReconcileError, а не OverflowError",
+          raises(lambda: rc.load_reference_url("http://127.0.0.1:1/x", MONTH,
+                                               timeout=float("inf")), rc.ReconcileError))
+
+
 def test_shapes_preserved():
     """Три формата различаются, и новый не перехватил старые."""
     check("формат A остаётся A",
@@ -905,6 +924,210 @@ def test_sales_monthly_end_to_end():
     text = rc.render_text(rep)
     check("в тексте отчёта валовые и возвраты — числа, а не прочерк",
           "28 500.00" in text and "5 000.00" in text)
+
+
+def orphan_db(tmpdir: Path) -> Path:
+    """Копия фикстуры с ОДНОЙ строкой продажи без товара своей организации.
+
+    Строка добавляется прямым sqlite к копии, а не через модели: приложение
+    такую строку само не создаёт, но и не запрещает — внешние ключи в нём
+    выключены осознанно (`app/db.py`), и именно это состояние проверяется.
+    """
+    copy = tmpdir / "orphan.db"
+    shutil.copyfile(DB_PATH, copy)
+    conn = sqlite3.connect(copy)
+    missing_pid = conn.execute("SELECT MAX(id) + 1000 FROM products").fetchone()[0]
+    conn.execute(
+        "INSERT INTO sales (org_id, product_id, date, qty, revenue, is_return) "
+        "VALUES (?, ?, ?, ?, ?, 0)", (ORG_ID, missing_pid, "2026-05-11", 3.0, 12345.0))
+    conn.commit()
+    conn.close()
+    return copy
+
+
+def test_orphan_rows_fail_closed():
+    """Строки продаж без товара своей организации — отказ, а не примечание.
+
+    Регрессия на discussion_r3877357936: внутреннее соединение выбрасывало
+    такие деньги из ВСЕХ итогов, «сырое нетто» переставало означать «все
+    продажи организации», а `--fail-on-delta` считался по неполной сумме.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        tmpdir = Path(tmp)
+        copy = orphan_db(tmpdir)
+        conn = rc.open_readonly(str(copy))
+        try:
+            check("месяц со строкой-сиротой не сверяется вовсе",
+                  raises(lambda: rc.load_saas_month(conn, ORG_ID, MONTH), rc.ReconcileError))
+            check("месяц без сирот сверяется по-прежнему",
+                  rc.load_saas_month(conn, ORG_ID, "2026-04")["totals"]["gross_rev"] == 30000.0)
+        finally:
+            conn.close()
+
+        ref_file = write_json(tmpdir, "ref.json", REFERENCE_BY_MONTH)
+        code, text = run_cli(["--db", str(copy), "--org", str(ORG_ID), "--month", MONTH,
+                              "--reference-file", ref_file])
+        check("через CLI это код 1, а не отчёт по неполным деньгам",
+              code == rc.EXIT_ERROR, f"код {code}")
+        check("и отчёта при этом нет", text == "", repr(text[:80]))
+        code, _ = run_cli(["--db", str(copy), "--org", str(ORG_ID), "--month", MONTH,
+                           "--reference-file", ref_file, "--fail-on-delta", "0"])
+        check("порог по неполной сумме не вычисляется: тоже код 1, а не 2",
+              code == rc.EXIT_ERROR, f"код {code}")
+
+        check("на здоровой базе поведение не изменилось",
+              saas_month()["orphan_rows"] == 0)
+
+
+def test_explicit_decomposition():
+    """Разрез, противоречащий сам себе, — отказ закрытым.
+
+    Регрессия на discussion_r3877357945: `net`, `gross` и `return` принимались
+    независимо, и отчёт печатал нетто-расхождение, противоречащее собственной
+    классификации — ровно тому, ради чего этот формат и существует.
+    """
+    contradiction = {"month": MONTH, "bases": {
+        "Худи": {"net_qty": 1, "net_rev": 100, "gross_rev": 100, "return_rev": 50}}}
+    check("net ≠ gross − return — отказ закрытым",
+          raises(lambda: rc.parse_reference(contradiction, MONTH), rc.ReconcileError))
+
+    for net in (150.5, 49.5, 0):
+        payload = {"month": MONTH, "bases": {
+            "Худи": {"net_qty": 1, "net_rev": net, "gross_rev": 100, "return_rev": 50}}}
+        check(f"net={net!r} при gross 100 и return 50 — отказ закрытым",
+              raises(lambda p=payload: rc.parse_reference(p, MONTH), rc.ReconcileError))
+
+    consistent = {"month": MONTH, "bases": {
+        "Худи": {"net_qty": 1, "net_rev": 50, "gross_rev": 100, "return_rev": 50}}}
+    check("согласованный разрез разбирается",
+          rc.parse_reference(consistent, MONTH)["totals"]["net_rev"] == 50.0)
+
+    # Допуск тот же ограниченный, что и у живой ручки: копейка прощается,
+    # две — уже нет.
+    noise = {"month": MONTH, "bases": {
+        "Худи": {"net_qty": 1, "net_rev": 50 + 1e-9, "gross_rev": 100, "return_rev": 50}}}
+    check("шум float внутри допуска разбор не роняет",
+          rc.parse_reference(noise, MONTH)["totals"]["gross_rev"] == 100.0)
+    off = {"month": MONTH, "bases": {
+        "Худи": {"net_qty": 1, "net_rev": 50.02, "gross_rev": 100, "return_rev": 50}}}
+    check("две копейки в разрезе — уже отказ",
+          raises(lambda: rc.parse_reference(off, MONTH), rc.ReconcileError))
+
+    # Неполный разрез проверять нечем — и он по-прежнему допустим.
+    partial = {"month": MONTH, "bases": {"Худи": {"net_qty": 1, "net_rev": 100}}}
+    check("позиция без разреза по-прежнему допустима",
+          rc.parse_reference(partial, MONTH)["totals"]["gross_rev"] is None)
+    check("прежняя синтетика формата B по-прежнему разбирается",
+          rc.parse_reference(REFERENCE_EXPLICIT, MONTH)["totals"]["gross_rev"] == 28500.0)
+
+
+def test_format_a_rounding():
+    """Округление формата A названо числом и не выдаётся за расхождение.
+
+    Регрессия на discussion_r3877357940: `sales_by_month` публикует выручку
+    позиции округлённой до рубля, а «Оборот» держит копейки — на идентичных
+    исходных строках сравнение «в лоб» давало до полурубля на позицию,
+    поднимало такие позиции в топ и роняло `--fail-on-delta 0`.
+    """
+    ref = rc.parse_reference(REFERENCE_BY_MONTH, MONTH)
+    check("формат A объявляет неопределённость публикации",
+          ref["rounding"]["per_base_rev"] == 0.5
+          and ref["rounding"]["total_rev"] == 0.5 * len(ref["bases"]),
+          str(ref["rounding"]))
+    for shape, payload in (("B", REFERENCE_EXPLICIT), ("C", SALES_MONTHLY)):
+        parsed = rc.parse_reference(payload, MONTH)
+        check(f"у формата {shape} неопределённости публикации нет",
+              parsed["rounding"]["total_rev"] == 0.0)
+
+    # Идентичные исходные данные, опубликованные с округлением до рубля:
+    # «Оборот» держит копейки, эталон — целые рубли.
+    cents = {"Худи": 12000.49, "Футболка": 6000.5, "Пробник": 999.5,
+             "Свеча": 4000.5}
+    rounded = {name: {MONTH: [1, round(value)]} for name, value in cents.items()}
+    saas = saas_month()
+    for name, value in cents.items():
+        saas["bases"][name]["net_rev"] = value
+    saas["totals"]["net_rev"] = sum(cents.values())
+    rep = rc.compare(saas, rc.parse_reference(rounded, MONTH))
+    check("подготовка: расхождение целиком в округлении",
+          abs(rep["deltas"]["net_rev"]) <= rep["reference_rounding"]["total_rev"],
+          f"Δ={rep['deltas']['net_rev']!r} допуск={rep['reference_rounding']['total_rev']!r}")
+    check("необъяснённая часть расхождения — ноль",
+          rep["deltas"]["net_rev_excess"] == 0.0, str(rep["deltas"]["net_rev_excess"]))
+    check("--fail-on-delta 0 на таком расхождении НЕ срабатывает",
+          rc.exceeds(rep, 0) is False)
+    check("каждая позиция помечена как объяснимая округлением",
+          all(it["within_reference_rounding"] for it in rep["top_base_deltas"]),
+          str([(it["base_name"], it["delta_rev"]) for it in rep["top_base_deltas"]
+               if not it["within_reference_rounding"]]))
+    check("само расхождение при этом не спрятано — оно в отчёте числом",
+          rep["deltas"]["net_rev"] != 0.0)
+    check("и неопределённость названа отдельной строкой текста",
+          "неопределённость публикации эталона" in rc.render_text(rep))
+
+    # Настоящее расхождение сверх округления по-прежнему видно и наказуемо.
+    real = dict(rounded)
+    real["Ремень"] = {MONTH: [1, 500]}
+    rep2 = rc.compare(saas, rc.parse_reference(real, MONTH))
+    check("расхождение сверх округления остаётся расхождением",
+          rep2["deltas"]["net_rev_excess"] > 495.0, str(rep2["deltas"]["net_rev_excess"]))
+    check("и порог на нём срабатывает", rc.exceeds(rep2, 0) is True)
+    check("позиция сверх округления идёт первой в топе",
+          rep2["top_base_deltas"][0]["base_name"] == "Ремень",
+          str([it["base_name"] for it in rep2["top_base_deltas"]]))
+    check("а объяснимые округлением — не помечены как необъяснённые",
+          rep2["top_base_deltas"][0]["within_reference_rounding"] is False)
+
+    # Форматы B и C ведут себя ровно как раньше: скидки нет.
+    plain = report(REFERENCE_EXPLICIT)
+    check("у формата B необъяснённая часть равна самому расхождению",
+          plain["deltas"]["net_rev_excess"] == abs(plain["deltas"]["net_rev"]) == 500.0)
+
+
+def test_returns_coverage():
+    """Разный охват возвратов назван структурно, а не спрятан в примечании.
+
+    Регрессия на discussion_r3877357928: «Оборот» грузит salesreturn И
+    retailsalesreturn, зеркало первой таблицы — только salesreturn. На месяце
+    с розничными возвратами разница по возвратам ОЖИДАЕМА и о качестве
+    загрузки не говорит ничего.
+    """
+    for shape, payload in (("A", REFERENCE_BY_MONTH), ("C", SALES_MONTHLY)):
+        parsed = rc.parse_reference(payload, MONTH)
+        check(f"формат {shape} объявлен неполным по возвратам",
+              parsed["returns_coverage"] == rc.COVERAGE_LEGACY_PARTIAL,
+              str(parsed["returns_coverage"]))
+    check("формат B без объявления — охват неизвестен, а не полон",
+          rc.parse_reference(REFERENCE_EXPLICIT, MONTH)["returns_coverage"]
+          == rc.COVERAGE_UNKNOWN)
+
+    rep = rc.compare(saas_month(), rc.parse_reference(SALES_MONTHLY, MONTH))
+    check("классификация возвратов НЕ объявляется сравнимой",
+          rep["returns_comparable"] is False)
+    check("причина названа в примечаниях структурно",
+          any("retailsalesreturn" in note for note in rep["scope_notes"]),
+          str(rep["scope_notes"][-2:]))
+    text = rc.render_text(rep)
+    check("и обе строки разреза помечены в тексте отчёта",
+          text.count("охват возвратов разный — справочно") == 2, text[:400])
+    check("сами числа при этом остались числами",
+          rep["deltas"]["return_rev_raw"] == 0.0
+          and rep["deltas"]["gross_rev_raw"] == -500.0)
+
+    # Эталон, про который известно, что охват совпадает, объявляет это сам.
+    declared = dict(REFERENCE_EXPLICIT, returns_coverage=rc.COVERAGE_FULL)
+    parsed = rc.parse_reference(declared, MONTH)
+    check("объявленный полный охват принимается",
+          parsed["returns_coverage"] == rc.COVERAGE_FULL)
+    rep_full = rc.compare(saas_month(), parsed)
+    check("и тогда классификация объявляется сравнимой",
+          rep_full["returns_comparable"] is True)
+    check("а пометки в тексте нет",
+          "охват возвратов разный" not in rc.render_text(rep_full))
+    check("мусор в объявлении охвата — отказ закрытым",
+          raises(lambda: rc.parse_reference(
+              dict(REFERENCE_EXPLICIT, returns_coverage="как-нибудь"), MONTH),
+              rc.ReconcileError))
 
 
 def test_reference_transport():
@@ -1019,7 +1242,15 @@ def test_returns_reconcile_gross_diverges():
 # ══ 7. Коды возврата и печать ════════════════════════════════════════════════
 
 def test_exit_policy():
-    rep = report()
+    # Строгость порога проверяется на эталоне БЕЗ неопределённости публикации
+    # (формат B): иначе вопрос «строго больше или нет» смешивается с вопросом
+    # «сколько из расхождения объяснимо округлением», и тест перестаёт
+    # проверять то, ради чего написан. Округление — отдельным блоком ниже.
+    rep = report(REFERENCE_EXPLICIT)
+    check("подготовка: у формата B неопределённости публикации нет",
+          rep["reference_rounding"]["total_rev"] == 0.0
+          and rep["deltas"]["net_rev_excess"] == 500.0,
+          str(rep["deltas"]["net_rev_excess"]))
     check("порога нет — расхождение не наказывается", rc.exceeds(rep, None) is False)
     check("порог 0 при расхождении −500 — превышен", rc.exceeds(rep, 0) is True)
     check("порог 500 при расхождении −500 — НЕ превышен (строго больше)",
@@ -1141,6 +1372,18 @@ def test_cli_exit_contract():
         code, _ = run_cli(base + ["--top", "-1"])
         check("отрицательный --top — код 1", code == rc.EXIT_ERROR, f"код {code}")
 
+        # Негодный таймаут обязан отвергаться ДО сети и независимо от того,
+        # берётся эталон из файла или по адресу.
+        for bad in ("inf", "nan", "0", "-1"):
+            code, text = run_cli(base + ["--timeout", bad])
+            check(f"негодный --timeout {bad!r} — код 1, а не трассировка",
+                  code == rc.EXIT_ERROR, f"код {code}")
+            check(f"и отчёта при негодном таймауте нет: {bad!r}", text == "", repr(text[:80]))
+        code, _ = run_cli(["--db", str(DB_PATH), "--org", str(ORG_ID), "--month", MONTH,
+                           "--reference-url", "http://127.0.0.1:1/x", "--timeout", "inf"])
+        check("негодный --timeout с --reference-url — тоже код 1",
+              code == rc.EXIT_ERROR, f"код {code}")
+
 
 def test_no_persistence():
     """Инструмент ничего не сохраняет: ни рядом с собой, ни рядом с базой."""
@@ -1242,11 +1485,15 @@ def _probe_number(mod) -> bool:
 
 
 def _probe_strict_threshold(mod) -> bool:
-    """Порог строгий: расхождение, равное порогу, кодом возврата не наказывается."""
+    """Порог строгий: расхождение, равное порогу, кодом возврата не наказывается.
+
+    Эталон намеренно формата B — без неопределённости публикации, иначе
+    проба смешивала бы строгость сравнения с округлением формата A.
+    """
     conn = mod.open_readonly(str(DB_PATH))
     try:
         rep = mod.compare(mod.load_saas_month(conn, ORG_ID, MONTH),
-                          mod.parse_reference(REFERENCE_BY_MONTH, MONTH))
+                          mod.parse_reference(REFERENCE_EXPLICIT, MONTH))
     finally:
         conn.close()
     return mod.exceeds(rep, 500) is False
@@ -1292,6 +1539,50 @@ def _probe_threshold(mod) -> bool:
     """Негодный порог отвергается, а не выключает и не выворачивает гейт."""
     return all(raises(lambda b=bad: mod.check_threshold(b), mod.ReconcileError)
                for bad in (float("nan"), -1))
+
+
+def _probe_orphan(mod) -> bool:
+    """Строка продажи без своего товара останавливает сверку."""
+    with tempfile.TemporaryDirectory() as tmp:
+        copy = orphan_db(Path(tmp))
+        conn = mod.open_readonly(str(copy))
+        try:
+            return raises(lambda: mod.load_saas_month(conn, ORG_ID, MONTH),
+                          mod.ReconcileError)
+        finally:
+            conn.close()
+
+
+def _probe_decomposition(mod) -> bool:
+    """Разрез net/gross/return, противоречащий сам себе, отвергается."""
+    contradiction = {"month": MONTH, "bases": {
+        "Худи": {"net_qty": 1, "net_rev": 100, "gross_rev": 100, "return_rev": 50}}}
+    return raises(lambda: mod.parse_reference(contradiction, MONTH), mod.ReconcileError)
+
+
+def _probe_rounding(mod) -> bool:
+    """Расхождение внутри округления формата A порогом не наказывается."""
+    rounded = {"Худи": {MONTH: [1, 12000]}}
+    saas = saas_month()
+    saas["bases"] = {"Худи": dict(saas["bases"]["Худи"], net_rev=12000.49)}
+    saas["totals"] = dict(saas["totals"], net_rev=12000.49)
+    rep = mod.compare(saas, mod.parse_reference(rounded, MONTH))
+    return rep["deltas"]["net_rev_excess"] == 0.0 and mod.exceeds(rep, 0) is False
+
+
+def _probe_returns_coverage(mod) -> bool:
+    """Неполный охват возвратов не выдаётся за сравнимую классификацию."""
+    rep = mod.compare(saas_month(), mod.parse_reference(SALES_MONTHLY, MONTH))
+    return (rep["returns_comparable"] is False
+            and any("retailsalesreturn" in note for note in rep["scope_notes"]))
+
+
+def _probe_timeout(mod) -> bool:
+    """Негодный таймаут отвергается, а не роняет вызов трассировкой."""
+    return (raises(lambda: mod.check_timeout(float("inf")), mod.ReconcileError)
+            and raises(lambda: mod.load_reference_url("http://127.0.0.1:1/x", MONTH,
+                                                      timeout=float("inf")),
+                       mod.ReconcileError))
 
 
 def _probe_argparse_exit(mod) -> bool:
@@ -1380,9 +1671,34 @@ MUTATIONS = [
      [("    if not math.isfinite(number):", "    if False:", 1)],
      _probe_finite_numbers),
     ("порог перестаёт проверяться",
-     [("    if not math.isfinite(value):", "    if False:", 1),
+     [('    if not math.isfinite(value):\n        raise ReconcileError(\n'
+       '            f"--fail-on-delta должен быть конечным',
+       '    if False:\n        raise ReconcileError(\n'
+       '            f"--fail-on-delta должен быть конечным', 1),
       ("    if value < 0:", "    if False:", 1)],
      _probe_threshold),
+    ("строки без своего товара снова только считаются",
+     [("    if orphan_rows:", "    if False:", 1)],
+     _probe_orphan),
+    ("разрез формата B перестаёт проверяться",
+     [('        if gross_rev is not None and return_rev is not None:',
+       '        if False:', 1)],
+     _probe_decomposition),
+    ("округление формата A перестаёт учитываться",
+     [('"total_rev": FORMAT_A_REV_ROUNDING * len(bases),',
+       '"total_rev": 0.0,', 1),
+      ('"per_base_rev": FORMAT_A_REV_ROUNDING,', '"per_base_rev": 0.0,', 1)],
+     _probe_rounding),
+    ("разный охват возвратов снова выдаётся за сравнимый",
+     [('    comparable = coverage == COVERAGE_FULL', '    comparable = True', 1)],
+     _probe_returns_coverage),
+    ("таймаут перестаёт проверяться",
+     [("    if not math.isfinite(value):\n        raise ReconcileError(f\"--timeout",
+       "    if False:\n        raise ReconcileError(f\"--timeout", 1),
+      ("    if value <= 0:", "    if False:", 1),
+      ("(urllib.error.URLError, OSError, ValueError, OverflowError)",
+       "(urllib.error.URLError, OSError, ValueError)", 1)],
+     _probe_timeout),
     ("ошибка вызова снова уходит в занятый код 2",
      [("        raise ReconcileError(f\"неверный вызов: {message}\")",
        "        super().error(message)", 1)],
@@ -1436,8 +1752,13 @@ def main() -> int:
     block("== 5ж. Допуск не прячет материальную разницу ==", test_tolerance_cannot_hide)
     block("== 5ж-1. Не конечные числа эталона ==", test_non_finite_reference)
     block("== 5ж-2. Порог --fail-on-delta ==", test_threshold_validation)
+    block("== 5ж-3. Таймаут запроса эталона ==", test_timeout_validation)
     block("== 5з. Три формата не перехватывают друг друга ==", test_shapes_preserved)
     block("== 5и. sales-monthly целиком: классификация DATA-5 ==", test_sales_monthly_end_to_end)
+    block("== 5и-1. Строки продаж без своего товара ==", test_orphan_rows_fail_closed)
+    block("== 5и-2. Разрез формата B согласован ==", test_explicit_decomposition)
+    block("== 5и-3. Округление формата A ==", test_format_a_rounding)
+    block("== 5и-4. Охват возвратов ==", test_returns_coverage)
     block("== 5к. Эталон: файл и сеть ==", test_reference_transport)
     block("== 6. Сравнение ==", test_compare)
     block("== 6а. Возвраты сходятся, валовые нет ==", test_returns_reconcile_gross_diverges)
