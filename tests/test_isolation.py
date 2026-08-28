@@ -26,16 +26,30 @@
   6) РОЛИ — owner-only ручки должны отклонять участника. Ручки, меняющие данные
      всей организации и при этом доступные участнику, тест не роняет, но
      печатает списком: это вопрос к владельцу продукта, а не дефект изоляции.
+  7) СТОРОЖ ПОЛНОТЫ ОБХОДА — пункт 1 обещает «все маршруты, принимающие id
+     в пути», но до 28.08.2026 держался на списке, набранном руками, и список
+     разошёлся с кодом: `/api/orders/{order_id}/receipts` (GET и POST) и
+     `/api/order-plan/{plan_id}/outcome|brief` в приложении появились, а в
+     обход не попали — и уронить тест было нечему. Теперь инвентарь снимается
+     с живой таблицы маршрутов FastAPI, покрытие регистрируется самим фактом
+     выполнения пробы, и каждый маршрут с параметром пути обязан быть либо
+     пройден пробой, либо внесён в узкий реестр исключений с причиной.
+     Проба не принимает готовый URL: он собирается из зарегистрированного
+     шаблона и резолвится обратно в тот же маршрут — иначе шаблон и URL были
+     бы двумя источниками правды, и скопированная проба с новым шаблоном при
+     старом URL записала бы покрытие на невызванную ручку.
 
 Запуск из корня репозитория:  python tests/test_isolation.py
 """
 import os
+import re
 import sqlite3
 import sys
 import threading
 import time
 from datetime import date, timedelta
 from pathlib import Path
+from urllib.parse import quote
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -54,6 +68,7 @@ if DB_PATH.exists():
 
 import httpx  # noqa: E402
 import uvicorn  # noqa: E402
+from starlette.routing import Match  # noqa: E402
 
 from app.main import app as oborot_app  # noqa: E402
 
@@ -116,6 +131,21 @@ def exec_sql(query: str, *args) -> int:
         con.close()
 
 
+def receipt_counts(org_a: int, org_b: int) -> tuple:
+    """Снимок таблицы приёмок: (строк и штук у A, у B, строк всего).
+
+    Итог по всей таблице считается отдельно от организаций намеренно: строка,
+    записанная с третьим `org_id` (или с нулём вместо него), в разрезе A и B
+    не видна, а таблицу уже испортила.
+    """
+    a_row = sql("SELECT COUNT(*), COALESCE(SUM(qty),0) FROM order_receipts"
+                " WHERE org_id=?", org_a)[0]
+    b_row = sql("SELECT COUNT(*), COALESCE(SUM(qty),0) FROM order_receipts"
+                " WHERE org_id=?", org_b)[0]
+    total = sql("SELECT COUNT(*) FROM order_receipts")[0][0]
+    return (tuple(a_row), tuple(b_row), total)
+
+
 def register(c: httpx.Client, email: str, org_name: str, password: str = "secret123"):
     return c.post("/register", data={
         "name": email.split("@")[0], "email": email,
@@ -137,6 +167,248 @@ def add_member(org_id: int, email: str) -> int:
     exec_sql("INSERT INTO memberships (user_id, org_id, role) VALUES (?,?,'member')",
              uid, org_id)
     return uid
+
+
+# ── Реестр маршрутов: сторож полноты обхода (§7) ─────────────────────────────
+#
+# Инвентарь маршрутов снимается с живого приложения, а не набирается руками.
+# Ручной список ровно один раз уже разошёлся с кодом — и разошёлся молча,
+# потому что «список не полон» не является событием, на которое что-то падает.
+
+# Маршруты с параметром пути, которые НЕ адресуют объект арендатора по
+# идентификатору. Реестр намеренно короткий, и у каждой записи есть причина:
+# исключение — это утверждение «здесь нечему утечь», а утверждение должно быть
+# проверяемым. Сам реестр тоже под сторожем (см. run_all §7): у исключённого
+# маршрута ни один параметр пути не может быть объявлен целым числом, поэтому
+# спрятать сюда `/api/orders/{order_id}` и закрыть вопрос не получится.
+ID_ROUTE_EXCLUSIONS = {
+    ("/api/lessons/{key}/done", "POST"):
+        "{key} — ключ урока из каталога app/lessons.py (строка справочника, "
+        "а не строка базы); прогресс привязан к ctx.user.id, объект другой "
+        "организации по этому пути не адресуется",
+    ("/api/lessons/{key}/reset", "POST"):
+        "то же самое: ключ урока из того же каталога, прогресс по ctx.user.id",
+    ("/ms/vendor/api/moysklad/vendor/1.0/apps/{path_app_id}/{account_id}", "PUT"):
+        "lifecycle-ручка вендора МойСклад: арендаторской сессии здесь нет "
+        "вовсе, вход по vendor JWT (app.ms_vendor.verify_incoming_jwt), а "
+        "{account_id} — внешний идентификатор аккаунта МС, не id нашей строки",
+    ("/ms/vendor/api/moysklad/vendor/1.0/apps/{path_app_id}/{account_id}", "DELETE"):
+        "то же самое, деактивация приложения в чужом аккаунте МС",
+}
+
+# Пары (шаблон маршрута, метод), по которым проба чужим идентификатором
+# ДЕЙСТВИТЕЛЬНО выполнена. Заполняется исполнением `probe_foreign`, а не
+# литералом: список покрытия, набранный рядом с проверками, — это второй
+# ручной реестр, и разойдётся он так же, как разошёлся первый.
+PROBED_ID_ROUTES: set = set()
+
+
+def iter_routes(routes):
+    """Плоский обход таблицы маршрутов приложения.
+
+    Спуск через `original_router` обязателен. В FastAPI 0.141 подключённый
+    роутер лежит в `app.routes` объектом `fastapi.routing._IncludedRouter`,
+    у которого нет ни `path`, ни `routes`: наивный обход `app.routes` не
+    находит НИ ОДНОГО маршрута из `app/api.py`, и сторож полноты молча стал бы
+    сторожем пустого множества — то есть был бы хуже, чем его отсутствие.
+    Поэтому §7 отдельно проверяет, что инвентарь непустой.
+    """
+    for route in routes:
+        original = getattr(route, "original_router", None)
+        if original is not None:
+            yield from iter_routes(getattr(original, "routes", ()))
+            continue
+        nested = getattr(route, "routes", None)
+        if nested:
+            yield from iter_routes(nested)
+            continue
+        yield route
+
+
+def id_route_inventory() -> dict:
+    """{(шаблон пути, метод): маршрут} для всех маршрутов с параметром в пути.
+
+    Из методов отбрасывается ровно один вид шума — HEAD, который Starlette
+    дописывает к каждому GET сам. За таким HEAD не стоит отдельной ручки: это
+    тот же обработчик, и проба GET его уже проходит.
+
+    Отбрасывать HEAD и OPTIONS безусловно, «потому что их добавляет фреймворк»,
+    нельзя. У маршрута, объявленного явно через `@router.head(...)` или
+    `@router.options(...)`, других методов нет вовсе, и такой фильтр вычёркивал
+    бы из инвентаря ВЕСЬ обработчик: §7 остался бы зелёным на арендаторской
+    ручке, которую никто не пробовал и не исключал (ревью PR #42,
+    discussion_r3879412309). Признак происхождения ровно один и он надёжен:
+    автоматический HEAD всегда идёт в паре с GET на том же маршруте, а явный
+    приходит один. OPTIONS Starlette не добавляет вовсе — preflight отвечал бы
+    CORS-middleware, которого в приложении нет и появление которого сторожит
+    §5, — поэтому любой OPTIONS в таблице объявлен руками и считается.
+
+    Маршрут, у которого GET и HEAD объявлены руками одной строкой
+    (`methods=["GET", "HEAD"]`), от автоматической пары неотличим, и HEAD у
+    него тоже отбрасывается. Потери покрытия здесь нет: обработчик один и тот
+    же, и проба GET доходит до него.
+    """
+    found = {}
+    for route in iter_routes(oborot_app.routes):
+        path = getattr(route, "path", "") or ""
+        if "{" not in path:
+            continue
+        methods = set(getattr(route, "methods", None) or ())
+        if "GET" in methods:
+            methods.discard("HEAD")
+        for method in methods:
+            found[(path, method)] = route
+    return found
+
+
+def dispatch_route(scope: dict):
+    """Какой маршрут ФАКТИЧЕСКИ обработает запрос — по порядку, как роутер.
+
+    Starlette перебирает маршруты в порядке регистрации и отдаёт запрос
+    ПЕРВОМУ, совпавшему целиком. Поэтому спросить `target.matches(scope)` мало:
+    это вопрос «может ли ЭТОТ маршрут принять URL», а не «кто его примет».
+    Два шаблона способны совпасть с одним concrete URL — у FastAPI аннотация
+    `int` в сигнатуре в регулярное выражение пути не попадает, и
+    `/api/x/{order_id}` и `/api/x/{other}` компилируются в одно и то же
+    `[^/]+`; литеральный `/api/orders/open` тоже перекрывает
+    `/api/orders/{order_id}`. Тогда запрос уходит в маршрут, объявленный
+    раньше, а покрытие записалось бы на тот, который никто не вызывал
+    (ревью PR #42, discussion_r3879544096). Возвращается ровно тот объект
+    маршрута, который выберет роутер, — сравнивать с целью нужно по
+    идентичности, а не по совпадению пути.
+    """
+    for route in iter_routes(oborot_app.routes):
+        matches = getattr(route, "matches", None)
+        if matches is None:
+            continue
+        if matches(scope)[0] is Match.FULL:
+            return route
+    return None
+
+
+def int_path_params(route) -> list:
+    """Параметры пути маршрута, объявленные целым числом.
+
+    В этом приложении целочисленный параметр пути означает первичный ключ
+    строки в базе (`_id_path()` в `app/api.py` — `Path(ge=1, le=2_147_483_647)`),
+    то есть ровно тот случай, ради которого §1 и существует.
+
+    Тип берётся из РАЗОБРАННОГО FastAPI маршрута — `route.dependant.path_params`,
+    поле `field_info.annotation`, — а не из сырых `__annotations__` функции.
+    Сырая аннотация зависит от того, как её написали: `order_id: int` даёт
+    `int`, а равносильный `order_id: Annotated[int, Path(ge=1)]` даёт объект
+    `Annotated[...]`, который на `int` не похож и мимо сравнения проходит.
+    Тогда арендаторский id считался бы не-целочисленным, и сторож реестра
+    исключений (§7) пропустил бы в исключения ручку с настоящим id объекта —
+    то есть проверка, которая должна закрывать самый опасный вид ошибки в
+    реестре, зависела бы от стиля записи аннотации. FastAPI обе формы уже
+    свёл к одному разрешённому типу, и здесь берётся именно он.
+
+    Строковые ключи справочников (`/api/lessons/{key}`) и внешние
+    идентификаторы (`{account_id}` у вендора МойСклад) остаются не-целыми при
+    любой форме записи — у них разрешённый тип `str`.
+
+    Если у маршрута разобранного `dependant` нет вовсе (обычный
+    starlette-`Route`, добавленный в обход FastAPI), тип берётся из
+    `__annotations__` как раньше. Это не запасной путь «на всякий случай»:
+    без него такой маршрут молча получал бы пустой список, и исключение для
+    него прошло бы проверку просто потому, что тип не удалось прочитать.
+    """
+    dependant = getattr(route, "dependant", None)
+    fields = getattr(dependant, "path_params", None)
+    if fields:
+        names = []
+        for field in fields:
+            annotation = getattr(getattr(field, "field_info", None),
+                                 "annotation", None)
+            if annotation is int:
+                names.append(getattr(field, "name", ""))
+        return sorted(n for n in names if n)
+
+    endpoint = getattr(route, "endpoint", None)
+    if endpoint is None:
+        return []
+    hints = getattr(endpoint, "__annotations__", None) or {}
+    names = re.findall(r"\{([^}:]+)", getattr(route, "path", "") or "")
+    return sorted(n for n in names if hints.get(n) in (int, "int"))
+
+
+def concrete_url(route: str, params: dict) -> str:
+    """Подставить значения в ЗАРЕГИСТРИРОВАННЫЙ шаблон маршрута.
+
+    URL пробе отдельной строкой не передаётся, и это не удобство, а требование.
+    Отдельная строка — второй источник правды рядом с шаблоном, и разойтись
+    они могут молча: скопированная проба, у которой шаблон поменяли на новый
+    маршрут, а URL оставили от соседнего, уходит на СТАРЫЙ endpoint, честно
+    получает 403/404 и регистрирует покрытие на маршрут, который никто не
+    вызывал. Тогда §7 зеленеет на непроверенной ручке — то есть сторож полноты
+    даёт ровно ту ложную уверенность, ради устранения которой заведён
+    (ревью PR #42, discussion_r3879252953). Здесь URL — функция от шаблона,
+    и разъехаться им негде.
+    """
+    url = route
+    for name, value in params.items():
+        url = url.replace("{" + name + "}", quote(str(value), safe=""))
+    return url
+
+
+def probe_foreign(c: httpx.Client, route: str, method: str, params: dict,
+                  body=None):
+    """Дёрнуть чужой объект по идентификатору — и этим же зарегистрировать обход.
+
+    Покрытие записывается здесь, побочным продуктом исполнения, и только после
+    того, как запрос фактически ушёл: «маршрут пройден» и «маршрут числится
+    пройденным» — одно событие. Приговор fail-closed: только 403 или 404.
+    2xx — утечка, 5xx — тоже дефект (чужой объект долетел до кода и упал уже
+    внутри).
+
+    Перед регистрацией покрытия проверяется ещё и обратное направление:
+    собранный URL прогоняется через РЕАЛЬНЫЙ порядок диспетчеризации, и
+    выбранный роутером маршрут обязан быть тем же самым объектом, под которым
+    покрытие записывается. Одной сборки URL из шаблона для этого мало —
+    шаблон, которого в приложении нет вовсе, так бы не поймался. Спросить
+    `target.matches(scope)` тоже мало: это проверяет, может ли цель принять
+    URL, а не то, достанется ли он ей. Совпасть с одним concrete URL способны
+    два шаблона, и тогда запрос уйдёт в объявленный раньше, а кредит достался
+    бы невызванному (ревью PR #42, discussion_r3879544096).
+    """
+    names = set(re.findall(r"\{([^}:]+)", route))
+    if set(params) != names:
+        check(f"{method} {route}: параметры пробы отвечают шаблону маршрута",
+              False, f"в шаблоне {sorted(names)}, в пробе {sorted(params)}")
+        return None
+    absent = sorted(n for n, v in params.items() if v is None)
+    if absent:
+        # Проба не выполнена — покрытия нет. Регистрировать его тут было бы
+        # враньём, поэтому §7 назовёт маршрут непокрытым, а заметка объяснит.
+        NOTES.append(f"{method} {route}: не с чем проверять (нет объекта в B: {absent})")
+        return None
+
+    url = concrete_url(route, params)
+    target = id_route_inventory().get((route, method))
+    scope = {"type": "http", "method": method, "path": url,
+             "path_params": {}, "root_path": "", "headers": []}
+    chosen = dispatch_route(scope)
+    if target is None or chosen is not target:
+        if target is None:
+            why = "такого шаблона с таким методом нет в таблице приложения"
+        elif chosen is None:
+            why = "этот URL не принимает ни один маршрут приложения"
+        else:
+            why = (f"запрос достанется другому маршруту: "
+                   f"{sorted(getattr(chosen, 'methods', None) or ())} "
+                   f"{getattr(chosen, 'path', '?')} — он объявлен раньше и "
+                   f"перекрывает цель на этом URL")
+        check(f"{method} {route}: запрос по собранному URL достаётся именно "
+              f"этому маршруту", False, f"url={url}; {why}")
+        return None
+
+    r = (c.request(method, url, json=body) if body is not None
+         else c.request(method, url))
+    PROBED_ID_ROUTES.add((route, method))
+    check(f"{method} {route} из чужой организации отклонён",
+          r.status_code in (403, 404), f"status={r.status_code} {r.text[:100]}")
+    return r
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -190,6 +462,13 @@ def run_all() -> None:
 
     # Уникальная позиция организации B — маркер утечки в чтении.
     SECRET = "СЕКРЕТНАЯ МОДЕЛЬ B-777"
+    # Маркеры приёмок. Ручка приёмки НАМЕРЕННО не сверяет имя позиции с
+    # каталогом (см. api_order_receipts_add), поэтому имя здесь — чистый
+    # маркер: если он окажется не в той таблице или не в той организации,
+    # спутать его не с чем.
+    RECEIPT_A = "ПРИЁМКА-МАРКЕР A-111"
+    RECEIPT_B = "ПРИЁМКА-МАРКЕР B-999"
+    INTRUSION = "ВТОРЖЕНИЕ A В ЗАКАЗ B"
     exec_sql("INSERT INTO products (org_id, ext_id, base_name, size, category,"
              " sale_price, cost_price, cost_full, supplier, archived, excluded)"
              " VALUES (?,?,?,?,?,?,?,?,?,0,0)",
@@ -227,26 +506,99 @@ def run_all() -> None:
     wh_b = wh_b[0][0] if wh_b else None
     base_b = sql("SELECT base_name FROM products WHERE org_id=? LIMIT 1", org_b)[0][0]
 
+    # Заказ и приёмка организации A — чтобы «у A ничего не изменилось» было
+    # утверждением о живых строках, а не о пустой таблице.
+    ra = a.post("/api/orders", json={"name": "Заказ A", "eta_date": None, "items": [
+        {"base_name": sql("SELECT base_name FROM products WHERE org_id=? LIMIT 1",
+                          org_a)[0][0], "qty": 4, "sizes": {}},
+    ]})
+    order_a = ra.json().get("id") if ra.status_code == 200 else None
+    if order_a:
+        a.post(f"/api/orders/{order_a}/status", json={"status": "sent"})
+        a.post(f"/api/orders/{order_a}/receipts",
+               json={"lines": [{"base_name": RECEIPT_A, "qty": 2}]})
+
+    # Приёмка организации B и её план заказа — цели проб §1.
+    # Живая строка приёмки нужна по той же причине: без неё проверка
+    # «отклонённый POST ничего не изменил» сравнивала бы ноль с нулём и
+    # проходила бы даже на дырявом коде.
+    if order_b:
+        b.post(f"/api/orders/{order_b}/status", json={"status": "sent"})
+        b.post(f"/api/orders/{order_b}/receipts",
+               json={"lines": [{"base_name": RECEIPT_B, "qty": 4}]})
+    rows_a = sql("SELECT COUNT(*) FROM order_receipts WHERE org_id=?", org_a)[0][0]
+    rows_b = sql("SELECT COUNT(*) FROM order_receipts WHERE org_id=?", org_b)[0][0]
+    check("у обеих организаций есть живые строки приёмки — базовая линия «не изменилось»",
+          rows_a > 0 and rows_b > 0, f"A={rows_a} B={rows_b}")
+
+    rb = b.post("/api/order-plan", json={"production_id": prod_b, "budget": 100000})
+    plan_b = ((rb.json().get("plan_id") or rb.json().get("id"))
+              if rb.status_code == 200 else None)
+    check("в организации B есть план заказа для проверок", plan_b is not None,
+          f"status={rb.status_code} {rb.text[:120]}")
+
     # ── 1. Прямой доступ по чужому идентификатору ────────────────────────────
     print("\n== 1. Чужой идентификатор в пути: ожидаем 403/404, никогда 200 и никогда 5xx ==")
+    # Первый столбец — ЗАРЕГИСТРИРОВАННЫЙ шаблон маршрута, третий — значения
+    # его параметров. Готового URL здесь нет намеренно: его собирает из шаблона
+    # сам `probe_foreign` и проверяет, что собранное резолвится обратно в этот
+    # же маршрут. Иначе шаблон и URL — два источника правды, и скопированная
+    # проба с новым шаблоном и старым URL зарегистрировала бы покрытие на
+    # ручку, которую никто не вызывал.
+    receipts_before = receipt_counts(org_a, org_b)
     cases = [
-        ("GET  /api/orders/{id}",            "GET",    f"/api/orders/{order_b}", None),
-        ("POST /api/orders/{id}/status",     "POST",   f"/api/orders/{order_b}/status", {"status": "sent"}),
-        ("DELETE /api/orders/{id}",          "DELETE", f"/api/orders/{order_b}", None),
-        ("GET  /api/orders/{id}/ms-doc",     "GET",    f"/api/orders/{order_b}/ms-doc", None),
-        ("POST /api/orders/{id}/push-to-ms", "POST",   f"/api/orders/{order_b}/push-to-ms", {}),
-        ("POST /api/warehouses/{id}/toggle", "POST",   f"/api/warehouses/{wh_b}/toggle", {"active": False}),
-        ("POST /api/productions/{id}",       "POST",   f"/api/productions/{prod_b}", {"name": "Захвачено"}),
-        ("DELETE /api/productions/{id}",     "DELETE", f"/api/productions/{prod_b}", None),
-        ("POST /api/productions/{id}/setup", "POST",   f"/api/productions/{prod_b}/setup", {"preset": "turnkey"}),
+        ("/api/orders/{order_id}",                "GET",    {"order_id": order_b}, None),
+        ("/api/orders/{order_id}/status",         "POST",   {"order_id": order_b}, {"status": "sent"}),
+        ("/api/orders/{order_id}",                "DELETE", {"order_id": order_b}, None),
+        ("/api/orders/{order_id}/ms-doc",         "GET",    {"order_id": order_b}, None),
+        ("/api/orders/{order_id}/push-to-ms",     "POST",   {"order_id": order_b}, {}),
+        ("/api/orders/{order_id}/receipts",       "GET",    {"order_id": order_b}, None),
+        ("/api/orders/{order_id}/receipts",       "POST",   {"order_id": order_b},
+         {"lines": [{"base_name": INTRUSION, "qty": 7}]}),
+        ("/api/order-plan/{plan_id}/outcome",     "GET",    {"plan_id": plan_b}, None),
+        ("/api/order-plan/{plan_id}/brief",       "GET",    {"plan_id": plan_b}, None),
+        ("/api/warehouses/{warehouse_id}/toggle", "POST",   {"warehouse_id": wh_b}, {"active": False}),
+        ("/api/productions/{pid}",                "POST",   {"pid": prod_b}, {"name": "Захвачено"}),
+        ("/api/productions/{pid}",                "DELETE", {"pid": prod_b}, None),
+        ("/api/productions/{pid}/setup",          "POST",   {"pid": prod_b}, {"preset": "turnkey"}),
     ]
-    for title, method, url, body in cases:
-        if "None" in url:
-            NOTES.append(f"{title}: не с чем проверять (нет объекта в B)")
+    answers = {}
+    for route, method, params, body in cases:
+        r = probe_foreign(a, route, method, params, body)
+        if r is not None:
+            answers[(route, method)] = r
+
+    # ── 1а. Отказ не должен ни раскрывать, ни менять ─────────────────────────
+    # Один только код ответа доказывает меньше, чем кажется: 404 с чужими
+    # строками в теле — это утечка, а отклонённый POST, успевший дописать
+    # строку, — это порча данных. Проверяются оба следствия отдельно.
+    print("\n== 1а. Отказ по чужому id: без раскрытия и без записи ==")
+    markers = [SECRET, "СЕКРЕТНЫЙ ЭТАП B", RECEIPT_B, "Заказ B"]
+    for route, method in (("/api/orders/{order_id}/receipts", "GET"),
+                          ("/api/orders/{order_id}/receipts", "POST"),
+                          ("/api/order-plan/{plan_id}/outcome", "GET"),
+                          ("/api/order-plan/{plan_id}/brief", "GET")):
+        r = answers.get((route, method))
+        if r is None:
             continue
-        r = a.request(method, url, json=body) if body is not None else a.request(method, url)
-        check(f"{title} из чужой организации отклонён",
-              r.status_code in (403, 404), f"status={r.status_code} {r.text[:100]}")
+        leaked = [m for m in markers if m in r.text]
+        check(f"{method} {route}: в отказе нет данных организации B",
+              not leaked, f"нашлось: {leaked}")
+        try:
+            payload = r.json()
+            keys = set(payload) if isinstance(payload, dict) else {"<не-объект>"}
+        except ValueError:
+            keys = set()
+        check(f"{method} {route}: тело отказа — только объяснение, без нагрузки",
+              keys <= {"detail"}, f"keys={sorted(keys)}")
+
+    receipts_after = receipt_counts(org_a, org_b)
+    check("отклонённый POST приёмки не изменил строки ни одной организации",
+          receipts_after == receipts_before,
+          f"было {receipts_before}, стало {receipts_after}")
+    intruded = sql("SELECT COUNT(*) FROM order_receipts WHERE base_name=?", INTRUSION)[0][0]
+    check("строка, которую A пыталась вписать в заказ B, не появилась нигде",
+          intruded == 0, f"rows={intruded}")
 
     # Чужое производство нельзя назначить своей позиции.
     base_a = sql("SELECT base_name FROM products WHERE org_id=? LIMIT 1", org_a)[0][0]
@@ -348,14 +700,11 @@ def run_all() -> None:
                 NOTES.append(f"apply вернул {r2.status_code} — заказ по плану не создан, "
                              f"проверка утечки в заказе пропущена")
 
-    # Чужой план заказа нельзя применить.
-    rb = b.post("/api/order-plan", json={"production_id": prod_b, "budget": 100000})
-    if rb.status_code == 200:
-        pid_b = rb.json().get("plan_id") or rb.json().get("id")
-        if pid_b:
-            r = a.post(f"/api/order-plan/{pid_b}/apply", json={"name": "Чужой план"})
-            check("нельзя оформить заказ по чужому плану",
-                  r.status_code in (403, 404), f"status={r.status_code} {r.text[:100]}")
+    # Чужой план заказа нельзя применить. План организации B создан в
+    # подготовке — он же цель проб outcome и brief в §1, и проба идёт через
+    # общий helper, чтобы маршрут `apply` числился пройденным у сторожа §7.
+    probe_foreign(a, "/api/order-plan/{plan_id}/apply", "POST",
+                  {"plan_id": plan_b}, {"name": "Чужой план"})
 
     # ── 5. Сторож CSRF ───────────────────────────────────────────────────────
     print("\n== 5. Сторож: защита изменяющих запросов держится на отсутствии CORS ==")
@@ -409,6 +758,45 @@ def run_all() -> None:
     m.close()
     a.close()
     b.close()
+
+    # ── 7. Сторож полноты обхода ─────────────────────────────────────────────
+    print("\n== 7. Сторож: маршрут с id в пути либо пройден пробой, либо исключён явно ==")
+    inventory = id_route_inventory()
+    # Первым делом — что инвентарь вообще собрался. Пустой инвентарь превращает
+    # все проверки ниже в тавтологию: пустое множество не нарушает ничего.
+    check("таблица маршрутов приложения прочитана",
+          len(inventory) >= 10,
+          f"маршрутов с параметром пути: {len(inventory)}")
+
+    uncovered = sorted(k for k in inventory
+                       if k not in PROBED_ID_ROUTES and k not in ID_ROUTE_EXCLUSIONS)
+    detail = ("не пройдено: "
+              + "; ".join(f"{m} {p}" for p, m in uncovered)
+              + " — добавьте пробу чужим идентификатором в §1 либо запись с "
+                "причиной в ID_ROUTE_EXCLUSIONS") if uncovered else ""
+    check("каждый маршрут с id в пути пройден пробой или исключён с причиной",
+          not uncovered, detail)
+
+    stale = sorted(k for k in ID_ROUTE_EXCLUSIONS if k not in inventory)
+    detail = ("устарело: " + "; ".join(f"{m} {p}" for p, m in stale)) if stale else ""
+    check("в реестре исключений нет записей о несуществующих маршрутах",
+          not stale, detail)
+
+    phantom = sorted(k for k in PROBED_ID_ROUTES if k not in inventory)
+    detail = ("таких маршрутов нет: " + "; ".join(f"{m} {p}" for p, m in phantom)
+              + " — шаблон в таблице проб разошёлся с приложением") if phantom else ""
+    check("каждая проба §1 бьёт по существующему маршруту", not phantom, detail)
+
+    # Сторож самого реестра исключений. Исключение оправдано тем, что параметр
+    # пути не адресует строку базы; целочисленный параметр — это ровно
+    # первичный ключ (`_id_path()`), поэтому исключить такой маршрут нельзя.
+    for key in sorted(ID_ROUTE_EXCLUSIONS):
+        route = inventory.get(key)
+        if route is None:
+            continue
+        ints = int_path_params(route)
+        check(f"исключение {key[1]} {key[0]} не прячет целочисленный id объекта",
+              not ints, f"целочисленные параметры пути: {ints}")
 
 
 if __name__ == "__main__":
