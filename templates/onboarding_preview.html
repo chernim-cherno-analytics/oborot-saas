@@ -61,6 +61,10 @@
   --pv-mono:ui-monospace,"Cascadia Mono","Liberation Mono",Consolas,monospace;
 }
 *{box-sizing:border-box;}
+/* Атрибут hidden обязан гасить элемент СИЛЬНЕЕ авторских правил отображения.
+   Без этой строки `.pv-sub{display:block}` перебивал UA-правило `[hidden]`, и
+   себестоимость оставалась на экране при выключенном денежном слое. */
+[hidden]{display:none !important;}
 html,body{margin:0;padding:0;}
 body{
   font-family:var(--pv-sans);
@@ -723,6 +727,14 @@ function money(n) {
   if (n === null || n === undefined || n !== n) return "—";
   return Math.round(n).toLocaleString("ru-RU") + " ₽";
 }
+function ruDate(iso) {
+  /* Показ даты по-русски, как на боевой странице. Значение из ответа ручки не
+     меняется — меняется только его написание; неразобранную дату отдаём как
+     есть, а не подменяем сегодняшним числом. */
+  var d = new Date(iso);
+  if (isNaN(d.getTime())) return String(iso);
+  return d.toLocaleDateString("ru-RU", { day: "numeric", month: "long", year: "numeric" });
+}
 function plural(n, one, few, many) {
   n = Math.abs(Math.round(n));
   var d10 = n % 10, d100 = n % 100;
@@ -1285,7 +1297,8 @@ function rowHtml(it, over, archived) {
   out.push(td("wos", '<span class="pv-num">' +
     (it.wos === null || it.wos === undefined ? '<span class="pv-na">—</span>' : num(it.wos)) +
     "</span>" +
-    (it.stockout_date ? '<span class="pv-sub">до ' + esc(it.stockout_date) + "</span>" : "")));
+    (it.stockout_date ? '<span class="pv-sub">до ' + esc(ruDate(it.stockout_date)) +
+                        "</span>" : "")));
   out.push(td("need", '<span class="pv-na" title="Величины нет в ответе GET /api/turnover; ' +
     'на боевой странице она считается в браузере, а предпросмотр не пересчитывает">—</span>'));
   out.push(td("fdisc", '<span class="pv-num">' + num(it.discount_fact) + " %</span>"));

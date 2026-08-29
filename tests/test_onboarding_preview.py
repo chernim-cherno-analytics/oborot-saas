@@ -659,6 +659,18 @@ def part_browser(pw, cookies, owner: httpx.Client, snap_before: dict) -> dict:
     check("столбец маржи по умолчанию скрыт",
           pv(page, "getComputedStyle(document.querySelector('#pv-thead th.pv-hidecol'))"
                    ".display") == "none")
+    # Себестоимость под ценой гасится АТРИБУТОМ hidden, а не классом, поэтому
+    # проверяется отдельно: ровно здесь `.pv-sub{display:block}` однажды уже
+    # перебил UA-правило `[hidden]`, и «с/с 4 029» стояло на экране приёмки при
+    # выключенном денежном слое.
+    check("себестоимость под ценой по умолчанию скрыта",
+          pv(page, "getComputedStyle(document.querySelector"
+                   "('#pv-tbody [data-money=\"1\"]')).display") == "none",
+          str(pv(page, "getComputedStyle(document.querySelector"
+                       "('#pv-tbody [data-money=\"1\"]')).display")))
+    check("и её текста нет в видимом тексте таблицы",
+          "с/с" not in (page.inner_text("#pv-tbody") or ""),
+          (page.inner_text("#pv-tbody") or "")[:120])
     page.click("#pv-money-btn")
     page.wait_for_timeout(200)
     check("тумблер открывает денежный слой",
@@ -666,8 +678,12 @@ def part_browser(pw, cookies, owner: httpx.Client, snap_before: dict) -> dict:
     check("и столбец маржи вместе с ним",
           pv(page, "getComputedStyle(document.querySelector('#pv-thead th.pv-hidecol'))"
                    ".display") != "none")
+    check("и себестоимость под ценой вместе с ним",
+          "с/с" in (page.inner_text("#pv-tbody") or ""))
     page.click("#pv-money-btn")
     page.wait_for_timeout(200)
+    check("повторное нажатие снова прячет себестоимость",
+          "с/с" not in (page.inner_text("#pv-tbody") or ""))
     check("настоящая «Оборачиваемость» денежный слой по-прежнему показывает",
           "money-bar" in owner.get("/turnover").text)
 
@@ -854,6 +870,8 @@ def part_responsive(browser, cookies) -> None:
         check(f"{tag}: горизонтальной прокрутки страницы нет ни на одном из "
               f"{len(STEP_KEYS)} шагов",
               worst <= 1, f"перелив {worst}px на шаге «{worst_step}»")
+        page.evaluate("() => window.scrollTo(0, 0)")
+        page.wait_for_timeout(150)
         page.screenshot(path=str(SHOTS_DIR / f"preview_{tag}_turnover.png"),
                         full_page=False)
         if tag == "390x844":
@@ -881,6 +899,8 @@ def part_responsive(browser, cookies) -> None:
             page.click(".pv-step.is-on [data-go='next']")
             page.wait_for_timeout(90)
         page.wait_for_selector("[data-step='loader'].is-on")
+        page.evaluate("() => window.scrollTo(0, 0)")
+        page.wait_for_timeout(150)
         page.screenshot(path=str(SHOTS_DIR / f"preview_{tag}_loader.png"))
         ctx.close()
     check("снимки всех трёх размеров сохранены",
