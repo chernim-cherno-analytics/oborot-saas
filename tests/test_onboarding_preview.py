@@ -566,6 +566,106 @@ def part_browser(pw, cookies, owner: httpx.Client, snap_before: dict) -> dict:
     page.click("[data-step='loader'] [data-go='next']")
     page.wait_for_selector("[data-step='turnover'].is-on")
 
+    turnover_step_html = page.inner_text("[data-step='turnover']") or ""
+    check("метрика на экране названа дословно: «Денежная отдача / нетто-выручка "
+          "в день наличия»",
+          "Денежная отдача / нетто-выручка в день наличия" in turnover_step_html,
+          turnover_step_html[:400])
+    check("рядом явно сказано, что это не прибыль",
+          "не прибыль" in turnover_step_html, turnover_step_html[:400])
+
+    # Сверяем бейдж с тем, что реально загрузила сама страница (PV.data.progress),
+    # а не с независимым свежим запросом к ручке: несколькими строками выше тест
+    # нарочно подменял /api/sync/progress через page.route для сценария «история
+    # полная», и после page.unroute данные страницы в памяти не обновляются сами
+    # без перезагрузки — свежий owner.get() и то, что видит уже отрисованная
+    # страница, тут два разных числа, и бейдж обязан следовать за вторым.
+    page_progress = pv(page, "window.__PV__.data.progress")
+    prelim_hidden = pv(page, "document.getElementById('pv-prelim').hidden")
+    cov = (page_progress or {}).get("coverage_days") or 0
+    if cov >= 730:
+        check("история полная (>=730 дней) — бейдж «предварительно» скрыт",
+              prelim_hidden, f"coverage_days={cov}")
+    else:
+        check("история неполная (<730 дней) — бейдж «предварительно» показан",
+              not prelim_hidden, f"coverage_days={cov}")
+        prelim_txt = page.text_content("#pv-prelim") or ""
+        check("бейдж называет число дней покрытия и канон 730",
+              str(cov) in prelim_txt and "730" in prelim_txt, prelim_txt[:160])
+
+    print("\n== §3 «На что обратить внимание сегодня»: подсчёт существующих полей ==")
+    attn_txt = page.inner_text("#pv-attn") or ""
+    check("блок явно подписан как предпросмотр, а не рекомендация действия",
+          "Только предпросмотр" in attn_txt, attn_txt[:300])
+    live_all = [it for it in turnover["items"] if not it.get("hidden") and not it["archived"]]
+    exp_weak = sum(1 for it in live_all if it["cls"] == "weak")
+    exp_below = sum(1 for it in live_all if it.get("below_cost"))
+    exp_lowdata = sum(1 for it in live_all if it.get("low_data"))
+    attn_numbers = pv(page, "Array.from(document.querySelectorAll('#pv-attn .pv-attn-item b'))"
+                            ".map(el => el.textContent.trim())")
+    check("сводка называет число слабых, ниже себестоимости и «мало данных» — "
+          "ровно как в подсчёте по полям ответа ручки (без новой формулы)",
+          attn_numbers[:3] == [str(exp_weak), str(exp_below), str(exp_lowdata)],
+          f"{attn_numbers[:3]} vs {[exp_weak, exp_below, exp_lowdata]}")
+
+    print("\n== §3 Поиск по таблице: подписанное поле, только визуальный фильтр ==")
+    label_for = pv(page, "document.querySelector('label[for=\"pv-search\"]') ? "
+                        "document.querySelector('label[for=\"pv-search\"]').getAttribute('for') : null")
+    check("поле поиска связано с <label> через for/id", label_for == "pv-search", str(label_for))
+    sample_item = next((it for it in live_all if it["base_name"]), None)
+    assert sample_item is not None
+    query = sample_item["base_name"][:4]
+    page.fill("#pv-search", query)
+    page.wait_for_timeout(150)
+    rows_after_search = pv(page, "document.querySelectorAll('#pv-tbody tr:not(.pv-grouprow)').length")
+    expected_after = sum(1 for it in live_all if query.lower() in it["base_name"].lower())
+    check("поиск фильтрует строки визуально, без обращения к сети",
+          rows_after_search == expected_after, f"{rows_after_search} vs {expected_after}")
+    check("поиск не тронул сами данные /api/turnover",
+          owner.get("/api/turnover").json() == turnover)
+    page.fill("#pv-search", "")
+    page.wait_for_timeout(150)
+
+    print("\n== §3 Переключатель объяснений: выключен по умолчанию, focus-managed ==")
+    check("глобальный переключатель объяснений по умолчанию выключен",
+          pv(page, "document.getElementById('pv-help-toggle').getAttribute('aria-pressed')") == "false")
+    check("попап объяснений изначально скрыт",
+          pv(page, "document.getElementById('pv-help-pop').hidden"))
+    btn_box = pv(page, "(() => { const r = document.getElementById('pv-help-toggle')"
+                       ".getBoundingClientRect(); return [r.width, r.height]; })()")
+    check("кнопка объяснений — полноценная цель нажатия (>=44px)",
+          btn_box[0] >= 44 and btn_box[1] >= 44, str(btn_box))
+    page.click("#pv-help-toggle")
+    page.wait_for_timeout(150)
+    check("клик открывает попап и включает состояние",
+          not pv(page, "document.getElementById('pv-help-pop').hidden")
+          and pv(page, "document.getElementById('pv-help-toggle').getAttribute('aria-pressed')") == "true")
+    check("фокус уходит в попап (на кнопку закрытия)",
+          pv(page, "document.activeElement && document.activeElement.id") == "pv-help-close")
+    page.keyboard.press("Escape")
+    page.wait_for_timeout(150)
+    check("Escape закрывает попап объяснений",
+          pv(page, "document.getElementById('pv-help-pop').hidden"))
+    check("фокус возвращается на кнопку, открывшую попап",
+          pv(page, "document.activeElement && document.activeElement.id") == "pv-help-toggle")
+    check("после закрытия переключатель снова выключен",
+          pv(page, "document.getElementById('pv-help-toggle').getAttribute('aria-pressed')") == "false")
+
+    # Второй триггер — на уровне заголовка метрики (шаг «Оборачиваемость»), а не
+    # точка в ячейке таблицы: искать точку в ячейках заведомо нечего.
+    check("в ячейках таблицы нет отдельных кнопок-точек объяснения",
+          pv(page, "document.querySelectorAll('#pv-tbody .pv-help, #pv-tbody [data-help]').length") == 0)
+    page.click("#pv-help-turnover")
+    page.wait_for_timeout(150)
+    help_title = page.text_content("#pv-help-title") or ""
+    check("метричный триггер открывает объяснение именно денежной отдачи",
+          "Денежная отдача" in help_title, help_title[:120])
+    page.click("#pv-help-close")
+    page.wait_for_timeout(120)
+    check("кнопка закрытия тоже закрывает попап и возвращает фокус",
+          pv(page, "document.getElementById('pv-help-pop').hidden")
+          and pv(page, "document.activeElement && document.activeElement.id") == "pv-help-turnover")
+
     live_items = [it for it in turnover["items"] if not it.get("hidden") and not it["archived"]]
     rank = [it for it in live_items if it["group"] == "rank" and not it["low_data"]]
     expected_hero = rank[len(rank) // 2]["base_name"] if rank else None
@@ -687,47 +787,83 @@ def part_browser(pw, cookies, owner: httpx.Client, snap_before: dict) -> dict:
     check("настоящая «Оборачиваемость» денежный слой по-прежнему показывает",
           "money-bar" in owner.get("/turnover").text)
 
-    print("\n== §3 Экскурсия по строке ==")
+    print("\n== §3 Экскурсия по строке: ровно 5 шагов, стабильные data-* цели ==")
     page.click("#pv-tour-start")
     page.wait_for_selector("#pv-tour:not([hidden])")
     steps_tour = walk_tour(page)
-    check("экскурсия состоит из десяти шагов", len(steps_tour) == 10, str(len(steps_tour)))
+    check("экскурсия сведена ровно к пяти шагам (было десять)",
+          len(steps_tour) == 5, str(len(steps_tour)))
     joined = " | ".join(s["title"] for s in steps_tour)
-    for need in ("Оборачиваемость", "денежная отдача", "номинальная цена", "Сезон",
-                 "Дней в стоке", "Остаток", "Фактическая скидка", "Ручная скидка",
-                 "Автоматическая скидка", "Архив"):
-        check(f"экскурсия проходит пункт «{need}»", need in joined, joined[:220])
+    for need in ("Денежная отдача", "Цена", "Сезон", "Дни в стоке", "Скидки и архив"):
+        check(f"экскурсия проходит пункт «{need}»", need in joined, joined[:260])
 
     def tour_text(i):
         return steps_tour[i]["text"] if i < len(steps_tour) else ""
 
-    color_txt = tour_text(1)
-    check("цвет объяснён как денежная отдача",
-          "денежную отдачу" in color_txt, color_txt[:140])
-    check("и прямо сказано, что это не рентабельность и не прибыльность",
-          "не рентабельность и не " in color_txt and "прибыльность" in color_txt,
-          color_txt[:200])
+    turn_txt = tour_text(0)
+    check("метрика названа дословно: «Денежная отдача / нетто-выручка в день наличия»",
+          "Денежная отдача / нетто-выручка в день наличия" in turn_txt, turn_txt[:220])
+    check("прямо сказано, что это не прибыль",
+          "не прибыль" in turn_txt, turn_txt[:220])
+    check("канон истории назван числом 730, а не расплывчато «годом»",
+          "730" in turn_txt, turn_txt[:220])
 
-    sea_txt = tour_text(3)
+    sea_txt = tour_text(2)
     check("сезонный ноль объяснён только для покрытого сезона без продаж",
           "покрыт загруженной историей" in sea_txt and "продаж в нём не было" in sea_txt,
           sea_txt[:200])
     check("прочерк объяснён как «данных нет», со ссылкой на D-34",
           "данных нет" in sea_txt.lower() and "D-34" in sea_txt, sea_txt[:200])
 
-    stock_txt = tour_text(5)
+    stock_txt = tour_text(3)
     check("шаг про запас честно объясняет пустую колонку «Не хватает»",
           "в предпросмотре пуст сознательно" in stock_txt
           and "пересчитывать её здесь" in stock_txt, stock_txt[:220])
+    check("тот же шаг называет дни в стоке из 730",
+          "730" in stock_txt, stock_txt[:220])
 
-    auto_txt = tour_text(8)
-    check("автоматическая скидка описана числами существующего правила",
-          digits_in(auto_txt, rule["rule"]["top_turnover"])
-          and digits_in(auto_txt, rule["rule"]["weak_pct"]), auto_txt[:220])
+    disc_txt = tour_text(4)
+    check("скидки описаны числами существующего правила",
+          digits_in(disc_txt, rule["rule"]["top_turnover"])
+          and digits_in(disc_txt, rule["rule"]["weak_pct"]), disc_txt[:260])
     check("и прямо сказано, что предпросмотр правило не применяет",
-          "не применяет" in auto_txt, auto_txt[:220])
+          "не применяется" in disc_txt, disc_txt[:260])
+    check("тот же шаг честно называет архив только чтением",
+          "только" in disc_txt and "информация" in disc_txt, disc_txt[:260])
     check("экскурсия ничего не применила: ручные скидки те же",
           owner.get("/api/discount-overrides").json() == overrides)
+
+    print("\n== §3 Подсветка экскурсии — стабильные атрибуты, без nth-child ==")
+    check("шаблон не использует позиционный DOM-таргетинг (:nth-child) для тура",
+          ":nth-child" not in page.content())
+    # Шаг «Дни в стоке, остаток и запас» подсвечивает СРАЗУ обе ячейки dis и wos —
+    # проверка, что подсветка не позиционная, а по нескольким стабильным ключам.
+    # walk_tour дошёл до последнего (пятого) шага кнопкой «Дальше»; возвращаемся
+    # на четвёртый (индекс 3) той же кнопкой «Назад», которой пользуется человек.
+    page.click("#pv-tour-prev")
+    page.wait_for_timeout(80)
+    check("экскурсия действительно на шаге «Дни в стоке, остаток и запас»",
+          pv(page, "window.__PV__.tour.i") == 3, str(pv(page, "window.__PV__.tour.i")))
+    hl = pv(page, "Array.from(document.querySelectorAll('#pv-tbody .pv-hl'))"
+                  ".map(el => el.getAttribute('data-tour'))")
+    check("шаг тура «запас» подсвечивает и dis, и wos одновременно",
+          set(hl) == {"dis", "wos"}, str(hl))
+    page.click("#pv-tour-next")
+    page.wait_for_timeout(80)
+
+    # Явное доказательство (не только через общий список ALLOWED_PATHS выше по
+    # файлу): полный проход экскурсии не отправил и не мог отправить POST
+    # прогресса обучения — ни через сторожа (он физически бросает исключение
+    # раньше, чем запрос уйдёт), ни как-то мимо него.
+    lesson_guard = page.evaluate("""() => {
+      const passed = Array.from(window.__PV_GUARD__.passed);
+      const blocked = window.__PV_GUARD__.blocked.slice();
+      return { passed, blocked,
+        anyLessonPassed: passed.some(p => p.indexOf('/api/lessons') !== -1
+          || p.indexOf('/api/hints') !== -1 || p.indexOf('/api/prefs') !== -1) };
+    }""")
+    check("экскурсия не пропустила сторожа ни одним запросом к урокам/подсказкам/prefs",
+          not lesson_guard["anyLessonPassed"], str(lesson_guard["passed"]))
 
     page.keyboard.press("Escape")
     page.wait_for_timeout(150)
@@ -886,6 +1022,30 @@ def part_responsive(browser, cookies) -> None:
                   inner[2] - inner[3] <= 1, f"{inner[2]} vs {inner[3]}")
             bad = page.evaluate(TOUCH_JS)
             check("390px: все цели нажатия не меньше 44px", not bad, "; ".join(bad)[:200])
+            check("390px: таблица шире контейнера — видна подсказка прокрутки",
+                  page.evaluate("() => document.getElementById('pv-tablewrap')"
+                                ".classList.contains('is-scrollable')"))
+            hint_visible = page.evaluate(
+                "() => getComputedStyle(document.getElementById('pv-scrollhint')).display")
+            check("390px: подсказка прокрутки реально показана (не display:none)",
+                  hint_visible != "none", hint_visible)
+            check("390px: у поля поиска есть подписанный <label>",
+                  page.evaluate("() => !!document.querySelector('label[for=\"pv-search\"]')"))
+            cls_badges = page.evaluate(
+                "() => document.querySelectorAll('#pv-tbody .pv-clsbadge').length")
+            check("390px: класс строки продублирован текстом, не только цветом фона",
+                  cls_badges > 0, str(cls_badges))
+            check("390px: рядом с архивом явно сказано, что это только информация",
+                  "только информация" in (page.inner_text("[data-step='turnover']") or ""))
+            page.click("#pv-help-toggle")
+            page.wait_for_timeout(200)
+            sheet_box = page.evaluate(
+                "() => { const r = document.getElementById('pv-help-pop')"
+                ".getBoundingClientRect(); return [r.left, r.width]; }")
+            check("390px: попап объяснений превращается в донный лист во всю ширину",
+                  sheet_box[0] == 0 and sheet_box[1] >= 380, str(sheet_box))
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(150)
         # Экскурсия на каждом размере: снимок для приёмки.
         page.click("#pv-tour-start")
         page.wait_for_selector("#pv-tour:not([hidden])")
