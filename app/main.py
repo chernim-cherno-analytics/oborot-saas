@@ -1095,6 +1095,50 @@ def onboarding_page(request: Request, db: Session = Depends(get_db)):
     return _page(request, ctx, "onboarding.html", "onboarding", "Подключение данных", db=db)
 
 
+# Куда уходит участник (не владелец) с owner-only предпросмотра. Безопасный
+# отказ, а не 500 и не пустая страница: человек попадает на обычный рабочий
+# экран своей организации. Вынесено в константу, потому что на это значение
+# опирается тест доступа — иначе адрес отказа жил бы в двух местах.
+ONBOARDING_PREVIEW_DENY_REDIRECT = "/turnover"
+
+
+@app.get("/onboarding/preview", response_class=HTMLResponse)
+def onboarding_preview_page(request: Request, db: Session = Depends(get_db)):
+    """Owner-only предпросмотр онбординга по выделенному явному адресу.
+
+    Это ВИЗУАЛЬНАЯ ПРИЁМКА, а не онбординг. Отсюда три свойства, и каждое из
+    них держится не на вёрстке, а на коде:
+
+    1. **Изолированность.** Ни один автоматический редирект приложения сюда не
+       ведёт: `/` уводит на `/onboarding` или `/turnover`, сам `/onboarding`
+       не изменён. Попасть на предпросмотр можно только набрав адрес руками —
+       поэтому он и не становится онбордингом «для всех подряд».
+    2. **Доступ проверяется на сервере.** Спрятать кнопку недостаточно: адрес
+       угадывается. Аноним — редирект на `/login`; участник без роли владельца
+       — редирект на обычную рабочую страницу. Роль берётся из
+       `auth.resolve_auth` (членство в организации проверено там же), а не из
+       заголовка и не из параметра запроса.
+    3. **Ничего не пишет.** Маршрут только GET, шаблон
+       `onboarding_preview.html` самодостаточен и НЕ наследует `base.html`:
+       базовый шаблон подключает `_hints.html` и `/static/app.js`, а те сами
+       по себе шлют служебные POST (`/api/hints/seen`, `/api/prefs/hints`,
+       `/api/lessons/{key}/done`, `/api/sync/run`). На странице приёмки такие
+       запросы были бы записью в чужую сессию под видом «просто посмотреть»,
+       поэтому базовый шаблон здесь не используется сознательно.
+
+    Проверка `_has_active_connection` тут намеренно ОТСУТСТВУЕТ (в отличие от
+    `/onboarding`, который уводит подключённую организацию на `/`): предпросмотр
+    показывают владельцу как раз на живой организации, где данные уже есть.
+    """
+    ctx = auth.resolve_auth(request, db)
+    if ctx is None:
+        return RedirectResponse("/login", status_code=302)
+    if ctx.role != "owner":
+        return RedirectResponse(ONBOARDING_PREVIEW_DENY_REDIRECT, status_code=302)
+    return _page(request, ctx, "onboarding_preview.html", "onboarding",
+                 "Предпросмотр онбординга", db=db)
+
+
 @app.get("/replenish", response_class=HTMLResponse)
 def replenish_page(request: Request, db: Session = Depends(get_db)):
     return _authed_page(request, db, "replenish.html", "replenish", "Что заказать")

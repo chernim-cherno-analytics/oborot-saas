@@ -122,6 +122,12 @@ SUITES = [
     # порту, поэтому раздавать ему порт не требуется.
     ("reconcile",   "test_reconcile_sales.py", False, False),
     ("ui",          "test_ui.py",              False, False),
+    # Owner-only предпросмотр онбординга: доступ по ролям, ноль записей
+    # (отпечаток всей базы до и после полного прохода), честность экрана,
+    # адаптив и клавиатура. Набор браузерный, как и `ui`, поэтому стоит рядом
+    # с ним; мока МойСклада и телеграма ему не нужно — данные синтетические,
+    # из демо-сида самого проекта.
+    ("onbprev",     "test_onboarding_preview.py", False, False),
     ("backup",      "test_backup.py",          False, False),
     ("deploy",      "test_deploy.py",          False, False),
     ("offsite",     "test_offsite.py",         False, False),
