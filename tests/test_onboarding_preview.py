@@ -73,9 +73,10 @@ ALLOWED_PATHS = {
     "/api/settings", "/api/sync/progress", "/api/turnover",
     "/api/discount-rule", "/api/discount-overrides",
 }
-# Восемь смысловых этапов доски загрузки в объявленном порядке.
-SEMANTIC_STAGES = ["connection", "warehouses", "products", "today", "month",
-                   "history", "turnover_calc", "matrix"]
+# Пять спокойных этапов доски загрузки в объявленном порядке (было восемь
+# технических — «Склады»/«Товары и цены»/«Остатки» слиты в «Товары и остатки»,
+# «Расчёт оборачиваемости»/«Подготовка матрицы» слиты в «Матрица»).
+SEMANTIC_STAGES = ["connection", "catalog", "month", "history", "matrix"]
 # Шаги пути предпросмотра в объявленном порядке.
 STEP_KEYS = ["welcome", "warehouses", "horizon", "discounts", "bt", "groups",
              "loader", "turnover"]
@@ -403,6 +404,27 @@ def part_browser(pw, cookies, owner: httpx.Client, snap_before: dict) -> dict:
     check("заголовок приветствия дословный",
           (page.text_content("#pv-h-welcome") or "").strip() == WELCOME_TITLE)
 
+    print("\n== §3 Приветствие за 5–10 секунд: коротко, по-человечески ==")
+    welcome_lead = (page.inner_text("[data-step='welcome'] .pv-lead") or "").strip()
+    check("вводный текст короткий (меньше ~40 слов — читается за 5-10 секунд)",
+          len(welcome_lead.split()) <= 40, f"{len(welcome_lead.split())} слов: {welcome_lead}")
+    check("видимый текст приветствия не содержит сырых путей ручек",
+          "GET /api" not in (page.inner_text("[data-step='welcome']") or ""))
+    check("ровно одно заметное уведомление «ответы не сохраняются» на экране",
+          "Предпросмотр — ответы не сохраняются" in
+          (page.inner_text("[data-step='welcome']") or ""))
+    points = pv(page, "Array.from(document.querySelectorAll("
+                      "'[data-step=\"welcome\"] .pv-plainlist li'))"
+                      ".map(li => li.textContent.trim())")
+    check("«что вы увидите» — не больше трёх понятных пунктов, без жаргона",
+          0 < len(points) <= 3 and not any("GET" in p or "Б/Т" in p for p in points),
+          str(points))
+    check("технические детали (белый список ручек) свёрнуты по умолчанию",
+          not pv(page, "document.querySelector('[data-step=\"welcome\"] details.pv-tech').open"))
+    tech_txt = page.text_content("[data-step='welcome'] details.pv-tech") or ""
+    check("но доказуемы: белый список из пяти GET-ручек по-прежнему там",
+          tech_txt.count("/api/") >= 5, tech_txt[:200])
+
     focused = pv(page, "document.activeElement && document.activeElement.id")
     page.click("[data-step='welcome'] [data-go='next']")
     page.wait_for_selector("[data-step='warehouses'].is-on")
@@ -492,6 +514,14 @@ def part_browser(pw, cookies, owner: httpx.Client, snap_before: dict) -> dict:
     check("замок истории назвал покрытие числами из /api/sync/progress",
           "из" in hist and any(ch.isdigit() for ch in hist), hist[:100])
 
+    gate_visible = page.inner_text("#pv-bt-gate") or ""
+    check("видимая (не свёрнутая) часть замка формулы не тащит D-23/D-35/"
+          "BUSINESS_LOGIC.md в первое прочтение — они в технических деталях",
+          "D-23" not in gate_visible and "D-35" not in gate_visible
+          and "BUSINESS_LOGIC" not in gate_visible, gate_visible[:200])
+    check("но видимая часть всё равно объясняет решение по-человечески",
+          "плохая рекомендация хуже" in gate_visible.lower(), gate_visible[:200])
+
     page.route("**/api/sync/progress", lambda route: route.fulfill(
         status=200, content_type="application/json",
         body='{"state":"done","mode":"initial","phase":"","progress_pct":100,'
@@ -524,27 +554,57 @@ def part_browser(pw, cookies, owner: httpx.Client, snap_before: dict) -> dict:
     check("черновик производственных групп остаётся в памяти вкладки",
           len(pv(page, "window.__PV__.draft.groups")) == 1,
           str(pv(page, "window.__PV__.draft.groups")))
+    groups_visible = page.inner_text("[data-step='groups']") or ""
+    check("на шаге групп не видно сырого GET /api/productions/commit объяснения "
+          "в первом прочтении",
+          "GET /api/productions" not in groups_visible, groups_visible[:200])
+    groups_tech = page.text_content("[data-step='groups'] details.pv-tech") or ""
+    check("но оно доказуемо в свёрнутых технических деталях",
+          "GET /api/productions" in groups_tech and "commit" in groups_tech,
+          groups_tech[:200])
     page.click("[data-step='groups'] [data-go='next']")
     page.wait_for_selector("[data-step='loader'].is-on")
 
     keys = pv(page, "Array.from(document.querySelectorAll('#pv-stages .pv-stage'))"
                     ".map(s => s.getAttribute('data-key'))")
-    check("восемь смысловых этапов в объявленном порядке",
+    check("пять спокойных смысловых этапов в объявленном порядке (было восемь)",
           keys == SEMANTIC_STAGES, str(keys))
+
+    # Главный статус — одна спокойная строка над списком этапов, не пусто и
+    # не тире: на мобильном именно её видно над сгибом экрана, список этапов
+    # может быть уже ниже.
+    mainstatus = page.inner_text("#pv-mainstatus") or ""
+    check("главный статус непустой и не тире/idle",
+          bool(mainstatus.strip()) and mainstatus.strip() not in ("—", ""), mainstatus)
+    check("на полностью загруженных (в этом сценарии) данных статус говорит "
+          "«матрица готова»", "Матрица готова" in mainstatus, mainstatus)
+
     # inner_text, а не text_content: лента «ДЕМОНСТРАЦИЯ» в живом режиме
     # спрятана стилем, и text_content вернул бы её как показанную.
     board = page.inner_text("#pv-board") or ""
+    check("в живом режиме на доске нет слова ДЕМО",
+          "ДЕМО" not in board and "ДЕМОНСТРАЦИЯ" not in board)
+    check("сырые имена полей контракта не видны в первом прочтении доски "
+          "(свёрнуты в технические детали)",
+          "coverage_days" not in board and "progress_pct" not in board, board[:200])
+
+    print("\n== §3 Доска загрузки: технические детали свёрнуты, но доказательство цело ==")
+    page.click("#pv-board details.pv-tech summary")
+    page.wait_for_timeout(120)
+    tech_foot = page.text_content("#pv-board-foot") or ""
     for field in ("coverage_days", "history_days", "progress_pct", "state", "eta_sec"):
-        check(f"живая доска называет поле контракта {field}", field in board)
+        check(f"технические детали доски называют поле контракта {field}", field in tech_foot)
     nofield = pv(page, "Array.from(document.querySelectorAll("
                        "'#pv-stages .pv-stage[data-state=\"nofield\"]'))"
                        ".map(s => s.getAttribute('data-key'))")
-    check("этапы без поля в контракте честно помечены, а не нарисованы",
-          nofield == ["turnover_calc", "matrix"], str(nofield))
-    check("для них прямо сказано, что поля нет и прогресс не рисуется",
-          "отдельного поля для этого этапа нет" in board)
-    check("в живом режиме на доске нет слова ДЕМО",
-          "ДЕМО" not in board and "ДЕМОНСТРАЦИЯ" not in board)
+    check("этап без поля в контракте («Матрица») честно помечен, а не нарисован",
+          nofield == ["matrix"], str(nofield))
+    check("для него прямо сказано в технических деталях, что поля нет",
+          "отдельного поля" in tech_foot, tech_foot[:200])
+    page.click("#pv-board details.pv-tech summary")
+    page.wait_for_timeout(80)
+    check("технические детали доски снова свёрнуты",
+          not pv(page, "document.querySelector('#pv-board details.pv-tech').open"))
 
     page.click("#pv-demo-btn")
     page.wait_for_timeout(400)
@@ -553,10 +613,13 @@ def part_browser(pw, cookies, owner: httpx.Client, snap_before: dict) -> dict:
     demo_txt = page.inner_text("#pv-board") or ""
     check("демонстрация подписана словом ДЕМОНСТРАЦИЯ", "ДЕМОНСТРАЦИЯ" in demo_txt)
     check("сказано, что числа синтетические", "синтетические" in demo_txt)
+    demo_status = page.inner_text("#pv-mainstatus") or ""
+    check("главный статус тоже подписан демонстрацией явно",
+          "демонстрация" in demo_status.lower(), demo_status)
     tags = pv(page, "document.querySelectorAll('#pv-stages .pv-demotag').length")
     check("каждый этап демонстрации помечен отдельно",
           tags == len(SEMANTIC_STAGES), str(tags))
-    check("живые поля контракта на время демонстрации скрыты целиком",
+    check("живые поля контракта на время демонстрации в первом прочтении по-прежнему не видны",
           "coverage_days" not in demo_txt and "progress_pct" not in demo_txt)
     moved = set()
     for _ in range(10):
@@ -578,12 +641,14 @@ def part_browser(pw, cookies, owner: httpx.Client, snap_before: dict) -> dict:
     page.wait_for_selector("[data-step='turnover'].is-on")
 
     turnover_step_html = page.inner_text("[data-step='turnover']") or ""
-    check("метрика на экране названа дословно: «Денежная отдача / нетто-выручка "
-          "в день наличия»",
-          "Денежная отдача / нетто-выручка в день наличия" in turnover_step_html,
-          turnover_step_html[:400])
-    check("рядом явно сказано, что это не прибыль",
-          "не прибыль" in turnover_step_html, turnover_step_html[:400])
+    check("главный показатель назван коротко: «Денежная отдача»",
+          "Денежная отдача" in turnover_step_html, turnover_step_html[:400])
+    check("рядом — короткая подпись «выручка в день наличия», без полного "
+          "определения на первом экране",
+          "выручка в день наличия" in turnover_step_html, turnover_step_html[:400])
+    check("полное определение (с «не прибыль») в первом прочтении НЕ повторено — "
+          "оно живёт в попапе «Объяснения», см. проверку ниже",
+          "не прибыль" not in turnover_step_html, turnover_step_html[:400])
 
     # Сверяем бейдж с тем, что реально загрузила сама страница (PV.data.progress),
     # а не с независимым свежим запросом к ручке: несколькими строками выше тест
@@ -671,6 +736,10 @@ def part_browser(pw, cookies, owner: httpx.Client, snap_before: dict) -> dict:
     help_title = page.text_content("#pv-help-title") or ""
     check("метричный триггер открывает объяснение именно денежной отдачи",
           "Денежная отдача" in help_title, help_title[:120])
+    help_text = page.text_content("#pv-help-text") or ""
+    check("полное определение и «не прибыль» — здесь, в объяснении, а не на "
+          "каждом экране подряд",
+          "не прибыл" in help_text and "730" in help_text, help_text[:300])
     page.click("#pv-help-close")
     page.wait_for_timeout(120)
     check("кнопка закрытия тоже закрывает попап и возвращает фокус",
@@ -798,39 +867,58 @@ def part_browser(pw, cookies, owner: httpx.Client, snap_before: dict) -> dict:
     check("настоящая «Оборачиваемость» денежный слой по-прежнему показывает",
           "money-bar" in owner.get("/turnover").text)
 
-    print("\n== §3 Экскурсия по строке: ровно 5 шагов, стабильные data-* цели ==")
+    print("\n== §3 Экскурсия по строке: ровно 5 шагов, 1 мысль + короткие строки, "
+          "технические детали свёрнуты ==")
     page.click("#pv-tour-start")
     page.wait_for_selector("#pv-tour:not([hidden])")
+
+    # Первый шаг ДО прохода кнопкой «Дальше»: видимый (inner_text) текст короткий
+    # и без канона/полей, а полный текст (text_content, ниже через walk_tour)
+    # всё равно доказуем — потому что лежит в свёрнутых технических деталях,
+    # а не выброшен совсем.
+    visible0 = page.inner_text("#pv-tour-text") or ""
+    check("видимый текст первого шага короткий: без канона D-35 и без сырых полей",
+          "D-35" not in visible0 and "GET /api/turnover" not in visible0, visible0[:220])
+    check("но «не прибыль» — базовая честность про деньги — видна сразу, без раскрытия",
+          "не прибыль" in visible0, visible0[:220])
+    check("на первом шаге есть свёрнутый разворот «Технические детали»",
+          pv(page, "!!document.querySelector('#pv-tour-text details.pv-tech')"))
+    check("и он свёрнут по умолчанию",
+          not pv(page, "document.querySelector('#pv-tour-text details.pv-tech').open"))
+
     steps_tour = walk_tour(page)
     check("экскурсия сведена ровно к пяти шагам (было десять)",
           len(steps_tour) == 5, str(len(steps_tour)))
     joined = " | ".join(s["title"] for s in steps_tour)
     for need in ("Денежная отдача", "Цена", "Сезон", "Дни в стоке", "Скидки и архив"):
         check(f"экскурсия проходит пункт «{need}»", need in joined, joined[:260])
+    for title in (s["title"] for s in steps_tour):
+        check(f"заголовок шага короткий (1 мысль, не длинное предложение): «{title}»",
+              len(title) <= 40, f"{len(title)} символов")
 
     def tour_text(i):
         return steps_tour[i]["text"] if i < len(steps_tour) else ""
 
     turn_txt = tour_text(0)
-    check("метрика названа дословно: «Денежная отдача / нетто-выручка в день наличия»",
-          "Денежная отдача / нетто-выручка в день наличия" in turn_txt, turn_txt[:220])
     check("прямо сказано, что это не прибыль",
           "не прибыль" in turn_txt, turn_txt[:220])
-    check("канон истории назван числом 730, а не расплывчато «годом»",
+    check("канон истории (730) доказуем — он в свёрнутых технических деталях",
           "730" in turn_txt, turn_txt[:220])
 
     sea_txt = tour_text(2)
-    check("сезонный ноль объяснён только для покрытого сезона без продаж",
-          "покрыт загруженной историей" in sea_txt and "продаж в нём не было" in sea_txt,
-          sea_txt[:200])
-    check("прочерк объяснён как «данных нет», со ссылкой на D-34",
-          "данных нет" in sea_txt.lower() and "D-34" in sea_txt, sea_txt[:200])
+    check("ноль объяснён как «продаж не было»",
+          "продаж не было" in sea_txt, sea_txt[:200])
+    check("прочерк объяснён как «данных ещё нет»",
+          "данных ещё нет" in sea_txt, sea_txt[:200])
+    check("значок «±» (возвраты превысили продажи) объяснён отдельно от обоих",
+          "возвраты" in sea_txt and "перевесили" in sea_txt, sea_txt[:200])
+    check("решение владельца D-34 доказуемо — в свёрнутых технических деталях",
+          "D-34" in sea_txt, sea_txt[:200])
 
     stock_txt = tour_text(3)
     check("шаг про запас честно объясняет пустую колонку «Не хватает»",
-          "в предпросмотре пуст сознательно" in stock_txt
-          and "пересчитывать её здесь" in stock_txt, stock_txt[:220])
-    check("тот же шаг называет дни в стоке из 730",
+          "пуст сознательно" in stock_txt, stock_txt[:220])
+    check("тот же шаг называет канон 730 (в технических деталях)",
           "730" in stock_txt, stock_txt[:220])
 
     disc_txt = tour_text(4)
@@ -1203,8 +1291,18 @@ def part_responsive(browser, cookies) -> None:
                 "() => document.querySelectorAll('#pv-tbody .pv-clsbadge').length")
             check("390px: класс строки продублирован текстом, не только цветом фона",
                   cls_badges > 0, str(cls_badges))
-            check("390px: рядом с архивом явно сказано, что это только информация",
-                  "только информация" in (page.inner_text("[data-step='turnover']") or ""))
+            check("390px: короткая строка над таблицей видна сразу, без раскрытия деталей",
+                  bool((page.inner_text("#pv-tfoot-short") or "").strip()))
+            check("390px: полное объяснение архива (в т.ч. «только информация») "
+                  "свёрнуто по умолчанию, но доказуемо",
+                  "только" in (page.text_content("#pv-tfoot") or "")
+                  and "информац" in (page.text_content("#pv-tfoot") or ""))
+            check("390px: сводка «на что обратить внимание» стоит ДО плотной таблицы "
+                  "(компактная карточка над скроллящейся таблицей)",
+                  page.evaluate("() => { const a = document.getElementById('pv-attn');"
+                                " const t = document.getElementById('pv-tablewrap');"
+                                " return !!(a && t && (a.compareDocumentPosition(t) "
+                                "& Node.DOCUMENT_POSITION_FOLLOWING)); }"))
             page.click("#pv-help-toggle")
             page.wait_for_timeout(200)
             sheet_box = page.evaluate(
@@ -1228,7 +1326,37 @@ def part_responsive(browser, cookies) -> None:
             page.wait_for_timeout(90)
         page.wait_for_selector("[data-step='loader'].is-on")
         page.evaluate("() => window.scrollTo(0, 0)")
-        page.wait_for_timeout(150)
+        page.wait_for_timeout(400)
+        if tag == "390x844":
+            # Над сгибом экрана должно быть видно, ЧТО происходит — не пустое
+            # состояние и не тире. Порог 640px взят из окна: главный статус
+            # обязан попадать в первый экран без прокрутки на телефоне.
+            status_box = page.evaluate(
+                "() => { const el = document.getElementById('pv-mainstatus');"
+                " if (!el) return null; const r = el.getBoundingClientRect();"
+                " return { top: r.top, bottom: r.bottom, text: el.innerText.trim() }; }")
+            check("390px: главный статус загрузки виден над сгибом экрана",
+                  status_box and status_box["top"] < 640, str(status_box))
+            check("390px: и это не пустая строка/тире/idle",
+                  status_box and status_box["text"] and status_box["text"] not in ("—", ""),
+                  str(status_box))
+            header_layout = page.evaluate(
+                "() => { const b = document.getElementById('pv-badge').getBoundingClientRect();"
+                " const s = document.getElementById('pv-stepcount').getBoundingClientRect();"
+                " const a = document.querySelector('.pv-top-actions').getBoundingClientRect();"
+                " return { badgeTop: b.top, stepTop: s.top, actionsTop: a.top }; }")
+            # Бейдж — пилюля с вертикальным паддингом, счётчик шага — голый текст:
+            # у них разная высота строки, поэтому верхние края отличаются даже в
+            # одной визуальной строке. Порог взят не «около нуля», а «явно меньше
+            # высоты строки шапки» (~30px) — это отличает «в одной строке» от
+            # «строкой ниже» (там разница — вся высота actions-блока, ~35px+).
+            check("390px: бейдж и счётчик шага — в одной строке шапки",
+                  abs(header_layout["badgeTop"] - header_layout["stepTop"]) < 20,
+                  str(header_layout))
+            check("390px: действия («Объяснения»/«Выйти») — отдельной строкой ниже, "
+                  "не втиснуты в первую",
+                  header_layout["actionsTop"] > header_layout["badgeTop"] + 20,
+                  str(header_layout))
         page.screenshot(path=str(SHOTS_DIR / f"preview_{tag}_loader.png"))
         ctx.close()
     check("снимки всех трёх размеров сохранены",
@@ -1285,6 +1413,23 @@ def part_responsive(browser, cookies) -> None:
           page.evaluate("() => document.activeElement && document.activeElement.id")
           == "pv-exit",
           str(page.evaluate("() => document.activeElement && document.activeElement.id")))
+
+    # Кольцо фокуса заметно, но не «взрывает» макет: было 3px + отступ 2px
+    # (визуально ~5px хало), стало 2px + отступ 1px. Проверяем именно то, что
+    # уменьшилось, а не просто «кольцо есть» — иначе регрессия к старому
+    # большому кольцу тоже прошла бы эту проверку.
+    ring = page.evaluate(
+        "() => { const el = document.getElementById('pv-exit'); el.focus();"
+        " const cs = getComputedStyle(el);"
+        " return { width: cs.outlineWidth, offset: cs.outlineOffset,"
+        " style: cs.outlineStyle }; }")
+    check("кольцо фокуса тоньше прежнего (<=2px, было 3px)",
+          ring["width"] in ("2px",), str(ring))
+    check("и не отодвинуто далеко от элемента (<=1px, был отступ 2px)",
+          ring["offset"] in ("1px",), str(ring))
+    check("кольцо всё ещё видимо (не none/hidden) — фокус клавиатуры не потерян",
+          ring["style"] not in ("none", "hidden"), str(ring))
+
     check("в консоли браузера нет ошибок и при reduced-motion",
           not errors, "; ".join(errors)[:200])
     ctx.close()

@@ -79,7 +79,11 @@ h1{font-size:32px;font-weight:700;}
 h2{font-size:24px;font-weight:700;}
 h3{font-size:17px;font-weight:700;}
 p{margin:0 0 12px;}
-:focus-visible{outline:3px solid var(--pv-blue);outline-offset:2px;border-radius:6px;}
+/* Тонкое кольцо фокуса: видно на любом фоне, но не «взрывает» макет. Прежние
+   3px + отступ 2px читались как техническая консоль, а не спокойный продукт;
+   :focus-visible по-прежнему держит клавиатурный фокус видимым и не трогает
+   объявление скринридером (это чисто визуальный контур, не aria-атрибут). */
+:focus-visible{outline:2px solid var(--pv-blue);outline-offset:1px;border-radius:6px;}
 
 /* Пропуск к содержимому: обязателен для клавиатуры, и у него тоже полноценная
    область нажатия — правило «>=44px» не знает исключений для служебных ссылок. */
@@ -414,6 +418,56 @@ table.pv-t tbody tr.pv-hero{outline:2px solid var(--pv-blue);outline-offset:-2px
   clip:rect(0,0,0,0);white-space:nowrap;border:0;
 }
 
+/* ── Простой список «что вы увидите» — без карточек-строк складов ───────── */
+.pv-plainlist{list-style:none;margin:10px 0 0;padding:0;display:grid;gap:8px;}
+.pv-plainlist li{
+  padding-left:22px;position:relative;color:var(--pv-ink-2);font-size:15px;
+}
+.pv-plainlist li::before{
+  content:"";position:absolute;left:0;top:9px;width:7px;height:7px;
+  border-radius:50%;background:var(--pv-blue);
+}
+
+/* ── Технический разворот: сырые пути/поля/каноны/пороги — по умолчанию
+      свёрнут, доступен по клику владельцу, но не часть первого прочтения.
+      <details>/<summary> — намеренно нативные: клавиатура (Enter/Space) и
+      объявление раскрытия скринридеру работают без единой строчки JS. ────── */
+.pv-tech{margin-top:14px;border-top:1px solid var(--pv-line-soft);padding-top:10px;}
+.pv-tech summary{
+  cursor:pointer;font-size:12px;font-weight:700;color:var(--pv-ink-3);
+  list-style:none;display:inline-flex;align-items:center;gap:6px;min-height:32px;
+}
+.pv-tech summary::-webkit-details-marker{display:none;}
+.pv-tech summary::before{
+  content:"▸";display:inline-block;font-size:10px;
+  transition:transform .15s var(--pv-ease);
+}
+.pv-tech[open] summary::before{transform:rotate(90deg);}
+.pv-tech .pv-tech-body{margin-top:8px;font-size:12px;color:var(--pv-ink-3);line-height:1.5;}
+.pv-tech .pv-tech-body p{margin:0 0 8px;}
+.pv-tech .pv-tech-body p:last-child{margin-bottom:0;}
+
+/* ── Короткая подпись главного показателя: заголовок + пояснение помельче,
+      полное определение живёт в попапе «Объяснения», а не тут ────────────── */
+.pv-metriclabel{font-size:17px;margin:4px 0 14px;}
+.pv-metriclabel b{font-weight:700;}
+.pv-metriclabel span{color:var(--pv-ink-2);}
+
+/* ── Главный статус доски загрузки: одна спокойная строка над списком
+      этапов, а не восемь технических строчек сразу ────────────────────────── */
+.pv-mainstatus{
+  display:flex;align-items:center;gap:12px;margin:2px 0 16px;
+  font-size:17px;font-weight:650;
+}
+.pv-mainstatus .pv-spin{
+  width:18px;height:18px;border-radius:50%;flex:0 0 auto;
+  border:2.5px solid var(--pv-blue-soft);border-top-color:var(--pv-blue);
+  animation:pv-spin .8s linear infinite;
+}
+@media (prefers-reduced-motion:reduce){.pv-mainstatus .pv-spin{animation:none;}}
+@keyframes pv-spin{to{transform:rotate(360deg);}}
+.pv-mainstatus .pv-done{color:var(--pv-green);}
+
 /* ── Адаптив: desktop-first, ниже — правки под узкие экраны ─────────────── */
 @media (max-width:1024px){
   .pv-main{padding:24px 18px 96px;}
@@ -424,9 +478,21 @@ table.pv-t tbody tr.pv-hero{outline:2px solid var(--pv-blue);outline-offset:-2px
   h1{font-size:24px;}
   h2{font-size:20px;}
   .pv-main{padding:20px 14px 110px;}
-  .pv-top-in{padding:8px 14px;gap:10px;}
+  /* Компактная шапка на узком экране: бейдж и счётчик шага — первая строка,
+     действия («Объяснения», «Выйти») — вторая, во всю ширину. Раньше это
+     складывалось само по себе через flex-wrap в произвольном порядке; теперь
+     это осознанная раскладка, а не побочный эффект переноса. */
+  .pv-top-in{
+    padding:8px 14px;gap:8px 10px;
+    display:grid;grid-template-columns:1fr auto;
+    grid-template-areas:"badge step" "actions actions";
+    align-items:center;
+  }
+  .pv-badge{grid-area:badge;}
+  .pv-stepcount{grid-area:step;display:block;justify-self:end;}
+  .pv-top-actions{grid-area:actions;display:flex;gap:8px;}
+  .pv-top-actions .pv-help-btn,.pv-top-actions .pv-exit{flex:1 1 0;}
   .pv-rail{display:none;}
-  .pv-stepcount{display:block;}
   .pv-safe{display:none;}
   .pv-card{padding:16px;border-radius:14px;}
   .pv-stage{grid-template-columns:24px 1fr;}
@@ -457,11 +523,13 @@ table.pv-t tbody tr.pv-hero{outline:2px solid var(--pv-blue);outline-offset:-2px
     <span class="pv-top-sp"></span>
     <span class="pv-stepcount" id="pv-stepcount"></span>
     <nav class="pv-rail" id="pv-rail" aria-label="Шаги предпросмотра"></nav>
-    <button class="pv-help-btn" type="button" id="pv-help-toggle" aria-pressed="false"
-            aria-expanded="false" aria-controls="pv-help-pop">
-      <span aria-hidden="true">?</span> Объяснения
-    </button>
-    <a class="pv-exit" id="pv-exit" href="/turnover">Выйти</a>
+    <div class="pv-top-actions">
+      <button class="pv-help-btn" type="button" id="pv-help-toggle" aria-pressed="false"
+              aria-expanded="false" aria-controls="pv-help-pop">
+        <span aria-hidden="true">?</span> Объяснения
+      </button>
+      <a class="pv-exit" id="pv-exit" href="/turnover">Выйти</a>
+    </div>
   </div>
 </header>
 
@@ -482,28 +550,32 @@ table.pv-t tbody tr.pv-hero{outline:2px solid var(--pv-blue);outline-offset:-2px
     <div class="pv-kicker">Шаг 1 · знакомство</div>
     <h1 id="pv-h-welcome" tabindex="-1">Оборот помогает выстроить торговую матрицу</h1>
     <p class="pv-lead">
-      Дальше — несколько экранов: по одному вопросу на каждом. Это
-      <b>предпросмотр, настройки не изменены</b>: ответы остаются в этой вкладке,
-      ничего не сохраняется и никуда не отправляется.
+      Мы подключим ваши данные, зададим несколько коротких вопросов и покажем
+      готовую матрицу — на всё уйдёт около минуты.
     </p>
+    <div class="pv-note"><b>Предпросмотр — ответы не сохраняются.</b></div>
     <div class="pv-card">
       <h3>Что вы увидите</h3>
-      <p class="pv-muted">
-        Продающие склады из текущего состояния организации «{{ org.name }}» ·
-        горизонт заказа · минимальная и максимальная скидка · экран Б/Т ·
-        производственные группы · доску загрузки данных · предпросмотр
-        «Оборачиваемости» с экскурсией по строке.
-      </p>
-      <p class="pv-muted" style="margin-bottom:0">
-        Страница работает только на чтение: она обращается к пяти GET-ручкам
-        (<span class="pv-mono">/api/settings</span>,
-        <span class="pv-mono">/api/sync/progress</span>,
-        <span class="pv-mono">/api/turnover</span>,
-        <span class="pv-mono">/api/discount-rule</span>,
-        <span class="pv-mono">/api/discount-overrides</span>) и не может обратиться
-        ни к чему больше: сторож в начале скрипта запрещает любой запрос с
-        методом, отличным от GET, и любой адрес вне этого списка.
-      </p>
+      <ul class="pv-plainlist">
+        <li>Ваши продающие склады «{{ org.name }}»</li>
+        <li>Несколько быстрых вопросов о закупке, скидках и производстве</li>
+        <li>Готовую матрицу «Оборачиваемости» на настоящей строке товаров</li>
+      </ul>
+      <details class="pv-tech">
+        <summary>Технические детали</summary>
+        <div class="pv-tech-body">
+          <p>
+            Страница работает только на чтение: она обращается к пяти GET-ручкам
+            (<span class="pv-mono">/api/settings</span>,
+            <span class="pv-mono">/api/sync/progress</span>,
+            <span class="pv-mono">/api/turnover</span>,
+            <span class="pv-mono">/api/discount-rule</span>,
+            <span class="pv-mono">/api/discount-overrides</span>) и не может обратиться
+            ни к чему больше: сторож в начале скрипта запрещает любой запрос с
+            методом, отличным от GET, и любой адрес вне этого списка.
+          </p>
+        </div>
+      </details>
     </div>
     <div class="pv-actions">
       <button class="pv-btn primary" type="button" data-go="next">Начать</button>
@@ -582,10 +654,8 @@ table.pv-t tbody tr.pv-hero{outline:2px solid var(--pv-blue);outline-offset:-2px
       </div>
       <p class="pv-muted" id="pv-disc-hint" style="margin:14px 0 0" role="status"></p>
       <div class="pv-note">
-        Этот черновик <b>не</b> подставляется в правило автоматических скидок и
-        не меняет ни одной сохранённой скидки. Само правило показано дальше, на
-        шаге экскурсии «Автоматическая скидка», — там названы те числа, которые
-        сейчас реально записаны у организации.
+        Этот черновик <b>не</b> меняет ни одной сохранённой скидки. Настоящее
+        правило скидок показано дальше, на шаге экскурсии «Скидки и архив».
       </div>
     </div>
     <div class="pv-actions">
@@ -623,14 +693,19 @@ table.pv-t tbody tr.pv-hero{outline:2px solid var(--pv-blue);outline-offset:-2px
       <div class="pv-draft">черновик · ничего не сохраняется</div>
       <div class="pv-chips" id="pv-groups"></div>
       <p class="pv-muted" id="pv-groups-sel" style="margin:14px 0 0" role="status"></p>
-      <div class="pv-note warn">
-        Существующие производства организации здесь <b>не читаются</b> намеренно:
-        единственная ручка со списком производств
-        (<span class="pv-mono">GET /api/productions</span>) при первом обращении
-        создаёт строку «Основное производство» и делает <span class="pv-mono">commit</span>.
-        Для страницы, которая обещает ноль записей, это дисквалифицирующее
-        свойство — поэтому экран остаётся локальным черновиком.
-      </div>
+      <details class="pv-tech">
+        <summary>Технические детали</summary>
+        <div class="pv-tech-body">
+          <p>
+            Существующие производства организации здесь <b>не читаются</b> намеренно:
+            единственная ручка со списком производств
+            (<span class="pv-mono">GET /api/productions</span>) при первом обращении
+            создаёт строку «Основное производство» и делает <span class="pv-mono">commit</span>.
+            Для страницы, которая обещает ноль записей, это дисквалифицирующее
+            свойство — поэтому экран остаётся локальным черновиком.
+          </p>
+        </div>
+      </details>
     </div>
     <div class="pv-actions">
       <button class="pv-btn" type="button" data-go="prev">Назад</button>
@@ -644,30 +719,29 @@ table.pv-t tbody tr.pv-hero{outline:2px solid var(--pv-blue);outline-offset:-2px
   <section class="pv-step" data-step="loader" aria-labelledby="pv-h-loader">
     <div class="pv-kicker">Шаг 7 · загрузка данных</div>
     <h2 id="pv-h-loader" tabindex="-1">Как «Оборот» собирает вашу матрицу</h2>
-    <p class="pv-lead">
-      Восемь смысловых этапов. Разметка и привязка полей — боевые: всё, что
-      показано как живое, приходит из
-      <span class="pv-mono">GET /api/sync/progress</span>.
-    </p>
+    <p class="pv-lead">Мы собираем ваши данные — обычно это занимает меньше минуты.</p>
 
     <div id="pv-board" data-mode="live">
+      <p class="pv-mainstatus" id="pv-mainstatus" role="status" aria-live="polite"></p>
       <div class="pv-boardhead">
-        <span class="pv-modechip" id="pv-modechip">живые данные · GET /api/sync/progress</span>
+        <span class="pv-modechip" id="pv-modechip">живые данные</span>
         <button class="pv-btn" type="button" id="pv-demo-btn">Показать демонстрацию хода</button>
       </div>
       <div class="pv-demoribbon" id="pv-demoribbon">
-        ДЕМОНСТРАЦИЯ. Числа ниже синтетические: они придуманы для показа анимации
-        и не относятся к вашей загрузке. Живые значения на это время скрыты
-        целиком, чтобы их нельзя было спутать.
+        ДЕМОНСТРАЦИЯ. Числа ниже синтетические — придуманы только для показа
+        анимации и не относятся к вашей загрузке. Живые значения на это время
+        скрыты целиком.
       </div>
       <ul class="pv-stages" id="pv-stages"></ul>
-      <p class="pv-muted" id="pv-board-foot" style="margin-top:14px"></p>
+      <details class="pv-tech">
+        <summary>Технические детали</summary>
+        <div class="pv-tech-body" id="pv-board-foot"></div>
+      </details>
     </div>
 
     <div class="pv-note">
-      Закрытие или перезагрузка предпросмотра на настоящую синхронизацию не
-      влияет: страница не запускает, не останавливает и не перезапускает её —
-      здесь нет ни одного запроса, кроме чтения.
+      Можно закрыть вкладку или перезагрузить страницу — на настоящую загрузку
+      данных это не влияет: здесь нет ни одного запроса, кроме чтения.
     </div>
 
     <div class="pv-actions">
@@ -680,12 +754,9 @@ table.pv-t tbody tr.pv-hero{outline:2px solid var(--pv-blue);outline-offset:-2px
   <section class="pv-step" data-step="turnover" aria-labelledby="pv-h-turnover">
     <div class="pv-kicker">Шаг 8 · предпросмотр «Оборачиваемости»</div>
     <h2 id="pv-h-turnover" tabindex="-1">Так будет выглядеть ваша матрица</h2>
-    <p class="pv-lead">
-      Строки и числа взяты готовыми из <span class="pv-mono">GET /api/turnover</span>.
-      Предпросмотр ничего не пересчитывает: чего нет в ответе — того нет и на
-      экране. Главный показатель — <b>Денежная отдача / нетто-выручка в день
-      наличия</b>: сколько рублей выручки вещь приносит за день, когда есть в
-      наличии. Это явно <b>не прибыль</b>: себестоимость в это число не входит.
+    <p class="pv-lead">Вот как будет выглядеть ваша матрица — настоящие товары, настоящие цифры.</p>
+    <p class="pv-metriclabel">
+      <b>Денежная отдача</b> <span>— выручка в день наличия</span>
     </p>
     <p class="pv-prelim" id="pv-prelim" hidden></p>
 
@@ -701,11 +772,7 @@ table.pv-t tbody tr.pv-hero{outline:2px solid var(--pv-blue);outline-offset:-2px
         <span aria-hidden="true">?</span> Что значит денежная отдача
       </button>
     </div>
-    <p class="pv-muted" id="pv-money-note">
-      В предпросмотре денежный слой (полоса сумм, блок «продаётся в минус»,
-      себестоимость и маржа) по умолчанию скрыт — и скрыт только здесь: на
-      рабочей странице «Оборачиваемость» он показывается как раньше.
-    </p>
+    <p class="pv-muted" id="pv-money-note">Себестоимость и маржа скрыты по умолчанию — только здесь.</p>
 
     <div class="pv-attn" id="pv-attn"></div>
 
@@ -726,11 +793,11 @@ table.pv-t tbody tr.pv-hero{outline:2px solid var(--pv-blue);outline-offset:-2px
         <tbody id="pv-tbody"><tr><td>Читаю данные…</td></tr></tbody>
       </table>
     </div>
-    <p class="pv-muted" id="pv-tfoot" style="margin-top:12px"></p>
-    <p class="pv-muted" style="margin-top:6px">
-      Строка «Архив» ниже — только информация: отправить сюда или вернуть
-      отсюда позицию из предпросмотра нельзя, это не элемент управления.
-    </p>
+    <p class="pv-muted" id="pv-tfoot-short" style="margin-top:12px"></p>
+    <details class="pv-tech">
+      <summary>Технические детали</summary>
+      <div class="pv-tech-body" id="pv-tfoot"></div>
+    </details>
 
     <div class="pv-actions">
       <button class="pv-btn" type="button" data-go="prev">Назад</button>
@@ -978,11 +1045,12 @@ function renderWarehouses() {
     }).join("");
   }
   var on = list.filter(function (w) { return w.active; }).length;
-  src.innerHTML = "Источник — <span class=\"pv-mono\">GET /api/settings</span>, поле " +
-    "<span class=\"pv-mono\">warehouses[]</span>: " + on + " " +
+  src.innerHTML = on + " " +
     plural(on, "продающий склад", "продающих склада", "продающих складов") +
-    " из " + list.length + ". Изменить выбор можно только в «Настройках»; " +
-    "предпросмотр этого не делает.";
+    " из " + list.length + ". Изменить выбор можно только в «Настройках»." +
+    '<details class="pv-tech"><summary>Технические детали</summary>' +
+    '<div class="pv-tech-body"><p>Источник — <span class="pv-mono">GET /api/settings</span>, ' +
+    'поле <span class="pv-mono">warehouses[]</span>.</p></div></details>';
 }
 
 /* ════════════════════════════════════════════════════════════════════════════
@@ -999,9 +1067,11 @@ function renderHorizon() {
   $("pv-horizon-val").textContent = PV.draft.horizon;
   var s = PV.data.settings;
   $("pv-horizon-now").innerHTML = s
-    ? "Сейчас в настройках организации: <b>" + num(s.horizon_days_fixed) +
-      " дн.</b> (поле <span class=\"pv-mono\">horizon_days_fixed</span>). " +
-      "Черновик выше это значение не меняет."
+    ? "Сейчас в настройках: <b>" + num(s.horizon_days_fixed) + " дн.</b> " +
+      "Черновик выше это значение не меняет." +
+      '<details class="pv-tech"><summary>Технические детали</summary>' +
+      '<div class="pv-tech-body"><p>Поле <span class="pv-mono">horizon_days_fixed</span> ' +
+      'ответа GET /api/settings.</p></div></details>'
     : "Текущую настройку прочитать не удалось — и придумывать её вместо " +
       "неё предпросмотр не станет.";
 }
@@ -1095,29 +1165,29 @@ function renderBT() {
   var full = need > 0 && cov >= need;
   parts.push('<div class="pv-card"><h3>Замок 1 — история</h3>' +
     '<p id="pv-bt-history">' + (full
-      ? 'История загружена полностью: <b>' + num(cov) + '</b> из <b>' + num(need) +
-        '</b> дней (поля <span class="pv-mono">coverage_days</span> и ' +
-        '<span class="pv-mono">history_days</span> из GET /api/sync/progress).'
+      ? 'История загружена полностью: <b>' + num(cov) + '</b> из <b>' + num(need) + '</b> дней.'
       : 'История загружена не полностью: <b>' + num(cov) + '</b> из <b>' + num(need) +
-        '</b> дней. Пока это так, экран Б/Т не показывается вовсе — на неполной ' +
-        'истории он делил бы ассортимент по данным, которых ещё нет.') +
+        '</b> дней. Пока это так, экран Б/Т не показывается вовсе.') +
+    '<details class="pv-tech"><summary>Технические детали</summary>' +
+    '<div class="pv-tech-body"><p>Поля <span class="pv-mono">coverage_days</span> и ' +
+    '<span class="pv-mono">history_days</span> из GET /api/sync/progress. На неполной ' +
+    'истории экран делил бы ассортимент по данным, которых ещё нет.</p></div></details>' +
     '</p></div>');
 
   parts.push('<div class="pv-card"><h3>Замок 2 — формула</h3>' +
     '<div class="pv-note stop" id="pv-bt-gate">' +
-    'Утверждённой владельцем числовой формулы Б/Т в проекте нет: её нет ни в ' +
-    '<b>BUSINESS_LOGIC.md §0</b>, ни в журнале решений <b>DECISIONS.md</b>. ' +
-    'Поэтому здесь <b>не показано ни одного числа</b>: предпросмотр не ' +
-    'изобретает, не считает, не сохраняет и не применяет спорную математику. ' +
-    'Это прямое следствие двух решений владельца: <b>D-23</b> — отказ от ' +
-    'рекомендации лучше плохой рекомендации, и <b>D-35</b> — формулы меняет ' +
-    'только владелец.' +
+    'Мы не показываем расчёт Б/Т, пока у него нет формулы, которую подтвердил бы ' +
+    'владелец: <b>плохая рекомендация хуже её отсутствия</b>. Здесь <b>не показано ' +
+    'ни одного числа</b> — предпросмотр не изобретает и не считает свою математику.' +
+    '<details class="pv-tech"><summary>Технические детали</summary>' +
+    '<div class="pv-tech-body"><p>Утверждённой владельцем числовой формулы Б/Т в ' +
+    'проекте нет: её нет ни в <b>BUSINESS_LOGIC.md §0</b>, ни в журнале решений ' +
+    '<b>DECISIONS.md</b>. Это прямое следствие двух решений владельца: <b>D-23</b> — ' +
+    'отказ от рекомендации лучше плохой рекомендации, и <b>D-35</b> — формулы меняет ' +
+    'только владелец.</p></div></details>' +
     '</div>' +
-    '<p class="pv-muted" style="margin-bottom:0">Что нужно, чтобы экран ожил: ' +
-    'владелец называет формулу и границы Б/Т, решение записывается в ' +
-    'DECISIONS.md, и только после этого экран получает право считать. До тех ' +
-    'пор он остаётся объяснением — и это его честное, а не сломанное ' +
-    'состояние.</p></div>');
+    '<p class="pv-muted" style="margin-bottom:0">Экран оживёт, когда владелец назовёт ' +
+    'формулу и границы Б/Т.</p></div>');
 
   box.innerHTML = parts.join("");
 }
@@ -1151,36 +1221,36 @@ function renderGroups() {
 /* ════════════════════════════════════════════════════════════════════════════
    9. Доска загрузки
 
-   Восемь смысловых этапов. У шести из них есть поле в боевом контракте
-   GET /api/sync/progress — они и привязаны к нему. У двух последних поля в
-   контракте НЕТ, и это написано прямым текстом вместо нарисованной полоски:
-   выдуманный прогресс на экране приёмки — это ровно тот случай, когда
-   интерфейс расходится с тем, что считает код (стоп-условие AGENTS.md §3).
+   Пять спокойных человеческих этапов (было восемь технических): «Склады»,
+   «Товары и цены» и «Остатки» слиты в «Товары и остатки» — владельцу не
+   важно, что это три разных внутренних шага синка, важно «каталог готов».
+   «Расчёт оборачиваемости» и «Подготовка матрицы» слиты в «Матрица» — обе
+   считаются из уже загруженной истории и для человека это один момент
+   «данные готовы», а не два отдельных пункта.
+
+   У «Подключение», «Товары и остатки», «Продажи и возвраты» и «История»
+   есть поле в боевом контракте GET /api/sync/progress — они и привязаны к
+   нему. У «Матрицы» поля в контракте НЕТ: выдуманный процент здесь — ровно
+   тот случай, когда интерфейс расходится с тем, что считает код (стоп-
+   условие AGENTS.md §3), поэтому её состояние — только «делаем/готово», без
+   полоски. Сырые имена полей контракта не потеряны — они читаются в
+   технических деталях под списком этапов и не часть первого прочтения.
    ══════════════════════════════════════════════════════════════════════════ */
 var SEM_STAGES = [
   { key: "connection", title: "Подключение",
     bind: "state, error, error_cause",
     sub: "Есть ли рабочее соединение с источником данных." },
-  { key: "warehouses", title: "Склады",
-    bind: "stages[today].counts.warehouses, warehouse_names",
-    sub: "Сколько складов участвует в аналитике." },
-  { key: "products", title: "Товары и цены",
-    bind: "stages[products]", stage: "products",
-    sub: "Каталог позиций и типы цен." },
-  { key: "today", title: "Остатки на сегодня",
-    bind: "stages[today]", stage: "today",
-    sub: "Текущий остаток по каждому складу." },
+  { key: "catalog", title: "Товары и остатки",
+    bind: "stages[products], stages[today], stages[today].counts.warehouses",
+    sub: "Каталог, цены и остатки по складам." },
   { key: "month", title: "Продажи и возвраты",
     bind: "stages[month]", stage: "month",
     sub: "Документы продаж и возвратов за стартовое окно." },
-  { key: "history", title: "История: 730 дней",
+  { key: "history", title: "История продаж",
     bind: "stages[history], coverage_days/history_days, months[], eta_sec",
     stage: "history",
-    sub: "Окно канона D-35: 730 дней, остатки и продажи день за днём. Никогда не «год» — ровно 730 дней." },
-  { key: "turnover_calc", title: "Расчёт оборачиваемости",
-    bind: null,
-    sub: "Считается из загруженной истории при первом открытии страницы." },
-  { key: "matrix", title: "Подготовка матрицы",
+    sub: "Остатки и продажи день за днём за всё загруженное окно." },
+  { key: "matrix", title: "Матрица",
     bind: null,
     sub: "Группировка, классы и порядок строк таблицы." }
 ];
@@ -1200,14 +1270,53 @@ function liveStageState(sem, p) {
     if (p.state === "done") return { state: "done", right: "готово" };
     return { state: "todo", right: p.state || "—" };
   }
-  if (sem.key === "warehouses") {
-    var today = null;
-    (p.stages || []).forEach(function (s) { if (s.key === "today") today = s; });
-    var n = today && today.counts ? today.counts.warehouses : null;
-    if (n === null || n === undefined) return { state: "todo", right: "—" };
-    return { state: today.state, right: n + " " + plural(n, "склад", "склада", "складов") };
+  if (sem.key === "catalog") {
+    /* Слитый этап: «готово», когда готовы ОБА исходных шага (products и
+       today); «идёт», когда хоть один начался; иначе «ещё не начато». Ошибка
+       любого из двух — ошибка слитого этапа: прятать её было бы нечестно. */
+    var byKey = {};
+    (p.stages || []).forEach(function (s) { byKey[s.key] = s; });
+    var prod = byKey.products, today = byKey.today;
+    var states = [prod, today].filter(Boolean).map(function (s) { return s.state; });
+    if (!states.length) return { state: "todo", right: "—" };
+    if (states.indexOf("error") !== -1) return { state: "error", right: "ошибка" };
+    if (states.length === 2 && states.every(function (s) { return s === "done"; })) {
+      var n = today && today.counts ? today.counts.warehouses : null;
+      return { state: "done",
+        right: n !== null && n !== undefined ? n + " " + plural(n, "склад", "склада", "складов") : "готово" };
+    }
+    if (states.indexOf("running") !== -1) return { state: "running", right: "идёт" };
+    return { state: "todo", right: "—" };
   }
   return { state: "todo", right: "—" };
+}
+
+/* Главная строка статуса — то, что видно сразу, без разбора списка этапов.
+   Агрегат ("N из M готово") и ETA — только реальные, посчитанные из уже
+   прочитанных состояний этапов: ни один процент здесь не придуман. */
+function mainStatusText(demo, p) {
+  if (demo) return { text: "Идёт демонстрация хода — числа синтетические.", spin: true, done: false };
+  if (!p) {
+    return { text: "Не удалось прочитать состояние загрузки" +
+      (PV.errors.progress ? ": " + PV.errors.progress : "") + ".", spin: false, done: false };
+  }
+  if (p.error) return { text: "Не получилось: " + p.error + ".", spin: false, done: false };
+  var real = SEM_STAGES.filter(function (sem) { return sem.bind !== null; });
+  var done = 0, current = null;
+  real.forEach(function (sem) {
+    var r = liveStageState(sem, p);
+    if (r.state === "done") done++;
+    else if (!current) current = sem;
+  });
+  if (done === real.length) return { text: "Матрица готова.", spin: false, done: true };
+  var extra = "";
+  if (current && current.key === "history") {
+    var cov = p.coverage_days || 0, need = p.history_days || 0;
+    extra = " (" + num(cov) + " из " + num(need) + " дн.)";
+    if (p.eta_sec !== null && p.eta_sec !== undefined) extra += " · ещё ~" + num(p.eta_sec) + " с";
+  }
+  return { text: "Собираем данные: " + (current ? current.title.toLowerCase() : "матрица") +
+    extra + " · " + done + " из " + real.length + " готово.", spin: true, done: false };
 }
 
 /* Сколько тиков демонстрация тратит на один этап. Вынесено в константу не для
@@ -1215,16 +1324,26 @@ function liveStageState(sem, p) {
    и «ход загрузки» не читался как ход ни человеком, ни проверкой. */
 var DEMO_TICKS_PER_STAGE = 4;
 
+function renderMainStatus() {
+  var el = $("pv-mainstatus");
+  if (!el) return;
+  var demo = PV.board.mode === "demo";
+  var r = mainStatusText(demo, PV.data.progress);
+  el.innerHTML = (r.spin ? '<span class="pv-spin" aria-hidden="true"></span>' : "") +
+    '<span class="' + (r.done ? "pv-done" : "") + '">' + esc(r.text) + "</span>";
+}
+
 function renderBoard() {
   var box = $("pv-stages"), foot = $("pv-board-foot");
   var demo = PV.board.mode === "demo";
   var p = PV.data.progress;
+  renderMainStatus();
 
   if (!demo && !p) {
     box.innerHTML = '<li class="pv-stage"><span class="pv-mark">!</span>' +
       '<div><div class="pv-stage-t">Живое состояние прочитать не удалось</div>' +
       '<div class="pv-stage-sub">' +
-      (PV.errors.progress ? esc(PV.errors.progress) : "GET /api/sync/progress не ответил") +
+      (PV.errors.progress ? esc(PV.errors.progress) : "не получилось прочитать состояние загрузки") +
       '. Придуманных значений вместо них здесь не будет.</div></div><div></div></li>';
     foot.textContent = "";
     return;
@@ -1272,33 +1391,37 @@ function renderBoard() {
         }
       }
     }
-    var bindLine = demo
-      ? '<div class="pv-stage-bind">демонстрация: значение придумано на месте, поля контракта не читаются</div>'
-      : (sem.bind === null
-        ? '<div class="pv-stage-bind">в контракте GET /api/sync/progress отдельного поля для этого этапа нет — ' +
-          'поэтому здесь не рисуется никакой прогресс</div>'
-        : '<div class="pv-stage-bind">' + esc(sem.bind) + '</div>');
     var glyph = st === "done" ? "✓" : (st === "running" ? "…" : (st === "error" ? "!" : "·"));
     return '<li class="pv-stage" data-state="' + esc(st) + '" data-key="' + esc(sem.key) + '">' +
       '<span class="pv-mark">' + glyph + '</span>' +
       '<div><div class="pv-stage-t">' + esc(sem.title) +
       (demo ? '<span class="pv-demotag">ДЕМО</span>' : '') + '</div>' +
-      '<div class="pv-stage-sub">' + esc(sem.sub) + '</div>' + bindLine + extra + '</div>' +
+      '<div class="pv-stage-sub">' + esc(sem.sub) + '</div>' + extra + '</div>' +
       '<div class="pv-stage-right">' + esc(right) + '</div></li>';
   }).join("");
 
+  /* Сырые имена полей контракта — по одному на этап — и полный набор живых
+     значений уходят в единый свёрнутый блок под списком, а не по абзацу на
+     каждую строку: то же самое доказательство честности, но не в первом
+     прочтении. */
+  var bindLines = SEM_STAGES.map(function (sem) {
+    return '<p><b>' + esc(sem.title) + '</b> — ' +
+      (sem.bind === null
+        ? "в контракте отдельного поля нет, прогресс не рисуется"
+        : esc(sem.bind)) + '</p>';
+  }).join("");
   if (demo) {
-    foot.innerHTML = 'Идёт <b>демонстрация</b>. Живые значения на это время не ' +
-      'показаны совсем — не приглушены и не смешаны с синтетическими, а скрыты, ' +
-      'чтобы их нельзя было прочитать как факт.';
+    foot.innerHTML = '<p>Идёт демонстрация. Живые значения на это время не показаны ' +
+      'совсем — скрыты целиком, чтобы их нельзя было прочитать как факт.</p>' + bindLines;
   } else {
-    foot.innerHTML = 'Живые поля: <span class="pv-mono">state=' + esc(p.state || "") +
+    foot.innerHTML = bindLines +
+      '<p>Живые поля GET /api/sync/progress: <span class="pv-mono">state=' + esc(p.state || "") +
       '</span>, <span class="pv-mono">progress_pct=' + esc(String(p.progress_pct)) +
       '</span>, <span class="pv-mono">coverage_days=' + esc(String(p.coverage_days)) +
       '</span>, <span class="pv-mono">history_days=' + esc(String(p.history_days)) +
       '</span>, <span class="pv-mono">eta_sec=' +
       esc(p.eta_sec === null || p.eta_sec === undefined ? "null" : String(p.eta_sec)) +
-      '</span>' + (p.error ? ', <span class="pv-mono">error=' + esc(p.error) + '</span>' : '') + '.';
+      '</span>' + (p.error ? ', <span class="pv-mono">error=' + esc(p.error) + '</span>' : '') + '.</p>';
   }
 }
 
@@ -1307,7 +1430,7 @@ function setBoardMode(mode) {
   $("pv-board").setAttribute("data-mode", mode);
   $("pv-modechip").textContent = mode === "demo"
     ? "ДЕМОНСТРАЦИЯ · синтетические числа"
-    : "живые данные · GET /api/sync/progress";
+    : "живые данные";
   $("pv-demo-btn").textContent = mode === "demo"
     ? "Остановить демонстрацию"
     : "Показать демонстрацию хода";
@@ -1399,12 +1522,14 @@ function pickHero(items) {
 
 function renderTurnover() {
   var head = $("pv-thead"), body = $("pv-tbody"), foot = $("pv-tfoot");
+  var footShort = $("pv-tfoot-short");
   var d = PV.data.turnover;
   if (!d) {
     head.innerHTML = "<th>Название</th>";
-    body.innerHTML = '<tr><td class="pv-na">Не удалось прочитать /api/turnover' +
+    body.innerHTML = '<tr><td class="pv-na">Не удалось прочитать данные' +
       (PV.errors.turnover ? ": " + esc(PV.errors.turnover) : "") + "</td></tr>";
     foot.textContent = "";
+    if (footShort) footShort.textContent = "";
     return;
   }
   head.innerHTML = COLS.map(function (c) {
@@ -1455,17 +1580,25 @@ function renderTurnover() {
        : '<tr><td colspan="' + COLS.length + '" class="pv-na">В ответе /api/turnover нет строк.</td></tr>');
 
   var t = d.thresholds || {};
+  /* Короткая строка — то, что видно сразу: сколько показано, сколько в архиве.
+     Полное объяснение порогов, нормы запаса, пустой колонки «Не хватает» и
+     статуса строки «Архив» — техническая подробность, свёрнутая по умолчанию
+     (см. #pv-tfoot внутри <details class="pv-tech"> в разметке шага). */
+  if (footShort) {
+    footShort.innerHTML =
+      "Показано: <b>" + liveShown.length + "</b>" +
+      (q ? " из " + live.length : "") +
+      (archShown.length ? " (и " + archShown.length + " в архиве)" : "") + ".";
+  }
   foot.innerHTML =
-    "Строк показано: <b>" + liveShown.length + "</b>" +
-    (q ? " из " + live.length : "") +
-    (archShown.length ? " (и " + archShown.length + " в архиве)" : "") +
-    ". Пороги классов организации из ответа ручки: слабый &lt; " + num(t.weak) +
+    "Пороги классов организации из ответа ручки: слабый &lt; " + num(t.weak) +
     ", медленный &lt; " + num(t.dull) + ", хороший &lt; " + num(t.good) +
     " ₽/день; норма запаса <span class=\"pv-mono\">stock_norm_days=" +
     num(d.stock_norm_days) + "</span>. " +
     "Столбец «Не хватает до нормы» намеренно пуст: этой величины нет в ответе " +
     "<span class=\"pv-mono\">GET /api/turnover</span>, а пересчитывать её " +
-    "предпросмотр не имеет права.";
+    "предпросмотр не имеет права. Строка «Архив» — тоже только информация: " +
+    "отправить туда или вернуть оттуда позицию из предпросмотра нельзя.";
   var sc = $("pv-search-count");
   if (sc) sc.textContent = q ? "найдено: " + (liveShown.length + archShown.length) : "";
 
@@ -1518,18 +1651,19 @@ function renderAttn() {
   });
   box.innerHTML =
     '<h3 style="margin-bottom:2px">На что обратить внимание сегодня</h3>' +
-    '<p class="pv-muted" style="margin-bottom:0">Только предпросмотр: подсчёт ' +
-    'существующих полей ответа <span class="pv-mono">GET /api/turnover</span>' +
-    ' (<span class="pv-mono">cls</span>, <span class="pv-mono">below_cost</span>,' +
-    ' <span class="pv-mono">low_data</span>) — без новой формулы и без ' +
-    'рекомендации действия.</p>' +
+    '<p class="pv-muted" style="margin-bottom:0">Только предпросмотр — не рекомендация действия.</p>' +
     '<div class="pv-attn-row">' +
-      '<div class="pv-attn-item"><b>' + num(weak.length) + '</b><span>слабых позиций (cls=weak)</span></div>' +
+      '<div class="pv-attn-item"><b>' + num(weak.length) + '</b><span>слабых позиций</span></div>' +
       '<div class="pv-attn-item"><b>' + num(belowCost.length) + '</b><span>продаются ниже себестоимости</span></div>' +
       '<div class="pv-attn-item"><b>' + num(lowData.length) + '</b><span>с меткой «мало данных»</span></div>' +
       (topCat ? '<div class="pv-attn-item"><b>' + esc(topCat) + '</b>' +
         '<span>категория с наибольшим числом слабых позиций (' + num(topCount) + ')</span></div>' : "") +
-    "</div>";
+    "</div>" +
+    '<details class="pv-tech"><summary>Технические детали</summary>' +
+    '<div class="pv-tech-body"><p>Подсчёт существующих полей ответа ' +
+    '<span class="pv-mono">GET /api/turnover</span> (<span class="pv-mono">cls</span>, ' +
+    '<span class="pv-mono">below_cost</span>, <span class="pv-mono">low_data</span>) ' +
+    '— без новой формулы.</p></div></details>';
 }
 
 /* ════════════════════════════════════════════════════════════════════════════
@@ -1647,72 +1781,73 @@ function tourSteps() {
      смысловой блок таблицы, а не по одному на каждую колонку. Подсветка шага
      может относиться сразу к нескольким ячейкам строки — `keys`, а не только
      к одной `key`; это не позиционный DOM-таргетинг (никакого nth-child), а
-     всё те же стабильные атрибуты data-tour, просто несколько на шаг. */
-  s.push({ keys: ["turn"], title: "Денежная отдача / нетто-выручка в день наличия",
-    body: "<b>Денежная отдача / нетто-выручка в день наличия</b> — " +
-      "<b>" + (it ? num(it.turnover) : "—") + " ₽/день</b>. Это явно " +
-      "<b>не прибыль</b>: себестоимость в это число не входит вовсе. Канон " +
-      "D-35: нетто-выручка дней «в стоке» за " + HISTORY_CANON_DAYS +
-      " дней ÷ эти же дни. Цвет строки — тоже про эту отдачу, а не про " +
-      "рентабельность: класс приходит полем <span class=\"pv-mono\">cls</span>, " +
-      "пороги — полем <span class=\"pv-mono\">thresholds</span> (" +
-      num(t.weak) + " / " + num(t.dull) + " / " + num(t.good) + " ₽/день). " +
-      "Предпросмотр берёт готовое поле <span class=\"pv-mono\">turnover</span> " +
-      "из <span class=\"pv-mono\">GET /api/turnover</span> и ничего не " +
-      "пересчитывает." });
+     всё те же стабильные атрибуты data-tour, просто несколько на шаг.
 
-  s.push({ keys: ["price"], title: "Цена: фактическая, номинальная, себестоимость",
-    body: "<b>" + (it ? num(it.avg_price) : "—") + " ₽</b> — средняя " +
-      "<b>фактическая</b> цена продажи, уже после скидок " +
-      "(<span class=\"pv-mono\">avg_price</span>). Рядом — <b>" +
-      (it ? num(it.sale_price) : "—") + " ₽</b> номинальной розничной цены " +
-      "(<span class=\"pv-mono\">sale_price</span>). Себестоимость " +
-      "(<span class=\"pv-mono\">cost_price</span>) в предпросмотре закрыта по " +
-      "умолчанию денежным слоем — её включает отдельный тумблер «Показать " +
-      "денежный слой», и это не то же самое, что экскурсия." });
+     Каждый шаг — одна мысль и две-три короткие человеческие строки; поля,
+     каноны и пороги остаются доступны, но свёрнуты в <details class="pv-tech">
+     внутри body, а не читаются сразу. tech() ниже собирает такой блок. */
+  function tech(html) {
+    return '<details class="pv-tech"><summary>Технические детали</summary>' +
+           '<div class="pv-tech-body">' + html + '</div></details>';
+  }
 
-  s.push({ keys: ["season"], title: "Сезон: ноль и «нет данных» — разные вещи",
-    body: "<b>0</b> ставится только там, где сезон покрыт загруженной историей, " +
-      "а продаж в нём не было. Если сезон историей не покрыт — стоит <b>«—»</b>, " +
-      "то есть <b>данных нет</b>, и ноль вместо них не рисуется. Это решение " +
-      "владельца D-34: ноль — утверждение «не продавалось», прочерк — «не знаем», " +
-      "и путать их нельзя. В ответе ручки непокрытый сезон приходит как " +
-      "<span class=\"pv-mono\">null</span> в поле <span class=\"pv-mono\">sea</span>. " +
-      "Третий случай — ноль с пунктирным подчёркиванием и значком «±»: сезон " +
-      "покрыт, но <b>возвраты в нём превысили продажи</b>, и честная отдача " +
-      "не бывает отрицательной, поэтому она зажата в ноль. Это тоже не «продаж " +
-      "не было» — сезон отмечен полем <span class=\"pv-mono\">sea_returns</span>." });
+  s.push({ keys: ["turn"], title: "Денежная отдача",
+    body: "<b>" + (it ? num(it.turnover) : "—") + " ₽/день</b> — сколько эта вещь " +
+      "приносит, пока есть в наличии. Это явно <b>не прибыль</b>: себестоимость " +
+      "сюда не входит. Цвет строки — про то же самое, не про рентабельность." +
+      tech("Канон D-35: нетто-выручка дней «в стоке» за " + HISTORY_CANON_DAYS +
+        " дней ÷ эти же дни. Класс приходит полем <span class=\"pv-mono\">cls</span>, " +
+        "пороги — полем <span class=\"pv-mono\">thresholds</span> (" +
+        num(t.weak) + " / " + num(t.dull) + " / " + num(t.good) + " ₽/день). " +
+        "Предпросмотр берёт готовое поле <span class=\"pv-mono\">turnover</span> " +
+        "из <span class=\"pv-mono\">GET /api/turnover</span> и ничего не пересчитывает.") });
 
-  s.push({ keys: ["dis", "wos"], title: "Дни в стоке, остаток и запас",
-    body: "<b>" + (it ? num(it.dis) : "—") + "</b> дней позиция реально была в " +
-      "наличии из " + HISTORY_CANON_DAYS + " (<span class=\"pv-mono\">dis</span>) " +
-      "— это индикатор доверия к цифрам, а не показатель продаж; при малой " +
-      "статистике строка помечается <b>«мало данных»</b> и не поднимается в " +
-      "рейтинг. Остаток — <b>" + (it ? num(it.cs) : "—") + " шт</b> " +
-      "(<span class=\"pv-mono\">cs</span>), запас — <b>" +
+  s.push({ keys: ["price"], title: "Цена",
+    body: "<b>" + (it ? num(it.avg_price) : "—") + " ₽</b> — фактическая цена " +
+      "продажи, уже со скидками. Номинал — <b>" +
+      (it ? num(it.sale_price) : "—") + " ₽</b>. Себестоимость скрыта денежным " +
+      "слоем по умолчанию — включается отдельным тумблером." +
+      tech("<span class=\"pv-mono\">avg_price</span>, " +
+        "<span class=\"pv-mono\">sale_price</span>, " +
+        "<span class=\"pv-mono\">cost_price</span> — поля ответа GET /api/turnover. " +
+        "Тумблер «Показать денежный слой» — не то же самое, что экскурсия.") });
+
+  s.push({ keys: ["season"], title: "Сезон",
+    body: "<b>0</b> значит «продаж не было». <b>«—»</b> значит «данных ещё нет». " +
+      "Значок «<b>±</b>» — возвраты в сезоне перевесили продажи, это тоже не " +
+      "«продаж не было»." +
+      tech("Это решение владельца D-34: ноль — утверждение «не продавалось», " +
+        "прочерк — «не знаем», путать их нельзя. Непокрытый сезон приходит как " +
+        "<span class=\"pv-mono\">null</span> в поле <span class=\"pv-mono\">sea</span>; " +
+        "зажатый возвратами — отмечен полем <span class=\"pv-mono\">sea_returns</span>.") });
+
+  s.push({ keys: ["dis", "wos"], title: "Дни в стоке и остаток",
+    body: "<b>" + (it ? num(it.dis) : "—") + "</b> дней вещь была в наличии — чем " +
+      "больше, тем больше доверия к цифрам. Остаток — <b>" +
+      (it ? num(it.cs) : "—") + " шт</b>, запас — <b>" +
       (it && it.wos !== null && it.wos !== undefined ? num(it.wos) + " дн." : "—") +
-      "</b> (<span class=\"pv-mono\">wos</span>). Столбец «Не хватает до " +
-      "нормы» в предпросмотре пуст сознательно: этой величины нет в ответе " +
-      "<span class=\"pv-mono\">GET /api/turnover</span>, а пересчитывать её " +
-      "здесь значило бы завести второй источник числа." });
+      "</b>." +
+      tech("Канон истории — " + HISTORY_CANON_DAYS + " дней " +
+        "(<span class=\"pv-mono\">dis</span>, <span class=\"pv-mono\">cs</span>, " +
+        "<span class=\"pv-mono\">wos</span>). При малой статистике строка помечается " +
+        "«мало данных» и не поднимается в рейтинг. Столбец «Не хватает до нормы» пуст " +
+        "сознательно: этой величины нет в ответе GET /api/turnover.") });
 
-  s.push({ keys: ["fdisc", "disc", "arch"], title: "Скидки и архив — только чтение",
-    body: "<b>" + (it ? pct(it.discount_fact) : "—") + " %</b> — фактическая " +
-      "скидка по документам продаж (<span class=\"pv-mono\">discount_fact</span>). " +
-      (manual ? "Сохранена ручная скидка <b>" + num(manual) + " %</b> " +
-                "(<span class=\"pv-mono\">GET /api/discount-overrides</span>). "
-              : "Ручной скидки нет. ") +
-      (rule
-        ? "У организации есть правило дефолтных скидок (топ продаж от <b>" +
-          num(rule.top_turnover) + "</b> ₽/день → <b>" + num(rule.weak_pct) +
-          "–" + num(rule.top_pct) + " %</b>, читается из " +
-          "<span class=\"pv-mono\">GET /api/discount-rule</span>), но здесь " +
-          "оно <b>не применяется</b> — кнопки для этого в предпросмотре нет. "
-        : "") +
-      "Всё это <b>текст, а не поле ввода</b>: запись из предпросмотра " +
-      "невозможна в принципе. Строка «Архив» ниже — тоже только " +
-      "информация (поле <span class=\"pv-mono\">archived</span>): отправить " +
-      "туда или вернуть оттуда позицию отсюда нельзя." });
+  s.push({ keys: ["fdisc", "disc", "arch"], title: "Скидки и архив",
+    body: "Фактическая скидка — <b>" + (it ? pct(it.discount_fact) : "—") + " %</b>. " +
+      (manual ? "Сохранена ручная скидка <b>" + num(manual) + " %</b>. " : "Ручной скидки нет. ") +
+      "Здесь только чтение — ничего не меняется и не применяется." +
+      tech("<span class=\"pv-mono\">discount_fact</span> — поле ответа GET /api/turnover" +
+        (manual ? "; ручная скидка читается из GET /api/discount-overrides" : "") + ". " +
+        (rule
+          ? "Правило дефолтных скидок организации (топ продаж от " +
+            num(rule.top_turnover) + " ₽/день → " + num(rule.weak_pct) + "–" +
+            num(rule.top_pct) + " %, GET /api/discount-rule) здесь не применяется — " +
+            "кнопки для этого в предпросмотре нет. "
+          : "") +
+        "Строка «Архив» — тоже только информация (поле " +
+        "<span class=\"pv-mono\">archived</span>): отправить туда или вернуть оттуда " +
+        "позицию отсюда нельзя.") });
 
   return s;
 }
