@@ -107,6 +107,12 @@ p{margin:0 0 12px;}
   background:var(--pv-amber-soft);color:var(--pv-amber);
   border:1px solid #e8d3a6;border-radius:999px;
   padding:6px 14px;font-size:13px;font-weight:700;white-space:nowrap;
+  /* Бейдж — единственное постоянное подтверждение «это не боевая страница».
+     Он же — первый по счёту флекс-элемент в .pv-top-in (flex-wrap:wrap): без
+     явного flex-shrink:0 узкий контейнер имеет право сжать его ниже ширины
+     содержимого раньше, чем перенесёт остальные элементы строкой ниже, — на
+     390px это выедало видимый текст «ПРЕДПРОСМОТР» до одной точки. */
+  flex:0 0 auto;min-width:max-content;
 }
 .pv-badge .pv-dotmark{width:8px;height:8px;border-radius:50%;background:var(--pv-amber);}
 .pv-safe{font-size:13px;color:var(--pv-ink-2);}
@@ -397,6 +403,15 @@ table.pv-t tbody tr.pv-hero{outline:2px solid var(--pv-blue);outline-offset:-2px
   background:var(--pv-amber-soft);color:var(--pv-amber);
   border:1px solid #e8d3a6;border-radius:999px;padding:4px 12px;
   font-size:12px;font-weight:700;margin:0 0 10px;
+}
+
+/* ── Сезонный ноль, зажатый возвратами (sea_returns) — визуально отличим
+      от честного «продаж не было», но без второго цвета строки ─────────── */
+.pv-seareturns{border-bottom:1px dashed var(--pv-amber);cursor:help;}
+.pv-seareturns sup{color:var(--pv-amber);font-weight:800;margin-left:1px;}
+.pv-sronly{
+  position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;
+  clip:rect(0,0,0,0);white-space:nowrap;border:0;
 }
 
 /* ── Адаптив: desktop-first, ниже — правки под узкие экраны ─────────────── */
@@ -851,6 +866,16 @@ function num(n) {
 function money(n) {
   if (n === null || n === undefined || n !== n) return "—";
   return Math.round(n).toLocaleString("ru-RU") + " ₽";
+}
+/* discount_fact и margin_pct приходят из GET /api/turnover ДОЛЯМИ (0.35, а не
+   35) — это видно по app/analytics.py, который их же округляет до трёх
+   знаков, и по production-рендеру, умножающему такие поля на 100 перед
+   показом. num() их не масштабирует, поэтому прямая передача печатала «0 %»
+   почти для любой ненулевой скидки/маржи. pct() — тот же num(), но со
+   сдвигом доли в проценты. */
+function pct(n) {
+  if (n === null || n === undefined || n !== n) return "—";
+  return num(n * 100);
 }
 function ruDate(iso) {
   /* Показ даты по-русски, как на боевой странице. Значение из ответа ручки не
@@ -1335,6 +1360,10 @@ function rowClass(it) {
   return { best: "rg2", good: "rg1", dull: "ro", weak: "rr" }[it.cls] || "rr";
 }
 
+var SEA_RETURNS_TITLE = "Возвраты в этом сезоне превысили продажи: честный ноль " +
+  "— это НЕ «продаж не было», а «отдача не может быть отрицательной, поэтому " +
+  "она зажата в ноль». Поле sea_returns из ответа GET /api/turnover.";
+
 function seaCell(it, key, hero) {
   var attr = hero ? ' data-tour="season"' : "";
   var v = (it.sea || {})[key];
@@ -1342,14 +1371,27 @@ function seaCell(it, key, hero) {
     return '<td class="pv-num"' + attr + '><span class="pv-na" title="' +
            esc(SEA_NA_TITLE) + '">—</span></td>';
   }
+  /* Ноль, зажатый анализом из-за возвратов (sea_returns), — не то же самое,
+     что честный «продаж не было»: экскурсия ниже (шаг «Сезон») учит именно
+     разнице между null и покрытым нулём, и подписывать оба вида нуля
+     одинаково значило бы рассказывать владельцу неправду про его же сезон. */
+  var isReturns = (it.sea_returns || []).indexOf(key) !== -1;
+  if (isReturns) {
+    return '<td class="pv-num"' + attr + '><span class="pv-seareturns" title="' +
+           esc(SEA_RETURNS_TITLE) + '">' + num(v) +
+           '<sup aria-hidden="true">±</sup></span>' +
+           '<span class="pv-sronly">, возвраты превысили продажи</span></td>';
+  }
   return '<td class="pv-num"' + attr + ">" + num(v) + "</td>";
 }
 
 function pickHero(items) {
   /* Строка для экскурсии: настоящая, из середины рейтинговой группы. Не первая
-     и не последняя — крайняя строка учит не тому, как читать таблицу. */
+     и не последняя — крайняя строка учит не тому, как читать таблицу.
+     it.archived — служебный флаг МойСклада (не наш архив, см. renderTurnover)
+     и здесь намеренно не проверяется: он не про видимость строки. */
   var rank = items.filter(function (it) {
-    return it.group === "rank" && !it.low_data && !it.archived && !it.hidden;
+    return it.group === "rank" && !it.low_data && !it.hidden;
   });
   if (!rank.length) return null;
   return rank[Math.floor(rank.length / 2)];
@@ -1370,9 +1412,15 @@ function renderTurnover() {
            (c.sub ? '<span class="sub">' + esc(c.sub) + "</span>" : "") + "</th>";
   }).join("");
 
-  var items = (d.items || []).filter(function (it) { return !it.hidden; });
-  var live = items.filter(function (it) { return !it.archived; });
-  var arch = items.filter(function (it) { return it.archived; });
+  /* Свой архив предпросмотра — это hidden=true (та же граница, что у боевой
+     «Оборачиваемости», см. templates/turnover.html:686,706): пользователь
+     сам отправляет позицию в архив через /api/hidden. Поле archived — это
+     ДРУГОЙ, служебный флаг МойСклада (архивная карточка на стороне учётной
+     системы) и партиции «живое/архив» здесь не касается: отдельная строка
+     с archived=true, но hidden=false остаётся в общем списке как есть. */
+  var items = d.items || [];
+  var live = items.filter(function (it) { return !it.hidden; });
+  var arch = items.filter(function (it) { return it.hidden; });
   /* Строка героя экскурсии выбирается из ПОЛНОГО списка, а не из отфильтрованного
      поиском: иначе набранный в поле поиска текст незаметно переставлял бы, какая
      строка учит экскурсии. */
@@ -1452,7 +1500,10 @@ function renderAttn() {
       esc(PV.errors.turnover || "нет данных /api/turnover") + "</p>";
     return;
   }
-  var items = (d.items || []).filter(function (it) { return !it.hidden && !it.archived; });
+  /* Сводка — про живой ассортимент (не в собственном архиве владельца, т.е.
+     !hidden). Служебный флаг archived (МойСклад) сюда не подмешивается по
+     той же причине, что и в разбивке таблицы, — см. renderTurnover(). */
+  var items = (d.items || []).filter(function (it) { return !it.hidden; });
   var weak = items.filter(function (it) { return it.cls === "weak"; });
   var belowCost = items.filter(function (it) { return it.below_cost; });
   var lowData = items.filter(function (it) { return it.low_data; });
@@ -1521,7 +1572,7 @@ function rowHtml(it, over, archived) {
   out.push('<td class="pv-hidecol"' + (hero ? ' data-tour="margin"' : "") + '>' +
     (it.no_cost ? '<span class="pv-na">нет с/с</span>'
                 : '<span class="pv-num">' + num(it.margin_unit) + "</span>" +
-                  '<span class="pv-sub">' + num(it.margin_pct) + " %</span>") + "</td>");
+                  '<span class="pv-sub">' + pct(it.margin_pct) + " %</span>") + "</td>");
   out.push(td("turn", '<span class="pv-num">' +
     (it.group === "rank" ? num(it.turnover) : '<span class="pv-na">—</span>') + "</span>"));
   ["winter", "spring", "summer", "autumn"].forEach(function (s) {
@@ -1535,7 +1586,7 @@ function rowHtml(it, over, archived) {
                         "</span>" : "")));
   out.push(td("need", '<span class="pv-na" title="Величины нет в ответе GET /api/turnover; ' +
     'на боевой странице она считается в браузере, а предпросмотр не пересчитывает">—</span>'));
-  out.push(td("fdisc", '<span class="pv-num">' + num(it.discount_fact) + " %</span>"));
+  out.push(td("fdisc", '<span class="pv-num">' + pct(it.discount_fact) + " %</span>"));
   out.push(td("disc", manual
     ? '<span class="pv-num">' + num(manual) + " %</span>"
     : '<span class="pv-na">—</span>'));
@@ -1563,10 +1614,10 @@ function renderMoney() {
       "<b>" + money(m.stock_sale) + "</b></div>" +
     '<div class="pv-tile"><span class="pv-muted">Валовая маржа за год</span>' +
       "<b>" + money(m.gross_margin) + "</b></div>";
-  loss.innerHTML = b.count
-    ? '<div class="pv-note stop">Продаётся ниже себестоимости: <b>' + num(b.count) +
-      "</b> " + plural(b.count, "позиция", "позиции", "позиций") +
-      ". Числа взяты из ответа ручки, не пересчитаны.</div>"
+  loss.innerHTML = b.positions
+    ? '<div class="pv-note stop">Продаётся ниже себестоимости: <b>' + num(b.positions) +
+      "</b> " + plural(b.positions, "позиция", "позиции", "позиций") +
+      ". Числа взяты из ответа ручки (below_cost.positions), не пересчитаны.</div>"
     : '<div class="pv-note">Позиций, продающихся ниже себестоимости, в ответе ручки нет.</div>';
 }
 
@@ -1626,7 +1677,11 @@ function tourSteps() {
       "то есть <b>данных нет</b>, и ноль вместо них не рисуется. Это решение " +
       "владельца D-34: ноль — утверждение «не продавалось», прочерк — «не знаем», " +
       "и путать их нельзя. В ответе ручки непокрытый сезон приходит как " +
-      "<span class=\"pv-mono\">null</span> в поле <span class=\"pv-mono\">sea</span>." });
+      "<span class=\"pv-mono\">null</span> в поле <span class=\"pv-mono\">sea</span>. " +
+      "Третий случай — ноль с пунктирным подчёркиванием и значком «±»: сезон " +
+      "покрыт, но <b>возвраты в нём превысили продажи</b>, и честная отдача " +
+      "не бывает отрицательной, поэтому она зажата в ноль. Это тоже не «продаж " +
+      "не было» — сезон отмечен полем <span class=\"pv-mono\">sea_returns</span>." });
 
   s.push({ keys: ["dis", "wos"], title: "Дни в стоке, остаток и запас",
     body: "<b>" + (it ? num(it.dis) : "—") + "</b> дней позиция реально была в " +
@@ -1642,7 +1697,7 @@ function tourSteps() {
       "здесь значило бы завести второй источник числа." });
 
   s.push({ keys: ["fdisc", "disc", "arch"], title: "Скидки и архив — только чтение",
-    body: "<b>" + (it ? num(it.discount_fact) : "—") + " %</b> — фактическая " +
+    body: "<b>" + (it ? pct(it.discount_fact) : "—") + " %</b> — фактическая " +
       "скидка по документам продаж (<span class=\"pv-mono\">discount_fact</span>). " +
       (manual ? "Сохранена ручная скидка <b>" + num(manual) + " %</b> " +
                 "(<span class=\"pv-mono\">GET /api/discount-overrides</span>). "
@@ -1728,14 +1783,22 @@ function tourGo(d) {
   renderTour();
 }
 
-/* Клавиатура диалога: Escape закрывает, Tab не выпускает фокус наружу. */
+/* Клавиатура диалога: Escape закрывает, Tab не выпускает фокус наружу.
+   openTour() ставит начальный фокус на #pv-tour-title (tabindex="-1" — вне
+   обычного порядка обхода, но программно фокусируемый элемент). Ловушка
+   ниже проверяла границу только по кнопкам: первый же Shift+Tab сразу после
+   открытия видел activeElement=title, не совпадающий ни с first, ни с last,
+   не находил себе ветки и выпускал фокус из aria-modal диалога наружу.
+   Заголовок явно включён в заднюю границу — с него, как и с первой кнопки,
+   Shift+Tab обязан заворачивать на последнюю кнопку. */
 function bindTourKeys() {
   $("pv-tour").addEventListener("keydown", function (ev) {
     if (ev.key !== "Tab") return;
     var f = $("pv-tour").querySelectorAll("button:not([disabled])");
     if (!f.length) return;
-    var first = f[0], last = f[f.length - 1];
-    if (ev.shiftKey && document.activeElement === first) { ev.preventDefault(); last.focus(); }
+    var first = f[0], last = f[f.length - 1], title = $("pv-tour-title");
+    var atBackStop = document.activeElement === first || document.activeElement === title;
+    if (ev.shiftKey && atBackStop) { ev.preventDefault(); last.focus(); }
     else if (!ev.shiftKey && document.activeElement === last) { ev.preventDefault(); first.focus(); }
   });
 }

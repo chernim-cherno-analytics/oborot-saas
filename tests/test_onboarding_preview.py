@@ -34,7 +34,9 @@ prefers-reduced-motion.
 Нужен Chromium под playwright: `pip install -r requirements-dev.lock` и
 `python -m playwright install chromium`.
 """
+import copy
 import hashlib
+import json
 import os
 import sqlite3
 import sys
@@ -372,6 +374,15 @@ def part_browser(pw, cookies, owner: httpx.Client, snap_before: dict) -> dict:
     errors = []
     page = ctx.new_page()
     page.on("pageerror", lambda e: errors.append(str(e)))
+    # Независимое от собственного сторожа страницы доказательство метода:
+    # список наблюдаемых Playwright запросов — то, что реально ушло по сети,
+    # а не то, что страница сама о себе рассказывает через __PV_GUARD__.
+    # Раньше «доказательство только GET/HEAD» опиралось исключительно на
+    # список ПУТЕЙ из window.__PV_GUARD__.passed — тот же источник, который
+    # сторож заполняет сам себе, так что баг в самом стороже остался бы
+    # незамеченным. real_requests — сторонний наблюдатель этого не повторяет.
+    real_requests = []
+    page.on("request", lambda req: real_requests.append((req.method, req.url)))
     SHOTS_DIR.mkdir(exist_ok=True)
 
     turnover = owner.get("/api/turnover").json()
@@ -879,6 +890,26 @@ def part_browser(pw, cookies, owner: httpx.Client, snap_before: dict) -> dict:
     check("кнопка «?» повторяет экскурсию с первого шага",
           not pv(page, "document.getElementById('pv-tour').hidden")
           and pv(page, "window.__PV__.tour.i") == 0)
+
+    # Детерминированное воспроизведение конкретного бага: openTour() ставит
+    # начальный фокус на #pv-tour-title (не входит в список кнопок ловушки),
+    # поэтому именно ПЕРВЫЙ Shift+Tab сразу после открытия — а не Shift+Tab
+    # после ручного page.focus() на другую кнопку — был тем самым нажатием,
+    # которое выпускало фокус из aria-modal диалога наружу.
+    check("сразу после открытия фокус стоит на заголовке экскурсии",
+          pv(page, "document.activeElement && document.activeElement.id") == "pv-tour-title",
+          str(pv(page, "document.activeElement && document.activeElement.id")))
+    page.keyboard.press("Shift+Tab")
+    page.wait_for_timeout(120)
+    after_shift_tab = pv(page, "document.activeElement && document.activeElement.id")
+    check("первый же Shift+Tab с заголовка не выпускает фокус из диалога экскурсии",
+          str(after_shift_tab).startswith("pv-tour"), str(after_shift_tab))
+    last_btn = pv(page, "(() => { const f = document.getElementById('pv-tour')"
+                        ".querySelectorAll('button:not([disabled])');"
+                        " return f.length ? f[f.length - 1].id : null; })()")
+    check("и заворачивает ровно на последнюю кнопку диалога (не куда попало)",
+          after_shift_tab == last_btn, f"{after_shift_tab} vs {last_btn}")
+
     page.keyboard.press("Escape")
     page.wait_for_timeout(150)
     page.keyboard.press("?")
@@ -927,6 +958,16 @@ def part_browser(pw, cookies, owner: httpx.Client, snap_before: dict) -> dict:
     check("и обратилась ко всем пяти", set(guard["passed"]) == ALLOWED_PATHS,
           str(sorted(guard["passed"])))
 
+    print("\n== §3 Реальные сетевые методы: сторонний наблюдатель, не сам сторож ==")
+    bad_methods = sorted(set(m for m, _ in real_requests if m not in ("GET", "HEAD")))
+    check("за весь проход не зафиксировано ни одного метода, кроме GET/HEAD",
+          not bad_methods, str(bad_methods))
+    api_methods = sorted(set(m for m, u in real_requests if "/api/" in u))
+    check("запросы к /api/ реально уходили методом GET (не только по заявлению сторожа)",
+          api_methods == ["GET"], str(api_methods))
+    check("Playwright зафиксировал непустой список запросов — наблюдатель не молчал впустую",
+          len(real_requests) > 10, str(len(real_requests)))
+
     check("в консоли браузера нет ошибок страницы", not errors, "; ".join(errors)[:200])
 
     print("\n== §3 Отпечаток базы после полного прохода ==")
@@ -963,6 +1004,112 @@ def part_browser(pw, cookies, owner: httpx.Client, snap_before: dict) -> dict:
     return {"browser": browser, "turnover": turnover, "snapshot": snap_after}
 
 
+def part_synthetic_contracts(browser, cookies, template_turnover: dict) -> None:
+    """Синтетические контракты corrective-раунда: масштаб процентов,
+    возвраты-превысили-продажи, партиция архива по hidden, below_cost.positions.
+
+    Демо-данные проекта (app/demo_seed.py) не гарантируют ни одного сезона с
+    sea_returns и ни одного товара с расхождением hidden/archived — искать
+    подходящую строку среди шестидесяти демо-товаров ненадёжно (появится
+    новый сид — проверка немо тихо перестанет что-либо проверять). Схема
+    ответа при этом не выдумывается с нуля: каждая синтетическая строка —
+    глубокая копия настоящего товара с точечно переопределёнными полями,
+    поэтому все остальные поля остаются валидными как в проде.
+    """
+    print("\n== §5 Синтетические контракты: проценты, возвраты, архив, below_cost ==")
+    real_items = template_turnover.get("items") or []
+    assert real_items, "нет ни одной строки в /api/turnover, синтетику не с чего копировать"
+    template_item = real_items[0]
+
+    def mk(name, **overrides):
+        it = copy.deepcopy(template_item)
+        it.update(overrides)
+        it["base_name"] = name
+        return it
+
+    item_pct = mk("§5 Проценты", discount_fact=0.257, margin_pct=0.4, no_cost=False,
+                  hidden=False, archived=False, group="rank", cls="best", low_data=False)
+    item_returns = mk("§5 Возвраты", hidden=False, archived=False, group="rank",
+                       low_data=False,
+                       sea={"winter": 0, "spring": 5000, "summer": None, "autumn": 1000},
+                       sea_returns=["winter"])
+    item_zero = mk("§5 Честный ноль", hidden=False, archived=False, group="rank",
+                    low_data=False,
+                    sea={"winter": 0, "spring": 5000, "summer": None, "autumn": 1000},
+                    sea_returns=[])
+    item_hidden = mk("§5 Архив владельца", hidden=True, archived=False, group="rank",
+                      low_data=False)
+    item_upstream_archived = mk("§5 Архив МойСклад", hidden=False, archived=True,
+                                 group="rank", low_data=False)
+
+    payload = copy.deepcopy(template_turnover)
+    payload["items"] = [item_pct, item_returns, item_zero, item_hidden, item_upstream_archived]
+    payload["below_cost"] = dict(payload.get("below_cost") or {})
+    payload["below_cost"]["positions"] = 3
+
+    ctx = browser.new_context(viewport={"width": 1440, "height": 900})
+    ctx.add_cookies([{"name": k, "value": v, "domain": "127.0.0.1", "path": "/"}
+                     for k, v in cookies.items()])
+    page = ctx.new_page()
+    page.route("**/api/turnover", lambda route: route.fulfill(
+        status=200, content_type="application/json", body=json.dumps(payload)))
+    page.goto(f"{BASE}{PREVIEW_URL}")
+    wait_ready(page)
+    for _ in range(7):
+        page.click(".pv-step.is-on [data-go='next']")
+    page.wait_for_selector("[data-step='turnover'].is-on")
+
+    print("== §5 Масштаб процентов: доли API умножены на 100, а не показаны как есть ==")
+    row_text = page.inner_text("#pv-tbody") or ""
+    check("фактическая скидка 0.257 показана как 26 % (округлено), а не 0 %",
+          "26 %" in row_text, row_text[:400])
+
+    page.click("#pv-money-btn")
+    page.wait_for_timeout(150)
+    row_text_money = page.inner_text("#pv-tbody") or ""
+    check("маржа 0.4 показана как 40 %, а не 0 %",
+          "40 %" in row_text_money, row_text_money[:400])
+
+    print("== §5 Ниже себестоимости: below_cost.positions, а не отсутствующее .count ==")
+    loss_text = page.inner_text("#pv-loss") or ""
+    check("алерт называет 3 позиции — ровно below_cost.positions из ответа ручки",
+          "3" in loss_text and "позици" in loss_text, loss_text[:200])
+    page.click("#pv-money-btn")
+    page.wait_for_timeout(150)
+
+    print("== §5 Сезон, зажатый возвратами: не тот же ноль, что «продаж не было» ==")
+    check("строка с sea_returns=['winter'] помечена особо, не как обычный ноль",
+          page.evaluate("() => !!document.querySelector('#pv-tbody .pv-seareturns')"))
+    seareturns_title = page.evaluate(
+        "() => { const el = document.querySelector('#pv-tbody .pv-seareturns');"
+        " return el ? el.getAttribute('title') : null; }")
+    check("подсказка объясняет: возвраты превысили продажи, это не «продаж не было»",
+          bool(seareturns_title) and "озвраты" in seareturns_title, str(seareturns_title))
+    zero_has_mark = page.evaluate(
+        "() => { const rows = Array.from(document.querySelectorAll('#pv-tbody tr'));"
+        " const row = rows.find(tr => tr.textContent.includes('§5 Честный ноль'));"
+        " return row ? !!row.querySelector('.pv-seareturns') : null; }")
+    check("а соседняя строка с честным нулём (sea_returns не содержит сезон) "
+          "пометки не получает — иначе метка обесценилась бы, отмечая всё подряд",
+          zero_has_mark is False, str(zero_has_mark))
+
+    print("== §5 Архив партиционируется по hidden, а не по служебному archived ==")
+    group_of = ("() => { const rows = Array.from(document.querySelectorAll('#pv-tbody tr'));"
+                " const i = rows.findIndex(tr => tr.textContent.includes('%s'));"
+                " if (i < 0) return null;"
+                " for (let j = i; j >= 0; j--) {"
+                "   if (rows[j].classList.contains('pv-grouprow')) return rows[j].textContent; }"
+                " return null; }")
+    g_upstream = page.evaluate(group_of % "§5 Архив МойСклад")
+    check("archived=true, hidden=false остаётся в живом списке (не в «Архиве»)",
+          g_upstream != "Архив", str(g_upstream))
+    g_hidden = page.evaluate(group_of % "§5 Архив владельца")
+    check("hidden=true, archived=false уходит в «Архив» независимо от archived",
+          g_hidden == "Архив", str(g_hidden))
+
+    ctx.close()
+
+
 # ── §4 Адаптив, цели нажатия, клавиатура, prefers-reduced-motion ─────────────
 
 TOUCH_JS = """() => {
@@ -995,6 +1142,7 @@ def part_responsive(browser, cookies) -> None:
         page.goto(f"{BASE}{PREVIEW_URL}")
         wait_ready(page)
         worst, worst_step = 0, ""
+        badge_fail_steps = []
         for i, key in enumerate(STEP_KEYS):
             if i:
                 page.click(".pv-step.is-on [data-go='next']")
@@ -1003,9 +1151,29 @@ def part_responsive(browser, cookies) -> None:
             over = page.evaluate(OVERFLOW_JS)
             if over > worst:
                 worst, worst_step = over, key
+            if tag == "390x844":
+                # На каждом шаге бейдж «ПРЕДПРОСМОТР» обязан оставаться видимым
+                # и целиком читаемым текстом — не сжиматься до точки. Проверка
+                # ловит и box (ширина/высота), и реальный видимый текст: узкая
+                # коробка с обрезанным текстом дала бы правильную ширину и
+                # неправильный (пустой) видимый текст, а ловушка должна ловить
+                # оба случая.
+                badge = page.evaluate(
+                    "() => { const el = document.getElementById('pv-badge');"
+                    " if (!el) return null; const r = el.getBoundingClientRect();"
+                    " return { w: r.width, h: r.height, text: el.innerText.trim(),"
+                    " display: getComputedStyle(el).display }; }")
+                ok = (badge and badge["display"] != "none" and badge["w"] >= 100
+                      and badge["h"] >= 20 and "ПРЕДПРОСМОТР" in badge["text"])
+                if not ok:
+                    badge_fail_steps.append(f"{key}: {badge}")
         check(f"{tag}: горизонтальной прокрутки страницы нет ни на одном из "
               f"{len(STEP_KEYS)} шагов",
               worst <= 1, f"перелив {worst}px на шаге «{worst_step}»")
+        if tag == "390x844":
+            check("390px: бейдж «ПРЕДПРОСМОТР» виден и не сжат ни на одном из "
+                  f"{len(STEP_KEYS)} шагов",
+                  not badge_fail_steps, "; ".join(badge_fail_steps)[:300])
         page.evaluate("() => window.scrollTo(0, 0)")
         page.wait_for_timeout(150)
         page.screenshot(path=str(SHOTS_DIR / f"preview_{tag}_turnover.png"),
@@ -1162,6 +1330,8 @@ def run() -> int:
             return 1
         out = part_browser(pw, {k: v for k, v in owner.cookies.items()}, owner, snap_before)
         try:
+            part_synthetic_contracts(out["browser"], {k: v for k, v in owner.cookies.items()},
+                                      out["turnover"])
             part_responsive(out["browser"], {k: v for k, v in owner.cookies.items()})
         finally:
             out["browser"].close()
