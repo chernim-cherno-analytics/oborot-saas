@@ -1331,7 +1331,27 @@ function liveStageState(sem, p) {
   if (sem.stage) {
     var found = null;
     (p.stages || []).forEach(function (s) { if (s.key === sem.stage) found = s; });
-    if (!found) return { state: "todo", right: "ожидает" };
+    if (!found) {
+      /* Верхнеуровневый p.state==="done" без детализации по ЭТОМУ этапу —
+         всё равно свидетельство того, что этап прошёл, а не «ещё не
+         начат»: «ожидает» здесь прямо противоречило бы главному статусу
+         (#pv-mainstatus), который для того же p уже честно говорит
+         «Матрица готова» — одна и та же правда не может звучать разными
+         словами на одном экране. История — особый случай: у нас есть
+         собственные верхнеуровневые числа покрытия (coverage_days/
+         history_days) независимо от stages[], и вместо расплывчатого
+         «получено» показываем ИХ — настоящие, а не придуманные «730 из
+         730»: если покрытие частичное, так и будет видно (X из Y, а не
+         «готово»). */
+      if (p.state === "done") {
+        if (sem.key === "history" && (p.coverage_days || p.history_days)) {
+          return { state: "done",
+            right: num(p.coverage_days || 0) + " из " + num(p.history_days || 0) + " дн." };
+        }
+        return { state: "done", right: "получено" };
+      }
+      return { state: "todo", right: "ожидает" };
+    }
     var right;
     if (found.seconds !== null && found.seconds !== undefined) right = found.seconds + " с";
     else if (found.state === "error") right = "ошибка";
@@ -1367,7 +1387,13 @@ function liveStageState(sem, p) {
     (p.stages || []).forEach(function (s) { byKey[s.key] = s; });
     var prod = byKey.products, today = byKey.today;
     var states = [prod, today].filter(Boolean).map(function (s) { return s.state; });
-    if (!states.length) return { state: "todo", right: "ожидает" };
+    if (!states.length) {
+      /* Та же логика, что и в общей ветке sem.stage выше: верхнеуровневый
+         done без детализации по products/today — свидетельство, что этап
+         прошёл, не «ещё не начат». */
+      if (p.state === "done") return { state: "done", right: "получено" };
+      return { state: "todo", right: "ожидает" };
+    }
     if (states.indexOf("error") !== -1) return { state: "error", right: "ошибка" };
     if (states.length === 2 && states.every(function (s) { return s === "done"; })) {
       var n = today && today.counts ? today.counts.warehouses : null;

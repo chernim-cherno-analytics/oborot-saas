@@ -1690,7 +1690,54 @@ def part_status_empty_stages_and_modal(browser, cookies) -> None:
           "Матрица готова" in mainstatus_done_empty
           or "Матрица недоступна" in mainstatus_done_empty,
           mainstatus_done_empty)
+    # Экран не может противоречить сам себе: если главный статус уже сказал
+    # «готово», ни одна карточка этапа НИЖЕ не имеет права молча стоять на
+    # «ожидает» — до этой правки liveStageState() не знал про верхнеуровневый
+    # p.state==="done" и рисовал catalog/month/history как todo, хотя
+    # заголовок над ними уже был «Матрица готова».
+    rows_done_empty = pv(page1, "Array.from(document.querySelectorAll("
+                                "'#pv-stages .pv-stage')).map(li => ({"
+                                " key: li.getAttribute('data-key'),"
+                                " state: li.getAttribute('data-state'),"
+                                " right: li.querySelector('.pv-stage-right').textContent.trim() }))")
+    bound_rows = [r for r in rows_done_empty if r["key"] != "matrix"]
+    todo_rows = [r for r in bound_rows if r["state"] == "todo" or r["right"] == "ожидает"]
+    check("done + пустой stages[]: ни одна из связанных карточек "
+          "(данные источника/товары/продажи/история) не осталась «ожидает» "
+          "— один и тот же экран не может звучать разными правдами",
+          not todo_rows, str(rows_done_empty))
+    hist_row_full = next((r for r in rows_done_empty if r["key"] == "history"), None)
+    check("история при полном покрытии (730 из 730) в этом сценарии честно "
+          "называет оба числа, а не абстрактное «готово»",
+          hist_row_full and hist_row_full["right"] == "730 из 730 дн.",
+          str(hist_row_full))
     ctx1.close()
+
+    print("\n== §5 state=done + пустой stages[] + ЧАСТИЧНОЕ покрытие: карточки не лгут про полноту ==")
+    ctx1b, page1b = open_loader(browser)
+    mock_progress(page1b, "done", 400, 730)
+    goto_loader(page1b)
+    hist_row_partial = pv(page1b, "(() => { const li = document.querySelector("
+                                  "'#pv-stages .pv-stage[data-key=\"history\"]');"
+                                  " return li ? { state: li.getAttribute('data-state'),"
+                                  " right: li.querySelector('.pv-stage-right').textContent.trim() }"
+                                  " : null; })()")
+    check("частичное покрытие (400 из 730) при done+пустых stages[]: карточка "
+          "истории называет РЕАЛЬНЫЕ числа (400 из 730), не выдуманную "
+          "полноту 730/730 и не голое «готово»",
+          hist_row_partial == {"state": "done", "right": "400 из 730 дн."},
+          str(hist_row_partial))
+    other_rows_partial = pv(page1b, "Array.from(document.querySelectorAll("
+                                    "'#pv-stages .pv-stage')).map(li => ({"
+                                    " key: li.getAttribute('data-key'),"
+                                    " state: li.getAttribute('data-state'),"
+                                    " right: li.querySelector('.pv-stage-right').textContent.trim() }))")
+    todo_rows_partial = [r for r in other_rows_partial
+                          if r["key"] != "matrix" and (r["state"] == "todo" or r["right"] == "ожидает")]
+    check("частичное покрытие: ни одна связанная карточка всё равно не "
+          "осталась «ожидает»",
+          not todo_rows_partial, str(other_rows_partial))
+    ctx1b.close()
 
     print("\n== §5 state=idle + coverage=0 + пустой stages[]: без спиннера/«Собираем» ==")
     ctx2, page2 = open_loader(browser)
