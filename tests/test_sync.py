@@ -744,8 +744,24 @@ def run_scenario() -> int:
           abs(ps["projected"] - exp_proj) <= 1,
           f"got={ps['projected']} exp={exp_proj}")
     known = [m["v"] for m in ps["months"] if m["v"] is not None]
-    check("среднее продаж = среднее известных (покрытых) месяцев",
-          bool(known) and abs(ps["avg6"] - sum(known) / len(known)) <= 1,
+    # На коротких историях (у теста — 60 дней) _exp_months закономерно бывает
+    # пустым: ни один прошлый месяц ещё не покрыт полностью (см. проверку
+    # «окно пульса» выше). known обязан совпасть с ним по длине в ОБОИХ
+    # случаях — а не только когда он непустой, как было раньше (bool(known)
+    # безусловно требовал хотя бы один месяц и 30.08 стал падать на границе
+    # календаря, где _exp_months=[] — это не регрессия рантайма, а дыра в
+    # самой проверке, не учитывавшей нулевой случай). Набор имён проверок
+    # остаётся неизменным независимо от календаря (важно для эталона
+    # полноты sync_baseline_checks.txt) — меняется только то, ЧТО каждая
+    # проверка утверждает внутри.
+    check("список известных месяцев продаж совпадает с окном пульса по длине "
+          "(включая случай, когда ни один месяц ещё не покрыт полностью)",
+          len(known) == len(_exp_months),
+          f"known={known} exp_months={_exp_months}")
+    check("среднее продаж = среднее известных (покрытых) месяцев, "
+          "либо честный 0, если полных месяцев ещё нет",
+          (abs(ps["avg6"] - sum(known) / len(known)) <= 1) if known
+          else (ps["avg6"] == 0),
           f"avg6={ps['avg6']} known={known}")
     rev_by_month = {m["month"]: m["total"] for m in rev["monthly"]}
     diverged = [m["month"] for m in ps["months"]
@@ -763,9 +779,15 @@ def run_scenario() -> int:
           and pst["as_of"] >= mock_ms.DATES[-1],
           f"current={pst['current']} as_of={pst['as_of']}")
     known_st = [m["v"] for m in pst["months"] if m["v"] is not None]
-    check("средний склад = среднее известных (покрытых) месяцев, все > 0",
-          bool(known_st) and all(v > 0 for v in known_st)
-          and abs(pst["avg6"] - sum(known_st) / len(known_st)) <= 1,
+    check("список известных месяцев склада совпадает с окном пульса по длине "
+          "(включая случай, когда ни один месяц ещё не покрыт полностью)",
+          len(known_st) == len(_exp_months),
+          f"known_st={known_st} exp_months={_exp_months}")
+    check("средний склад = среднее известных (покрытых) месяцев, все > 0, "
+          "либо честный 0, если полных месяцев ещё нет",
+          (all(v > 0 for v in known_st)
+           and abs(pst["avg6"] - sum(known_st) / len(known_st)) <= 1) if known_st
+          else (pst["avg6"] == 0),
           f"avg6={pst['avg6']} known={known_st}")
     if pst["avg6"] > 0 and not pulse["partial"]:
         check("pct склада = сейчас/среднее",

@@ -1,0 +1,2501 @@
+<!DOCTYPE html>
+<html lang="ru">
+{#
+  ПРЕДПРОСМОТР ОНБОРДИНГА — визуальная приёмка для владельца.
+
+  Шаблон САМОДОСТАТОЧЕН и намеренно НЕ наследует base.html. Причина ровно одна
+  и она техническая, а не вкусовая: base.html подключает /static/app.js и
+  включает _hints.html, а те по собственной инициативе шлют POST
+  (/api/hints/seen, /api/prefs/hints, /api/lessons/{key}/done, /api/sync/run).
+  На странице, которая обещает «настройки не изменены», такие запросы были бы
+  записью под видом просмотра. Поэтому здесь нет ни одного внешнего скрипта,
+  ни одной формы и ни одного унаследованного элемента управления.
+
+  Контракты, которые страница НЕ трогает: D-35 (канон оборачиваемости),
+  пороги, математика скидок, формулы заказа, редирект онбординга, существующие
+  /onboarding и /turnover. Все числа читаются готовыми из GET-ручек и не
+  пересчитываются.
+
+  GET-ручки, и только они (белый список продублирован в JS-стороже ниже):
+    /api/settings            — склады текущего состояния, горизонт, пороги
+    /api/sync/progress       — доска загрузки
+    /api/turnover            — канонические строки и числа таблицы
+    /api/discount-rule       — правило автоматических скидок (для описания)
+    /api/discount-overrides  — ручные скидки (для чтения)
+
+  GET /api/productions здесь СОЗНАТЕЛЬНО не используется: он вызывает
+  _ensure_main_production, который делает db.commit() и создаёт строку
+  Production. Для страницы с обещанием нуля записей это дисквалифицирующее
+  свойство, поэтому экран производственных групп — локальный черновик.
+#}
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Предпросмотр онбординга — {{ org.name }} — Оборот</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='6' fill='%231554d1'/%3E%3Ctext x='12' y='17' font-family='Arial,sans-serif' font-size='14' font-weight='800' fill='white' text-anchor='middle'%3E%D0%9E%3C/text%3E%3C/svg%3E">
+<style>
+/* ────────────────────────────────────────────────────────────────────────────
+   Собственная лёгкая тема предпросмотра: воздух, крупная типографика, мягкие
+   переходы, один синий акцент проекта (#1554d1). Ни шрифтов, ни иконок, ни
+   любых других сторонних фирменных ресурсов не подключается — всё своё.
+   ──────────────────────────────────────────────────────────────────────── */
+:root{
+  --pv-ink:#101722;
+  --pv-ink-2:#4a5768;
+  --pv-ink-3:#8492a4;
+  --pv-line:#dfe4ec;
+  --pv-line-soft:#eef1f6;
+  --pv-canvas:#f4f6fa;
+  --pv-surface:#ffffff;
+  --pv-blue:#1554d1;
+  --pv-blue-soft:#e6eefc;
+  --pv-green:#177a3d;
+  --pv-green-soft:#e7f5ec;
+  --pv-amber:#a86b00;
+  --pv-amber-soft:#fdf3e0;
+  --pv-red:#c62828;
+  --pv-red-soft:#fdecec;
+  --pv-radius:18px;
+  --pv-ease:cubic-bezier(.22,.61,.36,1);
+  --pv-sans:system-ui,"Segoe UI",Roboto,Ubuntu,Cantarell,Arial,sans-serif;
+  --pv-mono:ui-monospace,"Cascadia Mono","Liberation Mono",Consolas,monospace;
+}
+*{box-sizing:border-box;}
+/* Атрибут hidden обязан гасить элемент СИЛЬНЕЕ авторских правил отображения.
+   Без этой строки `.pv-sub{display:block}` перебивал UA-правило `[hidden]`, и
+   себестоимость оставалась на экране при выключенном денежном слое. */
+[hidden]{display:none !important;}
+html,body{margin:0;padding:0;}
+body{
+  font-family:var(--pv-sans);
+  background:var(--pv-canvas);
+  color:var(--pv-ink);
+  font-size:15px;
+  line-height:1.55;
+  -webkit-text-size-adjust:100%;
+}
+h1,h2,h3{margin:0 0 10px;line-height:1.2;letter-spacing:-.015em;}
+h1{font-size:32px;font-weight:700;}
+h2{font-size:24px;font-weight:700;}
+h3{font-size:17px;font-weight:700;}
+p{margin:0 0 12px;}
+/* Тонкое кольцо фокуса: видно на любом фоне, но не «взрывает» макет. Прежние
+   3px + отступ 2px читались как техническая консоль, а не спокойный продукт;
+   :focus-visible по-прежнему держит клавиатурный фокус видимым и не трогает
+   объявление скринридером (это чисто визуальный контур, не aria-атрибут). */
+:focus-visible{outline:2px solid var(--pv-blue);outline-offset:1px;border-radius:6px;}
+
+/* goto() переводит фокус на заголовок нового шага программно (tabindex="-1"),
+   чтобы скринридер объявил смену контента, — это не клавиатурная навигация
+   пользователя. Хромиум применяет :focus-visible и к такому программному
+   фокусу на некликабельном элементе, и вокруг всего H1/H2 на весь экран
+   рисуется то же кольцо, что и у кнопки: на большом заголовке оно читается
+   как обведённый прямоугольник во весь дизайн, а не как указание на фокус.
+   Само перемещение фокуса и его объявление остаются — гасится только контур
+   у ЭТИХ конкретных заголовков; кнопки, ссылки и поля кольцо не теряют. */
+.pv-step h1[tabindex="-1"]:focus,
+.pv-step h2[tabindex="-1"]:focus{outline:none;}
+
+/* Пропуск к содержимому: обязателен для клавиатуры, и у него тоже полноценная
+   область нажатия — правило «>=44px» не знает исключений для служебных ссылок. */
+.pv-skip{
+  position:absolute;left:-10000px;top:8px;z-index:80;
+  display:inline-flex;align-items:center;height:45px;min-width:45px;
+  padding:0 16px;border-radius:12px;background:var(--pv-blue);color:#fff;
+  text-decoration:none;font-weight:600;
+}
+.pv-skip:focus{left:12px;}
+
+/* ── Шапка: бейдж предпросмотра виден всегда и не уезжает при прокрутке ─── */
+.pv-top{
+  position:sticky;top:0;z-index:40;
+  background:rgba(255,255,255,.94);
+  backdrop-filter:saturate(140%) blur(8px);
+  border-bottom:1px solid var(--pv-line);
+}
+.pv-top-in{
+  max-width:1180px;margin:0 auto;padding:10px 20px;
+  display:flex;align-items:center;gap:14px;flex-wrap:wrap;
+}
+.pv-badge{
+  display:inline-flex;align-items:center;gap:8px;
+  background:var(--pv-amber-soft);color:var(--pv-amber);
+  border:1px solid #e8d3a6;border-radius:999px;
+  padding:6px 14px;font-size:13px;font-weight:700;white-space:nowrap;
+  /* Бейдж — единственное постоянное подтверждение «это не боевая страница».
+     Он же — первый по счёту флекс-элемент в .pv-top-in (flex-wrap:wrap): без
+     явного flex-shrink:0 узкий контейнер имеет право сжать его ниже ширины
+     содержимого раньше, чем перенесёт остальные элементы строкой ниже, — на
+     390px это выедало видимый текст «ПРЕДПРОСМОТР» до одной точки. */
+  flex:0 0 auto;min-width:max-content;
+}
+.pv-badge .pv-dotmark{width:8px;height:8px;border-radius:50%;background:var(--pv-amber);flex:0 0 auto;}
+/* Текст бейджа — отдельный измеримый узел (не смешан с точкой-индикатором):
+   явно фиксируем цвет/видимость/непрозрачность и запрещаем перенос, чтобы
+   ни при каком стеснении по ширине строки контейнер не мог отрисовать
+   текст пустым или прозрачным — только полноценным словом или ничем. */
+.pv-badge-text{
+  color:inherit;opacity:1;visibility:visible;white-space:nowrap;flex:0 0 auto;
+}
+.pv-safe{font-size:13px;color:var(--pv-ink-2);}
+.pv-top-sp{flex:1 1 auto;}
+.pv-rail{display:flex;align-items:center;}
+.pv-dot{
+  appearance:none;background:none;border:0;cursor:pointer;
+  min-width:45px;height:45px;padding:0;
+  display:inline-flex;align-items:center;justify-content:center;
+}
+.pv-dot i{
+  display:block;width:9px;height:9px;border-radius:50%;
+  background:#c6cedb;transition:background .25s var(--pv-ease),transform .25s var(--pv-ease);
+}
+.pv-dot[aria-current="step"] i{background:var(--pv-blue);transform:scale(1.5);}
+.pv-dot.done i{background:#9fb6e4;}
+.pv-stepcount{display:none;font-size:13px;color:var(--pv-ink-2);font-variant-numeric:tabular-nums;}
+.pv-exit{
+  display:inline-flex;align-items:center;justify-content:center;
+  height:45px;min-width:45px;padding:0 16px;
+  border:1px solid var(--pv-line);border-radius:12px;background:var(--pv-surface);
+  color:var(--pv-ink-2);text-decoration:none;font-size:14px;font-weight:600;
+}
+.pv-exit:hover{border-color:#c3ccda;color:var(--pv-ink);}
+
+/* ── Шаги ────────────────────────────────────────────────────────────────── */
+.pv-main{max-width:1180px;margin:0 auto;padding:28px 20px 96px;}
+.pv-step{display:none;}
+.pv-step.is-on{display:block;animation:pv-in .34s var(--pv-ease) both;}
+@keyframes pv-in{from{opacity:0;transform:translateY(14px);}to{opacity:1;transform:none;}}
+.pv-kicker{
+  font-size:12px;font-weight:700;letter-spacing:.09em;text-transform:uppercase;
+  color:var(--pv-blue);margin-bottom:10px;
+}
+.pv-lead{font-size:17px;color:var(--pv-ink-2);max-width:62ch;}
+.pv-card{
+  background:var(--pv-surface);border:1px solid var(--pv-line);
+  border-radius:var(--pv-radius);padding:22px;margin:18px 0;
+}
+.pv-note{
+  border-left:3px solid var(--pv-blue);background:var(--pv-blue-soft);
+  border-radius:0 12px 12px 0;padding:12px 16px;font-size:14px;color:#173a7d;margin:14px 0;
+}
+.pv-note.warn{border-left-color:var(--pv-amber);background:var(--pv-amber-soft);color:#6d4600;}
+.pv-note.stop{border-left-color:var(--pv-red);background:var(--pv-red-soft);color:#8a1f1f;}
+.pv-muted{color:var(--pv-ink-3);font-size:13px;}
+.pv-mono{font-family:var(--pv-mono);font-size:12px;color:var(--pv-ink-2);}
+.pv-actions{display:flex;gap:12px;flex-wrap:wrap;margin-top:22px;}
+.pv-btn{
+  appearance:none;cursor:pointer;font:inherit;font-weight:650;
+  /* height, не min-height: на Ubuntu-рендере CI шрифтовые метрики системного
+     стека иногда дают строку чуть ниже 44px до округления (43.6px), хотя
+     округлённо это выглядит как «44» — и правило «>=44px» в тесте меряет
+     именно нецелое значение. Фиксированная высота сама по себе это не
+     гарантировала целиком: даже explicit height:44px однажды снова дал
+     тот же дробный недобор на Ubuntu (разные шрифтовые движки чуть иначе
+     синтезируют начертание font-weight:650). 45px — не «40px и больше», а
+     минимально достаточный запас (1px) над требованием WCAG «>=44px»,
+     который перекрывает субпиксельную погрешность рендера с гарантией. */
+  height:45px;min-width:45px;padding:0 20px;border-radius:12px;
+  border:1px solid var(--pv-line);background:var(--pv-surface);color:var(--pv-ink);
+  display:inline-flex;align-items:center;justify-content:center;gap:8px;
+  transition:background .2s var(--pv-ease),border-color .2s var(--pv-ease),transform .12s var(--pv-ease);
+}
+.pv-btn:hover{border-color:#c3ccda;}
+.pv-btn:active{transform:translateY(1px);}
+.pv-btn.primary{background:var(--pv-blue);border-color:var(--pv-blue);color:#fff;}
+.pv-btn.primary:hover{background:#0f47b5;border-color:#0f47b5;}
+.pv-btn[disabled]{opacity:.45;cursor:not-allowed;}
+
+/* ── Вопросы: группа выбора на кнопках (нативные radio дают область нажатия
+      меньше 44px, а правило про 44px здесь обязательное) ────────────────── */
+.pv-optrow{display:flex;gap:10px;flex-wrap:wrap;margin:6px 0 4px;}
+.pv-opt{
+  appearance:none;cursor:pointer;font:inherit;font-weight:600;
+  height:45px;min-width:45px;padding:0 20px;border-radius:12px;
+  border:1px solid var(--pv-line);background:var(--pv-surface);color:var(--pv-ink);
+  display:inline-flex;align-items:center;justify-content:center;
+  transition:background .2s var(--pv-ease),border-color .2s var(--pv-ease),color .2s var(--pv-ease);
+}
+.pv-opt[aria-checked="true"]{background:var(--pv-blue);border-color:var(--pv-blue);color:#fff;}
+.pv-range{width:100%;height:45px;margin:0;accent-color:var(--pv-blue);}
+.pv-figure{font-family:var(--pv-mono);font-size:26px;font-weight:700;letter-spacing:-.02em;}
+.pv-draft{
+  display:inline-flex;align-items:center;gap:7px;
+  background:var(--pv-line-soft);color:var(--pv-ink-2);
+  border-radius:999px;padding:5px 12px;font-size:12px;font-weight:700;
+}
+
+/* Список складов — чтение текущего состояния, ни одного элемента ввода. */
+.pv-whlist{list-style:none;margin:8px 0 0;padding:0;display:grid;gap:8px;}
+.pv-whlist li{
+  display:flex;align-items:center;gap:12px;padding:12px 14px;
+  border:1px solid var(--pv-line);border-radius:12px;background:var(--pv-surface);
+}
+.pv-wh-flag{
+  font-size:12px;font-weight:700;border-radius:999px;padding:3px 10px;white-space:nowrap;
+}
+.pv-wh-on{background:var(--pv-green-soft);color:var(--pv-green);}
+.pv-wh-off{background:var(--pv-line-soft);color:var(--pv-ink-3);}
+
+/* Черновик производственных групп — фишки в памяти вкладки. */
+.pv-chips{display:flex;gap:10px;flex-wrap:wrap;margin-top:10px;}
+.pv-chip{
+  appearance:none;cursor:pointer;font:inherit;font-weight:600;font-size:14px;
+  height:45px;min-width:45px;padding:0 18px;border-radius:999px;
+  border:1px solid var(--pv-line);background:var(--pv-surface);color:var(--pv-ink-2);
+  display:inline-flex;align-items:center;gap:8px;
+}
+.pv-chip[aria-pressed="true"]{background:var(--pv-blue);border-color:var(--pv-blue);color:#fff;}
+
+/* ── Доска загрузки ──────────────────────────────────────────────────────── */
+.pv-boardhead{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:14px;}
+
+/* ── «Ещё»: вторичные действия шага «Оборачиваемость» ────────────────────────
+   На узком экране единственный очевидный CTA — «Экскурсия по строке»; повтор
+   экскурсии, денежный слой и объяснение метрики убраны под один disclosure
+   (#pv-more-toggle/#pv-more-body, управляется тем же ручным JS-паттерном, что
+   и попап объяснений — без <details>: display:contents на нём вступал в
+   конфликт с нативной видимостью содержимого закрытого <details> в части
+   рендереров и делал кнопки некликабельными даже на десктопе). На широком
+   экране кнопка «Ещё» скрыта, а панель показана как обычный тулбар всегда. */
+#pv-more-toggle{display:none;}
+.pv-more-body{display:flex;align-items:center;gap:12px;flex-wrap:wrap;}
+@media (max-width:640px){
+  #pv-more-toggle{display:inline-flex;}
+  .pv-more-body{display:none;margin-top:10px;}
+  .pv-more-body.is-open{display:flex;}
+}
+.pv-modechip{
+  display:inline-flex;align-items:center;gap:8px;border-radius:999px;
+  padding:6px 14px;font-size:13px;font-weight:700;
+}
+#pv-board[data-mode="live"] .pv-modechip{background:var(--pv-green-soft);color:var(--pv-green);}
+#pv-board[data-mode="demo"] .pv-modechip{background:var(--pv-red-soft);color:var(--pv-red);}
+.pv-demoribbon{display:none;}
+#pv-board[data-mode="demo"] .pv-demoribbon{
+  display:block;margin:0 0 14px;border-radius:14px;padding:14px 18px;
+  border:2px dashed var(--pv-red);color:#8a1f1f;font-weight:700;
+  background:repeating-linear-gradient(135deg,#fdecec,#fdecec 12px,#fbdede 12px,#fbdede 24px);
+}
+#pv-board[data-mode="demo"] .pv-stages{
+  border:2px dashed var(--pv-red);border-radius:16px;padding:10px;
+  background:repeating-linear-gradient(135deg,#fff,#fff 14px,#fdf4f4 14px,#fdf4f4 28px);
+}
+.pv-stages{display:grid;gap:10px;margin:0;padding:0;list-style:none;}
+.pv-stage{
+  display:grid;grid-template-columns:26px 1fr auto;gap:12px;align-items:start;
+  border:1px solid var(--pv-line);border-radius:14px;padding:13px 15px;background:var(--pv-surface);
+}
+.pv-stage .pv-mark{
+  width:26px;height:26px;border-radius:50%;border:2px solid var(--pv-line);
+  display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:800;color:var(--pv-ink-3);
+}
+.pv-stage[data-state="done"] .pv-mark{background:var(--pv-green-soft);border-color:#b6ddc4;color:var(--pv-green);}
+.pv-stage[data-state="running"] .pv-mark{background:var(--pv-blue-soft);border-color:#a9c3f0;color:var(--pv-blue);}
+.pv-stage[data-state="error"] .pv-mark{background:var(--pv-red-soft);border-color:#f0b4b4;color:var(--pv-red);}
+.pv-stage[data-state="nofield"]{border-style:dashed;background:#fbfcfe;}
+.pv-stage-t{font-weight:650;}
+.pv-stage-sub{font-size:13px;color:var(--pv-ink-2);margin-top:2px;}
+.pv-stage-bind{font-family:var(--pv-mono);font-size:11px;color:var(--pv-ink-3);margin-top:4px;word-break:break-word;}
+.pv-stage-right{text-align:right;font-family:var(--pv-mono);font-size:13px;color:var(--pv-ink-2);white-space:nowrap;}
+.pv-demotag{
+  display:inline-block;background:var(--pv-red);color:#fff;border-radius:6px;
+  padding:1px 7px;font-size:10px;font-weight:800;letter-spacing:.06em;margin-left:8px;vertical-align:2px;
+}
+.pv-bar{height:8px;border-radius:999px;background:var(--pv-line-soft);overflow:hidden;margin-top:8px;}
+.pv-bar i{display:block;height:100%;background:var(--pv-blue);transition:width .4s var(--pv-ease);}
+#pv-board[data-mode="demo"] .pv-bar i{background:var(--pv-red);}
+.pv-months{display:flex;gap:4px;flex-wrap:wrap;margin-top:10px;}
+.pv-month{
+  font-family:var(--pv-mono);font-size:11px;border-radius:6px;padding:3px 7px;
+  background:var(--pv-line-soft);color:var(--pv-ink-3);
+}
+.pv-month[data-s="done"]{background:var(--pv-green-soft);color:var(--pv-green);}
+.pv-month[data-s="running"]{background:var(--pv-blue-soft);color:var(--pv-blue);}
+
+/* ── Предпросмотр «Оборачиваемости» ──────────────────────────────────────── */
+.pv-tablewrap{
+  max-width:100%;overflow-x:auto;-webkit-overflow-scrolling:touch;
+  border:1px solid var(--pv-line);border-radius:16px;background:var(--pv-surface);
+}
+table.pv-t{border-collapse:collapse;width:100%;min-width:940px;font-size:13px;}
+table.pv-t th,table.pv-t td{padding:9px 11px;border-bottom:1px solid var(--pv-line-soft);text-align:right;}
+table.pv-t th:first-child,table.pv-t td:first-child{text-align:left;position:sticky;left:0;background:inherit;}
+table.pv-t thead th{
+  position:sticky;top:0;background:#f7f9fc;text-align:right;font-size:11px;
+  color:var(--pv-ink-2);font-weight:700;line-height:1.25;z-index:2;
+}
+table.pv-t thead th:first-child{z-index:3;}
+table.pv-t th .sub{display:block;font-weight:500;color:var(--pv-ink-3);}
+table.pv-t tbody tr{background:var(--pv-surface);}
+table.pv-t tbody tr.rg2{background:#dff3e6;}
+table.pv-t tbody tr.rg1{background:#eff9f2;}
+table.pv-t tbody tr.ro{background:#fdf5e3;}
+table.pv-t tbody tr.rr{background:#fdeeee;}
+table.pv-t tbody tr.rld{background:#f4f6fa;}
+table.pv-t tbody tr.rgr{background:#f7f8fa;color:var(--pv-ink-3);}
+table.pv-t tbody tr.pv-hero{outline:2px solid var(--pv-blue);outline-offset:-2px;}
+.pv-num{font-family:var(--pv-mono);font-variant-numeric:tabular-nums;}
+.pv-sub{display:block;font-size:11px;color:var(--pv-ink-3);}
+.pv-tag{
+  display:inline-block;border-radius:6px;padding:1px 7px;font-size:10px;font-weight:700;
+  background:var(--pv-line-soft);color:var(--pv-ink-2);margin-left:6px;
+}
+.pv-na{color:var(--pv-ink-3);}
+.pv-grouprow td{
+  background:#eef1f6;font-weight:700;font-size:12px;color:var(--pv-ink-2);
+  text-align:left;letter-spacing:.03em;
+}
+.pv-hl{box-shadow:inset 0 0 0 3px var(--pv-blue);border-radius:4px;}
+.pv-money{display:none;gap:12px;flex-wrap:wrap;margin:14px 0;}
+.pv-money.is-on{display:flex;}
+.pv-tile{
+  border:1px solid var(--pv-line);border-radius:14px;padding:14px 18px;background:var(--pv-surface);min-width:190px;
+}
+.pv-tile b{display:block;font-family:var(--pv-mono);font-size:22px;letter-spacing:-.02em;}
+.pv-hidecol{display:none;}
+.pv-showmoney .pv-hidecol{display:table-cell;}
+
+/* ── Тур ─────────────────────────────────────────────────────────────────── */
+.pv-tour{
+  position:fixed;left:50%;transform:translateX(-50%);bottom:18px;z-index:70;
+  width:min(660px,calc(100vw - 24px));
+  background:var(--pv-surface);border:1px solid var(--pv-line);
+  border-radius:var(--pv-radius);box-shadow:0 18px 48px rgba(16,23,34,.22);
+  padding:18px 20px;
+}
+.pv-tour[hidden]{display:none;}
+.pv-tour-top{display:flex;align-items:center;gap:10px;margin-bottom:6px;}
+.pv-tour-i{font-family:var(--pv-mono);font-size:12px;color:var(--pv-ink-3);}
+.pv-tour-body{font-size:14px;color:var(--pv-ink-2);}
+.pv-tour-body b{color:var(--pv-ink);}
+.pv-tour-nav{display:flex;gap:10px;margin-top:14px;flex-wrap:wrap;}
+.pv-tour-nav .pv-btn{padding:0 16px;}
+.pv-help{
+  appearance:none;cursor:pointer;font:inherit;font-weight:800;font-size:17px;
+  height:45px;width:45px;border-radius:50%;
+  display:inline-flex;align-items:center;justify-content:center;
+  border:1px solid var(--pv-line);background:var(--pv-surface);color:var(--pv-blue);
+}
+
+/* ── Переключатель объяснений: по умолчанию выключен, живёт в шапке/у
+      заголовка метрики — а НЕ точкой в каждой ячейке таблицы ─────────────── */
+.pv-help-btn{
+  appearance:none;cursor:pointer;font:inherit;font-weight:700;font-size:13px;
+  height:45px;min-width:45px;padding:0 14px;border-radius:12px;
+  border:1px solid var(--pv-line);background:var(--pv-surface);color:var(--pv-ink-2);
+  display:inline-flex;align-items:center;gap:6px;
+}
+.pv-help-btn[aria-pressed="true"]{background:var(--pv-blue-soft);border-color:#a9c3f0;color:var(--pv-blue);}
+.pv-help-pop{
+  position:fixed;z-index:90;width:min(360px,calc(100vw - 24px));
+  background:var(--pv-surface);border:1px solid var(--pv-line);
+  border-radius:16px;box-shadow:0 18px 48px rgba(16,23,34,.24);
+  padding:18px 20px;
+}
+.pv-help-pop[hidden]{display:none;}
+.pv-help-pop h3{font-size:15px;margin-bottom:6px;}
+.pv-help-pop p{font-size:13px;color:var(--pv-ink-2);margin-bottom:0;}
+.pv-help-close{
+  position:absolute;top:8px;right:8px;
+  height:45px;min-width:45px;border-radius:10px;
+  appearance:none;cursor:pointer;border:0;background:none;color:var(--pv-ink-3);font-size:16px;
+}
+/* Мобильная форма того же попапа — донный лист. DOM один и тот же, меняется
+   только позиционирование и анимация появления, поэтому фокус-менеджмент и
+   Escape работают одинаково независимо от размера экрана. */
+@media (max-width:390px){
+  .pv-help-pop{
+    left:0 !important;right:0;bottom:0;top:auto !important;
+    width:100%;max-width:none;border-radius:20px 20px 0 0;
+    box-shadow:0 -12px 32px rgba(16,23,34,.28);
+    max-height:70vh;overflow-y:auto;
+  }
+}
+
+/* ── Ячейка «на что обратить внимание сегодня» ───────────────────────────── */
+.pv-attn{
+  background:var(--pv-surface);border:1px solid var(--pv-line);
+  border-radius:var(--pv-radius);padding:16px 20px;margin:14px 0;
+}
+.pv-attn-row{display:flex;gap:22px;flex-wrap:wrap;margin-top:8px;}
+.pv-attn-item b{font-family:var(--pv-mono);font-size:20px;display:block;}
+.pv-attn-item span{font-size:12px;color:var(--pv-ink-2);}
+
+/* ── Значок класса текстом рядом с цветом строки — не только цвет ───────── */
+.pv-clsbadge{
+  display:inline-block;border-radius:6px;padding:1px 7px;font-size:10px;font-weight:800;
+  margin-left:6px;vertical-align:1px;white-space:nowrap;
+}
+.pv-clsbadge.best{background:#bfe6cd;color:#0d4d26;}
+.pv-clsbadge.good{background:var(--pv-green-soft);color:var(--pv-green);}
+.pv-clsbadge.dull{background:var(--pv-amber-soft);color:var(--pv-amber);}
+.pv-clsbadge.weak{background:var(--pv-red-soft);color:var(--pv-red);}
+
+/* ── Подсказка прокрутки: видна только там, где таблица реально шире окна ── */
+.pv-scrollhint{
+  display:none;font-size:12px;color:var(--pv-ink-2);padding:6px 14px;
+  border-bottom:1px solid var(--pv-line-soft);background:#f7f9fc;
+}
+.pv-tablewrap.is-scrollable .pv-scrollhint{display:block;}
+
+/* ── Поиск по таблице: подписанное поле, а не декоративная лупа ─────────── */
+.pv-searchwrap{display:flex;align-items:center;gap:10px;margin:12px 0;flex-wrap:wrap;}
+.pv-searchwrap label{font-weight:600;font-size:13px;}
+.pv-search{
+  height:45px;padding:0 14px;border-radius:12px;border:1px solid var(--pv-line);
+  font:inherit;font-size:14px;flex:1 1 220px;max-width:320px;
+}
+
+/* ── Предварительность данных, пока история короче 730 дней ─────────────── */
+.pv-prelim{
+  display:inline-flex;align-items:center;gap:6px;
+  background:var(--pv-amber-soft);color:var(--pv-amber);
+  border:1px solid #e8d3a6;border-radius:999px;padding:4px 12px;
+  font-size:12px;font-weight:700;margin:0 0 10px;
+}
+
+/* ── Сезонный ноль, зажатый возвратами (sea_returns) — визуально отличим
+      от честного «продаж не было», но без второго цвета строки ─────────── */
+.pv-seareturns{border-bottom:1px dashed var(--pv-amber);cursor:help;}
+.pv-seareturns sup{color:var(--pv-amber);font-weight:800;margin-left:1px;}
+.pv-sronly{
+  position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;
+  clip:rect(0,0,0,0);white-space:nowrap;border:0;
+}
+
+/* ── Простой список «что вы увидите» — без карточек-строк складов ───────── */
+.pv-plainlist{list-style:none;margin:10px 0 0;padding:0;display:grid;gap:8px;}
+.pv-plainlist li{
+  padding-left:22px;position:relative;color:var(--pv-ink-2);font-size:15px;
+}
+.pv-plainlist li::before{
+  content:"";position:absolute;left:0;top:9px;width:7px;height:7px;
+  border-radius:50%;background:var(--pv-blue);
+}
+
+/* ── Технический разворот: сырые пути/поля/каноны/пороги — по умолчанию
+      свёрнут, доступен по клику владельцу, но не часть первого прочтения.
+      <details>/<summary> — намеренно нативные: клавиатура (Enter/Space) и
+      объявление раскрытия скринридеру работают без единой строчки JS. ────── */
+.pv-tech{margin-top:14px;border-top:1px solid var(--pv-line-soft);padding-top:10px;}
+.pv-tech summary{
+  cursor:pointer;font-size:12px;font-weight:700;color:var(--pv-ink-3);
+  list-style:none;display:inline-flex;align-items:center;gap:6px;min-height:32px;
+}
+.pv-tech summary::-webkit-details-marker{display:none;}
+.pv-tech summary::before{
+  content:"▸";display:inline-block;font-size:10px;
+  transition:transform .15s var(--pv-ease);
+}
+.pv-tech[open] summary::before{transform:rotate(90deg);}
+.pv-tech .pv-tech-body{margin-top:8px;font-size:12px;color:var(--pv-ink-3);line-height:1.5;}
+.pv-tech .pv-tech-body p{margin:0 0 8px;}
+.pv-tech .pv-tech-body p:last-child{margin-bottom:0;}
+
+/* ── Короткая подпись главного показателя: заголовок + пояснение помельче,
+      полное определение живёт в попапе «Объяснения», а не тут ────────────── */
+.pv-metriclabel{font-size:17px;margin:4px 0 14px;}
+.pv-metriclabel b{font-weight:700;}
+.pv-metriclabel span{color:var(--pv-ink-2);}
+
+/* ── Главный статус доски загрузки: одна спокойная строка над списком
+      этапов, а не восемь технических строчек сразу ────────────────────────── */
+.pv-mainstatus{
+  display:flex;align-items:center;gap:12px;margin:2px 0 16px;
+  font-size:17px;font-weight:650;
+}
+.pv-mainstatus .pv-spin{
+  width:18px;height:18px;border-radius:50%;flex:0 0 auto;
+  border:2.5px solid var(--pv-blue-soft);border-top-color:var(--pv-blue);
+  animation:pv-spin .8s linear infinite;
+}
+@media (prefers-reduced-motion:reduce){.pv-mainstatus .pv-spin{animation:none;}}
+@keyframes pv-spin{to{transform:rotate(360deg);}}
+.pv-mainstatus .pv-done{color:var(--pv-green);}
+
+/* ── Адаптив: desktop-first, ниже — правки под узкие экраны ─────────────── */
+@media (max-width:1024px){
+  .pv-main{padding:24px 18px 96px;}
+  h1{font-size:28px;}
+}
+@media (max-width:640px){
+  body{font-size:15px;}
+  h1{font-size:24px;}
+  h2{font-size:20px;}
+  .pv-main{padding:20px 14px 110px;}
+  /* Компактная шапка на узком экране: бейдж и счётчик шага — первая строка,
+     действия («Объяснения», «Выйти») — вторая, во всю ширину. Раньше это
+     складывалось само по себе через flex-wrap в произвольном порядке; теперь
+     это осознанная раскладка, а не побочный эффект переноса. */
+  .pv-top-in{
+    padding:8px 14px;gap:8px 10px;
+    display:grid;
+    /* Колонка бейджа — max-content: она не резиновая и не участвует в
+       перераспределении ширины вовсе. Колонка счётчика шага —
+       minmax(0,1fr): именно minmax(0,…), а не голое auto/1fr — это ставит
+       ЯВНУЮ нижнюю границу 0 у ВТОРОЙ колонки, поэтому нехватку места при
+       нехватке всегда поглощает она (через text-overflow ниже), а не первая
+       колонка, для которой в спецификации Grid нет такой явной защиты. */
+    grid-template-columns:max-content minmax(0,1fr);
+    grid-template-areas:"badge step" "actions actions";
+    align-items:center;
+  }
+  .pv-badge{grid-area:badge;}
+  .pv-stepcount{
+    grid-area:step;display:block;justify-self:end;min-width:0;max-width:100%;
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  }
+  .pv-top-actions{grid-area:actions;display:flex;gap:8px;}
+  .pv-top-actions .pv-help-btn,.pv-top-actions .pv-exit{flex:1 1 0;}
+  .pv-rail{display:none;}
+  .pv-safe{display:none;}
+  .pv-card{padding:16px;border-radius:14px;}
+  .pv-stage{grid-template-columns:24px 1fr;}
+  .pv-stage-right{grid-column:2;text-align:left;}
+  .pv-tour{bottom:10px;padding:16px;}
+  .pv-actions .pv-btn{flex:1 1 auto;}
+}
+
+/* Уважение к системной настройке «меньше движения»: гасим и переходы, и
+   покадровую анимацию появления шага. Демонстрация хода загрузки при этом
+   не исчезает — она просто перестаёт двигаться плавно (см. JS, REDUCED). */
+@media (prefers-reduced-motion:reduce){
+  *,*::before,*::after{
+    animation-duration:.001ms !important;animation-iteration-count:1 !important;
+    transition-duration:.001ms !important;scroll-behavior:auto !important;
+  }
+  .pv-step.is-on{animation:none;}
+}
+</style>
+</head>
+<body>
+<a class="pv-skip" href="#pv-main">К содержимому предпросмотра</a>
+
+<header class="pv-top">
+  <div class="pv-top-in">
+    <span class="pv-badge" id="pv-badge"><span class="pv-dotmark"></span><span class="pv-badge-text">ПРЕДПРОСМОТР</span></span>
+    <span class="pv-safe" id="pv-safe">предпросмотр, настройки не изменены</span>
+    <span class="pv-top-sp"></span>
+    <span class="pv-stepcount" id="pv-stepcount"></span>
+    <nav class="pv-rail" id="pv-rail" aria-label="Шаги предпросмотра"></nav>
+    <div class="pv-top-actions">
+      <button class="pv-help-btn" type="button" id="pv-help-toggle" aria-pressed="false"
+              aria-expanded="false" aria-controls="pv-help-pop">
+        <span aria-hidden="true">?</span> Объяснения
+      </button>
+      <a class="pv-exit" id="pv-exit" href="/turnover">Выйти</a>
+    </div>
+  </div>
+</header>
+
+<!-- Единый попап объяснений: попап на десктопе, донный лист на узком экране.
+     По умолчанию выключен (id="pv-help-toggle" aria-pressed="false"); открывающие
+     кнопки — не точки в ячейках, а кнопки на уровне шапки и заголовка метрики. -->
+<div class="pv-help-pop" id="pv-help-pop" role="dialog" aria-modal="true"
+     aria-labelledby="pv-help-title" hidden>
+  <button class="pv-help-close" type="button" id="pv-help-close" aria-label="Закрыть объяснение">✕</button>
+  <h3 id="pv-help-title"></h3>
+  <p id="pv-help-text"></p>
+</div>
+
+<main class="pv-main" id="pv-main" tabindex="-1">
+
+  <!-- 1. Приветствие ------------------------------------------------------ -->
+  <section class="pv-step" data-step="welcome" aria-labelledby="pv-h-welcome">
+    <div class="pv-kicker">Шаг 1 · знакомство</div>
+    <h1 id="pv-h-welcome" tabindex="-1">Оборот помогает выстроить торговую матрицу</h1>
+    <p class="pv-lead">
+      На вопросы уйдёт около минуты. Первые данные появятся по мере загрузки.
+    </p>
+    <div class="pv-note"><b>Предпросмотр — ответы не сохраняются.</b></div>
+    <div class="pv-card">
+      <h3>Что вы увидите</h3>
+      <ul class="pv-plainlist">
+        <li>Ваши продающие склады «{{ org.name }}»</li>
+        <li>Несколько быстрых вопросов о закупке, скидках и производстве</li>
+        <li>Готовую матрицу «Оборачиваемости» на настоящей строке товаров</li>
+      </ul>
+      <details class="pv-tech">
+        <summary>Технические детали</summary>
+        <div class="pv-tech-body">
+          <p>
+            Страница работает только на чтение: она обращается к пяти GET-ручкам
+            (<span class="pv-mono">/api/settings</span>,
+            <span class="pv-mono">/api/sync/progress</span>,
+            <span class="pv-mono">/api/turnover</span>,
+            <span class="pv-mono">/api/discount-rule</span>,
+            <span class="pv-mono">/api/discount-overrides</span>) и не может обратиться
+            ни к чему больше: сторож в начале скрипта запрещает любой запрос с
+            методом, отличным от GET, и любой адрес вне этого списка.
+          </p>
+        </div>
+      </details>
+    </div>
+    <div class="pv-actions">
+      <button class="pv-btn primary" type="button" data-go="next">Начать</button>
+    </div>
+  </section>
+
+  <!-- 2. Продающие склады (только чтение) --------------------------------- -->
+  <section class="pv-step" data-step="warehouses" aria-labelledby="pv-h-warehouses">
+    <div class="pv-kicker">Шаг 2 · вопрос 1 из 5</div>
+    <h2 id="pv-h-warehouses" tabindex="-1">С каких складов вы сейчас продаёте?</h2>
+    <p class="pv-lead">
+      Это единственный экран, где ответ уже известен: он читается из текущего
+      состояния организации, а не спрашивается заново.
+    </p>
+    <div class="pv-card">
+      <div class="pv-draft">только чтение · выбор здесь не меняется</div>
+      <ul class="pv-whlist" id="pv-wh"></ul>
+      <p class="pv-muted" id="pv-wh-src" style="margin:12px 0 0"></p>
+    </div>
+    <div class="pv-actions">
+      <button class="pv-btn" type="button" data-go="prev">Назад</button>
+      <button class="pv-btn primary" type="button" data-go="next">Дальше</button>
+    </div>
+  </section>
+
+  <!-- 3. Горизонт --------------------------------------------------------- -->
+  <section class="pv-step" data-step="horizon" aria-labelledby="pv-h-horizon">
+    <div class="pv-kicker">Шаг 3 · вопрос 2 из 5</div>
+    <h2 id="pv-h-horizon" tabindex="-1">На какой горизонт вы планируете закупку?</h2>
+    <p class="pv-lead">На сколько дней вперёд партия должна закрывать спрос.</p>
+    <div class="pv-card">
+      <div class="pv-draft">черновик · ничего не сохраняется</div>
+      <div class="pv-optrow" id="pv-horizon-opts" role="radiogroup" aria-label="Горизонт заказа, дней">
+        <button class="pv-opt" type="button" role="radio" aria-checked="false" data-v="30">30 дней</button>
+        <button class="pv-opt" type="button" role="radio" aria-checked="false" data-v="60">60 дней</button>
+        <button class="pv-opt" type="button" role="radio" aria-checked="false" data-v="90">90 дней</button>
+        <button class="pv-opt" type="button" role="radio" aria-checked="false" data-v="120">120 дней</button>
+        <button class="pv-opt" type="button" role="radio" aria-checked="false" data-v="custom">свой</button>
+      </div>
+      <div id="pv-horizon-custom" hidden style="margin-top:14px">
+        <label for="pv-horizon-range" style="display:block;font-weight:600;margin-bottom:6px">
+          Свой горизонт: <span class="pv-figure" id="pv-horizon-val">90</span> дн.
+        </label>
+        <input class="pv-range" id="pv-horizon-range" type="range" min="7" max="365" step="1" value="90"
+               aria-describedby="pv-horizon-hint">
+        <p class="pv-muted" id="pv-horizon-hint" style="margin:6px 0 0">от 7 до 365 дней</p>
+      </div>
+      <p class="pv-muted" id="pv-horizon-now" style="margin:14px 0 0"></p>
+    </div>
+    <div class="pv-actions">
+      <button class="pv-btn" type="button" data-go="prev">Назад</button>
+      <button class="pv-btn" type="button" data-skip="1"
+              aria-label="Пропустить вопрос о горизонте без ответа">Пропустить</button>
+      <button class="pv-btn primary" type="button" data-go="next">Дальше</button>
+    </div>
+  </section>
+
+  <!-- 4. Минимальная и максимальная скидка -------------------------------- -->
+  <section class="pv-step" data-step="discounts" aria-labelledby="pv-h-discounts">
+    <div class="pv-kicker">Шаг 4 · вопрос 3 из 5</div>
+    <h2 id="pv-h-discounts" tabindex="-1">В каких границах вы готовы давать скидку?</h2>
+    <p class="pv-lead">Минимум и максимум распродажной скидки.</p>
+    <div class="pv-card">
+      <div class="pv-draft">черновик · ничего не сохраняется</div>
+      <div style="margin-top:14px">
+        <label for="pv-disc-min" style="display:block;font-weight:600;margin-bottom:6px">
+          Минимальная скидка: <span class="pv-figure" id="pv-disc-min-val">10</span> %
+        </label>
+        <input class="pv-range" id="pv-disc-min" type="range" min="0" max="90" step="5" value="10">
+      </div>
+      <div style="margin-top:14px">
+        <label for="pv-disc-max" style="display:block;font-weight:600;margin-bottom:6px">
+          Максимальная скидка: <span class="pv-figure" id="pv-disc-max-val">50</span> %
+        </label>
+        <input class="pv-range" id="pv-disc-max" type="range" min="0" max="90" step="5" value="50">
+      </div>
+      <p class="pv-muted" id="pv-disc-hint" style="margin:14px 0 0" role="status"></p>
+      <div class="pv-note">
+        Этот черновик <b>не</b> меняет ни одной сохранённой скидки. Настоящее
+        правило скидок показано дальше, на шаге экскурсии «Скидки и архив».
+      </div>
+    </div>
+    <div class="pv-actions">
+      <button class="pv-btn" type="button" data-go="prev">Назад</button>
+      <button class="pv-btn" type="button" data-skip="1"
+              aria-label="Пропустить вопрос о скидках без ответа">Пропустить</button>
+      <button class="pv-btn primary" type="button" data-go="next">Дальше</button>
+    </div>
+  </section>
+
+  <!-- 5. Б/Т — честное закрытое состояние --------------------------------- -->
+  <section class="pv-step" data-step="bt" aria-labelledby="pv-h-bt">
+    <div class="pv-kicker">Шаг 5 · вопрос 4 из 5</div>
+    <h2 id="pv-h-bt" tabindex="-1">Экран Б/Т</h2>
+    <p class="pv-lead">
+      Экран открывается только на полностью загруженной истории — и только
+      тогда, когда для него есть утверждённая владельцем формула.
+    </p>
+    <div id="pv-bt-body"></div>
+    <div class="pv-actions">
+      <button class="pv-btn" type="button" data-go="prev">Назад</button>
+      <button class="pv-btn primary" type="button" data-go="next">Дальше</button>
+    </div>
+  </section>
+
+  <!-- 6. Производственные группы ------------------------------------------ -->
+  <section class="pv-step" data-step="groups" aria-labelledby="pv-h-groups">
+    <div class="pv-kicker">Шаг 6 · вопрос 5 из 5</div>
+    <h2 id="pv-h-groups" tabindex="-1">Как у вас устроено производство?</h2>
+    <p class="pv-lead">
+      Отметьте группы, на которые вы делите заказы. Это набросок для разговора,
+      а не настройка.
+    </p>
+    <div class="pv-card">
+      <div class="pv-draft">черновик · ничего не сохраняется</div>
+      <div class="pv-chips" id="pv-groups"></div>
+      <p class="pv-muted" id="pv-groups-sel" style="margin:14px 0 0" role="status"></p>
+      <details class="pv-tech">
+        <summary>Технические детали</summary>
+        <div class="pv-tech-body">
+          <p>
+            Существующие производства организации здесь <b>не читаются</b> намеренно:
+            единственная ручка со списком производств
+            (<span class="pv-mono">GET /api/productions</span>) при первом обращении
+            создаёт строку «Основное производство» и делает <span class="pv-mono">commit</span>.
+            Для страницы, которая обещает ноль записей, это дисквалифицирующее
+            свойство — поэтому экран остаётся локальным черновиком.
+          </p>
+        </div>
+      </details>
+    </div>
+    <div class="pv-actions">
+      <button class="pv-btn" type="button" data-go="prev">Назад</button>
+      <button class="pv-btn" type="button" data-skip="1"
+              aria-label="Пропустить вопрос о производственных группах без ответа">Пропустить</button>
+      <button class="pv-btn primary" type="button" data-go="next">Дальше</button>
+    </div>
+  </section>
+
+  <!-- 7. Доска загрузки --------------------------------------------------- -->
+  <section class="pv-step" data-step="loader" aria-labelledby="pv-h-loader">
+    <div class="pv-kicker">Шаг 7 · загрузка данных</div>
+    <h2 id="pv-h-loader" tabindex="-1">Как «Оборот» собирает вашу матрицу</h2>
+    <p class="pv-lead" id="pv-loader-lead">Здесь показано состояние загрузки ваших данных.</p>
+
+    <div id="pv-board" data-mode="live">
+      <p class="pv-mainstatus" id="pv-mainstatus" role="status" aria-live="polite"></p>
+      <div class="pv-boardhead">
+        <span class="pv-modechip" id="pv-modechip">живые данные</span>
+        <button class="pv-btn" type="button" id="pv-demo-btn">Посмотреть, как проходит загрузка</button>
+      </div>
+      <div class="pv-demoribbon" id="pv-demoribbon">
+        ДЕМОНСТРАЦИЯ. Числа ниже синтетические — придуманы только для показа
+        анимации и не относятся к вашей загрузке. Живые значения на это время
+        скрыты целиком.
+      </div>
+      <ul class="pv-stages" id="pv-stages"></ul>
+      <details class="pv-tech">
+        <summary>Технические детали</summary>
+        <div class="pv-tech-body" id="pv-board-foot"></div>
+      </details>
+    </div>
+
+    <div class="pv-note">
+      <span id="pv-close-note">Можно закрыть вкладку или перезагрузить страницу.</span>
+      <details class="pv-tech">
+        <summary>Технические детали</summary>
+        <div class="pv-tech-body">
+          <p>Предпросмотр не запускает, не останавливает и не перезапускает
+          синхронизацию: здесь нет ни одного запроса, кроме чтения.</p>
+        </div>
+      </details>
+    </div>
+
+    <div class="pv-actions">
+      <button class="pv-btn" type="button" data-go="prev">Назад</button>
+      <button class="pv-btn primary" type="button" data-go="next">К предпросмотру таблицы</button>
+    </div>
+  </section>
+
+  <!-- 8. Предпросмотр «Оборачиваемости» + экскурсия ------------------------ -->
+  <section class="pv-step" data-step="turnover" aria-labelledby="pv-h-turnover">
+    <div class="pv-kicker">Шаг 8 · предпросмотр «Оборачиваемости»</div>
+    <h2 id="pv-h-turnover" tabindex="-1">Так будет выглядеть ваша матрица</h2>
+    <p class="pv-lead">Вот как будет выглядеть ваша матрица — настоящие товары, настоящие цифры.</p>
+    <p class="pv-metriclabel">
+      <b>Денежная отдача</b> <span>— выручка в день наличия</span>
+    </p>
+    <p class="pv-prelim" id="pv-prelim" hidden></p>
+
+    <div class="pv-boardhead">
+      <button class="pv-btn primary" type="button" id="pv-tour-start">Экскурсия по строке</button>
+      <!-- На <=640px «Экскурсия по строке» — единственная видимая с первого
+           взгляда кнопка; повтор экскурсии/денежный слой/объяснение метрики
+           уходят под «Ещё» (#pv-more-toggle). На десктопе кнопка «Ещё» скрыта
+           CSS-ом, а панель всегда видна как обычный тулбар — тот же DOM, две
+           разные раскладки, без <details> (см. CSS-комментарий рядом). -->
+      <button class="pv-btn" type="button" id="pv-more-toggle" aria-expanded="false"
+              aria-controls="pv-more-body">Ещё</button>
+    </div>
+    <div class="pv-more-body" id="pv-more-body">
+      <button class="pv-help" type="button" id="pv-tour-replay"
+              aria-label="Повторить экскурсию" title="Повторить экскурсию (клавиша ?)">?</button>
+      <button class="pv-btn" type="button" id="pv-money-btn" aria-pressed="false">
+        Показать себестоимость и маржу
+      </button>
+      <button class="pv-help-btn" type="button" id="pv-help-turnover" aria-pressed="false"
+              aria-expanded="false" aria-controls="pv-help-pop">
+        <span aria-hidden="true">?</span> Что значит денежная отдача
+      </button>
+    </div>
+    <p class="pv-muted" id="pv-money-note">Себестоимость и маржа скрыты по умолчанию — только здесь.</p>
+
+    <div class="pv-attn" id="pv-attn"></div>
+
+    <div class="pv-money" id="pv-money"></div>
+    <div id="pv-loss"></div>
+
+    <div class="pv-searchwrap">
+      <label for="pv-search">Поиск по названию</label>
+      <input class="pv-search" type="search" id="pv-search" autocomplete="off"
+             placeholder="Начните печатать название…">
+      <span class="pv-muted" id="pv-search-count"></span>
+    </div>
+
+    <div class="pv-tablewrap" id="pv-tablewrap">
+      <div class="pv-scrollhint" id="pv-scrollhint">Таблица шире экрана — прокрутите её вбок →</div>
+      <table class="pv-t" id="pv-table">
+        <thead><tr id="pv-thead"></tr></thead>
+        <tbody id="pv-tbody"><tr><td>Читаю данные…</td></tr></tbody>
+      </table>
+    </div>
+    <p class="pv-muted" id="pv-tfoot-short" style="margin-top:12px"></p>
+    <details class="pv-tech">
+      <summary>Технические детали</summary>
+      <div class="pv-tech-body" id="pv-tfoot"></div>
+    </details>
+
+    <div class="pv-actions">
+      <button class="pv-btn" type="button" data-go="prev">Назад</button>
+      <a class="pv-btn" href="/turnover">Открыть настоящую «Оборачиваемость»</a>
+    </div>
+  </section>
+
+</main>
+
+<div class="pv-tour" id="pv-tour" role="dialog" aria-modal="true"
+     aria-labelledby="pv-tour-title" hidden>
+  <div class="pv-tour-top">
+    <span class="pv-tour-i" id="pv-tour-i"></span>
+    <h3 id="pv-tour-title" tabindex="-1" style="margin:0"></h3>
+  </div>
+  <div class="pv-tour-body" id="pv-tour-text"></div>
+  <div class="pv-tour-nav">
+    <button class="pv-btn" type="button" id="pv-tour-prev">Назад</button>
+    <button class="pv-btn primary" type="button" id="pv-tour-next">Дальше</button>
+    <button class="pv-btn" type="button" id="pv-tour-close">Закрыть (Esc)</button>
+  </div>
+</div>
+
+<script>
+/* ════════════════════════════════════════════════════════════════════════════
+   1. СТОРОЖ ЗАПИСИ — первым делом, до любого другого кода страницы.
+
+   Обещание «настройки не изменены» не может держаться на дисциплине автора
+   разметки: достаточно одного скопированного обработчика, чтобы страница
+   начала писать. Поэтому здесь перекрыты все четыре способа, которыми
+   браузерная страница вообще может отправить что-то на сервер: fetch,
+   XMLHttpRequest, отправка формы и sendBeacon. Любой метод, кроме GET, и
+   любой адрес вне белого списка — исключение на месте вызова, а не тихий
+   запрос. Попытки складываются в window.__PV_GUARD__.blocked, чтобы их
+   можно было увидеть и проверить, а не подозревать.
+   ══════════════════════════════════════════════════════════════════════════ */
+(function () {
+  var ALLOWED = ["/api/settings", "/api/sync/progress", "/api/turnover",
+                 "/api/discount-rule", "/api/discount-overrides"];
+  var G = { allowed: ALLOWED.slice(), blocked: [], passed: [] };
+  window.__PV_GUARD__ = G;
+
+  function pathOf(url) {
+    try { return new URL(String(url), window.location.origin).pathname; }
+    catch (e) { return String(url); }
+  }
+  function permitted(url) { return ALLOWED.indexOf(pathOf(url)) !== -1; }
+  function deny(what) {
+    G.blocked.push(what);
+    throw new Error("Предпросмотр онбординга работает только на чтение: " + what);
+  }
+
+  var nativeFetch = window.fetch ? window.fetch.bind(window) : null;
+  window.fetch = function (input, init) {
+    var url = (input && typeof input === "object" && input.url) ? input.url : String(input);
+    var method = ((init && init.method) ||
+                  (input && typeof input === "object" && input.method) || "GET").toUpperCase();
+    if (method !== "GET") deny(method + " " + pathOf(url));
+    if (!permitted(url)) deny("GET вне белого списка: " + pathOf(url));
+    G.passed.push(pathOf(url));
+    return nativeFetch(url, { method: "GET", credentials: "same-origin" });
+  };
+
+  var nativeOpen = window.XMLHttpRequest && window.XMLHttpRequest.prototype.open;
+  if (nativeOpen) {
+    window.XMLHttpRequest.prototype.open = function (method, url) {
+      var m = String(method || "GET").toUpperCase();
+      if (m !== "GET") deny(m + " " + pathOf(url) + " (XMLHttpRequest)");
+      if (!permitted(url)) deny("GET вне белого списка: " + pathOf(url) + " (XMLHttpRequest)");
+      return nativeOpen.apply(this, arguments);
+    };
+  }
+  if (window.HTMLFormElement) {
+    window.HTMLFormElement.prototype.submit = function () {
+      deny("отправка формы");
+    };
+    /* Отправку формы клавишей Enter и кнопкой submit перехватываем событием:
+       requestSubmit/submit-кнопка идут мимо HTMLFormElement.prototype.submit. */
+    document.addEventListener("submit", function (ev) {
+      ev.preventDefault();
+      G.blocked.push("submit-событие формы");
+    }, true);
+  }
+  if (window.navigator && navigator.sendBeacon) {
+    navigator.sendBeacon = function () { deny("navigator.sendBeacon"); };
+  }
+})();
+
+/* ════════════════════════════════════════════════════════════════════════════
+   2. Состояние страницы
+   ══════════════════════════════════════════════════════════════════════════ */
+(function () {
+"use strict";
+
+var STEPS = ["welcome", "warehouses", "horizon", "discounts", "bt", "groups",
+             "loader", "turnover"];
+var STEP_TITLES = ["Знакомство", "Склады", "Горизонт", "Скидки", "Б/Т",
+                   "Производство", "Загрузка", "Оборачиваемость"];
+
+var REDUCED = window.matchMedia &&
+              window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+/* Канон истории — 730 дней (D-35). Число называется явно и одинаково везде,
+   а не пересказывается расплывчато как «год»/«два года»: слова полезны как
+   пояснение, но само число 730 не должно теряться за ними. */
+var HISTORY_CANON_DAYS = 730;
+
+var PV = {
+  step: 0,
+  data: { settings: null, progress: null, turnover: null, rule: null, overrides: null },
+  errors: {},
+  draft: { horizon: 90, horizonMode: "90", discMin: 10, discMax: 50, groups: [] },
+  board: { mode: "live", timer: null, tick: 0 },
+  tour: { open: false, i: 0, opener: null },
+  help: { open: false, opener: null },
+  search: "",
+  hero: null,
+  showMoney: false
+};
+window.__PV__ = PV;
+
+/* ── мелкие утилиты ──────────────────────────────────────────────────────── */
+function $(id) { return document.getElementById(id); }
+function esc(s) {
+  return String(s === null || s === undefined ? "" : s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+function num(n) {
+  if (n === null || n === undefined || n !== n) return "—";
+  return Math.round(n).toLocaleString("ru-RU");
+}
+function money(n) {
+  if (n === null || n === undefined || n !== n) return "—";
+  return Math.round(n).toLocaleString("ru-RU") + " ₽";
+}
+/* discount_fact и margin_pct приходят из GET /api/turnover ДОЛЯМИ (0.35, а не
+   35) — это видно по app/analytics.py, который их же округляет до трёх
+   знаков, и по production-рендеру, умножающему такие поля на 100 перед
+   показом. num() их не масштабирует, поэтому прямая передача печатала «0 %»
+   почти для любой ненулевой скидки/маржи. pct() — тот же num(), но со
+   сдвигом доли в проценты. */
+function pct(n) {
+  if (n === null || n === undefined || n !== n) return "—";
+  return num(n * 100);
+}
+function ruDate(iso) {
+  /* Показ даты по-русски, как на боевой странице. Значение из ответа ручки не
+     меняется — меняется только его написание; неразобранную дату отдаём как
+     есть, а не подменяем сегодняшним числом. */
+  var d = new Date(iso);
+  if (isNaN(d.getTime())) return String(iso);
+  return d.toLocaleDateString("ru-RU", { day: "numeric", month: "long", year: "numeric" });
+}
+function plural(n, one, few, many) {
+  n = Math.abs(Math.round(n));
+  var d10 = n % 10, d100 = n % 100;
+  if (d10 === 1 && d100 !== 11) return one;
+  if (d10 >= 2 && d10 <= 4 && (d100 < 12 || d100 > 14)) return few;
+  return many;
+}
+function getJSON(path) {
+  /* Ошибка размечается явно: код состояния и признак «нет сети» — отдельно от
+     текста, чтобы экран мог показать разные слова для 401 (сессия истекла),
+     409 (конфликт состояния синка) и офлайна, а не одно смазанное сообщение. */
+  return window.fetch(path).then(function (r) {
+    if (!r.ok) {
+      var err = new Error(path + " → HTTP " + r.status);
+      err.status = r.status;
+      throw err;
+    }
+    return r.json();
+  }, function (netErr) {
+    var err = new Error(path + " → нет соединения (офлайн)");
+    err.offline = true;
+    err.cause = netErr;
+    throw err;
+  });
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+   3. Навигация по шагам
+   ══════════════════════════════════════════════════════════════════════════ */
+function buildRail() {
+  var rail = $("pv-rail");
+  rail.innerHTML = STEPS.map(function (k, i) {
+    return '<button class="pv-dot" type="button" data-i="' + i + '" ' +
+           'aria-label="Шаг ' + (i + 1) + ': ' + esc(STEP_TITLES[i]) + '"><i></i></button>';
+  }).join("");
+  Array.prototype.forEach.call(rail.querySelectorAll(".pv-dot"), function (b) {
+    b.addEventListener("click", function () { goto(parseInt(b.getAttribute("data-i"), 10)); });
+  });
+}
+
+function goto(i) {
+  if (i < 0 || i >= STEPS.length) return;
+  /* Симметрично уже существующему closeTour() ниже: попап объяснений —
+     тоже aria-modal="true" поверх содержимого шага. Смена шага меняла
+     видимый контент и переставляла фокус на заголовок НОВОГО шага, пока
+     попап оставался открытым (и видимым) позади — фокус и модальный слой
+     переставали относиться друг к другу, а Escape потом искал бы уже
+     скрытый (сменой шага) opener попапа. closeHelp() сама проверяет
+     PV.help.open, так что безопасна к вызову и когда попап не открыт. */
+  closeHelp();
+  PV.step = i;
+  var key = STEPS[i];
+  Array.prototype.forEach.call(document.querySelectorAll(".pv-step"), function (s) {
+    s.classList.toggle("is-on", s.getAttribute("data-step") === key);
+  });
+  Array.prototype.forEach.call($("pv-rail").querySelectorAll(".pv-dot"), function (b, j) {
+    if (j === i) b.setAttribute("aria-current", "step");
+    else b.removeAttribute("aria-current");
+    b.classList.toggle("done", j < i);
+  });
+  $("pv-stepcount").textContent = "Шаг " + (i + 1) + " из " + STEPS.length +
+                                  " · " + STEP_TITLES[i];
+  /* Фокус переносится на заголовок нового шага: иначе клавиатура остаётся на
+     кнопке предыдущего экрана, а скринридер не объявляет смену содержимого. */
+  var h = $("pv-h-" + key);
+  if (h) h.focus({ preventScroll: true });
+  window.scrollTo({ top: 0, behavior: REDUCED ? "auto" : "smooth" });
+  /* Уходя с доски загрузки, гасим демонстрацию: она не должна тикать в фоне и
+     тем более «доигрываться» к возвращению. */
+  if (key !== "loader" && PV.board.mode === "demo") setBoardMode("live");
+  if (key !== "turnover" && PV.tour.open) closeTour();
+  /* Ширина .pv-tablewrap измеряется нулём, пока шаг скрыт (display:none у
+     неактивной секции), поэтому подсказку прокрутки нельзя решить один раз при
+     load() — она обязана пересчитываться заново в момент, когда шаг реально
+     становится видимым. */
+  if (key === "turnover") updateScrollHint();
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+   4. Экран складов — только чтение текущего состояния
+   ══════════════════════════════════════════════════════════════════════════ */
+function renderWarehouses() {
+  var box = $("pv-wh"), src = $("pv-wh-src");
+  var s = PV.data.settings;
+  if (!s) {
+    box.innerHTML = '<li><span class="pv-na">Не удалось прочитать /api/settings' +
+      (PV.errors.settings ? ": " + esc(PV.errors.settings) : "") + '</span></li>';
+    src.textContent = "";
+    return;
+  }
+  var list = s.warehouses || [];
+  if (!list.length) {
+    box.innerHTML = '<li><span class="pv-na">Складов в текущем состоянии организации нет.</span></li>';
+  } else {
+    box.innerHTML = list.map(function (w) {
+      return '<li><span class="pv-wh-flag ' + (w.active ? "pv-wh-on" : "pv-wh-off") + '">' +
+             (w.active ? "продаём" : "не участвует") + '</span>' +
+             '<span>' + esc(w.name) + '</span></li>';
+    }).join("");
+  }
+  var on = list.filter(function (w) { return w.active; }).length;
+  src.innerHTML = on + " " +
+    plural(on, "продающий склад", "продающих склада", "продающих складов") +
+    " из " + list.length + ". Изменить выбор можно только в «Настройках»." +
+    '<details class="pv-tech"><summary>Технические детали</summary>' +
+    '<div class="pv-tech-body"><p>Источник — <span class="pv-mono">GET /api/settings</span>, ' +
+    'поле <span class="pv-mono">warehouses[]</span>.</p></div></details>';
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+   5. Горизонт — локальный черновик
+   ══════════════════════════════════════════════════════════════════════════ */
+function renderHorizon() {
+  var opts = $("pv-horizon-opts").querySelectorAll(".pv-opt");
+  Array.prototype.forEach.call(opts, function (b) {
+    var on = b.getAttribute("data-v") === PV.draft.horizonMode;
+    b.setAttribute("aria-checked", on ? "true" : "false");
+    b.setAttribute("tabindex", on ? "0" : "-1");
+  });
+  $("pv-horizon-custom").hidden = PV.draft.horizonMode !== "custom";
+  $("pv-horizon-val").textContent = PV.draft.horizon;
+  var s = PV.data.settings;
+  $("pv-horizon-now").innerHTML = s
+    ? "Сейчас в настройках: <b>" + num(s.horizon_days_fixed) + " дн.</b> " +
+      "Черновик выше это значение не меняет." +
+      '<details class="pv-tech"><summary>Технические детали</summary>' +
+      '<div class="pv-tech-body"><p>Поле <span class="pv-mono">horizon_days_fixed</span> ' +
+      'ответа GET /api/settings.</p></div></details>'
+    : "Текущую настройку прочитать не удалось — и придумывать её вместо " +
+      "неё предпросмотр не станет.";
+}
+
+function bindHorizon() {
+  var group = $("pv-horizon-opts");
+  var opts = Array.prototype.slice.call(group.querySelectorAll(".pv-opt"));
+  function pick(b) {
+    var v = b.getAttribute("data-v");
+    PV.draft.horizonMode = v;
+    if (v !== "custom") PV.draft.horizon = parseInt(v, 10);
+    else PV.draft.horizon = parseInt($("pv-horizon-range").value, 10);
+    renderHorizon();
+    b.focus();
+  }
+  opts.forEach(function (b) {
+    b.addEventListener("click", function () { pick(b); });
+  });
+  /* Стрелки внутри radiogroup — того же поведения ждут и клавиатура, и
+     вспомогательные технологии; на кнопках его надо описать руками. */
+  group.addEventListener("keydown", function (ev) {
+    var i = opts.indexOf(document.activeElement);
+    if (i < 0) return;
+    var d = 0;
+    if (ev.key === "ArrowRight" || ev.key === "ArrowDown") d = 1;
+    else if (ev.key === "ArrowLeft" || ev.key === "ArrowUp") d = -1;
+    else return;
+    ev.preventDefault();
+    pick(opts[(i + d + opts.length) % opts.length]);
+  });
+  $("pv-horizon-range").addEventListener("input", function (ev) {
+    PV.draft.horizon = parseInt(ev.target.value, 10);
+    PV.draft.horizonMode = "custom";
+    renderHorizon();
+  });
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+   6. Скидки — локальный черновик
+   ══════════════════════════════════════════════════════════════════════════ */
+function renderDiscDraft() {
+  $("pv-disc-min-val").textContent = PV.draft.discMin;
+  $("pv-disc-max-val").textContent = PV.draft.discMax;
+  $("pv-disc-min").value = PV.draft.discMin;
+  $("pv-disc-max").value = PV.draft.discMax;
+  $("pv-disc-hint").textContent =
+    "Черновик: от " + PV.draft.discMin + " % до " + PV.draft.discMax + " %. " +
+    "Ни одна сохранённая скидка не затронута.";
+}
+
+function bindDiscDraft() {
+  $("pv-disc-min").addEventListener("input", function (ev) {
+    PV.draft.discMin = parseInt(ev.target.value, 10);
+    if (PV.draft.discMin > PV.draft.discMax) PV.draft.discMax = PV.draft.discMin;
+    renderDiscDraft();
+  });
+  $("pv-disc-max").addEventListener("input", function (ev) {
+    PV.draft.discMax = parseInt(ev.target.value, 10);
+    if (PV.draft.discMax < PV.draft.discMin) PV.draft.discMin = PV.draft.discMax;
+    renderDiscDraft();
+  });
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+   7. Экран Б/Т — два честных замка, ни одного придуманного числа
+
+   Первый замок — данные: экран показывается только на полностью загруженной
+   истории (coverage_days >= history_days из GET /api/sync/progress).
+   Второй замок — формула: утверждённой владельцем числовой формулы Б/Т в
+   проекте НЕТ (BUSINESS_LOGIC.md §0 и DECISIONS.md её не содержат), а
+   «математически разумная» формула, придуманная агентом, ровно однажды уже
+   обесценила все пороги проекта — D-35 и инцидент 18.08.2026. Поэтому даже
+   на полной истории экран остаётся объяснением, а не расчётом: отказ назвать
+   число честнее правдоподобного числа (D-23).
+   ══════════════════════════════════════════════════════════════════════════ */
+function renderBT() {
+  var box = $("pv-bt-body");
+  var p = PV.data.progress;
+  var parts = [];
+
+  if (!p) {
+    parts.push('<div class="pv-card"><div class="pv-note stop">' +
+      'Состояние загрузки прочитать не удалось' +
+      (PV.errors.progress ? " (" + esc(PV.errors.progress) + ")" : "") +
+      ', поэтому первый замок проверить нечем. Экран закрыт.</div></div>');
+    box.innerHTML = parts.join("");
+    return;
+  }
+
+  var cov = p.coverage_days || 0, need = p.history_days || 0;
+  var full = need > 0 && cov >= need;
+  parts.push('<div class="pv-card"><h3>Замок 1 — история</h3>' +
+    '<p id="pv-bt-history">' + (full
+      ? 'История загружена полностью: <b>' + num(cov) + '</b> из <b>' + num(need) + '</b> дней.'
+      : 'История загружена не полностью: <b>' + num(cov) + '</b> из <b>' + num(need) +
+        '</b> дней. Пока это так, экран Б/Т не показывается вовсе.') +
+    '<details class="pv-tech"><summary>Технические детали</summary>' +
+    '<div class="pv-tech-body"><p>Поля <span class="pv-mono">coverage_days</span> и ' +
+    '<span class="pv-mono">history_days</span> из GET /api/sync/progress. На неполной ' +
+    'истории экран делил бы ассортимент по данным, которых ещё нет.</p></div></details>' +
+    '</p></div>');
+
+  parts.push('<div class="pv-card"><h3>Замок 2 — формула</h3>' +
+    '<div class="pv-note stop" id="pv-bt-gate">' +
+    'Мы не показываем расчёт Б/Т, пока у него нет формулы, которую подтвердил бы ' +
+    'владелец: <b>плохая рекомендация хуже её отсутствия</b>. Здесь <b>не показано ' +
+    'ни одного числа</b> — предпросмотр не изобретает и не считает свою математику.' +
+    '<details class="pv-tech"><summary>Технические детали</summary>' +
+    '<div class="pv-tech-body"><p>Утверждённой владельцем числовой формулы Б/Т в ' +
+    'проекте нет: её нет ни в <b>BUSINESS_LOGIC.md §0</b>, ни в журнале решений ' +
+    '<b>DECISIONS.md</b>. Это прямое следствие двух решений владельца: <b>D-23</b> — ' +
+    'отказ от рекомендации лучше плохой рекомендации, и <b>D-35</b> — формулы меняет ' +
+    'только владелец.</p></div></details>' +
+    '</div>' +
+    '<p class="pv-muted" style="margin-bottom:0">Экран оживёт, когда владелец назовёт ' +
+    'формулу и границы Б/Т.</p></div>');
+
+  box.innerHTML = parts.join("");
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+   8. Производственные группы — черновик в памяти вкладки
+   ══════════════════════════════════════════════════════════════════════════ */
+var GROUP_CHOICES = ["Трикотаж", "Швейный цех", "Верхняя одежда", "Аксессуары",
+                     "Подряд снаружи"];
+
+function renderGroups() {
+  $("pv-groups").innerHTML = GROUP_CHOICES.map(function (g) {
+    var on = PV.draft.groups.indexOf(g) !== -1;
+    return '<button class="pv-chip" type="button" aria-pressed="' + (on ? "true" : "false") +
+           '" data-g="' + esc(g) + '">' + esc(g) + '</button>';
+  }).join("");
+  Array.prototype.forEach.call($("pv-groups").querySelectorAll(".pv-chip"), function (b) {
+    b.addEventListener("click", function () {
+      var g = b.getAttribute("data-g"), i = PV.draft.groups.indexOf(g);
+      if (i === -1) PV.draft.groups.push(g); else PV.draft.groups.splice(i, 1);
+      renderGroups();
+      var again = $("pv-groups").querySelector('[data-g="' + g.replace(/"/g, "") + '"]');
+      if (again) again.focus();
+    });
+  });
+  $("pv-groups-sel").textContent = PV.draft.groups.length
+    ? "Черновик: " + PV.draft.groups.join(", ") + ". Не сохраняется."
+    : "Черновик пуст. Ничего не сохраняется в любом случае.";
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+   9. Доска загрузки
+
+   Пять спокойных человеческих этапов (было восемь технических): «Склады»,
+   «Товары и цены» и «Остатки» слиты в «Товары и остатки» — владельцу не
+   важно, что это три разных внутренних шага синка, важно «каталог готов».
+   «Расчёт оборачиваемости» и «Подготовка матрицы» слиты в «Матрица» — обе
+   считаются из уже загруженной истории и для человека это один момент
+   «данные готовы», а не два отдельных пункта.
+
+   У «Подключение», «Товары и остатки», «Продажи и возвраты» и «История»
+   есть поле в боевом контракте GET /api/sync/progress — они и привязаны к
+   нему. У «Матрицы» поля в контракте НЕТ: выдуманный процент здесь — ровно
+   тот случай, когда интерфейс расходится с тем, что считает код (стоп-
+   условие AGENTS.md §3), поэтому её состояние — только «делаем/готово», без
+   полоски. Сырые имена полей контракта не потеряны — они читаются в
+   технических деталях под списком этапов и не часть первого прочтения.
+   ══════════════════════════════════════════════════════════════════════════ */
+var SEM_STAGES = [
+  { key: "connection", title: "Данные источника",
+    bind: "state, error, error_cause",
+    sub: "Что уже получено от источника данных." },
+  { key: "catalog", title: "Товары и остатки",
+    bind: "stages[products], stages[today], stages[today].counts.warehouses",
+    sub: "Каталог, цены и остатки по складам." },
+  { key: "month", title: "Продажи и возвраты",
+    bind: "stages[month]", stage: "month",
+    sub: "Документы продаж и возвратов за стартовое окно." },
+  { key: "history", title: "История продаж",
+    bind: "stages[history], coverage_days/history_days, months[], eta_sec",
+    stage: "history",
+    sub: "Остатки и продажи день за днём за всё загруженное окно." },
+  { key: "matrix", title: "Матрица",
+    bind: null,
+    sub: "Группировка, классы и порядок строк таблицы." }
+];
+
+function liveStageState(sem, p) {
+  /* Ни один живой правый ярлык не должен быть голым тире, «idle» или «нет
+     поля» — тире читается как «ноль/сломано», а не как «ещё не начато».
+     Везде, где данных для этапа попросту ещё нет, — человеческое «ожидает». */
+  if (sem.stage) {
+    var found = null;
+    (p.stages || []).forEach(function (s) { if (s.key === sem.stage) found = s; });
+    if (!found) {
+      /* Верхнеуровневый p.state==="done" без детализации по ЭТОМУ этапу —
+         всё равно свидетельство того, что этап прошёл, а не «ещё не
+         начат»: «ожидает» здесь прямо противоречило бы главному статусу
+         (#pv-mainstatus), который для того же p уже честно говорит
+         «Матрица готова» — одна и та же правда не может звучать разными
+         словами на одном экране. История — особый случай: у нас есть
+         собственные верхнеуровневые числа покрытия (coverage_days/
+         history_days) независимо от stages[], и вместо расплывчатого
+         «получено» показываем ИХ — настоящие, а не придуманные «730 из
+         730»: если покрытие частичное, так и будет видно (X из Y, а не
+         «готово»). */
+      if (p.state === "done") {
+        if (sem.key === "history" && (p.coverage_days || p.history_days)) {
+          return { state: "done",
+            right: num(p.coverage_days || 0) + " из " + num(p.history_days || 0) + " дн." };
+        }
+        return { state: "done", right: "получено" };
+      }
+      return { state: "todo", right: "ожидает" };
+    }
+    var right;
+    if (found.seconds !== null && found.seconds !== undefined) right = found.seconds + " с";
+    else if (found.state === "error") right = "ошибка";
+    else if (found.state === "running") right = "идёт";
+    else if (found.state === "done") right = "готово";
+    else right = "ожидает";
+    return { state: found.state, right: right, counts: found.counts || {} };
+  }
+  if (sem.key === "connection") {
+    /* Этот этап доказывает только ФАКТ получения данных от источника —
+       coverage_days/stages говорят «что-то когда-то получено», а не «связь
+       жива прямо сейчас»: у нас нет отдельного сигнала о состоянии токена
+       или соединения, и подписывать эту карточку «Подключение — готово»
+       значило бы утверждать то, чего мы не проверяли. Поэтому и заголовок
+       («Данные источника»), и слова — только про то, что реально в руках:
+       «получаем» (идёт прямо сейчас), «получены» (синк только что завершился),
+       «получены ранее» (данные есть, но синк сейчас не идёт — это и есть
+       честный смысл idle при непустом coverage_days), «ожидает» (данных
+       вообще ещё нет). Сырое p.state остаётся в технических деталях. */
+    if (p.error) return { state: "error", right: "ошибка" };
+    if (p.state === "running") return { state: "running", right: "получаем" };
+    if (p.state === "done") return { state: "done", right: "получены" };
+    var hasData = (p.coverage_days || 0) > 0 ||
+      (p.stages || []).some(function (s) { return s.state === "done" || s.state === "running"; });
+    if (hasData) return { state: "done", right: "получены ранее" };
+    return { state: "todo", right: "ожидает" };
+  }
+  if (sem.key === "catalog") {
+    /* Слитый этап: «готово», когда готовы ОБА исходных шага (products и
+       today); «идёт», когда хоть один начался; иначе «ещё не начато». Ошибка
+       любого из двух — ошибка слитого этапа: прятать её было бы нечестно. */
+    var byKey = {};
+    (p.stages || []).forEach(function (s) { byKey[s.key] = s; });
+    var prod = byKey.products, today = byKey.today;
+    var states = [prod, today].filter(Boolean).map(function (s) { return s.state; });
+    if (!states.length) {
+      /* Та же логика, что и в общей ветке sem.stage выше: верхнеуровневый
+         done без детализации по products/today — свидетельство, что этап
+         прошёл, не «ещё не начат». */
+      if (p.state === "done") return { state: "done", right: "получено" };
+      return { state: "todo", right: "ожидает" };
+    }
+    if (states.indexOf("error") !== -1) return { state: "error", right: "ошибка" };
+    if (states.length === 2 && states.every(function (s) { return s === "done"; })) {
+      var n = today && today.counts ? today.counts.warehouses : null;
+      return { state: "done",
+        right: n !== null && n !== undefined ? n + " " + plural(n, "склад", "склада", "складов") : "готово" };
+    }
+    if (states.indexOf("running") !== -1) return { state: "running", right: "идёт" };
+    return { state: "todo", right: "ожидает" };
+  }
+  return { state: "todo", right: "ожидает" };
+}
+
+/* Главная строка статуса — то, что видно сразу, без разбора списка этапов.
+   Агрегат ("N из M готово") и ETA — только реальные, посчитанные из уже
+   прочитанных состояний этапов: ни один процент здесь не придуман. */
+function mainStatusText(demo, p) {
+  if (demo) return { text: "Идёт демонстрация хода — числа синтетические.", spin: true, done: false };
+  if (!p) {
+    return { text: "Не удалось прочитать состояние загрузки" +
+      (PV.errors.progress ? ": " + PV.errors.progress : "") + ".", spin: false, done: false };
+  }
+  if (p.error) return { text: "Не получилось: " + p.error + ".", spin: false, done: false };
+  var real = SEM_STAGES.filter(function (sem) { return sem.bind !== null; });
+  var done = 0, current = null;
+  real.forEach(function (sem) {
+    var r = liveStageState(sem, p);
+    if (r.state === "done") done++;
+    else if (!current) current = sem;
+  });
+  var cov = p.coverage_days || 0, need = p.history_days || 0;
+  /* Верхнеуровневый p.state==="done" — самостоятельное и достаточное
+     доказательство того, что синхронизация завершилась целиком, даже
+     когда per-stage stages[] пуст (например, инкрементальный режим не
+     отдаёт разбивку по этапам). Без этой проверки главный статус в такой
+     ситуации искал бы подтверждение только в per-stage данных, не нашёл
+     бы их и показал «Собираем данные: … 1 из 4 готово» со спиннером —
+     придуманный «в процессе» там, где на деле всё уже позади. Заявление
+     ограничено ровно тем, что подтверждено: готовность МАТРИЦЫ (через
+     PV.data.turnover) — «Матрица готова» про экран «Оборачиваемость», а не
+     про синхронизацию саму по себе: если /api/turnover не прочитался
+     (сеть, 409, любая другая ошибка — см. errMessage()), матрицы физически
+     нет, и говорить «готова» значило бы обещать то, чего нет на следующем
+     экране. Заголовок при этом НЕ утверждает, что коннектор сейчас жив —
+     это про завершённость синка, а не про состояние соединения. */
+  if (p.state === "done" || done === real.length) {
+    if (PV.data.turnover) return { text: "Матрица готова.", spin: false, done: true };
+    return { text: "Синхронизация завершена. Матрица недоступна: не удалось прочитать данные" +
+      (PV.errors.turnover ? " (" + PV.errors.turnover + ")" : "") + ".", spin: false, done: false };
+  }
+  /* idle — это «синхронизация сейчас не идёт», при ЛЮБОМ покрытии истории
+     (нулевом, частичном или полном): ни спиннер, ни «Собираем данные»/
+     «Загружаем» тут неуместны ни в одном из трёх случаев — это обещание
+     активного процесса, которого при idle попросту нет. Частичный случай
+     (cov>0 && cov<need) уже был правильным и раньше — текст сохранён
+     дословно; новые случаи — coverage=0 (данных ещё нет вовсе) и coverage
+     >= history_days (историческое окно закрыто, но stages[] пуст, поэтому
+     до этой строки не дошла ветка выше). */
+  if (p.state === "idle") {
+    if (need > 0 && cov > 0 && cov < need) {
+      return { text: "История загружена частично: " + num(cov) + " из " + num(need) +
+        " дней. Загрузка сейчас не идёт.", spin: false, done: false };
+    }
+    if (cov > 0) {
+      return { text: "История загружена (" + num(cov) +
+        (need ? " из " + num(need) : "") + " дн.). Загрузка сейчас не идёт.",
+        spin: false, done: false };
+    }
+    return { text: "Данные ещё не загружены. Загрузка сейчас не идёт.",
+      spin: false, done: false };
+  }
+  /* Частичная история — самый важный факт, который есть прямо сейчас: если
+     он есть, он выходит в заголовок статуса независимо от того, какой этап
+     формально «текущий» по массиву stages[] (тот может вообще не знать про
+     историю — как в этом самом случае, когда stages[] не включает "history",
+     но coverage_days уже реальные 400 из 730). Без этой проверки статус мог
+     сказать «собираем: подключение», хотя история уже на 55% загружена. */
+  if (need > 0 && cov > 0 && cov < need) {
+    /* «Загружаем» и спиннер обещают активный процесс — это правда, только
+       когда p.state==="running". idle с тем же самым покрытием означает
+       ровно обратное: загрузка СЕЙЧАС НЕ идёт, и спиннер/ETA/«продолжится
+       сама» были бы придуманным движением там, где на самом деле пауза. */
+    if (p.state === "running") {
+      var histExtra = " (" + num(cov) + " из " + num(need) + " дн.)";
+      if (p.eta_sec !== null && p.eta_sec !== undefined) histExtra += " · ещё ~" + num(p.eta_sec) + " с";
+      return { text: "Загружаем историю продаж" + histExtra + " · " + done + " из " +
+        real.length + " готово.", spin: true, done: false };
+    }
+    return { text: "История загружена частично: " + num(cov) + " из " + num(need) +
+      " дней. Загрузка сейчас не идёт.", spin: false, done: false };
+  }
+  var extra = "";
+  if (current && current.key === "history") {
+    extra = " (" + num(cov) + " из " + num(need) + " дн.)";
+    if (p.eta_sec !== null && p.eta_sec !== undefined) extra += " · ещё ~" + num(p.eta_sec) + " с";
+  }
+  return { text: "Собираем данные: " + (current ? current.title.toLowerCase() : "матрица") +
+    extra + " · " + done + " из " + real.length + " готово.", spin: true, done: false };
+}
+
+/* Сколько тиков демонстрация тратит на один этап. Вынесено в константу не для
+   красоты: при 10 тиках по 260 мс один этап занимал 2.6 с, полный проход — 21 с,
+   и «ход загрузки» не читался как ход ни человеком, ни проверкой. */
+var DEMO_TICKS_PER_STAGE = 4;
+
+function renderMainStatus() {
+  var el = $("pv-mainstatus");
+  if (!el) return;
+  var demo = PV.board.mode === "demo";
+  var r = mainStatusText(demo, PV.data.progress);
+  el.innerHTML = (r.spin ? '<span class="pv-spin" aria-hidden="true"></span>' : "") +
+    '<span class="' + (r.done ? "pv-done" : "") + '">' + esc(r.text) + "</span>";
+}
+
+function renderBoard() {
+  var box = $("pv-stages"), foot = $("pv-board-foot");
+  var demo = PV.board.mode === "demo";
+  var p = PV.data.progress;
+  renderMainStatus();
+  /* «Продолжится сама» — обещание активного процесса; произносим его только
+     когда синк реально идёт (p.state==="running"). Иначе — нейтральная
+     версия без обещания движения, которого нет. */
+  var closeNote = $("pv-close-note");
+  if (closeNote) {
+    closeNote.textContent = (!demo && p && p.state === "running")
+      ? "Можно закрыть вкладку или перезагрузить страницу — загрузка продолжится сама."
+      : "Можно закрыть вкладку или перезагрузить страницу.";
+  }
+  /* Та же дисциплина, что и у нижней заметки: «появятся скоро» и «продолжит
+     грузиться в фоне» — обещание активного процесса, а не факт вообще.
+     Только пока синк реально идёт (p.state==="running"), эти слова правдивы;
+     во всех остальных состояниях (idle, done, ошибка, данных ещё нет)
+     заголовок остаётся нейтральным описанием того, что показано ниже, без
+     обещания движения, которого в эту секунду нет. */
+  var loaderLead = $("pv-loader-lead");
+  if (loaderLead) {
+    loaderLead.textContent = (!demo && p && p.state === "running")
+      ? "Первые данные появятся скоро, а вся история продолжит грузиться в фоне."
+      : "Здесь показано состояние загрузки ваших данных.";
+  }
+
+  if (!demo && !p) {
+    box.innerHTML = '<li class="pv-stage"><span class="pv-mark">!</span>' +
+      '<div><div class="pv-stage-t">Живое состояние прочитать не удалось</div>' +
+      '<div class="pv-stage-sub">' +
+      (PV.errors.progress ? esc(PV.errors.progress) : "не получилось прочитать состояние загрузки") +
+      '. Придуманных значений вместо них здесь не будет.</div></div><div></div></li>';
+    foot.textContent = "";
+    return;
+  }
+
+  var monthsHtml = "";
+  box.innerHTML = SEM_STAGES.map(function (sem, i) {
+    var st, right, extra = "";
+    if (demo) {
+      /* Демонстрация: состояние выводится из локального счётчика тиков и
+         НИКОГДА не смешивается с живыми значениями — живые на это время не
+         читаются вовсе. Каждая строка помечена словом ДЕМО. */
+      var pos = PV.board.tick / DEMO_TICKS_PER_STAGE;
+      st = pos > i + 1 ? "done" : (pos > i ? "running" : "todo");
+      var pct = Math.max(0, Math.min(100, Math.round((pos - i) * 100)));
+      right = st === "done" ? "готово" : (st === "running" ? pct + " %" : "ожидает");
+      if (st === "running") extra = '<div class="pv-bar" role="progressbar" aria-valuemin="0"' +
+        ' aria-valuemax="100" aria-valuenow="' + pct + '" aria-label="Демонстрация хода этапа ' +
+        esc(sem.title) + '"><i style="width:' + pct + '%"></i></div>';
+    } else if (sem.bind === null) {
+      /* У «Матрицы» нет своего поля в контракте синка — но у неё есть
+         косвенная, настоящая улику: сама матрица — это то, что построено
+         из ответа GET /api/turnover, и его наличие/отсутствие в PV.data —
+         не выдумка, а факт, который страница уже знает. Раньше карточка
+         всегда молчала («nofield», пустая колонка) — это было честно про
+         отсутствие ПОЛЯ КОНТРАКТА, но создавало противоречие с заголовком
+         «Матрица готова»: сам заголовок мог сказать «готова», пока карточка
+         снизу упорно ничего не подтверждала. Теперь у карточки то же
+         основание для правды, что и у заголовка. */
+      if (PV.data.turnover) { st = "done"; right = "готово"; }
+      else { st = "error"; right = "недоступна"; }
+    } else {
+      var r = liveStageState(sem, p);
+      st = r.state;
+      right = r.right;
+      if (sem.key === "history" && st === "running") {
+        var pct2 = Math.max(0, Math.min(100, Math.round(p.progress_pct || 0)));
+        extra = '<div class="pv-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100"' +
+          ' aria-valuenow="' + pct2 + '" aria-label="Загрузка истории, 730 дней">' +
+          '<i style="width:' + pct2 + '%"></i></div>';
+        if (p.eta_sec !== null && p.eta_sec !== undefined) {
+          right = right + " · ещё ~" + num(p.eta_sec) + " с";
+        }
+      }
+      if (sem.key === "history") {
+        var cov = p.coverage_days || 0, need = p.history_days || 0;
+        extra += '<div class="pv-stage-sub">Покрытие: <b>' + num(cov) + '</b> из <b>' +
+                 num(need) + '</b> дн.</div>';
+        /* Помесячная сетка (2026-08, 2026-07, …) — диагностика синка, не то,
+           что нужно владельцу с первого взгляда: то же самое покрытие уже
+           названо человеческой фразой строкой выше. Сетка переезжает в
+           технические детали целиком, а не остаётся инлайн под каждой
+           карточкой. */
+        var months = (p.months || []).slice(0, 24);
+        if (months.length) {
+          monthsHtml = '<p><b>Помесячно (' + months.length + ')</b>: ' +
+            months.map(function (m) {
+              return '<span class="pv-month" data-s="' + esc(m.state) + '">' + esc(m.ym) + '</span>';
+            }).join(" ") + '</p>';
+        }
+      }
+    }
+    var glyph = st === "done" ? "✓" : (st === "running" ? "…" : (st === "error" ? "!" : "·"));
+    return '<li class="pv-stage" data-state="' + esc(st) + '" data-key="' + esc(sem.key) + '">' +
+      '<span class="pv-mark">' + glyph + '</span>' +
+      '<div><div class="pv-stage-t">' + esc(sem.title) +
+      (demo ? '<span class="pv-demotag">ДЕМО</span>' : '') + '</div>' +
+      '<div class="pv-stage-sub">' + esc(sem.sub) + '</div>' + extra + '</div>' +
+      '<div class="pv-stage-right">' + esc(right) + '</div></li>';
+  }).join("");
+
+  /* Сырые имена полей контракта — по одному на этап — и полный набор живых
+     значений уходят в единый свёрнутый блок под списком, а не по абзацу на
+     каждую строку: то же самое доказательство честности, но не в первом
+     прочтении. */
+  var bindLines = SEM_STAGES.map(function (sem) {
+    return '<p><b>' + esc(sem.title) + '</b> — ' +
+      (sem.bind === null
+        ? "в контракте отдельного поля нет, прогресс не рисуется"
+        : esc(sem.bind)) + '</p>';
+  }).join("");
+  if (demo) {
+    foot.innerHTML = '<p>Идёт демонстрация. Живые значения на это время не показаны ' +
+      'совсем — скрыты целиком, чтобы их нельзя было прочитать как факт.</p>' + bindLines + monthsHtml;
+  } else {
+    foot.innerHTML = bindLines + monthsHtml +
+      '<p>Живые поля GET /api/sync/progress: <span class="pv-mono">state=' + esc(p.state || "") +
+      '</span>, <span class="pv-mono">progress_pct=' + esc(String(p.progress_pct)) +
+      '</span>, <span class="pv-mono">coverage_days=' + esc(String(p.coverage_days)) +
+      '</span>, <span class="pv-mono">history_days=' + esc(String(p.history_days)) +
+      '</span>, <span class="pv-mono">eta_sec=' +
+      esc(p.eta_sec === null || p.eta_sec === undefined ? "null" : String(p.eta_sec)) +
+      '</span>' + (p.error ? ', <span class="pv-mono">error=' + esc(p.error) + '</span>' : '') + '.</p>';
+  }
+}
+
+function setBoardMode(mode) {
+  PV.board.mode = mode;
+  $("pv-board").setAttribute("data-mode", mode);
+  $("pv-modechip").textContent = mode === "demo"
+    ? "ДЕМОНСТРАЦИЯ · синтетические числа"
+    : "живые данные";
+  $("pv-demo-btn").textContent = mode === "demo"
+    ? "Остановить демонстрацию"
+    : "Посмотреть, как проходит загрузка";
+  if (PV.board.timer) { clearInterval(PV.board.timer); PV.board.timer = null; }
+  if (mode === "demo") {
+    PV.board.tick = 0;
+    PV.board.timer = setInterval(function () {
+      PV.board.tick += 1;
+      if (PV.board.tick > DEMO_TICKS_PER_STAGE * SEM_STAGES.length + 4) PV.board.tick = 0;
+      renderBoard();
+    }, REDUCED ? 700 : 200);
+  }
+  renderBoard();
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+   10. Предпросмотр «Оборачиваемости»
+
+   Столбцы — только то, что есть в ответе GET /api/turnover. «Не хватает до
+   нормы» на боевой странице считается в браузере (BUSINESS_LOGIC §9.12) и в
+   ответе ручки не приходит: столбец оставлен, но в нём стоит честный прочерк,
+   а не пересчитанное здесь число. Так экскурсия может рассказать про эту
+   величину, не выдумывая её.
+   ══════════════════════════════════════════════════════════════════════════ */
+var COLS = [
+  { k: "name",   t: "Название",        sub: "" },
+  { k: "dis",    t: "Дней",            sub: "в стоке" },
+  { k: "price",  t: "Ср. цена",        sub: "продажи" },
+  { k: "margin", t: "Маржа",           sub: "₽/шт и %", money: true },
+  { k: "turn",   t: "Оборач.",         sub: "₽/день" },
+  { k: "winter", t: "Зима",            sub: "₽/день" },
+  { k: "spring", t: "Весна",           sub: "₽/день" },
+  { k: "summer", t: "Лето",            sub: "₽/день" },
+  { k: "autumn", t: "Осень",           sub: "₽/день" },
+  { k: "cs",     t: "Остаток",         sub: "шт" },
+  { k: "wos",    t: "Запас",           sub: "дней" },
+  { k: "need",   t: "Не хватает",      sub: "до нормы" },
+  { k: "fdisc",  t: "Факт. скидка",    sub: "от розницы" },
+  { k: "disc",   t: "Скидка",          sub: "%" },
+  { k: "arch",   t: "Архив",           sub: "" }
+];
+
+var SEASON_KEYS = { winter: "winter", spring: "spring", summer: "summer", autumn: "autumn" };
+var SEA_NA_TITLE = "Данных нет: сезон не покрыт загруженной историей. " +
+                   "Ноль вместо них не рисуется — ноль означал бы «продаж не было».";
+
+function rowClass(it) {
+  if (it.group === "no_sales") return "rgr";
+  if (it.group === "low_data") return "rld";
+  return { best: "rg2", good: "rg1", dull: "ro", weak: "rr" }[it.cls] || "rr";
+}
+
+var SEA_RETURNS_TITLE = "Возвраты в этом сезоне превысили продажи: честный ноль " +
+  "— это НЕ «продаж не было», а «отдача не может быть отрицательной, поэтому " +
+  "она зажата в ноль». Поле sea_returns из ответа GET /api/turnover.";
+
+function seaCell(it, key, hero) {
+  var attr = hero ? ' data-tour="season"' : "";
+  var v = (it.sea || {})[key];
+  if (v === null || v === undefined) {
+    return '<td class="pv-num"' + attr + '><span class="pv-na" title="' +
+           esc(SEA_NA_TITLE) + '">—</span></td>';
+  }
+  /* Ноль, зажатый анализом из-за возвратов (sea_returns), — не то же самое,
+     что честный «продаж не было»: экскурсия ниже (шаг «Сезон») учит именно
+     разнице между null и покрытым нулём, и подписывать оба вида нуля
+     одинаково значило бы рассказывать владельцу неправду про его же сезон. */
+  var isReturns = (it.sea_returns || []).indexOf(key) !== -1;
+  if (isReturns) {
+    return '<td class="pv-num"' + attr + '><span class="pv-seareturns" title="' +
+           esc(SEA_RETURNS_TITLE) + '">' + num(v) +
+           '<sup aria-hidden="true">±</sup></span>' +
+           '<span class="pv-sronly">, возвраты превысили продажи</span></td>';
+  }
+  return '<td class="pv-num"' + attr + ">" + num(v) + "</td>";
+}
+
+function pickHero(items) {
+  /* Строка для экскурсии: настоящая, из середины рейтинговой группы. Не первая
+     и не последняя — крайняя строка учит не тому, как читать таблицу.
+     !it.hidden — не в собственном архиве владельца (см. разбивку таблицы в
+     renderTurnover(), она намеренно смотрит только на hidden). !it.archived
+     — здесь, отдельно, для героя экскурсии добавлено намеренно: служебный
+     флаг МойСклада не про видимость СТРОКИ В ТАБЛИЦЕ (это по-прежнему верно
+     и не меняется), но он про то, годится ли строка на роль «типичная
+     активная позиция» для обучающего показа — карточка, архивная на
+     стороне учётной системы, не подходит для этого, даже оставаясь видимой
+     в общем списке. */
+  var rank = items.filter(function (it) {
+    return it.group === "rank" && !it.low_data && !it.hidden && !it.archived;
+  });
+  if (!rank.length) return null;
+  return rank[Math.floor(rank.length / 2)];
+}
+
+function renderTurnover(preserveHero) {
+  var head = $("pv-thead"), body = $("pv-tbody"), foot = $("pv-tfoot");
+  var footShort = $("pv-tfoot-short");
+  var d = PV.data.turnover;
+  if (!d) {
+    head.innerHTML = "<th>Название</th>";
+    body.innerHTML = '<tr><td class="pv-na">Не удалось прочитать данные' +
+      (PV.errors.turnover ? ": " + esc(PV.errors.turnover) : "") + "</td></tr>";
+    foot.textContent = "";
+    if (footShort) footShort.textContent = "";
+    return;
+  }
+  head.innerHTML = COLS.map(function (c) {
+    return '<th class="' + (c.money ? "pv-hidecol" : "") + '">' + esc(c.t) +
+           (c.sub ? '<span class="sub">' + esc(c.sub) + "</span>" : "") + "</th>";
+  }).join("");
+
+  /* Свой архив предпросмотра — это hidden=true (та же граница, что у боевой
+     «Оборачиваемости», см. templates/turnover.html:686,706): пользователь
+     сам отправляет позицию в архив через /api/hidden. Поле archived — это
+     ДРУГОЙ, служебный флаг МойСклада (архивная карточка на стороне учётной
+     системы) и партиции «живое/архив» здесь не касается: отдельная строка
+     с archived=true, но hidden=false остаётся в общем списке как есть. */
+  var items = d.items || [];
+  var live = items.filter(function (it) { return !it.hidden; });
+  var arch = items.filter(function (it) { return it.hidden; });
+  /* Строка героя экскурсии выбирается из ПОЛНОГО списка, а не из отфильтрованного
+     поиском: иначе набранный в поле поиска текст незаметно переставлял бы, какая
+     строка учит экскурсии. preserveHero=true — единственное исключение: так
+     openTour() перерисовывает таблицу ПОСЛЕ того, как сам сознательно выбрал
+     героя из видимых (см. openTour()), и этот выбор здесь нельзя затирать. */
+  if (!preserveHero) PV.hero = pickHero(live);
+  var over = PV.data.overrides || {};
+
+  var q = (PV.search || "").trim().toLowerCase();
+  var liveShown = q ? live.filter(function (it) {
+    return String(it.base_name || "").toLowerCase().indexOf(q) !== -1;
+  }) : live;
+  var archShown = q ? arch.filter(function (it) {
+    return String(it.base_name || "").toLowerCase().indexOf(q) !== -1;
+  }) : arch;
+  /* Запоминаем, что реально отрисовано СЕЙЧАС (после поиска) — нужно openTour(),
+     чтобы решить, годится ли текущий PV.hero для экскурсии, или его надо
+     пересчитать на видимый набор строк (см. openTour()). */
+  PV.liveShown = liveShown;
+  /* И отдельно — полный (не отфильтрованный поиском) список живых строк:
+     openTour() сверяет по нему, есть ли вообще подходящая для экскурсии
+     строка в ответе API, чтобы не спутать «активный поиск временно скрыл
+     все подходящие строки» с «в самом ответе API подходящих строк нет». */
+  PV.liveAll = live;
+
+  var groupTitles = { rank: "Рейтинг", low_data: "Мало данных", no_sales: "Без продаж за год" };
+  var html = [], seen = {};
+  liveShown.forEach(function (it) {
+    if (!seen[it.group]) {
+      seen[it.group] = true;
+      html.push('<tr class="pv-grouprow"><td colspan="' + COLS.length + '">' +
+                esc(groupTitles[it.group] || it.group) + "</td></tr>");
+    }
+    html.push(rowHtml(it, over, false));
+  });
+  if (archShown.length) {
+    html.push('<tr class="pv-grouprow"><td colspan="' + COLS.length + '">Архив</td></tr>');
+    archShown.forEach(function (it) { html.push(rowHtml(it, over, true)); });
+  }
+  body.innerHTML = html.join("") ||
+    (q ? '<tr><td colspan="' + COLS.length + '" class="pv-na">По запросу «' + esc(PV.search) +
+         '» ничего не найдено.</td></tr>'
+       : '<tr><td colspan="' + COLS.length + '" class="pv-na">В ответе /api/turnover нет строк.</td></tr>');
+
+  var t = d.thresholds || {};
+  /* Короткая строка — то, что видно сразу: сколько показано, сколько в архиве.
+     Полное объяснение порогов, нормы запаса, пустой колонки «Не хватает» и
+     статуса строки «Архив» — техническая подробность, свёрнутая по умолчанию
+     (см. #pv-tfoot внутри <details class="pv-tech"> в разметке шага). */
+  if (footShort) {
+    footShort.innerHTML =
+      "Показано: <b>" + liveShown.length + "</b>" +
+      (q ? " из " + live.length : "") +
+      (archShown.length ? " (и " + archShown.length + " в архиве)" : "") + ".";
+  }
+  foot.innerHTML =
+    "Пороги классов организации из ответа ручки: слабый &lt; " + num(t.weak) +
+    ", медленный &lt; " + num(t.dull) + ", хороший &lt; " + num(t.good) +
+    " ₽/день; норма запаса <span class=\"pv-mono\">stock_norm_days=" +
+    num(d.stock_norm_days) + "</span>. " +
+    "Столбец «Не хватает до нормы» намеренно пуст: этой величины нет в ответе " +
+    "<span class=\"pv-mono\">GET /api/turnover</span>, а пересчитывать её " +
+    "предпросмотр не имеет права. Строка «Архив» — тоже только информация: " +
+    "отправить туда или вернуть оттуда позицию из предпросмотра нельзя.";
+  var sc = $("pv-search-count");
+  if (sc) sc.textContent = q ? "найдено: " + (liveShown.length + archShown.length) : "";
+
+  /* Строки перерисованы — приводим денежный слой к текущему состоянию тумблера
+     (свежие ячейки «с/с» рождаются скрытыми, и без этого включённый слой
+     после перерисовки молча погас бы). */
+  setMoney(PV.showMoney);
+  updateScrollHint();
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+   9а. Предварительность данных, пока история короче канона (730 дней), и
+       компактная сводка «на что обратить внимание сегодня» — обе только из
+       уже присутствующих в ответе /api/turnover полей, без новой математики.
+   ══════════════════════════════════════════════════════════════════════════ */
+function renderPrelim() {
+  var el = $("pv-prelim");
+  var p = PV.data.progress;
+  if (!p || typeof p.coverage_days !== "number") { el.hidden = true; return; }
+  if (p.coverage_days >= HISTORY_CANON_DAYS) { el.hidden = true; return; }
+  el.hidden = false;
+  el.textContent = "Предварительно: история загружена не полностью — " +
+    num(p.coverage_days) + " из " + HISTORY_CANON_DAYS +
+    " дней. Обороты и сезоны ниже посчитаны по тому, что уже загружено.";
+}
+
+function renderAttn() {
+  var box = $("pv-attn");
+  var d = PV.data.turnover;
+  if (!d) {
+    box.innerHTML = '<p class="pv-muted" style="margin:0">Сводка недоступна: ' +
+      esc(PV.errors.turnover || "нет данных /api/turnover") + "</p>";
+    return;
+  }
+  /* Сводка — не таблица: она не партиционирует строки на «живое/архив» (это
+     остаётся делом renderTurnover(), который сознательно смотрит только на
+     hidden — см. его собственный комментарий). Сводка — агрегат для
+     принятия решения «на что посмотреть сегодня», и для НЕГО канонический
+     образец — серверный _live_items() (app/analytics.py), который исключает
+     и hidden, и archived разом. Показать в сводке позицию, архивную на
+     стороне учётной системы (даже если она технически ещё видна в таблице
+     ниже как «живая»), значило бы посчитать её в «внимание сегодня» ровно
+     там, где ни один канонический дашборд её бы не посчитал. */
+  var items = (d.items || []).filter(function (it) { return !it.hidden && !it.archived; });
+  /* «Слабых» и «ниже себестоимости» — это actionable-корзины: они должны
+     заставить владельца что-то РЕШИТЬ про конкретную позицию. Позиция с
+     low_data статистически недостоверна (мало дней в стоке или единичные
+     продажи) — её cls/below_cost сами по себе ещё не повод действовать,
+     ровно как канонические серверные сводки (см. пример в templates/
+     turnover.html) не считают low_data-позиции в actionable-корзинах.
+     lowData-корзина остаётся отдельной и включает ВСЕ low_data-позиции —
+     она как раз про «этим цифрам пока нельзя доверять», а не про действие. */
+  var weak = items.filter(function (it) { return it.cls === "weak" && !it.low_data; });
+  var belowCost = items.filter(function (it) { return it.below_cost && !it.low_data; });
+  var lowData = items.filter(function (it) { return it.low_data; });
+  var byCat = {};
+  weak.forEach(function (it) {
+    var c = it.category || "Без категории";
+    byCat[c] = (byCat[c] || 0) + 1;
+  });
+  var topCat = null, topCount = 0;
+  Object.keys(byCat).forEach(function (c) {
+    if (byCat[c] > topCount) { topCat = c; topCount = byCat[c]; }
+  });
+  box.innerHTML =
+    '<h3 style="margin-bottom:2px">На что обратить внимание сегодня</h3>' +
+    '<p class="pv-muted" style="margin-bottom:0">Только предпросмотр — не рекомендация действия.</p>' +
+    '<div class="pv-attn-row">' +
+      '<div class="pv-attn-item"><b>' + num(weak.length) + '</b><span>слабых позиций</span></div>' +
+      '<div class="pv-attn-item"><b>' + num(belowCost.length) + '</b><span>продаются ниже себестоимости</span></div>' +
+      '<div class="pv-attn-item"><b>' + num(lowData.length) + '</b><span>с меткой «мало данных»</span></div>' +
+      (topCat ? '<div class="pv-attn-item"><b>' + esc(topCat) + '</b>' +
+        '<span>категория с наибольшим числом слабых позиций (' + num(topCount) + ')</span></div>' : "") +
+    "</div>" +
+    '<details class="pv-tech"><summary>Технические детали</summary>' +
+    '<div class="pv-tech-body"><p>Подсчёт существующих полей ответа ' +
+    '<span class="pv-mono">GET /api/turnover</span> (<span class="pv-mono">cls</span>, ' +
+    '<span class="pv-mono">below_cost</span>, <span class="pv-mono">low_data</span>) ' +
+    '— без новой формулы.</p></div></details>';
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+   9б. Подсказка горизонтальной прокрутки таблицы — видна только там, где
+       таблица реально шире своего контейнера.
+   ══════════════════════════════════════════════════════════════════════════ */
+function updateScrollHint() {
+  var wrap = $("pv-tablewrap");
+  if (!wrap) return;
+  wrap.classList.toggle("is-scrollable", wrap.scrollWidth > wrap.clientWidth + 1);
+}
+
+function rowHtml(it, over, archived) {
+  var cls = rowClass(it) + (PV.hero && it.base_name === PV.hero.base_name ? " pv-hero" : "");
+  var hero = PV.hero && it.base_name === PV.hero.base_name;
+  function td(key, inner, cellCls) {
+    return '<td class="' + (cellCls || "") + '"' +
+           (hero ? ' data-tour="' + key + '"' : "") + ">" + inner + "</td>";
+  }
+  var lowTag = it.low_data
+    ? '<span class="pv-tag" title="Мало дней в стоке или единичные продажи — цифрам пока нельзя доверять">мало данных</span>'
+    : "";
+  /* Класс строки читается не только по цвету фона: рядом стоит подпись
+     текстом (best/good/dull/weak → «топ»/«хорошо»/«медленно»/«слабо»), иначе
+     единственный носитель смысла — цвет, а это не проходит для людей, не
+     различающих оттенки. */
+  var CLS_LABEL = { best: "топ", good: "хорошо", dull: "медленно", weak: "слабо" };
+  var clsBadge = (it.group === "rank" && CLS_LABEL[it.cls])
+    ? '<span class="pv-clsbadge ' + esc(it.cls) + '">' + esc(CLS_LABEL[it.cls]) + '</span>'
+    : "";
+  var manual = over[it.base_name];
+  var out = [];
+  out.push('<td' + (hero ? ' data-tour="name"' : "") + ">" + esc(it.base_name) + clsBadge + lowTag + "</td>");
+  out.push(td("dis", '<span class="pv-num">' + num(it.dis) + "</span>"));
+  out.push(td("price",
+    '<span class="pv-num">' + num(it.avg_price) + "</span>" +
+    '<span class="pv-sub">номинал ' + num(it.sale_price) + "</span>" +
+    '<span class="pv-sub" data-money="1" hidden>с/с ' +
+      (it.no_cost ? "нет с/с" : num(it.cost_price)) + "</span>"));
+  out.push('<td class="pv-hidecol"' + (hero ? ' data-tour="margin"' : "") + '>' +
+    (it.no_cost ? '<span class="pv-na">нет с/с</span>'
+                : '<span class="pv-num">' + num(it.margin_unit) + "</span>" +
+                  '<span class="pv-sub">' + pct(it.margin_pct) + " %</span>") + "</td>");
+  out.push(td("turn", '<span class="pv-num">' +
+    (it.group === "rank" ? num(it.turnover) : '<span class="pv-na">—</span>') + "</span>"));
+  ["winter", "spring", "summer", "autumn"].forEach(function (s) {
+    out.push(seaCell(it, SEASON_KEYS[s], hero));
+  });
+  out.push(td("cs", '<span class="pv-num">' + num(it.cs) + "</span>"));
+  out.push(td("wos", '<span class="pv-num">' +
+    (it.wos === null || it.wos === undefined ? '<span class="pv-na">—</span>' : num(it.wos)) +
+    "</span>" +
+    (it.stockout_date ? '<span class="pv-sub">до ' + esc(ruDate(it.stockout_date)) +
+                        "</span>" : "")));
+  out.push(td("need", '<span class="pv-na" title="Величины нет в ответе GET /api/turnover; ' +
+    'на боевой странице она считается в браузере, а предпросмотр не пересчитывает">—</span>'));
+  out.push(td("fdisc", '<span class="pv-num">' + pct(it.discount_fact) + " %</span>"));
+  out.push(td("disc", manual
+    ? '<span class="pv-num">' + num(manual) + " %</span>"
+    : '<span class="pv-na">—</span>'));
+  out.push(td("arch", archived
+    ? '<span class="pv-tag">в архиве</span>'
+    : '<span class="pv-na">—</span>'));
+  return '<tr class="' + cls + '">' + out.join("") + "</tr>";
+}
+
+function renderMoney() {
+  var box = $("pv-money"), loss = $("pv-loss");
+  var d = PV.data.turnover;
+  if (!d || !PV.showMoney) {
+    box.classList.remove("is-on");
+    box.innerHTML = "";
+    loss.innerHTML = "";
+    return;
+  }
+  var m = d.money || {}, b = d.below_cost || {};
+  box.classList.add("is-on");
+  /* Позиции без себестоимости (no_cost) исключены и из stock_cost («Заморожено
+     по себестоимости»), и из gross_margin («Валовая маржа за год») — см.
+     app/analytics.money_totals(): with_cost = [it for it in items if not
+     it.get("no_cost")], и stock_cost/gross_margin считаются только по нему.
+     Показать по этим позициям ноль/пропуск означало бы соврать про то,
+     сколько денег реально заморожено или заработано. stock_sale, наоборот,
+     считается по ВСЕМ позициям («За сколько продастся» не требует
+     себестоимости) — ему та же оговорка не идёт, и это тоже прямо
+     проверено тестом, а не только не написано случайно. Боевая
+     «Оборачиваемость» об этом прямо говорит рядом с обеими суммами
+     (templates/turnover.html, moneyNote()/nocost); здесь та же оговорка
+     теми же готовыми полями ответа (no_cost_positions, positions), без
+     пересчёта и без новой формулы — только показ. */
+  var noCostNote = m.no_cost_positions
+    ? '<span class="pv-sub">только позиции с себестоимостью — ' +
+      num((m.positions || 0) - m.no_cost_positions) + ' из ' + num(m.positions) + '</span>'
+    : "";
+  box.innerHTML =
+    '<div class="pv-tile"><span class="pv-muted">Заморожено по себестоимости</span>' +
+      "<b>" + money(m.stock_cost) + "</b>" + noCostNote + "</div>" +
+    '<div class="pv-tile"><span class="pv-muted">Если продать</span>' +
+      "<b>" + money(m.stock_sale) + "</b></div>" +
+    '<div class="pv-tile"><span class="pv-muted">Валовая маржа за год</span>' +
+      "<b>" + money(m.gross_margin) + "</b>" + noCostNote + "</div>";
+  /* below_cost различает «сильные» позиции (positions — уверенный вывод) и
+     «слабые» (low_data_positions — тоже в минусе, но продаж мало, чтобы
+     считать это правилом; см. app/analytics.below_cost_report() и то же
+     разделение в боевой «Оборачиваемости», templates/turnover.html,
+     renderLoss()). Раньше здесь смотрели только на b.positions: если он
+     нулевой, а low_data_positions>0, экран лгал — «в ответе ручки нет»,
+     хотя ручка как раз называет N позиций ниже себестоимости, просто со
+     слабой статистикой. «Нет вообще» — правда только когда оба счётчика
+     нулевые разом. */
+  var lossParts = [];
+  if (b.positions) {
+    lossParts.push('<div class="pv-note stop">Продаётся ниже себестоимости: <b>' +
+      num(b.positions) + "</b> " + plural(b.positions, "позиция", "позиции", "позиций") +
+      ". Числа взяты из ответа ручки (below_cost.positions), не пересчитаны.</div>");
+  }
+  if (b.low_data_positions) {
+    lossParts.push('<div class="pv-note">Ещё <b>' + num(b.low_data_positions) + "</b> " +
+      plural(b.low_data_positions, "позиция", "позиции", "позиций") +
+      " продаётся ниже себестоимости, но данных мало — вывод предварительный " +
+      "(below_cost.low_data_positions), не пересчитан.</div>");
+  }
+  loss.innerHTML = lossParts.length ? lossParts.join("")
+    : '<div class="pv-note">Позиций, продающихся ниже себестоимости, в ответе ручки нет.</div>';
+}
+
+function setMoney(on) {
+  PV.showMoney = on;
+  document.body.classList.toggle("pv-showmoney", on);
+  Array.prototype.forEach.call(document.querySelectorAll('[data-money="1"]'), function (el) {
+    el.hidden = !on;
+  });
+  var b = $("pv-money-btn");
+  b.setAttribute("aria-pressed", on ? "true" : "false");
+  b.textContent = on ? "Скрыть себестоимость и маржу" : "Показать себестоимость и маржу";
+  renderMoney();
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+   11. Экскурсия по настоящей строке
+   ══════════════════════════════════════════════════════════════════════════ */
+function tourSteps() {
+  var it = PV.hero, d = PV.data.turnover || {}, t = d.thresholds || {};
+  var rule = (PV.data.rule || {}).rule || null;
+  var over = PV.data.overrides || {};
+  var manual = it ? over[it.base_name] : undefined;
+  var s = [];
+
+  /* Экскурсия сведена ровно к 5 ключевым шагам (было 10): по одному на каждый
+     смысловой блок таблицы, а не по одному на каждую колонку. Подсветка шага
+     может относиться сразу к нескольким ячейкам строки — `keys`, а не только
+     к одной `key`; это не позиционный DOM-таргетинг (никакого nth-child), а
+     всё те же стабильные атрибуты data-tour, просто несколько на шаг.
+
+     Каждый шаг — одна мысль и две-три короткие человеческие строки; поля,
+     каноны и пороги остаются доступны, но свёрнуты в <details class="pv-tech">
+     внутри body, а не читаются сразу. tech() ниже собирает такой блок. */
+  function tech(html) {
+    return '<details class="pv-tech"><summary>Технические детали</summary>' +
+           '<div class="pv-tech-body">' + html + '</div></details>';
+  }
+
+  s.push({ keys: ["turn"], title: "Денежная отдача",
+    body: "<b>" + (it ? num(it.turnover) : "—") + " ₽/день</b> — сколько эта вещь " +
+      "приносит, пока есть в наличии. Это явно <b>не прибыль</b>: себестоимость " +
+      "сюда не входит. Цвет строки — про то же самое, не про рентабельность." +
+      tech("Канон D-35: нетто-выручка дней «в стоке» за " + HISTORY_CANON_DAYS +
+        " дней ÷ эти же дни. Класс приходит полем <span class=\"pv-mono\">cls</span>, " +
+        "пороги — полем <span class=\"pv-mono\">thresholds</span> (" +
+        num(t.weak) + " / " + num(t.dull) + " / " + num(t.good) + " ₽/день). " +
+        "Предпросмотр берёт готовое поле <span class=\"pv-mono\">turnover</span> " +
+        "из <span class=\"pv-mono\">GET /api/turnover</span> и ничего не пересчитывает.") });
+
+  s.push({ keys: ["price"], title: "Цена",
+    body: "<b>" + (it ? num(it.avg_price) : "—") + " ₽</b> — фактическая цена " +
+      "продажи, уже со скидками. Номинал — <b>" +
+      (it ? num(it.sale_price) : "—") + " ₽</b>. Себестоимость скрыта денежным " +
+      "слоем по умолчанию — включается отдельным тумблером." +
+      tech("<span class=\"pv-mono\">avg_price</span>, " +
+        "<span class=\"pv-mono\">sale_price</span>, " +
+        "<span class=\"pv-mono\">cost_price</span> — поля ответа GET /api/turnover. " +
+        "Тумблер «Показать себестоимость и маржу» — не то же самое, что экскурсия.") });
+
+  s.push({ keys: ["season"], title: "Сезон",
+    body: "<b>0</b> значит «продаж не было». <b>«—»</b> значит «данных ещё нет». " +
+      "Значок «<b>±</b>» — возвраты в сезоне перевесили продажи, это тоже не " +
+      "«продаж не было»." +
+      tech("Это решение владельца D-34: ноль — утверждение «не продавалось», " +
+        "прочерк — «не знаем», путать их нельзя. Непокрытый сезон приходит как " +
+        "<span class=\"pv-mono\">null</span> в поле <span class=\"pv-mono\">sea</span>; " +
+        "зажатый возвратами — отмечен полем <span class=\"pv-mono\">sea_returns</span>.") });
+
+  s.push({ keys: ["dis", "wos"], title: "Дни в стоке и остаток",
+    body: "<b>" + (it ? num(it.dis) : "—") + "</b> дней вещь была в наличии — чем " +
+      "больше, тем больше доверия к цифрам. Остаток — <b>" +
+      (it ? num(it.cs) : "—") + " шт</b>, запас — <b>" +
+      (it && it.wos !== null && it.wos !== undefined ? num(it.wos) + " дн." : "—") +
+      "</b>." +
+      tech("Канон истории — " + HISTORY_CANON_DAYS + " дней " +
+        "(<span class=\"pv-mono\">dis</span>, <span class=\"pv-mono\">cs</span>, " +
+        "<span class=\"pv-mono\">wos</span>). При малой статистике строка помечается " +
+        "«мало данных» и не поднимается в рейтинг. Столбец «Не хватает до нормы» пуст " +
+        "сознательно: этой величины нет в ответе GET /api/turnover.") });
+
+  s.push({ keys: ["fdisc", "disc", "arch"], title: "Скидки и архив",
+    body: "Фактическая скидка — <b>" + (it ? pct(it.discount_fact) : "—") + " %</b>. " +
+      (manual ? "Сохранена ручная скидка <b>" + num(manual) + " %</b>. " : "Ручной скидки нет. ") +
+      "Здесь только чтение — ничего не меняется и не применяется." +
+      tech("<span class=\"pv-mono\">discount_fact</span> — поле ответа GET /api/turnover" +
+        (manual ? "; ручная скидка читается из GET /api/discount-overrides" : "") + ". " +
+        (rule
+          ? "Правило дефолтных скидок организации (топ продаж от " +
+            num(rule.top_turnover) + " ₽/день → " + num(rule.weak_pct) + "–" +
+            num(rule.top_pct) + " %, GET /api/discount-rule) здесь не применяется — " +
+            "кнопки для этого в предпросмотре нет. "
+          : "") +
+        "Строка «Архив» — тоже только информация (поле " +
+        "<span class=\"pv-mono\">archived</span>): отправить туда или вернуть оттуда " +
+        "позицию отсюда нельзя.") });
+
+  return s;
+}
+
+function clearHl() {
+  Array.prototype.forEach.call(document.querySelectorAll(".pv-hl"), function (el) {
+    el.classList.remove("pv-hl");
+  });
+}
+
+function renderTour() {
+  var steps = tourSteps();
+  var st = steps[PV.tour.i];
+  if (!st) return;
+  $("pv-tour-i").textContent = (PV.tour.i + 1) + " / " + steps.length;
+  $("pv-tour-title").textContent = st.title;
+  $("pv-tour-text").innerHTML = st.body;
+  $("pv-tour-prev").disabled = PV.tour.i === 0;
+  $("pv-tour-next").disabled = PV.tour.i === steps.length - 1;
+  clearHl();
+  var keys = st.keys || (st.key ? [st.key] : []);
+  var first = null;
+  keys.forEach(function (k) {
+    var cell = document.querySelector('#pv-tbody [data-tour="' + k + '"]');
+    if (cell) {
+      cell.classList.add("pv-hl");
+      if (!first) first = cell;
+    }
+  });
+  if (first && first.scrollIntoView) {
+    first.scrollIntoView({ block: "center", inline: "center",
+                           behavior: REDUCED ? "auto" : "smooth" });
+  }
+  PV.tour.len = steps.length;
+}
+
+function openTour(fromEl) {
+  /* Попап объяснений и диалог экскурсии — оба aria-modal="true": если оба
+     открыты разом, ассистивные технологии видят два модальных слоя
+     одновременно, а Tab/Escape перестают однозначно относиться к одному из
+     них. closeHelp() безопасна к повторному вызову (сама проверяет
+     PV.help.open) и, будь help открыт, на мгновение вернёт фокус на его
+     opener — но openTour() сразу же ниже переставит фокус на заголовок
+     экскурсии, так что итоговый фокус и PV.tour.opener всегда относятся к
+     ЭТОМУ диалогу, а не к попапу объяснений. */
+  closeHelp();
+  /* Экскурсия обязана описывать строку, которая реально отрисована в
+     таблице ПРЯМО СЕЙЧАС: PV.hero выбирается один раз на полном списке
+     (renderTurnover(), намеренно — чтобы герой не «прыгал» при каждом
+     нажатии клавиши в поиске), но если активный поиск в итоге скрыл именно
+     его строку, вести по ней экскурсию нечестно — подсвечивать нечего, а
+     числа в тексте не совпадают с тем, что видно на экране. Пересчитываем
+     героя на видимый набор ТОЛЬКО в этом случае; если поиск пуст или
+     прежний герой всё ещё виден — ничего не меняется. */
+  var shown = PV.liveShown || [];
+  var heroVisible = PV.hero && shown.some(function (it) {
+    return it.base_name === PV.hero.base_name;
+  });
+  if (!heroVisible) {
+    PV.hero = pickHero(shown);
+    /* DOM таблицы уже отрисован со СТАРЫМ героем (его data-tour/pv-hero
+       достались другой строке или вообще никакой, если поиск скрыл её
+       целиком) — перерисовываем таблицу с уже пересчитанным PV.hero, чтобы
+       атрибуты data-tour оказались именно на новой, видимой строке.
+       preserveHero=true — иначе renderTurnover() тут же выбрал бы героя
+       заново из ПОЛНОГО списка и свёл на нет только что сделанный выбор. */
+    renderTurnover(true);
+  }
+  if (!PV.hero) {
+    /* Экскурсия по несуществующей строке — это выдуманная экскурсия. Молчать
+       тоже нельзя: человек нажал кнопку и должен узнать причину. Но причина
+       бывает ДВУХ разных родов, и подменять одну другой — тоже неправда:
+       либо в самом ответе API действительно нет ни одной подходящей строки,
+       либо строки есть, но их временно спрятал активный текст в поиске.
+       Различаем их по PV.liveAll (полный, не отфильтрованный список) — если
+       там герой находится, значит дело только в поиске, а не в API. Поиск
+       НЕ очищается автоматически: это было бы неожиданной для человека
+       подменой того, что он сам набрал. */
+    var filterActive = !!(PV.search || "").trim();
+    var apiHasEligible = filterActive && !!pickHero(PV.liveAll || []);
+    $("pv-tour-i").textContent = "";
+    if (apiHasEligible) {
+      $("pv-tour-title").textContent = "По текущему поиску нет подходящей строки";
+      $("pv-tour-text").innerHTML = "В ответе <span class=\"pv-mono\">GET /api/turnover</span> " +
+        "есть подходящие для экскурсии строки, но активный текст поиска " +
+        "скрывает их все. Очистите поиск, чтобы увидеть экскурсию.";
+    } else {
+      $("pv-tour-title").textContent = "Экскурсию показать не на чем";
+      $("pv-tour-text").innerHTML = "В ответе <span class=\"pv-mono\">GET /api/turnover</span> " +
+        "нет ни одной рейтинговой строки без пометки «мало данных», а вести " +
+        "экскурсию по крайней или недостоверной строке нельзя.";
+    }
+    $("pv-tour-prev").disabled = true;
+    $("pv-tour-next").disabled = true;
+  }
+  PV.tour.open = true;
+  PV.tour.opener = fromEl || null;
+  $("pv-tour").hidden = false;
+  if (PV.hero) { PV.tour.i = 0; renderTour(); }
+  $("pv-tour-title").focus();
+}
+
+function closeTour() {
+  /* Симметрично closeHelp(): защита от повторного/холостого вызова, когда
+     тур уже закрыт. Без неё openHelp(), вызывающий closeTour() перед каждым
+     своим открытием (см. ниже), при уже закрытом туре всё равно перетаскивал
+     бы фокус на PV.tour.opener — устаревшую кнопку из прошлой экскурсии —
+     на мгновение перед тем, как openHelp() переставит его на #pv-help-close. */
+  if (!PV.tour.open) return;
+  PV.tour.open = false;
+  $("pv-tour").hidden = true;
+  clearHl();
+  if (PV.tour.opener && PV.tour.opener.focus) PV.tour.opener.focus();
+  PV.tour.opener = null;
+}
+
+function tourGo(d) {
+  var steps = tourSteps();
+  var i = PV.tour.i + d;
+  if (i < 0 || i >= steps.length) return;
+  PV.tour.i = i;
+  renderTour();
+}
+
+/* Клавиатура диалога: Escape закрывает, Tab не выпускает фокус наружу.
+   openTour() ставит начальный фокус на #pv-tour-title (tabindex="-1" — вне
+   обычного порядка обхода, но программно фокусируемый элемент). Ловушка
+   ниже проверяла границу только по кнопкам: первый же Shift+Tab сразу после
+   открытия видел activeElement=title, не совпадающий ни с first, ни с last,
+   не находил себе ветки и выпускал фокус из aria-modal диалога наружу.
+   Заголовок явно включён в заднюю границу — с него, как и с первой кнопки,
+   Shift+Tab обязан заворачивать на последнюю кнопку. */
+function bindTourKeys() {
+  $("pv-tour").addEventListener("keydown", function (ev) {
+    if (ev.key !== "Tab") return;
+    var f = $("pv-tour").querySelectorAll("button:not([disabled])");
+    if (!f.length) return;
+    var first = f[0], last = f[f.length - 1], title = $("pv-tour-title");
+    var atBackStop = document.activeElement === first || document.activeElement === title;
+    if (ev.shiftKey && atBackStop) { ev.preventDefault(); last.focus(); }
+    else if (!ev.shiftKey && document.activeElement === last) { ev.preventDefault(); first.focus(); }
+  });
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+   12. Сборка
+   ══════════════════════════════════════════════════════════════════════════ */
+/* ════════════════════════════════════════════════════════════════════════════
+   11а. Переключатель объяснений — по умолчанию выключен, открывающие кнопки
+   живут на уровне шапки/заголовка метрики, а не точкой в каждой ячейке.
+   Один и тот же DOM работает и как попап (десктоп), и как донный лист
+   (<=390px) — меняется только CSS-позиционирование (см. .pv-help-pop).
+   ══════════════════════════════════════════════════════════════════════════ */
+var HELP_TEXTS = {
+  toggle: {
+    title: "Как читать этот предпросмотр",
+    text: "Все числа — готовые из ответов пяти GET-ручек, ничего не пересчитано " +
+      "заново. Кнопка «Экскурсия по строке» на шаге «Оборачиваемость» проходит " +
+      "по одной настоящей строке и объясняет пять смысловых блоков таблицы. " +
+      "Это объяснение по умолчанию выключено и не запоминается между визитами."
+  },
+  turnover: {
+    title: "Денежная отдача / нетто-выручка в день наличия",
+    text: "Сколько рублей выручки (не прибыли — без вычета себестоимости) вещь " +
+      "приносит за один день, когда она есть в наличии. Канон D-35: нетто-" +
+      "выручка дней «в стоке» за " + HISTORY_CANON_DAYS + " дней ÷ эти же дни."
+  }
+};
+
+function openHelp(key, opener) {
+  var t = HELP_TEXTS[key];
+  if (!t) return;
+  /* Симметрично openTour(): попап объяснений и диалог экскурсии оба
+     aria-modal="true", и если тур уже открыт (например, кнопка объяснений в
+     самом диалоге экскурсии или где-то позади него всё ещё доступна), нельзя
+     открыть попап поверх/рядом с ним — ассистивные технологии увидят два
+     модальных слоя разом. closeTour() безопасна к вызову даже когда тур не
+     открыт (просто скрывает уже скрытый диалог) и сама возвращает фокус на
+     PV.tour.opener — но это возвращение мгновенно, а строка ниже уже
+     переставляет фокус на #pv-help-close, так что итоговый фокус и
+     PV.help.opener всегда относятся к ЭТОМУ (открываемому) попапу. */
+  closeTour();
+  var pop = $("pv-help-pop");
+  $("pv-help-title").textContent = t.title;
+  $("pv-help-text").textContent = t.text;
+  pop.hidden = false;
+  PV.help.open = true;
+  PV.help.opener = opener || null;
+  if (opener && opener.getBoundingClientRect && window.innerWidth > 390) {
+    var r = opener.getBoundingClientRect();
+    pop.style.top = Math.round(r.bottom + 8 + window.scrollY) + "px";
+    var left = Math.round(r.left + window.scrollX);
+    var maxLeft = window.innerWidth - 360 - 12;
+    pop.style.left = Math.max(12, Math.min(left, maxLeft)) + "px";
+  } else {
+    pop.style.top = ""; pop.style.left = "";
+  }
+  if (opener) opener.setAttribute("aria-pressed", "true");
+  if (opener) opener.setAttribute("aria-expanded", "true");
+  $("pv-help-close").focus();
+}
+
+function closeHelp() {
+  if (!PV.help.open) return;
+  PV.help.open = false;
+  $("pv-help-pop").hidden = true;
+  Array.prototype.forEach.call(document.querySelectorAll(".pv-help-btn"), function (b) {
+    b.setAttribute("aria-pressed", "false");
+    b.setAttribute("aria-expanded", "false");
+  });
+  if (PV.help.opener && PV.help.opener.focus) PV.help.opener.focus();
+  PV.help.opener = null;
+}
+
+function bindHelp() {
+  $("pv-help-toggle").addEventListener("click", function (ev) {
+    if (PV.help.open) closeHelp(); else openHelp("toggle", ev.currentTarget);
+  });
+  var tHelp = $("pv-help-turnover");
+  if (tHelp) {
+    tHelp.addEventListener("click", function (ev) {
+      if (PV.help.open) closeHelp(); else openHelp("turnover", ev.currentTarget);
+    });
+  }
+  $("pv-help-close").addEventListener("click", closeHelp);
+  /* Та же ловушка фокуса, что и в диалоге экскурсии: единственный фокусируемый
+     элемент попапа — кнопка закрытия, поэтому Tab с неё возвращается на неё же. */
+  $("pv-help-pop").addEventListener("keydown", function (ev) {
+    if (ev.key !== "Tab") return;
+    ev.preventDefault();
+    $("pv-help-close").focus();
+  });
+}
+
+function bindSearch() {
+  var el = $("pv-search");
+  if (!el) return;
+  el.addEventListener("input", function (ev) {
+    PV.search = ev.target.value || "";
+    renderTurnover();
+  });
+}
+
+function bindAll() {
+  Array.prototype.forEach.call(document.querySelectorAll("[data-go]"), function (b) {
+    b.addEventListener("click", function () {
+      goto(PV.step + (b.getAttribute("data-go") === "next" ? 1 : -1));
+    });
+  });
+  /* «Пропустить» — отдельная кнопка (не второй data-go="next"), иначе селектор
+     «первая кнопка next на шаге», которым водит тест обычного перехода,
+     ловил бы её вместо «Дальше». Действие то же самое — goto(next) — но это
+     осознанный выбор пропустить вопрос, а не тот же клик под другим именем. */
+  Array.prototype.forEach.call(document.querySelectorAll("[data-skip]"), function (b) {
+    b.addEventListener("click", function () { goto(PV.step + 1); });
+  });
+  bindHorizon();
+  bindDiscDraft();
+  bindTourKeys();
+  bindHelp();
+  bindSearch();
+  window.addEventListener("resize", updateScrollHint);
+
+  $("pv-demo-btn").addEventListener("click", function () {
+    setBoardMode(PV.board.mode === "demo" ? "live" : "demo");
+  });
+  $("pv-money-btn").addEventListener("click", function () { setMoney(!PV.showMoney); });
+  $("pv-more-toggle").addEventListener("click", function () {
+    var body = $("pv-more-body");
+    var open = !body.classList.contains("is-open");
+    body.classList.toggle("is-open", open);
+    $("pv-more-toggle").setAttribute("aria-expanded", open ? "true" : "false");
+  });
+  $("pv-tour-start").addEventListener("click", function (ev) { openTour(ev.currentTarget); });
+  $("pv-tour-replay").addEventListener("click", function (ev) {
+    PV.tour.i = 0;
+    openTour(ev.currentTarget);
+    if (PV.hero) renderTour();
+  });
+  $("pv-tour-prev").addEventListener("click", function () { tourGo(-1); });
+  $("pv-tour-next").addEventListener("click", function () { tourGo(1); });
+  $("pv-tour-close").addEventListener("click", closeTour);
+
+  document.addEventListener("keydown", function (ev) {
+    if (ev.key === "Escape") {
+      /* Порядок разбора Escape: сначала то, что «поверх». Попап объяснений и
+         диалог экскурсии — модальные слои, они важнее идущей демонстрации,
+         демонстрация важнее ничего. */
+      if (PV.help.open) { ev.preventDefault(); closeHelp(); return; }
+      if (PV.tour.open) { ev.preventDefault(); closeTour(); return; }
+      if (PV.board.mode === "demo") { ev.preventDefault(); setBoardMode("live"); return; }
+      $("pv-exit").focus();
+      return;
+    }
+    if (ev.key === "?" && !PV.tour.open && STEPS[PV.step] === "turnover") {
+      var tag = (ev.target && ev.target.tagName) || "";
+      if (tag === "INPUT" || tag === "TEXTAREA") return;
+      ev.preventDefault();
+      PV.tour.i = 0;
+      openTour($("pv-tour-replay"));
+      if (PV.hero) renderTour();
+    }
+  });
+}
+
+/* Явные слова для четырёх разных причин отказа. Общее «не удалось прочитать»
+   для 401, 409 и офлайна маскировало бы то, что человеку нужно сделать
+   дальше, — а «дальше» в каждом случае своё, и это не переподключение само
+   собой: предпросмотр ничего не повторяет автоматически. */
+function errMessage(e) {
+  if (e && e.offline) {
+    return "нет соединения с сервером (офлайн). Само оно не переподключится — " +
+           "обновите страницу вручную, когда соединение вернётся.";
+  }
+  if (e && e.status === 401) {
+    return "сессия истекла (HTTP 401) — эта вкладка предпросмотра больше не " +
+           "авторизована. Обновите страницу и войдите заново.";
+  }
+  if (e && e.status === 409) {
+    return "конфликт состояния синхронизации (HTTP 409) — исходные данные " +
+           "меняются прямо сейчас. Обновите страницу через минуту.";
+  }
+  return String(e && e.message ? e.message : e);
+}
+
+function load() {
+  var jobs = [
+    ["settings", "/api/settings"],
+    ["progress", "/api/sync/progress"],
+    ["turnover", "/api/turnover"],
+    ["rule", "/api/discount-rule"],
+    ["overrides", "/api/discount-overrides"]
+  ];
+  return Promise.all(jobs.map(function (j) {
+    return getJSON(j[1]).then(
+      function (d) { PV.data[j[0]] = d; },
+      /* Ошибку не глотаем и не подменяем выдуманными данными: экран, который
+         не смог прочитать факт, обязан сказать об этом словами — и словами
+         разными для 401, 409 и офлайна (см. errMessage). */
+      function (e) { PV.errors[j[0]] = errMessage(e); }
+    );
+  })).then(function () {
+    renderWarehouses();
+    renderHorizon();
+    renderDiscDraft();
+    renderBT();
+    renderGroups();
+    renderBoard();
+    renderPrelim();
+    renderAttn();
+    renderTurnover();
+    updateScrollHint();
+    PV.ready = true;
+    document.body.setAttribute("data-pv-ready", "1");
+  });
+}
+
+buildRail();
+bindAll();
+goto(0);
+setMoney(false);
+load();
+
+})();
+</script>
+</body>
+</html>
