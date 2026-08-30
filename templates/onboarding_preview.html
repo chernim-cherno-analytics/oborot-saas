@@ -769,7 +769,7 @@ table.pv-t tbody tr.pv-hero{outline:2px solid var(--pv-blue);outline-offset:-2px
   <section class="pv-step" data-step="loader" aria-labelledby="pv-h-loader">
     <div class="pv-kicker">Шаг 7 · загрузка данных</div>
     <h2 id="pv-h-loader" tabindex="-1">Как «Оборот» собирает вашу матрицу</h2>
-    <p class="pv-lead">Первые данные появятся скоро, а вся история продолжит грузиться в фоне.</p>
+    <p class="pv-lead" id="pv-loader-lead">Здесь показано состояние загрузки ваших данных.</p>
 
     <div id="pv-board" data-mode="live">
       <p class="pv-mainstatus" id="pv-mainstatus" role="status" aria-live="polite"></p>
@@ -1461,6 +1461,18 @@ function renderBoard() {
     closeNote.textContent = (!demo && p && p.state === "running")
       ? "Можно закрыть вкладку или перезагрузить страницу — загрузка продолжится сама."
       : "Можно закрыть вкладку или перезагрузить страницу.";
+  }
+  /* Та же дисциплина, что и у нижней заметки: «появятся скоро» и «продолжит
+     грузиться в фоне» — обещание активного процесса, а не факт вообще.
+     Только пока синк реально идёт (p.state==="running"), эти слова правдивы;
+     во всех остальных состояниях (idle, done, ошибка, данных ещё нет)
+     заголовок остаётся нейтральным описанием того, что показано ниже, без
+     обещания движения, которого в эту секунду нет. */
+  var loaderLead = $("pv-loader-lead");
+  if (loaderLead) {
+    loaderLead.textContent = (!demo && p && p.state === "running")
+      ? "Первые данные появятся скоро, а вся история продолжит грузиться в фоне."
+      : "Здесь показано состояние загрузки ваших данных.";
   }
 
   if (!demo && !p) {

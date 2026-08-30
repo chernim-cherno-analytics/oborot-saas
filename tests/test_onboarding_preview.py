@@ -1404,6 +1404,17 @@ def part_loader_idle_partial(browser, cookies) -> None:
           "(движения, которое можно было бы продолжить, сейчас нет)",
           "продолжится сама" not in close_note_idle, close_note_idle)
 
+    # Статический раньше текст-заголовок #pv-loader-lead обещал «появятся
+    # скоро» и «продолжит грузиться в фоне» БЕЗУСЛОВНО — на этом самом экране
+    # одновременно с #pv-mainstatus, честно говорящим «Загрузка сейчас не
+    # идёт». idle обязан видеть нейтральный заголовок без обещания
+    # продолжения/скорого появления.
+    loader_lead_idle = page.inner_text("#pv-loader-lead") or ""
+    check("idle: вводный текст доски НЕ обещает «появятся скоро»/продолжение "
+          "в фоне — на этом же экране правда в том, что загрузка не идёт",
+          "скоро" not in loader_lead_idle and "фоне" not in loader_lead_idle
+          and "продолжит" not in loader_lead_idle, loader_lead_idle)
+
     # Матрица построена из /api/turnover, который в этом сценарии реально
     # прочитался (замокан только /api/sync/progress) — карточка обязана
     # согласованно сказать «готово», а не молчать пустым nofield-плейсхолдером.
@@ -1433,6 +1444,60 @@ def part_loader_idle_partial(browser, cookies) -> None:
           all(r["right"] == "ожидает" for r in todo_human), str(todo_human))
 
     ctx.close()
+
+    # Контрольная ветка: то же самое частичное покрытие (400/730), но синк
+    # РЕАЛЬНО идёт (state=running). Здесь и «Загружаем»/спиннер/ETA, и
+    # «появятся скоро»/«продолжит в фоне», и «продолжится сама» — обязаны
+    # вернуться, потому что теперь они правда. Без этой ветки правка пункта 1
+    # могла бы тайно превратить заголовки в вечно нейтральные и потерять
+    # честное «идёт прямо сейчас».
+    ctx3 = browser.new_context(viewport={"width": 1440, "height": 900})
+    ctx3.add_cookies([{"name": k, "value": v, "domain": "127.0.0.1", "path": "/"}
+                      for k, v in cookies.items()])
+    page3 = ctx3.new_page()
+    page3.route("**/api/sync/progress", lambda route: route.fulfill(
+        status=200, content_type="application/json",
+        body='{"state":"running","mode":"initial","phase":"","progress_pct":55,'
+             '"detail":"","error":"","error_cause":"","coverage_days":400,'
+             '"history_days":730,"window_days":30,"months":[],'
+             '"stages":[{"key":"products","title":"Товары и цены","state":"done",'
+             '"seconds":3,"counts":{"products_total":40}},'
+             '{"key":"today","title":"Остатки на сегодня","state":"done",'
+             '"seconds":2,"counts":{"warehouses":3}},'
+             '{"key":"month","title":"Продажи","state":"done","seconds":4,"counts":{}},'
+             '{"key":"history","title":"История","state":"running","seconds":null}],'
+             '"eta_sec":120,"started_at":null,"finished_at":null}'))
+    page3.goto(f"{BASE}{PREVIEW_URL}")
+    wait_ready(page3)
+    for _ in range(6):
+        page3.click(".pv-step.is-on [data-go='next']")
+        page3.wait_for_timeout(80)
+    page3.wait_for_selector("[data-step='loader'].is-on")
+
+    mainstatus_running = page3.inner_text("#pv-mainstatus") or ""
+    check("контроль (running): заголовок статуса честно говорит «Загружаем» "
+          "с числами покрытия",
+          "Загружаем" in mainstatus_running and "400" in mainstatus_running
+          and "730" in mainstatus_running, mainstatus_running)
+    spin_running = pv(page3, "!!document.querySelector('#pv-mainstatus .pv-spin')")
+    check("контроль (running): спиннер включён — процесс правда идёт",
+          spin_running)
+    close_note_running = page3.inner_text("#pv-close-note") or ""
+    check("контроль (running): нижняя строка обещает продолжение — это правда",
+          "продолжится сама" in close_note_running, close_note_running)
+    loader_lead_running = page3.inner_text("#pv-loader-lead") or ""
+    check("контроль (running): вводный текст доски обещает «появятся скоро» "
+          "и продолжение в фоне — на этом экране это правда",
+          "скоро" in loader_lead_running and "фоне" in loader_lead_running,
+          loader_lead_running)
+    conn_right_running = pv(page3, "(() => { const li = document.querySelector("
+                                   "'#pv-stages .pv-stage[data-key=\"connection\"]');"
+                                   " return li ? li.querySelector('.pv-stage-right')"
+                                   ".textContent.trim() : null; })()")
+    check("контроль (running): «Данные источника» говорит «получаем» "
+          "(процесс правда идёт сейчас)",
+          conn_right_running == "получаем", str(conn_right_running))
+    ctx3.close()
 
 
 def part_loader_matrix_truth(browser, cookies) -> None:
