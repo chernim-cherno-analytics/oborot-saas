@@ -1063,6 +1063,14 @@ function buildRail() {
 
 function goto(i) {
   if (i < 0 || i >= STEPS.length) return;
+  /* Симметрично уже существующему closeTour() ниже: попап объяснений —
+     тоже aria-modal="true" поверх содержимого шага. Смена шага меняла
+     видимый контент и переставляла фокус на заголовок НОВОГО шага, пока
+     попап оставался открытым (и видимым) позади — фокус и модальный слой
+     переставали относиться друг к другу, а Escape потом искал бы уже
+     скрытый (сменой шага) opener попапа. closeHelp() сама проверяет
+     PV.help.open, так что безопасна к вызову и когда попап не открыт. */
+  closeHelp();
   PV.step = i;
   var key = STEPS[i];
   Array.prototype.forEach.call(document.querySelectorAll(".pv-step"), function (s) {

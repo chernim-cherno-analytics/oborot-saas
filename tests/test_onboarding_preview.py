@@ -2028,6 +2028,42 @@ def part_status_empty_stages_and_modal(browser, cookies) -> None:
           pv(page6, "document.activeElement && document.activeElement.id") == "pv-help-turnover")
     ctx6.close()
 
+    print("\n== §5 Смена шага (рейл-точка) закрывает открытый попап объяснений ==")
+    # goto() уже гасил открытый тур при смене шага (closeTour() выше), но не
+    # попап объяснений: клик по рейл-точке менял видимый контент и уводил
+    # фокус на заголовок НОВОГО шага, пока попап оставался открытым и
+    # видимым позади — aria-modal слой и активный шаг переставали
+    # соответствовать друг другу.
+    ctx7, page7 = open_loader(browser)
+    goto_loader(page7)
+    page7.click(".pv-step.is-on [data-go='next']")
+    page7.wait_for_selector("[data-step='turnover'].is-on")
+    page7.click("#pv-help-turnover")
+    page7.wait_for_timeout(150)
+    check("попап объяснений открыт (подготовка сценария)",
+          not pv(page7, "document.getElementById('pv-help-pop').hidden"))
+    # Рейл-точка «Склады» (индекс 1) — настоящий переход шага, а не prev/next.
+    page7.click(".pv-dot[data-i='1']")
+    page7.wait_for_selector("[data-step='warehouses'].is-on")
+    page7.wait_for_timeout(150)
+    check("переход по рейл-точке закрывает попап объяснений (сам попап скрыт)",
+          pv(page7, "document.getElementById('pv-help-pop').hidden"))
+    check("попап объяснений больше не в состоянии «открыт» (PV.help.open=false)",
+          not pv(page7, "window.__PV__.help.open"))
+    check("активен именно целевой шаг «Склады», а не прежний «Оборачиваемость»",
+          pv(page7, "document.querySelector('.pv-step.is-on').getAttribute('data-step')")
+          == "warehouses")
+    check("фокус — на заголовке НОВОГО шага (обычный контракт goto()), не "
+          "оставлен в попапе или где-то ещё",
+          pv(page7, "document.activeElement && document.activeElement.id") == "pv-h-warehouses")
+    page7.keyboard.press("Escape")
+    page7.wait_for_timeout(150)
+    check("Escape после смены шага НЕ восстанавливает фокус на устаревший "
+          "(скрытый сменой шага) opener попапа — уходит на обычный fallback "
+          "(#pv-exit), как и без открытого диалога вовсе",
+          pv(page7, "document.activeElement && document.activeElement.id") == "pv-exit")
+    ctx7.close()
+
 
 def part_responsive(browser, cookies) -> None:
     print("\n== §4 Адаптив: 1440x900, 1024x768, 390x844 ==")
