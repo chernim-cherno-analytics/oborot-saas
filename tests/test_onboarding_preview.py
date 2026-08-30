@@ -1236,9 +1236,24 @@ def part_synthetic_contracts(browser, cookies, template_turnover: dict) -> None:
                       low_data=False)
     item_upstream_archived = mk("§5 Архив МойСклад", hidden=False, archived=True,
                                  group="rank", low_data=False)
+    # Канонический _live_items() (app/analytics.py) исключает и hidden, и
+    # archived разом; сводка «на что обратить внимание» — агрегат того же
+    # рода, что и серверный дашборд, и обязана исключать archived точно так
+    # же, а не только hidden (как это осознанно делает разбивка таблицы).
+    # Все три поля-триггера сводки выставлены явно, чтобы позиция считалась
+    # бы во ВСЕХ трёх корзинах сразу, если бы фильтр молча пропустил её.
+    item_archived_weak = mk("§5 Архив слабый", hidden=False, archived=True,
+                             group="rank", low_data=True, cls="weak", below_cost=True)
 
     payload = copy.deepcopy(template_turnover)
-    payload["items"] = [item_pct, item_returns, item_zero, item_hidden, item_upstream_archived]
+    # Порядок здесь не косметика: без исключения archived кандидаты героя
+    # (rank && !low_data && !hidden, старая логика) — [pct, returns,
+    # archived, zero], их 4, «середина» floor(4/2)=2 — ИМЕННО archived. С
+    # исключением archived кандидаты — [pct, returns, zero], их 3, середина
+    # — returns. Расположение специально подобрано так, чтобы тест ловил
+    # регрессию, а не совпадал по случайному индексу.
+    payload["items"] = [item_pct, item_returns, item_upstream_archived, item_zero,
+                         item_hidden, item_archived_weak]
     payload["below_cost"] = dict(payload.get("below_cost") or {})
     payload["below_cost"]["positions"] = 3
     # app/analytics.money_totals() исключает no_cost-позиции из gross_margin
@@ -1274,17 +1289,58 @@ def part_synthetic_contracts(browser, cookies, template_turnover: dict) -> None:
     check("маржа 0.4 показана как 40 %, а не 0 %",
           "40 %" in row_text_money, row_text_money[:400])
 
+    print("== §5 Сводка «на что обратить внимание»: исключает archived, как _live_items ==")
+    live_no_archived = [it for it in payload["items"] if not it["hidden"] and not it["archived"]]
+    exp_weak_s = sum(1 for it in live_no_archived if it["cls"] == "weak")
+    exp_below_s = sum(1 for it in live_no_archived if it.get("below_cost"))
+    exp_lowdata_s = sum(1 for it in live_no_archived if it.get("low_data"))
+    attn_numbers_s = pv(page, "Array.from(document.querySelectorAll('#pv-attn .pv-attn-item b'))"
+                              ".map(el => el.textContent.trim())")
+    check("сводка исключает archived=true позицию из подсчёта (не только hidden) — "
+          "числа сходятся с фильтром !hidden && !archived, а не только !hidden",
+          attn_numbers_s[:3] == [str(exp_weak_s), str(exp_below_s), str(exp_lowdata_s)],
+          f"{attn_numbers_s[:3]} vs {[exp_weak_s, exp_below_s, exp_lowdata_s]} "
+          f"(с archived числа были бы больше)")
+
+    print("== §5 Герой экскурсии не выбирается из upstream archived ==")
+    # Порядок массива подобран так (см. комментарий у payload["items"] выше),
+    # что «средний» кандидат ПО СТАРОЙ логике (без исключения archived) —
+    # именно archived-позиция. Прямая проверка не «не archived» (это прошло
+    # бы и по счастливой случайности), а конкретное ожидаемое/неожидаемое
+    # имя — тест ловит регрессию, а не просто «что-то другое».
+    hero_name = pv(page, "window.__PV__.hero && window.__PV__.hero.base_name")
+    check("герой экскурсии — «§5 Возвраты» (середина кандидатов БЕЗ archived), "
+          "не «§5 Архив МойСклад» (была бы середина, если бы archived не "
+          "исключался)",
+          hero_name == "§5 Возвраты", str(hero_name))
+
     print("== §5 Ниже себестоимости: below_cost.positions, а не отсутствующее .count ==")
     loss_text = page.inner_text("#pv-loss") or ""
     check("алерт называет 3 позиции — ровно below_cost.positions из ответа ручки",
           "3" in loss_text and "позици" in loss_text, loss_text[:200])
 
-    print("== §5 Валовая маржа: qualification при no_cost_positions>0 ==")
+    print("== §5 Валовая маржа и заморожено: qualification при no_cost_positions>0 ==")
     money_text = page.inner_text("#pv-money") or ""
     check("при no_cost_positions>0 сумма валовой маржи явно оговорена "
           "(только позиции с себестоимостью — 3 из 5, ровно positions-no_cost_positions/positions)",
           "только позиции с себестоимостью" in money_text
           and "3 из 5" in money_text, money_text[:300])
+    # app/analytics.money_totals(): stock_cost считается только по with_cost
+    # (без no_cost-позиций) — той же оговорки требует и «Заморожено по
+    # себестоимости», а не только «Валовая маржа за год». Раздельные
+    # проверки по каждой плитке — общий текст #pv-money мог совпасть просто
+    # потому, что нужная фраза стоит где-то ещё на экране.
+    tiles = pv(page, "Array.from(document.querySelectorAll('#pv-money .pv-tile'))"
+                     ".map(t => t.textContent)")
+    frozen_tile = next((t for t in tiles if "Заморожено по себестоимости" in t), "")
+    sale_tile = next((t for t in tiles if "Если продать" in t), "")
+    check("«Заморожено по себестоимости» тоже явно оговорена (та же qualification, "
+          "не только у валовой маржи)",
+          "только позиции с себестоимостью" in frozen_tile and "3 из 5" in frozen_tile,
+          frozen_tile[:200])
+    check("«Если продать» (stock_sale, считается по ВСЕМ позициям) НЕ несёт "
+          "эту оговорку — она была бы неверна для этой суммы",
+          "только позиции с себестоимостью" not in sale_tile, sale_tile[:200])
 
     page.click("#pv-money-btn")
     page.wait_for_timeout(150)
@@ -1574,6 +1630,122 @@ def part_loader_matrix_truth(browser, cookies) -> None:
     check("контроль: синк завершён И турновер читается нормально — «Матрица готова» на месте",
           "Матрица готова" in mainstatus2, mainstatus2)
     ctx2.close()
+
+
+def part_status_empty_stages_and_modal(browser, cookies) -> None:
+    """Пять P1/P2 из независимого exact-HEAD ревью: пустой stages[] и два модальных слоя разом.
+
+    1) state=done + пустой stages[] (например, инкрементальный синк не
+       отдаёт детализацию по этапам) не должен выглядеть как «1 из 4
+       готово» со спиннером — верхнеуровневый done сам по себе достаточное
+       доказательство завершения.
+    2) state=idle с coverage_days=0 и с coverage_days>=history_days (оба —
+       при пустом stages[]) не должны падать в «Собираем данные» со
+       спиннером — idle никогда не обещает активную загрузку, ни при каком
+       покрытии.
+    5) Попап объяснений и диалог экскурсии — оба aria-modal="true": открытие
+       тура при открытом попапе обязано сначала закрыть попап.
+    """
+    def mock_progress(page, state, coverage_days, history_days, extra=""):
+        page.route("**/api/sync/progress", lambda route: route.fulfill(
+            status=200, content_type="application/json",
+            body='{"state":"' + state + '","mode":"incremental","phase":"",'
+                 '"progress_pct":0,"detail":"","error":"","error_cause":"",'
+                 '"coverage_days":' + str(coverage_days) + ',' +
+                 '"history_days":' + str(history_days) + ',"window_days":30,'
+                 '"months":[],"stages":[],"eta_sec":null,"started_at":null,'
+                 '"finished_at":null}'))
+
+    def open_loader(pw_browser):
+        ctx = pw_browser.new_context(viewport={"width": 1440, "height": 900})
+        ctx.add_cookies([{"name": k, "value": v, "domain": "127.0.0.1", "path": "/"}
+                         for k, v in cookies.items()])
+        page = ctx.new_page()
+        return ctx, page
+
+    def goto_loader(page):
+        page.goto(f"{BASE}{PREVIEW_URL}")
+        wait_ready(page)
+        for _ in range(6):
+            page.click(".pv-step.is-on [data-go='next']")
+            page.wait_for_timeout(80)
+        page.wait_for_selector("[data-step='loader'].is-on")
+
+    print("\n== §5 state=done + пустой stages[]: не «1 из 4», без спиннера ==")
+    ctx1, page1 = open_loader(browser)
+    mock_progress(page1, "done", 730, 730)
+    goto_loader(page1)
+    mainstatus_done_empty = page1.inner_text("#pv-mainstatus") or ""
+    check("done + пустой stages[]: заголовок НЕ говорит «Собираем данные»",
+          "Собираем данные" not in mainstatus_done_empty, mainstatus_done_empty)
+    check("done + пустой stages[]: заголовок НЕ говорит «N из 4 готово» "
+          "(псевдо-pending при на деле завершённом синке)",
+          "из 4 готово" not in mainstatus_done_empty, mainstatus_done_empty)
+    spin_done_empty = pv(page1, "!!document.querySelector('#pv-mainstatus .pv-spin')")
+    check("done + пустой stages[]: спиннер выключен — верхнеуровневый done "
+          "уже достаточное доказательство завершения",
+          not spin_done_empty)
+    check("done + пустой stages[]: вместо этого — правда про матрицу "
+          "(готова или недоступна, но не «в процессе»)",
+          "Матрица готова" in mainstatus_done_empty
+          or "Матрица недоступна" in mainstatus_done_empty,
+          mainstatus_done_empty)
+    ctx1.close()
+
+    print("\n== §5 state=idle + coverage=0 + пустой stages[]: без спиннера/«Собираем» ==")
+    ctx2, page2 = open_loader(browser)
+    mock_progress(page2, "idle", 0, 730)
+    goto_loader(page2)
+    mainstatus_idle_zero = page2.inner_text("#pv-mainstatus") or ""
+    check("idle + coverage=0: заголовок НЕ говорит «Собираем данные»/«Загружаем»",
+          "Собираем данные" not in mainstatus_idle_zero
+          and "Загружаем" not in mainstatus_idle_zero, mainstatus_idle_zero)
+    check("idle + coverage=0: явно сказано, что загрузка сейчас не идёт",
+          "не идёт" in mainstatus_idle_zero, mainstatus_idle_zero)
+    spin_idle_zero = pv(page2, "!!document.querySelector('#pv-mainstatus .pv-spin')")
+    check("idle + coverage=0: спиннер выключен", not spin_idle_zero)
+    ctx2.close()
+
+    print("\n== §5 state=idle + coverage=history_days (полная) + пустой stages[]: без спиннера/«Собираем» ==")
+    ctx3, page3 = open_loader(browser)
+    mock_progress(page3, "idle", 730, 730)
+    goto_loader(page3)
+    mainstatus_idle_full = page3.inner_text("#pv-mainstatus") or ""
+    check("idle + полное покрытие: заголовок НЕ говорит «Собираем данные»/«Загружаем»",
+          "Собираем данные" not in mainstatus_idle_full
+          and "Загружаем" not in mainstatus_idle_full, mainstatus_idle_full)
+    check("idle + полное покрытие: явно сказано, что загрузка сейчас не идёт",
+          "не идёт" in mainstatus_idle_full, mainstatus_idle_full)
+    check("idle + полное покрытие: числа покрытия названы (730)",
+          "730" in mainstatus_idle_full, mainstatus_idle_full)
+    spin_idle_full = pv(page3, "!!document.querySelector('#pv-mainstatus .pv-spin')")
+    check("idle + полное покрытие: спиннер выключен", not spin_idle_full)
+    ctx3.close()
+
+    print("\n== §5 Тур закрывает попап объяснений — не два aria-modal разом ==")
+    ctx5, page5 = open_loader(browser)
+    goto_loader(page5)
+    page5.click(".pv-step.is-on [data-go='next']")
+    page5.wait_for_selector("[data-step='turnover'].is-on")
+    page5.click("#pv-help-turnover")
+    page5.wait_for_timeout(150)
+    check("попап объяснений открыт (подготовка сценария)",
+          not pv(page5, "document.getElementById('pv-help-pop').hidden"))
+    page5.click("#pv-tour-start")
+    page5.wait_for_selector("#pv-tour:not([hidden])")
+    check("открытие тура при открытом попапе объяснений сначала закрывает попап "
+          "(не два aria-modal одновременно)",
+          pv(page5, "document.getElementById('pv-help-pop').hidden"))
+    check("попап объяснений больше не в состоянии «открыт» (PV.help.open=false)",
+          not pv(page5, "window.__PV__.help.open"))
+    check("фокус — в диалоге экскурсии (заголовок тура), не в попапе объяснений",
+          pv(page5, "document.activeElement && document.activeElement.id") == "pv-tour-title")
+    page5.keyboard.press("Escape")
+    page5.wait_for_timeout(150)
+    check("Escape после закрытия тура возвращает фокус на opener ТУРА "
+          "(#pv-tour-start), а не на кнопку объяснений",
+          pv(page5, "document.activeElement && document.activeElement.id") == "pv-tour-start")
+    ctx5.close()
 
 
 def part_responsive(browser, cookies) -> None:
@@ -1889,6 +2061,8 @@ def run() -> int:
                                       out["turnover"])
             part_loader_idle_partial(out["browser"], {k: v for k, v in owner.cookies.items()})
             part_loader_matrix_truth(out["browser"], {k: v for k, v in owner.cookies.items()})
+            part_status_empty_stages_and_modal(out["browser"],
+                                                {k: v for k, v in owner.cookies.items()})
             part_responsive(out["browser"], {k: v for k, v in owner.cookies.items()})
         finally:
             out["browser"].close()
