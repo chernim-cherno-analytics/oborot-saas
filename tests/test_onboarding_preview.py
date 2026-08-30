@@ -410,6 +410,17 @@ def part_browser(pw, cookies, owner: httpx.Client, snap_before: dict) -> dict:
           len(welcome_lead.split()) <= 40, f"{len(welcome_lead.split())} слов: {welcome_lead}")
     check("видимый текст приветствия не содержит сырых путей ручек",
           "GET /api" not in (page.inner_text("[data-step='welcome']") or ""))
+    # «Минута» разрешена ТОЛЬКО применительно к вопросам (реальный факт: 5
+    # коротких вопросов). Полная история за 730 дней в проде занимает ~22
+    # минуты, поэтому «минута» рядом со словами «матрица»/«данные»/«история»
+    # была бы конкретным ложным обещанием готовности, а не честной оценкой.
+    check("«минута» привязана дословно к вопросам, а не к готовности матрицы",
+          "На вопросы уйдёт около минуты" in welcome_lead, welcome_lead)
+    check("«минута» НЕ соседствует с обещанием готовых данных/матрицы/истории",
+          not any(bad in welcome_lead for bad in
+                  ("матрицу — на всё", "данные — на", "историю — на",
+                   "готова через минуту", "данные появятся через минуту")),
+          welcome_lead)
     check("ровно одно заметное уведомление «ответы не сохраняются» на экране",
           "Предпросмотр — ответы не сохраняются" in
           (page.inner_text("[data-step='welcome']") or ""))
@@ -431,6 +442,24 @@ def part_browser(pw, cookies, owner: httpx.Client, snap_before: dict) -> dict:
     focused = pv(page, "document.activeElement && document.activeElement.id")
     check("после перехода фокус уходит на заголовок нового шага",
           focused == "pv-h-warehouses", str(focused))
+
+    print("\n== §3 Программный фокус заголовка: без гигантского синего контура ==")
+    heading_outline = page.evaluate(
+        "() => getComputedStyle(document.getElementById('pv-h-warehouses')).outlineStyle")
+    check("у программно сфокусированного заголовка шага контур выключен "
+          "(outline-style: none)",
+          heading_outline == "none", heading_outline)
+    # page.focus() — программный вызов, как и у заголовка: Chromium применяет
+    # :focus-visible к нему по другой эвристике, чем к настоящему Tab с
+    # клавиатуры (для «кликабельных» элементов вроде <button> программный
+    # фокус его иногда не показывает вовсе). Настоящая клавиатурная
+    # навигация — единственный источник истины для этой проверки.
+    page.keyboard.press("Tab")
+    active_tag = page.evaluate("() => document.activeElement && document.activeElement.tagName")
+    btn_outline = page.evaluate(
+        "() => getComputedStyle(document.activeElement).outlineStyle")
+    check("а настоящий Tab с клавиатуры на интерактивный элемент кольцо не теряет",
+          btn_outline == "solid", f"{active_tag}: {btn_outline}")
 
     print("\n== §3 Склады: только чтение текущего состояния ==")
     wh_names = pv(page, "Array.from(document.querySelectorAll('#pv-wh li'))"
@@ -526,7 +555,8 @@ def part_browser(pw, cookies, owner: httpx.Client, snap_before: dict) -> dict:
         status=200, content_type="application/json",
         body='{"state":"done","mode":"initial","phase":"","progress_pct":100,'
              '"detail":"","error":"","error_cause":"","coverage_days":730,'
-             '"history_days":730,"window_days":30,"months":[],'
+             '"history_days":730,"window_days":30,'
+             '"months":[{"ym":"2026-08","state":"done"},{"ym":"2026-07","state":"done"}],'
              '"stages":[{"key":"products","title":"Товары и цены","state":"done",'
              '"seconds":3,"counts":{"products_total":40}},'
              '{"key":"today","title":"Остатки на сегодня","state":"done",'
@@ -565,6 +595,16 @@ def part_browser(pw, cookies, owner: httpx.Client, snap_before: dict) -> dict:
     page.click("[data-step='groups'] [data-go='next']")
     page.wait_for_selector("[data-step='loader'].is-on")
 
+    print("\n== §3 Загрузка: правда о времени, не «меньше минуты» ==")
+    loader_lead = (page.inner_text("[data-step='loader'] .pv-lead") or "").strip()
+    check("вступление не обещает конкретный (и заведомо неверный) срок",
+          "меньше минуты" not in loader_lead and "минуту" not in loader_lead,
+          loader_lead)
+    check("демо-кнопка называется по-человечески «Посмотреть, как проходит "
+          "загрузка», а не «демонстрацию хода»",
+          "Посмотреть, как проходит загрузка" in
+          (page.inner_text("#pv-demo-btn") or ""))
+
     keys = pv(page, "Array.from(document.querySelectorAll('#pv-stages .pv-stage'))"
                     ".map(s => s.getAttribute('data-key'))")
     check("пять спокойных смысловых этапов в объявленном порядке (было восемь)",
@@ -587,6 +627,32 @@ def part_browser(pw, cookies, owner: httpx.Client, snap_before: dict) -> dict:
     check("сырые имена полей контракта не видны в первом прочтении доски "
           "(свёрнуты в технические детали)",
           "coverage_days" not in board and "progress_pct" not in board, board[:200])
+    check("сырое состояние contract (idle и т.п.) не показано как есть — "
+          "только человеческое слово",
+          "idle" not in board, board[:300])
+    check("жаргон «нет поля» не виден в первом прочтении",
+          "нет поля" not in board, board[:300])
+    check("помесячная диагностическая сетка (2026-08 и т.п.) не в первом "
+          "прочтении доски",
+          not pv(page, "!!document.querySelector('#pv-stages .pv-month')"))
+    right_texts = pv(page, "Array.from(document.querySelectorAll("
+                          "'#pv-stages .pv-stage-right')).map(el => el.textContent.trim())")
+    # Явный запрет по каждой карточке отдельно (не только «нет ни одного» —
+    # какая именно карточка нарушает, видно сразу): ни тире, ни idle, ни «нет
+    # поля» не разрешены нигде в живом режиме. Пустая строка (сознательно
+    # опущенный статус у этапа без поля контракта) — единственное разрешённое
+    # «ничего», и то только потому, что это явный выбор, а не суррогат.
+    FORBIDDEN_RIGHT = ("—", "-", "idle", "нет поля")
+    bad_rights = [t for t in right_texts if t in FORBIDDEN_RIGHT]
+    check("ни одна правая подпись карточки не равна —/idle/«нет поля» "
+          "в живом режиме",
+          not bad_rights, f"{bad_rights} из {right_texts}")
+    check("правые подписи карточек — человеческие слова, не сырые токены контракта",
+          all(t in ("", "ожидает", "идёт", "готово", "ошибка")
+              or t.endswith("складов") or t.endswith("склада") or t.endswith("склад")
+              or t.endswith(" с") or "готово" in t or "дн." in t
+              for t in right_texts),
+          str(right_texts))
 
     print("\n== §3 Доска загрузки: технические детали свёрнуты, но доказательство цело ==")
     page.click("#pv-board details.pv-tech summary")
@@ -594,6 +660,9 @@ def part_browser(pw, cookies, owner: httpx.Client, snap_before: dict) -> dict:
     tech_foot = page.text_content("#pv-board-foot") or ""
     for field in ("coverage_days", "history_days", "progress_pct", "state", "eta_sec"):
         check(f"технические детали доски называют поле контракта {field}", field in tech_foot)
+    check("помесячная сетка доказуема в свёрнутых технических деталях "
+          "(просто переехала, не потерялась)",
+          pv(page, "document.querySelectorAll('#pv-board-foot .pv-month').length") > 0)
     nofield = pv(page, "Array.from(document.querySelectorAll("
                        "'#pv-stages .pv-stage[data-state=\"nofield\"]'))"
                        ".map(s => s.getAttribute('data-key'))")
@@ -1218,6 +1287,80 @@ OVERFLOW_JS = ("() => document.documentElement.scrollWidth - "
                "document.documentElement.clientWidth")
 
 
+def part_loader_idle_partial(browser, cookies) -> None:
+    """idle + частично загруженная история (400/730) — идле это не «нет связи».
+
+    Изолированный сценарий в своём контексте (не встроен в общий проход
+    part_browser): реалистичная синтетика — синхронизация прямо сейчас не
+    идёт (state=idle), но 400 из 730 дней истории уже загружены раньше и
+    массив stages[] пуст (сервер не отдаёт по нему детали, когда он не
+    активен). До правки idle трактовался как «подключения нет» и владелец с
+    реальными частично загруженными данными видел лживое «Подключение · 0 из
+    4 готово».
+    """
+    print("\n== §5 idle + частичная история (400/730): idle — это НЕ «нет связи» ==")
+    ctx = browser.new_context(viewport={"width": 1440, "height": 900})
+    ctx.add_cookies([{"name": k, "value": v, "domain": "127.0.0.1", "path": "/"}
+                     for k, v in cookies.items()])
+    page = ctx.new_page()
+    page.route("**/api/sync/progress", lambda route: route.fulfill(
+        status=200, content_type="application/json",
+        body='{"state":"idle","mode":"initial","phase":"","progress_pct":0,'
+             '"detail":"","error":"","error_cause":"","coverage_days":400,'
+             '"history_days":730,"window_days":30,"months":[],"stages":[],'
+             '"eta_sec":null,"started_at":null,"finished_at":null}'))
+    page.goto(f"{BASE}{PREVIEW_URL}")
+    wait_ready(page)
+    for _ in range(6):
+        page.click(".pv-step.is-on [data-go='next']")
+        page.wait_for_timeout(80)
+    page.wait_for_selector("[data-step='loader'].is-on")
+
+    conn_right = pv(page, "(() => { const li = document.querySelector("
+                          "'#pv-stages .pv-stage[data-key=\"connection\"]');"
+                          " return li ? li.querySelector('.pv-stage-right').textContent.trim()"
+                          " : null; })()")
+    check("idle + покрытие 400/730: подключение читается как «готово», а не «ожидает»",
+          conn_right == "готово", str(conn_right))
+    board_idle_txt = page.inner_text("#pv-board") or ""
+    check("сырое слово idle нигде не показано на доске",
+          "idle" not in board_idle_txt, board_idle_txt[:300])
+    mainstatus_idle = page.inner_text("#pv-mainstatus") or ""
+    check("главный статус выносит частичную историю на первый план "
+          "(400 из 730), а не «собираем: подключение»",
+          "400" in mainstatus_idle and "730" in mainstatus_idle
+          and "историю" in mainstatus_idle.lower(), mainstatus_idle)
+    check("и явно не говорит про подключение как про текущий этап",
+          "подключение" not in mainstatus_idle.lower(), mainstatus_idle)
+
+    matrix_right = pv(page, "(() => { const li = document.querySelector("
+                            "'#pv-stages .pv-stage[data-key=\"matrix\"]');"
+                            " return li ? li.querySelector('.pv-stage-right').textContent.trim()"
+                            " : null; })()")
+    check("этап без поля контракта («Матрица») не рисует тире-плейсхолдер — "
+          "пусто честнее, чем «—», которое читается как ноль/ошибка",
+          matrix_right == "", repr(matrix_right))
+
+    # Все пять карточек разом: даже когда stages[] пуст (реалистичный idle-
+    # ответ без детализации по этапам), НИ ОДНА карточка не рисует голое
+    # тире/idle/«нет поля» — «Товары и остатки», «Продажи и возвраты» и
+    # «История продаж» тоже обязаны говорить «ожидает», а не «—».
+    all_rights = pv(page, "Array.from(document.querySelectorAll("
+                          "'#pv-stages .pv-stage')).map(li => ({"
+                          " key: li.getAttribute('data-key'),"
+                          " right: li.querySelector('.pv-stage-right').textContent.trim() }))")
+    bad = [r for r in all_rights if r["right"] in ("—", "-", "idle", "нет поля")]
+    check("ни одна из пяти карточек не показывает —/idle/«нет поля», "
+          "включая «Товары и остатки»/«Продажи и возвраты»/«История продаж»",
+          not bad, str(all_rights))
+    todo_human = [r for r in all_rights if r["key"] in ("catalog", "month", "history")]
+    check("«Товары и остатки», «Продажи и возвраты», «История продаж» без "
+          "детализации stages[] говорят человеческое «ожидает»",
+          all(r["right"] == "ожидает" for r in todo_human), str(todo_human))
+
+    ctx.close()
+
+
 def part_responsive(browser, cookies) -> None:
     print("\n== §4 Адаптив: 1440x900, 1024x768, 390x844 ==")
     SHOTS_DIR.mkdir(exist_ok=True)
@@ -1250,9 +1393,17 @@ def part_responsive(browser, cookies) -> None:
                     "() => { const el = document.getElementById('pv-badge');"
                     " if (!el) return null; const r = el.getBoundingClientRect();"
                     " return { w: r.width, h: r.height, text: el.innerText.trim(),"
-                    " display: getComputedStyle(el).display }; }")
+                    " display: getComputedStyle(el).display,"
+                    " scrollW: el.scrollWidth, clientW: el.clientWidth }; }")
+                # Явная проверка на КАЖДОМ шаге (не только welcome/turnover):
+                # innerText содержит слово буквально, бокс ненулевой и достаточно
+                # широкий, и scrollWidth не превышает clientWidth — то есть текст
+                # внутри бейджа не обрезан переполнением контейнера. Прежняя
+                # проверка ловила пустой/сжатый текст, но не внутреннее
+                # переполнение конкретно на шаге «Загрузка».
                 ok = (badge and badge["display"] != "none" and badge["w"] >= 100
-                      and badge["h"] >= 20 and "ПРЕДПРОСМОТР" in badge["text"])
+                      and badge["h"] >= 20 and badge["text"] == "ПРЕДПРОСМОТР"
+                      and badge["scrollW"] <= badge["clientW"] + 1)
                 if not ok:
                     badge_fail_steps.append(f"{key}: {badge}")
         check(f"{tag}: горизонтальной прокрутки страницы нет ни на одном из "
@@ -1357,6 +1508,39 @@ def part_responsive(browser, cookies) -> None:
                   "не втиснуты в первую",
                   header_layout["actionsTop"] > header_layout["badgeTop"] + 20,
                   str(header_layout))
+
+            # Проверка ИМЕННО в момент съёмки скриншота (не раньше): читаем
+            # box/стиль отдельного текстового узла .pv-badge-text на шаге
+            # «Загрузка» — том самом шаге, где ранее сообщался визуальный
+            # дефект (голая точка вместо слова). DOM innerText сам по себе не
+            # ловит «текст присутствует, но нулевой ширины/прозрачный» — здесь
+            # проверяются раздельно текст, box и вычисленные визуальные
+            # свойства прямо перед page.screenshot().
+            loader_badge = page.evaluate(
+                "() => { const el = document.querySelector('#pv-badge .pv-badge-text');"
+                " if (!el) return null; const r = el.getBoundingClientRect();"
+                " const cs = getComputedStyle(el);"
+                " return { text: el.textContent.trim(), w: r.width, h: r.height,"
+                " color: cs.color, opacity: cs.opacity, visibility: cs.visibility,"
+                " display: cs.display }; }")
+            check("390px, шаг «Загрузка», в момент съёмки скриншота: текст бейджа "
+                  "дословно «ПРЕДПРОСМОТР»",
+                  loader_badge and loader_badge["text"] == "ПРЕДПРОСМОТР", str(loader_badge))
+            check("390px, шаг «Загрузка»: текстовый узел бейджа имеет ненулевой "
+                  "видимый box (не 0×0)",
+                  loader_badge and loader_badge["w"] > 0 and loader_badge["h"] > 0,
+                  str(loader_badge))
+            check("390px, шаг «Загрузка»: текст бейджа не прозрачный и не visibility:hidden",
+                  loader_badge and loader_badge["opacity"] == "1"
+                  and loader_badge["visibility"] == "visible"
+                  and loader_badge["display"] != "none",
+                  str(loader_badge))
+            check("390px, шаг «Загрузка»: у текста задан непустой цвет (не "
+                  "transparent/rgba(0,0,0,0))",
+                  loader_badge and loader_badge["color"]
+                  and "0, 0, 0, 0)" not in loader_badge["color"].replace(" ", ", ")
+                  and loader_badge["color"] != "transparent",
+                  str(loader_badge))
         page.screenshot(path=str(SHOTS_DIR / f"preview_{tag}_loader.png"))
         ctx.close()
     check("снимки всех трёх размеров сохранены",
@@ -1477,6 +1661,7 @@ def run() -> int:
         try:
             part_synthetic_contracts(out["browser"], {k: v for k, v in owner.cookies.items()},
                                       out["turnover"])
+            part_loader_idle_partial(out["browser"], {k: v for k, v in owner.cookies.items()})
             part_responsive(out["browser"], {k: v for k, v in owner.cookies.items()})
         finally:
             out["browser"].close()

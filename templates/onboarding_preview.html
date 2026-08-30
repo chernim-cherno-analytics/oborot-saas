@@ -85,6 +85,17 @@ p{margin:0 0 12px;}
    объявление скринридером (это чисто визуальный контур, не aria-атрибут). */
 :focus-visible{outline:2px solid var(--pv-blue);outline-offset:1px;border-radius:6px;}
 
+/* goto() переводит фокус на заголовок нового шага программно (tabindex="-1"),
+   чтобы скринридер объявил смену контента, — это не клавиатурная навигация
+   пользователя. Хромиум применяет :focus-visible и к такому программному
+   фокусу на некликабельном элементе, и вокруг всего H1/H2 на весь экран
+   рисуется то же кольцо, что и у кнопки: на большом заголовке оно читается
+   как обведённый прямоугольник во весь дизайн, а не как указание на фокус.
+   Само перемещение фокуса и его объявление остаются — гасится только контур
+   у ЭТИХ конкретных заголовков; кнопки, ссылки и поля кольцо не теряют. */
+.pv-step h1[tabindex="-1"]:focus,
+.pv-step h2[tabindex="-1"]:focus{outline:none;}
+
 /* Пропуск к содержимому: обязателен для клавиатуры, и у него тоже полноценная
    область нажатия — правило «>=44px» не знает исключений для служебных ссылок. */
 .pv-skip{
@@ -118,7 +129,14 @@ p{margin:0 0 12px;}
      390px это выедало видимый текст «ПРЕДПРОСМОТР» до одной точки. */
   flex:0 0 auto;min-width:max-content;
 }
-.pv-badge .pv-dotmark{width:8px;height:8px;border-radius:50%;background:var(--pv-amber);}
+.pv-badge .pv-dotmark{width:8px;height:8px;border-radius:50%;background:var(--pv-amber);flex:0 0 auto;}
+/* Текст бейджа — отдельный измеримый узел (не смешан с точкой-индикатором):
+   явно фиксируем цвет/видимость/непрозрачность и запрещаем перенос, чтобы
+   ни при каком стеснении по ширине строки контейнер не мог отрисовать
+   текст пустым или прозрачным — только полноценным словом или ничем. */
+.pv-badge-text{
+  color:inherit;opacity:1;visibility:visible;white-space:nowrap;flex:0 0 auto;
+}
 .pv-safe{font-size:13px;color:var(--pv-ink-2);}
 .pv-top-sp{flex:1 1 auto;}
 .pv-rail{display:flex;align-items:center;}
@@ -226,6 +244,22 @@ p{margin:0 0 12px;}
 
 /* ── Доска загрузки ──────────────────────────────────────────────────────── */
 .pv-boardhead{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:14px;}
+
+/* ── «Ещё»: вторичные действия шага «Оборачиваемость» ────────────────────────
+   На узком экране единственный очевидный CTA — «Экскурсия по строке»; повтор
+   экскурсии, денежный слой и объяснение метрики убраны под один disclosure
+   (#pv-more-toggle/#pv-more-body, управляется тем же ручным JS-паттерном, что
+   и попап объяснений — без <details>: display:contents на нём вступал в
+   конфликт с нативной видимостью содержимого закрытого <details> в части
+   рендереров и делал кнопки некликабельными даже на десктопе). На широком
+   экране кнопка «Ещё» скрыта, а панель показана как обычный тулбар всегда. */
+#pv-more-toggle{display:none;}
+.pv-more-body{display:flex;align-items:center;gap:12px;flex-wrap:wrap;}
+@media (max-width:640px){
+  #pv-more-toggle{display:inline-flex;}
+  .pv-more-body{display:none;margin-top:10px;}
+  .pv-more-body.is-open{display:flex;}
+}
 .pv-modechip{
   display:inline-flex;align-items:center;gap:8px;border-radius:999px;
   padding:6px 14px;font-size:13px;font-weight:700;
@@ -490,12 +524,22 @@ table.pv-t tbody tr.pv-hero{outline:2px solid var(--pv-blue);outline-offset:-2px
      это осознанная раскладка, а не побочный эффект переноса. */
   .pv-top-in{
     padding:8px 14px;gap:8px 10px;
-    display:grid;grid-template-columns:1fr auto;
+    display:grid;
+    /* Колонка бейджа — max-content: она не резиновая и не участвует в
+       перераспределении ширины вовсе. Колонка счётчика шага —
+       minmax(0,1fr): именно minmax(0,…), а не голое auto/1fr — это ставит
+       ЯВНУЮ нижнюю границу 0 у ВТОРОЙ колонки, поэтому нехватку места при
+       нехватке всегда поглощает она (через text-overflow ниже), а не первая
+       колонка, для которой в спецификации Grid нет такой явной защиты. */
+    grid-template-columns:max-content minmax(0,1fr);
     grid-template-areas:"badge step" "actions actions";
     align-items:center;
   }
   .pv-badge{grid-area:badge;}
-  .pv-stepcount{grid-area:step;display:block;justify-self:end;}
+  .pv-stepcount{
+    grid-area:step;display:block;justify-self:end;min-width:0;max-width:100%;
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  }
   .pv-top-actions{grid-area:actions;display:flex;gap:8px;}
   .pv-top-actions .pv-help-btn,.pv-top-actions .pv-exit{flex:1 1 0;}
   .pv-rail{display:none;}
@@ -524,7 +568,7 @@ table.pv-t tbody tr.pv-hero{outline:2px solid var(--pv-blue);outline-offset:-2px
 
 <header class="pv-top">
   <div class="pv-top-in">
-    <span class="pv-badge" id="pv-badge"><span class="pv-dotmark"></span>ПРЕДПРОСМОТР</span>
+    <span class="pv-badge" id="pv-badge"><span class="pv-dotmark"></span><span class="pv-badge-text">ПРЕДПРОСМОТР</span></span>
     <span class="pv-safe" id="pv-safe">предпросмотр, настройки не изменены</span>
     <span class="pv-top-sp"></span>
     <span class="pv-stepcount" id="pv-stepcount"></span>
@@ -556,8 +600,7 @@ table.pv-t tbody tr.pv-hero{outline:2px solid var(--pv-blue);outline-offset:-2px
     <div class="pv-kicker">Шаг 1 · знакомство</div>
     <h1 id="pv-h-welcome" tabindex="-1">Оборот помогает выстроить торговую матрицу</h1>
     <p class="pv-lead">
-      Мы подключим ваши данные, зададим несколько коротких вопросов и покажем
-      готовую матрицу — на всё уйдёт около минуты.
+      На вопросы уйдёт около минуты. Первые данные появятся по мере загрузки.
     </p>
     <div class="pv-note"><b>Предпросмотр — ответы не сохраняются.</b></div>
     <div class="pv-card">
@@ -725,13 +768,13 @@ table.pv-t tbody tr.pv-hero{outline:2px solid var(--pv-blue);outline-offset:-2px
   <section class="pv-step" data-step="loader" aria-labelledby="pv-h-loader">
     <div class="pv-kicker">Шаг 7 · загрузка данных</div>
     <h2 id="pv-h-loader" tabindex="-1">Как «Оборот» собирает вашу матрицу</h2>
-    <p class="pv-lead">Мы собираем ваши данные — обычно это занимает меньше минуты.</p>
+    <p class="pv-lead">Первые данные появятся скоро, а вся история продолжит грузиться в фоне.</p>
 
     <div id="pv-board" data-mode="live">
       <p class="pv-mainstatus" id="pv-mainstatus" role="status" aria-live="polite"></p>
       <div class="pv-boardhead">
         <span class="pv-modechip" id="pv-modechip">живые данные</span>
-        <button class="pv-btn" type="button" id="pv-demo-btn">Показать демонстрацию хода</button>
+        <button class="pv-btn" type="button" id="pv-demo-btn">Посмотреть, как проходит загрузка</button>
       </div>
       <div class="pv-demoribbon" id="pv-demoribbon">
         ДЕМОНСТРАЦИЯ. Числа ниже синтетические — придуманы только для показа
@@ -746,8 +789,14 @@ table.pv-t tbody tr.pv-hero{outline:2px solid var(--pv-blue);outline-offset:-2px
     </div>
 
     <div class="pv-note">
-      Можно закрыть вкладку или перезагрузить страницу — на настоящую загрузку
-      данных это не влияет: здесь нет ни одного запроса, кроме чтения.
+      Можно закрыть вкладку или перезагрузить страницу — загрузка продолжится сама.
+      <details class="pv-tech">
+        <summary>Технические детали</summary>
+        <div class="pv-tech-body">
+          <p>Предпросмотр не запускает, не останавливает и не перезапускает
+          синхронизацию: здесь нет ни одного запроса, кроме чтения.</p>
+        </div>
+      </details>
     </div>
 
     <div class="pv-actions">
@@ -768,10 +817,19 @@ table.pv-t tbody tr.pv-hero{outline:2px solid var(--pv-blue);outline-offset:-2px
 
     <div class="pv-boardhead">
       <button class="pv-btn primary" type="button" id="pv-tour-start">Экскурсия по строке</button>
+      <!-- На <=640px «Экскурсия по строке» — единственная видимая с первого
+           взгляда кнопка; повтор экскурсии/денежный слой/объяснение метрики
+           уходят под «Ещё» (#pv-more-toggle). На десктопе кнопка «Ещё» скрыта
+           CSS-ом, а панель всегда видна как обычный тулбар — тот же DOM, две
+           разные раскладки, без <details> (см. CSS-комментарий рядом). -->
+      <button class="pv-btn" type="button" id="pv-more-toggle" aria-expanded="false"
+              aria-controls="pv-more-body">Ещё</button>
+    </div>
+    <div class="pv-more-body" id="pv-more-body">
       <button class="pv-help" type="button" id="pv-tour-replay"
               aria-label="Повторить экскурсию" title="Повторить экскурсию (клавиша ?)">?</button>
       <button class="pv-btn" type="button" id="pv-money-btn" aria-pressed="false">
-        Показать денежный слой
+        Показать себестоимость и маржу
       </button>
       <button class="pv-help-btn" type="button" id="pv-help-turnover" aria-pressed="false"
               aria-expanded="false" aria-controls="pv-help-pop">
@@ -1262,19 +1320,36 @@ var SEM_STAGES = [
 ];
 
 function liveStageState(sem, p) {
+  /* Ни один живой правый ярлык не должен быть голым тире, «idle» или «нет
+     поля» — тире читается как «ноль/сломано», а не как «ещё не начато».
+     Везде, где данных для этапа попросту ещё нет, — человеческое «ожидает». */
   if (sem.stage) {
     var found = null;
     (p.stages || []).forEach(function (s) { if (s.key === sem.stage) found = s; });
-    if (!found) return { state: "todo", right: "—" };
-    var right = found.seconds !== null && found.seconds !== undefined
-      ? found.seconds + " с" : "";
+    if (!found) return { state: "todo", right: "ожидает" };
+    var right;
+    if (found.seconds !== null && found.seconds !== undefined) right = found.seconds + " с";
+    else if (found.state === "error") right = "ошибка";
+    else if (found.state === "running") right = "идёт";
+    else if (found.state === "done") right = "готово";
+    else right = "ожидает";
     return { state: found.state, right: right, counts: found.counts || {} };
   }
   if (sem.key === "connection") {
+    /* Правая колонка — человеческое слово, а не сырое значение p.state
+       (idle/pending/…): подпись контракта видна в свёрнутых технических
+       деталях (см. bindLines в renderBoard), а не в первом прочтении.
+       «idle» — это «синхронизация сейчас не идёт», а НЕ «связи нет»: если
+       что-то уже загружено (покрытие истории или прогресс других этапов),
+       соединение явно рабочее, и подпись «ожидает» лгала бы, намекая на
+       обрыв связи там, где на деле просто нет активной задачи синка. */
     if (p.error) return { state: "error", right: "ошибка" };
     if (p.state === "running") return { state: "running", right: "идёт" };
     if (p.state === "done") return { state: "done", right: "готово" };
-    return { state: "todo", right: p.state || "—" };
+    var hasData = (p.coverage_days || 0) > 0 ||
+      (p.stages || []).some(function (s) { return s.state === "done" || s.state === "running"; });
+    if (hasData) return { state: "done", right: "готово" };
+    return { state: "todo", right: "ожидает" };
   }
   if (sem.key === "catalog") {
     /* Слитый этап: «готово», когда готовы ОБА исходных шага (products и
@@ -1284,7 +1359,7 @@ function liveStageState(sem, p) {
     (p.stages || []).forEach(function (s) { byKey[s.key] = s; });
     var prod = byKey.products, today = byKey.today;
     var states = [prod, today].filter(Boolean).map(function (s) { return s.state; });
-    if (!states.length) return { state: "todo", right: "—" };
+    if (!states.length) return { state: "todo", right: "ожидает" };
     if (states.indexOf("error") !== -1) return { state: "error", right: "ошибка" };
     if (states.length === 2 && states.every(function (s) { return s === "done"; })) {
       var n = today && today.counts ? today.counts.warehouses : null;
@@ -1292,9 +1367,9 @@ function liveStageState(sem, p) {
         right: n !== null && n !== undefined ? n + " " + plural(n, "склад", "склада", "складов") : "готово" };
     }
     if (states.indexOf("running") !== -1) return { state: "running", right: "идёт" };
-    return { state: "todo", right: "—" };
+    return { state: "todo", right: "ожидает" };
   }
-  return { state: "todo", right: "—" };
+  return { state: "todo", right: "ожидает" };
 }
 
 /* Главная строка статуса — то, что видно сразу, без разбора списка этапов.
@@ -1315,9 +1390,21 @@ function mainStatusText(demo, p) {
     else if (!current) current = sem;
   });
   if (done === real.length) return { text: "Матрица готова.", spin: false, done: true };
+  var cov = p.coverage_days || 0, need = p.history_days || 0;
+  /* Частичная история — самый важный факт, который есть прямо сейчас: если
+     он есть, он выходит в заголовок статуса независимо от того, какой этап
+     формально «текущий» по массиву stages[] (тот может вообще не знать про
+     историю — как в этом самом случае, когда stages[] не включает "history",
+     но coverage_days уже реальные 400 из 730). Без этой проверки статус мог
+     сказать «собираем: подключение», хотя история уже на 55% загружена. */
+  if (need > 0 && cov > 0 && cov < need) {
+    var histExtra = " (" + num(cov) + " из " + num(need) + " дн.)";
+    if (p.eta_sec !== null && p.eta_sec !== undefined) histExtra += " · ещё ~" + num(p.eta_sec) + " с";
+    return { text: "Загружаем историю продаж" + histExtra + " · " + done + " из " +
+      real.length + " готово.", spin: true, done: false };
+  }
   var extra = "";
   if (current && current.key === "history") {
-    var cov = p.coverage_days || 0, need = p.history_days || 0;
     extra = " (" + num(cov) + " из " + num(need) + " дн.)";
     if (p.eta_sec !== null && p.eta_sec !== undefined) extra += " · ещё ~" + num(p.eta_sec) + " с";
   }
@@ -1355,6 +1442,7 @@ function renderBoard() {
     return;
   }
 
+  var monthsHtml = "";
   box.innerHTML = SEM_STAGES.map(function (sem, i) {
     var st, right, extra = "";
     if (demo) {
@@ -1364,14 +1452,20 @@ function renderBoard() {
       var pos = PV.board.tick / DEMO_TICKS_PER_STAGE;
       st = pos > i + 1 ? "done" : (pos > i ? "running" : "todo");
       var pct = Math.max(0, Math.min(100, Math.round((pos - i) * 100)));
-      right = st === "done" ? "готово" : (st === "running" ? pct + " %" : "—");
+      right = st === "done" ? "готово" : (st === "running" ? pct + " %" : "ожидает");
       if (st === "running") extra = '<div class="pv-bar" role="progressbar" aria-valuemin="0"' +
         ' aria-valuemax="100" aria-valuenow="' + pct + '" aria-label="Демонстрация хода этапа ' +
         esc(sem.title) + '"><i style="width:' + pct + '%"></i></div>';
     } else if (sem.bind === null) {
-      /* Поля в контракте нет — и полоски прогресса тоже нет. */
+      /* Поля в контракте нет — и полоски прогресса тоже нет. Пунктирная рамка
+         карточки (см. CSS [data-state="nofield"]) уже показывает разницу на
+         вид; ни жаргон «нет поля», ни голый тире-плейсхолдер сюда не идут —
+         оба читаются как «пусто/сломано». Правая колонка просто пустая:
+         честнее промолчать про то, чего мы не измеряем, чем нарисовать
+         тире, которое выглядит как «ноль» или «ошибка». Объяснение — в
+         технических деталях (bindLines ниже). */
       st = "nofield";
-      right = "нет поля";
+      right = "";
     } else {
       var r = liveStageState(sem, p);
       st = r.state;
@@ -1389,11 +1483,17 @@ function renderBoard() {
         var cov = p.coverage_days || 0, need = p.history_days || 0;
         extra += '<div class="pv-stage-sub">Покрытие: <b>' + num(cov) + '</b> из <b>' +
                  num(need) + '</b> дн.</div>';
+        /* Помесячная сетка (2026-08, 2026-07, …) — диагностика синка, не то,
+           что нужно владельцу с первого взгляда: то же самое покрытие уже
+           названо человеческой фразой строкой выше. Сетка переезжает в
+           технические детали целиком, а не остаётся инлайн под каждой
+           карточкой. */
         var months = (p.months || []).slice(0, 24);
         if (months.length) {
-          extra += '<div class="pv-months">' + months.map(function (m) {
-            return '<span class="pv-month" data-s="' + esc(m.state) + '">' + esc(m.ym) + '</span>';
-          }).join("") + '</div>';
+          monthsHtml = '<p><b>Помесячно (' + months.length + ')</b>: ' +
+            months.map(function (m) {
+              return '<span class="pv-month" data-s="' + esc(m.state) + '">' + esc(m.ym) + '</span>';
+            }).join(" ") + '</p>';
         }
       }
     }
@@ -1418,9 +1518,9 @@ function renderBoard() {
   }).join("");
   if (demo) {
     foot.innerHTML = '<p>Идёт демонстрация. Живые значения на это время не показаны ' +
-      'совсем — скрыты целиком, чтобы их нельзя было прочитать как факт.</p>' + bindLines;
+      'совсем — скрыты целиком, чтобы их нельзя было прочитать как факт.</p>' + bindLines + monthsHtml;
   } else {
-    foot.innerHTML = bindLines +
+    foot.innerHTML = bindLines + monthsHtml +
       '<p>Живые поля GET /api/sync/progress: <span class="pv-mono">state=' + esc(p.state || "") +
       '</span>, <span class="pv-mono">progress_pct=' + esc(String(p.progress_pct)) +
       '</span>, <span class="pv-mono">coverage_days=' + esc(String(p.coverage_days)) +
@@ -1439,7 +1539,7 @@ function setBoardMode(mode) {
     : "живые данные";
   $("pv-demo-btn").textContent = mode === "demo"
     ? "Остановить демонстрацию"
-    : "Показать демонстрацию хода";
+    : "Посмотреть, как проходит загрузка";
   if (PV.board.timer) { clearInterval(PV.board.timer); PV.board.timer = null; }
   if (mode === "demo") {
     PV.board.tick = 0;
@@ -1769,7 +1869,7 @@ function setMoney(on) {
   });
   var b = $("pv-money-btn");
   b.setAttribute("aria-pressed", on ? "true" : "false");
-  b.textContent = on ? "Скрыть денежный слой" : "Показать денежный слой";
+  b.textContent = on ? "Скрыть себестоимость и маржу" : "Показать себестоимость и маржу";
   renderMoney();
 }
 
@@ -1816,7 +1916,7 @@ function tourSteps() {
       tech("<span class=\"pv-mono\">avg_price</span>, " +
         "<span class=\"pv-mono\">sale_price</span>, " +
         "<span class=\"pv-mono\">cost_price</span> — поля ответа GET /api/turnover. " +
-        "Тумблер «Показать денежный слой» — не то же самое, что экскурсия.") });
+        "Тумблер «Показать себестоимость и маржу» — не то же самое, что экскурсия.") });
 
   s.push({ keys: ["season"], title: "Сезон",
     body: "<b>0</b> значит «продаж не было». <b>«—»</b> значит «данных ещё нет». " +
@@ -2057,6 +2157,12 @@ function bindAll() {
     setBoardMode(PV.board.mode === "demo" ? "live" : "demo");
   });
   $("pv-money-btn").addEventListener("click", function () { setMoney(!PV.showMoney); });
+  $("pv-more-toggle").addEventListener("click", function () {
+    var body = $("pv-more-body");
+    var open = !body.classList.contains("is-open");
+    body.classList.toggle("is-open", open);
+    $("pv-more-toggle").setAttribute("aria-expanded", open ? "true" : "false");
+  });
   $("pv-tour-start").addEventListener("click", function (ev) { openTour(ev.currentTarget); });
   $("pv-tour-replay").addEventListener("click", function (ev) {
     PV.tour.i = 0;
