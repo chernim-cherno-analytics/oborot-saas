@@ -2180,10 +2180,17 @@ function openTour(fromEl) {
 }
 
 function closeTour() {
+  /* Симметрично closeHelp(): защита от повторного/холостого вызова, когда
+     тур уже закрыт. Без неё openHelp(), вызывающий closeTour() перед каждым
+     своим открытием (см. ниже), при уже закрытом туре всё равно перетаскивал
+     бы фокус на PV.tour.opener — устаревшую кнопку из прошлой экскурсии —
+     на мгновение перед тем, как openHelp() переставит его на #pv-help-close. */
+  if (!PV.tour.open) return;
   PV.tour.open = false;
   $("pv-tour").hidden = true;
   clearHl();
   if (PV.tour.opener && PV.tour.opener.focus) PV.tour.opener.focus();
+  PV.tour.opener = null;
 }
 
 function tourGo(d) {
@@ -2242,6 +2249,16 @@ var HELP_TEXTS = {
 function openHelp(key, opener) {
   var t = HELP_TEXTS[key];
   if (!t) return;
+  /* Симметрично openTour(): попап объяснений и диалог экскурсии оба
+     aria-modal="true", и если тур уже открыт (например, кнопка объяснений в
+     самом диалоге экскурсии или где-то позади него всё ещё доступна), нельзя
+     открыть попап поверх/рядом с ним — ассистивные технологии увидят два
+     модальных слоя разом. closeTour() безопасна к вызову даже когда тур не
+     открыт (просто скрывает уже скрытый диалог) и сама возвращает фокус на
+     PV.tour.opener — но это возвращение мгновенно, а строка ниже уже
+     переставляет фокус на #pv-help-close, так что итоговый фокус и
+     PV.help.opener всегда относятся к ЭТОМУ (открываемому) попапу. */
+  closeTour();
   var pop = $("pv-help-pop");
   $("pv-help-title").textContent = t.title;
   $("pv-help-text").textContent = t.text;

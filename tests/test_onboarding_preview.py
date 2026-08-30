@@ -1848,6 +1848,38 @@ def part_status_empty_stages_and_modal(browser, cookies) -> None:
           pv(page5, "document.activeElement && document.activeElement.id") == "pv-tour-start")
     ctx5.close()
 
+    print("\n== §5 Обратное направление: попап объяснений закрывает открытый тур ==")
+    # Симметричный сценарий: тур уже открыт (и, возможно, ещё «жива» кнопка
+    # объяснений позади/рядом с ним); активация попапа объяснений обязана
+    # сама закрыть тур первым, а не открыть второй aria-modal поверх первого.
+    ctx6, page6 = open_loader(browser)
+    goto_loader(page6)
+    page6.click(".pv-step.is-on [data-go='next']")
+    page6.wait_for_selector("[data-step='turnover'].is-on")
+    page6.click("#pv-tour-start")
+    page6.wait_for_selector("#pv-tour:not([hidden])")
+    check("тур открыт (подготовка обратного сценария)",
+          not pv(page6, "document.getElementById('pv-tour').hidden"))
+    page6.click("#pv-help-turnover")
+    page6.wait_for_timeout(150)
+    check("активация попапа объяснений при открытом туре сначала закрывает тур "
+          "(не два aria-modal одновременно)",
+          pv(page6, "document.getElementById('pv-tour').hidden"))
+    check("тур больше не в состоянии «открыт» (PV.tour.open=false)",
+          not pv(page6, "window.__PV__.tour.open"))
+    check("попап объяснений — единственный видимый модальный слой",
+          not pv(page6, "document.getElementById('pv-help-pop').hidden"))
+    check("фокус — в попапе объяснений (кнопка закрытия), не в диалоге тура",
+          pv(page6, "document.activeElement && document.activeElement.id") == "pv-help-close")
+    page6.keyboard.press("Escape")
+    page6.wait_for_timeout(150)
+    check("Escape закрывает попап объяснений (сам попап скрыт)",
+          pv(page6, "document.getElementById('pv-help-pop').hidden"))
+    check("Escape возвращает фокус на РЕАЛЬНУЮ кнопку-триггер объяснений "
+          "(#pv-help-turnover), а не на устаревший opener тура",
+          pv(page6, "document.activeElement && document.activeElement.id") == "pv-help-turnover")
+    ctx6.close()
+
 
 def part_responsive(browser, cookies) -> None:
     print("\n== §4 Адаптив: 1440x900, 1024x768, 390x844 ==")
