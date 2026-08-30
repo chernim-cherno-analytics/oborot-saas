@@ -100,7 +100,7 @@ p{margin:0 0 12px;}
    область нажатия — правило «>=44px» не знает исключений для служебных ссылок. */
 .pv-skip{
   position:absolute;left:-10000px;top:8px;z-index:80;
-  display:inline-flex;align-items:center;height:44px;min-width:44px;
+  display:inline-flex;align-items:center;height:45px;min-width:45px;
   padding:0 16px;border-radius:12px;background:var(--pv-blue);color:#fff;
   text-decoration:none;font-weight:600;
 }
@@ -142,7 +142,7 @@ p{margin:0 0 12px;}
 .pv-rail{display:flex;align-items:center;}
 .pv-dot{
   appearance:none;background:none;border:0;cursor:pointer;
-  min-width:44px;height:44px;padding:0;
+  min-width:45px;height:45px;padding:0;
   display:inline-flex;align-items:center;justify-content:center;
 }
 .pv-dot i{
@@ -154,7 +154,7 @@ p{margin:0 0 12px;}
 .pv-stepcount{display:none;font-size:13px;color:var(--pv-ink-2);font-variant-numeric:tabular-nums;}
 .pv-exit{
   display:inline-flex;align-items:center;justify-content:center;
-  height:44px;min-width:44px;padding:0 16px;
+  height:45px;min-width:45px;padding:0 16px;
   border:1px solid var(--pv-line);border-radius:12px;background:var(--pv-surface);
   color:var(--pv-ink-2);text-decoration:none;font-size:14px;font-weight:600;
 }
@@ -188,9 +188,13 @@ p{margin:0 0 12px;}
   /* height, не min-height: на Ubuntu-рендере CI шрифтовые метрики системного
      стека иногда дают строку чуть ниже 44px до округления (43.6px), хотя
      округлённо это выглядит как «44» — и правило «>=44px» в тесте меряет
-     именно нецелое значение. Фиксированная высота с центрированием контента
-     флексом не зависит от метрик шрифта вовсе. */
-  height:44px;min-width:44px;padding:0 20px;border-radius:12px;
+     именно нецелое значение. Фиксированная высота сама по себе это не
+     гарантировала целиком: даже explicit height:44px однажды снова дал
+     тот же дробный недобор на Ubuntu (разные шрифтовые движки чуть иначе
+     синтезируют начертание font-weight:650). 45px — не «40px и больше», а
+     минимально достаточный запас (1px) над требованием WCAG «>=44px»,
+     который перекрывает субпиксельную погрешность рендера с гарантией. */
+  height:45px;min-width:45px;padding:0 20px;border-radius:12px;
   border:1px solid var(--pv-line);background:var(--pv-surface);color:var(--pv-ink);
   display:inline-flex;align-items:center;justify-content:center;gap:8px;
   transition:background .2s var(--pv-ease),border-color .2s var(--pv-ease),transform .12s var(--pv-ease);
@@ -206,13 +210,13 @@ p{margin:0 0 12px;}
 .pv-optrow{display:flex;gap:10px;flex-wrap:wrap;margin:6px 0 4px;}
 .pv-opt{
   appearance:none;cursor:pointer;font:inherit;font-weight:600;
-  height:44px;min-width:44px;padding:0 20px;border-radius:12px;
+  height:45px;min-width:45px;padding:0 20px;border-radius:12px;
   border:1px solid var(--pv-line);background:var(--pv-surface);color:var(--pv-ink);
   display:inline-flex;align-items:center;justify-content:center;
   transition:background .2s var(--pv-ease),border-color .2s var(--pv-ease),color .2s var(--pv-ease);
 }
 .pv-opt[aria-checked="true"]{background:var(--pv-blue);border-color:var(--pv-blue);color:#fff;}
-.pv-range{width:100%;height:44px;margin:0;accent-color:var(--pv-blue);}
+.pv-range{width:100%;height:45px;margin:0;accent-color:var(--pv-blue);}
 .pv-figure{font-family:var(--pv-mono);font-size:26px;font-weight:700;letter-spacing:-.02em;}
 .pv-draft{
   display:inline-flex;align-items:center;gap:7px;
@@ -236,7 +240,7 @@ p{margin:0 0 12px;}
 .pv-chips{display:flex;gap:10px;flex-wrap:wrap;margin-top:10px;}
 .pv-chip{
   appearance:none;cursor:pointer;font:inherit;font-weight:600;font-size:14px;
-  height:44px;min-width:44px;padding:0 18px;border-radius:999px;
+  height:45px;min-width:45px;padding:0 18px;border-radius:999px;
   border:1px solid var(--pv-line);background:var(--pv-surface);color:var(--pv-ink-2);
   display:inline-flex;align-items:center;gap:8px;
 }
@@ -368,7 +372,7 @@ table.pv-t tbody tr.pv-hero{outline:2px solid var(--pv-blue);outline-offset:-2px
 .pv-tour-nav .pv-btn{padding:0 16px;}
 .pv-help{
   appearance:none;cursor:pointer;font:inherit;font-weight:800;font-size:17px;
-  height:44px;width:44px;border-radius:50%;
+  height:45px;width:45px;border-radius:50%;
   display:inline-flex;align-items:center;justify-content:center;
   border:1px solid var(--pv-line);background:var(--pv-surface);color:var(--pv-blue);
 }
@@ -377,7 +381,7 @@ table.pv-t tbody tr.pv-hero{outline:2px solid var(--pv-blue);outline-offset:-2px
       заголовка метрики — а НЕ точкой в каждой ячейке таблицы ─────────────── */
 .pv-help-btn{
   appearance:none;cursor:pointer;font:inherit;font-weight:700;font-size:13px;
-  height:44px;min-width:44px;padding:0 14px;border-radius:12px;
+  height:45px;min-width:45px;padding:0 14px;border-radius:12px;
   border:1px solid var(--pv-line);background:var(--pv-surface);color:var(--pv-ink-2);
   display:inline-flex;align-items:center;gap:6px;
 }
@@ -393,7 +397,7 @@ table.pv-t tbody tr.pv-hero{outline:2px solid var(--pv-blue);outline-offset:-2px
 .pv-help-pop p{font-size:13px;color:var(--pv-ink-2);margin-bottom:0;}
 .pv-help-close{
   position:absolute;top:8px;right:8px;
-  height:44px;min-width:44px;border-radius:10px;
+  height:45px;min-width:45px;border-radius:10px;
   appearance:none;cursor:pointer;border:0;background:none;color:var(--pv-ink-3);font-size:16px;
 }
 /* Мобильная форма того же попапа — донный лист. DOM один и тот же, меняется
@@ -438,7 +442,7 @@ table.pv-t tbody tr.pv-hero{outline:2px solid var(--pv-blue);outline-offset:-2px
 .pv-searchwrap{display:flex;align-items:center;gap:10px;margin:12px 0;flex-wrap:wrap;}
 .pv-searchwrap label{font-weight:600;font-size:13px;}
 .pv-search{
-  height:44px;padding:0 14px;border-radius:12px;border:1px solid var(--pv-line);
+  height:45px;padding:0 14px;border-radius:12px;border:1px solid var(--pv-line);
   font:inherit;font-size:14px;flex:1 1 220px;max-width:320px;
 }
 
