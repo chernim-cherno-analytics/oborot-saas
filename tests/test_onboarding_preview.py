@@ -1348,7 +1348,13 @@ def part_synthetic_contracts(browser, cookies, template_turnover: dict) -> None:
     page.keyboard.press("Escape")
     page.wait_for_timeout(120)
 
-    print("== §5 Поиск без единой rank-строки — честное «показать не на чем», не старая копия ==")
+    print("== §5 Поиск скрывает ВСЕ подходящие строки, хотя в API они есть — "
+          "«по поиску не найдено», а не ложное «в API их нет» ==")
+    # В этом payload §5 Проценты/§5 Возвраты/§5 Честный ноль — все три
+    # rank-кандидата — существуют в НЕотфильтрованном ответе API. Запрос
+    # "zzz-нет-такого-товара-zzz" прячет их все из видимой таблицы, но это
+    # факт про активный поиск, а не про содержимое API — заявлять
+    # «в ответе API нет подходящих строк» в этом случае было бы неправдой.
     page.fill("#pv-search", "zzz-нет-такого-товара-zzz")
     page.wait_for_timeout(150)
     check("поиск без совпадений оставил таблицу пустой",
@@ -1357,16 +1363,72 @@ def part_synthetic_contracts(browser, cookies, template_turnover: dict) -> None:
           .find("§5") == -1)
     page.click("#pv-tour-start")
     page.wait_for_selector("#pv-tour:not([hidden])")
-    tour_title_empty = page.text_content("#pv-tour-title") or ""
-    check("тур честно говорит «показать не на чем», а не описывает старую "
-          "(теперь скрытую) строку",
-          "показать не на чем" in tour_title_empty.lower(), tour_title_empty)
-    check("PV.hero сброшен в null — не осталась ссылка на скрытую строку",
+    tour_title_filtered = page.text_content("#pv-tour-title") or ""
+    tour_text_filtered = page.inner_text("#pv-tour-text") or ""
+    check("заголовок говорит про ПОИСК («по текущему поиску нет...»), не "
+          "про общее «показать не на чем»",
+          "поиску" in tour_title_filtered.lower()
+          and "показать не на чем" not in tour_title_filtered.lower(),
+          tour_title_filtered)
+    check("текст НЕ утверждает, что в ответе API нет подходящих строк "
+          "(ложь — они там есть, их скрывает поиск)",
+          "нет ни одной рейтинговой строки" not in tour_text_filtered,
+          tour_text_filtered[:300])
+    check("текст честно указывает на активный поиск как причину "
+          "(«скрывает» / «очистите поиск»)",
+          "скрывает" in tour_text_filtered.lower()
+          or "очистите поиск" in tour_text_filtered.lower(),
+          tour_text_filtered[:300])
+    check("PV.hero остаётся null — не показываем ссылку на скрытую строку",
           pv(page, "window.__PV__.hero") is None)
+    check("поиск НЕ очищен автоматически — значение поля осталось прежним "
+          "(тихая подмена того, что набрал человек, недопустима)",
+          pv(page, "document.getElementById('pv-search').value")
+          == "zzz-нет-такого-товара-zzz")
     page.keyboard.press("Escape")
     page.wait_for_timeout(120)
     page.fill("#pv-search", "")
     page.wait_for_timeout(150)
+
+    print("== §5 В API вообще нет подходящей строки — честное «показать не на "
+          "чем», без ложной ссылки на поиск ==")
+    # Отдельный payload, где КАЖДАЯ позиция дисквалифицирована (hidden,
+    # archived или low_data) — герой не находится ни с поиском, ни без него.
+    # Именно для этого сценария (и только для него) текст обязан утверждать,
+    # что подходящих строк нет в самом ответе API.
+    payload_empty = copy.deepcopy(template_turnover)
+    item_none_low = mk("§5 Мало данных", hidden=False, archived=False,
+                        group="rank", low_data=True)
+    item_none_hidden = mk("§5 Скрыт владельцем", hidden=True, archived=False,
+                           group="rank", low_data=False)
+    item_none_arch = mk("§5 Архивная карточка", hidden=False, archived=True,
+                         group="rank", low_data=False)
+    payload_empty["items"] = [item_none_low, item_none_hidden, item_none_arch]
+    ctx_empty = browser.new_context(viewport={"width": 1440, "height": 900})
+    ctx_empty.add_cookies([{"name": k, "value": v, "domain": "127.0.0.1", "path": "/"}
+                           for k, v in cookies.items()])
+    page_empty = ctx_empty.new_page()
+    page_empty.route("**/api/turnover", lambda route: route.fulfill(
+        status=200, content_type="application/json", body=json.dumps(payload_empty)))
+    page_empty.goto(f"{BASE}{PREVIEW_URL}")
+    wait_ready(page_empty)
+    for _ in range(7):
+        page_empty.click(".pv-step.is-on [data-go='next']")
+    page_empty.wait_for_selector("[data-step='turnover'].is-on")
+    page_empty.click("#pv-tour-start")
+    page_empty.wait_for_selector("#pv-tour:not([hidden])")
+    tour_title_apiempty = page_empty.text_content("#pv-tour-title") or ""
+    tour_text_apiempty = page_empty.inner_text("#pv-tour-text") or ""
+    check("заголовок — общее «показать не на чем» (не про поиск — поиск не "
+          "активен, а строк всё равно нет)",
+          "показать не на чем" in tour_title_apiempty.lower(), tour_title_apiempty)
+    check("текст честно утверждает: в ответе API нет ни одной подходящей "
+          "строки (это здесь правда)",
+          "нет ни одной рейтинговой строки" in tour_text_apiempty,
+          tour_text_apiempty[:300])
+    check("текст НЕ ссылается на поиск как причину (поиск здесь ни при чём)",
+          "поиск" not in tour_text_apiempty.lower(), tour_text_apiempty[:300])
+    ctx_empty.close()
 
     print("== §5 Ниже себестоимости: below_cost.positions, а не отсутствующее .count ==")
     loss_text = page.inner_text("#pv-loss") or ""
