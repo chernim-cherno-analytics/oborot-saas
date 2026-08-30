@@ -781,8 +781,10 @@ def part_browser(pw, cookies, owner: httpx.Client, snap_before: dict) -> dict:
     check("блок явно подписан как предпросмотр, а не рекомендация действия",
           "Только предпросмотр" in attn_txt, attn_txt[:300])
     live_all = [it for it in turnover["items"] if not it.get("hidden") and not it["archived"]]
-    exp_weak = sum(1 for it in live_all if it["cls"] == "weak")
-    exp_below = sum(1 for it in live_all if it.get("below_cost"))
+    # weak/below_cost — actionable-корзины и не считают статистически
+    # недостоверные (low_data) позиции; low_data-корзина считает их все.
+    exp_weak = sum(1 for it in live_all if it["cls"] == "weak" and not it.get("low_data"))
+    exp_below = sum(1 for it in live_all if it.get("below_cost") and not it.get("low_data"))
     exp_lowdata = sum(1 for it in live_all if it.get("low_data"))
     attn_numbers = pv(page, "Array.from(document.querySelectorAll('#pv-attn .pv-attn-item b'))"
                             ".map(el => el.textContent.trim())")
@@ -1244,6 +1246,15 @@ def part_synthetic_contracts(browser, cookies, template_turnover: dict) -> None:
     # бы во ВСЕХ трёх корзинах сразу, если бы фильтр молча пропустил её.
     item_archived_weak = mk("§5 Архив слабый", hidden=False, archived=True,
                              group="rank", low_data=True, cls="weak", below_cost=True)
+    # !hidden && !archived, но low_data=True — именно комбинация, которую
+    # прошлый корректив не проверял (item_archived_weak выше исключается
+    # ЕЩЁ и по archived, так что до сих пор не ловил регрессию в этом
+    # конкретном фильтре). Канонические серверные сводки не считают
+    # статистически недостоверную (low_data) позицию в actionable-корзинах
+    # «слабых» и «ниже себестоимости» — только в самой low_data-корзине.
+    item_weak_lowdata = mk("§5 Слабый но мало данных", hidden=False, archived=False,
+                            group="rank", low_data=True, cls="weak", below_cost=True,
+                            category="§5 Категория-ловушка")
 
     payload = copy.deepcopy(template_turnover)
     # Порядок здесь не косметика: без исключения archived кандидаты героя
@@ -1253,7 +1264,7 @@ def part_synthetic_contracts(browser, cookies, template_turnover: dict) -> None:
     # — returns. Расположение специально подобрано так, чтобы тест ловил
     # регрессию, а не совпадал по случайному индексу.
     payload["items"] = [item_pct, item_returns, item_upstream_archived, item_zero,
-                         item_hidden, item_archived_weak]
+                         item_hidden, item_archived_weak, item_weak_lowdata]
     payload["below_cost"] = dict(payload.get("below_cost") or {})
     payload["below_cost"]["positions"] = 3
     # app/analytics.money_totals() исключает no_cost-позиции из gross_margin
@@ -1291,8 +1302,14 @@ def part_synthetic_contracts(browser, cookies, template_turnover: dict) -> None:
 
     print("== §5 Сводка «на что обратить внимание»: исключает archived, как _live_items ==")
     live_no_archived = [it for it in payload["items"] if not it["hidden"] and not it["archived"]]
-    exp_weak_s = sum(1 for it in live_no_archived if it["cls"] == "weak")
-    exp_below_s = sum(1 for it in live_no_archived if it.get("below_cost"))
+    # weak и below_cost — actionable-корзины: low_data-позиция статистически
+    # недостоверна и не должна в них попадать (см. комментарий у
+    # item_weak_lowdata выше). low_data-корзина, наоборот, считает ВСЕ
+    # low_data-позиции — она не про действие, а про доверие к цифрам.
+    exp_weak_s = sum(1 for it in live_no_archived
+                      if it["cls"] == "weak" and not it.get("low_data"))
+    exp_below_s = sum(1 for it in live_no_archived
+                       if it.get("below_cost") and not it.get("low_data"))
     exp_lowdata_s = sum(1 for it in live_no_archived if it.get("low_data"))
     attn_numbers_s = pv(page, "Array.from(document.querySelectorAll('#pv-attn .pv-attn-item b'))"
                               ".map(el => el.textContent.trim())")
@@ -1301,6 +1318,25 @@ def part_synthetic_contracts(browser, cookies, template_turnover: dict) -> None:
           attn_numbers_s[:3] == [str(exp_weak_s), str(exp_below_s), str(exp_lowdata_s)],
           f"{attn_numbers_s[:3]} vs {[exp_weak_s, exp_below_s, exp_lowdata_s]} "
           f"(с archived числа были бы больше)")
+
+    print("== §5 low_data-позиция не считается в actionable-корзинах (слабо/ниже "
+          "себестоимости), только в «мало данных» ==")
+    # item_weak_lowdata: !hidden, !archived, cls=weak, below_cost=True,
+    # low_data=True — проходит фильтр !hidden&&!archived, значит без фикса
+    # попал бы И в «слабых», И в «ниже себестоимости», И в «мало данных»
+    # разом (тройной ложный подсчёт). exp_weak_s/exp_below_s/exp_lowdata_s
+    # выше уже посчитаны с учётом фикса — здесь явно проверяем, что она
+    # действительно ЕСТЬ в наборе (иначе проверка выше могла бы совпасть
+    # случайно, если бы фильтр вообще выбросил её отовсюду).
+    assert item_weak_lowdata in live_no_archived, \
+        "тестовая позиция должна остаться в !hidden&&!archived наборе"
+    check("low_data-позиция реально учтена хотя бы где-то (в корзине "
+          "«мало данных» — иначе тест вообще не про неё)",
+          exp_lowdata_s >= 1, str(exp_lowdata_s))
+    check("категория low_data-позиции («§5 Категория-ловушка») НЕ стала "
+          "категорией с наибольшим числом слабых позиций — она не входит "
+          "в скорректированный список «слабых»",
+          "§5 Категория-ловушка" not in (pv(page, "document.getElementById('pv-attn').textContent") or ""))
 
     print("== §5 Герой экскурсии не выбирается из upstream archived ==")
     # Порядок массива подобран так (см. комментарий у payload["items"] выше),

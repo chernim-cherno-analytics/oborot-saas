@@ -1870,8 +1870,16 @@ function renderAttn() {
      ниже как «живая»), значило бы посчитать её в «внимание сегодня» ровно
      там, где ни один канонический дашборд её бы не посчитал. */
   var items = (d.items || []).filter(function (it) { return !it.hidden && !it.archived; });
-  var weak = items.filter(function (it) { return it.cls === "weak"; });
-  var belowCost = items.filter(function (it) { return it.below_cost; });
+  /* «Слабых» и «ниже себестоимости» — это actionable-корзины: они должны
+     заставить владельца что-то РЕШИТЬ про конкретную позицию. Позиция с
+     low_data статистически недостоверна (мало дней в стоке или единичные
+     продажи) — её cls/below_cost сами по себе ещё не повод действовать,
+     ровно как канонические серверные сводки (см. пример в templates/
+     turnover.html) не считают low_data-позиции в actionable-корзинах.
+     lowData-корзина остаётся отдельной и включает ВСЕ low_data-позиции —
+     она как раз про «этим цифрам пока нельзя доверять», а не про действие. */
+  var weak = items.filter(function (it) { return it.cls === "weak" && !it.low_data; });
+  var belowCost = items.filter(function (it) { return it.below_cost && !it.low_data; });
   var lowData = items.filter(function (it) { return it.low_data; });
   var byCat = {};
   weak.forEach(function (it) {
