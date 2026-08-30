@@ -327,6 +327,34 @@ def pv(page, expr: str):
     return page.evaluate("() => " + expr)
 
 
+def wait_scroll_stable(page, checks: int = 3, interval_ms: int = 80, rounds: int = 30) -> None:
+    """Ждёт, пока плавный scrollIntoView() экскурсии действительно завершится.
+
+    renderTour() вызывает cell.scrollIntoView({behavior:"smooth"}) на
+    подсвеченной ячейке; съёмка скриншота сразу после появления диалога (без
+    этого ожидания) ловила промежуточный, ещё едущий кадр — рваная/обрезанная
+    рамка на PNG, не связанная ни с одной логической проверкой DOM. Опрашиваем
+    и вертикальную прокрутку страницы, и горизонтальную прокрутку таблицы
+    (scrollIntoView может двигать обе), пока оба значения не перестанут
+    меняться `checks` опросов подряд — это дисциплина съёмки скриншота, а не
+    изменение анимации для настоящих пользователей.
+    """
+    last = None
+    stable = 0
+    for _ in range(rounds):
+        cur = page.evaluate(
+            "() => { const w = document.getElementById('pv-tablewrap');"
+            " return [Math.round(window.scrollY), w ? Math.round(w.scrollLeft) : 0]; }")
+        if cur == last:
+            stable += 1
+            if stable >= checks:
+                return
+        else:
+            stable = 0
+        last = cur
+        page.wait_for_timeout(interval_ms)
+
+
 def digits(s: str) -> str:
     """Только цифры и минус.
 
@@ -648,7 +676,8 @@ def part_browser(pw, cookies, owner: httpx.Client, snap_before: dict) -> dict:
           "в живом режиме",
           not bad_rights, f"{bad_rights} из {right_texts}")
     check("правые подписи карточек — человеческие слова, не сырые токены контракта",
-          all(t in ("", "ожидает", "идёт", "готово", "ошибка")
+          all(t in ("", "ожидает", "идёт", "готово", "ошибка",
+                    "получены", "получены ранее", "получаем", "недоступна")
               or t.endswith("складов") or t.endswith("склада") or t.endswith("склад")
               or t.endswith(" с") or "готово" in t or "дн." in t
               for t in right_texts),
@@ -663,12 +692,21 @@ def part_browser(pw, cookies, owner: httpx.Client, snap_before: dict) -> dict:
     check("помесячная сетка доказуема в свёрнутых технических деталях "
           "(просто переехала, не потерялась)",
           pv(page, "document.querySelectorAll('#pv-board-foot .pv-month').length") > 0)
-    nofield = pv(page, "Array.from(document.querySelectorAll("
-                       "'#pv-stages .pv-stage[data-state=\"nofield\"]'))"
-                       ".map(s => s.getAttribute('data-key'))")
-    check("этап без поля в контракте («Матрица») честно помечен, а не нарисован",
-          nofield == ["matrix"], str(nofield))
-    check("для него прямо сказано в технических деталях, что поля нет",
+    # У «Матрицы» нет отдельного ПОЛЯ КОНТРАКТА (state=nofield по-прежнему
+    # означало бы «это не из stages[]») — но её видимое состояние честно
+    # берётся из реального PV.data.turnover, а не молчит: в этом сценарии
+    # /api/turnover читается нормально, поэтому карточка говорит «готово»,
+    # а не «nofield»/тире.
+    matrix_key_state = pv(page, "(() => { const li = document.querySelector("
+                                "'#pv-stages .pv-stage[data-key=\"matrix\"]');"
+                                " return li ? { state: li.getAttribute('data-state'),"
+                                " right: li.querySelector('.pv-stage-right').textContent.trim() }"
+                                " : null; })()")
+    check("«Матрица» без своего поля контракта, но с прочитанным turnover — "
+          "состояние «done», подпись «готово» (согласовано с турновером, не пусто)",
+          matrix_key_state == {"state": "done", "right": "готово"}, str(matrix_key_state))
+    check("для неё прямо сказано в технических деталях, что отдельного поля в "
+          "контракте нет (само состояние карточки при этом берётся из турновера)",
           "отдельного поля" in tech_foot, tech_foot[:200])
     page.click("#pv-board details.pv-tech summary")
     page.wait_for_timeout(80)
@@ -1203,6 +1241,15 @@ def part_synthetic_contracts(browser, cookies, template_turnover: dict) -> None:
     payload["items"] = [item_pct, item_returns, item_zero, item_hidden, item_upstream_archived]
     payload["below_cost"] = dict(payload.get("below_cost") or {})
     payload["below_cost"]["positions"] = 3
+    # app/analytics.money_totals() исключает no_cost-позиции из gross_margin
+    # целиком (показать по ним ноль значило бы соврать про заработанное) и
+    # отдаёт no_cost_positions/positions, чтобы экран мог честно сказать,
+    # какая часть каталога осталась за пределами суммы — ровно как это уже
+    # делает боевая «Оборачиваемость» (templates/turnover.html, moneyNote()).
+    payload["money"] = dict(payload.get("money") or {})
+    payload["money"]["positions"] = 5
+    payload["money"]["no_cost_positions"] = 2
+    payload["money"]["gross_margin"] = 123456
 
     ctx = browser.new_context(viewport={"width": 1440, "height": 900})
     ctx.add_cookies([{"name": k, "value": v, "domain": "127.0.0.1", "path": "/"}
@@ -1231,6 +1278,14 @@ def part_synthetic_contracts(browser, cookies, template_turnover: dict) -> None:
     loss_text = page.inner_text("#pv-loss") or ""
     check("алерт называет 3 позиции — ровно below_cost.positions из ответа ручки",
           "3" in loss_text and "позици" in loss_text, loss_text[:200])
+
+    print("== §5 Валовая маржа: qualification при no_cost_positions>0 ==")
+    money_text = page.inner_text("#pv-money") or ""
+    check("при no_cost_positions>0 сумма валовой маржи явно оговорена "
+          "(только позиции с себестоимостью — 3 из 5, ровно positions-no_cost_positions/positions)",
+          "только позиции с себестоимостью" in money_text
+          and "3 из 5" in money_text, money_text[:300])
+
     page.click("#pv-money-btn")
     page.wait_for_timeout(150)
 
@@ -1316,30 +1371,49 @@ def part_loader_idle_partial(browser, cookies) -> None:
         page.wait_for_timeout(80)
     page.wait_for_selector("[data-step='loader'].is-on")
 
+    # idle+данные доказывают только ФАКТ получения — не «связь жива сейчас».
+    # «получены ранее» — честный смысл: что-то есть, но синк сейчас не идёт.
     conn_right = pv(page, "(() => { const li = document.querySelector("
                           "'#pv-stages .pv-stage[data-key=\"connection\"]');"
                           " return li ? li.querySelector('.pv-stage-right').textContent.trim()"
                           " : null; })()")
-    check("idle + покрытие 400/730: подключение читается как «готово», а не «ожидает»",
-          conn_right == "готово", str(conn_right))
+    check("idle + покрытие 400/730: «Данные источника» читается как "
+          "«получены ранее» (факт получения, не заявление о живом соединении)",
+          conn_right == "получены ранее", str(conn_right))
     board_idle_txt = page.inner_text("#pv-board") or ""
     check("сырое слово idle нигде не показано на доске",
           "idle" not in board_idle_txt, board_idle_txt[:300])
-    mainstatus_idle = page.inner_text("#pv-mainstatus") or ""
-    check("главный статус выносит частичную историю на первый план "
-          "(400 из 730), а не «собираем: подключение»",
-          "400" in mainstatus_idle and "730" in mainstatus_idle
-          and "историю" in mainstatus_idle.lower(), mainstatus_idle)
-    check("и явно не говорит про подключение как про текущий этап",
-          "подключение" not in mainstatus_idle.lower(), mainstatus_idle)
 
-    matrix_right = pv(page, "(() => { const li = document.querySelector("
-                            "'#pv-stages .pv-stage[data-key=\"matrix\"]');"
-                            " return li ? li.querySelector('.pv-stage-right').textContent.trim()"
-                            " : null; })()")
-    check("этап без поля контракта («Матрица») не рисует тире-плейсхолдер — "
-          "пусто честнее, чем «—», которое читается как ноль/ошибка",
-          matrix_right == "", repr(matrix_right))
+    # idle — это «синк сейчас не идёт»: заголовок обязан говорить именно так,
+    # без «Загружаем»/спиннера/ETA — это были бы придуманное движение там,
+    # где на деле пауза.
+    mainstatus_idle = page.inner_text("#pv-mainstatus") or ""
+    check("idle + частичная история: заголовок статуса без слова «Загружаем» "
+          "и явно говорит, что загрузка сейчас не идёт",
+          "Загружаем" not in mainstatus_idle
+          and "загрузка сейчас не идёт" in mainstatus_idle.lower(), mainstatus_idle)
+    check("и всё равно называет числа покрытия (400 из 730)",
+          "400" in mainstatus_idle and "730" in mainstatus_idle, mainstatus_idle)
+    check("и явно не говорит про подключение/данные источника как про текущий этап",
+          "данные источника" not in mainstatus_idle.lower(), mainstatus_idle)
+    spin_visible = pv(page, "!!document.querySelector('#pv-mainstatus .pv-spin')")
+    check("idle: спиннер выключен (нет активного процесса, который он бы изображал)",
+          not spin_visible)
+    close_note_idle = page.inner_text("#pv-close-note") or ""
+    check("idle: нижняя строка НЕ обещает, что загрузка продолжится сама "
+          "(движения, которое можно было бы продолжить, сейчас нет)",
+          "продолжится сама" not in close_note_idle, close_note_idle)
+
+    # Матрица построена из /api/turnover, который в этом сценарии реально
+    # прочитался (замокан только /api/sync/progress) — карточка обязана
+    # согласованно сказать «готово», а не молчать пустым nofield-плейсхолдером.
+    matrix_right_idle = pv(page, "(() => { const li = document.querySelector("
+                                "'#pv-stages .pv-stage[data-key=\"matrix\"]');"
+                                " return li ? li.querySelector('.pv-stage-right').textContent.trim()"
+                                " : null; })()")
+    check("турновер реально прочитался в этом сценарии — карточка «Матрица» "
+          "согласованно говорит «готово», не молчит",
+          matrix_right_idle == "готово", str(matrix_right_idle))
 
     # Все пять карточек разом: даже когда stages[] пуст (реалистичный idle-
     # ответ без детализации по этапам), НИ ОДНА карточка не рисует голое
@@ -1359,6 +1433,82 @@ def part_loader_idle_partial(browser, cookies) -> None:
           all(r["right"] == "ожидает" for r in todo_human), str(todo_human))
 
     ctx.close()
+
+
+def part_loader_matrix_truth(browser, cookies) -> None:
+    """«Матрица готова» — обещание про экран «Оборачиваемость», не только про синк.
+
+    Синтетика: все четыре реальных этапа синхронизации помечены завершёнными
+    (state=done), но GET /api/turnover отдаёт 409 — сценарий, который
+    реально случается (конфликт состояния синка, сеть, любая другая ошибка
+    из errMessage()). До правки mainStatusText() смотрел только на
+    SEM_STAGES и говорил «Матрица готова», хотя следующий экран честно
+    писал «не удалось прочитать данные» — прямое противоречие в один шаг.
+    """
+    print("\n== §5 «Матрица готова» — только когда матрица реально прочиталась ==")
+    ctx = browser.new_context(viewport={"width": 1440, "height": 900})
+    ctx.add_cookies([{"name": k, "value": v, "domain": "127.0.0.1", "path": "/"}
+                     for k, v in cookies.items()])
+    page = ctx.new_page()
+    page.route("**/api/sync/progress", lambda route: route.fulfill(
+        status=200, content_type="application/json",
+        body='{"state":"done","mode":"initial","phase":"","progress_pct":100,'
+             '"detail":"","error":"","error_cause":"","coverage_days":730,'
+             '"history_days":730,"window_days":30,"months":[],'
+             '"stages":[{"key":"products","title":"Товары и цены","state":"done",'
+             '"seconds":3,"counts":{"products_total":40}},'
+             '{"key":"today","title":"Остатки на сегодня","state":"done",'
+             '"seconds":2,"counts":{"warehouses":3}},'
+             '{"key":"month","title":"Продажи","state":"done","seconds":4,"counts":{}},'
+             '{"key":"history","title":"История","state":"done","seconds":9,"counts":{}}],'
+             '"eta_sec":null,"started_at":null,"finished_at":null}'))
+    page.route("**/api/turnover", lambda route: route.fulfill(
+        status=409, content_type="application/json", body='{"detail":"conflict"}'))
+    page.goto(f"{BASE}{PREVIEW_URL}")
+    wait_ready(page)
+    for _ in range(6):
+        page.click(".pv-step.is-on [data-go='next']")
+        page.wait_for_timeout(80)
+    page.wait_for_selector("[data-step='loader'].is-on")
+
+    mainstatus = page.inner_text("#pv-mainstatus") or ""
+    check("синк завершён, но турновер не прочитался: НЕ говорим «Матрица готова»",
+          "Матрица готова" not in mainstatus, mainstatus)
+    check("вместо этого честно — синхронизация завершена, матрица недоступна",
+          "инхронизация завершена" in mainstatus and "недоступна" in mainstatus,
+          mainstatus)
+
+    ctx.close()
+
+    # Контрольная ветка: то же самое (все стадии done), но турновер читается
+    # нормально — «Матрица готова» обязана вернуться. Без этой ветки правка
+    # пункта 2 могла бы тайно сломать нормальный путь «всё хорошо».
+    ctx2 = browser.new_context(viewport={"width": 1440, "height": 900})
+    ctx2.add_cookies([{"name": k, "value": v, "domain": "127.0.0.1", "path": "/"}
+                      for k, v in cookies.items()])
+    page2 = ctx2.new_page()
+    page2.route("**/api/sync/progress", lambda route: route.fulfill(
+        status=200, content_type="application/json",
+        body='{"state":"done","mode":"initial","phase":"","progress_pct":100,'
+             '"detail":"","error":"","error_cause":"","coverage_days":730,'
+             '"history_days":730,"window_days":30,"months":[],'
+             '"stages":[{"key":"products","title":"Товары и цены","state":"done",'
+             '"seconds":3,"counts":{"products_total":40}},'
+             '{"key":"today","title":"Остатки на сегодня","state":"done",'
+             '"seconds":2,"counts":{"warehouses":3}},'
+             '{"key":"month","title":"Продажи","state":"done","seconds":4,"counts":{}},'
+             '{"key":"history","title":"История","state":"done","seconds":9,"counts":{}}],'
+             '"eta_sec":null,"started_at":null,"finished_at":null}'))
+    page2.goto(f"{BASE}{PREVIEW_URL}")
+    wait_ready(page2)
+    for _ in range(6):
+        page2.click(".pv-step.is-on [data-go='next']")
+        page2.wait_for_timeout(80)
+    page2.wait_for_selector("[data-step='loader'].is-on")
+    mainstatus2 = page2.inner_text("#pv-mainstatus") or ""
+    check("контроль: синк завершён И турновер читается нормально — «Матрица готова» на месте",
+          "Матрица готова" in mainstatus2, mainstatus2)
+    ctx2.close()
 
 
 def part_responsive(browser, cookies) -> None:
@@ -1463,9 +1613,20 @@ def part_responsive(browser, cookies) -> None:
                   sheet_box[0] == 0 and sheet_box[1] >= 380, str(sheet_box))
             page.keyboard.press("Escape")
             page.wait_for_timeout(150)
-        # Экскурсия на каждом размере: снимок для приёмки.
+        # Экскурсия на каждом размере: снимок для приёмки. Диалог открывается,
+        # renderTour() запускает scrollIntoView() к подсвеченной ячейке —
+        # ждём, пока прокрутка реально остановится, прежде чем снимать (см.
+        # wait_scroll_stable): иначе кадр ловит середину плавной анимации.
         page.click("#pv-tour-start")
         page.wait_for_selector("#pv-tour:not([hidden])")
+        wait_scroll_stable(page)
+        tour_box = page.evaluate(
+            "() => { const r = document.getElementById('pv-tour').getBoundingClientRect();"
+            " return { top: r.top, bottom: r.bottom, h: window.innerHeight }; }")
+        check(f"{tag}: диалог экскурсии кадрирован стабильно (не обрезан по высоте) "
+              "в момент съёмки",
+              tour_box["h"] > 0 and tour_box["bottom"] <= tour_box["h"] + 1
+              and tour_box["top"] >= -1, str(tour_box))
         page.screenshot(path=str(SHOTS_DIR / f"preview_{tag}_tour.png"))
         page.keyboard.press("Escape")
         # Первый и седьмой экраны — тоже в артефакты.
@@ -1662,6 +1823,7 @@ def run() -> int:
             part_synthetic_contracts(out["browser"], {k: v for k, v in owner.cookies.items()},
                                       out["turnover"])
             part_loader_idle_partial(out["browser"], {k: v for k, v in owner.cookies.items()})
+            part_loader_matrix_truth(out["browser"], {k: v for k, v in owner.cookies.items()})
             part_responsive(out["browser"], {k: v for k, v in owner.cookies.items()})
         finally:
             out["browser"].close()

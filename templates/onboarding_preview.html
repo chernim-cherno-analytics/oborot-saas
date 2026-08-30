@@ -287,6 +287,7 @@ p{margin:0 0 12px;}
 }
 .pv-stage[data-state="done"] .pv-mark{background:var(--pv-green-soft);border-color:#b6ddc4;color:var(--pv-green);}
 .pv-stage[data-state="running"] .pv-mark{background:var(--pv-blue-soft);border-color:#a9c3f0;color:var(--pv-blue);}
+.pv-stage[data-state="error"] .pv-mark{background:var(--pv-red-soft);border-color:#f0b4b4;color:var(--pv-red);}
 .pv-stage[data-state="nofield"]{border-style:dashed;background:#fbfcfe;}
 .pv-stage-t{font-weight:650;}
 .pv-stage-sub{font-size:13px;color:var(--pv-ink-2);margin-top:2px;}
@@ -789,7 +790,7 @@ table.pv-t tbody tr.pv-hero{outline:2px solid var(--pv-blue);outline-offset:-2px
     </div>
 
     <div class="pv-note">
-      Можно закрыть вкладку или перезагрузить страницу — загрузка продолжится сама.
+      <span id="pv-close-note">Можно закрыть вкладку или перезагрузить страницу.</span>
       <details class="pv-tech">
         <summary>Технические детали</summary>
         <div class="pv-tech-body">
@@ -1301,9 +1302,9 @@ function renderGroups() {
    технических деталях под списком этапов и не часть первого прочтения.
    ══════════════════════════════════════════════════════════════════════════ */
 var SEM_STAGES = [
-  { key: "connection", title: "Подключение",
+  { key: "connection", title: "Данные источника",
     bind: "state, error, error_cause",
-    sub: "Есть ли рабочее соединение с источником данных." },
+    sub: "Что уже получено от источника данных." },
   { key: "catalog", title: "Товары и остатки",
     bind: "stages[products], stages[today], stages[today].counts.warehouses",
     sub: "Каталог, цены и остатки по складам." },
@@ -1336,19 +1337,22 @@ function liveStageState(sem, p) {
     return { state: found.state, right: right, counts: found.counts || {} };
   }
   if (sem.key === "connection") {
-    /* Правая колонка — человеческое слово, а не сырое значение p.state
-       (idle/pending/…): подпись контракта видна в свёрнутых технических
-       деталях (см. bindLines в renderBoard), а не в первом прочтении.
-       «idle» — это «синхронизация сейчас не идёт», а НЕ «связи нет»: если
-       что-то уже загружено (покрытие истории или прогресс других этапов),
-       соединение явно рабочее, и подпись «ожидает» лгала бы, намекая на
-       обрыв связи там, где на деле просто нет активной задачи синка. */
+    /* Этот этап доказывает только ФАКТ получения данных от источника —
+       coverage_days/stages говорят «что-то когда-то получено», а не «связь
+       жива прямо сейчас»: у нас нет отдельного сигнала о состоянии токена
+       или соединения, и подписывать эту карточку «Подключение — готово»
+       значило бы утверждать то, чего мы не проверяли. Поэтому и заголовок
+       («Данные источника»), и слова — только про то, что реально в руках:
+       «получаем» (идёт прямо сейчас), «получены» (синк только что завершился),
+       «получены ранее» (данные есть, но синк сейчас не идёт — это и есть
+       честный смысл idle при непустом coverage_days), «ожидает» (данных
+       вообще ещё нет). Сырое p.state остаётся в технических деталях. */
     if (p.error) return { state: "error", right: "ошибка" };
-    if (p.state === "running") return { state: "running", right: "идёт" };
-    if (p.state === "done") return { state: "done", right: "готово" };
+    if (p.state === "running") return { state: "running", right: "получаем" };
+    if (p.state === "done") return { state: "done", right: "получены" };
     var hasData = (p.coverage_days || 0) > 0 ||
       (p.stages || []).some(function (s) { return s.state === "done" || s.state === "running"; });
-    if (hasData) return { state: "done", right: "готово" };
+    if (hasData) return { state: "done", right: "получены ранее" };
     return { state: "todo", right: "ожидает" };
   }
   if (sem.key === "catalog") {
@@ -1389,7 +1393,17 @@ function mainStatusText(demo, p) {
     if (r.state === "done") done++;
     else if (!current) current = sem;
   });
-  if (done === real.length) return { text: "Матрица готова.", spin: false, done: true };
+  if (done === real.length) {
+    /* «Матрица готова» — обещание про экран «Оборачиваемость», а не только
+       про синхронизацию: если /api/turnover не прочитался (сеть, 409, любая
+       другая ошибка — см. errMessage()), матрицы физически нет, и говорить
+       «готова» значило бы обещать то, чего нет на следующем экране. Синк
+       при этом мог реально завершиться — это тоже правда, и её тоже стоит
+       сказать, просто не как «матрица готова». */
+    if (PV.data.turnover) return { text: "Матрица готова.", spin: false, done: true };
+    return { text: "Синхронизация завершена. Матрица недоступна: не удалось прочитать данные" +
+      (PV.errors.turnover ? " (" + PV.errors.turnover + ")" : "") + ".", spin: false, done: false };
+  }
   var cov = p.coverage_days || 0, need = p.history_days || 0;
   /* Частичная история — самый важный факт, который есть прямо сейчас: если
      он есть, он выходит в заголовок статуса независимо от того, какой этап
@@ -1398,10 +1412,18 @@ function mainStatusText(demo, p) {
      но coverage_days уже реальные 400 из 730). Без этой проверки статус мог
      сказать «собираем: подключение», хотя история уже на 55% загружена. */
   if (need > 0 && cov > 0 && cov < need) {
-    var histExtra = " (" + num(cov) + " из " + num(need) + " дн.)";
-    if (p.eta_sec !== null && p.eta_sec !== undefined) histExtra += " · ещё ~" + num(p.eta_sec) + " с";
-    return { text: "Загружаем историю продаж" + histExtra + " · " + done + " из " +
-      real.length + " готово.", spin: true, done: false };
+    /* «Загружаем» и спиннер обещают активный процесс — это правда, только
+       когда p.state==="running". idle с тем же самым покрытием означает
+       ровно обратное: загрузка СЕЙЧАС НЕ идёт, и спиннер/ETA/«продолжится
+       сама» были бы придуманным движением там, где на самом деле пауза. */
+    if (p.state === "running") {
+      var histExtra = " (" + num(cov) + " из " + num(need) + " дн.)";
+      if (p.eta_sec !== null && p.eta_sec !== undefined) histExtra += " · ещё ~" + num(p.eta_sec) + " с";
+      return { text: "Загружаем историю продаж" + histExtra + " · " + done + " из " +
+        real.length + " готово.", spin: true, done: false };
+    }
+    return { text: "История загружена частично: " + num(cov) + " из " + num(need) +
+      " дней. Загрузка сейчас не идёт.", spin: false, done: false };
   }
   var extra = "";
   if (current && current.key === "history") {
@@ -1431,6 +1453,15 @@ function renderBoard() {
   var demo = PV.board.mode === "demo";
   var p = PV.data.progress;
   renderMainStatus();
+  /* «Продолжится сама» — обещание активного процесса; произносим его только
+     когда синк реально идёт (p.state==="running"). Иначе — нейтральная
+     версия без обещания движения, которого нет. */
+  var closeNote = $("pv-close-note");
+  if (closeNote) {
+    closeNote.textContent = (!demo && p && p.state === "running")
+      ? "Можно закрыть вкладку или перезагрузить страницу — загрузка продолжится сама."
+      : "Можно закрыть вкладку или перезагрузить страницу.";
+  }
 
   if (!demo && !p) {
     box.innerHTML = '<li class="pv-stage"><span class="pv-mark">!</span>' +
@@ -1457,15 +1488,17 @@ function renderBoard() {
         ' aria-valuemax="100" aria-valuenow="' + pct + '" aria-label="Демонстрация хода этапа ' +
         esc(sem.title) + '"><i style="width:' + pct + '%"></i></div>';
     } else if (sem.bind === null) {
-      /* Поля в контракте нет — и полоски прогресса тоже нет. Пунктирная рамка
-         карточки (см. CSS [data-state="nofield"]) уже показывает разницу на
-         вид; ни жаргон «нет поля», ни голый тире-плейсхолдер сюда не идут —
-         оба читаются как «пусто/сломано». Правая колонка просто пустая:
-         честнее промолчать про то, чего мы не измеряем, чем нарисовать
-         тире, которое выглядит как «ноль» или «ошибка». Объяснение — в
-         технических деталях (bindLines ниже). */
-      st = "nofield";
-      right = "";
+      /* У «Матрицы» нет своего поля в контракте синка — но у неё есть
+         косвенная, настоящая улику: сама матрица — это то, что построено
+         из ответа GET /api/turnover, и его наличие/отсутствие в PV.data —
+         не выдумка, а факт, который страница уже знает. Раньше карточка
+         всегда молчала («nofield», пустая колонка) — это было честно про
+         отсутствие ПОЛЯ КОНТРАКТА, но создавало противоречие с заголовком
+         «Матрица готова»: сам заголовок мог сказать «готова», пока карточка
+         снизу упорно ничего не подтверждала. Теперь у карточки то же
+         основание для правды, что и у заголовка. */
+      if (PV.data.turnover) { st = "done"; right = "готово"; }
+      else { st = "error"; right = "недоступна"; }
     } else {
       var r = liveStageState(sem, p);
       st = r.state;
@@ -1847,13 +1880,23 @@ function renderMoney() {
   }
   var m = d.money || {}, b = d.below_cost || {};
   box.classList.add("is-on");
+  /* Позиции без себестоимости (no_cost) в валовую маржу не входят вовсе —
+     см. app/analytics.money_totals(): показать по ним ноль означало бы
+     соврать про заработанное. Боевая «Оборачиваемость» об этом прямо
+     говорит рядом с суммой (templates/turnover.html, moneyNote()); здесь та
+     же оговорка теми же готовыми полями ответа (no_cost_positions,
+     positions), без пересчёта и без новой формулы — только показ. */
+  var marginNote = m.no_cost_positions
+    ? '<span class="pv-sub">только позиции с себестоимостью — ' +
+      num((m.positions || 0) - m.no_cost_positions) + ' из ' + num(m.positions) + '</span>'
+    : "";
   box.innerHTML =
     '<div class="pv-tile"><span class="pv-muted">Заморожено по себестоимости</span>' +
       "<b>" + money(m.stock_cost) + "</b></div>" +
     '<div class="pv-tile"><span class="pv-muted">Если продать</span>' +
       "<b>" + money(m.stock_sale) + "</b></div>" +
     '<div class="pv-tile"><span class="pv-muted">Валовая маржа за год</span>' +
-      "<b>" + money(m.gross_margin) + "</b></div>";
+      "<b>" + money(m.gross_margin) + "</b>" + marginNote + "</div>";
   loss.innerHTML = b.positions
     ? '<div class="pv-note stop">Продаётся ниже себестоимости: <b>' + num(b.positions) +
       "</b> " + plural(b.positions, "позиция", "позиции", "позиций") +
