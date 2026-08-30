@@ -1736,7 +1736,7 @@ function pickHero(items) {
   return rank[Math.floor(rank.length / 2)];
 }
 
-function renderTurnover() {
+function renderTurnover(preserveHero) {
   var head = $("pv-thead"), body = $("pv-tbody"), foot = $("pv-tfoot");
   var footShort = $("pv-tfoot-short");
   var d = PV.data.turnover;
@@ -1764,8 +1764,10 @@ function renderTurnover() {
   var arch = items.filter(function (it) { return it.hidden; });
   /* Строка героя экскурсии выбирается из ПОЛНОГО списка, а не из отфильтрованного
      поиском: иначе набранный в поле поиска текст незаметно переставлял бы, какая
-     строка учит экскурсии. */
-  PV.hero = pickHero(live);
+     строка учит экскурсии. preserveHero=true — единственное исключение: так
+     openTour() перерисовывает таблицу ПОСЛЕ того, как сам сознательно выбрал
+     героя из видимых (см. openTour()), и этот выбор здесь нельзя затирать. */
+  if (!preserveHero) PV.hero = pickHero(live);
   var over = PV.data.overrides || {};
 
   var q = (PV.search || "").trim().toLowerCase();
@@ -1775,6 +1777,10 @@ function renderTurnover() {
   var archShown = q ? arch.filter(function (it) {
     return String(it.base_name || "").toLowerCase().indexOf(q) !== -1;
   }) : arch;
+  /* Запоминаем, что реально отрисовано СЕЙЧАС (после поиска) — нужно openTour(),
+     чтобы решить, годится ли текущий PV.hero для экскурсии, или его надо
+     пересчитать на видимый набор строк (см. openTour()). */
+  PV.liveShown = liveShown;
 
   var groupTitles = { rank: "Рейтинг", low_data: "Мало данных", no_sales: "Без продаж за год" };
   var html = [], seen = {};
@@ -2133,6 +2139,28 @@ function openTour(fromEl) {
      экскурсии, так что итоговый фокус и PV.tour.opener всегда относятся к
      ЭТОМУ диалогу, а не к попапу объяснений. */
   closeHelp();
+  /* Экскурсия обязана описывать строку, которая реально отрисована в
+     таблице ПРЯМО СЕЙЧАС: PV.hero выбирается один раз на полном списке
+     (renderTurnover(), намеренно — чтобы герой не «прыгал» при каждом
+     нажатии клавиши в поиске), но если активный поиск в итоге скрыл именно
+     его строку, вести по ней экскурсию нечестно — подсвечивать нечего, а
+     числа в тексте не совпадают с тем, что видно на экране. Пересчитываем
+     героя на видимый набор ТОЛЬКО в этом случае; если поиск пуст или
+     прежний герой всё ещё виден — ничего не меняется. */
+  var shown = PV.liveShown || [];
+  var heroVisible = PV.hero && shown.some(function (it) {
+    return it.base_name === PV.hero.base_name;
+  });
+  if (!heroVisible) {
+    PV.hero = pickHero(shown);
+    /* DOM таблицы уже отрисован со СТАРЫМ героем (его data-tour/pv-hero
+       достались другой строке или вообще никакой, если поиск скрыл её
+       целиком) — перерисовываем таблицу с уже пересчитанным PV.hero, чтобы
+       атрибуты data-tour оказались именно на новой, видимой строке.
+       preserveHero=true — иначе renderTurnover() тут же выбрал бы героя
+       заново из ПОЛНОГО списка и свёл на нет только что сделанный выбор. */
+    renderTurnover(true);
+  }
   if (!PV.hero) {
     /* Экскурсия по несуществующей строке — это выдуманная экскурсия. Молчать
        тоже нельзя: человек нажал кнопку и должен узнать причину. */

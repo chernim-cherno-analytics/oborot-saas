@@ -1314,6 +1314,60 @@ def part_synthetic_contracts(browser, cookies, template_turnover: dict) -> None:
           "исключался)",
           hero_name == "§5 Возвраты", str(hero_name))
 
+    print("== §5 Поиск скрывает героя — тур описывает видимую строку, не скрытую ==")
+    # Прежний герой «§5 Возвраты» не подходит под запрос «Честный» — он
+    # исчезает из видимой таблицы, но «§5 Честный ноль» (тоже rank,
+    # !low_data, !hidden, !archived) остаётся. Тур обязан переключиться на
+    # видимую строку: до правки PV.hero оставался «§5 Возвраты», текст тура
+    # описывал скрытую строку, а подсветка не находила её в DOM (строка не
+    # отрисована) и не подсвечивала ничего.
+    page.fill("#pv-search", "Честный")
+    page.wait_for_timeout(150)
+    check("поиск действительно оставил видимой ровно «§5 Честный ноль»",
+          pv(page, "Array.from(document.querySelectorAll("
+                   "'#pv-tbody tr:not(.pv-grouprow)')).map(tr => tr.textContent)")
+          .__len__() == 1,
+          str(pv(page, "document.querySelectorAll('#pv-tbody tr:not(.pv-grouprow)').length")))
+    page.click("#pv-tour-start")
+    page.wait_for_selector("#pv-tour:not([hidden])")
+    hero_after_search = pv(page, "window.__PV__.hero && window.__PV__.hero.base_name")
+    check("герой экскурсии переключился на видимую после поиска строку "
+          "(«§5 Честный ноль»), не остался на скрытой «§5 Возвраты»",
+          hero_after_search == "§5 Честный ноль", str(hero_after_search))
+    highlighted = pv(page, "Array.from(document.querySelectorAll("
+                          "'#pv-tbody .pv-hl')).map(el => el.getAttribute('data-tour'))")
+    check("хотя бы одна ячейка данных подсвечена в диалоге тура (не «ничего»)",
+          len(highlighted) > 0, str(highlighted))
+    highlighted_row_text = pv(page, "(() => { const hl = document.querySelector"
+                                    "('#pv-tbody .pv-hl'); if (!hl) return null;"
+                                    " const tr = hl.closest('tr'); return tr ? tr.textContent : null; })()")
+    check("подсвеченная ячейка принадлежит именно видимой (отрисованной) "
+          "строке-герою, а не скрытой строке вне DOM",
+          highlighted_row_text and "§5 Честный ноль" in highlighted_row_text,
+          str(highlighted_row_text)[:200])
+    page.keyboard.press("Escape")
+    page.wait_for_timeout(120)
+
+    print("== §5 Поиск без единой rank-строки — честное «показать не на чем», не старая копия ==")
+    page.fill("#pv-search", "zzz-нет-такого-товара-zzz")
+    page.wait_for_timeout(150)
+    check("поиск без совпадений оставил таблицу пустой",
+          pv(page, "document.querySelectorAll('#pv-tbody tr:not(.pv-grouprow)').length") == 0
+          or pv(page, "(document.querySelector('#pv-tbody') || {}).textContent || ''")
+          .find("§5") == -1)
+    page.click("#pv-tour-start")
+    page.wait_for_selector("#pv-tour:not([hidden])")
+    tour_title_empty = page.text_content("#pv-tour-title") or ""
+    check("тур честно говорит «показать не на чем», а не описывает старую "
+          "(теперь скрытую) строку",
+          "показать не на чем" in tour_title_empty.lower(), tour_title_empty)
+    check("PV.hero сброшен в null — не осталась ссылка на скрытую строку",
+          pv(page, "window.__PV__.hero") is None)
+    page.keyboard.press("Escape")
+    page.wait_for_timeout(120)
+    page.fill("#pv-search", "")
+    page.wait_for_timeout(150)
+
     print("== §5 Ниже себестоимости: below_cost.positions, а не отсутствующее .count ==")
     loss_text = page.inner_text("#pv-loss") or ""
     check("алерт называет 3 позиции — ровно below_cost.positions из ответа ручки",
