@@ -2006,10 +2006,28 @@ function renderMoney() {
       "<b>" + money(m.stock_sale) + "</b></div>" +
     '<div class="pv-tile"><span class="pv-muted">Валовая маржа за год</span>' +
       "<b>" + money(m.gross_margin) + "</b>" + noCostNote + "</div>";
-  loss.innerHTML = b.positions
-    ? '<div class="pv-note stop">Продаётся ниже себестоимости: <b>' + num(b.positions) +
-      "</b> " + plural(b.positions, "позиция", "позиции", "позиций") +
-      ". Числа взяты из ответа ручки (below_cost.positions), не пересчитаны.</div>"
+  /* below_cost различает «сильные» позиции (positions — уверенный вывод) и
+     «слабые» (low_data_positions — тоже в минусе, но продаж мало, чтобы
+     считать это правилом; см. app/analytics.below_cost_report() и то же
+     разделение в боевой «Оборачиваемости», templates/turnover.html,
+     renderLoss()). Раньше здесь смотрели только на b.positions: если он
+     нулевой, а low_data_positions>0, экран лгал — «в ответе ручки нет»,
+     хотя ручка как раз называет N позиций ниже себестоимости, просто со
+     слабой статистикой. «Нет вообще» — правда только когда оба счётчика
+     нулевые разом. */
+  var lossParts = [];
+  if (b.positions) {
+    lossParts.push('<div class="pv-note stop">Продаётся ниже себестоимости: <b>' +
+      num(b.positions) + "</b> " + plural(b.positions, "позиция", "позиции", "позиций") +
+      ". Числа взяты из ответа ручки (below_cost.positions), не пересчитаны.</div>");
+  }
+  if (b.low_data_positions) {
+    lossParts.push('<div class="pv-note">Ещё <b>' + num(b.low_data_positions) + "</b> " +
+      plural(b.low_data_positions, "позиция", "позиции", "позиций") +
+      " продаётся ниже себестоимости, но данных мало — вывод предварительный " +
+      "(below_cost.low_data_positions), не пересчитан.</div>");
+  }
+  loss.innerHTML = lossParts.length ? lossParts.join("")
     : '<div class="pv-note">Позиций, продающихся ниже себестоимости, в ответе ручки нет.</div>';
 }
 

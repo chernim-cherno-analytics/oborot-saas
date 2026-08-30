@@ -1267,6 +1267,10 @@ def part_synthetic_contracts(browser, cookies, template_turnover: dict) -> None:
                          item_hidden, item_archived_weak, item_weak_lowdata]
     payload["below_cost"] = dict(payload.get("below_cost") or {})
     payload["below_cost"]["positions"] = 3
+    # low_data_positions — «слабые» below_cost-позиции (тоже в минусе, но
+    # продаж мало для уверенного вывода). Ненулевой и positions, и
+    # low_data_positions разом — сценарий «есть и уверенные, и слабые».
+    payload["below_cost"]["low_data_positions"] = 2
     # app/analytics.money_totals() исключает no_cost-позиции из gross_margin
     # целиком (показать по ним ноль значило бы соврать про заработанное) и
     # отдаёт no_cost_positions/positions, чтобы экран мог честно сказать,
@@ -1470,6 +1474,52 @@ def part_synthetic_contracts(browser, cookies, template_turnover: dict) -> None:
     loss_text = page.inner_text("#pv-loss") or ""
     check("алерт называет 3 позиции — ровно below_cost.positions из ответа ручки",
           "3" in loss_text and "позици" in loss_text, loss_text[:200])
+    check("алерт ОТДЕЛЬНО называет 2 слабых (low_data) below_cost-позиции, "
+          "не сваливает их в общее число и не молчит про них",
+          "2" in loss_text and "данных мало" in loss_text.lower(), loss_text[:300])
+
+    def below_cost_scenario(strong_positions, weak_positions):
+        p = copy.deepcopy(payload)
+        p["below_cost"] = dict(payload["below_cost"])
+        p["below_cost"]["positions"] = strong_positions
+        p["below_cost"]["low_data_positions"] = weak_positions
+        c = browser.new_context(viewport={"width": 1440, "height": 900})
+        c.add_cookies([{"name": k, "value": v, "domain": "127.0.0.1", "path": "/"}
+                       for k, v in cookies.items()])
+        pg = c.new_page()
+        pg.route("**/api/turnover", lambda route: route.fulfill(
+            status=200, content_type="application/json", body=json.dumps(p)))
+        pg.goto(f"{BASE}{PREVIEW_URL}")
+        wait_ready(pg)
+        for _ in range(7):
+            pg.click(".pv-step.is-on [data-go='next']")
+        pg.wait_for_selector("[data-step='turnover'].is-on")
+        pg.click("#pv-money-btn")
+        pg.wait_for_timeout(150)
+        return c, pg
+
+    print("== §5 below_cost: сильные=0, слабые>0 — честно называет слабые, "
+          "не лжёт «в ответе ручки нет» ==")
+    ctx_bw, page_bw = below_cost_scenario(0, 4)
+    loss_text_bw = page_bw.inner_text("#pv-loss") or ""
+    check("positions=0, low_data_positions=4: алерт называет 4 слабых "
+          "позиции, а не заявляет ложно, что в ответе ручки below_cost нет",
+          "4" in loss_text_bw and "данных мало" in loss_text_bw.lower(),
+          loss_text_bw[:300])
+    check("нет ложной фразы «в ответе ручки нет» — она правдива только когда "
+          "оба счётчика нулевые разом",
+          "в ответе ручки нет" not in loss_text_bw.lower(), loss_text_bw[:300])
+    ctx_bw.close()
+
+    print("== §5 below_cost: сильные=0, слабые=0 — честное «в ответе ручки нет» ==")
+    ctx_bn, page_bn = below_cost_scenario(0, 0)
+    loss_text_bn = page_bn.inner_text("#pv-loss") or ""
+    check("positions=0, low_data_positions=0: алерт честно говорит «в ответе "
+          "ручки нет» — оба счётчика действительно нулевые",
+          "в ответе ручки нет" in loss_text_bn.lower(), loss_text_bn[:300])
+    check("нет упоминания «данных мало» — слабых below_cost-позиций тоже нет",
+          "данных мало" not in loss_text_bn.lower(), loss_text_bn[:300])
+    ctx_bn.close()
 
     print("== §5 Валовая маржа и заморожено: qualification при no_cost_positions>0 ==")
     money_text = page.inner_text("#pv-money") or ""
