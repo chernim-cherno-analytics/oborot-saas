@@ -944,12 +944,19 @@ def _guard_envelope_size(envelope: dict) -> str:
 
 # ── Носитель снимка ──────────────────────────────────────────────────────────
 
-def select_carrier(db: Session, org_id: int) -> Connection | None:
-    """Основная связь организации — детерминированно и с фильтром по арендатору.
+def ordered_carriers(db: Session, org_id: int) -> list[Connection]:
+    """ВСЕ основные связи организации в едином каноническом порядке.
 
-    Порядок выбора задаётся кодом, а не базой: сначала `moysklad`, затем `demo`,
-    внутри вида — наименьший id. Иначе носитель мог бы «переехать» между двумя
-    обновлениями страницы, и снимок исчез бы на ровном месте.
+    ОДИН помощник на чтение и на запись — намеренно. Пока порядок чтения и
+    порядок записи задавались бы в двух местах, они рано или поздно разъехались
+    бы, и снимок писался бы в одну строку, а читался из другой. Здесь этого не
+    может случиться конструктивно: и `select_carrier`, и `read_envelope` берут
+    список отсюда.
+
+    Порядок задаётся кодом, а не базой: сначала `moysklad`, затем `demo`,
+    внутри вида — наименьший id. Порядок вставки и время создания в него не
+    входят вовсе: иначе носитель «переезжал» бы между двумя обновлениями
+    страницы, и снимок исчезал бы на ровном месте.
     """
     rows = db.execute(
         select(Connection).where(
@@ -957,9 +964,18 @@ def select_carrier(db: Session, org_id: int) -> Connection | None:
             Connection.kind.in_(PRIMARY_CONNECTION_KINDS),
         )
     ).scalars().all()
-    if not rows:
-        return None
-    return sorted(rows, key=lambda c: (_KIND_RANK.get(c.kind, 99), c.id))[0]
+    return sorted(rows, key=lambda c: (_KIND_RANK.get(c.kind, 99), c.id))
+
+
+def select_carrier(db: Session, org_id: int) -> Connection | None:
+    """Канонический носитель ЗАПИСИ. Первый в каноническом порядке.
+
+    Запись всегда идёт сюда — независимо от того, где сегодня физически лежит
+    прежний снимок. Так у снимка есть ровно одно место, которое считается
+    текущим, и «куда писать» не зависит от истории организации.
+    """
+    rows = ordered_carriers(db, org_id)
+    return rows[0] if rows else None
 
 
 def _load_config(conn: Connection) -> dict:
@@ -1033,15 +1049,8 @@ def _validate_envelope(envelope: dict) -> dict:
     return envelope
 
 
-def get_envelope(db: Session, org_id: int) -> dict | None:
-    """Текущий снимок организации или None. Чужие ключи не трогаются.
-
-    Отсутствие ключа — это None (нормальное «ещё не читали»). А вот ключ,
-    который есть, но читается не так, — отказ: см. `_validate_envelope`.
-    """
-    conn = select_carrier(db, org_id)
-    if conn is None:
-        return None
+def _envelope_of(conn: Connection) -> dict | None:
+    """Снимок ИЗ ОДНОЙ строки: None, если ключа нет; отказ, если он нечитаем."""
     data = _load_config(conn)
     if ENVELOPE_KEY not in data:
         return None
@@ -1052,6 +1061,42 @@ def get_envelope(db: Session, org_id: int) -> dict | None:
             "запись. Он оставлен как есть и не переписан."
         )
     return _validate_envelope(envelope)
+
+
+def read_envelope(db: Session, org_id: int) -> tuple[Connection | None, dict | None]:
+    """Где снимок ФАКТИЧЕСКИ лежит и что в нём. Только чтение, ни одной записи.
+
+    ЗАЧЕМ ЭТО ОТДЕЛЬНО ОТ `select_carrier`. Носитель записи — канонический
+    (первый в порядке), но снимок мог быть записан РАНЬШЕ, когда канонической
+    была другая строка. Живой сценарий, найденный независимой проверкой: у
+    организации есть удачный снимок в `demo`; позже появляется пустая связь
+    `moysklad` — и чтение «только из канонического носителя» перестало бы
+    показывать снимок вовсе. Данные при этом целы и лежат рядом. Обещание
+    «прежний успешный снимок остаётся видимым» — часть контракта этого слоя, и
+    держаться оно должно фактом, а не удачным порядком подключений.
+
+    Поэтому читатель идёт по ТОМУ ЖЕ каноническому порядку и возвращает первую
+    строку, где ключ действительно есть.
+
+    И ГЛАВНОЕ ОГРАНИЧЕНИЕ: первый ВСТРЕЧЕННЫЙ снимок проверяется немедленно и
+    fail closed. Перепрыгнуть повреждённый или неизвестной версии снимок к
+    более старому нельзя — это подменило бы правду тем, что удобнее, и человек
+    увидел бы старые данные, не зная, что рядом лежит непрочитанный снимок.
+    Молчаливый откат к предыдущему состоянию — это и есть тот класс ошибок,
+    против которого написан весь этот слой.
+    """
+    for conn in ordered_carriers(db, org_id):
+        data = _load_config(conn)
+        if ENVELOPE_KEY not in data:
+            continue
+        # Валидация ровно здесь, на ПЕРВОМ встреченном: см. абзац выше.
+        return conn, _envelope_of(conn)
+    return None, None
+
+
+def get_envelope(db: Session, org_id: int) -> dict | None:
+    """Фактический снимок организации или None. Чужие ключи не трогаются."""
+    return read_envelope(db, org_id)[1]
 
 
 def _store(db: Session, org_id: int, envelope: dict) -> None:
@@ -1073,6 +1118,10 @@ def _store(db: Session, org_id: int, envelope: dict) -> None:
     data[ENVELOPE_KEY] = envelope
     conn.config_json = json.dumps(data, ensure_ascii=False)
     db.commit()
+    # Прежний носитель, если снимок лежал не здесь, НЕ трогается: ни его
+    # снимок, ни любое другое содержимое его `config_json`. Удалять оттуда
+    # копию было бы разрушительной операцией ради опрятности — а опрятность не
+    # стоит риска остаться вовсе без снимка, если запись сюда потом откатят.
 
 
 def _skeleton(spreadsheet_id: str, sheet_names: list[str]) -> dict:
@@ -1153,7 +1202,9 @@ def refresh(db: Session, org_id: int, spreadsheet_url: str, sheet_names,
 
     # Читаемость уже лежащего снимка проверяется ДО сети: снимок, который мы не
     # умеем прочитать, мы не имеем права и перезаписать, а узнать об этом после
-    # двух GET значило бы сходить в чужую систему впустую.
+    # двух GET значило бы сходить в чужую систему впустую. Проверяется тот
+    # снимок, который ФАКТИЧЕСКИ найден (он может лежать не в каноническом
+    # носителе), — и повреждённый останавливает обновление здесь же.
     get_envelope(db, org_id)
 
     with _org_lock(org_id):
@@ -1325,13 +1376,17 @@ def preview(db: Session, org_id: int, role: str, sheet: str | None = None,
     if limit < 1 or limit > 200:
         raise ValidationError("limit должен быть от 1 до 200.")
 
-    carrier = select_carrier(db, org_id)
-    envelope = get_envelope(db, org_id) if carrier is not None else None
+    # Один проход по носителям: есть ли вообще где хранить и где снимок лежит
+    # фактически. `read_envelope` не пишет ничего — GET остаётся строго
+    # read-only, включая случай, когда снимок нашёлся не в каноническом
+    # носителе: переносить его «заодно» здесь нельзя, перенос — это запись.
+    carriers = ordered_carriers(db, org_id)
+    envelope = read_envelope(db, org_id)[1] if carriers else None
 
     base = {
         "role": role,
         "can_refresh": role == "owner",
-        "carrier_present": carrier is not None,
+        "carrier_present": bool(carriers),
         "queue": queue,
         "sheet": sheet or "",
         "offset": offset,

@@ -1424,6 +1424,268 @@ def envelope_version_checks() -> None:
         holder.close()
 
 
+# ── Непрерывность снимка при смене носителя ─────────────────────────────────
+
+def _conn_rows(org_id: int):
+    """Все связи организации: id, вид, config_json и НЕ-config поля."""
+    return sql("SELECT id, kind, config_json, token_enc, status, last_sync_at,"
+               " ms_agent_sync_id, ms_agent_href FROM connections"
+               " WHERE org_id = ? ORDER BY id", org_id)
+
+
+def _conn_by_kind(org_id: int, kind: str):
+    for row in _conn_rows(org_id):
+        if row[1] == kind:
+            return row
+    return None
+
+
+def _env_of(row) -> dict | None:
+    cfg = json.loads(row[2] or "{}")
+    value = cfg.get(ss.ENVELOPE_KEY)
+    return value if isinstance(value, dict) else None
+
+
+def continuity_checks() -> None:  # noqa: C901 — сценарный тест: шагов много
+    """Снимок не должен исчезать оттого, что рядом появилась новая связь.
+
+    Дефект, найденный независимой подготовкой к ревью: носитель ЗАПИСИ выбирался
+    канонически (`moysklad` → `demo`), а читатель смотрел ТОЛЬКО в него. Успешный
+    снимок в `demo` + появившаяся позже пустая связь `moysklad` = снимок пропал
+    с экрана, хотя данные целы. А следующая неудача записала бы в `moysklad`
+    пустой skeleton и закрепила бы пропажу.
+
+    Здесь проверяется поведение целиком: чтение идёт по тому же каноническому
+    порядку и берёт первый носитель, где снимок ЕСТЬ; повреждённый снимок
+    останавливает чтение, а не пропускается ради более старого; запись всегда
+    идёт в канонический носитель и прежний снимок не разрушает.
+    """
+    print("\n== Снимок в demo, затем появляется пустой МойСклад ==")
+    cont = client()
+    cont.post("/register", data={"name": "Непрерывность", "email": "sheets-h@test.io",
+                                "password": "secret123", "org_name": "Бренд-З"})
+    cont.post("/api/connect/demo")
+    org_id = sql("SELECT org_id FROM memberships WHERE user_id ="
+                 " (SELECT id FROM users WHERE email = 'sheets-h@test.io')")[0][0]
+    demo = _conn_by_kind(org_id, "demo")
+    check("демо-связь заведена и она единственная",
+          demo is not None and len(_conn_rows(org_id)) == 1, str(_conn_rows(org_id)))
+    demo_cfg = json.loads(demo[2] or "{}")
+    demo_cfg["keep_demo"] = {"чужое": [1, 2]}
+    exec_sql("UPDATE connections SET config_json = ? WHERE id = ?",
+             json.dumps(demo_cfg, ensure_ascii=False), demo[0])
+
+    fake = FakeGoogle()
+    ss.set_transport(fake)
+    try:
+        r = cont.post("/api/supply/sheets/refresh",
+                      json={"spreadsheet_url": SHEET_URL,
+                            "sheet_names": [SHEET_CURRENT, SHEET_NEXT]})
+        check("первый снимок создан в демо-связи", r.status_code == 200, r.text[:140])
+        good = _env_of(_conn_by_kind(org_id, "demo"))
+        check("и он действительно лежит именно в демо", good is not None)
+        good_hash = good["content_sha256"]
+        good_rows = json.dumps(good["rows"], ensure_ascii=False, sort_keys=True)
+        good_success = good["last_success_at"]
+        demo_blob_before = _conn_by_kind(org_id, "demo")[2]
+
+        # Появляется пустая связь МойСклада — она становится КАНОНИЧЕСКОЙ.
+        ms_id = exec_sql(
+            "INSERT INTO connections (org_id, kind, token_enc, status, config_json,"
+            " last_sync_at, ms_agent_sync_id, ms_agent_href)"
+            " VALUES (?, 'moysklad', 'tok-ms', 'active', ?, '2026-08-30 10:00:00',"
+            " 'sync-1', 'href-1')", org_id, json.dumps({"ms_own": 42}))
+        db = SessionLocal()
+        try:
+            check("канонический носитель ЗАПИСИ теперь МойСклад",
+                  ss.select_carrier(db, org_id).id == ms_id,
+                  str(ss.select_carrier(db, org_id).id))
+            found, env = ss.read_envelope(db, org_id)
+            check("а ЧТЕНИЕ находит снимок там, где он лежит — в демо",
+                  found is not None and found.id == demo[0] and env is not None,
+                  str(found and found.id))
+        finally:
+            db.close()
+
+        print("\n== GET после появления новой связи: снимок на месте, записи нет ==")
+        before = _fingerprint()
+        fake.calls.clear()
+        data = cont.get("/api/supply/sheets?limit=200").json()
+        check("прежний хеш виден", data["content_sha256"] == good_hash,
+              data["content_sha256"][:16])
+        check("прежнее время успеха видно",
+              data["last_success_at"] == good_success, str(data["last_success_at"]))
+        check("строки видны, а не пропали", data["total"] == 10, str(data["total"]))
+        check("источник считается настроенным", data["configured"] is True)
+        check("GET не сделал НИ ОДНОЙ записи в базу",
+              _diff(before, _fingerprint()) == [], str(_diff(before, _fingerprint())))
+        check("и ни одного сетевого вызова", fake.calls == [], str(fake.calls))
+
+        print("\n== Неудачное обновление после перехода ==")
+        fake.bodies[SHEET_NEXT] = ss.HttpResponse(
+            403, {}, b"forbidden body", "https://docs.google.com/x")
+        r = cont.post("/api/supply/sheets/refresh",
+                      json={"spreadsheet_url": SHEET_URL,
+                            "sheet_names": [SHEET_CURRENT, SHEET_NEXT]})
+        check("отказ источника — 502", r.status_code == 502, r.text[:120])
+        ms_env = _env_of(_conn_by_kind(org_id, "moysklad"))
+        check("в МойСклад приехал ПРЕЖНИЙ УСПЕШНЫЙ снимок, а не пустой skeleton",
+              ms_env is not None and ms_env["content_sha256"] == good_hash,
+              str(ms_env and ms_env["content_sha256"][:16]))
+        check("вместе с прежними строками до байта",
+              json.dumps(ms_env["rows"], ensure_ascii=False, sort_keys=True) == good_rows)
+        check("и прежним временем успеха",
+              ms_env["last_success_at"] == good_success, str(ms_env["last_success_at"]))
+        check("плюс новая безопасная ошибка",
+              "403" in ms_env["last_error"] and "forbidden body" not in ms_env["last_error"],
+              ms_env["last_error"][:110])
+        check("демо-связь не изменилась НИ НА БАЙТ",
+              _conn_by_kind(org_id, "demo")[2] == demo_blob_before)
+        shown = cont.get("/api/supply/sheets?limit=200").json()
+        check("экран показывает строки и ошибку, а не skeleton",
+              shown["total"] == 10 and "403" in shown["last_error"]
+              and shown["configured"] is True, str(shown["total"]))
+
+        print("\n== Удачное обновление после перехода пишет только в МойСклад ==")
+        moved = next_rows()
+        moved.append(put(blank(), {2: "2002", 3: "Шапка НГ", 5: "Белый",
+                                   10: "4", 11: "4", 14: "2", 15: "10"}))
+        fake.bodies[SHEET_NEXT] = to_csv(moved)
+        r = cont.post("/api/supply/sheets/refresh",
+                      json={"spreadsheet_url": SHEET_URL,
+                            "sheet_names": [SHEET_CURRENT, SHEET_NEXT]})
+        check("обновление удалось", r.status_code == 200, r.text[:140])
+        new_hash = _env_of(_conn_by_kind(org_id, "moysklad"))["content_sha256"]
+        check("новый снимок записан в МойСклад", new_hash != good_hash, new_hash[:16])
+        check("демо по-прежнему не тронута ни на байт",
+              _conn_by_kind(org_id, "demo")[2] == demo_blob_before)
+        check("демо всё ещё несёт ПРЕЖНИЙ снимок, он не удалён",
+              _env_of(_conn_by_kind(org_id, "demo"))["content_sha256"] == good_hash)
+        after = cont.get("/api/supply/sheets?limit=200").json()
+        check("чтение выбирает канонический носитель, а не более старый",
+              after["content_sha256"] == new_hash, after["content_sha256"][:16])
+        check("и показывает новые строки", after["total"] == 11, str(after["total"]))
+
+        print("\n== Чужие ключи и не-config поля целы на ОБЕИХ связях ==")
+        ms_row = _conn_by_kind(org_id, "moysklad")
+        demo_row = _conn_by_kind(org_id, "demo")
+        check("чужой ключ демо-связи цел",
+              json.loads(demo_row[2]).get("keep_demo") == {"чужое": [1, 2]},
+              str(json.loads(demo_row[2]).get("keep_demo")))
+        check("чужой ключ связи МойСклада цел",
+              json.loads(ms_row[2]).get("ms_own") == 42,
+              str(json.loads(ms_row[2]).get("ms_own")))
+        check("токен, вид, статус и время синка МойСклада не тронуты",
+              (ms_row[3], ms_row[4], ms_row[5]) == ("tok-ms", "active",
+                                                    "2026-08-30 10:00:00"),
+              str(ms_row[3:6]))
+        check("поля ms_* не тронуты",
+              (ms_row[6], ms_row[7]) == ("sync-1", "href-1"), str(ms_row[6:8]))
+        check("вид и статус демо-связи не тронуты",
+              (demo_row[1], demo_row[4]) == ("demo", demo[4]), str(demo_row[1:5]))
+        check("новых связей не появилось", len(_conn_rows(org_id)) == 2,
+              str(len(_conn_rows(org_id))))
+
+        print("\n== Два валидных снимка: канонический выигрывает детерминированно ==")
+        db = SessionLocal()
+        try:
+            found, env = ss.read_envelope(db, org_id)
+            check("выбран МойСклад, а не более старая демо",
+                  found.id == ms_id and env["content_sha256"] == new_hash,
+                  str(found.id))
+        finally:
+            db.close()
+        check("и это НЕ зависит от порядка вставки: демо вставлена раньше",
+              demo[0] < ms_id, f"demo={demo[0]} ms={ms_id}")
+        fake.calls.clear()
+        before = _fingerprint()
+        r = cont.post("/api/supply/sheets/refresh",
+                      json={"spreadsheet_url": SHEET_URL,
+                            "sheet_names": [SHEET_CURRENT, SHEET_NEXT]})
+        check("повтор принят и назван неизменившимся",
+              r.status_code == 200 and r.json().get("unchanged") is True, r.text[:140])
+        check("демо и после этого не изменилась",
+              _conn_by_kind(org_id, "demo")[2] == demo_blob_before)
+
+        print("\n== Повреждённый снимок НЕ перепрыгивается ради более старого ==")
+        ms_cfg = json.loads(_conn_by_kind(org_id, "moysklad")[2])
+        for label, payload in (
+            ("версия из будущего", {**ms_cfg[ss.ENVELOPE_KEY], "schema_version": 7}),
+            ("строки не список", {**ms_cfg[ss.ENVELOPE_KEY], "rows": "нет"}),
+            ("под ключом не запись", "снимок"),
+        ):
+            spoiled = dict(ms_cfg)
+            spoiled[ss.ENVELOPE_KEY] = payload
+            blob = json.dumps(spoiled, ensure_ascii=False)
+            exec_sql("UPDATE connections SET config_json = ? WHERE id = ?", blob, ms_id)
+            probe = FakeGoogle()
+            ss.set_transport(probe)
+            before = _fingerprint()
+            read = cont.get("/api/supply/sheets")
+            check(f"чтение отказывает 409, а не показывает демо: {label}",
+                  read.status_code == 409, f"{read.status_code} {read.text[:90]}")
+            write = cont.post("/api/supply/sheets/refresh",
+                              json={"spreadsheet_url": SHEET_URL,
+                                    "sheet_names": [SHEET_CURRENT, SHEET_NEXT]})
+            check(f"обновление тоже 409: {label}", write.status_code == 409,
+                  str(write.status_code))
+            check(f"без сети: {label}", probe.calls == [], str(probe.calls)[:80])
+            check(f"без единой записи: {label}", _diff(before, _fingerprint()) == [],
+                  str(_diff(before, _fingerprint())))
+            check(f"повреждённое оставлено как есть: {label}",
+                  _conn_by_kind(org_id, "moysklad")[2] == blob)
+            check(f"и демо по-прежнему цела: {label}",
+                  _conn_by_kind(org_id, "demo")[2] == demo_blob_before)
+        exec_sql("UPDATE connections SET config_json = ? WHERE id = ?",
+                 json.dumps(ms_cfg, ensure_ascii=False), ms_id)
+        ss.set_transport(fake)
+        check("возврат исправного снимка снова делает раздел рабочим",
+              cont.get("/api/supply/sheets").status_code == 200)
+
+        print("\n== Нечитаемый JSON канонической связи — тоже 409 без отката ==")
+        exec_sql("UPDATE connections SET config_json = ? WHERE id = ?",
+                 "не json вовсе", ms_id)
+        check("чтение отказывает", cont.get("/api/supply/sheets").status_code == 409)
+        check("и демо не подставляется вместо него",
+              good_hash not in cont.get("/api/supply/sheets").text)
+        exec_sql("UPDATE connections SET config_json = ? WHERE id = ?",
+                 json.dumps(ms_cfg, ensure_ascii=False), ms_id)
+
+        print("\n== Пустой канонический + повреждённый нижний = 409, не пустота ==")
+        exec_sql("UPDATE connections SET config_json = ? WHERE id = ?",
+                 json.dumps({"ms_own": 42}), ms_id)
+        broken_demo = json.loads(demo_blob_before)
+        broken_demo[ss.ENVELOPE_KEY] = {**broken_demo[ss.ENVELOPE_KEY],
+                                        "schema_version": 99}
+        exec_sql("UPDATE connections SET config_json = ? WHERE id = ?",
+                 json.dumps(broken_demo, ensure_ascii=False), demo[0])
+        probe = FakeGoogle()
+        ss.set_transport(probe)
+        before = _fingerprint()
+        read = cont.get("/api/supply/sheets")
+        check("повреждённый нижний носитель даёт 409, а не «снимка нет»",
+              read.status_code == 409, f"{read.status_code} {read.text[:90]}")
+        write = cont.post("/api/supply/sheets/refresh",
+                          json={"spreadsheet_url": SHEET_URL,
+                                "sheet_names": [SHEET_CURRENT, SHEET_NEXT]})
+        check("обновление тоже 409", write.status_code == 409, str(write.status_code))
+        check("без сети и без записей",
+              probe.calls == [] and _diff(before, _fingerprint()) == [],
+              str(probe.calls)[:60])
+
+        print("\n== Валидный канонический + повреждённый нижний: читается верхний ==")
+        exec_sql("UPDATE connections SET config_json = ? WHERE id = ?",
+                 json.dumps(ms_cfg, ensure_ascii=False), ms_id)
+        data = cont.get("/api/supply/sheets?limit=200").json()
+        check("верхний валидный снимок читается нормально",
+              data["content_sha256"] == new_hash, data["content_sha256"][:16])
+        check("нижний повреждённый при этом даже не инспектируется",
+              data["total"] == 11 and data["configured"] is True, str(data["total"]))
+    finally:
+        ss.set_transport(None)
+        cont.close()
+
+
 def purge_checks() -> None:
     print("\n== Удаление организации уносит носителя вместе со снимком ==")
     doomed = client()
@@ -1732,6 +1994,7 @@ def run() -> int:
     refresh_checks(owner, org_id)
     first_failure_checks()
     envelope_version_checks()
+    continuity_checks()
     isolation_checks(owner, member, org_id)
     structural_checks(owner)
     offline_checks(org_id)
