@@ -31,6 +31,11 @@
  2б) версия снимка: неизвестная/повреждённая запись под versioned-ключом —
      отказ 409, и повреждённое НЕ переписывается;
  2в) количество читается только ASCII-цифрами: «٣» и «１２» числом не считаются;
+ 2г) форма СТРОКИ снимка: поле не того вида даёт управляемый 409, а не 500;
+ 2д) все 22 общих поля строки ОБЯЗАНЫ быть — `rows: [{}]` и удаление любого из
+     них по одному дают 409 на GET и POST, до сети и без записей, в обеих
+     формах строки (обычной и пустой) и в обеих версиях разбора; полные снимки
+     `parser-1` (без `sketch_raw`, с `extra_raw`) и `parser-2` читаются;
   3) fail closed на дрейфе заголовка, orphan, мусорных количествах, HTML-странице
      входа, редиректе на чужой хост, 403, таймауте и превышении любого лимита;
   4) ровно два GET на построенные docs.google.com endpoint'ы, никаких иных
@@ -1557,12 +1562,21 @@ def row_shape_checks() -> None:  # noqa: C901 — матрица полей, в�
                                   "parser_version": "supply-sheets-parser-1"}
         exec_sql("UPDATE connections SET config_json = ? WHERE id = ?",
                  json.dumps(stale, ensure_ascii=False), conn_id)
-        data = shaped.get("/api/supply/sheets?limit=200").json()
+        # Ответ разбирается ТОЛЬКО после проверки кода. Первая версия делала
+        # `.json()["total"]` сразу — и на мутации «`sketch_raw` тоже обязателен»
+        # набор не краснел, а падал `KeyError` посреди прогона, унося с собой
+        # всё, что шло после. Падение проверки — не то же самое, что её отказ.
+        stale_resp = shaped.get("/api/supply/sheets?limit=200")
+        check("снимок прежней версии разбора вообще читается",
+              stale_resp.status_code == 200,
+              f"{stale_resp.status_code} {stale_resp.text[:90]}")
+        data = stale_resp.json() if stale_resp.status_code == 200 else {}
         check("снимок прежней версии разбора читается и помечен устаревшим",
-              data["total"] == 10 and data["parser_stale"] is True, str(data["total"]))
+              data.get("total") == 10 and data.get("parser_stale") is True,
+              str(data.get("total")))
         check("лишнее незнакомое поле строки чтению не мешает",
-              data["rows"][0].get("extra_raw") == {"16": "", "19": ""},
-              str(data["rows"][0].get("extra_raw")))
+              (data.get("rows") or [{}])[0].get("extra_raw") == {"16": "", "19": ""},
+              str((data.get("rows") or [{}])[0].get("extra_raw")))
         exec_sql("UPDATE connections SET config_json = ? WHERE id = ?",
                  json.dumps(good, ensure_ascii=False), conn_id)
         check("чужой ключ config_json пережил всю матрицу",
@@ -1571,6 +1585,162 @@ def row_shape_checks() -> None:  # noqa: C901 — матрица полей, в�
     finally:
         ss.set_transport(None)
         shaped.close()
+
+
+def row_required_checks() -> None:  # noqa: C901 — матрица полей, ветвлений мало
+    """Общие поля строки ОБЯЗАНЫ быть, а не только иметь верный тип.
+
+    Замечание ревью PR #47 на HEAD `0d9c226`, воспроизведённое дословно:
+    `_validate_row` смотрел поле, только если оно есть, и потому `rows: [{}]`
+    проходил читателя как нормальный снимок v1. Испорченный носитель показался
+    бы человеку обычной строкой — без листа, без номера строки источника, без
+    идентичности, количеств и очереди неоднозначностей.
+
+    Здесь проверяется три вещи:
+      1. форма, которую парсер выпускает СЕГОДНЯ, совпадает с требуемой — не по
+         памяти, а сверкой ключей настоящего снимка со списком в коде;
+      2. пустая запись строки и удаление любого общего поля дают управляемый
+         409 и на чтении, и на записи — до сети и без единой записи в базу;
+      3. полные снимки обеих версий разбора по-прежнему читаются: `parser-1`
+         без `sketch_raw` и с `extra_raw`, `parser-2` со `sketch_raw`.
+    """
+    print("\n== Общие поля строки: обязательны, а не «если оказались» ==")
+    req = client()
+    req.post("/register", data={"name": "Обязательные поля",
+                                "email": "sheets-r@test.io",
+                                "password": "secret123", "org_name": "Бренд-Р"})
+    req.post("/api/connect/demo")
+    org_id = sql("SELECT org_id FROM memberships WHERE user_id ="
+                 " (SELECT id FROM users WHERE email = 'sheets-r@test.io')")[0][0]
+    conn_id = sql("SELECT id FROM connections WHERE org_id = ? ORDER BY id",
+                  org_id)[0][0]
+    exec_sql("UPDATE connections SET config_json = ? WHERE id = ?",
+             json.dumps({"keep_req": {"чужое": 2}}, ensure_ascii=False), conn_id)
+
+    ss.set_transport(FakeGoogle())
+    try:
+        r = req.post("/api/supply/sheets/refresh",
+                     json={"spreadsheet_url": SHEET_URL,
+                           "sheet_names": [SHEET_CURRENT, SHEET_NEXT]})
+        check("исходный снимок создан", r.status_code == 200, r.text[:140])
+        good = json.loads(sql("SELECT config_json FROM connections WHERE id = ?",
+                              conn_id)[0][0])
+        good_env = good[ss.ENVELOPE_KEY]
+
+        # 1. Требуемый набор — это ФАКТИЧЕСКАЯ форма сегодняшнего парсера, а не
+        # список, выписанный по памяти. Если завтра парсер начнёт выпускать
+        # новое поле или перестанет выпускать старое, эта проверка покраснеет
+        # раньше, чем расхождение доедет до носителя.
+        anchor_sample = next(row for row in good_env["rows"] if not row["is_blank"])
+        blank_sample = next((row for row in good_env["rows"] if row["is_blank"]), None)
+        check("в снимке есть и обычная строка, и пустая строка-разделитель",
+              blank_sample is not None, str(len(good_env["rows"])))
+        required = set(ss._ROW_REQUIRED_FIELDS)
+        check("общих обязательных полей ровно 22", len(required) == 22, str(len(required)))
+        check("`sketch_raw` обязательным НЕ считается (его не знал parser-1)",
+              "sketch_raw" not in required)
+        check("обычная строка выпускает ровно общие поля плюс `sketch_raw`",
+              set(anchor_sample) == required | {"sketch_raw"},
+              str(sorted(set(anchor_sample) ^ (required | {"sketch_raw"}))))
+        check("у пустой строки-разделителя набор полей ТОТ ЖЕ",
+              blank_sample is not None and set(blank_sample) == set(anchor_sample),
+              str(sorted(set(blank_sample or {}) ^ set(anchor_sample))))
+
+        # Форма parser-1: `sketch_raw` он не знал, зато нёс `extra_raw`.
+        def as_parser1(row: dict) -> dict:
+            old = {k: v for k, v in row.items() if k != "sketch_raw"}
+            old["extra_raw"] = {"16": "", "19": ""}
+            return old
+
+        def spoil(rows: list) -> str:
+            spoiled = dict(good)
+            spoiled[ss.ENVELOPE_KEY] = {**good_env, "rows": rows}
+            blob = json.dumps(spoiled, ensure_ascii=False)
+            exec_sql("UPDATE connections SET config_json = ? WHERE id = ?",
+                     blob, conn_id)
+            return blob
+
+        def refuses(label: str, blob: str, full: bool) -> None:
+            probe = FakeGoogle()
+            ss.set_transport(probe)
+            before = _fingerprint()
+            read = req.get("/api/supply/sheets?limit=200")
+            check(f"GET отдаёт управляемый 409: {label}", read.status_code == 409,
+                  f"{read.status_code} {read.text[:80]}")
+            if not full:
+                return
+            write = req.post("/api/supply/sheets/refresh",
+                             json={"spreadsheet_url": SHEET_URL,
+                                   "sheet_names": [SHEET_CURRENT, SHEET_NEXT]})
+            check(f"POST тоже 409: {label}", write.status_code == 409,
+                  str(write.status_code))
+            check(f"без сети и без единой записи: {label}",
+                  probe.calls == [] and _diff(before, _fingerprint()) == [],
+                  f"{probe.calls}{_diff(before, _fingerprint())}"[:90])
+            check(f"повреждённое оставлено как есть: {label}",
+                  sql("SELECT config_json FROM connections WHERE id = ?",
+                      conn_id)[0][0] == blob)
+
+        # 2. Пустая запись строки — тот самый случай из отчёта ревью.
+        print("\n== Пустая запись строки: rows: [{}] ==")
+        refuses("rows: [{}]", spoil([{}]), full=True)
+
+        # 3. Удаление КАЖДОГО общего поля по одному. Обе версии разбора и обе
+        # формы строки: обычная и пустая. У пустой набор ключей доказанно тот
+        # же, поэтому ей достаточно чтения — POST и отпечаток базы уже закрыты
+        # на обычной строке тем же кодом отказа.
+        print("\n== Удаление каждого общего поля: parser-2 и parser-1 ==")
+        for version, shape in (("parser-2", anchor_sample),
+                               ("parser-1", as_parser1(anchor_sample))):
+            for field in sorted(ss._ROW_REQUIRED_FIELDS):
+                row = {k: v for k, v in shape.items() if k != field}
+                refuses(f"{version}, обычная строка без «{field}»",
+                        spoil([row]), full=True)
+        for version, shape in (("parser-2", blank_sample),
+                               ("parser-1", as_parser1(blank_sample or {}))):
+            for field in sorted(ss._ROW_REQUIRED_FIELDS):
+                row = {k: v for k, v in shape.items() if k != field}
+                refuses(f"{version}, пустая строка без «{field}»",
+                        spoil([row]), full=False)
+
+        # 4. Полные снимки обеих версий читаются. Иначе «стало строже» значило
+        # бы «перестали читаться уже выпущенные снимки», а это не исправление.
+        print("\n== Полные снимки обеих версий разбора читаются ==")
+        exec_sql("UPDATE connections SET config_json = ? WHERE id = ?",
+                 json.dumps(good, ensure_ascii=False), conn_id)
+        cur_resp = req.get("/api/supply/sheets?limit=200")
+        check("полный снимок parser-2 вообще читается", cur_resp.status_code == 200,
+              f"{cur_resp.status_code} {cur_resp.text[:90]}")
+        cur = cur_resp.json() if cur_resp.status_code == 200 else {}
+        check("полный снимок parser-2 читается целиком",
+              cur.get("total") == len(good_env["rows"]), str(cur.get("total")))
+        check("и он не помечен устаревшим", cur.get("parser_stale") is False)
+        stale = dict(good)
+        stale[ss.ENVELOPE_KEY] = {
+            **good_env,
+            "rows": [as_parser1(row) for row in good_env["rows"]],
+            "parser_version": "supply-sheets-parser-1"}
+        exec_sql("UPDATE connections SET config_json = ? WHERE id = ?",
+                 json.dumps(stale, ensure_ascii=False), conn_id)
+        old_resp = req.get("/api/supply/sheets?limit=200")
+        check("полный снимок parser-1 (без `sketch_raw`, с `extra_raw`) читается",
+              old_resp.status_code == 200,
+              f"{old_resp.status_code} {old_resp.text[:90]}")
+        old = old_resp.json() if old_resp.status_code == 200 else {}
+        check("снимок parser-1 отдан целиком",
+              old.get("total") == len(good_env["rows"]), str(old.get("total")))
+        check("и помечен устаревшим по версии разбора",
+              old.get("parser_stale") is True)
+        check("пустая строка-разделитель в снимке parser-1 тоже прочиталась",
+              any(row.get("is_blank") for row in old.get("rows") or []))
+        exec_sql("UPDATE connections SET config_json = ? WHERE id = ?",
+                 json.dumps(good, ensure_ascii=False), conn_id)
+        check("чужой ключ config_json пережил всю матрицу",
+              json.loads(sql("SELECT config_json FROM connections WHERE id = ?",
+                             conn_id)[0][0]).get("keep_req") == {"чужое": 2})
+    finally:
+        ss.set_transport(None)
+        req.close()
 
 
 # ── Непрерывность снимка при смене носителя ─────────────────────────────────
@@ -2209,6 +2379,7 @@ def run() -> int:
     first_failure_checks()
     envelope_version_checks()
     row_shape_checks()
+    row_required_checks()
     continuity_checks()
     isolation_checks(owner, member, org_id)
     structural_checks(owner)
