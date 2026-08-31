@@ -1103,9 +1103,9 @@ def backfill_cc_batch_ids(bind=None) -> int:
 
     Год в префиксе берётся из `created_at` самой строки, а не из «сегодня»:
     партия 2025 года, вылеченная в 2026-м, не должна называть себя партией
-    2026-го. Нечитаемая дата (её могло не быть у совсем старых строк) —
-    честный откат на текущий год: год здесь читаемая подпись, а не факт, на
-    котором что-то считается.
+    2026-го. Нечитаемая дата — и даже отсутствие самой колонки `created_at`,
+    см. ниже, — честный откат на текущий год: год здесь читаемая подпись, а не
+    факт, на котором что-то считается, и терять из-за неё имя партии нельзя.
 
     Про `run_migration_step`: он глушит ошибки вида «то же самое уже сделал
     соседний процесс». Для ЭТОГО UPDATE такой ошибкой могло бы стать разве
@@ -1120,16 +1120,25 @@ def backfill_cc_batch_ids(bind=None) -> int:
     cols = {c["name"] for c in insp.get_columns("production_orders")}
     if "cc_batch_id" not in cols:
         return 0
+    # `created_at` спрашивается, только если он есть. Шаг старта не имеет права
+    # опираться на колонки, которыми не управляет: базы бывают старше любого
+    # нашего представления о «нормальной» таблице заказов, и тест гонки
+    # миграций (`tests/test_sync.py`) поднимает именно такую — `(id, org_id)` и
+    # больше ничего. Без этой проверки backfill валил старт на базе, где
+    # `created_at` ещё не существует. Год в таком случае — текущий: это
+    # читаемая подпись, а не факт, и её отсутствие не повод не выдать партии
+    # имя.
+    dated = "created_at" in cols
+    select_sql = (
+        "SELECT id, created_at FROM production_orders " if dated
+        else "SELECT id, NULL FROM production_orders "
+    ) + "WHERE cc_batch_id IS NULL OR cc_batch_id = '' ORDER BY id LIMIT :n"
 
     filled, seen = 0, set()
     while True:
         with eng.connect() as conn:
-            rows = conn.execute(
-                text("SELECT id, created_at FROM production_orders "
-                     "WHERE cc_batch_id IS NULL OR cc_batch_id = '' "
-                     "ORDER BY id LIMIT :n"),
-                {"n": _CC_BATCH_BACKFILL_PAGE},
-            ).all()
+            rows = conn.execute(text(select_sql),
+                                {"n": _CC_BATCH_BACKFILL_PAGE}).all()
         # Страницу берём по одному и тому же условию, поэтому вторая итерация
         # обязана вернуть ДРУГИЕ строки. Если вернулись те же самые — лечить
         # их нечем, и крутиться на месте хуже, чем выйти: выход останавливает

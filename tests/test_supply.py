@@ -256,6 +256,32 @@ def migration_checks() -> None:
               1: healed[1], 2: healed[2], 3: healed[3]}, str(after))
     eng.dispose()
 
+    print("\n== Таблица без created_at: миграция не имеет права падать ==")
+    # Базы бывают старше любого нашего представления о «нормальной» таблице
+    # заказов. Ровно такую — `(id, org_id)` и больше ничего — поднимает тест
+    # гонки миграций в tests/test_sync.py, и первая версия backfill валила на
+    # ней старт: она спрашивала `created_at` безусловно. Шаг старта не должен
+    # опираться на колонки, которыми не управляет.
+    bare_path = Path(tempfile.mkdtemp()) / "bare_orders.db"
+    bare = create_engine(f"sqlite:///{bare_path}", future=True,
+                         connect_args={"check_same_thread": False})
+    with bare.begin() as conn:
+        conn.execute(text(
+            "CREATE TABLE production_orders (id INTEGER PRIMARY KEY, org_id INTEGER NOT NULL)"))
+        conn.execute(text(
+            "INSERT INTO production_orders (id, org_id) VALUES (1, 1), (2, 1)"))
+    bare_err = ""
+    try:
+        models.ensure_schema(bind=bare)
+    except Exception as exc:  # noqa: BLE001 — падение здесь и есть проверяемый дефект
+        bare_err = f"{type(exc).__name__}: {exc}"
+    check("миграция на таблице без created_at не падает", bare_err == "", bare_err[:160])
+    bare_ids = _batch_ids(bare) if not bare_err else {}
+    check("и партии всё равно получили имена",
+          len(bare_ids) == 2 and all(BATCH_RE.match(v or "") for v in bare_ids.values()),
+          str(bare_ids))
+    bare.dispose()
+
     print("\n== Конкурентный старт нескольких воркеров ==")
     eng2 = _old_schema_engine("old_orders_concurrent.db")
     with eng2.begin() as conn:
