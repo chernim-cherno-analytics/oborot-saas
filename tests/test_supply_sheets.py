@@ -640,8 +640,12 @@ def parse_checks() -> None:  # noqa: C901 — сценарий, ветвлени
     autumn = counts["sheets"][0]
     check("физические строки и строки данных различаются",
           (autumn["rows"], autumn["data_rows"]) == (9, 8), str(autumn))
-    check("штуки суммируются только по прочитанным числам",
-          autumn["quantity"] == 14 + 6 + 25 + 10 + 1 + 1, str(autumn["quantity"]))
+    check("прочитанное складывается, но итогом не объявляется",
+          autumn["quantity_known"] == 14 + 6 + 25 + 10 + 1 + 1
+          and autumn["quantity"] is None
+          and autumn["quantity_complete"] is False,
+          str({k: autumn[k] for k in
+               ("quantity", "quantity_known", "quantity_complete")}))
     check("счётчик неоднозначностей поимённый",
           counts["issues"].get("quantity_missing") == 3
           and counts["issues"].get("unknown_column") == 2, str(counts["issues"]))
@@ -2159,6 +2163,46 @@ def structural_checks(owner) -> None:
     check("устаревший разбор проговаривается словами",
           "parser_stale" in template and "прежней версией разбора" in template)
 
+    # Корректив по ревью PR #47. Ниже — структурные замки на три правки,
+    # ПОВЕДЕНИЕ которых проверяет браузерный набор `tests/test_supply_ui.py`.
+    # Здесь они стоят не вместо него, а рядом: этот набор офлайновый и
+    # выполняется даже там, где Chromium не поднялся, — и тогда возврат
+    # дефекта хотя бы не пройдёт молча.
+    print("\n== Страница: замки на корректив по ревью ==")
+    check("состояние подписки доезжает до страницы, а не вычисляется на глаз",
+          "writes_blocked" in template and "WRITES_BLOCKED" in template)
+    check("read-only состояние ветвится ДО отрисовки формы владельца",
+          template.index("if (WRITES_BLOCKED)") < template.index('var form = el("div", "sup-form")'))
+    check("общий offset не двигается по клику — позиция запроса локальная",
+          "state.offset += state.limit" not in template
+          and "var requested = state.offset + state.limit" in template)
+    check("позиция фиксируется только после успешного ответа",
+          "state.offset = offset;" in template)
+    check("у догрузки есть замок «один запрос в полёте»",
+          "inflight" in template and "moreBtn.disabled = true" in template)
+    check("и поколение состояния, чтобы поздний ответ не дописался",
+          "myGen !== gen" in template and "function resetView()" in template)
+    check("успешное обновление сбрасывает фильтр листа",
+          'state.sheet = "";' in template.split("function refresh(btn)")[1]
+          .split("function renderError")[0])
+    check("кнопка обновления восстанавливается при ЛЮБОМ исходе",
+          ".then(restore, restore);" in template)
+    check("неполный итог штук называется словами, а не числом",
+          "не определено · прочитано" in template
+          and "quantity_complete" in template)
+    # `static/app.js` подключён с `defer`: его `api()` появляется ПОСЛЕ разбора
+    # блока `scripts`. Запуск без ожидания `DOMContentLoaded` означал не
+    # «иногда медленнее», а «страница мертва всегда»: она падала на
+    # `api is not defined` и не показывала ни строк, ни формы, ни ошибки.
+    # Найдено запуском страницы в браузере (tests/test_supply_ui.py) — на
+    # уровне разметки дефект не виден вовсе, поэтому здесь стоит замок.
+    check("страница ждёт DOMContentLoaded, а не зовёт api() при разборе",
+          'document.addEventListener("DOMContentLoaded"' in template,
+          "скрипт страницы запускается до загрузки app.js")
+    check("и app.js по-прежнему подключён отложенно — это не догадка",
+          'src="/static/app.js" defer' in
+          (ROOT / "templates" / "base.html").read_text(encoding="utf-8"))
+
     check("на странице есть три фильтра очереди",
           "Требуют разбора" in page and "Ошибки" in page and "Все" in page)
     check("и одна кнопка обновления",
@@ -2343,11 +2387,604 @@ def carrier_choice_checks() -> None:
         picker.close()
 
 
+
+# ── Корректив по ревью PR #47 (REVIEW_REJECT на HEAD `08142a5`) ──────────────
+#
+# Восемь подтверждённых P2. Ниже — регрессии на каждый серверный пункт; три
+# пункта, которые живут в браузере (read-only форма подписки, сериализованная
+# догрузка и сброс устаревшего фильтра), проверяются запуском страницы —
+# `tests/test_supply_ui.py`, потому что «строка есть в шаблоне» их не ловит.
+
+#: Строка, которой в НАСТОЯЩЕЙ таблице быть не может, — и потому её появление
+#: где угодно однозначно означает утечку содержимого источника, а не совпадение.
+SENTINEL = "СЕКРЕТ-ЯЧЕЙКИ-b7f3e1a9"
+
+
+def safe_error_checks() -> None:  # noqa: C901 — матрица веток, ветвлений мало
+    """Ни одна ветка проверки заголовка не печатает содержимое чужой ячейки.
+
+    Замечание ревью PR #47. Отказ отсюда уходит тремя дорогами сразу: в ответ
+    502 владельцу, в сохранённый `last_error` носителя и оттуда — в GET,
+    который читает ЛЮБОЙ участник организации. Значение ячейки приехало из
+    чужой таблицы, которую заполняют люди; личные данные в ней возможны, и
+    показывать их в сообщении об ошибке нельзя.
+
+    Проверяются ВСЕ ветки, а не та одна, на которую указало ревью: дефект был
+    не в конкретной строке, а в способе писать сообщения.
+    """
+    print("\n== Отказ источника не выносит наружу содержимое чужой ячейки ==")
+
+    def drift(where: str, row1_patch: dict, row2_patch: dict) -> str:
+        rows = autumn_header_rows()
+        put(rows[0], row1_patch)
+        put(rows[1], row2_patch)
+        rows.append(put(blank(), {2: "1", 3: "Т", 10: "1", 15: "1"}))
+        message = raises(
+            lambda: ss.parse_sheet("Осень 26", ss.decode_csv("Осень 26", to_csv(rows))),
+            ss.SourceError)
+        check(f"ветка «{where}»: отказ случился", bool(message), message[:120])
+        check(f"ветка «{where}»: содержимого ячейки в тексте нет",
+              SENTINEL not in message, message[:160])
+        return message
+
+    # 1. Подпись каркаса не на месте (та самая строка 568 из отчёта ревью).
+    msg = drift("подпись каркаса", {5: SENTINEL}, {})
+    check("и при этом отказ по-прежнему называет колонку и ожидаемое",
+          "колонке 5" in msg and "«Цвет»" in msg, msg[:160])
+    # 2. Колонка артикула обязана быть без заголовка.
+    drift("артикул без заголовка", {2: SENTINEL}, {})
+    # 3. Крайняя метка размерной горки.
+    drift("край размерной горки", {}, {10: SENTINEL})
+    # 4. Промежуточная метка размерной горки.
+    drift("середина размерной горки", {}, {11: SENTINEL})
+    # 5. Подписи итога и цены за горкой.
+    drift("подпись итога", {}, {15: SENTINEL})
+    drift("подпись цены", {}, {16: SENTINEL})
+    # 6. Повтор подписи каркаса: сообщение и так о колонках, но проверяется.
+    dup = drift("повтор подписи каркаса", {20: "Цвет"}, {})
+    check("повтор назван колонками, а не содержимым",
+          "Цвет" in dup and "раз" in dup, dup[:160])
+    # 7. Вторая метка размера за пределами горки.
+    drift("вторая метка размера", {}, {20: "XL"})
+    # 8. Ячейка длиннее предела: номер строки есть, содержимого нет.
+    long_rows = autumn_header_rows()
+    long_rows.append(put(blank(), {3: SENTINEL + "x" * ss.MAX_CELL_CHARS}))
+    long_msg = raises(lambda: ss.decode_csv("Осень 26", to_csv(long_rows)),
+                      ss.SourceError)
+    check("ветка «слишком длинная ячейка»: содержимого в тексте нет",
+          bool(long_msg) and SENTINEL not in long_msg, long_msg[:120])
+
+    print("\n== И ни одной дорогой наружу: 502, носитель, owner, member, HTML ==")
+    holder = client()
+    holder.post("/register", data={"name": "Утечка", "email": "sheets-leak@test.io",
+                                   "password": "secret123", "org_name": "Бренд-У"})
+    holder.post("/api/connect/demo")
+    org_id = sql("SELECT org_id FROM memberships WHERE user_id ="
+                 " (SELECT id FROM users WHERE email = 'sheets-leak@test.io')")[0][0]
+    add_member(org_id, "sheets-leak-m@test.io")
+    watcher = client()
+    watcher.post("/login", data={"email": "sheets-leak-m@test.io",
+                                 "password": "secret123"})
+    ss.set_transport(FakeGoogle())
+    try:
+        ok = holder.post("/api/supply/sheets/refresh",
+                         json={"spreadsheet_url": SHEET_URL,
+                               "sheet_names": [SHEET_CURRENT, SHEET_NEXT]})
+        check("прежний успешный снимок сделан", ok.status_code == 200, ok.text[:120])
+        good_env = _config(org_id)[ss.ENVELOPE_KEY]
+        good_hash = good_env["content_sha256"]
+        good_rows = json.dumps(good_env["rows"], ensure_ascii=False, sort_keys=True)
+
+        poisoned = autumn_header_rows()
+        put(poisoned[0], {5: SENTINEL})
+        poisoned.append(put(blank(), {2: "1", 3: "Т", 10: "1", 15: "1"}))
+        ss.set_transport(FakeGoogle({SHEET_CURRENT: AUTUMN_CSV,
+                                     SHEET_NEXT: to_csv(poisoned)}))
+        bad = holder.post("/api/supply/sheets/refresh",
+                          json={"spreadsheet_url": SHEET_URL,
+                                "sheet_names": [SHEET_CURRENT, SHEET_NEXT]})
+        check("дрейф с чужим текстом — 502", bad.status_code == 502, bad.text[:120])
+        check("в теле 502 содержимого ячейки нет", SENTINEL not in bad.text,
+              bad.text[:160])
+        stored = _config(org_id)[ss.ENVELOPE_KEY]
+        check("в сохранённом last_error содержимого ячейки нет",
+              SENTINEL not in stored["last_error"], stored["last_error"][:160])
+        check("и вообще во всём носителе его нет",
+              SENTINEL not in json.dumps(_config(org_id), ensure_ascii=False))
+        owner_json = holder.get("/api/supply/sheets?limit=200").text
+        check("владелец не получает содержимого ячейки", SENTINEL not in owner_json)
+        member_json = watcher.get("/api/supply/sheets?limit=200").text
+        check("участник тоже не получает", SENTINEL not in member_json)
+        check("HTML страницы его тоже не несёт",
+              SENTINEL not in holder.get("/supply").text)
+        check("причина отказа при этом ЕСТЬ и она осмысленна",
+              "заголовк" in stored["last_error"], stored["last_error"][:120])
+        check("прежний успешный снимок цел: хеш",
+              stored["content_sha256"] == good_hash)
+        check("прежний успешный снимок цел: строки до байта",
+              json.dumps(stored["rows"], ensure_ascii=False, sort_keys=True)
+              == good_rows)
+    finally:
+        ss.set_transport(None)
+        holder.close()
+        watcher.close()
+
+
+def attempt_privacy_checks() -> None:
+    """Адрес и листы НЕУДАЧНОЙ попытки — владельцу, а не участнику.
+
+    Замечание ревью PR #47. Ввести ссылку и имена листов может только
+    владелец; форму восстанавливать нужно ему же. Участнику это состояние не
+    адресовано вовсе, а успешный снимок остаётся общим — так и записано в D-51.
+    """
+    print("\n== Неудачная попытка владельца не уезжает участнику ==")
+    boss = client()
+    boss.post("/register", data={"name": "Приватность", "email": "sheets-p@test.io",
+                                "password": "secret123", "org_name": "Бренд-П"})
+    boss.post("/api/connect/demo")
+    org_id = sql("SELECT org_id FROM memberships WHERE user_id ="
+                 " (SELECT id FROM users WHERE email = 'sheets-p@test.io')")[0][0]
+    add_member(org_id, "sheets-p-m@test.io")
+    mate = client()
+    mate.post("/login", data={"email": "sheets-p-m@test.io", "password": "secret123"})
+
+    denied = FakeGoogle({SHEET_CURRENT: ss.HttpResponse(
+        403, {}, b"forbidden body", "https://docs.google.com/x")})
+    ss.set_transport(denied)
+    try:
+        r = boss.post("/api/supply/sheets/refresh",
+                      json={"spreadsheet_url": SHEET_URL,
+                            "sheet_names": [SHEET_CURRENT, SHEET_NEXT]})
+        check("первое обновление владельца отказало", r.status_code == 502, r.text[:120])
+
+        mine = boss.get("/api/supply/sheets?limit=200").json()
+        check("владелец получает свой ввод обратно",
+              mine["attempt"]["spreadsheet_url"] == ss.spreadsheet_link(SPREADSHEET_ID)
+              and mine["attempt"]["sheet_names"] == [SHEET_CURRENT, SHEET_NEXT],
+              str(mine["attempt"]))
+
+        theirs_raw = mate.get("/api/supply/sheets?limit=200").text
+        theirs = json.loads(theirs_raw)
+        check("участнику попытка не отдана вовсе",
+              theirs["attempt"] == {"spreadsheet_id": "", "spreadsheet_url": "",
+                                    "sheet_names": []},
+              str(theirs["attempt"]))
+        check("идентификатора чужой таблицы в ответе участника нет",
+              SPREADSHEET_ID not in theirs_raw)
+        check("и имён листов неудачной попытки тоже нет",
+              SHEET_CURRENT not in theirs_raw.replace(
+                  json.dumps(theirs["last_error"], ensure_ascii=False), ""),
+              theirs_raw[:200])
+        check("но причина отказа участнику видна — это состояние раздела",
+              "403" in theirs["last_error"], theirs["last_error"][:100])
+        check("источник настроенным при этом не считается ни у кого",
+              mine["configured"] is False and theirs["configured"] is False)
+
+        print("\n== Удачный снимок остаётся общим для владельца и участника ==")
+        ss.set_transport(FakeGoogle())
+        ok = boss.post("/api/supply/sheets/refresh",
+                       json={"spreadsheet_url": SHEET_URL,
+                             "sheet_names": [SHEET_CURRENT, SHEET_NEXT]})
+        check("повторное обновление удалось", ok.status_code == 200, ok.text[:120])
+        mine = boss.get("/api/supply/sheets?limit=200").json()
+        theirs = mate.get("/api/supply/sheets?limit=200").json()
+        check("оба видят одну и ту же ссылку на источник",
+              mine["spreadsheet_url"] == theirs["spreadsheet_url"]
+              == ss.spreadsheet_link(SPREADSHEET_ID), str(theirs["spreadsheet_url"]))
+        check("оба видят одни и те же листы и строки",
+              mine["sheet_names"] == theirs["sheet_names"] == [SHEET_CURRENT, SHEET_NEXT]
+              and mine["total"] == theirs["total"], str(theirs["sheet_names"]))
+        check("право обновлять по-прежнему только у владельца",
+              mine["can_refresh"] is True and theirs["can_refresh"] is False)
+    finally:
+        ss.set_transport(None)
+        boss.close()
+        mate.close()
+
+
+def malformed_url_checks() -> None:
+    """`spreadsheet_url` не строкой — управляемый 400, а не 500.
+
+    Замечание ревью PR #47: тело запроса нетипизировано, и `{"spreadsheet_url":
+    123}` доезжал до `(raw or "").strip()`, где число даёт `AttributeError`.
+    Проверяется не только код ответа: на негодном вводе не должно быть НИ
+    ОДНОГО сетевого вызова и НИ ОДНОЙ записи в базу, а прежний снимок и
+    носитель обязаны остаться теми же до байта.
+    """
+    print("\n== Негодный тип ссылки: 400, ноль сети, ноль записей ==")
+    typed = client()
+    typed.post("/register", data={"name": "Типы", "email": "sheets-t@test.io",
+                                 "password": "secret123", "org_name": "Бренд-Т"})
+    typed.post("/api/connect/demo")
+    org_id = sql("SELECT org_id FROM memberships WHERE user_id ="
+                 " (SELECT id FROM users WHERE email = 'sheets-t@test.io')")[0][0]
+
+    ss.set_transport(FakeGoogle())
+    try:
+        ok = typed.post("/api/supply/sheets/refresh",
+                        json={"spreadsheet_url": SHEET_URL,
+                              "sheet_names": [SHEET_CURRENT, SHEET_NEXT]})
+        check("снимок для контроля создан", ok.status_code == 200, ok.text[:120])
+        env_before = json.dumps(_config(org_id)[ss.ENVELOPE_KEY],
+                                ensure_ascii=False, sort_keys=True)
+        carrier_before = _carrier_row(org_id)
+
+        cases = [("число", 123), ("дробное", 1.5), ("логическое", True),
+                 ("список", ["https://docs.google.com/spreadsheets/d/" + SPREADSHEET_ID]),
+                 ("объект", {"url": SHEET_URL}), ("null", None)]
+        for label, value in cases:
+            probe = FakeGoogle()
+            ss.set_transport(probe)
+            before = _fingerprint()
+            r = typed.post("/api/supply/sheets/refresh",
+                           json={"spreadsheet_url": value,
+                                 "sheet_names": [SHEET_CURRENT, SHEET_NEXT]})
+            check(f"{label}: управляемый 400, а не 500",
+                  r.status_code == 400, f"{r.status_code} {r.text[:110]}")
+            check(f"{label}: в ответе объяснение, а не трассировка",
+                  "AttributeError" not in r.text and "Traceback" not in r.text,
+                  r.text[:110])
+            check(f"{label}: ни одного сетевого вызова", probe.calls == [],
+                  str(probe.calls)[:100])
+            check(f"{label}: ни одной записи в базу",
+                  _diff(before, _fingerprint()) == [],
+                  str(_diff(before, _fingerprint())))
+            check(f"{label}: снимок не тронут",
+                  json.dumps(_config(org_id)[ss.ENVELOPE_KEY], ensure_ascii=False,
+                             sort_keys=True) == env_before)
+            check(f"{label}: носитель не тронут",
+                  _carrier_row(org_id) == carrier_before)
+            # Та же граница на уровне функции: маршрут её не подменяет.
+            message = raises(lambda v=value: ss.parse_spreadsheet_url(v),
+                             ss.ValidationError)
+            check(f"{label}: функция отказывает своим типом ошибки",
+                  bool(message) and not message.startswith("<"), message[:110])
+
+        print("\n== Негодные имена листов ведут себя так же ==")
+        for label, value in [("не список", "Осень 26"), ("число внутри", [1, 2]),
+                             ("одно имя", [SHEET_CURRENT]),
+                             ("null внутри", [SHEET_CURRENT, None])]:
+            probe = FakeGoogle()
+            ss.set_transport(probe)
+            before = _fingerprint()
+            r = typed.post("/api/supply/sheets/refresh",
+                           json={"spreadsheet_url": SHEET_URL, "sheet_names": value})
+            check(f"листы «{label}»: 400 без сети и без записей",
+                  r.status_code == 400 and probe.calls == []
+                  and _diff(before, _fingerprint()) == [],
+                  f"{r.status_code} {probe.calls}")
+    finally:
+        ss.set_transport(None)
+        typed.close()
+
+
+def incomplete_counts_checks() -> None:  # noqa: C901 — сценарий, ветвлений мало
+    """Неполный набор количеств не выдаётся за окончательный итог.
+
+    Замечание ревью PR #47 и исполнение уже закреплённого D-51 «нечитаемое или
+    отсутствующее не равно нулю». Новой формулы здесь нет: `size_sum` строки
+    остаётся тем же объясняющим показателем, меняется только контракт агрегата.
+    """
+    print("\n== Итог штук: число или честное «не определено» ==")
+
+    def sheet_of(name, data_rows):
+        rows = autumn_header_rows()
+        for patch in data_rows:
+            rows.append(put(blank(), patch))
+        return ss.parse_sheet(name, ss.decode_csv(name, to_csv(rows)))[0]
+
+    full = sheet_of("Полный", [
+        {2: "1", 3: "А", 10: "2", 11: "3", 15: "5"},
+        {2: "2", 3: "Б", 10: "4", 15: "4"},
+    ])
+    mixed = sheet_of("Смешанный", [
+        {2: "1", 3: "А", 10: "2", 11: "3", 15: "5"},
+        {2: "2", 3: "Б", 10: "4", 14: "Кроим по заданию"},
+    ])
+    missing = sheet_of("Без количеств", [
+        {2: "1", 3: "А", 10: "2", 11: "3", 15: "5"},
+        {2: "2", 3: "Б", 10: "-", 11: "—"},
+    ])
+
+    full_counts = ss.build_counts(full, ["Полный"])["sheets"][0]
+    check("полный набор: итог — число, и оно равно прочитанному",
+          full_counts["quantity"] == 9 and full_counts["quantity_known"] == 9
+          and full_counts["quantity_complete"] is True, str(full_counts))
+
+    mixed_counts = ss.build_counts(mixed, ["Смешанный"])["sheets"][0]
+    check("нечитаемый размер: итога нет, прочитанное названо",
+          mixed_counts["quantity"] is None
+          and mixed_counts["quantity_known"] == 5 + 4
+          and mixed_counts["quantity_complete"] is False, str(mixed_counts))
+    broken = [r for r in mixed if "invalid_quantity" in r["issues"]]
+    check("строка с нечитаемой ячейкой помечена и её сумма НЕ стёрта",
+          len(broken) == 1 and broken[0]["size_sum"] == 4
+          and broken[0]["sizes_raw"]["XL"] == "Кроим по заданию", str(broken))
+    check("и нечитаемая ячейка не превратилась в ноль",
+          broken and broken[0]["sizes"]["XL"] is None, str(broken[0]["sizes"]))
+
+    missing_counts = ss.build_counts(missing, ["Без количеств"])["sheets"][0]
+    check("строка без количеств тоже делает итог неопределённым",
+          missing_counts["quantity"] is None
+          and missing_counts["quantity_known"] == 5
+          and missing_counts["quantity_complete"] is False, str(missing_counts))
+
+    both = ss.build_counts(full + mixed, ["Полный", "Смешанный"])
+    check("полный лист остаётся полным рядом с неполным",
+          both["sheets"][0]["quantity_complete"] is True
+          and both["sheets"][1]["quantity_complete"] is False, str(both["sheets"]))
+    check("общий итог неполон, если неполон хотя бы один лист",
+          both["quantity"] is None and both["quantity_known"] == 9 + 9
+          and both["quantity_complete"] is False,
+          str({k: both[k] for k in ("quantity", "quantity_known",
+                                    "quantity_complete")}))
+    check("расхождение итога полноты НЕ отменяет: оба числа прочитаны",
+          ss.build_counts(sheet_of("Расхождение", [
+              {2: "1", 3: "А", 10: "2", 15: "9"}]), ["Расхождение"]
+          )["quantity"] == 2)
+
+    print("\n== Снимок прежней версии разбора не показывает частичный итог ==")
+    stale_c = client()
+    stale_c.post("/register", data={"name": "Устаревший разбор",
+                                    "email": "sheets-stale@test.io",
+                                    "password": "secret123", "org_name": "Бренд-С"})
+    stale_c.post("/api/connect/demo")
+    org_id = sql("SELECT org_id FROM memberships WHERE user_id ="
+                 " (SELECT id FROM users WHERE email = 'sheets-stale@test.io')")[0][0]
+    conn_id = sql("SELECT id FROM connections WHERE org_id = ? ORDER BY id",
+                  org_id)[0][0]
+    ss.set_transport(FakeGoogle())
+    try:
+        r = stale_c.post("/api/supply/sheets/refresh",
+                         json={"spreadsheet_url": SHEET_URL,
+                               "sheet_names": [SHEET_CURRENT, SHEET_NEXT]})
+        check("исходный снимок создан", r.status_code == 200, r.text[:120])
+        fresh = stale_c.get("/api/supply/sheets?limit=200").json()
+        check("свежий снимок сделан сегодняшним разбором",
+              fresh["parser_stale"] is False
+              and fresh["parser_version"] == ss.PARSER_VERSION,
+              fresh["parser_version"])
+        check("и его сводка честно неполна (в фикстуре есть нечитаемое)",
+              (fresh.get("counts") or {}).get("quantity", "нет ключа") is None
+              and (fresh.get("counts") or {}).get("quantity_complete") is False,
+              str((fresh.get("counts") or {}).get("quantity_known")))
+
+        # Хеш прежней версии считается ТОЙ ЖЕ функцией на той же константе —
+        # иначе «версия парсера входит в хеш» осталось бы утверждением из
+        # комментария, а не проверенным фактом.
+        real_version = ss.PARSER_VERSION
+        ss.PARSER_VERSION = "supply-sheets-parser-2"
+        try:
+            old_digest = ss.content_hash(SPREADSHEET_ID,
+                                         [SHEET_CURRENT, SHEET_NEXT],
+                                         [AUTUMN_CSV, NEXT_CSV])
+        finally:
+            ss.PARSER_VERSION = real_version
+        new_digest = ss.content_hash(SPREADSHEET_ID, [SHEET_CURRENT, SHEET_NEXT],
+                                     [AUTUMN_CSV, NEXT_CSV])
+        check("те же байты источника при разных версиях разбора дают разный хеш",
+              old_digest != new_digest, f"{old_digest[:12]} vs {new_digest[:12]}")
+
+        for old_version, old_counts in (
+            ("supply-sheets-parser-1", {"sheets": [
+                {"sheet_name": SHEET_CURRENT, "rows": 9, "data_rows": 8,
+                 "needs_review": 5, "invalid": 2, "quantity": 57},
+                {"sheet_name": SHEET_NEXT, "rows": 3, "data_rows": 1,
+                 "needs_review": 1, "invalid": 0, "quantity": 0}],
+                "rows": 12, "data_rows": 9, "needs_review": 6, "invalid": 2,
+                "quantity": 57, "issues": {}}),
+            ("supply-sheets-parser-2", {"sheets": [
+                {"sheet_name": SHEET_CURRENT, "rows": 9, "data_rows": 8,
+                 "needs_review": 5, "invalid": 2, "quantity": 57},
+                {"sheet_name": SHEET_NEXT, "rows": 3, "data_rows": 1,
+                 "needs_review": 1, "invalid": 0, "quantity": 0}],
+                "rows": 12, "data_rows": 9, "needs_review": 6, "invalid": 2,
+                "quantity": 57, "issues": {}}),
+        ):
+            cfg = json.loads(sql("SELECT config_json FROM connections WHERE id = ?",
+                                 conn_id)[0][0])
+            cfg[ss.ENVELOPE_KEY] = {**cfg[ss.ENVELOPE_KEY],
+                                    "parser_version": old_version,
+                                    "content_sha256": old_digest,
+                                    "counts": old_counts}
+            blob = json.dumps(cfg, ensure_ascii=False)
+            exec_sql("UPDATE connections SET config_json = ? WHERE id = ?",
+                     blob, conn_id)
+            seen = stale_c.get("/api/supply/sheets?limit=200").json()
+            # Ключи читаются через `.get`: проверка обязана ПОКРАСНЕТЬ на
+            # возврате дефекта, а не упасть посреди прогона. Красный контроль
+            # уже ловил здесь именно это — снимок прежней сводки не несёт
+            # сегодняшних ключей вовсе, и прямое обращение убивало набор
+            # вместо честного FAIL.
+            counts = seen.get("counts") or {}
+            per_sheet = {sheet.get("sheet_name"): sheet
+                         for sheet in (counts.get("sheets") or [])}
+            check(f"{old_version}: снимок читается и помечен устаревшим",
+                  seen.get("parser_stale") is True and seen.get("total") == 10,
+                  str((seen.get("parser_stale"), seen.get("total"))))
+            check(f"{old_version}: частичный итог НЕ показан окончательным",
+                  counts.get("quantity", "нет ключа") is None
+                  and counts.get("quantity_complete") is False,
+                  str(counts.get("quantity", "нет ключа")))
+            check(f"{old_version}: прочитанное пересчитано из самих строк",
+                  counts.get("quantity_known") == 14 + 6 + 25 + 10 + 1 + 1,
+                  str(counts.get("quantity_known")))
+            check(f"{old_version}: и по листам тоже, а не только в целом",
+                  per_sheet.get(SHEET_CURRENT, {}).get("quantity", "нет") is None
+                  and per_sheet.get(SHEET_CURRENT, {}).get("quantity_known") == 57
+                  and per_sheet.get(SHEET_NEXT, {}).get("quantity", "нет") is None
+                  and per_sheet.get(SHEET_NEXT, {}).get("quantity_known") == 0,
+                  str(counts.get("sheets")))
+            check(f"{old_version}: сохранённое число 57 больше не выдаётся за итог",
+                  counts.get("quantity", "нет ключа") != old_counts["quantity"],
+                  str(counts.get("quantity", "нет ключа")))
+            check(f"{old_version}: пересчёт НИЧЕГО не записал в носитель",
+                  sql("SELECT config_json FROM connections WHERE id = ?",
+                      conn_id)[0][0] == blob)
+
+        print("\n== Тот же источник после смены версии разбора — новый импорт ==")
+        probe = FakeGoogle()
+        ss.set_transport(probe)
+        again = stale_c.post("/api/supply/sheets/refresh",
+                             json={"spreadsheet_url": SHEET_URL,
+                                   "sheet_names": [SHEET_CURRENT, SHEET_NEXT]})
+        check("обновление принято", again.status_code == 200, again.text[:120])
+        check("и оно честно названо НОВЫМ импортом, а не «ничего не изменилось»",
+              again.json().get("unchanged") is False, again.text[:150])
+        healed = stale_c.get("/api/supply/sheets?limit=200").json()
+        check("снимок вылечился сам: он больше не устаревший",
+              healed["parser_stale"] is False
+              and healed["parser_version"] == ss.PARSER_VERSION,
+              healed["parser_version"])
+        check("и хеш содержимого стал хешем сегодняшней версии разбора",
+              healed["content_sha256"] == new_digest != old_digest,
+              healed["content_sha256"][:16])
+    finally:
+        ss.set_transport(None)
+        stale_c.close()
+
+
+def continuation_checks() -> None:
+    """Продолжение неполного якоря наследует неполноту вместе с идентичностью.
+
+    Замечание ревью PR #47: очередь «требуют разбора» строится по собственным
+    `issues` строки, поэтому продолжение неполного якоря из неё выпадало — его
+    количества и пометки опознать по-прежнему нельзя, а на экране разбора его
+    нет. Границы соседних случаев при этом не двигаются: пустая строка остаётся
+    разделителем, сирота — сиротой, продолжение ПОЛНОГО якоря — чистым.
+    """
+    print("\n== Продолжение неполного якоря видно в очереди разбора ==")
+
+    def parse(data_rows):
+        rows = autumn_header_rows()
+        for patch in data_rows:
+            rows.append(put(blank(), patch))
+        return ss.parse_sheet("Осень 26",
+                              ss.decode_csv("Осень 26", to_csv(rows)))[0]
+
+    for label, anchor_patch in (("только артикул", {2: "1042"}),
+                                ("только имя", {3: "Пальто «Осень»"})):
+        parsed = parse([anchor_patch, {5: "Молоко", 10: "3"}, {5: "Хаки", 10: "1"}])
+        anchor, first, second = parsed
+        check(f"{label}: якорь помечен неполной идентичностью",
+              "identity_missing_part" in anchor["issues"], str(anchor["issues"]))
+        check(f"{label}: первое продолжение унаследовало пометку",
+              "identity_missing_part" in first["issues"]
+              and first["anchor_row"] == anchor["source_row"], str(first["issues"]))
+        check(f"{label}: и второе тоже — наследуется якорь, а не соседняя строка",
+              "identity_missing_part" in second["issues"]
+              and second["anchor_row"] == anchor["source_row"], str(second["issues"]))
+        check(f"{label}: обе строки попадают в очередь разбора",
+              len(ss.filter_rows(parsed, None, "needs_review")) == 3,
+              str([r["issues"] for r in parsed]))
+        check(f"{label}: но ошибкой это не объявлено — читать можно, трактовать нет",
+              ss.filter_rows(parsed, None, "invalid") == [],
+              str(ss.filter_rows(parsed, None, "invalid")))
+
+    print("\n== Соседние случаи не сдвинулись ==")
+    clean = parse([{2: "1042", 3: "Пальто", 10: "2", 15: "2"},
+                   {5: "Молоко", 10: "1", 15: "1"}])
+    check("продолжение ПОЛНОГО якоря остаётся чистым",
+          clean[1]["issues"] == [] and clean[1]["anchor_row"] == 3,
+          str(clean[1]["issues"]))
+    reset = parse([{2: "1042"}, {}, {5: "Хаки", 10: "1"}])
+    check("пустая строка-разделитель по-прежнему сбрасывает якорь",
+          reset[1]["is_blank"] is True and reset[1]["issues"] == [],
+          str(reset[1]["issues"]))
+    check("а строка после разделителя становится сиротой, а не наследницей",
+          reset[2]["issues"] == ["orphan_continuation"]
+          and reset[2]["anchor_row"] is None, str(reset[2]))
+    orphan = parse([{5: "Синий", 10: "2"}])
+    check("сирота в начале листа осталась сиротой и ничем больше",
+          orphan[0]["issues"] == ["orphan_continuation"], str(orphan[0]["issues"]))
+    after_full = parse([{2: "1", 3: "А", 10: "1", 15: "1"}, {2: "2"},
+                        {5: "Хаки", 10: "1"}])
+    check("новый неполный якорь перебивает прежний полный",
+          "identity_missing_part" in after_full[2]["issues"]
+          and after_full[2]["anchor_row"] == after_full[1]["source_row"],
+          str(after_full[2]["issues"]))
+
+
+class _CountingCsv:
+    """Обёртка над модулем `csv`, считающая ФАКТИЧЕСКИ прочитанные строки.
+
+    Нужна для одного утверждения, которое иначе не доказать: предел строк
+    срабатывает ПО ХОДУ чтения, а не после того, как весь CSV уже материализован
+    в памяти. Проверка «в конце пришёл отказ» этого не отличает вовсе — отказ
+    приходил и раньше, просто после того, как ресурс был потрачен.
+    """
+
+    def __init__(self, real):
+        self._real = real
+        self.Error = real.Error
+        self.rows = 0
+
+    def reader(self, *args, **kwargs):
+        for row in self._real.reader(*args, **kwargs):
+            self.rows += 1
+            yield row
+
+
+def csv_limit_checks() -> None:
+    """Предел строк CSV срабатывает на limit+1, а не после всего файла."""
+    print("\n== Предел строк CSV: отказ до усиления, а не после ==")
+    over = ("\r\n" * (ss.MAX_ROWS_PER_SHEET + 500)).encode("utf-8")
+    check("ответ при этом умещается в разрешённые байты",
+          len(over) <= ss.MAX_RESPONSE_BYTES, str(len(over)))
+
+    real_csv = ss.csv
+    counting = _CountingCsv(real_csv)
+    ss.csv = counting
+    try:
+        message = raises(lambda: ss.decode_csv("Осень 26", over), ss.SourceError)
+    finally:
+        ss.csv = real_csv
+    check("слишком длинный лист отвергнут", bool(message), message[:120])
+    check("и отказ называет предел, а не «что-то пошло не так»",
+          str(ss.MAX_ROWS_PER_SHEET) in message, message[:120])
+    check("итератор прочитан ровно до предела плюс одна строка",
+          counting.rows == ss.MAX_ROWS_PER_SHEET + 1,
+          f"прочитано {counting.rows}, ожидалось {ss.MAX_ROWS_PER_SHEET + 1}")
+
+    edge = ("\r\n" * ss.MAX_ROWS_PER_SHEET).encode("utf-8")
+    counting = _CountingCsv(real_csv)
+    ss.csv = counting
+    try:
+        rows = ss.decode_csv("Осень 26", edge)
+    finally:
+        ss.csv = real_csv
+    check("ровно предел строк ещё принимается",
+          len(rows) == ss.MAX_ROWS_PER_SHEET, str(len(rows)))
+    check("и лишнего чтения на границе не случилось",
+          counting.rows == ss.MAX_ROWS_PER_SHEET, str(counting.rows))
+
+    print("\n== Прежние пределы байтов, колонок и ячеек не ослаблены ==")
+    wide = to_csv([[str(i) for i in range(ss.MAX_COLUMNS + 1)]])
+    check("колонок больше предела — отказ",
+          str(ss.MAX_COLUMNS) in raises(lambda: ss.decode_csv("Ш", wide),
+                                        ss.SourceError))
+    long_cell = to_csv([["x" * (ss.MAX_CELL_CHARS + 1)]])
+    check("ячейка длиннее предела — отказ",
+          str(ss.MAX_CELL_CHARS) in raises(lambda: ss.decode_csv("Я", long_cell),
+                                           ss.SourceError))
+    check("предел байтов ответа остался прежним",
+          ss.MAX_RESPONSE_BYTES == 2 * 1024 * 1024, str(ss.MAX_RESPONSE_BYTES))
+    # Ошибка самого разбора CSV должна остаться управляемой и после перехода
+    # на итератор: раньше `csv.Error` ловился вокруг `list(reader)`, теперь —
+    # вокруг каждого `next`, и потерять её на этом переходе было бы легко.
+    huge_field = b'"' + b"x" * (csv.field_size_limit() + 10) + b'"\r\n'
+    check("сбой самого разбора CSV — управляемый отказ, а не падение набора",
+          "CSV не разбирается" in raises(
+              lambda: ss.decode_csv("Б", huge_field), ss.SourceError),
+          raises(lambda: ss.decode_csv("Б", huge_field), ss.SourceError)[:120])
+
 # ── Прогон ──────────────────────────────────────────────────────────────────
 
 def run() -> int:
     input_checks()
     parse_checks()
+    continuation_checks()
+    csv_limit_checks()
     fail_closed_checks()
     network_checks()
 
@@ -2377,6 +3014,10 @@ def run() -> int:
 
     refresh_checks(owner, org_id)
     first_failure_checks()
+    safe_error_checks()
+    attempt_privacy_checks()
+    malformed_url_checks()
+    incomplete_counts_checks()
     envelope_version_checks()
     row_shape_checks()
     row_required_checks()

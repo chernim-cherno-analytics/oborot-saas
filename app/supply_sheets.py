@@ -72,13 +72,20 @@ ENVELOPE_KEY = "supply_sheets_v1"
 #: Версия парсера. Входит в `content_sha256`, и это не украшение: тот же CSV,
 #: разобранный ДРУГИМ парсером, — другой снимок, и выдавать его за «ничего не
 #: изменилось» нельзя. Версия 2 — исправление позиционной схемы по ревью PR #47
-#: (весь каркас был на колонку левее фактического). Поэтому первое обновление
-#: после этой правки честно приходит как НОВЫЙ импорт, даже если байты в Google
-#: не поменялись ни на один: изменилось не содержимое источника, а то, что мы в
-#: нём прочитали. Снимок, сделанный прежней версией, читается по-прежнему, но
-#: помечается устаревшим (`parser_stale`) — сам себя он вылечит первым же
-#: обновлением.
-PARSER_VERSION = "supply-sheets-parser-2"
+#: (весь каркас был на колонку левее фактического). Версия 3 — корректив того же
+#: ревью: продолжение неполного якоря наследует `identity_missing_part`, а
+#: листовой и общий итог штук перестал быть окончательным числом там, где хотя
+#: бы одна строка нечитаема или без количеств. И то и другое меняет СМЫСЛ
+#: сохранённых строк и счётчиков, а не только их вид.
+#:
+#: Поэтому первое обновление после каждой такой правки честно приходит как
+#: НОВЫЙ импорт, даже если байты в Google не поменялись ни на один: изменилось
+#: не содержимое источника, а то, что мы в нём прочитали. Снимок, сделанный
+#: прежней версией, читается по-прежнему, но помечается устаревшим
+#: (`parser_stale`) — сам себя он вылечит первым же обновлением. Версия САМОГО
+#: envelope при этом остаётся 1: форма контейнера и форма строки не менялись,
+#: менялось прочтение — миграции нет и быть не должно.
+PARSER_VERSION = "supply-sheets-parser-3"
 
 #: Виды связей, которые считаются ОСНОВНОЙ связью организации. Список явный:
 #: «любая связь» означало бы, что носитель зависит от порядка строк.
@@ -225,7 +232,21 @@ def parse_spreadsheet_url(raw: str) -> str:
     Возвращается ИДЕНТИФИКАТОР, а не URL: дальше запрос строит сервер. Это и
     есть граница, отделяющая «пользователь показал свою таблицу» от «клиент
     заставил сервер сходить по произвольному адресу».
+
+    ТИП проверяется первым, и это замечание ревью PR #47, а не педантизм. Тело
+    запроса — нетипизированный JSON-объект, и `{"spreadsheet_url": 123}` доезжал
+    до `(raw or "").strip()`, где число даёт `AttributeError`: вместо
+    обещанного 400 «поправьте ссылку» пользователь получал 500. Ошибка клиента
+    обязана оставаться ошибкой клиента — управляемой, названной и без единого
+    сетевого вызова. `None` считается пустым вводом (человек ничего не
+    прислал), любой другой не-строке отвечаем прямо, что здесь ждут текст;
+    `bool` в том числе — в Python он подкласс `int`, но строкой от этого не
+    становится.
     """
+    if raw is not None and not isinstance(raw, str):
+        raise ValidationError(
+            "Ссылка на таблицу должна быть текстом — пришло значение другого вида."
+        )
     value = (raw or "").strip()
     if not value:
         raise ValidationError("Вставьте ссылку на таблицу Google Sheets.")
@@ -501,25 +522,44 @@ def _cell(row: list[str], col: int) -> str:
 
 
 def decode_csv(sheet_name: str, blob: bytes) -> list[list[str]]:
-    """Байты CSV → физические строки. Лимиты проверяются здесь, fail closed."""
+    """Байты CSV → физические строки. Лимиты проверяются здесь, fail closed.
+
+    ПРЕДЕЛ СТРОК ПРОВЕРЯЕТСЯ ПО ХОДУ ЧТЕНИЯ, А НЕ ПОСЛЕ. Замечание ревью PR #47:
+    прежний `list(reader)` материализовал ВЕСЬ CSV, и только потом смотрел на
+    `MAX_ROWS_PER_SHEET`. Разрешённые 2 МиБ ответа — это около двух миллионов
+    строк из одного перевода строки, то есть два миллиона списков в памяти
+    единственного воркера ради того, чтобы следующей строкой сказать «слишком
+    много». Предел, который срабатывает после того, как ресурс уже потрачен,
+    ресурс не защищает.
+    Поэтому читаем итератором и отказываем НА ПЕРВОЙ ЖЕ лишней строке —
+    `MAX_ROWS_PER_SHEET + 1`, дальше источник не читается вовсе. Пределы
+    колонок и длины ячейки остаются на прежних местах и проверяются в том же
+    проходе, до того как строка попадёт в результат.
+    """
     try:
         text = blob.decode("utf-8-sig")
     except UnicodeDecodeError:
         raise SourceError(
             f"лист «{sheet_name}»: ответ не читается как текст UTF-8"
         ) from None
-    try:
-        reader = csv.reader(io.StringIO(text, newline=""))
-        raw_rows = list(reader)
-    except csv.Error:
-        raise SourceError(f"лист «{sheet_name}»: CSV не разбирается") from None
 
-    if len(raw_rows) > MAX_ROWS_PER_SHEET:
-        raise SourceError(
-            f"лист «{sheet_name}»: строк больше допустимых {MAX_ROWS_PER_SHEET}"
-        )
     rows: list[list[str]] = []
-    for index, raw in enumerate(raw_rows, start=1):
+    reader = csv.reader(io.StringIO(text, newline=""))
+    index = 0
+    while True:
+        try:
+            raw = next(reader)
+        except StopIteration:
+            break
+        except csv.Error:
+            raise SourceError(f"лист «{sheet_name}»: CSV не разбирается") from None
+        index += 1
+        if index > MAX_ROWS_PER_SHEET:
+            # Fail closed ровно здесь: строку с номером limit+1 мы уже увидели,
+            # и этого достаточно, чтобы знать ответ. Читать дальше незачем.
+            raise SourceError(
+                f"лист «{sheet_name}»: строк больше допустимых {MAX_ROWS_PER_SHEET}"
+            )
         if len(raw) > MAX_COLUMNS:
             raise SourceError(
                 f"лист «{sheet_name}», строка {index}: колонок больше "
@@ -553,6 +593,16 @@ def check_header(sheet_name: str, rows: list[list[str]]) -> dict:
       4. размерная горка — ровно пять последовательных колонок XS…XL, а за
          ней две колонки, подписи которых либо отсутствуют, либо в точности
          те, что наблюдались. Никакой третьей формы.
+
+    В ТЕКСТЕ ОТКАЗА НЕТ СОДЕРЖИМОГО ЧУЖОЙ ЯЧЕЙКИ — ни в одной ветке. Это
+    замечание ревью PR #47, и оно не про аккуратность формулировок. Отказ
+    отсюда уходит тремя дорогами сразу: в ответ 502 владельцу, в сохранённый
+    `last_error` носителя и оттуда — в GET, который читает ЛЮБОЙ участник
+    организации. Значение ячейки приехало из чужой таблицы, которую заполняют
+    люди, и может содержать что угодно, включая персональные данные. Поэтому
+    называется ровно то, что принадлежит НАМ: лист, номер колонки и наш
+    собственный ожидаемый контракт. Этого достаточно, чтобы человек открыл
+    свою таблицу и увидел расхождение своими глазами — а больше и не нужно.
     """
     if len(rows) < 2:
         raise SourceError(
@@ -565,7 +615,8 @@ def check_header(sheet_name: str, rows: list[list[str]]) -> dict:
         if actual != expected:
             raise SourceError(
                 f"лист «{sheet_name}»: формат заголовка изменился — в колонке "
-                f"{col} ожидалось «{expected}», а стоит «{actual}»"
+                f"{col} ожидалась подпись «{expected}», а стоит другое "
+                f"(содержимое ячейки здесь не показывается)"
             )
 
     # Уникальность подписей каркаса. «Комментарии» сюда не входит: их в
@@ -585,7 +636,7 @@ def check_header(sheet_name: str, rows: list[list[str]]) -> dict:
             raise SourceError(
                 f"лист «{sheet_name}»: формат заголовка изменился — колонка "
                 f"{col} читается как артикул и обязана быть без заголовка, "
-                f"а в ней стоит «{actual}»"
+                f"а она не пуста (содержимое ячейки здесь не показывается)"
             )
 
     article_column = NAME_COLUMN - 1
@@ -605,14 +656,16 @@ def check_header(sheet_name: str, rows: list[list[str]]) -> dict:
             if actual != label:
                 raise SourceError(
                     f"лист «{sheet_name}»: размерная горка не опознана — в "
-                    f"колонке {col} ожидалось «{label}», а стоит «{actual}»"
+                    f"колонке {col} ожидалась подпись «{label}», а стоит другое "
+                    f"(содержимое ячейки здесь не показывается)"
                 )
         elif actual == "":
             inferred.append(label)
         elif actual != label:
             raise SourceError(
                 f"лист «{sheet_name}»: размерная горка не опознана — в колонке "
-                f"{col} ожидалось пусто или «{label}», а стоит «{actual}»"
+                f"{col} ожидалась пустая ячейка или подпись «{label}», а стоит "
+                f"другое (содержимое ячейки здесь не показывается)"
             )
     band = set(range(SIZE_BAND_START, SIZE_BAND_START + len(SIZE_LABELS)))
     for col in range(1, len(row2) + 1):
@@ -633,7 +686,7 @@ def check_header(sheet_name: str, rows: list[list[str]]) -> dict:
             raise SourceError(
                 f"лист «{sheet_name}»: колонка {col} читается по позиции и "
                 f"должна быть либо без подписи, либо подписана «{expected}» — "
-                f"а в ней стоит «{actual}»"
+                f"а подписана иначе (содержимое ячейки здесь не показывается)"
             )
         trailing[col] = actual
 
@@ -756,11 +809,13 @@ def parse_sheet(sheet_name: str, rows: list[list[str]]) -> tuple[list[dict], dic
         is_anchor = bool(article_raw or name_raw)
 
         if is_anchor:
-            anchor = {"row": source_row, "article": article_raw, "name": name_raw}
+            incomplete = not (article_raw and name_raw)
+            anchor = {"row": source_row, "article": article_raw,
+                      "name": name_raw, "incomplete": incomplete}
             article = article_raw
             name = name_raw
             anchor_row = source_row
-            if not (article_raw and name_raw):
+            if incomplete:
                 # Якорь есть, но половины идентичности нет. Это не ошибка
                 # источника и не повод угадывать вторую половину: это строка,
                 # которую человек обязан посмотреть глазами.
@@ -769,6 +824,16 @@ def parse_sheet(sheet_name: str, rows: list[list[str]]) -> tuple[list[dict], dic
             article = anchor["article"]
             name = anchor["name"]
             anchor_row = anchor["row"]
+            if anchor.get("incomplete"):
+                # Продолжение НАСЛЕДУЕТ неполноту вместе с идентичностью —
+                # замечание ревью PR #47. Очередь «требуют разбора» строится
+                # по собственным `issues` каждой строки, поэтому продолжение
+                # неполного якоря из неё выпадало: его количества и пометки
+                # опознать по-прежнему нельзя, а на экране разбора его нет.
+                # Наследуется именно неполнота, а не «ошибка источника»:
+                # строка ровно так же требует человеческого взгляда, как и её
+                # якорь, и молчать о ней значило бы прятать половину случая.
+                issues.append("identity_missing_part")
         else:
             article = ""
             name = ""
@@ -888,8 +953,60 @@ def _row_flags(row: dict) -> tuple[bool, bool]:
     return bool(issues), bool(issues & INVALID_ISSUES)
 
 
+#: Неоднозначности, при которых итог штук перестаёт быть окончательным числом.
+#: Их ровно две, и обе означают одно: количество этой строки нам НЕИЗВЕСТНО.
+#: `invalid_quantity` — в ячейке размера написано не число («Кроим по заданию»),
+#: `quantity_missing` — количеств у позиции нет вовсе. Расхождение итога
+#: (`total_mismatch`) сюда НЕ входит намеренно: там оба числа прочитаны, и
+#: сумма размеров остаётся честно сложенной — расхождение называется
+#: расхождением и живёт своей пометкой.
+INCOMPLETE_QUANTITY_ISSUES = frozenset({"invalid_quantity", "quantity_missing"})
+
+
+def _quantity_summary(data_rows: list[dict]) -> dict:
+    """Итог штук по набору строк: число ИЛИ честное «не определено».
+
+    ЗАЧЕМ ЭТО ТАК, А НЕ ПРОСТО СУММОЙ. Замечание ревью PR #47 воспроизводится
+    на боевой строке: в колонке XL написано «Кроим по заданию», строка честно
+    помечена `invalid_quantity`, её `size_sum` сложен из ЧЕТЫРЁХ прочитанных
+    размеров — а плитка «штук» показывала этот неполный итог как окончательное
+    число. То есть нечитаемая ячейка складывалась как ноль ровно в том месте,
+    где D-51 запрещает считать нечитаемое нулём.
+
+    Новой формулы здесь нет и быть не должно. `size_sum` строки остаётся тем
+    же объясняющим показателем: он не стирается, не обнуляется и не
+    пересчитывается. Меняется только КОНТРАКТ агрегата:
+
+      * `quantity_known` — сумма фактически прочитанных `size_sum`. Это не
+        «оценка снизу» и не KPI: это ровно то, что мы смогли прочитать;
+      * `quantity_complete` — прочитано ли всё. `False`, если хотя бы одна
+        строка набора нечитаема или без количеств;
+      * `quantity` — окончательное число ИЛИ `None`. `None` означает «мы не
+        знаем», и подставлять вместо него `quantity_known` нельзя: неполная
+        сумма, названная итогом, — это и есть та самая выдумка.
+
+    В аналитику, заказы, «Едет» и «В заказе» ни одно из этих чисел не входит и
+    входить не может: слой к ним не подключён вовсе (D-51).
+    """
+    known = sum(r["size_sum"] or 0 for r in data_rows)
+    complete = not any(
+        set(r.get("issues") or ()) & INCOMPLETE_QUANTITY_ISSUES for r in data_rows
+    )
+    return {
+        "quantity": known if complete else None,
+        "quantity_known": known,
+        "quantity_complete": complete,
+    }
+
+
 def build_counts(rows: list[dict], sheet_names: list[str]) -> dict:
-    """Сводка по листам, строкам и количествам. Считается один раз, при импорте."""
+    """Сводка по листам, строкам и количествам.
+
+    Считается при импорте и ПЕРЕСЧИТЫВАЕТСЯ на чтении, если сохранённая сводка
+    сделана прежней версией разбора (`_counts_view`): иначе снимок `parser-1` и
+    `parser-2` продолжал бы показывать свой частичный итог как окончательный.
+    Функция чистая — ни базы, ни времени, ни записи.
+    """
     per_sheet: list[dict] = []
     issues_total: dict[str, int] = {}
     for name in sheet_names:
@@ -897,14 +1014,13 @@ def build_counts(rows: list[dict], sheet_names: list[str]) -> dict:
         data_rows = [r for r in subset if not r["is_blank"]]
         needs = sum(1 for r in data_rows if _row_flags(r)[0])
         invalid = sum(1 for r in data_rows if _row_flags(r)[1])
-        quantity = sum(r["size_sum"] or 0 for r in data_rows)
         per_sheet.append({
             "sheet_name": name,
             "rows": len(subset),
             "data_rows": len(data_rows),
             "needs_review": needs,
             "invalid": invalid,
-            "quantity": quantity,
+            **_quantity_summary(data_rows),
         })
     data_rows = [r for r in rows if not r["is_blank"]]
     for row in data_rows:
@@ -916,9 +1032,57 @@ def build_counts(rows: list[dict], sheet_names: list[str]) -> dict:
         "data_rows": len(data_rows),
         "needs_review": sum(1 for r in data_rows if _row_flags(r)[0]),
         "invalid": sum(1 for r in data_rows if _row_flags(r)[1]),
-        "quantity": sum(r["size_sum"] or 0 for r in data_rows),
+        **_quantity_summary(data_rows),
         "issues": issues_total,
     }
+
+
+def _counts_are_current(counts) -> bool:
+    """Несёт ли сохранённая сводка сегодняшний контракт полноты — целиком.
+
+    Смотрим на НАЛИЧИЕ и ВИД полей, а не на версию парсера: снимок мог быть
+    записан какой угодно версией и какой угодно рукой, а вопрос ровно один —
+    можно ли доверять его числу «штук». Проверяется и верхний уровень, и каждый
+    лист: сводка, у которой контракт есть только сверху, наполовину старая.
+    """
+    if not isinstance(counts, dict):
+        return False
+
+    def ok(block) -> bool:
+        if not isinstance(block, dict):
+            return False
+        if type(block.get("quantity_complete")) is not bool:
+            return False
+        if not _is_int(block.get("quantity_known")):
+            return False
+        value = block.get("quantity")
+        return value is None or _is_int(value)
+
+    sheets = counts.get("sheets")
+    if not isinstance(sheets, list):
+        return False
+    return ok(counts) and all(ok(sheet) for sheet in sheets)
+
+
+def _counts_view(envelope: dict, rows: list[dict], sheet_names: list[str]) -> dict:
+    """Сводка для ЧТЕНИЯ: сохранённая, если ей можно верить, иначе пересчитанная.
+
+    ЗАЧЕМ. Снимок, сделанный `parser-1`/`parser-2`, несёт сводку, в которой
+    «штук» — безусловная сумма, то есть неполный итог, выданный за
+    окончательный. Показывать его человеку как факт нельзя: смысл числа
+    изменился, а число осталось прежним. Лечится это первым же обновлением
+    (версия парсера входит в `content_sha256`), но до обновления экран обязан
+    говорить правду.
+
+    Поэтому сводка пересчитывается ЗДЕСЬ, из уже проверенных строк того же
+    снимка, и только для показа. Носитель при этом не трогается ни одним
+    байтом: GET остаётся строго read-only, а «починить» чужую запись
+    перезаписью — это ровно та операция, которой в чтении быть не должно.
+    """
+    stored = envelope.get("counts")
+    if _counts_are_current(stored):
+        return stored
+    return build_counts(rows, sheet_names)
 
 
 def _now_iso() -> str:
@@ -1402,7 +1566,12 @@ def refresh(db: Session, org_id: int, spreadsheet_url: str, sheet_names,
                 "content_sha256": digest,
                 "fetched_at": envelope.get("fetched_at"),
                 "last_success_at": envelope.get("last_success_at"),
-                "counts": envelope.get("counts") or build_counts([], names),
+                # Та же сводка, что увидит GET: если сохранённая сделана
+                # прежней версией разбора, здесь тоже пересчитанная — два
+                # разных ответа про одни и те же строки были бы расхождением
+                # интерфейса и расчёта.
+                "counts": _counts_view(envelope, envelope.get("rows") or [],
+                                       list(names)),
             }
 
         now = _now_iso()
@@ -1623,8 +1792,17 @@ def preview(db: Session, org_id: int, role: str, sheet: str | None = None,
         # вводил бы ссылку и два имени листов заново, не понимая, что пошло не
         # так. Это НЕ объявление источника настроенным: `configured` остаётся
         # false, пока нет ни одного удачного чтения.
-        "attempt": _attempt_view(envelope.get("last_attempt_source")),
-        "counts": envelope.get("counts") or build_counts([], sheet_names),
+        #
+        # И это ТОЛЬКО владельцу — замечание ревью PR #47. Неудачная попытка
+        # принадлежит тому, кто её сделал: ввести ссылку и имена листов может
+        # один лишь владелец, форму восстанавливать нужно ему же, а участнику
+        # это состояние не адресовано вовсе. Успешный снимок остаётся общим
+        # (D-51: владелец и участник видят одно и то же), а адрес и листы
+        # ПОПЫТКИ, которая ничем не закончилась, наружу роли, которая её не
+        # делала, не уезжают.
+        "attempt": (_attempt_view(envelope.get("last_attempt_source"))
+                    if role == "owner" else _attempt_view(None)),
+        "counts": _counts_view(envelope, rows, sheet_names),
         "total": len(selected),
         "rows": out_rows,
     })

@@ -29,6 +29,7 @@
               min-width: 150px; background: var(--surface); }
   .sup-tile .k { font-size: 11.5px; color: var(--ink-3); }
   .sup-tile .v { font-size: 18px; font-weight: 800; font-variant-numeric: tabular-nums; }
+  .sup-tile .v.soft { font-size: 13.5px; font-weight: 700; color: var(--ink-2); }
   .sup-bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
   .sup-chip { font-size: 12px; padding: 5px 12px; border-radius: 20px; cursor: pointer;
               border: 1px solid var(--line); background: var(--surface); color: var(--ink-2); }
@@ -125,10 +126,38 @@
 
 {% block scripts %}
 <script>
-(function () {
+// ЗАПУСК ОТЛОЖЕН НАМЕРЕННО, И ЭТО НЕ СТИЛЬ. `static/app.js` подключён в
+// `base.html` с атрибутом `defer`, то есть выполняется ПОСЛЕ разбора всего
+// документа — а значит и после этого блока. Прежняя редакция звала `load()`
+// сразу, при разборе: `api` в этот момент ещё не существовал, страница падала
+// на `api is not defined` и оставалась пустой НАВСЕГДА — ни строк, ни формы,
+// ни сообщения об ошибке. Дефект найден запуском страницы в браузере
+// (`tests/test_supply_ui.py`) и никакой проверкой разметки виден не был:
+// разметка была правильной, мёртвым был порядок выполнения. Остальные
+// страницы проекта, зовущие `api()` из блока `scripts`, ждут этого же события
+// (`account.html`, `dashboard.html`, `settings.html`, `plans.html` и др.).
+document.addEventListener("DOMContentLoaded", function () {
   var ROLE = "{{ role }}";
+  // Состояние подписки приходит с сервера тем же контекстом страницы, что и
+  // роль (`app/main.py:_page`). Отдельного запроса нет намеренно: страница уже
+  // отрендерена под сессией, и спрашивать сервер о том, что он только что знал,
+  // значит платить лишним round-trip на каждую загрузку.
+  var WRITES_BLOCKED = {{ writes_blocked | default(false) | tojson }};
   var state = { sheet: "", queue: "all", offset: 0, limit: 50 };
   var last = null;
+  // Сколько строк СЕЙЧАС на экране. Считается по факту отрисованного, а не
+  // выводится из offset: при догрузке offset фиксируется только после успеха,
+  // и выводить одно из другого значило бы снова связать их предположением.
+  var shown = 0;
+  // Поколение состояния. Растёт на каждой смене очереди, листа и на каждом
+  // УСПЕШНОМ обновлении снимка. Ответ, отправленный в прежнем поколении,
+  // дописан не будет: иначе страница фильтра «Ошибки» получала бы хвост
+  // страницы фильтра «Все», пришедший с опозданием, — и человек увидел бы в
+  // очереди разбора строки, которых там нет.
+  var gen = 0;
+  // Ровно один запрос догрузки за раз. Без этого двойной клик по «Показать
+  // ещё» отправлял два запроса и дважды двигал общий offset ДО ответа.
+  var inflight = false;
 
   function el(tag, cls, text) {
     var node = document.createElement(tag);
@@ -154,6 +183,31 @@
         ? "Источник настраивает владелец организации. Вам доступен просмотр."
         : "Источник ещё не настроен. Настроить его может владелец организации.";
       wrap.appendChild(ro);
+      return;
+    }
+    if (WRITES_BLOCKED) {
+      // Запись организации приостановлена подпиской (D-24). Сервер откажет
+      // этому POST кодом 402 ГАРАНТИРОВАННО — глобальной зависимостью гейта, а
+      // не проверкой на этой странице. Показывать при этом рабочую форму и
+      // кнопку значило бы предлагать действие, в котором приложение уже
+      // отказало: человек вводит ссылку, жмёт кнопку и получает отказ, который
+      // можно было назвать заранее. Поэтому здесь честное read-only состояние.
+      // Сам снимок при этом остаётся на экране целиком: readonly закрывает
+      // запись, а не чтение своих данных.
+      var blocked = el("div", "sup-err");
+      blocked.appendChild(el("b", null, "Обновление источника приостановлено: "));
+      blocked.appendChild(el("span", null,
+        "подписка организации не оплачена, и запись сейчас закрыта. "
+        + (data.configured
+            ? "Предпросмотр открыт на чтение — показан последний удачный снимок. "
+            : "Удачного чтения источника ещё не было, поэтому показывать пока нечего. ")
+        + "Чтение и выгрузка данных не ограничены; обновление источника вернётся после оплаты."));
+      var pay = el("div", null);
+      var link = el("a", null, "Выставить счёт — на странице «Тарифы»");
+      link.href = "/plans";
+      pay.appendChild(link);
+      blocked.appendChild(pay);
+      wrap.appendChild(blocked);
       return;
     }
     var form = el("div", "sup-form");
@@ -201,6 +255,17 @@
     var nxt = (document.getElementById("sup-next") || {}).value || "";
     btn.disabled = true;
     btn.textContent = "Читаем таблицу…";
+
+    // Кнопка восстанавливается при ЛЮБОМ исходе, включая падение следующего
+    // GET. Прежняя цепочка `.then().catch().then(restore)` этого не давала:
+    // если `load()` внутри `.catch` тоже отказывал, последний `.then` не
+    // выполнялся вовсе — и кнопка оставалась выключенной навсегда, то есть
+    // страница чинилась только перезагрузкой.
+    function restore() {
+      btn.disabled = false;
+      btn.textContent = "Обновить предпросмотр";
+    }
+
     api("/api/supply/sheets/refresh", {
       method: "POST",
       body: { spreadsheet_url: url, sheet_names: [cur, nxt] }
@@ -208,16 +273,21 @@
       toast(res.unchanged
         ? "Источник не изменился — показан прежний снимок."
         : "Предпросмотр обновлён.", res.unchanged ? "" : "ok");
-      state.offset = 0;
+      // УСПЕХ мог сменить сами имена листов: выбранный до этого лист в новом
+      // снимке существовать не обязан, и просить его у сервера значит получить
+      // 400 на ровном месте — а вместе с ним пустой экран вместо только что
+      // прочитанных строк. Поэтому лист и позиция сбрасываются, а очередь
+      // («Все / Требуют разбора / Ошибки») сохраняется: она к именам листов
+      // отношения не имеет.
+      state.sheet = "";
+      resetView();
       return load();
-    }).catch(function () {
-      // Текст ошибки уже показан тостом внутри api(); здесь только
-      // перечитываем состояние, чтобы человек увидел: прежний снимок цел.
+    }, function () {
+      // ОТКАЗ: снимок и его листы не изменились ни на байт, поэтому прежний
+      // фильтр остаётся законным, а строки — на экране. Перечитываем состояние
+      // только затем, чтобы стала видна причина отказа.
       return load();
-    }).then(function () {
-      btn.disabled = false;
-      btn.textContent = "Обновить предпросмотр";
-    });
+    }).then(restore, restore);
   }
 
   function renderError(data) {
@@ -286,11 +356,25 @@
     }
   }
 
-  function tile(k, v) {
+  function tile(k, v, cls) {
     var t = el("div", "sup-tile");
     t.appendChild(el("div", "k", k));
-    t.appendChild(el("div", "v", v));
+    t.appendChild(el("div", "v" + (cls ? " " + cls : ""), v));
     return t;
+  }
+
+  // Итог штук: число ИЛИ честное «не определено». Нечитаемая ячейка размера и
+  // строка вовсе без количеств не равны нулю (D-51), поэтому сумма по такому
+  // набору окончательным числом не является. Показываем ровно то, что
+  // прочитано, и прямо говорим, что это не итог, — вместо аккуратной цифры,
+  // которая молча считает «Кроим по заданию» нулём.
+  function quantityText(block) {
+    if (!block || block.quantity_complete !== true) {
+      var known = (block && typeof block.quantity_known === "number")
+        ? block.quantity_known : 0;
+      return "не определено · прочитано " + known;
+    }
+    return String(block.quantity);
   }
 
   function renderSummary(data) {
@@ -304,7 +388,8 @@
     (c.sheets || []).forEach(function (s) {
       box.appendChild(tile("Лист «" + s.sheet_name + "» · строк",
         s.data_rows + " из " + s.rows));
-      box.appendChild(tile("Лист «" + s.sheet_name + "» · штук", s.quantity));
+      box.appendChild(tile("Лист «" + s.sheet_name + "» · штук",
+        quantityText(s), s.quantity_complete === true ? null : "soft"));
     });
     box.appendChild(tile("Требуют разбора", c.needs_review || 0));
     box.appendChild(tile("Ошибки", c.invalid || 0));
@@ -317,18 +402,18 @@
     queues.forEach(function (q) {
       var b = el("button", "sup-chip" + (state.queue === q[0] ? " on" : ""), q[1]);
       b.addEventListener("click", function () {
-        state.queue = q[0]; state.offset = 0; load();
+        state.queue = q[0]; resetView(); load();
       });
       bar.appendChild(b);
     });
     if ((data.sheet_names || []).length) {
       bar.appendChild(el("span", "hint", "·"));
       var all = el("button", "sup-chip" + (state.sheet === "" ? " on" : ""), "Оба листа");
-      all.addEventListener("click", function () { state.sheet = ""; state.offset = 0; load(); });
+      all.addEventListener("click", function () { state.sheet = ""; resetView(); load(); });
       bar.appendChild(all);
       data.sheet_names.forEach(function (name) {
         var b = el("button", "sup-chip" + (state.sheet === name ? " on" : ""), name);
-        b.addEventListener("click", function () { state.sheet = name; state.offset = 0; load(); });
+        b.addEventListener("click", function () { state.sheet = name; resetView(); load(); });
         bar.appendChild(b);
       });
     }
@@ -434,18 +519,39 @@
       tr.appendChild(td);
       body.appendChild(tr);
     }
-    var shown = state.offset + (data.rows || []).length;
+    shown = (append ? shown : 0) + (data.rows || []).length;
     document.getElementById("sup-total").textContent =
       data.configured ? ("показано " + shown + " из " + data.total) : "";
     var more = document.getElementById("sup-more");
     more.style.display = shown < data.total ? "" : "none";
   }
 
-  function load(append) {
+  // Смена очереди, смена листа и УСПЕШНОЕ обновление снимка — это новое
+  // состояние: позиция обнуляется, а поколение растёт, чтобы ответ прежнего
+  // состояния, вернувшийся с опозданием, был отброшен, а не дописан.
+  function resetView() {
+    gen += 1;
+    state.offset = 0;
+    shown = 0;
+  }
+
+  function load(append, requestedOffset) {
+    // Поколение фиксируется В МОМЕНТ ОТПРАВКИ, а не читается в момент ответа.
+    var myGen = gen;
+    // Запрошенная позиция — ЛОКАЛЬНАЯ переменная запроса. Общий `state.offset`
+    // до ответа не двигается вовсе: замечание ревью PR #47. Прежний код
+    // прибавлял limit по клику, поэтому двойной клик уводил offset на две
+    // страницы вперёд при двух ответах в полёте, а любая ошибка оставляла его
+    // сдвинутым — и следующий клик перепрыгивал непоказанную страницу.
+    var offset = append ? requestedOffset : 0;
     var q = "?queue=" + encodeURIComponent(state.queue) +
-            "&offset=" + state.offset + "&limit=" + state.limit +
+            "&offset=" + offset + "&limit=" + state.limit +
             (state.sheet ? "&sheet=" + encodeURIComponent(state.sheet) : "");
     return api("/api/supply/sheets" + q).then(function (data) {
+      if (myGen !== gen) return;   // поздний ответ прежнего состояния — молча
+      // Позиция фиксируется ТОЛЬКО после успеха. Отказ её не двигает, поэтому
+      // повторный клик повторяет ровно ту же страницу, а не следующую.
+      state.offset = offset;
       last = data;
       if (data.disclaimer) {
         var note = document.getElementById("sup-note");
@@ -464,13 +570,25 @@
     });
   }
 
-  document.getElementById("sup-more").addEventListener("click", function () {
-    if (!last) return;
-    state.offset += state.limit;
-    load(true);
+  var moreBtn = document.getElementById("sup-more");
+  moreBtn.addEventListener("click", function () {
+    // Ровно один запрос догрузки в полёте. Кнопка гасится на время запроса и
+    // включается обратно при ЛЮБОМ исходе — иначе один неудачный ответ
+    // выключал бы догрузку до перезагрузки страницы.
+    if (!last || inflight) return;
+    var requested = state.offset + state.limit;
+    inflight = true;
+    moreBtn.disabled = true;
+    load(true, requested).catch(function () {
+      // Причина уже показана тостом внутри api(); позиция не сдвинута, и
+      // следующий клик повторит ТУ ЖЕ страницу.
+    }).then(function () {
+      inflight = false;
+      moreBtn.disabled = false;
+    });
   });
 
   load();
-})();
+});
 </script>
 {% endblock %}
