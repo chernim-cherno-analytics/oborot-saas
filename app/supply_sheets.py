@@ -69,9 +69,16 @@ ENVELOPE_SCHEMA_VERSION = 1
 #: смыслу JSON.
 ENVELOPE_KEY = "supply_sheets_v1"
 
-#: Версия парсера. Входит в `content_sha256`: тот же CSV, разобранный другим
-#: парсером, — другой снимок, и выдавать его за «ничего не изменилось» нельзя.
-PARSER_VERSION = "supply-sheets-parser-1"
+#: Версия парсера. Входит в `content_sha256`, и это не украшение: тот же CSV,
+#: разобранный ДРУГИМ парсером, — другой снимок, и выдавать его за «ничего не
+#: изменилось» нельзя. Версия 2 — исправление позиционной схемы по ревью PR #47
+#: (весь каркас был на колонку левее фактического). Поэтому первое обновление
+#: после этой правки честно приходит как НОВЫЙ импорт, даже если байты в Google
+#: не поменялись ни на один: изменилось не содержимое источника, а то, что мы в
+#: нём прочитали. Снимок, сделанный прежней версией, читается по-прежнему, но
+#: помечается устаревшим (`parser_stale`) — сам себя он вылечит первым же
+#: обновлением.
+PARSER_VERSION = "supply-sheets-parser-2"
 
 #: Виды связей, которые считаются ОСНОВНОЙ связью организации. Список явный:
 #: «любая связь» означало бы, что носитель зависит от порядка строк.
@@ -370,38 +377,72 @@ def fetch_sheet_csv(spreadsheet_id: str, sheet_name: str,
 
 # ── Контракт заголовка: маленький, явный, без догадок ────────────────────────
 #
-# Форма ниже — не гипотеза, а наблюдение read-only 31.08.2026 на боевой таблице.
-# Живой CSV в репозиторий не кладётся (там PII); в тестах — синтетические
-# фикстуры ровно этой формы.
+# ЭТИ ПОЗИЦИИ — НАБЛЮДЕНИЕ, А НЕ ДОГАДКА, и однажды они уже были неверны.
+# Первая версия слоя (отвергнутый ревью HEAD `a25e163`) задала весь каркас НА
+# ОДНУ КОЛОНКУ ЛЕВЕЕ: ждала «Наименование» в колонке 2, размерную горку с 9,
+# итог в 14. Синтетическая фикстура повторяла ту же ошибку — и потому весь
+# набор был зелёным, а оба живых листа падали ДО первой строки данных.
+# Урок записан здесь, а не только в журнале: фикстура, сочинённая по той же
+# памяти, что и код, ничего не проверяет. Ниже — форма, снятая read-only с
+# точных публичных байтов обоих листов 31.08.2026; живой CSV в репозиторий не
+# кладётся (там PII), в тестах — две синтетические формы этого каркаса.
+#
+# Наблюдены ДВЕ законные формы строки 2, и обе поддержаны намеренно:
+#   * «Осень 26»  — промежуточные S/M/L пусты (объединённая ячейка горки),
+#                   колонки итога и цены без подписи;
+#   * «НГ 26/27»  — S/M/L подписаны явно, а колонки 15 и 16 подписаны
+#                   «Общее количество» и «Цена».
+# Больше ничего не разрешено: третья форма — это дрейф, и он fail closed.
 
-#: Строка 1: ячейки, которые ОБЯЗАНЫ стоять ровно здесь и ровно так. Ключ —
-#: номер колонки с единицы, как их видит человек в таблице.
+#: Строка 1: подписи, которые ОБЯЗАНЫ стоять ровно здесь и ровно так.
+#: Ключ — номер колонки с единицы, как их видит человек в таблице.
 ROW1_REQUIRED_HEADERS: dict[int, str] = {
-    2: "Наименование",
-    4: "Цвет",
-    5: "Количество в м",
-    6: "Комментарии",
+    3: "Наименование",
+    4: "Эскиз",
+    5: "Цвет",
+    6: "Количество в м",
     7: "Комментарии",
     8: "Комментарии",
-    9: "Размерная горка",
-    17: "Комплектующие",
-    18: "Выбранное производство",
+    9: "Комментарии",
+    10: "Размерная горка",
+    18: "Комплектующие",
+    19: "Выбранное производство",
 }
 
-#: Строка 1: ячейки, которые обязаны быть ПУСТЫМИ. Колонка 14 — фактический
-#: итог источника, чей заголовок теряется в CSV. Поэтому она читается по
-#: позиции, и пустота её заголовка — часть контракта: появившийся здесь текст
-#: означает, что таблица переехала, и молча читать колонку дальше нельзя.
-ROW1_REQUIRED_EMPTY: tuple[int, ...] = (14,)
+#: Строка 1: колонка артикула. Своего заголовка у неё нет ни на одном листе —
+#: и пустота этого заголовка входит в контракт: текст, появившийся здесь,
+#: означает, что каркас переехал, и молча читать дальше нельзя.
+#: (На «НГ 26/27» в этой ячейке стоит перевод строки — после `strip()` это
+#: та же пустота, и отдельным случаем она не является.)
+ROW1_REQUIRED_EMPTY: tuple[int, ...] = (2,)
+
+#: Подписи, по которым держится ВЕСЬ позиционный контракт. Каждая обязана
+#: встречаться в строке 1 РОВНО ОДИН РАЗ. Без этой проверки сдвиг каркаса на
+#: колонку (ровно тот дефект, что был отвергнут ревью) мог бы пройти незаметно
+#: там, где подпись случайно повторяется.
+ROW1_UNIQUE_HEADERS: tuple[str, ...] = (
+    "Наименование", "Эскиз", "Цвет", "Количество в м",
+    "Размерная горка", "Комплектующие", "Выбранное производство",
+)
 
 #: Колонка «Наименование». Артикул выводится как РОВНО ОДНА колонка
 #: непосредственно перед ней — собственного заголовка у него нет.
-NAME_COLUMN = 2
+NAME_COLUMN = 3
 
 #: Размерная горка. Позиционное сопоставление XS,S,M,L,XL разрешено ТОЛЬКО
 #: при ровно пяти последовательных колонках, где первая помечена XS, а пятая XL.
-SIZE_BAND_START = 9
+SIZE_BAND_START = 10
 SIZE_LABELS: tuple[str, ...] = ("XS", "S", "M", "L", "XL")
+
+#: Итог источника и цена — сразу за размерной горкой. На одном листе они
+#: подписаны в строке 2, на другом подписи нет вовсе; обе формы законны, а
+#: любая ТРЕТЬЯ подпись — дрейф.
+SOURCE_TOTAL_COLUMN = 15
+PRICE_COLUMN = 16
+ROW2_OPTIONAL_LABELS: dict[int, str] = {
+    SOURCE_TOTAL_COLUMN: "Общее количество",
+    PRICE_COLUMN: "Цена",
+}
 
 #: Первая физическая строка данных.
 FIRST_DATA_ROW = 3
@@ -409,21 +450,23 @@ FIRST_DATA_ROW = 3
 #: Именованные колонки сверх размеров и идентичности. Словарь МАЛЕНЬКИЙ и
 #: явный: всё, чего здесь нет, попадает в `unknown_raw` и поднимает
 #: `unknown_column` — потерять чужую колонку хуже, чем показать её без имени.
+#: Колонка 1 сюда НЕ входит намеренно: на разных листах в ней стоит разное
+#: (на одном пусто, на другом «Цена ткани за м»), и придумывать ей общий
+#: бизнес-смысл — это ровно то угадывание, которого здесь быть не должно.
 NAMED_COLUMNS: dict[int, tuple[str, str]] = {
-    4: ("color_raw", "Цвет"),
-    5: ("qty_meters_raw", "Количество в м"),
-    14: ("source_total_raw", "Итог источника"),
-    15: ("price_raw", "Цена (сырое)"),
-    16: ("extra_raw_16", "Доп. поле 16"),
-    17: ("components_raw", "Комплектующие"),
-    18: ("production_raw", "Выбранное производство"),
-    19: ("extra_raw_19", "Доп. поле 19"),
+    4: ("sketch_raw", "Эскиз"),
+    5: ("color_raw", "Цвет"),
+    6: ("qty_meters_raw", "Количество в м"),
+    SOURCE_TOTAL_COLUMN: ("source_total_raw", "Итог источника"),
+    PRICE_COLUMN: ("price_raw", "Цена (сырое)"),
+    18: ("components_raw", "Комплектующие"),
+    19: ("production_raw", "Выбранное производство"),
 }
 
 #: Колонки комментариев. Их три, и они схлопыванию не подлежат: в источнике
 #: это три разные колонки, и человек, который ищет свою пометку, ищет её в
 #: своей колонке.
-COMMENT_COLUMNS: tuple[int, ...] = (6, 7, 8)
+COMMENT_COLUMNS: tuple[int, ...] = (7, 8, 9)
 
 #: Значения, которыми в источнике обозначают «размера нет». Тире — не ноль:
 #: ноль означал бы «решили не шить», а тире — «здесь ничего не написано».
@@ -498,9 +541,18 @@ def check_header(sheet_name: str, rows: list[list[str]]) -> dict:
     """Проверяет контракт двух header rows. Не сошлось — `SourceError`.
 
     Fail closed НАМЕРЕННО. Дрейф заголовка — это не «немного другой файл», это
-    смена смысла колонок: колонка 14 перестала быть итогом, размерная горка
-    поехала на две позиции, и всё, что мы покажем дальше, будет уверенной
-    неправдой. Пустой экран с honest ошибкой дешевле.
+    смена смысла колонок: колонка итога перестала быть итогом, размерная горка
+    поехала на позицию, и всё, что мы покажем дальше, будет уверенной
+    неправдой. Пустой экран с честной ошибкой дешевле.
+
+    Проверяется ЧЕТЫРЕ вещи, и каждая закрывает свой способ ошибиться:
+      1. подписи каркаса стоят ровно на своих номерах колонок;
+      2. каждая такая подпись встречается в строке 1 РОВНО ОДИН РАЗ — иначе
+         сдвиг каркаса на колонку мог бы спрятаться за случайным повтором;
+      3. у колонки артикула заголовка нет;
+      4. размерная горка — ровно пять последовательных колонок XS…XL, а за
+         ней две колонки, подписи которых либо отсутствуют, либо в точности
+         те, что наблюдались. Никакой третьей формы.
     """
     if len(rows) < 2:
         raise SourceError(
@@ -515,13 +567,25 @@ def check_header(sheet_name: str, rows: list[list[str]]) -> dict:
                 f"лист «{sheet_name}»: формат заголовка изменился — в колонке "
                 f"{col} ожидалось «{expected}», а стоит «{actual}»"
             )
+
+    # Уникальность подписей каркаса. «Комментарии» сюда не входит: их в
+    # источнике честно три подряд, и повтор там — норма, а не дрейф.
+    for label in ROW1_UNIQUE_HEADERS:
+        seen = [col for col in range(1, len(row1) + 1) if _cell(row1, col) == label]
+        if len(seen) != 1:
+            raise SourceError(
+                f"лист «{sheet_name}»: подпись «{label}» встречается в строке "
+                f"заголовка {len(seen)} раз(а) (колонки {seen or '—'}), а должна "
+                f"ровно один — какая из них задаёт каркас, мы не угадываем"
+            )
+
     for col in ROW1_REQUIRED_EMPTY:
         actual = _cell(row1, col)
         if actual != "":
             raise SourceError(
                 f"лист «{sheet_name}»: формат заголовка изменился — колонка "
-                f"{col} читается как итог источника и обязана быть без "
-                f"заголовка, а в ней стоит «{actual}»"
+                f"{col} читается как артикул и обязана быть без заголовка, "
+                f"а в ней стоит «{actual}»"
             )
 
     article_column = NAME_COLUMN - 1
@@ -530,9 +594,10 @@ def check_header(sheet_name: str, rows: list[list[str]]) -> dict:
             f"лист «{sheet_name}»: перед «Наименование» нет колонки артикула"
         )
 
-    # Размерная горка. Пять последовательных колонок, крайние подписаны, три
-    # промежуточные в источнике пусты — только это и разрешает позиционное
-    # сопоставление XS,S,M,L,XL. Ни одного «похоже, что это S» здесь нет.
+    # Размерная горка. Пять последовательных колонок; крайние подписаны всегда,
+    # три промежуточные либо пусты (объединённая ячейка), либо подписаны ровно
+    # своим размером. Ни одного «похоже, что это S» здесь нет.
+    inferred: list[str] = []
     for offset, label in enumerate(SIZE_LABELS):
         col = SIZE_BAND_START + offset
         actual = _cell(row2, col)
@@ -542,7 +607,9 @@ def check_header(sheet_name: str, rows: list[list[str]]) -> dict:
                     f"лист «{sheet_name}»: размерная горка не опознана — в "
                     f"колонке {col} ожидалось «{label}», а стоит «{actual}»"
                 )
-        elif actual not in ("", label):
+        elif actual == "":
+            inferred.append(label)
+        elif actual != label:
             raise SourceError(
                 f"лист «{sheet_name}»: размерная горка не опознана — в колонке "
                 f"{col} ожидалось пусто или «{label}», а стоит «{actual}»"
@@ -558,6 +625,31 @@ def check_header(sheet_name: str, rows: list[list[str]]) -> dict:
                 f"мы не угадываем"
             )
 
+    # Итог и цена. Подпись либо отсутствует, либо ровно ожидаемая.
+    trailing: dict[int, str] = {}
+    for col, expected in sorted(ROW2_OPTIONAL_LABELS.items()):
+        actual = _cell(row2, col)
+        if actual not in ("", expected):
+            raise SourceError(
+                f"лист «{sheet_name}»: колонка {col} читается по позиции и "
+                f"должна быть либо без подписи, либо подписана «{expected}» — "
+                f"а в ней стоит «{actual}»"
+            )
+        trailing[col] = actual
+
+    # Свободные колонки: те, которым этот слой НЕ назначает смысла. Их
+    # заголовок сохраняется как наблюдение (на «НГ 26/27» колонка 1 подписана
+    # «Цена ткани за м», на «Осень 26» — пуста), но бизнес-смысл из подписи не
+    # выводится: значения таких колонок едут в `unknown_raw` как есть.
+    known = _known_columns(article_column)
+    free: dict[str, str] = {}
+    for col in range(1, max(len(row1), len(row2)) + 1):
+        if col in known:
+            continue
+        header = _cell(row1, col) or _cell(row2, col)
+        if header:
+            free[str(col)] = header
+
     return {
         "header_rows": 2,
         "name_column": NAME_COLUMN,
@@ -568,12 +660,26 @@ def check_header(sheet_name: str, rows: list[list[str]]) -> dict:
         "article_column_inferred": True,
         "size_band_start": SIZE_BAND_START,
         "size_labels": list(SIZE_LABELS),
-        "size_labels_inferred": ["S", "M", "L"],
-        "source_total_column": 14,
-        "source_total_column_inferred": True,
+        # Какие именно размеры выведены позиционно, а какие подписаны в
+        # источнике, — зависит от листа, и это факт о конкретном листе.
+        "size_labels_inferred": inferred,
+        "source_total_column": SOURCE_TOTAL_COLUMN,
+        "source_total_header": trailing.get(SOURCE_TOTAL_COLUMN, ""),
+        "source_total_column_inferred": not trailing.get(SOURCE_TOTAL_COLUMN),
+        "price_column": PRICE_COLUMN,
+        "price_header": trailing.get(PRICE_COLUMN, ""),
+        "price_column_inferred": not trailing.get(PRICE_COLUMN),
         "first_data_row": FIRST_DATA_ROW,
         "comment_columns": list(COMMENT_COLUMNS),
+        "free_columns": free,
     }
+
+
+def _known_columns(article_column: int) -> set:
+    """Колонки, которым слой назначает смысл. Всё прочее — свободное."""
+    known = set(NAMED_COLUMNS) | set(COMMENT_COLUMNS) | {NAME_COLUMN, article_column}
+    known |= set(range(SIZE_BAND_START, SIZE_BAND_START + len(SIZE_LABELS)))
+    return known
 
 
 def parse_quantity(raw: str) -> tuple[int | None, bool]:
@@ -587,7 +693,11 @@ def parse_quantity(raw: str) -> tuple[int | None, bool]:
     value = (raw or "").strip()
     if value == "" or value in ABSENT_MARKS:
         return None, False
-    if not re.fullmatch(r"\d+", value):
+    # ТОЛЬКО ASCII-цифры. `\d` в Python юникодный: «٣», «１２» и прочие
+    # цифроподобные строки он принимает, а `int()` их радостно разбирает — и в
+    # предпросмотре появилось бы количество, которого человек в своей таблице
+    # не писал. Такие строки сохраняются сырыми и помечаются нечитаемыми.
+    if not re.fullmatch(r"[0-9]+", value):
         return None, True
     number = int(value)
     if number > MAX_QUANTITY:
@@ -628,7 +738,7 @@ def parse_sheet(sheet_name: str, rows: list[list[str]]) -> tuple[list[dict], dic
                 "is_blank": True,
                 "article_raw": "", "name_raw": "",
                 "article": "", "name": "",
-                "color_raw": "", "qty_meters_raw": "",
+                "color_raw": "", "qty_meters_raw": "", "sketch_raw": "",
                 "sizes": {label: None for label in SIZE_LABELS},
                 "sizes_raw": {label: "" for label in SIZE_LABELS},
                 "size_sum": None,
@@ -636,7 +746,7 @@ def parse_sheet(sheet_name: str, rows: list[list[str]]) -> tuple[list[dict], dic
                 "comments_raw": ["", "", ""],
                 "source_status_raw": "",
                 "price_raw": "", "components_raw": "", "production_raw": "",
-                "extra_raw": {}, "unknown_raw": {},
+                "unknown_raw": {},
                 "issues": [],
             })
             continue
@@ -681,7 +791,7 @@ def parse_sheet(sheet_name: str, rows: list[list[str]]) -> tuple[list[dict], dic
         # с итогом источника, — и ничего не «исправляет».
         size_sum = sum(valid_sizes) if valid_sizes else None
 
-        source_total_raw = _cell(cells, 14)
+        source_total_raw = _cell(cells, SOURCE_TOTAL_COLUMN)
         source_total, total_broken = parse_quantity(source_total_raw)
         if invalid_size or total_broken:
             issues.append("invalid_quantity")
@@ -703,8 +813,7 @@ def parse_sheet(sheet_name: str, rows: list[list[str]]) -> tuple[list[dict], dic
         for col, (key, _title) in NAMED_COLUMNS.items():
             named[key] = _cell(cells, col)
 
-        known = set(NAMED_COLUMNS) | set(COMMENT_COLUMNS) | {NAME_COLUMN, article_column}
-        known |= set(range(SIZE_BAND_START, SIZE_BAND_START + len(SIZE_LABELS)))
+        known = _known_columns(article_column)
         unknown_raw: dict[str, str] = {}
         for col in range(1, len(cells) + 1):
             if col in known:
@@ -735,12 +844,9 @@ def parse_sheet(sheet_name: str, rows: list[list[str]]) -> tuple[list[dict], dic
             # и приравнять их значило бы придумать факт.
             "source_status_raw": status_raw,
             "price_raw": named.get("price_raw", ""),
+            "sketch_raw": named.get("sketch_raw", ""),
             "components_raw": named.get("components_raw", ""),
             "production_raw": named.get("production_raw", ""),
-            "extra_raw": {
-                "16": named.get("extra_raw_16", ""),
-                "19": named.get("extra_raw_19", ""),
-            },
             "unknown_raw": unknown_raw,
             "issues": sorted(set(issues)),
         })
@@ -873,14 +979,79 @@ def _load_config(conn: Connection) -> dict:
     return data
 
 
+#: Форма envelope, которую умеет читать ЭТОТ код. Ключ → допустимые типы.
+#: Проверяется на чтении, а не на записи: пишем мы всегда сами, а читаем то,
+#: что оставил кто-то другой — прежняя версия кода, откат, ручная правка.
+_ENVELOPE_SHAPE: dict[str, tuple] = {
+    "schema_version": (int,),
+    "parser_version": (str,),
+    "spreadsheet_id": (str,),
+    "sheet_names": (list,),
+    "content_sha256": (str,),
+    "last_error": (str,),
+    "counts": (dict,),
+    "rows": (list,),
+}
+
+
+def _validate_envelope(envelope: dict) -> dict:
+    """Снимок читаемый — или отказ. Третьего исхода нет намеренно.
+
+    До этой проверки под versioned-ключом принимался ЛЮБОЙ словарь: комментарий
+    обещал различение версий, а код его не делал (замечание ревью PR #47).
+    Снимок, написанный будущей версией или испорченный руками, интерпретировался
+    бы сегодняшним читателем — то есть показывался бы человеку как правда.
+
+    Fail closed, и ВАЖНО: отказ читателя ничего не переписывает. Испорченный
+    снимок остаётся лежать как есть, чтобы его можно было посмотреть и понять,
+    а не «починить» перезаписью, потеряв улику.
+    """
+    version = envelope.get("schema_version")
+    if type(version) is not int or version != ENVELOPE_SCHEMA_VERSION:
+        raise CarrierConfigError(
+            f"Сохранённый предпросмотр сделан другой версией «Оборота» "
+            f"(версия снимка {version!r}, эта версия читает "
+            f"{ENVELOPE_SCHEMA_VERSION}). Он оставлен как есть и не переписан."
+        )
+    for key, types in _ENVELOPE_SHAPE.items():
+        if key not in envelope:
+            raise CarrierConfigError(
+                f"Сохранённый предпросмотр повреждён: нет поля «{key}». "
+                f"Он оставлен как есть и не переписан."
+            )
+        if not isinstance(envelope[key], types) or isinstance(envelope[key], bool):
+            raise CarrierConfigError(
+                f"Сохранённый предпросмотр повреждён: поле «{key}» не того "
+                f"вида. Он оставлен как есть и не переписан."
+            )
+    for row in envelope["rows"]:
+        if not isinstance(row, dict):
+            raise CarrierConfigError(
+                "Сохранённый предпросмотр повреждён: строка снимка не является "
+                "записью. Он оставлен как есть и не переписан."
+            )
+    return envelope
+
+
 def get_envelope(db: Session, org_id: int) -> dict | None:
-    """Текущий снимок организации или None. Чужие ключи не трогаются."""
+    """Текущий снимок организации или None. Чужие ключи не трогаются.
+
+    Отсутствие ключа — это None (нормальное «ещё не читали»). А вот ключ,
+    который есть, но читается не так, — отказ: см. `_validate_envelope`.
+    """
     conn = select_carrier(db, org_id)
     if conn is None:
         return None
     data = _load_config(conn)
-    envelope = data.get(ENVELOPE_KEY)
-    return envelope if isinstance(envelope, dict) else None
+    if ENVELOPE_KEY not in data:
+        return None
+    envelope = data[ENVELOPE_KEY]
+    if not isinstance(envelope, dict):
+        raise CarrierConfigError(
+            "Сохранённый предпросмотр повреждён: под своим ключом лежит не "
+            "запись. Он оставлен как есть и не переписан."
+        )
+    return _validate_envelope(envelope)
 
 
 def _store(db: Session, org_id: int, envelope: dict) -> None:
@@ -979,6 +1150,11 @@ def refresh(db: Session, org_id: int, spreadsheet_url: str, sheet_names,
             "У организации нет основного подключения, в котором мог бы жить "
             "предпросмотр. Подключите МойСклад или демо-данные."
         )
+
+    # Читаемость уже лежащего снимка проверяется ДО сети: снимок, который мы не
+    # умеем прочитать, мы не имеем права и перезаписать, а узнать об этом после
+    # двух GET значило бы сходить в чужую систему впустую.
+    get_envelope(db, org_id)
 
     with _org_lock(org_id):
         attempt_at = _now_iso()
@@ -1113,6 +1289,27 @@ def filter_rows(rows: list[dict], sheet: str | None, queue: str) -> list[dict]:
     return out
 
 
+def _attempt_view(source) -> dict:
+    """Последняя ПОПЫТКА как её показывают форме: ссылка и имена листов.
+
+    Ссылка собирается сервером из сохранённого идентификатора — в браузер не
+    уезжает ни одна строка, пришедшая от пользователя, даже та, которую он же
+    и прислал. Идентификатор, не прошедший бы сегодняшнюю проверку, ссылкой не
+    становится вовсе.
+    """
+    if not isinstance(source, dict):
+        return {"spreadsheet_id": "", "spreadsheet_url": "", "sheet_names": []}
+    raw_id = source.get("spreadsheet_id")
+    spreadsheet_id = raw_id if isinstance(raw_id, str) else ""
+    names = source.get("sheet_names")
+    names = [n for n in names if isinstance(n, str)] if isinstance(names, list) else []
+    return {
+        "spreadsheet_id": spreadsheet_id,
+        "spreadsheet_url": spreadsheet_link(spreadsheet_id) if spreadsheet_id else "",
+        "sheet_names": names,
+    }
+
+
 def preview(db: Session, org_id: int, role: str, sheet: str | None = None,
             queue: str = "all", offset: int = 0, limit: int = 50) -> dict:
     """Страница снимка для GET. Только чтение, ни одной мутации."""
@@ -1156,6 +1353,8 @@ def preview(db: Session, org_id: int, role: str, sheet: str | None = None,
             "fetched_at": None, "last_error": "",
             "content_sha256": "", "parser_version": PARSER_VERSION,
             "schema_version": ENVELOPE_SCHEMA_VERSION,
+            "parser_stale": False,
+            "attempt": _attempt_view(None),
             "counts": build_counts([], []), "total": 0, "rows": [],
         })
         return base
@@ -1195,6 +1394,18 @@ def preview(db: Session, org_id: int, role: str, sheet: str | None = None,
         "content_sha256": envelope.get("content_sha256") or "",
         "parser_version": envelope.get("parser_version") or "",
         "schema_version": envelope.get("schema_version"),
+        # Снимок, сделанный прежней версией разбора, читается — но выдавать
+        # его за сегодняшнее прочтение нельзя: колонки тогда понимались иначе.
+        # Лечится он сам, первым же обновлением (версия парсера входит в хеш).
+        "parser_stale": bool(envelope.get("parser_version"))
+                        and envelope.get("parser_version") != PARSER_VERSION,
+        # Что человек вводил в прошлый раз. Нужно ровно для одного случая:
+        # ПЕРВОЕ обновление не удалось, успешного снимка ещё нет, и без этого
+        # человек увидел бы четырёхсекундный тост и пустую форму — то есть
+        # вводил бы ссылку и два имени листов заново, не понимая, что пошло не
+        # так. Это НЕ объявление источника настроенным: `configured` остаётся
+        # false, пока нет ни одного удачного чтения.
+        "attempt": _attempt_view(envelope.get("last_attempt_source")),
         "counts": envelope.get("counts") or build_counts([], sheet_names),
         "total": len(selected),
         "rows": out_rows,

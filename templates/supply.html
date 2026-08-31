@@ -171,13 +171,19 @@
       return f;
     }
 
+    // Пока успешного снимка нет, форма показывает то, что человек вводил в
+    // ПОСЛЕДНЮЮ ПОПЫТКУ. Иначе после первого же сбоя он получал бы пустую
+    // форму и вводил ссылку и два имени листов заново — при том что сервер их
+    // помнит. Настроенным источник от этого не становится: см. renderState.
+    var attempt = data.attempt || {};
+    var srcUrl = data.spreadsheet_url || attempt.spreadsheet_url || "";
+    var names = (data.sheet_names && data.sheet_names.length)
+      ? data.sheet_names : (attempt.sheet_names || []);
     form.appendChild(field("sup-url", "Ссылка на таблицу Google Sheets",
-      data.spreadsheet_url, "wide",
+      srcUrl, "wide",
       "https://docs.google.com/spreadsheets/d/…"));
-    form.appendChild(field("sup-cur", "Текущий лист",
-      (data.sheet_names || [])[0] || "", null, "Осень 26"));
-    form.appendChild(field("sup-next", "Следующий лист",
-      (data.sheet_names || [])[1] || "", null, "НГ 26/27"));
+    form.appendChild(field("sup-cur", "Текущий лист", names[0] || "", null, "Осень 26"));
+    form.appendChild(field("sup-next", "Следующий лист", names[1] || "", null, "НГ 26/27"));
 
     var act = el("div", "field");
     act.appendChild(el("label", null, " "));
@@ -214,6 +220,33 @@
     });
   }
 
+  function renderError(data) {
+    // Отдельная функция и вызов БЕЗУСЛОВНЫЙ. Раньше отрисовка состояния
+    // выходила раньше этого места, когда успешного снимка ещё нет, — и после
+    // ПЕРВОГО неудачного обновления человек видел только четырёхсекундный
+    // тост. Причина отказа обязана оставаться на экране: она и есть ответ на
+    // вопрос «почему таблица пустая».
+    var box = document.getElementById("sup-error");
+    if (!data.last_error) {
+      box.style.display = "none";
+      clear(box);
+      return;
+    }
+    box.style.display = "";
+    clear(box);
+    box.appendChild(el("b", null, data.configured
+      ? "Последнее обновление не удалось: "
+      : "Прочитать источник не удалось: "));
+    box.appendChild(el("span", null, data.last_error));
+    box.appendChild(el("div", null, data.configured
+      ? "Показан предыдущий успешный снимок — он не изменился."
+      : "Удачного чтения ещё не было, поэтому показывать пока нечего. "
+        + "Ссылка и имена листов сохранены в форме выше — поправьте и попробуйте снова."));
+    if (data.last_attempt_at) {
+      box.appendChild(el("div", null, "Попытка: " + when(data.last_attempt_at) + "."));
+    }
+  }
+
   function renderState(data) {
     var line = document.getElementById("sup-state");
     clear(line);
@@ -224,8 +257,9 @@
       return;
     }
     if (!data.configured) {
-      line.appendChild(el("span", null,
-        "Источник ещё не читался. Вставьте ссылку, укажите два листа и нажмите «Обновить предпросмотр»."));
+      line.appendChild(el("span", null, data.last_error
+        ? "Удачного чтения источника пока не было — причина ниже."
+        : "Источник ещё не читался. Вставьте ссылку, укажите два листа и нажмите «Обновить предпросмотр»."));
       return;
     }
     line.appendChild(el("span", null, "Последнее успешное чтение: " + when(data.last_success_at) + "."));
@@ -245,17 +279,10 @@
       link.appendChild(a);
     }
 
-    var box = document.getElementById("sup-error");
-    if (data.last_error) {
-      box.style.display = "";
-      clear(box);
-      box.appendChild(el("b", null, "Последнее обновление не удалось: "));
-      box.appendChild(el("span", null, data.last_error));
-      box.appendChild(el("div", null,
-        "Показан предыдущий успешный снимок — он не изменился."));
-    } else {
-      box.style.display = "none";
-      clear(box);
+    if (data.parser_stale) {
+      line.appendChild(el("span", null,
+        " Снимок сделан прежней версией разбора — обновите предпросмотр,"
+        + " чтобы прочитать источник заново."));
     }
   }
 
@@ -372,6 +399,7 @@
       if (c) notes.appendChild(el("div", null, c));
     });
     if (r.qty_meters_raw) notes.appendChild(el("div", null, "ткань: " + r.qty_meters_raw));
+    if (r.sketch_raw) notes.appendChild(el("div", null, "эскиз: " + r.sketch_raw));
     if (r.production_raw) notes.appendChild(el("div", null, "производство: " + r.production_raw));
     if (r.components_raw) notes.appendChild(el("div", null, "комплектующие: " + r.components_raw));
     Object.keys(r.unknown_raw || {}).forEach(function (col) {
@@ -429,6 +457,7 @@
       }
       if (!append) renderForm(data);
       renderState(data);
+      renderError(data);
       renderSummary(data);
       renderFilters(data);
       renderRows(data, append);

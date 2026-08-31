@@ -19,11 +19,18 @@
 
   1) валидация входа: `spreadsheet_id` достаётся allowlist-regex, произвольный
      адрес не принимается, имена листов проверяются и их ровно два;
-  2) парсер на синтетической фикстуре ДОКАЗАННОЙ формы (27 колонок, две
-     физические строки заголовка, выведенные S/M/L, продолжения, пустая
+  2) парсер на ДВУХ синтетических формах наблюдённого заголовка (27 колонок,
+     две физические строки заголовка; на одном листе S/M/L и колонки итога и
+     цены без подписей, на другом подписаны явно) — продолжения, пустая
      строка-разделитель, новая модель без количеств, Unicode, текст в колонке
-     XL, расхождение итога, неизвестная колонка) — с точными source_row,
-     anchor_row и сохранённым raw;
+     XL, расхождение итога, неизвестная колонка — с точными source_row,
+     anchor_row и сохранённым raw. Отдельно: схема, отвергнутая ревью PR #47
+     (весь каркас на колонку левее), обязана быть отвергнута и сейчас;
+ 2а) первый неудачный refresh: причина остаётся на экране, ввод возвращается в
+     форму, но источник настроенным не объявляется;
+ 2б) версия снимка: неизвестная/повреждённая запись под versioned-ключом —
+     отказ 409, и повреждённое НЕ переписывается;
+ 2в) количество читается только ASCII-цифрами: «٣» и «１２» числом не считаются;
   3) fail closed на дрейфе заголовка, orphan, мусорных количествах, HTML-странице
      входа, редиректе на чужой хост, 403, таймауте и превышении любого лимита;
   4) ровно два GET на построенные docs.google.com endpoint'ы, никаких иных
@@ -165,13 +172,28 @@ def add_member(org_id: int, email: str) -> int:
     return uid
 
 
-# ── Синтетические фикстуры доказанной формы ─────────────────────────────────
+# ── Синтетические фикстуры: ДВЕ наблюдённые формы заголовка ─────────────────
 #
-# Форма снята read-only наблюдением 31.08.2026 на боевой таблице: 27 колонок,
-# две физические строки заголовка, артикул в колонке 1 без собственного
-# заголовка, размерная горка XS…XL в колонках 9–13 (промежуточные заголовки
-# пусты), итог источника в колонке 14 без заголовка. Живые CSV и любые данные
-# людей в репозиторий НЕ кладутся — здесь только выдуманные строки этой формы.
+# ПОЧЕМУ ЗДЕСЬ ДВЕ ФОРМЫ, А НЕ ОДНА, И ПОЧЕМУ ЭТО ВАЖНО. Первая версия набора
+# (отвергнутый ревью HEAD `a25e163`) сочиняла фикстуру по той же памяти, что и
+# парсер, и повторяла его ошибку: весь каркас стоял на колонку левее живого
+# источника. Набор был зелёным на 302 проверках, а оба настоящих листа падали
+# ДО первой строки данных. Фикстура, выведенная из кода, не проверяет код —
+# она проверяет саму себя.
+#
+# Поэтому теперь фикстур две, и они списаны с read-only наблюдения точных
+# публичных байтов 31.08.2026 — каждая со своими отличиями, а не одна «общая»:
+#   * «Осень 26»  — колонка 1 содержит пробел, промежуточные S/M/L в строке 2
+#                   пусты (объединённая ячейка горки), колонки итога и цены без
+#                   подписи;
+#   * «НГ 26/27»  — колонка 1 подписана «Цена ткани за м», в колонке 2 стоит
+#                   перевод строки, S/M/L подписаны явно, а колонки 15 и 16
+#                   подписаны «Общее количество» и «Цена».
+# Живых строк и PII здесь нет: каркас наблюдён, содержимое выдумано.
+#
+# Отдельно ниже стоит `legacy_wrong_header_rows()` — воспроизведение ИМЕННО той
+# ошибочной схемы, которую отверг ревьюер. Она обязана быть отвергнута парсером,
+# и это красный контроль против возврата дефекта.
 
 COLS = 27
 SHEET_CURRENT = "Осень 26"
@@ -188,12 +210,40 @@ def put(row: list, mapping: dict) -> list:
     return row
 
 
-def header_rows() -> list:
+#: Основной каркас строки 1 — общий у обоих листов.
+FRAME = {
+    3: "Наименование", 4: "Эскиз", 5: "Цвет", 6: "Количество в м",
+    7: "Комментарии", 8: "Комментарии", 9: "Комментарии",
+    10: "Размерная горка", 18: "Комплектующие", 19: "Выбранное производство",
+}
+
+
+def autumn_header_rows() -> list:
+    """Форма «Осень 26»: пробел в колонке 1, горка без промежуточных подписей."""
+    row1 = put(blank(), {**FRAME, 1: " "})
+    row2 = put(blank(), {10: "XS", 14: "XL"})
+    return [row1, row2]
+
+
+def next_header_rows() -> list:
+    """Форма «НГ 26/27»: подписанная колонка 1, перевод строки в колонке 2,
+    явные S/M/L и подписанные «Общее количество» и «Цена»."""
+    row1 = put(blank(), {**FRAME, 1: "Цена ткани за м", 2: "\n"})
+    row2 = put(blank(), {10: "XS", 11: "S", 12: "M", 13: "L", 14: "XL",
+                         15: "Общее количество", 16: "Цена"})
+    return [row1, row2]
+
+
+def legacy_wrong_header_rows() -> list:
+    """Схема, отвергнутая ревью PR #47: ВЕСЬ каркас на одну колонку левее.
+
+    Существует ровно затем, чтобы парсер её ОТВЕРГ. Если однажды эта фикстура
+    начнёт проходить — значит дефект вернулся.
+    """
     row1 = put(blank(), {
         2: "Наименование", 4: "Цвет", 5: "Количество в м",
         6: "Комментарии", 7: "Комментарии", 8: "Комментарии",
-        9: "Размерная горка", 17: "Комплектующие", 18: "Выбранное производство",
-    })
+        9: "Размерная горка", 17: "Комплектующие", 18: "Выбранное производство"})
     row2 = put(blank(), {9: "XS", 13: "XL"})
     return [row1, row2]
 
@@ -207,43 +257,53 @@ def to_csv(rows: list) -> bytes:
 
 
 def autumn_rows() -> list:
-    """Текущий лист: восемь физических строк данных, каждая со своим смыслом."""
-    rows = header_rows()
+    """Текущий лист: девять физических строк данных, каждая со своим смыслом."""
+    rows = autumn_header_rows()
     # 3 — обычный якорь: всё сошлось, ни одной неоднозначности.
     rows.append(put(blank(), {
-        1: "1042", 2: "Пальто «Осень»", 4: "Чёрный", 5: "3,2", 6: "Отгружено",
-        9: "2", 10: "3", 11: "4", 12: "3", 13: "2", 14: "14",
-        15: "12 900", 17: "пуговицы", 18: "Цех №1"}))
+        2: "1042", 3: "Пальто «Осень»", 4: "эскиз-1042", 5: "Чёрный", 6: "3,2",
+        7: "Отгружено", 10: "2", 11: "3", 12: "4", 13: "3", 14: "2", 15: "14",
+        16: "12 900", 18: "пуговицы", 19: "Цех №1"}))
     # 4 — продолжение: идентичности нет, наследует якорь строки 3.
     rows.append(put(blank(), {
-        4: "Молоко", 7: "Крой", 9: "1", 10: "1", 11: "2", 12: "1", 13: "1",
-        14: "6"}))
+        5: "Молоко", 8: "Крой", 10: "1", 11: "1", 12: "2", 13: "1", 14: "1",
+        15: "6"}))
     # 5 — полностью пустая строка: разделитель, сбрасывает якорь.
     rows.append(blank())
     # 6 — якорь без артикула + итог источника не сходится с суммой размеров.
     rows.append(put(blank(), {
-        2: "Жакет Тёплый", 4: "Серый",
-        9: "5", 10: "5", 11: "5", 12: "5", 13: "5", 14: "20"}))
+        3: "Жакет Тёплый", 5: "Серый",
+        10: "5", 11: "5", 12: "5", 13: "5", 14: "5", 15: "20"}))
     # 7 — в колонке XL человек написал словами. Это не ноль и не статус.
     rows.append(put(blank(), {
-        1: "1077", 2: "Брюки Прямые", 4: "Синий", 6: "Сдано ✓ 3 шт",
-        9: "1", 10: "2", 11: "3", 12: "4", 13: "Кроим по заданию"}))
+        2: "1077", 3: "Брюки Прямые", 5: "Синий", 7: "Сдано ✓ 3 шт",
+        10: "1", 11: "2", 12: "3", 13: "4", 14: "Кроим по заданию"}))
     # 8 — продолжение с непустой НЕИЗВЕСТНОЙ колонкой: raw обязан уцелеть.
-    rows.append(put(blank(), {4: "Хаки", 9: "1", 21: "служебная пометка"}))
+    rows.append(put(blank(), {5: "Хаки", 10: "1", 22: "служебная пометка"}))
     # 9 — якорь, где количеств нет вовсе (тире — это отсутствие, а не ноль).
     rows.append(put(blank(), {
-        1: "1099", 2: "Юбка Плиссе", 4: "Бежевый", 9: "-", 10: "—"}))
+        2: "1099", 3: "Юбка Плиссе", 5: "Бежевый", 10: "-", 11: "—"}))
     # 10 — чужой текст, который очень хочет стать разметкой.
     rows.append(put(blank(), {
-        1: "1101", 2: "<img src=x onerror=alert(1)>",
-        4: "\"><script>alert(2)</script>", 9: "1", 14: "1"}))
+        2: "1101", 3: "<img src=x onerror=alert(1)>",
+        5: "\"><script>alert(2)</script>", 10: "1", 15: "1"}))
+    # 11 — цифроподобные НЕ-ASCII строки: арабо-индийская тройка и полноширинные
+    # «12». Юникодный `\d` принял бы их за числа, и в предпросмотре появилось бы
+    # количество, которого человек не писал.
+    rows.append(put(blank(), {
+        2: "1102", 3: "Худи Юникод", 5: "Мята", 10: "\u0663", 11: "\uff11\uff12"}))
     return rows
 
 
 def next_rows() -> list:
-    """Следующий лист: новая модель уже заведена, количеств ещё нет."""
-    rows = header_rows()
-    rows.append(put(blank(), {1: "2001", 2: "Пуховик НГ", 4: "Чёрный"}))
+    """Следующий лист: новая модель заведена, количеств ещё нет.
+
+    Три физические строки — ровно столько, сколько у наблюдённого листа.
+    Колонка 1 здесь подписана, но смысла ей слой не назначает: её значение
+    обязано уехать в `unknown_raw`, а не превратиться в поле продукта.
+    """
+    rows = next_header_rows()
+    rows.append(put(blank(), {1: "1 250", 2: "2001", 3: "Пуховик НГ", 5: "Чёрный"}))
     return rows
 
 
@@ -353,50 +413,68 @@ def input_checks() -> None:
 
 # ── Часть 2. Парсер на доказанной форме ─────────────────────────────────────
 
-def parse_checks() -> None:
+def parse_checks() -> None:  # noqa: C901 — сценарий, ветвлений мало
     print("\n== Две физические строки заголовка и явный контракт схемы ==")
     rows = ss.decode_csv(SHEET_CURRENT, AUTUMN_CSV)
     check("фикстура ровно 27 колонок",
           max(len(r) for r in rows) == COLS, str(max(len(r) for r in rows)))
     parsed, schema = ss.parse_sheet(SHEET_CURRENT, rows)
     check("заголовков ровно два", schema["header_rows"] == 2, str(schema))
-    check("артикул выведен как колонка перед «Наименование»",
-          schema["article_column"] == 1 and schema["article_column_inferred"] is True,
+    check("«Наименование» стоит в колонке 3, как в живом источнике",
+          schema["name_column"] == 3, str(schema["name_column"]))
+    check("артикул выведен как колонка 2 — ровно перед именем",
+          schema["article_column"] == 2 and schema["article_column_inferred"] is True,
+          str(schema["article_column"]))
+    check("размерная горка начинается с колонки 10",
+          schema["size_band_start"] == 10, str(schema["size_band_start"]))
+    check("итог источника — колонка 15, и на этом листе он без подписи",
+          schema["source_total_column"] == 15
+          and schema["source_total_column_inferred"] is True
+          and schema["source_total_header"] == "", str(schema))
+    check("цена — колонка 16, тоже без подписи на этом листе",
+          schema["price_column"] == 16 and schema["price_column_inferred"] is True,
           str(schema))
-    check("итог источника читается по позиции и это отмечено",
-          schema["source_total_column"] == 14
-          and schema["source_total_column_inferred"] is True, str(schema))
-    check("S/M/L выведены позиционно и это отмечено",
+    check("комментарии — колонки 7, 8, 9",
+          schema["comment_columns"] == [7, 8, 9], str(schema["comment_columns"]))
+    check("на «Осень 26» S/M/L выведены позиционно (подписей в источнике нет)",
           schema["size_labels_inferred"] == ["S", "M", "L"], str(schema))
     check("данные начинаются с третьей физической строки",
           schema["first_data_row"] == 3, str(schema))
-    check("физических строк данных ровно восемь, ни одна не схлопнута",
-          len(parsed) == 8, str(len(parsed)))
+    check("пробел в колонке 1 свободной подписью не считается",
+          schema["free_columns"] == {}, str(schema["free_columns"]))
+    check("физических строк данных ровно девять, ни одна не схлопнута",
+          len(parsed) == 9, str(len(parsed)))
 
     by_row = {r["source_row"]: r for r in parsed}
     check("нумерация строк физическая и непрерывная",
-          sorted(by_row) == [3, 4, 5, 6, 7, 8, 9, 10], str(sorted(by_row)))
+          sorted(by_row) == [3, 4, 5, 6, 7, 8, 9, 10, 11], str(sorted(by_row)))
 
     print("\n== Обычная строка: ничего не потеряно и ничего не придумано ==")
     r3 = by_row[3]
     check("артикул и имя прочитаны как есть",
           (r3["article"], r3["name"]) == ("1042", "Пальто «Осень»"), str(r3["article"]))
     check("своя строка — сама себе якорь", r3["anchor_row"] == 3, str(r3["anchor_row"]))
-    check("размеры разобраны позиционно XS..XL",
+    check("размеры разобраны позиционно XS..XL из колонок 10–14",
           r3["sizes"] == {"XS": 2, "S": 3, "M": 4, "L": 3, "XL": 2}, str(r3["sizes"]))
     check("сумма размеров посчитана как объясняющий показатель",
           r3["size_sum"] == 14, str(r3["size_sum"]))
-    check("итог источника прочитан отдельно от суммы",
+    check("итог источника прочитан из колонки 15, отдельно от суммы",
           r3["source_total"] == 14 and r3["source_total_raw"] == "14", str(r3))
     check("неоднозначностей у этой строки нет", r3["issues"] == [], str(r3["issues"]))
     check("свободный текст остался текстом, а не стал статусом",
           r3["source_status_raw"] == "Отгружено"
           and r3["comments_raw"] == ["Отгружено", "", ""], str(r3["comments_raw"]))
-    check("цена и комплектующие сохранены сырыми",
+    check("цена (колонка 16) и комплектующие (18) сохранены сырыми",
           r3["price_raw"] == "12 900" and r3["components_raw"] == "пуговицы",
           str((r3["price_raw"], r3["components_raw"])))
+    check("производство (колонка 19) сохранено сырым",
+          r3["production_raw"] == "Цех №1", r3["production_raw"])
+    check("эскиз (колонка 4) сохранён сырым и полем продукта не стал",
+          r3["sketch_raw"] == "эскиз-1042", r3["sketch_raw"])
     check("метраж ткани сохранён сырым, без попытки посчитать",
           r3["qty_meters_raw"] == "3,2", r3["qty_meters_raw"])
+    check("именованные колонки в unknown не утекают", r3["unknown_raw"] == {},
+          str(r3["unknown_raw"]))
 
     print("\n== Продолжение наследует личность, но остаётся своей строкой ==")
     r4 = by_row[4]
@@ -407,6 +485,8 @@ def parse_checks() -> None:
     check("ссылка на якорь точная", r4["anchor_row"] == 3, str(r4["anchor_row"]))
     check("свои цвет и размеры у продолжения свои",
           r4["color_raw"] == "Молоко" and r4["size_sum"] == 6, str(r4))
+    check("комментарий из ВТОРОЙ колонки комментариев не потерян",
+          r4["comments_raw"] == ["", "Крой", ""], str(r4["comments_raw"]))
     check("продолжение с количествами не считается неполным",
           r4["issues"] == [], str(r4["issues"]))
 
@@ -446,7 +526,7 @@ def parse_checks() -> None:
     check("строка помечена неизвестной колонкой",
           "unknown_column" in r8["issues"], str(r8["issues"]))
     check("сырое значение сохранено вместе с номером колонки",
-          r8["unknown_raw"] == {"21": "служебная пометка"}, str(r8["unknown_raw"]))
+          r8["unknown_raw"] == {"22": "служебная пометка"}, str(r8["unknown_raw"]))
     check("продолжение по-прежнему знает свой якорь",
           r8["anchor_row"] == 7, str(r8["anchor_row"]))
 
@@ -462,15 +542,55 @@ def parse_checks() -> None:
     check("сумма размеров отсутствует, а не равна нулю",
           r9["size_sum"] is None, str(r9["size_sum"]))
 
-    print("\n== Следующий лист: новая модель без количеств не исчезает ==")
-    nxt, _ = ss.parse_sheet(SHEET_NEXT, ss.decode_csv(SHEET_NEXT, NEXT_CSV))
+    print("\n== Цифроподобные не-ASCII строки числом не считаются ==")
+    r11 = by_row[11]
+    check("арабо-индийская «٣» не стала числом 3",
+          r11["sizes"]["XS"] is None, str(r11["sizes"]["XS"]))
+    check("полноширинные «１２» не стали числом 12",
+          r11["sizes"]["S"] is None, str(r11["sizes"]["S"]))
+    check("исходные символы сохранены дословно",
+          (r11["sizes_raw"]["XS"], r11["sizes_raw"]["S"]) == ("\u0663", "\uff11\uff12"),
+          str(r11["sizes_raw"]))
+    check("строка помечена нечитаемым количеством",
+          "invalid_quantity" in r11["issues"], str(r11["issues"]))
+
+    print("\n== Следующий лист: ВТОРАЯ форма заголовка, а не та же самая ==")
+    nxt, nxt_schema = ss.parse_sheet(SHEET_NEXT, ss.decode_csv(SHEET_NEXT, NEXT_CSV))
+    check("на «НГ 26/27» S/M/L подписаны явно и ничего не выводится",
+          nxt_schema["size_labels_inferred"] == [], str(nxt_schema))
+    check("итог источника здесь ПОДПИСАН «Общее количество»",
+          nxt_schema["source_total_header"] == "Общее количество"
+          and nxt_schema["source_total_column_inferred"] is False, str(nxt_schema))
+    check("цена здесь подписана «Цена»",
+          nxt_schema["price_header"] == "Цена"
+          and nxt_schema["price_column_inferred"] is False, str(nxt_schema))
+    check("подпись свободной колонки 1 сохранена как наблюдение",
+          nxt_schema["free_columns"] == {"1": "Цена ткани за м"},
+          str(nxt_schema["free_columns"]))
+    check("перевод строки в колонке 2 читается как отсутствие заголовка",
+          nxt_schema["article_column"] == 2, str(nxt_schema["article_column"]))
     check("на следующем листе ровно одна физическая строка данных",
           len(nxt) == 1, str(len(nxt)))
     check("она видна и помечена «нет количеств», а не пропущена",
-          nxt[0]["name"] == "Пуховик НГ" and nxt[0]["issues"] == ["quantity_missing"],
+          nxt[0]["name"] == "Пуховик НГ" and "quantity_missing" in nxt[0]["issues"],
           str(nxt[0]["issues"]))
     check("и её физический номер строки — третий",
           nxt[0]["source_row"] == 3, str(nxt[0]["source_row"]))
+    check("значение подписанной, но НЕ назначенной колонки 1 уехало в raw",
+          nxt[0]["unknown_raw"] == {"1": "1 250"}, str(nxt[0]["unknown_raw"]))
+    check("и строка честно помечена неизвестной колонкой",
+          "unknown_column" in nxt[0]["issues"], str(nxt[0]["issues"]))
+
+    print("\n== Красный контроль: отвергнутая ревью схема не должна пройти ==")
+    legacy = legacy_wrong_header_rows()
+    legacy.append(put(blank(), {1: "1042", 2: "Пальто", 9: "2"}))
+    message = raises(
+        lambda: ss.parse_sheet("Старая", ss.decode_csv("Старая", to_csv(legacy))),
+        ss.SourceError)
+    check("схема «весь каркас на колонку левее» отвергается",
+          bool(message), message[:130])
+    check("и отказ называет колонку, а не «что-то пошло не так»",
+          "колонке 3" in message or "«Наименование»" in message, message[:130])
 
     print("\n== Количество: что считается числом, а что — нет ==")
     for raw, expect in [("0", (0, False)), ("7", (7, False)), (" 12 ", (12, False)),
@@ -478,6 +598,8 @@ def parse_checks() -> None:
                         ("-5", (None, True)), ("2.5", (None, True)),
                         ("2,5", (None, True)), ("1e3", (None, True)),
                         ("abc", (None, True)), ("Кроим", (None, True)),
+                        ("\u0663", (None, True)), ("\uff11\uff12", (None, True)),
+                        ("\u06f3", (None, True)), ("\u0967", (None, True)),
                         ("99999999999999999999", (None, True)),
                         (str(ss.MAX_QUANTITY + 1), (None, True)),
                         (str(ss.MAX_QUANTITY), (ss.MAX_QUANTITY, False))]:
@@ -485,8 +607,8 @@ def parse_checks() -> None:
         check(f"количество {raw!r} → {expect}", got == expect, str(got))
 
     print("\n== Продолжение без якоря — сирота, а не позиция ==")
-    orphan = header_rows()
-    orphan.append(put(blank(), {4: "Синий", 9: "2"}))
+    orphan = autumn_header_rows()
+    orphan.append(put(blank(), {5: "Синий", 10: "2"}))
     parsed_orphan, _ = ss.parse_sheet("Сирота", ss.decode_csv("Сирота", to_csv(orphan)))
     check("первая строка данных без идентичности помечена сиротой",
           parsed_orphan[0]["issues"] == ["orphan_continuation"],
@@ -512,12 +634,12 @@ def parse_checks() -> None:
     check("две записи по листам", len(counts["sheets"]) == 2, str(counts["sheets"]))
     autumn = counts["sheets"][0]
     check("физические строки и строки данных различаются",
-          (autumn["rows"], autumn["data_rows"]) == (8, 7), str(autumn))
+          (autumn["rows"], autumn["data_rows"]) == (9, 8), str(autumn))
     check("штуки суммируются только по прочитанным числам",
           autumn["quantity"] == 14 + 6 + 25 + 10 + 1 + 1, str(autumn["quantity"]))
     check("счётчик неоднозначностей поимённый",
-          counts["issues"].get("quantity_missing") == 2
-          and counts["issues"].get("unknown_column") == 1, str(counts["issues"]))
+          counts["issues"].get("quantity_missing") == 3
+          and counts["issues"].get("unknown_column") == 2, str(counts["issues"]))
 
 
 # ── Часть 3. Fail closed ────────────────────────────────────────────────────
@@ -525,53 +647,69 @@ def parse_checks() -> None:
 def fail_closed_checks() -> None:
     print("\n== Дрейф заголовка: молча читать дальше нельзя ==")
     drifts = {
-        "«Цвет» переименован": ({4: "Цвета"}, {}),
-        "«Наименование» уехало на колонку правее": ({2: "", 3: "Наименование"}, {}),
-        "у колонки итога появился заголовок": ({14: "Итого"}, {}),
-        "«Размерная горка» пропала": ({9: ""}, {}),
-        "XL заменён на XXL": ({}, {13: "XXL"}),
-        "размерная горка сдвинулась": ({}, {9: "", 10: "XS", 14: "XL"}),
-        "вторая метка размера за пределами горки": ({}, {22: "XS"}),
+        "«Цвет» переименован": ({5: "Цвета"}, {}),
+        "«Наименование» уехало на колонку правее": ({3: "", 4: "Наименование"}, {}),
+        "«Эскиз» пропал": ({4: ""}, {}),
+        "у колонки артикула появился заголовок": ({2: "Артикул"}, {}),
+        "«Размерная горка» пропала": ({10: ""}, {}),
+        "«Комплектующие» уехали": ({18: "", 17: "Комплектующие"}, {}),
+        "«Наименование» встречается дважды": ({25: "Наименование"}, {}),
+        "«Размерная горка» встречается дважды": ({25: "Размерная горка"}, {}),
+        "XL заменён на XXL": ({}, {14: "XXL"}),
+        "размерная горка сдвинулась": ({}, {10: "", 11: "XS", 15: "XL"}),
+        "вторая метка размера за пределами горки": ({}, {23: "XS"}),
+        "колонка итога подписана чужим словом": ({}, {15: "Итого"}),
+        "колонка цены подписана чужим словом": ({}, {16: "Стоимость"}),
     }
     for label, (fix1, fix2) in drifts.items():
-        rows = header_rows()
+        rows = autumn_header_rows()
         put(rows[0], fix1)
         put(rows[1], fix2)
-        rows.append(put(blank(), {1: "1", 2: "Тест", 9: "1"}))
+        rows.append(put(blank(), {2: "1", 3: "Тест", 10: "1"}))
         blob = to_csv(rows)
         message = raises(
             lambda b=blob: ss.parse_sheet("Дрейф", ss.decode_csv("Дрейф", b)),
             ss.SourceError)
-        check(f"fail closed на дрейфе: {label}", bool(message), message[:120])
+        check(f"fail closed на дрейфе: {label}", bool(message), message[:130])
 
-    print("\n== Промежуточные подписи размеров: пусто или ровно своя ==")
-    ok_rows = header_rows()
-    put(ok_rows[1], {10: "S", 11: "M", 12: "L"})
-    ok_rows.append(put(blank(), {1: "1", 2: "Тест", 9: "1"}))
-    check("явно подписанные S/M/L принимаются",
-          not raises(lambda: ss.parse_sheet("Явные", ss.decode_csv("Явные", to_csv(ok_rows))),
+    print("\n== Обе наблюдённые формы заголовка принимаются ==")
+    for label, header in (("Осень 26", autumn_header_rows()),
+                          ("НГ 26/27", next_header_rows())):
+        rows = list(header)
+        rows.append(put(blank(), {2: "1", 3: "Тест", 10: "1"}))
+        check(f"форма «{label}» проходит контракт",
+              not raises(lambda r=rows: ss.parse_sheet(label, ss.decode_csv(label, to_csv(r))),
+                         ss.SourceError))
+    mixed = autumn_header_rows()
+    put(mixed[1], {11: "S", 12: "M", 13: "L"})
+    mixed.append(put(blank(), {2: "1", 3: "Тест", 10: "1"}))
+    check("явно подписанные S/M/L на листе без подписей тоже законны",
+          not raises(lambda: ss.parse_sheet("Смешанная",
+                                            ss.decode_csv("Смешанная", to_csv(mixed))),
                      ss.SourceError))
-    bad_rows = header_rows()
-    put(bad_rows[1], {11: "XXL"})
-    bad_rows.append(put(blank(), {1: "1", 2: "Тест", 9: "1"}))
+    bad_rows = autumn_header_rows()
+    put(bad_rows[1], {12: "XXL"})
+    bad_rows.append(put(blank(), {2: "1", 3: "Тест", 10: "1"}))
     check("чужая подпись внутри горки — fail closed",
-          bool(raises(lambda: ss.parse_sheet("Чужая", ss.decode_csv("Чужая", to_csv(bad_rows))),
+          bool(raises(lambda: ss.parse_sheet("Чужая",
+                                             ss.decode_csv("Чужая", to_csv(bad_rows))),
                       ss.SourceError)))
 
     print("\n== Заголовка нет вовсе ==")
     check("одна строка вместо двух заголовков — fail closed",
-          bool(raises(lambda: ss.parse_sheet("Куцый", [header_rows()[0]]), ss.SourceError)))
+          bool(raises(lambda: ss.parse_sheet("Куцый", [autumn_header_rows()[0]]),
+                      ss.SourceError)))
 
     print("\n== Лимиты источника: fail closed до любой записи ==")
-    huge_rows = header_rows() + [put(blank(), {1: str(i), 2: "Т", 9: "1"})
-                                 for i in range(ss.MAX_ROWS_PER_SHEET + 1)]
+    huge_rows = autumn_header_rows() + [put(blank(), {2: str(i), 3: "Т", 10: "1"})
+                                        for i in range(ss.MAX_ROWS_PER_SHEET + 1)]
     check("строк больше предела",
           bool(raises(lambda: ss.decode_csv("Много", to_csv(huge_rows)), ss.SourceError)))
-    wide = header_rows() + [[""] * (ss.MAX_COLUMNS + 1)]
+    wide = autumn_header_rows() + [[""] * (ss.MAX_COLUMNS + 1)]
     check("колонок больше предела",
           bool(raises(lambda: ss.decode_csv("Широкий", to_csv(wide)), ss.SourceError)))
-    fat = header_rows()
-    fat.append(put(blank(), {2: "я" * (ss.MAX_CELL_CHARS + 1)}))
+    fat = autumn_header_rows()
+    fat.append(put(blank(), {3: "я" * (ss.MAX_CELL_CHARS + 1)}))
     check("ячейка длиннее предела",
           bool(raises(lambda: ss.decode_csv("Жирный", to_csv(fat)), ss.SourceError)))
     check("не-UTF-8 ответ — fail closed, а не «замена символов»",
@@ -805,8 +943,8 @@ def refresh_checks(owner, org_id: int) -> None:  # noqa: C901 — сценари
 
         print("\n== Чтение снимка: строки, фильтры, сводка ==")
         data = owner.get("/api/supply/sheets?limit=200").json()
-        check("отдано девять физических строк обоих листов",
-              data["total"] == 9 and len(data["rows"]) == 9,
+        check("отданы все десять физических строк обоих листов",
+              data["total"] == 10 and len(data["rows"]) == 10,
               f"total={data['total']} rows={len(data['rows'])}")
         check("честная подпись приходит с сервера",
               "не партия" in data["disclaimer"] and "Едет" in data["disclaimer"],
@@ -892,8 +1030,8 @@ def refresh_checks(owner, org_id: int) -> None:  # noqa: C901 — сценари
 
         print("\n== Изменился ВТОРОЙ лист: заменяются оба, смешанного снимка нет ==")
         moved = next_rows()
-        moved.append(put(blank(), {1: "2002", 2: "Шапка НГ", 4: "Белый",
-                                   9: "4", 10: "4", 13: "2", 14: "10"}))
+        moved.append(put(blank(), {2: "2002", 3: "Шапка НГ", 5: "Белый",
+                                   10: "4", 11: "4", 14: "2", 15: "10"}))
         fake.bodies[SHEET_NEXT] = to_csv(moved)
         fake.calls.clear()
         r = owner.post("/api/supply/sheets/refresh",
@@ -907,7 +1045,7 @@ def refresh_checks(owner, org_id: int) -> None:  # noqa: C901 — сценари
         check("в снимке по-прежнему оба листа",
               sheets_in_snapshot == {SHEET_CURRENT, SHEET_NEXT}, str(sheets_in_snapshot))
         check("строки первого листа не потерялись при замене второго",
-              sum(1 for row in env["rows"] if row["sheet_name"] == SHEET_CURRENT) == 8)
+              sum(1 for row in env["rows"] if row["sheet_name"] == SHEET_CURRENT) == 9)
         check("новая строка второго листа доехала",
               sum(1 for row in env["rows"] if row["sheet_name"] == SHEET_NEXT) == 2)
         good_hash = env["content_sha256"]
@@ -936,13 +1074,13 @@ def refresh_checks(owner, org_id: int) -> None:  # noqa: C901 — сценари
               env["last_error"][:110])
         shown = owner.get("/api/supply/sheets?limit=200").json()
         check("страница показывает прежний снимок и объясняет сбой",
-              shown["total"] == 10 and "403" in shown["last_error"],
+              shown["total"] == 11 and "403" in shown["last_error"],
               f"{shown['total']} {shown['last_error'][:80]}")
 
         print("\n== Дрейф заголовка ведёт себя так же: снимок цел ==")
-        drift = header_rows()
-        put(drift[0], {4: "Цвета"})
-        drift.append(put(blank(), {1: "1", 2: "Т", 9: "1"}))
+        drift = autumn_header_rows()
+        put(drift[0], {5: "Цвета"})
+        drift.append(put(blank(), {2: "1", 3: "Т", 10: "1"}))
         fake.bodies[SHEET_NEXT] = to_csv(drift)
         r = owner.post("/api/supply/sheets/refresh",
                        json={"spreadsheet_url": SHEET_URL,
@@ -1019,7 +1157,7 @@ def refresh_checks(owner, org_id: int) -> None:  # noqa: C901 — сценари
         check("снимок сошёлся к одному значению", env["content_sha256"] == good_hash,
               env["content_sha256"][:16])
         check("строк ровно столько, сколько в источнике — без дублей",
-              len(env["rows"]) == 10, str(len(env["rows"])))
+              len(env["rows"]) == 11, str(len(env["rows"])))
         check("чужие ключи пережили и гонку",
               _config(org_id).get("keep_me") == {"a": [1, 2], "b": "чужое"})
         check("носитель после гонки по-прежнему один",
@@ -1120,6 +1258,172 @@ def isolation_checks(owner, member, org_id: int) -> None:
         ss.set_transport(None)
 
 
+def first_failure_checks() -> None:
+    """ПЕРВОЕ обновление не удалось: причина обязана остаться на экране.
+
+    Замечание ревью PR #47. Раньше в этом состоянии человек получал
+    четырёхсекундный тост и пустую форму — то есть вводил ссылку и два имени
+    листов заново, не понимая, что пошло не так, хотя сервер их помнил.
+    Обратная опасность ровно такая же: восстановленная форма НЕ должна
+    выглядеть как успешно настроенный источник.
+    """
+    print("\n== Первый неудачный refresh: ошибка видна, ввод не потерян ==")
+    fresh = client()
+    fresh.post("/register", data={"name": "Первый сбой", "email": "sheets-f@test.io",
+                                 "password": "secret123", "org_name": "Бренд-Е"})
+    fresh.post("/api/connect/demo")
+    org_id = sql("SELECT org_id FROM memberships WHERE user_id ="
+                 " (SELECT id FROM users WHERE email = 'sheets-f@test.io')")[0][0]
+
+    denied = FakeGoogle({SHEET_CURRENT: ss.HttpResponse(
+        403, {}, b"forbidden body", "https://docs.google.com/x")})
+    ss.set_transport(denied)
+    try:
+        r = fresh.post("/api/supply/sheets/refresh",
+                       json={"spreadsheet_url": SHEET_URL,
+                             "sheet_names": [SHEET_CURRENT, SHEET_NEXT]})
+        check("первое обновление честно отказало", r.status_code == 502, r.text[:140])
+
+        data = fresh.get("/api/supply/sheets?limit=200").json()
+        check("причина отказа осталась в состоянии, а не только в тосте",
+              "403" in data["last_error"], data["last_error"][:120])
+        check("тела чужого ответа в ней нет",
+              "forbidden body" not in json.dumps(data, ensure_ascii=False))
+        check("время попытки отмечено", bool(data["last_attempt_at"]),
+              str(data["last_attempt_at"]))
+        check("ввод сохранён: ссылка восстановлена сервером из идентификатора",
+              data["attempt"]["spreadsheet_url"] == ss.spreadsheet_link(SPREADSHEET_ID),
+              str(data["attempt"]))
+        check("и оба имени листов в исходном порядке",
+              data["attempt"]["sheet_names"] == [SHEET_CURRENT, SHEET_NEXT],
+              str(data["attempt"]["sheet_names"]))
+
+        print("\n== ...но это НЕ выдаётся за успешно настроенный источник ==")
+        check("configured остаётся false", data["configured"] is False,
+              str(data["configured"]))
+        check("удачного чтения не было", data["last_success_at"] is None,
+              str(data["last_success_at"]))
+        check("снимка нет: ни хеша, ни строк",
+              data["content_sha256"] == "" and data["rows"] == [] and data["total"] == 0,
+              str((data["content_sha256"], data["total"])))
+        check("и ссылка «открыть исходник» не показывается как настроенная",
+              data["spreadsheet_url"] == "", data["spreadsheet_url"])
+        check("сводка пустая, а не выдуманная",
+              data["counts"]["data_rows"] == 0, str(data["counts"]["data_rows"]))
+
+        print("\n== Удачное чтение поверх сбоя приводит состояние в порядок ==")
+        ss.set_transport(FakeGoogle())
+        r = fresh.post("/api/supply/sheets/refresh",
+                       json={"spreadsheet_url": SHEET_URL,
+                             "sheet_names": [SHEET_CURRENT, SHEET_NEXT]})
+        check("повторная попытка удалась", r.status_code == 200, r.text[:140])
+        data = fresh.get("/api/supply/sheets?limit=200").json()
+        check("теперь источник настроен и ошибка снята",
+              data["configured"] is True and data["last_error"] == "",
+              str((data["configured"], data["last_error"][:60])))
+        check("и снимок появился", data["total"] == 10 and bool(data["last_success_at"]),
+              str(data["total"]))
+    finally:
+        ss.set_transport(None)
+        fresh.close()
+
+
+def envelope_version_checks() -> None:
+    """Снимок, который мы не умеем прочитать, не интерпретируется и не стирается."""
+    print("\n== Версия снимка: неизвестное/повреждённое — fail closed ==")
+    holder = client()
+    holder.post("/register", data={"name": "Версии", "email": "sheets-g@test.io",
+                                  "password": "secret123", "org_name": "Бренд-Ж"})
+    holder.post("/api/connect/demo")
+    org_id = sql("SELECT org_id FROM memberships WHERE user_id ="
+                 " (SELECT id FROM users WHERE email = 'sheets-g@test.io')")[0][0]
+    conn_id = sql("SELECT id FROM connections WHERE org_id = ? ORDER BY id",
+                  org_id)[0][0]
+    exec_sql("UPDATE connections SET config_json = ? WHERE id = ?",
+             json.dumps({"keep_me": {"чужое": [1, 2]}}, ensure_ascii=False), conn_id)
+
+    ss.set_transport(FakeGoogle())
+    try:
+        r = holder.post("/api/supply/sheets/refresh",
+                        json={"spreadsheet_url": SHEET_URL,
+                              "sheet_names": [SHEET_CURRENT, SHEET_NEXT]})
+        check("корректный снимок создан и читается", r.status_code == 200, r.text[:140])
+        check("и текущая версия читателем принимается",
+              holder.get("/api/supply/sheets").status_code == 200)
+        good = json.loads(sql("SELECT config_json FROM connections WHERE id = ?",
+                              conn_id)[0][0])
+        good_blob = json.dumps(good, ensure_ascii=False, sort_keys=True)
+
+        broken = {
+            "версия из будущего": {**good[ss.ENVELOPE_KEY], "schema_version": 2},
+            "версия строкой": {**good[ss.ENVELOPE_KEY], "schema_version": "1"},
+            "версия булевым": {**good[ss.ENVELOPE_KEY], "schema_version": True},
+            "версии нет вовсе": {k: v for k, v in good[ss.ENVELOPE_KEY].items()
+                                 if k != "schema_version"},
+            "нет строк": {k: v for k, v in good[ss.ENVELOPE_KEY].items() if k != "rows"},
+            "строки не список": {**good[ss.ENVELOPE_KEY], "rows": {"a": 1}},
+            "строка снимка не запись": {**good[ss.ENVELOPE_KEY], "rows": ["строка"]},
+            "счётчики не запись": {**good[ss.ENVELOPE_KEY], "counts": []},
+            "ошибка не текст": {**good[ss.ENVELOPE_KEY], "last_error": 500},
+            "под ключом не запись": "снимок",
+        }
+        for label, payload in broken.items():
+            spoiled = dict(good)
+            spoiled[ss.ENVELOPE_KEY] = payload
+            blob = json.dumps(spoiled, ensure_ascii=False)
+            exec_sql("UPDATE connections SET config_json = ? WHERE id = ?", blob, conn_id)
+
+            read = holder.get("/api/supply/sheets")
+            check(f"чтение отказывает 409: {label}", read.status_code == 409,
+                  f"{read.status_code} {read.text[:90]}")
+            check(f"и отказ безопасен по тексту: {label}",
+                  "предпросмотр" in read.text.lower(), read.text[:110])
+
+            probe = FakeGoogle()
+            ss.set_transport(probe)
+            write = holder.post("/api/supply/sheets/refresh",
+                                json={"spreadsheet_url": SHEET_URL,
+                                      "sheet_names": [SHEET_CURRENT, SHEET_NEXT]})
+            check(f"обновление тоже отказывает 409: {label}", write.status_code == 409,
+                  f"{write.status_code} {write.text[:90]}")
+            check(f"и не ходит в источник впустую: {label}", probe.calls == [],
+                  str(probe.calls)[:80])
+            after = sql("SELECT config_json FROM connections WHERE id = ?", conn_id)[0][0]
+            check(f"повреждённый снимок оставлен как есть, а не переписан: {label}",
+                  after == blob, after[:80])
+            check(f"и чужой ключ config_json цел: {label}",
+                  json.loads(after).get("keep_me") == {"чужое": [1, 2]},
+                  str(json.loads(after).get("keep_me")))
+
+        print("\n== Возврат корректного снимка снова делает раздел рабочим ==")
+        exec_sql("UPDATE connections SET config_json = ? WHERE id = ?",
+                 json.dumps(good, ensure_ascii=False), conn_id)
+        check("исправный снимок читается снова",
+              holder.get("/api/supply/sheets").status_code == 200)
+        check("и содержимое не изменилось за всё это время",
+              json.dumps(json.loads(sql("SELECT config_json FROM connections"
+                                        " WHERE id = ?", conn_id)[0][0]),
+                         ensure_ascii=False, sort_keys=True) == good_blob)
+
+        print("\n== Снимок прежней версии разбора помечается устаревшим ==")
+        stale = dict(good)
+        stale[ss.ENVELOPE_KEY] = {**good[ss.ENVELOPE_KEY],
+                                  "parser_version": "supply-sheets-parser-1"}
+        exec_sql("UPDATE connections SET config_json = ? WHERE id = ?",
+                 json.dumps(stale, ensure_ascii=False), conn_id)
+        data = holder.get("/api/supply/sheets").json()
+        check("он читается, но честно назван устаревшим",
+              data["parser_stale"] is True and data["configured"] is True,
+              str(data["parser_stale"]))
+        exec_sql("UPDATE connections SET config_json = ? WHERE id = ?",
+                 json.dumps(good, ensure_ascii=False), conn_id)
+        check("текущая версия разбора устаревшей не считается",
+              holder.get("/api/supply/sheets").json()["parser_stale"] is False)
+    finally:
+        ss.set_transport(None)
+        holder.close()
+
+
 def purge_checks() -> None:
     print("\n== Удаление организации уносит носителя вместе со снимком ==")
     doomed = client()
@@ -1180,6 +1484,35 @@ def structural_checks(owner) -> None:
           "не партия «Оборота»" in page and "не учитывается в «Едет»" in page)
     check("исходная таблица — ссылка, а не iframe",
           "<iframe" not in page and 'rel = "noopener noreferrer"' in page.replace('rel="', 'rel = "'))
+    print("\n== Страница: ошибка первого сбоя и восстановленный ввод ==")
+    # Регрессия по ревью PR #47. Раньше отрисовка состояния выходила раньше
+    # блока ошибки, когда успешного снимка ещё нет, и человек видел только
+    # тост. Проверяется структура шаблона: блок ошибки живёт СВОЕЙ функцией,
+    # которая вызывается безусловно, а не внутри ветки «источник настроен».
+    check("блок ошибки вынесен в отдельную функцию",
+          "function renderError(data)" in template)
+    # Именно БЕЗУСЛОВНО. Проверка на подстроку «renderError(data);» этого не
+    # доказывает: `if (data.configured) renderError(data);` содержит её тоже —
+    # и это ровно тот дефект, который ревью и нашло. Поэтому требуется строка,
+    # которая целиком является вызовом.
+    call_lines = [ln.strip() for ln in template.splitlines()
+                  if "renderError(data)" in ln and "function" not in ln]
+    check("и вызывается безусловно, рядом с остальной отрисовкой",
+          "renderError(data);" in call_lines,
+          f"вызов условный: {call_lines}")
+    check("внутри renderState блока ошибки больше нет",
+          "sup-error" not in template.split("function renderState(data)")[1]
+          .split("function tile(")[0],
+          "renderState всё ещё сам рисует ошибку")
+    check("текст для случая «удачного чтения ещё не было» есть",
+          "Удачного чтения ещё не было" in template)
+    check("форма восстанавливает ссылку последней попытки",
+          "attempt.spreadsheet_url" in template)
+    check("и имена листов последней попытки",
+          "attempt.sheet_names" in template)
+    check("устаревший разбор проговаривается словами",
+          "parser_stale" in template and "прежней версией разбора" in template)
+
     check("на странице есть три фильтра очереди",
           "Требуют разбора" in page and "Ошибки" in page and "Все" in page)
     check("и одна кнопка обновления",
@@ -1397,6 +1730,8 @@ def run() -> int:
           str(member.get("/api/settings").json().get("role")))
 
     refresh_checks(owner, org_id)
+    first_failure_checks()
+    envelope_version_checks()
     isolation_checks(owner, member, org_id)
     structural_checks(owner)
     offline_checks(org_id)
