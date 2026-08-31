@@ -181,6 +181,16 @@
   .mvbtn:hover { background: rgba(31,31,31,.09); color: #1f1f1f; }
   .mvsel { font-size: 11px; padding: 3px 6px; border-radius: 8px; border: 1px solid rgba(31,31,31,.22);
     background: rgba(255,255,255,.7); max-width: 130px; }
+  /* SUPPLY-1: идентификатор партии под названием заказа. Значение показывается
+     ЦЕЛИКОМ и переносится (word-break), а не обрезается многоточием: обрезанный
+     идентификатор нельзя ни продиктовать, ни сверить, а показывать «почти тот
+     же» — хуже, чем показывать длинный. */
+  .batchid { margin-top: 3px; display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; }
+  .batchid .lbl { font-size: 9.5px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase;
+    color: rgba(31,31,31,.45); }
+  .batchid code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 10.5px; color: rgba(31,31,31,.65); word-break: break-all; user-select: all; }
+  .batchid .none { font-size: 10.5px; color: rgba(31,31,31,.45); }
   tfoot td { position: sticky; bottom: 0; z-index: 9; background: #ece2d8; padding: 9px 8px; text-align: center;
     font-weight: 700; font-size: 12px; border-top: 2px solid rgba(31,31,31,.35); font-variant-numeric: tabular-nums; }
   tfoot td:first-child { text-align: left; padding-left: 14px; text-transform: uppercase; font-size: 10px; letter-spacing: .06em; }
@@ -708,7 +718,17 @@
       if(o.status==="sent")
         btns='<button class="mvbtn ord-recv" data-id="'+o.id+'" title="Заказ приехал: снимет количество из «Едет», остатки подтянет синхронизация">✓ Принят на склад</button> ';
       btns+='<button class="mvbtn ord-del" data-id="'+o.id+'" data-name="'+esc(o.name)+'">✕ Удалить</button>';
-      return '<tr><td class="name">'+esc(o.name)+'</td>'+
+      /* SUPPLY-1: CC_BATCH_ID партии — под названием заказа, целиком и с
+         кнопкой копирования. Пустое значение бывает ровно у строки, созданной
+         откатившимся старым кодом и ещё не вылеченной ближайшим стартом
+         приложения; так и написано словами — придумывать вместо него
+         прочерк-заглушку значило бы выдать «не знаем» за «нет». */
+      var bid=o.cc_batch_id||"";
+      var batch='<div class="batchid"><span class="lbl">Партия</span>'+
+        (bid?'<code>'+esc(bid)+'</code><button class="mvbtn ord-copy" type="button" '+
+             'data-batch="'+esc(bid)+'" title="Скопировать CC_BATCH_ID">Копировать</button>'
+            :'<span class="none">идентификатор ещё не присвоен</span>')+'</div>';
+      return '<tr><td class="name">'+esc(o.name)+batch+'</td>'+
         '<td class="nb muted">'+(o.created_at?fmtDate(o.created_at):"—")+'</td>'+
         '<td class="nb">'+(o.eta_date?fmtDate(o.eta_date):"—")+'</td>'+
         '<td class="nb">'+fmt(o.positions)+'</td>'+
@@ -736,6 +756,30 @@
           .then(load).catch(function(e){ alert("Не удалось: "+e.message); });
       });
     });
+    document.querySelectorAll(".ord-copy").forEach(function(b){
+      b.addEventListener("click",function(){ copyBatchId(b); });
+    });
+  }
+
+  /* Копирование CC_BATCH_ID. Кнопка — удобство, а не единственный путь: сам
+     идентификатор лежит в разметке целиком и выделяется одним щелчком
+     (user-select: all), поэтому отказ буфера обмена (нет разрешения, не
+     защищённый контекст) ничего не отнимает — об этом и говорится вслух,
+     вместо молчаливого «как будто скопировали». */
+  function copyBatchId(btn){
+    var value=btn.getAttribute("data-batch")||"";
+    if(!value) return;
+    var done=function(){
+      var was=btn.textContent;
+      btn.textContent="Скопировано";
+      setTimeout(function(){ btn.textContent=was; },1500);
+    };
+    var failed=function(){ alert("Не удалось скопировать автоматически. Выделите идентификатор и скопируйте вручную:\n"+value); };
+    if(navigator.clipboard&&navigator.clipboard.writeText){
+      navigator.clipboard.writeText(value).then(done).catch(failed);
+      return;
+    }
+    failed();
   }
 
   /* ── производства: вкладки ── */

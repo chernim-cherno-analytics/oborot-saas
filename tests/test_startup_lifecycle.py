@@ -2,8 +2,8 @@
 """Порядок жизненного цикла приложения: планировщик стартует ПОСЛЕ миграций.
 
 TECH_DEBT OPS-6: «Планировщик стартует до миграций». `scheduler.attach(app)`
-вызывался в main.py раньше регистрации `_startup` (init_db + девять шагов
-`ensure_schema`/`reset_stale_running`/`log_preview` суммарно), а FastAPI
+вызывался в main.py раньше регистрации `_startup` (init_db + остальные шаги
+`ensure_schema`/`reset_stale_running`/`log_preview`), а FastAPI
 выполняет `on_event("startup")`-хендлеры строго в порядке регистрации (см.
 `fastapi.routing.APIRouter._startup`, `for handler in self.on_startup`).
 Значит планировщик реально поднимался ДО того, как гарантированно применены
@@ -24,20 +24,21 @@ TECH_DEBT OPS-6: «Планировщик стартует до миграций
 (которого требует `app.main`) вызывал миграцию; если бы патч ставился позже,
 проверка ловила бы ложный успех: старый вызов уже случился бы мимо счётчика.
 
-  1) реальный порядок: все девять шагов старта (init_db,
+  1) реальный порядок: все десять шагов старта (init_db,
      lessons.ensure_schema, exclusions.ensure_schema, ms_sync.ensure_schema,
      ms_sync.reset_stale_running, ms_writeback.ensure_schema,
      ms_vendor.ensure_schema, subscription.ensure_schema,
-     subscription.log_preview) завершаются ДО scheduler.start, каждый — ровно
-     один раз, а lessons.ensure_schema — немедленно после init_db;
-  2) инъекция сбоя в КАЖДЫЙ из девяти шагов старта — планировщик не
+     subscription.log_preview, models.ensure_supply_schema) завершаются ДО
+     scheduler.start, каждый — ровно один раз, а lessons.ensure_schema —
+     немедленно после init_db;
+  2) инъекция сбоя в КАЖДЫЙ из десяти шагов старта — планировщик не
      стартует вообще, и ни один из последующих по порядку шагов не выполняется;
   3) import app.api и import app.main САМИ ПО СЕБЕ (без запуска ASGI-цикла)
      не вызывают lessons.ensure_schema — миграция не должна случаться на
      импорте модуля;
   4) повторный shutdown безопасен (идемпотентен), в т.ч. после ASGI-цикла.
 
-TECH_DEBT OPS-5 («Миграции без журнала и порядка»): те же девять шагов теперь
+TECH_DEBT OPS-5 («Миграции без журнала и порядка»): те же шаги теперь
 после успешного завершения пишут строку в журнал `migration_ledger`
 (`app/db.record_migration_step`) — стабильный id, числовая позиция, applied_at.
 Журнал НИЧЕГО не пропускает: шаги идемпотентны и выполняются на каждом старте
@@ -45,13 +46,13 @@ TECH_DEBT OPS-5 («Миграции без журнала и порядка»): 
 пять проверок, и каждая работает на СИНТЕТИЧЕСКОЙ базе (пустой файл или
 руками собранная прежняя схема), без боевых данных:
 
-  5) чистая база: журнал содержит ровно девять объявленных шагов, позиции
-     1..9 идут по возрастанию и совпадают с фактическим порядком вызовов;
+  5) чистая база: журнал содержит ровно десять объявленных шагов, позиции
+     1..10 идут по возрастанию и совпадают с фактическим порядком вызовов;
   6) прежняя схема: (а) база старой формы, где новых колонок ещё нет, и
      (б) уже мигрированная база, где журнала ещё нет вовсе, — приложение
      поднимается, миграции доезжают, журнал заполняется целиком;
-  7) повторный старт идемпотентен: строк по-прежнему девять, applied_at
-     первой записи НЕ переписан, и при этом все девять шагов выполнились
+  7) повторный старт идемпотентен: строк по-прежнему десять, applied_at
+     первой записи НЕ переписан, и при этом все десять шагов выполнились
      снова — журнал не служит основанием их пропустить;
   8) сбой шага: упавший шаг и все последующие записи в журнал не получают;
   9) конфликт id↔позиция и позиция↔id валит старт (fail closed) ДО того, как
@@ -68,7 +69,16 @@ TECH_DEBT OPS-5 («Миграции без журнала и порядка»): 
  11) фактическая последовательность вызовов привязана к объявленному списку:
      объявленный порядок проходит целиком, два шага, переставленные ВМЕСТЕ со
      своими id, отвергаются ДО выполнения переставленного шага, а пропуск шага
-     не даёт объявить старт завершённым.
+     не даёт объявить старт завершённым;
+ 12) SUPPLY-1 (ревью PR #46, discussion_r3894000377) записан в журнал СВОЕЙ
+     строкой, а не под идентичностью уже выпущенного `init_db`. База
+     синтетическая и собрана как боевая в момент выката: девять выпущенных
+     шагов в журнале уже есть, колонки `cc_batch_id` ещё нет. Старт добавляет
+     ровно одну строку — `models.ensure_supply_schema` на позиции 10, со своим
+     applied_at, — и не переписывает ни одной прежней. Отдельно проверено, что
+     эта строка НЕ превращает условный backfill в one-time migration: заказ,
+     созданный откатившимся старым кодом уже ПОСЛЕ записи шага, лечится
+     следующим стартом.
 
 Пункт 9 в этой форме — прямое следствие ревью жизненного цикла 28.08.2026
 (PR #44, discussion_r3884250490). Прежняя версия проверяла только неизменность
@@ -122,9 +132,30 @@ STEPS = [
     "ms_vendor.ensure_schema",
     "subscription.ensure_schema",
     "subscription.log_preview",
+    # SUPPLY-1: терминальный шаг, дописанный В КОНЕЦ append-only реестра
+    # (ревью PR #46, discussion_r3894000377). Позиция 10 — новая, девять
+    # прежних пар (id, позиция) не тронуты.
+    "models.ensure_supply_schema",
 ]
 
-# Общий пролог дочернего процесса: подменяет девять шагов старта и
+# Девять шагов, ВЫПУЩЕННЫХ до SUPPLY-1: ровно то, что журнал боевой базы уже
+# содержит. Список выписан явно, а не срезом STEPS[:9]: его смысл именно в
+# том, что эти строки не меняются, и срез от растущего списка этого бы не
+# удержал — он «поехал» бы вместе с любой будущей вставкой.
+RELEASED_BEFORE_SUPPLY = [
+    ("init_db", 1),
+    ("lessons.ensure_schema", 2),
+    ("exclusions.ensure_schema", 3),
+    ("ms_sync.ensure_schema", 4),
+    ("ms_sync.reset_stale_running", 5),
+    ("ms_writeback.ensure_schema", 6),
+    ("ms_vendor.ensure_schema", 7),
+    ("subscription.ensure_schema", 8),
+    ("subscription.log_preview", 9),
+]
+SUPPLY_STEP = ("models.ensure_supply_schema", 10)
+
+# Общий пролог дочернего процесса: подменяет десять шагов старта и
 # scheduler.start/shutdown ДО импорта app.main (см. докстринг файла — почему
 # именно до, а не после). lessons.ensure_schema патчится первым из
 # ensure_schema-шагов и раньше `import app.main`, чтобы поймать и старый
@@ -210,6 +241,13 @@ def _w_sub_preview():
     order.append("subscription.log_preview")
     return _orig_sub_preview()
 _sub.log_preview = _w_sub_preview
+
+import app.models as _models
+_orig_supply = _models.ensure_supply_schema
+def _w_supply(*a, **kw):
+    order.append("models.ensure_supply_schema")
+    return _orig_supply(*a, **kw)
+_models.ensure_supply_schema = _w_supply
 """
 
 
@@ -227,7 +265,7 @@ def _fresh_db(name: str) -> Path:
 
 
 def check_order() -> None:
-    """Проверка 1: реальный порядок девяти шагов старта и scheduler.start."""
+    """Проверка 1: реальный порядок десяти шагов старта и scheduler.start."""
     db = _fresh_db("test_startup_order.db")
     code = _CHILD_PREAMBLE.format(root=str(ROOT), db=str(db)) + """
 from fastapi.testclient import TestClient
@@ -240,7 +278,7 @@ for step in order:
     rc, out = _run_child(code)
     check("дочерний процесс завершился успешно (проверка порядка)", rc == 0, out[-400:])
     order = [ln.split("ORDER:", 1)[1] for ln in out.splitlines() if ln.startswith("ORDER:")]
-    check("зафиксированы все девять шагов старта",
+    check("зафиксированы все десять шагов старта",
           set(STEPS + ["scheduler.start"]) <= set(order), f"order={order}")
     check("lessons.ensure_schema вызван РОВНО ОДИН раз",
           order.count("lessons.ensure_schema") == 1, f"order={order}")
@@ -265,14 +303,14 @@ for step in order:
 
 
 def check_failure_prevents_scheduler_start() -> None:
-    """Проверка 2: сбой на КАЖДОМ из девяти шагов старта — планировщик не стартует,
+    """Проверка 2: сбой на КАЖДОМ из десяти шагов старта — планировщик не стартует,
     и ни один из шагов, идущих ПОСЛЕ упавшего по порядку, не выполняется."""
     for failing_step in STEPS:
         db = _fresh_db(f"test_startup_fail_{failing_step.replace('.', '_')}.db")
         # init_db разрешается в app.main через `from app.db import ... init_db`
         # ПРИ ИМПОРТЕ — патчить app.db.init_db ПОСЛЕ import app.main бесполезно,
         # у app.main уже своя копия имени. Патчим саму копию — m.init_db.
-        # Остальные восемь читаются внутри _startup() заново на каждый вызов
+        # Остальные девять читаются внутри _startup() заново на каждый вызов
         # (`from app import X as _x; _x.метод()`) — патч атрибута субмодуля
         # после импорта app.main их ловит как положено.
         target_var = {
@@ -285,6 +323,7 @@ def check_failure_prevents_scheduler_start() -> None:
             "ms_vendor.ensure_schema": "_msv.ensure_schema",
             "subscription.ensure_schema": "_sub.ensure_schema",
             "subscription.log_preview": "_sub.log_preview",
+            "models.ensure_supply_schema": "_models.ensure_supply_schema",
         }[failing_step]
         code = _CHILD_PREAMBLE.format(root=str(ROOT), db=str(db)) + f"""
 def _boom(*a, **kw):
@@ -446,6 +485,18 @@ def _tables(db: Path) -> set[str]:
         con.close()
 
 
+def _batch_ids(db: Path) -> dict:
+    """`{id: cc_batch_id}` из синтетической базы; {'ERR': ...} — колонки нет."""
+    con = sqlite3.connect(str(db))
+    try:
+        return {r[0]: r[1] for r in con.execute(
+            "SELECT id, cc_batch_id FROM production_orders ORDER BY id")}
+    except sqlite3.OperationalError as exc:
+        return {"ERR": str(exc)}
+    finally:
+        con.close()
+
+
 def _seed_ledger(db: Path, rows: list[tuple[str, int, str]]) -> None:
     """Кладёт в синтетическую базу заранее заданные строки журнала."""
     con = sqlite3.connect(str(db))
@@ -483,17 +534,17 @@ def _boot(db: Path, extra: str = "") -> tuple[int, str, list[str]]:
 
 
 def check_ledger_clean_db() -> None:
-    """Проверка 5: на чистой базе журнал содержит ровно девять объявленных шагов."""
+    """Проверка 5: на чистой базе журнал содержит ровно десять объявленных шагов."""
     db = _purge_db("test_startup_ledger_clean.db")
     rc, out, order = _boot(db)
     check("дочерний процесс завершился успешно (журнал, чистая база)", rc == 0, out[-400:])
     check("старт на чистой базе не упал", "RAISED \n" in out or "RAISED\n" in out, out[-300:])
     rows = _read_ledger(db)
-    check("журнал содержит ровно девять строк", len(rows) == 9, f"rows={rows}")
+    check("журнал содержит ровно десять строк", len(rows) == 10, f"rows={rows}")
     check("id и позиции журнала совпадают с объявленным порядком",
           [(r[0], r[1]) for r in rows] == LEDGER_STEPS, f"rows={rows}")
-    check("позиции идут 1..9 по возрастанию без пропусков",
-          [r[1] for r in rows] == list(range(1, 10)), f"rows={rows}")
+    check("позиции идут 1..10 по возрастанию без пропусков",
+          [r[1] for r in rows] == list(range(1, 11)), f"rows={rows}")
     check("у каждой строки непустой applied_at",
           all(r[2] and r[2].endswith("Z") for r in rows), f"rows={rows}")
     exec_order = [st for st in order if st in STEPS]
@@ -567,7 +618,7 @@ def check_ledger_legacy_db() -> None:
     check("журнал восстановлен целиком и в объявленном порядке",
           [(r[0], r[1]) for r in _read_ledger(db2)] == LEDGER_STEPS,
           f"rows={_read_ledger(db2)}")
-    check("все девять шагов выполнились и на базе без журнала",
+    check("все десять шагов выполнились и на базе без журнала",
           [st for st in order if st in STEPS] == STEPS, f"order={order}")
     _purge_db("test_startup_ledger_dropped.db")
 
@@ -585,13 +636,13 @@ def check_ledger_repeat_startup() -> None:
     rc, out, order_second = _boot(db)
     check("дочерний процесс завершился успешно (повторный старт)", rc == 0, out[-400:])
     second = _read_ledger(db)
-    check("повторный старт не добавил строк в журнал", len(second) == 9, f"rows={second}")
+    check("повторный старт не добавил строк в журнал", len(second) == 10, f"rows={second}")
     check("повторный старт не переписал journal (строки идентичны первым)",
           second == first, f"first={first} second={second}")
     check("повторный старт не изменил applied_at ни одной строки",
           [r[2] for r in second] == [r[2] for r in first],
           f"first={[r[2] for r in first]} second={[r[2] for r in second]}")
-    check("повторный старт ВЫПОЛНИЛ все девять шагов (журнал не повод пропускать)",
+    check("повторный старт ВЫПОЛНИЛ все десять шагов (журнал не повод пропускать)",
           [st for st in order_second if st in STEPS] == STEPS, f"order={order_second}")
     check("повторный старт довёл дело до планировщика",
           "scheduler.start" in order_second, f"order={order_second}")
@@ -603,12 +654,18 @@ def check_ledger_repeat_startup() -> None:
 
 def check_ledger_not_recorded_on_failure() -> None:
     """Проверка 8: упавший шаг и все следующие за ним записи в журнал не получают."""
-    for failing_step in ("init_db", "ms_writeback.ensure_schema", "subscription.log_preview"):
+    # Последний в списке — SUPPLY-1: терминальный шаг проверяется отдельно и
+    # намеренно. У него нет «следующего», чьё отсутствие в журнале выдало бы
+    # проблему за компанию, поэтому ложную запись о нём ловит ровно одно —
+    # отсутствие его собственной строки.
+    for failing_step in ("init_db", "ms_writeback.ensure_schema",
+                         "subscription.log_preview", "models.ensure_supply_schema"):
         db = _purge_db(f"test_startup_ledger_fail_{failing_step.replace('.', '_')}.db")
         target_var = {
             "init_db": "m.init_db",
             "ms_writeback.ensure_schema": "_mswb.ensure_schema",
             "subscription.log_preview": "_sub.log_preview",
+            "models.ensure_supply_schema": "_models.ensure_supply_schema",
         }[failing_step]
         extra = f"""
 def _boom(*a, **kw):
@@ -627,6 +684,104 @@ def _boom(*a, **kw):
         check(f"в журнале ровно шаги ДО {failing_step} и ни одного после",
               rows == expected, f"rows={rows} expected={expected}")
         _purge_db(f"test_startup_ledger_fail_{failing_step.replace('.', '_')}.db")
+
+
+def check_ledger_supply_step_is_distinct() -> None:
+    """Проверка 12: у SUPPLY-1 собственное свидетельство, отдельное от init_db.
+
+    Прямое следствие ревью PR #46 (discussion_r3894000377). Пока схемная работа
+    SUPPLY-1 шла внутри `models.ensure_schema()`, она исполнялась под
+    идентичностью УЖЕ ВЫПУЩЕННОГО шага `init_db` позиции 1: на базе, где эта
+    строка журнала давно есть, о применении SUPPLY-1 не появлялось никакого
+    свидетельства вовсе, и порядок относительно будущих миграций журнал не
+    удерживал. Проверки 5–8 такого дефекта не видят: они работают на базе, где
+    журнала ещё нет, и там разницы между «шаг свой» и «шаг чужой» не возникает.
+
+    База здесь собрана ровно как боевая в момент выката:
+      * `production_orders` СТАРОЙ формы — колонки `cc_batch_id` ещё нет;
+      * журнал уже содержит девять выпущенных шагов, включая `init_db`.
+
+    Доказывается три вещи, и третья — самая важная:
+      * старт добавляет РОВНО ОДНУ строку, и это `models.ensure_supply_schema`
+        на позиции 10, со своим собственным applied_at;
+      * девять прежних строк не переписаны — ни id, ни позиция, ни время;
+      * записанная строка НЕ становится основанием пропустить работу: заказ,
+        вставленный ПОСЛЕ неё откатившимся старым кодом, лечится следующим
+        стартом. Ledger здесь свидетельство, а не one-time migration flag —
+        разница ровно та, ради которой backfill сделан условным.
+    """
+    db = _purge_db("test_startup_ledger_supply.db")
+    con = sqlite3.connect(str(db))
+    con.executescript("""
+      CREATE TABLE orgs (id INTEGER PRIMARY KEY, name VARCHAR(255) NOT NULL,
+                         plan VARCHAR(32) NOT NULL DEFAULT 'trial',
+                         settings_json TEXT NOT NULL DEFAULT '{}');
+      CREATE TABLE production_orders (
+        id INTEGER PRIMARY KEY, org_id INTEGER NOT NULL, name VARCHAR(255) NOT NULL,
+        created_at DATETIME, eta_date VARCHAR(10),
+        status VARCHAR(16) NOT NULL DEFAULT 'draft',
+        items_json TEXT NOT NULL DEFAULT '[]');
+      INSERT INTO orgs (name) VALUES ('Синтетическая организация');
+      INSERT INTO production_orders (id, org_id, name, created_at)
+        VALUES (1, 1, 'Партия до SUPPLY-1', '2025-04-17 10:00:00');
+    """)
+    con.commit()
+    con.close()
+    seeded = [(sid, pos, "2026-01-01T00:00:00Z") for sid, pos in RELEASED_BEFORE_SUPPLY]
+    _seed_ledger(db, seeded)
+    check("до старта в журнале ровно девять выпущенных шагов, SUPPLY-1 среди них нет",
+          _read_ledger(db) == seeded, f"rows={_read_ledger(db)}")
+    check("до старта колонки партии в таблице заказов нет",
+          "ERR" in _batch_ids(db), f"orders={_batch_ids(db)}")
+
+    rc, out, order = _boot(db)
+    check("дочерний процесс завершился успешно (SUPPLY-1 на базе с журналом)",
+          rc == 0, out[-400:])
+    check("старт на базе с девятью выпущенными шагами не упал",
+          "SCHEDULER_START_CALLED True" in out, out[-300:])
+    rows = _read_ledger(db)
+    check("журнал прирос ровно одной строкой", len(rows) == 10, f"rows={rows}")
+    check("девять выпущенных строк не переписаны (id, позиция и applied_at те же)",
+          rows[:9] == seeded, f"rows={rows[:9]} seeded={seeded}")
+    fresh = [r for r in rows if (r[0], r[1]) not in {(s[0], s[1]) for s in seeded}]
+    check("новая строка ровно одна и это SUPPLY-1 на позиции 10",
+          len(fresh) == 1 and (fresh[0][0], fresh[0][1]) == SUPPLY_STEP, f"new={fresh}")
+    check("у SUPPLY-1 собственный applied_at, а не время выпущенных шагов",
+          bool(fresh) and fresh[0][2].endswith("Z") and fresh[0][2] != seeded[0][2],
+          f"new={fresh}")
+    check("шаг SUPPLY-1 действительно выполнился на этом старте",
+          "models.ensure_supply_schema" in order, f"order={order}")
+    check("SUPPLY-1 выполнился ПОСЛЕ init_db, а не вместо него",
+          "init_db" in order and "models.ensure_supply_schema" in order
+          and order.index("models.ensure_supply_schema") > order.index("init_db"),
+          f"order={order}")
+    healed = _batch_ids(db)
+    check("схемная работа доехала: старый заказ получил идентификатор партии",
+          bool(healed.get(1)), f"orders={healed}")
+
+    # Откатившийся старый код: INSERT без колонки, значение приходит из
+    # server_default=''. Это происходит УЖЕ ПОСЛЕ того, как шаг записан в
+    # журнал, — ровно здесь одноразовая миграция оставила бы партию без имени.
+    con = sqlite3.connect(str(db))
+    con.execute("INSERT INTO production_orders (id, org_id, name, created_at) "
+                "VALUES (2, 1, 'Заказ откатившегося кода', '2026-08-31 12:00:00')")
+    con.commit()
+    con.close()
+    check("старый код создал строку с пустым идентификатором уже после записи шага",
+          _batch_ids(db).get(2) == "", f"orders={_batch_ids(db)}")
+
+    rc, out, order = _boot(db)
+    check("дочерний процесс завершился успешно (старт после отката)", rc == 0, out[-400:])
+    check("шаг SUPPLY-1 выполнился снова, хотя в журнале уже записан",
+          "models.ensure_supply_schema" in order, f"order={order}")
+    after = _batch_ids(db)
+    check("запись в журнале НЕ стала основанием пропустить backfill",
+          bool(after.get(2)), f"orders={after}")
+    check("и уже выданный идентификатор соседа не переписан",
+          after.get(1) == healed.get(1), f"было={healed} стало={after}")
+    check("повторный старт журнал не изменил: те же десять строк и то же время",
+          _read_ledger(db) == rows, f"rows={_read_ledger(db)} было={rows}")
+    _purge_db("test_startup_ledger_supply.db")
 
 
 def check_ledger_conflict_fails_closed() -> None:
@@ -981,6 +1136,9 @@ def main() -> int:
 
     print("\n== OPS-5: упавший шаг записи в журнал не получает ==")
     check_ledger_not_recorded_on_failure()
+
+    print("\n== SUPPLY-1: собственная строка журнала, отдельная от init_db ==")
+    check_ledger_supply_step_is_distinct()
 
     print("\n== OPS-5: конфликт порядка валит старт (fail closed) ==")
     check_ledger_conflict_fails_closed()
