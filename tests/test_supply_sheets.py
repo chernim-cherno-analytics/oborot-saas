@@ -1424,6 +1424,155 @@ def envelope_version_checks() -> None:
         holder.close()
 
 
+def row_shape_checks() -> None:  # noqa: C901 — матрица полей, ветвлений мало
+    """Форма СТРОКИ снимка проверяется, а не предполагается.
+
+    Замечание ревью PR #47 на HEAD `c6919af`, воспроизведённое дословно:
+    `{"issues": 5}` проходил читателя, а потом `_row_flags` делал `set(5)` и
+    падал `TypeError` — вместо обещанного управляемого 409 получалась 500. То
+    же с полями, которые разыменовывает браузер: `comments_raw` числом ломает
+    `forEach`, `sizes` строкой молча превращает размеры в прочерки.
+
+    Здесь проверяется, что каждое такое поле даёт УПРАВЛЯЕМЫЙ 409 — на чтении и
+    на записи, до сети и без единой записи в базу, — и что валидные снимки
+    (включая сделанные прежней версией разбора) по-прежнему читаются.
+    """
+    print("\n== Форма строки снимка: fail closed вместо 500 ==")
+    shaped = client()
+    shaped.post("/register", data={"name": "Форма строк", "email": "sheets-i@test.io",
+                                  "password": "secret123", "org_name": "Бренд-И"})
+    shaped.post("/api/connect/demo")
+    org_id = sql("SELECT org_id FROM memberships WHERE user_id ="
+                 " (SELECT id FROM users WHERE email = 'sheets-i@test.io')")[0][0]
+    conn_id = sql("SELECT id FROM connections WHERE org_id = ? ORDER BY id",
+                  org_id)[0][0]
+    exec_sql("UPDATE connections SET config_json = ? WHERE id = ?",
+             json.dumps({"keep_row": {"чужое": 1}}, ensure_ascii=False), conn_id)
+
+    ss.set_transport(FakeGoogle())
+    try:
+        r = shaped.post("/api/supply/sheets/refresh",
+                        json={"spreadsheet_url": SHEET_URL,
+                              "sheet_names": [SHEET_CURRENT, SHEET_NEXT]})
+        check("исходный снимок создан", r.status_code == 200, r.text[:140])
+        good = json.loads(sql("SELECT config_json FROM connections WHERE id = ?",
+                              conn_id)[0][0])
+        good_env = good[ss.ENVELOPE_KEY]
+        sample = dict(good_env["rows"][0])
+        check("образец строки взят из настоящего снимка",
+              sample.get("sheet_name") == SHEET_CURRENT, str(sample.get("sheet_name")))
+        check("валидный снимок читается", shaped.get("/api/supply/sheets").status_code == 200)
+
+        # Каждый случай — реалистичная ПОЛНАЯ строка с одним испорченным полем:
+        # так проверяется именно поле, а не то, что запись «вообще куцая».
+        cases = [
+            ("issues числом (случай из отчёта ревью)", {"issues": 5}),
+            ("issues с не-строкой внутри", {"issues": ["quantity_missing", 5]}),
+            ("issues с булевым внутри", {"issues": [True]}),
+            ("issues отображением", {"issues": {"a": 1}}),
+            ("comments_raw числом", {"comments_raw": 7}),
+            ("comments_raw с не-строкой внутри", {"comments_raw": ["ок", 3]}),
+            ("sizes строкой", {"sizes": "нет"}),
+            ("sizes со значением-дробью", {"sizes": {"XS": 2.5}}),
+            ("sizes со значением-строкой", {"sizes": {"XS": "2"}}),
+            ("sizes_raw числом", {"sizes_raw": 3}),
+            ("sizes_raw со значением-числом", {"sizes_raw": {"XS": 2}}),
+            ("unknown_raw списком", {"unknown_raw": [1]}),
+            ("unknown_raw со значением-числом", {"unknown_raw": {"22": 5}}),
+            ("name числом", {"name": 5}),
+            ("sheet_name числом", {"sheet_name": 1}),
+            ("source_status_raw числом", {"source_status_raw": 0}),
+            ("is_blank единицей вместо True", {"is_blank": 1}),
+            ("source_row булевым", {"source_row": True}),
+            ("source_row строкой", {"source_row": "3"}),
+            ("anchor_row строкой", {"anchor_row": "3"}),
+            ("size_sum дробью", {"size_sum": 2.5}),
+            ("source_total булевым", {"source_total": True}),
+        ]
+        for label, patch in cases:
+            spoiled = dict(good)
+            spoiled[ss.ENVELOPE_KEY] = {**good_env, "rows": [{**sample, **patch}]}
+            blob = json.dumps(spoiled, ensure_ascii=False)
+            exec_sql("UPDATE connections SET config_json = ? WHERE id = ?",
+                     blob, conn_id)
+
+            probe = FakeGoogle()
+            ss.set_transport(probe)
+            before = _fingerprint()
+            read = shaped.get("/api/supply/sheets?limit=200")
+            check(f"GET отдаёт управляемый 409, а не 500: {label}",
+                  read.status_code == 409, f"{read.status_code} {read.text[:80]}")
+            write = shaped.post("/api/supply/sheets/refresh",
+                                json={"spreadsheet_url": SHEET_URL,
+                                      "sheet_names": [SHEET_CURRENT, SHEET_NEXT]})
+            check(f"POST тоже 409: {label}", write.status_code == 409,
+                  str(write.status_code))
+            check(f"без сети: {label}", probe.calls == [], str(probe.calls)[:70])
+            check(f"без единой записи: {label}",
+                  _diff(before, _fingerprint()) == [],
+                  str(_diff(before, _fingerprint())))
+            check(f"повреждённое оставлено как есть: {label}",
+                  sql("SELECT config_json FROM connections WHERE id = ?",
+                      conn_id)[0][0] == blob)
+
+        print("\n== В тексте отказа нет содержимого чужой таблицы ==")
+        # Содержимое источника заполняют люди, и в нём бывают личные данные.
+        # Проверяется САМЫЙ опасный случай: испорчено ровно то поле, значение
+        # которого и содержит секрет. Иначе проверка ловила бы только утечку
+        # соседнего поля и молчала бы про утечку самого значения — так первая
+        # версия этой проверки и промолчала на мутации «печатать значение».
+        secret = "СЕКРЕТНОЕ-ИМЯ-КЛИЕНТА-+7 900 000-00-00"
+        for label, patch in (
+            ("испорчено соседнее поле", {"name": secret, "issues": 5}),
+            ("испорчено само поле с секретом", {"name": [secret]}),
+            ("секрет внутри списка комментариев", {"comments_raw": [secret, 5]}),
+            ("секрет внутри отображения", {"unknown_raw": {"22": secret, "23": 5}}),
+        ):
+            spoiled = dict(good)
+            spoiled[ss.ENVELOPE_KEY] = {**good_env, "rows": [{**sample, **patch}]}
+            exec_sql("UPDATE connections SET config_json = ? WHERE id = ?",
+                     json.dumps(spoiled, ensure_ascii=False), conn_id)
+            resp = shaped.get("/api/supply/sheets")
+            check(f"отказ управляемый: {label}", resp.status_code == 409,
+                  str(resp.status_code))
+            check(f"значение строки в сообщение не попало: {label}",
+                  secret not in resp.text, resp.text[:140])
+            check(f"но поле и номер строки названы: {label}",
+                  "поле" in resp.text and "строки" in resp.text, resp.text[:140])
+
+        print("\n== Валидные снимки по-прежнему читаются ==")
+        exec_sql("UPDATE connections SET config_json = ? WHERE id = ?",
+                 json.dumps(good, ensure_ascii=False), conn_id)
+        check("текущий снимок читается",
+              shaped.get("/api/supply/sheets?limit=200").json()["total"] == 10)
+        stale = dict(good)
+        stale_rows = []
+        for row in good_env["rows"]:
+            # Строка в форме parser-1: поля `sketch_raw` она не знала, зато
+            # несла `extra_raw`. Такой снимок обязан остаться читаемым.
+            old_row = {k: v for k, v in row.items() if k != "sketch_raw"}
+            old_row["extra_raw"] = {"16": "", "19": ""}
+            stale_rows.append(old_row)
+        stale[ss.ENVELOPE_KEY] = {**good_env, "rows": stale_rows,
+                                  "parser_version": "supply-sheets-parser-1"}
+        exec_sql("UPDATE connections SET config_json = ? WHERE id = ?",
+                 json.dumps(stale, ensure_ascii=False), conn_id)
+        data = shaped.get("/api/supply/sheets?limit=200").json()
+        check("снимок прежней версии разбора читается и помечен устаревшим",
+              data["total"] == 10 and data["parser_stale"] is True, str(data["total"]))
+        check("лишнее незнакомое поле строки чтению не мешает",
+              data["rows"][0].get("extra_raw") == {"16": "", "19": ""},
+              str(data["rows"][0].get("extra_raw")))
+        exec_sql("UPDATE connections SET config_json = ? WHERE id = ?",
+                 json.dumps(good, ensure_ascii=False), conn_id)
+        check("чужой ключ config_json пережил всю матрицу",
+              json.loads(sql("SELECT config_json FROM connections WHERE id = ?",
+                             conn_id)[0][0]).get("keep_row") == {"чужое": 1})
+    finally:
+        ss.set_transport(None)
+        shaped.close()
+
+
 # ── Непрерывность снимка при смене носителя ─────────────────────────────────
 
 def _conn_rows(org_id: int):
@@ -1672,6 +1821,71 @@ def continuity_checks() -> None:  # noqa: C901 — сценарный тест: 
         check("без сети и без записей",
               probe.calls == [] and _diff(before, _fingerprint()) == [],
               str(probe.calls)[:60])
+
+        print("\n== Пустой канонический + НЕЧИТАЕМЫЙ JSON нижнего = 409 ==")
+        # Отдельно от «повреждённой версии» выше: там JSON был читаем, а снимок
+        # нет. Здесь не читается сам `config_json` нижней связи — путь другой,
+        # а обещание то же: отказ, а не «снимка нет» и не показ пустоты.
+        exec_sql("UPDATE connections SET config_json = ? WHERE id = ?",
+                 json.dumps({"ms_own": 42}), ms_id)
+        exec_sql("UPDATE connections SET config_json = ? WHERE id = ?",
+                 "{это не json", demo[0])
+        probe = FakeGoogle()
+        ss.set_transport(probe)
+        before = _fingerprint()
+        read = cont.get("/api/supply/sheets")
+        check("нечитаемый JSON нижней связи даёт 409", read.status_code == 409,
+              f"{read.status_code} {read.text[:90]}")
+        write = cont.post("/api/supply/sheets/refresh",
+                          json={"spreadsheet_url": SHEET_URL,
+                                "sheet_names": [SHEET_CURRENT, SHEET_NEXT]})
+        check("и обновление тоже 409", write.status_code == 409, str(write.status_code))
+        check("без сети и без записей",
+              probe.calls == [] and _diff(before, _fingerprint()) == [],
+              str(probe.calls)[:60])
+        check("нечитаемое содержимое не переписано",
+              _conn_by_kind(org_id, "demo")[2] == "{это не json")
+        exec_sql("UPDATE connections SET config_json = ? WHERE id = ?",
+                 demo_blob_before, demo[0])
+
+        print("\n== Переход у одной организации не задевает соседнюю ==")
+        # Дёшево, но закрывает главный страх: `ordered_carriers` фильтрует по
+        # арендатору, и обход носителей не может «дотянуться» до чужой строки.
+        neighbour = client()
+        neighbour.post("/register", data={"name": "Сосед", "email": "sheets-j@test.io",
+                                          "password": "secret123", "org_name": "Бренд-К"})
+        neighbour.post("/api/connect/demo")
+        other_id = sql("SELECT org_id FROM memberships WHERE user_id ="
+                       " (SELECT id FROM users WHERE email = 'sheets-j@test.io')")[0][0]
+        ss.set_transport(FakeGoogle())
+        neighbour.post("/api/supply/sheets/refresh",
+                       json={"spreadsheet_url": SHEET_URL,
+                             "sheet_names": [SHEET_CURRENT, SHEET_NEXT]})
+        other_blob = _conn_rows(other_id)[0][2]
+        check("у соседа есть свой снимок", ss.ENVELOPE_KEY in other_blob)
+        db = SessionLocal()
+        try:
+            ours = {c.id for c in ss.ordered_carriers(db, org_id)}
+            theirs = {c.id for c in ss.ordered_carriers(db, other_id)}
+            check("обход носителей не пересекается между организациями",
+                  not (ours & theirs), f"{sorted(ours)} vs {sorted(theirs)}")
+            found_a = ss.read_envelope(db, org_id)[0]
+            found_b = ss.read_envelope(db, other_id)[0]
+            check("каждая организация читает свой носитель",
+                  found_a.id in ours and found_b.id in theirs,
+                  f"{found_a.id} / {found_b.id}")
+        finally:
+            db.close()
+        ss.set_transport(fake)
+        before_other = _conn_rows(other_id)
+        cont.post("/api/supply/sheets/refresh",
+                  json={"spreadsheet_url": SHEET_URL,
+                        "sheet_names": [SHEET_CURRENT, SHEET_NEXT]})
+        check("обновление у переехавшей организации не тронуло соседа",
+              _conn_rows(other_id) == before_other)
+        check("и сосед по-прежнему видит свой снимок",
+              neighbour.get("/api/supply/sheets?limit=200").json()["total"] == 10)
+        neighbour.close()
 
         print("\n== Валидный канонический + повреждённый нижний: читается верхний ==")
         exec_sql("UPDATE connections SET config_json = ? WHERE id = ?",
@@ -1994,6 +2208,7 @@ def run() -> int:
     refresh_checks(owner, org_id)
     first_failure_checks()
     envelope_version_checks()
+    row_shape_checks()
     continuity_checks()
     isolation_checks(owner, member, org_id)
     structural_checks(owner)

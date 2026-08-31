@@ -1010,6 +1010,116 @@ _ENVELOPE_SHAPE: dict[str, tuple] = {
 }
 
 
+# ── Форма СТРОКИ снимка, которую потребляют API и страница ──────────────────
+#
+# Зачем это отдельно от проверки верхнего уровня. Проверять только «rows —
+# список словарей» недостаточно: дальше сервер и браузер обращаются к полям
+# строки по типу, а не по факту. Замечание ревью PR #47, воспроизведённое на
+# точном HEAD `c6919af`: строка `{"issues": 5}` проходила читателя, а потом
+# `_row_flags` делал `set(5)` и падал `TypeError` — то есть вместо обещанного
+# управляемого 409 получалась 500. То же и на стороне браузера: `comments_raw`
+# числом ломает `forEach`, `sizes` строкой молча превращает размеры в прочерки.
+#
+# Поэтому проверяются ровно те поля, которые кто-то ДЕЙСТВИТЕЛЬНО разыменовывает
+# (`preview`, `_row_flags`, `filter_rows`, `build_counts`, `templates/supply.html`),
+# и проверяются они по УЖЕ ВЫПУСКАЕМОЙ форме v1. Это не новая схема и не
+# миграция: версия envelope остаётся 1, потому что контракт не менялся — он
+# просто наконец проверяется.
+#
+# Поле проверяется, ТОЛЬКО ЕСЛИ ОНО ЕСТЬ, и ничего не требуется дополнительно.
+# Это не мягкость, а совместимость: снимок, сделанный parser-1, не знал поля
+# `sketch_raw` и знал `extra_raw`, и он обязан остаться читаемым, если его
+# фактическая форма корректна. Лишние незнакомые поля тоже допустимы — они
+# никем не разыменовываются, и запрещать их значило бы ломать снимки будущего
+# кода без всякой пользы.
+
+#: Строковые поля: идентичность, цвет, сырые ячейки, статус источника.
+_ROW_STRING_FIELDS: tuple[str, ...] = (
+    "sheet_name", "article_raw", "name_raw", "article", "name",
+    "color_raw", "qty_meters_raw", "source_total_raw", "source_status_raw",
+    "price_raw", "sketch_raw", "components_raw", "production_raw",
+)
+#: Целые. `bool` исключается явно: в Python он подкласс `int`, и `True`
+#: проехал бы как номер строки.
+_ROW_INT_FIELDS: tuple[str, ...] = ("source_row",)
+#: Целое ИЛИ None — «нет якоря», «нет суммы», «итога не было».
+_ROW_OPTIONAL_INT_FIELDS: tuple[str, ...] = ("anchor_row", "size_sum", "source_total")
+_ROW_BOOL_FIELDS: tuple[str, ...] = ("is_blank",)
+#: Списки строк: три колонки комментариев и коды неоднозначностей.
+_ROW_STRING_LIST_FIELDS: tuple[str, ...] = ("comments_raw", "issues")
+#: Отображения «ключ → строка»: сырые размеры и неизвестные колонки.
+_ROW_STRING_MAP_FIELDS: tuple[str, ...] = ("sizes_raw", "unknown_raw")
+#: Отображение «размер → целое или None».
+_ROW_OPTIONAL_INT_MAP_FIELDS: tuple[str, ...] = ("sizes",)
+
+
+def _is_int(value) -> bool:
+    return type(value) is int
+
+
+def _bad_row(index: int, field: str) -> CarrierConfigError:
+    """Отказ по строке снимка.
+
+    В сообщении НЕТ самого значения — только номер строки и имя поля. Значение
+    приехало из чужой таблицы и может содержать что угодно, включая личные
+    данные; показывать его в тексте ошибки нельзя.
+    """
+    return CarrierConfigError(
+        f"Сохранённый предпросмотр повреждён: у строки №{index + 1} поле "
+        f"«{field}» не того вида. Он оставлен как есть и не переписан."
+    )
+
+
+def _validate_row(row: dict, index: int) -> None:
+    """Минимально достаточная проверка формы строки. Fail closed."""
+    for field in _ROW_STRING_FIELDS:
+        if field in row and not isinstance(row[field], str):
+            raise _bad_row(index, field)
+
+    for field in _ROW_INT_FIELDS:
+        if field in row and not _is_int(row[field]):
+            raise _bad_row(index, field)
+
+    for field in _ROW_OPTIONAL_INT_FIELDS:
+        if field in row and row[field] is not None and not _is_int(row[field]):
+            raise _bad_row(index, field)
+
+    for field in _ROW_BOOL_FIELDS:
+        if field in row and type(row[field]) is not bool:
+            raise _bad_row(index, field)
+
+    for field in _ROW_STRING_LIST_FIELDS:
+        if field not in row:
+            continue
+        value = row[field]
+        if not isinstance(value, (list, tuple)):
+            raise _bad_row(index, field)
+        if any(not isinstance(item, str) for item in value):
+            raise _bad_row(index, field)
+
+    for field in _ROW_STRING_MAP_FIELDS:
+        if field not in row:
+            continue
+        value = row[field]
+        if not isinstance(value, dict):
+            raise _bad_row(index, field)
+        if any(not isinstance(k, str) or not isinstance(v, str)
+               for k, v in value.items()):
+            raise _bad_row(index, field)
+
+    for field in _ROW_OPTIONAL_INT_MAP_FIELDS:
+        if field not in row:
+            continue
+        value = row[field]
+        if not isinstance(value, dict):
+            raise _bad_row(index, field)
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise _bad_row(index, field)
+            if item is not None and not _is_int(item):
+                raise _bad_row(index, field)
+
+
 def _validate_envelope(envelope: dict) -> dict:
     """Снимок читаемый — или отказ. Третьего исхода нет намеренно.
 
@@ -1017,6 +1127,10 @@ def _validate_envelope(envelope: dict) -> dict:
     обещал различение версий, а код его не делал (замечание ревью PR #47).
     Снимок, написанный будущей версией или испорченный руками, интерпретировался
     бы сегодняшним читателем — то есть показывался бы человеку как правда.
+
+    Проверяется и ФОРМА СТРОК, а не только верхний уровень: см. `_validate_row`
+    и комментарий над ним. Иначе обещанный управляемый 409 превращался бы в 500
+    при первом же обращении потребителя к полю неверного типа.
 
     Fail closed, и ВАЖНО: отказ читателя ничего не переписывает. Испорченный
     снимок остаётся лежать как есть, чтобы его можно было посмотреть и понять,
@@ -1040,12 +1154,13 @@ def _validate_envelope(envelope: dict) -> dict:
                 f"Сохранённый предпросмотр повреждён: поле «{key}» не того "
                 f"вида. Он оставлен как есть и не переписан."
             )
-    for row in envelope["rows"]:
+    for index, row in enumerate(envelope["rows"]):
         if not isinstance(row, dict):
             raise CarrierConfigError(
                 "Сохранённый предпросмотр повреждён: строка снимка не является "
                 "записью. Он оставлен как есть и не переписан."
             )
+        _validate_row(row, index)
     return envelope
 
 
