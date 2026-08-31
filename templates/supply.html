@@ -279,15 +279,36 @@ document.addEventListener("DOMContentLoaded", function () {
       // прочитанных строк. Поэтому лист и позиция сбрасываются, а очередь
       // («Все / Требуют разбора / Ошибки») сохраняется: она к именам листов
       // отношения не имеет.
-      state.sheet = "";
-      resetView();
-      return load();
+      return switchView(function () { state.sheet = ""; });
     }, function () {
       // ОТКАЗ: снимок и его листы не изменились ни на байт, поэтому прежний
       // фильтр остаётся законным, а строки — на экране. Перечитываем состояние
       // только затем, чтобы стала видна причина отказа.
       return load();
     }).then(restore, restore);
+  }
+
+  // КУДА ЧЕЛОВЕКУ ИДТИ ПОСЛЕ ОТКАЗА — зависит от роли и от того, открыта ли
+  // запись. Замечание ревью PR #47 на HEAD `590b5c6`: прежний текст обещал
+  // ВСЕМ, что ссылка и имена листов «сохранены в форме выше — поправьте и
+  // попробуйте снова». Формы выше нет ни у участника (`renderForm` рисует ему
+  // подсказку про владельца), ни у владельца в readonly (там read-only блок со
+  // ссылкой на «Тарифы»). Совет, который невозможно выполнить, хуже отсутствия
+  // совета: человек ищет на экране то, чего там нет, и решает, что сломан он.
+  // Роль и состояние подписки берутся ТЕ ЖЕ, что и у формы (`ROLE`,
+  // `WRITES_BLOCKED`), — новых прав и новых источников здесь не появляется.
+  function recoveryHint() {
+    if (ROLE !== "owner") {
+      return "Ссылку на таблицу и имена листов задаёт владелец организации — "
+           + "поправить связь с источником может он.";
+    }
+    if (WRITES_BLOCKED) {
+      return "Ваши настройки сохранены и никуда не делись. Повторить чтение и "
+           + "поправить ссылку можно будет, когда вернётся доступ к записи, — "
+           + "после оплаты подписки на странице «Тарифы».";
+    }
+    return "Ссылка и имена листов сохранены в форме выше — поправьте и "
+         + "попробуйте снова.";
   }
 
   function renderError(data) {
@@ -310,8 +331,8 @@ document.addEventListener("DOMContentLoaded", function () {
     box.appendChild(el("span", null, data.last_error));
     box.appendChild(el("div", null, data.configured
       ? "Показан предыдущий успешный снимок — он не изменился."
-      : "Удачного чтения ещё не было, поэтому показывать пока нечего. "
-        + "Ссылка и имена листов сохранены в форме выше — поправьте и попробуйте снова."));
+      : "Удачного чтения ещё не было, поэтому показывать пока нечего."));
+    box.appendChild(el("div", null, recoveryHint()));
     if (data.last_attempt_at) {
       box.appendChild(el("div", null, "Попытка: " + when(data.last_attempt_at) + "."));
     }
@@ -399,24 +420,29 @@ document.addEventListener("DOMContentLoaded", function () {
     var bar = document.getElementById("sup-filters");
     clear(bar);
     var queues = [["all", "Все"], ["needs_review", "Требуют разбора"], ["invalid", "Ошибки"]];
-    queues.forEach(function (q) {
-      var b = el("button", "sup-chip" + (state.queue === q[0] ? " on" : ""), q[1]);
+    // `data-kind`/`data-value` нужны `markChips`: подсветку приходится
+    // обновлять и тогда, когда `renderFilters` не звался вовсе — например
+    // после неудачного перехода, когда рисовать нечего, а активный фильтр уже
+    // другой. Искать чип по подписи было бы связью через текст на экране.
+    function chip(kind, value, label) {
+      var b = el("button", "sup-chip", label);
+      b.setAttribute("data-kind", kind);
+      b.setAttribute("data-value", value);
       b.addEventListener("click", function () {
-        state.queue = q[0]; resetView(); load();
+        switchView(function () {
+          if (kind === "queue") { state.queue = value; } else { state.sheet = value; }
+        });
       });
       bar.appendChild(b);
-    });
+      return b;
+    }
+    queues.forEach(function (q) { chip("queue", q[0], q[1]); });
     if ((data.sheet_names || []).length) {
       bar.appendChild(el("span", "hint", "·"));
-      var all = el("button", "sup-chip" + (state.sheet === "" ? " on" : ""), "Оба листа");
-      all.addEventListener("click", function () { state.sheet = ""; resetView(); load(); });
-      bar.appendChild(all);
-      data.sheet_names.forEach(function (name) {
-        var b = el("button", "sup-chip" + (state.sheet === name ? " on" : ""), name);
-        b.addEventListener("click", function () { state.sheet = name; resetView(); load(); });
-        bar.appendChild(b);
-      });
+      chip("sheet", "", "Оба листа");
+      data.sheet_names.forEach(function (name) { chip("sheet", name, name); });
     }
+    markChips();
   }
 
   function rowNode(r, sizeLabels) {
@@ -524,15 +550,84 @@ document.addEventListener("DOMContentLoaded", function () {
       data.configured ? ("показано " + shown + " из " + data.total) : "";
     var more = document.getElementById("sup-more");
     more.style.display = shown < data.total ? "" : "none";
+    // Кнопку выключил `resetView` на входе в переход; успешный вид её
+    // возвращает. Иначе первый же переход выключал бы догрузку навсегда.
+    more.disabled = false;
   }
 
-  // Смена очереди, смена листа и УСПЕШНОЕ обновление снимка — это новое
-  // состояние: позиция обнуляется, а поколение растёт, чтобы ответ прежнего
-  // состояния, вернувшийся с опозданием, был отброшен, а не дописан.
+  // ПЕРЕХОД МЕЖДУ ФИЛЬТРАМИ АТОМАРЕН, И ЭТО ЗАМЕЧАНИЕ РЕВЬЮ PR #47 НА HEAD
+  // `590b5c6`. Прежняя редакция меняла `state.queue`/`state.sheet`, обнуляла
+  // позицию и уходила за данными — а старые строки, старый `last` и старая
+  // кнопка «Показать ещё» оставались на экране. Если новый GET падал, человек
+  // видел строки ОДНОГО фильтра под подписью ДРУГОГО, а следующий клик по
+  // «Показать ещё» уходил за `offset=50` нового фильтра и дописывал его к
+  // строкам старого. То же самое случалось после удачного обновления снимка:
+  // на сервере уже новый снимок, а на экране интерактивные строки прежнего.
+  //
+  // Поэтому новое состояние объявляется ОДНИМ ходом: поколение растёт, позиция
+  // обнуляется, `last` сбрасывается (догрузке нечего дописывать), а старые
+  // строки снимаются с экрана вместе со счётчиком и кнопкой догрузки. Экран в
+  // этот момент честно пустой и говорит, что он загружается, — пустой вид,
+  // который никого не обманывает, лучше заполненного, который обманывает.
   function resetView() {
     gen += 1;
     state.offset = 0;
     shown = 0;
+    last = null;
+    var body = document.getElementById("sup-rows");
+    clear(body);
+    document.getElementById("sup-total").textContent = "";
+    var more = document.getElementById("sup-more");
+    more.style.display = "none";
+    more.disabled = true;
+  }
+
+  // Заглушка вместо строк: одна строка таблицы с текстом и, если есть куда
+  // возвращаться, кнопкой повтора. Повтор начинает фильтр С НАЧАЛА (offset 0):
+  // ничего показанного не осталось, и продолжать неоткуда.
+  function placeholder(text, retry) {
+    var body = document.getElementById("sup-rows");
+    clear(body);
+    var tr = el("tr");
+    var td = el("td", "hint", text);
+    td.colSpan = 13;
+    if (retry) {
+      var btn = el("button", "btn sm", "Повторить");
+      btn.id = "sup-retry";
+      btn.style.marginLeft = "8px";
+      btn.addEventListener("click", retry);
+      td.appendChild(btn);
+    }
+    tr.appendChild(td);
+    body.appendChild(tr);
+  }
+
+  // Подсветка чипов приводится в соответствие с `state` СРАЗУ, а не только
+  // после успешного ответа: активный фильтр обязан описывать то, что на экране
+  // сейчас, — а сейчас там пустой/загружающийся вид нового фильтра.
+  function markChips() {
+    var bar = document.getElementById("sup-filters");
+    [].forEach.call(bar.querySelectorAll(".sup-chip"), function (b) {
+      var on = b.getAttribute("data-kind") === "queue"
+        ? state.queue === b.getAttribute("data-value")
+        : state.sheet === b.getAttribute("data-value");
+      b.className = "sup-chip" + (on ? " on" : "");
+    });
+  }
+
+  // Единственная дверь в новое состояние вида. Сначала меняется `state`, потом
+  // старый вид снимается целиком, и только успешный ответ рисует новый. Отказ
+  // не возвращает старые строки обратно — они принадлежали прежнему фильтру.
+  function switchView(mutate) {
+    if (mutate) mutate();
+    resetView();
+    markChips();
+    placeholder("Загружаем строки…", null);
+    return load().catch(function () {
+      placeholder("Не удалось загрузить строки этого фильтра. Прежние строки "
+                  + "убраны, чтобы не показывать их под новым фильтром.",
+                  function () { switchView(null); });
+    });
   }
 
   function load(append, requestedOffset) {
@@ -588,7 +683,9 @@ document.addEventListener("DOMContentLoaded", function () {
     });
   });
 
-  load();
+  // Первая загрузка идёт той же дверью: если она не удалась, человек получает
+  // не пустую таблицу без объяснений, а причину и кнопку повтора.
+  switchView(null);
 });
 </script>
 {% endblock %}

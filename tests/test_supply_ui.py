@@ -94,6 +94,11 @@ class ServerThread:
 
 
 SHEET_A, SHEET_B = "Осень 26", "НГ 26/27"
+#: Имя листа для проверок приватности. Уникальное намеренно: «Осень 26» стоит
+#: в исходнике страницы как placeholder поля формы, а `text_content("body")`
+#: захватывает и текст блока `<script>` — на таком имени проверка «его нет на
+#: экране» краснела бы по чужой причине и ничего не доказывала.
+SENTINEL_SHEET = "Щ-сентинель-Ui7Kq9Zt"
 SHEET_C, SHEET_D = "Весна 27", "Лето 27"
 SPREADSHEET_ID = "1AbCdEf_ghijklmnop-QRSTUV0123456789wxyz"
 
@@ -178,6 +183,56 @@ def write_snapshot(sheets, rows) -> None:
         cfg[ss.ENVELOPE_KEY] = envelope
         con.execute("UPDATE connections SET config_json = ? WHERE id = ?",
                     (json.dumps(cfg, ensure_ascii=False), row[0]))
+        con.commit()
+    finally:
+        con.close()
+
+
+def write_failed_attempt(sheets, detailed: str, public: str) -> None:
+    """Состояние «удачного чтения ещё не было, последняя попытка отказала».
+
+    `configured` в нём false: `spreadsheet_id` пуст, строк нет, успеха не было
+    ни одного. Ровно на этом состоянии страница и советует человеку, что делать
+    дальше, — и совет обязан подходить его роли.
+    """
+    envelope = {
+        "schema_version": ss.ENVELOPE_SCHEMA_VERSION,
+        "parser_version": ss.PARSER_VERSION,
+        "spreadsheet_id": "", "sheet_names": [],
+        "content_sha256": "",
+        "last_attempt_at": "2026-08-31T12:00:00+00:00",
+        "last_success_at": None, "fetched_at": None,
+        "last_error": detailed, "last_error_public": public,
+        "last_attempt_source": {"spreadsheet_id": SPREADSHEET_ID,
+                                "sheet_names": list(sheets)},
+        "schema": {}, "counts": ss.build_counts([], []), "rows": [],
+    }
+    con = sqlite3.connect(DB_PATH)
+    try:
+        row = con.execute("SELECT id, config_json FROM connections"
+                          " ORDER BY id LIMIT 1").fetchone()
+        cfg = json.loads(row[1] or "{}")
+        cfg[ss.ENVELOPE_KEY] = envelope
+        con.execute("UPDATE connections SET config_json = ? WHERE id = ?",
+                    (json.dumps(cfg, ensure_ascii=False), row[0]))
+        con.commit()
+    finally:
+        con.close()
+
+
+def add_member(email: str) -> None:
+    """Участник организации: приглашений в UI нет, заводим строкой в БД."""
+    import bcrypt
+
+    con = sqlite3.connect(DB_PATH)
+    try:
+        org_id = con.execute("SELECT id FROM orgs ORDER BY id LIMIT 1").fetchone()[0]
+        pw = bcrypt.hashpw(b"secret123", bcrypt.gensalt()).decode()
+        cur = con.execute(
+            "INSERT INTO users (email, pw_hash, name, created_at)"
+            " VALUES (?,?,?,datetime('now'))", (email, pw, email.split("@")[0]))
+        con.execute("INSERT INTO memberships (user_id, org_id, role)"
+                    " VALUES (?,?,'member')", (cur.lastrowid, org_id))
         con.commit()
     finally:
         con.close()
@@ -284,6 +339,14 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
         set_trial(30)
         page.goto(f"{base}/supply")
         page.wait_for_timeout(1200)
+        # Девятый дефект прошлого корректива: страница была МЕРТВА в браузере
+        # (`api is not defined` при разборе блока `scripts`, потому что
+        # `static/app.js` подключён с `defer`). Проверка стоит здесь и явно:
+        # ни одной ошибки в консоли и первый же элемент, который рисует JS.
+        check("страница ожила: скрипт дождался DOMContentLoaded",
+              not errors and page.evaluate(
+                  "() => document.querySelectorAll('#sup-rows tr').length") > 0,
+              str(errors)[:200])
         check("гейт выключен: кнопка обновления на месте",
               page.evaluate("() => !!document.getElementById('sup-refresh')") is True)
         check("и поле ссылки тоже",
@@ -515,6 +578,236 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
         summary = page.text_content("#sup-summary") or ""
         check("полный итог по-прежнему показывается числом",
               "не определено" not in summary and "10" in summary, summary[:220])
+
+        # ── 5. Переход между фильтрами атомарен ────────────────────────────
+        #
+        # Замечание ревью PR #47 на HEAD `590b5c6`. Прежняя редакция меняла
+        # `state.queue`/`state.sheet` и уходила за данными, а старые строки,
+        # старый `last` и старая кнопка догрузки оставались на экране. Отказ
+        # нового GET оставлял человека перед строками ОДНОГО фильтра под
+        # подписью ДРУГОГО, а следующий клик по «Показать ещё» уходил за
+        # `offset=50` НОВОГО фильтра и дописывал его к строкам СТАРОГО.
+        def data_rows() -> int:
+            """Строки данных, а не любые `tr`: заглушка — это тоже строка."""
+            return page.evaluate(
+                "() => document.querySelectorAll('#sup-rows td.sup-src').length")
+
+        def more_hidden() -> bool:
+            return page.evaluate(
+                "() => { const b = document.getElementById('sup-more');"
+                " return b.style.display === 'none' && b.disabled === true; }")
+
+        def active_chip(kind: str) -> str:
+            """Активный чип НУЖНОГО рода.
+
+            Чипов два ряда — очередь и лист, — и активен всегда один в каждом:
+            «первый .on в документе» отвечал бы на другой вопрос.
+            """
+            return page.evaluate(
+                "(kind) => { const on = document.querySelector("
+                "'#sup-filters .sup-chip.on[data-kind=\"' + kind + '\"]');"
+                " return on ? on.textContent : ''; }", kind)
+
+        def click_chip(label: str) -> None:
+            page.evaluate("(name) => { const b = [...document.querySelectorAll("
+                          "'#sup-filters .sup-chip')].find(x => x.textContent === name);"
+                          " if (b) b.click(); }", label)
+
+        print("\n== Отказ при смене очереди не оставляет строк прежней ==")
+        page.evaluate("() => { window.__supDelayMs = 0; window.__supDelayMatch = ''; }")
+        write_snapshot([SHEET_A, SHEET_B],
+                       [make_row(i + 1, SHEET_A) for i in range(120)]
+                       + [make_row(121, SHEET_A, invalid=True)])
+        page.goto(f"{base}/supply")
+        page.wait_for_timeout(1200)
+        check("исходно на экране первая страница прежнего фильтра",
+              data_rows() == 50 and total_line() == "показано 50 из 121",
+              f"{data_rows()} {total_line()}")
+
+        page.route(GET_RE, lambda route: route.fulfill(
+            status=502, content_type="application/json",
+            body='{"detail":"чтение снимка не удалось"}'))
+        page.evaluate("() => { window.__supCalls = []; }")
+        click_chip("Ошибки")
+        page.wait_for_timeout(900)
+        check("строк прежнего фильтра на экране не осталось",
+              data_rows() == 0, str(data_rows()))
+        check("счётчик показанного тоже не врёт о прежнем виде",
+              total_line() == "", total_line())
+        check("кнопка догрузки убрана и выключена", more_hidden() is True)
+        check("активный чип описывает НОВЫЙ (пустой) вид, а не старые строки",
+              active_chip("queue") == "Ошибки", active_chip("queue"))
+        check("человеку названа причина и дана кнопка повтора",
+              page.evaluate("() => !!document.getElementById('sup-retry')") is True,
+              page.text_content("#sup-rows") or "")
+
+        page.evaluate("() => { window.__supCalls = []; }")
+        page.evaluate("() => document.getElementById('sup-more')"
+                      ".dispatchEvent(new MouseEvent('click', {bubbles: true}))")
+        page.wait_for_timeout(600)
+        check("попытка догрузки после отказа не делает запроса вовсе",
+              get_calls() == [], str(get_calls()))
+        check("и уж точно не просит offset=50 для нового фильтра",
+              all("offset=50" not in u for u in get_calls()), str(get_calls()))
+        check("и дописывать в DOM ей тоже нечего", data_rows() == 0, str(data_rows()))
+
+        page.unroute(GET_RE)
+        page.evaluate("() => { window.__supCalls = []; }")
+        page.click("#sup-retry")
+        page.wait_for_timeout(1200)
+        retry_calls = get_calls()
+        check("повтор начинает НОВЫЙ фильтр с начала — offset=0",
+              retry_calls and "offset=0" in retry_calls[-1]
+              and "queue=invalid" in retry_calls[-1], str(retry_calls))
+        check("и показывает ровно строки нового фильтра, без примеси старых",
+              data_rows() == 1 and total_line() == "показано 1 из 1",
+              f"{data_rows()} {total_line()}")
+
+        print("\n== То же самое при смене ЛИСТА ==")
+        click_chip("Все")
+        page.wait_for_timeout(900)
+        check("вернулись к «Все»: строк снова много",
+              data_rows() == 50 and active_chip("queue") == "Все",
+              f"{data_rows()} {active_chip('queue')}")
+        page.route(GET_RE, lambda route: route.fulfill(
+            status=502, content_type="application/json",
+            body='{"detail":"чтение снимка не удалось"}'))
+        page.evaluate("() => { window.__supCalls = []; }")
+        click_chip(SHEET_A)
+        page.wait_for_timeout(900)
+        check("строк «обоих листов» под фильтром одного листа не осталось",
+              data_rows() == 0 and total_line() == "", str(data_rows()))
+        check("кнопка догрузки и здесь убрана и выключена", more_hidden() is True)
+        check("активный чип — выбранный лист, а не прежний вид",
+              active_chip("sheet") == SHEET_A, active_chip("sheet"))
+        page.evaluate("() => { window.__supCalls = []; }")
+        page.evaluate("() => document.getElementById('sup-more')"
+                      ".dispatchEvent(new MouseEvent('click', {bubbles: true}))")
+        page.wait_for_timeout(600)
+        check("догрузка по несуществующему виду запроса не делает",
+              get_calls() == [], str(get_calls()))
+        page.unroute(GET_RE)
+        page.evaluate("() => { window.__supCalls = []; }")
+        page.click("#sup-retry")
+        page.wait_for_timeout(1200)
+        retry_calls = get_calls()
+        check("повтор просит именно этот лист и с начала",
+              retry_calls and "offset=0" in retry_calls[-1]
+              and "sheet=" in retry_calls[-1], str(retry_calls))
+        check("и на экране строки только этого листа",
+              data_rows() == 50 and total_line() == "показано 50 из 121",
+              f"{data_rows()} {total_line()}")
+
+        print("\n== Удачное обновление + упавший следующий GET ==")
+        # Отдельный случай, и он НЕ сводится к предыдущим: снимок на сервере
+        # уже ДРУГОЙ, а на экране — интерактивные строки прежнего. Показывать
+        # их дальше значит показывать данные, которых на сервере больше нет.
+        write_snapshot([SHEET_A, SHEET_B], [make_row(i + 1, SHEET_A) for i in range(3)])
+        page.route(REFRESH_RE, lambda route: route.fulfill(
+            status=200, content_type="application/json",
+            body='{"ok":true,"unchanged":false}'))
+        page.goto(f"{base}/supply")
+        page.wait_for_timeout(1200)
+        check("на экране прежний снимок целиком",
+              data_rows() == 3 and total_line() == "показано 3 из 3",
+              f"{data_rows()} {total_line()}")
+        # Сервер меняет снимок ровно так, как это делает удачное обновление.
+        write_snapshot([SHEET_C, SHEET_D],
+                       [make_row(i + 1, SHEET_C) for i in range(5)])
+        page.route(GET_RE, lambda route: route.fulfill(
+            status=502, content_type="application/json",
+            body='{"detail":"чтение снимка не удалось"}'))
+        page.evaluate("() => { window.__supCalls = []; }")
+        page.click("#sup-refresh")
+        page.wait_for_timeout(1600)
+        check("строки ПРЕЖНЕГО снимка с экрана убраны",
+              data_rows() == 0 and total_line() == "", str(data_rows()))
+        check("и догрузка по ним невозможна", more_hidden() is True)
+        page.evaluate("() => { window.__supCalls = []; }")
+        page.evaluate("() => document.getElementById('sup-more')"
+                      ".dispatchEvent(new MouseEvent('click', {bubbles: true}))")
+        page.wait_for_timeout(600)
+        check("смешать два снимка догрузкой нечем",
+              get_calls() == [], str(get_calls()))
+        check("кнопка обновления при этом снова рабочая",
+              page.evaluate("() => document.getElementById('sup-refresh').disabled")
+              is False)
+        page.unroute(GET_RE)
+        page.evaluate("() => { window.__supCalls = []; }")
+        page.click("#sup-retry")
+        page.wait_for_timeout(1200)
+        retry_calls = get_calls()
+        check("повтор просит новый снимок с начала и без устаревшего листа",
+              retry_calls and "offset=0" in retry_calls[-1]
+              and "sheet=" not in retry_calls[-1], str(retry_calls))
+        check("и на экране НОВЫЙ снимок целиком, без строк прежнего",
+              data_rows() == 5 and total_line() == "показано 5 из 5",
+              f"{data_rows()} {total_line()}")
+        page.unroute(REFRESH_RE)
+
+        # ── 6. Совет после отказа подходит роли и состоянию подписки ───────
+        #
+        # Замечание ревью PR #47 (P3): прежний текст обещал ВСЕМ, что ссылка и
+        # имена листов «сохранены в форме выше — поправьте и попробуйте снова».
+        # Формы выше нет ни у участника, ни у владельца в readonly.
+        print("\n== Совет после первого отказа зависит от роли ==")
+        write_failed_attempt([SENTINEL_SHEET, SHEET_B],
+                             f"лист «{SENTINEL_SHEET}»: источник ответил 403",
+                             "лист источника: источник ответил 403")
+        page.goto(f"{base}/supply")
+        page.wait_for_timeout(1200)
+        err_text = page.text_content("#sup-error") or ""
+        check("владелец с открытой записью: причина показана целиком",
+              "403" in err_text and SENTINEL_SHEET in err_text, err_text[:200])
+        check("и совет ведёт в форму, которая у него на экране есть",
+              "в форме выше" in err_text
+              and page.evaluate("() => !!document.getElementById('sup-url')") is True,
+              err_text[:200])
+
+        set_trial(-40)
+        os.environ["OBOROT_SUBSCRIPTION_GATE"] = "1"
+        page.goto(f"{base}/supply")
+        page.wait_for_timeout(1200)
+        err_text = page.text_content("#sup-error") or ""
+        check("владелец в readonly формы не видит",
+              page.evaluate("() => !!document.getElementById('sup-url')") is False)
+        check("и совета «поправьте в форме выше» ему больше не дают",
+              "в форме выше" not in err_text, err_text[:220])
+        check("вместо этого сказано, что настройки целы и когда вернётся правка",
+              "сохранены" in err_text and "подписк" in err_text.lower(),
+              err_text[:220])
+        os.environ["OBOROT_SUBSCRIPTION_GATE"] = "0"
+        set_trial(30)
+
+        add_member("supply-ui-member@test.io")
+        mc = httpx.Client(headers={"X-Oborot-CSRF": "1"}, base_url=base, timeout=60.0)
+        mc.post("/login", data={"email": "supply-ui-member@test.io",
+                                "password": "secret123"})
+        mctx = browser.new_context(viewport={"width": 1400, "height": 900})
+        mctx.add_cookies([{"name": k, "value": v, "domain": "127.0.0.1", "path": "/"}
+                          for k, v in mc.cookies.items()])
+        mpage = mctx.new_page()
+        merrors: list[str] = []
+        mpage.on("pageerror", lambda e: merrors.append(str(e)))
+        mpage.goto(f"{base}/supply")
+        mpage.wait_for_timeout(1200)
+        m_err = mpage.text_content("#sup-error") or ""
+        check("участник формы не видит вовсе",
+              mpage.evaluate("() => !!document.getElementById('sup-url')") is False)
+        check("и ему не советуют править несуществующую форму",
+              "в форме выше" not in m_err, m_err[:220])
+        check("сказано, что поправить связь может владелец организации",
+              "владелец организации" in m_err, m_err[:220])
+        check("причина отказа участнику при этом видна и непуста",
+              "403" in m_err, m_err[:220])
+        check("а имени листа неудачной попытки на его экране нет нигде",
+              SENTINEL_SHEET not in (mpage.text_content("body") or "")
+              and SENTINEL_SHEET not in mpage.content(),
+              (mpage.text_content("#sup-error") or "")[:220])
+        check("страница участника тоже ожила, без ошибок в консоли",
+              not merrors, str(merrors)[:200])
+        mctx.close()
+        mc.close()
 
         check("на странице не было ошибок в консоли", not errors, str(errors)[:200])
         ctx.close()

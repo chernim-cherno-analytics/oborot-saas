@@ -2551,9 +2551,14 @@ def attempt_privacy_checks() -> None:
               str(theirs["attempt"]))
         check("идентификатора чужой таблицы в ответе участника нет",
               SPREADSHEET_ID not in theirs_raw)
-        check("и имён листов неудачной попытки тоже нет",
-              SHEET_CURRENT not in theirs_raw.replace(
-                  json.dumps(theirs["last_error"], ensure_ascii=False), ""),
+        # Ничего НЕ вырезается перед сравнением. Прежняя редакция убирала из
+        # текста ответа сериализованный `last_error` и только потом искала имя
+        # листа — то есть проверяла всё, кроме канала, по которому имя как раз
+        # и утекало (замечание ревью PR #47 на HEAD `590b5c6`). Проверка,
+        # которая заранее вычитает подозрительное место, доказывает меньше,
+        # чем кажется. Отдельная матрица этого канала — `failure_privacy_checks`.
+        check("и имён листов неудачной попытки тоже нет — во ВСЁМ ответе",
+              SHEET_CURRENT not in theirs_raw and SHEET_NEXT not in theirs_raw,
               theirs_raw[:200])
         check("но причина отказа участнику видна — это состояние раздела",
               "403" in theirs["last_error"], theirs["last_error"][:100])
@@ -2576,6 +2581,228 @@ def attempt_privacy_checks() -> None:
               and mine["total"] == theirs["total"], str(theirs["sheet_names"]))
         check("право обновлять по-прежнему только у владельца",
               mine["can_refresh"] is True and theirs["can_refresh"] is False)
+    finally:
+        ss.set_transport(None)
+        boss.close()
+        mate.close()
+
+
+#: Имя листа, которого нет больше нигде: ни в фикстурах, ни в коде, ни в
+#: соседних проверках. Уникальность здесь — не украшение: проверка «имени листа
+#: нет во ВСЁМ ответе участника» имеет смысл только если совпадение может быть
+#: вызвано ровно одной причиной. Обычное «Осень 26» встречается в ответе
+#: законно (это имя листа удачного снимка), и на нём проверка доказывала бы
+#: обратное тому, что нужно.
+SENTINEL_SHEET = "Щ-сентинель-Vx7Kq9Zt-текущий"
+SENTINEL_SHEET_NEXT = "Щ-сентинель-Vx7Kq9Zt-следующий"
+
+
+def failure_privacy_checks() -> None:  # noqa: C901 — сценарий, ветвлений мало
+    """Причина отказа видна обоим, но чужой ввод владельца — только владельцу.
+
+    Замечание ревью PR #47 на HEAD `590b5c6`. Предыдущий корректив убрал из
+    текста отказа содержимое ЯЧЕЙКИ источника и спрятал от участника адрес и
+    листы попытки (`attempt`), но САМ текст отказа остался общим: он собирался
+    как «лист «<имя, которое ввёл владелец>»: …», сохранялся в общий
+    `last_error` и оттуда уезжал в GET, который читает любой участник
+    организации. То есть закрытая дверь стояла рядом с открытым окном.
+
+    Здесь проверяется не формулировка, а канал: уникальное имя листа НЕ
+    ВСТРЕЧАЕТСЯ во всём ответе участника и во всём HTML страницы — включая
+    `last_error`, который прежняя проверка вырезала перед сравнением и тем
+    самым маскировала дефект. Владелец при этом сохраняет подробность: без
+    имени листа он не знает, какой из двух чинить.
+    """
+    print("\n== Имя листа неудачной попытки: владельцу да, участнику нет ==")
+    boss = client()
+    boss.post("/register", data={"name": "Приватность-2",
+                                 "email": "sheets-pv@test.io",
+                                 "password": "secret123", "org_name": "Бренд-ПВ"})
+    boss.post("/api/connect/demo")
+    org_id = sql("SELECT org_id FROM memberships WHERE user_id ="
+                 " (SELECT id FROM users WHERE email = 'sheets-pv@test.io')")[0][0]
+    conn_id = sql("SELECT id FROM connections WHERE org_id = ? ORDER BY id",
+                  org_id)[0][0]
+    add_member(org_id, "sheets-pv-m@test.io")
+    mate = client()
+    mate.post("/login", data={"email": "sheets-pv-m@test.io",
+                              "password": "secret123"})
+
+    def envelope_now() -> dict:
+        cfg = json.loads(sql("SELECT config_json FROM connections WHERE id = ?",
+                             conn_id)[0][0])
+        return cfg[ss.ENVELOPE_KEY]
+
+    def probe(label: str, expect_in_public: str) -> None:
+        """Один отказ — пять дорог наружу, и на каждой имени листа быть не должно."""
+        mine = boss.get("/api/supply/sheets?limit=200").json()
+        theirs_raw = mate.get("/api/supply/sheets?limit=200").text
+        theirs = json.loads(theirs_raw)
+        stored = envelope_now()
+
+        check(f"{label}: владелец сохраняет подробность — какой лист сломался",
+              SENTINEL_SHEET in (mine.get("last_error") or ""),
+              (mine.get("last_error") or "")[:140])
+        check(f"{label}: и она осмысленна, а не просто содержит имя",
+              expect_in_public in (mine.get("last_error") or ""),
+              (mine.get("last_error") or "")[:140])
+        # ГЛАВНАЯ проверка пакета: ничего не вырезается перед сравнением.
+        check(f"{label}: имени листа нет НИГДЕ во всём ответе участника",
+              SENTINEL_SHEET not in theirs_raw
+              and SENTINEL_SHEET_NEXT not in theirs_raw,
+              theirs_raw[:220])
+        check(f"{label}: в том числе в его last_error",
+              SENTINEL_SHEET not in (theirs.get("last_error") or ""),
+              (theirs.get("last_error") or "")[:160])
+        check(f"{label}: идентификатора чужой таблицы у участника тоже нет",
+              SPREADSHEET_ID not in theirs_raw)
+        check(f"{label}: причина у участника НЕПУСТА и осмысленна",
+              bool((theirs.get("last_error") or "").strip())
+              and expect_in_public in theirs["last_error"],
+              (theirs.get("last_error") or "")[:160])
+        check(f"{label}: HTML страницы участника имени листа не несёт",
+              SENTINEL_SHEET not in mate.get("/supply").text)
+        check(f"{label}: и HTML страницы владельца тоже (его строит JS)",
+              SENTINEL_SHEET not in boss.get("/supply").text)
+        check(f"{label}: в носителе подробный текст есть, а в общем — нет",
+              SENTINEL_SHEET in stored["last_error"]
+              and SENTINEL_SHEET not in stored["last_error_public"],
+              stored["last_error_public"][:160])
+        check(f"{label}: источник настроенным не считается ни у кого",
+              mine["configured"] is False and theirs["configured"] is False)
+
+    try:
+        # 1. Отказ транспорта: 403 на листе с сентинельным именем.
+        ss.set_transport(FakeGoogle({SENTINEL_SHEET: ss.HttpResponse(
+            403, {}, b"forbidden body", "https://docs.google.com/x")}))
+        r = boss.post("/api/supply/sheets/refresh",
+                      json={"spreadsheet_url": SHEET_URL,
+                            "sheet_names": [SENTINEL_SHEET, SENTINEL_SHEET_NEXT]})
+        check("отказ 403 доехал как 502", r.status_code == 502, r.text[:120])
+        check("и владельцу в теле 502 названо, какой именно лист",
+              SENTINEL_SHEET in r.text, r.text[:160])
+        probe("403", "403")
+
+        # 2. Дрейф заголовка: отказ рождается в парсере, а не в транспорте, —
+        #    это ДРУГАЯ ветка сборки текста, и её тоже надо пройти.
+        ss.set_transport(FakeGoogle({
+            SENTINEL_SHEET: to_csv(legacy_wrong_header_rows()),
+            SENTINEL_SHEET_NEXT: NEXT_CSV}))
+        r = boss.post("/api/supply/sheets/refresh",
+                      json={"spreadsheet_url": SHEET_URL,
+                            "sheet_names": [SENTINEL_SHEET, SENTINEL_SHEET_NEXT]})
+        check("дрейф заголовка тоже 502", r.status_code == 502, r.text[:120])
+        probe("дрейф заголовка", "заголовк")
+
+        print("\n== Тот же запрет, когда удачный снимок УЖЕ есть ==")
+        # Самое живое состояние: снимок с обычными именами прочитан и общий для
+        # обеих ролей, а неудачная попытка сделана уже с ДРУГИМИ листами.
+        # Прежний снимок при этом остаётся видимым обоим (D-51), и проверять
+        # надо ровно то, что имя листа НЕУДАВШЕЙСЯ попытки в общий вид не
+        # просочилось ни одним полем.
+        ss.set_transport(FakeGoogle())
+        ok = boss.post("/api/supply/sheets/refresh",
+                       json={"spreadsheet_url": SHEET_URL,
+                             "sheet_names": [SHEET_CURRENT, SHEET_NEXT]})
+        check("удачный снимок создан обычными листами",
+              ok.status_code == 200, ok.text[:120])
+        ss.set_transport(FakeGoogle({SENTINEL_SHEET: ss.HttpResponse(
+            500, {}, b"", "https://docs.google.com/x")}))
+        bad = boss.post("/api/supply/sheets/refresh",
+                        json={"spreadsheet_url": SHEET_URL,
+                              "sheet_names": [SENTINEL_SHEET, SENTINEL_SHEET_NEXT]})
+        check("следующая попытка другими листами отказала",
+              bad.status_code == 502, bad.text[:120])
+        theirs_raw = mate.get("/api/supply/sheets?limit=200").text
+        theirs = json.loads(theirs_raw)
+        mine = boss.get("/api/supply/sheets?limit=200").json()
+        check("прежний снимок остался виден обоим — это прежнее решение D-51",
+              theirs["configured"] is True and theirs["total"] == mine["total"] > 0
+              and theirs["sheet_names"] == [SHEET_CURRENT, SHEET_NEXT],
+              str((theirs["configured"], theirs["total"])))
+        check("а имён листов неудачной попытки нет во ВСЁМ ответе участника",
+              SENTINEL_SHEET not in theirs_raw
+              and SENTINEL_SHEET_NEXT not in theirs_raw,
+              (theirs.get("last_error") or "")[:160])
+        check("и в HTML его страницы тоже нет",
+              SENTINEL_SHEET not in mate.get("/supply").text)
+        check("причина отказа участнику при этом видна",
+              "500" in (theirs.get("last_error") or ""),
+              (theirs.get("last_error") or "")[:160])
+        check("владелец видит и подробность, и свой ввод обратно",
+              SENTINEL_SHEET in (mine.get("last_error") or "")
+              and mine["attempt"]["sheet_names"] == [SENTINEL_SHEET,
+                                                     SENTINEL_SHEET_NEXT],
+              str(mine["attempt"]["sheet_names"]))
+        check("и сам снимок неудача не тронула: хеш и время успеха прежние",
+              envelope_now()["content_sha256"] == mine["content_sha256"] != ""
+              and envelope_now()["last_success_at"] == mine["last_success_at"],
+              str(mine["content_sha256"])[:16])
+
+        print("\n== Носителю на слово не верят: общий текст перепроверяется ==")
+        # Снимок, записанный ДО разделения текстов (или после отката релиза),
+        # общего текста не несёт вовсе. Читатель не может знать, что лежит в
+        # подробном, — и обязан отдать участнику generic, а не подробность.
+        stored = envelope_now()
+        rolled_back = {k: v for k, v in stored.items() if k != "last_error_public"}
+        cfg = json.loads(sql("SELECT config_json FROM connections WHERE id = ?",
+                             conn_id)[0][0])
+        cfg[ss.ENVELOPE_KEY] = rolled_back
+        blob = json.dumps(cfg, ensure_ascii=False)
+        exec_sql("UPDATE connections SET config_json = ? WHERE id = ?",
+                 blob, conn_id)
+        theirs_raw = mate.get("/api/supply/sheets?limit=200").text
+        theirs = json.loads(theirs_raw)
+        check("снимок без общего текста читается, а не 409",
+              mate.get("/api/supply/sheets?limit=200").status_code == 200)
+        check("и участник получает generic, а не подробность прежней версии",
+              SENTINEL_SHEET not in theirs_raw
+              and theirs["last_error"] == ss.PUBLIC_FAILURE_FALLBACK,
+              theirs["last_error"][:160])
+        check("владелец при этом подробность не потерял",
+              SENTINEL_SHEET in boss.get("/api/supply/sheets").json()["last_error"])
+        check("и чтение ничего не переписало в носителе",
+              sql("SELECT config_json FROM connections WHERE id = ?",
+                  conn_id)[0][0] == blob)
+
+        # Испорченный/подложенный руками общий текст — та же история: читатель
+        # сверяет его с источником ПОПЫТКИ, а не принимает как есть.
+        cfg[ss.ENVELOPE_KEY] = {**rolled_back,
+                                "last_error_public":
+                                    f"лист «{SENTINEL_SHEET}»: подложено рукой"}
+        blob = json.dumps(cfg, ensure_ascii=False)
+        exec_sql("UPDATE connections SET config_json = ? WHERE id = ?",
+                 blob, conn_id)
+        theirs_raw = mate.get("/api/supply/sheets?limit=200").text
+        check("подложенный в носитель общий текст участнику не уезжает",
+              SENTINEL_SHEET not in theirs_raw
+              and json.loads(theirs_raw)["last_error"] == ss.PUBLIC_FAILURE_FALLBACK,
+              theirs_raw[:200])
+        check("и это чтение тоже ничего не записало",
+              sql("SELECT config_json FROM connections WHERE id = ?",
+                  conn_id)[0][0] == blob)
+
+        print("\n== Сам фильтр: что считается небезопасным текстом ==")
+        check("имя листа в тексте — замена на generic целиком",
+              ss._role_safe_failure(f"лист «{SENTINEL_SHEET}»: беда",
+                                    SPREADSHEET_ID, [SENTINEL_SHEET])
+              == ss.PUBLIC_FAILURE_FALLBACK)
+        check("идентификатор таблицы в тексте — тоже",
+              ss._role_safe_failure(f"таблица {SPREADSHEET_ID} закрыта",
+                                    SPREADSHEET_ID, [SENTINEL_SHEET])
+              == ss.PUBLIC_FAILURE_FALLBACK)
+        check("пустой текст generic'ом не остаётся пустым",
+              ss._role_safe_failure("   ", SPREADSHEET_ID, [])
+              == ss.PUBLIC_FAILURE_FALLBACK
+              and ss._role_safe_failure(None, SPREADSHEET_ID, [])
+              == ss.PUBLIC_FAILURE_FALLBACK)
+        check("чистый текст проходит как есть, а не обедняется",
+              ss._role_safe_failure("лист источника: источник ответил 500",
+                                    SPREADSHEET_ID, [SENTINEL_SHEET])
+              == "лист источника: источник ответил 500")
+        check("у каждого отказа слоя общий текст непустой",
+              bool(ss.SourceError("что-то").public)
+              and ss.SourceError("что-то", "иначе").public == "иначе")
     finally:
         ss.set_transport(None)
         boss.close()
@@ -2844,6 +3071,172 @@ def incomplete_counts_checks() -> None:  # noqa: C901 — сценарий, ве
         stale_c.close()
 
 
+def stored_counts_checks() -> None:  # noqa: C901 — матрица подмен, ветвлений мало
+    """Сводка на чтении ВЫВОДИТСЯ из строк, а не принимается по виду полей.
+
+    Замечание ревью PR #47 на HEAD `590b5c6`. Прежний читатель принимал
+    сохранённую сводку, если её поля были на месте и нужного ТИПА. Но тип — не
+    содержание: сводка с настоящим `bool` в `quantity_complete` и настоящим
+    `int` в `quantity` проезжала на экран, даже если сами числа были ложными —
+    записанными прежней версией, оставшимися от отката релиза или поправленными
+    руками. А носитель в этом слое прямо описан как «то, что оставил кто-то
+    другой»: доверять его числам по форме значит показывать человеку выдумку
+    как факт.
+
+    Проверяется поэтому не «сводка пересчитана», а РЕЗУЛЬТАТ: точные числа,
+    выведенные из тех же проверенных строк, включая имена листов и порядок.
+    И отдельно — что чтение осталось чтением: носитель байт в байт тот же,
+    сетевых вызовов ноль.
+    """
+    print("\n== Ложная сводка нужного вида на экран не попадает ==")
+    liar = client()
+    liar.post("/register", data={"name": "Ложная сводка",
+                                 "email": "sheets-cnt@test.io",
+                                 "password": "secret123", "org_name": "Бренд-Ц"})
+    liar.post("/api/connect/demo")
+    org_id = sql("SELECT org_id FROM memberships WHERE user_id ="
+                 " (SELECT id FROM users WHERE email = 'sheets-cnt@test.io')")[0][0]
+    conn_id = sql("SELECT id FROM connections WHERE org_id = ? ORDER BY id",
+                  org_id)[0][0]
+
+    # Истина этой фикстуры выписана ЧИСЛАМИ, а не выражена через ту же функцию,
+    # которую проверяем: иначе проверка сравнивала бы код сам с собой и молча
+    # соглашалась бы с любой его будущей ошибкой.
+    TRUE_TOTAL = {"rows": 10, "data_rows": 9, "needs_review": 6, "invalid": 3,
+                  "quantity": None, "quantity_known": 57,
+                  "quantity_complete": False}
+    TRUE_SHEETS = [
+        {"sheet_name": SHEET_CURRENT, "rows": 9, "data_rows": 8,
+         "needs_review": 5, "invalid": 3, "quantity": None,
+         "quantity_known": 57, "quantity_complete": False},
+        {"sheet_name": SHEET_NEXT, "rows": 1, "data_rows": 1,
+         "needs_review": 1, "invalid": 0, "quantity": None,
+         "quantity_known": 0, "quantity_complete": False},
+    ]
+
+    # Ложь СЕГОДНЯШНЕЙ формы: все поля на месте, все нужного типа, все врут.
+    # Прежний `_counts_are_current` пропускал ровно такую сводку целиком.
+    def liar_sheet(name: str) -> dict:
+        return {"sheet_name": name, "rows": 999, "data_rows": 999,
+                "needs_review": 0, "invalid": 0, "quantity": 4242,
+                "quantity_known": 4242, "quantity_complete": True}
+
+    ss.set_transport(FakeGoogle())
+    try:
+        r = liar.post("/api/supply/sheets/refresh",
+                      json={"spreadsheet_url": SHEET_URL,
+                            "sheet_names": [SHEET_CURRENT, SHEET_NEXT]})
+        check("исходный снимок создан", r.status_code == 200, r.text[:120])
+        honest = liar.get("/api/supply/sheets?limit=200").json()["counts"]
+        check("честная сводка совпала с выписанной в тесте истиной",
+              all(honest.get(k) == v for k, v in TRUE_TOTAL.items())
+              and honest.get("sheets") == TRUE_SHEETS,
+              json.dumps({k: honest.get(k) for k in TRUE_TOTAL},
+                         ensure_ascii=False))
+        # Сохранённая сводка продолжает ПИСАТЬСЯ, и это не рудимент: старый код
+        # после отката релиза читает её напрямую. Убрать её из носителя было бы
+        # не упрощением, а поломкой отката.
+        stored_counts = json.loads(sql(
+            "SELECT config_json FROM connections WHERE id = ?",
+            conn_id)[0][0])[ss.ENVELOPE_KEY]["counts"]
+        check("и она же честно записана в носитель — для отката",
+              all(stored_counts.get(k) == v for k, v in TRUE_TOTAL.items())
+              and stored_counts.get("sheets") == TRUE_SHEETS,
+              json.dumps({k: stored_counts.get(k) for k in TRUE_TOTAL},
+                         ensure_ascii=False))
+
+        fakes = {
+            "числа лгут, форма сегодняшняя": {
+                **TRUE_TOTAL, "rows": 999, "data_rows": 999, "needs_review": 0,
+                "invalid": 0, "quantity": 4242, "quantity_known": 4242,
+                "quantity_complete": True, "issues": {},
+                "sheets": [liar_sheet(SHEET_CURRENT), liar_sheet(SHEET_NEXT)]},
+            "листов нет вовсе": {
+                **TRUE_TOTAL, "quantity": 0, "quantity_known": 0,
+                "quantity_complete": True, "issues": {}, "sheets": []},
+            "имена листов чужие": {
+                **TRUE_TOTAL, "issues": {},
+                "sheets": [liar_sheet("Совсем другой лист"),
+                           liar_sheet("И ещё один")]},
+            "неполнота выдана за полноту": {
+                **TRUE_TOTAL, "quantity": 57, "quantity_complete": True,
+                "issues": {},
+                "sheets": [{**TRUE_SHEETS[0], "quantity": 57,
+                            "quantity_complete": True},
+                           {**TRUE_SHEETS[1], "quantity": 0,
+                            "quantity_complete": True}]},
+        }
+
+        for label, fake in fakes.items():
+            cfg = json.loads(sql("SELECT config_json FROM connections WHERE id = ?",
+                                 conn_id)[0][0])
+            cfg[ss.ENVELOPE_KEY] = {**cfg[ss.ENVELOPE_KEY], "counts": fake}
+            blob = json.dumps(cfg, ensure_ascii=False)
+            exec_sql("UPDATE connections SET config_json = ? WHERE id = ?",
+                     blob, conn_id)
+
+            # Сетевой счётчик обнуляется на каждой подмене: «ноль вызовов»
+            # должно относиться к ЭТОМУ GET, а не к прогону в целом.
+            watcher = FakeGoogle()
+            ss.set_transport(watcher)
+            seen = liar.get("/api/supply/sheets?limit=200").json()
+            counts = seen.get("counts") or {}
+
+            check(f"{label}: верхние числа — пересчитанные, а не сохранённые",
+                  all(counts.get(k, "нет ключа") == v
+                      for k, v in TRUE_TOTAL.items()),
+                  json.dumps({k: counts.get(k, "нет ключа") for k in TRUE_TOTAL},
+                             ensure_ascii=False))
+            check(f"{label}: листы, их имена и порядок — тоже",
+                  counts.get("sheets") == TRUE_SHEETS,
+                  json.dumps(counts.get("sheets"), ensure_ascii=False)[:220])
+            check(f"{label}: и ложное число на экран не попало",
+                  json.dumps(counts, ensure_ascii=False).find("4242") == -1,
+                  json.dumps(counts, ensure_ascii=False)[:200])
+            check(f"{label}: GET остался read-only — носитель байт в байт тот же",
+                  sql("SELECT config_json FROM connections WHERE id = ?",
+                      conn_id)[0][0] == blob)
+            check(f"{label}: и ни одного сетевого вызова",
+                  watcher.calls == [], str(watcher.calls))
+
+        print("\n== Тот же источник: ответ честен, а улику никто не «чинит» ==")
+        # Те же байты — `unchanged`: строки не переписываются, и сводка тоже.
+        # Испорченную запись обновление НЕ «лечит» перезаписью — ровно как
+        # повреждённый снимок не чинится чтением. Правду при этом обязаны
+        # говорить оба ответа: и GET, и сам ответ обновления.
+        before = sql("SELECT config_json FROM connections WHERE id = ?",
+                     conn_id)[0][0]
+        ss.set_transport(FakeGoogle())
+        again = liar.post("/api/supply/sheets/refresh",
+                          json={"spreadsheet_url": SHEET_URL,
+                                "sheet_names": [SHEET_CURRENT, SHEET_NEXT]})
+        check("те же байты — это `unchanged`",
+              again.status_code == 200 and again.json().get("unchanged") is True,
+              again.text[:150])
+        after_counts = json.loads(sql(
+            "SELECT config_json FROM connections WHERE id = ?",
+            conn_id)[0][0])[ss.ENVELOPE_KEY]["counts"]
+        check("сохранённая ложь при `unchanged` осталась лежать как была",
+              after_counts["quantity"] == 57
+              and after_counts["quantity_complete"] is True,
+              json.dumps(after_counts, ensure_ascii=False)[:160])
+        check("но ответ обновления показывает пересчитанную правду",
+              all((again.json().get("counts") or {}).get(k, "нет ключа") == v
+                  for k, v in TRUE_TOTAL.items()),
+              json.dumps(again.json().get("counts"), ensure_ascii=False)[:200])
+        check("и он совпадает с тем, что показывает GET — до единого числа",
+              again.json().get("counts") == liar.get(
+                  "/api/supply/sheets?limit=200").json()["counts"])
+        check("а строки снимка `unchanged` не тронул",
+              json.loads(before)[ss.ENVELOPE_KEY]["rows"]
+              == json.loads(sql("SELECT config_json FROM connections"
+                                " WHERE id = ?", conn_id)[0][0]
+                            )[ss.ENVELOPE_KEY]["rows"])
+    finally:
+        ss.set_transport(None)
+        liar.close()
+
+
 def continuation_checks() -> None:
     """Продолжение неполного якоря наследует неполноту вместе с идентичностью.
 
@@ -3016,8 +3409,10 @@ def run() -> int:
     first_failure_checks()
     safe_error_checks()
     attempt_privacy_checks()
+    failure_privacy_checks()
     malformed_url_checks()
     incomplete_counts_checks()
+    stored_counts_checks()
     envelope_version_checks()
     row_shape_checks()
     row_required_checks()

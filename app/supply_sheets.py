@@ -146,13 +146,41 @@ class CarrierConfigError(SupplySheetsError):
     """
 
 
+#: Причина отказа для того, кто попытки не делал, когда назвать её подробнее
+#: нельзя. Непустая и осмысленная намеренно: пустое место на экране участника
+#: значило бы «всё в порядке», а это неправда.
+PUBLIC_FAILURE_FALLBACK = ("источник не отдал таблицу в том виде, который "
+                           "«Оборот» умеет читать")
+
+
 class SourceError(SupplySheetsError):
     """Источник не отдал того, что мы умеем читать (502).
 
     Один тип на сеть, HTTP-статус, HTML-страницу входа, битый CSV, дрейф
     заголовка и превышение лимитов — потому что для пользователя все они
     означают одно: снимок не обновлён, прежний остался на месте.
+
+    У отказа ДВА текста, и это замечание ревью PR #47 на HEAD `590b5c6`.
+    Подробный (`str(exc)`) называет физический лист чужой таблицы — имя листа
+    ввёл владелец, ему же его и чинить, и без имени он не поймёт, какой из двух
+    листов сломался. Но тот же текст уезжал в общий `last_error` и оттуда — в
+    GET, который читает ЛЮБОЙ участник организации: чужой ввод владельца
+    становился видимым роли, которая попытки не делала. Поэтому рядом живёт
+    `public` — та же причина без единой строки, пришедшей от пользователя.
+
+    По умолчанию `public` равен подробному тексту: подавляющее большинство
+    отказов слоя (сеть, таймаут, редирект, предел размера) не содержит ввода
+    вовсе, и обеднять их было бы враньём наоборот. Там, где имя листа в тексте
+    есть, `public` задаётся явно — `_sheet_error()`. А последним рубежом стоит
+    `_role_safe_failure()`: перед записью общий текст сверяется с ФАКТИЧЕСКИМИ
+    строками попытки, и совпадение заменяется на generic. Дисциплина на местах
+    может однажды не сработать, проверка на чокпойнте — нет.
     """
+
+    def __init__(self, message: str, public: str | None = None):
+        super().__init__(message)
+        #: Та же причина, но без ввода владельца. Никогда не пустая.
+        self.public = public if public else message
 
 
 # ── Транспорт: инъектируемый, чтобы живого Google не было в обязательном CI ──
@@ -329,6 +357,21 @@ def _require_google_url(url: str) -> None:
         )
 
 
+# ── Отказ, у которого два адресата ───────────────────────────────────────────
+
+def _sheet_error(sheet_name: str, detail: str, where: str = "") -> SourceError:
+    """Отказ по конкретному листу: владельцу с именем листа, остальным без него.
+
+    Один конструктор на все такие отказы намеренно. Пока текст собирался на
+    месте, единственным способом не забыть про вторую роль была аккуратность
+    автора — а она масштабируется хуже, чем один helper. `detail` и `where`
+    принадлежат НАМ (наш контракт, номер колонки, номер строки), и потому
+    едут обеим ролям целиком; чужое здесь ровно одно — имя листа.
+    """
+    return SourceError(f"лист «{sheet_name}»{where}: {detail}",
+                       f"лист источника{where}: {detail}")
+
+
 # ── Загрузка одного листа ────────────────────────────────────────────────────
 
 def _fetch_url(url: str, timeout: float) -> HttpResponse:
@@ -363,14 +406,14 @@ def fetch_sheet_csv(spreadsheet_id: str, sheet_name: str,
     resp = _fetch_url(build_csv_url(spreadsheet_id, sheet_name), timeout)
 
     if resp.status in (401, 403):
-        raise SourceError(
-            f"лист «{sheet_name}»: таблица не открыта на чтение по ссылке "
-            f"(источник ответил {resp.status})"
-        )
+        raise _sheet_error(
+            sheet_name,
+            f"таблица не открыта на чтение по ссылке "
+            f"(источник ответил {resp.status})")
     if resp.status == 404:
-        raise SourceError(f"лист «{sheet_name}»: таблица или лист не найдены (404)")
+        raise _sheet_error(sheet_name, "таблица или лист не найдены (404)")
     if resp.status != 200:
-        raise SourceError(f"лист «{sheet_name}»: источник ответил {resp.status}")
+        raise _sheet_error(sheet_name, f"источник ответил {resp.status}")
 
     content_type = ""
     for key, value in (resp.headers or {}).items():
@@ -380,19 +423,18 @@ def fetch_sheet_csv(spreadsheet_id: str, sheet_name: str,
 
     body = resp.body or b""
     if len(body) > MAX_RESPONSE_BYTES:
-        raise SourceError(
-            f"лист «{sheet_name}»: ответ больше допустимых "
-            f"{MAX_RESPONSE_BYTES // 1024} КиБ"
-        )
+        raise _sheet_error(
+            sheet_name,
+            f"ответ больше допустимых {MAX_RESPONSE_BYTES // 1024} КиБ")
     if not body.strip():
-        raise SourceError(f"лист «{sheet_name}»: источник вернул пустой ответ")
+        raise _sheet_error(sheet_name, "источник вернул пустой ответ")
 
     head = body[:512].lstrip(b"\xef\xbb\xbf").lstrip().lower()
     if content_type.startswith("text/html") or head.startswith((b"<!doctype", b"<html")):
-        raise SourceError(
-            f"лист «{sheet_name}»: источник вернул страницу входа, а не CSV — "
-            f"похоже, таблица закрыта и её просят открыть после авторизации"
-        )
+        raise _sheet_error(
+            sheet_name,
+            "источник вернул страницу входа, а не CSV — похоже, таблица "
+            "закрыта и её просят открыть после авторизации")
     return body
 
 
@@ -539,9 +581,8 @@ def decode_csv(sheet_name: str, blob: bytes) -> list[list[str]]:
     try:
         text = blob.decode("utf-8-sig")
     except UnicodeDecodeError:
-        raise SourceError(
-            f"лист «{sheet_name}»: ответ не читается как текст UTF-8"
-        ) from None
+        raise _sheet_error(
+            sheet_name, "ответ не читается как текст UTF-8") from None
 
     rows: list[list[str]] = []
     reader = csv.reader(io.StringIO(text, newline=""))
@@ -552,26 +593,24 @@ def decode_csv(sheet_name: str, blob: bytes) -> list[list[str]]:
         except StopIteration:
             break
         except csv.Error:
-            raise SourceError(f"лист «{sheet_name}»: CSV не разбирается") from None
+            raise _sheet_error(sheet_name, "CSV не разбирается") from None
         index += 1
         if index > MAX_ROWS_PER_SHEET:
             # Fail closed ровно здесь: строку с номером limit+1 мы уже увидели,
             # и этого достаточно, чтобы знать ответ. Читать дальше незачем.
-            raise SourceError(
-                f"лист «{sheet_name}»: строк больше допустимых {MAX_ROWS_PER_SHEET}"
-            )
+            raise _sheet_error(
+                sheet_name,
+                f"строк больше допустимых {MAX_ROWS_PER_SHEET}")
         if len(raw) > MAX_COLUMNS:
-            raise SourceError(
-                f"лист «{sheet_name}», строка {index}: колонок больше "
-                f"допустимых {MAX_COLUMNS}"
-            )
+            raise _sheet_error(
+                sheet_name, f"колонок больше допустимых {MAX_COLUMNS}",
+                f", строка {index}")
         cells = []
         for value in raw:
             if len(value) > MAX_CELL_CHARS:
-                raise SourceError(
-                    f"лист «{sheet_name}», строка {index}: ячейка длиннее "
-                    f"{MAX_CELL_CHARS} символов"
-                )
+                raise _sheet_error(
+                    sheet_name, f"ячейка длиннее {MAX_CELL_CHARS} символов",
+                    f", строка {index}")
             cells.append(value.strip())
         rows.append(cells)
     return rows
@@ -605,45 +644,43 @@ def check_header(sheet_name: str, rows: list[list[str]]) -> dict:
     свою таблицу и увидел расхождение своими глазами — а больше и не нужно.
     """
     if len(rows) < 2:
-        raise SourceError(
-            f"лист «{sheet_name}»: нет двух строк заголовка, которых требует формат"
-        )
+        raise _sheet_error(
+            sheet_name, "нет двух строк заголовка, которых требует формат")
     row1, row2 = rows[0], rows[1]
 
     for col, expected in sorted(ROW1_REQUIRED_HEADERS.items()):
         actual = _cell(row1, col)
         if actual != expected:
-            raise SourceError(
-                f"лист «{sheet_name}»: формат заголовка изменился — в колонке "
-                f"{col} ожидалась подпись «{expected}», а стоит другое "
-                f"(содержимое ячейки здесь не показывается)"
-            )
+            raise _sheet_error(
+                sheet_name,
+                f"формат заголовка изменился — в колонке {col} ожидалась "
+                f"подпись «{expected}», а стоит другое "
+                f"(содержимое ячейки здесь не показывается)")
 
     # Уникальность подписей каркаса. «Комментарии» сюда не входит: их в
     # источнике честно три подряд, и повтор там — норма, а не дрейф.
     for label in ROW1_UNIQUE_HEADERS:
         seen = [col for col in range(1, len(row1) + 1) if _cell(row1, col) == label]
         if len(seen) != 1:
-            raise SourceError(
-                f"лист «{sheet_name}»: подпись «{label}» встречается в строке "
-                f"заголовка {len(seen)} раз(а) (колонки {seen or '—'}), а должна "
-                f"ровно один — какая из них задаёт каркас, мы не угадываем"
-            )
+            raise _sheet_error(
+                sheet_name,
+                f"подпись «{label}» встречается в строке заголовка "
+                f"{len(seen)} раз(а) (колонки {seen or '—'}), а должна ровно "
+                f"один — какая из них задаёт каркас, мы не угадываем")
 
     for col in ROW1_REQUIRED_EMPTY:
         actual = _cell(row1, col)
         if actual != "":
-            raise SourceError(
-                f"лист «{sheet_name}»: формат заголовка изменился — колонка "
-                f"{col} читается как артикул и обязана быть без заголовка, "
-                f"а она не пуста (содержимое ячейки здесь не показывается)"
-            )
+            raise _sheet_error(
+                sheet_name,
+                f"формат заголовка изменился — колонка {col} читается как "
+                f"артикул и обязана быть без заголовка, а она не пуста "
+                f"(содержимое ячейки здесь не показывается)")
 
     article_column = NAME_COLUMN - 1
     if article_column < 1:
-        raise SourceError(
-            f"лист «{sheet_name}»: перед «Наименование» нет колонки артикула"
-        )
+        raise _sheet_error(
+            sheet_name, "перед «Наименование» нет колонки артикула")
 
     # Размерная горка. Пять последовательных колонок; крайние подписаны всегда,
     # три промежуточные либо пусты (объединённая ячейка), либо подписаны ровно
@@ -654,40 +691,39 @@ def check_header(sheet_name: str, rows: list[list[str]]) -> dict:
         actual = _cell(row2, col)
         if offset in (0, len(SIZE_LABELS) - 1):
             if actual != label:
-                raise SourceError(
-                    f"лист «{sheet_name}»: размерная горка не опознана — в "
-                    f"колонке {col} ожидалась подпись «{label}», а стоит другое "
-                    f"(содержимое ячейки здесь не показывается)"
-                )
+                raise _sheet_error(
+                    sheet_name,
+                    f"размерная горка не опознана — в колонке {col} ожидалась "
+                    f"подпись «{label}», а стоит другое "
+                    f"(содержимое ячейки здесь не показывается)")
         elif actual == "":
             inferred.append(label)
         elif actual != label:
-            raise SourceError(
-                f"лист «{sheet_name}»: размерная горка не опознана — в колонке "
-                f"{col} ожидалась пустая ячейка или подпись «{label}», а стоит "
-                f"другое (содержимое ячейки здесь не показывается)"
-            )
+            raise _sheet_error(
+                sheet_name,
+                f"размерная горка не опознана — в колонке {col} ожидалась "
+                f"пустая ячейка или подпись «{label}», а стоит другое "
+                f"(содержимое ячейки здесь не показывается)")
     band = set(range(SIZE_BAND_START, SIZE_BAND_START + len(SIZE_LABELS)))
     for col in range(1, len(row2) + 1):
         if col in band:
             continue
         if _cell(row2, col) in ("XS", "XL"):
-            raise SourceError(
-                f"лист «{sheet_name}»: за пределами размерной горки найдена "
-                f"вторая метка размера в колонке {col} — какая из них настоящая, "
-                f"мы не угадываем"
-            )
+            raise _sheet_error(
+                sheet_name,
+                f"за пределами размерной горки найдена вторая метка размера в "
+                f"колонке {col} — какая из них настоящая, мы не угадываем")
 
     # Итог и цена. Подпись либо отсутствует, либо ровно ожидаемая.
     trailing: dict[int, str] = {}
     for col, expected in sorted(ROW2_OPTIONAL_LABELS.items()):
         actual = _cell(row2, col)
         if actual not in ("", expected):
-            raise SourceError(
-                f"лист «{sheet_name}»: колонка {col} читается по позиции и "
-                f"должна быть либо без подписи, либо подписана «{expected}» — "
-                f"а подписана иначе (содержимое ячейки здесь не показывается)"
-            )
+            raise _sheet_error(
+                sheet_name,
+                f"колонка {col} читается по позиции и должна быть либо без "
+                f"подписи, либо подписана «{expected}» — а подписана иначе "
+                f"(содержимое ячейки здесь не показывается)")
         trailing[col] = actual
 
     # Свободные колонки: те, которым этот слой НЕ назначает смысла. Их
@@ -1002,9 +1038,10 @@ def _quantity_summary(data_rows: list[dict]) -> dict:
 def build_counts(rows: list[dict], sheet_names: list[str]) -> dict:
     """Сводка по листам, строкам и количествам.
 
-    Считается при импорте и ПЕРЕСЧИТЫВАЕТСЯ на чтении, если сохранённая сводка
-    сделана прежней версией разбора (`_counts_view`): иначе снимок `parser-1` и
-    `parser-2` продолжал бы показывать свой частичный итог как окончательный.
+    Считается при импорте И ЗАНОВО на каждом чтении (`_counts_view`):
+    сохранённой сводке верить нельзя — она могла быть записана прежней версией
+    разбора, остаться после отката или быть поправленной рукой, и тогда её
+    число показывалось бы человеку как факт.
     Функция чистая — ни базы, ни времени, ни записи.
     """
     per_sheet: list[dict] = []
@@ -1037,51 +1074,31 @@ def build_counts(rows: list[dict], sheet_names: list[str]) -> dict:
     }
 
 
-def _counts_are_current(counts) -> bool:
-    """Несёт ли сохранённая сводка сегодняшний контракт полноты — целиком.
+def _counts_view(rows: list[dict], sheet_names: list[str]) -> dict:
+    """Сводка для ЧТЕНИЯ. Всегда пересчитанная из строк — и это весь алгоритм.
 
-    Смотрим на НАЛИЧИЕ и ВИД полей, а не на версию парсера: снимок мог быть
-    записан какой угодно версией и какой угодно рукой, а вопрос ровно один —
-    можно ли доверять его числу «штук». Проверяется и верхний уровень, и каждый
-    лист: сводка, у которой контракт есть только сверху, наполовину старая.
+    ЗАЧЕМ ИМЕННО ТАК. Прежняя редакция принимала сохранённую сводку, если её
+    поля были на месте и нужного ВИДА (`_counts_are_current`). Замечание ревью
+    PR #47 на HEAD `590b5c6`: вид — это не содержание. Сводка, у которой
+    `quantity_complete` действительно `bool`, а `quantity` действительно
+    целое, проезжала в API и на экран, даже если само число было неверным —
+    записанным прежней версией, оставшимся от отката или поправленным руками.
+    Носитель здесь прямо описан как «то, что оставил кто-то другой»
+    (`_ENVELOPE_SHAPE`), и доверять его числам по типу — значит доверять им по
+    форме, а показываем мы их человеку как факт.
+
+    Строки того же снимка к этому моменту уже проверены целиком
+    (`_validate_row`), а `build_counts` — чистая функция от них. Значит
+    правдивая сводка выводится, и выводить её ДЕШЕВЛЕ, чем сравнивать
+    сохранённую с выведенной: сравнение всё равно требует полного пересчёта,
+    а потом ещё и решения, что делать с расхождением.
+
+    Сохранённая сводка при этом продолжает ПИСАТЬСЯ (`refresh`) — она нужна
+    старому коду после отката релиза. Просто читатель на неё больше не
+    опирается. Носитель не трогается ни одним байтом: GET остаётся строго
+    read-only, «починить» чужую запись перезаписью — ровно та операция,
+    которой в чтении быть не должно.
     """
-    if not isinstance(counts, dict):
-        return False
-
-    def ok(block) -> bool:
-        if not isinstance(block, dict):
-            return False
-        if type(block.get("quantity_complete")) is not bool:
-            return False
-        if not _is_int(block.get("quantity_known")):
-            return False
-        value = block.get("quantity")
-        return value is None or _is_int(value)
-
-    sheets = counts.get("sheets")
-    if not isinstance(sheets, list):
-        return False
-    return ok(counts) and all(ok(sheet) for sheet in sheets)
-
-
-def _counts_view(envelope: dict, rows: list[dict], sheet_names: list[str]) -> dict:
-    """Сводка для ЧТЕНИЯ: сохранённая, если ей можно верить, иначе пересчитанная.
-
-    ЗАЧЕМ. Снимок, сделанный `parser-1`/`parser-2`, несёт сводку, в которой
-    «штук» — безусловная сумма, то есть неполный итог, выданный за
-    окончательный. Показывать его человеку как факт нельзя: смысл числа
-    изменился, а число осталось прежним. Лечится это первым же обновлением
-    (версия парсера входит в `content_sha256`), но до обновления экран обязан
-    говорить правду.
-
-    Поэтому сводка пересчитывается ЗДЕСЬ, из уже проверенных строк того же
-    снимка, и только для показа. Носитель при этом не трогается ни одним
-    байтом: GET остаётся строго read-only, а «починить» чужую запись
-    перезаписью — это ровно та операция, которой в чтении быть не должно.
-    """
-    stored = envelope.get("counts")
-    if _counts_are_current(stored):
-        return stored
     return build_counts(rows, sheet_names)
 
 
@@ -1171,6 +1188,16 @@ _ENVELOPE_SHAPE: dict[str, tuple] = {
     "last_error": (str,),
     "counts": (dict,),
     "rows": (list,),
+}
+
+#: Поля верхнего уровня, появившиеся ПОЗЖЕ первого выпуска v1. Проверяются по
+#: типу, но обязательными быть не могут: снимок, записанный до них (или после
+#: отката релиза), обязан читаться дальше — иначе «совместимость с откатом»
+#: была бы обещанием, а не свойством. Та же логика, что у `sketch_raw` в
+#: строке. Версия envelope от появления такого поля НЕ поднимается: контракт
+#: не менялся, к нему добавилось необязательное наблюдение.
+_ENVELOPE_OPTIONAL_SHAPE: dict[str, tuple] = {
+    "last_error_public": (str,),
 }
 
 
@@ -1366,6 +1393,14 @@ def _validate_envelope(envelope: dict) -> dict:
                 f"Сохранённый предпросмотр повреждён: поле «{key}» не того "
                 f"вида. Он оставлен как есть и не переписан."
             )
+    for key, types in _ENVELOPE_OPTIONAL_SHAPE.items():
+        if key not in envelope:
+            continue
+        if not isinstance(envelope[key], types) or isinstance(envelope[key], bool):
+            raise CarrierConfigError(
+                f"Сохранённый предпросмотр повреждён: поле «{key}» не того "
+                f"вида. Он оставлен как есть и не переписан."
+            )
     for index, row in enumerate(envelope["rows"]):
         if not isinstance(row, dict):
             raise CarrierConfigError(
@@ -1462,6 +1497,7 @@ def _skeleton(spreadsheet_id: str, sheet_names: list[str]) -> dict:
         "last_success_at": None,
         "fetched_at": None,
         "last_error": "",
+        "last_error_public": "",
         "last_attempt_source": {"spreadsheet_id": spreadsheet_id,
                                 "sheet_names": list(sheet_names)},
         "schema": {},
@@ -1470,21 +1506,54 @@ def _skeleton(spreadsheet_id: str, sheet_names: list[str]) -> dict:
     }
 
 
+def _role_safe_failure(text, spreadsheet_id: str, sheet_names: list[str]) -> str:
+    """Последний рубеж privacy: в общем тексте нет ни одной строки владельца.
+
+    Замечание ревью PR #47 на HEAD `590b5c6`, и защита здесь СТРУКТУРНАЯ, а не
+    дисциплинарная. Текст отказа собирается в двух десятках мест; требовать от
+    каждого будущего места помнить про вторую роль — значит поставить приватность
+    в зависимость от внимательности. Поэтому перед самой записью общий текст
+    сверяется с ФАКТИЧЕСКИМИ строками этой попытки: идентификатором таблицы и
+    именами обоих листов, как их прислал владелец. Совпало — текст заменяется
+    на generic целиком, а не «затирается звёздочками»: частично затёртая строка
+    всё ещё рассказывает её длину и форму.
+
+    Пустой результат тоже недопустим: участник, у которого причина отказа
+    пропала, видит пустой раздел и читает его как «всё в порядке».
+    """
+    if not isinstance(text, str) or not text.strip():
+        return PUBLIC_FAILURE_FALLBACK
+    owned = [value for value in ([spreadsheet_id] + list(sheet_names))
+             if isinstance(value, str) and value.strip()]
+    if any(value in text for value in owned):
+        return PUBLIC_FAILURE_FALLBACK
+    return text
+
+
 def _record_failure(db: Session, org_id: int, spreadsheet_id: str,
-                    sheet_names: list[str], attempt_at: str, message: str) -> None:
+                    sheet_names: list[str], attempt_at: str,
+                    exc: SourceError) -> None:
     """Отметить неудачу, НЕ тронув прежний успешный снимок.
 
-    Меняются ровно три поля: время попытки, её источник и безопасный текст
-    ошибки. `content_sha256`, `rows`, `fetched_at` и `last_success_at` остаются
-    теми же — иначе неудачное обновление стирало бы единственное, что у
-    пользователя есть, и «не получилось» превращалось бы в «данных больше нет».
+    Меняются ровно четыре поля: время попытки, её источник и ДВА текста ошибки —
+    подробный и общий. `content_sha256`, `rows`, `fetched_at` и
+    `last_success_at` остаются теми же — иначе неудачное обновление стирало бы
+    единственное, что у пользователя есть, и «не получилось» превращалось бы в
+    «данных больше нет».
+
+    Два текста, а не один, потому что читателей у этого поля двое. Владелец
+    ввёл ссылку и имена листов, ему их и чинить — он получает подробную
+    причину с именем листа. Участник попытки не делал, и чужой ввод владельца
+    ему не адресован — он получает ту же причину без единой строки владельца.
     """
     existing = get_envelope(db, org_id)
     envelope = dict(existing) if existing else _skeleton(spreadsheet_id, sheet_names)
     envelope["last_attempt_at"] = attempt_at
     envelope["last_attempt_source"] = {"spreadsheet_id": spreadsheet_id,
                                        "sheet_names": list(sheet_names)}
-    envelope["last_error"] = message
+    envelope["last_error"] = str(exc)
+    envelope["last_error_public"] = _role_safe_failure(
+        getattr(exc, "public", None), spreadsheet_id, sheet_names)
     _store(db, org_id, envelope)
 
 
@@ -1545,7 +1614,7 @@ def refresh(db: Session, org_id: int, spreadsheet_url: str, sheet_names,
                 rows.extend(parsed)
                 schema[name] = sheet_schema
         except SourceError as exc:
-            _record_failure(db, org_id, spreadsheet_id, names, attempt_at, str(exc))
+            _record_failure(db, org_id, spreadsheet_id, names, attempt_at, exc)
             raise
 
         digest = content_hash(spreadsheet_id, names, blobs)
@@ -1560,6 +1629,7 @@ def refresh(db: Session, org_id: int, spreadsheet_url: str, sheet_names,
             envelope["last_attempt_source"] = {"spreadsheet_id": spreadsheet_id,
                                                "sheet_names": list(names)}
             envelope["last_error"] = ""
+            envelope["last_error_public"] = ""
             _store(db, org_id, envelope)
             return {
                 "unchanged": True,
@@ -1570,7 +1640,7 @@ def refresh(db: Session, org_id: int, spreadsheet_url: str, sheet_names,
                 # прежней версией разбора, здесь тоже пересчитанная — два
                 # разных ответа про одни и те же строки были бы расхождением
                 # интерфейса и расчёта.
-                "counts": _counts_view(envelope, envelope.get("rows") or [],
+                "counts": _counts_view(envelope.get("rows") or [],
                                        list(names)),
             }
 
@@ -1585,6 +1655,7 @@ def refresh(db: Session, org_id: int, spreadsheet_url: str, sheet_names,
             "last_success_at": now,
             "fetched_at": now,
             "last_error": "",
+            "last_error_public": "",
             "last_attempt_source": {"spreadsheet_id": spreadsheet_id,
                                     "sheet_names": list(names)},
             "schema": schema,
@@ -1597,7 +1668,7 @@ def refresh(db: Session, org_id: int, spreadsheet_url: str, sheet_names,
             # остаётся на месте, а пользователь получает причину.
             _guard_envelope_size(envelope)
         except SourceError as exc:
-            _record_failure(db, org_id, spreadsheet_id, names, attempt_at, str(exc))
+            _record_failure(db, org_id, spreadsheet_id, names, attempt_at, exc)
             raise
         _store(db, org_id, envelope)
         return {
@@ -1693,6 +1764,43 @@ def _attempt_view(source) -> dict:
     }
 
 
+def _error_view(envelope: dict, role: str) -> str:
+    """Причина последнего отказа так, как её можно показать ЭТОЙ роли.
+
+    Владельцу — подробный текст: имена листов и ссылку вводил он, чинить их
+    ему, и без имени листа он не знает, какой из двух листов сломался.
+
+    Участнику — общий текст, сохранённый рядом (`last_error_public`). Его нет
+    вовсе, если снимок записан кодом ДО разделения текстов или откатом; тогда
+    что лежит в подробном тексте, читатель знать не может, и fail closed:
+    участник получает generic.
+
+    И общий текст, откуда бы он ни взялся, ПЕРЕПРОВЕРЯЕТСЯ здесь той же
+    функцией, что и при записи, — против `last_attempt_source` самого снимка.
+    Причина та же, по которой сводка на чтении пересчитывается, а не берётся
+    из носителя: носитель — это то, что оставил кто-то другой (прежняя версия,
+    откат, чужая рука), и доверять его содержимому по факту наличия нельзя.
+    Проверка на чтении дороже нуля и дешевле утечки.
+
+    Пустым результат при непустой причине не бывает никогда: пустая причина
+    читалась бы как «всё в порядке», а это неправда.
+    """
+    detailed = envelope.get("last_error") or ""
+    if role == "owner":
+        return detailed if isinstance(detailed, str) else ""
+    if not (isinstance(detailed, str) and detailed):
+        return ""
+    source = envelope.get("last_attempt_source")
+    source = source if isinstance(source, dict) else {}
+    raw_id = source.get("spreadsheet_id")
+    names = source.get("sheet_names")
+    return _role_safe_failure(
+        envelope.get("last_error_public"),
+        raw_id if isinstance(raw_id, str) else "",
+        [n for n in names if isinstance(n, str)] if isinstance(names, list) else [],
+    )
+
+
 def preview(db: Session, org_id: int, role: str, sheet: str | None = None,
             queue: str = "all", offset: int = 0, limit: int = 50) -> dict:
     """Страница снимка для GET. Только чтение, ни одной мутации."""
@@ -1777,7 +1885,9 @@ def preview(db: Session, org_id: int, role: str, sheet: str | None = None,
         "last_success_at": envelope.get("last_success_at"),
         "last_attempt_at": envelope.get("last_attempt_at"),
         "fetched_at": envelope.get("fetched_at"),
-        "last_error": envelope.get("last_error") or "",
+        # Причина отказа видна ОБЕИМ ролям: это состояние раздела, а не чужой
+        # ввод. Но подробность у неё разная — см. `_error_view`.
+        "last_error": _error_view(envelope, role),
         "content_sha256": envelope.get("content_sha256") or "",
         "parser_version": envelope.get("parser_version") or "",
         "schema_version": envelope.get("schema_version"),
@@ -1802,7 +1912,7 @@ def preview(db: Session, org_id: int, role: str, sheet: str | None = None,
         # делала, не уезжают.
         "attempt": (_attempt_view(envelope.get("last_attempt_source"))
                     if role == "owner" else _attempt_view(None)),
-        "counts": _counts_view(envelope, rows, sheet_names),
+        "counts": _counts_view(rows, sheet_names),
         "total": len(selected),
         "rows": out_rows,
     })
