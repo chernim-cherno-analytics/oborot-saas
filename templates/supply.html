@@ -1,0 +1,447 @@
+{% extends "base.html" %}
+{% block content %}
+{#
+  SUPPLY-2 (D-51): предпросмотр внешней производственной таблицы.
+
+  Вся таблица строится DOM-API (createElement + textContent), а не сборкой
+  строки разметки. Это не стилистика: содержимое приходит из ЧУЖОЙ таблицы,
+  которую заполняют люди, и единственный способ гарантировать, что «<img
+  onerror=…>» останется текстом, — никогда не отдавать его innerHTML.
+  Единственная ссылка наружу собрана сервером из сохранённого идентификатора и
+  ведёт в новую вкладку с rel="noopener"; iframe чужого документа здесь нет
+  сознательно — встроить его значило бы отдать чужому origin кусок экрана.
+#}
+<style>
+  .sup-wrap { max-width: 1400px; }
+  .sup-note { border: 1px solid var(--amber, #d99a2b); background: rgba(217,154,43,.10);
+              border-radius: 10px; padding: 12px 14px; font-size: 13px; line-height: 1.55;
+              color: var(--ink-2); margin-bottom: 14px; }
+  .sup-note b { color: var(--ink); }
+  .sup-form { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; }
+  .sup-form .field { display: flex; flex-direction: column; gap: 4px; min-width: 190px; }
+  .sup-form .field.wide { flex: 1 1 380px; }
+  .sup-form label { font-size: 12px; color: var(--ink-3); }
+  .sup-form input { width: 100%; padding: 7px 10px; border: 1px solid var(--line);
+                    border-radius: 8px; background: var(--surface); font-size: 13px;
+                    color: var(--ink); }
+  .sup-sum { display: flex; flex-wrap: wrap; gap: 10px; }
+  .sup-tile { border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px;
+              min-width: 150px; background: var(--surface); }
+  .sup-tile .k { font-size: 11.5px; color: var(--ink-3); }
+  .sup-tile .v { font-size: 18px; font-weight: 800; font-variant-numeric: tabular-nums; }
+  .sup-bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .sup-chip { font-size: 12px; padding: 5px 12px; border-radius: 20px; cursor: pointer;
+              border: 1px solid var(--line); background: var(--surface); color: var(--ink-2); }
+  .sup-chip.on { background: var(--ink); color: var(--surface); border-color: var(--ink); }
+  .sup-scroll { overflow-x: auto; }
+  table.sup { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  table.sup th, table.sup td { border-bottom: 1px solid var(--line); padding: 7px 8px;
+                               text-align: left; vertical-align: top; }
+  table.sup th { font-size: 11px; color: var(--ink-3); font-weight: 700; white-space: nowrap; }
+  table.sup td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  table.sup tr.blank td { color: var(--ink-3); font-style: italic; }
+  table.sup tr.bad { background: rgba(200,60,60,.06); }
+  table.sup tr.warn { background: rgba(217,154,43,.07); }
+  .sup-src { font-variant-numeric: tabular-nums; white-space: nowrap; color: var(--ink-3); }
+  .sup-name { font-weight: 700; }
+  .sup-inherit { color: var(--ink-3); font-weight: 400; }
+  .sup-raw { color: var(--ink-2); max-width: 260px; word-break: break-word; }
+  .sup-badge { display: inline-block; font-size: 10.5px; line-height: 1.5; padding: 1px 7px;
+               border-radius: 20px; margin: 1px 3px 1px 0; white-space: normal; }
+  .sup-badge.warn { background: rgba(217,154,43,.18); color: #7a5410; }
+  .sup-badge.bad { background: rgba(200,60,60,.15); color: #8c2020; }
+  .sup-badge.hint { background: rgba(31,31,31,.08); color: var(--ink-3); }
+  .sup-err { border: 1px solid rgba(200,60,60,.45); background: rgba(200,60,60,.08);
+             border-radius: 10px; padding: 10px 14px; font-size: 12.5px; color: #8c2020; }
+  @media (max-width: 760px) {
+    .sup-form .field, .sup-form .field.wide { min-width: 100%; flex: 1 1 100%; }
+    .sup-tile { min-width: 46%; flex: 1 1 46%; }
+    table.sup { font-size: 12px; }
+    .sup-raw { max-width: 160px; }
+  }
+</style>
+
+<div class="sup-wrap">
+
+  {# Подпись приходит с сервера (`disclaimer`), но её текст продублирован здесь
+     на случай пустого ответа: экран не должен показать ни одной цифры чужой
+     таблицы без объяснения, чем она НЕ является. #}
+  <div class="sup-note" id="sup-note">
+    <b>Предпросмотр источника — ещё не партия «Оборота» и не учитывается в «Едет».</b>
+    Это то, что сейчас написано в вашей производственной таблице, как есть.
+    «Оборот» ничего отсюда не заказывает, ни с чем не связывает и в расчёты не берёт:
+    ни в «Едет», ни в «В заказе», ни в оборачиваемость.
+  </div>
+
+  <div class="card" id="sup-setup-card">
+    <div class="card-head"><h2>Источник</h2><div class="spacer"></div>
+      <span class="hint" id="sup-src-link"></span></div>
+    <div class="card-body">
+      <div id="sup-form-wrap"></div>
+      <div class="hint" id="sup-state" style="margin-top:10px;">Загрузка…</div>
+      <div class="sup-err" id="sup-error" style="display:none;margin-top:10px;"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-head"><h2>Сводка</h2></div>
+    <div class="card-body">
+      <div class="sup-sum" id="sup-summary"><div class="loading-stub">Загрузка…</div></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-head"><h2>Строки листов</h2><div class="spacer"></div>
+      <span class="hint" id="sup-total"></span></div>
+    <div class="card-body">
+      <div class="sup-bar" id="sup-filters" style="margin-bottom:10px;"></div>
+      <div class="sup-scroll">
+        <table class="sup">
+          <thead>
+            <tr>
+              <th>Лист · строка</th>
+              <th>Артикул</th>
+              <th>Наименование</th>
+              <th>Цвет</th>
+              <th class="num">XS</th><th class="num">S</th><th class="num">M</th>
+              <th class="num">L</th><th class="num">XL</th>
+              <th class="num">Итог источника</th>
+              <th class="num">Сумма размеров</th>
+              <th>Статус и комментарии источника</th>
+              <th>Что не так</th>
+            </tr>
+          </thead>
+          <tbody id="sup-rows"></tbody>
+        </table>
+      </div>
+      <div style="margin-top:12px;">
+        <button class="btn sm" id="sup-more" style="display:none;">Показать ещё</button>
+      </div>
+    </div>
+  </div>
+
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+  var ROLE = "{{ role }}";
+  var state = { sheet: "", queue: "all", offset: 0, limit: 50 };
+  var last = null;
+
+  function el(tag, cls, text) {
+    var node = document.createElement(tag);
+    if (cls) node.className = cls;
+    // textContent, а не innerHTML: всё, что ниже, приходит из чужой таблицы.
+    if (text !== undefined && text !== null) node.textContent = String(text);
+    return node;
+  }
+  function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
+  function num(v) { return (v === null || v === undefined) ? "—" : String(v); }
+  function when(iso) {
+    if (!iso) return "никогда";
+    var d = new Date(iso);
+    return isNaN(d.getTime()) ? String(iso) : d.toLocaleString("ru-RU");
+  }
+
+  function renderForm(data) {
+    var wrap = document.getElementById("sup-form-wrap");
+    clear(wrap);
+    if (ROLE !== "owner") {
+      var ro = el("div", "hint");
+      ro.textContent = data.configured
+        ? "Источник настраивает владелец организации. Вам доступен просмотр."
+        : "Источник ещё не настроен. Настроить его может владелец организации.";
+      wrap.appendChild(ro);
+      return;
+    }
+    var form = el("div", "sup-form");
+
+    function field(id, label, value, cls, placeholder) {
+      var f = el("div", "field" + (cls ? " " + cls : ""));
+      var l = el("label", null, label);
+      l.setAttribute("for", id);
+      var i = el("input");
+      i.type = "text";
+      i.id = id;
+      i.value = value || "";
+      if (placeholder) i.placeholder = placeholder;
+      f.appendChild(l); f.appendChild(i);
+      return f;
+    }
+
+    form.appendChild(field("sup-url", "Ссылка на таблицу Google Sheets",
+      data.spreadsheet_url, "wide",
+      "https://docs.google.com/spreadsheets/d/…"));
+    form.appendChild(field("sup-cur", "Текущий лист",
+      (data.sheet_names || [])[0] || "", null, "Осень 26"));
+    form.appendChild(field("sup-next", "Следующий лист",
+      (data.sheet_names || [])[1] || "", null, "НГ 26/27"));
+
+    var act = el("div", "field");
+    act.appendChild(el("label", null, " "));
+    var btn = el("button", "btn primary", "Обновить предпросмотр");
+    btn.id = "sup-refresh";
+    btn.addEventListener("click", function () { refresh(btn); });
+    act.appendChild(btn);
+    form.appendChild(act);
+    wrap.appendChild(form);
+  }
+
+  function refresh(btn) {
+    var url = (document.getElementById("sup-url") || {}).value || "";
+    var cur = (document.getElementById("sup-cur") || {}).value || "";
+    var nxt = (document.getElementById("sup-next") || {}).value || "";
+    btn.disabled = true;
+    btn.textContent = "Читаем таблицу…";
+    api("/api/supply/sheets/refresh", {
+      method: "POST",
+      body: { spreadsheet_url: url, sheet_names: [cur, nxt] }
+    }).then(function (res) {
+      toast(res.unchanged
+        ? "Источник не изменился — показан прежний снимок."
+        : "Предпросмотр обновлён.", res.unchanged ? "" : "ok");
+      state.offset = 0;
+      return load();
+    }).catch(function () {
+      // Текст ошибки уже показан тостом внутри api(); здесь только
+      // перечитываем состояние, чтобы человек увидел: прежний снимок цел.
+      return load();
+    }).then(function () {
+      btn.disabled = false;
+      btn.textContent = "Обновить предпросмотр";
+    });
+  }
+
+  function renderState(data) {
+    var line = document.getElementById("sup-state");
+    clear(line);
+    if (!data.carrier_present) {
+      line.appendChild(el("span", null,
+        "Предпросмотру негде храниться: у организации нет основного подключения. " +
+        "Подключите МойСклад или демо-данные в Настройках."));
+      return;
+    }
+    if (!data.configured) {
+      line.appendChild(el("span", null,
+        "Источник ещё не читался. Вставьте ссылку, укажите два листа и нажмите «Обновить предпросмотр»."));
+      return;
+    }
+    line.appendChild(el("span", null, "Последнее успешное чтение: " + when(data.last_success_at) + "."));
+    line.appendChild(el("span", null, " Последняя попытка: " + when(data.last_attempt_at) + "."));
+    if (data.sheet_names && data.sheet_names.length) {
+      line.appendChild(el("span", null,
+        " Листы: " + data.sheet_names.join(" · ") + "."));
+    }
+
+    var link = document.getElementById("sup-src-link");
+    clear(link);
+    if (data.spreadsheet_url) {
+      var a = el("a", null, "Открыть исходную таблицу");
+      a.href = data.spreadsheet_url;         // собрана сервером, не пользователем
+      a.target = "_blank";
+      a.rel = "noopener noreferrer";
+      link.appendChild(a);
+    }
+
+    var box = document.getElementById("sup-error");
+    if (data.last_error) {
+      box.style.display = "";
+      clear(box);
+      box.appendChild(el("b", null, "Последнее обновление не удалось: "));
+      box.appendChild(el("span", null, data.last_error));
+      box.appendChild(el("div", null,
+        "Показан предыдущий успешный снимок — он не изменился."));
+    } else {
+      box.style.display = "none";
+      clear(box);
+    }
+  }
+
+  function tile(k, v) {
+    var t = el("div", "sup-tile");
+    t.appendChild(el("div", "k", k));
+    t.appendChild(el("div", "v", v));
+    return t;
+  }
+
+  function renderSummary(data) {
+    var box = document.getElementById("sup-summary");
+    clear(box);
+    var c = data.counts || {};
+    if (!data.configured) {
+      box.appendChild(el("div", "hint", "Пока нечего показывать."));
+      return;
+    }
+    (c.sheets || []).forEach(function (s) {
+      box.appendChild(tile("Лист «" + s.sheet_name + "» · строк",
+        s.data_rows + " из " + s.rows));
+      box.appendChild(tile("Лист «" + s.sheet_name + "» · штук", s.quantity));
+    });
+    box.appendChild(tile("Требуют разбора", c.needs_review || 0));
+    box.appendChild(tile("Ошибки", c.invalid || 0));
+  }
+
+  function renderFilters(data) {
+    var bar = document.getElementById("sup-filters");
+    clear(bar);
+    var queues = [["all", "Все"], ["needs_review", "Требуют разбора"], ["invalid", "Ошибки"]];
+    queues.forEach(function (q) {
+      var b = el("button", "sup-chip" + (state.queue === q[0] ? " on" : ""), q[1]);
+      b.addEventListener("click", function () {
+        state.queue = q[0]; state.offset = 0; load();
+      });
+      bar.appendChild(b);
+    });
+    if ((data.sheet_names || []).length) {
+      bar.appendChild(el("span", "hint", "·"));
+      var all = el("button", "sup-chip" + (state.sheet === "" ? " on" : ""), "Оба листа");
+      all.addEventListener("click", function () { state.sheet = ""; state.offset = 0; load(); });
+      bar.appendChild(all);
+      data.sheet_names.forEach(function (name) {
+        var b = el("button", "sup-chip" + (state.sheet === name ? " on" : ""), name);
+        b.addEventListener("click", function () { state.sheet = name; state.offset = 0; load(); });
+        bar.appendChild(b);
+      });
+    }
+  }
+
+  function rowNode(r, sizeLabels) {
+    var tr = el("tr", r.is_blank ? "blank" : (r.invalid ? "bad" : (r.needs_review ? "warn" : "")));
+
+    var src = el("td", "sup-src");
+    src.appendChild(el("div", null, r.sheet_name));
+    src.appendChild(el("div", null, "строка " + r.source_row));
+    if (!r.is_blank && r.anchor_row && r.anchor_row !== r.source_row) {
+      src.appendChild(el("div", null, "продолжение строки " + r.anchor_row));
+    }
+    tr.appendChild(src);
+
+    if (r.is_blank) {
+      var empty = el("td", null, "пустая строка-разделитель");
+      empty.colSpan = 12;
+      tr.appendChild(empty);
+      return tr;
+    }
+
+    var art = el("td", r.article_raw ? "sup-name" : "sup-inherit");
+    art.textContent = r.article || "—";
+    tr.appendChild(art);
+
+    var nm = el("td", r.name_raw ? "sup-name" : "sup-inherit");
+    nm.textContent = r.name || "—";
+    if (r.suggestion && r.suggestion.status !== "none") {
+      nm.appendChild(el("div", "sup-badge hint", r.suggestion.label));
+    }
+    tr.appendChild(nm);
+
+    tr.appendChild(el("td", "sup-raw", r.color_raw || "—"));
+
+    sizeLabels.forEach(function (label) {
+      var value = r.sizes ? r.sizes[label] : null;
+      var raw = (r.sizes_raw || {})[label] || "";
+      var td = el("td", "num");
+      if (value !== null && value !== undefined) {
+        td.textContent = String(value);
+      } else if (raw) {
+        // Нечисловое содержимое ячейки размера показывается как есть и
+        // подписывается ошибкой: ноль здесь был бы выдумкой.
+        td.textContent = raw;
+        td.className = "num sup-raw";
+      } else {
+        td.textContent = "—";
+      }
+      tr.appendChild(td);
+    });
+
+    var total = el("td", "num");
+    total.textContent = (r.source_total !== null && r.source_total !== undefined)
+      ? String(r.source_total)
+      : (r.source_total_raw || "—");
+    tr.appendChild(total);
+
+    tr.appendChild(el("td", "num", num(r.size_sum)));
+
+    var notes = el("td", "sup-raw");
+    // Три колонки комментариев источника выводятся как три отдельные строки:
+    // в таблице это три разные колонки, и человек ищет свою пометку там, где
+    // он её написал. `source_status_raw` — первая непустая из них, отдельной
+    // строкой не дублируется.
+    (r.comments_raw || []).forEach(function (c) {
+      if (c) notes.appendChild(el("div", null, c));
+    });
+    if (r.qty_meters_raw) notes.appendChild(el("div", null, "ткань: " + r.qty_meters_raw));
+    if (r.production_raw) notes.appendChild(el("div", null, "производство: " + r.production_raw));
+    if (r.components_raw) notes.appendChild(el("div", null, "комплектующие: " + r.components_raw));
+    Object.keys(r.unknown_raw || {}).forEach(function (col) {
+      notes.appendChild(el("div", null, "колонка " + col + ": " + r.unknown_raw[col]));
+    });
+    if (!notes.firstChild) notes.textContent = "—";
+    tr.appendChild(notes);
+
+    var issues = el("td");
+    (r.issues || []).forEach(function (code, i) {
+      var label = (r.labels || [])[i] || code;
+      issues.appendChild(el("span",
+        "sup-badge " + (r.invalid && (code === "invalid_quantity" || code === "total_mismatch") ? "bad" : "warn"),
+        label));
+    });
+    if (!issues.firstChild) issues.textContent = "—";
+    tr.appendChild(issues);
+    return tr;
+  }
+
+  function renderRows(data, append) {
+    var body = document.getElementById("sup-rows");
+    if (!append) clear(body);
+    var labels = data.size_labels || ["XS", "S", "M", "L", "XL"];
+    (data.rows || []).forEach(function (r) { body.appendChild(rowNode(r, labels)); });
+    if (!body.firstChild) {
+      var tr = el("tr");
+      var td = el("td", "hint", data.configured
+        ? "В этом фильтре строк нет."
+        : "Источник ещё не читался.");
+      td.colSpan = 13;
+      tr.appendChild(td);
+      body.appendChild(tr);
+    }
+    var shown = state.offset + (data.rows || []).length;
+    document.getElementById("sup-total").textContent =
+      data.configured ? ("показано " + shown + " из " + data.total) : "";
+    var more = document.getElementById("sup-more");
+    more.style.display = shown < data.total ? "" : "none";
+  }
+
+  function load(append) {
+    var q = "?queue=" + encodeURIComponent(state.queue) +
+            "&offset=" + state.offset + "&limit=" + state.limit +
+            (state.sheet ? "&sheet=" + encodeURIComponent(state.sheet) : "");
+    return api("/api/supply/sheets" + q).then(function (data) {
+      last = data;
+      if (data.disclaimer) {
+        var note = document.getElementById("sup-note");
+        clear(note);
+        note.appendChild(el("b", null, data.disclaimer));
+        note.appendChild(el("span", null,
+          " Это то, что сейчас написано в вашей производственной таблице, как есть. " +
+          "«Оборот» ничего отсюда не заказывает, ни с чем не связывает и в расчёты не берёт."));
+      }
+      if (!append) renderForm(data);
+      renderState(data);
+      renderSummary(data);
+      renderFilters(data);
+      renderRows(data, append);
+    });
+  }
+
+  document.getElementById("sup-more").addEventListener("click", function () {
+    if (!last) return;
+    state.offset += state.limit;
+    load(true);
+  });
+
+  load();
+})();
+</script>
+{% endblock %}

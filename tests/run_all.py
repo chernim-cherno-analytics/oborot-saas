@@ -115,6 +115,11 @@ SUITES = [
     # телеграма ему не нужно — внешних систем этот слой не касается вовсе, и
     # проверка этого входит в сам набор.
     ("supply",      "test_supply.py",          False, False),
+    # SUPPLY-2 (D-51): read-only предпросмотр внешних Google Sheets. Набор
+    # офлайновый по построению: транспорт инъектируется, живого Google в
+    # обязательном CI нет вовсе, а мок МойСклада ему не нужен — этот слой
+    # МойСклад не трогает, и проверка этого входит в сам набор.
+    ("supply_sheets", "test_supply_sheets.py",  False, False),
     ("consist",     "test_consistency.py",     False, False),
     ("canon",       "test_turnover_canon.py",  False, False),
     # Замок на формулы потребности и largest-remainder (DATA-11). Стоит рядом
