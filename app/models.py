@@ -1,5 +1,6 @@
 """ORM-модели. Все бизнес-таблицы несут org_id — мультитенантность обязательна."""
 import json
+import uuid
 from datetime import date, datetime
 
 from sqlalchemy import (
@@ -16,10 +17,10 @@ from sqlalchemy import (
     inspect,
     text,
 )
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, validates
 from sqlalchemy.types import TypeDecorator
 
-from app.db import Base, engine, run_migration_once
+from app.db import Base, engine, run_migration_once, run_migration_step
 
 
 class TolerantDate(TypeDecorator):
@@ -643,6 +644,37 @@ def encode_items_payload(items: list[dict], pushed_by_base: dict[str, float] | N
     )
 
 
+# ── SUPPLY-1: неизменяемый идентификатор партии (CC_BATCH_ID) ────────────────
+#
+# Решение владельца 31.08.2026 (DECISIONS D-49): центральная система цепочки
+# снабжения — «Оборот», и у каждой партии, которая в нём рождается, обязан быть
+# один собственный идентификатор, переживающий любые внешние системы. Первый
+# слой (D-50) вводит его ровно там, где партия сегодня появляется: в
+# `production_orders` — то есть в oborot_tracked flow по D-28. Всё, что
+# приезжает из МойСклада, по определению legacy flow и своего CC_BATCH_ID в
+# этом слое не получает.
+#
+# Формат: `CCB-<год>-<полный uuid4 hex>` — 41 символ при колонке VARCHAR(48).
+#
+#   * префикс `CCB-` и год читаются человеком: по идентификатору, названному
+#     вслух или вставленному в переписку, видно, что это партия «Оборота» и
+#     какого она года. Смыслом расчёта год не является и ни во что не входит;
+#   * uuid4 ЦЕЛИКОМ, а не обрезанный: обрезка ради красоты — это молчаливый
+#     обмен уникальности на длину, а идентификатор партии живёт дольше, чем
+#     любое удобство чтения;
+#   * uuid4, а НЕ производный от `id` заказа: `id` в SQLite — переиспользуемый
+#     rowid (то же основание, что у `ms_sync_id`, см. ниже). Производный ключ
+#     связал бы новую партию с идентификатором давно удалённой.
+CC_BATCH_ID_PREFIX = "CCB"
+CC_BATCH_ID_MAX_LEN = 48
+
+
+def new_cc_batch_id(year: int | None = None) -> str:
+    """Новый CC_BATCH_ID. Год — только префикс для чтения, по умолчанию текущий."""
+    y = int(year) if year else datetime.utcnow().year
+    return f"{CC_BATCH_ID_PREFIX}-{y:04d}-{uuid.uuid4().hex}"
+
+
 class ProductionOrder(Base):
     __tablename__ = "production_orders"
 
@@ -736,6 +768,46 @@ class ProductionOrder(Base):
     # Без неё найти «из какого расчёта вырос этот заказ» можно только
     # перебором планов организации.
     order_plan_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    # SUPPLY-1 (D-49/D-50): собственный неизменяемый идентификатор партии.
+    #
+    # Значение по умолчанию — ГЕНЕРАТОР, а не пустая строка: ни одна строка,
+    # вставленная этим кодом через ORM, не может остаться без идентификатора,
+    # какой бы ручкой её ни создали. Пустая строка остаётся возможной ровно в
+    # одном случае — её вставил процесс со СТАРЫМ кодом (деплой без простоя,
+    # откат релиза): он про эту колонку не знает, и `server_default=''`
+    # позволяет его INSERT'у пройти. Такие строки лечит условный backfill на
+    # старте (`backfill_cc_batch_ids`), а не одноразовая миграция.
+    #
+    # Генератор обёрнут в лямбду без аргументов намеренно: SQLAlchemy зовёт
+    # Python-side default с ExecutionContext, если у функции есть позиционный
+    # параметр. У `new_cc_batch_id(year=None)` он есть — пусть и со значением
+    # по умолчанию, — и полагаться на то, как библиотека посчитает «сколько
+    # тут обязательных позиционных», здесь незачем.
+    cc_batch_id: Mapped[str] = mapped_column(
+        String(CC_BATCH_ID_MAX_LEN), nullable=False,
+        default=lambda: new_cc_batch_id(), server_default="",
+    )
+
+    @validates("cc_batch_id")
+    def _cc_batch_id_is_immutable(self, _key: str, value: str) -> str:
+        """Непустой идентификатор партии не переписывается — никогда и ничем.
+
+        «Неизменяемый» в решении владельца — это свойство данных, а не обещание
+        в комментарии: пока запрет держится только дисциплиной вызывающих, он
+        держится ровно до первой ручки, которая «просто обновит поле». Переход
+        '' → значение разрешён (это и есть backfill/первичная выдача), обратный
+        и любой другой — ошибка программиста, а не ситуация выбора.
+
+        На загрузку строки из базы валидатор не срабатывает: он слушает
+        присваивание атрибута, а не materialization.
+        """
+        current = getattr(self, "cc_batch_id", "") or ""
+        if current and value != current:
+            raise ValueError(
+                f"cc_batch_id неизменяем: попытка заменить {current!r} на {value!r}"
+            )
+        return value
 
     @property
     def items(self) -> list[dict]:
@@ -904,6 +976,34 @@ _PRODUCTION_MIGRATION_FLAG = "productions_conditions_v1"
 # SEC-3: колонка версии сессии у старых баз, где её ещё нет.
 _USERS_SESSION_VERSION_MIGRATION_FLAG = "users_session_version_v1"
 
+# SUPPLY-1 (D-50): уникальность идентификатора партии внутри организации —
+# и ТОЛЬКО для непустых значений.
+#
+# Почему частичный индекс, а не обычный UNIQUE. Пустая строка здесь не
+# «значение», а признак «строку вставил старый код и её ещё не вылечили»
+# (см. ProductionOrder.cc_batch_id). Обычный UNIQUE(org_id, cc_batch_id)
+# запретил бы ДВЕ невылеченные строки одной организации — то есть ровно тот
+# случай, ради совместимости с которым пустая строка и разрешена: откат
+# релиза, при котором старый код создаёт заказы пачкой. Замок превратился бы
+# в отказ создавать заказы.
+#
+# Портируемость. `CREATE UNIQUE INDEX IF NOT EXISTS ... WHERE <предикат>` —
+# частичный индекс, он есть и в SQLite (с 3.8.0, 2013), и в PostgreSQL;
+# `IF NOT EXISTS` у индексов PostgreSQL понимает с 9.5. Ни одного
+# диалект-специфичного выражения в предикате нет: сравнение с литералом ''
+# одинаково в обоих. Тем же конструктором (`CREATE UNIQUE INDEX IF NOT
+# EXISTS`) в проекте уже создаётся `ux_migration_ledger_order` (app/db.py).
+# Исполнением это проверено на SQLite (tests/test_supply.py) — живого
+# PostgreSQL в проекте нет ни на проде, ни в тестах (PROJECT_STATE.md,
+# DECISIONS «по умолчанию»), и большего утверждать нечем.
+_CC_BATCH_ID_INDEX_DDL = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_production_orders_cc_batch_id "
+    "ON production_orders (org_id, cc_batch_id) WHERE cc_batch_id <> ''"
+)
+# Страница backfill: заказов у организации сотни, а не миллионы, но читать
+# таблицу целиком одним запросом всё равно незачем.
+_CC_BATCH_BACKFILL_PAGE = 500
+
 
 def ensure_schema(bind=None) -> None:
     """Прогоняет все аддитивные ALTER-миграции моделей этого файла.
@@ -924,6 +1024,7 @@ def ensure_schema(bind=None) -> None:
     eng = bind or engine
     _ensure_productions_conditions(eng)
     _ensure_users_session_version(eng)
+    _ensure_production_orders_cc_batch_id(eng)
 
 
 def _ensure_productions_conditions(eng) -> None:
@@ -965,3 +1066,111 @@ def _ensure_users_session_version(eng) -> None:
         ))
 
     run_migration_once(_USERS_SESSION_VERSION_MIGRATION_FLAG, _add_column, bind=eng)
+
+
+def _cc_batch_year(created_at) -> int | None:
+    """Год создания заказа для читаемого префикса; None — если не разобрать."""
+    if isinstance(created_at, datetime):
+        return created_at.year
+    head = str(created_at or "")[:4]
+    return int(head) if head.isdigit() else None
+
+
+def backfill_cc_batch_ids(bind=None) -> int:
+    """Выдаёт CC_BATCH_ID строкам `production_orders`, у которых его ещё нет.
+
+    Возвращает число строк, которые этот процесс ОТПРАВИЛ на лечение. Это
+    диагностика, а не утверждение «столько строк я и вылечил»: в гонке
+    соседний воркер мог успеть первым, и тогда наш UPDATE не тронул ничего.
+    Гарантия здесь держится не счётчиком, а условием в WHERE ниже.
+
+    Почему это НЕ разовая миграция под флагом. Одноразовый flag описывает мир,
+    в котором пустых строк после миграции больше не появляется. Здесь это
+    неверно: деплой идёт без простоя, а релиз бывает откачен. Рядом с новым
+    процессом живёт старый код, который про колонку не знает; его INSERT
+    проходит по `server_default=''` и создаёт НОВУЮ пустую строку уже ПОСЛЕ
+    того, как флаг проставлен. С флагом такая строка осталась бы без
+    идентификатора навсегда. Поэтому шаг условный и выполняется на каждом
+    старте: он читает ровно пустые строки, и на здоровой базе это один
+    дешёвый SELECT, который ничего не находит.
+
+    Обратной ошибки — «переписать чужой непустой ID» — здесь нет по
+    построению: и выборка, и сам UPDATE отбирают только пустые значения, а
+    условие в UPDATE повторено намеренно. Между SELECT и UPDATE строку мог
+    вылечить сосед; повторённое условие означает, что тогда наш UPDATE не
+    тронет ни одной строки вместо того, чтобы затереть его идентификатор
+    своим.
+
+    Год в префиксе берётся из `created_at` самой строки, а не из «сегодня»:
+    партия 2025 года, вылеченная в 2026-м, не должна называть себя партией
+    2026-го. Нечитаемая дата (её могло не быть у совсем старых строк) —
+    честный откат на текущий год: год здесь читаемая подпись, а не факт, на
+    котором что-то считается.
+
+    Про `run_migration_step`: он глушит ошибки вида «то же самое уже сделал
+    соседний процесс». Для ЭТОГО UPDATE такой ошибкой могло бы стать разве
+    что столкновение двух uuid4 внутри одной организации — то есть событие,
+    которого не бывает; ничего осмысленного этот помощник здесь не прячет, а
+    даёт нужное поведение при `database is locked`.
+    """
+    eng = bind or engine
+    insp = inspect(eng)
+    if not insp.has_table("production_orders"):
+        return 0
+    cols = {c["name"] for c in insp.get_columns("production_orders")}
+    if "cc_batch_id" not in cols:
+        return 0
+
+    filled, seen = 0, set()
+    while True:
+        with eng.connect() as conn:
+            rows = conn.execute(
+                text("SELECT id, created_at FROM production_orders "
+                     "WHERE cc_batch_id IS NULL OR cc_batch_id = '' "
+                     "ORDER BY id LIMIT :n"),
+                {"n": _CC_BATCH_BACKFILL_PAGE},
+            ).all()
+        # Страницу берём по одному и тому же условию, поэтому вторая итерация
+        # обязана вернуть ДРУГИЕ строки. Если вернулись те же самые — лечить
+        # их нечем, и крутиться на месте хуже, чем выйти: выход останавливает
+        # цикл, а следующий старт попробует снова.
+        fresh = [(rid, created) for rid, created in rows if rid not in seen]
+        if not fresh:
+            return filled
+        for row_id, created_at in fresh:
+            seen.add(row_id)
+            run_migration_step(
+                "UPDATE production_orders SET cc_batch_id = :v WHERE id = :i "
+                "AND (cc_batch_id IS NULL OR cc_batch_id = '')",
+                {"v": new_cc_batch_id(_cc_batch_year(created_at)), "i": row_id},
+                bind=eng,
+            )
+            filled += 1
+
+
+def _ensure_production_orders_cc_batch_id(eng) -> None:
+    """SUPPLY-1 (D-49/D-50): колонка партии, её замок уникальности и backfill.
+
+    Порядок трёх шагов не случаен: колонка → индекс → лечение пустых строк.
+    Индекс заводится ДО backfill, чтобы дубль не мог проскочить в промежутке,
+    и `IF NOT EXISTS` делает шаг идемпотентным на свежей базе, где колонка
+    пришла из модели (create_all), — сам индекс в модели не объявлен, потому
+    что он частичный (см. `_CC_BATCH_ID_INDEX_DDL`).
+
+    Откат релиза этим шагом не ломается: старый код колонку не выбирает и не
+    заполняет, а `NOT NULL DEFAULT ''` позволяет его INSERT'у пройти. Обратный
+    ход (forward) снова доводит пустые строки до идентификаторов.
+    """
+    insp = inspect(eng)
+    if not insp.has_table("production_orders"):
+        return
+    cols = {c["name"] for c in insp.get_columns("production_orders")}
+    if "cc_batch_id" not in cols:
+        run_migration_step(
+            "ALTER TABLE production_orders "
+            f"ADD COLUMN cc_batch_id VARCHAR({CC_BATCH_ID_MAX_LEN}) "
+            "NOT NULL DEFAULT ''",
+            bind=eng,
+        )
+    run_migration_step(_CC_BATCH_ID_INDEX_DDL, bind=eng)
+    backfill_cc_batch_ids(bind=eng)

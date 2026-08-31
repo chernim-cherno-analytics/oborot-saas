@@ -109,6 +109,12 @@ SUITES = [
     ("logging",     "test_logging.py",         False, False),
     ("subscr",      "test_subscription.py",    False, False),
     ("exec",        "test_execution.py",       False, False),
+    # SUPPLY-1 (D-49/D-50): неизменяемый CC_BATCH_ID партии — миграция и
+    # условный backfill на старой схеме, единый идентификатор во всех ручках
+    # заказов, показ на /replenish. Набор офлайновый: ни мока МойСклада, ни
+    # телеграма ему не нужно — внешних систем этот слой не касается вовсе, и
+    # проверка этого входит в сам набор.
+    ("supply",      "test_supply.py",          False, False),
     ("consist",     "test_consistency.py",     False, False),
     ("canon",       "test_turnover_canon.py",  False, False),
     # Замок на формулы потребности и largest-remainder (DATA-11). Стоит рядом

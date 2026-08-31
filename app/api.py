@@ -161,6 +161,13 @@ def _order_out(order: ProductionOrder) -> dict:
         "received_at": order.received_at.isoformat() if order.received_at else None,
         "order_plan_id": order.order_plan_id,
         "lead_time_fact_days": _lead_time_fact(order),
+        # SUPPLY-1 (D-49/D-50): собственный неизменяемый идентификатор партии.
+        # Отдаётся ОДНИМ полем из одного места — поэтому список, открытые
+        # заказы и карточка заказа не могут разойтись в том, как называется
+        # одна и та же партия. Пустая строка возможна только у строки,
+        # созданной откатившимся старым кодом и ещё не вылеченной ближайшим
+        # стартом; выдумывать вместо неё что-то читаемое было бы враньём.
+        "cc_batch_id": order.cc_batch_id or "",
     }
 
 
@@ -413,7 +420,11 @@ def api_create_order(
     if not body.allow_duplicate:
         twin = _find_twin_order(db, ctx.org.id, fingerprint)
         if twin is not None:
+            # Партия та же самая — значит и CC_BATCH_ID тот же (D-50). Новый
+            # идентификатор здесь означал бы «вторая партия», а весь смысл
+            # ветки — что второй партии не создано.
             return {"ok": True, "id": twin.id, "status": twin.status,
+                    "cc_batch_id": twin.cc_batch_id or "",
                     "duplicate": True, "message": _DUPLICATE_ORDER_MESSAGE}
     order = ProductionOrder(
         org_id=ctx.org.id,
@@ -434,10 +445,16 @@ def api_create_order(
             db.delete(order)
             db.commit()
             return {"ok": True, "id": twin.id, "status": twin.status,
+                    "cc_batch_id": twin.cc_batch_id or "",
                     "duplicate": True, "message": _DUPLICATE_ORDER_MESSAGE}
     # Снапшот не роняем: черновик не меняет ни остатков, ни «едет к нам»
     # (см. api_order_plan_apply) — кэш сбрасывается при переводе в производство.
-    return {"ok": True, "id": order.id, "status": "draft"}
+    #
+    # cc_batch_id клиент не выбирает и прислать не может: в OrderIn такого поля
+    # нет, лишние поля тела pydantic отбрасывает, а значение приходит из
+    # серверного генератора модели (D-50).
+    return {"ok": True, "id": order.id, "status": "draft",
+            "cc_batch_id": order.cc_batch_id or ""}
 
 
 def _items_and_pushed(items_json) -> tuple[list[dict], dict[str, float] | None]:
@@ -3038,7 +3055,13 @@ def api_order_plan_apply(
     # invalidate и стоит). Раньше каждый созданный заказ ронял кэш, и следующий
     # экран считался с холодного снапшота — до 30 секунд ожидания на каждый
     # заказ у менеджера, который оформляет их пачкой.
-    return {"ok": True, "order_id": order.id, "status": "draft"}
+    #
+    # Идентификатор партии отдаётся и здесь: заказ, выросший из плана, — такая
+    # же партия «Оборота», как созданный вручную, и молчать про её CC_BATCH_ID
+    # ровно в той ручке, которой пользуются чаще всего, значило бы иметь две
+    # разные правды об одном заказе в зависимости от способа его создания.
+    return {"ok": True, "order_id": order.id, "status": "draft",
+            "cc_batch_id": order.cc_batch_id or ""}
 
 
 class ProductionSetupIn(BaseModel):
