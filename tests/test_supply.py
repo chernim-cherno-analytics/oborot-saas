@@ -10,6 +10,14 @@
 
 Что здесь доказывается — и почему именно это:
 
+  0) схемная работа SUPPLY-1 — ОТДЕЛЬНЫЙ шаг старта `ensure_supply_schema`,
+     а не довесок к уже выпущенному `init_db`/`models.ensure_schema` (ревью
+     PR #46, discussion_r3894000377): прежний шаг колонку больше не заводит,
+     новый заводит, и в append-only реестре `STARTUP_SCHEMA_STEPS` он стоит
+     терминальным с новым id и позицией 10, а девять выпущенных пар (id,
+     позиция) не тронуты. Что журнал при этом различает SUPPLY-1 и `init_db`
+     и не превращает условный backfill в one-time migration — доказано на
+     синтетической базе в tests/test_startup_lifecycle.py (проверка 12);
   1) миграция аддитивна: колонка появляется у базы, созданной до правки, и
      существующие заказы получают идентификаторы (backfill двух заказов);
   2) повторный прогон ничего не переписывает — идентификатор, однажды выданный,
@@ -158,6 +166,41 @@ def _batch_ids(eng) -> dict:
 
 
 def migration_checks() -> None:
+    print("\n== SUPPLY-1 — ОТДЕЛЬНЫЙ шаг старта, а не довесок к старому ==")
+    # Ревью PR #46 (discussion_r3894000377). Пока эта работа жила внутри
+    # `models.ensure_schema()`, она исполнялась под идентичностью уже
+    # выпущенного шага `init_db` позиции 1 — то есть меняла смысл выпущенного
+    # шага задним числом (AGENTS.md §1). Здесь это проверяется на уровне самих
+    # функций: старый шаг SUPPLY-1 больше НЕ делает, новый — делает.
+    split = _old_schema_engine("supply_step_is_separate.db")
+    with split.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO production_orders (id, org_id, name, created_at) "
+            "VALUES (1, 1, 'Партия до SUPPLY-1', '2025-04-17 10:00:00')"))
+    models.ensure_schema(bind=split)
+    split_cols = {c["name"] for c in sa_inspect(split).get_columns("production_orders")}
+    check("прежний ensure_schema НЕ заводит колонку партии (смысл шага не изменён)",
+          "cc_batch_id" not in split_cols, f"cols={sorted(split_cols)}")
+    models.ensure_supply_schema(bind=split)
+    split_cols = {c["name"] for c in sa_inspect(split).get_columns("production_orders")}
+    check("это делает новый шаг ensure_supply_schema",
+          "cc_batch_id" in split_cols, f"cols={sorted(split_cols)}")
+    split.dispose()
+
+    # Шаг объявлен в append-only реестре старта: терминальный, с новым id и
+    # новой позицией, а девять выпущенных пар (id, позиция) не тронуты.
+    from app import main as _main
+    declared = list(_main.STARTUP_SCHEMA_STEPS)
+    check("SUPPLY-1 объявлен терминальным шагом старта с новой позицией",
+          declared[-1] == ("models.ensure_supply_schema", 10), f"steps={declared}")
+    check("девять выпущенных шагов не переименованы и не переставлены",
+          declared[:9] == [
+              ("init_db", 1), ("lessons.ensure_schema", 2),
+              ("exclusions.ensure_schema", 3), ("ms_sync.ensure_schema", 4),
+              ("ms_sync.reset_stale_running", 5), ("ms_writeback.ensure_schema", 6),
+              ("ms_vendor.ensure_schema", 7), ("subscription.ensure_schema", 8),
+              ("subscription.log_preview", 9)], f"steps={declared}")
+
     print("\n== Аддитивная миграция и backfill на старой схеме ==")
     eng = _old_schema_engine("old_orders_schema.db")
     with eng.begin() as conn:
@@ -168,7 +211,7 @@ def migration_checks() -> None:
             "INSERT INTO production_orders (id, org_id, name, created_at) "
             "VALUES (2, 1, 'Вторая партия', '2026-01-09 08:30:00')"))
 
-    models.ensure_schema(bind=eng)
+    models.ensure_supply_schema(bind=eng)
     cols = {c["name"] for c in sa_inspect(eng).get_columns("production_orders")}
     check("миграция добавила cc_batch_id в существующую таблицу",
           "cc_batch_id" in cols, f"cols={sorted(cols)}")
@@ -183,7 +226,7 @@ def migration_checks() -> None:
     check("год в префиксе взят из даты партии, а не из «сегодня»",
           batch_year(ids[1]) == "2025" and batch_year(ids[2]) == "2026", str(ids))
 
-    models.ensure_schema(bind=eng)          # повторный старт — идемпотентно
+    models.ensure_supply_schema(bind=eng)   # повторный старт — идемпотентно
     again = _batch_ids(eng)
     check("повторный прогон миграции НЕ переписывает выданные идентификаторы",
           again == ids, f"было={ids} стало={again}")
@@ -201,7 +244,7 @@ def migration_checks() -> None:
     check("старый код создал строку с пустым идентификатором (откат не сломан)",
           raw == "", repr(raw))
 
-    models.ensure_schema(bind=eng)
+    models.ensure_supply_schema(bind=eng)
     healed = _batch_ids(eng)
     check("следующий старт вылечил новую пустую строку",
           bool(healed.get(3)) and BATCH_RE.match(healed[3] or ""), str(healed.get(3)))
@@ -249,7 +292,7 @@ def migration_checks() -> None:
     check("индекс частичный, а не обычный UNIQUE",
           "WHERE cc_batch_id <> ''" in models._CC_BATCH_ID_INDEX_DDL,
           models._CC_BATCH_ID_INDEX_DDL)
-    models.ensure_schema(bind=eng)
+    models.ensure_supply_schema(bind=eng)
     after = _batch_ids(eng)
     check("последний прогон вылечил и обе пустые строки, не задев прежние",
           all(after[k] for k in after) and {k: after[k] for k in (1, 2, 3)} == {
@@ -272,7 +315,7 @@ def migration_checks() -> None:
             "INSERT INTO production_orders (id, org_id) VALUES (1, 1), (2, 1)"))
     bare_err = ""
     try:
-        models.ensure_schema(bind=bare)
+        models.ensure_supply_schema(bind=bare)
     except Exception as exc:  # noqa: BLE001 — падение здесь и есть проверяемый дефект
         bare_err = f"{type(exc).__name__}: {exc}"
     check("миграция на таблице без created_at не падает", bare_err == "", bare_err[:160])
@@ -293,7 +336,7 @@ def migration_checks() -> None:
 
     def _run():
         try:
-            models.ensure_schema(bind=eng2)
+            models.ensure_supply_schema(bind=eng2)
         except Exception as exc:  # noqa: BLE001 — гонка не должна ронять воркер
             errors.append(exc)
 
