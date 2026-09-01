@@ -704,6 +704,64 @@ def fail_closed_checks() -> None:
                                              ss.decode_csv("Чужая", to_csv(bad_rows))),
                       ss.SourceError)))
 
+    print("\n== Размерная горка: подписаны все три или ни одной, третьего нет ==")
+    # Замечание ревью PR #47 на HEAD `ae50ba0` (thread 3904456552). D-51 знает
+    # ровно две формы строки 2, и обе наблюдены на живых листах. Прежняя
+    # проверка смотрела каждую промежуточную колонку НЕЗАВИСИМО от соседей и
+    # потому принимала третью: «S подписан, M и L пусты». Дальше эти колонки
+    # читаются позиционно, то есть половинчатая разметка означала бы штуки,
+    # разъехавшиеся по размерам и показанные как уверенное число.
+    #
+    # Матрица полная: все восемь сочетаний «подписана / пуста» для S, M и L.
+    # Законны ровно два края — все три и ни одной; шесть середин обязаны быть
+    # отвергнуты. Проверяется не только сам отказ, но и то, что законные формы
+    # не поехали: `size_labels_inferred` у них прежний.
+    middle = list(ss.SIZE_LABELS[1:-1])
+    first_mid = ss.SIZE_BAND_START + 1
+    for mask in range(8):
+        marked = [bool(mask & (1 << i)) for i in range(len(middle))]
+        cells = {first_mid + i: (middle[i] if marked[i] else "")
+                 for i in range(len(middle))}
+        rows = autumn_header_rows()
+        put(rows[1], cells)
+        rows.append(put(blank(), {2: "1", 3: "Тест", 10: "1"}))
+        blob = to_csv(rows)
+        shape = "".join(lbl if m else "·" for lbl, m in zip(middle, marked))
+        legal = all(marked) or not any(marked)
+        message = raises(
+            lambda b=blob: ss.parse_sheet("Горка", ss.decode_csv("Горка", b)),
+            ss.SourceError)
+        if legal:
+            check(f"законная форма горки «{shape}» принимается", not message,
+                  message[:130])
+            schema = ss.check_header("Горка", ss.decode_csv("Горка", blob))
+            check(f"и её size_labels_inferred прежний ({shape})",
+                  schema["size_labels_inferred"] == (middle if not any(marked)
+                                                     else []),
+                  str(schema["size_labels_inferred"]))
+        else:
+            check(f"половинчатая горка «{shape}» — fail closed", bool(message),
+                  message[:130])
+            check(f"и отказ называет колонки, а не содержимое ячеек ({shape})",
+                  f"{first_mid}–{first_mid + len(middle) - 1}" in message
+                  and "содержимое ячеек здесь не показывается" in message,
+                  message[:160])
+
+    # Та же половинчатость на листе, где подписи стоят ЯВНО («НГ 26/27»):
+    # стереть одну подпись — то же самое нарушение с другой стороны.
+    for gone, label in ((first_mid, middle[0]),
+                        (first_mid + 1, middle[1]),
+                        (first_mid + 2, middle[2])):
+        rows = next_header_rows()
+        put(rows[1], {gone: ""})
+        rows.append(put(blank(), {2: "1", 3: "Тест", 10: "1"}))
+        check(f"на явно подписанном листе стёртая «{label}» — fail closed",
+              bool(raises(
+                  lambda r=rows: ss.parse_sheet("Полугорка",
+                                                ss.decode_csv("Полугорка",
+                                                              to_csv(r))),
+                  ss.SourceError)))
+
     print("\n== Заголовка нет вовсе ==")
     check("одна строка вместо двух заголовков — fail closed",
           bool(raises(lambda: ss.parse_sheet("Куцый", [autumn_header_rows()[0]]),
@@ -3794,6 +3852,420 @@ def source_total_only_checks() -> None:
           and cont2_counts["quantity_known"] == 5, str(cont2_counts))
 
 
+def envelope_headroom_checks() -> None:  # noqa: C901 — сценарий, ветвлений мало
+    """Отказ у самой границы предела: причина сохраняется, а не подменяется.
+
+    Замечание ревью PR #47 на HEAD `ae50ba0` (thread 3903750392), и оно про
+    самый неприятный класс дефекта — тот, где ломается механизм, который и
+    существует ради честного сообщения о поломке.
+
+    `_record_failure()` берёт УЖЕ ПРИНЯТЫЙ успешный снимок, накладывает поля
+    попытки и причины и отдаёт результат тому же `_store()`. Пока предел
+    записи был один на всех, снимок, принятый у самой границы, переставал
+    помещаться от одного лишь добавления причины: из записи отказа вылетал
+    ВТОРОЙ отказ с кодом `too_big`, он подменял исходную причину в ответе, а
+    метаданные попытки не записывались вовсе. Пользователь при этом видел
+    «предпросмотр не помещается» там, где источник ответил 403 — то есть
+    ровно ту неправду, против которой написан весь этот слой.
+
+    ПОЧЕМУ ГРАНИЦА ЗДЕСЬ ДВИГАЕТСЯ КОНСТАНТОЙ, А НЕ МЕГАБАЙТОМ CSV. Предел —
+    это одно сравнение размера в `_guard_envelope_size()`, и для него «снимок
+    в 1 МиБ при пределе 1 МиБ» и «снимок в 3 КиБ при пределе 3 КиБ» — один и
+    тот же случай, проходящий по одному и тому же коду. Разница только в
+    времени прогона. Поэтому предел опускается ровно до фактического размера
+    ПРИНЯТОГО успешного снимка: запаса не остаётся ни одного байта — это и
+    есть «у границы» в самом строгом виде, какой вообще бывает.
+
+    Существующая проверка малого лимита (`ss.MAX_ENVELOPE_BYTES = 512`) этот
+    класс не ловит и никогда не ловила: там успешный снимок В ПРИНЦИПЕ не
+    помещается, проверяются только 502 и сохранность прежнего hash, и оба
+    исхода одинаковы что с дефектом, что без него.
+    """
+    print("\n== Отказ у самой границы предела: причина не подменяется ==")
+    boss = client()
+    boss.post("/register", data={"name": "Граница",
+                                 "email": "sheets-edge@test.io",
+                                 "password": "secret123", "org_name": "Бренд-ГР"})
+    boss.post("/api/connect/demo")
+    org_id = sql("SELECT org_id FROM memberships WHERE user_id ="
+                 " (SELECT id FROM users WHERE email = 'sheets-edge@test.io')")[0][0]
+    conn_id = sql("SELECT id FROM connections WHERE org_id = ? ORDER BY id",
+                  org_id)[0][0]
+    add_member(org_id, "sheets-edge-m@test.io")
+    mate = client()
+    mate.post("/login", data={"email": "sheets-edge-m@test.io",
+                              "password": "secret123"})
+
+    def envelope_now() -> dict:
+        cfg = json.loads(sql("SELECT config_json FROM connections WHERE id = ?",
+                             conn_id)[0][0])
+        return cfg[ss.ENVELOPE_KEY]
+
+    def refresh_now():
+        return boss.post("/api/supply/sheets/refresh",
+                         json={"spreadsheet_url": SHEET_URL,
+                               "sheet_names": [SHEET_CURRENT, SHEET_NEXT]})
+
+    real_limit = ss.MAX_ENVELOPE_BYTES
+    try:
+        ss.set_transport(FakeGoogle())
+        r = refresh_now()
+        check("успешный снимок записан", r.status_code == 200, r.text[:160])
+        good = envelope_now()
+        exact = len(ss._dump(good).encode("utf-8"))
+
+        # Предел ровно по факту принятого снимка: ни одного байта запаса.
+        ss.MAX_ENVELOPE_BYTES = exact
+        r = refresh_now()
+        check("тот же успех у САМОЙ границы по-прежнему принимается",
+              r.status_code == 200, f"{r.status_code} {r.text[:160]}")
+        check("и это честная ветка «ничего не изменилось»",
+              r.json().get("unchanged") is True, r.text[:160])
+        good = envelope_now()
+        check("снимок у границы занимает ровно предел, а не меньше",
+              len(ss._dump(good).encode("utf-8")) == ss.MAX_ENVELOPE_BYTES,
+              f"{len(ss._dump(good).encode('utf-8'))} vs {ss.MAX_ENVELOPE_BYTES}")
+        good_rows = json.loads(json.dumps(good["rows"], ensure_ascii=False))
+        good_hash = good["content_sha256"]
+        good_success = good["last_success_at"]
+        good_fetched = good["fetched_at"]
+        good_counts = json.loads(json.dumps(good["counts"], ensure_ascii=False))
+        seen_total = boss.get("/api/supply/sheets?limit=200").json()["total"]
+
+        # Обычный последующий отказ источника: 403 на первом листе.
+        #
+        # Листы намеренно переставлены местами. Метаданные попытки обязаны
+        # принадлежать ЭТОЙ попытке, а не пережить её от прошлого успеха, — а
+        # у прошлого успеха ровно те же две строки в другом порядке. Проверка
+        # «last_attempt_source не пуст» этого не различила бы вовсе: он не был
+        # бы пуст и без единой новой записи. Порядок при этом не меняет ни
+        # одного байта размера, и снимок остаётся ровно на границе.
+        ss.set_transport(FakeGoogle({
+            SHEET_NEXT: ss.HttpResponse(403, {}, b"forbidden",
+                                        "https://docs.google.com/x"),
+            SHEET_CURRENT: AUTUMN_CSV}))
+        r = boss.post("/api/supply/sheets/refresh",
+                      json={"spreadsheet_url": SHEET_URL,
+                            "sheet_names": [SHEET_NEXT, SHEET_CURRENT]})
+        check("отказ источника у границы доехал как 502",
+              r.status_code == 502, f"{r.status_code} {r.text[:160]}")
+        check("в ответе названа ИСХОДНАЯ причина — 403, а не предел снимка",
+              "403" in r.text, r.text[:220])
+        check("и текстом предела исходная причина не подменена",
+              "не помещается" not in r.text and "вырос за пределы" not in r.text,
+              r.text[:220])
+
+        env = envelope_now()
+        check("прежний успешный снимок цел: строки не тронуты и не обрезаны",
+              env["rows"] == good_rows, f"{len(env['rows'])} vs {len(good_rows)}")
+        check("... и hash содержимого прежний", env["content_sha256"] == good_hash,
+              f"{env['content_sha256']} vs {good_hash}")
+        check("... и время удачи, и время загрузки прежние",
+              env["last_success_at"] == good_success
+              and env["fetched_at"] == good_fetched,
+              f"{env['last_success_at']} / {env['fetched_at']}")
+        check("... и сохранённая сводка прежняя", env["counts"] == good_counts,
+              str(env["counts"]))
+        check("метаданные попытки записаны: её время",
+              bool(env["last_attempt_at"]), str(env["last_attempt_at"]))
+        check("... и её источник целиком — именно этой попытки, а не прошлой",
+              env["last_attempt_source"] == {"spreadsheet_id": SPREADSHEET_ID,
+                                             "sheet_names": [SHEET_NEXT,
+                                                             SHEET_CURRENT]},
+              str(env["last_attempt_source"]))
+        check("подробная причина владельца сохранена и это тот самый 403",
+              "403" in (env["last_error"] or ""), (env["last_error"] or "")[:160])
+        check("и она не подменена текстом предела снимка",
+              "не помещается" not in (env["last_error"] or ""),
+              (env["last_error"] or "")[:160])
+        check("код причины из закрытого списка сохранён",
+              env["last_error_public_code"] == "access",
+              str(env["last_error_public_code"]))
+        check("и отпечаток связи сошёлся с ЭТОЙ записанной неудачей",
+              env["last_error_public_binding"] == ss._public_binding(
+                  "access", env["last_error"], env["last_attempt_at"],
+                  env["last_attempt_source"]),
+              str(env["last_error_public_binding"])[:32])
+
+        mine = boss.get("/api/supply/sheets?limit=200").json()
+        check("владелец читает исходную причину, а не «снимок не поместился»",
+              "403" in (mine.get("last_error") or "")
+              and "не помещается" not in (mine.get("last_error") or ""),
+              (mine.get("last_error") or "")[:160])
+        check("и прежний снимок владельцу по-прежнему виден целиком",
+              mine["total"] == seen_total, f"{mine['total']} vs {seen_total}")
+        theirs_raw = mate.get("/api/supply/sheets?limit=200").text
+        theirs = json.loads(theirs_raw)
+        check("участнику причина отказа — наша константа по коду",
+              theirs["last_error"] == ss.PUBLIC_FAILURE_REASONS["access"],
+              (theirs.get("last_error") or "")[:160])
+        # Успешный снимок общий, и имена его листов участник видит законно
+        # (D-51). Закрыт ровно ПОДРОБНЫЙ текст отказа: ни статуса источника,
+        # ни имени сломавшегося листа в причине участника быть не должно.
+        check("подробности отказа участнику не уехали ни одной строкой",
+              "403" not in (theirs.get("last_error") or "")
+              and SHEET_NEXT not in (theirs.get("last_error") or ""),
+              (theirs.get("last_error") or "")[:160])
+        check("и прежний общий снимок участник видит целиком",
+              theirs["total"] == seen_total, f"{theirs['total']} vs {seen_total}")
+
+        # Восстановление у той же границы. Успешное чтение ТОГО ЖЕ содержимого
+        # очищает поля отказа — и обязано поместиться, иначе «починиться» было
+        # бы нельзя: раздел остался бы навсегда с записанным отказом.
+        ss.set_transport(FakeGoogle())
+        r = refresh_now()
+        check("успех тем же содержимым у той же границы принят",
+              r.status_code == 200, f"{r.status_code} {r.text[:200]}")
+        env = envelope_now()
+        check("поля отказа очищены полностью",
+              env["last_error"] == "" and env["last_error_public"] == ""
+              and env["last_error_public_code"] == ""
+              and env["last_error_public_binding"] == "",
+              str([env["last_error"], env["last_error_public_code"]]))
+        check("а сам снимок так и остался прежним",
+              env["content_sha256"] == good_hash and env["rows"] == good_rows
+              and env["last_success_at"] == good_success,
+              env["content_sha256"])
+        check("и снова помещается в неослабленный предел успеха",
+              len(ss._dump(env).encode("utf-8")) <= ss.MAX_ENVELOPE_BYTES,
+              f"{len(ss._dump(env).encode('utf-8'))} vs {ss.MAX_ENVELOPE_BYTES}")
+
+        # И главное про границу решения владельца: резерв принадлежит ТОЛЬКО
+        # служебной записи отказа. Опускаем предел на один байт ниже
+        # фактического снимка — успешное чтение обязано упереться в него, а не
+        # проехать на резерве.
+        ss.MAX_ENVELOPE_BYTES = exact - 1
+        r = refresh_now()
+        check("успеху резерв не достаётся: на байт ниже — уже отказ",
+              r.status_code == 502 and "не помещается" in r.text,
+              f"{r.status_code} {r.text[:200]}")
+        env = envelope_now()
+        check("и снимок при этом остался нетронутым",
+              env["content_sha256"] == good_hash and env["rows"] == good_rows
+              and env["last_success_at"] == good_success,
+              env["content_sha256"])
+
+        # И главное про границу решения: резерв принадлежит ТОЛЬКО записи
+        # отказа. Опускаем предел на один байт ниже фактического снимка —
+        # успешное чтение обязано упереться в него, а не проехать на резерве.
+        ss.MAX_ENVELOPE_BYTES = exact - 1
+        r = refresh_now()
+        check("успеху резерв не достаётся: на байт ниже — уже отказ",
+              r.status_code == 502 and "не помещается" in r.text,
+              f"{r.status_code} {r.text[:200]}")
+        env = envelope_now()
+        check("и снимок при этом остался нетронутым",
+              env["content_sha256"] == good_hash and env["rows"] == good_rows
+              and env["last_success_at"] == good_success,
+              env["content_sha256"])
+    finally:
+        ss.MAX_ENVELOPE_BYTES = real_limit
+        ss.set_transport(None)
+        boss.close()
+        mate.close()
+
+
+def headroom_arithmetic_checks() -> None:  # noqa: C901 — матрица границ, ветвлений мало
+    """Замки на сам резерв: он назначен владельцем, доказан кодом и ограничен.
+
+    Сценарий выше доказывает ПОВЕДЕНИЕ на одном отказе. Здесь стоит то, чего
+    поведением одного отказа не проверить: что оценка худшего случая верна
+    ЛОКАЛЬНО (каждое слагаемое — граница само по себе, а не за счёт запаса в
+    соседнем), что она покрывает снимок старой версии, где пяти из шести полей
+    нет вовсе, и что обрезка длинного текста происходит ДО расчёта отпечатка,
+    а не после. Всё офлайновое: ни сети, ни базы.
+    """
+    print("\n== Резерв под запись отказа: числа владельца и локальная граница ==")
+
+    # 1. Числа, одобренные владельцем 01.09.2026 (DECISIONS D-52).
+    check("предел УСПЕШНОГО снимка остался ровно 1 МиБ",
+          ss.MAX_ENVELOPE_BYTES == 1024 * 1024, str(ss.MAX_ENVELOPE_BYTES))
+    check("резерв под запись отказа — ровно одобренные 27 525 байт",
+          ss.FAILURE_OVERLAY_BUDGET_BYTES == 27_525,
+          str(ss.FAILURE_OVERLAY_BUDGET_BYTES))
+    check("полный error-envelope — ровно одобренные 1 076 101 байт",
+          ss.MAX_ENVELOPE_BYTES + ss.FAILURE_OVERLAY_BUDGET_BYTES == 1_076_101,
+          str(ss.MAX_ENVELOPE_BYTES + ss.FAILURE_OVERLAY_BUDGET_BYTES))
+    check("худший случай ВЫЧИСЛЕН и укладывается в потолок владельца",
+          0 < ss._FAILURE_OVERLAY_WORST_BYTES <= ss.FAILURE_OVERLAY_BUDGET_BYTES,
+          f"{ss._FAILURE_OVERLAY_WORST_BYTES} vs {ss.FAILURE_OVERLAY_BUDGET_BYTES}")
+
+    # 2. ЛОКАЛЬНАЯ корректность слагаемого. Замечание независимого ревью на
+    #    HEAD `ae50ba0`: сумма может сойтись и при неверном слагаемом, если
+    #    недобор одного члена скрыт запасом другого. Поэтому каждый член
+    #    проверяется отдельно и ИЗМЕРЕНИЕМ: добавляем его в непустой объект той
+    #    же сериализацией, что и продукт, и сравниваем фактический прирост с
+    #    заявленной границей. Разделитель `", "` — два байта, и именно на нём
+    #    прежняя редакция теряла по байту на член.
+    worst_char = "\x01"                 # шесть байт в JSON: самый дорогой символ
+    members = [
+        ("last_attempt_at", "2026-09-01T13:34:40+00:00",
+         ss._json_ascii_bytes(ss.MAX_ATTEMPT_TIME_CHARS)),
+        ("last_attempt_source",
+         {"spreadsheet_id": "a" * ss.MAX_SPREADSHEET_ID_CHARS,
+          "sheet_names": [worst_char * ss.MAX_SHEET_NAME_CHARS] * ss.SHEET_COUNT},
+         ss._ATTEMPT_SOURCE_MAX_BYTES),
+        ("last_error", worst_char * ss.MAX_FAILURE_TEXT_CHARS,
+         ss._json_text_bytes(ss.MAX_FAILURE_TEXT_CHARS)),
+        ("last_error_public", worst_char * ss.MAX_FAILURE_TEXT_CHARS,
+         ss._json_text_bytes(ss.MAX_FAILURE_TEXT_CHARS)),
+        ("last_error_public_code", max(ss.PUBLIC_FAILURE_REASONS, key=len),
+         ss._json_ascii_bytes(max(len(c) for c in ss.PUBLIC_FAILURE_REASONS))),
+        ("last_error_public_binding", "f" * 64,
+         ss._json_ascii_bytes(64)),
+    ]
+    for key, value, value_bound in members:
+        # Соседи подобраны так, чтобы ключ попадал и в начало, и в середину, и
+        # в конец отсортированного объекта: разделитель у первого члена не
+        # нужен вовсе, и граница обязана оставаться верной в обоих случаях.
+        for label, neighbours in (("в начале", {"zzz": 1}),
+                                  ("в конце", {"aaa": 1}),
+                                  ("в середине", {"aaa": 1, "zzz": 1})):
+            base = dict(neighbours)
+            grown = dict(base)
+            grown[key] = value
+            delta = (len(ss._dump(grown).encode("utf-8"))
+                     - len(ss._dump(base).encode("utf-8")))
+            bound = ss._json_member_bytes(key, value_bound)
+            check(f"граница члена «{key}» верна сама по себе ({label})",
+                  delta <= bound, f"прирост {delta}, граница {bound}")
+
+    check("и сумма шести таких границ — это и есть худший случай",
+          sum(ss._json_member_bytes(k, b) for k, _v, b in members)
+          == ss._FAILURE_OVERLAY_WORST_BYTES,
+          str(ss._FAILURE_OVERLAY_WORST_BYTES))
+
+    # 3. СНИМОК СТАРОЙ ВЕРСИИ: пяти из шести полей нет вовсе. Обязателен по
+    #    `_ENVELOPE_SHAPE` только `last_error`, остальные пять — необязательные
+    #    или вовсе незнакомые старому коду. Это и есть случай максимального
+    #    прироста: каждому недостающему полю нужен и ключ, и разделитель.
+    overlay = {key: value for key, value, _b in members}
+    legacy = ss._skeleton("abcdefghij", ["Лист"])
+    missing = [k for k in overlay if k != "last_error"]
+    for key in missing:
+        legacy.pop(key, None)
+    check("у снимка старой версии отсутствуют ровно пять из шести полей",
+          len(missing) == 5 and all(k not in legacy for k in missing)
+          and "last_error" in legacy, str(sorted(missing)))
+    grown = dict(legacy)
+    grown.update(overlay)
+    delta = (len(ss._dump(grown).encode("utf-8"))
+             - len(ss._dump(legacy).encode("utf-8")))
+    check("худшая запись отказа поверх снимка старой версии влезает в резерв",
+          delta <= ss.FAILURE_OVERLAY_BUDGET_BYTES,
+          f"прирост {delta}, резерв {ss.FAILURE_OVERLAY_BUDGET_BYTES}")
+    check("и она же укладывается в вычисленный худший случай",
+          delta <= ss._FAILURE_OVERLAY_WORST_BYTES,
+          f"прирост {delta}, худший случай {ss._FAILURE_OVERLAY_WORST_BYTES}")
+
+    # 4. Повторный отказ поверх отказа ничего не разгоняет: поля ЗАМЕНЯЮТСЯ.
+    twice = dict(grown)
+    twice.update(overlay)
+    check("второй отказ подряд не увеличивает снимок ни на байт",
+          len(ss._dump(twice).encode("utf-8"))
+          == len(ss._dump(grown).encode("utf-8")))
+
+    # 5. Потолок текста отказа — свойство кода, а не обещание.
+    long_text = "я" * (ss.MAX_FAILURE_TEXT_CHARS * 3)
+    cut = ss._bounded_failure_text(long_text)
+    check("слишком длинный текст отказа обрезается до потолка",
+          len(cut) == ss.MAX_FAILURE_TEXT_CHARS, str(len(cut)))
+    check("обрезка проговаривается многоточием и не оставляет пустоты",
+          cut.endswith("…") and len(cut.strip()) > 1, cut[-8:])
+    short = "лист «Осень 26»: таблица не открыта на чтение по ссылке"
+    check("а обычный текст отказа не трогается вовсе",
+          ss._bounded_failure_text(short) == short, short)
+    check("самый длинный СЕГОДНЯШНИЙ текст слоя под потолок не попадает",
+          len(ss._sheet_error(
+              "Ж" * ss.MAX_SHEET_NAME_CHARS,
+              f"подпись «Комментарии» встречается в строке заголовка "
+              f"{ss.MAX_COLUMNS} раз(а) (колонки "
+              f"{list(range(1, ss.MAX_COLUMNS + 1))}), а должна ровно один — "
+              f"какая из них задаёт каркас, мы не угадываем").args[0])
+          <= ss.MAX_FAILURE_TEXT_CHARS,
+          f"потолок {ss.MAX_FAILURE_TEXT_CHARS}")
+
+    # 6. Длина идентификатора, из которой посчитан резерв, — та же, что
+    #    принимает разбор ссылки. Разъехались бы — резерв считался бы не по
+    #    тому источнику, и это заметили бы не здесь, а у пользователя.
+    limit_id = "a" * ss.MAX_SPREADSHEET_ID_CHARS
+    check("идентификатор предельной длины разбор принимает",
+          ss.parse_spreadsheet_url(
+              f"https://docs.google.com/spreadsheets/d/{limit_id}/edit") == limit_id)
+    check("а на символ длиннее — уже нет",
+          raises(lambda: ss.parse_spreadsheet_url(
+              f"https://docs.google.com/spreadsheets/d/{limit_id}a/edit"),
+              ss.ValidationError) != "")
+    check("имя листа предельной длины валидатор принимает",
+          ss.validate_sheet_names(["Ж" * ss.MAX_SHEET_NAME_CHARS, "Б"])
+          == ["Ж" * ss.MAX_SHEET_NAME_CHARS, "Б"])
+    check("а на символ длиннее — уже нет",
+          raises(lambda: ss.validate_sheet_names(
+              ["Ж" * (ss.MAX_SHEET_NAME_CHARS + 1), "Б"]),
+              ss.ValidationError) != "")
+
+
+def truncated_reason_checks() -> None:
+    """Обрезка длинного текста происходит ДО отпечатка, а не после.
+
+    Отпечаток `_public_binding()` считается по ТОМУ ЖЕ подробному тексту,
+    который лёг в носитель. Обрежь текст после расчёта — и отпечаток перестанет
+    сходиться на чтении: участник вместо конкретной причины получит generic,
+    причём молча и только на длинных отказах, то есть ровно там, где никто не
+    смотрит. Поэтому граница проверяется с обеих сторон: на символ короче
+    потолка и заведомо длиннее него.
+    """
+    print("\n== Обрезка длинного отказа не рвёт связь причины с записью ==")
+    boss = client()
+    boss.post("/register", data={"name": "Обрезка",
+                                 "email": "sheets-cut@test.io",
+                                 "password": "secret123", "org_name": "Бренд-ОБ"})
+    boss.post("/api/connect/demo")
+    org_id = sql("SELECT org_id FROM memberships WHERE user_id ="
+                 " (SELECT id FROM users WHERE email = 'sheets-cut@test.io')")[0][0]
+    from app.db import SessionLocal
+
+    def record(length: int) -> dict:
+        """Записать отказ с текстом ровно `length` символов и вернуть снимок."""
+        tail = "ы" * (length - len("лист «Осень 26»: "))
+        exc = ss.SourceError("лист «Осень 26»: " + tail,
+                             "лист источника: " + tail, code="access")
+        db = SessionLocal()
+        try:
+            ss._record_failure(db, org_id, SPREADSHEET_ID,
+                               [SHEET_CURRENT, SHEET_NEXT], ss._now_iso(), exc)
+            return ss.get_envelope(db, org_id)
+        finally:
+            db.close()
+
+    for label, length, expect_cut in (
+            ("на символ короче потолка", ss.MAX_FAILURE_TEXT_CHARS - 1, False),
+            ("ровно по потолку", ss.MAX_FAILURE_TEXT_CHARS, False),
+            ("заведомо длиннее потолка", ss.MAX_FAILURE_TEXT_CHARS * 2, True)):
+        env = record(length)
+        stored = env["last_error"]
+        check(f"{label}: сохранённый текст не длиннее потолка",
+              len(stored) <= ss.MAX_FAILURE_TEXT_CHARS, str(len(stored)))
+        check(f"{label}: обрезка сработала ровно тогда, когда должна",
+              stored.endswith("…") is expect_cut, f"len={len(stored)}")
+        check(f"{label}: отпечаток посчитан по СОХРАНЁННОМУ тексту",
+              env["last_error_public_binding"] == ss._public_binding(
+                  "access", stored, env["last_attempt_at"],
+                  env["last_attempt_source"]),
+              env["last_error_public_binding"][:32])
+        # И то, ради чего отпечаток вообще существует: участник получает
+        # конкретную причину, а не generic-заглушку.
+        check(f"{label}: участник читает конкретную причину, а не generic",
+              ss._public_reason(env, stored)
+              == ss.PUBLIC_FAILURE_REASONS["access"],
+              ss._public_reason(env, stored)[:80])
+        check(f"{label}: и снимок целиком помещается в error-envelope",
+              len(ss._dump(env).encode("utf-8"))
+              <= ss.MAX_ENVELOPE_BYTES + ss.FAILURE_OVERLAY_BUDGET_BYTES,
+              str(len(ss._dump(env).encode("utf-8"))))
+    boss.close()
+
+
 # ── Прогон ──────────────────────────────────────────────────────────────────
 
 def run() -> int:
@@ -3836,6 +4308,9 @@ def run() -> int:
     malformed_url_checks()
     incomplete_counts_checks()
     source_total_only_checks()
+    envelope_headroom_checks()
+    headroom_arithmetic_checks()
+    truncated_reason_checks()
     bound_public_reason_checks()
     stored_counts_checks()
     envelope_version_checks()
