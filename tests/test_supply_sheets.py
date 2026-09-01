@@ -4416,6 +4416,132 @@ def legacy_parser3_stale_checks() -> None:  # noqa: C901 — сценарий, �
         boss.close()
 
 
+def saved_sheet_names_checks() -> None:  # noqa: C901 — матрица форм, ветвлений мало
+    """Имена листов в носителе проверяются по элементам, а не только по типу.
+
+    Замечание ревью PR #47 на HEAD `26cca4d` (thread 3906617990). `_ENVELOPE_SHAPE`
+    проверял `sheet_names` как контейнер — `(list,)` — и до элементов не доходил.
+    Испорченный или оставленный чужим писателем `sheet_names: [1, 2]` проходил
+    читателя целиком, и противоречие расходилось по трём дорогам сразу: страница
+    рисовала чипы листов `1` и `2`; клик уходил СТРОКОЙ `sheet=1`, не совпадал с
+    элементом-числом и получал 400 «такого листа в предпросмотре нет» — на лист,
+    который эта же страница только что показала; а сводка считала по числовым
+    именам нули при живых строках под настоящими именами.
+
+    Это ровно тот класс, который уже закрывали для `rows` на HEAD `0d9c226`
+    («форма СТРОКИ, а не только контейнера»), просто на соседнем поле. И лечится
+    он там же, где лечился тот: на границе чтения, fail closed, управляемым 409.
+
+    Отдельно проверяется, что 409 — это НЕ 400. Разница не косметическая: 400
+    говорит «ты прислал ерунду» тому, кто ничего не присылал, а 409 говорит
+    «сохранённое состояние непригодно», и чинится оно обновлением, а не другим
+    запросом. Поэтому `ValidationError` из persisted-границы течь не должна,
+    хотя семантика имени листа у неё и у пользовательского ввода одна.
+    """
+    print("\n== Имена листов в носителе: проверяются элементы, а не тип ==")
+    boss = client()
+    boss.post("/register", data={"name": "Имена",
+                                 "email": "sheets-names@test.io",
+                                 "password": "secret123", "org_name": "Бренд-ИМ"})
+    boss.post("/api/connect/demo")
+    org_id = sql("SELECT org_id FROM memberships WHERE user_id ="
+                 " (SELECT id FROM users WHERE email = 'sheets-names@test.io')")[0][0]
+    conn_id = sql("SELECT id FROM connections WHERE org_id = ? ORDER BY id",
+                  org_id)[0][0]
+
+    def carrier_blob() -> str:
+        return sql("SELECT config_json FROM connections WHERE id = ?",
+                   conn_id)[0][0]
+
+    ss.set_transport(FakeGoogle())
+    try:
+        r = boss.post("/api/supply/sheets/refresh",
+                      json={"spreadsheet_url": SHEET_URL,
+                            "sheet_names": [SHEET_CURRENT, SHEET_NEXT]})
+        check("законный снимок создан", r.status_code == 200, r.text[:140])
+        good_cfg = json.loads(carrier_blob())
+        good_env = good_cfg[ss.ENVELOPE_KEY]
+
+        # Законное чтение до всех подмен — контрольная точка.
+        ok = boss.get("/api/supply/sheets?limit=200")
+        check("законный снимок читается", ok.status_code == 200, ok.text[:140])
+        check("и его имена листов — те самые",
+              ok.json()["sheet_names"] == [SHEET_CURRENT, SHEET_NEXT],
+              str(ok.json()["sheet_names"]))
+
+        # Матрица испорченных форм. Каждая — отдельный способ сломаться, и все
+        # они обязаны давать ОДИН исход: управляемый 409, носитель не тронут.
+        broken = {
+            "числовые имена": [1, 2],
+            "смешанные типы": [SHEET_CURRENT, 2],
+            "имя списком": [SHEET_CURRENT, [SHEET_NEXT]],
+            "имя пустой строкой": [SHEET_CURRENT, ""],
+            "имя из одних пробелов": [SHEET_CURRENT, "   "],
+            "имя длиннее предела": [SHEET_CURRENT,
+                                    "Ж" * (ss.MAX_SHEET_NAME_CHARS + 1)],
+            "управляющий символ в имени": [SHEET_CURRENT, "Лист\nвторой"],
+            "имя None": [SHEET_CURRENT, None],
+            "листов больше двух": [SHEET_CURRENT, SHEET_NEXT, "Третий"],
+            "листов меньше двух": [SHEET_CURRENT],
+            "листов нет вовсе у настроенного снимка": [],
+            "одинаковые имена": [SHEET_CURRENT, SHEET_CURRENT],
+        }
+        for label, names in broken.items():
+            spoiled = json.loads(json.dumps(good_cfg, ensure_ascii=False))
+            spoiled[ss.ENVELOPE_KEY]["sheet_names"] = names
+            blob = json.dumps(spoiled, ensure_ascii=False)
+            exec_sql("UPDATE connections SET config_json = ? WHERE id = ?",
+                     blob, conn_id)
+            before = carrier_blob()
+
+            read = boss.get("/api/supply/sheets?limit=200")
+            check(f"{label}: управляемый 409, а не 200 и не 500",
+                  read.status_code == 409,
+                  f"{read.status_code} {read.text[:140]}")
+            check(f"{label}: причина названа как повреждение снимка",
+                  "предпросмотр" in read.text.lower()
+                  and "не переписан" in read.text,
+                  read.text[:160])
+            # И то же самое на ФИЛЬТРЕ: прежде именно здесь рождался 400 на
+            # лист, который страница сама только что показала.
+            filtered = boss.get(f"/api/supply/sheets?sheet={SHEET_CURRENT}")
+            check(f"{label}: фильтр по листу даёт тот же 409, а не 400",
+                  filtered.status_code == 409,
+                  f"{filtered.status_code} {filtered.text[:140]}")
+            check(f"{label}: GET ничего не переписал в носителе",
+                  carrier_blob() == before)
+            check(f"{label}: и снимок остался на месте целиком",
+                  json.loads(carrier_blob())[ss.ENVELOPE_KEY]["rows"]
+                  == good_env["rows"])
+
+        # Законные формы обязаны читаться по-прежнему.
+        exec_sql("UPDATE connections SET config_json = ? WHERE id = ?",
+                 json.dumps(good_cfg, ensure_ascii=False), conn_id)
+        back = boss.get("/api/supply/sheets?limit=200")
+        check("законный снимок после всех подмен читается как прежде",
+              back.status_code == 200
+              and back.json()["sheet_names"] == [SHEET_CURRENT, SHEET_NEXT],
+              back.text[:140])
+
+        # Ненастроенный снимок (первая попытка не удалась, успеха ещё не было)
+        # живёт с ПУСТЫМ списком листов — и это законно, а не поломка.
+        skeleton = ss._skeleton(SPREADSHEET_ID, [SHEET_CURRENT, SHEET_NEXT])
+        skeleton["last_error"] = "лист «Осень 26»: источник ответил 500"
+        empty_cfg = json.loads(json.dumps(good_cfg, ensure_ascii=False))
+        empty_cfg[ss.ENVELOPE_KEY] = skeleton
+        exec_sql("UPDATE connections SET config_json = ? WHERE id = ?",
+                 json.dumps(empty_cfg, ensure_ascii=False), conn_id)
+        first = boss.get("/api/supply/sheets")
+        check("ненастроенный снимок с пустым списком листов читается",
+              first.status_code == 200, f"{first.status_code} {first.text[:140]}")
+        check("и он честно не считается настроенным",
+              first.json()["configured"] is False
+              and first.json()["sheet_names"] == [], first.text[:160])
+    finally:
+        ss.set_transport(None)
+        boss.close()
+
+
 # ── Прогон ──────────────────────────────────────────────────────────────────
 
 def run() -> int:
@@ -4462,6 +4588,7 @@ def run() -> int:
     headroom_arithmetic_checks()
     truncated_reason_checks()
     legacy_parser3_stale_checks()
+    saved_sheet_names_checks()
     bound_public_reason_checks()
     stored_counts_checks()
     envelope_version_checks()
