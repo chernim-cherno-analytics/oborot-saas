@@ -148,8 +148,14 @@ DELAY_SCRIPT = """
 """
 
 
-def make_row(index: int, sheet: str, *, invalid: bool = False) -> dict:
-    """Строка снимка ровно в той форме, которую выпускает парсер."""
+def make_row(index: int, sheet: str, *, invalid: bool = False,
+             price: str = "", name: str | None = None) -> dict:
+    """Строка снимка ровно в той форме, которую выпускает парсер.
+
+    `price` кладётся в `price_raw` — колонку 16 источника, которую парсер
+    признаёт и потому ИСКЛЮЧАЕТ из `unknown_raw`. Значение остаётся сырым
+    текстом: ни числом, ни валютой оно в предпросмотре не становится.
+    """
     sizes = {"XS": 1, "S": 1, "M": 1, "L": 1, "XL": None if invalid else 1}
     sizes_raw = {"XS": "1", "S": "1", "M": "1", "L": "1",
                  "XL": "Кроим по заданию" if invalid else "1"}
@@ -157,30 +163,34 @@ def make_row(index: int, sheet: str, *, invalid: bool = False) -> dict:
     return {
         "sheet_name": sheet, "source_row": index, "anchor_row": index,
         "is_blank": False,
-        "article_raw": f"A{index}", "name_raw": f"Позиция {index}",
-        "article": f"A{index}", "name": f"Позиция {index}",
+        "article_raw": f"A{index}", "name_raw": name or f"Позиция {index}",
+        "article": f"A{index}", "name": name or f"Позиция {index}",
         "color_raw": "Чёрный", "qty_meters_raw": "", "sketch_raw": "",
         "sizes": sizes, "sizes_raw": sizes_raw, "size_sum": known,
         "source_total_raw": str(known), "source_total": known,
         "comments_raw": ["", "", ""], "source_status_raw": "",
-        "price_raw": "", "components_raw": "", "production_raw": "",
+        "price_raw": price, "components_raw": "", "production_raw": "",
         "unknown_raw": {}, "issues": ["invalid_quantity"] if invalid else [],
     }
 
 
-def write_snapshot(sheets, rows) -> None:
+def write_snapshot(sheets, rows, content_sha256: str = "0" * 64) -> None:
     """Положить снимок в носителя организации.
 
     Счётчики считает САМ слой (`ss.build_counts`), а не тест: иначе проверка
     экрана опиралась бы на числа, выдуманные рядом с проверкой, и доказывала
     бы согласие теста с самим собой.
+
+    `content_sha256` задаётся снаружи там, где проверяется ГОНКА ВЕРСИЙ: две
+    версии снимка обязаны отличаться именно хешем содержимого, потому что
+    страница различает их по нему, а не по числу строк.
     """
     envelope = {
         "schema_version": ss.ENVELOPE_SCHEMA_VERSION,
         "parser_version": ss.PARSER_VERSION,
         "spreadsheet_id": SPREADSHEET_ID,
         "sheet_names": list(sheets),
-        "content_sha256": "0" * 64,
+        "content_sha256": content_sha256,
         "last_attempt_at": "2026-08-31T12:00:00+00:00",
         "last_success_at": "2026-08-31T12:00:00+00:00",
         "fetched_at": "2026-08-31T12:00:00+00:00",
@@ -245,7 +255,8 @@ def write_failed_attempt(sheets, detailed: str, public: str,
 
 def write_snapshot_with_failed_attempt(sheets, rows, attempt_sheets,
                                        attempt_id: str = ATTEMPT_SPREADSHEET_ID,
-                                       source_ok: bool = True) -> None:
+                                       source_ok: bool = True,
+                                       source_override=None) -> None:
     """Самое живое состояние владельца: снимок ЕСТЬ, а последняя попытка упала.
 
     Это состояние, в котором владелец меняет ссылку или имена листов у уже
@@ -262,6 +273,12 @@ def write_snapshot_with_failed_attempt(sheets, rows, attempt_sheets,
     detailed = f"лист «{attempt_sheets[0]}»: источник ответил 500"
     source = ({"spreadsheet_id": attempt_id, "sheet_names": list(attempt_sheets)}
               if source_ok else "испорчено рукой")
+    # ЧАСТИЧНАЯ порча — отдельно от полной. Полностью нечитаемый источник
+    # попытки страница и раньше откатывала целиком; опасен именно тот случай,
+    # когда ОДНА из двух половин тройки цела: из неё собирается попытка,
+    # которой никто никогда не делал.
+    if source_override is not None:
+        source = source_override
     envelope = {
         "schema_version": ss.ENVELOPE_SCHEMA_VERSION,
         "parser_version": ss.PARSER_VERSION,
@@ -1381,6 +1398,231 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
         check("и снимок снова показан",
               data_rows() == 3 and total_line() == "показано 3 из 3",
               f"{data_rows()} {total_line()}")
+
+        # ── 9. Частично испорченная попытка: тройка годна ЦЕЛИКОМ ─────────
+        #
+        # Замечание ревью PR #47 на HEAD `6a3cabd`. Ссылка попытки и пара имён
+        # проверялись и откатывались НЕЗАВИСИМО, и потому из половины одной
+        # попытки и половины другой собиралась третья, которой владелец никогда
+        # не делал: адрес попытки с листами снимка либо адрес снимка с листами
+        # попытки. Повтор отправлял эту выдуманную комбинацию на сервер — то
+        # есть страница не просто показывала неправду, она её отправляла.
+        print("\n== Частично испорченная попытка не собирается в гибрид ==")
+        page.evaluate("() => { window.__supDelayMs = 0; window.__supDelayMatch = '';"
+                      " window.__supDelayLimit = -1; }")
+        good_url = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit"
+        tried_url = f"https://docs.google.com/spreadsheets/d/{ATTEMPT_SPREADSHEET_ID}/edit"
+
+        def field_of(fid: str) -> str:
+            return page.evaluate("(id) => { const n = document.getElementById(id);"
+                                 " return n ? n.value : null; }", fid)
+
+        def retry_body() -> str:
+            sent = []
+            page.route(REFRESH_RE, lambda route: (
+                sent.append(route.request.post_data or ""),
+                route.fulfill(status=502, content_type="application/json",
+                              body='{"detail":"снова не отдал CSV"}')))
+            page.click("#sup-refresh")
+            page.wait_for_timeout(1600)
+            page.unroute(REFRESH_RE)
+            return sent[-1] if sent else ""
+
+        def whole_triple_case(label: str, override) -> None:
+            """Половина попытки цела — значит не годна ВСЯ тройка."""
+            write_snapshot_with_failed_attempt(
+                [SHEET_A, SHEET_B],
+                [make_row(i + 1, SHEET_A) for i in range(3)],
+                [SHEET_C, SHEET_D], source_override=override)
+            page.goto(f"{base}/supply")
+            page.wait_for_timeout(1200)
+            check(f"{label}: ссылка — от УДАЧНОГО снимка целиком",
+                  field_of("sup-url") == good_url, str(field_of("sup-url")))
+            check(f"{label}: и оба имени листов — тоже его",
+                  field_of("sup-cur") == SHEET_A and field_of("sup-next") == SHEET_B,
+                  f"{field_of('sup-cur')} | {field_of('sup-next')}")
+            body = retry_body()
+            check(f"{label}: повтор отправил ТОЛЬКО значения снимка",
+                  SPREADSHEET_ID in body and SHEET_A in body and SHEET_B in body,
+                  body[:200])
+            check(f"{label}: и ни одной части попытки в теле нет",
+                  ATTEMPT_SPREADSHEET_ID not in body
+                  and SHEET_C not in body and SHEET_D not in body, body[:200])
+            check(f"{label}: строки прежнего снимка на экране целы",
+                  data_rows() == 3, str(data_rows()))
+
+        # Направление 1: адрес попытки ЦЕЛ, а имён не пара — было бы
+        # «адрес попытки + листы снимка».
+        whole_triple_case("одно имя вместо двух",
+                          {"spreadsheet_id": ATTEMPT_SPREADSHEET_ID,
+                           "sheet_names": [SHEET_C]})
+        # Направление 2: имена попытки целы, а адреса нет — было бы
+        # «адрес снимка + листы попытки».
+        whole_triple_case("нет идентификатора таблицы",
+                          {"spreadsheet_id": "", "sheet_names": [SHEET_C, SHEET_D]})
+        # Направление 3: адрес есть, но НЕ канонический (идентификатор испорчен
+        # так, что сегодняшнюю проверку он бы не прошёл), имена целы.
+        whole_triple_case("неканонический идентификатор",
+                          {"spreadsheet_id": "не идентификатор/../a",
+                           "sheet_names": [SHEET_C, SHEET_D]})
+        # И контроль сверху: ЦЕЛАЯ тройка по-прежнему работает целиком.
+        write_snapshot_with_failed_attempt(
+            [SHEET_A, SHEET_B], [make_row(i + 1, SHEET_A) for i in range(3)],
+            [SHEET_C, SHEET_D])
+        page.goto(f"{base}/supply")
+        page.wait_for_timeout(1200)
+        check("целая тройка: поля от попытки",
+              field_of("sup-url") == tried_url
+              and field_of("sup-cur") == SHEET_C
+              and field_of("sup-next") == SHEET_D,
+              f"{field_of('sup-url')} {field_of('sup-cur')} {field_of('sup-next')}")
+        body = retry_body()
+        check("и повтор отправляет попытку целиком, без примеси снимка",
+              ATTEMPT_SPREADSHEET_ID in body and SHEET_C in body and SHEET_D in body
+              and SPREADSHEET_ID not in body and SHEET_A not in body, body[:200])
+
+        # ── 10. Цена источника видна в строке ─────────────────────────────
+        #
+        # Замечание ревью PR #47 на HEAD `6a3cabd` (thread r3903352252).
+        # Парсер признаёт колонку 16 как `price_raw` и ИМЕННО ПОЭТОМУ исключает
+        # её из `unknown_raw` — то есть страховки «покажется как неизвестная
+        # колонка» у неё нет. А строка её не выводила вовсе: значение,
+        # написанное человеком в его таблице, исчезало из предпросмотра
+        # бесследно.
+        print("\n== Цена источника: видна, сырая и безопасная ==")
+        xss = '<img src=x onerror=alert(1)>'
+        write_snapshot([SHEET_A, SHEET_B], [
+            make_row(1, SHEET_A, price="12 900"),
+            make_row(2, SHEET_A),
+            make_row(3, SHEET_A, price=xss),
+        ])
+        page.goto(f"{base}/supply")
+        page.wait_for_timeout(1200)
+
+        def price_cells() -> list:
+            return page.evaluate(
+                "() => [...document.querySelectorAll('#sup-rows tr')]"
+                ".map(tr => { const c = tr.querySelector('td.sup-price');"
+                " return c ? c.textContent : null; }).filter(v => v !== null)")
+
+        cells = price_cells()
+
+        def cell_at(i):
+            """Отсутствующая ячейка обязана дать FAIL, а не уронить сценарий:
+            набор без строки `ИТОГО` раннер засчитывает как «нет отчёта»."""
+            return cells[i] if i < len(cells) else None
+
+        check("у каждой строки данных есть ячейка цены",
+              len(cells) == 3, str(cells))
+        check("цена стоит РОВНО в своей строке и как есть",
+              cell_at(0) == "12 900", str(cells))
+        check("строка без цены показывает честный прочерк, а не пустоту",
+              cell_at(1) == "—", str(cells))
+        check("и заголовок колонки назван словами",
+              "Цена источника" in (page.text_content("table.sup thead") or ""),
+              (page.text_content("table.sup thead") or "")[:200])
+        check("цена — сырой текст, разметкой она не становится",
+              cell_at(2) == xss
+              and page.evaluate("() => document.querySelectorAll("
+                                "'#sup-rows td.sup-price img').length") == 0,
+              str(cell_at(2)))
+
+        # Геометрия таблицы: шапка, строка данных, разделитель и заглушка —
+        # одна и та же ширина. Иначе колонка «поедет» у части строк.
+        cols = page.evaluate(
+            "() => document.querySelectorAll('table.sup thead th').length")
+        check("ширина строки данных совпадает с шапкой",
+              page.evaluate("() => { const tr = [...document.querySelectorAll("
+                            "'#sup-rows tr')].find(t => t.querySelector('td.sup-price'));"
+                            " return tr ? [...tr.children].reduce((n, td) =>"
+                            " n + (td.colSpan || 1), 0) : -1; }") == cols, str(cols))
+        write_snapshot([SHEET_A, SHEET_B], [
+            make_row(1, SHEET_A, price="12 900"),
+            {**make_row(2, SHEET_A), "is_blank": True},
+        ])
+        page.goto(f"{base}/supply")
+        page.wait_for_timeout(1200)
+        check("и ширина строки-разделителя тоже",
+              page.evaluate("() => { const tr = document.querySelector('#sup-rows tr.blank');"
+                            " return tr ? [...tr.children].reduce((n, td) =>"
+                            " n + (td.colSpan || 1), 0) : -1; }") == cols, str(cols))
+        page.route(GET_RE, lambda route: route.fulfill(
+            status=502, content_type="application/json",
+            body='{"detail":"чтение снимка не удалось"}'))
+        click_chip("Ошибки")
+        page.wait_for_timeout(1200)
+        check("и ширина заглушки с причиной отказа",
+              page.evaluate("() => { const tr = document.querySelector('#sup-rows tr');"
+                            " return tr ? [...tr.children].reduce((n, td) =>"
+                            " n + (td.colSpan || 1), 0) : -1; }") == cols, str(cols))
+        page.unroute(GET_RE)
+        click_chip("Все")
+        page.wait_for_timeout(1200)
+
+        # ── 11. Гонка версий снимка при догрузке ──────────────────────────
+        #
+        # Замечание ревью PR #47 на HEAD `6a3cabd` (thread r3903352240).
+        # Пока человек смотрит первую страницу, снимок могли обновить в другой
+        # вкладке или руками владельца. Догрузка проверяла только поколение
+        # ЭКРАНА — а оно не менялось, потому что фильтр тот же. В результате
+        # строки НОВОЙ версии дописывались к строкам СТАРОЙ, а сводка и счётчик
+        # брались от новой: одна таблица, собранная из двух источников правды.
+        print("\n== Догрузка не смешивает две версии снимка ==")
+        H1, H2 = "1" * 64, "2" * 64
+        write_snapshot([SHEET_A, SHEET_B],
+                       [make_row(i + 1, SHEET_A) for i in range(120)], H1)
+        page.goto(f"{base}/supply")
+        page.wait_for_timeout(1200)
+
+        def rows_of_sheet(name: str) -> int:
+            return page.evaluate(
+                "(s) => [...document.querySelectorAll('#sup-rows td.sup-src')]"
+                ".filter(td => td.textContent.indexOf(s) === 0).length", name)
+
+        check("исходно на экране первая страница версии H1",
+              data_rows() == 50 and total_line() == "показано 50 из 120"
+              and rows_of_sheet(SHEET_A) == 50,
+              f"{data_rows()} {total_line()} {rows_of_sheet(SHEET_A)}")
+
+        # Догрузка тормозится, и РОВНО В ЭТОТ момент снимок подменяется на
+        # другую версию: другой хеш, другие листы, другое число строк.
+        page.evaluate("() => { window.__supCalls = []; window.__supDelayMs = 2500;"
+                      " window.__supDelayMatch = 'offset=50';"
+                      " window.__supDelayLimit = 1; }")
+        page.click("#sup-more")
+        page.wait_for_timeout(300)
+        write_snapshot([SHEET_C, SHEET_D],
+                       [make_row(i + 1, SHEET_C) for i in range(60)], H2)
+        page.wait_for_timeout(4000)
+
+        check("ни одной строки прежней версии на экране не осталось",
+              rows_of_sheet(SHEET_A) == 0, str(rows_of_sheet(SHEET_A)))
+        check("показана согласованная новая версия с начала",
+              data_rows() == 50 and rows_of_sheet(SHEET_C) == 50
+              and total_line() == "показано 50 из 60",
+              f"{data_rows()} {rows_of_sheet(SHEET_C)} {total_line()}")
+        check("сводка тоже от новой версии, а не от смеси",
+              "60" in (page.text_content("#sup-summary") or ""),
+              (page.text_content("#sup-summary") or "")[:200])
+        after = get_calls()
+        check("перезапуск сходил ровно за началом нового вида",
+              after and "offset=0" in after[-1], str(after[-2:]))
+        check("и цикла не случилось — запросов немного",
+              len(after) <= 4, str(after))
+        check("кнопка догрузки жива и включена",
+              page.evaluate("() => { const b = document.getElementById('sup-more');"
+                            " return b.style.display !== 'none' && !b.disabled; }")
+              is True)
+
+        # Замок догрузки не заклинил: следующая страница НОВОЙ версии грузится.
+        page.evaluate("() => { window.__supCalls = []; window.__supDelayMs = 0;"
+                      " window.__supDelayMatch = ''; window.__supDelayLimit = -1; }")
+        page.click("#sup-more")
+        page.wait_for_timeout(1500)
+        check("следующая страница новой версии дозагрузилась",
+              data_rows() == 60 and total_line() == "показано 60 из 60"
+              and rows_of_sheet(SHEET_A) == 0,
+              f"{data_rows()} {total_line()} {rows_of_sheet(SHEET_A)}")
 
         check("на странице не было ошибок в консоли", not errors, str(errors)[:200])
         ctx.close()

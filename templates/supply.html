@@ -108,6 +108,7 @@
               <th class="num">L</th><th class="num">XL</th>
               <th class="num">Итог источника</th>
               <th class="num">Сумма размеров</th>
+              <th>Цена источника</th>
               <th>Статус и комментарии источника</th>
               <th>Что не так</th>
             </tr>
@@ -168,6 +169,14 @@ document.addEventListener("DOMContentLoaded", function () {
   // такого ответа гасится здесь и превращается в этот маркер, чтобы `.catch()`
   // выше по цепочке не сработал, а `.then()` (восстановление кнопок) — сработал.
   var STALE = {stale: true};
+  // Версия снимка, которой принадлежат ПОКАЗАННЫЕ строки. Замечание ревью
+  // PR #47 на HEAD `6a3cabd`: догрузка проверяла только поколение ЭКРАНА, а
+  // оно не меняется от того, что снимок обновили в другой вкладке. Строки
+  // новой версии дописывались к строкам старой, сводка и счётчик брались от
+  // новой — одна таблица, собранная из двух источников правды. Поколение
+  // отвечает на вопрос «тот ли это вид», а этот хеш — на другой: «та ли это
+  // версия данных». Ответ на первый вопрос не заменяет ответа на второй.
+  var viewHash = null;
   // Замок догрузки. Ровно один запрос догрузки за раз — без него двойной клик
   // по «Показать ещё» отправлял два запроса и дважды двигал общий offset ДО
   // ответа.
@@ -203,6 +212,33 @@ document.addEventListener("DOMContentLoaded", function () {
     if (!btn) return;
     btn.disabled = refreshBusy;
     btn.textContent = REFRESH_LABELS[refreshBusy ? 1 : 0];
+  }
+
+  //: Каноническая ссылка на таблицу — РОВНО та форма, которую собирает сервер
+  //: (`spreadsheet_link()`), и ровно тот набор символов идентификатора, который
+  //: пропускает серверный allowlist. Проверка нужна потому, что ссылку попытки
+  //: сервер строит из СОХРАНЁННОГО идентификатора, не перепроверяя его: в
+  //: испорченном носителе там может лежать что угодно.
+  //: Сколько колонок в таблице предпросмотра. Одно число на все места, где
+  //: строка занимает всю ширину (разделитель, «строк нет», заглушка отказа):
+  //: пока их было три и каждое несло свой литерал, добавление колонки ломало
+  //: геометрию ровно в тех строках, которые никто не смотрит первыми.
+  var SUP_COLUMNS = document.querySelectorAll("table.sup thead th").length;
+
+  var CANONICAL_SOURCE_URL =
+    /^https:\/\/docs\.google\.com\/spreadsheets\/d\/[A-Za-z0-9_-]{10,120}\/edit$/;
+
+  // Пригодна ли попытка ЦЕЛИКОМ: канонический адрес и ровно два непустых
+  // имени. Возвращает тройку или null — половины не бывает.
+  function attemptTriple(attempt) {
+    if (!attempt) return null;
+    var url = attempt.spreadsheet_url;
+    var names = attempt.sheet_names;
+    if (typeof url !== "string" || !CANONICAL_SOURCE_URL.test(url)) return null;
+    if (!names || names.length !== 2) return null;
+    if (typeof names[0] !== "string" || typeof names[1] !== "string") return null;
+    if (!names[0].trim() || !names[1].trim()) return null;
+    return { url: url, names: [names[0], names[1]] };
   }
 
   function el(tag, cls, text) {
@@ -321,21 +357,24 @@ document.addEventListener("DOMContentLoaded", function () {
     // Участнику это состояние не адресовано вовсе: `attempt` ему сервер не
     // отдаёт (D-51), а до этой строки роль участника не доходит — выше стоит
     // ранний возврат.
+    // ТРОЙКА ГОДНА ЦЕЛИКОМ ИЛИ НЕ ГОДНА ВОВСЕ — замечание ревью PR #47 на
+    // HEAD `6a3cabd`. Прежняя редакция проверяла адрес и пару имён по
+    // отдельности и по отдельности же откатывала. Стоило одной половине
+    // источника попытки испортиться, как из уцелевшей половины и половины
+    // снимка собиралась ТРЕТЬЯ попытка, которой никто никогда не делал:
+    // «адрес попытки + листы снимка» либо «адрес снимка + листы попытки».
+    // И это не косметика: повтор отправлял эту выдуманную комбинацию на
+    // сервер — то есть страница не показывала неправду, а совершала её.
+    //
+    // Попытка — один неделимый ввод человека: он вводил адрес и два имени
+    // вместе, и вместе же они уезжали. Значит и восстанавливать их можно
+    // только вместе. Не удалось доказать все три — берём все три из
+    // последнего удачного снимка.
     var attempt = data.attempt || {};
     var failedNow = !!(data.last_error);
-    // Испорченный или отсутствующий источник попытки не должен ни ломать
-    // экран, ни показывать мусор: тогда честнее вернуться к успешным
-    // значениям. Имена берутся ПАРОЙ — половина одной попытки и половина
-    // другой не была ни введена человеком, ни отправлена на сервер.
-    var tried = (failedNow && typeof attempt.spreadsheet_url === "string")
-      ? attempt.spreadsheet_url : "";
-    var triedNames = [];
-    if (failedNow && attempt.sheet_names && attempt.sheet_names.length === 2
-        && attempt.sheet_names[0] && attempt.sheet_names[1]) {
-      triedNames = attempt.sheet_names;
-    }
-    var srcUrl = tried || data.spreadsheet_url || "";
-    var names = triedNames.length ? triedNames
+    var triple = failedNow ? attemptTriple(attempt) : null;
+    var srcUrl = triple ? triple.url : (data.spreadsheet_url || "");
+    var names = triple ? triple.names
       : ((data.sheet_names && data.sheet_names.length) ? data.sheet_names : []);
     form.appendChild(field("sup-url", "Ссылка на таблицу Google Sheets",
       srcUrl, "wide",
@@ -581,7 +620,7 @@ document.addEventListener("DOMContentLoaded", function () {
 
     if (r.is_blank) {
       var empty = el("td", null, "пустая строка-разделитель");
-      empty.colSpan = 12;
+      empty.colSpan = SUP_COLUMNS - 1;   // первая колонка занята «лист · строка»
       tr.appendChild(empty);
       return tr;
     }
@@ -624,6 +663,18 @@ document.addEventListener("DOMContentLoaded", function () {
 
     tr.appendChild(el("td", "num", num(r.size_sum)));
 
+    // ЦЕНА ИСТОЧНИКА — замечание ревью PR #47 на HEAD `6a3cabd`. Парсер
+    // признаёт колонку 16 как `price_raw` и ИМЕННО ПОЭТОМУ исключает её из
+    // `unknown_raw`: страховки «покажется как неизвестная колонка» у неё нет.
+    // А строка её не выводила вовсе — то, что человек написал в своей
+    // таблице, исчезало из предпросмотра бесследно.
+    //
+    // Показывается СЫРОЙ текст, и только он: ни числа, ни валюты, ни
+    // разделителей разрядов. «12 900» может быть рублями, юанями или пометкой
+    // «12 900 за партию» — доказать мы этого не можем, а показать как есть
+    // можем. Та же логика, по которой `source_status_raw` остаётся текстом.
+    tr.appendChild(el("td", "sup-raw sup-price", r.price_raw || "—"));
+
     var notes = el("td", "sup-raw");
     // Три колонки комментариев источника выводятся как три отдельные строки:
     // в таблице это три разные колонки, и человек ищет свою пометку там, где
@@ -664,7 +715,7 @@ document.addEventListener("DOMContentLoaded", function () {
       var td = el("td", "hint", data.configured
         ? "В этом фильтре строк нет."
         : "Источник ещё не читался.");
-      td.colSpan = 13;
+      td.colSpan = SUP_COLUMNS;
       tr.appendChild(td);
       body.appendChild(tr);
     }
@@ -697,6 +748,7 @@ document.addEventListener("DOMContentLoaded", function () {
     state.offset = 0;
     shown = 0;
     last = null;
+    viewHash = null;
     var body = document.getElementById("sup-rows");
     clear(body);
     document.getElementById("sup-total").textContent = "";
@@ -713,7 +765,7 @@ document.addEventListener("DOMContentLoaded", function () {
     clear(body);
     var tr = el("tr");
     var td = el("td", "hint", text);
-    td.colSpan = 13;
+    td.colSpan = SUP_COLUMNS;
     if (retry) {
       var btn = el("button", "btn sm", "Повторить");
       btn.id = "sup-retry";
@@ -767,10 +819,28 @@ document.addEventListener("DOMContentLoaded", function () {
             (state.sheet ? "&sheet=" + encodeURIComponent(state.sheet) : "");
     return api("/api/supply/sheets" + q).then(function (data) {
       if (myGen !== gen) return STALE;   // поздний ответ прежнего вида — молча
+      var hash = data.content_sha256 || "";
+      if (append && hash !== (viewHash || "")) {
+        // СНИМОК СМЕНИЛСЯ, ПОКА ЧЕЛОВЕК СМОТРЕЛ ПЕРВУЮ СТРАНИЦУ. Дописать эти
+        // строки к показанным нельзя: они из другой версии таблицы, и вместе
+        // они не были правдой ни в один момент времени. Склеить их означало бы
+        // показать документ, которого не существует, — а сводку и счётчик к
+        // нему взять от одной из версий, то есть подписать чужую сумму.
+        //
+        // Поэтому текущий фильтр перезапускается ОДНИМ ходом с начала — той же
+        // дверью `switchView()`, что и смена фильтра: поколение растёт, старые
+        // строки снимаются вместе со счётчиком и кнопкой, и на экран приходит
+        // одна согласованная версия. Цикла здесь быть не может: перезапуск
+        // идёт без `append`, а версия сверяется только у догрузки.
+        toast("Снимок источника обновился — список перечитан с начала.", "");
+        switchView(null);
+        return STALE;
+      }
       // Позиция фиксируется ТОЛЬКО после успеха. Отказ её не двигает, поэтому
       // повторный клик повторяет ровно ту же страницу, а не следующую.
       state.offset = offset;
       last = data;
+      if (!append) viewHash = hash;
       if (data.disclaimer) {
         var note = document.getElementById("sup-note");
         clear(note);

@@ -2218,12 +2218,37 @@ def structural_checks(owner) -> None:
           'slink.href = "/settings";' in template)
     check("поля формы предпочитают ввод последней НЕУДАЧНОЙ попытки",
           "var failedNow = !!(data.last_error);" in template
-          and "var srcUrl = tried || data.spreadsheet_url" in template)
+          and "var srcUrl = triple ? triple.url" in template)
     check("а имена листов берутся парой либо не берутся вовсе",
-          "attempt.sheet_names.length === 2" in template
-          and "var names = triedNames.length ? triedNames" in template)
+          "names.length !== 2" in template
+          and "var names = triple ? triple.names" in template)
     check("ссылка «открыть исходник» осталась на УСПЕШНОМ снимке",
           "a.href = data.spreadsheet_url;" in template)
+
+    # Корректив по ревью на HEAD `6a3cabd`. Поведение всех трёх проверяет
+    # браузерный набор; здесь — офлайновые структурные замки рядом с ним.
+    check("тройка попытки проверяется целиком, одной функцией",
+          "function attemptTriple(attempt)" in template
+          and "var triple = failedNow ? attemptTriple(attempt) : null;" in template)
+    check("и адрес попытки сверяется с КАНОНИЧЕСКОЙ формой",
+          "CANONICAL_SOURCE_URL" in template
+          and "docs\\.google\\.com" in template)
+    check("половины тройки не берутся по отдельности",
+          "var srcUrl = triple ? triple.url" in template
+          and "var names = triple ? triple.names" in template)
+    check("догрузка сверяет версию снимка, а не только поколение вида",
+          "var viewHash = null;" in template
+          and 'if (append && hash !== (viewHash || "")) {' in template)
+    check("и при расхождении перезапускает вид с начала, а не дописывает",
+          "switchView(null);" in template.split("if (append && hash !==")[1]
+          .split("return STALE;")[0])
+    check("цена источника выводится сырой отдельной ячейкой",
+          'el("td", "sup-raw sup-price", r.price_raw || "—")' in template)
+    check("и у неё есть своя подпись в шапке",
+          "<th>Цена источника</th>" in template)
+    check("ширина «широких» строк не выписана числом в трёх местах",
+          "colSpan = 13" not in template and "colSpan = 12" not in template
+          and template.count("SUP_COLUMNS") >= 4)
     check("кнопка обновления восстанавливается при ЛЮБОМ исходе",
           ".then(restore, restore);" in template)
     check("неполный итог штук называется словами, а не числом",
