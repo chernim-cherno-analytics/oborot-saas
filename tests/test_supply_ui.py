@@ -101,6 +101,9 @@ SHEET_A, SHEET_B = "Осень 26", "НГ 26/27"
 SENTINEL_SHEET = "Щ-сентинель-Ui7Kq9Zt"
 SHEET_C, SHEET_D = "Весна 27", "Лето 27"
 SPREADSHEET_ID = "1AbCdEf_ghijklmnop-QRSTUV0123456789wxyz"
+#: Таблица НЕУДАВШЕЙСЯ попытки. Отличается от успешной намеренно: иначе
+#: «в поле стоит адрес попытки» и «в поле стоит адрес снимка» неразличимы.
+ATTEMPT_SPREADSHEET_ID = "2ZyXwVu_ponmlkjihg-FEDCBA9876543210zyxw"
 
 #: Запросы страницы к API. `?` в glob playwright значим, поэтому адреса
 #: сопоставляются регулярным выражением, а не шаблоном со звёздочками.
@@ -235,6 +238,90 @@ def write_failed_attempt(sheets, detailed: str, public: str,
         cfg[ss.ENVELOPE_KEY] = envelope
         con.execute("UPDATE connections SET config_json = ? WHERE id = ?",
                     (json.dumps(cfg, ensure_ascii=False), row[0]))
+        con.commit()
+    finally:
+        con.close()
+
+
+def write_snapshot_with_failed_attempt(sheets, rows, attempt_sheets,
+                                       attempt_id: str = ATTEMPT_SPREADSHEET_ID,
+                                       source_ok: bool = True) -> None:
+    """Самое живое состояние владельца: снимок ЕСТЬ, а последняя попытка упала.
+
+    Это состояние, в котором владелец меняет ссылку или имена листов у уже
+    настроенного источника и промахивается. На сервере оно выглядит так:
+    успешные поля снимка (`spreadsheet_id`, `sheet_names`, `rows`, `counts`,
+    `last_success_at`) остаются прежними, а `last_error` и
+    `last_attempt_source` описывают НОВУЮ, неудачную попытку — ровно то, что
+    делает `_record_failure()`.
+
+    `source_ok=False` даёт испорченный источник попытки: читатель обязан
+    безопасно откатиться к успешным значениям, а не показать мусор.
+    """
+    attempt_at = "2026-08-31T15:00:00+00:00"
+    detailed = f"лист «{attempt_sheets[0]}»: источник ответил 500"
+    source = ({"spreadsheet_id": attempt_id, "sheet_names": list(attempt_sheets)}
+              if source_ok else "испорчено рукой")
+    envelope = {
+        "schema_version": ss.ENVELOPE_SCHEMA_VERSION,
+        "parser_version": ss.PARSER_VERSION,
+        # Успешный снимок — прежний, его неудача не трогает.
+        "spreadsheet_id": SPREADSHEET_ID,
+        "sheet_names": list(sheets),
+        "content_sha256": "0" * 64,
+        "last_success_at": "2026-08-31T12:00:00+00:00",
+        "fetched_at": "2026-08-31T12:00:00+00:00",
+        # Поля ПОПЫТКИ — новые.
+        "last_attempt_at": attempt_at,
+        "last_error": detailed,
+        "last_error_public": "лист источника: источник ответил 500",
+        "last_error_public_code": "unavailable",
+        "last_error_public_binding": ss._public_binding(
+            "unavailable", detailed, attempt_at, source),
+        "last_attempt_source": source,
+        "schema": {}, "counts": ss.build_counts(rows, list(sheets)), "rows": rows,
+    }
+    con = sqlite3.connect(DB_PATH)
+    try:
+        row = con.execute("SELECT id, config_json FROM connections"
+                          " ORDER BY id LIMIT 1").fetchone()
+        cfg = json.loads(row[1] or "{}")
+        cfg[ss.ENVELOPE_KEY] = envelope
+        con.execute("UPDATE connections SET config_json = ? WHERE id = ?",
+                    (json.dumps(cfg, ensure_ascii=False), row[0]))
+        con.commit()
+    finally:
+        con.close()
+
+
+def drop_carriers():
+    """Убрать ВСЕ основные связи организации: `carrier_present` станет false.
+
+    Возвращает (колонки, строки), чтобы состояние можно было вернуть на место
+    целиком: следующие сценарии набора рассчитывают на живого носителя.
+    Колонки читаются из схемы, а не выписываются здесь — иначе набор ломался бы
+    от любой будущей колонки, к нему отношения не имеющей.
+    """
+    con = sqlite3.connect(DB_PATH)
+    try:
+        cols = [r[1] for r in con.execute("PRAGMA table_info(connections)")]
+        rows = con.execute(
+            f"SELECT {', '.join(cols)} FROM connections ORDER BY id").fetchall()
+        con.execute("DELETE FROM connections")
+        con.commit()
+        return cols, rows
+    finally:
+        con.close()
+
+
+def restore_carriers(saved) -> None:
+    cols, rows = saved
+    placeholders = ", ".join("?" * len(cols))
+    con = sqlite3.connect(DB_PATH)
+    try:
+        for r in rows:
+            con.execute(f"INSERT INTO connections ({', '.join(cols)})"
+                        f" VALUES ({placeholders})", r)
         con.commit()
     finally:
         con.close()
@@ -1105,6 +1192,195 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
               not merrors, str(merrors)[:200])
         mctx.close()
         mc.close()
+
+        # ── 7. Настроенный источник + упавшая НОВАЯ попытка ────────────────
+        #
+        # Замечание ревью PR #47 на HEAD `5e21ba1` (thread r3898968262).
+        # Владелец у уже настроенного источника меняет ссылку или имена листов,
+        # и обновление падает. Сервер это состояние хранит правильно: успешный
+        # снимок A/B остаётся снимком, а НОВАЯ попытка C/D лежит в `attempt`.
+        # Форма же предпочитала `data.spreadsheet_url`/`data.sheet_names` и
+        # подставляла обратно A/B — при том что текст под ошибкой обещает
+        # «ссылка и имена листов сохранены в форме выше». Владелец, поправив
+        # одну букву в имени листа, терял свой ввод и восстанавливал его по
+        # памяти; а повторный клик уходил со СТАРЫМИ значениями, то есть
+        # «Повторить» повторял не ту попытку, которая упала.
+        print("\n== Настроен + новая попытка упала: в форме ввод ПОПЫТКИ ==")
+        page.evaluate("() => { window.__supDelayMs = 0; window.__supDelayMatch = '';"
+                      " window.__supDelayLimit = -1; }")
+        write_snapshot_with_failed_attempt(
+            [SHEET_A, SHEET_B], [make_row(i + 1, SHEET_A) for i in range(3)],
+            [SHEET_C, SHEET_D])
+        page.goto(f"{base}/supply")
+        page.wait_for_timeout(1200)
+
+        def field_value(fid: str) -> str:
+            return page.evaluate("(id) => { const n = document.getElementById(id);"
+                                 " return n ? n.value : null; }", fid)
+
+        # Снимок на экране — ПРЕЖНИЙ. Его неудача не трогает, и это прежнее
+        # решение D-51, а не побочный эффект правки.
+        check("строки прежнего успешного снимка остались на экране",
+              data_rows() == 3 and total_line() == "показано 3 из 3",
+              f"{data_rows()} {total_line()}")
+        check("и сводка тоже от прежнего снимка",
+              (page.text_content("#sup-summary") or "").strip() != "")
+        check("ссылка «открыть исходник» ведёт на УСПЕШНУЮ таблицу, не на попытку",
+              page.evaluate("() => { const a = document.querySelector('#sup-src-link a');"
+                            " return a ? a.getAttribute('href') : ''; }")
+              == f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit",
+              page.evaluate("() => { const a = document.querySelector('#sup-src-link a');"
+                            " return a ? a.getAttribute('href') : ''; }"))
+
+        # А поля формы — от ПОПЫТКИ: чинить владелец идёт именно её.
+        check("в поле ссылки стоит адрес НЕУДАВШЕЙСЯ попытки",
+              field_value("sup-url")
+              == f"https://docs.google.com/spreadsheets/d/{ATTEMPT_SPREADSHEET_ID}/edit",
+              str(field_value("sup-url")))
+        check("и имена листов — тоже её",
+              field_value("sup-cur") == SHEET_C
+              and field_value("sup-next") == SHEET_D,
+              f"{field_value('sup-cur')} | {field_value('sup-next')}")
+        check("совет при этом обещает ровно то, что на экране есть",
+              "в форме выше" in (page.text_content("#sup-error") or ""),
+              (page.text_content("#sup-error") or "")[:160])
+
+        # Повторный клик обязан повторить ТУ попытку, которая упала.
+        posted = []
+
+        def capture_refresh(route):
+            posted.append(route.request.post_data or "")
+            route.fulfill(status=502, content_type="application/json",
+                          body='{"detail":"источник снова не отдал CSV"}')
+
+        page.route(REFRESH_RE, capture_refresh)
+        page.click("#sup-refresh")
+        page.wait_for_timeout(1600)
+        body = posted[-1] if posted else ""
+        check("повторный клик отправил адрес ПОПЫТКИ, а не прежнего снимка",
+              ATTEMPT_SPREADSHEET_ID in body and SPREADSHEET_ID not in body,
+              body[:200])
+        check("и её имена листов, без повторного ввода руками",
+              SHEET_C in body and SHEET_D in body
+              and SHEET_A not in body and SHEET_B not in body, body[:200])
+        page.unroute(REFRESH_RE)
+
+        # Участнику неудачная попытка не адресована вовсе — прежнее решение
+        # D-51, и правка формы его не ослабляет.
+        m2 = httpx.Client(headers={"X-Oborot-CSRF": "1"}, base_url=base, timeout=60.0)
+        m2.post("/login", data={"email": "supply-ui-member@test.io",
+                                "password": "secret123"})
+        m2ctx = browser.new_context(viewport={"width": 1400, "height": 900})
+        m2ctx.add_cookies([{"name": k, "value": v, "domain": "127.0.0.1", "path": "/"}
+                           for k, v in m2.cookies.items()])
+        m2page = m2ctx.new_page()
+        m2errors: list[str] = []
+        m2page.on("pageerror", lambda e: m2errors.append(str(e)))
+        m2page.goto(f"{base}/supply")
+        m2page.wait_for_timeout(1200)
+        member_api = m2.get("/api/supply/sheets?limit=200").text
+        check("участнику адрес и листы попытки не отдаются вовсе",
+              ATTEMPT_SPREADSHEET_ID not in member_api
+              and SHEET_C not in member_api and SHEET_D not in member_api,
+              member_api[:200])
+        check("и на его экране их тоже нет",
+              ATTEMPT_SPREADSHEET_ID not in (m2page.content() or "")
+              and SHEET_C not in (m2page.text_content("body") or ""),
+              (m2page.text_content("#sup-error") or "")[:160])
+        check("прежний снимок участник по-прежнему видит целиком",
+              m2page.evaluate("() => document.querySelectorAll("
+                              "'#sup-rows td.sup-src').length") == 3)
+        check("страница участника без ошибок в консоли", not m2errors,
+              str(m2errors)[:200])
+        m2ctx.close()
+        m2.close()
+
+        # Испорченный источник попытки — безопасный откат к успешным значениям,
+        # а не мусор в полях и не пустая форма.
+        print("\n== Испорченная попытка: откат к успешным значениям ==")
+        write_snapshot_with_failed_attempt(
+            [SHEET_A, SHEET_B], [make_row(i + 1, SHEET_A) for i in range(3)],
+            [SHEET_C, SHEET_D], source_ok=False)
+        page.goto(f"{base}/supply")
+        page.wait_for_timeout(1200)
+        check("в поле ссылки — адрес удачного снимка",
+              field_value("sup-url")
+              == f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit",
+              str(field_value("sup-url")))
+        check("и его же имена листов",
+              field_value("sup-cur") == SHEET_A
+              and field_value("sup-next") == SHEET_B,
+              f"{field_value('sup-cur')} | {field_value('sup-next')}")
+        check("строки при этом на месте, экран не сломался",
+              data_rows() == 3, str(data_rows()))
+
+        # ── 8. Владелец без носителя: формы нет, есть причина и дорога ─────
+        #
+        # Замечание ревью PR #47 на HEAD `5e21ba1` (thread r3898968267).
+        # У организации нет ни МойСклад, ни демо-подключения — снимку негде
+        # жить. Сервер отвечает на POST кодом 409 ГАРАНТИРОВАННО и ДО единого
+        # сетевого вызова, а страница всё равно строила рабочую форму и
+        # включённую кнопку: человека просили ввести три значения ради
+        # действия, которое не может получиться. Это тот же класс ошибки, что
+        # уже закрыт для приостановленной подписки, — и закрывается он так же.
+        print("\n== Нет носителя: формы и кнопки нет, есть причина и /settings ==")
+        saved_carriers = drop_carriers()
+        try:
+            page.evaluate("() => { window.__supCalls = []; }")
+            page.goto(f"{base}/supply")
+            page.wait_for_timeout(1200)
+            check("сервер действительно сообщает, что носителя нет",
+                  c.get("/api/supply/sheets").json().get("carrier_present") is False)
+            check("поля ссылки на экране нет вовсе",
+                  page.evaluate("() => !!document.getElementById('sup-url')") is False)
+            check("и полей листов тоже нет",
+                  page.evaluate("() => !!document.getElementById('sup-cur')") is False
+                  and page.evaluate("() => !!document.getElementById('sup-next')")
+                  is False)
+            check("и кнопки обновления нет",
+                  page.evaluate("() => !!document.getElementById('sup-refresh')")
+                  is False)
+            form_text = page.text_content("#sup-form-wrap") or ""
+            check("названа причина: хранить предпросмотр негде",
+                  "подключени" in form_text.lower() and "негде" in form_text.lower(),
+                  form_text[:200])
+            settings_href = page.evaluate(
+                "() => { const a = [...document.querySelectorAll('#sup-form-wrap a')]"
+                ".find(x => x.getAttribute('href') === '/settings');"
+                " return a ? a.getAttribute('href') : ''; }")
+            check("и дана дорога — ссылка на «Настройки»",
+                  settings_href == "/settings", str(settings_href))
+            check("ссылка рабочая, а не украшение",
+                  c.get("/settings").status_code == 200,
+                  str(c.get("/settings").status_code))
+            check("страница при этом ни одного POST обновления не отправила",
+                  all("/refresh" not in u for u in calls()), str(calls()))
+            # Серверная граница не ослаблена: прямой POST по-прежнему 409 и
+            # по-прежнему ДО сети и без единой записи.
+            before_blob = carrier_blob()
+            direct = c.post("/api/supply/sheets/refresh",
+                            json={"spreadsheet_url":
+                                  f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit",
+                                  "sheet_names": [SHEET_A, SHEET_B]})
+            check("прямой POST в обход страницы — 409, а не 200",
+                  direct.status_code == 409, f"{direct.status_code} {direct.text[:110]}")
+            check("и он ничего не записал", carrier_blob() == before_blob)
+        finally:
+            restore_carriers(saved_carriers)
+
+        # Носитель вернулся — форма и кнопка обязаны вернуться вместе с ним.
+        write_snapshot([SHEET_A, SHEET_B], [make_row(i + 1, SHEET_A) for i in range(3)])
+        page.goto(f"{base}/supply")
+        page.wait_for_timeout(1200)
+        check("носитель вернулся — вернулась и форма",
+              page.evaluate("() => !!document.getElementById('sup-url')") is True
+              and page.evaluate("() => !!document.getElementById('sup-cur')") is True)
+        check("и рабочая кнопка обновления",
+              page.evaluate("() => { const b = document.getElementById('sup-refresh');"
+                            " return !!b && !b.disabled; }") is True)
+        check("и снимок снова показан",
+              data_rows() == 3 and total_line() == "показано 3 из 3",
+              f"{data_rows()} {total_line()}")
 
         check("на странице не было ошибок в консоли", not errors, str(errors)[:200])
         ctx.close()

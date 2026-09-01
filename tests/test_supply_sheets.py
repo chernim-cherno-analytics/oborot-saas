@@ -2205,6 +2205,25 @@ def structural_checks(owner) -> None:
     check("и кнопка рождается в текущем состоянии обновления",
           "btn.disabled = refreshBusy;" in template
           and "REFRESH_LABELS[refreshBusy ? 1 : 0]" in template)
+
+    # Корректив по ревью на HEAD `5e21ba1`. Поведение обоих исправлений
+    # проверяет браузерный набор; здесь — только структурные замки, и они
+    # стоят РЯДОМ с ним, а не вместо: этот набор офлайновый и отработает даже
+    # там, где Chromium не поднялся.
+    check("нет носителя — ветка стоит ДО построения формы, а не после",
+          "if (!data.carrier_present) {" in template
+          and template.index("if (!data.carrier_present) {")
+          < template.index('var form = el("div", "sup-form")'))
+    check("и она ведёт в «Настройки», а не в никуда",
+          'slink.href = "/settings";' in template)
+    check("поля формы предпочитают ввод последней НЕУДАЧНОЙ попытки",
+          "var failedNow = !!(data.last_error);" in template
+          and "var srcUrl = tried || data.spreadsheet_url" in template)
+    check("а имена листов берутся парой либо не берутся вовсе",
+          "attempt.sheet_names.length === 2" in template
+          and "var names = triedNames.length ? triedNames" in template)
+    check("ссылка «открыть исходник» осталась на УСПЕШНОМ снимке",
+          "a.href = data.spreadsheet_url;" in template)
     check("кнопка обновления восстанавливается при ЛЮБОМ исходе",
           ".then(restore, restore);" in template)
     check("неполный итог штук называется словами, а не числом",
