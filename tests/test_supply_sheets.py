@@ -4542,6 +4542,157 @@ def saved_sheet_names_checks() -> None:  # noqa: C901 — матрица фор�
         boss.close()
 
 
+def _uncodable(value: str) -> bool:
+    """Строка, которую физически нельзя записать в UTF-8. Фикстура, а не мнение."""
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return True
+    return False
+
+
+def surrogate_name_checks() -> None:  # noqa: C901 — две границы, ветвлений мало
+    """Одиночный суррогат — не имя листа, и обе границы обязаны это знать.
+
+    Блокирующий P1 на HEAD `7fda666` (REVIEW_REJECT issuecomment-5499288357),
+    воспроизведённый независимо. `_sheet_name_problem()` проверял четыре вещи —
+    тип, пустоту, длину и управляющие символы, — и ни одна из них суррогат не
+    ловит: `"\\ud800"` остаётся `str`, непустой, короткой и без управляющих
+    символов. Но в UTF-8 такая строка не кодируется ВООБЩЕ, и потому 500
+    приходил с двух сторон сразу:
+
+      * на ЧТЕНИИ — сохранённый настроенный снимок проходил проверку, `preview()`
+        возвращал значение наружу, и `UnicodeEncodeError: surrogates not
+        allowed` вылетал уже в сериализации ответа. То есть новая граница,
+        поставленная РАДИ управляемого 409, сама давала мёртвый GET;
+      * на ЗАПИСИ — `build_csv_url()` падал тем же исключением ДО единого
+        сетевого вызова, и владелец получал 500 вместо 400.
+
+    Отсюда форма проверки: не «запретить суррогаты», а «запретить то, что
+    нельзя закодировать». Суррогат — частный случай, и перечислять частные
+    случаи здесь значило бы ждать следующего.
+    """
+    print("\n== Одиночный суррогат в имени листа: 400 до сети и 409 без записи ==")
+    HIGH = json.loads('"\\ud800"')          # высокий суррогат
+    LOW = json.loads('"\\udfff"')           # низкий суррогат
+    PAIR_HIGH = json.loads('"\\ud83d"')     # первая половина эмодзи, одна
+    check("фикстура и правда некодируема, а не «похожа на»",
+          all(_uncodable(x) for x in (HIGH, LOW, PAIR_HIGH)),
+          repr([HIGH, LOW, PAIR_HIGH]))
+
+    # ── Граница ВВОДА: 400 и ни одного сетевого вызова ──────────────────────
+    boss = client()
+    boss.post("/register", data={"name": "Суррогат",
+                                 "email": "sheets-surr@test.io",
+                                 "password": "secret123", "org_name": "Бренд-СР"})
+    boss.post("/api/connect/demo")
+    org_id = sql("SELECT org_id FROM memberships WHERE user_id ="
+                 " (SELECT id FROM users WHERE email = 'sheets-surr@test.io')")[0][0]
+    conn_id = sql("SELECT id FROM connections WHERE org_id = ? ORDER BY id",
+                  org_id)[0][0]
+
+    def carrier_blob() -> str:
+        return sql("SELECT config_json FROM connections WHERE id = ?",
+                   conn_id)[0][0]
+
+    fake = FakeGoogle()
+    ss.set_transport(fake)
+    try:
+        for label, bad in (("высокий", HIGH), ("низкий", LOW),
+                           ("половина пары", PAIR_HIGH)):
+            for position, names in ((f"{label} первым", [bad, SHEET_NEXT]),
+                                    (f"{label} вторым", [SHEET_CURRENT, bad])):
+                calls_before = len(fake.calls)
+                before = carrier_blob()
+                # Тело собирается ВРУЧНУЮ и уезжает чистым ASCII: суррогат
+                # едет экранированной последовательностью `\ud800`, как его и
+                # прислал бы любой посторонний HTTP-клиент. Через `json=`
+                # httpx его закодировать не может вовсе — и это ограничение
+                # клиента, а не факт о продукте: сервер такое тело принимает и
+                # разбирает, что и делает границу настоящей.
+                body = json.dumps({"spreadsheet_url": SHEET_URL,
+                                   "sheet_names": names},
+                                  ensure_ascii=True).encode("ascii")
+                r = boss.post("/api/supply/sheets/refresh", content=body,
+                              headers={"Content-Type": "application/json"})
+                check(f"ввод, {position}: управляемый 400, а не 500",
+                      r.status_code == 400, f"{r.status_code} {r.text[:140]}")
+                check(f"ввод, {position}: ни одного сетевого вызова",
+                      len(fake.calls) == calls_before,
+                      f"{len(fake.calls) - calls_before} вызов(ов)")
+                check(f"ввод, {position}: носитель не тронут",
+                      carrier_blob() == before)
+                check(f"ввод, {position}: сырое значение в ответе не повторено",
+                      bad not in r.text, r.text[:140])
+            # И на самом валидаторе — тем же предикатом, без HTTP.
+            check(f"валидатор ввода отвергает суррогат ({label})",
+                  raises(lambda b=bad: ss.validate_sheet_names([b, SHEET_NEXT]),
+                         ss.ValidationError) != "")
+            check(f"предикат называет причину, а не молчит ({label})",
+                  bool(ss._sheet_name_problem(bad)),
+                  repr(ss._sheet_name_problem(bad)))
+
+        # ── Граница СОХРАНЁННОГО снимка: 409, ни записи, ни эха ────────────
+        r = boss.post("/api/supply/sheets/refresh",
+                      json={"spreadsheet_url": SHEET_URL,
+                            "sheet_names": [SHEET_CURRENT, SHEET_NEXT]})
+        check("законный снимок создан", r.status_code == 200, r.text[:140])
+        good_cfg = json.loads(carrier_blob())
+        good_rows = good_cfg[ss.ENVELOPE_KEY]["rows"]
+
+        for label, bad in (("высокий", HIGH), ("низкий", LOW),
+                           ("половина пары", PAIR_HIGH)):
+            for where in ("sheet_names", "last_attempt_source"):
+                spoiled = json.loads(json.dumps(good_cfg, ensure_ascii=False))
+                env = spoiled[ss.ENVELOPE_KEY]
+                if where == "sheet_names":
+                    env["sheet_names"] = [bad, SHEET_NEXT]
+                else:
+                    env["last_attempt_source"] = {
+                        "spreadsheet_id": SPREADSHEET_ID,
+                        "sheet_names": [bad, SHEET_NEXT]}
+                # Записываем в базу мимо json.dumps(ensure_ascii=False): само
+                # хранилище суррогат принимает, и в этом суть — испорченным
+                # носитель уже является, а не станет.
+                exec_sql("UPDATE connections SET config_json = ? WHERE id = ?",
+                         json.dumps(spoiled, ensure_ascii=True), conn_id)
+                before = carrier_blob()
+
+                read = boss.get("/api/supply/sheets?limit=200")
+                if where == "sheet_names":
+                    check(f"снимок, {label} в именах листов: 409, а не 500",
+                          read.status_code == 409,
+                          f"{read.status_code} {read.text[:140]}")
+                else:
+                    # Источник ПОПЫТКИ снимком не является и снимок не портит:
+                    # он обязан не свалить страницу, а перестать доказываться.
+                    check(f"снимок, {label} в источнике попытки: не 500",
+                          read.status_code == 200,
+                          f"{read.status_code} {read.text[:140]}")
+                    if read.status_code == 200:
+                        check(f"и суррогат наружу не уехал ({label})",
+                              bad not in read.text, read.text[:140])
+                check(f"{label}/{where}: сырое значение в ответе не повторено",
+                      bad not in read.text, read.text[:160])
+                check(f"{label}/{where}: GET ничего не переписал",
+                      carrier_blob() == before)
+                check(f"{label}/{where}: строки снимка на месте",
+                      json.loads(carrier_blob())[ss.ENVELOPE_KEY]["rows"]
+                      == good_rows)
+
+        # Законный снимок после всех подмен читается как прежде.
+        exec_sql("UPDATE connections SET config_json = ? WHERE id = ?",
+                 json.dumps(good_cfg, ensure_ascii=False), conn_id)
+        back = boss.get("/api/supply/sheets?limit=200")
+        check("законный снимок после всех подмен читается",
+              back.status_code == 200
+              and back.json()["sheet_names"] == [SHEET_CURRENT, SHEET_NEXT],
+              back.text[:140])
+    finally:
+        ss.set_transport(None)
+        boss.close()
+
+
 # ── Прогон ──────────────────────────────────────────────────────────────────
 
 def run() -> int:
@@ -4589,6 +4740,7 @@ def run() -> int:
     truncated_reason_checks()
     legacy_parser3_stale_checks()
     saved_sheet_names_checks()
+    surrogate_name_checks()
     bound_public_reason_checks()
     stored_counts_checks()
     envelope_version_checks()

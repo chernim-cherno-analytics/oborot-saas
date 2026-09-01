@@ -531,6 +531,31 @@ def parse_spreadsheet_url(raw: str) -> str:
     return match.group("id")
 
 
+def _utf8_safe(value: str) -> bool:
+    """Кодируется ли строка в UTF-8 вообще. Не «выглядит нормально», а кодируется.
+
+    Блокирующий P1 на HEAD `7fda666`. Одиночный суррогат — `"\\ud800"`, каким его
+    даёт `json.loads` из совершенно валидного JSON-тела, — это `str`: непустой,
+    короткий, без управляющих символов. Все четыре проверки имени листа он
+    проходил, а в UTF-8 не кодируется ВООБЩЕ, и дальше 500 приходил с двух
+    сторон сразу: на записи — из `build_csv_url()` ещё ДО единого сетевого
+    вызова, на чтении — из сериализации ответа, то есть уже после того, как
+    проверка объявила значение годным. Граница, поставленная ради управляемого
+    409, сама давала мёртвый экран.
+
+    Проверка сформулирована НЕ как «запретить суррогаты». Запрет частного
+    случая означал бы ждать следующего частного случая; здесь запрещено ровно
+    то свойство, из-за которого ломается всё остальное, — невозможность
+    представить значение теми байтами, которыми мы говорим и с источником, и с
+    браузером, и с базой.
+    """
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
 def _sheet_name_problem(raw) -> str:
     """Почему это НЕ годное имя листа. Пустая строка — значит годное.
 
@@ -551,6 +576,8 @@ def _sheet_name_problem(raw) -> str:
     """
     if not isinstance(raw, str):
         return "Имя листа должно быть текстом."
+    if not _utf8_safe(raw):
+        return "Имя листа содержит символы, которые невозможно прочитать."
     value = raw.strip()
     if not value:
         return "Имя листа не может быть пустым."
@@ -1980,9 +2007,17 @@ def _attempt_identity(source) -> tuple[str, list[str]]:
         return "", []
     raw_id = source.get("spreadsheet_id")
     names = source.get("sheet_names")
+    # `isinstance(str)` мало: одиночный суррогат — тоже `str`, и он не
+    # кодируется в UTF-8 вовсе. Отсюда уходил ТОТ ЖЕ 500, что и из имён листов
+    # снимка (P1 на HEAD `7fda666`), только на экране владельца: источник
+    # попытки читает `_attempt_view()` и отдаёт наружу. Docstring выше обещает,
+    # что испорченный источник даёт «не исключение, а недоказуемую связь», — и
+    # теперь это правда для всех строк, а не только для тех, что оказались
+    # представимыми.
     return (
-        raw_id if isinstance(raw_id, str) else "",
-        [n for n in names if isinstance(n, str)] if isinstance(names, list) else [],
+        raw_id if isinstance(raw_id, str) and _utf8_safe(raw_id) else "",
+        [n for n in names if isinstance(n, str) and _utf8_safe(n)]
+        if isinstance(names, list) else [],
     )
 
 
