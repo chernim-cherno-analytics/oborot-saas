@@ -4693,6 +4693,129 @@ def surrogate_name_checks() -> None:  # noqa: C901 — две границы, в
         boss.close()
 
 
+def row_surrogate_checks() -> None:  # noqa: C901 — матрица контейнеров, ветвлений мало
+    """Непредставимая строка ВНУТРИ строки снимка — тоже 409, а не 500.
+
+    Блокирующий P1 на HEAD `7732c7f` (REVIEW_REJECT issuecomment-5499967005),
+    и это недоделка предыдущего корректива, а не новое замечание. Тогда
+    `_utf8_safe()` был поставлен там, где ревью показало пример, — в именах
+    листов и в источнике попытки, — и не поставлен в остальных местах, где
+    сохранённая строка уезжает наружу. А их шесть, и все шесть проверялись
+    через `isinstance(..., str)`, которому одиночный суррогат удовлетворяет:
+    он и есть `str`.
+
+    Дальше `preview()` отдаёт строки наружу, `UnicodeEncodeError` вылетает уже
+    в сериализации ответа, и главный GET раздела даёт 500. Урок здесь не про
+    суррогаты: проверка «представима ли строка» принадлежит КАЖДОМУ месту, где
+    чужая строка пересекает границу чтения, а не тому месту, где её однажды
+    заметили.
+
+    Матрица идёт по всем шести контейнерам разом, и по каждому проверяется одно
+    и то же: управляемый 409, носитель побайтово не тронут, сырое значение в
+    ответе не повторено. Отдельно — что валидные не-ASCII строки, включая
+    эмодзи, проходят как прежде: починка, которая ломает законные имена, — не
+    починка.
+    """
+    print("\n== Непредставимая строка внутри строки снимка: 409, не 500 ==")
+    HIGH = json.loads('"\\ud800"')
+    LOW = json.loads('"\\udfff"')
+    boss = client()
+    boss.post("/register", data={"name": "Строки",
+                                 "email": "sheets-rowsurr@test.io",
+                                 "password": "secret123", "org_name": "Бренд-СТ"})
+    boss.post("/api/connect/demo")
+    org_id = sql("SELECT org_id FROM memberships WHERE user_id ="
+                 " (SELECT id FROM users WHERE email = 'sheets-rowsurr@test.io')")[0][0]
+    conn_id = sql("SELECT id FROM connections WHERE org_id = ? ORDER BY id",
+                  org_id)[0][0]
+
+    def carrier_blob() -> str:
+        return sql("SELECT config_json FROM connections WHERE id = ?",
+                   conn_id)[0][0]
+
+    ss.set_transport(FakeGoogle())
+    try:
+        r = boss.post("/api/supply/sheets/refresh",
+                      json={"spreadsheet_url": SHEET_URL,
+                            "sheet_names": [SHEET_CURRENT, SHEET_NEXT]})
+        check("законный снимок создан", r.status_code == 200, r.text[:140])
+        good_cfg = json.loads(carrier_blob())
+        good_rows = good_cfg[ss.ENVELOPE_KEY]["rows"]
+        good_blob = carrier_blob()
+
+        # Шесть контейнеров строки снимка. Каждый — своя ветка проверки формы,
+        # и каждая пропускала суррогат, потому что смотрела только на тип.
+        containers = {
+            "прямое строковое поле (name)":
+                lambda row, bad: row.__setitem__("name", bad),
+            "элемент списка строк (comments_raw)":
+                lambda row, bad: row.__setitem__("comments_raw", [bad]),
+            "элемент списка строк (issues)":
+                lambda row, bad: row.__setitem__("issues", [bad]),
+            "значение строковой карты (sizes_raw)":
+                lambda row, bad: row["sizes_raw"].__setitem__("XS", bad),
+            "ключ строковой карты (unknown_raw)":
+                lambda row, bad: row.__setitem__("unknown_raw", {bad: "1"}),
+            "ключ карты необязательных чисел (sizes)":
+                lambda row, bad: row.__setitem__("sizes", {bad: 1}),
+        }
+        for label, mutate in containers.items():
+            for kind, bad in (("высокий", HIGH), ("низкий", LOW)):
+                spoiled = json.loads(json.dumps(good_cfg, ensure_ascii=True))
+                mutate(spoiled[ss.ENVELOPE_KEY]["rows"][2], bad)
+                exec_sql("UPDATE connections SET config_json = ? WHERE id = ?",
+                         json.dumps(spoiled, ensure_ascii=True), conn_id)
+                before = carrier_blob()
+
+                read = boss.get("/api/supply/sheets?limit=200")
+                check(f"{label}, {kind}: управляемый 409, а не 500",
+                      read.status_code == 409,
+                      f"{read.status_code} {read.text[:130]}")
+                check(f"{label}, {kind}: причина названа как повреждение",
+                      "не переписан" in read.text, read.text[:130])
+                check(f"{label}, {kind}: сырое значение в ответе не повторено",
+                      bad not in read.text, read.text[:130])
+                check(f"{label}, {kind}: GET ничего не переписал",
+                      carrier_blob() == before)
+                # И тот же ответ на фильтре: 409 не должен зависеть от вида GET.
+                filtered = boss.get(f"/api/supply/sheets?sheet={SHEET_CURRENT}")
+                check(f"{label}, {kind}: на фильтре тот же 409",
+                      filtered.status_code == 409,
+                      f"{filtered.status_code} {filtered.text[:120]}")
+
+        # Совместимость: валидные не-ASCII строки не задеты. Проверяется по
+        # тем же шести контейнерам — починка, ломающая законное, не починка.
+        emoji = "Платье 👗 «Осень»"
+        okay = json.loads(json.dumps(good_cfg, ensure_ascii=False))
+        row = okay[ss.ENVELOPE_KEY]["rows"][2]
+        row["name"] = emoji
+        row["comments_raw"] = [emoji]
+        row["issues"] = []
+        row["sizes_raw"]["XS"] = emoji
+        row["unknown_raw"] = {emoji: emoji}
+        row["sizes"] = {emoji: 1}
+        exec_sql("UPDATE connections SET config_json = ? WHERE id = ?",
+                 json.dumps(okay, ensure_ascii=False), conn_id)
+        good = boss.get("/api/supply/sheets?limit=200")
+        check("валидные не-ASCII строки (эмодзи) во всех шести контейнерах "
+              "читаются как прежде", good.status_code == 200,
+              f"{good.status_code} {good.text[:140]}")
+        check("и они доезжают до ответа дословно",
+              emoji in good.text, good.text[:200])
+
+        # Законный снимок после всех подмен читается.
+        exec_sql("UPDATE connections SET config_json = ? WHERE id = ?",
+                 good_blob, conn_id)
+        back = boss.get("/api/supply/sheets?limit=200")
+        check("законный снимок после всех подмен читается",
+              back.status_code == 200
+              and [x["source_row"] for x in back.json()["rows"]]
+              == [x["source_row"] for x in good_rows], back.text[:140])
+    finally:
+        ss.set_transport(None)
+        boss.close()
+
+
 # ── Прогон ──────────────────────────────────────────────────────────────────
 
 def run() -> int:
@@ -4741,6 +4864,7 @@ def run() -> int:
     legacy_parser3_stale_checks()
     saved_sheet_names_checks()
     surrogate_name_checks()
+    row_surrogate_checks()
     bound_public_reason_checks()
     stored_counts_checks()
     envelope_version_checks()

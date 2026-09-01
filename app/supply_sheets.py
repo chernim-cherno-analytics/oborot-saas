@@ -1685,6 +1685,25 @@ def _missing_row_field(index: int, field: str) -> CarrierConfigError:
     )
 
 
+def _readable_text(value) -> bool:
+    """Строка, которую мы сможем и прочитать, и отдать наружу.
+
+    `isinstance(value, str)` отвечает на вопрос «это текст», но не на вопрос
+    «сможем ли мы его показать». Одиночный суррогат — текст, а показать его
+    нельзя: в UTF-8 он не кодируется вовсе. Блокирующий P1 на HEAD `7732c7f`,
+    и это недоделка предыдущего корректива: `_utf8_safe()` был поставлен там,
+    где ревью показало пример (имена листов, источник попытки), и не поставлен
+    в шести остальных местах, где сохранённая строка уезжает наружу.
+
+    Урок записан здесь, а не только в журнале: проверка «представима ли
+    строка» принадлежит КАЖДОМУ месту, где чужая строка пересекает границу
+    чтения, а не тому месту, где её однажды заметили. Поэтому предикат один и
+    зовётся из всех четырёх видов строковых форм строки снимка — прямых полей,
+    списков, карт (и ключи, и значения) и строковых ключей числовых карт.
+    """
+    return isinstance(value, str) and _utf8_safe(value)
+
+
 def _validate_row(row: dict, index: int) -> None:
     """Минимально достаточная проверка формы строки. Fail closed.
 
@@ -1695,7 +1714,7 @@ def _validate_row(row: dict, index: int) -> None:
             raise _missing_row_field(index, field)
 
     for field in _ROW_STRING_FIELDS:
-        if field in row and not isinstance(row[field], str):
+        if field in row and not _readable_text(row[field]):
             raise _bad_row(index, field)
 
     for field in _ROW_INT_FIELDS:
@@ -1716,7 +1735,7 @@ def _validate_row(row: dict, index: int) -> None:
         value = row[field]
         if not isinstance(value, (list, tuple)):
             raise _bad_row(index, field)
-        if any(not isinstance(item, str) for item in value):
+        if any(not _readable_text(item) for item in value):
             raise _bad_row(index, field)
 
     for field in _ROW_STRING_MAP_FIELDS:
@@ -1725,7 +1744,7 @@ def _validate_row(row: dict, index: int) -> None:
         value = row[field]
         if not isinstance(value, dict):
             raise _bad_row(index, field)
-        if any(not isinstance(k, str) or not isinstance(v, str)
+        if any(not _readable_text(k) or not _readable_text(v)
                for k, v in value.items()):
             raise _bad_row(index, field)
 
@@ -1736,7 +1755,7 @@ def _validate_row(row: dict, index: int) -> None:
         if not isinstance(value, dict):
             raise _bad_row(index, field)
         for key, item in value.items():
-            if not isinstance(key, str):
+            if not _readable_text(key):
                 raise _bad_row(index, field)
             if item is not None and not _is_int(item):
                 raise _bad_row(index, field)
