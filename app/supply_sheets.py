@@ -47,6 +47,7 @@ import csv
 import hashlib
 import io
 import json
+import math
 import re
 import threading
 from dataclasses import dataclass
@@ -1717,6 +1718,14 @@ def _unrepresentable(where: str) -> CarrierConfigError:
     )
 
 
+def _not_serializable(where: str) -> CarrierConfigError:
+    """Отказ по числу, которого в JSON не бывает. В тексте нет самого значения."""
+    return CarrierConfigError(
+        f"Сохранённый предпросмотр повреждён: в поле «{where}» есть число, "
+        f"которого в JSON не бывает. Он оставлен как есть и не переписан."
+    )
+
+
 def _too_deep(where: str) -> CarrierConfigError:
     """Отказ по чрезмерной вложенности. В тексте только литерал и число."""
     return CarrierConfigError(
@@ -1750,6 +1759,15 @@ def _reject_unrepresentable(value, where: str) -> None:
     сегменты пути в чужих данных сами бывают чужими, и подставлять их в текст
     ошибки значило бы вернуть эхо через заднюю дверь.
 
+    НЕ ТОЛЬКО ТЕКСТ. Инвариант я сформулировал как «ответ представим», а
+    проверял поначалу только представимость СТРОК — и этого мало.
+    `json.loads` принимает `NaN`, `Infinity` и `-Infinity` как расширение JSON
+    и отдаёт настоящие `float`, а `JSONResponse` падает на них
+    `ValueError: Out of range float values are not JSON compliant`, то есть тем
+    же 500. Поэтому проверяется и число: `float`, не проходящий
+    `math.isfinite()`, — отказ. Целые и `bool` не задеты (`bool` вообще не
+    `float`), конечные `float` законны, включая `0.0` и `1e308`.
+
     ГЛУБИНА ОГРАНИЧЕНА, И ЭТО ВТОРАЯ ПОЛОВИНА ТОГО ЖЕ ИНВАРИАНТА. «Ответ
     представим» значит не только «строки кодируются», но и «ниже по течению его
     сумеют закодировать». `jsonable_encoder()` FastAPI рекурсивен и падает
@@ -1775,6 +1793,8 @@ def _reject_unrepresentable(value, where: str) -> None:
         if isinstance(item, str):
             if not _utf8_safe(item):
                 raise _unrepresentable(where)
+        elif isinstance(item, float) and not math.isfinite(item):
+            raise _not_serializable(where)
         elif isinstance(item, dict):
             for key, sub in item.items():
                 if isinstance(key, str) and not _utf8_safe(key):

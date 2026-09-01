@@ -5043,6 +5043,145 @@ def persisted_representability_checks() -> None:  # noqa: C901 — матриц�
         boss.close()
 
 
+def non_finite_number_checks() -> None:  # noqa: C901 — матрица путей, ветвлений мало
+    """`NaN`/`Infinity` в носителе — тоже 409, а не 500.
+
+    Тот же инвариант «ответ обязан быть сериализуемым», у которого была вторая
+    дыра. Я сформулировал его как «ответ представим», а проверял только
+    представимость ТЕКСТА — сериализуемость шире. `json.loads` принимает
+    `NaN`, `Infinity` и `-Infinity` как расширение JSON, обход их пропускал, а
+    `JSONResponse` падает на них `ValueError: Out of range float values are not
+    JSON compliant` — то есть главный GET даёт 500.
+
+    ЧТО ЗДЕСЬ ЖИВОЙ ПУТЬ, А ЧТО ЗАЩИТА В ГЛУБИНУ — важно не смешивать:
+      * **живой** ровно один: незнакомые поля строки и их вложенные значения.
+        `preview()` копирует строку целиком (`item = dict(row)`), поэтому такое
+        значение доезжает до сериализации. Это красная база на `38d1957`;
+      * `counts`, `schema` и незнакомые ВЕРХНЕУРОВНЕВЫЕ ключи форма снимка
+        принимает, но в ответ они не попадают: `preview()` отдаёт пересчитанный
+        `_counts_view(...)`, а `schema` и посторонние ключи не возвращает вовсе.
+        Отказ на них — защита в глубину, и называть его закрытием 500 было бы
+        неправдой;
+      * типизированные верхнеуровневые поля (`spreadsheet_id`, `content_sha256`
+        и прочие `str`) дефектом НЕ являются вовсе: `_ENVELOPE_SHAPE` отвергает
+        float ещё до обхода. Проверка ниже это фиксирует, чтобы никто не принял
+        их за незакрытый путь.
+    """
+    print("\n== Нечисловые float в носителе: 409, не 500 ==")
+    boss = client()
+    boss.post("/register", data={"name": "Числа",
+                                 "email": "sheets-nan@test.io",
+                                 "password": "secret123", "org_name": "Бренд-ЧС"})
+    boss.post("/api/connect/demo")
+    org_id = sql("SELECT org_id FROM memberships WHERE user_id ="
+                 " (SELECT id FROM users WHERE email = 'sheets-nan@test.io')")[0][0]
+    conn_id = sql("SELECT id FROM connections WHERE org_id = ? ORDER BY id",
+                  org_id)[0][0]
+
+    def carrier_blob() -> str:
+        return sql("SELECT config_json FROM connections WHERE id = ?",
+                   conn_id)[0][0]
+
+    fake = FakeGoogle()
+    ss.set_transport(fake)
+    try:
+        r = boss.post("/api/supply/sheets/refresh",
+                      json={"spreadsheet_url": SHEET_URL,
+                            "sheet_names": [SHEET_CURRENT, SHEET_NEXT]})
+        check("законный снимок создан", r.status_code == 200, r.text[:140])
+        good_cfg = json.loads(carrier_blob())
+        good_blob = carrier_blob()
+        good_rows = good_cfg[ss.ENVELOPE_KEY]["rows"]
+
+        # Носитель пишется СЫРЫМ текстом: json.loads примет это обратно как
+        # nan/inf, и именно так испорченный носитель и выглядит на практике.
+        literals = {"NaN": "NaN", "Infinity": "Infinity", "-Infinity": "-Infinity"}
+        places = {
+            "живой: незнакомое поле строки":
+                ('["{k}"]["rows"][2]["future_raw"]', True),
+            "живой: вложенный список в строке":
+                ('["{k}"]["rows"][2]["extra_raw"]', True),
+            "защита в глубину: незнакомое поле верхнего уровня":
+                ('["{k}"]["future_top"]', False),
+            "защита в глубину: counts (вложенно)":
+                ('["{k}"]["counts"]["rows"]', False),
+        }
+        for label, (path, live) in places.items():
+            for name, literal in literals.items():
+                blob = json.dumps(good_cfg, ensure_ascii=False)
+                spoiled = json.loads(blob)
+                target = eval("spoiled" + path.format(k=ss.ENVELOPE_KEY).rsplit("[", 1)[0])
+                leaf = path.format(k=ss.ENVELOPE_KEY).rsplit("[", 1)[1].strip("]").strip('"')
+                # Значение подставляется СЫРЫМ литералом JSON, а не строкой.
+                target[leaf] = 0
+                raw = json.dumps(spoiled, ensure_ascii=False)
+                marker = f'"{leaf}": 0'
+                assert marker in raw, marker
+                raw = raw.replace(marker, f'"{leaf}": {literal}', 1)
+                exec_sql("UPDATE connections SET config_json = ? WHERE id = ?",
+                         raw, conn_id)
+                before = carrier_blob()
+                calls_before = len(fake.calls)
+
+                read = boss.get("/api/supply/sheets?limit=200")
+                check(f"GET · {label}, {name}: управляемый 409, а не 500",
+                      read.status_code == 409,
+                      f"{read.status_code} {read.text[:120]}")
+                check(f"GET · {label}, {name}: без эха значения",
+                      name.lower() not in read.text.lower()
+                      and "nan" not in read.text.lower(),
+                      read.text[:130])
+                check(f"GET · {label}, {name}: носитель не переписан",
+                      carrier_blob() == before)
+                post = boss.post("/api/supply/sheets/refresh",
+                                 json={"spreadsheet_url": SHEET_URL,
+                                       "sheet_names": [SHEET_CURRENT, SHEET_NEXT]})
+                check(f"REFRESH · {label}, {name}: тот же 409, а не 500",
+                      post.status_code == 409,
+                      f"{post.status_code} {post.text[:120]}")
+                check(f"REFRESH · {label}, {name}: до сети дело не дошло",
+                      len(fake.calls) == calls_before,
+                      f"{len(fake.calls) - calls_before} вызов(ов)")
+                check(f"REFRESH · {label}, {name}: носитель не переписан",
+                      carrier_blob() == before)
+
+        # Типизированное верхнеуровневое поле float не принимает и без обхода —
+        # фиксируем, чтобы его не приняли за незакрытый путь.
+        spoiled = json.loads(json.dumps(good_cfg, ensure_ascii=False))
+        spoiled[ss.ENVELOPE_KEY]["content_sha256"] = 0
+        raw = json.dumps(spoiled, ensure_ascii=False).replace(
+            '"content_sha256": 0', '"content_sha256": NaN', 1)
+        exec_sql("UPDATE connections SET config_json = ? WHERE id = ?", raw, conn_id)
+        typed = boss.get("/api/supply/sheets")
+        check("типизированное поле отвергает float формой снимка, а не обходом",
+              typed.status_code == 409, f"{typed.status_code} {typed.text[:120]}")
+
+        # КОНЕЧНЫЕ числа остаются законными: починка, ломающая законное, — не
+        # починка. Дробное значение в незнакомом поле строки обязано доехать.
+        okay = json.loads(json.dumps(good_cfg, ensure_ascii=False))
+        okay[ss.ENVELOPE_KEY]["rows"][2]["future_raw"] = 12.5
+        okay[ss.ENVELOPE_KEY]["rows"][2]["extra_raw"] = {"a": [0.0, -273.15, 1e308]}
+        exec_sql("UPDATE connections SET config_json = ? WHERE id = ?",
+                 json.dumps(okay, ensure_ascii=False), conn_id)
+        good = boss.get("/api/supply/sheets?limit=200")
+        check("конечные float во всех тех же местах: 200",
+              good.status_code == 200, f"{good.status_code} {good.text[:140]}")
+        check("и они доезжают до ответа",
+              "12.5" in good.text and "-273.15" in good.text, good.text[:200])
+        check("булевы и целые не задеты",
+              boss.get("/api/supply/sheets").status_code == 200)
+
+        exec_sql("UPDATE connections SET config_json = ? WHERE id = ?",
+                 good_blob, conn_id)
+        back = boss.get("/api/supply/sheets?limit=200")
+        check("законный снимок после всех подмен читается",
+              back.status_code == 200 and back.json()["total"] == len(good_rows),
+              back.text[:140])
+    finally:
+        ss.set_transport(None)
+        boss.close()
+
+
 # ── Прогон ──────────────────────────────────────────────────────────────────
 
 def run() -> int:
@@ -5093,6 +5232,7 @@ def run() -> int:
     surrogate_name_checks()
     row_surrogate_checks()
     persisted_representability_checks()
+    non_finite_number_checks()
     bound_public_reason_checks()
     stored_counts_checks()
     envelope_version_checks()
