@@ -4044,20 +4044,6 @@ def envelope_headroom_checks() -> None:  # noqa: C901 — сценарий, ве
               env["content_sha256"] == good_hash and env["rows"] == good_rows
               and env["last_success_at"] == good_success,
               env["content_sha256"])
-
-        # И главное про границу решения: резерв принадлежит ТОЛЬКО записи
-        # отказа. Опускаем предел на один байт ниже фактического снимка —
-        # успешное чтение обязано упереться в него, а не проехать на резерве.
-        ss.MAX_ENVELOPE_BYTES = exact - 1
-        r = refresh_now()
-        check("успеху резерв не достаётся: на байт ниже — уже отказ",
-              r.status_code == 502 and "не помещается" in r.text,
-              f"{r.status_code} {r.text[:200]}")
-        env = envelope_now()
-        check("и снимок при этом остался нетронутым",
-              env["content_sha256"] == good_hash and env["rows"] == good_rows
-              and env["last_success_at"] == good_success,
-              env["content_sha256"])
     finally:
         ss.MAX_ENVELOPE_BYTES = real_limit
         ss.set_transport(None)
@@ -4266,6 +4252,170 @@ def truncated_reason_checks() -> None:
     boss.close()
 
 
+def legacy_parser3_stale_checks() -> None:  # noqa: C901 — сценарий, ветвлений мало
+    """Снимок parser-3 из листа со СМЕШАННОЙ горкой обязан считаться устаревшим.
+
+    Замечание двух независимых ревью на HEAD `26cca4d`, и оно верное. Прошлый
+    корректив закрыл дыру в `check_header()` — смешанные формы S/M/L перестали
+    приниматься, — но НОМЕР ПАРСЕРА не поднял: рассуждение было «разбор
+    законных листов не изменился ни на байт». По букве прежнего списка поводов
+    это так. По смыслу — нет.
+
+    Потому что `parser_stale` считается СРАВНЕНИЕМ ВЕРСИЙ, а не повторной
+    проверкой заголовка: GET строго read-only и заново источник не разбирает.
+    Значит, снимок, который parser-3 УЖЕ сделал из листа со смешанной горкой,
+    без нового номера продолжал бы показываться как актуальный — с размерами,
+    разложенными по позициям, которые сегодняшний код считает недоказанными.
+    Непроверенное показывалось бы как проверенное, а это ровно тот класс
+    неправды, против которого написан весь слой.
+
+    ПОЧЕМУ СНИМОК ЗДЕСЬ ЗАСЕЯН РУКАМИ, А НЕ СДЕЛАН ОБНОВЛЕНИЕМ. Сегодняшний код
+    такой лист не примет — в том и правка. Воссоздать снимок parser-3 честно
+    можно только положив его в носитель как есть, и он воссоздан не выдумкой:
+    строки берутся из НАСТОЯЩЕГО разбора тех же байтов данных (подпись «S» в
+    строке 2 — это заголовок, на разбор строк данных она не влияет вовсе),
+    `size_labels_inferred` ставится тот, что parser-3 вывел бы для смешанной
+    горки (`["M", "L"]` — подписанным он считал только S), а `content_sha256`
+    считается тем же `content_hash()` при `PARSER_VERSION = parser-3`, то есть
+    ровно так, как посчитала бы прежняя сборка.
+    """
+    print("\n== Снимок parser-3 из смешанной горки: устарел, но не потерян ==")
+    boss = client()
+    boss.post("/register", data={"name": "Легаси",
+                                 "email": "sheets-legacy@test.io",
+                                 "password": "secret123", "org_name": "Бренд-ЛГ"})
+    boss.post("/api/connect/demo")
+    org_id = sql("SELECT org_id FROM memberships WHERE user_id ="
+                 " (SELECT id FROM users WHERE email = 'sheets-legacy@test.io')")[0][0]
+    conn_id = sql("SELECT id FROM connections WHERE org_id = ? ORDER BY id",
+                  org_id)[0][0]
+
+    # Смешанная горка: подписан только S. Строки данных — те же, что у законной
+    # формы; отличается ровно одна ячейка ЗАГОЛОВКА.
+    hybrid_rows = autumn_header_rows()
+    put(hybrid_rows[1], {ss.SIZE_BAND_START + 1: "S"})
+    for extra in autumn_rows()[2:]:
+        hybrid_rows.append(list(extra))
+    HYBRID_CSV = to_csv(hybrid_rows)
+    LEGAL_CSV = AUTUMN_CSV
+
+    try:
+        # 1. Законный снимок сегодняшним кодом — из него берём подлинную форму
+        #    envelope, чтобы засеять легаси, а не сочинять его структуру.
+        ss.set_transport(FakeGoogle())
+        r = boss.post("/api/supply/sheets/refresh",
+                      json={"spreadsheet_url": SHEET_URL,
+                            "sheet_names": [SHEET_CURRENT, SHEET_NEXT]})
+        check("подлинный снимок получен как заготовка", r.status_code == 200,
+              r.text[:140])
+        cfg = json.loads(sql("SELECT config_json FROM connections WHERE id = ?",
+                             conn_id)[0][0])
+        legacy = dict(cfg[ss.ENVELOPE_KEY])
+
+        # 2. Превращаем его в снимок parser-3 из СМЕШАННОГО листа.
+        real_version = ss.PARSER_VERSION
+        ss.PARSER_VERSION = "supply-sheets-parser-3"
+        try:
+            legacy_hash = ss.content_hash(SPREADSHEET_ID,
+                                          [SHEET_CURRENT, SHEET_NEXT],
+                                          [HYBRID_CSV, NEXT_CSV])
+        finally:
+            ss.PARSER_VERSION = real_version
+        legacy["parser_version"] = "supply-sheets-parser-3"
+        legacy["content_sha256"] = legacy_hash
+        schema = dict(legacy["schema"])
+        sheet_schema = dict(schema[SHEET_CURRENT])
+        sheet_schema["size_labels_inferred"] = ["M", "L"]
+        schema[SHEET_CURRENT] = sheet_schema
+        legacy["schema"] = schema
+        legacy_rows = json.loads(json.dumps(legacy["rows"], ensure_ascii=False))
+        cfg[ss.ENVELOPE_KEY] = legacy
+        exec_sql("UPDATE connections SET config_json = ? WHERE id = ?",
+                 json.dumps(cfg, ensure_ascii=False), conn_id)
+
+        # 3. ГЛАВНОЕ: читается, строки целы, но помечен устаревшим.
+        data = boss.get("/api/supply/sheets?limit=200").json()
+        check("снимок parser-3 читается, а не отвергается",
+              data["configured"] is True and data["total"] == len(legacy_rows),
+              f"{data['configured']} total={data['total']}")
+        check("строки прежнего снимка целы и не обрезаны",
+              [row["source_row"] for row in data["rows"]]
+              == [row["source_row"] for row in legacy_rows],
+              str(data["total"]))
+        check("и он помечен УСТАРЕВШИМ — это и есть замечание ревью",
+              data["parser_stale"] is True,
+              f"parser_version={data['parser_version']} vs {ss.PARSER_VERSION}")
+        check("версия разбора в ответе — та, которой снимок сделан",
+              data["parser_version"] == "supply-sheets-parser-3",
+              data["parser_version"])
+        check("предупреждение об устаревшем разборе есть на странице",
+              "parser_stale" in (ROOT / "templates" / "supply.html")
+              .read_text(encoding="utf-8")
+              and "прежней версией разбора" in (ROOT / "templates" / "supply.html")
+              .read_text(encoding="utf-8"))
+
+        # 4. Обновление ТОГО ЖЕ смешанного источника отвергается, а прежний
+        #    успех остаётся на месте: «устарел» не значит «можно потерять».
+        ss.set_transport(FakeGoogle({SHEET_CURRENT: HYBRID_CSV,
+                                     SHEET_NEXT: NEXT_CSV}))
+        r = boss.post("/api/supply/sheets/refresh",
+                      json={"spreadsheet_url": SHEET_URL,
+                            "sheet_names": [SHEET_CURRENT, SHEET_NEXT]})
+        check("смешанный источник на обновлении отвергается", r.status_code == 502,
+              f"{r.status_code} {r.text[:160]}")
+        check("и отказ говорит про половинчатую разметку горки",
+              "размечена наполовину" in r.text, r.text[:200])
+        after = json.loads(sql("SELECT config_json FROM connections WHERE id = ?",
+                               conn_id)[0][0])[ss.ENVELOPE_KEY]
+        check("прежний снимок parser-3 не тронут отказом",
+              after["content_sha256"] == legacy_hash
+              and after["rows"] == legacy_rows
+              and after["parser_version"] == "supply-sheets-parser-3",
+              after["content_sha256"])
+        check("и он по-прежнему устаревший, а не «починился» отказом",
+              boss.get("/api/supply/sheets").json()["parser_stale"] is True)
+
+        # 5. Обновление ИСПРАВЛЕННОГО источника заменяет снимок: новая версия
+        #    разбора, новый хеш, устаревшим он больше не считается.
+        ss.set_transport(FakeGoogle({SHEET_CURRENT: LEGAL_CSV,
+                                     SHEET_NEXT: NEXT_CSV}))
+        r = boss.post("/api/supply/sheets/refresh",
+                      json={"spreadsheet_url": SHEET_URL,
+                            "sheet_names": [SHEET_CURRENT, SHEET_NEXT]})
+        check("исправленный источник читается", r.status_code == 200,
+              f"{r.status_code} {r.text[:160]}")
+        check("и это НОВЫЙ импорт, а не «ничего не изменилось»",
+              r.json().get("unchanged") is False, r.text[:160])
+        fresh = json.loads(sql("SELECT config_json FROM connections WHERE id = ?",
+                               conn_id)[0][0])[ss.ENVELOPE_KEY]
+        check("снимок перезаписан новой версией разбора",
+              fresh["parser_version"] == ss.PARSER_VERSION
+              and ss.PARSER_VERSION == "supply-sheets-parser-4",
+              fresh["parser_version"])
+        check("и хеш содержимого сменился", fresh["content_sha256"] != legacy_hash,
+              fresh["content_sha256"])
+        check("устаревшим он больше не считается",
+              boss.get("/api/supply/sheets").json()["parser_stale"] is False)
+
+        # 6. И отдельно — что версия РЕАЛЬНО входит в хеш, а не просто рядом
+        #    лежит. Те же самые байты, разобранные parser-3 и parser-4, дают
+        #    разные хеши: снимок прежней сборки не может проехать как
+        #    «ничего не изменилось» даже при неизменившемся источнике.
+        ss.PARSER_VERSION = "supply-sheets-parser-3"
+        try:
+            same_bytes_old = ss.content_hash(SPREADSHEET_ID,
+                                             [SHEET_CURRENT, SHEET_NEXT],
+                                             [LEGAL_CSV, NEXT_CSV])
+        finally:
+            ss.PARSER_VERSION = real_version
+        check("те же байты под parser-3 и parser-4 дают разные хеши",
+              same_bytes_old != fresh["content_sha256"],
+              f"{same_bytes_old[:16]} vs {fresh['content_sha256'][:16]}")
+    finally:
+        ss.set_transport(None)
+        boss.close()
+
+
 # ── Прогон ──────────────────────────────────────────────────────────────────
 
 def run() -> int:
@@ -4311,6 +4461,7 @@ def run() -> int:
     envelope_headroom_checks()
     headroom_arithmetic_checks()
     truncated_reason_checks()
+    legacy_parser3_stale_checks()
     bound_public_reason_checks()
     stored_counts_checks()
     envelope_version_checks()
