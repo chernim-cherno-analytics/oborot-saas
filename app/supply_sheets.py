@@ -152,6 +152,42 @@ class CarrierConfigError(SupplySheetsError):
 PUBLIC_FAILURE_FALLBACK = ("источник не отдал таблицу в том виде, который "
                            "«Оборот» умеет читать")
 
+#: ЗАКРЫТЫЙ СПИСОК причин, которые вообще МОГУТ быть показаны участнику.
+#:
+#: Замечание ревью PR #47 на HEAD `459f170`, и оно не про формулировки. Прежде
+#: участник получал `last_error_public` — свободную строку ИЗ НОСИТЕЛЯ, и вся
+#: её безопасность держалась на том, что в ней не нашлось подстрок текущей
+#: попытки. Носитель в этом слое прямо описан как «то, что оставил кто-то
+#: другой» (прежняя версия кода, откат релиза, чужая рука), и у такой проверки
+#: было ровно два способа промахнуться: (а) откат — старый писатель меняет
+#: подробный текст и источник попытки, но НЕЗНАКОМОЕ ему поле общего текста
+#: переносит как есть, и участник читает причину прошлой попытки как текущую;
+#: (б) `last_attempt_source` испорчен или отсутствует — сверять не с чем, и
+#: произвольный текст уезжает участнику целиком.
+#:
+#: Поэтому участнику больше НЕ ПОКАЗЫВАЕТСЯ ни одна строка из носителя. Ему
+#: показывается константа ОТСЮДА, выбранная по сохранённому коду, и код обязан
+#: быть доказуемо связан с той самой записанной неудачей (`_public_binding`).
+#: Не доказано — generic. Это structured allowlist, а не «более строгий
+#: фильтр»: фильтр можно обойти неизвестным текстом, список — нельзя, в нём
+#: нечего обходить.
+#:
+#: Категорий пять, и они не выдуманы: это те же исходы, которые слой уже
+#: различает в коде. Подробности, принадлежащие владельцу (имя листа, номер
+#: колонки, точный HTTP-статус), в них не входят — их владелец видит в своём
+#: тексте, а участнику они не адресованы и починить он по ним ничего не может.
+PUBLIC_FAILURE_REASONS: dict[str, str] = {
+    "access": ("источник не отдал таблицу: она не открыта на чтение по "
+               "ссылке"),
+    "missing": "источник не отдал таблицу: таблица или лист не найдены",
+    "unavailable": ("с источником не удалось связаться — таблица не "
+                    "прочитана"),
+    "format": ("источник отдал таблицу не в том виде, который «Оборот» умеет "
+               "читать"),
+    "too_big": ("таблица источника больше того предела, на который рассчитан "
+                "этот раздел"),
+}
+
 
 class SourceError(SupplySheetsError):
     """Источник не отдал того, что мы умеем читать (502).
@@ -168,19 +204,25 @@ class SourceError(SupplySheetsError):
     становился видимым роли, которая попытки не делала. Поэтому рядом живёт
     `public` — та же причина без единой строки, пришедшей от пользователя.
 
-    По умолчанию `public` равен подробному тексту: подавляющее большинство
-    отказов слоя (сеть, таймаут, редирект, предел размера) не содержит ввода
-    вовсе, и обеднять их было бы враньём наоборот. Там, где имя листа в тексте
-    есть, `public` задаётся явно — `_sheet_error()`. А последним рубежом стоит
-    `_role_safe_failure()`: перед записью общий текст сверяется с ФАКТИЧЕСКИМИ
-    строками попытки, и совпадение заменяется на generic. Дисциплина на местах
-    может однажды не сработать, проверка на чокпойнте — нет.
+    `public` СЕГОДНЯ НЕ ПОКАЗЫВАЕТСЯ УЧАСТНИКУ: он пишется в носитель для
+    старого кода после отката (`last_error_public`), а участник видит
+    константу из `PUBLIC_FAILURE_REASONS` по коду `code`. Причина — замечание
+    ревью на HEAD `459f170`: свободный текст из носителя ничем не связан с
+    записанной неудачей, и доказать его актуальность нечем.
+
+    `code` — ключ этого списка, и по умолчанию он ПУСТ. Пустой код неизвестен
+    списку, а неизвестный код читается как generic: забытый на новом месте
+    отказа код обедняет сообщение, но не может показать участнику неправду.
+    Именно так и должно ломаться то, что охраняет приватность.
     """
 
-    def __init__(self, message: str, public: str | None = None):
+    def __init__(self, message: str, public: str | None = None,
+                 code: str = ""):
         super().__init__(message)
         #: Та же причина, но без ввода владельца. Никогда не пустая.
         self.public = public if public else message
+        #: Ключ `PUBLIC_FAILURE_REASONS`. Неизвестный — значит generic.
+        self.code = code if code in PUBLIC_FAILURE_REASONS else ""
 
 
 # ── Транспорт: инъектируемый, чтобы живого Google не было в обязательном CI ──
@@ -208,7 +250,7 @@ def _httpx_get(method: str, url: str, timeout: float) -> HttpResponse:
     import httpx
 
     if method != "GET":
-        raise SourceError("этот слой умеет только GET")
+        raise SourceError("этот слой умеет только GET", code="unavailable")
 
     chunks: list[bytes] = []
     total = 0
@@ -224,15 +266,18 @@ def _httpx_get(method: str, url: str, timeout: float) -> HttpResponse:
                         if total > MAX_RESPONSE_BYTES:
                             raise SourceError(
                                 f"ответ источника больше допустимых "
-                                f"{MAX_RESPONSE_BYTES // 1024} КиБ"
+                                f"{MAX_RESPONSE_BYTES // 1024} КиБ",
+                                code="too_big",
                             )
                         chunks.append(chunk)
         except SourceError:
             raise
         except httpx.TimeoutException:
-            raise SourceError("источник не ответил за отведённое время") from None
+            raise SourceError("источник не ответил за отведённое время",
+                              code="unavailable") from None
         except httpx.HTTPError:
-            raise SourceError("не удалось связаться с источником") from None
+            raise SourceError("не удалось связаться с источником",
+                              code="unavailable") from None
     return HttpResponse(status=status, headers=headers, body=b"".join(chunks),
                         url=final_url)
 
@@ -347,19 +392,23 @@ def _require_google_url(url: str) -> None:
     """Схема https и хост РОВНО docs.google.com, без userinfo."""
     parsed = urlparse(url)
     if parsed.scheme != "https":
-        raise SourceError("источник попытался увести запрос с https")
+        raise SourceError("источник попытался увести запрос с https",
+                          code="unavailable")
     if parsed.username or parsed.password:
-        raise SourceError("в адресе источника есть учётные данные")
+        raise SourceError("в адресе источника есть учётные данные",
+                          code="unavailable")
     if (parsed.hostname or "").lower() != GOOGLE_HOST:
         raise SourceError(
             f"источник попытался увести запрос на посторонний адрес "
-            f"(ожидался {GOOGLE_HOST})"
+            f"(ожидался {GOOGLE_HOST})",
+            code="unavailable",
         )
 
 
 # ── Отказ, у которого два адресата ───────────────────────────────────────────
 
-def _sheet_error(sheet_name: str, detail: str, where: str = "") -> SourceError:
+def _sheet_error(sheet_name: str, detail: str, where: str = "",
+                 code: str = "") -> SourceError:
     """Отказ по конкретному листу: владельцу с именем листа, остальным без него.
 
     Один конструктор на все такие отказы намеренно. Пока текст собирался на
@@ -369,7 +418,7 @@ def _sheet_error(sheet_name: str, detail: str, where: str = "") -> SourceError:
     едут обеим ролям целиком; чужое здесь ровно одно — имя листа.
     """
     return SourceError(f"лист «{sheet_name}»{where}: {detail}",
-                       f"лист источника{where}: {detail}")
+                       f"лист источника{where}: {detail}", code=code)
 
 
 # ── Загрузка одного листа ────────────────────────────────────────────────────
@@ -385,14 +434,16 @@ def _fetch_url(url: str, timeout: float) -> HttpResponse:
         if resp.status in (301, 302, 303, 307, 308):
             hops += 1
             if hops > MAX_REDIRECTS:
-                raise SourceError("источник переадресует запрос по кругу")
+                raise SourceError("источник переадресует запрос по кругу",
+                                  code="unavailable")
             location = ""
             for key, value in (resp.headers or {}).items():
                 if str(key).lower() == "location":
                     location = str(value)
                     break
             if not location:
-                raise SourceError("источник ответил переадресацией без адреса")
+                raise SourceError("источник ответил переадресацией без адреса",
+                              code="unavailable")
             target = urljoin(current, location)
             _require_google_url(target)
             current = target
@@ -409,11 +460,13 @@ def fetch_sheet_csv(spreadsheet_id: str, sheet_name: str,
         raise _sheet_error(
             sheet_name,
             f"таблица не открыта на чтение по ссылке "
-            f"(источник ответил {resp.status})")
+            f"(источник ответил {resp.status})", code="access")
     if resp.status == 404:
-        raise _sheet_error(sheet_name, "таблица или лист не найдены (404)")
+        raise _sheet_error(sheet_name, "таблица или лист не найдены (404)",
+                           code="missing")
     if resp.status != 200:
-        raise _sheet_error(sheet_name, f"источник ответил {resp.status}")
+        raise _sheet_error(sheet_name, f"источник ответил {resp.status}",
+                           code="unavailable")
 
     content_type = ""
     for key, value in (resp.headers or {}).items():
@@ -425,16 +478,18 @@ def fetch_sheet_csv(spreadsheet_id: str, sheet_name: str,
     if len(body) > MAX_RESPONSE_BYTES:
         raise _sheet_error(
             sheet_name,
-            f"ответ больше допустимых {MAX_RESPONSE_BYTES // 1024} КиБ")
+            f"ответ больше допустимых {MAX_RESPONSE_BYTES // 1024} КиБ",
+            code="too_big")
     if not body.strip():
-        raise _sheet_error(sheet_name, "источник вернул пустой ответ")
+        raise _sheet_error(sheet_name, "источник вернул пустой ответ",
+                           code="unavailable")
 
     head = body[:512].lstrip(b"\xef\xbb\xbf").lstrip().lower()
     if content_type.startswith("text/html") or head.startswith((b"<!doctype", b"<html")):
         raise _sheet_error(
             sheet_name,
             "источник вернул страницу входа, а не CSV — похоже, таблица "
-            "закрыта и её просят открыть после авторизации")
+            "закрыта и её просят открыть после авторизации", code="access")
     return body
 
 
@@ -582,7 +637,8 @@ def decode_csv(sheet_name: str, blob: bytes) -> list[list[str]]:
         text = blob.decode("utf-8-sig")
     except UnicodeDecodeError:
         raise _sheet_error(
-            sheet_name, "ответ не читается как текст UTF-8") from None
+            sheet_name, "ответ не читается как текст UTF-8",
+            code="format") from None
 
     rows: list[list[str]] = []
     reader = csv.reader(io.StringIO(text, newline=""))
@@ -593,24 +649,26 @@ def decode_csv(sheet_name: str, blob: bytes) -> list[list[str]]:
         except StopIteration:
             break
         except csv.Error:
-            raise _sheet_error(sheet_name, "CSV не разбирается") from None
+            raise _sheet_error(sheet_name, "CSV не разбирается",
+                               code="format") from None
         index += 1
         if index > MAX_ROWS_PER_SHEET:
             # Fail closed ровно здесь: строку с номером limit+1 мы уже увидели,
             # и этого достаточно, чтобы знать ответ. Читать дальше незачем.
             raise _sheet_error(
                 sheet_name,
-                f"строк больше допустимых {MAX_ROWS_PER_SHEET}")
+                f"строк больше допустимых {MAX_ROWS_PER_SHEET}",
+                code="too_big")
         if len(raw) > MAX_COLUMNS:
             raise _sheet_error(
                 sheet_name, f"колонок больше допустимых {MAX_COLUMNS}",
-                f", строка {index}")
+                f", строка {index}", code="too_big")
         cells = []
         for value in raw:
             if len(value) > MAX_CELL_CHARS:
                 raise _sheet_error(
                     sheet_name, f"ячейка длиннее {MAX_CELL_CHARS} символов",
-                    f", строка {index}")
+                    f", строка {index}", code="too_big")
             cells.append(value.strip())
         rows.append(cells)
     return rows
@@ -645,7 +703,8 @@ def check_header(sheet_name: str, rows: list[list[str]]) -> dict:
     """
     if len(rows) < 2:
         raise _sheet_error(
-            sheet_name, "нет двух строк заголовка, которых требует формат")
+            sheet_name, "нет двух строк заголовка, которых требует формат",
+            code="format")
     row1, row2 = rows[0], rows[1]
 
     for col, expected in sorted(ROW1_REQUIRED_HEADERS.items()):
@@ -655,7 +714,7 @@ def check_header(sheet_name: str, rows: list[list[str]]) -> dict:
                 sheet_name,
                 f"формат заголовка изменился — в колонке {col} ожидалась "
                 f"подпись «{expected}», а стоит другое "
-                f"(содержимое ячейки здесь не показывается)")
+                f"(содержимое ячейки здесь не показывается)", code="format")
 
     # Уникальность подписей каркаса. «Комментарии» сюда не входит: их в
     # источнике честно три подряд, и повтор там — норма, а не дрейф.
@@ -666,7 +725,8 @@ def check_header(sheet_name: str, rows: list[list[str]]) -> dict:
                 sheet_name,
                 f"подпись «{label}» встречается в строке заголовка "
                 f"{len(seen)} раз(а) (колонки {seen or '—'}), а должна ровно "
-                f"один — какая из них задаёт каркас, мы не угадываем")
+                f"один — какая из них задаёт каркас, мы не угадываем",
+                code="format")
 
     for col in ROW1_REQUIRED_EMPTY:
         actual = _cell(row1, col)
@@ -675,12 +735,13 @@ def check_header(sheet_name: str, rows: list[list[str]]) -> dict:
                 sheet_name,
                 f"формат заголовка изменился — колонка {col} читается как "
                 f"артикул и обязана быть без заголовка, а она не пуста "
-                f"(содержимое ячейки здесь не показывается)")
+                f"(содержимое ячейки здесь не показывается)", code="format")
 
     article_column = NAME_COLUMN - 1
     if article_column < 1:
         raise _sheet_error(
-            sheet_name, "перед «Наименование» нет колонки артикула")
+            sheet_name, "перед «Наименование» нет колонки артикула",
+            code="format")
 
     # Размерная горка. Пять последовательных колонок; крайние подписаны всегда,
     # три промежуточные либо пусты (объединённая ячейка), либо подписаны ровно
@@ -695,7 +756,8 @@ def check_header(sheet_name: str, rows: list[list[str]]) -> dict:
                     sheet_name,
                     f"размерная горка не опознана — в колонке {col} ожидалась "
                     f"подпись «{label}», а стоит другое "
-                    f"(содержимое ячейки здесь не показывается)")
+                    f"(содержимое ячейки здесь не показывается)",
+                    code="format")
         elif actual == "":
             inferred.append(label)
         elif actual != label:
@@ -703,7 +765,7 @@ def check_header(sheet_name: str, rows: list[list[str]]) -> dict:
                 sheet_name,
                 f"размерная горка не опознана — в колонке {col} ожидалась "
                 f"пустая ячейка или подпись «{label}», а стоит другое "
-                f"(содержимое ячейки здесь не показывается)")
+                f"(содержимое ячейки здесь не показывается)", code="format")
     band = set(range(SIZE_BAND_START, SIZE_BAND_START + len(SIZE_LABELS)))
     for col in range(1, len(row2) + 1):
         if col in band:
@@ -712,7 +774,8 @@ def check_header(sheet_name: str, rows: list[list[str]]) -> dict:
             raise _sheet_error(
                 sheet_name,
                 f"за пределами размерной горки найдена вторая метка размера в "
-                f"колонке {col} — какая из них настоящая, мы не угадываем")
+                f"колонке {col} — какая из них настоящая, мы не угадываем",
+                code="format")
 
     # Итог и цена. Подпись либо отсутствует, либо ровно ожидаемая.
     trailing: dict[int, str] = {}
@@ -723,7 +786,7 @@ def check_header(sheet_name: str, rows: list[list[str]]) -> dict:
                 sheet_name,
                 f"колонка {col} читается по позиции и должна быть либо без "
                 f"подписи, либо подписана «{expected}» — а подписана иначе "
-                f"(содержимое ячейки здесь не показывается)")
+                f"(содержимое ячейки здесь не показывается)", code="format")
         trailing[col] = actual
 
     # Свободные колонки: те, которым этот слой НЕ назначает смысла. Их
@@ -999,6 +1062,38 @@ def _row_flags(row: dict) -> tuple[bool, bool]:
 INCOMPLETE_QUANTITY_ISSUES = frozenset({"invalid_quantity", "quantity_missing"})
 
 
+def _row_quantity_unknown(row: dict) -> bool:
+    """Известно ли нам количество ЭТОЙ строки целиком.
+
+    Двух пометок оказалось мало, и это замечание ревью PR #47 на HEAD
+    `459f170`. Живой случай: строка-якорь, у которой все пять колонок XS–XL
+    ПУСТЫ, а колонка итога источника читается числом (`source_total=10`).
+    `quantity_missing` ей не ставится — количества у позиции есть, они просто
+    записаны не в размерной горке; `invalid_quantity` тоже нет — читается всё,
+    что написано. В итоге `size_sum` строки был `None`, в сумму она давала
+    ноль, и лист с десятью штуками показывался как окончательные
+    `quantity=0, quantity_complete=true`. Это ровно тот запрещённый D-51
+    случай: нечитаемое (точнее — непрочитанное нами) сложилось как ноль, и
+    неопределённость назвалась фактом.
+
+    Правильный ответ здесь — сказать «не знаем», а НЕ взять `source_total` за
+    количество. Решения считать итог источника количеством никто не принимал:
+    итог источника и сумма размеров — разные величины, и в этой самой таблице
+    они регулярно расходятся (`total_mismatch` живёт отдельной пометкой). Взять
+    одно за другое значило бы придумать формулу без владельца, а это §1
+    `AGENTS.md` и D-35.
+
+    Поэтому правило узкое и производных не имеет: количество строки неизвестно,
+    если она помечена нечитаемым/отсутствующим количеством ЛИБО если размерной
+    суммы у неё нет вовсе, а источник при этом назвал итог. `size_sum` строки,
+    её `source_total`, `issues` и сырые ячейки не меняются ни на символ —
+    меняется только то, считается ли АГРЕГАТ окончательным.
+    """
+    if set(row.get("issues") or ()) & INCOMPLETE_QUANTITY_ISSUES:
+        return True
+    return row.get("size_sum") is None and row.get("source_total") is not None
+
+
 def _quantity_summary(data_rows: list[dict]) -> dict:
     """Итог штук по набору строк: число ИЛИ честное «не определено».
 
@@ -1015,8 +1110,8 @@ def _quantity_summary(data_rows: list[dict]) -> dict:
 
       * `quantity_known` — сумма фактически прочитанных `size_sum`. Это не
         «оценка снизу» и не KPI: это ровно то, что мы смогли прочитать;
-      * `quantity_complete` — прочитано ли всё. `False`, если хотя бы одна
-        строка набора нечитаема или без количеств;
+      * `quantity_complete` — прочитано ли всё. `False`, если хотя бы у одной
+        строки набора количество нам неизвестно (`_row_quantity_unknown`);
       * `quantity` — окончательное число ИЛИ `None`. `None` означает «мы не
         знаем», и подставлять вместо него `quantity_known` нельзя: неполная
         сумма, названная итогом, — это и есть та самая выдумка.
@@ -1025,9 +1120,7 @@ def _quantity_summary(data_rows: list[dict]) -> dict:
     входить не может: слой к ним не подключён вовсе (D-51).
     """
     known = sum(r["size_sum"] or 0 for r in data_rows)
-    complete = not any(
-        set(r.get("issues") or ()) & INCOMPLETE_QUANTITY_ISSUES for r in data_rows
-    )
+    complete = not any(_row_quantity_unknown(r) for r in data_rows)
     return {
         "quantity": known if complete else None,
         "quantity_known": known,
@@ -1118,7 +1211,8 @@ def _guard_envelope_size(envelope: dict) -> str:
         raise SourceError(
             f"предпросмотр не помещается в отведённый {MAX_ENVELOPE_BYTES // 1024} "
             f"КиБ (получилось {size // 1024} КиБ) — источник вырос за пределы, "
-            f"на которые рассчитан этот раздел"
+            f"на которые рассчитан этот раздел",
+            code="too_big",
         )
     return blob
 
@@ -1198,6 +1292,8 @@ _ENVELOPE_SHAPE: dict[str, tuple] = {
 #: не менялся, к нему добавилось необязательное наблюдение.
 _ENVELOPE_OPTIONAL_SHAPE: dict[str, tuple] = {
     "last_error_public": (str,),
+    "last_error_public_code": (str,),
+    "last_error_public_binding": (str,),
 }
 
 
@@ -1498,6 +1594,8 @@ def _skeleton(spreadsheet_id: str, sheet_names: list[str]) -> dict:
         "fetched_at": None,
         "last_error": "",
         "last_error_public": "",
+        "last_error_public_code": "",
+        "last_error_public_binding": "",
         "last_attempt_source": {"spreadsheet_id": spreadsheet_id,
                                 "sheet_names": list(sheet_names)},
         "schema": {},
@@ -1507,19 +1605,27 @@ def _skeleton(spreadsheet_id: str, sheet_names: list[str]) -> dict:
 
 
 def _role_safe_failure(text, spreadsheet_id: str, sheet_names: list[str]) -> str:
-    """Последний рубеж privacy: в общем тексте нет ни одной строки владельца.
+    """Общий текст отказа: в нём нет ни одной строки, пришедшей от владельца.
 
-    Замечание ревью PR #47 на HEAD `590b5c6`, и защита здесь СТРУКТУРНАЯ, а не
-    дисциплинарная. Текст отказа собирается в двух десятках мест; требовать от
-    каждого будущего места помнить про вторую роль — значит поставить приватность
-    в зависимость от внимательности. Поэтому перед самой записью общий текст
-    сверяется с ФАКТИЧЕСКИМИ строками этой попытки: идентификатором таблицы и
-    именами обоих листов, как их прислал владелец. Совпало — текст заменяется
-    на generic целиком, а не «затирается звёздочками»: частично затёртая строка
-    всё ещё рассказывает её длину и форму.
+    Замечание ревью PR #47 на HEAD `590b5c6`. Текст отказа собирается в двух
+    десятках мест; требовать от каждого будущего места помнить про вторую роль
+    — значит поставить приватность в зависимость от внимательности. Поэтому
+    перед записью общий текст сверяется с ФАКТИЧЕСКИМИ строками этой попытки:
+    идентификатором таблицы и именами обоих листов, как их прислал владелец.
+    Совпало — текст заменяется на generic целиком, а не «затирается
+    звёздочками»: частично затёртая строка всё ещё рассказывает свою длину и
+    форму. Пустой результат тоже недопустим: пустая причина читается как «всё
+    в порядке».
 
-    Пустой результат тоже недопустим: участник, у которого причина отказа
-    пропала, видит пустой раздел и читает его как «всё в порядке».
+    ЧТО ЭТА ФУНКЦИЯ ДЕЛАЕТ СЕГОДНЯ, а чего не делает. Она осталась ровно на
+    ОДНОМ пути — записи `last_error_public`, поля для старого кода после
+    отката релиза. Сегодняшний читатель через неё не ходит вовсе: замечание
+    ревью на HEAD `459f170` показало, что сверка persisted-текста с текущей
+    попыткой в принципе не может доказать его актуальность — ни при откате
+    (текст прошлой попытки строк текущей не содержит), ни при испорченном
+    источнике попытки (сверять не с чем). Участнику теперь показывается
+    константа из `PUBLIC_FAILURE_REASONS` по связанному коду
+    (`_public_reason`), а не результат этой проверки.
     """
     if not isinstance(text, str) or not text.strip():
         return PUBLIC_FAILURE_FALLBACK
@@ -1530,21 +1636,81 @@ def _role_safe_failure(text, spreadsheet_id: str, sheet_names: list[str]) -> str
     return text
 
 
+def _attempt_identity(source) -> tuple[str, list[str]]:
+    """Источник попытки в НОРМАЛИЗОВАННОМ виде: (идентификатор, имена листов).
+
+    Одна функция и на записи, и на чтении — намеренно, по той же причине, по
+    которой `ordered_carriers()` один на чтение и запись: две нормализации
+    рано или поздно разойдутся, и связывание перестанет сходиться там, где
+    данные целы. Всё, что не строка, здесь исчезает: испорченный источник
+    попытки обязан давать не исключение, а недоказуемую связь.
+    """
+    if not isinstance(source, dict):
+        return "", []
+    raw_id = source.get("spreadsheet_id")
+    names = source.get("sheet_names")
+    return (
+        raw_id if isinstance(raw_id, str) else "",
+        [n for n in names if isinstance(n, str)] if isinstance(names, list) else [],
+    )
+
+
+def _public_binding(code: str, detailed: str, attempt_at, source) -> str:
+    """Отпечаток, связывающий код причины с ЭТОЙ записанной неудачей.
+
+    Зачем он нужен, если код и так из закрытого списка. Список гарантирует,
+    что участник увидит НАШУ строку, а не чужую; он не гарантирует, что эта
+    строка описывает СЕГОДНЯШНЮЮ неудачу. Живой сценарий из отчёта ревью:
+    после отката старый писатель обновляет подробный текст и источник попытки,
+    а незнакомое ему поле кода переносит из прежней записи как есть — и
+    участник читает причину прошлой попытки как текущую. Отпечаток это
+    закрывает конструктивно: он посчитан по тем самым полям, которые старый
+    писатель перезаписывает, и после его правки перестаёт сходиться.
+
+    Кодирование length-prefixed — тот же приём и по той же причине, что в
+    `content_hash()`: имя листа может содержать любой символ, который мы бы
+    взяли разделителем, и тогда две разные попытки дали бы один отпечаток.
+
+    Это НЕ подпись и не защита от того, у кого есть право писать в базу: соли
+    здесь нет, и посчитать отпечаток может кто угодно. Задача другая и она
+    названа прямо — отличить запись, сделанную ЭТИМ кодом для ЭТОЙ неудачи, от
+    пережитка отката, ручной правки и рассинхронизации полей.
+    """
+    spreadsheet_id, names = _attempt_identity(source)
+    digest = hashlib.sha256()
+
+    def part(chunk: bytes) -> None:
+        digest.update(str(len(chunk)).encode("ascii"))
+        digest.update(b"\x00")
+        digest.update(chunk)
+
+    part(b"supply-sheets-public-reason-1")
+    part(code.encode("utf-8"))
+    part(detailed.encode("utf-8"))
+    part((attempt_at if isinstance(attempt_at, str) else "").encode("utf-8"))
+    part(spreadsheet_id.encode("utf-8"))
+    part(str(len(names)).encode("ascii"))
+    for name in names:
+        part(name.encode("utf-8"))
+    return digest.hexdigest()
+
+
 def _record_failure(db: Session, org_id: int, spreadsheet_id: str,
                     sheet_names: list[str], attempt_at: str,
                     exc: SourceError) -> None:
     """Отметить неудачу, НЕ тронув прежний успешный снимок.
 
-    Меняются ровно четыре поля: время попытки, её источник и ДВА текста ошибки —
-    подробный и общий. `content_sha256`, `rows`, `fetched_at` и
-    `last_success_at` остаются теми же — иначе неудачное обновление стирало бы
-    единственное, что у пользователя есть, и «не получилось» превращалось бы в
-    «данных больше нет».
+    Меняются только поля ПОПЫТКИ: её время, её источник, подробный текст
+    ошибки и то, по чему участник получит причину, — код из закрытого списка,
+    отпечаток его связи с этой записью и общий текст для старого кода.
+    `content_sha256`, `rows`, `fetched_at` и `last_success_at` остаются теми же
+    — иначе неудачное обновление стирало бы единственное, что у пользователя
+    есть, и «не получилось» превращалось бы в «данных больше нет».
 
-    Два текста, а не один, потому что читателей у этого поля двое. Владелец
-    ввёл ссылку и имена листов, ему их и чинить — он получает подробную
-    причину с именем листа. Участник попытки не делал, и чужой ввод владельца
-    ему не адресован — он получает ту же причину без единой строки владельца.
+    Причин у отказа две редакции, потому что читателей двое. Владелец ввёл
+    ссылку и имена листов, ему их и чинить — он получает подробную причину с
+    именем листа. Участник попытки не делал, и чужой ввод владельца ему не
+    адресован — он получает нашу константу по коду.
     """
     existing = get_envelope(db, org_id)
     envelope = dict(existing) if existing else _skeleton(spreadsheet_id, sheet_names)
@@ -1552,6 +1718,19 @@ def _record_failure(db: Session, org_id: int, spreadsheet_id: str,
     envelope["last_attempt_source"] = {"spreadsheet_id": spreadsheet_id,
                                        "sheet_names": list(sheet_names)}
     envelope["last_error"] = str(exc)
+    # Что видит участник — код из закрытого списка плюс отпечаток, которым
+    # этот код связан с записанной здесь же неудачей. Свободного текста в этой
+    # паре нет вовсе, поэтому «показать участнику чужую строку» больше нечем.
+    code = getattr(exc, "code", "")
+    code = code if code in PUBLIC_FAILURE_REASONS else ""
+    envelope["last_error_public_code"] = code
+    envelope["last_error_public_binding"] = _public_binding(
+        code, envelope["last_error"], attempt_at,
+        envelope["last_attempt_source"])
+    # А это — для СТАРОГО кода после отката релиза: он про код и отпечаток не
+    # знает и читает общий текст. Та же логика, по которой продолжает
+    # писаться сохранённая сводка (`counts`): убрать поле значило бы не
+    # упростить, а сломать откат. Сегодняшний читатель на него не опирается.
     envelope["last_error_public"] = _role_safe_failure(
         getattr(exc, "public", None), spreadsheet_id, sheet_names)
     _store(db, org_id, envelope)
@@ -1630,6 +1809,8 @@ def refresh(db: Session, org_id: int, spreadsheet_url: str, sheet_names,
                                                "sheet_names": list(names)}
             envelope["last_error"] = ""
             envelope["last_error_public"] = ""
+            envelope["last_error_public_code"] = ""
+            envelope["last_error_public_binding"] = ""
             _store(db, org_id, envelope)
             return {
                 "unchanged": True,
@@ -1656,6 +1837,8 @@ def refresh(db: Session, org_id: int, spreadsheet_url: str, sheet_names,
             "fetched_at": now,
             "last_error": "",
             "last_error_public": "",
+            "last_error_public_code": "",
+            "last_error_public_binding": "",
             "last_attempt_source": {"spreadsheet_id": spreadsheet_id,
                                     "sheet_names": list(names)},
             "schema": schema,
@@ -1751,17 +1934,52 @@ def _attempt_view(source) -> dict:
     и прислал. Идентификатор, не прошедший бы сегодняшнюю проверку, ссылкой не
     становится вовсе.
     """
-    if not isinstance(source, dict):
-        return {"spreadsheet_id": "", "spreadsheet_url": "", "sheet_names": []}
-    raw_id = source.get("spreadsheet_id")
-    spreadsheet_id = raw_id if isinstance(raw_id, str) else ""
-    names = source.get("sheet_names")
-    names = [n for n in names if isinstance(n, str)] if isinstance(names, list) else []
+    spreadsheet_id, names = _attempt_identity(source)
     return {
         "spreadsheet_id": spreadsheet_id,
         "spreadsheet_url": spreadsheet_link(spreadsheet_id) if spreadsheet_id else "",
         "sheet_names": names,
     }
+
+
+def _public_reason(envelope: dict, detailed: str) -> str:
+    """Причина отказа для участника. ВСЕГДА строка из нашего исходника.
+
+    Замечание ревью PR #47 на HEAD `459f170`. Прежняя редакция отдавала
+    участнику сохранённый в носителе свободный текст (`last_error_public`),
+    если тот не содержал подстрок текущей попытки. Носитель — это то, что
+    оставил кто-то другой, и у такой проверки было два промаха:
+
+      * ОТКАТ. Старый писатель меняет `last_error` и `last_attempt_source`, но
+        незнакомое ему поле общего текста переносит как есть. Сверка проходит
+        (в тексте прошлой попытки нет строк текущей), и участник читает
+        причину прошлой попытки как сегодняшнюю;
+      * ИСПОРЧЕННЫЙ ИСТОЧНИК ПОПЫТКИ. Нет `last_attempt_source` или он не того
+        вида — сверять не с чем, «совпадений не найдено», и произвольный текст
+        уезжает участнику целиком.
+
+    Общее у обоих: показывалась persisted-строка, актуальность которой ничем
+    не доказана. Поэтому теперь не проверяется текст — текст вообще не
+    берётся. Берётся КОД из закрытого списка `PUBLIC_FAILURE_REASONS`, и
+    показывается наша константа по этому коду. Чтобы код не оказался
+    пережитком чужой записи, он обязан сойтись отпечатком (`_public_binding`)
+    с ФАКТИЧЕСКИМИ полями этой неудачи — подробным текстом, временем попытки и
+    её источником. Не сошлось, нет кода, код неизвестен — generic.
+
+    Fail closed здесь означает «беднее», а не «пусто»: причина участнику видна
+    всегда, потому что пустое место читалось бы как «всё в порядке».
+    """
+    code = envelope.get("last_error_public_code")
+    if not isinstance(code, str) or code not in PUBLIC_FAILURE_REASONS:
+        return PUBLIC_FAILURE_FALLBACK
+    binding = envelope.get("last_error_public_binding")
+    if not isinstance(binding, str) or not binding:
+        return PUBLIC_FAILURE_FALLBACK
+    expected = _public_binding(code, detailed, envelope.get("last_attempt_at"),
+                               envelope.get("last_attempt_source"))
+    if binding != expected:
+        return PUBLIC_FAILURE_FALLBACK
+    return PUBLIC_FAILURE_REASONS[code]
 
 
 def _error_view(envelope: dict, role: str) -> str:
@@ -1770,17 +1988,10 @@ def _error_view(envelope: dict, role: str) -> str:
     Владельцу — подробный текст: имена листов и ссылку вводил он, чинить их
     ему, и без имени листа он не знает, какой из двух листов сломался.
 
-    Участнику — общий текст, сохранённый рядом (`last_error_public`). Его нет
-    вовсе, если снимок записан кодом ДО разделения текстов или откатом; тогда
-    что лежит в подробном тексте, читатель знать не может, и fail closed:
-    участник получает generic.
-
-    И общий текст, откуда бы он ни взялся, ПЕРЕПРОВЕРЯЕТСЯ здесь той же
-    функцией, что и при записи, — против `last_attempt_source` самого снимка.
-    Причина та же, по которой сводка на чтении пересчитывается, а не берётся
-    из носителя: носитель — это то, что оставил кто-то другой (прежняя версия,
-    откат, чужая рука), и доверять его содержимому по факту наличия нельзя.
-    Проверка на чтении дороже нуля и дешевле утечки.
+    Участнику — константа из закрытого списка по сохранённому коду причины,
+    и ни одной строки из носителя (`_public_reason`). Снимок, записанный кодом
+    ДО этого разделения, откатом или рукой, кода не несёт либо не сходится
+    отпечатком — участник получает generic.
 
     Пустым результат при непустой причине не бывает никогда: пустая причина
     читалась бы как «всё в порядке», а это неправда.
@@ -1790,15 +2001,7 @@ def _error_view(envelope: dict, role: str) -> str:
         return detailed if isinstance(detailed, str) else ""
     if not (isinstance(detailed, str) and detailed):
         return ""
-    source = envelope.get("last_attempt_source")
-    source = source if isinstance(source, dict) else {}
-    raw_id = source.get("spreadsheet_id")
-    names = source.get("sheet_names")
-    return _role_safe_failure(
-        envelope.get("last_error_public"),
-        raw_id if isinstance(raw_id, str) else "",
-        [n for n in names if isinstance(n, str)] if isinstance(names, list) else [],
-    )
+    return _public_reason(envelope, detailed)
 
 
 def preview(db: Session, org_id: int, role: str, sheet: str | None = None,

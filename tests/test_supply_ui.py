@@ -113,18 +113,29 @@ REFRESH_RE = re.compile(r"/api/supply/sheets/refresh")
 #: вместе с возможностью её увидеть. Здесь же тормозится ровно тот запрос,
 #: который назван в `__supDelayMatch`, а журнал вызовов ведётся честно по
 #: каждой попытке — включая ту, которую страница обязана НЕ сделать.
+#:
+#: `__supDelayLimit` тормозит только ПЕРВЫЕ N совпавших запросов (`-1` — все).
+#: Без него нельзя воспроизвести гонку, где медленный и быстрый запросы идут
+#: по ОДНОМУ адресу: догрузка снятого вида и догрузка нового вида отличаются
+#: не URL, а тем, кто их начал, — и «тормозим всё, что совпало» затормозило бы
+#: обоих, спрятав ровно ту разницу, которую проверка обязана увидеть.
 DELAY_SCRIPT = """
 (() => {
   window.__supCalls = [];
   window.__supDelayMs = 0;
   window.__supDelayMatch = "";
+  window.__supDelayLimit = -1;
   const real = window.fetch;
   window.fetch = function (url, init) {
     const u = String((url && url.url) || url);
     const self = this, args = arguments;
     if (u.indexOf("/api/supply/sheets") !== -1) window.__supCalls.push(u);
     const wanted = window.__supDelayMatch;
-    const delay = (wanted && u.indexOf(wanted) !== -1) ? (window.__supDelayMs || 0) : 0;
+    let delay = (wanted && u.indexOf(wanted) !== -1) ? (window.__supDelayMs || 0) : 0;
+    if (delay && window.__supDelayLimit >= 0) {
+      if (window.__supDelayLimit > 0) { window.__supDelayLimit -= 1; }
+      else { delay = 0; }
+    }
     if (!delay) return real.apply(self, args);
     return new Promise((resolve, reject) => {
       setTimeout(() => { real.apply(self, args).then(resolve, reject); }, delay);
@@ -188,23 +199,32 @@ def write_snapshot(sheets, rows) -> None:
         con.close()
 
 
-def write_failed_attempt(sheets, detailed: str, public: str) -> None:
+def write_failed_attempt(sheets, detailed: str, public: str,
+                         code: str = "access") -> None:
     """Состояние «удачного чтения ещё не было, последняя попытка отказала».
 
     `configured` в нём false: `spreadsheet_id` пуст, строк нет, успеха не было
     ни одного. Ровно на этом состоянии страница и советует человеку, что делать
     дальше, — и совет обязан подходить его роли.
+
+    Код причины и его отпечаток считает САМ слой (`ss._public_binding`), а не
+    тест: иначе проверка экрана опиралась бы на связывание, выдуманное рядом с
+    проверкой, и доказывала бы согласие теста с самим собой.
     """
+    attempt_at = "2026-08-31T12:00:00+00:00"
+    source = {"spreadsheet_id": SPREADSHEET_ID, "sheet_names": list(sheets)}
     envelope = {
         "schema_version": ss.ENVELOPE_SCHEMA_VERSION,
         "parser_version": ss.PARSER_VERSION,
         "spreadsheet_id": "", "sheet_names": [],
         "content_sha256": "",
-        "last_attempt_at": "2026-08-31T12:00:00+00:00",
+        "last_attempt_at": attempt_at,
         "last_success_at": None, "fetched_at": None,
         "last_error": detailed, "last_error_public": public,
-        "last_attempt_source": {"spreadsheet_id": SPREADSHEET_ID,
-                                "sheet_names": list(sheets)},
+        "last_error_public_code": code,
+        "last_error_public_binding": ss._public_binding(
+            code, detailed, attempt_at, source),
+        "last_attempt_source": source,
         "schema": {}, "counts": ss.build_counts([], []), "rows": [],
     }
     con = sqlite3.connect(DB_PATH)
@@ -745,6 +765,280 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
               f"{data_rows()} {total_line()}")
         page.unroute(REFRESH_RE)
 
+        # ── 5а. Поздний ОТКАЗ снятого вида не стирает новый ───────────────
+        #
+        # Замечание ревью PR #47 на HEAD `459f170`. Поколение проверялось только
+        # в ветке успеха: `load()` молча бросал поздний УСПЕХ, но поздний ОТКАЗ
+        # летел дальше безусловно и попадал в `.catch()` того `switchView()`,
+        # который его начинал. Медленный переход A, отказавший ПОСЛЕ того, как
+        # быстрый переход B уже нарисовал свои строки, стирал строки B и рисовал
+        # поверх них ошибку A вместе с кнопкой «Повторить» — привязанной к
+        # текущему состоянию, то есть к чужому фильтру.
+        #
+        # Проверкой разметки это не ловится: разметка правильная, неверен
+        # порядок во времени. Поэтому здесь настоящий браузер, настоящая
+        # задержка ровно одного URL и настоящий 502 ровно на нём.
+        print("\n== Поздний 502 снятого фильтра не трогает уже показанный ==")
+        page.evaluate("() => { window.__supDelayMs = 0; window.__supDelayMatch = ''; }")
+        write_snapshot([SHEET_A, SHEET_B],
+                       [make_row(i + 1, SHEET_A) for i in range(120)]
+                       + [make_row(121, SHEET_A, invalid=True)])
+        page.goto(f"{base}/supply")
+        page.wait_for_timeout(1200)
+        check("исходно показан первый фильтр целиком",
+              data_rows() == 50 and total_line() == "показано 50 из 121",
+              f"{data_rows()} {total_line()}")
+
+        # Падает и тормозит РОВНО фильтр A (`queue=invalid`). Остальные запросы
+        # идут на настоящий сервер и отвечают быстро — иначе «B успел» было бы
+        # не свойством страницы, а свойством заглушки.
+        def only_invalid_fails(route):
+            if "queue=invalid" in route.request.url:
+                route.fulfill(status=502, content_type="application/json",
+                              body='{"detail":"фильтр A не прочитался"}')
+            else:
+                route.continue_()
+
+        page.route(GET_RE, only_invalid_fails)
+        page.evaluate("() => { window.__supCalls = []; window.__supDelayMs = 1800;"
+                      " window.__supDelayMatch = 'queue=invalid'; }")
+        click_chip("Ошибки")                  # A — медленный, обречённый
+        page.wait_for_timeout(250)
+        click_chip("Все")                     # B — быстрый и удачный
+        page.wait_for_timeout(900)
+        check("B успел нарисоваться, пока A ещё в полёте",
+              data_rows() == 50 and total_line() == "показано 50 из 121"
+              and active_chip("queue") == "Все",
+              f"{data_rows()} {total_line()} {active_chip('queue')}")
+
+        page.wait_for_timeout(2200)           # сюда приходит 502 фильтра A
+        after_calls = get_calls()
+        check("оба запроса действительно были сделаны",
+              any("queue=invalid" in u for u in after_calls)
+              and any("queue=all" in u for u in after_calls), str(after_calls))
+        check("строки B на месте — поздний отказ A их не стёр",
+              data_rows() == 50, str(data_rows()))
+        check("и счётчик показанного остался счётчиком B",
+              total_line() == "показано 50 из 121", total_line())
+        check("и подсветка чипа тоже описывает B, а не A",
+              active_chip("queue") == "Все", active_chip("queue"))
+        check("заглушки с причиной отказа A на экране нет вовсе",
+              "Не удалось загрузить строки" not in (page.text_content("#sup-rows") or ""),
+              (page.text_content("#sup-rows") or "")[:160])
+        check("и устаревшей кнопки «Повторить» тоже нет — перепривязывать нечего",
+              page.evaluate("() => !!document.getElementById('sup-retry')") is False)
+        check("кнопка догрузки осталась рабочей кнопкой вида B",
+              page.evaluate("() => { const b = document.getElementById('sup-more');"
+                            " return b.style.display !== 'none' && !b.disabled; }")
+              is True)
+
+        # И главное — вид B остался ЖИВЫМ, а не просто нарисованным: догрузка
+        # продолжает его же, с той позиции, на которой он остановился.
+        page.evaluate("() => { window.__supCalls = []; window.__supDelayMs = 0;"
+                      " window.__supDelayMatch = ''; }")
+        page.click("#sup-more")
+        page.wait_for_timeout(1200)
+        more_calls = get_calls()
+        check("догрузка продолжает именно B — offset=50 и queue=all",
+              more_calls and "offset=50" in more_calls[-1]
+              and "queue=all" in more_calls[-1], str(more_calls))
+        check("и дописала страницу к строкам B, а не к чему-то ещё",
+              data_rows() == 100 and total_line() == "показано 100 из 121",
+              f"{data_rows()} {total_line()}")
+        page.unroute(GET_RE)
+
+        # Контроль сверху: отказ СВОЕГО, не снятого вида по-прежнему виден.
+        # Иначе «поздний отказ не трогает экран» можно было бы выполнить,
+        # перестав показывать отказы вовсе.
+        page.route(GET_RE, lambda route: route.fulfill(
+            status=502, content_type="application/json",
+            body='{"detail":"чтение снимка не удалось"}'))
+        click_chip("Ошибки")
+        page.wait_for_timeout(1200)
+        check("отказ ТЕКУЩЕГО фильтра по-прежнему очищает экран и объясняет себя",
+              data_rows() == 0 and total_line() == ""
+              and page.evaluate("() => !!document.getElementById('sup-retry')") is True,
+              f"{data_rows()} {total_line()}")
+        page.unroute(GET_RE)
+
+        # ── 5б. Замок догрузки принадлежит ВИДУ, а не странице ────────────
+        #
+        # Замечание UX-аудита. `inflight` был один на всю страницу и жил дольше
+        # вида, который его взял. Отсюда два разных вреда из одной причины:
+        #
+        #   * медленная догрузка вида A не отпускала замок, человек переключался
+        #     на новый вид, тот рисовал ВКЛЮЧЁННУЮ кнопку «Показать ещё» — и
+        #     клик по ней молча не делал ничего: обработчик выходил по
+        #     `inflight` чужого вида. Кнопка выглядит рабочей и не работает —
+        #     худший вид отказа, потому что человеку нечего понять;
+        #   * финализатор A, добежав позже, трогал кнопку ЖИВОГО вида и
+        #     сбрасывал его замок — то есть снимал защиту от двойного запроса
+        #     ровно там, где она нужна.
+        #
+        # Тормозится РОВНО ОДИН первый совпавший запрос (`__supDelayLimit = 1`):
+        # догрузка снятого вида и догрузка живого идут по ОДНОМУ адресу, и
+        # «тормозим всё, что совпало» затормозило бы обоих, спрятав ровно ту
+        # разницу, которую проверка обязана увидеть.
+        print("\n== Медленная догрузка A не запирает догрузку нового вида ==")
+        page.evaluate("() => { window.__supDelayMs = 0; window.__supDelayMatch = '';"
+                      " window.__supDelayLimit = -1; }")
+        write_snapshot([SHEET_A, SHEET_B],
+                       [make_row(i + 1, SHEET_A) for i in range(120)]
+                       + [make_row(121, SHEET_A, invalid=True)])
+        page.goto(f"{base}/supply")
+        page.wait_for_timeout(1200)
+        check("исходно на экране первая страница вида A",
+              data_rows() == 50 and total_line() == "показано 50 из 121",
+              f"{data_rows()} {total_line()}")
+
+        page.evaluate("() => { window.__supCalls = []; window.__supDelayMs = 3000;"
+                      " window.__supDelayMatch = 'queue=all&offset=50';"
+                      " window.__supDelayLimit = 1; }")
+        page.click("#sup-more")               # A: медленная догрузка, замок взят
+        page.wait_for_timeout(200)
+        check("замок вида A взят: его кнопка выключена",
+              page.evaluate("() => document.getElementById('sup-more').disabled")
+              is True)
+
+        click_chip("Ошибки")                  # переход, вид A снят
+        page.wait_for_timeout(900)
+        check("нарисован уже другой вид",
+              active_chip("queue") == "Ошибки" and total_line() == "показано 1 из 1",
+              f"{active_chip('queue')} {total_line()}")
+
+        # Вид «Ошибки» короткий, догружать в нём нечего — поэтому возвращаемся в
+        # «Все» третьим переходом: это снова вид с догрузкой, и он тоже не
+        # должен быть заперт замком давно снятого A.
+        click_chip("Все")
+        page.wait_for_timeout(900)
+        check("вернулись в вид с догрузкой, кнопка включена",
+              page.evaluate("() => { const b = document.getElementById('sup-more');"
+                            " return b.style.display !== 'none' && !b.disabled; }")
+              is True)
+
+        page.evaluate("() => { window.__supCalls = []; }")
+        page.click("#sup-more")               # догрузка ЖИВОГО вида
+        page.wait_for_timeout(1200)
+        live_calls = get_calls()
+        check("догрузка живого вида действительно ушла на сервер",
+              any("offset=50" in u for u in live_calls), str(live_calls))
+        check("и дописала свою страницу, а не осталась немой кнопкой",
+              data_rows() == 100 and total_line() == "показано 100 из 121",
+              f"{data_rows()} {total_line()}")
+
+        # Теперь ждём, пока добежит медленная догрузка A, и смотрим, что её
+        # финализатор сделает с живым видом.
+        page.wait_for_timeout(2600)
+        check("поздний ответ A строк живого вида не дописал",
+              data_rows() == 100 and total_line() == "показано 100 из 121",
+              f"{data_rows()} {total_line()}")
+        check("и кнопка живого вида осталась в своём состоянии",
+              page.evaluate("() => { const b = document.getElementById('sup-more');"
+                            " return b.style.display !== 'none' && !b.disabled; }")
+              is True)
+
+        # И самое главное: замок живого вида цел. Двойной клик по-прежнему даёт
+        # ровно ОДИН запрос — финализатор A не снял чужую защиту.
+        page.evaluate("() => { window.__supCalls = []; window.__supDelayMs = 700;"
+                      " window.__supDelayMatch = 'offset=100';"
+                      " window.__supDelayLimit = -1; }")
+        page.click("#sup-more")
+        page.wait_for_timeout(150)
+        page.evaluate("() => document.getElementById('sup-more')"
+                      ".dispatchEvent(new MouseEvent('click', {bubbles: true}))")
+        page.wait_for_timeout(1600)
+        check("замок живого вида цел: двойной клик дал ровно один запрос",
+              len(get_calls()) == 1, str(get_calls()))
+        # 50 + 50 + 21 = 121: последняя страница короткая, и это НЕ дубль.
+        # Дубль виден иначе — числом строк в DOM, поэтому сверяются оба.
+        check("и показано ровно 121 из 121, без дублей и без пропусков",
+              total_line() == "показано 121 из 121" and data_rows() == 121,
+              f"{total_line()} {data_rows()}")
+        page.evaluate("() => { window.__supDelayMs = 0; window.__supDelayMatch = '';"
+                      " window.__supDelayLimit = -1; }")
+
+        # ── 5в. Замок обновления переживает пересборку формы ───────────────
+        #
+        # Замечание UX-аудита. Замок «идёт обновление» жил в САМОМ элементе
+        # кнопки (`btn.disabled`), а кнопку пересоздаёт `renderForm()` на каждом
+        # успешном GET. Значит любой переход фильтра во время медленного POST
+        # рисовал НОВУЮ включённую кнопку — и второй клик отправлял второй
+        # POST теми же (или уже другими) полями формы. Два обновления одного
+        # снимка наперегонки: чей ответ придёт вторым, тот и определит, что
+        # человек увидит.
+        #
+        # Попытки считаются НА СТОРОНЕ СТРАНИЦЫ (`__supCalls`), а не по приходу
+        # в обработчик playwright: запрос заторможен до отправки, и обработчик
+        # узнал бы о нём только через три секунды — проверка «второго POST нет»
+        # была бы зелёной просто потому, что первый ещё не долетел.
+        print("\n== Обновление идёт: пересборка формы кнопку не отпирает ==")
+        write_snapshot([SHEET_A, SHEET_B],
+                       [make_row(i + 1, SHEET_A) for i in range(120)]
+                       + [make_row(121, SHEET_A, invalid=True)])
+        arrived = []
+
+        def count_refresh(route):
+            arrived.append(route.request.url)
+            route.fulfill(status=200, content_type="application/json",
+                          body='{"ok":true,"unchanged":false}')
+
+        def refresh_attempts() -> int:
+            return len([u for u in calls() if "/refresh" in u])
+
+        page.goto(f"{base}/supply")
+        page.wait_for_timeout(1200)
+        page.route(REFRESH_RE, count_refresh)
+        page.evaluate("() => { window.__supCalls = []; window.__supDelayMs = 3000;"
+                      " window.__supDelayMatch = '/refresh';"
+                      " window.__supDelayLimit = -1; }")
+        page.click("#sup-refresh")
+        page.wait_for_timeout(200)
+        check("кнопка обновления выключена на время запроса",
+              page.evaluate("() => document.getElementById('sup-refresh').disabled")
+              is True)
+        check("и попытка обновления пока ровно одна",
+              refresh_attempts() == 1, str(refresh_attempts()))
+
+        # Переход фильтра во время POST: успешный GET пересобирает форму.
+        click_chip("Ошибки")
+        page.wait_for_timeout(900)
+        check("форма действительно пересобрана — кнопка на месте",
+              page.evaluate("() => !!document.getElementById('sup-refresh')") is True)
+        check("и ПЕРЕСОБРАННАЯ кнопка всё ещё показывает, что идёт чтение",
+              page.evaluate("() => document.getElementById('sup-refresh').disabled")
+              is True
+              and (page.text_content("#sup-refresh") or "") == "Читаем таблицу…",
+              page.text_content("#sup-refresh") or "")
+
+        page.evaluate("() => document.getElementById('sup-refresh')"
+                      ".dispatchEvent(new MouseEvent('click', {bubbles: true}))")
+        page.wait_for_timeout(300)
+        check("второй клик по пересобранной кнопке второго POST не отправил",
+              refresh_attempts() == 1, str(refresh_attempts()))
+
+        page.wait_for_timeout(3500)           # медленный POST добегает и оседает
+        check("за весь сценарий на сервер ушёл ровно один POST",
+              len(arrived) == 1, str(len(arrived)))
+        check("кнопка обновления вернулась в рабочее состояние",
+              page.evaluate("() => document.getElementById('sup-refresh').disabled")
+              is False)
+        check("и её подпись снова обычная",
+              (page.text_content("#sup-refresh") or "") == "Обновить предпросмотр",
+              page.text_content("#sup-refresh") or "")
+
+        # Контроль сверху: замок не «залип». Следующее обновление возможно —
+        # иначе требование можно было бы выполнить, запретив обновление совсем.
+        page.evaluate("() => { window.__supDelayMs = 0; window.__supDelayMatch = '';"
+                      " window.__supDelayLimit = -1; }")
+        page.click("#sup-refresh")
+        page.wait_for_timeout(1500)
+        check("следующее обновление после этого снова возможно",
+              len(arrived) == 2, str(len(arrived)))
+        check("и кнопка снова свободна",
+              page.evaluate("() => document.getElementById('sup-refresh').disabled")
+              is False)
+        page.unroute(REFRESH_RE)
+
         # ── 6. Совет после отказа подходит роли и состоянию подписки ───────
         #
         # Замечание ревью PR #47 (P3): прежний текст обещал ВСЕМ, что ссылка и
@@ -799,7 +1093,10 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
         check("сказано, что поправить связь может владелец организации",
               "владелец организации" in m_err, m_err[:220])
         check("причина отказа участнику при этом видна и непуста",
-              "403" in m_err, m_err[:220])
+              ss.PUBLIC_FAILURE_REASONS["access"] in m_err, m_err[:220])
+        check("а свободного текста из носителя на его экране нет",
+              "источник ответил 403" not in (mpage.text_content("body") or ""),
+              m_err[:220])
         check("а имени листа неудачной попытки на его экране нет нигде",
               SENTINEL_SHEET not in (mpage.text_content("body") or "")
               and SENTINEL_SHEET not in mpage.content(),

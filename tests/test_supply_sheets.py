@@ -2179,12 +2179,32 @@ def structural_checks(owner) -> None:
     check("позиция фиксируется только после успешного ответа",
           "state.offset = offset;" in template)
     check("у догрузки есть замок «один запрос в полёте»",
-          "inflight" in template and "moreBtn.disabled = true" in template)
+          "inflightGen" in template and "moreBtn.disabled = true" in template)
     check("и поколение состояния, чтобы поздний ответ не дописался",
           "myGen !== gen" in template and "function resetView()" in template)
     check("успешное обновление сбрасывает фильтр листа",
-          'state.sheet = "";' in template.split("function refresh(btn)")[1]
+          'state.sheet = "";' in template.split("function refresh()")[1]
           .split("function renderError")[0])
+
+    # Корректив по UX-аудиту: оба замка перестали быть привязаны к тому, что
+    # живёт не столько же, сколько они сами. Поведение проверяет браузерный
+    # набор; здесь стоят структурные замки — офлайн и без Chromium.
+    check("замок догрузки принадлежит поколению, а не странице",
+          "var inflightGen = -1;" in template
+          and "if (inflightGen === gen) return;" in template
+          and "if (inflightGen !== myGen) return;" in template)
+    check("и общего булева замка догрузки больше нет вовсе",
+          "var inflight = false" not in template
+          and "inflight = true;" not in template)
+    check("финализатор догрузки трогает кнопку только своего поколения",
+          "if (gen === myGen) moreBtn.disabled = false;" in template)
+    check("замок обновления живёт ВНЕ DOM и переживает пересборку формы",
+          "var refreshBusy = false;" in template
+          and "if (refreshBusy) return;" in template
+          and "function paintRefreshButton()" in template)
+    check("и кнопка рождается в текущем состоянии обновления",
+          "btn.disabled = refreshBusy;" in template
+          and "REFRESH_LABELS[refreshBusy ? 1 : 0]" in template)
     check("кнопка обновления восстанавливается при ЛЮБОМ исходе",
           ".then(restore, restore);" in template)
     check("неполный итог штук называется словами, а не числом",
@@ -2561,7 +2581,8 @@ def attempt_privacy_checks() -> None:
               SHEET_CURRENT not in theirs_raw and SHEET_NEXT not in theirs_raw,
               theirs_raw[:200])
         check("но причина отказа участнику видна — это состояние раздела",
-              "403" in theirs["last_error"], theirs["last_error"][:100])
+              theirs["last_error"] == ss.PUBLIC_FAILURE_REASONS["access"],
+              theirs["last_error"][:100])
         check("источник настроенным при этом не считается ни у кого",
               mine["configured"] is False and theirs["configured"] is False)
 
@@ -2633,7 +2654,7 @@ def failure_privacy_checks() -> None:  # noqa: C901 — сценарий, вет
                              conn_id)[0][0])
         return cfg[ss.ENVELOPE_KEY]
 
-    def probe(label: str, expect_in_public: str) -> None:
+    def probe(label: str, expect_in_detailed: str, public_code: str) -> None:
         """Один отказ — пять дорог наружу, и на каждой имени листа быть не должно."""
         mine = boss.get("/api/supply/sheets?limit=200").json()
         theirs_raw = mate.get("/api/supply/sheets?limit=200").text
@@ -2644,7 +2665,7 @@ def failure_privacy_checks() -> None:  # noqa: C901 — сценарий, вет
               SENTINEL_SHEET in (mine.get("last_error") or ""),
               (mine.get("last_error") or "")[:140])
         check(f"{label}: и она осмысленна, а не просто содержит имя",
-              expect_in_public in (mine.get("last_error") or ""),
+              expect_in_detailed in (mine.get("last_error") or ""),
               (mine.get("last_error") or "")[:140])
         # ГЛАВНАЯ проверка пакета: ничего не вырезается перед сравнением.
         check(f"{label}: имени листа нет НИГДЕ во всём ответе участника",
@@ -2656,9 +2677,13 @@ def failure_privacy_checks() -> None:  # noqa: C901 — сценарий, вет
               (theirs.get("last_error") or "")[:160])
         check(f"{label}: идентификатора чужой таблицы у участника тоже нет",
               SPREADSHEET_ID not in theirs_raw)
-        check(f"{label}: причина у участника НЕПУСТА и осмысленна",
+        # Причина участника — КОНСТАНТА нашего исходника, выбранная по коду и
+        # связанная отпечатком с этой самой неудачей. Проверяется равенство, а
+        # не вхождение подстроки: «содержит» пропустило бы приписанный к
+        # константе хвост из носителя, а именно этого здесь и не должно быть.
+        check(f"{label}: причина у участника НЕПУСТА и это наша константа",
               bool((theirs.get("last_error") or "").strip())
-              and expect_in_public in theirs["last_error"],
+              and theirs["last_error"] == ss.PUBLIC_FAILURE_REASONS[public_code],
               (theirs.get("last_error") or "")[:160])
         check(f"{label}: HTML страницы участника имени листа не несёт",
               SENTINEL_SHEET not in mate.get("/supply").text)
@@ -2681,7 +2706,7 @@ def failure_privacy_checks() -> None:  # noqa: C901 — сценарий, вет
         check("отказ 403 доехал как 502", r.status_code == 502, r.text[:120])
         check("и владельцу в теле 502 названо, какой именно лист",
               SENTINEL_SHEET in r.text, r.text[:160])
-        probe("403", "403")
+        probe("403", "403", "access")
 
         # 2. Дрейф заголовка: отказ рождается в парсере, а не в транспорте, —
         #    это ДРУГАЯ ветка сборки текста, и её тоже надо пройти.
@@ -2692,7 +2717,7 @@ def failure_privacy_checks() -> None:  # noqa: C901 — сценарий, вет
                       json={"spreadsheet_url": SHEET_URL,
                             "sheet_names": [SENTINEL_SHEET, SENTINEL_SHEET_NEXT]})
         check("дрейф заголовка тоже 502", r.status_code == 502, r.text[:120])
-        probe("дрейф заголовка", "заголовк")
+        probe("дрейф заголовка", "заголовк", "format")
 
         print("\n== Тот же запрет, когда удачный снимок УЖЕ есть ==")
         # Самое живое состояние: снимок с обычными именами прочитан и общий для
@@ -2727,7 +2752,7 @@ def failure_privacy_checks() -> None:  # noqa: C901 — сценарий, вет
         check("и в HTML его страницы тоже нет",
               SENTINEL_SHEET not in mate.get("/supply").text)
         check("причина отказа участнику при этом видна",
-              "500" in (theirs.get("last_error") or ""),
+              theirs.get("last_error") == ss.PUBLIC_FAILURE_REASONS["unavailable"],
               (theirs.get("last_error") or "")[:160])
         check("владелец видит и подробность, и свой ввод обратно",
               SENTINEL_SHEET in (mine.get("last_error") or "")
@@ -2739,12 +2764,14 @@ def failure_privacy_checks() -> None:  # noqa: C901 — сценарий, вет
               and envelope_now()["last_success_at"] == mine["last_success_at"],
               str(mine["content_sha256"])[:16])
 
-        print("\n== Носителю на слово не верят: общий текст перепроверяется ==")
-        # Снимок, записанный ДО разделения текстов (или после отката релиза),
-        # общего текста не несёт вовсе. Читатель не может знать, что лежит в
-        # подробном, — и обязан отдать участнику generic, а не подробность.
+        print("\n== Носителю на слово не верят: свободный текст не читается ==")
+        # Снимок, записанный ДО этого разделения (или после отката релиза),
+        # кода причины не несёт вовсе. Читатель не может знать, что лежит в
+        # подробном тексте, — и обязан отдать участнику generic.
         stored = envelope_now()
-        rolled_back = {k: v for k, v in stored.items() if k != "last_error_public"}
+        rolled_back = {k: v for k, v in stored.items()
+                       if k not in ("last_error_public_code",
+                                    "last_error_public_binding")}
         cfg = json.loads(sql("SELECT config_json FROM connections WHERE id = ?",
                              conn_id)[0][0])
         cfg[ss.ENVELOPE_KEY] = rolled_back
@@ -2753,29 +2780,34 @@ def failure_privacy_checks() -> None:  # noqa: C901 — сценарий, вет
                  blob, conn_id)
         theirs_raw = mate.get("/api/supply/sheets?limit=200").text
         theirs = json.loads(theirs_raw)
-        check("снимок без общего текста читается, а не 409",
+        check("снимок без кода причины читается, а не 409",
               mate.get("/api/supply/sheets?limit=200").status_code == 200)
         check("и участник получает generic, а не подробность прежней версии",
               SENTINEL_SHEET not in theirs_raw
               and theirs["last_error"] == ss.PUBLIC_FAILURE_FALLBACK,
               theirs["last_error"][:160])
+        check("сохранённый рядом свободный текст на экран участника НЕ попадает",
+              isinstance(rolled_back.get("last_error_public"), str)
+              and rolled_back["last_error_public"] != ""
+              and rolled_back["last_error_public"] not in theirs_raw,
+              str(rolled_back.get("last_error_public"))[:120])
         check("владелец при этом подробность не потерял",
               SENTINEL_SHEET in boss.get("/api/supply/sheets").json()["last_error"])
         check("и чтение ничего не переписало в носителе",
               sql("SELECT config_json FROM connections WHERE id = ?",
                   conn_id)[0][0] == blob)
 
-        # Испорченный/подложенный руками общий текст — та же история: читатель
-        # сверяет его с источником ПОПЫТКИ, а не принимает как есть.
-        cfg[ss.ENVELOPE_KEY] = {**rolled_back,
-                                "last_error_public":
-                                    f"лист «{SENTINEL_SHEET}»: подложено рукой"}
+        # Подложенный руками свободный текст — та же история, но теперь она
+        # заканчивается раньше: читатель его не сверяет, он его не читает.
+        # Даже безобидный на вид текст без строк владельца участнику не уезжает.
+        planted = "подложено рукой: источник ответил 418"
+        cfg[ss.ENVELOPE_KEY] = {**rolled_back, "last_error_public": planted}
         blob = json.dumps(cfg, ensure_ascii=False)
         exec_sql("UPDATE connections SET config_json = ? WHERE id = ?",
                  blob, conn_id)
         theirs_raw = mate.get("/api/supply/sheets?limit=200").text
-        check("подложенный в носитель общий текст участнику не уезжает",
-              SENTINEL_SHEET not in theirs_raw
+        check("подложенный в носитель свободный текст участнику не уезжает",
+              planted not in theirs_raw
               and json.loads(theirs_raw)["last_error"] == ss.PUBLIC_FAILURE_FALLBACK,
               theirs_raw[:200])
         check("и это чтение тоже ничего не записало",
@@ -3371,6 +3403,353 @@ def csv_limit_checks() -> None:
               lambda: ss.decode_csv("Б", huge_field), ss.SourceError),
           raises(lambda: ss.decode_csv("Б", huge_field), ss.SourceError)[:120])
 
+# ── Корректив по ревью PR #47 (REVIEW_REJECT на HEAD `459f170`) ─────────────
+
+def bound_public_reason_checks() -> None:  # noqa: C901 — матрица подмен, ветвлений мало
+    """Участник не получает НИ ОДНОЙ свободной строки из носителя.
+
+    Замечание ревью PR #47 на HEAD `459f170`. Прежняя редакция отдавала
+    участнику `last_error_public` — persisted-строку, признанную безопасной
+    лишь потому, что в ней не нашлось подстрок ТЕКУЩЕЙ попытки. У этой проверки
+    было два прохода насквозь, и оба воспроизводятся здесь буквально:
+
+      A. ОТКАТ. Старый писатель обновляет подробный текст, время и источник
+         попытки, а незнакомое ему поле общего текста переносит из прежней
+         записи как есть. Строк новой попытки в нём нет, сверка проходит — и
+         участник читает причину ПРОШЛОЙ попытки как сегодняшнюю.
+      B. ИСПОРЧЕННЫЙ ИСТОЧНИК ПОПЫТКИ. `last_attempt_source` отсутствует или не
+         того вида — сверять не с чем, «совпадений нет», и произвольный текст
+         уезжает участнику целиком. Проверка формы envelope здесь не помогает:
+         она смотрит ТИП необязательного поля, а не его происхождение.
+
+    Проверяется не формулировка, а канал: в ответе участника не должно быть ни
+    подложенной строки, ни подробностей чужой попытки — только константа из
+    закрытого списка либо generic. Владелец подробность сохраняет. GET при этом
+    остаётся read-only и без сети: носитель сверяется побайтно ДО и ПОСЛЕ, а
+    транспорт подменён на такой, который от любого вызова падает.
+    """
+    print("\n== Причина для участника связана с записанной неудачей ==")
+    boss = client()
+    boss.post("/register", data={"name": "Связывание",
+                                 "email": "sheets-bind@test.io",
+                                 "password": "secret123", "org_name": "Бренд-СВ"})
+    boss.post("/api/connect/demo")
+    org_id = sql("SELECT org_id FROM memberships WHERE user_id ="
+                 " (SELECT id FROM users WHERE email = 'sheets-bind@test.io')")[0][0]
+    conn_id = sql("SELECT id FROM connections WHERE org_id = ? ORDER BY id",
+                  org_id)[0][0]
+    add_member(org_id, "sheets-bind-m@test.io")
+    mate = client()
+    mate.post("/login", data={"email": "sheets-bind-m@test.io",
+                              "password": "secret123"})
+
+    def exploding_transport(method, url, timeout):
+        raise AssertionError("GET сходил в сеть — а чтение обязано быть без неё")
+
+    def blob() -> str:
+        return sql("SELECT config_json FROM connections WHERE id = ?",
+                   conn_id)[0][0]
+
+    def envelope_now() -> dict:
+        return json.loads(blob())[ss.ENVELOPE_KEY]
+
+    def store(envelope: dict) -> str:
+        cfg = json.loads(blob())
+        cfg[ss.ENVELOPE_KEY] = envelope
+        raw = json.dumps(cfg, ensure_ascii=False)
+        exec_sql("UPDATE connections SET config_json = ? WHERE id = ?",
+                 raw, conn_id)
+        return raw
+
+    def member_reason(label: str, expect: str, forbidden: list) -> None:
+        """Что видит участник, что при этом видит владелец и что стало с базой."""
+        before = blob()
+        ss.set_transport(exploding_transport)
+        try:
+            theirs_raw = mate.get("/api/supply/sheets?limit=200").text
+            mine = boss.get("/api/supply/sheets?limit=200").json()
+        finally:
+            ss.set_transport(None)
+        theirs = json.loads(theirs_raw)
+        check(f"{label}: участник получает ровно ожидаемую причину",
+              theirs.get("last_error") == expect,
+              str(theirs.get("last_error"))[:160])
+        check(f"{label}: и она непуста",
+              bool((theirs.get("last_error") or "").strip()))
+        check(f"{label}: причина участника — строка ИЗ НАШЕГО исходника",
+              theirs.get("last_error") in set(ss.PUBLIC_FAILURE_REASONS.values())
+              | {ss.PUBLIC_FAILURE_FALLBACK, ""},
+              str(theirs.get("last_error"))[:160])
+        for bad in forbidden:
+            check(f"{label}: «{bad[:40]}» нет во ВСЁМ ответе участника",
+                  bad not in theirs_raw, theirs_raw[:200])
+        check(f"{label}: владелец подробность сохранил",
+              isinstance(mine.get("last_error"), str)
+              and mine["last_error"] == envelope_now().get("last_error"),
+              str(mine.get("last_error"))[:160])
+        check(f"{label}: носитель после двух GET байт в байт прежний",
+              blob() == before)
+
+    try:
+        # Настоящая неудача настоящим кодом: 403 на сентинельном листе.
+        ss.set_transport(FakeGoogle({SENTINEL_SHEET: ss.HttpResponse(
+            403, {}, b"forbidden", "https://docs.google.com/x")}))
+        r = boss.post("/api/supply/sheets/refresh",
+                      json={"spreadsheet_url": SHEET_URL,
+                            "sheet_names": [SENTINEL_SHEET, SENTINEL_SHEET_NEXT]})
+        ss.set_transport(None)
+        check("отказ 403 записан", r.status_code == 502, r.text[:120])
+        first = envelope_now()
+        check("в носителе появился код причины из закрытого списка",
+              first.get("last_error_public_code") in ss.PUBLIC_FAILURE_REASONS,
+              str(first.get("last_error_public_code")))
+        check("и отпечаток его связи с этой записью",
+              bool(first.get("last_error_public_binding")),
+              str(first.get("last_error_public_binding"))[:24])
+        member_reason("связанная запись", ss.PUBLIC_FAILURE_REASONS["access"],
+                      [SENTINEL_SHEET, SENTINEL_SHEET_NEXT, SPREADSHEET_ID])
+
+        print("\n== A. Откат: старый писатель обновил неудачу, код остался прежним ==")
+        # Ровно то, что делает код, не знающий про код причины и отпечаток:
+        # переписывает подробный текст, время и источник попытки, а незнакомые
+        # поля переносит как есть. Прежняя редакция на этом и ломалась.
+        other_sheet = "Щ-сентинель-другой-лист-Wq2Lm8"
+        rolled = dict(first)
+        rolled["last_attempt_at"] = "2026-09-01T03:04:05+00:00"
+        rolled["last_error"] = f"лист «{other_sheet}»: таблица или лист не найдены (404)"
+        rolled["last_attempt_source"] = {"spreadsheet_id": SPREADSHEET_ID,
+                                         "sheet_names": [other_sheet,
+                                                         SENTINEL_SHEET_NEXT]}
+        rolled["last_error_public"] = "лист источника: источник ответил 403"
+        store(rolled)
+        check("подмена действительно сохранила ПРЕЖНИЙ код и отпечаток",
+              envelope_now()["last_error_public_code"]
+              == first["last_error_public_code"]
+              and envelope_now()["last_error_public_binding"]
+              == first["last_error_public_binding"])
+        # Причина прошлой попытки («не открыта на чтение») сегодняшней не
+        # является: сегодня 404. Связь недоказуема — значит generic.
+        member_reason("A: устаревший код", ss.PUBLIC_FAILURE_FALLBACK,
+                      [other_sheet, SENTINEL_SHEET,
+                       ss.PUBLIC_FAILURE_REASONS["access"],
+                       "лист источника: источник ответил 403"])
+
+        print("\n== B. Испорченный источник попытки + произвольный текст ==")
+        planted = "СЕКРЕТНАЯ-ПОДЛОЖЕННАЯ-СТРОКА-Zz9Qw4: таблица Иванова закрыта"
+        broken = dict(first)
+        broken.pop("last_attempt_source", None)
+        broken["last_error_public"] = planted
+        store(broken)
+        member_reason("B: нет источника попытки", ss.PUBLIC_FAILURE_FALLBACK,
+                      [planted, SENTINEL_SHEET,
+                       ss.PUBLIC_FAILURE_REASONS["access"]])
+
+        broken2 = dict(first)
+        broken2["last_attempt_source"] = "строка вместо объекта"
+        broken2["last_error_public"] = planted
+        store(broken2)
+        member_reason("B: источник попытки не того вида",
+                      ss.PUBLIC_FAILURE_FALLBACK,
+                      [planted, ss.PUBLIC_FAILURE_REASONS["access"]])
+
+        print("\n== Код без отпечатка и отпечаток без кода — тоже generic ==")
+        no_binding = dict(first)
+        no_binding["last_error_public_binding"] = ""
+        store(no_binding)
+        member_reason("код без отпечатка", ss.PUBLIC_FAILURE_FALLBACK,
+                      [ss.PUBLIC_FAILURE_REASONS["access"]])
+
+        forged = dict(first)
+        forged["last_error_public_code"] = "выдуманный-код"
+        store(forged)
+        member_reason("код вне закрытого списка", ss.PUBLIC_FAILURE_FALLBACK, [])
+
+        swapped = dict(first)
+        swapped["last_error_public_code"] = "missing"
+        store(swapped)
+        member_reason("подменённый код не сходится отпечатком",
+                      ss.PUBLIC_FAILURE_FALLBACK,
+                      [ss.PUBLIC_FAILURE_REASONS["missing"]])
+
+        print("\n== Сама функция связывания ==")
+        source = {"spreadsheet_id": SPREADSHEET_ID,
+                  "sheet_names": [SENTINEL_SHEET, SENTINEL_SHEET_NEXT]}
+        base = ss._public_binding("access", "подробно", "2026-09-01T00:00:00+00:00",
+                                  source)
+        check("отпечаток детерминирован",
+              base == ss._public_binding("access", "подробно",
+                                         "2026-09-01T00:00:00+00:00", source))
+        check("код входит в отпечаток",
+              base != ss._public_binding("missing", "подробно",
+                                         "2026-09-01T00:00:00+00:00", source))
+        check("подробный текст входит в отпечаток",
+              base != ss._public_binding("access", "иначе",
+                                         "2026-09-01T00:00:00+00:00", source))
+        check("время попытки входит в отпечаток",
+              base != ss._public_binding("access", "подробно",
+                                         "2026-09-01T00:00:01+00:00", source))
+        check("идентификатор таблицы входит в отпечаток",
+              base != ss._public_binding(
+                  "access", "подробно", "2026-09-01T00:00:00+00:00",
+                  {**source, "spreadsheet_id": SPREADSHEET_ID[:-1] + "Z"}))
+        check("имена листов входят в отпечаток",
+              base != ss._public_binding(
+                  "access", "подробно", "2026-09-01T00:00:00+00:00",
+                  {**source, "sheet_names": [SENTINEL_SHEET_NEXT, SENTINEL_SHEET]}))
+        # Length-prefix: склейка имён не должна давать тот же отпечаток, что
+        # другое разбиение тех же символов. Разделитель здесь подделать нечем.
+        check("склейка имён листов отпечаток не подделывает",
+              ss._public_binding("access", "п", "т",
+                                 {"spreadsheet_id": "", "sheet_names": ["аб", "в"]})
+              != ss._public_binding("access", "п", "т",
+                                    {"spreadsheet_id": "",
+                                     "sheet_names": ["а", "бв"]}))
+        check("испорченный источник попытки даёт отпечаток, а не исключение",
+              isinstance(ss._public_binding("access", "п", None, "не словарь"), str))
+
+        print("\n== Закрытый список причин ==")
+        check("в списке нет пустых и повторяющихся текстов",
+              all(v.strip() for v in ss.PUBLIC_FAILURE_REASONS.values())
+              and len(set(ss.PUBLIC_FAILURE_REASONS.values()))
+              == len(ss.PUBLIC_FAILURE_REASONS))
+        check("generic в закрытый список не входит и тоже непуст",
+              ss.PUBLIC_FAILURE_FALLBACK.strip()
+              and ss.PUBLIC_FAILURE_FALLBACK
+              not in set(ss.PUBLIC_FAILURE_REASONS.values()))
+        check("неизвестный код у самого отказа не приживается",
+              ss.SourceError("текст", code="таких-нет").code == ""
+              and ss.SourceError("текст").code == ""
+              and ss.SourceError("текст", code="access").code == "access")
+        # Отказ БЕЗ кода обязан обедняться до generic, а не показывать чужое.
+        check("отказ без кода даёт участнику generic",
+              ss._public_reason({"last_error_public_code": "",
+                                 "last_error_public_binding": "x"}, "подробно")
+              == ss.PUBLIC_FAILURE_FALLBACK)
+
+        # СТРУКТУРНАЯ проверка, а не дисциплинарная: у КАЖДОГО места, где слой
+        # рождает отказ источника, код причины проставлен явно. Забытый код не
+        # опасен — он даёт generic, — но он молча обедняет сообщение участнику,
+        # и заметить это глазами в двух десятках мест нельзя. Читается сам
+        # исходник, а не поведение: место, которого не проходит ни один тест,
+        # иначе не проверить.
+        import ast
+
+        tree = ast.parse(io.open(ss.__file__, encoding="utf-8").read())
+        sites = [n for n in ast.walk(tree)
+                 if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                 and n.func.id in ("SourceError", "_sheet_error")]
+        without_code = [n.lineno for n in sites
+                        if "code" not in {kw.arg for kw in n.keywords}]
+        check("у каждого места отказа источника код причины проставлен явно",
+              without_code == [], str(without_code))
+        check("и таких мест действительно много — проверка не выродилась",
+              len(sites) >= 20, str(len(sites)))
+    finally:
+        ss.set_transport(None)
+        boss.close()
+        mate.close()
+
+
+def source_total_only_checks() -> None:
+    """Якорь с пустой горкой и читаемым итогом источника — НЕ окончательный ноль.
+
+    Замечание ревью PR #47 на HEAD `459f170`, воспроизведённое буквально:
+    строка-якорь, у которой все пять колонок XS–XL пусты, а колонка итога
+    источника содержит `10`. `quantity_missing` ей не ставится (количества у
+    позиции есть), `invalid_quantity` тоже (всё написанное читается) — и сводка
+    выдавала `quantity_known=0, quantity=0, quantity_complete=true`. То есть
+    лист с десятью штуками объявлялся окончательно пустым.
+
+    Правильный ответ — «не знаем». Итог источника количеством НЕ становится:
+    решения считать его количеством никто не принимал, а в этой самой таблице
+    итог и сумма размеров регулярно расходятся (`total_mismatch` живёт
+    отдельной пометкой). Здесь проверяется и то, и другое: сводка неполна И
+    `quantity_known` не подменён числом источника.
+    """
+    print("\n== Итог источника без размеров: «не определено», а не ноль ==")
+    rows = autumn_header_rows()
+    rows.append(put(blank(), {
+        2: "2200", 3: "Пальто без горки", 5: "Чёрный", 15: "10"}))
+    parsed, _schema = ss.parse_sheet(SHEET_CURRENT, rows)
+    check("разобрана ровно одна строка данных", len(parsed) == 1, str(len(parsed)))
+    row = parsed[0]
+    check("итог источника прочитан как есть",
+          row["source_total"] == 10 and row["source_total_raw"] == "10",
+          str(row["source_total"]))
+    check("а суммы размеров у строки нет вовсе — её нечем складывать",
+          row["size_sum"] is None, str(row["size_sum"]))
+    check("итог источника размерную сумму НЕ подменил",
+          row["size_sum"] != row["source_total"], str(row["size_sum"]))
+    check("расхождением это не называется: сравнивать не с чем",
+          "total_mismatch" not in row["issues"], str(row["issues"]))
+
+    counts = ss.build_counts(parsed, [SHEET_CURRENT])
+    check("итог штук по снимку — «не знаем», а не ноль",
+          counts["quantity"] is None, str(counts["quantity"]))
+    check("и полным он не объявлен",
+          counts["quantity_complete"] is False, str(counts["quantity_complete"]))
+    check("прочитанное честно равно нулю — мы не прочитали ничего",
+          counts["quantity_known"] == 0, str(counts["quantity_known"]))
+    check("и итог источника в «прочитано» не подставлен",
+          counts["quantity_known"] != 10, str(counts["quantity_known"]))
+    sheet = counts["sheets"][0]
+    check("по листу ровно то же самое",
+          sheet["quantity"] is None and sheet["quantity_complete"] is False
+          and sheet["quantity_known"] == 0, str(sheet))
+
+    # Контроль сверху: правило узкое. Полная строка полноту не отменяет.
+    full = autumn_header_rows()
+    full.append(put(blank(), {
+        2: "2201", 3: "Пальто с горкой", 5: "Синий",
+        10: "1", 11: "1", 12: "1", 13: "1", 14: "1", 15: "5"}))
+    full_counts = ss.build_counts(ss.parse_sheet(SHEET_CURRENT, full)[0],
+                                  [SHEET_CURRENT])
+    check("строка с прочитанной горкой по-прежнему даёт окончательное число",
+          full_counts["quantity"] == 5 and full_counts["quantity_complete"] is True,
+          str(full_counts["quantity"]))
+
+    # И контроль снизу: расхождение итога полноту не отменяет — оба числа
+    # прочитаны, и это прежнее решение D-51, а не побочный эффект правки.
+    mism = autumn_header_rows()
+    mism.append(put(blank(), {
+        2: "2202", 3: "Пальто расхождение", 5: "Серый",
+        10: "1", 11: "1", 12: "1", 13: "1", 14: "1", 15: "9"}))
+    mism_rows = ss.parse_sheet(SHEET_CURRENT, mism)[0]
+    mism_counts = ss.build_counts(mism_rows, [SHEET_CURRENT])
+    check("расхождение итога названо расхождением",
+          "total_mismatch" in mism_rows[0]["issues"], str(mism_rows[0]["issues"]))
+    check("и полноту оно по-прежнему НЕ отменяет",
+          mism_counts["quantity"] == 5
+          and mism_counts["quantity_complete"] is True, str(mism_counts["quantity"]))
+
+    # Строка-продолжение без количеств и БЕЗ итога — прежнее поведение. Правка
+    # сюда не расползается: у такого фрагмента источник итога не называл вовсе,
+    # и объявлять из-за него весь лист неопределённым было бы новым смыслом.
+    cont = autumn_header_rows()
+    cont.append(put(blank(), {
+        2: "2203", 3: "Пальто с продолжением", 5: "Чёрный",
+        10: "1", 11: "1", 12: "1", 13: "1", 14: "1", 15: "5"}))
+    cont.append(put(blank(), {5: "Молоко"}))
+    cont_counts = ss.build_counts(ss.parse_sheet(SHEET_CURRENT, cont)[0],
+                                  [SHEET_CURRENT])
+    check("продолжение без количеств и без итога полноту не отменяет",
+          cont_counts["quantity"] == 5
+          and cont_counts["quantity_complete"] is True, str(cont_counts["quantity"]))
+
+    # Та же строка, но итог источника у продолжения назван: количество у неё
+    # есть, прочитать его в сумму нечем — значит «не знаем».
+    cont2 = autumn_header_rows()
+    cont2.append(put(blank(), {
+        2: "2204", 3: "Пальто с продолжением", 5: "Чёрный",
+        10: "1", 11: "1", 12: "1", 13: "1", 14: "1", 15: "5"}))
+    cont2.append(put(blank(), {5: "Молоко", 15: "3"}))
+    cont2_counts = ss.build_counts(ss.parse_sheet(SHEET_CURRENT, cont2)[0],
+                                   [SHEET_CURRENT])
+    check("а продолжение с названным итогом — уже «не определено»",
+          cont2_counts["quantity"] is None
+          and cont2_counts["quantity_known"] == 5, str(cont2_counts))
+
+
 # ── Прогон ──────────────────────────────────────────────────────────────────
 
 def run() -> int:
@@ -3412,6 +3791,8 @@ def run() -> int:
     failure_privacy_checks()
     malformed_url_checks()
     incomplete_counts_checks()
+    source_total_only_checks()
+    bound_public_reason_checks()
     stored_counts_checks()
     envelope_version_checks()
     row_shape_checks()
