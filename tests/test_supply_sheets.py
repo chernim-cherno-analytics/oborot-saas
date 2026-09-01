@@ -4816,6 +4816,233 @@ def row_surrogate_checks() -> None:  # noqa: C901 — матрица конте�
         boss.close()
 
 
+def persisted_representability_checks() -> None:  # noqa: C901 — матрица путей, ветвлений мало
+    """Ни одна persisted-строка не уходит в ответ непредставимой. Инвариант, не список.
+
+    Третий отвергнутый HEAD подряд по одному и тому же P1
+    (REVIEW_REJECT issuecomment-5500480665). Первый корректив закрыл имена
+    листов, второй — шесть контейнеров строки, и каждый раз наружу оставался
+    путь, которого в перечне не было: незнакомые поля строки (они разрешены
+    НАМЕРЕННО, ради совместимости с будущими версиями и с откатом), их
+    вложенные списки и карты, ключи этих карт и половина верхнеуровневых полей.
+    Инвентаризация перед этой правкой дала 16 путей, из них 14 живых, и два из
+    них — `schema` и `counts` — в отчёте ревью не значились вовсе.
+
+    Поэтому здесь проверяется не список, а СВОЙСТВО, и проверяется оно на
+    ГРАНИЦЕ ОТВЕТА: что бы ни лежало в носителе, наружу либо уходит то, что
+    `JSONResponse` умеет закодировать, либо не уходит ничего и человек получает
+    управляемый 409.
+
+    ЧТО ЗДЕСЬ КРАСНОЕ НА `0c11a82`, А ЧТО НЕТ — важно не перепутать:
+      * суррогатные случаи (их большинство) на неизменённом дереве дают 500 или
+        обрыв соединения. Это и есть красная база;
+      * случаи ГЛУБОКОЙ вложенности БЕЗ суррогата — тоже красная база, и это
+        отдельный P1, найденный этим тестом, а не ревью. На `0c11a82`
+        `_validate_envelope` такой снимок принимает, а `jsonable_encoder()`
+        FastAPI — рекурсивный — даёт `RecursionError`, то есть GET 500 без
+        единого непредставимого символа. Замерено: энкодер проходит 500
+        уровней и падает на 1000, тогда как `json.loads`/`json.dumps` спокойно
+        берут 20 000. Мой первый обход был рекурсивным и добавлял ту же беду со
+        своей стороны; теперь обход итеративный И ограничивает глубину, потому
+        что «ответ представим» значит ещё и «ниже по течению его сумеют
+        закодировать».
+    """
+    print("\n== Представимость persisted-строк: инвариант на границе ответа ==")
+    HIGH = json.loads('"\\ud800"')
+    LOW = json.loads('"\\udfff"')
+    ESCAPED = "\\ud800"          # то же самое в экранированном написании
+    boss = client()
+    boss.post("/register", data={"name": "Инвариант",
+                                 "email": "sheets-inv@test.io",
+                                 "password": "secret123", "org_name": "Бренд-ИН"})
+    boss.post("/api/connect/demo")
+    org_id = sql("SELECT org_id FROM memberships WHERE user_id ="
+                 " (SELECT id FROM users WHERE email = 'sheets-inv@test.io')")[0][0]
+    conn_id = sql("SELECT id FROM connections WHERE org_id = ? ORDER BY id",
+                  org_id)[0][0]
+
+    def carrier_blob() -> str:
+        return sql("SELECT config_json FROM connections WHERE id = ?",
+                   conn_id)[0][0]
+
+    def nest(depth: int, leaf):
+        """Глубокая вложенность: половина словарями, половина списками."""
+        obj = leaf
+        for i in range(depth):
+            obj = {"a": obj} if i % 2 else [obj]
+        return obj
+
+    ss.set_transport(FakeGoogle())
+    try:
+        r = boss.post("/api/supply/sheets/refresh",
+                      json={"spreadsheet_url": SHEET_URL,
+                            "sheet_names": [SHEET_CURRENT, SHEET_NEXT]})
+        check("законный снимок создан", r.status_code == 200, r.text[:140])
+        good_cfg = json.loads(carrier_blob())
+        good_blob = carrier_blob()
+        good_rows = good_cfg[ss.ENVELOPE_KEY]["rows"]
+
+        # ── 1. Суррогат в каждом персистентном месте, доходящем до ответа ──
+        places = {
+            "незнакомое поле строки (значение)":
+                lambda e, bad: e["rows"][2].update({"future_raw": bad}),
+            "незнакомый КЛЮЧ строки":
+                lambda e, bad: e["rows"][2].update({bad: "future"}),
+            "вложенная карта в extra_raw (значение)":
+                lambda e, bad: e["rows"][2].update({"extra_raw": {"a": {"b": bad}}}),
+            "вложенная карта в extra_raw (ключ)":
+                lambda e, bad: e["rows"][2].update({"extra_raw": {bad: "x"}}),
+            "вложенный список в extra_raw":
+                lambda e, bad: e["rows"][2].update({"extra_raw": [[bad]]}),
+            "верхний уровень: spreadsheet_id":
+                lambda e, bad: e.update({"spreadsheet_id": bad}),
+            "верхний уровень: content_sha256":
+                lambda e, bad: e.update({"content_sha256": bad}),
+            "верхний уровень: parser_version":
+                lambda e, bad: e.update({"parser_version": bad}),
+            "верхний уровень: last_error":
+                lambda e, bad: e.update({"last_error": bad}),
+            "верхний уровень: last_attempt_at":
+                lambda e, bad: e.update({"last_attempt_at": bad}),
+            "верхний уровень: last_success_at":
+                lambda e, bad: e.update({"last_success_at": bad}),
+            "верхний уровень: fetched_at":
+                lambda e, bad: e.update({"fetched_at": bad}),
+            "верхний уровень: schema (вложенно)":
+                lambda e, bad: e.update({"schema": {SHEET_CURRENT: {"free": {"1": bad}}}}),
+            "верхний уровень: counts (вложенно)":
+                lambda e, bad: e["counts"]["sheets"][0].update({"sheet_name": bad}),
+            "верхний уровень: незнакомое поле":
+                lambda e, bad: e.update({"future_top": bad}),
+            "верхний уровень: незнакомый КЛЮЧ":
+                lambda e, bad: e.update({bad: "x"}),
+            "глубокая вложенность с суррогатом":
+                lambda e, bad: e["rows"][2].update({"extra_raw": nest(4000, bad)}),
+        }
+        for label, mutate in places.items():
+            for kind, bad in (("высокий", HIGH), ("низкий", LOW)):
+                spoiled = json.loads(json.dumps(good_cfg, ensure_ascii=True))
+                mutate(spoiled[ss.ENVELOPE_KEY], bad)
+                exec_sql("UPDATE connections SET config_json = ? WHERE id = ?",
+                         json.dumps(spoiled, ensure_ascii=True), conn_id)
+                before = carrier_blob()
+
+                read = boss.get("/api/supply/sheets?limit=200")
+                check(f"GET · {label}, {kind}: управляемый 409, а не 500",
+                      read.status_code == 409,
+                      f"{read.status_code} {read.text[:120]}")
+                check(f"GET · {label}, {kind}: без эха, ни сырого, ни экранированного",
+                      bad not in read.text and ESCAPED not in read.text,
+                      read.text[:130])
+                check(f"GET · {label}, {kind}: носитель не переписан",
+                      carrier_blob() == before)
+                # Обновление читает снимок ДО сети — тот же управляемый отказ.
+                post = boss.post("/api/supply/sheets/refresh",
+                                 json={"spreadsheet_url": SHEET_URL,
+                                       "sheet_names": [SHEET_CURRENT, SHEET_NEXT]})
+                check(f"REFRESH · {label}, {kind}: тот же 409, а не 500",
+                      post.status_code == 409,
+                      f"{post.status_code} {post.text[:120]}")
+                check(f"REFRESH · {label}, {kind}: носитель не переписан",
+                      carrier_blob() == before)
+
+        # ── 2. ГЛУБИНА БЕЗ СУРРОГАТА — и это отдельный воспроизводимый P1,
+        #    найденный этим же тестом, а не ревью.
+        #
+        #    «Ответ представим» значит не только «строки кодируются», но и «ниже
+        #    по течению его сумеют закодировать». `jsonable_encoder()` FastAPI
+        #    рекурсивен: замерено — 500 уровней проходит, на 1000 падает. То
+        #    есть глубокий, но совершенно ЧИТАЕМЫЙ носитель ронял страницу без
+        #    единого суррогата, и на базе `0c11a82` это воспроизводится
+        #    напрямую: `_validate_envelope` принимает, `jsonable_encoder`
+        #    даёт RecursionError — то самое GET 500.
+        #
+        #    Поэтому глубже предела — управляемый 409, а не 200 и не 500.
+        #    Разумная вложенность обязана проходить: предел выбран заведомо
+        #    низким (настоящий снимок имеет глубину около пяти), и живых данных
+        #    он не задевает.
+        for depth in (2000, 20000):
+            spoiled = json.loads(json.dumps(good_cfg, ensure_ascii=False))
+            spoiled[ss.ENVELOPE_KEY]["rows"][2]["extra_raw"] = nest(depth, "ок")
+            exec_sql("UPDATE connections SET config_json = ? WHERE id = ?",
+                     json.dumps(spoiled, ensure_ascii=False), conn_id)
+            before = carrier_blob()
+            read = boss.get("/api/supply/sheets?limit=200")
+            check(f"глубина {depth} без суррогата: управляемый 409, а не 500",
+                  read.status_code == 409, f"{read.status_code} {read.text[:120]}")
+            check(f"глубина {depth}: отказ называет вложенность и не несёт эха",
+                  "вложенность" in read.text and "не переписан" in read.text,
+                  read.text[:130])
+            check(f"глубина {depth}: носитель не переписан",
+                  carrier_blob() == before)
+            post = boss.post("/api/supply/sheets/refresh",
+                             json={"spreadsheet_url": SHEET_URL,
+                                   "sheet_names": [SHEET_CURRENT, SHEET_NEXT]})
+            check(f"глубина {depth}: refresh тот же 409, а не 500",
+                  post.status_code == 409, f"{post.status_code} {post.text[:120]}")
+            check(f"глубина {depth}: и после refresh носитель тот же",
+                  carrier_blob() == before)
+
+        # Разумная вложенность — и ровно на пределе — обязана работать.
+        for depth, expect in ((8, 200), (ss.MAX_RESPONSE_DEPTH - 4, 200)):
+            spoiled = json.loads(json.dumps(good_cfg, ensure_ascii=False))
+            spoiled[ss.ENVELOPE_KEY]["rows"][2]["extra_raw"] = nest(depth, "ок")
+            exec_sql("UPDATE connections SET config_json = ? WHERE id = ?",
+                     json.dumps(spoiled, ensure_ascii=False), conn_id)
+            read = boss.get("/api/supply/sheets?limit=200")
+            check(f"разумная вложенность {depth}: {expect}, живые данные не задеты",
+                  read.status_code == expect,
+                  f"{read.status_code} {read.text[:120]}")
+
+        # ── 3. Терпимость источника ПОПЫТКИ сохранена намеренно ───────────
+        spoiled = json.loads(json.dumps(good_cfg, ensure_ascii=True))
+        spoiled[ss.ENVELOPE_KEY]["last_attempt_source"] = {
+            "spreadsheet_id": HIGH, "sheet_names": [HIGH, SHEET_NEXT]}
+        exec_sql("UPDATE connections SET config_json = ? WHERE id = ?",
+                 json.dumps(spoiled, ensure_ascii=True), conn_id)
+        read = boss.get("/api/supply/sheets?limit=200")
+        check("испорченный источник ПОПЫТКИ не рушит снимок: GET 200",
+              read.status_code == 200, f"{read.status_code} {read.text[:120]}")
+        check("и непредставимые его части отфильтрованы, а не отданы",
+              HIGH not in read.text and ESCAPED not in read.text,
+              read.text[:130])
+        if read.status_code == 200:
+            attempt = read.json()["attempt"]
+            check("источник попытки показан без непредставимых частей",
+                  attempt["spreadsheet_id"] == ""
+                  and attempt["sheet_names"] == [SHEET_NEXT], str(attempt))
+            check("а строки удачного снимка по-прежнему видны",
+                  read.json()["total"] == len(good_rows), str(read.json()["total"]))
+
+        # ── 4. Валидные не-ASCII строки во всех тех же местах — как прежде ─
+        emoji = "Платье 👗 «Осень»"
+        okay = json.loads(json.dumps(good_cfg, ensure_ascii=False))
+        env = okay[ss.ENVELOPE_KEY]
+        env["rows"][2]["future_raw"] = emoji
+        env["rows"][2]["extra_raw"] = {emoji: {emoji: [emoji]}}
+        env["last_error"] = "не прочитано: " + emoji
+        env["schema"] = {emoji: {"free": {"1": emoji}}}
+        env["future_top"] = emoji
+        exec_sql("UPDATE connections SET config_json = ? WHERE id = ?",
+                 json.dumps(okay, ensure_ascii=False), conn_id)
+        good = boss.get("/api/supply/sheets?limit=200")
+        check("валидные не-ASCII строки во всех тех же местах: 200",
+              good.status_code == 200, f"{good.status_code} {good.text[:140]}")
+        check("и они доезжают до ответа дословно",
+              emoji in good.text, good.text[:200])
+
+        # ── 5. Законный снимок после всех подмен читается ─────────────────
+        exec_sql("UPDATE connections SET config_json = ? WHERE id = ?",
+                 good_blob, conn_id)
+        back = boss.get("/api/supply/sheets?limit=200")
+        check("законный снимок после всех подмен читается",
+              back.status_code == 200 and back.json()["total"] == len(good_rows),
+              back.text[:140])
+    finally:
+        ss.set_transport(None)
+        boss.close()
+
+
 # ── Прогон ──────────────────────────────────────────────────────────────────
 
 def run() -> int:
@@ -4865,6 +5092,7 @@ def run() -> int:
     saved_sheet_names_checks()
     surrogate_name_checks()
     row_surrogate_checks()
+    persisted_representability_checks()
     bound_public_reason_checks()
     stored_counts_checks()
     envelope_version_checks()
