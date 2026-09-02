@@ -1,0 +1,903 @@
+{% extends "base.html" %}
+{% block content %}
+{#
+  SUPPLY-2 (D-51): предпросмотр внешней производственной таблицы.
+
+  Вся таблица строится DOM-API (createElement + textContent), а не сборкой
+  строки разметки. Это не стилистика: содержимое приходит из ЧУЖОЙ таблицы,
+  которую заполняют люди, и единственный способ гарантировать, что «<img
+  onerror=…>» останется текстом, — никогда не отдавать его innerHTML.
+  Единственная ссылка наружу собрана сервером из сохранённого идентификатора и
+  ведёт в новую вкладку с rel="noopener"; iframe чужого документа здесь нет
+  сознательно — встроить его значило бы отдать чужому origin кусок экрана.
+#}
+<style>
+  .sup-wrap { max-width: 1400px; }
+  .sup-note { border: 1px solid var(--amber, #d99a2b); background: rgba(217,154,43,.10);
+              border-radius: 10px; padding: 12px 14px; font-size: 13px; line-height: 1.55;
+              color: var(--ink-2); margin-bottom: 14px; }
+  .sup-note b { color: var(--ink); }
+  .sup-form { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; }
+  .sup-form .field { display: flex; flex-direction: column; gap: 4px; min-width: 190px; }
+  .sup-form .field.wide { flex: 1 1 380px; }
+  .sup-form label { font-size: 12px; color: var(--ink-3); }
+  .sup-form input { width: 100%; padding: 7px 10px; border: 1px solid var(--line);
+                    border-radius: 8px; background: var(--surface); font-size: 13px;
+                    color: var(--ink); }
+  .sup-sum { display: flex; flex-wrap: wrap; gap: 10px; }
+  .sup-tile { border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px;
+              min-width: 150px; background: var(--surface); }
+  .sup-tile .k { font-size: 11.5px; color: var(--ink-3); }
+  .sup-tile .v { font-size: 18px; font-weight: 800; font-variant-numeric: tabular-nums; }
+  .sup-tile .v.soft { font-size: 13.5px; font-weight: 700; color: var(--ink-2); }
+  .sup-bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .sup-chip { font-size: 12px; padding: 5px 12px; border-radius: 20px; cursor: pointer;
+              border: 1px solid var(--line); background: var(--surface); color: var(--ink-2); }
+  .sup-chip.on { background: var(--ink); color: var(--surface); border-color: var(--ink); }
+  .sup-scroll { overflow-x: auto; }
+  table.sup { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  table.sup th, table.sup td { border-bottom: 1px solid var(--line); padding: 7px 8px;
+                               text-align: left; vertical-align: top; }
+  table.sup th { font-size: 11px; color: var(--ink-3); font-weight: 700; white-space: nowrap; }
+  table.sup td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  table.sup tr.blank td { color: var(--ink-3); font-style: italic; }
+  table.sup tr.bad { background: rgba(200,60,60,.06); }
+  table.sup tr.warn { background: rgba(217,154,43,.07); }
+  .sup-src { font-variant-numeric: tabular-nums; white-space: nowrap; color: var(--ink-3); }
+  .sup-name { font-weight: 700; }
+  .sup-inherit { color: var(--ink-3); font-weight: 400; }
+  .sup-raw { color: var(--ink-2); max-width: 260px; word-break: break-word; }
+  .sup-badge { display: inline-block; font-size: 10.5px; line-height: 1.5; padding: 1px 7px;
+               border-radius: 20px; margin: 1px 3px 1px 0; white-space: normal; }
+  .sup-badge.warn { background: rgba(217,154,43,.18); color: #7a5410; }
+  .sup-badge.bad { background: rgba(200,60,60,.15); color: #8c2020; }
+  .sup-badge.hint { background: rgba(31,31,31,.08); color: var(--ink-3); }
+  .sup-err { border: 1px solid rgba(200,60,60,.45); background: rgba(200,60,60,.08);
+             border-radius: 10px; padding: 10px 14px; font-size: 12.5px; color: #8c2020; }
+  @media (max-width: 760px) {
+    .sup-form .field, .sup-form .field.wide { min-width: 100%; flex: 1 1 100%; }
+    .sup-tile { min-width: 46%; flex: 1 1 46%; }
+    table.sup { font-size: 12px; }
+    .sup-raw { max-width: 160px; }
+  }
+</style>
+
+<div class="sup-wrap">
+
+  {# Подпись приходит с сервера (`disclaimer`), но её текст продублирован здесь
+     на случай пустого ответа: экран не должен показать ни одной цифры чужой
+     таблицы без объяснения, чем она НЕ является. #}
+  <div class="sup-note" id="sup-note">
+    <b>Предпросмотр источника — ещё не партия «Оборота» и не учитывается в «Едет».</b>
+    Это то, что сейчас написано в вашей производственной таблице, как есть.
+    «Оборот» ничего отсюда не заказывает, ни с чем не связывает и в расчёты не берёт:
+    ни в «Едет», ни в «В заказе», ни в оборачиваемость.
+  </div>
+
+  <div class="card" id="sup-setup-card">
+    <div class="card-head"><h2>Источник</h2><div class="spacer"></div>
+      <span class="hint" id="sup-src-link"></span></div>
+    <div class="card-body">
+      <div id="sup-form-wrap"></div>
+      <div class="hint" id="sup-state" style="margin-top:10px;">Загрузка…</div>
+      <div class="sup-err" id="sup-error" style="display:none;margin-top:10px;"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-head"><h2>Сводка</h2></div>
+    <div class="card-body">
+      <div class="sup-sum" id="sup-summary"><div class="loading-stub">Загрузка…</div></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-head"><h2>Строки листов</h2><div class="spacer"></div>
+      <span class="hint" id="sup-total"></span></div>
+    <div class="card-body">
+      <div class="sup-bar" id="sup-filters" style="margin-bottom:10px;"></div>
+      <div class="sup-scroll">
+        <table class="sup">
+          <thead>
+            <tr>
+              <th>Лист · строка</th>
+              <th>Артикул</th>
+              <th>Наименование</th>
+              <th>Цвет</th>
+              <th class="num">XS</th><th class="num">S</th><th class="num">M</th>
+              <th class="num">L</th><th class="num">XL</th>
+              <th class="num">Итог источника</th>
+              <th class="num">Сумма размеров</th>
+              <th>Цена источника</th>
+              <th>Статус и комментарии источника</th>
+              <th>Что не так</th>
+            </tr>
+          </thead>
+          <tbody id="sup-rows"></tbody>
+        </table>
+      </div>
+      <div style="margin-top:12px;">
+        <button class="btn sm" id="sup-more" style="display:none;">Показать ещё</button>
+      </div>
+    </div>
+  </div>
+
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+// ЗАПУСК ОТЛОЖЕН НАМЕРЕННО, И ЭТО НЕ СТИЛЬ. `static/app.js` подключён в
+// `base.html` с атрибутом `defer`, то есть выполняется ПОСЛЕ разбора всего
+// документа — а значит и после этого блока. Прежняя редакция звала `load()`
+// сразу, при разборе: `api` в этот момент ещё не существовал, страница падала
+// на `api is not defined` и оставалась пустой НАВСЕГДА — ни строк, ни формы,
+// ни сообщения об ошибке. Дефект найден запуском страницы в браузере
+// (`tests/test_supply_ui.py`) и никакой проверкой разметки виден не был:
+// разметка была правильной, мёртвым был порядок выполнения. Остальные
+// страницы проекта, зовущие `api()` из блока `scripts`, ждут этого же события
+// (`account.html`, `dashboard.html`, `settings.html`, `plans.html` и др.).
+document.addEventListener("DOMContentLoaded", function () {
+  var ROLE = "{{ role }}";
+  // Состояние подписки приходит с сервера тем же контекстом страницы, что и
+  // роль (`app/main.py:_page`). Отдельного запроса нет намеренно: страница уже
+  // отрендерена под сессией, и спрашивать сервер о том, что он только что знал,
+  // значит платить лишним round-trip на каждую загрузку.
+  var WRITES_BLOCKED = {{ writes_blocked | default(false) | tojson }};
+  var state = { sheet: "", queue: "all", offset: 0, limit: 50 };
+  var last = null;
+  // Сколько строк СЕЙЧАС на экране. Считается по факту отрисованного, а не
+  // выводится из offset: при догрузке offset фиксируется только после успеха,
+  // и выводить одно из другого значило бы снова связать их предположением.
+  var shown = 0;
+  // Поколение состояния. Растёт на каждой смене очереди, листа и на каждом
+  // УСПЕШНОМ обновлении снимка. Ответ, отправленный в прежнем поколении,
+  // дописан не будет: иначе страница фильтра «Ошибки» получала бы хвост
+  // страницы фильтра «Все», пришедший с опозданием, — и человек увидел бы в
+  // очереди разбора строки, которых там нет.
+  var gen = 0;
+  // Маркер «этот ответ принадлежит СНЯТОМУ виду». Замечание ревью PR #47 на
+  // HEAD `459f170`: поколение проверялось только в ветке успеха, а отказ
+  // прежнего запроса летел дальше безусловно — и попадал в `.catch()` того
+  // `switchView()`, который его начинал. Поздний 502 медленного перехода A
+  // стирал уже нарисованный успешный переход B и рисовал поверх него ошибку A
+  // с кнопкой «Повторить», привязанной к текущему (то есть чужому) фильтру.
+  //
+  // Поэтому у отказа теперь тот же вопрос, что у успеха: «моё ли это
+  // поколение?». Чужое поколение не отказ и не успех — оно НИЧЕЙ ответ, и
+  // единственное верное действие с ним ровно одно: не трогать экран. Отказ
+  // такого ответа гасится здесь и превращается в этот маркер, чтобы `.catch()`
+  // выше по цепочке не сработал, а `.then()` (восстановление кнопок) — сработал.
+  var STALE = {stale: true};
+  // Версия снимка, которой принадлежат ПОКАЗАННЫЕ строки. Замечание ревью
+  // PR #47 на HEAD `6a3cabd`: догрузка проверяла только поколение ЭКРАНА, а
+  // оно не меняется от того, что снимок обновили в другой вкладке. Строки
+  // новой версии дописывались к строкам старой, сводка и счётчик брались от
+  // новой — одна таблица, собранная из двух источников правды. Поколение
+  // отвечает на вопрос «тот ли это вид», а этот хеш — на другой: «та ли это
+  // версия данных». Ответ на первый вопрос не заменяет ответа на второй.
+  var viewHash = null;
+  // Замок догрузки. Ровно один запрос догрузки за раз — без него двойной клик
+  // по «Показать ещё» отправлял два запроса и дважды двигал общий offset ДО
+  // ответа.
+  //
+  // Замок принадлежит ПОКОЛЕНИЮ, а не странице, и это замечание UX-аудита.
+  // Прежний общий `inflight = true` жил дольше вида, который его взял, и потому
+  // вредил дважды. Медленная догрузка вида A не отпускала замок — человек
+  // переключался на B, B рисовал ВКЛЮЧЁННУЮ кнопку «Показать ещё», а клик по
+  // ней молча выходил по чужому `inflight`: кнопка выглядит рабочей и не
+  // работает, и понять это человеку не по чему. А финализатор A, добежав
+  // позже, трогал кнопку живого вида B и сбрасывал ЕГО замок — то есть снимал
+  // защиту от двойного запроса ровно там, где она нужна.
+  //
+  // Поэтому здесь не «идёт ли запрос», а «ЧЕЙ запрос идёт»: поколение вида,
+  // чья догрузка сейчас в полёте, либо `-1`. Своё поколение узнаёт замок и
+  // ждёт; чужое поколение замка не видит вовсе; финализатор, чей замок уже
+  // забрал другой вид, не трогает ни замок, ни кнопку.
+  var inflightGen = -1;
+  // Идёт ли обновление снимка. Отдельный флаг, а не состояние кнопки: кнопку
+  // пересоздаёт `renderForm()`, и вместе с ней исчезал бы замок — см. refresh().
+  // От поколения он НЕ зависит: обновление принадлежит организации, а не виду,
+  // и переход между фильтрами его не отменяет и не разрешает второй.
+  var refreshBusy = false;
+  //: [свободна, идёт чтение] — подписи кнопки обновления. Одним списком, чтобы
+  //: рождение кнопки и её перекраска не разошлись двумя литералами.
+  var REFRESH_LABELS = ["Обновить предпросмотр", "Читаем таблицу…"];
+
+  // Привести ТЕКУЩУЮ кнопку обновления в соответствие с `refreshBusy`. Узел
+  // ищется в момент вызова: за время запроса форму могли пересобрать, а могли
+  // и убрать вовсе (участник, readonly-подписка) — тогда красить нечего.
+  function paintRefreshButton() {
+    var btn = document.getElementById("sup-refresh");
+    if (!btn) return;
+    btn.disabled = refreshBusy;
+    btn.textContent = REFRESH_LABELS[refreshBusy ? 1 : 0];
+  }
+
+  //: Каноническая ссылка на таблицу — РОВНО та форма, которую собирает сервер
+  //: (`spreadsheet_link()`), и ровно тот набор символов идентификатора, который
+  //: пропускает серверный allowlist. Проверка нужна потому, что ссылку попытки
+  //: сервер строит из СОХРАНЁННОГО идентификатора, не перепроверяя его: в
+  //: испорченном носителе там может лежать что угодно.
+  //: Сколько колонок в таблице предпросмотра. Одно число на все места, где
+  //: строка занимает всю ширину (разделитель, «строк нет», заглушка отказа):
+  //: пока их было три и каждое несло свой литерал, добавление колонки ломало
+  //: геометрию ровно в тех строках, которые никто не смотрит первыми.
+  var SUP_COLUMNS = document.querySelectorAll("table.sup thead th").length;
+
+  var CANONICAL_SOURCE_URL =
+    /^https:\/\/docs\.google\.com\/spreadsheets\/d\/[A-Za-z0-9_-]{10,120}\/edit$/;
+
+  // Пригодна ли попытка ЦЕЛИКОМ: канонический адрес и ровно два непустых
+  // имени. Возвращает тройку или null — половины не бывает.
+  function attemptTriple(attempt) {
+    if (!attempt) return null;
+    var url = attempt.spreadsheet_url;
+    var names = attempt.sheet_names;
+    if (typeof url !== "string" || !CANONICAL_SOURCE_URL.test(url)) return null;
+    if (!names || names.length !== 2) return null;
+    if (typeof names[0] !== "string" || typeof names[1] !== "string") return null;
+    if (!names[0].trim() || !names[1].trim()) return null;
+    return { url: url, names: [names[0], names[1]] };
+  }
+
+  function el(tag, cls, text) {
+    var node = document.createElement(tag);
+    if (cls) node.className = cls;
+    // textContent, а не innerHTML: всё, что ниже, приходит из чужой таблицы.
+    if (text !== undefined && text !== null) node.textContent = String(text);
+    return node;
+  }
+  function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
+  function num(v) { return (v === null || v === undefined) ? "—" : String(v); }
+  function when(iso) {
+    if (!iso) return "никогда";
+    var d = new Date(iso);
+    return isNaN(d.getTime()) ? String(iso) : d.toLocaleString("ru-RU");
+  }
+
+  function renderForm(data) {
+    var wrap = document.getElementById("sup-form-wrap");
+    clear(wrap);
+    if (ROLE !== "owner") {
+      var ro = el("div", "hint");
+      ro.textContent = data.configured
+        ? "Источник настраивает владелец организации. Вам доступен просмотр."
+        : "Источник ещё не настроен. Настроить его может владелец организации.";
+      wrap.appendChild(ro);
+      return;
+    }
+    if (WRITES_BLOCKED) {
+      // Запись организации приостановлена подпиской (D-24). Сервер откажет
+      // этому POST кодом 402 ГАРАНТИРОВАННО — глобальной зависимостью гейта, а
+      // не проверкой на этой странице. Показывать при этом рабочую форму и
+      // кнопку значило бы предлагать действие, в котором приложение уже
+      // отказало: человек вводит ссылку, жмёт кнопку и получает отказ, который
+      // можно было назвать заранее. Поэтому здесь честное read-only состояние.
+      // Сам снимок при этом остаётся на экране целиком: readonly закрывает
+      // запись, а не чтение своих данных.
+      var blocked = el("div", "sup-err");
+      blocked.appendChild(el("b", null, "Обновление источника приостановлено: "));
+      blocked.appendChild(el("span", null,
+        "подписка организации не оплачена, и запись сейчас закрыта. "
+        + (data.configured
+            ? "Предпросмотр открыт на чтение — показан последний удачный снимок. "
+            : "Удачного чтения источника ещё не было, поэтому показывать пока нечего. ")
+        + "Чтение и выгрузка данных не ограничены; обновление источника вернётся после оплаты."));
+      var pay = el("div", null);
+      var link = el("a", null, "Выставить счёт — на странице «Тарифы»");
+      link.href = "/plans";
+      pay.appendChild(link);
+      blocked.appendChild(pay);
+      wrap.appendChild(blocked);
+      return;
+    }
+    if (!data.carrier_present) {
+      // СНИМКУ НЕГДЕ ЖИТЬ, И ЭТО ЗАМЕЧАНИЕ РЕВЬЮ PR #47 НА HEAD `5e21ba1`.
+      // Предпросмотр хранится внутри УЖЕ СУЩЕСТВУЮЩЕЙ основной связи
+      // организации (D-51: своей `Connection` слой сознательно не заводит).
+      // Нет ни МойСклада, ни демо — сервер ответит на этот POST кодом 409
+      // ГАРАНТИРОВАННО и ДО единого сетевого вызова. Показывать при этом
+      // рабочую форму значит просить человека ввести три значения ради
+      // действия, которое не может получиться: он вводит ссылку, ищет имена
+      // листов, жмёт кнопку — и получает отказ, который можно было назвать
+      // заранее. Это ровно тот же класс ошибки, что уже закрыт для
+      // приостановленной подписки выше, и закрывается он так же.
+      var nocarrier = el("div", "sup-err");
+      nocarrier.appendChild(el("b", null, "Предпросмотру негде храниться: "));
+      nocarrier.appendChild(el("span", null,
+        "у организации нет основного подключения. Снимок производственной "
+        + "таблицы живёт внутри подключения к данным, поэтому сначала нужно "
+        + "подключить МойСклад или демо-данные — и тогда здесь появится форма "
+        + "источника."));
+      var go = el("div", null);
+      var slink = el("a", null, "Подключить — на странице «Настройки»");
+      slink.href = "/settings";
+      go.appendChild(slink);
+      nocarrier.appendChild(go);
+      wrap.appendChild(nocarrier);
+      return;
+    }
+    var form = el("div", "sup-form");
+
+    function field(id, label, value, cls, placeholder) {
+      var f = el("div", "field" + (cls ? " " + cls : ""));
+      var l = el("label", null, label);
+      l.setAttribute("for", id);
+      var i = el("input");
+      i.type = "text";
+      i.id = id;
+      i.value = value || "";
+      if (placeholder) i.placeholder = placeholder;
+      f.appendChild(l); f.appendChild(i);
+      return f;
+    }
+
+    // ФОРМА ПОКАЗЫВАЕТ ТО, ЧТО ЧЕЛОВЕК ВВОДИЛ В ПОСЛЕДНЮЮ ПОПЫТКУ, а снимок
+    // на экране остаётся прежним. Замечание ревью PR #47 на HEAD `5e21ba1`.
+    //
+    // Прежняя редакция предпочитала поля УСПЕШНОГО снимка и брала попытку
+    // только тогда, когда успешного снимка не было вовсе. На первом отказе это
+    // работало, а на живом состоянии — нет: владелец уже настроенного
+    // источника меняет ссылку или одну букву в имени листа, обновление падает,
+    // и форма подставляет обратно СТАРЫЕ значения. При этом текст под ошибкой
+    // обещает, что ввод сохранён здесь же. Два вреда сразу: человек
+    // восстанавливает свой ввод по памяти, а «Повторить» повторяет не ту
+    // попытку, которая упала, — то есть кнопка делает не то, что говорит.
+    //
+    // Признак «есть свежая неудачная попытка» — непустой текст отказа: сервер
+    // чистит его при каждом успехе и заполняет при каждой неудаче вместе с
+    // `last_attempt_source`. Значит поля попытки описывают именно её.
+    //
+    // ЧТО ЭТО НЕ МЕНЯЕТ: строки, сводку, счётчики и ссылку «открыть исходник».
+    // Всё это по-прежнему принадлежит последнему УДАЧНОМУ снимку — неудача его
+    // не трогает (D-51), и подменять показанные данные адресом, который
+    // прочитать не удалось, было бы враньём. Меняются только три поля ввода.
+    //
+    // Участнику это состояние не адресовано вовсе: `attempt` ему сервер не
+    // отдаёт (D-51), а до этой строки роль участника не доходит — выше стоит
+    // ранний возврат.
+    // ТРОЙКА ГОДНА ЦЕЛИКОМ ИЛИ НЕ ГОДНА ВОВСЕ — замечание ревью PR #47 на
+    // HEAD `6a3cabd`. Прежняя редакция проверяла адрес и пару имён по
+    // отдельности и по отдельности же откатывала. Стоило одной половине
+    // источника попытки испортиться, как из уцелевшей половины и половины
+    // снимка собиралась ТРЕТЬЯ попытка, которой никто никогда не делал:
+    // «адрес попытки + листы снимка» либо «адрес снимка + листы попытки».
+    // И это не косметика: повтор отправлял эту выдуманную комбинацию на
+    // сервер — то есть страница не показывала неправду, а совершала её.
+    //
+    // Попытка — один неделимый ввод человека: он вводил адрес и два имени
+    // вместе, и вместе же они уезжали. Значит и восстанавливать их можно
+    // только вместе. Не удалось доказать все три — берём все три из
+    // последнего удачного снимка.
+    var attempt = data.attempt || {};
+    var failedNow = !!(data.last_error);
+    var triple = failedNow ? attemptTriple(attempt) : null;
+    var srcUrl = triple ? triple.url : (data.spreadsheet_url || "");
+    var names = triple ? triple.names
+      : ((data.sheet_names && data.sheet_names.length) ? data.sheet_names : []);
+    form.appendChild(field("sup-url", "Ссылка на таблицу Google Sheets",
+      srcUrl, "wide",
+      "https://docs.google.com/spreadsheets/d/…"));
+    form.appendChild(field("sup-cur", "Текущий лист", names[0] || "", null, "Осень 26"));
+    form.appendChild(field("sup-next", "Следующий лист", names[1] || "", null, "НГ 26/27"));
+
+    var act = el("div", "field");
+    act.appendChild(el("label", null, " "));
+    // Кнопка рождается в том состоянии, в котором СЕЙЧАС находится
+    // обновление, а не в состоянии по умолчанию: форму пересобирает
+    // каждый успешный GET, и «новая кнопка = кнопка свободна» было бы
+    // неправдой ровно тогда, когда запрос ещё идёт. Замок живёт вне
+    // DOM — `refreshBusy`.
+    var btn = el("button", "btn primary", REFRESH_LABELS[refreshBusy ? 1 : 0]);
+    btn.id = "sup-refresh";
+    btn.disabled = refreshBusy;
+    btn.addEventListener("click", function () { refresh(); });
+    act.appendChild(btn);
+    form.appendChild(act);
+    wrap.appendChild(form);
+  }
+
+  function refresh() {
+    // ЗАМОК ОБНОВЛЕНИЯ ЖИВЁТ ВНЕ DOM, И ЭТО ЗАМЕЧАНИЕ UX-АУДИТА. Прежде им был
+    // сам элемент кнопки (`btn.disabled`), а кнопку пересоздаёт `renderForm()`
+    // на каждом успешном GET. Значит любой переход фильтра во время медленного
+    // POST рисовал НОВУЮ включённую кнопку, и второй клик отправлял второй
+    // POST — два обновления одного снимка наперегонки, где человек увидит
+    // результат того, чей ответ придёт вторым. Состояние, которое хранится в
+    // узле, пересоздаваемом кем-то другим, состоянием не является.
+    if (refreshBusy) return;
+    var url = (document.getElementById("sup-url") || {}).value || "";
+    var cur = (document.getElementById("sup-cur") || {}).value || "";
+    var nxt = (document.getElementById("sup-next") || {}).value || "";
+    refreshBusy = true;
+    paintRefreshButton();
+
+    // Кнопка восстанавливается при ЛЮБОМ исходе, включая падение следующего
+    // GET. Прежняя цепочка `.then().catch().then(restore)` этого не давала:
+    // если `load()` внутри `.catch` тоже отказывал, последний `.then` не
+    // выполнялся вовсе — и кнопка оставалась выключенной навсегда, то есть
+    // страница чинилась только перезагрузкой.
+    //
+    // Красит финализатор ТЕКУЩИЙ узел, найденный в момент восстановления, а не
+    // тот, на который кликнули: за время запроса форму могли пересобрать, и
+    // прежний узел давно выброшен из документа — включать его значило бы
+    // чинить то, чего человек уже не видит.
+    function restore() {
+      refreshBusy = false;
+      paintRefreshButton();
+    }
+
+    api("/api/supply/sheets/refresh", {
+      method: "POST",
+      body: { spreadsheet_url: url, sheet_names: [cur, nxt] }
+    }).then(function (res) {
+      toast(res.unchanged
+        ? "Источник не изменился — показан прежний снимок."
+        : "Предпросмотр обновлён.", res.unchanged ? "" : "ok");
+      // УСПЕХ мог сменить сами имена листов: выбранный до этого лист в новом
+      // снимке существовать не обязан, и просить его у сервера значит получить
+      // 400 на ровном месте — а вместе с ним пустой экран вместо только что
+      // прочитанных строк. Поэтому лист и позиция сбрасываются, а очередь
+      // («Все / Требуют разбора / Ошибки») сохраняется: она к именам листов
+      // отношения не имеет.
+      return switchView(function () { state.sheet = ""; });
+    }, function () {
+      // ОТКАЗ: снимок и его листы не изменились ни на байт, поэтому прежний
+      // фильтр остаётся законным, а строки — на экране. Перечитываем состояние
+      // только затем, чтобы стала видна причина отказа.
+      return load();
+    }).then(restore, restore);
+  }
+
+  // КУДА ЧЕЛОВЕКУ ИДТИ ПОСЛЕ ОТКАЗА — зависит от роли и от того, открыта ли
+  // запись. Замечание ревью PR #47 на HEAD `590b5c6`: прежний текст обещал
+  // ВСЕМ, что ссылка и имена листов «сохранены в форме выше — поправьте и
+  // попробуйте снова». Формы выше нет ни у участника (`renderForm` рисует ему
+  // подсказку про владельца), ни у владельца в readonly (там read-only блок со
+  // ссылкой на «Тарифы»). Совет, который невозможно выполнить, хуже отсутствия
+  // совета: человек ищет на экране то, чего там нет, и решает, что сломан он.
+  // Роль и состояние подписки берутся ТЕ ЖЕ, что и у формы (`ROLE`,
+  // `WRITES_BLOCKED`), — новых прав и новых источников здесь не появляется.
+  function recoveryHint() {
+    if (ROLE !== "owner") {
+      return "Ссылку на таблицу и имена листов задаёт владелец организации — "
+           + "поправить связь с источником может он.";
+    }
+    if (WRITES_BLOCKED) {
+      return "Ваши настройки сохранены и никуда не делись. Повторить чтение и "
+           + "поправить ссылку можно будет, когда вернётся доступ к записи, — "
+           + "после оплаты подписки на странице «Тарифы».";
+    }
+    return "Ссылка и имена листов сохранены в форме выше — поправьте и "
+         + "попробуйте снова.";
+  }
+
+  function renderError(data) {
+    // Отдельная функция и вызов БЕЗУСЛОВНЫЙ. Раньше отрисовка состояния
+    // выходила раньше этого места, когда успешного снимка ещё нет, — и после
+    // ПЕРВОГО неудачного обновления человек видел только четырёхсекундный
+    // тост. Причина отказа обязана оставаться на экране: она и есть ответ на
+    // вопрос «почему таблица пустая».
+    var box = document.getElementById("sup-error");
+    if (!data.last_error) {
+      box.style.display = "none";
+      clear(box);
+      return;
+    }
+    box.style.display = "";
+    clear(box);
+    box.appendChild(el("b", null, data.configured
+      ? "Последнее обновление не удалось: "
+      : "Прочитать источник не удалось: "));
+    box.appendChild(el("span", null, data.last_error));
+    box.appendChild(el("div", null, data.configured
+      ? "Показан предыдущий успешный снимок — он не изменился."
+      : "Удачного чтения ещё не было, поэтому показывать пока нечего."));
+    box.appendChild(el("div", null, recoveryHint()));
+    if (data.last_attempt_at) {
+      box.appendChild(el("div", null, "Попытка: " + when(data.last_attempt_at) + "."));
+    }
+  }
+
+  function renderState(data) {
+    var line = document.getElementById("sup-state");
+    clear(line);
+    if (!data.carrier_present) {
+      line.appendChild(el("span", null,
+        "Предпросмотру негде храниться: у организации нет основного подключения. " +
+        "Подключите МойСклад или демо-данные в Настройках."));
+      return;
+    }
+    if (!data.configured) {
+      line.appendChild(el("span", null, data.last_error
+        ? "Удачного чтения источника пока не было — причина ниже."
+        : "Источник ещё не читался. Вставьте ссылку, укажите два листа и нажмите «Обновить предпросмотр»."));
+      return;
+    }
+    line.appendChild(el("span", null, "Последнее успешное чтение: " + when(data.last_success_at) + "."));
+    line.appendChild(el("span", null, " Последняя попытка: " + when(data.last_attempt_at) + "."));
+    if (data.sheet_names && data.sheet_names.length) {
+      line.appendChild(el("span", null,
+        " Листы: " + data.sheet_names.join(" · ") + "."));
+    }
+
+    var link = document.getElementById("sup-src-link");
+    clear(link);
+    if (data.spreadsheet_url) {
+      var a = el("a", null, "Открыть исходную таблицу");
+      a.href = data.spreadsheet_url;         // собрана сервером, не пользователем
+      a.target = "_blank";
+      a.rel = "noopener noreferrer";
+      link.appendChild(a);
+    }
+
+    if (data.parser_stale) {
+      line.appendChild(el("span", null,
+        " Снимок сделан прежней версией разбора — обновите предпросмотр,"
+        + " чтобы прочитать источник заново."));
+    }
+  }
+
+  function tile(k, v, cls) {
+    var t = el("div", "sup-tile");
+    t.appendChild(el("div", "k", k));
+    t.appendChild(el("div", "v" + (cls ? " " + cls : ""), v));
+    return t;
+  }
+
+  // Итог штук: число ИЛИ честное «не определено». Нечитаемая ячейка размера и
+  // строка вовсе без количеств не равны нулю (D-51), поэтому сумма по такому
+  // набору окончательным числом не является. Показываем ровно то, что
+  // прочитано, и прямо говорим, что это не итог, — вместо аккуратной цифры,
+  // которая молча считает «Кроим по заданию» нулём.
+  function quantityText(block) {
+    if (!block || block.quantity_complete !== true) {
+      var known = (block && typeof block.quantity_known === "number")
+        ? block.quantity_known : 0;
+      return "не определено · прочитано " + known;
+    }
+    return String(block.quantity);
+  }
+
+  function renderSummary(data) {
+    var box = document.getElementById("sup-summary");
+    clear(box);
+    var c = data.counts || {};
+    if (!data.configured) {
+      box.appendChild(el("div", "hint", "Пока нечего показывать."));
+      return;
+    }
+    (c.sheets || []).forEach(function (s) {
+      box.appendChild(tile("Лист «" + s.sheet_name + "» · строк",
+        s.data_rows + " из " + s.rows));
+      box.appendChild(tile("Лист «" + s.sheet_name + "» · штук",
+        quantityText(s), s.quantity_complete === true ? null : "soft"));
+    });
+    box.appendChild(tile("Требуют разбора", c.needs_review || 0));
+    box.appendChild(tile("Ошибки", c.invalid || 0));
+  }
+
+  function renderFilters(data) {
+    var bar = document.getElementById("sup-filters");
+    clear(bar);
+    var queues = [["all", "Все"], ["needs_review", "Требуют разбора"], ["invalid", "Ошибки"]];
+    // `data-kind`/`data-value` нужны `markChips`: подсветку приходится
+    // обновлять и тогда, когда `renderFilters` не звался вовсе — например
+    // после неудачного перехода, когда рисовать нечего, а активный фильтр уже
+    // другой. Искать чип по подписи было бы связью через текст на экране.
+    function chip(kind, value, label) {
+      var b = el("button", "sup-chip", label);
+      b.setAttribute("data-kind", kind);
+      b.setAttribute("data-value", value);
+      b.addEventListener("click", function () {
+        switchView(function () {
+          if (kind === "queue") { state.queue = value; } else { state.sheet = value; }
+        });
+      });
+      bar.appendChild(b);
+      return b;
+    }
+    queues.forEach(function (q) { chip("queue", q[0], q[1]); });
+    if ((data.sheet_names || []).length) {
+      bar.appendChild(el("span", "hint", "·"));
+      chip("sheet", "", "Оба листа");
+      data.sheet_names.forEach(function (name) { chip("sheet", name, name); });
+    }
+    markChips();
+  }
+
+  function rowNode(r, sizeLabels) {
+    var tr = el("tr", r.is_blank ? "blank" : (r.invalid ? "bad" : (r.needs_review ? "warn" : "")));
+
+    var src = el("td", "sup-src");
+    src.appendChild(el("div", null, r.sheet_name));
+    src.appendChild(el("div", null, "строка " + r.source_row));
+    if (!r.is_blank && r.anchor_row && r.anchor_row !== r.source_row) {
+      src.appendChild(el("div", null, "продолжение строки " + r.anchor_row));
+    }
+    tr.appendChild(src);
+
+    if (r.is_blank) {
+      var empty = el("td", null, "пустая строка-разделитель");
+      empty.colSpan = SUP_COLUMNS - 1;   // первая колонка занята «лист · строка»
+      tr.appendChild(empty);
+      return tr;
+    }
+
+    var art = el("td", r.article_raw ? "sup-name" : "sup-inherit");
+    art.textContent = r.article || "—";
+    tr.appendChild(art);
+
+    var nm = el("td", r.name_raw ? "sup-name" : "sup-inherit");
+    nm.textContent = r.name || "—";
+    if (r.suggestion && r.suggestion.status !== "none") {
+      nm.appendChild(el("div", "sup-badge hint", r.suggestion.label));
+    }
+    tr.appendChild(nm);
+
+    tr.appendChild(el("td", "sup-raw", r.color_raw || "—"));
+
+    sizeLabels.forEach(function (label) {
+      var value = r.sizes ? r.sizes[label] : null;
+      var raw = (r.sizes_raw || {})[label] || "";
+      var td = el("td", "num");
+      if (value !== null && value !== undefined) {
+        td.textContent = String(value);
+      } else if (raw) {
+        // Нечисловое содержимое ячейки размера показывается как есть и
+        // подписывается ошибкой: ноль здесь был бы выдумкой.
+        td.textContent = raw;
+        td.className = "num sup-raw";
+      } else {
+        td.textContent = "—";
+      }
+      tr.appendChild(td);
+    });
+
+    var total = el("td", "num");
+    total.textContent = (r.source_total !== null && r.source_total !== undefined)
+      ? String(r.source_total)
+      : (r.source_total_raw || "—");
+    tr.appendChild(total);
+
+    tr.appendChild(el("td", "num", num(r.size_sum)));
+
+    // ЦЕНА ИСТОЧНИКА — замечание ревью PR #47 на HEAD `6a3cabd`. Парсер
+    // признаёт колонку 16 как `price_raw` и ИМЕННО ПОЭТОМУ исключает её из
+    // `unknown_raw`: страховки «покажется как неизвестная колонка» у неё нет.
+    // А строка её не выводила вовсе — то, что человек написал в своей
+    // таблице, исчезало из предпросмотра бесследно.
+    //
+    // Показывается СЫРОЙ текст, и только он: ни числа, ни валюты, ни
+    // разделителей разрядов. «12 900» может быть рублями, юанями или пометкой
+    // «12 900 за партию» — доказать мы этого не можем, а показать как есть
+    // можем. Та же логика, по которой `source_status_raw` остаётся текстом.
+    tr.appendChild(el("td", "sup-raw sup-price", r.price_raw || "—"));
+
+    var notes = el("td", "sup-raw");
+    // Три колонки комментариев источника выводятся как три отдельные строки:
+    // в таблице это три разные колонки, и человек ищет свою пометку там, где
+    // он её написал. `source_status_raw` — первая непустая из них, отдельной
+    // строкой не дублируется.
+    (r.comments_raw || []).forEach(function (c) {
+      if (c) notes.appendChild(el("div", null, c));
+    });
+    if (r.qty_meters_raw) notes.appendChild(el("div", null, "ткань: " + r.qty_meters_raw));
+    if (r.sketch_raw) notes.appendChild(el("div", null, "эскиз: " + r.sketch_raw));
+    if (r.production_raw) notes.appendChild(el("div", null, "производство: " + r.production_raw));
+    if (r.components_raw) notes.appendChild(el("div", null, "комплектующие: " + r.components_raw));
+    Object.keys(r.unknown_raw || {}).forEach(function (col) {
+      notes.appendChild(el("div", null, "колонка " + col + ": " + r.unknown_raw[col]));
+    });
+    if (!notes.firstChild) notes.textContent = "—";
+    tr.appendChild(notes);
+
+    var issues = el("td");
+    (r.issues || []).forEach(function (code, i) {
+      var label = (r.labels || [])[i] || code;
+      issues.appendChild(el("span",
+        "sup-badge " + (r.invalid && (code === "invalid_quantity" || code === "total_mismatch") ? "bad" : "warn"),
+        label));
+    });
+    if (!issues.firstChild) issues.textContent = "—";
+    tr.appendChild(issues);
+    return tr;
+  }
+
+  function renderRows(data, append) {
+    var body = document.getElementById("sup-rows");
+    if (!append) clear(body);
+    var labels = data.size_labels || ["XS", "S", "M", "L", "XL"];
+    (data.rows || []).forEach(function (r) { body.appendChild(rowNode(r, labels)); });
+    if (!body.firstChild) {
+      var tr = el("tr");
+      var td = el("td", "hint", data.configured
+        ? "В этом фильтре строк нет."
+        : "Источник ещё не читался.");
+      td.colSpan = SUP_COLUMNS;
+      tr.appendChild(td);
+      body.appendChild(tr);
+    }
+    shown = (append ? shown : 0) + (data.rows || []).length;
+    document.getElementById("sup-total").textContent =
+      data.configured ? ("показано " + shown + " из " + data.total) : "";
+    var more = document.getElementById("sup-more");
+    more.style.display = shown < data.total ? "" : "none";
+    // Кнопку выключил `resetView` на входе в переход; успешный вид её
+    // возвращает. Иначе первый же переход выключал бы догрузку навсегда.
+    more.disabled = false;
+  }
+
+  // ПЕРЕХОД МЕЖДУ ФИЛЬТРАМИ АТОМАРЕН, И ЭТО ЗАМЕЧАНИЕ РЕВЬЮ PR #47 НА HEAD
+  // `590b5c6`. Прежняя редакция меняла `state.queue`/`state.sheet`, обнуляла
+  // позицию и уходила за данными — а старые строки, старый `last` и старая
+  // кнопка «Показать ещё» оставались на экране. Если новый GET падал, человек
+  // видел строки ОДНОГО фильтра под подписью ДРУГОГО, а следующий клик по
+  // «Показать ещё» уходил за `offset=50` нового фильтра и дописывал его к
+  // строкам старого. То же самое случалось после удачного обновления снимка:
+  // на сервере уже новый снимок, а на экране интерактивные строки прежнего.
+  //
+  // Поэтому новое состояние объявляется ОДНИМ ходом: поколение растёт, позиция
+  // обнуляется, `last` сбрасывается (догрузке нечего дописывать), а старые
+  // строки снимаются с экрана вместе со счётчиком и кнопкой догрузки. Экран в
+  // этот момент честно пустой и говорит, что он загружается, — пустой вид,
+  // который никого не обманывает, лучше заполненного, который обманывает.
+  function resetView() {
+    gen += 1;
+    state.offset = 0;
+    shown = 0;
+    last = null;
+    viewHash = null;
+    var body = document.getElementById("sup-rows");
+    clear(body);
+    document.getElementById("sup-total").textContent = "";
+    var more = document.getElementById("sup-more");
+    more.style.display = "none";
+    more.disabled = true;
+  }
+
+  // Заглушка вместо строк: одна строка таблицы с текстом и, если есть куда
+  // возвращаться, кнопкой повтора. Повтор начинает фильтр С НАЧАЛА (offset 0):
+  // ничего показанного не осталось, и продолжать неоткуда.
+  function placeholder(text, retry) {
+    var body = document.getElementById("sup-rows");
+    clear(body);
+    var tr = el("tr");
+    var td = el("td", "hint", text);
+    td.colSpan = SUP_COLUMNS;
+    if (retry) {
+      var btn = el("button", "btn sm", "Повторить");
+      btn.id = "sup-retry";
+      btn.style.marginLeft = "8px";
+      btn.addEventListener("click", retry);
+      td.appendChild(btn);
+    }
+    tr.appendChild(td);
+    body.appendChild(tr);
+  }
+
+  // Подсветка чипов приводится в соответствие с `state` СРАЗУ, а не только
+  // после успешного ответа: активный фильтр обязан описывать то, что на экране
+  // сейчас, — а сейчас там пустой/загружающийся вид нового фильтра.
+  function markChips() {
+    var bar = document.getElementById("sup-filters");
+    [].forEach.call(bar.querySelectorAll(".sup-chip"), function (b) {
+      var on = b.getAttribute("data-kind") === "queue"
+        ? state.queue === b.getAttribute("data-value")
+        : state.sheet === b.getAttribute("data-value");
+      b.className = "sup-chip" + (on ? " on" : "");
+    });
+  }
+
+  // Единственная дверь в новое состояние вида. Сначала меняется `state`, потом
+  // старый вид снимается целиком, и только успешный ответ рисует новый. Отказ
+  // не возвращает старые строки обратно — они принадлежали прежнему фильтру.
+  function switchView(mutate) {
+    if (mutate) mutate();
+    resetView();
+    markChips();
+    placeholder("Загружаем строки…", null);
+    return load().catch(function () {
+      placeholder("Не удалось загрузить строки этого фильтра. Прежние строки "
+                  + "убраны, чтобы не показывать их под новым фильтром.",
+                  function () { switchView(null); });
+    });
+  }
+
+  function load(append, requestedOffset) {
+    // Поколение фиксируется В МОМЕНТ ОТПРАВКИ, а не читается в момент ответа.
+    var myGen = gen;
+    // Запрошенная позиция — ЛОКАЛЬНАЯ переменная запроса. Общий `state.offset`
+    // до ответа не двигается вовсе: замечание ревью PR #47. Прежний код
+    // прибавлял limit по клику, поэтому двойной клик уводил offset на две
+    // страницы вперёд при двух ответах в полёте, а любая ошибка оставляла его
+    // сдвинутым — и следующий клик перепрыгивал непоказанную страницу.
+    var offset = append ? requestedOffset : 0;
+    var q = "?queue=" + encodeURIComponent(state.queue) +
+            "&offset=" + offset + "&limit=" + state.limit +
+            (state.sheet ? "&sheet=" + encodeURIComponent(state.sheet) : "");
+    return api("/api/supply/sheets" + q).then(function (data) {
+      if (myGen !== gen) return STALE;   // поздний ответ прежнего вида — молча
+      var hash = data.content_sha256 || "";
+      if (append && hash !== (viewHash || "")) {
+        // СНИМОК СМЕНИЛСЯ, ПОКА ЧЕЛОВЕК СМОТРЕЛ ПЕРВУЮ СТРАНИЦУ. Дописать эти
+        // строки к показанным нельзя: они из другой версии таблицы, и вместе
+        // они не были правдой ни в один момент времени. Склеить их означало бы
+        // показать документ, которого не существует, — а сводку и счётчик к
+        // нему взять от одной из версий, то есть подписать чужую сумму.
+        //
+        // Поэтому текущий фильтр перезапускается ОДНИМ ходом с начала — той же
+        // дверью `switchView()`, что и смена фильтра: поколение растёт, старые
+        // строки снимаются вместе со счётчиком и кнопкой, и на экран приходит
+        // одна согласованная версия. Цикла здесь быть не может: перезапуск
+        // идёт без `append`, а версия сверяется только у догрузки.
+        toast("Снимок источника обновился — список перечитан с начала.", "");
+        switchView(null);
+        return STALE;
+      }
+      // Позиция фиксируется ТОЛЬКО после успеха. Отказ её не двигает, поэтому
+      // повторный клик повторяет ровно ту же страницу, а не следующую.
+      state.offset = offset;
+      last = data;
+      if (!append) viewHash = hash;
+      if (data.disclaimer) {
+        var note = document.getElementById("sup-note");
+        clear(note);
+        note.appendChild(el("b", null, data.disclaimer));
+        note.appendChild(el("span", null,
+          " Это то, что сейчас написано в вашей производственной таблице, как есть. " +
+          "«Оборот» ничего отсюда не заказывает, ни с чем не связывает и в расчёты не берёт."));
+      }
+      if (!append) renderForm(data);
+      renderState(data);
+      renderError(data);
+      renderSummary(data);
+      renderFilters(data);
+      renderRows(data, append);
+    }, function (err) {
+      // ОТКАЗ ТОЖЕ ПРИНАДЛЕЖИТ ПОКОЛЕНИЮ. Вид, который его заказывал, с экрана
+      // уже снят: писать в него нечего, и «не удалось загрузить строки этого
+      // фильтра» относилось бы к фильтру, которого на экране нет. Гасим здесь
+      // — ровно тем же условием, что и поздний успех, и ровно в том же месте,
+      // чтобы два ответа одного запроса не расходились в трактовке.
+      if (myGen !== gen) return STALE;
+      throw err;
+    });
+  }
+
+  var moreBtn = document.getElementById("sup-more");
+  moreBtn.addEventListener("click", function () {
+    // Ровно один запрос догрузки СВОЕГО вида в полёте. Кнопка гасится на время
+    // запроса и включается обратно при ЛЮБОМ исходе — иначе один неудачный
+    // ответ выключал бы догрузку до перезагрузки страницы.
+    if (!last) return;
+    // Заперт только тот вид, который сам взял замок. Догрузка снятого вида
+    // здесь больше ничего не решает: она принадлежит экрану, которого нет.
+    if (inflightGen === gen) return;
+    var myGen = gen;
+    var requested = state.offset + state.limit;
+    inflightGen = myGen;
+    moreBtn.disabled = true;
+    load(true, requested).catch(function () {
+      // Причина уже показана тостом внутри api(); позиция не сдвинута, и
+      // следующий клик повторит ТУ ЖЕ страницу.
+    }).then(function () {
+      // Замок отпускает только тот, кто его взял. Если вид успели сменить и
+      // новый вид уже взял замок себе, финализатор снятого вида молчит: иначе
+      // он снял бы чужую защиту и разрешил второй запрос там, где идёт первый.
+      if (inflightGen !== myGen) return;
+      inflightGen = -1;
+      // И кнопку он трогает тоже только свою. Состояние кнопки живого вида
+      // задают `resetView()` и `renderRows()` этого вида, а не финализатор
+      // запроса, который к нему не относится.
+      if (gen === myGen) moreBtn.disabled = false;
+    });
+  });
+
+  // Первая загрузка идёт той же дверью: если она не удалась, человек получает
+  // не пустую таблицу без объяснений, а причину и кнопку повтора.
+  switchView(null);
+});
+</script>
+{% endblock %}

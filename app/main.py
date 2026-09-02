@@ -30,6 +30,7 @@ from app.routes_connect import router as connect_router
 from app.routes_extra import router as extra_router
 from app.routes_ms_app import router as ms_app_router
 from app.routes_ms_vendor import router as ms_vendor_router
+from app.routes_supply import router as supply_router
 from app.db import get_db, init_db, record_migration_step, validate_migration_step
 from app.models import Connection, Membership, Org, Product, ProductionOrder, Sale, User
 
@@ -51,6 +52,10 @@ app.include_router(connect_router)
 app.include_router(extra_router)
 app.include_router(ms_vendor_router)
 app.include_router(ms_app_router)
+# SUPPLY-2 (D-51): read-only предпросмотр внешних Google Sheets. Отдельный
+# роутер, а не ветка в api.py: этот слой не имеет права трогать заказы,
+# «Едет» и формулы, и физическая отдельность делает это проверяемым.
+app.include_router(supply_router)
 
 
 def _csrf_reject():
@@ -1167,6 +1172,21 @@ def onboarding_preview_page(request: Request, db: Session = Depends(get_db)):
 @app.get("/replenish", response_class=HTMLResponse)
 def replenish_page(request: Request, db: Session = Depends(get_db)):
     return _authed_page(request, db, "replenish.html", "replenish", "Что заказать")
+
+
+@app.get("/supply", response_class=HTMLResponse)
+def supply_page(request: Request, db: Session = Depends(get_db)):
+    """«Поставки» — предпросмотр внешней таблицы (SUPPLY-2, D-51).
+
+    Роль кладётся в контекст страницы, а не выясняется отдельным запросом с
+    фронта: форма обновления существует только у владельца, и участник не
+    должен сначала увидеть её, а потом потерять после ответа API.
+    """
+    ctx = auth.resolve_auth(request, db)
+    if ctx is None:
+        return RedirectResponse("/login", status_code=302)
+    return _page(request, ctx, "supply.html", "supply", "Поставки", db=db,
+                 extra={"role": ctx.role})
 
 
 @app.get("/turnover", response_class=HTMLResponse)
