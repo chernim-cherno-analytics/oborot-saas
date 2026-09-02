@@ -4872,7 +4872,8 @@ def persisted_representability_checks() -> None:  # noqa: C901 — матриц�
             obj = {"a": obj} if i % 2 else [obj]
         return obj
 
-    ss.set_transport(FakeGoogle())
+    fake = FakeGoogle()
+    ss.set_transport(fake)
     try:
         r = boss.post("/api/supply/sheets/refresh",
                       json={"spreadsheet_url": SHEET_URL,
@@ -4916,9 +4917,11 @@ def persisted_representability_checks() -> None:  # noqa: C901 — матриц�
                 lambda e, bad: e.update({"future_top": bad}),
             "верхний уровень: незнакомый КЛЮЧ":
                 lambda e, bad: e.update({bad: "x"}),
-            "глубокая вложенность с суррогатом":
-                lambda e, bad: e["rows"][2].update({"extra_raw": nest(4000, bad)}),
         }
+        # Глубокий случай ВЫНЕСЕН из этой матрицы намеренно: здесь фикстура
+        # проходит через `json.dumps` питоновского объекта, а на Python 3.11
+        # энкодер рекурсивен и падает на глубине раньше, чем тест дойдёт до
+        # `exec_sql` и до endpoint. Ниже он собран сырой строкой.
         for label, mutate in places.items():
             for kind, bad in (("высокий", HIGH), ("низкий", LOW)):
                 spoiled = json.loads(json.dumps(good_cfg, ensure_ascii=True))
@@ -4946,6 +4949,51 @@ def persisted_representability_checks() -> None:  # noqa: C901 — матриц�
                 check(f"REFRESH · {label}, {kind}: носитель не переписан",
                       carrier_blob() == before)
 
+        # ── 1б. ГЛУБОКАЯ ВЛОЖЕННОСТЬ С СУРРОГАТОМ — сырой строкой.
+        #
+        # Прежняя редакция делала `nest(4000, bad)` и отдавала это общему
+        # `json.dumps`. На Python 3.11 рекурсивен и энкодер: тест падал прямо
+        # здесь, до записи в носитель и до единого обращения к endpoint, — и
+        # именно с этого места набор уходил в `NO_REPORT` на CI, показывая
+        # локально зелёный результат. Ложно-зелёная проверка утверждает
+        # проверенным то, что не выполнялось ни разу, и это хуже её отсутствия.
+        #
+        # Сырая строка не трогает ни энкодер, ни декодер теста: суррогат
+        # уезжает экранированной последовательностью, вложенность — скобками.
+        for kind, escaped in (("высокий", "\\ud800"), ("низкий", "\\udfff")):
+            shallow = json.loads(json.dumps(good_cfg, ensure_ascii=True))
+            shallow[ss.ENVELOPE_KEY]["rows"][2]["extra_raw"] = "__DEEPBAD__"
+            raw = json.dumps(shallow, ensure_ascii=True)
+            marker = '"extra_raw": "__DEEPBAD__"'
+            check(f"глубина+суррогат ({kind}): фикстура собрана без рекурсивного dumps",
+                  marker in raw, raw[:80])
+            raw = raw.replace(
+                marker,
+                '"extra_raw": ' + "[" * 4000 + f'"{escaped}"' + "]" * 4000, 1)
+            exec_sql("UPDATE connections SET config_json = ? WHERE id = ?",
+                     raw, conn_id)
+            before = carrier_blob()
+            calls_before = len(fake.calls)
+
+            read = boss.get("/api/supply/sheets?limit=200")
+            check(f"GET · глубина+суррогат ({kind}): управляемый 409, а не 500",
+                  read.status_code == 409, f"{read.status_code} {read.text[:120]}")
+            check(f"GET · глубина+суррогат ({kind}): без эха, ни сырого, ни экранированного",
+                  HIGH not in read.text and LOW not in read.text
+                  and ESCAPED not in read.text, read.text[:130])
+            check(f"GET · глубина+суррогат ({kind}): носитель не переписан",
+                  carrier_blob() == before)
+            post = boss.post("/api/supply/sheets/refresh",
+                             json={"spreadsheet_url": SHEET_URL,
+                                   "sheet_names": [SHEET_CURRENT, SHEET_NEXT]})
+            check(f"REFRESH · глубина+суррогат ({kind}): тот же 409, а не 500",
+                  post.status_code == 409, f"{post.status_code} {post.text[:120]}")
+            check(f"REFRESH · глубина+суррогат ({kind}): отказал ДО сети",
+                  len(fake.calls) == calls_before,
+                  f"{len(fake.calls) - calls_before} вызов(ов)")
+            check(f"REFRESH · глубина+суррогат ({kind}): носитель не переписан",
+                  carrier_blob() == before)
+
         # ── 2. ГЛУБИНА БЕЗ СУРРОГАТА — и это отдельный воспроизводимый P1,
         #    найденный этим же тестом, а не ревью.
         #
@@ -4961,17 +5009,59 @@ def persisted_representability_checks() -> None:  # noqa: C901 — матриц�
         #    Разумная вложенность обязана проходить: предел выбран заведомо
         #    низким (настоящий снимок имеет глубину около пяти), и живых данных
         #    он не задевает.
+        #    ФИКСТУРА СТРОИТСЯ СЫРОЙ СТРОКОЙ, А НЕ `json.dumps` ГЛУБОКОГО
+        #    ОБЪЕКТА, и это не стиль. Прежняя редакция собирала питоновский
+        #    объект глубины 2000 и звала `json.dumps(spoiled)`; на Python 3.11,
+        #    где идёт CI проекта, рекурсивен и ЭНКОДЕР — он падал прямо в
+        #    тесте, до `exec_sql` и до единого обращения к endpoint. Локальный
+        #    Python 3.14 с C-ускорителем этого не показывал, поэтому набор
+        #    зеленел, а CI получал `supply_sheets NO_REPORT` (прогон
+        #    33564072724 на `38d1957`). Ложно-зелёный тест хуже отсутствующего:
+        #    он утверждает проверенным то, что не выполнялось ни разу.
+        #
+        #    Сырая строка обходит и энкодер, и декодер теста целиком, и потому
+        #    ведёт себя одинаково на любом рантайме.
+        #    ЭХО ИЩЕТСЯ ПО ДЛИННОМУ УНИКАЛЬНОМУ SENTINEL, А НЕ ПО КОРОТКОМУ
+        #    СЛОВУ. Прежняя редакция клала в фикстуру «ок» и требовала, чтобы
+        #    его не было в отказе. Но «ок» — подстрока фиксированного
+        #    безопасного текста («вложены слишком глубОКо»), и проверка
+        #    краснела там, где никакого эха не было. Ложно-красное утверждение
+        #    так же бесполезно, как ложно-зелёное: оно проверяет совпадение
+        #    букв, а не то, что заявлено в его имени.
+        #
+        #    По той же причине здесь больше нет привязки к конкретной фразе
+        #    отказа. Ветка зависит от рантайма: на Python 3.11 разбор падает в
+        #    декодере и отвечает «не стал их переписывать», на 3.14 с
+        #    C-ускорителем разбор проходит и отвечает уже итеративная проверка
+        #    глубины — «не переписан». Обе одинаково законны, и no-echo не
+        #    обязан знать, какая из них сработала. Инвариант от этого не
+        #    слабеет: 409 проверяет соседний assertion строкой выше, а
+        #    побайтовое равенство носителя — assertion ниже, и это evidence
+        #    сильнее любого совпадения слов в тексте.
+        DEEP_ECHO_SENTINEL = "ЭХО-СОДЕРЖИМОГО-ГЛУБИНЫ-Ж7"
         for depth in (2000, 20000):
-            spoiled = json.loads(json.dumps(good_cfg, ensure_ascii=False))
-            spoiled[ss.ENVELOPE_KEY]["rows"][2]["extra_raw"] = nest(depth, "ок")
+            head = json.dumps(good_cfg, ensure_ascii=False)
+            marker = '"extra_raw": "__DEEP__"'
+            shallow = json.loads(head)
+            shallow[ss.ENVELOPE_KEY]["rows"][2]["extra_raw"] = "__DEEP__"
+            raw = json.dumps(shallow, ensure_ascii=False)
+            check(f"глубина {depth}: фикстура собрана без рекурсивного dumps",
+                  marker in raw, raw[:80])
+            raw = raw.replace(
+                marker,
+                '"extra_raw": ' + "[" * depth
+                + f'"{DEEP_ECHO_SENTINEL}"' + "]" * depth, 1)
+            check(f"глубина {depth}: sentinel действительно лёг в носитель",
+                  DEEP_ECHO_SENTINEL in raw)
             exec_sql("UPDATE connections SET config_json = ? WHERE id = ?",
-                     json.dumps(spoiled, ensure_ascii=False), conn_id)
+                     raw, conn_id)
             before = carrier_blob()
+            calls_before = len(fake.calls)
             read = boss.get("/api/supply/sheets?limit=200")
             check(f"глубина {depth} без суррогата: управляемый 409, а не 500",
                   read.status_code == 409, f"{read.status_code} {read.text[:120]}")
-            check(f"глубина {depth}: отказ называет вложенность и не несёт эха",
-                  "вложенность" in read.text and "не переписан" in read.text,
+            check(f"глубина {depth}: отказ не несёт эха содержимого",
+                  DEEP_ECHO_SENTINEL not in read.text,
                   read.text[:130])
             check(f"глубина {depth}: носитель не переписан",
                   carrier_blob() == before)
@@ -4980,10 +5070,18 @@ def persisted_representability_checks() -> None:  # noqa: C901 — матриц�
                                    "sheet_names": [SHEET_CURRENT, SHEET_NEXT]})
             check(f"глубина {depth}: refresh тот же 409, а не 500",
                   post.status_code == 409, f"{post.status_code} {post.text[:120]}")
+            check(f"глубина {depth}: refresh отказал ДО сети",
+                  len(fake.calls) == calls_before,
+                  f"{len(fake.calls) - calls_before} вызов(ов)")
             check(f"глубина {depth}: и после refresh носитель тот же",
                   carrier_blob() == before)
 
         # Разумная вложенность — и ровно на пределе — обязана работать.
+        # Здесь `nest()` через `json.dumps` ОСТАЁТСЯ намеренно: глубины 8 и 60
+        # безопасны на любом рантайме (предел рекурсии Python — 1000), и
+        # переписывать их сырой строкой значило бы усложнить фикстуру без
+        # единого выигрыша. Сырой строкой собраны ровно те случаи, где глубина
+        # заведомо больше предела энкодера.
         for depth, expect in ((8, 200), (ss.MAX_RESPONSE_DEPTH - 4, 200)):
             spoiled = json.loads(json.dumps(good_cfg, ensure_ascii=False))
             spoiled[ss.ENVELOPE_KEY]["rows"][2]["extra_raw"] = nest(depth, "ок")
