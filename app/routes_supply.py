@@ -36,16 +36,24 @@ router = APIRouter(prefix="/api/supply", tags=["supply"])
 def api_supply_sheets(
     sheet: str = Query("", max_length=supply_sheets.MAX_SHEET_NAME_CHARS),
     queue: str = Query("all"),
+    q: str = Query("", max_length=supply_sheets.MAX_SEARCH_CHARS),
     offset: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=200),
     ctx: AuthContext = Depends(require_auth_api),
     db: Session = Depends(get_db),
 ):
-    """Снимок предпросмотра своей организации. Только чтение."""
+    """Снимок предпросмотра своей организации. Только чтение.
+
+    `q` — поиск по наименованию, артикулу и цвету. Он сужает ВЕСЬ применимый
+    набор строк снимка до нарезки на страницы, поэтому `total` и догрузка
+    относятся к результату поиска, а не к тем строкам, которые страница успела
+    загрузить. Ни одной записи поиск не делает и ни одного сетевого вызова не
+    порождает: снимок уже лежит в носителе, читается он целиком и в памяти.
+    """
     try:
         return supply_sheets.preview(
             db, ctx.org.id, role=ctx.role, sheet=sheet or None,
-            queue=queue, offset=offset, limit=limit,
+            queue=queue, offset=offset, limit=limit, q=q,
         )
     except supply_sheets.ValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from None

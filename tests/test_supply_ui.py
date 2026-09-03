@@ -174,6 +174,49 @@ def make_row(index: int, sheet: str, *, invalid: bool = False,
     }
 
 
+#: Длинные значения — по ФОРМЕ такие же, как в живой производственной таблице:
+#: длинное имя модели, составной цвет, свободный комментарий со статусом,
+#: адрес самовывоза, перечень комплектующих и текст прямо в колонке размера.
+#: Содержимое выдумано целиком: живых данных, имён и контактов здесь нет.
+LONG_NAME = ("Платье миди из плотного трикотажа с потайной молнией и разрезом "
+             "сзади, лимитированная капсула сезона")
+LONG_COLOR = "Тёмно-изумрудный с переходом в бутылочный (партия 2)"
+LONG_STATUS = ("Отгружено 12 шт на склад, остаток в раскрое; ждём подтверждения "
+               "подрядчика по срокам и по цвету подкладки")
+LONG_ADDRESS = ("Забрать: г. Вымышленск, ул. Придуманная, д. 1, стр. 4, вход со "
+                "двора, оф. 512, с 10 до 18")
+LONG_COMPONENTS = ("Молния потайная 60 см — 40 шт, бирка тканая — 40 шт, "
+                   "пуговица 18 мм — 120 шт, лента репсовая 15 мм — 25 м")
+LONG_UNKNOWN = "прочее: согласовано устно, счёт выставят позже, номер уточнить"
+RAW_SIZE = "Кроим по заданию"
+
+
+def make_long_row(index: int, sheet: str) -> dict:
+    """Строка, на которой прежний экран разваливался: 323 px высоты.
+
+    Все длинные значения сразу — и в размерной колонке текст вместо числа.
+    Ровно эта строка проверяет и уплотнение, и сохранность исходного текста:
+    высота обязана остаться строкой, а весь текст — остаться доступным.
+    """
+    row = make_row(index, sheet, name=LONG_NAME)
+    row.update({
+        "color_raw": LONG_COLOR,
+        "comments_raw": [LONG_STATUS, LONG_ADDRESS, ""],
+        "source_status_raw": LONG_STATUS,
+        "components_raw": LONG_COMPONENTS,
+        "production_raw": "Цех №3, Вымышленск",
+        "qty_meters_raw": "3,2",
+        "price_raw": "12 900",
+        "unknown_raw": {"21": LONG_UNKNOWN},
+        "sizes": {"XS": 1, "S": 1, "M": 1, "L": 1, "XL": None},
+        "sizes_raw": {"XS": "1", "S": "1", "M": "1", "L": "1", "XL": RAW_SIZE},
+        "size_sum": 4,
+        "source_total_raw": "5", "source_total": 5,
+        "issues": ["invalid_quantity", "total_mismatch", "unknown_column"],
+    })
+    return row
+
+
 def write_snapshot(sheets, rows, content_sha256: str = "0" * 64) -> None:
     """Положить снимок в носителя организации.
 
@@ -452,8 +495,10 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
             return page.text_content("#sup-total") or ""
 
         def row_count() -> int:
+            # Панель подробностей — тоже `tr`, но она не строка снимка, а её
+            # раскрытие. Считаем строки, а не узлы.
             return page.evaluate(
-                "() => document.querySelectorAll('#sup-rows tr').length")
+                "() => document.querySelectorAll('#sup-rows tr:not(.sup-det)').length")
 
         # ── 1. Гейт подписки: read-only вместо формы, но снимок на месте ────
         print("\n== Подписка readonly: владельцу не предлагают то, в чём откажут ==")
@@ -469,7 +514,8 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
         # ни одной ошибки в консоли и первый же элемент, который рисует JS.
         check("страница ожила: скрипт дождался DOMContentLoaded",
               not errors and page.evaluate(
-                  "() => document.querySelectorAll('#sup-rows tr').length") > 0,
+                  "() => document.querySelectorAll('#sup-rows tr:not(.sup-det)')"
+                  ".length") > 0,
               str(errors)[:200])
         check("гейт выключен: кнопка обновления на месте",
               page.evaluate("() => !!document.getElementById('sup-refresh')") is True)
@@ -593,8 +639,10 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
                       " window.__supDelayMatch = 'offset=50'; }")
         page.click("#sup-more")               # уходит МЕДЛЕННЫЙ запрос
         page.wait_for_timeout(200)
-        page.evaluate("() => { const b = [...document.querySelectorAll('#sup-filters .sup-chip')]"
-                      ".find(x => x.textContent === 'Ошибки'); if (b) b.click(); }")
+        page.evaluate("() => { const b = [...document.querySelectorAll("
+                      "'#sup-queues button, #sup-sheets button')]"
+                      ".find(x => x.getAttribute('data-label') === 'Ошибки');"
+                      " if (b) b.click(); }")
         page.wait_for_timeout(2500)
         check("новый фильтр показал ровно свои строки",
               total_line() == "показано 1 из 1", total_line())
@@ -612,8 +660,10 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
             body='{"ok":true,"unchanged":false}'))
         page.goto(f"{base}/supply")
         page.wait_for_timeout(1200)
-        page.evaluate("(name) => { const b = [...document.querySelectorAll('#sup-filters .sup-chip')]"
-                      ".find(x => x.textContent === name); if (b) b.click(); }", SHEET_A)
+        page.evaluate("(name) => { const b = [...document.querySelectorAll("
+                      "'#sup-queues button, #sup-sheets button')]"
+                      ".find(x => x.getAttribute('data-label') === name);"
+                      " if (b) b.click(); }", SHEET_A)
         page.wait_for_timeout(900)
         check("лист выбран и запрошен у сервера",
               any("sheet=" in u for u in get_calls()), str(get_calls()[-1:]))
@@ -629,6 +679,11 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
               stale.status_code == 400, f"{stale.status_code} {stale.text[:90]}")
 
         page.evaluate("() => { window.__supCalls = []; }")
+        # Настроенный источник показан компактно, поэтому имена листов
+        # правятся через явное раскрытие формы — тем же путём, каким это
+        # делает человек.
+        page.click("#sup-edit")
+        page.wait_for_timeout(200)
         page.fill("#sup-cur", SHEET_C)
         page.fill("#sup-next", SHEET_D)
         page.click("#sup-refresh")
@@ -644,12 +699,16 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
               (page.text_content("#sup-refresh") or "") == "Обновить предпросмотр",
               page.text_content("#sup-refresh") or "")
         check("очередь при этом сохранена — она к именам листов не относится",
-              page.evaluate("() => { const on = document.querySelector('#sup-filters .sup-chip.on');"
-                            " return on ? on.textContent : ''; }") == "Все")
+              page.evaluate("() => { const on = document.querySelector("
+                            "'#sup-queues button[aria-pressed=\"true\"]');"
+                            " return on ? on.getAttribute('data-label') : ''; }")
+              == "Все строки")
 
         print("\n== Неудачное обновление фильтр и строки оставляет как есть ==")
-        page.evaluate("(name) => { const b = [...document.querySelectorAll('#sup-filters .sup-chip')]"
-                      ".find(x => x.textContent === name); if (b) b.click(); }", SHEET_C)
+        page.evaluate("(name) => { const b = [...document.querySelectorAll("
+                      "'#sup-queues button, #sup-sheets button')]"
+                      ".find(x => x.getAttribute('data-label') === name);"
+                      " if (b) b.click(); }", SHEET_C)
         page.wait_for_timeout(900)
         page.unroute(REFRESH_RE)
         page.route(REFRESH_RE, lambda route: route.fulfill(
@@ -691,17 +750,32 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
         page.goto(f"{base}/supply")
         page.wait_for_timeout(1200)
         summary = page.text_content("#sup-summary") or ""
-        check("вместо числа сказано «не определено» и названо прочитанное",
-              "не определено" in summary and "прочитано 9" in summary, summary[:220])
-        check("и голого числа итога на плитке штук нет",
-              "штук9" not in summary.replace(" ", ""), summary[:220])
+        # Неполнота названа РЯДОМ С ЧИСЛОМ и числом же: сказано, у скольких
+        # строк количество прочитать не удалось, и прямым текстом — что это не
+        # весь объём поставки. Прежняя редакция писала «не определено» вместо
+        # суммы: прочитанные 9 шт при этом пропадали с экрана совсем, хотя они
+        # прочитаны честно и человеку нужны.
+        check("сумма распознанного показана числом и в штуках",
+              "9 шт" in summary, summary[:260])
+        check("и тут же сказано, что прочитано НЕ ВСЁ, и у скольких строк",
+              "Прочитано не всё: у 1 строки количество прочитать не удалось"
+              in summary, summary[:260])
+        check("и что это не весь объём поставки",
+              "Это не весь объём поставки." in summary, summary[:260])
+        check("а само число не названо объёмом поставки",
+              "объём поставки" not in summary.split("Это не весь")[0],
+              summary[:260])
 
         write_snapshot([SHEET_A, SHEET_B], [make_row(1, SHEET_A), make_row(2, SHEET_A)])
         page.goto(f"{base}/supply")
         page.wait_for_timeout(1200)
         summary = page.text_content("#sup-summary") or ""
-        check("полный итог по-прежнему показывается числом",
-              "не определено" not in summary and "10" in summary, summary[:220])
+        check("полный итог показан числом и без предупреждения о неполноте",
+              "10 шт" in summary and "Прочитано не всё" not in summary,
+              summary[:260])
+        check("но и он не назван объёмом поставки: итог источника отдельно",
+              "Сумма распознанных размеров." in summary
+              and "Итог источника — отдельная колонка" in summary, summary[:260])
 
         # ── 5. Переход между фильтрами атомарен ────────────────────────────
         #
@@ -714,7 +788,7 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
         def data_rows() -> int:
             """Строки данных, а не любые `tr`: заглушка — это тоже строка."""
             return page.evaluate(
-                "() => document.querySelectorAll('#sup-rows td.sup-src').length")
+                "() => document.querySelectorAll('#sup-rows td.sup-id').length")
 
         def more_hidden() -> bool:
             return page.evaluate(
@@ -729,12 +803,15 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
             """
             return page.evaluate(
                 "(kind) => { const on = document.querySelector("
-                "'#sup-filters .sup-chip.on[data-kind=\"' + kind + '\"]');"
-                " return on ? on.textContent : ''; }", kind)
+                "'#sup-queues button[aria-pressed=\"true\"][data-kind=\"' + kind"
+                " + '\"], #sup-sheets button[aria-pressed=\"true\"]"
+                "[data-kind=\"' + kind + '\"]');"
+                " return on ? on.getAttribute('data-label') : ''; }", kind)
 
         def click_chip(label: str) -> None:
             page.evaluate("(name) => { const b = [...document.querySelectorAll("
-                          "'#sup-filters .sup-chip')].find(x => x.textContent === name);"
+                          "'#sup-queues button, #sup-sheets button')]"
+                          ".find(x => x.getAttribute('data-label') === name);"
                           " if (b) b.click(); }", label)
 
         print("\n== Отказ при смене очереди не оставляет строк прежней ==")
@@ -788,10 +865,10 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
               f"{data_rows()} {total_line()}")
 
         print("\n== То же самое при смене ЛИСТА ==")
-        click_chip("Все")
+        click_chip("Все строки")
         page.wait_for_timeout(900)
-        check("вернулись к «Все»: строк снова много",
-              data_rows() == 50 and active_chip("queue") == "Все",
+        check("вернулись к «Все строки»: строк снова много",
+              data_rows() == 50 and active_chip("queue") == "Все строки",
               f"{data_rows()} {active_chip('queue')}")
         page.route(GET_RE, lambda route: route.fulfill(
             status=502, content_type="application/json",
@@ -908,11 +985,11 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
                       " window.__supDelayMatch = 'queue=invalid'; }")
         click_chip("Ошибки")                  # A — медленный, обречённый
         page.wait_for_timeout(250)
-        click_chip("Все")                     # B — быстрый и удачный
+        click_chip("Все строки")              # B — быстрый и удачный
         page.wait_for_timeout(900)
         check("B успел нарисоваться, пока A ещё в полёте",
               data_rows() == 50 and total_line() == "показано 50 из 121"
-              and active_chip("queue") == "Все",
+              and active_chip("queue") == "Все строки",
               f"{data_rows()} {total_line()} {active_chip('queue')}")
 
         page.wait_for_timeout(2200)           # сюда приходит 502 фильтра A
@@ -925,7 +1002,7 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
         check("и счётчик показанного остался счётчиком B",
               total_line() == "показано 50 из 121", total_line())
         check("и подсветка чипа тоже описывает B, а не A",
-              active_chip("queue") == "Все", active_chip("queue"))
+              active_chip("queue") == "Все строки", active_chip("queue"))
         check("заглушки с причиной отказа A на экране нет вовсе",
               "Не удалось загрузить строки" not in (page.text_content("#sup-rows") or ""),
               (page.text_content("#sup-rows") or "")[:160])
@@ -1011,9 +1088,9 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
               f"{active_chip('queue')} {total_line()}")
 
         # Вид «Ошибки» короткий, догружать в нём нечего — поэтому возвращаемся в
-        # «Все» третьим переходом: это снова вид с догрузкой, и он тоже не
+        # «Все строки» третьим переходом: это снова вид с догрузкой, и он тоже не
         # должен быть заперт замком давно снятого A.
-        click_chip("Все")
+        click_chip("Все строки")
         page.wait_for_timeout(900)
         check("вернулись в вид с догрузкой, кнопка включена",
               page.evaluate("() => { const b = document.getElementById('sup-more');"
@@ -1306,7 +1383,7 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
               (m2page.text_content("#sup-error") or "")[:160])
         check("прежний снимок участник по-прежнему видит целиком",
               m2page.evaluate("() => document.querySelectorAll("
-                              "'#sup-rows td.sup-src').length") == 3)
+                              "'#sup-rows td.sup-id').length") == 3)
         check("страница участника без ошибок в консоли", not m2errors,
               str(m2errors)[:200])
         m2ctx.close()
@@ -1489,6 +1566,12 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
         # колонка» у неё нет. А строка её не выводила вовсе: значение,
         # написанное человеком в его таблице, исчезало из предпросмотра
         # бесследно.
+        #
+        # SUPPLY-UX-1.1 перенесла цену из колонки таблицы в подробности строки:
+        # свободный текст источника уплотнённую строку и разваливал. Требование
+        # ревью от этого не меняется — цена обязана быть НАЗВАНА, лежать РОВНО
+        # в своей строке и оставаться СЫРОЙ. Проверяется здесь именно это, а не
+        # факт существования колонки.
         print("\n== Цена источника: видна, сырая и безопасная ==")
         xss = '<img src=x onerror=alert(1)>'
         write_snapshot([SHEET_A, SHEET_B], [
@@ -1500,10 +1583,15 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
         page.wait_for_timeout(1200)
 
         def price_cells() -> list:
+            """Цена каждой строки — из ЕЁ подробностей, в порядке строк.
+
+            `null` означает «поле не названо вовсе»: именно это и было
+            исходным дефектом, поэтому пропускать такие панели нельзя."""
             return page.evaluate(
-                "() => [...document.querySelectorAll('#sup-rows tr')]"
-                ".map(tr => { const c = tr.querySelector('td.sup-price');"
-                " return c ? c.textContent : null; }).filter(v => v !== null)")
+                "() => [...document.querySelectorAll('#sup-rows tr.sup-det')]"
+                ".map(tr => { const dt = [...tr.querySelectorAll('dt')]"
+                ".find(d => d.textContent === 'Цена источника');"
+                " return dt ? dt.nextElementSibling.textContent : null; })")
 
         cells = price_cells()
 
@@ -1512,28 +1600,36 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
             набор без строки `ИТОГО` раннер засчитывает как «нет отчёта»."""
             return cells[i] if i < len(cells) else None
 
-        check("у каждой строки данных есть ячейка цены",
-              len(cells) == 3, str(cells))
+        check("цена названа у КАЖДОЙ строки данных, а не у той, где она есть",
+              len(cells) == 3 and all(v is not None for v in cells), str(cells))
         check("цена стоит РОВНО в своей строке и как есть",
-              cell_at(0) == "12 900", str(cells))
+              (cell_at(0) or "").startswith("12 900 —"), str(cells)[:200])
+        check("и не выдаётся за рубли или за цену штуки",
+              "без валюты и без перевода в рубли" in (cell_at(0) or ""),
+              str(cell_at(0))[:160])
         check("строка без цены показывает честный прочерк, а не пустоту",
-              cell_at(1) == "—", str(cells))
-        check("и заголовок колонки назван словами",
-              "Цена источника" in (page.text_content("table.sup thead") or ""),
-              (page.text_content("table.sup thead") or "")[:200])
+              cell_at(1) == "—", str(cells)[:200])
         check("цена — сырой текст, разметкой она не становится",
-              cell_at(2) == xss
+              (cell_at(2) or "").startswith(xss)
               and page.evaluate("() => document.querySelectorAll("
-                                "'#sup-rows td.sup-price img').length") == 0,
-              str(cell_at(2)))
+                                "'#sup-rows img').length") == 0,
+              str(cell_at(2))[:160])
 
         # Геометрия таблицы: шапка, строка данных, разделитель и заглушка —
         # одна и та же ширина. Иначе колонка «поедет» у части строк.
         cols = page.evaluate(
-            "() => document.querySelectorAll('table.sup thead th').length")
+            "() => document.querySelectorAll('table.sup-tbl thead th').length")
+        check("колонок в шапке столько, сколько их задумано",
+              cols == 11, str(cols))
         check("ширина строки данных совпадает с шапкой",
               page.evaluate("() => { const tr = [...document.querySelectorAll("
-                            "'#sup-rows tr')].find(t => t.querySelector('td.sup-price'));"
+                            "'#sup-rows tr:not(.sup-det)')]"
+                            ".find(t => t.querySelector('td.sup-pos'));"
+                            " return tr ? [...tr.children].reduce((n, td) =>"
+                            " n + (td.colSpan || 1), 0) : -1; }") == cols, str(cols))
+        check("и панель подробностей занимает всю ширину, а не часть",
+              page.evaluate("() => { const tr = document.querySelector("
+                            "'#sup-rows tr.sup-det');"
                             " return tr ? [...tr.children].reduce((n, td) =>"
                             " n + (td.colSpan || 1), 0) : -1; }") == cols, str(cols))
         write_snapshot([SHEET_A, SHEET_B], [
@@ -1543,7 +1639,8 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
         page.goto(f"{base}/supply")
         page.wait_for_timeout(1200)
         check("и ширина строки-разделителя тоже",
-              page.evaluate("() => { const tr = document.querySelector('#sup-rows tr.blank');"
+              page.evaluate("() => { const tr = document.querySelector("
+                            "'#sup-rows tr.r-blank');"
                             " return tr ? [...tr.children].reduce((n, td) =>"
                             " n + (td.colSpan || 1), 0) : -1; }") == cols, str(cols))
         page.route(GET_RE, lambda route: route.fulfill(
@@ -1556,7 +1653,7 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
                             " return tr ? [...tr.children].reduce((n, td) =>"
                             " n + (td.colSpan || 1), 0) : -1; }") == cols, str(cols))
         page.unroute(GET_RE)
-        click_chip("Все")
+        click_chip("Все строки")
         page.wait_for_timeout(1200)
 
         # ── 11. Гонка версий снимка при догрузке ──────────────────────────
@@ -1576,7 +1673,7 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
 
         def rows_of_sheet(name: str) -> int:
             return page.evaluate(
-                "(s) => [...document.querySelectorAll('#sup-rows td.sup-src')]"
+                "(s) => [...document.querySelectorAll('#sup-rows td.sup-id')]"
                 ".filter(td => td.textContent.indexOf(s) === 0).length", name)
 
         check("исходно на экране первая страница версии H1",
@@ -1623,6 +1720,298 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
               data_rows() == 60 and total_line() == "показано 60 из 60"
               and rows_of_sheet(SHEET_A) == 0,
               f"{data_rows()} {total_line()} {rows_of_sheet(SHEET_A)}")
+
+        # ── 12. SUPPLY-UX-1.1: плотная строка и полный текст в подробностях ─
+        #
+        # Замер прежнего экрана на этой же фикстуре: первая строка занимала
+        # 323 px на 1440×756 и 293 px на 390 px — одна позиция съедала половину
+        # экрана, а колонка «Цвет» переносилась по одной букве. Проверяется
+        # поэтому не «выглядит лучше», а два ЧИСЛА и одно свойство: высота
+        # строки, ширина размерных колонок и сохранность исходного текста.
+        print("\n== Плотная строка: высота ограничена, текст никуда не делся ==")
+        page.unroute(GET_RE)
+        dense = [make_long_row(3, SHEET_A)]
+        dense += [make_row(i + 4, SHEET_A) for i in range(70)]
+        dense.append(make_row(80, SHEET_B, name="Пуховик НГ"))
+        write_snapshot([SHEET_A, SHEET_B], dense, content_sha256="d" * 64)
+        page.set_viewport_size({"width": 1440, "height": 756})
+        page.goto(f"{base}/supply")
+        page.wait_for_timeout(1500)
+
+        heights = page.evaluate(
+            "() => [...document.querySelectorAll('#sup-rows tr:not(.sup-det)')]"
+            ".map(tr => Math.round(tr.getBoundingClientRect().height))")
+        check("каждая строка осталась строкой: не выше 72 px",
+              heights and max(heights) <= 72, f"max={max(heights or [0])} {heights[:4]}")
+        check("и не схлопнулась: не ниже 36 px",
+              heights and min(heights) >= 36, f"min={min(heights or [0])}")
+
+        widths = page.evaluate(
+            "() => [...document.querySelectorAll('#sup-rows tr:not(.sup-det)')]"
+            ".map(tr => [...tr.querySelectorAll('td.sz')]"
+            ".map(td => Math.round(td.getBoundingClientRect().width)).join(','))")
+        check("размерные колонки одинаковой ширины во ВСЕХ строках",
+              len(set(widths)) == 1 and widths[0].count(",") == 4,
+              str(sorted(set(widths))[:3]))
+
+        first_row_text = page.evaluate(
+            "() => { const tr = document.querySelector('#sup-rows tr:not(.sup-det)');"
+            " return tr ? tr.textContent : ''; }")
+        check("свободного текста источника в плотной строке нет",
+              LONG_STATUS not in first_row_text
+              and LONG_ADDRESS not in first_row_text
+              and LONG_COMPONENTS not in first_row_text
+              and LONG_UNKNOWN not in first_row_text,
+              first_row_text[:160])
+        check("но ошибка названа СЛОВОМ, а не только цветом строки",
+              "не число" in first_row_text or "итог ≠ сумма" in first_row_text,
+              first_row_text[:160])
+
+        # ── 13. Раскрытие подробностей — кнопкой и С КЛАВИАТУРЫ ────────────
+        print("\n== Подробности: доступны с клавиатуры, текст полный ==")
+        det_state = ("() => { const b = document.querySelector("
+                     "'#sup-rows tr:not(.sup-det) .sup-act button');"
+                     " const p = document.getElementById(b.getAttribute('aria-controls'));"
+                     " return {expanded: b.getAttribute('aria-expanded'),"
+                     " label: b.textContent, hidden: p.hidden, text: p.textContent}; }")
+        before_open = page.evaluate(det_state)
+        check("до раскрытия панель скрыта и кнопка говорит об этом",
+              before_open["expanded"] == "false" and before_open["hidden"] is True
+              and "Подробнее" in before_open["label"], str(before_open)[:140])
+
+        # Клавиатура: фокус на кнопку и Enter. Не `click()` — проверяется
+        # именно то, что человек без мыши до подробностей доберётся.
+        page.evaluate("() => document.querySelector("
+                      "'#sup-rows tr:not(.sup-det) .sup-act button').focus()")
+        page.keyboard.press("Enter")
+        page.wait_for_timeout(250)
+        after_open = page.evaluate(det_state)
+        check("Enter на кнопке раскрывает подробности",
+              after_open["expanded"] == "true" and after_open["hidden"] is False,
+              str({k: after_open[k] for k in ("expanded", "hidden")}))
+        check("и подпись кнопки описывает новое состояние",
+              "Свернуть" in after_open["label"], after_open["label"])
+
+        panel = after_open["text"]
+        missing = [name for name, value in (
+            ("наименование", LONG_NAME), ("цвет", LONG_COLOR),
+            ("статус", LONG_STATUS), ("адрес", LONG_ADDRESS),
+            ("комплектующие", LONG_COMPONENTS), ("чужая колонка", LONG_UNKNOWN),
+            ("текст в размере", RAW_SIZE), ("цена", "12 900"),
+        ) if value not in panel]
+        check("в подробностях лежит ВЕСЬ исходный текст строки, целиком",
+              not missing, "нет: " + ", ".join(missing))
+        check("и там же сказано, где эта строка в источнике",
+              f"Лист «{SHEET_A}», строка 3" in panel, panel[:160])
+        check("и объяснено, что именно не прочитано",
+              "Ноль вместо него не подставляется" in panel, panel[:200])
+        check("цена показана сырой и не названа рублями за штуку",
+              "без валюты и без перевода в рубли" in panel, panel[:200])
+
+        page.keyboard.press("Enter")
+        page.wait_for_timeout(250)
+        closed = page.evaluate(det_state)
+        check("повторный Enter сворачивает панель обратно",
+              closed["expanded"] == "false" and closed["hidden"] is True,
+              str({k: closed[k] for k in ("expanded", "hidden")}))
+
+        # ── 14. Поиск в браузере: по всему набору, а не по загруженным 50 ──
+        print("\n== Поиск на странице: считает весь набор и догружает его же ==")
+        page.evaluate("() => { window.__supCalls = []; }")
+        page.fill("#sup-q", "Позиция")
+        page.wait_for_timeout(1400)
+        check("запрос ушёл на сервер параметром q",
+              any("q=" in u for u in get_calls()), str(get_calls()[-1:]))
+        check("счётчик считает найденное по ВСЕМУ снимку, а не по странице",
+              total_line() == "показано 50 из 70, найденных по запросу «Позиция»",
+              total_line())
+        check("и показана ровно страница найденного", data_rows() == 50,
+              str(data_rows()))
+        check("поле поиска сохранило и текст, и фокус",
+              page.evaluate("() => document.activeElement === "
+                            "document.getElementById('sup-q')") is True
+              and page.input_value("#sup-q") == "Позиция")
+
+        page.click("#sup-more")
+        page.wait_for_timeout(1400)
+        check("догрузка идёт по результату поиска, а не по всему снимку",
+              data_rows() == 70
+              and total_line() == "показано 70 из 70, найденных по запросу «Позиция»",
+              f"{data_rows()} {total_line()}")
+        check("и ни одной чужой строки в результат не попало",
+              page.evaluate(
+                  "() => [...document.querySelectorAll('#sup-rows tr:not(.sup-det)"
+                  " .sup-pos .nm')].every(n => n.textContent.indexOf('Позиция') === 0)")
+              is True)
+
+        page.click("#sup-q-clear")
+        page.wait_for_timeout(1200)
+        check("сброс поиска возвращает весь снимок",
+              total_line() == "показано 50 из 72" and page.input_value("#sup-q") == "",
+              f"{total_line()} / {page.input_value('#sup-q')!r}")
+
+        # ── 15. Отказ 400 не отбирает у человека ввод и фокус ──────────────
+        #
+        # Настоящий серверный 400, а не подменённый ответ: лист выбран, а снимок
+        # тем временем перечитан с ДРУГИМИ листами — ровно то, что случается,
+        # когда владелец обновил источник в соседней вкладке.
+        print("\n== 400 на запросе: ввод и фокус остаются у человека ==")
+        click_chip(SHEET_A)
+        page.wait_for_timeout(900)
+        write_snapshot([SHEET_C, SHEET_D],
+                       [make_row(i + 3, SHEET_C) for i in range(4)],
+                       content_sha256="e" * 64)
+        page.focus("#sup-q")
+        page.type("#sup-q", "Позиция")
+        page.wait_for_timeout(1400)
+        check("сервер действительно отказал по устаревшему листу",
+              any("sheet=" in u for u in get_calls()), str(get_calls()[-1:]))
+        check("введённый запрос никуда не делся",
+              page.input_value("#sup-q") == "Позиция", page.input_value("#sup-q"))
+        check("и фокус остался в поле поиска",
+              page.evaluate("() => document.activeElement === "
+                            "document.getElementById('sup-q')") is True)
+        check("а на месте строк — причина и кнопка повтора, а не пустота",
+              "Не удалось загрузить строки" in (page.text_content("#sup-rows") or "")
+              and page.evaluate("() => !!document.getElementById('sup-retry')") is True,
+              (page.text_content("#sup-rows") or "")[:140])
+
+        # ── 16. Настроенный источник компактен, форма — за явным действием ─
+        print("\n== Источник: компактная строка, длинная форма по кнопке ==")
+        write_snapshot([SHEET_A, SHEET_B], dense, content_sha256="f" * 64)
+        page.goto(f"{base}/supply")
+        page.wait_for_timeout(1500)
+        check("у настроенного источника длинной формы на экране нет",
+              page.evaluate("() => document.getElementById('sup-form-wrap').hidden")
+              is True)
+        bar = page.text_content("#sup-srcbar") or ""
+        check("но видно главное: источник, оба листа и время снимка",
+              "Google Sheets" in bar and SHEET_A in bar and SHEET_B in bar
+              and "Снимок таблицы от" in bar, bar[:160])
+        check("и кнопка обновления на месте",
+              page.evaluate("() => !!document.getElementById('sup-refresh')") is True)
+        check("свежесть снимка подписана источником, а не безымянным «обновлено»",
+              "Таблица Google Sheets читается только по кнопке"
+              in (page.text_content("#sup-state") or ""),
+              (page.text_content("#sup-state") or "")[:120])
+        check("а пилюля в шапке называет СВОЙ источник — их два и они разные",
+              "Демо-данные" in (page.text_content("#live-pill") or ""),
+              (page.text_content("#live-pill") or "")[:80])
+
+        check("кнопка раскрытия честно объявляет состояние",
+              page.get_attribute("#sup-edit", "aria-expanded") == "false")
+        page.click("#sup-edit")
+        page.wait_for_timeout(250)
+        check("явное действие раскрывает длинную форму",
+              page.evaluate("() => document.getElementById('sup-form-wrap').hidden")
+              is False
+              and page.get_attribute("#sup-edit", "aria-expanded") == "true")
+        check("и фокус уезжает в первое поле, а не остаётся на кнопке",
+              page.evaluate("() => document.activeElement === "
+                            "document.getElementById('sup-url')") is True)
+        check("в полях стоит сохранённая связь, а не пустота",
+              page.input_value("#sup-url").endswith(f"{SPREADSHEET_ID}/edit")
+              and page.input_value("#sup-cur") == SHEET_A
+              and page.input_value("#sup-next") == SHEET_B,
+              f"{page.input_value('#sup-url')} {page.input_value('#sup-cur')}")
+
+        # Открытую человеком форму не захлопывает следующий успешный GET:
+        # состояние принадлежит тому, кто его выбрал.
+        click_chip("Ошибки")
+        page.wait_for_timeout(1200)
+        check("свой выбор переживает перерисовку экрана",
+              page.evaluate("() => document.getElementById('sup-form-wrap').hidden")
+              is False)
+        click_chip("Все строки")
+        page.wait_for_timeout(1200)
+
+        # ── 17. Две ширины: 1440×756 и 390 px ──────────────────────────────
+        print("\n== Desktop 1440×756 и mobile 390: шапка и идентичность на месте ==")
+        for label, size in (("desktop", {"width": 1440, "height": 756}),
+                            ("mobile", {"width": 390, "height": 844})):
+            page.set_viewport_size(size)
+            page.goto(f"{base}/supply")
+            page.wait_for_timeout(1500)
+
+            geom = page.evaluate(
+                "() => { const w = document.querySelector('.sup-scroll');"
+                " const t = document.querySelector('table.sup-tbl');"
+                " return {wrap: Math.round(w.clientWidth),"
+                " table: Math.round(t.scrollWidth)}; }")
+            if label == "desktop":
+                check("desktop: таблица помещается по ширине без прокрутки вбок",
+                      geom["table"] <= geom["wrap"] + 1, str(geom))
+
+            stuck = page.evaluate(
+                "() => { const w = document.querySelector('.sup-scroll');"
+                " w.scrollTop = 240; w.scrollLeft = 260;"
+                " const th = w.querySelector('thead th');"
+                " const td = w.querySelector('#sup-rows tr:not(.sup-det) td.sup-id');"
+                " return {head: Math.round(th.getBoundingClientRect().top"
+                "                          - w.getBoundingClientRect().top),"
+                " ident: Math.round(td.getBoundingClientRect().left"
+                "                   - w.getBoundingClientRect().left),"
+                " identText: td.textContent}; }")
+            check(f"{label}: шапка таблицы осталась наверху при прокрутке",
+                  abs(stuck["head"]) <= 2, str(stuck))
+            check(f"{label}: идентичность строки осталась слева",
+                  abs(stuck["ident"]) <= 2 and SHEET_A in stuck["identText"],
+                  str(stuck))
+
+            visible = page.evaluate(
+                "() => { const ok = id => { const e = document.getElementById(id);"
+                " if (!e) return false; const r = e.getBoundingClientRect();"
+                " return r.width > 0 && r.height > 0; };"
+                " return {q: ok('sup-q'), refresh: ok('sup-refresh'),"
+                " edit: ok('sup-edit'), more: ok('sup-more'),"
+                " queues: document.querySelectorAll('#sup-queues button').length,"
+                " sheets: document.querySelectorAll('#sup-sheets button').length}; }")
+            check(f"{label}: поиск, обновление и обе группы фильтров на месте",
+                  visible["q"] and visible["refresh"] and visible["edit"]
+                  and visible["queues"] == 3 and visible["sheets"] == 3,
+                  str(visible))
+
+            groups = page.evaluate(
+                "() => [...document.querySelectorAll('.sup-grp-lbl')]"
+                ".map(x => x.textContent)")
+            check(f"{label}: у каждой группы фильтров есть подпись",
+                  any("Что показать" in g for g in groups)
+                  and any("Лист источника" in g for g in groups)
+                  and any("Поиск" in g for g in groups), str(groups))
+
+            # ПУСТОТА, А НЕ ДЛИНА. Подводка к строкам — назначение, источник,
+            # сводка, фильтры — это содержание, и на телефоне она занимает
+            # больше экрана, чем на мониторе; требовать «всё в один экран»
+            # значило бы требовать выкинуть текст. Проверяется поэтому другое:
+            # между блоками нет провалов, подводка ЗАПОЛНЕНА содержанием, а её
+            # общая высота имеет потолок — иначе следующая правка добавит
+            # экран подводки и никто этого не заметит.
+            void = page.evaluate(
+                "() => { const t = document.querySelector('.sup-scroll')"
+                ".getBoundingClientRect().top;"
+                " const cards = [...document.querySelectorAll("
+                "'.sup-wrap section.card')].map(c => c.getBoundingClientRect())"
+                ".filter(r => r.top < t);"
+                " let filled = 0, prev = null, maxGap = 0;"
+                " cards.forEach(r => { filled += Math.min(r.height, t - r.top);"
+                "   if (prev !== null) maxGap = Math.max(maxGap, r.top - prev);"
+                "   prev = r.bottom; });"
+                " const from = cards.length ? cards[0].top : t;"
+                " return {top: Math.round(t), span: Math.round(t - from),"
+                "  filled: Math.round(filled), maxGap: Math.round(maxGap)}; }")
+            check(f"{label}: между блоками подводки нет провалов",
+                  void["maxGap"] <= 24, f"наибольший зазор {void['maxGap']} px")
+            check(f"{label}: подводка занята содержанием, а не пустотой",
+                  void["filled"] >= 0.85 * void["span"],
+                  f"{void['filled']} px содержания на {void['span']} px подводки")
+            # Потолок взят от замера: 1437 px на телефоне и 700 px на мониторе
+            # (замер 03.09 на этой же фикстуре, до правки было 1610 px).
+            ceiling = 1600 if label == "mobile" else 900
+            check(f"{label}: подводка к строкам не разрослась",
+                  void["top"] <= ceiling,
+                  f"верх таблицы на {void['top']} px при потолке {ceiling}")
+
+        page.set_viewport_size({"width": 1400, "height": 900})
 
         check("на странице не было ошибок в консоли", not errors, str(errors)[:200])
         ctx.close()
