@@ -12,115 +12,292 @@
   сознательно — встроить его значило бы отдать чужому origin кусок экрана.
 #}
 <style>
+  /* ЧТО ЗДЕСЬ РЕШАЕТСЯ ГЕОМЕТРИЕЙ, А НЕ ТЕКСТОМ.
+
+     Первая редакция экрана показывала каждую физическую строку чужой таблицы
+     целиком: сырой статус, три колонки комментариев, комплектующие, адрес
+     самовывоза и неизвестные колонки стояли прямо в строке. Замер на
+     синтетическом снимке с боевыми по ФОРМЕ значениями: первая строка занимала
+     323 px на 1440×756 и 293 px на 390 px — то есть одна позиция съедала
+     половину экрана, а колонка «Цвет» переносилась по одной букве. Ни
+     просмотреть лист, ни сравнить размеры по такому экрану нельзя.
+
+     Отсюда правило этого файла: СТРОКА КОРОТКАЯ, ПОЛНЫЙ ТЕКСТ НИКУДА НЕ ДЕЛСЯ.
+     Длинное значение обрезается визуально (`text-overflow`), а целиком лежит в
+     раскрываемых подробностях той же строки — и ничего не стирается, не
+     обнуляется и не «сокращается» в данных. Размерные колонки фиксированной
+     ширины: их ширину не должно двигать ни длинное имя, ни текст в ячейке
+     количества. */
   .sup-wrap { max-width: 1400px; }
-  .sup-note { border: 1px solid var(--amber, #d99a2b); background: rgba(217,154,43,.10);
-              border-radius: 10px; padding: 12px 14px; font-size: 13px; line-height: 1.55;
-              color: var(--ink-2); margin-bottom: 14px; }
-  .sup-note b { color: var(--ink); }
+  .sup-h { font-size: 15px; font-weight: 800; color: var(--ink); margin-bottom: 6px; }
+  .sup-lead { font-size: 13px; line-height: 1.55; color: var(--ink-2); }
+  .sup-limit { font-size: 12.5px; line-height: 1.55; color: var(--ink-2);
+               margin-top: 8px; padding-left: 10px;
+               border-left: 3px solid var(--amber-line, #edd3a4); }
+  .sup-limit b { color: var(--ink); }
+
+  /* Настроенный источник — одна строка. Длинная форма живёт за явным
+     раскрытием: пока источник читается, править в нём нечего, а на мобильном
+     три поля ввода занимали весь первый экран до единой строки данных. */
+  .sup-srcbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px;
+                font-size: 12.5px; color: var(--ink-2); }
+  .sup-srcbar .k { color: var(--ink-3); }
+  .sup-srcbar .v { color: var(--ink); font-weight: 600; }
+  .sup-srcbar .sup-spacer { flex: 1 1 auto; }
+  .sup-sheet-tag { display: inline-block; padding: 2px 8px; border-radius: 6px;
+                   background: var(--line-soft); color: var(--ink-2); font-weight: 600; }
+  .sup-formwrap { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line-soft); }
   .sup-form { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; }
-  .sup-form .field { display: flex; flex-direction: column; gap: 4px; min-width: 190px; }
+  .sup-form .field { display: flex; flex-direction: column; gap: 4px; min-width: 190px;
+                     margin-bottom: 0; }
   .sup-form .field.wide { flex: 1 1 380px; }
-  .sup-form label { font-size: 12px; color: var(--ink-3); }
+  .sup-form label { font-size: 12px; color: var(--ink-3); font-weight: 500; }
   .sup-form input { width: 100%; padding: 7px 10px; border: 1px solid var(--line);
                     border-radius: 8px; background: var(--surface); font-size: 13px;
                     color: var(--ink); }
+
+  /* Сводка: у каждого числа подписаны И область, И единицы. Число без области
+     («штук: 593») человек читает как весь объём поставки, а это не он. */
   .sup-sum { display: flex; flex-wrap: wrap; gap: 10px; }
   .sup-tile { border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px;
-              min-width: 150px; background: var(--surface); }
+              min-width: 210px; flex: 1 1 210px; background: var(--surface); }
   .sup-tile .k { font-size: 11.5px; color: var(--ink-3); }
-  .sup-tile .v { font-size: 18px; font-weight: 800; font-variant-numeric: tabular-nums; }
-  .sup-tile .v.soft { font-size: 13.5px; font-weight: 700; color: var(--ink-2); }
-  .sup-bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-  .sup-chip { font-size: 12px; padding: 5px 12px; border-radius: 20px; cursor: pointer;
-              border: 1px solid var(--line); background: var(--surface); color: var(--ink-2); }
-  .sup-chip.on { background: var(--ink); color: var(--surface); border-color: var(--ink); }
-  .sup-scroll { overflow-x: auto; }
-  table.sup { width: 100%; border-collapse: collapse; font-size: 12.5px; }
-  table.sup th, table.sup td { border-bottom: 1px solid var(--line); padding: 7px 8px;
-                               text-align: left; vertical-align: top; }
-  table.sup th { font-size: 11px; color: var(--ink-3); font-weight: 700; white-space: nowrap; }
-  table.sup td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
-  table.sup tr.blank td { color: var(--ink-3); font-style: italic; }
-  table.sup tr.bad { background: rgba(200,60,60,.06); }
-  table.sup tr.warn { background: rgba(217,154,43,.07); }
-  .sup-src { font-variant-numeric: tabular-nums; white-space: nowrap; color: var(--ink-3); }
-  .sup-name { font-weight: 700; }
-  .sup-inherit { color: var(--ink-3); font-weight: 400; }
-  .sup-raw { color: var(--ink-2); max-width: 260px; word-break: break-word; }
-  .sup-badge { display: inline-block; font-size: 10.5px; line-height: 1.5; padding: 1px 7px;
-               border-radius: 20px; margin: 1px 3px 1px 0; white-space: normal; }
-  .sup-badge.warn { background: rgba(217,154,43,.18); color: #7a5410; }
-  .sup-badge.bad { background: rgba(200,60,60,.15); color: #8c2020; }
-  .sup-badge.hint { background: rgba(31,31,31,.08); color: var(--ink-3); }
-  .sup-err { border: 1px solid rgba(200,60,60,.45); background: rgba(200,60,60,.08);
-             border-radius: 10px; padding: 10px 14px; font-size: 12.5px; color: #8c2020; }
+  .sup-tile .v { font-size: 20px; font-weight: 800; font-variant-numeric: tabular-nums;
+                 line-height: 1.25; }
+  .sup-tile .v .u { font-size: 12.5px; font-weight: 700; color: var(--ink-2);
+                    margin-left: 3px; }
+  .sup-tile .v.soft { font-size: 14px; font-weight: 700; color: var(--ink-2); }
+  .sup-tile .s { font-size: 11.5px; color: var(--ink-3); line-height: 1.45; margin-top: 3px; }
+  .sup-tile .s.warn { color: var(--amber, #b96e00); }
+
+  /* Поиск и две подписанные группы фильтров. Подпись у группы обязательна:
+     ряд одинаковых кнопок без заголовка не говорит, по какому признаку он
+     делит, — и «Ошибки» рядом с именем листа читается как третий лист. */
+  .sup-controls { display: flex; flex-wrap: wrap; gap: 10px 18px; align-items: flex-end;
+                  margin-bottom: 12px; }
+  .sup-grp { display: flex; flex-direction: column; gap: 5px; }
+  .sup-grp.grow { flex: 1 1 260px; min-width: 200px; }
+  .sup-grp-lbl { font-size: 11px; font-weight: 700; letter-spacing: .04em;
+                 text-transform: uppercase; color: var(--ink-3); }
+  .sup-search { display: flex; gap: 6px; align-items: center; }
+  .sup-search input { flex: 1 1 auto; min-width: 0; }
+
+  /* Прокрутка ограничена по высоте НАМЕРЕННО: `position: sticky` у заголовка
+     считается относительно ближайшего прокручиваемого предка, и без предела
+     высоты этим предком становится контейнер ростом со всё содержимое —
+     заголовок «прилипал» бы к тому, что и так никуда не уезжает. С пределом
+     шапка и колонка идентичности остаются на месте при прокрутке в обе
+     стороны. */
+  .sup-scroll { overflow: auto; max-height: min(62vh, 620px);
+                border: 1px solid var(--line-soft); border-radius: 10px; }
+  table.sup-tbl { width: 100%; }
+  .sup-tbl th { z-index: 6; }
+  .sup-tbl td { vertical-align: top; }
+  /* Идентичность строки закреплена по горизонтали: на узком экране таблица
+     едет вбок, и «какая это строка какого листа» обязано остаться видимым. */
+  .sup-tbl th:first-child, .sup-tbl td:first-child {
+    position: sticky; left: 0; background: var(--surface); }
+  .sup-tbl th:first-child { z-index: 7; background: #f6f8fa; }
+  .sup-tbl td:first-child { box-shadow: 1px 0 0 var(--line-soft); }
+  .sup-tbl tr.r-bad td:first-child { background: var(--red-row, #fff7f7); }
+  .sup-tbl tr.r-warn td:first-child { background: #fffdf6; }
+  .sup-tbl tr.r-blank td:first-child { background: #fafbfd; }
+  .sup-tbl tr.sup-det td:first-child { background: #f8fafc; }
+  .sup-tbl tr.r-bad > td { background: var(--red-row, #fff7f7); }
+  .sup-tbl tr.r-warn > td { background: #fffdf6; }
+  .sup-tbl tr.r-blank > td { background: #fafbfd; color: var(--ink-3); }
+  .sup-tbl tr.r-bad > td:first-child { box-shadow: inset 3px 0 0 var(--red, #d92b2b),
+                                                   1px 0 0 var(--line-soft); }
+  .sup-tbl tr.r-warn > td:first-child { box-shadow: inset 3px 0 0 var(--amber-fill, #e89312),
+                                                    1px 0 0 var(--line-soft); }
+  .sup-id { white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .sup-id .sub { font-size: 11px; color: var(--ink-3); margin-top: 1px; }
+  /* Ширина колонки позиции подобрана ЗАМЕРОМ, а не на глаз: при 1440×756
+     рабочая область даёт около 1148 px, и сумма всех колонок обязана в неё
+     уложиться, иначе «Замечания» и кнопка подробностей уезжают за край и
+     человек их просто не находит. 300 + 113 + 5×52 + 2×96 + 150 + 118 = 1133,
+     и это проверяется замером в браузере, а не арифметикой в комментарии. */
+  .sup-pos { max-width: 300px; min-width: 200px; }
+  .sup-pos .nm { font-weight: 600; }
+  .sup-pos .sub { font-size: 11px; color: var(--ink-3); margin-top: 1px; }
+  /* Одна строка и многоточие — и там, и там. Полный текст в подробностях. */
+  .sup-pos .nm, .sup-pos .sub, .sup-sz {
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sup-pos .nm.inherit, .sup-pos .sub.inherit { color: var(--ink-3); font-weight: 400; }
+  .sup-tbl th.sz, .sup-tbl td.sz { width: 52px; min-width: 52px; max-width: 52px; }
+  .sup-tbl th.tot, .sup-tbl td.tot { width: 96px; min-width: 96px; max-width: 96px; }
+  .sup-tbl th.sz, .sup-tbl th.tot { white-space: normal; }
+  /* Две самые длинные подписи шапки: разрядка общей таблицы (.09em) выносит
+     «ИСТОЧНИКА» за границу фиксированной колонки. */
+  .sup-tbl th.tot { letter-spacing: .03em; }
+  /* Сегментированный переключатель переносится по строкам: на 390 px три
+     подписи в один ряд не помещаются, а `inline-flex` без переноса просто
+     срезал бы «Ошибки» за краем — то есть спрятал бы действие. */
+  #sup-queues { flex-wrap: wrap; max-width: 100%; }
+  .sup-sz.raw { font-family: var(--sans); font-size: 11px; font-weight: 600;
+                font-style: italic; color: var(--amber, #b96e00); }
+  .sup-flags { min-width: 150px; }
+  .sup-mark { display: inline-flex; align-items: baseline; gap: 4px; font-size: 11px;
+              line-height: 1.45; padding: 1px 7px; border-radius: 20px;
+              margin: 1px 3px 1px 0; white-space: normal; font-weight: 600; }
+  /* Значок и слово, а не только цвет: цветовая слепота и печать не должны
+     стирать разницу между «ошибка» и «посмотрите». */
+  .sup-mark .g { font-weight: 800; }
+  .sup-mark.warn { background: var(--amber-bg, #fdf3e0); color: var(--amber, #b96e00); }
+  .sup-mark.bad { background: var(--red-bg, #fdeaea); color: var(--red, #d92b2b); }
+  .sup-mark.hint { background: var(--line-soft); color: var(--ink-3); }
+  .sup-act { width: 118px; min-width: 118px; text-align: right; }
+  .sup-more { margin-top: 12px; }
+
+  /* Подробности строки. Определения списком: подпись — значение. */
+  .sup-det > td { padding: 0 !important; }
+  .sup-dl { display: grid; grid-template-columns: 168px minmax(0, 1fr);
+            gap: 4px 14px; font-size: 12.5px; }
+  .sup-dl dt { color: var(--ink-3); }
+  .sup-dl dd { color: var(--ink); word-break: break-word; white-space: pre-wrap; }
+  .sup-det-head { font-size: 12px; color: var(--ink-3); margin-bottom: 8px; }
+  .sup-det-issues { margin-top: 10px; padding-top: 8px;
+                    border-top: 1px solid var(--line-soft); }
+  .sup-det-issue { font-size: 12.5px; line-height: 1.5; margin-bottom: 6px; }
+  .sup-det-issue b { color: var(--ink); }
+  .sup-err { border: 1px solid var(--red-line, #f3b9b9); background: var(--red-bg, #fdeaea);
+             border-radius: 10px; padding: 10px 14px; font-size: 12.5px;
+             color: var(--red, #d92b2b); margin-top: 10px; }
+  .sup-err b { color: var(--red, #d92b2b); }
+  .sup-sr { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+            overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+
   @media (max-width: 760px) {
     .sup-form .field, .sup-form .field.wide { min-width: 100%; flex: 1 1 100%; }
-    .sup-tile { min-width: 46%; flex: 1 1 46%; }
-    table.sup { font-size: 12px; }
-    .sup-raw { max-width: 160px; }
+    .sup-tile { min-width: 100%; flex: 1 1 100%; }
+    .sup-grp, .sup-grp.grow { flex: 1 1 100%; min-width: 100%; }
+    .sup-scroll { max-height: 62vh; }
+    .sup-pos { max-width: 210px; min-width: 150px; }
+    .sup-act { width: 104px; min-width: 104px; }
+    .sup-dl { grid-template-columns: minmax(0, 1fr); gap: 1px 0; }
+    .sup-dl dt { margin-top: 6px; }
+  }
+
+  /* ТЕЛЕФОН. Подводка к строкам — назначение, источник, сводка, фильтры —
+     на 390 px складывается в столбик, и на замере до первой строки набегало
+     1610 px: почти два экрана прокрутки на экране, куда заходят СМОТРЕТЬ
+     СТРОКИ. Уплотняются отступы и служебный кегль; ни одно слово при этом не
+     прячется и не сокращается — ни назначение, ни ограничение раздела, ни
+     подписи сводки. Прятать их за раскрытием значило бы показывать границу
+     раздела только тому, кто её и так знает.
+
+     `.card-head` здесь переносит подпись области на свою строку: во флекс-ряду
+     рядом с заголовком она сжималась в колонку по два-три слова. */
+  @media (max-width: 640px) {
+    .sup-wrap .card-body { padding: 12px; }
+    .sup-wrap .card + .card { margin-top: 10px; }
+    .sup-wrap .card-head { padding: 9px 12px; flex-wrap: wrap; gap: 2px 10px; }
+    .sup-wrap .card-head .spacer { display: none; }
+    .sup-wrap .card-head .hint { flex: 1 1 100%; line-height: 1.4; }
+    .sup-h { font-size: 14px; margin-bottom: 4px; }
+    .sup-lead { font-size: 12.5px; line-height: 1.45; }
+    .sup-limit { font-size: 12px; line-height: 1.45; margin-top: 6px; }
+    .sup-srcbar { gap: 6px 10px; }
+    .sup-sum { gap: 8px; }
+    .sup-tile { padding: 8px 10px; }
+    .sup-tile .v { font-size: 18px; }
+    .sup-tile .s { line-height: 1.35; }
+    .sup-controls { gap: 8px 12px; margin-bottom: 8px; }
+    .sup-scroll { max-height: 70vh; }
   }
 </style>
 
 <div class="sup-wrap">
 
-  {# Подпись приходит с сервера (`disclaimer`), но её текст продублирован здесь
-     на случай пустого ответа: экран не должен показать ни одной цифры чужой
-     таблицы без объяснения, чем она НЕ является. #}
-  <div class="sup-note" id="sup-note">
-    <b>Предпросмотр источника — ещё не партия «Оборота» и не учитывается в «Едет».</b>
-    Это то, что сейчас написано в вашей производственной таблице, как есть.
-    «Оборот» ничего отсюда не заказывает, ни с чем не связывает и в расчёты не берёт:
-    ни в «Едет», ни в «В заказе», ни в оборачиваемость.
-  </div>
+  {# НАЗНАЧЕНИЕ РАЗДЕЛА СКАЗАНО ПОЛОЖИТЕЛЬНО, А ГРАНИЦА — РЯДОМ И ЧЕСТНО.
+     Прежняя редакция открывалась одним предупреждением о том, чем раздел НЕ
+     является; человек, впервые сюда зашедший, не узнавал из него, зачем сюда
+     заходить. Смысл теперь назван первым, ограничение осталось на месте и не
+     смягчено ни на слово: подпись `disclaimer` приходит с сервера и
+     подставляется в этот же блок. #}
+  <section class="card">
+    <div class="card-body">
+      <div class="sup-h">Проверка данных производственных таблиц</div>
+      <div class="sup-lead">Строки вашей производственной таблицы Google Sheets — как
+        они в ней написаны. Видно, что прочиталось, а что нет: так в таблице находят
+        опечатку и пропуск.</div>
+      <div class="sup-limit" id="sup-note">
+        <b>Предпросмотр источника — ещё не партия «Оборота» и не учитывается в «Едет».</b>
+        Строки отсюда не становятся заказами и не входят в «Едет», «В заказе»,
+        оборачиваемость, бюджет и прогноз. Этапов производства, готовности и
+        автоматической сверки с каталогом раздел не считает.
+      </div>
+    </div>
+  </section>
 
-  <div class="card" id="sup-setup-card">
+  <section class="card" id="sup-setup-card">
     <div class="card-head"><h2>Источник</h2><div class="spacer"></div>
       <span class="hint" id="sup-src-link"></span></div>
     <div class="card-body">
-      <div id="sup-form-wrap"></div>
+      <div class="sup-srcbar" id="sup-srcbar"></div>
+      <div class="sup-formwrap" id="sup-form-wrap" hidden></div>
       <div class="hint" id="sup-state" style="margin-top:10px;">Загрузка…</div>
-      <div class="sup-err" id="sup-error" style="display:none;margin-top:10px;"></div>
+      <div class="sup-err" id="sup-error" style="display:none;"></div>
     </div>
-  </div>
+  </section>
 
-  <div class="card">
-    <div class="card-head"><h2>Сводка</h2></div>
+  <section class="card">
+    <div class="card-head"><h2>Сводка</h2><div class="spacer"></div>
+      <span class="hint" id="sup-scope"></span></div>
     <div class="card-body">
       <div class="sup-sum" id="sup-summary"><div class="loading-stub">Загрузка…</div></div>
     </div>
-  </div>
+  </section>
 
-  <div class="card">
+  <section class="card">
     <div class="card-head"><h2>Строки листов</h2><div class="spacer"></div>
       <span class="hint" id="sup-total"></span></div>
     <div class="card-body">
-      <div class="sup-bar" id="sup-filters" style="margin-bottom:10px;"></div>
+      <div class="sup-controls">
+        <div class="sup-grp grow">
+          <label class="sup-grp-lbl" for="sup-q">Поиск по наименованию, артикулу и цвету</label>
+          <div class="sup-search">
+            {# Поле поиска стоит в разметке, а не создаётся заново каждым
+               ответом: перерисовка отобрала бы у него фокус и каретку ровно
+               в тот момент, когда человек продолжает печатать. #}
+            <input class="input sm" type="text" id="sup-q" maxlength="120"
+                   autocomplete="off" spellcheck="false"
+                   placeholder="часть названия, артикул или цвет">
+            <button class="btn sm" id="sup-q-clear" type="button"
+                    style="display:none;">Сбросить</button>
+          </div>
+        </div>
+        <div class="sup-grp">
+          <span class="sup-grp-lbl" id="sup-grp-queue">Что показать</span>
+          <div class="seg" id="sup-queues" role="group" aria-labelledby="sup-grp-queue"></div>
+        </div>
+        <div class="sup-grp" id="sup-grp-sheet-wrap" style="display:none;">
+          <span class="sup-grp-lbl" id="sup-grp-sheet">Лист источника</span>
+          <div class="chips" id="sup-sheets" role="group" aria-labelledby="sup-grp-sheet"></div>
+        </div>
+      </div>
       <div class="sup-scroll">
-        <table class="sup">
+        <table class="tbl sup-tbl">
           <thead>
             <tr>
               <th>Лист · строка</th>
-              <th>Артикул</th>
-              <th>Наименование</th>
-              <th>Цвет</th>
-              <th class="num">XS</th><th class="num">S</th><th class="num">M</th>
-              <th class="num">L</th><th class="num">XL</th>
-              <th class="num">Итог источника</th>
-              <th class="num">Сумма размеров</th>
-              <th>Цена источника</th>
-              <th>Статус и комментарии источника</th>
-              <th>Что не так</th>
+              <th>Позиция</th>
+              <th class="num sz">XS</th><th class="num sz">S</th><th class="num sz">M</th>
+              <th class="num sz">L</th><th class="num sz">XL</th>
+              <th class="num tot">Сумма размеров</th>
+              <th class="num tot">Итог источника</th>
+              <th>Замечания</th>
+              <th class="sup-act"><span class="sup-sr">Подробности строки</span></th>
             </tr>
           </thead>
           <tbody id="sup-rows"></tbody>
         </table>
       </div>
-      <div style="margin-top:12px;">
+      <div class="sup-more">
         <button class="btn sm" id="sup-more" style="display:none;">Показать ещё</button>
       </div>
     </div>
-  </div>
+  </section>
 
 </div>
 {% endblock %}
@@ -144,7 +321,12 @@ document.addEventListener("DOMContentLoaded", function () {
   // отрендерена под сессией, и спрашивать сервер о том, что он только что знал,
   // значит платить лишним round-trip на каждую загрузку.
   var WRITES_BLOCKED = {{ writes_blocked | default(false) | tojson }};
-  var state = { sheet: "", queue: "all", offset: 0, limit: 50 };
+  //: `q` — поиск по наименованию, артикулу и цвету. Он живёт в состоянии вида
+  //: наравне с листом и очередью, потому что сужает ТОТ ЖЕ набор и той же
+  //: дверью: сервер применяет все три к целому снимку ДО нарезки на страницы,
+  //: поэтому «показано N из M» и догрузка относятся к результату поиска, а не
+  //: к тем строкам, что успели попасть на экран.
+  var state = { sheet: "", queue: "all", q: "", offset: 0, limit: 50 };
   var last = null;
   // Сколько строк СЕЙЧАС на экране. Считается по факту отрисованного, а не
   // выводится из offset: при догрузке offset фиксируется только после успеха,
@@ -223,7 +405,7 @@ document.addEventListener("DOMContentLoaded", function () {
   //: строка занимает всю ширину (разделитель, «строк нет», заглушка отказа):
   //: пока их было три и каждое несло свой литерал, добавление колонки ломало
   //: геометрию ровно в тех строках, которые никто не смотрит первыми.
-  var SUP_COLUMNS = document.querySelectorAll("table.sup thead th").length;
+  var SUP_COLUMNS = document.querySelectorAll("table.sup-tbl thead th").length;
 
   var CANONICAL_SOURCE_URL =
     /^https:\/\/docs\.google\.com\/spreadsheets\/d\/[A-Za-z0-9_-]{10,120}\/edit$/;
@@ -256,6 +438,102 @@ document.addEventListener("DOMContentLoaded", function () {
     return isNaN(d.getTime()) ? String(iso) : d.toLocaleString("ru-RU");
   }
 
+  //: Склонение существительного при числе: 1 строка, 2 строки, 5 строк.
+  //: Нужно ровно затем, чтобы у числа была подписана ЕДИНИЦА, а «3 строки»
+  //: не превращалось в «3 строка».
+  function plural(n, one, few, many) {
+    var a = Math.abs(n) % 100, b = a % 10;
+    if (a > 10 && a < 20) return many;
+    if (b > 1 && b < 5) return few;
+    if (b === 1) return one;
+    return many;
+  }
+
+  //: Открыта ли длинная форма источника. Состояние живёт вне DOM по той же
+  //: причине, что и замок обновления: `renderForm()` пересоздаёт содержимое
+  //: формы на каждом успешном GET, и «открыто ли» пришлось бы вычитывать из
+  //: узла, которого через мгновение не будет.
+  var formOpen = false;
+  //: Раскрывал ли человек форму сам. Пока нет — форму открывает и закрывает
+  //: состояние источника (не настроен, упала попытка). Как только раскрыл —
+  //: решение за ним: захлопнуть форму под руками у того, кто её открыл, было
+  //: бы хуже любой экономии места.
+  var formTouched = false;
+
+  function paintForm() {
+    var wrap = document.getElementById("sup-form-wrap");
+    var btn = document.getElementById("sup-edit");
+    if (wrap) wrap.hidden = !formOpen;
+    if (btn) {
+      btn.setAttribute("aria-expanded", formOpen ? "true" : "false");
+      btn.textContent = formOpen ? "Свернуть форму источника" : "Изменить источник";
+    }
+  }
+
+  // КОМПАКТНАЯ СТРОКА НАСТРОЕННОГО ИСТОЧНИКА. Видно ровно то, что человеку
+  // нужно каждый раз: какая таблица, какие два листа, когда снят снимок и
+  // кнопка «Обновить». Всё, что нужно один раз при настройке, — за явным
+  // действием «Изменить источник».
+  //
+  // Свежесть НАЗВАНА ИСТОЧНИКОМ. В шапке приложения висит своя пилюля про
+  // МойСклад/демо; если рядом стоит просто «обновлено тогда-то», две разные
+  // актуальности сливаются в одну, и человек читает статус синхронизации
+  // МойСклада как свежесть таблицы Google Sheets. Поэтому здесь всегда
+  // сказано, ЧЕЙ это снимок.
+  function renderSourceBar(data) {
+    var bar = document.getElementById("sup-srcbar");
+    clear(bar);
+    if (!data.configured) {
+      bar.appendChild(el("span", "k", data.carrier_present
+        ? "Источник ещё не настроен."
+        : "Источник настроить пока негде."));
+    } else {
+      bar.appendChild(el("span", "k", "Таблица Google Sheets"));
+      if ((data.sheet_names || []).length) {
+        var sheets = el("span", null);
+        data.sheet_names.forEach(function (name, i) {
+          if (i) sheets.appendChild(el("span", "k", " · "));
+          sheets.appendChild(el("span", "sup-sheet-tag", name));
+        });
+        bar.appendChild(sheets);
+      }
+      var when_ = el("span", null);
+      when_.appendChild(el("span", "k", "Снимок таблицы от "));
+      when_.appendChild(el("span", "v", when(data.last_success_at)));
+      bar.appendChild(when_);
+    }
+    bar.appendChild(el("span", "sup-spacer"));
+
+    // Кнопки рождаются в том состоянии, в котором СЕЙЧАС находится обновление
+    // и раскрытие формы: строку пересобирает каждый успешный GET, и «новая
+    // кнопка = кнопка свободна» было бы неправдой ровно тогда, когда запрос
+    // ещё идёт.
+    if (ROLE === "owner" && !WRITES_BLOCKED && data.carrier_present) {
+      var refreshBtn = el("button", "btn primary sm",
+                          REFRESH_LABELS[refreshBusy ? 1 : 0]);
+      refreshBtn.id = "sup-refresh";
+      refreshBtn.type = "button";
+      refreshBtn.disabled = refreshBusy;
+      refreshBtn.addEventListener("click", function () { refresh(); });
+      bar.appendChild(refreshBtn);
+
+      var edit = el("button", "btn sm", "Изменить источник");
+      edit.id = "sup-edit";
+      edit.type = "button";
+      edit.setAttribute("aria-controls", "sup-form-wrap");
+      edit.addEventListener("click", function () {
+        formOpen = !formOpen;
+        formTouched = true;
+        paintForm();
+        if (formOpen) {
+          var url = document.getElementById("sup-url");
+          if (url) url.focus();
+        }
+      });
+      bar.appendChild(edit);
+    }
+  }
+
   function renderForm(data) {
     var wrap = document.getElementById("sup-form-wrap");
     clear(wrap);
@@ -265,6 +543,10 @@ document.addEventListener("DOMContentLoaded", function () {
         ? "Источник настраивает владелец организации. Вам доступен просмотр."
         : "Источник ещё не настроен. Настроить его может владелец организации.";
       wrap.appendChild(ro);
+      // Это не форма, а состояние раздела: прятать его за раскрытием нельзя,
+      // и раскрывать нечем — кнопки «Изменить источник» у этой роли нет.
+      formOpen = true;
+      paintForm();
       return;
     }
     if (WRITES_BLOCKED) {
@@ -290,6 +572,8 @@ document.addEventListener("DOMContentLoaded", function () {
       pay.appendChild(link);
       blocked.appendChild(pay);
       wrap.appendChild(blocked);
+      formOpen = true;
+      paintForm();
       return;
     }
     if (!data.carrier_present) {
@@ -316,6 +600,8 @@ document.addEventListener("DOMContentLoaded", function () {
       go.appendChild(slink);
       nocarrier.appendChild(go);
       wrap.appendChild(nocarrier);
+      formOpen = true;
+      paintForm();
       return;
     }
     var form = el("div", "sup-form");
@@ -382,20 +668,21 @@ document.addEventListener("DOMContentLoaded", function () {
     form.appendChild(field("sup-cur", "Текущий лист", names[0] || "", null, "Осень 26"));
     form.appendChild(field("sup-next", "Следующий лист", names[1] || "", null, "НГ 26/27"));
 
-    var act = el("div", "field");
-    act.appendChild(el("label", null, " "));
-    // Кнопка рождается в том состоянии, в котором СЕЙЧАС находится
-    // обновление, а не в состоянии по умолчанию: форму пересобирает
-    // каждый успешный GET, и «новая кнопка = кнопка свободна» было бы
-    // неправдой ровно тогда, когда запрос ещё идёт. Замок живёт вне
-    // DOM — `refreshBusy`.
-    var btn = el("button", "btn primary", REFRESH_LABELS[refreshBusy ? 1 : 0]);
-    btn.id = "sup-refresh";
-    btn.disabled = refreshBusy;
-    btn.addEventListener("click", function () { refresh(); });
-    act.appendChild(btn);
-    form.appendChild(act);
     wrap.appendChild(form);
+
+    // КОГДА ФОРМА ОТКРЫТА САМА. Пока человек её не трогал, за раскрытие
+    // отвечает состояние источника, и поводов ровно два: настраивать ещё
+    // нечего (успеха не было) либо последняя попытка упала — и тогда в полях
+    // стоит ровно тот ввод, который упал, и чинить человек идёт именно его
+    // (D-51). Во всех остальных случаях источник настроен и работает, править
+    // в нём нечего, и три поля ввода занимают место зря — особенно на
+    // телефоне, где раньше они съедали весь первый экран до единой строки
+    // данных.
+    //
+    // Тронул сам — решает сам: захлопнуть форму под руками у того, кто её
+    // открыл, было бы хуже любой экономии места.
+    if (!formTouched) formOpen = !data.configured || !!data.last_error;
+    paintForm();
   }
 
   function refresh() {
@@ -515,12 +802,15 @@ document.addEventListener("DOMContentLoaded", function () {
         : "Источник ещё не читался. Вставьте ссылку, укажите два листа и нажмите «Обновить предпросмотр»."));
       return;
     }
-    line.appendChild(el("span", null, "Последнее успешное чтение: " + when(data.last_success_at) + "."));
-    line.appendChild(el("span", null, " Последняя попытка: " + when(data.last_attempt_at) + "."));
-    if (data.sheet_names && data.sheet_names.length) {
-      line.appendChild(el("span", null,
-        " Листы: " + data.sheet_names.join(" · ") + "."));
-    }
+    // ЧЬЯ ЭТО СВЕЖЕСТЬ — СКАЗАНО ПРЯМО. В шапке приложения висит собственная
+    // пилюля актуальности МойСклада или демо-данных; фраза «обновлено тогда-то»
+    // без имени источника рядом с ней читается как одно и то же состояние, а
+    // это два разных источника с двумя разными расписаниями. Таблицу читает
+    // только человек кнопкой, МойСклад — синхронизация.
+    line.appendChild(el("span", null,
+      "Таблица Google Sheets читается только по кнопке «Обновить»; расписания и "
+      + "фонового обновления у предпросмотра нет. Последняя попытка чтения: "
+      + when(data.last_attempt_at) + "."));
 
     var link = document.getElementById("sup-src-link");
     clear(link);
@@ -539,189 +829,461 @@ document.addEventListener("DOMContentLoaded", function () {
     }
   }
 
-  function tile(k, v, cls) {
+  //: Плитка сводки: подпись (что и по какой области), число с единицей и
+  //: пояснение под ним. Единица стоит РЯДОМ С ЧИСЛОМ, а не только в подписи:
+  //: «593» и «593 шт» человек читает по-разному, а «593 шт» и «593 строки» —
+  //: тем более.
+  function tile(k, value, unit, sub, subWarn) {
     var t = el("div", "sup-tile");
     t.appendChild(el("div", "k", k));
-    t.appendChild(el("div", "v" + (cls ? " " + cls : ""), v));
+    var v = el("div", "v" + (unit ? "" : " soft"));
+    v.appendChild(el("span", null, value));
+    if (unit) v.appendChild(el("span", "u", unit));
+    t.appendChild(v);
+    if (sub) t.appendChild(el("div", "s" + (subWarn ? " warn" : ""), sub));
     return t;
   }
 
-  // Итог штук: число ИЛИ честное «не определено». Нечитаемая ячейка размера и
-  // строка вовсе без количеств не равны нулю (D-51), поэтому сумма по такому
-  // набору окончательным числом не является. Показываем ровно то, что
-  // прочитано, и прямо говорим, что это не итог, — вместо аккуратной цифры,
-  // которая молча считает «Кроим по заданию» нулём.
-  function quantityText(block) {
-    if (!block || block.quantity_complete !== true) {
-      var known = (block && typeof block.quantity_known === "number")
-        ? block.quantity_known : 0;
-      return "не определено · прочитано " + known;
-    }
-    return String(block.quantity);
-  }
-
+  // СВОДКА ПОДПИСАНА ОБЛАСТЬЮ И ЕДИНИЦАМИ, И НИ ОДНО ЧИСЛО НЕ НАЗЫВАЕТСЯ ТЕМ,
+  // ЧЕМ ОНО НЕ ЯВЛЯЕТСЯ.
+  //
+  //   * область — «оба листа» или конкретный лист, ровно та, что выбрана
+  //     фильтром: иначе человек читает число одного листа как число обоих;
+  //   * `size_sum` — это СУММА РАСПОЗНАННЫХ РАЗМЕРОВ, а не объём поставки.
+  //     Итог источника — отдельная величина, и они регулярно расходятся
+  //     (`total_mismatch` живёт отдельной пометкой). Назвать сумму размеров
+  //     объёмом значило бы придумать равенство, которого нет;
+  //   * неполнота видна ЧИСЛОМ, а не только словом «не определено»: сказано,
+  //     у скольких строк количество прочитать не удалось;
+  //   * ошибки названы ПОДМНОЖЕСТВОМ замечаний прямым текстом. Две плитки
+  //     рядом («требуют разбора 3», «ошибки 1») читались как 3 + 1 = 4.
   function renderSummary(data) {
     var box = document.getElementById("sup-summary");
+    var scopeLine = document.getElementById("sup-scope");
     clear(box);
+    clear(scopeLine);
     var c = data.counts || {};
     if (!data.configured) {
-      box.appendChild(el("div", "hint", "Пока нечего показывать."));
+      box.appendChild(el("div", "hint",
+        "Удачного чтения таблицы ещё не было — считать пока нечего."));
       return;
     }
-    (c.sheets || []).forEach(function (s) {
-      box.appendChild(tile("Лист «" + s.sheet_name + "» · строк",
-        s.data_rows + " из " + s.rows));
-      box.appendChild(tile("Лист «" + s.sheet_name + "» · штук",
-        quantityText(s), s.quantity_complete === true ? null : "soft"));
-    });
-    box.appendChild(tile("Требуют разбора", c.needs_review || 0));
-    box.appendChild(tile("Ошибки", c.invalid || 0));
+    // Область сводки — ровно та, что выбрана фильтром листа.
+    var block = c;
+    var scope = "по обоим листам";
+    if (data.sheet) {
+      (c.sheets || []).forEach(function (s) {
+        if (s.sheet_name === data.sheet) { block = s; }
+      });
+      scope = "по листу «" + data.sheet + "»";
+    }
+    scopeLine.textContent = "Область: " + scope
+      + ". Поиск и фильтр «что показать» на сводку не влияют.";
+
+    var dataRows = block.data_rows || 0;
+    var allRows = block.rows || 0;
+    box.appendChild(tile(
+      "Строк с данными · " + scope,
+      String(dataRows), " " + plural(dataRows, "строка", "строки", "строк"),
+      "из " + allRows + " " + plural(allRows, "физической", "физических", "физических")
+        + " " + plural(allRows, "строки", "строк", "строк")
+        + " источника; остальные — пустые разделители."));
+
+    var known = (typeof block.quantity_known === "number") ? block.quantity_known : 0;
+    var complete = block.quantity_complete === true;
+    var unknownRows = (typeof block.quantity_unknown_rows === "number")
+      ? block.quantity_unknown_rows : 0;
+    box.appendChild(tile(
+      "Штук по размерам XS–XL · " + scope,
+      String(known), " шт",
+      complete
+        ? "Сумма распознанных размеров. Итог источника — отдельная колонка, и с этой суммой он совпадает не всегда."
+        : ("Прочитано не всё: у " + unknownRows + " "
+           + plural(unknownRows, "строки", "строк", "строк")
+           + " количество прочитать не удалось. Это не весь объём поставки."),
+      !complete));
+
+    var needs = block.needs_review || 0;
+    var invalid = block.invalid || 0;
+    box.appendChild(tile(
+      "Требуют внимания · " + scope,
+      String(needs), " " + plural(needs, "строка", "строки", "строк"),
+      "Из них ошибок: " + invalid + ". Ошибки входят в это же число, а не добавляются к нему.",
+      invalid > 0));
   }
 
+  // ДВЕ ГРУППЫ ФИЛЬТРОВ, И У КАЖДОЙ ЕСТЬ ПОДПИСЬ. Прежде «Все / Требуют
+  // разбора / Ошибки / Оба листа / Осень 26 / НГ 26/27» стояли одним рядом
+  // одинаковых кнопок: по такому ряду не видно, что первые три и последние три
+  // делят строки по РАЗНЫМ признакам, и «Ошибки» читается как третий лист.
+  // Подписи групп («Что показать», «Лист источника») стоят в разметке и
+  // связаны с группами через `aria-labelledby`.
   function renderFilters(data) {
-    var bar = document.getElementById("sup-filters");
-    clear(bar);
-    var queues = [["all", "Все"], ["needs_review", "Требуют разбора"], ["invalid", "Ошибки"]];
+    var queueBox = document.getElementById("sup-queues");
+    var sheetBox = document.getElementById("sup-sheets");
+    var sheetWrap = document.getElementById("sup-grp-sheet-wrap");
+    clear(queueBox);
+    clear(sheetBox);
+
+    // Счётчики на кнопках — от СНИМКА, а не от результата поиска. Пока идёт
+    // поиск, они относились бы к другому набору, чем строки под ними, поэтому
+    // на время поиска не показываются вовсе: число, которое противоречит
+    // соседнему числу, хуже отсутствующего. Найденное считает строка «показано
+    // N из M» под таблицей.
+    var counts = data.counts || {};
+    var block = counts;
+    if (data.sheet) {
+      (counts.sheets || []).forEach(function (s) {
+        if (s.sheet_name === data.sheet) { block = s; }
+      });
+    }
+    var searching = !!(data.q || "").trim();
+
     // `data-kind`/`data-value` нужны `markChips`: подсветку приходится
     // обновлять и тогда, когда `renderFilters` не звался вовсе — например
     // после неудачного перехода, когда рисовать нечего, а активный фильтр уже
-    // другой. Искать чип по подписи было бы связью через текст на экране.
-    function chip(kind, value, label) {
-      var b = el("button", "sup-chip", label);
+    // другой. Искать кнопку по подписи было бы связью через текст на экране.
+    function button(box, cls, kind, value, label, count) {
+      var b = el("button", cls, label);
+      b.type = "button";
       b.setAttribute("data-kind", kind);
       b.setAttribute("data-value", value);
+      // Подпись отдельным атрибутом: рядом с ней в кнопке живёт счётчик, и
+      // `textContent` кнопки — это уже «Все строки79», а не подпись.
+      b.setAttribute("data-label", label);
+      if (!searching && typeof count === "number") {
+        b.appendChild(el("span", kind === "queue" ? "c" : "cnt", String(count)));
+      }
       b.addEventListener("click", function () {
         switchView(function () {
           if (kind === "queue") { state.queue = value; } else { state.sheet = value; }
         });
       });
-      bar.appendChild(b);
+      box.appendChild(b);
       return b;
     }
-    queues.forEach(function (q) { chip("queue", q[0], q[1]); });
+
+    button(queueBox, "", "queue", "all", "Все строки", block.rows);
+    button(queueBox, "", "queue", "needs_review", "Требуют внимания",
+           block.needs_review);
+    button(queueBox, "", "queue", "invalid", "Ошибки", block.invalid);
+
     if ((data.sheet_names || []).length) {
-      bar.appendChild(el("span", "hint", "·"));
-      chip("sheet", "", "Оба листа");
-      data.sheet_names.forEach(function (name) { chip("sheet", name, name); });
+      sheetWrap.style.display = "";
+      button(sheetBox, "chip", "sheet", "", "Оба листа", counts.rows);
+      data.sheet_names.forEach(function (name) {
+        var own = null;
+        (counts.sheets || []).forEach(function (s) {
+          if (s.sheet_name === name) { own = s.rows; }
+        });
+        button(sheetBox, "chip", "sheet", name, name, own);
+      });
+    } else {
+      sheetWrap.style.display = "none";
     }
     markChips();
   }
 
-  function rowNode(r, sizeLabels) {
-    var tr = el("tr", r.is_blank ? "blank" : (r.invalid ? "bad" : (r.needs_review ? "warn" : "")));
+  //: Порядковый номер раскрываемой панели. Нужен только для связи кнопки с
+  //: панелью (`aria-controls` требует уникального id), поэтому растёт и при
+  //: догрузке: два раза открытая одна и та же страница даёт разные id, и это
+  //: правильно — узлы тоже разные.
+  var detSeq = 0;
 
-    var src = el("td", "sup-src");
-    src.appendChild(el("div", null, r.sheet_name));
-    src.appendChild(el("div", null, "строка " + r.source_row));
+  //: Ошибка это или замечание — решает сервер списком `invalid_issues`.
+  //: Выписывать коды в шаблон значило бы завести вторую редакцию правила,
+  //: которая однажды разойдётся с первой.
+  function isErrorCode(data, code) {
+    return (data.invalid_issues || []).indexOf(code) !== -1;
+  }
+
+  //: Строка «XS 1 · S 2 · … · XL «Кроим по заданию»» для подробностей.
+  //: Прочитанное показывается числом, непрочитанное — исходным текстом в
+  //: кавычках, отсутствующее — прочерком. Ноль не подставляется нигде.
+  function sizesText(r, sizeLabels) {
+    return sizeLabels.map(function (label) {
+      var value = r.sizes ? r.sizes[label] : null;
+      var raw = (r.sizes_raw || {})[label] || "";
+      if (value !== null && value !== undefined) return label + " " + value;
+      if (raw) return label + " «" + raw + "»";
+      return label + " —";
+    }).join(" · ");
+  }
+
+  //: Пара «подпись — значение» в подробностях. Пустое значение не пишется
+  //: вовсе: пустая строка под подписью выглядит как «здесь ничего нет», хотя
+  //: означала бы «в источнике этой колонки нет».
+  function def(dl, key, value) {
+    if (value === undefined || value === null || value === "") return;
+    dl.appendChild(el("dt", null, key));
+    dl.appendChild(el("dd", null, value));
+  }
+
+  // ПОДРОБНОСТИ СТРОКИ. Здесь лежит ВЕСЬ исходный текст: полное наименование
+  // и цвет (в плотной строке они обрезаны визуально), все три колонки
+  // комментариев, ткань, эскиз, производство, комплектующие, неизвестные
+  // колонки, цена как написана и размеры вместе с нечисловым содержимым
+  // ячеек. Ничего не удаляется и не обнуляется — уплотнилась строка, а не
+  // данные.
+  function detailNode(r, data, sizeLabels, panelId) {
+    var tr = el("tr", "sup-det");
+    tr.id = panelId;
+    tr.hidden = true;
+    var cell = el("td");
+    cell.colSpan = SUP_COLUMNS;
+    var panel = el("div", "sub-panel");
+
+    // ГДЕ ЭТА СТРОКА В ИСТОЧНИКЕ — честными координатами, а не ссылкой «в
+    // строку». Прямая ссылка на строку Google Sheets требует внутреннего
+    // идентификатора листа (`gid`); мы читаем листы ПО ИМЕНИ и `gid` не знаем
+    // вовсе. Собрать правдоподобный адрес и промахнуться мимо строки хуже, чем
+    // назвать лист и номер: по промаху человек будет искать ошибку в своих
+    // данных, а не в нашей ссылке.
+    var head = el("div", "sup-det-head");
+    var where = "Лист «" + r.sheet_name + "», строка " + r.source_row;
     if (!r.is_blank && r.anchor_row && r.anchor_row !== r.source_row) {
-      src.appendChild(el("div", null, "продолжение строки " + r.anchor_row));
+      where += " (продолжение строки " + r.anchor_row + ")";
     }
-    tr.appendChild(src);
+    head.appendChild(el("span", null, where + ". "));
+    if (data.spreadsheet_url) {
+      var a = el("a", null, "Открыть таблицу");
+      a.href = data.spreadsheet_url;
+      a.target = "_blank";
+      a.rel = "noopener noreferrer";
+      head.appendChild(a);
+      head.appendChild(el("span", null,
+        " — и найдите этот номер строки на листе: прямой ссылки на строку у "
+        + "предпросмотра нет."));
+    }
+    panel.appendChild(head);
 
+    var dl = el("dl", "sup-dl");
     if (r.is_blank) {
-      var empty = el("td", null, "пустая строка-разделитель");
-      empty.colSpan = SUP_COLUMNS - 1;   // первая колонка занята «лист · строка»
-      tr.appendChild(empty);
+      def(dl, "Содержимое", "Строка пуста целиком — в источнике это разделитель "
+                            + "между блоками. Она показана, чтобы номера строк "
+                            + "совпадали с таблицей.");
+      panel.appendChild(dl);
+      cell.appendChild(panel);
+      tr.appendChild(cell);
       return tr;
     }
 
-    var art = el("td", r.article_raw ? "sup-name" : "sup-inherit");
-    art.textContent = r.article || "—";
-    tr.appendChild(art);
-
-    var nm = el("td", r.name_raw ? "sup-name" : "sup-inherit");
-    nm.textContent = r.name || "—";
-    if (r.suggestion && r.suggestion.status !== "none") {
-      nm.appendChild(el("div", "sup-badge hint", r.suggestion.label));
+    def(dl, "Наименование", r.name || "—");
+    if (!r.name_raw && r.name) {
+      def(dl, "Откуда наименование", "Унаследовано от строки " + r.anchor_row
+                                     + ": в самой этой строке колонка пуста.");
     }
-    tr.appendChild(nm);
-
-    tr.appendChild(el("td", "sup-raw", r.color_raw || "—"));
-
-    sizeLabels.forEach(function (label) {
-      var value = r.sizes ? r.sizes[label] : null;
-      var raw = (r.sizes_raw || {})[label] || "";
-      var td = el("td", "num");
-      if (value !== null && value !== undefined) {
-        td.textContent = String(value);
-      } else if (raw) {
-        // Нечисловое содержимое ячейки размера показывается как есть и
-        // подписывается ошибкой: ноль здесь был бы выдумкой.
-        td.textContent = raw;
-        td.className = "num sup-raw";
-      } else {
-        td.textContent = "—";
-      }
-      tr.appendChild(td);
-    });
-
-    var total = el("td", "num");
-    total.textContent = (r.source_total !== null && r.source_total !== undefined)
-      ? String(r.source_total)
-      : (r.source_total_raw || "—");
-    tr.appendChild(total);
-
-    tr.appendChild(el("td", "num", num(r.size_sum)));
-
-    // ЦЕНА ИСТОЧНИКА — замечание ревью PR #47 на HEAD `6a3cabd`. Парсер
-    // признаёт колонку 16 как `price_raw` и ИМЕННО ПОЭТОМУ исключает её из
-    // `unknown_raw`: страховки «покажется как неизвестная колонка» у неё нет.
-    // А строка её не выводила вовсе — то, что человек написал в своей
-    // таблице, исчезало из предпросмотра бесследно.
-    //
-    // Показывается СЫРОЙ текст, и только он: ни числа, ни валюты, ни
+    def(dl, "Артикул", r.article || "—");
+    def(dl, "Цвет", r.color_raw);
+    def(dl, "Размеры", sizesText(r, sizeLabels));
+    def(dl, "Сумма размеров", num(r.size_sum) + " — сумма распознанных ячеек "
+                              + "XS–XL этой строки.");
+    def(dl, "Итог источника",
+        ((r.source_total !== null && r.source_total !== undefined)
+          ? String(r.source_total)
+          : (r.source_total_raw || "—"))
+        + " — отдельная колонка таблицы; с суммой размеров она совпадает не всегда.");
+    // ЦЕНА ИСТОЧНИКА — сырой текст, и только он: ни числа, ни валюты, ни
     // разделителей разрядов. «12 900» может быть рублями, юанями или пометкой
     // «12 900 за партию» — доказать мы этого не можем, а показать как есть
     // можем. Та же логика, по которой `source_status_raw` остаётся текстом.
-    tr.appendChild(el("td", "sup-raw sup-price", r.price_raw || "—"));
-
-    var notes = el("td", "sup-raw");
-    // Три колонки комментариев источника выводятся как три отдельные строки:
-    // в таблице это три разные колонки, и человек ищет свою пометку там, где
-    // он её написал. `source_status_raw` — первая непустая из них, отдельной
-    // строкой не дублируется.
-    (r.comments_raw || []).forEach(function (c) {
-      if (c) notes.appendChild(el("div", null, c));
+    //
+    // Поле НАЗВАНО ВСЕГДА, даже когда цены в источнике нет: прочерк отличает
+    // «в таблице пусто» от «предпросмотр её потерял». Именно потерей цены и
+    // было замечание ревью PR #47 (thread r3903352252) — колонка 16 признана
+    // парсером как `price_raw` и потому не попадает в `unknown_raw`, так что
+    // страховки «покажется как неизвестная колонка» у неё нет.
+    def(dl, "Цена источника",
+        r.price_raw
+          ? (r.price_raw + " — как написано в таблице: без валюты и без "
+             + "перевода в рубли или в цену за штуку.")
+          : "—");
+    // Три колонки комментариев выводятся раздельно: в таблице это три разные
+    // колонки, и человек ищет свою пометку там, где он её написал.
+    (r.comments_raw || []).forEach(function (c, i) {
+      def(dl, "Комментарий, колонка " + (i + 1), c);
     });
-    if (r.qty_meters_raw) notes.appendChild(el("div", null, "ткань: " + r.qty_meters_raw));
-    if (r.sketch_raw) notes.appendChild(el("div", null, "эскиз: " + r.sketch_raw));
-    if (r.production_raw) notes.appendChild(el("div", null, "производство: " + r.production_raw));
-    if (r.components_raw) notes.appendChild(el("div", null, "комплектующие: " + r.components_raw));
+    def(dl, "Количество в м", r.qty_meters_raw);
+    def(dl, "Эскиз", r.sketch_raw);
+    def(dl, "Производство", r.production_raw);
+    def(dl, "Комплектующие", r.components_raw);
     Object.keys(r.unknown_raw || {}).forEach(function (col) {
-      notes.appendChild(el("div", null, "колонка " + col + ": " + r.unknown_raw[col]));
+      def(dl, "Колонка " + col + " (без назначенного смысла)", r.unknown_raw[col]);
     });
-    if (!notes.firstChild) notes.textContent = "—";
-    tr.appendChild(notes);
+    if (r.suggestion && r.suggestion.status !== "none") {
+      def(dl, "Совпадение с каталогом", r.suggestion.label
+          + " — это подсказка, а не связь: предпросмотр ничего не привязывает.");
+    }
+    panel.appendChild(dl);
 
-    var issues = el("td");
-    (r.issues || []).forEach(function (code, i) {
-      var label = (r.labels || [])[i] || code;
-      issues.appendChild(el("span",
-        "sup-badge " + (r.invalid && (code === "invalid_quantity" || code === "total_mismatch") ? "bad" : "warn"),
-        label));
-    });
-    if (!issues.firstChild) issues.textContent = "—";
-    tr.appendChild(issues);
+    // ЗАМЕЧАНИЯ ОБЪЯСНЯЮТСЯ, А НЕ ТОЛЬКО НАЗЫВАЮТСЯ. Подпись говорит, ЧТО
+    // случилось, текст рядом — что именно не прочитано и какое действие
+    // разумно. Оба приходят с сервера из одного закрытого списка кодов.
+    if ((r.issues || []).length) {
+      var box = el("div", "sup-det-issues");
+      (r.issues || []).forEach(function (code, i) {
+        var line = el("div", "sup-det-issue");
+        var label = (r.labels || [])[i] || (data.issue_labels || {})[code] || code;
+        line.appendChild(el("b", null, label + ". "));
+        var help = (data.issue_help || {})[code];
+        if (help) line.appendChild(el("span", null, help));
+        box.appendChild(line);
+      });
+      panel.appendChild(box);
+    }
+
+    cell.appendChild(panel);
+    tr.appendChild(cell);
     return tr;
+  }
+
+  // ПЛОТНАЯ СТРОКА. Ориентир — 44–72 px: строка обязана оставаться строкой,
+  // чтобы лист можно было просматривать глазами и сравнивать размеры по
+  // колонкам. Достигается это ДВУМЯ решениями сразу, и оба обязательны:
+  // длинные значения обрезаются визуально в одну строку (CSS), а свободный
+  // текст источника вынесен в подробности. Уберёшь одно — вернётся прежние
+  // 323 px на первой же живой строке.
+  function rowNode(r, data, sizeLabels) {
+    var sizes = sizeLabels || ["XS", "S", "M", "L", "XL"];
+    var panelId = "sup-det-" + (detSeq += 1);
+    var tr = el("tr", r.is_blank ? "r-blank" : (r.invalid ? "r-bad"
+                                               : (r.needs_review ? "r-warn" : "")));
+
+    var src = el("td", "sup-id");
+    src.appendChild(el("div", null, r.sheet_name));
+    var sub = "строка " + r.source_row;
+    if (!r.is_blank && r.anchor_row && r.anchor_row !== r.source_row) {
+      sub += " · прод. " + r.anchor_row;
+    }
+    src.appendChild(el("div", "sub", sub));
+    tr.appendChild(src);
+
+    if (r.is_blank) {
+      var empty = el("td", null, "Пустая строка-разделитель источника");
+      empty.colSpan = SUP_COLUMNS - 2;   // первая колонка и колонка действия
+      tr.appendChild(empty);
+    } else {
+      var pos = el("td", "sup-pos");
+      var nm = el("div", "nm" + (r.name_raw ? "" : " inherit"));
+      nm.textContent = r.name || "—";
+      nm.title = r.name || "";
+      pos.appendChild(nm);
+      var parts = [];
+      if (r.article) parts.push(r.article);
+      if (r.color_raw) parts.push(r.color_raw);
+      var subLine = el("div", "sub" + (r.article_raw ? "" : " inherit"));
+      subLine.textContent = parts.length ? parts.join(" · ") : "без артикула и цвета";
+      subLine.title = parts.join(" · ");
+      pos.appendChild(subLine);
+      tr.appendChild(pos);
+
+      sizes.forEach(function (label) {
+        var value = r.sizes ? r.sizes[label] : null;
+        var raw = (r.sizes_raw || {})[label] || "";
+        var td = el("td", "num sz");
+        var inner = el("div", "sup-sz");
+        if (value !== null && value !== undefined) {
+          inner.textContent = String(value);
+        } else if (raw) {
+          // Нечисловое содержимое ячейки размера остаётся видимым и здесь —
+          // обрезанным по ширине колонки, целиком в подробностях. Ноль вместо
+          // него не подставляется: ноль означал бы «решили не шить».
+          inner.className = "sup-sz raw";
+          inner.textContent = raw;
+          inner.title = raw;
+        } else {
+          inner.textContent = "—";
+        }
+        td.appendChild(inner);
+        tr.appendChild(td);
+      });
+
+      tr.appendChild(el("td", "num tot", num(r.size_sum)));
+
+      var total = el("td", "num tot");
+      total.textContent = (r.source_total !== null && r.source_total !== undefined)
+        ? String(r.source_total)
+        : (r.source_total_raw || "—");
+      tr.appendChild(total);
+
+      // Пометки короткие и в одну строку. Больше двух не показывается: третья
+      // и дальше свернулись бы в «+N», а не обрезались молча — обрезанное
+      // предупреждение хуже отсутствующего, потому что о нём никто не узнает.
+      var flags = el("td", "sup-flags");
+      var codes = r.issues || [];
+      codes.slice(0, 2).forEach(function (code) {
+        var bad = isErrorCode(data, code);
+        var mark = el("span", "sup-mark " + (bad ? "bad" : "warn"));
+        mark.appendChild(el("span", "g", bad ? "✕" : "!"));
+        mark.appendChild(el("span", null,
+          (data.issue_short || {})[code]
+          || (data.issue_labels || {})[code] || code));
+        flags.appendChild(mark);
+      });
+      if (codes.length > 2) {
+        flags.appendChild(el("span", "sup-mark hint", "+" + (codes.length - 2)));
+      }
+      if (!codes.length) flags.appendChild(el("span", "sup-mark hint", "всё прочитано"));
+      tr.appendChild(flags);
+    }
+
+    // РАСКРЫТИЕ — НАСТОЯЩАЯ КНОПКА С КЛАВИАТУРЫ. Не строка-клик и не иконка
+    // без имени: `aria-expanded` и `aria-controls` описывают состояние и цель,
+    // подпись меняется вместе с состоянием, а `Tab`/`Enter`/`Space` работают
+    // потому, что это `button`, а не потому, что мы обработали клавиши сами.
+    var act = el("td", "sup-act");
+    var btn = el("button", "btn sm", "Подробнее");
+    btn.type = "button";
+    btn.setAttribute("aria-expanded", "false");
+    btn.setAttribute("aria-controls", panelId);
+    var det = detailNode(r, data, sizes, panelId);
+    btn.addEventListener("click", function () {
+      var open = det.hidden;
+      det.hidden = !open;
+      btn.setAttribute("aria-expanded", open ? "true" : "false");
+      btn.textContent = open ? "Свернуть" : "Подробнее";
+    });
+    act.appendChild(btn);
+    tr.appendChild(act);
+
+    return [tr, det];
   }
 
   function renderRows(data, append) {
     var body = document.getElementById("sup-rows");
     if (!append) clear(body);
     var labels = data.size_labels || ["XS", "S", "M", "L", "XL"];
-    (data.rows || []).forEach(function (r) { body.appendChild(rowNode(r, labels)); });
+    (data.rows || []).forEach(function (r) {
+      var pair = rowNode(r, data, labels);
+      body.appendChild(pair[0]);
+      body.appendChild(pair[1]);
+    });
     if (!body.firstChild) {
       var tr = el("tr");
-      var td = el("td", "hint", data.configured
-        ? "В этом фильтре строк нет."
-        : "Источник ещё не читался.");
+      var td = el("td", "hint", !data.configured
+        ? "Источник ещё не читался."
+        : ((data.q || "").trim()
+            ? ("По запросу «" + data.q + "» в этом фильтре ничего не нашлось. "
+               + "Поиск идёт по наименованию, артикулу и цвету.")
+            : "В этом фильтре строк нет."));
       td.colSpan = SUP_COLUMNS;
       tr.appendChild(td);
       body.appendChild(tr);
     }
     shown = (append ? shown : 0) + (data.rows || []).length;
-    document.getElementById("sup-total").textContent =
-      data.configured ? ("показано " + shown + " из " + data.total) : "";
+    // «Из скольки» — это размер ВСЕГО применимого набора, а не число
+    // загруженных строк: сервер применяет лист, очередь и поиск к целому
+    // снимку до нарезки на страницы. Когда идёт поиск, это сказано словами —
+    // иначе «из 3» рядом с «Все строки 79» выглядит опечаткой.
+    var totalLine = document.getElementById("sup-total");
+    if (!data.configured) {
+      totalLine.textContent = "";
+    } else if ((data.q || "").trim()) {
+      totalLine.textContent = "показано " + shown + " из " + data.total
+        + ", найденных по запросу «" + data.q + "»";
+    } else {
+      totalLine.textContent = "показано " + shown + " из " + data.total;
+    }
     var more = document.getElementById("sup-more");
     more.style.display = shown < data.total ? "" : "none";
     // Кнопку выключил `resetView` на входе в переход; успешный вид её
@@ -781,12 +1343,17 @@ document.addEventListener("DOMContentLoaded", function () {
   // после успешного ответа: активный фильтр обязан описывать то, что на экране
   // сейчас, — а сейчас там пустой/загружающийся вид нового фильтра.
   function markChips() {
-    var bar = document.getElementById("sup-filters");
-    [].forEach.call(bar.querySelectorAll(".sup-chip"), function (b) {
-      var on = b.getAttribute("data-kind") === "queue"
+    [].forEach.call(document.querySelectorAll("#sup-queues button,"
+                                              + " #sup-sheets button"), function (b) {
+      var queue = b.getAttribute("data-kind") === "queue";
+      var on = queue
         ? state.queue === b.getAttribute("data-value")
         : state.sheet === b.getAttribute("data-value");
-      b.className = "sup-chip" + (on ? " on" : "");
+      // Классы у двух групп разные: очередь — сегментированный переключатель
+      // общей дизайн-системы, листы — чипы. `aria-pressed` ставится обеим:
+      // подсветка это цвет, а состояние кнопки должно читаться и без него.
+      b.className = queue ? (on ? "on" : "") : ("chip" + (on ? " active" : ""));
+      b.setAttribute("aria-pressed", on ? "true" : "false");
     });
   }
 
@@ -814,10 +1381,11 @@ document.addEventListener("DOMContentLoaded", function () {
     // страницы вперёд при двух ответах в полёте, а любая ошибка оставляла его
     // сдвинутым — и следующий клик перепрыгивал непоказанную страницу.
     var offset = append ? requestedOffset : 0;
-    var q = "?queue=" + encodeURIComponent(state.queue) +
-            "&offset=" + offset + "&limit=" + state.limit +
-            (state.sheet ? "&sheet=" + encodeURIComponent(state.sheet) : "");
-    return api("/api/supply/sheets" + q).then(function (data) {
+    var qs = "?queue=" + encodeURIComponent(state.queue) +
+             "&offset=" + offset + "&limit=" + state.limit +
+             (state.sheet ? "&sheet=" + encodeURIComponent(state.sheet) : "") +
+             (state.q ? "&q=" + encodeURIComponent(state.q) : "");
+    return api("/api/supply/sheets" + qs).then(function (data) {
       if (myGen !== gen) return STALE;   // поздний ответ прежнего вида — молча
       var hash = data.content_sha256 || "";
       if (append && hash !== (viewHash || "")) {
@@ -846,10 +1414,11 @@ document.addEventListener("DOMContentLoaded", function () {
         clear(note);
         note.appendChild(el("b", null, data.disclaimer));
         note.appendChild(el("span", null,
-          " Это то, что сейчас написано в вашей производственной таблице, как есть. " +
-          "«Оборот» ничего отсюда не заказывает, ни с чем не связывает и в расчёты не берёт."));
+          " Строки отсюда не становятся заказами и не входят в «Едет», «В заказе», "
+          + "оборачиваемость, бюджет и прогноз. Этапов производства, готовности и "
+          + "автоматической сверки с каталогом раздел не считает."));
       }
-      if (!append) renderForm(data);
+      if (!append) { renderSourceBar(data); renderForm(data); }
       renderState(data);
       renderError(data);
       renderSummary(data);
@@ -894,6 +1463,52 @@ document.addEventListener("DOMContentLoaded", function () {
       if (gen === myGen) moreBtn.disabled = false;
     });
   });
+
+  // ПОИСК ХОДИТ ТОЙ ЖЕ ДВЕРЬЮ, ЧТО И ФИЛЬТРЫ. Он сужает тот же набор и на
+  // сервере, поэтому обязан подчиняться тем же правилам: поколение растёт,
+  // позиция обнуляется, старые строки снимаются с экрана. Иначе к строкам
+  // прежнего запроса дописался бы хвост нового.
+  //
+  // Поле ввода при этом НЕ ПЕРЕРИСОВЫВАЕТСЯ ни разу: оно стоит в разметке, а
+  // не создаётся ответом. Поэтому фокус и каретка переживают и удачный ответ, и
+  // отказ 400 — человек продолжает печатать там же, где печатал.
+  var qInput = document.getElementById("sup-q");
+  var qClear = document.getElementById("sup-q-clear");
+  var qTimer = null;
+
+  function paintClear() {
+    qClear.style.display = qInput.value ? "" : "none";
+  }
+
+  function applySearch() {
+    var value = qInput.value.trim();
+    if (value === state.q) return;          // тот же запрос — тот же экран
+    switchView(function () { state.q = value; });
+  }
+
+  qInput.addEventListener("input", function () {
+    paintClear();
+    // Задержка нужна затем, чтобы «платье» не превратилось в шесть запросов и
+    // шесть смен поколения. Ввод она не теряет: значение читается в момент
+    // срабатывания, а не в момент нажатия клавиши.
+    if (qTimer) clearTimeout(qTimer);
+    qTimer = setTimeout(applySearch, 300);
+  });
+  qInput.addEventListener("keydown", function (e) {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      if (qTimer) clearTimeout(qTimer);
+      applySearch();
+    }
+  });
+  qClear.addEventListener("click", function () {
+    if (qTimer) clearTimeout(qTimer);
+    qInput.value = "";
+    paintClear();
+    qInput.focus();
+    applySearch();
+  });
+  paintClear();
 
   // Первая загрузка идёт той же дверью: если она не удалась, человек получает
   // не пустую таблицу без объяснений, а причину и кнопку повтора.

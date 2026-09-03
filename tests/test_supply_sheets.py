@@ -315,6 +315,32 @@ def next_rows() -> list:
 AUTUMN_CSV = to_csv(autumn_rows())
 NEXT_CSV = to_csv(next_rows())
 
+
+def bulk_autumn_rows(platya: int = 60, dzhempery: int = 6) -> list:
+    """Много строк-якорей на наблюдённом каркасе «Осень 26».
+
+    Нужны затем, что поиск обязан работать по ВСЕМУ набору снимка, а не по
+    загруженной странице, и доказать это можно только на наборе, который в одну
+    страницу не помещается: при `limit=50` и 60 совпадениях «до пагинации» и
+    «после» дают разные числа, и разница видна.
+
+    Каркас заголовка тот же наблюдённый (`autumn_header_rows`), содержимое
+    выдумано: живых данных и PII здесь нет.
+    """
+    rows = autumn_header_rows()
+    for i in range(platya):
+        rows.append(put(blank(), {
+            2: f"PL-{i:04d}", 3: f"Платье миди {i}", 5: "Изумрудный",
+            10: "1", 11: "2", 12: "3", 13: "2", 14: "1", 15: "9"}))
+    for i in range(dzhempery):
+        rows.append(put(blank(), {
+            2: f"DZ-{i:04d}", 3: f"Джемпер оверсайз {i}", 5: "Молочный",
+            10: "1", 11: "1", 12: "1", 13: "1", 14: "1", 15: "5"}))
+    return rows
+
+
+BULK_CSV = to_csv(bulk_autumn_rows())
+
 SPREADSHEET_ID = "1AbCdEf_ghijklmnop-QRSTUV0123456789wxyz"
 SHEET_URL = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit#gid=0"
 
@@ -2300,18 +2326,41 @@ def structural_checks(owner) -> None:
     check("и при расхождении перезапускает вид с начала, а не дописывает",
           "switchView(null);" in template.split("if (append && hash !==")[1]
           .split("return STALE;")[0])
-    check("цена источника выводится сырой отдельной ячейкой",
-          'el("td", "sup-raw sup-price", r.price_raw || "—")' in template)
-    check("и у неё есть своя подпись в шапке",
-          "<th>Цена источника</th>" in template)
+    # ЦЕНА ИСТОЧНИКА ПЕРЕЕХАЛА В ПОДРОБНОСТИ СТРОКИ, А НЕ ИСЧЕЗЛА (SUPPLY-UX-1.1).
+    # Свойство, которое защищает эта проверка, прежнее и не ослаблено: то, что
+    # человек написал в колонке цены, обязано быть ВИДНО и обязано остаться
+    # СЫРЫМ текстом — без числа, валюты и перевода в рубли или в цену за штуку.
+    # Изменилось только место: в плотной строке свободный текст источника не
+    # живёт вовсе, иначе строка снова вырастет до трёхсот пикселей.
+    check("цена источника выводится сырым текстом в подробностях строки",
+          'def(dl, "Цена источника",' in template
+          and "r.price_raw" in template.split('def(dl, "Цена источника",')[1][:400])
+    # И НАЗЫВАЕТСЯ ВСЕГДА, даже когда в источнике пусто: прочерк отличает
+    # «в таблице цены нет» от «предпросмотр её потерял». Ровно потерей цены и
+    # было замечание ревью PR #47 (thread r3903352252).
+    check("и поле цены названо даже тогда, когда цены в источнике нет",
+          '"—"' in template.split('def(dl, "Цена источника",')[1][:400])
+    check("и рядом сказано, что это не рубли и не цена за штуку",
+          "без валюты и без "
+          in template.split('def(dl, "Цена источника",')[1][:400]
+          and "в цену за штуку" in template)
+    check("а в плотной строке свободного текста источника нет вовсе",
+          all(field not in template.split("function rowNode(")[1]
+              .split("function renderRows(")[0]
+              for field in ("comments_raw", "price_raw", "components_raw",
+                            "production_raw", "unknown_raw")),
+          "свободный текст вернулся в плотную строку")
     check("ширина «широких» строк не выписана числом в трёх местах",
           "colSpan = 13" not in template and "colSpan = 12" not in template
           and template.count("SUP_COLUMNS") >= 4)
     check("кнопка обновления восстанавливается при ЛЮБОМ исходе",
           ".then(restore, restore);" in template)
     check("неполный итог штук называется словами, а не числом",
-          "не определено · прочитано" in template
+          "Прочитано не всё" in template
+          and "Это не весь объём поставки." in template
           and "quantity_complete" in template)
+    check("а полный итог не называется объёмом поставки",
+          "Сумма распознанных размеров." in template)
     # `static/app.js` подключён с `defer`: его `api()` появляется ПОСЛЕ разбора
     # блока `scripts`. Запуск без ожидания `DOMContentLoaded` означал не
     # «иногда медленнее», а «страница мертва всегда»: она падала на
@@ -3247,6 +3296,17 @@ def stored_counts_checks() -> None:  # noqa: C901 — матрица подме�
          "needs_review": 1, "invalid": 0, "quantity": None,
          "quantity_known": 0, "quantity_complete": False},
     ]
+    # ЧТЕНИЕ И НОСИТЕЛЬ РАСХОДЯТСЯ РОВНО НА ОДНО ПОЛЕ, И ЭТО ПРОВЕРЯЕТСЯ, А НЕ
+    # ПОДРАЗУМЕВАЕТСЯ. `quantity_unknown_rows` — подпись для экрана: сколько
+    # строк набора не дали своего количества. Она выводится тем же предикатом,
+    # которым уже считается `quantity_complete`, живёт ТОЛЬКО на чтении и в
+    # носитель не пишется: добавить поле в сохраняемый снимок значило бы
+    # изменить снимок ради подписи.
+    TRUE_SHEETS_VIEW = [
+        {**TRUE_SHEETS[0], "quantity_unknown_rows": 3},
+        {**TRUE_SHEETS[1], "quantity_unknown_rows": 1},
+    ]
+    TRUE_TOTAL_VIEW = {**TRUE_TOTAL, "quantity_unknown_rows": 4}
 
     # Ложь СЕГОДНЯШНЕЙ формы: все поля на месте, все нужного типа, все врут.
     # Прежний `_counts_are_current` пропускал ровно такую сводку целиком.
@@ -3263,9 +3323,9 @@ def stored_counts_checks() -> None:  # noqa: C901 — матрица подме�
         check("исходный снимок создан", r.status_code == 200, r.text[:120])
         honest = liar.get("/api/supply/sheets?limit=200").json()["counts"]
         check("честная сводка совпала с выписанной в тесте истиной",
-              all(honest.get(k) == v for k, v in TRUE_TOTAL.items())
-              and honest.get("sheets") == TRUE_SHEETS,
-              json.dumps({k: honest.get(k) for k in TRUE_TOTAL},
+              all(honest.get(k) == v for k, v in TRUE_TOTAL_VIEW.items())
+              and honest.get("sheets") == TRUE_SHEETS_VIEW,
+              json.dumps({k: honest.get(k) for k in TRUE_TOTAL_VIEW},
                          ensure_ascii=False))
         # Сохранённая сводка продолжает ПИСАТЬСЯ, и это не рудимент: старый код
         # после отката релиза читает её напрямую. Убрать её из носителя было бы
@@ -3278,6 +3338,11 @@ def stored_counts_checks() -> None:  # noqa: C901 — матрица подме�
               and stored_counts.get("sheets") == TRUE_SHEETS,
               json.dumps({k: stored_counts.get(k) for k in TRUE_TOTAL},
                          ensure_ascii=False))
+        check("а подпись для экрана в носитель не уехала",
+              "quantity_unknown_rows" not in stored_counts
+              and all("quantity_unknown_rows" not in s
+                      for s in stored_counts["sheets"]),
+              json.dumps(stored_counts, ensure_ascii=False)[:160])
 
         fakes = {
             "числа лгут, форма сегодняшняя": {
@@ -3318,11 +3383,12 @@ def stored_counts_checks() -> None:  # noqa: C901 — матрица подме�
 
             check(f"{label}: верхние числа — пересчитанные, а не сохранённые",
                   all(counts.get(k, "нет ключа") == v
-                      for k, v in TRUE_TOTAL.items()),
-                  json.dumps({k: counts.get(k, "нет ключа") for k in TRUE_TOTAL},
+                      for k, v in TRUE_TOTAL_VIEW.items()),
+                  json.dumps({k: counts.get(k, "нет ключа")
+                              for k in TRUE_TOTAL_VIEW},
                              ensure_ascii=False))
             check(f"{label}: листы, их имена и порядок — тоже",
-                  counts.get("sheets") == TRUE_SHEETS,
+                  counts.get("sheets") == TRUE_SHEETS_VIEW,
                   json.dumps(counts.get("sheets"), ensure_ascii=False)[:220])
             check(f"{label}: и ложное число на экран не попало",
                   json.dumps(counts, ensure_ascii=False).find("4242") == -1,
@@ -5280,6 +5346,189 @@ def non_finite_number_checks() -> None:  # noqa: C901 — матрица пут�
         boss.close()
 
 
+# ── SUPPLY-UX-1.1: поиск по снимку ──────────────────────────────────────────
+
+def search_checks() -> None:  # noqa: C901 — сценарная матрица, ветвлений мало
+    """Поиск сужает ВЕСЬ применимый набор, а не загруженную страницу.
+
+    Зачем это отдельный набор, а не пара проверок. Поиск, приделанный к уже
+    загруженным строкам, выглядит рабочим ровно до 51-й строки: человек ищет
+    «платье», видит «показано 12 из 12» — и не знает, что за пределами первой
+    страницы лежат ещё сорок восемь таких же. Ложное «12 из 12» хуже
+    отсутствия поиска: отсутствие видно, а неполнота нет.
+
+    Поэтому доказательство строится на наборе, который в страницу НЕ
+    помещается: 60 совпадений при `limit=50`. «До пагинации» и «после» дают
+    здесь разные числа, и любая будущая правка, вернувшая поиск внутрь
+    страницы, покрасит эти проверки в красный.
+
+    Отдельно проверяется, что поиск ничего не пишет и никуда не ходит: он
+    читает уже проверенный снимок в памяти, и GET обязан остаться GET.
+    """
+    print("\n== Поиск: по всему набору снимка, до нарезки на страницы ==")
+    seeker = client()
+    seeker.post("/register", data={"name": "Поиск", "email": "sheets-q@test.io",
+                                   "password": "secret123", "org_name": "Бренд-П"})
+    seeker.post("/api/connect/demo")
+    org_id = sql("SELECT org_id FROM memberships WHERE user_id ="
+                 " (SELECT id FROM users WHERE email = 'sheets-q@test.io')")[0][0]
+    conn_id = sql("SELECT id FROM connections WHERE org_id = ? ORDER BY id",
+                  org_id)[0][0]
+
+    def get(**params) -> dict:
+        return seeker.get("/api/supply/sheets", params=params).json()
+
+    ss.set_transport(FakeGoogle({SHEET_CURRENT: BULK_CSV, SHEET_NEXT: NEXT_CSV}))
+    r = seeker.post("/api/supply/sheets/refresh",
+                    json={"spreadsheet_url": SHEET_URL,
+                          "sheet_names": [SHEET_CURRENT, SHEET_NEXT]})
+    check("снимок на 67 строк создан", r.status_code == 200, r.text[:140])
+
+    plain = get(limit=50)
+    check("без поиска показана первая страница целого снимка",
+          plain["total"] == 67 and len(plain["rows"]) == 50,
+          f"total={plain['total']} rows={len(plain['rows'])}")
+
+    # ГЛАВНАЯ ПРОВЕРКА ПАКЕТА. Шестьдесят совпадений при `limit=50`: если бы
+    # поиск шёл по загруженной странице, `total` был бы 50 или меньше, а второй
+    # страницы не существовало бы вовсе.
+    found = get(q="платье", limit=50)
+    check("поиск считает ВЕСЬ набор, а не загруженные 50",
+          found["total"] == 60, f"total={found['total']}")
+    check("а показывает ровно страницу", len(found["rows"]) == 50,
+          str(len(found["rows"])))
+    check("и все показанные строки — совпавшие",
+          all("Платье" in (row.get("name") or "") for row in found["rows"]),
+          str([row.get("name") for row in found["rows"][:3]]))
+
+    tail = get(q="платье", limit=50, offset=50)
+    check("вторая страница поиска существует и досчитывает до 60",
+          tail["total"] == 60 and len(tail["rows"]) == 10,
+          f"total={tail['total']} rows={len(tail['rows'])}")
+    seen = ([row["source_row"] for row in found["rows"]]
+            + [row["source_row"] for row in tail["rows"]])
+    check("две страницы поиска не пересекаются и покрывают все 60",
+          len(seen) == 60 and len(set(seen)) == 60, str(len(set(seen))))
+
+    check("запрос возвращается в ответе тем же, каким пришёл",
+          found.get("q") == "платье", repr(found.get("q")))
+
+    upper = get(q="ПЛАТЬЕ", limit=1)
+    padded = get(q="  платье  ", limit=1)
+    check("регистр не важен", upper["total"] == 60, str(upper["total"]))
+    check("внешние пробелы не важны", padded["total"] == 60, str(padded["total"]))
+
+    other = get(q="джемпер", limit=200)
+    check("другой запрос — другой набор", other["total"] == 6, str(other["total"]))
+    empty = get(q="такого текста в снимке нет", limit=200)
+    check("ничего не нашлось — это ноль, а не вся таблица",
+          empty["total"] == 0 and empty["rows"] == [], str(empty["total"]))
+
+    # Поиск НИЧЕГО не пишет и НИКУДА не ходит: снимок уже лежит в носителе.
+    before = sql("SELECT config_json FROM connections WHERE id = ?", conn_id)[0][0]
+    watcher = FakeGoogle({SHEET_CURRENT: BULK_CSV, SHEET_NEXT: NEXT_CSV})
+    ss.set_transport(watcher)
+    get(q="платье", limit=200)
+    after = sql("SELECT config_json FROM connections WHERE id = ?", conn_id)[0][0]
+    check("поиск не тронул носителя ни на байт", before == after)
+    check("и не сделал ни одного сетевого вызова", watcher.calls == [],
+          str(watcher.calls[:2]))
+
+    # ── Поиск на наблюдённой фикстуре: наследование, разделители, сочетания ──
+    ss.set_transport(FakeGoogle())
+    r = seeker.post("/api/supply/sheets/refresh",
+                    json={"spreadsheet_url": SHEET_URL,
+                          "sheet_names": [SHEET_CURRENT, SHEET_NEXT]})
+    check("снимок наблюдённой фикстуры создан", r.status_code == 200, r.text[:140])
+
+    coat = get(q="пальто", limit=200)
+    coat_rows = sorted(row["source_row"] for row in coat["rows"])
+    # Строка 4 — продолжение строки 3: собственная ячейка наименования у неё
+    # пуста, а позиция та же. Человек, который ищет позицию, ищет ВСЕ её
+    # строки, поэтому поиск идёт по `name`/`article`, а не по `*_raw`.
+    check("продолжение находится вместе со своим якорем",
+          coat_rows == [3, 4], str(coat_rows))
+
+    art = get(q="1077", limit=200)
+    art_rows = sorted(row["source_row"] for row in art["rows"])
+    check("поиск по артикулу находит якорь и его продолжение",
+          art_rows == [7, 8], str(art_rows))
+
+    colour = get(q="молоко", limit=200)
+    colour_rows = sorted(row["source_row"] for row in colour["rows"])
+    check("поиск по цвету находит свою строку", colour_rows == [4],
+          str(colour_rows))
+
+    all_rows = get(limit=200)
+    check("без поиска пустая строка-разделитель на месте",
+          any(row["is_blank"] for row in all_rows["rows"]), "разделителя нет")
+    check("а непустому запросу разделитель не соответствует никогда",
+          not any(row["is_blank"] for row in coat["rows"] + art["rows"]))
+
+    with_queue = get(q="1077", queue="invalid", limit=200)
+    queue_rows = sorted(row["source_row"] for row in with_queue["rows"])
+    check("поиск и очередь пересекаются, а не заменяют друг друга",
+          queue_rows == [7], str(queue_rows))
+
+    on_next = get(q="пуховик", sheet=SHEET_NEXT, limit=200)
+    on_current = get(q="пуховик", sheet=SHEET_CURRENT, limit=200)
+    check("поиск и лист тоже пересекаются",
+          on_next["total"] == 1 and on_current["total"] == 0,
+          f"{on_next['total']} / {on_current['total']}")
+
+    # Негодный запрос — управляемый отказ, а не 500 и не порча носителя.
+    long_q = "я" * (ss.MAX_SEARCH_CHARS + 1)
+    bad = seeker.get("/api/supply/sheets", params={"q": long_q})
+    check("слишком длинный запрос отклоняется управляемо",
+          bad.status_code in (400, 422), f"{bad.status_code} {bad.text[:100]}")
+    check("и снимок при этом читается по-прежнему",
+          seeker.get("/api/supply/sheets").status_code == 200)
+    session = SessionLocal()
+    try:
+        surrogate = raises(
+            lambda: ss.preview(session, org_id, role="owner",
+                               q=json.loads('"\\ud800"')),
+            ss.ValidationError)
+    finally:
+        session.close()
+    check("непредставимый запрос — ошибка ВВОДА, а не порча носителя",
+          "поисковом запросе" in surrogate, surrogate[:120])
+
+    # Закрытые списки подписей и объяснений: ровно те же коды, что и раньше.
+    view = get(limit=1)
+    check("объяснение есть у каждого кода неоднозначности и лишних нет",
+          set(view["issue_help"]) == set(view["issue_labels"]),
+          str(sorted(set(view["issue_help"]) ^ set(view["issue_labels"]))))
+    check("короткая пометка — тоже у каждого и только у них",
+          set(view["issue_short"]) == set(view["issue_labels"]),
+          str(sorted(set(view["issue_short"]) ^ set(view["issue_labels"]))))
+    joined = " ".join(view["issue_help"].values()).lower()
+    check("объяснения не обещают срыва производства и не требуют править источник",
+          not any(word in joined for word in
+                  ("срыв", "задерж", "исправьте таблиц", "удалите колонк",
+                   "переделайте")),
+          joined[:160])
+
+    # Неполнота названа ЧИСЛОМ на чтении и не уехала в носитель.
+    counts = view["counts"]
+    stored = json.loads(sql("SELECT config_json FROM connections WHERE id = ?",
+                            conn_id)[0][0])[ss.ENVELOPE_KEY]["counts"]
+    check("на чтении видно, у скольких строк количество не прочиталось",
+          isinstance(counts.get("quantity_unknown_rows"), int)
+          and counts["quantity_unknown_rows"] > 0,
+          repr(counts.get("quantity_unknown_rows")))
+    check("у каждого листа это число тоже своё",
+          all(isinstance(s.get("quantity_unknown_rows"), int)
+              for s in counts["sheets"]),
+          str([s.get("quantity_unknown_rows") for s in counts["sheets"]]))
+    check("а в носитель оно НЕ пишется: сохранённый снимок прежней формы",
+          "quantity_unknown_rows" not in stored
+          and all("quantity_unknown_rows" not in s for s in stored["sheets"]),
+          json.dumps(stored, ensure_ascii=False)[:160])
+
+    seeker.close()
+
+
 # ── Прогон ──────────────────────────────────────────────────────────────────
 
 def run() -> int:
@@ -5316,6 +5565,7 @@ def run() -> int:
 
     refresh_checks(owner, org_id)
     first_failure_checks()
+    search_checks()
     safe_error_checks()
     attempt_privacy_checks()
     failure_privacy_checks()
