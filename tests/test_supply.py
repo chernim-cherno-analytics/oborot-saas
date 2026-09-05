@@ -544,9 +544,89 @@ def api_checks() -> None:  # noqa: C901 — сценарный тест: шаг�
           "cc_batch_id" not in (ROOT / "app" / "ms_sync.py").read_text(encoding="utf-8"))
 
 
+def qty_split_checks() -> None:
+    """A06: общее количество позиции против её размерной разбивки.
+
+    Дефект, воспроизведённый на BASE `ea1caff`: `OrderItemIn` проверял размеры
+    только поштучно (не отрицательные, не запредельные), а сумму с общим `qty`
+    не сверял вовсе. Строка «qty=10, sizes={M:20}» принималась и сохранялась,
+    после чего документ поставщику собирался ИЗ РАЗБИВКИ
+    (`ms_writeback._item_size_breakdown`): подрядчику 20, владельцу на экране 10.
+
+    Здесь это проверяется на самой модели — без сервера и без базы, чтобы
+    контракт входа был зафиксирован там, где он объявлен. Сквозной путь
+    (HTTP → сохранение → отправка) закрыт в `tests/test_writeback.py`.
+
+    Отдельно фиксируется то, что правка НЕ меняет: пустая, отсутствующая и
+    полностью нулевая разбивка остаются безразмерной позицией, где `qty` стоит
+    сам за себя (`qty=10, sizes={}` — поддержанный и используемый случай).
+    """
+    from pydantic import ValidationError
+
+    from app.api import OrderItemIn
+    from app.ms_writeback import _item_size_breakdown, size_split_total
+
+    print("\n== A06: разбивка по размерам обязана сходиться с количеством ==")
+
+    def accepted(qty: int, sizes: dict | None) -> tuple[bool, str]:
+        payload = {"base_name": "Куртка «Шов»", "qty": qty, "cost": 100}
+        if sizes is not None:
+            payload["sizes"] = sizes
+        try:
+            OrderItemIn(**payload)
+            return True, ""
+        except ValidationError as exc:
+            return False, str(exc)
+
+    ok, err = accepted(10, {"M": 20})
+    check("qty=10 против sizes={M:20} отклонено", not ok, err[:120])
+    check("в отказе названы ОБА числа, а не выбрано «правильное»",
+          not ok and "10" in err and "20" in err and "не выбираем" in err, err[:200])
+
+    ok, _ = accepted(3, {"S": 2, "M": 1})
+    check("согласованная разбивка (3 = 2+1) принята", ok)
+    ok, _ = accepted(10, {})
+    check("безразмерная позиция qty=10, sizes={} принята (контракт не тронут)", ok)
+    ok, _ = accepted(10, None)
+    check("позиция вовсе без ключа sizes принята", ok)
+    ok, _ = accepted(10, {"M": 0})
+    check("полностью нулевые размеры — это НЕ разбивка, qty=10 принят", ok)
+    ok, _ = accepted(10, {"S": 10, "M": 0})
+    check("нулевой размер рядом с непустым разбивку не ломает (10 = 10+0)", ok)
+    ok, _ = accepted(0, {"M": 0})
+    check("qty=0 при полностью нулевых размерах принят как раньше", ok)
+    ok, err = accepted(0, {"M": 5})
+    check("qty=0 против sizes={M:5} отклонено, а не отброшено молча",
+          not ok, err[:120])
+
+    # Проверка и отправка обязаны читать разбивку ОДНИМ кодом: если они
+    # разойдутся в том, что считать разбивкой, вернётся ровно тот же дефект.
+    for qty, sizes in ((10, {}), (10, {"M": 0}), (10, {"S": 10}), (3, {"S": 2, "M": 1})):
+        item = {"base_name": "Куртка «Шов»", "qty": qty, "sizes": sizes}
+        split = size_split_total(item)
+        expected = sum(q for _s, q in _item_size_breakdown(item))
+        check(f"size_split_total согласован с _item_size_breakdown "
+              f"(qty={qty}, sizes={sizes})",
+              (split is None and expected == qty) or split == expected,
+              f"split={split} breakdown={expected}")
+
+    # План собирает разбивку сам (`analytics.size_split`, largest remainder),
+    # и её сумма равна количеству по построению — новый вход этот путь не
+    # ломает. Проверяется тем же кодом, что применяет план к заказу.
+    from app.analytics import size_split
+    grid = {"S": {"sold365": 7}, "M": {"sold365": 3}, "L": {"sold365": 0}}
+    for qty in (0, 1, 2, 7, 10, 41, 1000):
+        got = size_split(grid, qty)
+        total = sum(got.values())
+        check(f"size_split даёт ровно qty={qty} (путь «применить план»)",
+              (qty <= 0 and got == {}) or total == qty,
+              f"split={got} sum={total}")
+
+
 def run() -> int:
     migration_checks()
     api_checks()
+    qty_split_checks()
     print(f"\nИТОГО: {len(PASS)} OK, {len(FAIL)} FAIL")
     for name in FAIL:
         print(f"  FAIL {name}")
