@@ -48,6 +48,7 @@ import httpx  # noqa: E402
 import uvicorn  # noqa: E402
 
 import mock_ms  # noqa: E402
+from app import ms_writeback  # noqa: E402
 from app.main import app as oborot_app  # noqa: E402
 
 
@@ -145,6 +146,37 @@ def _set_items_json(order_id: int, items: list[dict]) -> None:
     try:
         con.execute("UPDATE production_orders SET items_json = ? WHERE id = ?",
                     (json.dumps(items, ensure_ascii=False), order_id))
+        con.commit()
+    finally:
+        con.close()
+
+
+def _clear_agent_binding() -> str:
+    """Снять закрепление контрагента у организации; вернуть прежний href.
+
+    Так моделируется «новый поставщик»: у организации ещё нет закреплённого
+    подрядчика, и resolve_agent пошла бы его ИСКАТЬ, а не найдя — создавать.
+    Служебный ms_agent_sync_id намеренно не трогаем: без него resolve_agent
+    отказала бы раньше и совсем по другой причине.
+    """
+    con = sqlite3.connect(DB_PATH, timeout=30)
+    try:
+        row = con.execute(
+            "SELECT ms_agent_href FROM connections "
+            "WHERE kind = 'moysklad' AND org_id = 1").fetchone()
+        con.execute("UPDATE connections SET ms_agent_href = '' "
+                    "WHERE kind = 'moysklad' AND org_id = 1")
+        con.commit()
+        return (row[0] if row else "") or ""
+    finally:
+        con.close()
+
+
+def _restore_agent_binding(href: str) -> None:
+    con = sqlite3.connect(DB_PATH, timeout=30)
+    try:
+        con.execute("UPDATE connections SET ms_agent_href = ? "
+                    "WHERE kind = 'moysklad' AND org_id = 1", (href,))
         con.commit()
     finally:
         con.close()
@@ -887,6 +919,56 @@ def run_scenario() -> int:
     check("и документ в МойСкладе появился ровно один",
           len(mock_ms.CREATED_PURCHASE_ORDERS) == docs_before_a06 + 1,
           f"{docs_before_a06} -> {len(mock_ms.CREATED_PURCHASE_ORDERS)}")
+
+    print("== A06: mismatch + новый поставщик → ни одной внешней записи ==")
+    # Отказ «до создания документа» сам по себе ещё не значит «без побочных
+    # внешних записей»: выше по push_order стоит resolve_agent, а он при
+    # нулевом совпадении СОЗДАЁТ контрагента (ms_writeback.resolve_agent,
+    # шаг 3). Для нового поставщика это значит заведённого в чужом аккаунте
+    # подрядчика ради заказа, который мы всё равно не отправим.
+    #
+    # «Новый поставщик» моделируется честно: снимаем закрепление контрагента
+    # у организации и убираем его из мира mock-МойСклада, оставив служебный
+    # syncId (без него resolve_agent отказала бы раньше, по другой причине).
+    r = client.post("/api/orders", json={
+        "name": "A06 новый поставщик", "eta_date": None, "items": [
+            {"base_name": "Худи «Штрих»", "qty": 2, "sizes": {"S": 2}, "cost": 3600},
+        ],
+    })
+    check("заказ для проверки «нового поставщика» создан", r.status_code == 200,
+          f"status={r.status_code} body={r.text[:200]}")
+    order_a06b = r.json()["id"]
+    _set_items_json(order_a06b, [
+        {"base_name": "Худи «Штрих»", "qty": 2, "sizes": {"S": 7}, "cost": 3600}])
+
+    agent_href_saved = _clear_agent_binding()
+    cps_saved = list(mock_ms.COUNTERPARTIES)
+    mock_ms.COUNTERPARTIES[:] = [cp for cp in mock_ms.COUNTERPARTIES
+                                 if cp.get("name") != ms_writeback.AGENT_NAME]
+    check("подготовка: контрагента «Производство» в МойСкладе нет",
+          not any(cp.get("name") == ms_writeback.AGENT_NAME
+                  for cp in mock_ms.COUNTERPARTIES),
+          f"counterparties={[cp.get('name') for cp in mock_ms.COUNTERPARTIES]}")
+    cps_before = len(mock_ms.COUNTERPARTIES)
+    docs_before_a06b = len(mock_ms.CREATED_PURCHASE_ORDERS)
+
+    r = client.post(f"/api/orders/{order_a06b}/push-to-ms")
+    check("mismatch у нового поставщика → 409", r.status_code == 409,
+          f"status={r.status_code} body={r.text[:200]}")
+    check("НИ ОДНОГО нового контрагента не заведено (resolve_agent не дошла)",
+          len(mock_ms.COUNTERPARTIES) == cps_before,
+          f"{cps_before} -> {len(mock_ms.COUNTERPARTIES)}: "
+          f"{[cp.get('name') for cp in mock_ms.COUNTERPARTIES]}")
+    check("и документа тоже нет",
+          len(mock_ms.CREATED_PURCHASE_ORDERS) == docs_before_a06b,
+          f"{docs_before_a06b} -> {len(mock_ms.CREATED_PURCHASE_ORDERS)}")
+    check("заказ не заперт: пометка отправки снята",
+          not (_order_href(order_a06b) or ""), f"href={_order_href(order_a06b)!r}")
+
+    # Мир возвращается как был — следующие блоки набора не должны видеть
+    # последствий этой подготовки.
+    mock_ms.COUNTERPARTIES[:] = cps_saved
+    _restore_agent_binding(agent_href_saved)
 
     print("== Демо-режим и изоляция ==")
     docs_before_demo = len(mock_ms.CREATED_PURCHASE_ORDERS)
