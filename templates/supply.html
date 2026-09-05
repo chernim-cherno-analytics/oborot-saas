@@ -188,6 +188,67 @@
 
      `.card-head` здесь переносит подпись области на свою строку: во флекс-ряду
      рядом с заголовком она сжималась в колонку по два-три слова. */
+  /* ── SUPPLY-3: план производства ────────────────────────────────────────
+     Мобильный экран здесь первичен, и это не лозунг: план ведут стоя у стола
+     раскроя, а не за монитором. Поэтому ни одной обязательной широкой таблицы
+     в разделе нет вовсе — карточка материала и карточка партии складываются в
+     столбик и читаются на 390 px без горизонтальной прокрутки. */
+  .sup-tabs { display: flex; gap: 6px; margin-bottom: 12px; flex-wrap: wrap; }
+  .sup-tab { border: 1px solid var(--line); background: var(--surface);
+             color: var(--ink-2); border-radius: 8px; padding: 7px 14px;
+             font-size: 13px; font-weight: 600; cursor: pointer; }
+  .sup-tab[aria-selected="true"] { background: var(--ink); color: #fff;
+                                   border-color: var(--ink); }
+
+  .pl-next { font-size: 13.5px; line-height: 1.5; color: var(--ink);
+             padding: 10px 12px; border-radius: 10px;
+             background: var(--line-soft); }
+  .pl-next.ok { color: var(--ink-2); }
+  .pl-list { display: flex; flex-direction: column; gap: 8px; }
+  .pl-card { border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px;
+             background: var(--surface); }
+  .pl-card .t { font-size: 13.5px; font-weight: 700; color: var(--ink);
+                display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+  .pl-card .sub { font-size: 12px; color: var(--ink-3); margin-top: 2px;
+                  line-height: 1.45; }
+  .pl-nums { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 6px;
+             font-size: 12.5px; color: var(--ink-2); }
+  .pl-nums b { color: var(--ink); font-variant-numeric: tabular-nums; }
+  .pl-nums .unknown { color: var(--ink-3); font-style: italic; }
+  .pl-warn { margin-top: 6px; font-size: 12px; line-height: 1.45;
+             color: var(--amber, #b96e00); }
+  .pl-warn::before { content: "⚠ "; }
+  .pl-tag { display: inline-block; font-size: 11px; font-weight: 700;
+            padding: 1px 7px; border-radius: 6px; background: var(--line-soft);
+            color: var(--ink-2); }
+  .pl-sketch { width: 44px; height: 44px; object-fit: cover; border-radius: 8px;
+               border: 1px solid var(--line); background: var(--line-soft); }
+  .pl-row { display: flex; gap: 10px; align-items: flex-start; }
+  .pl-row .grow { flex: 1 1 auto; min-width: 0; }
+  .pl-assign { font-size: 12.5px; color: var(--ink-2); padding: 4px 0;
+               border-top: 1px dashed var(--line); margin-top: 6px;
+               display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .pl-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+  .pl-empty { font-size: 13px; color: var(--ink-2); line-height: 1.5;
+              padding: 14px 12px; border: 1px dashed var(--line);
+              border-radius: 10px; }
+  .pl-form { margin-top: 10px; padding-top: 10px;
+             border-top: 1px solid var(--line-soft);
+             display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; }
+  .pl-field { display: flex; flex-direction: column; gap: 4px; min-width: 180px;
+              flex: 1 1 180px; }
+  .pl-field.wide { flex: 1 1 100%; }
+  .pl-field label { font-size: 12px; color: var(--ink-3); font-weight: 500; }
+  .pl-field input, .pl-field select, .pl-field textarea {
+      width: 100%; padding: 7px 10px; border: 1px solid var(--line);
+      border-radius: 8px; background: var(--surface); font-size: 13px;
+      color: var(--ink); font-family: inherit; }
+  .pl-hint { font-size: 11.5px; color: var(--ink-3); line-height: 1.4;
+             flex: 1 1 100%; }
+  .pl-form-err { flex: 1 1 100%; font-size: 12.5px; line-height: 1.45;
+                 color: var(--red, #d92b2b); }
+  .pl-saving { font-size: 12px; color: var(--ink-3); }
+
   @media (max-width: 640px) {
     .sup-wrap .card-body { padding: 12px; }
     .sup-wrap .card + .card { margin-top: 10px; }
@@ -208,6 +269,88 @@
 </style>
 
 <div class="sup-wrap">
+
+  {# ДВА РАЗДЕЛА НА ОДНОЙ СТРАНИЦЕ, И ПЕРЕКЛЮЧАТЕЛЬ НАЗЫВАЕТ ИХ СВОИМИ ИМЕНАМИ.
+     «План» — то, что человек ведёт сам: материал, вещь, плановая партия, срок.
+     «Предпросмотр таблицы» — read-only чтение чужого источника (SUPPLY-2), он
+     остаётся доступен целиком и ничем не урезан. Разные разделы, потому что
+     это разные виды правды: одно человек решил, другое он прочитал у себя в
+     таблице. Смешать их в один список значило бы выдать намерение за факт
+     источника. #}
+  <div class="sup-tabs" role="tablist" aria-label="Разделы поставок">
+    <button class="sup-tab" id="sup-tab-plan" role="tab" type="button"
+            aria-selected="true" aria-controls="sup-view-plan">План производства</button>
+    <button class="sup-tab" id="sup-tab-preview" role="tab" type="button"
+            aria-selected="false" aria-controls="sup-view-preview">Предпросмотр таблицы</button>
+  </div>
+
+  <div id="sup-view-plan" role="tabpanel" aria-labelledby="sup-tab-plan">
+
+    {# НАЗНАЧЕНИЕ РАЗДЕЛА ПЛАНА. Плановая партия похожа на заказ ровно
+       настолько, чтобы её с ним спутать, поэтому граница названа первой
+       строкой и повторена подписью с сервера. #}
+    <section class="card">
+      <div class="card-body">
+        <div class="sup-h">План производства</div>
+        <div class="sup-lead">Материал можно завести до того, как решено, что из
+          него шьют. Дальше — вещь своего каталога или новинка с эскизом,
+          плановая партия, назначенный на неё метраж, план изделий и срок.</div>
+        <div class="sup-limit" id="pl-note">
+          <b>Плановая партия — это намерение, а не заказ.</b>
+          Она не создаёт партию «Оборота», не получает её номер и не входит
+          в «Едет», «В заказе», потребность и бюджет.
+        </div>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="card-head"><h2>Сейчас</h2><div class="spacer"></div>
+        <span class="hint" id="pl-summary"></span></div>
+      <div class="card-body">
+        <div class="pl-next" id="pl-next">Загрузка…</div>
+        <div class="sup-err" id="pl-error" style="display:none;"></div>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="card-head"><h2>Материалы</h2><div class="spacer"></div>
+        <span class="hint" id="pl-mat-count"></span></div>
+      <div class="card-body">
+        <div class="pl-list" id="pl-materials"></div>
+        <div class="pl-empty" id="pl-mat-empty" hidden>
+          Материалов пока нет. Начните с ткани — вещь и партию можно выбрать позже.
+        </div>
+        <div class="pl-actions" id="pl-mat-actions">
+          <button class="btn sm primary" id="pl-add-material" type="button"
+                  aria-expanded="false" aria-controls="pl-mat-form">Добавить материал</button>
+        </div>
+        <form class="pl-form" id="pl-mat-form" hidden></form>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="card-head"><h2>Вещи и плановые партии</h2><div class="spacer"></div>
+        <span class="hint" id="pl-batch-count"></span></div>
+      <div class="card-body">
+        <div class="pl-list" id="pl-batches"></div>
+        <div class="pl-empty" id="pl-batch-empty" hidden>
+          Плановых партий пока нет. Выберите вещь каталога или заведите новинку —
+          и запланируйте, сколько шьёте.
+        </div>
+        <div class="pl-actions" id="pl-batch-actions">
+          <button class="btn sm" id="pl-add-item" type="button"
+                  aria-expanded="false" aria-controls="pl-item-form">Добавить вещь</button>
+          <button class="btn sm" id="pl-add-batch" type="button"
+                  aria-expanded="false" aria-controls="pl-batch-form">Создать плановую партию</button>
+        </div>
+        <form class="pl-form" id="pl-item-form" hidden></form>
+        <form class="pl-form" id="pl-batch-form" hidden></form>
+      </div>
+    </section>
+
+  </div>
+
+  <div id="sup-view-preview" role="tabpanel" aria-labelledby="sup-tab-preview" hidden>
 
   {# НАЗНАЧЕНИЕ РАЗДЕЛА СКАЗАНО ПОЛОЖИТЕЛЬНО, А ГРАНИЦА — РЯДОМ И ЧЕСТНО.
      Прежняя редакция открывалась одним предупреждением о том, чем раздел НЕ
@@ -298,6 +441,8 @@
       </div>
     </div>
   </section>
+
+  </div>
 
 </div>
 {% endblock %}
@@ -1514,5 +1659,655 @@ document.addEventListener("DOMContentLoaded", function () {
   // не пустую таблицу без объяснений, а причину и кнопку повтора.
   switchView(null);
 });
+</script>
+
+<script>
+// ── SUPPLY-3: план производства ─────────────────────────────────────────────
+//
+// ПОЧЕМУ ЭТОТ БЛОК ОТДЕЛЬНЫЙ, А НЕ ДОПИСАН В СКРИПТ ПРЕДПРОСМОТРА. Предпросмотр
+// читает ЧУЖОЙ источник и не пишет ничего; план — наоборот, целиком про записи
+// человека. Общего состояния у них нет, и склеивание двух наборов правил в
+// одну функцию рано или поздно кончилось бы тем, что отказ одного гасит экран
+// другого.
+//
+// ВСЁ СТРОИТСЯ DOM-API, А НЕ СБОРКОЙ РАЗМЕТКИ СТРОКАМИ. Названия материалов и
+// новинок человек пишет сам, и через `innerHTML` они стали бы разметкой. То же
+// правило, что в предпросмотре, и по той же причине.
+(function () {
+  var PL = {
+    board: null,
+    saving: false,          // один запрос записи в полёте
+    open: {},               // какие формы раскрыты
+    catalog: [],
+  };
+
+  function el(tag, cls, text) {
+    var n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text !== undefined && text !== null) n.textContent = text;
+    return n;
+  }
+  function clear(node) { while (node && node.firstChild) node.removeChild(node.firstChild); }
+  function byId(id) { return document.getElementById(id); }
+
+  // Идентификатор ПОСТУПКА. Он рождается в момент нажатия и не меняется при
+  // повторе: сервер по нему узнаёт, что это тот же самый поступок, а не второй
+  // такой же. Без него двойной клик создал бы два материала (и два назначения).
+  function opId() {
+    return "op-" + Date.now().toString(36) + "-" +
+           Math.random().toString(36).slice(2, 10);
+  }
+
+  function fmt(value) {
+    if (value === null || value === undefined) return "неизвестно";
+    var n = Number(value);
+    if (!isFinite(n)) return "неизвестно";
+    return String(Math.round(n * 1000) / 1000);
+  }
+
+  function field(labelText, node, wide) {
+    var box = el("div", "pl-field" + (wide ? " wide" : ""));
+    var lab = el("label", null, labelText);
+    var fid = node.id || ("pl-f-" + Math.random().toString(36).slice(2, 8));
+    node.id = fid;
+    lab.setAttribute("for", fid);
+    box.appendChild(lab);
+    box.appendChild(node);
+    return box;
+  }
+  function input(id, attrs) {
+    var n = el("input");
+    n.type = (attrs && attrs.type) || "text";
+    if (id) n.id = id;
+    if (attrs && attrs.placeholder) n.placeholder = attrs.placeholder;
+    if (attrs && attrs.value) n.value = attrs.value;
+    if (attrs && attrs.maxLength) n.maxLength = attrs.maxLength;
+    n.className = "";
+    return n;
+  }
+
+  function setError(where, message) {
+    var box = byId(where);
+    if (!box) return;
+    clear(box);
+    if (!message) { box.style.display = "none"; return; }
+    box.style.display = "";
+    box.appendChild(el("b", null, "Не сохранено. "));
+    box.appendChild(el("span", null, message));
+  }
+
+  // ЕДИНСТВЕННАЯ ДВЕРЬ К ЗАПИСИ. Один запрос в полёте: повторный клик по той же
+  // кнопке не уходит вторым запросом вовсе, а `op_id` защищает от того случая,
+  // когда второй клик всё-таки долетел (две вкладки, медленная сеть).
+  function send(url, body, formErrId, done) {
+    if (PL.saving) return;
+    PL.saving = true;
+    paintSaving(true);
+    setError("pl-error", "");
+    if (formErrId) setError(formErrId, "");
+    // `api()` сериализует тело сам (static/app.js) — передавать сюда уже
+    // готовую строку значило бы закодировать её ВТОРОЙ раз, и сервер получил
+    // бы строку вместо объекта.
+    api(url, {method: "POST", body: body})
+      .then(function (data) {
+        PL.board = data;
+        render();
+        if (done) done(true);
+      })
+      .catch(function (err) {
+        var msg = (err && err.message) ? err.message : "Попробуйте ещё раз.";
+        setError(formErrId || "pl-error", msg);
+        if (done) done(false);
+      })
+      .then(function () { PL.saving = false; paintSaving(false); });
+  }
+
+  function paintSaving(on) {
+    ["pl-add-material", "pl-add-item", "pl-add-batch"].forEach(function (id) {
+      var b = byId(id);
+      if (b) b.disabled = on;
+    });
+    document.querySelectorAll(".pl-form button[type=submit]").forEach(function (b) {
+      b.disabled = on;
+      b.textContent = on ? "Сохраняем…" : (b.dataset.label || b.textContent);
+    });
+  }
+
+  function disclosure(buttonId, formId, build) {
+    var btn = byId(buttonId), form = byId(formId);
+    if (!btn || !form) return;
+    btn.addEventListener("click", function () {
+      var willOpen = form.hidden;
+      form.hidden = !willOpen;
+      btn.setAttribute("aria-expanded", willOpen ? "true" : "false");
+      if (willOpen) {
+        build(form);
+        var first = form.querySelector("input, select, textarea");
+        if (first) first.focus();
+      } else {
+        clear(form);
+      }
+    });
+  }
+
+  function submitRow(label, formErrId) {
+    var wrap = el("div", "pl-field wide");
+    var btn = el("button", "btn sm primary", label);
+    btn.type = "submit";
+    btn.dataset.label = label;
+    wrap.appendChild(btn);
+    var err = el("div", "pl-form-err");
+    err.id = formErrId;
+    err.style.display = "none";
+    wrap.appendChild(err);
+    return wrap;
+  }
+
+  // ── Формы ─────────────────────────────────────────────────────────────────
+
+  function buildMaterialForm(form) {
+    clear(form);
+    var title = input("pl-mat-title", {placeholder: "Например: костюмная шерсть", maxLength: 200});
+    var qty = input("pl-mat-qty", {placeholder: "100"});
+    var unit = input("pl-mat-unit", {value: "м", maxLength: 16});
+    var note = input("pl-mat-note", {placeholder: "поставщик, счёт, комментарий", maxLength: 500});
+    form.appendChild(field("Название материала", title, true));
+    form.appendChild(field("Количество", qty));
+    form.appendChild(field("Единица", unit));
+    form.appendChild(field("Источник или комментарий", note, true));
+    var hint = el("div", "pl-hint",
+      "Количество можно не указывать: «неизвестно» так и останется неизвестным, "
+      + "нулём оно не станет.");
+    form.appendChild(hint);
+    form.appendChild(submitRow("Сохранить материал", "pl-mat-err"));
+    form.onsubmit = function (ev) {
+      ev.preventDefault();
+      send("/api/supply/planning/materials", {
+        title: title.value, qty: qty.value, unit: unit.value,
+        source_note: note.value, op_id: opId(),
+      }, "pl-mat-err", function (ok) {
+        if (ok) { form.hidden = true; clear(form);
+                  byId("pl-add-material").setAttribute("aria-expanded", "false"); }
+      });
+    };
+  }
+
+  function buildItemForm(form) {
+    clear(form);
+    var kind = el("select");
+    kind.id = "pl-item-kind";
+    [["catalog", "Вещь моего каталога"], ["draft", "Новинка (в каталоге ещё нет)"]]
+      .forEach(function (pair) {
+        var o = el("option", null, pair[1]);
+        o.value = pair[0];
+        kind.appendChild(o);
+      });
+    var pick = el("select");
+    pick.id = "pl-item-base";
+    var title = input("pl-item-title", {placeholder: "рабочее название новинки", maxLength: 200});
+    var file = el("input");
+    file.type = "file";
+    file.id = "pl-item-sketch";
+    file.accept = "image/jpeg,image/png";
+    var note = input("pl-item-note", {placeholder: "заметка", maxLength: 500});
+
+    var fCatalog = field("Вещь каталога", pick, true);
+    var fTitle = field("Название новинки", title, true);
+    var fSketch = field("Эскиз (JPEG или PNG, приватный)", file, true);
+
+    form.appendChild(field("Что это", kind, true));
+    form.appendChild(fCatalog);
+    form.appendChild(fTitle);
+    form.appendChild(fSketch);
+    form.appendChild(field("Заметка", note, true));
+    form.appendChild(el("div", "pl-hint",
+      "Два одинаковых названия — это две разные вещи: «Оборот» их не склеивает."));
+    form.appendChild(submitRow("Сохранить вещь", "pl-item-err"));
+
+    function paintKind() {
+      var isCatalog = kind.value === "catalog";
+      fCatalog.hidden = !isCatalog;
+      fTitle.hidden = isCatalog;
+      fSketch.hidden = isCatalog;
+    }
+    kind.addEventListener("change", paintKind);
+    paintKind();
+
+    clear(pick);
+    (PL.catalog || []).forEach(function (opt) {
+      var o = el("option", null, opt.base_name + " · размеров: " + opt.sizes);
+      o.value = opt.base_name;
+      pick.appendChild(o);
+    });
+    if (!(PL.catalog || []).length) {
+      var o = el("option", null, "в каталоге пока пусто");
+      o.value = "";
+      pick.appendChild(o);
+    }
+
+    form.onsubmit = function (ev) {
+      ev.preventDefault();
+      var body = {kind: kind.value, note: note.value, op_id: opId()};
+      if (kind.value === "catalog") {
+        body.base_name = pick.value;
+        send("/api/supply/planning/items", body, "pl-item-err", function (ok) {
+          if (ok) { form.hidden = true; clear(form);
+                    byId("pl-add-item").setAttribute("aria-expanded", "false"); }
+        });
+        return;
+      }
+      body.title = title.value;
+      // Эскиз уходит отдельным запросом ДО создания вещи: файл — это байты, а
+      // не поле JSON, и мешать их в одном теле значило бы кодировать картинку
+      // в текст ради удобства кода.
+      if (file.files && file.files.length) {
+        if (PL.saving) return;
+        PL.saving = true; paintSaving(true);
+        var fd = new FormData();
+        fd.append("file", file.files[0]);
+        fetch("/api/supply/planning/sketches", {
+          method: "POST", body: fd, credentials: "same-origin",
+          headers: {"X-Oborot-CSRF": "1"},
+        }).then(function (r) {
+          return r.json().then(function (j) { return {ok: r.ok, j: j}; });
+        }).then(function (res) {
+          PL.saving = false; paintSaving(false);
+          if (!res.ok) {
+            setError("pl-item-err", (res.j && res.j.detail) || "Эскиз не принят.");
+            return;
+          }
+          body.sketch_id = res.j.sketch_id;
+          send("/api/supply/planning/items", body, "pl-item-err", function (ok) {
+            if (ok) { form.hidden = true; clear(form);
+                      byId("pl-add-item").setAttribute("aria-expanded", "false"); }
+          });
+        }).catch(function () {
+          PL.saving = false; paintSaving(false);
+          setError("pl-item-err", "Эскиз не удалось отправить.");
+        });
+        return;
+      }
+      send("/api/supply/planning/items", body, "pl-item-err", function (ok) {
+        if (ok) { form.hidden = true; clear(form);
+                  byId("pl-add-item").setAttribute("aria-expanded", "false"); }
+      });
+    };
+  }
+
+  function dueFields(form, prefix, current) {
+    var kind = el("select");
+    kind.id = prefix + "-due-kind";
+    [["unknown", "срок неизвестен"], ["approx", "ориентировочно"],
+     ["exact", "точная дата"], ["text", "своими словами"]].forEach(function (p) {
+      var o = el("option", null, p[1]);
+      o.value = p[0];
+      kind.appendChild(o);
+    });
+    var text = input(prefix + "-due-text", {placeholder: "например: к середине ноября", maxLength: 255});
+    var date = input(prefix + "-due-date", {type: "date"});
+    var source = input(prefix + "-due-source", {placeholder: "кто сказал: цех, поставщик, свой расчёт", maxLength: 255});
+    var fText = field("Срок словами", text, true);
+    var fDate = field("Дата", date);
+    var fSource = field("Источник срока", source, true);
+    form.appendChild(field("Срок", kind, true));
+    form.appendChild(fText);
+    form.appendChild(fDate);
+    form.appendChild(fSource);
+    form.appendChild(el("div", "pl-hint",
+      "Ориентир — нормальный ответ. «Оборот» не превращает срок в просрочку и "
+      + "ничего не подставляет за вас."));
+    function paint() {
+      fText.hidden = (kind.value === "unknown" || kind.value === "exact");
+      fDate.hidden = kind.value !== "exact";
+      fSource.hidden = kind.value === "unknown";
+    }
+    kind.addEventListener("change", paint);
+    if (current) {
+      kind.value = current.due_kind || "unknown";
+      text.value = current.due_text || "";
+      date.value = current.due_date || "";
+      source.value = current.due_source || "";
+    }
+    paint();
+    return function () {
+      return {due_kind: kind.value, due_text: text.value,
+              due_date: date.value, due_source: source.value};
+    };
+  }
+
+  function buildBatchForm(form) {
+    clear(form);
+    var item = el("select");
+    item.id = "pl-batch-item";
+    (PL.board && PL.board.items || []).forEach(function (it) {
+      var o = el("option", null, it.title + (it.kind === "draft" ? " (новинка)" : ""));
+      o.value = String(it.id);
+      item.appendChild(o);
+    });
+    if (!(PL.board && PL.board.items || []).length) {
+      var o = el("option", null, "сначала добавьте вещь");
+      o.value = "";
+      item.appendChild(o);
+    }
+    var title = input("pl-batch-title", {placeholder: "например: первая партия", maxLength: 200});
+    var qty = input("pl-batch-qty", {placeholder: "30"});
+    form.appendChild(field("Вещь", item, true));
+    form.appendChild(field("Название партии", title, true));
+    form.appendChild(field("План изделий, шт", qty));
+    var readDue = dueFields(form, "pl-batch", null);
+    form.appendChild(el("div", "pl-hint",
+      "План изделий вводится отдельно и из метража НЕ выводится: расход ткани "
+      + "на изделие «Оборот» не знает и не выдумывает."));
+    form.appendChild(submitRow("Создать плановую партию", "pl-batch-err"));
+    form.onsubmit = function (ev) {
+      ev.preventDefault();
+      var body = {item_id: item.value, title: title.value, plan_qty: qty.value,
+                  op_id: opId()};
+      var due = readDue();
+      for (var k in due) { if (due.hasOwnProperty(k)) body[k] = due[k]; }
+      send("/api/supply/planning/batches", body, "pl-batch-err", function (ok) {
+        if (ok) { form.hidden = true; clear(form);
+                  byId("pl-add-batch").setAttribute("aria-expanded", "false"); }
+      });
+    };
+  }
+
+
+  // ── Отрисовка ─────────────────────────────────────────────────────────────
+
+  function materialCard(m) {
+    var card = el("div", "pl-card");
+    var head = el("div", "t");
+    head.appendChild(el("span", null, m.title));
+    if (!m.qty_known) head.appendChild(el("span", "pl-tag", "количество неизвестно"));
+    card.appendChild(head);
+    if (m.source_note) card.appendChild(el("div", "sub", m.source_note));
+
+    var nums = el("div", "pl-nums");
+    var all = el("span", null, "всего: ");
+    if (m.qty_known) all.appendChild(el("b", null, fmt(m.qty) + " " + m.unit));
+    else all.appendChild(el("span", "unknown", "неизвестно"));
+    nums.appendChild(all);
+
+    var used = el("span", null, "назначено: ");
+    used.appendChild(el("b", null, fmt(m.assigned) + " " + m.unit));
+    nums.appendChild(used);
+
+    var free = el("span", null, "свободно: ");
+    if (m.free_known) free.appendChild(el("b", null, fmt(m.free) + " " + m.unit));
+    // ОСТАТОК НЕИЗВЕСТНОГО — НЕИЗВЕСТЕН. Вычитать назначенное из незнания
+    // нечего, и показать здесь число значило бы придумать его.
+    else free.appendChild(el("span", "unknown", "неизвестно"));
+    nums.appendChild(free);
+    card.appendChild(nums);
+
+    if (m.warning) card.appendChild(el("div", "pl-warn", m.warning));
+
+    if (PL.board && PL.board.can_write) {
+      var actions = el("div", "pl-actions");
+      var assign = el("button", "btn sm", "Назначить на партию");
+      assign.type = "button";
+      assign.dataset.material = String(m.id);
+      assign.setAttribute("aria-expanded", "false");
+      assign.addEventListener("click", function () {
+        toggleInline(card, assign, function (box) { buildAssignForm(box, m); });
+      });
+      actions.appendChild(assign);
+
+      var edit = el("button", "btn sm", "Уточнить количество");
+      edit.type = "button";
+      edit.setAttribute("aria-expanded", "false");
+      edit.addEventListener("click", function () {
+        toggleInline(card, edit, function (box) { buildMaterialQtyForm(box, m); });
+      });
+      actions.appendChild(edit);
+      card.appendChild(actions);
+    }
+    return card;
+  }
+
+  function toggleInline(card, button, build) {
+    var existing = card.querySelector(".pl-form.inline");
+    if (existing) {
+      card.removeChild(existing);
+      button.setAttribute("aria-expanded", "false");
+      return;
+    }
+    var box = el("form", "pl-form inline");
+    card.appendChild(box);
+    button.setAttribute("aria-expanded", "true");
+    build(box);
+    var first = box.querySelector("input, select, textarea");
+    if (first) first.focus();
+  }
+
+  function buildAssignForm(form, material) {
+    var batches = (PL.board && PL.board.batches) || [];
+    if (!batches.length) {
+      form.appendChild(el("div", "pl-hint",
+        "Плановых партий ещё нет — создайте партию, и материал будет куда назначить."));
+      return;
+    }
+    var pick = el("select");
+    batches.forEach(function (b) {
+      var o = el("option", null, (b.title || b.item_title) + " · " + b.item_title);
+      o.value = String(b.id);
+      pick.appendChild(o);
+    });
+    var qty = input(null, {placeholder: "40"});
+    form.appendChild(field("Плановая партия", pick, true));
+    form.appendChild(field("Метраж, " + material.unit, qty));
+    form.appendChild(el("div", "pl-hint",
+      "Это план, а не расход: назначить можно и больше, чем в наличии — "
+      + "«Оборот» предупредит числом, но не запретит и не спишет."));
+    form.appendChild(submitRow("Назначить", "pl-assign-err"));
+    form.onsubmit = function (ev) {
+      ev.preventDefault();
+      send("/api/supply/planning/assignments", {
+        material_id: material.id, batch_id: pick.value, qty: qty.value,
+        op_id: opId(),
+      }, "pl-assign-err");
+    };
+  }
+
+  function buildMaterialQtyForm(form, material) {
+    var qty = input(null, {value: material.qty_known ? fmt(material.qty) : "",
+                           placeholder: "оставьте пустым, если неизвестно"});
+    form.appendChild(field("Количество, " + material.unit, qty, true));
+    form.appendChild(submitRow("Сохранить", "pl-matq-err"));
+    form.onsubmit = function (ev) {
+      ev.preventDefault();
+      send("/api/supply/planning/materials/" + material.id + "/update",
+           {qty: qty.value, rev: material.rev, op_id: opId()}, "pl-matq-err");
+    };
+  }
+
+  function batchCard(b) {
+    var card = el("div", "pl-card");
+    var row = el("div", "pl-row");
+    if (b.item_sketch_id) {
+      var img = el("img", "pl-sketch");
+      img.src = "/api/supply/planning/sketches/" + b.item_sketch_id;
+      img.alt = "Эскиз: " + b.item_title;
+      img.loading = "lazy";
+      row.appendChild(img);
+    }
+    var grow = el("div", "grow");
+    var head = el("div", "t");
+    head.appendChild(el("span", null, b.title || b.item_title));
+    head.appendChild(el("span", "pl-tag", "плановая партия"));
+    if (b.item_kind === "draft") head.appendChild(el("span", "pl-tag", "новинка"));
+    grow.appendChild(head);
+    grow.appendChild(el("div", "sub", "вещь: " + b.item_title));
+
+    var nums = el("div", "pl-nums");
+    var plan = el("span", null, "план: ");
+    if (b.plan_known) plan.appendChild(el("b", null, fmt(b.plan_qty) + " шт"));
+    else plan.appendChild(el("span", "unknown", "не задан"));
+    nums.appendChild(plan);
+    var due = el("span", null, "срок: ");
+    due.appendChild(b.due_kind === "unknown"
+      ? el("span", "unknown", "неизвестен")
+      : el("b", null, b.due_label));
+    nums.appendChild(due);
+    if (b.due_source) nums.appendChild(el("span", null, "источник: " + b.due_source));
+    if (b.due_author) nums.appendChild(el("span", null, "внёс: " + b.due_author));
+    grow.appendChild(nums);
+    row.appendChild(grow);
+    card.appendChild(row);
+
+    (b.assignments || []).forEach(function (a) {
+      var line = el("div", "pl-assign");
+      line.appendChild(el("span", null, a.material_title + " — " + fmt(a.qty) + " " + a.unit));
+      if (PL.board && PL.board.can_write) {
+        var move = el("button", "btn sm", "Перенести");
+        move.type = "button";
+        move.addEventListener("click", function () {
+          toggleInline(card, move, function (box) { buildMoveForm(box, a, b); });
+        });
+        line.appendChild(move);
+        var drop = el("button", "btn sm", "Снять");
+        drop.type = "button";
+        drop.addEventListener("click", function () {
+          send("/api/supply/planning/assignments/" + a.id + "/delete",
+               {rev: a.rev, op_id: opId()}, null);
+        });
+        line.appendChild(drop);
+      }
+      card.appendChild(line);
+    });
+
+    if (PL.board && PL.board.can_write) {
+      var actions = el("div", "pl-actions");
+      var edit = el("button", "btn sm", "План и срок");
+      edit.type = "button";
+      edit.setAttribute("aria-expanded", "false");
+      edit.addEventListener("click", function () {
+        toggleInline(card, edit, function (box) { buildBatchEditForm(box, b); });
+      });
+      actions.appendChild(edit);
+      card.appendChild(actions);
+    }
+    return card;
+  }
+
+  function buildMoveForm(form, assignment, fromBatch) {
+    var others = ((PL.board && PL.board.batches) || []).filter(function (b) {
+      return b.id !== fromBatch.id;
+    });
+    if (!others.length) {
+      form.appendChild(el("div", "pl-hint",
+        "Переносить некуда: другой плановой партии пока нет."));
+      return;
+    }
+    var pick = el("select");
+    others.forEach(function (b) {
+      var o = el("option", null, (b.title || b.item_title) + " · " + b.item_title);
+      o.value = String(b.id);
+      pick.appendChild(o);
+    });
+    var qty = input(null, {value: fmt(assignment.qty)});
+    form.appendChild(field("Куда перенести", pick, true));
+    form.appendChild(field("Сколько, " + assignment.unit, qty));
+    form.appendChild(submitRow("Перенести", "pl-move-err"));
+    form.onsubmit = function (ev) {
+      ev.preventDefault();
+      send("/api/supply/planning/assignments/move", {
+        assignment_id: assignment.id, to_batch_id: pick.value, qty: qty.value,
+        rev: assignment.rev, op_id: opId(),
+      }, "pl-move-err");
+    };
+  }
+
+  function buildBatchEditForm(form, b) {
+    var qty = input(null, {value: b.plan_known ? fmt(b.plan_qty) : "",
+                           placeholder: "оставьте пустым, если неизвестно"});
+    form.appendChild(field("План изделий, шт", qty, true));
+    var readDue = dueFields(form, "pl-edit-" + b.id, b);
+    form.appendChild(submitRow("Сохранить", "pl-batch-edit-err"));
+    form.onsubmit = function (ev) {
+      ev.preventDefault();
+      var body = {plan_qty: qty.value, rev: b.rev, op_id: opId()};
+      var due = readDue();
+      for (var k in due) { if (due.hasOwnProperty(k)) body[k] = due[k]; }
+      send("/api/supply/planning/batches/" + b.id + "/update", body,
+           "pl-batch-edit-err");
+    };
+  }
+
+  function render() {
+    var data = PL.board;
+    if (!data) return;
+    var next = byId("pl-next");
+    clear(next);
+    next.className = "pl-next" + (data.next_step.code === "ok" ? " ok" : "");
+    next.appendChild(el("b", null, "Следующий шаг: "));
+    next.appendChild(el("span", null, data.next_step.text));
+
+    var s = data.summary;
+    var parts = [
+      "материалов " + s.materials,
+      "плановых партий " + s.batches,
+      "свободно " + fmt(s.free_known) + " м",
+      "план " + fmt(s.plan_known) + " шт",
+    ];
+    if (s.unknown_materials) parts.push("без количества " + s.unknown_materials);
+    if (s.due_unknown) parts.push("без срока " + s.due_unknown);
+    byId("pl-summary").textContent = parts.join(" · ");
+
+    var mats = byId("pl-materials");
+    clear(mats);
+    (data.materials || []).forEach(function (m) { mats.appendChild(materialCard(m)); });
+    byId("pl-mat-empty").hidden = (data.materials || []).length > 0;
+    byId("pl-mat-count").textContent = (data.materials || []).length + " шт";
+    byId("pl-mat-actions").hidden = !data.can_write;
+
+    var batches = byId("pl-batches");
+    clear(batches);
+    (data.batches || []).forEach(function (b) { batches.appendChild(batchCard(b)); });
+    byId("pl-batch-empty").hidden = (data.batches || []).length > 0;
+    byId("pl-batch-count").textContent = (data.batches || []).length + " шт";
+    byId("pl-batch-actions").hidden = !data.can_write;
+  }
+
+  function loadBoard() {
+    api("/api/supply/planning").then(function (data) {
+      PL.board = data;
+      setError("pl-error", "");
+      render();
+    }).catch(function (err) {
+      setError("pl-error", (err && err.message) || "Не удалось загрузить план.");
+    });
+    api("/api/supply/planning/catalog").then(function (data) {
+      PL.catalog = (data && data.options) || [];
+    }).catch(function () { PL.catalog = []; });
+  }
+
+  function switchTab(which) {
+    var isPlan = which === "plan";
+    byId("sup-view-plan").hidden = !isPlan;
+    byId("sup-view-preview").hidden = isPlan;
+    byId("sup-tab-plan").setAttribute("aria-selected", isPlan ? "true" : "false");
+    byId("sup-tab-preview").setAttribute("aria-selected", isPlan ? "false" : "true");
+  }
+
+  function start() {
+    byId("sup-tab-plan").addEventListener("click", function () { switchTab("plan"); });
+    byId("sup-tab-preview").addEventListener("click", function () { switchTab("preview"); });
+    disclosure("pl-add-material", "pl-mat-form", buildMaterialForm);
+    disclosure("pl-add-item", "pl-item-form", buildItemForm);
+    disclosure("pl-add-batch", "pl-batch-form", buildBatchForm);
+    loadBoard();
+  }
+
+  // Та же причина отложенного запуска, что у предпросмотра: `static/app.js`
+  // подключён с `defer` и выполняется ПОСЛЕ этого блока, поэтому `api()` при
+  // разборе ещё не существует.
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", start);
+  } else {
+    start();
+  }
+})();
 </script>
 {% endblock %}

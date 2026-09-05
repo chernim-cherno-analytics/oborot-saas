@@ -31,6 +31,7 @@ from app.routes_extra import router as extra_router
 from app.routes_ms_app import router as ms_app_router
 from app.routes_ms_vendor import router as ms_vendor_router
 from app.routes_supply import router as supply_router
+from app.routes_supply_planning import router as supply_planning_router
 from app.db import get_db, init_db, record_migration_step, validate_migration_step
 from app.models import Connection, Membership, Org, Product, ProductionOrder, Sale, User
 
@@ -56,6 +57,7 @@ app.include_router(ms_app_router)
 # роутер, а не ветка в api.py: этот слой не имеет права трогать заказы,
 # «Едет» и формулы, и физическая отдельность делает это проверяемым.
 app.include_router(supply_router)
+app.include_router(supply_planning_router)
 
 
 def _csrf_reject():
@@ -224,6 +226,12 @@ STARTUP_SCHEMA_STEPS: tuple[tuple[str, int], ...] = (
     # журнале, и порядок относительно будущих миграций журнал бы не удержал.
     # Девять строк выше при этом не тронуты — ни id, ни позиция.
     ("models.ensure_supply_schema", 10),
+    # SUPPLY-3 (планирование: материал, вещь, плановая партия, назначения).
+    # Снова дописан В КОНЕЦ новым id и позицией 11: смысл новый, значит и
+    # пара (id, позиция) новая. Десять строк выше не тронуты — ни id, ни
+    # позиция, иначе старт на боевой базе упал бы MigrationLedgerConflict,
+    # и это не дефект, а замок.
+    ("models.ensure_supply_planning_schema", 11),
 )
 _STARTUP_STEP_ORDER = dict(STARTUP_SCHEMA_STEPS)
 
@@ -404,6 +412,11 @@ def _startup() -> None:
     # шаг записан, и вылечить её обязан следующий старт.
     from app import models as _models
     _startup_step("models.ensure_supply_schema", _models.ensure_supply_schema)
+    # SUPPLY-3: аддитивные таблицы планирования. Шаг тоже идемпотентен и
+    # тоже выполняется на каждом старте: `create_all` создаёт только
+    # отсутствующие таблицы, а частичный индекс идёт под IF NOT EXISTS.
+    _startup_step("models.ensure_supply_planning_schema",
+                  _models.ensure_supply_planning_schema)
     # Замок на пропуск: все объявленные шаги выполнены, и ровно они.
     _finish_startup_steps()
     global _STARTUP_DONE

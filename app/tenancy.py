@@ -75,15 +75,29 @@ def org_purge_models() -> tuple:
         SkuDiscount,
         SkuHidden,
         StockDay,
+        SupplyAssignment,
+        SupplyBatch,
+        SupplyEvent,
+        SupplyItem,
+        SupplyMaterial,
+        SupplySketch,
         SyncState,
         Warehouse,
         WarehouseStock,
     )
     from app.routes_extra import BillingRequest
 
+    # SUPPLY-3 идёт ОДНИМ блоком и в порядке «от зависимых к корневым»:
+    # назначение ссылается на материал и на партию, партия — на вещь, вещь —
+    # на эскиз. Обратный порядок в Postgres упал бы на внешнем ключе, и
+    # `purge_order_violations()` ловит это раньше человека. Журнал
+    # (`SupplyEvent`) ни на что не ссылается и стирается первым: он про
+    # строки, которых после удаления не будет.
     return (
         Sale, StockDay, WarehouseStock, OrderedQty, ReplenishDraft,
         ProductionAssign, OrderPlan, OrderReceipt, ProductionOrder, Production,
+        SupplyEvent, SupplyAssignment, SupplyBatch, SupplyItem,
+        SupplyMaterial, SupplySketch,
         SkuHidden, SkuCategoryOverride, CategoryMerge, SkuDiscount,
         NotifySettings, SyncState, BillingRequest,
         Product, Warehouse, Connection, Membership,

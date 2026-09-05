@@ -187,12 +187,17 @@ def migration_checks() -> None:
           "cc_batch_id" in split_cols, f"cols={sorted(split_cols)}")
     split.dispose()
 
-    # Шаг объявлен в append-only реестре старта: терминальный, с новым id и
-    # новой позицией, а девять выпущенных пар (id, позиция) не тронуты.
+    # Шаг объявлен в append-only реестре старта со своим id и своей позицией, а
+    # девять выпущенных до него пар (id, позиция) не тронуты. Терминальным он
+    # больше не является — сверху дописан следующий слой, — и это ровно то, как
+    # реестр и должен расти: проверяется НЕ последнее место в списке, а
+    # неизменность собственной пары шага.
     from app import main as _main
     declared = list(_main.STARTUP_SCHEMA_STEPS)
-    check("SUPPLY-1 объявлен терминальным шагом старта с новой позицией",
-          declared[-1] == ("models.ensure_supply_schema", 10), f"steps={declared}")
+    check("SUPPLY-1 стоит в реестре старта своей парой (id, позиция)",
+          declared[9] == ("models.ensure_supply_schema", 10)
+          and [s for s in declared if s[0] == "models.ensure_supply_schema"]
+              == [("models.ensure_supply_schema", 10)], f"steps={declared}")
     check("девять выпущенных шагов не переименованы и не переставлены",
           declared[:9] == [
               ("init_db", 1), ("lessons.ensure_schema", 2),

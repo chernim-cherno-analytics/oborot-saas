@@ -506,6 +506,47 @@ def run_all() -> None:
     wh_b = wh_b[0][0] if wh_b else None
     base_b = sql("SELECT base_name FROM products WHERE org_id=? LIMIT 1", org_b)[0][0]
 
+    # SUPPLY-3: объекты планирования организации B. Нужны настоящие, а не
+    # выдуманные идентификаторы: проба чужим id доказывает что-то только тогда,
+    # когда объект по этому id действительно существует — у соседа.
+    png_b = (b"\x89PNG\r\n\x1a\n"
+             b"\x00\x00\x00\rIHDR\x00\x00\x00\x04\x00\x00\x00\x03"
+             b"\x08\x02\x00\x00\x00\xd6oX\x83"
+             b"\x00\x00\x00\nIDATx\x9cc\xf8\x0f\x00\x01\x01\x01\x00"
+             b"\x18\xdd\x8d\xb4"
+             b"\x00\x00\x00\x00IEND\xaeB`\x82")
+    rmat = b.post("/api/supply/planning/materials",
+                  json={"title": SECRET, "qty": "50", "op_id": "iso-mat"})
+    mat_b = (rmat.json()["materials"][0]["id"]
+             if rmat.status_code == 200 and rmat.json().get("materials") else None)
+    rsk = b.post("/api/supply/planning/sketches",
+                 files={"file": ("b.png", png_b, "image/png")})
+    sketch_b = rsk.json().get("sketch_id") if rsk.status_code == 200 else None
+    ritem = b.post("/api/supply/planning/items",
+                   json={"kind": "draft", "title": SECRET, "sketch_id": sketch_b,
+                         "op_id": "iso-item"})
+    item_b = (ritem.json()["items"][0]["id"]
+              if ritem.status_code == 200 and ritem.json().get("items") else None)
+    rbatch = b.post("/api/supply/planning/batches",
+                    json={"item_id": item_b, "title": SECRET, "plan_qty": "9",
+                          "op_id": "iso-batch"}) if item_b else None
+    batch_b = (rbatch.json()["batches"][0]["id"]
+               if rbatch is not None and rbatch.status_code == 200
+               and rbatch.json().get("batches") else None)
+    rassign = b.post("/api/supply/planning/assignments",
+                     json={"material_id": mat_b, "batch_id": batch_b, "qty": "3",
+                           "op_id": "iso-assign"}) if (mat_b and batch_b) else None
+    assign_b = None
+    if rassign is not None and rassign.status_code == 200:
+        # Имена переменных цикла намеренно длинные: `a` и `b` в этом наборе —
+        # клиенты двух организаций, и затенить их значило бы сломать всё ниже.
+        for planned_batch in rassign.json().get("batches", []):
+            for planned_assignment in planned_batch.get("assignments", []):
+                assign_b = planned_assignment["id"]
+    check("в организации B есть план для проверок",
+          all(x is not None for x in (mat_b, sketch_b, item_b, batch_b, assign_b)),
+          f"mat={mat_b} sketch={sketch_b} item={item_b} batch={batch_b} assign={assign_b}")
+
     # Заказ и приёмка организации A — чтобы «у A ничего не изменилось» было
     # утверждением о живых строках, а не о пустой таблице.
     ra = a.post("/api/orders", json={"name": "Заказ A", "eta_date": None, "items": [
@@ -561,6 +602,19 @@ def run_all() -> None:
         ("/api/productions/{pid}",                "POST",   {"pid": prod_b}, {"name": "Захвачено"}),
         ("/api/productions/{pid}",                "DELETE", {"pid": prod_b}, None),
         ("/api/productions/{pid}/setup",          "POST",   {"pid": prod_b}, {"preset": "turnkey"}),
+        # SUPPLY-3. Отдельного «не найдено» и «чужое» у слоя нет намеренно:
+        # разные ответы рассказали бы о существовании чужих строк перебором
+        # номеров. Здесь проверяется сам запрет, ниже (§1а) — что отказ не несёт
+        # чужого текста и ничего не пишет.
+        ("/api/supply/planning/sketches/{sketch_id}", "GET", {"sketch_id": sketch_b}, None),
+        ("/api/supply/planning/materials/{material_id}/update", "POST",
+         {"material_id": mat_b}, {"qty": "1", "op_id": "iso-x1"}),
+        ("/api/supply/planning/batches/{batch_id}/update", "POST",
+         {"batch_id": batch_b}, {"plan_qty": "1", "op_id": "iso-x2"}),
+        ("/api/supply/planning/assignments/{assignment_id}/update", "POST",
+         {"assignment_id": assign_b}, {"qty": "1", "op_id": "iso-x3"}),
+        ("/api/supply/planning/assignments/{assignment_id}/delete", "POST",
+         {"assignment_id": assign_b}, {"op_id": "iso-x4"}),
     ]
     answers = {}
     for route, method, params, body in cases:

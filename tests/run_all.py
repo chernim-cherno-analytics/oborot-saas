@@ -127,6 +127,10 @@ SUITES = [
     # рядом со своим офлайновым близнецом; живого Google в нём нет — ответы
     # API подменяются на стороне страницы.
     ("supply_ui",   "test_supply_ui.py",       False, False),
+    # SUPPLY-3: планирование (материал, вещь, плановая партия, назначения).
+    # Набор офлайновый по построению: ни мока МойСклада, ни телеграма, ни сети —
+    # слой не ходит наружу вовсе, и проверка этого входит в сам набор.
+    ("supply_planning", "test_supply_planning.py", False, False),
     ("consist",     "test_consistency.py",     False, False),
     ("canon",       "test_turnover_canon.py",  False, False),
     # Замок на формулы потребности и largest-remainder (DATA-11). Стоит рядом
