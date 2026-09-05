@@ -863,12 +863,19 @@ def run_scenario() -> int:
           r.status_code == 409, f"status={r.status_code} body={r.text[:200]}")
     check("отказ называет позицию и оба числа",
           "Худи «Штрих»" in r.text and "2" in r.text and "5" in r.text, r.text[:250])
-    check("документ НЕ создан — остановились до первого сетевого вызова",
+    check("документ НЕ создан — отказ встал перед POST создания документа",
           len(mock_ms.CREATED_PURCHASE_ORDERS) == docs_before_a06,
           f"{docs_before_a06} -> {len(mock_ms.CREATED_PURCHASE_ORDERS)}")
     check("пометка отправки снята: заказ не заперт отказом",
           not (_order_href(order_a06) or ""), f"href={_order_href(order_a06)!r}")
 
+    # Проверка стоит на ветке СОЗДАНИЯ документа, а не в начале push_order:
+    # до find_own_document неизвестно, создаём мы документ или подбираем уже
+    # созданный, и ранний отказ закрыл бы recovered-путь — заказ с реально
+    # существующим документом остался бы сиротой навсегда. Что recovered
+    # переживает расхождение локального снимка, проверяет DATA-7 Package B
+    # (tests/test_writeback_idempotency.py, сценарий 30а).
+    #
     # Тот же заказ с исправленной разбивкой уходит штатно: закрыт mismatch,
     # а не механизм отправки.
     _set_items_json(order_a06, [
