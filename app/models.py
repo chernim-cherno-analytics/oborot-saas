@@ -11,6 +11,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    LargeBinary,
     String,
     Text,
     UniqueConstraint,
@@ -1005,6 +1006,280 @@ _CC_BATCH_ID_INDEX_DDL = (
 _CC_BATCH_BACKFILL_PAGE = 500
 
 
+# ── SUPPLY-3: планирование производства внутри «Оборота» ─────────────────────
+#
+# ЧТО ЭТО И ЧЕМ ОНО НЕ ЯВЛЯЕТСЯ. Пять таблиц ниже описывают ПЛАН: какой материал
+# куплен, какую вещь из него собираются шить, сколько изделий задумано и к
+# какому сроку. Планом это остаётся до конца: ни одна строка отсюда не является
+# партией «Оборота» и не превращается в неё сама.
+#
+# Отсюда главное решение слоя, и оно записано здесь, а не только в документах:
+# `CC_BATCH_ID` этим таблицам НЕ выдаётся и не имитируется. Идентификатор партии
+# по D-50 живёт ровно у `production_orders` — там, где партия рождается
+# (D-28: oborot_tracked flow). Две независимых сущности, каждая со своим
+# «идентификатором партии», означали бы два источника правды об одном понятии, и
+# первая же выгрузка наружу показала бы разные номера для одного и того же. Пока
+# перехода «план → заказ» нет, нет и идентификатора: имя партии выдаёт тот, кто
+# её создаёт, а не тот, кто её задумал.
+#
+# `OrderedQty`, `order_receipts`, «Едет», планировщик, формулы (D-35) и правила
+# статусов слоем не затрагиваются вовсе — ни одна функция здесь их не читает и
+# не пишет. Ткани и комплектующие остаются логистическими (D-49): движения и
+# сроки, без полного учёта и без списаний.
+#
+# НЕИЗВЕСТНОЕ ОСТАЁТСЯ НЕИЗВЕСТНЫМ. `qty IS NULL` — это «сколько метров, пока не
+# знаем», а не ноль; ноль означал бы «нечего шить». То же правило, что в D-51
+# («пусто ≠ ноль»), только теперь для ручного ввода, а не для чужой таблицы.
+
+
+#: Виды сущностей в журнале изменений. Закрытый список: строка, которой здесь
+#: нет, в журнал не попадёт — иначе журнал станет свалкой произвольных имён.
+SUPPLY_ENTITY_KINDS = ("material", "item", "batch", "assignment")
+
+# АВТОР ХРАНИТСЯ ИМЕНЕМ, А НЕ ССЫЛКОЙ НА ПОЛЬЗОВАТЕЛЯ, и это решение, а не
+# экономия. Журнал обязан оставаться читаемым после того, как человек ушёл из
+# организации и его учётная запись удалена: ссылка в этот момент превратилась
+# бы в осиротевший идентификатор (открытый SEC-8), а строка «кто поменял
+# срок» — в пустое место. Копия имени не ломается ни при удалении автора, ни
+# при переносе организации, и не создаёт новой ссылки на `users.id`.
+
+#: Как задан срок. `unknown` — названное состояние, а не NULL «на всякий
+#: случай»: человек прямо сказал, что срока пока нет.
+SUPPLY_DUE_KINDS = ("unknown", "approx", "exact", "text")
+
+#: Вид плановой вещи. `catalog` — вещь своего каталога, `draft` — новинка,
+#: которой в каталоге ещё нет вовсе.
+SUPPLY_ITEM_KINDS = ("catalog", "draft")
+
+#: Потолок картинки эскиза. Байты лежат в SQLite и попадают в штатный бэкап
+#: вместе с базой — значит их размер это размер бэкапа, и он ограничен.
+SKETCH_MAX_BYTES = 2 * 1024 * 1024
+SKETCH_MAX_SIDE = 4096
+SKETCH_MIME_TYPES = ("image/jpeg", "image/png")
+
+
+class SupplyMaterial(Base):
+    """Материал сам по себе: куплен до того, как решено, что из него шьют.
+
+    Именно самостоятельность здесь и есть смысл таблицы. Ткань покупают партией
+    и до дизайна, поэтому строка не ссылается ни на вещь, ни на партию: связь
+    появляется отдельной строкой `SupplyAssignment`, когда решение принято, и
+    исчезает вместе с ней, не унося материал.
+
+    `qty` НУЛЛИРУЕМ намеренно: «пришло сколько-то, взвесим потом» — обычное
+    состояние, и подставлять в него ноль значило бы записать за человека то,
+    чего он не говорил.
+    """
+
+    __tablename__ = "supply_materials"
+    __table_args__ = (Index("ix_supply_materials_org", "org_id", "id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    org_id: Mapped[int] = mapped_column(ForeignKey("orgs.id"), nullable=False, index=True)
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    qty: Mapped[float | None] = mapped_column(Float, nullable=True)      # None = неизвестно
+    unit: Mapped[str] = mapped_column(String(16), nullable=False, default="м")
+    source_note: Mapped[str] = mapped_column(String(500), nullable=False, default="")
+    author: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(TolerantDateTime, nullable=False,
+                                                 default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(TolerantDateTime, nullable=False,
+                                                 default=datetime.utcnow)
+    #: Счётчик редакций. Клиент присылает тот, который видел; разошлось —
+    #: 409 и текущее состояние, а не тихая перезапись чужой правки.
+    rev: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
+
+
+class SupplySketch(Base):
+    """Приватный эскиз новинки: байты картинки лежат в базе.
+
+    Почему BLOB, а не файл на диске. Штатный бэкап проекта копирует БАЗУ; файл
+    рядом с ней в этот бэкап не попадает, и восстановление вернуло бы карточки
+    новинок без единой картинки — то есть потерю пользовательских данных,
+    которую заметили бы только в день восстановления. Цена решения названа
+    прямо: эскизы занимают место в базе и в каждом бэкапе, поэтому размер
+    ограничен `SKETCH_MAX_BYTES`.
+
+    Формат проверяется по САМИМ БАЙТАМ, а не по присланному имени или заголовку:
+    `mime` здесь — результат разбора, а не то, что сказал клиент. SVG не
+    принимается вовсе: это исполняемый документ, и «картинкой» он является
+    только на первый взгляд.
+    """
+
+    __tablename__ = "supply_sketches"
+    __table_args__ = (Index("ix_supply_sketches_org", "org_id", "id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    org_id: Mapped[int] = mapped_column(ForeignKey("orgs.id"), nullable=False, index=True)
+    mime: Mapped[str] = mapped_column(String(32), nullable=False)
+    byte_len: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    width: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    height: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    data: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    author: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(TolerantDateTime, nullable=False,
+                                                 default=datetime.utcnow)
+
+
+class SupplyItem(Base):
+    """Вещь плана: своя карточка каталога ИЛИ полноценная новинка.
+
+    ТОЖДЕСТВО — ЭТО СТРОКА, А НЕ ИМЯ. Ключом служит `id` этой строки, и только
+    он. Две вещи с одинаковым именем — две разные вещи: имена в производстве
+    повторяются («Платье миди» бывает и прошлого сезона, и нового), и склеивать
+    их по строке значило бы принять решение за человека.
+
+    `base_name` у `kind='catalog'` — это КАНОНИЧЕСКОЕ имя без размера, то самое,
+    которым каталог ключуется во всём проекте (`products.base_name`), а не `id`
+    одной размерной строки: размерная строка живёт своей жизнью и исчезает при
+    пересинке. Хранится копией: связь должна пережить и пересинк, и
+    переименование в источнике, а не разъехаться вместе с ними.
+    """
+
+    __tablename__ = "supply_items"
+    __table_args__ = (Index("ix_supply_items_org", "org_id", "id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    org_id: Mapped[int] = mapped_column(ForeignKey("orgs.id"), nullable=False, index=True)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False, default="draft")
+    #: Каноническое имя каталога — только у kind='catalog', иначе ''.
+    base_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    #: Как вещь называет человек. У новинки это единственное имя.
+    title: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    sketch_id: Mapped[int | None] = mapped_column(
+        ForeignKey("supply_sketches.id"), nullable=True)
+    note: Mapped[str] = mapped_column(String(500), nullable=False, default="")
+    author: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(TolerantDateTime, nullable=False,
+                                                 default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(TolerantDateTime, nullable=False,
+                                                 default=datetime.utcnow)
+    rev: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
+
+
+class SupplyBatch(Base):
+    """ПЛАНОВАЯ партия: намерение сшить, а не заказ.
+
+    Слово «плановая» здесь не украшение: у строки нет и не может быть
+    `cc_batch_id` (D-50), она не создаёт `production_orders`, не двигает
+    `OrderedQty` и не входит в «Едет». Интерфейс обязан называть её плановой
+    ровно потому, что снаружи она похожа на партию, а внутри ею не является.
+
+    `plan_qty` НУЛЛИРУЕМ: «шьём, сколько выйдет из ткани» — законное состояние
+    плана. План изделий вводится ОТДЕЛЬНО от метража и из него не выводится:
+    пересчёта метров в штуки в этом слое нет нигде, потому что расход на изделие
+    никто не объявлял.
+    """
+
+    __tablename__ = "supply_batches"
+    __table_args__ = (Index("ix_supply_batches_org", "org_id", "id"),
+                      Index("ix_supply_batches_item", "org_id", "item_id"))
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    org_id: Mapped[int] = mapped_column(ForeignKey("orgs.id"), nullable=False, index=True)
+    item_id: Mapped[int] = mapped_column(ForeignKey("supply_items.id"), nullable=False)
+    title: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    plan_qty: Mapped[float | None] = mapped_column(Float, nullable=True)   # None = неизвестно
+    plan_note: Mapped[str] = mapped_column(String(500), nullable=False, default="")
+    #: Срок. `due_kind` называет ВИД срока, а не только его наличие: «примерно
+    #: к ноябрю» и «14.11» — разные утверждения, и хранить их одинаково значило
+    #: бы выдать догадку за дату. Ни одно из этих полей ни во что не считается:
+    #: ни автопросрочки, ни SLA, ни подстановки «сегодня» в слое нет.
+    due_kind: Mapped[str] = mapped_column(String(16), nullable=False, default="unknown")
+    due_text: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    due_date: Mapped[str] = mapped_column(String(10), nullable=False, default="")  # ISO, только exact
+    due_source: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    due_author: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    due_updated_at: Mapped[datetime | None] = mapped_column(TolerantDateTime, nullable=True)
+    author: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(TolerantDateTime, nullable=False,
+                                                 default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(TolerantDateTime, nullable=False,
+                                                 default=datetime.utcnow)
+    rev: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
+
+
+class SupplyAssignment(Base):
+    """Плановое назначение метража материала на плановую партию.
+
+    Это ПЛАН, а не физический расход: строка не списывает материал и не меняет
+    ни одного остатка. Поэтому назначить можно и больше, чем известно в
+    наличии, — экран об этом ПРЕДУПРЕДИТ явно и числом, но запрещать не станет:
+    запрет был бы бизнес-правилом, которого никто не принимал, а молчаливое
+    обрезание до наличия — подменой введённого человеком числа.
+
+    Один материал делится между несколькими партиями, и одна партия собирается
+    из нескольких материалов: обе связи многие-ко-многим, поэтому это отдельная
+    таблица, а не колонка.
+    """
+
+    __tablename__ = "supply_assignments"
+    __table_args__ = (
+        Index("ix_supply_assignments_org", "org_id", "id"),
+        Index("ix_supply_assignments_material", "org_id", "material_id"),
+        Index("ix_supply_assignments_batch", "org_id", "batch_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    org_id: Mapped[int] = mapped_column(ForeignKey("orgs.id"), nullable=False, index=True)
+    material_id: Mapped[int] = mapped_column(ForeignKey("supply_materials.id"), nullable=False)
+    batch_id: Mapped[int] = mapped_column(ForeignKey("supply_batches.id"), nullable=False)
+    #: Назначенное количество. НЕ нулируемо: назначение без числа — это не
+    #: назначение, а намерение, и для намерения существует сама партия.
+    qty: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    note: Mapped[str] = mapped_column(String(500), nullable=False, default="")
+    author: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(TolerantDateTime, nullable=False,
+                                                 default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(TolerantDateTime, nullable=False,
+                                                 default=datetime.utcnow)
+    rev: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
+
+
+class SupplyEvent(Base):
+    """Минимальная история: кто, когда и что было ДО правки.
+
+    Зачем в одном месте, а не колонками в каждой таблице. Вопрос, который
+    задают на самом деле, звучит «кто поменял срок и что там стояло раньше», и
+    ответ на него обязан существовать после того, как значение уже перезаписано.
+    Хранить предыдущее значение в самой строке можно ровно одно — предпоследнее
+    исчезает; отдельный журнал не теряет ничего и не растёт в ширину.
+
+    ЗАОДНО ЭТО ЗАМОК ОТ ПОВТОРНОГО POST. `op_id` — идентификатор ПОСТУПКА,
+    который присылает страница; частичный UNIQUE по `(org_id, op_id)` не даёт
+    одному поступку записаться дважды, даже когда две вкладки нажали кнопку
+    одновременно. Проверка «а нет ли уже такого» перед вставкой гонку не
+    закрывает — закрывает её сам индекс.
+    """
+
+    __tablename__ = "supply_events"
+    __table_args__ = (Index("ix_supply_events_org", "org_id", "id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    org_id: Mapped[int] = mapped_column(ForeignKey("orgs.id"), nullable=False, index=True)
+    entity_kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    entity_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    action: Mapped[str] = mapped_column(String(32), nullable=False)
+    field: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    old_value: Mapped[str] = mapped_column(String(500), nullable=False, default="")
+    new_value: Mapped[str] = mapped_column(String(500), nullable=False, default="")
+    author: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    op_id: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(TolerantDateTime, nullable=False,
+                                                 default=datetime.utcnow)
+
+
+#: Замок повторного поступка. ЧАСТИЧНЫЙ по той же причине, по какой частичен
+#: индекс `CC_BATCH_ID` (D-50): пустой `op_id` — это «поступок без имени»
+#: (запись, сделанная не из формы), и таких строк законно много. Обычный UNIQUE
+#: запретил бы вторую такую строку и превратил бы замок в отказ работать.
+_SUPPLY_OP_INDEX_DDL = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_supply_events_op "
+    "ON supply_events (org_id, op_id) WHERE op_id <> ''"
+)
+
+
 def ensure_schema(bind=None) -> None:
     """Прогоняет все аддитивные ALTER-миграции моделей этого файла.
 
@@ -1223,3 +1498,44 @@ def ensure_supply_schema(bind=None) -> None:
         )
     run_migration_step(_CC_BATCH_ID_INDEX_DDL, bind=eng)
     backfill_cc_batch_ids(bind=eng)
+
+
+def ensure_supply_planning_schema(bind=None) -> None:
+    """SUPPLY-3: таблицы планирования и замок повторного поступка.
+
+    ОТДЕЛЬНЫЙ шаг старта с новым id и новой позицией 11 — по тому же правилу,
+    по которому SUPPLY-1 стал шагом 10 (ревью PR #46, `discussion_r3894000377`,
+    AGENTS.md §1 «только новая миграция сверху»). Дописать эту работу в
+    `ensure_schema()` или в `ensure_supply_schema()` значило бы исполнить её под
+    идентичностью уже выпущенного шага: на боевых базах их строки в
+    `migration_ledger` записаны давно, собственного свидетельства о применении
+    SUPPLY-3 не появилось бы вовсе, а порядок относительно будущих миграций
+    журнал бы не удержал. Прежние десять пар (id, позиция) не тронуты ни одной
+    буквой.
+
+    ЧТО ЗДЕСЬ ДЕЛАЕТСЯ, И ПОЧЕМУ ЭТОГО ДОСТАТОЧНО. Пять таблиц и один частичный
+    индекс. Таблицы аддитивные и новые: ни одной существующей колонки шаг не
+    трогает, ни одной строки не переписывает, `ALTER` чужих таблиц не делает.
+    `create_all` создаёт только отсутствующие таблицы, поэтому шаг идемпотентен
+    и рассчитан на вызов НА КАЖДОМ старте (строка журнала — свидетельство, а не
+    основание пропустить: `db.validate_migration_step`, `main._startup_step`).
+
+    ОТКАТ. Старый код о таблицах не знает и в них не пишет: они просто стоят
+    пустыми и никому не мешают — ни одного `NOT NULL` в чужой таблице шаг не
+    добавляет, поэтому `INSERT` откатившегося кода проходит без изменений. Уже
+    введённые планы при откате не удаляются и не портятся; вернувшийся новый
+    код видит их на месте. Потери данных у отката в обе стороны нет.
+
+    bind — необязательный engine (тестам нужен, чтобы прогнать шаг на отдельной
+    базе со «старой» схемой); по умолчанию — engine приложения.
+    """
+    eng = bind or engine
+    Base.metadata.create_all(bind=eng, tables=[
+        SupplySketch.__table__,
+        SupplyMaterial.__table__,
+        SupplyItem.__table__,
+        SupplyBatch.__table__,
+        SupplyAssignment.__table__,
+        SupplyEvent.__table__,
+    ])
+    run_migration_step(_SUPPLY_OP_INDEX_DDL, bind=eng)

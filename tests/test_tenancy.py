@@ -270,6 +270,12 @@ def run_control(model_source: str) -> str:
 def _sample_value(column):
     """Значение-заглушка для обязательной колонки при засеве базы раздела 10."""
     kind = str(column.type).upper()
+    # Двоичная колонка обязана получить БАЙТЫ, а не текст: SQLite примет строку
+    # далеко не везде, и засев упал бы ещё до первой проверки удаления — то
+    # есть проверка полноты не выполнилась бы вовсе. Ветка общая, по типу
+    # колонки, а не по имени таблицы.
+    if "BLOB" in kind or "BINARY" in kind:
+        return b"x"
     if "INT" in kind:
         return 1
     if "FLOAT" in kind or "REAL" in kind or "NUMERIC" in kind:

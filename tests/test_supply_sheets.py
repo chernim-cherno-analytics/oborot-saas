@@ -2418,12 +2418,16 @@ def structural_checks(owner) -> None:
         check(f"{name} ничего не знает про supply_sheets",
               "supply_sheets" not in text and ss.ENVELOPE_KEY not in text, name)
 
+    # Проверяется НЕ «сколько всего шагов», а то, что ПРЕЖНИЕ десять пар
+    # (id, позиция) остались собой: реестр append-only, и число в нём законно
+    # растёт. Замок стоит на неизменности выпущенного, а не на длине списка.
     print("\n== Схема не тронута: те же десять выпущенных шагов старта ==")
     from app import main as _main
-    check("шагов ровно десять", len(_main.STARTUP_SCHEMA_STEPS) == 10,
+    check("шагов одиннадцать: десять выпущенных плюс один дописанный сверху",
+          len(_main.STARTUP_SCHEMA_STEPS) == 11,
           str(len(_main.STARTUP_SCHEMA_STEPS)))
-    check("и это ровно прежние десять пар (id, позиция)",
-          list(_main.STARTUP_SCHEMA_STEPS) == [
+    check("и первые десять — ровно прежние пары (id, позиция)",
+          list(_main.STARTUP_SCHEMA_STEPS)[:10] == [
               ("init_db", 1), ("lessons.ensure_schema", 2),
               ("exclusions.ensure_schema", 3), ("ms_sync.ensure_schema", 4),
               ("ms_sync.reset_stale_running", 5), ("ms_writeback.ensure_schema", 6),

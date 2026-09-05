@@ -387,6 +387,20 @@ def restore_carriers(saved) -> None:
         con.close()
 
 
+def open_preview(p, base: str) -> None:
+    """Открыть /supply и перейти на вкладку предпросмотра.
+
+    SUPPLY-3 добавил на страницу ВТОРОЙ раздел — план производства, — и он
+    открыт по умолчанию: это то, что человек ведёт сам. Предпросмотр чужой
+    таблицы никуда не делся и доступен целиком, но теперь за одним явным
+    нажатием. Проверки предпросмотра ходят сюда, потому что человек ходит так
+    же: набор обязан повторять его путь, а не обращаться к скрытой разметке.
+    """
+    p.goto(f"{base}/supply")
+    p.click("#sup-tab-preview")
+    p.wait_for_timeout(120)
+
+
 def add_member(email: str) -> None:
     """Участник организации: приглашений в UI нет, заводим строкой в БД."""
     import bcrypt
@@ -506,7 +520,7 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
         write_snapshot([SHEET_A, SHEET_B], big)
 
         set_trial(30)
-        page.goto(f"{base}/supply")
+        open_preview(page, base)
         page.wait_for_timeout(1200)
         # Девятый дефект прошлого корректива: страница была МЕРТВА в браузере
         # (`api is not defined` при разборе блока `scripts`, потому что
@@ -530,7 +544,7 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
         # `subscription.subscription_state`.
         set_trial(-40)
         os.environ["OBOROT_SUBSCRIPTION_GATE"] = "1"
-        page.goto(f"{base}/supply")
+        open_preview(page, base)
         page.wait_for_timeout(1200)
         check("в readonly кнопки обновления нет вовсе",
               page.evaluate("() => !!document.getElementById('sup-refresh')") is False)
@@ -566,7 +580,7 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
 
         # ── 2. Сериализованная догрузка ────────────────────────────────────
         print("\n== «Показать ещё»: один запрос в полёте, offset после успеха ==")
-        page.goto(f"{base}/supply")
+        open_preview(page, base)
         page.wait_for_timeout(1200)
         check("гейт снят — форма владельца вернулась",
               page.evaluate("() => !!document.getElementById('sup-refresh')") is True)
@@ -631,7 +645,7 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
         write_snapshot([SHEET_A, SHEET_B],
                        [make_row(i + 1, SHEET_A) for i in range(120)]
                        + [make_row(121, SHEET_A, invalid=True)])
-        page.goto(f"{base}/supply")
+        open_preview(page, base)
         page.wait_for_timeout(1200)
         check("исходное состояние: показана первая страница из 121",
               total_line() == "показано 50 из 121", total_line())
@@ -658,7 +672,7 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
         page.route(REFRESH_RE, lambda route: route.fulfill(
             status=200, content_type="application/json",
             body='{"ok":true,"unchanged":false}'))
-        page.goto(f"{base}/supply")
+        open_preview(page, base)
         page.wait_for_timeout(1200)
         page.evaluate("(name) => { const b = [...document.querySelectorAll("
                       "'#sup-queues button, #sup-sheets button')]"
@@ -747,7 +761,7 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
         print("\n== Неполный итог штук показан как «не определено» ==")
         write_snapshot([SHEET_A, SHEET_B],
                        [make_row(1, SHEET_A), make_row(2, SHEET_A, invalid=True)])
-        page.goto(f"{base}/supply")
+        open_preview(page, base)
         page.wait_for_timeout(1200)
         summary = page.text_content("#sup-summary") or ""
         # Неполнота названа РЯДОМ С ЧИСЛОМ и числом же: сказано, у скольких
@@ -767,7 +781,7 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
               summary[:260])
 
         write_snapshot([SHEET_A, SHEET_B], [make_row(1, SHEET_A), make_row(2, SHEET_A)])
-        page.goto(f"{base}/supply")
+        open_preview(page, base)
         page.wait_for_timeout(1200)
         summary = page.text_content("#sup-summary") or ""
         check("полный итог показан числом и без предупреждения о неполноте",
@@ -819,7 +833,7 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
         write_snapshot([SHEET_A, SHEET_B],
                        [make_row(i + 1, SHEET_A) for i in range(120)]
                        + [make_row(121, SHEET_A, invalid=True)])
-        page.goto(f"{base}/supply")
+        open_preview(page, base)
         page.wait_for_timeout(1200)
         check("исходно на экране первая страница прежнего фильтра",
               data_rows() == 50 and total_line() == "показано 50 из 121",
@@ -907,7 +921,7 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
         page.route(REFRESH_RE, lambda route: route.fulfill(
             status=200, content_type="application/json",
             body='{"ok":true,"unchanged":false}'))
-        page.goto(f"{base}/supply")
+        open_preview(page, base)
         page.wait_for_timeout(1200)
         check("на экране прежний снимок целиком",
               data_rows() == 3 and total_line() == "показано 3 из 3",
@@ -964,7 +978,7 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
         write_snapshot([SHEET_A, SHEET_B],
                        [make_row(i + 1, SHEET_A) for i in range(120)]
                        + [make_row(121, SHEET_A, invalid=True)])
-        page.goto(f"{base}/supply")
+        open_preview(page, base)
         page.wait_for_timeout(1200)
         check("исходно показан первый фильтр целиком",
               data_rows() == 50 and total_line() == "показано 50 из 121",
@@ -1066,7 +1080,7 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
         write_snapshot([SHEET_A, SHEET_B],
                        [make_row(i + 1, SHEET_A) for i in range(120)]
                        + [make_row(121, SHEET_A, invalid=True)])
-        page.goto(f"{base}/supply")
+        open_preview(page, base)
         page.wait_for_timeout(1200)
         check("исходно на экране первая страница вида A",
               data_rows() == 50 and total_line() == "показано 50 из 121",
@@ -1166,7 +1180,7 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
         def refresh_attempts() -> int:
             return len([u for u in calls() if "/refresh" in u])
 
-        page.goto(f"{base}/supply")
+        open_preview(page, base)
         page.wait_for_timeout(1200)
         page.route(REFRESH_RE, count_refresh)
         page.evaluate("() => { window.__supCalls = []; window.__supDelayMs = 3000;"
@@ -1229,7 +1243,7 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
         write_failed_attempt([SENTINEL_SHEET, SHEET_B],
                              f"лист «{SENTINEL_SHEET}»: источник ответил 403",
                              "лист источника: источник ответил 403")
-        page.goto(f"{base}/supply")
+        open_preview(page, base)
         page.wait_for_timeout(1200)
         err_text = page.text_content("#sup-error") or ""
         check("владелец с открытой записью: причина показана целиком",
@@ -1241,7 +1255,7 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
 
         set_trial(-40)
         os.environ["OBOROT_SUBSCRIPTION_GATE"] = "1"
-        page.goto(f"{base}/supply")
+        open_preview(page, base)
         page.wait_for_timeout(1200)
         err_text = page.text_content("#sup-error") or ""
         check("владелец в readonly формы не видит",
@@ -1264,7 +1278,7 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
         mpage = mctx.new_page()
         merrors: list[str] = []
         mpage.on("pageerror", lambda e: merrors.append(str(e)))
-        mpage.goto(f"{base}/supply")
+        open_preview(mpage, base)
         mpage.wait_for_timeout(1200)
         m_err = mpage.text_content("#sup-error") or ""
         check("участник формы не видит вовсе",
@@ -1305,7 +1319,7 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
         write_snapshot_with_failed_attempt(
             [SHEET_A, SHEET_B], [make_row(i + 1, SHEET_A) for i in range(3)],
             [SHEET_C, SHEET_D])
-        page.goto(f"{base}/supply")
+        open_preview(page, base)
         page.wait_for_timeout(1200)
 
         def field_value(fid: str) -> str:
@@ -1370,7 +1384,7 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
         m2page = m2ctx.new_page()
         m2errors: list[str] = []
         m2page.on("pageerror", lambda e: m2errors.append(str(e)))
-        m2page.goto(f"{base}/supply")
+        open_preview(m2page, base)
         m2page.wait_for_timeout(1200)
         member_api = m2.get("/api/supply/sheets?limit=200").text
         check("участнику адрес и листы попытки не отдаются вовсе",
@@ -1395,7 +1409,7 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
         write_snapshot_with_failed_attempt(
             [SHEET_A, SHEET_B], [make_row(i + 1, SHEET_A) for i in range(3)],
             [SHEET_C, SHEET_D], source_ok=False)
-        page.goto(f"{base}/supply")
+        open_preview(page, base)
         page.wait_for_timeout(1200)
         check("в поле ссылки — адрес удачного снимка",
               field_value("sup-url")
@@ -1421,7 +1435,7 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
         saved_carriers = drop_carriers()
         try:
             page.evaluate("() => { window.__supCalls = []; }")
-            page.goto(f"{base}/supply")
+            open_preview(page, base)
             page.wait_for_timeout(1200)
             check("сервер действительно сообщает, что носителя нет",
                   c.get("/api/supply/sheets").json().get("carrier_present") is False)
@@ -1464,7 +1478,7 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
 
         # Носитель вернулся — форма и кнопка обязаны вернуться вместе с ним.
         write_snapshot([SHEET_A, SHEET_B], [make_row(i + 1, SHEET_A) for i in range(3)])
-        page.goto(f"{base}/supply")
+        open_preview(page, base)
         page.wait_for_timeout(1200)
         check("носитель вернулся — вернулась и форма",
               page.evaluate("() => !!document.getElementById('sup-url')") is True
@@ -1511,7 +1525,7 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
                 [SHEET_A, SHEET_B],
                 [make_row(i + 1, SHEET_A) for i in range(3)],
                 [SHEET_C, SHEET_D], source_override=override)
-            page.goto(f"{base}/supply")
+            open_preview(page, base)
             page.wait_for_timeout(1200)
             check(f"{label}: ссылка — от УДАЧНОГО снимка целиком",
                   field_of("sup-url") == good_url, str(field_of("sup-url")))
@@ -1546,7 +1560,7 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
         write_snapshot_with_failed_attempt(
             [SHEET_A, SHEET_B], [make_row(i + 1, SHEET_A) for i in range(3)],
             [SHEET_C, SHEET_D])
-        page.goto(f"{base}/supply")
+        open_preview(page, base)
         page.wait_for_timeout(1200)
         check("целая тройка: поля от попытки",
               field_of("sup-url") == tried_url
@@ -1579,7 +1593,7 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
             make_row(2, SHEET_A),
             make_row(3, SHEET_A, price=xss),
         ])
-        page.goto(f"{base}/supply")
+        open_preview(page, base)
         page.wait_for_timeout(1200)
 
         def price_cells() -> list:
@@ -1636,7 +1650,7 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
             make_row(1, SHEET_A, price="12 900"),
             {**make_row(2, SHEET_A), "is_blank": True},
         ])
-        page.goto(f"{base}/supply")
+        open_preview(page, base)
         page.wait_for_timeout(1200)
         check("и ширина строки-разделителя тоже",
               page.evaluate("() => { const tr = document.querySelector("
@@ -1668,7 +1682,7 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
         H1, H2 = "1" * 64, "2" * 64
         write_snapshot([SHEET_A, SHEET_B],
                        [make_row(i + 1, SHEET_A) for i in range(120)], H1)
-        page.goto(f"{base}/supply")
+        open_preview(page, base)
         page.wait_for_timeout(1200)
 
         def rows_of_sheet(name: str) -> int:
@@ -1735,7 +1749,7 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
         dense.append(make_row(80, SHEET_B, name="Пуховик НГ"))
         write_snapshot([SHEET_A, SHEET_B], dense, content_sha256="d" * 64)
         page.set_viewport_size({"width": 1440, "height": 756})
-        page.goto(f"{base}/supply")
+        open_preview(page, base)
         page.wait_for_timeout(1500)
 
         heights = page.evaluate(
@@ -1879,7 +1893,7 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
         # ── 16. Настроенный источник компактен, форма — за явным действием ─
         print("\n== Источник: компактная строка, длинная форма по кнопке ==")
         write_snapshot([SHEET_A, SHEET_B], dense, content_sha256="f" * 64)
-        page.goto(f"{base}/supply")
+        open_preview(page, base)
         page.wait_for_timeout(1500)
         check("у настроенного источника длинной формы на экране нет",
               page.evaluate("() => document.getElementById('sup-form-wrap').hidden")
@@ -1930,7 +1944,7 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
         for label, size in (("desktop", {"width": 1440, "height": 756}),
                             ("mobile", {"width": 390, "height": 844})):
             page.set_viewport_size(size)
-            page.goto(f"{base}/supply")
+            open_preview(page, base)
             page.wait_for_timeout(1500)
 
             geom = page.evaluate(
@@ -1989,9 +2003,12 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
             void = page.evaluate(
                 "() => { const t = document.querySelector('.sup-scroll')"
                 ".getBoundingClientRect().top;"
+                # Скрытая карточка соседнего раздела подводкой не является:
+                # у неё нулевая геометрия и top=0, и без фильтра по высоте она
+                # считалась бы «провалом» во всю высоту экрана.
                 " const cards = [...document.querySelectorAll("
                 "'.sup-wrap section.card')].map(c => c.getBoundingClientRect())"
-                ".filter(r => r.top < t);"
+                ".filter(r => r.height > 0 && r.top < t);"
                 " let filled = 0, prev = null, maxGap = 0;"
                 " cards.forEach(r => { filled += Math.min(r.height, t - r.top);"
                 "   if (prev !== null) maxGap = Math.max(maxGap, r.top - prev);"
@@ -2012,6 +2029,332 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
                   f"верх таблицы на {void['top']} px при потолке {ceiling}")
 
         page.set_viewport_size({"width": 1400, "height": 900})
+
+        # ── 18. SUPPLY-3: план производства в браузере ─────────────────────
+        #
+        # Проверяется путь человека целиком, а не наличие разметки: пустое
+        # состояние → материал → новинка с эскизом → плановая партия →
+        # назначение → сводка и следующий шаг. Отдельно — то, что ломается чаще
+        # всего: отказ сохранения, двойной клик и узкий экран.
+        print("\n== План производства: сквозной путь в браузере ==")
+        page.set_viewport_size({"width": 1440, "height": 900})
+        page.goto(f"{base}/supply")
+        page.wait_for_timeout(1200)
+
+        check("по умолчанию открыт раздел плана, а не чужая таблица",
+              page.get_attribute("#sup-tab-plan", "aria-selected") == "true"
+              and page.evaluate("() => document.getElementById('sup-view-plan').hidden")
+              is False
+              and page.evaluate("() => document.getElementById('sup-view-preview').hidden")
+              is True)
+        check("старый предпросмотр при этом доступен одним нажатием",
+              page.evaluate("() => !!document.getElementById('sup-tab-preview')") is True)
+        check("плановая партия названа плановой прямо в назначении раздела",
+              "не заказ" in (page.text_content("#pl-note") or ""),
+              (page.text_content("#pl-note") or "")[:90])
+
+        check("пустое состояние предлагает начать с материала",
+              page.is_visible("#pl-mat-empty")
+              and "Начните с материала" in (page.text_content("#pl-next") or ""),
+              (page.text_content("#pl-next") or "")[:80])
+
+        # Материал: раскрытие формы явным действием, сохранение, результат.
+        check("форма материала закрыта, пока её не открыли",
+              page.evaluate("() => document.getElementById('pl-mat-form').hidden") is True
+              and page.get_attribute("#pl-add-material", "aria-expanded") == "false")
+        page.click("#pl-add-material")
+        page.wait_for_timeout(200)
+        check("явное действие раскрывает форму и уводит фокус в первое поле",
+              page.evaluate("() => document.getElementById('pl-mat-form').hidden") is False
+              and page.evaluate("() => document.activeElement.id") == "pl-mat-title",
+              page.evaluate("() => document.activeElement.id"))
+        page.fill("#pl-mat-title", "Ткань костюмная")
+        page.fill("#pl-mat-qty", "100")
+        page.fill("#pl-mat-note", "счёт 42")
+        page.click("#pl-mat-form button[type=submit]")
+        page.wait_for_timeout(1200)
+        check("материал появился на экране с числами",
+              "Ткань костюмная" in (page.text_content("#pl-materials") or "")
+              and "100" in (page.text_content("#pl-materials") or ""),
+              (page.text_content("#pl-materials") or "")[:120])
+        check("и форма закрылась сама — работа сделана",
+              page.evaluate("() => document.getElementById('pl-mat-form').hidden") is True)
+        check("следующий шаг сменился на выбор вещи",
+              "вещь" in (page.text_content("#pl-next") or "").lower(),
+              (page.text_content("#pl-next") or "")[:80])
+
+        # Новинка с эскизом: файл собирается прямо в браузере, чтобы набор не
+        # тащил бинарник в репозиторий.
+        page.click("#pl-add-item")
+        page.wait_for_timeout(200)
+        page.select_option("#pl-item-kind", "draft")
+        page.fill("#pl-item-title", "Новинка Б")
+        page.evaluate("""() => {
+            const png = new Uint8Array([137,80,78,71,13,10,26,10,
+              0,0,0,13,73,72,68,82, 0,0,0,4, 0,0,0,3, 8,2,0,0,0, 214,111,120,131,
+              0,0,0,22,73,68,65,84, 120,156,99,248,207,192,240,31,4,3,3,3,0,
+              47,224,5,251, 27,132,73,157,
+              0,0,0,0,73,69,78,68,174,66,96,130]);
+            const file = new File([png], 'sketch.png', {type: 'image/png'});
+            const dt = new DataTransfer();
+            dt.items.add(file);
+            document.getElementById('pl-item-sketch').files = dt.files;
+        }""")
+        page.click("#pl-item-form button[type=submit]")
+        page.wait_for_timeout(1500)
+        check("новинка создана", page.evaluate(
+            "() => document.getElementById('pl-item-form').hidden") is True)
+
+        # Плановая партия и назначение метража.
+        page.click("#pl-add-batch")
+        page.wait_for_timeout(200)
+        page.fill("#pl-batch-title", "Партия А")
+        page.fill("#pl-batch-qty", "30")
+        page.select_option("#pl-batch-due-kind", "approx")
+        page.fill("#pl-batch-due-text", "к середине ноября")
+        page.fill("#pl-batch-due-source", "цех")
+        page.click("#pl-batch-form button[type=submit]")
+        page.wait_for_timeout(1300)
+        batches_text = page.text_content("#pl-batches") or ""
+        check("партия показана и НАЗВАНА плановой",
+              "Партия А" in batches_text and "плановая партия" in batches_text,
+              batches_text[:120])
+        check("срок показан ориентиром вместе с источником, а не датой",
+              "ориентировочно к середине ноября" in batches_text
+              and "цех" in batches_text, batches_text[:200])
+        check("план изделий показан в штуках",
+              "30 шт" in batches_text, batches_text[:160])
+        # Эскиз ищется ПОСЛЕ создания партии: он показывается в карточке
+        # партии, и до неё показывать его негде.
+        sketch_src = page.evaluate(
+            "() => { const i = document.querySelector('#pl-batches img.pl-sketch');"
+            " return i ? i.getAttribute('src') : ''; }")
+        check("эскиз новинки виден на экране и адресуется приватной ручкой",
+              sketch_src.startswith("/api/supply/planning/sketches/"), sketch_src[:60])
+
+        page.click("#pl-materials .pl-actions button")
+        page.wait_for_timeout(300)
+        inline = page.query_selector("#pl-materials .pl-form.inline")
+        check("назначение раскрывается прямо в карточке материала",
+              inline is not None)
+        page.fill("#pl-materials .pl-form.inline input", "40")
+        page.click("#pl-materials .pl-form.inline button[type=submit]")
+        page.wait_for_timeout(1300)
+        mats = page.text_content("#pl-materials") or ""
+        check("после назначения видно назначенное и свободное",
+              "назначено:" in mats and "свободно:" in mats and "60" in mats,
+              mats[:160])
+        check("и следующий шаг называет остаток числом",
+              "60" in (page.text_content("#pl-next") or ""),
+              (page.text_content("#pl-next") or "")[:90])
+
+        # ── 19. Отказ сохранения виден, ввод не потерян ────────────────────
+        print("\n== Отказ сохранения: сказано словами, ввод на месте ==")
+        page.route(re.compile(r"/api/supply/planning/materials$"),
+                   lambda route: route.fulfill(
+                       status=400, content_type="application/json",
+                       body='{"detail":"Сервер отказал: проверьте название."}'))
+        page.click("#pl-add-material")
+        page.wait_for_timeout(200)
+        page.fill("#pl-mat-title", "Проверочная ткань")
+        page.fill("#pl-mat-qty", "7")
+        page.click("#pl-mat-form button[type=submit]")
+        page.wait_for_timeout(900)
+        check("причина отказа показана словами, а не молча проглочена",
+              "Сервер отказал" in (page.text_content("#pl-mat-err") or ""),
+              (page.text_content("#pl-mat-err") or "")[:90])
+        check("форма осталась открытой, а введённое — на месте",
+              page.evaluate("() => document.getElementById('pl-mat-form').hidden") is False
+              and page.input_value("#pl-mat-title") == "Проверочная ткань"
+              and page.input_value("#pl-mat-qty") == "7")
+        check("и на экране не появилось строки, которой сервер не принял",
+              "Проверочная ткань" not in (page.text_content("#pl-materials") or ""))
+        page.unroute(re.compile(r"/api/supply/planning/materials$"))
+
+        # Двойной клик по кнопке сохранения не создаёт двух материалов: один
+        # запрос в полёте, и `op_id` закрывает случай, когда второй всё же ушёл.
+        page.fill("#pl-mat-title", "Ткань один раз")
+        page.fill("#pl-mat-qty", "5")
+        page.evaluate("""() => {
+            const b = document.querySelector('#pl-mat-form button[type=submit]');
+            b.click(); b.click();
+        }""")
+        page.wait_for_timeout(1600)
+        count_once = page.evaluate(
+            "() => [...document.querySelectorAll('#pl-materials .pl-card .t')]"
+            ".filter(n => n.textContent.indexOf('Ткань один раз') === 0).length")
+        check("двойной клик создал ровно ОДИН материал", count_once == 1,
+              str(count_once))
+
+        # ── 20. Мобильный 390: без обязательной широкой таблицы ────────────
+        print("\n== Мобильный экран плана ==")
+        page.set_viewport_size({"width": 390, "height": 844})
+        page.goto(f"{base}/supply")
+        page.wait_for_timeout(1200)
+        geom = page.evaluate(
+            "() => { const w = document.getElementById('sup-view-plan');"
+            " return {doc: document.documentElement.scrollWidth,"
+            "         view: window.innerWidth,"
+            "         wide: [...w.querySelectorAll('table')].length}; }")
+        check("на 390 px раздел не требует горизонтальной прокрутки",
+              geom["doc"] <= geom["view"] + 1, str(geom))
+        check("и не содержит ни одной обязательной широкой таблицы",
+              geom["wide"] == 0, str(geom))
+        visible = page.evaluate(
+            "() => { const ok = id => { const e = document.getElementById(id);"
+            " if (!e) return false; const r = e.getBoundingClientRect();"
+            " return r.width > 0 && r.height > 0; };"
+            " return {next: ok('pl-next'), mats: ok('pl-materials'),"
+            "  add: ok('pl-add-material'), batches: ok('pl-batches')}; }")
+        check("следующий шаг, материалы, партии и кнопка добавления на месте",
+              all(visible.values()), str(visible))
+        check("переключатель разделов доступен и на телефоне",
+              page.is_visible("#sup-tab-plan") and page.is_visible("#sup-tab-preview"))
+        page.set_viewport_size({"width": 1400, "height": 900})
+
+        # ── 21. Потерянный ответ на УДАВШУЮСЯ запись ───────────────────────
+        #
+        # Воспроизведение P1 ревью PR #49 (issuecomment-5548612500). Сеть рвётся
+        # ПОСЛЕ того, как сервер принял и записал: запрос доходит, ответ — нет.
+        # Человек видит отказ и нажимает ещё раз, ничего не изменив. Если экран
+        # выдаёт повтор за НОВЫЙ поступок, на сервере окажется две записи вместо
+        # одной, и это уже испорченные данные, а не неудобство.
+        #
+        # `route.fetch()` выполняет настоящий запрос к настоящему серверу, и
+        # только потом соединение обрывается: подменять ответ заглушкой здесь
+        # нельзя — тогда сервер ничего бы не записал и проверять было бы нечего.
+        print("\n== Потерянный ответ: повтор не создаёт вторую запись ==")
+        page.set_viewport_size({"width": 1440, "height": 900})
+        page.goto(f"{base}/supply")
+        page.wait_for_timeout(1200)
+
+        def swallow_response(pattern):
+            """Пропустить запрос на сервер и потерять ответ ровно один раз."""
+            state = {"done": False}
+
+            def handler(route):
+                if state["done"]:
+                    route.continue_()
+                    return
+                state["done"] = True
+                try:
+                    route.fetch()          # сервер получает и записывает
+                except Exception:          # noqa: BLE001 — ответ нам не нужен
+                    pass
+                route.abort()              # ...а ответ до страницы не доходит
+
+            page.route(pattern, handler)
+            return state
+
+        mat_route = re.compile(r"/api/supply/planning/materials$")
+        swallow_response(mat_route)
+        page.click("#pl-add-material")
+        page.wait_for_timeout(200)
+        page.fill("#pl-mat-title", "Ткань после обрыва")
+        page.fill("#pl-mat-qty", "100")
+        page.click("#pl-mat-form button[type=submit]")
+        page.wait_for_timeout(1500)
+        check("после обрыва человек видит отказ, а не тишину",
+              (page.text_content("#pl-mat-err") or "").strip() != "",
+              (page.text_content("#pl-mat-err") or "")[:80])
+        check("и его ввод остался в форме, чтобы было что повторить",
+              page.input_value("#pl-mat-title") == "Ткань после обрыва"
+              and page.input_value("#pl-mat-qty") == "100")
+
+        page.click("#pl-mat-form button[type=submit]")
+        page.wait_for_timeout(1600)
+        page.unroute(mat_route)
+        page.goto(f"{base}/supply")
+        page.wait_for_timeout(1300)
+        after = page.evaluate(
+            "() => [...document.querySelectorAll('#pl-materials .pl-card .t')]"
+            ".map(n => n.textContent).filter(t => t.indexOf('Ткань после обрыва') === 0)")
+        check("повтор НЕ создал вторую запись: материал ровно один",
+              len(after) == 1, f"найдено {len(after)}: {after}")
+        totals = page.evaluate(
+            "() => [...document.querySelectorAll('#pl-materials .pl-card')]"
+            ".filter(c => c.textContent.indexOf('Ткань после обрыва') === 0)"
+            ".map(c => c.textContent)")
+        check("и количество у него одно, а не удвоенное",
+              len(totals) == 1 and "100" in totals[0] and "200" not in totals[0],
+              str(totals)[:160])
+
+        # Тот же обрыв на НАЗНАЧЕНИИ: там цена ошибки выше, потому что второе
+        # назначение молча съедает свободный метраж.
+        page.click("#pl-add-item")
+        page.wait_for_timeout(200)
+        page.select_option("#pl-item-kind", "draft")
+        page.fill("#pl-item-title", "Вещь для обрыва")
+        page.click("#pl-item-form button[type=submit]")
+        page.wait_for_timeout(1300)
+        page.click("#pl-add-batch")
+        page.wait_for_timeout(200)
+        page.fill("#pl-batch-title", "Партия для обрыва")
+        page.fill("#pl-batch-qty", "10")
+        page.click("#pl-batch-form button[type=submit]")
+        page.wait_for_timeout(1300)
+
+        assign_route = re.compile(r"/api/supply/planning/assignments$")
+        swallow_response(assign_route)
+        target = page.evaluate(
+            "() => { const cards = [...document.querySelectorAll('#pl-materials .pl-card')];"
+            " const i = cards.findIndex(c => c.textContent.indexOf('Ткань после обрыва') === 0);"
+            " return i; }")
+        page.evaluate(
+            "(i) => document.querySelectorAll('#pl-materials .pl-card')[i]"
+            ".querySelector('.pl-actions button').click()", target)
+        page.wait_for_timeout(400)
+        page.fill("#pl-materials .pl-form.inline input", "40")
+        page.click("#pl-materials .pl-form.inline button[type=submit]")
+        page.wait_for_timeout(1500)
+        check("назначение тоже показало отказ после обрыва",
+              (page.text_content("#pl-assign-err") or "").strip() != "",
+              (page.text_content("#pl-assign-err") or "")[:80])
+        page.click("#pl-materials .pl-form.inline button[type=submit]")
+        page.wait_for_timeout(1600)
+        page.unroute(assign_route)
+        page.goto(f"{base}/supply")
+        page.wait_for_timeout(1300)
+        card = page.evaluate(
+            "() => { const c = [...document.querySelectorAll('#pl-materials .pl-card')]"
+            ".find(x => x.textContent.indexOf('Ткань после обрыва') === 0);"
+            " return c ? c.textContent : ''; }")
+        check("повтор назначения не съел метраж дважды: назначено 40, свободно 60",
+              "назначено: 40 м" in card and "свободно: 60 м" in card, card[:200])
+
+        # ── 22. Несовместимые единицы не складываются ──────────────────────
+        #
+        # Второе воспроизведение того же отчёта. 100 м ткани и 10 кг фурнитуры —
+        # это НЕ 110 чего-нибудь. Пересчёта между ними у нас нет и быть не может:
+        # коэффициента никто не объявлял.
+        print("\n== Метры и килограммы не складываются в одно число ==")
+        # Метраж ДО появления килограммов берётся с экрана, а не пишется числом:
+        # проверяется свойство «килограммы не меняют метры», и оно не должно
+        # краснеть от того, что выше по сценарию добавился ещё один материал.
+        before = page.text_content("#pl-summary") or ""
+        metres = re.search(r"(\d[\d.,]*)\s*м(?![\wа-я])", before)
+        metres = metres.group(1) if metres else None
+        page.click("#pl-add-material")
+        page.wait_for_timeout(200)
+        page.fill("#pl-mat-title", "Фурнитура на вес")
+        page.fill("#pl-mat-qty", "10")
+        page.fill("#pl-mat-unit", "кг")
+        page.click("#pl-mat-form button[type=submit]")
+        page.wait_for_timeout(1400)
+        summary_text = page.text_content("#pl-summary") or ""
+        # Запрещено не абстрактное «110», а конкретное число, которое появилось
+        # бы именно здесь, если сложить метры с килограммами: до правки сводка
+        # показывала ровно его.
+        glued = float((metres or "0").replace(",", ".")) + 10.0
+        glued_forms = [f"{glued:g}", f"{glued:.1f}"]
+        check("в сводке нет числа, склеенного из разных единиц",
+              metres is not None
+              and not any(g in summary_text for g in glued_forms),
+              f"склейкой было бы {glued_forms} -> {summary_text[:160]}")
+        check("а свободное показано по каждой единице отдельно",
+              metres is not None and f"{metres} м" in summary_text
+              and "10 кг" in summary_text,
+              f"было {metres} м -> стало {summary_text[:200]}")
 
         check("на странице не было ошибок в консоли", not errors, str(errors)[:200])
         ctx.close()
