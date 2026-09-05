@@ -1690,12 +1690,41 @@ document.addEventListener("DOMContentLoaded", function () {
   function clear(node) { while (node && node.firstChild) node.removeChild(node.firstChild); }
   function byId(id) { return document.getElementById(id); }
 
-  // Идентификатор ПОСТУПКА. Он рождается в момент нажатия и не меняется при
-  // повторе: сервер по нему узнаёт, что это тот же самый поступок, а не второй
-  // такой же. Без него двойной клик создал бы два материала (и два назначения).
   function opId() {
     return "op-" + Date.now().toString(36) + "-" +
            Math.random().toString(36).slice(2, 10);
+  }
+
+  // ИДЕНТИЧНОСТЬ ПОСТУПКА ПРИНАДЛЕЖИТ ФОРМЕ, А НЕ НАЖАТИЮ. Это исправление
+  // P1 ревью PR #49 (issuecomment-5548612500), и разница здесь не тонкая.
+  //
+  // Прежняя редакция чеканила идентификатор ВНУТРИ обработчика отправки, то
+  // есть на каждом нажатии заново. Пока ответ доходил, это работало: сервер
+  // видел повтор как повтор. Но ровно в том случае, ради которого замок и
+  // существует, — запрос ДОШЁЛ и запись СОСТОЯЛАСЬ, а ответ потерялся, —
+  // человек видел отказ, нажимал ещё раз, и второе нажатие уходило под НОВЫМ
+  // именем. Сервер честно записывал второй материал и второе назначение: он не
+  // мог знать, что это тот же поступок, потому что мы ему этого не сказали.
+  //
+  // Теперь имя живёт на самой форме и переживает неудачу: повтор БЕЗ ПРАВОК —
+  // тот же поступок и то же имя. А любая правка поля делает поступок другим и
+  // сбрасывает имя: человек, изменивший количество после отказа, просит уже не
+  // то, что просил раньше, и склеивать эти два действия было бы такой же
+  // выдумкой, как и разделять неизменный повтор.
+  function actionToken(node) {
+    if (!node) return opId();
+    if (!node.dataset.opId) node.dataset.opId = opId();
+    return node.dataset.opId;
+  }
+  function resetToken(node) {
+    if (node && node.dataset) delete node.dataset.opId;
+  }
+  // Сброс вешается на саму форму: события ввода всплывают от любого поля
+  // внутри неё, включая те, что созданы позже.
+  function bindTokenReset(form) {
+    if (!form) return;
+    form.addEventListener("input", function () { resetToken(form); });
+    form.addEventListener("change", function () { resetToken(form); });
   }
 
   function fmt(value) {
@@ -1820,13 +1849,14 @@ document.addEventListener("DOMContentLoaded", function () {
       + "нулём оно не станет.");
     form.appendChild(hint);
     form.appendChild(submitRow("Сохранить материал", "pl-mat-err"));
+    bindTokenReset(form);
     form.onsubmit = function (ev) {
       ev.preventDefault();
       send("/api/supply/planning/materials", {
         title: title.value, qty: qty.value, unit: unit.value,
-        source_note: note.value, op_id: opId(),
+        source_note: note.value, op_id: actionToken(form),
       }, "pl-mat-err", function (ok) {
-        if (ok) { form.hidden = true; clear(form);
+        if (ok) { resetToken(form); form.hidden = true; clear(form);
                   byId("pl-add-material").setAttribute("aria-expanded", "false"); }
       });
     };
@@ -1885,13 +1915,14 @@ document.addEventListener("DOMContentLoaded", function () {
       pick.appendChild(o);
     }
 
+    bindTokenReset(form);
     form.onsubmit = function (ev) {
       ev.preventDefault();
-      var body = {kind: kind.value, note: note.value, op_id: opId()};
+      var body = {kind: kind.value, note: note.value, op_id: actionToken(form)};
       if (kind.value === "catalog") {
         body.base_name = pick.value;
         send("/api/supply/planning/items", body, "pl-item-err", function (ok) {
-          if (ok) { form.hidden = true; clear(form);
+          if (ok) { resetToken(form); form.hidden = true; clear(form);
                     byId("pl-add-item").setAttribute("aria-expanded", "false"); }
         });
         return;
@@ -1918,7 +1949,7 @@ document.addEventListener("DOMContentLoaded", function () {
           }
           body.sketch_id = res.j.sketch_id;
           send("/api/supply/planning/items", body, "pl-item-err", function (ok) {
-            if (ok) { form.hidden = true; clear(form);
+            if (ok) { resetToken(form); form.hidden = true; clear(form);
                       byId("pl-add-item").setAttribute("aria-expanded", "false"); }
           });
         }).catch(function () {
@@ -1928,7 +1959,7 @@ document.addEventListener("DOMContentLoaded", function () {
         return;
       }
       send("/api/supply/planning/items", body, "pl-item-err", function (ok) {
-        if (ok) { form.hidden = true; clear(form);
+        if (ok) { resetToken(form); form.hidden = true; clear(form);
                   byId("pl-add-item").setAttribute("aria-expanded", "false"); }
       });
     };
@@ -1999,14 +2030,15 @@ document.addEventListener("DOMContentLoaded", function () {
       "План изделий вводится отдельно и из метража НЕ выводится: расход ткани "
       + "на изделие «Оборот» не знает и не выдумывает."));
     form.appendChild(submitRow("Создать плановую партию", "pl-batch-err"));
+    bindTokenReset(form);
     form.onsubmit = function (ev) {
       ev.preventDefault();
       var body = {item_id: item.value, title: title.value, plan_qty: qty.value,
-                  op_id: opId()};
+                  op_id: actionToken(form)};
       var due = readDue();
       for (var k in due) { if (due.hasOwnProperty(k)) body[k] = due[k]; }
       send("/api/supply/planning/batches", body, "pl-batch-err", function (ok) {
-        if (ok) { form.hidden = true; clear(form);
+        if (ok) { resetToken(form); form.hidden = true; clear(form);
                   byId("pl-add-batch").setAttribute("aria-expanded", "false"); }
       });
     };
@@ -2101,11 +2133,12 @@ document.addEventListener("DOMContentLoaded", function () {
       "Это план, а не расход: назначить можно и больше, чем в наличии — "
       + "«Оборот» предупредит числом, но не запретит и не спишет."));
     form.appendChild(submitRow("Назначить", "pl-assign-err"));
+    bindTokenReset(form);
     form.onsubmit = function (ev) {
       ev.preventDefault();
       send("/api/supply/planning/assignments", {
         material_id: material.id, batch_id: pick.value, qty: qty.value,
-        op_id: opId(),
+        op_id: actionToken(form),
       }, "pl-assign-err");
     };
   }
@@ -2115,10 +2148,12 @@ document.addEventListener("DOMContentLoaded", function () {
                            placeholder: "оставьте пустым, если неизвестно"});
     form.appendChild(field("Количество, " + material.unit, qty, true));
     form.appendChild(submitRow("Сохранить", "pl-matq-err"));
+    bindTokenReset(form);
     form.onsubmit = function (ev) {
       ev.preventDefault();
       send("/api/supply/planning/materials/" + material.id + "/update",
-           {qty: qty.value, rev: material.rev, op_id: opId()}, "pl-matq-err");
+           {qty: qty.value, rev: material.rev, op_id: actionToken(form)},
+           "pl-matq-err");
     };
   }
 
@@ -2170,7 +2205,7 @@ document.addEventListener("DOMContentLoaded", function () {
         drop.type = "button";
         drop.addEventListener("click", function () {
           send("/api/supply/planning/assignments/" + a.id + "/delete",
-               {rev: a.rev, op_id: opId()}, null);
+               {rev: a.rev, op_id: actionToken(drop)}, null);
         });
         line.appendChild(drop);
       }
@@ -2210,11 +2245,12 @@ document.addEventListener("DOMContentLoaded", function () {
     form.appendChild(field("Куда перенести", pick, true));
     form.appendChild(field("Сколько, " + assignment.unit, qty));
     form.appendChild(submitRow("Перенести", "pl-move-err"));
+    bindTokenReset(form);
     form.onsubmit = function (ev) {
       ev.preventDefault();
       send("/api/supply/planning/assignments/move", {
         assignment_id: assignment.id, to_batch_id: pick.value, qty: qty.value,
-        rev: assignment.rev, op_id: opId(),
+        rev: assignment.rev, op_id: actionToken(form),
       }, "pl-move-err");
     };
   }
@@ -2225,9 +2261,10 @@ document.addEventListener("DOMContentLoaded", function () {
     form.appendChild(field("План изделий, шт", qty, true));
     var readDue = dueFields(form, "pl-edit-" + b.id, b);
     form.appendChild(submitRow("Сохранить", "pl-batch-edit-err"));
+    bindTokenReset(form);
     form.onsubmit = function (ev) {
       ev.preventDefault();
-      var body = {plan_qty: qty.value, rev: b.rev, op_id: opId()};
+      var body = {plan_qty: qty.value, rev: b.rev, op_id: actionToken(form)};
       var due = readDue();
       for (var k in due) { if (due.hasOwnProperty(k)) body[k] = due[k]; }
       send("/api/supply/planning/batches/" + b.id + "/update", body,
@@ -2245,10 +2282,18 @@ document.addEventListener("DOMContentLoaded", function () {
     next.appendChild(el("span", null, data.next_step.text));
 
     var s = data.summary;
+    // СВОБОДНОЕ ПОКАЗЫВАЕТСЯ ПО КАЖДОЙ ЕДИНИЦЕ ОТДЕЛЬНО. Прежняя редакция брала
+    // одно число и приписывала к нему «м» — то есть выдавала 100 м ткани и
+    // 10 кг фурнитуры за «110 м». Единого числа для разных единиц больше нет
+    // ни на экране, ни в ответе сервера: складывать разрешено только
+    // одинаковое (P1 ревью PR #49).
+    var freeParts = (s.free_by_unit || []).map(function (g) {
+      return fmt(g.qty) + " " + (g.unit || "без единицы");
+    });
     var parts = [
       "материалов " + s.materials,
       "плановых партий " + s.batches,
-      "свободно " + fmt(s.free_known) + " м",
+      "свободно " + (freeParts.length ? freeParts.join(" · ") : "нет"),
       "план " + fmt(s.plan_known) + " шт",
     ];
     if (s.unknown_materials) parts.push("без количества " + s.unknown_materials);

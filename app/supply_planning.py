@@ -805,7 +805,13 @@ def board(db: Session, org_id: int, role: str) -> dict:
                 "note": a.note,
                 "rev": a.rev,
             } for a in rows],
-            "assigned_total": round(sum(float(a.qty) for a in rows), 3),
+            # Тот же запрет, что и в сводке: назначения складываются только
+            # внутри своей единицы. Одна партия законно собирается из метров
+            # ткани и килограммов фурнитуры, и «52» для такой пары было бы
+            # выдумкой ровно того же сорта, что и «110 м» в сводке.
+            "assigned_by_unit": group_by_unit(
+                ((mat_by_id[a.material_id].unit
+                  if a.material_id in mat_by_id else ""), a.qty) for a in rows),
             "rev": b.rev,
         })
 
@@ -834,15 +840,45 @@ def board(db: Session, org_id: int, role: str) -> dict:
     }
 
 
+def group_by_unit(pairs) -> list[dict]:
+    """Складывает количества ТОЛЬКО внутри одной единицы.
+
+    Исправление P1 ревью PR #49 (issuecomment-5548612500). Прежняя редакция
+    складывала свободные остатки всех материалов в одно число и подписывала его
+    метрами: 100 м ткани и 10 кг фурнитуры превращались в «110 м». Это не
+    округление и не мелочь — это придуманный факт: коэффициента между метром и
+    килограммом никто не объявлял, и вывести его неоткуда.
+
+    Складывать разрешено только одинаковое, поэтому здесь нет ни одного
+    коэффициента пересчёта и не появится: единица берётся у самого материала
+    как есть, ничего не нормализуется и не переименовывается («м» и «метр»
+    остаются разными подписями, потому что доказать их равенство мы не можем —
+    это ввод человека, а не справочник).
+    """
+    totals: dict[str, float] = {}
+    for unit, qty in pairs:
+        if qty is None:
+            continue
+        key = (unit or "").strip()
+        totals[key] = round(totals.get(key, 0.0) + float(qty), 3)
+    return [{"unit": unit, "qty": qty}
+            for unit, qty in sorted(totals.items(), key=lambda kv: kv[0])]
+
+
 def summary(mat_views: list[dict], batch_views: list[dict]) -> dict:
     """Компактная сводка. Каждое число подписано тем, чем оно является.
 
     Метраж и штуки НЕ складываются и не пересчитываются друг в друга: это
     разные величины, и связи между ними в системе нет — расход на изделие
     никто не объявлял. Неизвестное считается отдельно и НЕ прячется в нули.
+
+    Свободный остаток отдаётся РАЗБИТЫМ ПО ЕДИНИЦАМ и общего числа не имеет
+    вовсе: единого числа для метров и килограммов не существует, и место, где
+    его можно было бы случайно показать, здесь просто отсутствует.
     """
-    free_known = sum(m["free"] for m in mat_views
-                     if m["free_known"] and m["free"] is not None and m["free"] > 0)
+    free_by_unit = group_by_unit(
+        (m["unit"], m["free"]) for m in mat_views
+        if m["free_known"] and m["free"] is not None and m["free"] > 0)
     unknown_materials = sum(1 for m in mat_views if not m["qty_known"])
     over_materials = sum(1 for m in mat_views if m["over"])
     plan_known = sum(b["plan_qty"] for b in batch_views if b["plan_known"])
@@ -851,9 +887,10 @@ def summary(mat_views: list[dict], batch_views: list[dict]) -> dict:
     return {
         "materials": len(mat_views),
         "batches": len(batch_views),
-        "free_known": round(float(free_known), 3),
+        "free_by_unit": free_by_unit,
         "unknown_materials": unknown_materials,
         "over_materials": over_materials,
+        # Штуки — одна величина по определению: изделия считаются изделиями.
         "plan_known": round(float(plan_known), 3),
         "plan_unknown": plan_unknown,
         "due_unknown": due_unknown,

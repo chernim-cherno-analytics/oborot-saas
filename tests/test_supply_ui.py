@@ -2212,6 +2212,150 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
               page.is_visible("#sup-tab-plan") and page.is_visible("#sup-tab-preview"))
         page.set_viewport_size({"width": 1400, "height": 900})
 
+        # ── 21. Потерянный ответ на УДАВШУЮСЯ запись ───────────────────────
+        #
+        # Воспроизведение P1 ревью PR #49 (issuecomment-5548612500). Сеть рвётся
+        # ПОСЛЕ того, как сервер принял и записал: запрос доходит, ответ — нет.
+        # Человек видит отказ и нажимает ещё раз, ничего не изменив. Если экран
+        # выдаёт повтор за НОВЫЙ поступок, на сервере окажется две записи вместо
+        # одной, и это уже испорченные данные, а не неудобство.
+        #
+        # `route.fetch()` выполняет настоящий запрос к настоящему серверу, и
+        # только потом соединение обрывается: подменять ответ заглушкой здесь
+        # нельзя — тогда сервер ничего бы не записал и проверять было бы нечего.
+        print("\n== Потерянный ответ: повтор не создаёт вторую запись ==")
+        page.set_viewport_size({"width": 1440, "height": 900})
+        page.goto(f"{base}/supply")
+        page.wait_for_timeout(1200)
+
+        def swallow_response(pattern):
+            """Пропустить запрос на сервер и потерять ответ ровно один раз."""
+            state = {"done": False}
+
+            def handler(route):
+                if state["done"]:
+                    route.continue_()
+                    return
+                state["done"] = True
+                try:
+                    route.fetch()          # сервер получает и записывает
+                except Exception:          # noqa: BLE001 — ответ нам не нужен
+                    pass
+                route.abort()              # ...а ответ до страницы не доходит
+
+            page.route(pattern, handler)
+            return state
+
+        mat_route = re.compile(r"/api/supply/planning/materials$")
+        swallow_response(mat_route)
+        page.click("#pl-add-material")
+        page.wait_for_timeout(200)
+        page.fill("#pl-mat-title", "Ткань после обрыва")
+        page.fill("#pl-mat-qty", "100")
+        page.click("#pl-mat-form button[type=submit]")
+        page.wait_for_timeout(1500)
+        check("после обрыва человек видит отказ, а не тишину",
+              (page.text_content("#pl-mat-err") or "").strip() != "",
+              (page.text_content("#pl-mat-err") or "")[:80])
+        check("и его ввод остался в форме, чтобы было что повторить",
+              page.input_value("#pl-mat-title") == "Ткань после обрыва"
+              and page.input_value("#pl-mat-qty") == "100")
+
+        page.click("#pl-mat-form button[type=submit]")
+        page.wait_for_timeout(1600)
+        page.unroute(mat_route)
+        page.goto(f"{base}/supply")
+        page.wait_for_timeout(1300)
+        after = page.evaluate(
+            "() => [...document.querySelectorAll('#pl-materials .pl-card .t')]"
+            ".map(n => n.textContent).filter(t => t.indexOf('Ткань после обрыва') === 0)")
+        check("повтор НЕ создал вторую запись: материал ровно один",
+              len(after) == 1, f"найдено {len(after)}: {after}")
+        totals = page.evaluate(
+            "() => [...document.querySelectorAll('#pl-materials .pl-card')]"
+            ".filter(c => c.textContent.indexOf('Ткань после обрыва') === 0)"
+            ".map(c => c.textContent)")
+        check("и количество у него одно, а не удвоенное",
+              len(totals) == 1 and "100" in totals[0] and "200" not in totals[0],
+              str(totals)[:160])
+
+        # Тот же обрыв на НАЗНАЧЕНИИ: там цена ошибки выше, потому что второе
+        # назначение молча съедает свободный метраж.
+        page.click("#pl-add-item")
+        page.wait_for_timeout(200)
+        page.select_option("#pl-item-kind", "draft")
+        page.fill("#pl-item-title", "Вещь для обрыва")
+        page.click("#pl-item-form button[type=submit]")
+        page.wait_for_timeout(1300)
+        page.click("#pl-add-batch")
+        page.wait_for_timeout(200)
+        page.fill("#pl-batch-title", "Партия для обрыва")
+        page.fill("#pl-batch-qty", "10")
+        page.click("#pl-batch-form button[type=submit]")
+        page.wait_for_timeout(1300)
+
+        assign_route = re.compile(r"/api/supply/planning/assignments$")
+        swallow_response(assign_route)
+        target = page.evaluate(
+            "() => { const cards = [...document.querySelectorAll('#pl-materials .pl-card')];"
+            " const i = cards.findIndex(c => c.textContent.indexOf('Ткань после обрыва') === 0);"
+            " return i; }")
+        page.evaluate(
+            "(i) => document.querySelectorAll('#pl-materials .pl-card')[i]"
+            ".querySelector('.pl-actions button').click()", target)
+        page.wait_for_timeout(400)
+        page.fill("#pl-materials .pl-form.inline input", "40")
+        page.click("#pl-materials .pl-form.inline button[type=submit]")
+        page.wait_for_timeout(1500)
+        check("назначение тоже показало отказ после обрыва",
+              (page.text_content("#pl-assign-err") or "").strip() != "",
+              (page.text_content("#pl-assign-err") or "")[:80])
+        page.click("#pl-materials .pl-form.inline button[type=submit]")
+        page.wait_for_timeout(1600)
+        page.unroute(assign_route)
+        page.goto(f"{base}/supply")
+        page.wait_for_timeout(1300)
+        card = page.evaluate(
+            "() => { const c = [...document.querySelectorAll('#pl-materials .pl-card')]"
+            ".find(x => x.textContent.indexOf('Ткань после обрыва') === 0);"
+            " return c ? c.textContent : ''; }")
+        check("повтор назначения не съел метраж дважды: назначено 40, свободно 60",
+              "назначено: 40 м" in card and "свободно: 60 м" in card, card[:200])
+
+        # ── 22. Несовместимые единицы не складываются ──────────────────────
+        #
+        # Второе воспроизведение того же отчёта. 100 м ткани и 10 кг фурнитуры —
+        # это НЕ 110 чего-нибудь. Пересчёта между ними у нас нет и быть не может:
+        # коэффициента никто не объявлял.
+        print("\n== Метры и килограммы не складываются в одно число ==")
+        # Метраж ДО появления килограммов берётся с экрана, а не пишется числом:
+        # проверяется свойство «килограммы не меняют метры», и оно не должно
+        # краснеть от того, что выше по сценарию добавился ещё один материал.
+        before = page.text_content("#pl-summary") or ""
+        metres = re.search(r"(\d[\d.,]*)\s*м(?![\wа-я])", before)
+        metres = metres.group(1) if metres else None
+        page.click("#pl-add-material")
+        page.wait_for_timeout(200)
+        page.fill("#pl-mat-title", "Фурнитура на вес")
+        page.fill("#pl-mat-qty", "10")
+        page.fill("#pl-mat-unit", "кг")
+        page.click("#pl-mat-form button[type=submit]")
+        page.wait_for_timeout(1400)
+        summary_text = page.text_content("#pl-summary") or ""
+        # Запрещено не абстрактное «110», а конкретное число, которое появилось
+        # бы именно здесь, если сложить метры с килограммами: до правки сводка
+        # показывала ровно его.
+        glued = float((metres or "0").replace(",", ".")) + 10.0
+        glued_forms = [f"{glued:g}", f"{glued:.1f}"]
+        check("в сводке нет числа, склеенного из разных единиц",
+              metres is not None
+              and not any(g in summary_text for g in glued_forms),
+              f"склейкой было бы {glued_forms} -> {summary_text[:160]}")
+        check("а свободное показано по каждой единице отдельно",
+              metres is not None and f"{metres} м" in summary_text
+              and "10 кг" in summary_text,
+              f"было {metres} м -> стало {summary_text[:200]}")
+
         check("на странице не было ошибок в консоли", not errors, str(errors)[:200])
         ctx.close()
         browser.close()

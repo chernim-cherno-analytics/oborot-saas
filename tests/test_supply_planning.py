@@ -170,7 +170,7 @@ def run() -> int:
           empty["next_step"]["code"] == "add_material", empty["next_step"]["text"][:60])
     check("и не показывает ни одной выдуманной цифры",
           empty["summary"]["materials"] == 0 and empty["summary"]["batches"] == 0
-          and empty["summary"]["free_known"] == 0, json.dumps(empty["summary"]))
+          and empty["summary"]["free_by_unit"] == [], json.dumps(empty["summary"]))
 
     r = owner.post("/api/supply/planning/materials",
                    json={"title": "Ткань костюмная 100", "qty": "100", "unit": "м",
@@ -297,15 +297,16 @@ def run() -> int:
           board["next_step"]["code"] == "assign" and "25" in board["next_step"]["text"],
           board["next_step"]["text"][:90])
     check("метраж и штуки в сводке НЕ смешаны",
-          board["summary"]["free_known"] == 25.0
+          board["summary"]["free_by_unit"] == [{"unit": "м", "qty": 25.0}]
           and board["summary"]["plan_known"] == 50.0,
-          json.dumps(board["summary"]))
+          json.dumps(board["summary"], ensure_ascii=False))
 
     # ── 6. Одна ткань на две вещи; две ткани на одну партию ───────────────────
     print("\n== Ткань на две вещи и две ткани на одну партию ==")
-    per_batch = {b["title"]: b["assigned_total"] for b in board["batches"]}
+    per_batch = {b["title"]: b["assigned_by_unit"] for b in board["batches"]}
     check("один материал расписан по двум партиям разных вещей",
-          per_batch["Партия А"] == 40.0 and per_batch["Партия Б"] == 35.0,
+          per_batch["Партия А"] == [{"unit": "м", "qty": 40.0}]
+          and per_batch["Партия Б"] == [{"unit": "м", "qty": 35.0}],
           str(per_batch))
 
     r = owner.post("/api/supply/planning/materials",
@@ -320,8 +321,9 @@ def run() -> int:
           and {a["material_title"] for a in batch_a["assignments"]}
               == {"Ткань костюмная 100", "Подкладка"},
           str([a["material_title"] for a in batch_a["assignments"]]))
-    check("и суммарно на партии 52 — сложены метры, а не метры со штуками",
-          batch_a["assigned_total"] == 52.0, str(batch_a["assigned_total"]))
+    check("и суммарно на партии 52 метра — сложены метры с метрами",
+          batch_a["assigned_by_unit"] == [{"unit": "м", "qty": 52.0}],
+          str(batch_a["assigned_by_unit"]))
 
     # ── 7. Неизвестное количество остаётся неизвестным ────────────────────────
     print("\n== Неизвестное количество: остаток тоже неизвестен ==")
@@ -347,6 +349,52 @@ def run() -> int:
     z = [x for x in zero.json()["materials"] if x["title"] == "Явный ноль"][0]
     check("явно написанный ноль остаётся нулём и неизвестным не становится",
           z["qty"] == 0.0 and z["qty_known"] is True, str(z["qty"]))
+
+    # ── 7а. Несовместимые единицы НЕ складываются ────────────────────────────
+    #
+    # Воспроизведение P1 ревью PR #49 (issuecomment-5548612500). 100 м ткани и
+    # 10 кг фурнитуры — это не «110» чего-либо: коэффициента между метром и
+    # килограммом никто не объявлял, и вывести его неоткуда. Проверяется не
+    # «красиво показано», а отсутствие самого числа, которого не существует.
+    print("\n== Метры и килограммы: два числа, а не одно ==")
+    # Метры ДО появления килограммов запоминаются, а не выписываются числом:
+    # проверяется свойство «килограммы не влияют на метры», и оно не должно
+    # краснеть от того, что выше по сценарию добавился ещё один материал.
+    metres_before = {g["unit"]: g["qty"] for g in
+                     owner.get("/api/supply/planning").json()["summary"]["free_by_unit"]
+                     }.get("м")
+    kilo = owner.post("/api/supply/planning/materials",
+                      json={"title": "Фурнитура на вес", "qty": "10", "unit": "кг",
+                            "op_id": "m-kg"})
+    board = kilo.json()
+    units = {g["unit"]: g["qty"] for g in board["summary"]["free_by_unit"]}
+    check("свободное разложено по единицам, а не сведено в одно число",
+          "кг" in units and "м" in units and units["кг"] == 10.0,
+          json.dumps(board["summary"]["free_by_unit"], ensure_ascii=False))
+    check("килограммы не приплюсовались к метрам: метры не изменились",
+          units["м"] == metres_before, f"{metres_before} -> {units.get('м')}")
+    check("общего числа для разных единиц в ответе нет вовсе",
+          "free_known" not in board["summary"],
+          json.dumps(sorted(board["summary"].keys())))
+    check("и ни одно поле сводки не равно сумме метров с килограммами",
+          (units["м"] + units["кг"]) not in [v for v in board["summary"].values()
+                                             if isinstance(v, (int, float))],
+          json.dumps(board["summary"], ensure_ascii=False))
+
+    # Та же проверка на карточке партии: одна партия законно собирается из
+    # метров ткани и килограммов фурнитуры.
+    mix = owner.post("/api/supply/planning/assignments",
+                     json={"material_id": [m["id"] for m in board["materials"]
+                                           if m["title"] == "Фурнитура на вес"][0],
+                           "batch_id": bids["Партия А"], "qty": "2",
+                           "op_id": "a-kg"})
+    mixed_batch = [b for b in mix.json()["batches"] if b["title"] == "Партия А"][0]
+    by_unit = {g["unit"]: g["qty"] for g in mixed_batch["assigned_by_unit"]}
+    check("на партии метры и килограммы посчитаны раздельно",
+          by_unit == {"м": 52.0, "кг": 2.0}, str(by_unit))
+    check("и общего числа назначенного у партии тоже нет",
+          "assigned_total" not in mixed_batch,
+          json.dumps(sorted(mixed_batch.keys())))
 
     # ── 8. Превышение предупреждает, но не запрещает ──────────────────────────
     print("\n== План сверх наличия: предупреждение, а не запрет ==")
