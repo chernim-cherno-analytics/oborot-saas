@@ -541,6 +541,42 @@ def _item_size_breakdown(item: dict) -> list[tuple[str, int]]:
     return [("", qty)] if qty > 0 else []
 
 
+def size_split_total(item: dict) -> int | None:
+    """Сумма размерной разбивки позиции; None — если разбивки нет вовсе.
+
+    Читает РОВНО ту же разбивку, что уходит в документ поставщику
+    (`_item_size_breakdown` выше): отсутствующие, пустые и полностью нулевые
+    `sizes` разбивкой не считаются — это безразмерная позиция, и сверять в ней
+    нечего, `qty` стоит сам за себя.
+
+    Функция вынесена наружу нарочно: по ней сверяются ОБА места — вход API
+    (`app.api.OrderItemIn`) и защита перед отправкой (`push_order`). Иначе
+    «что считать разбивкой» имело бы два определения, и они разошлись бы —
+    ровно тот класс расхождения, против которого проверка и написана.
+    """
+    if not any(int(q or 0) > 0 for q in (item.get("sizes") or {}).values()):
+        return None
+    return sum(qty for _size, qty in _item_size_breakdown(item))
+
+
+def qty_split_mismatches(items: list[dict]) -> list[str]:
+    """Позиции, где количество расходится с НЕПУСТОЙ размерной разбивкой.
+
+    Пусто — расхождений нет. Список — человекочитаемые строки «что с чем не
+    сходится»: цифру за владельца никто не выбирает, ему называют обе.
+    """
+    out: list[str] = []
+    for item in items:
+        split = size_split_total(item)
+        if split is None:
+            continue
+        item_qty = int(item.get("qty") or 0)
+        if split != item_qty:
+            out.append(f"«{item.get('base_name') or '—'}» — в заказе "
+                       f"{item_qty} шт, по размерам {split} шт")
+    return out
+
+
 def _position_label(base_name: str, size: str) -> str:
     return f"{base_name} ({size})" if size else base_name
 
@@ -1349,6 +1385,47 @@ async def push_order(db: Session, org_id: int, order: ProductionOrder,
                 "совпадают с ассортиментом МС.",
             )
 
+        # 2а) Количество позиции против её размерной разбивки — и граница,
+        #     за которой не должно случиться НИ ОДНОЙ внешней записи.
+        #
+        # Документ поставщику собирается ИЗ РАЗБИВКИ (positions выше). Если
+        # разбивка расходится с общим количеством заказа, подрядчик получил бы
+        # одно число, а владелец видел бы у себя другое. Такие строки могли
+        # быть сохранены раньше, чем вход API стал их отклонять
+        # (`app.api.OrderItemIn`); молча починить их нельзя — какая из двух
+        # цифр верна, знает только владелец.
+        #
+        # Сама проверка локальная и бесплатная, но одного её результата мало:
+        # если документ УЖЕ создан, отказывать нельзя. Recovered-путь ниже
+        # существует ровно для этого случая — он берёт правду из самого
+        # документа, а не из локального снимка, и локальное расхождение ему не
+        # мешает (DATA-7 Package B, tests/test_writeback_idempotency.py,
+        # сценарий 30а). Запретить его значило бы навсегда оставить финансовый
+        # документ в чужом аккаунте без владельца.
+        #
+        # Отсюда порядок: локальная проверка → ТОЛЬКО read-only поиск своего
+        # документа → отказ, если документа нет. Шаги 3 и 4 намеренно остались
+        # НИЖЕ: `resolve_agent` умеет СОЗДАТЬ контрагента, а заводить клиенту
+        # подрядчика ради заказа, который мы всё равно не отправим, — та же
+        # побочная внешняя запись, только не документом. Для заказов без
+        # расхождения путь не меняется ни на один вызов: `existing` остаётся
+        # None, и поиск идёт своим обычным местом на шаге 5.
+        marker = order_marker(order.id)
+        existing: dict | None = None
+        mismatched = qty_split_mismatches(order.items)
+        if mismatched:
+            existing = await find_own_document(client, keys, marker)
+            if existing is None:
+                raise WritebackError(
+                    409,
+                    "Заказ не отправлен: количество расходится с разбивкой по "
+                    "размерам (" + "; ".join(mismatched) + "). Документ "
+                    "поставщику собирается по размерам, поэтому он ушёл бы не "
+                    "на то количество, которое стоит в заказе. Исправьте заказ "
+                    "и повторите отправку — выбрать за вас верную цифру мы не "
+                    "вправе.",
+                )
+
         # 3) Юрлицо (organization) — первое в аккаунте.
         orgs = await client.fetch_organizations()
         if not orgs:
@@ -1373,8 +1450,10 @@ async def push_order(db: Session, org_id: int, order: ProductionOrder,
         # а не заводит второй. Метка `[oborot#N]` в описании остаётся, но её
         # работа теперь другая: она читаема человеком, нужна диагностике и
         # правилу принадлежности D-28 в синке — а идемпотентность держит ключ.
-        marker = order_marker(order.id)
-        existing = await find_own_document(client, keys, marker)
+        # На шаге 2а поиск уже мог быть выполнен (только при расхождении) —
+        # второй раз в сеть не ходим.
+        if existing is None:
+            existing = await find_own_document(client, keys, marker)
         if existing is not None:
             doc, recovered = existing, True
             # Документ уже существует — прошлая попытка (или legacy-документ)
@@ -1399,6 +1478,10 @@ async def push_order(db: Session, org_id: int, order: ProductionOrder,
             if order.eta_date:
                 # Планируемая дата приёмки — из ETA заказа.
                 payload["deliveryPlannedMoment"] = f"{order.eta_date} 00:00:00"
+            # Документа нет — он будет СОЗДАН, и уедет он ровно `positions`,
+            # то есть РАЗБИВКА. Расхождение сюда дойти не может: оно отсечено
+            # на шаге 2а, до шагов 3 и 4, чтобы отказ не стоил клиенту ни
+            # одной внешней записи (в том числе заведённого контрагента).
             recovered = False
             try:
                 doc = await client.create_purchase_order(payload)

@@ -18,6 +18,7 @@
 
 Запуск из корня репозитория:  python tests/test_writeback.py
 """
+import json
 import os
 import sqlite3
 import sys
@@ -47,6 +48,7 @@ import httpx  # noqa: E402
 import uvicorn  # noqa: E402
 
 import mock_ms  # noqa: E402
+from app import ms_writeback  # noqa: E402
 from app.main import app as oborot_app  # noqa: E402
 
 
@@ -112,6 +114,72 @@ def tracked_map() -> dict:
         "SELECT base_name, ms_qty, ms_qty_tracked FROM ordered_qty")}
     con.close()
     return rows
+
+
+def _order_count() -> int:
+    """Сколько строк заказов в базе — чтобы отказ входа был виден как «не сохранён»."""
+    con = sqlite3.connect(DB_PATH)
+    try:
+        return con.execute("SELECT COUNT(*) FROM production_orders").fetchone()[0]
+    finally:
+        con.close()
+
+
+def _order_href(order_id: int) -> str | None:
+    con = sqlite3.connect(DB_PATH)
+    try:
+        row = con.execute("SELECT ms_doc_href FROM production_orders WHERE id = ?",
+                          (order_id,)).fetchone()
+        return row[0] if row else None
+    finally:
+        con.close()
+
+
+def _set_items_json(order_id: int, items: list[dict]) -> None:
+    """Вписать состав заказа МИМО API — так расхождение и попадало в базу раньше.
+
+    Нужно ровно для одного: смоделировать УЖЕ СОХРАНЁННЫЙ заказ, который вход
+    API сегодня не принял бы. Настоящие старые записи этим тестом не трогаются
+    и не мигрируются — проверяется только то, что наружу они не уезжают.
+    """
+    con = sqlite3.connect(DB_PATH, timeout=30)
+    try:
+        con.execute("UPDATE production_orders SET items_json = ? WHERE id = ?",
+                    (json.dumps(items, ensure_ascii=False), order_id))
+        con.commit()
+    finally:
+        con.close()
+
+
+def _clear_agent_binding() -> str:
+    """Снять закрепление контрагента у организации; вернуть прежний href.
+
+    Так моделируется «новый поставщик»: у организации ещё нет закреплённого
+    подрядчика, и resolve_agent пошла бы его ИСКАТЬ, а не найдя — создавать.
+    Служебный ms_agent_sync_id намеренно не трогаем: без него resolve_agent
+    отказала бы раньше и совсем по другой причине.
+    """
+    con = sqlite3.connect(DB_PATH, timeout=30)
+    try:
+        row = con.execute(
+            "SELECT ms_agent_href FROM connections "
+            "WHERE kind = 'moysklad' AND org_id = 1").fetchone()
+        con.execute("UPDATE connections SET ms_agent_href = '' "
+                    "WHERE kind = 'moysklad' AND org_id = 1")
+        con.commit()
+        return (row[0] if row else "") or ""
+    finally:
+        con.close()
+
+
+def _restore_agent_binding(href: str) -> None:
+    con = sqlite3.connect(DB_PATH, timeout=30)
+    try:
+        con.execute("UPDATE connections SET ms_agent_href = ? "
+                    "WHERE kind = 'moysklad' AND org_id = 1", (href,))
+        con.commit()
+    finally:
+        con.close()
 
 
 def sku_ext(base: str, size: str) -> str | None:
@@ -757,6 +825,150 @@ def run_scenario() -> int:
           ren_after_recv[0] == ren_before_recv[0] - 1
           and ren_after_recv[1] == ren_before_recv[1],
           f"{ren_before_recv} -> {ren_after_recv} (ждали qty-1, ms_qty без изменений)")
+
+    print("== A06: количество против размерной разбивки ==")
+    # Дефект, воспроизведённый на BASE ea1caff: строка «qty=10, sizes={M:20}»
+    # принималась входом API (размеры проверялись только поштучно), ложилась в
+    # заказ как есть, а документ поставщику собирается ИЗ РАЗБИВКИ
+    # (_item_size_breakdown) — подрядчику ушло бы 20, а в заказе стояло бы 10.
+    #
+    # Здесь проверяются ОБА конца: вход больше такую строку не принимает, а уже
+    # сохранённый «старый» заказ с таким расхождением не уезжает наружу — и
+    # останавливается это ДО первого сетевого вызова, то есть без документа.
+    a06_orders_before = _order_count()
+    r = client.post("/api/orders", json={
+        "name": "A06 расхождение", "eta_date": None, "items": [
+            {"base_name": "Худи «Штрих»", "qty": 10, "sizes": {"M": 20}, "cost": 3600},
+        ],
+    })
+    check("вход API отклоняет qty=10 против sizes={M:20} → 422",
+          r.status_code == 422, f"status={r.status_code} body={r.text[:200]}")
+    check("отказ называет ОБА числа и не подставляет «правильное» сам",
+          "10" in r.text and "20" in r.text and "не выбираем" in r.text,
+          r.text[:220])
+    check("отклонённый заказ не сохранён (ни одной новой строки)",
+          _order_count() == a06_orders_before,
+          f"{a06_orders_before} -> {_order_count()}")
+
+    # Согласованная строка проходит ровно как раньше — payload не менялся.
+    r = client.post("/api/orders", json={
+        "name": "A06 согласованный", "eta_date": None, "items": [
+            {"base_name": "Худи «Штрих»", "qty": 2, "sizes": {"S": 2}, "cost": 3600},
+        ],
+    })
+    check("согласованный заказ (qty=2, sizes={S:2}) по-прежнему создаётся",
+          r.status_code == 200, f"status={r.status_code} body={r.text[:200]}")
+    order_a06 = r.json()["id"]
+
+    # Безразмерная позиция — поддержанный контракт, правкой не тронут.
+    r = client.post("/api/orders", json={
+        "name": "A06 безразмерный", "eta_date": None, "items": [
+            {"base_name": "Худи «Штрих»", "qty": 10, "sizes": {}, "cost": 3600},
+        ],
+    })
+    check("безразмерный заказ (qty=10, sizes={}) по-прежнему создаётся",
+          r.status_code == 200, f"status={r.status_code} body={r.text[:200]}")
+    r = client.post("/api/orders", json={
+        "name": "A06 без ключа sizes", "eta_date": None, "items": [
+            {"base_name": "Худи «Штрих»", "qty": 10, "cost": 3600},
+        ],
+    })
+    check("заказ без ключа sizes вовсе — тоже создаётся",
+          r.status_code == 200, f"status={r.status_code} body={r.text[:200]}")
+    # Полностью нулевые размеры разбивкой не считаются: это та же безразмерная
+    # позиция, и так её читает _item_size_breakdown — контракт не меняется.
+    r = client.post("/api/orders", json={
+        "name": "A06 нулевые размеры", "eta_date": None, "items": [
+            {"base_name": "Худи «Штрих»", "qty": 10, "sizes": {"M": 0}, "cost": 3600},
+        ],
+    })
+    check("qty=10 при sizes={M:0} — принимается (нулевые размеры это не разбивка)",
+          r.status_code == 200, f"status={r.status_code} body={r.text[:200]}")
+
+    # «Старый» заказ: расхождение вписано мимо API, как оно и могло попасть в
+    # базу до этой правки. Ничего не мигрируем и не чиним — только не пускаем.
+    docs_before_a06 = len(mock_ms.CREATED_PURCHASE_ORDERS)
+    _set_items_json(order_a06, [
+        {"base_name": "Худи «Штрих»", "qty": 2, "sizes": {"S": 5}, "cost": 3600}])
+    r = client.post(f"/api/orders/{order_a06}/push-to-ms")
+    check("сохранённый ранее mismatch не уходит в МойСклад → 409",
+          r.status_code == 409, f"status={r.status_code} body={r.text[:200]}")
+    check("отказ называет позицию и оба числа",
+          "Худи «Штрих»" in r.text and "2" in r.text and "5" in r.text, r.text[:250])
+    check("документ НЕ создан — отказ встал перед POST создания документа",
+          len(mock_ms.CREATED_PURCHASE_ORDERS) == docs_before_a06,
+          f"{docs_before_a06} -> {len(mock_ms.CREATED_PURCHASE_ORDERS)}")
+    check("пометка отправки снята: заказ не заперт отказом",
+          not (_order_href(order_a06) or ""), f"href={_order_href(order_a06)!r}")
+
+    # Проверка стоит на ветке СОЗДАНИЯ документа, а не в начале push_order:
+    # до find_own_document неизвестно, создаём мы документ или подбираем уже
+    # созданный, и ранний отказ закрыл бы recovered-путь — заказ с реально
+    # существующим документом остался бы сиротой навсегда. Что recovered
+    # переживает расхождение локального снимка, проверяет DATA-7 Package B
+    # (tests/test_writeback_idempotency.py, сценарий 30а).
+    #
+    # Тот же заказ с исправленной разбивкой уходит штатно: закрыт mismatch,
+    # а не механизм отправки.
+    _set_items_json(order_a06, [
+        {"base_name": "Худи «Штрих»", "qty": 2, "sizes": {"S": 2}, "cost": 3600}])
+    r = client.post(f"/api/orders/{order_a06}/push-to-ms")
+    check("после исправления разбивки тот же заказ отправляется → 200",
+          r.status_code == 200 and r.json().get("ok"),
+          f"status={r.status_code} body={r.text[:200]}")
+    check("и документ в МойСкладе появился ровно один",
+          len(mock_ms.CREATED_PURCHASE_ORDERS) == docs_before_a06 + 1,
+          f"{docs_before_a06} -> {len(mock_ms.CREATED_PURCHASE_ORDERS)}")
+
+    print("== A06: mismatch + новый поставщик → ни одной внешней записи ==")
+    # Отказ «до создания документа» сам по себе ещё не значит «без побочных
+    # внешних записей»: выше по push_order стоит resolve_agent, а он при
+    # нулевом совпадении СОЗДАЁТ контрагента (ms_writeback.resolve_agent,
+    # шаг 3). Для нового поставщика это значит заведённого в чужом аккаунте
+    # подрядчика ради заказа, который мы всё равно не отправим.
+    #
+    # «Новый поставщик» моделируется честно: снимаем закрепление контрагента
+    # у организации и убираем его из мира mock-МойСклада, оставив служебный
+    # syncId (без него resolve_agent отказала бы раньше, по другой причине).
+    r = client.post("/api/orders", json={
+        "name": "A06 новый поставщик", "eta_date": None, "items": [
+            {"base_name": "Худи «Штрих»", "qty": 2, "sizes": {"S": 2}, "cost": 3600},
+        ],
+    })
+    check("заказ для проверки «нового поставщика» создан", r.status_code == 200,
+          f"status={r.status_code} body={r.text[:200]}")
+    order_a06b = r.json()["id"]
+    _set_items_json(order_a06b, [
+        {"base_name": "Худи «Штрих»", "qty": 2, "sizes": {"S": 7}, "cost": 3600}])
+
+    agent_href_saved = _clear_agent_binding()
+    cps_saved = list(mock_ms.COUNTERPARTIES)
+    mock_ms.COUNTERPARTIES[:] = [cp for cp in mock_ms.COUNTERPARTIES
+                                 if cp.get("name") != ms_writeback.AGENT_NAME]
+    check("подготовка: контрагента «Производство» в МойСкладе нет",
+          not any(cp.get("name") == ms_writeback.AGENT_NAME
+                  for cp in mock_ms.COUNTERPARTIES),
+          f"counterparties={[cp.get('name') for cp in mock_ms.COUNTERPARTIES]}")
+    cps_before = len(mock_ms.COUNTERPARTIES)
+    docs_before_a06b = len(mock_ms.CREATED_PURCHASE_ORDERS)
+
+    r = client.post(f"/api/orders/{order_a06b}/push-to-ms")
+    check("mismatch у нового поставщика → 409", r.status_code == 409,
+          f"status={r.status_code} body={r.text[:200]}")
+    check("НИ ОДНОГО нового контрагента не заведено (resolve_agent не дошла)",
+          len(mock_ms.COUNTERPARTIES) == cps_before,
+          f"{cps_before} -> {len(mock_ms.COUNTERPARTIES)}: "
+          f"{[cp.get('name') for cp in mock_ms.COUNTERPARTIES]}")
+    check("и документа тоже нет",
+          len(mock_ms.CREATED_PURCHASE_ORDERS) == docs_before_a06b,
+          f"{docs_before_a06b} -> {len(mock_ms.CREATED_PURCHASE_ORDERS)}")
+    check("заказ не заперт: пометка отправки снята",
+          not (_order_href(order_a06b) or ""), f"href={_order_href(order_a06b)!r}")
+
+    # Мир возвращается как был — следующие блоки набора не должны видеть
+    # последствий этой подготовки.
+    mock_ms.COUNTERPARTIES[:] = cps_saved
+    _restore_agent_binding(agent_href_saved)
 
     print("== Демо-режим и изоляция ==")
     docs_before_demo = len(mock_ms.CREATED_PURCHASE_ORDERS)

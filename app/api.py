@@ -4,7 +4,7 @@ import json
 from datetime import date, datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Path
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session
 
@@ -118,6 +118,36 @@ class OrderItemIn(BaseModel):
             if q > 100_000:
                 raise ValueError(f"Неправдоподобное количество в размере {size!r}")
         return v
+
+    @model_validator(mode="after")
+    def _qty_matches_size_split(self) -> "OrderItemIn":
+        """Общее количество обязано сходиться с НЕПУСТОЙ разбивкой по размерам.
+
+        До этой проверки размеры сверялись только поштучно, а `qty` с их суммой
+        не сверялся вовсе: строка «10 штук, из них M — 20» принималась, ложилась
+        в заказ как есть и уезжала в МойСклад ПО РАЗБИВКЕ (ms_writeback.
+        _item_size_breakdown), то есть подрядчику — 20, а владельцу на экране —
+        10. Разбивка читается тем же кодом, что собирает документ, — иначе вход
+        и отправка разошлись бы в том, что считать разбивкой.
+
+        Чего проверка НЕ делает: не трогает безразмерные позиции. Пустые,
+        отсутствующие и полностью нулевые `sizes` разбивкой не являются — там
+        `qty` стоит сам за себя, и такие заказы (qty=10, sizes={}) остаются
+        валидными ровно как раньше.
+
+        Расхождение — отказ, а не автоподстановка «правильного» числа: какая из
+        двух цифр верна, знает только тот, кто заказывает. Подставить любую из
+        них молча значило бы решить за него на его же деньги.
+        """
+        split = ms_writeback.size_split_total(
+            {"qty": self.qty, "sizes": self.sizes})
+        if split is not None and split != self.qty:
+            raise ValueError(
+                f"Количество не сходится с разбивкой по размерам: указано "
+                f"{self.qty} шт, по размерам {split} шт. Исправьте одно из двух "
+                f"чисел — какое верное, за вас мы не выбираем."
+            )
+        return self
 
 
 class OrderIn(BaseModel):
