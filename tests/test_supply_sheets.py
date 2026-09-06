@@ -158,6 +158,30 @@ def exec_sql(query: str, *args) -> int:
         con.close()
 
 
+def enable_preview_all() -> None:
+    """Флаг предпросмотра — всем организациям набора (SUPPLY-FIX-1, F-08).
+
+    Вкладка и обе ручки `/api/supply/sheets*` теперь закрыты флагом
+    `settings.supply_sheets_preview`, и по умолчанию его нет ни у кого. Этот
+    набор проверяет САМ ПАРСЕР и его границы, а не гейт: без включённого флага
+    он получал бы 404 на каждом запросе и зеленел бы, ничего не разобрав.
+    Поэтому флаг включается явно и сразу после регистрации — видимой строкой, а
+    не подменой свойства модели. Что гейт закрыт по умолчанию и открывается
+    только флагом, проверяется отдельно (`tests/test_supply.py`,
+    `tests/test_supply_planning.py`).
+    """
+    for (org_id, raw) in sql("SELECT id, settings_json FROM orgs"):
+        try:
+            data = json.loads(raw or "{}")
+        except ValueError:
+            data = {}
+        if data.get("supply_sheets_preview") is True:
+            continue
+        data["supply_sheets_preview"] = True
+        exec_sql("UPDATE orgs SET settings_json = ? WHERE id = ?",
+                 json.dumps(data, ensure_ascii=False), org_id)
+
+
 def client(port: int = APP_PORT) -> httpx.Client:
     return httpx.Client(headers={"X-Oborot-CSRF": "1"},
                         base_url=f"http://127.0.0.1:{port}", timeout=60.0)
@@ -1296,6 +1320,7 @@ def isolation_checks(owner, member, org_id: int) -> None:
         other = client()
         other.post("/register", data={"name": "Чужой", "email": "sheets-b@test.io",
                                       "password": "secret123", "org_name": "Бренд-Б"})
+        enable_preview_all()
         other.post("/api/connect/demo")
         theirs = other.get("/api/supply/sheets?limit=200").json()
         check("у чужой организации предпросмотра нет",
@@ -1325,6 +1350,7 @@ def isolation_checks(owner, member, org_id: int) -> None:
         naked = client()
         naked.post("/register", data={"name": "Без связи", "email": "sheets-c@test.io",
                                       "password": "secret123", "org_name": "Бренд-В"})
+        enable_preview_all()
         naked_id = sql("SELECT org_id FROM memberships WHERE user_id ="
                        " (SELECT id FROM users WHERE email = 'sheets-c@test.io')")[0][0]
         exec_sql("DELETE FROM connections WHERE org_id = ?", naked_id)
@@ -1364,6 +1390,7 @@ def first_failure_checks() -> None:
     fresh = client()
     fresh.post("/register", data={"name": "Первый сбой", "email": "sheets-f@test.io",
                                  "password": "secret123", "org_name": "Бренд-Е"})
+    enable_preview_all()
     fresh.post("/api/connect/demo")
     org_id = sql("SELECT org_id FROM memberships WHERE user_id ="
                  " (SELECT id FROM users WHERE email = 'sheets-f@test.io')")[0][0]
@@ -1427,6 +1454,7 @@ def envelope_version_checks() -> None:
     holder = client()
     holder.post("/register", data={"name": "Версии", "email": "sheets-g@test.io",
                                   "password": "secret123", "org_name": "Бренд-Ж"})
+    enable_preview_all()
     holder.post("/api/connect/demo")
     org_id = sql("SELECT org_id FROM memberships WHERE user_id ="
                  " (SELECT id FROM users WHERE email = 'sheets-g@test.io')")[0][0]
@@ -1534,6 +1562,7 @@ def row_shape_checks() -> None:  # noqa: C901 — матрица полей, в�
     shaped = client()
     shaped.post("/register", data={"name": "Форма строк", "email": "sheets-i@test.io",
                                   "password": "secret123", "org_name": "Бренд-И"})
+    enable_preview_all()
     shaped.post("/api/connect/demo")
     org_id = sql("SELECT org_id FROM memberships WHERE user_id ="
                  " (SELECT id FROM users WHERE email = 'sheets-i@test.io')")[0][0]
@@ -1697,6 +1726,7 @@ def row_required_checks() -> None:  # noqa: C901 — матрица полей, 
     req.post("/register", data={"name": "Обязательные поля",
                                 "email": "sheets-r@test.io",
                                 "password": "secret123", "org_name": "Бренд-Р"})
+    enable_preview_all()
     req.post("/api/connect/demo")
     org_id = sql("SELECT org_id FROM memberships WHERE user_id ="
                  " (SELECT id FROM users WHERE email = 'sheets-r@test.io')")[0][0]
@@ -1871,6 +1901,7 @@ def continuity_checks() -> None:  # noqa: C901 — сценарный тест: 
     cont = client()
     cont.post("/register", data={"name": "Непрерывность", "email": "sheets-h@test.io",
                                 "password": "secret123", "org_name": "Бренд-З"})
+    enable_preview_all()
     cont.post("/api/connect/demo")
     org_id = sql("SELECT org_id FROM memberships WHERE user_id ="
                  " (SELECT id FROM users WHERE email = 'sheets-h@test.io')")[0][0]
@@ -2112,6 +2143,7 @@ def continuity_checks() -> None:  # noqa: C901 — сценарный тест: 
         neighbour = client()
         neighbour.post("/register", data={"name": "Сосед", "email": "sheets-j@test.io",
                                           "password": "secret123", "org_name": "Бренд-К"})
+        enable_preview_all()
         neighbour.post("/api/connect/demo")
         other_id = sql("SELECT org_id FROM memberships WHERE user_id ="
                        " (SELECT id FROM users WHERE email = 'sheets-j@test.io')")[0][0]
@@ -2163,6 +2195,7 @@ def purge_checks() -> None:
     doomed = client()
     doomed.post("/register", data={"name": "Уходящий", "email": "sheets-d@test.io",
                                    "password": "secret123", "org_name": "Бренд-Г"})
+    enable_preview_all()
     doomed.post("/api/connect/demo")
     org_id = sql("SELECT org_id FROM memberships WHERE user_id ="
                  " (SELECT id FROM users WHERE email = 'sheets-d@test.io')")[0][0]
@@ -2388,8 +2421,17 @@ def structural_checks(owner) -> None:
           Path(ROOT / "templates" / "supply.html").read_text(encoding="utf-8"))
 
     print("\n== Раздел обнаружим в навигации ==")
+    # SUPPLY-FIX-1 (F-01): девять самостоятельных страниц держали по СОБСТВЕННОЙ
+    # копии списка ссылок; теперь список один — `_nav_links.html`. Проверка идёт
+    # за включением на один уровень, иначе она краснела бы от де-дупликации,
+    # ничего не говоря про саму ссылку. Что ссылка ЕСТЬ и работает на всех
+    # десяти страницах, доказывает браузерная проверка F-01 в test_supply_ui.py;
+    # здесь — структурная страховка на случай, если фрагмент отвяжут.
+    fragment = (ROOT / "templates" / "_nav_links.html").read_text(encoding="utf-8")
     for name in ("base.html", "_embed.html", "replenish.html"):
         text = (ROOT / "templates" / name).read_text(encoding="utf-8")
+        if '{% include "_nav_links.html" %}' in text:
+            text += fragment
         check(f"ссылка «Поставки» есть в {name}",
               'href="/supply"' in text and "Поставки" in text)
     base = (ROOT / "templates" / "base.html").read_text(encoding="utf-8")
@@ -2423,8 +2465,8 @@ def structural_checks(owner) -> None:
     # растёт. Замок стоит на неизменности выпущенного, а не на длине списка.
     print("\n== Схема не тронута: те же десять выпущенных шагов старта ==")
     from app import main as _main
-    check("шагов одиннадцать: десять выпущенных плюс один дописанный сверху",
-          len(_main.STARTUP_SCHEMA_STEPS) == 11,
+    check("шагов двенадцать: десять выпущенных плюс два дописанных сверху",
+          len(_main.STARTUP_SCHEMA_STEPS) == 12,
           str(len(_main.STARTUP_SCHEMA_STEPS)))
     check("и первые десять — ровно прежние пары (id, позиция)",
           list(_main.STARTUP_SCHEMA_STEPS)[:10] == [
@@ -2524,6 +2566,7 @@ def carrier_choice_checks() -> None:
     picker = client()
     picker.post("/register", data={"name": "Двойной", "email": "sheets-e@test.io",
                                    "password": "secret123", "org_name": "Бренд-Д"})
+    enable_preview_all()
     org_id = sql("SELECT org_id FROM memberships WHERE user_id ="
                  " (SELECT id FROM users WHERE email = 'sheets-e@test.io')")[0][0]
     exec_sql("DELETE FROM connections WHERE org_id = ?", org_id)
@@ -2633,6 +2676,7 @@ def safe_error_checks() -> None:  # noqa: C901 — матрица веток, в
     holder = client()
     holder.post("/register", data={"name": "Утечка", "email": "sheets-leak@test.io",
                                    "password": "secret123", "org_name": "Бренд-У"})
+    enable_preview_all()
     holder.post("/api/connect/demo")
     org_id = sql("SELECT org_id FROM memberships WHERE user_id ="
                  " (SELECT id FROM users WHERE email = 'sheets-leak@test.io')")[0][0]
@@ -2696,6 +2740,7 @@ def attempt_privacy_checks() -> None:
     boss = client()
     boss.post("/register", data={"name": "Приватность", "email": "sheets-p@test.io",
                                 "password": "secret123", "org_name": "Бренд-П"})
+    enable_preview_all()
     boss.post("/api/connect/demo")
     org_id = sql("SELECT org_id FROM memberships WHERE user_id ="
                  " (SELECT id FROM users WHERE email = 'sheets-p@test.io')")[0][0]
@@ -2794,6 +2839,7 @@ def failure_privacy_checks() -> None:  # noqa: C901 — сценарий, вет
     boss.post("/register", data={"name": "Приватность-2",
                                  "email": "sheets-pv@test.io",
                                  "password": "secret123", "org_name": "Бренд-ПВ"})
+    enable_preview_all()
     boss.post("/api/connect/demo")
     org_id = sql("SELECT org_id FROM memberships WHERE user_id ="
                  " (SELECT id FROM users WHERE email = 'sheets-pv@test.io')")[0][0]
@@ -3009,6 +3055,7 @@ def malformed_url_checks() -> None:
     typed = client()
     typed.post("/register", data={"name": "Типы", "email": "sheets-t@test.io",
                                  "password": "secret123", "org_name": "Бренд-Т"})
+    enable_preview_all()
     typed.post("/api/connect/demo")
     org_id = sql("SELECT org_id FROM memberships WHERE user_id ="
                  " (SELECT id FROM users WHERE email = 'sheets-t@test.io')")[0][0]
@@ -3142,6 +3189,7 @@ def incomplete_counts_checks() -> None:  # noqa: C901 — сценарий, ве
     stale_c.post("/register", data={"name": "Устаревший разбор",
                                     "email": "sheets-stale@test.io",
                                     "password": "secret123", "org_name": "Бренд-С"})
+    enable_preview_all()
     stale_c.post("/api/connect/demo")
     org_id = sql("SELECT org_id FROM memberships WHERE user_id ="
                  " (SELECT id FROM users WHERE email = 'sheets-stale@test.io')")[0][0]
@@ -3280,6 +3328,7 @@ def stored_counts_checks() -> None:  # noqa: C901 — матрица подме�
     liar.post("/register", data={"name": "Ложная сводка",
                                  "email": "sheets-cnt@test.io",
                                  "password": "secret123", "org_name": "Бренд-Ц"})
+    enable_preview_all()
     liar.post("/api/connect/demo")
     org_id = sql("SELECT org_id FROM memberships WHERE user_id ="
                  " (SELECT id FROM users WHERE email = 'sheets-cnt@test.io')")[0][0]
@@ -3605,6 +3654,7 @@ def bound_public_reason_checks() -> None:  # noqa: C901 — матрица по�
     boss.post("/register", data={"name": "Связывание",
                                  "email": "sheets-bind@test.io",
                                  "password": "secret123", "org_name": "Бренд-СВ"})
+    enable_preview_all()
     boss.post("/api/connect/demo")
     org_id = sql("SELECT org_id FROM memberships WHERE user_id ="
                  " (SELECT id FROM users WHERE email = 'sheets-bind@test.io')")[0][0]
@@ -3956,6 +4006,7 @@ def envelope_headroom_checks() -> None:  # noqa: C901 — сценарий, ве
     boss.post("/register", data={"name": "Граница",
                                  "email": "sheets-edge@test.io",
                                  "password": "secret123", "org_name": "Бренд-ГР"})
+    enable_preview_all()
     boss.post("/api/connect/demo")
     org_id = sql("SELECT org_id FROM memberships WHERE user_id ="
                  " (SELECT id FROM users WHERE email = 'sheets-edge@test.io')")[0][0]
@@ -4276,6 +4327,7 @@ def truncated_reason_checks() -> None:
     boss.post("/register", data={"name": "Обрезка",
                                  "email": "sheets-cut@test.io",
                                  "password": "secret123", "org_name": "Бренд-ОБ"})
+    enable_preview_all()
     boss.post("/api/connect/demo")
     org_id = sql("SELECT org_id FROM memberships WHERE user_id ="
                  " (SELECT id FROM users WHERE email = 'sheets-cut@test.io')")[0][0]
@@ -4354,6 +4406,7 @@ def legacy_parser3_stale_checks() -> None:  # noqa: C901 — сценарий, �
     boss.post("/register", data={"name": "Легаси",
                                  "email": "sheets-legacy@test.io",
                                  "password": "secret123", "org_name": "Бренд-ЛГ"})
+    enable_preview_all()
     boss.post("/api/connect/demo")
     org_id = sql("SELECT org_id FROM memberships WHERE user_id ="
                  " (SELECT id FROM users WHERE email = 'sheets-legacy@test.io')")[0][0]
@@ -4513,6 +4566,7 @@ def saved_sheet_names_checks() -> None:  # noqa: C901 — матрица фор�
     boss.post("/register", data={"name": "Имена",
                                  "email": "sheets-names@test.io",
                                  "password": "secret123", "org_name": "Бренд-ИМ"})
+    enable_preview_all()
     boss.post("/api/connect/demo")
     org_id = sql("SELECT org_id FROM memberships WHERE user_id ="
                  " (SELECT id FROM users WHERE email = 'sheets-names@test.io')")[0][0]
@@ -4655,6 +4709,7 @@ def surrogate_name_checks() -> None:  # noqa: C901 — две границы, в
     boss.post("/register", data={"name": "Суррогат",
                                  "email": "sheets-surr@test.io",
                                  "password": "secret123", "org_name": "Бренд-СР"})
+    enable_preview_all()
     boss.post("/api/connect/demo")
     org_id = sql("SELECT org_id FROM memberships WHERE user_id ="
                  " (SELECT id FROM users WHERE email = 'sheets-surr@test.io')")[0][0]
@@ -4793,6 +4848,7 @@ def row_surrogate_checks() -> None:  # noqa: C901 — матрица конте�
     boss.post("/register", data={"name": "Строки",
                                  "email": "sheets-rowsurr@test.io",
                                  "password": "secret123", "org_name": "Бренд-СТ"})
+    enable_preview_all()
     boss.post("/api/connect/demo")
     org_id = sql("SELECT org_id FROM memberships WHERE user_id ="
                  " (SELECT id FROM users WHERE email = 'sheets-rowsurr@test.io')")[0][0]
@@ -4925,6 +4981,7 @@ def persisted_representability_checks() -> None:  # noqa: C901 — матриц�
     boss.post("/register", data={"name": "Инвариант",
                                  "email": "sheets-inv@test.io",
                                  "password": "secret123", "org_name": "Бренд-ИН"})
+    enable_preview_all()
     boss.post("/api/connect/demo")
     org_id = sql("SELECT org_id FROM memberships WHERE user_id ="
                  " (SELECT id FROM users WHERE email = 'sheets-inv@test.io')")[0][0]
@@ -5240,6 +5297,7 @@ def non_finite_number_checks() -> None:  # noqa: C901 — матрица пут�
     boss.post("/register", data={"name": "Числа",
                                  "email": "sheets-nan@test.io",
                                  "password": "secret123", "org_name": "Бренд-ЧС"})
+    enable_preview_all()
     boss.post("/api/connect/demo")
     org_id = sql("SELECT org_id FROM memberships WHERE user_id ="
                  " (SELECT id FROM users WHERE email = 'sheets-nan@test.io')")[0][0]
@@ -5373,6 +5431,7 @@ def search_checks() -> None:  # noqa: C901 — сценарная матрица
     seeker = client()
     seeker.post("/register", data={"name": "Поиск", "email": "sheets-q@test.io",
                                    "password": "secret123", "org_name": "Бренд-П"})
+    enable_preview_all()
     seeker.post("/api/connect/demo")
     org_id = sql("SELECT org_id FROM memberships WHERE user_id ="
                  " (SELECT id FROM users WHERE email = 'sheets-q@test.io')")[0][0]
@@ -5547,6 +5606,7 @@ def run() -> int:
     print("\n== Подготовка организации ==")
     r = owner.post("/register", data={"name": "Владелец", "email": "sheets-owner@test.io",
                                       "password": "secret123", "org_name": "Бренд-А"})
+    enable_preview_all()
     check("владелец зарегистрирован", r.status_code in (200, 302, 303), str(r.status_code))
     check("демо-данные загружены", owner.post("/api/connect/demo").status_code == 200)
     org_id = sql("SELECT org_id FROM memberships WHERE user_id ="

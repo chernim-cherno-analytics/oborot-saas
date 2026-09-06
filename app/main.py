@@ -232,6 +232,12 @@ STARTUP_SCHEMA_STEPS: tuple[tuple[str, int], ...] = (
     # позиция, иначе старт на боевой базе упал бы MigrationLedgerConflict,
     # и это не дефект, а замок.
     ("models.ensure_supply_planning_schema", 11),
+    # SUPPLY-FIX-1 (F-09, F-10): слияние дублей и два уникальных индекса.
+    # Снова дописан В КОНЕЦ новым id и позицией 12. Одиннадцать строк выше не
+    # тронуты — ни id, ни позиция. Этот шаг, в отличие от предыдущих, ТРОГАЕТ
+    # уже введённые строки (схлопывает дубли), поэтому его последствия и его
+    # откат разобраны в докстринге самой функции, а не только здесь.
+    ("models.ensure_supply_planning_unique_schema", 12),
 )
 _STARTUP_STEP_ORDER = dict(STARTUP_SCHEMA_STEPS)
 
@@ -417,6 +423,13 @@ def _startup() -> None:
     # отсутствующие таблицы, а частичный индекс идёт под IF NOT EXISTS.
     _startup_step("models.ensure_supply_planning_schema",
                   _models.ensure_supply_planning_schema)
+    # SUPPLY-FIX-1: дубли назначений и каталожных вещей схлопываются, после
+    # чего встают два уникальных индекса. Порядок внутри шага обратить нельзя —
+    # индекс на базе с дублями не создастся, и старт упал бы целиком. Шаг
+    # идемпотентен: после первого прохода дублей не остаётся, и повторный старт
+    # не делает ни одной записи.
+    _startup_step("models.ensure_supply_planning_unique_schema",
+                  _models.ensure_supply_planning_unique_schema)
     # Замок на пропуск: все объявленные шаги выполнены, и ровно они.
     _finish_startup_steps()
     global _STARTUP_DONE
@@ -1198,8 +1211,15 @@ def supply_page(request: Request, db: Session = Depends(get_db)):
     ctx = auth.resolve_auth(request, db)
     if ctx is None:
         return RedirectResponse("/login", status_code=302)
+    # SUPPLY-FIX-1 (F-08): вкладка предпросмотра рисуется только организации с
+    # флагом. Признак кладётся в контекст страницы, а не выясняется запросом с
+    # фронта, по той же причине, что и роль: человек не должен сначала увидеть
+    # вкладку, а потом потерять её после ответа API, которого для него нет.
+    from app import routes_supply as _routes_supply
     return _page(request, ctx, "supply.html", "supply", "Поставки", db=db,
-                 extra={"role": ctx.role})
+                 extra={"role": ctx.role,
+                        "sheets_preview":
+                            _routes_supply.preview_enabled(ctx.org)})
 
 
 @app.get("/turnover", response_class=HTMLResponse)

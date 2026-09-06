@@ -174,13 +174,33 @@ def parse_id(raw, field: str) -> int:
     return value
 
 
+#: Названия видов срока ДЛЯ ТЕКСТА ОШИБКИ. Ровно те слова, которые человек
+#: видит в списке на экране: ошибка, называющая внутренний код `text`, требует
+#: от него перевода, которого он не обязан знать.
+DUE_KIND_LABELS = {
+    "unknown": "неизвестен",
+    "approx": "ориентировочно",
+    "exact": "точная дата",
+    "text": "своими словами",
+}
+
+
 def parse_due(payload: dict) -> dict:
     """Срок: вид, текст, дата и ИСТОЧНИК — кто сказал.
 
     Источник хранится рядом со сроком не для красоты: «примерно к ноябрю» без
     автора и происхождения через месяц неотличимо от нашей собственной догадки.
     Ни одно из этих полей ни во что не считается — ни просрочки, ни SLA, ни
-    подстановки «сегодня» в слое нет вовсе.
+    подстановки «сегодня» при разборе нет вовсе.
+
+    ПРОТИВОРЕЧИВЫЙ ВВОД — ОТКАЗ, А НЕ ТИХОЕ ОБНУЛЕНИЕ. До этого пакета вид
+    срока молча выигрывал у остальных полей: «своими словами» с заполненной
+    датой отвечал 200 и выбрасывал дату, «срок неизвестен» с текстом — 200 и
+    выбрасывал текст. Человек видел успех и терял ровно то, что написал, а
+    узнавал об этом когда-нибудь потом. Теперь непустое поле, которого этот
+    вид срока не использует, останавливает запись и называет, что убрать.
+    Источник срока используется при ЛЮБОМ виде и здесь не отвергается: он
+    показывается на карточке даже у неизвестного срока, то есть не пропадает.
     """
     kind = clean_text(payload.get("due_kind") or "unknown", "вид срока", limit=16)
     if kind not in SUPPLY_DUE_KINDS:
@@ -195,12 +215,16 @@ def parse_due(payload: dict) -> dict:
             date.fromisoformat(iso)
         except ValueError:
             raise ValidationError("Дата должна быть в виде ГГГГ-ММ-ДД.") from None
-    else:
-        iso = ""
+    elif iso:
+        raise ValidationError(
+            f"Для срока «{DUE_KIND_LABELS[kind]}» дата не нужна — уберите дату "
+            "или выберите «точная дата».")
     if kind in ("approx", "text") and not text:
         raise ValidationError("Для ориентировочного срока нужен текст.")
-    if kind == "unknown":
-        text = ""
+    if kind in ("unknown", "exact") and text:
+        raise ValidationError(
+            f"Для срока «{DUE_KIND_LABELS[kind]}» текст не нужен — уберите "
+            "текст или выберите «своими словами».")
     return {"due_kind": kind, "due_text": text, "due_date": iso, "due_source": source}
 
 
@@ -401,14 +425,28 @@ def get_material(db: Session, org_id: int, material_id: int) -> SupplyMaterial:
 def create_item(db: Session, org_id: int, payload: dict, author: str) -> SupplyItem:
     """Вещь плана. `catalog` — из своего каталога, `draft` — полноценная новинка.
 
-    ДВА ОДИНАКОВЫХ ИМЕНИ — ДВЕ РАЗНЫЕ ВЕЩИ. Уникальности по имени здесь нет и не
-    будет: имена в производстве повторяются от сезона к сезону, и склеить их
-    значило бы принять за человека решение, которого он не принимал. Тождество —
+    ДВЕ НОВИНКИ С ОДНИМ ИМЕНЕМ — ДВЕ РАЗНЫЕ ВЕЩИ, И ЭТО НЕ ИЗМЕНИЛОСЬ. Рабочие
+    названия в производстве повторяются от сезона к сезону, и склеить их значило
+    бы принять за человека решение, которого он не принимал. Тождество новинки —
     это `id` строки.
+
+    У КАТАЛОЖНОЙ ВЕЩИ ТОЖДЕСТВО ДРУГОЕ, И ОНО НЕ НАШЕ. Каталожная вещь — это не
+    имя, придуманное здесь, а ссылка на строку СВОЕГО каталога: `base_name`
+    приходит из `products` и в пределах организации означает ровно одну модель.
+    Завести её в плане дважды нечем: обе строки указывали бы на одну и ту же
+    модель, партии расползлись бы по двум карточкам, и человек считал бы план по
+    половине. Поэтому повторный выбор той же модели ВОЗВРАЩАЕТ существующую
+    вещь (200 и её `id`), а не создаёт вторую; наружу это видно полем `reused`.
+    Это не склейка чужих имён, а отказ размножать один и тот же указатель.
 
     У каталожной вещи хранится КАНОНИЧЕСКОЕ имя (`products.base_name`), а не
     `id` размерной строки: размерная строка исчезает при пересинке каталога, и
     связь, построенная на ней, исчезла бы вместе с ней.
+
+    ЭСКИЗ — ТОЛЬКО У НОВИНКИ. Каталожная вещь уже описана каталогом, и до этого
+    пакета присланный ей `sketch_id` записывался в строку, но на экране вещи не
+    участвовал ни в чём: картинка занимала место в базе и в каждом бэкапе, а
+    человек не получал ничего. Молчание тут хуже отказа — теперь это 400.
     """
     kind = clean_text(payload.get("kind") or "draft", "вид вещи", limit=16)
     if kind not in SUPPLY_ITEM_KINDS:
@@ -434,6 +472,55 @@ def create_item(db: Session, org_id: int, payload: dict, author: str) -> SupplyI
             raise ValidationError(
                 "Такой вещи в вашем каталоге нет. Выберите из списка или "
                 "заведите новинку.")
+        if sketch_id is not None:
+            raise ValidationError("Эскиз прикрепляется только к новинке.")
+        existing = db.execute(
+            select(SupplyItem).where(SupplyItem.org_id == org_id,
+                                     SupplyItem.kind == "catalog",
+                                     SupplyItem.base_name == base_name).limit(1)
+        ).scalars().first()
+        if existing is not None:
+            # ВВЕДЁННАЯ ЗАМЕТКА НЕ ПРОПАДАЕТ МОЛЧА. Прежняя редакция возвращала
+            # найденную строку и на этом заканчивала: человек писал заметку,
+            # видел «Эта модель уже есть в плане» — и его текст исчезал без
+            # ошибки и без следа. Потеря ввода тут ничем не лучше той, что этот
+            # же пакет чинит в F-03.
+            #
+            # Заметка сливается тем же правилом, что уже принято для повторного
+            # назначения (D-55) и для самой миграции: старое, разделитель,
+            # новое; совпадающий текст не дублируется. Новой семантики это не
+            # вводит — это одно и то же правило в третьем месте.
+            existing.reused = True
+            if note:
+                merged, cut = _merge_notes(existing.note, note)
+                changed = merged != (existing.note or "")
+                op = parse_op_id(payload)
+                if changed:
+                    was = existing.note or ""
+                    existing.note = merged
+                    _touch(existing)
+                    _journal(db, org_id, "item", existing.id, "update",
+                             field="note", old=was, new=merged, author=author,
+                             op_id=op)
+                if cut:
+                    # ЗАПИСЬ ОБ ОБРЕЗКЕ НЕ ВЛОЖЕНА В «КОЛОНКА ИЗМЕНИЛАСЬ», И
+                    # ЭТО СУТЬ ПРАВКИ. Когда у вещи заметка уже занимает весь
+                    # предел, склейка `A*500 · НОВЫЙ` обрезается обратно ровно
+                    # в `A*500`: видимое поле не меняется ни на символ, и под
+                    # прежним условием весь блок пропускался — введённый текст
+                    # исчезал и из строки, и из журнала. Полный входящий текст
+                    # сохраняется ВСЕГДА, когда он не поместился.
+                    #
+                    # `op_id` несёт ровно одна запись поступка: частичный замок
+                    # `ux_supply_events_op` двух с одним значением не пустит.
+                    # Если колонка изменилась, его уже взяла запись `note`;
+                    # если нет — эта запись здесь и есть единственный след
+                    # поступка, и повтор с тем же `op_id` остаётся
+                    # идемпотентным.
+                    _journal(db, org_id, "item", existing.id, "update",
+                             field="note_truncated", old=note, new=merged,
+                             author=author, op_id="" if changed else op)
+            return existing
         title = base_name
     else:
         title = clean_text(payload.get("title"), "название новинки",
@@ -442,6 +529,7 @@ def create_item(db: Session, org_id: int, payload: dict, author: str) -> SupplyI
 
     row = SupplyItem(org_id=org_id, kind=kind, base_name=base_name, title=title,
                      sketch_id=sketch_id, note=note, author=author)
+    row.reused = False
     db.add(row)
     db.flush()
     _journal(db, org_id, "item", row.id, "create", field="title", old="", new=title,
@@ -456,10 +544,21 @@ def get_item(db: Session, org_id: int, item_id: int) -> SupplyItem:
     return row
 
 
-def catalog_options(db: Session, org_id: int, query: str = "", limit: int = 20) -> list[dict]:
+def catalog_options(db: Session, org_id: int, query: str = "",
+                    limit: int = 20) -> dict:
     """Кандидаты каталога по каноническому имени. Только чтение.
 
     Это подсказка выбора, а не привязка: пока человек не нажал, связи нет.
+
+    ОТДАЁТСЯ И `total` — СКОЛЬКО СОВПАЛО ВСЕГО, а не сколько поместилось в
+    ответ. Без него страница не может отличить «моделей ровно двадцать» от
+    «моделей пятьсот пятьдесят семь, показаны первые двадцать», и человек с
+    большим каталогом делает вывод о СВОИХ данных из нашего усечения. Лимит
+    остаётся: возвращать пятьсот строк на каждое нажатие клавиши незачем.
+
+    `catalog_size` — сколько моделей в каталоге ВООБЩЕ, без учёта запроса. По
+    нему страница отличает пустой каталог (синк не подключён — и об этом надо
+    сказать словами про МойСклад) от «ничего не нашлось по этому запросу».
     """
     stmt = (select(Product.base_name, func.count(Product.id))
             .where(Product.org_id == org_id, Product.archived.is_(False))
@@ -467,14 +566,16 @@ def catalog_options(db: Session, org_id: int, query: str = "", limit: int = 20) 
     needle = (query or "").strip().casefold()
     rows = db.execute(stmt).all()
     out = []
+    catalog_size = 0
     for base_name, sizes in rows:
         if not base_name:
             continue
+        catalog_size += 1
         if needle and needle not in base_name.casefold():
             continue
         out.append({"base_name": base_name, "sizes": int(sizes)})
     out.sort(key=lambda r: r["base_name"].casefold())
-    return out[:limit]
+    return {"options": out[:limit], "total": len(out), "catalog_size": catalog_size}
 
 
 # ── Плановая партия ──────────────────────────────────────────────────────────
@@ -582,6 +683,25 @@ def create_assignment(db: Session, org_id: int, payload: dict,
     Оба конца проверяются на принадлежность организации ДО записи: назначить
     чужой материал на свою партию (или наоборот) нельзя, и наружу это выглядит
     одинаково — «не найдено», без намёка на то, что строка где-то существует.
+
+    ОДНА ПАРА — ОДНА СТРОКА. Повторное назначение того же материала на ту же
+    партию ПРИБАВЛЯЕТ к существующей строке, а не заводит вторую. Прежняя
+    редакция всегда делала INSERT, и на карточке партии появлялись «фурнитура —
+    2 кг» и «фурнитура — 3 кг» рядом: сумма верная, а прочитать её человеку
+    нечем — он видит два разных материала с одним именем и не знает, сколько
+    отдано на самом деле. Хуже того, «Перенести» уже умел сливать строки
+    (`move_assignment`), то есть база жила по правилу «одна пара — одна
+    строка» ровно наполовину. Замок теперь стоит и в схеме
+    (`UNIQUE(org_id, material_id, batch_id)`), а не только в этой функции.
+
+    ЗАМЕТКА ПРИ СЛИЯНИИ НЕ ТЕРЯЕТСЯ. Новая непустая заметка дописывается к
+    прежней через « · », а не заменяет её: обе написал человек, и выбрать за
+    него, какая важнее, здесь не из чего. Каждая заметка ограничена на вводе
+    пятьюстами символами, а их склейка — нет, поэтому в видимое поле она может
+    не поместиться. Тогда обрезается ТОЛЬКО видимое поле, полный текст входящей
+    заметки уходит в журнал целиком (там своё поле того же размера), и сама
+    обрезка называется отдельной записью: укороченный текст, выданный за
+    полный, — это половина правды, а она хуже честного отказа (D-37).
     """
     material = get_material(db, org_id, parse_id(payload.get("material_id"), "материал"))
     batch = get_batch(db, org_id, parse_id(payload.get("batch_id"), "плановая партия"))
@@ -589,13 +709,65 @@ def create_assignment(db: Session, org_id: int, payload: dict,
     if qty is None or qty <= 0:
         raise ValidationError("Назначить нужно число больше нуля.")
     note = clean_text(payload.get("note"), "заметка", limit=MAX_NOTE_CHARS)
+    op_id = parse_op_id(payload)
+    existing = db.execute(
+        select(SupplyAssignment).where(SupplyAssignment.org_id == org_id,
+                                       SupplyAssignment.material_id == material.id,
+                                       SupplyAssignment.batch_id == batch.id).limit(1)
+    ).scalars().first()
+    if existing is not None:
+        was = float(existing.qty)
+        total = round(was + qty, 3)
+        if total > MAX_QTY:
+            raise ValidationError(
+                f"На этой партии уже {fmt_qty(was)} — вместе выходит больше "
+                f"допустимого предела {MAX_QTY:.0f}.")
+        existing.qty = total
+        merged_note, cut = _merge_notes(existing.note, note)
+        existing.note = merged_note
+        _touch(existing)
+        _journal(db, org_id, "assignment", existing.id, "update", field="qty",
+                 old=was, new=total, author=author, op_id=op_id)
+        if cut:
+            # Входящий текст целиком — в журнал, ДО того как человек увидит
+            # укороченное видимое поле. `op_id` пустой: поступок уже опознан
+            # записью выше, а вторая строка с тем же непустым `op_id` упёрлась
+            # бы в частичный замок `ux_supply_events_op`.
+            _journal(db, org_id, "assignment", existing.id, "update",
+                     field="note_truncated", old=note, new=merged_note,
+                     author=author)
+        existing.merged = True
+        return existing
     row = SupplyAssignment(org_id=org_id, material_id=material.id, batch_id=batch.id,
                            qty=qty, note=note, author=author)
+    row.merged = False
     db.add(row)
     db.flush()
     _journal(db, org_id, "assignment", row.id, "create", field="qty", old="", new=qty,
-             author=author, op_id=parse_op_id(payload))
+             author=author, op_id=op_id)
     return row
+
+
+def _merge_notes(old: str, new: str) -> tuple[str, bool]:
+    """Две заметки человека об одном и том же — обе, а не последняя.
+
+    Возвращает (значение видимого поля, было ли оно обрезано). Обрезка по
+    общему пределу нужна, чтобы слияние не могло вырасти длиннее того, что
+    принимает поле: иначе десятое назначение падало бы отказом базы вместо того,
+    чтобы сработать. Но обрезанное видимое поле — это не «сохранили»: полный
+    текст обязан лечь в журнал, и второй элемент кортежа существует ровно
+    затем, чтобы вызывающий не мог об этом «забыть» молча.
+    """
+    old = (old or "").strip()
+    new = (new or "").strip()
+    if not new or new == old:
+        return old, False
+    if not old:
+        return new, False
+    joined = f"{old} · {new}"
+    if len(joined) <= MAX_NOTE_CHARS:
+        return joined, False
+    return joined[:MAX_NOTE_CHARS], True
 
 
 def get_assignment(db: Session, org_id: int, assignment_id: int) -> SupplyAssignment:
@@ -905,6 +1077,25 @@ def next_step(mat_views: list[dict], items: list, batch_views: list[dict],
     полезен ровно один вопрос — что делать дальше. Порядок проверок повторяет
     порядок самого пути, поэтому подсказка не может предложить шаг, для
     которого ещё нет предыдущего.
+
+    ЗДЕСЬ ТОЛЬКО ЗАДАЧИ, А НЕ ПЕРЕСКАЗ СВОДКИ. Два правила убраны целиком, и
+    обоих не хватало ровно наоборот — они мешали:
+
+      * `assign` («у материала не назначено N») стояло ПЕРВЫМ и срабатывало у
+        любого материала со свободным остатком больше нуля. Свободный остаток —
+        это норма, а не задача: ткань покупают до того, как решено, что из неё
+        шьют, и «распределите» висело бы всегда. Хуже того, оно перекрывало
+        собой `over`, `plan_qty` и `due` — то есть настоящие расхождения были
+        не видны, пока на складе оставался хоть метр;
+      * `qty` («количество неизвестно») предлагало заполнить то, что человек
+        сознательно оставил неизвестным (D-49, «неизвестное ≠ ноль»). Это факт
+        сводки, и он там уже есть — счётчиком «без количества».
+
+    ПРОШЕДШИЙ ТОЧНЫЙ СРОК НАЗЫВАЕТСЯ ВСЛУХ (`due_past`), и это единственное
+    место слоя, которое смотрит на сегодняшнюю дату. Просрочки как состояния
+    строки по-прежнему нет: ни поля, ни статуса, ни SLA — дата в базе не
+    меняется, партия ничем не помечается, а подсказка предлагает ровно два
+    человеческих выхода: обновить срок или отметить в заметке, что готово.
     """
     if role != "owner":
         return {"code": "readonly",
@@ -919,19 +1110,20 @@ def next_step(mat_views: list[dict], items: list, batch_views: list[dict],
     if not batch_views:
         return {"code": "add_batch",
                 "text": "Создайте плановую партию: что и сколько собираетесь сшить."}
-    unassigned = [m for m in mat_views
-                  if m["free_known"] and m["free"] is not None and m["free"] > 0]
-    if unassigned:
-        first = unassigned[0]
-        return {"code": "assign",
-                "text": f"У материала «{first['title']}» не назначено "
-                        f"{fmt_qty(first['free'])} {first['unit']} — распределите "
-                        "по плановым партиям."}
     over = [m for m in mat_views if m["over"]]
     if over:
         return {"code": "over",
                 "text": f"У материала «{over[0]['title']}» назначено больше, чем "
                         "известно в наличии. Проверьте количество или назначения."}
+    today = date.today().isoformat()
+    past = [b for b in batch_views
+            if b["due_kind"] == "exact" and b["due_date"] and b["due_date"] < today]
+    if past:
+        first = past[0]
+        return {"code": "due_past",
+                "text": f"Срок партии «{first['title'] or first['item_title']}» "
+                        f"прошёл {first['due_date']} — обновите срок или "
+                        "отметьте в заметке, что готово."}
     no_plan = [b for b in batch_views if not b["plan_known"]]
     if no_plan:
         return {"code": "plan_qty",
@@ -942,10 +1134,5 @@ def next_step(mat_views: list[dict], items: list, batch_views: list[dict],
         return {"code": "due",
                 "text": f"У партии «{no_due[0]['title'] or no_due[0]['item_title']}» "
                         "не указан срок. Годится и ориентир — с источником."}
-    unknown = [m for m in mat_views if not m["qty_known"]]
-    if unknown:
-        return {"code": "qty",
-                "text": f"У материала «{unknown[0]['title']}» количество неизвестно. "
-                        "Когда узнаете — впишите, остаток посчитается."}
     return {"code": "ok",
             "text": "План собран: материалы распределены, у партий есть план и срок."}
