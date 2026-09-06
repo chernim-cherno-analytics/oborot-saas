@@ -615,6 +615,19 @@ def run_all() -> None:
          {"assignment_id": assign_b}, {"qty": "1", "op_id": "iso-x3"}),
         ("/api/supply/planning/assignments/{assignment_id}/delete", "POST",
          {"assignment_id": assign_b}, {"op_id": "iso-x4"}),
+        # SUPPLY-FIX-2. Убрать и вернуть чужую строку нельзя тем же порядком:
+        # архивная строка отвечает тем же «не найдено», что чужая, поэтому
+        # различить их снаружи нечем — и это здесь и проверяется.
+        ("/api/supply/planning/materials/{material_id}/archive", "POST",
+         {"material_id": mat_b}, {"op_id": "iso-x5"}),
+        ("/api/supply/planning/materials/{material_id}/restore", "POST",
+         {"material_id": mat_b}, {"op_id": "iso-x6"}),
+        ("/api/supply/planning/items/{item_id}/update", "POST",
+         {"item_id": item_b}, {"note": "захвачено", "op_id": "iso-x7"}),
+        ("/api/supply/planning/items/{item_id}/archive", "POST",
+         {"item_id": item_b}, {"op_id": "iso-x8"}),
+        ("/api/supply/planning/items/{item_id}/restore", "POST",
+         {"item_id": item_b}, {"op_id": "iso-x9"}),
     ]
     answers = {}
     for route, method, params, body in cases:
