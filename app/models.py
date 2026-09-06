@@ -1088,6 +1088,15 @@ class SupplyMaterial(Base):
     #: Счётчик редакций. Клиент присылает тот, который видел; разошлось —
     #: 409 и текущее состояние, а не тихая перезапись чужой правки.
     rev: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
+    #: Убран с доски, но не стёрт (SUPPLY-FIX-2, F-12). `NULL` — живая строка,
+    #: время — момент архивации. Почему мягко, а не `DELETE`: материал, вещь и
+    #: партия — это решения человека, на которые ссылается журнал `supply_events`
+    #: и (у партии) назначения; физическое удаление унесло бы историю правок в
+    #: осиротевшие `entity_id`, а «убрать ошибочную строку с экрана» и «стереть
+    #: то, что было» — разные поступки. Колонка НУЛЛИРУЕМА и без `server_default`
+    #: намеренно: откатившийся код о ней не знает, его `INSERT` её не называет,
+    #: и `NULL` для него означает ровно то же, что для нового, — строка живая.
+    archived_at: Mapped[datetime | None] = mapped_column(TolerantDateTime, nullable=True)
 
 
 class SupplySketch(Base):
@@ -1156,6 +1165,10 @@ class SupplyItem(Base):
     updated_at: Mapped[datetime] = mapped_column(TolerantDateTime, nullable=False,
                                                  default=datetime.utcnow)
     rev: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
+    #: Убрана с доски, но не стёрта (F-12). Архивировать вещь можно только
+    #: тогда, когда у неё не осталось живых плановых партий, — иначе партия
+    #: осталась бы на доске без вещи.
+    archived_at: Mapped[datetime | None] = mapped_column(TolerantDateTime, nullable=True)
 
 
 class SupplyBatch(Base):
@@ -1198,6 +1211,10 @@ class SupplyBatch(Base):
     updated_at: Mapped[datetime] = mapped_column(TolerantDateTime, nullable=False,
                                                  default=datetime.utcnow)
     rev: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
+    #: Убрана с доски, но не стёрта (F-12). Архивация партии, в отличие от
+    #: двух соседних, ещё и СНИМАЕТ её назначения физически — так задано ТЗ, и
+    #: последствие названо там, где его видит человек: в вопросе перед удалением.
+    archived_at: Mapped[datetime | None] = mapped_column(TolerantDateTime, nullable=True)
 
 
 class SupplyAssignment(Base):
@@ -1821,3 +1838,67 @@ def ensure_supply_planning_unique_schema(bind=None) -> None:
         _merge_duplicate_catalog_items(conn)
     run_migration_step(_SUPPLY_ASSIGNMENT_PAIR_DDL, bind=eng)
     run_migration_step(_SUPPLY_ITEM_CATALOG_DDL, bind=eng)
+
+
+#: SUPPLY-FIX-2 (F-12): три таблицы слоя получают отметку архива.
+#:
+#: Порядок именно такой — материалы, вещи, партии, — и он не имеет значения:
+#: колонки независимы, ни одна из них не участвует ни в каком индексе и ни в
+#: одном ограничении. Значение по умолчанию НЕ объявляется вовсе: `NULL` — это
+#: и есть «живая строка», и `DEFAULT NULL` в SQLite означает ровно то же, что
+#: его отсутствие. Пустая строка или ноль означали бы дату, которой не было.
+_SUPPLY_ARCHIVE_TABLES = ("supply_materials", "supply_items", "supply_batches")
+
+
+def ensure_supply_archive_schema(bind=None) -> None:
+    """SUPPLY-FIX-2: отметка архива у материала, вещи и партии. Шаг старта 13.
+
+    ПОЧЕМУ ОПЯТЬ ОТДЕЛЬНЫЙ ШАГ. Четвёртый раз по тому же правилу, что шаги 10,
+    11 и 12 (`AGENTS.md` §1 «только новая миграция сверху», ревью PR #46
+    discussion_r3894000377): новый смысл получает новую пару (id, позиция), а
+    двенадцать выпущенных пар не трогаются ни буквой — иначе старт на боевой
+    базе упал бы `MigrationLedgerConflict`, и это замок, а не дефект. Шаг 12
+    уже ВЫПУЩЕН на прод (журнал выпуска `5559927093`), поэтому переписать его
+    нельзя тем более.
+
+    ЧТО ЗДЕСЬ ДЕЛАЕТСЯ. Ровно три `ALTER TABLE … ADD COLUMN archived_at
+    DATETIME` и больше ничего: ни одной строки шаг не читает и не переписывает,
+    ни одного индекса не создаёт и не удаляет, чужих таблиц не касается. Это
+    самый узкий вид схемной правки, который существует, и выбран он не из
+    экономии: у организации, которая ничего не архивировала, шаг обязан быть
+    неотличим от отсутствия шага.
+
+    ИДЕМПОТЕНТЕН и рассчитан на вызов НА КАЖДОМ старте: колонка добавляется
+    только если её нет (`inspect`), а на свежей базе она приходит из модели
+    через `create_all` шага 11 — и тогда здесь не делается вообще ничего.
+    Строка журнала — свидетельство, а не основание пропустить
+    (`db.validate_migration_step`, `main._startup_step`).
+
+    ОТКАТ. Прежний код (в том числе выпущенный `0d8b6304…`) о колонке не знает:
+    он не выбирает её в `SELECT` — SQLAlchemy перечисляет колонки поимённо, а
+    не `SELECT *`, — и не называет в `INSERT`. Колонка нуллируема и без
+    `NOT NULL`, поэтому вставка прежнего кода проходит и строка получает `NULL`,
+    то есть «живая». Данные при откате не удаляются и не портятся.
+
+    ЦЕНА ОТКАТА НАЗЫВАЕТСЯ ПРЯМО, А НЕ ЗАМАЛЧИВАЕТСЯ: прежний код не фильтрует
+    по этой колонке, поэтому АРХИВИРОВАННЫЕ строки после отката снова видны на
+    доске — как были до пакета. Это не потеря и не порча: отметка остаётся в
+    базе, журнал архивации остаётся в `supply_events`, и вернувшийся новый код
+    снова их прячет. Но человек, откатившийся на прежнюю версию, увидит то, что
+    он убрал, и обязан узнать об этом отсюда, а не от удивления.
+
+    bind — необязательный engine (тестам нужен, чтобы прогнать шаг на отдельной
+    базе со «старой» схемой); по умолчанию — engine приложения.
+    """
+    eng = bind or engine
+    insp = inspect(eng)
+    for table in _SUPPLY_ARCHIVE_TABLES:
+        if not insp.has_table(table):
+            # Таблиц ещё нет — значит шаг 11 на этой базе не отработал, и
+            # добавлять колонку не к чему. Молча выходим: следующий старт
+            # пройдёт уже по порядку.
+            continue
+        cols = {c["name"] for c in insp.get_columns(table)}
+        if "archived_at" not in cols:
+            run_migration_step(
+                f"ALTER TABLE {table} ADD COLUMN archived_at DATETIME", bind=eng)

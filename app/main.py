@@ -238,6 +238,15 @@ STARTUP_SCHEMA_STEPS: tuple[tuple[str, int], ...] = (
     # уже введённые строки (схлопывает дубли), поэтому его последствия и его
     # откат разобраны в докстринге самой функции, а не только здесь.
     ("models.ensure_supply_planning_unique_schema", 12),
+    # SUPPLY-FIX-2 (F-12): отметка архива у материала, вещи и партии.
+    # Тот же append-only контракт в четвёртый раз. Позиция 13 новая,
+    # двенадцать прежних пар не тронуты — и двенадцатая тем более, она
+    # уже выпущена на прод. Шаг только добавляет три нуллируемые колонки:
+    # ни одной строки он не читает и не переписывает, ни одного индекса
+    # не создаёт, поэтому его последствия для отката ограничены тем, что
+    # прежний код по этим колонкам не фильтрует (разбор — в докстринге
+    # самой функции).
+    ("models.ensure_supply_archive_schema", 13),
 )
 _STARTUP_STEP_ORDER = dict(STARTUP_SCHEMA_STEPS)
 
@@ -430,6 +439,12 @@ def _startup() -> None:
     # не делает ни одной записи.
     _startup_step("models.ensure_supply_planning_unique_schema",
                   _models.ensure_supply_planning_unique_schema)
+    # SUPPLY-FIX-2: три нуллируемые колонки `archived_at`. Шаг ничего не
+    # читает и не переписывает: на базе, где колонки уже есть (в том числе
+    # на свежей, куда они пришли из модели через create_all шага 11), он не
+    # делает ни одного ALTER.
+    _startup_step("models.ensure_supply_archive_schema",
+                  _models.ensure_supply_archive_schema)
     # Замок на пропуск: все объявленные шаги выполнены, и ровно они.
     _finish_startup_steps()
     global _STARTUP_DONE

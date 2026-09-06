@@ -228,6 +228,15 @@
   .pl-assign { font-size: 12.5px; color: var(--ink-2); padding: 4px 0;
                border-top: 1px dashed var(--line); margin-top: 6px;
                display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  /* F-14: строка «120 м → Рубашки «Лебедь»». Ведёт к самой партии, поэтому
+     это кнопка, а не текст: клавиатура и экранная читалка обязаны её найти. */
+  .pl-link { font-size: 12.5px; color: var(--ink-2); margin-top: 4px;
+             display: flex; gap: 6px; flex-wrap: wrap; align-items: baseline; }
+  .pl-linkbtn { border: 0; background: none; padding: 0; cursor: pointer;
+                font: inherit; color: var(--accent, #2b6cb0);
+                text-align: left; text-decoration: underline;
+                text-underline-offset: 2px; }
+  .pl-linkbtn:hover { text-decoration: none; }
   .pl-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
   .pl-empty { font-size: 13px; color: var(--ink-2); line-height: 1.5;
               padding: 14px 12px; border: 1px dashed var(--line);
@@ -2403,6 +2412,24 @@ document.addEventListener("DOMContentLoaded", function () {
 
     if (m.warning) card.appendChild(el("div", "pl-warn", m.warning));
 
+    // F-14: КУДА РАСПИСАНО. «Назначено 220» было видно и раньше, а куда именно —
+    // нет: человек искал это глазами по карточкам партий и на десятке партий
+    // переставал искать. Строки кликабельны — они ведут к самой партии, потому
+    // что вопрос «куда» почти всегда продолжается вопросом «а что там».
+    (m.assignments || []).forEach(function (link) {
+      var line = el("div", "pl-link");
+      var go = el("button", "pl-linkbtn",
+                  fmt(link.qty) + " " + m.unit + " → " + link.batch_title);
+      go.type = "button";
+      go.dataset.batch = String(link.batch_id);
+      go.addEventListener("click", function () { flash("batch", link.batch_id); });
+      line.appendChild(go);
+      if (link.item_title && link.item_title !== link.batch_title) {
+        line.appendChild(el("span", "sub", " · " + link.item_title));
+      }
+      card.appendChild(line);
+    });
+
     if (PL.board && PL.board.can_write) {
       var actions = el("div", "pl-actions");
       var assign = el("button", "btn sm", "Назначить на партию");
@@ -2414,13 +2441,43 @@ document.addEventListener("DOMContentLoaded", function () {
       });
       actions.appendChild(assign);
 
-      var edit = el("button", "btn sm", "Уточнить количество");
+      // F-13: «Уточнить количество» правило ОДНО поле из четырёх. Название с
+      // опечаткой, не та единица и потерянная заметка правились только через
+      // API, то есть никак: человек заводил материал заново и получал два.
+      var edit = el("button", "btn sm", "Изменить");
       edit.type = "button";
       edit.setAttribute("aria-expanded", "false");
       edit.addEventListener("click", function () {
-        toggleInline(card, edit, function (box) { buildMaterialQtyForm(box, m); });
+        toggleInline(card, edit, function (box) { buildMaterialEditForm(box, m); });
       });
       actions.appendChild(edit);
+
+      // F-12: убрать ошибочную строку. Вопрос задаётся на месте кнопки (тот же
+      // приём, что у «Снять» в F-11), а после — шесть секунд на «Вернуть».
+      // Здесь возврат ПОЛНЫЙ и без оговорок: материал с назначениями убрать
+      // нельзя вовсе, поэтому убирать нечего, кроме самой строки.
+      var drop = el("button", "btn sm", "Удалить");
+      drop.type = "button";
+      drop.addEventListener("click", function () {
+        askConfirm(drop, "Удалить?", function () {
+          send("/api/supply/planning/materials/" + m.id + "/archive",
+               {rev: m.rev, op_id: actionToken(drop)}, null,
+               function (ok) {
+                 if (!ok) return;
+                 resetToken(drop);
+                 plToast("Удалено", {ms: 6000, action: {
+                   label: "Вернуть",
+                   run: function () {
+                     return send(
+                       "/api/supply/planning/materials/" + m.id + "/restore",
+                       {op_id: opId()}, null, null,
+                       {kind: "material", id: m.id, quiet: true});
+                   },
+                 }});
+               }, {kind: "material", quiet: true});
+        });
+      });
+      actions.appendChild(drop);
       card.appendChild(actions);
     }
     return card;
@@ -2471,16 +2528,29 @@ document.addEventListener("DOMContentLoaded", function () {
     };
   }
 
-  function buildMaterialQtyForm(form, material) {
+  // F-13(а): правятся все четыре поля материала, а не одно количество.
+  // Заметка и единица до этого пакета из интерфейса не менялись вовсе, а
+  // название — тем более: опечатка в названии ткани жила до конца сезона.
+  function buildMaterialEditForm(form, material) {
+    var title = input(null, {value: material.title, maxLength: 200});
     var qty = input(null, {value: material.qty_known ? fmt(material.qty) : "",
                            placeholder: "оставьте пустым, если неизвестно"});
-    form.appendChild(field("Количество, " + material.unit, qty, true));
+    var unit = input(null, {value: material.unit, maxLength: 16});
+    var note = input(null, {value: material.source_note || "",
+                            placeholder: "поставщик, счёт, комментарий",
+                            maxLength: 500});
+    form.appendChild(field("Название материала", title, true));
+    form.appendChild(field("Количество", qty));
+    form.appendChild(field("Единица", unit));
+    form.appendChild(field("Источник или комментарий", note, true));
     form.appendChild(submitRow("Сохранить", "pl-matq-err"));
     bindTokenReset(form);
     form.onsubmit = function (ev) {
       ev.preventDefault();
       send("/api/supply/planning/materials/" + material.id + "/update",
-           {qty: qty.value, rev: material.rev, op_id: actionToken(form)},
+           {title: title.value, qty: qty.value, unit: unit.value,
+            source_note: note.value, rev: material.rev,
+            op_id: actionToken(form)},
            "pl-matq-err", null, {kind: "material", id: material.id});
     };
   }
@@ -2498,6 +2568,10 @@ document.addEventListener("DOMContentLoaded", function () {
     row.appendChild(head);
     var sub = el("div", "sub", "плановых партий нет");
     row.appendChild(sub);
+    // Заметка показывается ЗДЕСЬ, а не только в форме: без этого правка «Изменить»
+    // отвечала бы 200 и не меняла на экране ничего — ровно тот дефект, который
+    // F-05 чинил у самой вещи.
+    if (it.note) row.appendChild(el("div", "sub", it.note));
     if (PL.board && PL.board.can_write) {
       var actions = el("div", "pl-actions");
       var plan = el("button", "btn sm", "Запланировать партию");
@@ -2511,9 +2585,76 @@ document.addEventListener("DOMContentLoaded", function () {
         }
       });
       actions.appendChild(plan);
+
+      // F-13(в): у вещи до этого пакета не было ручки update вовсе — опечатка в
+      // названии новинки не правилась ничем, кроме как завести вторую вещь.
+      var edit = el("button", "btn sm", "Изменить");
+      edit.type = "button";
+      edit.setAttribute("aria-expanded", "false");
+      edit.addEventListener("click", function () {
+        toggleInline(row, edit, function (box) { buildItemEditForm(box, it); });
+      });
+      actions.appendChild(edit);
+
+      // F-12: убрать можно НОВИНКУ. У вещи каталога стоит выпущенный замок
+      // `ux_supply_items_catalog`, и что делать при повторном выборе убранной
+      // модели — продуктовая развилка, удержанная до решения владельца
+      // (TECH_DEBT SUPPLY-FIX-2-REG). Кнопки, которая всегда отвечает отказом,
+      // здесь нет намеренно: она обещала бы действие, которого пока нет.
+      if (it.kind === "draft") {
+        var drop = el("button", "btn sm", "Удалить");
+        drop.type = "button";
+        drop.addEventListener("click", function () {
+          askConfirm(drop, "Удалить?", function () {
+            send("/api/supply/planning/items/" + it.id + "/archive",
+                 {rev: it.rev, op_id: actionToken(drop)}, null,
+                 function (ok) {
+                   if (!ok) return;
+                   resetToken(drop);
+                   plToast("Удалено", {ms: 6000, action: {
+                     label: "Вернуть",
+                     run: function () {
+                       return send(
+                         "/api/supply/planning/items/" + it.id + "/restore",
+                         {op_id: opId()}, null, null,
+                         {kind: "item", id: it.id, quiet: true});
+                     },
+                   }});
+                 }, {kind: "item", quiet: true});
+          });
+        });
+        actions.appendChild(drop);
+      }
       row.appendChild(actions);
     }
     return row;
+  }
+
+  // F-13(в). Эскиз здесь не заменяется: ручка это умеет (`sketch_id`), а форму
+  // с загрузкой файла в строку вещи этот пакет не добавляет — D-54 требует
+  // минимума в существующем интерфейсе, а замена картинки это отдельный экран.
+  // Названо прямо, чтобы «в UI нет» не читалось как «нигде нет».
+  function buildItemEditForm(form, it) {
+    var title = null;
+    if (it.kind === "draft") {
+      title = input(null, {value: it.title, maxLength: 200});
+      form.appendChild(field("Название новинки", title, true));
+    } else {
+      form.appendChild(el("div", "pl-hint",
+        "Название приходит из вашего каталога и здесь не меняется."));
+    }
+    var note = input(null, {value: it.note || "", maxLength: 500,
+                            placeholder: "заметка к вещи"});
+    form.appendChild(field("Заметка", note, true));
+    form.appendChild(submitRow("Сохранить", "pl-item-edit-err"));
+    bindTokenReset(form);
+    form.onsubmit = function (ev) {
+      ev.preventDefault();
+      var body = {note: note.value, rev: it.rev, op_id: actionToken(form)};
+      if (title) body.title = title.value;
+      send("/api/supply/planning/items/" + it.id + "/update", body,
+           "pl-item-edit-err", null, {kind: "item", id: it.id});
+    };
   }
 
   function batchCard(b) {
@@ -2555,6 +2696,13 @@ document.addEventListener("DOMContentLoaded", function () {
     (b.assignments || []).forEach(function (a) {
       var line = el("div", "pl-assign");
       line.appendChild(el("span", null, a.material_title + " — " + fmt(a.qty) + " " + a.unit));
+      // F-15: партия собрана из материала, количество которого никто не называл.
+      // Это НЕ запрет и не ноль (D-49): назначить такой материал можно, и слой
+      // этого не запрещает. Но факт обязан быть виден на самой партии — иначе
+      // «60 пиджаков» выглядят обеспеченными, пока не откроешь карточку ткани.
+      if (a.relies_on_unknown) {
+        line.appendChild(el("span", "pl-tag", "наличие не подтверждено"));
+      }
       if (PL.board && PL.board.can_write) {
         var move = el("button", "btn sm", "Перенести");
         move.type = "button";
@@ -2600,7 +2748,11 @@ document.addEventListener("DOMContentLoaded", function () {
 
     if (PL.board && PL.board.can_write) {
       var actions = el("div", "pl-actions");
-      var edit = el("button", "btn sm", "План и срок");
+      // F-13(б): кнопка называлась «План и срок» и правила ровно их. Название
+      // партии и заметка к плану из интерфейса не менялись вовсе, хотя оба поля
+      // человек вводит при создании — то есть опечатку в названии исправить
+      // было нечем.
+      var edit = el("button", "btn sm", "Изменить");
       edit.type = "button";
       edit.setAttribute("aria-expanded", "false");
       edit.addEventListener("click", function () {
@@ -2642,15 +2794,23 @@ document.addEventListener("DOMContentLoaded", function () {
   }
 
   function buildBatchEditForm(form, b) {
+    var title = input(null, {value: b.title || "", maxLength: 200,
+                             placeholder: "например: первая закладка"});
     var qty = input(null, {value: b.plan_known ? fmt(b.plan_qty) : "",
                            placeholder: "оставьте пустым, если неизвестно"});
+    var planNote = input(null, {value: b.plan_note || "", maxLength: 500,
+                                placeholder: "заметка к плану"});
+    form.appendChild(field("Название партии", title, true));
     form.appendChild(field("План изделий, шт", qty, true));
+    form.appendChild(field("Заметка к плану", planNote, true));
     var readDue = dueFields(form, "pl-edit-" + b.id, b);
     form.appendChild(submitRow("Сохранить", "pl-batch-edit-err"));
     bindTokenReset(form);
     form.onsubmit = function (ev) {
       ev.preventDefault();
-      var body = {plan_qty: qty.value, rev: b.rev, op_id: actionToken(form)};
+      var body = {title: title.value, plan_qty: qty.value,
+                  plan_note: planNote.value, rev: b.rev,
+                  op_id: actionToken(form)};
       var due = readDue();
       for (var k in due) { if (due.hasOwnProperty(k)) body[k] = due[k]; }
       send("/api/supply/planning/batches/" + b.id + "/update", body,
