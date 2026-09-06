@@ -75,7 +75,9 @@ for suffix in ("", "-wal", "-shm"):
 
 import httpx  # noqa: E402
 import uvicorn  # noqa: E402
+from sqlalchemy.exc import IntegrityError  # noqa: E402
 
+from app import routes_supply_planning as rsp  # noqa: E402
 from app.main import app as oborot_app  # noqa: E402
 
 BASE = f"http://127.0.0.1:{APP_PORT}"
@@ -479,7 +481,50 @@ def run() -> int:
         finally:
             con.close()
 
-    # ── 7. Замки не сняты и данные целы ──────────────────────────────────────
+    # ── 7. Сторожа контракта, а не одного случая ─────────────────────────────
+    #
+    # Всё выше проверяет, что сегодня замок обработан. Этот блок проверяет, что
+    # так останется: маршрут, добавленный завтра без обработчика, вернёт ту же
+    # пятисотку, и узнать об этом лучше здесь, чем из журнала выпуска.
+    print("\n== Контракт файла, а не отдельные ручки ==")
+
+    # `getattr` с умолчанием, а не прямое обращение: на дереве БЕЗ этого пакета
+    # константы нет вовсе, и прямое обращение уронило бы весь набор
+    # AttributeError'ом — то есть красный прогон на BASE превратился бы в аварию
+    # раннера вместо честного FAIL. Проверка обязана падать, а не ломаться.
+    detail = getattr(rsp, "_CONFLICT_DETAIL", None)
+    check("текст управляемого отказа не изменился ни на символ",
+          detail == "Это действие уже выполнено. Обновите страницу.", str(detail))
+
+    # Отказ на flush и отказ на commit обязаны быть НЕОТЛИЧИМЫ снаружи: это один
+    # класс события, и разные ответы на него означали бы, что клиент видит
+    # внутреннее устройство транзакции.
+    handled = rsp._fail(IntegrityError("INSERT INTO t VALUES (?)", {},
+                                       Exception("UNIQUE constraint failed: t.c")))
+    check("IntegrityError разбирается в 409 тем же самым текстом",
+          handled.status_code == 409 and handled.detail == detail,
+          f"{handled.status_code} {handled.detail}")
+
+    src = (ROOT / "app" / "routes_supply_planning.py").read_text(encoding="utf-8")
+    posts = [b for b in src.split("@router.") if b.startswith("post(")]
+    uncovered = []
+    for block in posts:
+        head = block.split("\n")
+        name = next((ln for ln in head if ln.startswith(("def ", "async def "))), "?")
+        if "IntegrityError" not in block or "db.rollback()" not in block:
+            uncovered.append(name.strip())
+    check("пишущих маршрутов найдено столько, сколько их есть", len(posts) == 10,
+          f"найдено: {len(posts)}")
+    check("КАЖДЫЙ пишущий маршрут ловит замок схемы и откатывает транзакцию",
+          not uncovered, "; ".join(uncovered))
+
+    # Обратная сторона того же контракта: у ЧИТАЮЩЕЙ ручки обработчика записи
+    # быть не должно — иначе однажды окажется, что GET умеет откатывать.
+    gets = [b for b in src.split("@router.") if b.startswith("get(")]
+    check("читающие ручки транзакцию не откатывают",
+          all("db.rollback()" not in b for b in gets), f"ручек: {len(gets)}")
+
+    # ── 8. Замки не сняты и данные целы ──────────────────────────────────────
     print("\n== Итоговое состояние базы ==")
     con = db_conn()
     try:
