@@ -1201,6 +1201,53 @@ def supply_fix_1_checks() -> None:  # noqa: C901 — сценарный блок
           same_note and same_note[0]["rev"] == noted[0]["rev"],
           f"{noted[0]['rev']} → {same_note[0]['rev'] if same_note else '?'}")
 
+    # РЕГРЕССИЯ КРАЙНЕГО СЛУЧАЯ: заметка уже занимает весь предел.
+    # Склейка `A*500 · НОВЫЙ` обрезается обратно ровно в `A*500`, видимое поле
+    # не меняется ни на символ — и под прежним условием введённый текст
+    # исчезал и из строки, и из журнала. Здесь проверяется, что он цел.
+    full_note = "A" * sp.MAX_NOTE_CHARS
+    c.post("/api/supply/planning/items",
+           json={"kind": "catalog", "base_name": "Модель 002",
+                 "note": full_note, "op_id": "f10-full1"})
+    full_board = c.get("/api/supply/planning").json()
+    full_id = [i for i in full_board["items"]
+               if i["base_name"] == "Модель 002"][0]["id"]
+    full_rev = [i for i in full_board["items"] if i["id"] == full_id][0]["rev"]
+    check("заметка на полный предел сохранена целиком",
+          len([i for i in full_board["items"]
+               if i["id"] == full_id][0]["note"]) == sp.MAX_NOTE_CHARS,
+          str(len([i for i in full_board["items"]
+                   if i["id"] == full_id][0]["note"])))
+    unique_text = "ВТОРАЯ-ЗАМЕТКА-НЕ-ПОМЕСТИЛАСЬ-9137"
+    r_full = c.post("/api/supply/planning/items",
+                    json={"kind": "catalog", "base_name": "Модель 002",
+                          "note": unique_text, "op_id": "f10-full2"})
+    check("повтор при заполненном поле принят", r_full.status_code == 200,
+          str(r_full.status_code))
+    after_full = [i for i in r_full.json()["items"] if i["id"] == full_id][0]
+    check("видимое поле осталось прежним — места в нём нет",
+          after_full["note"] == full_note, str(len(after_full["note"])))
+    kept_full = sqlite3.connect(DB_PATH).execute(
+        "SELECT old_value FROM supply_events WHERE entity_kind='item'"
+        " AND entity_id=? AND field='note_truncated'", (full_id,)).fetchall()
+    check("НО введённый текст сохранён целиком в журнале, а не потерян",
+          any(row[0] == unique_text for row in kept_full),
+          str(kept_full)[:200] or "записи нет")
+    op_rows = sqlite3.connect(DB_PATH).execute(
+        "SELECT COUNT(*) FROM supply_events WHERE op_id=?",
+        ("f10-full2",)).fetchone()[0]
+    check("поступок отмечен ровно одной записью с этим op_id",
+          op_rows == 1, str(op_rows))
+    again_full = c.post("/api/supply/planning/items",
+                        json={"kind": "catalog", "base_name": "Модель 002",
+                              "note": unique_text, "op_id": "f10-full2"})
+    check("повтор с тем же op_id идемпотентен и второй записи не заводит",
+          again_full.status_code == 200
+          and sqlite3.connect(DB_PATH).execute(
+              "SELECT COUNT(*) FROM supply_events WHERE op_id=?",
+              ("f10-full2",)).fetchone()[0] == 1,
+          str(again_full.status_code))
+
     d1 = c.post("/api/supply/planning/items",
                 json={"kind": "draft", "title": "Одно имя", "op_id": "f10-d1"})
     d2 = c.post("/api/supply/planning/items",
@@ -1261,16 +1308,21 @@ def supply_fix_1_checks() -> None:  # noqa: C901 — сценарный блок
           seen.count("A") == 300, f"видно {seen.count('A')} из 300")
     kept = sqlite3.connect(DB_PATH).execute(
         "SELECT old_value FROM supply_events WHERE field='note_truncated'"
-        " AND entity_id=?", (long_rows[0]["id"],)).fetchall()
+        " AND entity_kind='assignment' AND entity_id=?",
+        (long_rows[0]["id"],)).fetchall()
     check("вторая сохранена ЦЕЛИКОМ в журнале, а не обрезана вместе с видимым",
           len(kept) == 1 and kept[0][0] == LONG_NOTE_B,
           f"в журнале {len(kept[0][0]) if kept else 0} из 300")
     check("итого на живом пути сохранено 600 символов из 600",
           seen.count("A") + (len(kept[0][0]) if kept else 0) == 600,
           f"{seen.count('A') + (len(kept[0][0]) if kept else 0)} из 600")
+    # `entity_kind` в условии обязателен: `entity_id` уникален только внутри
+    # своего вида, и без него сюда попадали записи об обрезке у ВЕЩИ с тем же
+    # номером, что у назначения. Проверка молча считала чужие строки.
     short_cut = sqlite3.connect(DB_PATH).execute(
         "SELECT COUNT(*) FROM supply_events WHERE field='note_truncated'"
-        " AND entity_id=?", (rows[0]["id"],)).fetchone()[0]
+        " AND entity_kind='assignment' AND entity_id=?",
+        (rows[0]["id"],)).fetchone()[0]
     check("а короткая склейка отметки об обрезке не получает — обрезки не было",
           short_cut == 0, str(short_cut))
 

@@ -493,17 +493,33 @@ def create_item(db: Session, org_id: int, payload: dict, author: str) -> SupplyI
             existing.reused = True
             if note:
                 merged, cut = _merge_notes(existing.note, note)
-                if merged != (existing.note or ""):
+                changed = merged != (existing.note or "")
+                op = parse_op_id(payload)
+                if changed:
                     was = existing.note or ""
                     existing.note = merged
                     _touch(existing)
                     _journal(db, org_id, "item", existing.id, "update",
                              field="note", old=was, new=merged, author=author,
-                             op_id=parse_op_id(payload))
-                    if cut:
-                        _journal(db, org_id, "item", existing.id, "update",
-                                 field="note_truncated", old=note, new=merged,
-                                 author=author)
+                             op_id=op)
+                if cut:
+                    # ЗАПИСЬ ОБ ОБРЕЗКЕ НЕ ВЛОЖЕНА В «КОЛОНКА ИЗМЕНИЛАСЬ», И
+                    # ЭТО СУТЬ ПРАВКИ. Когда у вещи заметка уже занимает весь
+                    # предел, склейка `A*500 · НОВЫЙ` обрезается обратно ровно
+                    # в `A*500`: видимое поле не меняется ни на символ, и под
+                    # прежним условием весь блок пропускался — введённый текст
+                    # исчезал и из строки, и из журнала. Полный входящий текст
+                    # сохраняется ВСЕГДА, когда он не поместился.
+                    #
+                    # `op_id` несёт ровно одна запись поступка: частичный замок
+                    # `ux_supply_events_op` двух с одним значением не пустит.
+                    # Если колонка изменилась, его уже взяла запись `note`;
+                    # если нет — эта запись здесь и есть единственный след
+                    # поступка, и повтор с тем же `op_id` остаётся
+                    # идемпотентным.
+                    _journal(db, org_id, "item", existing.id, "update",
+                             field="note_truncated", old=note, new=merged,
+                             author=author, op_id="" if changed else op)
             return existing
         title = base_name
     else:
