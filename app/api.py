@@ -2857,33 +2857,23 @@ def api_order_plan_outcome(
         if candidate is not None and candidate.org_id == ctx.org.id:
             order = candidate
     received: dict[str, float] = {}
-    order_received = False
     execution_unknown = False
     disputed: set[str] = set()
     if order is not None:
         rows = _receipt_rows(db, ctx.org.id, order.id)
         received = _received_by_base(rows)
-        # Заказ, ушедший в МойСклад, исполняется машинным источником: отметка
-        # «принят» по нему допущения не пишет (иначе двойной счёт). Если при
-        # этом МойСклад ничего не прислал — а на боевых данных «отгружено»
-        # заполнено у нуля позиций из 69, — то принятое нам НЕИЗВЕСТНО.
-        # Показать здесь ноль значило бы утверждать «заказали 65, приехало 0»:
-        # подтверждённую недостачу, которой не было.
-        # Признак «не знаем» действует ПОСТРОЧНО, а не на заказ целиком.
-        # МойСклад заполняет «отгружено» по частям: одна пришедшая позиция
-        # переводила остальные 28 из «неизвестно» в утверждение «приехало
-        # ничего», и итог «2 из 65» читался как факт. Для заказа, ушедшего
-        # в МС, молчание источника по позиции — это молчание, а не ноль.
-        by_machine = ms_writeback.is_pushed(order.ms_doc_href)
-        execution_unknown = by_machine and not rows
-        order_received = order.status == "received" and not by_machine
+        # Как и в сверке приёмок: отсутствие факта по заказанной позиции
+        # означает «не знаем», в том числе у локального принятого заказа.
+        # Статус received и старые whole_order не подтверждают количество;
+        # _received_by_base уже отделяет их от явного ручного нуля.
+        execution_unknown = bool(set(_ordered_by_base(order)) - set(received))
         # Позиции, по которым источники спорят. Эта выдача — та самая, по
         # которой потом меряют качество рекомендаций, и подавать сюда спорное
         # число как факт нельзя: сверка приёмок уже говорит «не знаем», а здесь
         # выезжало уверенное `executed`, и две выдачи об одном заказе отвечали
         # по-разному.
         disputed = {c["base_name"] for c in _source_conflicts(rows)}
-    confirmed = (bool(received) or order_received) and not disputed
+    confirmed = bool(received) and not disputed
 
     def _executed(base: str):
         """Сколько принято ПО ЭТОЙ позиции. None — неизвестно.
@@ -2935,8 +2925,8 @@ def api_order_plan_outcome(
                         if order is not None and order.received_at else None),
         "lead_time_fact_days": _lead_time_fact(order) if order is not None else None,
         "execution_confirmed": confirmed,
-        # Заказ закрыт, но чем он закрыт — мы не знаем: он ушёл в МойСклад,
-        # а «отгружено» оттуда не пришло. Это не «приехало ноль».
+        # По заказанной позиции нет факта либо источники спорят.
+        # Статус заказа не превращает неизвестное количество в ноль.
         "execution_unknown": execution_unknown or bool(disputed),
         # Позиции, по которым источники приёмки спорят: у них `executed` = null
         # не потому, что данных нет, а потому, что данные противоречат друг

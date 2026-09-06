@@ -301,6 +301,39 @@ def run() -> int:  # noqa: C901 — сценарный тест, ветвлен�
     check("фактический срок производства посчитан",
           body2.get("lead_time_fact_days") == 0, str(body2.get("lead_time_fact_days")))
 
+    # A08: историческая связь плана с локальным принятым заказом.
+    # Сам статус не является свидетельством количества по D-25/D-30/D-34.
+    _raw_sql(
+        "INSERT INTO order_plans (org_id,status,brief_json,computed_json,result_json,production_order_id,created_at) "
+        "VALUES (2,'applied','{}','{}',?,?,CURRENT_TIMESTAMP)",
+        json.dumps({"items": [{"base_name": name2, "qty": 10}]}), order2)
+    local_plan = sql("SELECT id FROM order_plans WHERE production_order_id=?", order2)[0][0]
+
+    def check_local_outcome(label, expected):
+        outcome = c2.get(f"/api/order-plan/{local_plan}/outcome").json()
+        receipt = c2.get(f"/api/orders/{order2}/receipts").json()
+        check(f"A08 {label}: подтверждение совпадает с фактами приёмки",
+              outcome["execution_confirmed"] == receipt["confirmed"] == (expected is not None))
+        check(f"A08 {label}: неизвестность совпадает с фактами приёмки",
+              outcome["execution_unknown"] == receipt["execution_unknown"] == (expected is None))
+        check(f"A08 {label}: число не выдумано и ручной ноль сохранён",
+              outcome["totals"]["executed"] == receipt["received_total"] == expected
+              and outcome["lines"][0]["executed"] == expected)
+
+    check_local_outcome("без приёмок", None)
+    at = datetime.utcnow().isoformat(sep=" ", timespec="seconds")
+    _raw_sql(
+        "INSERT INTO order_receipts (org_id,order_id,base_name,qty,at,source,precision,source_ref,created_at) "
+        "VALUES (2,?,?,10,?,'manual','whole_order','',?)", order2, name2, at, at)
+    check_local_outcome("старое допущение whole_order", None)
+    zero_receipt = c2.post(f"/api/orders/{order2}/receipts",
+                           json={"lines": [{"base_name": name2, "qty": 0}]})
+    check("A08 ручной ноль принят", zero_receipt.status_code == 200)
+    check_local_outcome("явный ручной ноль", 0)
+    c2.post(f"/api/orders/{order2}/receipts",
+            json={"lines": [{"base_name": name2, "qty": 7}]})
+    check_local_outcome("явное количество", 7)
+
     print("\n== Отметка «принят» С деталями — подтверждение ==")
     r = c2.post("/api/orders", json={"name": "Второй заказ", "items": [
         {"base_name": name2, "qty": 10, "sizes": {}, "cost": 100},
