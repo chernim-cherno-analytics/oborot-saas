@@ -480,7 +480,30 @@ def create_item(db: Session, org_id: int, payload: dict, author: str) -> SupplyI
                                      SupplyItem.base_name == base_name).limit(1)
         ).scalars().first()
         if existing is not None:
+            # ВВЕДЁННАЯ ЗАМЕТКА НЕ ПРОПАДАЕТ МОЛЧА. Прежняя редакция возвращала
+            # найденную строку и на этом заканчивала: человек писал заметку,
+            # видел «Эта модель уже есть в плане» — и его текст исчезал без
+            # ошибки и без следа. Потеря ввода тут ничем не лучше той, что этот
+            # же пакет чинит в F-03.
+            #
+            # Заметка сливается тем же правилом, что уже принято для повторного
+            # назначения (D-55) и для самой миграции: старое, разделитель,
+            # новое; совпадающий текст не дублируется. Новой семантики это не
+            # вводит — это одно и то же правило в третьем месте.
             existing.reused = True
+            if note:
+                merged, cut = _merge_notes(existing.note, note)
+                if merged != (existing.note or ""):
+                    was = existing.note or ""
+                    existing.note = merged
+                    _touch(existing)
+                    _journal(db, org_id, "item", existing.id, "update",
+                             field="note", old=was, new=merged, author=author,
+                             op_id=parse_op_id(payload))
+                    if cut:
+                        _journal(db, org_id, "item", existing.id, "update",
+                                 field="note_truncated", old=note, new=merged,
+                                 author=author)
             return existing
         title = base_name
     else:

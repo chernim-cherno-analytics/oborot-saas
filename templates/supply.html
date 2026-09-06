@@ -1822,8 +1822,12 @@ document.addEventListener("DOMContentLoaded", function () {
   // потому что ответ отдаёт всю доску, а не созданную строку), либо
   // `{kind: …, id: N}` — за конкретной, если правили существующую.
   // `{quiet: true}` гасит общий тост «Сохранено» там, где у действия есть свой.
+  // Возвращает false, если отправка НЕ началась (уже идёт другая), и true,
+  // если началась. Прежде функция всегда возвращала undefined, и вызывающий не
+  // мог отличить «отправлено» от «занято» — на этом и терялось восстановление
+  // из тоста.
   function send(url, body, formErrId, done, spot) {
-    if (PL.saving) return;
+    if (PL.saving) return false;
     PL.saving = true;
     paintSaving(true);
     setError("pl-error", "");
@@ -1848,6 +1852,7 @@ document.addEventListener("DOMContentLoaded", function () {
         if (done) done(false);
       })
       .then(function () { PL.saving = false; paintSaving(false); });
+    return true;
   }
 
   function paintSaving(on) {
@@ -1897,7 +1902,22 @@ document.addEventListener("DOMContentLoaded", function () {
     if (opts.action) {
       var act = el("button", "pl-toast-act", opts.action.label);
       act.type = "button";
-      act.addEventListener("click", function () { close(); opts.action.run(); });
+      // ДЕЙСТВИЕ ВЫПОЛНЯЕТСЯ ДО ЗАКРЫТИЯ, И ТОСТ ЗАКРЫВАЕТСЯ ТОЛЬКО ЕСЛИ ОНО
+      // НАЧАЛОСЬ. Прежняя редакция закрывала первой строкой: `close()`, потом
+      // `run()`. Если в этот момент шла другая отправка, `send()` выходил по
+      // `PL.saving` ничего не сделав — а единственная кнопка возврата была уже
+      // удалена. Человек нажал «Вернуть», ничего не вернулось, и повторить
+      // стало нечем.
+      act.addEventListener("click", function () {
+        if (opts.action.run() === false) {
+          // Отправка не началась. Оставляем тост и даём ещё одно окно, чтобы
+          // нажатие можно было повторить, а не искать пропавшую кнопку.
+          if (timer) clearTimeout(timer);
+          timer = setTimeout(close, opts.ms || 3000);
+          return;
+        }
+        close();
+      });
       node.appendChild(act);
     }
     root.appendChild(node);
@@ -2560,8 +2580,11 @@ document.addEventListener("DOMContentLoaded", function () {
                    resetToken(drop);
                    plToast("Назначение снято", {ms: 6000, action: {
                      label: "Вернуть",
+                     // Ответ `send` возвращается наружу: по нему тост решает,
+                     // закрываться или остаться с кнопкой. Проглотить его
+                     // здесь значило бы вернуть тот же дефект на уровень выше.
                      run: function () {
-                       send("/api/supply/planning/assignments", {
+                       return send("/api/supply/planning/assignments", {
                          material_id: a.material_id, batch_id: b.id,
                          qty: a.qty, note: a.note || "", op_id: opId(),
                        }, null, null, {kind: "batch", id: b.id, quiet: true});

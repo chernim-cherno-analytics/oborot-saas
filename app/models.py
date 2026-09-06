@@ -1672,8 +1672,17 @@ def _merge_duplicate_assignments(conn) -> int:
                 str(len(" · ".join(notes))),
                 "видимая заметка обрезана до предела поля; полные тексты — "
                 "в записях этого слияния")
+        # РЕДАКЦИЯ ПОДНИМАЕТСЯ ВМЕСТЕ СО ЗНАЧЕНИЯМИ. Строка после слияния несёт
+        # уже не то, что видел человек: было 30, стало 70. Экран, открытый до
+        # миграции, держит прежний `rev`, и без этой строки `_rev_guard`
+        # пропустил бы его как совпавший — «Снять» сняло бы 70 вместо 30, то
+        # есть больше, чем было на экране. Замок оптимистичной блокировки
+        # существует ровно для этого случая, и миграция обязана его взводить,
+        # а не обходить.
         conn.execute(text(
-            "UPDATE supply_assignments SET qty = :q, note = :n WHERE id = :i"
+            "UPDATE supply_assignments SET qty = :q, note = :n,"
+            " rev = COALESCE(rev, 1) + 1, updated_at = datetime('now')"
+            " WHERE id = :i"
         ), {"q": round(total, 3), "n": merged_note, "i": keep_id})
     return removed
 
@@ -1716,9 +1725,15 @@ def _merge_duplicate_catalog_items(conn) -> int:
             if donor_note:
                 _journal_row(conn, org_id, "item", keep_id, "merge", "note",
                              donor_note, merged_note)
+            # Партия переехала под другую вещь — это тоже изменение того, что
+            # видит открытый экран, поэтому и здесь редакция поднимается.
+            # Иначе правка партии со старым `rev` прошла бы как совпавшая, хотя
+            # человек правил её, считая принадлежащей прежней, уже удалённой
+            # вещи.
             conn.execute(text(
-                "UPDATE supply_batches SET item_id = :keep "
-                "WHERE org_id = :o AND item_id = :old"
+                "UPDATE supply_batches SET item_id = :keep,"
+                " rev = COALESCE(rev, 1) + 1, updated_at = datetime('now')"
+                " WHERE org_id = :o AND item_id = :old"
             ), {"keep": keep_id, "o": org_id, "old": row[0]})
             conn.execute(text("DELETE FROM supply_items WHERE id = :i"),
                          {"i": row[0]})
@@ -1730,8 +1745,13 @@ def _merge_duplicate_catalog_items(conn) -> int:
                 "видимая заметка обрезана до предела поля; полные тексты — "
                 "в записях этого слияния")
         if merged_note != (rows[0][1] or "").strip():
+            # Заметка выжившей вещи изменилась — редакция поднимается по той же
+            # причине, что и у назначения: на экране человека стоит прежний
+            # текст и прежний `rev`.
             conn.execute(text(
-                "UPDATE supply_items SET note = :n WHERE id = :i"
+                "UPDATE supply_items SET note = :n,"
+                " rev = COALESCE(rev, 1) + 1, updated_at = datetime('now')"
+                " WHERE id = :i"
             ), {"n": merged_note, "i": keep_id})
     return removed
 

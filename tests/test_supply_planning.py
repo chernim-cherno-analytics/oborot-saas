@@ -1159,6 +1159,48 @@ def supply_fix_1_checks() -> None:  # noqa: C901 — сценарный блок
     check("человеку сказано, почему новой строки не появилось",
           b.json().get("notice") == "Эта модель уже есть в плане.",
           str(b.json().get("notice")))
+    # РЕГРЕССИЯ: повтор с заметкой не терял её молча. Ревью воспроизвело:
+    # note=first → повтор note=second давал reused=True и stored_note=first,
+    # без ошибки и без записи. Человек написал текст — текст исчез.
+    n1 = c.post("/api/supply/planning/items",
+                json={"kind": "catalog", "base_name": "Модель 001",
+                      "note": "первая заметка", "op_id": "f10-n1"})
+    check("каталожная вещь с заметкой заведена", n1.status_code == 200,
+          str(n1.status_code))
+    noted_id = [i for i in n1.json()["items"]
+                if i["base_name"] == "Модель 001"][0]["id"]
+    rev_before = [i for i in n1.json()["items"] if i["id"] == noted_id][0]["rev"]
+    n2 = c.post("/api/supply/planning/items",
+                json={"kind": "catalog", "base_name": "Модель 001",
+                      "note": "вторая заметка", "op_id": "f10-n2"})
+    check("повтор с новой заметкой принят", n2.status_code == 200,
+          str(n2.status_code))
+    noted = [i for i in n2.json()["items"] if i["id"] == noted_id]
+    check("вещь по-прежнему одна", len(noted) == 1 and len(
+        [i for i in n2.json()["items"]
+         if i["base_name"] == "Модель 001"]) == 1, str(noted))
+    check("ВТОРАЯ заметка не потерялась молча — она в строке",
+          noted and "вторая заметка" in (noted[0]["note"] or ""),
+          str(noted[0]["note"]) if noted else "нет строки")
+    check("и первая заметка при этом цела",
+          noted and "первая заметка" in (noted[0]["note"] or ""),
+          str(noted[0]["note"]) if noted else "нет строки")
+    check("редакция строки поднята: экран с прежним rev теперь устарел",
+          noted and noted[0]["rev"] > rev_before,
+          f"было {rev_before} стало {noted[0]['rev'] if noted else '?'}")
+    ev = sqlite3.connect(DB_PATH).execute(
+        "SELECT COUNT(*) FROM supply_events WHERE entity_kind='item'"
+        " AND entity_id=? AND field='note'", (noted_id,)).fetchone()[0]
+    check("изменение заметки названо записью журнала, а не молчит", ev == 1,
+          str(ev))
+    n3 = c.post("/api/supply/planning/items",
+                json={"kind": "catalog", "base_name": "Модель 001",
+                      "op_id": "f10-n3"})
+    same_note = [i for i in n3.json()["items"] if i["id"] == noted_id]
+    check("повтор БЕЗ заметки строку не трогает и редакцию не двигает",
+          same_note and same_note[0]["rev"] == noted[0]["rev"],
+          f"{noted[0]['rev']} → {same_note[0]['rev'] if same_note else '?'}")
+
     d1 = c.post("/api/supply/planning/items",
                 json={"kind": "draft", "title": "Одно имя", "op_id": "f10-d1"})
     d2 = c.post("/api/supply/planning/items",
@@ -1544,6 +1586,25 @@ def supply_fix_1_migration_checks() -> None:  # noqa: C901 — шагов мно
           rows("SELECT COUNT(*) FROM supply_batches")[0] == (3,),
           str(rows("SELECT COUNT(*) FROM supply_batches")))
 
+    # РЕГРЕССИЯ: строка после слияния несёт уже не то, что видел человек, и её
+    # редакция обязана это отражать. Ревью воспроизвело: две строки 30/40 с
+    # rev=1 → миграция даёт 70 при rev=1 → «Снять» с сохранённым до миграции
+    # rev=1 проходит проверку и снимает 70, то есть больше, чем было на экране.
+    merged_rev = rows("SELECT rev FROM supply_assignments WHERE id=1")[0][0]
+    check("редакция слитого назначения поднята миграцией",
+          merged_rev > 1, f"rev={merged_rev}")
+    kept_item_rev = rows("SELECT rev FROM supply_items WHERE id=1")[0][0]
+    check("редакция выжившей каталожной вещи поднята: её заметка изменилась",
+          kept_item_rev > 1, f"rev={kept_item_rev}")
+    # Перевешена партия 1: она висела на дублирующей вещи 2 и переехала на
+    # выжившую 1. Партия 2 стоит на новинке 3 и миграцией не тронута.
+    moved_rev = rows("SELECT rev FROM supply_batches WHERE id=1")[0][0]
+    check("редакция перевешенной партии поднята: она сменила вещь",
+          moved_rev > 1, f"rev={moved_rev}")
+    untouched_rev = rows("SELECT rev FROM supply_batches WHERE id=2")[0][0]
+    check("а партия, которую миграция не трогала, редакцию не меняла",
+          untouched_rev == 1, f"rev={untouched_rev}")
+
     idx_a = {i["name"] for i in sa_inspect(eng).get_indexes("supply_assignments")}
     idx_i = {i["name"] for i in sa_inspect(eng).get_indexes("supply_items")}
     check("замок пары (организация, материал, партия) стоит",
@@ -1595,6 +1656,52 @@ def supply_fix_1_migration_checks() -> None:  # noqa: C901 — шагов мно
           sorted(r[0] for r in rows("SELECT id FROM supply_assignments"))
           == [1, 4, 5, 7],
           str(sorted(r[0] for r in rows("SELECT id FROM supply_assignments"))))
+
+    # ── Экран, открытый ДО миграции, больше не снимает чужое ────────────────
+    #
+    # Поднятой редакции самой по себе мало: важно, что настоящий путь удаления
+    # её ПРОВЕРЯЕТ. Ревью воспроизвело обратное — снятие с сохранённым до
+    # миграции rev=1 успешно удаляло слитую строку целиком, хотя на экране
+    # человека стояла только его доля. В этой фикстуре доля равна 2.0, а после
+    # слияния строка несёт 6.5 (2.0 + 3.0 + 1.5). Здесь тот же сценарий
+    # целиком: сохранённый заранее rev, настоящий `delete_assignment`, и строка
+    # обязана уцелеть.
+    from sqlalchemy.orm import Session as _Session
+    stale_ok, stale_err = False, ""
+    with _Session(eng) as s:
+        try:
+            sp.delete_assignment(s, 1, 1, {"rev": 1, "op_id": "stale-after-merge"},
+                                 "Владелец")
+            s.commit()
+        except sp.StaleWrite as exc:
+            stale_ok, stale_err = True, str(exc)
+            s.rollback()
+        except Exception as exc:  # noqa: BLE001 — важен факт отказа и его тип
+            stale_err = f"{type(exc).__name__}: {exc}"
+            s.rollback()
+    check("снятие с редакцией, взятой ДО слияния, отвергается как устаревшее",
+          stale_ok, stale_err or "удаление прошло — строка снята чужой редакцией")
+    check("и слитая строка цела: 6.5 не сняты по разрешению на 2.0",
+          rows("SELECT qty FROM supply_assignments WHERE id=1") == [(6.5,)],
+          str(rows("SELECT qty FROM supply_assignments WHERE id=1")))
+
+    fresh_rev = rows("SELECT rev FROM supply_assignments WHERE id=1")[0][0]
+    fresh_ok = False
+    with _Session(eng) as s:
+        try:
+            sp.delete_assignment(s, 1, 1, {"rev": fresh_rev,
+                                           "op_id": "fresh-after-merge"},
+                                 "Владелец")
+            s.commit()
+            fresh_ok = True
+        except Exception as exc:  # noqa: BLE001
+            fresh_err = f"{type(exc).__name__}: {exc}"
+            s.rollback()
+    check("а с редакцией, взятой ПОСЛЕ слияния, снятие проходит как обычно",
+          fresh_ok, locals().get("fresh_err", ""))
+    check("и строка действительно снята",
+          rows("SELECT COUNT(*) FROM supply_assignments WHERE id=1") == [(0,)],
+          str(rows("SELECT COUNT(*) FROM supply_assignments WHERE id=1")))
 
     eng.dispose()
     for suffix in ("", "-wal", "-shm"):

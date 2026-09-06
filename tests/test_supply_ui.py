@@ -2965,6 +2965,102 @@ def _fix1_f11(page, base, c, dialogs) -> None:
     check("и confirm() не появлялся ни разу за весь сценарий",
           not dialogs, str(dialogs))
 
+    # ── «Вернуть» при занятом отправителе ───────────────────────────────────
+    #
+    # РЕГРЕССИЯ. Обработчик тоста закрывал его ПЕРВОЙ строкой, а `send()` при
+    # уже идущей записи выходил, ничего не отправив. Итог: человек нажал
+    # «Вернуть», восстановление не ушло, а единственная кнопка возврата исчезла
+    # вместе с тостом — повторить стало нечем.
+    #
+    # Занятость создаётся КОНТРОЛИРУЕМОЙ ЗАДЕРЖКОЙ ИНТЕРФЕЙСА, а не гонкой:
+    # `fetch` оборачивается так, что запрос к ДРУГОЙ ручке (материалы) висит
+    # заданное время. Никаких конкурентных записей в одну строку нет, запрос
+    # завершается сам и обычным ответом сервера. Опыт PR #49 не повторяется.
+    print("\n-- «Вернуть» при занятом отправителе --")
+    page.evaluate("""() => {
+      window.__undoPosts = [];
+      const real = window.fetch;
+      window.__realFetch = real;
+      window.fetch = function (url, init) {
+        const u = String((url && url.url) || url);
+        if (init && init.method === 'POST'
+            && u.indexOf('/planning/assignments') !== -1
+            && u.indexOf('/delete') === -1) {
+          window.__undoPosts.push(u);
+        }
+        if (u.indexOf('/planning/materials') !== -1 && window.__holdMs) {
+          const ms = window.__holdMs;
+          return new Promise((res, rej) => setTimeout(
+            () => real.apply(this, [url, init]).then(res, rej), ms));
+        }
+        return real.apply(this, arguments);
+      };
+    }""")
+
+    def undo_button() -> int:
+        return page.evaluate(
+            "() => [...document.querySelectorAll('#toast-root .pl-toast-act')]"
+            ".filter(b => b.textContent === 'Вернуть').length")
+
+    page.evaluate("""() => {
+      %s
+      if (!card) return;
+      const line = [...card.querySelectorAll('.pl-assign')]
+        .find(l => l.textContent.indexOf('Ткань для снятия') >= 0);
+      const btn = line ? [...line.querySelectorAll('button')]
+        .find(b => b.textContent === 'Снять') : null;
+      if (btn) btn.click();
+    }""" % CARD_JS)
+    page.wait_for_timeout(300)
+    page.evaluate("""() => {
+      %s
+      const yes = card ? [...card.querySelectorAll('.pl-confirm button')]
+        .find(b => b.textContent === 'Да') : null;
+      if (yes) yes.click();
+    }""" % CARD_JS)
+    page.wait_for_timeout(1500)
+    check("тост с «Вернуть» появился", undo_button() == 1, str(undo_button()))
+
+    # Занимаем отправителя долгим запросом к ДРУГОЙ ручке.
+    page.evaluate("() => { window.__holdMs = 2500; }")
+    page.click("#pl-add-material")
+    page.wait_for_timeout(200)
+    page.fill("#pl-mat-title", "Материал, занявший отправителя")
+    page.fill("#pl-mat-qty", "3")
+    page.click("#pl-mat-form button[type=submit]")
+    page.wait_for_timeout(300)
+    page.evaluate("() => { window.__undoPosts = []; }")
+
+    page.evaluate("""() => {
+      const b = [...document.querySelectorAll('#toast-root .pl-toast-act')]
+        .find(x => x.textContent === 'Вернуть');
+      if (b) b.click();
+    }""")
+    page.wait_for_timeout(400)
+    sent_while_busy = page.evaluate("() => (window.__undoPosts || []).length")
+    check("при занятом отправителе восстановление не ушло — это и есть занятость",
+          sent_while_busy == 0, f"ушло запросов: {sent_while_busy}")
+    check("НО кнопка «Вернуть» осталась на экране, а не исчезла впустую",
+          undo_button() == 1, f"кнопок «Вернуть»: {undo_button()}")
+
+    # Отпускаем отправителя и повторяем — теперь восстановление обязано пройти.
+    page.evaluate("() => { window.__holdMs = 0; }")
+    page.wait_for_timeout(2600)
+    check("кнопка дожила до момента, когда повтор возможен",
+          undo_button() == 1, f"кнопок «Вернуть»: {undo_button()}")
+    page.evaluate("""() => {
+      const b = [...document.querySelectorAll('#toast-root .pl-toast-act')]
+        .find(x => x.textContent === 'Вернуть');
+      if (b) b.click();
+    }""")
+    page.wait_for_timeout(1800)
+    check("повторное нажатие отправило восстановление",
+          page.evaluate("() => (window.__undoPosts || []).length") >= 1,
+          str(page.evaluate("() => (window.__undoPosts || []).length")))
+    check("и назначение действительно вернулось",
+          "40" in assign_line(), assign_line()[:120])
+    page.evaluate("() => { if (window.__realFetch) window.fetch = window.__realFetch; }")
+
 def _fix1_f07(page, base, c) -> None:
     """F-07: делать нечего — блока «Следующий шаг» на экране нет.
 
