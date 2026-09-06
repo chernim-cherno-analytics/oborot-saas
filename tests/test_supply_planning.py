@@ -35,7 +35,7 @@
  15) структурно: слой не трогает `production_orders`, `CC_BATCH_ID`,
      `OrderedQty`, приёмки, формулы, МойСклад и парсер предпросмотра;
  16) миграция аддитивна: старт на «старой» базе создаёт таблицы, повторный старт
-     идемпотентен, шагов старта одиннадцать и первые десять не тронуты;
+     идемпотентен, шагов старта двенадцать и первые одиннадцать не тронуты;
  17) удаление организации уносит все строки слоя.
 
 Живых внешних систем здесь нет ни одной: ни МойСклада, ни Google. Все данные
@@ -49,6 +49,7 @@ import sqlite3
 import sys
 import threading
 import time
+from datetime import date, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -148,6 +149,36 @@ def make_jpeg(width: int = 32, height: int = 20) -> bytes:
     sof_body = struct.pack(">BHHB", 8, height, width, 1) + b"\x01\x11\x00"
     sof = b"\xff\xc0" + struct.pack(">H", len(sof_body) + 2) + sof_body
     return b"\xff\xd8" + app0 + sof + b"\xff\xd9"
+
+
+def set_sheets_preview(on: bool, org_id: int | None = None) -> None:
+    """Флаг предпросмотра производственной таблицы (SUPPLY-FIX-1, F-08).
+
+    Пишется прямо в `orgs.settings_json` — тем же ключом, что читает
+    `Org.supply_sheets_preview` и переключает `tools/supply_sheets_preview.py`.
+    Без флага вкладки нет, а ручки `/api/supply/sheets*` отвечают 404, поэтому
+    проверки предпросмотра обязаны его включать явно: иначе они проверяли бы
+    не предпросмотр, а собственную неудачу.
+    """
+    con = sqlite3.connect(DB_PATH)
+    try:
+        if org_id is None:
+            org_id = con.execute("SELECT id FROM orgs ORDER BY id LIMIT 1").fetchone()[0]
+        raw = con.execute("SELECT settings_json FROM orgs WHERE id = ?",
+                          (org_id,)).fetchone()[0]
+        try:
+            data = json.loads(raw or "{}")
+        except ValueError:
+            data = {}
+        if on:
+            data["supply_sheets_preview"] = True
+        else:
+            data.pop("supply_sheets_preview", None)
+        con.execute("UPDATE orgs SET settings_json = ? WHERE id = ?",
+                    (json.dumps(data, ensure_ascii=False), org_id))
+        con.commit()
+    finally:
+        con.close()
 
 
 def sizes_of(payload: dict) -> dict:
@@ -293,8 +324,17 @@ def run() -> int:
           f"{m['assigned']} {m['free']}")
     check("предупреждения о превышении нет — его и не должно быть",
           m["over"] is False and m["warning"] == "", m["warning"][:80])
-    check("следующий шаг называет неназначенный остаток числом",
-          board["next_step"]["code"] == "assign" and "25" in board["next_step"]["text"],
+    # ПРАВИЛО `assign` УБРАНО (SUPPLY-FIX-1, F-07), и проверка заменена, а не
+    # ослаблена. Свободный остаток — это факт сводки, а не задача: материал
+    # покупают до того, как решено, что из него шьют, поэтому «распределите»
+    # висело у любого материала с остатком больше нуля и закрывало собой
+    # настоящие расхождения. Теперь при таком состоянии следующим шагом идёт
+    # первое НАСТОЯЩЕЕ незавершённое дело — партия без срока, — а число 25
+    # человек по-прежнему видит в сводке (проверка ниже).
+    check("свободный остаток больше не выдаётся за задачу",
+          board["next_step"]["code"] != "assign", board["next_step"]["code"])
+    check("следующим шагом идёт настоящее незавершённое дело",
+          board["next_step"]["code"] in ("plan_qty", "due"),
           board["next_step"]["text"][:90])
     check("метраж и штуки в сводке НЕ смешаны",
           board["summary"]["free_by_unit"] == [{"unit": "м", "qty": 25.0}]
@@ -634,10 +674,18 @@ def run() -> int:
           json.dumps(before_plan, sort_keys=True, ensure_ascii=False)
           == json.dumps(after_plan, sort_keys=True, ensure_ascii=False),
           "второй импорт")
+    # SUPPLY-FIX-1 (F-08): предпросмотр закрыт флагом организации. Проверка
+    # снимка обязана его включить — иначе она читала бы 404 и доказывала не
+    # «снимок жив», а «ручка закрыта».
+    closed = owner.get("/api/supply/sheets")
+    check("без флага организации предпросмотра не существует",
+          closed.status_code == 404, str(closed.status_code))
+    set_sheets_preview(True)
     preview = owner.get("/api/supply/sheets").json()
     check("а сам предпросмотр при этом читается и живёт своей жизнью",
           preview.get("configured") is True and len(preview.get("rows", [])) == 2,
           str(len(preview.get("rows", []))))
+    set_sheets_preview(False)
 
     # ── 15. Арендаторы, роли, подписка ────────────────────────────────────────
     print("\n== Чужая организация, участник и readonly ==")
@@ -850,10 +898,10 @@ def run() -> int:
     check("за весь сценарий не создано ни одного заказа и ни одной строки «В заказе»",
           orders == 0 and ordered == 0, f"orders={orders} ordered_qty={ordered}")
 
-    # ── 18. Миграция: аддитивна, идемпотентна, шагов одиннадцать ──────────────
-    print("\n== Миграция: новый шаг сверху, старые десять не тронуты ==")
+    # ── 18. Миграция: аддитивна, идемпотентна, шагов двенадцать ───────────────
+    print("\n== Миграция: новый шаг сверху, старые одиннадцать не тронуты ==")
     from app.main import STARTUP_SCHEMA_STEPS
-    check("шагов старта одиннадцать", len(STARTUP_SCHEMA_STEPS) == 11,
+    check("шагов старта двенадцать", len(STARTUP_SCHEMA_STEPS) == 12,
           str(len(STARTUP_SCHEMA_STEPS)))
     check("первые десять пар (id, позиция) не изменились",
           STARTUP_SCHEMA_STEPS[:10] == (
@@ -863,9 +911,18 @@ def run() -> int:
               ("ms_vendor.ensure_schema", 7), ("subscription.ensure_schema", 8),
               ("subscription.log_preview", 9), ("models.ensure_supply_schema", 10)),
           str(STARTUP_SCHEMA_STEPS[:10]))
-    check("новый шаг дописан в конец с новым id и позицией 11",
+    check("шаг SUPPLY-3 остался на позиции 11 и с прежним id",
           STARTUP_SCHEMA_STEPS[10] == ("models.ensure_supply_planning_schema", 11),
           str(STARTUP_SCHEMA_STEPS[10]))
+    # Индекс берётся безопасно намеренно: на дереве, где шага ещё нет, набор
+    # обязан НАПЕЧАТАТЬ красную строку, а не умереть IndexError на середине —
+    # иначе все проверки ниже не выполнятся вовсе, и прогон перестанет что-либо
+    # доказывать (D-42: непроведённая проверка не бывает зелёной).
+    twelfth = (STARTUP_SCHEMA_STEPS[11]
+               if len(STARTUP_SCHEMA_STEPS) > 11 else None)
+    check("новый шаг дописан в конец с новым id и позицией 12",
+          twelfth == ("models.ensure_supply_planning_unique_schema", 12),
+          str(twelfth))
 
     # «Старая» база: таблиц слоя нет вовсе — шаг обязан их создать и не упасть
     # при повторном вызове.
@@ -971,6 +1028,11 @@ def run() -> int:
     check("а строки другой организации на месте",
           owner.get("/api/supply/planning").json()["materials"], "план владельца цел")
 
+
+    # ── 20. SUPPLY-FIX-1: противоречивый ввод, поиск, приоритеты, дубли ───────
+    supply_fix_1_checks()
+    supply_fix_1_migration_checks()
+
     member.close()
     other.close()
     del_c.close()
@@ -980,6 +1042,756 @@ def run() -> int:
     for name in FAIL:
         print(f"  FAIL {name}")
     return 1 if FAIL else 0
+
+
+def supply_fix_1_checks() -> None:  # noqa: C901 — сценарный блок, ветвлений мало
+    """SUPPLY-FIX-1 (F-03, F-04, F-07, F-08, F-09, F-10) на уровне API.
+
+    Каждая проверка ниже КРАСНЕЕТ на `ea1caff` по поведению, а не по отсутствию
+    импорта или маршрута: адреса и поля те же самые, разошёлся только ответ.
+    """
+    c = client()
+    register(c, "sp-fix1@test.io", "Бренд Фикс")
+
+    # ── F-03: непустое поле, которого этот вид срока не использует, — отказ ──
+    print("\n== F-03: противоречивый срок и эскиз не проглатываются молча ==")
+    item = c.post("/api/supply/planning/items",
+                  json={"kind": "draft", "title": "Плащ", "op_id": "f3-item"})
+    check("вещь для проверок срока заведена", item.status_code == 200,
+          str(item.status_code))
+    item_id = item.json()["items"][0]["id"]
+
+    def make_batch(payload, op):
+        body = dict(payload)
+        body["item_id"] = item_id
+        body["op_id"] = op
+        return c.post("/api/supply/planning/batches", json=body)
+
+    r = make_batch({"due_kind": "text", "due_text": "к ноябрю",
+                    "due_date": "2026-10-31"}, "f3-a")
+    check("«своими словами» + дата → 400, а не 200 с потерянной датой",
+          r.status_code == 400, str(r.status_code))
+    check("отказ называет, что убрать, и чем заменить",
+          "дата не нужна" in r.text and "точная дата" in r.text, r.text[:160])
+    r = make_batch({"due_kind": "unknown", "due_text": "как получится"}, "f3-b")
+    check("«срок неизвестен» + текст → 400, а не 200 с потерянным текстом",
+          r.status_code == 400 and "текст не нужен" in r.text, r.text[:160])
+    r = make_batch({"due_kind": "unknown", "due_date": "2026-10-31"}, "f3-c")
+    check("«срок неизвестен» + дата → 400", r.status_code == 400 and
+          "дата не нужна" in r.text, r.text[:160])
+    r = make_batch({"due_kind": "exact", "due_date": "2026-10-31",
+                    "due_text": "к ноябрю"}, "f3-d")
+    check("«точная дата» + текст → 400", r.status_code == 400 and
+          "текст не нужен" in r.text, r.text[:160])
+    ok = make_batch({"due_kind": "exact", "due_date": "2026-10-31",
+                     "due_source": "цех"}, "f3-ok")
+    check("а непротиворечивый срок по-прежнему принимается",
+          ok.status_code == 200, str(ok.status_code))
+    saved = [b for b in ok.json()["batches"] if b["due_kind"] == "exact"]
+    check("и дата сохранена ровно та, что прислали",
+          len(saved) == 1 and saved[0]["due_date"] == "2026-10-31",
+          str(saved[:1]))
+    src = c.post("/api/supply/planning/batches",
+                 json={"item_id": item_id, "due_kind": "unknown",
+                       "due_source": "цех сказал, что не знает", "op_id": "f3-src"})
+    check("источник срока при неизвестном сроке ПРИНИМАЕТСЯ и сохраняется",
+          src.status_code == 200
+          and any(b["due_source"] == "цех сказал, что не знает"
+                  for b in src.json()["batches"]), str(src.status_code))
+
+    # ── F-04: поиск по каталогу отдаёт total и размер каталога ──────────────
+    print("\n== F-04: каталог ищется, а не показывается первыми двадцатью ==")
+    empty = c.get("/api/supply/planning/catalog").json()
+    check("у организации без синка каталог пуст, и это названо числом",
+          empty.get("catalog_size") == 0 and empty.get("total") == 0
+          and empty.get("options") == [], json.dumps(empty, ensure_ascii=False)[:160])
+    # Ниже поля читаются через .get(): на дереве, где их ещё нет, набор обязан
+    # напечатать красную строку, а не умереть KeyError на середине прогона.
+    org_id = sqlite3.connect(DB_PATH).execute(
+        "SELECT org_id FROM memberships ORDER BY org_id DESC LIMIT 1").fetchone()[0]
+    seed_catalog(org_id, 60)
+    full = c.get("/api/supply/planning/catalog").json()
+    check("каталог из 60 моделей: отдано 20, но сказано, что их 60",
+          len(full.get("options") or []) == 20 and full.get("total") == 60
+          and full.get("catalog_size") == 60,
+          f"options={len(full.get('options') or [])} total={full.get('total')}"
+          f" catalog_size={full.get('catalog_size')}")
+    found = c.get("/api/supply/planning/catalog", params={"q": "тренч"}).json()
+    found_opts = found.get("options") or []
+    check("поиск «тренч» находит модель, до которой в списке из 20 не дойти",
+          any(o["base_name"] == "Тренч «Классика»" for o in found_opts),
+          json.dumps(found_opts[:3], ensure_ascii=False)[:200])
+    check("и у найденного названа размерность",
+          bool(found_opts) and all("sizes" in o for o in found_opts),
+          str(found_opts[:1]))
+
+    # Эскиз на каталожной вещи — отказ. Проверка стоит ПОСЛЕ наполнения
+    # каталога намеренно: на пустом каталоге запрос останавливал бы отказ
+    # «такой вещи в каталоге нет», и краснота ничего не говорила бы про эскиз.
+    sk = c.post("/api/supply/planning/sketches",
+                files={"file": ("s.png", make_png(), "image/png")})
+    sketch_id = sk.json()["sketch_id"]
+    r = c.post("/api/supply/planning/items",
+               json={"kind": "catalog", "base_name": "Тренч «Классика»",
+                     "sketch_id": sketch_id, "op_id": "f3-sk"})
+    check("эскиз на каталожной вещи → 400, а не тихо сохранённый и невидимый",
+          r.status_code == 400 and "только к новинке" in r.text, r.text[:160])
+    kept = sqlite3.connect(DB_PATH).execute(
+        "SELECT COUNT(*) FROM supply_items WHERE base_name = ?",
+        ("Тренч «Классика»",)).fetchone()[0]
+    check("и вещь при этом не завелась вовсе", kept == 0, str(kept))
+
+    # ── F-10: каталожная вещь не заводится дважды ───────────────────────────
+    print("\n== F-10: одна модель каталога — одна вещь плана ==")
+    a = c.post("/api/supply/planning/items",
+               json={"kind": "catalog", "base_name": "Тренч «Классика»",
+                     "op_id": "f10-a"})
+    check("каталожная вещь заведена", a.status_code == 200, str(a.status_code))
+    first_id = [i for i in a.json()["items"] if i["base_name"] == "Тренч «Классика»"][0]["id"]
+    b = c.post("/api/supply/planning/items",
+               json={"kind": "catalog", "base_name": "Тренч «Классика»",
+                     "op_id": "f10-b"})
+    check("повтор той же модели отвечает 200, а не заводит вторую",
+          b.status_code == 200, str(b.status_code))
+    same = [i for i in b.json()["items"] if i["base_name"] == "Тренч «Классика»"]
+    check("в плане ровно одна такая вещь, и это ТА ЖЕ строка",
+          len(same) == 1 and same[0]["id"] == first_id, str(same))
+    check("человеку сказано, почему новой строки не появилось",
+          b.json().get("notice") == "Эта модель уже есть в плане.",
+          str(b.json().get("notice")))
+    # РЕГРЕССИЯ: повтор с заметкой не терял её молча. Ревью воспроизвело:
+    # note=first → повтор note=second давал reused=True и stored_note=first,
+    # без ошибки и без записи. Человек написал текст — текст исчез.
+    n1 = c.post("/api/supply/planning/items",
+                json={"kind": "catalog", "base_name": "Модель 001",
+                      "note": "первая заметка", "op_id": "f10-n1"})
+    check("каталожная вещь с заметкой заведена", n1.status_code == 200,
+          str(n1.status_code))
+    noted_id = [i for i in n1.json()["items"]
+                if i["base_name"] == "Модель 001"][0]["id"]
+    rev_before = [i for i in n1.json()["items"] if i["id"] == noted_id][0]["rev"]
+    n2 = c.post("/api/supply/planning/items",
+                json={"kind": "catalog", "base_name": "Модель 001",
+                      "note": "вторая заметка", "op_id": "f10-n2"})
+    check("повтор с новой заметкой принят", n2.status_code == 200,
+          str(n2.status_code))
+    noted = [i for i in n2.json()["items"] if i["id"] == noted_id]
+    check("вещь по-прежнему одна", len(noted) == 1 and len(
+        [i for i in n2.json()["items"]
+         if i["base_name"] == "Модель 001"]) == 1, str(noted))
+    check("ВТОРАЯ заметка не потерялась молча — она в строке",
+          noted and "вторая заметка" in (noted[0]["note"] or ""),
+          str(noted[0]["note"]) if noted else "нет строки")
+    check("и первая заметка при этом цела",
+          noted and "первая заметка" in (noted[0]["note"] or ""),
+          str(noted[0]["note"]) if noted else "нет строки")
+    check("редакция строки поднята: экран с прежним rev теперь устарел",
+          noted and noted[0]["rev"] > rev_before,
+          f"было {rev_before} стало {noted[0]['rev'] if noted else '?'}")
+    ev = sqlite3.connect(DB_PATH).execute(
+        "SELECT COUNT(*) FROM supply_events WHERE entity_kind='item'"
+        " AND entity_id=? AND field='note'", (noted_id,)).fetchone()[0]
+    check("изменение заметки названо записью журнала, а не молчит", ev == 1,
+          str(ev))
+    n3 = c.post("/api/supply/planning/items",
+                json={"kind": "catalog", "base_name": "Модель 001",
+                      "op_id": "f10-n3"})
+    same_note = [i for i in n3.json()["items"] if i["id"] == noted_id]
+    check("повтор БЕЗ заметки строку не трогает и редакцию не двигает",
+          same_note and same_note[0]["rev"] == noted[0]["rev"],
+          f"{noted[0]['rev']} → {same_note[0]['rev'] if same_note else '?'}")
+
+    # РЕГРЕССИЯ КРАЙНЕГО СЛУЧАЯ: заметка уже занимает весь предел.
+    # Склейка `A*500 · НОВЫЙ` обрезается обратно ровно в `A*500`, видимое поле
+    # не меняется ни на символ — и под прежним условием введённый текст
+    # исчезал и из строки, и из журнала. Здесь проверяется, что он цел.
+    full_note = "A" * sp.MAX_NOTE_CHARS
+    c.post("/api/supply/planning/items",
+           json={"kind": "catalog", "base_name": "Модель 002",
+                 "note": full_note, "op_id": "f10-full1"})
+    full_board = c.get("/api/supply/planning").json()
+    full_id = [i for i in full_board["items"]
+               if i["base_name"] == "Модель 002"][0]["id"]
+    full_rev = [i for i in full_board["items"] if i["id"] == full_id][0]["rev"]
+    check("заметка на полный предел сохранена целиком",
+          len([i for i in full_board["items"]
+               if i["id"] == full_id][0]["note"]) == sp.MAX_NOTE_CHARS,
+          str(len([i for i in full_board["items"]
+                   if i["id"] == full_id][0]["note"])))
+    unique_text = "ВТОРАЯ-ЗАМЕТКА-НЕ-ПОМЕСТИЛАСЬ-9137"
+    r_full = c.post("/api/supply/planning/items",
+                    json={"kind": "catalog", "base_name": "Модель 002",
+                          "note": unique_text, "op_id": "f10-full2"})
+    check("повтор при заполненном поле принят", r_full.status_code == 200,
+          str(r_full.status_code))
+    after_full = [i for i in r_full.json()["items"] if i["id"] == full_id][0]
+    check("видимое поле осталось прежним — места в нём нет",
+          after_full["note"] == full_note, str(len(after_full["note"])))
+    kept_full = sqlite3.connect(DB_PATH).execute(
+        "SELECT old_value FROM supply_events WHERE entity_kind='item'"
+        " AND entity_id=? AND field='note_truncated'", (full_id,)).fetchall()
+    check("НО введённый текст сохранён целиком в журнале, а не потерян",
+          any(row[0] == unique_text for row in kept_full),
+          str(kept_full)[:200] or "записи нет")
+    op_rows = sqlite3.connect(DB_PATH).execute(
+        "SELECT COUNT(*) FROM supply_events WHERE op_id=?",
+        ("f10-full2",)).fetchone()[0]
+    check("поступок отмечен ровно одной записью с этим op_id",
+          op_rows == 1, str(op_rows))
+    again_full = c.post("/api/supply/planning/items",
+                        json={"kind": "catalog", "base_name": "Модель 002",
+                              "note": unique_text, "op_id": "f10-full2"})
+    check("повтор с тем же op_id идемпотентен и второй записи не заводит",
+          again_full.status_code == 200
+          and sqlite3.connect(DB_PATH).execute(
+              "SELECT COUNT(*) FROM supply_events WHERE op_id=?",
+              ("f10-full2",)).fetchone()[0] == 1,
+          str(again_full.status_code))
+
+    d1 = c.post("/api/supply/planning/items",
+                json={"kind": "draft", "title": "Одно имя", "op_id": "f10-d1"})
+    d2 = c.post("/api/supply/planning/items",
+                json={"kind": "draft", "title": "Одно имя", "op_id": "f10-d2"})
+    drafts = [i for i in d2.json()["items"] if i["title"] == "Одно имя"]
+    check("а две новинки с одним именем по-прежнему две разные вещи",
+          d1.status_code == 200 and len(drafts) == 2, str(len(drafts)))
+
+    # ── F-09: одна пара (материал, партия) — одна строка ────────────────────
+    print("\n== F-09: повторное назначение прибавляет, а не двоит ==")
+    mat = c.post("/api/supply/planning/materials",
+                 json={"title": "Фурнитура", "qty": "10", "unit": "кг",
+                       "op_id": "f9-mat"})
+    mat_id = mat.json()["materials"][0]["id"]
+    batch_id = [b for b in mat.json()["batches"]][0]["id"]
+    c.post("/api/supply/planning/assignments",
+           json={"material_id": mat_id, "batch_id": batch_id, "qty": "2",
+                 "note": "первая", "op_id": "f9-a1"})
+    r = c.post("/api/supply/planning/assignments",
+               json={"material_id": mat_id, "batch_id": batch_id, "qty": "3",
+                     "note": "вторая", "op_id": "f9-a2"})
+    rows = [a for b in r.json()["batches"] if b["id"] == batch_id
+            for a in b["assignments"] if a["material_id"] == mat_id]
+    check("строка одна, а не две", len(rows) == 1, str(len(rows)))
+    check("и в ней сумма, а не последнее число",
+          rows and rows[0]["qty"] == 5.0, str(rows[:1]))
+    check("заметки обеих не потерялись",
+          rows and "первая" in rows[0]["note"] and "вторая" in rows[0]["note"],
+          str(rows[:1]))
+    events = sqlite3.connect(DB_PATH).execute(
+        "SELECT action, old_value, new_value FROM supply_events"
+        " WHERE entity_kind='assignment' AND entity_id=?", (rows[0]["id"],)).fetchall()
+    check("журнал хранит обе записи: создание и прибавление old→new",
+          len(events) == 2 and events[1][1] == "2.0" and events[1][2] == "5.0",
+          str(events)[:200])
+
+    # ── ЖИВОЙ путь: длинные заметки не теряются и здесь ─────────────────────
+    # Тот же класс, что в миграции (issuecomment-5555375180), но на ручке,
+    # которой человек пользуется каждый день: две законные заметки по 300
+    # символов дают склейку 603, и до правки она молча резалась до 500.
+    long_mat = c.post("/api/supply/planning/materials",
+                      json={"title": "Материал с длинными заметками", "qty": "50",
+                            "unit": "кг", "op_id": "f9-long-mat"}).json()
+    long_mat_id = [m for m in long_mat["materials"]
+                   if m["title"] == "Материал с длинными заметками"][0]["id"]
+    c.post("/api/supply/planning/assignments",
+           json={"material_id": long_mat_id, "batch_id": batch_id, "qty": "1",
+                 "note": LONG_NOTE_A, "op_id": "f9-long-1"})
+    long_res = c.post("/api/supply/planning/assignments",
+                      json={"material_id": long_mat_id, "batch_id": batch_id,
+                            "qty": "1", "note": LONG_NOTE_B, "op_id": "f9-long-2"})
+    long_rows = [a for b in long_res.json()["batches"] if b["id"] == batch_id
+                 for a in b["assignments"] if a["material_id"] == long_mat_id]
+    check("повтор с длинной заметкой слился в одну строку",
+          len(long_rows) == 1 and long_rows[0]["qty"] == 2.0, str(len(long_rows)))
+    seen = long_rows[0]["note"] if long_rows else ""
+    check("первая длинная заметка видна целиком",
+          seen.count("A") == 300, f"видно {seen.count('A')} из 300")
+    kept = sqlite3.connect(DB_PATH).execute(
+        "SELECT old_value FROM supply_events WHERE field='note_truncated'"
+        " AND entity_kind='assignment' AND entity_id=?",
+        (long_rows[0]["id"],)).fetchall()
+    check("вторая сохранена ЦЕЛИКОМ в журнале, а не обрезана вместе с видимым",
+          len(kept) == 1 and kept[0][0] == LONG_NOTE_B,
+          f"в журнале {len(kept[0][0]) if kept else 0} из 300")
+    check("итого на живом пути сохранено 600 символов из 600",
+          seen.count("A") + (len(kept[0][0]) if kept else 0) == 600,
+          f"{seen.count('A') + (len(kept[0][0]) if kept else 0)} из 600")
+    # `entity_kind` в условии обязателен: `entity_id` уникален только внутри
+    # своего вида, и без него сюда попадали записи об обрезке у ВЕЩИ с тем же
+    # номером, что у назначения. Проверка молча считала чужие строки.
+    short_cut = sqlite3.connect(DB_PATH).execute(
+        "SELECT COUNT(*) FROM supply_events WHERE field='note_truncated'"
+        " AND entity_kind='assignment' AND entity_id=?",
+        (rows[0]["id"],)).fetchone()[0]
+    check("а короткая склейка отметки об обрезке не получает — обрезки не было",
+          short_cut == 0, str(short_cut))
+
+    # ── F-07: сводка — не задача; прошедший срок называется вслух ───────────
+    print("\n== F-07: следующий шаг перестал маскировать расхождения ==")
+    board = c.get("/api/supply/planning").json()
+    free = [m for m in board["materials"] if m["free"] and m["free"] > 0]
+    check("у организации есть материал со свободным остатком",
+          bool(free), str(len(free)))
+    check("но «распределите» больше не выдаётся за следующий шаг",
+          board["next_step"]["code"] != "assign", board["next_step"]["code"])
+    c.post("/api/supply/planning/assignments",
+           json={"material_id": mat_id, "batch_id": batch_id, "qty": "100",
+                 "op_id": "f7-over"})
+    over = c.get("/api/supply/planning").json()
+    check("перерасход виден следующим шагом, а не спрятан за остатком",
+          over["next_step"]["code"] == "over", over["next_step"]["text"][:90])
+    unknown_qty = c.post("/api/supply/planning/materials",
+                         json={"title": "Без количества", "op_id": "f7-unk"})
+    check("неизвестное количество задачей не считается (правило `qty` убрано)",
+          unknown_qty.json()["next_step"]["code"] != "qty",
+          unknown_qty.json()["next_step"]["code"])
+
+    past = client()
+    register(past, "sp-fix1-past@test.io", "Бренд Просрочка")
+    pit = past.post("/api/supply/planning/items",
+                    json={"kind": "draft", "title": "Юбка", "op_id": "p-i"}).json()
+    pid = pit["items"][0]["id"]
+    past.post("/api/supply/planning/materials",
+              json={"title": "Ткань", "qty": "10", "op_id": "p-m"})
+    yesterday = (date.today() - timedelta(days=1)).isoformat()
+    pb = past.post("/api/supply/planning/batches",
+                   json={"item_id": pid, "title": "Вчерашняя", "plan_qty": "5",
+                         "due_kind": "exact", "due_date": yesterday, "op_id": "p-b"})
+    check("партия с вчерашним точным сроком заведена", pb.status_code == 200,
+          str(pb.status_code))
+    step = past.get("/api/supply/planning").json()["next_step"]
+    check("прошедший срок назван следующим шагом",
+          step["code"] == "due_past", step["code"])
+    check("и в тексте стоит сама дата, а не «просрочено»",
+          yesterday in step["text"] and "прошёл" in step["text"], step["text"][:120])
+    past.close()
+
+    done = client()
+    register(done, "sp-fix1-ok@test.io", "Бренд Порядок")
+    di = done.post("/api/supply/planning/items",
+                   json={"kind": "draft", "title": "Пальто", "op_id": "d-i"}).json()
+    done.post("/api/supply/planning/materials",
+              json={"title": "Сукно", "qty": "50", "op_id": "d-m"})
+    done.post("/api/supply/planning/batches",
+              json={"item_id": di["items"][0]["id"], "title": "Первая",
+                    "plan_qty": "5", "due_kind": "exact",
+                    "due_date": (date.today() + timedelta(days=30)).isoformat(),
+                    "op_id": "d-b"})
+    ok_step = done.get("/api/supply/planning").json()["next_step"]
+    check("когда всё в порядке — код ok, и нераспределённый остаток этому не мешает",
+          ok_step["code"] == "ok", f"{ok_step['code']}: {ok_step['text'][:90]}")
+    done.close()
+
+    # ── F-08: предпросмотр за флагом организации ────────────────────────────
+    print("\n== F-08: вкладка предпросмотра — только организациям с флагом ==")
+    page = c.get("/supply")
+    # Ищем РАЗМЕТКУ элемента (`id="…"`), а не имя идентификатора: имя есть и в
+    # скрипте плана — `byId("sup-tab-preview")`, — и поиск по нему зеленел бы
+    # или краснел по чужой причине.
+    check("без флага вкладки предпросмотра на странице нет",
+          page.status_code == 200 and 'id="sup-tab-preview"' not in page.text,
+          str(page.status_code))
+    check("и панели предпросмотра тоже нет",
+          'id="sup-view-preview"' not in page.text, "панель осталась в разметке")
+    check("раздел плана при этом на месте",
+          'id="sup-view-plan"' in page.text, "план пропал вместе с предпросмотром")
+    gone = c.get("/api/supply/sheets")
+    check("ручка чтения снимка отвечает 404", gone.status_code == 404,
+          str(gone.status_code))
+    check("тем же текстом, что несуществующий маршрут",
+          gone.json().get("detail") == "Not Found", gone.text[:120])
+    ref = c.post("/api/supply/sheets/refresh", json={})
+    check("и ручка обновления тоже 404", ref.status_code == 404, str(ref.status_code))
+
+    tool_org = sqlite3.connect(DB_PATH).execute(
+        "SELECT id FROM orgs WHERE id = ?", (org_id,)).fetchone()[0]
+    before_settings = json.loads(sqlite3.connect(DB_PATH).execute(
+        "SELECT settings_json FROM orgs WHERE id = ?", (tool_org,)).fetchone()[0])
+    rc = run_preview_tool(["--org-id", str(tool_org), "--on"])
+    check("штатный инструмент включает флаг и завершается успешно", rc == 0, str(rc))
+    page = c.get("/supply")
+    check("с флагом вкладка предпросмотра появилась",
+          'id="sup-tab-preview"' in page.text, "вкладки нет")
+    on = c.get("/api/supply/sheets")
+    check("и ручка снимка отвечает по-настоящему, а не 404",
+          on.status_code == 200, str(on.status_code))
+    after_settings = json.loads(sqlite3.connect(DB_PATH).execute(
+        "SELECT settings_json FROM orgs WHERE id = ?", (tool_org,)).fetchone()[0])
+    check("инструмент не тронул ни одной чужой настройки",
+          {k: v for k, v in after_settings.items() if k != "supply_sheets_preview"}
+          == before_settings, json.dumps(after_settings, ensure_ascii=False)[:200])
+    check("повторное включение идемпотентно",
+          run_preview_tool(["--org-id", str(tool_org), "--on"]) == 0, "rc")
+    check("выключение возвращает организацию в прежнее состояние",
+          run_preview_tool(["--org-id", str(tool_org), "--off"]) == 0, "rc")
+    off_settings = json.loads(sqlite3.connect(DB_PATH).execute(
+        "SELECT settings_json FROM orgs WHERE id = ?", (tool_org,)).fetchone()[0])
+    check("и следа временной меры в настройках не остаётся",
+          off_settings == before_settings,
+          json.dumps(off_settings, ensure_ascii=False)[:200])
+    check("после выключения ручка снова 404",
+          c.get("/api/supply/sheets").status_code == 404, "не 404")
+    check("несуществующая организация инструменту не по зубам",
+          run_preview_tool(["--org-id", "999999", "--on"]) == 2, "rc")
+    c.close()
+
+
+#: Две законные заметки, склейка которых в колонку `note` не помещается.
+#: Ровно тот вход, на котором независимое чтение воспроизвело потерю 103
+#: символов (issuecomment-5555375180). Уменьшать их нельзя: меньший размер
+#: проверял бы другой случай и зеленел бы на неисправленном коде.
+LONG_NOTE_A = "A" * 300
+LONG_NOTE_B = "B" * 300
+
+
+def supply_fix_1_migration_checks() -> None:  # noqa: C901 — шагов много, ветвлений мало
+    """SUPPLY-FIX-1: шаг 12 схлопывает дубли и ставит замки (F-09, F-10).
+
+    Проверяется на ОТДЕЛЬНОЙ базе, собранной шагом 11: это состояние боевой
+    базы до выпуска — с дублями, которые старый код умел заводить. Доказывается
+    не «индекс появился», а то, ради чего он появляется: сумма назначенного
+    цела, заметки обеих строк на месте, партии дублирующей вещи перевешены, а
+    соседняя организация не задета.
+    """
+    print("\n== Шаг 12: дубли схлопываются, замки встают ==")
+    from sqlalchemy import create_engine, inspect as sa_inspect, text as sa_text
+    from app import models as _models
+
+    # Шага может не быть вовсе (дерево до этого пакета). Тогда набор говорит об
+    # этом одной красной строкой и идёт дальше, а не падает AttributeError,
+    # унося с собой все проверки ниже.
+    if not hasattr(_models, "ensure_supply_planning_unique_schema"):
+        check("шаг 12 (слияние дублей и уникальные индексы) существует", False,
+              "models.ensure_supply_planning_unique_schema отсутствует")
+        return
+
+    mig_db = ROOT / "test_supply_planning_dup.db"
+    for suffix in ("", "-wal", "-shm"):
+        f = Path(str(mig_db) + suffix)
+        if f.exists():
+            f.unlink()
+    eng = create_engine(f"sqlite:///{mig_db}")
+    _models.Base.metadata.create_all(bind=eng, tables=[
+        _models.Org.__table__, _models.Product.__table__])
+    _models.ensure_supply_planning_schema(bind=eng)
+
+    ts = "2026-09-01 10:00:00"
+    with eng.begin() as conn:
+        for org_id, name in ((1, "Первая"), (2, "Вторая")):
+            conn.execute(sa_text(
+                "INSERT INTO orgs (id, name, plan, settings_json, created_at)"
+                " VALUES (:i, :n, 'trial', '{}', :t)"),
+                {"i": org_id, "n": name, "t": ts})
+        for org_id, mid, title in ((1, 1, "Шерсть"), (1, 2, "Подкладка"),
+                                   (2, 3, "Чужая ткань"), (1, 4, "Длинные заметки")):
+            conn.execute(sa_text(
+                "INSERT INTO supply_materials (id, org_id, title, qty, unit,"
+                " source_note, author, created_at, updated_at, rev)"
+                " VALUES (:i,:o,:t,100,'м','','a',:ts,:ts,1)"),
+                {"i": mid, "o": org_id, "t": title, "ts": ts})
+        # Две КАТАЛОЖНЫЕ вещи с одним base_name — то, что старый код разрешал.
+        # Плюс две новинки с одинаковым рабочим именем: их шаг трогать не имеет
+        # права, иначе замок против дублей стал бы запретом работать.
+        # Заметки каталожных дублей — те самые, на которых воспроизведена
+        # потеря (issuecomment-5555384087): у выжившей и у донора они РАЗНЫЕ, и
+        # текст донора обязан пережить удаление строки.
+        for iid, org_id, kind, base, title, note in (
+                (1, 1, "catalog", "Тренч", "Тренч", "first note"),
+                (2, 1, "catalog", "Тренч", "Тренч", "second important note"),
+                (3, 1, "draft", "", "Одно имя", ""),
+                (4, 1, "draft", "", "Одно имя", ""),
+                (5, 2, "catalog", "Тренч", "Тренч", "")):
+            conn.execute(sa_text(
+                "INSERT INTO supply_items (id, org_id, kind, base_name, title,"
+                " note, author, created_at, updated_at, rev)"
+                " VALUES (:i,:o,:k,:b,:t,:n,'a',:ts,:ts,1)"),
+                {"i": iid, "o": org_id, "k": kind, "b": base, "t": title,
+                 "n": note, "ts": ts})
+        # Партии висят на ВТОРОЙ (дублирующей) вещи — после шага они обязаны
+        # оказаться на первой, а не осиротеть.
+        for bid, org_id, item_id, title in ((1, 1, 2, "Партия дубля"),
+                                            (2, 1, 3, "Партия новинки"),
+                                            (3, 2, 5, "Чужая партия")):
+            conn.execute(sa_text(
+                "INSERT INTO supply_batches (id, org_id, item_id, title, plan_note,"
+                " due_kind, due_text, due_date, due_source, due_author, author,"
+                " created_at, updated_at, rev)"
+                " VALUES (:i,:o,:it,:t,'','unknown','','','','','a',:ts,:ts,1)"),
+                {"i": bid, "o": org_id, "it": item_id, "t": title, "ts": ts})
+        # Пара 7/8 — вход из issuecomment-5555375180: две заметки по 300
+        # символов, каждая законна на вводе (предел 500), а их склейка с
+        # разделителем даёт 603 и в колонку `note` не помещается. Размер
+        # фикстуры не уменьшается: он и есть суть случая.
+        for aid, org_id, mid, bid, qty, note in (
+                (1, 1, 1, 1, 2.0, "первая"),
+                (2, 1, 1, 1, 3.0, "вторая"),
+                (3, 1, 1, 1, 1.5, ""),
+                (4, 1, 2, 1, 7.0, "одиночка"),
+                (5, 2, 3, 3, 4.0, "чужая"),
+                (6, 2, 3, 3, 6.0, "чужая вторая"),
+                (7, 1, 4, 1, 2.0, LONG_NOTE_A),
+                (8, 1, 4, 1, 3.0, LONG_NOTE_B)):
+            conn.execute(sa_text(
+                "INSERT INTO supply_assignments (id, org_id, material_id, batch_id,"
+                " qty, note, author, created_at, updated_at, rev)"
+                " VALUES (:i,:o,:m,:b,:q,:n,'a',:ts,:ts,1)"),
+                {"i": aid, "o": org_id, "m": mid, "b": bid, "q": qty,
+                 "n": note, "ts": ts})
+
+    def rows(sql, *args):
+        with eng.connect() as conn:
+            return conn.execute(sa_text(sql), *args).all()
+
+    before_sum = rows("SELECT ROUND(SUM(qty), 3) FROM supply_assignments")[0][0]
+    _models.ensure_supply_planning_unique_schema(bind=eng)
+
+    merged = rows("SELECT id, qty, note FROM supply_assignments"
+                  " WHERE org_id=1 AND material_id=1 AND batch_id=1")
+    check("три дубля назначения стали одной строкой", len(merged) == 1, str(merged))
+    check("и в ней сумма 2 + 3 + 1.5 = 6.5, а не последнее число",
+          merged and merged[0][1] == 6.5, str(merged))
+    check("выжила строка с наименьшим id — та, что завели первой",
+          merged and merged[0][0] == 1, str(merged))
+    check("заметки обеих непустых строк склеены, а не выброшены",
+          merged and "первая" in merged[0][2] and "вторая" in merged[0][2],
+          str(merged))
+    single = rows("SELECT qty, note FROM supply_assignments"
+                  " WHERE org_id=1 AND material_id=2")
+    check("строка без дубля не тронута ни числом, ни заметкой",
+          single == [(7.0, "одиночка")], str(single))
+    other = rows("SELECT qty FROM supply_assignments WHERE org_id=2")
+    check("дубли ЧУЖОЙ организации схлопнуты отдельно и своей суммой",
+          other == [(10.0,)], str(other))
+    after_sum = rows("SELECT ROUND(SUM(qty), 3) FROM supply_assignments")[0][0]
+    check("общая сумма назначенного пережила слияние до десятых",
+          after_sum == before_sum, f"было={before_sum} стало={after_sum}")
+
+    # ── Длинные заметки: видимое поле обрезано, но НИ ОДИН символ не потерян ──
+    # Вход из issuecomment-5555375180. До правки склейка 300+3+300 = 603 резалась
+    # до 500 прямо перед удалением строки-донора, и 103 символа «B» исчезали
+    # вместе с ней — восстановить их было неоткуда.
+    long_row = rows("SELECT id, qty, note FROM supply_assignments"
+                    " WHERE org_id=1 AND material_id=4")
+    check("длинная пара тоже стала одной строкой с верной суммой",
+          len(long_row) == 1 and long_row[0][1] == 5.0, str(long_row)[:120])
+    visible = long_row[0][2] if long_row else ""
+    check("первая заметка видна целиком: 300 символов «A» на месте",
+          visible.count("A") == 300, f"в видимом поле {visible.count('A')} из 300")
+    donor = rows("SELECT old_value FROM supply_events"
+                 " WHERE entity_kind='assignment' AND field='note'")
+    donor_b = [r[0] for r in donor if r[0].startswith("B")]
+    check("вторая заметка сохранена ЦЕЛИКОМ — 300 символов «B» в журнале",
+          len(donor_b) == 1 and len(donor_b[0]) == 300 and donor_b[0] == LONG_NOTE_B,
+          f"в журнале {len(donor_b[0]) if donor_b else 0} из 300")
+    total_kept = visible.count("A") + (len(donor_b[0]) if donor_b else 0)
+    check("итого сохранено 600 символов из 600 — потери нет ни одного",
+          total_kept == 600, f"сохранено {total_kept} из 600")
+    cutmark = rows("SELECT old_value FROM supply_events"
+                   " WHERE field='note_truncated'")
+    check("обрезка видимого поля названа записью журнала, а не молчит",
+          len(cutmark) == 1 and cutmark[0][0] == str(len(LONG_NOTE_A) + 3 + len(LONG_NOTE_B)),
+          str(cutmark))
+    check("а короткая склейка обходится без отметки об обрезке — её и не было",
+          len(cutmark) == 1, f"отметок {len(cutmark)}, ожидалась одна")
+
+    # ── Ни одна удалённая строка не исчезает бесследно ───────────────────────
+    removed_notes = rows("SELECT old_value FROM supply_events"
+                         " WHERE entity_kind='assignment' AND field='note'"
+                         " AND org_id=1")
+    kept_texts = {r[0] for r in removed_notes}
+    check("заметка каждой удалённой строки записана до её удаления",
+          "вторая" in kept_texts and LONG_NOTE_B in kept_texts,
+          str(sorted(len(t) for t in kept_texts)))
+    check("автор записей слияния — шаг старта, а не человек",
+          rows("SELECT DISTINCT author FROM supply_events WHERE action='merge'")
+          == [("миграция SUPPLY-FIX-1",)],
+          str(rows("SELECT DISTINCT author FROM supply_events WHERE action='merge'")))
+    check("у записей слияния пустой op_id — частичный замок их не считает",
+          rows("SELECT COUNT(*) FROM supply_events"
+               " WHERE action='merge' AND op_id <> ''") == [(0,)],
+          "непустой op_id у записи слияния")
+
+    items = rows("SELECT id FROM supply_items WHERE org_id=1 AND kind='catalog'")
+    check("две каталожные вещи с одним именем стали одной",
+          items == [(1,)], str(items))
+    # Вход из issuecomment-5555384087: заметка донора не должна исчезнуть
+    # вместе со строкой. До правки в базе оставалось только «first note».
+    item_note = rows("SELECT note FROM supply_items WHERE id=1")[0][0]
+    check("заметка донора каталожной вещи пережила слияние и видна",
+          "first note" in item_note and "second important note" in item_note,
+          repr(item_note))
+    item_ev = rows("SELECT old_value, new_value FROM supply_events"
+                   " WHERE entity_kind='item' AND field='note'")
+    check("и она же записана в журнал целиком до удаления строки",
+          any(r[0] == "second important note" for r in item_ev), str(item_ev)[:200])
+    drafts = rows("SELECT COUNT(*) FROM supply_items"
+                  " WHERE org_id=1 AND kind='draft' AND title='Одно имя'")
+    check("а две новинки с одинаковым именем остались двумя",
+          drafts == [(2,)], str(drafts))
+    foreign = rows("SELECT COUNT(*) FROM supply_items WHERE org_id=2")
+    check("каталожная вещь соседней организации с тем же именем цела",
+          foreign == [(1,)], str(foreign))
+    moved = rows("SELECT id, item_id FROM supply_batches WHERE org_id=1 ORDER BY id")
+    check("партия дублирующей вещи перевешена на выжившую, а не осиротела",
+          moved == [(1, 1), (2, 3)], str(moved))
+    check("ни одна партия не потеряна",
+          rows("SELECT COUNT(*) FROM supply_batches")[0] == (3,),
+          str(rows("SELECT COUNT(*) FROM supply_batches")))
+
+    # РЕГРЕССИЯ: строка после слияния несёт уже не то, что видел человек, и её
+    # редакция обязана это отражать. Ревью воспроизвело: две строки 30/40 с
+    # rev=1 → миграция даёт 70 при rev=1 → «Снять» с сохранённым до миграции
+    # rev=1 проходит проверку и снимает 70, то есть больше, чем было на экране.
+    merged_rev = rows("SELECT rev FROM supply_assignments WHERE id=1")[0][0]
+    check("редакция слитого назначения поднята миграцией",
+          merged_rev > 1, f"rev={merged_rev}")
+    kept_item_rev = rows("SELECT rev FROM supply_items WHERE id=1")[0][0]
+    check("редакция выжившей каталожной вещи поднята: её заметка изменилась",
+          kept_item_rev > 1, f"rev={kept_item_rev}")
+    # Перевешена партия 1: она висела на дублирующей вещи 2 и переехала на
+    # выжившую 1. Партия 2 стоит на новинке 3 и миграцией не тронута.
+    moved_rev = rows("SELECT rev FROM supply_batches WHERE id=1")[0][0]
+    check("редакция перевешенной партии поднята: она сменила вещь",
+          moved_rev > 1, f"rev={moved_rev}")
+    untouched_rev = rows("SELECT rev FROM supply_batches WHERE id=2")[0][0]
+    check("а партия, которую миграция не трогала, редакцию не меняла",
+          untouched_rev == 1, f"rev={untouched_rev}")
+
+    idx_a = {i["name"] for i in sa_inspect(eng).get_indexes("supply_assignments")}
+    idx_i = {i["name"] for i in sa_inspect(eng).get_indexes("supply_items")}
+    check("замок пары (организация, материал, партия) стоит",
+          "ux_supply_assignments_pair" in idx_a, str(sorted(idx_a)))
+    check("частичный замок каталожной вещи стоит",
+          "ux_supply_items_catalog" in idx_i, str(sorted(idx_i)))
+
+    blocked = False
+    with eng.connect() as conn:
+        try:
+            conn.execute(sa_text(
+                "INSERT INTO supply_assignments (org_id, material_id, batch_id,"
+                " qty, note, author, created_at, updated_at, rev)"
+                " VALUES (1,1,1,1,'','a',:ts,:ts,1)"), {"ts": ts})
+            conn.commit()
+        except Exception:
+            blocked = True
+            conn.rollback()
+    check("вторая строка на ту же пару в базу больше не проходит", blocked,
+          "INSERT должен был упасть")
+
+    draft_ok = True
+    with eng.connect() as conn:
+        try:
+            conn.execute(sa_text(
+                "INSERT INTO supply_items (org_id, kind, base_name, title, note,"
+                " author, created_at, updated_at, rev)"
+                " VALUES (1,'draft','','Третья новинка','','a',:ts,:ts,1)"),
+                {"ts": ts})
+            conn.commit()
+        except Exception:
+            draft_ok = False
+            conn.rollback()
+    check("а новинки замок не задевает — их base_name пуст у всех сразу",
+          draft_ok, "INSERT новинки не должен был упасть")
+
+    snapshot = rows("SELECT id, qty, note FROM supply_assignments ORDER BY id")
+    _models.ensure_supply_planning_unique_schema(bind=eng)
+    check("повторный старт идемпотентен: ни одной строки не изменилось",
+          rows("SELECT id, qty, note FROM supply_assignments ORDER BY id") == snapshot,
+          str(snapshot))
+
+    # Откат совместим по ДАННЫМ: старый код читает те же строки. Что при этом
+    # его повторное назначение упрётся в замок и получит отказ вместо второй
+    # строки — названо в докстринге шага и проверено здесь же выше.
+    # Выжившие — ровно первые строки каждой группы плюс одиночка: 1 (пара
+    # 1/1), 4 (без дубля), 5 (пара чужой организации), 7 (длинные заметки).
+    check("после шага таблицы читаются обычным SELECT (откат данные не портит)",
+          sorted(r[0] for r in rows("SELECT id FROM supply_assignments"))
+          == [1, 4, 5, 7],
+          str(sorted(r[0] for r in rows("SELECT id FROM supply_assignments"))))
+
+    # ── Экран, открытый ДО миграции, больше не снимает чужое ────────────────
+    #
+    # Поднятой редакции самой по себе мало: важно, что настоящий путь удаления
+    # её ПРОВЕРЯЕТ. Ревью воспроизвело обратное — снятие с сохранённым до
+    # миграции rev=1 успешно удаляло слитую строку целиком, хотя на экране
+    # человека стояла только его доля. В этой фикстуре доля равна 2.0, а после
+    # слияния строка несёт 6.5 (2.0 + 3.0 + 1.5). Здесь тот же сценарий
+    # целиком: сохранённый заранее rev, настоящий `delete_assignment`, и строка
+    # обязана уцелеть.
+    from sqlalchemy.orm import Session as _Session
+    stale_ok, stale_err = False, ""
+    with _Session(eng) as s:
+        try:
+            sp.delete_assignment(s, 1, 1, {"rev": 1, "op_id": "stale-after-merge"},
+                                 "Владелец")
+            s.commit()
+        except sp.StaleWrite as exc:
+            stale_ok, stale_err = True, str(exc)
+            s.rollback()
+        except Exception as exc:  # noqa: BLE001 — важен факт отказа и его тип
+            stale_err = f"{type(exc).__name__}: {exc}"
+            s.rollback()
+    check("снятие с редакцией, взятой ДО слияния, отвергается как устаревшее",
+          stale_ok, stale_err or "удаление прошло — строка снята чужой редакцией")
+    check("и слитая строка цела: 6.5 не сняты по разрешению на 2.0",
+          rows("SELECT qty FROM supply_assignments WHERE id=1") == [(6.5,)],
+          str(rows("SELECT qty FROM supply_assignments WHERE id=1")))
+
+    fresh_rev = rows("SELECT rev FROM supply_assignments WHERE id=1")[0][0]
+    fresh_ok = False
+    with _Session(eng) as s:
+        try:
+            sp.delete_assignment(s, 1, 1, {"rev": fresh_rev,
+                                           "op_id": "fresh-after-merge"},
+                                 "Владелец")
+            s.commit()
+            fresh_ok = True
+        except Exception as exc:  # noqa: BLE001
+            fresh_err = f"{type(exc).__name__}: {exc}"
+            s.rollback()
+    check("а с редакцией, взятой ПОСЛЕ слияния, снятие проходит как обычно",
+          fresh_ok, locals().get("fresh_err", ""))
+    check("и строка действительно снята",
+          rows("SELECT COUNT(*) FROM supply_assignments WHERE id=1") == [(0,)],
+          str(rows("SELECT COUNT(*) FROM supply_assignments WHERE id=1")))
+
+    eng.dispose()
+    for suffix in ("", "-wal", "-shm"):
+        f = Path(str(mig_db) + suffix)
+        if f.exists():
+            f.unlink()
+
+
+def seed_catalog(org_id: int, count: int) -> None:
+    """Каталог организации: `count` моделей, среди них «Тренч «Классика»».
+
+    Пишется строками в `products` — тем же ключом `base_name`, каким каталог
+    ключуется во всём проекте. Живого синка с МойСклад в наборе нет и не нужно:
+    поиск читает СВОЙ каталог, а не источник.
+    """
+    con = sqlite3.connect(DB_PATH)
+    try:
+        names = ["Тренч «Классика»"] + [f"Модель {i:03d}" for i in range(count - 1)]
+        for i, base in enumerate(names):
+            con.execute(
+                "INSERT INTO products (org_id, ext_id, base_name, size, category,"
+                " sale_price, cost_price, cost_full, supplier, archived, excluded)"
+                " VALUES (?,?,?,?,'',0,0,0,'',0,0)",
+                (org_id, f"cat-{i}", base, "44"))
+        con.commit()
+    finally:
+        con.close()
+
+
+def run_preview_tool(argv: list) -> int:
+    """Операторский инструмент в том же процессе, но своим `main()`.
+
+    Запускать подпроцессом смысла нет: он взял бы ту же базу из `DATABASE_URL`,
+    а разбор аргументов и запись — ровно та же функция.
+    """
+    from tools import supply_sheets_preview as tool
+
+    return tool.main(argv)
 
 
 def main() -> int:

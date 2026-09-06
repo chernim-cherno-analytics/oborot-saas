@@ -268,12 +268,19 @@ def run() -> int:
     check("каталожная вещь заводится", r.status == 200, r.where)
     item_id = [i for i in json.loads(r.text)["items"] if i["kind"] == "catalog"][0]["id"]
 
+    # SUPPLY-FIX-1 изменил САМО создание: повтор той же модели каталога больше
+    # не заводит вторую вещь, а возвращает существующую с `notice` (F-10).
+    # Прежняя редакция этого набора требовала здесь ДВЕ вещи — она писалась
+    # против рантайма, где дубль был законен. Требовать прежнего теперь значило
+    # бы проверять отменённое поведение.
     r = post(owner, "/api/supply/planning/items",
              {"kind": "catalog", "base_name": base_name, "op_id": "c-i1-dup"})
-    dup_items = [i for i in json.loads(r.text).get("items", [])
-                 if i.get("base_name") == base_name] if r.status == 200 else []
-    check("без замка ВТОРАЯ такая же каталожная вещь принимается — как и было",
-          r.status == 200 and len(dup_items) == 2, f"{r.where} вещей: {len(dup_items)}")
+    body = json.loads(r.text) if r.status == 200 else {}
+    dup_items = [i for i in body.get("items", []) if i.get("base_name") == base_name]
+    check("повтор той же модели каталога переиспользует вещь, а не заводит вторую",
+          r.status == 200 and len(dup_items) == 1, f"{r.where} вещей: {len(dup_items)}")
+    check("и человеку сказано, почему новой строки не появилось",
+          body.get("notice") == "Эта модель уже есть в плане.", str(body.get("notice")))
 
     r = post(owner, "/api/supply/planning/batches",
              {"item_id": item_id, "title": "Партия А", "plan_qty": "30",
@@ -290,59 +297,96 @@ def run() -> int:
               "op_id": "c-a1"})
     check("метраж назначен на партию А", r.status == 200, r.where)
 
+    # Здесь та же перемена: повтор назначения на ту же пару ПРИБАВЛЯЕТ к
+    # существующей строке (F-09), а не заводит вторую. 30 + 40 = 70 одной
+    # строкой — и это уже не «как и было», а то, ради чего пакет делался.
     r = post(owner, "/api/supply/planning/assignments",
              {"material_id": mat_id, "batch_id": bids["Партия А"], "qty": "40",
               "op_id": "c-a1-dup"})
-    pair_rows = [a for a in json.loads(r.text).get("materials", [{}])[0].get("links", [])] \
-        if r.status == 200 else []
     con = db_conn()
     try:
-        pair_count = con.execute(
-            "SELECT COUNT(*) FROM supply_assignments"
+        pair = con.execute(
+            "SELECT COUNT(*), COALESCE(SUM(qty), 0) FROM supply_assignments"
             " WHERE org_id=? AND material_id=? AND batch_id=?",
-            (org_id, mat_id, bids["Партия А"])).fetchone()[0]
+            (org_id, mat_id, bids["Партия А"])).fetchone()
     finally:
         con.close()
-    check("без замка ВТОРАЯ строка на ту же пару принимается — как и было",
-          r.status == 200 and pair_count == 2,
-          f"{r.where} строк на пару: {pair_count}; связей: {len(pair_rows)}")
+    pair_count, pair_sum = int(pair[0]), float(pair[1])
+    check("повтор назначения на ту же пару прибавляет к строке, а не двоит её",
+          r.status == 200 and pair_count == 1,
+          f"{r.where} строк на пару: {pair_count}")
+    check("и в строке сумма обоих назначений, а не последнее число",
+          abs(pair_sum - 70.0) < 0.001, f"сумма: {pair_sum}")
 
-    # ── 2. Приезжает будущая схема ────────────────────────────────────────────
+    # ── 2. Схема больше не «будущая»: замки ставит настоящая миграция ────────
     #
-    # Дубли, законно созданные выше, сначала СХЛОПЫВАЮТСЯ — иначе уникальный
-    # индекс просто не встанет. Это не удобство набора, а свойство самой
-    # миграции: по этой же причине шаг 12 в PR #51 сначала сливает существующие
-    # строки и только потом ставит замок, и обратный порядок невозможен.
-    print("\n== Приехала будущая схема: два замка ==")
+    # Прежняя редакция доводила базу до будущего состояния РУКАМИ: удаляла дубли
+    # своим `DELETE` и создавала индексы своим DDL. Тогда иначе было нельзя —
+    # шага 12 в дереве не существовало. Теперь он здесь, и его выполняет старт
+    # приложения. Оставить ручную имитацию значило бы проверять собственный
+    # `DELETE` вместо миграции — ровно та подмена, которой быть не должно.
+    #
+    # Поэтому замки не создаются, а СВЕРЯЮТСЯ: если шаг 12 их не поставил, тут
+    # красная строка, а не тихо доведённая до нужного вида база.
+    print("\n== Замки поставлены настоящей миграцией шага 12 ==")
     con = db_conn()
     try:
-        con.execute(
-            "DELETE FROM supply_assignments WHERE id NOT IN "
-            "(SELECT MIN(id) FROM supply_assignments GROUP BY org_id, material_id, batch_id)")
-        con.execute(
-            "DELETE FROM supply_items WHERE kind='catalog' AND id NOT IN "
-            "(SELECT MIN(id) FROM supply_items WHERE kind='catalog'"
-            " GROUP BY org_id, base_name)")
-        for ddl in FUTURE_INDEXES:
-            con.execute(ddl)
-        con.commit()
         made = {row[0] for row in con.execute(
             "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'ux_supply_%'")}
+        ledger = {row[0] for row in con.execute(
+            "SELECT step_id FROM migration_ledger")}
     finally:
         con.close()
-    check("оба будущих замка стоят в базе",
+    check("оба замка стоят в базе — их поставил старт, а не набор",
           {"ux_supply_assignments_pair", "ux_supply_items_catalog"} <= made,
           ", ".join(sorted(made)))
+    check("и это именно шаг 12, записанный в журнал миграций",
+          "models.ensure_supply_planning_unique_schema" in ledger,
+          ", ".join(sorted(ledger)))
+    # Ожидаемая форма замков сохранена рядом как контракт: имена и колонки
+    # заданы в `FUTURE_INDEXES` и не должны разъехаться с тем, что создаёт шаг.
+    con = db_conn()
+    try:
+        ddl_now = {row[0]: (row[1] or "") for row in con.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type='index'"
+            " AND name LIKE 'ux_supply_%'")}
+    finally:
+        con.close()
+    check("замок пары — по (org_id, material_id, batch_id)",
+          "org_id" in ddl_now.get("ux_supply_assignments_pair", "")
+          and "material_id" in ddl_now.get("ux_supply_assignments_pair", "")
+          and "batch_id" in ddl_now.get("ux_supply_assignments_pair", ""),
+          ddl_now.get("ux_supply_assignments_pair", "<нет>"))
+    check("замок каталожной вещи частичный: только kind='catalog'",
+          "kind" in ddl_now.get("ux_supply_items_catalog", "")
+          and "catalog" in ddl_now.get("ux_supply_items_catalog", ""),
+          ddl_now.get("ux_supply_items_catalog", "<нет>"))
 
     board = owner.get("/api/supply/planning")
     check("прежний код на мигрированной базе читает доску", board.status_code == 200,
           str(board.status_code))
 
-    # ── 3. Конфликт пары: управляемый отказ вместо 500 ───────────────────────
+    # ── 3. Повтор на замкнутой схеме: не 500 и не отказ, а прибавление ───────
     #
-    # ЭТО КЛЮЧЕВАЯ ПРОВЕРКА ПАКЕТА. На BASE здесь HTTP 500 и
-    # `UNIQUE constraint failed` — тот самый открытый gate выпуска.
-    print("\n== Повторное назначение той же пары ==")
+    # ЧТО ЗДЕСЬ ИЗМЕНИЛОСЬ И ПОЧЕМУ. Набор писался, когда создание делало
+    # прямой `INSERT`: тогда на замкнутой схеме повтор упирался в индекс, и
+    # ключевой проверкой было «управляемый 409 вместо 500». SUPPLY-FIX-1 убрал
+    # сам конфликт: назначение прибавляет к строке, каталожная вещь
+    # переиспользуется, `move_assignment` тоже сливает в существующую пару.
+    # Ни одна ручка этого дерева больше не может нарушить эти два замка.
+    #
+    # Поэтому здесь проверяется то, что происходит НА САМОМ ДЕЛЕ: запрос
+    # проходит, строка одна, сумма сошлась, пятисотки нет. Требовать 409 от
+    # рантайма, который до конфликта не доходит, значило бы держать проверку,
+    # которая либо всегда красная, либо доказывает подстроенный конфликт.
+    #
+    # Обработчик 409 при этом НЕ остаётся без доказательства. Он существует для
+    # ОТКАТИВШЕГОСЯ рантайма, и проверяется там, где случается на самом деле:
+    # §7 ниже разбирает `IntegrityError` напрямую и сторожит, что каждый пишущий
+    # маршрут его ловит, а сквозной трёхфазный опыт с настоящим выпущенным
+    # рантаймом `2f1434eb` показывает живой 409 после отката. Подстраивать
+    # конфликт гонкой здесь нельзя: это запрещённый опыт PR #49.
+    print("\n== Повторное назначение той же пары на замкнутой схеме ==")
     cap = LogCapture()
     layer_log = logging.getLogger("oborot.supply_planning")
     layer_log.addHandler(cap)
@@ -361,31 +405,38 @@ def run() -> int:
     check("основной путь записи НЕ отвечает 500", conflict.status != 500, conflict.where)
     check("и вообще не падает пятисоткой любого вида",
           conflict.status not in (0, 500, 502, 503), conflict.where)
-    check("отказ управляемый: 409 Conflict", conflict.status == 409, conflict.where)
+    check("запрос проходит: конфликта на этом рантайме не возникает",
+          conflict.status == 200, conflict.where)
     check("в теле ответа нет ни слова про устройство хранилища",
           not leaks(conflict.text), ", ".join(leaks(conflict.text)) or conflict.text[:90])
-    check("клиенту сказано человеческими словами",
-          "Обновите страницу" in conflict.text, conflict.text[:120])
 
-    check("частичной записи не осталось: отпечаток строк совпал целиком",
-          before == after, f"до {before} / после {after}")
-    check("и поступок не отмечен как выполненный",
-          not op_recorded(org_id, "c-a1-conflict"))
+    # Строка по-прежнему ОДНА, а метраж прибавился: 70 + 5. Это и есть замена
+    # прежней проверке «частичной записи не осталось» — тогда записи не должно
+    # было быть вовсе, теперь она обязана быть полной и ровно одной.
+    check("строка на пару осталась одна",
+          after["assignments"] == before["assignments"],
+          f"до {before['assignments']} / после {after['assignments']}")
+    check("а метраж прибавлен целиком, без потери и без удвоения",
+          abs(after["assigned_sum"] - before["assigned_sum"] - 5.0) < 0.001,
+          f"до {before['assigned_sum']} / после {after['assigned_sum']}")
+    check("поступок отмечен выполненным — запись состоялась",
+          op_recorded(org_id, "c-a1-conflict"))
 
-    # 8-й и 9-й пункты набора: причина видна дежурному, но человек в лог не уехал.
+    # Журнал слоя обязан молчать: жаловаться не на что. И заметка человека в
+    # него не уезжает ни при каком исходе — это свойство обработчика, а не
+    # удача конкретного сценария.
     logged = " | ".join(cap.records)
-    check("настоящая причина ушла в журнал сервера, а не потерялась",
-          "UNIQUE constraint failed" in logged, logged[:160] or "<журнал пуст>")
+    check("замок не срабатывал, и в журнале слоя нет жалобы на него",
+          "UNIQUE constraint failed" not in logged, logged[:160] or "<журнал пуст>")
     check("а введённый человеком текст в журнал НЕ уехал",
           HUMAN_NOTE not in logged, logged[:160])
 
-    # ── 4. Отказ точечный: следующий запрос проходит ─────────────────────────
-    print("\n== После отказа приложение продолжает работать ==")
+    # ── 4. Соседняя пара живёт своей жизнью ──────────────────────────────────
+    print("\n== Прибавление к одной паре не задевает другую ==")
     ok_next = post(owner, "/api/supply/planning/assignments",
                    {"material_id": mat_id, "batch_id": bids["Партия Б"], "qty": "7",
                     "op_id": "c-a2"})
-    check("назначение на ДРУГУЮ партию проходит сразу после отказа",
-          ok_next.status == 200, ok_next.where)
+    check("назначение на ДРУГУЮ партию проходит", ok_next.status == 200, ok_next.where)
     again = owner.get("/api/supply/planning")
     check("и доска читается", again.status_code == 200, str(again.status_code))
 
@@ -397,24 +448,28 @@ def run() -> int:
             (org_id, mat_id, bids["Партия А"])).fetchone()
     finally:
         con.close()
-    check("уже назначенный метраж отказом не тронут",
-          pair_qty is not None and abs(float(pair_qty[0]) - 30.0) < 0.001,
+    check("на первой паре ровно то, что на неё назначали: 30 + 40 + 5",
+          pair_qty is not None and abs(float(pair_qty[0]) - 75.0) < 0.001,
           str(pair_qty))
 
     # ── 5. Второй замок — частичный, по каталожной вещи ──────────────────────
-    print("\n== Повторная каталожная вещь ==")
+    #
+    # Здесь та же перемена, что в §3: повтор не упирается в замок, а
+    # переиспользует вещь. Важное остаётся прежним и проверяется: пятисотки
+    # нет, устройство хранилища наружу не течёт, ВТОРАЯ строка не появляется.
+    print("\n== Повторная каталожная вещь на замкнутой схеме ==")
     before = fingerprint(org_id)
     dup = post(owner, "/api/supply/planning/items",
                {"kind": "catalog", "base_name": base_name, "note": HUMAN_NOTE,
                 "op_id": "c-i-conflict"})
     after = fingerprint(org_id)
     check("повтор каталожной вещи НЕ отвечает 500", dup.status != 500, dup.where)
-    check("отказ управляемый: 409 Conflict", dup.status == 409, dup.where)
+    check("запрос проходит: вещь переиспользована", dup.status == 200, dup.where)
     check("и без деталей хранилища в теле",
           not leaks(dup.text), ", ".join(leaks(dup.text)) or dup.text[:90])
-    check("вещь, событие и отметка поступка не появились",
-          before == after and not op_recorded(org_id, "c-i-conflict"),
-          f"до {before} / после {after}")
+    check("второй такой же вещи в плане не появилось",
+          after["items"] == before["items"],
+          f"до {before['items']} / после {after['items']}")
 
     # Частичность второго замка — это не деталь реализации, а условие того, что
     # он вообще пригоден: полный индекс по (org_id, base_name) запретил бы ВТОРУЮ

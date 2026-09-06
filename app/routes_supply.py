@@ -22,6 +22,8 @@ CSRF на POST — штатный: заголовок `X-Oborot-CSRF` требу
 """
 from __future__ import annotations
 
+import json
+
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
@@ -30,6 +32,53 @@ from app.auth import AuthContext, require_auth_api, require_owner_api
 from app.db import get_db
 
 router = APIRouter(prefix="/api/supply", tags=["supply"])
+
+
+#: Ключ флага в существующем `orgs.settings_json`. Колонки под него нет и не
+#: будет: мера временная — до развилки владельца Р-1 о судьбе парсера.
+PREVIEW_FLAG = "supply_sheets_preview"
+
+
+def preview_enabled(org) -> bool:
+    """Показывать ли этой организации предпросмотр (SUPPLY-FIX-1, F-08).
+
+    ЖИВЁТ ЗДЕСЬ, А НЕ В `Org`, И ЭТО НЕ ВКУСОВЩИНА. Структурный сторож набора
+    `tests/test_supply_sheets.py` требует, чтобы `app/models.py`, `app/db.py` и
+    `app/tenancy.py` не знали про слой предпросмотра вовсе: снимок живёт в
+    `connections.config_json`, своих таблиц и своих полей у него нет. Свойство
+    с именем слоя на модели `Org` эту границу нарушило бы — знание о временной
+    мере протекло бы в общую модель организации и пережило бы саму меру.
+
+    FAIL-CLOSED. Флагом считается только настоящий `True`. Строка «true»,
+    единица и «yes» им не являются намеренно: включение — операторское действие
+    с известным способом (`tools/supply_sheets_preview.py`), и угадывать за
+    оператора, что он имел в виду, здесь не из чего.
+
+    Читается СЫРОЙ `settings_json`, а не `org.settings`: тот дозаполняет три
+    ключа `DEFAULT_SETTINGS` и всё остальное из ответа выбрасывает.
+    """
+    try:
+        data = json.loads(getattr(org, "settings_json", "") or "{}")
+    except ValueError:
+        return False
+    return isinstance(data, dict) and data.get(PREVIEW_FLAG) is True
+
+
+def _require_preview(ctx: AuthContext) -> None:
+    """Обе ручки — за флагом организации (SUPPLY-FIX-1, F-08).
+
+    ПОЧЕМУ 404, А НЕ 403. Парсер разбирает одну конкретную производственную
+    таблицу: точные заголовки на фиксированных колонках, ровно два листа,
+    fail-closed. Для организации без флага этого маршрута не существует — и
+    отвечать надо ровно так же, как на любой несуществующий адрес, тем же
+    текстом. 403 сообщил бы, что функция есть, но ей отказано, и человек пошёл
+    бы искать, где её включить; 404 — правда о его аккаунте.
+
+    Текст берётся тот же, каким приложение отвечает на несуществующий маршрут:
+    иначе отличие ответа само становится признаком «здесь что-то есть».
+    """
+    if not preview_enabled(ctx.org):
+        raise HTTPException(status_code=404, detail="Not Found")
 
 
 @router.get("/sheets")
@@ -50,6 +99,7 @@ def api_supply_sheets(
     загрузить. Ни одной записи поиск не делает и ни одного сетевого вызова не
     порождает: снимок уже лежит в носителе, читается он целиком и в памяти.
     """
+    _require_preview(ctx)
     try:
         return supply_sheets.preview(
             db, ctx.org.id, role=ctx.role, sheet=sheet or None,
@@ -76,6 +126,7 @@ def api_supply_sheets_refresh(
             (и тогда ни одного сетевого вызова и ни одной записи не было);
       502 — источник не отдал того, что мы умеем читать. Прежний снимок цел.
     """
+    _require_preview(ctx)
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Ожидался объект JSON.")
     try:

@@ -141,8 +141,14 @@ def api_planning_catalog(
     ctx: AuthContext = Depends(require_auth_api),
     db: Session = Depends(get_db),
 ):
-    """Кандидаты каталога по каноническому имени. Подсказка, а не привязка."""
-    return {"options": sp.catalog_options(db, ctx.org.id, q)}
+    """Кандидаты каталога по каноническому имени. Подсказка, а не привязка.
+
+    В ответе рядом со списком идут `total` (сколько моделей совпало с запросом
+    целиком) и `catalog_size` (сколько их в каталоге вообще). Первое нужно,
+    чтобы честно сказать «показаны 20 из 143 — уточните», второе — чтобы не
+    выдать пустой каталог за отсутствие совпадений.
+    """
+    return sp.catalog_options(db, ctx.org.id, q)
 
 
 @router.post("/materials")
@@ -188,17 +194,28 @@ def api_planning_item_create(
     ctx: AuthContext = Depends(require_owner_api),
     db: Session = Depends(get_db),
 ):
-    """Вещь каталога или полноценная новинка с эскизом."""
+    """Вещь каталога или полноценная новинка с эскизом.
+
+    Повторный выбор ТОЙ ЖЕ модели каталога возвращает существующую вещь, а не
+    заводит вторую (F-10), и это не молчаливое «ничего не произошло»: в ответ
+    кладётся `notice`, из которого экран делает тост «Эта модель уже есть в
+    плане». Без него человек, нажавший «Сохранить вещь» и не увидевший новой
+    строки, нажимал бы ещё раз.
+    """
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Ожидался объект JSON.")
     try:
         if sp.check_op(db, ctx.org.id, sp.parse_op_id(payload)):
             return sp.board(db, ctx.org.id, ctx.role)
-        sp.create_item(db, ctx.org.id, payload, _author(ctx))
+        item = sp.create_item(db, ctx.org.id, payload, _author(ctx))
+        reused = bool(getattr(item, "reused", False))
     except (sp.PlanningError, IntegrityError) as exc:
         db.rollback()
         raise _fail(exc) from None
-    return _commit(db, ctx.org.id, ctx.role)
+    board = _commit(db, ctx.org.id, ctx.role)
+    if reused:
+        board["notice"] = "Эта модель уже есть в плане."
+    return board
 
 
 @router.post("/batches")
