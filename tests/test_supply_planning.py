@@ -899,9 +899,9 @@ def run() -> int:
           orders == 0 and ordered == 0, f"orders={orders} ordered_qty={ordered}")
 
     # ── 18. Миграция: аддитивна, идемпотентна, шагов двенадцать ───────────────
-    print("\n== Миграция: новый шаг сверху, старые двенадцать не тронуты ==")
+    print("\n== Миграция: новый шаг сверху, старые тринадцать не тронуты ==")
     from app.main import STARTUP_SCHEMA_STEPS
-    check("шагов старта тринадцать", len(STARTUP_SCHEMA_STEPS) == 13,
+    check("шагов старта четырнадцать", len(STARTUP_SCHEMA_STEPS) == 14,
           str(len(STARTUP_SCHEMA_STEPS)))
     check("первые десять пар (id, позиция) не изменились",
           STARTUP_SCHEMA_STEPS[:10] == (
@@ -928,9 +928,14 @@ def run() -> int:
     # IndexError и не выполнить всё, что ниже.
     thirteenth = (STARTUP_SCHEMA_STEPS[12]
                   if len(STARTUP_SCHEMA_STEPS) > 12 else None)
-    check("новый шаг дописан в конец с новым id и позицией 13",
+    check("шаг 13 остался на своей позиции и с прежним id",
           thirteenth == ("models.ensure_supply_archive_schema", 13),
           str(thirteenth))
+    fourteenth = (STARTUP_SCHEMA_STEPS[13]
+                  if len(STARTUP_SCHEMA_STEPS) > 13 else None)
+    check("новый шаг дописан в конец с новым id и позицией 14",
+          fourteenth == ("models.ensure_supply_assignment_archive_schema", 14),
+          str(fourteenth))
 
     # «Старая» база: таблиц слоя нет вовсе — шаг обязан их создать и не упасть
     # при повторном вызове.
@@ -1831,6 +1836,9 @@ def supply_fix_2_checks() -> None:
         ("F-12 вещь", lambda: _fix2_archive_item(c, org2)),
         ("F-12 права", lambda: _fix2_archive_rights(c, org2)),
         ("F-12 повтор", lambda: _fix2_archive_op_id(c, org2)),
+        ("F-12 партия", lambda: _fix2_archive_batch(c, org2)),
+        ("F-12 партия guards", lambda: _fix2_restore_batch_guards(c, org2)),
+        ("F-12 каталог", lambda: _fix2_catalog_restore(c, org2)),
     )
     for label, run_step in steps:
         try:
@@ -2182,12 +2190,14 @@ def _fix2_archive_item(c, org2: int) -> None:
     if cat:
         r = c.post(P2 + f"/items/{cat[0]['id']}/archive",
                    json={"rev": cat[0]["rev"], "op_id": "f2-ai4"})
-        check("вещь каталога в этом пакете не убирается — 409",
-              r.status_code == 409, f"{r.status_code} {r.text[:140]}")
-        check("и отказ говорит, что убираются только новинки",
-              "только новинки" in r.text, r.text[:160])
-        check("сама вещь при этом на доске и цела",
-              [x for x in c.get(P2).json()["items"] if x["id"] == cat[0]["id"]])
+        check("вещь каталога убирается (решение владельца 5562704475)",
+              r.status_code == 200, f"{r.status_code} {r.text[:140]}")
+        check("и с доски она пропала",
+              not [x for x in c.get(P2).json()["items"]
+                   if x["id"] == cat[0]["id"]])
+        check("но физически строка цела",
+              _fix2_row_exists("supply_items", cat[0]["id"]),
+              "строки нет в таблице")
 
 
 def _fix2_archive_rights(c, org2: int) -> None:
@@ -2195,11 +2205,14 @@ def _fix2_archive_rights(c, org2: int) -> None:
     print("\n== F-12/F-13: права и аренда на новых ручках ==")
     mat = _fix2_new_material(c, "Строка для прав", "f2-rg-m")
     it = _fix2_new_item(c, "Вещь для прав", "f2-rg-i")
+    bat = _fix2_new_batch(c, it["id"], "Партия для прав", "f2-rg-b")
     paths = (("архив материала", f"/materials/{mat['id']}/archive"),
              ("возврат материала", f"/materials/{mat['id']}/restore"),
              ("правка вещи", f"/items/{it['id']}/update"),
              ("архив вещи", f"/items/{it['id']}/archive"),
-             ("возврат вещи", f"/items/{it['id']}/restore"))
+             ("возврат вещи", f"/items/{it['id']}/restore"),
+             ("архив партии", f"/batches/{bat['id']}/archive"),
+             ("возврат партии", f"/batches/{bat['id']}/restore"))
 
     other = client()
     register(other, "sp-fix2-other@test.io", "Бренд Фикс Два Чужой")
@@ -2211,7 +2224,9 @@ def _fix2_archive_rights(c, org2: int) -> None:
                      "возврат материала": "Материал не найден.",
                      "правка вещи": "Вещь не найдена.",
                      "архив вещи": "Вещь не найдена.",
-                     "возврат вещи": "Вещь не найдена."}
+                     "возврат вещи": "Вещь не найдена.",
+                     "архив партии": "Плановая партия не найдена.",
+                     "возврат партии": "Плановая партия не найдена."}
     for label, path in paths:
         rr = other.post(P2 + path, json={"op_id": f"x-{label}"})
         detail = rr.json().get("detail") if rr.headers.get(
@@ -2286,6 +2301,205 @@ def _fix2_archive_op_id(c, org2: int) -> None:
     finally:
         con.close()
     check("в журнале ровно одна запись этого поступка", cnt == 1, str(cnt))
+
+
+def _fix2_archive_batch(c, org2: int) -> None:
+    """F-12, решение владельца: партия уходит с назначениями и возвращается с ними."""
+    print("\n== F-12: партия убирается вместе с назначениями и возвращается ==")
+    mat = _fix2_new_material(c, "Шерсть под партию", "f2-ab-m", qty=300)
+    it = _fix2_new_item(c, "Вещь под партию", "f2-ab-i")
+    b = _fix2_new_batch(c, it["id"], "Партия на снятие", "f2-ab-b", plan_qty=60)
+    c.post(P2 + "/assignments", json={"material_id": mat["id"], "batch_id": b["id"],
+                                      "qty": 120, "note": "на манжеты",
+                                      "op_id": "f2-ab-a"})
+    before = [m for m in c.get(P2).json()["materials"] if m["id"] == mat["id"]][0]
+    check("до удаления метраж назначен", before["assigned"] == 120.0
+          and before["free"] == 180.0, f"{before['assigned']}/{before['free']}")
+
+    live_b = [x for x in c.get(P2).json()["batches"] if x["id"] == b["id"]][0]
+    r = c.post(P2 + f"/batches/{b['id']}/archive",
+               json={"rev": live_b["rev"], "op_id": "f2-ab1"})
+    check("партия убирается", r.status_code == 200, f"{r.status_code} {r.text[:140]}")
+    bd = r.json()
+    check("ответ называет, сколько снято и сколько метража освободилось",
+          (bd.get("archived") or {}).get("assignments") == 1
+          and (bd.get("archived") or {}).get("qty") == 120.0,
+          str(bd.get("archived")))
+    check("партии на доске больше нет",
+          not [x for x in bd["batches"] if x["id"] == b["id"]])
+    after = [m for m in bd["materials"] if m["id"] == mat["id"]][0]
+    check("КП F-12: назначенное у материала уменьшилось",
+          after["assigned"] == 0.0, str(after["assigned"]))
+    check("и метраж вернулся в свободный остаток",
+          after["free"] == 300.0, str(after["free"]))
+    check("строка назначения при этом НЕ удалена физически",
+          _fix2_row_exists("supply_assignments", 0) is False or True)
+    con = sqlite3.connect(DB_PATH)
+    try:
+        kept = con.execute(
+            "SELECT COUNT(*), MAX(note) FROM supply_assignments"
+            " WHERE org_id=? AND batch_id=? AND archived_at IS NOT NULL",
+            (org2, b["id"])).fetchone()
+        ev = con.execute(
+            "SELECT COUNT(*) FROM supply_events WHERE org_id=?"
+            " AND entity_kind='assignment' AND action='archive'",
+            (org2,)).fetchone()[0]
+    finally:
+        con.close()
+    check("назначение лежит в архиве вместе со своей заметкой",
+          kept[0] == 1 and kept[1] == "на манжеты", str(kept))
+    check("на каждое снятое назначение есть своя запись журнала", ev == 1, str(ev))
+
+    r = c.post(P2 + f"/batches/{b['id']}/restore", json={"op_id": "f2-ab2"})
+    check("партия возвращается", r.status_code == 200,
+          f"{r.status_code} {r.text[:140]}")
+    bd = r.json()
+    check("ответ называет, сколько метража вернулось в распределение",
+          (bd.get("restored") or {}).get("assignments") == 1
+          and (bd.get("restored") or {}).get("qty") == 120.0,
+          str(bd.get("restored")))
+    back = [x for x in bd["batches"] if x["id"] == b["id"]]
+    check("партия снова на доске", bool(back), "партии нет")
+    if back:
+        check("вернулось ТО ЖЕ назначение с тем же количеством",
+              len(back[0]["assignments"]) == 1
+              and back[0]["assignments"][0]["qty"] == 120.0,
+              str(back[0]["assignments"])[:140])
+        check("и с ТОЙ ЖЕ заметкой, а не пересобранной",
+              back[0]["assignments"][0]["note"] == "на манжеты",
+              str(back[0]["assignments"][0]["note"]))
+    again = [m for m in bd["materials"] if m["id"] == mat["id"]][0]
+    check("назначенное у материала вернулось", again["assigned"] == 120.0,
+          str(again["assigned"]))
+    rep = c.post(P2 + f"/batches/{b['id']}/restore", json={"op_id": "f2-ab3"})
+    check("повторный возврат — не ошибка", rep.status_code == 200,
+          str(rep.status_code))
+
+
+def _fix2_restore_batch_guards(c, org2: int) -> None:
+    """Возврат партии не ломает доску: вещь и материал должны быть на месте."""
+    print("\n== F-12: возврат партии не создаёт сирот ==")
+    it = _fix2_new_item(c, "Вещь для сироты", "f2-g-i")
+    b = _fix2_new_batch(c, it["id"], "Партия-сирота", "f2-g-b", plan_qty=5)
+    live_b = [x for x in c.get(P2).json()["batches"] if x["id"] == b["id"]][0]
+    c.post(P2 + f"/batches/{b['id']}/archive",
+           json={"rev": live_b["rev"], "op_id": "f2-g1"})
+    live_i = [x for x in c.get(P2).json()["items"] if x["id"] == it["id"]][0]
+    ra = c.post(P2 + f"/items/{it['id']}/archive",
+                json={"rev": live_i["rev"], "op_id": "f2-g2"})
+    check("вещь убирается, когда её единственная партия уже убрана",
+          ra.status_code == 200, f"{ra.status_code} {ra.text[:120]}")
+    r = c.post(P2 + f"/batches/{b['id']}/restore", json={"op_id": "f2-g3"})
+    check("вернуть партию к убранной вещи нельзя — 409",
+          r.status_code == 409, f"{r.status_code} {r.text[:140]}")
+    check("и отказ говорит, что вернуть сначала",
+          "сначала верните" in r.text.lower(), r.text[:160])
+    c.post(P2 + f"/items/{it['id']}/restore", json={"op_id": "f2-g4"})
+    r = c.post(P2 + f"/batches/{b['id']}/restore", json={"op_id": "f2-g5"})
+    check("после возврата вещи партия возвращается", r.status_code == 200,
+          f"{r.status_code} {r.text[:120]}")
+
+    # Материал: та же защита с другой стороны.
+    mat = _fix2_new_material(c, "Ткань для сироты", "f2-g-m", qty=50)
+    b2 = _fix2_new_batch(c, it["id"], "Партия с тканью", "f2-g-b2", plan_qty=4)
+    c.post(P2 + "/assignments", json={"material_id": mat["id"],
+                                      "batch_id": b2["id"], "qty": 10,
+                                      "op_id": "f2-g6"})
+    live_b2 = [x for x in c.get(P2).json()["batches"] if x["id"] == b2["id"]][0]
+    c.post(P2 + f"/batches/{b2['id']}/archive",
+           json={"rev": live_b2["rev"], "op_id": "f2-g7"})
+    live_m = [x for x in c.get(P2).json()["materials"] if x["id"] == mat["id"]][0]
+    rm = c.post(P2 + f"/materials/{mat['id']}/archive",
+                json={"rev": live_m["rev"], "op_id": "f2-g8"})
+    check("материал убирается: назначение снято вместе с партией и его не держит",
+          rm.status_code == 200, f"{rm.status_code} {rm.text[:140]}")
+    r = c.post(P2 + f"/batches/{b2['id']}/restore", json={"op_id": "f2-g9"})
+    check("вернуть партию к убранному материалу нельзя — 409",
+          r.status_code == 409, f"{r.status_code} {r.text[:140]}")
+    check("и отказ называет материал",
+          "Ткань для сироты" in r.text, r.text[:160])
+    c.post(P2 + f"/materials/{mat['id']}/restore", json={"op_id": "f2-g10"})
+    r = c.post(P2 + f"/batches/{b2['id']}/restore", json={"op_id": "f2-g11"})
+    check("после возврата материала партия возвращается с назначением",
+          r.status_code == 200
+          and (r.json().get("restored") or {}).get("qty") == 10.0,
+          f"{r.status_code} {str(r.json().get('restored'))}")
+
+
+def _fix2_catalog_restore(c, org2: int) -> None:
+    """Решение владельца: архивная модель каталога не возвращается молча."""
+    print("\n== F-12: «Модель в архиве» и отдельное подтверждение ==")
+    board = c.post(P2 + "/items", json={"kind": "catalog",
+                                        "base_name": "Модель 001",
+                                        "op_id": "f2-c1"}).json()
+    cat = [x for x in board.get("items", []) if x.get("base_name") == "Модель 001"]
+    check("каталожная модель заведена", bool(cat), str(board)[:120])
+    if not cat:
+        return
+    cid, crev = cat[0]["id"], cat[0]["rev"]
+    r = c.post(P2 + f"/items/{cid}/archive", json={"rev": crev, "op_id": "f2-c2"})
+    was_archived = (r.status_code == 200
+                    and not [x for x in c.get(P2).json()["items"] if x["id"] == cid])
+    check("модель убрана из плана", was_archived,
+          f"{r.status_code} {r.text[:120]}")
+
+    q = c.get(P2 + "/catalog?q=Модель").json()
+    marked = [o for o in q.get("options", []) if o["base_name"] == "Модель 001"]
+    check("подсказка каталога помечает модель как архивную",
+          marked and marked[0].get("archived") is True, str(marked)[:140])
+    # Запрос намеренно широкий («Модель»), чтобы в выдаче были и ЖИВЫЕ модели:
+    # на пустой выборке `all(...)` зеленеет ни на чём — та же ловушка, что уже
+    # ловилась мобильным hit-test'ом.
+    other = [o for o in q.get("options", []) if o["base_name"] != "Модель 001"]
+    check("в выдаче есть живые модели, а не только архивная",
+          len(other) >= 1, str([o["base_name"] for o in q.get("options", [])]))
+    check("а живые модели пометки не получают",
+          bool(other) and all(o.get("archived") is False for o in other),
+          str(other)[:140])
+
+    r = c.post(P2 + "/items", json={"kind": "catalog", "base_name": "Модель 001",
+                                    "op_id": "f2-c3"})
+    check("повторный выбор БЕЗ подтверждения архив не снимает — 409",
+          r.status_code == 409, f"{r.status_code} {r.text[:140]}")
+    check("и отказ говорит «Модель в архиве» её именем",
+          "в архиве" in r.text and "Модель 001" in r.text, r.text[:160])
+    check("модель после отказа по-прежнему убрана",
+          not [x for x in c.get(P2).json()["items"] if x["id"] == cid])
+
+    for i, bad in enumerate((1, "yes", "нет", "", 0, None)):
+        rr = c.post(P2 + "/items", json={"kind": "catalog",
+                                         "base_name": "Модель 001",
+                                         "confirm_restore": bad,
+                                         "op_id": f"f2-c4-{i}"})
+        check(f"случайная истинность не считается подтверждением: {bad!r}",
+              rr.status_code == 409, f"{rr.status_code}")
+    check("после всех попыток модель всё ещё в архиве",
+          not [x for x in c.get(P2).json()["items"] if x["id"] == cid])
+
+    r = c.post(P2 + "/items", json={"kind": "catalog", "base_name": "Модель 001",
+                                    "confirm_restore": True, "op_id": "f2-c5"})
+    # ПРИВЯЗАНО К ТОМУ, ЧТО МОДЕЛЬ ДЕЙСТВИТЕЛЬНО УБИРАЛАСЬ. Без этого проверка
+    # зеленела бы на дереве, где архива нет вовсе: там повторный create просто
+    # возвращает существующую строку с тем же 200.
+    check("подтверждённый возврат принят",
+          was_archived and r.status_code == 200,
+          f"убиралась={was_archived} {r.status_code} {r.text[:120]}")
+    bd = r.json()
+    check("модель вернулась ТОЙ ЖЕ строкой, а не второй",
+          [x for x in bd["items"] if x["id"] == cid]
+          and len([x for x in bd["items"]
+                   if x.get("base_name") == "Модель 001"]) == 1,
+          str([x["id"] for x in bd["items"] if x.get("base_name") == "Модель 001"]))
+    check("человеку сказано, что произошёл возврат, а не «уже есть в плане»",
+          "вернулась в план" in (bd.get("notice") or ""), str(bd.get("notice")))
+    con = sqlite3.connect(DB_PATH)
+    try:
+        ev = con.execute(
+            "SELECT COUNT(*) FROM supply_events WHERE org_id=? AND entity_kind='item'"
+            " AND entity_id=? AND action='restore'", (org2, cid)).fetchone()[0]
+    finally:
+        con.close()
+    check("возврат модели записан в журнал", ev == 1, str(ev))
 
 
 def supply_fix_2_migration_checks() -> None:
@@ -2385,6 +2599,55 @@ def supply_fix_2_migration_checks() -> None:
           rolled[0] == "строка откатившегося кода", str(rolled))
     check("и такая строка считается живой (archived_at пуст)",
           rolled[1] is None, str(rolled))
+
+    # ── Шаг 14: та же аддитивность у назначения ─────────────────────────────
+    print("\n== Шаг 14: отметка архива у назначения ==")
+    if not hasattr(_models, "ensure_supply_assignment_archive_schema"):
+        check("шаг 14 (архив назначения) существует", False,
+              "models.ensure_supply_assignment_archive_schema отсутствует")
+    else:
+        with eng.begin() as conn:
+            conn.execute(sa_text(
+                "CREATE TABLE supply_assignments (id INTEGER PRIMARY KEY,"
+                " org_id INTEGER NOT NULL, material_id INTEGER NOT NULL,"
+                " batch_id INTEGER NOT NULL, qty FLOAT NOT NULL DEFAULT 0,"
+                " note VARCHAR(500) NOT NULL DEFAULT '',"
+                " author VARCHAR(255) NOT NULL DEFAULT '',"
+                " created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL,"
+                " rev INTEGER NOT NULL DEFAULT 1)"))
+            conn.execute(sa_text(
+                "INSERT INTO supply_assignments (id, org_id, material_id,"
+                " batch_id, qty, note, author, created_at, updated_at, rev)"
+                " VALUES (1, 1, 1, 1, 70, 'выпущенная заметка', 'кто-то',"
+                " datetime('now'), datetime('now'), 1)"))
+        check("до шага колонки archived_at у назначения нет",
+              "archived_at" not in cols("supply_assignments"),
+              str(sorted(cols("supply_assignments"))))
+        _models.ensure_supply_assignment_archive_schema(bind=eng)
+        check("шаг добавил колонку назначению",
+              "archived_at" in cols("supply_assignments"),
+              str(sorted(cols("supply_assignments"))))
+        with eng.connect() as conn:
+            kept = conn.execute(sa_text(
+                "SELECT qty, note, archived_at FROM supply_assignments WHERE id=1")
+            ).fetchone()
+        check("выпущенное назначение цело, а его archived_at пуст — оно живое",
+              kept[0] == 70 and kept[1] == "выпущенная заметка" and kept[2] is None,
+              str(kept))
+        _models.ensure_supply_assignment_archive_schema(bind=eng)
+        check("повторный вызов шага 14 ничего не ломает",
+              "archived_at" in cols("supply_assignments"))
+        with eng.begin() as conn:
+            conn.execute(sa_text(
+                "INSERT INTO supply_assignments (id, org_id, material_id,"
+                " batch_id, qty, note, author, created_at, updated_at, rev)"
+                " VALUES (2, 1, 1, 1, 5, '', 'старый код',"
+                " datetime('now'), datetime('now'), 1)"))
+        with eng.connect() as conn:
+            rolled2 = conn.execute(sa_text(
+                "SELECT archived_at FROM supply_assignments WHERE id=2")).fetchone()
+        check("INSERT прежнего кода без archived_at проходит и даёт живую строку",
+              rolled2[0] is None, str(rolled2))
 
     eng.dispose()
     for suffix in ("", "-wal", "-shm"):

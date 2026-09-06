@@ -3309,6 +3309,8 @@ def supply_fix_2_ui(pw, base, c) -> None:
         ("F-14", lambda: _fix2_f14(page, base, c)),
         ("F-15", lambda: _fix2_f15(page, base, c)),
         ("F-12", lambda: _fix2_f12(page, base, c, dialogs)),
+        ("F-12 партия", lambda: _fix2_batch_delete(page, base, c, dialogs)),
+        ("F-12 каталог", lambda: _fix2_catalog_confirm(page, base, c)),
     )
     for label, run_step in steps:
         try:
@@ -3710,6 +3712,203 @@ def _fix2_f12(page, base, c, dialogs) -> None:
     check("а системного confirm() по-прежнему не было", not dialogs, str(dialogs))
 
 
+def _fix2_batch_delete(page, base, c, dialogs) -> None:
+    """F-12 (решение владельца): партия удаляется с назначениями и возвращается."""
+    print("\n== F-12: удаление партии называет последствие и обратимо ==")
+    P = "/api/supply/planning"
+    mat = c.post(P + "/materials", json={"title": "Сукно под партию", "qty": "300",
+                                         "op_id": "ui-b-m"}).json()
+    mat_id = [m for m in mat["materials"]
+              if m["title"] == "Сукно под партию"][0]["id"]
+    it = c.post(P + "/items", json={"kind": "draft", "title": "Китель-новинка",
+                                    "op_id": "ui-b-i"}).json()
+    item_id = [i for i in it["items"] if i["title"] == "Китель-новинка"][0]["id"]
+    ba = c.post(P + "/batches", json={"item_id": item_id, "title": "Кители, партия",
+                                      "plan_qty": "20", "op_id": "ui-b-b"}).json()
+    batch_id = [b for b in ba["batches"]
+                if b["title"] == "Кители, партия"][0]["id"]
+    c.post(P + "/assignments", json={"material_id": mat_id, "batch_id": batch_id,
+                                     "qty": "120", "note": "на воротники",
+                                     "op_id": "ui-b-a"})
+    page.goto(f"{base}/supply")
+    page.wait_for_timeout(1100)
+    close_hint(page)
+
+    CARD = """
+      const cards = [...document.querySelectorAll('#pl-batches .pl-card')];
+      const card = cards.find(x => x.textContent.indexOf('Кители, партия') >= 0);
+    """
+    page.evaluate("""() => {
+      %s
+      if (!card) return;
+      const btn = [...card.querySelectorAll('.pl-actions button')]
+        .find(b => b.textContent === 'Удалить');
+      if (btn) btn.click();
+    }""" % CARD)
+    page.wait_for_timeout(400)
+    asked = page.evaluate("""() => {
+      %s
+      const box = card ? card.querySelector('.pl-confirm') : null;
+      return box ? box.textContent : null;
+    }""" % CARD)
+    check("вопрос перед удалением партии НАЗЫВАЕТ последствие, а не просто «Удалить?»",
+          asked is not None and "1 назначение" in asked and "снимется" in asked,
+          str(asked))
+    check("системного окна confirm() не было", not dialogs, str(dialogs))
+    check("до подтверждения партия на месте",
+          any(b["id"] == batch_id for b in c.get(P).json()["batches"]))
+
+    page.evaluate("""() => {
+      %s
+      if (!card) return;
+      const yes = [...card.querySelectorAll('.pl-confirm button')]
+        .find(b => b.textContent === 'Да');
+      if (yes) yes.click();
+    }""" % CARD)
+    page.wait_for_timeout(1300)
+    board = c.get(P).json()
+    gone = not any(b["id"] == batch_id for b in board["batches"])
+    check("после «Да» партии на сервере нет", gone)
+    freed = [m for m in board["materials"] if m["id"] == mat_id]
+    check("КП F-12: назначенное у материала уменьшилось на экранных данных",
+          gone and freed and freed[0]["assigned"] == 0.0,
+          str(freed[0]["assigned"]) if freed else "материала нет")
+    on_screen = page.evaluate("""() => {
+      const cards = [...document.querySelectorAll('#pl-batches .pl-card')];
+      return cards.some(x => x.textContent.indexOf('Кители, партия') >= 0);
+    }""")
+    check("и карточки партии на экране нет", on_screen is False, str(on_screen))
+    toast = page.evaluate("""() => {
+      const t = [...document.querySelectorAll('#toast-root .toast')]
+        .find(x => x.textContent.indexOf('Партия удалена') >= 0);
+      if (!t) return null;
+      const btn = t.querySelector('.pl-toast-act');
+      return {text: t.textContent, action: btn ? btn.textContent : null};
+    }""")
+    check("тост честно называет освободившийся метраж",
+          toast and "120" in toast.get("text", "")
+          and "свободный остаток" in toast.get("text", ""), str(toast))
+    check("и предлагает вернуть", toast and toast.get("action") == "Вернуть",
+          str(toast))
+
+    page.evaluate("""() => {
+      const t = [...document.querySelectorAll('#toast-root .toast')]
+        .find(x => x.textContent.indexOf('Партия удалена') >= 0);
+      const btn = t ? t.querySelector('.pl-toast-act') : null;
+      if (btn) btn.click();
+    }""")
+    page.wait_for_timeout(1400)
+    back = c.get(P).json()
+    row = [b for b in back["batches"] if b["id"] == batch_id]
+    check("«Вернуть» возвращает партию", gone and bool(row),
+          f"уходила={gone} вернулась={bool(row)}")
+    # ОБЕ ПРОВЕРКИ ПРИВЯЗАНЫ К `gone`. На дереве без этого пакета партия не
+    # удаляется вовсе, назначение с неё никуда не девается — и «вернулось то же
+    # самое» зеленело бы, не доказав ничего.
+    check("вместе с ТЕМ ЖЕ назначением и ТОЙ ЖЕ заметкой",
+          gone and row and len(row[0]["assignments"]) == 1
+          and row[0]["assignments"][0]["qty"] == 120.0
+          and row[0]["assignments"][0]["note"] == "на воротники",
+          f"уходила={gone} " + (str(row[0]["assignments"])[:130] if row else ""))
+    again = [m for m in back["materials"] if m["id"] == mat_id]
+    check("и метраж снова в распределении",
+          gone and again and again[0]["assigned"] == 120.0,
+          f"уходила={gone} " + (str(again[0]["assigned"]) if again else ""))
+    said = page.evaluate("""() => [...document.querySelectorAll('#toast-root .toast')]
+      .some(x => x.textContent.indexOf('снова в распределении') >= 0)""")
+    check("человеку сказано, что метраж вернулся в распределение",
+          said is True, str(said))
+
+
+def _fix2_catalog_confirm(page, base, c) -> None:
+    """Решение владельца: архивную модель каталога возвращает только подтверждение."""
+    print("\n== F-12: «Модель в архиве» и отдельное подтверждение в браузере ==")
+    P = "/api/supply/planning"
+    board = c.post(P + "/items", json={"kind": "catalog",
+                                       "base_name": "Тренч «Классика»",
+                                       "op_id": "ui-c-i"}).json()
+    cat = [i for i in board.get("items", [])
+           if i.get("base_name") == "Тренч «Классика»"]
+    check("каталожная модель для проверки заведена", bool(cat), str(board)[:120])
+    if not cat:
+        return
+    cid = cat[0]["id"]
+    r = c.post(P + f"/items/{cid}/archive",
+               json={"rev": cat[0]["rev"], "op_id": "ui-c-a"})
+    check("модель убрана из плана", r.status_code == 200, str(r.status_code))
+
+    page.goto(f"{base}/supply")
+    page.wait_for_timeout(1100)
+    close_hint(page)
+    page.click("#pl-add-item")
+    page.wait_for_timeout(400)
+    page.fill("#pl-item-base", "тренч")
+    page.wait_for_timeout(900)
+    marked = page.evaluate("""() => {
+      const opts = [...document.querySelectorAll('#pl-item-base-list .pl-combo-opt')];
+      const o = opts.find(x => x.textContent.indexOf('Тренч') >= 0);
+      if (!o) return null;
+      const tag = [...o.querySelectorAll('.pl-tag')]
+        .find(t => t.textContent.indexOf('в архиве') >= 0);
+      return {found: true, tagged: !!tag};
+    }""")
+    check("в подсказке каталога модель помечена «в архиве»",
+          marked and marked.get("tagged") is True, str(marked))
+
+    page.evaluate("""() => {
+      const opts = [...document.querySelectorAll('#pl-item-base-list .pl-combo-opt')];
+      const o = opts.find(x => x.textContent.indexOf('Тренч') >= 0);
+      if (o) o.dispatchEvent(new MouseEvent('mousedown', {bubbles: true}));
+    }""")
+    page.wait_for_timeout(400)
+    note = page.evaluate("""() => {
+      const n = document.getElementById('pl-item-base-note');
+      if (!n) return null;
+      const cb = document.getElementById('pl-item-restore');
+      const cs = getComputedStyle(n);
+      return {text: n.textContent, checkbox: !!cb, display: cs.display,
+              checked: cb ? cb.checked : null};
+    }""")
+    check("после выбора видно «Модель в архиве» и отдельное подтверждение",
+          note and "Модель в архиве" in note.get("text", "")
+          and note.get("checkbox") is True, str(note)[:180])
+    check("подтверждение по умолчанию НЕ проставлено",
+          note and note.get("checked") is False, str(note))
+    check("и сама подпись видима", note and note.get("display") != "none",
+          str(note))
+
+    page.evaluate("""() => {
+      const f = document.getElementById('pl-item-form');
+      if (f) f.querySelector('button[type=submit]').click();
+    }""")
+    page.wait_for_timeout(1300)
+    check("отправка БЕЗ подтверждения модель не вернула",
+          not [i for i in c.get(P).json()["items"] if i["id"] == cid])
+    err = page.evaluate("""() => {
+      const e = document.getElementById('pl-item-err');
+      return e ? e.textContent : null;
+    }""")
+    check("и человек видит причину у формы",
+          err and "в архиве" in err, str(err)[:160])
+
+    page.evaluate("""() => {
+      const cb = document.getElementById('pl-item-restore');
+      if (cb) { cb.checked = true; cb.dispatchEvent(new Event('change', {bubbles: true})); }
+    }""")
+    page.wait_for_timeout(200)
+    page.evaluate("""() => {
+      const f = document.getElementById('pl-item-form');
+      if (f) f.querySelector('button[type=submit]').click();
+    }""")
+    page.wait_for_timeout(1400)
+    restored = [i for i in c.get(P).json()["items"] if i["id"] == cid]
+    check("после подтверждения модель вернулась ТОЙ ЖЕ строкой",
+          bool(restored), "" if restored else "модель не вернулась")
+    check("и второй строки той же модели не появилось",
+          len([i for i in c.get(P).json()["items"]
+               if i.get("base_name") == "Тренч «Классика»"]) == 1)
+
+
 def _fix2_mobile(browser, base, c) -> None:
     """Новые кнопки на телефоне: их видно и по ним попадаешь."""
     print("\n== F-12/F-13 на телефоне 390x844: кнопки не перекрыты ==")
@@ -3726,7 +3925,8 @@ def _fix2_mobile(browser, base, c) -> None:
     covered = page.evaluate("""() => {
       const out = [];
       const wanted = ['Изменить', 'Удалить'];
-      const btns = [...document.querySelectorAll('#pl-materials .pl-actions button')]
+      const btns = [...document.querySelectorAll(
+        '#pl-materials .pl-actions button, #pl-batches .pl-actions button')]
         .filter(b => wanted.indexOf(b.textContent) >= 0);
       for (const b of btns) {
         const r = b.getBoundingClientRect();

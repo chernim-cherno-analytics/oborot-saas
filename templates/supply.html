@@ -237,6 +237,8 @@
                 text-align: left; text-decoration: underline;
                 text-underline-offset: 2px; }
   .pl-linkbtn:hover { text-decoration: none; }
+  .pl-confirm-restore { display: flex; align-items: center; gap: 4px;
+                        margin-top: 6px; font-size: 12.5px; cursor: pointer; }
   .pl-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
   .pl-empty { font-size: 13px; color: var(--ink-2); line-height: 1.5;
               padding: 14px 12px; border: 1px dashed var(--line);
@@ -1784,6 +1786,19 @@ document.addEventListener("DOMContentLoaded", function () {
     form.addEventListener("change", function () { resetToken(form); });
   }
 
+  // Склонение рядом с числом. Тот же смысл, что у `_ru_plural` на сервере:
+  // «1 назначение», «2 назначения», «5 назначений». Без него вопрос перед
+  // удалением читался бы машинным выводом ровно там, где человек принимает
+  // решение.
+  function plural(n, one, few, many) {
+    n = Math.abs(Number(n) || 0);
+    if (n % 100 >= 11 && n % 100 <= 14) return many;
+    var t = n % 10;
+    if (t === 1) return one;
+    if (t >= 2 && t <= 4) return few;
+    return many;
+  }
+
   function fmt(value) {
     if (value === null || value === undefined) return "неизвестно";
     var n = Number(value);
@@ -1853,12 +1868,16 @@ document.addEventListener("DOMContentLoaded", function () {
           plToast(data && data.notice ? data.notice : "Сохранено", {ms: 3000});
         }
         if (spot) flash(spot.kind, spot.id || onlyNew(spot.kind, before));
-        if (done) done(true);
+        // ОТВЕТ ОТДАЁТСЯ ВЫЗЫВАЮЩЕМУ ВТОРЫМ АРГУМЕНТОМ. Удаление партии
+        // возвращает в теле, сколько назначений снято и сколько метража ушло в
+        // свободный остаток; без доступа к этим числам тост сказал бы «Удалено»
+        // и умолчал о последствии, которое человек обязан увидеть.
+        if (done) done(true, data);
       })
       .catch(function (err) {
         var msg = (err && err.message) ? err.message : "Попробуйте ещё раз.";
         setError(formErrId || "pl-error", msg);
-        if (done) done(false);
+        if (done) done(false, null);
       })
       .then(function () { PL.saving = false; paintSaving(false); });
     return true;
@@ -2145,13 +2164,43 @@ document.addEventListener("DOMContentLoaded", function () {
       }
     }
 
+    //: Какая модель выбрана и убрана ли она. Подтверждение возврата
+    //: сбрасывается при каждом новом выборе: оно относится к КОНКРЕТНОЙ модели,
+    //: и переносить его на следующую значило бы вернуть из архива не ту.
+    var pickedArchived = false, confirmedRestore = false;
+
     function comboChoose(i) {
       var row = comboRows[i];
       if (!row) return;
       pick.value = row.base_name;
+      pickedArchived = !!row.archived;
+      confirmedRestore = false;
       comboClose();
       comboNoteBase();
+      paintArchivedNote();
       pick.focus();
+    }
+
+    // «Модель в архиве» и ОТДЕЛЬНОЕ подтверждение — не тост и не текст ошибки, а
+    // видимый выбор рядом с полем. Пока галочка не поставлена, форма уходит без
+    // подтверждения и сервер отвечает отказом: молчаливого снятия архива нет ни
+    // на клиенте, ни на сервере.
+    function paintArchivedNote() {
+      if (!pickedArchived) { clear(comboNote); comboNoteBase(); return; }
+      clear(comboNote);
+      comboNote.appendChild(el("b", null, "Модель в архиве. "));
+      comboNote.appendChild(el("span", null,
+        "Она была убрана из плана. Вернуть её вместе с прежними данными?"));
+      var wrap = el("label", "pl-confirm-restore");
+      var box = el("input");
+      box.type = "checkbox";
+      box.id = "pl-item-restore";
+      box.addEventListener("change", function () {
+        confirmedRestore = !!box.checked;
+      });
+      wrap.appendChild(box);
+      wrap.appendChild(el("span", null, " да, вернуть модель из архива"));
+      comboNote.appendChild(wrap);
     }
 
     function comboShow(rows, meta, q) {
@@ -2163,6 +2212,12 @@ document.addEventListener("DOMContentLoaded", function () {
                      row.base_name + " · размеров: " + row.sizes);
         opt.setAttribute("role", "option");
         opt.setAttribute("aria-selected", "false");
+        // МОДЕЛЬ, УБРАННАЯ ИЗ ПЛАНА, ВИДНА УЖЕ В ПОДСКАЗКЕ (решение владельца
+        // 5562704475, п. 2). Сказать об этом отказом ПОСЛЕ отправки формы было
+        // бы поздно: человек уже решил, что заводит её заново.
+        if (row.archived) {
+          opt.appendChild(el("span", "pl-tag", "в архиве"));
+        }
         // mousedown, а не click: click приходит ПОСЛЕ blur поля, и список к
         // этому моменту уже закрыт — выбор мышью не срабатывал бы вовсе.
         opt.addEventListener("mousedown", function (ev) {
@@ -2205,6 +2260,10 @@ document.addEventListener("DOMContentLoaded", function () {
     pick.addEventListener("input", function () {
       if (comboTimer) clearTimeout(comboTimer);
       var q = pick.value.trim();
+      // Правка поля руками отменяет и пометку, и подтверждение: человек
+      // набирает уже другое имя, а согласие относилось к прежнему.
+      pickedArchived = false;
+      confirmedRestore = false;
       if (q.length < 2) {
         comboSeq++;                       // ответ на прежний ввод уже не нужен
         comboClose();
@@ -2244,6 +2303,10 @@ document.addEventListener("DOMContentLoaded", function () {
       var body = {kind: kind.value, note: note.value, op_id: actionToken(form)};
       if (kind.value === "catalog") {
         body.base_name = pick.value.trim();
+        // Подтверждение уходит ТОЛЬКО когда человек его дал. Слать его всегда
+        // означало бы возвращать модель из архива молча — ровно то, что
+        // решение владельца запрещает.
+        if (confirmedRestore) body.confirm_restore = true;
         send("/api/supply/planning/items", body, "pl-item-err", function (ok) {
           if (ok) { resetToken(form); form.hidden = true; clear(form);
                     byId("pl-add-item").setAttribute("aria-expanded", "false"); }
@@ -2759,6 +2822,55 @@ document.addEventListener("DOMContentLoaded", function () {
         toggleInline(card, edit, function (box) { buildBatchEditForm(box, b); });
       });
       actions.appendChild(edit);
+
+      // F-12, решение владельца 5562704475. ПОСЛЕДСТВИЕ НАЗЫВАЕТСЯ ДО НАЖАТИЯ,
+      // а не после: удаление партии снимает её назначения, и метраж возвращается
+      // в свободный остаток. Человек, у которого на партии расписано сто
+      // двадцать метров, обязан прочитать это в самом вопросе, иначе «Удалить?»
+      // умалчивает главное.
+      var live = (b.assignments || []).length;
+      var ask = live
+        ? ("Удалить? " + live + " " + plural(live, "назначение", "назначения",
+                                             "назначений") + " снимется")
+        : "Удалить?";
+      var drop = el("button", "btn sm", "Удалить");
+      drop.type = "button";
+      drop.addEventListener("click", function () {
+        askConfirm(drop, ask, function () {
+          send("/api/supply/planning/batches/" + b.id + "/archive",
+               {rev: b.rev, op_id: actionToken(drop)}, null,
+               function (ok, data) {
+                 if (!ok) return;
+                 resetToken(drop);
+                 var off = (data && data.archived) || {};
+                 var said = off.assignments
+                   ? ("Партия удалена · " + fmt(off.qty) + " вернулось в свободный остаток")
+                   : "Партия удалена";
+                 plToast(said, {ms: 6000, action: {
+                   label: "Вернуть",
+                   // ВОЗВРАТ ПОЛНЫЙ: партия приходит вместе со своими прежними
+                   // назначениями и заметками (решение владельца), и метраж
+                   // снова уходит в распределение. Тост после возврата говорит
+                   // об этом числом — молча вернуть «назначено» нельзя.
+                   run: function () {
+                     return send(
+                       "/api/supply/planning/batches/" + b.id + "/restore",
+                       {op_id: opId()}, null,
+                       function (ok2, data2) {
+                         if (!ok2) return;
+                         var on = (data2 && data2.restored) || {};
+                         if (on.assignments) {
+                           plToast("Партия вернулась · " + fmt(on.qty)
+                                   + " снова в распределении", {ms: 4000});
+                         }
+                       },
+                       {kind: "batch", id: b.id, quiet: true});
+                   },
+                 }});
+               }, {kind: "batch", quiet: true});
+        });
+      });
+      actions.appendChild(drop);
       card.appendChild(actions);
     }
     return card;

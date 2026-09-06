@@ -2465,8 +2465,8 @@ def structural_checks(owner) -> None:
     # растёт. Замок стоит на неизменности выпущенного, а не на длине списка.
     print("\n== Схема не тронута: те же десять выпущенных шагов старта ==")
     from app import main as _main
-    check("шагов тринадцать: десять выпущенных плюс три дописанных сверху",
-          len(_main.STARTUP_SCHEMA_STEPS) == 13,
+    check("шагов четырнадцать: десять выпущенных плюс четыре дописанных сверху",
+          len(_main.STARTUP_SCHEMA_STEPS) == 14,
           str(len(_main.STARTUP_SCHEMA_STEPS)))
     check("и первые десять — ровно прежние пары (id, позиция)",
           list(_main.STARTUP_SCHEMA_STEPS)[:10] == [

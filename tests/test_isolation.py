@@ -628,6 +628,10 @@ def run_all() -> None:
          {"item_id": item_b}, {"op_id": "iso-x8"}),
         ("/api/supply/planning/items/{item_id}/restore", "POST",
          {"item_id": item_b}, {"op_id": "iso-x9"}),
+        ("/api/supply/planning/batches/{batch_id}/archive", "POST",
+         {"batch_id": batch_b}, {"op_id": "iso-x10"}),
+        ("/api/supply/planning/batches/{batch_id}/restore", "POST",
+         {"batch_id": batch_b}, {"op_id": "iso-x11"}),
     ]
     answers = {}
     for route, method, params, body in cases:

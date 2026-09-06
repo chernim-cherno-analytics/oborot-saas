@@ -247,6 +247,12 @@ STARTUP_SCHEMA_STEPS: tuple[tuple[str, int], ...] = (
     # прежний код по этим колонкам не фильтрует (разбор — в докстринге
     # самой функции).
     ("models.ensure_supply_archive_schema", 13),
+    # SUPPLY-FIX-2, решение владельца 5562704475: отметка архива у
+    # назначения. Пятый append-only шаг. Позиция 14 новая, тринадцать
+    # прежних пар не тронуты. Дописать колонку в шаг 13 было нельзя: на
+    # базе, где 13-й уже отработал, журнал считает его выполненным по id,
+    # и новая таблица не получила бы колонку вовсе.
+    ("models.ensure_supply_assignment_archive_schema", 14),
 )
 _STARTUP_STEP_ORDER = dict(STARTUP_SCHEMA_STEPS)
 
@@ -445,6 +451,11 @@ def _startup() -> None:
     # делает ни одного ALTER.
     _startup_step("models.ensure_supply_archive_schema",
                   _models.ensure_supply_archive_schema)
+    # SUPPLY-FIX-2: одна нуллируемая колонка у назначения. Как и шаг 13,
+    # ничего не читает и не переписывает; на базе, где колонка уже есть,
+    # не делает ни одного ALTER.
+    _startup_step("models.ensure_supply_assignment_archive_schema",
+                  _models.ensure_supply_assignment_archive_schema)
     # Замок на пропуск: все объявленные шаги выполнены, и ровно они.
     _finish_startup_steps()
     global _STARTUP_DONE

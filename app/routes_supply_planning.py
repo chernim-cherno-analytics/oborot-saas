@@ -106,6 +106,11 @@ def _fail(exc: Exception) -> HTTPException:
         return HTTPException(status_code=404, detail=str(exc))
     if isinstance(exc, sp.StaleWrite):
         return HTTPException(status_code=409, detail=str(exc))
+    if isinstance(exc, sp.ArchivedCatalogItem):
+        # 409, а не 400: ввод человека верен, модель существует — она убрана.
+        # Отдельный от `InUse` тип, потому что это вопрос, а не тупик: ответ на
+        # него — подтверждение `confirm_restore`, и текст его прямо предлагает.
+        return HTTPException(status_code=409, detail=str(exc))
     if isinstance(exc, sp.InUse):
         # 409, а не 400: ввод человека верен, отказ вызван состоянием соседних
         # строк. Текст приходит из слоя уже с числом и с тем, что надо сделать.
@@ -327,11 +332,17 @@ def api_planning_item_create(
             return sp.board(db, ctx.org.id, ctx.role)
         item = sp.create_item(db, ctx.org.id, payload, _author(ctx))
         reused = bool(getattr(item, "reused", False))
+        restored = bool(getattr(item, "restored", False))
+        title = item.title
     except (sp.PlanningError, IntegrityError) as exc:
         db.rollback()
         raise _fail(exc) from None
     board = _commit(db, ctx.org.id, ctx.role)
-    if reused:
+    if restored:
+        # Возврат из архива и «эта модель уже есть» — разные события, и один
+        # текст на оба сказал бы человеку неправду о том, что он сделал.
+        board["notice"] = f"Модель «{title}» вернулась в план."
+    elif reused:
         board["notice"] = "Эта модель уже есть в плане."
     return board
 
@@ -372,6 +383,61 @@ def api_planning_batch_update(
         db.rollback()
         raise _fail(exc) from None
     return _commit(db, ctx.org.id, ctx.role)
+
+
+@router.post("/batches/{batch_id}/archive")
+def api_planning_batch_archive(
+    batch_id: int,
+    payload: dict = Body(default={}),
+    ctx: AuthContext = Depends(require_owner_api),
+    db: Session = Depends(get_db),
+):
+    """Убрать партию вместе с её назначениями (F-12, решение владельца).
+
+    В ответ кладётся, СКОЛЬКО назначений снято и сколько метража вернулось в
+    свободный остаток: без этих чисел интерфейс не может сказать человеку
+    правду о том, что сейчас произошло, — а «Удалено» без последствий было бы
+    половиной правды.
+    """
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Ожидался объект JSON.")
+    try:
+        if sp.check_op(db, ctx.org.id, sp.parse_op_id(payload)):
+            return sp.board(db, ctx.org.id, ctx.role)
+        done = sp.archive_batch(db, ctx.org.id, batch_id, payload, _author(ctx))
+    except (sp.PlanningError, IntegrityError) as exc:
+        db.rollback()
+        raise _fail(exc) from None
+    board = _commit(db, ctx.org.id, ctx.role)
+    board["archived"] = done
+    return board
+
+
+@router.post("/batches/{batch_id}/restore")
+def api_planning_batch_restore(
+    batch_id: int,
+    payload: dict = Body(default={}),
+    ctx: AuthContext = Depends(require_owner_api),
+    db: Session = Depends(get_db),
+):
+    """Вернуть партию ВМЕСТЕ с прежними назначениями и заметками.
+
+    Число возвращённого метража уходит наружу по той же причине, что и при
+    архивации: метраж возвращается В РАСПРЕДЕЛЕНИЕ, у материала снова растёт
+    «назначено», и человек обязан увидеть это числом, а не обнаружить потом.
+    """
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Ожидался объект JSON.")
+    try:
+        if sp.check_op(db, ctx.org.id, sp.parse_op_id(payload)):
+            return sp.board(db, ctx.org.id, ctx.role)
+        done = sp.restore_batch(db, ctx.org.id, batch_id, payload, _author(ctx))
+    except (sp.PlanningError, IntegrityError) as exc:
+        db.rollback()
+        raise _fail(exc) from None
+    board = _commit(db, ctx.org.id, ctx.role)
+    board["restored"] = done
+    return board
 
 
 @router.post("/assignments")

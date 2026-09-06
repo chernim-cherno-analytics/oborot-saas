@@ -109,6 +109,30 @@ class DuplicateOp(PlanningError):
     """Тот же поступок уже записан — повторный POST не применяется дважды."""
 
 
+class ArchivedCatalogItem(PlanningError):
+    """Эта модель каталога в плане есть, но убрана — 409 до подтверждения.
+
+    Отдельный тип, а не общий `InUse`, потому что это не тупик, а ВОПРОС:
+    состояние поправимо одним подтверждённым действием человека, и интерфейсу
+    надо отличать «нельзя» от «можно, но подтвердите». Текст называет модель по
+    имени: человек ищет её в каталоге и должен узнать в отказе ровно то, что
+    набрал.
+    """
+
+
+def _wants_restore(payload: dict) -> bool:
+    """Явное подтверждение возврата модели из архива.
+
+    Строго `is True` и строка `"true"` — и ничего больше. Ни `1`, ни непустая
+    строка, ни `"нет"` подтверждением не считаются: подтверждение, которое можно
+    выдать случайной истинностью значения, — это не подтверждение.
+    """
+    raw = payload.get("confirm_restore")
+    if raw is True:
+        return True
+    return isinstance(raw, str) and raw.strip().casefold() == "true"
+
+
 class InUse(PlanningError):
     """Строку нельзя убрать, пока на неё опирается другая — 409 с числом.
 
@@ -497,10 +521,14 @@ def archive_material(db: Session, org_id: int, material_id: int, payload: dict,
     """
     row = get_material(db, org_id, material_id)
     _rev_guard(row, payload, "Материал")
+    # СЧИТАЮТСЯ ТОЛЬКО ЖИВЫЕ. Назначение, снятое вместе со своей убранной
+    # партией, материал не держит: иначе материал, однажды отданный партии,
+    # которую потом убрали, нельзя было бы убрать никогда — тупик вместо правила.
     used = int(db.execute(
         select(func.count(SupplyAssignment.id)).where(
             SupplyAssignment.org_id == org_id,
-            SupplyAssignment.material_id == row.id)
+            SupplyAssignment.material_id == row.id,
+            SupplyAssignment.archived_at.is_(None))
     ).scalar_one() or 0)
     if used:
         word = _ru_plural(used, "назначение", "назначения", "назначений")
@@ -599,6 +627,30 @@ def create_item(db: Session, org_id: int, payload: dict, author: str) -> SupplyI
                                      SupplyItem.kind == "catalog",
                                      SupplyItem.base_name == base_name).limit(1)
         ).scalars().first()
+        if existing is not None and existing.archived_at is not None:
+            # МОЛЧАЛИВОГО СНЯТИЯ АРХИВА НЕТ НИ В ОДНОЙ ВЕТКЕ — решение владельца
+            # (`5562704475`, п. 2). Человек убрал эту модель осознанно, и
+            # вернуть её обратно «заодно», потому что он начал набирать имя, —
+            # значит отменить его решение без спроса.
+            #
+            # Вставить вторую строку тоже нельзя: выпущенный замок
+            # `ux_supply_items_catalog` этого не даст, и без явной ветки здесь
+            # человек получил бы 409 про «действие уже выполнено» — отказ,
+            # который ничего не объясняет.
+            #
+            # Поэтому: отказ, называющий состояние, и ОТДЕЛЬНОЕ подтверждение.
+            # Подтверждение приходит тем же полем в теле, а не молчаливым
+            # повтором: повтор без него отвечает так же, сколько бы раз ни
+            # пришёл.
+            if not _wants_restore(payload):
+                raise ArchivedCatalogItem(
+                    f"Модель «{base_name}» в архиве. Вернуть её в план?")
+            was = existing.archived_at.isoformat()
+            existing.archived_at = None
+            existing.restored = True
+            _touch(existing)
+            _journal(db, org_id, "item", existing.id, "restore", field="archived",
+                     old=was, new="", author=author, op_id=parse_op_id(payload))
         if existing is not None:
             # ВВЕДЁННАЯ ЗАМЕТКА НЕ ПРОПАДАЕТ МОЛЧА. Прежняя редакция возвращала
             # найденную строку и на этом заканчивала: человек писал заметку,
@@ -745,15 +797,16 @@ def update_item(db: Session, org_id: int, item_id: int, payload: dict,
 
 def archive_item(db: Session, org_id: int, item_id: int, payload: dict,
                  author: str) -> SupplyItem:
-    """Убрать вещь с доски. В этом пакете — только новинку.
+    """Убрать вещь с доски — и новинку, и вещь каталога.
 
-    ПОЧЕМУ КАТАЛОЖНАЯ ВЕЩЬ СЮДА НЕ ПОПАДАЕТ, И ЭТО НЕ ЗАБЫВЧИВОСТЬ. У неё стоит
+    КАТАЛОЖНАЯ ВЕЩЬ УБИРАЕТСЯ ТОЖЕ, и это решение владельца (`5562704475`, п. 2),
+    а не техническое послабление. Раньше она была удержана: у неё стоит
     выпущенный замок `UNIQUE(org_id, base_name) WHERE kind='catalog'`
-    (SUPPLY-FIX-1, шаг 12). Если такую вещь убрать, следующий выбор ТОЙ ЖЕ модели
-    упрётся в замок, и что тогда делать — снять архив молча, отказать с названной
-    причиной или что-то третье — замок не диктует. Это продуктовый выбор, он
-    удержан до решения владельца (`TECH_DEBT.md`, `SUPPLY-FIX-2-REG`), и пока он
-    не сделан, состояние, в котором вопрос возникает, просто не создаётся.
+    (SUPPLY-FIX-1, шаг 12), и повторный выбор убранной модели в него упирается —
+    а что делать дальше, замок не диктует. Владелец ответил: НЕ снимать архив
+    молча, показать «Модель в архиве» и потребовать отдельного подтверждения.
+    Ответ живёт в `create_item`, здесь же снят сам запрет.
+
     Новинки под этот замок не попадают вовсе: у них `base_name` пуст, и две
     новинки с одним именем — по-прежнему две разные вещи (D-55).
 
@@ -762,9 +815,6 @@ def archive_item(db: Session, org_id: int, item_id: int, payload: dict,
     """
     row = get_item(db, org_id, item_id)
     _rev_guard(row, payload, "Вещь")
-    if row.kind == "catalog":
-        raise InUse("Вещь из каталога пока убрать нельзя — сейчас убираются "
-                    "только новинки.")
     live = int(db.execute(
         select(func.count(SupplyBatch.id)).where(
             SupplyBatch.org_id == org_id,
@@ -821,6 +871,17 @@ def catalog_options(db: Session, org_id: int, query: str = "",
             .group_by(Product.base_name))
     needle = (query or "").strip().casefold()
     rows = db.execute(stmt).all()
+    # Какие модели уже убраны из плана. Отдаётся ВМЕСТЕ с подсказкой, чтобы
+    # человек увидел «в архиве» в момент выбора, а не отказом после отправки
+    # формы (решение владельца 5562704475, п. 2). Одним запросом на весь список:
+    # архивных мало, но запрос на строку — привычка, которая ломается на сотнях.
+    archived = {
+        name for (name,) in db.execute(
+            select(SupplyItem.base_name).where(
+                SupplyItem.org_id == org_id,
+                SupplyItem.kind == "catalog",
+                SupplyItem.archived_at.is_not(None))).all()
+        if name}
     out = []
     catalog_size = 0
     for base_name, sizes in rows:
@@ -829,7 +890,8 @@ def catalog_options(db: Session, org_id: int, query: str = "",
         catalog_size += 1
         if needle and needle not in base_name.casefold():
             continue
-        out.append({"base_name": base_name, "sizes": int(sizes)})
+        out.append({"base_name": base_name, "sizes": int(sizes),
+                    "archived": base_name in archived})
     out.sort(key=lambda r: r["base_name"].casefold())
     return {"options": out[:limit], "total": len(out), "catalog_size": catalog_size}
 
@@ -874,6 +936,125 @@ def get_batch(db: Session, org_id: int, batch_id: int, *,
         raise NotFound("Плановая партия не найдена.")
     return row
 
+
+def archive_batch(db: Session, org_id: int, batch_id: int, payload: dict,
+                  author: str) -> dict:
+    """Убрать партию с доски вместе с её назначениями. Ничего не стирая.
+
+    РЕШЕНИЕ ВЛАДЕЛЬЦА (`5562704475`, п. 1) и то, как оно здесь исполнено. ТЗ
+    предлагало снимать назначения ФИЗИЧЕСКИ, оставляя след в журнале, и прямо
+    разрешало иную реализацию при том же КП. Иная здесь обязательна по существу:
+    владелец потребовал, чтобы восстановление вернуло партию ВМЕСТЕ с прежними
+    назначениями и заметками. Собрать заметку обратно из `supply_events` нельзя
+    честно — поле журнала ограничено 500 символами, а склейка заметок может быть
+    длиннее; значит, «вернуть ту же заметку» достижимо только одним способом —
+    не терять её. Поэтому назначения помечаются, а не удаляются.
+
+    ЧТО ВИДИТ ЧЕЛОВЕК. Партия уходит с доски, а назначенный на неё метраж
+    перестаёт считаться назначенным: `assigned` у материала уменьшается, и
+    свободный остаток растёт ровно на снятое. Это и есть КП F-12, и он выполнен
+    не на словах: архивные назначения не считаются нигде (`assigned_total`,
+    `board`, `material_links`).
+
+    ЖУРНАЛ ПИШЕТСЯ ПО КАЖДОМУ СНЯТОМУ НАЗНАЧЕНИЮ ОТДЕЛЬНО, а не одной строкой на
+    партию: через полгода вопрос будет «куда делись сто двадцать метров этой
+    ткани», и ответ на него обязан существовать по самому назначению.
+
+    Возвращает словарь с числом снятых назначений — интерфейсу он нужен, чтобы
+    сказать человеку правду ДО подтверждения, а не после.
+    """
+    row = get_batch(db, org_id, batch_id)
+    _rev_guard(row, payload, "Плановая партия")
+    op_id = parse_op_id(payload)
+    live = db.execute(
+        select(SupplyAssignment).where(SupplyAssignment.org_id == org_id,
+                                       SupplyAssignment.batch_id == row.id,
+                                       SupplyAssignment.archived_at.is_(None))
+        .order_by(SupplyAssignment.id.asc())
+    ).scalars().all()
+    stamp = datetime.utcnow()
+    for a in live:
+        a.archived_at = stamp
+        _touch(a)
+        _journal(db, org_id, "assignment", a.id, "archive", field="archived",
+                 old=a.qty, new="снято вместе с партией", author=author,
+                 op_id=op_id)
+        op_id = ""          # один поступок — одна запись с этим op_id
+    row.archived_at = stamp
+    _touch(row)
+    _journal(db, org_id, "batch", row.id, "archive", field="archived",
+             old="", new=stamp.isoformat(), author=author, op_id=op_id)
+    return {"batch_id": row.id, "assignments": len(live),
+            "qty": round(sum(float(a.qty) for a in live), 3)}
+
+
+def restore_batch(db: Session, org_id: int, batch_id: int, payload: dict,
+                  author: str) -> dict:
+    """Вернуть партию ВМЕСТЕ с её прежними назначениями и заметками.
+
+    РЕШЕНИЕ ВЛАДЕЛЬЦА (`5562704475`, п. 1) буквально: возвращается не «пустая
+    партия», а то же состояние — те же строки назначений, те же количества, те
+    же заметки. Пересборки нет нигде: строки всё это время лежали на месте с
+    отметкой, поэтому «то же самое» здесь — факт, а не старание.
+
+    ЦЕНА, КОТОРУЮ ЧЕЛОВЕК ОБЯЗАН УВИДЕТЬ ДО НАЖАТИЯ: метраж возвращается В
+    РАСПРЕДЕЛЕНИЕ. У материала снова вырастает `assigned` и уменьшается
+    свободный остаток — и если за это время метраж успели отдать другой партии,
+    суммарно назначенного станет больше, чем было. Слой этого не запрещает
+    (план — не расход, правило 2 шапки модуля), но и не умалчивает: число
+    возвращённого отдаётся наружу, и интерфейс говорит о нём словами.
+
+    ДВА ОТКАЗА, КОТОРЫЕ ЗДЕСЬ ЕСТЬ, И ОБА ПРО ЦЕЛОСТНОСТЬ ДОСКИ. Вернуть партию
+    к архивной вещи нельзя — на доске появилась бы партия вещи, которой на доске
+    нет. Вернуть назначение на архивный материал нельзя по той же причине.
+    Оба случая называют, что сделать раньше, а не просто запрещают.
+    """
+    row = get_batch(db, org_id, batch_id, include_archived=True)
+    _rev_guard(row, payload, "Плановая партия")
+    if row.archived_at is None:
+        # Уже на доске. Повтор — не ошибка: две вкладки не должны наказываться.
+        return {"batch_id": row.id, "assignments": 0, "qty": 0.0}
+
+    item = db.get(SupplyItem, row.item_id)
+    if item is None or item.org_id != org_id:
+        raise NotFound("Плановая партия не найдена.")
+    if item.archived_at is not None:
+        raise InUse(f"Вещь «{item.title}» убрана — сначала верните её, "
+                    "иначе партия окажется на доске без своей вещи.")
+
+    archived = db.execute(
+        select(SupplyAssignment).where(SupplyAssignment.org_id == org_id,
+                                       SupplyAssignment.batch_id == row.id,
+                                       SupplyAssignment.archived_at.is_not(None))
+        .order_by(SupplyAssignment.id.asc())
+    ).scalars().all()
+    blocked = []
+    for a in archived:
+        mat = db.get(SupplyMaterial, a.material_id)
+        if mat is not None and mat.org_id == org_id and mat.archived_at is not None:
+            blocked.append(mat.title)
+    if blocked:
+        word = _ru_plural(len(blocked), "материал", "материала", "материалов")
+        raise InUse(f"Сначала верните {len(blocked)} {word} "
+                    f"({', '.join(blocked[:3])}): без них назначения этой партии "
+                    "вернуть некуда.")
+
+    op_id = parse_op_id(payload)
+    returned = 0.0
+    for a in archived:
+        a.archived_at = None
+        _touch(a)
+        _journal(db, org_id, "assignment", a.id, "restore", field="archived",
+                 old="снято вместе с партией", new=a.qty, author=author,
+                 op_id=op_id)
+        op_id = ""
+        returned = round(returned + float(a.qty), 3)
+    was = row.archived_at.isoformat()
+    row.archived_at = None
+    _touch(row)
+    _journal(db, org_id, "batch", row.id, "restore", field="archived",
+             old=was, new="", author=author, op_id=op_id)
+    return {"batch_id": row.id, "assignments": len(archived), "qty": returned}
 
 def update_batch(db: Session, org_id: int, batch_id: int, payload: dict,
                  author: str) -> SupplyBatch:
@@ -935,7 +1116,11 @@ def assigned_total(db: Session, org_id: int, material_id: int) -> float:
     total = db.execute(
         select(func.coalesce(func.sum(SupplyAssignment.qty), 0.0))
         .where(SupplyAssignment.org_id == org_id,
-               SupplyAssignment.material_id == material_id)
+               SupplyAssignment.material_id == material_id,
+               # Снятое вместе с партией не считается назначенным — иначе
+               # «убрали партию» не уменьшало бы `assigned`, и КП F-12 был бы
+               # выполнен только на словах.
+               SupplyAssignment.archived_at.is_(None))
     ).scalar_one()
     return round(float(total or 0.0), 3)
 
@@ -1034,9 +1219,12 @@ def _merge_notes(old: str, new: str) -> tuple[str, bool]:
     return joined[:MAX_NOTE_CHARS], True
 
 
-def get_assignment(db: Session, org_id: int, assignment_id: int) -> SupplyAssignment:
+def get_assignment(db: Session, org_id: int, assignment_id: int, *,
+                   include_archived: bool = False) -> SupplyAssignment:
     row = db.get(SupplyAssignment, assignment_id)
     if row is None or row.org_id != org_id:
+        raise NotFound("Назначение не найдено.")
+    if row.archived_at is not None and not include_archived:
         raise NotFound("Назначение не найдено.")
     return row
 
@@ -1165,7 +1353,8 @@ def material_links(db: Session, org_id: int, material_id: int) -> list[dict]:
         .join(SupplyBatch, SupplyBatch.id == SupplyAssignment.batch_id)
         .join(SupplyItem, SupplyItem.id == SupplyBatch.item_id)
         .where(SupplyAssignment.org_id == org_id,
-               SupplyAssignment.material_id == material_id)
+               SupplyAssignment.material_id == material_id,
+               SupplyAssignment.archived_at.is_(None))
         .order_by(SupplyAssignment.id.asc())
     ).all()
     return [{"batch_id": bid, "batch_title": (btitle or ititle),
@@ -1243,7 +1432,8 @@ def board(db: Session, org_id: int, role: str) -> dict:
         .order_by(SupplyBatch.id.desc())
     ).scalars().all()
     assignments = db.execute(
-        select(SupplyAssignment).where(SupplyAssignment.org_id == org_id)
+        select(SupplyAssignment).where(SupplyAssignment.org_id == org_id,
+                                       SupplyAssignment.archived_at.is_(None))
         .order_by(SupplyAssignment.id.asc())
     ).scalars().all()
 

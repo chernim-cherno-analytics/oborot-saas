@@ -394,6 +394,10 @@ def main() -> int:
                 "/api/supply/planning/items/999999/archive", json={}),
             "план: вернуть вещь": c.post(
                 "/api/supply/planning/items/999999/restore", json={}),
+            "план: убрать партию": c.post(
+                "/api/supply/planning/batches/999999/archive", json={}),
+            "план: вернуть партию": c.post(
+                "/api/supply/planning/batches/999999/restore", json={}),
         }
         for label, resp in blocked.items():
             check(f"readonly закрывает: {label}", resp.status_code == 402,
