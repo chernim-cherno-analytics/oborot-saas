@@ -2714,6 +2714,9 @@ def api_order_plan_save(
         ),
         result_json=json.dumps(
             {"items": plan["items"], "totals": plan["totals"],
+             # Сохраняем итоговый запрет после ручных правок вместе с решением:
+             # сохранение для истории само по себе не разрешает создать заказ.
+             "stop": plan["stop"], "can_create": plan["can_create"],
              "spent": plan["spent"], "lost": plan.get("lost"),
              "manual_edit": bool(plan.get("manual_edit")),
              # Позиции, которые человек обнулил вручную, вместе с тем, что
@@ -3037,6 +3040,18 @@ def api_order_plan_apply(
         result = json.loads(row.result_json or "{}")
     except ValueError:
         result = {}
+    # Старый план не содержит итога проверки: не восстанавливаем его по
+    # сегодняшним данным и не меняем сохранённое решение человека.
+    if (not isinstance(result, dict)
+            or not isinstance(result.get("can_create"), bool)
+            or not isinstance(result.get("stop"), list)):
+        raise HTTPException(422, "Пересчитайте план в мастере заказа: "
+                            "в сохранённом плане нет результата проверки создания заказа")
+    if not result["can_create"] or result["stop"]:
+        reasons = [str(s.get("text")) for s in result["stop"]
+                   if isinstance(s, dict) and s.get("text")]
+        raise HTTPException(422, "Создать заказ нельзя: " +
+                            ("; ".join(reasons) or "план не прошёл проверку"))
     items = [
         {"base_name": i["base_name"], "qty": int(i["qty"]),
          "sizes": i.get("sizes") or {}, "cost": float(i.get("cost_price") or 0)}

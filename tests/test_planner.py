@@ -787,11 +787,73 @@ def api_checks() -> None:
         check("план сохранён", saved.get("ok") and saved.get("id"))
         check("последний бриф возвращается для предзаполнения",
               c.get("/api/order-plan/last").json()["brief"]["budget"] == 300000)
+        # A02: сохранение для истории не снимает запреты финального плана.
+        for reason, changes in (
+            ("past_date", {"eta_date": date.today().isoformat()}),
+            ("over_budget", {"overrides": {plan["items"][0]["base_name"]: 1000000}}),
+            ("empty", {"budget": 0}),
+        ):
+            gate_body = {"production_id": lab["id"], "eta_date": eta,
+                         "budget": 300000, "budget_scope": "now",
+                         "strategy": "balance", **changes}
+            gated = c.post("/api/order-plan", json=gate_body).json()
+            check(f"A02 {reason}: воспроизведён запрет финального плана",
+                  (gated["plan"]["items"] or reason == "empty")
+                  and not gated["plan"]["can_create"]
+                  and reason in [s["code"] for s in gated["plan"]["stop"]])
+            import json as _gate_json
+            stored_gate = _gate_json.loads(_sql(
+                "SELECT result_json FROM order_plans WHERE id=?", gated["id"])[0][0])
+            check(f"A02 {reason}: сохраняется запрет финального плана",
+                  stored_gate.get("can_create") is False
+                  and stored_gate.get("stop") == gated["plan"]["stop"])
+            count_before = _sql("SELECT COUNT(*) FROM production_orders")[0][0]
+            denied = c.post(f"/api/order-plan/{gated['id']}/apply",
+                            json={"force": True, "confirm_partial": True})
+            check(f"A02 {reason}: подтверждения не обходят запрет",
+                  denied.status_code == 422, f"status={denied.status_code}")
+            state = _sql("SELECT status, production_order_id FROM order_plans WHERE id=?",
+                         gated["id"])[0]
+            check(f"A02 {reason}: отказ не создаёт заказ и не меняет план",
+                  _sql("SELECT COUNT(*) FROM production_orders")[0][0] == count_before
+                  and state == ("draft", None), str(state))
+            # На неисправленном runtime лишний черновик не должен ломать
+            # остальные проверки через защиту от дублей. FAIL уже записан.
+            if denied.status_code == 200 and denied.json().get("order_id"):
+                c.delete(f"/api/orders/{denied.json()['order_id']}")
+        # Legacy: отсутствие сохранённого разрешения требует нового расчёта,
+        # а не восстановления бюджета или количеств на сегодняшних данных.
+        original_result = _sql("SELECT result_json FROM order_plans WHERE id=?",
+                               saved["id"])[0][0]
+        legacy_result = _gate_json.loads(original_result)
+        legacy_result.pop("stop", None)
+        legacy_result.pop("can_create", None)
+        _sql("UPDATE order_plans SET result_json=? WHERE id=?",
+             _gate_json.dumps(legacy_result), saved["id"])
+        before_legacy = _sql("SELECT COUNT(*) FROM production_orders")[0][0]
+        legacy = c.post(f"/api/order-plan/{saved['id']}/apply",
+                        json={"force": True, "confirm_partial": True})
+        check("A02 legacy: нужен явный новый расчёт",
+              legacy.status_code == 422 and "Пересчитайте" in legacy.text)
+        check("A02 legacy: отказ не меняет решение и не создаёт заказ",
+              _sql("SELECT COUNT(*) FROM production_orders")[0][0] == before_legacy
+              and _sql("SELECT status, production_order_id, result_json FROM order_plans WHERE id=?",
+                       saved["id"])[0] == ("draft", None, _gate_json.dumps(legacy_result)))
+        if legacy.status_code == 200 and legacy.json().get("order_id"):
+            c.delete(f"/api/orders/{legacy.json()['order_id']}")
+        _sql("UPDATE order_plans SET result_json=? WHERE id=?", original_result, saved["id"])
         applied = c.post(f"/api/order-plan/{saved['id']}/apply", json={"name": "Осень 2026"})
         check("план превращается в заказ на производство",
               applied.status_code == 200 and applied.json().get("order_id"))
         again = c.post(f"/api/order-plan/{saved['id']}/apply", json={"name": "Ещё раз"})
         check("повторное применение плана → 409", again.status_code == 409)
+        _sql("UPDATE order_plans SET result_json=? WHERE id=?",
+             _gate_json.dumps(legacy_result), saved["id"])
+        again_legacy = c.post(f"/api/order-plan/{saved['id']}/apply",
+                              json={"force": True, "confirm_partial": True})
+        check("A02 legacy: уже применённый план сохраняет 409",
+              again_legacy.status_code == 409 and "уже создан" in again_legacy.text)
+        _sql("UPDATE order_plans SET result_json=? WHERE id=?", original_result, saved["id"])
         # ── Правило распределения позиций по производствам ─────────────────
         from app.db import SessionLocal
         from app.models import Product as _P
