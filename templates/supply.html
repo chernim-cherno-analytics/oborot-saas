@@ -249,6 +249,42 @@
                  color: var(--red, #d92b2b); }
   .pl-saving { font-size: 12px; color: var(--ink-3); }
 
+  /* ── SUPPLY-FIX-1: результат виден, выбор ищется, снятие спрашивает ─────── */
+
+  /* Карточка, к которой человека привели после сохранения. Две секунды и
+     обычная рамка — этого хватает, чтобы глаз нашёл её в списке из тридцати;
+     анимации здесь нет намеренно, редизайн отдельно (решение владельца). */
+  .pl-flash { outline: 2px solid var(--accent, #1554d1); outline-offset: 2px; }
+  .pl-card[tabindex]:focus { outline: 2px solid var(--accent, #1554d1);
+                             outline-offset: 2px; }
+
+  /* Строка вещи без плановых партий: та же карточка, только приземистее. */
+  .pl-itemrow .sub { margin-top: 2px; }
+
+  /* Вопрос вместо кнопки «Снять». Живёт ровно на её месте, чтобы взгляд не
+     искал подтверждение в другом углу экрана. */
+  .pl-confirm { display: inline-flex; align-items: center; gap: 6px;
+                font-size: 12.5px; color: var(--ink-2); }
+
+  /* Действие внутри тоста («Вернуть»). Контейнер и класс тоста — общие из
+     static/app.css, поэтому здесь только сама кнопка. */
+  .pl-toast-act { margin-left: 10px; background: transparent; border: 0;
+                  padding: 0; color: inherit; font: inherit; font-weight: 700;
+                  text-decoration: underline; cursor: pointer; }
+
+  /* Поиск по каталогу. Список лежит В ПОТОКЕ, а не абсолютом: форма и так
+     раскрывается вниз, всплывающий слой пришлось бы позиционировать
+     относительно прокрутки карточки — лишняя механика ради того же результата. */
+  .pl-combo-list { margin-top: 4px; border: 1px solid var(--line);
+                   border-radius: 8px; background: var(--surface);
+                   max-height: 220px; overflow-y: auto; }
+  .pl-combo-opt { padding: 7px 10px; font-size: 13px; cursor: pointer;
+                  border-bottom: 1px solid var(--line-soft); }
+  .pl-combo-opt:last-child { border-bottom: 0; }
+  .pl-combo-opt:hover, .pl-combo-opt.on { background: var(--line-soft, #eef2f7); }
+  .pl-combo-note { margin-top: 4px; font-size: 11.5px; color: var(--ink-3);
+                   line-height: 1.4; }
+
   @media (max-width: 640px) {
     .sup-wrap .card-body { padding: 12px; }
     .sup-wrap .card + .card { margin-top: 10px; }
@@ -277,12 +313,20 @@
      это разные виды правды: одно человек решил, другое он прочитал у себя в
      таблице. Смешать их в один список значило бы выдать намерение за факт
      источника. #}
+  {# ПЕРЕКЛЮЧАТЕЛЬ СУЩЕСТВУЕТ, ТОЛЬКО ЕСЛИ ПЕРЕКЛЮЧАТЬ ЕСТЬ ЧТО (F-08).
+     Предпросмотр читает ОДНУ конкретную производственную таблицу: точные
+     заголовки на фиксированных колонках, ровно два листа, fail-closed. Для
+     организации без флага за этой вкладкой не было бы ничего — а вкладка,
+     которая ничего не открывает, хуже её отсутствия. Одна вкладка «План
+     производства» рядом с собой тоже не нужна: переключаться не с чего. #}
+  {% if sheets_preview %}
   <div class="sup-tabs" role="tablist" aria-label="Разделы поставок">
     <button class="sup-tab" id="sup-tab-plan" role="tab" type="button"
             aria-selected="true" aria-controls="sup-view-plan">План производства</button>
     <button class="sup-tab" id="sup-tab-preview" role="tab" type="button"
             aria-selected="false" aria-controls="sup-view-preview">Предпросмотр таблицы</button>
   </div>
+  {% endif %}
 
   <div id="sup-view-plan" role="tabpanel" aria-labelledby="sup-tab-plan">
 
@@ -350,6 +394,7 @@
 
   </div>
 
+  {% if sheets_preview %}
   <div id="sup-view-preview" role="tabpanel" aria-labelledby="sup-tab-preview" hidden>
 
   {# НАЗНАЧЕНИЕ РАЗДЕЛА СКАЗАНО ПОЛОЖИТЕЛЬНО, А ГРАНИЦА — РЯДОМ И ЧЕСТНО.
@@ -443,11 +488,13 @@
   </section>
 
   </div>
+  {% endif %}
 
 </div>
 {% endblock %}
 
 {% block scripts %}
+{% if sheets_preview %}
 <script>
 // ЗАПУСК ОТЛОЖЕН НАМЕРЕННО, И ЭТО НЕ СТИЛЬ. `static/app.js` подключён в
 // `base.html` с атрибутом `defer`, то есть выполняется ПОСЛЕ разбора всего
@@ -1660,6 +1707,7 @@ document.addEventListener("DOMContentLoaded", function () {
   switchView(null);
 });
 </script>
+{% endif %}
 
 <script>
 // ── SUPPLY-3: план производства ─────────────────────────────────────────────
@@ -1768,12 +1816,19 @@ document.addEventListener("DOMContentLoaded", function () {
   // ЕДИНСТВЕННАЯ ДВЕРЬ К ЗАПИСИ. Один запрос в полёте: повторный клик по той же
   // кнопке не уходит вторым запросом вовсе, а `op_id` защищает от того случая,
   // когда второй клик всё-таки долетел (две вкладки, медленная сеть).
-  function send(url, body, formErrId, done) {
+  // РЕЗУЛЬТАТ СОХРАНЕНИЯ ОБЯЗАН БЫТЬ ВИДЕН (F-05). `spot` говорит, за какой
+  // карточкой идти после ответа: `{kind: "material"|"item"|"batch"}` — за
+  // только что появившейся (её `id` вычисляется разностью списков до и после,
+  // потому что ответ отдаёт всю доску, а не созданную строку), либо
+  // `{kind: …, id: N}` — за конкретной, если правили существующую.
+  // `{quiet: true}` гасит общий тост «Сохранено» там, где у действия есть свой.
+  function send(url, body, formErrId, done, spot) {
     if (PL.saving) return;
     PL.saving = true;
     paintSaving(true);
     setError("pl-error", "");
     if (formErrId) setError(formErrId, "");
+    var before = spot ? idsOf(spot.kind) : null;
     // `api()` сериализует тело сам (static/app.js) — передавать сюда уже
     // готовую строку значило бы закодировать её ВТОРОЙ раз, и сервер получил
     // бы строку вместо объекта.
@@ -1781,6 +1836,10 @@ document.addEventListener("DOMContentLoaded", function () {
       .then(function (data) {
         PL.board = data;
         render();
+        if (spot && !spot.quiet) {
+          plToast(data && data.notice ? data.notice : "Сохранено", {ms: 3000});
+        }
+        if (spot) flash(spot.kind, spot.id || onlyNew(spot.kind, before));
         if (done) done(true);
       })
       .catch(function (err) {
@@ -1802,18 +1861,115 @@ document.addEventListener("DOMContentLoaded", function () {
     });
   }
 
+  //: Списки доски по виду карточки. Ключи ответа множественные, у карточки в
+  //: разметке — единственное число: одно место перевода вместо трёх.
+  var LIST_OF = {material: "materials", item: "items", batch: "batches"};
+
+  function idsOf(kind) {
+    var list = (PL.board && PL.board[LIST_OF[kind]]) || [];
+    return list.map(function (row) { return row.id; });
+  }
+
+  function onlyNew(kind, before) {
+    if (!before) return null;
+    var seen = {};
+    before.forEach(function (id) { seen[id] = true; });
+    var fresh = idsOf(kind).filter(function (id) { return !seen[id]; });
+    return fresh.length === 1 ? fresh[0] : null;
+  }
+
+  // ТОСТ ЗДЕСЬ СВОЙ, А НЕ ОБЩИЙ ИЗ static/app.js. Общему нельзя задать ни срок
+  // жизни, ни действие внутри, а F-05 и F-11 требуют ровно этого: «Сохранено»
+  // на 3 секунды и «Назначение снято · Вернуть» на 6. Контейнер и класс —
+  // те же самые (#toast-root, .toast), поэтому вида на экране это не меняет.
+  function plToast(text, opts) {
+    opts = opts || {};
+    var root = byId("toast-root");
+    if (!root) return null;
+    var node = el("div", "toast");
+    node.appendChild(el("span", null, text));
+    var timer = null;
+    function close() {
+      if (timer) { clearTimeout(timer); timer = null; }
+      node.classList.remove("show");
+      setTimeout(function () { if (node.parentNode) node.remove(); }, 250);
+    }
+    if (opts.action) {
+      var act = el("button", "pl-toast-act", opts.action.label);
+      act.type = "button";
+      act.addEventListener("click", function () { close(); opts.action.run(); });
+      node.appendChild(act);
+    }
+    root.appendChild(node);
+    requestAnimationFrame(function () { node.classList.add("show"); });
+    timer = setTimeout(close, opts.ms || 3000);
+    return node;
+  }
+
+  // Карточка, ради которой человек нажимал кнопку: подвести к ней, подсветить
+  // на две секунды и отдать ей фокус. Без этого при трёх десятках материалов
+  // сохранение выглядит так, будто ничего не произошло: новая карточка встаёт
+  // вверху списка, форма остаётся внизу, и подтверждения нет никакого.
+  function flash(kind, id) {
+    if (!id) return;
+    var node = document.querySelector(
+      '[data-pl="' + kind + '"][data-id="' + id + '"]');
+    if (!node) return;
+    if (node.scrollIntoView) node.scrollIntoView({block: "center"});
+    node.classList.add("pl-flash");
+    node.setAttribute("tabindex", "-1");
+    try { node.focus({preventScroll: true}); } catch (e) { node.focus(); }
+    setTimeout(function () { node.classList.remove("pl-flash"); }, 2000);
+  }
+
+  // ПОДТВЕРЖДЕНИЕ БЕЗ confirm(). Системное окно останавливает страницу целиком
+  // и на телефоне выглядит как ошибка браузера; здесь вопрос задаётся на месте
+  // кнопки и отменяется одним нажатием.
+  function askConfirm(btn, question, onYes) {
+    var host = btn.parentNode;
+    if (!host) return;
+    var box = el("span", "pl-confirm");
+    box.appendChild(el("span", null, question));
+    var yes = el("button", "btn sm", "Да");
+    yes.type = "button";
+    var no = el("button", "btn sm", "Нет");
+    no.type = "button";
+    box.appendChild(yes);
+    box.appendChild(no);
+    host.replaceChild(box, btn);
+    function restore() { if (box.parentNode === host) host.replaceChild(btn, box); }
+    no.addEventListener("click", function () { restore(); btn.focus(); });
+    yes.addEventListener("click", function () { restore(); onYes(); });
+    yes.focus();
+  }
+
+  //: Раскрытие формы — одна функция на обработчик кнопки и на вызов извне
+  //: (строка вещи из F-05 открывает форму партии сама).
+  var BUILDERS = {};
+
+  function openForm(buttonId, formId) {
+    var btn = byId(buttonId), form = byId(formId);
+    if (!btn || !form || !BUILDERS[formId]) return;
+    if (form.hidden) {
+      form.hidden = false;
+      btn.setAttribute("aria-expanded", "true");
+      BUILDERS[formId](form);
+    }
+    if (form.scrollIntoView) form.scrollIntoView({block: "center"});
+    var first = form.querySelector("input, select, textarea");
+    if (first) first.focus();
+  }
+
   function disclosure(buttonId, formId, build) {
     var btn = byId(buttonId), form = byId(formId);
     if (!btn || !form) return;
+    BUILDERS[formId] = build;
     btn.addEventListener("click", function () {
-      var willOpen = form.hidden;
-      form.hidden = !willOpen;
-      btn.setAttribute("aria-expanded", willOpen ? "true" : "false");
-      if (willOpen) {
-        build(form);
-        var first = form.querySelector("input, select, textarea");
-        if (first) first.focus();
+      if (form.hidden) {
+        openForm(buttonId, formId);
       } else {
+        form.hidden = true;
+        btn.setAttribute("aria-expanded", "false");
         clear(form);
       }
     });
@@ -1858,7 +2014,7 @@ document.addEventListener("DOMContentLoaded", function () {
       }, "pl-mat-err", function (ok) {
         if (ok) { resetToken(form); form.hidden = true; clear(form);
                   byId("pl-add-material").setAttribute("aria-expanded", "false"); }
-      });
+      }, {kind: "material"});
     };
   }
 
@@ -1872,8 +2028,26 @@ document.addEventListener("DOMContentLoaded", function () {
         o.value = pair[0];
         kind.appendChild(o);
       });
-    var pick = el("select");
-    pick.id = "pl-item-base";
+    // ── Каталог: поиск, а не список из двадцати (F-04) ──────────────────────
+    // Прежде здесь стоял `<select>`, набитый первыми двадцатью моделями по
+    // алфавиту. У бренда с пятьюстами моделями это означало, что четыре
+    // пятых каталога недоступны вовсе, и человек не мог даже узнать, что они
+    // есть: список выглядел как весь каталог. `datalist` не годится —
+    // события выбора он даёт ненадёжно, а состояние «показаны 20 из 143»
+    // показать в нём негде.
+    var pick = input("pl-item-base", {placeholder: "начните вводить название",
+                                      maxLength: 200});
+    pick.setAttribute("autocomplete", "off");
+    pick.setAttribute("role", "combobox");
+    pick.setAttribute("aria-expanded", "false");
+    pick.setAttribute("aria-autocomplete", "list");
+    pick.setAttribute("aria-controls", "pl-item-base-list");
+    var listBox = el("div", "pl-combo-list");
+    listBox.id = "pl-item-base-list";
+    listBox.setAttribute("role", "listbox");
+    listBox.hidden = true;
+    var comboNote = el("div", "pl-combo-note");
+    comboNote.id = "pl-item-base-note";
     var title = input("pl-item-title", {placeholder: "рабочее название новинки", maxLength: 200});
     var file = el("input");
     file.type = "file";
@@ -1882,6 +2056,10 @@ document.addEventListener("DOMContentLoaded", function () {
     var note = input("pl-item-note", {placeholder: "заметка", maxLength: 500});
 
     var fCatalog = field("Вещь каталога", pick, true);
+    // Список и подпись живут ВНУТРИ поля: тогда `hidden` на поле (вид «новинка»)
+    // прячет их заодно, и отдельного правила скрытия не нужно.
+    fCatalog.appendChild(listBox);
+    fCatalog.appendChild(comboNote);
     var fTitle = field("Название новинки", title, true);
     var fSketch = field("Эскиз (JPEG или PNG, приватный)", file, true);
 
@@ -1903,28 +2081,144 @@ document.addEventListener("DOMContentLoaded", function () {
     kind.addEventListener("change", paintKind);
     paintKind();
 
-    clear(pick);
-    (PL.catalog || []).forEach(function (opt) {
-      var o = el("option", null, opt.base_name + " · размеров: " + opt.sizes);
-      o.value = opt.base_name;
-      pick.appendChild(o);
-    });
-    if (!(PL.catalog || []).length) {
-      var o = el("option", null, "в каталоге пока пусто");
-      o.value = "";
-      pick.appendChild(o);
+    var comboTimer = null, comboSeq = 0, comboRows = [], comboIdx = -1;
+
+    function comboClose() {
+      listBox.hidden = true;
+      comboRows = [];
+      comboIdx = -1;
+      clear(listBox);
+      pick.setAttribute("aria-expanded", "false");
     }
 
+    // ПУСТОЙ КАТАЛОГ И ПУСТОЙ РЕЗУЛЬТАТ — РАЗНЫЕ ВЕЩИ, И СЛОВА У НИХ РАЗНЫЕ.
+    // «В каталоге пока пусто» человек читал как утверждение о СВОИХ данных,
+    // хотя означало это ровно одно: синк с МойСклад не подключён.
+    function comboNoteBase() {
+      clear(comboNote);
+      var meta = PL.catalogMeta;
+      if (meta && meta.catalog_size === 0) {
+        comboNote.appendChild(el("span", null,
+          "Каталог приходит из МойСклад — подключите его в Настройках."));
+      }
+    }
+
+    function comboPaint() {
+      var opts = listBox.querySelectorAll(".pl-combo-opt");
+      for (var i = 0; i < opts.length; i++) {
+        if (i === comboIdx) {
+          opts[i].classList.add("on");
+          opts[i].setAttribute("aria-selected", "true");
+        } else {
+          opts[i].classList.remove("on");
+          opts[i].setAttribute("aria-selected", "false");
+        }
+      }
+    }
+
+    function comboChoose(i) {
+      var row = comboRows[i];
+      if (!row) return;
+      pick.value = row.base_name;
+      comboClose();
+      comboNoteBase();
+      pick.focus();
+    }
+
+    function comboShow(rows, meta, q) {
+      comboRows = rows;
+      comboIdx = -1;
+      clear(listBox);
+      rows.forEach(function (row, i) {
+        var opt = el("div", "pl-combo-opt",
+                     row.base_name + " · размеров: " + row.sizes);
+        opt.setAttribute("role", "option");
+        opt.setAttribute("aria-selected", "false");
+        // mousedown, а не click: click приходит ПОСЛЕ blur поля, и список к
+        // этому моменту уже закрыт — выбор мышью не срабатывал бы вовсе.
+        opt.addEventListener("mousedown", function (ev) {
+          ev.preventDefault();
+          comboChoose(i);
+        });
+        listBox.appendChild(opt);
+      });
+      listBox.hidden = rows.length === 0;
+      pick.setAttribute("aria-expanded", rows.length ? "true" : "false");
+      clear(comboNote);
+      if (meta && meta.catalog_size === 0) {
+        comboNote.appendChild(el("span", null,
+          "Каталог приходит из МойСклад — подключите его в Настройках."));
+      } else if (meta && meta.total > rows.length) {
+        comboNote.appendChild(el("span", null,
+          "показаны " + rows.length + " из " + meta.total + " — уточните"));
+      } else if (!rows.length) {
+        comboNote.appendChild(el("span", null, "Ничего не нашлось."));
+      }
+    }
+
+    function comboAsk(q) {
+      var seq = ++comboSeq;
+      api("/api/supply/planning/catalog?q=" + encodeURIComponent(q))
+        .then(function (data) {
+          if (seq !== comboSeq) return;   // поздний ответ прежнего ввода
+          PL.catalogMeta = data || null;
+          comboShow((data && data.options) || [], data, q);
+        })
+        .catch(function () {
+          if (seq !== comboSeq) return;
+          comboClose();
+          clear(comboNote);
+          comboNote.appendChild(el("span", null,
+            "Список не загрузился — наберите ещё раз."));
+        });
+    }
+
+    pick.addEventListener("input", function () {
+      if (comboTimer) clearTimeout(comboTimer);
+      var q = pick.value.trim();
+      if (q.length < 2) {
+        comboSeq++;                       // ответ на прежний ввод уже не нужен
+        comboClose();
+        comboNoteBase();
+        return;
+      }
+      comboTimer = setTimeout(function () { comboAsk(q); }, 250);
+    });
+
+    pick.addEventListener("keydown", function (ev) {
+      if (ev.key === "Escape") { comboClose(); return; }
+      if (listBox.hidden || !comboRows.length) return;
+      if (ev.key === "ArrowDown") {
+        ev.preventDefault();
+        comboIdx = (comboIdx + 1) % comboRows.length;
+        comboPaint();
+      } else if (ev.key === "ArrowUp") {
+        ev.preventDefault();
+        comboIdx = (comboIdx <= 0 ? comboRows.length : comboIdx) - 1;
+        comboPaint();
+      } else if (ev.key === "Enter" && comboIdx >= 0) {
+        // Enter выбирает подсвеченное, а не отправляет форму: иначе первый же
+        // выбор с клавиатуры уходил бы на сервер недозаполненным.
+        ev.preventDefault();
+        comboChoose(comboIdx);
+      }
+    });
+
+    pick.addEventListener("blur", function () {
+      setTimeout(comboClose, 120);
+    });
+
+    comboNoteBase();
     bindTokenReset(form);
     form.onsubmit = function (ev) {
       ev.preventDefault();
       var body = {kind: kind.value, note: note.value, op_id: actionToken(form)};
       if (kind.value === "catalog") {
-        body.base_name = pick.value;
+        body.base_name = pick.value.trim();
         send("/api/supply/planning/items", body, "pl-item-err", function (ok) {
           if (ok) { resetToken(form); form.hidden = true; clear(form);
                     byId("pl-add-item").setAttribute("aria-expanded", "false"); }
-        });
+        }, {kind: "item"});
         return;
       }
       body.title = title.value;
@@ -1951,7 +2245,7 @@ document.addEventListener("DOMContentLoaded", function () {
           send("/api/supply/planning/items", body, "pl-item-err", function (ok) {
             if (ok) { resetToken(form); form.hidden = true; clear(form);
                       byId("pl-add-item").setAttribute("aria-expanded", "false"); }
-          });
+          }, {kind: "item"});
         }).catch(function () {
           PL.saving = false; paintSaving(false);
           setError("pl-item-err", "Эскиз не удалось отправить.");
@@ -1961,7 +2255,7 @@ document.addEventListener("DOMContentLoaded", function () {
       send("/api/supply/planning/items", body, "pl-item-err", function (ok) {
         if (ok) { resetToken(form); form.hidden = true; clear(form);
                   byId("pl-add-item").setAttribute("aria-expanded", "false"); }
-      });
+      }, {kind: "item"});
     };
   }
 
@@ -1987,10 +2281,13 @@ document.addEventListener("DOMContentLoaded", function () {
     form.appendChild(el("div", "pl-hint",
       "Ориентир — нормальный ответ. «Оборот» не превращает срок в просрочку и "
       + "ничего не подставляет за вас."));
+    // ИСТОЧНИК СРОКА ВИДЕН ПРИ ЛЮБОМ ВИДЕ (F-03). Раньше он прятался у
+    // «срок неизвестен», хотя сервер его хранит и карточка показывает: после
+    // правила «скрытое не отправляем» такое поле молча стиралось бы при смене
+    // вида — то есть ровно тот дефект, который этот пункт и закрывает.
     function paint() {
       fText.hidden = (kind.value === "unknown" || kind.value === "exact");
       fDate.hidden = kind.value !== "exact";
-      fSource.hidden = kind.value === "unknown";
     }
     kind.addEventListener("change", paint);
     if (current) {
@@ -2000,9 +2297,15 @@ document.addEventListener("DOMContentLoaded", function () {
       source.value = current.due_source || "";
     }
     paint();
+    // СКРЫТОЕ ПОЛЕ В ТЕЛО ЗАПРОСА НЕ ПОПАДАЕТ. Сервер теперь отвечает 400 на
+    // поле, которого этот вид срока не использует (F-03), и отправлять
+    // невидимую человеку дату значило бы получать отказ за то, чего он не
+    // делал: значение осталось в поле с прошлого выбора, а на экране его нет.
     return function () {
-      return {due_kind: kind.value, due_text: text.value,
-              due_date: date.value, due_source: source.value};
+      var out = {due_kind: kind.value, due_source: source.value};
+      if (!fText.hidden) out.due_text = text.value;
+      if (!fDate.hidden) out.due_date = date.value;
+      return out;
     };
   }
 
@@ -2040,7 +2343,7 @@ document.addEventListener("DOMContentLoaded", function () {
       send("/api/supply/planning/batches", body, "pl-batch-err", function (ok) {
         if (ok) { resetToken(form); form.hidden = true; clear(form);
                   byId("pl-add-batch").setAttribute("aria-expanded", "false"); }
-      });
+      }, {kind: "batch"});
     };
   }
 
@@ -2049,6 +2352,11 @@ document.addEventListener("DOMContentLoaded", function () {
 
   function materialCard(m) {
     var card = el("div", "pl-card");
+    // Опознавательные метки карточки — то, по чему её находит `flash()` после
+    // сохранения. Без них «подвести к результату» пришлось бы делать позицией
+    // в списке, а список переупорядочивается сервером.
+    card.dataset.pl = "material";
+    card.dataset.id = String(m.id);
     var head = el("div", "t");
     head.appendChild(el("span", null, m.title));
     if (!m.qty_known) head.appendChild(el("span", "pl-tag", "количество неизвестно"));
@@ -2139,7 +2447,7 @@ document.addEventListener("DOMContentLoaded", function () {
       send("/api/supply/planning/assignments", {
         material_id: material.id, batch_id: pick.value, qty: qty.value,
         op_id: actionToken(form),
-      }, "pl-assign-err");
+      }, "pl-assign-err", null, {kind: "batch", id: Number(pick.value)});
     };
   }
 
@@ -2153,12 +2461,45 @@ document.addEventListener("DOMContentLoaded", function () {
       ev.preventDefault();
       send("/api/supply/planning/materials/" + material.id + "/update",
            {qty: qty.value, rev: material.rev, op_id: actionToken(form)},
-           "pl-matq-err");
+           "pl-matq-err", null, {kind: "material", id: material.id});
     };
+  }
+
+  // Строка вещи, у которой ещё нет ни одной плановой партии. Не карточка:
+  // показывать нечего, кроме имени и одного действия, — а полноразмерная
+  // карточка с пустыми числами выглядела бы как партия, которой нет.
+  function itemRow(it) {
+    var row = el("div", "pl-card pl-itemrow");
+    row.dataset.pl = "item";
+    row.dataset.id = String(it.id);
+    var head = el("div", "t");
+    head.appendChild(el("span", null, it.title));
+    if (it.kind === "draft") head.appendChild(el("span", "pl-tag", "новинка"));
+    row.appendChild(head);
+    var sub = el("div", "sub", "плановых партий нет");
+    row.appendChild(sub);
+    if (PL.board && PL.board.can_write) {
+      var actions = el("div", "pl-actions");
+      var plan = el("button", "btn sm", "Запланировать партию");
+      plan.type = "button";
+      plan.addEventListener("click", function () {
+        openForm("pl-add-batch", "pl-batch-form");
+        var pickItem = byId("pl-batch-item");
+        if (pickItem) {
+          pickItem.value = String(it.id);
+          pickItem.focus();
+        }
+      });
+      actions.appendChild(plan);
+      row.appendChild(actions);
+    }
+    return row;
   }
 
   function batchCard(b) {
     var card = el("div", "pl-card");
+    card.dataset.pl = "batch";
+    card.dataset.id = String(b.id);
     var row = el("div", "pl-row");
     if (b.item_sketch_id) {
       var img = el("img", "pl-sketch");
@@ -2201,11 +2542,33 @@ document.addEventListener("DOMContentLoaded", function () {
           toggleInline(card, move, function (box) { buildMoveForm(box, a, b); });
         });
         line.appendChild(move);
+        // СНЯТИЕ — ЕДИНСТВЕННОЕ НЕОБРАТИМОЕ ДЕЙСТВИЕ НА ЭКРАНЕ, и до этого
+        // пакета оно происходило от одного нажатия, без вопроса и без пути
+        // назад: промах по соседней кнопке стоил метража, вписанного руками.
+        // Теперь вопрос задаётся на месте кнопки (без confirm(), который на
+        // телефоне выглядит как ошибка браузера), а после снятия шесть секунд
+        // висит «Вернуть» — тот же материал, та же партия, то же количество и
+        // та же заметка.
         var drop = el("button", "btn sm", "Снять");
         drop.type = "button";
         drop.addEventListener("click", function () {
-          send("/api/supply/planning/assignments/" + a.id + "/delete",
-               {rev: a.rev, op_id: actionToken(drop)}, null);
+          askConfirm(drop, "Снять?", function () {
+            send("/api/supply/planning/assignments/" + a.id + "/delete",
+                 {rev: a.rev, op_id: actionToken(drop)}, null,
+                 function (ok) {
+                   if (!ok) return;
+                   resetToken(drop);
+                   plToast("Назначение снято", {ms: 6000, action: {
+                     label: "Вернуть",
+                     run: function () {
+                       send("/api/supply/planning/assignments", {
+                         material_id: a.material_id, batch_id: b.id,
+                         qty: a.qty, note: a.note || "", op_id: opId(),
+                       }, null, null, {kind: "batch", id: b.id, quiet: true});
+                     },
+                   }});
+                 }, {kind: "batch", id: b.id, quiet: true});
+          });
         });
         line.appendChild(drop);
       }
@@ -2251,7 +2614,7 @@ document.addEventListener("DOMContentLoaded", function () {
       send("/api/supply/planning/assignments/move", {
         assignment_id: assignment.id, to_batch_id: pick.value, qty: qty.value,
         rev: assignment.rev, op_id: actionToken(form),
-      }, "pl-move-err");
+      }, "pl-move-err", null, {kind: "batch", id: Number(pick.value)});
     };
   }
 
@@ -2268,18 +2631,28 @@ document.addEventListener("DOMContentLoaded", function () {
       var due = readDue();
       for (var k in due) { if (due.hasOwnProperty(k)) body[k] = due[k]; }
       send("/api/supply/planning/batches/" + b.id + "/update", body,
-           "pl-batch-edit-err");
+           "pl-batch-edit-err", null, {kind: "batch", id: b.id});
     };
   }
 
   function render() {
     var data = PL.board;
     if (!data) return;
+    // F-07: когда делать нечего, блока не должно быть на экране. Прежняя
+    // редакция только красила его в «ok» и всё равно показывала — и человек
+    // читал «План собран: материалы распределены» ровно тогда, когда сто метров
+    // ещё лежат нераспределёнными. Утверждение неверно по сути, поэтому оно
+    // скрывается целиком, а не переписывается: нераспределённый остаток и
+    // неизвестное количество — факты сводки, а не задачи (ТЗ F-07).
     var next = byId("pl-next");
     clear(next);
-    next.className = "pl-next" + (data.next_step.code === "ok" ? " ok" : "");
-    next.appendChild(el("b", null, "Следующий шаг: "));
-    next.appendChild(el("span", null, data.next_step.text));
+    var nothingToDo = data.next_step.code === "ok";
+    next.hidden = nothingToDo;
+    next.className = "pl-next" + (nothingToDo ? " ok" : "");
+    if (!nothingToDo) {
+      next.appendChild(el("b", null, "Следующий шаг: "));
+      next.appendChild(el("span", null, data.next_step.text));
+    }
 
     var s = data.summary;
     // СВОБОДНОЕ ПОКАЗЫВАЕТСЯ ПО КАЖДОЙ ЕДИНИЦЕ ОТДЕЛЬНО. Прежняя редакция брала
@@ -2309,9 +2682,20 @@ document.addEventListener("DOMContentLoaded", function () {
 
     var batches = byId("pl-batches");
     clear(batches);
+    // СОХРАНЁННАЯ ВЕЩЬ ВИДНА (F-05). До этого пакета «Сохранить вещь»
+    // отвечало 200 и не меняло на экране ничего: вещи жили только в
+    // выпадающем списке формы партии, счётчик показывал «0 шт», и человек,
+    // не увидев результата, нажимал ещё раз — так появлялись дубли.
+    var withBatches = {};
+    (data.batches || []).forEach(function (b) { withBatches[b.item_id] = true; });
+    var lonely = (data.items || []).filter(function (it) {
+      return !withBatches[it.id];
+    });
+    lonely.forEach(function (it) { batches.appendChild(itemRow(it)); });
     (data.batches || []).forEach(function (b) { batches.appendChild(batchCard(b)); });
-    byId("pl-batch-empty").hidden = (data.batches || []).length > 0;
-    byId("pl-batch-count").textContent = (data.batches || []).length + " шт";
+    var totalRows = (data.items || []).length + (data.batches || []).length;
+    byId("pl-batch-empty").hidden = totalRows > 0;
+    byId("pl-batch-count").textContent = totalRows + " шт";
     byId("pl-batch-actions").hidden = !data.can_write;
   }
 
@@ -2325,20 +2709,31 @@ document.addEventListener("DOMContentLoaded", function () {
     });
     api("/api/supply/planning/catalog").then(function (data) {
       PL.catalog = (data && data.options) || [];
-    }).catch(function () { PL.catalog = []; });
+      // `catalog_size` отличает пустой каталог от «ничего не нашлось» ещё до
+      // первого ввода — на этом держится текст про МойСклад (F-04).
+      PL.catalogMeta = data || null;
+    }).catch(function () { PL.catalog = []; PL.catalogMeta = null; });
   }
 
+  // Вкладка предпросмотра существует не у всех организаций (F-08), поэтому
+  // переключатель здесь необязателен: без него страница — один раздел плана.
   function switchTab(which) {
+    var preview = byId("sup-view-preview");
+    if (!preview) return;
     var isPlan = which === "plan";
     byId("sup-view-plan").hidden = !isPlan;
-    byId("sup-view-preview").hidden = isPlan;
+    preview.hidden = isPlan;
     byId("sup-tab-plan").setAttribute("aria-selected", isPlan ? "true" : "false");
     byId("sup-tab-preview").setAttribute("aria-selected", isPlan ? "false" : "true");
   }
 
   function start() {
-    byId("sup-tab-plan").addEventListener("click", function () { switchTab("plan"); });
-    byId("sup-tab-preview").addEventListener("click", function () { switchTab("preview"); });
+    if (byId("sup-tab-plan")) {
+      byId("sup-tab-plan").addEventListener("click", function () { switchTab("plan"); });
+    }
+    if (byId("sup-tab-preview")) {
+      byId("sup-tab-preview").addEventListener("click", function () { switchTab("preview"); });
+    }
     disclosure("pl-add-material", "pl-mat-form", buildMaterialForm);
     disclosure("pl-add-item", "pl-item-form", buildItemForm);
     disclosure("pl-add-batch", "pl-batch-form", buildBatchForm);

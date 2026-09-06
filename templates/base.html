@@ -65,7 +65,10 @@
       <a href="/replenish" class="{{ 'active' if active == 'replenish' else '' }}">Заказ<span class="pip" id="nav-pip-replenish" style="display:none;"></span></a>
       <a href="/sizes" class="{{ 'active' if active == 'sizes' else '' }}">Заказ позиции</a>
       <a href="/supply" class="{{ 'active' if active == 'supply' else '' }}">Поставки</a>
-      <div class="nav-grp">Аналитика</div>
+      {# Вторая группа «Аналитика» убрана (SUPPLY-FIX-1, F-01): один и тот же
+         заголовок стоял в списке дважды, и человек не мог понять, чем первая
+         «Аналитика» отличается от второй. Переименование и перегруппировку
+         пунктов сюда не тащим — это словарь раздела, он за владельцем. #}
       <a href="/budget" class="{{ 'active' if active == 'budget' else '' }}">Бюджет</a>
       <a href="/forecast" class="{{ 'active' if active == 'forecast' else '' }}">Прогноз</a>
       <a href="/revenue" class="{{ 'active' if active == 'revenue' else '' }}">Оборот</a>

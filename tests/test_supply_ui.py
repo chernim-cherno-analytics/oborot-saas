@@ -401,6 +401,51 @@ def open_preview(p, base: str) -> None:
     p.wait_for_timeout(120)
 
 
+def set_preview_flag(on: bool) -> None:
+    """Флаг `settings.supply_sheets_preview` у единственной организации набора."""
+    con = sqlite3.connect(DB_PATH)
+    try:
+        row = con.execute("SELECT id, settings_json FROM orgs"
+                          " ORDER BY id LIMIT 1").fetchone()
+        if row is None:
+            return
+        try:
+            data = json.loads(row[1] or "{}")
+        except ValueError:
+            data = {}
+        if on:
+            data["supply_sheets_preview"] = True
+        else:
+            data.pop("supply_sheets_preview", None)
+        con.execute("UPDATE orgs SET settings_json = ? WHERE id = ?",
+                    (json.dumps(data, ensure_ascii=False), row[0]))
+        con.commit()
+    finally:
+        con.close()
+
+
+def seed_catalog(count: int) -> None:
+    """Каталог организации: `count` моделей, среди них «Тренч «Классика»».
+
+    Нужен F-04: поиск имеет смысл проверять только там, где найти можно то,
+    до чего в списке из двадцати не дойти. Пишется строками в `products` —
+    тем же ключом `base_name`, каким каталог ключуется во всём проекте.
+    """
+    con = sqlite3.connect(DB_PATH)
+    try:
+        org_id = con.execute("SELECT id FROM orgs ORDER BY id LIMIT 1").fetchone()[0]
+        names = ["Тренч «Классика»"] + [f"Модель {i:03d}" for i in range(count - 1)]
+        for i, base in enumerate(names):
+            con.execute(
+                "INSERT INTO products (org_id, ext_id, base_name, size, category,"
+                " sale_price, cost_price, cost_full, supplier, archived, excluded)"
+                " VALUES (?,?,?,?,'',0,0,0,'',0,0)",
+                (org_id, f"fix1-cat-{i}", base, "44"))
+        con.commit()
+    finally:
+        con.close()
+
+
 def add_member(email: str) -> None:
     """Участник организации: приглашений в UI нет, заводим строкой в БД."""
     import bcrypt
@@ -481,6 +526,10 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
                                     "password": "secret123", "org_name": "Бренд-UI"})
     check("владелец зарегистрирован", reg.status_code in (200, 302, 303),
           str(reg.status_code))
+    # SUPPLY-FIX-1 (F-08): вкладка предпросмотра теперь за флагом организации.
+    # Сценарии предпросмотра обязаны его включить явно — иначе они проверяли бы
+    # не предпросмотр, а собственную неудачу на несуществующей кнопке.
+    set_preview_flag(True)
     check("демо-данные загружены", c.post("/api/connect/demo").status_code == 200)
 
     with sync_playwright() as pw:
@@ -2144,8 +2193,16 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
         check("после назначения видно назначенное и свободное",
               "назначено:" in mats and "свободно:" in mats and "60" in mats,
               mats[:160])
-        check("и следующий шаг называет остаток числом",
-              "60" in (page.text_content("#pl-next") or ""),
+        # SUPPLY-FIX-1 (F-07): «распределите остаток» из подсказки убрано —
+        # свободный метраж это норма, а не задача, и правило `assign` стояло
+        # первым, закрывая собой перерасход и партии без плана и срока. Число
+        # остатка человек по-прежнему видит: на карточке материала (проверка
+        # выше) и в сводке. Проверяем именно это, а не исчезнувшую подсказку.
+        check("остаток назван числом там, где он и есть, — в сводке",
+              "60" in (page.text_content("#pl-summary") or ""),
+              (page.text_content("#pl-summary") or "")[:120])
+        check("а подсказка не выдаёт свободный остаток за следующий шаг",
+              "распределите" not in (page.text_content("#pl-next") or "").lower(),
               (page.text_content("#pl-next") or "")[:90])
 
         # ── 19. Отказ сохранения виден, ввод не потерян ────────────────────
@@ -2206,8 +2263,17 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
             " return r.width > 0 && r.height > 0; };"
             " return {next: ok('pl-next'), mats: ok('pl-materials'),"
             "  add: ok('pl-add-material'), batches: ok('pl-batches')}; }")
-        check("следующий шаг, материалы, партии и кнопка добавления на месте",
-              all(visible.values()), str(visible))
+        # SUPPLY-FIX-1 (F-07): блок «Следующий шаг» больше не обязан быть
+        # видимым ВСЕГДА — когда делать нечего, его на экране нет. Поэтому
+        # ожидание сверяется с тем, что ответил сервер, а не с константой
+        # «виден». Требовать прежнее «виден всегда» значило бы требовать от
+        # экрана ровно того утверждения, которое F-07 убирает.
+        code = c.get("/api/supply/planning").json()["next_step"]["code"]
+        check("материалы, партии и кнопка добавления на месте",
+              visible["mats"] and visible["add"] and visible["batches"],
+              str(visible))
+        check("а блок следующего шага виден ровно тогда, когда дело есть",
+              visible["next"] == (code != "ok"), f"code={code} {visible}")
         check("переключатель разделов доступен и на телефоне",
               page.is_visible("#sup-tab-plan") and page.is_visible("#sup-tab-preview"))
         page.set_viewport_size({"width": 1400, "height": 900})
@@ -2360,11 +2426,755 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
         ctx.close()
         browser.close()
 
+        # ── 23. SUPPLY-FIX-1: видимость раздела, hidden, поиск, снятие ──────
+        supply_fix_1_ui(pw, base, c)
+
     c.close()
     print(f"\nИТОГО: {len(PASS)} OK, {len(FAIL)} FAIL")
     for name in FAIL:
         print(f"  FAIL {name}")
     return 1 if FAIL else 0
+
+
+def close_hint(page) -> None:
+    """Закрыть модалку подсказки, если она открылась сама.
+
+    `_hints.html` показывает её при ПЕРВОМ заходе на страницу, и она лежит
+    поверх всего (`position: fixed; inset: 0; z-index: 1000`). Для проверок,
+    которые кликают по навигации или считают попадания `elementFromPoint`, это
+    посторонний слой: он перехватывает нажатия и делает вид, будто кнопка
+    перекрыта. Закрываем её так же, как человек, — кнопкой в самой модалке.
+    """
+    if page.evaluate("() => { const o = document.getElementById('hint-overlay');"
+                     " return !!o && o.classList.contains('open'); }"):
+        page.click("#hint-close")
+        page.wait_for_timeout(200)
+
+
+def supply_fix_1_ui(pw, base, c) -> None:
+    """SUPPLY-FIX-1 в настоящем браузере: F-01…F-06, F-08, F-11.
+
+    Здесь проверяется ПОВЕДЕНИЕ, а не разметка: `getComputedStyle` вместо
+    «в шаблоне есть строка», `elementFromPoint` вместо «кнопка в DOM»,
+    геометрия вместо «карточка отрисована», тело запроса вместо «поле есть в
+    форме».
+
+    КАЖДЫЙ ПУНКТ — ОТДЕЛЬНЫЙ ШАГ, И ЭТО НЕ СТИЛЬ. Прогон против дерева, где
+    правки ещё нет, обязан сказать про КАЖДЫЙ пункт, а не умереть на первом же
+    отсутствующем узле. Прежняя, линейная редакция этого не умела: на `ea1caff`
+    она падала исключением внутри `page.evaluate` в F-01, и девять оставшихся
+    пунктов не выполнялись вовсе — то есть их краснота ничем не была
+    доказана (D-42: непроведённая проверка не бывает ни зелёной, ни красной).
+    Теперь исключение внутри шага превращается в его собственную красную
+    строку, а соседние шаги идут своим чередом.
+    """
+    browser = pw.chromium.launch()
+    ctx = browser.new_context(viewport={"width": 1400, "height": 900})
+    ctx.add_cookies([{"name": k, "value": v, "domain": "127.0.0.1", "path": "/"}
+                     for k, v in c.cookies.items()])
+    errors: list[str] = []
+    dialogs: list[str] = []
+    page = ctx.new_page()
+    page.on("pageerror", lambda e: errors.append(str(e)))
+    page.on("dialog", lambda d: (dialogs.append(d.type), d.dismiss()))
+
+    steps = (
+        ("F-01", lambda: _fix1_f01(page, base)),
+        ("F-02", lambda: _fix1_f02(page, base)),
+        ("F-03", lambda: _fix1_f03(page)),
+        ("F-05", lambda: _fix1_f05(page, base, c)),
+        ("F-04", lambda: _fix1_f04(page, base, c)),
+        ("F-11", lambda: _fix1_f11(page, base, c, dialogs)),
+        ("F-07", lambda: _fix1_f07(page, base, c)),
+        ("F-08", lambda: _fix1_f08(page, base, errors)),
+    )
+    for label, run_step in steps:
+        try:
+            run_step()
+        except Exception as exc:  # noqa: BLE001 — важен отчёт, а не тип
+            check(f"{label}: шаг дошёл до конца без исключения", False,
+                  f"{type(exc).__name__}: "
+                  f"{str(exc).strip().splitlines()[0][:160]}")
+
+    check("за весь настольный сценарий не было ошибок в консоли",
+          not errors, str(errors)[:200])
+    ctx.close()
+    try:
+        _fix1_f06(browser, base, c)
+    except Exception as exc:  # noqa: BLE001
+        check("F-06: шаг дошёл до конца без исключения", False,
+              f"{type(exc).__name__}: {str(exc).strip().splitlines()[0][:160]}")
+    browser.close()
+
+
+def _fix1_f01(page, base) -> None:
+    """F-01: ссылка «Поставки» есть, видима и работает на всех десяти страницах."""
+    print("\n== F-01: раздел можно найти из любой страницы ==")
+    pages = ["turnover", "stocks", "assistant", "sizes", "replenish", "supply",
+             "budget", "forecast", "revenue", "lessons"]
+    missing, invisible, misplaced = [], [], []
+    for name in pages:
+        page.goto(f"{base}/{name}")
+        page.wait_for_timeout(250)
+        close_hint(page)
+        info = page.evaluate("""() => {
+          const nav = document.querySelector('nav.nav');
+          if (!nav) return {nav: false};
+          const a = nav.querySelector('a[href="/supply"]');
+          if (!a) return {nav: true, found: false};
+          const cs = getComputedStyle(a);
+          const box = a.getBoundingClientRect();
+          const links = [...nav.querySelectorAll('a')].map(x => x.getAttribute('href'));
+          const hit = document.elementFromPoint(box.left + box.width / 2,
+                                               box.top + box.height / 2);
+          return {nav: true, found: true, display: cs.display,
+                  visibility: cs.visibility, width: box.width, height: box.height,
+                  active: a.classList.contains('active'),
+                  clickable: hit === a || a.contains(hit),
+                  after: links[links.indexOf('/supply') - 1],
+                  before: links[links.indexOf('/supply') + 1]};
+        }""")
+        if not info.get("found"):
+            missing.append(name)
+            continue
+        if (info["display"] == "none" or info["visibility"] == "hidden"
+                or info["width"] <= 0 or info["height"] <= 0
+                or not info["clickable"]):
+            invisible.append((name, info))
+        if not (info.get("after") == "/sizes" and info.get("before") == "/budget"):
+            misplaced.append((name, info.get("after"), info.get("before")))
+    check("ссылка «Поставки» есть в навигации всех десяти страниц",
+          not missing, f"нет на: {missing}")
+    check("и она действительно видима и принимает нажатие мышью",
+          not invisible, str(invisible)[:200])
+    check("и стоит между «Заказ позиции» и «Бюджет»",
+          not misplaced, str(misplaced)[:200])
+
+    page.goto(f"{base}/supply")
+    page.wait_for_timeout(250)
+    close_hint(page)
+    active = page.evaluate(
+        "() => { const a = document.querySelector('nav.nav a[href=\"/supply\"]');"
+        " return a ? a.className : null; }")
+    check("на самой странице «Поставки» ссылка помечена активной",
+          active is not None and "active" in active, str(active))
+
+    # ОДИН ФРАГМЕНТ НА ДЕВЯТЬ СТРАНИЦ ДОБАВИЛ КЛАСС ТАМ, ГДЕ ЕГО НЕ БЫЛО, и это
+    # проверяется, а не объявляется. `primary-page` у «Оборачиваемости» стоял
+    # только в turnover.html и stocks.html — единственных, где объявлено правило
+    # `.nav a.primary-page { font-weight: 700 }`. Фрагмент ставит класс на всех
+    # девяти; на остальных семи правила нет, значит и вида он менять не должен.
+    page.goto(f"{base}/budget")
+    page.wait_for_timeout(250)
+    close_hint(page)
+    # `null` вместо стиля — это ответ «ссылки нет», а не исключение: шаг обязан
+    # дойти до конца и на дереве, где «Поставок» в навигации ещё не завели.
+    weights = page.evaluate("""() => {
+      const nav = document.querySelector('nav.nav');
+      const g = h => { const a = nav && nav.querySelector('a[href="' + h + '"]');
+                       return a ? getComputedStyle(a).fontWeight : null; };
+      return {turnover: g('/turnover'), stocks: g('/stocks'), supply: g('/supply')};
+    }""")
+    check("на странице без правила `primary-page` класс ничего не меняет",
+          weights["supply"] is not None
+          and weights["turnover"] == weights["stocks"] == weights["supply"],
+          str(weights))
+    page.goto(f"{base}/turnover")
+    page.wait_for_timeout(250)
+    close_hint(page)
+    bold = page.evaluate("""() => {
+      const nav = document.querySelector('nav.nav');
+      const g = h => getComputedStyle(nav.querySelector('a[href="' + h + '"]')).fontWeight;
+      return {turnover: g('/turnover'), stocks: g('/stocks')};
+    }""")
+    check("а там, где правило есть, «Оборачиваемость» осталась выделенной",
+          bold["turnover"] != bold["stocks"], str(bold))
+    # Нажатие делается через DOM, а не `page.click`: на дереве без ссылки
+    # `click` ждал бы её тридцать секунд и уронил шаг таймаутом, а нужно
+    # поведение — «переход произошёл» или «переходить не по чему».
+    page.evaluate("""() => {
+      const a = document.querySelector('nav.nav a[href="/supply"]');
+      if (a) a.click();
+    }""")
+    page.wait_for_timeout(500)
+    check("ссылка работает: с «Оборачиваемости» переход приводит на /supply",
+          page.url.endswith("/supply"), page.url)
+
+def _fix1_f02(page, base) -> None:
+    """F-02: атрибут hidden действительно скрывает, а не оставляет полоску."""
+    print("\n== F-02: [hidden] скрывает, а не оставляет полоску в 11 px ==")
+    page.goto(f"{base}/supply")
+    page.wait_for_timeout(700)
+    close_hint(page)
+    closed = page.evaluate("""() => ({
+      mat: document.getElementById('pl-mat-form').getBoundingClientRect().height,
+      item: document.getElementById('pl-item-form').getBoundingClientRect().height,
+      batch: document.getElementById('pl-batch-form').getBoundingClientRect().height,
+      display: getComputedStyle(document.getElementById('pl-mat-form')).display,
+    })""")
+    check("закрытые формы имеют нулевую высоту, а не рисуются полосками",
+          closed["mat"] == 0 and closed["item"] == 0 and closed["batch"] == 0,
+          str(closed))
+    check("и это именно display:none, а не схлопнувшийся flex",
+          closed["display"] == "none", closed["display"])
+
+    page.click("#pl-add-item")
+    page.wait_for_timeout(250)
+    page.select_option("#pl-item-kind", "catalog")
+    page.wait_for_timeout(120)
+    cat = page.evaluate("""() => ({
+      title: getComputedStyle(document.getElementById('pl-item-title').parentElement).display,
+      sketch: getComputedStyle(document.getElementById('pl-item-sketch').parentElement).display,
+      base: getComputedStyle(document.getElementById('pl-item-base').parentElement).display,
+    })""")
+    check("вид «вещь каталога»: название новинки и эскиз скрыты по-настоящему",
+          cat["title"] == "none" and cat["sketch"] == "none",
+          str(cat))
+    check("а поле выбора модели показано", cat["base"] != "none", str(cat))
+    page.select_option("#pl-item-kind", "draft")
+    page.wait_for_timeout(120)
+    draft = page.evaluate("""() => ({
+      base: getComputedStyle(document.getElementById('pl-item-base').parentElement).display,
+      title: getComputedStyle(document.getElementById('pl-item-title').parentElement).display,
+    })""")
+    check("вид «новинка»: поле каталога скрыто, а название показано",
+          draft["base"] == "none" and draft["title"] != "none", str(draft))
+    page.click("#pl-add-item")
+    page.wait_for_timeout(150)
+
+    page.click("#pl-add-batch")
+    page.wait_for_timeout(250)
+    page.select_option("#pl-batch-due-kind", "unknown")
+    page.wait_for_timeout(120)
+    unknown = page.evaluate("""() => ({
+      text: getComputedStyle(document.getElementById('pl-batch-due-text').parentElement).display,
+      date: getComputedStyle(document.getElementById('pl-batch-due-date').parentElement).display,
+      source: getComputedStyle(document.getElementById('pl-batch-due-source').parentElement).display,
+    })""")
+    check("при «срок неизвестен» скрыты «Срок словами» и «Дата»",
+          unknown["text"] == "none" and unknown["date"] == "none", str(unknown))
+    check("а «Источник срока» остаётся: сервер его хранит и карточка показывает",
+          unknown["source"] != "none", str(unknown))
+
+def _fix1_f03(page) -> None:
+    """F-03: скрытое на экране поле не уходит на сервер и не пропадает молча.
+
+    Шаг продолжает состояние F-02: форма партии уже открыта. Если предыдущий
+    шаг упал, этот честно упадёт своей строкой — и это лучше, чем не выполниться
+    вовсе.
+    """
+    print("\n== F-03: набранная дата не пропадает молча ==")
+    bodies: list = []
+    page.on("request", lambda r: bodies.append(r.post_data)
+            if r.method == "POST" and r.url.endswith("/planning/batches") else None)
+    page.select_option("#pl-batch-due-kind", "exact")
+    page.wait_for_timeout(120)
+    page.fill("#pl-batch-due-date", "2026-10-31")
+    page.select_option("#pl-batch-due-kind", "text")
+    page.wait_for_timeout(120)
+    page.fill("#pl-batch-due-text", "к середине ноября")
+    page.fill("#pl-batch-title", "Партия со словами")
+    page.click("#pl-batch-form button[type=submit]")
+    page.wait_for_timeout(1400)
+    sent = [b for b in bodies if b]
+    check("форма партии ушла на сервер", bool(sent), str(bodies)[:120])
+    check("дата, скрытая после смены вида срока, в тело запроса НЕ попала",
+          sent and "due_date" not in sent[-1], (sent[-1] if sent else "")[:200])
+    check("а текст срока — попал", sent and "due_text" in sent[-1],
+          (sent[-1] if sent else "")[:200])
+    # Успех проверяется появлением партии, а не пустотой поля ошибки: после
+    # удачного сохранения форма закрывается и очищается, поэтому `#pl-batch-err`
+    # в DOM больше нет — ожидание этого узла и было бы «проверкой», которая
+    # висит тридцать секунд и ничего не доказывает.
+    saved_batch = page.evaluate("""() => {
+      const card = [...document.querySelectorAll('[data-pl="batch"]')]
+        .find(x => x.textContent.indexOf('Партия со словами') >= 0);
+      return {saved: !!card,
+              text: card ? card.textContent.slice(0, 120) : '',
+              formClosed: document.getElementById('pl-batch-form').hidden};
+    }""")
+    check("и партия сохранилась, а не получила отказ",
+          saved_batch["saved"] and saved_batch["formClosed"], str(saved_batch)[:200])
+    check("а срок на карточке — тот, что человек написал словами",
+          "к середине ноября" in saved_batch["text"], saved_batch["text"])
+
+def _fix1_f05(page, base, c) -> None:
+    """F-05: сохранённая вещь видна, и результат сохранения тоже."""
+    print("\n== F-05: сохранённая вещь видна, а не «0 шт» ==")
+    before_count = page.text_content("#pl-batch-count") or ""
+    page.click("#pl-add-item")
+    page.wait_for_timeout(250)
+    page.select_option("#pl-item-kind", "draft")
+    page.fill("#pl-item-title", "Вещь без партий Ф5")
+    page.click("#pl-item-form button[type=submit]")
+    page.wait_for_timeout(1500)
+    row = page.evaluate("""() => {
+      const r = [...document.querySelectorAll('[data-pl="item"]')]
+        .find(x => x.textContent.indexOf('Вещь без партий Ф5') >= 0);
+      if (!r) return null;
+      const btn = r.querySelector('button');
+      const box = r.getBoundingClientRect();
+      return {text: r.textContent, button: btn ? btn.textContent : null,
+              top: box.top, bottom: box.bottom, height: box.height,
+              inView: box.top >= 0 && box.bottom <= window.innerHeight};
+    }""")
+    check("после сохранения вещь ВИДНА строкой в блоке, а не только в списке формы",
+          row is not None, "строки вещи нет в DOM")
+    check("в строке названо, что партий нет, и есть кнопка их создать",
+          row and "плановых партий нет" in row["text"]
+          and row["button"] == "Запланировать партию", str(row)[:200])
+    after_count = page.text_content("#pl-batch-count") or ""
+    check("счётчик блока вырос: он считает вещи вместе с партиями",
+          before_count != after_count,
+          f"было {before_count!r} стало {after_count!r}")
+    check("новая строка прокручена в область видимости",
+          row and row["inView"], str(row)[:160])
+    toast = page.evaluate(
+        "() => { const t = document.querySelector('#toast-root .toast');"
+        " return t ? t.textContent : null; }")
+    check("и человеку сказано «Сохранено»", toast == "Сохранено", str(toast))
+
+    page.evaluate("""() => {
+      const r = [...document.querySelectorAll('[data-pl="item"]')]
+        .find(x => x.textContent.indexOf('Вещь без партий Ф5') >= 0);
+      const b = r ? r.querySelector('button') : null;
+      if (b) b.click();
+    }""")
+    page.wait_for_timeout(400)
+    picked = page.evaluate("""() => {
+      const f = document.getElementById('pl-batch-form');
+      const sel = document.getElementById('pl-batch-item');
+      const opt = sel && sel.selectedIndex >= 0 ? sel.options[sel.selectedIndex] : null;
+      return {open: !!f && !f.hidden, label: opt ? opt.textContent : null};
+    }""")
+    check("кнопка строки открывает форму партии С ЭТОЙ вещью выбранной",
+          picked["open"] and picked["label"]
+          and "Вещь без партий Ф5" in picked["label"], str(picked))
+    page.click("#pl-add-batch")
+    page.wait_for_timeout(200)
+
+    # Тридцать материалов: новая карточка встаёт ВВЕРХУ, форма остаётся внизу.
+    for i in range(30):
+        c.post("/api/supply/planning/materials",
+               json={"title": f"Массовый материал {i:02d}", "qty": "5",
+                     "op_id": f"f5-mass-{i}"})
+    page.goto(f"{base}/supply")
+    page.wait_for_timeout(900)
+    page.click("#pl-add-material")
+    page.wait_for_timeout(300)
+    page.fill("#pl-mat-title", "Материал после тридцати")
+    page.fill("#pl-mat-qty", "12")
+    page.click("#pl-mat-form button[type=submit]")
+    page.wait_for_timeout(1600)
+    # Карточка ищется по `#pl-materials .pl-card` — узлу, который есть и до
+    # этого пакета. Через новый `data-pl` замер на старом дереве вернул бы
+    # `None`, и «карточка не в окне» доказывало бы отсутствие атрибута, а не
+    # неверное положение. Нужна геометрия существующей карточки.
+    fresh = page.evaluate("""() => {
+      const cards = [...document.querySelectorAll('#pl-materials .pl-card')];
+      const card = cards.find(
+        x => x.textContent.indexOf('Материал после тридцати') === 0);
+      if (!card) return {found: false, total: cards.length};
+      const box = card.getBoundingClientRect();
+      return {found: true, total: cards.length,
+              top: Math.round(box.top), bottom: Math.round(box.bottom),
+              h: window.innerHeight,
+              index: cards.indexOf(card),
+              flashed: card.classList.contains('pl-flash'),
+              focused: document.activeElement === card};
+    }""")
+    check("карточка тридцать первого материала вообще отрисована",
+          fresh["found"], str(fresh))
+    check("при тридцати материалах новая карточка оказывается в окне",
+          fresh["found"] and 0 <= fresh["top"] <= fresh["h"], str(fresh))
+    check("она подсвечена и получила фокус",
+          fresh["found"] and fresh["flashed"] and fresh["focused"], str(fresh))
+
+def _fix1_f04(page, base, c) -> None:
+    """F-04: модель каталога ищется, а не выбирается из первых двадцати."""
+    print("\n== F-04: модель ищется, а не выбирается из двадцати ==")
+    seed_catalog(60)
+    page.goto(f"{base}/supply")
+    page.wait_for_timeout(900)
+    page.click("#pl-add-item")
+    page.wait_for_timeout(300)
+    page.select_option("#pl-item-kind", "catalog")
+    page.wait_for_timeout(120)
+    kind_tag = page.evaluate(
+        "() => document.getElementById('pl-item-base').tagName")
+    check("выбор модели — поле ввода, а не список из двадцати",
+          kind_tag == "INPUT", str(kind_tag))
+    # Ввод через DOM с событием `input` — тем же, что порождает клавиатура.
+    # `page.fill` на дереве, где здесь всё ещё `<select>`, бросил бы исключение
+    # и унёс бы с собой остальные проверки шага; нужен ответ «подсказка не
+    # появилась», а не отсутствие ответа.
+    page.evaluate("""() => {
+      const el = document.getElementById('pl-item-base');
+      if (!el) return;
+      el.focus();
+      el.value = 'тренч';
+      el.dispatchEvent(new Event('input', {bubbles: true}));
+    }""")
+    page.wait_for_timeout(900)
+    listed = page.evaluate("""() => {
+      const box = document.getElementById('pl-item-base-list');
+      if (!box) return {hidden: true, display: 'none', opts: [], missing: true};
+      const opts = [...box.querySelectorAll('.pl-combo-opt')].map(o => o.textContent);
+      return {hidden: box.hidden, display: getComputedStyle(box).display, opts: opts};
+    }""")
+    check("по «тренч» подсказка показывает найденную модель",
+          not listed["hidden"] and listed["display"] != "none"
+          and any("Тренч «Классика»" in o for o in listed["opts"]),
+          str(listed)[:200])
+    check("и рядом с именем названо число размеров",
+          any("размеров" in o for o in listed["opts"]), str(listed["opts"][:2]))
+    page.focus("#pl-item-base")
+    page.keyboard.press("ArrowDown")
+    page.wait_for_timeout(80)
+    page.keyboard.press("Enter")
+    page.wait_for_timeout(150)
+    chosen = page.evaluate(
+        "() => { const el = document.getElementById('pl-item-base');"
+        " return el ? el.value : null; }")
+    check("выбор с клавиатуры (↓ Enter) подставляет каноническое имя",
+          chosen == "Тренч «Классика»", repr(chosen))
+    page.evaluate("""() => {
+      const b = document.querySelector('#pl-item-form button[type=submit]');
+      if (b) b.click();
+    }""")
+    page.wait_for_timeout(1600)
+    board = c.get("/api/supply/planning").json()
+    check("вещь создана именно с этим base_name",
+          any(i["base_name"] == "Тренч «Классика»" for i in board["items"]),
+          str([i["base_name"] for i in board["items"]][:5]))
+
+
+def _fix1_f11(page, base, c, dialogs) -> None:
+    """F-11: «Снять» спрашивает на месте кнопки и даёт вернуть назначение."""
+    print("\n== F-11: снятие назначения спрашивает и обратимо ==")
+    mat = c.post("/api/supply/planning/materials",
+                 json={"title": "Ткань для снятия", "qty": "100",
+                       "op_id": "f11-mat"}).json()
+    mat_id = [m for m in mat["materials"] if m["title"] == "Ткань для снятия"][0]["id"]
+    it = c.post("/api/supply/planning/items",
+                json={"kind": "draft", "title": "Вещь для снятия",
+                      "op_id": "f11-item"}).json()
+    item_id = [i for i in it["items"] if i["title"] == "Вещь для снятия"][0]["id"]
+    ba = c.post("/api/supply/planning/batches",
+                json={"item_id": item_id, "title": "Партия для снятия",
+                      "plan_qty": "5", "op_id": "f11-batch"}).json()
+    batch_id = [b for b in ba["batches"] if b["title"] == "Партия для снятия"][0]["id"]
+    c.post("/api/supply/planning/assignments",
+           json={"material_id": mat_id, "batch_id": batch_id, "qty": "40",
+                 "note": "на манжеты", "op_id": "f11-assign"})
+    page.goto(f"{base}/supply")
+    page.wait_for_timeout(1000)
+
+    # КАРТОЧКА ИЩЕТСЯ ПО ТОМУ, ЧТО ЕСТЬ НА ОБОИХ ДЕРЕВЬЯХ. `#pl-batches
+    # .pl-card` и `.pl-assign` существовали и до этого пакета, а `data-pl`
+    # добавлен им. Опираться на новый атрибут значило бы получить на старом
+    # дереве «элемента нет» вместо «кнопка удалила сразу» — то есть доказать
+    # отсутствие разметки вместо неверного поведения.
+    CARD_JS = """
+      const cards = [...document.querySelectorAll('#pl-batches .pl-card')];
+      const card = cards.find(x => x.textContent.indexOf('Партия для снятия') >= 0);
+    """
+
+    def assign_line() -> str:
+        return page.evaluate("""() => {
+          %s
+          if (!card) return "";
+          const line = [...card.querySelectorAll('.pl-assign')]
+            .find(l => l.textContent.indexOf('Ткань для снятия') >= 0);
+          return line ? line.textContent : "";
+        }""" % CARD_JS)
+
+    check("назначение видно на карточке партии", "40" in assign_line(),
+          assign_line()[:120])
+    page.evaluate("""() => {
+      %s
+      if (!card) return;
+      const line = [...card.querySelectorAll('.pl-assign')]
+        .find(l => l.textContent.indexOf('Ткань для снятия') >= 0);
+      if (!line) return;
+      const btn = [...line.querySelectorAll('button')]
+        .find(b => b.textContent === 'Снять');
+      if (btn) btn.click();
+    }""" % CARD_JS)
+    page.wait_for_timeout(600)
+    asked = page.evaluate("""() => {
+      %s
+      const box = card ? card.querySelector('.pl-confirm') : null;
+      return box ? box.textContent : null;
+    }""" % CARD_JS)
+    check("одно нажатие «Снять» ничего не удаляет, а спрашивает",
+          asked is not None and "Снять?" in asked and "Да" in asked and "Нет" in asked,
+          str(asked))
+    check("и назначение всё ещё на месте", "40" in assign_line(), assign_line()[:120])
+    check("системного окна confirm() при этом не было", not dialogs, str(dialogs))
+
+    page.evaluate("""() => {
+      %s
+      if (!card) return;
+      const no = [...card.querySelectorAll('.pl-confirm button')]
+        .find(b => b.textContent === 'Нет');
+      if (no) no.click();
+    }""" % CARD_JS)
+    page.wait_for_timeout(250)
+    check("«Нет» возвращает кнопку и оставляет назначение",
+          "40" in assign_line(), assign_line()[:120])
+
+    page.evaluate("""() => {
+      %s
+      if (!card) return;
+      const line = [...card.querySelectorAll('.pl-assign')]
+        .find(l => l.textContent.indexOf('Ткань для снятия') >= 0);
+      if (!line) return;
+      const btn = [...line.querySelectorAll('button')]
+        .find(b => b.textContent === 'Снять');
+      if (btn) btn.click();
+    }""" % CARD_JS)
+    page.wait_for_timeout(400)
+    page.evaluate("""() => {
+      %s
+      if (!card) return;
+      const yes = [...card.querySelectorAll('.pl-confirm button')]
+        .find(b => b.textContent === 'Да');
+      if (yes) yes.click();
+    }""" % CARD_JS)
+    page.wait_for_timeout(1500)
+    check("после «Да» назначение снято", assign_line() == "", assign_line()[:120])
+    undo = page.evaluate("""() => {
+      const t = [...document.querySelectorAll('#toast-root .toast')].pop();
+      if (!t) return null;
+      const b = t.querySelector('button');
+      return {text: t.textContent, action: b ? b.textContent : null};
+    }""")
+    check("и предложено вернуть",
+          undo and "Назначение снято" in undo["text"] and undo["action"] == "Вернуть",
+          str(undo))
+    page.evaluate("""() => {
+      const t = [...document.querySelectorAll('#toast-root .toast')].pop();
+      const b = t ? t.querySelector('button') : null;
+      if (b) b.click();
+    }""")
+    page.wait_for_timeout(1600)
+    back = assign_line()
+    check("«Вернуть» восстанавливает назначение с тем же количеством",
+          "40" in back, back[:120])
+    check("и confirm() не появлялся ни разу за весь сценарий",
+          not dialogs, str(dialogs))
+
+def _fix1_f07(page, base, c) -> None:
+    """F-07: делать нечего — блока «Следующий шаг» на экране нет.
+
+    Отказ сервера от правила `assign` проверяется юнитами в
+    `test_supply_planning.py`; здесь проверяется ВТОРАЯ половина того же
+    пункта — отрисовка. Она жила отдельно от серверной: `render()` красил блок
+    в «ok» и всё равно показывал, поэтому человек читал «План собран:
+    материалы распределены» ровно тогда, когда сто метров лежали
+    нераспределёнными.
+
+    Ответ сервера здесь подменяется намеренно. Довести общую организацию
+    набора до `code=ok` живым путём нельзя надёжно: в ней к этому шагу уже
+    лежат партии без плана и перерасход из соседних сценариев, и правило `ok`
+    не наступит — проверка молча превратилась бы в «блок виден», то есть
+    всегда зелёную на обеих ветках. Подменяется РОВНО `next_step`, остальная
+    доска остаётся настоящей; браузер, DOM и стили — тоже настоящие.
+    """
+    print("\n== F-07: при «делать нечего» блок следующего шага скрыт ==")
+    live = c.get("/api/supply/planning").json()
+    route_re = re.compile(r"/api/supply/planning$")
+
+    def serve(code: str, text: str) -> dict:
+        body = dict(live)
+        body["next_step"] = {"code": code, "text": text}
+        page.unroute(route_re)
+        page.route(route_re, lambda route: route.fulfill(
+            status=200, content_type="application/json",
+            body=json.dumps(body, ensure_ascii=False)))
+        page.goto(f"{base}/supply")
+        page.wait_for_timeout(900)
+        return page.evaluate("""() => {
+          const n = document.getElementById('pl-next');
+          if (!n) return {missing: true};
+          const cs = getComputedStyle(n);
+          const box = n.getBoundingClientRect();
+          return {missing: false, hidden: n.hidden, display: cs.display,
+                  h: Math.round(box.height),
+                  text: n.textContent.replace(/\\s+/g, ' ').trim()};
+        }""")
+
+    todo = serve("plan_qty", "У партии «Проба» нет плана — укажите количество.")
+    check("когда дело есть — блок показан и называет его",
+          not todo["missing"] and not todo["hidden"]
+          and todo["display"] != "none" and todo["h"] > 0
+          and "нет плана" in todo["text"], str(todo)[:200])
+
+    done = serve("ok", "План собран: материалы распределены, у партий "
+                       "есть план и срок.")
+    check("когда делать нечего — блок скрыт атрибутом hidden",
+          not done["missing"] and done["hidden"], str(done)[:200])
+    check("и скрыт по-настоящему: display none и нулевая высота",
+          not done["missing"] and done["display"] == "none" and done["h"] == 0,
+          str(done)[:200])
+    check("и с экрана ушло утверждение «материалы распределены»",
+          not done["missing"] and "распределены" not in done["text"],
+          str(done)[:200])
+    page.unroute(route_re)
+
+
+def _fix1_f08(page, base, errors) -> None:
+    """F-08: вкладка предпросмотра существует только у организации с флагом."""
+    print("\n== F-08: предпросмотр показан только организации с флагом ==")
+    set_preview_flag(False)
+    page.goto(f"{base}/supply")
+    page.wait_for_timeout(700)
+    gated = page.evaluate("""() => ({
+      tab: !!document.getElementById('sup-tab-preview'),
+      panel: !!document.getElementById('sup-view-preview'),
+      plan: !!document.getElementById('sup-view-plan'),
+      planVisible: document.getElementById('sup-view-plan')
+        ? getComputedStyle(document.getElementById('sup-view-plan')).display !== 'none'
+        : false,
+    })""")
+    check("без флага вкладки предпросмотра на странице нет",
+          not gated["tab"] and not gated["panel"], str(gated))
+    check("а план производства остаётся и виден",
+          gated["plan"] and gated["planVisible"], str(gated))
+    check("страница без предпросмотра работает без ошибок в консоли",
+          not errors, str(errors)[:200])
+    set_preview_flag(True)
+    page.goto(f"{base}/supply")
+    page.wait_for_timeout(700)
+    check("с флагом вкладка снова на месте и переключает раздел",
+          page.evaluate("() => !!document.getElementById('sup-tab-preview')"),
+          "вкладки нет")
+    page.click("#sup-tab-preview")
+    page.wait_for_timeout(300)
+    check("переключение работает: панель предпросмотра показана",
+          page.evaluate("() => getComputedStyle("
+                        "document.getElementById('sup-view-preview')).display")
+          != "none", "панель не открылась")
+
+
+def _fix1_f06(browser, base, c) -> None:
+    """F-06: на телефоне ни одна кнопка не лежит под фиксированной плашкой.
+
+    Свой контекст, а не общая страница: 390×844 — это другое устройство, и
+    менять размер окна у уже открытой страницы значило бы проверять поведение
+    ресайза, а не мобильную раскладку.
+
+    ЧЕСТНАЯ ГРАНИЦА ДОКАЗАТЕЛЬСТВА. Точный hit-test из ТЗ (кнопки «Создать
+    плановую партию» и «Добавить материал» на /supply при 390×844 отдают
+    `A.fresh-chip`) НА `ea1caff` НЕ ВОСПРОИЗВЁЛСЯ. Замерено: после прокрутки в
+    самый низ обе кнопки занимают 719..757, плашка свежести — 773..826, между
+    ними 16 px. Перебраны состояния: пустая организация, демо без плана, 1/2/3/
+    4/6/9/14 материалов, `is_mobile` True и False, искусственно удлинённый до
+    двух строк текст плашки. Ни одно не дало перекрытия.
+    Поэтому ниже РАЗДЕЛЕНО:
+      • сам hit-test на /supply — GUARD: он зелёный и на старом дереве, и
+        выдавать его за RED нельзя (D-42);
+      • запас снизу и место тоста — настоящий RED, они и есть то, что этот
+        пакет изменил.
+    Статус точного КП: NOT REPRODUCED, решение за владельцем. Подменять его
+    другой страницей я не стал: механизм там тот же, но это другой КП.
+    """
+    print("\n== F-06: 390x844 — кнопки не под чипом свежести и кнопкой «?» ==")
+    mob = browser.new_context(viewport={"width": 390, "height": 844},
+                              is_mobile=True, has_touch=True)
+    mob.add_cookies([{"name": k, "value": v, "domain": "127.0.0.1", "path": "/"}
+                     for k, v in c.cookies.items()])
+    mpage = mob.new_page()
+    mpage.goto(f"{base}/supply")
+    mpage.wait_for_timeout(1200)
+    close_hint(mpage)
+    mpage.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+    mpage.wait_for_timeout(500)
+    probe = mpage.evaluate("""() => {
+      const bad = [], seen = [];
+      for (const btn of document.querySelectorAll('button.btn')) {
+        const box = btn.getBoundingClientRect();
+        if (box.width === 0 || box.height === 0) continue;
+        const x = box.left + box.width / 2, y = box.top + box.height / 2;
+        // Точка ЗА пределами окна — не «перекрытая кнопка»: elementFromPoint
+        // там законно отдаёт null. Спрашиваем только про то, что видно.
+        if (y < 0 || y > window.innerHeight || x < 0 || x > window.innerWidth) continue;
+        seen.push(btn.textContent.replace(/\\s+/g, ' ').trim());
+        const hit = document.elementFromPoint(x, y);
+        if (!hit) { bad.push([btn.textContent.slice(0, 24), 'null']); continue; }
+        if (hit !== btn && !btn.contains(hit)) {
+          bad.push([btn.textContent.slice(0, 24),
+                    hit.tagName + '.' + (hit.className || '')]);
+        }
+      }
+      const present = [...document.querySelectorAll('button.btn')]
+        .map(b => b.textContent.replace(/\\s+/g, ' ').trim())
+        .filter(t => t.indexOf('Создать плановую партию') >= 0
+                  || t.indexOf('Добавить материал') >= 0);
+      return {bad: bad, seen: seen, present: present};
+    }""")
+    # Выборка обязана быть непустой, а обе кнопки из ТЗ — существовать на
+    # странице. Без этих строк «перекрытых нет» стало бы зелёным и на странице,
+    # где кнопок не осталось вовсе, — проверка перестала бы что-либо значить,
+    # не покраснев.
+    # Существование и осмотр РАЗНЕСЕНЫ намеренно. При прокрутке в самый низ
+    # «Добавить материал» уходит выше края окна, и требовать её осмотра значило
+    # бы требовать hit-test точки, которой на экране нет: `elementFromPoint`
+    # там законно отдаёт null, и красная строка говорила бы о положении окна,
+    # а не о перекрытии.
+    check("hit-test смотрел на реальные кнопки, а не на пустую выборку",
+          len(probe["seen"]) >= 5, f"осмотрено {len(probe['seen'])}: "
+          f"{probe['seen'][:8]}")
+    check("обе кнопки, названные в ТЗ по F-06, на странице есть",
+          len(probe["present"]) == 2, f"нашлось {probe['present']}")
+    # GUARD, НЕ RED: на `ea1caff` эта строка тоже зелёная (замеры — в описании
+    # шага). Она защищает от появления перекрытия, но не доказывает F-06.
+    check("GUARD (зелено и на baseline): на /supply ни одна кнопка не "
+          "перекрыта чужим элементом",
+          probe["bad"] == [], str(probe["bad"])[:300])
+    chip = mpage.evaluate("""() => {
+      const el = document.getElementById('fresh-chip');
+      const sp = document.getElementById('hint-bottom-spacer');
+      return {chip: el ? getComputedStyle(el).position : null,
+              spacer: sp ? getComputedStyle(sp).display : null,
+              spacerH: sp ? sp.getBoundingClientRect().height : 0};
+    }""")
+    check("запас под фиксированными элементами на телефоне включён",
+          chip["spacer"] == "block" and chip["spacerH"] >= 70, str(chip))
+    toast_pos = mpage.evaluate(
+        "() => getComputedStyle(document.getElementById('toast-root')).bottom")
+    check("тост поднят над кнопкой «?», а не лежит на ней",
+          toast_pos == "72px", str(toast_pos))
+    # Настоящий RED с геометрией: живой тост и кнопка «?» не должны занимать
+    # общих точек. Инструмент — пересечение прямоугольников, а не
+    # elementFromPoint: тост прозрачен для указателя, поэтому hit-test прошёл бы
+    # и там, где тост лежит на кнопке — и «доказал» бы отсутствие того, что
+    # человек видит своими глазами.
+    overlap = mpage.evaluate("""() => {
+      const root = document.getElementById('toast-root');
+      const fab = document.getElementById('hint-fab');
+      if (!root || !fab) return {ok: false, why: 'нет toast-root или кнопки «?»'};
+      const t = document.createElement('div');
+      t.className = 'toast';
+      t.textContent = 'Сохранено';
+      root.appendChild(t);
+      const a = t.getBoundingClientRect(), b = fab.getBoundingClientRect();
+      const dx = Math.min(a.right, b.right) - Math.max(a.left, b.left);
+      const dy = Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top);
+      const res = {ok: true, overlapX: Math.round(dx), overlapY: Math.round(dy),
+                   toast: [Math.round(a.top), Math.round(a.bottom),
+                           Math.round(a.left), Math.round(a.right)],
+                   fab: [Math.round(b.top), Math.round(b.bottom),
+                         Math.round(b.left), Math.round(b.right)]};
+      t.remove();
+      return res;
+    }""")
+    check("живой тост и кнопка «?» не имеют ни одной общей точки",
+          overlap["ok"] and not (overlap["overlapX"] > 0
+                                 and overlap["overlapY"] > 0),
+          str(overlap))
+    mob.close()
 
 
 if __name__ == "__main__":
