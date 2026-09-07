@@ -1,5 +1,19 @@
 # Independent audit queue
 
+## Completed local CLAIM — A08 complete execution evidence
+
+BRANCH: codex/audit-a08-complete-evidence. BASE: ece5ffe.
+FILES: app/api.py, tests/test_execution.py, docs/audit_a08_evidence.md,
+docs/audit_queue.md. SOURCE: A08 requires equal completeness flags for partial,
+full, zero and conflicting receipts. Receipts already use complete-evidence
+confirmation; outcome still confirms a partial receipt. Earlier narrow A08
+package deliberately left this discrepancy, now addressed under the owner's
+instruction to finish all non-formula work.
+DONE_WHEN: shared evidence summary preserves receipt API semantics, outcome
+matches it on partial receipt and existing full/zero/conflict regressions pass.
+No quantity arithmetic, accounting formula, schema or receipt-status change.
+RESULT: RED174/2; GREEN execution176/0, history47/0, planner363/0.
+
 ## Completed local CLAIM — explicit order actions
 
 BRANCH: codex/audit-order-action-labels. BASE: c0014db.
