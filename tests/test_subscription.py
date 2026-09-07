@@ -378,6 +378,26 @@ def main() -> int:
             "ввод токена МойСклада": c.post("/api/connect/moysklad",
                                             json={"token": "x"}),
             "настройки уведомлений": c.post("/api/notify/settings", json={}),
+            # SUPPLY-FIX-2: новые пишущие ручки плана. Гейт стоит на приложении
+            # и запрещает по умолчанию, поэтому сюда они попадают не «на всякий
+            # случай»: сторож проверяет запросом, а не чтением списка, — и
+            # незакрытая ручка иначе была бы для него невидима (см. шапку).
+            # Идентификатор заведомо чужой: до тела запрос не доходит, отказ
+            # обязан прийти от гейта, а не от поиска строки.
+            "план: убрать материал": c.post(
+                "/api/supply/planning/materials/999999/archive", json={}),
+            "план: вернуть материал": c.post(
+                "/api/supply/planning/materials/999999/restore", json={}),
+            "план: правка вещи": c.post(
+                "/api/supply/planning/items/999999/update", json={}),
+            "план: убрать вещь": c.post(
+                "/api/supply/planning/items/999999/archive", json={}),
+            "план: вернуть вещь": c.post(
+                "/api/supply/planning/items/999999/restore", json={}),
+            "план: убрать партию": c.post(
+                "/api/supply/planning/batches/999999/archive", json={}),
+            "план: вернуть партию": c.post(
+                "/api/supply/planning/batches/999999/restore", json={}),
         }
         for label, resp in blocked.items():
             check(f"readonly закрывает: {label}", resp.status_code == 402,

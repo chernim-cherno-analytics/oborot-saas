@@ -37,6 +37,16 @@
 3. ЧУЖУЮ ПРАВКУ НЕ ЗАТИРАЕМ. У каждой изменяемой строки есть `rev`; клиент
    присылает тот, который видел. Разошлось — 409 и текущее состояние, чтобы
    человек увидел, что изменилось, а не узнал об этом от коллеги.
+
+УБРАННОЕ НЕ СТИРАЕТСЯ (SUPPLY-FIX-2). У материала, вещи и партии есть отметка
+`archived_at`: строка уходит с доски и остаётся в базе вместе со своей историей.
+Убранная строка отвечает тем же «не найдено», что чужая и несуществующая.
+
+Архивация ПАРТИИ и архивация КАТАЛОЖНОЙ вещи здесь СОЗНАТЕЛЬНО отсутствуют, и
+это не пробел: по ТЗ архивация партии физически снимает её назначения, а чего
+ждать от восстановления — вернуть их или только партию — не решено. Выбор
+продуктовый, он за владельцем (`AGENTS.md` §3); разбор — `DECISIONS.md` D-57 п. 5
+и `TECH_DEBT.md` `SUPPLY-FIX-2-REG`. До ответа поведения по умолчанию нет вовсе.
 """
 from __future__ import annotations
 
@@ -97,6 +107,45 @@ class StaleWrite(PlanningError):
 
 class DuplicateOp(PlanningError):
     """Тот же поступок уже записан — повторный POST не применяется дважды."""
+
+
+class ArchivedCatalogItem(PlanningError):
+    """Эта модель каталога в плане есть, но убрана — 409 до подтверждения.
+
+    Отдельный тип, а не общий `InUse`, потому что это не тупик, а ВОПРОС:
+    состояние поправимо одним подтверждённым действием человека, и интерфейсу
+    надо отличать «нельзя» от «можно, но подтвердите». Текст называет модель по
+    имени: человек ищет её в каталоге и должен узнать в отказе ровно то, что
+    набрал.
+    """
+
+
+def _wants_restore(payload: dict) -> bool:
+    """Явное подтверждение возврата модели из архива.
+
+    Строго `is True` и строка `"true"` — и ничего больше. Ни `1`, ни непустая
+    строка, ни `"нет"` подтверждением не считаются: подтверждение, которое можно
+    выдать случайной истинностью значения, — это не подтверждение.
+    """
+    raw = payload.get("confirm_restore")
+    if raw is True:
+        return True
+    return isinstance(raw, str) and raw.strip().casefold() == "true"
+
+
+class InUse(PlanningError):
+    """Строку нельзя убрать, пока на неё опирается другая — 409 с числом.
+
+    Отдельный тип, а не `ValidationError`: ввод человека здесь безупречен, и
+    400 сказало бы ему, что он написал что-то не то. Отказ вызван СОСТОЯНИЕМ
+    соседних строк, и текст обязан назвать, сколько их и что сделать, — иначе
+    «нельзя» превращается в тупик.
+
+    Каскада в этом пакете нет НИ ОДНОГО. Снять чужие назначения за человека
+    значило бы принять решение, которого он не принимал; единственный каскад,
+    который вообще обсуждался (архивация партии вместе с её назначениями),
+    удержан до решения владельца — см. `TECH_DEBT.md`, `SUPPLY-FIX-2-REG`.
+    """
 
 
 # ── Разбор ввода ─────────────────────────────────────────────────────────────
@@ -357,6 +406,25 @@ def _touch(row) -> None:
     row.updated_at = datetime.utcnow()
 
 
+def _ru_plural(n: int, one: str, few: str, many: str) -> str:
+    """«1 назначение», «2 назначения», «5 назначений».
+
+    Отказ называет ЧИСЛО, а число без согласованного слова читается как машинный
+    вывод. Правило русского счёта короткое, и подтягивать ради него библиотеку
+    незачем; исключение 11–14 учтено — без него «11 назначение» встречалось бы
+    ровно у тех организаций, у которых строк много.
+    """
+    n = abs(int(n))
+    if n % 100 in (11, 12, 13, 14):
+        return many
+    tail = n % 10
+    if tail == 1:
+        return one
+    if tail in (2, 3, 4):
+        return few
+    return many
+
+
 # ── Материал ─────────────────────────────────────────────────────────────────
 
 def create_material(db: Session, org_id: int, payload: dict, author: str) -> SupplyMaterial:
@@ -407,16 +475,96 @@ def update_material(db: Session, org_id: int, material_id: int,
         row.source_note = clean_text(payload.get("source_note"),
                                      "источник или комментарий", limit=MAX_NOTE_CHARS)
     if "unit" in payload:
-        row.unit = clean_text(payload.get("unit") or "м", "единица",
+        # ЕДИНИЦА ЖУРНАЛИРУЕТСЯ (F-13). До этого пакета её можно было поменять
+        # только программно, и следа не оставалось: «120» превращалось из метров
+        # в килограммы, а сводка складывала это в новую корзину — при том, что
+        # число не менялось ни на единицу. Такая правка обязана быть видна.
+        new_unit = clean_text(payload.get("unit") or "м", "единица",
                               limit=MAX_UNIT_CHARS) or "м"
+        if new_unit != row.unit:
+            _journal(db, org_id, "material", row.id, "update", field="unit",
+                     old=row.unit, new=new_unit, author=author, op_id=op_id)
+            op_id = ""
+            row.unit = new_unit
     _touch(row)
     return row
 
 
-def get_material(db: Session, org_id: int, material_id: int) -> SupplyMaterial:
+def get_material(db: Session, org_id: int, material_id: int, *,
+                 include_archived: bool = False) -> SupplyMaterial:
     row = db.get(SupplyMaterial, material_id)
     if row is None or row.org_id != org_id:
         raise NotFound("Материал не найден.")
+    if row.archived_at is not None and not include_archived:
+        # УБРАННАЯ СТРОКА ОТВЕЧАЕТ ТЕМ ЖЕ, ЧЕМ ЧУЖАЯ И НЕСУЩЕСТВУЮЩАЯ. Отдельный
+        # ответ «есть, но в архиве» был бы удобнее ровно одному человеку —
+        # тому, кто перебирает номера: он рассказал бы, что строка существует.
+        # Восстановление ходит сюда с `include_archived=True` и знает id, потому
+        # что человек только что видел его в тосте.
+        raise NotFound("Материал не найден.")
+    return row
+
+
+def archive_material(db: Session, org_id: int, material_id: int, payload: dict,
+                     author: str) -> SupplyMaterial:
+    """Убрать материал с доски. Строка остаётся, отметка проставляется.
+
+    МЯГКО, А НЕ `DELETE`. На материал ссылается журнал `supply_events`: физическое
+    удаление превратило бы его записи в осиротевшие `entity_id` — «кто-то менял
+    количество у чего-то, чего больше нет». Отметка `archived_at` убирает строку
+    с экрана и не трогает ни одного факта о ней.
+
+    НАЗНАЧЕНИЯ ЗА ЧЕЛОВЕКА НЕ СНИМАЮТСЯ. Материал, отданный плановым партиям,
+    убрать нельзя: 409 с числом и с тем, что надо сделать. Каскад здесь был бы
+    решением, которого никто не принимал, — метраж расписан руками, и молча
+    стереть эту работу нельзя (ТЗ F-12).
+    """
+    row = get_material(db, org_id, material_id)
+    _rev_guard(row, payload, "Материал")
+    # СЧИТАЮТСЯ ТОЛЬКО ЖИВЫЕ. Назначение, снятое вместе со своей убранной
+    # партией, материал не держит: иначе материал, однажды отданный партии,
+    # которую потом убрали, нельзя было бы убрать никогда — тупик вместо правила.
+    used = int(db.execute(
+        select(func.count(SupplyAssignment.id)).where(
+            SupplyAssignment.org_id == org_id,
+            SupplyAssignment.material_id == row.id,
+            SupplyAssignment.archived_at.is_(None))
+    ).scalar_one() or 0)
+    if used:
+        word = _ru_plural(used, "назначение", "назначения", "назначений")
+        raise InUse(f"Сначала снимите {used} {word}: материал отдан плановым "
+                    "партиям, и они останутся без него.")
+    stamp = datetime.utcnow()
+    row.archived_at = stamp
+    _touch(row)
+    _journal(db, org_id, "material", row.id, "archive", field="archived",
+             old="", new=stamp.isoformat(), author=author,
+             op_id=parse_op_id(payload))
+    return row
+
+
+def restore_material(db: Session, org_id: int, material_id: int, payload: dict,
+                     author: str) -> SupplyMaterial:
+    """Вернуть материал на доску. Возвращается ровно то, что убрали.
+
+    Развилки здесь нет и быть не может: архивация материала ничего не разрушает
+    (она невозможна, пока есть хоть одно назначение), поэтому «вернуть» означает
+    ровно одно — снять отметку. Повтор — не ошибка: строка уже на доске, и
+    сообщать об этом отказом значило бы наказывать за две вкладки.
+
+    `rev` здесь НЕ обязателен, и это следствие, а не поблажка: архивная строка с
+    доски не отдаётся, поэтому её текущей редакции клиент не видит. Если `rev`
+    всё-таки прислан — он проверяется обычным порядком.
+    """
+    row = get_material(db, org_id, material_id, include_archived=True)
+    _rev_guard(row, payload, "Материал")
+    if row.archived_at is None:
+        return row
+    was = row.archived_at.isoformat()
+    row.archived_at = None
+    _touch(row)
+    _journal(db, org_id, "material", row.id, "restore", field="archived",
+             old=was, new="", author=author, op_id=parse_op_id(payload))
     return row
 
 
@@ -479,6 +627,30 @@ def create_item(db: Session, org_id: int, payload: dict, author: str) -> SupplyI
                                      SupplyItem.kind == "catalog",
                                      SupplyItem.base_name == base_name).limit(1)
         ).scalars().first()
+        if existing is not None and existing.archived_at is not None:
+            # МОЛЧАЛИВОГО СНЯТИЯ АРХИВА НЕТ НИ В ОДНОЙ ВЕТКЕ — решение владельца
+            # (`5562704475`, п. 2). Человек убрал эту модель осознанно, и
+            # вернуть её обратно «заодно», потому что он начал набирать имя, —
+            # значит отменить его решение без спроса.
+            #
+            # Вставить вторую строку тоже нельзя: выпущенный замок
+            # `ux_supply_items_catalog` этого не даст, и без явной ветки здесь
+            # человек получил бы 409 про «действие уже выполнено» — отказ,
+            # который ничего не объясняет.
+            #
+            # Поэтому: отказ, называющий состояние, и ОТДЕЛЬНОЕ подтверждение.
+            # Подтверждение приходит тем же полем в теле, а не молчаливым
+            # повтором: повтор без него отвечает так же, сколько бы раз ни
+            # пришёл.
+            if not _wants_restore(payload):
+                raise ArchivedCatalogItem(
+                    f"Модель «{base_name}» в архиве. Вернуть её в план?")
+            was = existing.archived_at.isoformat()
+            existing.archived_at = None
+            existing.restored = True
+            _touch(existing)
+            _journal(db, org_id, "item", existing.id, "restore", field="archived",
+                     old=was, new="", author=author, op_id=parse_op_id(payload))
         if existing is not None:
             # ВВЕДЁННАЯ ЗАМЕТКА НЕ ПРОПАДАЕТ МОЛЧА. Прежняя редакция возвращала
             # найденную строку и на этом заканчивала: человек писал заметку,
@@ -537,10 +709,144 @@ def create_item(db: Session, org_id: int, payload: dict, author: str) -> SupplyI
     return row
 
 
-def get_item(db: Session, org_id: int, item_id: int) -> SupplyItem:
+def get_item(db: Session, org_id: int, item_id: int, *,
+             include_archived: bool = False) -> SupplyItem:
     row = db.get(SupplyItem, item_id)
     if row is None or row.org_id != org_id:
         raise NotFound("Вещь не найдена.")
+    if row.archived_at is not None and not include_archived:
+        raise NotFound("Вещь не найдена.")
+    return row
+
+
+def update_item(db: Session, org_id: int, item_id: int, payload: dict,
+                author: str) -> SupplyItem:
+    """Правка вещи: имя новинки, заметка, замена эскиза (F-13в).
+
+    ЧТО ЗДЕСЬ НЕ МЕНЯЕТСЯ, И ЭТО НЕ ЗАБЫТО. `base_name` каталожной вещи — не
+    наше имя, а указатель на строку СВОЕГО каталога (`products.base_name`,
+    D-55). Переписать его здесь значило бы, что план указывает на модель,
+    которой в каталоге нет; поэтому имя каталожной вещи не правится, а
+    присланный `base_name` останавливает запись и говорит, что убрать, — тем же
+    правилом, которым пакет 1 заменил молчаливое обнуление ввода (D-55, п. 1).
+
+    `kind` не меняется тоже: новинка и вещь каталога — разные тождества, а не
+    два состояния одной строки. Превращение одной в другую — это удалить и
+    завести заново, и решать это человеку, а не переключателю.
+    """
+    row = get_item(db, org_id, item_id)
+    _rev_guard(row, payload, "Вещь")
+    op_id = parse_op_id(payload)
+
+    if clean_text(payload.get("base_name"), "вещь каталога",
+                  limit=MAX_TITLE_CHARS):
+        raise ValidationError(
+            "Название вещи каталога приходит из вашего каталога — здесь оно не "
+            "меняется. Уберите это поле.")
+    if "kind" in payload and clean_text(payload.get("kind"), "вид вещи",
+                                        limit=16) not in ("", row.kind):
+        raise ValidationError("Вид вещи не меняется: новинка и вещь каталога — "
+                              "разные вещи, а не два состояния одной.")
+
+    if "title" in payload:
+        if row.kind == "catalog":
+            raise ValidationError(
+                "Название вещи каталога приходит из вашего каталога — здесь оно "
+                "не меняется. Уберите это поле.")
+        new_title = clean_text(payload.get("title"), "название новинки",
+                               limit=MAX_TITLE_CHARS, required=True)
+        if new_title != row.title:
+            _journal(db, org_id, "item", row.id, "update", field="title",
+                     old=row.title, new=new_title, author=author, op_id=op_id)
+            op_id = ""
+            row.title = new_title
+
+    if "note" in payload:
+        new_note = clean_text(payload.get("note"), "заметка", limit=MAX_NOTE_CHARS)
+        if new_note != (row.note or ""):
+            _journal(db, org_id, "item", row.id, "update", field="note",
+                     old=row.note or "", new=new_note, author=author, op_id=op_id)
+            op_id = ""
+            row.note = new_note
+
+    if "sketch_id" in payload:
+        raw = payload.get("sketch_id")
+        if raw in (None, "", 0):
+            new_sketch = None
+        else:
+            try:
+                new_sketch = int(raw)
+            except (TypeError, ValueError):
+                raise ValidationError("Эскиз указан неверно.") from None
+            get_sketch(db, org_id, new_sketch)   # чужой эскиз сюда не привяжется
+            if row.kind == "catalog":
+                raise ValidationError("Эскиз прикрепляется только к новинке.")
+        if new_sketch != row.sketch_id:
+            # В журнал уходит СМЕНА, а не картинка: байты лежат в своей таблице,
+            # и дублировать их в историю значило бы растить базу вдвое.
+            _journal(db, org_id, "item", row.id, "update", field="sketch",
+                     old="" if row.sketch_id is None else row.sketch_id,
+                     new="" if new_sketch is None else new_sketch,
+                     author=author, op_id=op_id)
+            op_id = ""
+            row.sketch_id = new_sketch
+
+    _touch(row)
+    return row
+
+
+def archive_item(db: Session, org_id: int, item_id: int, payload: dict,
+                 author: str) -> SupplyItem:
+    """Убрать вещь с доски — и новинку, и вещь каталога.
+
+    КАТАЛОЖНАЯ ВЕЩЬ УБИРАЕТСЯ ТОЖЕ, и это решение владельца (`5562704475`, п. 2),
+    а не техническое послабление. Раньше она была удержана: у неё стоит
+    выпущенный замок `UNIQUE(org_id, base_name) WHERE kind='catalog'`
+    (SUPPLY-FIX-1, шаг 12), и повторный выбор убранной модели в него упирается —
+    а что делать дальше, замок не диктует. Владелец ответил: НЕ снимать архив
+    молча, показать «Модель в архиве» и потребовать отдельного подтверждения.
+    Ответ живёт в `create_item`, здесь же снят сам запрет.
+
+    Новинки под этот замок не попадают вовсе: у них `base_name` пуст, и две
+    новинки с одним именем — по-прежнему две разные вещи (D-55).
+
+    ПЛАНОВЫЕ ПАРТИИ ЗА ЧЕЛОВЕКА НЕ УБИРАЮТСЯ: пока у вещи есть хоть одна живая
+    партия, вещь остаётся — иначе партия висела бы на доске без вещи.
+    """
+    row = get_item(db, org_id, item_id)
+    _rev_guard(row, payload, "Вещь")
+    live = int(db.execute(
+        select(func.count(SupplyBatch.id)).where(
+            SupplyBatch.org_id == org_id,
+            SupplyBatch.item_id == row.id,
+            SupplyBatch.archived_at.is_(None))
+    ).scalar_one() or 0)
+    if live:
+        word = _ru_plural(live, "плановая партия", "плановые партии",
+                          "плановых партий")
+        raise InUse(f"У этой вещи ещё есть {live} {word} — вещь останется, "
+                    "пока они на доске.")
+    stamp = datetime.utcnow()
+    row.archived_at = stamp
+    _touch(row)
+    _journal(db, org_id, "item", row.id, "archive", field="archived",
+             old="", new=stamp.isoformat(), author=author,
+             op_id=parse_op_id(payload))
+    return row
+
+
+def restore_item(db: Session, org_id: int, item_id: int, payload: dict,
+                 author: str) -> SupplyItem:
+    """Вернуть вещь на доску — ровно ту же, ничего не воссоздавая."""
+    row = get_item(db, org_id, item_id, include_archived=True)
+    _rev_guard(row, payload, "Вещь")
+    if row.archived_at is None:
+        return row
+    was = row.archived_at.isoformat()
+    row.archived_at = None
+    _touch(row)
+    _journal(db, org_id, "item", row.id, "restore", field="archived",
+             old=was, new="", author=author, op_id=parse_op_id(payload))
     return row
 
 
@@ -565,6 +871,17 @@ def catalog_options(db: Session, org_id: int, query: str = "",
             .group_by(Product.base_name))
     needle = (query or "").strip().casefold()
     rows = db.execute(stmt).all()
+    # Какие модели уже убраны из плана. Отдаётся ВМЕСТЕ с подсказкой, чтобы
+    # человек увидел «в архиве» в момент выбора, а не отказом после отправки
+    # формы (решение владельца 5562704475, п. 2). Одним запросом на весь список:
+    # архивных мало, но запрос на строку — привычка, которая ломается на сотнях.
+    archived = {
+        name for (name,) in db.execute(
+            select(SupplyItem.base_name).where(
+                SupplyItem.org_id == org_id,
+                SupplyItem.kind == "catalog",
+                SupplyItem.archived_at.is_not(None))).all()
+        if name}
     out = []
     catalog_size = 0
     for base_name, sizes in rows:
@@ -573,7 +890,8 @@ def catalog_options(db: Session, org_id: int, query: str = "",
         catalog_size += 1
         if needle and needle not in base_name.casefold():
             continue
-        out.append({"base_name": base_name, "sizes": int(sizes)})
+        out.append({"base_name": base_name, "sizes": int(sizes),
+                    "archived": base_name in archived})
     out.sort(key=lambda r: r["base_name"].casefold())
     return {"options": out[:limit], "total": len(out), "catalog_size": catalog_size}
 
@@ -609,12 +927,134 @@ def create_batch(db: Session, org_id: int, payload: dict, author: str) -> Supply
     return row
 
 
-def get_batch(db: Session, org_id: int, batch_id: int) -> SupplyBatch:
+def get_batch(db: Session, org_id: int, batch_id: int, *,
+              include_archived: bool = False) -> SupplyBatch:
     row = db.get(SupplyBatch, batch_id)
     if row is None or row.org_id != org_id:
         raise NotFound("Плановая партия не найдена.")
+    if row.archived_at is not None and not include_archived:
+        raise NotFound("Плановая партия не найдена.")
     return row
 
+
+def archive_batch(db: Session, org_id: int, batch_id: int, payload: dict,
+                  author: str) -> dict:
+    """Убрать партию с доски вместе с её назначениями. Ничего не стирая.
+
+    РЕШЕНИЕ ВЛАДЕЛЬЦА (`5562704475`, п. 1) и то, как оно здесь исполнено. ТЗ
+    предлагало снимать назначения ФИЗИЧЕСКИ, оставляя след в журнале, и прямо
+    разрешало иную реализацию при том же КП. Иная здесь обязательна по существу:
+    владелец потребовал, чтобы восстановление вернуло партию ВМЕСТЕ с прежними
+    назначениями и заметками. Собрать заметку обратно из `supply_events` нельзя
+    честно — поле журнала ограничено 500 символами, а склейка заметок может быть
+    длиннее; значит, «вернуть ту же заметку» достижимо только одним способом —
+    не терять её. Поэтому назначения помечаются, а не удаляются.
+
+    ЧТО ВИДИТ ЧЕЛОВЕК. Партия уходит с доски, а назначенный на неё метраж
+    перестаёт считаться назначенным: `assigned` у материала уменьшается, и
+    свободный остаток растёт ровно на снятое. Это и есть КП F-12, и он выполнен
+    не на словах: архивные назначения не считаются нигде (`assigned_total`,
+    `board`, `material_links`).
+
+    ЖУРНАЛ ПИШЕТСЯ ПО КАЖДОМУ СНЯТОМУ НАЗНАЧЕНИЮ ОТДЕЛЬНО, а не одной строкой на
+    партию: через полгода вопрос будет «куда делись сто двадцать метров этой
+    ткани», и ответ на него обязан существовать по самому назначению.
+
+    Возвращает словарь с числом снятых назначений — интерфейсу он нужен, чтобы
+    сказать человеку правду ДО подтверждения, а не после.
+    """
+    row = get_batch(db, org_id, batch_id)
+    _rev_guard(row, payload, "Плановая партия")
+    op_id = parse_op_id(payload)
+    live = db.execute(
+        select(SupplyAssignment).where(SupplyAssignment.org_id == org_id,
+                                       SupplyAssignment.batch_id == row.id,
+                                       SupplyAssignment.archived_at.is_(None))
+        .order_by(SupplyAssignment.id.asc())
+    ).scalars().all()
+    stamp = datetime.utcnow()
+    for a in live:
+        a.archived_at = stamp
+        _touch(a)
+        _journal(db, org_id, "assignment", a.id, "archive", field="archived",
+                 old=a.qty, new="снято вместе с партией", author=author,
+                 op_id=op_id)
+        op_id = ""          # один поступок — одна запись с этим op_id
+    row.archived_at = stamp
+    _touch(row)
+    _journal(db, org_id, "batch", row.id, "archive", field="archived",
+             old="", new=stamp.isoformat(), author=author, op_id=op_id)
+    return {"batch_id": row.id, "assignments": len(live),
+            "qty": round(sum(float(a.qty) for a in live), 3)}
+
+
+def restore_batch(db: Session, org_id: int, batch_id: int, payload: dict,
+                  author: str) -> dict:
+    """Вернуть партию ВМЕСТЕ с её прежними назначениями и заметками.
+
+    РЕШЕНИЕ ВЛАДЕЛЬЦА (`5562704475`, п. 1) буквально: возвращается не «пустая
+    партия», а то же состояние — те же строки назначений, те же количества, те
+    же заметки. Пересборки нет нигде: строки всё это время лежали на месте с
+    отметкой, поэтому «то же самое» здесь — факт, а не старание.
+
+    ЦЕНА, КОТОРУЮ ЧЕЛОВЕК ОБЯЗАН УВИДЕТЬ ДО НАЖАТИЯ: метраж возвращается В
+    РАСПРЕДЕЛЕНИЕ. У материала снова вырастает `assigned` и уменьшается
+    свободный остаток — и если за это время метраж успели отдать другой партии,
+    суммарно назначенного станет больше, чем было. Слой этого не запрещает
+    (план — не расход, правило 2 шапки модуля), но и не умалчивает: число
+    возвращённого отдаётся наружу, и интерфейс говорит о нём словами.
+
+    ДВА ОТКАЗА, КОТОРЫЕ ЗДЕСЬ ЕСТЬ, И ОБА ПРО ЦЕЛОСТНОСТЬ ДОСКИ. Вернуть партию
+    к архивной вещи нельзя — на доске появилась бы партия вещи, которой на доске
+    нет. Вернуть назначение на архивный материал нельзя по той же причине.
+    Оба случая называют, что сделать раньше, а не просто запрещают.
+    """
+    row = get_batch(db, org_id, batch_id, include_archived=True)
+    _rev_guard(row, payload, "Плановая партия")
+    if row.archived_at is None:
+        # Уже на доске. Повтор — не ошибка: две вкладки не должны наказываться.
+        return {"batch_id": row.id, "assignments": 0, "qty": 0.0}
+
+    item = db.get(SupplyItem, row.item_id)
+    if item is None or item.org_id != org_id:
+        raise NotFound("Плановая партия не найдена.")
+    if item.archived_at is not None:
+        raise InUse(f"Вещь «{item.title}» убрана — сначала верните её, "
+                    "иначе партия окажется на доске без своей вещи.")
+
+    archived = db.execute(
+        select(SupplyAssignment).where(SupplyAssignment.org_id == org_id,
+                                       SupplyAssignment.batch_id == row.id,
+                                       SupplyAssignment.archived_at.is_not(None))
+        .order_by(SupplyAssignment.id.asc())
+    ).scalars().all()
+    blocked = []
+    for a in archived:
+        mat = db.get(SupplyMaterial, a.material_id)
+        if mat is not None and mat.org_id == org_id and mat.archived_at is not None:
+            blocked.append(mat.title)
+    if blocked:
+        word = _ru_plural(len(blocked), "материал", "материала", "материалов")
+        raise InUse(f"Сначала верните {len(blocked)} {word} "
+                    f"({', '.join(blocked[:3])}): без них назначения этой партии "
+                    "вернуть некуда.")
+
+    op_id = parse_op_id(payload)
+    returned = 0.0
+    for a in archived:
+        a.archived_at = None
+        _touch(a)
+        _journal(db, org_id, "assignment", a.id, "restore", field="archived",
+                 old="снято вместе с партией", new=a.qty, author=author,
+                 op_id=op_id)
+        op_id = ""
+        returned = round(returned + float(a.qty), 3)
+    was = row.archived_at.isoformat()
+    row.archived_at = None
+    _touch(row)
+    _journal(db, org_id, "batch", row.id, "restore", field="archived",
+             old=was, new="", author=author, op_id=op_id)
+    return {"batch_id": row.id, "assignments": len(archived), "qty": returned}
 
 def update_batch(db: Session, org_id: int, batch_id: int, payload: dict,
                  author: str) -> SupplyBatch:
@@ -623,8 +1063,13 @@ def update_batch(db: Session, org_id: int, batch_id: int, payload: dict,
     _rev_guard(row, payload, "Плановая партия")
     op_id = parse_op_id(payload)
     if "title" in payload:
-        row.title = clean_text(payload.get("title"), "название партии",
+        new_title = clean_text(payload.get("title"), "название партии",
                                limit=MAX_TITLE_CHARS)
+        if new_title != row.title:
+            _journal(db, org_id, "batch", row.id, "update", field="title",
+                     old=row.title, new=new_title, author=author, op_id=op_id)
+            op_id = ""
+            row.title = new_title
     if "plan_qty" in payload:
         new_qty = parse_qty(payload.get("plan_qty"), "план изделий", allow_unknown=True)
         if new_qty != row.plan_qty:
@@ -671,7 +1116,11 @@ def assigned_total(db: Session, org_id: int, material_id: int) -> float:
     total = db.execute(
         select(func.coalesce(func.sum(SupplyAssignment.qty), 0.0))
         .where(SupplyAssignment.org_id == org_id,
-               SupplyAssignment.material_id == material_id)
+               SupplyAssignment.material_id == material_id,
+               # Снятое вместе с партией не считается назначенным — иначе
+               # «убрали партию» не уменьшало бы `assigned`, и КП F-12 был бы
+               # выполнен только на словах.
+               SupplyAssignment.archived_at.is_(None))
     ).scalar_one()
     return round(float(total or 0.0), 3)
 
@@ -770,9 +1219,12 @@ def _merge_notes(old: str, new: str) -> tuple[str, bool]:
     return joined[:MAX_NOTE_CHARS], True
 
 
-def get_assignment(db: Session, org_id: int, assignment_id: int) -> SupplyAssignment:
+def get_assignment(db: Session, org_id: int, assignment_id: int, *,
+                   include_archived: bool = False) -> SupplyAssignment:
     row = db.get(SupplyAssignment, assignment_id)
     if row is None or row.org_id != org_id:
+        raise NotFound("Назначение не найдено.")
+    if row.archived_at is not None and not include_archived:
         raise NotFound("Назначение не найдено.")
     return row
 
@@ -873,16 +1325,60 @@ def fmt_qty(value) -> str:
     return text or "0"
 
 
+def material_links(db: Session, org_id: int, material_id: int) -> list[dict]:
+    """Куда этот материал расписан: партия, вещь, сколько (F-14).
+
+    ОДИН ЗАПРОС С ДВУМЯ СОЕДИНЕНИЯМИ, а не строка на назначение: карточек
+    материалов на экране десятки, и запрос на каждую связь — привычка, которая
+    ломается ровно тогда, когда их станут сотни. `board()` этой функцией не
+    пользуется вовсе: там те же данные уже прочитаны для карточек партий, и
+    читать их второй раз было бы просто лишней работой.
+
+    Партия без названия называется своей вещью — тем же правилом, что на
+    карточке партии: показать «—» значило бы, что человек не узнает строку,
+    которую сам же и создал.
+
+    ФИЛЬТРА ПО АРХИВУ ЗДЕСЬ НЕТ НАМЕРЕННО, и это надо прочитать вместе с F-12.
+    Сумма этих строк обязана совпадать с `assigned`, а `assigned` считается по
+    ВСЕМ назначениям материала. Сегодня расхождение невозможно: архивация партии
+    в этом пакете не реализована вовсе (продуктовая развилка удержана,
+    `TECH_DEBT.md` `SUPPLY-FIX-2-REG`), поэтому назначения, ведущего на убранную
+    партию, просто не существует. Когда развилку решат, отвечать на неё придётся
+    ОДНИМ решением сразу в трёх местах — здесь, в `assigned` и в `restore`, — а
+    не тихим `WHERE` в одном из них.
+    """
+    rows = db.execute(
+        select(SupplyAssignment.batch_id, SupplyBatch.title, SupplyItem.title,
+               SupplyAssignment.qty)
+        .join(SupplyBatch, SupplyBatch.id == SupplyAssignment.batch_id)
+        .join(SupplyItem, SupplyItem.id == SupplyBatch.item_id)
+        .where(SupplyAssignment.org_id == org_id,
+               SupplyAssignment.material_id == material_id,
+               SupplyAssignment.archived_at.is_(None))
+        .order_by(SupplyAssignment.id.asc())
+    ).all()
+    return [{"batch_id": bid, "batch_title": (btitle or ititle),
+             "item_title": ititle, "qty": qty}
+            for bid, btitle, ititle, qty in rows]
+
+
 def material_view(db: Session, org_id: int, row: SupplyMaterial,
-                  used: float | None = None) -> dict:
+                  used: float | None = None,
+                  links: list[dict] | None = None) -> dict:
     """Материал для экрана: назначено, остаток и ЧЕСТНОЕ предупреждение.
 
     Остаток неизвестного количества — тоже НЕИЗВЕСТЕН, а не «минус
     назначенное»: вычитать из незнания нечего. Превышение показывается числом и
     словом, но назначение не обрезается и не отменяется — это план, а не
     физический расход (см. шапку модуля, правило 2).
+
+    `assignments` (F-14) отвечает на вопрос, которого до этого пакета на экране
+    не было вовсе: «назначено 220» видно, а КУДА — нет, и человек искал это
+    глазами по карточкам партий. Сумма этих строк равна `assigned` по
+    построению: и то и другое считается из одних и тех же назначений.
     """
     assigned = assigned_total(db, org_id, row.id) if used is None else used
+    rows = material_links(db, org_id, row.id) if links is None else links
     unknown_qty = row.qty is None
     free = None if unknown_qty else round(float(row.qty) - assigned, 3)
     over = (not unknown_qty) and assigned > float(row.qty) + 1e-9
@@ -894,6 +1390,7 @@ def material_view(db: Session, org_id: int, row: SupplyMaterial,
         "unit": row.unit,
         "source_note": row.source_note,
         "assigned": assigned,
+        "assignments": rows,
         "free": free,
         "free_known": not unknown_qty,
         "over": over,
@@ -916,33 +1413,55 @@ def board(db: Session, org_id: int, role: str) -> dict:
     материалов и партий у бренда десятки, но запрос на каждого — это привычка,
     которая ломается ровно тогда, когда их станут сотни.
     """
+    # УБРАННОЕ НЕ ОТДАЁТСЯ (F-12). Фильтр стоит в трёх запросах, а не в одном
+    # общем месте после выборки: доска — единственное чтение всего экрана, и
+    # «отфильтруем потом» рано или поздно означает «в одном из списков забыли».
     materials = db.execute(
-        select(SupplyMaterial).where(SupplyMaterial.org_id == org_id)
+        select(SupplyMaterial).where(SupplyMaterial.org_id == org_id,
+                                     SupplyMaterial.archived_at.is_(None))
         .order_by(SupplyMaterial.id.desc())
     ).scalars().all()
     items = db.execute(
-        select(SupplyItem).where(SupplyItem.org_id == org_id)
+        select(SupplyItem).where(SupplyItem.org_id == org_id,
+                                 SupplyItem.archived_at.is_(None))
         .order_by(SupplyItem.id.desc())
     ).scalars().all()
     batches = db.execute(
-        select(SupplyBatch).where(SupplyBatch.org_id == org_id)
+        select(SupplyBatch).where(SupplyBatch.org_id == org_id,
+                                  SupplyBatch.archived_at.is_(None))
         .order_by(SupplyBatch.id.desc())
     ).scalars().all()
     assignments = db.execute(
-        select(SupplyAssignment).where(SupplyAssignment.org_id == org_id)
+        select(SupplyAssignment).where(SupplyAssignment.org_id == org_id,
+                                       SupplyAssignment.archived_at.is_(None))
         .order_by(SupplyAssignment.id.asc())
     ).scalars().all()
 
+    item_by_id = {i.id: i for i in items}
+    mat_by_id = {m.id: m for m in materials}
+    batch_by_id = {b.id: b for b in batches}
+
     used: dict[int, float] = {}
     by_batch: dict[int, list] = {}
+    # Куда расписан каждый материал (F-14). Собирается ЗДЕСЬ, из уже прочитанных
+    # назначений, а не отдельным запросом на карточку: те же строки уже нужны
+    # карточкам партий, и читать их второй раз незачем.
+    links: dict[int, list[dict]] = {}
     for a in assignments:
         used[a.material_id] = round(used.get(a.material_id, 0.0) + float(a.qty), 3)
         by_batch.setdefault(a.batch_id, []).append(a)
+        b = batch_by_id.get(a.batch_id)
+        item = item_by_id.get(b.item_id) if b is not None else None
+        item_title = item.title if item is not None else ""
+        links.setdefault(a.material_id, []).append({
+            "batch_id": a.batch_id,
+            "batch_title": ((b.title if b is not None else "") or item_title),
+            "item_title": item_title,
+            "qty": a.qty,
+        })
 
-    item_by_id = {i.id: i for i in items}
-    mat_by_id = {m.id: m for m in materials}
-
-    mat_views = [material_view(db, org_id, m, used=used.get(m.id, 0.0))
+    mat_views = [material_view(db, org_id, m, used=used.get(m.id, 0.0),
+                               links=links.get(m.id, []))
                  for m in materials]
 
     batch_views = []
@@ -975,6 +1494,13 @@ def board(db: Session, org_id: int, role: str) -> dict:
                          if a.material_id in mat_by_id else ""),
                 "qty": a.qty,
                 "note": a.note,
+                # F-15: материал, количество которого никто не называл. Это НЕ
+                # запрет и не ноль (D-49, «неизвестное ≠ ноль»): партия честно
+                # собрана из того, чего может не хватить, и человек обязан это
+                # видеть на самой партии, а не вычислять, открыв карточку
+                # материала.
+                "relies_on_unknown": (a.material_id in mat_by_id
+                                      and mat_by_id[a.material_id].qty is None),
                 "rev": a.rev,
             } for a in rows],
             # Тот же запрет, что и в сводке: назначения складываются только
@@ -1056,12 +1582,19 @@ def summary(mat_views: list[dict], batch_views: list[dict]) -> dict:
     plan_known = sum(b["plan_qty"] for b in batch_views if b["plan_known"])
     plan_unknown = sum(1 for b in batch_views if not b["plan_known"])
     due_unknown = sum(1 for b in batch_views if b["due_kind"] == "unknown")
+    # F-15: сколько партий опираются хотя бы на один материал без количества.
+    # Считается по партиям, а не по назначениям: человека интересует, сколько
+    # ЗАПУСКОВ стоит на неподтверждённом наличии, а не сколько строк.
+    batches_on_unknown = sum(
+        1 for b in batch_views
+        if any(a.get("relies_on_unknown") for a in b.get("assignments", [])))
     return {
         "materials": len(mat_views),
         "batches": len(batch_views),
         "free_by_unit": free_by_unit,
         "unknown_materials": unknown_materials,
         "over_materials": over_materials,
+        "batches_on_unknown": batches_on_unknown,
         # Штуки — одна величина по определению: изделия считаются изделиями.
         "plan_known": round(float(plan_known), 3),
         "plan_unknown": plan_unknown,
