@@ -51,6 +51,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import struct
 from datetime import datetime, date
 
@@ -81,6 +82,28 @@ MAX_OP_ID_CHARS = 64
 #: которое не помещается в double без потерь, показывается не тем, чем его
 #: записали (тот же класс дефекта, что SUPPLY-2-REG п.6).
 MAX_QTY = 1_000_000.0
+#: Наименьшее количество, которое слой умеет сохранить БЕЗ обмана. Числа
+#: округляются до трёх знаков, поэтому 0,0004 после округления становится нулём —
+#: то есть «ничего нет» вместо «очень мало». Молча принять такой ввод значило бы
+#: подменить написанное человеком (ТЗ F-17г).
+MIN_QTY = 0.001
+
+#: УТВЕРЖДЁННЫЙ СПИСОК ЕДИНИЦ (ТЗ F-16). Шестого пункта «другое» здесь нет
+#: намеренно: «другое» — это не единица, а способ написать свою, и в базу уходит
+#: ровно то, что человек написал. Список закрытый и придуман не здесь.
+UNIT_CHOICES = ("м", "кг", "шт", "рул.", "компл.")
+
+#: СИНОНИМЫ, НАЗВАННЫЕ ТЗ БУКВАЛЬНО, и ничего сверх них. Раньше «м», «м.», «М»,
+#: «метры» и «m» были пятью разными корзинами свободного остатка — человек видел
+#: пять строк про одну и ту же ткань. Точка и регистр снимаются механически
+#: (`casefold` + `rstrip('.')`), а словами перечислены только те написания,
+#: равенство которых утвердил владелец: догадываться, что «ярд» это «м», слой не
+#: станет — ключ незнакомой единицы остаётся своим.
+UNIT_SYNONYMS = {
+    "m": "м", "метр": "м", "метры": "м",
+    "kg": "кг", "килограмм": "кг",
+    "штук": "шт",
+}
 
 
 class PlanningError(Exception):
@@ -150,6 +173,57 @@ class InUse(PlanningError):
 
 # ── Разбор ввода ─────────────────────────────────────────────────────────────
 
+def _cap(field: str) -> str:
+    """Подпись поля с большой буквы — для начала фразы.
+
+    Тексты отказов по Приложению А начинаются с самого поля («Количество не
+    читается как число»), а не с «Поле «количество»…». Одна функция вместо
+    полутора десятков литералов существует затем, чтобы вторая такая же фраза
+    не написалась по-своему.
+    """
+    return (field[:1].upper() + field[1:]) if field else field
+
+
+def _max_qty_text() -> str:
+    """Потолок словами человека: «1 000 000», а не машинное `1000000.0`.
+
+    Число берётся из самой константы, чтобы текст не разошёлся с проверкой.
+    """
+    return f"{MAX_QTY:,.0f}".replace(",", " ")
+
+
+def unit_key(raw) -> str:
+    """Ключ, по которому единицы считаются ОДНОЙ (ТЗ F-16).
+
+    Механически снимаются края, регистр и завершающая точка, а дальше работает
+    закрытый список синонимов. Незнакомая единица остаётся собой: доказательства
+    её равенства чему-либо у нас нет, а придумать коэффициент — значит выдумать
+    факт (то же правило, что в `group_by_unit`).
+    """
+    text = (raw or "").strip().casefold().rstrip(".")
+    return UNIT_SYNONYMS.get(text, text)
+
+
+#: Ключ утверждённой единицы → как она пишется на экране: «рул» → «рул.».
+_UNIT_BY_KEY = {unit_key(u): u for u in UNIT_CHOICES}
+
+
+def normalize_unit(raw) -> str:
+    """Написание единицы при ЗАПИСИ. Старые строки этим не переписываются.
+
+    Нормализация происходит только тогда, когда человек сам сохраняет строку:
+    миграции, переписывающей уже введённые единицы, в пакете нет вовсе (ТЗ
+    F-16). Поэтому на доске какое-то время законно соседствуют «метры» из
+    прошлого и «м» из настоящего — и сводка всё равно складывает их вместе,
+    потому что группировка идёт по `unit_key`, а не по написанию.
+
+    Незнакомая единица возвращается ровно как написана: «другое» в списке — это
+    не единица, а разрешение написать свою.
+    """
+    text = (raw or "").strip()
+    return _UNIT_BY_KEY.get(unit_key(text), text)
+
+
 def clean_text(raw, field: str, *, limit: int, required: bool = False) -> str:
     """Строка человека: обрезаем края, проверяем длину, ничего не «чиним».
 
@@ -158,12 +232,12 @@ def clean_text(raw, field: str, *, limit: int, required: bool = False) -> str:
     if raw is None:
         raw = ""
     if not isinstance(raw, str):
-        raise ValidationError(f"Поле «{field}» должно быть текстом.")
+        raise ValidationError(f"{_cap(field)}: ожидался текст.")
     value = raw.strip()
     if required and not value:
-        raise ValidationError(f"Поле «{field}» обязательно.")
+        raise ValidationError(f"Укажите {field}.")
     if len(value) > limit:
-        raise ValidationError(f"Поле «{field}» длиннее {limit} символов.")
+        raise ValidationError(f"{_cap(field)}: не больше {limit} символов.")
     return value
 
 
@@ -176,32 +250,91 @@ def parse_qty(raw, field: str, *, allow_unknown: bool) -> float | None:
 
     Запятая как десятичный разделитель принимается: человек пишет «12,5»,
     и отвергать это значило бы требовать от него раскладку, а не число.
+
+    ЧИСЛО, НЕ ПОМЕЩАЮЩЕЕСЯ В `float`, — ЭТО 400, А НЕ 500 (ТЗ F-17б). Строка из
+    четырёхсот цифр превращается в `inf` и ловится проверкой конечности, а вот
+    JSON-ЧИСЛО из тех же цифр приходит сюда целым `int`, и `float()` на нём
+    поднимает `OverflowError`. Прежде эта ветка не ловилась ничем и выходила
+    наружу пустым отказом сервера — то есть человек получал 500 за опечатку.
+
+    ОКРУГЛЕНИЕ НЕ ИМЕЕТ ПРАВА ОБНУЛЯТЬ (ТЗ F-17г). Слой хранит три знака после
+    запятой; 0,0004 после округления стало бы нулём, а ноль здесь означает
+    «ничего нет». Поэтому ненулевой ввод, который округляется в ноль,
+    останавливает запись и называет минимум, а не сохраняется молча.
     """
     if raw is None or (isinstance(raw, str) and not raw.strip()):
         if allow_unknown:
             return None
-        raise ValidationError(f"Поле «{field}» обязательно.")
+        raise ValidationError(f"Укажите {field}.")
     if isinstance(raw, bool):
-        raise ValidationError(f"Поле «{field}» должно быть числом.")
+        raise ValidationError(f"{_cap(field)} не читается как число.")
     if isinstance(raw, str):
         text = raw.strip().replace(",", ".").replace(" ", "").replace(" ", "")
         try:
             value = float(text)
-        except ValueError:
+        except (ValueError, OverflowError):
             raise ValidationError(
-                f"Поле «{field}» не читается как число: «{raw.strip()[:40]}».") from None
+                f"{_cap(field)}: «{raw.strip()[:40]}» — это не число.") from None
     elif isinstance(raw, (int, float)):
-        value = float(raw)
+        try:
+            value = float(raw)
+        except (OverflowError, ValueError):
+            raise ValidationError(f"{_cap(field)} не читается как число.") from None
     else:
-        raise ValidationError(f"Поле «{field}» должно быть числом.")
+        raise ValidationError(f"{_cap(field)} не читается как число.")
     if value != value or value in (float("inf"), float("-inf")):
-        raise ValidationError(f"Поле «{field}» должно быть конечным числом.")
+        raise ValidationError(f"{_cap(field)} не читается как число.")
     if value < 0:
-        raise ValidationError(f"Поле «{field}» не может быть отрицательным.")
+        raise ValidationError(f"{_cap(field)} не может быть меньше нуля.")
     if value > MAX_QTY:
+        raise ValidationError(f"Максимум — {_max_qty_text()}.")
+    rounded = round(value, 3)
+    if rounded == 0 and value != 0:
         raise ValidationError(
-            f"Поле «{field}» больше допустимого предела {MAX_QTY:.0f}.")
-    return round(value, 3)
+            f"Слишком маленькое количество: минимум {fmt_qty(MIN_QTY)}.")
+    return rounded
+
+
+def parse_pieces(raw) -> float | None:
+    """План изделий — ЦЕЛОЕ число штук (ТЗ F-17а).
+
+    Отдельный разбор, а не `parse_qty`: изделие не бывает дробным, и «1,5
+    пиджака» — это не количество, а опечатка. Прежде такой ввод принимался и
+    сохранялся, после чего план партии показывался дробным числом штук.
+
+    Пусто по-прежнему означает НЕИЗВЕСТНО: план можно не задавать, и это
+    состояние, а не ноль (правило 1 шапки модуля).
+
+    Возвращается `float`, а не `int`, потому что колонка вещественная: класть
+    туда `int` значило бы завести в базе два разных представления одного плана.
+    """
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return None
+    bad = ValidationError("План изделий — целое число штук.")
+    if isinstance(raw, bool):
+        raise bad
+    if isinstance(raw, str):
+        text = raw.strip().replace(" ", "").replace(" ", "")
+        if not re.fullmatch(r"\d+", text):
+            raise bad
+        value = int(text)
+    elif isinstance(raw, int):
+        value = raw
+    elif isinstance(raw, float):
+        try:
+            exact = int(raw)
+        except (ValueError, OverflowError):
+            raise bad from None
+        if exact != raw:
+            raise bad
+        value = exact
+    else:
+        raise bad
+    if value < 0:
+        raise ValidationError("План изделий не может быть меньше нуля.")
+    if value > MAX_QTY:
+        raise ValidationError(f"Максимум — {_max_qty_text()}.")
+    return float(value)
 
 
 def parse_id(raw, field: str) -> int:
@@ -209,18 +342,61 @@ def parse_id(raw, field: str) -> int:
 
     Отдельная функция, потому что `int(x or 0)` молча превращает мусор в ноль,
     а ноль потом ищется в базе и даёт «не найдено» вместо «прислан мусор».
+
+    ДРОБНОЕ ЧИСЛО СЮДА НЕ ПРОХОДИТ (ТЗ F-17д). `int(1.9)` — это `1`, то есть
+    запрос про одну строку молча исполнялся бы над ДРУГОЙ, и человек узнал бы об
+    этом по результату. `inf` и `nan` тоже приходят законным JSON-числом и
+    прежде роняли `int()` наружу пятисотым.
     """
     if raw is None or (isinstance(raw, str) and not raw.strip()):
-        raise ValidationError(f"Не выбрано: {field}.")
+        raise ValidationError(f"Выберите {field}.")
     if isinstance(raw, bool):
-        raise ValidationError(f"Неверно указано: {field}.")
+        raise ValidationError(f"Выберите {field}.")
+    if isinstance(raw, float):
+        try:
+            exact = int(raw)
+        except (ValueError, OverflowError):
+            raise ValidationError(f"Выберите {field}.") from None
+        if exact != raw:
+            raise ValidationError(f"Выберите {field}.")
     try:
         value = int(raw)
-    except (TypeError, ValueError):
-        raise ValidationError(f"Неверно указано: {field}.") from None
+    except (TypeError, ValueError, OverflowError):
+        raise ValidationError(f"Выберите {field}.") from None
     if value <= 0:
-        raise ValidationError(f"Неверно указано: {field}.")
+        raise ValidationError(f"Выберите {field}.")
     return value
+
+
+#: Месяцы в родительном падеже: дата читается как «1 августа 2026», а не
+#: «1 август 2026». Таблица своя, а не `locale`: результат `locale` зависит от
+#: машины, на которой запущен процесс, и тогда CI и прод показывали бы разное.
+_MONTHS_LONG = ("января", "февраля", "марта", "апреля", "мая", "июня",
+                "июля", "августа", "сентября", "октября", "ноября", "декабря")
+_MONTHS_SHORT = ("янв", "фев", "мар", "апр", "мая", "июн",
+                 "июл", "авг", "сен", "окт", "ноя", "дек")
+
+#: Дата принимается ТОЛЬКО в этом виде (ТЗ F-17в). `date.fromisoformat` с версии
+#: 3.11 понимает и `20260101` — это не подарок, а ловушка: человек, написавший
+#: «20260101», имел в виду что-то своё, а мы бы это молча истолковали.
+_ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def ru_date(iso: str, *, short: bool = False) -> str:
+    """Дата человеку: «1 августа 2026» либо «1 авг 2026» (ТЗ F-18).
+
+    Неразобранная строка возвращается КАК ЕСТЬ, а не пустой: если в базе лежит
+    что-то, чего сегодняшний разбор не понимает, честнее показать это, чем
+    спрятать. Данные функция не трогает вовсе — только показ.
+    """
+    if not isinstance(iso, str) or not _ISO_DATE.match(iso):
+        return iso if isinstance(iso, str) else ""
+    try:
+        day = date.fromisoformat(iso)
+    except ValueError:
+        return iso
+    names = _MONTHS_SHORT if short else _MONTHS_LONG
+    return f"{day.day} {names[day.month - 1]} {day.year}"
 
 
 #: Названия видов срока ДЛЯ ТЕКСТА ОШИБКИ. Ровно те слова, которые человек
@@ -234,7 +410,7 @@ DUE_KIND_LABELS = {
 }
 
 
-def parse_due(payload: dict) -> dict:
+def parse_due(payload: dict, current=None) -> dict:
     """Срок: вид, текст, дата и ИСТОЧНИК — кто сказал.
 
     Источник хранится рядом со сроком не для красоты: «примерно к ноябрю» без
@@ -250,30 +426,64 @@ def parse_due(payload: dict) -> dict:
     вид срока не использует, останавливает запись и называет, что убрать.
     Источник срока используется при ЛЮБОМ виде и здесь не отвергается: он
     показывается на карточке даже у неизвестного срока, то есть не пропадает.
+
+    ЧАСТИЧНАЯ ПРАВКА НЕ СБРАСЫВАЕТ СРОК (ТЗ F-19). Прежде любой из ключей
+    `due_*` в теле означал «разбери срок заново», а отсутствующие ключи брались
+    по умолчанию — то есть `{"due_source": "цех"}` у партии с точной датой
+    отвечал 200 и превращал срок в «неизвестен», стирая саму дату. Теперь
+    отсутствующий ключ берётся из СТРОКИ (`current`), а не из пустоты.
+
+    Отсюда важное различие, и оно не формальное. Присланное явно поле, которого
+    этот вид срока не использует, по-прежнему ОСТАНАВЛИВАЕТ запись (D-55 п. 1):
+    человек написал то, что мы не сохраним, и узнать об этом он должен сразу.
+    А вот унаследованное из строки поле при СМЕНЕ вида просто снимается: при
+    переходе «точная дата» → «срок неизвестен» дата не нужна по определению, и
+    отказывать за значение, которого человек в этой отправке не присылал, значило
+    бы требовать от него убрать то, чего он не писал.
     """
-    kind = clean_text(payload.get("due_kind") or "unknown", "вид срока", limit=16)
+    if "due_kind" in payload:
+        kind_raw = payload.get("due_kind") or "unknown"
+    else:
+        kind_raw = (getattr(current, "due_kind", "") or "unknown")
+    kind = clean_text(kind_raw, "вид срока", limit=16)
     if kind not in SUPPLY_DUE_KINDS:
         raise ValidationError("Неизвестный вид срока.")
-    text = clean_text(payload.get("due_text"), "срок", limit=255)
-    source = clean_text(payload.get("due_source"), "источник срока", limit=255)
-    iso = clean_text(payload.get("due_date"), "дата", limit=10)
+
+    def carried(key: str) -> tuple[object, bool]:
+        """Значение поля и то, ПРИСЛАЛ ли его человек этой отправкой."""
+        if key in payload:
+            return payload.get(key), True
+        return (getattr(current, key, "") or ""), False
+
+    text_raw, text_sent = carried("due_text")
+    date_raw, date_sent = carried("due_date")
+    source_raw, _ = carried("due_source")
+    text = clean_text(text_raw, "срок", limit=255)
+    source = clean_text(source_raw, "источник срока", limit=255)
+    iso = clean_text(date_raw, "дата", limit=10)
     if kind == "exact":
         if not iso:
-            raise ValidationError("Для точного срока нужна дата.")
+            raise ValidationError("Укажите дату.")
+        if not _ISO_DATE.match(iso):
+            raise ValidationError("Дата должна быть в виде ГГГГ-ММ-ДД.")
         try:
             date.fromisoformat(iso)
         except ValueError:
             raise ValidationError("Дата должна быть в виде ГГГГ-ММ-ДД.") from None
     elif iso:
-        raise ValidationError(
-            f"Для срока «{DUE_KIND_LABELS[kind]}» дата не нужна — уберите дату "
-            "или выберите «точная дата».")
+        if date_sent:
+            raise ValidationError(
+                f"Для срока «{DUE_KIND_LABELS[kind]}» дата не нужна — уберите дату "
+                "или выберите «точная дата».")
+        iso = ""
     if kind in ("approx", "text") and not text:
-        raise ValidationError("Для ориентировочного срока нужен текст.")
+        raise ValidationError("Напишите срок словами.")
     if kind in ("unknown", "exact") and text:
-        raise ValidationError(
-            f"Для срока «{DUE_KIND_LABELS[kind]}» текст не нужен — уберите "
-            "текст или выберите «своими словами».")
+        if text_sent:
+            raise ValidationError(
+                f"Для срока «{DUE_KIND_LABELS[kind]}» текст не нужен — уберите "
+                "текст или выберите «своими словами».")
+        text = ""
     return {"due_kind": kind, "due_text": text, "due_date": iso, "due_source": source}
 
 
@@ -293,7 +503,8 @@ def sniff_image(data: bytes) -> tuple[str, int, int]:
     data = bytes(data)
     if len(data) > SKETCH_MAX_BYTES:
         raise ValidationError(
-            f"Файл больше {SKETCH_MAX_BYTES // (1024 * 1024)} МБ.")
+            f"Файл больше {SKETCH_MAX_BYTES // (1024 * 1024)} МБ — "
+            "уменьшите картинку.")
     if data[:8] == b"\x89PNG\r\n\x1a\n":
         if len(data) < 24 or data[12:16] != b"IHDR":
             raise ValidationError("Файл повреждён: это не читаемый PNG.")
@@ -325,7 +536,7 @@ def sniff_image(data: bytes) -> tuple[str, int, int]:
         raise ValidationError("Принимаются только JPEG и PNG.")
     if width <= 0 or height <= 0 or width > SKETCH_MAX_SIDE or height > SKETCH_MAX_SIDE:
         raise ValidationError(
-            f"Сторона картинки должна быть от 1 до {SKETCH_MAX_SIDE} точек.")
+            f"Картинка не больше {SKETCH_MAX_SIDE}×{SKETCH_MAX_SIDE} пикселей.")
     return mime, width, height
 
 
@@ -393,8 +604,11 @@ def _rev_guard(row, payload: dict, name: str) -> None:
         return
     try:
         rev = int(raw)
-    except (TypeError, ValueError):
-        raise ValidationError("Редакция должна быть целым числом.") from None
+    except (TypeError, ValueError, OverflowError):
+        # «Редакция» — наше служебное слово, и человеку оно ничего не объясняет
+        # (ТЗ F-20, Приложение А). Отдельно ловится `OverflowError`: `inf`
+        # приходит сюда законным JSON-числом и прежде выходил наружу пятисотым.
+        raise ValidationError("Обновите страницу — данные устарели.") from None
     if rev != row.rev:
         raise StaleWrite(
             f"{name} уже изменили в другом окне. Обновите страницу — "
@@ -433,10 +647,13 @@ def create_material(db: Session, org_id: int, payload: dict, author: str) -> Sup
     Именно это и есть первый шаг пути: ткань покупают партией и до дизайна,
     поэтому строка не требует ни вещи, ни партии, ни даже количества.
     """
-    title = clean_text(payload.get("title"), "название материала",
+    title = clean_text(payload.get("title"), "название",
                        limit=MAX_TITLE_CHARS, required=True)
     qty = parse_qty(payload.get("qty"), "количество", allow_unknown=True)
-    unit = clean_text(payload.get("unit") or "м", "единица", limit=MAX_UNIT_CHARS)
+    # ЕДИНИЦА НОРМАЛИЗУЕТСЯ ПРИ ЗАПИСИ (ТЗ F-16), и только при ней: уже
+    # введённые строки миграцией не переписываются.
+    unit = normalize_unit(clean_text(payload.get("unit") or "м", "единица",
+                                     limit=MAX_UNIT_CHARS))
     note = clean_text(payload.get("source_note"), "источник или комментарий",
                       limit=MAX_NOTE_CHARS)
     row = SupplyMaterial(org_id=org_id, title=title, qty=qty, unit=unit or "м",
@@ -455,7 +672,7 @@ def update_material(db: Session, org_id: int, material_id: int,
     _rev_guard(row, payload, "Материал")
     op_id = parse_op_id(payload)
     if "title" in payload:
-        new = clean_text(payload.get("title"), "название материала",
+        new = clean_text(payload.get("title"), "название",
                          limit=MAX_TITLE_CHARS, required=True)
         if new != row.title:
             _journal(db, org_id, "material", row.id, "update", field="title",
@@ -479,8 +696,9 @@ def update_material(db: Session, org_id: int, material_id: int,
         # только программно, и следа не оставалось: «120» превращалось из метров
         # в килограммы, а сводка складывала это в новую корзину — при том, что
         # число не менялось ни на единицу. Такая правка обязана быть видна.
-        new_unit = clean_text(payload.get("unit") or "м", "единица",
-                              limit=MAX_UNIT_CHARS) or "м"
+        new_unit = normalize_unit(clean_text(payload.get("unit") or "м",
+                                             "единица",
+                                             limit=MAX_UNIT_CHARS)) or "м"
         if new_unit != row.unit:
             _journal(db, org_id, "material", row.id, "update", field="unit",
                      old=row.unit, new=new_unit, author=author, op_id=op_id)
@@ -610,7 +828,7 @@ def create_item(db: Session, org_id: int, payload: dict, author: str) -> SupplyI
         get_sketch(db, org_id, sketch_id)      # чужой эскиз сюда не привяжется
 
     if kind == "catalog":
-        base_name = clean_text(payload.get("base_name"), "вещь каталога",
+        base_name = clean_text(payload.get("base_name"), "модель",
                                limit=MAX_TITLE_CHARS, required=True)
         known = db.execute(
             select(Product.base_name).where(Product.org_id == org_id,
@@ -738,7 +956,7 @@ def update_item(db: Session, org_id: int, item_id: int, payload: dict,
     _rev_guard(row, payload, "Вещь")
     op_id = parse_op_id(payload)
 
-    if clean_text(payload.get("base_name"), "вещь каталога",
+    if clean_text(payload.get("base_name"), "модель",
                   limit=MAX_TITLE_CHARS):
         raise ValidationError(
             "Название вещи каталога приходит из вашего каталога — здесь оно не "
@@ -906,9 +1124,9 @@ def create_batch(db: Session, org_id: int, payload: dict, author: str) -> Supply
     намерению. Интерфейс обязан называть эту строку плановой — иначе снаружи
     она неотличима от заказа, которого нет.
     """
-    item = get_item(db, org_id, parse_id(payload.get("item_id"), "вещь"))
+    item = get_item(db, org_id, parse_id(payload.get("item_id"), "модель"))
     title = clean_text(payload.get("title"), "название партии", limit=MAX_TITLE_CHARS)
-    plan_qty = parse_qty(payload.get("plan_qty"), "план изделий", allow_unknown=True)
+    plan_qty = parse_pieces(payload.get("plan_qty"))
     plan_note = clean_text(payload.get("plan_note"), "заметка к плану",
                            limit=MAX_NOTE_CHARS)
     due = parse_due(payload)
@@ -1071,7 +1289,7 @@ def update_batch(db: Session, org_id: int, batch_id: int, payload: dict,
             op_id = ""
             row.title = new_title
     if "plan_qty" in payload:
-        new_qty = parse_qty(payload.get("plan_qty"), "план изделий", allow_unknown=True)
+        new_qty = parse_pieces(payload.get("plan_qty"))
         if new_qty != row.plan_qty:
             _journal(db, org_id, "batch", row.id, "update", field="plan_qty",
                      old="неизвестно" if row.plan_qty is None else row.plan_qty,
@@ -1083,7 +1301,10 @@ def update_batch(db: Session, org_id: int, batch_id: int, payload: dict,
         row.plan_note = clean_text(payload.get("plan_note"), "заметка к плану",
                                    limit=MAX_NOTE_CHARS)
     if any(k in payload for k in ("due_kind", "due_text", "due_date", "due_source")):
-        due = parse_due(payload)
+        # ТЕКУЩАЯ СТРОКА — ИСТОЧНИК УМОЛЧАНИЙ (ТЗ F-19). Без неё правка одного
+        # только источника срока стирала сам срок: разбор начинался с нуля, а
+        # отсутствующий `due_kind` означал «неизвестен».
+        due = parse_due(payload, current=row)
         before = describe_due(row)
         for key, value in due.items():
             setattr(row, key, value)
@@ -1099,9 +1320,15 @@ def update_batch(db: Session, org_id: int, batch_id: int, payload: dict,
 
 
 def describe_due(row: SupplyBatch) -> str:
-    """Срок словами — ровно тем видом, каким он задан. Без «сегодня»."""
+    """Срок словами — ровно тем видом, каким он задан. Без «сегодня».
+
+    ДАТА ЧИТАЕТСЯ ПО-РУССКИ (ТЗ F-18): «к 1 августа 2026» вместо «точно
+    2026-08-01». Машинный вид даты человек читает по одной цифре и всё равно
+    путает месяц с днём; формат показа при этом не меняет ни одного байта в
+    базе — там по-прежнему `ГГГГ-ММ-ДД`, и разбор ввода тоже прежний и строгий.
+    """
     if row.due_kind == "exact" and row.due_date:
-        return f"точно {row.due_date}"
+        return f"к {ru_date(row.due_date)}"
     if row.due_kind == "approx" and row.due_text:
         return f"ориентировочно {row.due_text}"
     if row.due_kind == "text" and row.due_text:
@@ -1153,10 +1380,10 @@ def create_assignment(db: Session, org_id: int, payload: dict,
     полный, — это половина правды, а она хуже честного отказа (D-37).
     """
     material = get_material(db, org_id, parse_id(payload.get("material_id"), "материал"))
-    batch = get_batch(db, org_id, parse_id(payload.get("batch_id"), "плановая партия"))
-    qty = parse_qty(payload.get("qty"), "метраж", allow_unknown=False)
+    batch = get_batch(db, org_id, parse_id(payload.get("batch_id"), "партию"))
+    qty = parse_qty(payload.get("qty"), "количество", allow_unknown=False)
     if qty is None or qty <= 0:
-        raise ValidationError("Назначить нужно число больше нуля.")
+        raise ValidationError("Укажите количество больше нуля.")
     note = clean_text(payload.get("note"), "заметка", limit=MAX_NOTE_CHARS)
     op_id = parse_op_id(payload)
     existing = db.execute(
@@ -1169,8 +1396,8 @@ def create_assignment(db: Session, org_id: int, payload: dict,
         total = round(was + qty, 3)
         if total > MAX_QTY:
             raise ValidationError(
-                f"На этой партии уже {fmt_qty(was)} — вместе выходит больше "
-                f"допустимого предела {MAX_QTY:.0f}.")
+                f"На этой партии уже {fmt_qty(was)} — вместе выходит больше. "
+                f"Максимум — {_max_qty_text()}.")
         existing.qty = total
         merged_note, cut = _merge_notes(existing.note, note)
         existing.note = merged_note
@@ -1235,9 +1462,9 @@ def update_assignment(db: Session, org_id: int, assignment_id: int, payload: dic
     _rev_guard(row, payload, "Назначение")
     op_id = parse_op_id(payload)
     if "qty" in payload:
-        qty = parse_qty(payload.get("qty"), "метраж", allow_unknown=False)
+        qty = parse_qty(payload.get("qty"), "количество", allow_unknown=False)
         if qty is None or qty <= 0:
-            raise ValidationError("Назначить нужно число больше нуля.")
+            raise ValidationError("Укажите количество больше нуля.")
         if qty != row.qty:
             _journal(db, org_id, "assignment", row.id, "update", field="qty",
                      old=row.qty, new=qty, author=author, op_id=op_id)
@@ -1278,15 +1505,15 @@ def move_assignment(db: Session, org_id: int, payload: dict, author: str) -> dic
     src = get_assignment(db, org_id, parse_id(payload.get("assignment_id"), "назначение"))
     _rev_guard(src, payload, "Назначение")
     target_batch = get_batch(db, org_id, parse_id(payload.get("to_batch_id"),
-                                                  "плановая партия"))
+                                                  "партию"))
     if target_batch.id == src.batch_id:
-        raise ValidationError("Это та же самая партия — переносить некуда.")
-    qty = parse_qty(payload.get("qty"), "метраж", allow_unknown=False)
+        raise ValidationError("Выберите другую партию.")
+    qty = parse_qty(payload.get("qty"), "количество", allow_unknown=False)
     if qty is None or qty <= 0:
-        raise ValidationError("Перенести нужно число больше нуля.")
+        raise ValidationError("Укажите количество больше нуля.")
     if qty > src.qty:
         raise ValidationError(
-            f"На этой партии назначено {fmt_qty(src.qty)} — перенести больше нечего.")
+            f"На этой партии только {fmt_qty(src.qty)} — больше перенести нельзя.")
     op_id = parse_op_id(payload)
 
     dst = db.execute(
@@ -1318,11 +1545,18 @@ def move_assignment(db: Session, org_id: int, payload: dict, author: str) -> dic
 # ── Сводка и следующий шаг ───────────────────────────────────────────────────
 
 def fmt_qty(value) -> str:
-    """Число человеку: без хвоста из нулей и без выдуманной точности."""
+    """Число человеку: без хвоста из нулей, без выдуманной точности и с запятой.
+
+    Запятая — десятичный разделитель по-русски (ТЗ F-18). Целое число дробной
+    части не получает вовсе, поэтому «шт» всегда печатаются целыми: хвост
+    `.rstrip("0").rstrip(".")` снимает его до подстановки запятой, а не после.
+    """
     if value is None:
         return "неизвестно"
     text = f"{float(value):.3f}".rstrip("0").rstrip(".")
-    return text or "0"
+    if not text or text == "-0":
+        text = "0"
+    return text.replace(".", ",")
 
 
 def material_links(db: Session, org_id: int, material_id: int) -> list[dict]:
@@ -1437,6 +1671,12 @@ def board(db: Session, org_id: int, role: str) -> dict:
         .order_by(SupplyAssignment.id.asc())
     ).scalars().all()
 
+    # Сегодняшняя дата читается ОДИН раз на всю доску: иначе партия, попавшая в
+    # ответ на границе суток, могла бы получить один признак, а соседняя —
+    # другой. Данные при этом не меняются: `due_past` считается на чтении и в
+    # базу не пишется (ТЗ F-18, «без изменения данных»).
+    today_iso = date.today().isoformat()
+
     item_by_id = {i.id: i for i in items}
     mat_by_id = {m.id: m for m in materials}
     batch_by_id = {b.id: b for b in batches}
@@ -1485,6 +1725,12 @@ def board(db: Session, org_id: int, role: str) -> dict:
             "due_author": b.due_author,
             "due_updated_at": b.due_updated_at.isoformat() if b.due_updated_at else "",
             "due_label": describe_due(b),
+            # ПРОШЕДШИЙ ТОЧНЫЙ СРОК — ПРИЗНАК ПОКАЗА, А НЕ СОСТОЯНИЕ СТРОКИ.
+            # Просрочки в слое по-прежнему нет: ни колонки, ни статуса, ни SLA.
+            # Ориентировочный срок и срок словами сюда не попадают вовсе — их не
+            # с чем сравнивать, и объявлять их просроченными было бы выдумкой.
+            "due_past": bool(b.due_kind == "exact" and b.due_date
+                             and b.due_date < today_iso),
             "assignments": [{
                 "id": a.id,
                 "material_id": a.material_id,
@@ -1530,11 +1776,11 @@ def board(db: Session, org_id: int, role: str) -> dict:
             "sketch_mime": list(SKETCH_MIME_TYPES),
             "max_qty": MAX_QTY,
         },
-        "disclaimer": (
-            "Плановые партии — это намерение, а не заказ: они не создают партию "
-            "«Оборота», не получают её номер и не входят в «Едет», «В заказе», "
-            "потребность и бюджет."
-        ),
+        # ОДИН ДИСКЛЕЙМЕР НА ВКЛАДКУ (ТЗ F-20). Прежний текст перечислял пять
+        # показателей и стоял на странице дважды; повторённое ограничение
+        # читается не внимательнее, а хуже. Смысл сохранён целиком: это план, и
+        # он не двигает ни заказы, ни «Едет», ни бюджет.
+        "disclaimer": "Это план: заказы, «Едет» и бюджет он не меняет.",
     }
 
 
@@ -1548,19 +1794,32 @@ def group_by_unit(pairs) -> list[dict]:
     килограммом никто не объявлял, и вывести его неоткуда.
 
     Складывать разрешено только одинаковое, поэтому здесь нет ни одного
-    коэффициента пересчёта и не появится: единица берётся у самого материала
-    как есть, ничего не нормализуется и не переименовывается («м» и «метр»
-    остаются разными подписями, потому что доказать их равенство мы не можем —
-    это ввод человека, а не справочник).
+    коэффициента пересчёта и не появится.
+
+    ЧТО ИЗМЕНИЛОСЬ ЗДЕСЬ ПО ТЗ F-16, И ЭТО НЕ ОТКАЗ ОТ ПРАВИЛА ВЫШЕ. Прежняя
+    редакция брала написание как есть и говорила прямо: доказать равенство «м» и
+    «метр» мы не можем. Владелец утвердил закрытый список синонимов — то есть
+    равенство теперь НЕ выводится нами, а названо решением; список лежит в
+    `UNIT_SYNONYMS`, и всё, чего в нём нет, по-прежнему остаётся своей корзиной.
+    Регистр и завершающая точка снимаются механически: «м», «м.» и «М» — это
+    одна и та же единица в любом справочнике, и пять корзин вместо одной были
+    не честностью, а неудобством.
+
+    ПОДПИСЬ КОРЗИНЫ — ПЕРВОЕ ВСТРЕЧЕННОЕ НАПИСАНИЕ (для утверждённых единиц —
+    каноническое). Своё написание человека не переписывается на экране: слой
+    складывает вместе, но не переучивает.
     """
     totals: dict[str, float] = {}
+    labels: dict[str, str] = {}
     for unit, qty in pairs:
         if qty is None:
             continue
-        key = (unit or "").strip()
+        raw = (unit or "").strip()
+        key = unit_key(raw)
+        labels.setdefault(key, _UNIT_BY_KEY.get(key, raw))
         totals[key] = round(totals.get(key, 0.0) + float(qty), 3)
-    return [{"unit": unit, "qty": qty}
-            for unit, qty in sorted(totals.items(), key=lambda kv: kv[0])]
+    return [{"unit": labels[key], "qty": qty}
+            for key, qty in sorted(totals.items(), key=lambda kv: kv[0])]
 
 
 def summary(mat_views: list[dict], batch_views: list[dict]) -> dict:
@@ -1654,9 +1913,11 @@ def next_step(mat_views: list[dict], items: list, batch_views: list[dict],
     if past:
         first = past[0]
         return {"code": "due_past",
+                # Дата в подсказке — короткой формой (ТЗ F-18): строка одна, и
+                # «1 авг 2026» читается тут лучше, чем полное написание.
                 "text": f"Срок партии «{first['title'] or first['item_title']}» "
-                        f"прошёл {first['due_date']} — обновите срок или "
-                        "отметьте в заметке, что готово."}
+                        f"прошёл {ru_date(first['due_date'], short=True)} — "
+                        "обновите срок или отметьте в заметке, что готово."}
     no_plan = [b for b in batch_views if not b["plan_known"]]
     if no_plan:
         return {"code": "plan_qty",

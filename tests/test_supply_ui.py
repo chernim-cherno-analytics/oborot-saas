@@ -2098,8 +2098,12 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
               is True)
         check("старый предпросмотр при этом доступен одним нажатием",
               page.evaluate("() => !!document.getElementById('sup-tab-preview')") is True)
-        check("плановая партия названа плановой прямо в назначении раздела",
-              "не заказ" in (page.text_content("#pl-note") or ""),
+        # F-20: дисклеймер стал одной утверждённой фразой. Прежде здесь
+        # проверялось слово «не заказ» из старого длинного текста; смысл
+        # («это план, и он ничего не двигает») проверяется по новому тексту.
+        check("граница раздела названа одной фразой прямо в назначении",
+              "Это план" in (page.text_content("#pl-note") or "")
+              and "«Едет»" in (page.text_content("#pl-note") or ""),
               (page.text_content("#pl-note") or "")[:90])
 
         check("пустое состояние предлагает начать с материала",
@@ -2165,9 +2169,13 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
         page.click("#pl-batch-form button[type=submit]")
         page.wait_for_timeout(1300)
         batches_text = page.text_content("#pl-batches") or ""
-        check("партия показана и НАЗВАНА плановой",
-              "Партия А" in batches_text and "плановая партия" in batches_text,
-              batches_text[:120])
+        # F-20: бейдж «плановая партия» с карточек убран — он стоял на ста
+        # процентах строк. Граница раздела осталась на месте, дисклеймером;
+        # проверка карточки теперь про саму карточку, а не про бейдж.
+        check("партия показана своей строкой",
+              "Партия А" in batches_text, batches_text[:120])
+        check("а бейджа «плановая партия» на карточках больше нет",
+              "плановая партия" not in batches_text, batches_text[:200])
         check("срок показан ориентиром вместе с источником, а не датой",
               "ориентировочно к середине ноября" in batches_text
               and "цех" in batches_text, batches_text[:200])
@@ -2404,7 +2412,7 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
         page.wait_for_timeout(200)
         page.fill("#pl-mat-title", "Фурнитура на вес")
         page.fill("#pl-mat-qty", "10")
-        page.fill("#pl-mat-unit", "кг")
+        page.select_option("#pl-mat-unit", "кг")
         page.click("#pl-mat-form button[type=submit]")
         page.wait_for_timeout(1400)
         summary_text = page.text_content("#pl-summary") or ""
@@ -2431,6 +2439,9 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
 
         # ── 24. SUPPLY-FIX-2: правки, распределение, пометка, удаление ──────
         supply_fix_2_ui(pw, base, c)
+
+        # ── 25. SUPPLY-FIX-3: единицы, формат, тексты, сохранность форм ─────
+        supply_fix_3_ui(pw, base, c)
 
     c.close()
     print(f"\nИТОГО: {len(PASS)} OK, {len(FAIL)} FAIL")
@@ -3907,6 +3918,379 @@ def _fix2_catalog_confirm(page, base, c) -> None:
     check("и второй строки той же модели не появилось",
           len([i for i in c.get(P).json()["items"]
                if i.get("base_name") == "Тренч «Классика»"]) == 1)
+
+
+def supply_fix_3_ui(pw, base, c) -> None:
+    """SUPPLY-FIX-3 в настоящем браузере: F-16, F-18, F-20 и весь F-21.
+
+    ПОЧЕМУ ЭТИ ЧЕТЫРЕ ЗДЕСЬ, А ДВА ДРУГИХ — НЕТ. F-17 и F-19 живут целиком на
+    сервере: строгий разбор и частичная правка срока проверяются ответом ручки,
+    и браузер к ним ничего не добавляет. А F-21 наоборот НЕ проверяем ничем,
+    кроме браузера: «набранное не пропало» — это состояние DOM после
+    перерисовки, и по HTML его не увидеть.
+
+    ПОВЕДЕНИЕ, А НЕ РАЗМЕТКА: тип элемента берётся у самого узла,
+    видимость — из `getComputedStyle`, положение — из `getBoundingClientRect`,
+    фокус — из `document.activeElement`.
+
+    Каждый шаг отдельный по той же причине, что в пакетах 1 и 2: прогон против
+    дерева без правки обязан сказать про КАЖДЫЙ пункт, а не умереть на первом.
+    """
+    browser = pw.chromium.launch()
+    ctx = browser.new_context(viewport={"width": 1400, "height": 900})
+    ctx.add_cookies([{"name": k, "value": v, "domain": "127.0.0.1", "path": "/"}
+                     for k, v in c.cookies.items()])
+    errors: list[str] = []
+    page = ctx.new_page()
+    page.on("pageerror", lambda e: errors.append(str(e)))
+
+    steps = (
+        ("F-16", lambda: _fix3_units(page, base)),
+        ("F-18", lambda: _fix3_format_ui(page, base, c)),
+        ("F-20", lambda: _fix3_texts_ui(page, base, c)),
+        ("F-21", lambda: _fix3_forms(page, base)),
+    )
+    for label, run_step in steps:
+        try:
+            run_step()
+        except Exception as exc:  # noqa: BLE001 — важен отчёт, а не тип
+            check(f"{label}: шаг дошёл до конца без исключения", False,
+                  f"{type(exc).__name__}: "
+                  f"{str(exc).strip().splitlines()[0][:160]}")
+
+    check("за сценарий SUPPLY-FIX-3 не было ошибок в консоли",
+          not errors, str(errors)[:200])
+    ctx.close()
+    try:
+        _fix3_mobile(browser, base, c)
+    except Exception as exc:  # noqa: BLE001
+        check("F-16/F-21 на телефоне: шаг дошёл до конца без исключения", False,
+              f"{type(exc).__name__}: {str(exc).strip().splitlines()[0][:160]}")
+    browser.close()
+
+
+def _open_plan(page, base) -> None:
+    page.goto(f"{base}/supply")
+    page.wait_for_timeout(1200)
+    close_hint(page)
+
+
+def _fix3_units(page, base) -> None:
+    """F-16: единица выбирается из списка, «другое» открывает своё поле."""
+    print("\n== F-16: единица — список из шести, «другое» открывает поле ==")
+    _open_plan(page, base)
+    page.click("#pl-add-material")
+    page.wait_for_timeout(300)
+
+    facts = page.evaluate("""() => {
+      const node = document.getElementById('pl-mat-unit');
+      const other = document.getElementById('pl-mat-unit-other');
+      return {
+        tag: node ? node.tagName : 'НЕТ',
+        options: (node && node.options)
+          ? [...node.options].map(o => o.value) : [],
+        otherExists: !!other,
+        otherShown: other
+          ? getComputedStyle(other.parentNode).display !== 'none' : null
+      };
+    }""")
+    check("единица — выпадающий список, а не свободное поле",
+          facts["tag"] == "SELECT", str(facts))
+    check("и в нём ровно шесть утверждённых вариантов",
+          facts["options"] == ["м", "кг", "шт", "рул.", "компл.", "другое"],
+          str(facts["options"]))
+    check("поле своей единицы существует",
+          facts["otherExists"] is True, str(facts))
+    check("но по умолчанию скрыто — оно нужно только для «другое»",
+          facts["otherShown"] is False, str(facts))
+
+    shown = page.evaluate("""() => {
+      const node = document.getElementById('pl-mat-unit');
+      if (!node || node.tagName !== 'SELECT') return null;
+      node.value = 'другое';
+      node.dispatchEvent(new Event('change'));
+      const other = document.getElementById('pl-mat-unit-other');
+      return other ? getComputedStyle(other.parentNode).display !== 'none' : null;
+    }""")
+    check("выбор «другое» открывает поле своей единицы", shown is True, str(shown))
+
+    # Возврат к единице из списка проверяется ДО отправки: удачное сохранение
+    # закрывает и очищает форму, и после него спрашивать было бы уже не у чего.
+    back = page.evaluate("""() => {
+      const node = document.getElementById('pl-mat-unit');
+      if (!node || node.tagName !== 'SELECT') return null;
+      node.value = 'кг';
+      node.dispatchEvent(new Event('change'));
+      const other = document.getElementById('pl-mat-unit-other');
+      return other ? getComputedStyle(other.parentNode).display !== 'none' : null;
+    }""")
+    check("возврат к единице из списка снова прячет своё поле",
+          back is False, str(back))
+
+    typed = page.evaluate("""() => {
+      const sel = document.getElementById('pl-mat-unit');
+      const t = document.getElementById('pl-mat-title');
+      const q = document.getElementById('pl-mat-qty');
+      const o = document.getElementById('pl-mat-unit-other');
+      if (!sel || sel.tagName !== 'SELECT' || !t || !q || !o) return false;
+      sel.value = 'другое';
+      sel.dispatchEvent(new Event('change'));
+      t.value = 'Тесьма Ф16';
+      q.value = '7';
+      o.value = 'ярд';
+      return true;
+    }""")
+    if typed:
+        page.click("#pl-mat-form button[type=submit]")
+        page.wait_for_timeout(1300)
+        text = page.text_content("#pl-materials") or ""
+        check("своя единица сохраняется и показывается как написана",
+              "Тесьма Ф16" in text and "7 ярд" in text, text[:200])
+    else:
+        check("своя единица сохраняется и показывается как написана", False,
+              "поля своей единицы на странице нет")
+
+
+#: Тот же адрес, что и у соседних блоков; локальная константа здесь затем,
+#: чтобы шаги F-18 и F-20 не переписывали его строкой в каждом вызове.
+P3 = "/api/supply/planning"
+
+
+def _fix3_format_ui(page, base, c) -> None:
+    """F-18: «1 августа 2026», «уже прошла» и запятая в дробном количестве."""
+    print("\n== F-18: русская дата на карточке и запятая в числе ==")
+    item = c.post(P3 + "/items", json={"kind": "draft", "title": "Плащ Ф18",
+                                      "op_id": "f3ui-i"}).json()
+    iid = [i for i in item["items"] if i["title"] == "Плащ Ф18"][0]["id"]
+    c.post(P3 + "/batches", json={"item_id": iid, "title": "Августовская Ф18",
+                                 "due_kind": "exact", "due_date": "2026-08-01",
+                                 "due_source": "цех", "plan_qty": "12",
+                                 "op_id": "f3ui-b"})
+    c.post(P3 + "/materials", json={"title": "Фурнитура Ф18", "qty": "10.5",
+                                   "unit": "кг", "op_id": "f3ui-m"})
+    _open_plan(page, base)
+
+    card = page.evaluate("""() => {
+      const cards = [...document.querySelectorAll('#pl-batches .pl-card')];
+      const one = cards.find(x => x.textContent.indexOf('Августовская Ф18') >= 0);
+      if (!one) return null;
+      const mark = one.querySelector('.pl-past');
+      const title = one.querySelector('.t');
+      return {
+        text: one.textContent,
+        markText: mark ? mark.textContent : '',
+        markColor: mark ? getComputedStyle(mark).color : '',
+        titleColor: title ? getComputedStyle(title).color : ''
+      };
+    }""")
+    check("карточка партии со сроком 2026-08-01 нашлась", card is not None,
+          "" if card else "карточки нет")
+    if card:
+        check("дата на карточке написана по-русски",
+              "1 августа 2026" in card["text"], card["text"][:200])
+        check("машинного вида даты на карточке нет",
+              "2026-08-01" not in card["text"], card["text"][:200])
+        check("прошедший срок помечен словами «уже прошла»",
+              card["markText"] == "уже прошла", repr(card["markText"]))
+        check("и пометка серая, а не того же цвета, что название",
+              bool(card["markColor"]) and card["markColor"] != card["titleColor"],
+              f"{card['markColor']} против {card['titleColor']}")
+
+    mat = page.evaluate("""() => {
+      const cards = [...document.querySelectorAll('#pl-materials .pl-card')];
+      const one = cards.find(x => x.textContent.indexOf('Фурнитура Ф18') >= 0);
+      return one ? one.textContent : null;
+    }""")
+    check("карточка дробного материала нашлась", mat is not None,
+          "" if mat else "карточки нет")
+    if mat:
+        check("дробное количество показано с запятой",
+              "10,5 кг" in mat, mat[:200])
+        check("и точки как разделителя на карточке нет",
+              "10.5" not in mat, mat[:200])
+
+
+def _fix3_texts_ui(page, base, c) -> None:
+    """F-20: один дисклеймер, утверждённые подписи, служебных слов нет."""
+    print("\n== F-20: тезис про «Едет» ровно один раз, подписи по ТЗ ==")
+    set_preview_flag(False)
+    _open_plan(page, base)
+    count = page.evaluate(
+        "() => (document.body.textContent.match(/«Едет»/g) || []).length")
+    check("без вкладки предпросмотра тезис про «Едет» встречается РОВНО раз",
+          count == 1, f"встретился {count} раз")
+
+    html = page.content()
+    for banned in ("Метраж, ", "Уточнить количество", "конечным числом",
+                   "Редакция должна"):
+        check(f"строки «{banned}» на странице нет", banned not in html,
+              banned)
+
+    set_preview_flag(True)
+    _open_plan(page, base)
+    per_tab = page.evaluate("""() => {
+      const one = document.getElementById('sup-view-plan');
+      const two = document.getElementById('sup-view-preview');
+      const n = el => el ? (el.textContent.match(/«Едет»/g) || []).length : -1;
+      return [n(one), n(two)];
+    }""")
+    check("с двумя вкладками тезис стоит по одному разу на каждой",
+          per_tab == [1, 1], str(per_tab))
+
+    batches = page.text_content("#pl-batches") or ""
+    check("бейджа «плановая партия» на карточках нет",
+          "плановая партия" not in batches, batches[:200])
+    check("а «новинка» осталась — она различает",
+          "новинка" in batches, batches[:200])
+    check("источник срока подписан человеческими словами",
+          "кто назвал срок: цех" in batches, batches[:300])
+    check("и служебного «источник:» на карточке больше нет",
+          "источник: цех" not in batches, batches[:300])
+
+    opened = page.evaluate("""() => {
+      const cards = [...document.querySelectorAll('#pl-materials .pl-card')];
+      const one = cards.find(x => x.textContent.indexOf('Фурнитура Ф18') >= 0);
+      if (!one) return false;
+      const btn = [...one.querySelectorAll('.pl-actions button')]
+        .find(b => b.textContent === 'Назначить на партию');
+      if (!btn) return false;
+      btn.click();
+      return true;
+    }""")
+    check("форма назначения открылась", opened is True, str(opened))
+    if opened:
+        page.wait_for_timeout(300)
+        form = page.evaluate("""() => {
+          const box = document.querySelector('#pl-materials .pl-form.inline');
+          if (!box) return null;
+          const submit = box.querySelector('button[type=submit]');
+          return {labels: [...box.querySelectorAll('label')].map(l => l.textContent),
+                  submit: submit ? submit.textContent : ''};
+        }""")
+        check("подпись количества названа «Сколько, <единица>»",
+              bool(form) and any(l.startswith("Сколько, ") for l in form["labels"]),
+              str(form))
+        check("а кнопка отправки называется «Отдать»",
+              bool(form) and form["submit"] == "Отдать", str(form))
+
+
+def _fix3_forms(page, base) -> None:
+    """F-21: набранное не пропадает, пустая соседка закрывается, фокус на месте."""
+    print("\n== F-21: формы не теряют ввод, открытая — в окне и в фокусе ==")
+    _open_plan(page, base)
+
+    # 1. Пустая соседняя форма закрывается, и это видно по её `hidden`.
+    page.click("#pl-add-item")
+    page.wait_for_timeout(250)
+    page.click("#pl-add-batch")
+    page.wait_for_timeout(250)
+    state = page.evaluate("""() => ({
+      item: document.getElementById('pl-item-form').hidden,
+      batch: document.getElementById('pl-batch-form').hidden
+    })""")
+    check("пустая форма вещи закрылась, когда открыли форму партии",
+          state["item"] is True and state["batch"] is False, str(state))
+
+    # 2. НЕПУСТУЮ не закрываем: там набранное человеком.
+    page.fill("#pl-batch-title", "Черновик Ф21")
+    page.click("#pl-add-material")
+    page.wait_for_timeout(300)
+    kept = page.evaluate("""() => {
+      const batch = document.getElementById('pl-batch-form');
+      const title = document.getElementById('pl-batch-title');
+      const first = document.getElementById('pl-mat-title');
+      const r = first ? first.getBoundingClientRect() : null;
+      return {
+        batchHidden: batch.hidden,
+        title: title ? title.value : null,
+        focused: document.activeElement ? document.activeElement.id : '',
+        inView: r ? (r.top >= 0 && r.bottom <= window.innerHeight
+                     && r.width > 0 && r.height > 0) : false
+      };
+    }""")
+    check("форма партии с набранным текстом НЕ закрылась",
+          kept["batchHidden"] is False, str(kept))
+    check("и текст в ней на месте", kept["title"] == "Черновик Ф21", str(kept))
+    check("первое поле открытой формы получило фокус",
+          kept["focused"] == "pl-mat-title", str(kept))
+    check("и оно видно на экране целиком", kept["inView"] is True, str(kept))
+
+    # 3. Инлайн-форма карточки переживает перерисовку с набранным текстом.
+    #    Кнопка ищется по видимому тексту обеих редакций: на дереве без правки
+    #    она называется иначе, и опираться на новое имя значило бы доказать
+    #    отсутствие КНОПКИ вместо отсутствия ПОВЕДЕНИЯ.
+    started = page.evaluate("""() => {
+      const cards = [...document.querySelectorAll('#pl-materials .pl-card')];
+      const one = cards.find(x => x.textContent.indexOf('Фурнитура Ф18') >= 0);
+      if (!one) return null;
+      const btn = [...one.querySelectorAll('.pl-actions button')]
+        .find(b => b.textContent === 'Изменить'
+                   || b.textContent === 'Уточнить количество');
+      if (!btn) return null;
+      if (!one.querySelector('.pl-form.inline')) btn.click();
+      const box = one.querySelector('.pl-form.inline');
+      if (!box) return null;
+      const text = box.querySelector('input[type=text], input:not([type])');
+      if (!text) return null;
+      text.value = 'НЕ ТЕРЯЙ МЕНЯ';
+      return {cardId: one.dataset.id || ''};
+    }""")
+    check("инлайн-форма на карточке материала открылась", started is not None,
+          "" if started else "формы или кнопки нет")
+    if started:
+        page.fill("#pl-mat-title", "Повод для перерисовки")
+        page.fill("#pl-mat-qty", "1")
+        page.click("#pl-mat-form button[type=submit]")
+        page.wait_for_timeout(1500)
+        after = page.evaluate("""() => {
+          const cards = [...document.querySelectorAll('#pl-materials .pl-card')];
+          const one = cards.find(x => x.textContent.indexOf('Фурнитура Ф18') >= 0);
+          if (!one) return {card: false};
+          const box = one.querySelector('.pl-form.inline');
+          if (!box) return {card: true, open: false};
+          const vals = [...box.querySelectorAll('input')].map(i => i.value);
+          return {card: true, open: true, vals: vals};
+        }""")
+        check("после сохранения в другой форме карточка на месте",
+              after.get("card") is True, str(after))
+        check("инлайн-форма пережила перерисовку",
+              after.get("open") is True, str(after))
+        check("и набранный в ней текст не пропал",
+              "НЕ ТЕРЯЙ МЕНЯ" in (after.get("vals") or []), str(after)[:200])
+
+
+def _fix3_mobile(browser, base, c) -> None:
+    """Те же два свойства на телефоне: список единиц и фокус в окне 390x844."""
+    print("\n== F-16/F-21 на телефоне 390x844 ==")
+    ctx = browser.new_context(viewport={"width": 390, "height": 844})
+    ctx.add_cookies([{"name": k, "value": v, "domain": "127.0.0.1", "path": "/"}
+                     for k, v in c.cookies.items()])
+    errors: list[str] = []
+    page = ctx.new_page()
+    page.on("pageerror", lambda e: errors.append(str(e)))
+    page.goto(f"{base}/supply")
+    page.wait_for_timeout(1200)
+    close_hint(page)
+    page.click("#pl-add-material")
+    page.wait_for_timeout(400)
+
+    facts = page.evaluate("""() => {
+      const sel = document.getElementById('pl-mat-unit');
+      const first = document.getElementById('pl-mat-title');
+      const r = first ? first.getBoundingClientRect() : null;
+      return {
+        tag: sel ? sel.tagName : 'НЕТ',
+        focused: document.activeElement ? document.activeElement.id : '',
+        inView: r ? (r.top >= 0 && r.bottom <= window.innerHeight
+                     && r.width > 0 && r.height > 0) : false
+      };
+    }""")
+    check("на телефоне единица тоже выбирается списком",
+          facts["tag"] == "SELECT", str(facts))
+    check("первое поле в фокусе", facts["focused"] == "pl-mat-title", str(facts))
+    check("и видно целиком на узком экране", facts["inView"] is True, str(facts))
+    check("на телефоне не было ошибок в консоли", not errors, str(errors)[:200])
+    ctx.close()
 
 
 def _fix2_mobile(browser, base, c) -> None:
