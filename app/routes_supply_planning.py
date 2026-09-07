@@ -106,6 +106,15 @@ def _fail(exc: Exception) -> HTTPException:
         return HTTPException(status_code=404, detail=str(exc))
     if isinstance(exc, sp.StaleWrite):
         return HTTPException(status_code=409, detail=str(exc))
+    if isinstance(exc, sp.ArchivedCatalogItem):
+        # 409, а не 400: ввод человека верен, модель существует — она убрана.
+        # Отдельный от `InUse` тип, потому что это вопрос, а не тупик: ответ на
+        # него — подтверждение `confirm_restore`, и текст его прямо предлагает.
+        return HTTPException(status_code=409, detail=str(exc))
+    if isinstance(exc, sp.InUse):
+        # 409, а не 400: ввод человека верен, отказ вызван состоянием соседних
+        # строк. Текст приходит из слоя уже с числом и с тем, что надо сделать.
+        return HTTPException(status_code=409, detail=str(exc))
     if isinstance(exc, sp.DuplicateOp):
         return HTTPException(status_code=409, detail=str(exc))
     return HTTPException(status_code=400, detail="Не удалось выполнить действие.")
@@ -188,6 +197,120 @@ def api_planning_material_update(
     return _commit(db, ctx.org.id, ctx.role)
 
 
+@router.post("/materials/{material_id}/archive")
+def api_planning_material_archive(
+    material_id: int,
+    payload: dict = Body(default={}),
+    ctx: AuthContext = Depends(require_owner_api),
+    db: Session = Depends(get_db),
+):
+    """Убрать материал с доски (F-12). Строка остаётся, отметка проставляется.
+
+    Права те же, что у любой записи слоя: только владелец, поверх — общий гейт
+    подписки и общий CSRF. Исключений «удаление же не запись» здесь нет:
+    убрать строку — это изменить данные организации.
+    """
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Ожидался объект JSON.")
+    try:
+        if sp.check_op(db, ctx.org.id, sp.parse_op_id(payload)):
+            return sp.board(db, ctx.org.id, ctx.role)
+        sp.archive_material(db, ctx.org.id, material_id, payload, _author(ctx))
+    except (sp.PlanningError, IntegrityError) as exc:
+        db.rollback()
+        raise _fail(exc) from None
+    return _commit(db, ctx.org.id, ctx.role)
+
+
+@router.post("/materials/{material_id}/restore")
+def api_planning_material_restore(
+    material_id: int,
+    payload: dict = Body(default={}),
+    ctx: AuthContext = Depends(require_owner_api),
+    db: Session = Depends(get_db),
+):
+    """Вернуть материал на доску. Возвращается ровно то, что убрали."""
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Ожидался объект JSON.")
+    try:
+        if sp.check_op(db, ctx.org.id, sp.parse_op_id(payload)):
+            return sp.board(db, ctx.org.id, ctx.role)
+        sp.restore_material(db, ctx.org.id, material_id, payload, _author(ctx))
+    except (sp.PlanningError, IntegrityError) as exc:
+        db.rollback()
+        raise _fail(exc) from None
+    return _commit(db, ctx.org.id, ctx.role)
+
+
+@router.post("/items/{item_id}/update")
+def api_planning_item_update(
+    item_id: int,
+    payload: dict = Body(...),
+    ctx: AuthContext = Depends(require_owner_api),
+    db: Session = Depends(get_db),
+):
+    """Правка вещи: имя новинки, заметка, замена эскиза (F-13в).
+
+    `base_name` и `kind` не меняются — слой отвечает 400 и называет, что убрать,
+    вместо того чтобы принять поле и молча его выбросить (D-55, п. 1).
+    """
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Ожидался объект JSON.")
+    try:
+        if sp.check_op(db, ctx.org.id, sp.parse_op_id(payload)):
+            return sp.board(db, ctx.org.id, ctx.role)
+        sp.update_item(db, ctx.org.id, item_id, payload, _author(ctx))
+    except (sp.PlanningError, IntegrityError) as exc:
+        db.rollback()
+        raise _fail(exc) from None
+    return _commit(db, ctx.org.id, ctx.role)
+
+
+@router.post("/items/{item_id}/archive")
+def api_planning_item_archive(
+    item_id: int,
+    payload: dict = Body(default={}),
+    ctx: AuthContext = Depends(require_owner_api),
+    db: Session = Depends(get_db),
+):
+    """Убрать вещь с доски (F-12). В этом пакете — только новинку.
+
+    Вещь каталога отвечает 409: её взаимодействие с выпущенным замком
+    `ux_supply_items_catalog` — продуктовая развилка, удержанная до решения
+    владельца (`TECH_DEBT.md`, `SUPPLY-FIX-2-REG`).
+    """
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Ожидался объект JSON.")
+    try:
+        if sp.check_op(db, ctx.org.id, sp.parse_op_id(payload)):
+            return sp.board(db, ctx.org.id, ctx.role)
+        sp.archive_item(db, ctx.org.id, item_id, payload, _author(ctx))
+    except (sp.PlanningError, IntegrityError) as exc:
+        db.rollback()
+        raise _fail(exc) from None
+    return _commit(db, ctx.org.id, ctx.role)
+
+
+@router.post("/items/{item_id}/restore")
+def api_planning_item_restore(
+    item_id: int,
+    payload: dict = Body(default={}),
+    ctx: AuthContext = Depends(require_owner_api),
+    db: Session = Depends(get_db),
+):
+    """Вернуть вещь на доску — ровно ту же, ничего не воссоздавая."""
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Ожидался объект JSON.")
+    try:
+        if sp.check_op(db, ctx.org.id, sp.parse_op_id(payload)):
+            return sp.board(db, ctx.org.id, ctx.role)
+        sp.restore_item(db, ctx.org.id, item_id, payload, _author(ctx))
+    except (sp.PlanningError, IntegrityError) as exc:
+        db.rollback()
+        raise _fail(exc) from None
+    return _commit(db, ctx.org.id, ctx.role)
+
+
 @router.post("/items")
 def api_planning_item_create(
     payload: dict = Body(...),
@@ -209,11 +332,17 @@ def api_planning_item_create(
             return sp.board(db, ctx.org.id, ctx.role)
         item = sp.create_item(db, ctx.org.id, payload, _author(ctx))
         reused = bool(getattr(item, "reused", False))
+        restored = bool(getattr(item, "restored", False))
+        title = item.title
     except (sp.PlanningError, IntegrityError) as exc:
         db.rollback()
         raise _fail(exc) from None
     board = _commit(db, ctx.org.id, ctx.role)
-    if reused:
+    if restored:
+        # Возврат из архива и «эта модель уже есть» — разные события, и один
+        # текст на оба сказал бы человеку неправду о том, что он сделал.
+        board["notice"] = f"Модель «{title}» вернулась в план."
+    elif reused:
         board["notice"] = "Эта модель уже есть в плане."
     return board
 
@@ -254,6 +383,61 @@ def api_planning_batch_update(
         db.rollback()
         raise _fail(exc) from None
     return _commit(db, ctx.org.id, ctx.role)
+
+
+@router.post("/batches/{batch_id}/archive")
+def api_planning_batch_archive(
+    batch_id: int,
+    payload: dict = Body(default={}),
+    ctx: AuthContext = Depends(require_owner_api),
+    db: Session = Depends(get_db),
+):
+    """Убрать партию вместе с её назначениями (F-12, решение владельца).
+
+    В ответ кладётся, СКОЛЬКО назначений снято и сколько метража вернулось в
+    свободный остаток: без этих чисел интерфейс не может сказать человеку
+    правду о том, что сейчас произошло, — а «Удалено» без последствий было бы
+    половиной правды.
+    """
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Ожидался объект JSON.")
+    try:
+        if sp.check_op(db, ctx.org.id, sp.parse_op_id(payload)):
+            return sp.board(db, ctx.org.id, ctx.role)
+        done = sp.archive_batch(db, ctx.org.id, batch_id, payload, _author(ctx))
+    except (sp.PlanningError, IntegrityError) as exc:
+        db.rollback()
+        raise _fail(exc) from None
+    board = _commit(db, ctx.org.id, ctx.role)
+    board["archived"] = done
+    return board
+
+
+@router.post("/batches/{batch_id}/restore")
+def api_planning_batch_restore(
+    batch_id: int,
+    payload: dict = Body(default={}),
+    ctx: AuthContext = Depends(require_owner_api),
+    db: Session = Depends(get_db),
+):
+    """Вернуть партию ВМЕСТЕ с прежними назначениями и заметками.
+
+    Число возвращённого метража уходит наружу по той же причине, что и при
+    архивации: метраж возвращается В РАСПРЕДЕЛЕНИЕ, у материала снова растёт
+    «назначено», и человек обязан увидеть это числом, а не обнаружить потом.
+    """
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Ожидался объект JSON.")
+    try:
+        if sp.check_op(db, ctx.org.id, sp.parse_op_id(payload)):
+            return sp.board(db, ctx.org.id, ctx.role)
+        done = sp.restore_batch(db, ctx.org.id, batch_id, payload, _author(ctx))
+    except (sp.PlanningError, IntegrityError) as exc:
+        db.rollback()
+        raise _fail(exc) from None
+    board = _commit(db, ctx.org.id, ctx.role)
+    board["restored"] = done
+    return board
 
 
 @router.post("/assignments")
