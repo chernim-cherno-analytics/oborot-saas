@@ -2098,8 +2098,12 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
               is True)
         check("старый предпросмотр при этом доступен одним нажатием",
               page.evaluate("() => !!document.getElementById('sup-tab-preview')") is True)
-        check("плановая партия названа плановой прямо в назначении раздела",
-              "не заказ" in (page.text_content("#pl-note") or ""),
+        # F-20: дисклеймер стал одной утверждённой фразой. Прежде здесь
+        # проверялось слово «не заказ» из старого длинного текста; смысл
+        # («это план, и он ничего не двигает») проверяется по новому тексту.
+        check("граница раздела названа одной фразой прямо в назначении",
+              "Это план" in (page.text_content("#pl-note") or "")
+              and "«Едет»" in (page.text_content("#pl-note") or ""),
               (page.text_content("#pl-note") or "")[:90])
 
         check("пустое состояние предлагает начать с материала",
@@ -2165,9 +2169,13 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
         page.click("#pl-batch-form button[type=submit]")
         page.wait_for_timeout(1300)
         batches_text = page.text_content("#pl-batches") or ""
-        check("партия показана и НАЗВАНА плановой",
-              "Партия А" in batches_text and "плановая партия" in batches_text,
-              batches_text[:120])
+        # F-20: бейдж «плановая партия» с карточек убран — он стоял на ста
+        # процентах строк. Граница раздела осталась на месте, дисклеймером;
+        # проверка карточки теперь про саму карточку, а не про бейдж.
+        check("партия показана своей строкой",
+              "Партия А" in batches_text, batches_text[:120])
+        check("а бейджа «плановая партия» на карточках больше нет",
+              "плановая партия" not in batches_text, batches_text[:200])
         check("срок показан ориентиром вместе с источником, а не датой",
               "ориентировочно к середине ноября" in batches_text
               and "цех" in batches_text, batches_text[:200])
@@ -2404,7 +2412,7 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
         page.wait_for_timeout(200)
         page.fill("#pl-mat-title", "Фурнитура на вес")
         page.fill("#pl-mat-qty", "10")
-        page.fill("#pl-mat-unit", "кг")
+        page.select_option("#pl-mat-unit", "кг")
         page.click("#pl-mat-form button[type=submit]")
         page.wait_for_timeout(1400)
         summary_text = page.text_content("#pl-summary") or ""
@@ -2431,6 +2439,9 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
 
         # ── 24. SUPPLY-FIX-2: правки, распределение, пометка, удаление ──────
         supply_fix_2_ui(pw, base, c)
+
+        # ── 25. SUPPLY-FIX-3: единицы, формат, тексты, сохранность форм ─────
+        supply_fix_3_ui(pw, base, c)
 
     c.close()
     print(f"\nИТОГО: {len(PASS)} OK, {len(FAIL)} FAIL")
@@ -3907,6 +3918,1326 @@ def _fix2_catalog_confirm(page, base, c) -> None:
     check("и второй строки той же модели не появилось",
           len([i for i in c.get(P).json()["items"]
                if i.get("base_name") == "Тренч «Классика»"]) == 1)
+
+
+def supply_fix_3_ui(pw, base, c) -> None:
+    """SUPPLY-FIX-3 в настоящем браузере: F-16, F-18, F-20 и весь F-21.
+
+    ПОЧЕМУ ЭТИ ЧЕТЫРЕ ЗДЕСЬ, А ДВА ДРУГИХ — НЕТ. F-17 и F-19 живут целиком на
+    сервере: строгий разбор и частичная правка срока проверяются ответом ручки,
+    и браузер к ним ничего не добавляет. А F-21 наоборот НЕ проверяем ничем,
+    кроме браузера: «набранное не пропало» — это состояние DOM после
+    перерисовки, и по HTML его не увидеть.
+
+    ПОВЕДЕНИЕ, А НЕ РАЗМЕТКА: тип элемента берётся у самого узла,
+    видимость — из `getComputedStyle`, положение — из `getBoundingClientRect`,
+    фокус — из `document.activeElement`.
+
+    Каждый шаг отдельный по той же причине, что в пакетах 1 и 2: прогон против
+    дерева без правки обязан сказать про КАЖДЫЙ пункт, а не умереть на первом.
+    """
+    browser = pw.chromium.launch()
+    ctx = browser.new_context(viewport={"width": 1400, "height": 900})
+    ctx.add_cookies([{"name": k, "value": v, "domain": "127.0.0.1", "path": "/"}
+                     for k, v in c.cookies.items()])
+    errors: list[str] = []
+    page = ctx.new_page()
+    page.on("pageerror", lambda e: errors.append(str(e)))
+
+    steps = (
+        ("F-16", lambda: _fix3_units(page, base)),
+        ("F-18", lambda: _fix3_format_ui(page, base, c)),
+        ("F-20", lambda: _fix3_texts_ui(page, base, c)),
+        ("F-21", lambda: _fix3_forms(page, base)),
+        # Корректив 1 по REVIEW_REJECT: восстановленная форма обязана
+        # описывать своё состояние, а «Сохранить» — работать.
+        ("P1 срок", lambda: _fix3_restore_case(page, base, c, "desktop")),
+        ("P1 единица", lambda: _fix3_restore_unit(page, base, c, "desktop")),
+        ("P1 сосед", lambda: _fix3_restore_plain(page, base, c, "desktop")),
+        # Корректив 2: воспроизведённые P1 внешних тредов.
+        ("P1 пустая единица", lambda: _fix3_empty_unit_ui(page, base, c, "desktop")),
+        ("P1 потерянный ответ", lambda: _fix3_lost_response(page, base, c)),
+        # Корректив 3: черновик обязан держаться за СВОЮ редакцию.
+        ("P1 черновик материала", lambda: _fix3_stale_material(page, base, c, "desktop")),
+        ("P1 черновик вещи", lambda: _fix3_stale_item(page, base, c, "desktop")),
+        ("P1 черновик партии", lambda: _fix3_stale_batch(page, base, c, "desktop")),
+        ("P1 черновик переноса", lambda: _fix3_stale_move(page, base, c, "desktop")),
+        ("сторож своей записи", lambda: _fix3_own_save_rebase(page, base, c, "desktop")),
+        # Корректив 4: повтор поступка не воскрешает старый черновик.
+        ("P1 повтор и правка", lambda: _fix3_replay_then_edit(page, base, c, "desktop")),
+        ("сторож чужой правки после коммита",
+         lambda: _fix3_peer_after_commit(page, base, c, "desktop")),
+    )
+    for label, run_step in steps:
+        try:
+            run_step()
+        except Exception as exc:  # noqa: BLE001 — важен отчёт, а не тип
+            check(f"{label}: шаг дошёл до конца без исключения", False,
+                  f"{type(exc).__name__}: "
+                  f"{str(exc).strip().splitlines()[0][:160]}")
+
+    check("за сценарий SUPPLY-FIX-3 не было ошибок в консоли",
+          not errors, str(errors)[:200])
+    ctx.close()
+    try:
+        _fix3_mobile(browser, base, c)
+    except Exception as exc:  # noqa: BLE001
+        check("F-16/F-21 на телефоне: шаг дошёл до конца без исключения", False,
+              f"{type(exc).__name__}: {str(exc).strip().splitlines()[0][:160]}")
+    browser.close()
+
+
+def _open_plan(page, base) -> None:
+    page.goto(f"{base}/supply")
+    page.wait_for_timeout(1200)
+    close_hint(page)
+
+
+def _fix3_units(page, base) -> None:
+    """F-16: единица выбирается из списка, «другое» открывает своё поле."""
+    print("\n== F-16: единица — список из шести, «другое» открывает поле ==")
+    _open_plan(page, base)
+    page.click("#pl-add-material")
+    page.wait_for_timeout(300)
+
+    facts = page.evaluate("""() => {
+      const node = document.getElementById('pl-mat-unit');
+      const other = document.getElementById('pl-mat-unit-other');
+      return {
+        tag: node ? node.tagName : 'НЕТ',
+        options: (node && node.options)
+          ? [...node.options].map(o => o.value) : [],
+        otherExists: !!other,
+        otherShown: other
+          ? getComputedStyle(other.parentNode).display !== 'none' : null
+      };
+    }""")
+    check("единица — выпадающий список, а не свободное поле",
+          facts["tag"] == "SELECT", str(facts))
+    check("и в нём ровно шесть утверждённых вариантов",
+          facts["options"] == ["м", "кг", "шт", "рул.", "компл.", "другое"],
+          str(facts["options"]))
+    check("поле своей единицы существует",
+          facts["otherExists"] is True, str(facts))
+    check("но по умолчанию скрыто — оно нужно только для «другое»",
+          facts["otherShown"] is False, str(facts))
+
+    shown = page.evaluate("""() => {
+      const node = document.getElementById('pl-mat-unit');
+      if (!node || node.tagName !== 'SELECT') return null;
+      node.value = 'другое';
+      node.dispatchEvent(new Event('change'));
+      const other = document.getElementById('pl-mat-unit-other');
+      return other ? getComputedStyle(other.parentNode).display !== 'none' : null;
+    }""")
+    check("выбор «другое» открывает поле своей единицы", shown is True, str(shown))
+
+    # Возврат к единице из списка проверяется ДО отправки: удачное сохранение
+    # закрывает и очищает форму, и после него спрашивать было бы уже не у чего.
+    back = page.evaluate("""() => {
+      const node = document.getElementById('pl-mat-unit');
+      if (!node || node.tagName !== 'SELECT') return null;
+      node.value = 'кг';
+      node.dispatchEvent(new Event('change'));
+      const other = document.getElementById('pl-mat-unit-other');
+      return other ? getComputedStyle(other.parentNode).display !== 'none' : null;
+    }""")
+    check("возврат к единице из списка снова прячет своё поле",
+          back is False, str(back))
+
+    typed = page.evaluate("""() => {
+      const sel = document.getElementById('pl-mat-unit');
+      const t = document.getElementById('pl-mat-title');
+      const q = document.getElementById('pl-mat-qty');
+      const o = document.getElementById('pl-mat-unit-other');
+      if (!sel || sel.tagName !== 'SELECT' || !t || !q || !o) return false;
+      sel.value = 'другое';
+      sel.dispatchEvent(new Event('change'));
+      t.value = 'Тесьма Ф16';
+      q.value = '7';
+      o.value = 'ярд';
+      return true;
+    }""")
+    if typed:
+        page.click("#pl-mat-form button[type=submit]")
+        page.wait_for_timeout(1300)
+        text = page.text_content("#pl-materials") or ""
+        check("своя единица сохраняется и показывается как написана",
+              "Тесьма Ф16" in text and "7 ярд" in text, text[:200])
+    else:
+        check("своя единица сохраняется и показывается как написана", False,
+              "поля своей единицы на странице нет")
+
+
+#: Тот же адрес, что и у соседних блоков; локальная константа здесь затем,
+#: чтобы шаги F-18 и F-20 не переписывали его строкой в каждом вызове.
+P3 = "/api/supply/planning"
+
+
+def _fix3_format_ui(page, base, c) -> None:
+    """F-18: «1 августа 2026», «уже прошла» и запятая в дробном количестве."""
+    print("\n== F-18: русская дата на карточке и запятая в числе ==")
+    item = c.post(P3 + "/items", json={"kind": "draft", "title": "Плащ Ф18",
+                                      "op_id": "f3ui-i"}).json()
+    iid = [i for i in item["items"] if i["title"] == "Плащ Ф18"][0]["id"]
+    c.post(P3 + "/batches", json={"item_id": iid, "title": "Августовская Ф18",
+                                 "due_kind": "exact", "due_date": "2026-08-01",
+                                 "due_source": "цех", "plan_qty": "12",
+                                 "op_id": "f3ui-b"})
+    c.post(P3 + "/materials", json={"title": "Фурнитура Ф18", "qty": "10.5",
+                                   "unit": "кг", "op_id": "f3ui-m"})
+    _open_plan(page, base)
+
+    card = page.evaluate("""() => {
+      const cards = [...document.querySelectorAll('#pl-batches .pl-card')];
+      const one = cards.find(x => x.textContent.indexOf('Августовская Ф18') >= 0);
+      if (!one) return null;
+      const mark = one.querySelector('.pl-past');
+      const title = one.querySelector('.t');
+      return {
+        text: one.textContent,
+        markText: mark ? mark.textContent : '',
+        markColor: mark ? getComputedStyle(mark).color : '',
+        titleColor: title ? getComputedStyle(title).color : ''
+      };
+    }""")
+    check("карточка партии со сроком 2026-08-01 нашлась", card is not None,
+          "" if card else "карточки нет")
+    if card:
+        check("дата на карточке написана по-русски",
+              "1 августа 2026" in card["text"], card["text"][:200])
+        check("машинного вида даты на карточке нет",
+              "2026-08-01" not in card["text"], card["text"][:200])
+        check("прошедший срок помечен словами «уже прошла»",
+              card["markText"] == "уже прошла", repr(card["markText"]))
+        check("и пометка серая, а не того же цвета, что название",
+              bool(card["markColor"]) and card["markColor"] != card["titleColor"],
+              f"{card['markColor']} против {card['titleColor']}")
+
+    mat = page.evaluate("""() => {
+      const cards = [...document.querySelectorAll('#pl-materials .pl-card')];
+      const one = cards.find(x => x.textContent.indexOf('Фурнитура Ф18') >= 0);
+      return one ? one.textContent : null;
+    }""")
+    check("карточка дробного материала нашлась", mat is not None,
+          "" if mat else "карточки нет")
+    if mat:
+        check("дробное количество показано с запятой",
+              "10,5 кг" in mat, mat[:200])
+        check("и точки как разделителя на карточке нет",
+              "10.5" not in mat, mat[:200])
+
+
+def _fix3_texts_ui(page, base, c) -> None:
+    """F-20: один дисклеймер, утверждённые подписи, служебных слов нет."""
+    print("\n== F-20: тезис про «Едет» ровно один раз, подписи по ТЗ ==")
+    set_preview_flag(False)
+    _open_plan(page, base)
+    count = page.evaluate(
+        "() => (document.body.textContent.match(/«Едет»/g) || []).length")
+    check("без вкладки предпросмотра тезис про «Едет» встречается РОВНО раз",
+          count == 1, f"встретился {count} раз")
+
+    html = page.content()
+    for banned in ("Метраж, ", "Уточнить количество", "конечным числом",
+                   "Редакция должна"):
+        check(f"строки «{banned}» на странице нет", banned not in html,
+              banned)
+
+    set_preview_flag(True)
+    _open_plan(page, base)
+    per_tab = page.evaluate("""() => {
+      const one = document.getElementById('sup-view-plan');
+      const two = document.getElementById('sup-view-preview');
+      const n = el => el ? (el.textContent.match(/«Едет»/g) || []).length : -1;
+      return [n(one), n(two)];
+    }""")
+    check("с двумя вкладками тезис стоит по одному разу на каждой",
+          per_tab == [1, 1], str(per_tab))
+
+    batches = page.text_content("#pl-batches") or ""
+    check("бейджа «плановая партия» на карточках нет",
+          "плановая партия" not in batches, batches[:200])
+    check("а «новинка» осталась — она различает",
+          "новинка" in batches, batches[:200])
+    check("источник срока подписан человеческими словами",
+          "кто назвал срок: цех" in batches, batches[:300])
+    check("и служебного «источник:» на карточке больше нет",
+          "источник: цех" not in batches, batches[:300])
+
+    opened = page.evaluate("""() => {
+      const cards = [...document.querySelectorAll('#pl-materials .pl-card')];
+      const one = cards.find(x => x.textContent.indexOf('Фурнитура Ф18') >= 0);
+      if (!one) return false;
+      const btn = [...one.querySelectorAll('.pl-actions button')]
+        .find(b => b.textContent === 'Назначить на партию');
+      if (!btn) return false;
+      btn.click();
+      return true;
+    }""")
+    check("форма назначения открылась", opened is True, str(opened))
+    if opened:
+        page.wait_for_timeout(300)
+        form = page.evaluate("""() => {
+          const box = document.querySelector('#pl-materials .pl-form.inline');
+          if (!box) return null;
+          const submit = box.querySelector('button[type=submit]');
+          return {labels: [...box.querySelectorAll('label')].map(l => l.textContent),
+                  submit: submit ? submit.textContent : ''};
+        }""")
+        check("подпись количества названа «Сколько, <единица>»",
+              bool(form) and any(l.startswith("Сколько, ") for l in form["labels"]),
+              str(form))
+        check("а кнопка отправки называется «Отдать»",
+              bool(form) and form["submit"] == "Отдать", str(form))
+
+
+def _fix3_forms(page, base) -> None:
+    """F-21: набранное не пропадает, пустая соседка закрывается, фокус на месте."""
+    print("\n== F-21: формы не теряют ввод, открытая — в окне и в фокусе ==")
+    _open_plan(page, base)
+
+    # 1. Пустая соседняя форма закрывается, и это видно по её `hidden`.
+    page.click("#pl-add-item")
+    page.wait_for_timeout(250)
+    page.click("#pl-add-batch")
+    page.wait_for_timeout(250)
+    state = page.evaluate("""() => ({
+      item: document.getElementById('pl-item-form').hidden,
+      batch: document.getElementById('pl-batch-form').hidden
+    })""")
+    check("пустая форма вещи закрылась, когда открыли форму партии",
+          state["item"] is True and state["batch"] is False, str(state))
+
+    # 2. НЕПУСТУЮ не закрываем: там набранное человеком.
+    page.fill("#pl-batch-title", "Черновик Ф21")
+    page.click("#pl-add-material")
+    page.wait_for_timeout(300)
+    kept = page.evaluate("""() => {
+      const batch = document.getElementById('pl-batch-form');
+      const title = document.getElementById('pl-batch-title');
+      const first = document.getElementById('pl-mat-title');
+      const r = first ? first.getBoundingClientRect() : null;
+      return {
+        batchHidden: batch.hidden,
+        title: title ? title.value : null,
+        focused: document.activeElement ? document.activeElement.id : '',
+        inView: r ? (r.top >= 0 && r.bottom <= window.innerHeight
+                     && r.width > 0 && r.height > 0) : false
+      };
+    }""")
+    check("форма партии с набранным текстом НЕ закрылась",
+          kept["batchHidden"] is False, str(kept))
+    check("и текст в ней на месте", kept["title"] == "Черновик Ф21", str(kept))
+    check("первое поле открытой формы получило фокус",
+          kept["focused"] == "pl-mat-title", str(kept))
+    check("и оно видно на экране целиком", kept["inView"] is True, str(kept))
+
+    # 3. Инлайн-форма карточки переживает перерисовку с набранным текстом.
+    #    Кнопка ищется по видимому тексту обеих редакций: на дереве без правки
+    #    она называется иначе, и опираться на новое имя значило бы доказать
+    #    отсутствие КНОПКИ вместо отсутствия ПОВЕДЕНИЯ.
+    started = page.evaluate("""() => {
+      const cards = [...document.querySelectorAll('#pl-materials .pl-card')];
+      const one = cards.find(x => x.textContent.indexOf('Фурнитура Ф18') >= 0);
+      if (!one) return null;
+      const btn = [...one.querySelectorAll('.pl-actions button')]
+        .find(b => b.textContent === 'Изменить'
+                   || b.textContent === 'Уточнить количество');
+      if (!btn) return null;
+      if (!one.querySelector('.pl-form.inline')) btn.click();
+      const box = one.querySelector('.pl-form.inline');
+      if (!box) return null;
+      const text = box.querySelector('input[type=text], input:not([type])');
+      if (!text) return null;
+      text.value = 'НЕ ТЕРЯЙ МЕНЯ';
+      return {cardId: one.dataset.id || ''};
+    }""")
+    check("инлайн-форма на карточке материала открылась", started is not None,
+          "" if started else "формы или кнопки нет")
+    if started:
+        page.fill("#pl-mat-title", "Повод для перерисовки")
+        page.fill("#pl-mat-qty", "1")
+        page.click("#pl-mat-form button[type=submit]")
+        page.wait_for_timeout(1500)
+        after = page.evaluate("""() => {
+          const cards = [...document.querySelectorAll('#pl-materials .pl-card')];
+          const one = cards.find(x => x.textContent.indexOf('Фурнитура Ф18') >= 0);
+          if (!one) return {card: false};
+          const box = one.querySelector('.pl-form.inline');
+          if (!box) return {card: true, open: false};
+          const vals = [...box.querySelectorAll('input')].map(i => i.value);
+          return {card: true, open: true, vals: vals};
+        }""")
+        check("после сохранения в другой форме карточка на месте",
+              after.get("card") is True, str(after))
+        check("инлайн-форма пережила перерисовку",
+              after.get("open") is True, str(after))
+        check("и набранный в ней текст не пропал",
+              "НЕ ТЕРЯЙ МЕНЯ" in (after.get("vals") or []), str(after)[:200])
+
+
+# ── Корректив 1: восстановленная форма описывает СВОЁ состояние (P1 ревью) ────
+
+def _fix3_restore_case(page, base, c, tag: str) -> None:
+    """P1 ревью PR #54: после перерисовки форма врала и «Сохранить» отвечало 400.
+
+    ЧТО ИМЕННО ВОСПРОИЗВОДИТСЯ, шаг в шаг. У партии стоит точная дата. Человек
+    открывает «Изменить», переключает срок на «ориентировочно» и пишет текст —
+    и, не сохранив, сохраняет что-то в ДРУГОЙ форме. Это вызывает `render()`.
+    До исправления восстановленный список говорил «ориентировочно», введённый
+    текст лежал СКРЫТЫМ, а прежняя точная дата оставалась ВИДИМОЙ — и уходила в
+    запрос, потому что тело собирается по видимости. «Сохранить» отвечало 400.
+
+    Проверяется не разметка, а три разных факта сразу: что видно
+    (`getComputedStyle`), что уйдёт на сервер (ответ ручки) и что там осталось
+    (отдельный GET). Совпасть все три могут только если форма честна.
+    """
+    print(f"\n== Корректив: срок переживает перерисовку и сохраняется ({tag}) ==")
+    item = c.post(P3 + "/items", json={"kind": "draft", "title": f"Вещь {tag}",
+                                       "op_id": f"cr-i-{tag}"}).json()
+    iid = [i for i in item["items"] if i["title"] == f"Вещь {tag}"][0]["id"]
+    board = c.post(P3 + "/batches",
+                   json={"item_id": iid, "title": f"Партия {tag}", "plan_qty": "20",
+                         "due_kind": "exact", "due_date": "2026-10-31",
+                         "op_id": f"cr-b-{tag}"}).json()
+    bid = [b for b in board["batches"] if b["title"] == f"Партия {tag}"][0]["id"]
+
+    page.goto(f"{base}/supply")
+    page.wait_for_timeout(1200)
+    close_hint(page)
+
+    opened = page.evaluate("""(id) => {
+      const card = document.querySelector('[data-pl="batch"][data-id="' + id + '"]');
+      if (!card) return 'карточки нет';
+      const btn = card.querySelector('button[data-inline="edit"]');
+      if (!btn) return 'кнопки правки нет';
+      btn.click();
+      return card.querySelector('form.pl-form.inline') ? '' : 'форма не открылась';
+    }""", str(bid))
+    check(f"{tag}: форма правки партии открылась", opened == "", str(opened))
+    if opened:
+        return
+    page.wait_for_timeout(250)
+
+    # Выбор делается ровно так, как его делает человек: значение и событие.
+    page.evaluate("""(id) => {
+      const box = document.querySelector('[data-pl="batch"][data-id="' + id
+                                         + '"] form.pl-form.inline');
+      const sel = box.querySelector('select');
+      sel.value = 'approx';
+      sel.dispatchEvent(new Event('change'));
+      box.querySelector('input[id$="due-text"]').value = 'Конец ноября';
+    }""", str(bid))
+
+    # Перерисовку вызывает сохранение в ДРУГОЙ форме — это и есть условие P1.
+    page.click("#pl-add-material")
+    page.wait_for_timeout(250)
+    page.fill("#pl-mat-title", f"Повод {tag}")
+    page.fill("#pl-mat-qty", "3")
+    page.click("#pl-mat-form button[type=submit]")
+    page.wait_for_timeout(1500)
+
+    state = page.evaluate("""(id) => {
+      const box = document.querySelector('[data-pl="batch"][data-id="' + id
+                                         + '"] form.pl-form.inline');
+      if (!box) return null;
+      const vis = n => !!n && getComputedStyle(n.closest('.pl-field')).display !== 'none';
+      const t = box.querySelector('input[id$="due-text"]');
+      const d = box.querySelector('input[id$="due-date"]');
+      return {kind: box.querySelector('select').value,
+              text: t ? t.value : null, textVisible: vis(t),
+              date: d ? d.value : null, dateVisible: vis(d),
+              shown: box.innerText};
+    }""", str(bid))
+    check(f"{tag}: форма пережила перерисовку", state is not None,
+          "" if state else "формы нет")
+    if not state:
+        return
+    check(f"{tag}: вид срока остался тем, который выбрал человек",
+          state["kind"] == "approx", str(state["kind"]))
+    check(f"{tag}: введённый текст на месте", state["text"] == "Конец ноября",
+          repr(state["text"]))
+    check(f"{tag}: и он ВИДЕН, а не лежит скрытым",
+          state["textVisible"] is True, str(state))
+    check(f"{tag}: поле даты для этого вида срока скрыто",
+          state["dateVisible"] is False, str(state))
+
+    # Нажимаем «Сохранить» той же формы и смотрим на ТРИ вещи: ошибку у формы,
+    # ответ сервера и состояние строки после него.
+    page.evaluate("""(id) => {
+      const box = document.querySelector('[data-pl="batch"][data-id="' + id
+                                         + '"] form.pl-form.inline');
+      box.querySelector('button[type=submit]').click();
+    }""", str(bid))
+    page.wait_for_timeout(1500)
+    err = page.evaluate("""(id) => {
+      const card = document.querySelector('[data-pl="batch"][data-id="' + id + '"]');
+      const box = card && card.querySelector('form.pl-form.inline');
+      const e = box && box.querySelector('.pl-form-err');
+      return e ? e.textContent.trim() : '';
+    }""", str(bid))
+    check(f"{tag}: «Сохранить» не отвечает отказом", err == "", err[:160])
+
+    row = [b for b in c.get(P3).json()["batches"] if b["id"] == bid]
+    check(f"{tag}: строка партии на месте", bool(row), "" if row else "строки нет")
+    if row:
+        check(f"{tag}: на сервере лежит выбранный вид срока",
+              row[0]["due_kind"] == "approx", str(row[0]["due_kind"]))
+        check(f"{tag}: и написанный человеком текст",
+              row[0]["due_text"] == "Конец ноября", repr(row[0]["due_text"]))
+        check(f"{tag}: а прежняя точная дата снята, а не уехала в запрос",
+              row[0]["due_date"] == "", repr(row[0]["due_date"]))
+
+
+def _fix3_restore_unit(page, base, c, tag: str) -> None:
+    """Тот же корень у выбора единицы: «другое» и своя строка (корректив 1).
+
+    Здесь сохранение проходило и ДО исправления — и именно поэтому случай
+    отдельный: на сервер уходило значение, которого человек на экране не видел.
+    Это ровно то, что пакет 1 запретил (D-55 п. 1), и одной проверкой «ответ
+    200» такое не ловится.
+    """
+    print(f"\n== Корректив: своя единица переживает перерисовку ({tag}) ==")
+    board = c.post(P3 + "/materials",
+                   json={"title": f"Материал {tag}", "qty": "50", "unit": "м",
+                         "op_id": f"cr-m-{tag}"}).json()
+    mid = [m for m in board["materials"] if m["title"] == f"Материал {tag}"][0]["id"]
+
+    page.goto(f"{base}/supply")
+    page.wait_for_timeout(1200)
+    close_hint(page)
+    opened = page.evaluate("""(id) => {
+      const card = document.querySelector('[data-pl="material"][data-id="' + id + '"]');
+      if (!card) return 'карточки нет';
+      const btn = card.querySelector('button[data-inline="edit"]');
+      if (!btn) return 'кнопки правки нет';
+      btn.click();
+      return card.querySelector('form.pl-form.inline') ? '' : 'форма не открылась';
+    }""", str(mid))
+    check(f"{tag}: форма правки материала открылась", opened == "", str(opened))
+    if opened:
+        return
+    page.wait_for_timeout(250)
+    page.evaluate("""(id) => {
+      const box = document.querySelector('[data-pl="material"][data-id="' + id
+                                         + '"] form.pl-form.inline');
+      const sel = box.querySelector('select');
+      sel.value = 'другое';
+      sel.dispatchEvent(new Event('change'));
+      box.querySelector('input[id$="-other"]').value = 'бобина';
+    }""", str(mid))
+    page.click("#pl-add-material")
+    page.wait_for_timeout(250)
+    page.fill("#pl-mat-title", f"Второй повод {tag}")
+    page.fill("#pl-mat-qty", "4")
+    page.click("#pl-mat-form button[type=submit]")
+    page.wait_for_timeout(1500)
+
+    state = page.evaluate("""(id) => {
+      const box = document.querySelector('[data-pl="material"][data-id="' + id
+                                         + '"] form.pl-form.inline');
+      if (!box) return null;
+      const o = box.querySelector('input[id$="-other"]');
+      return {unit: box.querySelector('select').value,
+              other: o ? o.value : null,
+              otherVisible: !!o && getComputedStyle(o.closest('.pl-field')).display !== 'none'};
+    }""", str(mid))
+    check(f"{tag}: форма единицы пережила перерисовку", state is not None,
+          "" if state else "формы нет")
+    if not state:
+        return
+    check(f"{tag}: выбран по-прежнему «другое»", state["unit"] == "другое",
+          str(state["unit"]))
+    check(f"{tag}: своя единица на месте", state["other"] == "бобина",
+          repr(state["other"]))
+    check(f"{tag}: и поле своей единицы ВИДНО, а не отправляется втайне",
+          state["otherVisible"] is True, str(state))
+
+    page.evaluate("""(id) => {
+      const box = document.querySelector('[data-pl="material"][data-id="' + id
+                                         + '"] form.pl-form.inline');
+      box.querySelector('button[type=submit]').click();
+    }""", str(mid))
+    page.wait_for_timeout(1500)
+    row = [m for m in c.get(P3).json()["materials"] if m["id"] == mid]
+    check(f"{tag}: единица сохранена той, что видна на экране",
+          bool(row) and row[0]["unit"] == "бобина",
+          row[0]["unit"] if row else "строки нет")
+
+
+def _fix3_restore_plain(page, base, c, tag: str) -> None:
+    """Сторож соседей: форма БЕЗ зависимой видимости от правки не изменилась.
+
+    Перекраска после восстановления шлёт `change` списку, а списки есть и у
+    переноса. Здесь у формы зависимых полей нет вовсе, и правильное поведение —
+    «ничего не изменилось»: выбранная партия-приёмник остаётся выбранной, поле
+    количества целым, форма живой.
+    """
+    print(f"\n== Корректив: форма переноса от перекраски не пострадала ({tag}) ==")
+    board = c.get(P3).json()
+    mats = [m for m in board["materials"] if m["title"] == f"Материал {tag}"]
+    batches = [b for b in board["batches"] if b["title"] == f"Партия {tag}"]
+    if not mats or not batches:
+        check(f"{tag}: фикстуры переноса на месте", False, "нет материала или партии")
+        return
+    mid, bid = mats[0]["id"], batches[0]["id"]
+    other = c.post(P3 + "/batches",
+                   json={"item_id": batches[0]["item_id"], "title": f"Приёмник {tag}",
+                         "op_id": f"cr-b2-{tag}"}).json()
+    oid = [b for b in other["batches"] if b["title"] == f"Приёмник {tag}"][0]["id"]
+    c.post(P3 + "/assignments", json={"material_id": mid, "batch_id": bid,
+                                      "qty": "10", "op_id": f"cr-a-{tag}"})
+
+    page.goto(f"{base}/supply")
+    page.wait_for_timeout(1200)
+    close_hint(page)
+    opened = page.evaluate("""(id) => {
+      const card = document.querySelector('[data-pl="batch"][data-id="' + id + '"]');
+      if (!card) return 'карточки нет';
+      const btn = [...card.querySelectorAll('button[data-inline]')]
+        .find(b => (b.dataset.inline || '').indexOf('move-') === 0);
+      if (!btn) return 'кнопки переноса нет';
+      btn.click();
+      return card.querySelector('form.pl-form.inline') ? '' : 'форма не открылась';
+    }""", str(bid))
+    check(f"{tag}: форма переноса открылась", opened == "", str(opened))
+    if opened:
+        return
+    page.wait_for_timeout(250)
+    page.evaluate("""(args) => {
+      const box = document.querySelector('[data-pl="batch"][data-id="' + args[0]
+                                         + '"] form.pl-form.inline');
+      const sel = box.querySelector('select');
+      sel.value = String(args[1]);
+      sel.dispatchEvent(new Event('change'));
+      box.querySelector('input').value = '4';
+    }""", [str(bid), oid])
+    page.click("#pl-add-material")
+    page.wait_for_timeout(250)
+    page.fill("#pl-mat-title", f"Третий повод {tag}")
+    page.fill("#pl-mat-qty", "5")
+    page.click("#pl-mat-form button[type=submit]")
+    page.wait_for_timeout(1500)
+    state = page.evaluate("""(id) => {
+      const box = document.querySelector('[data-pl="batch"][data-id="' + id
+                                         + '"] form.pl-form.inline');
+      if (!box) return null;
+      const inputs = [...box.querySelectorAll('input')];
+      return {target: box.querySelector('select').value,
+              qty: inputs.length ? inputs[0].value : null,
+              fields: [...box.querySelectorAll('.pl-field')]
+                .filter(f => getComputedStyle(f).display === 'none').length};
+    }""", str(bid))
+    check(f"{tag}: форма переноса пережила перерисовку", state is not None,
+          "" if state else "формы нет")
+    if state:
+        check(f"{tag}: выбранная партия-приёмник осталась выбранной",
+              state["target"] == str(oid), f"{state['target']} против {oid}")
+        check(f"{tag}: количество не потерялось", state["qty"] == "4", str(state))
+        check(f"{tag}: и перекраска ничего в ней не спрятала",
+              state["fields"] == 0, str(state))
+
+
+def _fix3_empty_unit_ui(page, base, c, tag: str) -> None:
+    """P1 (тред r3948822957) в браузере: тот же жест, что у ревью.
+
+    Материал в килограммах → «Изменить» → в списке «другое» → своё поле пустым →
+    «Сохранить». До исправления это отвечало 200 и молча меняло величину в
+    данных владельца. Проверяется и видимая ошибка, и то, что в строке ничего
+    не изменилось: одно без другого доказывает половину.
+    """
+    print(f"\n== P1 в браузере: пустая своя единица не подменяет величину ({tag}) ==")
+    board = c.post(P3 + "/materials",
+                   json={"title": f"Килограммы {tag}", "qty": "10", "unit": "кг",
+                         "op_id": f"c2ui-m-{tag}"}).json()
+    mid = [m for m in board["materials"] if m["title"] == f"Килограммы {tag}"][0]["id"]
+
+    page.goto(f"{base}/supply")
+    page.wait_for_timeout(1200)
+    close_hint(page)
+    opened = page.evaluate("""(id) => {
+      const card = document.querySelector('[data-pl="material"][data-id="' + id + '"]');
+      if (!card) return 'карточки нет';
+      const btn = card.querySelector('button[data-inline="edit"]');
+      if (!btn) return 'кнопки правки нет';
+      btn.click();
+      return card.querySelector('form.pl-form.inline') ? '' : 'форма не открылась';
+    }""", str(mid))
+    check(f"{tag}: форма правки материала открылась", opened == "", str(opened))
+    if opened:
+        return
+    page.wait_for_timeout(250)
+    shown = page.evaluate("""(id) => {
+      const box = document.querySelector('[data-pl="material"][data-id="' + id
+                                         + '"] form.pl-form.inline');
+      const sel = box.querySelector('select');
+      sel.value = 'другое';
+      sel.dispatchEvent(new Event('change'));
+      const o = box.querySelector('input[id$="-other"]');
+      o.value = '';
+      return getComputedStyle(o.closest('.pl-field')).display !== 'none';
+    }""", str(mid))
+    check(f"{tag}: поле своей единицы открылось и оставлено пустым",
+          shown is True, str(shown))
+
+    page.evaluate("""(id) => {
+      const box = document.querySelector('[data-pl="material"][data-id="' + id
+                                         + '"] form.pl-form.inline');
+      box.querySelector('button[type=submit]').click();
+    }""", str(mid))
+    page.wait_for_timeout(1500)
+    err = page.evaluate("""(id) => {
+      const card = document.querySelector('[data-pl="material"][data-id="' + id + '"]');
+      const box = card && card.querySelector('form.pl-form.inline');
+      const e = box && box.querySelector('.pl-form-err');
+      return {text: e ? e.textContent.trim() : '',
+              visible: !!e && getComputedStyle(e).display !== 'none'};
+    }""", str(mid))
+    check(f"{tag}: человек видит отказ, а не молчаливый успех",
+          bool(err) and err["visible"] is True and "единиц" in err["text"],
+          str(err)[:200])
+
+    row = [m for m in c.get(P3).json()["materials"] if m["id"] == mid]
+    check(f"{tag}: величина в данных не подменена",
+          bool(row) and row[0]["unit"] == "кг",
+          row[0]["unit"] if row else "строки нет")
+
+    # А годная своя единица тем же путём по-прежнему сохраняется.
+    page.evaluate("""(id) => {
+      const box = document.querySelector('[data-pl="material"][data-id="' + id
+                                         + '"] form.pl-form.inline');
+      box.querySelector('input[id$="-other"]').value = 'бобина';
+      box.querySelector('button[type=submit]').click();
+    }""", str(mid))
+    page.wait_for_timeout(1500)
+    row = [m for m in c.get(P3).json()["materials"] if m["id"] == mid]
+    check(f"{tag}: а написанная своя единица сохраняется как прежде",
+          bool(row) and row[0]["unit"] == "бобина",
+          row[0]["unit"] if row else "строки нет")
+
+
+def _fix3_lost_response(page, base, c) -> None:
+    """P1 (тред r3950849148): повтор после ПОТЕРЯННОГО ответа удваивал метраж.
+
+    Потерянный ответ имитируется честно, а не подделкой: запрос ДОХОДИТ до
+    сервера и там исполняется, а страница видит сетевой отказ — ровно то, что
+    бывает при обрыве после коммита. Потом человек успешно сохраняет в другой
+    форме (это вызывает `render()`) и повторяет то же назначение. Замок
+    повторного поступка обязан узнать его по `op_id`; до исправления форма
+    приходила под новой идентичностью, и те же 10 метров прибавлялись второй раз.
+
+    Проверка не зависит от ширины экрана — она про идентичность запроса, а не
+    про раскладку, — поэтому делается на одном viewport и это сказано вслух.
+    """
+    print("\n== P1 в браузере: повтор после потерянного ответа не двоит метраж ==")
+    it = c.post(P3 + "/items", json={"kind": "draft", "title": "Вещь-повтор",
+                                     "op_id": "c2ui-i"}).json()
+    iid = [i for i in it["items"] if i["title"] == "Вещь-повтор"][0]["id"]
+    c.post(P3 + "/batches", json={"item_id": iid, "title": "Партия-повтор",
+                                  "plan_qty": "5", "op_id": "c2ui-b"})
+    mb = c.post(P3 + "/materials", json={"title": "Ткань-повтор", "qty": "100",
+                                         "unit": "м", "op_id": "c2ui-m"}).json()
+    mid = [m for m in mb["materials"] if m["title"] == "Ткань-повтор"][0]["id"]
+
+    page.goto(f"{base}/supply")
+    page.wait_for_timeout(1200)
+    close_hint(page)
+    opened = page.evaluate("""(id) => {
+      const card = document.querySelector('[data-pl="material"][data-id="' + id + '"]');
+      if (!card) return 'карточки нет';
+      const btn = card.querySelector('button[data-inline="assign"]');
+      if (!btn) return 'кнопки назначения нет';
+      btn.click();
+      return card.querySelector('form.pl-form.inline') ? '' : 'форма не открылась';
+    }""", str(mid))
+    check("форма назначения открылась", opened == "", str(opened))
+    if opened:
+        return
+    page.wait_for_timeout(250)
+    page.evaluate("""(id) => {
+      const box = document.querySelector('[data-pl="material"][data-id="' + id
+                                         + '"] form.pl-form.inline');
+      box.querySelector('input').value = '10';
+    }""", str(mid))
+
+    def lose(route):
+        # Сервер запрос ИСПОЛНЯЕТ, страница ответа не получает.
+        try:
+            route.fetch()
+        finally:
+            route.abort()
+
+    page.route("**/api/supply/planning/assignments", lose)
+    page.evaluate("""(id) => {
+      const box = document.querySelector('[data-pl="material"][data-id="' + id
+                                         + '"] form.pl-form.inline');
+      box.querySelector('button[type=submit]').click();
+    }""", str(mid))
+    page.wait_for_timeout(1500)
+    page.unroute("**/api/supply/planning/assignments")
+    first = [m for m in c.get(P3).json()["materials"] if m["id"] == mid]
+    check("сервер записал назначение, хотя ответ не дошёл",
+          bool(first) and first[0]["assigned"] == 10,
+          str(first[0]["assigned"]) if first else "строки нет")
+
+    page.click("#pl-add-material")
+    page.wait_for_timeout(250)
+    page.fill("#pl-mat-title", "Повод для повтора")
+    page.fill("#pl-mat-qty", "1")
+    page.click("#pl-mat-form button[type=submit]")
+    page.wait_for_timeout(1500)
+    token = page.evaluate("""(id) => {
+      const box = document.querySelector('[data-pl="material"][data-id="' + id
+                                         + '"] form.pl-form.inline');
+      return box ? (box.dataset.opId || '') : 'формы нет';
+    }""", str(mid))
+    check("идентичность поступка пережила перерисовку",
+          isinstance(token, str) and token.startswith("op-"), repr(token))
+
+    page.evaluate("""(id) => {
+      const box = document.querySelector('[data-pl="material"][data-id="' + id
+                                         + '"] form.pl-form.inline');
+      box.querySelector('button[type=submit]').click();
+    }""", str(mid))
+    page.wait_for_timeout(1500)
+    second = [m for m in c.get(P3).json()["materials"] if m["id"] == mid]
+    check("повтор того же назначения НЕ прибавил метраж второй раз",
+          bool(second) and second[0]["assigned"] == 10,
+          str(second[0]["assigned"]) if second else "строки нет")
+
+    # А изменённая форма — это уже другой поступок, и он обязан пройти.
+    page.evaluate("""(id) => {
+      const box = document.querySelector('[data-pl="material"][data-id="' + id
+                                         + '"] form.pl-form.inline');
+      const q = box.querySelector('input');
+      q.value = '5';
+      q.dispatchEvent(new Event('input', {bubbles: true}));
+      box.querySelector('button[type=submit]').click();
+    }""", str(mid))
+    page.wait_for_timeout(1500)
+    third = [m for m in c.get(P3).json()["materials"] if m["id"] == mid]
+    check("а изменённое назначение по-прежнему записывается",
+          bool(third) and third[0]["assigned"] == 15,
+          str(third[0]["assigned"]) if third else "строки нет")
+
+
+# ── Корректив 3: черновик держится за СВОЮ редакцию (тред r3951150422) ────────
+
+def _stale_draft_replay(page, base, c, kind, card_id, inline_name, mutate, tag):
+    """Разыграть два окна и вернуть текст ошибки у формы после «Сохранить».
+
+    Хореография ровно та, что в отчёте: черновик открыт на редакции N; ВТОРОЙ
+    аутентифицированный клиент правит ту же строку до N+1; в первом окне
+    сохраняется ПОСТОРОННЯЯ форма, из-за чего доска перерисовывается и форма
+    пересобирается; человек жмёт «Сохранить» в своём черновике.
+
+    Возвращается именно текст ошибки, а не код ответа: человек видит текст, и
+    проверять надо то, что видит он. Состояние строки набор сверяет отдельно —
+    одно без другого доказывает половину.
+    """
+    page.goto(f"{base}/supply")
+    page.wait_for_timeout(1200)
+    close_hint(page)
+    opened = page.evaluate("""(a) => {
+      const card = document.querySelector('[data-pl="' + a[0] + '"][data-id="' + a[1] + '"]');
+      if (!card) return 'карточки нет';
+      const btn = card.querySelector('button[data-inline="' + a[2] + '"]');
+      if (!btn) return 'кнопки нет';
+      btn.click();
+      return card.querySelector('form.pl-form.inline') ? '' : 'форма не открылась';
+    }""", [kind, str(card_id), inline_name])
+    check(f"{tag}: черновик открыт", opened == "", str(opened))
+    if opened:
+        return None
+    page.wait_for_timeout(250)
+
+    mutate()                       # второе окно: та же строка уходит на N+1
+
+    page.click("#pl-add-material")
+    page.wait_for_timeout(250)
+    page.fill("#pl-mat-title", f"Посторонний {tag}")
+    page.fill("#pl-mat-qty", "1")
+    page.click("#pl-mat-form button[type=submit]")
+    page.wait_for_timeout(1500)
+
+    page.evaluate("""(a) => {
+      const box = document.querySelector('[data-pl="' + a[0] + '"][data-id="' + a[1]
+                                         + '"] form.pl-form.inline');
+      if (box) box.querySelector('button[type=submit]').click();
+    }""", [kind, str(card_id)])
+    page.wait_for_timeout(1500)
+    return page.evaluate("""(a) => {
+      const card = document.querySelector('[data-pl="' + a[0] + '"][data-id="' + a[1] + '"]');
+      const box = card && card.querySelector('form.pl-form.inline');
+      const e = box && box.querySelector('.pl-form-err');
+      return e ? e.textContent.trim() : '';
+    }""", [kind, str(card_id)])
+
+
+def _fix3_stale_material(page, base, c, tag: str) -> None:
+    """P1: черновик правки материала не имеет права затирать чужую правку."""
+    print(f"\n== P1: черновик материала держится за свою редакцию ({tag}) ==")
+    board = c.post(P3 + "/materials",
+                   json={"title": f"Ткань-редакция {tag}", "qty": "10", "unit": "м",
+                         "op_id": f"c3-m-{tag}"}).json()
+    mid = [m for m in board["materials"]
+           if m["title"] == f"Ткань-редакция {tag}"][0]["id"]
+
+    def other_window():
+        cur = [m for m in c.get(P3).json()["materials"] if m["id"] == mid][0]
+        r = c.post(P3 + f"/materials/{mid}/update",
+                   json={"qty": "25", "rev": cur["rev"], "op_id": f"c3-o-{tag}"})
+        check(f"{tag}: второе окно записало 25", r.status_code == 200,
+              f"{r.status_code}: {r.text[:120]}")
+
+    err = _stale_draft_replay(page, base, c, "material", mid, "edit",
+                              other_window, tag)
+    if err is None:
+        return
+    check(f"{tag}: человек видит отказ, а не молчаливый успех",
+          "уже изменили" in err, err[:160] or "ошибки нет")
+    row = [m for m in c.get(P3).json()["materials"] if m["id"] == mid]
+    check(f"{tag}: чужая правка цела — в данных 25, а не 10",
+          bool(row) and row[0]["qty"] == 25, str(row[0]["qty"]) if row else "нет строки")
+
+
+def _fix3_stale_item(page, base, c, tag: str) -> None:
+    """Тот же корень у формы правки вещи."""
+    print(f"\n== P1: черновик вещи держится за свою редакцию ({tag}) ==")
+    board = c.post(P3 + "/items",
+                   json={"kind": "draft", "title": f"Новинка-редакция {tag}",
+                         "note": "первая", "op_id": f"c3-i-{tag}"}).json()
+    iid = [i for i in board["items"]
+           if i["title"] == f"Новинка-редакция {tag}"][0]["id"]
+
+    def other_window():
+        cur = [i for i in c.get(P3).json()["items"] if i["id"] == iid][0]
+        r = c.post(P3 + f"/items/{iid}/update",
+                   json={"note": "правка из другого окна", "rev": cur["rev"],
+                         "op_id": f"c3-oi-{tag}"})
+        check(f"{tag}: второе окно правит заметку вещи", r.status_code == 200,
+              f"{r.status_code}: {r.text[:120]}")
+
+    err = _stale_draft_replay(page, base, c, "item", iid, "edit", other_window, tag)
+    if err is None:
+        return
+    check(f"{tag}: черновик вещи отвергнут отказом",
+          "уже изменили" in err, err[:160] or "ошибки нет")
+    row = [i for i in c.get(P3).json()["items"] if i["id"] == iid]
+    check(f"{tag}: заметка из другого окна цела",
+          bool(row) and row[0]["note"] == "правка из другого окна",
+          repr(row[0]["note"]) if row else "нет строки")
+
+
+def _fix3_stale_batch(page, base, c, tag: str) -> None:
+    """Тот же корень у формы правки плановой партии."""
+    print(f"\n== P1: черновик партии держится за свою редакцию ({tag}) ==")
+    it = c.post(P3 + "/items", json={"kind": "draft", "title": f"Вещь-партия {tag}",
+                                     "op_id": f"c3-bi-{tag}"}).json()
+    iid = [i for i in it["items"] if i["title"] == f"Вещь-партия {tag}"][0]["id"]
+    board = c.post(P3 + "/batches",
+                   json={"item_id": iid, "title": f"Партия-редакция {tag}",
+                         "plan_qty": "10", "op_id": f"c3-b-{tag}"}).json()
+    bid = [b for b in board["batches"]
+           if b["title"] == f"Партия-редакция {tag}"][0]["id"]
+
+    def other_window():
+        cur = [b for b in c.get(P3).json()["batches"] if b["id"] == bid][0]
+        r = c.post(P3 + f"/batches/{bid}/update",
+                   json={"plan_qty": "60", "rev": cur["rev"], "op_id": f"c3-ob-{tag}"})
+        check(f"{tag}: второе окно ставит план 60", r.status_code == 200,
+              f"{r.status_code}: {r.text[:120]}")
+
+    err = _stale_draft_replay(page, base, c, "batch", bid, "edit", other_window, tag)
+    if err is None:
+        return
+    check(f"{tag}: черновик партии отвергнут отказом",
+          "уже изменили" in err, err[:160] or "ошибки нет")
+    row = [b for b in c.get(P3).json()["batches"] if b["id"] == bid]
+    check(f"{tag}: план из другого окна цел — 60, а не 10",
+          bool(row) and row[0]["plan_qty"] == 60,
+          str(row[0]["plan_qty"]) if row else "нет строки")
+
+
+def _fix3_stale_move(page, base, c, tag: str) -> None:
+    """И у переноса: он тоже несёт редакцию и тоже восстанавливается."""
+    print(f"\n== P1: черновик переноса держится за свою редакцию ({tag}) ==")
+    it = c.post(P3 + "/items", json={"kind": "draft", "title": f"Вещь-перенос {tag}",
+                                     "op_id": f"c3-mi-{tag}"}).json()
+    iid = [i for i in it["items"] if i["title"] == f"Вещь-перенос {tag}"][0]["id"]
+    b1 = c.post(P3 + "/batches", json={"item_id": iid, "title": f"Откуда {tag}",
+                                       "op_id": f"c3-mb1-{tag}"}).json()
+    src = [b for b in b1["batches"] if b["title"] == f"Откуда {tag}"][0]["id"]
+    b2 = c.post(P3 + "/batches", json={"item_id": iid, "title": f"Куда {tag}",
+                                       "op_id": f"c3-mb2-{tag}"}).json()
+    dst = [b for b in b2["batches"] if b["title"] == f"Куда {tag}"][0]["id"]
+    mb = c.post(P3 + "/materials", json={"title": f"Ткань-перенос {tag}", "qty": "100",
+                                         "unit": "м", "op_id": f"c3-mm-{tag}"}).json()
+    mid = [m for m in mb["materials"] if m["title"] == f"Ткань-перенос {tag}"][0]["id"]
+    c.post(P3 + "/assignments", json={"material_id": mid, "batch_id": src,
+                                      "qty": "50", "op_id": f"c3-ma-{tag}"})
+    aid = None
+    for b in c.get(P3).json()["batches"]:
+        if b["id"] != src:
+            continue
+        for a in b["assignments"]:
+            if a["material_id"] == mid:
+                aid = a["id"]
+    check(f"{tag}: назначение для переноса заведено", aid is not None,
+          "" if aid else "назначения нет")
+    if aid is None:
+        return
+
+    def other_window():
+        cur = None
+        for b in c.get(P3).json()["batches"]:
+            for a in b["assignments"]:
+                if a["id"] == aid:
+                    cur = a
+        r = c.post(P3 + f"/assignments/{aid}/update",
+                   json={"qty": "80", "rev": cur["rev"], "op_id": f"c3-oa-{tag}"})
+        check(f"{tag}: второе окно меняет назначение на 80", r.status_code == 200,
+              f"{r.status_code}: {r.text[:120]}")
+
+    err = _stale_draft_replay(page, base, c, "batch", src, f"move-{aid}",
+                              other_window, tag)
+    if err is None:
+        return
+    check(f"{tag}: черновик переноса отвергнут отказом",
+          "уже изменили" in err, err[:160] or "ошибки нет")
+    now = None
+    for b in c.get(P3).json()["batches"]:
+        for a in b["assignments"]:
+            if a["id"] == aid:
+                now = a
+    check(f"{tag}: назначение из другого окна цело — 80 и на своей партии",
+          now is not None and now["qty"] == 80, str(now["qty"]) if now else "нет строки")
+
+
+def _fix3_own_save_rebase(page, base, c, tag: str) -> None:
+    """Обратная сторона: СВОЯ удачная запись не превращается в ложный 409.
+
+    Правило «черновик держится за свою редакцию» обязано кончаться там, где
+    черновик применён. После собственной удачной записи строка — та же самая,
+    что в форме, и держаться за прежний номер значило бы ответить человеку
+    «кто-то изменил» на его собственную правку.
+
+    Проверяется ВТОРОЙ правкой, а не повтором: неизменный повтор опознаётся
+    замком поступка (`op_id`) и до сверки редакций не доходит вовсе.
+    """
+    print(f"\n== Сторож: своя удачная запись не даёт ложного отказа ({tag}) ==")
+    board = c.post(P3 + "/materials",
+                   json={"title": f"Своя правка {tag}", "qty": "10", "unit": "м",
+                         "op_id": f"c3-s-{tag}"}).json()
+    mid = [m for m in board["materials"] if m["title"] == f"Своя правка {tag}"][0]["id"]
+
+    page.goto(f"{base}/supply")
+    page.wait_for_timeout(1200)
+    close_hint(page)
+    opened = page.evaluate("""(id) => {
+      const card = document.querySelector('[data-pl="material"][data-id="' + id + '"]');
+      if (!card) return 'карточки нет';
+      card.querySelector('button[data-inline="edit"]').click();
+      return card.querySelector('form.pl-form.inline') ? '' : 'форма не открылась';
+    }""", str(mid))
+    check(f"{tag}: форма правки открыта", opened == "", str(opened))
+    if opened:
+        return
+    page.wait_for_timeout(250)
+
+    def save_with_title(new_title):
+        page.evaluate("""(a) => {
+          const box = document.querySelector('[data-pl="material"][data-id="' + a[0]
+                                             + '"] form.pl-form.inline');
+          const t = box.querySelector('input[type=text], input:not([type])');
+          t.value = a[1];
+          // Событие ввода — как у человека: оно и снимает прежнюю идентичность
+          // поступка, потому что это уже другая правка.
+          t.dispatchEvent(new Event('input', {bubbles: true}));
+          box.querySelector('button[type=submit]').click();
+        }""", [str(mid), new_title])
+        page.wait_for_timeout(1500)
+        return page.evaluate("""(id) => {
+          const card = document.querySelector('[data-pl="material"][data-id="' + id + '"]');
+          const box = card && card.querySelector('form.pl-form.inline');
+          const e = box && box.querySelector('.pl-form-err');
+          return e ? e.textContent.trim() : '';
+        }""", str(mid))
+
+    first = save_with_title(f"Первая правка {tag}")
+    check(f"{tag}: первая правка прошла без отказа", first == "", first[:160])
+    second = save_with_title(f"Вторая правка {tag}")
+    check(f"{tag}: и ВТОРАЯ правка в той же форме тоже прошла",
+          second == "", second[:160])
+    row = [m for m in c.get(P3).json()["materials"] if m["id"] == mid]
+    check(f"{tag}: в данных лежит последняя правка человека",
+          bool(row) and row[0]["title"] == f"Вторая правка {tag}",
+          row[0]["title"] if row else "нет строки")
+
+
+def _fix3_replay_then_edit(page, base, c, tag: str) -> None:
+    """Корректив 4: повтор поступка не имеет права оставить чужие данные под
+    старым черновиком.
+
+    ЦЕПОЧКА, И КАЖДОЕ ЕЁ ЗВЕНО ОБЯЗАТЕЛЬНО. Человек правит название материала;
+    запрос ДОХОДИТ до сервера и там применяется, а ответ теряется (обрыв после
+    коммита — имитируем честно, а не подделкой ответа). Сосед в это время ставит
+    количество 40 на свежей редакции. Человек повторяет то же нажатие — замок
+    поступка (`op_id`) узнаёт повтор и отвечает 200, ничего не записывая. И вот
+    здесь начинается предмет проверки: форма пересобирается, и если ей вернуть
+    ПРЕЖНИЕ значения черновика поверх свежей редакции, то следующая правка
+    молча вернёт соседские 40 к своим 25.
+
+    Проверяется не только итог, но и то, что человек ВИДИТ между шагами:
+    количество в форме после повтора обязано быть текущим, а не прежним. Итог
+    без этого доказывал бы меньше: правильное число могло бы совпасть случайно.
+    """
+    print(f"\n== Корректив 4: повтор поступка не воскрешает старый черновик ({tag}) ==")
+    board = c.post(P3 + "/materials",
+                   json={"title": f"Ткань-повтор {tag}", "qty": "25", "unit": "м",
+                         "op_id": f"c4-m-{tag}"}).json()
+    mid = [m for m in board["materials"]
+           if m["title"] == f"Ткань-повтор {tag}"][0]["id"]
+
+    page.goto(f"{base}/supply")
+    page.wait_for_timeout(1200)
+    close_hint(page)
+    opened = page.evaluate("""(id) => {
+      const card = document.querySelector('[data-pl="material"][data-id="' + id + '"]');
+      if (!card) return 'карточки нет';
+      const btn = card.querySelector('button[data-inline="edit"]');
+      if (!btn) return 'кнопки правки нет';
+      btn.click();
+      return card.querySelector('form.pl-form.inline') ? '' : 'форма не открылась';
+    }""", str(mid))
+    check(f"{tag}: форма правки открыта", opened == "", str(opened))
+    if opened:
+        return
+    page.wait_for_timeout(250)
+
+    def type_title_and_save(value):
+        page.evaluate("""(a) => {
+          const box = document.querySelector('[data-pl="material"][data-id="' + a[0]
+                                             + '"] form.pl-form.inline');
+          const t = box.querySelector('input[type=text], input:not([type])');
+          t.value = a[1];
+          // Событие ввода — как у человека: оно снимает прежнюю идентичность
+          // поступка, потому что это уже другая правка.
+          t.dispatchEvent(new Event('input', {bubbles: true}));
+          box.querySelector('button[type=submit]').click();
+        }""", [str(mid), value])
+        page.wait_for_timeout(1500)
+
+    def lose(route):
+        # Сервер запрос ИСПОЛНЯЕТ, страница ответа не получает.
+        try:
+            route.fetch()
+        finally:
+            route.abort()
+
+    page.route(f"**/api/supply/planning/materials/{mid}/update", lose)
+    type_title_and_save(f"Правка один {tag}")
+    page.unroute(f"**/api/supply/planning/materials/{mid}/update")
+    lost = [m for m in c.get(P3).json()["materials"] if m["id"] == mid]
+    check(f"{tag}: сервер применил правку, хотя ответ не дошёл",
+          bool(lost) and lost[0]["title"] == f"Правка один {tag}",
+          lost[0]["title"] if lost else "нет строки")
+
+    peer = c.post(P3 + f"/materials/{mid}/update",
+                  json={"qty": "40", "rev": lost[0]["rev"], "op_id": f"c4-peer-{tag}"})
+    check(f"{tag}: сосед поставил количество 40", peer.status_code == 200,
+          f"{peer.status_code}: {peer.text[:120]}")
+
+    # Повтор ТОГО ЖЕ нажатия: форма не тронута, идентичность поступка прежняя.
+    page.evaluate("""(id) => {
+      const box = document.querySelector('[data-pl="material"][data-id="' + id
+                                         + '"] form.pl-form.inline');
+      box.querySelector('button[type=submit]').click();
+    }""", str(mid))
+    page.wait_for_timeout(1500)
+    after_retry = [m for m in c.get(P3).json()["materials"] if m["id"] == mid]
+    check(f"{tag}: повтор поступка чужую правку не тронул — 40 на месте",
+          bool(after_retry) and after_retry[0]["qty"] == 40,
+          str(after_retry[0]["qty"]) if after_retry else "нет строки")
+
+    shown = page.evaluate("""(id) => {
+      const box = document.querySelector('[data-pl="material"][data-id="' + id
+                                         + '"] form.pl-form.inline');
+      if (!box) return null;
+      const fields = [...box.querySelectorAll('input')];
+      return {rev: box.dataset.rev || '',
+              qty: fields.length > 1 ? fields[1].value : null};
+    }""", str(mid))
+    check(f"{tag}: форма после повтора показывает ТЕКУЩЕЕ количество, а не прежнее",
+          bool(shown) and shown["qty"] == "40", str(shown))
+    check(f"{tag}: и редакция в форме та же, из которой взяты эти значения",
+          bool(shown) and shown["rev"] == str(after_retry[0]["rev"]),
+          f"{shown['rev'] if shown else '—'} против {after_retry[0]['rev'] if after_retry else '—'}")
+
+    # Следующая правка человека: она обязана лечь ПОВЕРХ правды, а не поверх
+    # своего прежнего черновика.
+    type_title_and_save(f"Правка два {tag}")
+    final = [m for m in c.get(P3).json()["materials"] if m["id"] == mid]
+    err = page.evaluate("""(id) => {
+      const card = document.querySelector('[data-pl="material"][data-id="' + id + '"]');
+      const box = card && card.querySelector('form.pl-form.inline');
+      const e = box && box.querySelector('.pl-form-err');
+      return e ? e.textContent.trim() : '';
+    }""", str(mid))
+    check(f"{tag}: следующая правка прошла без отказа", err == "", err[:160])
+    check(f"{tag}: и чужие 40 НЕ вернулись к 25",
+          bool(final) and final[0]["qty"] == 40,
+          str(final[0]["qty"]) if final else "нет строки")
+    check(f"{tag}: а собственная правка названия применена",
+          bool(final) and final[0]["title"] == f"Правка два {tag}",
+          final[0]["title"] if final else "нет строки")
+
+
+def _fix3_peer_after_commit(page, base, c, tag: str) -> None:
+    """Сосед пишет ПОСЛЕ нашего коммита — молчаливой подмены быть не должно.
+
+    Это форма, о которой говорит тред r3952047085: наша запись прошла, а строку
+    успели изменить прежде, чем ответ добрался до страницы. Точное серверное
+    чередование «коммит → чужая запись → чтение доски» из браузера не
+    закрепляется, поэтому здесь берётся достижимая и полностью детерминированная
+    его половина: ответ на нашу запись перехватывается, чужая правка делается
+    ПОКА он не отдан странице, и только потом он доставляется. Дальше человек
+    правит ещё раз и сохраняет.
+
+    Что обязано быть верным в любом исходе: чужие данные не подменяются молча.
+    Либо человек получает отказ, либо его правка ложится поверх чужих значений —
+    но «200 и чужого числа больше нет» не бывает никогда.
+
+    Это СТОРОЖ, а не воспроизведение: он зелёный и до корректива 4. Красным
+    корректив 4 доказан цепочкой повтора (`_fix3_replay_then_edit`); здесь
+    проверяется, что соседняя форма той же семьи не осталась дырой.
+    """
+    print(f"\n== Сторож: чужая правка после нашего коммита не исчезает ({tag}) ==")
+    board = c.post(P3 + "/materials",
+                   json={"title": f"Ткань-гонка {tag}", "qty": "25", "unit": "м",
+                         "op_id": f"c4r-m-{tag}"}).json()
+    mid = [m for m in board["materials"]
+           if m["title"] == f"Ткань-гонка {tag}"][0]["id"]
+
+    page.goto(f"{base}/supply")
+    page.wait_for_timeout(1200)
+    close_hint(page)
+    opened = page.evaluate("""(id) => {
+      const card = document.querySelector('[data-pl="material"][data-id="' + id + '"]');
+      if (!card) return 'карточки нет';
+      const btn = card.querySelector('button[data-inline="edit"]');
+      if (!btn) return 'кнопки правки нет';
+      btn.click();
+      return card.querySelector('form.pl-form.inline') ? '' : 'форма не открылась';
+    }""", str(mid))
+    check(f"{tag}: форма правки открыта", opened == "", str(opened))
+    if opened:
+        return
+    page.wait_for_timeout(250)
+
+    def peer_between(route):
+        # Наш запрос сервер исполняет целиком; ответ придерживается.
+        resp = route.fetch()
+        cur = [m for m in c.get(P3).json()["materials"] if m["id"] == mid]
+        if cur:
+            c.post(P3 + f"/materials/{mid}/update",
+                   json={"qty": "40", "rev": cur[0]["rev"], "op_id": f"c4r-peer-{tag}"})
+        route.fulfill(response=resp)
+
+    page.route(f"**/api/supply/planning/materials/{mid}/update", peer_between)
+    page.evaluate("""(a) => {
+      const box = document.querySelector('[data-pl="material"][data-id="' + a[0]
+                                         + '"] form.pl-form.inline');
+      const t = box.querySelector('input[type=text], input:not([type])');
+      t.value = a[1];
+      t.dispatchEvent(new Event('input', {bubbles: true}));
+      box.querySelector('button[type=submit]').click();
+    }""", [str(mid), f"Наша правка {tag}"])
+    page.wait_for_timeout(1800)
+    page.unroute(f"**/api/supply/planning/materials/{mid}/update")
+
+    mid_state = [m for m in c.get(P3).json()["materials"] if m["id"] == mid]
+    check(f"{tag}: чужая правка легла на сервер",
+          bool(mid_state) and mid_state[0]["qty"] == 40,
+          str(mid_state[0]["qty"]) if mid_state else "нет строки")
+
+    page.evaluate("""(a) => {
+      const box = document.querySelector('[data-pl="material"][data-id="' + a[0]
+                                         + '"] form.pl-form.inline');
+      if (!box) return;
+      const t = box.querySelector('input[type=text], input:not([type])');
+      t.value = a[1];
+      t.dispatchEvent(new Event('input', {bubbles: true}));
+      box.querySelector('button[type=submit]').click();
+    }""", [str(mid), f"Вторая наша правка {tag}"])
+    page.wait_for_timeout(1800)
+    final = [m for m in c.get(P3).json()["materials"] if m["id"] == mid]
+    err = page.evaluate("""(id) => {
+      const card = document.querySelector('[data-pl="material"][data-id="' + id + '"]');
+      const box = card && card.querySelector('form.pl-form.inline');
+      const e = box && box.querySelector('.pl-form-err');
+      return e ? e.textContent.trim() : '';
+    }""", str(mid))
+    # Годных исходов ровно два, и оба честные: отказ либо правка поверх чужих
+    # значений. Негодный один — тихо вернувшиеся 25.
+    check(f"{tag}: чужие 40 не исчезли ни при каком исходе",
+          bool(final) and final[0]["qty"] == 40,
+          f"qty={final[0]['qty'] if final else '—'}, ошибка: {err[:90]}")
+    check(f"{tag}: и человек либо получил отказ, либо его правка применена",
+          bool(final) and (err != "" or final[0]["title"] == f"Вторая наша правка {tag}"),
+          f"title={final[0]['title'] if final else '—'}, ошибка: {err[:90]}")
+
+
+def _fix3_mobile(browser, base, c) -> None:
+    """Те же два свойства на телефоне: список единиц и фокус в окне 390x844."""
+    print("\n== F-16/F-21 на телефоне 390x844 ==")
+    ctx = browser.new_context(viewport={"width": 390, "height": 844})
+    ctx.add_cookies([{"name": k, "value": v, "domain": "127.0.0.1", "path": "/"}
+                     for k, v in c.cookies.items()])
+    errors: list[str] = []
+    page = ctx.new_page()
+    page.on("pageerror", lambda e: errors.append(str(e)))
+    page.goto(f"{base}/supply")
+    page.wait_for_timeout(1200)
+    close_hint(page)
+    page.click("#pl-add-material")
+    page.wait_for_timeout(400)
+
+    facts = page.evaluate("""() => {
+      const sel = document.getElementById('pl-mat-unit');
+      const first = document.getElementById('pl-mat-title');
+      const r = first ? first.getBoundingClientRect() : null;
+      return {
+        tag: sel ? sel.tagName : 'НЕТ',
+        focused: document.activeElement ? document.activeElement.id : '',
+        inView: r ? (r.top >= 0 && r.bottom <= window.innerHeight
+                     && r.width > 0 && r.height > 0) : false
+      };
+    }""")
+    check("на телефоне единица тоже выбирается списком",
+          facts["tag"] == "SELECT", str(facts))
+    check("первое поле в фокусе", facts["focused"] == "pl-mat-title", str(facts))
+    check("и видно целиком на узком экране", facts["inView"] is True, str(facts))
+    # Тот же P1 на телефоне: ревью воспроизвело его на ОБОИХ viewport, значит и
+    # доказательство исправления обязано быть на обоих.
+    for label, run_step in (("P1 срок", lambda: _fix3_restore_case(page, base, c, "mobile")),
+                            ("P1 единица", lambda: _fix3_restore_unit(page, base, c, "mobile")),
+                            ("P1 сосед", lambda: _fix3_restore_plain(page, base, c, "mobile")),
+                            ("P1 пустая единица",
+                             lambda: _fix3_empty_unit_ui(page, base, c, "mobile")),
+                            ("P1 черновик материала",
+                             lambda: _fix3_stale_material(page, base, c, "mobile")),
+                            ("P1 повтор и правка",
+                             lambda: _fix3_replay_then_edit(page, base, c, "mobile"))):
+        try:
+            run_step()
+        except Exception as exc:  # noqa: BLE001 — важен отчёт, а не тип
+            check(f"{label} на телефоне: шаг дошёл до конца без исключения", False,
+                  f"{type(exc).__name__}: {str(exc).strip().splitlines()[0][:160]}")
+
+    check("на телефоне не было ошибок в консоли", not errors, str(errors)[:200])
+    ctx.close()
 
 
 def _fix2_mobile(browser, base, c) -> None:

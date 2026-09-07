@@ -215,6 +215,9 @@
              font-size: 12.5px; color: var(--ink-2); }
   .pl-nums b { color: var(--ink); font-variant-numeric: tabular-nums; }
   .pl-nums .unknown { color: var(--ink-3); font-style: italic; }
+  /* F-18: прошедший ТОЧНЫЙ срок называется вслух и серым. Это пометка показа,
+     а не состояние строки: данных она не меняет и просрочкой не является. */
+  .pl-past { color: var(--ink-3); margin-left: 6px; }
   .pl-warn { margin-top: 6px; font-size: 12px; line-height: 1.45;
              color: var(--amber, #b96e00); }
   .pl-warn::before { content: "⚠ "; }
@@ -350,10 +353,13 @@
         <div class="sup-lead">Материал можно завести до того, как решено, что из
           него шьют. Дальше — вещь своего каталога или новинка с эскизом,
           плановая партия, назначенный на неё метраж, план изделий и срок.</div>
+        {# ОДИН ДИСКЛЕЙМЕР НА ВКЛАДКУ (ТЗ F-20). Прежний текст перечислял пять
+           показателей и повторял то же самое во втором месте страницы;
+           повторённое ограничение читают не внимательнее, а хуже. Смысл
+           сохранён целиком, и тот же текст приходит с сервера полем
+           `disclaimer`. #}
         <div class="sup-limit" id="pl-note">
-          <b>Плановая партия — это намерение, а не заказ.</b>
-          Она не создаёт партию «Оборота», не получает её номер и не входит
-          в «Едет», «В заказе», потребность и бюджет.
+          <b>Это план: заказы, «Едет» и бюджет он не меняет.</b>
         </div>
       </div>
     </section>
@@ -420,11 +426,12 @@
       <div class="sup-lead">Строки вашей производственной таблицы Google Sheets — как
         они в ней написаны. Видно, что прочиталось, а что нет: так в таблице находят
         опечатку и пропуск.</div>
+      {# Тот же приём, что на вкладке плана: ограничение названо ОДИН раз.
+         Прежде «Едет» стояло в этом блоке дважды — в заголовке и в перечне. #}
       <div class="sup-limit" id="sup-note">
         <b>Предпросмотр источника — ещё не партия «Оборота» и не учитывается в «Едет».</b>
-        Строки отсюда не становятся заказами и не входят в «Едет», «В заказе»,
-        оборачиваемость, бюджет и прогноз. Этапов производства, готовности и
-        автоматической сверки с каталогом раздел не считает.
+        Этапов производства, готовности и автоматической сверки с каталогом
+        раздел не считает.
       </div>
     </div>
   </section>
@@ -1617,9 +1624,8 @@ document.addEventListener("DOMContentLoaded", function () {
         clear(note);
         note.appendChild(el("b", null, data.disclaimer));
         note.appendChild(el("span", null,
-          " Строки отсюда не становятся заказами и не входят в «Едет», «В заказе», "
-          + "оборачиваемость, бюджет и прогноз. Этапов производства, готовности и "
-          + "автоматической сверки с каталогом раздел не считает."));
+          " Этапов производства, готовности и автоматической сверки с каталогом "
+          + "раздел не считает."));
       }
       if (!append) { renderSourceBar(data); renderForm(data); }
       renderState(data);
@@ -1737,6 +1743,13 @@ document.addEventListener("DOMContentLoaded", function () {
     board: null,
     saving: false,          // один запрос записи в полёте
     open: {},               // какие формы раскрыты
+    // Идёт ли восстановление инлайн-форм после перерисовки (F-21). Во время
+    // него фокус не отбирается: человек в этот момент печатает в другом месте.
+    restoring: false,
+    // Форма, ЧЬЯ СОБСТВЕННАЯ запись только что удалась. Живёт ровно одну
+    // перерисовку и нужна одному месту — `captureInline`: её черновика больше
+    // нет, и восстанавливать ей нечего.
+    applied: null,
     catalog: [],
   };
 
@@ -1782,8 +1795,17 @@ document.addEventListener("DOMContentLoaded", function () {
   // внутри неё, включая те, что созданы позже.
   function bindTokenReset(form) {
     if (!form) return;
-    form.addEventListener("input", function () { resetToken(form); });
-    form.addEventListener("change", function () { resetToken(form); });
+    // ВОССТАНОВЛЕНИЕ — НЕ ПРАВКА ЧЕЛОВЕКА. Пока идёт возврат значений после
+    // перерисовки, идентичность поступка не трогается: иначе повтор после
+    // потерянного ответа пришёл бы под новым `op_id` и создал вторую запись
+    // (P1, закрытый в SUPPLY-3). Событие перекраски и так не всплывает — это
+    // вторая, явная защита того же правила, а не замена ей.
+    form.addEventListener("input", function () {
+      if (!PL.restoring) resetToken(form);
+    });
+    form.addEventListener("change", function () {
+      if (!PL.restoring) resetToken(form);
+    });
   }
 
   // Склонение рядом с числом. Тот же смысл, что у `_ru_plural` на сервере:
@@ -1799,11 +1821,14 @@ document.addEventListener("DOMContentLoaded", function () {
     return many;
   }
 
+  // ЧИСЛО ПО-РУССКИ (F-18): запятая как десятичный разделитель, целое — без
+  // дробной части вовсе. Тот же вид, что у серверного `fmt_qty`: одно число не
+  // должно выглядеть по-разному в ответе API и на экране.
   function fmt(value) {
     if (value === null || value === undefined) return "неизвестно";
     var n = Number(value);
     if (!isFinite(n)) return "неизвестно";
-    return String(Math.round(n * 1000) / 1000);
+    return String(Math.round(n * 1000) / 1000).replace(".", ",");
   }
 
   function field(labelText, node, wide) {
@@ -1825,6 +1850,48 @@ document.addEventListener("DOMContentLoaded", function () {
     if (attrs && attrs.maxLength) n.maxLength = attrs.maxLength;
     n.className = "";
     return n;
+  }
+
+  //: УТВЕРЖДЁННЫЙ СПИСОК ЕДИНИЦ (F-16). Тот же, что в `supply_planning`:
+  //: расходиться им нельзя — иначе экран предлагает вариант, который сервер
+  //: считает «своей» единицей, и наоборот.
+  var UNIT_CHOICES = ["м", "кг", "шт", "рул.", "компл."];
+  var UNIT_OTHER = "другое";
+
+  // ПОЧЕМУ СПИСОК, А НЕ ПОЛЕ. Свободный текст давал «м», «м.», «М», «метры» и
+  // «m» — пять корзин свободного остатка на одну и ту же ткань. Список не
+  // запрещает свою единицу: шестой пункт «другое» открывает то же поле на 16
+  // знаков, каким оно и было. Возвращается функция чтения, потому что читать
+  // надо ОДНО из двух мест в зависимости от выбора.
+  function unitPicker(form, idBase, current) {
+    var sel = el("select");
+    sel.id = idBase;
+    UNIT_CHOICES.concat([UNIT_OTHER]).forEach(function (u) {
+      var o = el("option", null, u);
+      o.value = u;
+      sel.appendChild(o);
+    });
+    var other = input(idBase + "-other", {placeholder: "своя единица",
+                                          maxLength: 16});
+    var fOther = field("Своя единица", other, true);
+    form.appendChild(field("Единица", sel, true));
+    form.appendChild(fOther);
+    var value = (current || "").trim();
+    if (value && UNIT_CHOICES.indexOf(value) < 0) {
+      // Единица, заведённая до этого пакета («метры»), из списка не пропадает
+      // и не переписывается молча: она показывается как «другое» со своим
+      // текстом, и человек сам решает, оставить её или выбрать из списка.
+      sel.value = UNIT_OTHER;
+      other.value = value;
+    } else {
+      sel.value = value || "м";
+    }
+    function paint() { fOther.hidden = sel.value !== UNIT_OTHER; }
+    sel.addEventListener("change", paint);
+    paint();
+    return function () {
+      return sel.value === UNIT_OTHER ? other.value : sel.value;
+    };
   }
 
   function setError(where, message) {
@@ -1863,7 +1930,12 @@ document.addEventListener("DOMContentLoaded", function () {
     api(url, {method: "POST", body: body})
       .then(function (data) {
         PL.board = data;
+        // Пометка живёт РОВНО на время перерисовки и снимается сразу после неё:
+        // «эта форма только что записала своё» — состояние одного мгновения, а
+        // не свойство формы.
+        PL.applied = (spot && spot.form) || null;
         render();
+        PL.applied = null;
         if (spot && !spot.quiet) {
           plToast(data && data.notice ? data.notice : "Сохранено", {ms: 3000});
         }
@@ -1995,6 +2067,49 @@ document.addEventListener("DOMContentLoaded", function () {
   //: (строка вещи из F-05 открывает форму партии сама).
   var BUILDERS = {};
 
+  //: Три формы верхнего уровня: кнопка и её форма. Список нужен затем, чтобы
+  //: открытие одной знало о существовании остальных (F-21).
+  var TOP_FORMS = [["pl-add-material", "pl-mat-form"],
+                   ["pl-add-item", "pl-item-form"],
+                   ["pl-add-batch", "pl-batch-form"]];
+
+  // ЕСТЬ ЛИ В ФОРМЕ НАБРАННОЕ ЧЕЛОВЕКОМ. Считаются только поля, куда он что-то
+  // вносит сам: `select` всегда имеет значение, и по нему любая форма выглядела
+  // бы заполненной, а закрывать пустую форму никто бы не стал.
+  function formHasInput(form) {
+    var nodes = form.querySelectorAll("input, textarea");
+    for (var i = 0; i < nodes.length; i++) {
+      var n = nodes[i];
+      if (n.type === "file") {
+        if (n.files && n.files.length) return true;
+        continue;
+      }
+      if (n.type === "checkbox" || n.type === "radio") {
+        if (n.checked) return true;
+        continue;
+      }
+      if ((n.value || "").trim()) return true;
+    }
+    return false;
+  }
+
+  // ПУСТУЮ СОСЕДНЮЮ ФОРМУ ЗАКРЫВАЕМ, НЕПУСТУЮ — НЕТ (F-21). Раньше «Добавить
+  // вещь» и «Создать плановую партию» стояли открытыми одновременно и вместе
+  // занимали экран целиком. Закрывать вторую безусловно тоже нельзя: в ней
+  // может лежать набранный текст, а тихо стереть его — та же потеря ввода,
+  // против которой сделан весь пакет 1 (D-55, п. 1).
+  function closeEmptySiblings(keepFormId) {
+    TOP_FORMS.forEach(function (pair) {
+      if (pair[1] === keepFormId) return;
+      var form = byId(pair[1]), btn = byId(pair[0]);
+      if (!form || form.hidden) return;
+      if (formHasInput(form)) return;
+      form.hidden = true;
+      if (btn) btn.setAttribute("aria-expanded", "false");
+      clear(form);
+    });
+  }
+
   function openForm(buttonId, formId) {
     var btn = byId(buttonId), form = byId(formId);
     if (!btn || !form || !BUILDERS[formId]) return;
@@ -2003,9 +2118,17 @@ document.addEventListener("DOMContentLoaded", function () {
       btn.setAttribute("aria-expanded", "true");
       BUILDERS[formId](form);
     }
+    closeEmptySiblings(formId);
     if (form.scrollIntoView) form.scrollIntoView({block: "center"});
+    // ФОКУС ДО ПРОКРУТКИ, ПРОКРУТКА — К САМОМУ ПОЛЮ. `focus()` умеет
+    // прокручивать сам, и тогда «в области видимости» оказывалась форма, а
+    // первое поле — уже нет; `preventScroll` разводит два действия, чтобы
+    // последнее слово осталось за явной прокруткой к полю (F-21).
     var first = form.querySelector("input, select, textarea");
-    if (first) first.focus();
+    if (first) {
+      try { first.focus({preventScroll: true}); } catch (e) { first.focus(); }
+      if (first.scrollIntoView) first.scrollIntoView({block: "center"});
+    }
   }
 
   function disclosure(buttonId, formId, build) {
@@ -2042,22 +2165,20 @@ document.addEventListener("DOMContentLoaded", function () {
     clear(form);
     var title = input("pl-mat-title", {placeholder: "Например: костюмная шерсть", maxLength: 200});
     var qty = input("pl-mat-qty", {placeholder: "100"});
-    var unit = input("pl-mat-unit", {value: "м", maxLength: 16});
     var note = input("pl-mat-note", {placeholder: "поставщик, счёт, комментарий", maxLength: 500});
     form.appendChild(field("Название материала", title, true));
     form.appendChild(field("Количество", qty));
-    form.appendChild(field("Единица", unit));
+    var readUnit = unitPicker(form, "pl-mat-unit", "м");
     form.appendChild(field("Источник или комментарий", note, true));
     var hint = el("div", "pl-hint",
-      "Количество можно не указывать: «неизвестно» так и останется неизвестным, "
-      + "нулём оно не станет.");
+      "Не знаете количество — оставьте пустым.");
     form.appendChild(hint);
     form.appendChild(submitRow("Сохранить материал", "pl-mat-err"));
     bindTokenReset(form);
     form.onsubmit = function (ev) {
       ev.preventDefault();
       send("/api/supply/planning/materials", {
-        title: title.value, qty: qty.value, unit: unit.value,
+        title: title.value, qty: qty.value, unit: readUnit(),
         source_note: note.value, op_id: actionToken(form),
       }, "pl-mat-err", function (ok) {
         if (ok) { resetToken(form); form.hidden = true; clear(form);
@@ -2370,9 +2491,7 @@ document.addEventListener("DOMContentLoaded", function () {
     form.appendChild(fText);
     form.appendChild(fDate);
     form.appendChild(fSource);
-    form.appendChild(el("div", "pl-hint",
-      "Ориентир — нормальный ответ. «Оборот» не превращает срок в просрочку и "
-      + "ничего не подставляет за вас."));
+    form.appendChild(el("div", "pl-hint", "Ориентир — нормальный ответ."));
     // ИСТОЧНИК СРОКА ВИДЕН ПРИ ЛЮБОМ ВИДЕ (F-03). Раньше он прятался у
     // «срок неизвестен», хотя сервер его хранит и карточка показывает: после
     // правила «скрытое не отправляем» такое поле молча стиралось бы при смене
@@ -2422,8 +2541,7 @@ document.addEventListener("DOMContentLoaded", function () {
     form.appendChild(field("План изделий, шт", qty));
     var readDue = dueFields(form, "pl-batch", null);
     form.appendChild(el("div", "pl-hint",
-      "План изделий вводится отдельно и из метража НЕ выводится: расход ткани "
-      + "на изделие «Оборот» не знает и не выдумывает."));
+      "План изделий вводится отдельно от количества материала."));
     form.appendChild(submitRow("Создать плановую партию", "pl-batch-err"));
     bindTokenReset(form);
     form.onsubmit = function (ev) {
@@ -2495,24 +2613,16 @@ document.addEventListener("DOMContentLoaded", function () {
 
     if (PL.board && PL.board.can_write) {
       var actions = el("div", "pl-actions");
-      var assign = el("button", "btn sm", "Назначить на партию");
-      assign.type = "button";
+      var assign = inlineButton(card, "Назначить на партию", "assign",
+                                function (box) { buildAssignForm(box, m); });
       assign.dataset.material = String(m.id);
-      assign.setAttribute("aria-expanded", "false");
-      assign.addEventListener("click", function () {
-        toggleInline(card, assign, function (box) { buildAssignForm(box, m); });
-      });
       actions.appendChild(assign);
 
-      // F-13: «Уточнить количество» правило ОДНО поле из четырёх. Название с
+      // F-13: прежняя кнопка правила ОДНО поле из четырёх. Название с
       // опечаткой, не та единица и потерянная заметка правились только через
       // API, то есть никак: человек заводил материал заново и получал два.
-      var edit = el("button", "btn sm", "Изменить");
-      edit.type = "button";
-      edit.setAttribute("aria-expanded", "false");
-      edit.addEventListener("click", function () {
-        toggleInline(card, edit, function (box) { buildMaterialEditForm(box, m); });
-      });
+      var edit = inlineButton(card, "Изменить", "edit",
+                              function (box) { buildMaterialEditForm(box, m); });
       actions.appendChild(edit);
 
       // F-12: убрать ошибочную строку. Вопрос задаётся на месте кнопки (тот же
@@ -2546,7 +2656,11 @@ document.addEventListener("DOMContentLoaded", function () {
     return card;
   }
 
-  function toggleInline(card, button, build) {
+  // ИНЛАЙН-ФОРМА ПОДПИСАНА ИМЕНЕМ (F-21). Имя нужно не для красоты: после
+  // перерисовки списка карточек форму надо открыть ЗАНОВО и ровно ту же, а
+  // кнопки к этому моменту уже другие объекты с другими замыканиями. Имя —
+  // единственное, что переживает перерисовку.
+  function toggleInline(card, button, name, build) {
     var existing = card.querySelector(".pl-form.inline");
     if (existing) {
       card.removeChild(existing);
@@ -2554,11 +2668,208 @@ document.addEventListener("DOMContentLoaded", function () {
       return;
     }
     var box = el("form", "pl-form inline");
+    box.dataset.inline = name;
     card.appendChild(box);
     button.setAttribute("aria-expanded", "true");
     build(box);
+    // Во время восстановления фокус НЕ трогаем: человек в этот момент печатает
+    // в другом месте экрана, и отобрать у него курсор ради формы, которую он
+    // открыл минуту назад, — это тот же класс потери, что и стереть текст.
+    if (PL.restoring) return;
     var first = box.querySelector("input, select, textarea");
     if (first) first.focus();
+  }
+
+  // КНОПКА ИНЛАЙН-ФОРМЫ СОБИРАЕТСЯ ОДНИМ МЕСТОМ, и это не сокращение записи.
+  // Имя формы обязано стоять на кнопке СРАЗУ, а не появляться при первом
+  // нажатии: после перерисовки карточка и кнопка — новые объекты, форму ещё
+  // никто не открывал, а найти её кнопку уже надо (F-21).
+  // РЕДАКЦИЯ ЧЕРНОВИКА ЖИВЁТ В ФОРМЕ, А НЕ В ЗАМЫКАНИИ СТРОИТЕЛЯ, и это и есть
+  // всё исправление. Замыкание пересобирается на каждой перерисовке и берёт
+  // редакцию свежей доски; черновик человека при этом остаётся прежним. Пока
+  // редакция была значением замыкания, восстановление склеивало старые значения
+  // со свежим номером — пару, которой не существовало ни в один момент, — и
+  // оптимистичная блокировка пропускала её, стирая правку соседнего окна.
+  //
+  // Записанная в саму форму, редакция снимается и возвращается тем же порядком,
+  // что и введённый текст: «эти значения поверх ВОТ ЭТОЙ строки» — одно
+  // утверждение, а не два независимых.
+  function draftRev(form, rev) {
+    var n = Number(rev);
+    if (isFinite(n)) form.dataset.rev = String(n);
+    return function () { return form.dataset.rev; };
+  }
+
+  function inlineButton(card, label, name, build) {
+    var btn = el("button", "btn sm", label);
+    btn.type = "button";
+    btn.dataset.inline = name;
+    btn.setAttribute("aria-expanded", "false");
+    btn.addEventListener("click", function () {
+      toggleInline(card, btn, name, build);
+    });
+    return btn;
+  }
+
+  // ── Сохранность открытых инлайн-форм при перерисовке (F-21) ───────────────
+  // `render()` заново собирает списки карточек, а инлайн-форма живёт ВНУТРИ
+  // карточки — значит, любое сохранение в другом месте уносило её вместе с
+  // набранным текстом. Формы верхнего уровня этой беды не знают: они лежат вне
+  // перерисовываемых контейнеров. Здесь тот же результат достигается вторым
+  // способом из ТЗ — снять значения и восстановить их.
+  function captureInline() {
+    var out = [];
+    [].forEach.call(
+      document.querySelectorAll("#pl-materials .pl-form.inline,"
+                                + " #pl-batches .pl-form.inline"),
+      function (box) {
+        var card = box.closest ? box.closest("[data-pl][data-id]") : null;
+        if (!card || !box.dataset.inline) return;
+        var fields = [].slice.call(box.querySelectorAll("input, select, textarea"));
+        var active = fields.indexOf(document.activeElement);
+        var caret = null;
+        if (active >= 0) {
+          try { caret = fields[active].selectionStart; } catch (e) { caret = null; }
+        }
+        // ЧЕРНОВИКА БОЛЬШЕ НЕТ — ЗНАЧИТ, И ВОССТАНАВЛИВАТЬ НЕЧЕГО. Если запись
+        // ЭТОЙ формы только что удалась, всё, что человек набрал, уже сохранено:
+        // возвращать поверх свежей строки прежние значения не только незачем —
+        // это прямой вред. Первая редакция этого места снимала только
+        // закрепление редакции, а значения продолжала возвращать, и получалась
+        // та же негодная пара «старые значения + свежая редакция», против
+        // которой всё и делалось, просто собранная с другой стороны: после
+        // потерянного ответа, правки соседа и повтора того же поступка
+        // следующая правка молча возвращала соседские числа к своим.
+        //
+        // Поэтому здесь снимается ВСЁ разом: и значения, и редакция, и место
+        // курсора. Форму заново заполнит её строитель — из свежей доски, одним
+        // источником на всё. Пара, которой не существовало, перестаёт быть
+        // собираемой в принципе, а человек видит правду, а не свой прежний
+        // черновик поверх чужой правки.
+        //
+        // Переживает это одно: идентичность поступка. Повтор неизменного
+        // нажатия обязан остаться идемпотентным (корректив 2).
+        var applied = (box === PL.applied);
+        out.push({
+          kind: card.dataset.pl,
+          id: card.dataset.id,
+          name: box.dataset.inline,
+          // ИДЕНТИЧНОСТЬ ПОСТУПКА ПЕРЕЖИВАЕТ ПЕРЕРИСОВКУ. Без неё повтор после
+          // ПОТЕРЯННОГО ответа (сервер записал, ответ не дошёл) приходил под
+          // новым `op_id`, замок повторного поступка его не узнавал, и то же
+          // назначение прибавлялось второй раз — расписанный метраж удваивался
+          // без действия человека. Форма после перерисовки — новый узел, и
+          // `dataset.opId` исчезал вместе со старым; значит, его надо снять и
+          // вернуть так же, как значения полей.
+          opId: box.dataset.opId || "",
+          // РЕДАКЦИЯ ЧЕРНОВИКА СНИМАЕТСЯ ВМЕСТЕ СО ЗНАЧЕНИЯМИ И ПО ТОЙ ЖЕ
+          // ПРИЧИНЕ. Она — не украшение формы, а вторая половина того, что
+          // человек собирается отправить: «вот эти значения поверх ВОТ ЭТОЙ
+          // строки». Пересобранная форма берёт редакцию из свежей доски, и без
+          // этой строки поверх неё ложились старые значения — пара, которой
+          // никогда не существовало. Сервер такую пару пропускал, и правка из
+          // соседнего окна молча стиралась.
+          //
+          // Исключение ровно одно и описано выше: форма, чья СОБСТВЕННАЯ
+          // запись только что удалась, не восстанавливается вовсе — её
+          // пересоберёт строитель по свежей доске.
+          rev: applied ? "" : (box.dataset.rev || ""),
+          // Файловое поле не восстанавливается и восстановлено быть не может:
+          // выбранный файл принадлежит окну выбора, а не нам. Пишем пустую
+          // строку, чтобы длины списков совпадали, и не делаем вид, что файл
+          // на месте.
+          values: applied ? null : fields.map(function (f) {
+            return f.type === "file" ? null : f.value;
+          }),
+          active: applied ? -1 : active,
+          caret: applied ? null : caret
+        });
+      });
+    return out;
+  }
+
+  function restoreInline(saved) {
+    if (!saved.length) return;
+    PL.restoring = true;
+    try {
+      saved.forEach(function (item) {
+        var card = document.querySelector('[data-pl="' + item.kind + '"]'
+                                          + '[data-id="' + item.id + '"]');
+        if (!card) return;                       // строку убрали — нечего открывать
+        var btn = card.querySelector('button[data-inline="' + item.name + '"]');
+        if (!btn) return;
+        if (!card.querySelector(".pl-form.inline")) btn.click();
+        var box = card.querySelector(".pl-form.inline");
+        if (!box) return;
+        // Токен возвращается ПЕРВЫМ и до значений: если человек тронет поле
+        // после восстановления, `bindTokenReset` честно снимет его сам — это
+        // уже другая правка и другой поступок.
+        if (item.opId) box.dataset.opId = item.opId;
+        if (item.rev) box.dataset.rev = item.rev;
+        var fields = [].slice.call(box.querySelectorAll("input, select, textarea"));
+        var chosen = [];
+        // `values === null` — это «черновика нет»: форма только что записала
+        // своё и заполнена строителем из свежей доски. Трогать её нечем.
+        (item.values || []).forEach(function (value, i) {
+          if (value === null || i >= fields.length) return;
+          var node = fields[i];
+          if (node.tagName === "SELECT") {
+            // У списка восстанавливается только существующий вариант: партию
+            // могли убрать, пока форма переноса была открыта, и подставлять в
+            // `value` исчезнувший номер значило бы отправить его на сервер.
+            var ok = [].some.call(node.options, function (o) {
+              return o.value === value;
+            });
+            if (ok) {
+              node.value = value;
+              chosen.push(node);
+            }
+            return;
+          }
+          node.value = value;
+        });
+        // ФОРМА ОБЯЗАНА УЗНАТЬ О ВОССТАНОВЛЕННОМ ВЫБОРЕ, А НЕ ТОЛЬКО ПОКАЗАТЬ
+        // ЕГО. Это и был воспроизведённый P1 ревью PR #54. Значение списку
+        // присваивалось молча, а зависимые поля живут не здесь: их прячет и
+        // показывает сам строитель формы (`dueFields`, `unitPicker`), и делает
+        // он это по событию `change`. Без события форма после перерисовки
+        // описывала состояние, которое было ДО выбора человека: список говорил
+        // «ориентировочно», введённый текст лежал скрытым, а прежняя точная
+        // дата оставалась на экране — и уходила в запрос, потому что `readDue`
+        // читает именно видимость. «Сохранить» отвечало 400 на основном пути
+        // записи. Теперь список сообщает о себе ровно тем же событием, каким
+        // сообщил бы человек, и строитель перекрашивает свои поля сам.
+        //
+        // СОБЫТИЕ НЕ ВСПЛЫВАЕТ, и это не мелочь. `bindTokenReset` слушает
+        // `change` на самой форме и сбрасывает `op_id`: всплывшее событие
+        // означало бы, что КАЖДАЯ перерисовка меняет идентичность поступка, и
+        // повтор после потерянного ответа снова создавал бы вторую запись —
+        // ровно тот P1, который закрыт в SUPPLY-3. Восстановление правкой
+        // человека не является.
+        //
+        // Перекраска идёт ПОСЛЕ того, как вернулись все значения: строитель
+        // вправе смотреть не только на список, и решать он должен по готовой
+        // форме, а не по половине.
+        chosen.forEach(function (node) {
+          node.dispatchEvent(new Event("change"));
+        });
+        if (item.active >= 0 && item.active < fields.length) {
+          var node = fields[item.active];
+          // Поле, которое перекраска только что спрятала, фокуса не получает:
+          // курсор в невидимом поле — это тот же обман, что и скрытое значение
+          // в запросе.
+          var host = node.closest ? node.closest(".pl-field") : null;
+          if (!host || getComputedStyle(host).display !== "none") {
+            try { node.focus({preventScroll: true}); } catch (e) { node.focus(); }
+            if (item.caret !== null && node.setSelectionRange) {
+              try { node.setSelectionRange(item.caret, item.caret); } catch (e) { /* нечисловое поле */ }
+            }
+          }
+        }
+      });
+    } finally {
+      PL.restoring = false;
+    }
   }
 
   function buildAssignForm(form, material) {
@@ -2576,11 +2887,10 @@ document.addEventListener("DOMContentLoaded", function () {
     });
     var qty = input(null, {placeholder: "40"});
     form.appendChild(field("Плановая партия", pick, true));
-    form.appendChild(field("Метраж, " + material.unit, qty));
+    form.appendChild(field("Сколько, " + material.unit, qty));
     form.appendChild(el("div", "pl-hint",
-      "Это план, а не расход: назначить можно и больше, чем в наличии — "
-      + "«Оборот» предупредит числом, но не запретит и не спишет."));
-    form.appendChild(submitRow("Назначить", "pl-assign-err"));
+      "Это план, а не расход: назначить можно больше, чем в наличии."));
+    form.appendChild(submitRow("Отдать", "pl-assign-err"));
     bindTokenReset(form);
     form.onsubmit = function (ev) {
       ev.preventDefault();
@@ -2595,26 +2905,27 @@ document.addEventListener("DOMContentLoaded", function () {
   // Заметка и единица до этого пакета из интерфейса не менялись вовсе, а
   // название — тем более: опечатка в названии ткани жила до конца сезона.
   function buildMaterialEditForm(form, material) {
+    var readRev = draftRev(form, material.rev);
     var title = input(null, {value: material.title, maxLength: 200});
     var qty = input(null, {value: material.qty_known ? fmt(material.qty) : "",
                            placeholder: "оставьте пустым, если неизвестно"});
-    var unit = input(null, {value: material.unit, maxLength: 16});
     var note = input(null, {value: material.source_note || "",
                             placeholder: "поставщик, счёт, комментарий",
                             maxLength: 500});
     form.appendChild(field("Название материала", title, true));
     form.appendChild(field("Количество", qty));
-    form.appendChild(field("Единица", unit));
+    var readUnit = unitPicker(form, "pl-matq-unit-" + material.id, material.unit);
     form.appendChild(field("Источник или комментарий", note, true));
     form.appendChild(submitRow("Сохранить", "pl-matq-err"));
     bindTokenReset(form);
     form.onsubmit = function (ev) {
       ev.preventDefault();
       send("/api/supply/planning/materials/" + material.id + "/update",
-           {title: title.value, qty: qty.value, unit: unit.value,
-            source_note: note.value, rev: material.rev,
+           {title: title.value, qty: qty.value, unit: readUnit(),
+            source_note: note.value, rev: readRev(),
             op_id: actionToken(form)},
-           "pl-matq-err", null, {kind: "material", id: material.id});
+           "pl-matq-err", null,
+           {kind: "material", id: material.id, form: form});
     };
   }
 
@@ -2651,12 +2962,8 @@ document.addEventListener("DOMContentLoaded", function () {
 
       // F-13(в): у вещи до этого пакета не было ручки update вовсе — опечатка в
       // названии новинки не правилась ничем, кроме как завести вторую вещь.
-      var edit = el("button", "btn sm", "Изменить");
-      edit.type = "button";
-      edit.setAttribute("aria-expanded", "false");
-      edit.addEventListener("click", function () {
-        toggleInline(row, edit, function (box) { buildItemEditForm(box, it); });
-      });
+      var edit = inlineButton(row, "Изменить", "edit",
+                              function (box) { buildItemEditForm(box, it); });
       actions.appendChild(edit);
 
       // F-12: убрать можно НОВИНКУ. У вещи каталога стоит выпущенный замок
@@ -2698,6 +3005,7 @@ document.addEventListener("DOMContentLoaded", function () {
   // минимума в существующем интерфейсе, а замена картинки это отдельный экран.
   // Названо прямо, чтобы «в UI нет» не читалось как «нигде нет».
   function buildItemEditForm(form, it) {
+    var readRev = draftRev(form, it.rev);
     var title = null;
     if (it.kind === "draft") {
       title = input(null, {value: it.title, maxLength: 200});
@@ -2713,10 +3021,10 @@ document.addEventListener("DOMContentLoaded", function () {
     bindTokenReset(form);
     form.onsubmit = function (ev) {
       ev.preventDefault();
-      var body = {note: note.value, rev: it.rev, op_id: actionToken(form)};
+      var body = {note: note.value, rev: readRev(), op_id: actionToken(form)};
       if (title) body.title = title.value;
       send("/api/supply/planning/items/" + it.id + "/update", body,
-           "pl-item-edit-err", null, {kind: "item", id: it.id});
+           "pl-item-edit-err", null, {kind: "item", id: it.id, form: form});
     };
   }
 
@@ -2735,7 +3043,9 @@ document.addEventListener("DOMContentLoaded", function () {
     var grow = el("div", "grow");
     var head = el("div", "t");
     head.appendChild(el("span", null, b.title || b.item_title));
-    head.appendChild(el("span", "pl-tag", "плановая партия"));
+    // Бейджа «плановая партия» здесь больше нет (F-20): он стоял на ста
+    // процентах карточек и потому не различал ничего, а место занимал у
+    // «новинки» — которая как раз различает.
     if (b.item_kind === "draft") head.appendChild(el("span", "pl-tag", "новинка"));
     grow.appendChild(head);
     grow.appendChild(el("div", "sub", "вещь: " + b.item_title));
@@ -2749,8 +3059,15 @@ document.addEventListener("DOMContentLoaded", function () {
     due.appendChild(b.due_kind === "unknown"
       ? el("span", "unknown", "неизвестен")
       : el("b", null, b.due_label));
+    // F-18: прошедший ТОЧНЫЙ срок называется вслух и серым. Признак считает
+    // сервер (`due_past`) — иначе часовой пояс браузера решал бы, просрочена
+    // партия или нет, и два человека видели бы разное. Данные не меняются:
+    // ни поля, ни статуса, ни просрочки в слое по-прежнему нет.
+    if (b.due_past) due.appendChild(el("span", "pl-past", "уже прошла"));
     nums.appendChild(due);
-    if (b.due_source) nums.appendChild(el("span", null, "источник: " + b.due_source));
+    if (b.due_source) {
+      nums.appendChild(el("span", null, "кто назвал срок: " + b.due_source));
+    }
     if (b.due_author) nums.appendChild(el("span", null, "внёс: " + b.due_author));
     grow.appendChild(nums);
     row.appendChild(grow);
@@ -2767,11 +3084,8 @@ document.addEventListener("DOMContentLoaded", function () {
         line.appendChild(el("span", "pl-tag", "наличие не подтверждено"));
       }
       if (PL.board && PL.board.can_write) {
-        var move = el("button", "btn sm", "Перенести");
-        move.type = "button";
-        move.addEventListener("click", function () {
-          toggleInline(card, move, function (box) { buildMoveForm(box, a, b); });
-        });
+        var move = inlineButton(card, "Перенести", "move-" + a.id,
+                                function (box) { buildMoveForm(box, a, b); });
         line.appendChild(move);
         // СНЯТИЕ — ЕДИНСТВЕННОЕ НЕОБРАТИМОЕ ДЕЙСТВИЕ НА ЭКРАНЕ, и до этого
         // пакета оно происходило от одного нажатия, без вопроса и без пути
@@ -2815,12 +3129,8 @@ document.addEventListener("DOMContentLoaded", function () {
       // партии и заметка к плану из интерфейса не менялись вовсе, хотя оба поля
       // человек вводит при создании — то есть опечатку в названии исправить
       // было нечем.
-      var edit = el("button", "btn sm", "Изменить");
-      edit.type = "button";
-      edit.setAttribute("aria-expanded", "false");
-      edit.addEventListener("click", function () {
-        toggleInline(card, edit, function (box) { buildBatchEditForm(box, b); });
-      });
+      var edit = inlineButton(card, "Изменить", "edit",
+                              function (box) { buildBatchEditForm(box, b); });
       actions.appendChild(edit);
 
       // F-12, решение владельца 5562704475. ПОСЛЕДСТВИЕ НАЗЫВАЕТСЯ ДО НАЖАТИЯ,
@@ -2877,6 +3187,7 @@ document.addEventListener("DOMContentLoaded", function () {
   }
 
   function buildMoveForm(form, assignment, fromBatch) {
+    var readRev = draftRev(form, assignment.rev);
     var others = ((PL.board && PL.board.batches) || []).filter(function (b) {
       return b.id !== fromBatch.id;
     });
@@ -2900,12 +3211,14 @@ document.addEventListener("DOMContentLoaded", function () {
       ev.preventDefault();
       send("/api/supply/planning/assignments/move", {
         assignment_id: assignment.id, to_batch_id: pick.value, qty: qty.value,
-        rev: assignment.rev, op_id: actionToken(form),
-      }, "pl-move-err", null, {kind: "batch", id: Number(pick.value)});
+        rev: readRev(), op_id: actionToken(form),
+      }, "pl-move-err", null,
+         {kind: "batch", id: Number(pick.value), form: form});
     };
   }
 
   function buildBatchEditForm(form, b) {
+    var readRev = draftRev(form, b.rev);
     var title = input(null, {value: b.title || "", maxLength: 200,
                              placeholder: "например: первая закладка"});
     var qty = input(null, {value: b.plan_known ? fmt(b.plan_qty) : "",
@@ -2921,18 +3234,26 @@ document.addEventListener("DOMContentLoaded", function () {
     form.onsubmit = function (ev) {
       ev.preventDefault();
       var body = {title: title.value, plan_qty: qty.value,
-                  plan_note: planNote.value, rev: b.rev,
+                  plan_note: planNote.value, rev: readRev(),
                   op_id: actionToken(form)};
       var due = readDue();
       for (var k in due) { if (due.hasOwnProperty(k)) body[k] = due[k]; }
       send("/api/supply/planning/batches/" + b.id + "/update", body,
-           "pl-batch-edit-err", null, {kind: "batch", id: b.id});
+           "pl-batch-edit-err", null, {kind: "batch", id: b.id, form: form});
     };
   }
 
   function render() {
     var data = PL.board;
     if (!data) return;
+    // Открытые инлайн-формы и место курсора снимаются ДО перерисовки списков:
+    // после неё ни того, ни другого уже не существует (F-21).
+    var openInline = captureInline();
+    var wasActive = document.activeElement;
+    var wasCaret = null;
+    if (wasActive && wasActive !== document.body) {
+      try { wasCaret = wasActive.selectionStart; } catch (e) { wasCaret = null; }
+    }
     // F-07: когда делать нечего, блока не должно быть на экране. Прежняя
     // редакция только красила его в «ok» и всё равно показывала — и человек
     // читал «План собран: материалы распределены» ровно тогда, когда сто метров
@@ -2992,6 +3313,18 @@ document.addEventListener("DOMContentLoaded", function () {
     byId("pl-batch-empty").hidden = totalRows > 0;
     byId("pl-batch-count").textContent = totalRows + " шт";
     byId("pl-batch-actions").hidden = !data.can_write;
+
+    restoreInline(openInline);
+    // Курсор возвращается туда, где он был, — если это место пережило
+    // перерисовку. Форма верхнего уровня её переживает всегда, инлайн-форму
+    // вернул `restoreInline` и сам поставил в неё фокус; сюда попадает случай
+    // «человек печатал в одной форме, а сохранилось в другой».
+    if (wasActive && wasActive !== document.body && document.contains(wasActive)) {
+      try { wasActive.focus({preventScroll: true}); } catch (e) { wasActive.focus(); }
+      if (wasCaret !== null && wasActive.setSelectionRange) {
+        try { wasActive.setSelectionRange(wasCaret, wasCaret); } catch (e) { /* нечисловое поле */ }
+      }
+    }
   }
 
   function loadBoard() {
