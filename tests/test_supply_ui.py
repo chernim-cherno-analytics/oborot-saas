@@ -3965,6 +3965,8 @@ def supply_fix_3_ui(pw, base, c) -> None:
         ("сторож своей записи", lambda: _fix3_own_save_rebase(page, base, c, "desktop")),
         # Корректив 4: повтор поступка не воскрешает старый черновик.
         ("P1 повтор и правка", lambda: _fix3_replay_then_edit(page, base, c, "desktop")),
+        ("сторож чужой правки после коммита",
+         lambda: _fix3_peer_after_commit(page, base, c, "desktop")),
     )
     for label, run_step in steps:
         try:
@@ -5090,6 +5092,101 @@ def _fix3_replay_then_edit(page, base, c, tag: str) -> None:
     check(f"{tag}: а собственная правка названия применена",
           bool(final) and final[0]["title"] == f"Правка два {tag}",
           final[0]["title"] if final else "нет строки")
+
+
+def _fix3_peer_after_commit(page, base, c, tag: str) -> None:
+    """Сосед пишет ПОСЛЕ нашего коммита — молчаливой подмены быть не должно.
+
+    Это форма, о которой говорит тред r3952047085: наша запись прошла, а строку
+    успели изменить прежде, чем ответ добрался до страницы. Точное серверное
+    чередование «коммит → чужая запись → чтение доски» из браузера не
+    закрепляется, поэтому здесь берётся достижимая и полностью детерминированная
+    его половина: ответ на нашу запись перехватывается, чужая правка делается
+    ПОКА он не отдан странице, и только потом он доставляется. Дальше человек
+    правит ещё раз и сохраняет.
+
+    Что обязано быть верным в любом исходе: чужие данные не подменяются молча.
+    Либо человек получает отказ, либо его правка ложится поверх чужих значений —
+    но «200 и чужого числа больше нет» не бывает никогда.
+
+    Это СТОРОЖ, а не воспроизведение: он зелёный и до корректива 4. Красным
+    корректив 4 доказан цепочкой повтора (`_fix3_replay_then_edit`); здесь
+    проверяется, что соседняя форма той же семьи не осталась дырой.
+    """
+    print(f"\n== Сторож: чужая правка после нашего коммита не исчезает ({tag}) ==")
+    board = c.post(P3 + "/materials",
+                   json={"title": f"Ткань-гонка {tag}", "qty": "25", "unit": "м",
+                         "op_id": f"c4r-m-{tag}"}).json()
+    mid = [m for m in board["materials"]
+           if m["title"] == f"Ткань-гонка {tag}"][0]["id"]
+
+    page.goto(f"{base}/supply")
+    page.wait_for_timeout(1200)
+    close_hint(page)
+    opened = page.evaluate("""(id) => {
+      const card = document.querySelector('[data-pl="material"][data-id="' + id + '"]');
+      if (!card) return 'карточки нет';
+      const btn = card.querySelector('button[data-inline="edit"]');
+      if (!btn) return 'кнопки правки нет';
+      btn.click();
+      return card.querySelector('form.pl-form.inline') ? '' : 'форма не открылась';
+    }""", str(mid))
+    check(f"{tag}: форма правки открыта", opened == "", str(opened))
+    if opened:
+        return
+    page.wait_for_timeout(250)
+
+    def peer_between(route):
+        # Наш запрос сервер исполняет целиком; ответ придерживается.
+        resp = route.fetch()
+        cur = [m for m in c.get(P3).json()["materials"] if m["id"] == mid]
+        if cur:
+            c.post(P3 + f"/materials/{mid}/update",
+                   json={"qty": "40", "rev": cur[0]["rev"], "op_id": f"c4r-peer-{tag}"})
+        route.fulfill(response=resp)
+
+    page.route(f"**/api/supply/planning/materials/{mid}/update", peer_between)
+    page.evaluate("""(a) => {
+      const box = document.querySelector('[data-pl="material"][data-id="' + a[0]
+                                         + '"] form.pl-form.inline');
+      const t = box.querySelector('input[type=text], input:not([type])');
+      t.value = a[1];
+      t.dispatchEvent(new Event('input', {bubbles: true}));
+      box.querySelector('button[type=submit]').click();
+    }""", [str(mid), f"Наша правка {tag}"])
+    page.wait_for_timeout(1800)
+    page.unroute(f"**/api/supply/planning/materials/{mid}/update")
+
+    mid_state = [m for m in c.get(P3).json()["materials"] if m["id"] == mid]
+    check(f"{tag}: чужая правка легла на сервер",
+          bool(mid_state) and mid_state[0]["qty"] == 40,
+          str(mid_state[0]["qty"]) if mid_state else "нет строки")
+
+    page.evaluate("""(a) => {
+      const box = document.querySelector('[data-pl="material"][data-id="' + a[0]
+                                         + '"] form.pl-form.inline');
+      if (!box) return;
+      const t = box.querySelector('input[type=text], input:not([type])');
+      t.value = a[1];
+      t.dispatchEvent(new Event('input', {bubbles: true}));
+      box.querySelector('button[type=submit]').click();
+    }""", [str(mid), f"Вторая наша правка {tag}"])
+    page.wait_for_timeout(1800)
+    final = [m for m in c.get(P3).json()["materials"] if m["id"] == mid]
+    err = page.evaluate("""(id) => {
+      const card = document.querySelector('[data-pl="material"][data-id="' + id + '"]');
+      const box = card && card.querySelector('form.pl-form.inline');
+      const e = box && box.querySelector('.pl-form-err');
+      return e ? e.textContent.trim() : '';
+    }""", str(mid))
+    # Годных исходов ровно два, и оба честные: отказ либо правка поверх чужих
+    # значений. Негодный один — тихо вернувшиеся 25.
+    check(f"{tag}: чужие 40 не исчезли ни при каком исходе",
+          bool(final) and final[0]["qty"] == 40,
+          f"qty={final[0]['qty'] if final else '—'}, ошибка: {err[:90]}")
+    check(f"{tag}: и человек либо получил отказ, либо его правка применена",
+          bool(final) and (err != "" or final[0]["title"] == f"Вторая наша правка {tag}"),
+          f"title={final[0]['title'] if final else '—'}, ошибка: {err[:90]}")
 
 
 def _fix3_mobile(browser, base, c) -> None:
