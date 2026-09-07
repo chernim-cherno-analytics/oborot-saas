@@ -875,7 +875,7 @@
 
   function renderPlan(){
     var p = STATE.plan;
-    if(p.blocked){
+    if(p.blocked && !(p.new_items||[]).length){
       var extra = (p.blocked.reason === "no_assignment")
         ? '<a class="go-btn ghost" style="text-decoration:none" href="/settings">Настроить распределение</a>' : '';
       document.getElementById("planBox").innerHTML =

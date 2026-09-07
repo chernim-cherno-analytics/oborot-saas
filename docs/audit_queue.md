@@ -264,3 +264,13 @@ History uses stored complete totals when present and marks old partial totals.
 RESULT: execution175/0, planner361/0, history47/0, Chromium55/0 (638).
 Next bounded UI check: renderPlan exits on p.blocked even when nonempty
 new_items make the order valid; test a new-items-only production end to end.
+
+## Completed local CLAIM A01 new-only screen
+
+BRANCH: codex/audit-a01-new-only-screen. BASE: a327c0f.
+FILES: templates/assistant.html, tests/test_ui.py, docs/audit_queue.md,
+docs/audit_a01_evidence.md.
+DONE_WHEN: a real plan with no catalogue recommendations and valid entered
+new items renders its full order summary and create button. Empty catalogue
+diagnostics must not hide the entered order; server stop/can_create remain.
+RESULT: real browser RED56/1, GREEN57/0. New-only plans render correctly.

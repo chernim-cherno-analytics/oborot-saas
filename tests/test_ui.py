@@ -495,6 +495,23 @@ def run() -> int:  # noqa: C901 — сценарный тест: шагов мн
             check("история: неполная себестоимость явно подписана",
                   "сумма неполная" in (history_row.text_content() or ""))
 
+        print("\n== A01: заказ только из новинок доступен в мастере ==")
+        only_prod = c.post("/api/productions", json={"name": "UI только новинки"}).json()["id"]
+        c.post(f"/api/productions/{only_prod}/setup", json={"preset": "fabric_sewing"})
+        page.goto(f"{base}/assistant")
+        page.locator(f"#prodTiles .tile[data-id='{only_prod}']").click()
+        page.evaluate("() => window.addNew('Только новинки UI', 2, 1000)")
+        with page.expect_response(lambda r: r.url == f"{base}/api/order-plan/preview") as only_preview:
+            page.get_by_text("Сразу показать план", exact=True).click()
+        only_plan = only_preview.value.json()
+        check("A01 реальный сервер разрешает план только из новинок",
+              not only_plan["items"] and bool(only_plan["new_items"]) and only_plan["can_create"])
+        page.wait_for_timeout(500)
+        check("A01 отсутствие рекомендаций не скрывает полный заказ новинок",
+              page.locator("#completeOrderSummary").count() == 1
+              and page.locator("#mkOrder").count() == 1
+              and not page.locator("#mkOrder").is_disabled())
+
         print("\n== «Что заказать»: позиции без себестоимости не бесплатны ==")
         page.goto(f"{base}/replenish")
         page.wait_for_timeout(3500)

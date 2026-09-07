@@ -129,3 +129,15 @@ API RED171/4: /private/tmp/a01-summary-red.log. GREEN execution175/0:
 /private/tmp/a01-summary-ui.log. A final browser pass adds explicit pending-edit
 and restore checks:55/0, /private/tmp/a01-summary-ui-final.log. Total638 checks.
 No full strict CI, independent review or publication is claimed.
+# New-items-only wizard
+
+Basea327c0f. The server accepted a real new-items-only plan but renderPlan
+returned early on the catalogue-only blocked diagnostic. The wizard now
+uses that early diagnostic only when no new items exist; entered rows render
+with the existing server stop/can_create restrictions intact.
+
+Browser RED56/1: /private/tmp/a01-new-only-red.log. The test creates a real
+production without catalogue assignments, selects its tile, enters new items
+and clicks Show plan. It verifies the server allows the plan and the full
+summary/create button are available. GREEN57/0: /private/tmp/a01-new-only-green.log.
+No server calculation or formula change.
