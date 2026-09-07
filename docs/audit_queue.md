@@ -1,5 +1,16 @@
 # Independent audit queue
 
+## Local CLAIM — PR56 navigation CI preparation
+
+BRANCH: codex/audit-stage2-refresh. FILES: tests/test_supply_ui.py,
+docs/audit_queue.md. SOURCE: CI34162892450 F-01 /replenish hit-test failure.
+The hint opens after asynchronous seen/progress/lessons requests, whereas
+F-01 closes it after a fixed 250ms. Mark hints seen using the real API before
+navigation; preserve the actual visibility and mouse hit-test assertions.
+DONE_WHEN: browser suite passes and current PR56 strict CI passes.
+LOCAL RESULT: supply_ui543 OK/0 FAIL, exit0; log
+/private/tmp/pr56-navigation-ui.log. Hosted strict CI remains required.
+
 ## Completed local CLAIM — A05 missing purchase price versus explicit zero
 
 BRANCH: codex/audit-a05-price-presence. SOURCE: PR56 comment3950691498.
@@ -164,6 +175,15 @@ forget the remaining audit items. Formula changes remain prohibited.
 | A07 New production terms alter historical payment calendar | Local exact plan snapshots and new simple-order snapshots throughc0014db; terminal additive migration15; plan/receipt links verify reciprocal identity | Independent review/publication pending; legacy fallback, placement-date policy, renegotiation history and actual payment facts remain open |
 | A08 Received status falsely confirms execution | Local shared completeness summary through8b041c7; no evidence, partial, full, zero and conflicts use the receipt API's existing rules | Independent review/publication pending; partial known lines remain available while the whole order stays unconfirmed |
 | A09 Invalidated cache can republish an obsolete snapshot | Open, P2 after pilot in original priority | Read-only current verification; no repeated prohibited concurrency experiment |
+
+Publication update, 07 September 2026: the historical "independent
+review/publication pending" entries above are superseded by the owner's
+scoped review waiver in AGENTS.md. PR55 merged at
+5d989c7fe21a98ff6ade3735e532245385b744c0 and post-merge CI34162863552 passed.
+PR56 contains the second A05 stage, including missing-price/explicit-zero
+presence and terminal migration16; its current browser CI correction is
+tracked in the CLAIM above. No deployment is claimed. Four findings remain
+partly or wholly open: A03, A04, A07, A09; merging PR56 does not close them.
 
 After P1 consistency fixes: first correct order/onboarding, clear data quality,
 verified supply/batch mapping and paid pilot. These are not permission for
