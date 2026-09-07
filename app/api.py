@@ -2804,7 +2804,7 @@ def api_order_plan_last(
     return {"brief": row.brief, "id": row.id, "created_at": row.created_at.isoformat()}
 
 
-def _plan_row_out(row, names: dict, prods: dict) -> dict:
+def _plan_row_out(row, names: dict, prods: dict, linked_orders: dict) -> dict:
     """Строка истории планов: что решили, на сколько и чем кончилось."""
     brief = row.brief
     try:
@@ -2812,11 +2812,14 @@ def _plan_row_out(row, names: dict, prods: dict) -> dict:
     except ValueError:
         result = {}
     totals = result.get("totals") or {}
+    order_id = (row.production_order_id
+                if linked_orders.get(row.id) == row.production_order_id else None)
     return {
         "id": row.id,
         "created_at": row.created_at.isoformat() if row.created_at else None,
         "status": row.status,
-        "order_id": row.production_order_id,
+        "order_id": order_id,
+        "order_missing": bool(row.production_order_id and order_id is None),
         "author": names.get(row.created_by or 0, ""),
         "production_id": brief.get("production_id"),
         "production_name": prods.get(brief.get("production_id") or 0, ""),
@@ -2861,7 +2864,11 @@ def api_order_plan_history(
             select(Production).where(Production.org_id == ctx.org.id)
         ).scalars()
     }
-    return {"plans": [_plan_row_out(r, names, prods) for r in rows]}
+    linked_orders = dict(db.execute(select(ProductionOrder.order_plan_id, ProductionOrder.id).where(
+        ProductionOrder.org_id == ctx.org.id,
+        ProductionOrder.order_plan_id.in_([r.id for r in rows]),
+    )).all()) if rows else {}
+    return {"plans": [_plan_row_out(r, names, prods, linked_orders) for r in rows]}
 
 
 @router.get("/order-plan/{plan_id}/outcome")

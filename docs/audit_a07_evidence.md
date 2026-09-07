@@ -6,8 +6,9 @@ with 50% upfront and 50% at day45 changed into one immediate 1,000 payment
 after the production directory was edited to 100% upfront. Its original
 computed stage snapshot was still available throughout.
 
-The order now uses the existing snapshot from its earliest applied plan in
-the same organization. The saved stage values are used directly; their shares
+The order now uses the snapshot from its reciprocally linked applied plan in
+the same organization. Exact saved payment terms are preferred to the legacy
+rounded stage display. The saved values are used directly; their shares
 are not renormalized. No schema or stored data changes. Missing, malformed or
 foreign snapshots retain the previous production/settings fallback; simple
 orders without a snapshot are therefore not claimed fixed by this package.
@@ -51,3 +52,15 @@ Precision baseline: planner342 OK /2 FAIL. After the precision fix344/0.
 Reused-ID baseline:345 OK /1 FAIL after an actual API delete/create sequence.
 Decision record regression43/0. Final planner346/0 and execution164/0:
 553 OK /0 FAIL across these suites. No schema, supplier-price policy or allocator changes.
+
+## History links after deletion and ID reuse
+
+The same identity issue remained in history: _plan_row_out emitted the stored
+production_order_id without checking the current order. An actual API
+delete/create sequence reproduced a history link to a different new order.
+History now loads same-organization plan/order links in one query and emits
+a link only when both directions agree. Otherwise it returns order_id=null
+and order_missing=true, rendered as an unavailable order. No historical rows
+are rewritten. Genuine links and plans with no created order retain their
+normal behavior. Baseline planner347 OK /1 FAIL. Final planner348/0 and
+Chromium52/0, including history rendering and no console errors:400/0.

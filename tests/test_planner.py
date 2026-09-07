@@ -1101,6 +1101,13 @@ def api_checks() -> None:
         plain_expected = precision_op.payment_plan(date.today(), _gate_json.loads(original_terms), new_plain["total_cost"])
         check("A07 новый заказ не наследует снимок удалённого заказа",
               new_plain["order_plan_id"] is None and new_plain["payments"] == plain_expected)
+        identity_history = {h["id"]: h for h in c.get("/api/order-plan/history", params={"limit": 100}).json()["plans"]}
+        check("история не связывает старый план с переиспользованным ID",
+              identity_history[precise_saved["id"]]["order_id"] is None
+              and identity_history[precise_saved["id"]].get("order_missing") is True)
+        check("история сохраняет действительную связь плана с заказом",
+              identity_history[saved["id"]]["order_id"] == made["id"]
+              and not identity_history[saved["id"]].get("order_missing"))
         c.delete(f"/api/orders/{reused['id']}")
 
         other = c.get("/api/orders/open", params={"production_id": china["id"]}).json()

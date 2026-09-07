@@ -166,3 +166,14 @@ Next bounded check: _plan_row_out still emits production_order_id directly
 as a clickable history link. Verify deleted/reused order IDs there as well;
 do not show a different new order as the old plan's result. This is a read
 contract/identity check, not a change to payment or allocation policy.
+
+## Completed local CLAIM history order identity
+
+BRANCH: codex/audit-history-order-identity. BASE: dda4fc6.
+FILES: app/api.py (_plan_row_out/history order lookup), templates/assistant.html
+(unavailable-order label), tests/test_planner.py, docs/audit_queue.md,
+docs/audit_a07_evidence.md.
+DONE_WHEN: history links only a same-organization order reciprocally linked
+to the plan; deleted/reused IDs show unavailable instead of linking a new
+order. Valid links and uncreated-plan status remain. No writes to history,
+schema or monetary changes. Regression uses actual API delete/create.

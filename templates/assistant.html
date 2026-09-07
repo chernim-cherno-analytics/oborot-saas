@@ -587,7 +587,7 @@
             (h.totals_exclude_new_items ? '<span class="why">без новинок</span>' : '')+
             (h.cost_incomplete ? '<span class="why">сумма неполная</span>' : '')+"</td>"+
           "<td>"+esc(h.author||"—")+"</td>"+
-          "<td>"+(h.order_id ? '<a href="/replenish#orders" title="Заказы в производстве — внизу страницы «Заказ»">№'+h.order_id+"</a>" : '<span class="muted">не оформлен</span>')+"</td>"+
+          "<td>"+(h.order_id ? '<a href="/replenish#orders" title="Заказы в производстве — внизу страницы «Заказ»">№'+h.order_id+"</a>" : '<span class="muted">'+(h.order_missing ? 'заказ недоступен' : 'не оформлен')+'</span>')+"</td>"+
           '<td><button class="go-btn ghost repeat" type="button" data-id="'+h.id+
             '" style="padding:4px 10px;font-size:12px">Повторить</button></td></tr>';
       }).join("")+"</tbody></table></div>";
