@@ -63,3 +63,30 @@ pause. The test now waits for calculation completion before checking the
 window label; that rerun passed50/0. The final combined browser case saves
 real new items and a real catalogue item with missing cost:52 OK /0 FAIL.
 Combined final package checks: API43 plus browser52, 95 OK /0 FAIL.
+# New-item quantities in outcome
+
+Owner07 Sep: continue remaining work except calculation formulas. The outcome
+report now includes saved brief.new_items. A new-only name has recommended=null,
+decided equal to its entered quantity and executed=null until a receipt fact.
+new_item_qty exposes the manual addition. Same-name new items group under the
+existing receipt base_name identity; mixed catalogue/manual rows preserve the
+catalogue recommendation and add the entered quantity without repeating receipt
+facts. Historical inputs/results and all monetary/forecast formulas are unchanged.
+
+The real API regression additionally found draft-to-sent failed for duplicate
+new names: autoflush=false let two db.get misses queue two OrderedQty inserts
+with the same key. _apply_order_to_incoming now sums by name before writing,
+matching the neighbouring remainder path and existing receipt aggregation.
+
+RED at d347bb0: /private/tmp/a01-outcome-red.log contains two failed new-item
+outcome checks followed by the real UNIQUE violation and connection reset;
+it is not a completed suite result. Initial fixed run passed new-only cases,
+then the mixed fixture hit the existing budget guard. The fixture now uses
+one assigned catalogue model in an isolated production with adequate budget.
+
+Final GREEN: execution171/0 (/private/tmp/a01-outcome-green-final.log),
+planner361/0 (/private/tmp/a01-outcome-planner.log), mock writeback140/0
+(/private/tmp/a01-outcome-writeback.log):672 checks. Explicit zero and receipt50
+are counted once for quantities20+30; mixed10+5 keeps catalogue recommendation
+and reports decided/executed15. Read-only outcome does not rewrite saved JSON.
+No full strict CI, independent review, publication or deployment is claimed.

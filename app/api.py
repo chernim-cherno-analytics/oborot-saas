@@ -531,10 +531,15 @@ def _items_and_pushed(items_json) -> tuple[list[dict], dict[str, float] | None]:
 
 def _apply_order_to_incoming(db: Session, org_id: int, items: list[dict], sign: int) -> None:
     """Прибавляет (sign=+1) или вычитает (sign=-1) позиции заказа из «едет к нам»."""
+    totals: dict[str, int] = {}
     for item in items:
         base, qty = item.get("base_name"), int(item.get("qty") or 0)
         if not base or qty <= 0:
             continue
+        totals[base] = totals.get(base, 0) + qty
+    # Autoflush выключен: повторный db.get не увидит ещё не вставленную
+    # строку. Одно имя записываем один раз, как и в сверке приёмок.
+    for base, qty in totals.items():
         row = db.get(OrderedQty, (org_id, base))
         if row is None:
             db.add(OrderedQty(org_id=org_id, base_name=base, qty=max(0, sign * qty)))
@@ -2963,6 +2968,24 @@ def api_order_plan_outcome(
         if base:
             rec = item.get("qty_recommended")
             lines.append(_line(base, None if rec is None else int(rec), 0.0))
+
+    # Факт приёмки относится к имени, а не к отдельной строке брифа.
+    # Две новинки одного имени и новинка поверх каталога не должны
+    # повторять один факт исполнения. Рекомендацию каталога сохраняем;
+    # вручную добавленное количество показываем отдельно.
+    by_base = {line["base_name"]: line for line in lines}
+    for item in (row.brief.get("new_items") or []):
+        base = str(item.get("name") or "").strip()
+        qty = int(item.get("qty") or 0)
+        if not base or qty <= 0:
+            continue
+        line = by_base.get(base)
+        if line is None:
+            line = _line(base, None, 0)
+            lines.append(line)
+            by_base[base] = line
+        line["decided"] += qty
+        line["new_item_qty"] = line.get("new_item_qty", 0) + qty
 
     edited = sum(1 for x in lines
                  if x["recommended"] is not None and x["recommended"] != x["decided"])

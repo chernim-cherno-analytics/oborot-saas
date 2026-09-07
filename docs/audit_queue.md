@@ -213,3 +213,23 @@ clients. Legacy missing gate metadata has a distinct recalculate code.
 Tests verify codes plus no writes; no recalculation or monetary semantics.
 RESULT: RED355/6, GREEN361/0. Existing string detail and422 are preserved;
 code/stop fields expose saved reasons without parsing translated text.
+
+## Completed local CLAIM A01 new-item outcome
+
+BRANCH: codex/audit-a01-new-item-outcome. BASE: d347bb0.
+FILES: app/api.py (outcome lines, _apply_order_to_incoming), tests/test_execution.py,
+docs/audit_queue.md, docs/audit_a01_evidence.md.
+OWNER: continue all remaining work except calculation formulas (07 Sep).
+DONE_WHEN: saved new items appear in outcome with entered quantities and no
+invented recommendation. Group by the existing receipt identity base_name;
+duplicate/mixed names consume a receipt once, retain catalogue recommendation
+and expose new_item_qty separately. Test before receipts, zero, actual receipts,
+duplicate new names and mixed catalogue/manual names. No monetary formulas,
+schema or historical writes.
+The API regression also reproduced a UNIQUE violation on draft-to-sent for
+duplicate new names: with autoflush disabled, incoming inserts the same key
+twice. Aggregate quantities by the same existing base-name key before the
+write, as the neighbouring remainder path already does. Verify incoming50.
+RESULT: execution171/0, planner361/0, mock writeback140/0. New-only and mixed
+names retain quantities/provenance and consume one receipt fact per name.
+Full monetary totals/calendar work remains separate; formulas unchanged.

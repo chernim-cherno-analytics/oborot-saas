@@ -913,6 +913,58 @@ def run() -> int:  # noqa: C901 — сценарный тест, ветвлен�
     check("и берёт id заказа доказуемой связью, а не догадкой",
           "_oborot_order_id" in calls, str(sorted(calls))[:200])
 
+    print("\n== A01: новинки в отчёте исполнения ==")
+    new_prod = c.post("/api/productions", json={"name": "Только новинки"}).json()["id"]
+    c.post(f"/api/productions/{new_prod}/setup", json={"preset": "fabric_sewing"})
+    new_saved = c.post("/api/order-plan", json={"production_id": new_prod,
+        "budget": 100000, "budget_scope": "full", "new_items": [
+            {"name": "Новинка A01", "qty": 20, "cost": 100},
+            {"name": "Новинка A01", "qty": 30, "cost": 100}]}).json()
+    new_plan = new_saved["id"]
+    original_new = sql("SELECT brief_json,result_json FROM order_plans WHERE id=?", new_plan)[0]
+    new_before = c.get(f"/api/order-plan/{new_plan}/outcome").json()
+    check("A01 две новинки одного имени — одна позиция решения без рекомендации",
+          new_before["positions"] == 1 and new_before["lines"] == [{
+              "base_name": "Новинка A01", "recommended": None, "decided": 50,
+              "executed": None, "new_item_qty": 50}], str(new_before)[:220])
+    check("A01 итог решения включает новинки до оформления заказа",
+          new_before["totals"] == {"recommended": 0, "decided": 50, "executed": None})
+    new_apply = c.post(f"/api/order-plan/{new_plan}/apply", json={"force": True}).json()
+    new_order = new_apply["order_id"]
+    new_sent = c.post(f"/api/orders/{new_order}/status", json={"status": "sent"})
+    check("A01 повторённое имя отправляется без ошибки и даёт ровно50 в пути",
+          new_sent.status_code == 200
+          and sql("SELECT qty FROM ordered_qty WHERE org_id=1 AND base_name=?", "Новинка A01") == [(50,)],
+          str(new_sent.status_code))
+    for qty, expected in ((0, 0), (50, 50)):
+        receipt = c.post(f"/api/orders/{new_order}/receipts",
+                        json={"lines": [{"base_name": "Новинка A01", "qty": qty}]})
+        outcome = c.get(f"/api/order-plan/{new_plan}/outcome").json()
+        reconciliation = c.get(f"/api/orders/{new_order}/receipts").json()
+        check(f"A01 факт {expected} по повторённому имени учитывается один раз",
+              receipt.status_code == 200 and outcome["totals"]["executed"] == expected
+              and reconciliation["received_total"] == expected
+              and len(outcome["lines"]) == 1, str(outcome["totals"]))
+    check("A01 чтение outcome не переписывает исторические входы и результат",
+          sql("SELECT brief_json,result_json FROM order_plans WHERE id=?", new_plan)[0] == original_new)
+
+    c.post("/api/productions/assign", json={"base_name": victim, "production_id": new_prod})
+    mixed_saved = c.post("/api/order-plan", json={"budget": 1000000, "production_id": new_prod,
+        "budget_scope": "now", "new_items": [{"name": victim, "qty": 5, "cost": 100}],
+        "overrides": {victim: 10}}).json()
+    mixed_plan = mixed_saved["id"]
+    mixed_result = json.loads(sql("SELECT result_json FROM order_plans WHERE id=?", mixed_plan)[0][0])
+    catalogue = next(i for i in mixed_result["items"] if i["base_name"] == victim)
+    mixed_order = c.post(f"/api/order-plan/{mixed_plan}/apply", json={"force": True}).json()["order_id"]
+    c.post(f"/api/orders/{mixed_order}/status", json={"status": "sent"})
+    c.post(f"/api/orders/{mixed_order}/receipts", json={"lines": [{"base_name": victim, "qty": 15}]})
+    mixed_outcome = c.get(f"/api/order-plan/{mixed_plan}/outcome").json()
+    mixed_lines = [line for line in mixed_outcome["lines"] if line["base_name"] == victim]
+    check("A01 смешанное имя сохраняет рекомендацию и отдельно ручное добавление",
+          len(mixed_lines) == 1 and mixed_lines[0]["recommended"] == catalogue["qty_recommended"]
+          and mixed_lines[0]["decided"] == 15 and mixed_lines[0]["executed"] == 15
+          and mixed_lines[0].get("new_item_qty") == 5, str(mixed_lines))
+
     print("\n== Удаление организации не оставляет приёмок ==")
     before = sql("SELECT COUNT(*) FROM order_receipts")[0][0]
     check("приёмки в базе есть", before > 0, str(before))
