@@ -201,3 +201,15 @@ ID. Verify using a temporary rejection trigger only in the synthetic test DB.
 No concurrency experiment, schema migration, formulas or production writes.
 RESULT: planner RED354/1, GREEN355/0; mock writeback140/0. The order and
 both links now commit together. No claim about simultaneous apply requests.
+
+## Completed local CLAIM A02 structured stop codes
+
+BRANCH: codex/audit-plan-stop-codes. BASE: 95cd980.
+FILES: app/api.py (apply refusal response), tests/test_planner.py,
+docs/audit_queue.md, docs/audit_a02_evidence.md.
+DONE_WHEN: blocked apply exposes the saved stop codes/text as structured
+fields while preserving existing status422 and string detail consumed by
+clients. Legacy missing gate metadata has a distinct recalculate code.
+Tests verify codes plus no writes; no recalculation or monetary semantics.
+RESULT: RED355/6, GREEN361/0. Existing string detail and422 are preserved;
+code/stop fields expose saved reasons without parsing translated text.

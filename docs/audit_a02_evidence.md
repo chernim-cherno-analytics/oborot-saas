@@ -103,3 +103,18 @@ on a reset connection, and is not the completed RED result.
 No concurrent requests were tested; this package does not claim to solve
 concurrent double application. No production writes, full strict CI,
 independent approval or publication. Rollback restores the two-commit risk.
+# Follow-up: structured refusal codes
+
+At base95cd980, apply refusal had only a translated string detail. The audit's
+structured reason criterion is now implemented additively: status422 and
+string detail remain; code=plan_forbidden and stop expose the saved reasons.
+Missing/malformed gate metadata returns code=plan_recalculation_required and
+an empty stop list, without inventing a historic decision. Saved restrictions
+are not recomputed. Existing assistant API handling reads detail unchanged.
+
+Planner RED355 OK/6 FAIL: /private/tmp/plan-stop-codes-red.log.
+GREEN361 OK/0 FAIL: /private/tmp/plan-stop-codes-green.log. Covers past date,
+budget, empty plan, new-item budget with/without edits, and legacy metadata;
+asserts saved reasons/text and preserves existing no-write checks. Already
+applied409 and successful apply paths retain their existing regression checks.
+No formula/schema change, full strict run, publication or independent review.

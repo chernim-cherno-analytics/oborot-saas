@@ -898,6 +898,11 @@ def api_checks() -> None:
                             json={"force": True, "confirm_partial": True})
             check(f"A02 {reason}: подтверждения не обходят запрет",
                   denied.status_code == 422, f"status={denied.status_code}")
+            check(f"A02 {reason}: отказ сохраняет структурированные причины и текст",
+                  denied.json().get("code") == "plan_forbidden"
+                  and denied.json().get("stop") == stored_gate["stop"]
+                  and isinstance(denied.json().get("detail"), str)
+                  and all(s["text"] in denied.json()["detail"] for s in stored_gate["stop"]))
             state = _sql("SELECT status, production_order_id FROM order_plans WHERE id=?",
                          gated["id"])[0]
             check(f"A02 {reason}: отказ не создаёт заказ и не меняет план",
@@ -921,6 +926,10 @@ def api_checks() -> None:
                         json={"force": True, "confirm_partial": True})
         check("A02 legacy: нужен явный новый расчёт",
               legacy.status_code == 422 and "Пересчитайте" in legacy.text)
+        check("A02 legacy: отсутствие решения имеет отдельный код",
+              legacy.json().get("code") == "plan_recalculation_required"
+              and legacy.json().get("stop") == []
+              and isinstance(legacy.json().get("detail"), str))
         check("A02 legacy: отказ не меняет решение и не создаёт заказ",
               _sql("SELECT COUNT(*) FROM production_orders")[0][0] == before_legacy
               and _sql("SELECT status, production_order_id, result_json FROM order_plans WHERE id=?",

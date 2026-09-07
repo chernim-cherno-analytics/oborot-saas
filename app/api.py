@@ -4,6 +4,7 @@ import json
 from datetime import date, datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Path
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session
@@ -3084,13 +3085,19 @@ def api_order_plan_apply(
     if (not isinstance(result, dict)
             or not isinstance(result.get("can_create"), bool)
             or not isinstance(result.get("stop"), list)):
-        raise HTTPException(422, "Пересчитайте план в мастере заказа: "
-                            "в сохранённом плане нет результата проверки создания заказа")
+        return JSONResponse(status_code=422, content={
+            "detail": "Пересчитайте план в мастере заказа: "
+                      "в сохранённом плане нет результата проверки создания заказа",
+            "code": "plan_recalculation_required", "stop": [],
+        })
     if not result["can_create"] or result["stop"]:
         reasons = [str(s.get("text")) for s in result["stop"]
                    if isinstance(s, dict) and s.get("text")]
-        raise HTTPException(422, "Создать заказ нельзя: " +
-                            ("; ".join(reasons) or "план не прошёл проверку"))
+        return JSONResponse(status_code=422, content={
+            "detail": "Создать заказ нельзя: " +
+                      ("; ".join(reasons) or "план не прошёл проверку"),
+            "code": "plan_forbidden", "stop": result["stop"],
+        })
     items = [
         {"base_name": i["base_name"], "qty": int(i["qty"]),
          "sizes": i.get("sizes") or {}, "cost": float(i.get("cost_price") or 0)}
