@@ -3949,6 +3949,11 @@ def supply_fix_3_ui(pw, base, c) -> None:
         ("F-18", lambda: _fix3_format_ui(page, base, c)),
         ("F-20", lambda: _fix3_texts_ui(page, base, c)),
         ("F-21", lambda: _fix3_forms(page, base)),
+        # Корректив 1 по REVIEW_REJECT: восстановленная форма обязана
+        # описывать своё состояние, а «Сохранить» — работать.
+        ("P1 срок", lambda: _fix3_restore_case(page, base, c, "desktop")),
+        ("P1 единица", lambda: _fix3_restore_unit(page, base, c, "desktop")),
+        ("P1 сосед", lambda: _fix3_restore_plain(page, base, c, "desktop")),
     )
     for label, run_step in steps:
         try:
@@ -4259,6 +4264,268 @@ def _fix3_forms(page, base) -> None:
               "НЕ ТЕРЯЙ МЕНЯ" in (after.get("vals") or []), str(after)[:200])
 
 
+# ── Корректив 1: восстановленная форма описывает СВОЁ состояние (P1 ревью) ────
+
+def _fix3_restore_case(page, base, c, tag: str) -> None:
+    """P1 ревью PR #54: после перерисовки форма врала и «Сохранить» отвечало 400.
+
+    ЧТО ИМЕННО ВОСПРОИЗВОДИТСЯ, шаг в шаг. У партии стоит точная дата. Человек
+    открывает «Изменить», переключает срок на «ориентировочно» и пишет текст —
+    и, не сохранив, сохраняет что-то в ДРУГОЙ форме. Это вызывает `render()`.
+    До исправления восстановленный список говорил «ориентировочно», введённый
+    текст лежал СКРЫТЫМ, а прежняя точная дата оставалась ВИДИМОЙ — и уходила в
+    запрос, потому что тело собирается по видимости. «Сохранить» отвечало 400.
+
+    Проверяется не разметка, а три разных факта сразу: что видно
+    (`getComputedStyle`), что уйдёт на сервер (ответ ручки) и что там осталось
+    (отдельный GET). Совпасть все три могут только если форма честна.
+    """
+    print(f"\n== Корректив: срок переживает перерисовку и сохраняется ({tag}) ==")
+    item = c.post(P3 + "/items", json={"kind": "draft", "title": f"Вещь {tag}",
+                                       "op_id": f"cr-i-{tag}"}).json()
+    iid = [i for i in item["items"] if i["title"] == f"Вещь {tag}"][0]["id"]
+    board = c.post(P3 + "/batches",
+                   json={"item_id": iid, "title": f"Партия {tag}", "plan_qty": "20",
+                         "due_kind": "exact", "due_date": "2026-10-31",
+                         "op_id": f"cr-b-{tag}"}).json()
+    bid = [b for b in board["batches"] if b["title"] == f"Партия {tag}"][0]["id"]
+
+    page.goto(f"{base}/supply")
+    page.wait_for_timeout(1200)
+    close_hint(page)
+
+    opened = page.evaluate("""(id) => {
+      const card = document.querySelector('[data-pl="batch"][data-id="' + id + '"]');
+      if (!card) return 'карточки нет';
+      const btn = card.querySelector('button[data-inline="edit"]');
+      if (!btn) return 'кнопки правки нет';
+      btn.click();
+      return card.querySelector('form.pl-form.inline') ? '' : 'форма не открылась';
+    }""", str(bid))
+    check(f"{tag}: форма правки партии открылась", opened == "", str(opened))
+    if opened:
+        return
+    page.wait_for_timeout(250)
+
+    # Выбор делается ровно так, как его делает человек: значение и событие.
+    page.evaluate("""(id) => {
+      const box = document.querySelector('[data-pl="batch"][data-id="' + id
+                                         + '"] form.pl-form.inline');
+      const sel = box.querySelector('select');
+      sel.value = 'approx';
+      sel.dispatchEvent(new Event('change'));
+      box.querySelector('input[id$="due-text"]').value = 'Конец ноября';
+    }""", str(bid))
+
+    # Перерисовку вызывает сохранение в ДРУГОЙ форме — это и есть условие P1.
+    page.click("#pl-add-material")
+    page.wait_for_timeout(250)
+    page.fill("#pl-mat-title", f"Повод {tag}")
+    page.fill("#pl-mat-qty", "3")
+    page.click("#pl-mat-form button[type=submit]")
+    page.wait_for_timeout(1500)
+
+    state = page.evaluate("""(id) => {
+      const box = document.querySelector('[data-pl="batch"][data-id="' + id
+                                         + '"] form.pl-form.inline');
+      if (!box) return null;
+      const vis = n => !!n && getComputedStyle(n.closest('.pl-field')).display !== 'none';
+      const t = box.querySelector('input[id$="due-text"]');
+      const d = box.querySelector('input[id$="due-date"]');
+      return {kind: box.querySelector('select').value,
+              text: t ? t.value : null, textVisible: vis(t),
+              date: d ? d.value : null, dateVisible: vis(d),
+              shown: box.innerText};
+    }""", str(bid))
+    check(f"{tag}: форма пережила перерисовку", state is not None,
+          "" if state else "формы нет")
+    if not state:
+        return
+    check(f"{tag}: вид срока остался тем, который выбрал человек",
+          state["kind"] == "approx", str(state["kind"]))
+    check(f"{tag}: введённый текст на месте", state["text"] == "Конец ноября",
+          repr(state["text"]))
+    check(f"{tag}: и он ВИДЕН, а не лежит скрытым",
+          state["textVisible"] is True, str(state))
+    check(f"{tag}: поле даты для этого вида срока скрыто",
+          state["dateVisible"] is False, str(state))
+
+    # Нажимаем «Сохранить» той же формы и смотрим на ТРИ вещи: ошибку у формы,
+    # ответ сервера и состояние строки после него.
+    page.evaluate("""(id) => {
+      const box = document.querySelector('[data-pl="batch"][data-id="' + id
+                                         + '"] form.pl-form.inline');
+      box.querySelector('button[type=submit]').click();
+    }""", str(bid))
+    page.wait_for_timeout(1500)
+    err = page.evaluate("""(id) => {
+      const card = document.querySelector('[data-pl="batch"][data-id="' + id + '"]');
+      const box = card && card.querySelector('form.pl-form.inline');
+      const e = box && box.querySelector('.pl-form-err');
+      return e ? e.textContent.trim() : '';
+    }""", str(bid))
+    check(f"{tag}: «Сохранить» не отвечает отказом", err == "", err[:160])
+
+    row = [b for b in c.get(P3).json()["batches"] if b["id"] == bid]
+    check(f"{tag}: строка партии на месте", bool(row), "" if row else "строки нет")
+    if row:
+        check(f"{tag}: на сервере лежит выбранный вид срока",
+              row[0]["due_kind"] == "approx", str(row[0]["due_kind"]))
+        check(f"{tag}: и написанный человеком текст",
+              row[0]["due_text"] == "Конец ноября", repr(row[0]["due_text"]))
+        check(f"{tag}: а прежняя точная дата снята, а не уехала в запрос",
+              row[0]["due_date"] == "", repr(row[0]["due_date"]))
+
+
+def _fix3_restore_unit(page, base, c, tag: str) -> None:
+    """Тот же корень у выбора единицы: «другое» и своя строка (корректив 1).
+
+    Здесь сохранение проходило и ДО исправления — и именно поэтому случай
+    отдельный: на сервер уходило значение, которого человек на экране не видел.
+    Это ровно то, что пакет 1 запретил (D-55 п. 1), и одной проверкой «ответ
+    200» такое не ловится.
+    """
+    print(f"\n== Корректив: своя единица переживает перерисовку ({tag}) ==")
+    board = c.post(P3 + "/materials",
+                   json={"title": f"Материал {tag}", "qty": "50", "unit": "м",
+                         "op_id": f"cr-m-{tag}"}).json()
+    mid = [m for m in board["materials"] if m["title"] == f"Материал {tag}"][0]["id"]
+
+    page.goto(f"{base}/supply")
+    page.wait_for_timeout(1200)
+    close_hint(page)
+    opened = page.evaluate("""(id) => {
+      const card = document.querySelector('[data-pl="material"][data-id="' + id + '"]');
+      if (!card) return 'карточки нет';
+      const btn = card.querySelector('button[data-inline="edit"]');
+      if (!btn) return 'кнопки правки нет';
+      btn.click();
+      return card.querySelector('form.pl-form.inline') ? '' : 'форма не открылась';
+    }""", str(mid))
+    check(f"{tag}: форма правки материала открылась", opened == "", str(opened))
+    if opened:
+        return
+    page.wait_for_timeout(250)
+    page.evaluate("""(id) => {
+      const box = document.querySelector('[data-pl="material"][data-id="' + id
+                                         + '"] form.pl-form.inline');
+      const sel = box.querySelector('select');
+      sel.value = 'другое';
+      sel.dispatchEvent(new Event('change'));
+      box.querySelector('input[id$="-other"]').value = 'бобина';
+    }""", str(mid))
+    page.click("#pl-add-material")
+    page.wait_for_timeout(250)
+    page.fill("#pl-mat-title", f"Второй повод {tag}")
+    page.fill("#pl-mat-qty", "4")
+    page.click("#pl-mat-form button[type=submit]")
+    page.wait_for_timeout(1500)
+
+    state = page.evaluate("""(id) => {
+      const box = document.querySelector('[data-pl="material"][data-id="' + id
+                                         + '"] form.pl-form.inline');
+      if (!box) return null;
+      const o = box.querySelector('input[id$="-other"]');
+      return {unit: box.querySelector('select').value,
+              other: o ? o.value : null,
+              otherVisible: !!o && getComputedStyle(o.closest('.pl-field')).display !== 'none'};
+    }""", str(mid))
+    check(f"{tag}: форма единицы пережила перерисовку", state is not None,
+          "" if state else "формы нет")
+    if not state:
+        return
+    check(f"{tag}: выбран по-прежнему «другое»", state["unit"] == "другое",
+          str(state["unit"]))
+    check(f"{tag}: своя единица на месте", state["other"] == "бобина",
+          repr(state["other"]))
+    check(f"{tag}: и поле своей единицы ВИДНО, а не отправляется втайне",
+          state["otherVisible"] is True, str(state))
+
+    page.evaluate("""(id) => {
+      const box = document.querySelector('[data-pl="material"][data-id="' + id
+                                         + '"] form.pl-form.inline');
+      box.querySelector('button[type=submit]').click();
+    }""", str(mid))
+    page.wait_for_timeout(1500)
+    row = [m for m in c.get(P3).json()["materials"] if m["id"] == mid]
+    check(f"{tag}: единица сохранена той, что видна на экране",
+          bool(row) and row[0]["unit"] == "бобина",
+          row[0]["unit"] if row else "строки нет")
+
+
+def _fix3_restore_plain(page, base, c, tag: str) -> None:
+    """Сторож соседей: форма БЕЗ зависимой видимости от правки не изменилась.
+
+    Перекраска после восстановления шлёт `change` списку, а списки есть и у
+    переноса. Здесь у формы зависимых полей нет вовсе, и правильное поведение —
+    «ничего не изменилось»: выбранная партия-приёмник остаётся выбранной, поле
+    количества целым, форма живой.
+    """
+    print(f"\n== Корректив: форма переноса от перекраски не пострадала ({tag}) ==")
+    board = c.get(P3).json()
+    mats = [m for m in board["materials"] if m["title"] == f"Материал {tag}"]
+    batches = [b for b in board["batches"] if b["title"] == f"Партия {tag}"]
+    if not mats or not batches:
+        check(f"{tag}: фикстуры переноса на месте", False, "нет материала или партии")
+        return
+    mid, bid = mats[0]["id"], batches[0]["id"]
+    other = c.post(P3 + "/batches",
+                   json={"item_id": batches[0]["item_id"], "title": f"Приёмник {tag}",
+                         "op_id": f"cr-b2-{tag}"}).json()
+    oid = [b for b in other["batches"] if b["title"] == f"Приёмник {tag}"][0]["id"]
+    c.post(P3 + "/assignments", json={"material_id": mid, "batch_id": bid,
+                                      "qty": "10", "op_id": f"cr-a-{tag}"})
+
+    page.goto(f"{base}/supply")
+    page.wait_for_timeout(1200)
+    close_hint(page)
+    opened = page.evaluate("""(id) => {
+      const card = document.querySelector('[data-pl="batch"][data-id="' + id + '"]');
+      if (!card) return 'карточки нет';
+      const btn = [...card.querySelectorAll('button[data-inline]')]
+        .find(b => (b.dataset.inline || '').indexOf('move-') === 0);
+      if (!btn) return 'кнопки переноса нет';
+      btn.click();
+      return card.querySelector('form.pl-form.inline') ? '' : 'форма не открылась';
+    }""", str(bid))
+    check(f"{tag}: форма переноса открылась", opened == "", str(opened))
+    if opened:
+        return
+    page.wait_for_timeout(250)
+    page.evaluate("""(args) => {
+      const box = document.querySelector('[data-pl="batch"][data-id="' + args[0]
+                                         + '"] form.pl-form.inline');
+      const sel = box.querySelector('select');
+      sel.value = String(args[1]);
+      sel.dispatchEvent(new Event('change'));
+      box.querySelector('input').value = '4';
+    }""", [str(bid), oid])
+    page.click("#pl-add-material")
+    page.wait_for_timeout(250)
+    page.fill("#pl-mat-title", f"Третий повод {tag}")
+    page.fill("#pl-mat-qty", "5")
+    page.click("#pl-mat-form button[type=submit]")
+    page.wait_for_timeout(1500)
+    state = page.evaluate("""(id) => {
+      const box = document.querySelector('[data-pl="batch"][data-id="' + id
+                                         + '"] form.pl-form.inline');
+      if (!box) return null;
+      const inputs = [...box.querySelectorAll('input')];
+      return {target: box.querySelector('select').value,
+              qty: inputs.length ? inputs[0].value : null,
+              fields: [...box.querySelectorAll('.pl-field')]
+                .filter(f => getComputedStyle(f).display === 'none').length};
+    }""", str(bid))
+    check(f"{tag}: форма переноса пережила перерисовку", state is not None,
+          "" if state else "формы нет")
+    if state:
+        check(f"{tag}: выбранная партия-приёмник осталась выбранной",
+              state["target"] == str(oid), f"{state['target']} против {oid}")
+        check(f"{tag}: количество не потерялось", state["qty"] == "4", str(state))
+        check(f"{tag}: и перекраска ничего в ней не спрятала",
+              state["fields"] == 0, str(state))
+
+
 def _fix3_mobile(browser, base, c) -> None:
     """Те же два свойства на телефоне: список единиц и фокус в окне 390x844."""
     print("\n== F-16/F-21 на телефоне 390x844 ==")
@@ -4289,6 +4556,17 @@ def _fix3_mobile(browser, base, c) -> None:
           facts["tag"] == "SELECT", str(facts))
     check("первое поле в фокусе", facts["focused"] == "pl-mat-title", str(facts))
     check("и видно целиком на узком экране", facts["inView"] is True, str(facts))
+    # Тот же P1 на телефоне: ревью воспроизвело его на ОБОИХ viewport, значит и
+    # доказательство исправления обязано быть на обоих.
+    for label, run_step in (("P1 срок", lambda: _fix3_restore_case(page, base, c, "mobile")),
+                            ("P1 единица", lambda: _fix3_restore_unit(page, base, c, "mobile")),
+                            ("P1 сосед", lambda: _fix3_restore_plain(page, base, c, "mobile"))):
+        try:
+            run_step()
+        except Exception as exc:  # noqa: BLE001 — важен отчёт, а не тип
+            check(f"{label} на телефоне: шаг дошёл до конца без исключения", False,
+                  f"{type(exc).__name__}: {str(exc).strip().splitlines()[0][:160]}")
+
     check("на телефоне не было ошибок в консоли", not errors, str(errors)[:200])
     ctx.close()
 

@@ -1791,8 +1791,17 @@ document.addEventListener("DOMContentLoaded", function () {
   // внутри неё, включая те, что созданы позже.
   function bindTokenReset(form) {
     if (!form) return;
-    form.addEventListener("input", function () { resetToken(form); });
-    form.addEventListener("change", function () { resetToken(form); });
+    // ВОССТАНОВЛЕНИЕ — НЕ ПРАВКА ЧЕЛОВЕКА. Пока идёт возврат значений после
+    // перерисовки, идентичность поступка не трогается: иначе повтор после
+    // потерянного ответа пришёл бы под новым `op_id` и создал вторую запись
+    // (P1, закрытый в SUPPLY-3). Событие перекраски и так не всплывает — это
+    // вторая, явная защита того же правила, а не замена ей.
+    form.addEventListener("input", function () {
+      if (!PL.restoring) resetToken(form);
+    });
+    form.addEventListener("change", function () {
+      if (!PL.restoring) resetToken(form);
+    });
   }
 
   // Склонение рядом с числом. Тот же смысл, что у `_ru_plural` на сервере:
@@ -2729,6 +2738,7 @@ document.addEventListener("DOMContentLoaded", function () {
         var box = card.querySelector(".pl-form.inline");
         if (!box) return;
         var fields = [].slice.call(box.querySelectorAll("input, select, textarea"));
+        var chosen = [];
         item.values.forEach(function (value, i) {
           if (value === null || i >= fields.length) return;
           var node = fields[i];
@@ -2739,16 +2749,50 @@ document.addEventListener("DOMContentLoaded", function () {
             var ok = [].some.call(node.options, function (o) {
               return o.value === value;
             });
-            if (ok) node.value = value;
+            if (ok) {
+              node.value = value;
+              chosen.push(node);
+            }
             return;
           }
           node.value = value;
         });
+        // ФОРМА ОБЯЗАНА УЗНАТЬ О ВОССТАНОВЛЕННОМ ВЫБОРЕ, А НЕ ТОЛЬКО ПОКАЗАТЬ
+        // ЕГО. Это и был воспроизведённый P1 ревью PR #54. Значение списку
+        // присваивалось молча, а зависимые поля живут не здесь: их прячет и
+        // показывает сам строитель формы (`dueFields`, `unitPicker`), и делает
+        // он это по событию `change`. Без события форма после перерисовки
+        // описывала состояние, которое было ДО выбора человека: список говорил
+        // «ориентировочно», введённый текст лежал скрытым, а прежняя точная
+        // дата оставалась на экране — и уходила в запрос, потому что `readDue`
+        // читает именно видимость. «Сохранить» отвечало 400 на основном пути
+        // записи. Теперь список сообщает о себе ровно тем же событием, каким
+        // сообщил бы человек, и строитель перекрашивает свои поля сам.
+        //
+        // СОБЫТИЕ НЕ ВСПЛЫВАЕТ, и это не мелочь. `bindTokenReset` слушает
+        // `change` на самой форме и сбрасывает `op_id`: всплывшее событие
+        // означало бы, что КАЖДАЯ перерисовка меняет идентичность поступка, и
+        // повтор после потерянного ответа снова создавал бы вторую запись —
+        // ровно тот P1, который закрыт в SUPPLY-3. Восстановление правкой
+        // человека не является.
+        //
+        // Перекраска идёт ПОСЛЕ того, как вернулись все значения: строитель
+        // вправе смотреть не только на список, и решать он должен по готовой
+        // форме, а не по половине.
+        chosen.forEach(function (node) {
+          node.dispatchEvent(new Event("change"));
+        });
         if (item.active >= 0 && item.active < fields.length) {
           var node = fields[item.active];
-          try { node.focus({preventScroll: true}); } catch (e) { node.focus(); }
-          if (item.caret !== null && node.setSelectionRange) {
-            try { node.setSelectionRange(item.caret, item.caret); } catch (e) { /* нечисловое поле */ }
+          // Поле, которое перекраска только что спрятала, фокуса не получает:
+          // курсор в невидимом поле — это тот же обман, что и скрытое значение
+          // в запросе.
+          var host = node.closest ? node.closest(".pl-field") : null;
+          if (!host || getComputedStyle(host).display !== "none") {
+            try { node.focus({preventScroll: true}); } catch (e) { node.focus(); }
+            if (item.caret !== null && node.setSelectionRange) {
+              try { node.setSelectionRange(item.caret, item.caret); } catch (e) { /* нечисловое поле */ }
+            }
           }
         }
       });
