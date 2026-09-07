@@ -412,6 +412,106 @@ def run() -> int:  # noqa: C901 — сценарный тест: шагов мн
                   "карточки маржи нет" if over_note is None
                   else f"подпись карточки: {over_note[:120]}")
 
+        print("\n== Мастер: серверный запрет управляет кнопкой создания ==")
+        if row:
+            if page.locator("#hint-overlay").is_visible():
+                page.locator("#hint-overlay .hm-close").click()
+            page.evaluate("""(qty) => {
+                const input = document.querySelector('.qinp');
+                input.value = String(qty);
+                input.dispatchEvent(new Event('input', {bubbles:true}));
+            }""", row["qty"])
+            gate = {"blocked": True, "code": "share_limit"}
+
+            def server_gate(route):
+                response = route.fetch()
+                data = response.json()
+                data["can_create"] = not gate["blocked"]
+                data["stop"] = ([{"code": gate["code"], "text": "Сервер запретил этот план"}]
+                                if gate["blocked"] and gate["code"] else [])
+                route.fulfill(response=response, json=data)
+
+            page.route("**/api/order-plan/preview", server_gate)
+            for code, blocked in (("share_limit", True), ("new_items_over_budget", True),
+                                  ("", True), ("", False)):
+                gate.update(code=code, blocked=blocked)
+                with page.expect_response(lambda r: r.url == f"{base}/api/order-plan/preview"):
+                    page.locator("#recalcPlan").click()
+                page.locator("#mkOrder").wait_for(state="visible")
+                check(f"кнопка соблюдает серверный запрет {code or 'can_create'}={blocked}",
+                      page.locator("#mkOrder").is_disabled() == blocked)
+                if blocked:
+                    check("у запрещённой кнопки есть объяснение",
+                          bool(page.locator("#mkOrder").get_attribute("title")))
+            page.unroute("**/api/order-plan/preview", server_gate)
+
+        print("\n== A01: новинки не выдают неполные итоги за полные ==")
+        if row:
+            check("A01 без новинок обычная подпись сохранена",
+                  "Полное обязательство" in (page.text_content("#cards") or "")
+                  and "не учитывают" not in (page.text_content("#budgetWarn") or ""))
+            page.evaluate("() => window.addNew('A01 UI новинка', 2, 1000)")
+            with page.expect_response(lambda r: r.url == f"{base}/api/order-plan/preview") as new_preview:
+                page.locator("#recalcPlan").click()
+            check("A01 сервер отдельно считает стоимость новинок",
+                  new_preview.value.json()["new_items_cost"] == 2000)
+            page.locator("#mkOrder").wait_for(state="visible")
+            cards_with_new = page.text_content("#cards") or ""
+            check("A01 обязательство с новинками не названо полным",
+                  "Полное обязательство" not in cards_with_new
+                  and "Обязательство по каталожным позициям" in cards_with_new)
+            check("A01 количество ограничено каталожными позициями",
+                  "Каталожных позиций / штук" in cards_with_new)
+            warning_with_new = page.text_content("#budgetWarn") or ""
+            check("A01 полный состав и календарь включают новинки",
+                  "Полный состав заказа, включая новинки" in warning_with_new
+                  and "Новинки включены в календарь" in warning_with_new)
+            shown_payments = page.locator("#payflow .a").all_text_contents()
+            check("A01 браузер показывает полную сумму платежей сервера",
+                  sum(int(''.join(ch for ch in text if ch.isdigit())) for text in shown_payments)
+                  == new_preview.value.json()["order_totals"]["cost"])
+            first_qty = page.locator(".qinp").first
+            previous_qty = first_qty.input_value()
+            first_qty.fill(str(int(previous_qty) + 1))
+            check("A01 ручная правка не оставляет устаревший полный календарь",
+                  "Пересчитайте" in (page.text_content("#payflow") or "")
+                  and page.locator("#completeOrderSummary").count() == 0)
+            first_qty.fill(previous_qty)
+            check("A01 возврат количества восстанавливает полный итог",
+                  page.locator("#completeOrderSummary").count() == 1
+                  and page.locator("#payflow .a").count() == len(shown_payments))
+            history_body = new_preview.value.request.post_data_json
+            missing_cost = new_preview.value.json()["review"]["no_cost"]
+            check("история: в каталоге есть позиция без себестоимости", bool(missing_cost))
+            if missing_cost:
+                history_body["overrides"] = {**history_body.get("overrides", {}),
+                                             missing_cost[0]["base_name"]: 2}
+            history_saved = c.post("/api/order-plan", json=history_body).json()
+            page.reload()
+            history_row = page.locator(f".repeat[data-id='{history_saved['id']}']").locator("xpath=../..")
+            history_row.wait_for(state="attached")
+            check("A01 история показывает полный сохранённый состав",
+                  "без новинок" not in (history_row.text_content() or ""))
+            check("история: неполная себестоимость явно подписана",
+                  "сумма неполная" in (history_row.text_content() or ""))
+
+        print("\n== A01: заказ только из новинок доступен в мастере ==")
+        only_prod = c.post("/api/productions", json={"name": "UI только новинки"}).json()["id"]
+        c.post(f"/api/productions/{only_prod}/setup", json={"preset": "fabric_sewing"})
+        page.goto(f"{base}/assistant")
+        page.locator(f"#prodTiles .tile[data-id='{only_prod}']").click()
+        page.evaluate("() => window.addNew('Только новинки UI', 2, 1000)")
+        with page.expect_response(lambda r: r.url == f"{base}/api/order-plan/preview") as only_preview:
+            page.get_by_text("Сразу показать план", exact=True).click()
+        only_plan = only_preview.value.json()
+        check("A01 реальный сервер разрешает план только из новинок",
+              not only_plan["items"] and bool(only_plan["new_items"]) and only_plan["can_create"])
+        page.wait_for_timeout(500)
+        check("A01 отсутствие рекомендаций не скрывает полный заказ новинок",
+              page.locator("#completeOrderSummary").count() == 1
+              and page.locator("#mkOrder").count() == 1
+              and not page.locator("#mkOrder").is_disabled())
+
         print("\n== «Что заказать»: позиции без себестоимости не бесплатны ==")
         page.goto(f"{base}/replenish")
         page.wait_for_timeout(3500)
@@ -428,6 +528,32 @@ def run() -> int:  # noqa: C901 — сценарный тест: шагов мн
         else:
             check("без таких позиций подпись обычная", "НЕПОЛНАЯ" not in sub, sub[:80])
 
+        print("\n== A05: простая форма передаёт выбранное производство ==")
+        if page.locator("#hint-overlay").is_visible():
+            page.locator("#hint-overlay .hm-close").click()
+        selected_production = int(page.locator(".bigtab.active").get_attribute("data-id"))
+        page.locator("#btn-create-order").click()
+        page.locator("#order-name").fill("A05 browser metadata")
+        with page.expect_response(lambda r: r.url == f"{base}/api/orders"
+                                  and r.request.method == "POST") as created_response:
+            page.locator("#btn-order-submit").click()
+        created_response = created_response.value
+        check("A05 браузер передаёт выбранное производство",
+              created_response.request.post_data_json.get("production_id") == selected_production)
+        check("A05 заказ из браузера создан", created_response.status == 200)
+        if created_response.status == 200:
+            page.locator("#order-modal").wait_for(state="hidden")
+            import sqlite3
+            created_id = created_response.json()["id"]
+            with sqlite3.connect(DB_PATH) as connection:
+                metadata = connection.execute(
+                    "SELECT production_id, created_by FROM production_orders WHERE id=?",
+                    (created_id,)).fetchone()
+                author = connection.execute("SELECT id FROM users WHERE email='ui@test.io'").fetchone()[0]
+            check("A05 выбор и автор из браузера сохранены",
+                  metadata == (selected_production, author), str(metadata))
+            c.delete(f"/api/orders/{created_id}")
+
         print("\n== «Бюджет»: строка состояния называет окно темпа ==")
         page.goto(f"{base}/budget")
         page.wait_for_timeout(3000)
@@ -435,7 +561,10 @@ def run() -> int:  # noqa: C901 — сценарный тест: шагов мн
           const b = document.getElementById('calcBtn') || document.querySelector('.go-btn');
           if (b) b.click();
         }""")
-        page.wait_for_timeout(3000)
+        page.wait_for_function("""() => {
+            const text = document.getElementById('statusHint').textContent.trim();
+            return text && text !== 'считаю…';
+        }""")
         hint_year = page.text_content("#statusHint") or ""
         check("окно темпа названо в строке состояния", "темп" in hint_year, hint_year[:100])
         post_settings(c, {"rate_window": "d90"}, "смена окна темпа на d90")
@@ -445,7 +574,10 @@ def run() -> int:  # noqa: C901 — сценарный тест: шагов мн
           const b = document.getElementById('calcBtn') || document.querySelector('.go-btn');
           if (b) b.click();
         }""")
-        page.wait_for_timeout(3000)
+        page.wait_for_function("""() => {
+            const text = document.getElementById('statusHint').textContent.trim();
+            return text && text !== 'считаю…';
+        }""")
         hint_90 = page.text_content("#statusHint") or ""
         check("после смены окна строка изменилась",
               hint_90 != hint_year, f"{hint_year[:60]} -> {hint_90[:60]}")

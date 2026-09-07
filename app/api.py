@@ -4,6 +4,7 @@ import json
 from datetime import date, datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Path
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session
@@ -153,6 +154,7 @@ class OrderItemIn(BaseModel):
 class OrderIn(BaseModel):
     name: str = Field(default="", max_length=120)
     eta_date: str | None = None
+    production_id: int | None = Field(default=None, ge=1, le=2_147_483_647)
     items: list[OrderItemIn]
     # «да, второй такой же заказ нужен» — осознанное повторение состава
     # в обход защиты от случайного дубля (см. api_create_order).
@@ -170,8 +172,35 @@ class OrderIn(BaseModel):
         return v
 
 
+def _order_totals(items: list[dict]) -> dict:
+    """Те же итоги окончательного состава, что и в карточке заказа."""
+    return {
+        "positions": len(items),
+        "units": sum(int(i.get("qty") or 0) for i in items),
+        "cost": round(sum(float(i.get("cost") or 0) * int(i.get("qty") or 0) for i in items)),
+    }
+
+
+def _plan_order_items(result: dict, brief: dict) -> list[dict]:
+    """Единый состав для предварительного итога и создания заказа."""
+    items = [
+        {"base_name": i["base_name"], "qty": int(i["qty"]),
+         "sizes": i.get("sizes") or {}, "cost": float(i.get("cost_price") or 0)}
+        for i in (result.get("items") or []) if int(i.get("qty") or 0) > 0
+    ]
+    for n in (brief.get("new_items") or []):
+        if int(n.get("qty") or 0) > 0:
+            items.append({"base_name": n["name"], "qty": int(n["qty"]),
+                          "sizes": {}, "cost": float(n.get("cost") or 0)})
+    if "supplier_prices" in result:
+        for item in items:
+            item["supplier_prices"] = result["supplier_prices"].get(item["base_name"], {})
+    return items
+
+
 def _order_out(order: ProductionOrder) -> dict:
     items = order.items
+    totals = _order_totals(items)
     return {
         "id": order.id,
         "name": order.name,
@@ -179,9 +208,9 @@ def _order_out(order: ProductionOrder) -> dict:
         "eta_date": order.eta_date,
         "status": order.status,
         "items": items,
-        "positions": len(items),
-        "total_qty": sum(int(i.get("qty") or 0) for i in items),
-        "total_cost": round(sum(float(i.get("cost") or 0) * int(i.get("qty") or 0) for i in items)),
+        "positions": totals["positions"],
+        "total_qty": totals["units"],
+        "total_cost": totals["cost"],
         "production_id": order.production_id,
         "created_by": order.created_by,
         # D-25: даты переходов и обратная ссылка на расчёт, из которого вырос
@@ -219,8 +248,41 @@ OPEN_STATUSES = ("draft", "sent")
 CASH_WEEKS = 16
 
 
+def _valid_payment_terms(stages) -> bool:
+    return (isinstance(stages, list) and bool(stages) and all(
+        isinstance(st, dict) and isinstance(st.get("name"), str)
+        and type(st.get("lead_days")) is int and 0 <= st["lead_days"] <= 365
+        and all(type(st.get(k)) in (int, float) and 0 <= st[k] <= 1
+                for k in ("cost_share", "prepay_share"))
+        for st in stages) and sum(st["cost_share"] for st in stages) > 0)
+
+
 def _order_stages(db: Session, order: ProductionOrder, settings: dict) -> list[dict]:
-    """Этапы канала заказа (или один этап на общий срок производства)."""
+    """Сохранённые этапы принятого плана; для старых заказов — этапы канала."""
+    from app.models import OrderPlan
+
+    try:
+        own_terms = json.loads(order.payment_terms_json or "[]")
+    except (TypeError, ValueError):
+        own_terms = None
+    if _valid_payment_terms(own_terms):
+        return own_terms
+    saved = db.execute(select(OrderPlan.computed_json).where(
+        OrderPlan.org_id == order.org_id,
+        OrderPlan.id == order.order_plan_id,
+        OrderPlan.production_order_id == order.id,
+        OrderPlan.status == "applied",
+    ).order_by(OrderPlan.id).limit(1)).scalar_one_or_none()
+    try:
+        computed = json.loads(saved or "{}")
+    except (TypeError, ValueError):
+        computed = {}
+    stages = ((computed.get("payment_terms") or computed.get("stages"))
+              if isinstance(computed, dict) else None)
+    # Снимок уже нормализован и показан человеку. Не заменяем его условиями
+    # сегодняшнего справочника и не нормируем доли повторно.
+    if _valid_payment_terms(stages):
+        return stages
     raw = None
     if order.production_id:
         prod = db.get(Production, order.production_id)
@@ -378,7 +440,8 @@ def _order_fingerprint(name: str, eta_date: str | None, items: list[dict]) -> st
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def _find_twin_order(db: Session, org_id: int, fingerprint: str, before_id: int | None = None):
+def _find_twin_order(db: Session, org_id: int, fingerprint: str, before_id: int | None = None,
+                     production_id: int | None = None):
     """Ищет такой же заказ, созданный в окне защиты от повтора.
 
     before_id — искать только среди более ранних заказов: так два запроса,
@@ -395,6 +458,7 @@ def _find_twin_order(db: Session, org_id: int, fingerprint: str, before_id: int 
     since = datetime.utcnow() - timedelta(seconds=ORDER_DEDUP_WINDOW_SEC)
     q = select(ProductionOrder).where(
         ProductionOrder.org_id == org_id,
+        ProductionOrder.production_id == production_id,
         ProductionOrder.created_at >= since,
         ProductionOrder.status != "received",
     )
@@ -419,6 +483,10 @@ def api_create_order(
     items = [i for i in body.items if i.qty > 0]
     if not items:
         raise HTTPException(status_code=422, detail="В заказе нет позиций с количеством > 0")
+    if body.production_id is not None:
+        production = db.get(Production, body.production_id)
+        if production is None or production.org_id != ctx.org.id:
+            raise HTTPException(status_code=404, detail="Производство не найдено")
     # Позиций, которых нет в каталоге организации, в заказе быть не может —
     # иначе создаётся «призрачная» позиция, для которой ниже неоткуда взять
     # свою себестоимость, и сервер был вынужден верить присланной клиентом.
@@ -435,20 +503,26 @@ def api_create_order(
     # Себестоимость всегда берём из БД, присланной клиентом не доверяем ни при
     # каких обстоятельствах (раньше для позиций вне каталога это правило не
     # действовало — теперь такие позиции отсеяны проверкой выше).
+    # Та же база стоимости, что в analytics: полная, иначе закупочная;
+    # размеры агрегируются тем же max, а не порядком строк SELECT.
     cost_by_base = {
-        p.base_name: float(p.cost_price or 0)
-        for p in db.execute(
-            select(Product).where(Product.org_id == ctx.org.id)
-        ).scalars()
+        base: float(full or 0) or float(purchase or 0)
+        for base, full, purchase in db.execute(
+            select(Product.base_name, func.max(Product.cost_full), func.max(Product.cost_price))
+            .where(Product.org_id == ctx.org.id, Product.excluded.is_(False))
+            .group_by(Product.base_name)
+        ).all()
     }
+    supplier_prices = ms_writeback.supplier_prices_snapshot(db, ctx.org.id)
     payload = []
     for i in items:
         d = i.model_dump()
         d["cost"] = cost_by_base.get(i.base_name, 0.0)
+        d["supplier_prices"] = supplier_prices.get(i.base_name, {})
         payload.append(d)
     fingerprint = _order_fingerprint(name, body.eta_date, payload)
     if not body.allow_duplicate:
-        twin = _find_twin_order(db, ctx.org.id, fingerprint)
+        twin = _find_twin_order(db, ctx.org.id, fingerprint, production_id=body.production_id)
         if twin is not None:
             # Партия та же самая — значит и CC_BATCH_ID тот же (D-50). Новый
             # идентификатор здесь означал бы «вторая партия», а весь смысл
@@ -460,9 +534,13 @@ def api_create_order(
         org_id=ctx.org.id,
         name=name,
         eta_date=body.eta_date,
+        production_id=body.production_id,
+        created_by=ctx.user.id,
         status="draft",
         items_json=json.dumps(payload, ensure_ascii=False),
     )
+    order.payment_terms_json = json.dumps(
+        _order_stages(db, order, analytics.extra_settings(ctx.org)), ensure_ascii=False)
     db.add(order)
     # ВАЖНО (фикс P0): черновик НЕ попадает в «едет к нам» — рекомендации
     # «Что заказать» уменьшаются только после перевода заказа «В производство».
@@ -470,7 +548,8 @@ def api_create_order(
     if not body.allow_duplicate:
         # Два одновременных запроса могли не увидеть друг друга до вставки:
         # тот, у кого id больше, убирает свой заказ и отдаёт чужой.
-        twin = _find_twin_order(db, ctx.org.id, fingerprint, before_id=order.id)
+        twin = _find_twin_order(db, ctx.org.id, fingerprint, before_id=order.id,
+                                production_id=body.production_id)
         if twin is not None:
             db.delete(order)
             db.commit()
@@ -497,10 +576,15 @@ def _items_and_pushed(items_json) -> tuple[list[dict], dict[str, float] | None]:
 
 def _apply_order_to_incoming(db: Session, org_id: int, items: list[dict], sign: int) -> None:
     """Прибавляет (sign=+1) или вычитает (sign=-1) позиции заказа из «едет к нам»."""
+    totals: dict[str, int] = {}
     for item in items:
         base, qty = item.get("base_name"), int(item.get("qty") or 0)
         if not base or qty <= 0:
             continue
+        totals[base] = totals.get(base, 0) + qty
+    # Autoflush выключен: повторный db.get не увидит ещё не вставленную
+    # строку. Одно имя записываем один раз, как и в сверке приёмок.
+    for base, qty in totals.items():
         row = db.get(OrderedQty, (org_id, base))
         if row is None:
             db.add(OrderedQty(org_id=org_id, base_name=base, qty=max(0, sign * qty)))
@@ -731,17 +815,27 @@ def _ordered_by_base(order: ProductionOrder) -> dict[str, float]:
     return out
 
 
+def _execution_evidence(order: ProductionOrder, rows: list[OrderReceipt]) -> dict:
+    """Общий признак полноты фактов для сверки приёмок и истории решения."""
+    received = _received_by_base(rows)
+    ordered = _ordered_by_base(order)
+    conflicts = _source_conflicts(rows)
+    unknown = bool(set(ordered) - set(received)) or bool(conflicts)
+    return {"received": received, "ordered": ordered, "conflicts": conflicts,
+            "unknown": unknown, "confirmed": bool(rows) and not unknown}
+
+
 def _receipts_out(db: Session, order: ProductionOrder) -> dict:
     rows = _receipt_rows(db, order.org_id, order.id)
-    by_base = _received_by_base(rows)
-    ordered = _ordered_by_base(order)
+    evidence = _execution_evidence(order, rows)
+    by_base, ordered = evidence["received"], evidence["ordered"]
     # Позиции, по которым числа НЕТ: либо факта не записано вовсе, либо
     # источники спорят. По решению владельца 23.08.2026 такие числа отдаются
     # как null, а не как ноль и не как победитель приоритета. Ноль — это
     # утверждение «не приехало»; null — честное «не знаем». Разница видна не
     # в формулировке, а в статистике качества рекомендаций, которая считается
     # по этим же полям.
-    disputed = {c["base_name"] for c in _source_conflicts(rows)}
+    disputed = {c["base_name"] for c in evidence["conflicts"]}
     lines = []
     for base, qty in ordered.items():
         known = base in by_base and base not in disputed
@@ -763,7 +857,6 @@ def _receipts_out(db: Session, order: ProductionOrder) -> dict:
                           "diff": round(got, 3) if known else None})
     # «Неизвестно» — это любая заказанная позиция без записанного факта
     # приёмки, независимо от того, ушёл заказ в МойСклад или нет.
-    unknown = bool(set(ordered) - set(by_base))
     # ...а также любая позиция, где источники говорят РАЗНОЕ. Раньше расхождение
     # только показывалось отдельным списком, но итог всё равно объявлялся
     # подтверждённым: приоритет молча выбирал победителя, и «80 против 10»
@@ -776,8 +869,8 @@ def _receipts_out(db: Session, order: ProductionOrder) -> dict:
     # съезжаются под одно имя и выглядят как два свидетельства об одном
     # приходе. Считать их спором и сказать «неизвестно» — правильнее, чем
     # уверенно назвать число, которое получилось из склейки.
-    conflicts = _source_conflicts(rows)
-    unknown = unknown or bool(conflicts)
+    conflicts = evidence["conflicts"]
+    unknown = evidence["unknown"]
     return {
         "order_id": order.id,
         "status": order.status,
@@ -787,7 +880,7 @@ def _receipts_out(db: Session, order: ProductionOrder) -> dict:
         # именно так она и читается на экране. Сырые данные при этом никуда не
         # деваются — они ниже, в by_source и source_conflicts.
         "received_total": None if unknown else round(sum(by_base.values()), 3),
-        "confirmed": bool(rows) and not unknown,
+        "confirmed": evidence["confirmed"],
         # Есть заказанные позиции без записанного факта приёмки: по ним
         # принятое НЕИЗВЕСТНО. Ноль в received_total по такой позиции
         # означает «не знаем», а не «не приехало».
@@ -2310,6 +2403,25 @@ def _plan(db: Session, ctx: AuthContext, body: OrderPlanIn) -> dict:
     plan["overrides_rejected"] = []
     if body.overrides:
         _apply_overrides(plan, body.overrides, snap)
+    missing_new = [item for item in plan.get("new_items") or []
+                   if float(item.get("cost") or 0) <= 0 and int(item.get("qty") or 0) > 0]
+    if missing_new:
+        incomplete = plan["budget_incomplete"] or {"positions": 0, "units": 0, "names": []}
+        plan["budget_incomplete"] = {
+            "positions": incomplete["positions"] + len(missing_new),
+            "units": incomplete["units"] + sum(int(item["qty"]) for item in missing_new),
+            "names": (incomplete["names"] + [item["name"] for item in missing_new])[:10],
+            "new_item_positions": len(missing_new),
+        }
+    supplier_prices = ms_writeback.supplier_prices_snapshot(db, ctx.org.id)
+    selected_bases = {i["base_name"] for i in plan.get("items") or []}
+    selected_bases.update(i["name"] for i in plan["brief"].get("new_items") or [])
+    plan["supplier_prices"] = {base: supplier_prices.get(base, {}) for base in selected_bases}
+    plan["order_totals"] = _order_totals(_plan_order_items(plan, plan["brief"]))
+    plan["order_payments"] = order_planner.payment_plan(
+        date.fromisoformat(plan["order_date"]), plan["payment_terms"],
+        plan["order_totals"]["cost"],
+    )
     plan["record"] = _decision_record(db, ctx, snap)
     return plan
 
@@ -2436,7 +2548,7 @@ def _manual_item(base: str, qty: int, snap: dict, plan: dict) -> dict | None:
     cost = float(src.get("cost_price") or 0)
     price = float(src.get("avg_price") or src.get("sale_price") or 0)
     margin = max(0.0, price - cost) if cost > 0 else 0.0
-    stages = plan.get("stages") or []
+    stages = plan.get("payment_terms") or plan.get("stages") or []
     pay_share = stages[0].get("cost_share", 1.0) * stages[0].get("prepay_share", 1.0) \
         if stages else 1.0
     return {
@@ -2588,7 +2700,7 @@ def _apply_overrides(plan: dict, overrides: dict, snap: dict) -> None:
     } if no_cost_rows else None)
     # Календарь платежей пересобираем от новой себестоимости, «сейчас» —
     # снова первый транш календаря, а не отдельная формула.
-    stages = plan.get("stages") or []
+    stages = plan.get("payment_terms") or plan.get("stages") or []
     plan["payments"] = op.payment_plan(
         date.fromisoformat(plan["order_date"]),
         [{"name": st["name"], "lead_days": st["lead_days"],
@@ -2633,10 +2745,15 @@ def _apply_overrides(plan: dict, overrides: dict, snap: dict) -> None:
     if plan["rest"] < 0:
         stop.append({"code": "over_budget", "text":
                      f"Заказ выходит за бюджет на {op.fmt_rub(-plan['rest'])}"})
+    if plan["new_items_over_budget"] > 0:
+        stop.append({"code": "new_items_over_budget", "text":
+                     f"Новинки выходят за бюджет на {op.fmt_rub(plan['new_items_over_budget'])}. "
+                     "Уменьшите количество новинок или увеличьте бюджет."})
     if plan["order_date"] < plan["today"]:
         stop.append({"code": "past_date", "text":
                      f"Заказ пришлось бы разместить {plan['order_date']} — эта дата уже прошла."})
     plan["stop"] = stop
+    stop.extend(op.share_limit_stops(plan["items"]))
     plan["can_create"] = not stop
     plan["manual_edit"] = True
 
@@ -2702,6 +2819,7 @@ def api_order_plan_save(
                 "order_date": plan["order_date"],
                 "covered_until": plan["covered_until"],
                 "stages": plan["stages"],
+                "payment_terms": plan.get("payment_terms"),
                 "lead_days": plan["lead_days"],
                 # На какой истории посчитан план (деплой П1): apply спросит
                 # осознанное подтверждение, если истории было мало.
@@ -2714,6 +2832,11 @@ def api_order_plan_save(
         ),
         result_json=json.dumps(
             {"items": plan["items"], "totals": plan["totals"],
+             "supplier_prices": plan["supplier_prices"],
+             "order_totals": plan["order_totals"], "order_payments": plan["order_payments"],
+             # Сохраняем итоговый запрет после ручных правок вместе с решением:
+             # сохранение для истории само по себе не разрешает создать заказ.
+             "stop": plan["stop"], "can_create": plan["can_create"],
              "spent": plan["spent"], "lost": plan.get("lost"),
              "manual_edit": bool(plan.get("manual_edit")),
              # Позиции, которые человек обнулил вручную, вместе с тем, что
@@ -2762,19 +2885,23 @@ def api_order_plan_last(
     return {"brief": row.brief, "id": row.id, "created_at": row.created_at.isoformat()}
 
 
-def _plan_row_out(row, names: dict, prods: dict) -> dict:
+def _plan_row_out(row, names: dict, prods: dict, linked_orders: dict) -> dict:
     """Строка истории планов: что решили, на сколько и чем кончилось."""
     brief = row.brief
     try:
         result = json.loads(row.result_json or "{}")
     except ValueError:
         result = {}
-    totals = result.get("totals") or {}
+    complete_totals = result.get("order_totals")
+    totals = complete_totals if isinstance(complete_totals, dict) else (result.get("totals") or {})
+    order_id = (row.production_order_id
+                if linked_orders.get(row.id) == row.production_order_id else None)
     return {
         "id": row.id,
         "created_at": row.created_at.isoformat() if row.created_at else None,
         "status": row.status,
-        "order_id": row.production_order_id,
+        "order_id": order_id,
+        "order_missing": bool(row.production_order_id and order_id is None),
         "author": names.get(row.created_by or 0, ""),
         "production_id": brief.get("production_id"),
         "production_name": prods.get(brief.get("production_id") or 0, ""),
@@ -2783,6 +2910,8 @@ def _plan_row_out(row, names: dict, prods: dict) -> dict:
         "positions": int(totals.get("positions") or 0),
         "units": int(totals.get("units") or 0),
         "cost": int(totals.get("cost") or 0),
+        "totals_exclude_new_items": bool(brief.get("new_items")) and not isinstance(complete_totals, dict),
+        "cost_incomplete": bool(result.get("budget_incomplete")),
     }
 
 
@@ -2817,7 +2946,11 @@ def api_order_plan_history(
             select(Production).where(Production.org_id == ctx.org.id)
         ).scalars()
     }
-    return {"plans": [_plan_row_out(r, names, prods) for r in rows]}
+    linked_orders = dict(db.execute(select(ProductionOrder.order_plan_id, ProductionOrder.id).where(
+        ProductionOrder.org_id == ctx.org.id,
+        ProductionOrder.order_plan_id.in_([r.id for r in rows]),
+    )).all()) if rows else {}
+    return {"plans": [_plan_row_out(r, names, prods, linked_orders) for r in rows]}
 
 
 @router.get("/order-plan/{plan_id}/outcome")
@@ -2851,36 +2984,29 @@ def api_order_plan_outcome(
     order = None
     if row.production_order_id:
         candidate = db.get(ProductionOrder, row.production_order_id)
-        if candidate is not None and candidate.org_id == ctx.org.id:
+        if (candidate is not None and candidate.org_id == ctx.org.id
+                and candidate.order_plan_id == row.id):
             order = candidate
     received: dict[str, float] = {}
-    order_received = False
     execution_unknown = False
+    confirmed = False
     disputed: set[str] = set()
     if order is not None:
         rows = _receipt_rows(db, ctx.org.id, order.id)
-        received = _received_by_base(rows)
-        # Заказ, ушедший в МойСклад, исполняется машинным источником: отметка
-        # «принят» по нему допущения не пишет (иначе двойной счёт). Если при
-        # этом МойСклад ничего не прислал — а на боевых данных «отгружено»
-        # заполнено у нуля позиций из 69, — то принятое нам НЕИЗВЕСТНО.
-        # Показать здесь ноль значило бы утверждать «заказали 65, приехало 0»:
-        # подтверждённую недостачу, которой не было.
-        # Признак «не знаем» действует ПОСТРОЧНО, а не на заказ целиком.
-        # МойСклад заполняет «отгружено» по частям: одна пришедшая позиция
-        # переводила остальные 28 из «неизвестно» в утверждение «приехало
-        # ничего», и итог «2 из 65» читался как факт. Для заказа, ушедшего
-        # в МС, молчание источника по позиции — это молчание, а не ноль.
-        by_machine = ms_writeback.is_pushed(order.ms_doc_href)
-        execution_unknown = by_machine and not rows
-        order_received = order.status == "received" and not by_machine
+        evidence = _execution_evidence(order, rows)
+        received = evidence["received"]
+        # Как и в сверке приёмок: отсутствие факта по заказанной позиции
+        # означает «не знаем», в том числе у локального принятого заказа.
+        # Статус received и старые whole_order не подтверждают количество;
+        # _received_by_base уже отделяет их от явного ручного нуля.
+        execution_unknown = evidence["unknown"]
+        confirmed = evidence["confirmed"]
         # Позиции, по которым источники спорят. Эта выдача — та самая, по
         # которой потом меряют качество рекомендаций, и подавать сюда спорное
         # число как факт нельзя: сверка приёмок уже говорит «не знаем», а здесь
         # выезжало уверенное `executed`, и две выдачи об одном заказе отвечали
         # по-разному.
-        disputed = {c["base_name"] for c in _source_conflicts(rows)}
-    confirmed = (bool(received) or order_received) and not disputed
+        disputed = {c["base_name"] for c in evidence["conflicts"]}
 
     def _executed(base: str):
         """Сколько принято ПО ЭТОЙ позиции. None — неизвестно.
@@ -2921,6 +3047,24 @@ def api_order_plan_outcome(
             rec = item.get("qty_recommended")
             lines.append(_line(base, None if rec is None else int(rec), 0.0))
 
+    # Факт приёмки относится к имени, а не к отдельной строке брифа.
+    # Две новинки одного имени и новинка поверх каталога не должны
+    # повторять один факт исполнения. Рекомендацию каталога сохраняем;
+    # вручную добавленное количество показываем отдельно.
+    by_base = {line["base_name"]: line for line in lines}
+    for item in (row.brief.get("new_items") or []):
+        base = str(item.get("name") or "").strip()
+        qty = int(item.get("qty") or 0)
+        if not base or qty <= 0:
+            continue
+        line = by_base.get(base)
+        if line is None:
+            line = _line(base, None, 0)
+            lines.append(line)
+            by_base[base] = line
+        line["decided"] += qty
+        line["new_item_qty"] = line.get("new_item_qty", 0) + qty
+
     edited = sum(1 for x in lines
                  if x["recommended"] is not None and x["recommended"] != x["decided"])
     return {
@@ -2932,9 +3076,9 @@ def api_order_plan_outcome(
                         if order is not None and order.received_at else None),
         "lead_time_fact_days": _lead_time_fact(order) if order is not None else None,
         "execution_confirmed": confirmed,
-        # Заказ закрыт, но чем он закрыт — мы не знаем: он ушёл в МойСклад,
-        # а «отгружено» оттуда не пришло. Это не «приехало ноль».
-        "execution_unknown": execution_unknown or bool(disputed),
+        # По заказанной позиции нет факта либо источники спорят.
+        # Статус заказа не превращает неизвестное количество в ноль.
+        "execution_unknown": execution_unknown,
         # Позиции, по которым источники приёмки спорят: у них `executed` = null
         # не потому, что данных нет, а потому, что данные противоречат друг
         # другу. Разница видна на экране, а не только в этом комментарии.
@@ -3037,18 +3181,26 @@ def api_order_plan_apply(
         result = json.loads(row.result_json or "{}")
     except ValueError:
         result = {}
-    items = [
-        {"base_name": i["base_name"], "qty": int(i["qty"]),
-         "sizes": i.get("sizes") or {}, "cost": float(i.get("cost_price") or 0)}
-        for i in (result.get("items") or []) if int(i.get("qty") or 0) > 0
-    ]
-    # Новинки, вписанные вручную, — такие же строки заказа (в МойСкладе у них
-    # может ещё не быть карточки: писбэк вернёт их в списке unmatched).
+    # Старый план не содержит итога проверки: не восстанавливаем его по
+    # сегодняшним данным и не меняем сохранённое решение человека.
+    if (not isinstance(result, dict)
+            or not isinstance(result.get("can_create"), bool)
+            or not isinstance(result.get("stop"), list)):
+        return JSONResponse(status_code=422, content={
+            "detail": "Пересчитайте план в мастере заказа: "
+                      "в сохранённом плане нет результата проверки создания заказа",
+            "code": "plan_recalculation_required", "stop": [],
+        })
+    if not result["can_create"] or result["stop"]:
+        reasons = [str(s.get("text")) for s in result["stop"]
+                   if isinstance(s, dict) and s.get("text")]
+        return JSONResponse(status_code=422, content={
+            "detail": "Создать заказ нельзя: " +
+                      ("; ".join(reasons) or "план не прошёл проверку"),
+            "code": "plan_forbidden", "stop": result["stop"],
+        })
     brief = row.brief
-    for n in (brief.get("new_items") or []):
-        if int(n.get("qty") or 0) > 0:
-            items.append({"base_name": n["name"], "qty": int(n["qty"]),
-                          "sizes": {}, "cost": float(n.get("cost") or 0)})
+    items = _plan_order_items(result, brief)
     if not items:
         raise HTTPException(422, "В плане нет позиций с количеством > 0")
     pid = brief.get("production_id")
@@ -3074,8 +3226,9 @@ def api_order_plan_apply(
         items_json=json.dumps(items, ensure_ascii=False),
     )
     db.add(order)
-    db.commit()
-    db.refresh(order)
+    # Получаем ID, но не сохраняем заказ отдельно от принятого плана:
+    # ошибка записи любой из связей должна откатить весь результат.
+    db.flush()
     row.production_order_id = order.id
     order.order_plan_id = row.id      # обратная ссылка (D-25)
     row.status = "applied"
@@ -3150,4 +3303,3 @@ def api_production_setup(
     db.commit()
     analytics.invalidate(ctx.org.id)
     return _production_out(p, analytics.extra_settings(ctx.org)["lead_time_days"])
-

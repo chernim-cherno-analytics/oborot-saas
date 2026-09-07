@@ -324,12 +324,16 @@ STARTUP_SCHEMA_STEPS: tuple[tuple[str, int], ...] = (
     # базе, где 13-й уже отработал, журнал считает его выполненным по id,
     # и новая таблица не получила бы колонку вовсе.
     ("models.ensure_supply_assignment_archive_schema", 14),
-    # SUPPLY-FIX-4 (F-23б): миниатюра эскиза. Шестой append-only шаг, позиция
-    # 15 новая, четырнадцать прежних пар не тронуты — четырнадцатая тем более,
-    # она уже выпущена на прод. Шаг добавляет одну нуллируемую колонку BLOB:
-    # ни одной строки не читает и не переписывает, ни одного индекса не
-    # создаёт. Последствия отката разобраны в докстринге самой функции.
-    ("models.ensure_supply_sketch_thumb_schema", 15),
+    ("models.ensure_order_payment_terms_schema", 15),
+    ("models.ensure_buy_price_presence_schema", 16),
+    # SUPPLY-FIX-4 (F-23б): миниатюра эскиза. Шестой append-only шаг ЭТОГО
+    # слоя и семнадцатый в списке. Позиция здесь 17, а не 15, и это не
+    # косметика: пока пакет делался, в `main` слились шаги 15 и 16 чужого
+    # пакета, и они уже выпущены. Занять их номер значило бы объявить
+    # противоречивым сам список (`_validate_startup_order`) и уронить старт на
+    # любой базе, где те шаги записаны. Собственный, ещё не выпущенный номер
+    # подвинуть можно; чужой выпущенный — нет.
+    ("models.ensure_supply_sketch_thumb_schema", 17),
 )
 _STARTUP_STEP_ORDER = dict(STARTUP_SCHEMA_STEPS)
 
@@ -533,9 +537,14 @@ def _startup() -> None:
     # не делает ни одного ALTER.
     _startup_step("models.ensure_supply_assignment_archive_schema",
                   _models.ensure_supply_assignment_archive_schema)
+    _startup_step("models.ensure_order_payment_terms_schema",
+                  _models.ensure_order_payment_terms_schema)
+    _startup_step("models.ensure_buy_price_presence_schema",
+                  _models.ensure_buy_price_presence_schema)
     # SUPPLY-FIX-4: одна нуллируемая колонка миниатюры у эскиза. Как и шаги
     # 13–14, ничего не читает и не переписывает; на базе, где колонка уже
-    # есть, не делает ни одного ALTER.
+    # есть, не делает ни одного ALTER. Вызов стоит ПОСЛЕ двух шагов чужого
+    # пакета — в том же порядке, в каком они объявлены выше.
     _startup_step("models.ensure_supply_sketch_thumb_schema",
                   _models.ensure_supply_sketch_thumb_schema)
     # Замок на пропуск: все объявленные шаги выполнены, и ровно они.

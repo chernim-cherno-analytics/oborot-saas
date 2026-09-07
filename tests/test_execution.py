@@ -233,8 +233,13 @@ def run() -> int:  # noqa: C901 — сценарный тест, ветвлен�
     check("outcome отдаёт строки", out.get("positions", 0) > 0, str(out)[:160])
     check("outcome знает заказ", out.get("order_id") == order_id)
     check("строки плана есть", len(out["lines"]) > 0, str(len(out["lines"])))
-    check("исполнение подтверждено — приёмки записаны вручную",
-          out.get("execution_confirmed") is True, str(out.get("execution_confirmed")))
+    check("A08 частичная приёмка не подтверждает весь заказ",
+          out.get("execution_confirmed") is False, str(out.get("execution_confirmed")))
+    reconciliation = c.get(f"/api/orders/{order_id}/receipts").json()
+    check("A08 обе выдачи одинаково отмечают неполную приёмку",
+          out.get("execution_confirmed") == reconciliation.get("confirmed") is False
+          and out.get("execution_unknown") == reconciliation.get("execution_unknown") is True
+          and out["totals"]["executed"] is reconciliation["received_total"] is None)
     # Приёмка была записана по ОДНОЙ позиции (и по одной, которой в заказе нет).
     # Остальные позиции ещё едут: у них исполнение обязано быть неизвестно,
     # а не нулём. Раньше одна частичная приёмка обнуляла ВСЕ строки, и цифры
@@ -300,6 +305,42 @@ def run() -> int:  # noqa: C901 — сценарный тест, ветвлен�
     check("дата приёмки записана", bool(body2.get("received_at")))
     check("фактический срок производства посчитан",
           body2.get("lead_time_fact_days") == 0, str(body2.get("lead_time_fact_days")))
+
+    # A08: историческая связь плана с локальным принятым заказом.
+    # Сам статус не является свидетельством количества по D-25/D-30/D-34.
+    _raw_sql(
+        "INSERT INTO order_plans (org_id,status,brief_json,computed_json,result_json,production_order_id,created_at) "
+        "VALUES (2,'applied','{}','{}',?,?,CURRENT_TIMESTAMP)",
+        json.dumps({"items": [{"base_name": name2, "qty": 10}]}), order2)
+    local_plan = sql("SELECT id FROM order_plans WHERE production_order_id=?", order2)[0][0]
+    # Reproduce both links written by the real apply route: a lone reused
+    # production_order_id is not evidence that this is the plan's order.
+    _raw_sql("UPDATE production_orders SET order_plan_id=? WHERE id=?", local_plan, order2)
+
+    def check_local_outcome(label, expected):
+        outcome = c2.get(f"/api/order-plan/{local_plan}/outcome").json()
+        receipt = c2.get(f"/api/orders/{order2}/receipts").json()
+        check(f"A08 {label}: подтверждение совпадает с фактами приёмки",
+              outcome["execution_confirmed"] == receipt["confirmed"] == (expected is not None))
+        check(f"A08 {label}: неизвестность совпадает с фактами приёмки",
+              outcome["execution_unknown"] == receipt["execution_unknown"] == (expected is None))
+        check(f"A08 {label}: число не выдумано и ручной ноль сохранён",
+              outcome["totals"]["executed"] == receipt["received_total"] == expected
+              and outcome["lines"][0]["executed"] == expected)
+
+    check_local_outcome("без приёмок", None)
+    at = datetime.utcnow().isoformat(sep=" ", timespec="seconds")
+    _raw_sql(
+        "INSERT INTO order_receipts (org_id,order_id,base_name,qty,at,source,precision,source_ref,created_at) "
+        "VALUES (2,?,?,10,?,'manual','whole_order','',?)", order2, name2, at, at)
+    check_local_outcome("старое допущение whole_order", None)
+    zero_receipt = c2.post(f"/api/orders/{order2}/receipts",
+                           json={"lines": [{"base_name": name2, "qty": 0}]})
+    check("A08 ручной ноль принят", zero_receipt.status_code == 200)
+    check_local_outcome("явный ручной ноль", 0)
+    c2.post(f"/api/orders/{order2}/receipts",
+            json={"lines": [{"base_name": name2, "qty": 7}]})
+    check_local_outcome("явное количество", 7)
 
     print("\n== Отметка «принят» С деталями — подтверждение ==")
     r = c2.post("/api/orders", json={"name": "Второй заказ", "items": [
@@ -876,6 +917,77 @@ def run() -> int:  # noqa: C901 — сценарный тест, ветвлен�
           "_write_shipped_receipts" in calls, str(sorted(calls))[:200])
     check("и берёт id заказа доказуемой связью, а не догадкой",
           "_oborot_order_id" in calls, str(sorted(calls))[:200])
+
+    print("\n== A01: новинки в отчёте исполнения ==")
+    new_prod = c.post("/api/productions", json={"name": "Только новинки"}).json()["id"]
+    c.post(f"/api/productions/{new_prod}/setup", json={"preset": "fabric_sewing"})
+    new_saved = c.post("/api/order-plan", json={"production_id": new_prod,
+        "budget": 100000, "budget_scope": "full", "new_items": [
+            {"name": "Новинка A01", "qty": 20, "cost": 100},
+            {"name": "Новинка A01", "qty": 30, "cost": 100}]}).json()
+    new_plan = new_saved["id"]
+    original_new = sql("SELECT brief_json,result_json FROM order_plans WHERE id=?", new_plan)[0]
+    new_before = c.get(f"/api/order-plan/{new_plan}/outcome").json()
+    check("A01 две новинки одного имени — одна позиция решения без рекомендации",
+          new_before["positions"] == 1 and new_before["lines"] == [{
+              "base_name": "Новинка A01", "recommended": None, "decided": 50,
+              "executed": None, "new_item_qty": 50}], str(new_before)[:220])
+    check("A01 итог решения включает новинки до оформления заказа",
+          new_before["totals"] == {"recommended": 0, "decided": 50, "executed": None})
+    new_apply = c.post(f"/api/order-plan/{new_plan}/apply", json={"force": True}).json()
+    new_order = new_apply["order_id"]
+    new_actual = c.get(f"/api/orders/{new_order}").json()
+    full_summary = new_saved["plan"].get("order_totals") or {}
+    check("A01 полный итог плана совпадает с созданным заказом новинок",
+          full_summary == {"positions": new_actual["positions"],
+                           "units": new_actual["total_qty"], "cost": new_actual["total_cost"]}
+          and full_summary.get("cost") == 5000, str(full_summary))
+    check("A01 полный календарь плана включает всю стоимость новинок",
+          sum(p["amount"] for p in new_saved["plan"].get("order_payments", [])) == 5000)
+    stored_complete = json.loads(sql("SELECT result_json FROM order_plans WHERE id=?", new_plan)[0][0])
+    check("A01 полный итог и календарь сохраняются как принятое решение",
+          stored_complete.get("order_totals") == full_summary and bool(full_summary)
+          and stored_complete.get("order_payments") == new_saved["plan"].get("order_payments"))
+    new_sent = c.post(f"/api/orders/{new_order}/status", json={"status": "sent"})
+    check("A01 повторённое имя отправляется без ошибки и даёт ровно50 в пути",
+          new_sent.status_code == 200
+          and sql("SELECT qty FROM ordered_qty WHERE org_id=1 AND base_name=?", "Новинка A01") == [(50,)],
+          str(new_sent.status_code))
+    for qty, expected in ((0, 0), (50, 50)):
+        receipt = c.post(f"/api/orders/{new_order}/receipts",
+                        json={"lines": [{"base_name": "Новинка A01", "qty": qty}]})
+        outcome = c.get(f"/api/order-plan/{new_plan}/outcome").json()
+        reconciliation = c.get(f"/api/orders/{new_order}/receipts").json()
+        check(f"A01 факт {expected} по повторённому имени учитывается один раз",
+              receipt.status_code == 200 and outcome["totals"]["executed"] == expected
+              and reconciliation["received_total"] == expected
+              and len(outcome["lines"]) == 1, str(outcome["totals"]))
+    check("A01 чтение outcome не переписывает исторические входы и результат",
+          sql("SELECT brief_json,result_json FROM order_plans WHERE id=?", new_plan)[0] == original_new)
+
+    c.post("/api/productions/assign", json={"base_name": victim, "production_id": new_prod})
+    mixed_saved = c.post("/api/order-plan", json={"budget": 1000000, "production_id": new_prod,
+        "budget_scope": "now", "new_items": [{"name": victim, "qty": 5, "cost": 100}],
+        "overrides": {victim: 10}}).json()
+    mixed_plan = mixed_saved["id"]
+    mixed_result = json.loads(sql("SELECT result_json FROM order_plans WHERE id=?", mixed_plan)[0][0])
+    catalogue = next(i for i in mixed_result["items"] if i["base_name"] == victim)
+    mixed_order = c.post(f"/api/order-plan/{mixed_plan}/apply", json={"force": True}).json()["order_id"]
+    mixed_actual = c.get(f"/api/orders/{mixed_order}").json()
+    mixed_summary = mixed_saved["plan"].get("order_totals") or {}
+    check("A01 ручные правки и новинки входят в один полный итог и календарь",
+          mixed_summary.get("units") == mixed_actual["total_qty"]
+          and mixed_summary.get("cost") == mixed_actual["total_cost"]
+          and sum(p["amount"] for p in mixed_saved["plan"].get("order_payments", []))
+              == mixed_actual["total_cost"], str(mixed_summary))
+    c.post(f"/api/orders/{mixed_order}/status", json={"status": "sent"})
+    c.post(f"/api/orders/{mixed_order}/receipts", json={"lines": [{"base_name": victim, "qty": 15}]})
+    mixed_outcome = c.get(f"/api/order-plan/{mixed_plan}/outcome").json()
+    mixed_lines = [line for line in mixed_outcome["lines"] if line["base_name"] == victim]
+    check("A01 смешанное имя сохраняет рекомендацию и отдельно ручное добавление",
+          len(mixed_lines) == 1 and mixed_lines[0]["recommended"] == catalogue["qty_recommended"]
+          and mixed_lines[0]["decided"] == 15 and mixed_lines[0]["executed"] == 15
+          and mixed_lines[0].get("new_item_qty") == 5, str(mixed_lines))
 
     print("\n== Удаление организации не оставляет приёмок ==")
     before = sql("SELECT COUNT(*) FROM order_receipts")[0][0]

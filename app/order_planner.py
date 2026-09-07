@@ -939,6 +939,25 @@ def _coverage(snap: dict, ctx: dict, stages: list[dict]) -> dict:
     }
 
 
+def share_limit_stops(items: list[dict]) -> list[dict]:
+    """Проверяет итог рекомендации по уже рассчитанному лимиту распределителя."""
+    stops = []
+    for item in items:
+        cap = item.get("share_limit_qty")
+        if cap is None or item["qty"] <= cap:
+            continue
+        # Явная правка количества — решение человека. Повторить прежнее
+        # количество или изменить другую строку не значит принять превышение.
+        if ("manual" in (item.get("why") or [])
+                and item["qty"] != item.get("qty_recommended", item["qty"])):
+            continue
+        stops.append({"code": "share_limit", "text":
+                      f"«{item['base_name']}»: рекомендация после округления превышает "
+                      f"лимит доли на позицию ({item['qty']} шт. при максимуме {cap}). "
+                      "Измените условия или укажите количество вручную."})
+    return stops
+
+
 def plan_order(snap: dict, brief: dict, ctx: dict, stages: list[dict],
                with_sensitivity: bool = True) -> dict:
     """Бриф → план заказа. Чистая функция: в БД не ходит."""
@@ -996,6 +1015,8 @@ def plan_order(snap: dict, brief: dict, ctx: dict, stages: list[dict],
             "gap_days": c["gap_days"],
             "need": c["need"],
             "qty": qty,
+            "share_limit_qty": (None if c["must_have"]
+                                else res["cap_units"].get(c["base_name"])),
             "unmet": unmet,
             "sizes": size_split(c["sizes"], qty),
             "cost_price": c["cost_price"],
@@ -1087,6 +1108,9 @@ def plan_order(snap: dict, brief: dict, ctx: dict, stages: list[dict],
         "pack_multiple": int(ctx.get("pack_multiple") or 0),
         "no_supplier_count": sum(1 for i in items if i.get("no_supplier")),
         "stages": stage_schedule(order_date, stages),
+        # Для повторного расчёта платежей нужны исходные доли: stage_schedule
+        # округляет их для показа и не подходит как точный источник условий.
+        "payment_terms": [dict(stage) for stage in stages],
         "payments": payments,
         "new_items": list(brief.get("new_items") or []),
         "new_items_cost": res["new_cost"],
@@ -1203,11 +1227,16 @@ def plan_order(snap: dict, brief: dict, ctx: dict, stages: list[dict],
     if plan["rest"] < 0:
         stop.append({"code": "over_budget", "text":
                      f"Заказ выходит за бюджет на {fmt_rub(-plan['rest'])}"})
+    if plan["new_items_over_budget"] > 0:
+        stop.append({"code": "new_items_over_budget", "text":
+                     f"Новинки выходят за бюджет на {fmt_rub(plan['new_items_over_budget'])}. "
+                     "Уменьшите количество новинок или увеличьте бюджет."})
     if plan["order_date"] < snap["today"]:
         stop.append({"code": "past_date", "text":
                      f"Заказ пришлось бы разместить {plan['order_date']} — "
                      f"эта дата уже прошла. Сдвиньте дату приёмки."})
     plan["stop"] = stop
+    stop.extend(share_limit_stops(items))
     plan["can_create"] = not stop
     if coverage["partial"]:
         # Пометка для UI и для api_order_plan_apply: план предварительный —

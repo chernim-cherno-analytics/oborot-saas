@@ -269,7 +269,7 @@
     <span class="draft-note" id="draft-note"></span>
     <button class="abtn" id="btn-reset-drafts" type="button" style="display:none">↺ Сбросить правки</button>
     <button class="abtn" type="button" id="btn-export-xlsx" title="Выгрузить в Excel отмеченные галочкой позиции">⬇ Excel</button>
-    <button class="abtn primary" id="btn-create-order" type="button" disabled>+ Создать заказ</button>
+    <button class="abtn primary" id="btn-create-order" type="button" disabled>+ Оформить размещение</button>
   </div>
 
   <div class="cat-bar" id="cat-bar" style="display:none"></div>
@@ -331,7 +331,7 @@
 <!-- Модалка создания заказа -->
 <div class="modal-bg" id="order-modal">
   <div class="modal">
-    <h3>Новый заказ на производство</h3>
+    <h3>Зафиксировать размещение заказа</h3>
     <div class="msub" id="order-modal-summary"></div>
     <label for="order-name">Название заказа</label>
     <input type="text" id="order-name" autocomplete="off" placeholder="Например: Иван · трикотаж или Швейцех №2">
@@ -342,9 +342,11 @@
     <div class="fieldhint">Все расчёты уже сделаны на дату прихода: из остатков вычтено то, что продастся
       за время производства.</div>
     <div class="warn" id="order-modal-warning"></div>
+    <div class="fieldhint">Заказ будет отмечен «в производстве», а количество появится в «Едет».
+      Документ в МойСкладе создаётся отдельным действием.</div>
     <div class="actions">
       <button class="abtn" type="button" id="btn-order-cancel">Отмена</button>
-      <button class="abtn primary" type="button" id="btn-order-submit">Создать заказ</button>
+      <button class="abtn primary" type="button" id="btn-order-submit">Зафиксировать размещение</button>
     </div>
   </div>
 </div>
@@ -1401,7 +1403,7 @@
     var btn=this;
     var name=document.getElementById("order-name").value.trim()||"Заказ на производство";
     var eta=document.getElementById("order-eta").value||null;
-    var payload={name:name,eta_date:eta,items:checkedItems().map(function(it){
+    var payload={name:name,eta_date:eta,production_id:ACTIVE_PROD,items:checkedItems().map(function(it){
       var sizes={};
       Object.keys(it._recs).forEach(function(sz){ var q=Number(it._recs[sz])||0; if(q>0) sizes[sz]=q; });
       return {base_name:it.base_name,qty:it._need,sizes:sizes,cost:it.cost_price||0};

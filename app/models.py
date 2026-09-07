@@ -15,6 +15,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    false,
     inspect,
     text,
 )
@@ -272,6 +273,9 @@ class Product(Base):
     #   cost_full  — полная себестоимость из выбранного типа цены, 0 = не задана.
     # Деньги считаются по cost_full с фолбэком на cost_price (analytics).
     cost_price: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)  # закупочная, ₽
+    # Ноль в старом cost_price также означает отсутствие buyPrice. Только
+    # синк с явным нулём источника разрешает отправлять нулевую цену.
+    buy_price_zero_explicit: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=false())
     cost_full: Mapped[float] = mapped_column(Float, nullable=False, default=0.0, server_default="0")
     # Поставщик из МойСклада (контрагент в карточке товара). По нему обычно и
     # видно, кто шьёт позицию: «Китай» — фабрика под ключ, своё производство —
@@ -769,6 +773,9 @@ class ProductionOrder(Base):
     # Без неё найти «из какого расчёта вырос этот заказ» можно только
     # перебором планов организации.
     order_plan_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Снимок условий простого заказа. Пусто у старых записей: не выдаём
+    # сегодняшние настройки за исторически согласованные условия.
+    payment_terms_json: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default="")
 
     # SUPPLY-1 (D-49/D-50): собственный неизменяемый идентификатор партии.
     #
@@ -1975,13 +1982,43 @@ def ensure_supply_assignment_archive_schema(bind=None) -> None:
             bind=eng)
 
 
+def ensure_order_payment_terms_schema(bind=None) -> None:
+    """A07: новый терминальный шаг15; прежние миграции не меняются."""
+    eng = bind or engine
+    insp = inspect(eng)
+    if not insp.has_table("production_orders"):
+        return
+    if "payment_terms_json" not in {c["name"] for c in insp.get_columns("production_orders")}:
+        run_migration_step(
+            "ALTER TABLE production_orders ADD COLUMN payment_terms_json TEXT NOT NULL DEFAULT ''",
+            bind=eng)
+
+
+def ensure_buy_price_presence_schema(bind=None) -> None:
+    """A05: терминальный шаг16, без догадок о старых нулевых ценах."""
+    eng = bind or engine
+    insp = inspect(eng)
+    if not insp.has_table("products"):
+        return
+    if "buy_price_zero_explicit" not in {c["name"] for c in insp.get_columns("products")}:
+        run_migration_step(
+            "ALTER TABLE products ADD COLUMN buy_price_zero_explicit BOOLEAN NOT NULL DEFAULT FALSE",
+            bind=eng)
+
+
 def ensure_supply_sketch_thumb_schema(bind=None) -> None:
-    """SUPPLY-FIX-4 (F-23б): миниатюра эскиза. Шаг старта 15.
+    """SUPPLY-FIX-4 (F-23б): миниатюра эскиза. Шаг старта 17.
 
     ПОЧЕМУ ШЕСТОЙ ОТДЕЛЬНЫЙ ШАГ, А НЕ ДОПИСКА В ПРЕЖНИЙ. То же правило и по
     той же причине, что у шагов 12–14 (`AGENTS.md` §1, «только новая миграция
-    сверху»): четырнадцать выпущенных пар (id, позиция) не трогаются ни буквой,
-    а у новой работы своя пара. Дописать колонку в шаг 11 было нельзя вовсе: на
+    сверху»): выпущенные пары (id, позиция) не трогаются ни буквой, а у новой
+    работы своя пара.
+
+    ПОЧЕМУ 17, А НЕ 15. Пакет писался от `66ad1c1`, где последним был шаг 14, и
+    номер 15 был свободен. Пока он писался, в `main` слились шаги 15 и 16
+    чужого пакета — и они уже выпущены. Свой, ещё не выпущенный номер подвинуть
+    можно; чужой выпущенный занять нельзя, иначе список шагов становится
+    противоречивым и старт падает на любой базе, где те шаги записаны. Дописать колонку в шаг 11 было нельзя вовсе: на
     боевой базе он давно выполнен, журнал считает его сделанным по id, и новая
     колонка не появилась бы там никогда.
 

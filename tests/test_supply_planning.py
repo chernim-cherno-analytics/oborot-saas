@@ -939,10 +939,10 @@ def run() -> int:
     check("за весь сценарий не создано ни одного заказа и ни одной строки «В заказе»",
           orders == 0 and ordered == 0, f"orders={orders} ordered_qty={ordered}")
 
-    # ── 18. Миграция: аддитивна, идемпотентна, шагов двенадцать ───────────────
-    print("\n== Миграция: новый шаг сверху, старые тринадцать не тронуты ==")
+    # ── 18. Миграция: аддитивна, идемпотентна, прежние шаги сохранены ────────
+    print("\n== Миграция: новый шаг сверху, старые четырнадцать не тронуты ==")
     from app.main import STARTUP_SCHEMA_STEPS
-    check("шагов старта пятнадцать", len(STARTUP_SCHEMA_STEPS) == 15,
+    check("шагов старта семнадцать", len(STARTUP_SCHEMA_STEPS) == 17,
           str(len(STARTUP_SCHEMA_STEPS)))
     check("первые десять пар (id, позиция) не изменились",
           STARTUP_SCHEMA_STEPS[:10] == (
@@ -979,9 +979,18 @@ def run() -> int:
           str(fourteenth))
     fifteenth = (STARTUP_SCHEMA_STEPS[14]
                  if len(STARTUP_SCHEMA_STEPS) > 14 else None)
-    check("новый шаг дописан в конец с новым id и позицией 15",
-          fifteenth == ("models.ensure_supply_sketch_thumb_schema", 15),
+    check("снимок условий заказа дописан в конец с новым id и позицией 15",
+          fifteenth == ("models.ensure_order_payment_terms_schema", 15),
           str(fifteenth))
+    check("признак цены добавлен отдельным шагом 16",
+          STARTUP_SCHEMA_STEPS[15:16] == (("models.ensure_buy_price_presence_schema", 16),),
+          str(STARTUP_SCHEMA_STEPS[15:16]))
+    # SUPPLY-FIX-4: миниатюра эскиза. Позиция 17, а не 15: пока пакет писался,
+    # номера 15 и 16 заняли шаги чужого пакета, и они уже выпущены. Свой,
+    # ещё не выпущенный номер подвинуть можно; чужой выпущенный — нет.
+    check("миниатюра эскиза дописана в конец с новым id и позицией 17",
+          STARTUP_SCHEMA_STEPS[16:] == (("models.ensure_supply_sketch_thumb_schema", 17),),
+          str(STARTUP_SCHEMA_STEPS[16:]))
 
     # «Старая» база: таблиц слоя нет вовсе — шаг обязан их создать и не упасть
     # при повторном вызове.
@@ -3440,7 +3449,7 @@ def _fix3_long_digits(c) -> None:
 
 
 def supply_fix_4_migration_checks() -> None:
-    """SUPPLY-FIX-4: шаг 15 добавляет одну колонку и переживает откат.
+    """SUPPLY-FIX-4: шаг 17 добавляет одну колонку и переживает откат.
 
     База собирается ТЕМ ЖЕ DDL, что выпущен на прод (форма `supply_sketches` из
     шага 11), но БЕЗ `thumb`: иначе шагу нечего было бы добавлять, и проверка
@@ -3450,12 +3459,12 @@ def supply_fix_4_migration_checks() -> None:
     прежний код, который её не называет, продолжает писать, а его строки
     читаются и новым кодом, и старым.
     """
-    print("\n== Шаг 15: миниатюра добавляется аддитивно и переживает откат ==")
+    print("\n== Шаг 17: миниатюра добавляется аддитивно и переживает откат ==")
     from sqlalchemy import create_engine, inspect as sa_inspect, text as sa_text
     from app import models as _models
 
     if not hasattr(_models, "ensure_supply_sketch_thumb_schema"):
-        check("шаг 15 (миниатюра эскиза) существует", False,
+        check("шаг 17 (миниатюра эскиза) существует", False,
               "models.ensure_supply_sketch_thumb_schema отсутствует")
         return
 
