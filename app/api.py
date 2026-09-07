@@ -2822,6 +2822,8 @@ def _plan_row_out(row, names: dict, prods: dict) -> dict:
         "positions": int(totals.get("positions") or 0),
         "units": int(totals.get("units") or 0),
         "cost": int(totals.get("cost") or 0),
+        "totals_exclude_new_items": bool(brief.get("new_items")),
+        "cost_incomplete": bool(result.get("budget_incomplete")),
     }
 
 

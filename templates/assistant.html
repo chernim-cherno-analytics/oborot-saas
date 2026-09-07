@@ -581,8 +581,11 @@
         return "<tr><td>"+dstr((h.created_at||"").slice(0,10))+"</td>"+
           "<td>"+esc(h.production_name||"—")+"</td>"+
           '<td class="nb">'+fmtR(h.budget)+"</td>"+
-          '<td class="nb">'+fmt(h.positions)+" / "+fmt(h.units)+"</td>"+
-          '<td class="nb">'+fmtR(h.cost)+"</td>"+
+          '<td class="nb">'+fmt(h.positions)+" / "+fmt(h.units)+
+            (h.totals_exclude_new_items ? '<span class="why">без новинок</span>' : '')+"</td>"+
+          '<td class="nb">'+fmtR(h.cost)+
+            (h.totals_exclude_new_items ? '<span class="why">без новинок</span>' : '')+
+            (h.cost_incomplete ? '<span class="why">сумма неполная</span>' : '')+"</td>"+
           "<td>"+esc(h.author||"—")+"</td>"+
           "<td>"+(h.order_id ? '<a href="/replenish#orders" title="Заказы в производстве — внизу страницы «Заказ»">№'+h.order_id+"</a>" : '<span class="muted">не оформлен</span>')+"</td>"+
           '<td><button class="go-btn ghost repeat" type="button" data-id="'+h.id+

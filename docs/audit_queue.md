@@ -135,3 +135,17 @@ verification. No formula, amount, API or storage changes.
 Next bounded verification: saved-plan history uses the same catalogue-only
 totals without a scope marker. Inspect _plan_row_out/renderHistory and expose
 the omission explicitly without changing stored amounts or monetary policy.
+
+## Completed local CLAIM A01 history scope
+
+BRANCH: codex/audit-a01-history-scope. BASE: 4fe17b7.
+FILES: app/api.py (_plan_row_out), templates/assistant.html (renderHistory),
+tests/test_decision_record.py, tests/test_ui.py, docs/audit_queue.md,
+docs/audit_a01_evidence.md.
+DONE_WHEN: history marks catalogue-only quantities/cost for plans containing
+new items, using the saved brief, and carries the already stored incomplete-
+cost flag from the saved result. Plans without either condition keep ordinary display.
+Stored historical values remain unchanged. API and browser regressions,
+separate commit; no formulas/schema or release bypass.
+RESULT: API43/0 and Chromium52/0; stored new-item scope and missing-cost flag
+are visible in history, without recalculating existing amounts.

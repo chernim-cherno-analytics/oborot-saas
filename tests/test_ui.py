@@ -466,6 +466,20 @@ def run() -> int:  # noqa: C901 — сценарный тест: шагов мн
             check("A01 ограничение итогов и календаря явно показано",
                   "Новинки" in warning_with_new and "не учитывают" in warning_with_new
                   and "календарь" in warning_with_new)
+            history_body = new_preview.value.request.post_data_json
+            missing_cost = new_preview.value.json()["review"]["no_cost"]
+            check("история: в каталоге есть позиция без себестоимости", bool(missing_cost))
+            if missing_cost:
+                history_body["overrides"] = {**history_body.get("overrides", {}),
+                                             missing_cost[0]["base_name"]: 2}
+            history_saved = c.post("/api/order-plan", json=history_body).json()
+            page.reload()
+            history_row = page.locator(f".repeat[data-id='{history_saved['id']}']").locator("xpath=../..")
+            history_row.wait_for(state="attached")
+            check("A01 история помечает стоимость и количество без новинок",
+                  (history_row.text_content() or "").count("без новинок") == 2)
+            check("история: неполная себестоимость явно подписана",
+                  "сумма неполная" in (history_row.text_content() or ""))
 
         print("\n== «Что заказать»: позиции без себестоимости не бесплатны ==")
         page.goto(f"{base}/replenish")
@@ -516,7 +530,10 @@ def run() -> int:  # noqa: C901 — сценарный тест: шагов мн
           const b = document.getElementById('calcBtn') || document.querySelector('.go-btn');
           if (b) b.click();
         }""")
-        page.wait_for_timeout(3000)
+        page.wait_for_function("""() => {
+            const text = document.getElementById('statusHint').textContent.trim();
+            return text && text !== 'считаю…';
+        }""")
         hint_year = page.text_content("#statusHint") or ""
         check("окно темпа названо в строке состояния", "темп" in hint_year, hint_year[:100])
         post_settings(c, {"rate_window": "d90"}, "смена окна темпа на d90")
@@ -526,7 +543,10 @@ def run() -> int:  # noqa: C901 — сценарный тест: шагов мн
           const b = document.getElementById('calcBtn') || document.querySelector('.go-btn');
           if (b) b.click();
         }""")
-        page.wait_for_timeout(3000)
+        page.wait_for_function("""() => {
+            const text = document.getElementById('statusHint').textContent.trim();
+            return text && text !== 'считаю…';
+        }""")
         hint_90 = page.text_content("#statusHint") or ""
         check("после смены окна строка изменилась",
               hint_90 != hint_year, f"{hint_year[:60]} -> {hint_90[:60]}")

@@ -40,3 +40,26 @@ states that current-plan totals, quantities and calendar exclude the new
 items shown separately. No amounts or formulas change. The ordinary labels
 are retained when there are no new items. Final browser:49 OK /0 FAIL,
 including real preview and no console errors.
+
+## Saved-plan history scope
+
+History also displayed catalogue-only cost/count without noting missing new
+items. The history API now exposes totals_exclude_new_items from the saved
+brief; the UI labels both cost and quantity as excluding new items. Stored
+result_json and its amounts remain byte-for-byte unchanged by history reads.
+
+API baseline37 OK /2 FAIL, fixed39 OK /0 FAIL. Browser baseline49 OK /1 FAIL
+for the missing history labels, using a real saved preview with new items.
+An adjacent D-23 omission was found: the saved budget_incomplete flag also
+disappeared from history. The API now exposes cost_incomplete from that
+existing flag and the cost cell says the amount is incomplete. API baseline
+for this case41 OK /2 FAIL; final API43 OK /0 FAIL, using an actual manual
+addition of a catalogue position without cost. No migrations, monetary
+recalculation or changes to interpretation of supplier versus full cost.
+
+An intermediate browser run passed the new-item history case but read the
+unrelated budget status while it still said "считаю…" after a fixed3-second
+pause. The test now waits for calculation completion before checking the
+window label; that rerun passed50/0. The final combined browser case saves
+real new items and a real catalogue item with missing cost:52 OK /0 FAIL.
+Combined final package checks: API43 plus browser52, 95 OK /0 FAIL.

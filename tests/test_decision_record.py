@@ -150,6 +150,32 @@ def run() -> int:
     computed = json.loads(row[0][0]) if row else {}
     result = json.loads(row[0][1]) if row else {}
 
+    print("\n== A01: история раскрывает неполный состав итогов ==")
+    new_saved = c.post("/api/order-plan", json={**body, "new_items": [
+        {"name": "A01 история", "qty": 2, "cost": 1000}]}).json()
+    new_plan_id = new_saved["id"]
+    saved_bytes = sql("SELECT result_json FROM order_plans WHERE id=?", new_plan_id)[0][0]
+    history_rows = {h["id"]: h for h in c.get("/api/order-plan/history").json()["plans"]}
+    check("A01 история помечает итоги без новинок",
+          history_rows[new_plan_id].get("totals_exclude_new_items") is True)
+    check("A01 история без новинок не получает ложную пометку",
+          history_rows[plan_id].get("totals_exclude_new_items") is False)
+    check("A01 пометка не переписывает сохранённые значения",
+          sql("SELECT result_json FROM order_plans WHERE id=?", new_plan_id)[0][0] == saved_bytes
+          and history_rows[new_plan_id]["cost"] == json.loads(saved_bytes)["totals"]["cost"])
+    no_cost_items = new_saved["plan"]["review"]["no_cost"]
+    check("история: есть реальная позиция без себестоимости для проверки", bool(no_cost_items))
+    if no_cost_items:
+        unknown_cost_saved = c.post("/api/order-plan", json={**body, "overrides": {
+            no_cost_items[0]["base_name"]: 2}}).json()
+        check("история: исходный результат хранит неполную себестоимость",
+              bool(unknown_cost_saved["plan"]["budget_incomplete"]))
+        history_rows = {h["id"]: h for h in c.get("/api/order-plan/history").json()["plans"]}
+        check("история: неполная себестоимость явно помечена",
+              history_rows[unknown_cost_saved["id"]].get("cost_incomplete") is True)
+        check("история: обычный план не получает ложную неполноту",
+              history_rows[plan_id].get("cost_incomplete") is False)
+
     algo = computed.get("algo") or {}
     check("сохранена версия домена", algo.get("domain") == DOMAIN_VERSION,
           f"algo={algo}")
