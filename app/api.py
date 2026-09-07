@@ -226,6 +226,7 @@ def _order_stages(db: Session, order: ProductionOrder, settings: dict) -> list[d
 
     saved = db.execute(select(OrderPlan.computed_json).where(
         OrderPlan.org_id == order.org_id,
+        OrderPlan.id == order.order_plan_id,
         OrderPlan.production_order_id == order.id,
         OrderPlan.status == "applied",
     ).order_by(OrderPlan.id).limit(1)).scalar_one_or_none()
@@ -233,7 +234,8 @@ def _order_stages(db: Session, order: ProductionOrder, settings: dict) -> list[d
         computed = json.loads(saved or "{}")
     except (TypeError, ValueError):
         computed = {}
-    stages = computed.get("stages") if isinstance(computed, dict) else None
+    stages = ((computed.get("payment_terms") or computed.get("stages"))
+              if isinstance(computed, dict) else None)
     # Снимок уже нормализован и показан человеку. Не заменяем его условиями
     # сегодняшнего справочника и не нормируем доли повторно.
     if (isinstance(stages, list) and stages and all(
@@ -2467,7 +2469,7 @@ def _manual_item(base: str, qty: int, snap: dict, plan: dict) -> dict | None:
     cost = float(src.get("cost_price") or 0)
     price = float(src.get("avg_price") or src.get("sale_price") or 0)
     margin = max(0.0, price - cost) if cost > 0 else 0.0
-    stages = plan.get("stages") or []
+    stages = plan.get("payment_terms") or plan.get("stages") or []
     pay_share = stages[0].get("cost_share", 1.0) * stages[0].get("prepay_share", 1.0) \
         if stages else 1.0
     return {
@@ -2619,7 +2621,7 @@ def _apply_overrides(plan: dict, overrides: dict, snap: dict) -> None:
     } if no_cost_rows else None)
     # Календарь платежей пересобираем от новой себестоимости, «сейчас» —
     # снова первый транш календаря, а не отдельная формула.
-    stages = plan.get("stages") or []
+    stages = plan.get("payment_terms") or plan.get("stages") or []
     plan["payments"] = op.payment_plan(
         date.fromisoformat(plan["order_date"]),
         [{"name": st["name"], "lead_days": st["lead_days"],
@@ -2738,6 +2740,7 @@ def api_order_plan_save(
                 "order_date": plan["order_date"],
                 "covered_until": plan["covered_until"],
                 "stages": plan["stages"],
+                "payment_terms": plan.get("payment_terms"),
                 "lead_days": plan["lead_days"],
                 # На какой истории посчитан план (деплой П1): apply спросит
                 # осознанное подтверждение, если истории было мало.

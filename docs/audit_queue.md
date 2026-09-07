@@ -149,3 +149,20 @@ Stored historical values remain unchanged. API and browser regressions,
 separate commit; no formulas/schema or release bypass.
 RESULT: API43/0 and Chromium52/0; stored new-item scope and missing-cost flag
 are visible in history, without recalculating existing amounts.
+
+## Completed local CLAIM A07 payment precision
+
+BRANCH: codex/audit-a07-payment-precision. BASE: 2fc478d.
+FILES: app/order_planner.py (retain normalized payment terms), app/api.py
+(save/read exact terms and use them after overrides), tests/test_planner.py,
+docs/audit_queue.md, docs/audit_a07_evidence.md.
+DONE_WHEN: saving/applying a new plan and manual quantity recalculation use
+the same unrounded stage shares as its original payment calculation. Existing
+rounded stage display stays unchanged; old records without exact terms keep
+the documented legacy fallback. Require reciprocal plan/order links so reused
+order IDs cannot attach an old plan's conditions. No formula, schema or historic backfill.
+
+Next bounded check: _plan_row_out still emits production_order_id directly
+as a clickable history link. Verify deleted/reused order IDs there as well;
+do not show a different new order as the old plan's result. This is a read
+contract/identity check, not a change to payment or allocation policy.

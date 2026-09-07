@@ -1108,6 +1108,9 @@ def plan_order(snap: dict, brief: dict, ctx: dict, stages: list[dict],
         "pack_multiple": int(ctx.get("pack_multiple") or 0),
         "no_supplier_count": sum(1 for i in items if i.get("no_supplier")),
         "stages": stage_schedule(order_date, stages),
+        # Для повторного расчёта платежей нужны исходные доли: stage_schedule
+        # округляет их для показа и не подходит как точный источник условий.
+        "payment_terms": [dict(stage) for stage in stages],
         "payments": payments,
         "new_items": list(brief.get("new_items") or []),
         "new_items_cost": res["new_cost"],

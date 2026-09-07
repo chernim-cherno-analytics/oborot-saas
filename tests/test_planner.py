@@ -1064,6 +1064,45 @@ def api_checks() -> None:
               c.post(f"/api/productions/{lab['id']}/setup",
                      json={"stages": _gate_json.loads(original_terms)}).status_code == 200)
 
+        from app import order_planner as precision_op
+        precise_setup = c.post(f"/api/productions/{lab['id']}/setup", json={"stages": [
+            {"name": f"A07 этап {i}", "lead_days": 10, "cost_share": 1, "prepay_share": 1}
+            for i in range(3)]}).json()
+        precise_body = {"production_id": lab["id"], "eta_date": eta,
+                        "budget": 100000000, "budget_scope": "full"}
+        precise_saved = c.post("/api/order-plan", json=precise_body).json()
+        precise_plan = precise_saved["plan"]
+        expected_precise = precision_op.payment_plan(date.today(), precise_setup["stages"],
+                                                      precise_plan["cost_total"])
+        precise_apply = c.post(f"/api/order-plan/{precise_saved['id']}/apply",
+                               json={"force": True, "confirm_partial": True}).json()
+        precise_order_id = precise_apply["order_id"]
+        precise_orders = c.get("/api/orders/open").json()["orders"]
+        actual_precise = next(o["payments"] for o in precise_orders if o["id"] == precise_order_id)
+        check("A07 сохранение не округляет исходные доли платежей",
+              [p["amount"] for p in actual_precise] == [p["amount"] for p in expected_precise],
+              str([p["amount"] for p in actual_precise]))
+        precise_item = precise_plan["items"][0]
+        precise_edited = c.post("/api/order-plan/preview", json={**precise_body,
+            "overrides": {precise_item["base_name"]: precise_item["qty"] + 1}}).json()
+        expected_edited = precision_op.payment_plan(date.today(), precise_setup["stages"],
+                                                     precise_edited["cost_total"])
+        check("A07 ручная правка сохраняет точность долей платежей",
+              [p["amount"] for p in precise_edited["payments"]] == [p["amount"] for p in expected_edited])
+        c.delete(f"/api/orders/{precise_order_id}")
+        c.post(f"/api/productions/{lab['id']}/setup", json={"stages": _gate_json.loads(original_terms)})
+
+        reused = c.post("/api/orders", json={"name": "A07 новый простой заказ",
+            "production_id": lab["id"], "items": [{"base_name": precise_item["base_name"],
+                                                       "qty": 1, "sizes": {}}]}).json()
+        check("A07 воспроизведено переиспользование ID удалённого заказа",
+              reused["id"] == precise_order_id)
+        new_plain = next(o for o in c.get("/api/orders/open").json()["orders"] if o["id"] == reused["id"])
+        plain_expected = precision_op.payment_plan(date.today(), _gate_json.loads(original_terms), new_plain["total_cost"])
+        check("A07 новый заказ не наследует снимок удалённого заказа",
+              new_plain["order_plan_id"] is None and new_plain["payments"] == plain_expected)
+        c.delete(f"/api/orders/{reused['id']}")
+
         other = c.get("/api/orders/open", params={"production_id": china["id"]}).json()
         check("фильтр по каналу не показывает чужие заказы",
               other["count"] == 0, str(other["count"]))

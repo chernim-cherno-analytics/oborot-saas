@@ -28,3 +28,26 @@ Placement dates still follow the existing creation-date behavior. Payment
 facts, planned-versus-paid labels, simple-order storage and later negotiated
 revisions remain separate open A07 work. No claim that a past planned date
 proves payment, no full A07 closure and no release/independent-review claim.
+
+## Payment precision and reciprocal links
+
+Further verification found two flaws in the local A07 package before release.
+The display stage snapshot rounds shares to four decimals: three equal stages
+for1,000,000 produce333,333 /333,333 /333,334 originally but333,300 /333,300
+/333,400 from the rounded snapshot. The same loss occurred after manual
+quantity edits. New plans now retain the original normalized payment_terms
+separately, persist them in computed_json, and use them for order payments
+and manual edits. Display stages and the payment formula are unchanged.
+Old records without exact terms cannot recover lost precision; their existing
+rounded snapshot fallback remains explicit, without inventing historic data.
+
+Second, deleting an order leaves the old plan link behind; SQLite may reuse
+the order ID. A new simple order then inherited the deleted order's stage
+snapshot. Snapshot selection now requires both plan.production_order_id and
+order.order_plan_id to point to each other within the same organization.
+Orders without that reciprocal evidence retain the legacy production fallback.
+
+Precision baseline: planner342 OK /2 FAIL. After the precision fix344/0.
+Reused-ID baseline:345 OK /1 FAIL after an actual API delete/create sequence.
+Decision record regression43/0. Final planner346/0 and execution164/0:
+553 OK /0 FAIL across these suites. No schema, supplier-price policy or allocator changes.
