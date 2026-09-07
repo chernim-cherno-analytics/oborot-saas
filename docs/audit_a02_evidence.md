@@ -80,3 +80,26 @@ preserving explicit manual zero. Outcome nevertheless allows local status
 `received` alone to set `confirmed` through `order_received`, even when line
 execution and total remain null. No A08 runtime or test changes are included;
 it requires its own subsequent CLAIM/PR.
+# Follow-up: atomic plan application
+
+At base501d744, apply committed the new order before saving either plan link.
+A later database failure returned500 but left a persisted orphan order. The
+first commit/refresh is now flush: ID and default batch ID are available, but
+the order, plan status and reciprocal links commit in one transaction. Existing
+request-session close rolls back a failed transaction. No schema change.
+
+Regression uses a temporary SQLite trigger rejecting the plan-link UPDATE in
+the synthetic planner DB, removed in finally. It asserts the injected500,
+unchanged order count and original plan record, then retries after removing
+the trigger and verifies exactly one order, both links and the returned batch
+ID. The expected500 uses a separate HTTP client because Uvicorn closes that
+connection; the initial run reproduced the orphan but stopped during cleanup
+on a reset connection, and is not the completed RED result.
+
+- Completed RED: planner354 OK/1 FAIL, /private/tmp/plan-atomicity-red-complete.log.
+- GREEN: planner355 OK/0 FAIL, /private/tmp/plan-atomicity-green.log.
+- Mock writeback compatibility:140 OK/0 FAIL, /private/tmp/plan-atomicity-writeback.log.
+
+No concurrent requests were tested; this package does not claim to solve
+concurrent double application. No production writes, full strict CI,
+independent approval or publication. Rollback restores the two-commit risk.

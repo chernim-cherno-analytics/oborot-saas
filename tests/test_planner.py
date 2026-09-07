@@ -928,9 +928,42 @@ def api_checks() -> None:
         if legacy.status_code == 200 and legacy.json().get("order_id"):
             c.delete(f"/api/orders/{legacy.json()['order_id']}")
         _sql("UPDATE order_plans SET result_json=? WHERE id=?", original_result, saved["id"])
+        before_atomic = {r[0] for r in _sql("SELECT id FROM production_orders")}
+        _sql("CREATE TRIGGER test_reject_plan_link BEFORE UPDATE OF production_order_id "
+             "ON order_plans WHEN NEW.production_order_id IS NOT NULL "
+             "BEGIN SELECT RAISE(ABORT, 'test plan link failure'); END")
+        try:
+            # The expected unhandled DB error closes its HTTP connection.
+            # Isolate that connection from the remaining scenario requests.
+            with httpx.Client(base_url=base, cookies=c.cookies,
+                              headers={"X-Oborot-CSRF": "1"}, timeout=60) as failing_client:
+                failed_apply = failing_client.post(f"/api/order-plan/{saved['id']}/apply",
+                                      json={"name": "Проверка отката", "force": True})
+            after_atomic = {r[0] for r in _sql("SELECT id FROM production_orders")}
+            check("сбой записи связи плана действительно воспроизведён",
+                  failed_apply.status_code == 500, str(failed_apply.status_code))
+            check("ошибка применения плана не оставляет осиротевший заказ",
+                  after_atomic == before_atomic,
+                  str(sorted(after_atomic - before_atomic)))
+            check("ошибка применения сохраняет исходное решение плана",
+                  _sql("SELECT status, production_order_id, result_json FROM order_plans WHERE id=?",
+                       saved["id"])[0] == ("draft", None, original_result))
+        finally:
+            _sql("DROP TRIGGER test_reject_plan_link")
+            # Clean up only a reproduced baseline orphan, so later checks
+            # continue to test their original scenarios on the RED run.
+            for orphan_id in {r[0] for r in _sql("SELECT id FROM production_orders")} - before_atomic:
+                c.delete(f"/api/orders/{orphan_id}")
         applied = c.post(f"/api/order-plan/{saved['id']}/apply", json={"name": "Осень 2026"})
         check("план превращается в заказ на производство",
               applied.status_code == 200 and applied.json().get("order_id"))
+        check("повтор после сбоя сохраняет один заказ с обеими связями и ID партии",
+              _sql("SELECT COUNT(*) FROM production_orders")[0][0] == len(before_atomic) + 1
+              and _sql("SELECT p.production_order_id, o.order_plan_id, o.cc_batch_id "
+                       "FROM order_plans p JOIN production_orders o ON o.id=p.production_order_id "
+                       "WHERE p.id=?", saved["id"])[0]
+              == (applied.json()["order_id"], saved["id"], applied.json()["cc_batch_id"])
+              and bool(applied.json()["cc_batch_id"]))
         again = c.post(f"/api/order-plan/{saved['id']}/apply", json={"name": "Ещё раз"})
         check("повторное применение плана → 409", again.status_code == 409)
         _sql("UPDATE order_plans SET result_json=? WHERE id=?",

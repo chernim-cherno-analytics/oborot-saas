@@ -189,3 +189,15 @@ written on apply. Valid applied orders retain their outcomes. Real API
 delete/create/receipt regression, no schema or monetary changes.
 RESULT: planner351/0 and execution164/0. One-sided legacy links no longer
 provide order or receipt evidence; no historical repair was attempted.
+
+## Completed local CLAIM plan apply atomicity
+
+BRANCH: codex/audit-plan-apply-atomicity. BASE: 501d744.
+FILES: app/api.py (api_order_plan_apply), tests/test_planner.py,
+docs/audit_queue.md, docs/audit_a02_evidence.md.
+DONE_WHEN: a database failure saving the plan/order link leaves no new order;
+retry after the failure creates exactly one order with both links and batch
+ID. Verify using a temporary rejection trigger only in the synthetic test DB.
+No concurrency experiment, schema migration, formulas or production writes.
+RESULT: planner RED354/1, GREEN355/0; mock writeback140/0. The order and
+both links now commit together. No claim about simultaneous apply requests.

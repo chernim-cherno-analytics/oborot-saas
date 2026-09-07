@@ -3128,8 +3128,9 @@ def api_order_plan_apply(
         items_json=json.dumps(items, ensure_ascii=False),
     )
     db.add(order)
-    db.commit()
-    db.refresh(order)
+    # Получаем ID, но не сохраняем заказ отдельно от принятого плана:
+    # ошибка записи любой из связей должна откатить весь результат.
+    db.flush()
     row.production_order_id = order.id
     order.order_plan_id = row.id      # обратная ссылка (D-25)
     row.status = "applied"
