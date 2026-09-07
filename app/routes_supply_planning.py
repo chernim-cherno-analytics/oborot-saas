@@ -536,9 +536,14 @@ async def api_planning_sketch_upload(
             break
         data.extend(chunk)
         if len(data) > limit:
+            # Текст тот же, что у разбора байтов (`sniff_image`), и это не
+            # копия ради копии: до слоя такой файл не доходит вовсе — он
+            # обрывается на чтении потока, — а человек обязан получить один и
+            # тот же ответ на одну и ту же причину (ТЗ F-20, Приложение А).
             raise HTTPException(
                 status_code=400,
-                detail=f"Файл больше {limit // (1024 * 1024)} МБ.")
+                detail=f"Файл больше {limit // (1024 * 1024)} МБ — "
+                       "уменьшите картинку.")
     try:
         row = sp.save_sketch(db, ctx.org.id, bytes(data), _author(ctx))
     except (sp.PlanningError, IntegrityError) as exc:

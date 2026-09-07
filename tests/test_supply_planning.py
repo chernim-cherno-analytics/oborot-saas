@@ -181,6 +181,19 @@ def set_sheets_preview(on: bool, org_id: int | None = None) -> None:
         con.close()
 
 
+#: Русская дата КОРОТКОЙ формой — СВОЯ таблица набора, а не вызов продукта.
+#: Считать ожидание той же функцией, которую проверяешь, значит сверять код с
+#: самим собой: он останется «правильным» при любой ошибке (урок фикстуры
+#: предпросмотра, `DECISIONS.md` D-51).
+_TEST_MONTHS_SHORT = ("янв", "фев", "мар", "апр", "мая", "июн",
+                      "июл", "авг", "сен", "окт", "ноя", "дек")
+
+
+def ru_short_expected(iso: str) -> str:
+    y, m, d = iso.split("-")
+    return f"{int(d)} {_TEST_MONTHS_SHORT[int(m) - 1]} {int(y)}"
+
+
 def sizes_of(payload: dict) -> dict:
     return {m["title"]: (m["qty"], m["assigned"], m["free"]) for m in payload["materials"]}
 
@@ -572,7 +585,9 @@ def run() -> int:
     b_b2 = [b for b in r.json()["batches"] if b["id"] == b_b["id"]][0]
     check("точная дата принята и показана точной",
           b_b2["due_kind"] == "exact" and b_b2["due_date"] == "2026-11-14"
-          and b_b2["due_label"] == "точно 2026-11-14", str(b_b2["due_label"]))
+          # F-18: дата читается по-русски. Прежде здесь стояло «точно
+          # 2026-11-14» — машинный вид, который человек разбирает по цифре.
+          and b_b2["due_label"] == "к 14 ноября 2026", str(b_b2["due_label"]))
     bad_date = owner.post(f"/api/supply/planning/batches/{b_b['id']}/update",
                           json={"due_kind": "exact", "due_date": "14 ноября",
                                 "rev": b_b2["rev"], "op_id": "due-bad"})
@@ -599,9 +614,12 @@ def run() -> int:
     due_events = [r for r in rows if r[2] == "due"]
     qty_events = [r for r in rows if r[0] == "material" and r[2] == "qty"
                   and r[1] == "update"]
+    # F-18: в журнал уходит то же человеческое описание срока, что и на экран,
+    # — теперь с русской датой. Машинного вида здесь больше нет: сравнивать
+    # записи журнала с ISO значило бы ждать формата, которого продукт не пишет.
     check("правка срока записана вместе с прежним значением",
           any(e[3] == "срок неизвестен" for e in due_events)
-          and any("2026-11-14" in (e[4] or "") for e in due_events),
+          and any("14 ноября 2026" in (e[4] or "") for e in due_events),
           str(due_events[:2]))
     check("правка количества записана с прежним значением и автором",
           any(e[3] == "100.0" and e[4] == "90.0" and e[5] for e in qty_events),
@@ -1058,6 +1076,9 @@ def run() -> int:
     supply_fix_2_checks()
     supply_fix_2_migration_checks()
 
+    # ── 22. SUPPLY-FIX-3: единицы, строгий разбор, формат, срок, тексты ──────
+    supply_fix_3_checks()
+
     member.close()
     other.close()
     del_c.close()
@@ -1387,8 +1408,14 @@ def supply_fix_1_checks() -> None:  # noqa: C901 — сценарный блок
     step = past.get("/api/supply/planning").json()["next_step"]
     check("прошедший срок назван следующим шагом",
           step["code"] == "due_past", step["code"])
+    # F-18: дата в подсказке — короткой русской формой, а не ISO. Ожидание
+    # считается СВОЕЙ таблицей набора (`ru_short_expected`), а не функцией
+    # продукта: иначе проверка сверяла бы код сам с собой.
     check("и в тексте стоит сама дата, а не «просрочено»",
-          yesterday in step["text"] and "прошёл" in step["text"], step["text"][:120])
+          ru_short_expected(yesterday) in step["text"]
+          and "прошёл" in step["text"], step["text"][:120])
+    check("а машинного вида даты в подсказке больше нет",
+          yesterday not in step["text"], step["text"][:120])
     past.close()
 
     done = client()
@@ -1906,7 +1933,10 @@ def _fix2_new_batch(c, item_id: int, title: str, op: str, **extra) -> dict:
 def _fix2_material_edit(c, org2: int) -> None:
     """F-13(а): у материала правятся все четыре поля, а не одно количество."""
     print("\n== F-13: название, единица и заметка материала правятся ==")
-    mat = _fix2_new_material(c, "костюмнаЯ шерсь", "f2-m1", qty=300, unit="метры",
+    # Единица фикстуры «кг», а не «метры»: с F-16 «метры» нормализуются ПРИ
+    # ЗАПИСИ и до правки уже стали бы «м» — тогда правка не меняла бы единицу
+    # вовсе, и проверка журнала доказывала бы не то, ради чего написана.
+    mat = _fix2_new_material(c, "костюмнаЯ шерсь", "f2-m1", qty=300, unit="кг",
                              source_note="счёт 11")
     mid, mrev = mat["id"], mat["rev"]
     r = c.post(P2 + f"/materials/{mid}/update",
@@ -1931,7 +1961,7 @@ def _fix2_material_edit(c, org2: int) -> None:
           rows.get("title") == "костюмнаЯ шерсь→костюмная шерсть",
           str(rows.get("title")))
     check("журнал хранит прежнюю единицу и новую (её раньше не журналировали)",
-          rows.get("unit") == "метры→м", str(rows.get("unit")))
+          rows.get("unit") == "кг→м", str(rows.get("unit")))
     stale = c.post(P2 + f"/materials/{mid}/update",
                    json={"title": "поверх чужой правки", "rev": mrev,
                          "op_id": "f2-m3"})
@@ -2662,6 +2692,727 @@ def supply_fix_2_migration_checks() -> None:
         f = Path(str(mig_db) + suffix)
         if f.exists():
             f.unlink()
+
+
+# ── SUPPLY-FIX-3: единицы, строгий разбор, формат, срок, тексты ──────────────
+
+def supply_fix_3_checks() -> None:
+    """SUPPLY-FIX-3 (F-16…F-20) на уровне API.
+
+    КАЖДЫЙ ПУНКТ — ОТДЕЛЬНЫЙ ШАГ СО СВОИМИ ФИКСТУРАМИ, и это не стиль, а урок
+    пакета 2: прогон против `ea1caff` обязан сказать про КАЖДЫЙ пункт, а не
+    умереть на первом же отказе. Непроведённая проверка не бывает ни зелёной,
+    ни красной (D-42).
+
+    ЧТО ЗДЕСЬ ДОКАЗЫВАЕТСЯ, А ЧТО НЕТ. Доказывается поведение по одним и тем же
+    адресам и полям: разошёлся ответ, а не контракт. Не доказывается ничего про
+    экран — это `tests/test_supply_ui.py`, там же и F-21 целиком: сохранность
+    ввода в браузере API-проверкой не показать.
+    """
+    c = client()
+    register(c, "sp-fix3@test.io", "Бренд Фикс Три")
+    con = sqlite3.connect(DB_PATH)
+    try:
+        org3 = con.execute("SELECT id FROM orgs WHERE name = ?",
+                           ("Бренд Фикс Три",)).fetchone()[0]
+    finally:
+        con.close()
+
+    steps = (
+        ("F-16 группировка", _fix3_unit_grouping),
+        ("F-16 нормализация", lambda: _fix3_unit_normalize(c, org3)),
+        # РАЗБИТО НА МЕЛКИЕ ШАГИ НЕ ДЛЯ КРАСОТЫ. Против дерева без правки
+        # переполнение отвечает 500, а 500 рвёт соединение — и всё, что стояло
+        # в том же шаге ниже, не исполняется вовсе. Непроведённая проверка не
+        # бывает ни зелёной, ни красной (D-42), поэтому каждый пункт (а)–(д)
+        # отвечает за себя сам.
+        ("F-17 план целым", lambda: _fix3_plan_integer(c)),
+        ("F-17 переполнение", lambda: _fix3_overflow(c)),
+        ("F-17 мелочь", lambda: _fix3_tiny_qty(c)),
+        ("F-17 бесконечность", lambda: _fix3_infinity(c)),
+        ("F-17 даты и id", lambda: _fix3_strict_dates(c)),
+        ("F-18 дата", lambda: _fix3_date_label(c)),
+        ("F-18 прошедший срок", lambda: _fix3_due_past(c)),
+        ("F-18 запятая", lambda: _fix3_comma(c)),
+        ("F-19 частичный срок", lambda: _fix3_partial_due(c)),
+        ("F-20 тексты", lambda: _fix3_texts(c)),
+        # Корректив 2 по REVIEW_REJECT round 2: воспроизведённые P1 внешних
+        # тредов. Отдельными шагами по той же причине, что и всё выше: один
+        # 500 не должен уносить с собой соседние проверки.
+        ("P1 пустая единица", lambda: _fix3_empty_unit(c)),
+        ("P1 длинное число", lambda: _fix3_long_digits(c)),
+    )
+    for label, run_step in steps:
+        try:
+            run_step()
+        except Exception as exc:  # noqa: BLE001 — важен отчёт, а не тип
+            check(f"{label}: шаг дошёл до конца без исключения", False,
+                  f"{type(exc).__name__}: "
+                  f"{str(exc).strip().splitlines()[0][:200]}")
+    c.close()
+
+
+def _fix3_fresh(c) -> httpx.Client:
+    """Отдельное соединение той же сессии.
+
+    Зачем: на дереве без правки проверяемое здесь переполнение отвечает 500, а
+    500 рвёт keep-alive — и СЛЕДУЮЩИЙ запрос того же клиента падает `ReadError`
+    ещё до сервера. Тогда красным оказывался бы не продукт, а соседняя
+    проверка, которая до сервера не доехала. Свежий клиент разводит их: сессия
+    та же, соединение своё.
+    """
+    own = client()
+    own.cookies.update(c.cookies)
+    return own
+
+
+def _fix3_new_item(c, title: str, op: str) -> int:
+    board = c.post(P2 + "/items",
+                   json={"kind": "draft", "title": title, "op_id": op}).json()
+    return [i for i in board["items"] if i["title"] == title][0]["id"]
+
+
+def _fix3_unit_grouping() -> None:
+    """F-16: пять написаний одной единицы — одна корзина.
+
+    Проверяется САМА функция сводки, а не экран: КП ТЗ назван юнит-тестом
+    `group_by_unit`, и он же — самая узкая точка, где «пять корзин» видно без
+    посредников.
+    """
+    print("\n== F-16: «м», «м.», «М», «метры», «m» — одна корзина ==")
+    buckets = sp.group_by_unit([("м", 1), ("м.", 2), ("М", 3),
+                                ("метры", 4), ("m", 5)])
+    check("пять написаний метра дают ОДНУ корзину",
+          len(buckets) == 1, str(buckets))
+    check("и в ней сумма всех пяти, а не последнего",
+          bool(buckets) and buckets[0]["qty"] == 15.0, str(buckets))
+    check("подпись корзины — каноническая «м»",
+          bool(buckets) and buckets[0]["unit"] == "м", str(buckets))
+    mixed = sp.group_by_unit([("м", 10), ("кг", 4), ("ярд", 2)])
+    check("а незнакомая единица своей корзины не теряет",
+          len(mixed) == 3 and {b["unit"] for b in mixed} == {"м", "кг", "ярд"},
+          str(mixed))
+    check("килограммы с метрами по-прежнему НЕ складываются",
+          all(b["qty"] != 14.0 for b in mixed), str(mixed))
+
+
+def _fix3_unit_normalize(c, org3: int) -> None:
+    """F-16: единица нормализуется при ЗАПИСИ и только при ней."""
+    print("\n== F-16: «метры» при сохранении становятся «м», старое не трогаем ==")
+    board = c.post(P2 + "/materials",
+                   json={"title": "Шерсть-3", "qty": "100", "unit": "метры",
+                         "op_id": "f3-u1"}).json()
+    saved = [m for m in board["materials"] if m["title"] == "Шерсть-3"]
+    check("материал с единицей «метры» сохранён", bool(saved), str(board)[:160])
+    check("а единица записана канонически — «м»",
+          bool(saved) and saved[0]["unit"] == "м",
+          saved[0]["unit"] if saved else "нет строки")
+
+    board = c.post(P2 + "/materials",
+                   json={"title": "Лента-3", "qty": "5", "unit": "Ярд",
+                         "op_id": "f3-u2"}).json()
+    own = [m for m in board["materials"] if m["title"] == "Лента-3"]
+    check("своя единица человека остаётся как написана",
+          bool(own) and own[0]["unit"] == "Ярд",
+          own[0]["unit"] if own else "нет строки")
+
+    # СТАРАЯ СТРОКА НЕ ПЕРЕПИСЫВАЕТСЯ. Она кладётся прямо в базу — так же, как
+    # её оставил бы прежний код, — и проверяется, что после чтения доски в
+    # НОСИТЕЛЕ по-прежнему «метры»: миграции, переписывающей единицы, в пакете
+    # нет вовсе, и появиться она здесь не должна ни от чтения, ни от соседней
+    # записи.
+    con = sqlite3.connect(DB_PATH)
+    try:
+        con.execute(
+            "INSERT INTO supply_materials (org_id, title, qty, unit, source_note,"
+            " author, rev, created_at, updated_at)"
+            " VALUES (?, 'Старая ткань', 40, 'метры', '', 'до пакета', 1,"
+            " CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)", (org3,))
+        con.commit()
+        old_id = con.execute(
+            "SELECT id FROM supply_materials WHERE org_id=? AND title='Старая ткань'",
+            (org3,)).fetchone()[0]
+    finally:
+        con.close()
+    board = c.get(P2).json()
+    old_view = [m for m in board["materials"] if m["title"] == "Старая ткань"]
+    check("старая строка показана как записана — «метры»",
+          bool(old_view) and old_view[0]["unit"] == "метры",
+          old_view[0]["unit"] if old_view else "нет строки")
+    units = {b["unit"] for b in board["summary"]["free_by_unit"]}
+    check("но в сводке она сложена ВМЕСТЕ с «м», а не отдельной корзиной",
+          "метры" not in units and "м" in units, str(board["summary"]["free_by_unit"]))
+
+    con = sqlite3.connect(DB_PATH)
+    try:
+        stored = con.execute("SELECT unit FROM supply_materials WHERE id=?",
+                             (old_id,)).fetchone()[0]
+    finally:
+        con.close()
+    check("и в самой базе она не переписана ни чтением, ни соседней записью",
+          stored == "метры", str(stored))
+
+    upd = c.post(P2 + f"/materials/{old_id}/update",
+                 json={"unit": "метры", "rev": old_view[0]["rev"] if old_view else 1,
+                       "op_id": "f3-u3"})
+    check("правка той же строки нормализует её единицу", upd.status_code == 200,
+          upd.text[:160])
+    con = sqlite3.connect(DB_PATH)
+    try:
+        after = con.execute("SELECT unit FROM supply_materials WHERE id=?",
+                            (old_id,)).fetchone()[0]
+    finally:
+        con.close()
+    check("после правки в базе стоит «м»", after == "м", str(after))
+
+
+def _fix3_plan_integer(c) -> None:
+    """F-17а: план изделий — только целое число штук."""
+    print("\n== F-17а: «1,5 пиджака» — это опечатка, а не количество ==")
+    item = _fix3_new_item(c, "Пальто-3", "f3-n-i")
+    frac = c.post(P2 + "/batches",
+                  json={"item_id": item, "title": "Дробный план",
+                        "plan_qty": "1.5", "op_id": "f3-n1"})
+    check("план изделий дробным не принимается", frac.status_code == 400,
+          f"{frac.status_code}: {frac.text[:120]}")
+    check("и отказ говорит про целое число штук",
+          "целое число штук" in frac.text, frac.text[:160])
+    whole = c.post(P2 + "/batches",
+                   json={"item_id": item, "title": "Целый план",
+                         "plan_qty": "30", "op_id": "f3-n2"})
+    check("а целый план по-прежнему принимается", whole.status_code == 200,
+          f"{whole.status_code}: {whole.text[:120]}")
+    saved = [b for b in whole.json().get("batches", []) if b["title"] == "Целый план"]
+    check("и хранится числом без дробной части",
+          bool(saved) and float(saved[0]["plan_qty"]) == 30.0,
+          str(saved[0]["plan_qty"]) if saved else "нет строки")
+    empty = c.post(P2 + "/batches",
+                   json={"item_id": item, "title": "Без плана", "plan_qty": "",
+                         "op_id": "f3-n2b"})
+    check("а пустой план по-прежнему означает «неизвестно», а не ноль",
+          empty.status_code == 200
+          and any(b["title"] == "Без плана" and b["plan_qty"] is None
+                  for b in empty.json().get("batches", [])),
+          f"{empty.status_code}: {empty.text[:120]}")
+
+
+def _fix3_overflow(c) -> None:
+    """F-17б: число, не помещающееся в `float`, — это 400, а не 500.
+
+    ОТДЕЛЬНЫЙ ШАГ, потому что на дереве без правки здесь отвечает 500, а 500
+    рвёт соединение: всё, что стояло бы ниже в том же шаге, не исполнилось бы
+    вовсе и выглядело бы «непроверенным», а не «красным».
+    """
+    print("\n== F-17б: 400 цифр в теле — управляемый отказ, а не 500 ==")
+    huge = int("9" * 400)
+    own = _fix3_fresh(c)
+    try:
+        big = own.post(P2 + "/materials",
+                       json={"title": "Огромное", "qty": huge, "op_id": "f3-n3"})
+    finally:
+        own.close()
+    check("JSON-число из 400 цифр даёт 400, а не 500", big.status_code == 400,
+          f"{big.status_code}: {big.text[:120]}")
+    check("и текст отказа русский, а не пустой отказ сервера",
+          "число" in big.text, big.text[:160])
+
+
+def _fix3_tiny_qty(c) -> None:
+    """F-17г: ненулевой ввод, который округлится в ноль, не сохраняется."""
+    print("\n== F-17г: 0,0004 не превращается в «ничего нет» ==")
+    for label, value in (("строка из 400 цифр", "9" * 400), ("1e309", "1e309")):
+        r = c.post(P2 + "/materials",
+                   json={"title": "Огромное-" + label, "qty": value,
+                         "op_id": "f3-n-" + label[:6]})
+        check(f"{label} тоже даёт управляемый 400", r.status_code == 400,
+              f"{r.status_code}: {r.text[:120]}")
+    tiny = c.post(P2 + "/materials",
+                  json={"title": "Крошка", "qty": "0.0004", "op_id": "f3-n4"})
+    check("ненулевое количество, которое округлится в ноль, не сохраняется",
+          tiny.status_code == 400, f"{tiny.status_code}: {tiny.text[:120]}")
+    check("и отказ называет минимум по-русски",
+          "0,001" in tiny.text, tiny.text[:160])
+    zero = c.post(P2 + "/materials",
+                  json={"title": "Явный ноль", "qty": "0", "op_id": "f3-n5"})
+    check("а ЯВНО написанный ноль по-прежнему принимается: у него другой смысл",
+          zero.status_code == 200, f"{zero.status_code}: {zero.text[:120]}")
+
+
+def _fix3_infinity(c) -> None:
+    """F-17б: бесконечность приходит законным JSON-числом и тоже даёт 400.
+
+    ТЕЛО СОБИРАЕТСЯ РУКАМИ, А НЕ `json=`. Бесконечность через `json=` не
+    проходит вовсе — сериализатор клиента откажется её писать, — а вот разбор
+    на СЕРВЕРЕ её принимает: `1e999` в теле становится `inf`. Значит, прислать
+    такое человеку ничто не мешает.
+    """
+    print("\n== F-17б: `1e999` в теле — тоже управляемый отказ ==")
+    item = _fix3_new_item(c, "Ревизия-3", "f3-n6i")
+    made = c.post(P2 + "/batches",
+                  json={"item_id": item, "title": "Ревизия", "op_id": "f3-n6"})
+    bid = [b for b in made.json().get("batches", []) if b["title"] == "Ревизия"]
+    check("партия для проверки редакции заведена", bool(bid),
+          f"{made.status_code}: {made.text[:120]}")
+    if not bid:
+        return
+    json_ct = {"Content-Type": "application/json"}
+    # Каждая проба — своим соединением: на дереве без правки любая из трёх
+    # отвечает 500 и рвёт keep-alive, а следующая тогда падала бы клиентской
+    # ошибкой вместо честного ответа сервера.
+    probes = (
+        ("бесконечная редакция даёт 400, а не 500",
+         P2 + f"/batches/{bid[0]['id']}/update",
+         '{"title": "Другая", "rev": 1e999, "op_id": "f3-n7"}'),
+        ("бесконечное количество числом тоже даёт 400, а не 500",
+         P2 + "/materials",
+         '{"title": "Бесконечность", "qty": 1e999, "op_id": "f3-n8"}'),
+        ("бесконечный идентификатор тоже даёт 400, а не 500",
+         P2 + "/batches",
+         '{"item_id": 1e999, "title": "Б", "op_id": "f3-n9"}'),
+    )
+    for name, url, body in probes:
+        own = _fix3_fresh(c)
+        try:
+            r = own.post(url, headers=json_ct, content=body)
+            status, text = r.status_code, r.text[:120]
+        except Exception as exc:  # noqa: BLE001 — отказ соединения тоже результат
+            status, text = -1, f"{type(exc).__name__}: {exc}"
+        finally:
+            own.close()
+        check(name, status == 400, f"{status}: {text}")
+
+
+def _fix3_strict_dates(c) -> None:
+    """F-17 (в, д): дата строго ГГГГ-ММ-ДД, идентификатор — только целый."""
+    print("\n== F-17: «20260101» и «1.9» больше не проходят ==")
+    item = _fix3_new_item(c, "Юбка-3", "f3-d-i")
+
+    compact = c.post(P2 + "/batches",
+                     json={"item_id": item, "title": "Компактная дата",
+                           "due_kind": "exact", "due_date": "20260101",
+                           "op_id": "f3-d1"})
+    check("дата без разделителей не принимается", compact.status_code == 400,
+          f"{compact.status_code}: {compact.text[:120]}")
+    check("и отказ показывает нужный вид даты",
+          "ГГГГ-ММ-ДД" in compact.text, compact.text[:160])
+
+    good = c.post(P2 + "/batches",
+                  json={"item_id": item, "title": "Обычная дата",
+                        "due_kind": "exact", "due_date": "2026-01-01",
+                        "op_id": "f3-d2"})
+    check("а обычная дата принимается", good.status_code == 200,
+          f"{good.status_code}: {good.text[:120]}")
+
+    frac_id = c.post(P2 + "/batches",
+                     json={"item_id": 1.9, "title": "Дробный id",
+                           "op_id": "f3-d3"})
+    check("дробный идентификатор вещи не превращается молча в целый",
+          frac_id.status_code == 400,
+          f"{frac_id.status_code}: {frac_id.text[:120]}")
+    check("и отказ предлагает выбрать модель",
+          "Выберите модель" in frac_id.text, frac_id.text[:160])
+
+
+def _fix3_date_label(c) -> None:
+    """F-18: дата на подписи срока читается по-русски, а в данных не меняется."""
+    print("\n== F-18: «к 1 августа 2026» вместо «точно 2026-08-01» ==")
+    item = _fix3_new_item(c, "Плащ-3", "f3-f-i")
+    board = c.post(P2 + "/batches",
+                   json={"item_id": item, "title": "Августовская",
+                         "due_kind": "exact", "due_date": "2026-08-01",
+                         "plan_qty": "12", "op_id": "f3-f1"}).json()
+    row = [b for b in board.get("batches", []) if b["title"] == "Августовская"]
+    check("срок показан по-русски словами месяца",
+          bool(row) and row[0]["due_label"] == "к 1 августа 2026",
+          row[0]["due_label"] if row else "нет строки")
+    check("а машинного «точно 2026-08-01» в подписи больше нет",
+          bool(row) and "2026-08-01" not in row[0]["due_label"],
+          row[0]["due_label"] if row else "нет строки")
+    check("сама дата в данных не изменилась ни на символ",
+          bool(row) and row[0]["due_date"] == "2026-08-01",
+          row[0]["due_date"] if row else "нет строки")
+
+
+def _fix3_due_past(c) -> None:
+    """F-18: прошедший ТОЧНЫЙ срок помечен признаком показа, и только он."""
+    print("\n== F-18: «уже прошла» — признак показа, а не состояние строки ==")
+    item = _fix3_new_item(c, "Юбка-прошлое", "f3-f2i")
+    yesterday = (date.today() - timedelta(days=1)).isoformat()
+    tomorrow = (date.today() + timedelta(days=1)).isoformat()
+    c.post(P2 + "/batches",
+           json={"item_id": item, "title": "Вчерашняя-3", "due_kind": "exact",
+                 "due_date": yesterday, "op_id": "f3-f2"})
+    c.post(P2 + "/batches",
+           json={"item_id": item, "title": "Ориентир-3", "due_kind": "approx",
+                 "due_text": "к ноябрю", "op_id": "f3-f2a"})
+    board = c.post(P2 + "/batches",
+                   json={"item_id": item, "title": "Завтрашняя-3",
+                         "due_kind": "exact", "due_date": tomorrow,
+                         "op_id": "f3-f3"}).json()
+    by_title = {b["title"]: b for b in board.get("batches", [])}
+    check("прошедший точный срок помечен признаком показа",
+          by_title.get("Вчерашняя-3", {}).get("due_past") is True,
+          str(by_title.get("Вчерашняя-3", {}).get("due_past")))
+    check("будущий — не помечен",
+          by_title.get("Завтрашняя-3", {}).get("due_past") is False,
+          str(by_title.get("Завтрашняя-3", {}).get("due_past")))
+    check("а ориентировочный срок в просроченные не записывается вовсе",
+          by_title.get("Ориентир-3", {}).get("due_past") is False,
+          str(by_title.get("Ориентир-3", {}).get("due_past")))
+    check("и сама дата прошедшей партии в данных не тронута",
+          by_title.get("Вчерашняя-3", {}).get("due_date") == yesterday,
+          str(by_title.get("Вчерашняя-3", {}).get("due_date")))
+
+
+def _fix3_comma(c) -> None:
+    """F-18: число, которое сервер печатает человеку, пишется с запятой.
+
+    Проверяется ТЕКСТ ОТКАЗА, потому что это единственное место, где сервер сам
+    печатает число: в теле ответа числа остаются числами, и форматирует их
+    экран.
+    """
+    print("\n== F-18: «10,5», а не «10.5», там где число печатает сервер ==")
+    item = _fix3_new_item(c, "Кардиган-3", "f3-f4i")
+    board = c.post(P2 + "/batches",
+                   json={"item_id": item, "title": "Первая-запятая",
+                         "op_id": "f3-f4b1"}).json()
+    board = c.post(P2 + "/batches",
+                   json={"item_id": item, "title": "Вторая-запятая",
+                         "op_id": "f3-f4b2"}).json()
+    by_title = {b["title"]: b for b in board.get("batches", [])}
+    b1 = by_title["Первая-запятая"]["id"]
+    b2 = by_title["Вторая-запятая"]["id"]
+    mat = c.post(P2 + "/materials",
+                 json={"title": "Фурнитура-3", "qty": "10.5", "unit": "кг",
+                       "op_id": "f3-f4"}).json()
+    mid = [m for m in mat["materials"] if m["title"] == "Фурнитура-3"][0]["id"]
+    c.post(P2 + "/assignments", json={"material_id": mid, "batch_id": b1,
+                                      "qty": "10.5", "op_id": "f3-f5"})
+    aid = None
+    for b in c.get(P2).json()["batches"]:
+        if b["id"] != b1:
+            continue
+        for a in b["assignments"]:
+            if a["material_id"] == mid:
+                aid = a["id"]
+    check("назначение для проверки заведено", aid is not None,
+          "" if aid else "назначения нет")
+    if aid is None:
+        return
+    moved = c.post(P2 + "/assignments/move",
+                   json={"assignment_id": aid, "to_batch_id": b2, "qty": "20",
+                         "op_id": "f3-f6"})
+    check("перенос сверх назначенного отвергнут", moved.status_code == 400,
+          f"{moved.status_code}: {moved.text[:120]}")
+    check("и число в отказе написано с запятой, а не с точкой",
+          "10,5" in moved.text and "10.5" not in moved.text, moved.text[:200])
+
+
+def _fix3_partial_due(c) -> None:
+    """F-19: правка одного источника срока не сбрасывает сам срок."""
+    print("\n== F-19: {due_source} у точной даты больше не стирает дату ==")
+    item = _fix3_new_item(c, "Жакет-3", "f3-p-i")
+    board = c.post(P2 + "/batches",
+                   json={"item_id": item, "title": "Срочная",
+                         "due_kind": "exact", "due_date": "2026-10-31",
+                         "due_source": "свой расчёт", "op_id": "f3-p1"}).json()
+    row = [b for b in board["batches"] if b["title"] == "Срочная"][0]
+    upd = c.post(P2 + f"/batches/{row['id']}/update",
+                 json={"due_source": "цех", "rev": row["rev"], "op_id": "f3-p2"})
+    check("правка одного источника принята", upd.status_code == 200,
+          f"{upd.status_code}: {upd.text[:160]}")
+    after = [b for b in upd.json().get("batches", []) if b["id"] == row["id"]]
+    check("вид срока не изменился",
+          bool(after) and after[0]["due_kind"] == "exact",
+          after[0]["due_kind"] if after else "нет строки")
+    check("дата на месте, а не стёрта",
+          bool(after) and after[0]["due_date"] == "2026-10-31",
+          after[0]["due_date"] if after else "нет строки")
+    check("а источник обновлён",
+          bool(after) and after[0]["due_source"] == "цех",
+          after[0]["due_source"] if after else "нет строки")
+
+    # СМЕНА ВИДА СРОКА ПО-ПРЕЖНЕМУ СНИМАЕТ ЛИШНЕЕ. Дата, унаследованная из
+    # строки, при переходе в «срок неизвестен» не нужна по определению — и
+    # отказывать за значение, которого человек в этой отправке не присылал,
+    # значило бы требовать убрать то, чего он не писал.
+    rev2 = after[0]["rev"] if after else row["rev"]
+    off = c.post(P2 + f"/batches/{row['id']}/update",
+                 json={"due_kind": "unknown", "rev": rev2, "op_id": "f3-p3"})
+    check("переход в «срок неизвестен» проходит без отказа",
+          off.status_code == 200, f"{off.status_code}: {off.text[:160]}")
+    gone = [b for b in off.json().get("batches", []) if b["id"] == row["id"]]
+    check("и дата при этом снята",
+          bool(gone) and gone[0]["due_date"] == "" and gone[0]["due_kind"] == "unknown",
+          str(gone[0]["due_date"]) if gone else "нет строки")
+
+    # ЯВНОЕ ПРОТИВОРЕЧИЕ ОСТАЁТСЯ ОТКАЗОМ (D-55 п. 1): человек прислал поле,
+    # которого этот вид срока не использует, и узнать об этом он должен сразу.
+    rev3 = gone[0]["rev"] if gone else rev2
+    clash = c.post(P2 + f"/batches/{row['id']}/update",
+                   json={"due_kind": "unknown", "due_date": "2026-12-01",
+                         "rev": rev3, "op_id": "f3-p4"})
+    check("а присланная явно дата у «срок неизвестен» по-прежнему 400",
+          clash.status_code == 400, f"{clash.status_code}: {clash.text[:120]}")
+
+
+def _fix3_texts(c) -> None:
+    """F-20: тексты отказов — по таблице Приложения А, строка за строкой."""
+    print("\n== F-20: каждый отказ проверяется своим текстом ==")
+    item = _fix3_new_item(c, "Рубашка-3", "f3-t-i")
+    board = c.post(P2 + "/batches",
+                   json={"item_id": item, "title": "Текстовая", "op_id": "f3-t-b"}).json()
+    bid = [b for b in board["batches"] if b["title"] == "Текстовая"][0]["id"]
+    board = c.post(P2 + "/batches",
+                   json={"item_id": item, "title": "Вторая текстовая",
+                         "op_id": "f3-t-b2"}).json()
+    bid2 = [b for b in board["batches"] if b["title"] == "Вторая текстовая"][0]["id"]
+    mat = c.post(P2 + "/materials",
+                 json={"title": "Ткань-текст", "qty": "25", "op_id": "f3-t-m"}).json()
+    mid = [m for m in mat["materials"] if m["title"] == "Ткань-текст"][0]["id"]
+    c.post(P2 + "/assignments", json={"material_id": mid, "batch_id": bid,
+                                      "qty": "25", "op_id": "f3-t-a"})
+    aid = None
+    for b in c.get(P2).json()["batches"]:
+        for a in b["assignments"]:
+            if b["id"] == bid and a["material_id"] == mid:
+                aid = a["id"]
+
+    cases = [
+        ("название без текста", P2 + "/materials",
+         {"title": "", "op_id": "f3-t1"}, "Укажите название."),
+        ("нечисловое количество", P2 + "/materials",
+         {"title": "Т", "qty": "abc", "op_id": "f3-t2"},
+         "Количество: «abc» — это не число."),
+        ("бесконечное количество", P2 + "/materials",
+         {"title": "Т", "qty": "1e309", "op_id": "f3-t3"},
+         "Количество не читается как число."),
+        ("отрицательное количество", P2 + "/materials",
+         {"title": "Т", "qty": "-5", "op_id": "f3-t4"},
+         "Количество не может быть меньше нуля."),
+        ("количество сверх предела", P2 + "/materials",
+         {"title": "Т", "qty": "2000000", "op_id": "f3-t5"},
+         "Максимум — 1\u00a0000\u00a0000."),
+        ("вещь не выбрана", P2 + "/batches",
+         {"title": "Б", "op_id": "f3-t6"}, "Выберите модель."),
+        ("точный срок без даты", P2 + "/batches",
+         {"item_id": item, "due_kind": "exact", "op_id": "f3-t7"},
+         "Укажите дату."),
+        ("ориентировочный срок без текста", P2 + "/batches",
+         {"item_id": item, "due_kind": "approx", "op_id": "f3-t8"},
+         "Напишите срок словами."),
+        ("назначение нулём", P2 + "/assignments",
+         {"material_id": mid, "batch_id": bid, "qty": "0", "op_id": "f3-t9"},
+         "Укажите количество больше нуля."),
+        ("перенос сверх назначенного", P2 + "/assignments/move",
+         {"assignment_id": aid, "to_batch_id": bid2, "qty": "40",
+          "op_id": "f3-t10"},
+         "На этой партии только 25 — больше перенести нельзя."),
+        ("перенос на ту же партию", P2 + "/assignments/move",
+         {"assignment_id": aid, "to_batch_id": bid, "qty": "5",
+          "op_id": "f3-t11"},
+         "Выберите другую партию."),
+        ("негодная редакция", P2 + f"/batches/{bid}/update",
+         {"title": "Другая", "rev": "abc", "op_id": "f3-t12"},
+         "Обновите страницу — данные устарели."),
+    ]
+    for label, url, body, expect in cases:
+        r = c.post(url, json=body)
+        detail = ""
+        try:
+            detail = r.json().get("detail", "")
+        except ValueError:
+            detail = r.text
+        check(f"{label}: отказ управляемый", r.status_code in (400, 409),
+              f"{r.status_code}: {r.text[:120]}")
+        check(f"{label}: текст по Приложению А", detail == expect,
+              f"ожидалось {expect!r}, пришло {detail!r}")
+
+    # Картинка и файл — отдельно: у них своя дверь (multipart), и текст обязан
+    # совпадать с тем, что человек видит при обычной ошибке.
+    wide = c.post(P2 + "/sketches",
+                  files={"file": ("w.png", make_png(5000, 2), "image/png")})
+    detail = wide.json().get("detail", "") if wide.status_code != 200 else ""
+    check("слишком широкая картинка: отказ управляемый", wide.status_code == 400,
+          f"{wide.status_code}: {wide.text[:120]}")
+    check("слишком широкая картинка: текст по Приложению А",
+          detail == "Картинка не больше 4096×4096 пикселей.", repr(detail))
+
+    heavy = c.post(P2 + "/sketches",
+                   files={"file": ("h.png", b"\x89PNG\r\n\x1a\n" + b"0" * (2 * 1024 * 1024 + 16),
+                                   "image/png")})
+    detail = heavy.json().get("detail", "") if heavy.status_code != 200 else ""
+    check("слишком тяжёлый файл: отказ управляемый", heavy.status_code == 400,
+          f"{heavy.status_code}: {heavy.text[:120]}")
+    check("слишком тяжёлый файл: текст по Приложению А",
+          detail == "Файл больше 2 МБ — уменьшите картинку.", repr(detail))
+
+    # СЛУЖЕБНЫХ СЛОВ В ОТВЕТАХ БОЛЬШЕ НЕТ НИ ОДНОГО. Проверяется не «где-то
+    # исчезло», а сам список из ТЗ: имена полей в кавычках, «конечным числом» и
+    # «Редакция должна» — это наш словарь, а не человеческий.
+    banned = ("Поле «", "конечным числом", "Редакция должна",
+              "Не выбрано:", "Неверно указано:")
+    seen = []
+    for url, body in ((P2 + "/materials", {"title": "", "op_id": "f3-t20"}),
+                      (P2 + "/materials", {"title": "Т", "qty": True, "op_id": "f3-t21"}),
+                      (P2 + "/batches", {"item_id": "нет", "op_id": "f3-t22"}),
+                      (P2 + f"/batches/{bid}/update",
+                       {"title": "X", "rev": "нет", "op_id": "f3-t23"})):
+        r = c.post(url, json=body)
+        try:
+            seen.append(r.json().get("detail", ""))
+        except ValueError:
+            seen.append(r.text)
+    check("ни один отказ не говорит служебными словами",
+          not any(word in text for text in seen for word in banned),
+          str(seen)[:300])
+
+    # И один дисклеймер: тот же текст, что на вкладке плана.
+    board = c.get(P2).json()
+    check("подпись раздела — одна утверждённая фраза",
+          board.get("disclaimer") == "Это план: заказы, «Едет» и бюджет он не меняет.",
+          repr(board.get("disclaimer")))
+
+
+def _fix3_empty_unit(c) -> None:
+    """P1 (тред r3948822957): пустая своя единица молча подменяла величину.
+
+    ЧТО ЗДЕСЬ ДОКАЗЫВАЕТСЯ ДВУМЯ РАЗНЫМИ СПОСОБАМИ. Что новое правило работает —
+    отказом и неизменной строкой. И что оно НЕ съело существующий контракт
+    ручки: пропущенный ключ `unit` при создании по-прежнему даёт «м», а при
+    правке не трогает единицу вовсе. Второе важнее первого: правило, закрывшее
+    дефект и сломавшее соседний договор, — не исправление.
+    """
+    print("\n== P1: «другое» без своей единицы больше не превращает кг в м ==")
+    mat = c.post(P2 + "/materials",
+                 json={"title": "Фурнитура-пустая", "qty": "10", "unit": "кг",
+                       "op_id": "c2-u1"}).json()
+    row = [m for m in mat["materials"] if m["title"] == "Фурнитура-пустая"][0]
+
+    empty = c.post(P2 + f"/materials/{row['id']}/update",
+                   json={"unit": "", "rev": row["rev"], "op_id": "c2-u2"})
+    check("явно пустая единица при правке отвергнута", empty.status_code == 400,
+          f"{empty.status_code}: {empty.text[:120]}")
+    check("и отказ называет, чего не хватает",
+          "Укажите единицу." in empty.text, empty.text[:160])
+    after = [m for m in c.get(P2).json()["materials"] if m["id"] == row["id"]][0]
+    check("а единица в строке НЕ подменена: килограммы остались килограммами",
+          after["unit"] == "кг", after["unit"])
+    check("и редакция строки не сдвинулась — записи не было",
+          after["rev"] == row["rev"], f"{row['rev']} → {after['rev']}")
+
+    # Своя строка и здесь: иначе на дереве без правки проба упёрлась бы в `rev`,
+    # сдвинутый молчаливой записью выше, и покраснела бы не своим цветом.
+    blank = _fix2_new_material(c, "Килограммы-пробелы", "c2-u3a", qty=10, unit="кг")
+    spaces = c.post(P2 + f"/materials/{blank['id']}/update",
+                    json={"unit": "   ", "rev": blank["rev"], "op_id": "c2-u3"})
+    check("одни пробелы — тот же отказ, а не «своя единица из пробелов»",
+          spaces.status_code == 400, f"{spaces.status_code}: {spaces.text[:120]}")
+    blank_after = [m for m in c.get(P2).json()["materials"] if m["id"] == blank["id"]]
+    check("и величина от пробелов тоже не подменилась",
+          bool(blank_after) and blank_after[0]["unit"] == "кг",
+          blank_after[0]["unit"] if blank_after else "нет строки")
+
+    born = c.post(P2 + "/materials",
+                  json={"title": "Создание с пустой", "qty": "5", "unit": "",
+                        "op_id": "c2-u4"})
+    check("тот же жест при СОЗДАНИИ тоже отвергнут", born.status_code == 400,
+          f"{born.status_code}: {born.text[:120]}")
+    born_rows = [m for m in c.get(P2).json()["materials"]
+                 if m["title"] == "Создание с пустой"]
+    check("и строка не завелась", not born_rows,
+          "" if not born_rows else "строка появилась")
+
+    # ── Сторожа существующего контракта ручки ────────────────────────────────
+    plain = c.post(P2 + "/materials",
+                   json={"title": "Без ключа единицы", "qty": "5",
+                         "op_id": "c2-u5"})
+    made = [m for m in plain.json().get("materials", [])
+            if m["title"] == "Без ключа единицы"]
+    check("пропущенный ключ при создании по-прежнему даёт «м»",
+          plain.status_code == 200 and bool(made) and made[0]["unit"] == "м",
+          f"{plain.status_code}: {made[0]['unit'] if made else 'нет строки'}")
+
+    # СТОРОЖА БЕРУТ СВОЮ СТРОКУ, А НЕ ПРОДОЛЖАЮТ ПРЕДЫДУЩУЮ. На дереве без
+    # правки первая же проверка выше делает молчаливую запись и двигает `rev`;
+    # если сторожа пойдут по той же строке, они покраснеют от чужого 409, а не
+    # от своего предмета — и красный список стал бы шире правды.
+    own = _fix2_new_material(c, "Килограммы-сторож", "c2-u6a", qty=10, unit="кг")
+    keep = c.post(P2 + f"/materials/{own['id']}/update",
+                  json={"qty": "12", "rev": own["rev"], "op_id": "c2-u6"})
+    kept = [m for m in keep.json().get("materials", []) if m["id"] == own["id"]]
+    check("пропущенный ключ при правке единицу не трогает",
+          keep.status_code == 200 and bool(kept) and kept[0]["unit"] == "кг",
+          f"{keep.status_code}: {kept[0]['unit'] if kept else 'нет строки'}")
+    check("и соседнее поле при этом правится как раньше",
+          bool(kept) and kept[0]["qty"] == 12, str(kept[0]["qty"]) if kept else "")
+
+    other = _fix2_new_material(c, "Килограммы-годная", "c2-u7a", qty=10, unit="кг")
+    ok_unit = c.post(P2 + f"/materials/{other['id']}/update",
+                     json={"unit": "метры", "rev": other["rev"], "op_id": "c2-u7"})
+    fresh = [m for m in ok_unit.json().get("materials", []) if m["id"] == other["id"]]
+    check("годная единица по-прежнему принимается и нормализуется",
+          ok_unit.status_code == 200 and bool(fresh) and fresh[0]["unit"] == "м",
+          f"{ok_unit.status_code}: {fresh[0]['unit'] if fresh else 'нет строки'}")
+
+
+def _fix3_long_digits(c) -> None:
+    """P1 (тред r3948610672): 4301 цифра в плане изделий давала 500.
+
+    Граница проверяется С ОБЕИХ СТОРОН. 4300 цифр Python разбирает и упирается в
+    наш потолок; 4301 он отказывается разбирать вовсе (`sys.int_max_str_digits`),
+    и прежде этот `ValueError` выходил мимо обработчика ручки пустым отказом
+    сервера. Ответ обязан быть одним и тем же: у одного отказа не бывает двух
+    лиц.
+
+    Проба идёт СВОИМ соединением: 500 рвёт keep-alive, и на дереве без правки
+    следующая проверка падала бы клиентской ошибкой вместо ответа сервера.
+    """
+    print("\n== P1: длинное целое в плане изделий — 400, а не 500 ==")
+    item = _fix3_new_item(c, "Вещь-длинная", "c2-d-i")
+    made = c.post(P2 + "/batches",
+                  json={"item_id": item, "title": "Партия-длинная", "plan_qty": "7",
+                        "op_id": "c2-d-b"}).json()
+    bid = [b for b in made["batches"] if b["title"] == "Партия-длинная"][0]
+
+    for digits in (4300, 4301, 5000):
+        own = _fix3_fresh(c)
+        try:
+            r = own.post(P2 + "/batches",
+                         json={"item_id": item, "title": f"Партия {digits}",
+                               "plan_qty": "9" * digits, "op_id": f"c2-d-{digits}"})
+            status, text = r.status_code, r.text[:120]
+        except Exception as exc:  # noqa: BLE001 — отказ соединения тоже результат
+            status, text = -1, f"{type(exc).__name__}: {exc}"
+        finally:
+            own.close()
+        check(f"план изделий из {digits} цифр даёт 400, а не 500", status == 400,
+              f"{status}: {text}")
+        check(f"и текст отказа тот же, что у любого превышения ({digits})",
+              "Максимум" in text, text[:120])
+
+    own = _fix3_fresh(c)
+    try:
+        upd = own.post(P2 + f"/batches/{bid['id']}/update",
+                       json={"plan_qty": "9" * 4301, "rev": bid["rev"],
+                             "op_id": "c2-d-upd"})
+        status, text = upd.status_code, upd.text[:120]
+    except Exception as exc:  # noqa: BLE001
+        status, text = -1, f"{type(exc).__name__}: {exc}"
+    finally:
+        own.close()
+    check("тот же ввод при ПРАВКЕ партии тоже даёт 400", status == 400,
+          f"{status}: {text}")
+
+    board = c.get(P2).json()
+    check("ни одной партии длинным числом не создано",
+          not [b for b in board["batches"] if b["title"].startswith("Партия 4")
+               or b["title"].startswith("Партия 5")],
+          str([b["title"] for b in board["batches"]])[:160])
+    survived = [b for b in board["batches"] if b["id"] == bid["id"]]
+    check("а прежний план партии остался целым",
+          bool(survived) and survived[0]["plan_qty"] == 7,
+          str(survived[0]["plan_qty"]) if survived else "нет строки")
 
 
 def run_preview_tool(argv: list) -> int:
