@@ -412,6 +412,37 @@ def run() -> int:  # noqa: C901 — сценарный тест: шагов мн
                   "карточки маржи нет" if over_note is None
                   else f"подпись карточки: {over_note[:120]}")
 
+        print("\n== Мастер: серверный запрет управляет кнопкой создания ==")
+        if row:
+            page.evaluate("""(qty) => {
+                const input = document.querySelector('.qinp');
+                input.value = String(qty);
+                input.dispatchEvent(new Event('input', {bubbles:true}));
+            }""", row["qty"])
+            gate = {"blocked": True, "code": "share_limit"}
+
+            def server_gate(route):
+                response = route.fetch()
+                data = response.json()
+                data["can_create"] = not gate["blocked"]
+                data["stop"] = ([{"code": gate["code"], "text": "Сервер запретил этот план"}]
+                                if gate["blocked"] and gate["code"] else [])
+                route.fulfill(response=response, json=data)
+
+            page.route("**/api/order-plan/preview", server_gate)
+            for code, blocked in (("share_limit", True), ("new_items_over_budget", True),
+                                  ("", True), ("", False)):
+                gate.update(code=code, blocked=blocked)
+                with page.expect_response(lambda r: r.url == f"{base}/api/order-plan/preview"):
+                    page.evaluate("() => window.preview(3, true)")
+                page.locator("#mkOrder").wait_for(state="visible")
+                check(f"кнопка соблюдает серверный запрет {code or 'can_create'}={blocked}",
+                      page.locator("#mkOrder").is_disabled() == blocked)
+                if blocked:
+                    check("у запрещённой кнопки есть объяснение",
+                          bool(page.locator("#mkOrder").get_attribute("title")))
+            page.unroute("**/api/order-plan/preview", server_gate)
+
         print("\n== «Что заказать»: позиции без себестоимости не бесплатны ==")
         page.goto(f"{base}/replenish")
         page.wait_for_timeout(3500)

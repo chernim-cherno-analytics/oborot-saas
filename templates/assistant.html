@@ -775,7 +775,10 @@
     renderCash();
     var btn = document.getElementById("mkOrder");
     if(btn){
-      var stop = [];
+      var stop = (p.stop||[]).map(function(reason){
+        return reason.text || "план не прошёл проверку сервера";
+      });
+      if(p.can_create === false && !stop.length) stop.push("план не прошёл проверку сервера");
       if(left < 0) stop.push("выход за бюджет");
       if(!t.positions && !(p.new_items||[]).length) stop.push("в плане нет позиций");
       if(p.order_date < p.today) stop.push("дата размещения уже прошла");

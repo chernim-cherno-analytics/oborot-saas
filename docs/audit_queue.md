@@ -16,7 +16,7 @@ forget the remaining audit items. Formula changes remain prohibited.
 | A04 Explicit zero safety stock becomes 14 | Open, explicit formula/product decision required | Preserve reproduction and narrow decision; do not change calculation by default |
 | A05 Simple order loses cost basis, production and author | Metadata package locally implemented; planner 313, execution 164, browser 37 checks pass | Independent review/publication pending; supplier-price versus full-cost semantics remain open |
 | A06 Total quantity differs from size quantities | Released, confirmed by owner-control history | Do not implement again; existing regressions remain |
-| A07 New production terms alter historical payment calendar | Open | Verify existing frozen decision data and historical schedule; schema changes overlap SUPPLY and require a separately coordinated package; no invented payment facts |
+| A07 New production terms alter historical payment calendar | Reproduced even with an existing frozen plan: two payments of 500 become one payment of 1000 after changing production | Next: use existing frozen plan terms for plan-backed orders without schema changes; /private/tmp/a07-current-reproduction.json; simple orders, placement dates and payment facts remain separate |
 | A08 Received status falsely confirms execution | Local fix034eab8; not released | Independent review pending; existing partial-evidence contract retained, not blanket equivalence of both APIs |
 | A09 Invalidated cache can republish an obsolete snapshot | Open, P2 after pilot in original priority | Read-only current verification; no repeated prohibited concurrency experiment |
 
@@ -79,3 +79,13 @@ exceptions. Existing total-budget safeguard still rejects MOQ/pack excess.
 EXCLUSIONS: changing allocation/rounding, formulas, schema, SUPPLY, self-review
 or release bypass. This prevents accepting an invalid recommendation; it does
 not claim the audit's desired corrected allocation (24 instead of 30) is done.
+
+## Completed local CLAIM final plan stop UI
+
+BRANCH: codex/audit-plan-stop-ui. BASE: 836d8a2.
+FILES: templates/assistant.html, tests/test_ui.py, docs/audit_queue.md,
+docs/audit_plan_stop_ui_evidence.md.
+DONE_WHEN: server stop reasons and can_create=false disable the create-order
+button; a subsequent valid recalculation enables it. Real Chromium behavioral
+regression, no formula or API changes. Relevant to remaining A01/A02/A03 UI.
+RESULT: 44 browser checks pass, including invalid-to-valid recalculation.
