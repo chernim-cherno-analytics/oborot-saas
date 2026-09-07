@@ -101,3 +101,12 @@ missing or foreign snapshots retain the legacy fallback. API regression must
 prove both isolation and unchanged saved terms. No schema or formula changes.
 EXCLUSIONS: new snapshot storage for simple orders, placement-date policy,
 payment confirmation, historic backfill, SUPPLY files, release bypass.
+
+## Completed local CLAIM A07 planned-payment wording
+
+BRANCH: codex/audit-a07-payment-label. BASE: 32072a7.
+FILES: templates/assistant.html, docs/audit_queue.md,
+docs/audit_a07_payment_label_evidence.md.
+DONE_WHEN: the open-order banner calls left_to_pay today's/future scheduled
+payments and explains that actual payments need separate verification.
+No API, formula or monetary changes; inspect the rendered text/JS diff.
