@@ -152,6 +152,7 @@ STEPS = [
     # SUPPLY-FIX-2, решение владельца 5562704475: пятый append-only шаг.
     # Позиция 14 новая, тринадцать прежних пар не тронуты.
     "models.ensure_supply_assignment_archive_schema",
+    "models.ensure_order_payment_terms_schema",
 ]
 
 # Девять шагов, ВЫПУЩЕННЫХ до SUPPLY-1: ровно то, что журнал боевой базы уже
@@ -192,6 +193,7 @@ ARCHIVE_STEP = ("models.ensure_supply_archive_schema", 13)
 # явным сложением, а не срезом: прежние строки журнала не двигаются.
 RELEASED_BEFORE_ASSIGN_ARCHIVE = RELEASED_BEFORE_ARCHIVE + [ARCHIVE_STEP]
 ASSIGN_ARCHIVE_STEP = ("models.ensure_supply_assignment_archive_schema", 14)
+ORDER_TERMS_STEP = ("models.ensure_order_payment_terms_schema", 15)
 
 # Общий пролог дочернего процесса: подменяет четырнадцать шагов старта и
 # scheduler.start/shutdown ДО импорта app.main (см. докстринг файла — почему
@@ -306,6 +308,11 @@ def _w_aarch(*a, **kw):
     order.append("models.ensure_supply_assignment_archive_schema")
     return _orig_aarch(*a, **kw)
 _models.ensure_supply_assignment_archive_schema = _w_aarch
+_orig_terms = _models.ensure_order_payment_terms_schema
+def _w_terms(*a, **kw):
+    order.append("models.ensure_order_payment_terms_schema")
+    return _orig_terms(*a, **kw)
+_models.ensure_order_payment_terms_schema = _w_terms
 """
 
 
@@ -390,6 +397,8 @@ def check_failure_prevents_scheduler_start() -> None:
                 "_models.ensure_supply_archive_schema",
             "models.ensure_supply_assignment_archive_schema":
                 "_models.ensure_supply_assignment_archive_schema",
+            "models.ensure_order_payment_terms_schema":
+                "_models.ensure_order_payment_terms_schema",
         }[failing_step]
         code = _CHILD_PREAMBLE.format(root=str(ROOT), db=str(db)) + f"""
 def _boom(*a, **kw):
@@ -606,11 +615,11 @@ def check_ledger_clean_db() -> None:
     check("дочерний процесс завершился успешно (журнал, чистая база)", rc == 0, out[-400:])
     check("старт на чистой базе не упал", "RAISED \n" in out or "RAISED\n" in out, out[-300:])
     rows = _read_ledger(db)
-    check("журнал содержит ровно четырнадцать строк", len(rows) == 14, f"rows={rows}")
+    check("журнал содержит ровно пятнадцать строк", len(rows) == 15, f"rows={rows}")
     check("id и позиции журнала совпадают с объявленным порядком",
           [(r[0], r[1]) for r in rows] == LEDGER_STEPS, f"rows={rows}")
-    check("позиции идут 1..14 по возрастанию без пропусков",
-          [r[1] for r in rows] == list(range(1, 15)), f"rows={rows}")
+    check("позиции идут 1..15 по возрастанию без пропусков",
+          [r[1] for r in rows] == list(range(1, 16)), f"rows={rows}")
     check("у каждой строки непустой applied_at",
           all(r[2] and r[2].endswith("Z") for r in rows), f"rows={rows}")
     exec_order = [st for st in order if st in STEPS]
@@ -702,7 +711,7 @@ def check_ledger_repeat_startup() -> None:
     rc, out, order_second = _boot(db)
     check("дочерний процесс завершился успешно (повторный старт)", rc == 0, out[-400:])
     second = _read_ledger(db)
-    check("повторный старт не добавил строк в журнал", len(second) == 14, f"rows={second}")
+    check("повторный старт не добавил строк в журнал", len(second) == 15, f"rows={second}")
     check("повторный старт не переписал journal (строки идентичны первым)",
           second == first, f"first={first} second={second}")
     check("повторный старт не изменил applied_at ни одной строки",
@@ -741,6 +750,8 @@ def check_ledger_not_recorded_on_failure() -> None:
                 "_models.ensure_supply_archive_schema",
             "models.ensure_supply_assignment_archive_schema":
                 "_models.ensure_supply_assignment_archive_schema",
+            "models.ensure_order_payment_terms_schema":
+                "_models.ensure_order_payment_terms_schema",
         }[failing_step]
         extra = f"""
 def _boom(*a, **kw):
@@ -819,19 +830,20 @@ def check_ledger_supply_step_is_distinct() -> None:
     # SUPPLY-1 (позиция 10), SUPPLY-3 (11), SUPPLY-FIX-1 (12) и два шага
     # SUPPLY-FIX-2 (13 и 14). Их ровно пять, они идут своим порядком, и у
     # каждого своё время.
-    check("журнал прирос ровно пятью строками", len(rows) == 14, f"rows={rows}")
+    check("журнал прирос ровно шестью строками", len(rows) == 15, f"rows={rows}")
     check("девять выпущенных строк не переписаны (id, позиция и applied_at те же)",
           rows[:9] == seeded, f"rows={rows[:9]} seeded={seeded}")
     fresh = [r for r in rows if (r[0], r[1]) not in {(s[0], s[1]) for s in seeded}]
     check("новые строки — SUPPLY-1 (10), SUPPLY-3 (11), SUPPLY-FIX-1 (12), "
           "SUPPLY-FIX-2 (13 и 14)",
-          len(fresh) == 5 and (fresh[0][0], fresh[0][1]) == SUPPLY_STEP
+          len(fresh) == 6 and (fresh[0][0], fresh[0][1]) == SUPPLY_STEP
           and (fresh[1][0], fresh[1][1]) == PLANNING_STEP
           and (fresh[2][0], fresh[2][1]) == UNIQUE_STEP
           and (fresh[3][0], fresh[3][1]) == ARCHIVE_STEP
-          and (fresh[4][0], fresh[4][1]) == ASSIGN_ARCHIVE_STEP, f"new={fresh}")
-    check("у всех пяти собственный applied_at, а не время выпущенных шагов",
-          len(fresh) == 5 and all(f[2].endswith("Z") and f[2] != seeded[0][2]
+          and (fresh[4][0], fresh[4][1]) == ASSIGN_ARCHIVE_STEP
+          and (fresh[5][0], fresh[5][1]) == ORDER_TERMS_STEP, f"new={fresh}")
+    check("у всех шести собственный applied_at, а не время выпущенных шагов",
+          len(fresh) == 6 and all(f[2].endswith("Z") and f[2] != seeded[0][2]
                                   for f in fresh), f"new={fresh}")
     check("шаг SUPPLY-1 действительно выполнился на этом старте",
           "models.ensure_supply_schema" in order, f"order={order}")

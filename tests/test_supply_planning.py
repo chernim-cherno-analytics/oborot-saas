@@ -916,10 +916,10 @@ def run() -> int:
     check("за весь сценарий не создано ни одного заказа и ни одной строки «В заказе»",
           orders == 0 and ordered == 0, f"orders={orders} ordered_qty={ordered}")
 
-    # ── 18. Миграция: аддитивна, идемпотентна, шагов двенадцать ───────────────
-    print("\n== Миграция: новый шаг сверху, старые тринадцать не тронуты ==")
+    # ── 18. Миграция: аддитивна, идемпотентна, прежние шаги сохранены ────────
+    print("\n== Миграция: новый шаг сверху, старые четырнадцать не тронуты ==")
     from app.main import STARTUP_SCHEMA_STEPS
-    check("шагов старта четырнадцать", len(STARTUP_SCHEMA_STEPS) == 14,
+    check("шагов старта пятнадцать", len(STARTUP_SCHEMA_STEPS) == 15,
           str(len(STARTUP_SCHEMA_STEPS)))
     check("первые десять пар (id, позиция) не изменились",
           STARTUP_SCHEMA_STEPS[:10] == (
@@ -951,9 +951,14 @@ def run() -> int:
           str(thirteenth))
     fourteenth = (STARTUP_SCHEMA_STEPS[13]
                   if len(STARTUP_SCHEMA_STEPS) > 13 else None)
-    check("новый шаг дописан в конец с новым id и позицией 14",
+    check("шаг 14 остался на своей позиции и с прежним id",
           fourteenth == ("models.ensure_supply_assignment_archive_schema", 14),
           str(fourteenth))
+    fifteenth = (STARTUP_SCHEMA_STEPS[14]
+                 if len(STARTUP_SCHEMA_STEPS) > 14 else None)
+    check("снимок условий заказа дописан в конец с новым id и позицией 15",
+          fifteenth == ("models.ensure_order_payment_terms_schema", 15),
+          str(fifteenth))
 
     # «Старая» база: таблиц слоя нет вовсе — шаг обязан их создать и не упасть
     # при повторном вызове.

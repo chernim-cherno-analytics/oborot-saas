@@ -84,6 +84,7 @@ processingorder требует техкарту (processingPlan) и доступ
 SQLite, а описание правит человек. См. find_own_document.
 """
 import uuid
+import math
 from datetime import date, timedelta
 
 import httpx
@@ -773,6 +774,27 @@ def _product_map(db: Session, org_id: int) -> dict[tuple[str, str], Product]:
     return {(p.base_name, p.size): p for p in rows}
 
 
+def supplier_prices_snapshot(db: Session, org_id: int) -> dict[str, dict[str, float]]:
+    """Закупочные цены именно тех SKU, которые сопоставляет отправка (D-12/21)."""
+    prices: dict[str, dict[str, float]] = {}
+    for (base, size), product in _product_map(db, org_id).items():
+        prices.setdefault(base, {})[size] = float(product.cost_price or 0)
+    return prices
+
+
+def _supplier_price_kopecks(item: dict, size: str) -> int:
+    # Старые заказы не переоцениваем: до разделения полей cost был ценой отправки.
+    if "supplier_prices" not in item:
+        return _kopecks_of(item.get("cost"))
+    prices = item["supplier_prices"]
+    price = prices.get(size) if isinstance(prices, dict) else None
+    if type(price) not in (int, float) or not math.isfinite(price) or price < 0:
+        raise WritebackError(422, "Цена подрядчика для позиции заказа не сохранена. "
+                             "Уточните закупочную цену в МойСкладе и создайте новый заказ. "
+                             "Документ не отправлен.")
+    return _kopecks_of(price)
+
+
 # Сколько дней назад искать «свой» документ перед созданием. Заказ отправляют
 # в день оформления; две недели — запас на «нажал, не дошло, вернулся завтра».
 LOOKBACK_DAYS = 14
@@ -1363,13 +1385,13 @@ async def push_order(db: Session, org_id: int, order: ProductionOrder,
         pushed_by_base: dict[str, float] = {}  # для переноса вклада в ms_qty
         for item in order.items:
             base = str(item.get("base_name") or "")
-            cost_kopecks = _kopecks_of(item.get("cost"))
             for size, qty in _item_size_breakdown(item):
                 product = products.get((base, size))
                 meta = assortment_meta.get(product.ext_id) if product else None
                 if meta is None:
                     unmatched.append(_position_label(base, size))
                     continue
+                cost_kopecks = _supplier_price_kopecks(item, size)
                 positions.append({
                     "assortment": {"meta": meta},
                     "quantity": qty,

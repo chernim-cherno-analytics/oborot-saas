@@ -338,6 +338,43 @@ def main() -> int:
     check("новинки видны в плане отдельным блоком",
           np_["new_items"] and np_["new_items"][0]["name"] == "Пальто «Осень»")
 
+    for scope in ("full", "now"):
+        for qty in (99, 100, 150):
+            new_only = mk_snap([])
+            new_plan = op.plan_order(new_only, mk_brief(
+                budget=100000, budget_scope=scope,
+                new_items=[{"name": "A01 новинка", "qty": qty, "cost": 1000}]),
+                mk_ctx(new_only), ONE_STAGE)
+            check(f"A01 {scope}: новинки {qty}000 при бюджете 100000",
+                  new_plan["can_create"] == (qty <= 100)
+                  and (qty <= 100 or "new_items_over_budget" in
+                       [s["code"] for s in new_plan["stop"]]),
+                  f"can_create={new_plan['can_create']} stop={new_plan['stop']}")
+
+    from app.api import _apply_overrides
+    import copy
+    share_snap = mk_snap([mk_item("A03", turnover=5000, cost=10, price=30, rate=3)])
+    share_ctx = dict(mk_ctx(share_snap), pack_multiple=6)
+    share_plan = op.plan_order(share_snap, mk_brief(budget=1000, max_share_pct=25),
+                               share_ctx, ONE_STAGE)
+    check("A03 воспроизведено округление выше лимита: 30 вместо максимум 25",
+          share_plan["items"][0]["qty"] == 30)
+    check("A03 автоматический перерасход доли запрещает создание",
+          not share_plan["can_create"]
+          and "share_limit" in [s["code"] for s in share_plan["stop"]])
+    for label, edits, allowed in (
+        ("посторонняя правка", {"неизвестная позиция": 0}, False),
+        ("то же количество", {"A03": 30}, False),
+        ("исправлено до 24", {"A03": 24}, True),
+        ("явное ручное решение 36", {"A03": 36}, True),
+    ):
+        edited = copy.deepcopy(share_plan)
+        _apply_overrides(edited, edits, share_snap)
+        check(f"A03 {label}", edited["can_create"] == allowed, str(edited["stop"]))
+    must_plan = op.plan_order(share_snap, mk_brief(
+        budget=1000, max_share_pct=25, must_have=["A03"]), share_ctx, ONE_STAGE)
+    check("A03 явное must-have сохраняет исключение лимита доли", must_plan["can_create"])
+
     print("\n10. Отсев позиций")
     snap4 = mk_snap([
         mk_item("Норм", turnover=4000, cost=2000, price=6000, rate=1.0),
@@ -780,6 +817,50 @@ def api_checks() -> None:
               all(i["qty"] >= 10 for i in plan["items"]),
               str([(i["base_name"], i["qty"]) for i in plan["items"]][:5]))
 
+        # A05: простой заказ сохраняет выбранное производство и автора.
+        metadata_body = {"name": "A05 metadata", "eta_date": eta,
+                         "production_id": lab["id"],
+                         "items": [{"base_name": plan["items"][0]["base_name"],
+                                    "qty": 3, "sizes": {}}]}
+        metadata_orders = set()
+        made_meta = c.post("/api/orders", json=metadata_body)
+        check("A05 простой заказ создан", made_meta.status_code == 200)
+        metadata_id = made_meta.json()["id"]
+        metadata_orders.add(metadata_id)
+        creator = _sql("SELECT id FROM users WHERE email=?", "planner@test.io")[0][0]
+        check("A05 производство и автор сохранены",
+              _sql("SELECT production_id,created_by FROM production_orders WHERE id=?",
+                   metadata_id)[0] == (lab["id"], creator))
+        repeated_meta = c.post("/api/orders", json=metadata_body).json()
+        check("A05 повтор остаётся тем же заказом",
+              repeated_meta.get("duplicate") and repeated_meta["id"] == metadata_id)
+        other_meta = c.post("/api/orders", json={**metadata_body, "production_id": china["id"]}).json()
+        metadata_orders.add(other_meta["id"])
+        check("A05 другое производство не склеивается с первым заказом",
+              other_meta["id"] != metadata_id and not other_meta.get("duplicate"))
+        old_meta = c.post("/api/orders", json={k: v for k, v in metadata_body.items()
+                                             if k != "production_id"}).json()
+        metadata_orders.add(old_meta["id"])
+        check("A05 запрос без производства поддержан и автор известен",
+              _sql("SELECT production_id,created_by FROM production_orders WHERE id=?",
+                   old_meta["id"])[0] == (None, creator))
+        with httpx.Client(headers={"X-Oborot-CSRF": "1"}, base_url=base, timeout=60) as outsider:
+            outsider.post("/register", data={"name": "A05", "email": "planner-a05@test.io",
+                                            "password": "secret123", "org_name": "A05 чужой бренд"})
+            foreign_pid = outsider.post("/api/productions", json={"name": "A05 чужое"}).json()["id"]
+        for pid in (foreign_pid, 2147483647):
+            before_meta = _sql("SELECT COUNT(*) FROM production_orders")[0][0]
+            denied_meta = c.post("/api/orders", json={**metadata_body, "production_id": pid,
+                                                     "allow_duplicate": True})
+            check("A05 чужое или отсутствующее производство отклонено",
+                  denied_meta.status_code == 404, str(denied_meta.status_code))
+            check("A05 отказ не создаёт заказ",
+                  _sql("SELECT COUNT(*) FROM production_orders")[0][0] == before_meta)
+            if denied_meta.status_code == 200:
+                metadata_orders.add(denied_meta.json()["id"])
+        for oid in metadata_orders:
+            c.delete(f"/api/orders/{oid}")
+
         saved = c.post("/api/order-plan", json={
             "production_id": lab["id"], "eta_date": eta, "budget": 300000,
             "budget_scope": "now", "strategy": "balance",
@@ -787,11 +868,120 @@ def api_checks() -> None:
         check("план сохранён", saved.get("ok") and saved.get("id"))
         check("последний бриф возвращается для предзаполнения",
               c.get("/api/order-plan/last").json()["brief"]["budget"] == 300000)
+        # A02: сохранение для истории не снимает запреты финального плана.
+        for reason, changes in (
+            ("past_date", {"eta_date": date.today().isoformat()}),
+            ("over_budget", {"overrides": {plan["items"][0]["base_name"]: 1000000}}),
+            ("empty", {"budget": 0}),
+            ("new_items_over_budget", {"budget": 100000, "new_items": [
+                {"name": "A01 новинка", "qty": 150, "cost": 1000}]}),
+            ("new_items_over_budget", {"budget": 100000, "new_items": [
+                {"name": "A01 новинка с ручной правкой", "qty": 150, "cost": 1000}],
+                "overrides": {plan["items"][0]["base_name"]: 0}}),
+        ):
+            gate_body = {"production_id": lab["id"], "eta_date": eta,
+                         "budget": 300000, "budget_scope": "now",
+                         "strategy": "balance", **changes}
+            gated = c.post("/api/order-plan", json=gate_body).json()
+            check(f"A02 {reason}: воспроизведён запрет финального плана",
+                  (gated["plan"]["items"] or gated["plan"].get("new_items") or reason == "empty")
+                  and not gated["plan"]["can_create"]
+                  and reason in [s["code"] for s in gated["plan"]["stop"]])
+            import json as _gate_json
+            stored_gate = _gate_json.loads(_sql(
+                "SELECT result_json FROM order_plans WHERE id=?", gated["id"])[0][0])
+            check(f"A02 {reason}: сохраняется запрет финального плана",
+                  stored_gate.get("can_create") is False
+                  and stored_gate.get("stop") == gated["plan"]["stop"])
+            count_before = _sql("SELECT COUNT(*) FROM production_orders")[0][0]
+            denied = c.post(f"/api/order-plan/{gated['id']}/apply",
+                            json={"force": True, "confirm_partial": True})
+            check(f"A02 {reason}: подтверждения не обходят запрет",
+                  denied.status_code == 422, f"status={denied.status_code}")
+            check(f"A02 {reason}: отказ сохраняет структурированные причины и текст",
+                  denied.json().get("code") == "plan_forbidden"
+                  and denied.json().get("stop") == stored_gate["stop"]
+                  and isinstance(denied.json().get("detail"), str)
+                  and all(s["text"] in denied.json()["detail"] for s in stored_gate["stop"]))
+            state = _sql("SELECT status, production_order_id FROM order_plans WHERE id=?",
+                         gated["id"])[0]
+            check(f"A02 {reason}: отказ не создаёт заказ и не меняет план",
+                  _sql("SELECT COUNT(*) FROM production_orders")[0][0] == count_before
+                  and state == ("draft", None), str(state))
+            # На неисправленном runtime лишний черновик не должен ломать
+            # остальные проверки через защиту от дублей. FAIL уже записан.
+            if denied.status_code == 200 and denied.json().get("order_id"):
+                c.delete(f"/api/orders/{denied.json()['order_id']}")
+        # Legacy: отсутствие сохранённого разрешения требует нового расчёта,
+        # а не восстановления бюджета или количеств на сегодняшних данных.
+        original_result = _sql("SELECT result_json FROM order_plans WHERE id=?",
+                               saved["id"])[0][0]
+        legacy_result = _gate_json.loads(original_result)
+        legacy_result.pop("stop", None)
+        legacy_result.pop("can_create", None)
+        _sql("UPDATE order_plans SET result_json=? WHERE id=?",
+             _gate_json.dumps(legacy_result), saved["id"])
+        before_legacy = _sql("SELECT COUNT(*) FROM production_orders")[0][0]
+        legacy = c.post(f"/api/order-plan/{saved['id']}/apply",
+                        json={"force": True, "confirm_partial": True})
+        check("A02 legacy: нужен явный новый расчёт",
+              legacy.status_code == 422 and "Пересчитайте" in legacy.text)
+        check("A02 legacy: отсутствие решения имеет отдельный код",
+              legacy.json().get("code") == "plan_recalculation_required"
+              and legacy.json().get("stop") == []
+              and isinstance(legacy.json().get("detail"), str))
+        check("A02 legacy: отказ не меняет решение и не создаёт заказ",
+              _sql("SELECT COUNT(*) FROM production_orders")[0][0] == before_legacy
+              and _sql("SELECT status, production_order_id, result_json FROM order_plans WHERE id=?",
+                       saved["id"])[0] == ("draft", None, _gate_json.dumps(legacy_result)))
+        if legacy.status_code == 200 and legacy.json().get("order_id"):
+            c.delete(f"/api/orders/{legacy.json()['order_id']}")
+        _sql("UPDATE order_plans SET result_json=? WHERE id=?", original_result, saved["id"])
+        before_atomic = {r[0] for r in _sql("SELECT id FROM production_orders")}
+        _sql("CREATE TRIGGER test_reject_plan_link BEFORE UPDATE OF production_order_id "
+             "ON order_plans WHEN NEW.production_order_id IS NOT NULL "
+             "BEGIN SELECT RAISE(ABORT, 'test plan link failure'); END")
+        try:
+            # The expected unhandled DB error closes its HTTP connection.
+            # Isolate that connection from the remaining scenario requests.
+            with httpx.Client(base_url=base, cookies=c.cookies,
+                              headers={"X-Oborot-CSRF": "1"}, timeout=60) as failing_client:
+                failed_apply = failing_client.post(f"/api/order-plan/{saved['id']}/apply",
+                                      json={"name": "Проверка отката", "force": True})
+            after_atomic = {r[0] for r in _sql("SELECT id FROM production_orders")}
+            check("сбой записи связи плана действительно воспроизведён",
+                  failed_apply.status_code == 500, str(failed_apply.status_code))
+            check("ошибка применения плана не оставляет осиротевший заказ",
+                  after_atomic == before_atomic,
+                  str(sorted(after_atomic - before_atomic)))
+            check("ошибка применения сохраняет исходное решение плана",
+                  _sql("SELECT status, production_order_id, result_json FROM order_plans WHERE id=?",
+                       saved["id"])[0] == ("draft", None, original_result))
+        finally:
+            _sql("DROP TRIGGER test_reject_plan_link")
+            # Clean up only a reproduced baseline orphan, so later checks
+            # continue to test their original scenarios on the RED run.
+            for orphan_id in {r[0] for r in _sql("SELECT id FROM production_orders")} - before_atomic:
+                c.delete(f"/api/orders/{orphan_id}")
         applied = c.post(f"/api/order-plan/{saved['id']}/apply", json={"name": "Осень 2026"})
         check("план превращается в заказ на производство",
               applied.status_code == 200 and applied.json().get("order_id"))
+        check("повтор после сбоя сохраняет один заказ с обеими связями и ID партии",
+              _sql("SELECT COUNT(*) FROM production_orders")[0][0] == len(before_atomic) + 1
+              and _sql("SELECT p.production_order_id, o.order_plan_id, o.cc_batch_id "
+                       "FROM order_plans p JOIN production_orders o ON o.id=p.production_order_id "
+                       "WHERE p.id=?", saved["id"])[0]
+              == (applied.json()["order_id"], saved["id"], applied.json()["cc_batch_id"])
+              and bool(applied.json()["cc_batch_id"]))
         again = c.post(f"/api/order-plan/{saved['id']}/apply", json={"name": "Ещё раз"})
         check("повторное применение плана → 409", again.status_code == 409)
+        _sql("UPDATE order_plans SET result_json=? WHERE id=?",
+             _gate_json.dumps(legacy_result), saved["id"])
+        again_legacy = c.post(f"/api/order-plan/{saved['id']}/apply",
+                              json={"force": True, "confirm_partial": True})
+        check("A02 legacy: уже применённый план сохраняет 409",
+              again_legacy.status_code == 409 and "уже создан" in again_legacy.text)
+        _sql("UPDATE order_plans SET result_json=? WHERE id=?", original_result, saved["id"])
         # ── Правило распределения позиций по производствам ─────────────────
         from app.db import SessionLocal
         from app.models import Product as _P
@@ -884,6 +1074,113 @@ def api_checks() -> None:
         check("по позициям открытых заказов видно количество",
               op["by_base"] and sum(op["by_base"].values()) == made["total_qty"],
               str(sum(op["by_base"].values())))
+        # A07: изменение справочника не переписывает условия принятого плана.
+        original_terms = _sql("SELECT stages_json FROM productions WHERE id=?", lab["id"])[0][0]
+        original_computed = _sql("SELECT computed_json FROM order_plans WHERE id=?", saved["id"])[0][0]
+        original_plan_org = _sql("SELECT org_id FROM order_plans WHERE id=?", saved["id"])[0][0]
+        frozen_payments = next(o["payments"] for o in op["orders"] if o["id"] == made["id"])
+        changed_terms = [{"name": "A07 новые условия", "lead_days": 90,
+                          "cost_share": 1, "prepay_share": 1}]
+        check("A07 новые условия справочника сохранены",
+              c.post(f"/api/productions/{lab['id']}/setup", json={"stages": changed_terms}).status_code == 200)
+
+        def order_payments_now():
+            rows = c.get("/api/orders/open", params={"production_id": lab["id"]}).json()["orders"]
+            return next(o["payments"] for o in rows if o["id"] == made["id"])
+
+        check("A07 календарь принятого плана сохраняет исходные условия",
+              order_payments_now() == frozen_payments)
+        _sql("UPDATE order_plans SET computed_json=? WHERE id=?", '{"stages":"invalid"}', saved["id"])
+        fallback_payments = order_payments_now()
+        check("A07 повреждённый снимок сохраняет прежний fallback",
+              fallback_payments and fallback_payments[0]["label"] == "A07 новые условия")
+        _sql("UPDATE order_plans SET computed_json=? WHERE id=?", original_computed, saved["id"])
+        foreign_org = _sql("SELECT org_id FROM productions WHERE id=?", foreign_pid)[0][0]
+        _sql("UPDATE order_plans SET org_id=? WHERE id=?", foreign_org, saved["id"])
+        check("A07 снимок другой организации не используется",
+              order_payments_now() == fallback_payments)
+        _sql("UPDATE order_plans SET org_id=? WHERE id=?", original_plan_org, saved["id"])
+        check("A07 восстановленный свой снимок снова задаёт условия",
+              order_payments_now() == frozen_payments)
+        check("A07 исходные условия справочника восстановлены",
+              c.post(f"/api/productions/{lab['id']}/setup",
+                     json={"stages": _gate_json.loads(original_terms)}).status_code == 200)
+
+        from app import order_planner as precision_op
+        precise_setup = c.post(f"/api/productions/{lab['id']}/setup", json={"stages": [
+            {"name": f"A07 этап {i}", "lead_days": 10, "cost_share": 1, "prepay_share": 1}
+            for i in range(3)]}).json()
+        precise_body = {"production_id": lab["id"], "eta_date": eta,
+                        "budget": 100000000, "budget_scope": "full"}
+        precise_saved = c.post("/api/order-plan", json=precise_body).json()
+        precise_plan = precise_saved["plan"]
+        expected_precise = precision_op.payment_plan(date.today(), precise_setup["stages"],
+                                                      precise_plan["cost_total"])
+        precise_apply = c.post(f"/api/order-plan/{precise_saved['id']}/apply",
+                               json={"force": True, "confirm_partial": True}).json()
+        precise_order_id = precise_apply["order_id"]
+        precise_orders = c.get("/api/orders/open").json()["orders"]
+        actual_precise = next(o["payments"] for o in precise_orders if o["id"] == precise_order_id)
+        check("A07 сохранение не округляет исходные доли платежей",
+              [p["amount"] for p in actual_precise] == [p["amount"] for p in expected_precise],
+              str([p["amount"] for p in actual_precise]))
+        precise_item = precise_plan["items"][0]
+        precise_edited = c.post("/api/order-plan/preview", json={**precise_body,
+            "overrides": {precise_item["base_name"]: precise_item["qty"] + 1}}).json()
+        expected_edited = precision_op.payment_plan(date.today(), precise_setup["stages"],
+                                                     precise_edited["cost_total"])
+        check("A07 ручная правка сохраняет точность долей платежей",
+              [p["amount"] for p in precise_edited["payments"]] == [p["amount"] for p in expected_edited])
+        c.delete(f"/api/orders/{precise_order_id}")
+        c.post(f"/api/productions/{lab['id']}/setup", json={"stages": _gate_json.loads(original_terms)})
+
+        reused = c.post("/api/orders", json={"name": "A07 новый простой заказ",
+            "production_id": lab["id"], "items": [{"base_name": precise_item["base_name"],
+                                                       "qty": 1, "sizes": {}}]}).json()
+        check("A07 воспроизведено переиспользование ID удалённого заказа",
+              reused["id"] == precise_order_id)
+        new_plain = next(o for o in c.get("/api/orders/open").json()["orders"] if o["id"] == reused["id"])
+        plain_expected = precision_op.payment_plan(date.today(), _gate_json.loads(original_terms), new_plain["total_cost"])
+        check("A07 новый заказ не наследует снимок удалённого заказа",
+              new_plain["order_plan_id"] is None and new_plain["payments"] == plain_expected)
+        c.post(f"/api/productions/{lab['id']}/setup", json={"stages": [
+            {"name": "Новые условия", "lead_days": 2, "cost_share": 1, "prepay_share": 1}]})
+        changed_plain = next(o for o in c.get("/api/orders/open").json()["orders"]
+                             if o["id"] == reused["id"])
+        check("A07 простой заказ сохраняет условия после изменения производства",
+              changed_plain["payments"] == plain_expected, str(changed_plain["payments"]))
+        repeated_plain = c.post("/api/orders", json={"name": "A07 новый простой заказ",
+            "production_id": lab["id"], "items": [{"base_name": precise_item["base_name"],
+                                                       "qty": 1, "sizes": {}}]}).json()
+        check("A07 повтор простого заказа сохраняет прежний заказ и его условия",
+              repeated_plain["id"] == reused["id"] and repeated_plain.get("duplicate") is True
+              and next(o for o in c.get("/api/orders/open").json()["orders"]
+                       if o["id"] == reused["id"])["payments"] == plain_expected)
+        c.post(f"/api/productions/{lab['id']}/setup", json={"stages": _gate_json.loads(original_terms)})
+        identity_history = {h["id"]: h for h in c.get("/api/order-plan/history", params={"limit": 100}).json()["plans"]}
+        check("история не связывает старый план с переиспользованным ID",
+              identity_history[precise_saved["id"]]["order_id"] is None
+              and identity_history[precise_saved["id"]].get("order_missing") is True)
+        check("история сохраняет действительную связь плана с заказом",
+              identity_history[saved["id"]]["order_id"] == made["id"]
+              and not identity_history[saved["id"]].get("order_missing"))
+        sent_reused = c.post(f"/api/orders/{reused['id']}/status", json={"status": "sent"})
+        received_reused = c.post(f"/api/orders/{reused['id']}/receipts",
+            json={"lines": [{"base_name": precise_item["base_name"], "qty": 1}]})
+        check("приёмка нового заказа записана для проверки переиспользованного ID",
+              sent_reused.status_code == 200 and received_reused.status_code == 200,
+              received_reused.text[:160])
+        stale_outcome = c.get(f"/api/order-plan/{precise_saved['id']}/outcome").json()
+        check("старый план не наследует заказ и приёмку по переиспользованному ID",
+              stale_outcome["order_id"] is None and stale_outcome["order_status"] is None
+              and not stale_outcome["execution_confirmed"]
+              and all(line["executed"] is None for line in stale_outcome["lines"]),
+              str(stale_outcome)[:250])
+        valid_outcome = c.get(f"/api/order-plan/{saved['id']}/outcome").json()
+        check("исполнение сохраняет действительную связь плана с заказом",
+              valid_outcome["order_id"] == made["id"])
+        c.delete(f"/api/orders/{reused['id']}")
+
         other = c.get("/api/orders/open", params={"production_id": china["id"]}).json()
         check("фильтр по каналу не показывает чужие заказы",
               other["count"] == 0, str(other["count"]))
@@ -1087,6 +1384,20 @@ def api_checks() -> None:
         check("причина «кратность» видна в строке",
               any("pack" in i["why"] for i in packed["items"]),
               str([i["why"] for i in packed["items"]][:3]))
+        share_saved = c.post("/api/order-plan", json={
+            "production_id": lab["id"], "eta_date": eta, "budget": 300000,
+            "budget_scope": "full", "max_share_pct": 1}).json()
+        check("A03 сохранённый план с нарушением доли запрещён",
+              "share_limit" in [s["code"] for s in share_saved["plan"]["stop"]]
+              and not share_saved["plan"]["can_create"])
+        count_share = _sql("SELECT COUNT(*) FROM production_orders")[0][0]
+        share_denied = c.post(f"/api/order-plan/{share_saved['id']}/apply",
+                              json={"force": True, "confirm_partial": True})
+        check("A03 force не обходит лимит автоматической рекомендации",
+              share_denied.status_code == 422
+              and _sql("SELECT COUNT(*) FROM production_orders")[0][0] == count_share)
+        if share_denied.status_code == 200:
+            c.delete(f"/api/orders/{share_denied.json()['order_id']}")
         c.post(f"/api/productions/{lab['id']}",
                json={"name": lab["name"], "pack_multiple": 0})
 

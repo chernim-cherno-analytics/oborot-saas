@@ -581,10 +581,13 @@
         return "<tr><td>"+dstr((h.created_at||"").slice(0,10))+"</td>"+
           "<td>"+esc(h.production_name||"—")+"</td>"+
           '<td class="nb">'+fmtR(h.budget)+"</td>"+
-          '<td class="nb">'+fmt(h.positions)+" / "+fmt(h.units)+"</td>"+
-          '<td class="nb">'+fmtR(h.cost)+"</td>"+
+          '<td class="nb">'+fmt(h.positions)+" / "+fmt(h.units)+
+            (h.totals_exclude_new_items ? '<span class="why">без новинок</span>' : '')+"</td>"+
+          '<td class="nb">'+fmtR(h.cost)+
+            (h.totals_exclude_new_items ? '<span class="why">без новинок</span>' : '')+
+            (h.cost_incomplete ? '<span class="why">сумма неполная</span>' : '')+"</td>"+
           "<td>"+esc(h.author||"—")+"</td>"+
-          "<td>"+(h.order_id ? '<a href="/replenish#orders" title="Заказы в производстве — внизу страницы «Заказ»">№'+h.order_id+"</a>" : '<span class="muted">не оформлен</span>')+"</td>"+
+          "<td>"+(h.order_id ? '<a href="/replenish#orders" title="Заказы в производстве — внизу страницы «Заказ»">№'+h.order_id+"</a>" : '<span class="muted">'+(h.order_missing ? 'заказ недоступен' : 'не оформлен')+'</span>')+"</td>"+
           '<td><button class="go-btn ghost repeat" type="button" data-id="'+h.id+
             '" style="padding:4px 10px;font-size:12px">Повторить</button></td></tr>';
       }).join("")+"</tbody></table></div>";
@@ -734,8 +737,15 @@
              covered_until: cov, covered_full: covFull };
   }
 
+  function pendingOrderEdits(){
+    return (STATE.plan.items||[]).some(function(i){
+      return STATE.edits[i.base_name] !== undefined && STATE.edits[i.base_name] !== i.qty;
+    });
+  }
+
   function renderCards(){
     var p = STATE.plan, t = liveTotals();
+    var hasNew = (p.new_items||[]).length > 0;
     var budget = p.budget || 0;
     var spent = (p.budget_basis === "now") ? t.pay_now : t.cost;
     var left = budget - (p.reserve_new||0) - spent;
@@ -743,16 +753,16 @@
     document.getElementById("cards").innerHTML =
       '<div class="card"><div class="l">'+(p.budget_note
           ? ('Первый платёж '+dstr((p.payments||[])[0] && p.payments[0].date))
-          : 'Заплатить сейчас')+'</div><div class="v">'+fmtR(t.pay_now)+'</div>'+
+          : 'Заплатить сейчас')+(hasNew ? ' · каталожные позиции' : '')+'</div><div class="v">'+fmtR(t.pay_now)+'</div>'+
         '<div class="s">из бюджета '+fmtR(budget)+
         (p.reserve_new? (" · новинки "+fmtR(p.reserve_new)) : "")+
         ' · свободно '+fmtR(left)+'</div></div>'+
       '<div class="card"'+(t.pay_later>0?' style="background:rgba(255,204,0,.16)"':'')+'>'+
-        '<div class="l">Полное обязательство</div><div class="v">'+fmtR(t.cost)+'</div>'+
+        '<div class="l">'+(hasNew ? 'Обязательство по каталожным позициям' : 'Полное обязательство')+'</div><div class="v">'+fmtR(t.cost)+'</div>'+
         '<div class="s">'+(t.pay_later>0
           ? ('ещё '+fmtR(t.pay_later)+' платится позже')
-          : 'весь заказ оплачивается сразу')+'</div></div>'+
-      '<div class="card"><div class="l">Позиций / штук</div><div class="v">'+fmt(t.positions)+' / '+fmt(t.units)+'</div>'+
+          : (hasNew ? 'каталожные позиции оплачиваются сразу' : 'весь заказ оплачивается сразу'))+'</div></div>'+
+      '<div class="card"><div class="l">'+(hasNew ? 'Каталожных позиций / штук' : 'Позиций / штук')+'</div><div class="v">'+fmt(t.positions)+' / '+fmt(t.units)+'</div>'+
         '<div class="s">'+(p.over_need_cost ? ('из них '+fmtR(p.over_need_cost)+' — запас сверх потребности') : 'в заказе')+'</div></div>'+
       '<div class="card" style="background:rgba(76,187,23,0.18)"><div class="l">Валовая маржа</div>'+
         '<div class="v">'+fmtR(t.profit)+'</div><div class="s">если продать по средней цене, до налогов и логистики'+
@@ -766,6 +776,14 @@
     // сравнивал бюджет с полной стоимостью заказа. Молчать об этом нельзя —
     // иначе цифры на карточках выглядят как ошибка.
     warn.innerHTML =
+      (hasNew && p.order_totals ? (pendingOrderEdits() ?
+        '<div class="warn">Пересчитайте план, чтобы обновить полный состав и календарь с новинками.</div>' :
+        '<div class="panel" id="completeOrderSummary"><b>Полный состав заказа, включая новинки</b>: '+
+        fmt(p.order_totals.positions)+' позиций · '+fmt(p.order_totals.units)+' шт · '+
+        fmtR(p.order_totals.cost)+'. Новинки включены в календарь платежей. '+
+        'Карточки выше относятся к каталожным позициям.</div>') :
+        (hasNew ? '<div class="warn">Новинки на '+fmtR(p.new_items_cost)+
+        ' показаны отдельно ниже. Итоговые суммы, количество и календарь этого плана их пока не учитывают.</div>' : '')) +
       (p.budget_note ? '<div class="warn">'+esc(p.budget_note)+'</div>' : "") +
       (left < 0
         ? '<div class="err">Заказ выходит за бюджет на '+fmtR(-left)+
@@ -775,7 +793,10 @@
     renderCash();
     var btn = document.getElementById("mkOrder");
     if(btn){
-      var stop = [];
+      var stop = (p.stop||[]).map(function(reason){
+        return reason.text || "план не прошёл проверку";
+      });
+      if(p.can_create === false && !stop.length) stop.push("план не прошёл проверку");
       if(left < 0) stop.push("выход за бюджет");
       if(!t.positions && !(p.new_items||[]).length) stop.push("в плане нет позиций");
       if(p.order_date < p.today) stop.push("дата размещения уже прошла");
@@ -790,11 +811,16 @@
     var c = STATE.cash, p = STATE.plan;
     if(!c || !c.weeks){ box.innerHTML = '<div class="muted" style="font-size:12px">нет данных</div>'; return; }
     var t = liveTotals(), share = p.cost_total ? (t.cost / p.cost_total) : 1;
+    var payments = p.payments||[];
+    if((p.new_items||[]).length && p.order_payments){
+      if(pendingOrderEdits()){ box.textContent = "Пересчитайте план для полного календаря с новинками."; return; }
+      payments = p.order_payments; share = 1;
+    }
     var start = new Date(c.week_start+"T00:00:00");
     // Текущий (ещё не созданный) заказ кладём в ту же сетку — иначе календарь
     // показывает вчерашние обязательства и молчит про то, что решается сейчас.
     var mine = c.weeks.map(function(){ return 0; });
-    (p.payments||[]).forEach(function(x){
+    payments.forEach(function(x){
       var idx = Math.floor((new Date(x.date+"T00:00:00") - start)/86400000/7);
       if(idx >= 0 && idx < mine.length) mine[idx] += Math.round(x.amount * share);
     });
@@ -835,7 +861,12 @@
     var p = STATE.plan, box = document.getElementById("payflow");
     if(!box) return;
     var t = liveTotals(), share = p.cost_total ? (t.cost / p.cost_total) : 1;
-    box.innerHTML = (p.payments||[]).map(function(x,i){
+    var payments = p.payments||[];
+    if((p.new_items||[]).length && p.order_payments){
+      if(pendingOrderEdits()){ box.textContent = "Пересчитайте план для полного календаря с новинками."; return; }
+      payments = p.order_payments; share = 1;
+    }
+    box.innerHTML = payments.map(function(x,i){
       var amount = Math.round(x.amount * share);
       return '<div class="pay'+(i===0?" now":"")+'"><div class="d">'+dstr(x.date)+'</div>'+
         '<div class="a">'+fmtR(amount)+'</div><div class="n">'+esc(x.label)+'</div></div>';
@@ -844,7 +875,7 @@
 
   function renderPlan(){
     var p = STATE.plan;
-    if(p.blocked){
+    if(p.blocked && !(p.new_items||[]).length){
       var extra = (p.blocked.reason === "no_assignment")
         ? '<a class="go-btn ghost" style="text-decoration:none" href="/settings">Настроить распределение</a>' : '';
       document.getElementById("planBox").innerHTML =
@@ -953,8 +984,8 @@
         (op.count === 1 ? 'открыт заказ' : ('открыто заказов: '+op.count+', последний')) + ' ' +
         '<b>№'+first.id+' «'+esc(first.name)+'»</b> от '+dstr((first.created_at||"").slice(0,10))+
         ' — '+fmt(first.total_qty)+' шт'+
-        (op.left_to_pay ? (', по всем открытым заказам осталось заплатить <b>'+fmtR(op.left_to_pay)+'</b>') : '')+
-        '. <a href="/replenish#orders">Посмотреть заказы</a></div>';
+        (op.left_to_pay ? (', по открытым заказам на сегодня и будущие даты запланировано <b>'+fmtR(op.left_to_pay)+'</b>') : '')+
+        '. Фактические оплаты нужно проверить отдельно. <a href="/replenish#orders">Посмотреть заказы</a></div>';
     }
 
     // Решение владельца D-23: нельзя молча показывать общий бюджет как полный,
@@ -966,7 +997,9 @@
       plural(bi.positions, "позиция", "позиции", "позиций")+' без себестоимости ('+
       fmt(bi.units)+' шт): '+esc((bi.names||[]).join(", "))+
       '. Их стоимость в сумму не входит — не потому, что они бесплатны, а потому '+
-      'что цифры нет. Заполните себестоимость в МойСкладе, чтобы увидеть настоящую сумму.'+
+      'что цифры нет. '+(bi.new_item_positions ?
+        'Укажите стоимость новинок в анкете; себестоимость каталожных позиций заполните в МойСкладе.' :
+        'Заполните себестоимость в МойСкладе, чтобы увидеть настоящую сумму.')+
       '</div>') : "";
 
     document.getElementById("planBox").innerHTML =
@@ -1018,7 +1051,8 @@
       ((p.stop||[]).length ? '<div class="err">'+
         (p.stop||[]).map(function(x){ return esc(x.text); }).join('. ')+'</div>' : '')+
       '<div class="actions" style="margin:14px 0 18px">'+
-        '<button class="go-btn" id="mkOrder">Создать заказ</button>'+
+        '<button class="go-btn" id="mkOrder">Создать черновик</button>'+
+        '<button class="go-btn ghost" id="recalcPlan" onclick="preview(3,true)">Пересчитать</button>'+
         '<button class="go-btn ghost" onclick="go(1)">← Изменить условия</button>'+
         '<span class="hint" id="mkHint"></span></div>'+
       (notIn ? ('<div class="fold"><details><summary>'+lostTitle+
@@ -1232,7 +1266,7 @@
     var b = brief(); b.overrides = STATE.edits;
     var flags = {force:false, confirm_partial:false};
     api("/api/order-plan", b).then(function(res){
-      hint.textContent = "создаю заказ…";
+      hint.textContent = "создаю черновик…";
       var pr = curProd();
       var name = (pr ? pr.name : "Заказ") + " · " + dstr(STATE.plan.eta_date);
       // 409 от сервера — это не ошибка, а вопрос: похоже на дубль / история
