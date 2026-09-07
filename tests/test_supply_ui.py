@@ -3963,6 +3963,8 @@ def supply_fix_3_ui(pw, base, c) -> None:
         ("P1 черновик партии", lambda: _fix3_stale_batch(page, base, c, "desktop")),
         ("P1 черновик переноса", lambda: _fix3_stale_move(page, base, c, "desktop")),
         ("сторож своей записи", lambda: _fix3_own_save_rebase(page, base, c, "desktop")),
+        # Корректив 4: повтор поступка не воскрешает старый черновик.
+        ("P1 повтор и правка", lambda: _fix3_replay_then_edit(page, base, c, "desktop")),
     )
     for label, run_step in steps:
         try:
@@ -4972,6 +4974,124 @@ def _fix3_own_save_rebase(page, base, c, tag: str) -> None:
           row[0]["title"] if row else "нет строки")
 
 
+def _fix3_replay_then_edit(page, base, c, tag: str) -> None:
+    """Корректив 4: повтор поступка не имеет права оставить чужие данные под
+    старым черновиком.
+
+    ЦЕПОЧКА, И КАЖДОЕ ЕЁ ЗВЕНО ОБЯЗАТЕЛЬНО. Человек правит название материала;
+    запрос ДОХОДИТ до сервера и там применяется, а ответ теряется (обрыв после
+    коммита — имитируем честно, а не подделкой ответа). Сосед в это время ставит
+    количество 40 на свежей редакции. Человек повторяет то же нажатие — замок
+    поступка (`op_id`) узнаёт повтор и отвечает 200, ничего не записывая. И вот
+    здесь начинается предмет проверки: форма пересобирается, и если ей вернуть
+    ПРЕЖНИЕ значения черновика поверх свежей редакции, то следующая правка
+    молча вернёт соседские 40 к своим 25.
+
+    Проверяется не только итог, но и то, что человек ВИДИТ между шагами:
+    количество в форме после повтора обязано быть текущим, а не прежним. Итог
+    без этого доказывал бы меньше: правильное число могло бы совпасть случайно.
+    """
+    print(f"\n== Корректив 4: повтор поступка не воскрешает старый черновик ({tag}) ==")
+    board = c.post(P3 + "/materials",
+                   json={"title": f"Ткань-повтор {tag}", "qty": "25", "unit": "м",
+                         "op_id": f"c4-m-{tag}"}).json()
+    mid = [m for m in board["materials"]
+           if m["title"] == f"Ткань-повтор {tag}"][0]["id"]
+
+    page.goto(f"{base}/supply")
+    page.wait_for_timeout(1200)
+    close_hint(page)
+    opened = page.evaluate("""(id) => {
+      const card = document.querySelector('[data-pl="material"][data-id="' + id + '"]');
+      if (!card) return 'карточки нет';
+      const btn = card.querySelector('button[data-inline="edit"]');
+      if (!btn) return 'кнопки правки нет';
+      btn.click();
+      return card.querySelector('form.pl-form.inline') ? '' : 'форма не открылась';
+    }""", str(mid))
+    check(f"{tag}: форма правки открыта", opened == "", str(opened))
+    if opened:
+        return
+    page.wait_for_timeout(250)
+
+    def type_title_and_save(value):
+        page.evaluate("""(a) => {
+          const box = document.querySelector('[data-pl="material"][data-id="' + a[0]
+                                             + '"] form.pl-form.inline');
+          const t = box.querySelector('input[type=text], input:not([type])');
+          t.value = a[1];
+          // Событие ввода — как у человека: оно снимает прежнюю идентичность
+          // поступка, потому что это уже другая правка.
+          t.dispatchEvent(new Event('input', {bubbles: true}));
+          box.querySelector('button[type=submit]').click();
+        }""", [str(mid), value])
+        page.wait_for_timeout(1500)
+
+    def lose(route):
+        # Сервер запрос ИСПОЛНЯЕТ, страница ответа не получает.
+        try:
+            route.fetch()
+        finally:
+            route.abort()
+
+    page.route(f"**/api/supply/planning/materials/{mid}/update", lose)
+    type_title_and_save(f"Правка один {tag}")
+    page.unroute(f"**/api/supply/planning/materials/{mid}/update")
+    lost = [m for m in c.get(P3).json()["materials"] if m["id"] == mid]
+    check(f"{tag}: сервер применил правку, хотя ответ не дошёл",
+          bool(lost) and lost[0]["title"] == f"Правка один {tag}",
+          lost[0]["title"] if lost else "нет строки")
+
+    peer = c.post(P3 + f"/materials/{mid}/update",
+                  json={"qty": "40", "rev": lost[0]["rev"], "op_id": f"c4-peer-{tag}"})
+    check(f"{tag}: сосед поставил количество 40", peer.status_code == 200,
+          f"{peer.status_code}: {peer.text[:120]}")
+
+    # Повтор ТОГО ЖЕ нажатия: форма не тронута, идентичность поступка прежняя.
+    page.evaluate("""(id) => {
+      const box = document.querySelector('[data-pl="material"][data-id="' + id
+                                         + '"] form.pl-form.inline');
+      box.querySelector('button[type=submit]').click();
+    }""", str(mid))
+    page.wait_for_timeout(1500)
+    after_retry = [m for m in c.get(P3).json()["materials"] if m["id"] == mid]
+    check(f"{tag}: повтор поступка чужую правку не тронул — 40 на месте",
+          bool(after_retry) and after_retry[0]["qty"] == 40,
+          str(after_retry[0]["qty"]) if after_retry else "нет строки")
+
+    shown = page.evaluate("""(id) => {
+      const box = document.querySelector('[data-pl="material"][data-id="' + id
+                                         + '"] form.pl-form.inline');
+      if (!box) return null;
+      const fields = [...box.querySelectorAll('input')];
+      return {rev: box.dataset.rev || '',
+              qty: fields.length > 1 ? fields[1].value : null};
+    }""", str(mid))
+    check(f"{tag}: форма после повтора показывает ТЕКУЩЕЕ количество, а не прежнее",
+          bool(shown) and shown["qty"] == "40", str(shown))
+    check(f"{tag}: и редакция в форме та же, из которой взяты эти значения",
+          bool(shown) and shown["rev"] == str(after_retry[0]["rev"]),
+          f"{shown['rev'] if shown else '—'} против {after_retry[0]['rev'] if after_retry else '—'}")
+
+    # Следующая правка человека: она обязана лечь ПОВЕРХ правды, а не поверх
+    # своего прежнего черновика.
+    type_title_and_save(f"Правка два {tag}")
+    final = [m for m in c.get(P3).json()["materials"] if m["id"] == mid]
+    err = page.evaluate("""(id) => {
+      const card = document.querySelector('[data-pl="material"][data-id="' + id + '"]');
+      const box = card && card.querySelector('form.pl-form.inline');
+      const e = box && box.querySelector('.pl-form-err');
+      return e ? e.textContent.trim() : '';
+    }""", str(mid))
+    check(f"{tag}: следующая правка прошла без отказа", err == "", err[:160])
+    check(f"{tag}: и чужие 40 НЕ вернулись к 25",
+          bool(final) and final[0]["qty"] == 40,
+          str(final[0]["qty"]) if final else "нет строки")
+    check(f"{tag}: а собственная правка названия применена",
+          bool(final) and final[0]["title"] == f"Правка два {tag}",
+          final[0]["title"] if final else "нет строки")
+
+
 def _fix3_mobile(browser, base, c) -> None:
     """Те же два свойства на телефоне: список единиц и фокус в окне 390x844."""
     print("\n== F-16/F-21 на телефоне 390x844 ==")
@@ -5010,7 +5130,9 @@ def _fix3_mobile(browser, base, c) -> None:
                             ("P1 пустая единица",
                              lambda: _fix3_empty_unit_ui(page, base, c, "mobile")),
                             ("P1 черновик материала",
-                             lambda: _fix3_stale_material(page, base, c, "mobile"))):
+                             lambda: _fix3_stale_material(page, base, c, "mobile")),
+                            ("P1 повтор и правка",
+                             lambda: _fix3_replay_then_edit(page, base, c, "mobile"))):
         try:
             run_step()
         except Exception as exc:  # noqa: BLE001 — важен отчёт, а не тип
