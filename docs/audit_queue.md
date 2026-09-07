@@ -1,5 +1,19 @@
 # Independent audit queue
 
+## Completed local CLAIM — A07 startup compatibility sentinel
+
+BRANCH: codex/audit-a07-startup-compat. BASE_RUNTIME:8b041c7.
+FILES: tests/test_supply_planning.py, docs/audit_queue.md.
+SOURCE: full strictc0014db, supply_planning355 OK/1 FAIL: old assertion
+expects14 startup steps after A07 adds terminal step15. DONE_WHEN: require
+all15 exact step identities without weakening the checks for released1–14;
+the complete supply-planning suite passes. Runtime/formulas unchanged.
+RESULT: supply_planning357 OK/0 FAIL, exit0;
+/private/tmp/a07-startup-supply-planning-green.log. All previous step identity
+assertions remain; step15 is checked explicitly. Full strict remains non-green.
+Separate follow-up: supply_sheets is running on isolated port18964 after
+strict's port8845 conflict; /private/tmp/audit-supply-sheets-isolated.log.
+
 ## Completed local CLAIM — integrated validation and current queue
 
 BRANCH: codex/audit-validation-c0014db.
