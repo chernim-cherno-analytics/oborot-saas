@@ -1032,6 +1032,38 @@ def api_checks() -> None:
         check("по позициям открытых заказов видно количество",
               op["by_base"] and sum(op["by_base"].values()) == made["total_qty"],
               str(sum(op["by_base"].values())))
+        # A07: изменение справочника не переписывает условия принятого плана.
+        original_terms = _sql("SELECT stages_json FROM productions WHERE id=?", lab["id"])[0][0]
+        original_computed = _sql("SELECT computed_json FROM order_plans WHERE id=?", saved["id"])[0][0]
+        original_plan_org = _sql("SELECT org_id FROM order_plans WHERE id=?", saved["id"])[0][0]
+        frozen_payments = next(o["payments"] for o in op["orders"] if o["id"] == made["id"])
+        changed_terms = [{"name": "A07 новые условия", "lead_days": 90,
+                          "cost_share": 1, "prepay_share": 1}]
+        check("A07 новые условия справочника сохранены",
+              c.post(f"/api/productions/{lab['id']}/setup", json={"stages": changed_terms}).status_code == 200)
+
+        def order_payments_now():
+            rows = c.get("/api/orders/open", params={"production_id": lab["id"]}).json()["orders"]
+            return next(o["payments"] for o in rows if o["id"] == made["id"])
+
+        check("A07 календарь принятого плана сохраняет исходные условия",
+              order_payments_now() == frozen_payments)
+        _sql("UPDATE order_plans SET computed_json=? WHERE id=?", '{"stages":"invalid"}', saved["id"])
+        fallback_payments = order_payments_now()
+        check("A07 повреждённый снимок сохраняет прежний fallback",
+              fallback_payments and fallback_payments[0]["label"] == "A07 новые условия")
+        _sql("UPDATE order_plans SET computed_json=? WHERE id=?", original_computed, saved["id"])
+        foreign_org = _sql("SELECT org_id FROM productions WHERE id=?", foreign_pid)[0][0]
+        _sql("UPDATE order_plans SET org_id=? WHERE id=?", foreign_org, saved["id"])
+        check("A07 снимок другой организации не используется",
+              order_payments_now() == fallback_payments)
+        _sql("UPDATE order_plans SET org_id=? WHERE id=?", original_plan_org, saved["id"])
+        check("A07 восстановленный свой снимок снова задаёт условия",
+              order_payments_now() == frozen_payments)
+        check("A07 исходные условия справочника восстановлены",
+              c.post(f"/api/productions/{lab['id']}/setup",
+                     json={"stages": _gate_json.loads(original_terms)}).status_code == 200)
+
         other = c.get("/api/orders/open", params={"production_id": china["id"]}).json()
         check("фильтр по каналу не показывает чужие заказы",
               other["count"] == 0, str(other["count"]))

@@ -16,7 +16,7 @@ forget the remaining audit items. Formula changes remain prohibited.
 | A04 Explicit zero safety stock becomes 14 | Open, explicit formula/product decision required | Preserve reproduction and narrow decision; do not change calculation by default |
 | A05 Simple order loses cost basis, production and author | Metadata package locally implemented; planner 313, execution 164, browser 37 checks pass | Independent review/publication pending; supplier-price versus full-cost semantics remain open |
 | A06 Total quantity differs from size quantities | Released, confirmed by owner-control history | Do not implement again; existing regressions remain |
-| A07 New production terms alter historical payment calendar | Reproduced even with an existing frozen plan: two payments of 500 become one payment of 1000 after changing production | Next: use existing frozen plan terms for plan-backed orders without schema changes; /private/tmp/a07-current-reproduction.json; simple orders, placement dates and payment facts remain separate |
+| A07 New production terms alter historical payment calendar | Plan-backed orders now use their frozen terms locally; 506 checks pass | Independent review/publication pending; simple orders, placement dates and payment facts remain open; /private/tmp/a07-current-reproduction.json |
 | A08 Received status falsely confirms execution | Local fix034eab8; not released | Independent review pending; existing partial-evidence contract retained, not blanket equivalence of both APIs |
 | A09 Invalidated cache can republish an obsolete snapshot | Open, P2 after pilot in original priority | Read-only current verification; no repeated prohibited concurrency experiment |
 
@@ -89,3 +89,15 @@ DONE_WHEN: server stop reasons and can_create=false disable the create-order
 button; a subsequent valid recalculation enables it. Real Chromium behavioral
 regression, no formula or API changes. Relevant to remaining A01/A02/A03 UI.
 RESULT: 44 browser checks pass, including invalid-to-valid recalculation.
+
+## Completed local CLAIM A07 frozen plan terms
+
+BRANCH: codex/audit-a07-frozen-plan-terms. BASE: 959a569.
+FILES: app/api.py (_order_stages), tests/test_planner.py, docs/audit_queue.md,
+docs/audit_a07_evidence.md.
+DONE_WHEN: orders with an applied plan use that same-organization plan's
+existing computed stage snapshot even after production terms change; corrupt,
+missing or foreign snapshots retain the legacy fallback. API regression must
+prove both isolation and unchanged saved terms. No schema or formula changes.
+EXCLUSIONS: new snapshot storage for simple orders, placement-date policy,
+payment confirmation, historic backfill, SUPPLY files, release bypass.

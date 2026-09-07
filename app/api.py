@@ -221,7 +221,28 @@ CASH_WEEKS = 16
 
 
 def _order_stages(db: Session, order: ProductionOrder, settings: dict) -> list[dict]:
-    """Этапы канала заказа (или один этап на общий срок производства)."""
+    """Сохранённые этапы принятого плана; для старых заказов — этапы канала."""
+    from app.models import OrderPlan
+
+    saved = db.execute(select(OrderPlan.computed_json).where(
+        OrderPlan.org_id == order.org_id,
+        OrderPlan.production_order_id == order.id,
+        OrderPlan.status == "applied",
+    ).order_by(OrderPlan.id).limit(1)).scalar_one_or_none()
+    try:
+        computed = json.loads(saved or "{}")
+    except (TypeError, ValueError):
+        computed = {}
+    stages = computed.get("stages") if isinstance(computed, dict) else None
+    # Снимок уже нормализован и показан человеку. Не заменяем его условиями
+    # сегодняшнего справочника и не нормируем доли повторно.
+    if (isinstance(stages, list) and stages and all(
+            isinstance(st, dict) and isinstance(st.get("name"), str)
+            and type(st.get("lead_days")) is int and 0 <= st["lead_days"] <= 365
+            and all(type(st.get(k)) in (int, float) and 0 <= st[k] <= 1
+                    for k in ("cost_share", "prepay_share"))
+            for st in stages) and sum(st["cost_share"] for st in stages) > 0):
+        return stages
     raw = None
     if order.production_id:
         prod = db.get(Production, order.production_id)
