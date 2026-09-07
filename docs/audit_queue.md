@@ -1,5 +1,24 @@
 # Independent audit queue
 
+## Completed local CLAIM — A05 missing purchase price versus explicit zero
+
+BRANCH: codex/audit-a05-price-presence. SOURCE: PR56 comment3950691498.
+FILES: app/models.py, app/ms_sync.py, app/ms_writeback.py, app/main.py,
+app/startup_schema.py if it owns the startup list; tests/test_writeback.py,
+tests/test_startup_lifecycle.py, tests/test_supply_planning.py,
+tests/test_supply_sheets.py, docs/audit_a05_evidence.md, docs/audit_queue.md.
+DONE_WHEN: a real omitted buyPrice cannot become a saved/sendable zero,
+explicit source zero remains usable, inherited catalogue price formulas stay
+unchanged, terminal additive migration preserves all existing startup steps.
+Existing catalogue zero without presence evidence must require resync.
+SCOPE ADDITION before edit: DECISIONS.md, because D-58's original no-migration
+statement is superseded by the required source-presence field.
+RESULT: RED writeback145/3; GREEN150/0. Supply planning358/0.
+Startup lifecycle177/1 was solely the old range1..15 assertion; corrected
+clean-database group8/0. Other177 checks passed; hosted full CI must verify
+the final revision. Manual source-inheritance and migration/old-writer probes
+passed. Logs:/private/tmp/a05-presence-{red,final,supply,startup,startup-focused}.log.
+
 ## Completed local CLAIM — scoped publication mandate clarification
 
 BRANCH: codex/audit-publication-mandate. BASE:4c25f37. FILES: AGENTS.md,

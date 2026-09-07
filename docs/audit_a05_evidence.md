@@ -1,5 +1,39 @@
 # A05: simple-order production and author
 
+## PR56 correction: missing buyPrice is not explicit zero
+
+Review3950691498 reproduced a real defect: sync collapsed missing buyPrice
+and explicit zero to cost_price=0. The former snapshot accepted both as zero.
+The integration reproduction passes omitted buyPrice through the real parser
+and field persistence, creates an order through the API and attempts mock
+writeback: RED145 OK/3 FAIL, /private/tmp/a05-presence-red.log.
+
+A separate buy_price_zero_explicit source flag now preserves this distinction.
+Nonzero cost and its existing parent inheritance remain unchanged; an explicit
+variant zero is preserved for writeback even where analytics retains its old
+parent-cost fallback. An inherited explicit parent zero remains known. Without
+zero evidence, zero is omitted from new snapshots and sending returns422.
+The integration tests no longer fabricate an empty snapshot to prove refusal;
+they exercise source parsing, persistence, API creation and document sending.
+
+This supersedes the original no-migration statement: terminal step16 adds one
+Boolean column with default false. Existing15 steps are unchanged, no old zero
+is declared known by backfill, and old-writer INSERTs get false. Existing zero
+catalogue values require a fresh sync before new zero-priced orders can send.
+Historical order snapshots are not repriced. If rolling back to an older sync
+writer, perform a full catalogue sync with this corrected writer before enabling
+new snapshot creation again: the old writer does not maintain the new flag.
+
+Local migration checks: additive ALTER twice, existing zero and positive rows
+keep false, old-writer INSERT receives false. Parser probes preserve explicit
+variant zero and inherited positive/zero while rejecting missing source zero.
+Hosted strict CI passed both original published heads; corrected HEAD needs a
+fresh hosted run and independent review, not self-acceptance.
+GREEN writeback150/0 and supply planning358/0. Startup lifecycle177/1 had only
+the stale range1..15 assertion; after correction its clean-database group8/0.
+Logs:/private/tmp/a05-presence-final.log, /private/tmp/a05-presence-supply.log,
+/private/tmp/a05-presence-startup.log and /private/tmp/a05-presence-startup-focused.log.
+
 ## Completion: cost basis and document price, 07 September
 
 The owner explicitly delegated the price decision to the project's existing

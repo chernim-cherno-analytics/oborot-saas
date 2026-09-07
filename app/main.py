@@ -254,6 +254,7 @@ STARTUP_SCHEMA_STEPS: tuple[tuple[str, int], ...] = (
     # и новая таблица не получила бы колонку вовсе.
     ("models.ensure_supply_assignment_archive_schema", 14),
     ("models.ensure_order_payment_terms_schema", 15),
+    ("models.ensure_buy_price_presence_schema", 16),
 )
 _STARTUP_STEP_ORDER = dict(STARTUP_SCHEMA_STEPS)
 
@@ -459,6 +460,8 @@ def _startup() -> None:
                   _models.ensure_supply_assignment_archive_schema)
     _startup_step("models.ensure_order_payment_terms_schema",
                   _models.ensure_order_payment_terms_schema)
+    _startup_step("models.ensure_buy_price_presence_schema",
+                  _models.ensure_buy_price_presence_schema)
     # Замок на пропуск: все объявленные шаги выполнены, и ровно они.
     _finish_startup_steps()
     global _STARTUP_DONE

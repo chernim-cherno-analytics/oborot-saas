@@ -1984,6 +1984,12 @@ def _has_stock_rows(org_id: int) -> bool:
 _IMPORTED_TYPES = ("product", "variant")
 
 
+def _explicit_buy_price_zero(row: dict) -> bool:
+    price = row.get("buyPrice")
+    value = price.get("value") if isinstance(price, dict) else None
+    return type(value) in (int, float) and value == 0
+
+
 def _parse_assortment(rows: list[dict], org_id: int = 0) -> list[dict]:
     """Строки ассортимента → атрибуты наших products.
 
@@ -2000,6 +2006,7 @@ def _parse_assortment(rows: list[dict], org_id: int = 0) -> list[dict]:
                 "category": _category_of(row),
                 "sale_price": _sale_price_of(row, org_id),
                 "cost_price": _kopecks((row.get("buyPrice") or {}).get("value")),
+                "buy_price_zero_explicit": _explicit_buy_price_zero(row),
                 "cost_full": _cost_full_of(row, org_id),
                 "supplier": _supplier_of(row, org_id),
                 "supplier_link": _supplier_link_present(row),
@@ -2024,6 +2031,7 @@ def _parse_assortment(rows: list[dict], org_id: int = 0) -> list[dict]:
                 "category": parent["category"],
                 "sale_price": parent["sale_price"],
                 "cost_price": parent["cost_price"],
+                "buy_price_zero_explicit": parent["buy_price_zero_explicit"],
                 "cost_full": parent["cost_full"],
                 "supplier": parent["supplier"],
                 "supplier_link": parent["supplier_link"],
@@ -2060,6 +2068,11 @@ def _parse_assortment(rows: list[dict], org_id: int = 0) -> list[dict]:
             "category": parent["category"] if parent else _category_of(row),
             "sale_price": sale_price,
             "cost_price": cost_price,
+            "buy_price_zero_explicit": (
+                _explicit_buy_price_zero(row)
+                or (not (row.get("buyPrice") or {}).get("value")
+                    and bool(parent and parent["buy_price_zero_explicit"]))
+            ),
             "cost_full": cost_full,
             "supplier": supplier,
             "supplier_link": supplier_link,
@@ -2271,6 +2284,7 @@ def _apply_product_fields(row: Product, item: dict, suppliers_ok: bool) -> None:
     if suppliers_ok or not item.get("supplier_link"):
         row.supplier = item.get("supplier") or ""
     row.cost_price = item["cost_price"]
+    row.buy_price_zero_explicit = bool(item.get("buy_price_zero_explicit"))
     row.archived = item["archived"]
 
 

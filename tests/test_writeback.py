@@ -1071,12 +1071,36 @@ def run_scenario() -> int:
     lock_client.close()
 
     print("== A05 отсутствующая цена не подменяется себестоимостью ==")
+    from app import ms_sync as _price_sync
+    from app.models import Product as _PriceProduct
+    price_parent = {"id":"price-parent", "meta":{"type":"product"}, "name":"Price probe",
+                    "buyPrice":{"value":10000}}
+    price_variant = {"id":"price-variant", "meta":{"type":"variant"}, "name":"Price probe (S)",
+                     "product":{"meta":{"href":"https://mock/product/price-parent"}}, "buyPrice":{"value":0}}
+    parsed_zero = _price_sync._parse_assortment([price_parent, price_variant], 1)[-1]
+    check("A05 явный ноль варианта различается с унаследованной ценой без изменения аналитики",
+          parsed_zero["cost_price"] == 100 and parsed_zero["buy_price_zero_explicit"] is True)
+    price_variant.pop("buyPrice")
+    parsed_inherited = _price_sync._parse_assortment([price_parent, price_variant], 1)[-1]
+    check("A05 наследование ненулевой цены родителя сохранено",
+          parsed_inherited["cost_price"] == 100 and parsed_inherited["buy_price_zero_explicit"] is False)
+    def sync_probe_price(buy_price):
+        with _SL() as db:
+            product = db.query(_PriceProduct).filter_by(org_id=1, base_name="Худи «Штрих»", size="S").first()
+            raw = {"id":product.ext_id, "meta":{"type":"product"}, "name":product.base_name}
+            if buy_price is not None:
+                raw["buyPrice"] = buy_price
+            parsed = _price_sync._parse_assortment([raw], 1)[0]
+            parsed["size"] = product.size
+            _price_sync._apply_product_fields(product, parsed, True)
+            db.commit()
+    sync_probe_price(None)
     price_probe = client.post("/api/orders", json={"name":"A05 missing supplier price",
         "items":[{"base_name":"Худи «Штрих»", "qty":2, "sizes":{"S":2}}]}).json()["id"]
     with sqlite3.connect(DB_PATH) as con:
         probe_items = json.loads(con.execute("SELECT items_json FROM production_orders WHERE id=?", (price_probe,)).fetchone()[0])
-        probe_items[0]["supplier_prices"] = {}
-        con.execute("UPDATE production_orders SET items_json=? WHERE id=?", (json.dumps(probe_items), price_probe))
+        check("A05 пропущенный buyPrice не становится сохранённым нулём",
+              "S" not in probe_items[0]["supplier_prices"])
     documents_before = len(mock_ms.CREATED_PURCHASE_ORDERS)
     price_refusal = client.post(f"/api/orders/{price_probe}/push-to-ms")
     check("A05 нет сохранённой цены — управляемый отказ до создания документа",
@@ -1089,6 +1113,12 @@ def run_scenario() -> int:
     check("A05 явная нулевая цена сохранена, повтор после отказа работает",
           price_retry.status_code == 200
           and mock_ms.CREATED_PURCHASE_ORDERS[-1]["positions"][0]["price"] == 0)
+    sync_probe_price({"value":0})
+    source_zero = client.post("/api/orders", json={"name":"A05 explicit source zero",
+        "items":[{"base_name":"Худи «Штрих»", "qty":2, "sizes":{"S":2}}]}).json()["id"]
+    zero_push = client.post(f"/api/orders/{source_zero}/push-to-ms")
+    check("A05 явный buyPrice=0 проходит синк, сохранение и отправку",
+          zero_push.status_code == 200 and mock_ms.CREATED_PURCHASE_ORDERS[-1]["positions"][0]["price"] == 0)
     legacy_probe = client.post("/api/orders", json={"name":"A05 legacy price",
         "items":[{"base_name":"Худи «Штрих»", "qty":2, "sizes":{"S":2}}]}).json()["id"]
     with sqlite3.connect(DB_PATH) as con:
