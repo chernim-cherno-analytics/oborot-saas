@@ -2710,6 +2710,14 @@ document.addEventListener("DOMContentLoaded", function () {
           kind: card.dataset.pl,
           id: card.dataset.id,
           name: box.dataset.inline,
+          // ИДЕНТИЧНОСТЬ ПОСТУПКА ПЕРЕЖИВАЕТ ПЕРЕРИСОВКУ. Без неё повтор после
+          // ПОТЕРЯННОГО ответа (сервер записал, ответ не дошёл) приходил под
+          // новым `op_id`, замок повторного поступка его не узнавал, и то же
+          // назначение прибавлялось второй раз — расписанный метраж удваивался
+          // без действия человека. Форма после перерисовки — новый узел, и
+          // `dataset.opId` исчезал вместе со старым; значит, его надо снять и
+          // вернуть так же, как значения полей.
+          opId: box.dataset.opId || "",
           // Файловое поле не восстанавливается и восстановлено быть не может:
           // выбранный файл принадлежит окну выбора, а не нам. Пишем пустую
           // строку, чтобы длины списков совпадали, и не делаем вид, что файл
@@ -2737,6 +2745,10 @@ document.addEventListener("DOMContentLoaded", function () {
         if (!card.querySelector(".pl-form.inline")) btn.click();
         var box = card.querySelector(".pl-form.inline");
         if (!box) return;
+        // Токен возвращается ПЕРВЫМ и до значений: если человек тронет поле
+        // после восстановления, `bindTokenReset` честно снимет его сам — это
+        // уже другая правка и другой поступок.
+        if (item.opId) box.dataset.opId = item.opId;
         var fields = [].slice.call(box.querySelectorAll("input, select, textarea"));
         var chosen = [];
         item.values.forEach(function (value, i) {

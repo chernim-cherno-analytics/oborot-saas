@@ -2728,6 +2728,11 @@ def supply_fix_3_checks() -> None:
         ("F-18 запятая", lambda: _fix3_comma(c)),
         ("F-19 частичный срок", lambda: _fix3_partial_due(c)),
         ("F-20 тексты", lambda: _fix3_texts(c)),
+        # Корректив 2 по REVIEW_REJECT round 2: воспроизведённые P1 внешних
+        # тредов. Отдельными шагами по той же причине, что и всё выше: один
+        # 500 не должен уносить с собой соседние проверки.
+        ("P1 пустая единица", lambda: _fix3_empty_unit(c)),
+        ("P1 длинное число", lambda: _fix3_long_digits(c)),
     )
     for label, run_step in steps:
         try:
@@ -3259,6 +3264,147 @@ def _fix3_texts(c) -> None:
     check("подпись раздела — одна утверждённая фраза",
           board.get("disclaimer") == "Это план: заказы, «Едет» и бюджет он не меняет.",
           repr(board.get("disclaimer")))
+
+
+def _fix3_empty_unit(c) -> None:
+    """P1 (тред r3948822957): пустая своя единица молча подменяла величину.
+
+    ЧТО ЗДЕСЬ ДОКАЗЫВАЕТСЯ ДВУМЯ РАЗНЫМИ СПОСОБАМИ. Что новое правило работает —
+    отказом и неизменной строкой. И что оно НЕ съело существующий контракт
+    ручки: пропущенный ключ `unit` при создании по-прежнему даёт «м», а при
+    правке не трогает единицу вовсе. Второе важнее первого: правило, закрывшее
+    дефект и сломавшее соседний договор, — не исправление.
+    """
+    print("\n== P1: «другое» без своей единицы больше не превращает кг в м ==")
+    mat = c.post(P2 + "/materials",
+                 json={"title": "Фурнитура-пустая", "qty": "10", "unit": "кг",
+                       "op_id": "c2-u1"}).json()
+    row = [m for m in mat["materials"] if m["title"] == "Фурнитура-пустая"][0]
+
+    empty = c.post(P2 + f"/materials/{row['id']}/update",
+                   json={"unit": "", "rev": row["rev"], "op_id": "c2-u2"})
+    check("явно пустая единица при правке отвергнута", empty.status_code == 400,
+          f"{empty.status_code}: {empty.text[:120]}")
+    check("и отказ называет, чего не хватает",
+          "Укажите единицу." in empty.text, empty.text[:160])
+    after = [m for m in c.get(P2).json()["materials"] if m["id"] == row["id"]][0]
+    check("а единица в строке НЕ подменена: килограммы остались килограммами",
+          after["unit"] == "кг", after["unit"])
+    check("и редакция строки не сдвинулась — записи не было",
+          after["rev"] == row["rev"], f"{row['rev']} → {after['rev']}")
+
+    # Своя строка и здесь: иначе на дереве без правки проба упёрлась бы в `rev`,
+    # сдвинутый молчаливой записью выше, и покраснела бы не своим цветом.
+    blank = _fix2_new_material(c, "Килограммы-пробелы", "c2-u3a", qty=10, unit="кг")
+    spaces = c.post(P2 + f"/materials/{blank['id']}/update",
+                    json={"unit": "   ", "rev": blank["rev"], "op_id": "c2-u3"})
+    check("одни пробелы — тот же отказ, а не «своя единица из пробелов»",
+          spaces.status_code == 400, f"{spaces.status_code}: {spaces.text[:120]}")
+    blank_after = [m for m in c.get(P2).json()["materials"] if m["id"] == blank["id"]]
+    check("и величина от пробелов тоже не подменилась",
+          bool(blank_after) and blank_after[0]["unit"] == "кг",
+          blank_after[0]["unit"] if blank_after else "нет строки")
+
+    born = c.post(P2 + "/materials",
+                  json={"title": "Создание с пустой", "qty": "5", "unit": "",
+                        "op_id": "c2-u4"})
+    check("тот же жест при СОЗДАНИИ тоже отвергнут", born.status_code == 400,
+          f"{born.status_code}: {born.text[:120]}")
+    born_rows = [m for m in c.get(P2).json()["materials"]
+                 if m["title"] == "Создание с пустой"]
+    check("и строка не завелась", not born_rows,
+          "" if not born_rows else "строка появилась")
+
+    # ── Сторожа существующего контракта ручки ────────────────────────────────
+    plain = c.post(P2 + "/materials",
+                   json={"title": "Без ключа единицы", "qty": "5",
+                         "op_id": "c2-u5"})
+    made = [m for m in plain.json().get("materials", [])
+            if m["title"] == "Без ключа единицы"]
+    check("пропущенный ключ при создании по-прежнему даёт «м»",
+          plain.status_code == 200 and bool(made) and made[0]["unit"] == "м",
+          f"{plain.status_code}: {made[0]['unit'] if made else 'нет строки'}")
+
+    # СТОРОЖА БЕРУТ СВОЮ СТРОКУ, А НЕ ПРОДОЛЖАЮТ ПРЕДЫДУЩУЮ. На дереве без
+    # правки первая же проверка выше делает молчаливую запись и двигает `rev`;
+    # если сторожа пойдут по той же строке, они покраснеют от чужого 409, а не
+    # от своего предмета — и красный список стал бы шире правды.
+    own = _fix2_new_material(c, "Килограммы-сторож", "c2-u6a", qty=10, unit="кг")
+    keep = c.post(P2 + f"/materials/{own['id']}/update",
+                  json={"qty": "12", "rev": own["rev"], "op_id": "c2-u6"})
+    kept = [m for m in keep.json().get("materials", []) if m["id"] == own["id"]]
+    check("пропущенный ключ при правке единицу не трогает",
+          keep.status_code == 200 and bool(kept) and kept[0]["unit"] == "кг",
+          f"{keep.status_code}: {kept[0]['unit'] if kept else 'нет строки'}")
+    check("и соседнее поле при этом правится как раньше",
+          bool(kept) and kept[0]["qty"] == 12, str(kept[0]["qty"]) if kept else "")
+
+    other = _fix2_new_material(c, "Килограммы-годная", "c2-u7a", qty=10, unit="кг")
+    ok_unit = c.post(P2 + f"/materials/{other['id']}/update",
+                     json={"unit": "метры", "rev": other["rev"], "op_id": "c2-u7"})
+    fresh = [m for m in ok_unit.json().get("materials", []) if m["id"] == other["id"]]
+    check("годная единица по-прежнему принимается и нормализуется",
+          ok_unit.status_code == 200 and bool(fresh) and fresh[0]["unit"] == "м",
+          f"{ok_unit.status_code}: {fresh[0]['unit'] if fresh else 'нет строки'}")
+
+
+def _fix3_long_digits(c) -> None:
+    """P1 (тред r3948610672): 4301 цифра в плане изделий давала 500.
+
+    Граница проверяется С ОБЕИХ СТОРОН. 4300 цифр Python разбирает и упирается в
+    наш потолок; 4301 он отказывается разбирать вовсе (`sys.int_max_str_digits`),
+    и прежде этот `ValueError` выходил мимо обработчика ручки пустым отказом
+    сервера. Ответ обязан быть одним и тем же: у одного отказа не бывает двух
+    лиц.
+
+    Проба идёт СВОИМ соединением: 500 рвёт keep-alive, и на дереве без правки
+    следующая проверка падала бы клиентской ошибкой вместо ответа сервера.
+    """
+    print("\n== P1: длинное целое в плане изделий — 400, а не 500 ==")
+    item = _fix3_new_item(c, "Вещь-длинная", "c2-d-i")
+    made = c.post(P2 + "/batches",
+                  json={"item_id": item, "title": "Партия-длинная", "plan_qty": "7",
+                        "op_id": "c2-d-b"}).json()
+    bid = [b for b in made["batches"] if b["title"] == "Партия-длинная"][0]
+
+    for digits in (4300, 4301, 5000):
+        own = _fix3_fresh(c)
+        try:
+            r = own.post(P2 + "/batches",
+                         json={"item_id": item, "title": f"Партия {digits}",
+                               "plan_qty": "9" * digits, "op_id": f"c2-d-{digits}"})
+            status, text = r.status_code, r.text[:120]
+        except Exception as exc:  # noqa: BLE001 — отказ соединения тоже результат
+            status, text = -1, f"{type(exc).__name__}: {exc}"
+        finally:
+            own.close()
+        check(f"план изделий из {digits} цифр даёт 400, а не 500", status == 400,
+              f"{status}: {text}")
+        check(f"и текст отказа тот же, что у любого превышения ({digits})",
+              "Максимум" in text, text[:120])
+
+    own = _fix3_fresh(c)
+    try:
+        upd = own.post(P2 + f"/batches/{bid['id']}/update",
+                       json={"plan_qty": "9" * 4301, "rev": bid["rev"],
+                             "op_id": "c2-d-upd"})
+        status, text = upd.status_code, upd.text[:120]
+    except Exception as exc:  # noqa: BLE001
+        status, text = -1, f"{type(exc).__name__}: {exc}"
+    finally:
+        own.close()
+    check("тот же ввод при ПРАВКЕ партии тоже даёт 400", status == 400,
+          f"{status}: {text}")
+
+    board = c.get(P2).json()
+    check("ни одной партии длинным числом не создано",
+          not [b for b in board["batches"] if b["title"].startswith("Партия 4")
+               or b["title"].startswith("Партия 5")],
+          str([b["title"] for b in board["batches"]])[:160])
+    survived = [b for b in board["batches"] if b["id"] == bid["id"]]
+    check("а прежний план партии остался целым",
+          bool(survived) and survived[0]["plan_qty"] == 7,
+          str(survived[0]["plan_qty"]) if survived else "нет строки")
 
 
 def run_preview_tool(argv: list) -> int:

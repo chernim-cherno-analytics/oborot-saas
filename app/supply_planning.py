@@ -208,6 +208,37 @@ def unit_key(raw) -> str:
 _UNIT_BY_KEY = {unit_key(u): u for u in UNIT_CHOICES}
 
 
+#: Единица по умолчанию у нового материала. Это существующий контракт ручки:
+#: тело без ключа `unit` заводит строку в метрах, и менять это здесь не за чем.
+UNIT_DEFAULT = "м"
+
+
+def parse_unit(payload: dict, *, fallback: str) -> str:
+    """Единица из тела запроса. ПРОПУЩЕННЫЙ ключ и ПУСТОЙ — разные вещи.
+
+    Ключа нет — берётся `fallback`: при создании это «м», при правке — то, что
+    уже стоит в строке. Так ручка вела себя с самого начала слоя, на это
+    рассчитывает и экран, и программный клиент, и ломать это нечем.
+
+    КЛЮЧ ЕСТЬ, А ЗНАЧЕНИЯ НЕТ — ЭТО НЕ «ПОДСТАВЬ УМОЛЧАНИЕ». Так выглядит
+    человек, выбравший в списке «другое» и не написавший свою единицу. Прежде
+    пустая строка была ложной и падала в то же `or "м"`, что и отсутствие
+    ключа: материал, заведённый в килограммах, молча становился метрами прямо в
+    данных владельца — при ответе 200 и без единого слова. Подмена величины
+    хуже отказа, поэтому теперь запись останавливается и называет, чего не
+    хватает.
+
+    Годных единиц и нормализации синонимов правило не касается: «кг» остаётся
+    «кг», «метры» по-прежнему становятся «м».
+    """
+    if "unit" not in payload:
+        return fallback
+    value = clean_text(payload.get("unit"), "единица", limit=MAX_UNIT_CHARS)
+    if not value:
+        raise ValidationError("Укажите единицу.")
+    return normalize_unit(value)
+
+
 def normalize_unit(raw) -> str:
     """Написание единицы при ЗАПИСИ. Старые строки этим не переписываются.
 
@@ -317,7 +348,17 @@ def parse_pieces(raw) -> float | None:
         text = raw.strip().replace(" ", "").replace(" ", "")
         if not re.fullmatch(r"\d+", text):
             raise bad
-        value = int(text)
+        try:
+            value = int(text)
+        except ValueError:
+            # ПИТОН ОТКАЗЫВАЕТСЯ РАЗБИРАТЬ ЦЕЛОЕ ДЛИННЕЕ 4300 ЦИФР
+            # (`sys.int_max_str_digits`), и делает это `ValueError`, а не
+            # переполнением. Проверка потолка стоит НИЖЕ по коду и до неё дело
+            # не доходило: отказ выходил мимо `except PlanningError` в ручке и
+            # становился пустым 500 на основном пути записи. Число из четырёх
+            # тысяч цифр заведомо больше миллиона, поэтому и ответ тот же, что
+            # у любого превышения: у одного отказа не должно быть двух лиц.
+            raise ValidationError(f"Максимум — {_max_qty_text()}.") from None
     elif isinstance(raw, int):
         value = raw
     elif isinstance(raw, float):
@@ -651,9 +692,9 @@ def create_material(db: Session, org_id: int, payload: dict, author: str) -> Sup
                        limit=MAX_TITLE_CHARS, required=True)
     qty = parse_qty(payload.get("qty"), "количество", allow_unknown=True)
     # ЕДИНИЦА НОРМАЛИЗУЕТСЯ ПРИ ЗАПИСИ (ТЗ F-16), и только при ней: уже
-    # введённые строки миграцией не переписываются.
-    unit = normalize_unit(clean_text(payload.get("unit") or "м", "единица",
-                                     limit=MAX_UNIT_CHARS))
+    # введённые строки миграцией не переписываются. Пропущенный ключ даёт «м» —
+    # это прежний контракт ручки; пустой присланный ключ даёт отказ, а не «м».
+    unit = parse_unit(payload, fallback=UNIT_DEFAULT)
     note = clean_text(payload.get("source_note"), "источник или комментарий",
                       limit=MAX_NOTE_CHARS)
     row = SupplyMaterial(org_id=org_id, title=title, qty=qty, unit=unit or "м",
@@ -696,9 +737,10 @@ def update_material(db: Session, org_id: int, material_id: int,
         # только программно, и следа не оставалось: «120» превращалось из метров
         # в килограммы, а сводка складывала это в новую корзину — при том, что
         # число не менялось ни на единицу. Такая правка обязана быть видна.
-        new_unit = normalize_unit(clean_text(payload.get("unit") or "м",
-                                             "единица",
-                                             limit=MAX_UNIT_CHARS)) or "м"
+        # `fallback` — ТЕКУЩАЯ единица строки, а не «м»: сюда попадают только с
+        # присланным ключом, и подставлять метры в чужие килограммы нельзя ни
+        # при каком значении этого ключа.
+        new_unit = parse_unit(payload, fallback=row.unit)
         if new_unit != row.unit:
             _journal(db, org_id, "material", row.id, "update", field="unit",
                      old=row.unit, new=new_unit, author=author, op_id=op_id)
