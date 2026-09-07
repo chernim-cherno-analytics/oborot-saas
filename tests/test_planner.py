@@ -1108,6 +1108,21 @@ def api_checks() -> None:
         check("история сохраняет действительную связь плана с заказом",
               identity_history[saved["id"]]["order_id"] == made["id"]
               and not identity_history[saved["id"]].get("order_missing"))
+        sent_reused = c.post(f"/api/orders/{reused['id']}/status", json={"status": "sent"})
+        received_reused = c.post(f"/api/orders/{reused['id']}/receipts",
+            json={"lines": [{"base_name": precise_item["base_name"], "qty": 1}]})
+        check("приёмка нового заказа записана для проверки переиспользованного ID",
+              sent_reused.status_code == 200 and received_reused.status_code == 200,
+              received_reused.text[:160])
+        stale_outcome = c.get(f"/api/order-plan/{precise_saved['id']}/outcome").json()
+        check("старый план не наследует заказ и приёмку по переиспользованному ID",
+              stale_outcome["order_id"] is None and stale_outcome["order_status"] is None
+              and not stale_outcome["execution_confirmed"]
+              and all(line["executed"] is None for line in stale_outcome["lines"]),
+              str(stale_outcome)[:250])
+        valid_outcome = c.get(f"/api/order-plan/{saved['id']}/outcome").json()
+        check("исполнение сохраняет действительную связь плана с заказом",
+              valid_outcome["order_id"] == made["id"])
         c.delete(f"/api/orders/{reused['id']}")
 
         other = c.get("/api/orders/open", params={"production_id": china["id"]}).json()

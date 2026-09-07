@@ -78,3 +78,27 @@ No full strict CI or independent review has run. Publication remains blocked
 by platform approval review. This is a separate local commit stacked on A02;
 an eventual separate PR must exclude the parent A02 diff. No migration is
 required; rollback is schema-compatible but restores the inaccurate flags.
+
+## Follow-up: outcome order identity
+
+The same actual API delete/create sequence used for A07 also exposed an
+outcome defect: the old plan accepted the replacement order with the reused
+SQLite ID, including its newly recorded receipt and confirmed flag. Outcome
+now requires the reciprocal order.order_plan_id written by the apply route,
+in addition to the existing same-organization and plan.production_order_id
+checks. It does not change receipt arithmetic or stored history.
+
+Behavioral RED: planner350 OK/1 FAIL, /private/tmp/outcome-identity-red.log.
+GREEN: planner351 OK/0 FAIL, /private/tmp/outcome-identity-green.log.
+The regression records a real receipt on the replacement order, verifies the
+old plan has no order/status/confirmed execution or executed quantities,
+and preserves a valid applied plan's order link.
+
+Compatibility limitation: legacy one-sided links cannot establish identity
+and now return no linked order/receipt evidence. No historic backfill is
+attempted. The existing execution test's direct-SQL A08 fixture initially
+created only one link (158 OK/6 FAIL); it now writes both links as the real
+apply route does. That fixture correction is not counted as behavioral RED.
+Final execution: 164 OK/0 FAIL, /private/tmp/outcome-identity-execution-green.log.
+Together with planner, 515 relevant checks pass. No full strict CI,
+independent review, publication or deployment is claimed for this package.

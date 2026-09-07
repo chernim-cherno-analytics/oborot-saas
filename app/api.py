@@ -2902,7 +2902,8 @@ def api_order_plan_outcome(
     order = None
     if row.production_order_id:
         candidate = db.get(ProductionOrder, row.production_order_id)
-        if candidate is not None and candidate.org_id == ctx.org.id:
+        if (candidate is not None and candidate.org_id == ctx.org.id
+                and candidate.order_plan_id == row.id):
             order = candidate
     received: dict[str, float] = {}
     execution_unknown = False

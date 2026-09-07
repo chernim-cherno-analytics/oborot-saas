@@ -308,6 +308,9 @@ def run() -> int:  # noqa: C901 — сценарный тест, ветвлен�
         "VALUES (2,'applied','{}','{}',?,?,CURRENT_TIMESTAMP)",
         json.dumps({"items": [{"base_name": name2, "qty": 10}]}), order2)
     local_plan = sql("SELECT id FROM order_plans WHERE production_order_id=?", order2)[0][0]
+    # Reproduce both links written by the real apply route: a lone reused
+    # production_order_id is not evidence that this is the plan's order.
+    _raw_sql("UPDATE production_orders SET order_plan_id=? WHERE id=?", local_plan, order2)
 
     def check_local_outcome(label, expected):
         outcome = c2.get(f"/api/order-plan/{local_plan}/outcome").json()

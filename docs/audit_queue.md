@@ -177,3 +177,15 @@ DONE_WHEN: history links only a same-organization order reciprocally linked
 to the plan; deleted/reused IDs show unavailable instead of linking a new
 order. Valid links and uncreated-plan status remain. No writes to history,
 schema or monetary changes. Regression uses actual API delete/create.
+
+## Completed local CLAIM outcome order identity
+
+BRANCH: codex/audit-outcome-order-identity. BASE: 6bc66a4.
+FILES: app/api.py (api_order_plan_outcome), tests/test_planner.py, tests/test_execution.py,
+docs/audit_queue.md, docs/audit_a08_evidence.md.
+DONE_WHEN: a deleted plan order cannot inherit receipt facts or status from
+a new order reusing its ID; outcome requires the reciprocal plan link already
+written on apply. Valid applied orders retain their outcomes. Real API
+delete/create/receipt regression, no schema or monetary changes.
+RESULT: planner351/0 and execution164/0. One-sided legacy links no longer
+provide order or receipt evidence; no historical repair was attempted.
