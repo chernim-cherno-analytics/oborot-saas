@@ -17,6 +17,34 @@ offsite lack flock on this Mac. Full log:/private/tmp/audit-c0014db-full-strict.
 Next: separate test compatibility CLAIM for the terminal step; no weakening
 of the released-step identities. A07 rollback evidence is recorded separately.
 
+## Completed local CLAIM — A08 complete execution evidence
+
+BRANCH: codex/audit-a08-complete-evidence. BASE: ece5ffe.
+FILES: app/api.py, tests/test_execution.py, docs/audit_a08_evidence.md,
+docs/audit_queue.md. SOURCE: A08 requires equal completeness flags for partial,
+full, zero and conflicting receipts. Receipts already use complete-evidence
+confirmation; outcome still confirms a partial receipt. Earlier narrow A08
+package deliberately left this discrepancy, now addressed under the owner's
+instruction to finish all non-formula work.
+DONE_WHEN: shared evidence summary preserves receipt API semantics, outcome
+matches it on partial receipt and existing full/zero/conflict regressions pass.
+No quantity arithmetic, accounting formula, schema or receipt-status change.
+RESULT: RED174/2; GREEN execution176/0, history47/0, planner363/0.
+
+## Completed local CLAIM — explicit order actions
+
+BRANCH: codex/audit-order-action-labels. BASE: c0014db.
+FILES: templates/replenish.html, templates/assistant.html, docs/audit_queue.md.
+SOURCE: independent audit, decision/placement workflow; owner authorizes all
+non-formula work. DONE_WHEN: quick-order confirmation explicitly says it
+records placement and explains the existing sent/incoming transition; wizard
+creation explicitly says draft. Existing browser regression passes.
+No status/API/formula change or new tests for this small copy correction.
+Isolated worktree preserves the source of the ongoing full strict run.
+RESULT: existing Chromium UI regression57 OK/0 FAIL, exit0;
+/private/tmp/audit-order-action-labels-ui.log. Diff check clean.
+This is a copy correction; no new acceptance test or formula changes.
+
 Recovered on 07 September 2026 from the owner-control task and the private
 04 September audit. The source document is not to be published wholesale.
 The owner's original request was to verify and prioritize all findings for a
@@ -34,14 +62,14 @@ forget the remaining audit items. Formula changes remain prohibited.
 | A05 Simple order loses cost basis, production and author | Metadata package locally implemented; planner 313, execution 164, browser 37 checks pass | Independent review/publication pending; supplier-price versus full-cost semantics remain open |
 | A06 Total quantity differs from size quantities | Released, confirmed by owner-control history | Do not implement again; existing regressions remain |
 | A07 New production terms alter historical payment calendar | Local exact plan snapshots and new simple-order snapshots throughc0014db; terminal additive migration15; plan/receipt links verify reciprocal identity | Independent review/publication pending; legacy fallback, placement-date policy, renegotiation history and actual payment facts remain open |
-| A08 Received status falsely confirms execution | Local fix034eab8; not released | Independent review pending; existing partial-evidence contract retained, not blanket equivalence of both APIs |
+| A08 Received status falsely confirms execution | Local shared completeness summary through8b041c7; no evidence, partial, full, zero and conflicts use the receipt API's existing rules | Independent review/publication pending; partial known lines remain available while the whole order stays unconfirmed |
 | A09 Invalidated cache can republish an obsolete snapshot | Open, P2 after pilot in original priority | Read-only current verification; no repeated prohibited concurrency experiment |
 
 After P1 consistency fixes: first correct order/onboarding, clear data quality,
 verified supply/batch mapping and paid pilot. These are not permission for
 microservices, broad integrations, redesign or new forecast formulas.
 
-Current runtime/test HEAD: c0014dbab9a97a940ce175814cda42380cbdfd96,
+Current runtime/test HEAD: 8b041c7190b3dfdb0ae7bf176c6af62e3d8ebbb8,
 including main2dcbd7fa7f57a07169364529ad3e148ff65c017f (SUPPLY PR53).
 The older full strict run was43 PASS,3 FAIL,2 SKIP. The new full strict run
 on c0014db is43 PASS,2 FAIL,1 NO_REPORT,2 SKIP; it is not a green release gate.

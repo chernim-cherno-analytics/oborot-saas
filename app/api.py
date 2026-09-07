@@ -806,17 +806,27 @@ def _ordered_by_base(order: ProductionOrder) -> dict[str, float]:
     return out
 
 
+def _execution_evidence(order: ProductionOrder, rows: list[OrderReceipt]) -> dict:
+    """Общий признак полноты фактов для сверки приёмок и истории решения."""
+    received = _received_by_base(rows)
+    ordered = _ordered_by_base(order)
+    conflicts = _source_conflicts(rows)
+    unknown = bool(set(ordered) - set(received)) or bool(conflicts)
+    return {"received": received, "ordered": ordered, "conflicts": conflicts,
+            "unknown": unknown, "confirmed": bool(rows) and not unknown}
+
+
 def _receipts_out(db: Session, order: ProductionOrder) -> dict:
     rows = _receipt_rows(db, order.org_id, order.id)
-    by_base = _received_by_base(rows)
-    ordered = _ordered_by_base(order)
+    evidence = _execution_evidence(order, rows)
+    by_base, ordered = evidence["received"], evidence["ordered"]
     # Позиции, по которым числа НЕТ: либо факта не записано вовсе, либо
     # источники спорят. По решению владельца 23.08.2026 такие числа отдаются
     # как null, а не как ноль и не как победитель приоритета. Ноль — это
     # утверждение «не приехало»; null — честное «не знаем». Разница видна не
     # в формулировке, а в статистике качества рекомендаций, которая считается
     # по этим же полям.
-    disputed = {c["base_name"] for c in _source_conflicts(rows)}
+    disputed = {c["base_name"] for c in evidence["conflicts"]}
     lines = []
     for base, qty in ordered.items():
         known = base in by_base and base not in disputed
@@ -838,7 +848,6 @@ def _receipts_out(db: Session, order: ProductionOrder) -> dict:
                           "diff": round(got, 3) if known else None})
     # «Неизвестно» — это любая заказанная позиция без записанного факта
     # приёмки, независимо от того, ушёл заказ в МойСклад или нет.
-    unknown = bool(set(ordered) - set(by_base))
     # ...а также любая позиция, где источники говорят РАЗНОЕ. Раньше расхождение
     # только показывалось отдельным списком, но итог всё равно объявлялся
     # подтверждённым: приоритет молча выбирал победителя, и «80 против 10»
@@ -851,8 +860,8 @@ def _receipts_out(db: Session, order: ProductionOrder) -> dict:
     # съезжаются под одно имя и выглядят как два свидетельства об одном
     # приходе. Считать их спором и сказать «неизвестно» — правильнее, чем
     # уверенно назвать число, которое получилось из склейки.
-    conflicts = _source_conflicts(rows)
-    unknown = unknown or bool(conflicts)
+    conflicts = evidence["conflicts"]
+    unknown = evidence["unknown"]
     return {
         "order_id": order.id,
         "status": order.status,
@@ -862,7 +871,7 @@ def _receipts_out(db: Session, order: ProductionOrder) -> dict:
         # именно так она и читается на экране. Сырые данные при этом никуда не
         # деваются — они ниже, в by_source и source_conflicts.
         "received_total": None if unknown else round(sum(by_base.values()), 3),
-        "confirmed": bool(rows) and not unknown,
+        "confirmed": evidence["confirmed"],
         # Есть заказанные позиции без записанного факта приёмки: по ним
         # принятое НЕИЗВЕСТНО. Ноль в received_total по такой позиции
         # означает «не знаем», а не «не приехало».
@@ -2966,22 +2975,24 @@ def api_order_plan_outcome(
             order = candidate
     received: dict[str, float] = {}
     execution_unknown = False
+    confirmed = False
     disputed: set[str] = set()
     if order is not None:
         rows = _receipt_rows(db, ctx.org.id, order.id)
-        received = _received_by_base(rows)
+        evidence = _execution_evidence(order, rows)
+        received = evidence["received"]
         # Как и в сверке приёмок: отсутствие факта по заказанной позиции
         # означает «не знаем», в том числе у локального принятого заказа.
         # Статус received и старые whole_order не подтверждают количество;
         # _received_by_base уже отделяет их от явного ручного нуля.
-        execution_unknown = bool(set(_ordered_by_base(order)) - set(received))
+        execution_unknown = evidence["unknown"]
+        confirmed = evidence["confirmed"]
         # Позиции, по которым источники спорят. Эта выдача — та самая, по
         # которой потом меряют качество рекомендаций, и подавать сюда спорное
         # число как факт нельзя: сверка приёмок уже говорит «не знаем», а здесь
         # выезжало уверенное `executed`, и две выдачи об одном заказе отвечали
         # по-разному.
-        disputed = {c["base_name"] for c in _source_conflicts(rows)}
-    confirmed = bool(received) and not disputed
+        disputed = {c["base_name"] for c in evidence["conflicts"]}
 
     def _executed(base: str):
         """Сколько принято ПО ЭТОЙ позиции. None — неизвестно.
@@ -3053,7 +3064,7 @@ def api_order_plan_outcome(
         "execution_confirmed": confirmed,
         # По заказанной позиции нет факта либо источники спорят.
         # Статус заказа не превращает неизвестное количество в ноль.
-        "execution_unknown": execution_unknown or bool(disputed),
+        "execution_unknown": execution_unknown,
         # Позиции, по которым источники приёмки спорят: у них `executed` = null
         # не потому, что данных нет, а потому, что данные противоречат друг
         # другу. Разница видна на экране, а не только в этом комментарии.

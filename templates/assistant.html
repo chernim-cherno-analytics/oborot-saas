@@ -1051,7 +1051,7 @@
       ((p.stop||[]).length ? '<div class="err">'+
         (p.stop||[]).map(function(x){ return esc(x.text); }).join('. ')+'</div>' : '')+
       '<div class="actions" style="margin:14px 0 18px">'+
-        '<button class="go-btn" id="mkOrder">Создать заказ</button>'+
+        '<button class="go-btn" id="mkOrder">Создать черновик</button>'+
         '<button class="go-btn ghost" id="recalcPlan" onclick="preview(3,true)">Пересчитать</button>'+
         '<button class="go-btn ghost" onclick="go(1)">← Изменить условия</button>'+
         '<span class="hint" id="mkHint"></span></div>'+
@@ -1266,7 +1266,7 @@
     var b = brief(); b.overrides = STATE.edits;
     var flags = {force:false, confirm_partial:false};
     api("/api/order-plan", b).then(function(res){
-      hint.textContent = "создаю заказ…";
+      hint.textContent = "создаю черновик…";
       var pr = curProd();
       var name = (pr ? pr.name : "Заказ") + " · " + dstr(STATE.plan.eta_date);
       // 409 от сервера — это не ошибка, а вопрос: похоже на дубль / история

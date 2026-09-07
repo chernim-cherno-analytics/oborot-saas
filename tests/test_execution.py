@@ -233,8 +233,13 @@ def run() -> int:  # noqa: C901 — сценарный тест, ветвлен�
     check("outcome отдаёт строки", out.get("positions", 0) > 0, str(out)[:160])
     check("outcome знает заказ", out.get("order_id") == order_id)
     check("строки плана есть", len(out["lines"]) > 0, str(len(out["lines"])))
-    check("исполнение подтверждено — приёмки записаны вручную",
-          out.get("execution_confirmed") is True, str(out.get("execution_confirmed")))
+    check("A08 частичная приёмка не подтверждает весь заказ",
+          out.get("execution_confirmed") is False, str(out.get("execution_confirmed")))
+    reconciliation = c.get(f"/api/orders/{order_id}/receipts").json()
+    check("A08 обе выдачи одинаково отмечают неполную приёмку",
+          out.get("execution_confirmed") == reconciliation.get("confirmed") is False
+          and out.get("execution_unknown") == reconciliation.get("execution_unknown") is True
+          and out["totals"]["executed"] is reconciliation["received_total"] is None)
     # Приёмка была записана по ОДНОЙ позиции (и по одной, которой в заказе нет).
     # Остальные позиции ещё едут: у них исполнение обязано быть неизвестно,
     # а не нулём. Раньше одна частичная приёмка обнуляла ВСЕ строки, и цифры

@@ -1,5 +1,31 @@
 # A08 — local execution evidence
 
+## Follow-up: complete evidence in both APIs
+
+The original narrow package below preserved outcome's partial-confirmation
+behavior. That exclusion is superseded by the owner's instruction to finish
+all non-formula audit work and A08's explicit acceptance criterion: partial,
+full, zero and conflicting receipts must expose the same completeness flags.
+
+The existing receipt API already requires facts for every ordered position,
+without source conflicts, before confirmed=true. Outcome still returnedtrue
+after a manual receipt for just one of several positions. Two actual-API
+assertions reproduce the discrepancy: execution174 OK/2 FAIL, exit1,
+/private/tmp/a08-complete-evidence-red.log.
+
+Both endpoints now consume _execution_evidence. It reuses the existing
+receipt reconciliation rules without changing quantity arithmetic, monetary
+formulas, status transitions, precision rules or null/zero handling. A known
+line remains known during partial receipt; the incomplete whole order is not
+confirmed. The receipt API's contract remains unchanged; outcome's partial
+confirmation changes fromtrue tofalse, as required by the audit.
+
+GREEN: execution176/0, history47/0, planner363/0; all exit0,586 checks.
+Logs: /private/tmp/a08-complete-evidence-{green,history,planner}.log.
+Existing regressions preserve known partial lines, explicit zero, full
+receipts, disputed sources, tenant boundaries and reciprocal order links.
+No full strict CI on this follow-up and no independent review/publication.
+
 ## Local work authorization and publication rule
 
 On 2026-09-06 the owner explicitly instructed this task to change publication
