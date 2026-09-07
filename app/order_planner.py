@@ -1203,6 +1203,10 @@ def plan_order(snap: dict, brief: dict, ctx: dict, stages: list[dict],
     if plan["rest"] < 0:
         stop.append({"code": "over_budget", "text":
                      f"Заказ выходит за бюджет на {fmt_rub(-plan['rest'])}"})
+    if plan["new_items_over_budget"] > 0:
+        stop.append({"code": "new_items_over_budget", "text":
+                     f"Новинки выходят за бюджет на {fmt_rub(plan['new_items_over_budget'])}. "
+                     "Уменьшите количество новинок или увеличьте бюджет."})
     if plan["order_date"] < snap["today"]:
         stop.append({"code": "past_date", "text":
                      f"Заказ пришлось бы разместить {plan['order_date']} — "

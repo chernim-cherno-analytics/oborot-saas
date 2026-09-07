@@ -338,6 +338,19 @@ def main() -> int:
     check("новинки видны в плане отдельным блоком",
           np_["new_items"] and np_["new_items"][0]["name"] == "Пальто «Осень»")
 
+    for scope in ("full", "now"):
+        for qty in (99, 100, 150):
+            new_only = mk_snap([])
+            new_plan = op.plan_order(new_only, mk_brief(
+                budget=100000, budget_scope=scope,
+                new_items=[{"name": "A01 новинка", "qty": qty, "cost": 1000}]),
+                mk_ctx(new_only), ONE_STAGE)
+            check(f"A01 {scope}: новинки {qty}000 при бюджете 100000",
+                  new_plan["can_create"] == (qty <= 100)
+                  and (qty <= 100 or "new_items_over_budget" in
+                       [s["code"] for s in new_plan["stop"]]),
+                  f"can_create={new_plan['can_create']} stop={new_plan['stop']}")
+
     print("\n10. Отсев позиций")
     snap4 = mk_snap([
         mk_item("Норм", turnover=4000, cost=2000, price=6000, rate=1.0),
@@ -836,13 +849,18 @@ def api_checks() -> None:
             ("past_date", {"eta_date": date.today().isoformat()}),
             ("over_budget", {"overrides": {plan["items"][0]["base_name"]: 1000000}}),
             ("empty", {"budget": 0}),
+            ("new_items_over_budget", {"budget": 100000, "new_items": [
+                {"name": "A01 новинка", "qty": 150, "cost": 1000}]}),
+            ("new_items_over_budget", {"budget": 100000, "new_items": [
+                {"name": "A01 новинка с ручной правкой", "qty": 150, "cost": 1000}],
+                "overrides": {plan["items"][0]["base_name"]: 0}}),
         ):
             gate_body = {"production_id": lab["id"], "eta_date": eta,
                          "budget": 300000, "budget_scope": "now",
                          "strategy": "balance", **changes}
             gated = c.post("/api/order-plan", json=gate_body).json()
             check(f"A02 {reason}: воспроизведён запрет финального плана",
-                  (gated["plan"]["items"] or reason == "empty")
+                  (gated["plan"]["items"] or gated["plan"].get("new_items") or reason == "empty")
                   and not gated["plan"]["can_create"]
                   and reason in [s["code"] for s in gated["plan"]["stop"]])
             import json as _gate_json

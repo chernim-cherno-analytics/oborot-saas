@@ -10,9 +10,9 @@ forget the remaining audit items. Formula changes remain prohibited.
 
 | Finding | Actual status | Next action |
 | --- | --- | --- |
-| A01 New items bypass budget and disappear from decision totals | Open; reproduced on current code: budget 100,000, new items 150,000, can_create=true, cost/totals zero, payments empty | Fix in a separate bounded package without silently redefining monetary fields; synthetic reproduction at /private/tmp/a01-current-reproduction.json |
+| A01 New items bypass budget and disappear from decision totals | Budget safeguard implemented locally, including manual edits and forced apply; 363 checks pass | Independent review/publication pending; totals/payment/outcome discrepancy remains open; reproduction at /private/tmp/a01-current-reproduction.json |
 | A02 Saved prohibited plan can be applied | Local server fix32f17cd; not released | Independent review and publication pending; audit's wider UI/structured-reason criteria are not all claimed complete |
-| A03 Packaging can exceed budget, MOQ or share limits | Open; allocation formulas frozen | Verify final-order safeguards separately; do not rewrite rounding/allocation formulas |
+| A03 Packaging can exceed budget, MOQ or share limits | Reproduced: MOQ10/pack6/budget110 yields120; cap250/pack6 yields300; allocation formulas frozen | Verify final-order safeguards separately; /private/tmp/a03-current-reproduction.json; do not rewrite rounding/allocation formulas |
 | A04 Explicit zero safety stock becomes 14 | Open, explicit formula/product decision required | Preserve reproduction and narrow decision; do not change calculation by default |
 | A05 Simple order loses cost basis, production and author | Metadata package locally implemented; planner 313, execution 164, browser 37 checks pass | Independent review/publication pending; supplier-price versus full-cost semantics remain open |
 | A06 Total quantity differs from size quantities | Released, confirmed by owner-control history | Do not implement again; existing regressions remain |
@@ -30,7 +30,7 @@ strict test result is documented in /private/tmp/oborot-audit-review-handoff.md:
 43 PASS, 3 FAIL, 2 SKIP; not a green release gate. Unrelated backup diagnostics
 are recorded there and are not the next audit implementation priority.
 
-## Active local CLAIM A05 metadata
+## Completed local CLAIM A05 metadata
 
 BRANCH: codex/audit-a05-order-metadata.
 BASE_SHA: 14a03957a513a29937c27dcc68bc5cc46cdcdc70.
@@ -49,3 +49,18 @@ SUPPLY files, production writes, self-review and deployment.
 Active SUPPLY PR53 was inspected at9e249ff5cbb15bb87198af7094df31b08546636d.
 Its file list does not include these A05 implementation files. Shared models,
 subscription/isolation tests and decision/debt journals are not edited here.
+
+## Completed local CLAIM A01 new-item budget safeguard
+
+BRANCH: codex/audit-a01-new-item-budget.
+BASE_SHA: f4e1e942e3cc40efada7937bbe071ec91eb57084.
+FILES: app/order_planner.py and app/api.py (final stop reasons only, including
+rebuilding reasons after manual overrides), tests/test_planner.py,
+docs/audit_queue.md, docs/audit_a01_evidence.md.
+DONE_WHEN: the existing calculated new_items_over_budget prohibits creation;
+the saved plan cannot be applied through the A02 guard, including force;
+within-budget and exactly-at-budget new items remain available. Preserve
+allocation, reservation and monetary calculations. RED/GREEN and local commit.
+EXCLUSIONS: total/payment/outcome monetary semantics, formulas, schema,
+SUPPLY files, self-review and publication bypass. Remaining A01 monetary
+consistency work and decisions stay open for the morning report.

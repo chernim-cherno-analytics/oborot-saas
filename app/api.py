@@ -2643,6 +2643,10 @@ def _apply_overrides(plan: dict, overrides: dict, snap: dict) -> None:
     if plan["rest"] < 0:
         stop.append({"code": "over_budget", "text":
                      f"Заказ выходит за бюджет на {op.fmt_rub(-plan['rest'])}"})
+    if plan["new_items_over_budget"] > 0:
+        stop.append({"code": "new_items_over_budget", "text":
+                     f"Новинки выходят за бюджет на {op.fmt_rub(plan['new_items_over_budget'])}. "
+                     "Уменьшите количество новинок или увеличьте бюджет."})
     if plan["order_date"] < plan["today"]:
         stop.append({"code": "past_date", "text":
                      f"Заказ пришлось бы разместить {plan['order_date']} — эта дата уже прошла."})
