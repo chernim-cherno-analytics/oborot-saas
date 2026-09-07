@@ -2465,8 +2465,8 @@ def structural_checks(owner) -> None:
     # растёт. Замок стоит на неизменности выпущенного, а не на длине списка.
     print("\n== Схема не тронута: те же десять выпущенных шагов старта ==")
     from app import main as _main
-    check("шагов четырнадцать: десять выпущенных плюс четыре дописанных сверху",
-          len(_main.STARTUP_SCHEMA_STEPS) == 14,
+    check("шагов пятнадцать: десять выпущенных плюс пять дописанных сверху",
+          len(_main.STARTUP_SCHEMA_STEPS) == 15,
           str(len(_main.STARTUP_SCHEMA_STEPS)))
     check("и первые десять — ровно прежние пары (id, позиция)",
           list(_main.STARTUP_SCHEMA_STEPS)[:10] == [
@@ -2475,6 +2475,14 @@ def structural_checks(owner) -> None:
               ("ms_sync.reset_stale_running", 5), ("ms_writeback.ensure_schema", 6),
               ("ms_vendor.ensure_schema", 7), ("subscription.ensure_schema", 8),
               ("subscription.log_preview", 9), ("models.ensure_supply_schema", 10)],
+          str(_main.STARTUP_SCHEMA_STEPS))
+    check("следующие пять сохраняют точные id и позиции 11–15",
+          list(_main.STARTUP_SCHEMA_STEPS)[10:] == [
+              ("models.ensure_supply_planning_schema", 11),
+              ("models.ensure_supply_planning_unique_schema", 12),
+              ("models.ensure_supply_archive_schema", 13),
+              ("models.ensure_supply_assignment_archive_schema", 14),
+              ("models.ensure_order_payment_terms_schema", 15)],
           str(_main.STARTUP_SCHEMA_STEPS))
     for name in ("models.py", "db.py", "tenancy.py"):
         text = (ROOT / "app" / name).read_text(encoding="utf-8")

@@ -1,5 +1,22 @@
 # Independent audit queue
 
+## Completed local CLAIM — A07 sheets startup compatibility
+
+BRANCH: codex/audit-a07-sheets-startup-compat. BASE:702b8b7.
+FILES: tests/test_supply_sheets.py, docs/audit_queue.md.
+SOURCE: isolated full supply_sheets run1798 OK/1 FAIL, exit1. The sole failure
+is a second14-step expectation; no port conflict remains. DONE_WHEN: require
+all15 identities and rerun the existing structural_checks group containing
+the failure against a fresh synthetic application. No runtime/formula edits.
+The full suite's remaining1798 checks passed; do not call a focused retest
+a new green full strict run. Remaining14 references in startup lifecycle are
+descriptive text; its actual ledger/order assertions already require15.
+RESULT: existing structural_checks group98 OK/0 FAIL, exit0;
+/private/tmp/a07-sheets-structural-green.log. Setup uses a fresh synthetic
+organization, actual local API and the existing FakeGoogle transport. The
+failed expectation is now15 and all five appended identities are checked.
+No active test processes remain. No new full strict success is claimed.
+
 ## Completed local CLAIM — A07 startup compatibility sentinel
 
 BRANCH: codex/audit-a07-startup-compat. BASE_RUNTIME:8b041c7.
@@ -11,8 +28,9 @@ the complete supply-planning suite passes. Runtime/formulas unchanged.
 RESULT: supply_planning357 OK/0 FAIL, exit0;
 /private/tmp/a07-startup-supply-planning-green.log. All previous step identity
 assertions remain; step15 is checked explicitly. Full strict remains non-green.
-Separate follow-up: supply_sheets is running on isolated port18964 after
-strict's port8845 conflict; /private/tmp/audit-supply-sheets-isolated.log.
+Separate follow-up completed: supply_sheets ran on isolated port18964 after
+strict's port8845 conflict;1798/1, the remaining14-step assertion is corrected
+by the subsequent sheets startup compatibility CLAIM above.
 
 ## Completed local CLAIM — integrated validation and current queue
 
