@@ -1,5 +1,24 @@
 # Independent audit queue
 
+## Local CLAIM — A05 cost basis and supplier price
+
+BRANCH: codex/audit-a05-cost-basis. BASE:ff2de21.
+FILES: app/api.py, app/ms_writeback.py, tests/test_planner.py,
+tests/test_writeback.py, docs/audit_a05_evidence.md, docs/audit_queue.md,
+DECISIONS.md. Owner explicitly delegates the price decision to project logic.
+D-12: Product.cost_full is full cost, cost_price is supplier buyPrice;
+D-21: purchaseorder represents contractor sewing. Store these separately.
+DONE_WHEN: simple orders retain full cost using the existing analytics
+fallback; new catalogue orders snapshot supplier_price, and writeback uses
+that snapshot rather than full cost. Plan snapshots survive catalogue edits.
+Legacy orders without the new JSON key keep their saved send price; no
+historic repricing. New items with unknown supplier price must not fabricate
+one when matched for sending. Preserve all allocation/payment formulas.
+RELEASE ORDER: first land the writeback reader supporting supplier_prices,
+then the creator/full-cost change. The reader-only revision is the rollback
+target for the creator revision; pre-reader code would mistake full cost for
+document price. This ordering remains required when remote release unblocks.
+
 ## Completed local CLAIM — A07 sheets startup compatibility
 
 BRANCH: codex/audit-a07-sheets-startup-compat. BASE:702b8b7.
