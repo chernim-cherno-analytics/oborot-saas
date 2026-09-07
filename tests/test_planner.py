@@ -351,6 +351,30 @@ def main() -> int:
                        [s["code"] for s in new_plan["stop"]]),
                   f"can_create={new_plan['can_create']} stop={new_plan['stop']}")
 
+    from app.api import _apply_overrides
+    import copy
+    share_snap = mk_snap([mk_item("A03", turnover=5000, cost=10, price=30, rate=3)])
+    share_ctx = dict(mk_ctx(share_snap), pack_multiple=6)
+    share_plan = op.plan_order(share_snap, mk_brief(budget=1000, max_share_pct=25),
+                               share_ctx, ONE_STAGE)
+    check("A03 воспроизведено округление выше лимита: 30 вместо максимум 25",
+          share_plan["items"][0]["qty"] == 30)
+    check("A03 автоматический перерасход доли запрещает создание",
+          not share_plan["can_create"]
+          and "share_limit" in [s["code"] for s in share_plan["stop"]])
+    for label, edits, allowed in (
+        ("посторонняя правка", {"неизвестная позиция": 0}, False),
+        ("то же количество", {"A03": 30}, False),
+        ("исправлено до 24", {"A03": 24}, True),
+        ("явное ручное решение 36", {"A03": 36}, True),
+    ):
+        edited = copy.deepcopy(share_plan)
+        _apply_overrides(edited, edits, share_snap)
+        check(f"A03 {label}", edited["can_create"] == allowed, str(edited["stop"]))
+    must_plan = op.plan_order(share_snap, mk_brief(
+        budget=1000, max_share_pct=25, must_have=["A03"]), share_ctx, ONE_STAGE)
+    check("A03 явное must-have сохраняет исключение лимита доли", must_plan["can_create"])
+
     print("\n10. Отсев позиций")
     snap4 = mk_snap([
         mk_item("Норм", turnover=4000, cost=2000, price=6000, rate=1.0),
@@ -1211,6 +1235,20 @@ def api_checks() -> None:
         check("причина «кратность» видна в строке",
               any("pack" in i["why"] for i in packed["items"]),
               str([i["why"] for i in packed["items"]][:3]))
+        share_saved = c.post("/api/order-plan", json={
+            "production_id": lab["id"], "eta_date": eta, "budget": 300000,
+            "budget_scope": "full", "max_share_pct": 1}).json()
+        check("A03 сохранённый план с нарушением доли запрещён",
+              "share_limit" in [s["code"] for s in share_saved["plan"]["stop"]]
+              and not share_saved["plan"]["can_create"])
+        count_share = _sql("SELECT COUNT(*) FROM production_orders")[0][0]
+        share_denied = c.post(f"/api/order-plan/{share_saved['id']}/apply",
+                              json={"force": True, "confirm_partial": True})
+        check("A03 force не обходит лимит автоматической рекомендации",
+              share_denied.status_code == 422
+              and _sql("SELECT COUNT(*) FROM production_orders")[0][0] == count_share)
+        if share_denied.status_code == 200:
+            c.delete(f"/api/orders/{share_denied.json()['order_id']}")
         c.post(f"/api/productions/{lab['id']}",
                json={"name": lab["name"], "pack_multiple": 0})
 

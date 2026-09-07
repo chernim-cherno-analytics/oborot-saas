@@ -12,7 +12,7 @@ forget the remaining audit items. Formula changes remain prohibited.
 | --- | --- | --- |
 | A01 New items bypass budget and disappear from decision totals | Budget safeguard implemented locally, including manual edits and forced apply; 363 checks pass | Independent review/publication pending; totals/payment/outcome discrepancy remains open; reproduction at /private/tmp/a01-current-reproduction.json |
 | A02 Saved prohibited plan can be applied | Local server fix32f17cd; not released | Independent review and publication pending; audit's wider UI/structured-reason criteria are not all claimed complete |
-| A03 Packaging can exceed budget, MOQ or share limits | Reproduced: MOQ10/pack6/budget110 yields120; cap250/pack6 yields300; allocation formulas frozen | Verify final-order safeguards separately; /private/tmp/a03-current-reproduction.json; do not rewrite rounding/allocation formulas |
+| A03 Packaging can exceed budget, MOQ or share limits | Final share safeguard implemented locally; 372 checks pass; existing budget guard covers MOQ/pack overspend | Independent review/publication pending; corrected allocation remains open under formula freeze; /private/tmp/a03-current-reproduction.json |
 | A04 Explicit zero safety stock becomes 14 | Open, explicit formula/product decision required | Preserve reproduction and narrow decision; do not change calculation by default |
 | A05 Simple order loses cost basis, production and author | Metadata package locally implemented; planner 313, execution 164, browser 37 checks pass | Independent review/publication pending; supplier-price versus full-cost semantics remain open |
 | A06 Total quantity differs from size quantities | Released, confirmed by owner-control history | Do not implement again; existing regressions remain |
@@ -64,3 +64,18 @@ allocation, reservation and monetary calculations. RED/GREEN and local commit.
 EXCLUSIONS: total/payment/outcome monetary semantics, formulas, schema,
 SUPPLY files, self-review and publication bypass. Remaining A01 monetary
 consistency work and decisions stay open for the morning report.
+
+## Completed local CLAIM A03 final share safeguard
+
+BRANCH: codex/audit-a03-final-share-guard.
+BASE_SHA: 7d5987d6d68c3f1acd59eca49e8db78d86dcb19d.
+FILES: app/order_planner.py (preserve existing per-item cap and validate final
+quantity), app/api.py (revalidate after manual edits), tests/test_planner.py,
+docs/audit_queue.md, docs/audit_a03_evidence.md.
+DONE_WHEN: automatically allocated quantities above the allocator's existing
+share cap cannot be applied, including after an unrelated/no-op manual edit;
+explicit must-have and genuine manual quantity decisions retain their existing
+exceptions. Existing total-budget safeguard still rejects MOQ/pack excess.
+EXCLUSIONS: changing allocation/rounding, formulas, schema, SUPPLY, self-review
+or release bypass. This prevents accepting an invalid recommendation; it does
+not claim the audit's desired corrected allocation (24 instead of 30) is done.

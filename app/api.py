@@ -2651,6 +2651,7 @@ def _apply_overrides(plan: dict, overrides: dict, snap: dict) -> None:
         stop.append({"code": "past_date", "text":
                      f"Заказ пришлось бы разместить {plan['order_date']} — эта дата уже прошла."})
     plan["stop"] = stop
+    stop.extend(op.share_limit_stops(plan["items"]))
     plan["can_create"] = not stop
     plan["manual_edit"] = True
 

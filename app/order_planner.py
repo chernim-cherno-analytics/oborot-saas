@@ -939,6 +939,25 @@ def _coverage(snap: dict, ctx: dict, stages: list[dict]) -> dict:
     }
 
 
+def share_limit_stops(items: list[dict]) -> list[dict]:
+    """Проверяет итог рекомендации по уже рассчитанному лимиту распределителя."""
+    stops = []
+    for item in items:
+        cap = item.get("share_limit_qty")
+        if cap is None or item["qty"] <= cap:
+            continue
+        # Явная правка количества — решение человека. Повторить прежнее
+        # количество или изменить другую строку не значит принять превышение.
+        if ("manual" in (item.get("why") or [])
+                and item["qty"] != item.get("qty_recommended", item["qty"])):
+            continue
+        stops.append({"code": "share_limit", "text":
+                      f"«{item['base_name']}»: рекомендация после округления превышает "
+                      f"лимит доли на позицию ({item['qty']} шт. при максимуме {cap}). "
+                      "Измените условия или укажите количество вручную."})
+    return stops
+
+
 def plan_order(snap: dict, brief: dict, ctx: dict, stages: list[dict],
                with_sensitivity: bool = True) -> dict:
     """Бриф → план заказа. Чистая функция: в БД не ходит."""
@@ -996,6 +1015,8 @@ def plan_order(snap: dict, brief: dict, ctx: dict, stages: list[dict],
             "gap_days": c["gap_days"],
             "need": c["need"],
             "qty": qty,
+            "share_limit_qty": (None if c["must_have"]
+                                else res["cap_units"].get(c["base_name"])),
             "unmet": unmet,
             "sizes": size_split(c["sizes"], qty),
             "cost_price": c["cost_price"],
@@ -1212,6 +1233,7 @@ def plan_order(snap: dict, brief: dict, ctx: dict, stages: list[dict],
                      f"Заказ пришлось бы разместить {plan['order_date']} — "
                      f"эта дата уже прошла. Сдвиньте дату приёмки."})
     plan["stop"] = stop
+    stop.extend(share_limit_stops(items))
     plan["can_create"] = not stop
     if coverage["partial"]:
         # Пометка для UI и для api_order_plan_apply: план предварительный —
