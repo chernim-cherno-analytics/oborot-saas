@@ -1,5 +1,14 @@
 # Independent audit queue
 
+## Local CLAIM — owner merge instruction and current main
+
+BRANCH: codex/audit-release-refresh. FILES: AGENTS.md, docs/audit_queue.md.
+Owner explicitly removed the independent-review requirement for these audit
+fixes and instructed merging and continued coding. Preserve CI and protected
+merge; no self-review verdict is created. Main66ad1c1 (SUPPLY PR54) merged
+normally without conflicts before this documentation change. DONE_WHEN:
+record the scoped override, publish updated PR55 and pass fresh required CI.
+
 ## Completed local CLAIM — scoped publication mandate clarification
 
 BRANCH: codex/audit-publication-mandate. BASE:4c25f37. FILES: AGENTS.md,
