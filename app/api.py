@@ -172,8 +172,32 @@ class OrderIn(BaseModel):
         return v
 
 
+def _order_totals(items: list[dict]) -> dict:
+    """Те же итоги окончательного состава, что и в карточке заказа."""
+    return {
+        "positions": len(items),
+        "units": sum(int(i.get("qty") or 0) for i in items),
+        "cost": round(sum(float(i.get("cost") or 0) * int(i.get("qty") or 0) for i in items)),
+    }
+
+
+def _plan_order_items(result: dict, brief: dict) -> list[dict]:
+    """Единый состав для предварительного итога и создания заказа."""
+    items = [
+        {"base_name": i["base_name"], "qty": int(i["qty"]),
+         "sizes": i.get("sizes") or {}, "cost": float(i.get("cost_price") or 0)}
+        for i in (result.get("items") or []) if int(i.get("qty") or 0) > 0
+    ]
+    for n in (brief.get("new_items") or []):
+        if int(n.get("qty") or 0) > 0:
+            items.append({"base_name": n["name"], "qty": int(n["qty"]),
+                          "sizes": {}, "cost": float(n.get("cost") or 0)})
+    return items
+
+
 def _order_out(order: ProductionOrder) -> dict:
     items = order.items
+    totals = _order_totals(items)
     return {
         "id": order.id,
         "name": order.name,
@@ -181,9 +205,9 @@ def _order_out(order: ProductionOrder) -> dict:
         "eta_date": order.eta_date,
         "status": order.status,
         "items": items,
-        "positions": len(items),
-        "total_qty": sum(int(i.get("qty") or 0) for i in items),
-        "total_cost": round(sum(float(i.get("cost") or 0) * int(i.get("qty") or 0) for i in items)),
+        "positions": totals["positions"],
+        "total_qty": totals["units"],
+        "total_cost": totals["cost"],
         "production_id": order.production_id,
         "created_by": order.created_by,
         # D-25: даты переходов и обратная ссылка на расчёт, из которого вырос
@@ -2359,6 +2383,11 @@ def _plan(db: Session, ctx: AuthContext, body: OrderPlanIn) -> dict:
             "names": (incomplete["names"] + [item["name"] for item in missing_new])[:10],
             "new_item_positions": len(missing_new),
         }
+    plan["order_totals"] = _order_totals(_plan_order_items(plan, plan["brief"]))
+    plan["order_payments"] = order_planner.payment_plan(
+        date.fromisoformat(plan["order_date"]), plan["payment_terms"],
+        plan["order_totals"]["cost"],
+    )
     plan["record"] = _decision_record(db, ctx, snap)
     return plan
 
@@ -2769,6 +2798,7 @@ def api_order_plan_save(
         ),
         result_json=json.dumps(
             {"items": plan["items"], "totals": plan["totals"],
+             "order_totals": plan["order_totals"], "order_payments": plan["order_payments"],
              # Сохраняем итоговый запрет после ручных правок вместе с решением:
              # сохранение для истории само по себе не разрешает создать заказ.
              "stop": plan["stop"], "can_create": plan["can_create"],
@@ -2827,7 +2857,8 @@ def _plan_row_out(row, names: dict, prods: dict, linked_orders: dict) -> dict:
         result = json.loads(row.result_json or "{}")
     except ValueError:
         result = {}
-    totals = result.get("totals") or {}
+    complete_totals = result.get("order_totals")
+    totals = complete_totals if isinstance(complete_totals, dict) else (result.get("totals") or {})
     order_id = (row.production_order_id
                 if linked_orders.get(row.id) == row.production_order_id else None)
     return {
@@ -2844,7 +2875,7 @@ def _plan_row_out(row, names: dict, prods: dict, linked_orders: dict) -> dict:
         "positions": int(totals.get("positions") or 0),
         "units": int(totals.get("units") or 0),
         "cost": int(totals.get("cost") or 0),
-        "totals_exclude_new_items": bool(brief.get("new_items")),
+        "totals_exclude_new_items": bool(brief.get("new_items")) and not isinstance(complete_totals, dict),
         "cost_incomplete": bool(result.get("budget_incomplete")),
     }
 
@@ -3131,18 +3162,8 @@ def api_order_plan_apply(
                       ("; ".join(reasons) or "план не прошёл проверку"),
             "code": "plan_forbidden", "stop": result["stop"],
         })
-    items = [
-        {"base_name": i["base_name"], "qty": int(i["qty"]),
-         "sizes": i.get("sizes") or {}, "cost": float(i.get("cost_price") or 0)}
-        for i in (result.get("items") or []) if int(i.get("qty") or 0) > 0
-    ]
-    # Новинки, вписанные вручную, — такие же строки заказа (в МойСкладе у них
-    # может ещё не быть карточки: писбэк вернёт их в списке unmatched).
     brief = row.brief
-    for n in (brief.get("new_items") or []):
-        if int(n.get("qty") or 0) > 0:
-            items.append({"base_name": n["name"], "qty": int(n["qty"]),
-                          "sizes": {}, "cost": float(n.get("cost") or 0)})
+    items = _plan_order_items(result, brief)
     if not items:
         raise HTTPException(422, "В плане нет позиций с количеством > 0")
     pid = brief.get("production_id")

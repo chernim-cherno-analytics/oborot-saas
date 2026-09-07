@@ -737,6 +737,12 @@
              covered_until: cov, covered_full: covFull };
   }
 
+  function pendingOrderEdits(){
+    return (STATE.plan.items||[]).some(function(i){
+      return STATE.edits[i.base_name] !== undefined && STATE.edits[i.base_name] !== i.qty;
+    });
+  }
+
   function renderCards(){
     var p = STATE.plan, t = liveTotals();
     var hasNew = (p.new_items||[]).length > 0;
@@ -770,8 +776,14 @@
     // сравнивал бюджет с полной стоимостью заказа. Молчать об этом нельзя —
     // иначе цифры на карточках выглядят как ошибка.
     warn.innerHTML =
-      (hasNew ? '<div class="warn">Новинки на '+fmtR(p.new_items_cost)+
-        ' показаны отдельно ниже. Итоговые суммы, количество и календарь этого плана их пока не учитывают.</div>' : '') +
+      (hasNew && p.order_totals ? (pendingOrderEdits() ?
+        '<div class="warn">Пересчитайте план, чтобы обновить полный состав и календарь с новинками.</div>' :
+        '<div class="panel" id="completeOrderSummary"><b>Полный состав заказа, включая новинки</b>: '+
+        fmt(p.order_totals.positions)+' позиций · '+fmt(p.order_totals.units)+' шт · '+
+        fmtR(p.order_totals.cost)+'. Новинки включены в календарь платежей. '+
+        'Карточки выше относятся к каталожным позициям.</div>') :
+        (hasNew ? '<div class="warn">Новинки на '+fmtR(p.new_items_cost)+
+        ' показаны отдельно ниже. Итоговые суммы, количество и календарь этого плана их пока не учитывают.</div>' : '')) +
       (p.budget_note ? '<div class="warn">'+esc(p.budget_note)+'</div>' : "") +
       (left < 0
         ? '<div class="err">Заказ выходит за бюджет на '+fmtR(-left)+
@@ -799,11 +811,16 @@
     var c = STATE.cash, p = STATE.plan;
     if(!c || !c.weeks){ box.innerHTML = '<div class="muted" style="font-size:12px">нет данных</div>'; return; }
     var t = liveTotals(), share = p.cost_total ? (t.cost / p.cost_total) : 1;
+    var payments = p.payments||[];
+    if((p.new_items||[]).length && p.order_payments){
+      if(pendingOrderEdits()){ box.textContent = "Пересчитайте план для полного календаря с новинками."; return; }
+      payments = p.order_payments; share = 1;
+    }
     var start = new Date(c.week_start+"T00:00:00");
     // Текущий (ещё не созданный) заказ кладём в ту же сетку — иначе календарь
     // показывает вчерашние обязательства и молчит про то, что решается сейчас.
     var mine = c.weeks.map(function(){ return 0; });
-    (p.payments||[]).forEach(function(x){
+    payments.forEach(function(x){
       var idx = Math.floor((new Date(x.date+"T00:00:00") - start)/86400000/7);
       if(idx >= 0 && idx < mine.length) mine[idx] += Math.round(x.amount * share);
     });
@@ -844,7 +861,12 @@
     var p = STATE.plan, box = document.getElementById("payflow");
     if(!box) return;
     var t = liveTotals(), share = p.cost_total ? (t.cost / p.cost_total) : 1;
-    box.innerHTML = (p.payments||[]).map(function(x,i){
+    var payments = p.payments||[];
+    if((p.new_items||[]).length && p.order_payments){
+      if(pendingOrderEdits()){ box.textContent = "Пересчитайте план для полного календаря с новинками."; return; }
+      payments = p.order_payments; share = 1;
+    }
+    box.innerHTML = payments.map(function(x,i){
       var amount = Math.round(x.amount * share);
       return '<div class="pay'+(i===0?" now":"")+'"><div class="d">'+dstr(x.date)+'</div>'+
         '<div class="a">'+fmtR(amount)+'</div><div class="n">'+esc(x.label)+'</div></div>';

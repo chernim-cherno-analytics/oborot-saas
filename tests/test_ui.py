@@ -463,9 +463,23 @@ def run() -> int:  # noqa: C901 — сценарный тест: шагов мн
             check("A01 количество ограничено каталожными позициями",
                   "Каталожных позиций / штук" in cards_with_new)
             warning_with_new = page.text_content("#budgetWarn") or ""
-            check("A01 ограничение итогов и календаря явно показано",
-                  "Новинки" in warning_with_new and "не учитывают" in warning_with_new
-                  and "календарь" in warning_with_new)
+            check("A01 полный состав и календарь включают новинки",
+                  "Полный состав заказа, включая новинки" in warning_with_new
+                  and "Новинки включены в календарь" in warning_with_new)
+            shown_payments = page.locator("#payflow .a").all_text_contents()
+            check("A01 браузер показывает полную сумму платежей сервера",
+                  sum(int(''.join(ch for ch in text if ch.isdigit())) for text in shown_payments)
+                  == new_preview.value.json()["order_totals"]["cost"])
+            first_qty = page.locator(".qinp").first
+            previous_qty = first_qty.input_value()
+            first_qty.fill(str(int(previous_qty) + 1))
+            check("A01 ручная правка не оставляет устаревший полный календарь",
+                  "Пересчитайте" in (page.text_content("#payflow") or "")
+                  and page.locator("#completeOrderSummary").count() == 0)
+            first_qty.fill(previous_qty)
+            check("A01 возврат количества восстанавливает полный итог",
+                  page.locator("#completeOrderSummary").count() == 1
+                  and page.locator("#payflow .a").count() == len(shown_payments))
             history_body = new_preview.value.request.post_data_json
             missing_cost = new_preview.value.json()["review"]["no_cost"]
             check("история: в каталоге есть позиция без себестоимости", bool(missing_cost))
@@ -476,8 +490,8 @@ def run() -> int:  # noqa: C901 — сценарный тест: шагов мн
             page.reload()
             history_row = page.locator(f".repeat[data-id='{history_saved['id']}']").locator("xpath=../..")
             history_row.wait_for(state="attached")
-            check("A01 история помечает стоимость и количество без новинок",
-                  (history_row.text_content() or "").count("без новинок") == 2)
+            check("A01 история показывает полный сохранённый состав",
+                  "без новинок" not in (history_row.text_content() or ""))
             check("история: неполная себестоимость явно подписана",
                   "сумма неполная" in (history_row.text_content() or ""))
 

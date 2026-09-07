@@ -246,3 +246,21 @@ catalogue missing-cost facts and amounts; UI tells users to enter new-item
 cost in the questionnaire. No calculation formulas or new creation gate.
 RESULT: decision-record RED44/3, GREEN47/0; Chromium52/0. Completeness
 metadata includes new-item quantities and preserves catalogue facts.
+
+## Completed local CLAIM A01 complete order summary
+
+BRANCH: codex/audit-a01-complete-order-summary. BASE: 7683eb8.
+FILES: app/api.py (shared final items/summary, plan metadata/save/apply),
+tests/test_execution.py, docs/audit_queue.md, docs/audit_a01_evidence.md.
+DONE_WHEN: preview/save expose order_totals and order_payments from exactly
+the same catalogue+new-item rows used by apply. Reuse existing order summary
+and payment_plan arithmetic without changing allocation, budget, forecast or
+payment formulas. Persist complete summary separately from legacy catalogue
+totals, allowing UI/history adoption without silently reinterpreting old data.
+EXTENSION: templates/assistant.html, tests/test_ui.py,
+tests/test_decision_record.py. Display complete order summary and payment
+calendar; after local edits require recalculation of the complete calendar.
+History uses stored complete totals when present and marks old partial totals.
+RESULT: execution175/0, planner361/0, history47/0, Chromium55/0 (638).
+Next bounded UI check: renderPlan exits on p.blocked even when nonempty
+new_items make the order valid; test a new-items-only production end to end.

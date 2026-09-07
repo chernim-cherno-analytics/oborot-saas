@@ -105,3 +105,27 @@ manually selected catalogue item lacking cost, including persistence/history.
 Existing Chromium suite52/0 (/private/tmp/a01-new-cost-ui.log) verifies the
 wizard still renders without console errors; it does not specifically exercise
 the new-item guidance branch. No independent review/full CI/publication.
+# Complete order summary and calendar
+
+Base7683eb8. A shared _plan_order_items now supplies the existing catalogue+
+new-item composition to both preview summary and apply. _order_totals extracts
+the existing order-card arithmetic unchanged. The existing payment_plan receives
+that complete cost and the exact saved stage terms. New order_totals and
+order_payments persist alongside legacy catalogue totals: allocation, budget
+reservation, recommendation/profit and payment formulas remain unchanged.
+
+The wizard shows a complete-order summary and uses the complete payment list
+for the tranche and weekly calendars when new items exist. Catalogue analytics
+cards remain explicitly labelled. Pending local edits hide the stale complete
+summary/calendar until recalculation (or return to the server quantities).
+History uses stored complete totals where available; old records retain their
+saved partial values and omission marker. No historical rewrite or supplier-
+price reinterpretation occurs.
+
+API RED171/4: /private/tmp/a01-summary-red.log. GREEN execution175/0:
+/private/tmp/a01-summary-green.log. Planner361/0:
+/private/tmp/a01-summary-planner.log. History47/0:
+/private/tmp/a01-summary-history.log. Initial UI53/0:
+/private/tmp/a01-summary-ui.log. A final browser pass adds explicit pending-edit
+and restore checks:55/0, /private/tmp/a01-summary-ui-final.log. Total638 checks.
+No full strict CI, independent review or publication is claimed.

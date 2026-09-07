@@ -156,13 +156,13 @@ def run() -> int:
     new_plan_id = new_saved["id"]
     saved_bytes = sql("SELECT result_json FROM order_plans WHERE id=?", new_plan_id)[0][0]
     history_rows = {h["id"]: h for h in c.get("/api/order-plan/history").json()["plans"]}
-    check("A01 история помечает итоги без новинок",
-          history_rows[new_plan_id].get("totals_exclude_new_items") is True)
+    check("A01 история показывает полный итог с новинками",
+          history_rows[new_plan_id].get("totals_exclude_new_items") is False)
     check("A01 история без новинок не получает ложную пометку",
           history_rows[plan_id].get("totals_exclude_new_items") is False)
     check("A01 пометка не переписывает сохранённые значения",
           sql("SELECT result_json FROM order_plans WHERE id=?", new_plan_id)[0][0] == saved_bytes
-          and history_rows[new_plan_id]["cost"] == json.loads(saved_bytes)["totals"]["cost"])
+          and history_rows[new_plan_id]["cost"] == json.loads(saved_bytes)["order_totals"]["cost"])
     no_cost_items = new_saved["plan"]["review"]["no_cost"]
     check("история: есть реальная позиция без себестоимости для проверки", bool(no_cost_items))
     if no_cost_items:

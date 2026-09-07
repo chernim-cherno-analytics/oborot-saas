@@ -931,6 +931,18 @@ def run() -> int:  # noqa: C901 — сценарный тест, ветвлен�
           new_before["totals"] == {"recommended": 0, "decided": 50, "executed": None})
     new_apply = c.post(f"/api/order-plan/{new_plan}/apply", json={"force": True}).json()
     new_order = new_apply["order_id"]
+    new_actual = c.get(f"/api/orders/{new_order}").json()
+    full_summary = new_saved["plan"].get("order_totals") or {}
+    check("A01 полный итог плана совпадает с созданным заказом новинок",
+          full_summary == {"positions": new_actual["positions"],
+                           "units": new_actual["total_qty"], "cost": new_actual["total_cost"]}
+          and full_summary.get("cost") == 5000, str(full_summary))
+    check("A01 полный календарь плана включает всю стоимость новинок",
+          sum(p["amount"] for p in new_saved["plan"].get("order_payments", [])) == 5000)
+    stored_complete = json.loads(sql("SELECT result_json FROM order_plans WHERE id=?", new_plan)[0][0])
+    check("A01 полный итог и календарь сохраняются как принятое решение",
+          stored_complete.get("order_totals") == full_summary and bool(full_summary)
+          and stored_complete.get("order_payments") == new_saved["plan"].get("order_payments"))
     new_sent = c.post(f"/api/orders/{new_order}/status", json={"status": "sent"})
     check("A01 повторённое имя отправляется без ошибки и даёт ровно50 в пути",
           new_sent.status_code == 200
@@ -956,6 +968,13 @@ def run() -> int:  # noqa: C901 — сценарный тест, ветвлен�
     mixed_result = json.loads(sql("SELECT result_json FROM order_plans WHERE id=?", mixed_plan)[0][0])
     catalogue = next(i for i in mixed_result["items"] if i["base_name"] == victim)
     mixed_order = c.post(f"/api/order-plan/{mixed_plan}/apply", json={"force": True}).json()["order_id"]
+    mixed_actual = c.get(f"/api/orders/{mixed_order}").json()
+    mixed_summary = mixed_saved["plan"].get("order_totals") or {}
+    check("A01 ручные правки и новинки входят в один полный итог и календарь",
+          mixed_summary.get("units") == mixed_actual["total_qty"]
+          and mixed_summary.get("cost") == mixed_actual["total_cost"]
+          and sum(p["amount"] for p in mixed_saved["plan"].get("order_payments", []))
+              == mixed_actual["total_cost"], str(mixed_summary))
     c.post(f"/api/orders/{mixed_order}/status", json={"status": "sent"})
     c.post(f"/api/orders/{mixed_order}/receipts", json={"lines": [{"base_name": victim, "qty": 15}]})
     mixed_outcome = c.get(f"/api/order-plan/{mixed_plan}/outcome").json()
