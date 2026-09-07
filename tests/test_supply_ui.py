@@ -3957,6 +3957,12 @@ def supply_fix_3_ui(pw, base, c) -> None:
         # Корректив 2: воспроизведённые P1 внешних тредов.
         ("P1 пустая единица", lambda: _fix3_empty_unit_ui(page, base, c, "desktop")),
         ("P1 потерянный ответ", lambda: _fix3_lost_response(page, base, c)),
+        # Корректив 3: черновик обязан держаться за СВОЮ редакцию.
+        ("P1 черновик материала", lambda: _fix3_stale_material(page, base, c, "desktop")),
+        ("P1 черновик вещи", lambda: _fix3_stale_item(page, base, c, "desktop")),
+        ("P1 черновик партии", lambda: _fix3_stale_batch(page, base, c, "desktop")),
+        ("P1 черновик переноса", lambda: _fix3_stale_move(page, base, c, "desktop")),
+        ("сторож своей записи", lambda: _fix3_own_save_rebase(page, base, c, "desktop")),
     )
     for label, run_step in steps:
         try:
@@ -4712,6 +4718,260 @@ def _fix3_lost_response(page, base, c) -> None:
           str(third[0]["assigned"]) if third else "строки нет")
 
 
+# ── Корректив 3: черновик держится за СВОЮ редакцию (тред r3951150422) ────────
+
+def _stale_draft_replay(page, base, c, kind, card_id, inline_name, mutate, tag):
+    """Разыграть два окна и вернуть текст ошибки у формы после «Сохранить».
+
+    Хореография ровно та, что в отчёте: черновик открыт на редакции N; ВТОРОЙ
+    аутентифицированный клиент правит ту же строку до N+1; в первом окне
+    сохраняется ПОСТОРОННЯЯ форма, из-за чего доска перерисовывается и форма
+    пересобирается; человек жмёт «Сохранить» в своём черновике.
+
+    Возвращается именно текст ошибки, а не код ответа: человек видит текст, и
+    проверять надо то, что видит он. Состояние строки набор сверяет отдельно —
+    одно без другого доказывает половину.
+    """
+    page.goto(f"{base}/supply")
+    page.wait_for_timeout(1200)
+    close_hint(page)
+    opened = page.evaluate("""(a) => {
+      const card = document.querySelector('[data-pl="' + a[0] + '"][data-id="' + a[1] + '"]');
+      if (!card) return 'карточки нет';
+      const btn = card.querySelector('button[data-inline="' + a[2] + '"]');
+      if (!btn) return 'кнопки нет';
+      btn.click();
+      return card.querySelector('form.pl-form.inline') ? '' : 'форма не открылась';
+    }""", [kind, str(card_id), inline_name])
+    check(f"{tag}: черновик открыт", opened == "", str(opened))
+    if opened:
+        return None
+    page.wait_for_timeout(250)
+
+    mutate()                       # второе окно: та же строка уходит на N+1
+
+    page.click("#pl-add-material")
+    page.wait_for_timeout(250)
+    page.fill("#pl-mat-title", f"Посторонний {tag}")
+    page.fill("#pl-mat-qty", "1")
+    page.click("#pl-mat-form button[type=submit]")
+    page.wait_for_timeout(1500)
+
+    page.evaluate("""(a) => {
+      const box = document.querySelector('[data-pl="' + a[0] + '"][data-id="' + a[1]
+                                         + '"] form.pl-form.inline');
+      if (box) box.querySelector('button[type=submit]').click();
+    }""", [kind, str(card_id)])
+    page.wait_for_timeout(1500)
+    return page.evaluate("""(a) => {
+      const card = document.querySelector('[data-pl="' + a[0] + '"][data-id="' + a[1] + '"]');
+      const box = card && card.querySelector('form.pl-form.inline');
+      const e = box && box.querySelector('.pl-form-err');
+      return e ? e.textContent.trim() : '';
+    }""", [kind, str(card_id)])
+
+
+def _fix3_stale_material(page, base, c, tag: str) -> None:
+    """P1: черновик правки материала не имеет права затирать чужую правку."""
+    print(f"\n== P1: черновик материала держится за свою редакцию ({tag}) ==")
+    board = c.post(P3 + "/materials",
+                   json={"title": f"Ткань-редакция {tag}", "qty": "10", "unit": "м",
+                         "op_id": f"c3-m-{tag}"}).json()
+    mid = [m for m in board["materials"]
+           if m["title"] == f"Ткань-редакция {tag}"][0]["id"]
+
+    def other_window():
+        cur = [m for m in c.get(P3).json()["materials"] if m["id"] == mid][0]
+        r = c.post(P3 + f"/materials/{mid}/update",
+                   json={"qty": "25", "rev": cur["rev"], "op_id": f"c3-o-{tag}"})
+        check(f"{tag}: второе окно записало 25", r.status_code == 200,
+              f"{r.status_code}: {r.text[:120]}")
+
+    err = _stale_draft_replay(page, base, c, "material", mid, "edit",
+                              other_window, tag)
+    if err is None:
+        return
+    check(f"{tag}: человек видит отказ, а не молчаливый успех",
+          "уже изменили" in err, err[:160] or "ошибки нет")
+    row = [m for m in c.get(P3).json()["materials"] if m["id"] == mid]
+    check(f"{tag}: чужая правка цела — в данных 25, а не 10",
+          bool(row) and row[0]["qty"] == 25, str(row[0]["qty"]) if row else "нет строки")
+
+
+def _fix3_stale_item(page, base, c, tag: str) -> None:
+    """Тот же корень у формы правки вещи."""
+    print(f"\n== P1: черновик вещи держится за свою редакцию ({tag}) ==")
+    board = c.post(P3 + "/items",
+                   json={"kind": "draft", "title": f"Новинка-редакция {tag}",
+                         "note": "первая", "op_id": f"c3-i-{tag}"}).json()
+    iid = [i for i in board["items"]
+           if i["title"] == f"Новинка-редакция {tag}"][0]["id"]
+
+    def other_window():
+        cur = [i for i in c.get(P3).json()["items"] if i["id"] == iid][0]
+        r = c.post(P3 + f"/items/{iid}/update",
+                   json={"note": "правка из другого окна", "rev": cur["rev"],
+                         "op_id": f"c3-oi-{tag}"})
+        check(f"{tag}: второе окно правит заметку вещи", r.status_code == 200,
+              f"{r.status_code}: {r.text[:120]}")
+
+    err = _stale_draft_replay(page, base, c, "item", iid, "edit", other_window, tag)
+    if err is None:
+        return
+    check(f"{tag}: черновик вещи отвергнут отказом",
+          "уже изменили" in err, err[:160] or "ошибки нет")
+    row = [i for i in c.get(P3).json()["items"] if i["id"] == iid]
+    check(f"{tag}: заметка из другого окна цела",
+          bool(row) and row[0]["note"] == "правка из другого окна",
+          repr(row[0]["note"]) if row else "нет строки")
+
+
+def _fix3_stale_batch(page, base, c, tag: str) -> None:
+    """Тот же корень у формы правки плановой партии."""
+    print(f"\n== P1: черновик партии держится за свою редакцию ({tag}) ==")
+    it = c.post(P3 + "/items", json={"kind": "draft", "title": f"Вещь-партия {tag}",
+                                     "op_id": f"c3-bi-{tag}"}).json()
+    iid = [i for i in it["items"] if i["title"] == f"Вещь-партия {tag}"][0]["id"]
+    board = c.post(P3 + "/batches",
+                   json={"item_id": iid, "title": f"Партия-редакция {tag}",
+                         "plan_qty": "10", "op_id": f"c3-b-{tag}"}).json()
+    bid = [b for b in board["batches"]
+           if b["title"] == f"Партия-редакция {tag}"][0]["id"]
+
+    def other_window():
+        cur = [b for b in c.get(P3).json()["batches"] if b["id"] == bid][0]
+        r = c.post(P3 + f"/batches/{bid}/update",
+                   json={"plan_qty": "60", "rev": cur["rev"], "op_id": f"c3-ob-{tag}"})
+        check(f"{tag}: второе окно ставит план 60", r.status_code == 200,
+              f"{r.status_code}: {r.text[:120]}")
+
+    err = _stale_draft_replay(page, base, c, "batch", bid, "edit", other_window, tag)
+    if err is None:
+        return
+    check(f"{tag}: черновик партии отвергнут отказом",
+          "уже изменили" in err, err[:160] or "ошибки нет")
+    row = [b for b in c.get(P3).json()["batches"] if b["id"] == bid]
+    check(f"{tag}: план из другого окна цел — 60, а не 10",
+          bool(row) and row[0]["plan_qty"] == 60,
+          str(row[0]["plan_qty"]) if row else "нет строки")
+
+
+def _fix3_stale_move(page, base, c, tag: str) -> None:
+    """И у переноса: он тоже несёт редакцию и тоже восстанавливается."""
+    print(f"\n== P1: черновик переноса держится за свою редакцию ({tag}) ==")
+    it = c.post(P3 + "/items", json={"kind": "draft", "title": f"Вещь-перенос {tag}",
+                                     "op_id": f"c3-mi-{tag}"}).json()
+    iid = [i for i in it["items"] if i["title"] == f"Вещь-перенос {tag}"][0]["id"]
+    b1 = c.post(P3 + "/batches", json={"item_id": iid, "title": f"Откуда {tag}",
+                                       "op_id": f"c3-mb1-{tag}"}).json()
+    src = [b for b in b1["batches"] if b["title"] == f"Откуда {tag}"][0]["id"]
+    b2 = c.post(P3 + "/batches", json={"item_id": iid, "title": f"Куда {tag}",
+                                       "op_id": f"c3-mb2-{tag}"}).json()
+    dst = [b for b in b2["batches"] if b["title"] == f"Куда {tag}"][0]["id"]
+    mb = c.post(P3 + "/materials", json={"title": f"Ткань-перенос {tag}", "qty": "100",
+                                         "unit": "м", "op_id": f"c3-mm-{tag}"}).json()
+    mid = [m for m in mb["materials"] if m["title"] == f"Ткань-перенос {tag}"][0]["id"]
+    c.post(P3 + "/assignments", json={"material_id": mid, "batch_id": src,
+                                      "qty": "50", "op_id": f"c3-ma-{tag}"})
+    aid = None
+    for b in c.get(P3).json()["batches"]:
+        if b["id"] != src:
+            continue
+        for a in b["assignments"]:
+            if a["material_id"] == mid:
+                aid = a["id"]
+    check(f"{tag}: назначение для переноса заведено", aid is not None,
+          "" if aid else "назначения нет")
+    if aid is None:
+        return
+
+    def other_window():
+        cur = None
+        for b in c.get(P3).json()["batches"]:
+            for a in b["assignments"]:
+                if a["id"] == aid:
+                    cur = a
+        r = c.post(P3 + f"/assignments/{aid}/update",
+                   json={"qty": "80", "rev": cur["rev"], "op_id": f"c3-oa-{tag}"})
+        check(f"{tag}: второе окно меняет назначение на 80", r.status_code == 200,
+              f"{r.status_code}: {r.text[:120]}")
+
+    err = _stale_draft_replay(page, base, c, "batch", src, f"move-{aid}",
+                              other_window, tag)
+    if err is None:
+        return
+    check(f"{tag}: черновик переноса отвергнут отказом",
+          "уже изменили" in err, err[:160] or "ошибки нет")
+    now = None
+    for b in c.get(P3).json()["batches"]:
+        for a in b["assignments"]:
+            if a["id"] == aid:
+                now = a
+    check(f"{tag}: назначение из другого окна цело — 80 и на своей партии",
+          now is not None and now["qty"] == 80, str(now["qty"]) if now else "нет строки")
+
+
+def _fix3_own_save_rebase(page, base, c, tag: str) -> None:
+    """Обратная сторона: СВОЯ удачная запись не превращается в ложный 409.
+
+    Правило «черновик держится за свою редакцию» обязано кончаться там, где
+    черновик применён. После собственной удачной записи строка — та же самая,
+    что в форме, и держаться за прежний номер значило бы ответить человеку
+    «кто-то изменил» на его собственную правку.
+
+    Проверяется ВТОРОЙ правкой, а не повтором: неизменный повтор опознаётся
+    замком поступка (`op_id`) и до сверки редакций не доходит вовсе.
+    """
+    print(f"\n== Сторож: своя удачная запись не даёт ложного отказа ({tag}) ==")
+    board = c.post(P3 + "/materials",
+                   json={"title": f"Своя правка {tag}", "qty": "10", "unit": "м",
+                         "op_id": f"c3-s-{tag}"}).json()
+    mid = [m for m in board["materials"] if m["title"] == f"Своя правка {tag}"][0]["id"]
+
+    page.goto(f"{base}/supply")
+    page.wait_for_timeout(1200)
+    close_hint(page)
+    opened = page.evaluate("""(id) => {
+      const card = document.querySelector('[data-pl="material"][data-id="' + id + '"]');
+      if (!card) return 'карточки нет';
+      card.querySelector('button[data-inline="edit"]').click();
+      return card.querySelector('form.pl-form.inline') ? '' : 'форма не открылась';
+    }""", str(mid))
+    check(f"{tag}: форма правки открыта", opened == "", str(opened))
+    if opened:
+        return
+    page.wait_for_timeout(250)
+
+    def save_with_title(new_title):
+        page.evaluate("""(a) => {
+          const box = document.querySelector('[data-pl="material"][data-id="' + a[0]
+                                             + '"] form.pl-form.inline');
+          const t = box.querySelector('input[type=text], input:not([type])');
+          t.value = a[1];
+          // Событие ввода — как у человека: оно и снимает прежнюю идентичность
+          // поступка, потому что это уже другая правка.
+          t.dispatchEvent(new Event('input', {bubbles: true}));
+          box.querySelector('button[type=submit]').click();
+        }""", [str(mid), new_title])
+        page.wait_for_timeout(1500)
+        return page.evaluate("""(id) => {
+          const card = document.querySelector('[data-pl="material"][data-id="' + id + '"]');
+          const box = card && card.querySelector('form.pl-form.inline');
+          const e = box && box.querySelector('.pl-form-err');
+          return e ? e.textContent.trim() : '';
+        }""", str(mid))
+
+    first = save_with_title(f"Первая правка {tag}")
+    check(f"{tag}: первая правка прошла без отказа", first == "", first[:160])
+    second = save_with_title(f"Вторая правка {tag}")
+    check(f"{tag}: и ВТОРАЯ правка в той же форме тоже прошла",
+          second == "", second[:160])
+    row = [m for m in c.get(P3).json()["materials"] if m["id"] == mid]
+    check(f"{tag}: в данных лежит последняя правка человека",
+          bool(row) and row[0]["title"] == f"Вторая правка {tag}",
+          row[0]["title"] if row else "нет строки")
+
+
 def _fix3_mobile(browser, base, c) -> None:
     """Те же два свойства на телефоне: список единиц и фокус в окне 390x844."""
     print("\n== F-16/F-21 на телефоне 390x844 ==")
@@ -4748,7 +5008,9 @@ def _fix3_mobile(browser, base, c) -> None:
                             ("P1 единица", lambda: _fix3_restore_unit(page, base, c, "mobile")),
                             ("P1 сосед", lambda: _fix3_restore_plain(page, base, c, "mobile")),
                             ("P1 пустая единица",
-                             lambda: _fix3_empty_unit_ui(page, base, c, "mobile"))):
+                             lambda: _fix3_empty_unit_ui(page, base, c, "mobile")),
+                            ("P1 черновик материала",
+                             lambda: _fix3_stale_material(page, base, c, "mobile"))):
         try:
             run_step()
         except Exception as exc:  # noqa: BLE001 — важен отчёт, а не тип

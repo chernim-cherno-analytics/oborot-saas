@@ -1746,6 +1746,10 @@ document.addEventListener("DOMContentLoaded", function () {
     // Идёт ли восстановление инлайн-форм после перерисовки (F-21). Во время
     // него фокус не отбирается: человек в этот момент печатает в другом месте.
     restoring: false,
+    // Форма, ЧЬЯ СОБСТВЕННАЯ запись только что удалась. Живёт ровно одну
+    // перерисовку и нужна одному месту — `captureInline`: её черновик применён,
+    // и держаться за прежнюю редакцию ей больше не за чем.
+    applied: null,
     catalog: [],
   };
 
@@ -1926,7 +1930,12 @@ document.addEventListener("DOMContentLoaded", function () {
     api(url, {method: "POST", body: body})
       .then(function (data) {
         PL.board = data;
+        // Пометка живёт РОВНО на время перерисовки и снимается сразу после неё:
+        // «эта форма только что записала своё» — состояние одного мгновения, а
+        // не свойство формы.
+        PL.applied = (spot && spot.form) || null;
         render();
+        PL.applied = null;
         if (spot && !spot.quiet) {
           plToast(data && data.notice ? data.notice : "Сохранено", {ms: 3000});
         }
@@ -2675,6 +2684,22 @@ document.addEventListener("DOMContentLoaded", function () {
   // Имя формы обязано стоять на кнопке СРАЗУ, а не появляться при первом
   // нажатии: после перерисовки карточка и кнопка — новые объекты, форму ещё
   // никто не открывал, а найти её кнопку уже надо (F-21).
+  // РЕДАКЦИЯ ЧЕРНОВИКА ЖИВЁТ В ФОРМЕ, А НЕ В ЗАМЫКАНИИ СТРОИТЕЛЯ, и это и есть
+  // всё исправление. Замыкание пересобирается на каждой перерисовке и берёт
+  // редакцию свежей доски; черновик человека при этом остаётся прежним. Пока
+  // редакция была значением замыкания, восстановление склеивало старые значения
+  // со свежим номером — пару, которой не существовало ни в один момент, — и
+  // оптимистичная блокировка пропускала её, стирая правку соседнего окна.
+  //
+  // Записанная в саму форму, редакция снимается и возвращается тем же порядком,
+  // что и введённый текст: «эти значения поверх ВОТ ЭТОЙ строки» — одно
+  // утверждение, а не два независимых.
+  function draftRev(form, rev) {
+    var n = Number(rev);
+    if (isFinite(n)) form.dataset.rev = String(n);
+    return function () { return form.dataset.rev; };
+  }
+
   function inlineButton(card, label, name, build) {
     var btn = el("button", "btn sm", label);
     btn.type = "button";
@@ -2718,6 +2743,18 @@ document.addEventListener("DOMContentLoaded", function () {
           // `dataset.opId` исчезал вместе со старым; значит, его надо снять и
           // вернуть так же, как значения полей.
           opId: box.dataset.opId || "",
+          // РЕДАКЦИЯ ЧЕРНОВИКА СНИМАЕТСЯ ВМЕСТЕ СО ЗНАЧЕНИЯМИ И ПО ТОЙ ЖЕ
+          // ПРИЧИНЕ. Она — не украшение формы, а вторая половина того, что
+          // человек собирается отправить: «вот эти значения поверх ВОТ ЭТОЙ
+          // строки». Пересобранная форма берёт редакцию из свежей доски, и без
+          // этой строки поверх неё ложились старые значения — пара, которой
+          // никогда не существовало. Сервер такую пару пропускал, и правка из
+          // соседнего окна молча стиралась.
+          //
+          // Исключение ровно одно: форма, чья СОБСТВЕННАЯ запись только что
+          // удалась. Её черновик применён, строка теперь та же самая, и держать
+          // прежнюю редакцию значило бы ответить человеку 409 за его же правку.
+          rev: (box === PL.applied) ? "" : (box.dataset.rev || ""),
           // Файловое поле не восстанавливается и восстановлено быть не может:
           // выбранный файл принадлежит окну выбора, а не нам. Пишем пустую
           // строку, чтобы длины списков совпадали, и не делаем вид, что файл
@@ -2749,6 +2786,7 @@ document.addEventListener("DOMContentLoaded", function () {
         // после восстановления, `bindTokenReset` честно снимет его сам — это
         // уже другая правка и другой поступок.
         if (item.opId) box.dataset.opId = item.opId;
+        if (item.rev) box.dataset.rev = item.rev;
         var fields = [].slice.call(box.querySelectorAll("input, select, textarea"));
         var chosen = [];
         item.values.forEach(function (value, i) {
@@ -2846,6 +2884,7 @@ document.addEventListener("DOMContentLoaded", function () {
   // Заметка и единица до этого пакета из интерфейса не менялись вовсе, а
   // название — тем более: опечатка в названии ткани жила до конца сезона.
   function buildMaterialEditForm(form, material) {
+    var readRev = draftRev(form, material.rev);
     var title = input(null, {value: material.title, maxLength: 200});
     var qty = input(null, {value: material.qty_known ? fmt(material.qty) : "",
                            placeholder: "оставьте пустым, если неизвестно"});
@@ -2862,9 +2901,10 @@ document.addEventListener("DOMContentLoaded", function () {
       ev.preventDefault();
       send("/api/supply/planning/materials/" + material.id + "/update",
            {title: title.value, qty: qty.value, unit: readUnit(),
-            source_note: note.value, rev: material.rev,
+            source_note: note.value, rev: readRev(),
             op_id: actionToken(form)},
-           "pl-matq-err", null, {kind: "material", id: material.id});
+           "pl-matq-err", null,
+           {kind: "material", id: material.id, form: form});
     };
   }
 
@@ -2944,6 +2984,7 @@ document.addEventListener("DOMContentLoaded", function () {
   // минимума в существующем интерфейсе, а замена картинки это отдельный экран.
   // Названо прямо, чтобы «в UI нет» не читалось как «нигде нет».
   function buildItemEditForm(form, it) {
+    var readRev = draftRev(form, it.rev);
     var title = null;
     if (it.kind === "draft") {
       title = input(null, {value: it.title, maxLength: 200});
@@ -2959,10 +3000,10 @@ document.addEventListener("DOMContentLoaded", function () {
     bindTokenReset(form);
     form.onsubmit = function (ev) {
       ev.preventDefault();
-      var body = {note: note.value, rev: it.rev, op_id: actionToken(form)};
+      var body = {note: note.value, rev: readRev(), op_id: actionToken(form)};
       if (title) body.title = title.value;
       send("/api/supply/planning/items/" + it.id + "/update", body,
-           "pl-item-edit-err", null, {kind: "item", id: it.id});
+           "pl-item-edit-err", null, {kind: "item", id: it.id, form: form});
     };
   }
 
@@ -3125,6 +3166,7 @@ document.addEventListener("DOMContentLoaded", function () {
   }
 
   function buildMoveForm(form, assignment, fromBatch) {
+    var readRev = draftRev(form, assignment.rev);
     var others = ((PL.board && PL.board.batches) || []).filter(function (b) {
       return b.id !== fromBatch.id;
     });
@@ -3148,12 +3190,14 @@ document.addEventListener("DOMContentLoaded", function () {
       ev.preventDefault();
       send("/api/supply/planning/assignments/move", {
         assignment_id: assignment.id, to_batch_id: pick.value, qty: qty.value,
-        rev: assignment.rev, op_id: actionToken(form),
-      }, "pl-move-err", null, {kind: "batch", id: Number(pick.value)});
+        rev: readRev(), op_id: actionToken(form),
+      }, "pl-move-err", null,
+         {kind: "batch", id: Number(pick.value), form: form});
     };
   }
 
   function buildBatchEditForm(form, b) {
+    var readRev = draftRev(form, b.rev);
     var title = input(null, {value: b.title || "", maxLength: 200,
                              placeholder: "например: первая закладка"});
     var qty = input(null, {value: b.plan_known ? fmt(b.plan_qty) : "",
@@ -3169,12 +3213,12 @@ document.addEventListener("DOMContentLoaded", function () {
     form.onsubmit = function (ev) {
       ev.preventDefault();
       var body = {title: title.value, plan_qty: qty.value,
-                  plan_note: planNote.value, rev: b.rev,
+                  plan_note: planNote.value, rev: readRev(),
                   op_id: actionToken(form)};
       var due = readDue();
       for (var k in due) { if (due.hasOwnProperty(k)) body[k] = due[k]; }
       send("/api/supply/planning/batches/" + b.id + "/update", body,
-           "pl-batch-edit-err", null, {kind: "batch", id: b.id});
+           "pl-batch-edit-err", null, {kind: "batch", id: b.id, form: form});
     };
   }
 
