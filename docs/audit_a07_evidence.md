@@ -64,3 +64,33 @@ and order_missing=true, rendered as an unavailable order. No historical rows
 are rewritten. Genuine links and plans with no created order retain their
 normal behavior. Baseline planner347 OK /1 FAIL. Final planner348/0 and
 Chromium52/0, including history rendering and no console errors:400/0.
+# Simple-order creation snapshot
+
+Base547508b. A07 now covers new simple orders: creation stores normalized
+terms in production_orders.payment_terms_json in the same transaction as the
+order. Reading payments prefers a valid own snapshot, then the existing
+reciprocal applied-plan snapshot, then the legacy production fallback. The
+snapshot validation is extracted unchanged from the existing plan path.
+Duplicate requests retain the original order and original terms. No payment
+formula/date anchor changes or retrospective filling of old terms.
+
+Schema: append-only startup step15 models.ensure_order_payment_terms_schema,
+after all14 unchanged existing identities. One additive TEXT NOT NULL DEFAULT
+'' column; old records remain blank. The startup checks now include failure
+injection for step15 and the fifteen-step ledger. Their first run stopped on
+an omitted test injection-map entry; that test harness entry was added before
+the completed result below. No runtime startup failure is inferred from it.
+
+RED planner361/2: /private/tmp/a07-simple-terms-red.log.
+GREEN planner363/0: /private/tmp/a07-simple-terms-green.log.
+Execution175/0: /private/tmp/a07-simple-terms-execution.log.
+Startup174/0: /private/tmp/a07-simple-terms-startup-final.log. Total712 checks.
+Separate synthetic old-schema proof /private/tmp/a07-simple-terms-migration.json:
+old rows stay blank, repeat migration preserves a snapshot, and an old-style
+INSERT omitting the column succeeds. No concurrent migration experiment added.
+
+Rollback supports old writes but old code ignores this snapshot, so payments
+again follow mutable settings while rolled back. Old orders without snapshots
+still use the documented fallback; corrupt snapshots do as well. This is the
+creation-time configuration, not evidence of confirmed negotiation or payment.
+No full strict CI, independent review, publication or deployment is claimed.

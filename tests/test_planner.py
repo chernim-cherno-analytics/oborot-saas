@@ -1143,6 +1143,20 @@ def api_checks() -> None:
         plain_expected = precision_op.payment_plan(date.today(), _gate_json.loads(original_terms), new_plain["total_cost"])
         check("A07 новый заказ не наследует снимок удалённого заказа",
               new_plain["order_plan_id"] is None and new_plain["payments"] == plain_expected)
+        c.post(f"/api/productions/{lab['id']}/setup", json={"stages": [
+            {"name": "Новые условия", "lead_days": 2, "cost_share": 1, "prepay_share": 1}]})
+        changed_plain = next(o for o in c.get("/api/orders/open").json()["orders"]
+                             if o["id"] == reused["id"])
+        check("A07 простой заказ сохраняет условия после изменения производства",
+              changed_plain["payments"] == plain_expected, str(changed_plain["payments"]))
+        repeated_plain = c.post("/api/orders", json={"name": "A07 новый простой заказ",
+            "production_id": lab["id"], "items": [{"base_name": precise_item["base_name"],
+                                                       "qty": 1, "sizes": {}}]}).json()
+        check("A07 повтор простого заказа сохраняет прежний заказ и его условия",
+              repeated_plain["id"] == reused["id"] and repeated_plain.get("duplicate") is True
+              and next(o for o in c.get("/api/orders/open").json()["orders"]
+                       if o["id"] == reused["id"])["payments"] == plain_expected)
+        c.post(f"/api/productions/{lab['id']}/setup", json={"stages": _gate_json.loads(original_terms)})
         identity_history = {h["id"]: h for h in c.get("/api/order-plan/history", params={"limit": 100}).json()["plans"]}
         check("история не связывает старый план с переиспользованным ID",
               identity_history[precise_saved["id"]]["order_id"] is None

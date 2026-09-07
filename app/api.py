@@ -245,10 +245,25 @@ OPEN_STATUSES = ("draft", "sent")
 CASH_WEEKS = 16
 
 
+def _valid_payment_terms(stages) -> bool:
+    return (isinstance(stages, list) and bool(stages) and all(
+        isinstance(st, dict) and isinstance(st.get("name"), str)
+        and type(st.get("lead_days")) is int and 0 <= st["lead_days"] <= 365
+        and all(type(st.get(k)) in (int, float) and 0 <= st[k] <= 1
+                for k in ("cost_share", "prepay_share"))
+        for st in stages) and sum(st["cost_share"] for st in stages) > 0)
+
+
 def _order_stages(db: Session, order: ProductionOrder, settings: dict) -> list[dict]:
     """Сохранённые этапы принятого плана; для старых заказов — этапы канала."""
     from app.models import OrderPlan
 
+    try:
+        own_terms = json.loads(order.payment_terms_json or "[]")
+    except (TypeError, ValueError):
+        own_terms = None
+    if _valid_payment_terms(own_terms):
+        return own_terms
     saved = db.execute(select(OrderPlan.computed_json).where(
         OrderPlan.org_id == order.org_id,
         OrderPlan.id == order.order_plan_id,
@@ -263,12 +278,7 @@ def _order_stages(db: Session, order: ProductionOrder, settings: dict) -> list[d
               if isinstance(computed, dict) else None)
     # Снимок уже нормализован и показан человеку. Не заменяем его условиями
     # сегодняшнего справочника и не нормируем доли повторно.
-    if (isinstance(stages, list) and stages and all(
-            isinstance(st, dict) and isinstance(st.get("name"), str)
-            and type(st.get("lead_days")) is int and 0 <= st["lead_days"] <= 365
-            and all(type(st.get(k)) in (int, float) and 0 <= st[k] <= 1
-                    for k in ("cost_share", "prepay_share"))
-            for st in stages) and sum(st["cost_share"] for st in stages) > 0):
+    if _valid_payment_terms(stages):
         return stages
     raw = None
     if order.production_id:
@@ -520,6 +530,8 @@ def api_create_order(
         status="draft",
         items_json=json.dumps(payload, ensure_ascii=False),
     )
+    order.payment_terms_json = json.dumps(
+        _order_stages(db, order, analytics.extra_settings(ctx.org)), ensure_ascii=False)
     db.add(order)
     # ВАЖНО (фикс P0): черновик НЕ попадает в «едет к нам» — рекомендации
     # «Что заказать» уменьшаются только после перевода заказа «В производство».

@@ -769,6 +769,9 @@ class ProductionOrder(Base):
     # Без неё найти «из какого расчёта вырос этот заказ» можно только
     # перебором планов организации.
     order_plan_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Снимок условий простого заказа. Пусто у старых записей: не выдаём
+    # сегодняшние настройки за исторически согласованные условия.
+    payment_terms_json: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default="")
 
     # SUPPLY-1 (D-49/D-50): собственный неизменяемый идентификатор партии.
     #
@@ -1955,4 +1958,16 @@ def ensure_supply_assignment_archive_schema(bind=None) -> None:
     if "archived_at" not in cols:
         run_migration_step(
             "ALTER TABLE supply_assignments ADD COLUMN archived_at DATETIME",
+            bind=eng)
+
+
+def ensure_order_payment_terms_schema(bind=None) -> None:
+    """A07: новый терминальный шаг15; прежние миграции не меняются."""
+    eng = bind or engine
+    insp = inspect(eng)
+    if not insp.has_table("production_orders"):
+        return
+    if "payment_terms_json" not in {c["name"] for c in insp.get_columns("production_orders")}:
+        run_migration_step(
+            "ALTER TABLE production_orders ADD COLUMN payment_terms_json TEXT NOT NULL DEFAULT ''",
             bind=eng)

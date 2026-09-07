@@ -274,3 +274,20 @@ DONE_WHEN: a real plan with no catalogue recommendations and valid entered
 new items renders its full order summary and create button. Empty catalogue
 diagnostics must not hide the entered order; server stop/can_create remain.
 RESULT: real browser RED56/1, GREEN57/0. New-only plans render correctly.
+
+## Completed local CLAIM A07 simple-order terms
+
+BRANCH: codex/audit-a07-simple-order-terms. BASE: 547508b.
+FILES: app/api.py, app/models.py (new payment_terms_json column and additive
+migration), app/main.py (new terminal startup step15), tests/test_planner.py,
+tests/test_startup_lifecycle.py, docs/audit_queue.md, docs/audit_a07_evidence.md.
+OWNER: continue all work except calculation formulas. SUPPLY53 merged in base;
+no other running writer observed. Preserve all14 released startup identities.
+DONE_WHEN: simple orders snapshot their normalized terms at creation and keep
+their payments after production terms change. Duplicate creation retains the
+original order/snapshot. Legacy blank snapshots retain documented fallback;
+no historic backfill, no new payment/date formula or fact-of-payment inference.
+RESULT: planner RED361/2, GREEN363/0; execution175/0; startup174/0.
+Old-schema migration, repeat-run preservation and old-writer compatibility
+also passed on isolated synthetic SQLite. Snapshot records creation-time
+terms, not confirmed negotiation/payment facts. Legacy fallback remains.
