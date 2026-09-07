@@ -90,3 +90,18 @@ planner361/0 (/private/tmp/a01-outcome-planner.log), mock writeback140/0
 are counted once for quantities20+30; mixed10+5 keeps catalogue recommendation
 and reports decided/executed15. Read-only outcome does not rewrite saved JSON.
 No full strict CI, independent review, publication or deployment is claimed.
+# Missing cost on new items
+
+At base215b266, new items with absent/zero cost did not set budget_incomplete.
+_plan now extends the existing metadata after overrides with missing-cost
+new-item counts, quantities and names. new_item_positions directs UI guidance
+to the questionnaire; catalogue-cost guidance remains. Save/history preserve
+the existing completeness field. No amount, formula, creation gate or schema
+changed; this does not complete the monetary-total/calendar portion of A01.
+
+Decision-record RED44/3 (/private/tmp/a01-new-cost-red.log), GREEN47/0
+(/private/tmp/a01-new-cost-green.log): new items alone and together with a
+manually selected catalogue item lacking cost, including persistence/history.
+Existing Chromium suite52/0 (/private/tmp/a01-new-cost-ui.log) verifies the
+wizard still renders without console errors; it does not specifically exercise
+the new-item guidance branch. No independent review/full CI/publication.

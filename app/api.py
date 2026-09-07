@@ -2349,6 +2349,16 @@ def _plan(db: Session, ctx: AuthContext, body: OrderPlanIn) -> dict:
     plan["overrides_rejected"] = []
     if body.overrides:
         _apply_overrides(plan, body.overrides, snap)
+    missing_new = [item for item in plan.get("new_items") or []
+                   if float(item.get("cost") or 0) <= 0 and int(item.get("qty") or 0) > 0]
+    if missing_new:
+        incomplete = plan["budget_incomplete"] or {"positions": 0, "units": 0, "names": []}
+        plan["budget_incomplete"] = {
+            "positions": incomplete["positions"] + len(missing_new),
+            "units": incomplete["units"] + sum(int(item["qty"]) for item in missing_new),
+            "names": (incomplete["names"] + [item["name"] for item in missing_new])[:10],
+            "new_item_positions": len(missing_new),
+        }
     plan["record"] = _decision_record(db, ctx, snap)
     return plan
 

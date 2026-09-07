@@ -176,6 +176,24 @@ def run() -> int:
         check("история: обычный план не получает ложную неполноту",
               history_rows[plan_id].get("cost_incomplete") is False)
 
+    for manual in (False, True):
+        incomplete_body = {**body, "new_items": [
+            {"name": "Новинка без цены", "qty": 3},
+            {"name": "Новинка с ценой", "qty": 1, "cost": 100}]}
+        if manual and no_cost_items:
+            incomplete_body["overrides"] = {no_cost_items[0]["base_name"]: 2}
+        incomplete_saved = c.post("/api/order-plan", json=incomplete_body).json()
+        inc = incomplete_saved["plan"].get("budget_incomplete") or {}
+        check(f"A01 новинка без стоимости помечена, ручная правка={manual}",
+              inc.get("new_item_positions") == 1 and "Новинка без цены" in inc.get("names", [])
+              and inc.get("units") == (5 if manual and no_cost_items else 3), str(inc))
+        inc_stored = json.loads(sql("SELECT result_json FROM order_plans WHERE id=?",
+                                   incomplete_saved["id"])[0][0])
+        inc_history = next(h for h in c.get("/api/order-plan/history").json()["plans"]
+                           if h["id"] == incomplete_saved["id"])
+        check(f"A01 неполнота стоимости новинки сохраняется в истории, правка={manual}",
+              bool(inc_stored.get("budget_incomplete")) and inc_history["cost_incomplete"] is True)
+
     algo = computed.get("algo") or {}
     check("сохранена версия домена", algo.get("domain") == DOMAIN_VERSION,
           f"algo={algo}")

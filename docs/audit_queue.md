@@ -233,3 +233,16 @@ write, as the neighbouring remainder path already does. Verify incoming50.
 RESULT: execution171/0, planner361/0, mock writeback140/0. New-only and mixed
 names retain quantities/provenance and consume one receipt fact per name.
 Full monetary totals/calendar work remains separate; formulas unchanged.
+
+## Completed local CLAIM A01 missing new-item cost
+
+BRANCH: codex/audit-a01-new-item-missing-cost. BASE: 215b266.
+FILES: app/api.py (_plan completeness metadata), templates/assistant.html
+(cost-entry guidance), tests/test_decision_record.py, docs/audit_queue.md,
+docs/audit_a01_evidence.md.
+DONE_WHEN: zero/missing-cost new items mark the saved and preview plan as
+incomplete, including after overrides; history retains that marker. Preserve
+catalogue missing-cost facts and amounts; UI tells users to enter new-item
+cost in the questionnaire. No calculation formulas or new creation gate.
+RESULT: decision-record RED44/3, GREEN47/0; Chromium52/0. Completeness
+metadata includes new-item quantities and preserves catalogue facts.
