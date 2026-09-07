@@ -21,3 +21,10 @@ checks disabled state and tooltip explanation, then verifies a valid
 recalculation re-enables the button. Final Chromium suite: 44 OK / 0 FAIL,
 including the existing A05 creation regression and no console errors.
 No formulas, monetary values or server APIs changed.
+
+Follow-up: a visible Recalculate button now sits beside Create order. It
+uses the existing preview flow and retains pending edits, so correcting a
+prohibited plan does not require discovering that the step-3 navigation
+also recalculates. The regression now clicks this real button for every
+prohibited/allowed transition. Final browser run: 44 OK / 0 FAIL, no console
+errors. Fallback wording no longer exposes server implementation detail.

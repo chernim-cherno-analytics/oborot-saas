@@ -414,6 +414,8 @@ def run() -> int:  # noqa: C901 — сценарный тест: шагов мн
 
         print("\n== Мастер: серверный запрет управляет кнопкой создания ==")
         if row:
+            if page.locator("#hint-overlay").is_visible():
+                page.locator("#hint-overlay .hm-close").click()
             page.evaluate("""(qty) => {
                 const input = document.querySelector('.qinp');
                 input.value = String(qty);
@@ -434,7 +436,7 @@ def run() -> int:  # noqa: C901 — сценарный тест: шагов мн
                                   ("", True), ("", False)):
                 gate.update(code=code, blocked=blocked)
                 with page.expect_response(lambda r: r.url == f"{base}/api/order-plan/preview"):
-                    page.evaluate("() => window.preview(3, true)")
+                    page.locator("#recalcPlan").click()
                 page.locator("#mkOrder").wait_for(state="visible")
                 check(f"кнопка соблюдает серверный запрет {code or 'can_create'}={blocked}",
                       page.locator("#mkOrder").is_disabled() == blocked)

@@ -110,3 +110,14 @@ docs/audit_a07_payment_label_evidence.md.
 DONE_WHEN: the open-order banner calls left_to_pay today's/future scheduled
 payments and explains that actual payments need separate verification.
 No API, formula or monetary changes; inspect the rendered text/JS diff.
+
+## Completed local CLAIM plan recheck action
+
+BRANCH: codex/audit-plan-recheck-action. BASE: 6dd6989.
+FILES: templates/assistant.html, tests/test_ui.py, docs/audit_queue.md,
+docs/audit_plan_stop_ui_evidence.md.
+DONE_WHEN: after a prohibited plan is edited, a visible Recalculate action
+lets the user obtain a new server decision without discovering the step-3
+navigation shortcut. Browser regression uses actual clicks for all stop and
+recovery cases. No formulas/API changes.
+RESULT: 44 browser checks pass using the actual visible action.
