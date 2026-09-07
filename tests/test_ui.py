@@ -428,6 +428,32 @@ def run() -> int:  # noqa: C901 — сценарный тест: шагов мн
         else:
             check("без таких позиций подпись обычная", "НЕПОЛНАЯ" not in sub, sub[:80])
 
+        print("\n== A05: простая форма передаёт выбранное производство ==")
+        if page.locator("#hint-overlay").is_visible():
+            page.locator("#hint-overlay .hm-close").click()
+        selected_production = int(page.locator(".bigtab.active").get_attribute("data-id"))
+        page.locator("#btn-create-order").click()
+        page.locator("#order-name").fill("A05 browser metadata")
+        with page.expect_response(lambda r: r.url == f"{base}/api/orders"
+                                  and r.request.method == "POST") as created_response:
+            page.locator("#btn-order-submit").click()
+        created_response = created_response.value
+        check("A05 браузер передаёт выбранное производство",
+              created_response.request.post_data_json.get("production_id") == selected_production)
+        check("A05 заказ из браузера создан", created_response.status == 200)
+        if created_response.status == 200:
+            page.locator("#order-modal").wait_for(state="hidden")
+            import sqlite3
+            created_id = created_response.json()["id"]
+            with sqlite3.connect(DB_PATH) as connection:
+                metadata = connection.execute(
+                    "SELECT production_id, created_by FROM production_orders WHERE id=?",
+                    (created_id,)).fetchone()
+                author = connection.execute("SELECT id FROM users WHERE email='ui@test.io'").fetchone()[0]
+            check("A05 выбор и автор из браузера сохранены",
+                  metadata == (selected_production, author), str(metadata))
+            c.delete(f"/api/orders/{created_id}")
+
         print("\n== «Бюджет»: строка состояния называет окно темпа ==")
         page.goto(f"{base}/budget")
         page.wait_for_timeout(3000)

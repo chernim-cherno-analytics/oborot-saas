@@ -153,6 +153,7 @@ class OrderItemIn(BaseModel):
 class OrderIn(BaseModel):
     name: str = Field(default="", max_length=120)
     eta_date: str | None = None
+    production_id: int | None = Field(default=None, ge=1, le=2_147_483_647)
     items: list[OrderItemIn]
     # «да, второй такой же заказ нужен» — осознанное повторение состава
     # в обход защиты от случайного дубля (см. api_create_order).
@@ -378,7 +379,8 @@ def _order_fingerprint(name: str, eta_date: str | None, items: list[dict]) -> st
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def _find_twin_order(db: Session, org_id: int, fingerprint: str, before_id: int | None = None):
+def _find_twin_order(db: Session, org_id: int, fingerprint: str, before_id: int | None = None,
+                     production_id: int | None = None):
     """Ищет такой же заказ, созданный в окне защиты от повтора.
 
     before_id — искать только среди более ранних заказов: так два запроса,
@@ -395,6 +397,7 @@ def _find_twin_order(db: Session, org_id: int, fingerprint: str, before_id: int 
     since = datetime.utcnow() - timedelta(seconds=ORDER_DEDUP_WINDOW_SEC)
     q = select(ProductionOrder).where(
         ProductionOrder.org_id == org_id,
+        ProductionOrder.production_id == production_id,
         ProductionOrder.created_at >= since,
         ProductionOrder.status != "received",
     )
@@ -419,6 +422,10 @@ def api_create_order(
     items = [i for i in body.items if i.qty > 0]
     if not items:
         raise HTTPException(status_code=422, detail="В заказе нет позиций с количеством > 0")
+    if body.production_id is not None:
+        production = db.get(Production, body.production_id)
+        if production is None or production.org_id != ctx.org.id:
+            raise HTTPException(status_code=404, detail="Производство не найдено")
     # Позиций, которых нет в каталоге организации, в заказе быть не может —
     # иначе создаётся «призрачная» позиция, для которой ниже неоткуда взять
     # свою себестоимость, и сервер был вынужден верить присланной клиентом.
@@ -448,7 +455,7 @@ def api_create_order(
         payload.append(d)
     fingerprint = _order_fingerprint(name, body.eta_date, payload)
     if not body.allow_duplicate:
-        twin = _find_twin_order(db, ctx.org.id, fingerprint)
+        twin = _find_twin_order(db, ctx.org.id, fingerprint, production_id=body.production_id)
         if twin is not None:
             # Партия та же самая — значит и CC_BATCH_ID тот же (D-50). Новый
             # идентификатор здесь означал бы «вторая партия», а весь смысл
@@ -460,6 +467,8 @@ def api_create_order(
         org_id=ctx.org.id,
         name=name,
         eta_date=body.eta_date,
+        production_id=body.production_id,
+        created_by=ctx.user.id,
         status="draft",
         items_json=json.dumps(payload, ensure_ascii=False),
     )
@@ -470,7 +479,8 @@ def api_create_order(
     if not body.allow_duplicate:
         # Два одновременных запроса могли не увидеть друг друга до вставки:
         # тот, у кого id больше, убирает свой заказ и отдаёт чужой.
-        twin = _find_twin_order(db, ctx.org.id, fingerprint, before_id=order.id)
+        twin = _find_twin_order(db, ctx.org.id, fingerprint, before_id=order.id,
+                                production_id=body.production_id)
         if twin is not None:
             db.delete(order)
             db.commit()
@@ -3155,4 +3165,3 @@ def api_production_setup(
     db.commit()
     analytics.invalidate(ctx.org.id)
     return _production_out(p, analytics.extra_settings(ctx.org)["lead_time_days"])
-

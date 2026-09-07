@@ -1401,7 +1401,7 @@
     var btn=this;
     var name=document.getElementById("order-name").value.trim()||"Заказ на производство";
     var eta=document.getElementById("order-eta").value||null;
-    var payload={name:name,eta_date:eta,items:checkedItems().map(function(it){
+    var payload={name:name,eta_date:eta,production_id:ACTIVE_PROD,items:checkedItems().map(function(it){
       var sizes={};
       Object.keys(it._recs).forEach(function(sz){ var q=Number(it._recs[sz])||0; if(q>0) sizes[sz]=q; });
       return {base_name:it.base_name,qty:it._need,sizes:sizes,cost:it.cost_price||0};

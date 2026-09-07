@@ -780,6 +780,50 @@ def api_checks() -> None:
               all(i["qty"] >= 10 for i in plan["items"]),
               str([(i["base_name"], i["qty"]) for i in plan["items"]][:5]))
 
+        # A05: простой заказ сохраняет выбранное производство и автора.
+        metadata_body = {"name": "A05 metadata", "eta_date": eta,
+                         "production_id": lab["id"],
+                         "items": [{"base_name": plan["items"][0]["base_name"],
+                                    "qty": 3, "sizes": {}}]}
+        metadata_orders = set()
+        made_meta = c.post("/api/orders", json=metadata_body)
+        check("A05 простой заказ создан", made_meta.status_code == 200)
+        metadata_id = made_meta.json()["id"]
+        metadata_orders.add(metadata_id)
+        creator = _sql("SELECT id FROM users WHERE email=?", "planner@test.io")[0][0]
+        check("A05 производство и автор сохранены",
+              _sql("SELECT production_id,created_by FROM production_orders WHERE id=?",
+                   metadata_id)[0] == (lab["id"], creator))
+        repeated_meta = c.post("/api/orders", json=metadata_body).json()
+        check("A05 повтор остаётся тем же заказом",
+              repeated_meta.get("duplicate") and repeated_meta["id"] == metadata_id)
+        other_meta = c.post("/api/orders", json={**metadata_body, "production_id": china["id"]}).json()
+        metadata_orders.add(other_meta["id"])
+        check("A05 другое производство не склеивается с первым заказом",
+              other_meta["id"] != metadata_id and not other_meta.get("duplicate"))
+        old_meta = c.post("/api/orders", json={k: v for k, v in metadata_body.items()
+                                             if k != "production_id"}).json()
+        metadata_orders.add(old_meta["id"])
+        check("A05 запрос без производства поддержан и автор известен",
+              _sql("SELECT production_id,created_by FROM production_orders WHERE id=?",
+                   old_meta["id"])[0] == (None, creator))
+        with httpx.Client(headers={"X-Oborot-CSRF": "1"}, base_url=base, timeout=60) as outsider:
+            outsider.post("/register", data={"name": "A05", "email": "planner-a05@test.io",
+                                            "password": "secret123", "org_name": "A05 чужой бренд"})
+            foreign_pid = outsider.post("/api/productions", json={"name": "A05 чужое"}).json()["id"]
+        for pid in (foreign_pid, 2147483647):
+            before_meta = _sql("SELECT COUNT(*) FROM production_orders")[0][0]
+            denied_meta = c.post("/api/orders", json={**metadata_body, "production_id": pid,
+                                                     "allow_duplicate": True})
+            check("A05 чужое или отсутствующее производство отклонено",
+                  denied_meta.status_code == 404, str(denied_meta.status_code))
+            check("A05 отказ не создаёт заказ",
+                  _sql("SELECT COUNT(*) FROM production_orders")[0][0] == before_meta)
+            if denied_meta.status_code == 200:
+                metadata_orders.add(denied_meta.json()["id"])
+        for oid in metadata_orders:
+            c.delete(f"/api/orders/{oid}")
+
         saved = c.post("/api/order-plan", json={
             "production_id": lab["id"], "eta_date": eta, "budget": 300000,
             "budget_scope": "now", "strategy": "balance",
