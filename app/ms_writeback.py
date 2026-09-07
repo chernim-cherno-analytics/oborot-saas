@@ -778,7 +778,12 @@ def supplier_prices_snapshot(db: Session, org_id: int) -> dict[str, dict[str, fl
     """Закупочные цены именно тех SKU, которые сопоставляет отправка (D-12/21)."""
     prices: dict[str, dict[str, float]] = {}
     for (base, size), product in _product_map(db, org_id).items():
-        prices.setdefault(base, {})[size] = float(product.cost_price or 0)
+        price = float(product.cost_price or 0)
+        if product.buy_price_zero_explicit:
+            price = 0.0
+        elif price == 0:
+            continue  # отсутствие buyPrice и старый ноль без сведений источника
+        prices.setdefault(base, {})[size] = price
     return prices
 
 
@@ -790,7 +795,7 @@ def _supplier_price_kopecks(item: dict, size: str) -> int:
     price = prices.get(size) if isinstance(prices, dict) else None
     if type(price) not in (int, float) or not math.isfinite(price) or price < 0:
         raise WritebackError(422, "Цена подрядчика для позиции заказа не сохранена. "
-                             "Уточните закупочную цену в МойСкладе и создайте новый заказ. "
+                             "Уточните закупочную цену в МойСкладе, обновите данные и создайте новый заказ. "
                              "Документ не отправлен.")
     return _kopecks_of(price)
 

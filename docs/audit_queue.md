@@ -1,5 +1,48 @@
 # Independent audit queue
 
+## Local CLAIM — PR56 portable Boolean migration
+
+BRANCH: codex/audit-stage2-refresh. FILES: app/models.py,
+docs/audit_queue.md. SOURCE: review3952626340, terminal unreleased step16
+uses integer DEFAULT0 with BOOLEAN, incompatible with PostgreSQL ALTER.
+Use a dialect-aware false ORM default and SQL FALSE in the new migration.
+DONE_WHEN: SQLite existing-row/old-writer defaults remain false, repeated
+migration succeeds, PostgreSQL CREATE TABLE compiles a Boolean default,
+and fresh hosted strict CI passes. No formula or old migration changes.
+LOCAL RESULT: SQLite migration twice, existing and old-writer inserted rows
+false, integrity_check ok. PostgreSQL CREATE TABLE compiles DEFAULT false;
+live PostgreSQL execution was not performed locally.
+
+## Local CLAIM — PR56 navigation CI preparation
+
+BRANCH: codex/audit-stage2-refresh. FILES: tests/test_supply_ui.py,
+docs/audit_queue.md. SOURCE: CI34162892450 F-01 /replenish hit-test failure.
+The hint opens after asynchronous seen/progress/lessons requests, whereas
+F-01 closes it after a fixed 250ms. Mark hints seen using the real API before
+navigation; preserve the actual visibility and mouse hit-test assertions.
+DONE_WHEN: browser suite passes and current PR56 strict CI passes.
+LOCAL RESULT: supply_ui543 OK/0 FAIL, exit0; log
+/private/tmp/pr56-navigation-ui.log. Hosted strict CI remains required.
+
+## Completed local CLAIM — A05 missing purchase price versus explicit zero
+
+BRANCH: codex/audit-a05-price-presence. SOURCE: PR56 comment3950691498.
+FILES: app/models.py, app/ms_sync.py, app/ms_writeback.py, app/main.py,
+app/startup_schema.py if it owns the startup list; tests/test_writeback.py,
+tests/test_startup_lifecycle.py, tests/test_supply_planning.py,
+tests/test_supply_sheets.py, docs/audit_a05_evidence.md, docs/audit_queue.md.
+DONE_WHEN: a real omitted buyPrice cannot become a saved/sendable zero,
+explicit source zero remains usable, inherited catalogue price formulas stay
+unchanged, terminal additive migration preserves all existing startup steps.
+Existing catalogue zero without presence evidence must require resync.
+SCOPE ADDITION before edit: DECISIONS.md, because D-58's original no-migration
+statement is superseded by the required source-presence field.
+RESULT: RED writeback145/3; GREEN150/0. Supply planning358/0.
+Startup lifecycle177/1 was solely the old range1..15 assertion; corrected
+clean-database group8/0. Other177 checks passed; hosted full CI must verify
+the final revision. Manual source-inheritance and migration/old-writer probes
+passed. Logs:/private/tmp/a05-presence-{red,final,supply,startup,startup-focused}.log.
+
 ## Local CLAIM — owner merge instruction and current main
 
 BRANCH: codex/audit-release-refresh. FILES: AGENTS.md, docs/audit_queue.md.
@@ -23,7 +66,7 @@ RESULT: scoped owner exception added to AGENTS.md; runtime unchanged.
 Both original published heads passed hosted strict CI (runs34133115581 and
 34133118777); this documentation commit requires its own fresh CI/review.
 
-## Local CLAIM — A05 cost basis and supplier price
+## Completed local CLAIM — A05 cost basis and supplier price
 
 BRANCH: codex/audit-a05-cost-basis. BASE:ff2de21.
 FILES: app/api.py, app/ms_writeback.py, tests/test_planner.py,
@@ -41,6 +84,13 @@ RELEASE ORDER: first land the writeback reader supporting supplier_prices,
 then the creator/full-cost change. The reader-only revision is the rollback
 target for the creator revision; pre-reader code would mistake full cost for
 document price. This ordering remains required when remote release unblocks.
+SCOPE ADDITION before edit: templates/orders.html, because its confirmation
+currently promises sending full cost. Update it to name saved supplier prices
+and the preserved legacy fallback, matching the new writeback contract.
+RESULT: writeback146/0, planner366/0, execution176/0, UI57/0,
+idempotency533/0. Reader-only4c25f37 with old creator:140/0.
+Decision D-58 resolves A05 locally; publication and independent review remain
+pending. No full strict success is claimed. Evidence: docs/audit_a05_evidence.md.
 
 ## Completed local CLAIM — A07 sheets startup compatibility
 
@@ -133,11 +183,20 @@ forget the remaining audit items. Formula changes remain prohibited.
 | A02 Saved prohibited plan can be applied | Local server guard, UI stop/recalculate, structured refusal codes and atomic apply are implemented throughd347bb0 | Independent review/publication pending; concurrent apply is not claimed verified |
 | A03 Packaging can exceed budget, MOQ or share limits | Final share safeguard implemented locally; 372 checks pass; existing budget guard covers MOQ/pack overspend | Independent review/publication pending; corrected allocation remains open under formula freeze; /private/tmp/a03-current-reproduction.json |
 | A04 Explicit zero safety stock becomes 14 | Open, explicit formula/product decision required | Preserve reproduction and narrow decision; do not change calculation by default |
-| A05 Simple order loses cost basis, production and author | Metadata package locally implemented; planner 313, execution 164, browser 37 checks pass | Independent review/publication pending; supplier-price versus full-cost semantics remain open |
+| A05 Simple order loses cost basis, production and author | Metadata and separate full cost / frozen supplier price implemented locally; D-58; writeback146, planner366, idempotency533 checks pass | Independent review/publication pending; reader4c25f37 must precede creator and remain the rollback baseline |
 | A06 Total quantity differs from size quantities | Released, confirmed by owner-control history | Do not implement again; existing regressions remain |
 | A07 New production terms alter historical payment calendar | Local exact plan snapshots and new simple-order snapshots throughc0014db; terminal additive migration15; plan/receipt links verify reciprocal identity | Independent review/publication pending; legacy fallback, placement-date policy, renegotiation history and actual payment facts remain open |
 | A08 Received status falsely confirms execution | Local shared completeness summary through8b041c7; no evidence, partial, full, zero and conflicts use the receipt API's existing rules | Independent review/publication pending; partial known lines remain available while the whole order stays unconfirmed |
 | A09 Invalidated cache can republish an obsolete snapshot | Open, P2 after pilot in original priority | Read-only current verification; no repeated prohibited concurrency experiment |
+
+Publication update, 07 September 2026: the historical "independent
+review/publication pending" entries above are superseded by the owner's
+scoped review waiver in AGENTS.md. PR55 merged at
+5d989c7fe21a98ff6ade3735e532245385b744c0 and post-merge CI34162863552 passed.
+PR56 contains the second A05 stage, including missing-price/explicit-zero
+presence and terminal migration16; its current browser CI correction is
+tracked in the CLAIM above. No deployment is claimed. Four findings remain
+partly or wholly open: A03, A04, A07, A09; merging PR56 does not close them.
 
 After P1 consistency fixes: first correct order/onboarding, clear data quality,
 verified supply/batch mapping and paid pilot. These are not permission for

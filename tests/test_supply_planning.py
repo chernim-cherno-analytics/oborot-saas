@@ -919,7 +919,7 @@ def run() -> int:
     # ── 18. Миграция: аддитивна, идемпотентна, прежние шаги сохранены ────────
     print("\n== Миграция: новый шаг сверху, старые четырнадцать не тронуты ==")
     from app.main import STARTUP_SCHEMA_STEPS
-    check("шагов старта пятнадцать", len(STARTUP_SCHEMA_STEPS) == 15,
+    check("шагов старта шестнадцать", len(STARTUP_SCHEMA_STEPS) == 16,
           str(len(STARTUP_SCHEMA_STEPS)))
     check("первые десять пар (id, позиция) не изменились",
           STARTUP_SCHEMA_STEPS[:10] == (
@@ -959,6 +959,9 @@ def run() -> int:
     check("снимок условий заказа дописан в конец с новым id и позицией 15",
           fifteenth == ("models.ensure_order_payment_terms_schema", 15),
           str(fifteenth))
+    check("признак цены добавлен отдельным шагом 16",
+          STARTUP_SCHEMA_STEPS[15:] == (("models.ensure_buy_price_presence_schema", 16),),
+          str(STARTUP_SCHEMA_STEPS[15:]))
 
     # «Старая» база: таблиц слоя нет вовсе — шаг обязан их создать и не упасть
     # при повторном вызове.

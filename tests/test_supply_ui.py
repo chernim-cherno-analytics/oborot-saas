@@ -2528,6 +2528,14 @@ def _fix1_f01(page, base) -> None:
              "budget", "forecast", "revenue", "lessons"]
     missing, invisible, misplaced = [], [], []
     for name in pages:
+        # Автопоказ подсказки ждёт несколько API-ответов и может произойти
+        # уже ПОСЛЕ close_hint(). Подготовим состояние через настоящий API:
+        # здесь проверяется навигация пользователя, прочитавшего подсказку.
+        seen = page.request.post(
+            f"{base}/api/hints/seen", data={"page": name},
+            headers={"X-Oborot-CSRF": "1"})
+        check(f"F-01: подсказка {name} отмечена просмотренной", seen.ok,
+              str(seen.status))
         page.goto(f"{base}/{name}")
         page.wait_for_timeout(250)
         close_hint(page)
