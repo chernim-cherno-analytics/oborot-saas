@@ -1,5 +1,28 @@
 # A07: existing frozen terms for orders created from a plan
 
+## Integrated compatibility on c0014db
+
+SUPPLY compatibility43/0, tenant isolation91/0 and subscription119/0 pass
+with TZ=UTC and synthetic local databases. Logs:
+/private/tmp/a07-simple-terms-supply-compat.log,
+/private/tmp/a07-simple-terms-isolation.log,
+/private/tmp/a07-simple-terms-subscription.log.
+
+A separate four-phase rehearsal uses git archives of main2dcbd7f and
+candidatec0014db, with the real application lifespan and ORM on one isolated
+SQLite file: old creates a row; new migrates and stores a snapshot; old reads,
+updates the snapshot-bearing order and creates another row; new starts again.
+All four phases exit0. Both old-writer rows retain blank defaults, the new
+snapshot survives the old ORM update, and quick_check returnsok.
+Reproducible script: /private/tmp/a07-rollback-rehearsal.py; exact versions,
+phase statuses and temporary directory: /private/tmp/a07-rollback-rehearsal.json.
+This verifies startup/ORM compatibility, not authenticated API replay.
+
+Measured rollback cost: the old runtime ignores the snapshot and uses its
+legacy45-day fallback instead of the stored10-day terms. Returning to the
+new runtime restores the stored terms. Schema/data compatibility therefore
+does not imply unchanged calendar behavior during rollback.
+
 Previously `_order_stages` read today's production terms, even when the order
 had an applied plan with a saved stage schedule. A synthetic order for 1,000
 with 50% upfront and 50% at day45 changed into one immediate 1,000 payment

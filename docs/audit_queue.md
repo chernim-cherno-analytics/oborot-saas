@@ -1,5 +1,22 @@
 # Independent audit queue
 
+## Completed local CLAIM — integrated validation and current queue
+
+BRANCH: codex/audit-validation-c0014db.
+BASE_SHA: c0014dbab9a97a940ce175814cda42380cbdfd96.
+FILES: docs/audit_queue.md, docs/audit_a07_evidence.md.
+DONE_WHEN: record the actual integrated strict result, A07 old/new/old/new
+startup and ORM compatibility evidence, and replace stale top-level statuses
+with the completed local packages. No runtime, formula, or test changes.
+Full strict execution was started on the named BASE_SHA before these docs edits.
+RESULT:48 suites,43 PASS,2 FAIL,1 NO_REPORT,2 SKIP;5064 OK/16 FAIL, exit1.
+Supply planning has one outdated14-step assertion after A07 adds step15.
+Supply sheets cannot bind occupied port8845; rerun it on a separate port.
+Backup has the previously observed WAL/GNU-stat fixture failures; deploy and
+offsite lack flock on this Mac. Full log:/private/tmp/audit-c0014db-full-strict.log.
+Next: separate test compatibility CLAIM for the terminal step; no weakening
+of the released-step identities. A07 rollback evidence is recorded separately.
+
 Recovered on 07 September 2026 from the owner-control task and the private
 04 September audit. The source document is not to be published wholesale.
 The owner's original request was to verify and prioritize all findings for a
@@ -10,13 +27,13 @@ forget the remaining audit items. Formula changes remain prohibited.
 
 | Finding | Actual status | Next action |
 | --- | --- | --- |
-| A01 New items bypass budget and disappear from decision totals | Budget safeguard implemented locally, including manual edits and forced apply; 363 checks pass | Independent review/publication pending; totals/payment/outcome discrepancy remains open; reproduction at /private/tmp/a01-current-reproduction.json |
-| A02 Saved prohibited plan can be applied | Local server fix32f17cd; not released | Independent review and publication pending; audit's wider UI/structured-reason criteria are not all claimed complete |
+| A01 New items bypass budget and disappear from decision totals | Local budget safeguard, full order totals/calendar/history, outcome grouping, missing-cost warning, and new-only UI are implemented through547508b | Independent review/publication pending; catalogue forecasts retain their existing scope and formulas; historical partial totals are marked, not backfilled |
+| A02 Saved prohibited plan can be applied | Local server guard, UI stop/recalculate, structured refusal codes and atomic apply are implemented throughd347bb0 | Independent review/publication pending; concurrent apply is not claimed verified |
 | A03 Packaging can exceed budget, MOQ or share limits | Final share safeguard implemented locally; 372 checks pass; existing budget guard covers MOQ/pack overspend | Independent review/publication pending; corrected allocation remains open under formula freeze; /private/tmp/a03-current-reproduction.json |
 | A04 Explicit zero safety stock becomes 14 | Open, explicit formula/product decision required | Preserve reproduction and narrow decision; do not change calculation by default |
 | A05 Simple order loses cost basis, production and author | Metadata package locally implemented; planner 313, execution 164, browser 37 checks pass | Independent review/publication pending; supplier-price versus full-cost semantics remain open |
 | A06 Total quantity differs from size quantities | Released, confirmed by owner-control history | Do not implement again; existing regressions remain |
-| A07 New production terms alter historical payment calendar | Plan-backed orders now use their frozen terms locally; 506 checks pass | Independent review/publication pending; simple orders, placement dates and payment facts remain open; /private/tmp/a07-current-reproduction.json |
+| A07 New production terms alter historical payment calendar | Local exact plan snapshots and new simple-order snapshots throughc0014db; terminal additive migration15; plan/receipt links verify reciprocal identity | Independent review/publication pending; legacy fallback, placement-date policy, renegotiation history and actual payment facts remain open |
 | A08 Received status falsely confirms execution | Local fix034eab8; not released | Independent review pending; existing partial-evidence contract retained, not blanket equivalence of both APIs |
 | A09 Invalidated cache can republish an obsolete snapshot | Open, P2 after pilot in original priority | Read-only current verification; no repeated prohibited concurrency experiment |
 
@@ -24,11 +41,14 @@ After P1 consistency fixes: first correct order/onboarding, clear data quality,
 verified supply/batch mapping and paid pilot. These are not permission for
 microservices, broad integrations, redesign or new forecast formulas.
 
-Current implementation base: integrated audit HEAD14a03957a513a29937c27dcc68bc5cc46cdcdc70,
-including released main0d8b6304ad181d2a484e859f8fce57ce529bf613. The complete local
-strict test result is documented in /private/tmp/oborot-audit-review-handoff.md:
-43 PASS, 3 FAIL, 2 SKIP; not a green release gate. Unrelated backup diagnostics
-are recorded there and are not the next audit implementation priority.
+Current runtime/test HEAD: c0014dbab9a97a940ce175814cda42380cbdfd96,
+including main2dcbd7fa7f57a07169364529ad3e148ff65c017f (SUPPLY PR53).
+The older full strict run was43 PASS,3 FAIL,2 SKIP. The new full strict run
+on c0014db is43 PASS,2 FAIL,1 NO_REPORT,2 SKIP; it is not a green release gate.
+Evidence is recorded in the current
+validation CLAIM and /private/tmp/oborot-audit-review-handoff.md.
+Completed CLAIMs below are historical package evidence, not a fresh queue of
+unfinished implementation. Their exclusions can be superseded by later CLAIMs.
 
 ## Completed local CLAIM A05 metadata
 
