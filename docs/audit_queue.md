@@ -1,5 +1,19 @@
 # Independent audit queue
 
+## Completed local CLAIM — explicit order actions
+
+BRANCH: codex/audit-order-action-labels. BASE: c0014db.
+FILES: templates/replenish.html, templates/assistant.html, docs/audit_queue.md.
+SOURCE: independent audit, decision/placement workflow; owner authorizes all
+non-formula work. DONE_WHEN: quick-order confirmation explicitly says it
+records placement and explains the existing sent/incoming transition; wizard
+creation explicitly says draft. Existing browser regression passes.
+No status/API/formula change or new tests for this small copy correction.
+Isolated worktree preserves the source of the ongoing full strict run.
+RESULT: existing Chromium UI regression57 OK/0 FAIL, exit0;
+/private/tmp/audit-order-action-labels-ui.log. Diff check clean.
+This is a copy correction; no new acceptance test or formula changes.
+
 Recovered on 07 September 2026 from the owner-control task and the private
 04 September audit. The source document is not to be published wholesale.
 The owner's original request was to verify and prioritize all findings for a
