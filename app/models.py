@@ -15,6 +15,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    false,
     inspect,
     text,
 )
@@ -274,7 +275,7 @@ class Product(Base):
     cost_price: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)  # закупочная, ₽
     # Ноль в старом cost_price также означает отсутствие buyPrice. Только
     # синк с явным нулём источника разрешает отправлять нулевую цену.
-    buy_price_zero_explicit: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
+    buy_price_zero_explicit: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=false())
     cost_full: Mapped[float] = mapped_column(Float, nullable=False, default=0.0, server_default="0")
     # Поставщик из МойСклада (контрагент в карточке товара). По нему обычно и
     # видно, кто шьёт позицию: «Китай» — фабрика под ключ, своё производство —
@@ -1984,5 +1985,5 @@ def ensure_buy_price_presence_schema(bind=None) -> None:
         return
     if "buy_price_zero_explicit" not in {c["name"] for c in insp.get_columns("products")}:
         run_migration_step(
-            "ALTER TABLE products ADD COLUMN buy_price_zero_explicit BOOLEAN NOT NULL DEFAULT 0",
+            "ALTER TABLE products ADD COLUMN buy_price_zero_explicit BOOLEAN NOT NULL DEFAULT FALSE",
             bind=eng)

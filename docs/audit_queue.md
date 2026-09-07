@@ -1,5 +1,18 @@
 # Independent audit queue
 
+## Local CLAIM — PR56 portable Boolean migration
+
+BRANCH: codex/audit-stage2-refresh. FILES: app/models.py,
+docs/audit_queue.md. SOURCE: review3952626340, terminal unreleased step16
+uses integer DEFAULT0 with BOOLEAN, incompatible with PostgreSQL ALTER.
+Use a dialect-aware false ORM default and SQL FALSE in the new migration.
+DONE_WHEN: SQLite existing-row/old-writer defaults remain false, repeated
+migration succeeds, PostgreSQL CREATE TABLE compiles a Boolean default,
+and fresh hosted strict CI passes. No formula or old migration changes.
+LOCAL RESULT: SQLite migration twice, existing and old-writer inserted rows
+false, integrity_check ok. PostgreSQL CREATE TABLE compiles DEFAULT false;
+live PostgreSQL execution was not performed locally.
+
 ## Local CLAIM — PR56 navigation CI preparation
 
 BRANCH: codex/audit-stage2-refresh. FILES: tests/test_supply_ui.py,
