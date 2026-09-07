@@ -192,6 +192,9 @@ def _plan_order_items(result: dict, brief: dict) -> list[dict]:
         if int(n.get("qty") or 0) > 0:
             items.append({"base_name": n["name"], "qty": int(n["qty"]),
                           "sizes": {}, "cost": float(n.get("cost") or 0)})
+    if "supplier_prices" in result:
+        for item in items:
+            item["supplier_prices"] = result["supplier_prices"].get(item["base_name"], {})
     return items
 
 
@@ -500,16 +503,22 @@ def api_create_order(
     # Себестоимость всегда берём из БД, присланной клиентом не доверяем ни при
     # каких обстоятельствах (раньше для позиций вне каталога это правило не
     # действовало — теперь такие позиции отсеяны проверкой выше).
+    # Та же база стоимости, что в analytics: полная, иначе закупочная;
+    # размеры агрегируются тем же max, а не порядком строк SELECT.
     cost_by_base = {
-        p.base_name: float(p.cost_price or 0)
-        for p in db.execute(
-            select(Product).where(Product.org_id == ctx.org.id)
-        ).scalars()
+        base: float(full or 0) or float(purchase or 0)
+        for base, full, purchase in db.execute(
+            select(Product.base_name, func.max(Product.cost_full), func.max(Product.cost_price))
+            .where(Product.org_id == ctx.org.id, Product.excluded.is_(False))
+            .group_by(Product.base_name)
+        ).all()
     }
+    supplier_prices = ms_writeback.supplier_prices_snapshot(db, ctx.org.id)
     payload = []
     for i in items:
         d = i.model_dump()
         d["cost"] = cost_by_base.get(i.base_name, 0.0)
+        d["supplier_prices"] = supplier_prices.get(i.base_name, {})
         payload.append(d)
     fingerprint = _order_fingerprint(name, body.eta_date, payload)
     if not body.allow_duplicate:
@@ -2404,6 +2413,10 @@ def _plan(db: Session, ctx: AuthContext, body: OrderPlanIn) -> dict:
             "names": (incomplete["names"] + [item["name"] for item in missing_new])[:10],
             "new_item_positions": len(missing_new),
         }
+    supplier_prices = ms_writeback.supplier_prices_snapshot(db, ctx.org.id)
+    selected_bases = {i["base_name"] for i in plan.get("items") or []}
+    selected_bases.update(i["name"] for i in plan["brief"].get("new_items") or [])
+    plan["supplier_prices"] = {base: supplier_prices.get(base, {}) for base in selected_bases}
     plan["order_totals"] = _order_totals(_plan_order_items(plan, plan["brief"]))
     plan["order_payments"] = order_planner.payment_plan(
         date.fromisoformat(plan["order_date"]), plan["payment_terms"],
@@ -2819,6 +2832,7 @@ def api_order_plan_save(
         ),
         result_json=json.dumps(
             {"items": plan["items"], "totals": plan["totals"],
+             "supplier_prices": plan["supplier_prices"],
              "order_totals": plan["order_totals"], "order_payments": plan["order_payments"],
              # Сохраняем итоговый запрет после ручных правок вместе с решением:
              # сохранение для истории само по себе не разрешает создать заказ.

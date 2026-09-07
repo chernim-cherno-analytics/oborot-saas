@@ -1114,11 +1114,26 @@ def api_checks() -> None:
                         "budget": 100000000, "budget_scope": "full"}
         precise_saved = c.post("/api/order-plan", json=precise_body).json()
         precise_plan = precise_saved["plan"]
+        price_base = precise_plan["items"][0]["base_name"]
+        original_supplier_rows = _sql("SELECT id,cost_price FROM products WHERE org_id=1 AND base_name=?", price_base)
+        frozen_supplier_prices = {size: price for size, price in _sql(
+            "SELECT size,cost_price FROM products WHERE org_id=1 AND base_name=? AND ext_id != ''", price_base)}
+        check("A05 план сохраняет закупочные цены отдельно от расчётной базы",
+              precise_plan.get("supplier_prices", {}).get(price_base) == frozen_supplier_prices)
+        _sql("UPDATE products SET cost_price=98765 WHERE org_id=1 AND base_name=?", price_base)
         expected_precise = precision_op.payment_plan(date.today(), precise_setup["stages"],
                                                       precise_plan["cost_total"])
         precise_apply = c.post(f"/api/order-plan/{precise_saved['id']}/apply",
                                json={"force": True, "confirm_partial": True}).json()
         precise_order_id = precise_apply["order_id"]
+        for product_id, purchase_price in original_supplier_rows:
+            _sql("UPDATE products SET cost_price=? WHERE id=?", purchase_price, product_id)
+        price_order = c.get(f"/api/orders/{precise_order_id}").json()
+        frozen_line = next(i for i in price_order["items"] if i["base_name"] == price_base)
+        check("A05 применение плана сохраняет цену подрядчика до изменения каталога",
+              frozen_line.get("supplier_prices") == frozen_supplier_prices)
+        check("A05 применение плана сохраняет его полную расчётную себестоимость",
+              frozen_line["cost"] == precise_plan["items"][0]["cost_price"])
         precise_orders = c.get("/api/orders/open").json()["orders"]
         actual_precise = next(o["payments"] for o in precise_orders if o["id"] == precise_order_id)
         check("A07 сохранение не округляет исходные доли платежей",

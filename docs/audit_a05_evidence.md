@@ -1,5 +1,52 @@
 # A05: simple-order production and author
 
+## Completion: cost basis and document price, 07 September
+
+The owner explicitly delegated the price decision to the project's existing
+business logic. D-12 identifies cost_full as full cost and cost_price/buyPrice
+as contractor purchase price; D-21 defines purchaseorder as ordering sewing
+from that contractor. D-58 records the resulting local implementation decision.
+The earlier pricing exclusion below is superseded.
+
+Simple creation now reads the same full-cost/fallback and max-over-sizes basis
+as analytics, rather than whichever purchase-price row SELECT returned last.
+The client cannot supply either price. The wizard retains its displayed
+calculated cost and any explicitly configured overhead; no formula changes.
+Both paths freeze contractor purchase prices by size in supplier_prices.
+For the wizard the snapshot is saved with the plan and copied when applied,
+so intervening catalogue edits cannot reprice the document. Quantities,
+allocation, calendar arithmetic, tenant checks and order identity are unchanged.
+
+Writeback uses the saved price of the matched SKU, preserving differing size
+prices. A missing price in the new snapshot rejects sending before document
+creation instead of using full cost. Explicit zero is retained. Old order
+rows and old saved plans without the key retain their legacy saved cost as
+send price; no historic repricing. The send confirmation describes both cases.
+
+Release is deliberately two-stage. Reader compatibility is committed first
+as4c25f370be2f9610376e232c7930f7410df3b170. Its old-creator workflow passes
+writeback140/0 in a separate worktree. The second stage enables recording new
+prices and full costs; its rollback target must include that first stage.
+Pre-reader code would ignore the new field and could send full cost as price.
+No schema migration is required, but that older rollback is not price-safe.
+
+RED: real API plus mock writeback140 OK/3 FAIL, /private/tmp/a05-cost-basis-red.log.
+For a synthetic buyPrice100/full cost150, the old API saved100, lost the
+separate supplier price and retained the wrong cost after catalogue changes.
+GREEN expanded coverage: writeback146/0, planner366/0, execution176/0, UI57/0.
+Idempotency and recovery:533/0, /private/tmp/a05-cost-basis-idempotency.log.
+The UI suite is general regression coverage, not a dedicated assertion of the
+updated send-confirmation text.
+Logs:/private/tmp/a05-cost-basis-writeback-complete.log,
+/private/tmp/a05-cost-basis-planner.log, /private/tmp/a05-cost-basis-execution.log,
+/private/tmp/a05-cost-basis-ui.log. Reader-only log:/private/tmp/a05-price-reader-compat.log.
+The final sending scenario additionally uses purchase prices100/125 by size,
+full cost150, forged client prices and a subsequent catalogue change to999/1999;
+the document still uses its stored100/125 prices. Partial refusal can be retried,
+zero remains zero, and a legacy row sends its original175 price.
+
+These are local checks, not full strict CI, independent approval or release.
+
 Scope: metadata part of the independent audit, on top of integrated audit
 base `14a03957a513a29937c27dcc68bc5cc46cdcdc70`. Supplier-price versus
 full-cost semantics remain open; this package does not change pricing,
