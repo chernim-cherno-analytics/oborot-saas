@@ -28,3 +28,15 @@ no external systems or production data modified.
 
 Local package only; independent review/publication pending. Does not claim
 the entire A01 finding closed or the previously failing strict CI green.
+
+## Partial-total labels in the wizard
+
+The UI previously called catalogue-only cost the full obligation even with
+new items. The displayed quantity and cash-calendar explanation also omitted
+that restriction. A browser baseline using the real preview for two new
+units at1,000 returned45 OK /3 FAIL: all three missing scope explanations
+were reproduced. This follow-up labels catalogue-only cards accordingly and
+states that current-plan totals, quantities and calendar exclude the new
+items shown separately. No amounts or formulas change. The ordinary labels
+are retained when there are no new items. Final browser:49 OK /0 FAIL,
+including real preview and no console errors.

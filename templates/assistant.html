@@ -736,6 +736,7 @@
 
   function renderCards(){
     var p = STATE.plan, t = liveTotals();
+    var hasNew = (p.new_items||[]).length > 0;
     var budget = p.budget || 0;
     var spent = (p.budget_basis === "now") ? t.pay_now : t.cost;
     var left = budget - (p.reserve_new||0) - spent;
@@ -743,16 +744,16 @@
     document.getElementById("cards").innerHTML =
       '<div class="card"><div class="l">'+(p.budget_note
           ? ('Первый платёж '+dstr((p.payments||[])[0] && p.payments[0].date))
-          : 'Заплатить сейчас')+'</div><div class="v">'+fmtR(t.pay_now)+'</div>'+
+          : 'Заплатить сейчас')+(hasNew ? ' · каталожные позиции' : '')+'</div><div class="v">'+fmtR(t.pay_now)+'</div>'+
         '<div class="s">из бюджета '+fmtR(budget)+
         (p.reserve_new? (" · новинки "+fmtR(p.reserve_new)) : "")+
         ' · свободно '+fmtR(left)+'</div></div>'+
       '<div class="card"'+(t.pay_later>0?' style="background:rgba(255,204,0,.16)"':'')+'>'+
-        '<div class="l">Полное обязательство</div><div class="v">'+fmtR(t.cost)+'</div>'+
+        '<div class="l">'+(hasNew ? 'Обязательство по каталожным позициям' : 'Полное обязательство')+'</div><div class="v">'+fmtR(t.cost)+'</div>'+
         '<div class="s">'+(t.pay_later>0
           ? ('ещё '+fmtR(t.pay_later)+' платится позже')
-          : 'весь заказ оплачивается сразу')+'</div></div>'+
-      '<div class="card"><div class="l">Позиций / штук</div><div class="v">'+fmt(t.positions)+' / '+fmt(t.units)+'</div>'+
+          : (hasNew ? 'каталожные позиции оплачиваются сразу' : 'весь заказ оплачивается сразу'))+'</div></div>'+
+      '<div class="card"><div class="l">'+(hasNew ? 'Каталожных позиций / штук' : 'Позиций / штук')+'</div><div class="v">'+fmt(t.positions)+' / '+fmt(t.units)+'</div>'+
         '<div class="s">'+(p.over_need_cost ? ('из них '+fmtR(p.over_need_cost)+' — запас сверх потребности') : 'в заказе')+'</div></div>'+
       '<div class="card" style="background:rgba(76,187,23,0.18)"><div class="l">Валовая маржа</div>'+
         '<div class="v">'+fmtR(t.profit)+'</div><div class="s">если продать по средней цене, до налогов и логистики'+
@@ -766,6 +767,8 @@
     // сравнивал бюджет с полной стоимостью заказа. Молчать об этом нельзя —
     // иначе цифры на карточках выглядят как ошибка.
     warn.innerHTML =
+      (hasNew ? '<div class="warn">Новинки на '+fmtR(p.new_items_cost)+
+        ' показаны отдельно ниже. Итоговые суммы, количество и календарь этого плана их пока не учитывают.</div>' : '') +
       (p.budget_note ? '<div class="warn">'+esc(p.budget_note)+'</div>' : "") +
       (left < 0
         ? '<div class="err">Заказ выходит за бюджет на '+fmtR(-left)+

@@ -121,3 +121,17 @@ lets the user obtain a new server decision without discovering the step-3
 navigation shortcut. Browser regression uses actual clicks for all stop and
 recovery cases. No formulas/API changes.
 RESULT: 44 browser checks pass using the actual visible action.
+
+## Completed local CLAIM A01 partial-total labels
+
+BRANCH: codex/audit-a01-partial-total-labels. BASE: 9dcc7f9.
+FILES: templates/assistant.html, tests/test_ui.py, docs/audit_queue.md,
+docs/audit_a01_evidence.md.
+DONE_WHEN: with new items, the wizard labels its amounts/counts as catalogue
+positions and explicitly says new items are absent from current-plan totals
+and calendar; without new items existing labels remain. Real preview/browser
+verification. No formula, amount, API or storage changes.
+
+Next bounded verification: saved-plan history uses the same catalogue-only
+totals without a scope marker. Inspect _plan_row_out/renderHistory and expose
+the omission explicitly without changing stored amounts or monetary policy.

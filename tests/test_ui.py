@@ -445,6 +445,28 @@ def run() -> int:  # noqa: C901 — сценарный тест: шагов мн
                           bool(page.locator("#mkOrder").get_attribute("title")))
             page.unroute("**/api/order-plan/preview", server_gate)
 
+        print("\n== A01: новинки не выдают неполные итоги за полные ==")
+        if row:
+            check("A01 без новинок обычная подпись сохранена",
+                  "Полное обязательство" in (page.text_content("#cards") or "")
+                  and "не учитывают" not in (page.text_content("#budgetWarn") or ""))
+            page.evaluate("() => window.addNew('A01 UI новинка', 2, 1000)")
+            with page.expect_response(lambda r: r.url == f"{base}/api/order-plan/preview") as new_preview:
+                page.locator("#recalcPlan").click()
+            check("A01 сервер отдельно считает стоимость новинок",
+                  new_preview.value.json()["new_items_cost"] == 2000)
+            page.locator("#mkOrder").wait_for(state="visible")
+            cards_with_new = page.text_content("#cards") or ""
+            check("A01 обязательство с новинками не названо полным",
+                  "Полное обязательство" not in cards_with_new
+                  and "Обязательство по каталожным позициям" in cards_with_new)
+            check("A01 количество ограничено каталожными позициями",
+                  "Каталожных позиций / штук" in cards_with_new)
+            warning_with_new = page.text_content("#budgetWarn") or ""
+            check("A01 ограничение итогов и календаря явно показано",
+                  "Новинки" in warning_with_new and "не учитывают" in warning_with_new
+                  and "календарь" in warning_with_new)
+
         print("\n== «Что заказать»: позиции без себестоимости не бесплатны ==")
         page.goto(f"{base}/replenish")
         page.wait_for_timeout(3500)
