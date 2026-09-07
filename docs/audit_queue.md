@@ -1,5 +1,19 @@
 # Independent audit queue
 
+## Completed local CLAIM — scoped publication mandate clarification
+
+BRANCH: codex/audit-publication-mandate. BASE:4c25f37. FILES: AGENTS.md,
+docs/audit_queue.md. SOURCE: owner directly instructed Codex to write this
+audit package, change its publication rules, decide A05, and explicitly
+confirmed publication to chernim-cherno-analytics/oborot-saas via two PRs.
+DONE_WHEN: repository instructions expose this scoped exception to reviewers
+without weakening formula, CI, independent review or release requirements.
+PR55 review3950677137 cites the older single-author rule; no runtime defect
+is described by that comment. No authorship/history rewriting is permitted.
+RESULT: scoped owner exception added to AGENTS.md; runtime unchanged.
+Both original published heads passed hosted strict CI (runs34133115581 and
+34133118777); this documentation commit requires its own fresh CI/review.
+
 ## Local CLAIM — A05 cost basis and supplier price
 
 BRANCH: codex/audit-a05-cost-basis. BASE:ff2de21.
