@@ -1057,6 +1057,18 @@ SKETCH_MAX_BYTES = 2 * 1024 * 1024
 SKETCH_MAX_SIDE = 4096
 SKETCH_MIME_TYPES = ("image/jpeg", "image/png")
 
+#: Миниатюра эскиза (ТЗ F-23б). Сторона не больше 128 точек — столько и занимает
+#: картинка в карточке; полноразмерный файл под 44 px был не «немного больше»,
+#: а в тысячу раз больше нужного.
+#:
+#: ПОЧЕМУ ПОТОЛОК БАЙТОВ ОТДЕЛЬНЫЙ И МАЛЕНЬКИЙ. Миниатюру рисует клиент
+#: (Pillow в `requirements.lock` нет, и ТЗ прямо назвало этот путь), то есть
+#: приходит она снаружи и её размеру верить нельзя. 64 КБ — потолок из ТЗ:
+#: честный PNG 128×128 в него помещается с запасом, а «миниатюра» на два
+#: мегабайта в базу не ляжет.
+SKETCH_THUMB_MAX_BYTES = 64 * 1024
+SKETCH_THUMB_MAX_SIDE = 128
+
 
 class SupplyMaterial(Base):
     """Материал сам по себе: куплен до того, как решено, что из него шьют.
@@ -1126,6 +1138,11 @@ class SupplySketch(Base):
     height: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     sha256: Mapped[str] = mapped_column(String(64), nullable=False, default="")
     data: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    #: Миниатюра ≤128 px, PNG (F-23б). НУЛЛИРУЕМА намеренно и навсегда: у
+    #: эскизов, заведённых до этого пакета, её нет и взяться ей неоткуда —
+    #: пересчитать её на сервере нечем, Pillow в замыкании зависимостей
+    #: отсутствует. Пустая колонка здесь означает ровно это, а не «потеряли».
+    thumb: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
     author: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     created_at: Mapped[datetime] = mapped_column(TolerantDateTime, nullable=False,
                                                  default=datetime.utcnow)
@@ -1956,3 +1973,38 @@ def ensure_supply_assignment_archive_schema(bind=None) -> None:
         run_migration_step(
             "ALTER TABLE supply_assignments ADD COLUMN archived_at DATETIME",
             bind=eng)
+
+
+def ensure_supply_sketch_thumb_schema(bind=None) -> None:
+    """SUPPLY-FIX-4 (F-23б): миниатюра эскиза. Шаг старта 15.
+
+    ПОЧЕМУ ШЕСТОЙ ОТДЕЛЬНЫЙ ШАГ, А НЕ ДОПИСКА В ПРЕЖНИЙ. То же правило и по
+    той же причине, что у шагов 12–14 (`AGENTS.md` §1, «только новая миграция
+    сверху»): четырнадцать выпущенных пар (id, позиция) не трогаются ни буквой,
+    а у новой работы своя пара. Дописать колонку в шаг 11 было нельзя вовсе: на
+    боевой базе он давно выполнен, журнал считает его сделанным по id, и новая
+    колонка не появилась бы там никогда.
+
+    ЧТО ЗДЕСЬ ДЕЛАЕТСЯ. Один `ALTER TABLE supply_sketches ADD COLUMN thumb
+    BLOB`. Ни одной строки шаг не читает и не переписывает, ни одного индекса
+    не создаёт и не удаляет, чужих таблиц не касается.
+
+    ИДЕМПОТЕНТЕН: колонка добавляется только если её нет; на свежей базе она
+    приходит из модели через `create_all` шага 11, и тогда шаг не делает ничего.
+
+    ОТКАТ. Колонка нуллируема и без `server_default`: прежний код о ней не
+    знает, в `INSERT` её не называет, и его запись проходит — новый эскиз
+    получает `NULL`, то есть «миниатюры нет». Цена названа прямо и она мала:
+    после отката карточки показывают полноразмерные картинки, как показывали до
+    этого пакета, — то есть возвращается прежнее поведение, а не поломка.
+    Вернувшийся новый код снова отдаёт миниатюры тем эскизам, у которых они
+    сохранились; данные не теряются ни в одну сторону.
+    """
+    eng = bind or engine
+    insp = inspect(eng)
+    if not insp.has_table("supply_sketches"):
+        return
+    cols = {c["name"] for c in insp.get_columns("supply_sketches")}
+    if "thumb" not in cols:
+        run_migration_step(
+            "ALTER TABLE supply_sketches ADD COLUMN thumb BLOB", bind=eng)

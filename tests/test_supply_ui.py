@@ -32,6 +32,7 @@
 Нужен Chromium под playwright: `pip install -r requirements-dev.lock` и
 `python -m playwright install chromium`.
 """
+import base64
 import json
 import os
 import re
@@ -53,6 +54,13 @@ os.environ["OBOROT_SUBSCRIPTION_GATE"] = "0"
 
 if DB_PATH.exists():
     DB_PATH.unlink()
+
+#: НАСТОЯЩИЙ PNG 4×3 строкой base64: сигнатура, IHDR, IDAT и IEND с ВЕРНЫМИ
+#: контрольными суммами. Бинарника в репозитории по-прежнему нет, а картинка
+#: теперь действительно картинка — её открывает браузер, а не только принимает
+#: наш разбор (он контрольных сумм не проверяет, и подделка проходила мимо).
+VALID_PNG_B64 = ("iVBORw0KGgoAAAANSUhEUgAAAAQAAAADCAIAAAA7ljmRAAAAEElEQVR4nGNo"
+                 "cFCAIwacHADRZwqBZaYHGAAAAABJRU5ErkJggg==")
 
 import httpx  # noqa: E402
 import uvicorn  # noqa: E402
@@ -2142,17 +2150,23 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
         page.wait_for_timeout(200)
         page.select_option("#pl-item-kind", "draft")
         page.fill("#pl-item-title", "Новинка Б")
-        page.evaluate("""() => {
-            const png = new Uint8Array([137,80,78,71,13,10,26,10,
-              0,0,0,13,73,72,68,82, 0,0,0,4, 0,0,0,3, 8,2,0,0,0, 214,111,120,131,
-              0,0,0,22,73,68,65,84, 120,156,99,248,207,192,240,31,4,3,3,3,0,
-              47,224,5,251, 27,132,73,157,
-              0,0,0,0,73,69,78,68,174,66,96,130]);
+        # ЗДЕСЬ БЫЛА ПОДДЕЛЬНАЯ КАРТИНКА, И ЭТО НАШЛОСЬ ПАКЕТОМ 4. Прежняя
+        # редакция собирала PNG побайтно руками, и контрольные суммы обоих
+        # блоков в нём были неверны: наш разбор их не проверяет, поэтому файл
+        # принимался и хранился, но НИ ОДИН браузер такую картинку не
+        # показывает. Пока проверка смотрела только на адрес в `src`, разницы
+        # видно не было; проверка «картинка нарисована» (F-23) её обнаружила
+        # сразу. Теперь байты берутся из настоящего PNG (base64), и фикстура
+        # проверяет продукт, а не саму себя.
+        page.evaluate("""(b64) => {
+            const raw = atob(b64);
+            const png = new Uint8Array(raw.length);
+            for (let i = 0; i < raw.length; i++) png[i] = raw.charCodeAt(i);
             const file = new File([png], 'sketch.png', {type: 'image/png'});
             const dt = new DataTransfer();
             dt.items.add(file);
             document.getElementById('pl-item-sketch').files = dt.files;
-        }""")
+        }""", VALID_PNG_B64)
         page.click("#pl-item-form button[type=submit]")
         page.wait_for_timeout(1500)
         check("новинка создана", page.evaluate(
@@ -2442,6 +2456,9 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
 
         # ── 25. SUPPLY-FIX-3: единицы, формат, тексты, сохранность форм ─────
         supply_fix_3_ui(pw, base, c)
+
+        # ── 26. SUPPLY-FIX-4: порядок отправки эскиза, кэш картинки, история ─
+        supply_fix_4_ui(pw, base, c)
 
     c.close()
     print(f"\nИТОГО: {len(PASS)} OK, {len(FAIL)} FAIL")
@@ -3985,6 +4002,257 @@ def supply_fix_3_ui(pw, base, c) -> None:
         check("F-16/F-21 на телефоне: шаг дошёл до конца без исключения", False,
               f"{type(exc).__name__}: {str(exc).strip().splitlines()[0][:160]}")
     browser.close()
+
+
+def supply_fix_4_ui(pw, base, c) -> None:
+    """SUPPLY-FIX-4 в настоящем браузере: F-23 и F-24 на стороне страницы.
+
+    ЧТО СЮДА ПОПАЛО И ПОЧЕМУ ИМЕННО ЭТО. Три вещи не видны ниоткуда, кроме
+    браузера: (1) порядок запросов при сохранении новинки с эскизом — по ответу
+    ручки его не увидеть вовсе; (2) отсутствие повторной перекачки картинки при
+    перерисовке — это счётчик сетевых запросов, а не строка HTML; (3) «История»
+    как элемент карточки. Всё остальное из пакета живёт на сервере и проверено
+    там (`tests/test_supply_planning.py`).
+
+    ЧЕГО ЗДЕСЬ НЕТ: ни одной параллельной вкладки и ни одного состязательного
+    сценария. F-22 в пакет не входит.
+    """
+    browser = pw.chromium.launch()
+    ctx = browser.new_context(viewport={"width": 1400, "height": 900})
+    ctx.add_cookies([{"name": k, "value": v, "domain": "127.0.0.1", "path": "/"}
+                     for k, v in c.cookies.items()])
+    errors: list[str] = []
+    page = ctx.new_page()
+    page.on("pageerror", lambda e: errors.append(str(e)))
+
+    steps = (
+        ("F-23 порядок", lambda: _fix4_order_ui(page, base, c)),
+        ("F-23 кэш картинки", lambda: _fix4_no_refetch_ui(page, base)),
+        ("F-24 история", lambda: _fix4_history_ui(page, base, c)),
+    )
+    for label, run_step in steps:
+        try:
+            run_step()
+        except Exception as exc:  # noqa: BLE001 — важен отчёт, а не тип
+            check(f"{label}: шаг дошёл до конца без исключения", False,
+                  f"{type(exc).__name__}: "
+                  f"{str(exc).strip().splitlines()[0][:160]}")
+
+    check("за сценарий SUPPLY-FIX-4 не было ошибок в консоли",
+          not errors, str(errors)[:200])
+    ctx.close()
+    browser.close()
+
+
+def _fix4_order_ui(page, base, c) -> None:
+    """F-23а: сначала вещь, потом файл — и порядок виден по самим запросам."""
+    print("\n== F-23: эскиз уходит ПОСЛЕ создания вещи, а не до ==")
+    _open_plan(page, base)
+    seen: list[str] = []
+    page.on("request", lambda r: seen.append(r.method + " " + r.url)
+            if "/api/supply/planning/" in r.url else None)
+
+    page.click("#pl-add-item")
+    page.wait_for_timeout(250)
+    page.select_option("#pl-item-kind", "draft")
+    page.wait_for_timeout(150)
+
+    # ПУСТОЕ НАЗВАНИЕ: страница обязана отказать САМА и не отправить ни байта.
+    # Это и есть весь пункт: раньше файл уходил первым, и отказ сервера уже
+    # ничего не менял — картинка лежала в базе.
+    page.set_input_files("#pl-item-sketch", {
+        "name": "sketch.png", "mimeType": "image/png",
+        "buffer": base64.b64decode(VALID_PNG_B64)})
+    before = len([u for u in seen if "POST" in u])
+    page.evaluate("""() => {
+      const b = document.querySelector('#pl-item-form button[type=submit]');
+      if (b) b.click();
+    }""")
+    page.wait_for_timeout(700)
+    after = [u for u in seen if u.startswith("POST")]
+    check("пустое название не отправило НИ ОДНОГО запроса",
+          len(after) == before, str(after[-3:]))
+    # ПРИЧИНУ НАЗЫВАЕТ БРАУЗЕР, И ЭТО НЕ ОБХОД ПРОВЕРКИ, А ЕЁ СМЫСЛ. Поле
+    # объявлено обязательным (`required`), поэтому нажатие на «Сохранить» до
+    # нашего обработчика вообще не доходит: форма не отправляется, и человек
+    # видит родную подсказку у пустого поля. Спрашивать после этого наш
+    # `#pl-item-err` значило бы требовать вторую ошибку там, где первая уже
+    # остановила отправку.
+    told = page.evaluate("""() => {
+      const t = document.getElementById('pl-item-title');
+      if (!t) return null;
+      return {missing: t.validity.valueMissing, required: t.required,
+              shown: getComputedStyle(t).display !== 'none'};
+    }""")
+    check("и человек видит причину у самого поля: оно обязательное и пустое",
+          told and told["required"] and told["missing"] and told["shown"],
+          str(told))
+
+    seen.clear()
+    page.fill("#pl-item-title", "Новинка-порядок")
+    page.evaluate("""() => {
+      const b = document.querySelector('#pl-item-form button[type=submit]');
+      if (b) b.click();
+    }""")
+    page.wait_for_timeout(2500)
+    posts = [u for u in seen if u.startswith("POST")]
+    items = [i for i, u in enumerate(posts) if u.endswith("/items")]
+    sketches = [i for i, u in enumerate(posts) if "/sketch" in u]
+    check("оба запроса ушли", bool(items) and bool(sketches), str(posts))
+    check("вещь создана ПЕРВОЙ, файл прикреплён ВТОРЫМ",
+          bool(items) and bool(sketches) and items[0] < sketches[0], str(posts))
+    check("к старой ручке загрузки страница больше не ходит",
+          not any(u.rstrip("/").endswith("/sketches") for u in posts), str(posts))
+
+    board = c.get("/api/supply/planning").json()
+    made = [i for i in board["items"] if i["title"] == "Новинка-порядок"]
+    check("вещь на месте и с эскизом",
+          bool(made) and made[0]["sketch_id"] is not None,
+          str(made[:1])[:160])
+
+
+def _fix4_no_refetch_ui(page, base) -> None:
+    """F-23б,в: карточка показывает миниатюру и не перекачивает её заново."""
+    print("\n== F-23: миниатюра в карточке и ни одного повторного запроса ==")
+    _open_plan(page, base)
+    # Картинке дают ЗАГРУЗИТЬСЯ прежде, чем её считать: `loading="lazy"` и
+    # обычная сеть означают, что сразу после `goto` она ещё в пути, и «не
+    # нарисована» тогда сказало бы о моменте замера, а не о продукте.
+    #
+    # Сначала картинку ПОКАЗЫВАЮТ: у неё `loading="lazy"`, и пока карточка
+    # партии ниже сгиба, браузер её не запрашивает вовсе. Без прокрутки
+    # проверка «повторных запросов нет» была бы зелёной ни на чём — запросов не
+    # было бы и в первый раз.
+    page.evaluate("""() => {
+      const i = document.querySelector('#pl-batches img.pl-sketch');
+      if (i && i.scrollIntoView) i.scrollIntoView({block: 'center'});
+    }""")
+    page.wait_for_timeout(400)
+    loaded = True
+    try:
+        page.wait_for_function(
+            "() => { const i = document.querySelector('#pl-batches img.pl-sketch');"
+            " return !!i && i.complete && i.naturalWidth > 0; }", timeout=8000)
+    except Exception:  # noqa: BLE001 — важен отчёт, а не тип
+        loaded = False
+    check("миниатюра успела загрузиться", loaded)
+    shown = page.evaluate("""() => {
+      const a = document.querySelector('#pl-batches a.pl-sketch-link');
+      const i = document.querySelector('#pl-batches img.pl-sketch');
+      if (!i) return null;
+      const box = i.getBoundingClientRect();
+      return {src: i.getAttribute('src'), href: a ? a.getAttribute('href') : '',
+              target: a ? a.getAttribute('target') : '',
+              w: Math.round(box.width), h: Math.round(box.height),
+              natural: i.naturalWidth};
+    }""")
+    check("в карточке партии показана миниатюра, а не оригинал",
+          shown and shown["src"].endswith("/thumb"), str(shown))
+    check("картинка действительно нарисована браузером",
+          shown and shown["natural"] > 0 and shown["w"] > 0, str(shown))
+    check("полный размер открывается по клику отдельной вкладкой",
+          shown and shown["href"].startswith("/api/supply/planning/sketches/")
+          and not shown["href"].endswith("/thumb")
+          and shown["target"] == "_blank", str(shown))
+
+    # СЧЁТЧИК СЕТЕВЫХ ЗАПРОСОВ, А НЕ РАЗМЕТКА. `render()` пересоздаёт `<img>`
+    # каждый раз, и до этого пакета каждая перерисовка означала повторную
+    # загрузку картинки: ответ приходил с `no-store`. Теперь ответ приватно
+    # кэшируется на сутки, и повторная перерисовка сети не касается.
+    #
+    # Перерисовка вызывается ТАК, КАК ЕЁ ВЫЗЫВАЕТ ЧЕЛОВЕК: сохранением в другом
+    # месте экрана. Дёргать `render()` напрямую было бы нечем — страница
+    # наружу его не отдаёт, и выставлять его наружу ради проверки значило бы
+    # менять продукт под тест.
+    hits: list[str] = []
+    page.on("request", lambda r: hits.append(r.url)
+            if "/api/supply/planning/sketches/" in r.url else None)
+    for _ in range(3):
+        opened = page.evaluate("""() => {
+          const card = document.querySelector('[data-pl="material"]');
+          if (!card) return false;
+          const b = card.querySelector('button[data-inline="edit"]');
+          if (!b) return false;
+          b.click();
+          return true;
+        }""")
+        if not opened:
+            break
+        page.wait_for_timeout(250)
+        page.evaluate("""() => {
+          const f = document.querySelector('#pl-materials .pl-form.inline');
+          const b = f ? f.querySelector('button[type=submit]') : null;
+          if (b) b.click();
+        }""")
+        page.wait_for_timeout(900)
+    redrawn = page.evaluate("""() => {
+      const i = document.querySelector('#pl-batches img.pl-sketch');
+      return i ? {src: i.getAttribute('src'), natural: i.naturalWidth} : null;
+    }""")
+    check("после трёх перерисовок картинка на месте и нарисована",
+          redrawn and redrawn["natural"] > 0, str(redrawn))
+    check("и ни одного повторного запроса за картинкой не ушло",
+          not hits, str(hits[:3]))
+
+
+def _fix4_history_ui(page, base, c) -> None:
+    """F-24: «История» на карточке показывает последнюю правку."""
+    print("\n== F-24: история правок читается с карточки ==")
+    mat = c.post("/api/supply/planning/materials",
+                 json={"title": "Ткань-история-UI", "qty": "12", "unit": "м",
+                       "op_id": "f4ui-m"}).json()
+    mid = [m for m in mat["materials"] if m["title"] == "Ткань-история-UI"][0]["id"]
+    rev = [m for m in mat["materials"] if m["id"] == mid][0]["rev"]
+    c.post(f"/api/supply/planning/materials/{mid}/update",
+           json={"title": "Ткань-история-UI-2", "rev": rev, "op_id": "f4ui-m2"})
+
+    _open_plan(page, base)
+    opened = page.evaluate("""(id) => {
+      const card = document.querySelector('[data-pl="material"][data-id="' + id + '"]');
+      if (!card) return false;
+      const b = card.querySelector('button[data-inline="history"]');
+      if (!b) return false;
+      b.click();
+      return true;
+    }""", str(mid))
+    check("кнопка «История» есть на карточке материала", opened is True)
+    page.wait_for_timeout(1200)
+    text = page.evaluate("""(id) => {
+      const card = document.querySelector('[data-pl="material"][data-id="' + id + '"]');
+      const box = card ? card.querySelector('.pl-hist') : null;
+      return box ? box.textContent : '';
+    }""", str(mid))
+    check("история показывает поле, прежнее и новое значение",
+          "название" in text and "Ткань-история-UI" in text
+          and "Ткань-история-UI-2" in text, text[:200])
+    check("и называет автора правки", "Владелец" in text, text[:200])
+
+    struck = page.evaluate("""(id) => {
+      const card = document.querySelector('[data-pl="material"][data-id="' + id + '"]');
+      const old = card ? card.querySelector('.pl-hist-old') : null;
+      return old ? getComputedStyle(old).textDecorationLine : '';
+    }""", str(mid))
+    check("прежнее значение зачёркнуто, а не выдано за текущее",
+          "line-through" in struck, str(struck))
+
+    # У партии кнопка та же и работает так же — иначе история жила бы у одной
+    # сущности из двух названных ТЗ.
+    on_batch = page.evaluate("""() => {
+      const card = document.querySelector('[data-pl="batch"]');
+      if (!card) return false;
+      const b = card.querySelector('button[data-inline="history"]');
+      if (!b) return false;
+      b.click();
+      return true;
+    }""")
+    check("кнопка «История» есть и на карточке партии", on_batch is True)
+    page.wait_for_timeout(1200)
+    btext = page.evaluate("""() => {
+      const card = document.querySelector('[data-pl="batch"]');
+      const box = card ? card.querySelector('.pl-hist') : null;
+      return box ? box.textContent : '';
+    }""")
+    check("история партии тоже наполнилась", bool(btext.strip()), btext[:160])
 
 
 def _open_plan(page, base) -> None:

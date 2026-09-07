@@ -60,11 +60,69 @@ app.include_router(supply_router)
 app.include_router(supply_planning_router)
 
 
+#: Потолок тела JSON для пишущих ручек «Поставок» (ТЗ F-25). Один мегабайт —
+#: это на два порядка больше самого длинного законного тела слоя: у него нет ни
+#: одного поля длиннее 500 знаков, а тело переноса и правки укладывается в
+#: сотни байтов.
+#:
+#: ПОЧЕМУ ПОТОЛОК УЗКИЙ, А НЕ ОБЩЕСИСТЕМНЫЙ. Общий лимит на всё приложение —
+#: это отдельная работа со своим сторожем: тела импорта, выгрузки и вебхуков
+#: МойСклада живут по другим правилам, и один потолок на всех сломал бы первый
+#: же из них молча. ТЗ прямо разрешает оба варианта и требует сторожа для
+#: общего; здесь берётся узкий.
+_SUPPLY_JSON_LIMIT = 1024 * 1024
+
+#: Путь, на который потолок распространяется. Именно префикс, а не весь `/api`.
+_SUPPLY_API_PREFIX = "/api/supply/"
+
+
+def _too_large_reject():
+    from fastapi.responses import JSONResponse as _JR
+    resp = _JR(status_code=413, content={"detail": "Слишком много данных."})
+    resp.headers["Content-Security-Policy"] = "frame-ancestors 'self' https://online.moysklad.ru"
+    return resp
+
+
 def _csrf_reject():
     from fastapi.responses import JSONResponse as _JR
     resp = _JR(status_code=403, content={"detail": "CSRF: запрос отклонён"})
     resp.headers["Content-Security-Policy"] = "frame-ancestors 'self' https://online.moysklad.ru"
     return resp
+
+
+@app.middleware("http")
+async def _supply_body_limit(request: Request, call_next):
+    """Потолок тела JSON для `/api/supply/*` ДО разбора (ТЗ F-25).
+
+    ЗАЧЕМ. До этого пакета тело читалось и разбиралось целиком, каким бы оно ни
+    пришло: чтобы занять память сервера, хватало одного запроса с большим
+    JSON — авторизация и гейт подписки к этому моменту ещё не отработали.
+    Теперь превышение отсекается ответом 413 и до разбора не доходит.
+
+    ДВА РУБЕЖА, И ПЕРВЫЙ ДЕШЁВЫЙ. Сначала смотрим объявленную длину: она
+    приходит от клиента и врать может, но честный большой запрос отсекается по
+    ней, не прочитав ни байта. Затем — фактически прочитанное: тело, пришедшее
+    без объявленной длины (`Transfer-Encoding: chunked`), считается по факту.
+    Тело при этом читается через `request.body()`, а не `stream()`: только
+    первый способ кладёт прочитанное в сам объект запроса, и ручка ниже
+    получает его целиком, а не пустоту (та же ловушка, что у CSRF-проверки форм
+    строкой ниже).
+
+    MULTIPART СЮДА НЕ ПОПАДАЕТ, И ЭТО НЕ ПОСЛАБЛЕНИЕ. Загрузка эскиза законно
+    несёт до двух мегабайт файла, и общий потолок обрезал бы её на основном
+    пути записи. У неё свой потолок — `SKETCH_MAX_BYTES`, и он проверяется
+    потоком в самой ручке, то есть тоже до того, как байты куда-либо попадут.
+    """
+    if (request.method in ("POST", "PUT", "PATCH", "DELETE")
+            and request.url.path.startswith(_SUPPLY_API_PREFIX)
+            and "multipart/form-data" not in (
+                request.headers.get("content-type") or "").lower()):
+        declared = (request.headers.get("content-length") or "").strip()
+        if declared.isdigit() and int(declared) > _SUPPLY_JSON_LIMIT:
+            return _too_large_reject()
+        if len(await request.body()) > _SUPPLY_JSON_LIMIT:
+            return _too_large_reject()
+    return await call_next(request)
 
 
 @app.middleware("http")
@@ -142,6 +200,19 @@ async def _log_org_context(request: Request, call_next):
         logging_conf.set_org(sess.get("org_id") if sess else None)
     return await call_next(request)
 
+
+# ТЗ F-25: сжатие ответов. Ответ доски планирования — это весь экран одним
+# документом (порядка двухсот килобайт у бренда с сотней строк), и передавать
+# его несжатым на мобильной сети значило платить временем человека за то, что
+# стоит одну строку. Порог 1024 байта: сжимать короткие ответы дороже, чем
+# отдать их как есть.
+#
+# Middleware добавляется ПОСЛЕ двух объявленных выше, поэтому в стеке
+# оказывается снаружи: сжимается уже готовый ответ, включая ответы отказов CSRF
+# и потолка тела. Клиент, не приславший `Accept-Encoding: gzip`, получает всё
+# ровно как раньше — согласование здесь стандартное, своего в нём ничего нет.
+from starlette.middleware.gzip import GZipMiddleware  # noqa: E402
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 from app import scheduler as _scheduler  # noqa: E402
 _scheduler.attach(app)
@@ -253,6 +324,12 @@ STARTUP_SCHEMA_STEPS: tuple[tuple[str, int], ...] = (
     # базе, где 13-й уже отработал, журнал считает его выполненным по id,
     # и новая таблица не получила бы колонку вовсе.
     ("models.ensure_supply_assignment_archive_schema", 14),
+    # SUPPLY-FIX-4 (F-23б): миниатюра эскиза. Шестой append-only шаг, позиция
+    # 15 новая, четырнадцать прежних пар не тронуты — четырнадцатая тем более,
+    # она уже выпущена на прод. Шаг добавляет одну нуллируемую колонку BLOB:
+    # ни одной строки не читает и не переписывает, ни одного индекса не
+    # создаёт. Последствия отката разобраны в докстринге самой функции.
+    ("models.ensure_supply_sketch_thumb_schema", 15),
 )
 _STARTUP_STEP_ORDER = dict(STARTUP_SCHEMA_STEPS)
 
@@ -456,6 +533,11 @@ def _startup() -> None:
     # не делает ни одного ALTER.
     _startup_step("models.ensure_supply_assignment_archive_schema",
                   _models.ensure_supply_assignment_archive_schema)
+    # SUPPLY-FIX-4: одна нуллируемая колонка миниатюры у эскиза. Как и шаги
+    # 13–14, ничего не читает и не переписывает; на базе, где колонка уже
+    # есть, не делает ни одного ALTER.
+    _startup_step("models.ensure_supply_sketch_thumb_schema",
+                  _models.ensure_supply_sketch_thumb_schema)
     # Замок на пропуск: все объявленные шаги выполнены, и ровно они.
     _finish_startup_steps()
     global _STARTUP_DONE

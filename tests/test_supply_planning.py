@@ -281,10 +281,20 @@ def run() -> int:
     got = owner.get(f"/api/supply/planning/sketches/{sketch_id}")
     check("свой эскиз отдаётся и это те же байты",
           got.status_code == 200 and got.content == png, f"{got.status_code}")
-    check("отдаётся с nosniff и без публичного кэша",
+    # F-23в изменил ровно одно слово в этой строке и изменил его осознанно:
+    # `no-store` заставлял браузер перекачивать картинку при КАЖДОЙ перерисовке
+    # страницы. Теперь кэш `private` и на сутки — то есть картинка живёт в
+    # одном браузере одного человека и ни в одном общем кэше. Проверяется и то,
+    # и другое: `private` без потолка ничего не ускорил бы, а потолок без
+    # `private` разрешил бы прокси хранить чужой эскиз.
+    cache = (got.headers.get("cache-control") or "")
+    check("отдаётся с nosniff и приватным кэшем без публичного хранения",
           got.headers.get("x-content-type-options") == "nosniff"
-          and "no-store" in (got.headers.get("cache-control") or ""),
-          str(dict(got.headers))[:120])
+          and "private" in cache and "max-age=86400" in cache
+          and "public" not in cache,
+          str(dict(got.headers))[:160])
+    check("у эскиза есть ETag по содержимому",
+          bool(got.headers.get("etag")), str(got.headers.get("etag")))
 
     r = owner.post("/api/supply/planning/items",
                    json={"kind": "draft", "title": "Новинка Б", "sketch_id": sketch_id,
@@ -546,8 +556,14 @@ def run() -> int:
     # никогда не был текущим, значило бы проверить арифметику, а не защиту.
     seen_rev = [x for x in owner.get("/api/supply/planning").json()["materials"]
                 if x["id"] == mat_id][0]["rev"]
+    # ЧУЖАЯ РУКА ОБЯЗАНА ЧТО-ТО ИЗМЕНИТЬ. Прежняя редакция этой строки посылала
+    # те же самые значения и полагалась на то, что редакция сдвинется всё
+    # равно. С F-24 это больше не так — и правильно: отправка тех же значений
+    # правкой не является, и объявлять из-за неё чужие открытые формы
+    # устаревшими не за что. Проверка защиты от затирания при этом не
+    # ослаблена ни на шаг: ниже всё так же приходит НАСТОЯЩАЯ старая редакция.
     owner.post(f"/api/supply/planning/materials/{mat_id}/update",
-               json={"title": "Ткань костюмная 100", "qty": "100",
+               json={"title": "Ткань костюмная 100", "qty": "101",
                      "rev": seen_rev, "op_id": "other-hand"})
     stale = owner.post(f"/api/supply/planning/materials/{mat_id}/update",
                        json={"qty": "90", "rev": seen_rev, "op_id": "stale-1"})
@@ -555,8 +571,9 @@ def run() -> int:
           stale.status_code == 409 and "другом окне" in stale.json()["detail"],
           f"{stale.status_code} {stale.text[:100]}")
     fresh = owner.get("/api/supply/planning").json()
-    check("и значение осталось прежним",
-          [x for x in fresh["materials"] if x["id"] == mat_id][0]["qty"] == 100.0)
+    check("и значение осталось тем, которое записала чужая рука",
+          [x for x in fresh["materials"] if x["id"] == mat_id][0]["qty"] == 101.0,
+          str([x for x in fresh["materials"] if x["id"] == mat_id][0]["qty"]))
     cur_rev = [x for x in fresh["materials"] if x["id"] == mat_id][0]["rev"]
     ok = owner.post(f"/api/supply/planning/materials/{mat_id}/update",
                     json={"qty": "90", "rev": cur_rev, "op_id": "fresh-1"})
@@ -621,9 +638,15 @@ def run() -> int:
           any(e[3] == "срок неизвестен" for e in due_events)
           and any("14 ноября 2026" in (e[4] or "") for e in due_events),
           str(due_events[:2]))
+    # Обе правки количества этого сценария названы поимённо, а не «какая-нибудь
+    # запись есть»: первая — та, которой «чужая рука» сдвинула редакцию, вторая
+    # — та, что прошла уже с текущей. Прежняя редакция проверки ждала одну пару
+    # 100→90 и держалась на том, что промежуточной правки не было; цепочку
+    # честнее назвать целиком, чем подгонять под неё ожидание.
     check("правка количества записана с прежним значением и автором",
-          any(e[3] == "100.0" and e[4] == "90.0" and e[5] for e in qty_events),
-          str(qty_events[:2]))
+          any(e[3] == "100.0" and e[4] == "101.0" and e[5] for e in qty_events)
+          and any(e[3] == "101.0" and e[4] == "90.0" and e[5] for e in qty_events),
+          str(qty_events[:3]))
     check("у каждой записи журнала есть время",
           all(r[6] for r in rows), f"{len(rows)} записей")
 
@@ -919,7 +942,7 @@ def run() -> int:
     # ── 18. Миграция: аддитивна, идемпотентна, шагов двенадцать ───────────────
     print("\n== Миграция: новый шаг сверху, старые тринадцать не тронуты ==")
     from app.main import STARTUP_SCHEMA_STEPS
-    check("шагов старта четырнадцать", len(STARTUP_SCHEMA_STEPS) == 14,
+    check("шагов старта пятнадцать", len(STARTUP_SCHEMA_STEPS) == 15,
           str(len(STARTUP_SCHEMA_STEPS)))
     check("первые десять пар (id, позиция) не изменились",
           STARTUP_SCHEMA_STEPS[:10] == (
@@ -951,9 +974,14 @@ def run() -> int:
           str(thirteenth))
     fourteenth = (STARTUP_SCHEMA_STEPS[13]
                   if len(STARTUP_SCHEMA_STEPS) > 13 else None)
-    check("новый шаг дописан в конец с новым id и позицией 14",
+    check("шаг 14 остался на своей позиции и с прежним id",
           fourteenth == ("models.ensure_supply_assignment_archive_schema", 14),
           str(fourteenth))
+    fifteenth = (STARTUP_SCHEMA_STEPS[14]
+                 if len(STARTUP_SCHEMA_STEPS) > 14 else None)
+    check("новый шаг дописан в конец с новым id и позицией 15",
+          fifteenth == ("models.ensure_supply_sketch_thumb_schema", 15),
+          str(fifteenth))
 
     # «Старая» база: таблиц слоя нет вовсе — шаг обязан их создать и не упасть
     # при повторном вызове.
@@ -1070,6 +1098,9 @@ def run() -> int:
 
     # ── 22. SUPPLY-FIX-3: единицы, строгий разбор, формат, срок, тексты ──────
     supply_fix_3_checks()
+
+    # ── 23. SUPPLY-FIX-4: эскизы, журнал, транспорт ─────────────────────────
+    supply_fix_4_checks()
 
     member.close()
     other.close()
@@ -3405,6 +3436,639 @@ def _fix3_long_digits(c) -> None:
     check("а прежний план партии остался целым",
           bool(survived) and survived[0]["plan_qty"] == 7,
           str(survived[0]["plan_qty"]) if survived else "нет строки")
+
+
+# ── SUPPLY-FIX-4: эскизы, журнал, транспорт ─────────────────────────────────
+
+def supply_fix_4_checks() -> None:
+    """SUPPLY-FIX-4 (F-23…F-25) на уровне API.
+
+    КАЖДЫЙ ПУНКТ — ОТДЕЛЬНЫЙ ШАГ СО СВОИМИ ФИКСТУРАМИ, по тому же уроку, что и
+    в пакете 3: прогон против базы `66ad1c1` обязан сказать про КАЖДЫЙ пункт, а
+    не умереть на первом же отказе. Непроведённая проверка не бывает ни
+    зелёной, ни красной (D-42).
+
+    ЧЕГО ЗДЕСЬ НЕТ И НЕ БУДЕТ. Ни одной состязательной проверки: F-22
+    (атомарный `rev`) в пакет не входит вовсе, и его КП — параллельные запросы —
+    здесь не воспроизводится ни в каком виде. Всё, что ниже, однопоточно.
+    """
+    c = client()
+    register(c, "sp-fix4@test.io", "Бренд Фикс Четыре")
+    con = sqlite3.connect(DB_PATH)
+    try:
+        org4 = con.execute("SELECT id FROM orgs WHERE name = ?",
+                           ("Бренд Фикс Четыре",)).fetchone()[0]
+    finally:
+        con.close()
+
+    steps = (
+        ("F-23 порядок и сироты", lambda: _fix4_no_orphans(c, org4)),
+        ("F-23 миниатюра", lambda: _fix4_thumb(c)),
+        ("F-23 кэш и 304", lambda: _fix4_cache(c)),
+        ("F-23 дедуп", lambda: _fix4_dedup(c, org4)),
+        ("F-23 уборка сирот", lambda: _fix4_cleanup(c, org4)),
+        ("F-23 чужой эскиз", lambda: _fix4_foreign_sketch(c)),
+        ("F-24 журнал полей", lambda: _fix4_journal_fields(c, org4)),
+        ("F-24 перенос заметки", lambda: _fix4_move_note(c, org4)),
+        ("F-24 чтение журнала", lambda: _fix4_events_api(c)),
+        ("F-24 no-op", lambda: _fix4_noop(c)),
+        ("F-25 транспорт", lambda: _fix4_transport(c)),
+    )
+    for label, run_step in steps:
+        try:
+            run_step()
+        except Exception as exc:  # noqa: BLE001 — важен отчёт, а не тип
+            check(f"{label}: шаг дошёл до конца без исключения", False,
+                  f"{type(exc).__name__}: "
+                  f"{str(exc).strip().splitlines()[0][:200]}")
+    c.close()
+
+
+def _fix4_sketch_count(org_id: int) -> int:
+    con = sqlite3.connect(DB_PATH)
+    try:
+        return con.execute("SELECT COUNT(*) FROM supply_sketches WHERE org_id=?",
+                           (org_id,)).fetchone()[0]
+    finally:
+        con.close()
+
+
+def _fix4_png(width: int = 300, height: int = 200, tone: int = 0x80,
+              noisy: bool = True) -> bytes:
+    """PNG заданных размеров и заданного цвета.
+
+    Цвет — параметр, потому что дедуп проверяется по СОДЕРЖИМОМУ: две картинки
+    одного размера, но разных байтов, обязаны остаться двумя строками, иначе
+    проверка «повтор не заводит вторую» доказывала бы совпадение размеров.
+    """
+    import struct
+    import zlib
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return (struct.pack(">I", len(data)) + tag + data
+                + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    # Пиксели ШУМНЫЕ, а не залитые одним цветом, и это существенно ровно для
+    # одной проверки: одноцветный PNG 700×700 сжимается в три килобайта, и
+    # «файл больше мегабайта» на нём было бы неправдой. Генератор
+    # детерминированный (свой линейный конгруэнтный), чтобы набор не зависел от
+    # случайности и не давал разный результат в двух прогонах.
+    if not noisy:
+        # Залитая одним цветом картинка нужна ровно там, где проверяется
+        # СТОРОНА, а не объём: сжатая, она занимает сотни байтов, и до проверки
+        # стороны дело действительно доходит.
+        flat = bytes([tone, (tone + 40) % 256, (tone + 80) % 256]) * width
+        raw = b"".join(b"\x00" + flat for _ in range(height))
+        return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
+                + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+    seed = (tone * 2654435761 + 12345) & 0xFFFFFFFF
+    noise = bytearray()
+    for _ in range(width * height * 3):
+        seed = (1103515245 * seed + 12345) & 0x7FFFFFFF
+        noise.append((seed >> 16) & 0xFF)
+    raw = b"".join(b"\x00" + bytes(noise[i * width * 3:(i + 1) * width * 3])
+                   for i in range(height))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
+            + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+
+
+def _fix4_png_size(data: bytes) -> tuple:
+    """Размеры PNG — СВОИМ разбором, а не вызовом продукта.
+
+    Спрашивать у `sniff_image` про то, что проверяешь, значит сверять код с
+    самим собой (урок фикстуры предпросмотра, D-51).
+    """
+    import struct
+    assert data[:8] == b"\x89PNG\r\n\x1a\n", "не PNG"
+    return struct.unpack(">II", data[16:24])
+
+
+def _fix4_no_orphans(c, org4: int) -> None:
+    """F-23а: три отказа формы — ноль осиротевших эскизов.
+
+    Именно этот счёт и есть весь пункт. Раньше страница отправляла файл ПЕРВЫМ,
+    и каждая ошибка валидации оставляла в базе до двух мегабайт. Теперь файл
+    прикрепляется к УЖЕ созданной вещи: отказ создания стоит ноль строк.
+    """
+    print("\n== F-23: ошибка формы больше не оставляет эскиз-сироту ==")
+    before = _fix4_sketch_count(org4)
+    png = _fix4_png()
+    refusals = (
+        ({"kind": "draft", "op_id": "f4-r1"}, "без названия"),
+        ({"kind": "draft", "title": "", "op_id": "f4-r2"}, "с пустым названием"),
+        ({"kind": "draft", "title": "x" * 400, "op_id": "f4-r3"}, "с длинным названием"),
+    )
+    for body, what in refusals:
+        r = c.post(P2 + "/items", json=body)
+        check(f"вещь {what} не создаётся", r.status_code == 400,
+              f"{r.status_code} {r.text[:90]}")
+    check("три отказа формы оставили НОЛЬ эскизов",
+          _fix4_sketch_count(org4) == before,
+          f"было {before}, стало {_fix4_sketch_count(org4)}")
+
+    ok = c.post(P2 + "/items", json={"kind": "draft", "title": "Новинка-Ф4",
+                                     "op_id": "f4-ok"})
+    check("вещь создана и её номер назван в ответе",
+          ok.status_code == 200 and isinstance(ok.json().get("item_id"), int),
+          f"{ok.status_code} {str(ok.json().get('item_id'))[:40]}")
+    item_id = ok.json()["item_id"]
+    att = c.post(P2 + f"/items/{item_id}/sketch",
+                 files={"file": ("s.png", png, "image/png")})
+    check("эскиз прикрепился к уже созданной вещи",
+          att.status_code == 200 and att.json().get("sketch_id"),
+          f"{att.status_code} {att.text[:120]}")
+    board = att.json()
+    row = [i for i in board["items"] if i["id"] == item_id][0]
+    check("вещь на доске показывает свой эскиз", row["sketch_id"] is not None,
+          str(row["sketch_id"]))
+
+    # Повтор ТОГО ЖЕ поступка создания вещи не заводит вторую и всё равно
+    # называет её номер — иначе идемпотентность первого запроса ломала бы
+    # второй, а человек с выбранным файлом оставался бы ни с чем.
+    replay = c.post(P2 + "/items", json={"kind": "draft", "title": "Новинка-Ф4",
+                                         "op_id": "f4-ok"})
+    check("повтор поступка не заводит вторую вещь и называет прежний номер",
+          replay.status_code == 200 and replay.json().get("item_id") == item_id,
+          f"{replay.status_code} {str(replay.json().get('item_id'))}")
+
+    # Каталожная вещь эскиза не получает — то же правило, что и в остальных
+    # ручках, а не второе на новом месте.
+    cat = c.get(P2 + "/catalog").json()["options"]
+    if cat:
+        ci = c.post(P2 + "/items", json={"kind": "catalog",
+                                         "base_name": cat[0]["base_name"],
+                                         "op_id": "f4-cat"})
+        if ci.status_code == 200 and ci.json().get("item_id"):
+            bad = c.post(P2 + f"/items/{ci.json()['item_id']}/sketch",
+                         files={"file": ("s.png", png, "image/png")})
+            check("к каталожной вещи эскиз не прикрепляется",
+                  bad.status_code == 400 and "новинке" in bad.json()["detail"],
+                  f"{bad.status_code} {bad.text[:90]}")
+
+
+def _fix4_thumb(c) -> None:
+    """F-23б: миниатюра ≤128 px, и у эскиза без неё отдаётся оригинал."""
+    print("\n== F-23: миниатюра вместо полноразмерного файла под 44 px ==")
+    big = _fix4_png(300, 200, tone=0x10)
+    thumb = _fix4_png(128, 85, tone=0x10)
+    item = c.post(P2 + "/items", json={"kind": "draft", "title": "Вещь-мини",
+                                       "op_id": "f4-t-i"}).json()["item_id"]
+    r = c.post(P2 + f"/items/{item}/sketch",
+               files={"file": ("s.png", big, "image/png"),
+                      "thumb": ("t.png", thumb, "image/png")})
+    check("эскиз с миниатюрой принят", r.status_code == 200, r.text[:120])
+    sid = r.json()["sketch_id"]
+    got = c.get(P2 + f"/sketches/{sid}/thumb")
+    check("миниатюра отдаётся", got.status_code == 200, str(got.status_code))
+    w, h = _fix4_png_size(got.content)
+    check("сторона миниатюры не больше 128", max(w, h) <= 128, f"{w}×{h}")
+    check("миниатюра легче оригинала",
+          len(got.content) < len(big), f"{len(got.content)} < {len(big)}")
+    full = c.get(P2 + f"/sketches/{sid}")
+    check("оригинал по-прежнему отдаётся целиком", full.content == big,
+          f"{len(full.content)} vs {len(big)}")
+
+    # Слишком большая миниатюра — отказ, а не тихое сохранение чего попало:
+    # сервер проверяет присланное по самим байтам, а не верит слову клиента.
+    item2 = c.post(P2 + "/items", json={"kind": "draft", "title": "Вещь-мини-2",
+                                        "op_id": "f4-t-i2"}).json()["item_id"]
+    bad = c.post(P2 + f"/items/{item2}/sketch",
+                 files={"file": ("s.png", _fix4_png(300, 200, tone=0x20), "image/png"),
+                        "thumb": ("t.png", _fix4_png(200, 200, tone=0x20, noisy=False),
+                                  "image/png")})
+    check("миниатюра больше 128 точек отвергнута",
+          bad.status_code == 400 and "128" in bad.json()["detail"],
+          f"{bad.status_code} {bad.text[:120]}")
+    # Шумная картинка 200×200 весит около ста двадцати килобайт — то есть
+    # обрывается ПОТОЛКОМ БАЙТОВ на чтении потока, ещё до разбора размеров.
+    # Это отдельный рубеж, и текст у него свой: сказать «не больше 128 точек»
+    # про файл, который до размеров не дочитан, значило бы назвать не ту причину.
+    heavy_thumb = _fix4_png(200, 200, tone=0x21)
+    check("шумная миниатюра действительно тяжелее потолка",
+          len(heavy_thumb) > 64 * 1024, str(len(heavy_thumb)))
+    heavy = c.post(P2 + f"/items/{item2}/sketch",
+                   files={"file": ("s.png", _fix4_png(300, 200, tone=0x21), "image/png"),
+                          "thumb": ("t.png", heavy_thumb, "image/png")})
+    check("миниатюра тяжелее 64 КБ отвергнута отдельным текстом",
+          heavy.status_code == 400 and "64" in heavy.json()["detail"],
+          f"{heavy.status_code} {heavy.text[:120]}")
+    jpeg_thumb = c.post(P2 + f"/items/{item2}/sketch",
+                        files={"file": ("s.png", _fix4_png(300, 200, tone=0x22),
+                                        "image/png"),
+                               "thumb": ("t.jpg", make_jpeg(100, 80), "image/jpeg")})
+    check("миниатюра не в PNG отвергнута — формат решают байты, а не имя файла",
+          jpeg_thumb.status_code == 400 and "PNG" in jpeg_thumb.json()["detail"],
+          f"{jpeg_thumb.status_code} {jpeg_thumb.text[:120]}")
+    check("после трёх отвергнутых миниатюр эскиз вещи не подменён",
+          [i for i in c.get(P2).json()["items"] if i["id"] == item2][0]["sketch_id"] is None,
+          "эскиз всё-таки записан")
+
+    # Эскиз БЕЗ миниатюры (старый путь и всё, что заведено до пакета) отдаёт
+    # оригинал, а не 404: иначе живые карточки показали бы битые квадраты.
+    old = c.post(P2 + "/sketches",
+                 files={"file": ("s.png", _fix4_png(300, 200, tone=0x30), "image/png")})
+    old_id = old.json()["sketch_id"]
+    fb = c.get(P2 + f"/sketches/{old_id}/thumb")
+    check("у эскиза без миниатюры ручка отдаёт оригинал, а не 404",
+          fb.status_code == 200 and len(fb.content) > 0,
+          f"{fb.status_code} {len(fb.content)}")
+
+
+def _fix4_cache(c) -> None:
+    """F-23в: приватный кэш, ETag и 304 на повторный запрос."""
+    print("\n== F-23: эскиз не перекачивается при каждой перерисовке ==")
+    png = _fix4_png(300, 200, tone=0x40)
+    item = c.post(P2 + "/items", json={"kind": "draft", "title": "Вещь-кэш",
+                                       "op_id": "f4-c-i"}).json()["item_id"]
+    sid = c.post(P2 + f"/items/{item}/sketch",
+                 files={"file": ("s.png", png, "image/png"),
+                        "thumb": ("t.png", _fix4_png(120, 80, tone=0x40), "image/png")}
+                 ).json()["sketch_id"]
+    first = c.get(P2 + f"/sketches/{sid}")
+    etag = first.headers.get("etag")
+    cache = first.headers.get("cache-control") or ""
+    check("кэш приватный и на сутки",
+          "private" in cache and "max-age=86400" in cache and "public" not in cache,
+          cache)
+    check("ETag выдан", bool(etag), str(etag))
+    again = c.get(P2 + f"/sketches/{sid}", headers={"If-None-Match": etag})
+    check("повторный запрос с тем же ETag даёт 304 и пустое тело",
+          again.status_code == 304 and not again.content, str(again.status_code))
+    weak = c.get(P2 + f"/sketches/{sid}", headers={"If-None-Match": "W/" + etag})
+    check("слабая форма ETag тоже узнаётся", weak.status_code == 304,
+          str(weak.status_code))
+    star = c.get(P2 + f"/sketches/{sid}", headers={"If-None-Match": "*"})
+    check("звёздочка тоже узнаётся", star.status_code == 304, str(star.status_code))
+    # Значение ЛАТИНСКОЕ: заголовки HTTP ходят байтами ASCII, и кириллица в
+    # `If-None-Match` упала бы на кодировании в самом клиенте, не доехав до
+    # сервера, — красным оказался бы набор, а не продукт.
+    other = c.get(P2 + f"/sketches/{sid}", headers={"If-None-Match": '"nomatch"'})
+    check("чужой ETag 304 не даёт — приходят байты",
+          other.status_code == 200 and other.content == png, str(other.status_code))
+
+    tetag = c.get(P2 + f"/sketches/{sid}/thumb").headers.get("etag")
+    check("у миниатюры ETag СВОЙ, а не общий с оригиналом", tetag != etag,
+          f"{tetag} vs {etag}")
+    crossed = c.get(P2 + f"/sketches/{sid}/thumb", headers={"If-None-Match": etag})
+    check("ETag оригинала не выдаёт миниатюру за неизменную",
+          crossed.status_code == 200, str(crossed.status_code))
+
+
+def _fix4_dedup(c, org4: int) -> None:
+    """F-23д: те же байты в одной организации — одна строка."""
+    print("\n== F-23: одна и та же картинка не ложится в базу дважды ==")
+    png = _fix4_png(300, 200, tone=0x50)
+    before = _fix4_sketch_count(org4)
+    one = c.post(P2 + "/sketches", files={"file": ("a.png", png, "image/png")})
+    two = c.post(P2 + "/sketches", files={"file": ("b.png", png, "image/png")})
+    check("повтор тех же байтов вернул ТОТ ЖЕ номер",
+          one.json()["sketch_id"] == two.json()["sketch_id"],
+          f"{one.json()['sketch_id']} vs {two.json()['sketch_id']}")
+    check("и строк прибавилось ровно на одну",
+          _fix4_sketch_count(org4) == before + 1,
+          f"было {before}, стало {_fix4_sketch_count(org4)}")
+    other = c.post(P2 + "/sketches",
+                   files={"file": ("c.png", _fix4_png(300, 200, tone=0x60),
+                                   "image/png")})
+    check("другая картинка того же размера — своя строка",
+          other.json()["sketch_id"] != one.json()["sketch_id"],
+          f"{other.json()['sketch_id']}")
+
+
+def _fix4_cleanup(c, org4: int) -> None:
+    """F-23г: сироты старше суток убираются, привязанное — никогда."""
+    print("\n== F-23: уборка сирот не трогает то, на что ссылается вещь ==")
+    orphan = c.post(P2 + "/sketches",
+                    files={"file": ("o.png", _fix4_png(300, 200, tone=0x70),
+                                    "image/png")}).json()["sketch_id"]
+    item = c.post(P2 + "/items", json={"kind": "draft", "title": "Вещь-архивная",
+                                       "op_id": "f4-cl-i"}).json()["item_id"]
+    kept = c.post(P2 + f"/items/{item}/sketch",
+                  files={"file": ("k.png", _fix4_png(300, 200, tone=0x71),
+                                  "image/png")}).json()["sketch_id"]
+    # Вещь УБИРАЕТСЯ С ДОСКИ: архивная — не удалённая, её возвращают одной
+    # кнопкой, и вернуться она обязана с картинкой. Это главный случай пункта.
+    rev = [i for i in c.get(P2).json()["items"] if i["id"] == item]
+    arch = c.post(P2 + f"/items/{item}/archive",
+                  json={"rev": rev[0]["rev"] if rev else 1, "op_id": "f4-cl-a"})
+    check("вещь убрана с доски", arch.status_code == 200, arch.text[:100])
+
+    # Обоим эскизам проставляется возраст «вчера» — прямо в базе, потому что
+    # ждать сутки в наборе нечем.
+    con = sqlite3.connect(DB_PATH)
+    try:
+        con.execute("UPDATE supply_sketches SET created_at = datetime('now', '-2 day')"
+                    " WHERE id IN (?, ?)", (orphan, kept))
+        con.commit()
+    finally:
+        con.close()
+
+    c.post(P2 + "/sketches",
+           files={"file": ("trigger.png", _fix4_png(300, 200, tone=0x72),
+                           "image/png")})
+    gone = c.get(P2 + f"/sketches/{orphan}")
+    check("сирота старше суток убран", gone.status_code == 404,
+          str(gone.status_code))
+    alive = c.get(P2 + f"/sketches/{kept}")
+    check("эскиз АРХИВНОЙ вещи не тронут — её возвращают с картинкой",
+          alive.status_code == 200, str(alive.status_code))
+
+    fresh = c.post(P2 + "/sketches",
+                   files={"file": ("f.png", _fix4_png(300, 200, tone=0x73),
+                                   "image/png")}).json()["sketch_id"]
+    c.post(P2 + "/sketches",
+           files={"file": ("t2.png", _fix4_png(300, 200, tone=0x74), "image/png")})
+    still = c.get(P2 + f"/sketches/{fresh}")
+    check("свежая сирота не убирается: сутки ещё не прошли",
+          still.status_code == 200, str(still.status_code))
+
+
+def _fix4_foreign_sketch(c) -> None:
+    """F-23: чужая миниатюра — 404, тем же текстом, что и несуществующая."""
+    print("\n== F-23: чужая миниатюра не отдаётся ==")
+    mine = c.post(P2 + "/sketches",
+                  files={"file": ("m.png", _fix4_png(300, 200, tone=0x80),
+                                  "image/png")}).json()["sketch_id"]
+    stranger = client()
+    register(stranger, "sp-fix4-alien@test.io", "Чужой Бренд Четыре")
+    try:
+        t = stranger.get(P2 + f"/sketches/{mine}/thumb")
+        check("чужая миниатюра даёт 404", t.status_code == 404,
+              f"{t.status_code} {t.text[:80]}")
+        f = stranger.get(P2 + f"/sketches/{mine}")
+        check("и чужой оригинал тоже", f.status_code == 404, str(f.status_code))
+        # 304 на чужое рассказало бы о существовании строки перебором номеров:
+        # проверка арендатора обязана стоять ДО сверки ETag.
+        etag = c.get(P2 + f"/sketches/{mine}").headers.get("etag")
+        cached = stranger.get(P2 + f"/sketches/{mine}",
+                              headers={"If-None-Match": etag})
+        check("чужой ETag не превращает 404 в 304",
+              cached.status_code == 404, str(cached.status_code))
+        missing = stranger.get(P2 + "/sketches/999999/thumb")
+        check("несуществующая миниатюра отвечает тем же, что и чужая",
+              missing.status_code == 404
+              and missing.json()["detail"] == t.json()["detail"],
+              f"{missing.status_code} {missing.text[:80]}")
+    finally:
+        stranger.close()
+
+
+def _fix4_journal_fields(c, org4: int) -> None:
+    """F-24: журналируются ВСЕ изменяемые поля, включая источник срока."""
+    print("\n== F-24: молча меняющихся полей больше нет ==")
+    mat = c.post(P2 + "/materials",
+                 json={"title": "Ткань-журнал", "qty": "50", "unit": "м",
+                       "source_note": "счёт 1", "op_id": "f4-j-m"}).json()
+    mid = [m for m in mat["materials"] if m["title"] == "Ткань-журнал"][0]["id"]
+    mrev = [m for m in mat["materials"] if m["id"] == mid][0]["rev"]
+    r = c.post(P2 + f"/materials/{mid}/update",
+               json={"source_note": "счёт 2", "rev": mrev, "op_id": "f4-j-m2"})
+    check("правка источника материала принята", r.status_code == 200, r.text[:100])
+    rows = _fix2_journal(org4, "material", mid)
+    check("источник материала записан вместе с прежним значением",
+          rows.get("source_note") == "счёт 1→счёт 2", str(rows.get("source_note")))
+
+    item = c.post(P2 + "/items", json={"kind": "draft", "title": "Вещь-журнал",
+                                       "op_id": "f4-j-i"}).json()["item_id"]
+    b = c.post(P2 + "/batches",
+               json={"item_id": item, "title": "Партия-журнал", "plan_qty": "5",
+                     "plan_note": "заметка 1", "due_kind": "exact",
+                     "due_date": "2026-11-14", "due_source": "цех",
+                     "op_id": "f4-j-b"}).json()
+    bid = [x for x in b["batches"] if x["title"] == "Партия-журнал"][0]["id"]
+    brev = [x for x in b["batches"] if x["id"] == bid][0]["rev"]
+    r = c.post(P2 + f"/batches/{bid}/update",
+               json={"plan_note": "заметка 2", "rev": brev, "op_id": "f4-j-b2"})
+    check("правка заметки к плану принята", r.status_code == 200, r.text[:100])
+    brev = [x for x in r.json()["batches"] if x["id"] == bid][0]["rev"]
+    rows = _fix2_journal(org4, "batch", bid)
+    check("заметка к плану записана вместе с прежней",
+          rows.get("plan_note") == "заметка 1→заметка 2", str(rows.get("plan_note")))
+
+    # ГЛАВНЫЙ СЛУЧАЙ ПУНКТА: меняется ТОЛЬКО источник срока. Сам срок при этом
+    # не меняется ни на день, `describe_due` даёт одно и то же — и до этого
+    # пакета запись не появлялась нигде.
+    r = c.post(P2 + f"/batches/{bid}/update",
+               json={"due_source": "поставщик", "rev": brev, "op_id": "f4-j-b3"})
+    check("правка одного источника срока принята", r.status_code == 200,
+          r.text[:100])
+    row = [x for x in r.json()["batches"] if x["id"] == bid][0]
+    check("сам срок при этом не тронут",
+          row["due_kind"] == "exact" and row["due_date"] == "2026-11-14",
+          f"{row['due_kind']} {row['due_date']}")
+    check("источник срока на доске новый", row["due_source"] == "поставщик",
+          row["due_source"])
+    rows = _fix2_journal(org4, "batch", bid)
+    check("источник срока записан в журнал отдельным полем",
+          rows.get("due_source") == "цех→поставщик", str(rows.get("due_source")))
+    check("автор правки срока обновился вместе с источником",
+          bool(row.get("due_author")), str(row.get("due_author")))
+
+    # И тот же поступок повторно: `op_id` записан, значит повтор идемпотентен,
+    # а не отвечает конфликтом редакции.
+    again = c.post(P2 + f"/batches/{bid}/update",
+                   json={"due_source": "поставщик-2", "rev": row["rev"],
+                         "op_id": "f4-j-b3"})
+    check("повтор ТОГО ЖЕ поступка отвечает успехом, а не конфликтом",
+          again.status_code == 200, f"{again.status_code} {again.text[:90]}")
+    now = [x for x in again.json()["batches"] if x["id"] == bid][0]
+    check("и второй раз ничего не записал",
+          now["due_source"] == "поставщик", now["due_source"])
+
+    # Заметка назначения — четвёртое поле, менявшееся молча.
+    a = c.post(P2 + "/assignments",
+               json={"material_id": mid, "batch_id": bid, "qty": "10",
+                     "note": "заметка А", "op_id": "f4-j-a"}).json()
+    aid = [x for x in a["batches"] if x["id"] == bid][0]["assignments"][0]["id"]
+    arev = [x for x in a["batches"] if x["id"] == bid][0]["assignments"][0]["rev"]
+    c.post(P2 + f"/assignments/{aid}/update",
+           json={"note": "заметка Б", "rev": arev, "op_id": "f4-j-a2"})
+    rows = _fix2_journal(org4, "assignment", aid)
+    check("заметка назначения записана вместе с прежней",
+          rows.get("note") == "заметка А→заметка Б", str(rows.get("note")))
+
+
+def _fix4_move_note(c, org4: int) -> None:
+    """F-24: перенос уносит заметку вместе с метражом."""
+    print("\n== F-24: перенос больше не теряет заметку ==")
+    mat = c.post(P2 + "/materials",
+                 json={"title": "Ткань-перенос-4", "qty": "100", "unit": "м",
+                       "op_id": "f4-mv-m"}).json()
+    mid = [m for m in mat["materials"] if m["title"] == "Ткань-перенос-4"][0]["id"]
+    item = c.post(P2 + "/items", json={"kind": "draft", "title": "Вещь-перенос-4",
+                                       "op_id": "f4-mv-i"}).json()["item_id"]
+    b1 = c.post(P2 + "/batches", json={"item_id": item, "title": "Откуда-4",
+                                       "op_id": "f4-mv-b1"}).json()
+    b2 = c.post(P2 + "/batches", json={"item_id": item, "title": "Куда-4",
+                                       "op_id": "f4-mv-b2"}).json()
+    src_b = [x for x in b2["batches"] if x["title"] == "Откуда-4"][0]["id"]
+    dst_b = [x for x in b2["batches"] if x["title"] == "Куда-4"][0]["id"]
+    a = c.post(P2 + "/assignments",
+               json={"material_id": mid, "batch_id": src_b, "qty": "50",
+                     "note": "остаток рулона", "op_id": "f4-mv-a"}).json()
+    aid = [x for x in a["batches"] if x["id"] == src_b][0]["assignments"][0]["id"]
+    arev = [x for x in a["batches"] if x["id"] == src_b][0]["assignments"][0]["rev"]
+    r = c.post(P2 + "/assignments/move",
+               json={"assignment_id": aid, "to_batch_id": dst_b, "qty": "20",
+                     "rev": arev, "op_id": "f4-mv-1"})
+    check("перенос выполнен", r.status_code == 200, r.text[:120])
+    dst = [x for x in r.json()["batches"] if x["id"] == dst_b][0]["assignments"]
+    check("на приёмнике оказалась та же заметка, а не пустое поле",
+          dst and dst[0]["note"] == "остаток рулона",
+          str(dst[0]["note"]) if dst else "назначения нет")
+    total = sum(x["qty"] for bx in r.json()["batches"]
+                for x in bx["assignments"] if x["material_id"] == mid)
+    check("сумма назначенного не изменилась переносом", total == 50.0, str(total))
+
+
+def _fix4_events_api(c) -> None:
+    """F-24: историю читают владелец и участник, чужую — никто."""
+    print("\n== F-24: журнал стал читаемым ==")
+    mat = c.post(P2 + "/materials",
+                 json={"title": "Ткань-история", "qty": "10", "unit": "м",
+                       "op_id": "f4-e-m"}).json()
+    mid = [m for m in mat["materials"] if m["title"] == "Ткань-история"][0]["id"]
+    rev = [m for m in mat["materials"] if m["id"] == mid][0]["rev"]
+    c.post(P2 + f"/materials/{mid}/update",
+           json={"title": "Ткань-история-2", "rev": rev, "op_id": "f4-e-m2"})
+    r = c.get(P2 + "/events", params={"entity": "material", "id": mid})
+    check("история своей строки читается", r.status_code == 200, r.text[:120])
+    ev = r.json()["events"]
+    check("последняя правка — первой в списке",
+          ev and ev[0]["field"] == "title"
+          and ev[0]["old"] == "Ткань-история" and ev[0]["new"] == "Ткань-история-2",
+          str(ev[:1]))
+    check("у записи есть автор, время и русское время словами",
+          ev and ev[0]["author"] and ev[0]["at"] and ev[0]["at_label"],
+          str(ev[0]) if ev else "пусто")
+    check("поле названо по-русски", ev and ev[0]["field_label"] == "название",
+          str(ev[0].get("field_label")) if ev else "пусто")
+
+    many = c.get(P2 + "/events", params={"entity": "material", "id": mid,
+                                         "limit": 500})
+    check("больше пятидесяти записей ручка не отдаёт",
+          many.status_code == 200 and len(many.json()["events"]) <= 50
+          and many.json()["limit"] == 50, str(many.json().get("limit")))
+
+    bad = c.get(P2 + "/events", params={"entity": "выдумка", "id": mid})
+    check("неизвестный вид записи отвергается", bad.status_code == 400,
+          f"{bad.status_code} {bad.text[:80]}")
+
+    stranger = client()
+    register(stranger, "sp-fix4-hist@test.io", "Чужой Бренд Истории")
+    try:
+        f = stranger.get(P2 + "/events", params={"entity": "material", "id": mid})
+        check("чужая история даёт 404", f.status_code == 404,
+              f"{f.status_code} {f.text[:80]}")
+        gone = stranger.get(P2 + "/events",
+                            params={"entity": "material", "id": 999999})
+        check("несуществующая отвечает тем же, что и чужая",
+              gone.status_code == 404
+              and gone.json()["detail"] == f.json()["detail"],
+              f"{gone.status_code} {gone.text[:80]}")
+    finally:
+        stranger.close()
+
+
+def _fix4_noop(c) -> None:
+    """F-24: те же значения при верной редакции — 200 и редакция на месте."""
+    print("\n== F-24: правка, которая ничего не меняет, не двигает редакцию ==")
+    mat = c.post(P2 + "/materials",
+                 json={"title": "Ткань-ноль", "qty": "7", "unit": "м",
+                       "source_note": "как есть", "op_id": "f4-n-m"}).json()
+    mid = [m for m in mat["materials"] if m["title"] == "Ткань-ноль"][0]["id"]
+    rev = [m for m in mat["materials"] if m["id"] == mid][0]["rev"]
+    same = {"title": "Ткань-ноль", "qty": "7", "unit": "м",
+            "source_note": "как есть", "rev": rev, "op_id": "f4-n-m2"}
+    r = c.post(P2 + f"/materials/{mid}/update", json=same)
+    check("отправка тех же значений отвечает 200", r.status_code == 200,
+          f"{r.status_code} {r.text[:90]}")
+    after = [m for m in r.json()["materials"] if m["id"] == mid][0]
+    check("редакция не сдвинулась", after["rev"] == rev, f"{rev} → {after['rev']}")
+    check("и значения на месте",
+          after["title"] == "Ткань-ноль" and after["qty"] == 7.0,
+          f"{after['title']} {after['qty']}")
+
+    # Защита от чужой правки при этом НЕ ослаблена: устаревшая редакция всё так
+    # же отвергается 409. Это здесь не для полноты — без этой строки правка
+    # «не двигаем редакцию» выглядела бы как ослабление блокировки.
+    c.post(P2 + f"/materials/{mid}/update",
+           json={"qty": "9", "rev": rev, "op_id": "f4-n-m3"})
+    stale = c.post(P2 + f"/materials/{mid}/update",
+                   json={"qty": "11", "rev": rev, "op_id": "f4-n-m4"})
+    check("устаревшая редакция по-прежнему отвергается 409",
+          stale.status_code == 409, f"{stale.status_code} {stale.text[:90]}")
+
+    # То же правило у партии и у назначения — иначе оно жило бы у одной строки
+    # из трёх.
+    item = c.post(P2 + "/items", json={"kind": "draft", "title": "Вещь-ноль",
+                                       "op_id": "f4-n-i"}).json()["item_id"]
+    b = c.post(P2 + "/batches",
+               json={"item_id": item, "title": "Партия-ноль", "plan_qty": "3",
+                     "op_id": "f4-n-b"}).json()
+    bid = [x for x in b["batches"] if x["title"] == "Партия-ноль"][0]["id"]
+    brev = [x for x in b["batches"] if x["id"] == bid][0]["rev"]
+    rb = c.post(P2 + f"/batches/{bid}/update",
+                json={"title": "Партия-ноль", "plan_qty": "3", "rev": brev,
+                      "op_id": "f4-n-b2"})
+    nb = [x for x in rb.json()["batches"] if x["id"] == bid][0]
+    check("редакция партии не сдвинулась от повторения тех же значений",
+          rb.status_code == 200 and nb["rev"] == brev,
+          f"{rb.status_code}: {brev} → {nb['rev']}")
+
+    ri = c.post(P2 + f"/items/{item}/update",
+                json={"title": "Вещь-ноль", "rev": 1, "op_id": "f4-n-i2"})
+    ni = [x for x in ri.json()["items"] if x["id"] == item][0]
+    check("редакция вещи тоже не сдвинулась",
+          ri.status_code == 200 and ni["rev"] == 1,
+          f"{ri.status_code}: 1 → {ni['rev']}")
+
+
+def _fix4_transport(c) -> None:
+    """F-25: сжатие ответа и потолок тела JSON."""
+    print("\n== F-25: транспорт ==")
+    plain = c.get(P2, headers={"Accept-Encoding": "identity"})
+    check("без gzip доска отдаётся как раньше", plain.status_code == 200,
+          str(plain.status_code))
+    # httpx распаковывает сам, поэтому смотрим ЗАГОЛОВОК, а не длину тела:
+    # длина после распаковки одинакова в обоих случаях и ничего бы не доказала.
+    zipped = client()
+    zipped.cookies.update(c.cookies)
+    try:
+        r = zipped.get(P2, headers={"Accept-Encoding": "gzip"})
+        check("ответ доски сжат, когда клиент об этом просит",
+              r.status_code == 200
+              and (r.headers.get("content-encoding") or "").lower() == "gzip",
+              str(dict(r.headers))[:160])
+        check("и распаковывается в тот же самый ответ",
+              r.json()["materials"] == plain.json()["materials"],
+              "содержимое разошлось")
+    finally:
+        zipped.close()
+
+    # Тело в два мегабайта на пишущей ручке слоя: 413 ДО разбора, а не 500 и не
+    # молчаливое чтение всего в память.
+    big = {"title": "Ткань", "op_id": "f4-big", "source_note": "x" * (2 * 1024 * 1024)}
+    heavy = client()
+    heavy.cookies.update(c.cookies)
+    try:
+        r = heavy.post(P2 + "/materials", json=big)
+        check("тело 2 МБ отвергнуто 413", r.status_code == 413,
+              f"{r.status_code} {r.text[:90]}")
+    finally:
+        heavy.close()
+
+    # А законный эскиз в два мегабайта по-прежнему проходит: общий потолок тела
+    # обрезал бы основной путь записи, и это ровно та цена, которую пакет
+    # платить не должен.
+    payload = _fix4_png(700, 700, tone=0x90)
+    check("тестовый файл действительно велик", len(payload) > 1024 * 1024,
+          str(len(payload)))
+    big_up = c.post(P2 + "/sketches",
+                    files={"file": ("big.png", payload, "image/png")})
+    check("загрузка эскиза больше мегабайта не отвергается потолком JSON",
+          big_up.status_code == 200, f"{big_up.status_code} {big_up.text[:90]}")
 
 
 def run_preview_tool(argv: list) -> int:
