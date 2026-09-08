@@ -1762,6 +1762,33 @@ def update_batch(db: Session, org_id: int, batch_id: int, payload: dict,
     return row
 
 
+def batch_label(title: str, item_title: str, batch_id: int) -> str:
+    """Как партия называется на экране и в выгрузке. Одно определение на всех.
+
+    ПОЧЕМУ ЭТО ФУНКЦИЯ, А НЕ `title or item_title` НА МЕСТЕ. Прежнее правило
+    подставляло вместо пустого названия имя вещи — и партия начинала называться
+    так же, как сама вещь. У вещи с двумя партиями получались две строки с одним
+    и тем же текстом: «Тренч «Классика»» и «Тренч «Классика»». Человек видел два
+    одинаковых заголовка и не мог сказать, какой из них какой; хуже того, строка
+    вещи БЕЗ партий подписана ровно этим же именем — то есть три разных объекта
+    на одном экране носили одно имя.
+
+    Номер здесь — не украшение и не «id наружу»: это единственное, чем безымянные
+    партии одной вещи отличаются друг от друга, и человек его уже видит в адресе
+    истории и в тостах. Названная партия своё имя сохраняет целиком — правило
+    работает только там, где называть нечем.
+
+    Живёт в слое, а не в шаблоне, потому что потребителей два — экран и выгрузка
+    xlsx (ТЗ F-28, F-29), — и разъехавшиеся подписи одной и той же строки в
+    файле и на экране были бы расхождением интерфейса и данных.
+    """
+    title = (title or "").strip()
+    if title:
+        return title
+    item = (item_title or "").strip()
+    return f"{item} · партия №{batch_id}" if item else f"Партия №{batch_id}"
+
+
 def describe_due(row: SupplyBatch) -> str:
     """Срок словами — ровно тем видом, каким он задан. Без «сегодня».
 
@@ -2071,7 +2098,11 @@ def material_links(db: Session, org_id: int, material_id: int) -> list[dict]:
                SupplyAssignment.archived_at.is_(None))
         .order_by(SupplyAssignment.id.asc())
     ).all()
-    return [{"batch_id": bid, "batch_title": (btitle or ititle),
+    # Подпись партии — та же, что на её карточке и в выгрузке (F-29). Прежде
+    # здесь стояло `btitle or ititle`, и безымянная партия называлась именем
+    # своей вещи: строка «120 м → Пальто» вела на карточку «Пальто · партия
+    # №5», то есть один объект носил на одном экране два имени.
+    return [{"batch_id": bid, "batch_title": batch_label(btitle, ititle, bid),
              "item_title": ititle, "qty": qty}
             for bid, btitle, ititle, qty in rows]
 
@@ -2175,7 +2206,11 @@ def board(db: Session, org_id: int, role: str) -> dict:
         item_title = item.title if item is not None else ""
         links.setdefault(a.material_id, []).append({
             "batch_id": a.batch_id,
-            "batch_title": ((b.title if b is not None else "") or item_title),
+            # Та же подпись, что на карточке партии и в выгрузке (F-29).
+            # Собирается тем же `batch_label`, что и `material_links`: две
+            # копии одного правила разошлись бы в первый же день.
+            "batch_title": batch_label((b.title if b is not None else ""),
+                                       item_title, a.batch_id),
             "item_title": item_title,
             "qty": a.qty,
         })
@@ -2191,6 +2226,10 @@ def board(db: Session, org_id: int, role: str) -> dict:
         batch_views.append({
             "id": b.id,
             "title": b.title,
+            # Подпись строки на экране и в выгрузке — из одного места (F-29).
+            # Собственное название партии здесь не подменяется: `label`
+            # отличается от `title` ровно тогда, когда называть нечем.
+            "label": batch_label(b.title, item.title if item else "", b.id),
             "item_id": b.item_id,
             "item_title": item.title if item else "",
             "item_kind": item.kind if item else "",

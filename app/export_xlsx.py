@@ -651,3 +651,138 @@ def budget_workbook(org_name: str, data: dict) -> Workbook:
     )
     _autofit(ws)
     return wb
+
+
+# ── «План производства» (раздел «Поставки») ───────────────────────────────────
+#
+# ЧТО ЭТА ВЫГРУЗКА ЕСТЬ И ЧЕМ ОНА НЕ ЯВЛЯЕТСЯ. Файл повторяет план, который
+# человек ведёт руками: материалы, плановые партии и назначенный на них метраж.
+# Заказом он не становится ни в каком месте — ни здесь, ни в разделе: партия не
+# создаёт `ProductionOrder`, не двигает «Едет» и не входит в бюджет. Подпись под
+# каждым листом говорит это прямым текстом, потому что файл уезжает в почту и
+# читается без экрана рядом.
+#
+# НИ ОДНО ЧИСЛО ЗДЕСЬ НЕ СЧИТАЕТСЯ ЗАНОВО. Всё приходит готовым из
+# `supply_planning.board()` — той же доски, что рисует экран. Второй расчёт
+# означал бы вторую версию правды, и расходиться они начали бы в первый же день.
+#
+# НЕИЗВЕСТНОЕ ОСТАЁТСЯ НЕИЗВЕСТНЫМ (D-49). Пустое количество материала, план
+# партии, которого никто не называл, и остаток неизвестного материала пишутся
+# СЛОВОМ, а не нулём: ноль в ячейке Excel складывается, сортируется и выглядит
+# как факт — а факта нет.
+
+#: Как выглядит незаполненное в файле. Слово, а не пустая ячейка: пустая
+#: читается как «забыли выгрузить», а здесь это осознанное состояние данных.
+_SUPPLY_UNKNOWN = "не указано"
+
+#: Тот же дисклеймер, что на вкладке (F-20), — один текст на экран и на файл.
+_SUPPLY_DISCLAIMER = "Это план: заказы, «Едет» и бюджет он не меняет."
+
+_SUPPLY_DUE_KIND_RU = {
+    "exact": "точная дата",
+    "approx": "ориентировочно",
+    "text": "своими словами",
+    "unknown": "неизвестен",
+}
+
+
+def _supply_qty(value, known: bool = True):
+    """Количество для ячейки: число как число, незнание — словом.
+
+    `known=False` — это не «ноль» и не «пусто»: человек сознательно не назвал
+    величину, и подставлять за него ноль здесь так же нельзя, как на экране.
+    """
+    if not known or value is None:
+        return _SUPPLY_UNKNOWN
+    return round(float(value), 3)
+
+
+def _supply_due(b: dict) -> str:
+    """Срок партии одной строкой — ровно тем видом, каким он задан."""
+    label = b.get("due_label") or ""
+    if b.get("due_past"):
+        return f"{label} (уже прошла)"
+    return label
+
+
+def supply_workbook(org_name: str, data: dict) -> Workbook:
+    """Три листа плана производства: «Материалы», «Партии», «Назначения».
+
+    `data` — готовый ответ `supply_planning.board()`. Разбит на три листа, а не
+    сведён в один: у материала и у партии разные ключи и разные единицы, и
+    склеенная таблица заставляла бы читать половину строк как пустые.
+    """
+    wb = Workbook()
+
+    # ── Лист 1: материалы ────────────────────────────────────────────────────
+    mat_headers = ["Материал", "Всего", "Назначено", "Свободно", "Единица", "Заметка"]
+    ws = _new_sheet(wb, "Материалы", org_name, len(mat_headers),
+                    subtitle=_SUPPLY_DISCLAIMER)
+    _write_header(ws, mat_headers)
+    row = 3
+    for m in data.get("materials") or []:
+        _write_row(ws, row, [
+            m.get("title") or "",
+            _supply_qty(m.get("qty"), bool(m.get("qty_known"))),
+            _supply_qty(m.get("assigned")),
+            _supply_qty(m.get("free"), bool(m.get("free_known"))),
+            m.get("unit") or "",
+            m.get("source_note") or "",
+        ], {2: FMT_NUM2, 3: FMT_NUM2, 4: FMT_NUM2})
+        row += 1
+    if row == 3:
+        _cell(ws, row, 1, "Материалов в плане пока нет", font=_TITLE_FONT)
+    _autofit(ws)
+
+    # ── Лист 2: плановые партии ──────────────────────────────────────────────
+    batch_headers = ["Партия", "Вещь", "План, шт", "Срок", "Вид срока",
+                     "Кто назвал срок", "Назначенные материалы"]
+    ws = _new_sheet(wb, "Партии", org_name, len(batch_headers),
+                    subtitle=_SUPPLY_DISCLAIMER, first=False)
+    _write_header(ws, batch_headers)
+    row = 3
+    for b in data.get("batches") or []:
+        # Материалы партии перечисляются В ЕДИНИЦАХ КАЖДОГО и не складываются:
+        # метры ткани и килограммы фурнитуры одной суммы не имеют, и «52» для
+        # такой пары было бы придуманным числом (та же причина, что в сводке).
+        materials = " · ".join(
+            f"{a.get('material_title') or ''} — "
+            f"{_supply_qty(a.get('qty'))} {a.get('unit') or ''}".strip()
+            + (" (наличие не подтверждено)" if a.get("relies_on_unknown") else "")
+            for a in (b.get("assignments") or [])
+        )
+        _write_row(ws, row, [
+            b.get("label") or b.get("title") or "",
+            b.get("item_title") or "",
+            _supply_qty(b.get("plan_qty"), bool(b.get("plan_known"))),
+            _supply_due(b),
+            _SUPPLY_DUE_KIND_RU.get(b.get("due_kind") or "", b.get("due_kind") or ""),
+            b.get("due_source") or "",
+            materials,
+        ], {3: FMT_NUM2})
+        row += 1
+    if row == 3:
+        _cell(ws, row, 1, "Плановых партий пока нет", font=_TITLE_FONT)
+    _autofit(ws)
+
+    # ── Лист 3: назначения ───────────────────────────────────────────────────
+    asg_headers = ["Материал", "Количество", "Единица", "Партия", "Вещь", "Заметка"]
+    ws = _new_sheet(wb, "Назначения", org_name, len(asg_headers),
+                    subtitle=_SUPPLY_DISCLAIMER, first=False)
+    _write_header(ws, asg_headers)
+    row = 3
+    for b in data.get("batches") or []:
+        for a in b.get("assignments") or []:
+            _write_row(ws, row, [
+                a.get("material_title") or "",
+                _supply_qty(a.get("qty")),
+                a.get("unit") or "",
+                b.get("label") or b.get("title") or "",
+                b.get("item_title") or "",
+                a.get("note") or "",
+            ], {2: FMT_NUM2})
+            row += 1
+    if row == 3:
+        _cell(ws, row, 1, "Назначений пока нет", font=_TITLE_FONT)
+    _autofit(ws)
+    return wb

@@ -45,6 +45,7 @@ from fastapi.responses import Response
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app import export_xlsx
 from app import supply_planning as sp
 from app.auth import AuthContext, require_auth_api, require_owner_api
 from app.db import get_db
@@ -800,3 +801,32 @@ def api_planning_sketch_thumb(
     ext = "png" if row.mime == "image/png" else "jpg"
     return _sketch_response(row.data, row.mime, f"sketch-{row.id}.{ext}",
                             f'"{row.sha256}"', request)
+
+
+@router.get("/export.xlsx")
+def api_planning_export_xlsx(
+    ctx: AuthContext = Depends(require_auth_api),
+    db: Session = Depends(get_db),
+):
+    """План производства в Excel: «Материалы», «Партии», «Назначения» (ТЗ F-28).
+
+    ЧИТАЮТ ВЛАДЕЛЕЦ И УЧАСТНИК — та же зависимость, что у доски и у истории.
+    Это выгрузка того, что человек и так видит на экране; закрывать её строже,
+    чем сам экран, значило бы прятать от участника его же данные. Гейт подписки
+    на чтение не срабатывает по общему правилу (`subscription.SAFE_METHODS`), и
+    здесь для этого не сделано ни одного исключения — метод просто GET.
+
+    АРЕНДАТОР БЕРЁТСЯ ИЗ СЕССИИ И БОЛЬШЕ НИОТКУДА. У ручки нет ни одного
+    параметра — ни `org_id`, ни идентификатора строки, — поэтому «чужую»
+    выгрузку невозможно даже попросить: файл собирается из `board()` своей
+    организации. Это сильнее, чем 404 на чужой идентификатор: нет параметра —
+    нет и перебора.
+
+    Данные НЕ пересчитываются: `board()` — та же доска, что рисует экран. Весь
+    пользовательский текст (названия материалов, вещей, партий, заметки) уходит
+    в ячейку через `_cell`, где стоит защита от формульной инъекции.
+    """
+    data = sp.board(db, ctx.org.id, ctx.role)
+    wb = export_xlsx.supply_workbook(ctx.org.name, data)
+    return export_xlsx.xlsx_response(wb, "План производства.xlsx",
+                                     "supply-plan.xlsx")

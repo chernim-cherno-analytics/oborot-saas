@@ -454,6 +454,33 @@ def seed_catalog(count: int) -> None:
         con.close()
 
 
+#: Таблицы плана в порядке удаления: от ссылающихся к тем, на кого ссылаются.
+_PLAN_TABLES = ("supply_events", "supply_assignments", "supply_batches",
+                "supply_items", "supply_materials", "supply_sketches")
+
+
+def drop_demo_plan(org_name: str) -> None:
+    """Снимает синтетический план «Поставок», пришедший с демо-сидом (ТЗ F-26).
+
+    ФИКСТУРА, А НЕ ПРОВЕРКА. Демо нужно этому набору каталогом и историей
+    продаж; план, который с пакета 5 приходит вместе с ними, здесь только
+    мешает — почти каждый сценарий ниже считает СВОИ карточки и свои строки
+    сводки. Состав самого демо проверяется там, где он и живёт
+    (`tests/test_supply_planning.py`, `supply_fix_5_checks`), а фикстура о нём
+    ничего не утверждает — иначе она доказывала бы саму себя.
+    """
+    con = sqlite3.connect(DB_PATH)
+    try:
+        row = con.execute("SELECT id FROM orgs WHERE name = ?", (org_name,)).fetchone()
+        if row is None:
+            return
+        for table in _PLAN_TABLES:
+            con.execute(f"DELETE FROM {table} WHERE org_id = ?", (row[0],))
+        con.commit()
+    finally:
+        con.close()
+
+
 def add_member(email: str) -> None:
     """Участник организации: приглашений в UI нет, заводим строкой в БД."""
     import bcrypt
@@ -539,6 +566,12 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
     # не предпросмотр, а собственную неудачу на несуществующей кнопке.
     set_preview_flag(True)
     check("демо-данные загружены", c.post("/api/connect/demo").status_code == 200)
+    # Демо нужно набору каталогом и историей; его синтетический план «Поставок»
+    # (ТЗ F-26) снимается фикстурой — сценарии ниже считают свои карточки.
+    drop_demo_plan("Бренд-UI")
+    check("фикстура сняла демо-план целиком",
+          not c.get("/api/supply/planning").json()["materials"],
+          str(c.get("/api/supply/planning").json()["summary"]))
 
     with sync_playwright() as pw:
         try:
@@ -2459,6 +2492,9 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
 
         # ── 26. SUPPLY-FIX-4: порядок отправки эскиза, кэш картинки, история ─
         supply_fix_4_ui(pw, base, c)
+
+        # ── 27. SUPPLY-FIX-5: урок раздела, выгрузка, масштаб и адрес ───────
+        supply_fix_5_ui(pw, base)
 
     c.close()
     print(f"\nИТОГО: {len(PASS)} OK, {len(FAIL)} FAIL")
@@ -5911,6 +5947,375 @@ def _fix2_mobile(browser, base, c) -> None:
     check("и ни одна из них не перекрыта фиксированным элементом",
           found and not covered["covered"], str(covered)[:220])
     ctx.close()
+
+
+# ── SUPPLY-FIX-5 (F-27, F-28, F-29) в настоящем браузере ────────────────────
+#
+# СВОЯ ОРГАНИЗАЦИЯ НА ВЕСЬ БЛОК. Порог F-29 — «строк больше десяти», и
+# проверять его на организации, у которой строки накопили предыдущие двадцать
+# шесть шагов, нельзя: «полосы поиска нет» стало бы утверждением про чужую
+# историю, а не про порог. Здесь список растёт с нуля и на глазах.
+
+def _fix5_ui_client(base):
+    c5 = httpx.Client(headers={"X-Oborot-CSRF": "1"}, base_url=base, timeout=120.0)
+    r = c5.post("/register", data={"name": "Владелец Пять",
+                                   "email": "supply-ui5@test.io",
+                                   "password": "secret123",
+                                   "org_name": "Бренд-UI-Пять"})
+    check("организация пакета 5 зарегистрирована", r.status_code in (200, 302, 303),
+          str(r.status_code))
+    return c5
+
+
+def _fix5_ui_preview_flag(org_name: str) -> None:
+    """Флаг предпросмотра ИМЕННО этой организации (общий помощник берёт первую)."""
+    con = sqlite3.connect(DB_PATH)
+    try:
+        row = con.execute("SELECT id, settings_json FROM orgs WHERE name = ?",
+                          (org_name,)).fetchone()
+        if row is None:
+            return
+        try:
+            data = json.loads(row[1] or "{}")
+        except ValueError:
+            data = {}
+        data["supply_sheets_preview"] = True
+        con.execute("UPDATE orgs SET settings_json = ? WHERE id = ?",
+                    (json.dumps(data, ensure_ascii=False), row[0]))
+        con.commit()
+    finally:
+        con.close()
+
+
+def supply_fix_5_ui(pw, base) -> None:
+    """SUPPLY-FIX-5 в браузере: F-27 (урок), F-28 (кнопка), F-29 (масштаб).
+
+    ЧТО СЮДА ПОПАЛО И ПОЧЕМУ ИМЕННО ЭТО. Ни один из трёх пунктов не виден из
+    ответа сервера: урок — это подсветка живого элемента страницы, выгрузка —
+    работающая кнопка, а поиск и сворачивание существуют только в браузере.
+    Всё, что живёт на сервере (состав демо, содержимое книги, подпись партии),
+    проверено там (`tests/test_supply_planning.py`), и здесь не повторяется.
+    """
+    c5 = _fix5_ui_client(base)
+    _fix5_ui_preview_flag("Бренд-UI-Пять")
+    browser = pw.chromium.launch()
+    ctx = browser.new_context(viewport={"width": 1400, "height": 900})
+    ctx.add_cookies([{"name": k, "value": v, "domain": "127.0.0.1", "path": "/"}
+                     for k, v in c5.cookies.items()])
+    errors: list[str] = []
+    page = ctx.new_page()
+    page.on("pageerror", lambda e: errors.append(str(e)))
+
+    steps = (
+        ("F-29 порог до одиннадцатой строки", lambda: _fix5_below_threshold(page, base, c5)),
+        ("F-27 урок раздела", lambda: _fix5_lesson_ui(page, base)),
+        ("F-28 кнопка выгрузки", lambda: _fix5_export_ui(page, base)),
+        ("F-29 поиск и сворачивание", lambda: _fix5_scale_ui(page, base, c5)),
+        ("F-29 состояние в адресе", lambda: _fix5_hash_ui(page, base)),
+    )
+    for label, run_step in steps:
+        try:
+            run_step()
+        except Exception as exc:  # noqa: BLE001 — важен отчёт, а не тип
+            check(f"{label}: шаг дошёл до конца без исключения", False,
+                  f"{type(exc).__name__}: "
+                  f"{str(exc).strip().splitlines()[0][:160]}")
+
+    check("за сценарий SUPPLY-FIX-5 не было ошибок в консоли",
+          not errors, str(errors)[:200])
+    ctx.close()
+    browser.close()
+    c5.close()
+
+
+def _fix5_cards(page, kind: str) -> int:
+    return page.evaluate(
+        "(k) => document.querySelectorAll('.pl-card[data-pl=\"' + k + '\"]').length",
+        kind)
+
+
+def _fix5_shown(page, sel: str) -> bool:
+    """Виден ли элемент по-настоящему: `getComputedStyle`, а не наличие в HTML."""
+    return page.evaluate(
+        "(s) => { const n = document.querySelector(s); if (!n) return false;"
+        " const st = getComputedStyle(n);"
+        " return st.display !== 'none' && st.visibility !== 'hidden'"
+        " && n.getBoundingClientRect().height > 0; }", sel)
+
+
+def _fix5_below_threshold(page, base, c5) -> None:
+    """До одиннадцатой строки поиска и сворачивания на экране нет вовсе."""
+    print("\n== F-29: маленький список обходится без поиска ==")
+    c5.post("/api/supply/planning/materials",
+            json={"title": "Шерсть-пять", "qty": "100", "unit": "м", "op_id": "u5-m1"})
+    it = c5.post("/api/supply/planning/items",
+                 json={"kind": "draft", "title": "Пальто-пять", "op_id": "u5-i1"}
+                 ).json()["items"][0]
+    board = c5.post("/api/supply/planning/batches",
+                    json={"item_id": it["id"], "title": "Запуск-пять",
+                          "plan_qty": "10", "op_id": "u5-b1"}).json()
+    batch = board["batches"][0]
+    mat = board["materials"][0]
+    c5.post("/api/supply/planning/assignments",
+            json={"material_id": mat["id"], "batch_id": batch["id"], "qty": "30",
+                  "op_id": "u5-a1"})
+    page.goto(f"{base}/supply")
+    page.wait_for_timeout(1200)
+    close_hint(page)
+    check("карточки на месте", _fix5_cards(page, "material") == 1
+          and _fix5_cards(page, "batch") == 1,
+          f"{_fix5_cards(page, 'material')}/{_fix5_cards(page, 'batch')}")
+    check("полосы поиска материалов нет на экране",
+          not _fix5_shown(page, "#pl-mat-find"), "видна")
+    check("кнопки «Свернуть» у материалов тоже нет",
+          not _fix5_shown(page, "#pl-mat-toggle"), "видна")
+    check("и у блока партий их тоже нет",
+          not _fix5_shown(page, "#pl-batch-find")
+          and not _fix5_shown(page, "#pl-batch-toggle"), "видны")
+
+
+def _fix5_lesson_ui(page, base) -> None:
+    """F-27: урок раздела есть в меню «?» и подсвечивает «Добавить материал»."""
+    print("\n== F-27: седьмой урок живёт на своей странице ==")
+    page.goto(f"{base}/supply")
+    page.wait_for_timeout(1400)
+    close_hint(page)
+    page.click("#hint-fab")
+    page.wait_for_timeout(400)
+    check("в меню «?» появился урок этой страницы",
+          _fix5_shown(page, "#hm-lesson"), "пункта нет")
+    check("счётчик уроков считает семь",
+          (page.text_content("#hm-cnt") or "").strip().endswith("/7"),
+          str(page.text_content("#hm-cnt")))
+    page.keyboard.press("Escape")
+    page.wait_for_timeout(200)
+
+    page.goto(f"{base}/supply?lesson=supply")
+    # ЖДЁМ, ПОКА ДОСКА ДОРИСУЕТСЯ, И ТОЛЬКО ПОТОМ МЕРЯЕМ. Это не «дать
+    # странице время»: цель первого шага лежит В РАЗМЕТКЕ, поэтому обводка
+    # встаёт по ещё пустой странице, а список карточек приходит ответом API и
+    # сдвигает кнопку вниз на свою высоту. Замер без этого ожидания проверял бы
+    # ту половину случаев, где ответ успел прийти раньше, — и молчал бы ровно
+    # про ту, где урок подсвечивает пустое место.
+    page.wait_for_selector(".pl-card", timeout=10000)
+    page.wait_for_timeout(900)
+    check("бегунок урока показан", _fix5_shown(page, "#tour-bar"), "бегунка нет")
+    check("карточка первого шага — про материал",
+          "материал" in (page.text_content(".tour-card .tc-title") or "").lower(),
+          str(page.text_content(".tour-card .tc-title")))
+    layout = page.evaluate(
+        "() => { const b = document.getElementById('pl-add-material');"
+        " const l = document.getElementById('pl-materials');"
+        " if (!b || !l) return null;"
+        " const br = b.getBoundingClientRect(), lr = l.getBoundingClientRect();"
+        " return {listHeight: Math.round(lr.height),"
+        "         buttonBelow: br.top >= lr.bottom - 1}; }")
+    check("список карточек занял место НАД кнопкой — значит кнопка уехала вниз",
+          layout and layout["listHeight"] > 0 and layout["buttonBelow"],
+          str(layout))
+    # КП ТЗ: подсветка стоит именно на «Добавить материал». Сверяются координаты,
+    # а не «на странице есть кольцо»: кольцо без цели выглядело бы так же.
+    same = page.evaluate(
+        "() => { const r = document.querySelector('.tour-ring');"
+        " const b = document.getElementById('pl-add-material');"
+        " if (!r || !b) return null;"
+        " const a = r.getBoundingClientRect(), c = b.getBoundingClientRect();"
+        " return Math.abs(a.left + 3 - c.left) < 3 && Math.abs(a.top + 3 - c.top) < 3"
+        "     && Math.abs(a.width - 6 - c.width) < 3; }")
+    check("кольцо урока стоит на кнопке «Добавить материал»", same is True, str(same))
+
+    # Шаги, которые указывают на строки списка, обязаны иметь на что указать:
+    # урок, подсвечивающий пустоту, честнее не показывать вовсе.
+    from app import lessons as _lessons
+    steps = [l for l in _lessons.CATALOGUE if l["key"] == "supply"][0]["steps"]
+    check("в уроке пять шагов пути", len(steps) == 5, str(len(steps)))
+    missing = [s["sel"] for s in steps
+               if not page.evaluate("(s) => !!document.querySelector(s)", s["sel"])]
+    check("каждый селектор урока находит живой элемент раздела",
+          not missing, str(missing))
+
+
+def _fix5_export_ui(page, base) -> None:
+    """F-28: кнопка «Скачать xlsx» стоит в шапке раздела и действительно качает."""
+    print("\n== F-28: кнопка выгрузки не обещает того, чего не делает ==")
+    page.goto(f"{base}/supply")
+    page.wait_for_timeout(1200)
+    close_hint(page)
+    check("кнопка «Скачать xlsx» видна на вкладке плана",
+          _fix5_shown(page, "#pl-export"), "не видна")
+    check("и ведёт на ручку выгрузки, а не в никуда",
+          (page.get_attribute("#pl-export", "href") or "")
+          .endswith("/api/supply/planning/export.xlsx"),
+          str(page.get_attribute("#pl-export", "href")))
+    with page.expect_download(timeout=15000) as info:
+        page.click("#pl-export")
+    dl = info.value
+    path = dl.path()
+    head = open(path, "rb").read(4) if path else b""
+    check("нажатие действительно скачивает файл",
+          str(dl.suggested_filename).endswith(".xlsx"), str(dl.suggested_filename))
+    check("и это настоящий xlsx (ZIP-контейнер), а не страница с ошибкой",
+          head == b"PK\x03\x04", repr(head))
+
+
+def _fix5_scale_ui(page, base, c5) -> None:
+    """F-29: тридцать материалов и двадцать партий — поиск и сворачивание."""
+    print("\n== F-29: тридцать материалов и двадцать партий ==")
+    it = c5.post("/api/supply/planning/items",
+                 json={"kind": "draft", "title": "Жакет-масштаб", "op_id": "u5-i2"}
+                 ).json()["items"][0]
+    for i in range(29):
+        c5.post("/api/supply/planning/materials",
+                json={"title": f"Ткань-масштаб-{i:02d}", "qty": "5", "unit": "м",
+                      "op_id": f"u5-sm-{i}"})
+    for i in range(18):
+        c5.post("/api/supply/planning/batches",
+                json={"item_id": it["id"], "title": f"Запуск-масштаб-{i:02d}",
+                      "plan_qty": "3", "op_id": f"u5-sb-{i}"})
+    # Одна партия НАМЕРЕННО без названия: её подпись — предмет отдельной
+    # проверки ниже, и собирать её задним числом было бы поздно.
+    c5.post("/api/supply/planning/batches",
+            json={"item_id": it["id"], "op_id": "u5-sb-none"})
+    board = c5.get("/api/supply/planning").json()
+    check("на доске тридцать материалов и двадцать партий",
+          len(board["materials"]) == 30 and len(board["batches"]) == 20,
+          f"{len(board['materials'])}/{len(board['batches'])}")
+
+    page.goto(f"{base}/supply")
+    page.wait_for_timeout(1600)
+    close_hint(page)
+    check("за порогом полоса поиска появилась",
+          _fix5_shown(page, "#pl-mat-find") and _fix5_shown(page, "#pl-batch-find"),
+          "не появилась")
+    check("и кнопки сворачивания тоже",
+          _fix5_shown(page, "#pl-mat-toggle") and _fix5_shown(page, "#pl-batch-toggle"),
+          "не появились")
+    check("нарисованы все тридцать карточек материалов",
+          _fix5_cards(page, "material") == 30, str(_fix5_cards(page, "material")))
+
+    page.fill("#pl-mat-q", "масштаб-07")
+    page.wait_for_timeout(400)
+    check("поиск сузил список материалов до одного",
+          _fix5_cards(page, "material") == 1, str(_fix5_cards(page, "material")))
+    check("и сказал, сколько нашлось",
+          "найдено 1 из 30" in (page.text_content("#pl-mat-found") or ""),
+          str(page.text_content("#pl-mat-found")))
+    check("уцелевшая карточка — именно искомая",
+          "Ткань-масштаб-07" in (page.text_content("#pl-materials") or ""),
+          (page.text_content("#pl-materials") or "")[:80])
+    page.fill("#pl-mat-q", "ТКАНЬ-МАСШТАБ-07")
+    page.wait_for_timeout(400)
+    check("верхний регистр находит ту же строку",
+          _fix5_cards(page, "material") == 1, str(_fix5_cards(page, "material")))
+    page.fill("#pl-mat-q", "такого нет")
+    page.wait_for_timeout(400)
+    check("несовпадение сказано словами, а не пустым экраном",
+          _fix5_cards(page, "material") == 0
+          and "ничего не найдено" in (page.text_content("#pl-mat-found") or ""),
+          str(page.text_content("#pl-mat-found")))
+    page.click("#pl-mat-q-clear")
+    page.wait_for_timeout(400)
+    check("«Сбросить» возвращает весь список",
+          _fix5_cards(page, "material") == 30 and not page.input_value("#pl-mat-q"),
+          str(_fix5_cards(page, "material")))
+
+    page.fill("#pl-batch-q", "масштаб-11")
+    page.wait_for_timeout(400)
+    check("поиск по партиям сужает свой блок и не трогает соседний",
+          _fix5_cards(page, "batch") == 1 and _fix5_cards(page, "material") == 30,
+          f"{_fix5_cards(page, 'batch')}/{_fix5_cards(page, 'material')}")
+    page.click("#pl-batch-q-clear")
+    page.wait_for_timeout(400)
+
+    # Безымянная партия: подпись видна на самой карточке, а не только в ответе.
+    check("безымянная партия подписана вещью и номером",
+          " · партия №" in (page.text_content("#pl-batches") or ""),
+          (page.text_content("#pl-batches") or "")[:120])
+
+    # «X · X» ЖИЛО НЕ ТОЛЬКО НА КАРТОЧКЕ. Выпадающие списки «Назначить» и
+    # «Перенести» собирали подпись как `(название или вещь) · вещь`, и у
+    # безымянной партии обе половины были одним и тем же словом: человек
+    # выбирал «куда перенести» из нескольких одинаковых строк. Проверяется
+    # именно повтор, а не наличие точки: у названной партии точка законна.
+    if page.is_visible("#pl-mat-q-clear"):
+        page.click("#pl-mat-q-clear")
+        page.wait_for_timeout(300)
+    opened = page.evaluate("""() => {
+      const card = document.querySelector('.pl-card[data-pl="material"]');
+      if (!card) return null;
+      const b = [...card.querySelectorAll('button')]
+        .find(x => x.textContent.trim() === 'Назначить на партию');
+      if (!b) return null;
+      b.click();
+      return true;
+    }""")
+    page.wait_for_timeout(600)
+    opts = page.evaluate("""() => {
+      const sel = document.querySelector('#pl-materials .pl-form.inline select');
+      return sel ? [...sel.options].map(o => o.textContent.trim()) : null;
+    }""")
+    check("форма назначения открылась и в ней есть список партий",
+          opened is True and isinstance(opts, list) and len(opts) >= 2,
+          str(opts)[:160])
+    doubled = [o for o in (opts or []) if " · " in o
+               and o.split(" · ")[0].strip() == o.split(" · ")[1].strip()]
+    check("ни одна строка списка не повторяет одно и то же слово дважды",
+          not doubled, str(doubled)[:160])
+    check("а безымянная партия и там названа вещью с номером",
+          any(" · партия №" in o for o in (opts or [])), str(opts)[:200])
+
+    page.click("#pl-mat-toggle")
+    page.wait_for_timeout(300)
+    check("«Свернуть» прячет список по-настоящему",
+          not _fix5_shown(page, "#pl-materials"), "список виден")
+    check("кнопка называет обратное действие",
+          (page.text_content("#pl-mat-toggle") or "").strip() == "Развернуть",
+          str(page.text_content("#pl-mat-toggle")))
+    check("а соседний блок остался развёрнутым",
+          _fix5_shown(page, "#pl-batches"), "свёрнут вместе с чужим")
+    page.click("#pl-mat-toggle")
+    page.wait_for_timeout(300)
+    check("«Развернуть» возвращает список", _fix5_shown(page, "#pl-materials"),
+          "список не вернулся")
+
+
+def _fix5_hash_ui(page, base) -> None:
+    """F-29: вкладка и свёрнутые блоки живут в адресе и переживают перезагрузку."""
+    print("\n== F-29: состояние экрана лежит в адресе ==")
+    page.goto(f"{base}/supply#preview")
+    page.wait_for_timeout(1600)
+    close_hint(page)
+    check("адрес с #preview открывает вторую вкладку",
+          _fix5_shown(page, "#sup-view-preview")
+          and not _fix5_shown(page, "#sup-view-plan"),
+          "открыта не та вкладка")
+    check("и переключатель это показывает",
+          page.get_attribute("#sup-tab-preview", "aria-selected") == "true",
+          str(page.get_attribute("#sup-tab-preview", "aria-selected")))
+
+    page.click("#sup-tab-plan")
+    page.wait_for_timeout(300)
+    check("возврат на план убирает #preview из адреса",
+          "preview" not in (page.evaluate("() => location.hash") or ""),
+          str(page.evaluate("() => location.hash")))
+
+    page.click("#pl-mat-toggle")
+    page.wait_for_timeout(300)
+    check("свёрнутый блок записан в адрес",
+          "mat-off" in (page.evaluate("() => location.hash") or ""),
+          str(page.evaluate("() => location.hash")))
+
+    page.goto(f"{base}/supply#preview,mat-off")
+    page.wait_for_timeout(1600)
+    close_hint(page)
+    check("после перезагрузки вкладка и свёрнутый блок восстановлены",
+          _fix5_shown(page, "#sup-view-preview"), "вкладка не та")
+    page.click("#sup-tab-plan")
+    page.wait_for_timeout(400)
+    check("и блок материалов действительно свёрнут",
+          not _fix5_shown(page, "#pl-materials")
+          and (page.text_content("#pl-mat-toggle") or "").strip() == "Развернуть",
+          str(page.text_content("#pl-mat-toggle")))
 
 
 if __name__ == "__main__":
