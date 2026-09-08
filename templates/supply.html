@@ -3493,7 +3493,13 @@ document.addEventListener("DOMContentLoaded", function () {
     // «новинки» — которая как раз различает.
     if (b.item_kind === "draft") head.appendChild(el("span", "pl-tag", "новинка"));
     grow.appendChild(head);
-    grow.appendChild(el("div", "sub", "вещь: " + b.item_title));
+    // Строка «вещь: …» нужна там, где название партии своё и вещь по нему не
+    // угадывается. У безымянной партии подпись САМА начинается с имени вещи
+    // (F-29), и повторять его строкой ниже — писать одно слово дважды на одной
+    // карточке, то есть ровно то, против чего пункт и делался.
+    if (b.item_title && (b.label || "").indexOf(b.item_title) < 0) {
+      grow.appendChild(el("div", "sub", "вещь: " + b.item_title));
+    }
 
     var nums = el("div", "pl-nums");
     var plan = el("span", null, "план: ");

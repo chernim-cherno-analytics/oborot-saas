@@ -6260,6 +6260,20 @@ def _fix5_scale_ui(page, base, c5) -> None:
     check("безымянная партия подписана вещью и номером",
           " · партия №" in (page.text_content("#pl-batches") or ""),
           (page.text_content("#pl-batches") or "")[:120])
+    # И имя вещи на такой карточке стоит ОДИН раз: подпись уже начинается с
+    # него, поэтому строки «вещь: …» под ней быть не должно.
+    twice = page.evaluate("""() => {
+      const card = [...document.querySelectorAll('.pl-card[data-pl="batch"]')]
+        .find(c => (c.querySelector('.t') || {}).textContent
+                   && c.querySelector('.t').textContent.indexOf(' · партия №') >= 0);
+      if (!card) return null;
+      const head = card.querySelector('.t').textContent.trim();
+      const subs = [...card.querySelectorAll('.sub')].map(s => s.textContent.trim());
+      return {head: head, subs: subs,
+              repeats: subs.some(s => s.indexOf('вещь: ') === 0)};
+    }""")
+    check("на безымянной карточке имя вещи стоит один раз, а не дважды",
+          twice and twice["repeats"] is False, str(twice)[:200])
 
     # «X · X» ЖИЛО НЕ ТОЛЬКО НА КАРТОЧКЕ. Выпадающие списки «Назначить» и
     # «Перенести» собирали подпись как `(название или вещь) · вещь`, и у
