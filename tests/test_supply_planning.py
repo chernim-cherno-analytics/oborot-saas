@@ -3488,6 +3488,31 @@ def _fix4_dedup_cleanup_race(c, org4: int) -> None:
           bool(row) and row[0]["sketch_id"] == sid,
           str(row[0]["sketch_id"]) if row else "вещи нет")
 
+    # ТОТ ЖЕ СЛУЧАЙ У СТАРОЙ РУЧКИ, И ЗАЩИТА У НЕГО ДРУГАЯ. Вещи здесь ещё нет
+    # вовсе — ссылка появится только следующим запросом старого клиента, — и
+    # `db.flush()` помочь не может: сбрасывать нечего. Номер, который ручка
+    # возвращает, исключается из прохода уборки явно; иначе ответ 200 нёс бы
+    # идентификатор строки, удалённой этим же запросом.
+    legacy_bytes = _fix4_png(300, 200, tone=0xA5)
+    legacy = c.post(P2 + "/sketches",
+                    files={"file": ("l.png", legacy_bytes, "image/png")})
+    legacy_id = legacy.json().get("sketch_id") if legacy.status_code == 200 else 0
+    con = sqlite3.connect(DB_PATH)
+    try:
+        con.execute("UPDATE supply_sketches SET created_at ="
+                    " datetime('now', '-2 day') WHERE id=?", (legacy_id,))
+        con.commit()
+    finally:
+        con.close()
+    again = c.post(P2 + "/sketches",
+                   files={"file": ("l2.png", legacy_bytes, "image/png")})
+    again_id = again.json().get("sketch_id") if again.status_code == 200 else 0
+    check("старая ручка вернула ту же строку по дедупу", again_id == legacy_id,
+          f"{again_id} vs {legacy_id}")
+    still = c.get(P2 + f"/sketches/{again_id}")
+    check("и НЕ удалила номер, который сама же вернула",
+          still.status_code == 200, f"{still.status_code} {still.text[:80]}")
+
 
 def _fix4_cache_vary(c) -> None:
     """P1 ревью: приватный кэш обязан различать сессии.

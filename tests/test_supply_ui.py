@@ -4259,8 +4259,12 @@ def _fix4_retry_after_sketch_fail(page, base, c) -> None:
           f"строк: {len(made)}")
 
     # Человек выбирает другой файл: `change` сбрасывает идентичность поступка —
-    # и именно на этом прежняя редакция заводила вторую строку.
+    # и именно на этом прежняя редакция заводила вторую строку. Заодно он
+    # правит ОБА текстовых поля: повтор обязан донести до сервера то, что
+    # человек видит перед собой, а не то, что ушло в первый раз.
     page.unroute(re.compile(r"/api/supply/planning/items/\d+/sketch$"))
+    page.fill("#pl-item-title", title)
+    page.fill("#pl-item-note", "заметка после отказа")
     page.set_input_files("#pl-item-sketch", {
         "name": "second.png", "mimeType": "image/png",
         "buffer": base64.b64decode(VALID_PNG_B64)})
@@ -4277,6 +4281,9 @@ def _fix4_retry_after_sketch_fail(page, base, c) -> None:
     check("и эскиз прикреплён именно к ней",
           len(made) == 1 and made[0]["sketch_id"] is not None,
           str(made[0]["sketch_id"]) if made else "строки нет")
+    check("правка, сделанная между отказом и повтором, дошла до сервера",
+          len(made) == 1 and made[0]["note"] == "заметка после отказа",
+          str(made[0]["note"]) if made else "строки нет")
     check("форма закрылась — работа доведена до конца",
           page.evaluate("() => document.getElementById('pl-item-form').hidden")
           is True)

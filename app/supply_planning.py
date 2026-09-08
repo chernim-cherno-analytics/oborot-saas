@@ -671,7 +671,8 @@ SKETCH_ORPHAN_HOURS = 24
 
 def cleanup_orphan_sketches(db: Session, org_id: int, *,
                             hours: int = SKETCH_ORPHAN_HOURS,
-                            limit: int = SKETCH_ORPHAN_BATCH) -> int:
+                            limit: int = SKETCH_ORPHAN_BATCH,
+                            keep: int | None = None) -> int:
     """Убирает эскизы СВОЕЙ организации, на которые не ссылается ни одна вещь.
 
     Откуда берутся сироты. До этого пакета страница отправляла файл ДО создания
@@ -689,6 +690,14 @@ def cleanup_orphan_sketches(db: Session, org_id: int, *,
 
     Возраст считается от `created_at`, потому что другого времени у строки нет,
     и сравнивается с UTC — тем же временем, которым строка создаётся.
+
+    `keep` — НОМЕР, КОТОРЫЙ ЭТОТ ЗАПРОС ТОЛЬКО ЧТО ВЕРНУЛ ЧЕЛОВЕКУ, и трогать
+    его нельзя ни при каком возрасте. Случай не выдуманный: дедуп по содержимому
+    отдаёт СТАРУЮ строку, а она вполне может быть сиротой старше суток. У
+    прикрепления к вещи ссылка появляется сразу (и `db.flush()` выше делает её
+    видимой), а вот старая ручка `POST /sketches` вещи ещё не знает — ссылки нет
+    и не будет до следующего запроса. Без этой защиты она отвечала 200 с номером
+    строки, которую сама же в этом запросе и удалила.
     """
     # СНАЧАЛА СБРАСЫВАЕМ НЕЗАПИСАННОЕ, ПОТОМ СПРАШИВАЕМ, ЧТО НИЧЬЁ. Сессия слоя
     # создана с `autoflush=False`, поэтому только что проставленный
@@ -701,11 +710,13 @@ def cleanup_orphan_sketches(db: Session, org_id: int, *,
     cutoff = datetime.utcnow() - timedelta(hours=hours)
     referenced = select(SupplyItem.sketch_id).where(
         SupplyItem.org_id == org_id, SupplyItem.sketch_id.is_not(None))
+    conditions = [SupplySketch.org_id == org_id,
+                  SupplySketch.created_at < cutoff,
+                  SupplySketch.id.not_in(referenced)]
+    if keep is not None:
+        conditions.append(SupplySketch.id != keep)
     doomed = db.execute(
-        select(SupplySketch.id).where(
-            SupplySketch.org_id == org_id,
-            SupplySketch.created_at < cutoff,
-            SupplySketch.id.not_in(referenced)).limit(limit)
+        select(SupplySketch.id).where(*conditions).limit(limit)
     ).scalars().all()
     if not doomed:
         return 0

@@ -2566,11 +2566,11 @@ document.addEventListener("DOMContentLoaded", function () {
     return isFinite(raw) && raw > 0 ? raw : 0;
   }
 
-  function itemRevOf(id) {
+  function itemRowOf(id) {
     var rows = ((PL.board && PL.board.items) || []).filter(function (i) {
       return i.id === id;
     });
-    return rows.length ? rows[0].rev : null;
+    return rows.length ? rows[0] : null;
   }
 
   function submitDraftWithSketch(form, body, fileObj) {
@@ -2594,16 +2594,25 @@ document.addEventListener("DOMContentLoaded", function () {
     var known = draftItemId(form);
     var first;
     if (known) {
-      var rev = itemRevOf(known);
-      var wanted = (body.title || "").trim();
-      var current = ((PL.board && PL.board.items) || []).filter(function (i) {
-        return i.id === known;
-      });
-      if (current.length && (current[0].title || "") !== wanted && rev !== null) {
+      // ПОВТОР ДОСЫЛАЕТ ВСЁ, ЧТО ЧЕЛОВЕК ИЗМЕНИЛ, А НЕ ТОЛЬКО НАЗВАНИЕ. Между
+      // отказом и повтором он мог поправить и имя, и заметку, и оба поля он
+      // видит перед собой; сохранить одно и промолчать про второе — это та же
+      // потеря ввода, что запрещена пакетом 1 (D-55 п. 1). Сравнение идёт со
+      // СВЕЖЕЙ доской: ответ создания кладётся в `PL.board` сразу, иначе
+      // созданной строки в ней нет вовсе и сравнивать не с чем.
+      var row = itemRowOf(known);
+      var wantTitle = (body.title || "").trim();
+      var wantNote = body.note || "";
+      if (row && ((row.title || "") !== wantTitle
+                  || (row.note || "") !== wantNote)) {
         first = api("/api/supply/planning/items/" + known + "/update",
-                    {method: "POST", body: {title: wanted, rev: rev,
+                    {method: "POST", body: {title: wantTitle, note: wantNote,
+                                            rev: row.rev,
                                             op_id: body.op_id + "-t"}})
-          .then(function () { return {item_id: known}; });
+          .then(function (data) {
+            PL.board = data;
+            return {item_id: known};
+          });
       } else {
         first = Promise.resolve({item_id: known});
       }
@@ -2618,6 +2627,15 @@ document.addEventListener("DOMContentLoaded", function () {
                           + "Обновите страницу.");
         }
         draftItemId(form, itemId);
+        // ДОСКА ОБНОВЛЯЕТСЯ СРАЗУ ПОСЛЕ СОЗДАНИЯ, А НЕ В САМОМ КОНЦЕ. Вещь уже
+        // записана: держать её в тайне от экрана до конца второго запроса
+        // значило бы показывать состояние, которого на сервере больше нет, — и
+        // именно из-за этого повтор не находил созданной строки и не мог
+        // сравнить с ней поля.
+        if (data && data.items) {
+          PL.board = data;
+          render();
+        }
         return sketchThumb(fileObj).then(function (thumb) {
           var fd = new FormData();
           fd.append("file", fileObj);

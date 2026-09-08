@@ -689,7 +689,13 @@ async def api_planning_sketch_upload(
                                         _thumb_too_big())
     try:
         row = sp.save_sketch(db, ctx.org.id, data, _author(ctx), thumb=thumb_data)
-        sp.cleanup_orphan_sketches(db, ctx.org.id)
+        # НОМЕР, КОТОРЫЙ МЫ СЕЙЧАС ВЕРНЁМ, УБОРКА НЕ ТРОГАЕТ. У этой ручки вещи
+        # ещё нет — ссылка на эскиз появится только следующим запросом старого
+        # клиента, — поэтому строка выглядит ничьей и по возрасту вполне могла
+        # оказаться сиротой: дедуп отдаёт СТАРУЮ строку, если байты те же.
+        # Без этой оговорки ручка отвечала бы 200 с номером, который сама же в
+        # этом запросе и удалила.
+        sp.cleanup_orphan_sketches(db, ctx.org.id, keep=row.id)
     except (sp.PlanningError, IntegrityError) as exc:
         db.rollback()
         raise _fail(exc) from None
@@ -734,7 +740,10 @@ async def api_planning_item_sketch(
         row = sp.attach_sketch(db, ctx.org.id, item_id, data, thumb_data,
                                _author(ctx))
         sketch_id = row.id
-        sp.cleanup_orphan_sketches(db, ctx.org.id)
+        # Здесь ссылка на эскиз уже проставлена вещи, и `db.flush()` внутри
+        # уборки делает её видимой запросу. `keep` всё равно передаётся: две
+        # защиты от одного и того же лучше, чем одна, а стоит она ничего.
+        sp.cleanup_orphan_sketches(db, ctx.org.id, keep=sketch_id)
     except (sp.PlanningError, IntegrityError) as exc:
         db.rollback()
         raise _fail(exc) from None
