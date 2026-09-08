@@ -4585,6 +4585,110 @@ def _fix4_retry_after_sketch_fail(page, base, c) -> None:
               len(done) == 1 and done[0]["note"] == "правка с потерянным ответом",
               str(done[:1])[:160])
 
+    # ВОСЬМОЙ ПУТЬ: заметка с пробелами по краям. Сервер обрезает края
+    # (`clean_text`), а снимок формы обязан хранить ровно то, что ляжет на
+    # сервер, — иначе форма считает собственную запись чужой правкой и
+    # упирается в отказ, которого никто не вызывал.
+    page.evaluate("""() => {
+      const f = document.getElementById('pl-item-form');
+      const b = document.getElementById('pl-add-item');
+      if (f && !f.hidden && b) b.click();
+    }""")
+    page.wait_for_timeout(300)
+    page.route(re.compile(r"/api/supply/planning/items/\d+/sketch$"),
+               lambda route: route.fulfill(status=400,
+                                           content_type="application/json",
+                                           body='{"detail":"Эскиз не принят."}'))
+    page.click("#pl-add-item")
+    page.wait_for_timeout(250)
+    page.select_option("#pl-item-kind", "draft")
+    page.wait_for_timeout(150)
+    page.fill("#pl-item-title", "Новинка-пробелы")
+    page.fill("#pl-item-note", "   заметка с краями   ")
+    page.set_input_files("#pl-item-sketch", {
+        "name": "bad5.png", "mimeType": "image/png",
+        "buffer": base64.b64decode(VALID_PNG_B64)})
+    page.evaluate("""() => {
+      const b = document.querySelector('#pl-item-form button[type=submit]');
+      if (b) b.click();
+    }""")
+    page.wait_for_timeout(2500)
+    page.unroute(re.compile(r"/api/supply/planning/items/\d+/sketch$"))
+    page.fill("#pl-item-title", "Новинка-пробелы-2")
+    page.wait_for_timeout(200)
+    page.evaluate("""() => {
+      const b = document.querySelector('#pl-item-form button[type=submit]');
+      if (b) b.click();
+    }""")
+    page.wait_for_timeout(2500)
+    err = page.evaluate("""() => {
+      const box = document.getElementById('pl-item-err');
+      return box ? box.textContent : '';
+    }""")
+    check("пробелы по краям заметки не превращают свою запись в чужую",
+          "другом окне" not in err, err[:140])
+    board = c.get("/api/supply/planning").json()
+    trimmed = [i for i in board["items"] if i["title"] == "Новинка-пробелы-2"]
+    check("правка названия дошла, и строка одна", len(trimmed) == 1,
+          f"строк: {len(trimmed)}")
+    check("а эскиз прикреплён со второй попытки",
+          len(trimmed) == 1 and trimmed[0]["sketch_id"] is not None,
+          str(trimmed[0]["sketch_id"]) if trimmed else "строки нет")
+
+    # ДЕВЯТЫЙ ПУТЬ: ответ прикрепления потерян, человек убирает файл и жмёт
+    # «Сохранить», ничего не изменив. Писать нечего — но на сервере УЖЕ лежит
+    # картинка, и закрыть форму на доске без неё значило бы оставить экран
+    # расходиться с данными до перезагрузки.
+    # Форму снова закрывают перед открытием: предыдущий шаг мог оставить её
+    # открытой (на дереве без правки он именно это и делает), и без этого
+    # красный прогон умирал бы здесь вместо того, чтобы отчитаться (D-42).
+    page.evaluate("""() => {
+      const f = document.getElementById('pl-item-form');
+      const b = document.getElementById('pl-add-item');
+      if (f && !f.hidden && b) b.click();
+    }""")
+    page.wait_for_timeout(300)
+    page.route(re.compile(r"/api/supply/planning/items/\d+/sketch$"), lose)
+    page.click("#pl-add-item")
+    page.wait_for_timeout(250)
+    page.select_option("#pl-item-kind", "draft")
+    page.wait_for_timeout(150)
+    page.fill("#pl-item-title", "Новинка-расхождение")
+    page.set_input_files("#pl-item-sketch", {
+        "name": "lost2.png", "mimeType": "image/png",
+        "buffer": base64.b64decode(VALID_PNG_B64)})
+    page.evaluate("""() => {
+      const b = document.querySelector('#pl-item-form button[type=submit]');
+      if (b) b.click();
+    }""")
+    page.wait_for_timeout(2500)
+    page.unroute(re.compile(r"/api/supply/planning/items/\d+/sketch$"))
+    page.set_input_files("#pl-item-sketch", [])
+    page.wait_for_timeout(200)
+    # СЧЁТЧИК ЧТЕНИЙ ДОСКИ. Состояние страницы наружу не отдаётся (`PL` живёт
+    # в замыкании), а вот перечитала ли она доску — видно по сети. Это и есть
+    # разница между «закрылись на устаревшем состоянии» и «сверились с
+    # сервером»: до правки чтения не было ни одного.
+    reads = []
+    page.on("request", lambda r: reads.append(r.url)
+            if r.method == "GET" and r.url.endswith("/api/supply/planning")
+            else None)
+    page.evaluate("""() => {
+      const b = document.querySelector('#pl-item-form button[type=submit]');
+      if (b) b.click();
+    }""")
+    page.wait_for_timeout(2500)
+    board = c.get("/api/supply/planning").json()
+    diverged = [i for i in board["items"] if i["title"] == "Новинка-расхождение"]
+    check("на сервере эскиз есть", len(diverged) == 1
+          and diverged[0]["sketch_id"] is not None,
+          str(diverged[:1])[:140])
+    check("страница сверилась с сервером, а не закрылась на устаревшем",
+          len(reads) >= 1, f"чтений доски: {len(reads)}")
+    check("и форма всё-таки закрыта — работа доведена до конца",
+          page.evaluate("() => document.getElementById('pl-item-form').hidden")
+          is True)
+
 
 def _fix4_history_ui(page, base, c) -> None:
     """F-24: «История» на карточке показывает последнюю правку."""
