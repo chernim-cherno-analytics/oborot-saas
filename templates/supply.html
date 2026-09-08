@@ -243,6 +243,13 @@
   .pl-confirm-restore { display: flex; align-items: center; gap: 4px;
                         margin-top: 6px; font-size: 12.5px; cursor: pointer; }
   .pl-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+  /* Обёртка эскиза не должна ни увеличивать карточку, ни подчёркиваться как
+     обычная ссылка: это картинка, а не текст. */
+  .pl-sketch-link { display: inline-flex; line-height: 0; text-decoration: none; }
+  .pl-hist { margin-top: 6px; display: flex; flex-direction: column; gap: 4px; }
+  .pl-hist-row { font-size: 13px; line-height: 1.4; }
+  .pl-hist-row .who { color: #6b7280; }
+  .pl-hist-old { text-decoration: line-through; color: #6b7280; }
   .pl-empty { font-size: 13px; color: var(--ink-2); line-height: 1.5;
               padding: 14px 12px; border: 1px dashed var(--line);
               border-radius: 10px; }
@@ -1800,12 +1807,21 @@ document.addEventListener("DOMContentLoaded", function () {
     // потерянного ответа пришёл бы под новым `op_id` и создал вторую запись
     // (P1, закрытый в SUPPLY-3). Событие перекраски и так не всплывает — это
     // вторая, явная защита того же правила, а не замена ей.
-    form.addEventListener("input", function () {
-      if (!PL.restoring) resetToken(form);
-    });
-    form.addEventListener("change", function () {
-      if (!PL.restoring) resetToken(form);
-    });
+    // ВЫБОР ФАЙЛА НЕ МЕНЯЕТ ПОСТУПОК, КОТОРЫЙ ЭТА ФОРМА ПОВТОРЯЕТ. Тело
+    // создания вещи файла не содержит вовсе: там имя, заметка и вид. Пока файл
+    // считался правкой, случай «ответ на создание потерялся, человек выбрал
+    // другую картинку и нажал снова» приходил под НОВОЙ идентичностью — замок
+    // повторного поступка его не узнавал, и на доске появлялась вторая новинка
+    // с тем же именем, а первая оставалась без эскиза. Текстовые поля
+    // идентичность сбрасывают как и раньше: другое имя — другая вещь.
+    function bumpUnlessFile(ev) {
+      if (PL.restoring) return;
+      var node = ev && ev.target;
+      if (node && node.type === "file") return;
+      resetToken(form);
+    }
+    form.addEventListener("input", bumpUnlessFile);
+    form.addEventListener("change", bumpUnlessFile);
   }
 
   // Склонение рядом с числом. Тот же смысл, что у `_ru_plural` на сервере:
@@ -2142,6 +2158,10 @@ document.addEventListener("DOMContentLoaded", function () {
         form.hidden = true;
         btn.setAttribute("aria-expanded", "false");
         clear(form);
+        // Закрытая форма — это отказ от начатого, и память о начатом закрывается
+        // вместе с ней: иначе следующее открытие «Добавить вещь» доделывало бы
+        // ту новинку, о которой человек уже забыл (F-23а).
+        delete form.dataset.itemId;
       }
     });
   }
@@ -2188,6 +2208,11 @@ document.addEventListener("DOMContentLoaded", function () {
   }
 
   function buildItemForm(form) {
+    // ФОРМА, КОТОРУЮ ТОЛЬКО ЧТО СОБРАЛИ, НИЧЕГО НЕ НАЧИНАЛА. Это второй,
+    // независимый рубеж к `closeItemForm`: как бы форму ни закрыли — кнопкой,
+    // успехом, чем-то ещё, что появится позже, — следующее открытие начинает с
+    // чистого листа. Один рубеж на трёх путях закрытия уже однажды не сработал.
+    delete form.dataset.itemId;
     clear(form);
     var kind = el("select");
     kind.id = "pl-item-kind";
@@ -2239,6 +2264,14 @@ document.addEventListener("DOMContentLoaded", function () {
     form.appendChild(field("Заметка", note, true));
     form.appendChild(el("div", "pl-hint",
       "Два одинаковых названия — это две разные вещи: «Оборот» их не склеивает."));
+    // Подсказка режима прикрепления: она появляется, только когда вещь уже
+    // создана, и объясняет, почему поля перестали правиться (F-23а).
+    var attachHint = el("div", "pl-hint",
+      "Вещь сохранена. Осталось прикрепить эскиз — выберите файл и нажмите "
+      + "«Сохранить». Название и заметку можно поправить на карточке вещи.");
+    attachHint.id = "pl-item-attach-hint";
+    attachHint.hidden = true;
+    form.appendChild(attachHint);
     form.appendChild(submitRow("Сохранить вещь", "pl-item-err"));
 
     function paintKind() {
@@ -2246,6 +2279,15 @@ document.addEventListener("DOMContentLoaded", function () {
       fCatalog.hidden = !isCatalog;
       fTitle.hidden = isCatalog;
       fSketch.hidden = isCatalog;
+      // ОБЯЗАТЕЛЬНОСТЬ НАЗВАНИЯ ОБЪЯВЛЕНА ПОЛЮ, А НЕ ТОЛЬКО ПРОВЕРЕНА КОДОМ
+      // (F-23а): сервер это правило держал и раньше, но узнавал о нарушении
+      // ПОСЛЕ того, как эскиз уже уехал и лёг в базу.
+      //
+      // Признак снимается вместе с показом поля, и это не мелочь: спрятанное
+      // обязательное поле браузер всё равно проверяет и отказывается
+      // отправлять форму, не в силах показать, на что жалуется. Вещь каталога
+      // своего названия не имеет вовсе — значит и требовать его у неё не за что.
+      title.required = !isCatalog;
     }
     kind.addEventListener("change", paintKind);
     paintKind();
@@ -2429,47 +2471,313 @@ document.addEventListener("DOMContentLoaded", function () {
         // решение владельца запрещает.
         if (confirmedRestore) body.confirm_restore = true;
         send("/api/supply/planning/items", body, "pl-item-err", function (ok) {
-          if (ok) { resetToken(form); form.hidden = true; clear(form);
-                    byId("pl-add-item").setAttribute("aria-expanded", "false"); }
+          if (ok) closeItemForm(form);
         }, {kind: "item"});
         return;
       }
       body.title = title.value;
-      // Эскиз уходит отдельным запросом ДО создания вещи: файл — это байты, а
-      // не поле JSON, и мешать их в одном теле значило бы кодировать картинку
-      // в текст ради удобства кода.
-      if (file.files && file.files.length) {
-        if (PL.saving) return;
-        PL.saving = true; paintSaving(true);
-        var fd = new FormData();
-        fd.append("file", file.files[0]);
-        fetch("/api/supply/planning/sketches", {
-          method: "POST", body: fd, credentials: "same-origin",
-          headers: {"X-Oborot-CSRF": "1"},
-        }).then(function (r) {
-          return r.json().then(function (j) { return {ok: r.ok, j: j}; });
-        }).then(function (res) {
-          PL.saving = false; paintSaving(false);
-          if (!res.ok) {
-            setError("pl-item-err", (res.j && res.j.detail) || "Эскиз не принят.");
-            return;
-          }
-          body.sketch_id = res.j.sketch_id;
-          send("/api/supply/planning/items", body, "pl-item-err", function (ok) {
-            if (ok) { resetToken(form); form.hidden = true; clear(form);
-                      byId("pl-add-item").setAttribute("aria-expanded", "false"); }
-          }, {kind: "item"});
-        }).catch(function () {
-          PL.saving = false; paintSaving(false);
-          setError("pl-item-err", "Эскиз не удалось отправить.");
-        });
+      // ФОРМА ПРОВЕРЯЕТСЯ ДО ТОГО, КАК УЙДУТ БАЙТЫ (F-23а). Раньше порядок был
+      // обратный: эскиз отправлялся ПЕРВЫМ, и только потом сервер отвечал, что
+      // название пустое. Каждая такая ошибка оставляла в базе до двух
+      // мегабайт, на которых уже никогда ничего не повиснет, — и лежали они
+      // там же, где данные человека, и в каждом ночном бэкапе.
+      if (!title.value.trim()) {
+        setError("pl-item-err", "Укажите название новинки.");
+        title.focus();
+        return;
+      }
+      var chosen = (file.files && file.files.length) ? file.files[0] : null;
+      if (chosen) {
+        var limits = (PL.board && PL.board.limits) || {};
+        var maxBytes = limits.sketch_max_bytes || (2 * 1024 * 1024);
+        if (chosen.size > maxBytes) {
+          // Тот же текст, что у сервера: у одного отказа не должно быть двух
+          // лиц (Приложение А ТЗ). Проверка здесь не заменяет серверную —
+          // размер файла со стороны браузера это подсказка, а не гарантия, —
+          // она лишь избавляет человека от ожидания загрузки ради отказа.
+          setError("pl-item-err", "Файл больше "
+                   + Math.round(maxBytes / (1024 * 1024)) + " МБ — уменьшите картинку.");
+          return;
+        }
+      }
+      // ВЕЩЬ УЖЕ СОЗДАНА? ЗНАЧИТ ВТОРОЙ ЕЙ НЕ БЫВАТЬ. Вопрос задаётся ДО
+      // всякого ветвления по файлу и ровно один раз: путей отправки несколько,
+      // а память о начатом одна. Прежде проверка стояла только на пути С
+      // файлом — и повтор без файла заводил вторую новинку с тем же именем.
+      if (finishStartedItem(form, chosen)) return;
+      if (chosen) {
+        submitDraftWithSketch(form, body, chosen);
         return;
       }
       send("/api/supply/planning/items", body, "pl-item-err", function (ok) {
-        if (ok) { resetToken(form); form.hidden = true; clear(form);
-                  byId("pl-add-item").setAttribute("aria-expanded", "false"); }
+        if (ok) closeItemForm(form);
       }, {kind: "item"});
     };
+  }
+
+  //: Сторона миниатюры и её потолок в байтах — те же числа, что у сервера
+  //: (`SKETCH_THUMB_MAX_SIDE`, `SKETCH_THUMB_MAX_BYTES`). Разойтись им нельзя:
+  //: браузер нарисовал бы то, что сервер не примет, и человек получал бы отказ
+  //: за картинку, которую сам не выбирал.
+  var THUMB_SIDE = 128;
+  var THUMB_MAX_BYTES = 64 * 1024;
+
+  // МИНИАТЮРУ РИСУЕТ БРАУЗЕР, И ЭТО НЕ ОБХОДНОЙ ПУТЬ, А НАЗВАННЫЙ (ТЗ F-23).
+  // Библиотеки работы с картинками в замыкании зависимостей проекта нет, а
+  // заводить её ради сорока четырёх точек в карточке — это новая зависимость
+  // на проде ради украшения. Поэтому сторона считается здесь, а сервер её
+  // ПРОВЕРЯЕТ по самим байтам: клиент рисует, но не решает.
+  //
+  // Неудача здесь не является отказом. Не получилось нарисовать (старый
+  // браузер, странный файл, запрет canvas) — эскиз уходит без миниатюры, и
+  // карточка показывает оригинал, как показывала до этого пакета. Терять
+  // сохранение картинки из-за неудавшегося уменьшения было бы дороже, чем
+  // лишние килобайты.
+  function sketchThumb(fileObj) {
+    return new Promise(function (resolve) {
+      var url;
+      try { url = URL.createObjectURL(fileObj); } catch (e) { return resolve(null); }
+      var img = new Image();
+      img.onload = function () {
+        try {
+          var w0 = img.naturalWidth || img.width || 0;
+          var h0 = img.naturalHeight || img.height || 0;
+          if (!w0 || !h0) { URL.revokeObjectURL(url); return resolve(null); }
+          var k = Math.min(1, THUMB_SIDE / Math.max(w0, h0));
+          var w = Math.max(1, Math.round(w0 * k));
+          var h = Math.max(1, Math.round(h0 * k));
+          var cv = document.createElement("canvas");
+          cv.width = w;
+          cv.height = h;
+          cv.getContext("2d").drawImage(img, 0, 0, w, h);
+          URL.revokeObjectURL(url);
+          if (!cv.toBlob) return resolve(null);
+          cv.toBlob(function (blob) {
+            // Не поместилась в потолок — значит миниатюры нет. Отправлять то,
+            // что сервер отвергнет, значило бы превратить украшение в отказ.
+            resolve(blob && blob.size <= THUMB_MAX_BYTES ? blob : null);
+          }, "image/png");
+        } catch (e) {
+          try { URL.revokeObjectURL(url); } catch (e2) { /* уже снят */ }
+          resolve(null);
+        }
+      };
+      img.onerror = function () {
+        try { URL.revokeObjectURL(url); } catch (e) { /* уже снят */ }
+        resolve(null);
+      };
+      img.src = url;
+    });
+  }
+
+  // СОХРАНЕНИЕ НОВИНКИ С ЭСКИЗОМ — ДВА ЗАПРОСА В НАЗВАННОМ ПОРЯДКЕ (F-23а):
+  // сначала вещь, потом байты к ней. Своя ветка нужна потому, что `send()`
+  // умеет ровно один запрос и отдаёт результат уже после того, как снял свой
+  // замок; вложить в него второй запрос значило бы либо отпустить кнопки на
+  // время загрузки файла, либо переписать общую функцию ради одного случая.
+  //
+  // ЧТО ПРОИСХОДИТ ПРИ ОТКАЗЕ НА ВТОРОМ ШАГЕ. Вещь уже создана, эскиз — нет,
+  // и форма остаётся открытой с ошибкой. Повтор неизменного нажатия уходит с
+  // ТЕМ ЖЕ `op_id`: сервер узнаёт поступок, вещь второй раз не заводит и
+  // отвечает номером уже созданной — файл прикрепляется к ней. Именно ради
+  // этого случая ручка создания и возвращает `item_id` в ответе на повтор.
+  //: Номер уже созданной вещи живёт НА ФОРМЕ, а не в замыкании отправки.
+  //: Причина ровно та же, по которой там же живут редакция и идентичность
+  //: поступка (D-58 п. 6в): форма переживает отказ, а замыкание — нет.
+  // ЗАКРЫТИЕ ФОРМЫ ВЕЩИ — ОДНО МЕСТО, А НЕ ТРИ ПОХОЖИХ. Пока путей было три
+  // (каталожная вещь, новинка без файла, новинка с файлом), каждый закрывал
+  // форму по-своему, и память о начатой новинке снималась только в одном из
+  // них. Ревью нашло ровно это: успешно сохранённая вещь каталога оставляла
+  // `itemId` от прежней неудачной новинки, и следующая новинка с эскизом
+  // переписывала СТАРУЮ строку вместо создания своей.
+  function closeItemForm(form) {
+    resetToken(form);
+    draftItemId(form, 0);
+    form.hidden = true;
+    clear(form);
+    // Содержимое формы стёрто целиком, поэтому режим прикрепления снимать не с
+    // чего — но номер снят выше, и следующая сборка начнёт с чистого листа.
+    var add = byId("pl-add-item");
+    if (add) add.setAttribute("aria-expanded", "false");
+  }
+
+  function draftItemId(form, value) {
+    if (value !== undefined) {
+      if (value) form.dataset.itemId = String(value);
+      else delete form.dataset.itemId;
+    }
+    var raw = Number(form.dataset.itemId);
+    return isFinite(raw) && raw > 0 ? raw : 0;
+  }
+
+  //: ФОРМА, У КОТОРОЙ ВЕЩЬ УЖЕ СОЗДАНА, БОЛЬШЕ НЕ ПРАВИТ ПОЛЯ — И ЭТО НЕ
+  //: УПРОЩЕНИЕ РАДИ УПРОЩЕНИЯ, А ВЫВОД ИЗ ДЕСЯТИ РАУНДОВ РЕВЬЮ.
+  //:
+  //: Сохранение новинки с эскизом идёт двумя запросами (ТЗ F-23а): сначала
+  //: вещь, потом файл к ней. Между ними бывает отказ — и первая редакция
+  //: оставляла форму полностью живой: правь имя, правь заметку, меняй файл,
+  //: жми снова. Каждое такое состояние приходилось согласовывать с сервером
+  //: вручную: чья это правка, какая сейчас редакция, не долетела ли наша
+  //: предыдущая, не обрезал ли сервер края строки. Ревью нашло в этой сверке
+  //: пять дефектов подряд — от затирания чужой правки повтором до вечного
+  //: отказа после потерянного ответа, — и каждый раз чинилась ОДНА ветка
+  //: разросшегося дерева состояний.
+  //:
+  //: Поэтому дерево срублено, а не подстрижено. Как только вещь создана, форма
+  //: переходит в одно понятное состояние: «вещь сохранена, осталось прикрепить
+  //: эскиз». Текстовые поля становятся только для чтения и показывают ровно то,
+  //: что записано, — ничего не теряется и не прячется. Правка имени и заметки
+  //: живёт там, где ей и место: на карточке вещи, кнопкой «Изменить».
+  //:
+  //: Что это убирает целиком: сверку снимка с доской, переоснование редакции,
+  //: распознавание собственной применившейся правки, нормализацию краёв строки.
+  //: Ни одного из этих механизмов больше нет — вместе с классом ошибок, который
+  //: они порождали. Остаётся один вопрос: прикрепить файл или нет.
+  function paintItemAttachMode(form) {
+    var lock = !!draftItemId(form);
+    ["pl-item-title", "pl-item-note"].forEach(function (id) {
+      var node = byId(id);
+      if (!node) return;
+      // `readOnly`, а не `disabled`: отключённое поле браузер красит серым и
+      // не даёт из него копировать — человек должен ВИДЕТЬ сохранённое, а не
+      // смотреть на серый прямоугольник.
+      node.readOnly = lock;
+      node.setAttribute("aria-readonly", lock ? "true" : "false");
+    });
+    var kind = byId("pl-item-kind");
+    if (kind) kind.disabled = lock;
+    var hint = byId("pl-item-attach-hint");
+    if (hint) hint.hidden = !lock;
+  }
+
+  // ВЕЩЬ УЖЕ СОЗДАНА — ЗНАЧИТ ОСТАЛСЯ ТОЛЬКО ЭСКИЗ. Возвращает true, если
+  // отправка взята на себя.
+  //
+  // Файла нет — значит человек решил обойтись без картинки: писать нечего. Но
+  // и закрыться молча нельзя: если ответ прикрепления потерялся, сервер уже
+  // хранит картинку, а доска у формы — от создания и без неё. Экран, который
+  // расходится с данными, это стоп-условие `AGENTS.md` §3, поэтому доска
+  // перечитывается одним дешёвым чтением.
+  function finishStartedItem(form, fileObj) {
+    var known = draftItemId(form);
+    if (!known) return false;
+    if (fileObj) {
+      attachSketchToItem(form, known, fileObj, null);
+      return true;
+    }
+    if (PL.saving) return true;
+    PL.saving = true;
+    paintSaving(true);
+    setError("pl-error", "");
+    setError("pl-item-err", "");
+    api("/api/supply/planning")
+      .then(function (board) {
+        PL.board = board;
+        render();
+        plToast("Сохранено", {ms: 3000});
+        flash("item", known);
+        closeItemForm(form);
+      })
+      .catch(function (err) {
+        setError("pl-item-err",
+                 (err && err.message) ? err.message : "Попробуйте ещё раз.");
+      })
+      .then(function () { PL.saving = false; paintSaving(false); });
+    return true;
+  }
+
+  // ПРИКРЕПЛЕНИЕ ФАЙЛА К УЖЕ СОЗДАННОЙ ВЕЩИ — один запрос и один исход.
+  // `before` нужен только первому проходу: подсветить появившуюся строку.
+  function attachSketchToItem(form, itemId, fileObj, before) {
+    if (PL.saving) return;
+    PL.saving = true;
+    paintSaving(true);
+    setError("pl-error", "");
+    setError("pl-item-err", "");
+    sketchThumb(fileObj)
+      .then(function (thumb) {
+        var fd = new FormData();
+        fd.append("file", fileObj);
+        if (thumb) fd.append("thumb", thumb, "thumb.png");
+        return fetch("/api/supply/planning/items/" + itemId + "/sketch", {
+          method: "POST", body: fd, credentials: "same-origin",
+          headers: {"X-Oborot-CSRF": "1"},
+        }).then(function (r) {
+          return r.json().then(function (j) { return {ok: r.ok, j: j}; },
+                               function () { return {ok: r.ok, j: null}; });
+        }).then(function (res) {
+          if (!res.ok) {
+            throw new Error((res.j && res.j.detail) || "Эскиз не принят.");
+          }
+          return res.j;
+        });
+      })
+      .then(function (board) {
+        PL.board = board;
+        render();
+        plToast("Сохранено", {ms: 3000});
+        flash("item", before ? onlyNew("item", before) : itemId);
+        closeItemForm(form);
+      })
+      .catch(function (err) {
+        var msg = (err && err.message) ? err.message : "Попробуйте ещё раз.";
+        // Человек обязан знать, в каком он состоянии: вещь уже сохранена, не
+        // хватает только картинки. Иначе «Не сохранено» читается как «ничего
+        // не произошло», и он заводит ту же новинку заново руками.
+        msg += " Вещь уже сохранена — выберите другой файл и нажмите "
+               + "«Сохранить» ещё раз или закройте форму.";
+        setError("pl-item-err", msg);
+      })
+      .then(function () { PL.saving = false; paintSaving(false); });
+  }
+
+  // СОХРАНЕНИЕ НОВИНКИ С ЭСКИЗОМ — ДВА ЗАПРОСА В НАЗВАННОМ ПОРЯДКЕ (F-23а):
+  // сначала вещь, потом байты к ней. Своя ветка нужна потому, что `send()`
+  // умеет ровно один запрос и отдаёт результат уже после того, как снял свой
+  // замок; вложить в него второй запрос значило бы либо отпустить кнопки на
+  // время загрузки файла, либо переписать общую функцию ради одного случая.
+  //
+  // ЧТО ПРОИСХОДИТ ПРИ ОТКАЗЕ НА ВТОРОМ ШАГЕ. Вещь уже создана, эскиз — нет.
+  // Форма остаётся открытой с ошибкой и переходит в режим прикрепления: поля
+  // становятся только для чтения, номер созданной вещи живёт на форме. Повтор
+  // отправляет ТОЛЬКО файл — второй вещи не появляется, а править имя и
+  // заметку человек идёт на карточку, где для этого есть «Изменить».
+  function submitDraftWithSketch(form, body, fileObj) {
+    if (PL.saving) return;
+    PL.saving = true;
+    paintSaving(true);
+    setError("pl-error", "");
+    setError("pl-item-err", "");
+    var before = idsOf("item");
+    api("/api/supply/planning/items", {method: "POST", body: body})
+      .then(function (data) {
+        var itemId = data && data.item_id;
+        if (!itemId) {
+          throw new Error("Вещь сохранена, но эскиз прикрепить не к чему. "
+                          + "Обновите страницу.");
+        }
+        // ДОСКА ОБНОВЛЯЕТСЯ СРАЗУ ПОСЛЕ СОЗДАНИЯ, А НЕ В САМОМ КОНЦЕ. Вещь уже
+        // записана: держать её в тайне от экрана до конца второго запроса
+        // значило бы показывать состояние, которого на сервере больше нет.
+        if (data.items) {
+          PL.board = data;
+          render();
+        }
+        draftItemId(form, itemId);
+        paintItemAttachMode(form);
+        return itemId;
+      })
+      .then(function (itemId) {
+        PL.saving = false;
+        paintSaving(false);
+        attachSketchToItem(form, itemId, fileObj, before);
+      })
+      .catch(function (err) {
+        setError("pl-item-err",
+                 (err && err.message) ? err.message : "Попробуйте ещё раз.");
+        PL.saving = false;
+        paintSaving(false);
+      });
   }
 
   function dueFields(form, prefix, current) {
@@ -2611,8 +2919,17 @@ document.addEventListener("DOMContentLoaded", function () {
       card.appendChild(line);
     });
 
+    // ИСТОРИЯ ВИДНА И УЧАСТНИКУ, ПОЭТОМУ РЯД КНОПОК СОБИРАЕТСЯ ДО ПРОВЕРКИ
+    // ПРАВ (F-24). Чтение прежних значений своей организации — не запись, и
+    // прятать его за `can_write` значило бы прятать от участника то, что он и
+    // так видит на карточке, только в прошедшем времени.
+    //
+    // Сама кнопка добавляется ПОСЛЕДНЕЙ — после действий, которые что-то
+    // делают. Порядок здесь не украшение: «Назначить» и «Изменить» — то, зачем
+    // человек пришёл на карточку, а история — то, куда он заглядывает, когда
+    // что-то не сходится.
+    var actions = el("div", "pl-actions");
     if (PL.board && PL.board.can_write) {
-      var actions = el("div", "pl-actions");
       var assign = inlineButton(card, "Назначить на партию", "assign",
                                 function (box) { buildAssignForm(box, m); });
       assign.dataset.material = String(m.id);
@@ -2651,8 +2968,12 @@ document.addEventListener("DOMContentLoaded", function () {
         });
       });
       actions.appendChild(drop);
-      card.appendChild(actions);
     }
+    actions.appendChild(inlineButton(card, "История", "history",
+                                     function (box) {
+                                       buildHistory(box, "material", m.id);
+                                     }));
+    card.appendChild(actions);
     return card;
   }
 
@@ -2698,6 +3019,51 @@ document.addEventListener("DOMContentLoaded", function () {
     var n = Number(rev);
     if (isFinite(n)) form.dataset.rev = String(n);
     return function () { return form.dataset.rev; };
+  }
+
+  // ── История строки (F-24) ────────────────────────────────────────────────
+  //
+  // Журнал в проекте был с самого начала слоя, но прочитать его человеку было
+  // негде: он существовал только в базе. Здесь он становится тем, ради чего
+  // заводился, — ответом на вопрос «кто поменял срок и что там стояло раньше».
+  //
+  // Читают и владелец, и участник — ровно как всю остальную доску: история не
+  // показывает ничего, кроме прежних значений СВОЕЙ организации.
+  function buildHistory(box, kind, id) {
+    var list = el("div", "pl-hist");
+    box.appendChild(list);
+    list.appendChild(el("div", "sub", "Загружаем историю…"));
+    api("/api/supply/planning/events?entity=" + kind + "&id=" + id)
+      .then(function (data) {
+        clear(list);
+        var rows = (data && data.events) || [];
+        if (!rows.length) {
+          list.appendChild(el("div", "sub", "Правок пока не было."));
+          return;
+        }
+        rows.forEach(function (e) {
+          var line = el("div", "pl-hist-row");
+          line.appendChild(el("span", "who",
+            (e.at_label || "") + " · " + (e.author || "—") + " · "));
+          if (e.action === "update" && e.field) {
+            line.appendChild(el("span", null, (e.field_label || e.field) + ": "));
+            // ПРЕЖНЕЕ ЗНАЧЕНИЕ ПОКАЗЫВАЕТСЯ ЗАЧЁРКНУТЫМ, а не пропадает: весь
+            // смысл журнала в том, что было ДО, — иначе строка сообщала бы то
+            // же, что и сама карточка.
+            line.appendChild(el("span", "pl-hist-old", e.old || "пусто"));
+            line.appendChild(el("span", null, " → "));
+            line.appendChild(el("b", null, e.new || "пусто"));
+          } else {
+            line.appendChild(el("span", null, e.action_label || e.action));
+            if (e.new) line.appendChild(el("span", null, ": " + e.new));
+          }
+          list.appendChild(line);
+        });
+      })
+      .catch(function () {
+        clear(list);
+        list.appendChild(el("div", "sub", "История не загрузилась."));
+      });
   }
 
   function inlineButton(card, label, name, build) {
@@ -3034,11 +3400,25 @@ document.addEventListener("DOMContentLoaded", function () {
     card.dataset.id = String(b.id);
     var row = el("div", "pl-row");
     if (b.item_sketch_id) {
+      // В КАРТОЧКЕ — МИНИАТЮРА, ПОЛНЫЙ РАЗМЕР ПО КЛИКУ (F-23б). Раньше сюда
+      // подставлялся файл целиком: под сорок четыре точки на экране браузер
+      // качал два мегабайта, и делал это на каждой карточке.
+      //
+      // Ссылка ведёт на ту же приватную ручку, а не на публичный адрес: без
+      // сессии по ней ничего не отдаётся, и «открыть в новой вкладке» не
+      // означает «показать всему интернету».
       var img = el("img", "pl-sketch");
-      img.src = "/api/supply/planning/sketches/" + b.item_sketch_id;
+      var base = "/api/supply/planning/sketches/" + b.item_sketch_id;
+      img.src = base + "/thumb";
       img.alt = "Эскиз: " + b.item_title;
       img.loading = "lazy";
-      row.appendChild(img);
+      var open = el("a", "pl-sketch-link");
+      open.href = base;
+      open.target = "_blank";
+      open.rel = "noopener";
+      open.title = "Открыть эскиз в полном размере";
+      open.appendChild(img);
+      row.appendChild(open);
     }
     var grow = el("div", "grow");
     var head = el("div", "t");
@@ -3123,8 +3503,10 @@ document.addEventListener("DOMContentLoaded", function () {
       card.appendChild(line);
     });
 
+    // Тот же порядок, что у материала: история — чтение, участнику она доступна
+    // наравне с владельцем, и стоит она последней в ряду (F-24).
+    var actions = el("div", "pl-actions");
     if (PL.board && PL.board.can_write) {
-      var actions = el("div", "pl-actions");
       // F-13(б): кнопка называлась «План и срок» и правила ровно их. Название
       // партии и заметка к плану из интерфейса не менялись вовсе, хотя оба поля
       // человек вводит при создании — то есть опечатку в названии исправить
@@ -3181,8 +3563,12 @@ document.addEventListener("DOMContentLoaded", function () {
         });
       });
       actions.appendChild(drop);
-      card.appendChild(actions);
     }
+    actions.appendChild(inlineButton(card, "История", "history",
+                                     function (box) {
+                                       buildHistory(box, "batch", b.id);
+                                     }));
+    card.appendChild(actions);
     return card;
   }
 

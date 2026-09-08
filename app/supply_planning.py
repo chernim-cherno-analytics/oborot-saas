@@ -53,7 +53,7 @@ from __future__ import annotations
 import hashlib
 import re
 import struct
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
@@ -64,6 +64,8 @@ from app.models import (
     SKETCH_MAX_BYTES,
     SKETCH_MAX_SIDE,
     SKETCH_MIME_TYPES,
+    SKETCH_THUMB_MAX_BYTES,
+    SKETCH_THUMB_MAX_SIDE,
     SUPPLY_DUE_KINDS,
     SUPPLY_ITEM_KINDS,
     SupplyAssignment,
@@ -126,10 +128,6 @@ class NotFound(PlanningError):
 
 class StaleWrite(PlanningError):
     """Строку изменили, пока её правили, — 409 с текущим состоянием."""
-
-
-class DuplicateOp(PlanningError):
-    """Тот же поступок уже записан — повторный POST не применяется дважды."""
 
 
 class ArchivedCatalogItem(PlanningError):
@@ -443,6 +441,10 @@ def ru_date(iso: str, *, short: bool = False) -> str:
 #: Названия видов срока ДЛЯ ТЕКСТА ОШИБКИ. Ровно те слова, которые человек
 #: видит в списке на экране: ошибка, называющая внутренний код `text`, требует
 #: от него перевода, которого он не обязан знать.
+#: Поля, из которых состоит сам срок. Источник (`due_source`) сюда НЕ входит: он
+#: рядом со сроком, а не внутри него, и журналируется отдельной записью.
+_DUE_FIELDS = ("due_kind", "due_text", "due_date")
+
 DUE_KIND_LABELS = {
     "unknown": "неизвестен",
     "approx": "ориентировочно",
@@ -581,12 +583,86 @@ def sniff_image(data: bytes) -> tuple[str, int, int]:
     return mime, width, height
 
 
-def save_sketch(db: Session, org_id: int, data: bytes, author: str) -> SupplySketch:
-    """Кладёт эскиз в базу. Байты — в BLOB, чтобы их забрал штатный бэкап."""
+def sniff_thumb(data: bytes) -> tuple[int, int]:
+    """Разбирает МИНИАТЮРУ и говорит её размеры. PNG, сторона ≤128, ≤64 КБ.
+
+    Миниатюру рисует браузер (`canvas.toDataURL("image/png")`), потому что
+    Pillow в замыкании зависимостей проекта отсутствует, а ТЗ F-23 назвало этот
+    путь прямо и запретило заводить ради миниатюры новую библиотеку. Отсюда
+    главное свойство этой функции: она проверяет ПРИСЛАННОЕ, а не доверяет
+    ему. Клиент может нарисовать что угодно и назвать это миниатюрой; сторона,
+    формат и объём читаются из самих байтов тем же разбором, что и у полного
+    эскиза.
+
+    Только PNG. JPEG здесь не нужен: миниатюру мы не переносим из чужого файла,
+    а рисуем сами, и второй допустимый формат означал бы вторую ветку разбора
+    ради ничего.
+    """
+    if len(data) > SKETCH_THUMB_MAX_BYTES:
+        raise ValidationError(
+            f"Миниатюра больше {SKETCH_THUMB_MAX_BYTES // 1024} КБ.")
     mime, width, height = sniff_image(data)
+    if mime != "image/png":
+        raise ValidationError("Миниатюра принимается только в PNG.")
+    if width > SKETCH_THUMB_MAX_SIDE or height > SKETCH_THUMB_MAX_SIDE:
+        raise ValidationError(
+            f"Миниатюра не больше {SKETCH_THUMB_MAX_SIDE}×"
+            f"{SKETCH_THUMB_MAX_SIDE} пикселей.")
+    return width, height
+
+
+def save_sketch(db: Session, org_id: int, data: bytes, author: str,
+                thumb: bytes | None = None) -> SupplySketch:
+    """Кладёт эскиз в базу. Байты — в BLOB, чтобы их забрал штатный бэкап.
+
+    ДЕДУП ПО СОДЕРЖИМОМУ, И КЛЮЧ ВСЕГДА ПАРНЫЙ (ТЗ F-23д). Одна и та же
+    картинка, загруженная второй раз в ТОЙ ЖЕ организации, возвращает
+    существующую строку вместо второй копии: два мегабайта одинаковых байтов
+    лежат в базе и в каждом бэкапе дважды безо всякой пользы. Ключ — пара
+    (организация, `sha256`), и разделять её нельзя ни при каком удобстве:
+    склейка по одному хэшу означала бы, что эскиз одной организации выдаётся
+    другой по её собственному `sketch_id`.
+
+    Совпадение хэша при разных байтах здесь не рассматривается как угроза
+    подмены: sha256 столкновений не даёт, а если бы давал — обе стороны
+    коллизии всё равно принадлежали бы одной организации.
+
+    Миниатюра догружается к уже существующей строке, если её там нет: эскиз мог
+    быть загружен старым путём (или до этого пакета), и отказать ему в
+    миниатюре навсегда только потому, что байты уже знакомы, значило бы наказать
+    человека за дедуп.
+
+    У переиспользованной строки обновляется `created_at`. Колонка здесь значит
+    «когда эти байты в последний раз появились в организации», а не «когда их
+    впервые записали»: после дедупа строка одна на все одинаковые загрузки, и
+    первая из них ничем не важнее последней. От этого времени считается возраст
+    сироты — и без сдвига только что выданный номер мог быть убран следующей же
+    уборкой, до того как старый клиент успеет создать вещь.
+    """
+    mime, width, height = sniff_image(data)
+    if thumb is not None:
+        sniff_thumb(thumb)
+    digest = hashlib.sha256(data).hexdigest()
+    same = db.execute(
+        select(SupplySketch).where(SupplySketch.org_id == org_id,
+                                   SupplySketch.sha256 == digest).limit(1)
+    ).scalars().first()
+    if same is not None:
+        if thumb is not None and not same.thumb:
+            same.thumb = bytes(thumb)
+        # ЧАСЫ СИРОТЫ ИДУТ ОТ ПОСЛЕДНЕЙ ВЫДАЧИ, А НЕ ОТ ПЕРВОЙ ЗАГРУЗКИ. Строка
+        # после дедупа представляет ВСЕ загрузки этих байтов, а не одну первую,
+        # и «когда её завели» для неё — величина приблизительная по построению.
+        # Практический смысл прямой: старая ручка отдаёт номер клиенту, который
+        # придёт за вещью следующим запросом, и уборка не должна успеть убрать
+        # этот номер в промежутке. `keep` защищает только текущий проход;
+        # сдвинутое время — все последующие.
+        same.created_at = datetime.utcnow()
+        return same
     row = SupplySketch(
         org_id=org_id, mime=mime, byte_len=len(data), width=width, height=height,
-        sha256=hashlib.sha256(data).hexdigest(), data=bytes(data), author=author,
+        sha256=digest, data=bytes(data), author=author,
+        thumb=(bytes(thumb) if thumb is not None else None),
     )
     db.add(row)
     db.flush()
@@ -597,6 +673,108 @@ def get_sketch(db: Session, org_id: int, sketch_id: int) -> SupplySketch:
     row = db.get(SupplySketch, sketch_id)
     if row is None or row.org_id != org_id:
         raise NotFound("Эскиз не найден.")
+    return row
+
+
+#: Сколько сирот убирается за один проход. Потолок нужен затем, чтобы уборка
+#: не превращала обычное сохранение картинки в долгую транзакцию: организация,
+#: накопившая тысячу сирот, разберёт их за несколько сохранений, а не за одно.
+SKETCH_ORPHAN_BATCH = 50
+
+#: Сколько сирота живёт до уборки (ТЗ F-23г). Сутки — не осторожность ради
+#: осторожности: эскиз законно существует БЕЗ вещи ровно между двумя запросами
+#: старого пути загрузки, и слишком короткий срок унёс бы картинку из-под
+#: человека, который в этот момент дозаполняет форму.
+SKETCH_ORPHAN_HOURS = 24
+
+
+def cleanup_orphan_sketches(db: Session, org_id: int, *,
+                            hours: int = SKETCH_ORPHAN_HOURS,
+                            limit: int = SKETCH_ORPHAN_BATCH,
+                            keep: int | None = None) -> int:
+    """Убирает эскизы СВОЕЙ организации, на которые не ссылается ни одна вещь.
+
+    Откуда берутся сироты. До этого пакета страница отправляла файл ДО создания
+    вещи, и каждая ошибка валидации формы оставляла в базе до двух мегабайт,
+    которые больше никогда никто не открывал, — а лежали они и в базе, и в
+    каждом ночном бэкапе. Порядок теперь обратный (F-23а), но старая ручка
+    осталась ради совместимости, да и накопленное за прежние недели никуда не
+    делось: убирать его всё равно нужно.
+
+    ССЫЛКА ИЩЕТСЯ ПО ВСЕМ ВЕЩАМ, ВКЛЮЧАЯ АРХИВНЫЕ, и это главное правило
+    функции. Архивная вещь — не удалённая: её возвращают одной кнопкой, и
+    вернуться она обязана с картинкой. Фильтр `archived_at IS NULL` здесь
+    выглядел бы уместно ровно до того дня, когда кто-нибудь вернул бы новинку и
+    увидел пустой квадрат вместо эскиза.
+
+    Возраст считается от `created_at`, потому что другого времени у строки нет,
+    и сравнивается с UTC — тем же временем, которым строка создаётся.
+
+    `keep` — НОМЕР, КОТОРЫЙ ЭТОТ ЗАПРОС ТОЛЬКО ЧТО ВЕРНУЛ ЧЕЛОВЕКУ, и трогать
+    его нельзя ни при каком возрасте. Случай не выдуманный: дедуп по содержимому
+    отдаёт СТАРУЮ строку, а она вполне может быть сиротой старше суток. У
+    прикрепления к вещи ссылка появляется сразу (и `db.flush()` выше делает её
+    видимой), а вот старая ручка `POST /sketches` вещи ещё не знает — ссылки нет
+    и не будет до следующего запроса. Без этой защиты она отвечала 200 с номером
+    строки, которую сама же в этом запросе и удалила.
+    """
+    # СНАЧАЛА СБРАСЫВАЕМ НЕЗАПИСАННОЕ, ПОТОМ СПРАШИВАЕМ, ЧТО НИЧЬЁ. Сессия слоя
+    # создана с `autoflush=False`, поэтому только что проставленный
+    # `item.sketch_id` живёт в памяти и в SELECT ниже не виден. Без этой строки
+    # уборка честно не находила ссылку на эскиз, который прикрепили секунду
+    # назад, и удаляла его: при дедупе повторной загрузки тех же байтов
+    # `save_sketch` возвращает СТАРУЮ строку — а она как раз и могла быть
+    # сиротой старше суток. Вещь оставалась с номером удалённой картинки.
+    db.flush()
+    cutoff = datetime.utcnow() - timedelta(hours=hours)
+    referenced = select(SupplyItem.sketch_id).where(
+        SupplyItem.org_id == org_id, SupplyItem.sketch_id.is_not(None))
+    conditions = [SupplySketch.org_id == org_id,
+                  SupplySketch.created_at < cutoff,
+                  SupplySketch.id.not_in(referenced)]
+    if keep is not None:
+        conditions.append(SupplySketch.id != keep)
+    doomed = db.execute(
+        select(SupplySketch.id).where(*conditions).limit(limit)
+    ).scalars().all()
+    if not doomed:
+        return 0
+    for row_id in doomed:
+        row = db.get(SupplySketch, row_id)
+        # Проверка организации повторяется у самой строки, а не только в
+        # условии выборки: удаление — не то место, где стоит экономить на
+        # втором вопросе о том, чьё это.
+        if row is not None and row.org_id == org_id:
+            db.delete(row)
+    db.flush()
+    return len(doomed)
+
+
+def attach_sketch(db: Session, org_id: int, item_id: int, data: bytes,
+                  thumb: bytes | None, author: str) -> SupplySketch:
+    """Прикрепляет эскиз к УЖЕ СУЩЕСТВУЮЩЕЙ новинке (ТЗ F-23а).
+
+    Порядок «сначала вещь, потом файл» — это и есть исправление: пока файл
+    уходил первым, каждая ошибка валидации формы (не заполнено название,
+    отказ по длине заметки) оставляла в базе картинку, которой не на чем
+    висеть. Теперь байты отправляются только после того, как вещь создана, и
+    сирота может появиться лишь при отказе САМОГО прикрепления — то есть
+    тогда, когда эскиз и не сохранился.
+
+    Эскиз остаётся принадлежностью новинки: у каталожной вещи есть каталог, и
+    прикреплять к ней картинку по-прежнему нельзя (то же правило, что в
+    `create_item` и `update_item`, а не второе на том же месте).
+    """
+    item = get_item(db, org_id, item_id)
+    if item.kind == "catalog":
+        raise ValidationError("Эскиз прикрепляется только к новинке.")
+    row = save_sketch(db, org_id, data, author, thumb=thumb)
+    if item.sketch_id != row.id:
+        _journal(db, org_id, "item", item.id, "update", field="sketch",
+                 old="" if item.sketch_id is None else item.sketch_id,
+                 new=row.id, author=author)
+        item.sketch_id = row.id
+        _touch(item)
     return row
 
 
@@ -631,6 +809,138 @@ def check_op(db: Session, org_id: int, op_id: str) -> bool:
 def parse_op_id(payload: dict) -> str:
     return clean_text(payload.get("op_id"), "идентификатор действия",
                       limit=MAX_OP_ID_CHARS)
+
+
+#: Сколько записей журнала отдаётся на одну сущность (ТЗ F-24). Не «сколько
+#: влезет»: история читается человеком с экрана, и пятьдесят последних правок —
+#: это уже больше, чем кто-либо просматривает подряд.
+EVENTS_LIMIT = 50
+
+
+def find_op_entity(db: Session, org_id: int, op_id: str, kind: str) -> int | None:
+    """Какую строку записал ЭТОТ поступок. Нужен повтору после потери ответа.
+
+    Зачем это существует. Новинка с эскизом сохраняется в два запроса: сначала
+    вещь, потом файл к ней (ТЗ F-23а). Если ответ на первый потерялся, человек
+    нажимает «Сохранить» ещё раз — замок повторного поступка честно узнаёт тот
+    же `op_id` и НИЧЕГО не записывает, отвечая успехом. Но страница в этот
+    момент держит в руках выбранный файл, и прикрепить его ей не к чему: номера
+    созданной вещи в таком ответе нет.
+
+    Номер берётся из журнала — оттуда же, откуда замок узнаёт о повторе. Это не
+    второй источник правды, а тот же самый: запись поступка и есть след того,
+    что было сделано.
+    """
+    if not op_id:
+        return None
+    found = db.execute(
+        select(SupplyEvent.entity_id).where(SupplyEvent.org_id == org_id,
+                                            SupplyEvent.op_id == op_id,
+                                            SupplyEvent.entity_kind == kind)
+        .limit(1)
+    ).first()
+    return int(found[0]) if found else None
+
+#: Названия полей по-русски. ОДИН словарь на сервере, а не второй такой же на
+#: странице: разъехавшись, они показали бы одному и тому же полю два разных
+#: имени, и человек решил бы, что менялись разные вещи.
+EVENT_FIELD_LABELS = {
+    "title": "название",
+    "qty": "количество",
+    "unit": "единица",
+    "source_note": "источник",
+    "note": "заметка",
+    "note_truncated": "заметка (полный текст)",
+    "plan_qty": "план изделий",
+    "plan_note": "заметка к плану",
+    "due": "срок",
+    "due_source": "источник срока",
+    "sketch": "эскиз",
+    "archived": "убрано с доски",
+}
+
+#: Что сделали. Действие и поле — разные вещи: «убрали» и «вернули» это не
+#: правка поля, и называть их «поле archived: было → стало» значило бы
+#: показывать человеку устройство таблицы вместо его собственного поступка.
+EVENT_ACTION_LABELS = {
+    "create": "создано",
+    "update": "изменено",
+    "delete": "снято",
+    "move": "перенесено",
+    "archive": "убрано с доски",
+    "restore": "возвращено на доску",
+}
+
+#: Виды сущностей, у которых история читается снаружи, и способ проверить, что
+#: строка СВОЯ. Проверка идёт через те же функции, что и обычное чтение, поэтому
+#: чужой и несуществующий идентификатор дают один и тот же 404 — как и везде в
+#: этом слое.
+_EVENT_ENTITY_KINDS = ("material", "item", "batch", "assignment")
+
+
+def _event_when(moment) -> str:
+    """«7 сентября 2026, 20:44» — дата словами и время сервера рядом с ней."""
+    if not moment:
+        return ""
+    return f"{ru_date(moment.date().isoformat())}, {moment.strftime('%H:%M')}"
+
+
+def read_events(db: Session, org_id: int, kind: str, entity_id: int,
+                limit: int = EVENTS_LIMIT) -> dict:
+    """История одной строки: кто, когда и что было до правки (ТЗ F-24).
+
+    ЧИТАЮТ ВЛАДЕЛЕЦ И УЧАСТНИК — как и всю остальную доску: история не
+    рассказывает ничего, чего не видно на карточке, кроме прежних значений
+    СВОЕЙ организации. Запись сюда не приходит вовсе: это чтение.
+
+    ПРИНАДЛЕЖНОСТЬ ПРОВЕРЯЕТСЯ У САМОЙ СТРОКИ, А НЕ ТОЛЬКО У ЖУРНАЛА. Запросить
+    события с чужим `id` и получить пустой список — значит рассказать, что такой
+    строки у нас нет, а с существующим — что есть. Поэтому строка сначала
+    ищется обычным способом (`get_*`), и чужая даёт тот же 404 и тот же текст,
+    что и несуществующая.
+
+    Архивные строки историю отдают: убранное — не удалённое, и «что там было до
+    того, как это убрали» спрашивают как раз о них.
+    """
+    if kind not in _EVENT_ENTITY_KINDS:
+        raise ValidationError("Неизвестный вид записи.")
+    if kind == "material":
+        get_material(db, org_id, entity_id, include_archived=True)
+    elif kind == "item":
+        get_item(db, org_id, entity_id, include_archived=True)
+    elif kind == "batch":
+        get_batch(db, org_id, entity_id, include_archived=True)
+    else:
+        get_assignment(db, org_id, entity_id, include_archived=True)
+    limit = max(1, min(int(limit or EVENTS_LIMIT), EVENTS_LIMIT))
+    rows = db.execute(
+        select(SupplyEvent).where(SupplyEvent.org_id == org_id,
+                                  SupplyEvent.entity_kind == kind,
+                                  SupplyEvent.entity_id == entity_id)
+        .order_by(SupplyEvent.id.desc()).limit(limit)
+    ).scalars().all()
+    return {
+        "entity": kind,
+        "id": entity_id,
+        "limit": limit,
+        "events": [{
+            "id": e.id,
+            "at": e.created_at.isoformat() if e.created_at else "",
+            # Дата по-русски и время рядом — ОДНИМ местом, здесь (D-58 п. 3).
+            # Считать её на странице значило бы завести второй формат даты и
+            # заодно пересчитать время в часовой пояс браузера: тогда два
+            # человека увидели бы у одной правки разное время, а в базе оно
+            # лежит одно.
+            "at_label": _event_when(e.created_at),
+            "author": e.author or "",
+            "action": e.action,
+            "action_label": EVENT_ACTION_LABELS.get(e.action, e.action),
+            "field": e.field,
+            "field_label": EVENT_FIELD_LABELS.get(e.field, e.field),
+            "old": e.old_value,
+            "new": e.new_value,
+        } for e in rows],
+    }
 
 
 def _rev_guard(row, payload: dict, name: str) -> None:
@@ -709,9 +1019,19 @@ def create_material(db: Session, org_id: int, payload: dict, author: str) -> Sup
 
 def update_material(db: Session, org_id: int, material_id: int,
                     payload: dict, author: str) -> SupplyMaterial:
+    """Правка материала. Каждое изменённое поле уходит в журнал (ТЗ F-24).
+
+    ПРАВКА, КОТОРАЯ НИЧЕГО НЕ МЕНЯЕТ, НЕ ЯВЛЯЕТСЯ ПРАВКОЙ. Прежде `_touch`
+    стоял безусловно: отправка тех же самых значений двигала редакцию строки —
+    и все открытые в других окнах формы становились устаревшими из-за действия,
+    которого не было. Теперь редакция растёт только вместе с изменением; всё
+    остальное в защите от чужой перезаписи прежнее и не ослаблено —
+    `_rev_guard` выше по-прежнему отвечает 409 на устаревшую редакцию.
+    """
     row = get_material(db, org_id, material_id)
     _rev_guard(row, payload, "Материал")
     op_id = parse_op_id(payload)
+    changed = False
     if "title" in payload:
         new = clean_text(payload.get("title"), "название",
                          limit=MAX_TITLE_CHARS, required=True)
@@ -720,6 +1040,7 @@ def update_material(db: Session, org_id: int, material_id: int,
                      old=row.title, new=new, author=author, op_id=op_id)
             op_id = ""          # один поступок — одна запись с этим op_id
             row.title = new
+            changed = True
     if "qty" in payload:
         new_qty = parse_qty(payload.get("qty"), "количество", allow_unknown=True)
         if new_qty != row.qty:
@@ -729,9 +1050,22 @@ def update_material(db: Session, org_id: int, material_id: int,
                      author=author, op_id=op_id)
             op_id = ""
             row.qty = new_qty
+            changed = True
     if "source_note" in payload:
-        row.source_note = clean_text(payload.get("source_note"),
-                                     "источник или комментарий", limit=MAX_NOTE_CHARS)
+        # ИСТОЧНИК МАТЕРИАЛА ТЕПЕРЬ ЖУРНАЛИРУЕТСЯ (ТЗ F-24). До этого пакета он
+        # молча присваивался: «куплено у Иванова, счёт 12» превращалось в «взяли
+        # у соседей» без единого следа, и восстановить прежний текст было
+        # неоткуда. Поле хранит происхождение ткани — ровно тот род сведений,
+        # к которому возвращаются через полгода.
+        new_note = clean_text(payload.get("source_note"),
+                              "источник или комментарий", limit=MAX_NOTE_CHARS)
+        if new_note != (row.source_note or ""):
+            _journal(db, org_id, "material", row.id, "update",
+                     field="source_note", old=row.source_note or "",
+                     new=new_note, author=author, op_id=op_id)
+            op_id = ""
+            row.source_note = new_note
+            changed = True
     if "unit" in payload:
         # ЕДИНИЦА ЖУРНАЛИРУЕТСЯ (F-13). До этого пакета её можно было поменять
         # только программно, и следа не оставалось: «120» превращалось из метров
@@ -746,7 +1080,9 @@ def update_material(db: Session, org_id: int, material_id: int,
                      old=row.unit, new=new_unit, author=author, op_id=op_id)
             op_id = ""
             row.unit = new_unit
-    _touch(row)
+            changed = True
+    if changed:
+        _touch(row)
     return row
 
 
@@ -993,10 +1329,14 @@ def update_item(db: Session, org_id: int, item_id: int, payload: dict,
     `kind` не меняется тоже: новинка и вещь каталога — разные тождества, а не
     два состояния одной строки. Превращение одной в другую — это удалить и
     завести заново, и решать это человеку, а не переключателю.
+
+    Правка, не изменившая ни одного поля, редакцию не двигает (ТЗ F-24) — то же
+    правило и по той же причине, что у материала.
     """
     row = get_item(db, org_id, item_id)
     _rev_guard(row, payload, "Вещь")
     op_id = parse_op_id(payload)
+    changed = False
 
     if clean_text(payload.get("base_name"), "модель",
                   limit=MAX_TITLE_CHARS):
@@ -1020,6 +1360,7 @@ def update_item(db: Session, org_id: int, item_id: int, payload: dict,
                      old=row.title, new=new_title, author=author, op_id=op_id)
             op_id = ""
             row.title = new_title
+            changed = True
 
     if "note" in payload:
         new_note = clean_text(payload.get("note"), "заметка", limit=MAX_NOTE_CHARS)
@@ -1028,6 +1369,7 @@ def update_item(db: Session, org_id: int, item_id: int, payload: dict,
                      old=row.note or "", new=new_note, author=author, op_id=op_id)
             op_id = ""
             row.note = new_note
+            changed = True
 
     if "sketch_id" in payload:
         raw = payload.get("sketch_id")
@@ -1050,8 +1392,10 @@ def update_item(db: Session, org_id: int, item_id: int, payload: dict,
                      author=author, op_id=op_id)
             op_id = ""
             row.sketch_id = new_sketch
+            changed = True
 
-    _touch(row)
+    if changed:
+        _touch(row)
     return row
 
 
@@ -1318,10 +1662,25 @@ def restore_batch(db: Session, org_id: int, batch_id: int, payload: dict,
 
 def update_batch(db: Session, org_id: int, batch_id: int, payload: dict,
                  author: str) -> SupplyBatch:
-    """Правка плана и срока. Прежнее значение уходит в журнал, а не пропадает."""
+    """Правка плана и срока. Прежнее значение уходит в журнал, а не пропадает.
+
+    ЖУРНАЛИРУЮТСЯ ВСЕ ИЗМЕНЯЕМЫЕ ПОЛЯ (ТЗ F-24), включая два, которые до этого
+    пакета менялись молча: заметка к плану и ИСТОЧНИК срока. Последний —
+    отдельным полем журнала, и это не мелочь: срок «ориентировочно к ноябрю»
+    со слов цеха и тот же срок со слов поставщика — разные сведения, а
+    `describe_due` их не различает вовсе, потому что источник в него не входит.
+    Поэтому правка одного источника не попадала в журнал НИКУДА, а вместе с ней
+    не сохранялся и `op_id` — повтор после потерянного ответа отвечал конфликтом
+    редакции вместо идемпотентного успеха (`TECH_DEBT` SUPPLY-FIX-3-REG 5б,
+    тред `r3948822971`).
+
+    Правка, не изменившая ни одного поля, редакцию не двигает — то же правило,
+    что у материала и вещи.
+    """
     row = get_batch(db, org_id, batch_id)
     _rev_guard(row, payload, "Плановая партия")
     op_id = parse_op_id(payload)
+    changed = False
     if "title" in payload:
         new_title = clean_text(payload.get("title"), "название партии",
                                limit=MAX_TITLE_CHARS)
@@ -1330,6 +1689,7 @@ def update_batch(db: Session, org_id: int, batch_id: int, payload: dict,
                      old=row.title, new=new_title, author=author, op_id=op_id)
             op_id = ""
             row.title = new_title
+            changed = True
     if "plan_qty" in payload:
         new_qty = parse_pieces(payload.get("plan_qty"))
         if new_qty != row.plan_qty:
@@ -1339,25 +1699,66 @@ def update_batch(db: Session, org_id: int, batch_id: int, payload: dict,
                      author=author, op_id=op_id)
             op_id = ""
             row.plan_qty = new_qty
+            changed = True
     if "plan_note" in payload:
-        row.plan_note = clean_text(payload.get("plan_note"), "заметка к плану",
+        new_plan_note = clean_text(payload.get("plan_note"), "заметка к плану",
                                    limit=MAX_NOTE_CHARS)
+        if new_plan_note != (row.plan_note or ""):
+            _journal(db, org_id, "batch", row.id, "update", field="plan_note",
+                     old=row.plan_note or "", new=new_plan_note,
+                     author=author, op_id=op_id)
+            op_id = ""
+            row.plan_note = new_plan_note
+            changed = True
     if any(k in payload for k in ("due_kind", "due_text", "due_date", "due_source")):
         # ТЕКУЩАЯ СТРОКА — ИСТОЧНИК УМОЛЧАНИЙ (ТЗ F-19). Без неё правка одного
         # только источника срока стирала сам срок: разбор начинался с нуля, а
         # отсутствующий `due_kind` означал «неизвестен».
+        # СРАВНИВАЮТСЯ САМИ ПОЛЯ, А НЕ ПОДПИСЬ ПОД НИМИ. Это не педантизм: точная
+        # дата 2020-01-01 и та же дата, набранная словами «к 1 января 2020»,
+        # дают у `describe_due` ОДНУ И ТУ ЖЕ строку — а это разные сроки, и в
+        # базе они лежат разными полями. Первая редакция правила «правка без
+        # изменений не двигает редакцию» смотрела на подпись, поэтому такая
+        # смена вида проходила молча: поля сохранялись, а редакция и журнал
+        # оставались прежними. Дальше соседнее окно со СТАРОЙ редакцией
+        # записывало своё и молча отменяло эту правку вместо 409 — то есть
+        # оптимистичная блокировка обходилась сменой вида срока.
         due = parse_due(payload, current=row)
+        before_due = {k: (getattr(row, k) or "") for k in _DUE_FIELDS}
         before = describe_due(row)
+        before_source = row.due_source or ""
         for key, value in due.items():
             setattr(row, key, value)
+        after_due = {k: (getattr(row, k) or "") for k in _DUE_FIELDS}
         after = describe_due(row)
-        if after != before:
+        after_source = row.due_source or ""
+        if before_due != after_due:
+            old_text, new_text = before, after
+            if old_text == new_text:
+                # Подпись совпала, а срок изменился. Запись «к 1 января 2020 →
+                # к 1 января 2020» не сказала бы человеку ничего, поэтому вид
+                # срока называется вслух — он и есть то, что поменялось.
+                old_text = f"{before} ({DUE_KIND_LABELS.get(before_due['due_kind'], before_due['due_kind'])})"
+                new_text = f"{after} ({DUE_KIND_LABELS.get(after_due['due_kind'], after_due['due_kind'])})"
             _journal(db, org_id, "batch", row.id, "update", field="due",
-                     old=before, new=after, author=author, op_id=op_id)
+                     old=old_text, new=new_text, author=author, op_id=op_id)
             op_id = ""
+            changed = True
+        if after_source != before_source:
+            _journal(db, org_id, "batch", row.id, "update", field="due_source",
+                     old=before_source, new=after_source,
+                     author=author, op_id=op_id)
+            op_id = ""
+            changed = True
+        if before_due != after_due or after_source != before_source:
+            # Кто и когда назвал срок — часть самого срока, и меняется вместе с
+            # ним ИЛИ с его источником. Прежде вторая половина этого условия
+            # отсутствовала: смена источника оставляла на карточке прежнего
+            # автора и прежнюю дату правки, то есть карточка говорила неправду.
             row.due_author = author
             row.due_updated_at = datetime.utcnow()
-    _touch(row)
+    if changed:
+        _touch(row)
     return row
 
 
@@ -1500,9 +1901,16 @@ def get_assignment(db: Session, org_id: int, assignment_id: int, *,
 
 def update_assignment(db: Session, org_id: int, assignment_id: int, payload: dict,
                       author: str) -> SupplyAssignment:
+    """Правка назначения. Количество и заметка — оба в журнал (ТЗ F-24).
+
+    Заметка назначения до этого пакета присваивалась молча, хотя именно в ней
+    человек пишет, ПОЧЕМУ этот метраж ушёл на эту партию. Правка, не изменившая
+    ничего, редакцию не двигает — то же правило, что у остальных трёх сущностей.
+    """
     row = get_assignment(db, org_id, assignment_id)
     _rev_guard(row, payload, "Назначение")
     op_id = parse_op_id(payload)
+    changed = False
     if "qty" in payload:
         qty = parse_qty(payload.get("qty"), "количество", allow_unknown=False)
         if qty is None or qty <= 0:
@@ -1512,9 +1920,17 @@ def update_assignment(db: Session, org_id: int, assignment_id: int, payload: dic
                      old=row.qty, new=qty, author=author, op_id=op_id)
             op_id = ""
             row.qty = qty
+            changed = True
     if "note" in payload:
-        row.note = clean_text(payload.get("note"), "заметка", limit=MAX_NOTE_CHARS)
-    _touch(row)
+        new_note = clean_text(payload.get("note"), "заметка", limit=MAX_NOTE_CHARS)
+        if new_note != (row.note or ""):
+            _journal(db, org_id, "assignment", row.id, "update", field="note",
+                     old=row.note or "", new=new_note, author=author, op_id=op_id)
+            op_id = ""
+            row.note = new_note
+            changed = True
+    if changed:
+        _touch(row)
     return row
 
 
@@ -1564,12 +1980,34 @@ def move_assignment(db: Session, org_id: int, payload: dict, author: str) -> dic
             SupplyAssignment.material_id == src.material_id,
             SupplyAssignment.batch_id == target_batch.id).limit(1)
     ).scalars().first()
+    # ЗАМЕТКА ПЕРЕЕЗЖАЕТ ВМЕСТЕ С МЕТРАЖОМ (ТЗ F-24). Прежде перенос её терял:
+    # приёмник создавался с пустой заметкой, а при переносе на приёмник, у
+    # которого заметка уже была, текст источника не доходил вовсе. Между тем
+    # заметка объясняет, ПОЧЕМУ эти метры расписаны сюда, и переносится тот же
+    # самый метраж — значит объяснение переносится вместе с ним.
+    #
+    # Склейка та же, что у повторного назначения и у слияния дублей (D-55): обе
+    # заметки, разделитель, совпадающий текст не дублируется. Полный текст,
+    # не поместившийся в видимое поле, уходит в журнал — иначе он исчез бы молча.
+    note = (src.note or "").strip()
     if dst is None:
         dst = SupplyAssignment(org_id=org_id, material_id=src.material_id,
-                               batch_id=target_batch.id, qty=qty, author=author)
+                               batch_id=target_batch.id, qty=qty, author=author,
+                               note=note)
         db.add(dst)
     else:
         dst.qty = round(float(dst.qty) + qty, 3)
+        if note:
+            merged, cut = _merge_notes(dst.note, note)
+            if merged != (dst.note or ""):
+                _journal(db, org_id, "assignment", dst.id, "update",
+                         field="note", old=dst.note or "", new=merged,
+                         author=author)
+                dst.note = merged
+            if cut:
+                _journal(db, org_id, "assignment", dst.id, "update",
+                         field="note_truncated", old=note, new=merged,
+                         author=author)
         _touch(dst)
 
     remainder = round(float(src.qty) - qty, 3)

@@ -24,7 +24,7 @@ TECH_DEBT OPS-6: «Планировщик стартует до миграций
 (которого требует `app.main`) вызывал миграцию; если бы патч ставился позже,
 проверка ловила бы ложный успех: старый вызов уже случился бы мимо счётчика.
 
-  1) реальный порядок: все четырнадцать шагов старта (init_db,
+  1) реальный порядок: все семнадцать шагов старта (init_db,
      lessons.ensure_schema, exclusions.ensure_schema, ms_sync.ensure_schema,
      ms_sync.reset_stale_running, ms_writeback.ensure_schema,
      ms_vendor.ensure_schema, subscription.ensure_schema,
@@ -46,13 +46,13 @@ TECH_DEBT OPS-5 («Миграции без журнала и порядка»): 
 пять проверок, и каждая работает на СИНТЕТИЧЕСКОЙ базе (пустой файл или
 руками собранная прежняя схема), без боевых данных:
 
-  5) чистая база: журнал содержит ровно четырнадцать объявленных шагов, позиции
+  5) чистая база: журнал содержит ровно семнадцать объявленных шагов, позиции
      1..10 идут по возрастанию и совпадают с фактическим порядком вызовов;
   6) прежняя схема: (а) база старой формы, где новых колонок ещё нет, и
      (б) уже мигрированная база, где журнала ещё нет вовсе, — приложение
      поднимается, миграции доезжают, журнал заполняется целиком;
-  7) повторный старт идемпотентен: строк по-прежнему четырнадцать, applied_at
-     первой записи НЕ переписан, и при этом все четырнадцать шагов выполнились
+  7) повторный старт идемпотентен: строк по-прежнему семнадцать, applied_at
+     первой записи НЕ переписан, и при этом все семнадцать шагов выполнились
      снова — журнал не служит основанием их пропустить;
   8) сбой шага: упавший шаг и все последующие записи в журнал не получают;
   9) конфликт id↔позиция и позиция↔id валит старт (fail closed) ДО того, как
@@ -154,6 +154,11 @@ STEPS = [
     "models.ensure_supply_assignment_archive_schema",
     "models.ensure_order_payment_terms_schema",
     "models.ensure_buy_price_presence_schema",
+    # SUPPLY-FIX-4 (F-23б): шестой append-only шаг этого слоя, позиция 17.
+    # Пятнадцатая и шестнадцатая заняты чужим пакетом и уже выпущены, поэтому
+    # свой номер подвинут, а чужие не тронуты. Шаг добавляет одну нуллируемую
+    # колонку BLOB и ни одной строки не читает.
+    "models.ensure_supply_sketch_thumb_schema",
 ]
 
 # Девять шагов, ВЫПУЩЕННЫХ до SUPPLY-1: ровно то, что журнал боевой базы уже
@@ -197,7 +202,15 @@ ASSIGN_ARCHIVE_STEP = ("models.ensure_supply_assignment_archive_schema", 14)
 ORDER_TERMS_STEP = ("models.ensure_order_payment_terms_schema", 15)
 BUY_PRICE_STEP = ("models.ensure_buy_price_presence_schema", 16)
 
-# Общий пролог дочернего процесса: подменяет четырнадцать шагов старта и
+# Шестнадцать шагов до миниатюры эскиза. Список опять наращивается явным
+# сложением, а не срезом, и по той же причине: прежние строки журнала боевой
+# базы не двигаются. Позиция 17, а не 15: пока пакет писался, номера 15 и 16
+# заняли шаги чужого пакета и уже выпущены.
+RELEASED_BEFORE_THUMB = (RELEASED_BEFORE_ASSIGN_ARCHIVE
+                         + [ASSIGN_ARCHIVE_STEP, ORDER_TERMS_STEP, BUY_PRICE_STEP])
+THUMB_STEP = ("models.ensure_supply_sketch_thumb_schema", 17)
+
+# Общий пролог дочернего процесса: подменяет семнадцать шагов старта и
 # scheduler.start/shutdown ДО импорта app.main (см. докстринг файла — почему
 # именно до, а не после). lessons.ensure_schema патчится первым из
 # ensure_schema-шагов и раньше `import app.main`, чтобы поймать и старый
@@ -320,6 +333,11 @@ def _w_buy_price(*a, **kw):
     order.append("models.ensure_buy_price_presence_schema")
     return _orig_buy_price(*a, **kw)
 _models.ensure_buy_price_presence_schema = _w_buy_price
+_orig_thumb = _models.ensure_supply_sketch_thumb_schema
+def _w_thumb(*a, **kw):
+    order.append("models.ensure_supply_sketch_thumb_schema")
+    return _orig_thumb(*a, **kw)
+_models.ensure_supply_sketch_thumb_schema = _w_thumb
 """
 
 
@@ -337,7 +355,7 @@ def _fresh_db(name: str) -> Path:
 
 
 def check_order() -> None:
-    """Проверка 1: реальный порядок четырнадцати шагов старта и scheduler.start."""
+    """Проверка 1: реальный порядок семнадцати шагов старта и scheduler.start."""
     db = _fresh_db("test_startup_order.db")
     code = _CHILD_PREAMBLE.format(root=str(ROOT), db=str(db)) + """
 from fastapi.testclient import TestClient
@@ -350,7 +368,7 @@ for step in order:
     rc, out = _run_child(code)
     check("дочерний процесс завершился успешно (проверка порядка)", rc == 0, out[-400:])
     order = [ln.split("ORDER:", 1)[1] for ln in out.splitlines() if ln.startswith("ORDER:")]
-    check("зафиксированы все четырнадцать шагов старта",
+    check("зафиксированы все семнадцать шагов старта",
           set(STEPS + ["scheduler.start"]) <= set(order), f"order={order}")
     check("lessons.ensure_schema вызван РОВНО ОДИН раз",
           order.count("lessons.ensure_schema") == 1, f"order={order}")
@@ -408,6 +426,8 @@ def check_failure_prevents_scheduler_start() -> None:
                 "_models.ensure_order_payment_terms_schema",
             "models.ensure_buy_price_presence_schema":
                 "_models.ensure_buy_price_presence_schema",
+            "models.ensure_supply_sketch_thumb_schema":
+                "_models.ensure_supply_sketch_thumb_schema",
         }[failing_step]
         code = _CHILD_PREAMBLE.format(root=str(ROOT), db=str(db)) + f"""
 def _boom(*a, **kw):
@@ -618,17 +638,17 @@ def _boot(db: Path, extra: str = "") -> tuple[int, str, list[str]]:
 
 
 def check_ledger_clean_db() -> None:
-    """Проверка 5: на чистой базе журнал содержит ровно четырнадцать шагов."""
+    """Проверка 5: на чистой базе журнал содержит ровно семнадцать шагов."""
     db = _purge_db("test_startup_ledger_clean.db")
     rc, out, order = _boot(db)
     check("дочерний процесс завершился успешно (журнал, чистая база)", rc == 0, out[-400:])
     check("старт на чистой базе не упал", "RAISED \n" in out or "RAISED\n" in out, out[-300:])
     rows = _read_ledger(db)
-    check("журнал содержит ровно шестнадцать строк", len(rows) == 16, f"rows={rows}")
+    check("журнал содержит ровно семнадцать строк", len(rows) == 17, f"rows={rows}")
     check("id и позиции журнала совпадают с объявленным порядком",
           [(r[0], r[1]) for r in rows] == LEDGER_STEPS, f"rows={rows}")
-    check("позиции идут 1..16 по возрастанию без пропусков",
-          [r[1] for r in rows] == list(range(1, 17)), f"rows={rows}")
+    check("позиции идут 1..17 по возрастанию без пропусков",
+          [r[1] for r in rows] == list(range(1, 18)), f"rows={rows}")
     check("у каждой строки непустой applied_at",
           all(r[2] and r[2].endswith("Z") for r in rows), f"rows={rows}")
     exec_order = [st for st in order if st in STEPS]
@@ -702,7 +722,7 @@ def check_ledger_legacy_db() -> None:
     check("журнал восстановлен целиком и в объявленном порядке",
           [(r[0], r[1]) for r in _read_ledger(db2)] == LEDGER_STEPS,
           f"rows={_read_ledger(db2)}")
-    check("все четырнадцать шагов выполнились и на базе без журнала",
+    check("все семнадцать шагов выполнились и на базе без журнала",
           [st for st in order if st in STEPS] == STEPS, f"order={order}")
     _purge_db("test_startup_ledger_dropped.db")
 
@@ -720,13 +740,13 @@ def check_ledger_repeat_startup() -> None:
     rc, out, order_second = _boot(db)
     check("дочерний процесс завершился успешно (повторный старт)", rc == 0, out[-400:])
     second = _read_ledger(db)
-    check("повторный старт не добавил строк в журнал", len(second) == 16, f"rows={second}")
+    check("повторный старт не добавил строк в журнал", len(second) == 17, f"rows={second}")
     check("повторный старт не переписал journal (строки идентичны первым)",
           second == first, f"first={first} second={second}")
     check("повторный старт не изменил applied_at ни одной строки",
           [r[2] for r in second] == [r[2] for r in first],
           f"first={[r[2] for r in first]} second={[r[2] for r in second]}")
-    check("повторный старт ВЫПОЛНИЛ все четырнадцать шагов (журнал не повод пропускать)",
+    check("повторный старт ВЫПОЛНИЛ все семнадцать шагов (журнал не повод пропускать)",
           [st for st in order_second if st in STEPS] == STEPS, f"order={order_second}")
     check("повторный старт довёл дело до планировщика",
           "scheduler.start" in order_second, f"order={order_second}")
@@ -763,6 +783,8 @@ def check_ledger_not_recorded_on_failure() -> None:
                 "_models.ensure_order_payment_terms_schema",
             "models.ensure_buy_price_presence_schema":
                 "_models.ensure_buy_price_presence_schema",
+            "models.ensure_supply_sketch_thumb_schema":
+                "_models.ensure_supply_sketch_thumb_schema",
         }[failing_step]
         extra = f"""
 def _boom(*a, **kw):
@@ -839,23 +861,24 @@ def check_ledger_supply_step_is_distinct() -> None:
     rows = _read_ledger(db)
     # На базе с девятью выпущенными шагами дописываются ПЯТЬ терминальных:
     # SUPPLY-1 (позиция 10), SUPPLY-3 (11), SUPPLY-FIX-1 (12) и два шага
-    # SUPPLY-FIX-2 (13 и 14). Их ровно пять, они идут своим порядком, и у
-    # каждого своё время.
-    check("журнал прирос ровно семью строками", len(rows) == 16, f"rows={rows}")
+    # SUPPLY-FIX-2 (13 и 14), аудит (15 и 16) и SUPPLY-FIX-4 (17). Их ровно
+    # восемь, они идут своим порядком, и у каждого своё время.
+    check("журнал прирос ровно восемью строками", len(rows) == 17, f"rows={rows}")
     check("девять выпущенных строк не переписаны (id, позиция и applied_at те же)",
           rows[:9] == seeded, f"rows={rows[:9]} seeded={seeded}")
     fresh = [r for r in rows if (r[0], r[1]) not in {(s[0], s[1]) for s in seeded}]
     check("новые строки — SUPPLY-1 (10), SUPPLY-3 (11), SUPPLY-FIX-1 (12), "
-          "SUPPLY-FIX-2 (13 и 14)",
-          len(fresh) == 7 and (fresh[0][0], fresh[0][1]) == SUPPLY_STEP
+          "SUPPLY-FIX-2 (13 и 14), аудит (15 и 16), SUPPLY-FIX-4 (17)",
+          len(fresh) == 8 and (fresh[0][0], fresh[0][1]) == SUPPLY_STEP
           and (fresh[1][0], fresh[1][1]) == PLANNING_STEP
           and (fresh[2][0], fresh[2][1]) == UNIQUE_STEP
           and (fresh[3][0], fresh[3][1]) == ARCHIVE_STEP
           and (fresh[4][0], fresh[4][1]) == ASSIGN_ARCHIVE_STEP
           and (fresh[5][0], fresh[5][1]) == ORDER_TERMS_STEP
-          and (fresh[6][0], fresh[6][1]) == BUY_PRICE_STEP, f"new={fresh}")
-    check("у всех семи собственный applied_at, а не время выпущенных шагов",
-          len(fresh) == 7 and all(f[2].endswith("Z") and f[2] != seeded[0][2]
+          and (fresh[6][0], fresh[6][1]) == BUY_PRICE_STEP
+          and (fresh[7][0], fresh[7][1]) == THUMB_STEP, f"new={fresh}")
+    check("у всех восьми собственный applied_at, а не время выпущенных шагов",
+          len(fresh) == 8 and all(f[2].endswith("Z") and f[2] != seeded[0][2]
                                   for f in fresh), f"new={fresh}")
     check("шаг SUPPLY-1 действительно выполнился на этом старте",
           "models.ensure_supply_schema" in order, f"order={order}")
@@ -887,7 +910,7 @@ def check_ledger_supply_step_is_distinct() -> None:
           bool(after.get(2)), f"orders={after}")
     check("и уже выданный идентификатор соседа не переписан",
           after.get(1) == healed.get(1), f"было={healed} стало={after}")
-    check("повторный старт журнал не изменил: те же четырнадцать строк и то же время",
+    check("повторный старт журнал не изменил: те же семнадцать строк и то же время",
           _read_ledger(db) == rows, f"rows={_read_ledger(db)} было={rows}")
     _purge_db("test_startup_ledger_supply.db")
 

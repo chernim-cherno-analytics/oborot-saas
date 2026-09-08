@@ -39,7 +39,8 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, Body, Depends, File, HTTPException, Query, UploadFile
+from fastapi import (APIRouter, Body, Depends, File, HTTPException, Query,
+                     Request, UploadFile)
 from fastapi.responses import Response
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -115,8 +116,6 @@ def _fail(exc: Exception) -> HTTPException:
         # 409, а не 400: ввод человека верен, отказ вызван состоянием соседних
         # строк. Текст приходит из слоя уже с числом и с тем, что надо сделать.
         return HTTPException(status_code=409, detail=str(exc))
-    if isinstance(exc, sp.DuplicateOp):
-        return HTTPException(status_code=409, detail=str(exc))
     return HTTPException(status_code=400, detail="Не удалось выполнить действие.")
 
 
@@ -158,6 +157,33 @@ def api_planning_catalog(
     выдать пустой каталог за отсутствие совпадений.
     """
     return sp.catalog_options(db, ctx.org.id, q)
+
+
+@router.get("/events")
+def api_planning_events(
+    entity: str = Query(..., max_length=16),
+    id: int = Query(...),
+    ctx: AuthContext = Depends(require_auth_api),
+    db: Session = Depends(get_db),
+):
+    """История одной строки: последние 50 правок (ТЗ F-24).
+
+    ЧИТАЮТ ВЛАДЕЛЕЦ И УЧАСТНИК — та же зависимость, что у доски
+    (`require_auth_api`). Ничего нового о чужой организации ручка не
+    рассказывает: строка сначала ищется обычным способом в СВОЕЙ организации, и
+    чужой идентификатор даёт тот же 404 и тот же текст, что и несуществующий.
+    Записи здесь нет вовсе, поэтому и `require_owner_api` тут был бы не защитой,
+    а запретом участнику видеть то, что он и так видит на карточке.
+
+    Имя параметра `id` совпадает со встроенным именем Python и выбрано не по
+    небрежности: так его называет ТЗ (`?entity=…&id=`), и переименовать
+    параметр запроса ради красоты кода значило бы разойтись с контрактом,
+    который уже описан.
+    """
+    try:
+        return sp.read_events(db, ctx.org.id, entity, id)
+    except sp.PlanningError as exc:
+        raise _fail(exc) from None
 
 
 @router.post("/materials")
@@ -328,16 +354,33 @@ def api_planning_item_create(
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Ожидался объект JSON.")
     try:
-        if sp.check_op(db, ctx.org.id, sp.parse_op_id(payload)):
-            return sp.board(db, ctx.org.id, ctx.role)
+        op_id = sp.parse_op_id(payload)
+        if sp.check_op(db, ctx.org.id, op_id):
+            # ПОВТОР ПОСЛЕ ПОТЕРЯННОГО ОТВЕТА ОТВЕЧАЕТ ТЕМ ЖЕ, ЧЕМ И ПЕРВЫЙ РАЗ.
+            # Номер созданной вещи здесь берётся из журнала: без него страница,
+            # держащая в руках выбранный файл, не смогла бы прикрепить эскиз к
+            # уже созданной новинке — то есть идемпотентность первого запроса
+            # ломала бы второй (ТЗ F-23а).
+            replay = sp.board(db, ctx.org.id, ctx.role)
+            known = sp.find_op_entity(db, ctx.org.id, op_id, "item")
+            if known is not None:
+                replay["item_id"] = known
+            return replay
         item = sp.create_item(db, ctx.org.id, payload, _author(ctx))
         reused = bool(getattr(item, "reused", False))
         restored = bool(getattr(item, "restored", False))
         title = item.title
+        item_id = item.id
     except (sp.PlanningError, IntegrityError) as exc:
         db.rollback()
         raise _fail(exc) from None
     board = _commit(db, ctx.org.id, ctx.role)
+    # НОМЕР СОХРАНЁННОЙ ВЕЩИ В ОТВЕТЕ. Ответ этой ручки — вся доска, и до сих
+    # пор из неё нельзя было понять, какая строка только что появилась: экран
+    # вычислял это разностью списков. Для эскиза такой догадки мало — файл
+    # прикрепляется по точному номеру, и ошибиться в нём значит прикрепить
+    # картинку не к той вещи.
+    board["item_id"] = item_id
     if restored:
         # Возврат из архива и «эта модель уже есть» — разные события, и один
         # текст на оба сказал бы человеку неправду о том, что он сделал.
@@ -515,37 +558,144 @@ def api_planning_assignment_delete(
     return _commit(db, ctx.org.id, ctx.role)
 
 
-@router.post("/sketches")
-async def api_planning_sketch_upload(
-    file: UploadFile = File(...),
-    ctx: AuthContext = Depends(require_owner_api),
-    db: Session = Depends(get_db),
-):
-    """Приватный эскиз новинки. Байты идут в базу, а не на диск.
+async def _read_upload(file: UploadFile, limit: int, too_big: str) -> bytes:
+    """Читает файл с потолком и говорит человеку, что именно не влезло.
 
-    Читаем ПОТОКОМ с потолком: `Content-Length` приходит от клиента, и верить
-    ему нельзя — файл, объявленный маленьким, может оказаться каким угодно.
-    Формат определяется по самим байтам (`supply_planning.sniff_image`), имя
-    файла и присланный `content_type` не участвуют в решении вовсе.
+    ЧТО ЭТА ПРОВЕРКА ДЕЛАЕТ, А ЧТО НЕТ, И ЭТО ВАЖНО НЕ ПЕРЕПУТАТЬ. Она НЕ
+    защищает память воркера: к моменту, когда ручка начинает исполняться,
+    FastAPI уже разобрал форму и сложил файл в `UploadFile`. Оборвать входящий
+    поток отсюда невозможно в принципе. Потолок самого потока стоит выше по
+    стеку — в `main._supply_body_limit`, до разбора формы.
+
+    Здесь остаётся ДОМЕННЫЙ предел: сказать человеку понятными словами, что
+    картинка больше двух мегабайт или миниатюра больше шестидесяти четырёх
+    килобайт, и не пустить такие байты в базу. Тексты приходят от вызывающего:
+    у полного эскиза и у миниатюры пределы разные, и один текст на оба сказал
+    бы неправду о том, что именно не влезло.
+
+    `Content-Length` тут не участвует вовсе: он приходит от клиента, и файл,
+    объявленный маленьким, может оказаться каким угодно.
     """
     data = bytearray()
-    limit = sp.SKETCH_MAX_BYTES
     while True:
         chunk = await file.read(_SKETCH_READ_CHUNK)
         if not chunk:
             break
         data.extend(chunk)
         if len(data) > limit:
-            # Текст тот же, что у разбора байтов (`sniff_image`), и это не
-            # копия ради копии: до слоя такой файл не доходит вовсе — он
-            # обрывается на чтении потока, — а человек обязан получить один и
-            # тот же ответ на одну и ту же причину (ТЗ F-20, Приложение А).
-            raise HTTPException(
-                status_code=400,
-                detail=f"Файл больше {limit // (1024 * 1024)} МБ — "
-                       "уменьшите картинку.")
+            raise HTTPException(status_code=400, detail=too_big)
+    return bytes(data)
+
+
+def _sketch_too_big() -> str:
+    """Один текст на оба места, где отвергается слишком большой эскиз.
+
+    До слоя такой файл не доходит вовсе — он обрывается на чтении потока, — а
+    человек обязан получить один и тот же ответ на одну и ту же причину
+    (ТЗ F-20, Приложение А).
+    """
+    return (f"Файл больше {sp.SKETCH_MAX_BYTES // (1024 * 1024)} МБ — "
+            "уменьшите картинку.")
+
+
+def _thumb_too_big() -> str:
+    return f"Миниатюра больше {sp.SKETCH_THUMB_MAX_BYTES // 1024} КБ."
+
+
+def _sketch_response(payload: bytes, mime: str, name: str, etag: str,
+                     request: Request) -> Response:
+    """Отдача картинки: приватный кэш, ETag и 304 — но только СВОЕЙ организации.
+
+    ПОРЯДОК ЗДЕСЬ ЧАСТЬ ЗАЩИТЫ, А НЕ ОФОРМЛЕНИЕ. Эта функция вызывается ПОСЛЕ
+    того, как строка найдена через `sp.get_sketch`, то есть после проверки
+    арендатора. Сделать наоборот — сверить `If-None-Match` раньше и ответить
+    304 — значило бы рассказать чужому, что эскиз с таким номером и таким
+    содержимым существует: 304 на несуществующее не приходит.
+
+    `private` в кэше и `max-age=86400` (ТЗ F-23в) вместо прежнего `no-store`:
+    картинка перестаёт перекачиваться при каждой перерисовке страницы, но
+    остаётся в кэше ОДНОГО браузера и не попадает ни в один общий кэш.
+    Остальная скупость отдачи прежняя: тип из нашего разбора, `nosniff`,
+    имя файла без пользовательского текста, запрет на исполнение чего бы то ни
+    было внутри.
+    """
+    headers = {
+        "Cache-Control": "private, max-age=86400",
+        # VARY: COOKIE — ЭТО НЕ ФОРМАЛЬНОСТЬ, А ВТОРАЯ ПОЛОВИНА `private`.
+        # Кэш браузера ключуется адресом, а адрес эскиза — это номер строки, и
+        # номера у разных организаций совпадают. Без этой строки один профиль
+        # браузера, побывавший в двух организациях, мог показать во второй
+        # картинку из первой — не спросив сервер вовсе, то есть мимо всех
+        # наших проверок арендатора. Сессия живёт в куке, поэтому именно она
+        # и объявляется частью ключа.
+        "Vary": "Cookie",
+        "ETag": etag,
+        "X-Content-Type-Options": "nosniff",
+        "Content-Disposition": f'inline; filename="{name}"',
+        "Content-Security-Policy": "default-src 'none'; sandbox",
+    }
+    if _etag_matches(request.headers.get("if-none-match"), etag):
+        return Response(status_code=304, headers=headers)
+    return Response(content=payload, media_type=mime, headers=headers)
+
+
+def _etag_matches(header: str | None, etag: str) -> bool:
+    """`If-None-Match` по правилам заголовка, а не по равенству строк.
+
+    Браузер вправе прислать список через запятую, `*` и слабую форму `W/"…"`.
+    Сравнение «строка равна строке» промахнулось бы на каждом из трёх случаев,
+    и картинка перекачивалась бы целиком при формально верном кэше — то есть
+    пункт ТЗ был бы выполнен только на своём собственном тесте.
+    """
+    if not header:
+        return False
+    for part in header.split(","):
+        candidate = part.strip()
+        if candidate == "*":
+            return True
+        if candidate.startswith("W/"):
+            candidate = candidate[2:]
+        if candidate == etag:
+            return True
+    return False
+
+
+@router.post("/sketches")
+async def api_planning_sketch_upload(
+    file: UploadFile = File(...),
+    thumb: UploadFile | None = File(None),
+    ctx: AuthContext = Depends(require_owner_api),
+    db: Session = Depends(get_db),
+):
+    """СТАРЫЙ путь загрузки эскиза: файл отдельно, вещь потом.
+
+    Ручка сохранена ради совместимости (ТЗ F-23а разрешает оба исхода) — но
+    штатным путём страницы она больше не является: теперь вещь создаётся
+    первой, а файл прикрепляется к ней (`POST /items/{id}/sketch`). Здесь
+    остаётся ровно то, что нужно уже выпущенному клиенту и программному
+    обращению.
+
+    Именно этот порядок и рождал сирот: между «файл сохранён» и «вещь создана»
+    есть отказ формы, и после него картинка остаётся ничьей. Поэтому уборка
+    сирот старше суток идёт здесь же, при следующем сохранении (ТЗ F-23г).
+
+    Формат определяется по САМИМ БАЙТАМ (`supply_planning.sniff_image`), имя
+    файла и присланный `content_type` не участвуют в решении вовсе.
+    """
+    data = await _read_upload(file, sp.SKETCH_MAX_BYTES, _sketch_too_big())
+    thumb_data = None
+    if thumb is not None and getattr(thumb, "filename", None):
+        thumb_data = await _read_upload(thumb, sp.SKETCH_THUMB_MAX_BYTES,
+                                        _thumb_too_big())
     try:
-        row = sp.save_sketch(db, ctx.org.id, bytes(data), _author(ctx))
+        row = sp.save_sketch(db, ctx.org.id, data, _author(ctx), thumb=thumb_data)
+        # НОМЕР, КОТОРЫЙ МЫ СЕЙЧАС ВЕРНЁМ, УБОРКА НЕ ТРОГАЕТ. У этой ручки вещи
+        # ещё нет — ссылка на эскиз появится только следующим запросом старого
+        # клиента, — поэтому строка выглядит ничьей и по возрасту вполне могла
+        # оказаться сиротой: дедуп отдаёт СТАРУЮ строку, если байты те же.
+        # Без этой оговорки ручка отвечала бы 200 с номером, который сама же в
+        # этом запросе и удалила.
+        sp.cleanup_orphan_sketches(db, ctx.org.id, keep=row.id)
     except (sp.PlanningError, IntegrityError) as exc:
         db.rollback()
         raise _fail(exc) from None
@@ -555,34 +705,98 @@ async def api_planning_sketch_upload(
         db.rollback()
         raise _fail(exc) from None
     return {"ok": True, "sketch_id": row.id, "width": row.width,
-            "height": row.height, "mime": row.mime, "bytes": row.byte_len}
+            "height": row.height, "mime": row.mime, "bytes": row.byte_len,
+            "has_thumb": bool(row.thumb)}
+
+
+@router.post("/items/{item_id}/sketch")
+async def api_planning_item_sketch(
+    item_id: int,
+    file: UploadFile = File(...),
+    thumb: UploadFile | None = File(None),
+    ctx: AuthContext = Depends(require_owner_api),
+    db: Session = Depends(get_db),
+):
+    """ШТАТНЫЙ путь (ТЗ F-23а): файл прикрепляется к уже созданной новинке.
+
+    Что этим исправлено. Прежде страница отправляла картинку ПЕРВОЙ, и любая
+    ошибка валидации формы — пустое название новинки, слишком длинная
+    заметка — оставляла в базе до двух мегабайт, на которых уже никогда ничего
+    не повиснет. Теперь порядок обратный: сначала вещь, и только потом байты.
+    Ошибка формы больше не стоит ни одной строки в `supply_sketches`.
+
+    Миниатюра приходит вторым файлом и рисуется браузером: Pillow в замыкании
+    зависимостей проекта нет, и ТЗ F-23 назвало этот путь прямо. Сервер ей не
+    верит — формат и сторона проверяются по самим байтам (`sp.sniff_thumb`).
+    Миниатюра НЕОБЯЗАТЕЛЬНА: без неё эскиз сохраняется как раньше, и карточка
+    показывает оригинал.
+    """
+    data = await _read_upload(file, sp.SKETCH_MAX_BYTES, _sketch_too_big())
+    thumb_data = None
+    if thumb is not None and getattr(thumb, "filename", None):
+        thumb_data = await _read_upload(thumb, sp.SKETCH_THUMB_MAX_BYTES,
+                                        _thumb_too_big())
+    try:
+        row = sp.attach_sketch(db, ctx.org.id, item_id, data, thumb_data,
+                               _author(ctx))
+        sketch_id = row.id
+        # Здесь ссылка на эскиз уже проставлена вещи, и `db.flush()` внутри
+        # уборки делает её видимой запросу. `keep` всё равно передаётся: две
+        # защиты от одного и того же лучше, чем одна, а стоит она ничего.
+        sp.cleanup_orphan_sketches(db, ctx.org.id, keep=sketch_id)
+    except (sp.PlanningError, IntegrityError) as exc:
+        db.rollback()
+        raise _fail(exc) from None
+    board = _commit(db, ctx.org.id, ctx.role)
+    board["sketch_id"] = sketch_id
+    return board
 
 
 @router.get("/sketches/{sketch_id}")
 def api_planning_sketch_read(
     sketch_id: int,
+    request: Request,
     ctx: AuthContext = Depends(require_auth_api),
     db: Session = Depends(get_db),
 ):
-    """Отдаёт эскиз СВОЕЙ организации. Публичной ссылки у него нет.
-
-    Отдача намеренно скупая: тип из нашего разбора (а не из присланного
-    заголовка), `nosniff`, `attachment`-имя без пользовательского текста и
-    `private` в кэше. Картинку видно на своей странице, но она не превращается
-    в файл, который можно раздать по ссылке кому угодно.
-    """
+    """Отдаёт эскиз СВОЕЙ организации. Публичной ссылки у него нет."""
     try:
         row = sp.get_sketch(db, ctx.org.id, sketch_id)
     except sp.PlanningError as exc:
         raise _fail(exc) from None
     ext = "png" if row.mime == "image/png" else "jpg"
-    return Response(
-        content=row.data,
-        media_type=row.mime,
-        headers={
-            "Cache-Control": "private, max-age=0, no-store",
-            "X-Content-Type-Options": "nosniff",
-            "Content-Disposition": f'inline; filename="sketch-{row.id}.{ext}"',
-            "Content-Security-Policy": "default-src 'none'; sandbox",
-        },
-    )
+    return _sketch_response(row.data, row.mime, f"sketch-{row.id}.{ext}",
+                            f'"{row.sha256}"', request)
+
+
+@router.get("/sketches/{sketch_id}/thumb")
+def api_planning_sketch_thumb(
+    sketch_id: int,
+    request: Request,
+    ctx: AuthContext = Depends(require_auth_api),
+    db: Session = Depends(get_db),
+):
+    """Миниатюра эскиза (ТЗ F-23б). Права и арендатор — те же, что у оригинала.
+
+    ЧТО ПРОИСХОДИТ У ЭСКИЗА БЕЗ МИНИАТЮРЫ, И ПОЧЕМУ НЕ 404. Миниатюры нет у
+    всего, что загружено до этого пакета и старым путём, а пересчитать её на
+    сервере нечем — Pillow в проекте отсутствует. Ответ 404 превратил бы
+    картинки на живых карточках в битые квадраты, то есть починка кэша сломала
+    бы показ. Поэтому такая ручка отдаёт ОРИГИНАЛ: он тяжелее, чем нужно, но
+    это ровно то поведение, которое было до пакета, а не поломка.
+
+    ETag у миниатюры свой (`sha256` оригинала с суффиксом): содержимое здесь
+    другое, и общий ETag на два разных ответа означал бы, что браузер способен
+    подставить одно вместо другого.
+    """
+    try:
+        row = sp.get_sketch(db, ctx.org.id, sketch_id)
+    except sp.PlanningError as exc:
+        raise _fail(exc) from None
+    if row.thumb:
+        return _sketch_response(row.thumb, "image/png",
+                                f"sketch-{row.id}-thumb.png",
+                                f'"{row.sha256}-t"', request)
+    ext = "png" if row.mime == "image/png" else "jpg"
+    return _sketch_response(row.data, row.mime, f"sketch-{row.id}.{ext}",
+                            f'"{row.sha256}"', request)

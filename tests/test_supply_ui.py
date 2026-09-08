@@ -32,6 +32,7 @@
 Нужен Chromium под playwright: `pip install -r requirements-dev.lock` и
 `python -m playwright install chromium`.
 """
+import base64
 import json
 import os
 import re
@@ -53,6 +54,13 @@ os.environ["OBOROT_SUBSCRIPTION_GATE"] = "0"
 
 if DB_PATH.exists():
     DB_PATH.unlink()
+
+#: НАСТОЯЩИЙ PNG 4×3 строкой base64: сигнатура, IHDR, IDAT и IEND с ВЕРНЫМИ
+#: контрольными суммами. Бинарника в репозитории по-прежнему нет, а картинка
+#: теперь действительно картинка — её открывает браузер, а не только принимает
+#: наш разбор (он контрольных сумм не проверяет, и подделка проходила мимо).
+VALID_PNG_B64 = ("iVBORw0KGgoAAAANSUhEUgAAAAQAAAADCAIAAAA7ljmRAAAAEElEQVR4nGNo"
+                 "cFCAIwacHADRZwqBZaYHGAAAAABJRU5ErkJggg==")
 
 import httpx  # noqa: E402
 import uvicorn  # noqa: E402
@@ -2142,17 +2150,23 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
         page.wait_for_timeout(200)
         page.select_option("#pl-item-kind", "draft")
         page.fill("#pl-item-title", "Новинка Б")
-        page.evaluate("""() => {
-            const png = new Uint8Array([137,80,78,71,13,10,26,10,
-              0,0,0,13,73,72,68,82, 0,0,0,4, 0,0,0,3, 8,2,0,0,0, 214,111,120,131,
-              0,0,0,22,73,68,65,84, 120,156,99,248,207,192,240,31,4,3,3,3,0,
-              47,224,5,251, 27,132,73,157,
-              0,0,0,0,73,69,78,68,174,66,96,130]);
+        # ЗДЕСЬ БЫЛА ПОДДЕЛЬНАЯ КАРТИНКА, И ЭТО НАШЛОСЬ ПАКЕТОМ 4. Прежняя
+        # редакция собирала PNG побайтно руками, и контрольные суммы обоих
+        # блоков в нём были неверны: наш разбор их не проверяет, поэтому файл
+        # принимался и хранился, но НИ ОДИН браузер такую картинку не
+        # показывает. Пока проверка смотрела только на адрес в `src`, разницы
+        # видно не было; проверка «картинка нарисована» (F-23) её обнаружила
+        # сразу. Теперь байты берутся из настоящего PNG (base64), и фикстура
+        # проверяет продукт, а не саму себя.
+        page.evaluate("""(b64) => {
+            const raw = atob(b64);
+            const png = new Uint8Array(raw.length);
+            for (let i = 0; i < raw.length; i++) png[i] = raw.charCodeAt(i);
             const file = new File([png], 'sketch.png', {type: 'image/png'});
             const dt = new DataTransfer();
             dt.items.add(file);
             document.getElementById('pl-item-sketch').files = dt.files;
-        }""")
+        }""", VALID_PNG_B64)
         page.click("#pl-item-form button[type=submit]")
         page.wait_for_timeout(1500)
         check("новинка создана", page.evaluate(
@@ -2442,6 +2456,9 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
 
         # ── 25. SUPPLY-FIX-3: единицы, формат, тексты, сохранность форм ─────
         supply_fix_3_ui(pw, base, c)
+
+        # ── 26. SUPPLY-FIX-4: порядок отправки эскиза, кэш картинки, история ─
+        supply_fix_4_ui(pw, base, c)
 
     c.close()
     print(f"\nИТОГО: {len(PASS)} OK, {len(FAIL)} FAIL")
@@ -3993,6 +4010,615 @@ def supply_fix_3_ui(pw, base, c) -> None:
         check("F-16/F-21 на телефоне: шаг дошёл до конца без исключения", False,
               f"{type(exc).__name__}: {str(exc).strip().splitlines()[0][:160]}")
     browser.close()
+
+
+def supply_fix_4_ui(pw, base, c) -> None:
+    """SUPPLY-FIX-4 в настоящем браузере: F-23 и F-24 на стороне страницы.
+
+    ЧТО СЮДА ПОПАЛО И ПОЧЕМУ ИМЕННО ЭТО. Три вещи не видны ниоткуда, кроме
+    браузера: (1) порядок запросов при сохранении новинки с эскизом — по ответу
+    ручки его не увидеть вовсе; (2) отсутствие повторной перекачки картинки при
+    перерисовке — это счётчик сетевых запросов, а не строка HTML; (3) «История»
+    как элемент карточки. Всё остальное из пакета живёт на сервере и проверено
+    там (`tests/test_supply_planning.py`).
+
+    ЧЕГО ЗДЕСЬ НЕТ: ни одной параллельной вкладки и ни одного состязательного
+    сценария. F-22 в пакет не входит.
+    """
+    browser = pw.chromium.launch()
+    ctx = browser.new_context(viewport={"width": 1400, "height": 900})
+    ctx.add_cookies([{"name": k, "value": v, "domain": "127.0.0.1", "path": "/"}
+                     for k, v in c.cookies.items()])
+    errors: list[str] = []
+    page = ctx.new_page()
+    page.on("pageerror", lambda e: errors.append(str(e)))
+
+    steps = (
+        ("F-23 порядок", lambda: _fix4_order_ui(page, base, c)),
+        ("F-23 кэш картинки", lambda: _fix4_no_refetch_ui(page, base)),
+        ("F-24 история", lambda: _fix4_history_ui(page, base, c)),
+        # Корректив по независимому ревью PR #57: отказ прикрепления эскиза
+        # не должен заводить вторую новинку.
+        ("P1 повтор после отказа эскиза",
+         lambda: _fix4_retry_after_sketch_fail(page, base, c)),
+    )
+    for label, run_step in steps:
+        try:
+            run_step()
+        except Exception as exc:  # noqa: BLE001 — важен отчёт, а не тип
+            check(f"{label}: шаг дошёл до конца без исключения", False,
+                  f"{type(exc).__name__}: "
+                  f"{str(exc).strip().splitlines()[0][:160]}")
+
+    check("за сценарий SUPPLY-FIX-4 не было ошибок в консоли",
+          not errors, str(errors)[:200])
+    ctx.close()
+    browser.close()
+
+
+def _fix4_order_ui(page, base, c) -> None:
+    """F-23а: сначала вещь, потом файл — и порядок виден по самим запросам."""
+    print("\n== F-23: эскиз уходит ПОСЛЕ создания вещи, а не до ==")
+    _open_plan(page, base)
+    seen: list[str] = []
+    page.on("request", lambda r: seen.append(r.method + " " + r.url)
+            if "/api/supply/planning/" in r.url else None)
+
+    page.click("#pl-add-item")
+    page.wait_for_timeout(250)
+    page.select_option("#pl-item-kind", "draft")
+    page.wait_for_timeout(150)
+
+    # ПУСТОЕ НАЗВАНИЕ: страница обязана отказать САМА и не отправить ни байта.
+    # Это и есть весь пункт: раньше файл уходил первым, и отказ сервера уже
+    # ничего не менял — картинка лежала в базе.
+    page.set_input_files("#pl-item-sketch", {
+        "name": "sketch.png", "mimeType": "image/png",
+        "buffer": base64.b64decode(VALID_PNG_B64)})
+    before = len([u for u in seen if "POST" in u])
+    page.evaluate("""() => {
+      const b = document.querySelector('#pl-item-form button[type=submit]');
+      if (b) b.click();
+    }""")
+    page.wait_for_timeout(700)
+    after = [u for u in seen if u.startswith("POST")]
+    check("пустое название не отправило НИ ОДНОГО запроса",
+          len(after) == before, str(after[-3:]))
+    # ПРИЧИНУ НАЗЫВАЕТ БРАУЗЕР, И ЭТО НЕ ОБХОД ПРОВЕРКИ, А ЕЁ СМЫСЛ. Поле
+    # объявлено обязательным (`required`), поэтому нажатие на «Сохранить» до
+    # нашего обработчика вообще не доходит: форма не отправляется, и человек
+    # видит родную подсказку у пустого поля. Спрашивать после этого наш
+    # `#pl-item-err` значило бы требовать вторую ошибку там, где первая уже
+    # остановила отправку.
+    told = page.evaluate("""() => {
+      const t = document.getElementById('pl-item-title');
+      if (!t) return null;
+      return {missing: t.validity.valueMissing, required: t.required,
+              shown: getComputedStyle(t).display !== 'none'};
+    }""")
+    check("и человек видит причину у самого поля: оно обязательное и пустое",
+          told and told["required"] and told["missing"] and told["shown"],
+          str(told))
+
+    seen.clear()
+    page.fill("#pl-item-title", "Новинка-порядок")
+    page.evaluate("""() => {
+      const b = document.querySelector('#pl-item-form button[type=submit]');
+      if (b) b.click();
+    }""")
+    page.wait_for_timeout(2500)
+    posts = [u for u in seen if u.startswith("POST")]
+    items = [i for i, u in enumerate(posts) if u.endswith("/items")]
+    sketches = [i for i, u in enumerate(posts) if "/sketch" in u]
+    check("оба запроса ушли", bool(items) and bool(sketches), str(posts))
+    check("вещь создана ПЕРВОЙ, файл прикреплён ВТОРЫМ",
+          bool(items) and bool(sketches) and items[0] < sketches[0], str(posts))
+    check("к старой ручке загрузки страница больше не ходит",
+          not any(u.rstrip("/").endswith("/sketches") for u in posts), str(posts))
+
+    board = c.get("/api/supply/planning").json()
+    made = [i for i in board["items"] if i["title"] == "Новинка-порядок"]
+    check("вещь на месте и с эскизом",
+          bool(made) and made[0]["sketch_id"] is not None,
+          str(made[:1])[:160])
+
+
+def _fix4_no_refetch_ui(page, base) -> None:
+    """F-23б,в: карточка показывает миниатюру и не перекачивает её заново."""
+    print("\n== F-23: миниатюра в карточке и ни одного повторного запроса ==")
+    _open_plan(page, base)
+    # Картинке дают ЗАГРУЗИТЬСЯ прежде, чем её считать: `loading="lazy"` и
+    # обычная сеть означают, что сразу после `goto` она ещё в пути, и «не
+    # нарисована» тогда сказало бы о моменте замера, а не о продукте.
+    #
+    # Сначала картинку ПОКАЗЫВАЮТ: у неё `loading="lazy"`, и пока карточка
+    # партии ниже сгиба, браузер её не запрашивает вовсе. Без прокрутки
+    # проверка «повторных запросов нет» была бы зелёной ни на чём — запросов не
+    # было бы и в первый раз.
+    page.evaluate("""() => {
+      const i = document.querySelector('#pl-batches img.pl-sketch');
+      if (i && i.scrollIntoView) i.scrollIntoView({block: 'center'});
+    }""")
+    page.wait_for_timeout(400)
+    loaded = True
+    try:
+        page.wait_for_function(
+            "() => { const i = document.querySelector('#pl-batches img.pl-sketch');"
+            " return !!i && i.complete && i.naturalWidth > 0; }", timeout=8000)
+    except Exception:  # noqa: BLE001 — важен отчёт, а не тип
+        loaded = False
+    check("миниатюра успела загрузиться", loaded)
+    shown = page.evaluate("""() => {
+      const a = document.querySelector('#pl-batches a.pl-sketch-link');
+      const i = document.querySelector('#pl-batches img.pl-sketch');
+      if (!i) return null;
+      const box = i.getBoundingClientRect();
+      return {src: i.getAttribute('src'), href: a ? a.getAttribute('href') : '',
+              target: a ? a.getAttribute('target') : '',
+              w: Math.round(box.width), h: Math.round(box.height),
+              natural: i.naturalWidth};
+    }""")
+    check("в карточке партии показана миниатюра, а не оригинал",
+          shown and shown["src"].endswith("/thumb"), str(shown))
+    check("картинка действительно нарисована браузером",
+          shown and shown["natural"] > 0 and shown["w"] > 0, str(shown))
+    check("полный размер открывается по клику отдельной вкладкой",
+          shown and shown["href"].startswith("/api/supply/planning/sketches/")
+          and not shown["href"].endswith("/thumb")
+          and shown["target"] == "_blank", str(shown))
+
+    # СЧЁТЧИК СЕТЕВЫХ ЗАПРОСОВ, А НЕ РАЗМЕТКА. `render()` пересоздаёт `<img>`
+    # каждый раз, и до этого пакета каждая перерисовка означала повторную
+    # загрузку картинки: ответ приходил с `no-store`. Теперь ответ приватно
+    # кэшируется на сутки, и повторная перерисовка сети не касается.
+    #
+    # Перерисовка вызывается ТАК, КАК ЕЁ ВЫЗЫВАЕТ ЧЕЛОВЕК: сохранением в другом
+    # месте экрана. Дёргать `render()` напрямую было бы нечем — страница
+    # наружу его не отдаёт, и выставлять его наружу ради проверки значило бы
+    # менять продукт под тест.
+    hits: list[str] = []
+    page.on("request", lambda r: hits.append(r.url)
+            if "/api/supply/planning/sketches/" in r.url else None)
+    for _ in range(3):
+        opened = page.evaluate("""() => {
+          const card = document.querySelector('[data-pl="material"]');
+          if (!card) return false;
+          const b = card.querySelector('button[data-inline="edit"]');
+          if (!b) return false;
+          b.click();
+          return true;
+        }""")
+        if not opened:
+            break
+        page.wait_for_timeout(250)
+        page.evaluate("""() => {
+          const f = document.querySelector('#pl-materials .pl-form.inline');
+          const b = f ? f.querySelector('button[type=submit]') : null;
+          if (b) b.click();
+        }""")
+        page.wait_for_timeout(900)
+    redrawn = page.evaluate("""() => {
+      const i = document.querySelector('#pl-batches img.pl-sketch');
+      return i ? {src: i.getAttribute('src'), natural: i.naturalWidth} : null;
+    }""")
+    check("после трёх перерисовок картинка на месте и нарисована",
+          redrawn and redrawn["natural"] > 0, str(redrawn))
+    check("и ни одного повторного запроса за картинкой не ушло",
+          not hits, str(hits[:3]))
+
+
+def _fix4_retry_after_sketch_fail(page, base, c) -> None:
+    """P1 ревью: отказ эскиза не заводит вторую новинку, и повтор доделывает.
+
+    Порядок «сначала вещь, потом файл» (F-23а) закрыл сирот в базе — и открыл
+    другое: первый запрос уже коммитит новинку, а отказ второго оставляет
+    человека перед формой. Любая правка поля честно сбрасывает идентичность
+    поступка, и повтор уходил как НОВОЕ создание.
+
+    После десяти раундов ревью форма ведёт себя иначе, и проверяется именно
+    это: как только вещь создана, поля становятся только для чтения, а повтор
+    отправляет ТОЛЬКО файл. Дерева состояний «правь что угодно между попытками»
+    больше нет — вместе с классом ошибок, который оно порождало.
+    """
+    print("\n== P1: отказ эскиза не удваивает новинку ==")
+    _open_plan(page, base)
+    title = "Новинка-повтор"
+
+    failed = {"n": 0}
+
+    def deny(route):
+        failed["n"] += 1
+        route.fulfill(status=400, content_type="application/json",
+                      body='{"detail":"Эскиз не принят."}')
+
+    page.route(re.compile(r"/api/supply/planning/items/\d+/sketch$"), deny)
+
+    page.click("#pl-add-item")
+    page.wait_for_timeout(250)
+    page.select_option("#pl-item-kind", "draft")
+    page.wait_for_timeout(150)
+    page.fill("#pl-item-title", title)
+    page.fill("#pl-item-note", "заметка новинки")
+    page.set_input_files("#pl-item-sketch", {
+        "name": "sketch.png", "mimeType": "image/png",
+        "buffer": base64.b64decode(VALID_PNG_B64)})
+    page.evaluate("""() => {
+      const b = document.querySelector('#pl-item-form button[type=submit]');
+      if (b) b.click();
+    }""")
+    page.wait_for_timeout(2500)
+    check("прикрепление действительно отвергнуто", failed["n"] >= 1,
+          str(failed["n"]))
+    err = page.evaluate("""() => {
+      const box = document.getElementById('pl-item-err');
+      return box ? box.textContent : '';
+    }""")
+    check("человеку сказано, что вещь уже сохранена",
+          "уже сохранена" in err, err[:160])
+    board = c.get("/api/supply/planning").json()
+    made = [i for i in board["items"] if i["title"] == title]
+    check("после отказа новинка ровно одна", len(made) == 1,
+          f"строк: {len(made)}")
+
+    # РЕЖИМ ПРИКРЕПЛЕНИЯ ВИДЕН ГЛАЗАМИ, А НЕ ТОЛЬКО ЗАЛОЖЕН В КОДЕ. Поля
+    # показывают сохранённое и не правятся, вид вещи переключить нельзя,
+    # подсказка объясняет почему.
+    mode = page.evaluate("""() => {
+      const t = document.getElementById('pl-item-title');
+      const n = document.getElementById('pl-item-note');
+      const k = document.getElementById('pl-item-kind');
+      const h = document.getElementById('pl-item-attach-hint');
+      return {title: t ? t.value : null, titleRO: t ? t.readOnly : null,
+              note: n ? n.value : null, noteRO: n ? n.readOnly : null,
+              kindOff: k ? k.disabled : null,
+              hint: h ? (!h.hidden && getComputedStyle(h).display !== 'none') : null,
+              hintText: h ? h.textContent : ''};
+    }""")
+    check("поля показывают сохранённое и стали только для чтения",
+          mode and mode["titleRO"] and mode["noteRO"]
+          and mode["title"] == title and mode["note"] == "заметка новинки",
+          str(mode)[:200])
+    check("вид вещи в этом состоянии не переключается",
+          bool(mode and mode["kindOff"]), str(mode and mode["kindOff"]))
+    check("и подсказка объясняет, что осталось сделать",
+          bool(mode and mode["hint"]) and "прикрепить эскиз" in (mode["hintText"] or ""),
+          (mode["hintText"] or "")[:120] if mode else "нет подсказки")
+
+    # Человек выбирает другой файл и сохраняет: уходит ТОЛЬКО прикрепление.
+    page.unroute(re.compile(r"/api/supply/planning/items/\d+/sketch$"))
+    posts = []
+    page.on("request", lambda r: posts.append(r.url)
+            if r.method == "POST" and "/api/supply/planning/" in r.url else None)
+    page.set_input_files("#pl-item-sketch", {
+        "name": "second.png", "mimeType": "image/png",
+        "buffer": base64.b64decode(VALID_PNG_B64)})
+    page.wait_for_timeout(200)
+    page.evaluate("""() => {
+      const b = document.querySelector('#pl-item-form button[type=submit]');
+      if (b) b.click();
+    }""")
+    page.wait_for_timeout(2500)
+    board = c.get("/api/supply/planning").json()
+    made = [i for i in board["items"] if i["title"] == title]
+    check("после удачного повтора новинка ВСЁ ЕЩЁ одна", len(made) == 1,
+          f"строк: {len(made)} — {[i['id'] for i in made]}")
+    check("и эскиз прикреплён именно к ней",
+          len(made) == 1 and made[0]["sketch_id"] is not None,
+          str(made[0]["sketch_id"]) if made else "строки нет")
+    check("повтор отправил только прикрепление, без второго создания",
+          all("/sketch" in u for u in posts), str(posts))
+    check("заметка, набранная до создания, на месте",
+          len(made) == 1 and made[0]["note"] == "заметка новинки",
+          str(made[0]["note"]) if made else "строки нет")
+    check("форма закрылась — работа доведена до конца",
+          page.evaluate("() => document.getElementById('pl-item-form').hidden")
+          is True)
+
+    # ПАМЯТЬ О НАЧАТОМ НЕ ПЕРЕЖИВАЕТ ЗАКРЫТИЕ ФОРМЫ. Ревью нашло путь: после
+    # отказа закрыть форму кнопкой и завести СЛЕДУЮЩУЮ новинку — прежде она
+    # переписывала брошенную строку вместо создания своей.
+    fail2 = {"n": 0}
+    page.route(re.compile(r"/api/supply/planning/items/\d+/sketch$"),
+               lambda route: (fail2.__setitem__("n", fail2["n"] + 1),
+                              route.fulfill(status=400,
+                                            content_type="application/json",
+                                            body='{"detail":"Эскиз не принят."}')))
+    page.click("#pl-add-item")
+    page.wait_for_timeout(250)
+    page.select_option("#pl-item-kind", "draft")
+    page.wait_for_timeout(150)
+    page.fill("#pl-item-title", "Брошенная-новинка")
+    page.set_input_files("#pl-item-sketch", {
+        "name": "bad.png", "mimeType": "image/png",
+        "buffer": base64.b64decode(VALID_PNG_B64)})
+    page.evaluate("""() => {
+      const b = document.querySelector('#pl-item-form button[type=submit]');
+      if (b) b.click();
+    }""")
+    page.wait_for_timeout(2500)
+    check("вторая новинка тоже создана и её эскиз отвергнут", fail2["n"] >= 1,
+          str(fail2["n"]))
+    page.unroute(re.compile(r"/api/supply/planning/items/\d+/sketch$"))
+    # Закрываем форму кнопкой — это отказ от начатого.
+    page.click("#pl-add-item")
+    page.wait_for_timeout(400)
+    page.click("#pl-add-item")
+    page.wait_for_timeout(300)
+    page.select_option("#pl-item-kind", "draft")
+    page.wait_for_timeout(150)
+    page.fill("#pl-item-title", "Совсем-другая-новинка")
+    page.set_input_files("#pl-item-sketch", {
+        "name": "good.png", "mimeType": "image/png",
+        "buffer": base64.b64decode(VALID_PNG_B64)})
+    page.evaluate("""() => {
+      const b = document.querySelector('#pl-item-form button[type=submit]');
+      if (b) b.click();
+    }""")
+    page.wait_for_timeout(2500)
+    board = c.get("/api/supply/planning").json()
+    dropped = [i for i in board["items"] if i["title"] == "Брошенная-новинка"]
+    fresh = [i for i in board["items"] if i["title"] == "Совсем-другая-новинка"]
+    check("брошенная новинка осталась собой, а не переписана следующей",
+          len(dropped) == 1, f"строк: {len(dropped)}")
+    check("и у неё по-прежнему нет эскиза — она его не получала",
+          len(dropped) == 1 and dropped[0]["sketch_id"] is None,
+          str(dropped[0]["sketch_id"]) if dropped else "строки нет")
+    check("новая новинка завелась своей строкой", len(fresh) == 1,
+          f"строк: {len(fresh)}")
+    check("и эскиз достался именно ей",
+          len(fresh) == 1 and fresh[0]["sketch_id"] is not None,
+          str(fresh[0]["sketch_id"]) if fresh else "строки нет")
+
+    # ПУТЬ БЕЗ ФАЙЛА: после отказа человек убирает файл и сохраняет вещь без
+    # эскиза. Это законный исход, и вторая строка здесь так же не нужна.
+    fail3 = {"n": 0}
+    page.route(re.compile(r"/api/supply/planning/items/\d+/sketch$"),
+               lambda route: (fail3.__setitem__("n", fail3["n"] + 1),
+                              route.fulfill(status=400,
+                                            content_type="application/json",
+                                            body='{"detail":"Эскиз не принят."}')))
+    page.click("#pl-add-item")
+    page.wait_for_timeout(250)
+    page.select_option("#pl-item-kind", "draft")
+    page.wait_for_timeout(150)
+    page.fill("#pl-item-title", "Новинка-без-файла")
+    page.set_input_files("#pl-item-sketch", {
+        "name": "bad2.png", "mimeType": "image/png",
+        "buffer": base64.b64decode(VALID_PNG_B64)})
+    page.evaluate("""() => {
+      const b = document.querySelector('#pl-item-form button[type=submit]');
+      if (b) b.click();
+    }""")
+    page.wait_for_timeout(2500)
+    check("третья новинка создана, её эскиз отвергнут", fail3["n"] >= 1,
+          str(fail3["n"]))
+    page.unroute(re.compile(r"/api/supply/planning/items/\d+/sketch$"))
+    page.set_input_files("#pl-item-sketch", [])
+    page.wait_for_timeout(200)
+    page.evaluate("""() => {
+      const b = document.querySelector('#pl-item-form button[type=submit]');
+      if (b) b.click();
+    }""")
+    page.wait_for_timeout(2000)
+    board = c.get("/api/supply/planning").json()
+    plain = [i for i in board["items"] if i["title"] == "Новинка-без-файла"]
+    check("сохранение без файла не завело вторую строку", len(plain) == 1,
+          f"строк: {len(plain)}")
+    check("форма закрыта и после пути без файла",
+          page.evaluate("() => document.getElementById('pl-item-form').hidden")
+          is True)
+
+    # ПОТЕРЯННЫЙ ОТВЕТ ПРИКРЕПЛЕНИЯ: сервер записал эскиз, страница не узнала.
+    # Человек убирает файл и сохраняет — писать нечего, но экран обязан
+    # сойтись с данными, а не закрыться на доске без картинки (`AGENTS.md` §3).
+    def lose(route):
+        try:
+            route.fetch()
+        finally:
+            route.abort()
+
+    page.route(re.compile(r"/api/supply/planning/items/\d+/sketch$"), lose)
+    page.click("#pl-add-item")
+    page.wait_for_timeout(250)
+    page.select_option("#pl-item-kind", "draft")
+    page.wait_for_timeout(150)
+    page.fill("#pl-item-title", "Новинка-расхождение")
+    page.set_input_files("#pl-item-sketch", {
+        "name": "lost.png", "mimeType": "image/png",
+        "buffer": base64.b64decode(VALID_PNG_B64)})
+    page.evaluate("""() => {
+      const b = document.querySelector('#pl-item-form button[type=submit]');
+      if (b) b.click();
+    }""")
+    page.wait_for_timeout(2500)
+    page.unroute(re.compile(r"/api/supply/planning/items/\d+/sketch$"))
+    board = c.get("/api/supply/planning").json()
+    diverged = [i for i in board["items"] if i["title"] == "Новинка-расхождение"]
+    check("сервер прикрепил эскиз, хотя ответ не дошёл",
+          len(diverged) == 1 and diverged[0]["sketch_id"] is not None,
+          str(diverged[:1])[:160])
+    page.set_input_files("#pl-item-sketch", [])
+    page.wait_for_timeout(200)
+    reads = []
+    page.on("request", lambda r: reads.append(r.url)
+            if r.method == "GET" and r.url.endswith("/api/supply/planning")
+            else None)
+    page.evaluate("""() => {
+      const b = document.querySelector('#pl-item-form button[type=submit]');
+      if (b) b.click();
+    }""")
+    page.wait_for_timeout(2500)
+    check("страница сверилась с сервером, а не закрылась на устаревшем",
+          len(reads) >= 1, f"чтений доски: {len(reads)}")
+    check("и форма всё-таки закрыта — работа доведена до конца",
+          page.evaluate("() => document.getElementById('pl-item-form').hidden")
+          is True)
+    board = c.get("/api/supply/planning").json()
+    diverged = [i for i in board["items"] if i["title"] == "Новинка-расхождение"]
+    check("строка одна, и эскиз на ней остался",
+          len(diverged) == 1 and diverged[0]["sketch_id"] is not None,
+          str(diverged[:1])[:160])
+
+    # ЧУЖАЯ ПРАВКА ВО ВРЕМЯ ОТКРЫТОЙ ФОРМЫ. После перестройки формы этот случай
+    # закрыт по построению: форма полей больше не пишет, значит и затирать ей
+    # нечем. Проверяется именно это — ни одного запроса правки и целая чужая
+    # заметка.
+    page.route(re.compile(r"/api/supply/planning/items/\d+/sketch$"),
+               lambda route: route.fulfill(status=400,
+                                           content_type="application/json",
+                                           body='{"detail":"Эскиз не принят."}'))
+    page.click("#pl-add-item")
+    page.wait_for_timeout(250)
+    page.select_option("#pl-item-kind", "draft")
+    page.wait_for_timeout(150)
+    page.fill("#pl-item-title", "Новинка-сосед")
+    page.set_input_files("#pl-item-sketch", {
+        "name": "bad3.png", "mimeType": "image/png",
+        "buffer": base64.b64decode(VALID_PNG_B64)})
+    page.evaluate("""() => {
+      const b = document.querySelector('#pl-item-form button[type=submit]');
+      if (b) b.click();
+    }""")
+    page.wait_for_timeout(2500)
+    page.unroute(re.compile(r"/api/supply/planning/items/\d+/sketch$"))
+    board = c.get("/api/supply/planning").json()
+    peer = [i for i in board["items"] if i["title"] == "Новинка-сосед"]
+    check("новинка для проверки соседа создана", len(peer) == 1,
+          f"строк: {len(peer)}")
+    if len(peer) == 1:
+        c.post(f"/api/supply/planning/items/{peer[0]['id']}/update",
+               json={"note": "заметка соседа", "rev": peer[0]["rev"],
+                     "op_id": "ui-peer-1"})
+        updates = []
+        page.on("request", lambda r: updates.append(r.url)
+                if r.method == "POST" and r.url.endswith("/update") else None)
+        page.set_input_files("#pl-item-sketch", {
+            "name": "peer.png", "mimeType": "image/png",
+            "buffer": base64.b64decode(VALID_PNG_B64)})
+        page.wait_for_timeout(200)
+        page.evaluate("""() => {
+          const b = document.querySelector('#pl-item-form button[type=submit]');
+          if (b) b.click();
+        }""")
+        page.wait_for_timeout(2500)
+        check("форма не отправила ни одной правки полей",
+              not updates, str(updates))
+        after = [i for i in c.get("/api/supply/planning").json()["items"]
+                 if i["id"] == peer[0]["id"]]
+        check("заметка соседа осталась целой",
+              bool(after) and after[0]["note"] == "заметка соседа",
+              str(after[0]["note"]) if after else "строки нет")
+        check("а эскиз всё-таки прикреплён",
+              bool(after) and after[0]["sketch_id"] is not None,
+              str(after[0]["sketch_id"]) if after else "строки нет")
+
+    # ПОТЕРЯН ОТВЕТ САМОГО ПЕРВОГО ЗАПРОСА — СОЗДАНИЯ ВЕЩИ. Вещь на сервере
+    # есть, а страница о ней не знает: номера в руках нет. Повтор обязан
+    # прийти под ТОЙ ЖЕ идентичностью поступка, чтобы замок его узнал, — а
+    # значит выбор другого файла эту идентичность сбрасывать не должен: тело
+    # создания файла не содержит вовсе.
+    page.evaluate("""() => {
+      const f = document.getElementById('pl-item-form');
+      const b = document.getElementById('pl-add-item');
+      if (f && !f.hidden && b) b.click();
+    }""")
+    page.wait_for_timeout(300)
+    page.route(re.compile(r"/api/supply/planning/items$"), lose)
+    page.click("#pl-add-item")
+    page.wait_for_timeout(250)
+    page.select_option("#pl-item-kind", "draft")
+    page.wait_for_timeout(150)
+    page.fill("#pl-item-title", "Новинка-потеря-создания")
+    page.set_input_files("#pl-item-sketch", {
+        "name": "first.png", "mimeType": "image/png",
+        "buffer": base64.b64decode(VALID_PNG_B64)})
+    page.evaluate("""() => {
+      const b = document.querySelector('#pl-item-form button[type=submit]');
+      if (b) b.click();
+    }""")
+    page.wait_for_timeout(2500)
+    page.unroute(re.compile(r"/api/supply/planning/items$"))
+    born = [i for i in c.get("/api/supply/planning").json()["items"]
+            if i["title"] == "Новинка-потеря-создания"]
+    check("сервер создал вещь, хотя ответ не дошёл", len(born) == 1,
+          f"строк: {len(born)}")
+    # Человек выбирает другую картинку и жмёт снова.
+    page.set_input_files("#pl-item-sketch", {
+        "name": "second.png", "mimeType": "image/png",
+        "buffer": base64.b64decode(VALID_PNG_B64)})
+    page.wait_for_timeout(200)
+    page.evaluate("""() => {
+      const b = document.querySelector('#pl-item-form button[type=submit]');
+      if (b) b.click();
+    }""")
+    page.wait_for_timeout(2500)
+    again = [i for i in c.get("/api/supply/planning").json()["items"]
+             if i["title"] == "Новинка-потеря-создания"]
+    check("второй новинки не появилось — повтор узнан по поступку",
+          len(again) == 1, f"строк: {len(again)} — {[i['id'] for i in again]}")
+    check("и эскиз прикреплён к той самой вещи",
+          len(again) == 1 and again[0]["sketch_id"] is not None,
+          str(again[0]["sketch_id"]) if again else "строки нет")
+
+
+def _fix4_history_ui(page, base, c) -> None:
+    """F-24: «История» на карточке показывает последнюю правку."""
+    print("\n== F-24: история правок читается с карточки ==")
+    mat = c.post("/api/supply/planning/materials",
+                 json={"title": "Ткань-история-UI", "qty": "12", "unit": "м",
+                       "op_id": "f4ui-m"}).json()
+    mid = [m for m in mat["materials"] if m["title"] == "Ткань-история-UI"][0]["id"]
+    rev = [m for m in mat["materials"] if m["id"] == mid][0]["rev"]
+    c.post(f"/api/supply/planning/materials/{mid}/update",
+           json={"title": "Ткань-история-UI-2", "rev": rev, "op_id": "f4ui-m2"})
+
+    _open_plan(page, base)
+    opened = page.evaluate("""(id) => {
+      const card = document.querySelector('[data-pl="material"][data-id="' + id + '"]');
+      if (!card) return false;
+      const b = card.querySelector('button[data-inline="history"]');
+      if (!b) return false;
+      b.click();
+      return true;
+    }""", str(mid))
+    check("кнопка «История» есть на карточке материала", opened is True)
+    page.wait_for_timeout(1200)
+    text = page.evaluate("""(id) => {
+      const card = document.querySelector('[data-pl="material"][data-id="' + id + '"]');
+      const box = card ? card.querySelector('.pl-hist') : null;
+      return box ? box.textContent : '';
+    }""", str(mid))
+    check("история показывает поле, прежнее и новое значение",
+          "название" in text and "Ткань-история-UI" in text
+          and "Ткань-история-UI-2" in text, text[:200])
+    check("и называет автора правки", "Владелец" in text, text[:200])
+
+    struck = page.evaluate("""(id) => {
+      const card = document.querySelector('[data-pl="material"][data-id="' + id + '"]');
+      const old = card ? card.querySelector('.pl-hist-old') : null;
+      return old ? getComputedStyle(old).textDecorationLine : '';
+    }""", str(mid))
+    check("прежнее значение зачёркнуто, а не выдано за текущее",
+          "line-through" in struck, str(struck))
+
+    # У партии кнопка та же и работает так же — иначе история жила бы у одной
+    # сущности из двух названных ТЗ.
+    on_batch = page.evaluate("""() => {
+      const card = document.querySelector('[data-pl="batch"]');
+      if (!card) return false;
+      const b = card.querySelector('button[data-inline="history"]');
+      if (!b) return false;
+      b.click();
+      return true;
+    }""")
+    check("кнопка «История» есть и на карточке партии", on_batch is True)
+    page.wait_for_timeout(1200)
+    btext = page.evaluate("""() => {
+      const card = document.querySelector('[data-pl="batch"]');
+      const box = card ? card.querySelector('.pl-hist') : null;
+      return box ? box.textContent : '';
+    }""")
+    check("история партии тоже наполнилась", bool(btext.strip()), btext[:160])
 
 
 def _open_plan(page, base) -> None:

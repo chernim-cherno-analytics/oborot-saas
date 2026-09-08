@@ -16,6 +16,12 @@ oborot.db-wal
 oborot.db-shm
 test_*.db-wal
 test_*.db-shm
+# Базы разовых прогонов для снимков экрана (SUPPLY-FIX-4): такой файл уже
+# попал в коммит один раз, и стоил он шести мегабайт в истории. Правило
+# заведено вместо обещания быть внимательнее.
+shot*.db
+shot*.db-wal
+shot*.db-shm
 ci_*.db
 ci_*.db-wal
 ci_*.db-shm

@@ -60,11 +60,110 @@ app.include_router(supply_router)
 app.include_router(supply_planning_router)
 
 
+#: Потолок тела JSON для пишущих ручек «Поставок» (ТЗ F-25). Один мегабайт —
+#: это на два порядка больше самого длинного законного тела слоя: у него нет ни
+#: одного поля длиннее 500 знаков, а тело переноса и правки укладывается в
+#: сотни байтов.
+#:
+#: ПОЧЕМУ ПОТОЛОК УЗКИЙ, А НЕ ОБЩЕСИСТЕМНЫЙ. Общий лимит на всё приложение —
+#: это отдельная работа со своим сторожем: тела импорта, выгрузки и вебхуков
+#: МойСклада живут по другим правилам, и один потолок на всех сломал бы первый
+#: же из них молча. ТЗ прямо разрешает оба варианта и требует сторожа для
+#: общего; здесь берётся узкий.
+_SUPPLY_JSON_LIMIT = 1024 * 1024
+
+#: Потолок тела ЗАГРУЗКИ (multipart) того же слоя. Он больше, потому что
+#: законная загрузка эскиза несёт до `SKETCH_MAX_BYTES` файла плюс миниатюру
+#: плюс границы формы: одним числом на оба вида тела обрезался бы основной путь
+#: записи. Прежняя редакция вместо этого ИСКЛЮЧАЛА multipart из проверки — и
+#: тем самым оставляла загрузку без потолка вовсе до самого разбора формы.
+_SUPPLY_UPLOAD_LIMIT = 2 * 1024 * 1024 + 256 * 1024
+
+#: Путь, на который потолок распространяется. Именно префикс, а не весь `/api`.
+_SUPPLY_API_PREFIX = "/api/supply/"
+
+
+def _media_type(raw: str | None) -> str:
+    """Основной медиатип без параметров и регистра.
+
+    Разбор нужен потому, что заголовок законно несёт параметры
+    (`application/json; charset=utf-8`), и поиск подстроки в нём — не проверка,
+    а её видимость: `application/json; note=multipart/form-data` прошёл бы как
+    загрузка файла и обошёл бы потолок одним словом в заголовке.
+    """
+    return (raw or "").split(";", 1)[0].strip().lower()
+
+
+def _too_large_reject():
+    from fastapi.responses import JSONResponse as _JR
+    resp = _JR(status_code=413, content={"detail": "Слишком много данных."})
+    resp.headers["Content-Security-Policy"] = "frame-ancestors 'self' https://online.moysklad.ru"
+    return resp
+
+
 def _csrf_reject():
     from fastapi.responses import JSONResponse as _JR
     resp = _JR(status_code=403, content={"detail": "CSRF: запрос отклонён"})
     resp.headers["Content-Security-Policy"] = "frame-ancestors 'self' https://online.moysklad.ru"
     return resp
+
+
+@app.middleware("http")
+async def _supply_body_limit(request: Request, call_next):
+    """Потолок тела JSON для `/api/supply/*` ДО разбора (ТЗ F-25).
+
+    ЗАЧЕМ. До этого пакета тело читалось и разбиралось целиком, каким бы оно ни
+    пришло: чтобы занять память сервера, хватало одного запроса с большим
+    JSON — авторизация и гейт подписки к этому моменту ещё не отработали.
+    Теперь превышение отсекается ответом 413 и до разбора не доходит.
+
+    ДВА РУБЕЖА, И ПЕРВЫЙ ДЕШЁВЫЙ. Сначала смотрим объявленную длину: она
+    приходит от клиента и врать может, но честный большой запрос отсекается по
+    ней, не прочитав ни байта. Затем читаем поток САМИ и обрываем чтение на
+    первом же чанке, который переваливает за потолок: тело без объявленной
+    длины (`Transfer-Encoding: chunked`) иначе накапливалось бы в памяти
+    целиком, и «потолок» означал бы только «отказ после того, как всё уже
+    прочитано». Прочитанное кладётся в сам объект запроса, поэтому ручка ниже
+    получает тело целиком, а не пустоту, — это тот же механизм реплея, которым
+    пользуется CSRF-проверка форм строкой ниже.
+
+    MULTIPART ТОЖЕ ПОД ПОТОЛКОМ, ПРОСТО ПОД СВОИМ. Прежняя редакция исключала
+    его из проверки, рассчитывая на потоковый потолок в самой ручке эскиза, —
+    и это было неверно: FastAPI разбирает форму и складывает файл в
+    `UploadFile` ДО того, как ручка начинает исполняться, поэтому её цикл
+    ограничивает уже накопленное, а не входящий поток. Единственное место, где
+    поток ещё можно оборвать, — здесь, до разбора. Потолок загрузки шире
+    (`_SUPPLY_UPLOAD_LIMIT`): законная картинка в два мегабайта обязана
+    проходить.
+
+    Вид тела определяется РАЗОБРАННЫМ медиатипом, а не поиском подстроки:
+    иначе `application/json; note=multipart/form-data` объявлял бы себя
+    загрузкой и получал вдвое больший потолок.
+    """
+    if (request.method in ("POST", "PUT", "PATCH", "DELETE")
+            and request.url.path.startswith(_SUPPLY_API_PREFIX)):
+        limit = (_SUPPLY_UPLOAD_LIMIT
+                 if _media_type(request.headers.get("content-type")) == "multipart/form-data"
+                 else _SUPPLY_JSON_LIMIT)
+        declared = (request.headers.get("content-length") or "").strip()
+        if declared.isdigit() and int(declared) > limit:
+            return _too_large_reject()
+        if getattr(request, "_body", None) is None:
+            chunks: list[bytes] = []
+            seen = 0
+            async for chunk in request.stream():
+                seen += len(chunk)
+                if seen > limit:
+                    # Читать дальше незачем: ответ уже известен, а каждый
+                    # следующий байт — это память воркера, потраченная на
+                    # запрос, который всё равно отвергнут.
+                    return _too_large_reject()
+                chunks.append(chunk)
+            # Присваивание, а не `await request.body()`: тело уже прочитано, и
+            # второй проход по исчерпанному потоку упал бы. Это тот самый
+            # атрибут, который `BaseHTTPMiddleware` реплеит вниз по стеку.
+            request._body = b"".join(chunks)
+    return await call_next(request)
 
 
 @app.middleware("http")
@@ -142,6 +241,19 @@ async def _log_org_context(request: Request, call_next):
         logging_conf.set_org(sess.get("org_id") if sess else None)
     return await call_next(request)
 
+
+# ТЗ F-25: сжатие ответов. Ответ доски планирования — это весь экран одним
+# документом (порядка двухсот килобайт у бренда с сотней строк), и передавать
+# его несжатым на мобильной сети значило платить временем человека за то, что
+# стоит одну строку. Порог 1024 байта: сжимать короткие ответы дороже, чем
+# отдать их как есть.
+#
+# Middleware добавляется ПОСЛЕ двух объявленных выше, поэтому в стеке
+# оказывается снаружи: сжимается уже готовый ответ, включая ответы отказов CSRF
+# и потолка тела. Клиент, не приславший `Accept-Encoding: gzip`, получает всё
+# ровно как раньше — согласование здесь стандартное, своего в нём ничего нет.
+from starlette.middleware.gzip import GZipMiddleware  # noqa: E402
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 from app import scheduler as _scheduler  # noqa: E402
 _scheduler.attach(app)
@@ -255,6 +367,14 @@ STARTUP_SCHEMA_STEPS: tuple[tuple[str, int], ...] = (
     ("models.ensure_supply_assignment_archive_schema", 14),
     ("models.ensure_order_payment_terms_schema", 15),
     ("models.ensure_buy_price_presence_schema", 16),
+    # SUPPLY-FIX-4 (F-23б): миниатюра эскиза. Шестой append-only шаг ЭТОГО
+    # слоя и семнадцатый в списке. Позиция здесь 17, а не 15, и это не
+    # косметика: пока пакет делался, в `main` слились шаги 15 и 16 чужого
+    # пакета, и они уже выпущены. Занять их номер значило бы объявить
+    # противоречивым сам список (`_validate_startup_order`) и уронить старт на
+    # любой базе, где те шаги записаны. Собственный, ещё не выпущенный номер
+    # подвинуть можно; чужой выпущенный — нет.
+    ("models.ensure_supply_sketch_thumb_schema", 17),
 )
 _STARTUP_STEP_ORDER = dict(STARTUP_SCHEMA_STEPS)
 
@@ -462,6 +582,12 @@ def _startup() -> None:
                   _models.ensure_order_payment_terms_schema)
     _startup_step("models.ensure_buy_price_presence_schema",
                   _models.ensure_buy_price_presence_schema)
+    # SUPPLY-FIX-4: одна нуллируемая колонка миниатюры у эскиза. Как и шаги
+    # 13–14, ничего не читает и не переписывает; на базе, где колонка уже
+    # есть, не делает ни одного ALTER. Вызов стоит ПОСЛЕ двух шагов чужого
+    # пакета — в том же порядке, в каком они объявлены выше.
+    _startup_step("models.ensure_supply_sketch_thumb_schema",
+                  _models.ensure_supply_sketch_thumb_schema)
     # Замок на пропуск: все объявленные шаги выполнены, и ровно они.
     _finish_startup_steps()
     global _STARTUP_DONE

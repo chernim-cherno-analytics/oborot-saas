@@ -353,7 +353,7 @@ def concrete_url(route: str, params: dict) -> str:
 
 
 def probe_foreign(c: httpx.Client, route: str, method: str, params: dict,
-                  body=None):
+                  body=None, files=None):
     """Дёрнуть чужой объект по идентификатору — и этим же зарегистрировать обход.
 
     Покрытие записывается здесь, побочным продуктом исполнения, и только после
@@ -403,8 +403,17 @@ def probe_foreign(c: httpx.Client, route: str, method: str, params: dict,
               f"этому маршруту", False, f"url={url}; {why}")
         return None
 
-    r = (c.request(method, url, json=body) if body is not None
-         else c.request(method, url))
+    # `files` вместо `body` — не удобство, а условие осмысленности пробы.
+    # Ручка, принимающая ФАЙЛ, на теле JSON отвечает 422 «тело не то», и такой
+    # ответ не сказал бы ничего про арендатора: до проверки чужого
+    # идентификатора запрос просто не доходит. Проба обязана бить туда же, куда
+    # бьёт настоящий запрос.
+    if files is not None:
+        r = c.request(method, url, files=files)
+    elif body is not None:
+        r = c.request(method, url, json=body)
+    else:
+        r = c.request(method, url)
     PROBED_ID_ROUTES.add((route, method))
     check(f"{method} {route} из чужой организации отклонён",
           r.status_code in (403, 404), f"status={r.status_code} {r.text[:100]}")
@@ -607,6 +616,11 @@ def run_all() -> None:
         # номеров. Здесь проверяется сам запрет, ниже (§1а) — что отказ не несёт
         # чужого текста и ничего не пишет.
         ("/api/supply/planning/sketches/{sketch_id}", "GET", {"sketch_id": sketch_b}, None),
+        # SUPPLY-FIX-4. Миниатюра — тот же приватный эскиз другим адресом, и
+        # чужой она отвечает так же. Отдельная проба нужна именно потому, что
+        # адрес другой: маршрут, которого нет в этом списке, не проверен ничем.
+        ("/api/supply/planning/sketches/{sketch_id}/thumb", "GET",
+         {"sketch_id": sketch_b}, None),
         ("/api/supply/planning/materials/{material_id}/update", "POST",
          {"material_id": mat_b}, {"qty": "1", "op_id": "iso-x1"}),
         ("/api/supply/planning/batches/{batch_id}/update", "POST",
@@ -638,6 +652,20 @@ def run_all() -> None:
         r = probe_foreign(a, route, method, params, body)
         if r is not None:
             answers[(route, method)] = r
+
+    # SUPPLY-FIX-4: прикрепление эскиза к ЧУЖОЙ вещи. Стоит отдельно от таблицы
+    # выше, потому что тело у этой ручки не JSON, а файл (см. `files` в
+    # `probe_foreign`). Байты синтетические и минимальные: проверяется отказ по
+    # арендатору, а не разбор картинки.
+    tiny_png = bytes.fromhex(
+        "89504e470d0a1a0a0000000d49484452000000010000000108020000009077"
+        "3dfa0000000c4944415478da63f8cfc0000003010100b5a5b2a6"
+        "0000000049454e44ae426082")
+    r = probe_foreign(a, "/api/supply/planning/items/{item_id}/sketch", "POST",
+                      {"item_id": item_b},
+                      files={"file": ("x.png", tiny_png, "image/png")})
+    if r is not None:
+        answers[("/api/supply/planning/items/{item_id}/sketch", "POST")] = r
 
     # ── 1а. Отказ не должен ни раскрывать, ни менять ─────────────────────────
     # Один только код ответа доказывает меньше, чем кажется: 404 с чужими
