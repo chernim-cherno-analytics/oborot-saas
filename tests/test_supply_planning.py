@@ -3513,6 +3513,24 @@ def _fix4_dedup_cleanup_race(c, org4: int) -> None:
     check("и НЕ удалила номер, который сама же вернула",
           still.status_code == 200, f"{still.status_code} {still.text[:80]}")
 
+    # И СЛЕДУЮЩАЯ УБОРКА ЕГО ТОЖЕ НЕ ЗАБИРАЕТ. `keep` защищает только свой
+    # проход; между выдачей номера и созданием вещи старый клиент делает ещё
+    # один запрос, и без сдвига часов второй проход уносил бы выданную строку —
+    # то есть штатный двухзапросный сценарий ломался бы через раз.
+    c.post(P2 + "/sketches",
+           files={"file": ("other.png", _fix4_png(300, 200, tone=0xA6),
+                           "image/png")})
+    survived = c.get(P2 + f"/sketches/{again_id}")
+    check("и следующая уборка чужого файла его тоже не забрала",
+          survived.status_code == 200,
+          f"{survived.status_code} {survived.text[:80]}")
+    late = _fix4_new_item(c, "Вещь-совместимость", "f4-lg-i")
+    attached = c.post(P2 + f"/items/{late}/update",
+                      json={"sketch_id": again_id, "rev": 1,
+                            "op_id": "f4-lg-a"})
+    check("старый клиент доводит свой сценарий до конца",
+          attached.status_code == 200, f"{attached.status_code} {attached.text[:90]}")
+
 
 def _fix4_cache_vary(c) -> None:
     """P1 ревью: приватный кэш обязан различать сессии.
