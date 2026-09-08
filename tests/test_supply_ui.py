@@ -4463,6 +4463,57 @@ def _fix4_retry_after_sketch_fail(page, base, c) -> None:
           len(lost) == 1 and lost[0]["sketch_id"] is not None,
           str(lost[0]["sketch_id"]) if lost else "строки нет")
 
+    # ШЕСТОЙ ПУТЬ: ЧУЖАЯ ПРАВКА ВО ВРЕМЯ ОТКРЫТОЙ ФОРМЫ. Отказ, который
+    # снимается повтором, защитой не является: первая попытка обязана
+    # отказать, и ВТОРАЯ — тоже, а чужие значения обязаны остаться на месте.
+    page.route(re.compile(r"/api/supply/planning/items/\d+/sketch$"),
+               lambda route: route.fulfill(status=400,
+                                           content_type="application/json",
+                                           body='{"detail":"Эскиз не принят."}'))
+    page.click("#pl-add-item")
+    page.wait_for_timeout(250)
+    page.select_option("#pl-item-kind", "draft")
+    page.wait_for_timeout(150)
+    page.fill("#pl-item-title", "Новинка-сосед")
+    page.set_input_files("#pl-item-sketch", {
+        "name": "bad3.png", "mimeType": "image/png",
+        "buffer": base64.b64decode(VALID_PNG_B64)})
+    page.evaluate("""() => {
+      const b = document.querySelector('#pl-item-form button[type=submit]');
+      if (b) b.click();
+    }""")
+    page.wait_for_timeout(2500)
+    page.unroute(re.compile(r"/api/supply/planning/items/\d+/sketch$"))
+    board = c.get("/api/supply/planning").json()
+    peer = [i for i in board["items"] if i["title"] == "Новинка-сосед"]
+    check("новинка для проверки соседа создана", len(peer) == 1,
+          f"строк: {len(peer)}")
+    if len(peer) == 1:
+        # Сосед правит ту же вещь мимо этой страницы.
+        c.post(f"/api/supply/planning/items/{peer[0]['id']}/update",
+               json={"note": "заметка соседа", "rev": peer[0]["rev"],
+                     "op_id": "ui-peer-1"})
+        page.set_input_files("#pl-item-sketch", [])
+        page.fill("#pl-item-note", "моя заметка поверх чужой")
+        page.wait_for_timeout(200)
+        for attempt in (1, 2):
+            page.evaluate("""() => {
+              const b = document.querySelector('#pl-item-form button[type=submit]');
+              if (b) b.click();
+            }""")
+            page.wait_for_timeout(2000)
+            err = page.evaluate("""() => {
+              const box = document.getElementById('pl-item-err');
+              return box ? box.textContent : '';
+            }""")
+            check(f"попытка {attempt}: чужая правка названа, а не затёрта",
+                  "другом окне" in err, err[:140])
+        after = [i for i in c.get("/api/supply/planning").json()["items"]
+                 if i["id"] == peer[0]["id"]]
+        check("заметка соседа осталась целой после ДВУХ нажатий",
+              bool(after) and after[0]["note"] == "заметка соседа",
+              str(after[0]["note"]) if after else "строки нет")
+
 
 def _fix4_history_ui(page, base, c) -> None:
     """F-24: «История» на карточке показывает последнюю правку."""

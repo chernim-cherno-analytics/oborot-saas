@@ -2153,6 +2153,7 @@ document.addEventListener("DOMContentLoaded", function () {
         // вместе с ней: иначе следующее открытие «Добавить вещь» доделывало бы
         // ту новинку, о которой человек уже забыл (F-23а).
         delete form.dataset.itemId;
+        delete form.dataset.itemSeen;
       }
     });
   }
@@ -2204,6 +2205,7 @@ document.addEventListener("DOMContentLoaded", function () {
     // успехом, чем-то ещё, что появится позже, — следующее открытие начинает с
     // чистого листа. Один рубеж на трёх путях закрытия уже однажды не сработал.
     delete form.dataset.itemId;
+    delete form.dataset.itemSeen;
     clear(form);
     var kind = el("select");
     kind.id = "pl-item-kind";
@@ -2577,6 +2579,7 @@ document.addEventListener("DOMContentLoaded", function () {
   function closeItemForm(form) {
     resetToken(form);
     draftItemId(form, 0);
+    draftItemSeen(form, 0);
     form.hidden = true;
     clear(form);
     var add = byId("pl-add-item");
@@ -2599,6 +2602,24 @@ document.addEventListener("DOMContentLoaded", function () {
     return rows.length ? rows[0] : null;
   }
 
+  //: ЧТО ЭТА ФОРМА САМА ЗАПИСАЛА В СТРОКУ — снимок, а не текущая доска.
+  //:
+  //: Разница не тонкая, и она уже стоила дефекта. Доска — общее состояние: её
+  //: перезаписывает любой запрос, включая тот, который принёс ЧУЖУЮ правку.
+  //: Если брать «что форма видела» оттуда, то после первой же неудачной
+  //: попытки основанием становятся чужие значения — и вторая попытка спокойно
+  //: затирает их своими старыми. Снимок живёт на самой форме и от чужих правок
+  //: не меняется: он и есть то утверждение, которое форма собирается
+  //: подтвердить (то же правило, что у редакции черновика, D-58 п. 6в).
+  function draftItemSeen(form, value) {
+    if (value !== undefined) {
+      if (value) form.dataset.itemSeen = JSON.stringify(value);
+      else delete form.dataset.itemSeen;
+    }
+    if (!form.dataset.itemSeen) return null;
+    try { return JSON.parse(form.dataset.itemSeen); } catch (e) { return null; }
+  }
+
   // СВЕЖАЯ РЕДАКЦИЯ НАЧАТОЙ ВЕЩИ — И ТОЛЬКО ЕСЛИ ЕЁ НИКТО НЕ ТРОГАЛ.
   //
   // Зачем это нужно. Прикрепление эскиза меняет строку на сервере (у вещи
@@ -2618,17 +2639,22 @@ document.addEventListener("DOMContentLoaded", function () {
   // узнаёт о ней, а не затирает её молча.
   function freshItemRev(known, seen) {
     return api("/api/supply/planning").then(function (board) {
-      PL.board = board;
       var rows = (board.items || []).filter(function (i) { return i.id === known; });
       if (!rows.length) {
         throw new Error("Эта вещь больше не на доске. Обновите страницу.");
       }
       var row = rows[0];
-      if ((row.title || "") !== (seen.title || "")
-          || (row.note || "") !== (seen.note || "")) {
+      if ((row.title || "") !== ((seen && seen.title) || "")
+          || (row.note || "") !== ((seen && seen.note) || "")) {
+        // ДОСКА НЕ ПРИСВАИВАЕТСЯ ПРИ РАСХОЖДЕНИИ, И ЭТО ГЛАВНОЕ ЗДЕСЬ. Присвоив
+        // её, мы сделали бы чужие значения тем, «что форма видела», — и
+        // повторное нажатие затёрло бы чужую правку своими старыми числами,
+        // отказав ровно один раз. Отказ, который снимается повтором, защитой не
+        // является.
         throw new Error("Вещь уже изменили в другом окне. Обновите страницу — "
                         + "показанные значения устарели.");
       }
+      PL.board = board;
       return row.rev;
     });
   }
@@ -2644,20 +2670,20 @@ document.addEventListener("DOMContentLoaded", function () {
   function finishStartedItem(form, body) {
     var known = draftItemId(form);
     if (!known) return false;
-    var row = itemRowOf(known);
-    if (!row) {
-      // Строки на доске нет — значит её убрали, пока форма была открыта.
-      // Дописывать в неё нечего, и память о ней снимается: дальше обычное
+    var seen = draftItemSeen(form);
+    if (!seen && !itemRowOf(known)) {
+      // Ни снимка, ни строки на доске — начинать нечего: дальше обычное
       // создание, а не молчаливый отказ.
       draftItemId(form, 0);
       return false;
     }
     var wantTitle = (body.title || "").trim();
     var wantNote = body.note || "";
-    if ((row.title || "") === wantTitle && (row.note || "") === wantNote) {
-      // Ничего не изменилось: вещь на сервере уже такая, какой человек её
-      // видит. Второй запрос был бы записью без изменения — тем самым, что
-      // F-24 перестал считать правкой.
+    if (seen && (seen.title || "") === wantTitle
+        && (seen.note || "") === wantNote) {
+      // Человек ничего не изменил с прошлой записи ЭТОЙ формы: писать нечего.
+      // Сравнение идёт со СНИМКОМ, а не с доской, намеренно — доска могла уже
+      // принести чужую правку, и «совпало с доской» означало бы «затрём её».
       closeItemForm(form);
       plToast("Сохранено", {ms: 3000});
       flash("item", known);
@@ -2669,7 +2695,7 @@ document.addEventListener("DOMContentLoaded", function () {
     setError("pl-error", "");
     setError("pl-item-err", "");
     var token = actionToken(form);
-    freshItemRev(known, row)
+    freshItemRev(known, seen)
       .then(function (rev) {
         return api("/api/supply/planning/items/" + known + "/update",
                    {method: "POST", body: {title: wantTitle, note: wantNote,
@@ -2717,12 +2743,12 @@ document.addEventListener("DOMContentLoaded", function () {
       // потеря ввода, что запрещена пакетом 1 (D-55 п. 1). Сравнение идёт со
       // СВЕЖЕЙ доской: ответ создания кладётся в `PL.board` сразу, иначе
       // созданной строки в ней нет вовсе и сравнивать не с чем.
-      var row = itemRowOf(known);
+      var seen = draftItemSeen(form);
       var wantTitle = (body.title || "").trim();
       var wantNote = body.note || "";
-      if (row && ((row.title || "") !== wantTitle
-                  || (row.note || "") !== wantNote)) {
-        first = freshItemRev(known, row)
+      if (seen && ((seen.title || "") !== wantTitle
+                   || (seen.note || "") !== wantNote)) {
+        first = freshItemRev(known, seen)
           .then(function (rev) {
             return api("/api/supply/planning/items/" + known + "/update",
                        {method: "POST", body: {title: wantTitle,
@@ -2747,6 +2773,10 @@ document.addEventListener("DOMContentLoaded", function () {
                           + "Обновите страницу.");
         }
         draftItemId(form, itemId);
+        // Снимок ставится ровно тем, что эта форма записала, и обновляется
+        // после каждой её удачной записи: он и есть «то, что форма видела».
+        draftItemSeen(form, {title: (body.title || "").trim(),
+                             note: body.note || ""});
         // ДОСКА ОБНОВЛЯЕТСЯ СРАЗУ ПОСЛЕ СОЗДАНИЯ, А НЕ В САМОМ КОНЦЕ. Вещь уже
         // записана: держать её в тайне от экрана до конца второго запроса
         // значило бы показывать состояние, которого на сервере больше нет, — и
