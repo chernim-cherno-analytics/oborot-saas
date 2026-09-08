@@ -2153,7 +2153,6 @@ document.addEventListener("DOMContentLoaded", function () {
         // вместе с ней: иначе следующее открытие «Добавить вещь» доделывало бы
         // ту новинку, о которой человек уже забыл (F-23а).
         delete form.dataset.itemId;
-        delete form.dataset.itemSeen;
       }
     });
   }
@@ -2205,7 +2204,6 @@ document.addEventListener("DOMContentLoaded", function () {
     // успехом, чем-то ещё, что появится позже, — следующее открытие начинает с
     // чистого листа. Один рубеж на трёх путях закрытия уже однажды не сработал.
     delete form.dataset.itemId;
-    delete form.dataset.itemSeen;
     clear(form);
     var kind = el("select");
     kind.id = "pl-item-kind";
@@ -2257,6 +2255,14 @@ document.addEventListener("DOMContentLoaded", function () {
     form.appendChild(field("Заметка", note, true));
     form.appendChild(el("div", "pl-hint",
       "Два одинаковых названия — это две разные вещи: «Оборот» их не склеивает."));
+    // Подсказка режима прикрепления: она появляется, только когда вещь уже
+    // создана, и объясняет, почему поля перестали правиться (F-23а).
+    var attachHint = el("div", "pl-hint",
+      "Вещь сохранена. Осталось прикрепить эскиз — выберите файл и нажмите "
+      + "«Сохранить». Название и заметку можно поправить на карточке вещи.");
+    attachHint.id = "pl-item-attach-hint";
+    attachHint.hidden = true;
+    form.appendChild(attachHint);
     form.appendChild(submitRow("Сохранить вещь", "pl-item-err"));
 
     function paintKind() {
@@ -2484,17 +2490,16 @@ document.addEventListener("DOMContentLoaded", function () {
                    + Math.round(maxBytes / (1024 * 1024)) + " МБ — уменьшите картинку.");
           return;
         }
+      }
+      // ВЕЩЬ УЖЕ СОЗДАНА? ЗНАЧИТ ВТОРОЙ ЕЙ НЕ БЫВАТЬ. Вопрос задаётся ДО
+      // всякого ветвления по файлу и ровно один раз: путей отправки несколько,
+      // а память о начатом одна. Прежде проверка стояла только на пути С
+      // файлом — и повтор без файла заводил вторую новинку с тем же именем.
+      if (finishStartedItem(form, chosen)) return;
+      if (chosen) {
         submitDraftWithSketch(form, body, chosen);
         return;
       }
-      // ФАЙЛА НЕТ — НО ВЕЩЬ МОГЛА БЫТЬ УЖЕ СОЗДАНА ПРОШЛОЙ ПОПЫТКОЙ. Человек
-      // после отказа прикрепления вправе просто убрать файл из поля и
-      // сохранить вещь без эскиза: это законный исход, а не отказ от начатого.
-      // Прежняя редакция проверяла память о начатом только на пути С файлом, и
-      // здесь безусловно создавала ВТОРУЮ новинку с тем же именем, оставляя
-      // первую без эскиза. Проверка стоит до всякого ветвления по файлу именно
-      // поэтому: путей отправки несколько, а память о начатом одна.
-      if (finishStartedItem(form, body)) return;
       send("/api/supply/planning/items", body, "pl-item-err", function (ok) {
         if (ok) closeItemForm(form);
       }, {kind: "item"});
@@ -2579,9 +2584,10 @@ document.addEventListener("DOMContentLoaded", function () {
   function closeItemForm(form) {
     resetToken(form);
     draftItemId(form, 0);
-    draftItemSeen(form, 0);
     form.hidden = true;
     clear(form);
+    // Содержимое формы стёрто целиком, поэтому режим прикрепления снимать не с
+    // чего — но номер снят выше, и следующая сборка начнёт с чистого листа.
     var add = byId("pl-add-item");
     if (add) add.setAttribute("aria-expanded", "false");
   }
@@ -2595,143 +2601,59 @@ document.addEventListener("DOMContentLoaded", function () {
     return isFinite(raw) && raw > 0 ? raw : 0;
   }
 
-  function itemRowOf(id) {
-    var rows = ((PL.board && PL.board.items) || []).filter(function (i) {
-      return i.id === id;
+  //: ФОРМА, У КОТОРОЙ ВЕЩЬ УЖЕ СОЗДАНА, БОЛЬШЕ НЕ ПРАВИТ ПОЛЯ — И ЭТО НЕ
+  //: УПРОЩЕНИЕ РАДИ УПРОЩЕНИЯ, А ВЫВОД ИЗ ДЕСЯТИ РАУНДОВ РЕВЬЮ.
+  //:
+  //: Сохранение новинки с эскизом идёт двумя запросами (ТЗ F-23а): сначала
+  //: вещь, потом файл к ней. Между ними бывает отказ — и первая редакция
+  //: оставляла форму полностью живой: правь имя, правь заметку, меняй файл,
+  //: жми снова. Каждое такое состояние приходилось согласовывать с сервером
+  //: вручную: чья это правка, какая сейчас редакция, не долетела ли наша
+  //: предыдущая, не обрезал ли сервер края строки. Ревью нашло в этой сверке
+  //: пять дефектов подряд — от затирания чужой правки повтором до вечного
+  //: отказа после потерянного ответа, — и каждый раз чинилась ОДНА ветка
+  //: разросшегося дерева состояний.
+  //:
+  //: Поэтому дерево срублено, а не подстрижено. Как только вещь создана, форма
+  //: переходит в одно понятное состояние: «вещь сохранена, осталось прикрепить
+  //: эскиз». Текстовые поля становятся только для чтения и показывают ровно то,
+  //: что записано, — ничего не теряется и не прячется. Правка имени и заметки
+  //: живёт там, где ей и место: на карточке вещи, кнопкой «Изменить».
+  //:
+  //: Что это убирает целиком: сверку снимка с доской, переоснование редакции,
+  //: распознавание собственной применившейся правки, нормализацию краёв строки.
+  //: Ни одного из этих механизмов больше нет — вместе с классом ошибок, который
+  //: они порождали. Остаётся один вопрос: прикрепить файл или нет.
+  function paintItemAttachMode(form) {
+    var lock = !!draftItemId(form);
+    ["pl-item-title", "pl-item-note"].forEach(function (id) {
+      var node = byId(id);
+      if (!node) return;
+      // `readOnly`, а не `disabled`: отключённое поле браузер красит серым и
+      // не даёт из него копировать — человек должен ВИДЕТЬ сохранённое, а не
+      // смотреть на серый прямоугольник.
+      node.readOnly = lock;
+      node.setAttribute("aria-readonly", lock ? "true" : "false");
     });
-    return rows.length ? rows[0] : null;
+    var kind = byId("pl-item-kind");
+    if (kind) kind.disabled = lock;
+    var hint = byId("pl-item-attach-hint");
+    if (hint) hint.hidden = !lock;
   }
 
-  //: ЧТО ЭТА ФОРМА САМА ЗАПИСАЛА В СТРОКУ — снимок, а не текущая доска.
-  //:
-  //: Разница не тонкая, и она уже стоила дефекта. Доска — общее состояние: её
-  //: перезаписывает любой запрос, включая тот, который принёс ЧУЖУЮ правку.
-  //: Если брать «что форма видела» оттуда, то после первой же неудачной
-  //: попытки основанием становятся чужие значения — и вторая попытка спокойно
-  //: затирает их своими старыми. Снимок живёт на самой форме и от чужих правок
-  //: не меняется: он и есть то утверждение, которое форма собирается
-  //: подтвердить (то же правило, что у редакции черновика, D-58 п. 6в).
-  //: КАКИМИ ЗНАЧЕНИЯ ЛЯГУТ НА СЕРВЕР. Сервер обрезает края строки (`clean_text`),
-  //: и снимок обязан хранить то же самое: иначе заметка «  текст  » уходит с
-  //: пробелами, возвращается без них, и форма считает собственную запись чужой
-  //: правкой. Внутренние пробелы и регистр не трогаются ни здесь, ни там — это
-  //: текст человека, а не наш.
-  function itemFields(title, note) {
-    return {title: (title || "").trim(), note: (note || "").trim()};
-  }
-
-  function draftItemSeen(form, value) {
-    if (value !== undefined) {
-      if (value) form.dataset.itemSeen = JSON.stringify(value);
-      else delete form.dataset.itemSeen;
-    }
-    if (!form.dataset.itemSeen) return null;
-    try { return JSON.parse(form.dataset.itemSeen); } catch (e) { return null; }
-  }
-
-  // СВЕЖАЯ РЕДАКЦИЯ НАЧАТОЙ ВЕЩИ — И ТОЛЬКО ЕСЛИ ЕЁ НИКТО НЕ ТРОГАЛ.
+  // ВЕЩЬ УЖЕ СОЗДАНА — ЗНАЧИТ ОСТАЛСЯ ТОЛЬКО ЭСКИЗ. Возвращает true, если
+  // отправка взята на себя.
   //
-  // Зачем это нужно. Прикрепление эскиза меняет строку на сервере (у вещи
-  // появляется картинка), а значит двигает её редакцию. Если ответ этого
-  // запроса потерялся — сервер записал, страница не узнала, — доска у нас
-  // осталась той, что вернуло создание, с ПРЕЖНЕЙ редакцией. Правка полей
-  // после этого уходила со старым номером и получала 409 «изменили в другом
-  // окне» за собственное же изменение: основной путь записи упирался в тупик,
-  // из которого выходили только перезагрузкой страницы.
-  //
-  // Почему нельзя просто взять свежий номер и записать поверх. Потому что это
-  // ровно то, против чего оптимистичная блокировка и стоит (D-58 п. 6в):
-  // соседнее окно могло за это время изменить ту же вещь. Поэтому номер
-  // берётся свежий ТОЛЬКО когда значения на сервере совпадают с теми, которые
-  // форма в последний раз видела: тогда сдвиг редакции — наш собственный, и
-  // переоснование безопасно. Разошлись значения — это чужая правка, и человек
-  // узнаёт о ней, а не затирает её молча.
-  //: НА ЧТО ОПЕРЕТЬСЯ ПРИ ЗАПИСИ В УЖЕ НАЧАТУЮ ВЕЩЬ. Возвращает свежую редакцию
-  //: и признак «наша правка уже применилась».
-  //:
-  //: Годных состояний строки на сервере ровно два, и оба надо различать.
-  //: (1) Она такая, какой её оставила ЭТА форма (`seen`) — значит писать
-  //: можно. (2) Она уже такая, какой человек хочет её видеть (`want`) — значит
-  //: наша же правка долетела, а ответ на неё потерялся; писать второй раз
-  //: нечего, и объявлять это чужим вмешательством нельзя: иначе после
-  //: потерянного ответа форма упиралась бы в вечный отказ, из которого выход
-  //: только перезагрузкой. Всё остальное — чужая правка, и её называют вслух.
-  //:
-  //: ДОСКА ПРИСВАИВАЕТСЯ ТОЛЬКО ПОСЛЕ УДАЧНОГО СРАВНЕНИЯ. Присвоив её раньше,
-  //: мы сделали бы чужие значения тем, «что форма видела», — и повторное
-  //: нажатие затёрло бы чужую правку своими старыми числами, отказав ровно
-  //: один раз. Отказ, который снимается повтором, защитой не является.
-  function itemWriteBase(known, seen, want) {
-    return api("/api/supply/planning").then(function (board) {
-      var rows = (board.items || []).filter(function (i) { return i.id === known; });
-      if (!rows.length) {
-        throw new Error("Эта вещь больше не на доске. Обновите страницу.");
-      }
-      var row = rows[0];
-      var asWant = (row.title || "") === ((want && want.title) || "")
-                   && (row.note || "") === ((want && want.note) || "");
-      var asSeen = (row.title || "") === ((seen && seen.title) || "")
-                   && (row.note || "") === ((seen && seen.note) || "");
-      if (!asWant && !asSeen) {
-        throw new Error("Вещь уже изменили в другом окне. Обновите страницу — "
-                        + "показанные значения устарели.");
-      }
-      PL.board = board;
-      return {rev: row.rev, applied: asWant};
-    });
-  }
-
-  // ДОВЕСТИ ДО КОНЦА УЖЕ НАЧАТУЮ ВЕЩЬ, А НЕ ЗАВЕСТИ ВТОРУЮ. Возвращает true,
-  // если отправка взята на себя: вызывающему остаётся выйти.
-  //
-  // Случай один и тот же на всех путях: первый запрос уже создал новинку,
-  // второй (эскиз) отказал, и человек продолжает работу — правит поля, меняет
-  // файл или убирает его вовсе. Любая такая правка честно сбрасывает
-  // идентичность поступка, потому что это уже другой поступок; без памяти о
-  // созданной строке повтор заводил бы её заново.
-  function finishStartedItem(form, body) {
+  // Файла нет — значит человек решил обойтись без картинки: писать нечего. Но
+  // и закрыться молча нельзя: если ответ прикрепления потерялся, сервер уже
+  // хранит картинку, а доска у формы — от создания и без неё. Экран, который
+  // расходится с данными, это стоп-условие `AGENTS.md` §3, поэтому доска
+  // перечитывается одним дешёвым чтением.
+  function finishStartedItem(form, fileObj) {
     var known = draftItemId(form);
     if (!known) return false;
-    var seen = draftItemSeen(form);
-    if (!seen && !itemRowOf(known)) {
-      // Ни снимка, ни строки на доске — начинать нечего: дальше обычное
-      // создание, а не молчаливый отказ.
-      draftItemId(form, 0);
-      return false;
-    }
-    var want = itemFields(body.title, body.note);
-    var wantTitle = want.title, wantNote = want.note;
-    if (seen && (seen.title || "") === wantTitle
-        && (seen.note || "") === wantNote) {
-      // Человек ничего не изменил с прошлой записи ЭТОЙ формы: писать нечего.
-      // Сравнение идёт со СНИМКОМ, а не с доской, намеренно — доска могла уже
-      // принести чужую правку, и «совпало с доской» означало бы «затрём её».
-      //
-      // НО ЗАКРЫТЬСЯ МОЛЧА ЗДЕСЬ НЕЛЬЗЯ. Писать нечего — а показать надо: если
-      // ответ прикрепления эскиза потерялся, сервер УЖЕ хранит картинку, а
-      // доска у нас от создания и без неё. Закрыв форму на этом состоянии, мы
-      // оставили бы экран расходиться с данными до перезагрузки, и человек
-      // увидел бы эскиз «внезапно появившимся» (стоп-условие `AGENTS.md` §3:
-      // расхождение того, что показывает интерфейс, и того, что в данных).
-      // Поэтому доска перечитывается — одним дешёвым чтением, без записи.
-      if (PL.saving) return true;
-      PL.saving = true;
-      paintSaving(true);
-      setError("pl-error", "");
-      setError("pl-item-err", "");
-      api("/api/supply/planning")
-        .then(function (board) {
-          PL.board = board;
-          render();
-          plToast("Сохранено", {ms: 3000});
-          flash("item", known);
-          closeItemForm(form);
-        })
-        .catch(function (err) {
-          setError("pl-item-err",
-                   (err && err.message) ? err.message : "Попробуйте ещё раз.");
-        })
-        .then(function () { PL.saving = false; paintSaving(false); });
+    if (fileObj) {
+      attachSketchToItem(form, known, fileObj, null);
       return true;
     }
     if (PL.saving) return true;
@@ -2739,17 +2661,9 @@ document.addEventListener("DOMContentLoaded", function () {
     paintSaving(true);
     setError("pl-error", "");
     setError("pl-item-err", "");
-    var token = actionToken(form);
-    itemWriteBase(known, seen, want)
-      .then(function (base) {
-        if (base.applied) return null;   // наша правка уже долетела
-        return api("/api/supply/planning/items/" + known + "/update",
-                   {method: "POST", body: {title: wantTitle, note: wantNote,
-                                           rev: base.rev, op_id: token}});
-      })
+    api("/api/supply/planning")
       .then(function (board) {
-        if (board) PL.board = board;
-        draftItemSeen(form, want);
+        PL.board = board;
         render();
         plToast("Сохранено", {ms: 3000});
         flash("item", known);
@@ -2763,100 +2677,37 @@ document.addEventListener("DOMContentLoaded", function () {
     return true;
   }
 
-  function submitDraftWithSketch(form, body, fileObj) {
+  // ПРИКРЕПЛЕНИЕ ФАЙЛА К УЖЕ СОЗДАННОЙ ВЕЩИ — один запрос и один исход.
+  // `before` нужен только первому проходу: подсветить появившуюся строку.
+  function attachSketchToItem(form, itemId, fileObj, before) {
     if (PL.saving) return;
     PL.saving = true;
     paintSaving(true);
     setError("pl-error", "");
     setError("pl-item-err", "");
-    var before = idsOf("item");
-    // ВЕЩЬ СОЗДАЁТСЯ ОДИН РАЗ, ДАЖЕ ЕСЛИ ЭСКИЗ НЕ ПРИНЯЛИ. Первый запрос уже
-    // закоммитил новинку; если второй отказал (битый файл, слишком большая
-    // картинка), человек выбирает другой файл — и `change` честно сбрасывает
-    // идентичность поступка, потому что это уже другой поступок. Без памяти о
-    // созданной вещи повторное «Сохранить» заводило ВТОРУЮ новинку с тем же
-    // именем, причём первая оставалась без эскиза. Поэтому номер запоминается
-    // на форме и переживает отказ, а повтор доделывает начатое.
-    //
-    // Название при этом не игнорируется: если человек успел его поправить,
-    // правка уходит на уже созданную вещь отдельным запросом. Промолчать здесь
-    // значило бы сохранить не то, что человек видит на экране (D-55 п. 1).
-    var known = draftItemId(form);
-    var first;
-    if (known) {
-      // ПОВТОР ДОСЫЛАЕТ ВСЁ, ЧТО ЧЕЛОВЕК ИЗМЕНИЛ, А НЕ ТОЛЬКО НАЗВАНИЕ. Между
-      // отказом и повтором он мог поправить и имя, и заметку, и оба поля он
-      // видит перед собой; сохранить одно и промолчать про второе — это та же
-      // потеря ввода, что запрещена пакетом 1 (D-55 п. 1). Сравнение идёт со
-      // СВЕЖЕЙ доской: ответ создания кладётся в `PL.board` сразу, иначе
-      // созданной строки в ней нет вовсе и сравнивать не с чем.
-      var seen = draftItemSeen(form);
-      var want = itemFields(body.title, body.note);
-      var wantTitle = want.title, wantNote = want.note;
-      if (seen && ((seen.title || "") !== wantTitle
-                   || (seen.note || "") !== wantNote)) {
-        first = itemWriteBase(known, seen, want)
-          .then(function (base) {
-            if (base.applied) return null;   // наша правка уже долетела
-            return api("/api/supply/planning/items/" + known + "/update",
-                       {method: "POST", body: {title: wantTitle,
-                                               note: wantNote, rev: base.rev,
-                                               op_id: body.op_id + "-t"}});
-          })
-          .then(function (data) {
-            if (data) PL.board = data;
-            draftItemSeen(form, want);
-            return {item_id: known};
-          });
-      } else {
-        first = Promise.resolve({item_id: known});
-      }
-    } else {
-      first = api("/api/supply/planning/items", {method: "POST", body: body});
-    }
-    first
-      .then(function (data) {
-        var itemId = data && data.item_id;
-        if (!itemId) {
-          throw new Error("Вещь сохранена, но эскиз прикрепить не к чему. "
-                          + "Обновите страницу.");
-        }
-        draftItemId(form, itemId);
-        // Снимок ставится ровно тем, что эта форма записала, и обновляется
-        // после каждой её удачной записи: он и есть «то, что форма видела».
-        draftItemSeen(form, itemFields(body.title, body.note));
-        // ДОСКА ОБНОВЛЯЕТСЯ СРАЗУ ПОСЛЕ СОЗДАНИЯ, А НЕ В САМОМ КОНЦЕ. Вещь уже
-        // записана: держать её в тайне от экрана до конца второго запроса
-        // значило бы показывать состояние, которого на сервере больше нет, — и
-        // именно из-за этого повтор не находил созданной строки и не мог
-        // сравнить с ней поля.
-        if (data && data.items) {
-          PL.board = data;
-          render();
-        }
-        return sketchThumb(fileObj).then(function (thumb) {
-          var fd = new FormData();
-          fd.append("file", fileObj);
-          if (thumb) fd.append("thumb", thumb, "thumb.png");
-          return fetch("/api/supply/planning/items/" + itemId + "/sketch", {
-            method: "POST", body: fd, credentials: "same-origin",
-            headers: {"X-Oborot-CSRF": "1"},
-          }).then(function (r) {
-            return r.json().then(function (j) { return {ok: r.ok, j: j}; },
-                                 function () { return {ok: r.ok, j: null}; });
-          }).then(function (res) {
-            if (!res.ok) {
-              throw new Error((res.j && res.j.detail) || "Эскиз не принят.");
-            }
-            return res.j;
-          });
+    sketchThumb(fileObj)
+      .then(function (thumb) {
+        var fd = new FormData();
+        fd.append("file", fileObj);
+        if (thumb) fd.append("thumb", thumb, "thumb.png");
+        return fetch("/api/supply/planning/items/" + itemId + "/sketch", {
+          method: "POST", body: fd, credentials: "same-origin",
+          headers: {"X-Oborot-CSRF": "1"},
+        }).then(function (r) {
+          return r.json().then(function (j) { return {ok: r.ok, j: j}; },
+                               function () { return {ok: r.ok, j: null}; });
+        }).then(function (res) {
+          if (!res.ok) {
+            throw new Error((res.j && res.j.detail) || "Эскиз не принят.");
+          }
+          return res.j;
         });
       })
       .then(function (board) {
         PL.board = board;
         render();
         plToast("Сохранено", {ms: 3000});
-        flash("item", known ? known : onlyNew("item", before));
+        flash("item", before ? onlyNew("item", before) : itemId);
         closeItemForm(form);
       })
       .catch(function (err) {
@@ -2864,13 +2715,60 @@ document.addEventListener("DOMContentLoaded", function () {
         // Человек обязан знать, в каком он состоянии: вещь уже сохранена, не
         // хватает только картинки. Иначе «Не сохранено» читается как «ничего
         // не произошло», и он заводит ту же новинку заново руками.
-        if (draftItemId(form)) {
-          msg += " Вещь уже сохранена — выберите другой файл и нажмите "
-                 + "«Сохранить» ещё раз.";
-        }
+        msg += " Вещь уже сохранена — выберите другой файл и нажмите "
+               + "«Сохранить» ещё раз или закройте форму.";
         setError("pl-item-err", msg);
       })
       .then(function () { PL.saving = false; paintSaving(false); });
+  }
+
+  // СОХРАНЕНИЕ НОВИНКИ С ЭСКИЗОМ — ДВА ЗАПРОСА В НАЗВАННОМ ПОРЯДКЕ (F-23а):
+  // сначала вещь, потом байты к ней. Своя ветка нужна потому, что `send()`
+  // умеет ровно один запрос и отдаёт результат уже после того, как снял свой
+  // замок; вложить в него второй запрос значило бы либо отпустить кнопки на
+  // время загрузки файла, либо переписать общую функцию ради одного случая.
+  //
+  // ЧТО ПРОИСХОДИТ ПРИ ОТКАЗЕ НА ВТОРОМ ШАГЕ. Вещь уже создана, эскиз — нет.
+  // Форма остаётся открытой с ошибкой и переходит в режим прикрепления: поля
+  // становятся только для чтения, номер созданной вещи живёт на форме. Повтор
+  // отправляет ТОЛЬКО файл — второй вещи не появляется, а править имя и
+  // заметку человек идёт на карточку, где для этого есть «Изменить».
+  function submitDraftWithSketch(form, body, fileObj) {
+    if (PL.saving) return;
+    PL.saving = true;
+    paintSaving(true);
+    setError("pl-error", "");
+    setError("pl-item-err", "");
+    var before = idsOf("item");
+    api("/api/supply/planning/items", {method: "POST", body: body})
+      .then(function (data) {
+        var itemId = data && data.item_id;
+        if (!itemId) {
+          throw new Error("Вещь сохранена, но эскиз прикрепить не к чему. "
+                          + "Обновите страницу.");
+        }
+        // ДОСКА ОБНОВЛЯЕТСЯ СРАЗУ ПОСЛЕ СОЗДАНИЯ, А НЕ В САМОМ КОНЦЕ. Вещь уже
+        // записана: держать её в тайне от экрана до конца второго запроса
+        // значило бы показывать состояние, которого на сервере больше нет.
+        if (data.items) {
+          PL.board = data;
+          render();
+        }
+        draftItemId(form, itemId);
+        paintItemAttachMode(form);
+        return itemId;
+      })
+      .then(function (itemId) {
+        PL.saving = false;
+        paintSaving(false);
+        attachSketchToItem(form, itemId, fileObj, before);
+      })
+      .catch(function (err) {
+        setError("pl-item-err",
+                 (err && err.message) ? err.message : "Попробуйте ещё раз.");
+        PL.saving = false;
+        paintSaving(false);
+      });
   }
 
   function dueFields(form, prefix, current) {
