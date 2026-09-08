@@ -3715,6 +3715,64 @@ def _fix4_upload_ceiling(c) -> None:
           r.status_code == 200, f"{r.status_code} {r.text[:90]}")
 
 
+def _fix4_due_kind_switch(c, org4: int) -> None:
+    """P1 ревью: смена вида срока с той же подписью — это правка, а не тишина.
+
+    Точная дата `2020-01-01` и та же дата словами «к 1 января 2020» дают у
+    `describe_due` ОДНУ И ТУ ЖЕ строку. Правило «правка без изменений не двигает
+    редакцию» сравнивало подпись — и такая смена проходила молча: поля
+    сохранялись, а редакция и журнал оставались прежними. Дальше соседнее окно
+    со старой редакцией записывало своё и молча отменяло эту правку.
+    """
+    print("\n== P1: смена вида срока при одинаковой подписи — это правка ==")
+    item = _fix4_new_item(c, "Вещь-вид-срока", "f4-dk-i")
+    b = c.post(P2 + "/batches",
+               json={"item_id": item, "title": "Партия-вид-срока",
+                     "due_kind": "exact", "due_date": "2020-01-01",
+                     "op_id": "f4-dk-b"}).json()
+    row = [x for x in b["batches"] if x["title"] == "Партия-вид-срока"][0]
+    bid, rev0 = row["id"], row["rev"]
+    label0 = row["due_label"]
+
+    r = c.post(P2 + f"/batches/{bid}/update",
+               json={"due_kind": "text", "due_text": label0, "rev": rev0,
+                     "op_id": "f4-dk-1"})
+    check("смена вида срока принята", r.status_code == 200, r.text[:120])
+    now = [x for x in r.json()["batches"] if x["id"] == bid][0]
+    check("подпись действительно не изменилась ни на символ",
+          now["due_label"] == label0, f"{label0!r} → {now['due_label']!r}")
+    check("но сами поля изменились",
+          now["due_kind"] == "text" and now["due_date"] == "",
+          f"{now['due_kind']} {now['due_date']!r}")
+    check("редакция сдвинулась — это правка, а не тишина",
+          now["rev"] != rev0, f"{rev0} → {now['rev']}")
+    rows = _fix2_journal(org4, "batch", bid)
+    check("и правка попала в журнал, назвав вид срока",
+          "due" in rows and rows["due"].count("(") == 2, str(rows.get("due")))
+
+    # ГЛАВНОЕ СЛЕДСТВИЕ: соседнее окно со СТАРОЙ редакцией больше не отменяет
+    # эту правку молча. Без сдвига редакции оно отвечало 200 и возвращало срок.
+    stale = c.post(P2 + f"/batches/{bid}/update",
+                   json={"title": "Партия-вид-срока-2", "rev": rev0,
+                         "op_id": "f4-dk-2"})
+    check("запись поверх неё со старой редакцией отвергнута 409",
+          stale.status_code == 409, f"{stale.status_code} {stale.text[:90]}")
+    final = [x for x in c.get(P2).json()["batches"] if x["id"] == bid][0]
+    check("и срок остался тем, каким его сделала первая правка",
+          final["due_kind"] == "text" and final["due_date"] == "",
+          f"{final['due_kind']} {final['due_date']!r}")
+
+    # А ПОЛНЫЙ ПОВТОР ТЕХ ЖЕ ЗНАЧЕНИЙ по-прежнему редакцию не двигает: правило
+    # F-24 не отменено, оно лишь перестало смотреть на подпись вместо полей.
+    same = c.post(P2 + f"/batches/{bid}/update",
+                  json={"due_kind": "text", "due_text": label0,
+                        "rev": final["rev"], "op_id": "f4-dk-3"})
+    after = [x for x in same.json()["batches"] if x["id"] == bid][0]
+    check("повтор тех же значений редакцию не двигает",
+          same.status_code == 200 and after["rev"] == final["rev"],
+          f"{same.status_code}: {final['rev']} → {after['rev']}")
+
+
 def supply_fix_4_migration_checks() -> None:
     """SUPPLY-FIX-4: шаг 17 добавляет одну колонку и переживает откат.
 
@@ -3847,6 +3905,7 @@ def supply_fix_4_checks() -> None:
         ("P1 медиатип", lambda: _fix4_media_type(c)),
         ("P1 поток без длины", lambda: _fix4_chunked(c)),
         ("P1 потолок загрузки", lambda: _fix4_upload_ceiling(c)),
+        ("P1 смена вида срока", lambda: _fix4_due_kind_switch(c, org4)),
     )
     for label, run_step in steps:
         try:

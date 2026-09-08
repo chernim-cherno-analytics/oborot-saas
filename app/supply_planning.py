@@ -441,6 +441,10 @@ def ru_date(iso: str, *, short: bool = False) -> str:
 #: Названия видов срока ДЛЯ ТЕКСТА ОШИБКИ. Ровно те слова, которые человек
 #: видит в списке на экране: ошибка, называющая внутренний код `text`, требует
 #: от него перевода, которого он не обязан знать.
+#: Поля, из которых состоит сам срок. Источник (`due_source`) сюда НЕ входит: он
+#: рядом со сроком, а не внутри него, и журналируется отдельной записью.
+_DUE_FIELDS = ("due_kind", "due_text", "due_date")
+
 DUE_KIND_LABELS = {
     "unknown": "неизвестен",
     "approx": "ориентировочно",
@@ -1710,16 +1714,34 @@ def update_batch(db: Session, org_id: int, batch_id: int, payload: dict,
         # ТЕКУЩАЯ СТРОКА — ИСТОЧНИК УМОЛЧАНИЙ (ТЗ F-19). Без неё правка одного
         # только источника срока стирала сам срок: разбор начинался с нуля, а
         # отсутствующий `due_kind` означал «неизвестен».
+        # СРАВНИВАЮТСЯ САМИ ПОЛЯ, А НЕ ПОДПИСЬ ПОД НИМИ. Это не педантизм: точная
+        # дата 2020-01-01 и та же дата, набранная словами «к 1 января 2020»,
+        # дают у `describe_due` ОДНУ И ТУ ЖЕ строку — а это разные сроки, и в
+        # базе они лежат разными полями. Первая редакция правила «правка без
+        # изменений не двигает редакцию» смотрела на подпись, поэтому такая
+        # смена вида проходила молча: поля сохранялись, а редакция и журнал
+        # оставались прежними. Дальше соседнее окно со СТАРОЙ редакцией
+        # записывало своё и молча отменяло эту правку вместо 409 — то есть
+        # оптимистичная блокировка обходилась сменой вида срока.
         due = parse_due(payload, current=row)
+        before_due = {k: (getattr(row, k) or "") for k in _DUE_FIELDS}
         before = describe_due(row)
         before_source = row.due_source or ""
         for key, value in due.items():
             setattr(row, key, value)
+        after_due = {k: (getattr(row, k) or "") for k in _DUE_FIELDS}
         after = describe_due(row)
         after_source = row.due_source or ""
-        if after != before:
+        if before_due != after_due:
+            old_text, new_text = before, after
+            if old_text == new_text:
+                # Подпись совпала, а срок изменился. Запись «к 1 января 2020 →
+                # к 1 января 2020» не сказала бы человеку ничего, поэтому вид
+                # срока называется вслух — он и есть то, что поменялось.
+                old_text = f"{before} ({DUE_KIND_LABELS.get(before_due['due_kind'], before_due['due_kind'])})"
+                new_text = f"{after} ({DUE_KIND_LABELS.get(after_due['due_kind'], after_due['due_kind'])})"
             _journal(db, org_id, "batch", row.id, "update", field="due",
-                     old=before, new=after, author=author, op_id=op_id)
+                     old=old_text, new=new_text, author=author, op_id=op_id)
             op_id = ""
             changed = True
         if after_source != before_source:
@@ -1728,7 +1750,7 @@ def update_batch(db: Session, org_id: int, batch_id: int, payload: dict,
                      author=author, op_id=op_id)
             op_id = ""
             changed = True
-        if after != before or after_source != before_source:
+        if before_due != after_due or after_source != before_source:
             # Кто и когда назвал срок — часть самого срока, и меняется вместе с
             # ним ИЛИ с его источником. Прежде вторая половина этого условия
             # отсутствовала: смена источника оставляла на карточке прежнего
