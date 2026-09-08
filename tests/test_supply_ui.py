@@ -4037,6 +4037,10 @@ def supply_fix_4_ui(pw, base, c) -> None:
         ("F-23 порядок", lambda: _fix4_order_ui(page, base, c)),
         ("F-23 кэш картинки", lambda: _fix4_no_refetch_ui(page, base)),
         ("F-24 история", lambda: _fix4_history_ui(page, base, c)),
+        # Корректив по независимому ревью PR #57: отказ прикрепления эскиза
+        # не должен заводить вторую новинку.
+        ("P1 повтор после отказа эскиза",
+         lambda: _fix4_retry_after_sketch_fail(page, base, c)),
     )
     for label, run_step in steps:
         try:
@@ -4201,6 +4205,81 @@ def _fix4_no_refetch_ui(page, base) -> None:
           redrawn and redrawn["natural"] > 0, str(redrawn))
     check("и ни одного повторного запроса за картинкой не ушло",
           not hits, str(hits[:3]))
+
+
+def _fix4_retry_after_sketch_fail(page, base, c) -> None:
+    """P1 ревью: после отказа эскиза повтор доделывает начатое, а не удваивает.
+
+    Порядок «сначала вещь, потом файл» (F-23а) закрыл сирот в базе — и открыл
+    другую дыру, которую ревью и нашло. Первый запрос уже коммитит новинку;
+    если второй отвечает отказом (битый файл), человек выбирает другой файл, а
+    любая правка поля честно сбрасывает идентичность поступка — это уже другой
+    поступок. Повтор уходил как НОВОЕ создание, и на доске оказывались две
+    новинки с одним именем, причём первая без эскиза.
+
+    Проверяется исход, который видит человек: строк ровно одна, и у неё есть
+    эскиз.
+    """
+    print("\n== P1: отказ эскиза не удваивает новинку ==")
+    _open_plan(page, base)
+    title = "Новинка-повтор"
+
+    # Первый прикрепляющий запрос отвергается — ровно как отвергается битый
+    # файл. Дальше маршрут снимается, и вторая попытка идёт к живому серверу.
+    failed = {"n": 0}
+
+    def deny(route):
+        failed["n"] += 1
+        route.fulfill(status=400, content_type="application/json",
+                      body='{"detail":"Эскиз не принят."}')
+
+    page.route(re.compile(r"/api/supply/planning/items/\d+/sketch$"), deny)
+
+    page.click("#pl-add-item")
+    page.wait_for_timeout(250)
+    page.select_option("#pl-item-kind", "draft")
+    page.wait_for_timeout(150)
+    page.fill("#pl-item-title", title)
+    page.set_input_files("#pl-item-sketch", {
+        "name": "sketch.png", "mimeType": "image/png",
+        "buffer": base64.b64decode(VALID_PNG_B64)})
+    page.evaluate("""() => {
+      const b = document.querySelector('#pl-item-form button[type=submit]');
+      if (b) b.click();
+    }""")
+    page.wait_for_timeout(2500)
+    check("прикрепление действительно отвергнуто", failed["n"] >= 1,
+          str(failed["n"]))
+    err = (page.text_content("#pl-item-err") or "")
+    check("человеку сказано, что вещь уже сохранена",
+          "уже сохранена" in err, err[:160])
+    board = c.get("/api/supply/planning").json()
+    made = [i for i in board["items"] if i["title"] == title]
+    check("после отказа новинка ровно одна", len(made) == 1,
+          f"строк: {len(made)}")
+
+    # Человек выбирает другой файл: `change` сбрасывает идентичность поступка —
+    # и именно на этом прежняя редакция заводила вторую строку.
+    page.unroute(re.compile(r"/api/supply/planning/items/\d+/sketch$"))
+    page.set_input_files("#pl-item-sketch", {
+        "name": "second.png", "mimeType": "image/png",
+        "buffer": base64.b64decode(VALID_PNG_B64)})
+    page.wait_for_timeout(200)
+    page.evaluate("""() => {
+      const b = document.querySelector('#pl-item-form button[type=submit]');
+      if (b) b.click();
+    }""")
+    page.wait_for_timeout(2500)
+    board = c.get("/api/supply/planning").json()
+    made = [i for i in board["items"] if i["title"] == title]
+    check("после удачного повтора новинка ВСЁ ЕЩЁ одна", len(made) == 1,
+          f"строк: {len(made)} — {[i['id'] for i in made]}")
+    check("и эскиз прикреплён именно к ней",
+          len(made) == 1 and made[0]["sketch_id"] is not None,
+          str(made[0]["sketch_id"]) if made else "строки нет")
+    check("форма закрылась — работа доведена до конца",
+          page.evaluate("() => document.getElementById('pl-item-form').hidden")
+          is True)
 
 
 def _fix4_history_ui(page, base, c) -> None:

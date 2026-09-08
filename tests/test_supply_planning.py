@@ -3448,6 +3448,230 @@ def _fix3_long_digits(c) -> None:
           str(survived[0]["plan_qty"]) if survived else "нет строки")
 
 
+def _fix4_dedup_cleanup_race(c, org4: int) -> None:
+    """P1 ревью: уборка удаляла эскиз, который секунду назад прикрепили.
+
+    Случай собирается из двух правильных по отдельности вещей. Дедуп по
+    содержимому возвращает СТАРУЮ строку — а она вполне может быть сиротой
+    старше суток. Сессия слоя создана с `autoflush=False`, поэтому запрос
+    уборки не видел только что проставленной ссылки и честно считал эскиз
+    ничьим. Вещь оставалась с номером удалённой картинки.
+    """
+    print("\n== P1: уборка не трогает только что прикреплённый эскиз ==")
+    data = _fix4_png(300, 200, tone=0xA0)
+    orphan = c.post(P2 + "/sketches",
+                    files={"file": ("o.png", data, "image/png")})
+    orphan_id = orphan.json().get("sketch_id") if orphan.status_code == 200 else 0
+    check("сирота заведён старым путём", bool(orphan_id), orphan.text[:100])
+
+    # Сироте проставляется возраст «позавчера» — иначе уборка до него не дойдёт.
+    con = sqlite3.connect(DB_PATH)
+    try:
+        con.execute("UPDATE supply_sketches SET created_at ="
+                    " datetime('now', '-2 day') WHERE id=?", (orphan_id,))
+        con.commit()
+    finally:
+        con.close()
+
+    item = _fix4_new_item(c, "Вещь-дедуп-гонка", "f4-dr-i")
+    # ТЕ ЖЕ БАЙТЫ: дедуп обязан вернуть ту самую строку-сироту.
+    att, sid = _fix4_attach(c, item, data)
+    check("прикрепление приняло те же байты", att.status_code == 200,
+          f"{att.status_code} {att.text[:100]}")
+    check("дедуп вернул именно ту строку, что была сиротой", sid == orphan_id,
+          f"{sid} vs {orphan_id}")
+    alive = c.get(P2 + f"/sketches/{sid}")
+    check("эскиз НЕ удалён уборкой того же запроса", alive.status_code == 200,
+          f"{alive.status_code} {alive.text[:80]}")
+    row = [i for i in c.get(P2).json()["items"] if i["id"] == item]
+    check("и вещь ссылается на существующую картинку, а не на пустоту",
+          bool(row) and row[0]["sketch_id"] == sid,
+          str(row[0]["sketch_id"]) if row else "вещи нет")
+
+
+def _fix4_cache_vary(c) -> None:
+    """P1 ревью: приватный кэш обязан различать сессии.
+
+    `private` запрещает общий кэш, но не различает пользователей в ОДНОМ
+    браузере: ключ у записи — адрес, а номера эскизов у разных организаций
+    совпадают. Один профиль, побывавший в двух организациях, мог показать во
+    второй картинку из первой, вообще не спросив сервер.
+    """
+    print("\n== P1: кэш эскиза различает сессии ==")
+    sid = c.post(P2 + "/sketches",
+                 files={"file": ("v.png", _fix4_png(300, 200, tone=0xB0),
+                                 "image/png")}).json()["sketch_id"]
+    full = c.get(P2 + f"/sketches/{sid}")
+    thumb = c.get(P2 + f"/sketches/{sid}/thumb")
+    for name, r in (("оригинал", full), ("миниатюра", thumb)):
+        vary = (r.headers.get("vary") or "").lower()
+        check(f"{name}: ответ объявляет Cookie частью ключа кэша",
+              "cookie" in vary, f"vary={vary!r}")
+    # И на 304 тоже: запись кэша обновляется этим ответом, и без `Vary` она
+    # снова стала бы общей для двух сессий одного браузера.
+    again = c.get(P2 + f"/sketches/{sid}",
+                  headers={"If-None-Match": full.headers.get("etag") or "x"})
+    check("и на 304 заголовок тот же", again.status_code == 304
+          and "cookie" in (again.headers.get("vary") or "").lower(),
+          f"{again.status_code} vary={again.headers.get('vary')!r}")
+
+
+def _fix4_media_type(c) -> None:
+    """P1 ревью: потолок обходился параметром в заголовке.
+
+    Проверка вида тела искала подстроку, поэтому `application/json;
+    note=multipart/form-data` объявлял себя загрузкой файла и получал потолок
+    загрузки. Тело при этом разбиралось как JSON — то есть один параметр
+    заголовка снимал ограничение.
+    """
+    print("\n== P1: вид тела определяется медиатипом, а не подстрокой ==")
+    big = {"title": "Ткань-обход", "op_id": "f4-mt-1",
+           "source_note": "x" * (1024 * 1024 + 4096)}
+    body = json.dumps(big, ensure_ascii=False).encode("utf-8")
+    sneaky = client()
+    sneaky.cookies.update(c.cookies)
+    try:
+        r = sneaky.post(P2 + "/materials", content=body,
+                        headers={"Content-Type":
+                                 "application/json; note=multipart/form-data"})
+        check("JSON с параметром «multipart» в заголовке всё равно отвергнут",
+              r.status_code == 413, f"{r.status_code} {r.text[:90]}")
+        rows = [m for m in c.get(P2).json()["materials"]
+                if m["title"] == "Ткань-обход"]
+        check("и материал этим запросом не создан", not rows, str(rows[:1]))
+    finally:
+        sneaky.close()
+
+
+def _fix4_chunked(c) -> None:
+    """P1 ревью: тело без объявленной длины читалось целиком до отказа.
+
+    Отказ был, но приходил ПОСЛЕ того, как весь запрос уже лежал в памяти, —
+    то есть потолок ограничивал ответ, а не расход. Здесь проверяется исход,
+    который виден снаружи: превышение отвергается, а законное тело без длины
+    по-прежнему доходит до ручки целиком.
+    """
+    print("\n== P1: тело без Content-Length тоже под потолком ==")
+
+    def chunks(payload: bytes, size: int = 256 * 1024):
+        for i in range(0, len(payload), size):
+            yield payload[i:i + size]
+
+    own = client()
+    own.cookies.update(c.cookies)
+    try:
+        heavy = json.dumps({"title": "Ткань-поток", "op_id": "f4-ch-1",
+                            "source_note": "y" * (1536 * 1024)},
+                           ensure_ascii=False).encode("utf-8")
+        r = own.post(P2 + "/materials", content=chunks(heavy),
+                     headers={"Content-Type": "application/json"})
+        check("тело без Content-Length больше потолка отвергнуто 413",
+              r.status_code == 413, f"{r.status_code} {r.text[:90]}")
+        rows = [m for m in c.get(P2).json()["materials"]
+                if m["title"] == "Ткань-поток"]
+        check("и материал не создан", not rows, str(rows[:1]))
+    finally:
+        own.close()
+
+    ok = client()
+    ok.cookies.update(c.cookies)
+    try:
+        light = json.dumps({"title": "Ткань-поток-малая", "qty": "5",
+                            "unit": "м", "op_id": "f4-ch-2"},
+                           ensure_ascii=False).encode("utf-8")
+        r = ok.post(P2 + "/materials", content=chunks(light),
+                    headers={"Content-Type": "application/json"})
+        check("законное тело без Content-Length доходит до ручки целиком",
+              r.status_code == 200, f"{r.status_code} {r.text[:120]}")
+        rows = [m for m in r.json().get("materials", [])
+                if m["title"] == "Ткань-поток-малая"]
+        check("и материал создан именно с присланными значениями",
+              bool(rows) and rows[0]["qty"] == 5.0, str(rows[:1])[:120])
+    finally:
+        ok.close()
+
+    # СКОЛЬКО БАЙТОВ СЕРВЕР ВООБЩЕ ПРОЧИТАЛ — этого снаружи, по HTTP, не видно
+    # никак: код ответа одинаков и у того, кто оборвал чтение, и у того, кто
+    # сначала сложил всё в память. Поэтому приложение зовётся напрямую как ASGI,
+    # а счётчик стоит в самом источнике тела. Это единственный способ отличить
+    # «потолок расхода» от «потолка ответа», и без него правка проверялась бы
+    # только на слово.
+    pulled = _fix4_asgi_chunks_read(P2 + "/materials", 40, 256 * 1024)
+    check("сервер перестаёт читать сразу после превышения, а не в конце",
+          pulled["status"] == 413 and pulled["chunks"] <= 8,
+          f"status={pulled['status']} прочитано чанков={pulled['chunks']} из 40")
+
+
+def _fix4_asgi_chunks_read(path: str, count: int, size: int) -> dict:
+    """Зовёт приложение как ASGI и считает, СКОЛЬКО кусков тела оно забрало.
+
+    Источник тела здесь наш, поэтому видно то, чего не видно по HTTP: сервер,
+    который обрывает чтение на превышении, запросит несколько кусков и
+    остановится, а сервер, который сначала копит всё в памяти, вытянет все.
+
+    Сессии в запросе нет намеренно: потолок стоит ДО маршрутизации и до любой
+    авторизации, и проверяется именно он. Заголовок CSRF присутствует, потому
+    что общая проверка изменяющих `/api/*` стоит ещё выше и иначе ответила бы
+    раньше.
+    """
+    import asyncio
+
+    state = {"asked": 0, "status": 0}
+
+    async def receive():
+        state["asked"] += 1
+        if state["asked"] > count:
+            return {"type": "http.request", "body": b"", "more_body": False}
+        return {"type": "http.request", "body": b"z" * size, "more_body": True}
+
+    async def send(message):
+        if message["type"] == "http.response.start":
+            state["status"] = message["status"]
+
+    scope = {
+        "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
+        "method": "POST", "scheme": "http", "path": path, "raw_path": path.encode(),
+        "query_string": b"", "root_path": "", "server": ("127.0.0.1", APP_PORT),
+        "client": ("127.0.0.1", 50000),
+        "headers": [(b"host", b"127.0.0.1"),
+                    (b"content-type", b"application/json"),
+                    (b"x-oborot-csrf", b"1")],
+    }
+    asyncio.run(oborot_app(scope, receive, send))
+    return {"status": state["status"], "chunks": state["asked"]}
+
+
+def _fix4_upload_ceiling(c) -> None:
+    """P1 ревью: multipart исключался из потолка вовсе.
+
+    Расчёт был на потоковый потолок в самой ручке — но FastAPI разбирает форму
+    и складывает файл в `UploadFile` ДО того, как ручка начинает исполняться.
+    Значит, единственное место, где поток ещё можно оборвать, — общий сторож до
+    разбора. Проверяется и то, и другое: чрезмерная загрузка отвергается, а
+    законная картинка в полтора мегабайта по-прежнему проходит.
+    """
+    print("\n== P1: у загрузки свой потолок, а не отсутствие потолка ==")
+    huge = client()
+    huge.cookies.update(c.cookies)
+    try:
+        # Десять мегабайт «картинки»: до разбора формы дело доходить не должно.
+        payload = b"\x89PNG\r\n\x1a\n" + b"z" * (10 * 1024 * 1024)
+        r = huge.post(P2 + "/sketches",
+                      files={"file": ("huge.png", payload, "image/png")})
+        check("multipart больше потолка загрузки отвергнут 413",
+              r.status_code == 413, f"{r.status_code} {r.text[:90]}")
+    finally:
+        huge.close()
+
+    legit = _fix4_png(700, 700, tone=0xC0)
+    check("законный файл действительно больше мегабайта",
+          len(legit) > 1024 * 1024, str(len(legit)))
+    r = c.post(P2 + "/sketches",
+               files={"file": ("legit.png", legit, "image/png")})
+    check("а законная картинка проходит и после ужесточения",
+          r.status_code == 200, f"{r.status_code} {r.text[:90]}")
+
+
 def supply_fix_4_migration_checks() -> None:
     """SUPPLY-FIX-4: шаг 17 добавляет одну колонку и переживает откат.
 
@@ -3572,6 +3796,14 @@ def supply_fix_4_checks() -> None:
         ("F-24 чтение журнала", lambda: _fix4_events_api(c)),
         ("F-24 no-op", lambda: _fix4_noop(c)),
         ("F-25 транспорт", lambda: _fix4_transport(c)),
+        # Корректив по независимому ревью PR #57: пять воспроизведённых P1.
+        # Отдельными шагами по той же причине, что и всё выше: один отказ не
+        # должен уносить с собой соседние проверки (D-42).
+        ("P1 дедуп и уборка", lambda: _fix4_dedup_cleanup_race(c, org4)),
+        ("P1 кэш по сессии", lambda: _fix4_cache_vary(c)),
+        ("P1 медиатип", lambda: _fix4_media_type(c)),
+        ("P1 поток без длины", lambda: _fix4_chunked(c)),
+        ("P1 потолок загрузки", lambda: _fix4_upload_ceiling(c)),
     )
     for label, run_step in steps:
         try:

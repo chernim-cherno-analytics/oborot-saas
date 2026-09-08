@@ -2149,6 +2149,10 @@ document.addEventListener("DOMContentLoaded", function () {
         form.hidden = true;
         btn.setAttribute("aria-expanded", "false");
         clear(form);
+        // Закрытая форма — это отказ от начатого, и память о начатом закрывается
+        // вместе с ней: иначе следующее открытие «Добавить вещь» доделывало бы
+        // ту новинку, о которой человек уже забыл (F-23а).
+        delete form.dataset.itemId;
       }
     });
   }
@@ -2550,6 +2554,25 @@ document.addEventListener("DOMContentLoaded", function () {
   // ТЕМ ЖЕ `op_id`: сервер узнаёт поступок, вещь второй раз не заводит и
   // отвечает номером уже созданной — файл прикрепляется к ней. Именно ради
   // этого случая ручка создания и возвращает `item_id` в ответе на повтор.
+  //: Номер уже созданной вещи живёт НА ФОРМЕ, а не в замыкании отправки.
+  //: Причина ровно та же, по которой там же живут редакция и идентичность
+  //: поступка (D-58 п. 6в): форма переживает отказ, а замыкание — нет.
+  function draftItemId(form, value) {
+    if (value !== undefined) {
+      if (value) form.dataset.itemId = String(value);
+      else delete form.dataset.itemId;
+    }
+    var raw = Number(form.dataset.itemId);
+    return isFinite(raw) && raw > 0 ? raw : 0;
+  }
+
+  function itemRevOf(id) {
+    var rows = ((PL.board && PL.board.items) || []).filter(function (i) {
+      return i.id === id;
+    });
+    return rows.length ? rows[0].rev : null;
+  }
+
   function submitDraftWithSketch(form, body, fileObj) {
     if (PL.saving) return;
     PL.saving = true;
@@ -2557,13 +2580,44 @@ document.addEventListener("DOMContentLoaded", function () {
     setError("pl-error", "");
     setError("pl-item-err", "");
     var before = idsOf("item");
-    api("/api/supply/planning/items", {method: "POST", body: body})
+    // ВЕЩЬ СОЗДАЁТСЯ ОДИН РАЗ, ДАЖЕ ЕСЛИ ЭСКИЗ НЕ ПРИНЯЛИ. Первый запрос уже
+    // закоммитил новинку; если второй отказал (битый файл, слишком большая
+    // картинка), человек выбирает другой файл — и `change` честно сбрасывает
+    // идентичность поступка, потому что это уже другой поступок. Без памяти о
+    // созданной вещи повторное «Сохранить» заводило ВТОРУЮ новинку с тем же
+    // именем, причём первая оставалась без эскиза. Поэтому номер запоминается
+    // на форме и переживает отказ, а повтор доделывает начатое.
+    //
+    // Название при этом не игнорируется: если человек успел его поправить,
+    // правка уходит на уже созданную вещь отдельным запросом. Промолчать здесь
+    // значило бы сохранить не то, что человек видит на экране (D-55 п. 1).
+    var known = draftItemId(form);
+    var first;
+    if (known) {
+      var rev = itemRevOf(known);
+      var wanted = (body.title || "").trim();
+      var current = ((PL.board && PL.board.items) || []).filter(function (i) {
+        return i.id === known;
+      });
+      if (current.length && (current[0].title || "") !== wanted && rev !== null) {
+        first = api("/api/supply/planning/items/" + known + "/update",
+                    {method: "POST", body: {title: wanted, rev: rev,
+                                            op_id: body.op_id + "-t"}})
+          .then(function () { return {item_id: known}; });
+      } else {
+        first = Promise.resolve({item_id: known});
+      }
+    } else {
+      first = api("/api/supply/planning/items", {method: "POST", body: body});
+    }
+    first
       .then(function (data) {
         var itemId = data && data.item_id;
         if (!itemId) {
           throw new Error("Вещь сохранена, но эскиз прикрепить не к чему. "
                           + "Обновите страницу.");
         }
+        draftItemId(form, itemId);
         return sketchThumb(fileObj).then(function (thumb) {
           var fd = new FormData();
           fd.append("file", fileObj);
@@ -2586,16 +2640,24 @@ document.addEventListener("DOMContentLoaded", function () {
         PL.board = board;
         render();
         plToast("Сохранено", {ms: 3000});
-        flash("item", onlyNew("item", before));
+        flash("item", known ? known : onlyNew("item", before));
         resetToken(form);
+        draftItemId(form, 0);
         form.hidden = true;
         clear(form);
         var add = byId("pl-add-item");
         if (add) add.setAttribute("aria-expanded", "false");
       })
       .catch(function (err) {
-        setError("pl-item-err",
-                 (err && err.message) ? err.message : "Попробуйте ещё раз.");
+        var msg = (err && err.message) ? err.message : "Попробуйте ещё раз.";
+        // Человек обязан знать, в каком он состоянии: вещь уже сохранена, не
+        // хватает только картинки. Иначе «Не сохранено» читается как «ничего
+        // не произошло», и он заводит ту же новинку заново руками.
+        if (draftItemId(form)) {
+          msg += " Вещь уже сохранена — выберите другой файл и нажмите "
+                 + "«Сохранить» ещё раз.";
+        }
+        setError("pl-item-err", msg);
       })
       .then(function () { PL.saving = false; paintSaving(false); });
   }
