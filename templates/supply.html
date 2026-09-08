@@ -1807,12 +1807,21 @@ document.addEventListener("DOMContentLoaded", function () {
     // потерянного ответа пришёл бы под новым `op_id` и создал вторую запись
     // (P1, закрытый в SUPPLY-3). Событие перекраски и так не всплывает — это
     // вторая, явная защита того же правила, а не замена ей.
-    form.addEventListener("input", function () {
-      if (!PL.restoring) resetToken(form);
-    });
-    form.addEventListener("change", function () {
-      if (!PL.restoring) resetToken(form);
-    });
+    // ВЫБОР ФАЙЛА НЕ МЕНЯЕТ ПОСТУПОК, КОТОРЫЙ ЭТА ФОРМА ПОВТОРЯЕТ. Тело
+    // создания вещи файла не содержит вовсе: там имя, заметка и вид. Пока файл
+    // считался правкой, случай «ответ на создание потерялся, человек выбрал
+    // другую картинку и нажал снова» приходил под НОВОЙ идентичностью — замок
+    // повторного поступка его не узнавал, и на доске появлялась вторая новинка
+    // с тем же именем, а первая оставалась без эскиза. Текстовые поля
+    // идентичность сбрасывают как и раньше: другое имя — другая вещь.
+    function bumpUnlessFile(ev) {
+      if (PL.restoring) return;
+      var node = ev && ev.target;
+      if (node && node.type === "file") return;
+      resetToken(form);
+    }
+    form.addEventListener("input", bumpUnlessFile);
+    form.addEventListener("change", bumpUnlessFile);
   }
 
   // Склонение рядом с числом. Тот же смысл, что у `_ru_plural` на сервере:

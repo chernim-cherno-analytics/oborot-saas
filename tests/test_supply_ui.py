@@ -4512,6 +4512,54 @@ def _fix4_retry_after_sketch_fail(page, base, c) -> None:
               bool(after) and after[0]["sketch_id"] is not None,
               str(after[0]["sketch_id"]) if after else "строки нет")
 
+    # ПОТЕРЯН ОТВЕТ САМОГО ПЕРВОГО ЗАПРОСА — СОЗДАНИЯ ВЕЩИ. Вещь на сервере
+    # есть, а страница о ней не знает: номера в руках нет. Повтор обязан
+    # прийти под ТОЙ ЖЕ идентичностью поступка, чтобы замок его узнал, — а
+    # значит выбор другого файла эту идентичность сбрасывать не должен: тело
+    # создания файла не содержит вовсе.
+    page.evaluate("""() => {
+      const f = document.getElementById('pl-item-form');
+      const b = document.getElementById('pl-add-item');
+      if (f && !f.hidden && b) b.click();
+    }""")
+    page.wait_for_timeout(300)
+    page.route(re.compile(r"/api/supply/planning/items$"), lose)
+    page.click("#pl-add-item")
+    page.wait_for_timeout(250)
+    page.select_option("#pl-item-kind", "draft")
+    page.wait_for_timeout(150)
+    page.fill("#pl-item-title", "Новинка-потеря-создания")
+    page.set_input_files("#pl-item-sketch", {
+        "name": "first.png", "mimeType": "image/png",
+        "buffer": base64.b64decode(VALID_PNG_B64)})
+    page.evaluate("""() => {
+      const b = document.querySelector('#pl-item-form button[type=submit]');
+      if (b) b.click();
+    }""")
+    page.wait_for_timeout(2500)
+    page.unroute(re.compile(r"/api/supply/planning/items$"))
+    born = [i for i in c.get("/api/supply/planning").json()["items"]
+            if i["title"] == "Новинка-потеря-создания"]
+    check("сервер создал вещь, хотя ответ не дошёл", len(born) == 1,
+          f"строк: {len(born)}")
+    # Человек выбирает другую картинку и жмёт снова.
+    page.set_input_files("#pl-item-sketch", {
+        "name": "second.png", "mimeType": "image/png",
+        "buffer": base64.b64decode(VALID_PNG_B64)})
+    page.wait_for_timeout(200)
+    page.evaluate("""() => {
+      const b = document.querySelector('#pl-item-form button[type=submit]');
+      if (b) b.click();
+    }""")
+    page.wait_for_timeout(2500)
+    again = [i for i in c.get("/api/supply/planning").json()["items"]
+             if i["title"] == "Новинка-потеря-создания"]
+    check("второй новинки не появилось — повтор узнан по поступку",
+          len(again) == 1, f"строк: {len(again)} — {[i['id'] for i in again]}")
+    check("и эскиз прикреплён к той самой вещи",
+          len(again) == 1 and again[0]["sketch_id"] is not None,
+          str(again[0]["sketch_id"]) if again else "строки нет")
+
 
 def _fix4_history_ui(page, base, c) -> None:
     """F-24: «История» на карточке показывает последнюю правку."""
