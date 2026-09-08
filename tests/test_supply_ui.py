@@ -5987,6 +5987,20 @@ def _fix5_ui_preview_flag(org_name: str) -> None:
         con.close()
 
 
+#: Ответ доски задерживается НАМЕРЕННО — иначе проверка обводки урока ничего не
+#: проверяет. Тур и доска грузятся двумя независимыми запросами, и кто из них
+#: успеет первым, решает случай. Когда первой приходит доска, кнопка стоит на
+#: своём окончательном месте ещё до появления обводки, и дефект «обводка не
+#: пошла за уехавшей целью» не может проявиться вовсе: такой прогон зеленеет и
+#: на сломанном коде — проверено запуском на дереве с прежним `_hints.html`
+#: (636 OK / 0 FAIL). Задержка закрепляет ТОТ порядок, в котором дефект живёт:
+#: обводка встаёт по пустой странице, и только потом приходит список карточек.
+LESSON_DELAY_SCRIPT = DELAY_SCRIPT + """
+(() => { window.__supDelayMatch = "/api/supply/planning";
+         window.__supDelayMs = 1500; })();
+"""
+
+
 def supply_fix_5_ui(pw, base) -> None:
     """SUPPLY-FIX-5 в браузере: F-27 (урок), F-28 (кнопка), F-29 (масштаб).
 
@@ -6008,7 +6022,7 @@ def supply_fix_5_ui(pw, base) -> None:
 
     steps = (
         ("F-29 порог до одиннадцатой строки", lambda: _fix5_below_threshold(page, base, c5)),
-        ("F-27 урок раздела", lambda: _fix5_lesson_ui(page, base)),
+        ("F-27 урок раздела", lambda: _fix5_lesson_ui(ctx, base, errors)),
         ("F-28 кнопка выгрузки", lambda: _fix5_export_ui(page, base)),
         ("F-29 поиск и сворачивание", lambda: _fix5_scale_ui(page, base, c5)),
         ("F-29 состояние в адресе", lambda: _fix5_hash_ui(page, base)),
@@ -6074,9 +6088,24 @@ def _fix5_below_threshold(page, base, c5) -> None:
           and not _fix5_shown(page, "#pl-batch-toggle"), "видны")
 
 
-def _fix5_lesson_ui(page, base) -> None:
-    """F-27: урок раздела есть в меню «?» и подсвечивает «Добавить материал»."""
+def _fix5_lesson_ui(ctx, base, errors) -> None:
+    """F-27: урок раздела есть в меню «?» и подсвечивает «Добавить материал».
+
+    Своя вкладка на весь шаг: на ней стоит задержка ответа доски
+    (`LESSON_DELAY_SCRIPT`), и тащить её в соседние проверки, которым она не
+    нужна, значило бы замедлять их ради чужого условия.
+    """
     print("\n== F-27: седьмой урок живёт на своей странице ==")
+    page = ctx.new_page()
+    page.on("pageerror", lambda e: errors.append(str(e)))
+    page.add_init_script(LESSON_DELAY_SCRIPT)
+    try:
+        _fix5_lesson_steps(page, base)
+    finally:
+        page.close()
+
+
+def _fix5_lesson_steps(page, base) -> None:
     page.goto(f"{base}/supply")
     page.wait_for_timeout(1400)
     close_hint(page)
