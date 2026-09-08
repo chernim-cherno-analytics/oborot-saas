@@ -4400,6 +4400,69 @@ def _fix4_retry_after_sketch_fail(page, base, c) -> None:
           page.evaluate("() => document.getElementById('pl-item-form').hidden")
           is True)
 
+    # ПЯТЫЙ ПУТЬ: ответ прикрепления ПОТЕРЯЛСЯ. Сервер записал эскиз и сдвинул
+    # редакцию вещи, а страница об этом не узнала — и правка полей после этого
+    # уходила со старым номером, получая 409 за собственное же изменение.
+    # Потеря имитируется честно: запрос доходит до сервера и там исполняется,
+    # а браузер видит сетевой отказ.
+    def lose(route):
+        try:
+            route.fetch()
+        finally:
+            route.abort()
+
+    page.route(re.compile(r"/api/supply/planning/items/\d+/sketch$"), lose)
+    page.click("#pl-add-item")
+    page.wait_for_timeout(250)
+    page.select_option("#pl-item-kind", "draft")
+    page.wait_for_timeout(150)
+    page.fill("#pl-item-title", "Новинка-потеря")
+    page.set_input_files("#pl-item-sketch", {
+        "name": "lost.png", "mimeType": "image/png",
+        "buffer": base64.b64decode(VALID_PNG_B64)})
+    page.evaluate("""() => {
+      const b = document.querySelector('#pl-item-form button[type=submit]');
+      if (b) b.click();
+    }""")
+    page.wait_for_timeout(2500)
+    page.unroute(re.compile(r"/api/supply/planning/items/\d+/sketch$"))
+    board = c.get("/api/supply/planning").json()
+    lost = [i for i in board["items"] if i["title"] == "Новинка-потеря"]
+    check("сервер прикрепил эскиз, хотя ответ не дошёл",
+          len(lost) == 1 and lost[0]["sketch_id"] is not None,
+          str(lost[:1])[:160])
+
+    # Человек правит заметку и сохраняет ещё раз. До исправления здесь приходил
+    # 409 «Вещь уже изменили в другом окне» — за его собственную правку.
+    page.set_input_files("#pl-item-sketch", [])
+    page.fill("#pl-item-note", "дописано после потери ответа")
+    page.wait_for_timeout(200)
+    page.evaluate("""() => {
+      const b = document.querySelector('#pl-item-form button[type=submit]');
+      if (b) b.click();
+    }""")
+    page.wait_for_timeout(2500)
+    # Читаем через `evaluate`, а не `text_content`: при удачном исходе форма
+    # закрывается и коробка ошибки исчезает вместе с ней — селектор, которого
+    # нет, у Playwright означает ожидание до таймаута, то есть красным
+    # оказался бы успех.
+    err = page.evaluate("""() => {
+      const box = document.getElementById('pl-item-err');
+      return box ? box.textContent : '';
+    }""")
+    check("отказа «изменили в другом окне» за свою же правку нет",
+          "другом окне" not in err, err[:160])
+    board = c.get("/api/supply/planning").json()
+    lost = [i for i in board["items"] if i["title"] == "Новинка-потеря"]
+    check("правка после потерянного ответа сохранена", len(lost) == 1
+          and lost[0]["note"] == "дописано после потери ответа",
+          str(lost[0]["note"]) if lost else "строки нет")
+    check("и второй новинки не появилось", len(lost) == 1,
+          f"строк: {len(lost)}")
+    check("а эскиз остался на месте",
+          len(lost) == 1 and lost[0]["sketch_id"] is not None,
+          str(lost[0]["sketch_id"]) if lost else "строки нет")
+
 
 def _fix4_history_ui(page, base, c) -> None:
     """F-24: «История» на карточке показывает последнюю правку."""

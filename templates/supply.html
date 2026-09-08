@@ -2599,6 +2599,40 @@ document.addEventListener("DOMContentLoaded", function () {
     return rows.length ? rows[0] : null;
   }
 
+  // СВЕЖАЯ РЕДАКЦИЯ НАЧАТОЙ ВЕЩИ — И ТОЛЬКО ЕСЛИ ЕЁ НИКТО НЕ ТРОГАЛ.
+  //
+  // Зачем это нужно. Прикрепление эскиза меняет строку на сервере (у вещи
+  // появляется картинка), а значит двигает её редакцию. Если ответ этого
+  // запроса потерялся — сервер записал, страница не узнала, — доска у нас
+  // осталась той, что вернуло создание, с ПРЕЖНЕЙ редакцией. Правка полей
+  // после этого уходила со старым номером и получала 409 «изменили в другом
+  // окне» за собственное же изменение: основной путь записи упирался в тупик,
+  // из которого выходили только перезагрузкой страницы.
+  //
+  // Почему нельзя просто взять свежий номер и записать поверх. Потому что это
+  // ровно то, против чего оптимистичная блокировка и стоит (D-58 п. 6в):
+  // соседнее окно могло за это время изменить ту же вещь. Поэтому номер
+  // берётся свежий ТОЛЬКО когда значения на сервере совпадают с теми, которые
+  // форма в последний раз видела: тогда сдвиг редакции — наш собственный, и
+  // переоснование безопасно. Разошлись значения — это чужая правка, и человек
+  // узнаёт о ней, а не затирает её молча.
+  function freshItemRev(known, seen) {
+    return api("/api/supply/planning").then(function (board) {
+      PL.board = board;
+      var rows = (board.items || []).filter(function (i) { return i.id === known; });
+      if (!rows.length) {
+        throw new Error("Эта вещь больше не на доске. Обновите страницу.");
+      }
+      var row = rows[0];
+      if ((row.title || "") !== (seen.title || "")
+          || (row.note || "") !== (seen.note || "")) {
+        throw new Error("Вещь уже изменили в другом окне. Обновите страницу — "
+                        + "показанные значения устарели.");
+      }
+      return row.rev;
+    });
+  }
+
   // ДОВЕСТИ ДО КОНЦА УЖЕ НАЧАТУЮ ВЕЩЬ, А НЕ ЗАВЕСТИ ВТОРУЮ. Возвращает true,
   // если отправка взята на себя: вызывающему остаётся выйти.
   //
@@ -2629,11 +2663,30 @@ document.addEventListener("DOMContentLoaded", function () {
       flash("item", known);
       return true;
     }
-    send("/api/supply/planning/items/" + known + "/update",
-         {title: wantTitle, note: wantNote, rev: row.rev,
-          op_id: actionToken(form)},
-         "pl-item-err", function (ok) { if (ok) closeItemForm(form); },
-         {kind: "item", id: known});
+    if (PL.saving) return true;
+    PL.saving = true;
+    paintSaving(true);
+    setError("pl-error", "");
+    setError("pl-item-err", "");
+    var token = actionToken(form);
+    freshItemRev(known, row)
+      .then(function (rev) {
+        return api("/api/supply/planning/items/" + known + "/update",
+                   {method: "POST", body: {title: wantTitle, note: wantNote,
+                                           rev: rev, op_id: token}});
+      })
+      .then(function (board) {
+        PL.board = board;
+        render();
+        plToast("Сохранено", {ms: 3000});
+        flash("item", known);
+        closeItemForm(form);
+      })
+      .catch(function (err) {
+        setError("pl-item-err",
+                 (err && err.message) ? err.message : "Попробуйте ещё раз.");
+      })
+      .then(function () { PL.saving = false; paintSaving(false); });
     return true;
   }
 
@@ -2669,10 +2722,13 @@ document.addEventListener("DOMContentLoaded", function () {
       var wantNote = body.note || "";
       if (row && ((row.title || "") !== wantTitle
                   || (row.note || "") !== wantNote)) {
-        first = api("/api/supply/planning/items/" + known + "/update",
-                    {method: "POST", body: {title: wantTitle, note: wantNote,
-                                            rev: row.rev,
-                                            op_id: body.op_id + "-t"}})
+        first = freshItemRev(known, row)
+          .then(function (rev) {
+            return api("/api/supply/planning/items/" + known + "/update",
+                       {method: "POST", body: {title: wantTitle,
+                                               note: wantNote, rev: rev,
+                                               op_id: body.op_id + "-t"}});
+          })
           .then(function (data) {
             PL.board = data;
             return {item_id: known};
