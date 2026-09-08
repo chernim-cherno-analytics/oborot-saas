@@ -2199,6 +2199,11 @@ document.addEventListener("DOMContentLoaded", function () {
   }
 
   function buildItemForm(form) {
+    // ФОРМА, КОТОРУЮ ТОЛЬКО ЧТО СОБРАЛИ, НИЧЕГО НЕ НАЧИНАЛА. Это второй,
+    // независимый рубеж к `closeItemForm`: как бы форму ни закрыли — кнопкой,
+    // успехом, чем-то ещё, что появится позже, — следующее открытие начинает с
+    // чистого листа. Один рубеж на трёх путях закрытия уже однажды не сработал.
+    delete form.dataset.itemId;
     clear(form);
     var kind = el("select");
     kind.id = "pl-item-kind";
@@ -2449,8 +2454,7 @@ document.addEventListener("DOMContentLoaded", function () {
         // решение владельца запрещает.
         if (confirmedRestore) body.confirm_restore = true;
         send("/api/supply/planning/items", body, "pl-item-err", function (ok) {
-          if (ok) { resetToken(form); form.hidden = true; clear(form);
-                    byId("pl-add-item").setAttribute("aria-expanded", "false"); }
+          if (ok) closeItemForm(form);
         }, {kind: "item"});
         return;
       }
@@ -2482,8 +2486,7 @@ document.addEventListener("DOMContentLoaded", function () {
         return;
       }
       send("/api/supply/planning/items", body, "pl-item-err", function (ok) {
-        if (ok) { resetToken(form); form.hidden = true; clear(form);
-                  byId("pl-add-item").setAttribute("aria-expanded", "false"); }
+        if (ok) closeItemForm(form);
       }, {kind: "item"});
     };
   }
@@ -2557,6 +2560,21 @@ document.addEventListener("DOMContentLoaded", function () {
   //: Номер уже созданной вещи живёт НА ФОРМЕ, а не в замыкании отправки.
   //: Причина ровно та же, по которой там же живут редакция и идентичность
   //: поступка (D-58 п. 6в): форма переживает отказ, а замыкание — нет.
+  // ЗАКРЫТИЕ ФОРМЫ ВЕЩИ — ОДНО МЕСТО, А НЕ ТРИ ПОХОЖИХ. Пока путей было три
+  // (каталожная вещь, новинка без файла, новинка с файлом), каждый закрывал
+  // форму по-своему, и память о начатой новинке снималась только в одном из
+  // них. Ревью нашло ровно это: успешно сохранённая вещь каталога оставляла
+  // `itemId` от прежней неудачной новинки, и следующая новинка с эскизом
+  // переписывала СТАРУЮ строку вместо создания своей.
+  function closeItemForm(form) {
+    resetToken(form);
+    draftItemId(form, 0);
+    form.hidden = true;
+    clear(form);
+    var add = byId("pl-add-item");
+    if (add) add.setAttribute("aria-expanded", "false");
+  }
+
   function draftItemId(form, value) {
     if (value !== undefined) {
       if (value) form.dataset.itemId = String(value);
@@ -2659,12 +2677,7 @@ document.addEventListener("DOMContentLoaded", function () {
         render();
         plToast("Сохранено", {ms: 3000});
         flash("item", known ? known : onlyNew("item", before));
-        resetToken(form);
-        draftItemId(form, 0);
-        form.hidden = true;
-        clear(form);
-        var add = byId("pl-add-item");
-        if (add) add.setAttribute("aria-expanded", "false");
+        closeItemForm(form);
       })
       .catch(function (err) {
         var msg = (err && err.message) ? err.message : "Попробуйте ещё раз.";

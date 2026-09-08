@@ -4288,6 +4288,73 @@ def _fix4_retry_after_sketch_fail(page, base, c) -> None:
           page.evaluate("() => document.getElementById('pl-item-form').hidden")
           is True)
 
+    # ПАМЯТЬ О НАЧАТОМ НЕ ПЕРЕЖИВАЕТ ЗАКРЫТИЕ ФОРМЫ НИ ОДНИМ ПУТЁМ. Ревью нашло
+    # третий путь: после отказа переключить ту же форму на вещь каталога и
+    # сохранить её — форма закрывалась, а номер прежней новинки оставался, и
+    # СЛЕДУЮЩАЯ новинка с эскизом переписывала старую строку вместо своей.
+    fail2 = {"n": 0}
+    page.route(re.compile(r"/api/supply/planning/items/\d+/sketch$"),
+               lambda route: (fail2.__setitem__("n", fail2["n"] + 1),
+                              route.fulfill(status=400,
+                                            content_type="application/json",
+                                            body='{"detail":"Эскиз не принят."}')))
+    page.click("#pl-add-item")
+    page.wait_for_timeout(250)
+    page.select_option("#pl-item-kind", "draft")
+    page.wait_for_timeout(150)
+    page.fill("#pl-item-title", "Брошенная-новинка")
+    page.set_input_files("#pl-item-sketch", {
+        "name": "bad.png", "mimeType": "image/png",
+        "buffer": base64.b64decode(VALID_PNG_B64)})
+    page.evaluate("""() => {
+      const b = document.querySelector('#pl-item-form button[type=submit]');
+      if (b) b.click();
+    }""")
+    page.wait_for_timeout(2500)
+    check("вторая новинка тоже создана и её эскиз отвергнут", fail2["n"] >= 1,
+          str(fail2["n"]))
+    page.unroute(re.compile(r"/api/supply/planning/items/\d+/sketch$"))
+
+    # ТА ЖЕ форма переключается на вещь каталога и успешно сохраняется.
+    cat = c.get("/api/supply/planning/catalog").json()["options"]
+    if cat:
+        page.select_option("#pl-item-kind", "catalog")
+        page.wait_for_timeout(200)
+        page.fill("#pl-item-base", cat[0]["base_name"])
+        page.evaluate("""() => {
+          const b = document.querySelector('#pl-item-form button[type=submit]');
+          if (b) b.click();
+        }""")
+        page.wait_for_timeout(2000)
+
+    # И только теперь — новая новинка со СВОИМ эскизом.
+    page.click("#pl-add-item")
+    page.wait_for_timeout(250)
+    page.select_option("#pl-item-kind", "draft")
+    page.wait_for_timeout(150)
+    page.fill("#pl-item-title", "Совсем-другая-новинка")
+    page.set_input_files("#pl-item-sketch", {
+        "name": "good.png", "mimeType": "image/png",
+        "buffer": base64.b64decode(VALID_PNG_B64)})
+    page.evaluate("""() => {
+      const b = document.querySelector('#pl-item-form button[type=submit]');
+      if (b) b.click();
+    }""")
+    page.wait_for_timeout(2500)
+    board = c.get("/api/supply/planning").json()
+    dropped = [i for i in board["items"] if i["title"] == "Брошенная-новинка"]
+    fresh = [i for i in board["items"] if i["title"] == "Совсем-другая-новинка"]
+    check("брошенная новинка осталась собой, а не переписана следующей",
+          len(dropped) == 1, f"строк: {len(dropped)}")
+    check("и у неё по-прежнему нет эскиза — она его не получала",
+          len(dropped) == 1 and dropped[0]["sketch_id"] is None,
+          str(dropped[0]["sketch_id"]) if dropped else "строки нет")
+    check("новая новинка завелась своей строкой", len(fresh) == 1,
+          f"строк: {len(fresh)}")
+    check("и эскиз достался именно ей",
+          len(fresh) == 1 and fresh[0]["sketch_id"] is not None,
+          str(fresh[0]["sketch_id"]) if fresh else "строки нет")
+
 
 def _fix4_history_ui(page, base, c) -> None:
     """F-24: «История» на карточке показывает последнюю правку."""
