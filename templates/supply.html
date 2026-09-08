@@ -2637,25 +2637,38 @@ document.addEventListener("DOMContentLoaded", function () {
   // форма в последний раз видела: тогда сдвиг редакции — наш собственный, и
   // переоснование безопасно. Разошлись значения — это чужая правка, и человек
   // узнаёт о ней, а не затирает её молча.
-  function freshItemRev(known, seen) {
+  //: НА ЧТО ОПЕРЕТЬСЯ ПРИ ЗАПИСИ В УЖЕ НАЧАТУЮ ВЕЩЬ. Возвращает свежую редакцию
+  //: и признак «наша правка уже применилась».
+  //:
+  //: Годных состояний строки на сервере ровно два, и оба надо различать.
+  //: (1) Она такая, какой её оставила ЭТА форма (`seen`) — значит писать
+  //: можно. (2) Она уже такая, какой человек хочет её видеть (`want`) — значит
+  //: наша же правка долетела, а ответ на неё потерялся; писать второй раз
+  //: нечего, и объявлять это чужим вмешательством нельзя: иначе после
+  //: потерянного ответа форма упиралась бы в вечный отказ, из которого выход
+  //: только перезагрузкой. Всё остальное — чужая правка, и её называют вслух.
+  //:
+  //: ДОСКА ПРИСВАИВАЕТСЯ ТОЛЬКО ПОСЛЕ УДАЧНОГО СРАВНЕНИЯ. Присвоив её раньше,
+  //: мы сделали бы чужие значения тем, «что форма видела», — и повторное
+  //: нажатие затёрло бы чужую правку своими старыми числами, отказав ровно
+  //: один раз. Отказ, который снимается повтором, защитой не является.
+  function itemWriteBase(known, seen, want) {
     return api("/api/supply/planning").then(function (board) {
       var rows = (board.items || []).filter(function (i) { return i.id === known; });
       if (!rows.length) {
         throw new Error("Эта вещь больше не на доске. Обновите страницу.");
       }
       var row = rows[0];
-      if ((row.title || "") !== ((seen && seen.title) || "")
-          || (row.note || "") !== ((seen && seen.note) || "")) {
-        // ДОСКА НЕ ПРИСВАИВАЕТСЯ ПРИ РАСХОЖДЕНИИ, И ЭТО ГЛАВНОЕ ЗДЕСЬ. Присвоив
-        // её, мы сделали бы чужие значения тем, «что форма видела», — и
-        // повторное нажатие затёрло бы чужую правку своими старыми числами,
-        // отказав ровно один раз. Отказ, который снимается повтором, защитой не
-        // является.
+      var asWant = (row.title || "") === ((want && want.title) || "")
+                   && (row.note || "") === ((want && want.note) || "");
+      var asSeen = (row.title || "") === ((seen && seen.title) || "")
+                   && (row.note || "") === ((seen && seen.note) || "");
+      if (!asWant && !asSeen) {
         throw new Error("Вещь уже изменили в другом окне. Обновите страницу — "
                         + "показанные значения устарели.");
       }
       PL.board = board;
-      return row.rev;
+      return {rev: row.rev, applied: asWant};
     });
   }
 
@@ -2695,14 +2708,17 @@ document.addEventListener("DOMContentLoaded", function () {
     setError("pl-error", "");
     setError("pl-item-err", "");
     var token = actionToken(form);
-    freshItemRev(known, seen)
-      .then(function (rev) {
+    var want = {title: wantTitle, note: wantNote};
+    itemWriteBase(known, seen, want)
+      .then(function (base) {
+        if (base.applied) return null;   // наша правка уже долетела
         return api("/api/supply/planning/items/" + known + "/update",
                    {method: "POST", body: {title: wantTitle, note: wantNote,
-                                           rev: rev, op_id: token}});
+                                           rev: base.rev, op_id: token}});
       })
       .then(function (board) {
-        PL.board = board;
+        if (board) PL.board = board;
+        draftItemSeen(form, want);
         render();
         plToast("Сохранено", {ms: 3000});
         flash("item", known);
@@ -2748,15 +2764,17 @@ document.addEventListener("DOMContentLoaded", function () {
       var wantNote = body.note || "";
       if (seen && ((seen.title || "") !== wantTitle
                    || (seen.note || "") !== wantNote)) {
-        first = freshItemRev(known, seen)
-          .then(function (rev) {
+        first = itemWriteBase(known, seen, {title: wantTitle, note: wantNote})
+          .then(function (base) {
+            if (base.applied) return null;   // наша правка уже долетела
             return api("/api/supply/planning/items/" + known + "/update",
                        {method: "POST", body: {title: wantTitle,
-                                               note: wantNote, rev: rev,
+                                               note: wantNote, rev: base.rev,
                                                op_id: body.op_id + "-t"}});
           })
           .then(function (data) {
-            PL.board = data;
+            if (data) PL.board = data;
+            draftItemSeen(form, {title: wantTitle, note: wantNote});
             return {item_id: known};
           });
       } else {

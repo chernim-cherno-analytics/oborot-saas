@@ -4514,6 +4514,77 @@ def _fix4_retry_after_sketch_fail(page, base, c) -> None:
               bool(after) and after[0]["note"] == "заметка соседа",
               str(after[0]["note"]) if after else "строки нет")
 
+    # СЕДЬМОЙ ПУТЬ: потерялся ответ уже не прикрепления, а промежуточной ПРАВКИ.
+    # На сервере лежат новые значения, а снимок формы — старые: если считать
+    # это чужим вмешательством, форма упрётся в вечный отказ, из которого выход
+    # только перезагрузкой. Своя применившаяся правка обязана узнаваться.
+    page.route(re.compile(r"/api/supply/planning/items/\d+/sketch$"),
+               lambda route: route.fulfill(status=400,
+                                           content_type="application/json",
+                                           body='{"detail":"Эскиз не принят."}'))
+    # Предыдущий шаг оставил форму ОТКРЫТОЙ с отказом — так и должно быть.
+    # Значит её сначала закрывают, а потом открывают заново: иначе нажатие на
+    # «Добавить вещь» просто свернуло бы её, и следующий шаг ждал бы поле,
+    # которого нет.
+    page.evaluate("""() => {
+      const f = document.getElementById('pl-item-form');
+      const b = document.getElementById('pl-add-item');
+      if (f && !f.hidden && b) b.click();
+    }""")
+    page.wait_for_timeout(300)
+    page.click("#pl-add-item")
+    page.wait_for_timeout(250)
+    page.select_option("#pl-item-kind", "draft")
+    page.wait_for_timeout(150)
+    page.fill("#pl-item-title", "Новинка-потеря-правки")
+    page.set_input_files("#pl-item-sketch", {
+        "name": "bad4.png", "mimeType": "image/png",
+        "buffer": base64.b64decode(VALID_PNG_B64)})
+    page.evaluate("""() => {
+      const b = document.querySelector('#pl-item-form button[type=submit]');
+      if (b) b.click();
+    }""")
+    page.wait_for_timeout(2500)
+    page.unroute(re.compile(r"/api/supply/planning/items/\d+/sketch$"))
+    board = c.get("/api/supply/planning").json()
+    upd = [i for i in board["items"] if i["title"] == "Новинка-потеря-правки"]
+    check("новинка для проверки потерянной правки создана", len(upd) == 1,
+          f"строк: {len(upd)}")
+    if len(upd) == 1:
+        # Правка полей уходит на сервер и применяется, а ответ теряется.
+        page.fill("#pl-item-note", "правка с потерянным ответом")
+        page.wait_for_timeout(200)
+        page.route(re.compile(r"/api/supply/planning/items/\d+/update$"), lose)
+        page.evaluate("""() => {
+          const b = document.querySelector('#pl-item-form button[type=submit]');
+          if (b) b.click();
+        }""")
+        page.wait_for_timeout(2500)
+        page.unroute(re.compile(r"/api/supply/planning/items/\d+/update$"))
+        mid = [i for i in c.get("/api/supply/planning").json()["items"]
+               if i["id"] == upd[0]["id"]]
+        check("сервер применил правку, хотя ответ не дошёл",
+              bool(mid) and mid[0]["note"] == "правка с потерянным ответом",
+              str(mid[0]["note"]) if mid else "строки нет")
+        # Повтор: своя применившаяся правка обязана узнаться, а не быть названа
+        # чужой. Эскиз при этом прикрепляется, и форма закрывается.
+        page.evaluate("""() => {
+          const b = document.querySelector('#pl-item-form button[type=submit]');
+          if (b) b.click();
+        }""")
+        page.wait_for_timeout(2500)
+        err = page.evaluate("""() => {
+          const box = document.getElementById('pl-item-err');
+          return box ? box.textContent : '';
+        }""")
+        check("повтор не назвал собственную правку чужой",
+              "другом окне" not in err, err[:140])
+        done = [i for i in c.get("/api/supply/planning").json()["items"]
+                if i["id"] == upd[0]["id"]]
+        check("и правка на месте, второй строки нет",
+              len(done) == 1 and done[0]["note"] == "правка с потерянным ответом",
+              str(done[:1])[:160])
+
 
 def _fix4_history_ui(page, base, c) -> None:
     """F-24: «История» на карточке показывает последнюю правку."""
