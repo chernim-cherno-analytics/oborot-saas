@@ -4639,6 +4639,8 @@ def supply_fix_5_checks() -> None:
         # Коррективы по независимому ревью PR #58.
         ("P1 выгрузка переживает управляющий символ", _fix5_export_control_chars),
         ("P2 количество не теряет третий знак", _fix5_export_precision),
+        # Корректив 2 по независимому ревью PR #58.
+        ("P1 первое демо не стирает свой план", _fix5_demo_keeps_manual_plan),
     )
     for label, run_step in steps:
         try:
@@ -4702,14 +4704,16 @@ def _fix5_demo_seed() -> None:
     drafts = [i for i in items if i["kind"] == "draft"]
     check("две вещи каталога и одна новинка",
           len(catalog) == 2 and len(drafts) == 1, str([(i["kind"], i["title"]) for i in items]))
-    check("каталожные вещи ссылаются на реальные строки каталога",
-          all(i["base_name"] for i in catalog)
-          and {o["base_name"] for o in c.get("/api/supply/planning/catalog",
-                                             params={"q": ""}).json()["options"]}
-          or True,
-          str([i["base_name"] for i in catalog]))
-    # Имя каталожной вещи обязано существовать в каталоге организации: иначе
-    # это не указатель, а выдуманное имя, похожее на указатель.
+    # ЗДЕСЬ СТОЯЛА ЛОЖНО-ЗЕЛЁНАЯ ПРОВЕРКА, И ОНА УБРАНА, А НЕ ПОДПРАВЛЕНА.
+    # Её условие заканчивалось на `or True`, то есть было истинным всегда: и
+    # при пустом `base_name`, и при каталоге, не содержащем ни одного нужного
+    # имени. Она не «слабо проверяла» — она не проверяла НИЧЕГО и добавляла
+    # выдуманный PASS к счёту набора (замечание ревью PR #58). Утверждение,
+    # которое она изображала, целиком покрывает проверка ниже, и та настоящая:
+    # имена сверяются с таблицей `products` этой организации.
+    #
+    # Счёт после удаления честный: проверок в этом шаге стало на одну меньше,
+    # и это уменьшение — не потеря покрытия, а снятие приписки.
     con = sqlite3.connect(DB_PATH)
     try:
         org = _fix5_org_id("Бренд Демо Пять")
@@ -4717,9 +4721,18 @@ def _fix5_demo_seed() -> None:
             "SELECT DISTINCT base_name FROM products WHERE org_id = ?", (org,))}
     finally:
         con.close()
+    names = [i["base_name"] for i in catalog]
     check("обе каталожные вещи есть в каталоге организации",
-          all(i["base_name"] in real for i in catalog),
-          str([i["base_name"] for i in catalog]))
+          bool(names) and all(n and n in real for n in names),
+          f"{names} ⊂ каталог из {len(real)} имён")
+    # ОТРИЦАТЕЛЬНЫЙ КОНТРОЛЬ к той же проверке: тем же предикатом убеждаемся,
+    # что он УМЕЕТ отвечать «нет». Без него «все имена нашлись» неотличимо от
+    # «предикат всегда согласен» — ровно та ошибка, которую здесь и допустили.
+    fake = ["Модель, которой нет в каталоге"]
+    check("тот же предикат отвергает выдуманное имя — значит он различает",
+          not all(n and n in real for n in fake)
+          and not all(n and n in real for n in [""]),
+          f"каталог из {len(real)} имён, проверено {fake}")
     check("у новинки есть эскиз", drafts and drafts[0]["sketch_id"], str(drafts))
 
     sid = drafts[0]["sketch_id"]
@@ -4979,6 +4992,199 @@ def _fix5_export_row(ws, title: str) -> int:
         if ws.cell(row=i, column=1).value == title:
             return i
     return 0
+
+
+#: Все таблицы слоя: предохранитель обязан смотреть на то, что реально
+#: стирается, а не на то, что видно на доске.
+_PLAN_TABLES_ALL = ("supply_materials", "supply_items", "supply_batches",
+                    "supply_assignments", "supply_sketches", "supply_events")
+
+
+def _fix5_plan_counts(org_id: int) -> dict:
+    con = sqlite3.connect(DB_PATH)
+    try:
+        return {t: con.execute(f"SELECT COUNT(*) FROM {t} WHERE org_id = ?",
+                               (org_id,)).fetchone()[0] for t in _PLAN_TABLES_ALL}
+    finally:
+        con.close()
+
+
+def _fix5_plan_identity(org_id: int) -> list:
+    """Отпечаток плана: не счётчики, а САМИ строки.
+
+    Считать строки мало: демо-сид не только удаляет, но и вставляет свои, и
+    «было 1, стало 3» неотличимо от «твою строку стёрли, положив три чужие».
+    Поэтому сверяются идентичности — то, что человек узнает на экране.
+    """
+    con = sqlite3.connect(DB_PATH)
+    try:
+        return sorted(
+            [("material", r[0]) for r in con.execute(
+                "SELECT title FROM supply_materials WHERE org_id=?", (org_id,))]
+            + [("item", r[0]) for r in con.execute(
+                "SELECT title FROM supply_items WHERE org_id=?", (org_id,))]
+            + [("batch", r[0]) for r in con.execute(
+                "SELECT title FROM supply_batches WHERE org_id=?", (org_id,))]
+            + [("sketch", r[0]) for r in con.execute(
+                "SELECT sha256 FROM supply_sketches WHERE org_id=?", (org_id,))])
+    finally:
+        con.close()
+
+
+def _fix5_demo_keeps_manual_plan() -> None:
+    """P1 ревью PR #58 (тред 3958649864): первое демо не стирает СВОЙ план.
+
+    Воспроизведено синтетически до правки: организация без МойСклада, материал
+    заведён руками, `POST /api/connect/demo` отвечал 200 — и на доске
+    оставались только посеянные строки. Прежний предохранитель смотрел лишь на
+    живой источник, а у ручного плана источника нет: он и есть источник.
+
+    Проверяются ВСЕ входы персистентных данных слоя, а не только видимый
+    материал: архивная строка (человек убрал её с доски, но она возвращается
+    кнопкой «Вернуть»), эскиз без вещи и журнал правок стираются тем же
+    вызовом и потому обязаны одинаково держать отказ.
+    """
+    print("\n== P1: первое демо не стирает ручной план ==")
+
+    def fresh(email: str, org: str):
+        c = client()
+        register(c, email, org)
+        return c, _fix5_org_id(org)
+
+    # ── 1. Живой ручной план ──────────────────────────────────────────────
+    c, oid = fresh("sp-fix5-manual@test.io", "Бренд Ручной План")
+    c.post("/api/supply/planning/materials",
+           json={"title": "Моя ткань, заведена руками", "qty": "120",
+                 "unit": "м", "op_id": "f5-mp-m"})
+    it = c.post("/api/supply/planning/items",
+                json={"kind": "draft", "title": "Моя новинка", "op_id": "f5-mp-i"}
+                ).json()["items"][0]
+    c.post("/api/supply/planning/batches",
+           json={"item_id": it["id"], "title": "Мой запуск", "plan_qty": "10",
+                 "op_id": "f5-mp-b"})
+    before_rows = _fix5_plan_counts(oid)
+    before_id = _fix5_plan_identity(oid)
+    r = c.post("/api/connect/demo")
+    check("первое демо на организации со своим планом ОТКЛОНЕНО",
+          r.status_code == 409, f"{r.status_code} {r.text[:160]}")
+    check("и отказ объясняет, что именно остановлено",
+          "Поставки" in r.text and "ничего" in r.text.lower(), r.text[:200])
+    check("НИ ОДНА строка плана не тронута — ни счётчики, ни сами строки",
+          _fix5_plan_counts(oid) == before_rows
+          and _fix5_plan_identity(oid) == before_id,
+          f"{before_rows} → {_fix5_plan_counts(oid)}")
+    board = c.get("/api/supply/planning").json()
+    check("на доске по-прежнему СВОЙ материал, а не посеянный",
+          [m["title"] for m in board["materials"]] == ["Моя ткань, заведена руками"],
+          str([m["title"] for m in board["materials"]]))
+    check("и демо-подключения после отказа не появилось",
+          _fix5_demo_conn_count(oid) == 0, str(_fix5_demo_conn_count(oid)))
+    check("каталог тоже не посеян — отказ случился ДО первой записи",
+          _fix5_products_count(oid) == 0, str(_fix5_products_count(oid)))
+    c.close()
+
+    # ── 2. ТОЛЬКО архивная строка ─────────────────────────────────────────
+    c2, oid2 = fresh("sp-fix5-arch@test.io", "Бренд Только Архив")
+    m = c2.post("/api/supply/planning/materials",
+                json={"title": "Убранная строка", "qty": "3", "op_id": "f5-ar-m"}
+                ).json()["materials"][0]
+    c2.post(f"/api/supply/planning/materials/{m['id']}/archive",
+            json={"rev": m["rev"], "op_id": "f5-ar-a"})
+    check("на доске её уже нет — она архивная",
+          not c2.get("/api/supply/planning").json()["materials"],
+          str(c2.get("/api/supply/planning").json()["materials"])[:120])
+    before2 = _fix5_plan_identity(oid2)
+    r2 = c2.post("/api/connect/demo")
+    check("но демо всё равно отклонено: архивное — не удалённое",
+          r2.status_code == 409, f"{r2.status_code} {r2.text[:120]}")
+    check("и архивная строка цела",
+          _fix5_plan_identity(oid2) == before2, str(_fix5_plan_identity(oid2))[:140])
+    c2.close()
+
+    # ── 3. ТОЛЬКО эскиз без вещи ──────────────────────────────────────────
+    c3, oid3 = fresh("sp-fix5-sk@test.io", "Бренд Только Эскиз")
+    c3.post("/api/supply/planning/sketches",
+            files={"file": ("s.png", make_png(), "image/png")})
+    before3 = _fix5_plan_identity(oid3)
+    r3 = c3.post("/api/connect/demo")
+    check("эскиз без вещи — тоже его файл, и демо отклонено",
+          r3.status_code == 409, f"{r3.status_code} {r3.text[:120]}")
+    check("и эскиз тот же самый, а не подменён посеянным",
+          _fix5_plan_identity(oid3) == before3 and len(before3) == 1,
+          str(_fix5_plan_identity(oid3))[:140])
+    c3.close()
+
+    # ── 4. КОНТРОЛЬ: пустая организация — первое демо обязано работать ────
+    c4, oid4 = fresh("sp-fix5-empty@test.io", "Бренд Пустой Старт")
+    r4 = c4.post("/api/connect/demo")
+    check("на пустой организации первое демо по-прежнему проходит",
+          r4.status_code == 200, f"{r4.status_code} {r4.text[:120]}")
+    seeded = _fix5_plan_counts(oid4)
+    check("и план действительно посеян",
+          seeded["supply_materials"] == 3 and seeded["supply_batches"] == 3,
+          str(seeded))
+
+    # ── 5. КОНТРОЛЬ: повторное демо пересевает, как и раньше ─────────────
+    c4.post("/api/supply/planning/materials",
+            json={"title": "Дописано поверх демо", "qty": "1", "op_id": "f5-re-m"})
+    r5 = c4.post("/api/connect/demo")
+    check("повторное демо на демо-организации по-прежнему пересевает",
+          r5.status_code == 200, f"{r5.status_code} {r5.text[:120]}")
+    again = _fix5_plan_counts(oid4)
+    check("и состав тот же, а не удвоенный",
+          again["supply_materials"] == 3 and again["supply_batches"] == 3,
+          str(again))
+    c4.close()
+
+    # ── 6. КОНТРОЛЬ: предохранитель живого источника не подменён новым ────
+    c6, oid6 = fresh("sp-fix5-ms@test.io", "Бренд Живой И Пустой")
+    con = sqlite3.connect(DB_PATH)
+    try:
+        con.execute("INSERT INTO connections (org_id, kind, token_enc,"
+                    " config_json, status) VALUES (?,'moysklad','','{}','active')",
+                    (oid6,))
+        cur = con.execute("INSERT INTO products (org_id, ext_id, base_name, size,"
+                          " category, sale_price, cost_price, cost_full, archived)"
+                          " VALUES (?,?,?,?,?,?,?,?,0)",
+                          (oid6, "ms-1", "Живая модель", "M", "Тест", 1, 1, 1))
+        con.execute("INSERT INTO stock_days (org_id, product_id, date, qty)"
+                    " VALUES (?,?,?,?)", (oid6, cur.lastrowid, "2026-09-01", 5))
+        con.commit()
+    finally:
+        con.close()
+    r6 = c6.post("/api/connect/demo")
+    check("организация с живым МойСкладом и ПУСТЫМ планом отклонена прежним "
+          "предохранителем, а не новым",
+          r6.status_code == 409 and "МойСклад" in r6.text, r6.text[:160])
+    c6.close()
+
+    # ── 7. Изоляция: чужой план не влияет на моё демо ─────────────────────
+    c7, oid7 = fresh("sp-fix5-iso@test.io", "Бренд Изоляция Демо")
+    r7 = c7.post("/api/connect/demo")
+    check("свой пустой старт не заблокирован планом СОСЕДНЕЙ организации",
+          r7.status_code == 200, f"{r7.status_code} {r7.text[:120]}")
+    neighbour = _fix5_plan_identity(_fix5_org_id("Бренд Ручной План"))
+    check("и план соседа при этом цел",
+          neighbour == before_id, f"{before_id} → {neighbour}")
+    c7.close()
+
+
+def _fix5_demo_conn_count(org_id: int) -> int:
+    con = sqlite3.connect(DB_PATH)
+    try:
+        return con.execute("SELECT COUNT(*) FROM connections WHERE org_id=?"
+                           " AND kind='demo'", (org_id,)).fetchone()[0]
+    finally:
+        con.close()
+
+
+def _fix5_products_count(org_id: int) -> int:
+    con = sqlite3.connect(DB_PATH)
+    try:
+        return con.execute("SELECT COUNT(*) FROM products WHERE org_id=?",
+                           (org_id,)).fetchone()[0]
+    finally:
+        con.close()
 
 
 def _fix5_export_control_chars() -> None:

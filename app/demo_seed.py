@@ -18,7 +18,7 @@ import struct
 import zlib
 from datetime import date, timedelta
 
-from sqlalchemy import delete, insert
+from sqlalchemy import delete, func, insert, select
 from sqlalchemy.orm import Session
 
 from app.models import (
@@ -259,13 +259,43 @@ def _largest_remainder(total: int, weights: list[float]) -> list[int]:
     return alloc
 
 
+#: Таблицы слоя «Поставки» в порядке удаления — от ссылающихся к тем, на кого
+#: ссылаются. Один список на удаление и на пересчёт: разойдись они, и
+#: предохранитель начал бы охранять не то, что стирается.
+SUPPLY_MODELS = (SupplyEvent, SupplyAssignment, SupplyBatch, SupplyItem,
+                 SupplyMaterial, SupplySketch)
+
+
+def supply_plan_rows(db: Session, org_id: int) -> dict:
+    """Сколько строк слоя «Поставки» уже есть у организации. Ничего не меняет.
+
+    СЧИТАЕТСЯ ВСЁ, ВКЛЮЧАЯ АРХИВНОЕ И НИ К ЧЕМУ НЕ ПРИВЯЗАННОЕ. Архивная строка
+    — это не «удалённая»: человек убрал её с доски, она лежит в базе и
+    возвращается кнопкой «Вернуть» (F-12). Эскиз без вещи — тоже его файл.
+    Журнал — история его правок. Всё это одинаково персистентно и одинаково
+    исчезает при `clear_org_data`, поэтому и в пересчёт входит одинаково:
+    предохранитель обязан смотреть на то, что РЕАЛЬНО будет стёрто, а не на то,
+    что видно на доске.
+
+    ПРОВЕНАНС ЗДЕСЬ НЕ ЧИТАЕТСЯ ВОВСЕ. Ни `author`, ни любое другое показываемое
+    человеку поле не спрашивается: это отображаемый текст, который вводит
+    пользователь, и строить на нём решение о стирании данных нельзя — он
+    подделывается тривиально. Вопрос «чьи это строки» решается снаружи и другим
+    признаком (см. `app/api.py`), а здесь считаются просто строки.
+    """
+    return {model.__tablename__: int(db.execute(
+        select(func.count()).select_from(model).where(model.org_id == org_id)
+    ).scalar_one() or 0) for model in SUPPLY_MODELS}
+
+
 def clear_org_data(db: Session, org_id: int) -> None:
     """Удаляет все бизнес-данные организации (перед повторным сидированием).
 
     ПЛАН «ПОСТАВОК» ЧИСТИТСЯ ЗДЕСЬ ЖЕ, И ЭТО НЕ РАСШИРЕНИЕ ПРАВ. Функция и до
     этого стирала организацию целиком — включая невосстановимые заказы на
-    производство; звать её разрешено ровно из одного места, и там стоит
-    предохранитель, который не пускает демо к организации с живым МойСкладом
+    производство; звать её разрешено ровно из одного места, и там стоят
+    предохранители: один не пускает демо к организации с живым МойСкладом,
+    второй — к организации, которая уже ведёт СВОЙ план «Поставок»
     (`app/api.py`, `POST /api/connect/demo`). Оставить слой снаружи было бы не
     осторожностью, а дефектом: второе подключение демо клало бы вторую копию
     материалов и партий поверх первой, и «пересоздаётся идентично» перестало бы
@@ -277,8 +307,7 @@ def clear_org_data(db: Session, org_id: int) -> None:
     """
     for model in (Sale, StockDay, WarehouseStock, OrderedQty, ProductionOrder, Product, Warehouse):
         db.execute(delete(model).where(model.org_id == org_id))
-    for model in (SupplyEvent, SupplyAssignment, SupplyBatch, SupplyItem,
-                  SupplyMaterial, SupplySketch):
+    for model in SUPPLY_MODELS:
         db.execute(delete(model).where(model.org_id == org_id))
 
 
