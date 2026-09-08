@@ -4636,6 +4636,9 @@ def supply_fix_5_checks() -> None:
         ("F-28 выгрузка xlsx", _fix5_export),
         ("F-28 права и арендатор", _fix5_export_access),
         ("F-29 подпись безымянной партии", _fix5_batch_label),
+        # Коррективы по независимому ревью PR #58.
+        ("P1 выгрузка переживает управляющий символ", _fix5_export_control_chars),
+        ("P2 количество не теряет третий знак", _fix5_export_precision),
     )
     for label, run_step in steps:
         try:
@@ -4965,6 +4968,193 @@ def _fix5_export_access() -> None:
           "Соседская ткань" not in mine_seen, str(sorted(str(s) for s in mine_seen)))
     member.close()
     other.close()
+    c.close()
+
+
+VT = chr(0x0b)          # вертикальная табуляция: невидима и недопустима в XML
+
+
+def _fix5_export_row(ws, title: str) -> int:
+    for i in range(3, ws.max_row + 1):
+        if ws.cell(row=i, column=1).value == title:
+            return i
+    return 0
+
+
+def _fix5_export_control_chars() -> None:
+    """P1 ревью PR #58: одна принятая строка не имеет права ронять выгрузку.
+
+    ВОСПРОИЗВЕДЕНИЕ ПОЛНОЕ, ЧЕРЕЗ HTTP, а не на уровне библиотеки: дефект жил
+    именно в связке «слой принял → выгрузка отдала», и проверка, зовущая
+    `supply_workbook` напрямую, не увидела бы кода ответа ручки.
+
+    Здесь же закреплено, ЧЕГО правка НЕ делает: канон ввода не меняется, база
+    хранит присланное человеком как есть, и доска отдаёт его же. Чистится
+    только представление в чужом формате.
+    """
+    print("\n== P1: управляющий символ не роняет выгрузку ==")
+    c = client()
+    register(c, "sp-fix5-ctl@test.io", "Бренд" + VT + "Управляющий")
+    dirty = "Ткань" + VT + "партия"
+    r = c.post("/api/supply/planning/materials",
+               json={"title": dirty, "qty": "5", "unit": "м",
+                     "source_note": "строка" + chr(0x0c) + "с переводом",
+                     "op_id": "f5-ctl-m"})
+    check("слой принял строку с управляющим символом, как принимал и раньше",
+          r.status_code == 200, f"{r.status_code} {r.text[:120]}")
+    board = r.json()
+    saved = [m for m in board["materials"] if m["title"] == dirty]
+    check("и сохранил её БЕЗ изменений — канон ввода не тронут",
+          bool(saved) and VT in saved[0]["title"], str(saved)[:140])
+
+    x = c.get("/api/supply/planning/export.xlsx")
+    check("выгрузка отдаётся, а не падает 500", x.status_code == 200,
+          f"{x.status_code} {x.text[:160]}")
+    check("и это настоящий xlsx, а не текст ошибки",
+          x.content[:4] == b"PK\x03\x04"
+          and (x.headers.get("content-type") or "").startswith(
+              "application/vnd.openxml"),
+          f"{x.content[:8]!r} {x.headers.get('content-type')}")
+    wb = _fix5_export_book(x.content)
+    ws = wb["Материалы"]
+    clean = "Ткань партия"
+    row = _fix5_export_row(ws, clean)
+    check("в ячейке символ заменён пробелом, а слова не склеились",
+          row > 0, str([ws.cell(row=i, column=1).value
+                        for i in range(3, ws.max_row + 1)])[:160])
+    if row:
+        check("заметка с U+000C тоже прошла",
+              ws.cell(row=row, column=6).value == "строка с переводом",
+              repr(ws.cell(row=row, column=6).value))
+    check("название организации с управляющим символом не сломало шапку листа",
+          isinstance(ws.cell(row=1, column=1).value, str)
+          and VT not in ws.cell(row=1, column=1).value
+          and "Бренд Управляющий" in ws.cell(row=1, column=1).value,
+          repr(ws.cell(row=1, column=1).value)[:120])
+
+    # База и доска не изменились от того, что кто-то скачал файл.
+    after = c.get("/api/supply/planning").json()
+    check("после выгрузки в базе по-прежнему исходная строка",
+          any(m["title"] == dirty for m in after["materials"]),
+          str([m["title"] for m in after["materials"]])[:140])
+
+    # ПОРЯДОК ЗАЩИТ. Формула, спрятанная за управляющим символом, после очистки
+    # оказывается первой — и обязана получить защиту, которой до очистки у неё
+    # не было.
+    #
+    # Символ здесь `U+0001`, а НЕ `U+000B`, и это не придирка к букве. Питон
+    # считает `\x0b` пробельным, поэтому `clean_text` снимает его с КРАЯ строки
+    # ещё на входе — до выгрузки такая формула просто не доезжает. А `\x01`
+    # пробельным не считается, доживает до ячейки, и после очистки оказывается
+    # ровно тем случаем, ради которого порядок и переставлен. Первая редакция
+    # этой проверки брала `\x0b` и краснела не на дефекте, а на собственной
+    # неверной посылке.
+    hide = chr(0x01) + '=HYPERLINK("http://evil.example","жми")'
+    c.post("/api/supply/planning/materials",
+           json={"title": hide, "qty": "1", "unit": "м", "op_id": "f5-ctl-f"})
+    wb2 = _fix5_export_book(
+        c.get("/api/supply/planning/export.xlsx").content)
+    ws2 = wb2["Материалы"]
+    hidden = _fix5_export_row(ws2, ' =HYPERLINK("http://evil.example","жми")')
+    check("формула из-под управляющего символа осталась ТЕКСТОМ и защищена",
+          hidden > 0 and ws2.cell(row=hidden, column=1).data_type == "s"
+          and ws2.cell(row=hidden, column=1).quotePrefix is True,
+          f"row={hidden}")
+
+    # Ведущий ПРОБЕЛ через ручку не проходит вовсе (его снимает `clean_text`),
+    # поэтому правило «первый непробельный символ» проверяется там, где оно
+    # живёт, — на самой общей точке записи. Это единственное место набора, где
+    # выгрузка зовётся мимо HTTP, и позвано оно осознанно.
+    from openpyxl import Workbook as _WB
+
+    from app import export_xlsx as _ex
+    probe = _WB()
+    pws = probe.active
+    cases = [(" =2+3", True), ("\t=2+3", True), ("  @SUM(A1)", True),
+             ("-15", True), ("обычное название", False),
+             ("шерсть 100 м", False)]
+    bad = []
+    for i, (text, want) in enumerate(cases, start=1):
+        got = _ex._cell(pws, i, 1, text).quotePrefix is True
+        if got != want:
+            bad.append((text, want, got))
+    check("защита формулы смотрит на первый НЕПРОБЕЛЬНЫЙ символ и не трогает "
+          "обычный текст", not bad, str(bad)[:200])
+    c.close()
+
+
+def _fix5_export_precision() -> None:
+    """P2 ревью PR #58: показ не имеет права прятать третий знак."""
+    print("\n== P2: 0,001 в файле остаётся 0,001 ==")
+    c = client()
+    register(c, "sp-fix5-prec@test.io", "Бренд Точность")
+    it = c.post("/api/supply/planning/items",
+                json={"kind": "draft", "title": "Вещь-точность", "op_id": "f5-p-i"}
+                ).json()["items"][0]
+    for tag, qty in (("001", "0.001"), ("004", "0.004"), ("005", "0.005"),
+                     ("ноль", "0"), ("целое", "100")):
+        c.post("/api/supply/planning/materials",
+               json={"title": f"Нить {tag}", "qty": qty, "unit": "кг",
+                     "op_id": f"f5-p-m-{tag}"})
+    c.post("/api/supply/planning/materials",
+           json={"title": "Нить без числа", "unit": "кг", "op_id": "f5-p-m-un"})
+    board = c.post("/api/supply/planning/batches",
+                   json={"item_id": it["id"], "title": "Партия-точность",
+                         "plan_qty": "60", "op_id": "f5-p-b"}).json()
+    batch = [b for b in board["batches"] if b["title"] == "Партия-точность"][0]
+    mat001 = [m for m in board["materials"] if m["title"] == "Нить 001"][0]
+    c.post("/api/supply/planning/assignments",
+           json={"material_id": mat001["id"], "batch_id": batch["id"],
+                 "qty": "0.001", "op_id": "f5-p-a"})
+
+    wb = _fix5_export_book(c.get("/api/supply/planning/export.xlsx").content)
+    ws = wb["Материалы"]
+
+    def decimals(fmt: str) -> int:
+        """Сколько знаков после запятой ПОКАЗЫВАЕТ формат ячейки."""
+        tail = str(fmt).split(".")[1] if "." in str(fmt) else ""
+        return sum(1 for ch in tail if ch in "0#")
+
+    for tag, want in (("001", 0.001), ("004", 0.004), ("005", 0.005)):
+        row = _fix5_export_row(ws, f"Нить {tag}")
+        cell = ws.cell(row=row, column=2)
+        check(f"«Нить {tag}»: значение в ячейке точное",
+              row > 0 and cell.value == want, f"row={row} value={cell.value!r}")
+        check(f"«Нить {tag}»: формат показывает третий знак, а не прячет его",
+              row > 0 and decimals(cell.number_format) >= 3,
+              f"fmt={cell.number_format!r}")
+
+    zero = _fix5_export_row(ws, "Нить ноль")
+    check("ноль остался нулём-числом, а не словом",
+          zero > 0 and ws.cell(row=zero, column=2).value == 0,
+          repr(ws.cell(row=zero, column=2).value) if zero else "нет строки")
+    unknown = _fix5_export_row(ws, "Нить без числа")
+    check("а неназванное количество по-прежнему СЛОВО, а не ноль",
+          unknown > 0 and ws.cell(row=unknown, column=2).value == "не указано",
+          repr(ws.cell(row=unknown, column=2).value) if unknown else "нет строки")
+    whole = _fix5_export_row(ws, "Нить целое")
+    check("целое количество не обросло лишними нулями в показе",
+          whole > 0 and ws.cell(row=whole, column=2).value == 100
+          and "0.00" not in ws.cell(row=whole, column=2).number_format,
+          f"fmt={ws.cell(row=whole, column=2).number_format!r}" if whole else "нет")
+
+    wsa = wb["Назначения"]
+    arow = 0
+    for i in range(3, wsa.max_row + 1):
+        if wsa.cell(row=i, column=1).value == "Нить 001":
+            arow = i
+    check("назначение 0,001 в файле тоже не превращается в ноль",
+          arow > 0 and wsa.cell(row=arow, column=2).value == 0.001
+          and decimals(wsa.cell(row=arow, column=2).number_format) >= 3,
+          f"row={arow}")
+
+    wsb = wb["Партии"]
+    brow = _fix5_export_row(wsb, "Партия-точность")
+    check("план изделий показан целым — штуки дробными не бывают",
+          brow > 0 and wsb.cell(row=brow, column=3).value == 60
+          and decimals(wsb.cell(row=brow, column=3).number_format) == 0,
+          f"row={brow} fmt={wsb.cell(row=brow, column=3).number_format!r}"
+          if brow else "нет строки")
     c.close()
 
 

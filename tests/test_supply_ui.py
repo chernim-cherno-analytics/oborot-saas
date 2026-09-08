@@ -6153,6 +6153,53 @@ def _fix5_lesson_steps(page, base) -> None:
         "     && Math.abs(a.width - 6 - c.width) < 3; }")
     check("кольцо урока стоит на кнопке «Добавить материал»", same is True, str(same))
 
+    # ── Наблюдатель обязан УСПОКОИТЬСЯ (корректив по ревью PR #58) ────────
+    #
+    # `place()` пишет карточке `style.left = "0px"`, меряет ширину и тут же
+    # пишет настоящее значение — два настоящих изменения атрибута на каждом
+    # вызове. Пока наблюдатель видел собственное наложение, каждый такой вызов
+    # будил следующий кадр, и урок держал 60 кадров в секунду на неподвижной
+    # странице до самого закрытия. Считаем не «плавно ли», а сами кадры.
+    page.evaluate("""() => {
+      window.__frames = 0;
+      window.__cardWrites = 0;
+      const real = window.requestAnimationFrame;
+      window.requestAnimationFrame = function (fn) {
+        window.__frames += 1;
+        return real.call(window, fn);
+      };
+      const c = document.querySelector('.tour-card');
+      if (c) new MutationObserver(rs => { window.__cardWrites += rs.length; })
+        .observe(c, {attributes: true, attributeFilter: ['style', 'class']});
+    }""")
+    page.wait_for_timeout(300)
+    page.evaluate("() => { window.__frames = 0; window.__cardWrites = 0; }")
+    page.wait_for_timeout(1200)
+    idle = page.evaluate("() => ({frames: window.__frames,"
+                         " writes: window.__cardWrites})")
+    # Потолок с запасом: до правки за это окно набегало около 70 кадров и
+    # четырёхсот правок стиля. Ноль требовать нельзя — посторонний кадр может
+    # прийти от чужого кода страницы, и проверка стала бы хрупкой без пользы.
+    check("на стоящей странице урок не крутит кадры без конца",
+          idle["frames"] <= 5 and idle["writes"] <= 10, str(idle))
+
+    # И при этом обводка НЕ оглохла: изменение размера окна она по-прежнему
+    # отрабатывает (это отдельный от наблюдателя путь, и он не должен был
+    # пострадать).
+    page.set_viewport_size({"width": 1100, "height": 800})
+    page.wait_for_timeout(700)
+    after_resize = page.evaluate(
+        "() => { const r = document.querySelector('.tour-ring');"
+        " const b = document.getElementById('pl-add-material');"
+        " if (!r || !b) return null;"
+        " const a = r.getBoundingClientRect(), c = b.getBoundingClientRect();"
+        " return Math.abs(a.left + 3 - c.left) < 3"
+        "     && Math.abs(a.top + 3 - c.top) < 3; }")
+    check("после изменения размера окна обводка снова на кнопке",
+          after_resize is True, str(after_resize))
+    page.set_viewport_size({"width": 1400, "height": 900})
+    page.wait_for_timeout(500)
+
     # Шаги, которые указывают на строки списка, обязаны иметь на что указать:
     # урок, подсвечивающий пустоту, честнее не показывать вовсе.
     from app import lessons as _lessons

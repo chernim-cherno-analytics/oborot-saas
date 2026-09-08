@@ -1314,15 +1314,62 @@
   // 525 px выше цели и не возвращалась НИКОГДА, пока человек не прокрутит
   // страницу. То есть урок подсвечивал пустое место.
   //
-  // Поэтому обводка следует за целью: любое изменение DOM во время урока
+  // Поэтому обводка следует за целью: изменение СТРАНИЦЫ во время урока
   // назначает пересчёт. Дорого это не выходит — `schedulePlace` схлопывает
   // сколько угодно вызовов в один кадр, а сам `place()` считает две рамки.
   // Наблюдатель живёт ровно столько же, сколько урок: заводится в `start` и
   // снимается в `finishTour`.
+  //
+  // СОБСТВЕННЫЕ ПРАВКИ НАЛОЖЕНИЯ НАБЛЮДАТЕЛЮ НЕ ВИДНЫ, И БЕЗ ЭТОГО ОН НЕ
+  // ОСТАНАВЛИВАЕТСЯ. Замечание ревью PR #58, воспроизведено счётчиком.
+  // `place()` пишет карточке `style.left = "0px"`, меряет её ширину и тут же
+  // пишет настоящее значение — это два НАСТОЯЩИХ изменения атрибута на каждом
+  // вызове. Наблюдатель их видел, назначал следующий кадр, тот снова писал, и
+  // так до закрытия урока. Замер на неподвижной странице: 360 правок стиля
+  // карточки и 60 запрошенных кадров В СЕКУНДУ, бесконечно. (Сама обводка при
+  // этом показывала ноль: её значения не менялись, и браузер не помечал
+  // атрибут грязным — то есть по одной обводке петлю было не увидеть.)
+  //
+  // Поэтому мутации, целиком принадлежащие наложению урока, пропускаются.
+  // Проверяется не «кто написал», а «где»: узел внутри обводки, карточки или
+  // бегунка. Всё остальное — обычное содержимое страницы, и оно по-прежнему
+  // двигает обводку: изменение доски проверяется отдельно.
   var domWatch = null;
+  function ownNode(node){
+    var el = (node && node.nodeType === 1) ? node : (node && node.parentNode);
+    if (!el || el.nodeType !== 1) return false;
+    if (ring && (el === ring || ring.contains(el))) return true;
+    if (card && (el === card || card.contains(el))) return true;
+    if (bar && (el === bar || bar.contains(el))) return true;
+    return false;
+  }
+  function pageChanged(records){
+    for (var i = 0; i < records.length; i++){
+      var rec = records[i];
+      if (rec.type === "childList"){
+        // Появление и снятие самих наложений — тоже наша работа: карточку
+        // каждого шага мы кладём в body и убираем оттуда сами.
+        var mine = true, j;
+        for (j = 0; j < rec.addedNodes.length; j++){
+          if (!ownNode(rec.addedNodes[j])) { mine = false; break; }
+        }
+        if (mine) {
+          for (j = 0; j < rec.removedNodes.length; j++){
+            if (!ownNode(rec.removedNodes[j])) { mine = false; break; }
+          }
+        }
+        if (mine && (rec.addedNodes.length || rec.removedNodes.length)) continue;
+      }
+      if (ownNode(rec.target)) continue;
+      return true;
+    }
+    return false;
+  }
   function watchLayout(){
     if (domWatch || typeof MutationObserver !== "function") return;
-    domWatch = new MutationObserver(schedulePlace);
+    domWatch = new MutationObserver(function(records){
+      if (pageChanged(records)) schedulePlace();
+    });
     domWatch.observe(document.body, {childList: true, subtree: true,
                                      attributes: true, characterData: true});
   }
