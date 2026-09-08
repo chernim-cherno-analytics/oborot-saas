@@ -4355,6 +4355,51 @@ def _fix4_retry_after_sketch_fail(page, base, c) -> None:
           len(fresh) == 1 and fresh[0]["sketch_id"] is not None,
           str(fresh[0]["sketch_id"]) if fresh else "строки нет")
 
+    # ЧЕТВЁРТЫЙ ПУТЬ: после отказа человек УБИРАЕТ файл из поля и сохраняет
+    # вещь без эскиза. Это законный исход, а не отказ от начатого, — и вторая
+    # строка здесь так же не нужна, как и на пути с файлом.
+    fail3 = {"n": 0}
+    page.route(re.compile(r"/api/supply/planning/items/\d+/sketch$"),
+               lambda route: (fail3.__setitem__("n", fail3["n"] + 1),
+                              route.fulfill(status=400,
+                                            content_type="application/json",
+                                            body='{"detail":"Эскиз не принят."}')))
+    page.click("#pl-add-item")
+    page.wait_for_timeout(250)
+    page.select_option("#pl-item-kind", "draft")
+    page.wait_for_timeout(150)
+    page.fill("#pl-item-title", "Новинка-без-файла")
+    page.set_input_files("#pl-item-sketch", {
+        "name": "bad2.png", "mimeType": "image/png",
+        "buffer": base64.b64decode(VALID_PNG_B64)})
+    page.evaluate("""() => {
+      const b = document.querySelector('#pl-item-form button[type=submit]');
+      if (b) b.click();
+    }""")
+    page.wait_for_timeout(2500)
+    check("третья новинка создана, её эскиз отвергнут", fail3["n"] >= 1,
+          str(fail3["n"]))
+    page.unroute(re.compile(r"/api/supply/planning/items/\d+/sketch$"))
+    # Поле файла очищается, заметка правится — и «Сохранить» ещё раз.
+    page.set_input_files("#pl-item-sketch", [])
+    page.fill("#pl-item-note", "решил обойтись без эскиза")
+    page.wait_for_timeout(200)
+    page.evaluate("""() => {
+      const b = document.querySelector('#pl-item-form button[type=submit]');
+      if (b) b.click();
+    }""")
+    page.wait_for_timeout(2000)
+    board = c.get("/api/supply/planning").json()
+    plain = [i for i in board["items"] if i["title"] == "Новинка-без-файла"]
+    check("сохранение без файла не завело вторую строку", len(plain) == 1,
+          f"строк: {len(plain)}")
+    check("и заметка, набранная перед этим, сохранена",
+          len(plain) == 1 and plain[0]["note"] == "решил обойтись без эскиза",
+          str(plain[0]["note"]) if plain else "строки нет")
+    check("форма закрыта и после пути без файла",
+          page.evaluate("() => document.getElementById('pl-item-form').hidden")
+          is True)
+
 
 def _fix4_history_ui(page, base, c) -> None:
     """F-24: «История» на карточке показывает последнюю правку."""

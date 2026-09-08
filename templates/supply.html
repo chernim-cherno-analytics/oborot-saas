@@ -2485,6 +2485,14 @@ document.addEventListener("DOMContentLoaded", function () {
         submitDraftWithSketch(form, body, chosen);
         return;
       }
+      // ФАЙЛА НЕТ — НО ВЕЩЬ МОГЛА БЫТЬ УЖЕ СОЗДАНА ПРОШЛОЙ ПОПЫТКОЙ. Человек
+      // после отказа прикрепления вправе просто убрать файл из поля и
+      // сохранить вещь без эскиза: это законный исход, а не отказ от начатого.
+      // Прежняя редакция проверяла память о начатом только на пути С файлом, и
+      // здесь безусловно создавала ВТОРУЮ новинку с тем же именем, оставляя
+      // первую без эскиза. Проверка стоит до всякого ветвления по файлу именно
+      // поэтому: путей отправки несколько, а память о начатом одна.
+      if (finishStartedItem(form, body)) return;
       send("/api/supply/planning/items", body, "pl-item-err", function (ok) {
         if (ok) closeItemForm(form);
       }, {kind: "item"});
@@ -2589,6 +2597,44 @@ document.addEventListener("DOMContentLoaded", function () {
       return i.id === id;
     });
     return rows.length ? rows[0] : null;
+  }
+
+  // ДОВЕСТИ ДО КОНЦА УЖЕ НАЧАТУЮ ВЕЩЬ, А НЕ ЗАВЕСТИ ВТОРУЮ. Возвращает true,
+  // если отправка взята на себя: вызывающему остаётся выйти.
+  //
+  // Случай один и тот же на всех путях: первый запрос уже создал новинку,
+  // второй (эскиз) отказал, и человек продолжает работу — правит поля, меняет
+  // файл или убирает его вовсе. Любая такая правка честно сбрасывает
+  // идентичность поступка, потому что это уже другой поступок; без памяти о
+  // созданной строке повтор заводил бы её заново.
+  function finishStartedItem(form, body) {
+    var known = draftItemId(form);
+    if (!known) return false;
+    var row = itemRowOf(known);
+    if (!row) {
+      // Строки на доске нет — значит её убрали, пока форма была открыта.
+      // Дописывать в неё нечего, и память о ней снимается: дальше обычное
+      // создание, а не молчаливый отказ.
+      draftItemId(form, 0);
+      return false;
+    }
+    var wantTitle = (body.title || "").trim();
+    var wantNote = body.note || "";
+    if ((row.title || "") === wantTitle && (row.note || "") === wantNote) {
+      // Ничего не изменилось: вещь на сервере уже такая, какой человек её
+      // видит. Второй запрос был бы записью без изменения — тем самым, что
+      // F-24 перестал считать правкой.
+      closeItemForm(form);
+      plToast("Сохранено", {ms: 3000});
+      flash("item", known);
+      return true;
+    }
+    send("/api/supply/planning/items/" + known + "/update",
+         {title: wantTitle, note: wantNote, rev: row.rev,
+          op_id: actionToken(form)},
+         "pl-item-err", function (ok) { if (ok) closeItemForm(form); },
+         {kind: "item", id: known});
+    return true;
   }
 
   function submitDraftWithSketch(form, body, fileObj) {
