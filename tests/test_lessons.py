@@ -4,8 +4,8 @@
 Сценарий (без pytest, просто python; mock-МойСклад не нужен — данные для
 примера даёт демо-сид):
   1) поднимаем приложение на 127.0.0.1:8805 с чистой БД;
-  2) каталог app.lessons: шесть уроков, у каждого шага непустые sel/title/
-     text/fallback, суммарно 13 минут («Пройти все уроки подряд · 13 мин»);
+  2) каталог app.lessons: семь уроков, у каждого шага непустые sel/title/
+     text/fallback, суммарно 16 минут («Пройти все уроки подряд · 16 мин»);
   3) аноним → 401 на всех ручках, /lessons → редирект на /login;
   4) GET /api/lessons: форма ответа, done=false у всех, hints_enabled=true;
   5) done/reset: идемпотентность, арифметика done_count, сброс всего,
@@ -118,15 +118,15 @@ def run_scenario() -> int:
     # ── 1. Каталог как контракт (его же читает рендерер тура) ────────────────
     print("== Каталог уроков ==")
     cat = lessons.CATALOGUE
-    check("в каталоге ровно 6 уроков", len(cat) == 6, f"n={len(cat)}")
+    check("в каталоге ровно 7 уроков", len(cat) == 7, f"n={len(cat)}")
     check("порядок ключей зафиксирован",
           [l["key"] for l in cat] == ["turnover", "settings", "replenish", "budget",
-                                      "forecast", "trust"],
+                                      "forecast", "trust", "supply"],
           f"keys={[l['key'] for l in cat]}")
-    check("ключи уникальны", len({l["key"] for l in cat}) == 6)
+    check("ключи уникальны", len({l["key"] for l in cat}) == 7)
     check("lessons.KEYS/TOTAL согласованы с каталогом",
-          lessons.KEYS == [l["key"] for l in cat] and lessons.TOTAL == 6)
-    check("«все уроки подряд» = 13 минут", lessons.TOTAL_MINUTES == 13,
+          lessons.KEYS == [l["key"] for l in cat] and lessons.TOTAL == 7)
+    check("«все уроки подряд» = 16 минут", lessons.TOTAL_MINUTES == 16,
           f"minutes={lessons.TOTAL_MINUTES}")
 
     bad_meta = [l["key"] for l in cat
@@ -154,7 +154,7 @@ def run_scenario() -> int:
     # Селекторы обязаны существовать на своих страницах (иначе тур подсветит пустоту).
     tpl = {"/turnover": "turnover.html", "/replenish": "replenish.html",
            "/budget": "budget.html", "/forecast": "forecast.html",
-           "/settings": "settings.html"}
+           "/settings": "settings.html", "/supply": "supply.html"}
     missing = []
     for l in cat:
         html = (ROOT / "templates" / tpl[l["url"]]).read_text(encoding="utf-8")
@@ -191,8 +191,8 @@ def run_scenario() -> int:
     check("регистрация владельца", r.status_code == 303, f"status={r.status_code}")
 
     d = a.get("/api/lessons").json()
-    check("GET /api/lessons: total = 6 и столько же уроков",
-          d["total"] == 6 and len(d["lessons"]) == 6,
+    check("GET /api/lessons: total = 7 и столько же уроков",
+          d["total"] == 7 and len(d["lessons"]) == 7,
           f"total={d['total']} n={len(d['lessons'])}")
     check("done_count = 0 у новичка", d["done_count"] == 0, f"done_count={d['done_count']}")
     check("все уроки помечены непройденными", all(l["done"] is False for l in d["lessons"]))

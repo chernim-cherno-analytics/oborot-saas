@@ -306,6 +306,16 @@
   .pl-combo-note { margin-top: 4px; font-size: 11.5px; color: var(--ink-3);
                    line-height: 1.4; }
 
+  /* ── SUPPLY-FIX-5: масштаб — поиск и сворачивание блока (F-29) ─────────── */
+
+  /* Полоса поиска над списком. Появляется, когда список перестаёт умещаться в
+     глаз (>10 строк), и до этого момента её нет на экране вовсе: поле поиска
+     над тремя карточками — лишний элемент, а не удобство. */
+  .pl-find { display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+             margin-bottom: 10px; }
+  .pl-find input { flex: 1 1 200px; min-width: 0; }
+  .pl-find .hint { flex: 0 0 auto; }
+
   @media (max-width: 640px) {
     .sup-wrap .card-body { padding: 12px; }
     .sup-wrap .card + .card { margin-top: 10px; }
@@ -368,6 +378,15 @@
         <div class="sup-limit" id="pl-note">
           <b>Это план: заказы, «Едет» и бюджет он не меняет.</b>
         </div>
+        {# ВЫГРУЗКА — ОБЫЧНАЯ ССЫЛКА, А НЕ КНОПКА С JS (ТЗ F-28). Ручка
+           отдаёт файл GET-запросом без параметров, поэтому здесь нечего
+           собирать скриптом: браузер скачает его сам, ссылку можно сохранить
+           и открыть в новой вкладке, а при выключенном JS она всё равно
+           работает. `download` просит браузер не открывать файл вкладкой. #}
+        <div class="pl-actions" id="pl-export-actions">
+          <a class="btn sm" id="pl-export" href="/api/supply/planning/export.xlsx"
+             download>Скачать xlsx</a>
+        </div>
       </div>
     </section>
 
@@ -380,10 +399,24 @@
       </div>
     </section>
 
+    {# МАСШТАБ: ПОИСК И СВОРАЧИВАНИЕ ПОЯВЛЯЮТСЯ, КОГДА ОНИ НУЖНЫ (ТЗ F-29).
+       Поле поиска и кнопка стоят в РАЗМЕТКЕ и только показываются/прячутся, а
+       не создаются заново каждой перерисовкой: созданное заново поле теряет
+       фокус и каретку ровно в тот момент, когда человек продолжает печатать —
+       та же причина, по которой так сделан поиск на вкладке предпросмотра. #}
     <section class="card">
       <div class="card-head"><h2>Материалы</h2><div class="spacer"></div>
-        <span class="hint" id="pl-mat-count"></span></div>
+        <span class="hint" id="pl-mat-count"></span>
+        <button class="btn sm" id="pl-mat-toggle" type="button" hidden
+                aria-expanded="true" aria-controls="pl-materials">Свернуть</button></div>
       <div class="card-body">
+        <div class="pl-find" id="pl-mat-find" hidden>
+          <label class="sup-sr" for="pl-mat-q">Поиск по названию материала</label>
+          <input class="input sm" type="text" id="pl-mat-q" maxlength="120"
+                 autocomplete="off" spellcheck="false" placeholder="часть названия">
+          <button class="btn sm" id="pl-mat-q-clear" type="button" hidden>Сбросить</button>
+          <span class="hint" id="pl-mat-found"></span>
+        </div>
         <div class="pl-list" id="pl-materials"></div>
         <div class="pl-empty" id="pl-mat-empty" hidden>
           Материалов пока нет. Начните с ткани — вещь и партию можно выбрать позже.
@@ -398,8 +431,17 @@
 
     <section class="card">
       <div class="card-head"><h2>Вещи и плановые партии</h2><div class="spacer"></div>
-        <span class="hint" id="pl-batch-count"></span></div>
+        <span class="hint" id="pl-batch-count"></span>
+        <button class="btn sm" id="pl-batch-toggle" type="button" hidden
+                aria-expanded="true" aria-controls="pl-batches">Свернуть</button></div>
       <div class="card-body">
+        <div class="pl-find" id="pl-batch-find" hidden>
+          <label class="sup-sr" for="pl-batch-q">Поиск по названию партии или вещи</label>
+          <input class="input sm" type="text" id="pl-batch-q" maxlength="120"
+                 autocomplete="off" spellcheck="false" placeholder="часть названия">
+          <button class="btn sm" id="pl-batch-q-clear" type="button" hidden>Сбросить</button>
+          <span class="hint" id="pl-batch-found"></span>
+        </div>
         <div class="pl-list" id="pl-batches"></div>
         <div class="pl-empty" id="pl-batch-empty" hidden>
           Плановых партий пока нет. Выберите вещь каталога или заведите новинку —
@@ -2913,7 +2955,10 @@ document.addEventListener("DOMContentLoaded", function () {
       go.dataset.batch = String(link.batch_id);
       go.addEventListener("click", function () { flash("batch", link.batch_id); });
       line.appendChild(go);
-      if (link.item_title && link.item_title !== link.batch_title) {
+      // Вещь дописывается, только если её ещё нет в подписи партии. У
+      // безымянной партии подпись сама начинается с имени вещи (F-29), и
+      // прежнее сравнение «не равны» дописало бы его второй раз.
+      if (link.item_title && link.batch_title.indexOf(link.item_title) < 0) {
         line.appendChild(el("span", "sub", " · " + link.item_title));
       }
       card.appendChild(line);
@@ -3064,6 +3109,20 @@ document.addEventListener("DOMContentLoaded", function () {
         clear(list);
         list.appendChild(el("div", "sub", "История не загрузилась."));
       });
+  }
+
+  // Подпись партии в выпадающем списке (ТЗ F-29). ИМЕННО ЗДЕСЬ ЖИЛО «X · X»,
+  // которое ТЗ называет дословно: прежняя строка `(b.title || b.item_title) +
+  // " · " + b.item_title` у безымянной партии подставляла имя вещи в ОБЕ
+  // половины, и человек выбирал «куда перенести» из нескольких одинаковых
+  // строк. Теперь слева стоит подпись самой партии (её считает сервер), а
+  // вещь дописывается только тогда, когда добавляет что-то новое.
+  function batchOption(b) {
+    var label = b.label || b.title || b.item_title || "";
+    if (b.item_title && label.indexOf(b.item_title) < 0) {
+      label += " · " + b.item_title;
+    }
+    return label;
   }
 
   function inlineButton(card, label, name, build) {
@@ -3247,7 +3306,7 @@ document.addEventListener("DOMContentLoaded", function () {
     }
     var pick = el("select");
     batches.forEach(function (b) {
-      var o = el("option", null, (b.title || b.item_title) + " · " + b.item_title);
+      var o = el("option", null, batchOption(b));
       o.value = String(b.id);
       pick.appendChild(o);
     });
@@ -3422,13 +3481,25 @@ document.addEventListener("DOMContentLoaded", function () {
     }
     var grow = el("div", "grow");
     var head = el("div", "t");
-    head.appendChild(el("span", null, b.title || b.item_title));
+    // БЕЗЫМЯННАЯ ПАРТИЯ НАЗЫВАЕТСЯ ВЕЩЬЮ И НОМЕРОМ (ТЗ F-29), а не именем
+    // вещи. Прежнее правило `title || item_title` давало «X · X»: заголовок
+    // партии и строка «вещь: X» под ним совпадали слово в слово, а две
+    // безымянные партии одной вещи выглядели двумя одинаковыми карточками.
+    // Подпись считает сервер (`label`) — она же уходит в выгрузку xlsx, и
+    // расходиться этим двум местам нельзя.
+    head.appendChild(el("span", null, b.label || b.title || b.item_title));
     // Бейджа «плановая партия» здесь больше нет (F-20): он стоял на ста
     // процентах карточек и потому не различал ничего, а место занимал у
     // «новинки» — которая как раз различает.
     if (b.item_kind === "draft") head.appendChild(el("span", "pl-tag", "новинка"));
     grow.appendChild(head);
-    grow.appendChild(el("div", "sub", "вещь: " + b.item_title));
+    // Строка «вещь: …» нужна там, где название партии своё и вещь по нему не
+    // угадывается. У безымянной партии подпись САМА начинается с имени вещи
+    // (F-29), и повторять его строкой ниже — писать одно слово дважды на одной
+    // карточке, то есть ровно то, против чего пункт и делался.
+    if (b.item_title && (b.label || "").indexOf(b.item_title) < 0) {
+      grow.appendChild(el("div", "sub", "вещь: " + b.item_title));
+    }
 
     var nums = el("div", "pl-nums");
     var plan = el("span", null, "план: ");
@@ -3584,7 +3655,7 @@ document.addEventListener("DOMContentLoaded", function () {
     }
     var pick = el("select");
     others.forEach(function (b) {
-      var o = el("option", null, (b.title || b.item_title) + " · " + b.item_title);
+      var o = el("option", null, batchOption(b));
       o.value = String(b.id);
       pick.appendChild(o);
     });
@@ -3627,6 +3698,109 @@ document.addEventListener("DOMContentLoaded", function () {
       send("/api/supply/planning/batches/" + b.id + "/update", body,
            "pl-batch-edit-err", null, {kind: "batch", id: b.id, form: form});
     };
+  }
+
+  // ── Масштаб: поиск, сворачивание и состояние в адресе (ТЗ F-29) ──────────
+  //
+  // ПОРОГ. Поиск и «Свернуть» появляются, когда в блоке больше десяти строк, и
+  // до этого их на экране нет вовсе. Это не осторожность, а честность экрана:
+  // поле поиска над тремя карточками обещает работу, которой нет, и занимает
+  // ровно ту строку, где человек ищет кнопку «Добавить».
+  var PL_BIG = 10;
+
+  // Какие блоки свёрнуты. Живёт здесь, а не в DOM, потому что списки
+  // перерисовываются целиком, а решение человека перерисовку обязано пережить.
+  PL.collapsed = {mat: false, batch: false};
+
+  // Запрос, который СЕЙЧАС имеет право фильтровать список.
+  //
+  // Порог проверяется здесь, ДО фильтрации, а не при показе полосы поиска:
+  // список мог сократиться до десяти строк как раз потому, что человек что-то
+  // удалил, — и спрятанное поле продолжало бы отсеивать карточки, оставаясь
+  // невидимой причиной полупустого экрана. Поэтому запрос снимается вместе с
+  // самой возможностью его видеть, и снимается до того, как что-то отсеет.
+  function activeQuery(kind, total) {
+    var input = byId("pl-" + kind + "-q");
+    if (!input) return "";
+    if (total <= PL_BIG) { input.value = ""; return ""; }
+    // `toLowerCase` вместо `toLocaleLowerCase`: русский регистр он снимает
+    // одинаково, а локаль браузера в результат поиска попадать не должна.
+    return String(input.value || "").trim().toLowerCase();
+  }
+
+  // Совпадение по ЛЮБОМУ из названий строки. Пустой запрос совпадает со всем —
+  // так «фильтра нет» и «фильтр ничего не отсеял» остаются одним состоянием.
+  function hit(query, fields) {
+    if (!query) return true;
+    for (var i = 0; i < fields.length; i++) {
+      var v = fields[i];
+      if (v && String(v).toLowerCase().indexOf(query) >= 0) return true;
+    }
+    return false;
+  }
+
+  function paintFind(kind, total, shown, query) {
+    var find = byId("pl-" + kind + "-find");
+    var toggle = byId("pl-" + kind + "-toggle");
+    var found = byId("pl-" + kind + "-found");
+    var clearBtn = byId("pl-" + kind + "-q-clear");
+    var big = total > PL_BIG;
+    find.hidden = !big;
+    toggle.hidden = !big;
+    if (clearBtn) clearBtn.hidden = !query;
+    if (found) {
+      found.textContent = query
+        ? (shown ? "найдено " + shown + " из " + total : "ничего не найдено")
+        : "";
+    }
+    paintCollapse(kind);
+  }
+
+  function paintCollapse(kind) {
+    var toggle = byId("pl-" + kind + "-toggle");
+    var list = byId(kind === "mat" ? "pl-materials" : "pl-batches");
+    // Свёрнутым блок бывает, только пока кнопка есть на экране: иначе список
+    // остался бы спрятанным без единого способа его вернуть.
+    var off = PL.collapsed[kind] && !toggle.hidden;
+    list.hidden = off;
+    toggle.textContent = off ? "Развернуть" : "Свернуть";
+    toggle.setAttribute("aria-expanded", off ? "false" : "true");
+  }
+
+  // ── Состояние экрана в адресе ────────────────────────────────────────────
+  // В хеше лежит ровно то, что человек может захотеть переслать или открыть
+  // закладкой: какая вкладка и какой блок свёрнут. Ни поиска, ни номеров строк
+  // здесь нет намеренно — набранный запрос это черновик, а не место в продукте.
+  function hashTokens() {
+    var raw = String(window.location.hash || "").replace(/^#/, "");
+    return raw ? raw.split(",").map(function (t) { return t.trim(); }).filter(Boolean) : [];
+  }
+
+  function writeHash() {
+    var tokens = [];
+    if (PL.tab === "preview") tokens.push("preview");
+    if (PL.collapsed.mat) tokens.push("mat-off");
+    if (PL.collapsed.batch) tokens.push("batch-off");
+    var next = tokens.length ? "#" + tokens.join(",") : "";
+    if (next === (window.location.hash || "")) return;
+    // `replaceState`, а не присваивание `location.hash`: состояние блока — не
+    // отдельный шаг истории, и «Назад» после трёх сворачиваний должен вернуть
+    // человека на прошлую страницу, а не разворачивать блоки по одному.
+    if (window.history && window.history.replaceState) {
+      window.history.replaceState(null, "",
+        window.location.pathname + window.location.search + next);
+    } else if (next) {
+      window.location.hash = next;
+    }
+  }
+
+  function applyHash() {
+    var tokens = hashTokens();
+    PL.collapsed.mat = tokens.indexOf("mat-off") >= 0;
+    PL.collapsed.batch = tokens.indexOf("batch-off") >= 0;
+    switchTab(tokens.indexOf("preview") >= 0 ? "preview" : "plan", true);
+    paintCollapse("mat");
+    paintCollapse("batch");
   }
 
   function render() {
@@ -3675,12 +3849,20 @@ document.addEventListener("DOMContentLoaded", function () {
     if (s.due_unknown) parts.push("без срока " + s.due_unknown);
     byId("pl-summary").textContent = parts.join(" · ");
 
+    // МАСШТАБ (F-29). Списки СНАЧАЛА фильтруются, и только потом рисуются:
+    // строить тридцать карточек, чтобы спрятать двадцать девять, — это работа
+    // ради того, чтобы её выбросить, и на телефоне она видна.
+    var allMats = data.materials || [];
+    var matQuery = activeQuery("mat", allMats.length);
+    var shownMats = allMats.filter(function (m) { return hit(matQuery, [m.title]); });
+
     var mats = byId("pl-materials");
     clear(mats);
-    (data.materials || []).forEach(function (m) { mats.appendChild(materialCard(m)); });
-    byId("pl-mat-empty").hidden = (data.materials || []).length > 0;
-    byId("pl-mat-count").textContent = (data.materials || []).length + " шт";
+    shownMats.forEach(function (m) { mats.appendChild(materialCard(m)); });
+    byId("pl-mat-empty").hidden = allMats.length > 0;
+    byId("pl-mat-count").textContent = allMats.length + " шт";
     byId("pl-mat-actions").hidden = !data.can_write;
+    paintFind("mat", allMats.length, shownMats.length, matQuery);
 
     var batches = byId("pl-batches");
     clear(batches);
@@ -3693,12 +3875,26 @@ document.addEventListener("DOMContentLoaded", function () {
     var lonely = (data.items || []).filter(function (it) {
       return !withBatches[it.id];
     });
-    lonely.forEach(function (it) { batches.appendChild(itemRow(it)); });
-    (data.batches || []).forEach(function (b) { batches.appendChild(batchCard(b)); });
+    var batchRows = lonely.length + (data.batches || []).length;
+    var batchQuery = activeQuery("batch", batchRows);
+    // Строка вещи ищется по своему названию, партия — по СВОЕЙ подписи и по
+    // названию вещи: у безымянной партии собственных слов нет вовсе, и искать
+    // её можно только тем, что человек видит на карточке.
+    var shownLonely = lonely.filter(function (it) { return hit(batchQuery, [it.title]); });
+    var shownBatches = (data.batches || []).filter(function (b) {
+      return hit(batchQuery, [b.label, b.title, b.item_title]);
+    });
+    shownLonely.forEach(function (it) { batches.appendChild(itemRow(it)); });
+    shownBatches.forEach(function (b) { batches.appendChild(batchCard(b)); });
     var totalRows = (data.items || []).length + (data.batches || []).length;
     byId("pl-batch-empty").hidden = totalRows > 0;
     byId("pl-batch-count").textContent = totalRows + " шт";
     byId("pl-batch-actions").hidden = !data.can_write;
+    // Порог и «найдено N из M» считаются по СТРОКАМ БЛОКА, а не по счётчику в
+    // шапке: счётчик по F-05 показывает вещи + партии, а строк рисуется
+    // меньше — вещь с партиями своей отдельной строки не имеет.
+    paintFind("batch", batchRows, shownLonely.length + shownBatches.length,
+              batchQuery);
 
     restoreInline(openInline);
     // Курсор возвращается туда, где он был, — если это место пережило
@@ -3731,14 +3927,18 @@ document.addEventListener("DOMContentLoaded", function () {
 
   // Вкладка предпросмотра существует не у всех организаций (F-08), поэтому
   // переключатель здесь необязателен: без него страница — один раздел плана.
-  function switchTab(which) {
+  function switchTab(which, silent) {
     var preview = byId("sup-view-preview");
-    if (!preview) return;
-    var isPlan = which === "plan";
+    // Вкладки нет — и вкладка «preview» из адреса ничего не открывает. Ставить
+    // здесь PL.tab всё равно было бы неправдой: открывать нечего.
+    if (!preview) { PL.tab = "plan"; return; }
+    var isPlan = which !== "preview";
+    PL.tab = isPlan ? "plan" : "preview";
     byId("sup-view-plan").hidden = !isPlan;
     preview.hidden = isPlan;
     byId("sup-tab-plan").setAttribute("aria-selected", isPlan ? "true" : "false");
     byId("sup-tab-preview").setAttribute("aria-selected", isPlan ? "false" : "true");
+    if (!silent) writeHash();
   }
 
   function start() {
@@ -3751,6 +3951,31 @@ document.addEventListener("DOMContentLoaded", function () {
     disclosure("pl-add-material", "pl-mat-form", buildMaterialForm);
     disclosure("pl-add-item", "pl-item-form", buildItemForm);
     disclosure("pl-add-batch", "pl-batch-form", buildBatchForm);
+
+    // F-29. Поиск клиентский: доска уже целиком в памяти, и ходить за
+    // подмножеством на сервер значило бы ждать сеть ради того, что уже есть.
+    ["mat", "batch"].forEach(function (kind) {
+      var input = byId("pl-" + kind + "-q");
+      var clearBtn = byId("pl-" + kind + "-q-clear");
+      var toggle = byId("pl-" + kind + "-toggle");
+      if (input) input.addEventListener("input", function () { render(); });
+      if (clearBtn) {
+        clearBtn.addEventListener("click", function () {
+          input.value = "";
+          render();
+          input.focus();
+        });
+      }
+      if (toggle) {
+        toggle.addEventListener("click", function () {
+          PL.collapsed[kind] = !PL.collapsed[kind];
+          paintCollapse(kind);
+          writeHash();
+        });
+      }
+    });
+    applyHash();
+    window.addEventListener("hashchange", applyHash);
     loadBoard();
   }
 

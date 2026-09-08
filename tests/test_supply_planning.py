@@ -198,16 +198,51 @@ def sizes_of(payload: dict) -> dict:
     return {m["title"]: (m["qty"], m["assigned"], m["free"]) for m in payload["materials"]}
 
 
+#: Таблицы плана в порядке удаления: от ссылающихся к тем, на кого ссылаются.
+_PLAN_TABLES = ("supply_events", "supply_assignments", "supply_batches",
+                "supply_items", "supply_materials", "supply_sketches")
+
+
+def _drop_demo_plan(org_name: str) -> None:
+    """Снимает синтетический план «Поставок», пришедший с демо-сидом (F-26).
+
+    ФИКСТУРА, А НЕ ПРОВЕРКА, и разница здесь принципиальна. Ручки «очистить
+    план» в продукте нет и быть не должно — убирают строки по одной и осознанно
+    (F-12), а каталожную вещь не убирают вовсе. Сценарию ниже нужен только
+    каталог демо-организации, поэтому её план снимается прямо в базе, как здесь
+    уже снимаются и подставляются другие предусловия.
+
+    То, ЧТО именно сеет демо, эта функция не утверждает ни в одном месте:
+    состав проверяется отдельно, на своей организации и своими проверками
+    (`supply_fix_5_checks`). Иначе фикстура доказывала бы саму себя.
+    """
+    con = sqlite3.connect(DB_PATH)
+    try:
+        row = con.execute("SELECT id FROM orgs WHERE name = ?", (org_name,)).fetchone()
+        if row is None:
+            return
+        for table in _PLAN_TABLES:
+            con.execute(f"DELETE FROM {table} WHERE org_id = ?", (row[0],))
+        con.commit()
+    finally:
+        con.close()
+
+
 def run() -> int:
     owner = client()
     register(owner, "sp-owner@test.io", "Бренд Один")
-    owner.post("/api/connect/demo")
 
     # ── 1. Материал заводится ДО вещи и партии ────────────────────────────────
     #
     # Это не «удобно», а факт производства: ткань покупают партией задолго до
     # того, как решено, что из неё шьют. Слой, который требует сначала выбрать
     # вещь, заставил бы человека выдумать её ради формы.
+    #
+    # ПУСТОЕ СОСТОЯНИЕ ПРОВЕРЯЕТСЯ ДО ДЕМО, И ЭТО НЕ ПЕРЕСТАНОВКА РАДИ УДОБСТВА.
+    # С пакета 5 (ТЗ F-26) демо-сид заводит и план «Поставок», поэтому «после
+    # демо экран пуст» — уже неправда, и проверять её там значило бы требовать
+    # от продукта прежнего дефекта. Сам демо-план проверяется отдельно и целиком
+    # (`supply_fix_5_checks`), а этот сценарий ниже говорит о СВОИХ строках.
     print("\n== Материал существует сам по себе, до дизайна ==")
     empty = owner.get("/api/supply/planning").json()
     check("пустое состояние предлагает начать с материала",
@@ -215,6 +250,17 @@ def run() -> int:
     check("и не показывает ни одной выдуманной цифры",
           empty["summary"]["materials"] == 0 and empty["summary"]["batches"] == 0
           and empty["summary"]["free_by_unit"] == [], json.dumps(empty["summary"]))
+
+    # Демо нужно этому сценарию ровно одним: каталогом (`products`), из которого
+    # берётся вещь `kind='catalog'`. Синтетический план, который приходит вместе
+    # с ним, снимается фикстурой — иначе каждая проверка ниже считала бы чужие
+    # строки вместе со своими.
+    owner.post("/api/connect/demo")
+    _drop_demo_plan("Бренд Один")
+    after_demo = owner.get("/api/supply/planning").json()
+    check("фикстура сняла демо-план целиком",
+          not after_demo["materials"] and not after_demo["items"]
+          and not after_demo["batches"], json.dumps(after_demo["summary"]))
 
     r = owner.post("/api/supply/planning/materials",
                    json={"title": "Ткань костюмная 100", "qty": "100", "unit": "м",
@@ -1111,6 +1157,9 @@ def run() -> int:
     # ── 23. SUPPLY-FIX-4: эскизы, журнал, транспорт ─────────────────────────
     supply_fix_4_checks()
     supply_fix_4_migration_checks()
+
+    # ── 24. SUPPLY-FIX-5: демо-план, выгрузка xlsx, подпись партии ───────────
+    supply_fix_5_checks()
 
     member.close()
     other.close()
@@ -2097,8 +2146,14 @@ def _fix2_material_links(c) -> None:
               and named[0].get("item_title") == "Вещь для распределения"
               and named[0].get("qty") == 120, str(named)[:140])
         nameless = [x for x in links if x.get("batch_id") == b2["id"]]
-        check("партия без названия называется своей вещью, а не пустой строкой",
-              nameless and nameless[0].get("batch_title") == "Вещь для распределения",
+        # ПОДПИСЬ ЗДЕСЬ СМЕНИЛАСЬ В ПАКЕТЕ 5 (F-29), и это не ослабление
+        # проверки, а её уточнение. Прежде безымянная партия называлась именем
+        # своей вещи — тем же, что стоит на строке вещи и на карточке партии,
+        # — и строка «120 м → Вещь» вела на карточку с другим заголовком.
+        # Теперь имя у объекта одно, и оно проверяется дословно.
+        check("партия без названия называется вещью и номером, а не пустой строкой",
+              nameless and nameless[0].get("batch_title")
+              == f"Вещь для распределения · партия №{b2['id']}",
               str(nameless)[:140])
         check("сумма строк равна «назначено»",
               round(sum(x["qty"] for x in links), 3) == m["assigned"],
@@ -4558,6 +4613,797 @@ def run_preview_tool(argv: list) -> int:
     from tools import supply_sheets_preview as tool
 
     return tool.main(argv)
+
+
+# ── SUPPLY-FIX-5 (F-26, F-28, F-29-подпись): демо, выгрузка, имя партии ──────
+#
+# Отдельная организация на весь блок: демо-сид СТИРАЕТ данные организации, и
+# гонять его на той, где уже лежат строки сценария, значило бы проверять
+# демо ценой всего остального.
+
+def supply_fix_5_checks() -> None:
+    """SUPPLY-FIX-5 на уровне API: демо-план, xlsx и подпись безымянной партии.
+
+    Каждый пункт — отдельный шаг со своими фикстурами, по тому же уроку, что и
+    в пакетах 3 и 4: прогон против базы `4a4c147` обязан сказать про КАЖДЫЙ
+    пункт, а не умереть на первом же отказе. Непроведённая проверка не бывает
+    ни зелёной, ни красной (D-42).
+    """
+    steps = (
+        ("F-26 демо-план", _fix5_demo_seed),
+        ("F-26 повторное демо", _fix5_demo_reseed),
+        ("F-26 предохранитель живого источника", _fix5_demo_guard),
+        ("F-28 выгрузка xlsx", _fix5_export),
+        ("F-28 права и арендатор", _fix5_export_access),
+        ("F-29 подпись безымянной партии", _fix5_batch_label),
+        # Коррективы по независимому ревью PR #58.
+        ("P1 выгрузка переживает управляющий символ", _fix5_export_control_chars),
+        ("P2 количество не теряет третий знак", _fix5_export_precision),
+        # Корректив 2 по независимому ревью PR #58.
+        ("P1 первое демо не стирает свой план", _fix5_demo_keeps_manual_plan),
+    )
+    for label, run_step in steps:
+        try:
+            run_step()
+        except Exception as exc:  # noqa: BLE001 — важен отчёт, а не тип
+            check(f"{label}: шаг дошёл до конца без исключения", False,
+                  f"{type(exc).__name__}: "
+                  f"{str(exc).strip().splitlines()[0][:200]}")
+
+
+def _fix5_org_id(name: str) -> int:
+    con = sqlite3.connect(DB_PATH)
+    try:
+        return con.execute("SELECT id FROM orgs WHERE name = ?", (name,)).fetchone()[0]
+    finally:
+        con.close()
+
+
+def _fix5_demo_client(email: str, org: str):
+    """Организация со свежим демо: и каталог, и план «Поставок»."""
+    c = client()
+    register(c, email, org)
+    r = c.post("/api/connect/demo")
+    check("демо подключается", r.status_code == 200, r.text[:160])
+    return c, r
+
+
+def _fix5_demo_seed() -> None:
+    print("\n== F-26: демо-организация показывает раздел, а не пустой экран ==")
+    c, r = _fix5_demo_client("sp-fix5-demo@test.io", "Бренд Демо Пять")
+    counters = (r.json() or {}).get("seeded") or {}
+    check("сид отчитался о строках плана",
+          counters.get("supply_materials") == 3 and counters.get("supply_items") == 3
+          and counters.get("supply_batches") == 3
+          and counters.get("supply_assignments") == 5, json.dumps(counters))
+
+    b = c.get("/api/supply/planning").json()
+    mats = {m["title"]: m for m in b["materials"]}
+    check("три материала", len(b["materials"]) == 3, str(sorted(mats)))
+    known = [m for m in b["materials"] if m["qty_known"]]
+    unknown = [m for m in b["materials"] if not m["qty_known"]]
+    check("у одного материала количество не названо вовсе",
+          len(unknown) == 1 and unknown[0]["qty"] is None and unknown[0]["free"] is None,
+          str(unknown)[:160])
+    check("сто метров основной ткани есть и часть свободна",
+          any(m["qty"] == 100.0 and m["free"] == 20.0 for m in known),
+          str([(m["title"], m["qty"], m["free"]) for m in known]))
+    over = [m for m in b["materials"] if m["over"]]
+    check("ровно один материал назначен сверх известного наличия",
+          len(over) == 1 and over[0]["qty"] == 40.0 and over[0]["assigned"] == 55.0,
+          str([(m["title"], m["qty"], m["assigned"]) for m in over]))
+    check("и предупреждение у него не пустое и не про запрет",
+          over and "не запрещает" in over[0]["warning"], over[0]["warning"][:80])
+
+    # КП ТЗ: демо-организация открывается на самом интересном состоянии слоя.
+    check("следующий шаг демо — перерасход",
+          b["next_step"]["code"] == "over", json.dumps(b["next_step"]))
+
+    items = b["items"]
+    catalog = [i for i in items if i["kind"] == "catalog"]
+    drafts = [i for i in items if i["kind"] == "draft"]
+    check("две вещи каталога и одна новинка",
+          len(catalog) == 2 and len(drafts) == 1, str([(i["kind"], i["title"]) for i in items]))
+    # ЗДЕСЬ СТОЯЛА ЛОЖНО-ЗЕЛЁНАЯ ПРОВЕРКА, И ОНА УБРАНА, А НЕ ПОДПРАВЛЕНА.
+    # Её условие заканчивалось на `or True`, то есть было истинным всегда: и
+    # при пустом `base_name`, и при каталоге, не содержащем ни одного нужного
+    # имени. Она не «слабо проверяла» — она не проверяла НИЧЕГО и добавляла
+    # выдуманный PASS к счёту набора (замечание ревью PR #58). Утверждение,
+    # которое она изображала, целиком покрывает проверка ниже, и та настоящая:
+    # имена сверяются с таблицей `products` этой организации.
+    #
+    # Счёт после удаления честный: проверок в этом шаге стало на одну меньше,
+    # и это уменьшение — не потеря покрытия, а снятие приписки.
+    con = sqlite3.connect(DB_PATH)
+    try:
+        org = _fix5_org_id("Бренд Демо Пять")
+        real = {row[0] for row in con.execute(
+            "SELECT DISTINCT base_name FROM products WHERE org_id = ?", (org,))}
+    finally:
+        con.close()
+    names = [i["base_name"] for i in catalog]
+    check("обе каталожные вещи есть в каталоге организации",
+          bool(names) and all(n and n in real for n in names),
+          f"{names} ⊂ каталог из {len(real)} имён")
+    # ОТРИЦАТЕЛЬНЫЙ КОНТРОЛЬ к той же проверке: тем же предикатом убеждаемся,
+    # что он УМЕЕТ отвечать «нет». Без него «все имена нашлись» неотличимо от
+    # «предикат всегда согласен» — ровно та ошибка, которую здесь и допустили.
+    fake = ["Модель, которой нет в каталоге"]
+    check("тот же предикат отвергает выдуманное имя — значит он различает",
+          not all(n and n in real for n in fake)
+          and not all(n and n in real for n in [""]),
+          f"каталог из {len(real)} имён, проверено {fake}")
+    check("у новинки есть эскиз", drafts and drafts[0]["sketch_id"], str(drafts))
+
+    sid = drafts[0]["sketch_id"]
+    full = c.get(f"/api/supply/planning/sketches/{sid}")
+    thumb = c.get(f"/api/supply/planning/sketches/{sid}/thumb")
+    check("эскиз новинки отдаётся и это PNG",
+          full.status_code == 200 and full.content[:8] == b"\x89PNG\r\n\x1a\n",
+          f"{full.status_code} {full.content[:8]!r}")
+    check("и у него есть отдельная миниатюра не больше 128 точек",
+          thumb.status_code == 200 and thumb.content != full.content
+          and _fix4_png_size(thumb.content)[0] <= 128
+          and _fix4_png_size(thumb.content)[1] <= 128,
+          f"{thumb.status_code} {_fix4_png_size(thumb.content)}")
+
+    kinds = sorted(x["due_kind"] for x in b["batches"])
+    check("три партии: точная дата, ориентир и неизвестный срок",
+          len(b["batches"]) == 3 and kinds == ["approx", "exact", "unknown"], str(kinds))
+    exact = [x for x in b["batches"] if x["due_kind"] == "exact"][0]
+    check("у точного срока есть дата и она не в прошлом",
+          exact["due_date"] and not exact["due_past"],
+          f"{exact['due_date']} past={exact['due_past']}")
+    check("одна партия опирается на материал без количества",
+          b["summary"]["batches_on_unknown"] == 1, json.dumps(b["summary"]))
+    check("и у неё это видно строкой назначения",
+          any(a.get("relies_on_unknown") for x in b["batches"]
+              for a in x["assignments"]), "нет пометки")
+    check("назначений ровно пять",
+          sum(len(x["assignments"]) for x in b["batches"]) == 5,
+          str([len(x["assignments"]) for x in b["batches"]]))
+    c.close()
+
+
+def _fix5_demo_reseed() -> None:
+    """Повторное демо ПЕРЕСОЗДАЁТ план, а не кладёт вторую копию."""
+    print("\n== F-26: второе подключение демо не удваивает план ==")
+    c, _ = _fix5_demo_client("sp-fix5-again@test.io", "Бренд Демо Снова")
+    first = c.get("/api/supply/planning").json()
+    # ПОМЕТКА, А НЕ СРАВНЕНИЕ ИДЕНТИФИКАТОРОВ. SQLite переиспользует rowid после
+    # DELETE, поэтому «id остались теми же» ничего не доказывает: строку могли
+    # и удалить, и вставить заново под тем же номером. Пометка переживает
+    # только НЕ пересозданную строку — и потому отвечает на нужный вопрос.
+    marked = first["materials"][0]
+    mark = c.post(f"/api/supply/planning/materials/{marked['id']}/update",
+                  json={"title": "ПОМЕЧЕНО ЧЕЛОВЕКОМ", "rev": marked["rev"],
+                        "op_id": "f5-again-mark"})
+    check("демо-строку можно поправить как обычную", mark.status_code == 200,
+          mark.text[:120])
+    c.post("/api/connect/demo")
+    second = c.get("/api/supply/planning").json()
+    check("состав тот же, а не удвоенный",
+          len(second["materials"]) == 3 and len(second["items"]) == 3
+          and len(second["batches"]) == 3,
+          f"{len(second['materials'])}/{len(second['items'])}/{len(second['batches'])}")
+    check("строки именно ПЕРЕСОЗДАНЫ: правки поверх прежнего посева не осталось",
+          all(m["title"] != "ПОМЕЧЕНО ЧЕЛОВЕКОМ" for m in second["materials"]),
+          str([m["title"] for m in second["materials"]]))
+    check("сводка после пересоздания та же",
+          second["summary"]["over_materials"] == 1
+          and second["summary"]["unknown_materials"] == 1
+          and second["next_step"]["code"] == "over",
+          json.dumps(second["summary"]))
+    con = sqlite3.connect(DB_PATH)
+    try:
+        org = _fix5_org_id("Бренд Демо Снова")
+        left = {t: con.execute(f"SELECT COUNT(*) FROM {t} WHERE org_id = ?",
+                               (org,)).fetchone()[0]
+                for t in ("supply_materials", "supply_items", "supply_batches",
+                          "supply_assignments", "supply_sketches")}
+    finally:
+        con.close()
+    check("в базе тоже не осталось строк от прошлого посева",
+          left == {"supply_materials": 3, "supply_items": 3, "supply_batches": 3,
+                   "supply_assignments": 5, "supply_sketches": 1}, str(left))
+    c.close()
+
+
+def _fix5_demo_guard() -> None:
+    """Предохранитель живого источника не ослаблен добавлением слоя.
+
+    Демо СТИРАЕТ организацию, и теперь стирает ещё и план «Поставок». Проверка
+    здесь ровно об этом: организация с загруженными остатками отвечает 409, и
+    ни одна её строка плана не исчезает — иначе цену новой фичи заплатил бы
+    живой клиент.
+    """
+    print("\n== F-26: организация с живым источником демо не пускает ==")
+    c = client()
+    register(c, "sp-fix5-live@test.io", "Бренд Живой Источник")
+    org = _fix5_org_id("Бренд Живой Источник")
+    c.post("/api/supply/planning/materials",
+           json={"title": "Ткань живого клиента", "qty": "12", "unit": "м",
+                 "op_id": "f5-live-m"})
+    con = sqlite3.connect(DB_PATH)
+    try:
+        con.execute("INSERT INTO connections (org_id, kind, token_enc, config_json,"
+                    " status) VALUES (?,'moysklad','','{}','active')", (org,))
+        cur = con.execute("INSERT INTO products (org_id, ext_id, base_name, size,"
+                          " category, sale_price, cost_price, cost_full, archived)"
+                          " VALUES (?,?,?,?,?,?,?,?,0)",
+                          (org, "live-1", "Живая модель", "M", "Тест", 1000, 400, 400))
+        con.execute("INSERT INTO stock_days (org_id, product_id, date, qty)"
+                    " VALUES (?,?,?,?)", (org, cur.lastrowid, "2026-09-01", 5))
+        con.commit()
+    finally:
+        con.close()
+    r = c.post("/api/connect/demo")
+    check("демо на живой организации отвергнуто 409", r.status_code == 409,
+          f"{r.status_code} {r.text[:120]}")
+    b = c.get("/api/supply/planning").json()
+    check("и план живой организации цел",
+          len(b["materials"]) == 1 and b["materials"][0]["title"] == "Ткань живого клиента",
+          str([m["title"] for m in b["materials"]]))
+    c.close()
+
+
+def _fix5_export_book(content: bytes):
+    import io
+    from openpyxl import load_workbook
+    return load_workbook(io.BytesIO(content))
+
+
+def _fix5_export() -> None:
+    print("\n== F-28: план выгружается в xlsx тремя листами ==")
+    c, _ = _fix5_demo_client("sp-fix5-x@test.io", "Бренд Выгрузка")
+    # Текст, который Excel исполнил бы как формулу, — в названии материала и в
+    # заметке: обе колонки пользовательские, и защита нужна обеим.
+    c.post("/api/supply/planning/materials",
+           json={"title": '=HYPERLINK("http://evil.example","жми")', "qty": "7",
+                 "unit": "м", "source_note": "@SUM(A1:A9)", "op_id": "f5-x-m"})
+    b = c.get("/api/supply/planning").json()
+
+    r = c.get("/api/supply/planning/export.xlsx")
+    check("выгрузка отдаётся владельцу", r.status_code == 200,
+          f"{r.status_code} {r.text[:120]}")
+    check("медиатип — xlsx, а не octet-stream",
+          (r.headers.get("content-type") or "").startswith(
+              "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+          str(r.headers.get("content-type")))
+    check("имя файла по-русски и с ASCII-запасным",
+          "filename*=UTF-8''" in (r.headers.get("content-disposition") or "")
+          and "supply-plan.xlsx" in (r.headers.get("content-disposition") or ""),
+          str(r.headers.get("content-disposition")))
+
+    wb = _fix5_export_book(r.content)
+    check("три листа и названы по-русски",
+          wb.sheetnames == ["Материалы", "Партии", "Назначения"], str(wb.sheetnames))
+
+    ws = wb["Материалы"]
+    heads = [ws.cell(row=2, column=i).value for i in range(1, 7)]
+    check("шапка листа материалов — из ТЗ",
+          heads == ["Материал", "Всего", "Назначено", "Свободно", "Единица", "Заметка"],
+          str(heads))
+    rows = {ws.cell(row=i, column=1).value: i for i in range(3, ws.max_row + 1)}
+    check("выгружены все материалы доски",
+          len(rows) == len(b["materials"]), f"{len(rows)} vs {len(b['materials'])}")
+
+    evil = '=HYPERLINK("http://evil.example","жми")'
+    cell = ws.cell(row=rows[evil], column=1)
+    check("текст с «=» остался ТЕКСТОМ, а не стал формулой",
+          cell.data_type == "s" and cell.quotePrefix is True and cell.value == evil,
+          f"type={cell.data_type} quote={cell.quotePrefix}")
+    note = ws.cell(row=rows[evil], column=6)
+    check("и заметка с «@» защищена так же",
+          note.data_type == "s" and note.quotePrefix is True,
+          f"type={note.data_type} quote={note.quotePrefix}")
+
+    # НЕИЗВЕСТНОЕ НЕ ПРЕВРАЩАЕТСЯ В НОЛЬ. Ноль в ячейке Excel складывается и
+    # сортируется, то есть выглядит фактом, — а факта нет (D-49).
+    unknown = [m for m in b["materials"] if not m["qty_known"]][0]
+    urow = rows[unknown["title"]]
+    check("материал без количества выгружен словом, а не нулём",
+          ws.cell(row=urow, column=2).value == "не указано"
+          and ws.cell(row=urow, column=4).value == "не указано",
+          f"{ws.cell(row=urow, column=2).value!r} {ws.cell(row=urow, column=4).value!r}")
+    known = [m for m in b["materials"] if m["qty_known"] and m["qty"] == 100.0][0]
+    krow = rows[known["title"]]
+    check("а известные числа выгружены числами и совпадают с доской",
+          ws.cell(row=krow, column=2).value == known["qty"]
+          and ws.cell(row=krow, column=3).value == known["assigned"]
+          and ws.cell(row=krow, column=4).value == known["free"],
+          f"{ws.cell(row=krow, column=2).value} {ws.cell(row=krow, column=3).value}")
+
+    wsb = wb["Партии"]
+    titles = [wsb.cell(row=i, column=1).value for i in range(3, wsb.max_row + 1)]
+    check("выгружены все партии", len(titles) == len(b["batches"]), str(titles))
+    check("безымянная партия подписана вещью и номером, а не пустотой",
+          any(" · партия №" in str(t) for t in titles), str(titles))
+    noplan = [x for x in b["batches"] if not x["plan_known"]][0]
+    prow = [i for i in range(3, wsb.max_row + 1)
+            if wsb.cell(row=i, column=1).value == noplan["label"]][0]
+    check("партия без плана изделий выгружена словом, а не нулём",
+          wsb.cell(row=prow, column=3).value == "не указано",
+          str(wsb.cell(row=prow, column=3).value))
+
+    wsa = wb["Назначения"]
+    check("лист назначений содержит все строки доски",
+          wsa.max_row - 2 == sum(len(x["assignments"]) for x in b["batches"]),
+          f"{wsa.max_row - 2}")
+    c.close()
+
+
+def _fix5_export_access() -> None:
+    print("\n== F-28: выгрузку читает участник, аноним — нет, чужого в ней нет ==")
+    import bcrypt
+    c, _ = _fix5_demo_client("sp-fix5-acc@test.io", "Бренд Доступ Пять")
+    org = _fix5_org_id("Бренд Доступ Пять")
+    con = sqlite3.connect(DB_PATH)
+    try:
+        pw = bcrypt.hashpw(b"secret123", bcrypt.gensalt()).decode()
+        cur = con.execute("INSERT INTO users (email, pw_hash, name, created_at)"
+                          " VALUES (?,?,?,datetime('now'))",
+                          ("sp-fix5-member@test.io", pw, "Участница"))
+        con.execute("INSERT INTO memberships (user_id, org_id, role)"
+                    " VALUES (?,?,'member')", (cur.lastrowid, org))
+        con.commit()
+    finally:
+        con.close()
+    member = client()
+    member.post("/login", data={"email": "sp-fix5-member@test.io",
+                                "password": "secret123"})
+    rm = member.get("/api/supply/planning/export.xlsx")
+    check("участник выгрузку читает — это его же экран", rm.status_code == 200,
+          f"{rm.status_code} {rm.text[:120]}")
+
+    anon = client()
+    ra = anon.get("/api/supply/planning/export.xlsx")
+    check("аноним не читает вовсе", ra.status_code == 401, str(ra.status_code))
+    anon.close()
+
+    # У ручки нет ни одного параметра, поэтому «попросить чужую выгрузку»
+    # нечем: арендатор берётся из сессии. Проверяется следствие — в файле
+    # соседней организации нет ни одной чужой строки.
+    other = client()
+    register(other, "sp-fix5-other@test.io", "Бренд Соседний Пять")
+    other.post("/api/supply/planning/materials",
+               json={"title": "Соседская ткань", "qty": "3", "op_id": "f5-o-m"})
+    ro = other.get("/api/supply/planning/export.xlsx")
+    wb = _fix5_export_book(ro.content)
+    seen = {wb["Материалы"].cell(row=i, column=1).value
+            for i in range(3, wb["Материалы"].max_row + 1)}
+    check("в файле соседа только его строки",
+          seen == {"Соседская ткань"}, str(sorted(str(s) for s in seen)))
+    mine = _fix5_export_book(member.get("/api/supply/planning/export.xlsx").content)
+    mine_seen = {mine["Материалы"].cell(row=i, column=1).value
+                 for i in range(3, mine["Материалы"].max_row + 1)}
+    check("и наоборот — соседской строки в своём файле нет",
+          "Соседская ткань" not in mine_seen, str(sorted(str(s) for s in mine_seen)))
+    member.close()
+    other.close()
+    c.close()
+
+
+VT = chr(0x0b)          # вертикальная табуляция: невидима и недопустима в XML
+
+
+def _fix5_export_row(ws, title: str) -> int:
+    for i in range(3, ws.max_row + 1):
+        if ws.cell(row=i, column=1).value == title:
+            return i
+    return 0
+
+
+#: Все таблицы слоя: предохранитель обязан смотреть на то, что реально
+#: стирается, а не на то, что видно на доске.
+_PLAN_TABLES_ALL = ("supply_materials", "supply_items", "supply_batches",
+                    "supply_assignments", "supply_sketches", "supply_events")
+
+
+def _fix5_plan_counts(org_id: int) -> dict:
+    con = sqlite3.connect(DB_PATH)
+    try:
+        return {t: con.execute(f"SELECT COUNT(*) FROM {t} WHERE org_id = ?",
+                               (org_id,)).fetchone()[0] for t in _PLAN_TABLES_ALL}
+    finally:
+        con.close()
+
+
+def _fix5_plan_identity(org_id: int) -> list:
+    """Отпечаток плана: не счётчики, а САМИ строки.
+
+    Считать строки мало: демо-сид не только удаляет, но и вставляет свои, и
+    «было 1, стало 3» неотличимо от «твою строку стёрли, положив три чужие».
+    Поэтому сверяются идентичности — то, что человек узнает на экране.
+    """
+    con = sqlite3.connect(DB_PATH)
+    try:
+        return sorted(
+            [("material", r[0]) for r in con.execute(
+                "SELECT title FROM supply_materials WHERE org_id=?", (org_id,))]
+            + [("item", r[0]) for r in con.execute(
+                "SELECT title FROM supply_items WHERE org_id=?", (org_id,))]
+            + [("batch", r[0]) for r in con.execute(
+                "SELECT title FROM supply_batches WHERE org_id=?", (org_id,))]
+            + [("sketch", r[0]) for r in con.execute(
+                "SELECT sha256 FROM supply_sketches WHERE org_id=?", (org_id,))])
+    finally:
+        con.close()
+
+
+def _fix5_demo_keeps_manual_plan() -> None:
+    """P1 ревью PR #58 (тред 3958649864): первое демо не стирает СВОЙ план.
+
+    Воспроизведено синтетически до правки: организация без МойСклада, материал
+    заведён руками, `POST /api/connect/demo` отвечал 200 — и на доске
+    оставались только посеянные строки. Прежний предохранитель смотрел лишь на
+    живой источник, а у ручного плана источника нет: он и есть источник.
+
+    Проверяются ВСЕ входы персистентных данных слоя, а не только видимый
+    материал: архивная строка (человек убрал её с доски, но она возвращается
+    кнопкой «Вернуть»), эскиз без вещи и журнал правок стираются тем же
+    вызовом и потому обязаны одинаково держать отказ.
+    """
+    print("\n== P1: первое демо не стирает ручной план ==")
+
+    def fresh(email: str, org: str):
+        c = client()
+        register(c, email, org)
+        return c, _fix5_org_id(org)
+
+    # ── 1. Живой ручной план ──────────────────────────────────────────────
+    c, oid = fresh("sp-fix5-manual@test.io", "Бренд Ручной План")
+    c.post("/api/supply/planning/materials",
+           json={"title": "Моя ткань, заведена руками", "qty": "120",
+                 "unit": "м", "op_id": "f5-mp-m"})
+    it = c.post("/api/supply/planning/items",
+                json={"kind": "draft", "title": "Моя новинка", "op_id": "f5-mp-i"}
+                ).json()["items"][0]
+    c.post("/api/supply/planning/batches",
+           json={"item_id": it["id"], "title": "Мой запуск", "plan_qty": "10",
+                 "op_id": "f5-mp-b"})
+    before_rows = _fix5_plan_counts(oid)
+    before_id = _fix5_plan_identity(oid)
+    r = c.post("/api/connect/demo")
+    check("первое демо на организации со своим планом ОТКЛОНЕНО",
+          r.status_code == 409, f"{r.status_code} {r.text[:160]}")
+    check("и отказ объясняет, что именно остановлено",
+          "Поставки" in r.text and "ничего" in r.text.lower(), r.text[:200])
+    check("НИ ОДНА строка плана не тронута — ни счётчики, ни сами строки",
+          _fix5_plan_counts(oid) == before_rows
+          and _fix5_plan_identity(oid) == before_id,
+          f"{before_rows} → {_fix5_plan_counts(oid)}")
+    board = c.get("/api/supply/planning").json()
+    check("на доске по-прежнему СВОЙ материал, а не посеянный",
+          [m["title"] for m in board["materials"]] == ["Моя ткань, заведена руками"],
+          str([m["title"] for m in board["materials"]]))
+    check("и демо-подключения после отказа не появилось",
+          _fix5_demo_conn_count(oid) == 0, str(_fix5_demo_conn_count(oid)))
+    check("каталог тоже не посеян — отказ случился ДО первой записи",
+          _fix5_products_count(oid) == 0, str(_fix5_products_count(oid)))
+    c.close()
+
+    # ── 2. ТОЛЬКО архивная строка ─────────────────────────────────────────
+    c2, oid2 = fresh("sp-fix5-arch@test.io", "Бренд Только Архив")
+    m = c2.post("/api/supply/planning/materials",
+                json={"title": "Убранная строка", "qty": "3", "op_id": "f5-ar-m"}
+                ).json()["materials"][0]
+    c2.post(f"/api/supply/planning/materials/{m['id']}/archive",
+            json={"rev": m["rev"], "op_id": "f5-ar-a"})
+    check("на доске её уже нет — она архивная",
+          not c2.get("/api/supply/planning").json()["materials"],
+          str(c2.get("/api/supply/planning").json()["materials"])[:120])
+    before2 = _fix5_plan_identity(oid2)
+    r2 = c2.post("/api/connect/demo")
+    check("но демо всё равно отклонено: архивное — не удалённое",
+          r2.status_code == 409, f"{r2.status_code} {r2.text[:120]}")
+    check("и архивная строка цела",
+          _fix5_plan_identity(oid2) == before2, str(_fix5_plan_identity(oid2))[:140])
+    c2.close()
+
+    # ── 3. ТОЛЬКО эскиз без вещи ──────────────────────────────────────────
+    c3, oid3 = fresh("sp-fix5-sk@test.io", "Бренд Только Эскиз")
+    c3.post("/api/supply/planning/sketches",
+            files={"file": ("s.png", make_png(), "image/png")})
+    before3 = _fix5_plan_identity(oid3)
+    r3 = c3.post("/api/connect/demo")
+    check("эскиз без вещи — тоже его файл, и демо отклонено",
+          r3.status_code == 409, f"{r3.status_code} {r3.text[:120]}")
+    check("и эскиз тот же самый, а не подменён посеянным",
+          _fix5_plan_identity(oid3) == before3 and len(before3) == 1,
+          str(_fix5_plan_identity(oid3))[:140])
+    c3.close()
+
+    # ── 4. КОНТРОЛЬ: пустая организация — первое демо обязано работать ────
+    c4, oid4 = fresh("sp-fix5-empty@test.io", "Бренд Пустой Старт")
+    r4 = c4.post("/api/connect/demo")
+    check("на пустой организации первое демо по-прежнему проходит",
+          r4.status_code == 200, f"{r4.status_code} {r4.text[:120]}")
+    seeded = _fix5_plan_counts(oid4)
+    check("и план действительно посеян",
+          seeded["supply_materials"] == 3 and seeded["supply_batches"] == 3,
+          str(seeded))
+
+    # ── 5. КОНТРОЛЬ: повторное демо пересевает, как и раньше ─────────────
+    c4.post("/api/supply/planning/materials",
+            json={"title": "Дописано поверх демо", "qty": "1", "op_id": "f5-re-m"})
+    r5 = c4.post("/api/connect/demo")
+    check("повторное демо на демо-организации по-прежнему пересевает",
+          r5.status_code == 200, f"{r5.status_code} {r5.text[:120]}")
+    again = _fix5_plan_counts(oid4)
+    check("и состав тот же, а не удвоенный",
+          again["supply_materials"] == 3 and again["supply_batches"] == 3,
+          str(again))
+    c4.close()
+
+    # ── 6. КОНТРОЛЬ: предохранитель живого источника не подменён новым ────
+    c6, oid6 = fresh("sp-fix5-ms@test.io", "Бренд Живой И Пустой")
+    con = sqlite3.connect(DB_PATH)
+    try:
+        con.execute("INSERT INTO connections (org_id, kind, token_enc,"
+                    " config_json, status) VALUES (?,'moysklad','','{}','active')",
+                    (oid6,))
+        cur = con.execute("INSERT INTO products (org_id, ext_id, base_name, size,"
+                          " category, sale_price, cost_price, cost_full, archived)"
+                          " VALUES (?,?,?,?,?,?,?,?,0)",
+                          (oid6, "ms-1", "Живая модель", "M", "Тест", 1, 1, 1))
+        con.execute("INSERT INTO stock_days (org_id, product_id, date, qty)"
+                    " VALUES (?,?,?,?)", (oid6, cur.lastrowid, "2026-09-01", 5))
+        con.commit()
+    finally:
+        con.close()
+    r6 = c6.post("/api/connect/demo")
+    check("организация с живым МойСкладом и ПУСТЫМ планом отклонена прежним "
+          "предохранителем, а не новым",
+          r6.status_code == 409 and "МойСклад" in r6.text, r6.text[:160])
+    c6.close()
+
+    # ── 7. Изоляция: чужой план не влияет на моё демо ─────────────────────
+    c7, oid7 = fresh("sp-fix5-iso@test.io", "Бренд Изоляция Демо")
+    r7 = c7.post("/api/connect/demo")
+    check("свой пустой старт не заблокирован планом СОСЕДНЕЙ организации",
+          r7.status_code == 200, f"{r7.status_code} {r7.text[:120]}")
+    neighbour = _fix5_plan_identity(_fix5_org_id("Бренд Ручной План"))
+    check("и план соседа при этом цел",
+          neighbour == before_id, f"{before_id} → {neighbour}")
+    c7.close()
+
+
+def _fix5_demo_conn_count(org_id: int) -> int:
+    con = sqlite3.connect(DB_PATH)
+    try:
+        return con.execute("SELECT COUNT(*) FROM connections WHERE org_id=?"
+                           " AND kind='demo'", (org_id,)).fetchone()[0]
+    finally:
+        con.close()
+
+
+def _fix5_products_count(org_id: int) -> int:
+    con = sqlite3.connect(DB_PATH)
+    try:
+        return con.execute("SELECT COUNT(*) FROM products WHERE org_id=?",
+                           (org_id,)).fetchone()[0]
+    finally:
+        con.close()
+
+
+def _fix5_export_control_chars() -> None:
+    """P1 ревью PR #58: одна принятая строка не имеет права ронять выгрузку.
+
+    ВОСПРОИЗВЕДЕНИЕ ПОЛНОЕ, ЧЕРЕЗ HTTP, а не на уровне библиотеки: дефект жил
+    именно в связке «слой принял → выгрузка отдала», и проверка, зовущая
+    `supply_workbook` напрямую, не увидела бы кода ответа ручки.
+
+    Здесь же закреплено, ЧЕГО правка НЕ делает: канон ввода не меняется, база
+    хранит присланное человеком как есть, и доска отдаёт его же. Чистится
+    только представление в чужом формате.
+    """
+    print("\n== P1: управляющий символ не роняет выгрузку ==")
+    c = client()
+    register(c, "sp-fix5-ctl@test.io", "Бренд" + VT + "Управляющий")
+    dirty = "Ткань" + VT + "партия"
+    r = c.post("/api/supply/planning/materials",
+               json={"title": dirty, "qty": "5", "unit": "м",
+                     "source_note": "строка" + chr(0x0c) + "с переводом",
+                     "op_id": "f5-ctl-m"})
+    check("слой принял строку с управляющим символом, как принимал и раньше",
+          r.status_code == 200, f"{r.status_code} {r.text[:120]}")
+    board = r.json()
+    saved = [m for m in board["materials"] if m["title"] == dirty]
+    check("и сохранил её БЕЗ изменений — канон ввода не тронут",
+          bool(saved) and VT in saved[0]["title"], str(saved)[:140])
+
+    x = c.get("/api/supply/planning/export.xlsx")
+    check("выгрузка отдаётся, а не падает 500", x.status_code == 200,
+          f"{x.status_code} {x.text[:160]}")
+    check("и это настоящий xlsx, а не текст ошибки",
+          x.content[:4] == b"PK\x03\x04"
+          and (x.headers.get("content-type") or "").startswith(
+              "application/vnd.openxml"),
+          f"{x.content[:8]!r} {x.headers.get('content-type')}")
+    wb = _fix5_export_book(x.content)
+    ws = wb["Материалы"]
+    clean = "Ткань партия"
+    row = _fix5_export_row(ws, clean)
+    check("в ячейке символ заменён пробелом, а слова не склеились",
+          row > 0, str([ws.cell(row=i, column=1).value
+                        for i in range(3, ws.max_row + 1)])[:160])
+    if row:
+        check("заметка с U+000C тоже прошла",
+              ws.cell(row=row, column=6).value == "строка с переводом",
+              repr(ws.cell(row=row, column=6).value))
+    check("название организации с управляющим символом не сломало шапку листа",
+          isinstance(ws.cell(row=1, column=1).value, str)
+          and VT not in ws.cell(row=1, column=1).value
+          and "Бренд Управляющий" in ws.cell(row=1, column=1).value,
+          repr(ws.cell(row=1, column=1).value)[:120])
+
+    # База и доска не изменились от того, что кто-то скачал файл.
+    after = c.get("/api/supply/planning").json()
+    check("после выгрузки в базе по-прежнему исходная строка",
+          any(m["title"] == dirty for m in after["materials"]),
+          str([m["title"] for m in after["materials"]])[:140])
+
+    # ПОРЯДОК ЗАЩИТ. Формула, спрятанная за управляющим символом, после очистки
+    # оказывается первой — и обязана получить защиту, которой до очистки у неё
+    # не было.
+    #
+    # Символ здесь `U+0001`, а НЕ `U+000B`, и это не придирка к букве. Питон
+    # считает `\x0b` пробельным, поэтому `clean_text` снимает его с КРАЯ строки
+    # ещё на входе — до выгрузки такая формула просто не доезжает. А `\x01`
+    # пробельным не считается, доживает до ячейки, и после очистки оказывается
+    # ровно тем случаем, ради которого порядок и переставлен. Первая редакция
+    # этой проверки брала `\x0b` и краснела не на дефекте, а на собственной
+    # неверной посылке.
+    hide = chr(0x01) + '=HYPERLINK("http://evil.example","жми")'
+    c.post("/api/supply/planning/materials",
+           json={"title": hide, "qty": "1", "unit": "м", "op_id": "f5-ctl-f"})
+    wb2 = _fix5_export_book(
+        c.get("/api/supply/planning/export.xlsx").content)
+    ws2 = wb2["Материалы"]
+    hidden = _fix5_export_row(ws2, ' =HYPERLINK("http://evil.example","жми")')
+    check("формула из-под управляющего символа осталась ТЕКСТОМ и защищена",
+          hidden > 0 and ws2.cell(row=hidden, column=1).data_type == "s"
+          and ws2.cell(row=hidden, column=1).quotePrefix is True,
+          f"row={hidden}")
+
+    # Ведущий ПРОБЕЛ через ручку не проходит вовсе (его снимает `clean_text`),
+    # поэтому правило «первый непробельный символ» проверяется там, где оно
+    # живёт, — на самой общей точке записи. Это единственное место набора, где
+    # выгрузка зовётся мимо HTTP, и позвано оно осознанно.
+    from openpyxl import Workbook as _WB
+
+    from app import export_xlsx as _ex
+    probe = _WB()
+    pws = probe.active
+    cases = [(" =2+3", True), ("\t=2+3", True), ("  @SUM(A1)", True),
+             ("-15", True), ("обычное название", False),
+             ("шерсть 100 м", False)]
+    bad = []
+    for i, (text, want) in enumerate(cases, start=1):
+        got = _ex._cell(pws, i, 1, text).quotePrefix is True
+        if got != want:
+            bad.append((text, want, got))
+    check("защита формулы смотрит на первый НЕПРОБЕЛЬНЫЙ символ и не трогает "
+          "обычный текст", not bad, str(bad)[:200])
+    c.close()
+
+
+def _fix5_export_precision() -> None:
+    """P2 ревью PR #58: показ не имеет права прятать третий знак."""
+    print("\n== P2: 0,001 в файле остаётся 0,001 ==")
+    c = client()
+    register(c, "sp-fix5-prec@test.io", "Бренд Точность")
+    it = c.post("/api/supply/planning/items",
+                json={"kind": "draft", "title": "Вещь-точность", "op_id": "f5-p-i"}
+                ).json()["items"][0]
+    for tag, qty in (("001", "0.001"), ("004", "0.004"), ("005", "0.005"),
+                     ("ноль", "0"), ("целое", "100")):
+        c.post("/api/supply/planning/materials",
+               json={"title": f"Нить {tag}", "qty": qty, "unit": "кг",
+                     "op_id": f"f5-p-m-{tag}"})
+    c.post("/api/supply/planning/materials",
+           json={"title": "Нить без числа", "unit": "кг", "op_id": "f5-p-m-un"})
+    board = c.post("/api/supply/planning/batches",
+                   json={"item_id": it["id"], "title": "Партия-точность",
+                         "plan_qty": "60", "op_id": "f5-p-b"}).json()
+    batch = [b for b in board["batches"] if b["title"] == "Партия-точность"][0]
+    mat001 = [m for m in board["materials"] if m["title"] == "Нить 001"][0]
+    c.post("/api/supply/planning/assignments",
+           json={"material_id": mat001["id"], "batch_id": batch["id"],
+                 "qty": "0.001", "op_id": "f5-p-a"})
+
+    wb = _fix5_export_book(c.get("/api/supply/planning/export.xlsx").content)
+    ws = wb["Материалы"]
+
+    def decimals(fmt: str) -> int:
+        """Сколько знаков после запятой ПОКАЗЫВАЕТ формат ячейки."""
+        tail = str(fmt).split(".")[1] if "." in str(fmt) else ""
+        return sum(1 for ch in tail if ch in "0#")
+
+    for tag, want in (("001", 0.001), ("004", 0.004), ("005", 0.005)):
+        row = _fix5_export_row(ws, f"Нить {tag}")
+        cell = ws.cell(row=row, column=2)
+        check(f"«Нить {tag}»: значение в ячейке точное",
+              row > 0 and cell.value == want, f"row={row} value={cell.value!r}")
+        check(f"«Нить {tag}»: формат показывает третий знак, а не прячет его",
+              row > 0 and decimals(cell.number_format) >= 3,
+              f"fmt={cell.number_format!r}")
+
+    zero = _fix5_export_row(ws, "Нить ноль")
+    check("ноль остался нулём-числом, а не словом",
+          zero > 0 and ws.cell(row=zero, column=2).value == 0,
+          repr(ws.cell(row=zero, column=2).value) if zero else "нет строки")
+    unknown = _fix5_export_row(ws, "Нить без числа")
+    check("а неназванное количество по-прежнему СЛОВО, а не ноль",
+          unknown > 0 and ws.cell(row=unknown, column=2).value == "не указано",
+          repr(ws.cell(row=unknown, column=2).value) if unknown else "нет строки")
+    whole = _fix5_export_row(ws, "Нить целое")
+    check("целое количество не обросло лишними нулями в показе",
+          whole > 0 and ws.cell(row=whole, column=2).value == 100
+          and "0.00" not in ws.cell(row=whole, column=2).number_format,
+          f"fmt={ws.cell(row=whole, column=2).number_format!r}" if whole else "нет")
+
+    wsa = wb["Назначения"]
+    arow = 0
+    for i in range(3, wsa.max_row + 1):
+        if wsa.cell(row=i, column=1).value == "Нить 001":
+            arow = i
+    check("назначение 0,001 в файле тоже не превращается в ноль",
+          arow > 0 and wsa.cell(row=arow, column=2).value == 0.001
+          and decimals(wsa.cell(row=arow, column=2).number_format) >= 3,
+          f"row={arow}")
+
+    wsb = wb["Партии"]
+    brow = _fix5_export_row(wsb, "Партия-точность")
+    check("план изделий показан целым — штуки дробными не бывают",
+          brow > 0 and wsb.cell(row=brow, column=3).value == 60
+          and decimals(wsb.cell(row=brow, column=3).number_format) == 0,
+          f"row={brow} fmt={wsb.cell(row=brow, column=3).number_format!r}"
+          if brow else "нет строки")
+    c.close()
+
+
+def _fix5_batch_label() -> None:
+    """F-29: у безымянной партии есть своё имя, и оно не имя вещи."""
+    print("\n== F-29: безымянная партия называется вещью и номером ==")
+    c = client()
+    register(c, "sp-fix5-label@test.io", "Бренд Подпись Пять")
+    it = c.post("/api/supply/planning/items",
+                json={"kind": "draft", "title": "Пальто-новинка", "op_id": "f5-l-i"}
+                ).json()["items"][0]
+    named = c.post("/api/supply/planning/batches",
+                   json={"item_id": it["id"], "title": "Первый запуск",
+                         "op_id": "f5-l-b1"}).json()
+    board = c.post("/api/supply/planning/batches",
+                   json={"item_id": it["id"], "op_id": "f5-l-b2"}).json()
+    with_name = [x for x in board["batches"] if x["title"] == "Первый запуск"][0]
+    without = [x for x in board["batches"] if not x["title"]][0]
+    check("названная партия сохраняет своё имя целиком",
+          with_name["label"] == "Первый запуск", str(with_name["label"]))
+    check("безымянная получает вещь и номер, а не имя вещи",
+          without["label"] == f"Пальто-новинка · партия №{without['id']}",
+          str(without["label"]))
+    check("две подписи на экране больше не совпадают",
+          with_name["label"] != without["label"] != with_name["item_title"],
+          f"{with_name['label']} / {without['label']}")
+    check("а первый ответ уже нёс подпись — она не появляется задним числом",
+          all("label" in x for x in named["batches"]), str(named["batches"])[:120])
+
+    # ТА ЖЕ ПОДПИСЬ НА КАРТОЧКЕ МАТЕРИАЛА. Строка «сколько → куда» ведёт к
+    # партии, и называть её там иначе, чем на самой партии, значило бы дать
+    # одному объекту два имени на одном экране.
+    mat = c.post("/api/supply/planning/materials",
+                 json={"title": "Ткань-подпись", "qty": "50", "unit": "м",
+                       "op_id": "f5-l-m"}).json()["materials"][0]
+    board = c.post("/api/supply/planning/assignments",
+                   json={"material_id": mat["id"], "batch_id": without["id"],
+                         "qty": "10", "op_id": "f5-l-a"}).json()
+    link = [m for m in board["materials"] if m["id"] == mat["id"]][0]["assignments"][0]
+    check("карточка материала называет партию тем же именем, что и сама партия",
+          link["batch_title"] == without["label"],
+          f"{link['batch_title']} vs {without['label']}")
+    c.close()
 
 
 def main() -> int:

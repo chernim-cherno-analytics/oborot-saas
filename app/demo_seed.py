@@ -5,12 +5,20 @@
 циклом, бестселлерами (turnover >= 5000 ₽/день), распроданными в ноль
 позициями (cs=0, need>0) и неликвидом без продаж. random.seed(42) — при
 повторном подключении демо данные пересоздаются идентично.
+
+С 08.09.2026 (ТЗ F-26) сюда же входит план производства «Поставок»: материалы,
+вещи, плановые партии и назначения. Причина та же, по которой в каталоге
+появились позиции с убытком и без себестоимости: раздел существовал, а в демо
+его не было ВООБЩЕ — человек, который смотрит продукт перед покупкой, видел
+пустой экран и не узнавал, что раздел вообще есть.
 """
 import math
 import random
+import struct
+import zlib
 from datetime import date, timedelta
 
-from sqlalchemy import delete, insert
+from sqlalchemy import delete, func, insert, select
 from sqlalchemy.orm import Session
 
 from app.models import (
@@ -20,6 +28,12 @@ from app.models import (
     ProductionOrder,
     Sale,
     StockDay,
+    SupplyAssignment,
+    SupplyBatch,
+    SupplyEvent,
+    SupplyItem,
+    SupplyMaterial,
+    SupplySketch,
     Warehouse,
     WarehouseStock,
 )
@@ -130,6 +144,77 @@ WINTER_CATS = {"Худи и свитшоты", "Верхняя одежда", "�
 SUMMER_CATS = {"Футболки", "Платья"}
 ONE_SIZE_CATS = {"Сумки", "Украшения", "Аксессуары"}
 
+# ── «Поставки»: план производства демо-бренда (ТЗ F-26) ──────────────────────
+#
+# Состав задан ТЗ пофамильно, и каждая строка здесь показывает СВОЁ состояние
+# слоя, а не просто заполняет экран:
+#
+#   * шерсть — обычный материал с известным количеством и свободным остатком;
+#   * подкладка — назначена СВЕРХ известного наличия: ровно тот случай, ради
+#     которого существует предупреждение «назначено больше, чем известно», и
+#     `next_step` демо-организации начинается именно с него;
+#   * фурнитура — количество не названо (D-49, «неизвестное ≠ ноль»): на партии
+#     это видно бейджем «наличие не подтверждено», а в сводке — счётчиком.
+#
+# Ни одно из этих чисел никуда не считается: план не двигает ни заказы, ни
+# «Едет», ни бюджет. Названия и количества синтетические, как и весь каталог.
+
+#: Две модели своего каталога и одна новинка. Каталожные имена обязаны
+#: существовать в CATALOG выше — вещь `kind='catalog'` это указатель на строку
+#: каталога, а не собственное имя (см. supply_planning.create_item).
+SUPPLY_CATALOG_ITEMS = ('Тренч «Классика»', 'Рубашка «Оверсайз чёрная»')
+SUPPLY_DRAFT_TITLE = "Жакет прямой, образец"
+
+#: (title, qty, unit, source_note). qty=None — количество не названо.
+SUPPLY_MATERIALS = [
+    ("Шерсть костюмная, серая", 100.0, "м", "рулон принят и померен на складе"),
+    ("Подкладка вискозная", 40.0, "м", "остаток прошлого сезона"),
+    ("Пуговицы роговые", None, "шт", "мешок от поставщика, не пересчитан"),
+]
+
+#: Партии: (индекс вещи, название, план изделий, вид срока, текст, сдвиг даты).
+#: Вторая партия НАРОЧНО без названия — так в демо видно, как раздел
+#: подписывает безымянную партию вещью и номером (F-29), а не «X · X».
+SUPPLY_BATCHES = [
+    (0, "Тренч, осенний запуск", 60.0, "exact", "", 45),
+    # Слово «ориентировочно» подставляет describe_due — в тексте его быть не
+    # должно, иначе на карточке выйдет «ориентировочно ориентировочно…».
+    (1, "", None, "approx", "к концу месяца", None),
+    (2, "Жакет, отшив образца", 12.0, "unknown", "", None),
+]
+
+#: Назначения: (индекс материала, индекс партии, метраж, заметка).
+#: Подкладки назначено 35 + 20 = 55 при известных 40 — это и даёт `over`.
+SUPPLY_ASSIGNMENTS = [
+    (0, 0, 60.0, "основная ткань"),
+    (0, 1, 20.0, ""),
+    (1, 0, 35.0, ""),
+    (1, 2, 20.0, "на образец"),
+    (2, 0, 120.0, "по 2 шт на изделие"),
+]
+
+#: Кто «завёл» демо-строки. В журнале и на карточках стоит имя, а не роль:
+#: поле author показывается человеку, и «owner» ему ничего не сказало бы.
+SUPPLY_AUTHOR = "Демо"
+
+
+def _demo_png(width: int, height: int, tone: tuple[int, int, int]) -> bytes:
+    """Синтетический PNG нужного размера — собран байтами, без библиотек.
+
+    Файла в репозитории нет намеренно: бинарник пришлось бы объяснять («что
+    именно на этой картинке и откуда она»), а демо обязано быть синтетическим
+    целиком. Тем же способом картинки строит набор тестов слоя.
+    """
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return (struct.pack(">I", len(data)) + tag + data
+                + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    row = bytes(tone) * width
+    raw = b"".join(b"\x00" + row for _ in range(height))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
+            + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+
 
 def _season_mult(d: date, category: str) -> float:
     """Сезонный множитель спроса: зимой растут худи/куртки, летом — футболки/платья."""
@@ -174,9 +259,55 @@ def _largest_remainder(total: int, weights: list[float]) -> list[int]:
     return alloc
 
 
+#: Таблицы слоя «Поставки» в порядке удаления — от ссылающихся к тем, на кого
+#: ссылаются. Один список на удаление и на пересчёт: разойдись они, и
+#: предохранитель начал бы охранять не то, что стирается.
+SUPPLY_MODELS = (SupplyEvent, SupplyAssignment, SupplyBatch, SupplyItem,
+                 SupplyMaterial, SupplySketch)
+
+
+def supply_plan_rows(db: Session, org_id: int) -> dict:
+    """Сколько строк слоя «Поставки» уже есть у организации. Ничего не меняет.
+
+    СЧИТАЕТСЯ ВСЁ, ВКЛЮЧАЯ АРХИВНОЕ И НИ К ЧЕМУ НЕ ПРИВЯЗАННОЕ. Архивная строка
+    — это не «удалённая»: человек убрал её с доски, она лежит в базе и
+    возвращается кнопкой «Вернуть» (F-12). Эскиз без вещи — тоже его файл.
+    Журнал — история его правок. Всё это одинаково персистентно и одинаково
+    исчезает при `clear_org_data`, поэтому и в пересчёт входит одинаково:
+    предохранитель обязан смотреть на то, что РЕАЛЬНО будет стёрто, а не на то,
+    что видно на доске.
+
+    ПРОВЕНАНС ЗДЕСЬ НЕ ЧИТАЕТСЯ ВОВСЕ. Ни `author`, ни любое другое показываемое
+    человеку поле не спрашивается: это отображаемый текст, который вводит
+    пользователь, и строить на нём решение о стирании данных нельзя — он
+    подделывается тривиально. Вопрос «чьи это строки» решается снаружи и другим
+    признаком (см. `app/api.py`), а здесь считаются просто строки.
+    """
+    return {model.__tablename__: int(db.execute(
+        select(func.count()).select_from(model).where(model.org_id == org_id)
+    ).scalar_one() or 0) for model in SUPPLY_MODELS}
+
+
 def clear_org_data(db: Session, org_id: int) -> None:
-    """Удаляет все бизнес-данные организации (перед повторным сидированием)."""
+    """Удаляет все бизнес-данные организации (перед повторным сидированием).
+
+    ПЛАН «ПОСТАВОК» ЧИСТИТСЯ ЗДЕСЬ ЖЕ, И ЭТО НЕ РАСШИРЕНИЕ ПРАВ. Функция и до
+    этого стирала организацию целиком — включая невосстановимые заказы на
+    производство; звать её разрешено ровно из одного места, и там стоят
+    предохранители: один не пускает демо к организации с живым МойСкладом,
+    второй — к организации, которая уже ведёт СВОЙ план «Поставок»
+    (`app/api.py`, `POST /api/connect/demo`). Оставить слой снаружи было бы не
+    осторожностью, а дефектом: второе подключение демо клало бы вторую копию
+    материалов и партий поверх первой, и «пересоздаётся идентично» перестало бы
+    быть правдой.
+
+    Порядок удаления — от ссылающихся к тем, на кого ссылаются: назначение
+    держит партию и материал, партия — вещь, вещь — эскиз. Журнал (`supply_
+    events`) ссылок не имеет и снимается первым вместе с замком поступков.
+    """
     for model in (Sale, StockDay, WarehouseStock, OrderedQty, ProductionOrder, Product, Warehouse):
+        db.execute(delete(model).where(model.org_id == org_id))
+    for model in SUPPLY_MODELS:
         db.execute(delete(model).where(model.org_id == org_id))
 
 
@@ -313,9 +444,83 @@ def seed_demo(db: Session, org: Org) -> dict:
         for i in range(0, len(rows), 10000):
             db.execute(insert(model), rows[i : i + 10000])
 
-    return {
+    counters = {
         "products": n_products,
         "stock_days": len(stock_rows),
         "sales": len(sales_rows),
         "warehouse_stock": len(whstock_rows),
+    }
+    # План производства сеется ПОСЛЕ каталога: каталожная вещь ссылается на
+    # `products.base_name`, и до вставки позиций ссылаться ей не на что.
+    counters.update(seed_supply(db, org, today))
+    return counters
+
+
+def seed_supply(db: Session, org: Org, today: date | None = None) -> dict:
+    """План «Поставок» демо-организации (ТЗ F-26). Возвращает счётчики строк.
+
+    Ничего не пересчитывает и ни во что не считается: назначенный метраж — это
+    план, а не расход, и ни одна строка отсюда не двигает остатки, «Едет»,
+    заказы и бюджет. Формул здесь нет.
+
+    Состав жёстко задан константами выше, а не случаен: демо обязано ПОКАЗАТЬ
+    состояния слоя (перерасход, неизвестное количество, три вида срока,
+    новинку с эскизом), а «случайно похожие» данные показывают их через раз.
+    Поэтому же строки собираются моделями напрямую: слой планирования — это
+    правила ввода человека, и прогонять через них заведомо готовый набор значило
+    бы проверять валидацию, а не сеять данные.
+    """
+    today = today or date.today()
+
+    materials = []
+    for title, qty, unit, note in SUPPLY_MATERIALS:
+        row = SupplyMaterial(org_id=org.id, title=title, qty=qty, unit=unit,
+                             source_note=note, author=SUPPLY_AUTHOR)
+        db.add(row)
+        materials.append(row)
+
+    items = []
+    for base_name in SUPPLY_CATALOG_ITEMS:
+        # title каталожной вещи — то же каноническое имя: собственного имени у
+        # неё нет, она указывает на строку каталога (supply_planning.create_item).
+        items.append(SupplyItem(org_id=org.id, kind="catalog", base_name=base_name,
+                                title=base_name, author=SUPPLY_AUTHOR))
+    from app import supply_planning as sp   # локально: слой знает про модели, не наоборот
+
+    sketch = sp.save_sketch(
+        db, org.id, _demo_png(240, 160, (0x9A, 0x8C, 0x7A)), SUPPLY_AUTHOR,
+        thumb=_demo_png(96, 64, (0x9A, 0x8C, 0x7A)))
+    items.append(SupplyItem(org_id=org.id, kind="draft", base_name="",
+                            title=SUPPLY_DRAFT_TITLE, sketch_id=sketch.id,
+                            note="эскиз на согласовании", author=SUPPLY_AUTHOR))
+    for row in items:
+        db.add(row)
+    db.flush()
+
+    batches = []
+    for item_idx, title, plan_qty, due_kind, due_text, due_shift in SUPPLY_BATCHES:
+        row = SupplyBatch(
+            org_id=org.id, item_id=items[item_idx].id, title=title,
+            plan_qty=plan_qty, due_kind=due_kind, due_text=due_text,
+            due_date=((today + timedelta(days=due_shift)).isoformat()
+                      if due_shift is not None else ""),
+            due_source=("цех" if due_kind != "unknown" else ""),
+            due_author=(SUPPLY_AUTHOR if due_kind != "unknown" else ""),
+            author=SUPPLY_AUTHOR,
+        )
+        db.add(row)
+        batches.append(row)
+    db.flush()
+
+    for mat_idx, batch_idx, qty, note in SUPPLY_ASSIGNMENTS:
+        db.add(SupplyAssignment(org_id=org.id, material_id=materials[mat_idx].id,
+                                batch_id=batches[batch_idx].id, qty=qty,
+                                note=note, author=SUPPLY_AUTHOR))
+    db.flush()
+
+    return {
+        "supply_materials": len(materials),
+        "supply_items": len(items),
+        "supply_batches": len(batches),
+        "supply_assignments": len(SUPPLY_ASSIGNMENTS),
     }
