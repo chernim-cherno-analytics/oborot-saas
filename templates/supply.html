@@ -1799,6 +1799,12 @@ document.addEventListener("DOMContentLoaded", function () {
     // перерисовку и нужна одному месту — `captureInline`: её черновика больше
     // нет, и восстанавливать ей нечего.
     applied: null,
+    // Форма, которая своим удавшимся действием ЗАКОНЧИЛАСЬ, и потому не
+    // открывается заново (SUPPLY-OWNERUT-1, находка 1 приёмки). Отличается от
+    // `applied` ровно этим: `applied` говорит «черновика больше нет, собери
+    // форму заново из свежей доски», а `closing` — «формы больше не должно
+    // быть вовсе». Живёт, как и `applied`, одну перерисовку.
+    closing: null,
     catalog: [],
   };
 
@@ -1992,8 +1998,16 @@ document.addEventListener("DOMContentLoaded", function () {
         // «эта форма только что записала своё» — состояние одного мгновения, а
         // не свойство формы.
         PL.applied = (spot && spot.form) || null;
+        // ЗАКРЫВАЕТ ФОРМУ ТОЛЬКО ПОДТВЕРЖДЁННЫЙ УСПЕХ, и поэтому строка стоит
+        // ЗДЕСЬ, внутри `then`, а не рядом с отправкой. Отказ и неопределённый
+        // исход (оборванная сеть, потерянный ответ) уходят в `catch`, который
+        // перерисовки не делает вовсе: форма, черновик и `op_id` остаются на
+        // месте, и повтор без правок приходит тем же поступком. Закрыть форму
+        // раньше ответа значило бы объявить успехом то, чего мы не знаем.
+        PL.closing = (spot && spot.close) ? PL.applied : null;
         render();
         PL.applied = null;
+        PL.closing = null;
         if (spot && !spot.quiet) {
           plToast(data && data.notice ? data.notice : "Сохранено", {ms: 3000});
         }
@@ -3150,6 +3164,22 @@ document.addEventListener("DOMContentLoaded", function () {
       function (box) {
         var card = box.closest ? box.closest("[data-pl][data-id]") : null;
         if (!card || !box.dataset.inline) return;
+        // ФОРМА, КОТОРАЯ СВОЁ ОТРАБОТАЛА, НЕ СНИМАЕТСЯ И НЕ ВОЗВРАЩАЕТСЯ.
+        // Инлайн-форма живёт внутри перерисовываемой карточки, и на экране её
+        // держит ровно это восстановление; не попав сюда, она просто не
+        // открывается заново — вместе с прежним количеством, прежней партией
+        // и прежней идентичностью поступка.
+        //
+        // Это и есть исправление находки 1 приёмки. До него удавшееся
+        // «Отдать» оставляло на карточке заполненный орган управления: сам по
+        // себе повторный клик был безвреден (тот же `op_id`, замок поступка
+        // на сервере), но любая правка поля делала поступок ДРУГИМ — и
+        // человек, поправивший количество в форме, которая уже сработала,
+        // назначал метраж второй раз, ничего для этого не сделав.
+        //
+        // Следующее назначение от этого не страдает: его человек начинает
+        // сам, и начинает с чистой формы — новое количество и новый `op_id`.
+        if (box === PL.closing) return;
         var fields = [].slice.call(box.querySelectorAll("input, select, textarea"));
         var active = fields.indexOf(document.activeElement);
         var caret = null;
@@ -3319,10 +3349,14 @@ document.addEventListener("DOMContentLoaded", function () {
     bindTokenReset(form);
     form.onsubmit = function (ev) {
       ev.preventDefault();
+      // `close: true` — назначение это ЗАКОНЧЕННОЕ действие, а не правка
+      // строки: после него у формы нет продолжения, и оставлять её открытой
+      // значит оставлять на экране кнопку, которая уже сработала.
       send("/api/supply/planning/assignments", {
         material_id: material.id, batch_id: pick.value, qty: qty.value,
         op_id: actionToken(form),
-      }, "pl-assign-err", null, {kind: "batch", id: Number(pick.value)});
+      }, "pl-assign-err", null,
+         {kind: "batch", id: Number(pick.value), form: form, close: true});
     };
   }
 
@@ -3670,7 +3704,11 @@ document.addEventListener("DOMContentLoaded", function () {
         assignment_id: assignment.id, to_batch_id: pick.value, qty: qty.value,
         rev: readRev(), op_id: actionToken(form),
       }, "pl-move-err", null,
-         {kind: "batch", id: Number(pick.value), form: form});
+         // Перенос — такое же законченное действие, как назначение. При
+         // ЧАСТИЧНОМ переносе строка на источнике остаётся, и без этого флага
+         // форма возвращалась заново заполненной остатком: она предлагала
+         // перенести ещё раз то, что человек уже перенёс.
+         {kind: "batch", id: Number(pick.value), form: form, close: true});
     };
   }
 
