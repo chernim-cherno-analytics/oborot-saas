@@ -179,6 +179,57 @@
   .mvbtn { font-size: 10px; font-weight: 600; padding: 3px 9px; border-radius: 9px;
     border: 1px solid rgba(31,31,31,.22); background: rgba(255,255,255,.6); color: #434446; cursor: pointer; white-space: nowrap; }
   .mvbtn:hover { background: rgba(31,31,31,.09); color: #1f1f1f; }
+  .mvbtn.primary { background: #1f1f1f; color: #fff; border-color: #1f1f1f; }
+  .mvbtn.primary:hover { background: #000; color: #fff; }
+  /* PILOT-RECEIPTS-UI-1: панель приёмки. Оверлей, а не отдельная страница:
+     приёмка читается вместе со списком заказов, и уводить человека со
+     страницы ради четырёх чисел незачем. На узком экране панель занимает
+     почти всё окно, но НЕ шире его — горизонтальной прокрутки у раздела быть
+     не должно (проверяется набором). */
+  .rc-panel { position: fixed; inset: 0; z-index: 1200; background: rgba(20,20,20,.42);
+    display: flex; align-items: flex-start; justify-content: center; padding: 24px 12px; }
+  /* Высота ограничена окном, а прокручивается ТЕЛО, а не вся панель. Первая
+     редакция давала прокрутку самому оверлею, и на длинной истории шапка
+     вместе с кнопкой «Закрыть» уезжала за верхний край: на снимке QA её
+     просто не было видно, а на телефоне это единственная кнопка выхода
+     кроме Esc. */
+  .rc-box { background: #fff; border-radius: 14px; width: 100%; max-width: 760px;
+    box-shadow: 0 18px 48px rgba(0,0,0,.22); overflow: hidden;
+    max-height: calc(100vh - 48px); display: flex; flex-direction: column; }
+  .rc-head { display: flex; align-items: center; gap: 12px; padding: 14px 18px;
+    border-bottom: 1px solid rgba(31,31,31,.1); flex: 0 0 auto; }
+  .rc-head h3 { margin: 0; font-size: 15px; flex: 1; }
+  .rc-body { padding: 14px 18px 18px; overflow: auto; flex: 1 1 auto; }
+  .rc-summary { font-size: 13px; margin-bottom: 8px; }
+  .rc-notes { font-size: 12px; color: #7a5c00; margin-bottom: 10px; }
+  .rc-notes div { margin-bottom: 4px; }
+  .rc-unknown { color: #6b6f76; font-style: italic; }
+  .rc-extra { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 12px; font-size: 12px; }
+  .rc-extra label { color: #6b6f76; }
+  .rc-extra .input { font-size: 12px; padding: 4px 8px; }
+  .rc-extra .num { max-width: 90px; }
+  .rc-err { color: #a30003; font-size: 12px; margin-top: 10px; min-height: 1em; }
+  .rc-actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 10px; }
+  .rc-hint { font-size: 11px; color: #6b6f76; }
+  .rc-subtitle { font-size: 12px; font-weight: 700; margin-top: 16px; }
+  .rc-history { font-size: 12px; color: #434446; max-height: 26vh; overflow: auto; margin-top: 6px; }
+  .rc-history .row { padding: 3px 0; border-bottom: 1px solid rgba(31,31,31,.06); }
+  @media (max-width: 560px) {
+    .rc-panel { padding: 10px 6px; }
+    .rc-box { max-height: calc(100vh - 20px); }
+    .rc-extra .num { max-width: 70px; }
+    /* На 390 px таблица строк не влезала: колонка «Этот приход» уезжала за
+       правый край панели, и поле ввода оказывалось обрезанным — то есть
+       ровно тот орган, ради которого экран и сделан. Сжимаем ячейки и само
+       поле; горизонтальной прокрутки у страницы при этом нет ни до, ни
+       после — она и раньше была не у body, а внутри таблицы. */
+    #rc-lines td, .rc-box thead th { padding: 6px 4px; font-size: 11px; }
+    /* Заголовкам разрешено переноситься: общий стиль таблиц держит `nowrap`,
+       и «ЗАКАЗАНО»/«РАЗНИЦА»/«ЭТОТ ПРИХОД» задавали колонкам такую
+       минимальную ширину, что поле ввода уезжало за правый край панели. */
+    .rc-box thead th { white-space: normal; letter-spacing: .02em; }
+    #rc-lines input[data-rc-qty] { max-width: 52px; padding: 3px 4px; font-size: 11px; }
+  }
   .mvsel { font-size: 11px; padding: 3px 6px; border-radius: 8px; border: 1px solid rgba(31,31,31,.22);
     background: rgba(255,255,255,.7); max-width: 130px; }
   /* SUPPLY-1: идентификатор партии под названием заказа. Значение показывается
@@ -319,6 +370,61 @@
     </table>
   </div>
 
+  <!-- PILOT-RECEIPTS-UI-1. Принятые заказы ОТДЕЛЬНЫМ списком, а не вперемешку
+       с едущими. До этого пакета `load()` вырезал их целиком
+       (`status !== "received"`), то есть принятый заказ пропадал с экрана
+       вместе со всей своей приёмкой; а `renderOrders` различал только `sent` и
+       «всё остальное», поэтому принятый заказ, если бы дошёл, был бы подписан
+       «черновик». Здесь он достижим и подписан своим статусом, и прямо
+       сказано, что в «Едет» эти заказы уже не считаются — иначе отдельный
+       список читался бы как второй источник того же числа. -->
+  <div class="arch-title" id="orders-done-title" style="display:none" onclick="void(0)"></div>
+  <div class="table-outer" id="orders-done-wrap" style="display:none;max-height:40vh">
+    <table>
+      <thead><tr><th style="text-align:left">Заказ</th><th>Создан</th><th>Принят</th>
+        <th>Позиций</th><th>Шт</th><th>Статус</th><th style="width:210px"></th></tr></thead>
+      <tbody id="orders-done-tb"></tbody>
+    </table>
+  </div>
+
+  <!-- Панель приёмки. Живёт одна на страницу и наполняется по заказу:
+       строк приёмки у заказа бывают сотни, и держать разметку на каждый
+       заказ значило бы собирать её впустую для всех, кого человек не открыл. -->
+  <div id="rc-panel" class="rc-panel" style="display:none" role="dialog"
+       aria-modal="true" aria-labelledby="rc-title">
+    <div class="rc-box">
+      <div class="rc-head">
+        <h3 id="rc-title" tabindex="-1">Приёмка</h3>
+        <button class="mvbtn" type="button" id="rc-close" aria-label="Закрыть">✕</button>
+      </div>
+      <div class="rc-body">
+        <div id="rc-summary" class="rc-summary"></div>
+        <div id="rc-notes" class="rc-notes"></div>
+        <div class="table-outer" style="max-height:34vh">
+          <table>
+            <thead><tr><th style="text-align:left">Позиция</th><th>Заказано</th>
+              <th>Принято</th><th>Разница</th><th style="width:130px">Этот приход</th></tr></thead>
+            <tbody id="rc-lines"></tbody>
+          </table>
+        </div>
+        <div class="rc-extra">
+          <label for="rc-extra-name">Позиция не из заказа</label>
+          <input class="input" type="text" id="rc-extra-name" maxlength="255"
+                 placeholder="название, как прислал подрядчик">
+          <input class="input num" type="number" id="rc-extra-qty" step="any"
+                 placeholder="шт" aria-label="Количество позиции не из заказа">
+        </div>
+        <div id="rc-err" class="rc-err" role="alert"></div>
+        <div class="rc-actions">
+          <button class="mvbtn primary" type="button" id="rc-save">Записать приход</button>
+          <span class="rc-hint">Пустое поле — ничего не утверждаем. Ноль — «не приехало». Минус — исправление прежней строки.</span>
+        </div>
+        <div id="rc-history-title" class="rc-subtitle">История приёмок</div>
+        <div id="rc-history" class="rc-history"></div>
+      </div>
+    </div>
+  </div>
+
   <div class="arch-title" id="excluded-title" style="display:none" onclick="void(0)"></div>
   <div class="table-outer" id="excluded-wrap" style="display:none;max-height:40vh">
     <table>
@@ -455,13 +561,19 @@
   function prodOf(base){ return ASSIGN[base]||MAIN_ID; }
 
   var ORDERS=[];
+  var RECEIVED=[];
   function load(){
     tbody.innerHTML='<tr><td colspan="'+NCOLS+'" class="loading">Загрузка…</td></tr>';
     Promise.all([api("/api/replenish"), api("/api/productions"),
                  api("/api/orders").catch(function(){ return {orders:[]}; }),
                  api("/api/replenish-draft").catch(function(){ return {drafts:{}}; })]).then(function(res){
       applyProds(res[1]);
-      ORDERS=(res[2].orders||[]).filter(function(o){ return o.status!=="received"; });
+      /* PILOT-RECEIPTS-UI-1: принятые заказы больше не выбрасываются, а
+         откладываются в свой список. ORDERS по-прежнему содержит ТОЛЬКО те,
+         что участвуют в «Едет», — семантика колонки не меняется ни на строку. */
+      var all=res[2].orders||[];
+      ORDERS=all.filter(function(o){ return o.status!=="received"; });
+      RECEIVED=all.filter(function(o){ return o.status==="received"; });
       DRAFTS=res[3].drafts||{};
       applyData(res[0]);
     }).catch(function(e){
@@ -689,6 +801,7 @@
     syncSegUI();
     renderTable();
     renderOrders();
+    renderReceivedOrders();
     renderExcluded();
     updateSummary();
     renderKpis();
@@ -704,12 +817,17 @@
     if(w.style.display!=="") w.style.display="";
     t.innerHTML='Заказы в производстве ('+ORDERS.length+') — учитываются в колонке «Едет»';
     document.getElementById("orders-tb").innerHTML=ORDERS.map(function(o){
-      var st=o.status==="sent"?"в производстве":"черновик";
+      var st=ordStatusText(o.status);
       var btns='';
       if(o.status==="draft")
         btns='<button class="mvbtn ord-send" data-id="'+o.id+'">▶ В производство</button> ';
       if(o.status==="sent")
         btns='<button class="mvbtn ord-recv" data-id="'+o.id+'" title="Заказ приехал: снимет количество из «Едет», остатки подтянет синхронизация">✓ Принят на склад</button> ';
+      /* Приёмка — только у отправленного: черновику сервер отвечает 422
+         («принимать нечего»), и кнопка, которая всегда получает отказ, врала
+         бы о доступном действии. */
+      if(o.status!=="draft")
+        btns+='<button class="mvbtn ord-receipts" data-id="'+o.id+'" title="Что фактически принято по заказу">Приёмка</button> ';
       btns+='<button class="mvbtn ord-del" data-id="'+o.id+'" data-name="'+esc(o.name)+'">✕ Удалить</button>';
       /* SUPPLY-1: CC_BATCH_ID партии — под названием заказа, целиком и с
          кнопкой копирования. Пустое значение бывает ровно у строки, созданной
@@ -721,7 +839,7 @@
         (bid?'<code>'+esc(bid)+'</code><button class="mvbtn ord-copy" type="button" '+
              'data-batch="'+esc(bid)+'" title="Скопировать CC_BATCH_ID">Копировать</button>'
             :'<span class="none">идентификатор ещё не присвоен</span>')+'</div>';
-      return '<tr><td class="name">'+esc(o.name)+batch+'</td>'+
+      return '<tr data-order="'+o.id+'"><td class="name">'+esc(o.name)+batch+'</td>'+
         '<td class="nb muted">'+(o.created_at?fmtDate(o.created_at):"—")+'</td>'+
         '<td class="nb">'+(o.eta_date?fmtDate(o.eta_date):"—")+'</td>'+
         '<td class="nb">'+fmt(o.positions)+'</td>'+
@@ -729,6 +847,7 @@
         '<td><span class="stbadge '+(o.status==="sent"?"g":"y")+'">'+st+'</span></td>'+
         '<td>'+btns+'</td></tr>';
     }).join("");
+    bindReceiptButtons();
     document.querySelectorAll(".ord-send").forEach(function(b){
       b.addEventListener("click",function(){
         api("/api/orders/"+b.getAttribute("data-id")+"/status",{method:"POST",body:{status:"sent"}})
@@ -753,6 +872,303 @@
       b.addEventListener("click",function(){ copyBatchId(b); });
     });
   }
+
+  /* ── PILOT-RECEIPTS-UI-1: приёмка заказа ─────────────────────────────────
+     Экран поверх существующих ручек `GET`/`POST /api/orders/{id}/receipts`.
+     Новых правил не вводит: всё, что здесь показано, посчитал сервер. */
+
+  function ordStatusText(s){
+    /* Статусов ТРИ, а не два. Прежний тернарник называл черновиком всё, что
+       не «отправлен», — и принятый заказ, попади он в список, был бы подписан
+       «черновик». */
+    if(s==="sent") return "в производстве";
+    if(s==="received") return "принят на склад";
+    return "черновик";
+  }
+
+  function renderReceivedOrders(){
+    var t=document.getElementById("orders-done-title");
+    var w=document.getElementById("orders-done-wrap");
+    if(!RECEIVED.length){ t.style.display="none"; w.style.display="none"; return; }
+    t.style.display=""; w.style.display="";
+    t.innerHTML='Принятые на склад ('+RECEIVED.length+') — в колонке «Едет» уже не считаются';
+    document.getElementById("orders-done-tb").innerHTML=RECEIVED.map(function(o){
+      return '<tr data-order="'+o.id+'"><td class="name">'+esc(o.name)+'</td>'+
+        '<td class="nb muted">'+(o.created_at?fmtDate(o.created_at):"—")+'</td>'+
+        '<td class="nb muted">'+(o.received_at?fmtDate(o.received_at):"—")+'</td>'+
+        '<td class="nb">'+fmt(o.positions)+'</td>'+
+        '<td class="nb">'+fmt(o.total_qty)+'</td>'+
+        '<td><span class="stbadge g">'+ordStatusText(o.status)+'</span></td>'+
+        '<td><button class="mvbtn ord-receipts" data-id="'+o.id+'" '+
+            'title="Что фактически принято по заказу">Приёмка</button></td></tr>';
+    }).join("");
+    bindReceiptButtons();
+  }
+
+  function bindReceiptButtons(){
+    document.querySelectorAll(".ord-receipts").forEach(function(b){
+      if(b.dataset.bound) return;
+      b.dataset.bound="1";
+      b.addEventListener("click",function(){ openReceipts(b.getAttribute("data-id")); });
+    });
+  }
+
+  /* Состояние ОДНОГО намерения человека. `key` живёт от открытия панели до
+     подтверждённого успеха — и в этом весь смысл.
+
+     Замок сервера — пара «ключ + содержимое запроса» (`source_ref =
+     key:<ключ>:<хэш строк>`). Поэтому повтор ВНУТРИ одного намерения (обрыв
+     сети, второе нажатие) приходит тем же ключом с тем же телом, и сервер
+     узнаёт его как повтор, ничего не дописывая. Правка чисел меняет тело —
+     это уже другой факт, и он обязан записаться.
+
+     А новое открытие панели — новое намерение и новый ключ. Иначе «защита от
+     дубля» съедала бы ДОВОЗ: второй приход того же количества — законный
+     факт, а не второе нажатие той же кнопки. */
+  var RC={id:null,key:"",data:null,gen:0};
+
+  function rcKey(){
+    return "rc-"+Date.now().toString(36)+"-"+Math.random().toString(36).slice(2,10);
+  }
+
+  /* ЧЬЁ ЭТО ОТКРЫТИЕ ПАНЕЛИ (P1 ревью PR #61, r4106171226).
+     Сверять один номер заказа НЕДОСТАТОЧНО, и это не теория: закрыть панель
+     заказа А и открыть её же заново — обычное действие, номер при этом
+     совпадает, и ответ первого, уже брошенного запроса считался бы своим.
+     Поэтому каждое открытие получает свой номер, и его сверяют ВСЕ отложенные
+     обработчики — успех, отказ и завершающий шаг. Панель закрыта — номер не
+     совпадает ни с чем, и опоздавший ответ не трогает ничего. */
+  function rcCurrent(gen){ return RC.id!==null && RC.gen===gen; }
+
+  /* Формат ЧИСЕЛ ПРИЁМКИ — свой, и только для этой панели.
+     Общий `fmt` округляет (`Math.round`), потому что вся остальная страница
+     считает штуки целыми. Но ручка приёмки принимает и хранит дробь (поле
+     ввода объявлено `step="any"`, сервер округляет до трёх знаков), и 0,4
+     превращалось в 0, а -0,4 в -0: клиент подменял факт сервера. Здесь
+     показывается то, что пришло, с той же точностью — не трогая общий
+     форматтер и ничего не меняя в расчётах. */
+  function rcFmt(n){
+    if(n===null||n===undefined||isNaN(n)) return "—";
+    return Number(n).toLocaleString("ru-RU",{maximumFractionDigits:3});
+  }
+
+  function openReceipts(orderId){
+    RC.id=orderId; RC.key=rcKey(); RC.data=null; RC.gen=RC.gen+1;
+    var mine=RC.gen;
+    /* КНОПКА ОДНА НА ВСЮ СТРАНИЦУ, ПОЭТОМУ КАЖДОЕ ОТКРЫТИЕ ЗАДАЁТ ЕЁ СОСТОЯНИЕ
+       САМО (корректив B, тред r4106595260).
+
+       Отправка выключает кнопку, а завершающий шаг включает обратно — но
+       только СВОЕМУ открытию: охрана по поколению верна и остаётся как есть.
+       Не хватало ровно противоположного: новое открытие состояние кнопки не
+       задавало вовсе. Если предыдущая отправка ещё не завершилась, следующая
+       панель открывалась с уже выключенной кнопкой, а опоздавший ответ
+       включить её отказывался — по делу. Главное действие экрана оставалось
+       мёртвым до перезагрузки страницы.
+
+       Строка стоит ЗДЕСЬ, в начале открытия, а не в обработчиках ответа:
+       свежая панель не должна зависеть от того, чем и когда закончилась
+       чужая отправка. Опоздавшее завершение по-прежнему не трогает ничего —
+       в том числе не включает кнопку панели, которая сохраняет прямо сейчас. */
+    var saveBtn=document.getElementById("rc-save");
+    if(saveBtn) saveBtn.disabled=false;
+    var p=document.getElementById("rc-panel");
+    /* ПАНЕЛЬ ПЕРЕЕЗЖАЕТ В <body> ПЕРЕД ПЕРВЫМ ПОКАЗОМ, и это не косметика.
+       Геометрия у неё верная и без этого (замерено: оверлей ровно по окну,
+       шапка на своём месте), но рисовалась она ПОД шапкой страницы: предок
+       в разметке раздела образует свой контекст наложения, и любой z-index
+       внутри него остаётся внутри. На снимках QA это выглядело так, что у
+       панели нет заголовка и кнопки «Закрыть» — на телефоне единственного
+       выхода, кроме Esc. Перенос к <body> снимает причину, а не подбирает
+       число z-index, которое завтра перебьёт соседний слой. */
+    if(p.parentNode!==document.body) document.body.appendChild(p);
+    p.style.display="";
+    setRcError("");
+    document.getElementById("rc-lines").innerHTML=
+      '<tr><td colspan="5" class="loading">Загрузка…</td></tr>';
+    document.getElementById("rc-summary").textContent="";
+    document.getElementById("rc-notes").innerHTML="";
+    document.getElementById("rc-history").innerHTML="";
+    document.getElementById("rc-extra-name").value="";
+    document.getElementById("rc-extra-qty").value="";
+    /* preventScroll: фокус нужен для клавиатуры и озвучки, а прокрутка при
+       этом — его побочный эффект, который уводил бы панель из вида. */
+    try { document.getElementById("rc-title").focus({preventScroll:true}); }
+    catch(e){ document.getElementById("rc-title").focus(); }
+    api("/api/orders/"+orderId+"/receipts").then(function(d){
+      if(!rcCurrent(mine)) return;   /* панель закрыли или открыли заново */
+      RC.data=d; renderReceipts(d);
+    }).catch(function(e){
+      /* ОТКАЗ ПРОШЛОГО ОТКРЫТИЯ НЕ ИМЕЕТ ПРАВА НИЧЕГО ЧИСТИТЬ. Здесь охраны
+         не было вовсе: опоздавший отказ заказа А стирал строки уже открытой
+         панели Б вместе с набранными в ней числами и показывал чужую ошибку. */
+      if(!rcCurrent(mine)) return;
+      document.getElementById("rc-lines").innerHTML="";
+      setRcError("Не удалось загрузить приёмку: "+e.message);
+    });
+  }
+
+  function closeReceipts(){
+    RC.id=null; RC.key=""; RC.data=null;
+    document.getElementById("rc-panel").style.display="none";
+  }
+
+  function setRcError(msg){
+    document.getElementById("rc-err").textContent=msg||"";
+  }
+
+  /* «Не знаем» и «ноль» — РАЗНЫЕ утверждения, и это главное правило экрана.
+     Сервер отдаёт `null`, когда факта нет или источники спорят; ноль он
+     отдаёт, когда человек сказал «не приехало ничего». Показать первое нулём
+     значило бы выдать незнание за подтверждённую недостачу. */
+  function rcNum(v){
+    return (v===null||v===undefined)
+      ? '<span class="rc-unknown">неизвестно</span>' : rcFmt(v);
+  }
+
+  function renderReceipts(d){
+    document.getElementById("rc-title").textContent="Приёмка заказа";
+    var got=(d.received_total===null||d.received_total===undefined)
+      ? '<span class="rc-unknown">неизвестно</span>' : rcFmt(d.received_total);
+    document.getElementById("rc-summary").innerHTML=
+      'Заказано: <b>'+rcFmt(d.ordered_total)+'</b> шт · Принято: <b>'+got+'</b>'+
+      (d.execution_unknown
+        ? ' <span class="rc-unknown">— по части позиций факта нет или источники спорят</span>'
+        : '');
+
+    var notes=[];
+    if((d.source_conflicts||[]).length){
+      /* Спор источников НЕ решается на экране приоритетом: показания видны,
+         вывод не делается. */
+      notes.push('<div><b>Расхождение источников.</b> По этим позициям источники '+
+        'говорят разное, поэтому принятое количество считается неизвестным: '+
+        d.source_conflicts.map(function(cf){ return esc(cf.base_name); }).join(", ")+'.</div>');
+    }
+    if((d.precisions||[]).indexOf("whole_order")>=0){
+      notes.push('<div><b>Есть строки-допущения.</b> Их записали прежние версии '+
+        'при отметке «принят целиком»: количества там взяты из заказа, а не '+
+        'названы человеком. Подтверждением они не считаются и в «Принято» не входят.</div>');
+    }
+    var srcs=Object.keys(d.by_source||{});
+    if(srcs.length){
+      notes.push('<div>Что сказал каждый источник: '+srcs.map(function(s){
+        return esc(s)+" — "+rcFmt(d.by_source[s]);
+      }).join("; ")+'. Итог их НЕ складывает: два источника об одном приходе — не двойная поставка.</div>');
+    }
+    document.getElementById("rc-notes").innerHTML=notes.join("");
+
+    document.getElementById("rc-lines").innerHTML=(d.lines||[]).map(function(ln){
+      var extra=(ln.ordered_qty===0)
+        ? ' <span class="rc-unknown">(не было в заказе)</span>' : '';
+      return '<tr data-rc-line="'+esc(ln.base_name)+'">'+
+        '<td class="name">'+esc(ln.base_name)+extra+'</td>'+
+        '<td class="nb" data-rc-ordered>'+rcFmt(ln.ordered_qty)+'</td>'+
+        '<td class="nb" data-rc-received>'+rcNum(ln.received_qty)+'</td>'+
+        '<td class="nb" data-rc-diff>'+rcNum(ln.diff)+'</td>'+
+        '<td class="nb"><input class="input num" type="number" step="any" '+
+          'data-rc-qty aria-label="Принято в этот приход: '+esc(ln.base_name)+'"></td></tr>';
+    }).join("")||'<tr><td colspan="5" class="loading">В заказе нет позиций.</td></tr>';
+
+    var hist=(d.receipts||[]).slice().reverse().map(function(r){
+      return '<div class="row">'+(r.at?fmtDate(r.at):"—")+' · '+esc(r.base_name)+
+        ' · <b>'+rcFmt(r.qty)+'</b> · '+esc(r.source)+
+        (r.precision==="whole_order"?' · <i>допущение</i>':'')+'</div>';
+    }).join("");
+    /* Обрезка названа ЧИСЛОМ. Молчаливое усечение читается как «это всё». */
+    var cut=(d.receipts_hidden>0)
+      ? '<div class="row rc-unknown">Показаны последние '+(d.receipts||[]).length+
+        ' строк из '+d.receipts_total+'; скрыто '+d.receipts_hidden+'.</div>' : '';
+    document.getElementById("rc-history").innerHTML=
+      cut+(hist||'<div class="row rc-unknown">Приёмок пока не записано.</div>');
+  }
+
+  /* Что человек утверждает ЭТИМ приходом. Пустое поле не попадает в тело
+     вовсе: «ничего не говорю» и «приехал ноль» — разные вещи, и второе
+     отправляется явным нулём. */
+  function rcCollect(){
+    var lines=[],bad=null;
+    document.querySelectorAll('#rc-lines [data-rc-line]').forEach(function(tr){
+      var i=tr.querySelector('input[data-rc-qty]');
+      var raw=i?String(i.value).trim():"";
+      if(raw==="") return;
+      var v=Number(raw.replace(",","."));
+      /* Непонятное число — тоже НЕ повод молча выбросить строку: человек
+         что-то в неё написал, и это «что-то» он считает своим приходом. */
+      if(!isFinite(v)){ bad=bad||("Не понял количество по позиции «"+
+        tr.getAttribute("data-rc-line")+"». Исправьте или очистите поле."); return; }
+      lines.push({base_name:tr.getAttribute("data-rc-line"),qty:v});
+    });
+    var name=String(document.getElementById("rc-extra-name").value||"").trim();
+    var qtyRaw=String(document.getElementById("rc-extra-qty").value||"").trim();
+    /* ПОЛОВИНА УТВЕРЖДЕНИЯ — НЕ УТВЕРЖДЕНИЕ (P1 ревью PR #61, r4106171209).
+       Прежняя редакция брала пару только целиком, а неполную молча
+       выбрасывала. Пока в форме есть хоть одна верная заказанная строка,
+       `lines` оставался непустым, POST уходил и УДАВАЛСЯ — а успех очищал
+       все поля. Названные человеком штуки исчезали без единого слова.
+
+       Теперь неполная пара отклоняет отправку ЦЕЛИКОМ и до запроса: частично
+       записанный приход хуже незаписанного, потому что выглядит записанным. */
+    if(name&&qtyRaw===""){
+      bad=bad||"У позиции вне заказа не указано количество. Впишите его или очистите название.";
+    }else if(!name&&qtyRaw!==""){
+      bad=bad||"У позиции вне заказа не названо название. Впишите его или очистите количество.";
+    }else if(name&&qtyRaw!==""){
+      var q=Number(qtyRaw.replace(",","."));
+      if(isFinite(q)) lines.push({base_name:name,qty:q});
+      else bad=bad||"Не понял количество позиции вне заказа. Исправьте его или очистите поле.";
+    }
+    return {lines:lines,error:bad};
+  }
+
+  function saveReceipts(){
+    if(!RC.id) return;
+    var got=rcCollect();
+    /* Отказ ДО запроса и до единой правки полей: ввод человека остаётся
+       ровно таким, каким он его оставил. */
+    if(got.error){ setRcError(got.error); return; }
+    var lines=got.lines;
+    if(!lines.length){
+      setRcError("Ничего не записано: заполните хотя бы одну позицию. Пустое поле — это «не знаю», и отправлять его нечем.");
+      return;
+    }
+    var btn=document.getElementById("rc-save");
+    btn.disabled=true; setRcError("");
+    var mine=RC.gen;
+    var orderId=RC.id;
+    api("/api/orders/"+orderId+"/receipts",
+        {method:"POST",body:{lines:lines,idempotency_key:RC.key}})
+      .then(function(d){
+        /* УСПЕХ ОБЪЯВЛЯЕТСЯ ТОЛЬКО ПО ПОДТВЕРЖДЁННОМУ ОТВЕТУ. Ключ намерения
+           сбрасывается именно здесь: дальше — уже другое намерение. */
+        if(rcCurrent(mine)){
+          RC.key=rcKey(); RC.data=d; renderReceipts(d);
+          document.querySelectorAll('#rc-lines input[data-rc-qty]').forEach(function(i){ i.value=""; });
+          document.getElementById("rc-extra-name").value="";
+          document.getElementById("rc-extra-qty").value="";
+        }
+        load();
+      })
+      .catch(function(e){
+        /* Исход НЕИЗВЕСТЕН — и панель это признаёт: набранное и ключ остаются
+           на месте, повтор придёт тем же намерением и не удвоит факт. */
+        if(!rcCurrent(mine)) return;
+        setRcError("Не сохранено: "+e.message+" Нажмите ещё раз — повтор того же прихода не запишется дважды.");
+      })
+      .then(function(){
+        /* И ЗАВЕРШАЮЩИЙ ШАГ ТОЖЕ ПОД ОХРАНОЙ. Без него ответ прошлого
+           открытия включал бы кнопку текущего прямо посреди его отправки. */
+        if(rcCurrent(mine)) btn.disabled=false;
+      });
+  }
+
+  document.getElementById("rc-save").addEventListener("click",saveReceipts);
+  document.getElementById("rc-close").addEventListener("click",closeReceipts);
+  document.getElementById("rc-panel").addEventListener("click",function(ev){
+    if(ev.target===this) closeReceipts();
+  });
+  document.addEventListener("keydown",function(ev){
+    if(ev.key==="Escape"&&RC.id) closeReceipts();
+  });
 
   /* Копирование CC_BATCH_ID. Кнопка — удобство, а не единственный путь: сам
      идентификатор лежит в разметке целиком и выделяется одним щелчком
