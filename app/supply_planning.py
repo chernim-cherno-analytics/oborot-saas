@@ -790,6 +790,75 @@ def _journal(db: Session, org_id: int, kind: str, entity_id: int, action: str,
     ))
 
 
+def _own_row(db: Session, model, row_id, org_id: int):
+    """Строка своей организации — или None, без исключения.
+
+    Нужна журналу, а не контракту: если названной строки почему-то нет, запись
+    истории просто не появляется. Придумать вместо неё правдоподобную — хуже,
+    чем не написать ничего (D-37).
+    """
+    if row_id is None:
+        return None
+    row = db.get(model, row_id)
+    if row is None or getattr(row, "org_id", None) != org_id:
+        return None
+    return row
+
+
+def _batch_name(db: Session, batch: "SupplyBatch") -> str:
+    """Как партия называется на экране — тем же правилом, что и везде."""
+    item = _own_row(db, SupplyItem, batch.item_id, batch.org_id)
+    return batch_label(batch.title, item.title if item else "", batch.id)
+
+
+def _qty_text(qty, unit: str) -> str:
+    return f"{fmt_qty(qty)} {unit}".strip()
+
+
+def _journal_allocation(db: Session, org_id: int, material, batch,
+                        action: str, qty_text: str, author: str, *,
+                        tail: str = "", sides: str = "both") -> None:
+    """Одно движение метража — запись у МАТЕРИАЛА и запись у ПАРТИИ.
+
+    ЗАЧЕМ ЭТО ВООБЩЕ ПОНАДОБИЛОСЬ (SUPPLY-OWNERUT-1, находка 2 приёмки).
+    Журнал назначений существовал с первого дня слоя, но писался ТОЛЬКО на саму
+    строку назначения. История читается по паре «вид записи + номер строки»,
+    поэтому на карточке материала и на карточке партии этих событий не было
+    видно ни одного. А снятие и полный перенос ещё и УДАЛЯЮТ строку назначения —
+    вместе с ней её события становились недостижимы вовсе: спросить историю
+    несуществующей строки нельзя.
+
+    То есть вопрос «куда делись сто двадцать метров этой ткани», ради которого
+    журнал и заводился, ответа не имел ни у одной из двух сторон, которые на
+    доске остаются.
+
+    ПОЧЕМУ ЗАПИСЬ, А НЕ СБОРКА ПРИ ЧТЕНИИ. Собрать историю материала из событий
+    назначений при чтении честно нельзя: у события нет ни материала, ни партии —
+    только номер строки, которой может уже не быть. Догадываться о них по
+    ТЕКУЩЕМУ состоянию доски значило бы рассказывать настоящее в прошедшем
+    времени: перенесённое назначение назвало бы своей ту партию, на которую
+    попало позже, а снятое не назвало бы никакой.
+
+    ПОЭТОМУ ЖЕ У СТАРЫХ НАЗНАЧЕНИЙ ЭТИХ ЗАПИСЕЙ НЕТ И НЕ ПОЯВИТСЯ. Всё, что
+    произошло до пакета, произошло без них, и дорисовать это задним числом
+    нечем. История, в которой часть строк выдумана, хуже короткой.
+
+    `op_id` здесь всегда пустой: поступок уже опознан записью самой строки
+    назначения, а вторая строка с тем же непустым `op_id` упёрлась бы в
+    частичный замок `ux_supply_events_op`.
+    """
+    if sides in ("both", "material") and material is not None:
+        name = _batch_name(db, batch) if batch is not None else ""
+        where = f" — «{name}»" if name else ""
+        _journal(db, org_id, "material", material.id, action,
+                 new=f"{qty_text}{where}{tail}", author=author)
+    if sides in ("both", "batch") and batch is not None:
+        title = material.title if material is not None else ""
+        what = f"{title} — " if title else ""
+        _journal(db, org_id, "batch", batch.id, action,
+                 new=f"{what}{qty_text}{tail}", author=author)
+
+
 def check_op(db: Session, org_id: int, op_id: str) -> bool:
     """True, если такой поступок уже записан.
 
@@ -869,6 +938,19 @@ EVENT_ACTION_LABELS = {
     "move": "перенесено",
     "archive": "убрано с доски",
     "restore": "возвращено на доску",
+    # SUPPLY-OWNERUT-1. Движение метража глазами МАТЕРИАЛА и ПАРТИИ, а не
+    # строки назначения. Почему это отдельные действия, а не те же `create`
+    # и `delete`: у материала не «создалось» ничего — у него ушёл метраж, и
+    # слово «создано» на его карточке читалось бы про сам материал.
+    "assign": "назначено",
+    "unassign": "снято назначение",
+    "move_in": "получено переносом",
+    # Корректив по ревью PR #59 (тред r4062457720). Отдельное слово именно
+    # потому, что «назначено» здесь солгало бы: это ЗАМЕНА количества, а не
+    # ещё один метраж сверх прежнего. Строка «назначено: 40 м → 70 м» в списке
+    # рядом с настоящими назначениями читалась бы как прибавка — то есть как
+    # сто десять метров вместо семидесяти.
+    "reassign": "количество изменено",
 }
 
 #: Виды сущностей, у которых история читается снаружи, и способ проверить, что
@@ -1584,6 +1666,15 @@ def archive_batch(db: Session, org_id: int, batch_id: int, payload: dict,
                  old=a.qty, new="снято вместе с партией", author=author,
                  op_id=op_id)
         op_id = ""          # один поступок — одна запись с этим op_id
+        # У МАТЕРИАЛА МЕТРАЖ ДЕЙСТВИТЕЛЬНО УШЁЛ ИЗ РАСПРЕДЕЛЕНИЯ, и на его
+        # карточке это видно числом. Без этой записи «назначено» падало молча:
+        # на карточке одно, в истории — ни слова. У самой партии запись своя,
+        # общая («убрано с доски»), и дублировать её строкой на каждое
+        # назначение незачем: назначения никуда не делись и вернутся такими же.
+        mat = _own_row(db, SupplyMaterial, a.material_id, org_id)
+        _journal_allocation(db, org_id, mat, row, "unassign",
+                            _qty_text(a.qty, mat.unit if mat else ""), author,
+                            tail=" — вместе с самой партией", sides="material")
     row.archived_at = stamp
     _touch(row)
     _journal(db, org_id, "batch", row.id, "archive", field="archived",
@@ -1652,6 +1743,15 @@ def restore_batch(db: Session, org_id: int, batch_id: int, payload: dict,
                  old="снято вместе с партией", new=a.qty, author=author,
                  op_id=op_id)
         op_id = ""
+        # Возврат метража В РАСПРЕДЕЛЕНИЕ — такое же изменение карточки
+        # материала, как и снятие, и цена его названа в шапке этой функции:
+        # суммарно назначенного может стать больше, чем было. Молчать об этом в
+        # истории значило бы прятать ровно тот случай, ради которого её читают.
+        mat = _own_row(db, SupplyMaterial, a.material_id, org_id)
+        _journal_allocation(db, org_id, mat, row, "assign",
+                            _qty_text(a.qty, mat.unit if mat else ""), author,
+                            tail=" — вместе с возвратом партии",
+                            sides="material")
         returned = round(returned + float(a.qty), 3)
     was = row.archived_at.isoformat()
     row.archived_at = None
@@ -1882,6 +1982,14 @@ def create_assignment(db: Session, org_id: int, payload: dict,
             _journal(db, org_id, "assignment", existing.id, "update",
                      field="note_truncated", old=note, new=merged_note,
                      author=author)
+        # ПРИБАВКА НАЗЫВАЕТСЯ ПРИБАВКОЙ, а не новым назначением: на карточке
+        # видно только итог, и запись «назначено 50» после записи «назначено
+        # 40» читалась бы как девяносто. Пишется и то, что добавили, и то, что
+        # из этого вышло.
+        _journal_allocation(
+            db, org_id, material, batch, "assign",
+            f"+{_qty_text(qty, material.unit)}, стало "
+            f"{_qty_text(total, material.unit)}", author)
         existing.merged = True
         return existing
     row = SupplyAssignment(org_id=org_id, material_id=material.id, batch_id=batch.id,
@@ -1891,6 +1999,8 @@ def create_assignment(db: Session, org_id: int, payload: dict,
     db.flush()
     _journal(db, org_id, "assignment", row.id, "create", field="qty", old="", new=qty,
              author=author, op_id=op_id)
+    _journal_allocation(db, org_id, material, batch, "assign",
+                        _qty_text(qty, material.unit), author)
     return row
 
 
@@ -1933,6 +2043,22 @@ def update_assignment(db: Session, org_id: int, assignment_id: int, payload: dic
     Заметка назначения до этого пакета присваивалась молча, хотя именно в ней
     человек пишет, ПОЧЕМУ этот метраж ушёл на эту партию. Правка, не изменившая
     ничего, редакцию не двигает — то же правило, что у остальных трёх сущностей.
+
+    ПРАВКА КОЛИЧЕСТВА ВИДНА И МАТЕРИАЛУ, И ПАРТИИ (корректив по ревью PR #59,
+    тред `r4062457720`). Это был последний путь записи, пропущенный в D-62:
+    остальные четыре — назначение, прибавка, перенос и снятие — рассказывали о
+    себе обеим сторонам, а прямая правка количества писала только в журнал
+    САМОЙ строки назначения. Цена была ровно та, которую назвало ревью:
+    последовательность «назначить 40 → изменить на 70 → снять» оставляла на
+    карточке материала «назначено 40», а следом «снято назначение 70», и
+    тридцати метров не объяснял никто. Событие правки при этом существовало, но
+    лежало на строке, которую снятие УДАЛЯЕТ, — после чего спросить его нельзя
+    вовсе: истории несуществующей строки нет.
+
+    ЗАПИСЬ ПОЯВЛЯЕТСЯ ТОЛЬКО ВМЕСТЕ С ДВИЖЕНИЕМ. Она стоит внутри проверки
+    `qty != row.qty`, а не рядом с ней: правка тем же числом и правка одной
+    только заметки метраж не двигают, и строка о движении там была бы
+    выдумкой — по ней человек пошёл бы искать метры, которых никто не трогал.
     """
     row = get_assignment(db, org_id, assignment_id)
     _rev_guard(row, payload, "Назначение")
@@ -1943,11 +2069,22 @@ def update_assignment(db: Session, org_id: int, assignment_id: int, payload: dic
         if qty is None or qty <= 0:
             raise ValidationError("Укажите количество больше нуля.")
         if qty != row.qty:
+            was = row.qty
             _journal(db, org_id, "assignment", row.id, "update", field="qty",
-                     old=row.qty, new=qty, author=author, op_id=op_id)
+                     old=was, new=qty, author=author, op_id=op_id)
             op_id = ""
             row.qty = qty
             changed = True
+            # «Было → стало» целиком в одной строке, и обе величины с единицей:
+            # у материала своя единица, и число без неё в истории читается
+            # наугад. `reassign`, а не `assign`, — чтобы строка не встала в
+            # список как ещё одно назначение сверх прежнего (см. подписи).
+            material = _own_row(db, SupplyMaterial, row.material_id, org_id)
+            batch = _own_row(db, SupplyBatch, row.batch_id, org_id)
+            unit = material.unit if material else ""
+            _journal_allocation(
+                db, org_id, material, batch, "reassign",
+                f"{_qty_text(was, unit)} → {_qty_text(qty, unit)}", author)
     if "note" in payload:
         new_note = clean_text(payload.get("note"), "заметка", limit=MAX_NOTE_CHARS)
         if new_note != (row.note or ""):
@@ -1969,6 +2106,15 @@ def delete_assignment(db: Session, org_id: int, assignment_id: int, payload: dic
     material_id, qty = row.material_id, row.qty
     _journal(db, org_id, "assignment", row.id, "delete", field="qty",
              old=qty, new="снято", author=author, op_id=parse_op_id(payload))
+    # ЗАПИСЬ СТОРОН — ДО `db.delete`, и это не вкусовщина. Сама строка
+    # назначения сейчас исчезнет, и вместе с ней исчезнет возможность спросить
+    # её историю: ручка ответит 404 по несуществующей строке. Материал и партия
+    # на доске остаются — значит рассказывать про снятый метраж обязаны они.
+    material = _own_row(db, SupplyMaterial, row.material_id, org_id)
+    batch = _own_row(db, SupplyBatch, row.batch_id, org_id)
+    _journal_allocation(db, org_id, material, batch, "unassign",
+                        _qty_text(qty, material.unit if material else ""),
+                        author)
     db.delete(row)
     return {"material_id": material_id, "qty": qty}
 
@@ -2040,6 +2186,30 @@ def move_assignment(db: Session, org_id: int, payload: dict, author: str) -> dic
     remainder = round(float(src.qty) - qty, 3)
     _journal(db, org_id, "assignment", src.id, "move", field="qty",
              old=src.qty, new=remainder, author=author, op_id=op_id)
+
+    # ПЕРЕНОС ВИДЕН ОБЕИМ ПАРТИЯМ, И ЭТО ТРИ РАЗНЫЕ ЗАПИСИ, А НЕ ОДНА НА ВСЕХ.
+    # У источника вопрос «куда ушло», у приёмника — «откуда пришло», и ответ
+    # на один из них не является ответом на другой. У материала запись одна:
+    # его метраж никуда не девался, он сменил партию, и обе названы рядом.
+    #
+    # Пишется это ДО удаления пустого источника — по той же причине, что и в
+    # `delete_assignment`: строки, у которой спрашивать историю, сейчас может
+    # не стать.
+    material = _own_row(db, SupplyMaterial, src.material_id, org_id)
+    src_batch = _own_row(db, SupplyBatch, src.batch_id, org_id)
+    unit = material.unit if material else ""
+    moved_text = _qty_text(qty, unit)
+    src_name = _batch_name(db, src_batch) if src_batch else ""
+    dst_name = _batch_name(db, target_batch)
+    if material is not None:
+        _journal(db, org_id, "material", material.id, "move",
+                 new=f"{moved_text}: «{src_name}» → «{dst_name}»", author=author)
+    _journal_allocation(db, org_id, material, src_batch, "move",
+                        moved_text, author, tail=f" в «{dst_name}»",
+                        sides="batch")
+    _journal_allocation(db, org_id, material, target_batch, "move_in",
+                        moved_text, author, tail=f" из «{src_name}»",
+                        sides="batch")
     if remainder <= 0:
         db.delete(src)
     else:

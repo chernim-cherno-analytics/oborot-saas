@@ -2496,6 +2496,9 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
         # ── 27. SUPPLY-FIX-5: урок раздела, выгрузка, масштаб и адрес ───────
         supply_fix_5_ui(pw, base)
 
+        # ── 28. SUPPLY-OWNERUT-1: форма после успеха и история на карточке ──
+        supply_ownerut_1_ui(pw, base, c)
+
     c.close()
     print(f"\nИТОГО: {len(PASS)} OK, {len(FAIL)} FAIL")
     for name in FAIL:
@@ -5376,10 +5379,34 @@ def _fix3_lost_response(page, base, c) -> None:
           bool(second) and second[0]["assigned"] == 10,
           str(second[0]["assigned"]) if second else "строки нет")
 
-    # А изменённая форма — это уже другой поступок, и он обязан пройти.
+    # ФОРМУ НАДО ОТКРЫТЬ ЗАНОВО, И ЭТО ИЗМЕНЕНИЕ ПОВЕДЕНИЯ, А НЕ ОБХОД
+    # ПРОВЕРКИ. Повтор выше закончился ПОДТВЕРЖДЁННЫМ успехом: замок поступка
+    # узнал `op_id` и ручка ответила 200. С этого момента действие завершено,
+    # и форма закрывается (SUPPLY-OWNERUT-1, находка 1 приёмки) — ровно затем,
+    # чтобы заполненный орган управления не остался на экране после того, как
+    # он сработал. До того пакета форма оставалась открытой, и следующие строки
+    # писались в неё.
+    #
+    # Свойство, которое здесь проверяется, от этого не изменилось ни на слово:
+    # ИЗМЕНЁННОЕ назначение — другой поступок, и он обязан пройти. Меняется
+    # только то, что человек начинает его сам, с чистой формы.
+    reopened = page.evaluate("""(id) => {
+      const card = document.querySelector('[data-pl="material"][data-id="' + id + '"]');
+      if (!card) return 'карточки нет';
+      if (card.querySelector('form.pl-form.inline'))
+        return 'форма осталась открытой после подтверждённого успеха';
+      const btn = card.querySelector('button[data-inline="assign"]');
+      if (!btn) return 'кнопки назначения нет';
+      btn.click();
+      return card.querySelector('form.pl-form.inline') ? '' : 'форма не открылась';
+    }""", str(mid))
+    check("после подтверждённого повтора форма закрыта и открывается заново",
+          reopened == "", str(reopened))
+    page.wait_for_timeout(250)
     page.evaluate("""(id) => {
       const box = document.querySelector('[data-pl="material"][data-id="' + id
                                          + '"] form.pl-form.inline');
+      if (!box) return;
       const q = box.querySelector('input');
       q.value = '5';
       q.dispatchEvent(new Event('input', {bubbles: true}));
@@ -6406,6 +6433,417 @@ def _fix5_hash_ui(page, base) -> None:
           not _fix5_shown(page, "#pl-materials")
           and (page.text_content("#pl-mat-toggle") or "").strip() == "Развернуть",
           str(page.text_content("#pl-mat-toggle")))
+
+
+# ── SUPPLY-OWNERUT-1: форма после успеха и история на карточке ──────────────
+
+
+def supply_ownerut_1_ui(pw, base, c) -> None:
+    """Обратная связь приёмки: две находки, обе видны только в браузере.
+
+    НАХОДКА 1 — ЖИЗНЕННЫЙ ЦИКЛ ФОРМЫ. После подтверждённого успеха форма
+    «Отдать» оставалась открытой и заполненной: то же количество, та же партия,
+    та же идентичность поступка. Человек видел рабочий орган управления там,
+    где действие уже выполнено. Проверяется именно это — и ОТДЕЛЬНО
+    проверяется, что отказ и потерянный ответ форму НЕ закрывают: черновик и
+    `op_id` обязаны пережить неудачу, иначе повтор перестанет быть повтором.
+
+    НАХОДКА 2 — ИСТОРИЯ НА КАРТОЧКЕ. То же, что набор `supply_planning`
+    доказывает на ручке, здесь доказывается на экране: строка назначения
+    действительно появляется в открытой «Истории», а не только в ответе API.
+
+    ЧЕГО ЗДЕСЬ НЕТ. Ни одной параллельной вкладки и ни одного состязательного
+    сценария: F-22 в пакет не входит. Телефона тоже нет — 390×844 это
+    эмуляция вьюпорта, и названа она так намеренно.
+    """
+    browser = pw.chromium.launch()
+    ctx = browser.new_context(viewport={"width": 1400, "height": 900})
+    ctx.add_cookies([{"name": k, "value": v, "domain": "127.0.0.1", "path": "/"}
+                     for k, v in c.cookies.items()])
+    errors: list[str] = []
+    page = ctx.new_page()
+    page.on("pageerror", lambda e: errors.append(str(e)))
+
+    steps = (
+        ("успех закрывает форму назначения",
+         lambda: _ou1_assign_closes(page, base, c)),
+        ("отказ форму не закрывает и ввод не теряет",
+         lambda: _ou1_failure_keeps_form(page, base, c)),
+        ("потерянный ответ: повтор остаётся повтором",
+         lambda: _ou1_lost_response(page, base, c)),
+        ("успех закрывает и форму переноса",
+         lambda: _ou1_move_closes(page, base, c)),
+        ("история на карточке говорит про назначение",
+         lambda: _ou1_history_on_card(page, base, c)),
+    )
+    for label, run_step in steps:
+        try:
+            run_step()
+        except Exception as exc:  # noqa: BLE001 — важен отчёт, а не тип
+            check(f"{label}: шаг дошёл до конца без исключения", False,
+                  f"{type(exc).__name__}: "
+                  f"{str(exc).strip().splitlines()[0][:160]}")
+
+    check("за сценарий SUPPLY-OWNERUT-1 не было ошибок в консоли",
+          not errors, str(errors)[:200])
+    ctx.close()
+
+    # Те же два свойства в окне телефона. Отдельный контекст, а не смена
+    # размера: 390×844 — это другое устройство, и мерить его на странице,
+    # открытой широкой, значило бы мерить не то.
+    _ou1_mobile(browser, base, c)
+    browser.close()
+
+
+def _ou1_fixture(c, tag: str) -> dict:
+    """Материал, вещь и две плановые партии — свои у каждого шага."""
+    mat = c.post("/api/supply/planning/materials",
+                 json={"title": f"Ткань ОУ {tag}", "qty": "100", "unit": "м",
+                       "op_id": f"ou1ui-{tag}-m"}).json()
+    mid = [m for m in mat["materials"]
+           if m["title"] == f"Ткань ОУ {tag}"][0]["id"]
+    it = c.post("/api/supply/planning/items",
+                json={"kind": "draft", "title": f"Вещь ОУ {tag}",
+                      "op_id": f"ou1ui-{tag}-i"}).json()
+    iid = [i for i in it["items"] if i["title"] == f"Вещь ОУ {tag}"][0]["id"]
+    one = c.post("/api/supply/planning/batches",
+                 json={"item_id": iid, "title": f"Партия {tag} один",
+                       "plan_qty": "10", "op_id": f"ou1ui-{tag}-b1"}).json()
+    two = c.post("/api/supply/planning/batches",
+                 json={"item_id": iid, "title": f"Партия {tag} два",
+                       "plan_qty": "10", "op_id": f"ou1ui-{tag}-b2"}).json()
+    return {
+        "mid": mid,
+        "b1": [b for b in one["batches"]
+               if b["title"] == f"Партия {tag} один"][0]["id"],
+        "b2": [b for b in two["batches"]
+               if b["title"] == f"Партия {tag} два"][0]["id"],
+    }
+
+
+#: Состояние инлайн-формы на карточке ОДНИМ снимком: открыта ли, что в поле,
+#: какая на ней идентичность поступка и что говорит сама кнопка.
+_OU1_FORM_JS = """
+  (arg) => {
+    const card = document.querySelector(
+      '[data-pl="' + arg.kind + '"][data-id="' + arg.id + '"]');
+    if (!card) return {card: false};
+    const btn = card.querySelector('button[data-inline="' + arg.name + '"]');
+    const box = card.querySelector('.pl-form.inline');
+    return {
+      card: true,
+      button: !!btn,
+      expanded: btn ? btn.getAttribute('aria-expanded') : null,
+      open: !!box,
+      qty: box && box.querySelector('input')
+        ? box.querySelector('input').value : null,
+      opId: box ? (box.dataset.opId || '') : null,
+      err: box && box.querySelector('.pl-form-err')
+        ? (box.querySelector('.pl-form-err').textContent || '').trim() : '',
+    };
+  }
+"""
+
+
+def _ou1_form(page, kind: str, entity_id, name: str) -> dict:
+    return page.evaluate(_OU1_FORM_JS, {"kind": kind, "id": str(entity_id),
+                                        "name": name})
+
+
+def _ou1_open(page, kind: str, entity_id, name: str) -> bool:
+    return page.evaluate("""(arg) => {
+      const card = document.querySelector(
+        '[data-pl="' + arg.kind + '"][data-id="' + arg.id + '"]');
+      if (!card) return false;
+      const btn = card.querySelector('button[data-inline="' + arg.name + '"]');
+      if (!btn) return false;
+      btn.click();
+      return true;
+    }""", {"kind": kind, "id": str(entity_id), "name": name})
+
+
+def _ou1_fill_and_submit(page, kind: str, entity_id, qty: str) -> bool:
+    """Заполнить количество и нажать «Отдать»/«Перенести» — как человек.
+
+    Значение кладётся с событием `input`, а не присваиванием: именно по этому
+    событию страница решает, что поступок изменился, и сбрасывает `op_id`.
+    Молчаливое присваивание проверяло бы страницу, которой нет.
+    """
+    return page.evaluate("""(arg) => {
+      const card = document.querySelector(
+        '[data-pl="' + arg.kind + '"][data-id="' + arg.id + '"]');
+      const box = card ? card.querySelector('.pl-form.inline') : null;
+      if (!box) return false;
+      const input = box.querySelector('input');
+      if (!input) return false;
+      input.value = arg.qty;
+      input.dispatchEvent(new Event('input', {bubbles: true}));
+      const btn = box.querySelector('button[type=submit]');
+      if (!btn) return false;
+      btn.click();
+      return true;
+    }""", {"kind": kind, "id": str(entity_id), "qty": qty})
+
+
+def _ou1_assigned(c, mid: int) -> float:
+    board = c.get("/api/supply/planning").json()
+    row = [m for m in board["materials"] if m["id"] == mid]
+    return float(row[0]["assigned"]) if row else -1.0
+
+
+def _ou1_assign_closes(page, base, c) -> None:
+    print("\n== Находка 1: удавшееся «Отдать» закрывает свою форму ==")
+    f = _ou1_fixture(c, "закрытие")
+    _open_plan(page, base)
+    check("форма назначения открылась", _ou1_open(page, "material", f["mid"], "assign") is True)
+    page.wait_for_timeout(400)
+    before = _ou1_form(page, "material", f["mid"], "assign")
+    check("и она действительно на карточке", before["open"] is True, str(before))
+    check("до отправки форма заполняется человеком",
+          _ou1_fill_and_submit(page, "material", f["mid"], "40") is True)
+    page.wait_for_timeout(1600)
+
+    check("назначение записано на сервере",
+          abs(_ou1_assigned(c, f["mid"]) - 40.0) < 1e-9,
+          str(_ou1_assigned(c, f["mid"])))
+    after = _ou1_form(page, "material", f["mid"], "assign")
+    check("ПОСЛЕ УСПЕХА формы на карточке больше нет",
+          after["open"] is False, str(after))
+    check("и кнопка снова говорит, что ничего не раскрыто",
+          after["expanded"] == "false", str(after))
+
+    # Закрытие не должно мешать ЗАКОННОМУ повторному назначению: его человек
+    # начинает заново, и начинает с чистой формы — без прежнего количества и
+    # без прежней идентичности поступка.
+    check("форму можно открыть снова",
+          _ou1_open(page, "material", f["mid"], "assign") is True)
+    page.wait_for_timeout(400)
+    fresh = _ou1_form(page, "material", f["mid"], "assign")
+    check("и она открывается пустой, а не с прежним количеством",
+          fresh["open"] is True and not (fresh["qty"] or ""), str(fresh))
+    check("и без прежней идентичности поступка",
+          fresh["opId"] == "", str(fresh))
+    _ou1_fill_and_submit(page, "material", f["mid"], "25")
+    page.wait_for_timeout(1600)
+    check("законное повторное назначение прошло: 40 + 25 = 65",
+          abs(_ou1_assigned(c, f["mid"]) - 65.0) < 1e-9,
+          str(_ou1_assigned(c, f["mid"])))
+
+
+def _ou1_failure_keeps_form(page, base, c) -> None:
+    print("\n== Находка 1: отказ форму НЕ закрывает и ввод не теряет ==")
+    f = _ou1_fixture(c, "отказ")
+    _open_plan(page, base)
+    route = re.compile(r"/api/supply/planning/assignments$")
+    state = {"blocked": True}
+
+    def handler(r):
+        if state["blocked"]:
+            r.abort()
+        else:
+            r.continue_()
+
+    page.route(route, handler)
+    try:
+        _ou1_open(page, "material", f["mid"], "assign")
+        page.wait_for_timeout(400)
+        _ou1_fill_and_submit(page, "material", f["mid"], "30")
+        page.wait_for_timeout(1600)
+        failed = _ou1_form(page, "material", f["mid"], "assign")
+        check("форма осталась открытой", failed["open"] is True, str(failed))
+        check("введённое количество на месте", failed["qty"] == "30", str(failed))
+        check("и человеку сказано, что не сохранено", bool(failed["err"]),
+              str(failed))
+        check("на сервере при этом ничего не записалось",
+              abs(_ou1_assigned(c, f["mid"])) < 1e-9,
+              str(_ou1_assigned(c, f["mid"])))
+        token = failed["opId"]
+        check("идентичность поступка у формы есть — повтор будет повтором",
+              bool(token), str(failed))
+
+        state["blocked"] = False
+        page.evaluate("""(arg) => {
+          const card = document.querySelector(
+            '[data-pl="material"][data-id="' + arg.id + '"]');
+          const box = card ? card.querySelector('.pl-form.inline') : null;
+          if (box) box.querySelector('button[type=submit]').click();
+        }""", {"id": str(f["mid"])})
+        page.wait_for_timeout(1800)
+        check("повтор без правок прошёл ровно один раз",
+              abs(_ou1_assigned(c, f["mid"]) - 30.0) < 1e-9,
+              str(_ou1_assigned(c, f["mid"])))
+        ok = _ou1_form(page, "material", f["mid"], "assign")
+        check("и только теперь форма закрылась", ok["open"] is False, str(ok))
+    finally:
+        page.unroute(route)
+
+
+def _ou1_lost_response(page, base, c) -> None:
+    """Самый дорогой случай: запись СОСТОЯЛАСЬ, а ответ до страницы не дошёл.
+
+    Форма обязана остаться открытой — с экрана неотличимо, записалось или нет,
+    и закрыть её значило бы соврать про успех. И она обязана сохранить `op_id`:
+    иначе повтор придёт новым поступком, и метраж прибавится второй раз.
+    """
+    print("\n== Находка 1: потерянный ответ не выдаётся за успех ==")
+    f = _ou1_fixture(c, "обрыв")
+    _open_plan(page, base)
+    route = re.compile(r"/api/supply/planning/assignments$")
+    state = {"done": False}
+
+    def handler(r):
+        if state["done"]:
+            r.continue_()
+            return
+        state["done"] = True
+        try:
+            r.fetch()          # сервер получает запрос и записывает
+        except Exception:      # noqa: BLE001 — ответ нам и не нужен
+            pass
+        r.abort()              # ...а до страницы он не доходит
+
+    page.route(route, handler)
+    try:
+        _ou1_open(page, "material", f["mid"], "assign")
+        page.wait_for_timeout(400)
+        _ou1_fill_and_submit(page, "material", f["mid"], "40")
+        page.wait_for_timeout(1800)
+        lost = _ou1_form(page, "material", f["mid"], "assign")
+        check("форма НЕ закрыта: неопределённый исход успехом не считается",
+              lost["open"] is True, str(lost))
+        check("и количество в ней не потеряно", lost["qty"] == "40", str(lost))
+        token = lost["opId"]
+        check("идентичность поступка сохранена", bool(token), str(lost))
+
+        page.evaluate("""(arg) => {
+          const card = document.querySelector(
+            '[data-pl="material"][data-id="' + arg.id + '"]');
+          const box = card ? card.querySelector('.pl-form.inline') : null;
+          if (box) box.querySelector('button[type=submit]').click();
+        }""", {"id": str(f["mid"])})
+        page.wait_for_timeout(1800)
+        check("повтор после потерянного ответа не удвоил метраж",
+              abs(_ou1_assigned(c, f["mid"]) - 40.0) < 1e-9,
+              str(_ou1_assigned(c, f["mid"])))
+        done = _ou1_form(page, "material", f["mid"], "assign")
+        check("а теперь, после подтверждённого ответа, форма закрылась",
+              done["open"] is False, str(done))
+    finally:
+        page.unroute(route)
+
+
+def _ou1_move_closes(page, base, c) -> None:
+    print("\n== Находка 1: удавшийся «Перенести» закрывает свою форму ==")
+    f = _ou1_fixture(c, "перенос")
+    board = c.post("/api/supply/planning/assignments",
+                   json={"material_id": f["mid"], "batch_id": f["b1"],
+                         "qty": "40", "op_id": "ou1ui-перенос-a"}).json()
+    aid = [b for b in board["batches"]
+           if b["id"] == f["b1"]][0]["assignments"][0]["id"]
+    _open_plan(page, base)
+    check("форма переноса открылась",
+          _ou1_open(page, "batch", f["b1"], f"move-{aid}") is True)
+    page.wait_for_timeout(400)
+    opened = _ou1_form(page, "batch", f["b1"], f"move-{aid}")
+    check("и подставила весь метраж назначения", opened["qty"] == "40",
+          str(opened))
+    # Переносится ЧАСТЬ: тогда строка на партии-источнике остаётся, и кнопка
+    # переноса вместе с ней. Полный перенос убрал бы и строку, и кнопку — и
+    # проверка «формы больше нет» прошла бы по чужой причине.
+    _ou1_fill_and_submit(page, "batch", f["b1"], "15")
+    page.wait_for_timeout(1800)
+    moved = c.get("/api/supply/planning").json()
+    src = [b for b in moved["batches"] if b["id"] == f["b1"]][0]["assignments"]
+    dst = [b for b in moved["batches"] if b["id"] == f["b2"]][0]["assignments"]
+    check("перенесена ровно часть: 25 осталось, 15 ушло",
+          bool(src) and abs(float(src[0]["qty"]) - 25.0) < 1e-9
+          and bool(dst) and abs(float(dst[0]["qty"]) - 15.0) < 1e-9,
+          f"{src} / {dst}")
+    after = _ou1_form(page, "batch", f["b1"], f"move-{aid}")
+    check("строка на источнике осталась — кнопка переноса на месте",
+          after["button"] is True, str(after))
+    check("ПОСЛЕ УСПЕХА форма переноса закрыта", after["open"] is False,
+          str(after))
+
+
+def _ou1_history_on_card(page, base, c) -> None:
+    print("\n== Находка 2: «История» на карточке рассказывает про назначение ==")
+    f = _ou1_fixture(c, "история")
+    board = c.post("/api/supply/planning/assignments",
+                   json={"material_id": f["mid"], "batch_id": f["b1"],
+                         "qty": "40", "op_id": "ou1ui-история-a"}).json()
+    aid = [b for b in board["batches"]
+           if b["id"] == f["b1"]][0]["assignments"][0]["id"]
+    arev = [b for b in board["batches"]
+            if b["id"] == f["b1"]][0]["assignments"][0]["rev"]
+    c.post("/api/supply/planning/assignments/move",
+           json={"assignment_id": aid, "to_batch_id": f["b2"], "qty": "15",
+                 "rev": arev, "op_id": "ou1ui-история-mv"})
+    _open_plan(page, base)
+
+    def history_text(kind, entity_id) -> str:
+        page.evaluate("""(arg) => {
+          const card = document.querySelector(
+            '[data-pl="' + arg.kind + '"][data-id="' + arg.id + '"]');
+          const b = card ? card.querySelector('button[data-inline="history"]') : null;
+          if (b) b.click();
+        }""", {"kind": kind, "id": str(entity_id)})
+        page.wait_for_timeout(1300)
+        return page.evaluate("""(arg) => {
+          const card = document.querySelector(
+            '[data-pl="' + arg.kind + '"][data-id="' + arg.id + '"]');
+          const box = card ? card.querySelector('.pl-hist') : null;
+          return box ? box.textContent : '';
+        }""", {"kind": kind, "id": str(entity_id)})
+
+    mt = history_text("material", f["mid"])
+    check("история материала называет назначение с партией и количеством",
+          "назначено" in mt and "Партия история один" in mt and "40" in mt,
+          mt[:260])
+    check("и называет перенос с обеими партиями",
+          "перенесено" in mt and "Партия история два" in mt and "15" in mt,
+          mt[:260])
+    check("и у строки есть автор", "Владелец" in mt, mt[:260])
+
+    bt = history_text("batch", f["b2"])
+    check("история партии-приёмника говорит, откуда пришёл метраж",
+          "Партия история один" in bt and "15" in bt
+          and "Ткань ОУ история" in bt, bt[:260])
+
+
+def _ou1_mobile(browser, base, c) -> None:
+    """То же свойство в окне 390×844 — эмуляция вьюпорта, не телефон."""
+    print("\n== Находка 1 на 390×844: успех так же закрывает форму ==")
+    ctx = browser.new_context(viewport={"width": 390, "height": 844})
+    ctx.add_cookies([{"name": k, "value": v, "domain": "127.0.0.1", "path": "/"}
+                     for k, v in c.cookies.items()])
+    errors: list[str] = []
+    page = ctx.new_page()
+    page.on("pageerror", lambda e: errors.append(str(e)))
+    try:
+        f = _ou1_fixture(c, "телефон")
+        _open_plan(page, base)
+        _ou1_open(page, "material", f["mid"], "assign")
+        page.wait_for_timeout(400)
+        opened = _ou1_form(page, "material", f["mid"], "assign")
+        check("на 390 px форма назначения открывается", opened["open"] is True,
+              str(opened))
+        _ou1_fill_and_submit(page, "material", f["mid"], "12")
+        page.wait_for_timeout(1800)
+        after = _ou1_form(page, "material", f["mid"], "assign")
+        check("и после успеха закрывается так же", after["open"] is False,
+              str(after))
+        check("назначение при этом записано",
+              abs(_ou1_assigned(c, f["mid"]) - 12.0) < 1e-9,
+              str(_ou1_assigned(c, f["mid"])))
+        check("на 390 px раздел по-прежнему не требует горизонтальной прокрутки",
+              page.evaluate("() => document.documentElement.scrollWidth"
+                            " <= window.innerWidth + 1") is True,
+              str(page.evaluate("() => document.documentElement.scrollWidth")))
+        check("и ошибок в консоли телефонного окна не было", not errors,
+              str(errors)[:200])
+    finally:
+        ctx.close()
 
 
 if __name__ == "__main__":

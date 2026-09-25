@@ -1161,6 +1161,9 @@ def run() -> int:
     # ── 24. SUPPLY-FIX-5: демо-план, выгрузка xlsx, подпись партии ───────────
     supply_fix_5_checks()
 
+    # ── 25. SUPPLY-OWNERUT-1: история материала и партии про назначения ──────
+    supply_ownerut_1_checks()
+
     member.close()
     other.close()
     del_c.close()
@@ -5404,6 +5407,697 @@ def _fix5_batch_label() -> None:
           link["batch_title"] == without["label"],
           f"{link['batch_title']} vs {without['label']}")
     c.close()
+
+
+# ── SUPPLY-OWNERUT-1: история материала и партии говорит про назначения ──────
+
+
+def supply_ownerut_1_checks() -> None:
+    """Обратная связь приёмки, находка 2: журнал есть, а истории — нет.
+
+    ЧТО ИМЕННО ВОСПРОИЗВОДИТСЯ. События назначения, переноса и снятия слой
+    пишет с самого начала, но пишет их ТОЛЬКО на саму строку назначения
+    (`entity_kind="assignment"`). История читается по паре «вид + номер»,
+    поэтому ни на карточке материала, ни на карточке партии этих событий не
+    видно ни одного. Хуже того: снятие и полный перенос УДАЛЯЮТ строку
+    назначения, и её собственные события становятся недостижимы вовсе — ручка
+    истории отвечает по ним 404, потому что строки больше нет.
+
+    Значит вопрос «куда делись сто двадцать метров этой ткани», ради которого
+    журнал и заводился (см. `archive_batch` в слое), ответа не имел.
+
+    Каждый пункт — отдельный шаг со своими фикстурами, по тому же уроку, что и
+    в пакетах 3, 4 и 5: прогон против базы `9786877` обязан сказать про КАЖДЫЙ
+    пункт, а не умереть на первом же отказе (D-42).
+
+    ЧЕГО ЗДЕСЬ НЕТ. Ни одной состязательной проверки: F-22 в пакет не входит,
+    параллельных запросов набор не делает. Реального МойСклада, прода и
+    платных ручек здесь тоже нет — все данные синтетические.
+    """
+    steps = (
+        ("назначение видно в истории", _ou1_assign_visible),
+        ("перенос виден у ОБЕИХ партий", _ou1_move_visible),
+        ("снятие переживает удаление строки", _ou1_remove_visible),
+        ("партия, убранная целиком, объясняет метраж", _ou1_archive_visible),
+        ("старые назначения не обрастают выдуманной историей", _ou1_no_backfill),
+        ("история не смешивает арендаторов", _ou1_tenant),
+        ("гипотеза второго клика", _ou1_duplicate_hypothesis),
+        ("контракты записи не ослаблены", _ou1_contracts),
+        # Корректив по независимому ревью PR #59 (тред r4062457720): один путь
+        # записи из того же класса был пропущен — прямая правка количества.
+        ("прямая правка количества видна обеим сторонам", _ou1_qty_edit_visible),
+        ("правка без движения метража истории не выдумывает", _ou1_qty_edit_quiet),
+        ("отказ и повтор правки не оставляют лишних записей",
+         _ou1_qty_edit_contracts),
+    )
+    for label, run_step in steps:
+        try:
+            run_step()
+        except Exception as exc:  # noqa: BLE001 — важен отчёт, а не тип
+            check(f"{label}: шаг дошёл до конца без исключения", False,
+                  f"{type(exc).__name__}: "
+                  f"{str(exc).strip().splitlines()[0][:200]}")
+
+
+def _ou1_org_id(name: str) -> int:
+    con = sqlite3.connect(DB_PATH)
+    try:
+        return con.execute("SELECT id FROM orgs WHERE name = ?",
+                           (name,)).fetchone()[0]
+    finally:
+        con.close()
+
+
+def _ou1_setup(email: str, org: str):
+    """Своя организация, материал, вещь и две плановые партии.
+
+    Фикстура у каждого шага своя: шаг, испорченный соседним, доказывает не то,
+    что проверяет.
+    """
+    c = client()
+    register(c, email, org)
+    mat = c.post(P2 + "/materials",
+                 json={"title": "Ткань ОУ", "qty": "100", "unit": "м",
+                       "op_id": f"ou1-{org}-m"}).json()
+    mid = [m for m in mat["materials"] if m["title"] == "Ткань ОУ"][0]["id"]
+    it = c.post(P2 + "/items", json={"kind": "draft", "title": "Вещь ОУ",
+                                     "op_id": f"ou1-{org}-i"}).json()
+    iid = [i for i in it["items"] if i["title"] == "Вещь ОУ"][0]["id"]
+    first = c.post(P2 + "/batches",
+                   json={"item_id": iid, "title": "Первая закладка",
+                         "plan_qty": "10", "op_id": f"ou1-{org}-b1"}).json()
+    second = c.post(P2 + "/batches",
+                    json={"item_id": iid, "title": "Вторая закладка",
+                          "plan_qty": "10", "op_id": f"ou1-{org}-b2"}).json()
+    bid1 = [b for b in first["batches"] if b["title"] == "Первая закладка"][0]["id"]
+    bid2 = [b for b in second["batches"] if b["title"] == "Вторая закладка"][0]["id"]
+    return c, mid, bid1, bid2
+
+
+def _ou1_events(c, kind: str, entity_id: int) -> list:
+    r = c.get(P2 + "/events", params={"entity": kind, "id": entity_id})
+    if r.status_code != 200:
+        return []
+    body = r.json()
+    return body.get("events", []) if isinstance(body, dict) else []
+
+
+def _ou1_text(events: list) -> str:
+    """Вся история одной строки одной строкой — так её и читает человек."""
+    return " | ".join(
+        f"{e.get('action_label') or e.get('action')}·{e.get('field_label') or ''}"
+        f"·{e.get('old')}→{e.get('new')}" for e in events)
+
+
+def _ou1_assign_visible() -> None:
+    print("\n== Находка 2: назначение обязано быть видно в истории обеих сторон ==")
+    c, mid, bid1, _ = _ou1_setup("sp-ou1-a@test.io", "Бренд ОУ Назначение")
+    try:
+        r = c.post(P2 + "/assignments",
+                   json={"material_id": mid, "batch_id": bid1, "qty": "40",
+                         "note": "на манжеты", "op_id": "ou1-a-assign"})
+        check("назначение записано", r.status_code == 200, r.text[:120])
+
+        mev = _ou1_events(c, "material", mid)
+        assigned = [e for e in mev if e["action"] == "assign"]
+        check("история МАТЕРИАЛА называет назначение",
+              len(assigned) == 1, _ou1_text(mev)[:300])
+        check("и в нём есть количество и партия, на которую оно ушло",
+              bool(assigned) and "40" in assigned[0]["new"]
+              and "Первая закладка" in assigned[0]["new"],
+              str(assigned[:1])[:220])
+        check("у записи есть автор и время",
+              bool(assigned) and assigned[0]["author"] == "Владелец"
+              and assigned[0]["at"] and assigned[0]["at_label"],
+              str(assigned[:1])[:220])
+
+        bev = _ou1_events(c, "batch", bid1)
+        got = [e for e in bev if e["action"] == "assign"]
+        check("история ПАРТИИ называет то же назначение",
+              len(got) == 1, _ou1_text(bev)[:300])
+        check("и в нём есть материал и количество",
+              bool(got) and "Ткань ОУ" in got[0]["new"] and "40" in got[0]["new"],
+              str(got[:1])[:220])
+
+        # Повторное назначение на ту же партию прибавляет к строке (D-55), и
+        # прибавка — тоже поступок: её обязано быть видно, иначе метраж растёт
+        # без объяснения.
+        c.post(P2 + "/assignments",
+               json={"material_id": mid, "batch_id": bid1, "qty": "10",
+                     "op_id": "ou1-a-assign-2"})
+        mev2 = _ou1_events(c, "material", mid)
+        check("прибавка к существующему назначению тоже попала в историю",
+              len([e for e in mev2 if e["action"] == "assign"]) == 2,
+              _ou1_text(mev2)[:300])
+    finally:
+        c.close()
+
+
+def _ou1_move_visible() -> None:
+    print("\n== Находка 2: перенос виден у ОБЕИХ затронутых партий ==")
+    c, mid, bid1, bid2 = _ou1_setup("sp-ou1-mv@test.io", "Бренд ОУ Перенос")
+    try:
+        board = c.post(P2 + "/assignments",
+                       json={"material_id": mid, "batch_id": bid1, "qty": "40",
+                             "op_id": "ou1-mv-assign"}).json()
+        aid = [b for b in board["batches"] if b["id"] == bid1][0]["assignments"][0]["id"]
+        arev = [b for b in board["batches"]
+                if b["id"] == bid1][0]["assignments"][0]["rev"]
+        r = c.post(P2 + "/assignments/move",
+                   json={"assignment_id": aid, "to_batch_id": bid2, "qty": "15",
+                         "rev": arev, "op_id": "ou1-mv-move"})
+        check("перенос выполнен", r.status_code == 200, r.text[:140])
+
+        out = [e for e in _ou1_events(c, "batch", bid1) if e["action"] == "move"]
+        check("история партии-ИСТОЧНИКА называет перенос",
+              len(out) == 1, _ou1_text(_ou1_events(c, "batch", bid1))[:300])
+        check("и говорит, КУДА ушёл метраж",
+              bool(out) and "Вторая закладка" in out[0]["new"]
+              and "15" in out[0]["new"], str(out[:1])[:220])
+
+        into = [e for e in _ou1_events(c, "batch", bid2)
+                if e["action"] == "move_in"]
+        check("история партии-ПРИЁМНИКА называет тот же перенос",
+              len(into) == 1, _ou1_text(_ou1_events(c, "batch", bid2))[:300])
+        check("и говорит, ОТКУДА метраж пришёл",
+              bool(into) and "Первая закладка" in into[0]["new"]
+              and "15" in into[0]["new"], str(into[:1])[:220])
+
+        mmove = [e for e in _ou1_events(c, "material", mid)
+                 if e["action"] == "move"]
+        check("история МАТЕРИАЛА называет перенос одной записью",
+              len(mmove) == 1,
+              _ou1_text(_ou1_events(c, "material", mid))[:300])
+        check("и в ней названы обе партии",
+              bool(mmove) and "Первая закладка" in mmove[0]["new"]
+              and "Вторая закладка" in mmove[0]["new"], str(mmove[:1])[:240])
+    finally:
+        c.close()
+
+
+def _ou1_remove_visible() -> None:
+    print("\n== Находка 2: снятое назначение не уносит свою историю в небытие ==")
+    c, mid, bid1, _ = _ou1_setup("sp-ou1-rm@test.io", "Бренд ОУ Снятие")
+    try:
+        board = c.post(P2 + "/assignments",
+                       json={"material_id": mid, "batch_id": bid1, "qty": "40",
+                             "op_id": "ou1-rm-assign"}).json()
+        a = [b for b in board["batches"] if b["id"] == bid1][0]["assignments"][0]
+        r = c.post(P2 + f"/assignments/{a['id']}/delete",
+                   json={"rev": a["rev"], "op_id": "ou1-rm-del"})
+        check("назначение снято", r.status_code == 200, r.text[:140])
+
+        # Строки назначения больше нет — значит и спросить её историю нельзя.
+        # Это не дефект ручки, а причина, по которой рассказывать обязаны
+        # материал и партия: они-то на доске остались.
+        gone = c.get(P2 + "/events", params={"entity": "assignment",
+                                             "id": a["id"]})
+        check("история САМОГО назначения после снятия недоступна — строки нет",
+              gone.status_code == 404, f"{gone.status_code} {gone.text[:80]}")
+
+        mev = [e for e in _ou1_events(c, "material", mid)
+               if e["action"] == "unassign"]
+        check("история МАТЕРИАЛА объясняет, куда делся метраж",
+              len(mev) == 1, _ou1_text(_ou1_events(c, "material", mid))[:300])
+        check("и называет количество и партию",
+              bool(mev) and "40" in mev[0]["new"]
+              and "Первая закладка" in mev[0]["new"], str(mev[:1])[:220])
+
+        bev = [e for e in _ou1_events(c, "batch", bid1)
+               if e["action"] == "unassign"]
+        check("история ПАРТИИ говорит о том же снятии",
+              len(bev) == 1, _ou1_text(_ou1_events(c, "batch", bid1))[:300])
+        check("и называет материал и количество",
+              bool(bev) and "Ткань ОУ" in bev[0]["new"] and "40" in bev[0]["new"],
+              str(bev[:1])[:220])
+    finally:
+        c.close()
+
+
+def _ou1_archive_visible() -> None:
+    print("\n== Находка 2: партию убрали целиком — метраж объяснён у материала ==")
+    c, mid, bid1, _ = _ou1_setup("sp-ou1-ar@test.io", "Бренд ОУ Архив")
+    try:
+        board = c.post(P2 + "/assignments",
+                       json={"material_id": mid, "batch_id": bid1, "qty": "40",
+                             "op_id": "ou1-ar-assign"}).json()
+        brev = [b for b in board["batches"] if b["id"] == bid1][0]["rev"]
+        r = c.post(P2 + f"/batches/{bid1}/archive",
+                   json={"rev": brev, "op_id": "ou1-ar-arch"})
+        check("партия убрана вместе с назначениями", r.status_code == 200,
+              r.text[:140])
+        mev = [e for e in _ou1_events(c, "material", mid)
+               if e["action"] == "unassign"]
+        check("у материала записано, что метраж снят вместе с партией",
+              len(mev) == 1 and "Первая закладка" in mev[0]["new"]
+              and "40" in mev[0]["new"],
+              _ou1_text(_ou1_events(c, "material", mid))[:300])
+
+        arch = c.post(P2 + f"/batches/{bid1}/restore", json={"op_id": "ou1-ar-res"})
+        check("партия возвращена", arch.status_code == 200, arch.text[:140])
+        mev2 = [e for e in _ou1_events(c, "material", mid)
+                if e["action"] == "assign"]
+        # Первое `assign` — само назначение, второе — возврат вместе с партией.
+        check("и возврат метража в распределение тоже записан у материала",
+              len(mev2) == 2, _ou1_text(_ou1_events(c, "material", mid))[:340])
+    finally:
+        c.close()
+
+
+def _ou1_no_backfill() -> None:
+    print("\n== Находка 2: старым назначениям история не дорисовывается ==")
+    c, mid, bid1, _ = _ou1_setup("sp-ou1-nb@test.io", "Бренд ОУ Без Выдумок")
+    org = _ou1_org_id("Бренд ОУ Без Выдумок")
+    try:
+        # Назначение, заведённое В ОБХОД слоя, — это и есть строка, дожившая до
+        # пакета с прежних времён: она в базе есть, а событий у неё нет и
+        # взяться им неоткуда. История обязана молчать про неё, а не
+        # пересказывать текущее состояние доски как прошлое.
+        con = sqlite3.connect(DB_PATH)
+        try:
+            con.execute(
+                "INSERT INTO supply_assignments"
+                " (org_id, material_id, batch_id, qty, note, author,"
+                "  rev, created_at, updated_at)"
+                " VALUES (?,?,?,?,'','Прежний владелец',1,"
+                "         datetime('now'), datetime('now'))",
+                (org, mid, bid1, 33.0))
+            con.commit()
+        finally:
+            con.close()
+
+        board = c.get(P2).json()
+        shown = [m for m in board["materials"] if m["id"] == mid][0]
+        check("строка без журнала на доске видна — данные не тронуты",
+              abs(float(shown["assigned"]) - 33.0) < 1e-9, str(shown["assigned"]))
+        mev = _ou1_events(c, "material", mid)
+        check("а в истории материала про неё нет ни одного события",
+              not [e for e in mev
+                   if e["action"] in ("assign", "move", "move_in", "unassign")],
+              _ou1_text(mev)[:300])
+        bev = _ou1_events(c, "batch", bid1)
+        check("и в истории партии тоже нет",
+              not [e for e in bev
+                   if e["action"] in ("assign", "move", "move_in", "unassign")],
+              _ou1_text(bev)[:300])
+    finally:
+        c.close()
+
+
+def _ou1_tenant() -> None:
+    print("\n== Находка 2: история одной организации не знает о соседней ==")
+    a_c, a_mid, a_b1, _ = _ou1_setup("sp-ou1-t1@test.io", "Бренд ОУ Первый")
+    b_c, b_mid, b_b1, _ = _ou1_setup("sp-ou1-t2@test.io", "Бренд ОУ Второй")
+    try:
+        a_c.post(P2 + "/assignments",
+                 json={"material_id": a_mid, "batch_id": a_b1, "qty": "40",
+                       "op_id": "ou1-t1-assign"})
+        b_c.post(P2 + "/assignments",
+                 json={"material_id": b_mid, "batch_id": b_b1, "qty": "7",
+                       "op_id": "ou1-t2-assign"})
+        # Названия у обеих организаций НАМЕРЕННО одинаковые (фикстура одна), а
+        # числа разные: различать истории по совпадающим именам нечем, и
+        # проверка, которая «проходит» на одинаковых данных, ничего не доказала
+        # бы. Разделяет их количество — оно у каждой своё.
+        a_ev = [e for e in _ou1_events(a_c, "material", a_mid)
+                if e["action"] == "assign"]
+        b_ev = [e for e in _ou1_events(b_c, "material", b_mid)
+                if e["action"] == "assign"]
+        check("у первой организации ровно одно своё назначение и ничего чужого",
+              len(a_ev) == 1 and "40" in a_ev[0]["new"] and "7" not in a_ev[0]["new"],
+              str(a_ev)[:240])
+        check("у второй — ровно одно своё и ничего чужого",
+              len(b_ev) == 1 and "7" in b_ev[0]["new"] and "40" not in b_ev[0]["new"],
+              str(b_ev)[:240])
+        foreign = b_c.get(P2 + "/events",
+                          params={"entity": "material", "id": a_mid})
+        missing = b_c.get(P2 + "/events",
+                          params={"entity": "material", "id": 999999})
+        check("чужая история даёт 404", foreign.status_code == 404,
+              f"{foreign.status_code} {foreign.text[:80]}")
+        check("и несуществующая отвечает тем же самым",
+              missing.status_code == 404 and missing.text == foreign.text,
+              f"{missing.status_code} {missing.text[:80]}")
+        fb = b_c.get(P2 + "/events", params={"entity": "batch", "id": a_b1})
+        check("чужая партия — тоже 404", fb.status_code == 404,
+              f"{fb.status_code} {fb.text[:80]}")
+    finally:
+        a_c.close()
+        b_c.close()
+
+
+def _ou1_duplicate_hypothesis() -> None:
+    """Находка 1, отдельно: «второй клик удваивает» — ГИПОТЕЗА, а не факт.
+
+    Владелец сообщил, что после удавшегося назначения форма остаётся рабочей.
+    Отсюда легко сделать вывод «значит второй клик создаёт второе назначение» —
+    но вывод этот проверяется, а не принимается. Ниже воспроизведено ровно то,
+    что делает страница: ПОВТОР БЕЗ ПРАВОК уходит с тем же `op_id`, и ручка
+    гасит его замком поступка. Значит гипотеза в этой формулировке НЕ
+    подтверждается.
+
+    Что подтверждается — рядом, в том же шаге: удваивает не «второй клик», а
+    второй ОТЛИЧАЮЩИЙСЯ поступок. Страница сбрасывает `op_id` на любой правке
+    поля, поэтому человек, поправивший количество в оставшейся открытой форме,
+    отправляет НОВЫЙ поступок, и метраж законно прибавляется. Вот почему
+    исправление находки 1 — закрыть форму после успеха, а не «запретить второй
+    запрос».
+    """
+    print("\n== Находка 1: гипотеза второго клика проверяется, а не принимается ==")
+    c, mid, bid1, _ = _ou1_setup("sp-ou1-dup@test.io", "Бренд ОУ Повтор")
+    try:
+        body = {"material_id": mid, "batch_id": bid1, "qty": "40",
+                "op_id": "ou1-dup-same"}
+        first = c.post(P2 + "/assignments", json=body)
+        second = c.post(P2 + "/assignments", json=body)
+        check("повтор того же поступка отвечает успехом, а не отказом",
+              first.status_code == 200 and second.status_code == 200,
+              f"{first.status_code}/{second.status_code}")
+        mat = [m for m in second.json()["materials"] if m["id"] == mid][0]
+        check("ГИПОТЕЗА НЕ ПОДТВЕРЖДЕНА: второй клик без правок не удвоил метраж",
+              abs(float(mat["assigned"]) - 40.0) < 1e-9, str(mat["assigned"]))
+        check("и второй записи в истории тоже не появилось",
+              len([e for e in _ou1_events(c, "material", mid)
+                   if e["action"] == "assign"]) == 1,
+              _ou1_text(_ou1_events(c, "material", mid))[:300])
+
+        # А вот это — настоящая цена оставшейся открытой формы: правка поля
+        # делает поступок другим, и слой обязан его выполнить. Запрещать это
+        # нельзя — повторное назначение законно (D-55).
+        again = c.post(P2 + "/assignments",
+                       json={"material_id": mid, "batch_id": bid1, "qty": "50",
+                             "op_id": "ou1-dup-other"})
+        mat2 = [m for m in again.json()["materials"] if m["id"] == mid][0]
+        check("а ДРУГОЙ поступок прибавляется — законное повторное назначение цело",
+              abs(float(mat2["assigned"]) - 90.0) < 1e-9, str(mat2["assigned"]))
+    finally:
+        c.close()
+
+
+def _ou1_contracts() -> None:
+    print("\n== Находки 1 и 2: readonly, редакция и права записи не ослаблены ==")
+    import bcrypt
+    c, mid, bid1, bid2 = _ou1_setup("sp-ou1-ct@test.io", "Бренд ОУ Контракты")
+    org = _ou1_org_id("Бренд ОУ Контракты")
+    member = client()
+    try:
+        board = c.post(P2 + "/assignments",
+                       json={"material_id": mid, "batch_id": bid1, "qty": "40",
+                             "op_id": "ou1-ct-assign"}).json()
+        a = [b for b in board["batches"] if b["id"] == bid1][0]["assignments"][0]
+
+        stale = c.post(P2 + "/assignments/move",
+                       json={"assignment_id": a["id"], "to_batch_id": bid2,
+                             "qty": "5", "rev": int(a["rev"]) - 1,
+                             "op_id": "ou1-ct-stale"})
+        check("перенос с устаревшей редакцией по-прежнему 409",
+              stale.status_code == 409, f"{stale.status_code} {stale.text[:100]}")
+        check("и ни одной записи в историю такой отказ не положил",
+              not [e for e in _ou1_events(c, "batch", bid2)
+                   if e["action"] in ("move", "move_in")],
+              _ou1_text(_ou1_events(c, "batch", bid2))[:240])
+
+        con = sqlite3.connect(DB_PATH)
+        try:
+            pw = bcrypt.hashpw(b"secret123", bcrypt.gensalt()).decode()
+            cur = con.execute(
+                "INSERT INTO users (email, pw_hash, name, created_at)"
+                " VALUES (?,?,?,datetime('now'))",
+                ("sp-ou1-member@test.io", pw, "Участник ОУ"))
+            con.execute("INSERT INTO memberships (user_id, org_id, role)"
+                        " VALUES (?,?,'member')", (cur.lastrowid, org))
+            con.commit()
+        finally:
+            con.close()
+        member.post("/login", data={"email": "sp-ou1-member@test.io",
+                                    "password": "secret123"})
+        rm = member.get(P2 + "/events", params={"entity": "material", "id": mid})
+        check("участник историю читает — это его же карточка, только в прошлом",
+              rm.status_code == 200, f"{rm.status_code} {rm.text[:100]}")
+        check("и видит в ней то самое назначение",
+              rm.status_code == 200
+              and [e for e in rm.json()["events"] if e["action"] == "assign"],
+              rm.text[:200])
+        wm = member.post(P2 + "/assignments",
+                         json={"material_id": mid, "batch_id": bid2, "qty": "1",
+                               "op_id": "ou1-ct-member-write"})
+        check("а писать участнику по-прежнему нельзя", wm.status_code == 403,
+              f"{wm.status_code} {wm.text[:100]}")
+        # У партии есть своя запись о создании — её отказ участника не отменяет.
+        # Проверяется отсутствие именно записи о назначении.
+        check("и его отказ ничего не записал в историю партии",
+              not [e for e in _ou1_events(c, "batch", bid2)
+                   if e["action"] in ("assign", "move", "move_in", "unassign")],
+              _ou1_text(_ou1_events(c, "batch", bid2))[:200])
+    finally:
+        member.close()
+        c.close()
+
+
+# ── Корректив по ревью PR #59, тред r4062457720 ─────────────────────────────
+#
+# Пропущенный путь записи того же класса, что закрыт в D-62. Прямая правка
+# количества назначения (`POST /assignments/{id}/update` с `qty`) меняет
+# `row.qty`, но пишет об этом ТОЛЬКО в журнал самой строки назначения. История
+# материала и партии её не видит, а снятие эту строку УДАЛЯЕТ — вместе с
+# единственным следом правки.
+#
+# ПУТЬ СЕГОДНЯ ТОЛЬКО ПРОГРАММНЫЙ, и это сказано вслух, а не обойдено молчанием:
+# страница `/supply` ручку `/assignments/{id}/update` не вызывает ни разу.
+# Дефект от этого не перестаёт быть дефектом — ручка опубликована и закрыта
+# `require_owner_api`, — но браузерного воспроизведения у него нет, и
+# `tests/test_supply_ui.py` этот корректив не трогает по ЭТОЙ причине.
+
+
+def _ou1_qty_alloc(events: list) -> list:
+    """Записи о движении метража — те, что читает человек на карточке."""
+    return [e for e in events
+            if e["action"] in ("assign", "move", "move_in", "unassign",
+                               "reassign")]
+
+
+def _ou1_qty_edit_visible() -> None:
+    """Последовательность из замечания ревью: назначить 40 → 70 → снять.
+
+    До корректива история материала показывала `назначено 40`, а следом
+    `снято назначение 70`, и тридцати метров не объяснял никто. Собственное
+    событие правки существовало, но лежало на строке назначения, которую
+    снятие удаляет, — после чего спросить его нельзя вовсе.
+    """
+    print("\n== Корректив: прямая правка количества видна материалу и партии ==")
+    c, mid, bid1, _ = _ou1_setup("sp-ou1-qe@test.io", "Бренд ОУ Правка")
+    try:
+        board = c.post(P2 + "/assignments",
+                       json={"material_id": mid, "batch_id": bid1, "qty": "40",
+                             "op_id": "ou1-qe-assign"}).json()
+        a = [b for b in board["batches"] if b["id"] == bid1][0]["assignments"][0]
+        upd = c.post(P2 + f"/assignments/{a['id']}/update",
+                     json={"qty": "70", "rev": a["rev"], "op_id": "ou1-qe-upd"})
+        check("правка количества принята", upd.status_code == 200, upd.text[:140])
+        after = [m for m in upd.json()["materials"] if m["id"] == mid][0]
+        check("и это ЗАМЕНА, а не прибавка: назначено 70, а не 110",
+              abs(float(after["assigned"]) - 70.0) < 1e-9, str(after["assigned"]))
+
+        mev = [e for e in _ou1_events(c, "material", mid)
+               if e["action"] == "reassign"]
+        check("история МАТЕРИАЛА называет правку количества",
+              len(mev) == 1, _ou1_text(_ou1_events(c, "material", mid))[:320])
+        check("и в ней видно и БЫЛО, и СТАЛО, и единица, и партия",
+              bool(mev) and "40" in mev[0]["new"] and "70" in mev[0]["new"]
+              and "м" in mev[0]["new"] and "Первая закладка" in mev[0]["new"],
+              str(mev[:1])[:260])
+        check("у записи есть автор и время",
+              bool(mev) and mev[0]["author"] == "Владелец"
+              and mev[0]["at"] and mev[0]["at_label"], str(mev[:1])[:260])
+
+        bev = [e for e in _ou1_events(c, "batch", bid1)
+               if e["action"] == "reassign"]
+        check("история ПАРТИИ называет ту же правку",
+              len(bev) == 1, _ou1_text(_ou1_events(c, "batch", bid1))[:320])
+        check("и называет материал, БЫЛО и СТАЛО",
+              bool(bev) and "Ткань ОУ" in bev[0]["new"]
+              and "40" in bev[0]["new"] and "70" in bev[0]["new"],
+              str(bev[:1])[:260])
+
+        # Снятие — третий шаг последовательности. После него строки назначения
+        # нет, и её собственная история недоступна: ровно поэтому рассказывать
+        # обязаны материал и партия.
+        board2 = c.get(P2).json()
+        live = [b for b in board2["batches"]
+                if b["id"] == bid1][0]["assignments"][0]
+        rm = c.post(P2 + f"/assignments/{live['id']}/delete",
+                    json={"rev": live["rev"], "op_id": "ou1-qe-del"})
+        check("назначение снято", rm.status_code == 200, rm.text[:140])
+        gone = c.get(P2 + "/events", params={"entity": "assignment",
+                                             "id": live["id"]})
+        check("история самой строки после снятия недоступна — строки нет",
+              gone.status_code == 404, f"{gone.status_code} {gone.text[:80]}")
+
+        # ГЛАВНАЯ ПРОВЕРКА ШАГА: рассказ материала сходится сам с собой.
+        # Три записи подряд, в обратном порядке (свежее сверху): сняли 70,
+        # до этого 40 стало 70, до этого назначили 40. Тридцать метров больше
+        # не появляются ниоткуда.
+        story = _ou1_qty_alloc(_ou1_events(c, "material", mid))
+        check("рассказ материала закрыт: снято 70 ← было 40→70 ← назначено 40",
+              len(story) == 3
+              and story[0]["action"] == "unassign" and "70" in story[0]["new"]
+              and story[1]["action"] == "reassign"
+              and "40" in story[1]["new"] and "70" in story[1]["new"]
+              and story[2]["action"] == "assign" and "40" in story[2]["new"],
+              _ou1_text(story)[:340])
+        bstory = _ou1_qty_alloc(_ou1_events(c, "batch", bid1))
+        check("и рассказ партии закрыт тем же самым", len(bstory) == 3
+              and [e["action"] for e in bstory] == ["unassign", "reassign",
+                                                    "assign"],
+              _ou1_text(bstory)[:340])
+    finally:
+        c.close()
+
+
+def _ou1_qty_edit_quiet() -> None:
+    """Движения метража не было — значит и записи о нём быть не должно.
+
+    Два случая, и оба легко испортить одной лишней строкой: правка ТЕМ ЖЕ
+    количеством и правка ТОЛЬКО заметки. Выдуманное движение в истории хуже
+    отсутствующего: по нему человек будет искать метраж, которого никто не
+    трогал.
+    """
+    print("\n== Корректив: no-op и правка заметки не выдумывают движения ==")
+    c, mid, bid1, _ = _ou1_setup("sp-ou1-qq@test.io", "Бренд ОУ Тишина")
+    try:
+        board = c.post(P2 + "/assignments",
+                       json={"material_id": mid, "batch_id": bid1, "qty": "40",
+                             "note": "на манжеты",
+                             "op_id": "ou1-qq-assign"}).json()
+        a = [b for b in board["batches"] if b["id"] == bid1][0]["assignments"][0]
+        before_m = len(_ou1_qty_alloc(_ou1_events(c, "material", mid)))
+        before_b = len(_ou1_qty_alloc(_ou1_events(c, "batch", bid1)))
+
+        same = c.post(P2 + f"/assignments/{a['id']}/update",
+                      json={"qty": "40", "rev": a["rev"], "op_id": "ou1-qq-same"})
+        check("правка тем же количеством принята", same.status_code == 200,
+              same.text[:140])
+        still = [b for b in same.json()["batches"]
+                 if b["id"] == bid1][0]["assignments"][0]
+        check("и редакция не сдвинулась — правки не было (D-60 п. 6)",
+              still["rev"] == a["rev"], f"{a['rev']} → {still['rev']}")
+        check("и ни одной записи о движении метража не добавилось",
+              len(_ou1_qty_alloc(_ou1_events(c, "material", mid))) == before_m
+              and len(_ou1_qty_alloc(_ou1_events(c, "batch", bid1))) == before_b,
+              _ou1_text(_ou1_events(c, "material", mid))[:280])
+
+        note = c.post(P2 + f"/assignments/{a['id']}/update",
+                      json={"note": "переписали объяснение",
+                            "rev": still["rev"], "op_id": "ou1-qq-note"})
+        check("правка только заметки принята", note.status_code == 200,
+              note.text[:140])
+        check("количество при этом не трогали",
+              abs(float([m for m in note.json()["materials"]
+                         if m["id"] == mid][0]["assigned"]) - 40.0) < 1e-9,
+              str([m for m in note.json()["materials"] if m["id"] == mid][0]))
+        check("и движения метража она тоже не выдумала",
+              len(_ou1_qty_alloc(_ou1_events(c, "material", mid))) == before_m
+              and len(_ou1_qty_alloc(_ou1_events(c, "batch", bid1))) == before_b,
+              _ou1_text(_ou1_events(c, "material", mid))[:280])
+        # Сторож против обратной ошибки: заметка ОБЯЗАНА остаться в журнале
+        # самой строки. Иначе «ничего не добавилось» зеленело бы на дереве, где
+        # правка заметки не пишется вовсе.
+        own = [e for e in _ou1_events(c, "assignment", a["id"])
+               if e["field"] == "note"]
+        check("но сама заметка в журнале назначения записана, как и раньше",
+              len(own) == 1 and own[0]["new"] == "переписали объяснение",
+              str(own[:1])[:220])
+    finally:
+        c.close()
+
+
+def _ou1_qty_edit_contracts() -> None:
+    """Отказ — это отсутствие записи, а не запись об отказе.
+
+    Три отказа и один повтор. Каждый обязан оставить историю ровно такой, какой
+    она была: устаревшая редакция, участник без права записи, чужой арендатор и
+    повторённый тем же `op_id` поступок.
+    """
+    print("\n== Корректив: отказ и повтор правки не оставляют лишних записей ==")
+    import bcrypt
+    c, mid, bid1, _ = _ou1_setup("sp-ou1-qc@test.io", "Бренд ОУ Отказы")
+    org = _ou1_org_id("Бренд ОУ Отказы")
+    member = client()
+    stranger = client()
+    try:
+        board = c.post(P2 + "/assignments",
+                       json={"material_id": mid, "batch_id": bid1, "qty": "40",
+                             "op_id": "ou1-qc-assign"}).json()
+        a = [b for b in board["batches"] if b["id"] == bid1][0]["assignments"][0]
+        base_m = len(_ou1_qty_alloc(_ou1_events(c, "material", mid)))
+        base_b = len(_ou1_qty_alloc(_ou1_events(c, "batch", bid1)))
+
+        stale = c.post(P2 + f"/assignments/{a['id']}/update",
+                       json={"qty": "70", "rev": int(a["rev"]) - 1,
+                             "op_id": "ou1-qc-stale"})
+        check("устаревшая редакция по-прежнему 409", stale.status_code == 409,
+              f"{stale.status_code} {stale.text[:110]}")
+
+        pw = bcrypt.hashpw(b"secret123", bcrypt.gensalt()).decode()
+        con = sqlite3.connect(DB_PATH)
+        try:
+            cur = con.execute(
+                "INSERT INTO users (email, pw_hash, name, created_at)"
+                " VALUES (?,?,?,datetime('now'))",
+                ("sp-ou1-qc-member@test.io", pw, "Участник Правок"))
+            con.execute("INSERT INTO memberships (user_id, org_id, role)"
+                        " VALUES (?,?,'member')", (cur.lastrowid, org))
+            con.commit()
+        finally:
+            con.close()
+        member.post("/login", data={"email": "sp-ou1-qc-member@test.io",
+                                    "password": "secret123"})
+        wm = member.post(P2 + f"/assignments/{a['id']}/update",
+                         json={"qty": "70", "rev": a["rev"],
+                               "op_id": "ou1-qc-member"})
+        check("участнику писать по-прежнему нельзя", wm.status_code == 403,
+              f"{wm.status_code} {wm.text[:110]}")
+
+        register(stranger, "sp-ou1-qc-far@test.io", "Бренд ОУ Чужой Правок")
+        fr = stranger.post(P2 + f"/assignments/{a['id']}/update",
+                           json={"qty": "70", "op_id": "ou1-qc-far"})
+        check("чужое назначение даёт 404, а не отказ по правам",
+              fr.status_code == 404, f"{fr.status_code} {fr.text[:110]}")
+
+        check("после ТРЁХ отказов история не выросла ни на строку",
+              len(_ou1_qty_alloc(_ou1_events(c, "material", mid))) == base_m
+              and len(_ou1_qty_alloc(_ou1_events(c, "batch", bid1))) == base_b,
+              _ou1_text(_ou1_events(c, "material", mid))[:280])
+        check("и количество осталось прежним",
+              abs(_ou1_assigned_of(c, mid) - 40.0) < 1e-9,
+              str(_ou1_assigned_of(c, mid)))
+
+        # ПОВТОР ТОГО ЖЕ ПОСТУПКА. Замок `check_op` обязан узнать его и не
+        # применить правку второй раз — ни числом, ни записью в истории.
+        body = {"qty": "70", "rev": a["rev"], "op_id": "ou1-qc-once"}
+        first = c.post(P2 + f"/assignments/{a['id']}/update", json=body)
+        second = c.post(P2 + f"/assignments/{a['id']}/update", json=body)
+        check("повтор отвечает успехом, а не отказом",
+              first.status_code == 200 and second.status_code == 200,
+              f"{first.status_code}/{second.status_code}")
+        check("количество применено ОДИН раз: 70, а не 100",
+              abs(_ou1_assigned_of(c, mid) - 70.0) < 1e-9,
+              str(_ou1_assigned_of(c, mid)))
+        check("и запись о правке в истории ровно одна на каждой стороне",
+              len([e for e in _ou1_events(c, "material", mid)
+                   if e["action"] == "reassign"]) == 1
+              and len([e for e in _ou1_events(c, "batch", bid1)
+                       if e["action"] == "reassign"]) == 1,
+              _ou1_text(_ou1_events(c, "material", mid))[:300])
+    finally:
+        stranger.close()
+        member.close()
+        c.close()
+
+
+def _ou1_assigned_of(c, mid: int) -> float:
+    row = [m for m in c.get(P2).json()["materials"] if m["id"] == mid]
+    return float(row[0]["assigned"]) if row else -1.0
 
 
 def main() -> int:
