@@ -281,6 +281,9 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
              lambda: step_fractions(page, c, names)),
             ("ответ прошлой панели не портит новую",
              lambda: step_stale_callbacks(page, c, names)),
+            # Корректив B: регресс, внесённый коррективом A.
+            ("новое открытие получает рабочую кнопку",
+             lambda: step_save_button_fresh(page, c, names)),
         )
         for label, run_step in steps:
             try:
@@ -828,6 +831,124 @@ def step_stale_callbacks(page, c, names) -> None:
         check("чужой ошибки на экране нет", _err_text(page) == "",
               _err_text(page)[:200])
     finally:
+        try:
+            page.unroute(route)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _save_disabled(page):
+    return page.evaluate(
+        "() => { const b = document.getElementById('rc-save');"
+        " return b ? b.disabled : null; }")
+
+
+def _click_save(page) -> None:
+    """Нажать и НЕ ждать завершения: запрос в этом шаге держится нарочно."""
+    page.evaluate("() => { const b = document.getElementById('rc-save');"
+                  " if (b) b.click(); }")
+    page.wait_for_timeout(300)
+
+
+def step_save_button_fresh(page, c, names) -> None:
+    """Регресс корректива A: кнопка «Записать приход» одна на всю страницу.
+
+    Отправка выключает её, а завершающий шаг включает обратно — но ТОЛЬКО
+    своему открытию (охрана по поколению, и она верна). Беда в том, что новое
+    открытие панели состояние кнопки не задавало вовсе: если предыдущая
+    отправка ещё не завершилась, человек открывал следующую панель с уже
+    выключённой кнопкой, а опоздавший ответ её включить отказывался — по делу.
+    Главное действие экрана оставалось мёртвым до перезагрузки страницы.
+
+    Проверка целиком клиентская: POST задерживается маршрутом браузера и
+    отпускается набором. Параллельных запросов к серверу нет.
+    """
+    print("\n== Новое открытие панели получает рабочую кнопку ==")
+    a_id = make_order(c, "Кнопка А", [{"base_name": names[0], "qty": 10}])
+    b_id = make_order(c, "Кнопка Б", [{"base_name": names[1], "qty": 8}])
+    open_replenish(page)
+
+    held = []
+    route = "**/api/orders/*/receipts"
+
+    def hold_posts(r):
+        if r.request.method == "POST":
+            held.append(r)
+            return
+        r.continue_()
+
+    page.route(route, hold_posts)
+    try:
+        # 1. Отправка по заказу А зависает.
+        open_receipts(page, a_id)
+        _fill_line(page, names[0], "4")
+        _click_save(page)
+        check("во время отправки кнопка выключена", _save_disabled(page) is True,
+              str(_save_disabled(page)))
+        check("запрос А задержан", len(held) == 1, str(len(held)))
+
+        # 2. Человек закрывает А и открывает ДРУГОЙ заказ.
+        page.evaluate("() => document.getElementById('rc-close').click()")
+        page.wait_for_timeout(200)
+        check("панель Б открылась", open_receipts(page, b_id) is True)
+        check("у нового открытия кнопка РАБОЧАЯ, а не унаследованно выключенная",
+              _save_disabled(page) is False, str(_save_disabled(page)))
+
+        # 3. Опоздавший ответ А ничего не чинит и не ломает.
+        held[0].abort()
+        page.wait_for_timeout(1000)
+        check("после завершения старой отправки кнопка Б по-прежнему рабочая",
+              _save_disabled(page) is False, str(_save_disabled(page)))
+        check("и чужой ошибки на экране Б нет", _err_text(page) == "",
+              _err_text(page)[:160])
+
+        # 4. ТОТ ЖЕ ЗАКАЗ: закрыли во время отправки и открыли заново.
+        held.clear()
+        open_receipts(page, a_id)
+        _fill_line(page, names[0], "2")
+        _click_save(page)
+        check("отправка по А снова задержана и кнопка выключена",
+              len(held) == 1 and _save_disabled(page) is True,
+              f"held={len(held)} disabled={_save_disabled(page)}")
+        page.evaluate("() => document.getElementById('rc-close').click()")
+        page.wait_for_timeout(200)
+        check("тот же заказ открыт заново", open_receipts(page, a_id) is True)
+        check("и у него кнопка тоже рабочая",
+              _save_disabled(page) is False, str(_save_disabled(page)))
+        held[0].abort()
+        page.wait_for_timeout(1000)
+        check("опоздавший ответ того же заказа кнопку не выключил",
+              _save_disabled(page) is False, str(_save_disabled(page)))
+
+        # 5. И ОБРАТНОЕ: старое завершение НЕ включает кнопку панели, которая
+        #    сохраняет ПРЯМО СЕЙЧАС. Иначе человек нажал бы второй раз посреди
+        #    собственной отправки.
+        held.clear()
+        open_receipts(page, a_id)
+        _fill_line(page, names[0], "1")
+        _click_save(page)                      # отправка №1 висит
+        page.evaluate("() => document.getElementById('rc-close').click()")
+        page.wait_for_timeout(200)
+        open_receipts(page, b_id)
+        _fill_line(page, names[1], "3")
+        _click_save(page)                      # отправка №2 висит, кнопка off
+        check("обе отправки задержаны, кнопка выключена своей же отправкой",
+              len(held) == 2 and _save_disabled(page) is True,
+              f"held={len(held)} disabled={_save_disabled(page)}")
+        held[0].abort()                        # завершается СТАРАЯ
+        page.wait_for_timeout(1000)
+        check("старое завершение не включило кнопку идущей отправки",
+              _save_disabled(page) is True, str(_save_disabled(page)))
+        held[1].abort()                        # завершается своя
+        page.wait_for_timeout(1000)
+        check("а своё завершение кнопку вернуло",
+              _save_disabled(page) is False, str(_save_disabled(page)))
+    finally:
+        for r in held:
+            try:
+                r.abort()
+            except Exception:  # noqa: BLE001 — маршрут мог быть уже отпущен
+                pass
         try:
             page.unroute(route)
         except Exception:  # noqa: BLE001
