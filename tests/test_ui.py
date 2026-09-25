@@ -33,9 +33,23 @@ HTML» такое не ловит — ловит только запуск ст�
      инкременте; при авторитетном нуле (успешная полная пересборка) —
      тишина. Сама серверная сохранность факта через инкремент —
      tests/test_sync_diag_store.py (часть 2);
-  9) на страницах нет ошибок в консоли.
+  9) на страницах нет ошибок в консоли;
+ 10) сквозной путь оператора целиком в браузере: регистрация формой (включая
+     обязательное согласие, о котором API-вариант не знает вовсе), демо
+     кнопкой, переход в план по ссылке меню, правка ростовки, её сохранение,
+     перезагрузка и повторное открытие, выгрузка кнопкой и разбор скачанной
+     книги. Плюс состояние подключения — ошибка, повтор, неполные данные —
+     на 1400 и на 390.
+
+     Проверки 1-9 намеренно стартуют с готового аккаунта: регистрация и демо
+     там делаются httpx-клиентом ДО запуска браузера. Это правильно для них,
+     но сквозным путём не является — пункт 10 закрывает именно этот разрыв.
 
 Запуск из корня репозитория:  python tests/test_ui.py
+
+Снимки экрана по умолчанию НЕ сохраняются. Чтобы получить их для разбора:
+`OBOROT_UI_ARTIFACTS=/абсолютный/путь/вне/репозитория python tests/test_ui.py`
+— абсолютные пути к файлам набор напечатает в конце.
 
 Нужен Chromium под playwright: `pip install -r requirements-dev.lock` и
 `python -m playwright install chromium`. Каталог браузеров раньше был зашит
@@ -45,9 +59,12 @@ macOS: playwright молча искал браузер не там, не нах�
 `PLAYWRIGHT_BROWSERS_PATH` — работает штатный кэш playwright.
 """
 import os
+import shutil
 import sys
+import tempfile
 import threading
 import time
+import traceback
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -681,6 +698,28 @@ def run() -> int:  # noqa: C901 — сценарный тест: шагов мн
         _pilot_sync_truth(page, base, check, errors)
 
         check("ни одной ошибки в консоли за весь проход", not errors, str(errors[:2]))
+
+        # ── PILOT-BROWSER-JOURNEY-1 ───────────────────────────────────────
+        # Отдельный контекст и отдельная организация: путь начинается с пустой
+        # формы регистрации, а не с готовой сессии, которую тест себе выдал.
+        journey_shots: list[str] = []
+        try:
+            _browser_journey(browser, base, journey_shots)
+            for width in (1400, MOBILE_WIDTH):
+                _connection_states(browser, base, width, journey_shots)
+        except Exception as exc:  # noqa: BLE001 — падение пути обязано стать
+            # отчётом и ненулевым кодом, а не трассировкой без отчёта (D-42).
+            check("сквозной путь в браузере дошёл до конца", False,
+                  f"{type(exc).__name__}: {exc}"[:300])
+            traceback.print_exc()
+        if journey_shots:
+            print("\nСнимки экрана (абсолютные пути):")
+            for shot_path in journey_shots:
+                print(f"  {shot_path}")
+        else:
+            print("\nСнимки экрана не сохранялись: OBOROT_UI_ARTIFACTS не задан "
+                  "— это поведение по умолчанию, а не сбой.")
+
         browser.close()
 
     print(f"\nИтого: {len(PASS)} OK, {len(FAIL)} FAIL")
@@ -954,6 +993,572 @@ def _pilot_sync_truth(page, base, check, errors) -> None:
     check("и сезонная подпись не обещает фоновую догрузку",
           "догружается фоном" not in _season_help(page_src),
           _season_help(page_src)[:220])
+
+
+# ── PILOT-BROWSER-JOURNEY-1: путь оператора целиком в браузере ─────────────
+#
+# Зачем отдельный блок, если набор и так «браузерный». Проверки выше стартуют
+# с готового аккаунта: регистрация и подключение демо делаются httpx-клиентом
+# (строки 179-182) ДО того, как браузер вообще существует (`sync_playwright`
+# — строка 184, запуск Chromium — 186), а браузер получает только готовые
+# cookie. Это законно для тех проверок — им нужен вход в состояние, а не сам
+# вход, — но как доказательство сквозного пути это не годится, и мой прошлый
+# отчёт выдал его за такое доказательство ошибочно.
+#
+# Разница не теоретическая. В форме регистрации есть обязательный чекбокс
+# согласия: браузер без него submit не отправит, а httpx про него не знает
+# вовсе. Точно так же демо-подключение в продукте — это кнопка, анимация на
+# ~2,75 с и переход по `location.href`, а не один POST.
+#
+# Здесь путь проходится так, как его проходит человек: форма регистрации →
+# редиректы продукта → кнопка демо → переход по ссылке в меню → правка
+# ростовки в раскрытой строке → перезагрузка и повторное открытие →
+# выгрузка файла кнопкой и разбор самой книги.
+#
+# Ничего из того, что доказывается, не подменяется: сервер, база и выгрузка
+# настоящие. Синтетические фикстуры стоят только там, где речь о ВНЕШНЕМ
+# источнике (состояние синхронизации) — и только в блоке про подключение.
+
+JOURNEY_EMAIL = "journey@test.io"
+JOURNEY_PASSWORD = "journey-secret-123"
+JOURNEY_ORG = "Бренд Путь"
+JOURNEY_USER = "Оператор Путь"
+MOBILE_WIDTH = 390
+
+
+def _artifact_dir() -> "Path | None":
+    """Каталог для снимков экрана: по умолчанию ВЫКЛЮЧЕН.
+
+    Снимки пишутся, только если человек сам назвал каталог в
+    OBOROT_UI_ARTIFACTS. Путь обязан быть абсолютным и лежать ВНЕ репозитория:
+    снимок, упавший внутрь рабочего дерева, рано или поздно уезжает в коммит.
+
+    Неверный путь — это отказ, а не молчаливый пропуск. Молчаливый пропуск
+    хуже отсутствия снимков: человек считает, что картинки у него есть, и
+    делает по ним вывод, которого никто не делал.
+    """
+    raw = (os.environ.get("OBOROT_UI_ARTIFACTS") or "").strip()
+    if not raw:
+        return None
+    path = Path(raw)
+    if not path.is_absolute():
+        raise RuntimeError(
+            f"OBOROT_UI_ARTIFACTS={raw!r}: нужен АБСОЛЮТНЫЙ путь — "
+            "относительный разрешился бы от текущего каталога запуска.")
+    if path.is_relative_to(ROOT):
+        raise RuntimeError(
+            f"OBOROT_UI_ARTIFACTS={raw!r} лежит внутри репозитория ({ROOT}). "
+            "Снимки экрана туда писать нельзя — назовите каталог вне дерева.")
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _shot(page, adir, shots: list, name: str) -> None:
+    """Снимок экрана, если каталог задан. Абсолютные пути копятся для отчёта."""
+    if adir is None:
+        return
+    target = adir / f"{name}.png"
+    page.screenshot(path=str(target), full_page=True)
+    shots.append(str(target.resolve()))
+
+
+def _close_hint(page) -> None:
+    """Подсказка-модалка перехватывает клики — закрываем, если открыта."""
+    try:
+        is_open = page.evaluate(
+            "() => { const o = document.getElementById('hint-overlay');"
+            " return !!o && o.classList.contains('open'); }")
+    except Exception:  # noqa: BLE001 — страница ещё грузится, подсказки нет
+        return
+    if is_open:
+        page.click("#hint-close")
+        page.wait_for_timeout(200)
+
+
+def _click_past_hint(page, locator, what: str, timeout_ms: int = 30000) -> None:
+    """Клик, закрывая подсказку первого визита, если она всплыла.
+
+    Подсказка открывается не сразу: `templates/_hints.html` показывает её
+    только после трёх запросов (`/api/hints/seen`, прогресс, уроки), и когда
+    именно они ответят — от прогона к прогону разное. Разовое «закрыть перед
+    кликом» поэтому ненадёжно: модалка успевает появиться ПОСЛЕ него и
+    перехватить клик. Человек в этом месте закрывает подсказку и жмёт снова —
+    тест делает ровно это.
+
+    Это не обход дефекта: модалка первого визита — штатное поведение продукта,
+    и падение на ней означало бы проверку таймера подсказки, а не пути.
+    """
+    deadline = time.time() + timeout_ms / 1000
+    last_error = None
+    while time.time() < deadline:
+        _close_hint(page)
+        try:
+            locator.click(timeout=2000)
+            return
+        except Exception as exc:  # noqa: BLE001 — причина уйдёт в отчёт ниже
+            last_error = exc
+            page.wait_for_timeout(200)
+    raise RuntimeError(f"клик по {what} не прошёл за {timeout_ms} мс: {last_error}")
+
+
+def _click_through_hint(page, selector: str, timeout_ms: int = 30000) -> None:
+    _click_past_hint(page, page.locator(selector).first, repr(selector), timeout_ms)
+
+
+def _register_in_browser(page, base: str) -> None:
+    """Регистрация формой, а не POST'ом: со всеми полями, которые видит человек.
+
+    Обязательное согласие — отдельный чекбокс в форме. Без него браузер submit
+    не отправит вообще, и это ровно та часть пути, которой у API-варианта
+    никогда не было.
+    """
+    page.goto(f"{base}/register")
+    page.fill("#name", JOURNEY_USER)
+    page.fill("#org_name", JOURNEY_ORG)
+    page.fill("#email", JOURNEY_EMAIL)
+    page.fill("#password", JOURNEY_PASSWORD)
+    page.check("form[action='/register'] input[type=checkbox]")
+    with page.expect_navigation(wait_until="load", timeout=30000):
+        page.click("form[action='/register'] button[type=submit]")
+
+
+def _open_sized_row(page):
+    """Раскрыть первую строку, у которой ЕСТЬ размерная сетка.
+
+    Безразмерные позиции в демо встречаются, и у них полей ростовки нет вовсе:
+    брать «просто первую строку» — значит иногда искать поле, которого продукт
+    здесь и не рисует, и объявлять это дефектом. Возвращает (base_name, index)
+    или (None, -1), если сеток нет ни у одной строки.
+    """
+    rows = page.locator("#tbody tr[data-base]")
+    total = min(rows.count(), 12)
+    for i in range(total):
+        base_name = rows.nth(i).get_attribute("data-base")
+        _expand_row(page, i)
+        if page.locator(".sub-panel input.size-rec").count() > 0:
+            return base_name, i
+        _expand_row(page, i)  # свернуть обратно
+    return None, -1
+
+
+def _expand_row(page, index: int) -> None:
+    _click_past_hint(page, page.locator("#tbody tr[data-base] .expander").nth(index),
+                     f"раскрытию строки #{index}")
+    page.wait_for_timeout(250)
+
+
+def _goto_plan(page, base: str) -> None:
+    """Открыть «Заказ» и дождаться отрисованной таблицы, а не поспать.
+
+    Ждём именно строки с `data-base`: в `#tbody` изначально стоит заглушка
+    «Загрузка…», и проверка «в таблице что-то есть» зеленела бы на ней.
+    """
+    _close_hint(page)
+    page.wait_for_function(
+        "() => document.querySelectorAll('#tbody tr[data-base]').length > 0",
+        timeout=45000)
+    _close_hint(page)
+
+
+def _size_input(page, size: str):
+    return page.locator(f".sub-panel input.size-rec[data-size='{size}']").first
+
+
+def _parse_replenish_workbook(path: str) -> dict:
+    """Книга «Что заказать» → {позиция: {размер: (кол-во, примечание)}}.
+
+    Разбирается настоящий файл, который скачала страница, а не то, что тест
+    сам себе положил: строки размеров в книге идут отступом «— S» под строкой
+    позиции (app/export_xlsx.py, _replenish_sheet).
+    """
+    from openpyxl import load_workbook
+
+    wb = load_workbook(path, read_only=True, data_only=True)
+    sheet = wb["Что заказать"] if "Что заказать" in wb.sheetnames else wb.worksheets[0]
+    parsed: dict = {}
+    current = None
+    for row in sheet.iter_rows(min_row=3, values_only=True):
+        first = row[0]
+        if not isinstance(first, str) or not first.strip():
+            continue
+        if first.startswith("—"):
+            if current is None:
+                continue
+            size = first.lstrip("—").strip()
+            note = row[14] if len(row) > 14 else ""
+            parsed[current][size] = (row[10], note or "")
+        elif first.startswith("Итого"):
+            current = None
+        else:
+            current = first
+            parsed.setdefault(current, {})
+    wb.close()
+    return parsed
+
+
+def _app_paths() -> list:
+    """Все маршруты приложения, включая вложенные роутеры.
+
+    Плоского `app.routes` тут мало: FastAPI держит подключённые роутеры
+    обёртками (`_IncludedRouter`), у которых своего `path` нет, а настоящие
+    маршруты лежат внутри. Обход только верхнего уровня даёт пустой список —
+    и заявление «такой выгрузки нет» оказалось бы верным просто потому, что
+    тест никуда не заглянул. Обходим вглубь.
+    """
+    def walk(routes, depth=0):
+        found = []
+        for route in routes:
+            path = getattr(route, "path", None)
+            if isinstance(path, str):
+                found.append(path)
+            if depth < 5:
+                nested = getattr(route, "routes", None)
+                if nested:
+                    found += walk(nested, depth + 1)
+                original = getattr(route, "original_router", None)
+                if original is not None:
+                    found += walk(getattr(original, "routes", []), depth + 1)
+        return found
+
+    return sorted(set(walk(oborot_app.routes)))
+
+
+def _export_surface(paths: list) -> list:
+    return sorted(p for p in paths if p.endswith(".xlsx"))
+
+
+def _browser_journey(browser, base: str, shots: list) -> None:  # noqa: C901
+    """Регистрация → демо → план → сохранение → перезаход → выгрузка. В браузере."""
+    from playwright.sync_api import TimeoutError as PWTimeoutError
+
+    adir = _artifact_dir()
+    ctx = browser.new_context(viewport={"width": 1400, "height": 900},
+                              accept_downloads=True)
+    errors: list[str] = []
+    page = ctx.new_page()
+    page.on("pageerror", lambda e: errors.append(str(e)))
+
+    print("\n== Путь в браузере: регистрация формой ==")
+    _register_in_browser(page, base)
+    # Продукт сам решает, куда вести: /register отвечает 303 на «/», а «/» без
+    # подключения уводит на /onboarding. Проверяем, что пришли именно туда,
+    # куда ведёт продукт, а не туда, куда тест сходил бы сам.
+    check("после формы регистрации человек оказался на подключении данных",
+          page.url.rstrip("/").endswith("/onboarding"), page.url)
+    check("сессия создана самим браузером, а не подложена тестом",
+          any(c["name"] == "oborot_session" for c in ctx.cookies()),
+          str([c["name"] for c in ctx.cookies()]))
+    _shot(page, adir, shots, "01-onboarding-1400")
+
+    print("\n== Путь в браузере: демо-данные кнопкой ==")
+    with page.expect_navigation(url=lambda u: "/onboarding" not in u, timeout=60000):
+        _click_through_hint(page, "#btn-connect-demo")
+    check("после демо-подключения продукт увёл на «Оборачиваемость»",
+          page.url.rstrip("/").endswith("/turnover"), page.url)
+    _close_hint(page)
+    _shot(page, adir, shots, "02-turnover-1400")
+
+    print("\n== Путь в браузере: переход в план по ссылке меню ==")
+    with page.expect_navigation(timeout=60000):
+        _click_through_hint(page, "a[href='/replenish']")
+    check("ссылка меню привела на «Заказ»",
+          page.url.rstrip("/").endswith("/replenish"), page.url)
+    _goto_plan(page, base)
+
+    base_name, row_i = _open_sized_row(page)
+    if base_name is None:
+        check("в демо-данных нашлась позиция с размерной сеткой", False,
+              "ни у одной из первых строк нет полей ростовки")
+        ctx.close()
+        return
+    check("в демо-данных нашлась позиция с размерной сеткой",
+          page.locator(".sub-panel input.size-rec").count() > 0, base_name[:60])
+
+    print("\n== Путь в браузере: правка ростовки и сохранение ==")
+    inp = page.locator(".sub-panel input.size-rec").first
+    size = inp.get_attribute("data-size")
+    rec = int(inp.input_value() or "0")
+    target = rec + 7 if rec + 7 <= 9999 else max(0, rec - 7)
+    with page.expect_response(
+            lambda r: "/api/replenish-draft" in r.url
+            and r.request.method == "POST", timeout=30000) as saved:
+        inp.fill(str(target))
+        inp.press("Tab")
+    check("страница сама отправила правку на сервер",
+          saved.value.status == 200, f"HTTP {saved.value.status}")
+    # Ждём подпись, но НЕ падаем на таймауте: молчаливое исключение здесь
+    # унесло бы весь набор в трассировку вместо честного FAIL с текстом,
+    # который реально стоял на экране.
+    try:
+        page.wait_for_function(
+            "() => (document.getElementById('draft-note')||{}).textContent"
+            " === 'Правки сохранены'", timeout=15000)
+    except PWTimeoutError:
+        pass
+    draft_note = (page.text_content("#draft-note") or "").strip()
+    check("человек увидел, что правка сохранена",
+          draft_note == "Правки сохранены",
+          f"на экране: {draft_note[:120]!r} · "
+          f"{base_name[:40]} · {size} · {rec} → {target}")
+    _shot(page, adir, shots, "03-plan-edited-1400")
+
+    print("\n== Путь в браузере: правка переживает перезагрузку ==")
+    page.reload()
+    _goto_plan(page, base)
+    _expand_row(page, row_i)
+    reloaded_base = page.locator("#tbody tr[data-base]").nth(row_i).get_attribute("data-base")
+    check("после перезагрузки это та же позиция", reloaded_base == base_name,
+          f"было {base_name[:40]}, стало {str(reloaded_base)[:40]}")
+    after_reload = _size_input(page, size).input_value()
+    check("после перезагрузки в поле стоит сохранённое число",
+          after_reload == str(target), f"ожидали {target}, в поле {after_reload}")
+    check("строка помечена как правленная вручную",
+          page.locator("#tbody tr[data-base]").nth(row_i).locator(".editmark").count() > 0)
+    check("счётчик сохранённых правок виден",
+          page.locator("#btn-reset-drafts").is_visible())
+
+    print("\n== Путь в браузере: правка переживает повторное открытие ==")
+    page2 = ctx.new_page()
+    page2.on("pageerror", lambda e: errors.append(str(e)))
+    page2.goto(f"{base}/replenish")
+    _goto_plan(page2, base)
+    _expand_row(page2, row_i)
+    reopened = _size_input(page2, size).input_value()
+    check("в новой вкладке — та же позиция и то же число",
+          page2.locator("#tbody tr[data-base]").nth(row_i)
+          .get_attribute("data-base") == base_name and reopened == str(target),
+          f"ожидали {target}, в поле {reopened}")
+    page2.close()
+
+    print("\n== Путь в браузере: выгрузка кнопкой и разбор книги ==")
+    with page.expect_download(timeout=60000) as dl:
+        _click_through_hint(page, "#btn-export-xlsx")
+    download = dl.value
+    check("файл отдан под именем, которое человек видит в продукте",
+          download.suggested_filename == "Что заказать.xlsx",
+          download.suggested_filename)
+    out_dir = tempfile.mkdtemp(prefix="oborot-journey-")
+    saved_xlsx = os.path.join(out_dir, "replenish.xlsx")
+    download.save_as(saved_xlsx)
+    book = _parse_replenish_workbook(saved_xlsx)
+    sizes_in_book = book.get(base_name, {})
+    cell = sizes_in_book.get(size)
+    check("позиция и её размер есть в скачанной книге", cell is not None,
+          f"позиция {base_name[:40]}, размер {size}, "
+          f"в книге размеры: {sorted(sizes_in_book)[:8]}")
+    if cell is not None:
+        check("в книге стоит сохранённое человеком количество, а не расчёт",
+              cell[0] == target, f"ожидали {target}, в книге {cell[0]} (расчёт был {rec})")
+        check("книга подписывает, что число правлено вручную",
+              "правлено вручную" in str(cell[1]), str(cell[1])[:120])
+    shutil.rmtree(out_dir, ignore_errors=True)
+
+    print("\n== Какая именно выгрузка существует, а какой в продукте нет ==")
+    # Скачанный артефакт — это РЕКОМЕНДАЦИИ «что заказать» в состоянии экрана
+    # (app/routes_extra.py:744-754: расчёт → условия производства → ручные
+    # правки ростовки). Это НЕ выгрузка сохранённого плана заказа.
+    #
+    # Разница здесь не словесная. Сохранённый план заказа в продукте
+    # существует отдельной сущностью: POST /api/order-plan кладёт OrderPlan с
+    # брифом и расчётом, есть история и превращение плана в заказ
+    # (/api/order-plan/{id}/apply). Выгрузки у этой сущности нет ни одной.
+    #
+    # Поэтому пробел называется ровно так: план заказа в продукте есть,
+    # выгрузки плана заказа — нет. Ни того, ни другого тест не придумывает и
+    # не добавляет; факт берётся из таблицы маршрутов самого приложения.
+    paths = _app_paths()
+    surface = _export_surface(paths)
+    check("таблица маршрутов вообще прочитана (иначе «ничего нет» ничего не значит)",
+          len(paths) > 50 and len(surface) > 0, f"{len(paths)} маршрутов, выгрузок {len(surface)}")
+    check("скачанное — выгрузка рекомендаций «Что заказать»",
+          "/api/export/replenish.xlsx" in surface, str(surface))
+    check("сохранённый план заказа в продукте есть",
+          "/api/order-plan" in paths and "/api/order-plan/history" in paths,
+          str([p for p in paths if "order-plan" in p][:4]))
+    # Именно префиксы, а не поиск слова где угодно: /api/supply/planning/…
+    # — это планирование МАТЕРИАЛОВ из другой части продукта, и путать его с
+    # планом заказа значило бы закрыть пробел на бумаге.
+    order_exports = [p for p in surface
+                     if p.startswith("/api/order-plan") or p.startswith("/api/orders")]
+    check("а выгрузки сохранённого плана заказа нет — существующий пробел продукта",
+          not order_exports, f"выгрузки: {surface}")
+
+    check("ни одной ошибки в консоли за весь путь", not errors, str(errors[:2]))
+    ctx.close()
+
+
+SYNC_ERROR_TEXT = "Синхронизация прервана: источник не ответил"
+
+
+def _sync_state_routes(page, state: dict, settings_patch: dict) -> None:
+    """Синтетическое состояние ВНЕШНЕГО источника — и только оно.
+
+    Подменяются два ответа: карточка подключения (иначе блок синхронизации не
+    рисуется вовсе — он только для владельца с подключённым МойСкладом) и
+    состояние синка. Сам экран, его разметка и его логика — настоящие; это
+    ровно тот приём, которым в этом наборе уже проверяется DATA-8.
+
+    /api/settings именно ДОПОЛНЯЕТСЯ, а не заменяется: страница читает оттуда
+    много несвязанных настроек, и выдуманный целиком ответ проверял бы
+    отрисовку выдуманного продукта.
+    """
+    def settings_handler(route):
+        resp = route.fetch()
+        data = resp.json()
+        data.update(settings_patch)
+        route.fulfill(response=resp, json=data)
+
+    page.route("**/api/settings", settings_handler)
+    page.route("**/api/sync/status", lambda route: route.fulfill(json=state))
+
+
+def _fits_viewport(page, selector: str, width: int) -> bool:
+    """Элемент виден целиком в окне и не обрезан по горизонтали.
+
+    Проверка именно про чтение: на 390 сообщение об ошибке, уехавшее за
+    правый край, формально «на странице есть», а человеку недоступно.
+    """
+    return page.evaluate(
+        "([sel, w]) => { const el = document.querySelector(sel);"
+        " if (!el) return false;"
+        " const r = el.getBoundingClientRect();"
+        " if (r.width <= 0 || r.height <= 0) return false;"
+        " return r.left >= -1 && r.right <= w + 1"
+        "   && el.scrollWidth <= el.clientWidth + 1; }",
+        [selector, width])
+
+
+def _selfcheck_fits_viewport(page, width: int) -> None:
+    """Проверка обрезки обязана уметь возвращать False — иначе она украшение.
+
+    Ставим на страницу два заведомо разных элемента: один шире окна, второй
+    нормальный, — и убеждаемся, что помощник их различает. Без этого «не
+    обрезано» зеленело бы всегда, в том числе на действительно обрезанном
+    экране, и проверка 390 не значила бы ничего.
+    """
+    page.evaluate(
+        "(w) => { const bad = document.createElement('div');"
+        " bad.id = '__probe_bad'; bad.style.cssText ="
+        " 'position:fixed;left:0;top:0;width:' + (w * 3) + 'px;height:20px';"
+        " bad.textContent = 'x';"
+        " const good = document.createElement('div');"
+        " good.id = '__probe_good'; good.style.cssText ="
+        " 'position:fixed;left:0;top:40px;width:50px;height:20px';"
+        " good.textContent = 'x';"
+        " document.body.append(bad, good); }", width)
+    check(f"[{width}] проверка обрезки видит вылезший за экран элемент",
+          _fits_viewport(page, "#__probe_bad", width) is False)
+    check(f"[{width}] и не считает обрезанным поместившийся",
+          _fits_viewport(page, "#__probe_good", width) is True)
+    page.evaluate(
+        "() => { ['__probe_bad', '__probe_good'].forEach(id => {"
+        " const el = document.getElementById(id); if (el) el.remove(); }); }")
+
+
+def _connection_states(browser, base: str, width: int, shots: list) -> None:
+    """Ошибка подключения, повтор и неполнота — на заданной ширине окна.
+
+    Это НЕ ошибки обновления поставок: там другой экран, другая ручка и другая
+    причина. Раньше я предъявил их как доказательство этого пути — ошибочно.
+    """
+    adir = _artifact_dir()
+    tag = f"{width}"
+    ctx = browser.new_context(viewport={"width": width, "height": 900})
+    errors: list[str] = []
+    page = ctx.new_page()
+    page.on("pageerror", lambda e: errors.append(str(e)))
+
+    # Вход настоящей формой, а не подложенной cookie: на узком окне это ещё и
+    # единственная проверка того, что войти оттуда вообще можно.
+    page.goto(f"{base}/login")
+    page.fill("#email", JOURNEY_EMAIL)
+    page.fill("#password", JOURNEY_PASSWORD)
+    with page.expect_navigation(wait_until="load", timeout=30000):
+        page.click("button[type=submit]")
+    check(f"[{tag}] вход формой удался",
+          "/login" not in page.url, page.url)
+
+    settings_patch = {
+        "connection": {"kind": "moysklad", "status": "active", "last_sync_at": None},
+        "role": "owner",
+    }
+    failed = {"state": "error", "mode": "incremental", "phase": "",
+              "progress_pct": 0, "detail": "", "error": SYNC_ERROR_TEXT,
+              "started_at": None, "finished_at": None,
+              "diagnostics": {"sales_docs_skipped_store_unresolved": 0}}
+
+    print(f"\n== [{tag}] подключение: синхронизация упала ==")
+    _sync_state_routes(page, failed, settings_patch)
+    page.goto(f"{base}/settings")
+    page.wait_for_selector("#btn-sync-now", timeout=30000)
+    page.wait_for_function(
+        "() => (document.getElementById('sync-status-line')||{}).textContent",
+        timeout=15000)
+    _selfcheck_fits_viewport(page, width)
+    line = (page.text_content("#sync-status-line") or "").strip()
+    check(f"[{tag}] причину назвал сервер, а не браузер",
+          line == SYNC_ERROR_TEXT, line[:160])
+    check(f"[{tag}] сообщение об ошибке читается целиком, не обрезано",
+          _fits_viewport(page, "#sync-status-line", width), line[:80])
+    check(f"[{tag}] после отказа повтор не заблокирован",
+          not page.locator("#btn-sync-now").is_disabled())
+    _shot(page, adir, shots, f"04-sync-error-{tag}")
+
+    print(f"\n== [{tag}] подключение: повтор — сначала отказ, потом успех ==")
+    page.route("**/api/sync/run", lambda route: route.fulfill(
+        status=500, content_type="application/json",
+        body='{"detail":"Источник снова недоступен"}'))
+    _click_through_hint(page, "#btn-sync-now")
+    page.wait_for_function(
+        "() => !document.getElementById('btn-sync-now').disabled", timeout=15000)
+    check(f"[{tag}] неудачный повтор не запирает кнопку навсегда",
+          not page.locator("#btn-sync-now").is_disabled())
+
+    running = {"state": "running", "mode": "incremental", "phase": "history",
+               "progress_pct": 40, "detail": "Загружаем историю", "error": "",
+               "started_at": None, "finished_at": None, "diagnostics": {}}
+    page.unroute("**/api/sync/run")
+    page.unroute("**/api/sync/status")
+    page.route("**/api/sync/status", lambda route: route.fulfill(json=running))
+    page.route("**/api/sync/run", lambda route: route.fulfill(
+        json={"ok": True, "started": True}))
+    with page.expect_response(
+            lambda r: "/api/sync/run" in r.url
+            and r.request.method == "POST", timeout=30000) as retried:
+        _click_through_hint(page, "#btn-sync-now")
+    check(f"[{tag}] повтор действительно ушёл на сервер",
+          retried.value.status == 200, f"HTTP {retried.value.status}")
+    page.wait_for_function(
+        "() => { const el = document.getElementById('sync-status-line');"
+        " return el && el.textContent.indexOf('Загружаем историю') >= 0; }",
+        timeout=20000)
+    after_retry = (page.text_content("#sync-status-line") or "").strip()
+    check(f"[{tag}] после удачного повтора экран вышел из ошибки",
+          SYNC_ERROR_TEXT not in after_retry and "Загружаем историю" in after_retry,
+          after_retry[:160])
+
+    print(f"\n== [{tag}] подключение: данные неполные ==")
+    incomplete = dict(failed)
+    incomplete.update(state="done", error="", progress_pct=100,
+                      diagnostics={"sales_docs_skipped_store_unresolved": 12})
+    page.unroute("**/api/sync/status")
+    page.unroute("**/api/sync/run")
+    page.route("**/api/sync/status", lambda route: route.fulfill(json=incomplete))
+    page.goto(f"{base}/settings")
+    page.wait_for_selector("#btn-sync-now", timeout=30000)
+    page.wait_for_function(
+        "() => { const b = document.getElementById('sync-diag-hint');"
+        " return b && getComputedStyle(b).display !== 'none'; }", timeout=20000)
+    hint = (page.text_content("#sync-diag-hint") or "").strip()
+    check(f"[{tag}] про неполные данные сказано прямо",
+          "неполн" in hint.lower() and "12" in hint, hint[:200])
+    check(f"[{tag}] предупреждение о неполноте читается целиком, не обрезано",
+          _fits_viewport(page, "#sync-diag-hint", width), hint[:80])
+    _shot(page, adir, shots, f"05-sync-incomplete-{tag}")
+
+    check(f"[{tag}] ни одной ошибки в консоли на экране подключения",
+          not errors, str(errors[:2]))
+    ctx.close()
 
 
 if __name__ == "__main__":
