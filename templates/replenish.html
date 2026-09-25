@@ -925,14 +925,36 @@
      А новое открытие панели — новое намерение и новый ключ. Иначе «защита от
      дубля» съедала бы ДОВОЗ: второй приход того же количества — законный
      факт, а не второе нажатие той же кнопки. */
-  var RC={id:null,key:"",data:null};
+  var RC={id:null,key:"",data:null,gen:0};
 
   function rcKey(){
     return "rc-"+Date.now().toString(36)+"-"+Math.random().toString(36).slice(2,10);
   }
 
+  /* ЧЬЁ ЭТО ОТКРЫТИЕ ПАНЕЛИ (P1 ревью PR #61, r4106171226).
+     Сверять один номер заказа НЕДОСТАТОЧНО, и это не теория: закрыть панель
+     заказа А и открыть её же заново — обычное действие, номер при этом
+     совпадает, и ответ первого, уже брошенного запроса считался бы своим.
+     Поэтому каждое открытие получает свой номер, и его сверяют ВСЕ отложенные
+     обработчики — успех, отказ и завершающий шаг. Панель закрыта — номер не
+     совпадает ни с чем, и опоздавший ответ не трогает ничего. */
+  function rcCurrent(gen){ return RC.id!==null && RC.gen===gen; }
+
+  /* Формат ЧИСЕЛ ПРИЁМКИ — свой, и только для этой панели.
+     Общий `fmt` округляет (`Math.round`), потому что вся остальная страница
+     считает штуки целыми. Но ручка приёмки принимает и хранит дробь (поле
+     ввода объявлено `step="any"`, сервер округляет до трёх знаков), и 0,4
+     превращалось в 0, а -0,4 в -0: клиент подменял факт сервера. Здесь
+     показывается то, что пришло, с той же точностью — не трогая общий
+     форматтер и ничего не меняя в расчётах. */
+  function rcFmt(n){
+    if(n===null||n===undefined||isNaN(n)) return "—";
+    return Number(n).toLocaleString("ru-RU",{maximumFractionDigits:3});
+  }
+
   function openReceipts(orderId){
-    RC.id=orderId; RC.key=rcKey(); RC.data=null;
+    RC.id=orderId; RC.key=rcKey(); RC.data=null; RC.gen=RC.gen+1;
+    var mine=RC.gen;
     var p=document.getElementById("rc-panel");
     /* ПАНЕЛЬ ПЕРЕЕЗЖАЕТ В <body> ПЕРЕД ПЕРВЫМ ПОКАЗОМ, и это не косметика.
        Геометрия у неё верная и без этого (замерено: оверлей ровно по окну,
@@ -957,9 +979,13 @@
     try { document.getElementById("rc-title").focus({preventScroll:true}); }
     catch(e){ document.getElementById("rc-title").focus(); }
     api("/api/orders/"+orderId+"/receipts").then(function(d){
-      if(RC.id!==orderId) return;   /* успели открыть другой заказ */
+      if(!rcCurrent(mine)) return;   /* панель закрыли или открыли заново */
       RC.data=d; renderReceipts(d);
     }).catch(function(e){
+      /* ОТКАЗ ПРОШЛОГО ОТКРЫТИЯ НЕ ИМЕЕТ ПРАВА НИЧЕГО ЧИСТИТЬ. Здесь охраны
+         не было вовсе: опоздавший отказ заказа А стирал строки уже открытой
+         панели Б вместе с набранными в ней числами и показывал чужую ошибку. */
+      if(!rcCurrent(mine)) return;
       document.getElementById("rc-lines").innerHTML="";
       setRcError("Не удалось загрузить приёмку: "+e.message);
     });
@@ -980,15 +1006,15 @@
      значило бы выдать незнание за подтверждённую недостачу. */
   function rcNum(v){
     return (v===null||v===undefined)
-      ? '<span class="rc-unknown">неизвестно</span>' : fmt(v);
+      ? '<span class="rc-unknown">неизвестно</span>' : rcFmt(v);
   }
 
   function renderReceipts(d){
     document.getElementById("rc-title").textContent="Приёмка заказа";
     var got=(d.received_total===null||d.received_total===undefined)
-      ? '<span class="rc-unknown">неизвестно</span>' : fmt(d.received_total);
+      ? '<span class="rc-unknown">неизвестно</span>' : rcFmt(d.received_total);
     document.getElementById("rc-summary").innerHTML=
-      'Заказано: <b>'+fmt(d.ordered_total)+'</b> шт · Принято: <b>'+got+'</b>'+
+      'Заказано: <b>'+rcFmt(d.ordered_total)+'</b> шт · Принято: <b>'+got+'</b>'+
       (d.execution_unknown
         ? ' <span class="rc-unknown">— по части позиций факта нет или источники спорят</span>'
         : '');
@@ -1009,7 +1035,7 @@
     var srcs=Object.keys(d.by_source||{});
     if(srcs.length){
       notes.push('<div>Что сказал каждый источник: '+srcs.map(function(s){
-        return esc(s)+" — "+fmt(d.by_source[s]);
+        return esc(s)+" — "+rcFmt(d.by_source[s]);
       }).join("; ")+'. Итог их НЕ складывает: два источника об одном приходе — не двойная поставка.</div>');
     }
     document.getElementById("rc-notes").innerHTML=notes.join("");
@@ -1019,7 +1045,7 @@
         ? ' <span class="rc-unknown">(не было в заказе)</span>' : '';
       return '<tr data-rc-line="'+esc(ln.base_name)+'">'+
         '<td class="name">'+esc(ln.base_name)+extra+'</td>'+
-        '<td class="nb" data-rc-ordered>'+fmt(ln.ordered_qty)+'</td>'+
+        '<td class="nb" data-rc-ordered>'+rcFmt(ln.ordered_qty)+'</td>'+
         '<td class="nb" data-rc-received>'+rcNum(ln.received_qty)+'</td>'+
         '<td class="nb" data-rc-diff>'+rcNum(ln.diff)+'</td>'+
         '<td class="nb"><input class="input num" type="number" step="any" '+
@@ -1028,7 +1054,7 @@
 
     var hist=(d.receipts||[]).slice().reverse().map(function(r){
       return '<div class="row">'+(r.at?fmtDate(r.at):"—")+' · '+esc(r.base_name)+
-        ' · <b>'+fmt(r.qty)+'</b> · '+esc(r.source)+
+        ' · <b>'+rcFmt(r.qty)+'</b> · '+esc(r.source)+
         (r.precision==="whole_order"?' · <i>допущение</i>':'')+'</div>';
     }).join("");
     /* Обрезка названа ЧИСЛОМ. Молчаливое усечение читается как «это всё». */
@@ -1043,40 +1069,61 @@
      вовсе: «ничего не говорю» и «приехал ноль» — разные вещи, и второе
      отправляется явным нулём. */
   function rcCollect(){
-    var lines=[];
+    var lines=[],bad=null;
     document.querySelectorAll('#rc-lines [data-rc-line]').forEach(function(tr){
       var i=tr.querySelector('input[data-rc-qty]');
       var raw=i?String(i.value).trim():"";
       if(raw==="") return;
       var v=Number(raw.replace(",","."));
-      if(!isFinite(v)) return;
+      /* Непонятное число — тоже НЕ повод молча выбросить строку: человек
+         что-то в неё написал, и это «что-то» он считает своим приходом. */
+      if(!isFinite(v)){ bad=bad||("Не понял количество по позиции «"+
+        tr.getAttribute("data-rc-line")+"». Исправьте или очистите поле."); return; }
       lines.push({base_name:tr.getAttribute("data-rc-line"),qty:v});
     });
     var name=String(document.getElementById("rc-extra-name").value||"").trim();
     var qtyRaw=String(document.getElementById("rc-extra-qty").value||"").trim();
-    if(name&&qtyRaw!==""){
+    /* ПОЛОВИНА УТВЕРЖДЕНИЯ — НЕ УТВЕРЖДЕНИЕ (P1 ревью PR #61, r4106171209).
+       Прежняя редакция брала пару только целиком, а неполную молча
+       выбрасывала. Пока в форме есть хоть одна верная заказанная строка,
+       `lines` оставался непустым, POST уходил и УДАВАЛСЯ — а успех очищал
+       все поля. Названные человеком штуки исчезали без единого слова.
+
+       Теперь неполная пара отклоняет отправку ЦЕЛИКОМ и до запроса: частично
+       записанный приход хуже незаписанного, потому что выглядит записанным. */
+    if(name&&qtyRaw===""){
+      bad=bad||"У позиции вне заказа не указано количество. Впишите его или очистите название.";
+    }else if(!name&&qtyRaw!==""){
+      bad=bad||"У позиции вне заказа не названо название. Впишите его или очистите количество.";
+    }else if(name&&qtyRaw!==""){
       var q=Number(qtyRaw.replace(",","."));
       if(isFinite(q)) lines.push({base_name:name,qty:q});
+      else bad=bad||"Не понял количество позиции вне заказа. Исправьте его или очистите поле.";
     }
-    return lines;
+    return {lines:lines,error:bad};
   }
 
   function saveReceipts(){
     if(!RC.id) return;
-    var lines=rcCollect();
+    var got=rcCollect();
+    /* Отказ ДО запроса и до единой правки полей: ввод человека остаётся
+       ровно таким, каким он его оставил. */
+    if(got.error){ setRcError(got.error); return; }
+    var lines=got.lines;
     if(!lines.length){
       setRcError("Ничего не записано: заполните хотя бы одну позицию. Пустое поле — это «не знаю», и отправлять его нечем.");
       return;
     }
     var btn=document.getElementById("rc-save");
     btn.disabled=true; setRcError("");
+    var mine=RC.gen;
     var orderId=RC.id;
     api("/api/orders/"+orderId+"/receipts",
         {method:"POST",body:{lines:lines,idempotency_key:RC.key}})
       .then(function(d){
         /* УСПЕХ ОБЪЯВЛЯЕТСЯ ТОЛЬКО ПО ПОДТВЕРЖДЁННОМУ ОТВЕТУ. Ключ намерения
            сбрасывается именно здесь: дальше — уже другое намерение. */
-        if(RC.id===orderId){
+        if(rcCurrent(mine)){
           RC.key=rcKey(); RC.data=d; renderReceipts(d);
           document.querySelectorAll('#rc-lines input[data-rc-qty]').forEach(function(i){ i.value=""; });
           document.getElementById("rc-extra-name").value="";
@@ -1087,9 +1134,14 @@
       .catch(function(e){
         /* Исход НЕИЗВЕСТЕН — и панель это признаёт: набранное и ключ остаются
            на месте, повтор придёт тем же намерением и не удвоит факт. */
+        if(!rcCurrent(mine)) return;
         setRcError("Не сохранено: "+e.message+" Нажмите ещё раз — повтор того же прихода не запишется дважды.");
       })
-      .then(function(){ btn.disabled=false; });
+      .then(function(){
+        /* И ЗАВЕРШАЮЩИЙ ШАГ ТОЖЕ ПОД ОХРАНОЙ. Без него ответ прошлого
+           открытия включал бы кнопку текущего прямо посреди его отправки. */
+        if(rcCurrent(mine)) btn.disabled=false;
+      });
   }
 
   document.getElementById("rc-save").addEventListener("click",saveReceipts);

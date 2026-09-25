@@ -274,6 +274,13 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
             ("повтор после неизвестного исхода",
              lambda: step_retry(page, c, names)),
             ("обрезка истории названа", lambda: step_truncation(page, c, names)),
+            # Корректив A по независимому ревью PR #61: три подтверждённых P1.
+            ("неполная позиция вне заказа не теряется",
+             lambda: step_extra_incomplete(page, c, names)),
+            ("дробное количество не округляется",
+             lambda: step_fractions(page, c, names)),
+            ("ответ прошлой панели не портит новую",
+             lambda: step_stale_callbacks(page, c, names)),
         )
         for label, run_step in steps:
             try:
@@ -606,6 +613,225 @@ def step_mobile(browser, c, names) -> None:
               str(errors[:2])[:200])
     finally:
         ctx.close()
+
+
+# ── Корректив A по ревью PR #61: три подтверждённых P1 ──────────────────────
+
+
+def _extra(page, name: str, qty: str) -> None:
+    page.evaluate("""(a) => {
+      const n = document.getElementById('rc-extra-name');
+      const q = document.getElementById('rc-extra-qty');
+      n.value = a.name; n.dispatchEvent(new Event('input', {bubbles: true}));
+      q.value = a.qty;  q.dispatchEvent(new Event('input', {bubbles: true}));
+    }""", {"name": name, "qty": qty})
+
+
+def _extra_values(page) -> dict:
+    return page.evaluate("""() => ({
+      name: (document.getElementById('rc-extra-name') || {}).value,
+      qty: (document.getElementById('rc-extra-qty') || {}).value
+    })""")
+
+
+def step_extra_incomplete(page, c, names) -> None:
+    """Половина утверждения — не утверждение, и молча её терять нельзя.
+
+    Случай ревью: по заказанной позиции названо верное число, а у позиции вне
+    заказа заполнено ТОЛЬКО количество. Прежняя редакция такую пару молча
+    выбрасывала, POST уходил с одной строкой и УДАВАЛСЯ, а успех очищал все
+    поля — пять названных человеком штук исчезали без единого слова.
+    """
+    print("\n== Неполная позиция вне заказа: отказ до отправки, ввод цел ==")
+    oid = make_order(c, "Неполная позиция", [{"base_name": names[0], "qty": 10}])
+    open_replenish(page)
+    open_receipts(page, oid)
+
+    posts = []
+    route = "**/api/orders/*/receipts"
+    page.route(route, lambda r: (posts.append(r.request.method), r.continue_())[-1]
+               if r.request.method == "POST" else r.continue_())
+    try:
+        _fill_line(page, names[0], "6")
+        _extra(page, "", "5")
+        _submit(page)
+        check("ни одного POST не ушло — отправка отклонена целиком",
+              len(posts) == 0, str(posts))
+        check("человеку сказано, чего не хватает",
+              "назван" in _err_text(page).lower()
+              or "название" in _err_text(page).lower(), _err_text(page)[:200])
+        check("введённое по заказанной позиции на месте",
+              _line_value(page, names[0]) == "6", _line_value(page, names[0]))
+        vals = _extra_values(page)
+        check("и количество вне заказа не стёрто", vals["qty"] == "5", str(vals))
+        body = c.get(f"/api/orders/{oid}/receipts").json()
+        check("на сервере не записано ничего", body["receipts_total"] == 0,
+              str(body["receipts_total"]))
+
+        # Обратная неполная пара: имя есть, количества нет.
+        _extra(page, "Коробка без счёта", "")
+        _submit(page)
+        check("обратная неполная пара тоже отклонена до отправки",
+              len(posts) == 0, str(posts))
+        check("и ввод по-прежнему цел",
+              _line_value(page, names[0]) == "6"
+              and _extra_values(page)["name"] == "Коробка без счёта",
+              str(_extra_values(page)))
+
+        # Полная пара проходит — отказ не должен запрещать законный случай.
+        _extra(page, "Коробка без счёта", "5")
+        _submit(page)
+        body = c.get(f"/api/orders/{oid}/receipts").json()
+        got = {ln["base_name"]: ln["received_qty"] for ln in body["lines"]}
+        check("полная пара записывается: и заказанное, и позиция вне заказа",
+              got.get(names[0]) == 6 and got.get("Коробка без счёта") == 5,
+              str(got))
+    finally:
+        page.unroute(route)
+
+
+def step_fractions(page, c, names) -> None:
+    """API принимает и отдаёт дроби — экран обязан их показывать.
+
+    `fmt` в шаблоне округляет (`Math.round`), и 0,4 превращалось в 0, а -0,4 в
+    -0. Это подмена факта клиентом: поле ввода объявлено `step="any"`, сервер
+    хранит три знака, а человек видел ноль там, где приехало 0,4.
+    """
+    print("\n== Дробное количество показывается, а не округляется ==")
+    oid = make_order(c, "Дробные приходы",
+                     [{"base_name": names[0], "qty": 10},
+                      {"base_name": names[1], "qty": 4}])
+    # Положительная дробь, отрицательная дробь и ПОДТВЕРЖДЁННЫЙ ноль рядом.
+    c.post(f"/api/orders/{oid}/receipts",
+           json={"lines": [{"base_name": names[0], "qty": 1.5}],
+                 "idempotency_key": "fr-1"})
+    c.post(f"/api/orders/{oid}/receipts",
+           json={"lines": [{"base_name": names[0], "qty": -0.4}],
+                 "idempotency_key": "fr-2"})
+    api_lines = {ln["base_name"]: ln
+                 for ln in c.get(f"/api/orders/{oid}/receipts").json()["lines"]}
+    check("контракт: сервер хранит дробь, а не целое",
+          abs(api_lines[names[0]]["received_qty"] - 1.1) < 1e-9,
+          str(api_lines[names[0]]["received_qty"]))
+
+    open_replenish(page)
+    open_receipts(page, oid)
+    cells = {row["base"]: row for row in line_cells(page)}
+    got = cells[names[0]]["received"].strip()
+    check("в сверке видна дробь 1,1, а не округлённая единица",
+          got.replace(" ", "").replace(" ", "") in ("1,1",), got)
+    check("а позиция без факта по-прежнему «неизвестно», а не ноль",
+          "еизвестно" in cells[names[1]]["received"], str(cells[names[1]]))
+
+    hist = page.evaluate(
+        "() => { const h=document.getElementById('rc-history');"
+        " return h ? h.innerText : ''; }") or ""
+    check("в истории видна положительная дробь 1,5", "1,5" in hist, hist[:200])
+    check("и отрицательная дробь -0,4, а не -0",
+          ("-0,4" in hist or "−0,4" in hist), hist[:200])
+
+    # Подтверждённый ноль обязан остаться нулём, а не стать «неизвестно».
+    c.post(f"/api/orders/{oid}/receipts",
+           json={"lines": [{"base_name": names[1], "qty": 0}],
+                 "idempotency_key": "fr-0"})
+    open_receipts(page, oid)
+    cells = {row["base"]: row for row in line_cells(page)}
+    check("подтверждённый ноль показан нулём и после правки формата",
+          cells[names[1]]["received"].strip() == "0", str(cells[names[1]]))
+
+
+def step_stale_callbacks(page, c, names) -> None:
+    """Ответ ПРОШЛОГО открытия панели не имеет права трогать текущее.
+
+    Проверка полностью клиентская и детерминированная: запрос задерживается
+    маршрутом браузера и отпускается тогда, когда решит набор. Никаких
+    параллельных запросов к серверу и никаких состязательных проб.
+    """
+    print("\n== Ответ прошлой панели не портит текущую ==")
+    a_id = make_order(c, "Заказ А", [{"base_name": names[0], "qty": 10}])
+    b_id = make_order(c, "Заказ Б", [{"base_name": names[1], "qty": 7}])
+    open_replenish(page)
+
+    held = []
+    route = "**/api/orders/*/receipts"
+
+    def hold_first(r):
+        # Задерживаем ТОЛЬКО первый GET (он от заказа А) — остальное пропускаем.
+        if r.request.method == "GET" and not held:
+            held.append(r)
+            return
+        r.continue_()
+
+    page.route(route, hold_first)
+    try:
+        page.evaluate("""(id) => {
+          const b = document.querySelector('.ord-receipts[data-id="' + id + '"]');
+          if (b) b.click();
+        }""", str(a_id))
+        page.wait_for_timeout(600)
+        check("запрос заказа А задержан", len(held) == 1, str(len(held)))
+
+        # Человек закрывает панель А и открывает Б, которая грузится нормально.
+        # Маршрут НЕ снимаем: `unroute` сам доигрывает задержанный запрос, и
+        # отпустить его по своей воле уже не получится («Route is already
+        # handled»). Обработчик и так пропускает всё, кроме первого GET.
+        page.evaluate("() => document.getElementById('rc-close').click()")
+        page.wait_for_timeout(200)
+        check("панель Б открылась", open_receipts(page, b_id) is True)
+        _fill_line(page, names[1], "3")
+
+        # ...и только теперь падает задержанный запрос А.
+        held[0].abort()
+        page.wait_for_timeout(1200)
+        cells = {row["base"]: row for row in line_cells(page)}
+        check("строки панели Б на месте, а не стёрты отказом А",
+              names[1] in cells, str(list(cells)))
+        check("набранное в Б не потеряно",
+              _line_value(page, names[1]) == "3", _line_value(page, names[1]))
+        check("и чужая ошибка на экране Б не показана",
+              _err_text(page) == "", _err_text(page)[:200])
+    finally:
+        try:
+            page.unroute(route)
+        except Exception:  # noqa: BLE001 — маршрут мог быть уже снят
+            pass
+
+    # ТОТ ЖЕ ЗАКАЗ, закрытие и повторное открытие: одной сверки номера заказа
+    # тут мало — он совпадает. Отличать обязано САМО ОТКРЫТИЕ.
+    print("\n== Тот же заказ: закрыли и открыли заново ==")
+    held2 = []
+
+    def hold_first_again(r):
+        if r.request.method == "GET" and not held2:
+            held2.append(r)
+            return
+        r.continue_()
+
+    open_replenish(page)
+    page.route(route, hold_first_again)
+    try:
+        page.evaluate("""(id) => {
+          const b = document.querySelector('.ord-receipts[data-id="' + id + '"]');
+          if (b) b.click();
+        }""", str(a_id))
+        page.wait_for_timeout(600)
+        page.evaluate("() => document.getElementById('rc-close').click()")
+        page.wait_for_timeout(200)
+        check("та же панель открыта заново", open_receipts(page, a_id) is True)
+        _fill_line(page, names[0], "2")
+        held2[0].abort()
+        page.wait_for_timeout(1200)
+        check("строки текущего открытия целы",
+              bool(line_cells(page)), str(line_cells(page))[:160])
+        check("и набранное во втором открытии не потеряно",
+              _line_value(page, names[0]) == "2", _line_value(page, names[0]))
+        check("чужой ошибки на экране нет", _err_text(page) == "",
+              _err_text(page)[:200])
+    finally:
+        try:
+            page.unroute(route)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 # ── Мелкие помощники ────────────────────────────────────────────────────────
