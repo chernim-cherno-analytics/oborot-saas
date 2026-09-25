@@ -749,10 +749,10 @@ def _pilot_sync_truth(page, base, check, errors) -> None:
             route.fulfill(response=resp, json=data)
         return handler
 
-    def sync_status(state, error=""):
+    def sync_status(state, error="", mode="incremental", phase=""):
         def handler(route):
             route.fulfill(json={
-                "state": state, "mode": "incremental", "phase": "",
+                "state": state, "mode": mode, "phase": phase,
                 "progress_pct": 100 if state == "done" else 0,
                 "detail": "", "error": error,
                 "started_at": None, "finished_at": None,
@@ -760,13 +760,21 @@ def _pilot_sync_truth(page, base, check, errors) -> None:
             })
         return handler
 
-    # СЛУЧАЙ, РАДИ КОТОРОГО ВСЁ И ДЕЛАЕТСЯ: запись подключения `active`,
-    # а последняя синхронизация упала.
+    # СЛУЧАЙ, РАДИ КОТОРОГО ВСЁ И ДЕЛАЕТСЯ, и он воспроизводит РЕАЛЬНЫЙ
+    # сценарий, а не абстрактный «active + error»: первичная загрузка дошла до
+    # `finalize-lite`, открыла сервис на частичной истории и ПРОСТАВИЛА
+    # `conn.last_sync_at` (`ms_sync.py:1556` → `_activate_connection`), а
+    # затем догрузка истории упала — `state="error"`, `phase="history"`, дата
+    # осталась. На сервере это состояние достижимо и закреплено:
+    # `tests/test_sync.py`, случай (c).
     page.route("**/api/settings", settings_with(
         {"kind": "moysklad", "status": "active",
          "last_sync_at": "2026-09-01T10:00:00"}))
     page.route("**/api/sync/status",
-               sync_status("error", "Источник ответил 401"))
+               sync_status("error",
+                           "История загружена за 10 дней из 60 — "
+                           "продолжим автоматически",
+                           mode="initial", phase="history"))
     page.goto(f"{base}/settings")
     page.wait_for_timeout(1500)
     conn_text = _conn_line_text(page)
@@ -777,10 +785,26 @@ def _pilot_sync_truth(page, base, check, errors) -> None:
     # Баннер ошибки — существующий механизм, и он ОБЯЗАН остаться: иначе
     # «убрали ложное обещание» превратилось бы в «убрали сообщение об ошибке».
     check("существующий баннер ошибки синхронизации на месте",
-          "401" in _sync_line_text(page), _sync_line_text(page)[:200])
-    check("дата последней синхронизации названа последней УСПЕШНОЙ, "
-          "а не просто «синхронизация»",
-          "спешн" in conn_text, conn_text[:200])
+          "История загружена за 10 дней" in _sync_line_text(page),
+          _sync_line_text(page)[:200])
+    # ДАТА НЕ ДОКАЗЫВАЕТ УСПЕХА, и это ровно тот случай, который здесь
+    # разыгран (корректив B, тред r4105185067). `conn.last_sync_at` ставит
+    # `_activate_connection`, а его зовёт не только успешное завершение:
+    # `_finalize_lite` (`ms_sync.py:1556`) вызывает его на ЧАСТИЧНОЙ истории,
+    # когда сервис открывается на 25% прогресса, а `sync_state` остаётся
+    # `running` со `stage="history"` — так и написано в его докстроке. Если
+    # догрузка истории потом падает, `state` становится `error`, а дата
+    # остаётся стоять. Достижимость этого состояния доказана не здесь, а на
+    # сервере: `tests/test_sync.py`, случай (c) — прерванный первичный синк
+    # даёт `state=error` при `connection.status == "active"`.
+    #
+    # Значит подпись обязана быть НЕЙТРАЛЬНОЙ. «Последняя успешная
+    # синхронизация» в этот момент — неправда, и прежняя редакция этой
+    # проверки её закрепляла, требуя слова «успешная».
+    check("дата НЕ выдаётся за доказательство успешной синхронизации",
+          "спешн" not in conn_text, conn_text[:200])
+    check("и названа нейтрально — как время обновления данных",
+          "обновление данных" in conn_text, conn_text[:200])
     page.unroute("**/api/sync/status")
     page.unroute("**/api/settings")
 
