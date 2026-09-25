@@ -140,8 +140,21 @@ def catalog_names(c, n: int) -> list[str]:
 
 
 def open_replenish(page) -> None:
+    """Открыть раздел и ДОЖДАТЬСЯ списка заказов, а не поспать фиксированно.
+
+    Фиксированная пауза здесь уже подвела: локально 1,8 с хватало, а на
+    холодном CI первые шаги не успевали — `load()` делает четыре запроса, и
+    кнопки приёмки к моменту клика ещё не существовало. Набор падал не на
+    продукте, а на собственном таймере; ждём условие.
+    """
     page.goto(f"{BASE}/replenish")
-    page.wait_for_timeout(1800)
+    close_hint(page)
+    try:
+        page.wait_for_function(
+            "() => document.querySelectorAll('#orders-tb tr,"
+            " #orders-done-tb tr').length > 0", timeout=30000)
+    except Exception:  # noqa: BLE001 — отсутствие строк проверит сам шаг
+        pass
     close_hint(page)
 
 
@@ -153,15 +166,30 @@ def close_hint(page) -> None:
 
 
 def open_receipts(page, order_id: int) -> bool:
-    ok = page.evaluate("""(id) => {
+    """Открыть панель и дождаться, пока строки ДЕЙСТВИТЕЛЬНО отрисованы.
+
+    Ждём не время, а два условия подряд: появилась кнопка (список заказов уже
+    отрисован) и в панели больше нет «Загрузка…» (ответ ручки пришёл и разобран).
+    """
+    try:
+        page.wait_for_selector('.ord-receipts[data-id="%s"]' % order_id,
+                               timeout=30000)
+    except Exception:  # noqa: BLE001 — отсутствие кнопки и есть ответ шага
+        return False
+    page.evaluate("""(id) => {
       const b = document.querySelector('.ord-receipts[data-id="' + id + '"]');
-      if (!b) return false;
-      b.click();
-      return true;
+      if (b) b.click();
     }""", str(order_id))
-    if ok:
-        page.wait_for_timeout(1200)
-    return ok
+    try:
+        page.wait_for_function("""() => {
+          const p = document.getElementById('rc-panel');
+          if (!p || p.style.display === 'none') return false;
+          const l = document.getElementById('rc-lines');
+          return !!l && !l.querySelector('.loading');
+        }""", timeout=30000)
+    except Exception:  # noqa: BLE001
+        return False
+    return True
 
 
 def panel_text(page) -> str:
@@ -280,9 +308,15 @@ def step_draft(page, c, names) -> None:
     check("сервер отказывает черновику в приёмке", r.status_code == 422,
           f"{r.status_code} {r.text[:120]}")
     open_replenish(page)
-    has = page.evaluate("""(id) => !!document.querySelector(
-        '.ord-receipts[data-id="' + id + '"]')""", str(oid))
-    check("у черновика кнопки приёмки нет", has is False, str(has))
+    state = page.evaluate("""(id) => ({
+      row: !!document.querySelector('#orders-tb tr[data-order="' + id + '"]'),
+      btn: !!document.querySelector('.ord-receipts[data-id="' + id + '"]')
+    })""", str(oid))
+    # Строка заказа проверяется ОТДЕЛЬНО и первой: без неё «кнопки нет»
+    # зеленело бы и на неотрисованной странице — то есть проверка доказывала
+    # бы отсутствие разметки вместо отсутствия действия.
+    check("черновик виден в списке заказов", state["row"] is True, str(state))
+    check("у черновика кнопки приёмки нет", state["btn"] is False, str(state))
 
 
 def step_null_vs_zero(page, c, names) -> None:
@@ -641,10 +675,24 @@ def _line_value(page, base: str) -> str:
 
 
 def _submit(page) -> None:
+    """Нажать «Записать приход» и дождаться, пока запрос ОТРАБОТАЛ.
+
+    Кнопка выключается синхронно в начале отправки и включается в самом конце
+    цепочки — и на успехе, и на отказе. Поэтому «кнопка снова включена» это
+    точный признак завершения, в отличие от фиксированной паузы, которая на
+    медленной машине истекает раньше ответа.
+    """
     page.evaluate("""() => {
       const b = document.getElementById('rc-save');
       if (b) b.click();
     }""")
+    try:
+        page.wait_for_function(
+            "() => { const b = document.getElementById('rc-save');"
+            " return !!b && !b.disabled; }", timeout=30000)
+    except Exception:  # noqa: BLE001 — итог всё равно проверяется по данным
+        pass
+    page.wait_for_timeout(250)
 
 
 def _err_text(page) -> str:
