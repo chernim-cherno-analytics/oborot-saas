@@ -712,10 +712,236 @@ def main() -> int:
     eng.dispose()
     old_db.unlink(missing_ok=True)
 
+    operator_journey()
+
     print(f"\nИтого: {len(PASS)} OK, {len(FAIL)} FAIL")
     for name in FAIL:
         print(f"  FAIL {name}")
     return 1 if FAIL else 0
+
+
+# ── PILOT-OPERATOR-JOURNEY-1: один сквозной путь оператора ──────────────────
+#
+# Пункт 6 отчёта приёмки (issuecomment-5838277250): по отдельности были
+# доказаны поведение приложения и атомарность буквальной команды из
+# `deploy/README.md`, но НИ ОДНОГО прохода «заявка → счёт → оплата → продление
+# → истечение» на ОДНОЙ организации и ОДНОЙ заявке не существовало. Проверки
+# выше собирают состояния фикстурами — каждая правдива про свой кусок и ни
+# одна не доказывает, что куски стыкуются.
+#
+# ЧТО ЭТОТ ПРОХОД НЕ ДОКАЗЫВАЕТ, и это сказано здесь, а не в примечании мелким
+# шрифтом: отметка `status='paid'` — ИМИТАЦИЯ поступления денег, а не
+# банковская проверка. Проход доказывает связность приложения и
+# документированной процедуры, и ничего про фактический платёж, личность
+# оператора и восстановление доступа.
+
+
+def documented_atomic(*statements: str) -> None:
+    """Выполнить пару UPDATE ОДНОЙ транзакцией — как написано в README.
+
+    Форма совпадает с документом: `BEGIN IMMEDIATE … COMMIT`. Здесь она
+    прогоняется через ту же базу, с которой работает приложение, поэтому
+    проверяется стыковка процедуры и продукта, а не пересказ процедуры.
+
+    `isolation_level=None` снимает неявное управление транзакцией у драйвера:
+    иначе BEGIN/COMMIT в скрипте спорили бы с его собственным.
+    """
+    con = sqlite3.connect(DB_PATH, isolation_level=None)
+    try:
+        con.executescript("BEGIN IMMEDIATE;\n" + "\n".join(statements) + "\nCOMMIT;")
+    finally:
+        con.close()
+
+
+class FakeToday:
+    """Синтетические часы: сдвигаем «сегодня», НЕ трогая купленные даты.
+
+    Истечение проверяется сменой дня, а не переписыванием `paid_until`.
+    Переписать срок значило бы проверить фикстуру: купленная дата — это то,
+    за что заплатили, и в проходе она обязана оставаться неизменной.
+    """
+
+    def __init__(self, offset_days: int):
+        self.offset = offset_days
+        self.original = subscription._today
+
+    def __enter__(self):
+        shift = timedelta(days=self.offset)
+        subscription._today = lambda: datetime.utcnow().date() + shift
+        return self
+
+    def __exit__(self, *exc):
+        subscription._today = self.original
+        return False
+
+
+def operator_journey() -> None:  # noqa: C901 — один связный путь, ветвлений нет
+    print("\n== Сквозной путь оператора: заявка → счёт → оплата → продление → истечение ==")
+    gate(True)
+    with TestClient(oborot_app, headers={"X-Oborot-CSRF": "1"}) as c:
+        # ── Шаг 0. Две организации: целевая и соседняя ────────────────────
+        # ПОРЯДОК РЕГИСТРАЦИИ ЗДЕСЬ ЗНАЧИМ. `/register` логинит клиента, и
+        # сессия принадлежит последней зарегистрированной организации. Сосед
+        # заводится ПЕРВЫМ, целевая — последней: иначе заявка на счёт уходит
+        # от чужого имени, и проход молча проверяет не ту организацию.
+        #
+        # Сосед заводится ТОЙ ЖЕ настоящей ручкой, а не INSERT-ом: собранная
+        # руками строка расходится со схемой (и разошлась — `settings_json`
+        # NOT NULL), а «сосед», которого продукт создать не умеет, ничего не
+        # доказывает про невмешательство.
+        c.post("/register", data={"name": "сосед", "email": "neighbour@test.io",
+                                  "password": "secret123", "org_name": "Сосед-бренд"})
+        neighbour = sql("SELECT id FROM orgs WHERE name = ?", "Сосед-бренд")[0][0]
+        set_org(neighbour, plan="start", trial_ends_at=f"{D(-30)} 00:00:00",
+                paid_until=D(400))
+
+        c.post("/register", data={"name": "оператор", "email": "journey@test.io",
+                                  "password": "secret123", "org_name": "Путь-бренд"})
+        org = sql("SELECT id FROM orgs WHERE name = ?", "Путь-бренд")[0][0]
+        check("0. целевая и соседняя организации — разные",
+              org != neighbour, f"org={org} neighbour={neighbour}")
+        neighbour_paid = sql("SELECT paid_until FROM orgs WHERE id = ?", neighbour)[0][0]
+
+        def neighbour_untouched(where: str) -> None:
+            now = sql("SELECT paid_until FROM orgs WHERE id = ?", neighbour)[0][0]
+            check(f"сосед не тронут: {where}",
+                  now == neighbour_paid and state_of(neighbour) == subscription.ACTIVE,
+                  f"paid_until={now} state={state_of(neighbour)}")
+
+        # Триал кончился — это честная отправная точка того, кому пора платить.
+        set_org(org, plan="start", trial_ends_at=f"{D(-1)} 00:00:00", paid_until=None)
+        # Сессия принадлежит ЦЕЛЕВОЙ организации, и проверяется это РАЗЛИЧАЮЩИМ
+        # признаком, а не тем, что ответ непустой: у соседа оплачено до D(400),
+        # у целевой срока нет вовсе.
+        mine = c.get("/api/subscription").json()
+        check("   и сессия принадлежит целевой, а не соседу",
+              mine.get("paid_until") is None,
+              f"payload.paid_until={mine.get('paid_until')}")
+
+        check("1. до оплаты организация в readonly",
+              state_of(org) == subscription.READONLY, state_of(org))
+        # ТЕЛО ВЕРНОЕ (`page`, а не `key`), и это принципиально: гейт стоит
+        # ПЕРЕД разбором тела, поэтому с неверным телом 402 приходил бы и от
+        # опечатки. Верное тело означает, что 402 — это именно запрет записи.
+        blocked = c.post("/api/hints/seen", json={"page": "turnover"})
+        check("   и запись действительно закрыта гейтом", blocked.status_code == 402,
+              f"status={blocked.status_code}")
+
+        # ── Шаг 1. Заявка на счёт настоящей ручкой ───────────────────────
+        r = c.post("/api/plans/request", json={
+            "plan": "start", "period": "month", "company": "ООО Путь-бренд",
+            "inn": "7701234567", "email": "journey@test.io",
+            "phone": "+70000000001",
+        })
+        check("2. заявка на счёт проходит даже из readonly",
+              r.status_code == 200, f"status={r.status_code} {r.text[:120]}")
+        rows = sql("SELECT id, org_id, status, plan, period FROM billing_requests"
+                   " WHERE org_id = ? ORDER BY id DESC LIMIT 1", org)
+        check("   заявка записана и привязана к организации", bool(rows), str(rows))
+        req_id, req_org, req_status, req_plan, req_period = rows[0]
+
+        # ── Шаг 2. Оператор сверяет заявку ───────────────────────────────
+        # Это тот самый шаг, который README требует делать глазами. Здесь он
+        # выражен утверждением по реальным данным: та ли организация и тот ли
+        # согласованный тариф с периодом.
+        check("3. сверка оператора: заявка принадлежит ИМЕННО этой организации",
+              req_org == org and req_org != neighbour,
+              f"req.org_id={req_org} org={org} neighbour={neighbour}")
+        check("   и несёт согласованные тариф и период",
+              (req_plan, req_period) == ("start", "month"),
+              f"{req_plan}/{req_period}")
+        check("   новая заявка ещё не даёт ни дня доступа",
+              req_status == "new" and state_of(org) == subscription.READONLY,
+              f"status={req_status} state={state_of(org)}")
+        neighbour_untouched("после заявки")
+
+        # ── Шаг 3. Документированный шаг «счёт выставлен» ────────────────
+        exec_sql("UPDATE billing_requests SET status = 'invoiced',"
+                 " invoiced_at = datetime('now') WHERE id = ?", req_id)
+        check("4. после выставленного счёта — грейс",
+              state_of(org) == subscription.GRACE, state_of(org))
+        # 200, а НЕ «не 402». Первая редакция этой проверки спрашивала
+        # `!= 402` и зеленела на 422 — то есть доказывала, что тело неверное,
+        # а не что запись прошла. Пустая проверка хуже отсутствующей.
+        wrote = c.post("/api/hints/seen", json={"page": "turnover"})
+        check("   и запись в грейсе ДЕЙСТВИТЕЛЬНО проходит (200)",
+              wrote.status_code == 200, f"status={wrote.status_code}")
+
+        # ── Шаг 4. Границы грейса синтетическими часами ──────────────────
+        # invoiced_at НЕ переписывается: двигаем «сегодня».
+        stamped = sql("SELECT invoiced_at FROM billing_requests WHERE id = ?", req_id)[0][0]
+        with FakeToday(subscription.GRACE_DAYS):
+            check("5. пятый день грейса ещё грейс",
+                  state_of(org) == subscription.GRACE, state_of(org))
+        with FakeToday(subscription.GRACE_DAYS + 1):
+            check("   шестой день — грейс кончился",
+                  state_of(org) == subscription.READONLY, state_of(org))
+        check("   отметка о счёте при этом не переписывалась",
+              sql("SELECT invoiced_at FROM billing_requests WHERE id = ?",
+                  req_id)[0][0] == stamped, str(stamped))
+
+        # ── Шаг 5. Документированная АТОМАРНАЯ пара «оплата + срок» ──────
+        # ИМИТАЦИЯ поступления денег. Банковской проверки здесь нет и быть не
+        # может: мы лишь отмечаем то, что оператор увидел в выписке.
+        paid_until = D(30)
+        documented_atomic(
+            f"UPDATE billing_requests SET status='paid' WHERE id = {req_id};",
+            f"UPDATE orgs SET paid_until='{paid_until}' WHERE id = {org};")
+        after = sql("SELECT (SELECT status FROM billing_requests WHERE id = ?),"
+                    " (SELECT paid_until FROM orgs WHERE id = ?)", req_id, org)[0]
+        check("6. документированная пара применилась целиком",
+              after == ("paid", paid_until), str(after))
+        check("   и это ТА ЖЕ заявка и ТА ЖЕ организация, что в шаге 3",
+              req_id == rows[0][0] and req_org == org, f"req={req_id} org={org}")
+
+        # ── Шаг 6. Право доступа приложения ──────────────────────────────
+        check("7. приложение признаёт оплату — active",
+              state_of(org) == subscription.ACTIVE, state_of(org))
+        w = c.post("/api/hints/seen", json={"page": "replenish"})
+        check("   запись после оплаты ДЕЙСТВИТЕЛЬНО проходит (200)",
+              w.status_code == 200, f"status={w.status_code}")
+        rd = c.get("/api/subscription").json()
+        check("   интерфейс сообщает, что запись не блокируется",
+              rd.get("state") == "active" and rd.get("writes_blocked") is False,
+              str(rd)[:160])
+        neighbour_untouched("после оплаты")
+
+        # ── Шаг 7. Продление тем же документированным способом ───────────
+        renewed = D(60)
+        documented_atomic(
+            f"UPDATE orgs SET paid_until='{renewed}' WHERE id = {org};")
+        check("8. продление записано и организация по-прежнему active",
+              sql("SELECT paid_until FROM orgs WHERE id = ?", org)[0][0] == renewed
+              and state_of(org) == subscription.ACTIVE,
+              f"paid_until={sql('SELECT paid_until FROM orgs WHERE id = ?', org)[0][0]}")
+
+        # ── Шаг 8. Включительное истечение — часами, не правкой срока ────
+        with FakeToday(60):
+            check("9. последний оплаченный день ещё active",
+                  state_of(org) == subscription.ACTIVE, state_of(org))
+        with FakeToday(61):
+            check("   следующий день — readonly",
+                  state_of(org) == subscription.READONLY, state_of(org))
+            # Запись закрыта, а чтение и путь оплаты — нет.
+            w2 = c.post("/api/hints/seen", json={"page": "turnover"})
+            check("   запись после истечения закрыта гейтом (верное тело, 402)",
+                  w2.status_code == 402, f"status={w2.status_code}")
+            for path in ("/api/subscription", "/api/turnover", "/"):
+                resp = c.get(path)
+                check(f"   чтение остаётся открытым: {path}",
+                      resp.status_code == 200, f"status={resp.status_code}")
+            again = c.post("/api/plans/request", json={
+                "plan": "start", "period": "month", "company": "ООО Путь-бренд",
+                "inn": "7701234567", "email": "journey@test.io",
+                "phone": "+70000000001",
+            })
+            check("   и путь оплаты снова открыт", again.status_code == 200,
+                  f"status={again.status_code}")
+        check("10. купленный срок за весь проход не переписывался часами",
+              sql("SELECT paid_until FROM orgs WHERE id = ?", org)[0][0] == renewed,
+              sql("SELECT paid_until FROM orgs WHERE id = ?", org)[0][0])
+        neighbour_untouched("после истечения")
+    gate(False)
 
 
 if __name__ == "__main__":
