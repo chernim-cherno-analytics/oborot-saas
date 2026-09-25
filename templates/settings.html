@@ -848,14 +848,29 @@ document.addEventListener("DOMContentLoaded", function () {
   function renderConnection(conn, isOwner) {
     var box = document.getElementById("conn-box");
     var KIND = { moysklad: "МойСклад", demo: "Демо-данные" };
-    var ST = { active: ["active", "работает"], pending: ["pending", "ожидает синхронизации"], error: ["error", "ошибка"] };
+    // PILOT-SYNC-TRUTH-1. Подпись говорит про ЗАПИСЬ ПОДКЛЮЧЕНИЯ, а не про
+    // здоровье источника, и слово «работает» отсюда убрано именно поэтому.
+    // `connection.status` не понижается никогда: `ms_sync._activate_connection`
+    // только поднимает его до `active` (это написано в его докстроке), а
+    // провалившийся синк пишет `state="error"` в SyncState и записи подключения
+    // не касается. Значения `error` connection не присваивает вообще никто —
+    // во всём `app/` такого присваивания нет ни одного. То есть «работает»
+    // означало ровно одно: «когда-то подключение удалось», — и продолжало
+    // стоять на экране рядом с красной строкой об упавшей синхронизации.
+    // Здоровье по-прежнему сообщает существующий баннер ниже (`showSyncStatus`),
+    // и он не тронут: убрано ложное обещание, а не сообщение об ошибке.
+    var ST = { active: ["active", "подключён"], pending: ["pending", "ожидает синхронизации"], error: ["error", "ошибка"] };
     var html = "";
     if (conn) {
       var st = ST[conn.status] || ST.pending;
       html += '<div style="display:flex; align-items:center; gap:12px; margin-bottom:14px;">' +
         '<span class="conn-status ' + st[0] + '"><span class="dot-live"></span>' + (KIND[conn.kind] || esc(conn.kind || "")) + "</span>" +
         '<span style="font-size:12px; color:var(--text-soft);">' + st[1] +
-        (conn.last_sync_at ? " · синхронизация " + fmtDate(conn.last_sync_at) : "") + "</span></div>";
+        // Дата приходит из `conn.last_sync_at`, а его ставит только успешное
+        // завершение (`_activate_connection`). Поэтому она называется
+        // последней УСПЕШНОЙ: без этого слова свежая дата рядом с упавшим
+        // синком читается как «данные на эту дату актуальны».
+        (conn.last_sync_at ? " · последняя успешная синхронизация " + fmtDate(conn.last_sync_at) : "") + "</span></div>";
       if (conn.kind === "demo") {
         html += '<p style="margin:0 0 14px; font-size:12px; color:var(--text-soft);">Сейчас показаны синтетические данные. Подключите МойСклад, чтобы работать со своим ассортиментом.</p>';
       }

@@ -656,6 +656,30 @@ def run() -> int:  # noqa: C901 — сценарный тест: шагов мн
         page.unroute("**/api/sync/status")
         page.unroute("**/api/settings")
 
+        # ── PILOT-SYNC-TRUTH-1 ────────────────────────────────────────────
+        #
+        # Экран говорит про состояние источника двумя местами, и оба брали
+        # слова не оттуда, откуда факт.
+        #
+        # 1. «Настройки» подписывают подключение словом «работает», а берут
+        #    его из `connection.status`. Эта запись НЕ ПОНИЖАЕТСЯ:
+        #    `ms_sync._activate_connection` только поднимает её до `active`
+        #    (так и написано в его докстроке), а провал синка пишется в
+        #    SyncState (`_thread_main`, ветка except). Значения `error` у
+        #    connection не ставит вообще никто — во всём `app/` нет ни одного
+        #    присваивания. Значит после упавшей синхронизации экран продолжает
+        #    говорить «работает».
+        # 2. «Оборачиваемость» при неполном окне обещает фоновую догрузку и
+        #    РОСТ ЦИФР, а признак неполноты считает из одного покрытия. Само
+        #    состояние синка рядом уже прочитано (им же гасится авто-refresh),
+        #    то есть факт под рукой, а слова его не спрашивают.
+        #
+        # Проверяется ТОЛЬКО правдивость слов. Данные, ручки, права и
+        # существующий баннер ошибки не трогаются — за последним тут отдельная
+        # проверка, потому что «убрать обещание» и «убрать сообщение об
+        # ошибке» — разные вещи, и перепутать их было бы хуже дефекта.
+        _pilot_sync_truth(page, base, check, errors)
+
         check("ни одной ошибки в консоли за весь проход", not errors, str(errors[:2]))
         browser.close()
 
@@ -663,6 +687,234 @@ def run() -> int:  # noqa: C901 — сценарный тест: шагов мн
     for name in FAIL:
         print(f"  FAIL {name}")
     return 1 if FAIL else 0
+
+
+# ── PILOT-SYNC-TRUTH-1: экран не обещает того, чего не знает ────────────────
+
+
+def _conn_line_text(page) -> str:
+    """ТОЛЬКО строка состояния, а не вся карточка подключения.
+
+    Читать весь `#conn-box` здесь нельзя, и это не придирка: в карточке стоит
+    кнопка «Подключить», и проверка «подключение названо подключённым»
+    зеленела бы на ней — то есть на неизменённой вёрстке. Берём ровно ту
+    строку, которую рисует `renderConnection` под состояние.
+    """
+    return page.evaluate(
+        "() => { var b = document.getElementById('conn-box');"
+        " var row = b ? b.querySelector('div') : null;"
+        " return row ? row.textContent : ''; }") or ""
+
+
+def _season_help(page_src: str) -> str:
+    """Куски страницы, где сезонная колонка объясняется человеку.
+
+    Это подпись «—» (`SEA_NA`) и абзац справки про Зиму/Весну/Лето/Осень. Обе
+    строки статические: состояния синка они не видят и условными быть не могут,
+    поэтому обещание из них просто убрано. Склеиваем оба места, чтобы проверка
+    смотрела на текст ДЛЯ ЧЕЛОВЕКА, а не на весь исходник заодно с
+    комментариями разработчика.
+    """
+    out = []
+    for needle in ("Сезон ещё не загружен", "Зима/Весна/Лето/Осень"):
+        i = page_src.find(needle)
+        if i >= 0:
+            out.append(page_src[i:i + 400])
+    return " | ".join(out)
+
+
+def _conn_box_text(page) -> str:
+    """Вся карточка — для проверок про соседние пояснения (например, демо)."""
+    return page.evaluate(
+        "() => { var b = document.getElementById('conn-box');"
+        " return b ? b.textContent : ''; }") or ""
+
+
+def _sync_line_text(page) -> str:
+    return page.evaluate(
+        "() => { var s = document.getElementById('sync-status-line');"
+        " return s ? s.textContent : ''; }") or ""
+
+
+def _pilot_sync_truth(page, base, check, errors) -> None:
+    print("\n== PILOT-SYNC-TRUTH-1: «Настройки» не выдают запись подключения "
+          "за здоровье источника ==")
+
+    def settings_with(conn):
+        def handler(route):
+            resp = route.fetch()
+            data = resp.json()
+            data["connection"] = conn
+            data["role"] = "owner"
+            route.fulfill(response=resp, json=data)
+        return handler
+
+    def sync_status(state, error=""):
+        def handler(route):
+            route.fulfill(json={
+                "state": state, "mode": "incremental", "phase": "",
+                "progress_pct": 100 if state == "done" else 0,
+                "detail": "", "error": error,
+                "started_at": None, "finished_at": None,
+                "diagnostics": {},
+            })
+        return handler
+
+    # СЛУЧАЙ, РАДИ КОТОРОГО ВСЁ И ДЕЛАЕТСЯ: запись подключения `active`,
+    # а последняя синхронизация упала.
+    page.route("**/api/settings", settings_with(
+        {"kind": "moysklad", "status": "active",
+         "last_sync_at": "2026-09-01T10:00:00"}))
+    page.route("**/api/sync/status",
+               sync_status("error", "Источник ответил 401"))
+    page.goto(f"{base}/settings")
+    page.wait_for_timeout(1500)
+    conn_text = _conn_line_text(page)
+    check("при упавшем синке подпись подключения НЕ говорит «работает»",
+          "работает" not in conn_text, conn_text[:200])
+    check("но подключение названо подключённым, а не пропало с экрана",
+          "одключ" in conn_text, conn_text[:200])
+    # Баннер ошибки — существующий механизм, и он ОБЯЗАН остаться: иначе
+    # «убрали ложное обещание» превратилось бы в «убрали сообщение об ошибке».
+    check("существующий баннер ошибки синхронизации на месте",
+          "401" in _sync_line_text(page), _sync_line_text(page)[:200])
+    check("дата последней синхронизации названа последней УСПЕШНОЙ, "
+          "а не просто «синхронизация»",
+          "спешн" in conn_text, conn_text[:200])
+    page.unroute("**/api/sync/status")
+    page.unroute("**/api/settings")
+
+    # Остальные состояния записи не должны пострадать.
+    page.route("**/api/settings", settings_with(
+        {"kind": "moysklad", "status": "pending", "last_sync_at": None}))
+    page.route("**/api/sync/status", sync_status("idle"))
+    page.goto(f"{base}/settings")
+    page.wait_for_timeout(1200)
+    pending_text = _conn_line_text(page)
+    check("«ожидает синхронизации» осталось как было",
+          "жидает синхронизации" in pending_text, pending_text[:200])
+    page.unroute("**/api/sync/status")
+    page.unroute("**/api/settings")
+
+    page.route("**/api/settings", settings_with(
+        {"kind": "demo", "status": "active", "last_sync_at": None}))
+    page.route("**/api/sync/status", sync_status("done"))
+    page.goto(f"{base}/settings")
+    page.wait_for_timeout(1200)
+    check("демо тоже не объявляется «работающим» источником",
+          "работает" not in _conn_line_text(page), _conn_line_text(page)[:200])
+    check("и объяснение про синтетические данные осталось",
+          "интетическ" in _conn_box_text(page), _conn_box_text(page)[:200])
+    page.unroute("**/api/sync/status")
+    page.unroute("**/api/settings")
+
+    print("\n== PILOT-SYNC-TRUTH-1: «Оборачиваемость» не обещает фоновую "
+          "догрузку и рост цифр ==")
+
+    def freshness(coverage_days, sync_state, window=730):
+        def handler(route):
+            route.fulfill(json={
+                "connected": True,
+                "last_sale_date": "2026-09-01",
+                "last_stock_date": "2026-09-01",
+                "sync_state": sync_state,
+                "sync_error": "",
+                "sync_finished_at": None,
+                "coverage_days": coverage_days,
+                "coverage_start": "2026-06-01",
+                "history_days": window,
+                "turnover_window_days": window,
+            })
+        return handler
+
+    def titles():
+        return page.evaluate("""() => {
+          var t = document.getElementById('th-turnover');
+          var d = document.getElementById('th-dis');
+          var p = document.getElementById('th-turnover-period');
+          return {turn: t ? t.title : '', dis: d ? d.title : '',
+                  period: p ? p.textContent : ''};
+        }""")
+
+    def load_turnover(cov, state, window=730):
+        page.route("**/api/freshness", freshness(cov, state, window))
+        page.goto(f"{base}/turnover")
+        page.wait_for_timeout(2500)
+        out = titles()
+        page.unroute("**/api/freshness")
+        return out
+
+    # 1. Неполное окно и синк НЕ идёт — ни одного обещания продолжения.
+    for state in ("idle", "error", "done"):
+        t = load_turnover(90, state)
+        both = t["turn"] + " | " + t["dis"]
+        check(f"[{state}] неполное окно не обещает фоновую догрузку",
+              "догружается" not in both and "догружаетс" not in both,
+              both[:260])
+        check(f"[{state}] и прямо говорит, что загрузка сейчас не идёт",
+              "не идёт" in both or "не идет" in both, both[:260])
+        check(f"[{state}] и по-прежнему называет реальное окно",
+              "90" in t["turn"], t["turn"][:200])
+
+    # 2. Обещания РОСТА не должно быть НИ В ОДНОМ состоянии: оборачиваемость
+    #    это выручка ÷ дни в стоке, и догруженная история двигает обе части —
+    #    число может и упасть.
+    for state in ("running", "idle", "error", "done"):
+        t = load_turnover(90, state)
+        both = t["turn"] + " | " + t["dis"]
+        check(f"[{state}] нет обещания, что цифры вырастут",
+              "вырастут" not in both and "вырастет" not in both, both[:260])
+
+    # 3. Пока синк ИДЁТ — продолжение называть можно и нужно: это правда.
+    t = load_turnover(90, "running")
+    both = t["turn"] + " | " + t["dis"]
+    check("[running] идущая загрузка названа вслух",
+          "догружа" in both or "загрузка истории идёт" in both, both[:260])
+
+    # 4. Полное окно — подсказка прежняя, без приписок про неполноту.
+    t = load_turnover(730, "done")
+    check("полное окно: подпись периода прежняя",
+          "2 года" in t["period"], t["period"][:120])
+    check("полное окно: в подсказке нет речи про неполную историю",
+          "догружа" not in (t["turn"] + t["dis"])
+          and "не идёт" not in (t["turn"] + t["dis"]),
+          (t["turn"] + " | " + t["dis"])[:260])
+
+    # 5. Покрытие НЕИЗВЕСТНО (нулей быть не должно, но они бывают) — экран не
+    #    имеет права объявить это полными двумя годами.
+    t = load_turnover(0, "idle")
+    check("неизвестное покрытие не выдаётся за «за 2 года» в подписи периода",
+          "2 года" not in t["period"], t["period"][:120])
+    # И в подсказках тоже: подпись можно было бы поправить, а title оставить —
+    # тогда обещание полного окна просто переехало бы под курсор.
+    check("и подсказки колонок при этом не обещают полные два года",
+          "2 года" not in t["turn"] and "2 года" not in t["dis"],
+          (t["turn"] + " | " + t["dis"])[:260])
+    check("и сказано, что глубина истории неизвестна",
+          "еизвестн" in (t["turn"] + " " + t["dis"] + " " + t["period"]),
+          (t["period"] + " | " + t["turn"])[:260])
+
+    # ── Сезонные подписи: тот же класс обещания, тот же файл ──────────────
+    #
+    # `SEA_NA` и абзац справки про сезоны обещали фоновую догрузку и что
+    # «цифра появится сама». Обе строки СТАТИЧЕСКИЕ — состояния синка они не
+    # видят вовсе, поэтому условными их сделать нечем, и обещание просто
+    # убрано. Проверка здесь ИСХОДНАЯ, а не поведенческая, и названа так
+    # честно: она доказывает, что страница больше не отдаёт этих слов
+    # браузеру, а не то, что тултип отрисовался на конкретной ячейке —
+    # для последнего нужен сезон, которого в демо-данных может не быть.
+    page_src = page.evaluate("() => document.documentElement.outerHTML") or ""
+    check("страница «Оборачиваемость» не обещает, что цифра сезона появится сама",
+          "цифра появится сама" not in page_src,
+          page_src[page_src.find("Сезон ещё не загружен"):][:200])
+    # Проверяется ИМЕННО сезонное обещание, а не подстрока «догружается фоном»
+    # где угодно в исходнике: она законно встречается в комментариях кода, и
+    # widescale-поиск по ним ловил бы не обещание пользователю, а пояснение
+    # разработчику. Условный текст про идущую загрузку выше — тоже законный,
+    # и запрещать его вообще было бы неверно.
+    check("и сезонная подпись не обещает фоновую догрузку",
+          "догружается фоном" not in _season_help(page_src),
+          _season_help(page_src)[:220])
 
 
 if __name__ == "__main__":
