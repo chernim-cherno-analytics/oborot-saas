@@ -6492,6 +6492,7 @@ def supply_ownerut_1_ui(pw, base, c) -> None:
     # размера: 390×844 — это другое устройство, и мерить его на странице,
     # открытой широкой, значило бы мерить не то.
     _ou1_mobile(browser, base, c)
+    _pilot_mobile_journey(browser, base, c)
     browser.close()
 
 
@@ -6843,6 +6844,182 @@ def _ou1_mobile(browser, base, c) -> None:
         check("и ошибок в консоли телефонного окна не было", not errors,
               str(errors)[:200])
     finally:
+        ctx.close()
+
+
+# ── Контрольная точка 11: весь путь планирования на 390×844 ─────────────────
+#
+# Настольные шаги этого пути доказаны выше по отдельности (создание, «Отдать»,
+# перенос, «Снять», удаление партии с возвратом, история). Здесь — ОДИН путь
+# подряд в окне 390×844, и только настоящими нажатиями Playwright по видимым
+# кнопкам: ни `el.click()` из evaluate, ни `force`. Кнопка, до которой палец
+# не дотянулся бы, роняет шаг, а не обходится. После каждого шага число
+# сверяется с сервером, а не с экраном.
+
+_PJ = "/api/supply/planning"
+
+
+def _pj_post(page, path: str):
+    """Ожидание ответа на запись: `path` — хвост адреса POST-ручки."""
+    return page.expect_response(
+        lambda r: r.request.method == "POST" and r.url.split("?")[0].endswith(path))
+
+
+def _pj_state(c, mid: int, b1: int, b2: int) -> tuple:
+    """(назначения партии 1, назначения партии 2, назначено у материала).
+
+    Партии нет на доске — вместо списка None: так «убрана» отличима от «пуста».
+    """
+    board = c.get(_PJ).json()
+    per = {b["id"]: [float(a["qty"]) for a in b["assignments"]
+                     if a["material_id"] == mid] for b in board["batches"]}
+    mat = [m for m in board["materials"] if m["id"] == mid]
+    return per.get(b1), per.get(b2), (float(mat[0]["assigned"]) if mat else None)
+
+
+def _pilot_mobile_journey(browser, base, c) -> None:
+    print("\n== КТ-11: путь планирования целиком на 390×844 ==")
+    ctx = browser.new_context(viewport={"width": 390, "height": 844})
+    ctx.add_cookies([{"name": k, "value": v, "domain": "127.0.0.1", "path": "/"}
+                     for k, v in c.cookies.items()])
+    errors: list[str] = []
+    page = ctx.new_page()
+    page.on("pageerror", lambda e: errors.append(str(e)))
+    MAT, ITEM = "Ткань КТ11", "Вещь КТ11"
+    B1, B2 = "Партия КТ11 один", "Партия КТ11 два"
+    try:
+        _open_plan(page, base)
+
+        # 1. Материал — формой.
+        page.locator("#pl-add-material").click()
+        page.locator("#pl-mat-title").fill(MAT)
+        page.locator("#pl-mat-qty").fill("100")
+        with _pj_post(page, "/materials") as r:
+            page.locator("#pl-mat-form button[type=submit]").click()
+        page.locator("#pl-mat-form").wait_for(state="hidden")
+        mats = [m for m in c.get(_PJ).json()["materials"] if m["title"] == MAT]
+        check("КТ-11 390: материал создан формой — ровно один, 100 м",
+              r.value.status == 200 and len(mats) == 1
+              and float(mats[0]["qty"]) == 100.0 and mats[0]["unit"] == "м",
+              str(mats)[:200])
+        mid = mats[0]["id"]
+
+        # 2. Вещь-новинка — формой.
+        page.locator("#pl-add-item").click()
+        page.locator("#pl-item-kind").select_option("draft")
+        page.locator("#pl-item-title").fill(ITEM)
+        with _pj_post(page, "/items"):
+            page.locator("#pl-item-form button[type=submit]").click()
+        page.locator("#pl-item-form").wait_for(state="hidden")
+        items = [i for i in c.get(_PJ).json()["items"] if i["title"] == ITEM]
+        check("КТ-11 390: новинка создана формой — ровно одна",
+              len(items) == 1 and items[0]["kind"] == "draft", str(items)[:200])
+        iid = items[0]["id"]
+
+        # 3. Две плановые партии — формой. Вторая нужна переносу, и заводится
+        # тем же путём: создание партии на 390 до этого не проверялось вовсе.
+        for title in (B1, B2):
+            page.locator("#pl-add-batch").click()
+            page.locator("#pl-batch-item").select_option(str(iid))
+            page.locator("#pl-batch-title").fill(title)
+            page.locator("#pl-batch-qty").fill("10")
+            with _pj_post(page, "/batches"):
+                page.locator("#pl-batch-form button[type=submit]").click()
+            page.locator("#pl-batch-form").wait_for(state="hidden")
+        bats = {b["title"]: b for b in c.get(_PJ).json()["batches"]
+                if b["item_id"] == iid}
+        check("КТ-11 390: обе партии созданы формой, план 10 шт, назначений нет",
+              sorted(bats) == sorted([B1, B2])
+              and all(float(b["plan_qty"]) == 10.0 and not b["assignments"]
+                      for b in bats.values()), str(list(bats))[:200])
+        b1, b2 = bats[B1]["id"], bats[B2]["id"]
+        mcard = page.locator(f'[data-pl="material"][data-id="{mid}"]')
+        card1 = page.locator(f'[data-pl="batch"][data-id="{b1}"]')
+        card2 = page.locator(f'[data-pl="batch"][data-id="{b2}"]')
+
+        # 4. «Назначить на партию» → 40 м на первую партию.
+        mcard.locator('button[data-inline="assign"]').click()
+        form = mcard.locator(".pl-form.inline")
+        form.locator("select").select_option(str(b1))
+        form.locator("input").fill("40")
+        with _pj_post(page, "/assignments"):
+            form.get_by_role("button", name="Отдать", exact=True).click()
+        form.wait_for(state="detached")
+        st = _pj_state(c, mid, b1, b2)
+        check("КТ-11 390: «Отдать» записал 40 на партию один: [40] / [] / 40",
+              st == ([40.0], [], 40.0), str(st))
+
+        # 5. Частичный перенос 15 из 40 на вторую партию.
+        aid = [a for b in c.get(_PJ).json()["batches"] if b["id"] == b1
+               for a in b["assignments"]][0]["id"]
+        card1.locator(f'button[data-inline="move-{aid}"]').click()
+        form = card1.locator(".pl-form.inline")
+        form.locator("select").select_option(str(b2))
+        form.locator("input").fill("15")
+        with _pj_post(page, "/assignments/move"):
+            form.get_by_role("button", name="Перенести", exact=True).click()
+        form.wait_for(state="detached")
+        st = _pj_state(c, mid, b1, b2)
+        check("КТ-11 390: перенос части: 25 осталось, 15 ушло, всего 40",
+              st == ([25.0], [15.0], 40.0), str(st))
+
+        # 6. «Снять» остаток с первой партии — через вопрос на месте кнопки.
+        card1.locator(".pl-assign").get_by_role("button", name="Снять",
+                                                exact=True).click()
+        with _pj_post(page, f"/assignments/{aid}/delete"):
+            card1.locator(".pl-confirm").get_by_role(
+                "button", name="Да", exact=True).click()
+        card1.locator(".pl-assign").wait_for(state="detached")
+        st = _pj_state(c, mid, b1, b2)
+        check("КТ-11 390: остаток снят: [] / [15], назначено 15",
+              st == ([], [15.0], 15.0), str(st))
+
+        # 7. Удалить (в архив) вторую партию вместе с назначением и вернуть
+        # тостом: решение владельца — возвращается то же назначение.
+        card2.locator(".pl-actions").get_by_role("button", name="Удалить",
+                                                 exact=True).click()
+        with _pj_post(page, f"/batches/{b2}/archive"):
+            card2.locator(".pl-confirm").get_by_role(
+                "button", name="Да", exact=True).click()
+        card2.wait_for(state="detached")
+        st = _pj_state(c, mid, b1, b2)
+        check("КТ-11 390: партия два убрана с доски, метраж освобождён: 0",
+              st == ([], None, 0.0), str(st))
+        toast = page.locator("#toast-root .toast",
+                             has_text="Партия удалена").locator(".pl-toast-act")
+        with _pj_post(page, f"/batches/{b2}/restore"):
+            toast.click()
+        card2.wait_for(state="attached")
+        st = _pj_state(c, mid, b1, b2)
+        check("КТ-11 390: «Вернуть» вернул партию с тем же назначением 15",
+              st == ([], [15.0], 15.0), str(st))
+
+        # 8. «История» материала: на экране — те же шесть записей, что в журнале.
+        mcard.locator('button[data-inline="history"]').click()
+        rows = mcard.locator(".pl-hist .pl-hist-row")
+        rows.nth(5).wait_for()
+        ev = c.get(f"{_PJ}/events", params={"entity": "material",
+                                            "id": mid}).json()["events"]
+        acts = [e["action"] for e in ev]
+        check("КТ-11 390: журнал материала — ровно шесть действий пути",
+              acts == ["assign", "unassign", "unassign", "move", "assign",
+                       "create"], str(acts))
+        shown = rows.all_text_contents()
+        want = [("назначено: 15 м", B2), ("снято назначение: 15 м", B2),
+                ("снято назначение: 25 м", B1), ("перенесено: 15 м", B2),
+                ("назначено: 40 м", B1), ("создано", "")]
+        check("КТ-11 390: «История» на экране показывает те же шесть строк",
+              len(shown) == 6 and all(w in s and n in s for s, (w, n) in
+                                      zip(shown, want)), str(shown)[:400])
+        check("КТ-11 390: без горизонтальной прокрутки",
+              page.evaluate("() => document.documentElement.scrollWidth"
+                            " <= window.innerWidth + 1") is True)
+    except Exception as exc:  # noqa: BLE001 — важен отчёт, а не тип
+        check("КТ-11 390: путь дошёл до конца без исключения", False,
+              f"{type(exc).__name__}: {str(exc).strip().splitlines()[0][:200]}")
+    finally:
+        check("КТ-11 390: ошибок в консоли не было", not errors,
+              str(errors)[:200])
         ctx.close()
 
 

@@ -284,6 +284,9 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
             # Корректив B: регресс, внесённый коррективом A.
             ("новое открытие получает рабочую кнопку",
              lambda: step_save_button_fresh(page, c, names)),
+            # Контрольная точка 10: жизненный цикл настоящими нажатиями.
+            ("жизненный цикл заказа кликами и повтор после потери ответа",
+             lambda: step_lifecycle_clicks(page, c, names)),
         )
         for label, run_step in steps:
             try:
@@ -297,6 +300,11 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
               str(errors[:2])[:300])
         ctx.close()
         step_mobile(browser, c, names)
+        try:
+            step_mobile_lifecycle(browser, c, names)
+        except Exception as exc:  # noqa: BLE001 — важен отчёт, а не тип
+            check("390 px: жизненный цикл дошёл до конца без исключения", False,
+                  f"{type(exc).__name__}: {str(exc).strip().splitlines()[0][:200]}")
         browser.close()
 
     c.close()
@@ -953,6 +961,195 @@ def step_save_button_fresh(page, c, names) -> None:
             page.unroute(route)
         except Exception:  # noqa: BLE001
             pass
+
+
+# ── Контрольная точка 10: жизненный цикл заказа НАСТОЯЩИМИ нажатиями ────────
+# Здесь нет ни одного `el.click()` через evaluate и ни одного `force`: кнопку,
+# до которой не дотянется палец на телефоне, Playwright честно не нажмёт, и
+# шаг упадёт — это и есть находка, а не повод обойти элемент.
+
+
+def _text_is(locator, text: str) -> bool:
+    """Дождаться точного текста (textContent, не зависит от CSS-регистра)."""
+    from playwright.sync_api import expect
+    try:
+        expect(locator).to_have_text(text, timeout=30000)
+        return True
+    except AssertionError:
+        return False
+
+
+def _order_api(c, oid: int) -> tuple:
+    rc = c.get(f"/api/orders/{oid}/receipts").json()
+    return c.get(f"/api/orders/{oid}").json().get("status"), rc
+
+
+def _lifecycle(page, c, oid: int, tag: str) -> None:
+    """Черновик → «▶ В производство» → «✓ Принят на склад», как делает человек."""
+    row = page.locator('#orders-tb tr[data-order="%s"]' % oid)
+    check(f"{tag}: черновик подписан «черновик»",
+          _text_is(row.locator(".stbadge"), "черновик"),
+          str(row.locator(".stbadge").all_text_contents()))
+    with page.expect_response(lambda r: r.request.method == "POST"
+                              and r.url.endswith(f"/api/orders/{oid}/status")) as sent:
+        row.get_by_role("button", name="▶ В производство").click()
+    check(f"{tag}: сервер принял перевод в производство", sent.value.status == 200,
+          str(sent.value.status))
+    check(f"{tag}: на экране статус «в производстве»",
+          _text_is(row.locator(".stbadge"), "в производстве"),
+          str(row.locator(".stbadge").all_text_contents()))
+    check(f"{tag}: сервер хранит status=sent", _order_api(c, oid)[0] == "sent",
+          str(_order_api(c, oid)[0]))
+
+    # «✓ Принят на склад» спрашивает confirm() и шлёт status=received БЕЗ
+    # количеств (replenish.html:857-862): заказ закрывается, а сколько
+    # приехало, остаётся неизвестным — выдумывать число сервер не должен.
+    asked: list = []
+    page.once("dialog", lambda d: (asked.append(d.message), d.accept()))
+    with page.expect_response(lambda r: r.request.method == "POST"
+                              and r.url.endswith(f"/api/orders/{oid}/status")) as recv:
+        row.get_by_role("button", name="✓ Принят на склад").click()
+    check(f"{tag}: перед приёмкой спрошено подтверждение",
+          bool(asked) and "Заказ принят на склад?" in asked[0], str(asked))
+    check(f"{tag}: сервер принял перевод на склад", recv.value.status == 200,
+          str(recv.value.status))
+    done = page.locator('#orders-done-tb tr[data-order="%s"]' % oid)
+    check(f"{tag}: заказ переехал в «Принятые на склад» со статусом «принят на склад»",
+          _text_is(done.locator(".stbadge"), "принят на склад"),
+          str(done.locator(".stbadge").all_text_contents()))
+    check(f"{tag}: и пропал из заказов в производстве", row.count() == 0,
+          str(row.count()))
+    status, rc = _order_api(c, oid)
+    check(f"{tag}: сервер: status=received, строк приёмки 0, принято — неизвестно",
+          status == "received" and rc["receipts_total"] == 0
+          and rc["received_total"] is None,
+          f"{status} total={rc['receipts_total']} got={rc['received_total']}")
+
+
+def _open_rc_click(page, oid: int) -> None:
+    page.locator('#orders-done-tb .ord-receipts[data-id="%s"]' % oid).click()
+    page.wait_for_function("""() => {
+      const l = document.getElementById('rc-lines');
+      return !!l && !!l.querySelector('[data-rc-line]');
+    }""", timeout=30000)
+
+
+def _rc_input(page, base: str):
+    return page.get_by_label("Принято в этот приход: " + base, exact=True)
+
+
+def _rc_received_cell(page, base: str):
+    return _rc_input(page, base).locator("xpath=ancestor::tr[1]").locator(
+        "[data-rc-received]")
+
+
+def _save_click(page, oid: int):
+    with page.expect_response(lambda r: r.request.method == "POST"
+                              and r.url.endswith(f"/api/orders/{oid}/receipts")) as resp:
+        page.locator("#rc-save").click()
+    return resp.value
+
+
+def step_lifecycle_clicks(page, c, names) -> None:
+    """Десктоп: цикл кликами + повтор, когда сервер ОБРАБОТАЛ, а ответ потерян.
+
+    Частичный приход, довоз и минус на десктопе уже проверены в `step_record` —
+    здесь их не дублируем. Отличие от `step_retry`: там первый запрос до
+    сервера не доходит; здесь доходит и записывается, а теряется только ответ.
+    """
+    print("\n== Цикл заказа кликами; повтор после потерянного ответа ==")
+    # Подготовка, а не предмет проверки: черновик заводится ручкой.
+    oid = make_order(c, "Цикл-десктоп", [{"base_name": names[0], "qty": 9}],
+                     status="draft")
+    open_replenish(page)
+    _lifecycle(page, c, oid, "десктоп")
+
+    _open_rc_click(page, oid)
+    _rc_input(page, names[0]).fill("4")
+    lost: list = []
+    route = "**/api/orders/*/receipts"
+
+    def process_then_lose(r):
+        if r.request.method != "POST" or lost:
+            r.continue_()
+            return
+        lost.append(r.fetch().status)   # сервер запрос ВЫПОЛНИЛ…
+        r.abort()                       # …а браузер ответа не получил
+
+    page.route(route, process_then_lose)
+    page.locator("#rc-save").click()
+    page.wait_for_function("() => document.getElementById('rc-err')"
+                           ".textContent.trim() !== ''", timeout=30000)
+    page.unroute(route)
+    rc = _order_api(c, oid)[1]
+    check("первая попытка дошла до сервера и записана (4 шт, одна строка)",
+          lost == [200] and rc["receipts_total"] == 1
+          and rc["lines"][0]["received_qty"] == 4,
+          f"lost={lost} total={rc['receipts_total']} qty={rc['lines'][0]['received_qty']}")
+    check("экран честно говорит «Не сохранено» и хранит набранное",
+          _err_text(page).startswith("Не сохранено")
+          and _rc_input(page, names[0]).input_value() == "4",
+          _err_text(page)[:120])
+
+    # Человек нажимает ту же кнопку ещё раз — тот же ключ и то же тело.
+    resp = _save_click(page, oid)
+    body = resp.json()
+    check("повтор узнан сервером как повтор: added=0, repeat=true",
+          resp.status == 200 and body.get("added") == 0 and body.get("repeat") is True,
+          f"{resp.status} added={body.get('added')} repeat={body.get('repeat')}")
+    rc = _order_api(c, oid)[1]
+    check("на сервере ровно одна строка и ровно 4 шт — двойного счёта нет",
+          rc["receipts_total"] == 1 and rc["lines"][0]["received_qty"] == 4,
+          f"total={rc['receipts_total']} qty={rc['lines'][0]['received_qty']}")
+    check("и экран показывает принятыми 4",
+          _text_is(_rc_received_cell(page, names[0]), "4")
+          and _err_text(page) == "", _err_text(page)[:120])
+    page.locator("#rc-close").click()
+
+
+def step_mobile_lifecycle(browser, c, names) -> None:
+    """390×844: цикл, частичный приход и довоз — всё настоящими нажатиями."""
+    print("\n== 390×844: цикл заказа, частичный приход и довоз кликами ==")
+    ctx = browser.new_context(viewport={"width": 390, "height": 844})
+    ctx.add_cookies([{"name": k, "value": v, "domain": "127.0.0.1", "path": "/"}
+                     for k, v in c.cookies.items()])
+    errors: list[str] = []
+    page = ctx.new_page()
+    page.on("pageerror", lambda e: errors.append(str(e)))
+    try:
+        oid = make_order(c, "Цикл-телефон", [{"base_name": names[1], "qty": 12}],
+                         status="draft")                     # подготовка
+        open_replenish(page)
+        _lifecycle(page, c, oid, "390 px")
+
+        _open_rc_click(page, oid)
+        _rc_input(page, names[1]).fill("5")
+        resp = _save_click(page, oid)
+        rc = _order_api(c, oid)[1]
+        check("390 px: частичный приход записан — 5 из 12, одна строка",
+              resp.status == 200 and rc["receipts_total"] == 1
+              and rc["lines"][0]["received_qty"] == 5
+              and rc["lines"][0]["diff"] == -7,
+              f"{resp.status} total={rc['receipts_total']} line={rc['lines'][0]}")
+        check("390 px: экран показывает принятыми 5",
+              _text_is(_rc_received_cell(page, names[1]), "5"))
+
+        # Довоз — новое открытие панели, новое намерение.
+        page.locator("#rc-close").click()
+        _open_rc_click(page, oid)
+        _rc_input(page, names[1]).fill("7")
+        resp = _save_click(page, oid)
+        rc = _order_api(c, oid)[1]
+        check("390 px: довоз записан — 5 + 7 = 12, две строки, расхождения нет",
+              resp.status == 200 and rc["receipts_total"] == 2
+              and rc["lines"][0]["received_qty"] == 12
+              and rc["lines"][0]["diff"] == 0 and rc["received_total"] == 12,
+              f"{resp.status} total={rc['receipts_total']} line={rc['lines'][0]}")
+        check("390 px: экран показывает принятыми 12",
+              _text_is(_rc_received_cell(page, names[1]), "12"))
+        check("390 px: ошибок в консоли не было", not errors, str(errors[:2])[:200])
+    finally:
+        ctx.close()
 
 
 # ── Мелкие помощники ────────────────────────────────────────────────────────
