@@ -219,6 +219,58 @@ class Membership(Base):
     role: Mapped[str] = mapped_column(String(16), nullable=False, default="owner")  # owner|member
 
 
+# ── Восстановление доступа (PILOT-MANUAL-RECOVERY-1, D-63) ───────────────────
+# Три аддитивные таблицы; существующие не меняются. Откат кода оставляет их
+# неиспользуемыми, а отзыв сессий живёт только в users.session_version,
+# который старше этого пакета, — поэтому откат не воскрешает отозванные сессии.
+
+class RecoveryContact(Base):
+    """Заранее подтверждённый контакт человека: телефон или Telegram.
+
+    Записывается оператором при сопровождаемом подключении (D-63). Без обоих
+    подтверждённых контактов ссылку выпустить нельзя.
+    """
+
+    __tablename__ = "recovery_contacts"
+    __table_args__ = (UniqueConstraint("user_id", "kind", name="uq_recovery_contact_kind"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)  # phone | telegram
+    value: Mapped[str] = mapped_column(String(128), nullable=False)
+    verified_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    verified_by: Mapped[str] = mapped_column(String(64), nullable=False)
+    verified_method: Mapped[str] = mapped_column(Text, nullable=False)
+
+
+class PasswordReset(Base):
+    """Одноразовая ссылка сброса. Хранится ТОЛЬКО хеш токена, не сам токен."""
+
+    __tablename__ = "password_resets"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    issued_by: Mapped[str] = mapped_column(String(64), nullable=False)
+
+
+class AccountEvent(Base):
+    """Журнал действий с доступом: только дописывается, секретов не содержит."""
+
+    __tablename__ = "account_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    actor: Mapped[str] = mapped_column(String(64), nullable=False)
+    detail_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+
+
 class Connection(Base):
     __tablename__ = "connections"
 

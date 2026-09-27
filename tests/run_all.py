@@ -165,6 +165,11 @@ SUITES = [
     # с ним; мока МойСклада и телеграма ему не нужно — данные синтетические,
     # из демо-сида самого проекта.
     ("onbprev",     "test_onboarding_preview.py", False, False),
+    # PILOT-MANUAL-RECOVERY-1 (D-63): сброс пароля по одноразовой ссылке —
+    # хеш вместо токена, атомарная одноразовость, отзыв всех сессий, токен вне
+    # журналов и адреса запроса. Есть браузерный путь (1400 и 390), поэтому
+    # набор стоит рядом с остальными браузерными; наружу не ходит.
+    ("recovery",    "test_account_recovery.py", False, False),
     ("backup",      "test_backup.py",          False, False),
     ("deploy",      "test_deploy.py",          False, False),
     ("offsite",     "test_offsite.py",         False, False),

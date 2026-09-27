@@ -111,9 +111,15 @@ def user_purge_models() -> tuple:
     факт: у строки членства есть и `org_id`, и `user_id`, и она обязана уйти
     в обоих потоках. Саму строку `users` стирает отдельный DELETE после цикла.
     """
-    from app.models import Membership, UserHintSeen, UserLesson, UserPrefs
+    from app.models import (
+        AccountEvent, Membership, PasswordReset, RecoveryContact,
+        UserHintSeen, UserLesson, UserPrefs,
+    )
 
-    return (UserHintSeen, UserLesson, UserPrefs, Membership)
+    # Контакты восстановления — телефон и Telegram человека (D-63): с
+    # удалённым аккаунтом они уходят, а не остаются осиротевшими личными данными.
+    return (UserHintSeen, UserLesson, UserPrefs,
+            RecoveryContact, PasswordReset, AccountEvent, Membership)
 
 
 # ── Ссылки, которые владением не являются ────────────────────────────────────

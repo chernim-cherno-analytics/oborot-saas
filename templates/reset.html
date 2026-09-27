@@ -1,0 +1,99 @@
+{% extends "base.html" %}
+{% block bodyclass %}auth-page{% endblock %}
+{% block body %}
+<div class="auth-wrap">
+  <div class="auth-logo">
+    <span style="width:34px;height:34px;min-width:34px;border-radius:9px;background:var(--blue);display:inline-flex;align-items:center;justify-content:center;color:#fff;font-weight:800;font-size:17px;">О</span>
+    <span class="logo-text">Оборот</span>
+  </div>
+
+  <div class="auth-card">
+    <h1>Новый пароль</h1>
+    <p class="auth-sub" id="rs-sub">Придумайте новый пароль. Ссылка одноразовая и действует 30 минут.
+      После сохранения все прежние входы на других устройствах закроются.</p>
+
+    <div class="form-error" id="rs-error" role="alert" style="display:none"></div>
+    <div id="rs-ok" role="status" style="display:none; margin:0 0 14px; padding:12px 14px; border-radius:10px; background:rgba(22,163,74,.08); color:#166534; font-size:13.5px;"></div>
+
+    <form id="rs-form" novalidate>
+      <div class="field">
+        <label for="rs-new">Новый пароль</label>
+        <input class="input" type="password" id="rs-new" required minlength="8"
+               autocomplete="new-password" placeholder="Не менее 8 символов">
+      </div>
+      <div class="field">
+        <label for="rs-confirm">Ещё раз</label>
+        <input class="input" type="password" id="rs-confirm" required minlength="8"
+               autocomplete="new-password">
+      </div>
+      <button class="btn primary" type="submit" id="rs-submit" style="width:100%">Сохранить пароль</button>
+    </form>
+
+    <div class="auth-alt"><a href="/login">Ко входу</a></div>
+  </div>
+</div>
+<script>
+(function () {
+  // Токен приходит во ФРАГМЕНТЕ (#t=…): браузер не отправляет его серверу ни с
+  // этой страницей, ни в Referer. Забираем его в память и сразу стираем из
+  // адресной строки и истории — чтобы он не остался в закладке, в истории
+  // браузера и на экране при демонстрации.
+  var m = /(?:^#|&)t=([^&]+)/.exec(location.hash || "");
+  var token = m ? decodeURIComponent(m[1]) : "";
+  if (location.hash) history.replaceState(null, "", location.pathname);
+
+  var form = document.getElementById("rs-form");
+  var errBox = document.getElementById("rs-error");
+  var okBox = document.getElementById("rs-ok");
+  var btn = document.getElementById("rs-submit");
+
+  function showError(text) { errBox.textContent = text; errBox.style.display = ""; }
+  function finish(el, text) {
+    token = "";
+    form.style.display = "none";
+    el.textContent = text;
+    el.style.display = "";
+  }
+
+  if (!token) {
+    finish(errBox, "Ссылка неполная. Откройте её целиком из сообщения в Telegram " +
+                   "или попросите новую у поддержки.");
+    return;
+  }
+
+  form.addEventListener("submit", function (ev) {
+    ev.preventDefault();
+    errBox.style.display = "none";
+    btn.disabled = true;
+    fetch("/api/account/reset", {
+      method: "POST",
+      credentials: "same-origin",
+      referrerPolicy: "no-referrer",
+      headers: { "Content-Type": "application/json", "X-Oborot-CSRF": "1" },
+      body: JSON.stringify({
+        token: token,
+        new_password: document.getElementById("rs-new").value,
+        confirm_password: document.getElementById("rs-confirm").value
+      })
+    }).then(function (r) {
+      return r.json().catch(function () { return {}; }).then(function (j) {
+        var detail = (j && typeof j.detail === "string") ? j.detail : "";
+        if (r.ok) {
+          finish(okBox, "Пароль изменён. Войдите с новым паролем.");
+          var a = document.createElement("a");
+          a.href = "/login"; a.textContent = " Перейти ко входу";
+          okBox.appendChild(a);
+        } else if (r.status === 400) {
+          // Ссылка больше не годится ни при каком вводе — форму убираем.
+          finish(errBox, detail || "Ссылка недействительна или устарела.");
+        } else {
+          showError(detail || ("Не удалось сохранить пароль (" + r.status + ")."));
+        }
+      });
+    }).catch(function () {
+      showError("Не удалось отправить — проверьте связь и попробуйте ещё раз.");
+    }).then(function () { btn.disabled = false; });
+  });
+})();
+</script>
+{% endblock %}
