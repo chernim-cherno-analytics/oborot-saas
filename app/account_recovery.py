@@ -169,6 +169,23 @@ def set_contact(db: Session, *, email: str, kind: str, value: str, operator: str
     return row
 
 
+def revoke_on_password_change(db: Session, user_id: int) -> int:
+    """Гасит открытые ссылки сброса при обычной смене пароля. БЕЗ commit.
+
+    Человек сменил пароль, зная текущий: выпущенная раньше ссылка ему больше
+    не нужна, а рабочей оставаться не должна — иначе её предъявитель до конца
+    30 минут переписал бы только что заданный пароль (issuecomment-5855953073).
+    Вызывается внутри транзакции смены пароля, после всех проверок: неудачная
+    смена сюда не доходит и ничего не гасит. Журнал — только число, и только
+    если было что гасить.
+    """
+    revoked = _revoke_open_resets(db, user_id, datetime.utcnow())
+    if revoked:
+        _audit(db, user_id, "resets_revoked_by_password_change", "self",
+               revoked_resets=revoked)
+    return revoked
+
+
 def _revoke_open_resets(db: Session, user_id: int, now: datetime) -> int:
     """Гасит все неиспользованные ссылки человека. Внутри транзакции вызывающего."""
     return db.execute(

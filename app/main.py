@@ -1123,6 +1123,11 @@ def api_change_password(
     new_version = db.execute(
         select(User.session_version).where(User.id == ctx.user.id)
     ).scalar_one()
+    # D-63: открытые ссылки сброса, выпущенные до смены, гаснут в ТОЙ ЖЕ
+    # транзакции — иначе их предъявитель переписал бы только что заданный
+    # пароль. Сюда доходит только успешная смена: все отказы выше.
+    from app import account_recovery
+    account_recovery.revoke_on_password_change(db, ctx.user.id)
     db.commit()
     # Текущую сессию НЕ обрываем: человек только что доказал знание пароля,
     # выкидывать его на форму входа посреди работы незачем. Куку переставляем

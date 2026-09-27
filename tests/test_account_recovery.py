@@ -558,6 +558,92 @@ def contact_replacement():
           not any(t in blob or hashlib.sha256(t.encode()).hexdigest() in blob for t in TOKENS))
 
 
+def password_change_revokes():
+    """Обычная смена пароля гасит открытые ссылки сброса (issuecomment-5855953073).
+
+    Человек сменил пароль сам, зная текущий, — выпущенная раньше ссылка сброса
+    ему больше не нужна и не должна оставаться рабочей до конца своих 30 минут.
+    Неудачная попытка смены (неверный текущий, несовпадение) не меняет ничего.
+    """
+    print("\n== Обычная смена пароля гасит ссылки, выпущенные до неё ==")
+    clear_limit()
+    old = issue(A)
+    neighbour = issue(N)
+    n_before = user_row(N)
+    old_hash = hashlib.sha256(old.encode()).hexdigest()
+    c = login(A, STATE["pw"])
+    changed = "Changed-pass-808"
+    bad = (
+        ({"current_password": "wrong-pass-000", "new_password": changed,
+          "confirm_password": changed}, 403, "неверный текущий"),
+        ({"current_password": STATE["pw"], "new_password": changed,
+          "confirm_password": "Other-pass-808"}, 422, "несовпадение"),
+        ({"current_password": STATE["pw"], "new_password": "short7",
+          "confirm_password": "short7"}, 422, "короткий"),
+        ({"current_password": STATE["pw"], "new_password": "Ы" * 37,
+          "confirm_password": "Ы" * 37}, 422, "длиннее 72 байт"),
+        ({"current_password": STATE["pw"], "new_password": STATE["pw"],
+          "confirm_password": STATE["pw"]}, 422, "совпадает со старым"),
+    )
+    for body, code, label in bad:
+        r = c.post("/api/account/password", json=body)
+        revoked = sql("SELECT revoked_at FROM password_resets WHERE token_hash=?",
+                      (old_hash,))[0][0]
+        check(f"неудачная смена ({label}) → {code} и ссылку не гасит",
+              r.status_code == code and revoked is None, f"{r.status_code} {revoked}")
+    r = c.post("/api/account/password", json={"current_password": STATE["pw"],
+                                              "new_password": changed,
+                                              "confirm_password": changed})
+    check("смена пароля прошла", r.status_code == 200, r.text[:80])
+    check("текущая сессия после смены жива", alive(c))
+    last = sql("SELECT detail_json FROM account_events e JOIN users u ON u.id=e.user_id "
+               "WHERE u.email=? AND e.kind='resets_revoked_by_password_change' "
+               "ORDER BY e.id DESC LIMIT 1", (A,))
+    check("журнал называет число погашенных ссылок (1)",
+          bool(last) and '"revoked_resets": 1' in last[0][0], str(last)[:120])
+    r = reset(client(), old, "Stale-pass-909")
+    check("ссылка, выпущенная до смены пароля, — 400", r.status_code == 400,
+          f"{r.status_code} {r.text[:80]}")
+    check("и пароль она не сменила — в силе пароль из смены", login(A, changed) is not None)
+    STATE["pw"] = changed
+    check("сосед не задет: пароль и версия прежние", user_row(N) == n_before)
+    r = reset(client(), neighbour, "Neighbour-pw-910")
+    check("открытая ссылка соседа по-прежнему работает", r.status_code == 200, r.text[:80])
+    fresh = issue(A)
+    r = reset(client(), fresh, "Fresh-after-change-911")
+    check("свежая ссылка после смены пароля работает", r.status_code == 200, r.text[:80])
+    STATE["pw"] = "Fresh-after-change-911"
+
+    print("\n== Сбой посреди смены пароля откатывает и пароль, и отзыв ==")
+    clear_limit()
+    live = issue(A)
+    before = user_row(A)
+    c = login(A, STATE["pw"])
+    real = ar._audit
+
+    def boom(db, user_id, event, actor, **detail):
+        if event == "resets_revoked_by_password_change":
+            raise RuntimeError("синтетический сбой записи журнала")
+        return real(db, user_id, event, actor, **detail)
+
+    ar._audit = boom
+    try:
+        r = c.post("/api/account/password", json={"current_password": STATE["pw"],
+                                                  "new_password": "Never-set-912",
+                                                  "confirm_password": "Never-set-912"})
+    finally:
+        ar._audit = real
+    check("сбой всплыл ответом 500, а не тихим успехом", r.status_code == 500,
+          str(r.status_code))
+    check("пароль и версия сессии не тронуты", user_row(A) == before)
+    revoked = sql("SELECT revoked_at FROM password_resets WHERE token_hash=?",
+                  (hashlib.sha256(live.encode()).hexdigest(),))[0][0]
+    check("и отзыв ссылки откатился вместе со сменой", revoked is None, str(revoked))
+    r = reset(client(), live, "Survive-change-913")
+    check("ссылка после отката работает", r.status_code == 200, r.text[:80])
+    STATE["pw"] = "Survive-change-913"
+
+
 def browser_journey() -> bool:
     try:
         from playwright.sync_api import sync_playwright
@@ -686,6 +772,7 @@ def main() -> int:
         rate_limit()
         cli()
         contact_replacement()
+        password_change_revokes()
         browser_ran = browser_journey()
         audit()
         purge_and_rollback()
