@@ -119,6 +119,16 @@ def set_contact(db: Session, *, email: str, kind: str, value: str, operator: str
     потерявший доступ, и тот, кто выдаёт себя за него, пишут одинаково. Поэтому
     уже записанный контакт меняется только флагом `reverify` и с описанием
     новой проверки, а журнал хранит маски старого и нового значения.
+
+    Любая запись контакта ГАСИТ открытые ссылки этого человека — в той же
+    транзакции. Ссылка, выпущенная под прежний Telegram или телефон, иначе
+    жила бы до конца своих 30 минут уже после того, как контакт признан
+    неактуальным (ревью PR #66, issuecomment-5855573872): правило D-63 — ссылка
+    только в ТЕКУЩИЙ подтверждённый контакт. При первой записи вида контакта
+    гасить обычно нечего (без обоих контактов ссылку не выпустить), но и там
+    отзыв делается — ни одна ссылка не должна быть старше контакта, под
+    который выпущена. Свежая ссылка после замены выпускается как обычно.
+    Сбой где угодно внутри откатывает и контакт, и отзыв.
     """
     if kind not in CONTACT_KINDS:
         raise RecoveryRefused(f"Неизвестный вид контакта: {kind!r}")
@@ -137,19 +147,37 @@ def set_contact(db: Session, *, email: str, kind: str, value: str, operator: str
         raise RecoveryRefused(
             f"Контакт {kind} уже подтверждён ({mask(kind, row.value)}). Замена — "
             "только после новой проверки, флагом --reverify")
-    if row is None:
-        row = RecoveryContact(user_id=user.id, kind=kind, value=norm, verified_at=now,
-                              verified_by=operator, verified_method=note)
-        db.add(row)
-        _audit(db, user.id, "contact_set", operator, kind=kind, contact=mask(kind, norm),
-               method=note)
-    else:
-        old = row.value
-        row.value, row.verified_at, row.verified_by, row.verified_method = norm, now, operator, note
-        _audit(db, user.id, "contact_reverified", operator, kind=kind,
-               old=mask(kind, old), new=mask(kind, norm), method=note)
-    db.commit()
+    try:
+        revoked = _revoke_open_resets(db, user.id, now)
+        if row is None:
+            row = RecoveryContact(user_id=user.id, kind=kind, value=norm, verified_at=now,
+                                  verified_by=operator, verified_method=note)
+            db.add(row)
+            _audit(db, user.id, "contact_set", operator, kind=kind,
+                   contact=mask(kind, norm), method=note, revoked_resets=revoked)
+        else:
+            old = row.value
+            row.value, row.verified_at, row.verified_by, row.verified_method = (
+                norm, now, operator, note)
+            _audit(db, user.id, "contact_reverified", operator, kind=kind,
+                   old=mask(kind, old), new=mask(kind, norm), method=note,
+                   revoked_resets=revoked)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
     return row
+
+
+def _revoke_open_resets(db: Session, user_id: int, now: datetime) -> int:
+    """Гасит все неиспользованные ссылки человека. Внутри транзакции вызывающего."""
+    return db.execute(
+        update(PasswordReset)
+        .where(PasswordReset.user_id == user_id, PasswordReset.used_at.is_(None),
+               PasswordReset.revoked_at.is_(None))
+        .values(revoked_at=now)
+        .execution_options(synchronize_session=False)
+    ).rowcount
 
 
 def callback_phone(db: Session, *, email: str, operator: str, reason: str) -> RecoveryContact:
@@ -222,13 +250,7 @@ def issue_reset(db: Session, *, email: str, operator: str, callback_note: str,
             "Нет подтверждённых контактов: " + ", ".join(missing)
             + ". Без обоих сброс не выдаётся (D-63) — сначала сопровождаемая проверка")
     now = now or datetime.utcnow()
-    revoked = db.execute(
-        update(PasswordReset)
-        .where(PasswordReset.user_id == user.id, PasswordReset.used_at.is_(None),
-               PasswordReset.revoked_at.is_(None))
-        .values(revoked_at=now)
-        .execution_options(synchronize_session=False)
-    ).rowcount
+    revoked = _revoke_open_resets(db, user.id, now)
     token = secrets.token_urlsafe(32)
     db.add(PasswordReset(user_id=user.id, token_hash=token_hash(token), created_at=now,
                          expires_at=now + RESET_TTL, issued_by=operator))

@@ -195,6 +195,7 @@ def clear_limit():
 # ── сценарии ─────────────────────────────────────────────────────────────────
 
 A, B, M = "owner-a@test.io", "owner-b@test.io", "ms-user@test.io"
+N = "owner-n@test.io"   # сосед с контактами и своей открытой ссылкой
 STATE = {"pw": PW0}
 
 
@@ -419,8 +420,8 @@ def audit():
           {"contact_set", "contact_reverified", "reset_issued", "reset_consumed",
            "reset_rejected"} <= kinds, str(sorted(kinds)))
     blob = " ".join(d for _, _, d in rows)
-    check("полного телефона в журнале нет", "+79994445566" not in blob
-          and "79991112233" not in blob)
+    check("полного телефона в журнале нет",
+          not any(p in blob for p in ("79994445566", "79991112233", "79990001122")))
     check("ни токена, ни его хеша в журнале нет",
           not any(t in blob or hashlib.sha256(t.encode()).hexdigest() in blob for t in TOKENS))
 
@@ -479,6 +480,82 @@ def cli():
         rr = reset(client(), token, "Cli-pass-202")
         check("ссылка из инструмента работает", rr.status_code == 200, rr.text[:100])
         STATE["pw"] = "Cli-pass-202"
+
+
+def contact_replacement():
+    """Замена контакта гасит открытые ссылки (issuecomment-5855573872).
+
+    Ссылка, выпущенная под прежний Telegram или прежний телефон, не должна
+    переживать перепроверку контакта: правило — ссылка уходит только в
+    ТЕКУЩИЙ подтверждённый контакт.
+    """
+    print("\n== Замена контакта гасит ссылки, выпущенные под прежний ==")
+    set_contact(N, "phone", "+7 999 555-00-11")
+    set_contact(N, "telegram", "neighbour_tg")
+    for kind, new_value in (("telegram", "owner_a_new_tg"), ("phone", "+7 999 000-11-22")):
+        clear_limit()
+        old = issue(A)
+        neighbour = issue(N)
+        n_before = user_row(N)
+        pw_before = STATE["pw"]
+        set_contact(A, kind, new_value, reverify=True)
+        last = sql("SELECT detail_json FROM account_events e JOIN users u ON u.id=e.user_id "
+                   "WHERE u.email=? AND e.kind='contact_reverified' ORDER BY e.id DESC LIMIT 1",
+                   (A,))[0][0]
+        check(f"[{kind}] журнал замены называет число погашенных ссылок (1)",
+              '"revoked_resets": 1' in last, last[:160])
+        r = reset(client(), old, "Stale-pass-404")
+        check(f"[{kind}] ссылка под прежний контакт после замены — 400",
+              r.status_code == 400, f"{r.status_code} {r.text[:80]}")
+        check(f"[{kind}] и пароль она не сменила", login(A, pw_before) is not None)
+        fresh = issue(A)
+        new_pw = f"Fresh-{kind}-505"
+        r = reset(client(), fresh, new_pw)
+        check(f"[{kind}] свежая ссылка после замены работает", r.status_code == 200,
+              r.text[:80])
+        STATE["pw"] = new_pw
+        check(f"[{kind}] сосед не задет: его пароль и версия прежние", user_row(N) == n_before)
+        r = reset(client(), neighbour, f"Neighbour-{kind}-606")
+        check(f"[{kind}] открытая ссылка соседа по-прежнему работает", r.status_code == 200,
+              r.text[:80])
+
+    print("\n== Сбой посреди замены контакта откатывает и замену, и отзыв ==")
+    clear_limit()
+    live = issue(A)
+    tg_before = sql("SELECT value FROM recovery_contacts rc JOIN users u ON u.id=rc.user_id "
+                    "WHERE u.email=? AND kind='telegram'", (A,))[0][0]
+    real = ar._audit
+
+    def boom(db, user_id, event, actor, **detail):
+        if event == "contact_reverified":
+            raise RuntimeError("синтетический сбой записи журнала")
+        return real(db, user_id, event, actor, **detail)
+
+    ar._audit = boom
+    try:
+        try:
+            set_contact(A, "telegram", "owner_a_other_tg", reverify=True)
+            raised = False
+        except RuntimeError:
+            raised = True
+    finally:
+        ar._audit = real
+    check("сбой всплыл, а не проглочен", raised)
+    tg_after = sql("SELECT value FROM recovery_contacts rc JOIN users u ON u.id=rc.user_id "
+                   "WHERE u.email=? AND kind='telegram'", (A,))[0][0]
+    check("контакт не заменён", tg_after == tg_before, f"{tg_before} → {tg_after}")
+    revoked = sql("SELECT revoked_at FROM password_resets WHERE token_hash=?",
+                  (hashlib.sha256(live.encode()).hexdigest(),))[0][0]
+    check("и отзыв ссылок откатился вместе с ним", revoked is None, str(revoked))
+    r = reset(client(), live, "Survive-pass-707")
+    check("ссылка, выпущенная под неизменившийся контакт, работает", r.status_code == 200,
+          r.text[:80])
+    STATE["pw"] = "Survive-pass-707"
+    rows = sql("SELECT detail_json FROM account_events e JOIN users u ON u.id=e.user_id "
+               "WHERE u.email=? AND e.kind='contact_reverified' ORDER BY e.id", (A,))
+    blob = " ".join(d for (d,) in rows)
+    check("в журнале замены нет ни токенов, ни хешей",
+          not any(t in blob or hashlib.sha256(t.encode()).hexdigest() in blob for t in TOKENS))
 
 
 def browser_journey() -> bool:
@@ -597,6 +674,7 @@ def main() -> int:
         register(A, "Бренд А")
         register(B, "Бренд Б")
         register(M, "Бренд М")
+        register(N, "Бренд Н")
         sql("UPDATE users SET ms_uid='ms-synthetic-uid' WHERE email=?", (M,))
         policy()
         consume_http(token_storage())
@@ -607,6 +685,7 @@ def main() -> int:
         atomic_rollback()
         rate_limit()
         cli()
+        contact_replacement()
         browser_ran = browser_journey()
         audit()
         purge_and_rollback()
