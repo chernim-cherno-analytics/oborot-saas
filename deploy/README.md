@@ -850,9 +850,18 @@ cat /opt/oborot/backup-state/last-offsite-drill    # когда было уче�
 
 ```bash
 $EDITOR /opt/oborot/env     # дописать: OBOROT_TG_BOT_TOKEN=… и OBOROT_OPS_CHAT_ID=…
+cp deploy/systemd/oborot-offsite-backup.service /etc/systemd/system/
+cp deploy/systemd/oborot-offsite-drill.service /etc/systemd/system/
 cp deploy/systemd/oborot-ops-alert@.service /etc/systemd/system/
 systemctl daemon-reload
+systemctl show -p OnFailure oborot-offsite-backup.service oborot-offsite-drill.service
 ```
+
+Копировать нужно **все три** файла, даже если юниты копии и учения уже стоят:
+установленные раньше версии не знают про `OnFailure`, и `daemon-reload` сам
+его не добавит. Последняя команда обязана показать у обоих юнитов
+`OnFailure=oborot-ops-alert@…`; пустое значение — оповещения о сбоях не
+подключены, как бы ни прошла проверка канала ниже.
 
 `deploy.sh` правит в этом файле только строку `OBOROT_COMMIT=`, остальные
 переживают выкладки. Юнит отправителя читает файл сам при каждом запуске
@@ -869,6 +878,13 @@ systemd-run --wait --pipe -p EnvironmentFile=/opt/oborot/env -p User=oborot \
 Код 0 и «отправлено» значат одно: Telegram принял сообщение. Дошло ли оно до
 людей в чате, видно только там. Код 1 — не отправлено (причина в выводе), код
 2 — неверный ввод.
+
+**Проверка канала — не проверка срабатывания.** Команда выше доказывает только,
+что токен, служебный чат и доставка работают. Что упавшая копия или учение
+действительно вызывают отправителя, она не показывает: это отдельная проверка
+при активации — настоящий сбой юнита на сервере и пришедшее оповещение (в том
+числе для учения без смонтированного каталога). До неё подключение оповещений
+о сбоях не считается доказанным.
 
 У самого отправителя `OnFailure` нет: сбой отправки не вызывает сам себя, он
 остаётся в журнале (`journalctl -u 'oborot-ops-alert@*'`).

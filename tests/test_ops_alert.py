@@ -246,6 +246,66 @@ def units():
           wired == set(notify.OPS_UNITS), f"{sorted(wired)} vs {sorted(notify.OPS_UNITS)}")
 
 
+def activation_upgrade():
+    """Документированная активация на сервере, где офсайт-юниты УЖЕ стоят.
+
+    Ревью PR #67 (issuecomment-5856723112): блок активации копировал только
+    отправителя — установленные раньше юниты копии и учения оставались без
+    OnFailure, daemon-reload его не добавит, а прямая проверка канала при этом
+    проходила бы. Здесь блок из README исполняется на имитации
+    /etc/systemd/system, где лежат юниты в виде ДО этого пакета. Настоящий
+    systemd не запускается: это проверка инструкции, а не срабатывания.
+    """
+    import shlex
+    import shutil
+    import tempfile
+
+    print("\n== Активация по README поверх уже установленных юнитов ==")
+    readme = (ROOT / "deploy" / "README.md").read_text(encoding="utf-8")
+    start = readme.find("### Служебные оповещения о сбоях")
+    end = readme.find("\n### ", start + 5)
+    section = readme[start:end] if start >= 0 else ""
+    blocks = [b for b in section.split("```")[1::2] if "daemon-reload" in b]
+    check("в разделе ровно один блок активации с daemon-reload", len(blocks) == 1,
+          str(len(blocks)))
+    lines = [ln.strip() for ln in (blocks[0] if blocks else "").splitlines()]
+    reload_at = next((i for i, ln in enumerate(lines) if "daemon-reload" in ln), -1)
+    cps = [(i, ln) for i, ln in enumerate(lines) if ln.startswith("cp ")]
+    check("все копирования юнитов — до daemon-reload",
+          bool(cps) and reload_at >= 0 and all(i < reload_at for i, _ in cps), str(cps))
+
+    sysd = ROOT / "deploy" / "systemd"
+    tpl_name = "oborot-ops-alert@.service"
+    with tempfile.TemporaryDirectory() as tmp:
+        etc = Path(tmp) / "etc" / "systemd" / "system"
+        etc.mkdir(parents=True)
+        for name in notify.OPS_UNITS:        # как их поставил прежний раздел README
+            old = "\n".join(ln for ln in (sysd / name).read_text(encoding="utf-8").splitlines()
+                            if not ln.strip().startswith("OnFailure="))
+            (etc / name).write_text(old, encoding="utf-8")
+        for _, ln in cps:
+            parts = [p for p in shlex.split(ln)[1:] if not p.startswith("-")]
+            dest, srcs = parts[-1], parts[:-1]
+            if not dest.startswith("/etc/systemd/system"):
+                continue
+            for src in srcs:
+                for f in sorted(ROOT.glob(src)):
+                    shutil.copy(f, etc / f.name)
+        for name in notify.OPS_UNITS:
+            installed = (etc / name).read_text(encoding="utf-8")
+            check(f"после активации установленный {name} несёт OnFailure на отправителя",
+                  "OnFailure=oborot-ops-alert@%n.service" in installed.splitlines())
+        check("и сам отправитель установлен из репозитория",
+              (etc / tpl_name).exists() and (etc / tpl_name).read_bytes()
+              == (sysd / tpl_name).read_bytes())
+    shows = [ln for ln in lines if ln.startswith("systemctl show") and "-p OnFailure" in ln]
+    check("после daemon-reload проверяется загруженная связка (systemctl show -p OnFailure)",
+          bool(shows) and all(any(u in s for s in shows) for u in notify.OPS_UNITS)
+          and all(lines.index(s) > reload_at for s in shows), str(shows))
+    check("README разводит проверку доставки и проверку срабатывания",
+          "Проверка канала — не проверка срабатывания" in section)
+
+
 def main() -> int:
     srv = ServerThread(tg_app, TG_PORT)
     srv.start()
@@ -256,6 +316,7 @@ def main() -> int:
         bad_input()
         failures()
         units()
+        activation_upgrade()
         check("токен ни разу не ушёл ни в один текст сообщения",
               not any(TOKEN in str(p) for _, p in RECEIVED))
     except Exception as exc:  # noqa: BLE001 — падение обязано стать отчётом
