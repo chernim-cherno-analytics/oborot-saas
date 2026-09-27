@@ -844,8 +844,9 @@ def _too_many_attempts_error(retry_after_sec: int) -> str:
     return (
         f"Слишком много неудачных попыток входа в этот аккаунт. "
         f"Попробуйте снова через {mins} {_minutes_word(mins)} — счётчик обнулится сам. "
-        f"Если вы забыли пароль: восстановления по почте у нас пока нет, "
-        f"напишите на {SUPPORT_EMAIL} с адреса, на который заведён аккаунт, — вернём доступ."
+        f"Если вы забыли пароль: восстановления по почте у нас нет. Напишите на "
+        f"{SUPPORT_EMAIL} — если при подключении мы подтвердили ваш телефон и Telegram, "
+        f"перезвоним на этот номер и пришлём одноразовую ссылку в этот Telegram."
     )
 
 
@@ -1122,6 +1123,11 @@ def api_change_password(
     new_version = db.execute(
         select(User.session_version).where(User.id == ctx.user.id)
     ).scalar_one()
+    # D-63: открытые ссылки сброса, выпущенные до смены, гаснут в ТОЙ ЖЕ
+    # транзакции — иначе их предъявитель переписал бы только что заданный
+    # пароль. Сюда доходит только успешная смена: все отказы выше.
+    from app import account_recovery
+    account_recovery.revoke_on_password_change(db, ctx.user.id)
     db.commit()
     # Текущую сессию НЕ обрываем: человек только что доказал знание пароля,
     # выкидывать его на форму входа посреди работы незачем. Куку переставляем
@@ -1130,6 +1136,65 @@ def api_change_password(
     # немедленно (см. auth.resolve_auth), а не «протухают сами до 7 дней».
     response = JSONResponse({"ok": True, "note": "Пароль изменён"})
     auth.set_session(response, ctx.user.id, ctx.org.id, new_version)
+    return response
+
+
+# ── Сброс пароля по одноразовой ссылке (D-63) ────────────────────────────────
+# Ссылку выпускает оператор (tools/account_recovery.py) после звонка на
+# записанный телефон и шлёт в записанный Telegram. Токен живёт во ФРАГМЕНТЕ
+# ссылки (`/reset#t=…`): GET этой страницы приходит на сервер без него, так
+# что в журнал доступа, прокси и Referer он не попадает. Страница стирает его
+# из адресной строки и отправляет только в теле POST ниже.
+
+_RESET_PAGE_HEADERS = {
+    "Referrer-Policy": "no-referrer",
+    "Cache-Control": "no-store",
+}
+
+
+@app.get("/reset", response_class=HTMLResponse)
+def reset_page(request: Request):
+    response = _render_auth(request, "reset.html")
+    response.headers.update(_RESET_PAGE_HEADERS)
+    return response
+
+
+class ResetIn(BaseModel):
+    token: str = Field(default="", max_length=128)
+    new_password: str = Field(default="", max_length=512)
+    confirm_password: str = Field(default="", max_length=512)
+
+
+@app.post("/api/account/reset")
+def api_account_reset(body: ResetIn, request: Request, db: Session = Depends(get_db)):
+    """Новый пароль по ссылке. Сессию НЕ выдаёт: войти человек должен сам.
+
+    Защита от подделки запроса — общая для /api: заголовок X-Oborot-CSRF,
+    который сторонняя форма поставить не может. Плохая ссылка любого рода —
+    один и тот же ответ.
+    """
+    from app import account_recovery
+
+    ip, ip_trusted = auth.client_ip(request)
+    ip_key = f"ip:{ip}"
+    if ip_trusted and auth.reset_ip_limiter.retry_after(ip_key):
+        raise HTTPException(
+            status_code=429,
+            detail="Слишком много попыток с этого адреса. Попробуйте через несколько минут.",
+        )
+    problem = account_recovery.password_problem(body.new_password, body.confirm_password)
+    if problem:
+        raise HTTPException(status_code=422, detail=problem)
+    pw_hash = auth.hash_password(body.new_password)
+    if not account_recovery.consume_reset(db, body.token, pw_hash):
+        if ip_trusted:
+            auth.reset_ip_limiter.hit(ip_key)
+        raise HTTPException(status_code=400, detail=account_recovery.GENERIC_INVALID)
+    response = JSONResponse({"ok": True, "note": "Пароль изменён. Войдите с новым паролем."})
+    response.headers["Cache-Control"] = "no-store"
+    # Старую куку в этом браузере стираем: она уже отозвана (session_version),
+    # а оставленная выглядела бы как «вход сохранился».
+    auth.clear_session(response)
     return response
 
 
