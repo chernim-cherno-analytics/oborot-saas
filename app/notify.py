@@ -15,7 +15,7 @@ send_daily_digest(org_id) молча пропускает организацию
 import html
 import logging
 import os
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import httpx
 from sqlalchemy import case, func, select
@@ -88,6 +88,56 @@ def _human_tg_error(resp: httpx.Response) -> str:
     if resp.status_code == 429:
         return "Telegram ограничил частоту отправки. Попробуйте через минуту."
     return f"Telegram ответил ошибкой {resp.status_code}: {description or 'без описания'}."
+
+
+# ── Операционные оповещения (канал сервиса, не организации) ──────────────────
+#
+# Отдельный чат сервиса для сбоев, которые видит только оператор: офсайт-бэкап
+# и учение по восстановлению. Это НЕ уведомления организаций: адрес берётся
+# только из OBOROT_OPS_CHAT_ID, никогда из notify_settings — иначе сбой
+# сервиса мог бы уйти в чат клиента, а данные клиента — в чат оператора.
+# Текст фиксированный: никакого журнала, путей, имён организаций, секретов и
+# строк извне. Подробности — только в журнале сервера.
+
+OPS_UNITS = {
+    "oborot-offsite-backup.service": "офсайт-бэкап (копия базы вне сервера)",
+    "oborot-offsite-drill.service": "учение по восстановлению из офсайт-копии",
+}
+
+
+def ops_chat_id() -> str:
+    return os.environ.get("OBOROT_OPS_CHAT_ID", "").strip()
+
+
+def ops_text(kind: str, unit: str | None = None, now: datetime | None = None) -> str:
+    """Фиксированный текст оповещения. Неизвестное — ValueError, а не «что-то»."""
+    stamp = f"{(now or datetime.utcnow()):%Y-%m-%d %H:%M} UTC"
+    if kind == "test":
+        if unit is not None:
+            raise ValueError("test не принимает имя юнита")
+        return (f"Оборот, служебный канал: проверка связи ({stamp}). "
+                "Если вы видите это сообщение — операционные оповещения доходят.")
+    if kind == "unit-failed":
+        if unit not in OPS_UNITS:
+            raise ValueError("юнит не из списка операционных оповещений")
+        return (f"Оборот, служебный канал: НЕ выполнено — {OPS_UNITS[unit]} ({stamp}). "
+                f"Подробности — в журнале сервера: journalctl -u {unit}")
+    raise ValueError("неизвестный вид оповещения")
+
+
+def send_ops(kind: str, unit: str | None = None) -> tuple[bool, str]:
+    """Шлёт операционное оповещение в чат сервиса. (ok, причина отказа).
+
+    Нет токена или чата сервиса — отказ без запроса наружу; запасного адреса
+    (например, чата организации) нет намеренно.
+    """
+    text = ops_text(kind, unit)          # сначала проверка ввода: мусор — не запрос
+    chat = ops_chat_id()
+    if not chat:
+        return False, "Не задан OBOROT_OPS_CHAT_ID — служебный канал не настроен."
+    if not bot_token():
+        return False, "Telegram-бот не настроен на сервере (нет OBOROT_TG_BOT_TOKEN)."
+    return send_message(chat, text)
 
 
 # ── Настройки ────────────────────────────────────────────────────────────────
