@@ -6,8 +6,9 @@
 
 1. при сопровождаемом подключении — подтверждает и записывает телефон и
    Telegram человека (`contact-set`);
-2. при просьбе о восстановлении — перезванивает ТОЛЬКО на записанный телефон,
-   а не на номер, с которого пришла просьба;
+2. при просьбе о восстановлении — берёт записанный номер (`callback-phone`;
+   сам просмотр пишется в журнал) и перезванивает ТОЛЬКО на него, а не на
+   номер, с которого пришла просьба;
 3. выпускает одноразовую ссылку (`issue`) и отправляет её ТОЛЬКО в записанный
    Telegram. Ссылка живёт 30 минут; прежние ссылки этого человека гаснут.
 
@@ -24,6 +25,9 @@ e-mail или знание счёта не заменяют ни один из �
         --operator vlad --method "видеозвонок при подключении, сверено с договором"
 
     python tools/account_recovery.py --db … contact-list --email owner@brand.ru
+
+    python tools/account_recovery.py --db … callback-phone --email owner@brand.ru \\
+        --operator vlad --reason "просьба о сбросе 27.09 из чата поддержки"
 
     python tools/account_recovery.py --db … issue --email owner@brand.ru \\
         --operator vlad --base-url https://app.example.ru \\
@@ -79,6 +83,12 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("contact-list", help="показать контакты (в маске)")
     s.add_argument("--email", required=True)
 
+    s = sub.add_parser("callback-phone",
+                       help="полный записанный телефон для обратного звонка (просмотр пишется в журнал)")
+    s.add_argument("--email", required=True)
+    s.add_argument("--operator", required=True)
+    s.add_argument("--reason", required=True, help="зачем смотрите, например «просьба о сбросе 27.09»")
+
     s = sub.add_parser("issue", help="выпустить одноразовую ссылку")
     s.add_argument("--email", required=True)
     s.add_argument("--operator", required=True)
@@ -110,6 +120,14 @@ def main(argv=None) -> int:
             for r in rows:
                 print(f"{r.kind:9} {ar.mask(r.kind, r.value):18} {r.verified_at:%Y-%m-%d %H:%M} "
                       f"{r.verified_by}: {r.verified_method}")
+        elif args.cmd == "callback-phone":
+            row = ar.callback_phone(db, email=args.email, operator=args.operator,
+                                    reason=args.reason)
+            print("Перезвоните на ЭТОТ номер — не на тот, с которого пришла просьба:")
+            print(row.value)
+            print(f"Подтверждён {row.verified_at:%Y-%m-%d} ({row.verified_by}: "
+                  f"{row.verified_method}). Не пересылайте номер в чаты и заявки; "
+                  f"этот просмотр записан в журнал.")
         elif args.cmd == "issue":
             if not args.base_url.startswith("https://"):
                 raise ar.RecoveryRefused("Адрес сервиса должен начинаться с https://")

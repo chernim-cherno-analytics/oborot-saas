@@ -152,6 +152,35 @@ def set_contact(db: Session, *, email: str, kind: str, value: str, operator: str
     return row
 
 
+def callback_phone(db: Session, *, email: str, operator: str, reason: str) -> RecoveryContact:
+    """Полный записанный телефон — чтобы оператор мог ПЕРЕЗВОНИТЬ по нему.
+
+    Маска в списках защищает номер от случайного взгляда, но правило D-63
+    требует звонка именно на записанный номер, а не на тот, с которого пришла
+    просьба. Без этой команды оператор без собственной записной книжки шаг
+    «перезвонить» выполнить не мог (ревью PR #66, issuecomment-5855362557).
+
+    Только для оператора на сервере; публичной ручки нет. Каждый просмотр
+    пишется в журнал — кто, когда и зачем, — но САМ номер в журнал не попадает
+    даже в маске: журнал отвечает на вопрос «кто смотрел», а не хранит копию.
+    """
+    operator = (operator or "").strip()
+    if not operator:
+        raise RecoveryRefused("Нужно имя оператора (--operator)")
+    note = _require_note("Причина просмотра", reason)
+    user = _user_by_email(db, email)
+    row = db.execute(
+        select(RecoveryContact).where(RecoveryContact.user_id == user.id,
+                                      RecoveryContact.kind == "phone")
+    ).scalars().first()
+    if row is None:
+        raise RecoveryRefused("Подтверждённого телефона нет — перезванивать некуда, "
+                              "сброс не выдаётся (D-63)")
+    _audit(db, user.id, "callback_phone_viewed", operator, reason=note)
+    db.commit()
+    return row
+
+
 def contacts(db: Session, email: str) -> list[RecoveryContact]:
     user = _user_by_email(db, email)
     return list(db.execute(

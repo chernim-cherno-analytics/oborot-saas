@@ -15,8 +15,10 @@
      один; сбой посреди смены пароля откатывает и отметку об использовании;
   4) все сессии отзываются, новая не выдаётся, соседний пользователь не
      задет; сброс работает и для организации в readonly;
-  5) откат кода не воскрешает отозванные сессии: отзыв живёт только в
-     users.session_version — проверяется, УДАЛИВ новые таблицы;
+  5) без новых таблиц отозванные сессии остаются отозванными: отзыв живёт
+     только в users.session_version. Проверяется удалением новых таблиц — это
+     НЕ запуск кода предыдущей версии. Откат опирается ещё и на то, что сама
+     проверка версии в auth.resolve_auth этим пакетом не менялась;
   6) путь человека в настоящем браузере на 1400 и на 390.
 
 Данные только синтетические, сервер локальный, наружу набор не ходит.
@@ -428,9 +430,35 @@ def cli():
     tool = [sys.executable, str(ROOT / "tools" / "account_recovery.py"), "--db", str(DB_PATH)]
     run = lambda *a: subprocess.run(tool + list(a), capture_output=True, text=True,  # noqa: E731
                                     timeout=120)
+    # Путь оператора по регламенту, шаг за шагом и тем же инструментом:
+    # список (маска) → записанный номер для звонка → звонок → выпуск ссылки.
     r = run("contact-list", "--email", A)
     check("список контактов — только в маске", r.returncode == 0 and "+79994445566"
           not in r.stdout and "5566" in r.stdout, r.stdout.strip()[:160])
+    r = run("callback-phone", "--email", A, "--operator", "т")
+    check("номер для звонка без причины просмотра не выдаётся", r.returncode == 2)
+    r = run("callback-phone", "--email", A, "--operator", "т", "--reason", "надо")
+    check("и с отпиской вместо причины — тоже", r.returncode == 2 and "Причина" in r.stderr)
+    r = run("callback-phone", "--email", B, "--operator", "т",
+            "--reason", "просьба о сбросе из чата поддержки")
+    check("без записанного телефона звонить некуда — отказ", r.returncode == 2)
+    viewed_before = sql("SELECT COUNT(*) FROM account_events e JOIN users u ON u.id=e.user_id "
+                        "WHERE u.email=? AND e.kind='callback_phone_viewed'", (A,))[0][0]
+    r = run("callback-phone", "--email", A, "--operator", "т",
+            "--reason", "просьба о сбросе из чата поддержки")
+    lines = r.stdout.splitlines()
+    check("оператор получает ТОЧНО записанный номер для звонка",
+          r.returncode == 0 and "+79994445566" in lines, r.stdout.strip()[:160])
+    check("и предупреждение звонить на него, а не на номер просьбы",
+          "не на тот, с которого пришла просьба" in r.stdout)
+    viewed = sql("SELECT e.actor, e.detail_json FROM account_events e JOIN users u "
+                 "ON u.id=e.user_id WHERE u.email=? AND e.kind='callback_phone_viewed' "
+                 "ORDER BY e.id", (A,))
+    check("просмотр номера записан в журнал с оператором и причиной",
+          len(viewed) == viewed_before + 1 and viewed[-1][0] == "т"
+          and "просьба о сбросе" in viewed[-1][1], str(viewed[-1:])[:160])
+    check("а самого номера в журнале просмотра нет — даже в маске",
+          not any(d in viewed[-1][1] for d in ("79994445566", "5566", "+7")), viewed[-1][1][:160])
     r = run("issue", "--email", A, "--operator", "т", "--base-url", "https://app.example.ru")
     check("без --callback-confirmed не выпускает", r.returncode == 2)
     r = run("issue", "--email", A, "--operator", "т", "--base-url", "http://app.example.ru",
@@ -536,7 +564,10 @@ def purge_and_rollback():
     check("после удаления аккаунта его контакты, ссылки и журнал стёрты", left == 0, str(left))
 
     # Откат: предыдущая версия кода новых таблиц не знает. Снимаем их вовсе и
-    # проверяем, что отзыв сессий и новый пароль держатся без них.
+    # проверяем, что отзыв сессий и новый пароль держатся без них. Это НЕ прогон
+    # старого кода: доказано лишь, что отзыв не зависит от новых таблиц; то, что
+    # старый код его соблюдает, держится на неизменённой проверке версии в
+    # auth.resolve_auth (этот пакет её не трогал).
     old = login(A, STATE["pw"])
     clear_limit()
     t = issue(A)
