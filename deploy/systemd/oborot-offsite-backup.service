@@ -2,6 +2,8 @@
 Description=Оборот: зашифрованная копия базы вне сервера
 After=network-online.target
 Wants=network-online.target
+# Сбой копии — служебное оповещение оператору (не в чат организации).
+OnFailure=oborot-ops-alert@%n.service
 
 [Service]
 Type=oneshot

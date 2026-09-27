@@ -173,6 +173,10 @@ SUITES = [
     ("backup",      "test_backup.py",          False, False),
     ("deploy",      "test_deploy.py",          False, False),
     ("offsite",     "test_offsite.py",         False, False),
+    # PILOT-OPS-ALERTS-1: служебные оповещения о сбоях офсайт-бэкапа и
+    # учения — только в чат сервиса, фиксированный текст, без секретов.
+    # Нужен порт mock-Telegram (четвёртое поле), наружу набор не ходит.
+    ("ops_alert",   "test_ops_alert.py",       False, True),
     ("deps",        "test_dependencies.py",    False, False),
 ]
 

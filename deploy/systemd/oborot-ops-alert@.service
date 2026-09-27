@@ -1,0 +1,23 @@
+[Unit]
+Description=Оборот: служебное оповещение о сбое %i
+# Вызывается как OnFailure=oborot-ops-alert@%n.service у юнитов офсайт-бэкапа
+# и учения. У самого отправителя OnFailure НЕТ и быть не должно: упавшая
+# отправка иначе вызывала бы сама себя. Её сбой остаётся в журнале.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Токен бота и чат сервиса (OBOROT_TG_BOT_TOKEN, OBOROT_OPS_CHAT_ID) — из
+# защищённого файла окружения. Файл читает systemd до смены пользователя;
+# в аргументах команды и в Environment= юнита секретов нет — `systemctl show`
+# показывает только путь к файлу, а не его содержимое.
+EnvironmentFile=/opt/oborot/env
+User=oborot
+WorkingDirectory=/opt/oborot/app-src
+# %i — имя упавшего юнита; инструмент принимает только юниты из явного списка
+# (app/notify.py, OPS_UNITS), всё прочее — отказ с кодом 2 без отправки.
+ExecStart=/opt/oborot/venv/bin/python /opt/oborot/app-src/tools/ops_alert.py unit-failed %i
+TimeoutStartSec=60
+NoNewPrivileges=yes
+PrivateTmp=yes
