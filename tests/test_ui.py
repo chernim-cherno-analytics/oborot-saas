@@ -707,6 +707,7 @@ def run() -> int:  # noqa: C901 — сценарный тест: шагов мн
             _browser_journey(browser, base, journey_shots)
             for width in (1400, MOBILE_WIDTH):
                 _connection_states(browser, base, width, journey_shots)
+            _shell_journey(browser, base, c)
         except Exception as exc:  # noqa: BLE001 — падение пути обязано стать
             # отчётом и ненулевым кодом, а не трассировкой без отчёта (D-42).
             check("сквозной путь в браузере дошёл до конца", False,
@@ -726,6 +727,317 @@ def run() -> int:  # noqa: C901 — сценарный тест: шагов мн
     for name in FAIL:
         print(f"  FAIL {name}")
     return 1 if FAIL else 0
+
+
+# ── PILOT-UX-SHELL-1: каркас — меню, выход, демо ────────────────────────────
+#
+# Меряется то, что видит и нажимает человек, а не `scrollWidth` страницы:
+# прежняя лента меню на 390 px не расширяла страницу, но прятала 8–10 из 11
+# разделов за краем своей прокрутки без намёка, что их можно докрутить.
+
+SHELL_LINKS = ("/turnover", "/stocks", "/assistant", "/replenish", "/sizes", "/supply",
+               "/budget", "/forecast", "/revenue", "/lessons", "/settings")
+
+
+def _shell_btn(page):
+    return page.locator('[data-shell-toggle][aria-controls="app-nav"],'
+                        ' [data-shell-toggle][aria-controls="side-nav"]').first
+
+
+def _shell_nav_boxes(page) -> list:
+    """Прямоугольники ссылок меню текущего каркаса (без встроенных табов)."""
+    return page.evaluate("""() => {
+      const nav = document.getElementById('app-nav') || document.getElementById('side-nav');
+      if (!nav) return [];
+      return [...nav.querySelectorAll('a[href]')].map(a => {
+        const r = a.getBoundingClientRect(); const s = getComputedStyle(a);
+        return {href: a.getAttribute('href'), left: r.left, right: r.right, top: r.top,
+                bottom: r.bottom, h: r.height, w: r.width, vw: innerWidth, vh: innerHeight,
+                shown: r.width > 0 && r.height > 0 && s.visibility !== 'hidden',
+                current: a.getAttribute('aria-current')};
+      });
+    }""")
+
+
+def _tap_past_hint(page, locator, what: str, timeout_ms: int = 30000) -> None:
+    """Касание с той же оговоркой, что и `_click_past_hint`: подсказка первого
+    визита всплывает не сразу и может перехватить касание — человек её
+    закрывает и касается снова."""
+    deadline = time.time() + timeout_ms / 1000
+    last_error = None
+    while time.time() < deadline:
+        _close_hint(page)
+        try:
+            locator.tap(timeout=2000)
+            return
+        except Exception as exc:  # noqa: BLE001 — причина уйдёт в отчёт ниже
+            last_error = exc
+            page.wait_for_timeout(200)
+    raise RuntimeError(f"касание {what} не прошло за {timeout_ms} мс: {last_error}")
+
+
+def _wait_shell(page) -> None:
+    """Дождаться УСПЕШНОЙ инициализации shell.js: класс `shell-js` ставит
+    сам скрипт последним шагом (корректив REVIEW_REJECT r1)."""
+    page.wait_for_load_state("domcontentloaded")
+    page.wait_for_function("() => document.documentElement.classList.contains('shell-js')",
+                           timeout=30000)
+    _close_hint(page)
+
+
+def _shell_script_failure(browser, base: str, cookies: list) -> None:
+    """Корректив REVIEW_REJECT r1 (issuecomment-5862497540): shell.js не дошёл.
+
+    Прежде класс `shell-js` ставила строка в <head> ДО загрузки скрипта, и при
+    его сбое меню на 390 px было свёрнуто, а кнопка мертва — ни одной видимой
+    ссылки. Здесь браузер сам обрывает запрос /static/shell.js, и проверяется,
+    что все 11 разделов видны и переход по ним работает. Контроль — та же
+    страница с доставленным скриптом: меню свёрнуто и раскрывается касанием.
+    """
+    print("\n== PILOT-UX-SHELL-1: shell.js не загрузился — навигация жива ==")
+    for path, target in (("/replenish", "/budget"), ("/settings", "/turnover")):
+        for failed in (True, False):
+            tag = f"390 {path} ({'shell.js оборван' if failed else 'контроль: shell.js есть'})"
+            ctx = browser.new_context(viewport={"width": MOBILE_WIDTH, "height": 844},
+                                      has_touch=True, is_mobile=True)
+            ctx.add_cookies(cookies)
+            aborted: list[str] = []
+            if failed:
+                def _abort(route):
+                    aborted.append(route.request.url)
+                    route.abort()
+                ctx.route("**/static/shell.js", _abort)
+            page = ctx.new_page()
+            try:
+                page.goto(base + path)
+                page.wait_for_load_state("load")
+                if not failed:
+                    _wait_shell(page)
+                _close_hint(page)
+                has_cls = page.evaluate(
+                    "() => document.documentElement.classList.contains('shell-js')")
+                btn = _shell_btn(page)
+                boxes = {b["href"]: b for b in _shell_nav_boxes(page)}
+                if failed:
+                    check(f"{tag}: запрос shell.js действительно оборван",
+                          any(u.endswith("/static/shell.js") for u in aborted), str(aborted))
+                    check(f"{tag}: класса shell-js нет, кнопки меню нет",
+                          not has_cls and not btn.is_visible(), f"cls={has_cls}")
+                    bad = [h for h in SHELL_LINKS if not (
+                        h in boxes and boxes[h]["shown"] and boxes[h]["h"] >= 40
+                        and boxes[h]["left"] >= -0.5 and boxes[h]["right"] <= boxes[h]["vw"] + 0.5)]
+                    check(f"{tag}: все 11 разделов видны целиком по ширине и ≥ 40 px",
+                          not bad, str(bad))
+                    nav_id = "app-nav" if path != "/settings" else "side-nav"
+                    if bad:
+                        # Касаться нечего — это и есть дефект; отчёт, а не
+                        # исключение, чтобы проверка base.html тоже прошла.
+                        check(f"{tag}: касание пункта без shell.js открывает {target}",
+                              False, "пункт не виден — касание невозможно")
+                    else:
+                        with page.expect_navigation():
+                            _tap_past_hint(page, page.locator(f'#{nav_id} a[href="{target}"]'),
+                                           target)
+                        check(f"{tag}: касание пункта без shell.js открывает {target}",
+                              page.url.endswith(target), page.url)
+                else:
+                    shown = [h for h, b in boxes.items() if b["shown"]]
+                    check(f"{tag}: класс shell-js стоит, меню свёрнуто, кнопка видна",
+                          has_cls and not shown and btn.is_visible(), f"shown={shown}")
+                    _tap_past_hint(page, btn, "кнопка меню")
+                    page.wait_for_function(
+                        "() => { const n = document.getElementById('app-nav') ||"
+                        " document.getElementById('side-nav');"
+                        " return !!n && n.classList.contains('open'); }", timeout=10000)
+                    opened = [h for h, b in _shell_nav_boxes_map(page).items() if b["shown"]]
+                    check(f"{tag}: касание раскрывает все 11 разделов",
+                          btn.get_attribute("aria-expanded") == "true"
+                          and all(h in opened for h in SHELL_LINKS), str(len(opened)))
+            finally:
+                ctx.close()
+
+
+def _shell_nav_boxes_map(page) -> dict:
+    return {b["href"]: b for b in _shell_nav_boxes(page)}
+
+
+def _shell_mobile(browser, base: str, cookies: list) -> None:
+    print("\n== PILOT-UX-SHELL-1: меню на 390 px — касания, Escape, переход ==")
+    ctx = browser.new_context(viewport={"width": MOBILE_WIDTH, "height": 844},
+                              has_touch=True, is_mobile=True)
+    ctx.add_cookies(cookies)
+    errors: list[str] = []
+    page = ctx.new_page()
+    page.on("pageerror", lambda e: errors.append(str(e)))
+    try:
+        for path, label, target, target_label in (
+                ("/replenish", "Заказ", "/budget", "Бюджет"),
+                ("/settings", "Настройки", "/turnover", "Оборачиваемость")):
+            tag = f"390 {path}"
+            page.goto(base + path)
+            _wait_shell(page)
+            btn = _shell_btn(page)
+            box = btn.bounding_box() or {}
+            check(f"{tag}: кнопка меню видна, не ниже 40 px и называет раздел «{label}»",
+                  btn.is_visible() and box.get("height", 0) >= 40
+                  and label in (btn.text_content() or ""),
+                  f"h={box.get('height')} text={btn.text_content()!r}")
+            closed = [b for b in _shell_nav_boxes(page) if b["shown"]]
+            check(f"{tag}: пока меню закрыто, список разделов свёрнут", not closed,
+                  str([b["href"] for b in closed]))
+            _tap_past_hint(page, btn, "кнопка меню")
+            page.wait_for_function(
+                "() => { const n = document.getElementById('app-nav') ||"
+                " document.getElementById('side-nav'); return !!n && n.classList.contains('open'); }",
+                timeout=10000)
+            check(f"{tag}: aria-expanded=true после касания",
+                  btn.get_attribute("aria-expanded") == "true")
+            boxes = {b["href"]: b for b in _shell_nav_boxes(page)}
+            missing = [h for h in SHELL_LINKS if h not in boxes]
+            check(f"{tag}: в открытом меню все 11 разделов", not missing, str(missing))
+            bad = [h for h, b in boxes.items()
+                   if not (b["shown"] and b["h"] >= 40 and b["left"] >= -0.5
+                           and b["right"] <= b["vw"] + 0.5)]
+            check(f"{tag}: каждый раздел виден целиком по ширине и не ниже 40 px",
+                  not bad, str([(h, boxes[h]) for h in bad][:2]))
+            current = [h for h, b in boxes.items() if b["current"] == "page"]
+            check(f"{tag}: текущий раздел отмечен aria-current (ровно один: {path})",
+                  current == [path], str(current))
+            page.keyboard.press("Escape")
+            focused = page.evaluate("() => document.activeElement &&"
+                                    " document.activeElement.hasAttribute('data-shell-toggle')"
+                                    " && document.activeElement.getAttribute('aria-controls')")
+            check(f"{tag}: Escape закрывает меню и возвращает фокус на кнопку",
+                  btn.get_attribute("aria-expanded") == "false"
+                  and focused in ("app-nav", "side-nav"), f"focus={focused}")
+            # Tab за последний пункт: меню обязано закрыться, а не остаться
+            # поверх страницы, пряча элемент, на который ушёл фокус.
+            _tap_past_hint(page, btn, "кнопка меню")
+            nav_id = btn.get_attribute("aria-controls")
+            left = False
+            for _ in range(20):
+                page.keyboard.press("Tab")
+                left = page.evaluate("""(id) => { const a = document.activeElement;
+                  const n = document.getElementById(id);
+                  return !!a && a !== document.body && !n.contains(a)
+                         && !a.hasAttribute('data-shell-toggle'); }""", nav_id)
+                if left:
+                    break
+            check(f"{tag}: фокус ушёл из меню клавишей Tab — меню закрылось",
+                  left and btn.get_attribute("aria-expanded") == "false",
+                  f"left={left} expanded={btn.get_attribute('aria-expanded')}")
+            _tap_past_hint(page, btn, "кнопка меню")
+            with page.expect_navigation():
+                _tap_past_hint(page, page.locator(f'#{nav_id} a[href="{target}"]'), target)
+            _wait_shell(page)
+            nbtn = _shell_btn(page)
+            check(f"{tag}: касание пункта открыло {target}, меню на новой странице"
+                  f" закрыто и называет «{target_label}»",
+                  page.url.endswith(target) and nbtn.get_attribute("aria-expanded") == "false"
+                  and target_label in (nbtn.text_content() or ""),
+                  f"url={page.url} text={nbtn.text_content()!r}")
+        page.goto(base + "/replenish")
+        _wait_shell(page)
+        check("390 /replenish: каркас не расширяет страницу",
+              page.evaluate("() => document.documentElement.scrollWidth <= innerWidth + 1"),
+              str(page.evaluate("() => document.documentElement.scrollWidth")))
+        ubtn = page.locator('[data-shell-toggle][aria-controls="app-user-pop"]')
+        _tap_past_hint(page, ubtn, "меню пользователя")
+        out = page.locator('#app-user-pop button[type="submit"]')
+        obox = out.bounding_box() or {}
+        check("390: меню пользователя открывается касанием, «Выйти» в окне и ≥ 40 px",
+              out.is_visible() and obox.get("height", 0) >= 40
+              and obox.get("x", -1) >= 0 and obox.get("x", 0) + obox.get("width", 0) <= MOBILE_WIDTH + 0.5,
+              str(obox))
+        check("390: ошибок в консоли не было", not errors, str(errors[:2])[:200])
+    finally:
+        ctx.close()
+
+
+def _shell_desktop_and_logout(browser, base: str, cookies: list) -> None:
+    print("\n== PILOT-UX-SHELL-1: десктоп — все разделы видны; выход POST с CSRF ==")
+    ctx = browser.new_context(viewport={"width": 1440, "height": 900})
+    ctx.add_cookies(cookies)
+    errors: list[str] = []
+    page = ctx.new_page()
+    page.on("pageerror", lambda e: errors.append(str(e)))
+    try:
+        for path in ("/turnover", "/settings"):
+            page.goto(base + path)
+            _wait_shell(page)
+            boxes = {b["href"]: b for b in _shell_nav_boxes(page)}
+            hidden = [h for h in SHELL_LINKS if not (h in boxes and boxes[h]["shown"]
+                      and boxes[h]["right"] <= boxes[h]["vw"] + 0.5 and boxes[h]["top"] >= 0
+                      and boxes[h]["bottom"] <= boxes[h]["vh"])]
+            check(f"1440 {path}: все 11 разделов видны без раскрытия меню", not hidden,
+                  str(hidden))
+            check(f"1440 {path}: кнопка мобильного меню скрыта",
+                  not _shell_btn(page).is_visible())
+        page.goto(base + "/turnover")
+        _wait_shell(page)
+        ubtn = page.locator('[data-shell-toggle][aria-controls="app-user-pop"]')
+        _click_past_hint(page, ubtn, "меню пользователя")
+        form = page.locator('#app-user-pop form[action="/logout"]')
+        token = form.locator('input[name="csrf_token"]').get_attribute("value") or ""
+        check("1440 /turnover: в меню пользователя форма POST /logout с csrf_token",
+              form.count() == 1 and (form.get_attribute("method") or "").lower() == "post"
+              and len(token) > 8, f"token_len={len(token)}")
+        page.keyboard.press("Escape")
+        check("1440 /turnover: Escape закрывает меню пользователя",
+              ubtn.get_attribute("aria-expanded") == "false"
+              and not page.locator("#app-user-pop").is_visible())
+        _click_past_hint(page, ubtn, "меню пользователя")
+        with page.expect_navigation():
+            _click_past_hint(page, page.locator('#app-user-pop button[type="submit"]'), "«Выйти»")
+        check("«Выйти» со самостоятельной страницы ведёт на /login", page.url.endswith("/login"),
+              page.url)
+        page.goto(base + "/turnover")
+        check("после выхода /turnover снова требует входа", page.url.endswith("/login"),
+              page.url)
+        check("1440: ошибок в консоли не было", not errors, str(errors[:2])[:200])
+    finally:
+        ctx.close()
+
+
+def _shell_demo_truth(base: str) -> None:
+    """«Демо-режим» — правда о данных: по `org.demo`, а не по тарифу."""
+    import sqlite3
+    print("\n== PILOT-UX-SHELL-1: «Демо-режим» по данным, а не по тарифу ==")
+    for demo in (True, False):
+        cl = httpx.Client(headers={"X-Oborot-CSRF": "1"}, base_url=base, timeout=120.0)
+        email = f"shell-{'demo' if demo else 'real'}@test.io"
+        cl.post("/register", data={"name": "Каркас", "email": email,
+                                   "password": "secret123", "org_name": "Каркас-" + email})
+        if demo:
+            cl.post("/api/connect/demo")
+        kind = "демо" if demo else "без демо"
+        for plan in ("trial", "start"):
+            with sqlite3.connect(DB_PATH) as con:
+                # Фикстура тарифа — в базе набора, как и в других наборах:
+                # публичной ручки «сменить тариф без оплаты» нет и быть не должно.
+                con.execute("UPDATE orgs SET plan=? WHERE id IN (SELECT m.org_id FROM"
+                            " memberships m JOIN users u ON u.id=m.user_id WHERE u.email=?)",
+                            (plan, email))
+            for path in ("/turnover", "/replenish", "/settings"):
+                html = cl.get(path).text
+                check(f"{kind}, тариф {plan}, {path}: «Демо-режим» "
+                      f"{'есть' if demo else 'нет'}",
+                      ("Демо-режим" in html) is demo)
+            settings = cl.get("/settings").text
+            check(f"{kind}, тариф {plan}: триал на /settings назван только у триала",
+                  ("Триал до" in settings) is (plan == "trial"))
+            check(f"{kind}, тариф {plan}: на самостоятельной странице про триал ни слова",
+                  "Триал до" not in cl.get("/turnover").text)
+        cl.close()
+
+
+def _shell_journey(browser, base: str, c) -> None:
+    cookies = [{"name": k, "value": v, "domain": "127.0.0.1", "path": "/"}
+               for k, v in c.cookies.items()]
+    _shell_mobile(browser, base, cookies)
+    _shell_script_failure(browser, base, cookies)
+    _shell_desktop_and_logout(browser, base, cookies)
+    _shell_demo_truth(base)
 
 
 # ── PILOT-SYNC-TRUTH-1: экран не обещает того, чего не знает ────────────────

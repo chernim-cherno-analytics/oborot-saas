@@ -136,9 +136,15 @@ h1, h2, h3 { margin: 0; font-weight: 700; }
 
 .nav { flex: 1; padding: 8px 8px 10px; overflow-y: auto; }
 
+/* Кнопка мобильного меню сайдбара (PILOT-UX-SHELL-1) — только на узком
+   экране, см. @media (max-width: 760px) ниже. */
+.side-menu-btn { display: none; }
+
 .nav .nav-grp {
-  font-size: 9.5px; letter-spacing: .14em; text-transform: uppercase;
-  color: var(--side-grp);
+  /* PILOT-UX-SHELL-1: было --side-grp (#5c6878 на #10161f, 3,2:1 при 9,5 px);
+     --side-muted даёт ≥ 4,5:1, подпись группы читается. */
+  font-size: 10px; letter-spacing: .14em; text-transform: uppercase;
+  color: var(--side-muted);
   padding: 12px 10px 5px;
   user-select: none;
 }
@@ -239,6 +245,9 @@ h1, h2, h3 { margin: 0; font-weight: 700; }
   font: inherit; color: var(--ink); cursor: pointer; text-decoration: none;
 }
 .user-pop button:hover, .user-pop a.up-item:hover { background: #f1f4f8; text-decoration: none; }
+/* PILOT-UX-SHELL-1: «Выйти» и «Настройки» — не ниже 40 px (было 34,8 px),
+   как и в меню пользователя самостоятельных страниц. */
+.user-pop button, .user-pop a.up-item { min-height: 40px; }
 
 /* --- Демо-полоска --- */
 
@@ -920,22 +929,44 @@ tr.rt-weak:hover > td { background: rgba(229, 72, 77, 0.13); }
 
   .shell { flex-direction: column; min-height: 0; }
 
-  /* Сайдбар: из вертикальной колонки слева — в компактную строку сверху,
-     меню становится горизонтальной лентой со своим скроллом (та же идея,
-     что уже применена для встроенного режима в МойСклад, .embed-tabs). */
+  /* Сайдбар: из вертикальной колонки слева — в компактную строку сверху:
+     логотип и кнопка «Меню · <раздел>». Список раскрывается по кнопке
+     (static/shell.js) во всю ширину, с группами и пунктами по 44 px.
+     PILOT-UX-SHELL-1: прежде меню было горизонтальной лентой со своей
+     прокруткой, и на 390 px из 11 разделов в окне был виден один. Класс
+     `shell-js` ставит static/shell.js в конце успешной инициализации; пока
+     его нет (скрипт не загрузился или упал), кнопки меню нет, а список не
+     свёрнут и виден целиком. */
   .sidebar {
     position: relative; inset: auto; width: 100%; min-width: 0;
-    flex-direction: row; align-items: center; gap: 10px;
-    padding: 8px 10px;
+    flex-direction: row; flex-wrap: wrap; align-items: center; gap: 10px;
+    padding: 8px 12px;
   }
   .sidebar .brand { padding: 0; border-bottom: none; flex: 0 0 auto; }
   .sidebar .b-org { max-width: 80px; }
-  .sidebar .nav {
-    display: flex; flex-direction: row; align-items: center; overflow-x: auto;
-    padding: 0; gap: 2px; -webkit-overflow-scrolling: touch; flex: 0 1 auto;
+  .sidebar .side-menu-btn {
+    display: inline-flex; align-items: center; gap: 8px;
+    flex: 1 1 auto; min-width: 0; min-height: 44px; padding: 0 12px;
+    border: 1px solid rgba(255,255,255,.16); border-radius: 8px;
+    background: var(--side-2); color: #fff;
+    font: inherit; font-size: 14px; cursor: pointer; text-align: left;
   }
-  .sidebar .nav .nav-grp { display: none; }
-  .sidebar .nav a { white-space: nowrap; flex: 0 0 auto; }
+  .sidebar .side-menu-btn:focus-visible { outline: 2px solid #8fb4ff; outline-offset: 2px; }
+  .sidebar .side-menu-lbl { flex: 0 0 auto; color: var(--side-text); }
+  .sidebar .side-menu-cur {
+    min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 700;
+  }
+  .sidebar .side-menu-cur:not(:empty)::before { content: "· "; font-weight: 400; color: var(--side-text); }
+  html:not(.shell-js) .sidebar .side-menu-btn { display: none; }
+  /* Список — в потоке страницы, без своего потолка по высоте: с потолком
+     70vh на 375×667 он обрывался ровно по краю пункта, и «Обучение» и
+     «Настройки» выглядели отсутствующими (замер линии B). */
+  .sidebar .nav {
+    flex: 1 1 100%; order: 3; padding: 4px 0 8px;
+  }
+  html.shell-js .sidebar .nav { display: none; }
+  html.shell-js .sidebar .nav.open { display: block; }
+  .sidebar .nav a { min-height: 44px; }
   .sidebar .side-status { display: none; }
 
   .main { margin-left: 0; }

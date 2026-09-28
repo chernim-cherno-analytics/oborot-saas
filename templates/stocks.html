@@ -163,16 +163,12 @@
   .msub2 { display: block; font-size: 9px; opacity: .55; margin-top: 2px; }
 </style>
 {% include "_mobile.html" %}
+{% include "_app_shell_head.html" %}
 </head>
 <body>
 {% include "_embed.html" %}
 <div class="gradient-bg"></div>
-<div class="header">
-  <a class="logo" href="/turnover">ОБОРОТ</a>
-  <nav class="nav">
-{% with nav_primary = true %}{% include "_nav_links.html" %}{% endwith %}
-  </nav>
-</div>
+{% with nav_primary = true %}{% include "_app_shell.html" %}{% endwith %}
 
 <div class="cat-bar" id="cat-bar"></div>
 

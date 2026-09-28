@@ -88,16 +88,12 @@
     border: 1px solid rgba(31,31,31,.16); background: rgba(255,255,255,.85); outline: none; margin-bottom: 10px; }
 </style>
 {% include "_mobile.html" %}
+{% include "_app_shell_head.html" %}
 </head>
 <body>
 {% include "_embed.html" %}
 <div class="gradient-bg"></div>
-<div class="header">
-  <a class="logo" href="/turnover">ОБОРОТ</a>
-  <nav class="nav">
-{% include "_nav_links.html" %}
-  </nav>
-</div>
+{% include "_app_shell.html" %}
 
 <div class="main">
   <details class="note">

@@ -25,19 +25,10 @@
    static/app.css для страниц на общем каркасе, и разъезжаться им незачем. #}
 <style>
 @media (max-width: 760px) {
-  /* ── 1. Шапка: логотип строкой, меню — лента с горизонтальной прокруткой ── */
-  .header {
-    height: auto; min-height: 52px; padding: 8px 14px;
-    flex-wrap: wrap; row-gap: 6px; align-items: center;
-  }
-  .header .logo { flex: 0 0 auto; }
-  .nav {
-    flex-wrap: nowrap; width: 100%; gap: 16px;
-    overflow-x: auto; -webkit-overflow-scrolling: touch;
-    scrollbar-width: none; padding-bottom: 2px;
-  }
-  .nav::-webkit-scrollbar { height: 0; }
-  .nav a { white-space: nowrap; flex: 0 0 auto; padding: 4px 0; }
+  /* ── 1. Шапка — теперь в static/shell.css (PILOT-UX-SHELL-1). Прежняя
+         лента меню со скрытой прокруткой прятала за краем 8 из 11 разделов
+         без единого намёка, что их можно докрутить; её место заняла кнопка
+         «Меню · <раздел>» с полным списком. ── */
 
   .main { padding-left: 14px; padding-right: 14px; }
 
