@@ -777,11 +777,88 @@ def _tap_past_hint(page, locator, what: str, timeout_ms: int = 30000) -> None:
 
 
 def _wait_shell(page) -> None:
+    """Дождаться УСПЕШНОЙ инициализации shell.js: класс `shell-js` ставит
+    сам скрипт последним шагом (корректив REVIEW_REJECT r1)."""
     page.wait_for_load_state("domcontentloaded")
-    page.wait_for_function("() => { const b = document.querySelector('[data-shell-toggle]');"
-                           " return !!b && !!b.querySelector('[data-shell-current]'); }",
+    page.wait_for_function("() => document.documentElement.classList.contains('shell-js')",
                            timeout=30000)
     _close_hint(page)
+
+
+def _shell_script_failure(browser, base: str, cookies: list) -> None:
+    """Корректив REVIEW_REJECT r1 (issuecomment-5862497540): shell.js не дошёл.
+
+    Прежде класс `shell-js` ставила строка в <head> ДО загрузки скрипта, и при
+    его сбое меню на 390 px было свёрнуто, а кнопка мертва — ни одной видимой
+    ссылки. Здесь браузер сам обрывает запрос /static/shell.js, и проверяется,
+    что все 11 разделов видны и переход по ним работает. Контроль — та же
+    страница с доставленным скриптом: меню свёрнуто и раскрывается касанием.
+    """
+    print("\n== PILOT-UX-SHELL-1: shell.js не загрузился — навигация жива ==")
+    for path, target in (("/replenish", "/budget"), ("/settings", "/turnover")):
+        for failed in (True, False):
+            tag = f"390 {path} ({'shell.js оборван' if failed else 'контроль: shell.js есть'})"
+            ctx = browser.new_context(viewport={"width": MOBILE_WIDTH, "height": 844},
+                                      has_touch=True, is_mobile=True)
+            ctx.add_cookies(cookies)
+            aborted: list[str] = []
+            if failed:
+                def _abort(route):
+                    aborted.append(route.request.url)
+                    route.abort()
+                ctx.route("**/static/shell.js", _abort)
+            page = ctx.new_page()
+            try:
+                page.goto(base + path)
+                page.wait_for_load_state("load")
+                if not failed:
+                    _wait_shell(page)
+                _close_hint(page)
+                has_cls = page.evaluate(
+                    "() => document.documentElement.classList.contains('shell-js')")
+                btn = _shell_btn(page)
+                boxes = {b["href"]: b for b in _shell_nav_boxes(page)}
+                if failed:
+                    check(f"{tag}: запрос shell.js действительно оборван",
+                          any(u.endswith("/static/shell.js") for u in aborted), str(aborted))
+                    check(f"{tag}: класса shell-js нет, кнопки меню нет",
+                          not has_cls and not btn.is_visible(), f"cls={has_cls}")
+                    bad = [h for h in SHELL_LINKS if not (
+                        h in boxes and boxes[h]["shown"] and boxes[h]["h"] >= 40
+                        and boxes[h]["left"] >= -0.5 and boxes[h]["right"] <= boxes[h]["vw"] + 0.5)]
+                    check(f"{tag}: все 11 разделов видны целиком по ширине и ≥ 40 px",
+                          not bad, str(bad))
+                    nav_id = "app-nav" if path != "/settings" else "side-nav"
+                    if bad:
+                        # Касаться нечего — это и есть дефект; отчёт, а не
+                        # исключение, чтобы проверка base.html тоже прошла.
+                        check(f"{tag}: касание пункта без shell.js открывает {target}",
+                              False, "пункт не виден — касание невозможно")
+                    else:
+                        with page.expect_navigation():
+                            _tap_past_hint(page, page.locator(f'#{nav_id} a[href="{target}"]'),
+                                           target)
+                        check(f"{tag}: касание пункта без shell.js открывает {target}",
+                              page.url.endswith(target), page.url)
+                else:
+                    shown = [h for h, b in boxes.items() if b["shown"]]
+                    check(f"{tag}: класс shell-js стоит, меню свёрнуто, кнопка видна",
+                          has_cls and not shown and btn.is_visible(), f"shown={shown}")
+                    _tap_past_hint(page, btn, "кнопка меню")
+                    page.wait_for_function(
+                        "() => { const n = document.getElementById('app-nav') ||"
+                        " document.getElementById('side-nav');"
+                        " return !!n && n.classList.contains('open'); }", timeout=10000)
+                    opened = [h for h, b in _shell_nav_boxes_map(page).items() if b["shown"]]
+                    check(f"{tag}: касание раскрывает все 11 разделов",
+                          btn.get_attribute("aria-expanded") == "true"
+                          and all(h in opened for h in SHELL_LINKS), str(len(opened)))
+            finally:
+                ctx.close()
+
+
+def _shell_nav_boxes_map(page) -> dict:
+    return {b["href"]: b for b in _shell_nav_boxes(page)}
 
 
 def _shell_mobile(browser, base: str, cookies: list) -> None:
@@ -958,6 +1035,7 @@ def _shell_journey(browser, base: str, c) -> None:
     cookies = [{"name": k, "value": v, "domain": "127.0.0.1", "path": "/"}
                for k, v in c.cookies.items()]
     _shell_mobile(browser, base, cookies)
+    _shell_script_failure(browser, base, cookies)
     _shell_desktop_and_logout(browser, base, cookies)
     _shell_demo_truth(base)
 

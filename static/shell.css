@@ -131,8 +131,11 @@
     min-width: 44px; min-height: 44px; padding: 4px; justify-content: center;
   }
 
-  /* Без JS список остаётся в потоке и виден весь (перенос строк). С JS —
-     выпадает под шапкой по кнопке и помещается в окно по высоте. */
+  /* Пока на <html> нет `shell-js`, список в потоке и виден весь (перенос
+     строк), а кнопки меню нет. Класс ставит static/shell.js в конце успешной
+     инициализации, так что при незагрузившемся или упавшем скрипте меню не
+     бывает свёрнутым без рабочей кнопки. С классом — список выпадает под
+     шапкой по кнопке и помещается в окно по высоте. */
   .header.app-top .app-nav { justify-content: flex-start; }
   html.shell-js .header.app-top { flex-wrap: nowrap; }
   html:not(.shell-js) .header.app-top { flex-wrap: wrap; }

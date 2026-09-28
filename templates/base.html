@@ -8,9 +8,10 @@
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='6' fill='%231554d1'/%3E%3Ctext x='12' y='17' font-family='Arial,sans-serif' font-size='14' font-weight='800' fill='white' text-anchor='middle'%3E%D0%9E%3C/text%3E%3C/svg%3E">
   <script src="/static/app.js" defer></script>
   {# PILOT-UX-SHELL-1: мобильное меню сайдбара ведёт тот же static/shell.js,
-     что и шапку самостоятельных страниц. `shell-js` — до отрисовки: без
-     скрипта список разделов не сворачивается. #}
-  <script>document.documentElement.classList.add("shell-js");</script>
+     что и шапку самостоятельных страниц. Класс `shell-js`, сворачивающий
+     список, ставит сам скрипт после успешной инициализации (корректив
+     REVIEW_REJECT r1, см. _app_shell_head.html): не загрузился скрипт —
+     список разделов остаётся развёрнутым и рабочим. #}
   <script src="/static/shell.js" defer></script>
 </head>
 <body class="{% if embedded %}embed {% endif %}{% block bodyclass %}{% endblock %}">
