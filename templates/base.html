@@ -7,6 +7,11 @@
   <link rel="stylesheet" href="/static/app.css">
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='6' fill='%231554d1'/%3E%3Ctext x='12' y='17' font-family='Arial,sans-serif' font-size='14' font-weight='800' fill='white' text-anchor='middle'%3E%D0%9E%3C/text%3E%3C/svg%3E">
   <script src="/static/app.js" defer></script>
+  {# PILOT-UX-SHELL-1: мобильное меню сайдбара ведёт тот же static/shell.js,
+     что и шапку самостоятельных страниц. `shell-js` — до отрисовки: без
+     скрипта список разделов не сворачивается. #}
+  <script>document.documentElement.classList.add("shell-js");</script>
+  <script src="/static/shell.js" defer></script>
 </head>
 <body class="{% if embedded %}embed {% endif %}{% block bodyclass %}{% endblock %}">
 {% block body %}
@@ -31,12 +36,16 @@
     <a href="/settings" class="{{ 'active' if active == 'settings' else '' }}">Настройки</a>
   </nav>
 
-  {# Триал/демо-полоску показываем ТОЛЬКО не-МС-триалу: подписку МС-аккаунта
-     показывает сам МойСклад снаружи (см. задачу, п.3). #}
-  {% if org.plan == 'trial' and org.source != 'ms_app' %}
+  {# Триал показываем ТОЛЬКО не-МС-триалу: подписку МС-аккаунта показывает сам
+     МойСклад снаружи (см. задачу, п.3). Демо-режим — правда о ДАННЫХ, а не о
+     подписке (PILOT-UX-SHELL-1): он виден при `org.demo` независимо от тарифа.
+     Прежде слова про демо жили внутри триальной полоски, и демо-организация на
+     платном тарифе не видела их нигде. #}
+  {% set show_trial = org.plan == 'trial' and org.source != 'ms_app' %}
+  {% if show_trial or org.demo %}
   <div class="trial-strip">
     {% if org.demo %}<strong>Демо-режим:</strong> показаны синтетические данные.
-    {% endif %}Триал до <span data-fmt-date="{{ org.trial_ends_at }}">{{ org.trial_ends_at }}</span>.
+    {% endif %}{% if show_trial %}Триал до <span data-fmt-date="{{ org.trial_ends_at }}">{{ org.trial_ends_at }}</span>.{% endif %}
   </div>
   {% endif %}
 
@@ -56,9 +65,19 @@
       </div>
     </div>
 
-    <nav class="nav">
+    {# PILOT-UX-SHELL-1: на узком экране сайдбар — строка «логотип + Меню ·
+       <раздел>», список раскрывается по кнопке (static/shell.js). На широком
+       экране кнопка скрыта и сайдбар прежний. Жирная «Оборачиваемость» на
+       каждой странице читалась как второй активный пункт — начертание снято,
+       текущий раздел отмечает только `.active`. #}
+    <button class="side-menu-btn" type="button" data-shell-toggle aria-controls="side-nav" aria-expanded="false">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><line x1="4" y1="7" x2="20" y2="7"/><line x1="4" y1="12" x2="20" y2="12"/><line x1="4" y1="17" x2="20" y2="17"/></svg>
+      <span class="side-menu-lbl">Меню</span><span class="side-menu-cur" data-shell-current></span>
+    </button>
+
+    <nav class="nav" id="side-nav" aria-label="Разделы Оборота">
       <div class="nav-grp">Аналитика</div>
-      <a href="/turnover" class="{{ 'active' if active == 'turnover' else '' }}" style="font-weight:700;">Оборачиваемость</a>
+      <a href="/turnover" class="{{ 'active' if active == 'turnover' else '' }}">Оборачиваемость</a>
       <a href="/stocks" class="{{ 'active' if active == 'stocks' else '' }}">Активный сток</a>
       <div class="nav-grp">Операции</div>
       <a href="/assistant" class="{{ 'active' if active == 'assistant' else '' }}">Мастер заказа</a>
@@ -118,10 +137,12 @@
       </div>
     </header>
 
-    {% if org.plan == 'trial' %}
+    {# Демо — при `org.demo` на любом тарифе; триал — как и прежде, только у
+       триала. Одна полоска на оба факта, но ни один не выводится из другого. #}
+    {% if org.plan == 'trial' or org.demo %}
     <div class="trial-strip">
       {% if org.demo %}<strong>Демо-режим:</strong> показаны синтетические данные.
-      {% endif %}Триал до <span data-fmt-date="{{ org.trial_ends_at }}">{{ org.trial_ends_at }}</span>.
+      {% endif %}{% if org.plan == 'trial' %}Триал до <span data-fmt-date="{{ org.trial_ends_at }}">{{ org.trial_ends_at }}</span>.{% endif %}
     </div>
     {% endif %}
 

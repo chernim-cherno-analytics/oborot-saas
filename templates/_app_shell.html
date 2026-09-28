@@ -1,0 +1,51 @@
+{# ── PILOT-UX-SHELL-1: шапка девяти самостоятельных страниц ─────────────────
+   Одна копия вместо девяти одинаковых блоков `<div class="header">`. Стили —
+   static/shell.css, поведение — static/shell.js (тот же файл ведёт мобильное
+   меню сайдбара base.html). Подключается в <head> через _app_shell_head.html.
+
+   Состав:
+     • логотип и тот же список разделов `_nav_links.html` — названия, адреса
+       и порядок не меняются; `nav_primary` проходит насквозь;
+     • кнопка «Меню · <текущий раздел>» — видна только на узком экране;
+     • меню пользователя: имя, почта, «Настройки» и «Выйти». Выход — та же
+       форма POST /logout с csrf_token, что и в base.html: новой логики входа
+       и выхода нет, GET-выхода нет;
+     • под шапкой — полоска «Демо-режим», только когда `org.demo` (активное
+       подключение — демо, см. app.main._page). Про триал и тариф здесь не
+       говорится: это разные вещи, и подписка к данным отношения не имеет.
+
+   Класс `header` оставлен намеренно: встроенный режим МойСклада
+   (`_embed.html`) прячет именно `.header`, и внутри iframe шапка по-прежнему
+   не рисуется. Имя и почта выводятся через автоэкранирование Jinja. #}
+<header class="header app-top">
+  <a class="logo app-logo" href="/turnover">ОБОРОТ</a>
+  <button class="app-menu-btn" type="button" data-shell-toggle aria-controls="app-nav" aria-expanded="false">
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><line x1="4" y1="7" x2="20" y2="7"/><line x1="4" y1="12" x2="20" y2="12"/><line x1="4" y1="17" x2="20" y2="17"/></svg>
+    <span class="app-menu-lbl">Меню</span><span class="app-menu-cur" data-shell-current></span>
+  </button>
+  <nav class="nav app-nav" id="app-nav" aria-label="Разделы Оборота">
+{% include "_nav_links.html" %}
+  </nav>
+  <div class="app-user">
+    <button class="app-user-btn" type="button" data-shell-toggle aria-controls="app-user-pop"
+            aria-expanded="false" aria-haspopup="true" aria-label="Пользователь: {{ user.name or user.email }}">
+      <span class="app-avatar" aria-hidden="true">{{ (user.name or user.email or "?")[:1]|upper }}</span>
+      <span class="app-user-name">{{ user.name or user.email }}</span>
+      <span class="app-caret" aria-hidden="true"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg></span>
+    </button>
+    <div class="app-user-pop" id="app-user-pop">
+      <div class="app-up-head">
+        <div class="app-up-name">{{ user.name or "" }}</div>
+        <div class="app-up-mail">{{ user.email or "" }}</div>
+      </div>
+      <a class="app-up-item" href="/settings">Настройки</a>
+      <form method="post" action="/logout">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button class="app-up-item" type="submit">Выйти</button>
+      </form>
+    </div>
+  </div>
+</header>
+{% if org.demo %}
+<div class="app-demo" role="note"><strong>Демо-режим:</strong> показаны синтетические данные.</div>
+{% endif %}

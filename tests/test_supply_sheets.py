@@ -2428,8 +2428,14 @@ def structural_checks(owner) -> None:
     # десяти страницах, доказывает браузерная проверка F-01 в test_supply_ui.py;
     # здесь — структурная страховка на случай, если фрагмент отвяжут.
     fragment = (ROOT / "templates" / "_nav_links.html").read_text(encoding="utf-8")
+    # PILOT-UX-SHELL-1: самостоятельные страницы включают список не напрямую,
+    # а через общую шапку `_app_shell.html`; идём и по этой цепочке, иначе
+    # проверка краснела бы от переезда шапки, ничего не говоря про ссылку.
+    shell = (ROOT / "templates" / "_app_shell.html").read_text(encoding="utf-8")
     for name in ("base.html", "_embed.html", "replenish.html"):
         text = (ROOT / "templates" / name).read_text(encoding="utf-8")
+        if '{% include "_app_shell.html" %}' in text:
+            text += shell
         if '{% include "_nav_links.html" %}' in text:
             text += fragment
         check(f"ссылка «Поставки» есть в {name}",

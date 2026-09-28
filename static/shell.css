@@ -1,0 +1,155 @@
+/* ============================================================
+   PILOT-UX-SHELL-1: шапка девяти самостоятельных страниц
+   (templates/_app_shell.html). Эти страницы не подключают app.css — у
+   каждой своя тёплая палитра, — поэтому здесь только каркас шапки, и
+   весь он под `.header.app-top`: правила страниц `.header/.nav` той же
+   или меньшей специфичности остаются, но ничего здесь не перебивают.
+
+   Что меняется по сравнению с прежней шапкой:
+     • неактивные разделы — контраст ≥ 4,5:1 (было 2,7:1, rgba(31,31,31,.45));
+     • текущий раздел — тёмная плашка, а не только полужирный;
+     • справа — меню пользователя с «Настройками» и «Выйти» (раньше выхода
+       на этих страницах не было вовсе);
+     • на узком экране — кнопка «Меню · <раздел>» и полный список по нажатию
+       вместо ленты со скрытой прокруткой, где 8 из 11 разделов были за краем.
+   ============================================================ */
+
+.header.app-top {
+  position: sticky; top: 0; z-index: 200;
+  display: flex; align-items: center; justify-content: flex-start; gap: 18px;
+  height: auto; min-height: 56px; padding: 8px 28px;
+  background: rgba(243, 233, 224, .94);
+  backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+  border-bottom: 1px solid rgba(31, 31, 31, .08);
+}
+.header.app-top .app-logo {
+  flex: 0 0 auto; text-decoration: none; color: #1f1f1f;
+  font-size: 15px; font-weight: 700; letter-spacing: .12em;
+}
+
+.header.app-top .app-nav {
+  display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: center;
+  gap: 2px 4px; flex: 1 1 auto; margin: 0;
+}
+.header.app-top .app-nav a {
+  display: inline-flex; align-items: center;
+  padding: 7px 10px; border-radius: 8px;
+  font-size: 13px; line-height: 1.2; font-weight: 500;
+  color: #5a5550; text-decoration: none; white-space: nowrap;
+}
+.header.app-top .app-nav a:hover { background: rgba(31, 31, 31, .07); color: #1f1f1f; }
+.header.app-top .app-nav a.active { background: #1f1f1f; color: #fff; font-weight: 600; }
+/* `primary-page` (жирная «Оборачиваемость» на двух страницах) читался как
+   второй активный пункт. Текущий раздел теперь отмечен плашкой — жирный
+   неактивный пункт стал бы ложной подсказкой. */
+.header.app-top .app-nav a.primary-page:not(.active) { font-weight: 500; }
+
+.header.app-top a:focus-visible, .header.app-top button:focus-visible,
+.app-user-pop a:focus-visible, .app-user-pop button:focus-visible {
+  outline: 2px solid #1554d1; outline-offset: 2px;
+}
+
+/* Кнопка меню — только на узком экране. */
+.header.app-top .app-menu-btn { display: none; }
+
+/* --- Пользователь --- */
+.header.app-top .app-user { position: relative; flex: 0 0 auto; }
+.header.app-top .app-user-btn {
+  display: flex; align-items: center; gap: 8px; max-width: 220px;
+  min-height: 40px; padding: 4px 10px 4px 4px;
+  border: 1px solid rgba(31, 31, 31, .14); border-radius: 999px;
+  background: rgba(255, 255, 255, .65); color: #1f1f1f;
+  font: inherit; font-size: 13px; cursor: pointer;
+}
+.header.app-top .app-user-btn:hover { background: #fff; }
+.header.app-top .app-avatar {
+  flex: 0 0 auto; width: 30px; height: 30px; border-radius: 50%;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: #1f1f1f; color: #fff; font-size: 12px; font-weight: 700;
+}
+.header.app-top .app-user-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.header.app-top .app-caret { flex: 0 0 auto; color: #5a5550; display: inline-flex; }
+
+.app-user-pop {
+  display: none; position: absolute; right: 0; top: calc(100% + 8px); z-index: 260;
+  min-width: 240px; max-width: calc(100vw - 24px); padding: 6px 0;
+  background: #fff; border: 1px solid rgba(31, 31, 31, .12); border-radius: 12px;
+  box-shadow: 0 14px 34px rgba(0, 0, 0, .15);
+}
+.app-user-pop.open { display: block; }
+.app-user-pop .app-up-head { padding: 8px 16px 10px; border-bottom: 1px solid rgba(31, 31, 31, .08); }
+.app-user-pop .app-up-name { font-weight: 600; font-size: 13.5px; color: #1f1f1f; overflow-wrap: anywhere; }
+.app-user-pop .app-up-mail { font-size: 12px; color: #5a5550; overflow-wrap: anywhere; }
+.app-user-pop form { margin: 0; }
+.app-user-pop .app-up-item {
+  display: flex; align-items: center; width: 100%; min-height: 40px; padding: 8px 16px;
+  border: 0; background: none; text-align: left; text-decoration: none;
+  font: inherit; font-size: 13.5px; color: #1f1f1f; cursor: pointer;
+}
+.app-user-pop .app-up-item:hover { background: #f5efe9; }
+
+/* --- Демо-режим: правда о данных, не о подписке --- */
+.app-demo {
+  position: relative; z-index: 150;
+  padding: 7px 28px; font-size: 12.5px; line-height: 1.45;
+  background: #fdf3e0; color: #6b4e0e; border-bottom: 1px solid #edd3a4;
+}
+.app-demo strong { font-weight: 700; }
+
+/* Средняя ширина (ноутбук 1024–1360): одиннадцать разделов и имя
+   пользователя в одну строку не помещаются, и «Настройки» одиноко
+   переносились на вторую строку. Имя остаётся в подписи кнопки и в меню —
+   на кнопке здесь только аватар. */
+@media (max-width: 1360px) and (min-width: 761px) {
+  .header.app-top { gap: 12px; padding-left: 20px; padding-right: 20px; }
+  .header.app-top .app-nav a { padding: 7px 8px; }
+  .header.app-top .app-user-name, .header.app-top .app-caret { display: none; }
+  .header.app-top .app-user-btn { padding: 4px; }
+}
+
+/* ============ Узкий экран ============ */
+@media (max-width: 760px) {
+  .header.app-top { flex-wrap: nowrap; gap: 8px; padding: 8px 12px; }
+  .header.app-top .app-logo { font-size: 14px; letter-spacing: .08em; }
+
+  .header.app-top .app-menu-btn {
+    display: inline-flex; align-items: center; gap: 8px;
+    flex: 1 1 auto; min-width: 0; min-height: 44px; padding: 0 12px;
+    border: 1px solid rgba(31, 31, 31, .18); border-radius: 10px;
+    background: rgba(255, 255, 255, .75); color: #1f1f1f;
+    font: inherit; font-size: 14px; cursor: pointer; text-align: left;
+  }
+  .header.app-top .app-menu-btn svg { flex: 0 0 auto; }
+  .header.app-top .app-menu-lbl { flex: 0 0 auto; color: #5a5550; }
+  .header.app-top .app-menu-cur {
+    min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 700;
+  }
+  .header.app-top .app-menu-cur:not(:empty)::before { content: "· "; font-weight: 400; color: #5a5550; }
+
+  .header.app-top .app-user-name, .header.app-top .app-caret { display: none; }
+  .header.app-top .app-user-btn {
+    min-width: 44px; min-height: 44px; padding: 4px; justify-content: center;
+  }
+
+  /* Без JS список остаётся в потоке и виден весь (перенос строк). С JS —
+     выпадает под шапкой по кнопке и помещается в окно по высоте. */
+  .header.app-top .app-nav { justify-content: flex-start; }
+  html.shell-js .header.app-top { flex-wrap: nowrap; }
+  html:not(.shell-js) .header.app-top { flex-wrap: wrap; }
+  html:not(.shell-js) .header.app-top .app-menu-btn { display: none; }
+  /* Нижний запас 150 px: внизу окна поверх страницы лежат плашка свежести
+     данных и кнопка «?» (_hints.html, z-index выше шапки). Без запаса на
+     низком экране (360×560) они закрывали последние пункты открытого меню;
+     теперь список кончается выше них и прокручивается внутри себя. */
+  html.shell-js .header.app-top .app-nav {
+    display: none; position: absolute; left: 0; right: 0; top: 100%;
+    flex-direction: column; flex-wrap: nowrap; align-items: stretch; gap: 2px;
+    padding: 8px 12px 14px; max-height: calc(100vh - 150px); overflow-y: auto;
+    background: #fbf6f1; border-bottom: 1px solid rgba(31, 31, 31, .12);
+    box-shadow: 0 16px 30px rgba(0, 0, 0, .14);
+  }
+  html.shell-js .header.app-top .app-nav.open { display: flex; }
+  .header.app-top .app-nav a { min-height: 44px; padding: 0 14px; font-size: 15px; }
+
+  .app-demo { padding: 7px 14px; }
+}

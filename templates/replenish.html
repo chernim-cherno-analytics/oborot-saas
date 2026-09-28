@@ -307,16 +307,12 @@
   .modal .actions { display: flex; gap: 10px; margin-top: 18px; justify-content: flex-end; }
 </style>
 {% include "_mobile.html" %}
+{% include "_app_shell_head.html" %}
 </head>
 <body>
 {% include "_embed.html" %}
 <div class="gradient-bg"></div>
-<div class="header">
-  <a class="logo" href="/turnover">ОБОРОТ</a>
-  <nav class="nav">
-{% include "_nav_links.html" %}
-  </nav>
-</div>
+{% include "_app_shell.html" %}
 
 <div class="main">
   <details class="note">

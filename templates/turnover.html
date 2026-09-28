@@ -188,16 +188,12 @@
   .modal .actions { display: flex; gap: 10px; margin-top: 18px; justify-content: flex-end; }
 </style>
 {% include "_mobile.html" %}
+{% include "_app_shell_head.html" %}
 </head>
 <body>
 {% include "_embed.html" %}
 <div class="gradient-bg"></div>
-<div class="header">
-  <a class="logo" href="/turnover">ОБОРОТ</a>
-  <nav class="nav">
-{% with nav_primary = true %}{% include "_nav_links.html" %}{% endwith %}
-  </nav>
-</div>
+{% with nav_primary = true %}{% include "_app_shell.html" %}{% endwith %}
 
 <div class="cat-bar" id="cat-bar"><span style="font-size:12px;color:rgba(31,31,31,.4)">Загрузка...</span></div>
 

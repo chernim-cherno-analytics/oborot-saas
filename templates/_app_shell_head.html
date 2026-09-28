@@ -1,0 +1,9 @@
+{# PILOT-UX-SHELL-1: подключение шапки для девяти самостоятельных страниц —
+   одной строкой в <head> каждой, после их собственных стилей и _mobile.html,
+   чтобы правила каркаса стояли позже и не зависели от порядка внутри страниц.
+   Класс `shell-js` ставится сразу, до отрисовки: сворачивать меню на телефоне
+   можно только там, где есть скрипт, который его развернёт (static/shell.js).
+   Без JS список разделов остаётся видимым. #}
+<link rel="stylesheet" href="/static/shell.css">
+<script>document.documentElement.classList.add("shell-js");</script>
+<script src="/static/shell.js" defer></script>
