@@ -218,17 +218,28 @@
     .rc-panel { padding: 10px 6px; }
     .rc-box { max-height: calc(100vh - 20px); }
     .rc-extra .num { max-width: 70px; }
-    /* На 390 px таблица строк не влезала: колонка «Этот приход» уезжала за
-       правый край панели, и поле ввода оказывалось обрезанным — то есть
-       ровно тот орган, ради которого экран и сделан. Сжимаем ячейки и само
-       поле; горизонтальной прокрутки у страницы при этом нет ни до, ни
-       после — она и раньше была не у body, а внутри таблицы. */
-    #rc-lines td, .rc-box thead th { padding: 6px 4px; font-size: 11px; }
-    /* Заголовкам разрешено переноситься: общий стиль таблиц держит `nowrap`,
-       и «ЗАКАЗАНО»/«РАЗНИЦА»/«ЭТОТ ПРИХОД» задавали колонкам такую
-       минимальную ширину, что поле ввода уезжало за правый край панели. */
-    .rc-box thead th { white-space: normal; letter-spacing: .02em; }
-    #rc-lines input[data-rc-qty] { max-width: 52px; padding: 3px 4px; font-size: 11px; }
+    /* PILOT-UX-ORDERS-MOBILE-1: на телефоне строка приёмки — карточка, а не
+       строка таблицы. Прежняя редакция сжимала пять колонок до 11 px и поля
+       до 52 px: поле влезало, но шапка обрезалась («ЭТОТ ПРИХО»), а цифры
+       и кнопки становились мелкими. Карточка — название во всю ширину, три
+       числа под ним с подписями и поле «Этот приход» во всю ширину, — не
+       требует прокрутки вбок ни при каком названии. Прокручивается тело
+       панели, а не вложенная таблица. */
+    .rc-box .table-outer { max-height: none !important; overflow: visible; }
+    .rc-box thead { display: none; }
+    .rc-box table, #rc-lines { display: block; }
+    #rc-lines tr { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 4px 10px; padding: 10px 12px; border-bottom: 1px solid rgba(31,31,31,.08); }
+    #rc-lines td { display: block; border: 0; padding: 0; text-align: left; font-size: 13px; }
+    #rc-lines td.name, #rc-lines td[colspan], #rc-lines td.rc-in { grid-column: 1 / -1; }
+    #rc-lines td[data-label]::before { content: attr(data-label); display: block; font-size: 10.5px;
+      font-weight: 500; color: rgba(31,31,31,.6); text-transform: uppercase; letter-spacing: .04em; }
+    #rc-lines td.rc-in { margin-top: 6px; }
+    /* 16 px — ниже этого мобильный Safari увеличивает страницу при фокусе. */
+    #rc-lines input[data-rc-qty] { width: 100%; max-width: none; min-height: 40px; font-size: 16px;
+      padding: 6px 10px; box-sizing: border-box; }
+    #rc-save, #rc-close { min-height: 40px; min-width: 40px; font-size: 14px; padding: 8px 16px;
+      border-radius: 10px; }
   }
   .mvsel { font-size: 11px; padding: 3px 6px; border-radius: 8px; border: 1px solid rgba(31,31,31,.22);
     background: rgba(255,255,255,.7); max-width: 130px; }
@@ -242,6 +253,35 @@
   .batchid code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     font-size: 10.5px; color: rgba(31,31,31,.65); word-break: break-all; user-select: all; }
   .batchid .none { font-size: 10.5px; color: rgba(31,31,31,.45); }
+  /* PILOT-UX-ORDERS-MOBILE-1: отзыв после «Зафиксировать размещение». Прежде
+     окно закрывалось молча, а новый заказ оказывался ниже края экрана —
+     человек не знал, получилось ли. */
+  .ord-created { margin: 14px 0 6px; padding: 10px 14px; border-radius: 10px; font-size: 13px;
+    line-height: 1.45; background: rgba(76,187,23,.16); color: #2c5e10; scroll-margin-top: 90px; }
+  .ord-new td { background: rgba(76,187,23,.16); }
+  .ord-new:focus { outline: 2px solid rgba(44,122,31,.55); outline-offset: -2px; }
+  /* На телефоне заказ — карточка, а не строка таблицы шириной 651 px внутри
+     окна 360 px: кнопки «Принят на склад», «Приёмка» и «Удалить» стояли за
+     правым краем вложенной прокрутки (x≈545–658) высотой 19 px, и человек
+     их просто не видел. Здесь всё в одну колонку, подписи из data-label,
+     кнопки — отдельным рядом не ниже 40 px. Ширина окна у всего раздела та
+     же, что и была: прокрутки вбок нет ни у страницы, ни у списка. */
+  @media (max-width: 640px) {
+    #orders-wrap, #orders-done-wrap { max-height: none !important; overflow: visible; }
+    #orders-wrap thead, #orders-done-wrap thead { display: none; }
+    #orders-wrap table, #orders-wrap tbody, #orders-wrap tr, #orders-wrap td,
+    #orders-done-wrap table, #orders-done-wrap tbody, #orders-done-wrap tr, #orders-done-wrap td {
+      display: block; width: auto; }
+    #orders-wrap tr, #orders-done-wrap tr { padding: 12px 14px; border-bottom: 1px solid rgba(31,31,31,.09); }
+    #orders-wrap td, #orders-done-wrap td { border: 0; padding: 2px 0; text-align: left; font-size: 13px; }
+    #orders-wrap td[data-label]::before, #orders-done-wrap td[data-label]::before {
+      content: attr(data-label) ": "; color: rgba(31,31,31,.6); font-weight: 400; }
+    .ord-actions { display: flex; flex-wrap: wrap; gap: 8px; padding-top: 10px !important; }
+    .ord-actions .mvbtn, .batchid .mvbtn { min-height: 40px; font-size: 13px; padding: 8px 14px;
+      border-radius: 10px; }
+    .batchid { align-items: center; margin-top: 6px; }
+    .batchid code { font-size: 12px; line-height: 1.35; }
+  }
   tfoot td { position: sticky; bottom: 0; z-index: 9; background: #ece2d8; padding: 9px 8px; text-align: center;
     font-weight: 700; font-size: 12px; border-top: 2px solid rgba(31,31,31,.35); font-variant-numeric: tabular-nums; }
   tfoot td:first-child { text-align: left; padding-left: 14px; text-transform: uppercase; font-size: 10px; letter-spacing: .06em; }
@@ -361,6 +401,7 @@
     </table>
   </div>
 
+  <div id="order-created" class="ord-created" role="status" style="display:none"></div>
   <div class="arch-title" id="orders" style="display:none" onclick="void(0)"></div>
   <div class="table-outer" id="orders-wrap" style="display:none;max-height:40vh">
     <table>
@@ -562,9 +603,12 @@
 
   var ORDERS=[];
   var RECEIVED=[];
+  /* Возвращает обещание — чтобы действие «после перерисовки» (сообщение о
+     созданном заказе и прокрутка к нему) шло за готовым списком, а не
+     гадало по таймеру. Прежние вызовы результат не используют. */
   function load(){
     tbody.innerHTML='<tr><td colspan="'+NCOLS+'" class="loading">Загрузка…</td></tr>';
-    Promise.all([api("/api/replenish"), api("/api/productions"),
+    return Promise.all([api("/api/replenish"), api("/api/productions"),
                  api("/api/orders").catch(function(){ return {orders:[]}; }),
                  api("/api/replenish-draft").catch(function(){ return {drafts:{}}; })]).then(function(res){
       applyProds(res[1]);
@@ -812,10 +856,18 @@
   function renderOrders(){
     var t=document.getElementById("orders");
     var w=document.getElementById("orders-wrap");
-    if(!ORDERS.length){ t.style.display="none"; w.style.display="none"; return; }
+    if(!ORDERS.length){
+      t.style.display="none"; w.style.display="none";
+      document.getElementById("order-created").style.display="none";
+      return;
+    }
     t.style.display="";
     if(w.style.display!=="") w.style.display="";
     t.innerHTML='Заказы в производстве ('+ORDERS.length+') — учитываются в колонке «Едет»';
+    /* Пока висит сообщение «заказ создан … выделен ниже», выделение
+       переживает перерисовку списка (после приёмки, смены статуса и т. п.). */
+    var note=document.getElementById("order-created");
+    var hl=(note.style.display!=="none")?note.dataset.order:"";
     document.getElementById("orders-tb").innerHTML=ORDERS.map(function(o){
       var st=ordStatusText(o.status);
       var btns='';
@@ -839,14 +891,21 @@
         (bid?'<code>'+esc(bid)+'</code><button class="mvbtn ord-copy" type="button" '+
              'data-batch="'+esc(bid)+'" title="Скопировать CC_BATCH_ID">Копировать</button>'
             :'<span class="none">идентификатор ещё не присвоен</span>')+'</div>';
-      return '<tr data-order="'+o.id+'"><td class="name">'+esc(o.name)+batch+'</td>'+
-        '<td class="nb muted">'+(o.created_at?fmtDate(o.created_at):"—")+'</td>'+
-        '<td class="nb">'+(o.eta_date?fmtDate(o.eta_date):"—")+'</td>'+
-        '<td class="nb">'+fmt(o.positions)+'</td>'+
-        '<td class="nb">'+fmt(o.total_qty)+'</td>'+
+      /* data-label — подписи для карточки на телефоне (CSS ниже 640 px); на
+         широком экране их роль играет шапка таблицы, и там они не видны. */
+      return '<tr data-order="'+o.id+'"'+(String(o.id)===hl?' class="ord-new"':'')+'>'+
+        '<td class="name">'+esc(o.name)+batch+'</td>'+
+        '<td class="nb muted" data-label="Создан">'+(o.created_at?fmtDate(o.created_at):"—")+'</td>'+
+        '<td class="nb" data-label="Ожидаемый приход">'+(o.eta_date?fmtDate(o.eta_date):"—")+'</td>'+
+        '<td class="nb" data-label="Позиций">'+fmt(o.positions)+'</td>'+
+        '<td class="nb" data-label="Шт">'+fmt(o.total_qty)+'</td>'+
         '<td><span class="stbadge '+(o.status==="sent"?"g":"y")+'">'+st+'</span></td>'+
-        '<td>'+btns+'</td></tr>';
+        '<td class="ord-actions">'+btns+'</td></tr>';
     }).join("");
+    /* Сообщение «заказ создан» говорит «он выделен ниже» — если заказа в
+       списке больше нет (удалили, приняли), эта фраза стала бы неправдой. */
+    if(hl&&!ORDERS.some(function(o){ return String(o.id)===hl; }))
+      note.style.display="none";
     bindReceiptButtons();
     document.querySelectorAll(".ord-send").forEach(function(b){
       b.addEventListener("click",function(){
@@ -863,14 +922,39 @@
     });
     document.querySelectorAll(".ord-del").forEach(function(b){
       b.addEventListener("click",function(){
-        if(!confirm("Удалить заказ «"+b.getAttribute("data-name")+"»? Его количество будет снято из «Едет».")) return;
-        api("/api/orders/"+b.getAttribute("data-id"),{method:"DELETE"})
-          .then(load).catch(function(e){ alert("Не удалось: "+e.message); });
+        var id=b.getAttribute("data-id");
+        /* Сколько строк приёмки уйдёт вместе с заказом — спрашиваем ту же
+           ручку, что открывает панель приёмки; нового API нет. Не ответила —
+           число неизвестно, но сам факт удаления истории всё равно назван. */
+        b.disabled=true;
+        api("/api/orders/"+id+"/receipts")
+          .then(function(d){ return d.receipts_total; },function(){ return null; })
+          .then(function(n){
+            b.disabled=false;
+            if(!confirm(deleteQuestion(b.getAttribute("data-name"),n))) return;
+            return api("/api/orders/"+id,{method:"DELETE"}).then(load);
+          })
+          .catch(function(e){ b.disabled=false; alert("Не удалось: "+e.message); });
       });
     });
     document.querySelectorAll(".ord-copy").forEach(function(b){
       b.addEventListener("click",function(){ copyBatchId(b); });
     });
+  }
+
+  /* Текст подтверждения удаления. Сервер удаляет строки приёмки вместе с
+     заказом (api_order_delete: rowid в SQLite переиспользуется, и чужие
+     факты приёмки иначе достались бы следующему заказу). Прежний текст
+     говорил только про «Едет», и история приёмки исчезала без предупреждения. */
+  function deleteQuestion(name,n){
+    var q="Удалить заказ «"+name+"»? Его количество будет снято из «Едет».";
+    if(n===null||n===undefined||isNaN(n))
+      return q+" Вместе с заказом будут удалены и все записанные по нему приёмки — "+
+        "восстановить их будет нельзя.";
+    if(n>0)
+      return q+" Вместе с ним будет удалена история приёмки: "+n+" "+
+        plural(n,"строка","строки","строк")+". Восстановить её будет нельзя.";
+    return q+" Записанных приёмок по нему нет.";
   }
 
   /* ── PILOT-RECEIPTS-UI-1: приёмка заказа ─────────────────────────────────
@@ -894,12 +978,12 @@
     t.innerHTML='Принятые на склад ('+RECEIVED.length+') — в колонке «Едет» уже не считаются';
     document.getElementById("orders-done-tb").innerHTML=RECEIVED.map(function(o){
       return '<tr data-order="'+o.id+'"><td class="name">'+esc(o.name)+'</td>'+
-        '<td class="nb muted">'+(o.created_at?fmtDate(o.created_at):"—")+'</td>'+
-        '<td class="nb muted">'+(o.received_at?fmtDate(o.received_at):"—")+'</td>'+
-        '<td class="nb">'+fmt(o.positions)+'</td>'+
-        '<td class="nb">'+fmt(o.total_qty)+'</td>'+
+        '<td class="nb muted" data-label="Создан">'+(o.created_at?fmtDate(o.created_at):"—")+'</td>'+
+        '<td class="nb muted" data-label="Принят">'+(o.received_at?fmtDate(o.received_at):"—")+'</td>'+
+        '<td class="nb" data-label="Позиций">'+fmt(o.positions)+'</td>'+
+        '<td class="nb" data-label="Шт">'+fmt(o.total_qty)+'</td>'+
         '<td><span class="stbadge g">'+ordStatusText(o.status)+'</span></td>'+
-        '<td><button class="mvbtn ord-receipts" data-id="'+o.id+'" '+
+        '<td class="ord-actions"><button class="mvbtn ord-receipts" data-id="'+o.id+'" '+
             'title="Что фактически принято по заказу">Приёмка</button></td></tr>';
     }).join("");
     bindReceiptButtons();
@@ -1026,6 +1110,28 @@
       ? '<span class="rc-unknown">неизвестно</span>' : rcFmt(v);
   }
 
+  /* Источники приёмки — словами. Служебный код («manual») человеку ничего не
+     говорит; неизвестный код показывается как есть, а не прячется. */
+  var RC_SOURCE={manual:"вручную",ms_order_shipped:"МойСклад: отгрузка по заказу",
+                 ms_supply:"МойСклад: приёмка"};
+  function rcSource(s){ return RC_SOURCE[s]||s; }
+
+  /* Почему «неизвестно» — названо по факту, а не одной фразой на всё:
+     «факта нет ИЛИ источники спорят» до первой приёмки читалось как спор,
+     которого не было. Причины две, и сервер отдаёт обе: спор — в
+     source_conflicts, отсутствие подтверждённого числа — null в строке. */
+  function rcUnknownReason(d){
+    var disputed={};
+    (d.source_conflicts||[]).forEach(function(cf){ disputed[cf.base_name]=true; });
+    var missing=(d.lines||[]).some(function(ln){
+      return (ln.received_qty===null||ln.received_qty===undefined)&&!disputed[ln.base_name];
+    });
+    var parts=[];
+    if(missing) parts.push("по части позиций подтверждённый приход ещё не записан");
+    if((d.source_conflicts||[]).length) parts.push("по части позиций источники говорят разное");
+    return parts.length?parts.join("; "):"по части позиций принятое количество неизвестно";
+  }
+
   function renderReceipts(d){
     document.getElementById("rc-title").textContent="Приёмка заказа";
     var got=(d.received_total===null||d.received_total===undefined)
@@ -1033,7 +1139,7 @@
     document.getElementById("rc-summary").innerHTML=
       'Заказано: <b>'+rcFmt(d.ordered_total)+'</b> шт · Принято: <b>'+got+'</b>'+
       (d.execution_unknown
-        ? ' <span class="rc-unknown">— по части позиций факта нет или источники спорят</span>'
+        ? ' <span class="rc-unknown">— '+esc(rcUnknownReason(d))+'</span>'
         : '');
 
     var notes=[];
@@ -1049,11 +1155,14 @@
         'при отметке «принят целиком»: количества там взяты из заказа, а не '+
         'названы человеком. Подтверждением они не считаются и в «Принято» не входят.</div>');
     }
+    /* Разбивка по источникам нужна, когда их БОЛЬШЕ ОДНОГО: тогда и видно,
+       кто что сказал, и важно, что итог их не складывает. Один источник —
+       сверять не с чем, и та же фраза была бы шумом. */
     var srcs=Object.keys(d.by_source||{});
-    if(srcs.length){
+    if(srcs.length>1){
       notes.push('<div>Что сказал каждый источник: '+srcs.map(function(s){
-        return esc(s)+" — "+rcFmt(d.by_source[s]);
-      }).join("; ")+'. Итог их НЕ складывает: два источника об одном приходе — не двойная поставка.</div>');
+        return esc(rcSource(s))+" — "+rcFmt(d.by_source[s]);
+      }).join("; ")+'. Итог их не складывает: два источника об одном приходе — не двойная поставка.</div>');
     }
     document.getElementById("rc-notes").innerHTML=notes.join("");
 
@@ -1062,16 +1171,16 @@
         ? ' <span class="rc-unknown">(не было в заказе)</span>' : '';
       return '<tr data-rc-line="'+esc(ln.base_name)+'">'+
         '<td class="name">'+esc(ln.base_name)+extra+'</td>'+
-        '<td class="nb" data-rc-ordered>'+rcFmt(ln.ordered_qty)+'</td>'+
-        '<td class="nb" data-rc-received>'+rcNum(ln.received_qty)+'</td>'+
-        '<td class="nb" data-rc-diff>'+rcNum(ln.diff)+'</td>'+
-        '<td class="nb"><input class="input num" type="number" step="any" '+
+        '<td class="nb" data-rc-ordered data-label="Заказано">'+rcFmt(ln.ordered_qty)+'</td>'+
+        '<td class="nb" data-rc-received data-label="Принято">'+rcNum(ln.received_qty)+'</td>'+
+        '<td class="nb" data-rc-diff data-label="Разница">'+rcNum(ln.diff)+'</td>'+
+        '<td class="nb rc-in" data-label="Этот приход"><input class="input num" type="number" step="any" '+
           'data-rc-qty aria-label="Принято в этот приход: '+esc(ln.base_name)+'"></td></tr>';
     }).join("")||'<tr><td colspan="5" class="loading">В заказе нет позиций.</td></tr>';
 
     var hist=(d.receipts||[]).slice().reverse().map(function(r){
       return '<div class="row">'+(r.at?fmtDate(r.at):"—")+' · '+esc(r.base_name)+
-        ' · <b>'+rcFmt(r.qty)+'</b> · '+esc(r.source)+
+        ' · <b>'+rcFmt(r.qty)+'</b> · '+esc(rcSource(r.source))+
         (r.precision==="whole_order"?' · <i>допущение</i>':'')+'</div>';
     }).join("");
     /* Обрезка названа ЧИСЛОМ. Молчаливое усечение читается как «это всё». */
@@ -1825,19 +1934,53 @@
       return {base_name:it.base_name,qty:it._need,sizes:sizes,cost:it.cost_price||0};
     })};
     btn.disabled=true;
+    var created=null;
     // заказ сразу уходит «в производство» (отдельной страницы заказов нет):
     // его количество попадает в «Едет», управление — в блоке под таблицей
     api("/api/orders",{method:"POST",body:payload}).then(function(r){
       // Заказ склеен с уже существующим (защита от случайного повтора) —
       // об этом надо сказать словами, а не молча показать чужой заказ.
       if(r.duplicate) alert(r.message);
+      created={id:r.id,name:name,duplicate:!!r.duplicate};
       return api("/api/orders/"+r.id+"/status",{method:"POST",body:{status:"sent"}});
     }).then(function(){
       orderModal.classList.remove("open");
       btn.disabled=false;
-      load();
+      return load();
+    }).then(function(){
+      if(created) announceCreated(created);
     }).catch(function(e){ btn.disabled=false; alert("Не удалось создать заказ: "+e.message); });
   });
+
+  /* Отзыв после создания: словами — что создано, и глазами — где оно.
+     Новый заказ подсвечивается и прокручивается в окно; если сообщение и
+     заказ помещаются в окно вместе, видны оба. Выбор строк и количества
+     здесь не трогаются: это только показ результата. */
+  function announceCreated(c){
+    var el=document.getElementById("order-created");
+    var o=ORDERS.find(function(x){ return String(x.id)===String(c.id); });
+    var nm=o?o.name:c.name;
+    var row=document.querySelector('#orders-tb tr[data-order="'+c.id+'"]');
+    /* «Выделен в списке ниже» — только когда строка действительно есть:
+       список мог не перерисоваться (сбой загрузки), и тогда фраза врала бы. */
+    var where=row?" Он выделен в списке ниже":"";
+    el.textContent=c.duplicate
+      ? "Такой заказ уже есть: «"+nm+"»."+where+(where?".":"")
+      : "Заказ «"+nm+"» создан и отправлен в производство."+where+
+        (where?", его количество учтено в колонке «Едет».":"");
+    el.dataset.order=String(c.id);
+    el.style.display="";
+    if(!row){ el.scrollIntoView({block:"start"}); return; }
+    row.classList.add("ord-new");
+    row.setAttribute("tabindex","-1");
+    // Сначала — строку во вложенной прокрутке списка (на широком экране
+    // список ограничен по высоте), затем, если помещаются вместе, — сообщение.
+    row.scrollIntoView({block:"nearest"});
+    var span=row.getBoundingClientRect().bottom-el.getBoundingClientRect().top;
+    if(span<window.innerHeight-120) el.scrollIntoView({block:"start"});
+    else row.scrollIntoView({block:"center"});
+    try { row.focus({preventScroll:true}); } catch(e){ row.focus(); }
+  }
 
   // Роль — отдельным лёгким запросом, параллельно с load(): нужна только для
   // того, прятать ли owner-only управление производствами (см. renderTabs,

@@ -287,6 +287,9 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
             # Контрольная точка 10: жизненный цикл настоящими нажатиями.
             ("жизненный цикл заказа кликами и повтор после потери ответа",
              lambda: step_lifecycle_clicks(page, c, names)),
+            # PILOT-UX-ORDERS-MOBILE-1.
+            ("удаление называет приёмку", lambda: step_delete_warning(page, c, names)),
+            ("источники словами", lambda: step_source_labels(page, c, names)),
         )
         for label, run_step in steps:
             try:
@@ -305,6 +308,17 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
         except Exception as exc:  # noqa: BLE001 — важен отчёт, а не тип
             check("390 px: жизненный цикл дошёл до конца без исключения", False,
                   f"{type(exc).__name__}: {str(exc).strip().splitlines()[0][:200]}")
+        for label, run_step in (
+                ("390 px: действия заказа и поле прихода",
+                 lambda: step_mobile_orders(browser, c, names)),
+                ("создание заказа: отзыв и прокрутка",
+                 lambda: step_create_feedback(browser, c, names))):
+            try:
+                run_step()
+            except Exception as exc:  # noqa: BLE001 — важен отчёт, а не тип
+                check(f"{label}: шаг дошёл до конца без исключения", False,
+                      f"{type(exc).__name__}: "
+                      f"{str(exc).strip().splitlines()[0][:200]}")
         browser.close()
 
     c.close()
@@ -1147,6 +1161,302 @@ def step_mobile_lifecycle(browser, c, names) -> None:
               f"{resp.status} total={rc['receipts_total']} line={rc['lines'][0]}")
         check("390 px: экран показывает принятыми 12",
               _text_is(_rc_received_cell(page, names[1]), "12"))
+        check("390 px: ошибок в консоли не было", not errors, str(errors[:2])[:200])
+    finally:
+        ctx.close()
+
+
+# ── PILOT-UX-ORDERS-MOBILE-1: заказы и приёмка — видимо, честно, с отзывом ──
+#
+# Прежние проверки 390 px мерили только `scrollWidth` страницы, а он и при
+# дефекте был в норме: вбок прокручивалась не страница, а таблица заказов
+# внутри себя. Кнопки «Приёмка» / «Принят на склад» / «Удалить» стояли за
+# правым краем этой таблицы (x≈545–658 при окне 390), и Playwright честно
+# докручивал до них сам — человек же их не видел. Поэтому здесь меряется
+# ГЕОМЕТРИЯ: кнопка целиком внутри окна И внутри видимой части своей
+# прокручиваемой обёртки, без единой прокрутки со стороны набора.
+
+
+def _rc_post(c, oid: int, base: str, qty: float, key: str) -> None:
+    r = c.post(f"/api/orders/{oid}/receipts",
+               json={"lines": [{"base_name": base, "qty": qty}],
+                     "idempotency_key": key})
+    if r.status_code != 200:
+        raise RuntimeError(f"приёмка не записана: {r.status_code} {r.text[:200]}")
+
+
+def _geometry(page, selector: str):
+    """Прямоугольник элемента, окно и видимая часть ближайшей прокрутки."""
+    return page.evaluate("""(sel) => {
+      const el = document.querySelector(sel);
+      if (!el) return null;
+      const r = el.getBoundingClientRect();
+      let sc = el.parentElement;
+      while (sc && sc !== document.body) {
+        const s = getComputedStyle(sc);
+        if (/(auto|scroll|hidden)/.test(s.overflowX)) break;
+        sc = sc.parentElement;
+      }
+      const clip = (sc && sc !== document.body) ? sc.getBoundingClientRect()
+                                                 : {left: 0, right: window.innerWidth};
+      return {left: r.left, right: r.right, top: r.top, bottom: r.bottom,
+              width: r.width, height: r.height, vw: window.innerWidth,
+              vh: window.innerHeight, clipLeft: clip.left, clipRight: clip.right,
+              fontSize: parseFloat(getComputedStyle(el).fontSize),
+              lineHeight: parseFloat(getComputedStyle(el).lineHeight) || 0};
+    }""", selector)
+
+
+def _visible_across(g) -> bool:
+    """Целиком по горизонтали: в окне и в видимой части своей прокрутки."""
+    return (g is not None and g["width"] > 0 and g["left"] >= -0.5
+            and g["right"] <= g["vw"] + 0.5 and g["left"] >= g["clipLeft"] - 0.5
+            and g["right"] <= g["clipRight"] + 0.5)
+
+
+def _confirm_text(page, oid: int, accept: bool) -> str:
+    """Нажать «Удалить» у заказа и вернуть текст confirm()."""
+    asked: list = []
+
+    def answer(d):
+        asked.append(d.message)
+        if accept:
+            d.accept()
+        else:
+            d.dismiss()
+
+    page.once("dialog", answer)
+    page.locator('#orders-tb .ord-del[data-id="%s"]' % oid).click()
+    for _ in range(100):
+        if asked:
+            break
+        page.wait_for_timeout(100)
+    return asked[0] if asked else ""
+
+
+def step_delete_warning(page, c, names) -> None:
+    """«Удалить» говорит правду: история приёмки заказа уходит вместе с ним.
+
+    Сервер удаляет строки приёмки вместе с заказом НАМЕРЕННО (`api_order_delete`
+    — rowid в SQLite переиспользуется). Дефект был только в словах: confirm
+    говорил лишь про «Едет», и человек стирал факты приёмки, не зная об этом.
+    Число берётся существующей ручкой GET /receipts; нового API нет.
+    """
+    print("\n== Удаление заказа: предупреждение называет приёмку ==")
+    with_rc = make_order(c, "Удаление-с-приёмкой", [{"base_name": names[0], "qty": 6}])
+    _rc_post(c, with_rc, names[0], 2, "del-a")
+    _rc_post(c, with_rc, names[0], 1, "del-b")
+    no_rc = make_order(c, "Удаление-без-приёмки", [{"base_name": names[1], "qty": 4}])
+    open_replenish(page)
+
+    msg = _confirm_text(page, with_rc, accept=False)
+    check("confirm удаления называет приёмку и число её строк (2)",
+          "приёмк" in msg and "2" in msg, msg[:200])
+    check("отказ в confirm ничего не удалил: заказ и 2 строки приёмки на месте",
+          c.get(f"/api/orders/{with_rc}").status_code == 200
+          and _order_api(c, with_rc)[1]["receipts_total"] == 2)
+
+    msg = _confirm_text(page, no_rc, accept=False)
+    check("у заказа без приёмки confirm так и говорит: приёмок нет",
+          "приёмок по нему нет" in msg, msg[:200])
+
+    # Ручка приёмки не ответила — число неизвестно, но правда остаётся:
+    # история уходит вместе с заказом, просто без числа.
+    route = f"**/api/orders/{with_rc}/receipts"
+    page.route(route, lambda r: r.abort())
+    msg = _confirm_text(page, with_rc, accept=False)
+    page.unroute(route)
+    check("без ответа ручки confirm всё равно предупреждает о приёмке",
+          "приёмк" in msg and "удален" in msg, msg[:200])
+
+    msg = _confirm_text(page, with_rc, accept=True)
+    row = page.locator('#orders-tb tr[data-order="%s"]' % with_rc)
+    gone = False
+    for _ in range(100):
+        if row.count() == 0:
+            gone = True
+            break
+        page.wait_for_timeout(100)
+    check("согласие удаляет заказ, как и прежде (строка ушла, сервер 404)",
+          gone and c.get(f"/api/orders/{with_rc}").status_code == 404,
+          f"gone={gone}")
+    c.delete(f"/api/orders/{no_rc}")
+
+
+def step_source_labels(page, c, names) -> None:
+    """Источники приёмки названы по-человечески; правда о споре сохранена."""
+    print("\n== Приёмка: источники словами, спор и «не записано» различены ==")
+    fresh = make_order(c, "Источники-пусто", [{"base_name": names[0], "qty": 5}])
+    open_replenish(page)
+    check("панель пустого заказа открылась", open_receipts(page, fresh) is True)
+    text = panel_text(page)
+    check("без записанного прихода сказано «ещё не записан», а не «спорят»",
+          "не записан" in text and "спорят" not in text, text[:240])
+    page.locator("#rc-close").click()
+
+    oid = make_order(c, "Источники-спор", [{"base_name": names[1], "qty": 10}])
+    _rc_post(c, oid, names[1], 4, "src-a")
+    _seed_receipt(c, oid, names[1], 9, "ms_order_shipped")
+    open_replenish(page)
+    check("панель заказа со спором открылась", open_receipts(page, oid) is True)
+    text = panel_text(page)
+    check("служебных кодов источников на экране нет",
+          "manual" not in text and "ms_order_shipped" not in text, text[:300])
+    check("ручной источник назван «вручную», МойСклад — по имени",
+          "вручную" in text and "МойСклад" in text, text[:300])
+    check("спор источников по-прежнему назван и итог неизвестен",
+          "Расхождение источников" in text and "неизвестно" in text, text[:300])
+    check("итог по-прежнему не складывает источники",
+          "не складывает" in text.lower(), text[:300])
+    page.locator("#rc-close").click()
+
+
+def _pick_one_row(page) -> int:
+    """Снять все галочки и поставить одну — как человек, кликами."""
+    page.wait_for_selector("#tbody .row-check", timeout=30000)
+    close_hint(page)
+    if page.locator("#check-all").is_checked():
+        page.locator("#check-all").click()
+    page.locator("#tbody .row-check").first.click()
+    return page.locator("#tbody .row-check:checked").count()
+
+
+def _create_order(page, name: str, tap: bool) -> tuple:
+    act = (lambda loc: loc.tap()) if tap else (lambda loc: loc.click())
+    act(page.locator("#btn-create-order"))
+    page.locator("#order-modal.open").wait_for(timeout=10000)
+    summary = page.locator("#order-modal-summary").text_content() or ""
+    page.locator("#order-name").fill(name)
+    with page.expect_response(lambda r: r.request.method == "POST"
+                              and r.url.endswith("/api/orders")) as created:
+        act(page.locator("#btn-order-submit"))
+    return created.value, summary
+
+
+def _check_created(page, c, resp, name: str, summary: str, tag: str) -> None:
+    oid = resp.json()["id"]
+    note = page.locator("#order-created")
+    try:
+        note.wait_for(state="visible", timeout=30000)
+        shown = note.text_content() or ""
+    except Exception:  # noqa: BLE001 — отсутствие сообщения и есть ответ
+        shown = ""
+    check(f"{tag}: после создания видно сообщение с названием заказа",
+          name in shown and "создан" in shown, shown[:200])
+    row_sel = '#orders-tb tr[data-order="%s"]' % oid
+    try:
+        page.wait_for_function("""(sel) => {
+          const r = document.querySelector(sel);
+          if (!r) return false;
+          const b = r.getBoundingClientRect();
+          return b.top >= 0 && b.bottom <= window.innerHeight;
+        }""", arg=row_sel, timeout=10000)
+        in_view = True
+    except Exception:  # noqa: BLE001
+        in_view = False
+    check(f"{tag}: новый заказ прокручен в окно", in_view,
+          str(_geometry(page, row_sel)))
+    check(f"{tag}: новый заказ подсвечен",
+          page.locator(row_sel + ".ord-new").count() == 1)
+    order = c.get(f"/api/orders/{oid}").json()
+    check(f"{tag}: заказ на сервере в производстве, позиций — как в окне (1)",
+          order.get("status") == "sent" and order.get("positions") == 1
+          and "1 позиция" in summary,
+          f"{order.get('status')} positions={order.get('positions')} «{summary[:80]}»")
+
+
+def step_create_feedback(browser, c, names) -> None:
+    """После «Зафиксировать размещение» человек видит, что заказ создан и где он."""
+    print("\n== Создание заказа: сообщение и прокрутка к новому заказу ==")
+    for tag, viewport, tap in (("десктоп", {"width": 1400, "height": 900}, False),
+                               ("390 px", {"width": 390, "height": 844}, True)):
+        ctx = browser.new_context(viewport=viewport, has_touch=tap)
+        ctx.add_cookies([{"name": k, "value": v, "domain": "127.0.0.1", "path": "/"}
+                         for k, v in c.cookies.items()])
+        errors: list[str] = []
+        page = ctx.new_page()
+        page.on("pageerror", lambda e: errors.append(str(e)))
+        try:
+            page.goto(f"{BASE}/replenish")
+            close_hint(page)
+            picked = _pick_one_row(page)
+            check(f"{tag}: выбрана одна позиция", picked == 1, str(picked))
+            name = f"UX-создан-{tag}"
+            resp, summary = _create_order(page, name, tap)
+            check(f"{tag}: сервер создал заказ", resp.status == 200, str(resp.status))
+            if resp.status == 200:
+                _check_created(page, c, resp, name, summary, tag)
+            check(f"{tag}: ошибок в консоли не было", not errors, str(errors[:2])[:200])
+        finally:
+            ctx.close()
+
+
+def step_mobile_orders(browser, c, names) -> None:
+    """390×844, касания: действия заказа видны, приёмка вводится без прокрутки вбок."""
+    print("\n== 390×844: действия заказа и поле прихода видны без прокрутки вбок ==")
+    ctx = browser.new_context(viewport={"width": 390, "height": 844}, has_touch=True)
+    ctx.add_cookies([{"name": k, "value": v, "domain": "127.0.0.1", "path": "/"}
+                     for k, v in c.cookies.items()])
+    errors: list[str] = []
+    page = ctx.new_page()
+    page.on("pageerror", lambda e: errors.append(str(e)))
+    try:
+        oid = make_order(c, "Телефон-действия", [{"base_name": names[2], "qty": 8}])
+        open_replenish(page)
+        row = '#orders-tb tr[data-order="%s"] ' % oid
+        for cls, label in ((".ord-recv", "«Принят на склад»"),
+                           (".ord-receipts", "«Приёмка»"), (".ord-del", "«Удалить»")):
+            g = _geometry(page, row + cls)
+            check(f"390 px: {label} целиком виден без прокрутки вбок",
+                  _visible_across(g), str(g))
+            check(f"390 px: {label} не ниже 40 px", g is not None and g["height"] >= 40,
+                  str(g and g["height"]))
+        g = _geometry(page, row + ".ord-copy")
+        check("390 px: «Копировать» виден и не ниже 40 px",
+              _visible_across(g) and g["height"] >= 40, str(g))
+        g = _geometry(page, row + ".batchid code")
+        # line-height «normal» отдаётся строкой и парсится в 0 — тогда меряем
+        # по обычной для моноширинного шрифта высоте строки ≈ 1,25 кегля.
+        lh = (g["lineHeight"] or g["fontSize"] * 1.25) if g else 0
+        lines = (g["height"] / lh) if lh else 99
+        check("390 px: идентификатор партии читается: шрифт ≥ 12 px, не больше 2 строк",
+              g is not None and g["fontSize"] >= 12 and lines <= 2.2,
+              f"font={g and g['fontSize']} lines={lines:.1f}")
+        check("390 px: страница не прокручивается вбок",
+              page.evaluate("() => document.documentElement.scrollWidth"
+                            " <= window.innerWidth + 1") is True)
+
+        page.locator(row + ".ord-receipts").tap()
+        page.wait_for_function("""() => {
+          const l = document.getElementById('rc-lines');
+          return !!l && !!l.querySelector('[data-rc-line]');
+        }""", timeout=30000)
+        inp = '#rc-lines [data-rc-line] input[data-rc-qty]'
+        g = _geometry(page, inp)
+        check("390 px: поле «Этот приход» целиком видно без прокрутки вбок",
+              _visible_across(g), str(g))
+        wide = page.evaluate("""() => {
+          const t = document.querySelector('#rc-panel .table-outer');
+          return t ? t.scrollWidth - t.clientWidth : -1;
+        }""")
+        check("390 px: таблица приёмки не прокручивается вбок", 0 <= wide <= 1, str(wide))
+        for sel, label in (("#rc-save", "«Записать приход»"), ("#rc-close", "«Закрыть»")):
+            g = _geometry(page, sel)
+            check(f"390 px: {label} виден и не ниже 40 px",
+                  _visible_across(g) and g["height"] >= 40, str(g))
+
+        page.locator(inp).tap()
+        page.locator(inp).fill("3")
+        with page.expect_response(lambda r: r.request.method == "POST"
+                                  and r.url.endswith(f"/api/orders/{oid}/receipts")) as resp:
+            page.locator("#rc-save").tap()
+        check("390 px: приход записан касанием", resp.value.status == 200,
+              str(resp.value.status))
+        page.locator("#rc-close").tap()
+        page.locator(row + ".ord-receipts").tap()
+        check("390 px: после повторного открытия принято 3",
+              _text_is(_rc_received_cell(page, names[2]), "3"))
+        page.locator("#rc-close").tap()
         check("390 px: ошибок в консоли не было", not errors, str(errors[:2])[:200])
     finally:
         ctx.close()
