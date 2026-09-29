@@ -710,6 +710,7 @@ def run() -> int:  # noqa: C901 — сценарный тест: шагов мн
             _shell_journey(browser, base, c)
             _actions_clarity(browser, base, c)
             _focus_urgent(browser, base)
+            _metric_copy(browser, base)
         except Exception as exc:  # noqa: BLE001 — падение пути обязано стать
             # отчётом и ненулевым кодом, а не трассировкой без отчёта (D-42).
             check("сквозной путь в браузере дошёл до конца", False,
@@ -1416,6 +1417,130 @@ def _focus_urgent(browser, base: str) -> None:
     check("фокус: ручные правки ростовки и число заказов не изменились",
           cl.get("/api/replenish-draft").json() == drafts0
           and len(cl.get("/api/orders").json().get("orders", [])) == orders0)
+    cl.close()
+
+
+# ── PILOT-UX-CLARITY-3-METRIC-COPY: справки без «обычно больше», ₽/день ─────
+#
+# «Не хватает до нормы» и «Заказать» отвечают на разные вопросы (BUSINESS_LOGIC
+# §11.1: норма — «каким должен быть склад сегодня», горизонт — «на сколько
+# дней продаж должен хватить заказ»). Справка не обещает, какое из двух
+# чисел больше. Единица «₽/день» у «Оборач.» видна без наведения и не
+# пропадает ни при каком состоянии свежести (полное/неполное/неизвестное
+# окно) и после сортировки.
+
+_BANNED = ("обычно больше", "число больше")
+
+
+def _fresh_stub(cov, window):
+    def handler(route):
+        body = {"connected": True, "last_sale_date": "2026-09-01", "last_stock_date": "2026-09-01",
+                "sync_state": "done", "sync_error": "", "sync_finished_at": None,
+                "history_days": window, "turnover_window_days": window}
+        if cov is not None:
+            body.update({"coverage_days": cov, "coverage_start": "2026-06-01"})
+        route.fulfill(json=body)
+    return handler
+
+
+def _metric_copy(browser, base: str) -> None:
+    print("\n== PILOT-UX-CLARITY-3-METRIC-COPY: справки «Не хватает»/«Заказать» и ₽/день ==")
+    cl = httpx.Client(headers={"X-Oborot-CSRF": "1"}, base_url=base, timeout=120.0)
+    cl.post("/register", data={"name": "Метрика", "email": "metric@test.io",
+                               "password": "secret123", "org_name": "Бренд-Метрика"})
+    check("метрика: демо-данные загружены", cl.post("/api/connect/demo").status_code == 200)
+    cookies = [{"name": k, "value": v, "domain": "127.0.0.1", "path": "/"} for k, v in cl.cookies.items()]
+    for tag, vp, touch in (("1440", {"width": 1440, "height": 900}, False),
+                           ("390", {"width": MOBILE_WIDTH, "height": 844}, True)):
+        ctx = browser.new_context(viewport=vp, has_touch=touch, is_mobile=touch)
+        ctx.add_cookies(cookies)
+        errors: list[str] = []
+        page = ctx.new_page()
+        page.on("pageerror", lambda e: errors.append(str(e)))
+        posts: list[str] = []
+        # /api/hints/seen — отметка «подсказку первого визита закрыли»: её шлёт
+        # закрытие подсказки помощником набора, а не чтение справки или
+        # сортировка. Остальные записи считаются.
+        page.on("request", lambda r: posts.append(r.url)
+                if r.method != "GET" and "/api/hints/seen" not in r.url else None)
+        try:
+            # /turnover: справка раскрывается настоящим кликом по <summary>.
+            page.goto(f"{base}/turnover")
+            page.wait_for_function("() => document.querySelectorAll('#tb tr').length > 1",
+                                   timeout=45000)
+            _close_hint(page)
+            posts.clear()
+            summ = page.locator("details.note > summary").first
+            (_tap_past_hint if touch else _click_past_hint)(page, summ, "справка /turnover")
+            body = page.locator("details.note .body").first
+            txt = body.inner_text() if body.is_visible() else ""
+            check(f"{tag} /turnover: справка раскрыта кликом и объясняет разницу вопросов",
+                  "каким должен быть склад сегодня" in txt and "напрямую не сравнивают" in txt, txt[:120])
+            check(f"{tag} /turnover: в справке нет обещания «обычно больше»",
+                  txt and not any(b in txt for b in _BANNED))
+            ttl = page.locator("#th-defq").get_attribute("title") or ""
+            check(f"{tag} /turnover: подсказка «Не хватает» без «число больше»",
+                  "напрямую не сравнивают" in ttl and not any(b in ttl for b in _BANNED), ttl[:160])
+            # Единица видна без наведения.
+            unit = page.locator("#th-turnover .th-unit")
+            check(f"{tag} /turnover: у «Оборач.» видна единица ₽/день",
+                  unit.count() == 1 and unit.is_visible()
+                  and (unit.text_content() or "").strip() == "₽/день")
+            # Сортировка кликом по заголовку — единица остаётся, записей нет.
+            th = page.locator("#th-turnover")
+            before_sort = th.get_attribute("aria-sort")
+            (_tap_past_hint if touch else _click_past_hint)(page, th, "заголовок «Оборач.»")
+            page.wait_for_timeout(300)
+            after_sort = th.get_attribute("aria-sort")
+            check(f"{tag} /turnover: клик по «Оборач.» сортирует (aria-sort меняется), единица на месте",
+                  before_sort != after_sort and after_sort in ("ascending", "descending")
+                  and page.locator("#th-turnover .th-unit").is_visible(),
+                  f"{before_sort} -> {after_sort}")
+            check(f"{tag} /turnover: чтение справки и сортировка ничего не записали", not posts,
+                  str(posts[:3]))
+            if touch:
+                sw = page.evaluate("() => document.documentElement.scrollWidth")
+                # 415 — известный P2 блока «Торгуете в минус» (TECH_DEBT); шире не стало.
+                check("390 /turnover: ширина страницы не выросла сверх известной (≤ 415)", sw <= 416, str(sw))
+            # Три состояния свежести: единица не пропадает, период — прежний.
+            for label, cov, window, want in (("полное окно", 730, 730, "2 года"),
+                                             ("неполное окно", 90, 730, "90"),
+                                             ("окно неизвестно", None, 730, "неизвест")):
+                page.route("**/api/freshness", _fresh_stub(cov, window))
+                page.goto(f"{base}/turnover")
+                page.wait_for_function("() => document.querySelectorAll('#tb tr').length > 1",
+                                       timeout=45000)
+                page.wait_for_timeout(1500)
+                period = page.locator("#th-turnover-period").text_content() or ""
+                shown = page.locator("#th-turnover .th-unit")
+                check(f"{tag} /turnover [{label}]: ₽/день на месте, период «{want}» прежний",
+                      shown.count() == 1 and shown.is_visible() and want in period, period)
+                page.unroute("**/api/freshness")
+            # /stocks: то же пояснение в справке и в подсказке колонки.
+            page.goto(f"{base}/stocks")
+            page.wait_for_function("() => document.querySelectorAll('#tb tr').length > 1",
+                                   timeout=45000)
+            _close_hint(page)
+            posts.clear()
+            summ = page.locator("details > summary", has_text="Как устроена эта страница").first
+            (_tap_past_hint if touch else _click_past_hint)(page, summ, "справка /stocks")
+            det = summ.locator("xpath=..")
+            txt = det.inner_text()
+            check(f"{tag} /stocks: справка раскрыта кликом и объясняет разницу вопросов",
+                  "каким должен быть склад сегодня" in txt and "напрямую не сравнивают" in txt, txt[-200:])
+            check(f"{tag} /stocks: в справке нет обещания «обычно больше»",
+                  not any(b in txt for b in _BANNED))
+            ttl = page.locator('th[data-sk="defq"]').get_attribute("title") or ""
+            check(f"{tag} /stocks: подсказка «Не хватает» без «число больше»",
+                  "напрямую не сравнивают" in ttl and not any(b in ttl for b in _BANNED), ttl[:160])
+            check(f"{tag} /stocks: чтение справки ничего не записало", not posts, str(posts[:3]))
+            if touch:
+                check("390 /stocks: страница не прокручивается вбок",
+                      page.evaluate("() => document.documentElement.scrollWidth <= innerWidth + 1"),
+                      str(page.evaluate("() => document.documentElement.scrollWidth")))
+            check(f"{tag}: ошибок в консоли не было", not errors, str(errors[:2])[:200])
+        finally:
+            ctx.close()
     cl.close()
 
 
