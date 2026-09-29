@@ -712,6 +712,7 @@ def run() -> int:  # noqa: C901 — сценарный тест: шагов мн
             _focus_urgent(browser, base)
             _metric_copy(browser, base)
             _copy_consistency(browser, base)
+            _loss_width(browser, base)
         except Exception as exc:  # noqa: BLE001 — падение пути обязано стать
             # отчётом и ненулевым кодом, а не трассировкой без отчёта (D-42).
             check("сквозной путь в браузере дошёл до конца", False,
@@ -1501,8 +1502,10 @@ def _metric_copy(browser, base: str) -> None:
                   str(posts[:3]))
             if touch:
                 sw = page.evaluate("() => document.documentElement.scrollWidth")
-                # 415 — известный P2 блока «Торгуете в минус» (TECH_DEBT); шире не стало.
-                check("390 /turnover: ширина страницы не выросла сверх известной (≤ 415)", sw <= 416, str(sw))
+                # Прежний допуск 415 (блок «Торгуете в минус») снят
+                # PILOT-UX-MOBILE-LOSS-WIDTH-1: страница обязана помещаться в окно.
+                check(f"390 /turnover: страница не шире окна ({MOBILE_WIDTH})",
+                      sw <= MOBILE_WIDTH + 1, str(sw))
             # Три состояния свежести: единица не пропадает, период — прежний.
             for label, cov, window, want in (("полное окно", 730, 730, "2 года"),
                                              ("неполное окно", 90, 730, "90"),
@@ -1666,6 +1669,109 @@ def _copy_consistency(browser, base: str) -> None:
                   not other and seen and all('"stocks"' in w[2] or '"settings"' in w[2] for w in seen),
                   str(writes)[:300])
             check(f"{tag}: ошибок в консоли не было", not errors, str(errors[:2])[:200])
+        finally:
+            ctx.close()
+            cl.close()
+
+
+# ── PILOT-UX-MOBILE-LOSS-WIDTH-1: «Торгуете в минус» не шире экрана ─────────
+
+# Синтетические длинные строки: название с пробелами и без, категория без
+# пробелов. Подменяются только ПОДПИСИ в ответе GET /api/turnover — числа и
+# состав позиций остаются теми, что посчитал сервер.
+_LOSS_LONG_NAME = ("Платье-трансформер оверсайз с длинным рукавом и поясом "
+                   + "Сверхдлинныйартикулбезпробелов" * 3)
+_LOSS_LONG_CAT = "Категория-с-очень-длинным-названием-без-переносов-" * 2
+
+# Геометрия меряется от ширины окна, заданной тестом, а не от innerWidth:
+# на телефоне (is_mobile) слишком широкая страница раздувает сам layout
+# viewport, и innerWidth «подрастает» вместе с ней — сравнение с ним ничего
+# бы не поймало (на исходной вёрстке innerWidth был 415 при окне 390).
+_LOSS_GEOM_JS = """(vw) => {
+  const box = document.getElementById('loss-box'), br = box.getBoundingClientRect();
+  const cells = [...box.querySelectorAll('#loss-body td')];
+  const bad = cells.filter(td => { const r = td.getBoundingClientRect();
+    return r.width < 1 || r.left < br.left - 1 || r.right > Math.min(vw, br.right) + 1
+      || td.scrollWidth > td.clientWidth + 1; }).map(td => td.textContent.slice(0, 30));
+  const hid = [document.documentElement, document.body].some(e =>
+    /hidden|clip/.test(getComputedStyle(e).overflowX));
+  return {doc: document.documentElement.scrollWidth, shown: getComputedStyle(box).display !== 'none',
+          rows: box.querySelectorAll('#loss-body tr').length, cells: cells.length, bad, hid,
+          boxRight: br.right, first: cells.length ? cells[0].textContent : '',
+          td: cells.length ? getComputedStyle(cells[0]).display : ''};
+}"""
+
+
+def _loss_width(browser, base: str) -> None:
+    print("\n== PILOT-UX-MOBILE-LOSS-WIDTH-1: «Торгуете в минус» на 390 и 1440 ==")
+    for tag, vp, touch in (("1440", {"width": 1440, "height": 900}, False),
+                           ("390", {"width": MOBILE_WIDTH, "height": 844}, True)):
+        vw = vp["width"]
+        cl = httpx.Client(headers={"X-Oborot-CSRF": "1"}, base_url=base, timeout=120.0)
+        cl.post("/register", data={"name": "Минус", "email": f"lossw-{tag}@test.io",
+                                   "password": "secret123", "org_name": "Бренд-Минус-" + tag})
+        check(f"{tag}: минус: демо-данные загружены", cl.post("/api/connect/demo").status_code == 200)
+        # Подсказка первого визита — не предмет проверки; отмечена до браузера.
+        cl.post("/api/hints/seen", json={"page": "turnover"})
+        ctx = browser.new_context(viewport=vp, has_touch=touch, is_mobile=touch)
+        ctx.add_cookies([{"name": k, "value": v, "domain": "127.0.0.1", "path": "/"}
+                         for k, v in cl.cookies.items()])
+        errors: list[str] = []
+        page = ctx.new_page()
+        page.on("pageerror", lambda e: errors.append(str(e)))
+        writes: list[tuple] = []
+        page.on("request", lambda r: writes.append((r.method, r.url.split("?")[0]))
+                if r.method != "GET" else None)
+
+        def _long_labels(route):
+            resp = route.fetch()
+            data = resp.json()
+            items = (data.get("below_cost") or {}).get("items") or []
+            if items:
+                items[0]["base_name"] = _LOSS_LONG_NAME
+                items[0]["category"] = _LOSS_LONG_CAT
+            route.fulfill(response=resp, json=data)
+
+        try:
+            for mode in ("демо", "длинные подписи"):
+                if mode != "демо":
+                    page.route("**/api/turnover", _long_labels)
+                page.goto(f"{base}/turnover")
+                page.wait_for_function("() => document.querySelectorAll('#tb tr').length > 1",
+                                       timeout=45000)
+                page.wait_for_timeout(800)
+                g = page.evaluate(_LOSS_GEOM_JS, vw)
+                label = f"{tag} /turnover [{mode}]"
+                check(f"{label}: блок «Торгуете в минус» показан, в нём есть позиции",
+                      g["shown"] and g["rows"] >= 1 and g["cells"] == 7 * g["rows"], str(g)[:200])
+                check(f"{label}: страница не шире окна ({vw})", g["doc"] <= vw + 1, str(g["doc"]))
+                check(f"{label}: html/body не прячут вылезающее (нет overflow hidden/clip)", not g["hid"])
+                check(f"{label}: каждая ячейка внутри блока и окна и не обрезана",
+                      not g["bad"] and g["boxRight"] <= vw + 1, str(g["bad"])[:200])
+                if mode != "демо":
+                    first = _norm_ws(g["first"])
+                    check(f"{label}: длинное название и категория показаны целиком",
+                          _norm_ws(_LOSS_LONG_NAME) in first and _norm_ws(_LOSS_LONG_CAT) in first,
+                          first[:120])
+                check(f"{label}: на десктопе таблица прежняя, на телефоне — строки блоком",
+                      g["td"] == ("block" if touch else "table-cell"), g["td"])
+                summ = page.locator("#loss-sum")
+                summ.scroll_into_view_if_needed()
+                toggled = []
+                for _ in range(2):
+                    try:
+                        (summ.tap if touch else summ.click)(timeout=5000)
+                    except Exception as exc:  # noqa: BLE001 — перехват касания = провал проверки
+                        toggled.append(f"{type(exc).__name__}")
+                        break
+                    page.wait_for_timeout(250)
+                    toggled.append(page.evaluate("() => document.getElementById('loss-box').open"))
+                check(f"{label}: {'касание' if touch else 'клик'} по заголовку сворачивает и снова раскрывает",
+                      toggled == [False, True], str(toggled))
+                check(f"{label}: после раскрытия страница всё так же не шире окна",
+                      page.evaluate("() => document.documentElement.scrollWidth") <= vw + 1)
+            check(f"{tag}: минус: браузер ничего не записал", not writes, str(writes)[:200])
+            check(f"{tag}: минус: ошибок в консоли не было", not errors, str(errors[:2])[:200])
         finally:
             ctx.close()
             cl.close()

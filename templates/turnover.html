@@ -166,6 +166,21 @@
   .loss-box td { padding: 5px 8px; border-bottom: 1px solid rgba(221,0,4,.14); text-align: right; }
   .loss-box td:first-child { text-align: left; font-weight: 600; }
   .loss-box .lred { color: #a00003; font-weight: 700; }
+  {# На телефоне семь ячеек строки в одну линию не помещались: таблица вылезала
+     за блок, и вся страница становилась шире экрана (415 px на 390, а с длинным
+     названием — за 1000). Каждая ячейка и так подписана сама («цена …»,
+     «с/с …», «… шт за год»), поэтому строка раскладывается блоком: название на
+     своей строке, остальные ячейки переносятся под ним. Ничего не прячется и
+     не обрезается; длинные названия и категории переносятся по буквам. На
+     десктопе таблица прежняя. #}
+  @media (max-width: 760px) {
+    .loss-box .body { overflow-wrap: anywhere; }
+    .loss-box table, .loss-box tbody { display: block; width: 100%; }
+    .loss-box tr { display: flex; flex-wrap: wrap; column-gap: 12px; padding: 6px 0;
+      border-bottom: 1px solid rgba(221,0,4,.14); }
+    .loss-box td { display: block; padding: 1px 0; border-bottom: 0; text-align: left; min-width: 0; max-width: 100%; }
+    .loss-box td:first-child { flex: 0 0 100%; }
+  }
   .costline { font-size: 9px; opacity: .55; margin-top: 2px; }
   .mneg { color: #a00003; font-weight: 700; }
   .mnone { opacity: .4; font-size: 11px; }
