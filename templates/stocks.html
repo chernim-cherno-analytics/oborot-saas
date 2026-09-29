@@ -366,7 +366,12 @@ function renderMoneyStrip(){
     '<div class="ms-card"><div class="lbl">Заморожено в товаре</div><div class="val">'+fmtMoney(m.stock_cost)+'</div>'+
       '<div class="sub">'+m.stock_cost_basis+' · '+fmt(m.stock_units)+' шт на складах. Это ваши деньги, а не будущая выручка.</div>'+nocost+'</div>'+
     '<div class="ms-card"><div class="lbl">Едет к нам</div><div class="val">'+fmtMoney(inc.cost)+'</div>'+
-      '<div class="sub">'+m.stock_cost_basis+' · '+fmt(inc.units)+' шт в заказах на производстве. Эти деньги вы уже потратите.</div></div>'+
+      /* PILOT-UX-CLARITY-1-ACTIONS: «едет» — это вся графа «Заказано»
+         (ordered_manual + ordered_ms, см. ordTotal): заказы на производство со
+         страницы «Заказ», ручные отметки «Заказано» (здесь и на «Заказ
+         позиции») и заказы из МойСклада. Прежняя подпись «шт в заказах на
+         производстве» выдавала ручные отметки за заказы. Число то же. */
+      '<div class="sub">'+m.stock_cost_basis+' · '+fmt(inc.units)+' шт в графе «Заказано»: заказы на производство, ручные отметки и заказы из МойСклада. Эти деньги вы уже потратите.</div></div>'+
     '<div class="ms-card"><div class="lbl">Если продать остаток</div><div class="val">'+fmtMoney(m.stock_sale)+'</div>'+
       '<div class="sub">'+m.stock_sale_basis+'. По прайсу без скидок — '+fmtMoney(m.stock_retail)+'.</div></div>'+
     '<div class="ms-card accent"><div class="lbl">Маржа в остатке</div><div class="val">'+fmtMoney(m.stock_margin)+'</div>'+

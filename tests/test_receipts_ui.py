@@ -312,7 +312,12 @@ def run() -> int:  # noqa: C901 — сценарный набор: шагов м
                 ("390 px: действия заказа и поле прихода",
                  lambda: step_mobile_orders(browser, c, names)),
                 ("создание заказа: отзыв и прокрутка",
-                 lambda: step_create_feedback(browser, c, names))):
+                 lambda: step_create_feedback(browser, c, names)),
+                # PILOT-UX-CLARITY-1-ACTIONS.
+                ("действия приёмки: пояснения и плашка свежести",
+                 lambda: step_actions_clarity(browser, c, names)),
+                ("readonly: приёмка по-прежнему закрыта на запись",
+                 lambda: step_actions_readonly(browser, c, names))):
             try:
                 run_step()
             except Exception as exc:  # noqa: BLE001 — важен отчёт, а не тип
@@ -1460,6 +1465,173 @@ def step_mobile_orders(browser, c, names) -> None:
         check("390 px: ошибок в консоли не было", not errors, str(errors[:2])[:200])
     finally:
         ctx.close()
+
+
+# ── PILOT-UX-CLARITY-1-ACTIONS: пояснения к действиям и плашка свежести ─────
+#
+# Hit-test по ПЯТИ точкам кнопки: центр и четыре угла с отступом 3 px. На
+# базовом дереве фиксированная плашка свежести перекрывала «✕ Удалить» (390)
+# и «Копировать» (1440) у заказа, прижатого к низу окна.
+
+_HIT5 = """(sel) => [...document.querySelectorAll(sel)].map(b => {
+  const r = b.getBoundingClientRect();
+  if (!r.width || !r.height) return null;
+  const pts = [[r.left + r.width / 2, r.top + r.height / 2], [r.left + 3, r.top + 3],
+               [r.right - 3, r.top + 3], [r.left + 3, r.bottom - 3], [r.right - 3, r.bottom - 3]];
+  const res = pts.map(([x, y]) => {
+    if (y < 0 || y > innerHeight || x < 0 || x > innerWidth) return 'out';
+    const h = document.elementFromPoint(x, y);
+    if (!h) return 'null';
+    if (h === b || b.contains(h)) return 'self';
+    const chip = document.getElementById('fresh-chip');
+    return (chip && (h === chip || chip.contains(h))) ? 'fresh-chip' : (h.id || String(h.className) || h.tagName);
+  });
+  return {text: b.textContent.trim().slice(0, 24), res: res};
+}).filter(Boolean)"""
+
+
+def _wait_fresh_chip(page) -> None:
+    page.wait_for_function("() => { const c = document.getElementById('fresh-chip');"
+                           " return !!c && c.style.display === 'flex'; }", timeout=30000)
+
+
+def step_actions_clarity(browser, c, names) -> None:
+    """Заголовок «Едет», видимые пояснения к «Принят на склад»/«Приёмка» и то,
+    что плашка свежести не перекрывает действия заказа — на 1440 и на 390."""
+    print("\n== Действия приёмки: пояснения видны, плашка свежести ничего не закрывает ==")
+    oid = make_order(c, "Пояснения-действия", [{"base_name": names[0], "qty": 6}])
+    for tag, vp, touch in (("1440", {"width": 1440, "height": 900}, False),
+                           ("390 px", {"width": 390, "height": 844}, True)):
+        ctx = browser.new_context(viewport=vp, has_touch=touch, is_mobile=touch)
+        ctx.add_cookies([{"name": k, "value": v, "domain": "127.0.0.1", "path": "/"}
+                         for k, v in c.cookies.items()])
+        errors: list[str] = []
+        page = ctx.new_page()
+        page.on("pageerror", lambda e: errors.append(str(e)))
+        try:
+            open_replenish(page)
+            _wait_fresh_chip(page)
+            close_hint(page)
+            head = page.locator("#orders").text_content() or ""
+            check(f"{tag}: заголовок заказов не выдаёт «Едет» за сумму этих заказов",
+                  "учитываются в колонке" not in head and "ручными отметками" in head
+                  and "МойСклад" in head, head[:160])
+            row = page.locator('#orders-tb tr[data-order="%s"]' % oid)
+            helptxt = row.locator(".ord-help").inner_text() if row.locator(".ord-help").count() else ""
+            check(f"{tag}: у заказа ВИДНО, чем «Принят на склад» отличается от «Приёмки»",
+                  row.locator(".ord-help").is_visible()
+                  and "Принят на склад" in helptxt and "не записывается" in helptxt
+                  and "Приёмка" in helptxt and "по позициям" in helptxt, helptxt[:200])
+            g = page.evaluate("""(id) => { const h = document.querySelector(
+              '#orders-tb tr[data-order="' + id + '"] .ord-help'); if (!h) return null;
+              const r = h.getBoundingClientRect();
+              return {left: r.left, right: r.right, vw: innerWidth, fs: parseFloat(getComputedStyle(h).fontSize)}; }""",
+                              str(oid))
+            check(f"{tag}: пояснение целиком в окне и не мельче 11 px",
+                  g is not None and g["left"] >= 0 and g["right"] <= g["vw"] + 0.5 and g["fs"] >= 11,
+                  str(g))
+            # Строка заказа прижата к низу окна — там, где раньше лежала плашка.
+            page.evaluate("""(id) => { const r = document.querySelector(
+              '#orders-tb tr[data-order="' + id + '"]');
+              const y = r.getBoundingClientRect().bottom + scrollY - innerHeight + 20;
+              window.scrollTo(0, Math.max(0, y)); }""", str(oid))
+            page.wait_for_timeout(300)
+            hits = page.evaluate(_HIT5, '#orders-tb tr[data-order="%s"] .mvbtn' % oid)
+            covered = [h for h in hits if "fresh-chip" in h["res"]]
+            seen = [h for h in hits if "self" in h["res"]]
+            check(f"{tag}: ни одна точка кнопок заказа у низа окна не под плашкой свежести",
+                  len(seen) >= 3 and not covered, str(hits)[:400])
+            others = [h for h in hits if any(x not in ("self", "out", "fresh-chip") for x in h["res"])]
+            if others:
+                print(f"  INFO {tag}: другие перекрытия (не плашка свежести): {str(others)[:300]}")
+            chip_pos = page.evaluate("() => getComputedStyle(document.getElementById('fresh-chip')).position")
+            check(f"{tag}: плашка свежести в потоке страницы", chip_pos != "fixed", chip_pos)
+            # Обычный клик по «Приёмке» в этом же положении открывает панель.
+            btn = row.locator(".ord-receipts")
+            (btn.tap if touch else btn.click)()
+            page.wait_for_function("""() => { const l = document.getElementById('rc-lines');
+              return !!l && !!l.querySelector('[data-rc-line]'); }""", timeout=30000)
+            check(f"{tag}: обычный клик по «Приёмке» у низа окна открывает панель",
+                  page.locator("#rc-panel").is_visible())
+            page.locator("#rc-close").click()
+            check(f"{tag}: ошибок в консоли не было", not errors, str(errors[:2])[:200])
+        finally:
+            ctx.close()
+    # Частичный приход и история после правок — тем же путём, что человек.
+    ctx = browser.new_context(viewport={"width": 390, "height": 844}, has_touch=True)
+    ctx.add_cookies([{"name": k, "value": v, "domain": "127.0.0.1", "path": "/"}
+                     for k, v in c.cookies.items()])
+    page = ctx.new_page()
+    try:
+        open_replenish(page)
+        close_hint(page)
+        page.locator('#orders-tb tr[data-order="%s"] .ord-receipts' % oid).tap()
+        page.wait_for_function("() => !!document.querySelector('#rc-lines [data-rc-line]')",
+                               timeout=30000)
+        _rc_input(page, names[0]).fill("2")
+        with page.expect_response(lambda r: r.request.method == "POST"
+                                  and r.url.endswith(f"/api/orders/{oid}/receipts")) as resp:
+            page.locator("#rc-save").tap()
+        rc = _order_api(c, oid)[1]
+        check("390 px: частичный приход после правок записан — 2 из 6, одна строка, история 1",
+              resp.value.status == 200 and rc["receipts_total"] == 1
+              and rc["lines"][0]["received_qty"] == 2
+              and page.locator("#rc-history .row").count() == 1,
+              f"{resp.value.status} total={rc['receipts_total']}")
+        check("статус заказа не тронут: по-прежнему в производстве",
+              _order_api(c, oid)[0] == "sent")
+    finally:
+        ctx.close()
+
+
+def step_actions_readonly(browser, c, names) -> None:
+    """readonly (гейт подписки включён, триал истёк): приёмка по-прежнему
+    закрыта на запись — сервер отвечает 402, строка не пишется, пояснения
+    остаются. Фикстура состояния — в базе набора; окружение восстанавливается."""
+    import sqlite3
+    print("\n== readonly: приёмка закрыта на запись, пояснения на месте ==")
+    oid = make_order(c, "Readonly-приёмка", [{"base_name": names[1], "qty": 4}])
+    with sqlite3.connect(DB_PATH) as con:
+        org, trial, paid = con.execute(
+            "SELECT id, trial_ends_at, paid_until FROM orgs WHERE id=(SELECT org_id FROM"
+            " production_orders WHERE id=?)", (oid,)).fetchone()
+        con.execute("UPDATE orgs SET trial_ends_at='2020-01-01 00:00:00', paid_until=NULL"
+                    " WHERE id=?", (org,))
+    prev = os.environ.get("OBOROT_SUBSCRIPTION_GATE")
+    os.environ["OBOROT_SUBSCRIPTION_GATE"] = "1"
+    ctx = browser.new_context(viewport={"width": 1440, "height": 900})
+    ctx.add_cookies([{"name": k, "value": v, "domain": "127.0.0.1", "path": "/"}
+                     for k, v in c.cookies.items()])
+    page = ctx.new_page()
+    try:
+        open_replenish(page)
+        close_hint(page)
+        row = page.locator('#orders-tb tr[data-order="%s"]' % oid)
+        check("readonly: пояснения к действиям видны", row.locator(".ord-help").is_visible())
+        row.locator(".ord-receipts").click()
+        page.wait_for_function("() => !!document.querySelector('#rc-lines [data-rc-line]')",
+                               timeout=30000)
+        _rc_input(page, names[1]).fill("1")
+        with page.expect_response(lambda r: r.request.method == "POST"
+                                  and r.url.endswith(f"/api/orders/{oid}/receipts")) as resp:
+            page.locator("#rc-save").click()
+        page.wait_for_function("() => document.getElementById('rc-err').textContent.trim() !== ''",
+                               timeout=15000)
+        os.environ.pop("OBOROT_SUBSCRIPTION_GATE", None)
+        rc = _order_api(c, oid)[1]
+        check("readonly: сервер отказал 402, строка не записана, экран говорит «Не сохранено»",
+              resp.value.status == 402 and rc["receipts_total"] == 0
+              and _err_text(page).startswith("Не сохранено"),
+              f"{resp.value.status} total={rc['receipts_total']} err={_err_text(page)[:60]}")
+    finally:
+        ctx.close()
+        if prev is None:
+            os.environ.pop("OBOROT_SUBSCRIPTION_GATE", None)
+        else:
+            os.environ["OBOROT_SUBSCRIPTION_GATE"] = prev
+        with sqlite3.connect(DB_PATH) as con:
+            con.execute("UPDATE orgs SET trial_ends_at=?, paid_until=? WHERE id=?",
+                        (trial, paid, org))
 
 
 # ── Мелкие помощники ────────────────────────────────────────────────────────

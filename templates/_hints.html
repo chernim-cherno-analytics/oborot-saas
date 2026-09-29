@@ -420,8 +420,18 @@
 </script>
 
 {# Табло свежести данных: до какого дня загружены продажи и остатки и не
-   падает ли синк. Всегда видно (левый нижний угол); при ошибке синка —
-   красное, при отставании данных — жёлтое. Клик ведёт в настройки. #}
+   падает ли синк. При ошибке синка — красное, при отставании данных —
+   жёлтое. Клик ведёт в настройки.
+
+   PILOT-UX-CLARITY-1-ACTIONS: табло стоит В ПОТОКЕ страницы — сразу под
+   шапкой (самостоятельные страницы) или первым в main.content (страницы на
+   base.html), а не фиксированной плашкой в левом нижнем углу. Фиксированное,
+   оно лежало поверх содержимого: на /assistant (1440) закрывало верх кнопки
+   «Дальше →», на /replenish (390) — «✕ Удалить» у заказа. Плашка поверх
+   страницы перекрывает то, что окажется под ней при прокрутке, как ни
+   двигай; место в потоке не перекрывает ничего. Текст, цвета предупреждения
+   и ошибки, ссылка в настройки — прежние. Фиксированное положение осталось
+   только запасным: если ни шапки, ни main.content на странице нет. #}
 <style>
   .fresh-chip { position: fixed; left: 18px; bottom: 18px; z-index: 900;
     display: none; align-items: center; gap: 8px; max-width: 46vw;
@@ -456,6 +466,15 @@
     .fresh-chip { max-width: calc(100vw - 76px); min-height: 44px; padding: 9px 13px; }
     #hint-bottom-spacer { display: block; height: 76px; }
   }
+  {# В потоке (см. пояснение выше). Специфичность 0-2-0 выше, чем у правил
+     .fresh-chip, поэтому порядок относительно медиазапроса не важен. #}
+  .fresh-chip.fresh-inflow { position: relative; left: auto; top: auto; bottom: auto; z-index: 150;
+    width: fit-content; max-width: calc(100% - 56px); margin: 8px 28px 0; box-shadow: none; }
+  main.content > .fresh-chip.fresh-inflow { max-width: 100%; margin: 0 0 12px; }
+  @media (max-width: 640px) {
+    .fresh-chip.fresh-inflow { max-width: calc(100% - 28px); margin: 8px 14px 0; }
+    main.content > .fresh-chip.fresh-inflow { max-width: 100%; margin: 0 0 10px; }
+  }
 </style>
 <a class="fresh-chip" id="fresh-chip" href="/settings"></a>
 <div id="hint-bottom-spacer" aria-hidden="true"></div>
@@ -479,7 +498,26 @@
   // ширины документа, а не от того, что видно на экране. Держим плашку у
   // левого нижнего угла РЕАЛЬНО видимой области и ограничиваем её ширину тем
   // же способом.
+  // Место в потоке: первым в main.content (base.html, в том числе встроенный
+  // режим) либо сразу за полосой демо-данных (.app-demo) / шапкой
+  // самостоятельной страницы. Нет ни того, ни другого — плашка остаётся
+  // фиксированной. (Слово-метку полосы здесь не пишем: этот комментарий
+  // уходит в HTML страницы, а проверки ищут метку в тексте ответа.)
+  function placeInFlow(){
+    var content = document.querySelector("main.content");
+    if (content) {
+      content.insertBefore(chip, content.firstChild);
+    } else {
+      var anchor = document.querySelector(".app-demo") || document.querySelector("header.app-top");
+      if (!anchor || !anchor.parentNode) return false;
+      anchor.parentNode.insertBefore(chip, anchor.nextSibling);
+    }
+    chip.classList.add("fresh-inflow");
+    chip.style.left = ""; chip.style.top = ""; chip.style.bottom = ""; chip.style.maxWidth = "";
+    return true;
+  }
   function syncChipPosition(){
+    if (chip.classList.contains("fresh-inflow")) return;
     var vv = window.visualViewport;
     if (!vv) return;
     chip.style.maxWidth = (vv.width - 76) + "px";
@@ -532,6 +570,7 @@
         }
         chip.innerHTML = '<span class="fd"></span><span></span>';
         chip.lastChild.textContent = txt;
+        placeInFlow();
         chip.style.display = "flex";
         syncChipPosition();
       }).catch(function(){});

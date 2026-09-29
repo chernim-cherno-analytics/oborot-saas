@@ -45,6 +45,14 @@
   .dl-btn { margin-left: auto; font-size: 12px; font-weight: 600; padding: 8px 18px; border-radius: 20px;
     border: 1px solid rgba(31,31,31,.25); background: #2c7a1f; color: #f3e9e0; cursor: pointer; }
   .dl-btn:hover { background: #3d9430; }
+  /* PILOT-UX-CLARITY-1-ACTIONS: «Добавить в «Заказано»» — нейтральная кнопка,
+     а не зелёная «✓ …»: зелёная галочка до нажатия читалась как уже
+     случившаяся отправка, хотя кнопка лишь прибавляет штуки к графе
+     «Заказано» на «Активном стоке» и заказа на производство не создаёт. */
+  .dl-btn.neutral { background: rgba(255,255,255,.8); color: #1f1f1f; border-color: rgba(31,31,31,.3); }
+  .dl-btn.neutral:hover { background: #fff; }
+  .dl-btn.neutral:disabled { opacity: .6; cursor: default; }
+  .dl-btn.neutral.done { background: rgba(76,187,23,.2); border-color: rgba(44,122,31,.45); color: #2c5e10; }
 
   .cards { display: grid; grid-template-columns: repeat(4,1fr); gap: 12px; margin-bottom: 16px; }
   .card { background: rgba(255,255,255,.6); backdrop-filter: blur(10px);
@@ -117,7 +125,8 @@
         <button data-m="pure">чистая пропорция</button>
       </div>
       <span class="hint" id="status-hint">загружаю список товаров…</span>
-      <button class="dl-btn" id="send-btn" style="display:none">✓ Заказ отправлен</button>
+      <button class="dl-btn neutral" id="send-btn" style="display:none"
+              title="Прибавит сумму к графе «Заказано» на «Активном стоке». Заказ на производство не создаётся">Добавить в «Заказано»</button>
     </div>
   </div>
 
@@ -142,8 +151,10 @@
     «менее ходовым»). Остатки прогнозируются на дату прихода заказа по этим темпам. «С учётом
     остатков»: доля темпа размера применяется к сумме (остаток к приходу + заказ), из результата
     вычитается прогнозный остаток — заказ закрывает дыры по размерам, а не дублирует сток.
-    «Чистая пропорция»: количество делится ровно по долям темпов. Кнопка «Заказ отправлен»
-    добавляет сумму заказа в «Заказано» на Активном стоке. Период «N мес» = N полных месяцев +
+    «Чистая пропорция»: количество делится ровно по долям темпов. Кнопка «Добавить в «Заказано»»
+    прибавляет сумму к графе «Заказано» на Активном стоке — это ручная отметка «уже заказано»,
+    она попадает в «Едет»; заказ на производство при этом не создаётся (его создают на странице
+    «Заказ»). Период «N мес» = N полных месяцев +
     текущий неполный; сезоны — за все годы истории. Дата прихода по умолчанию — как на «Заказе»:
     по сроку производства, за которым закреплена позиция (если своего срока у него нет — общий из
     настроек); если у этого производства есть минимальная партия, она показана рядом с полем «Заказ».
@@ -347,7 +358,7 @@
       });
   }
 
-  // «Заказ отправлен»: сумма активного режима → в «Заказано» (Активный сток)
+  // «Добавить в «Заказано»»: сумма активного режима → в «Заказано» (Активный сток)
   document.getElementById("send-btn").addEventListener("click",function(){
     if(!LAST||!SEL) return;
     // Страховка второго уровня: расчёт на экране обязан относиться К ТОМУ ЖЕ
@@ -359,15 +370,32 @@
     }
     var key=MODE==="stock"?"order_stock":"order_pure";
     var total=LAST.sizes.reduce(function(a,s){ return a+(s[key]||0); },0);
-    if(total<=0){ alert("Заказ пустой — нечего отправлять."); return; }
-    if(!confirm("Добавить "+total+" шт «"+SEL+"» в «Заказано» на Активном стоке?")) return;
+    if(total<=0){ alert("Количество пустое — добавлять в «Заказано» нечего."); return; }
+    if(!confirm("Добавить "+total+" шт «"+SEL+"» в «Заказано» на Активном стоке?\n\n"+
+                "Это ручная отметка «уже заказано»: штуки попадут в «Едет». "+
+                "Заказ на производство при этом не создаётся.")) return;
     var btn=this;
+    /* PILOT-UX-CLARITY-1-ACTIONS: состояния кнопки называют ровно то, что
+       делает ручка /api/ordered/add, — прибавку к «Заказано». Запрос, тело и
+       количество те же. Кнопка на время запроса выключена: повторное нажатие
+       прибавило бы штуки второй раз. */
+    btn.disabled=true; btn.classList.remove("done");
+    btn.textContent="Добавляю в «Заказано»…";
     api("/api/ordered/add",{method:"POST",body:{base_name:SEL,qty:total}})
       .then(function(r){
-        btn.textContent="✓ Отправлено: "+fmt(r.qty_total)+" шт в «Заказано»";
-        setTimeout(function(){ btn.textContent="✓ Заказ отправлен"; },4000);
+        btn.classList.add("done");
+        btn.textContent="✓ Добавлено в «Заказано»: теперь "+fmt(r.qty_total)+" шт";
+        setTimeout(function(){
+          btn.classList.remove("done");
+          btn.textContent="Добавить в «Заказано»";
+          btn.disabled=false;
+        },4000);
       })
-      .catch(function(e){ alert(errText(e)); });
+      .catch(function(e){
+        btn.textContent="Добавить в «Заказано»";
+        btn.disabled=false;
+        alert(errText(e));
+      });
   });
 
   function render(d){
