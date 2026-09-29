@@ -709,6 +709,7 @@ def run() -> int:  # noqa: C901 — сценарный тест: шагов мн
                 _connection_states(browser, base, width, journey_shots)
             _shell_journey(browser, base, c)
             _actions_clarity(browser, base, c)
+            _focus_urgent(browser, base)
         except Exception as exc:  # noqa: BLE001 — падение пути обязано стать
             # отчётом и ненулевым кодом, а не трассировкой без отчёта (D-42).
             check("сквозной путь в браузере дошёл до конца", False,
@@ -1212,6 +1213,210 @@ def _actions_clarity(browser, base: str, c) -> None:
         check("ошибок в консоли не было", not errors, str(errors[:2])[:200])
     finally:
         ctx.close()
+
+
+# ── PILOT-UX-CLARITY-2-FOCUS: фильтр «Срочно» из карточки риска ────────────
+#
+# Своя организация (регистрация + демо): шаг двигает позиции во второе
+# производство и не должен влиять на соседние шаги набора.
+
+_ROWS_JS = """() => [...document.querySelectorAll('#tbody tr[data-base]')].map(r => {
+  const b = r.querySelector('.stbadge');
+  return {base: r.getAttribute('data-base'), st: b ? b.textContent.trim() : '',
+          gap: /⚠/.test(r.textContent)};
+})"""
+_STATE_JS = """() => ({
+  qty: document.getElementById('s-qty').textContent, pos: document.getElementById('s-pos').textContent,
+  cost: document.getElementById('s-cost').textContent, risk: document.getElementById('k-risk').textContent,
+  checked: document.querySelectorAll('#tbody .row-check:checked').length,
+  search: document.getElementById('search').value,
+  cat: (document.querySelector('#cat-bar .active') || {}).textContent || '',
+  tab: (document.querySelector('#bigtabs .bigtab.active') || {getAttribute: () => null}).getAttribute('data-id'),
+  segR: document.getElementById('seg-r').textContent, segAll: document.getElementById('seg-all').textContent,
+  band: (document.querySelector('#band-seg button.on') || {}).getAttribute ?
+        document.querySelector('#band-seg button.on').getAttribute('data-band') : null})"""
+_FOCUS_JS = """() => { const a = document.activeElement; const hdr = document.querySelector('header.app-top');
+  const r = a.getBoundingClientRect(); const hb = hdr ? hdr.getBoundingClientRect().bottom : 0;
+  const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+  return {band: a.getAttribute('data-band'), inSeg: !!a.closest('#band-seg'), top: r.top, bottom: r.bottom,
+          headerBottom: hb, vh: innerHeight, hitSelf: !!hit && (hit === a || a.contains(hit)),
+          ring: getComputedStyle(a).outlineStyle !== 'none'}; }"""
+
+
+def _wait_rows(page) -> None:
+    page.wait_for_function("() => document.querySelectorAll('#tbody tr[data-base]').length > 0",
+                           timeout=45000)
+    _close_hint(page)
+    page.wait_for_timeout(300)
+
+
+def _check_urgent_view(page, tag: str, before: dict, posts: list, how: str) -> None:
+    after = page.evaluate(_STATE_JS)
+    rows = page.evaluate(_ROWS_JS)
+    check(f"{tag} [{how}]: включён именно существующий фильтр «Срочно» (aria-pressed)",
+          after["band"] == "r" and page.locator('#band-seg button[data-band="r"]')
+          .get_attribute("aria-pressed") == "true", str(after["band"]))
+    check(f"{tag} [{how}]: все видимые строки — «Срочно», их столько же, сколько в счётчике",
+          rows and all(r["st"] == "Срочно" for r in rows) and str(len(rows)) == after["segR"],
+          f"rows={len(rows)} seg-r={after['segR']} st={sorted({r['st'] for r in rows})}")
+    same = {k: before[k] for k in ("qty", "pos", "cost", "risk", "search", "cat", "tab")}
+    now = {k: after[k] for k in same}
+    check(f"{tag} [{how}]: производство, поиск, категория, итоги заказа и KPI не тронуты",
+          same == now, f"{same} -> {now}")
+    check(f"{tag} [{how}]: фильтр ничего не записал (0 POST)", not posts, str(posts[:3]))
+    f = page.evaluate(_FOCUS_JS)
+    check(f"{tag} [{how}]: фокус на «Срочно», ниже липкой шапки, виден и не перекрыт",
+          f["inSeg"] and f["band"] == "r" and f["top"] >= f["headerBottom"] - 0.5
+          and f["bottom"] <= f["vh"] and f["hitSelf"], str(f))
+
+
+def _focus_urgent(browser, base: str) -> None:
+    print("\n== PILOT-UX-CLARITY-2-FOCUS: «Срочно» из карточки риска — мышь, клавиатура, 390 ==")
+    cl = httpx.Client(headers={"X-Oborot-CSRF": "1"}, base_url=base, timeout=120.0)
+    cl.post("/register", data={"name": "Фокус", "email": "focus@test.io",
+                               "password": "secret123", "org_name": "Бренд-Фокус"})
+    check("фокус: демо-данные загружены", cl.post("/api/connect/demo").status_code == 200)
+    items = cl.get("/api/replenish").json()["items"]
+    pid = cl.post("/api/productions", json={"name": "Второй цех"}).json().get("id")
+    # Во второе производство — и срочные (wos < 2, как у wosBand), и прочие,
+    # чтобы там проверялась включённая кнопка, а не только выключенная.
+    urgent = [it["base_name"] for it in items if it.get("wos") is not None and it["wos"] < 2]
+    other = [it["base_name"] for it in items if not (it.get("wos") is not None and it["wos"] < 2)]
+    moved = urgent[:2] + other[:4]
+    for b in moved:
+        cl.post("/api/productions/assign", json={"base_name": b, "production_id": pid})
+    drafts0 = cl.get("/api/replenish-draft").json()
+    orders0 = len(cl.get("/api/orders").json().get("orders", []))
+    cookies = [{"name": k, "value": v, "domain": "127.0.0.1", "path": "/"} for k, v in cl.cookies.items()]
+
+    for tag, vp, touch in (("1440", {"width": 1440, "height": 900}, False),
+                           ("390", {"width": MOBILE_WIDTH, "height": 844}, True)):
+        ctx = browser.new_context(viewport=vp, has_touch=touch, is_mobile=touch)
+        ctx.add_cookies(cookies)
+        errors: list[str] = []
+        page = ctx.new_page()
+        page.on("pageerror", lambda e: errors.append(str(e)))
+        posts: list[str] = []
+        page.on("request", lambda r: posts.append(r.url) if r.method != "GET" else None)
+        try:
+            page.goto(f"{base}/replenish")
+            _wait_rows(page)
+            legend = page.locator("#tbl-legend")
+            check(f"{tag}: смысл ⚠ виден без наведения и не приравнен к «Срочно»",
+                  legend.is_visible() and "не то же, что статус «Срочно»" in (legend.text_content() or ""))
+            # Нетривиальная категория: есть и срочные, и прочие.
+            chips = page.locator('#cat-bar [data-cat]:not([data-cat=""])')
+            chosen = None
+            for i in range(chips.count()):
+                _click_past_hint(page, chips.nth(i), "категория")
+                st = page.evaluate(_STATE_JS)
+                if int(st["segR"]) > 0 and int(st["segAll"]) > int(st["segR"]):
+                    chosen = chips.nth(i).get_attribute("data-cat")
+                    break
+            check(f"{tag}: найдена категория и со срочными, и с прочими позициями", chosen is not None)
+            rg = page.locator("#risk-go")
+            has_rg = rg.count() == 1
+            label = (rg.text_content() or "") if has_rg else ""
+            st = page.evaluate(_STATE_JS)
+            check(f"{tag}: кнопка в карточке риска называет фильтр и его счётчик с учётом категории",
+                  has_rg and rg.is_visible() and "Показать «Срочно» в таблице" in label
+                  and st["segR"] in label and "с учётом поиска и категории" in label, label)
+            if touch:
+                g = page.evaluate("""() => [...document.querySelectorAll('#band-seg button, #rate-seg button,'
+                  + ' #risk-go')].map(b => { const r = b.getBoundingClientRect();
+                  return {t: b.textContent.trim().slice(0, 12), h: r.height, l: r.left, r: r.right}; })""")
+                small = [x for x in g if x["h"] < 44]
+                check("390: кнопки статуса, темпа и «Показать «Срочно»» — не ниже 44 px", not small, str(small))
+                boxes = page.evaluate("""() => ['band-seg', 'rate-seg', 'search'].map(id => {
+                  const r = document.getElementById(id).getBoundingClientRect();
+                  return [r.left, r.top, r.right, r.bottom]; })""")
+                inter = [(i, j) for i in range(3) for j in range(i + 1, 3)
+                         if min(boxes[i][2], boxes[j][2]) > max(boxes[i][0], boxes[j][0]) + 0.5
+                         and min(boxes[i][3], boxes[j][3]) > max(boxes[i][1], boxes[j][1]) + 0.5]
+                check("390: переключатели и поиск не наезжают друг на друга", not inter, str(boxes))
+                check("390: страница не прокручивается вбок",
+                      page.evaluate("() => document.documentElement.scrollWidth <= innerWidth + 1"),
+                      str(page.evaluate("() => document.documentElement.scrollWidth")))
+            if not has_rg:
+                # Кнопки нет (базовое дерево): мышь и клавиатура проверять
+                # нечем — это уже красная строка выше, дальше не идём.
+                continue
+            # 1) Указатель: настоящий клик / касание.
+            before = page.evaluate(_STATE_JS)
+            posts.clear()
+            (rg.tap if touch else rg.click)()
+            page.wait_for_timeout(400)
+            _check_urgent_view(page, tag, before, posts, "касание" if touch else "мышь")
+            # «Все» возвращает строки.
+            (page.locator('#band-seg button[data-band=""]').tap if touch
+             else page.locator('#band-seg button[data-band=""]').click)()
+            page.wait_for_timeout(300)
+            st = page.evaluate(_STATE_JS)
+            check(f"{tag}: «Все» снимает только статус и возвращает все строки категории",
+                  st["band"] == "" and len(page.evaluate(_ROWS_JS)) == int(st["segAll"])
+                  and st["cat"] == before["cat"], str(st))
+            # 2) Клавиатура: Tab до кнопки, затем Enter (1440) / пробел (390).
+            page.evaluate("() => window.scrollTo(0, 0)")
+            page.locator("#k-risk-sub").click() if not touch else None
+            for _ in range(40):
+                if page.evaluate("() => document.activeElement && document.activeElement.id") == "risk-go":
+                    break
+                page.keyboard.press("Tab")
+            reached = page.evaluate("() => document.activeElement && document.activeElement.id") == "risk-go"
+            check(f"{tag}: до кнопки доходит Tab, фокус виден",
+                  reached and page.evaluate("() => getComputedStyle(document.activeElement)"
+                                            ".outlineStyle !== 'none'"))
+            before = page.evaluate(_STATE_JS)
+            posts.clear()
+            page.keyboard.press("Enter" if not touch else " ")
+            page.wait_for_timeout(400)
+            _check_urgent_view(page, tag, before, posts, "Enter" if not touch else "пробел")
+            page.locator('#band-seg button[data-band=""]').click()
+            page.wait_for_timeout(200)
+            # 3) Поиск по одной НЕсрочной позиции с ⚠: честное «нет» вместо «всё хорошо».
+            # Ищем по всем категориям (в выбранной такой строки может не быть).
+            _click_past_hint(page, page.locator('#cat-bar [data-cat=""]'), "все категории")
+            page.wait_for_timeout(300)
+            gap_rows = [r for r in page.evaluate(_ROWS_JS) if r["st"] != "Срочно" and r["gap"]]
+            if gap_rows:
+                page.fill("#search", gap_rows[0]["base"])
+                page.wait_for_timeout(500)
+                label = rg.text_content() or ""
+                check(f"{tag}: без срочных в фильтре кнопка выключена и говорит «нет», не «всё хорошо»",
+                      rg.is_disabled() and "Срочных в таблице нет" in label
+                      and "с учётом поиска и категории" in label, label)
+                page.locator('#band-seg button[data-band="r"]').click()
+                page.wait_for_timeout(300)
+                empty = page.locator("#tbody .empty-note").text_content() or ""
+                check(f"{tag}: пустой «Срочно» объясняет, что ⚠ есть в других статусах",
+                      "Срочных позиций среди найденных" in empty and "дыра поставки есть у" in empty, empty)
+                page.locator('#band-seg button[data-band=""]').click()
+                page.fill("#search", "")
+                page.wait_for_timeout(400)
+            else:
+                check(f"{tag}: в демо есть несрочная позиция с ⚠ для проверки пустого фильтра", False)
+            # 4) Второе производство: вкладка остаётся той же, KPI — по вкладке.
+            page.locator('#bigtabs .bigtab[data-id="%s"]' % pid).click()
+            page.wait_for_timeout(500)
+            st2 = page.evaluate(_STATE_JS)
+            check(f"{tag}: во втором производстве есть срочные — кнопка включена",
+                  not rg.is_disabled(), rg.text_content())
+            before = page.evaluate(_STATE_JS)
+            posts.clear()
+            (rg.tap if touch else rg.click)()
+            page.wait_for_timeout(400)
+            _check_urgent_view(page, tag + " второе производство", before, posts,
+                               "касание" if touch else "мышь")
+            page.locator('#band-seg button[data-band=""]').click()
+            check(f"{tag}: вкладка второго производства не сброшена фильтром",
+                  page.evaluate(_STATE_JS)["tab"] == str(pid) == st2["tab"], str(st2["tab"]))
+            check(f"{tag}: ошибок в консоли не было", not errors, str(errors[:2])[:200])
+        finally:
+            ctx.close()
+    check("фокус: ручные правки ростовки и число заказов не изменились",
+          cl.get("/api/replenish-draft").json() == drafts0
+          and len(cl.get("/api/orders").json().get("orders", [])) == orders0)
+    cl.close()
 
 
 # ── PILOT-SYNC-TRUTH-1: экран не обещает того, чего не знает ────────────────

@@ -74,7 +74,35 @@
   .moq-warn { display: inline-block; font-size: 9px; font-weight: 700; padding: 1px 6px; border-radius: 8px;
     background: rgba(221,0,4,.12); color: #a30003; cursor: help; margin-top: 2px; }
 
-  .tools { position: relative; z-index: 10; padding: 8px 0 10px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  .tools { position: relative; z-index: 10; padding: 8px 0 10px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    scroll-margin-top: 84px; }
+  /* PILOT-UX-CLARITY-2-FOCUS: кнопка в карточке «Риск стокаута» — тот же
+     фильтр «Срочно», что и в переключателе над таблицей, только найти его
+     теперь можно с того места, куда смотрят первым. scroll-margin у .tools
+     держит полосу фильтров ниже липкой шапки, когда к ней прокручивают. */
+  .risk-go { display: inline-flex; align-items: center; flex-wrap: wrap; gap: 4px; margin-top: 8px;
+    font: inherit; font-size: 12px; font-weight: 600; padding: 6px 12px; border-radius: 10px;
+    border: 1px solid rgba(163,0,3,.45); background: #fff; color: #a30003; cursor: pointer; text-align: left; }
+  .risk-go:hover { background: #fff5f5; }
+  .risk-go:disabled { color: rgba(31,31,31,.55); border-color: rgba(31,31,31,.2);
+    background: rgba(255,255,255,.6); cursor: default; }
+  .risk-go .rg-note { font-weight: 400; opacity: .85; }
+  .risk-go:focus-visible, #band-seg button:focus-visible { outline: 2px solid #1554d1; outline-offset: 2px; }
+  /* Смысл ⚠ в колонке «Стокаут» — строкой рядом с таблицей, а не только во
+     всплывающей подсказке заголовка, которой на телефоне нет. */
+  .tbl-legend { font-size: 12px; line-height: 1.45; color: rgba(31,31,31,.72); margin: 2px 0 8px; }
+  .tbl-legend b { color: #a30003; font-weight: 600; }
+  /* Телефон: кнопки статуса и темпа — не ниже 44 px, ряды переносятся
+     (сама таблица по-прежнему прокручивается вбок внутри своей рамки). */
+  {# Селекторы по id: общий _mobile.html (подключён позже, та же
+     специфичность у `.seg button`) держит 40 px, и правило по классу
+     проигрывало бы ему по порядку. #}
+  @media (max-width: 640px) {
+    .seg { flex-wrap: wrap; }
+    #band-seg button, #rate-seg button { min-height: 44px; padding: 10px 14px; font-size: 13px; }
+    .seg .seg-lbl { display: inline-flex; align-items: center; }
+    .risk-go { min-height: 44px; font-size: 13px; }
+  }
   .seg { display: flex; gap: 0; border: 1px solid rgba(31,31,31,.15); border-radius: 20px; overflow: hidden; background: rgba(255,255,255,.5); }
   .seg button { font-size: 12px; font-weight: 500; padding: 6px 14px; border: none; background: transparent;
     color: #434446; cursor: pointer; transition: all .15s; white-space: nowrap; }
@@ -335,7 +363,8 @@
   </details>
 
   <div class="sumbar" id="sumbar" style="display:none">
-    <div class="scard" id="risk-card"><div class="sl">Риск стокаута</div><div class="sv" id="k-risk">0</div><div class="ss" id="k-risk-sub">покрытие меньше 2 недель</div></div>
+    <div class="scard" id="risk-card"><div class="sl">Риск стокаута</div><div class="sv" id="k-risk">0</div><div class="ss" id="k-risk-sub">покрытие меньше 2 недель</div>
+      <button type="button" class="risk-go" id="risk-go" aria-controls="tbl-wrap" aria-pressed="false">Показать «Срочно» в таблице</button></div>
     <div class="scard"><div class="sl">К заказу</div><div class="sv" id="s-pos">0</div><div class="ss" id="s-pos-sub">по рекомендации системы</div></div>
     <div class="scard"><div class="sl">Объём заказа</div><div class="sv" id="s-qty">0</div><div class="ss">шт · по отмеченным позициям</div></div>
     <div class="scard"><div class="sl">Себестоимость</div><div class="sv" id="s-cost">—</div><div class="ss" id="s-cost-sub">затраты на производство заказа</div></div>
@@ -370,6 +399,9 @@
   <div class="cat-bar" id="cat-bar" style="display:none"></div>
 
   <div class="tbl-badges" id="tbl-badges"></div>
+  <div class="tbl-legend" id="tbl-legend"><b>⚠</b> в колонке «Стокаут» — дыра поставки: остаток кончится
+    раньше, чем придёт новый заказ. Это не то же, что статус «Срочно» (покрытие меньше 2 недель):
+    ⚠ бывает и у позиций «Скоро» и «План».</div>
 
   <div class="table-outer" id="tbl-wrap">
     <table>
@@ -854,6 +886,7 @@
     updateSummary();
     renderKpis();
     document.getElementById("sumbar").style.display=items.length?"":"none";
+    document.getElementById("tbl-legend").style.display=items.length?"":"none";
   }
 
   /* ── заказы в производстве: управление прямо здесь (страницы «Заказы» нет) ── */
@@ -1473,9 +1506,39 @@
     document.getElementById("seg-y").textContent=cnt.y;
     document.getElementById("seg-g").textContent=cnt.g;
     segBox.querySelectorAll("button").forEach(function(b){
-      b.classList.toggle("on",b.getAttribute("data-band")===state.band);
+      var on=b.getAttribute("data-band")===state.band;
+      b.classList.toggle("on",on);
+      b.setAttribute("aria-pressed",on?"true":"false");
     });
+    /* PILOT-UX-CLARITY-2-FOCUS: подпись кнопки в карточке риска — ровно тот
+       же счётчик, что у «Срочно» в переключателе (с учётом поиска и
+       категории). Число в самой карточке считается по всему производству и
+       может быть больше — поэтому при активных поиске/категории это сказано
+       словами, а не подменено. */
+    var rg=document.getElementById("risk-go");
+    if(rg){
+      var narrowed=!!(state.query||state.cat);
+      rg.disabled=cnt.r===0;
+      rg.innerHTML=(cnt.r?"Показать «Срочно» в таблице: "+fmt(cnt.r):"Срочных в таблице нет")+
+        (narrowed?' <span class="rg-note">(с учётом поиска и категории)</span>':'');
+      rg.setAttribute("aria-pressed",state.band==="r"?"true":"false");
+    }
   }
+
+  /* Кнопка в карточке риска — не свой фильтр, а нажатие существующей
+     кнопки «Срочно»: тот же state.band="r", те же syncSegUI/renderTable.
+     Производство, поиск, категория, окно темпа, галочки и количества не
+     трогаются. После — полоса фильтров прокручивается под липкую шапку
+     (scroll-margin у .tools), а фокус встаёт на «Срочно», где видно, что
+     фильтр включён и как его снять («Все»). */
+  document.getElementById("risk-go").addEventListener("click",function(){
+    var seg=segBox.querySelector('button[data-band="r"]');
+    if(!seg) return;
+    seg.click();
+    var tools=document.querySelector(".tools");
+    if(tools) tools.scrollIntoView({block:"start"});
+    try { seg.focus({preventScroll:true}); } catch(e){ seg.focus(); }
+  });
 
   var rateSeg=document.getElementById("rate-seg");
   rateSeg.querySelectorAll("button").forEach(function(b){
@@ -1680,7 +1743,17 @@
     if(!arr.length){
       var msg;
       var total=prodItems(ACTIVE_PROD).length;
-      if(total&&(state.query||state.cat||state.band)){
+      if(total&&state.band==="r"){
+        /* Пустой результат «Срочно» — не «всё в порядке»: срочных нет в
+           ТЕКУЩИХ фильтрах, а дыра поставки (⚠) бывает и в других статусах. */
+        var gapOther=baseFiltered().filter(function(it){
+          return it._band!=="r"&&(it.gap_days||0)>0; }).length;
+        msg="Срочных позиций "+((state.query||state.cat)?"среди найденных по поиску и категории ":"")+
+          "нет."+(gapOther
+            ?" Но ⚠ дыра поставки есть у "+fmt(gapOther)+" "+plural(gapOther,"позиции","позиций","позиций")+
+              " в статусах «Скоро» и «План» — нажмите «Все», чтобы их увидеть."
+            :" Нажмите «Все», чтобы вернуть все позиции.");
+      }else if(total&&(state.query||state.cat||state.band)){
         msg="Ничего не найдено — измените запрос, статус или категорию.";
       }else if(ACTIVE_PROD!==MAIN_ID){
         msg="На этом производстве пока нет позиций.<br>Перенесите их из основного — кнопка в последней колонке таблицы.";
