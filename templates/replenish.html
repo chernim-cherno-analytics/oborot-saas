@@ -259,6 +259,13 @@
   .ord-created { margin: 14px 0 6px; padding: 10px 14px; border-radius: 10px; font-size: 13px;
     line-height: 1.45; background: rgba(76,187,23,.16); color: #2c5e10; scroll-margin-top: 90px; }
   .ord-new td { background: rgba(76,187,23,.16); }
+  /* PILOT-UX-CLARITY-1-ACTIONS: чем «Принят на склад» отличается от
+     «Приёмки» — видимым текстом, а не только всплывающей подсказкой title,
+     которой на телефоне нет вовсе. */
+  .ord-help { margin-top: 6px; font-size: 11px; line-height: 1.4; color: rgba(31,31,31,.68);
+    text-align: left; white-space: normal; max-width: 260px; }
+  .ord-help div + div { margin-top: 2px; }
+  .ord-help b { color: #1f1f1f; font-weight: 600; }
   .ord-new:focus { outline: 2px solid rgba(44,122,31,.55); outline-offset: -2px; }
   /* На телефоне заказ — карточка, а не строка таблицы шириной 651 px внутри
      окна 360 px: кнопки «Принят на склад», «Приёмка» и «Удалить» стояли за
@@ -277,6 +284,7 @@
     #orders-wrap td[data-label]::before, #orders-done-wrap td[data-label]::before {
       content: attr(data-label) ": "; color: rgba(31,31,31,.6); font-weight: 400; }
     .ord-actions { display: flex; flex-wrap: wrap; gap: 8px; padding-top: 10px !important; }
+    .ord-actions .ord-help { flex-basis: 100%; max-width: none; margin-top: 0; font-size: 12px; }
     .ord-actions .mvbtn, .batchid .mvbtn { min-height: 40px; font-size: 13px; padding: 8px 14px;
       border-radius: 10px; }
     .batchid { align-items: center; margin-top: 6px; }
@@ -859,7 +867,11 @@
     }
     t.style.display="";
     if(w.style.display!=="") w.style.display="";
-    t.innerHTML='Заказы в производстве ('+ORDERS.length+') — учитываются в колонке «Едет»';
+    /* PILOT-UX-CLARITY-1-ACTIONS: колонка «Едет» — это НЕ только эти заказы:
+       в неё входит вся графа «Заказано» (ручные отметки на «Активном стоке» и
+       «Заказ позиции», заказы из МойСклада). Прежний заголовок «учитываются в
+       колонке «Едет»» читался как «Едет = сумма этих заказов». */
+    t.innerHTML='Заказы в производстве ('+ORDERS.length+') — входят в колонку «Едет» вместе с ручными отметками «Заказано» и заказами из МойСклада';
     /* Пока висит сообщение «заказ создан … выделен ниже», выделение
        переживает перерисовку списка (после приёмки, смены статуса и т. п.). */
     var note=document.getElementById("order-created");
@@ -877,6 +889,7 @@
       if(o.status!=="draft")
         btns+='<button class="mvbtn ord-receipts" data-id="'+o.id+'" title="Что фактически принято по заказу">Приёмка</button> ';
       btns+='<button class="mvbtn ord-del" data-id="'+o.id+'" data-name="'+esc(o.name)+'">✕ Удалить</button>';
+      if(o.status==="sent") btns+=ORD_HELP_SENT;
       /* SUPPLY-1: CC_BATCH_ID партии — под названием заказа, целиком и с
          кнопкой копирования. Пустое значение бывает ровно у строки, созданной
          откатившимся старым кодом и ещё не вылеченной ближайшим стартом
@@ -957,6 +970,21 @@
      Экран поверх существующих ручек `GET`/`POST /api/orders/{id}/receipts`.
      Новых правил не вводит: всё, что здесь показано, посчитал сервер. */
 
+  /* PILOT-UX-CLARITY-1-ACTIONS: видимые пояснения к двум действиям приёмки.
+     Смысл — ровно D-25 и существующие ручки, ничего нового:
+       • «Принят на склад» — status=received без количеств: заказ закрыт и
+         снят из «Едет», а сколько приехало, остаётся «неизвестно», пока его
+         не записали в «Приёмке»;
+       • «Приёмка» — строки order_receipts по позициям и их история; внутри
+         панели уже различены подтверждённые количества и «допущения»
+         (whole_order из прежних версий).
+     Статические строки: имён и чисел из данных в них нет. */
+  var ORD_HELP_SENT='<div class="ord-help">'+
+    '<div><b>Принят на склад</b> — весь заказ закрыт и снят из «Едет»; сколько приехало, при этом не записывается.</div>'+
+    '<div><b>Приёмка</b> — записать, сколько фактически принято по позициям; там же история приходов.</div></div>';
+  var ORD_HELP_RECEIVED='<div class="ord-help">'+
+    '<div><b>Приёмка</b> — сколько фактически принято по позициям и история приходов. «Неизвестно» — количества ещё не записаны.</div></div>';
+
   function ordStatusText(s){
     /* Статусов ТРИ, а не два. Прежний тернарник называл черновиком всё, что
        не «отправлен», — и принятый заказ, попади он в список, был бы подписан
@@ -980,7 +1008,7 @@
         '<td class="nb" data-label="Шт">'+fmt(o.total_qty)+'</td>'+
         '<td><span class="stbadge g">'+ordStatusText(o.status)+'</span></td>'+
         '<td class="ord-actions"><button class="mvbtn ord-receipts" data-id="'+o.id+'" '+
-            'title="Что фактически принято по заказу">Приёмка</button></td></tr>';
+            'title="Что фактически принято по заказу">Приёмка</button>'+ORD_HELP_RECEIVED+'</td></tr>';
     }).join("");
     bindReceiptButtons();
   }

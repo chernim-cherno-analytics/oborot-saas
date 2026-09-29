@@ -708,6 +708,7 @@ def run() -> int:  # noqa: C901 — сценарный тест: шагов мн
             for width in (1400, MOBILE_WIDTH):
                 _connection_states(browser, base, width, journey_shots)
             _shell_journey(browser, base, c)
+            _actions_clarity(browser, base, c)
         except Exception as exc:  # noqa: BLE001 — падение пути обязано стать
             # отчётом и ненулевым кодом, а не трассировкой без отчёта (D-42).
             check("сквозной путь в браузере дошёл до конца", False,
@@ -1038,6 +1039,179 @@ def _shell_journey(browser, base: str, c) -> None:
     _shell_script_failure(browser, base, cookies)
     _shell_desktop_and_logout(browser, base, cookies)
     _shell_demo_truth(base)
+
+
+# ── PILOT-UX-CLARITY-1-ACTIONS: подписи действий и плашка свежести ──────────
+#
+# Hit-test по ПЯТИ точкам кнопки (центр и четыре угла с отступом 3 px), а не по
+# центру: на /assistant (1440×900) фиксированная плашка свежести закрывала ВЕРХ
+# кнопки «Дальше →» (плашка 847..882, кнопка 867..903), а центр кнопки (885)
+# оставался открытым — проверка по центру была бы зелёной и на дефекте.
+
+HIT5 = """(sel) => [...document.querySelectorAll(sel)].map(b => {
+  const r = b.getBoundingClientRect();
+  if (!r.width || !r.height) return null;
+  const pts = [[r.left + r.width / 2, r.top + r.height / 2], [r.left + 3, r.top + 3],
+               [r.right - 3, r.top + 3], [r.left + 3, r.bottom - 3], [r.right - 3, r.bottom - 3]];
+  const res = pts.map(([x, y]) => {
+    if (y < 0 || y > innerHeight || x < 0 || x > innerWidth) return 'out';
+    const h = document.elementFromPoint(x, y);
+    if (!h) return 'null';
+    if (h === b || b.contains(h)) return 'self';
+    const chip = document.getElementById('fresh-chip');
+    return (chip && (h === chip || chip.contains(h))) ? 'fresh-chip' : (h.id || h.className || h.tagName);
+  });
+  return {text: b.textContent.trim().slice(0, 24), res: res};
+}).filter(Boolean)"""
+
+
+def _chip_state(page) -> dict:
+    return page.evaluate("""() => { const c = document.getElementById('fresh-chip');
+      if (!c) return null; const r = c.getBoundingClientRect();
+      return {pos: getComputedStyle(c).position, shown: c.style.display === 'flex',
+              top: r.top, bottom: r.bottom, vh: innerHeight, cls: c.className,
+              href: c.getAttribute('href'), text: c.textContent}; }""")
+
+
+def _wait_chip(page) -> None:
+    page.wait_for_function("() => { const c = document.getElementById('fresh-chip');"
+                           " return !!c && c.style.display === 'flex'; }", timeout=30000)
+
+
+def _actions_clarity(browser, base: str, c) -> None:
+    import sqlite3
+    print("\n== PILOT-UX-CLARITY-1-ACTIONS: «Заказ позиции», «Едет», плашка свежести ==")
+    cookies = [{"name": k, "value": v, "domain": "127.0.0.1", "path": "/"}
+               for k, v in c.cookies.items()]
+    ctx = browser.new_context(viewport={"width": 1440, "height": 900})
+    ctx.add_cookies(cookies)
+    errors: list[str] = []
+    page = ctx.new_page()
+    page.on("pageerror", lambda e: errors.append(str(e)))
+    try:
+        # 1. «Заказ позиции»: честная подпись, та же ручная отметка, заказа нет.
+        prods = c.get("/api/sizes/products").json()["products"]
+        name = prods[0]["base_name"] if isinstance(prods[0], dict) else prods[0]
+        page.goto(f"{base}/sizes")
+        _close_hint(page)
+        page.fill("#prod-search", name)
+        page.dispatch_event("#prod-search", "input")
+        page.wait_for_timeout(400)
+        page.evaluate("() => { const el=document.querySelector('#dd [data-i]'); if(el)"
+                      " el.dispatchEvent(new MouseEvent('mousedown',{bubbles:true,cancelable:true})); }")
+        btn = page.locator("#send-btn")
+        btn.wait_for(state="visible", timeout=30000)
+        label = (btn.text_content() or "").strip()
+        check("«Заказ позиции»: кнопка называет действие «Добавить в «Заказано»», без «отправлен»",
+              label == "Добавить в «Заказано»" and "отправ" not in label.lower(), label)
+        check("«Заказ позиции»: кнопка нейтральная, а не зелёная «готово»",
+              "neutral" in (btn.get_attribute("class") or ""))
+        with sqlite3.connect(DB_PATH) as con:
+            org = con.execute("SELECT m.org_id FROM memberships m JOIN users u ON u.id=m.user_id"
+                              " WHERE u.email='ui@test.io'").fetchone()[0]
+            row = con.execute("SELECT qty FROM ordered_qty WHERE org_id=? AND base_name=?",
+                              (org, name)).fetchone()
+        before = float(row[0]) if row else 0.0
+        orders_before = len(c.get("/api/orders").json().get("orders", []))
+        held: list = []
+        page.route("**/api/ordered/add", lambda r: held.append(r))
+        asked: list = []
+        page.once("dialog", lambda d: (asked.append(d.message), d.accept()))
+        _click_past_hint(page, btn, "«Добавить в «Заказано»»")
+        try:
+            page.wait_for_function("() => document.getElementById('send-btn').disabled",
+                                   timeout=5000)
+        except Exception:  # noqa: BLE001 — отсутствие состояния ожидания проверяется ниже
+            pass
+        pending = (btn.text_content() or "").strip()
+        check("«Заказ позиции»: пока запрос идёт, кнопка выключена и пишет «Добавляю…»",
+              btn.is_disabled() and pending.startswith("Добавляю"), pending)
+        check("«Заказ позиции»: подтверждение говорит, что заказ на производство не создаётся",
+              bool(asked) and "не создаётся" in asked[0] and "«Заказано»" in asked[0], str(asked)[:200])
+        for _ in range(100):
+            if held:
+                break
+            page.wait_for_timeout(100)
+        sent = held[0].request.post_data_json if held else {}
+        with page.expect_response(lambda r: r.url.endswith("/api/ordered/add")) as resp:
+            held[0].continue_()
+        page.unroute("**/api/ordered/add")
+        try:
+            page.wait_for_function("() => /Добавлено в «Заказано»/.test(document.getElementById("
+                                   "'send-btn').textContent)", timeout=15000)
+        except Exception:  # noqa: BLE001 — подпись успеха проверяется ниже
+            page.wait_for_timeout(500)
+        with sqlite3.connect(DB_PATH) as con:
+            after = float(con.execute("SELECT qty FROM ordered_qty WHERE org_id=? AND base_name=?",
+                                      (org, name)).fetchone()[0])
+        qty = float(sent.get("qty") or 0)
+        check("«Заказ позиции»: та же ручка и то же тело — «Заказано» выросло ровно на сумму",
+              resp.value.status == 200 and sent.get("base_name") == name and qty > 0
+              and abs(after - before - qty) < 1e-9, f"before={before} after={after} qty={qty}")
+        check("«Заказ позиции»: заказ на производство НЕ создан",
+              len(c.get("/api/orders").json().get("orders", [])) == orders_before)
+        check("«Заказ позиции»: успех назван «Добавлено в «Заказано»»",
+              "Добавлено в «Заказано»" in (btn.text_content() or ""), btn.text_content())
+
+        # 2. «Активный сток»: «Едет к нам» не выдаёт ручные отметки за заказы.
+        page.goto(f"{base}/stocks")
+        _close_hint(page)
+        page.wait_for_function("() => [...document.querySelectorAll('.ms-card')]"
+                               ".some(e => /Едет к нам/.test(e.textContent))", timeout=30000)
+        card = page.evaluate("() => [...document.querySelectorAll('.ms-card')]"
+                             ".find(e => /Едет к нам/.test(e.textContent)).innerText")
+        check("«Активный сток»: «Едет к нам» — вся графа «Заказано», не «в заказах на производстве»",
+              "в заказах на производстве" not in card and "«Заказано»" in card
+              and "ручные отметки" in card, card[:200])
+
+        # 3. /assistant 1440×900: плашка в потоке, «Дальше →» открыт целиком, клик доходит.
+        page.goto(f"{base}/assistant")
+        _wait_chip(page)
+        _close_hint(page)
+        page.wait_for_timeout(300)
+        chip = _chip_state(page)
+        check("плашка свежести на месте: видна, ведёт в настройки, текст прежний",
+              chip and chip["shown"] and chip["href"] == "/settings"
+              and chip["text"].startswith("Данные:") and 0 <= chip["top"] < chip["vh"], str(chip)[:200])
+        check("плашка свежести стоит в потоке страницы, а не поверх неё",
+              chip and chip["pos"] != "fixed", str(chip and chip["pos"]))
+        # Кнопку — к НИЖНЕМУ краю окна: именно там лежала фиксированная плашка.
+        # Без прокрутки кнопка может оказаться ниже окна, и все пять точек
+        # дали бы «out» — проверка прошла бы, ничего не проверив.
+        page.evaluate("""() => { const b = [...document.querySelectorAll('#s1 .go-btn')]
+          .find(x => /Дальше/.test(x.textContent));
+          const y = b.getBoundingClientRect().bottom + scrollY - innerHeight + 10;
+          window.scrollTo(0, Math.max(0, y)); }""")
+        page.wait_for_timeout(300)
+        hits = page.evaluate(HIT5, "#s1 .go-btn")
+        covered = [h for h in hits if "fresh-chip" in h["res"]]
+        check("/assistant 1440: кнопки шага 1 у нижнего края окна — ни одна точка не под плашкой",
+              len(hits) == 2 and all("self" in h["res"] for h in hits) and not covered,
+              str(hits)[:300])
+        nxt = page.locator("#s1 .go-btn", has_text="Дальше")
+        page.evaluate("() => { window.__nextClicks = 0; const b = [...document.querySelectorAll("
+                      "'#s1 .go-btn')].find(x => /Дальше/.test(x.textContent));"
+                      " b.addEventListener('click', () => window.__nextClicks++, true); }")
+        box = nxt.bounding_box()
+        page.mouse.click(box["x"] + 12, box["y"] + 4)   # верхний край: там раньше была плашка
+        check("/assistant 1440: обычный клик в верхний край «Дальше →» доходит до кнопки",
+              page.evaluate("() => window.__nextClicks") == 1)
+
+        # 4. Предупреждение плашки сохранилось: отстающие данные — жёлтая, в потоке.
+        page.route("**/api/freshness", lambda r: r.fulfill(
+            status=200, content_type="application/json",
+            body='{"connected": true, "last_sale_date": "2020-01-01", "last_stock_date": '
+                 '"2020-01-01", "sync_state": "done"}'))
+        page.goto(f"{base}/turnover")
+        _wait_chip(page)
+        chip = _chip_state(page)
+        page.unroute("**/api/freshness")
+        check("плашка свежести сохранила предупреждение: отставание — жёлтая, в потоке",
+              chip and "warn" in chip["cls"] and "Данные отстают" in chip["text"]
+              and chip["pos"] != "fixed", str(chip)[:200])
+        check("ошибок в консоли не было", not errors, str(errors[:2])[:200])
+    finally:
+        ctx.close()
 
 
 # ── PILOT-SYNC-TRUTH-1: экран не обещает того, чего не знает ────────────────
