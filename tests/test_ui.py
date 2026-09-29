@@ -711,6 +711,7 @@ def run() -> int:  # noqa: C901 — сценарный тест: шагов мн
             _actions_clarity(browser, base, c)
             _focus_urgent(browser, base)
             _metric_copy(browser, base)
+            _copy_consistency(browser, base)
         except Exception as exc:  # noqa: BLE001 — падение пути обязано стать
             # отчётом и ненулевым кодом, а не трассировкой без отчёта (D-42).
             check("сквозной путь в браузере дошёл до конца", False,
@@ -1542,6 +1543,132 @@ def _metric_copy(browser, base: str) -> None:
         finally:
             ctx.close()
     cl.close()
+
+
+# ── PILOT-UX-CLARITY-4-COPY-CONSISTENCY: подсказка первого визита и «Настройки» ─
+#
+# Те же два вопроса, что в справках PR72 (BUSINESS_LOGIC §11.1). Текст
+# сверяется ЦЕЛИКОМ, а не отсутствием одной фразы; модалка первого визита
+# читается ДО закрытия, затем закрывается и открывается снова через «?».
+
+_HINT_STOCKS_ORDER = (
+    "«Сток на N дней» и «Не хватает до нормы» считаются от темпа продаж и от нормы запаса "
+    "организации (по умолчанию 90 дней, меняется на «Оборачиваемости») и отвечают на вопрос "
+    "«каким должен быть склад сегодня». «Заказать» на странице «Заказ» отвечает на другой "
+    "вопрос — на сколько дней продаж должен хватить заказ до следующего: у него свой горизонт "
+    "покрытия и свой расчёт на дату прихода (окно темпа, товар в пути, продажи за срок "
+    "производства, минимальная партия и кратность). Поэтому эти два числа напрямую не "
+    "сравнивают: любое из них может оказаться больше. Что и сколько заказывать — на странице "
+    "«Заказ».")
+_SETTINGS_TAIL = (
+    "это оценка сегодняшнего склада, а не расчёт заказа. Это ответы на разные вопросы: норма — "
+    "«каким должен быть склад сегодня», «Заказать» — на сколько дней продаж должен хватить заказ "
+    "до следующего. Поэтому эти два числа напрямую не сравнивают: любое из них может оказаться "
+    "больше.")
+_DIRECTIONAL = ("будет больше", "обычно больше", "число больше", "появится в «Заказе» как рекомендация")
+
+
+def _norm_ws(s: str) -> str:
+    return " ".join((s or "").split())
+
+
+_HINT_PARA_JS = """() => {
+  const hs = [...document.querySelectorAll('#hint-body h3')].filter(h => /Связь с заказом/.test(h.textContent));
+  if (!hs.length) return null;
+  let p = hs[0].nextElementSibling;
+  while (p && p.tagName !== 'P') p = p.nextElementSibling;
+  if (!p) return null;
+  const r = p.getBoundingClientRect(), m = document.querySelector('#hint-overlay .hint-modal').getBoundingClientRect();
+  return {text: p.textContent, pLeft: r.left, pRight: r.right, mLeft: m.left, mRight: m.right,
+          mTop: m.top, mBottom: m.bottom, vw: innerWidth, vh: innerHeight};
+}"""
+
+
+def _hint_close_ok(page) -> bool:
+    return page.evaluate("""() => { const b = document.getElementById('hint-close');
+      const r = b.getBoundingClientRect(); if (!r.width) return false;
+      const h = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+      return !!h && (h === b || b.contains(h)) && r.bottom <= innerHeight && r.right <= innerWidth; }""")
+
+
+def _copy_consistency(browser, base: str) -> None:
+    print("\n== PILOT-UX-CLARITY-4-COPY-CONSISTENCY: подсказка «Активного стока» и «Настройки» ==")
+    for tag, vp, touch in (("1440", {"width": 1440, "height": 900}, False),
+                           ("390", {"width": MOBILE_WIDTH, "height": 844}, True)):
+        # Свой пользователь на каждый размер: модалка первого визита — один раз
+        # на пользователя (hints/seen), её и нужно увидеть «впервые».
+        cl = httpx.Client(headers={"X-Oborot-CSRF": "1"}, base_url=base, timeout=120.0)
+        email = f"copy-{tag}@test.io"
+        cl.post("/register", data={"name": "Копия", "email": email,
+                                   "password": "secret123", "org_name": "Бренд-Копия-" + tag})
+        check(f"{tag}: копия: демо-данные загружены", cl.post("/api/connect/demo").status_code == 200)
+        ctx = browser.new_context(viewport=vp, has_touch=touch, is_mobile=touch)
+        ctx.add_cookies([{"name": k, "value": v, "domain": "127.0.0.1", "path": "/"}
+                         for k, v in cl.cookies.items()])
+        errors: list[str] = []
+        page = ctx.new_page()
+        page.on("pageerror", lambda e: errors.append(str(e)))
+        writes: list[tuple] = []
+        page.on("request", lambda r: writes.append((r.method, r.url.split("?")[0], r.post_data or ""))
+                if r.method != "GET" else None)
+        act = (lambda loc: loc.tap()) if touch else (lambda loc: loc.click())
+        try:
+            page.goto(f"{base}/stocks")
+            page.wait_for_function("() => document.querySelectorAll('#tb tr').length > 1", timeout=45000)
+            page.wait_for_selector("#hint-overlay.open", timeout=30000)
+            page.wait_for_timeout(300)
+            first = page.evaluate(_HINT_PARA_JS)
+            check(f"{tag} /stocks: подсказка первого визита открылась сама, абзац «Связь с заказом» найден",
+                  first is not None)
+            got = _norm_ws(first["text"]) if first else ""
+            check(f"{tag} /stocks: абзац «Связь с заказом» ДО закрытия — ровно новый нейтральный текст",
+                  got == _norm_ws(_HINT_STOCKS_ORDER), got[:200])
+            check(f"{tag} /stocks: в нём нет направленного «больше» и обещания рекомендации",
+                  got and not any(d in got for d in _DIRECTIONAL), got[:200])
+            check(f"{tag} /stocks: окно подсказки в пределах экрана, абзац не обрезан по ширине",
+                  first and first["mLeft"] >= -0.5 and first["mRight"] <= first["vw"] + 0.5
+                  and first["pLeft"] >= first["mLeft"] - 0.5 and first["pRight"] <= first["mRight"] + 0.5,
+                  str(first)[:200])
+            check(f"{tag} /stocks: кнопку закрытия видно и её ничто не перекрывает", _hint_close_ok(page))
+            act(page.locator("#hint-close"))
+            page.wait_for_function("() => !document.getElementById('hint-overlay').classList.contains('open')",
+                                   timeout=10000)
+            page.wait_for_timeout(500)
+            # Открыть снова штатно: «?» → «Что означают колонки».
+            act(page.locator("#hint-fab"))
+            page.wait_for_selector("#help-menu.open", timeout=10000)
+            act(page.locator("#hm-cols"))
+            page.wait_for_selector("#hint-overlay.open", timeout=10000)
+            again = page.evaluate(_HINT_PARA_JS)
+            check(f"{tag} /stocks: открыта снова через «?» — тот же текст",
+                  again is not None and _norm_ws(again["text"]) == _norm_ws(_HINT_STOCKS_ORDER))
+            act(page.locator("#hint-close"))
+            page.wait_for_function("() => !document.getElementById('hint-overlay').classList.contains('open')",
+                                   timeout=10000)
+            # «Настройки»: прочитать абзац, ничего не меняя и не сохраняя.
+            page.goto(f"{base}/settings")
+            para = page.locator("p.hint", has_text="«Не хватает до нормы»").first
+            para.wait_for(timeout=30000)
+            if page.locator("#hint-overlay.open").count():
+                act(page.locator("#hint-close"))
+            para.scroll_into_view_if_needed()
+            stext = _norm_ws(para.text_content() or "")
+            check(f"{tag} /settings: абзац виден и заканчивается ровно новым нейтральным текстом",
+                  para.is_visible() and stext.endswith(_norm_ws(_SETTINGS_TAIL)), stext[-220:])
+            check(f"{tag} /settings: в абзаце нет направленного «больше»",
+                  stext and not any(d in stext for d in _DIRECTIONAL), stext[-160:])
+            check(f"{tag} /settings: страница не прокручивается вбок",
+                  page.evaluate("() => document.documentElement.scrollWidth <= innerWidth + 1"),
+                  str(page.evaluate("() => document.documentElement.scrollWidth")))
+            other = [w for w in writes if w[1].split("127.0.0.1")[-1].split("/", 1)[-1] != "api/hints/seen"]
+            seen = [w for w in writes if w[1].endswith("/api/hints/seen")]
+            check(f"{tag}: записи только штатной отметки подсказок, и только по «Активному стоку»",
+                  not other and seen and all('"stocks"' in w[2] or '"settings"' in w[2] for w in seen),
+                  str(writes)[:300])
+            check(f"{tag}: ошибок в консоли не было", not errors, str(errors[:2])[:200])
+        finally:
+            ctx.close()
+            cl.close()
 
 
 # ── PILOT-SYNC-TRUTH-1: экран не обещает того, чего не знает ────────────────
