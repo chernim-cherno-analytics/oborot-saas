@@ -484,8 +484,14 @@
     var d = new Date(String(iso).slice(0,10) + "T00:00:00");
     return isNaN(d) ? String(iso) : d.toLocaleDateString("ru-RU");
   }
+  // Сервер отдаёт момент синхронизации в UTC БЕЗ суффикса (datetime.utcnow()
+  // .isoformat()), а new Date() читает такую строку как МЕСТНОЕ время браузера —
+  // в Париже синхронизация в 23:30 UTC показывалась «29.09, 23:30» вместо
+  // «30.09, 01:30». Строку без Z/смещения считаем UTC (как hhmm в _hints.html);
+  // явные Z и ±чч:мм сохраняют свой смысл, показ — по-прежнему местное время.
   function fmtDateTime(iso){
-    var d = new Date(iso);
+    var s = String(iso);
+    var d = new Date(/(Z|[+-]\d\d:?\d\d)$/i.test(s) ? s : s + "Z");
     return isNaN(d) ? String(iso)
       : d.toLocaleDateString("ru-RU") + ", " +
         d.toLocaleTimeString("ru-RU", {hour: "2-digit", minute: "2-digit"});
