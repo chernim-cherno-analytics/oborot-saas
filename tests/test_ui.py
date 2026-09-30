@@ -58,6 +58,7 @@ macOS: playwright молча искал браузер не там, не нах�
 себя пропущенным. Теперь каталог не навязывается: не задан
 `PLAYWRIGHT_BROWSERS_PATH` — работает штатный кэш playwright.
 """
+import json
 import os
 import shutil
 import sys
@@ -713,6 +714,7 @@ def run() -> int:  # noqa: C901 — сценарный тест: шагов мн
             _metric_copy(browser, base)
             _copy_consistency(browser, base)
             _loss_width(browser, base)
+            _assistant_sync_time(browser, base)
         except Exception as exc:  # noqa: BLE001 — падение пути обязано стать
             # отчётом и ненулевым кодом, а не трассировкой без отчёта (D-42).
             check("сквозной путь в браузере дошёл до конца", False,
@@ -1775,6 +1777,87 @@ def _loss_width(browser, base: str) -> None:
         finally:
             ctx.close()
             cl.close()
+
+
+# ── PILOT-UX-ASSISTANT-SYNC-TIME-1: время синхронизации в мастере заказа ─────
+
+# Сервер отдаёт last_sync_at в UTC без суффикса (ms_sync: datetime.utcnow()).
+# В ответе /api/order-plan/options подменяются ТОЛЬКО last_sync_at, sync_state и
+# coverage_start; страница — настоящая, пояс браузера задаётся контекстом.
+_SYNC_COV = "2026-03-01"          # календарная дата: одинакова в любом поясе
+_SYNC_CASES = (
+    # (метка, пояс, last_sync_at, что обязана показать строка «Данные из МойСклада на …»)
+    ("Париж, лето, UTC без суффикса", "Europe/Paris", "2026-09-29T23:30:00", "30.09.2026, 01:30"),
+    ("Париж, лето, то же с Z", "Europe/Paris", "2026-09-29T23:30:00Z", "30.09.2026, 01:30"),
+    ("Париж, лето, то же со смещением", "Europe/Paris", "2026-09-30T01:30:00+02:00", "30.09.2026, 01:30"),
+    ("Париж, лето, с микросекундами", "Europe/Paris", "2026-09-29T23:30:00.123456", "30.09.2026, 01:30"),
+    ("Париж, зима, переход через сутки", "Europe/Paris", "2026-01-15T23:30:00", "16.01.2026, 00:30"),
+    ("Париж, зима, то же с Z", "Europe/Paris", "2026-01-15T23:30:00Z", "16.01.2026, 00:30"),
+    ("UTC, без суффикса", "UTC", "2026-09-29T23:30:00", "29.09.2026, 23:30"),
+    ("UTC, со смещением", "UTC", "2026-09-30T01:30:00+02:00", "29.09.2026, 23:30"),
+    ("не дата — показывается как есть", "Europe/Paris", "не-дата", "не-дата"),
+    ("синхронизации не было", "Europe/Paris", None, None),
+)
+
+
+def _assistant_sync_time(browser, base: str) -> None:
+    print("\n== PILOT-UX-ASSISTANT-SYNC-TIME-1: момент синхронизации в мастере заказа ==")
+    cl = httpx.Client(headers={"X-Oborot-CSRF": "1"}, base_url=base, timeout=120.0)
+    cl.post("/register", data={"name": "Время", "email": "synctime@test.io",
+                               "password": "secret123", "org_name": "Бренд-Время"})
+    check("время: демо-данные загружены", cl.post("/api/connect/demo").status_code == 200)
+    # Подсказка первого визита — не предмет проверки; отмечена до браузера.
+    cl.post("/api/hints/seen", json={"page": "assistant"})
+    cookies = [{"name": k, "value": v, "domain": "127.0.0.1", "path": "/"} for k, v in cl.cookies.items()]
+    try:
+        for label, tz, raw, want in _SYNC_CASES:
+            ctx = browser.new_context(viewport={"width": 1440, "height": 900}, timezone_id=tz, locale="ru-RU")
+            ctx.add_cookies(cookies)
+            page = ctx.new_page()
+            errors: list[str] = []
+            page.on("pageerror", lambda e: errors.append(str(e)))
+            writes: list[str] = []
+            page.on("request", lambda r: writes.append(r.method + " " + r.url.split("?")[0])
+                    if r.method != "GET" else None)
+
+            # Playwright вызывает обработчик как (route, request): значения случая —
+            # только именованными аргументами, иначе на их место придёт Request.
+            def _stub(route, request=None, *, raw=raw):
+                resp = route.fetch()
+                data = resp.json()
+                dq = data.get("data_quality") or {}
+                dq["last_sync_at"] = raw
+                dq["sync_state"] = "done"
+                dq["coverage_start"] = _SYNC_COV
+                data["data_quality"] = dq
+                route.fulfill(status=200, content_type="application/json", body=json.dumps(data))
+
+            try:
+                page.route("**/api/order-plan/options", _stub)
+                page.goto(f"{base}/assistant")
+                page.wait_for_function(
+                    "() => { const b = document.getElementById('dataFacts');"
+                    " return b && b.style.display !== 'none' && b.querySelectorAll('li').length > 0; }",
+                    timeout=45000)
+                items = page.evaluate(
+                    "() => [...document.querySelectorAll('#dataFacts li')].map(li => li.textContent)")
+                resolved = page.evaluate("() => Intl.DateTimeFormat().resolvedOptions().timeZone")
+                line = next((t for t in items if "Данные из МойСклада на" in t), "")
+                cov = next((t for t in items if "История продаж" in t), "")
+                if want is None:
+                    check(f"время [{label}]: честно «ещё не завершалась»",
+                          not line and any("ещё не завершалась" in t for t in items), str(items)[:200])
+                else:
+                    got = line.split("Данные из МойСклада на ", 1)[-1].strip()
+                    check(f"время [{label}] ({resolved}): показано «{want}»", got == want, got)
+                check(f"время [{label}]: календарная дата истории прежняя «(с 01.03.2026)»",
+                      "(с 01.03.2026)" in cov, cov[:120])
+                check(f"время [{label}]: браузер ничего не записал, ошибок нет",
+                      not writes and not errors, (str(writes) + str(errors))[:200])
+            finally:
+                ctx.close()
+    finally:
+        cl.close()
 
 
 # ── PILOT-SYNC-TRUTH-1: экран не обещает того, чего не знает ────────────────
