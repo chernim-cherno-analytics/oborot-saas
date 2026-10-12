@@ -328,6 +328,7 @@ def run() -> int:  # noqa: C901 — сценарный тест: шагов мн
         # проверяем ровно то, что видит пользователь.
         page.goto(f"{base}/assistant")
         page.wait_for_timeout(1800)
+        _wizard_all_categories(page)
         page.fill("#budget", "300 000")
         # Экраны анкеты переключаются функцией go(n), кнопок с одинаковым
         # текстом на странице несколько — зовём напрямую то же, что и кнопка.
@@ -518,6 +519,7 @@ def run() -> int:  # noqa: C901 — сценарный тест: шагов мн
         c.post(f"/api/productions/{only_prod}/setup", json={"preset": "fabric_sewing"})
         page.goto(f"{base}/assistant")
         page.locator(f"#prodTiles .tile[data-id='{only_prod}']").click()
+        _wizard_all_categories(page)
         page.evaluate("() => window.addNew('Только новинки UI', 2, 1000)")
         with page.expect_response(lambda r: r.url == f"{base}/api/order-plan/preview") as only_preview:
             page.get_by_text("Сразу показать план", exact=True).click()
@@ -533,6 +535,8 @@ def run() -> int:  # noqa: C901 — сценарный тест: шагов мн
         print("\n== «Что заказать»: позиции без себестоимости не бесплатны ==")
         page.goto(f"{base}/replenish")
         page.wait_for_timeout(3500)
+        _replenish_all_categories(page)   # сумма всего отмеченного — как и прежде, но явным выбором
+        page.wait_for_timeout(300)
         sub = page.text_content("#s-cost-sub") or ""
         check("подпись суммы заказа отрисована", bool(sub.strip()), sub[:60])
         # Сколько позиций без себестоимости на самом деле — спрашиваем сервер,
@@ -550,6 +554,7 @@ def run() -> int:  # noqa: C901 — сценарный тест: шагов мн
         if page.locator("#hint-overlay").is_visible():
             page.locator("#hint-overlay .hm-close").click()
         selected_production = int(page.locator(".bigtab.active").get_attribute("data-id"))
+        _replenish_all_categories(page)
         page.locator("#btn-create-order").click()
         page.locator("#order-name").fill("A05 browser metadata")
         with page.expect_response(lambda r: r.url == f"{base}/api/orders"
@@ -716,6 +721,7 @@ def run() -> int:  # noqa: C901 — сценарный тест: шагов мн
             _loss_width(browser, base)
             _assistant_sync_time(browser, base)
             _connection_state_clarity(browser, base)
+            _order_category_scope(browser, base)
         except Exception as exc:  # noqa: BLE001 — падение пути обязано стать
             # отчётом и ненулевым кодом, а не трассировкой без отчёта (D-42).
             check("сквозной путь в браузере дошёл до конца", False,
@@ -1364,7 +1370,11 @@ def _focus_urgent(browser, base: str) -> None:
             # 2) Клавиатура: Tab до кнопки, затем Enter (1440) / пробел (390).
             page.evaluate("() => window.scrollTo(0, 0)")
             page.locator("#k-risk-sub").click() if not touch else None
-            for _ in range(40):
+            # Предел нажатий — запас, а не требование: Tab идёт от «Все» в полосе
+            # статусов вперёд и по кругу. PILOT-ORDER-CATEGORY-SCOPE-1 добавил на
+            # этом пути кнопки «Категории в заказе», и прежних 40 не хватало;
+            # от начала страницы порядок прежний (7 шагов до кнопки).
+            for _ in range(80):
                 if page.evaluate("() => document.activeElement && document.activeElement.id") == "risk-go":
                     break
                 page.keyboard.press("Tab")
@@ -2075,6 +2085,415 @@ def _connection_state_clarity(browser, base: str) -> None:
         ctx.close()
 
 
+# ── PILOT-ORDER-CATEGORY-SCOPE-1: заказ по выбранным категориям ──────────────
+
+# Прежние проверки заказа и мастера шли по пути, где «все категории» были
+# выбраны молча. Теперь этот выбор явный; хелперы делают ровно его — смысл
+# прежних проверок (числа, роли, формулы) не меняется.
+# Нет элемента (код до этого пакета) — путь прежний, с неявным «всё»; на
+# новом коде без выбора «Оформить»/план недоступны, так что пропажа элемента
+# не спрячется — прежние проверки сами упадут.
+def _replenish_all_categories(page) -> None:
+    btn = page.locator('#scope-btns .scope-btn[data-scope="*"]')
+    try:
+        btn.wait_for(state="visible", timeout=8000)
+    except Exception:  # noqa: BLE001
+        return
+    if btn.get_attribute("aria-pressed") != "true":
+        _close_hint(page)
+        btn.click()
+
+
+def _wizard_all_categories(page) -> None:
+    chip = page.locator('#catChips .chip[data-all="1"]')
+    try:
+        chip.wait_for(state="visible", timeout=8000)
+    except Exception:  # noqa: BLE001
+        return
+    if chip.get_attribute("aria-pressed") != "true":
+        _close_hint(page)
+        chip.click()
+
+
+def _cat_user(base: str, key: str):
+    cl = httpx.Client(headers={"X-Oborot-CSRF": "1"}, base_url=base, timeout=120.0)
+    cl.post("/register", data={"name": "Категории", "email": f"catscope-{key}@test.io",
+                               "password": "secret123", "org_name": "Бренд-Категории-" + key})
+    check(f"категории [{key}]: демо-данные загружены", cl.post("/api/connect/demo").status_code == 200)
+    for page_name in ("replenish", "assistant"):
+        cl.post("/api/hints/seen", json={"page": page_name})
+    cookies = [{"name": k, "value": v, "domain": "127.0.0.1", "path": "/"} for k, v in cl.cookies.items()]
+    return cl, cookies
+
+
+def _cat_page(browser, cookies, width=1440, init_script=None):
+    mobile = width < 760
+    ctx = browser.new_context(viewport={"width": width, "height": 844 if mobile else 900},
+                              has_touch=mobile, is_mobile=mobile, locale="ru-RU")
+    ctx.add_cookies(cookies)
+    if init_script:
+        ctx.add_init_script(init_script)
+    page = ctx.new_page()
+    log = {"posts": [], "errors": [], "outside": [], "dialogs": [], "plans": []}
+    page.on("pageerror", lambda e: log["errors"].append(str(e)))
+
+    def _req(r):
+        if "127.0.0.1" not in r.url:
+            log["outside"].append(r.url)
+        if r.method == "POST":
+            try:
+                body = json.loads(r.post_data or "{}")
+            except ValueError:
+                body = None
+            log["posts"].append((r.url.split("127.0.0.1")[-1].split(":", 1)[-1].split("/", 1)[-1], body))
+    page.on("request", _req)
+
+    def _resp(r):
+        if r.url.endswith("/api/order-plan/preview") and r.status == 200:
+            try:
+                log["plans"].append(r.json())
+            except Exception:  # noqa: BLE001
+                pass
+    page.on("response", _resp)
+
+    def _dialog(d):
+        log["dialogs"].append(d.message)
+        d.accept()
+    page.on("dialog", _dialog)
+    return ctx, page, log
+
+
+def _posts(log, path):
+    return [b for p, b in log["posts"] if p == path]
+
+
+def _order_category_scope(browser, base: str) -> None:
+    print("\n== PILOT-ORDER-CATEGORY-SCOPE-1: заказ по выбранным категориям ==")
+    # ── «Заказ» (/replenish) ──
+    cl, cookies = _cat_user(base, "replenish")
+    rep = cl.get("/api/replenish").json()
+    cat_of = {it["base_name"]: (it.get("category") or "Без категории") for it in rep.get("items", [])}
+    need_by_cat: dict = {}
+    for it in rep.get("items", []):
+        if (it.get("need") or 0) > 0:
+            need_by_cat.setdefault(cat_of[it["base_name"]], []).append(it["base_name"])
+    ranked = sorted(need_by_cat, key=lambda c: -len(need_by_cat[c]))
+    check("категории: в синтетике есть минимум три категории с потребностью", len(ranked) >= 3, str(ranked))
+    A, C, B = ranked[0], ranked[1], ranked[2]
+    # Ручная ростовка позиции из A (существующая правка черновика) и второе
+    # производство с одной позицией A — до открытия страницы.
+    a_item = need_by_cat[A][0]
+    a_sizes = next((it.get("sizes") or {}) for it in rep["items"] if it["base_name"] == a_item)
+    a_size = sorted(a_sizes)[0] if a_sizes else None
+    if a_size:
+        cl.post("/api/replenish-draft", json={"base_name": a_item, "sizes": {a_size: 7}})
+    p2_item = need_by_cat[A][-1]
+    p2 = cl.post("/api/productions", json={"name": "Второй цех"}).json()
+    p2_id = p2.get("id") or (p2.get("production") or {}).get("id")
+    cl.post("/api/productions/assign", json={"base_name": p2_item, "production_id": p2_id})
+
+    def cats_of(names):
+        return sorted({cat_of.get(n, "?") for n in names})
+
+    ctx, page, log = _cat_page(browser, cookies)
+    try:
+        page.goto(f"{base}/replenish")
+        page.wait_for_function("() => document.querySelectorAll('#tbody .row-check').length > 3", timeout=45000)
+        page.wait_for_timeout(600)
+        bar = page.locator("#scope-bar")
+        has_bar = bar.count() == 1 and bar.is_visible()
+        page.locator("#btn-export-xlsx").click()
+        page.wait_for_timeout(500)
+        check("заказ: при открытии категории в заказе НЕ выбраны — есть блок выбора, «Оформить» недоступно, "
+              "Excel без выбора не уходит",
+              has_bar and page.locator("#btn-create-order").is_disabled()
+              and not _posts(log, "api/export/replenish.xlsx")
+              and any("выберите категории" in d for d in log["dialogs"]),
+              f"bar={has_bar} dialogs={log['dialogs'][:1]} exports={len(_posts(log, 'api/export/replenish.xlsx'))}")
+        btn_a = page.locator(f'#scope-btns .scope-btn[data-scope="{A}"]')
+        if btn_a.count():
+            btn_a.click()
+        # Видимость — отдельно: фильтр таблицы по другой категории и поиск.
+        page.locator(f'#cat-bar .cat-btn[data-cat="{B}"]').click()
+        page.wait_for_timeout(300)
+        out_rows = page.evaluate("() => document.querySelectorAll('#tbody tr.out-scope').length")
+        check(f"заказ: таблица показывает «{B}», но эти строки помечены как не входящие в заказ",
+              out_rows > 0, str(out_rows))
+        page.locator("#btn-create-order").click()
+        page.wait_for_timeout(400)
+        summary = page.locator("#order-modal-summary").text_content() or ""
+        check(f"заказ: окно оформления называет категории состава — только «{A}»",
+              f"Категории в заказе: {A}" in summary and B not in summary, summary[:200])
+        # Двойное нажатие — один заказ.
+        page.locator("#btn-order-submit").dblclick()
+        page.wait_for_timeout(2500)
+        orders = _posts(log, "api/orders")
+        payload = orders[0] if orders else {}
+        names = [i["base_name"] for i in payload.get("items", [])]
+        expect = sorted(n for n in need_by_cat[A] if n != p2_item)
+        check(f"заказ: в теле заказа только «{A}» — ровно её отмеченные позиции этого производства, "
+              "фильтр таблицы ничего не добавил",
+              cats_of(names) == [A] and sorted(names) == expect, f"{cats_of(names)} {len(names)}/{len(expect)}")
+        check("заказ: двойное нажатие «Создать» отправило один заказ", len(orders) == 1, str(len(orders)))
+        sizes = next((i.get("sizes") for i in payload.get("items", []) if i["base_name"] == a_item), None)
+        check("заказ: ручная ростовка позиции сохранилась в заказе (выбор категорий её не тронул)",
+              a_size is not None and sizes is not None and sizes.get(a_size) == 7, str(sizes))
+        saved = (cl.get("/api/orders").json().get("orders") or [])
+        latest = max(saved, key=lambda o: o.get("id") or 0) if saved else {}
+        saved_names = [i.get("base_name") for i in (latest.get("items") or [])]
+        check(f"заказ: сохранённый заказ состоит только из «{A}»",
+              saved_names and cats_of(saved_names) == [A], str(cats_of(saved_names)))
+        # Снять и вернуть выбор, добавить вторую категорию; Excel — тот же состав.
+        page.wait_for_function("() => !document.getElementById('order-modal').classList.contains('open')",
+                               timeout=15000)
+        btn_a = page.locator(f'#scope-btns .scope-btn[data-scope="{A}"]')
+        if btn_a.count():
+            btn_a.click()
+        check("заказ: снятый выбор снова делает «Оформить» недоступным",
+              page.locator("#btn-create-order").is_disabled())
+        for cat in (A, C):
+            b2 = page.locator(f'#scope-btns .scope-btn[data-scope="{cat}"]')
+            if b2.count():
+                b2.click()
+        page.locator("#btn-export-xlsx").click()
+        page.wait_for_timeout(1500)
+        exports = _posts(log, "api/export/replenish.xlsx")
+        ex = exports[-1] if exports else None
+        check(f"заказ: Excel по выбору «{A}» + «{C}» — только эти категории",
+              isinstance(ex, dict) and ex.get("base_names") and cats_of(ex["base_names"]) == sorted([A, C]),
+              str(ex)[:160])
+        allb = page.locator('#scope-btns .scope-btn[data-scope="*"]')
+        if allb.count():
+            allb.click()
+        page.locator("#btn-export-xlsx").click()
+        page.wait_for_timeout(1500)
+        exports = _posts(log, "api/export/replenish.xlsx")
+        ex = exports[-1] if exports else None
+        check("заказ: явное «Все категории» — Excel по всем отмеченным (прежний короткий запрос {})",
+              len(exports) >= 2 and ex == {}, str(ex)[:120])
+        # Смена производства: выбор категорий сохраняется, заказ — с этой вкладки.
+        if btn_a.count():
+            page.locator(f'#scope-btns .scope-btn[data-scope="{A}"]').click()
+        page.locator(f'#bigtabs .bigtab[data-id="{p2_id}"]').click()
+        page.wait_for_timeout(500)
+        page.locator("#btn-create-order").click()
+        page.wait_for_timeout(400)
+        page.locator("#btn-order-submit").click()
+        page.wait_for_timeout(2500)
+        orders = _posts(log, "api/orders")
+        last = orders[-1] if len(orders) >= 2 else {}
+        check("заказ: другое производство — тот же выбор категорий, в заказе только его позиция",
+              last.get("production_id") == p2_id and [i["base_name"] for i in last.get("items", [])] == [p2_item],
+              str(last)[:160])
+        check("заказ: ни одного запроса наружу и ошибок страницы", not log["outside"] and not log["errors"],
+              str(log["outside"] + log["errors"])[:200])
+    except Exception as exc:  # noqa: BLE001 — сценарий не должен обрывать весь проход
+        check("заказ: сценарий выполнился без исключений", False, f"{type(exc).__name__}: {exc}"[:200])
+    finally:
+        ctx.close()
+    # 390: блок выбора виден, выбирается касанием, страница не шире окна.
+    ctx, page, log = _cat_page(browser, cookies, width=MOBILE_WIDTH)
+    try:
+        page.goto(f"{base}/replenish")
+        page.wait_for_function("() => document.querySelectorAll('#tbody .row-check').length > 3", timeout=45000)
+        page.wait_for_timeout(600)
+        b390 = page.locator(f'#scope-btns .scope-btn[data-scope="{A}"]')
+        ok = b390.count() == 1
+        if ok:
+            b390.scroll_into_view_if_needed()
+            b390.tap()
+            page.wait_for_timeout(300)
+        note = page.locator("#scope-note").text_content() if page.locator("#scope-note").count() else ""
+        check(f"заказ [390]: выбор «{A}» касанием, подпись состава, кнопка оформления доступна, ширина в окне",
+              ok and A in (note or "") and not page.locator("#btn-create-order").is_disabled()
+              and page.evaluate("() => document.documentElement.scrollWidth") <= MOBILE_WIDTH + 1, str(note)[:160])
+    except Exception as exc:  # noqa: BLE001
+        check("заказ [390]: сценарий выполнился без исключений", False, f"{type(exc).__name__}: {exc}"[:200])
+    finally:
+        ctx.close()
+    cl.close()
+
+    # ── «Мастер заказа» (/assistant) ──
+    cl, cookies = _cat_user(base, "assistant")
+    pid = cl.get("/api/productions").json()["productions"][0]["id"]
+    all_cats = cl.get("/api/order-plan/options").json().get("categories") or []
+    full = cl.post("/api/order-plan/preview", json={"production_id": pid, "budget": 50_000_000,
+                                                    "budget_scope": "now", "cadence_days": 30}).json()
+    plan_by_cat: dict = {}
+    for i in full.get("items") or []:
+        plan_by_cat.setdefault(i["category"], []).append(i["base_name"])
+    pr = sorted(plan_by_cat, key=lambda c: -len(plan_by_cat[c]))
+    check("мастер: в плане минимум три категории", len(pr) >= 3, str(pr))
+    WA, WC, WB = pr[0], pr[1], pr[2]
+    x_item = plan_by_cat[WB][0]
+
+    def excl(chosen):
+        return sorted(c for c in all_cats if c not in chosen)
+
+    def wait_plan(page):
+        page.wait_for_function("() => document.getElementById('s3').style.display !== 'none' && "
+                               "!document.getElementById('planBox').textContent.includes('Считаю план')",
+                               timeout=45000)
+        page.wait_for_timeout(400)
+
+    def open_wizard(ctx_page):
+        ctx_page.goto(f"{base}/assistant")
+        ctx_page.wait_for_function("() => !document.getElementById('prodTiles').textContent.includes('загрузка')",
+                                   timeout=45000)
+        ctx_page.wait_for_timeout(800)
+
+    def chip(page, name):
+        el = page.locator(f'#catChips .chip[data-c="{name}"]')
+        if el.count():
+            el.click()
+            return True
+        return False
+
+    shortcut = lambda page: page.get_by_role("button", name="Сразу показать план").click()  # noqa: E731
+    ctx, page, log = _cat_page(browser, cookies)
+    try:
+        open_wizard(page)
+        shortcut(page)
+        page.wait_for_timeout(1500)
+        note = page.locator("#catNote").text_content() if page.locator("#catNote").count() else ""
+        check("мастер: первый визит — «Сразу показать план» без выбора категорий план НЕ считает и просит выбрать",
+              not _posts(log, "api/order-plan/preview") and "не выбраны" in (note or "")
+              and page.locator("#s1").is_visible(), f"previews={len(_posts(log, 'api/order-plan/preview'))} {note}")
+        chip(page, WA)
+        shortcut(page)
+        wait_plan(page)
+        pv = _posts(log, "api/order-plan/preview")
+        body = pv[-1] if pv else {}
+        plan = log["plans"][-1] if log["plans"] else {}
+        check(f"мастер: выбрана одна категория «{WA}» — бриф исключает остальные, план только из неё",
+              sorted(body.get("exclude_categories") or []) == excl([WA])
+              and {i["category"] for i in plan.get("items") or []} == {WA},
+              f"{body.get('exclude_categories')} {sorted({i['category'] for i in plan.get('items') or []})}")
+        check(f"мастер: строка плана называет состав «{WA}»",
+              WA in (page.locator("#planScope").text_content() or "") if page.locator("#planScope").count() else False)
+        page.evaluate("go(1)")
+        chip(page, WC)
+        shortcut(page)
+        wait_plan(page)
+        body = _posts(log, "api/order-plan/preview")[-1]
+        check(f"мастер: несколько категорий «{WA}» + «{WC}»", sorted(body.get("exclude_categories") or []) == excl([WA, WC]),
+              str(body.get("exclude_categories")))
+        page.evaluate("go(1)")
+        allc = page.locator('#catChips .chip[data-all="1"]')
+        if allc.count():
+            allc.click()
+        shortcut(page)
+        wait_plan(page)
+        body = _posts(log, "api/order-plan/preview")[-1]
+        check("мастер: явное «Все категории» — бриф без исключений", body.get("exclude_categories") == [],
+              str(body.get("exclude_categories")))
+        # Сохранить план одной категории (черновик заказа) и открыть мастер заново.
+        page.evaluate("go(1)")
+        if allc.count():
+            allc.click()        # снять «все»
+        chip(page, WA)
+        shortcut(page)
+        wait_plan(page)
+        page.locator("#mkOrder").click()
+        page.wait_for_function("() => !document.getElementById('mkOrder') || "
+                               "document.getElementById('mkHint').textContent === ''", timeout=45000)
+        page.wait_for_timeout(1500)
+        last = (cl.get("/api/order-plan/last").json() or {}).get("brief") or {}
+        check(f"мастер: сохранённая анкета хранит выбор «{WA}» в существующем exclude_categories",
+              sorted(last.get("exclude_categories") or []) == excl([WA]), str(last.get("exclude_categories")))
+        check("мастер: ни одного запроса наружу и ошибок страницы", not log["outside"] and not log["errors"],
+              str(log["outside"] + log["errors"])[:200])
+    except Exception as exc:  # noqa: BLE001
+        check("мастер: сценарий выполнился без исключений", False, f"{type(exc).__name__}: {exc}"[:200])
+    finally:
+        ctx.close()
+    # Повторное открытие: прошлая анкета показана честно и не выбирает состав сама.
+    ctx, page, log = _cat_page(browser, cookies)
+    try:
+        open_wizard(page)
+        prev = page.locator("#catPrev")
+        prev_txt = prev.text_content() if prev.count() and prev.is_visible() else ""
+        shortcut(page)
+        page.wait_for_timeout(1200)
+        check(f"мастер: прошлый состав показан («только {WA}»), но не применён молча — план не считается",
+              f"только {WA}" in (prev_txt or "") and not _posts(log, "api/order-plan/preview"), str(prev_txt)[:160])
+        reuse = page.locator("#catReuse")
+        if reuse.count():
+            reuse.click()
+        shortcut(page)
+        wait_plan(page)
+        pv = _posts(log, "api/order-plan/preview")
+        check("мастер: «Как в прошлый раз» — тот же состав, что в сохранённой анкете",
+              pv and sorted(pv[-1].get("exclude_categories") or []) == excl([WA]), str(pv[-1:] and pv[-1].get("exclude_categories")))
+    except Exception as exc:  # noqa: BLE001
+        check("мастер [повторное открытие]: сценарий выполнился без исключений", False, f"{type(exc).__name__}: {exc}"[:200])
+    finally:
+        ctx.close()
+    # Восстановленный черновик с «Взять» из другой категории не обходит новый выбор.
+    draft = json.dumps({"pid": pid, "edits": {}, "must": [x_item], "ts": 0})
+    init = ("(() => { const d = %s; d.ts = Date.now(); "
+            "localStorage.setItem('oborot.assistant.draft', JSON.stringify(d)); })();" % draft)
+    ctx, page, log = _cat_page(browser, cookies, init_script=init)
+    try:
+        open_wizard(page)
+        chip(page, WA)
+        shortcut(page)
+        wait_plan(page)
+        pv = _posts(log, "api/order-plan/preview")
+        plan = log["plans"][-1] if log["plans"] else {}
+        names = [i["base_name"] for i in plan.get("items") or []]
+        dropped = page.locator("#planMustDropped").text_content() if page.locator("#planMustDropped").count() else ""
+        check(f"мастер: «Взять» из черновика («{WB}») не обошёл выбор «{WA}» — снято и названо, план только из «{WA}»",
+              x_item not in names and {i["category"] for i in plan.get("items") or []} == {WA}
+              and x_item in (dropped or "") and pv and x_item not in (pv[-1].get("must_have") or []),
+              f"in_plan={x_item in names} dropped={dropped[:80]}")
+    except Exception as exc:  # noqa: BLE001
+        check("мастер [черновик]: сценарий выполнился без исключений", False, f"{type(exc).__name__}: {exc}"[:200])
+    finally:
+        ctx.close()
+    # «Повторить» прежней анкеты с явным исключением и must_have — прежний смысл.
+    legacy = cl.post("/api/order-plan", json={"production_id": pid, "budget": 50_000_000, "budget_scope": "now",
+                                              "cadence_days": 30, "exclude_categories": [WB],
+                                              "must_have": [x_item]}).json()
+    ctx, page, log = _cat_page(browser, cookies)
+    try:
+        open_wizard(page)
+        rep_btn = page.locator(f'#histBox .repeat[data-id="{legacy.get("id")}"]')
+        if rep_btn.count():
+            rep_btn.click()
+            wait_plan(page)
+        pv = _posts(log, "api/order-plan/preview")
+        plan = log["plans"][-1] if log["plans"] else {}
+        names = [i["base_name"] for i in plan.get("items") or []]
+        check("мастер: «Повторить» прежней анкеты — тот же exclude_categories и must_have, "
+              "явное исключение-«Взять» сохранено",
+              pv and pv[-1].get("exclude_categories") == [WB] and pv[-1].get("must_have") == [x_item]
+              and x_item in names, f"{pv[-1:] and (pv[-1].get('exclude_categories'), pv[-1].get('must_have'))} in_plan={x_item in names}")
+    except Exception as exc:  # noqa: BLE001
+        check("мастер [повтор]: сценарий выполнился без исключений", False, f"{type(exc).__name__}: {exc}"[:200])
+    finally:
+        ctx.close()
+    # 390: выбор на первом шаге касанием.
+    ctx, page, log = _cat_page(browser, cookies, width=MOBILE_WIDTH)
+    try:
+        open_wizard(page)
+        el = page.locator(f'#catChips .chip[data-c="{WA}"]')
+        ok = el.count() == 1
+        if ok:
+            el.scroll_into_view_if_needed()
+            el.tap()
+            page.wait_for_timeout(300)
+        note = page.locator("#catNote").text_content() if page.locator("#catNote").count() else ""
+        check(f"мастер [390]: категория выбирается касанием на первом шаге, ширина в окне",
+              ok and WA in (note or "") and page.evaluate("() => document.documentElement.scrollWidth") <= MOBILE_WIDTH + 1,
+              str(note)[:160])
+    except Exception as exc:  # noqa: BLE001
+        check("мастер [390]: сценарий выполнился без исключений", False, f"{type(exc).__name__}: {exc}"[:200])
+    finally:
+        ctx.close()
+    cl.close()
+
+
 # ── PILOT-SYNC-TRUTH-1: экран не обещает того, чего не знает ────────────────
 
 
@@ -2678,6 +3097,7 @@ def _browser_journey(browser, base: str, shots: list) -> None:  # noqa: C901
     page2.close()
 
     print("\n== Путь в браузере: выгрузка кнопкой и разбор книги ==")
+    _replenish_all_categories(page)
     with page.expect_download(timeout=60000) as dl:
         _click_through_hint(page, "#btn-export-xlsx")
     download = dl.value

@@ -1328,6 +1328,13 @@ def _pick_one_row(page) -> int:
 
 def _create_order(page, name: str, tap: bool) -> tuple:
     act = (lambda loc: loc.tap()) if tap else (lambda loc: loc.click())
+    # PILOT-ORDER-CATEGORY-SCOPE-1: состав по категориям теперь выбирается явно
+    # (при открытии не выбрано ничего). Прежний путь заказывал отмеченное во
+    # всех категориях — ровно это и выбираем, смысл проверки не меняется.
+    all_btn = page.locator('#scope-btns .scope-btn[data-scope="*"]')
+    if all_btn.count() and all_btn.get_attribute("aria-pressed") != "true":
+        all_btn.scroll_into_view_if_needed()
+        act(all_btn)
     act(page.locator("#btn-create-order"))
     page.locator("#order-modal.open").wait_for(timeout=10000)
     summary = page.locator("#order-modal-summary").text_content() or ""
