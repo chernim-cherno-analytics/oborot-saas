@@ -725,6 +725,7 @@ def run() -> int:  # noqa: C901 — сценарный тест: шагов мн
             _order_category_p1(browser, base)
             _order_category_star(browser, base)
             _order_category_stale_empty(browser, base)
+            _order_category_stale_sel(browser, base)
         except Exception as exc:  # noqa: BLE001 — падение пути обязано стать
             # отчётом и ненулевым кодом, а не трассировкой без отчёта (D-42).
             check("сквозной путь в браузере дошёл до конца", False,
@@ -2852,7 +2853,7 @@ def _order_category_stale_empty(browser, base: str) -> None:
         page.wait_for_timeout(2500)
         pv = _posts(log, "api/order-plan/preview")
         check("пополнение до расчёта: план НЕ считается, мастер просит выбрать категории, они показаны",
-              not pv and "появились позиции" in note(page) and chips(page) > 0 and page.locator("#s1").is_visible(),
+              not pv and "каталог изменился" in note(page) and chips(page) > 0 and page.locator("#s1").is_visible(),
               f"previews={len(pv)} chips={chips(page)} note={note(page)[:90]}")
         cats = cl.get("/api/order-plan/options").json().get("categories") or []
         one = cats[0] if cats and isinstance(cats[0], str) else (cats[0].get("name") if cats else "")
@@ -2892,7 +2893,7 @@ def _order_category_stale_empty(browser, base: str) -> None:
               f"plan={ok_plan} orders={len(orders)} saves={len(_posts(log, 'api/order-plan'))} applies={len(applies(log))} "
               f"items={[len(o.get('items') or []) for o in orders]}")
         check("пополнение между расчётом и сохранением: мастер вернулся к выбору категорий",
-              page.locator("#s1").is_visible() and "появились позиции" in note(page) and chips(page) > 0,
+              page.locator("#s1").is_visible() and "каталог изменился" in note(page) and chips(page) > 0,
               note(page)[:100])
     except Exception as exc:  # noqa: BLE001
         check("пополнение между расчётом и сохранением: сценарий выполнился без исключений", False,
@@ -2968,6 +2969,255 @@ def _order_category_stale_empty(browser, base: str) -> None:
     finally:
         ctx.close()
         cl.close()
+
+
+# Корректив ревью PR #77 (раунд 4): выбор категорий хранится позитивно и
+# переводится в exclude_categories по свежему каталогу перед расчётом и
+# сохранением; явное «Все категории» ≠ «отмечены все известные имена».
+def _order_category_stale_sel(browser, base: str) -> None:
+    print("\n== PILOT-ORDER-CATEGORY-SCOPE-1: выбор категорий переживает изменение каталога ==")
+
+    def setup(key):
+        cl, cookies = _cat_user(base, "sel-" + key)
+        pid = cl.get("/api/productions").json()["productions"][0]["id"]
+        full = cl.post("/api/order-plan/preview", json={"production_id": pid, "budget": 50_000_000,
+                                                        "budget_scope": "now", "cadence_days": 30}).json()
+        by: dict = {}
+        for i in full.get("items") or []:
+            by.setdefault(i["category"], []).append(i["base_name"])
+        ranked = sorted(by, key=lambda c: -len(by[c]))
+        opts = cl.get("/api/order-plan/options").json().get("categories") or []
+        return cl, cookies, by, ranked, opts
+
+    def open_wizard(page):
+        page.goto(f"{base}/assistant")
+        page.wait_for_function("() => !document.getElementById('prodTiles').textContent.includes('загрузка')",
+                               timeout=45000)
+        page.wait_for_timeout(800)
+
+    def wait_plan(page):
+        page.wait_for_function("() => document.getElementById('s3').style.display !== 'none' && "
+                               "!document.getElementById('planBox').textContent.includes('Считаю план')",
+                               timeout=45000)
+        page.wait_for_timeout(400)
+
+    def note(page):
+        return (page.locator("#catNote").text_content() or "") if page.locator("#catNote").count() else ""
+
+    def chip(page, name):
+        page.locator(f'#catChips .chip[data-c="{name}"]').click()
+
+    def applies(log):
+        return [p for p, _ in log["posts"] if p.startswith("api/order-plan/") and p.endswith("/apply")]
+
+    def create(page):
+        if page.locator("#mkOrder").count():
+            page.locator("#mkOrder").click()
+            page.wait_for_function("() => !document.getElementById('mkOrder') || "
+                                   "document.getElementById('mkHint').textContent !== 'сохраняю…'", timeout=45000)
+        page.wait_for_timeout(3000)
+
+    def order_names(cl):
+        orders = cl.get("/api/orders").json().get("orders") or []
+        return orders, [i.get("base_name") for o in orders for i in (o.get("items") or [])]
+
+    def plan_cats(log):
+        plan = log["plans"][-1] if log["plans"] else {}
+        return {i["category"] for i in plan.get("items") or []}
+
+    def stub_options(page, cats):
+        page.route("**/api/order-plan/options",
+                   lambda route: route.fulfill(status=200, content_type="application/json",
+                                               body=json.dumps({"categories": cats})))
+
+    shortcut = lambda page: page.get_by_role("button", name="Сразу показать план").click()  # noqa: E731
+
+    def scenario(title, fn):
+        try:
+            fn()
+        except Exception as exc:  # noqa: BLE001
+            check(f"{title}: сценарий выполнился без исключений", False, f"{type(exc).__name__}: {exc}"[:200])
+
+    # F: невыбранная категория переименована ДО расчёта.
+    def f():
+        cl, cookies, by, ranked, _ = setup("before")
+        A, B = ranked[0], ranked[1]
+        ctx, page, log = _cat_page(browser, cookies)
+        try:
+            open_wizard(page)
+            chip(page, A)
+            cl.post("/api/categories/merge", json={"from_category": B, "to_category": "Новая-F"})
+            shortcut(page)
+            wait_plan(page)
+            pv = _posts(log, "api/order-plan/preview")
+            excl = (pv[-1].get("exclude_categories") or []) if pv else []
+            check(f"переименование до расчёта: «Новая-F» (бывшая «{B}») исключена, план только из «{A}»",
+                  "Новая-F" in excl and A not in excl and plan_cats(log) == {A},
+                  f"excl_has_new={'Новая-F' in excl} plan={sorted(plan_cats(log))}")
+            create(page)
+            orders, names = order_names(cl)
+            saves = _posts(log, "api/order-plan")
+            check(f"переименование до расчёта: сохранённый заказ — только «{A}»",
+                  len(orders) == 1 and names and set(names) <= set(by[A])
+                  and saves and "Новая-F" in (saves[-1].get("exclude_categories") or []),
+                  f"orders={len(orders)} names={len(names)} outside={len(set(names) - set(by[A]))}")
+            check("переименование до расчёта: ни одного запроса наружу и ошибок страницы",
+                  not log["outside"] and not log["errors"], str(log["outside"] + log["errors"])[:200])
+        finally:
+            ctx.close()
+            cl.close()
+
+    # G: переименование МЕЖДУ расчётом и сохранением.
+    def g():
+        cl, cookies, by, ranked, _ = setup("between")
+        A, B = ranked[0], ranked[1]
+        ctx, page, log = _cat_page(browser, cookies)
+        try:
+            open_wizard(page)
+            chip(page, A)
+            shortcut(page)
+            wait_plan(page)
+            cl.post("/api/categories/merge", json={"from_category": B, "to_category": "Новая-G"})
+            create(page)
+            orders, names = order_names(cl)
+            saves = _posts(log, "api/order-plan")
+            check(f"переименование между расчётом и сохранением: бриф исключает «Новая-G», заказ — только «{A}»",
+                  saves and "Новая-G" in (saves[-1].get("exclude_categories") or [])
+                  and len(orders) == 1 and names and set(names) <= set(by[A]),
+                  f"orders={len(orders)} names={len(names)} outside={len(set(names) - set(by[A]))}")
+        finally:
+            ctx.close()
+            cl.close()
+
+    # H: проверка «опоздала» (ответ о категориях устарел) — ответ предпросмотра
+    # со строками невыбранной категории не показывается.
+    def h():
+        cl, cookies, by, ranked, opts = setup("race-preview")
+        A, B = ranked[0], ranked[1]
+        ctx, page, log = _cat_page(browser, cookies)
+        try:
+            stub_options(page, opts)
+            open_wizard(page)
+            chip(page, A)
+            cl.post("/api/categories/merge", json={"from_category": B, "to_category": "Новая-H"})
+            shortcut(page)
+            page.wait_for_timeout(3500)
+            leaked = "Новая-H" in {i["category"] for p in log["plans"] for i in (p.get("items") or [])}
+            check("устаревшая проверка перед расчётом: ответ со строками «Новая-H» не показан, выбор заново",
+                  leaked and page.locator("#s1").is_visible() and not page.locator("#s3").is_visible()
+                  and "каталог изменился" in note(page),
+                  f"leaked_in_response={leaked} s1={page.locator('#s1').is_visible()} note={note(page)[:80]}")
+        finally:
+            ctx.close()
+            cl.close()
+
+    # H2: та же «опоздавшая» проверка перед сохранением — сохранённый план
+    # со строками невыбранной категории не применяется.
+    def h2():
+        cl, cookies, by, ranked, opts = setup("race-save")
+        A, B = ranked[0], ranked[1]
+        ctx, page, log = _cat_page(browser, cookies)
+        try:
+            stub_options(page, opts)
+            open_wizard(page)
+            chip(page, A)
+            shortcut(page)
+            wait_plan(page)
+            cl.post("/api/categories/merge", json={"from_category": B, "to_category": "Новая-H2"})
+            create(page)
+            orders, _ = order_names(cl)
+            check("устаревшая проверка перед сохранением: план со строками «Новая-H2» сохранён, но НЕ применён",
+                  len(_posts(log, "api/order-plan")) == 1 and not applies(log) and not orders
+                  and page.locator("#s1").is_visible(),
+                  f"saves={len(_posts(log, 'api/order-plan'))} applies={len(applies(log))} orders={len(orders)}")
+        finally:
+            ctx.close()
+            cl.close()
+
+    # I: выбранная категория исчезла (переименована) — выбор заново, без догадок.
+    def i_():
+        cl, cookies, by, ranked, _ = setup("gone")
+        A = ranked[0]
+        ctx, page, log = _cat_page(browser, cookies)
+        try:
+            open_wizard(page)
+            chip(page, A)
+            cl.post("/api/categories/merge", json={"from_category": A, "to_category": "Переим-I"})
+            shortcut(page)
+            page.wait_for_timeout(2500)
+            check(f"выбранная «{A}» переименована: план не считается, мастер называет пропавшую и просит выбрать заново",
+                  not _posts(log, "api/order-plan/preview") and "больше нет" in note(page) and A in note(page)
+                  and page.locator('#catChips .chip[data-c="Переим-I"]').count() == 1
+                  and page.locator('#catChips .chip[data-c="Переим-I"]').get_attribute("aria-pressed") != "true",
+                  f"previews={len(_posts(log, 'api/order-plan/preview'))} note={note(page)[:100]}")
+        finally:
+            ctx.close()
+            cl.close()
+
+    # J: сбой проверки — блок.
+    def j():
+        cl, cookies, by, ranked, _ = setup("fail")
+        A = ranked[0]
+        ctx, page, log = _cat_page(browser, cookies)
+        try:
+            open_wizard(page)
+            chip(page, A)
+            page.route("**/api/order-plan/options", lambda route: route.fulfill(status=500, body="{}"))
+            shortcut(page)
+            page.wait_for_timeout(2500)
+            check("сбой проверки выбора: план не считается, мастер просит обновить страницу",
+                  not _posts(log, "api/order-plan/preview") and "Не удалось загрузить категории" in note(page),
+                  f"previews={len(_posts(log, 'api/order-plan/preview'))} note={note(page)[:90]}")
+        finally:
+            ctx.close()
+            cl.close()
+
+    # K/L: явное «Все» включает и новую категорию; «отмечены все известные имена»
+    # новую категорию не включает.
+    def kl():
+        cl, cookies, by, ranked, opts = setup("all")
+        B = ranked[1]
+        moved = by[B][0]
+        ctx, page, log = _cat_page(browser, cookies)
+        try:
+            open_wizard(page)
+            page.locator('#catChips .chip[data-all="1"]').click()
+            r = cl.post("/api/categories/override", json={"base_name": moved, "category": "Новая-K"})
+            shortcut(page)
+            wait_plan(page)
+            pv = _posts(log, "api/order-plan/preview")
+            check("явное «Все категории» + новая категория: бриф без исключений (новая входит)",
+                  r.status_code == 200 and pv and pv[-1].get("exclude_categories") == [],
+                  f"override={r.status_code} excl={pv and pv[-1].get('exclude_categories')}")
+            page.evaluate("go(1)")
+            page.locator('#catChips .chip[data-all="1"]').click()      # снять «Все»
+            names_now = [n for n in page.evaluate(
+                "() => Array.from(document.querySelectorAll('#catChips .chip[data-c]')).map(e => e.dataset.c)")]
+            for n in names_now:
+                chip(page, n)
+            all_pressed = page.locator('#catChips .chip[data-all="1"]').get_attribute("aria-pressed") == "true"
+            r2 = cl.post("/api/categories/override", json={"base_name": by[B][1] if len(by[B]) > 1 else by[ranked[2]][0],
+                                                            "category": "Новая-L"})
+            fresh = cl.get("/api/order-plan/options").json().get("categories") or []
+            expect = sorted(set(fresh) - set(names_now))
+            shortcut(page)
+            wait_plan(page)
+            pv = _posts(log, "api/order-plan/preview")
+            check("отмечены все известные имена по одной + новая категория: «Все» не нажата, новая исключена",
+                  r2.status_code == 200 and not all_pressed and pv and "Новая-L" in expect
+                  and sorted(pv[-1].get("exclude_categories") or []) == expect and "Новая-L" not in plan_cats(log),
+                  f"all_pressed={all_pressed} excl={pv and pv[-1].get('exclude_categories')}")
+            check("«Все»/«все имена»: ни одного запроса наружу и ошибок страницы",
+                  not log["outside"] and not log["errors"], str(log["outside"] + log["errors"])[:200])
+        finally:
+            ctx.close()
+            cl.close()
+
+    for title, fn in (("переименование до расчёта", f), ("переименование между расчётом и сохранением", g),
+                      ("устаревшая проверка перед расчётом", h), ("устаревшая проверка перед сохранением", h2),
+                      ("выбранная категория исчезла", i_), ("сбой проверки выбора", j),
+                      ("«Все» и «все имена»", kl)):
+        scenario(title, fn)
 
 
 
