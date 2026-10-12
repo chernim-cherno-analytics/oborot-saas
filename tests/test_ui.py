@@ -726,6 +726,7 @@ def run() -> int:  # noqa: C901 — сценарный тест: шагов мн
             _order_category_star(browser, base)
             _order_category_stale_empty(browser, base)
             _order_category_stale_sel(browser, base)
+            _order_category_round5(browser, base)
         except Exception as exc:  # noqa: BLE001 — падение пути обязано стать
             # отчётом и ненулевым кодом, а не трассировкой без отчёта (D-42).
             check("сквозной путь в браузере дошёл до конца", False,
@@ -3218,6 +3219,147 @@ def _order_category_stale_sel(browser, base: str) -> None:
                       ("выбранная категория исчезла", i_), ("сбой проверки выбора", j),
                       ("«Все» и «все имена»", kl)):
         scenario(title, fn)
+
+
+# Корректив ревью PR #77 (раунд 5): (1) ответ на прежний состав, пришедший
+# позже ответа на новый, не подменяет план на экране и не уходит в заказ;
+# (2) Excel по выбору имён категорий — списком позиций, даже если выбраны все
+# загруженные имена; короткий {} — только при явном «Все категории».
+def _order_category_round5(browser, base: str) -> None:
+    print("\n== PILOT-ORDER-CATEGORY-SCOPE-1: устаревший расчёт и Excel по именам ==")
+
+    def open_wizard(page):
+        page.goto(f"{base}/assistant")
+        page.wait_for_function("() => !document.getElementById('prodTiles').textContent.includes('загрузка')",
+                               timeout=45000)
+        page.wait_for_timeout(800)
+
+    def wait_plan(page):
+        page.wait_for_function("() => document.getElementById('s3').style.display !== 'none' && "
+                               "!document.getElementById('planBox').textContent.includes('Считаю план')",
+                               timeout=45000)
+        page.wait_for_timeout(400)
+
+    def chip(page, name):
+        page.locator(f'#catChips .chip[data-c="{name}"]').click()
+
+    shortcut = lambda page: page.get_by_role("button", name="Сразу показать план").click()  # noqa: E731
+
+    def plan_scope(page):
+        return (page.locator("#planScope").text_content() or "") if page.locator("#planScope").count() else ""
+
+    def run(key, reorder):
+        cl, cookies = _cat_user(base, "r5-" + key)
+        pid = cl.get("/api/productions").json()["productions"][0]["id"]
+        full = cl.post("/api/order-plan/preview", json={"production_id": pid, "budget": 50_000_000,
+                                                        "budget_scope": "now", "cadence_days": 30}).json()
+        by: dict = {}
+        for i in full.get("items") or []:
+            by.setdefault(i["category"], []).append(i["base_name"])
+        ranked = sorted(by, key=lambda c: -len(by[c]))
+        A, B = ranked[0], ranked[1]
+        ctx, page, log = _cat_page(browser, cookies)
+        held = []
+        try:
+            if reorder:
+                def hold_first(route, request=None):
+                    if not held:
+                        held.append((route, route.fetch()))   # настоящий ответ, отдаётся позже
+                    else:
+                        route.continue_()
+                page.route("**/api/order-plan/preview", hold_first)
+            open_wizard(page)
+            chip(page, A)
+            shortcut(page)
+            if reorder:
+                page.wait_for_timeout(1500)
+            else:
+                wait_plan(page)
+            page.evaluate("go(1)")
+            chip(page, B)
+            shortcut(page)
+            wait_plan(page)
+            if reorder and held:
+                route, resp = held[0]
+                route.fulfill(response=resp)              # прежний ответ «только A» — позже нового
+                page.wait_for_timeout(2000)
+            shown = plan_scope(page)
+            latest = log["plans"][-1] if log["plans"] else {}
+            ab = [p for p in log["plans"] if {i["category"] for i in p.get("items") or []} >= {A, B}]
+            plan_ab = ab[-1] if ab else {}
+            expect = sorted(i["base_name"] for i in plan_ab.get("items") or [] if (i.get("qty") or 0) > 0)
+            tag = "устаревший ответ пришёл позже" if reorder else "контроль, без перестановки"
+            check(f"расчёт «{A}» → «{A} + {B}» ({tag}): на экране план с «{B}»",
+                  f"{B} — " in shown and f"{A} — " in shown,
+                  f"held={len(held)} last_resp_cats={sorted({i['category'] for i in latest.get('items') or []})} "
+                  f"shown={shown[:160]}")
+            if page.locator("#mkOrder").count():
+                page.locator("#mkOrder").click()
+                page.wait_for_function("() => !document.getElementById('mkOrder') || "
+                                       "document.getElementById('mkHint').textContent !== 'сохраняю…'", timeout=45000)
+            page.wait_for_timeout(3000)
+            orders = cl.get("/api/orders").json().get("orders") or []
+            names = sorted(i.get("base_name") for o in orders for i in (o.get("items") or []))
+            # Что было на экране: «в плане: кат — n, …» в строке состава.
+            shown_counts = {}
+            for part in (shown.split("в плане: ", 1)[1] if "в плане: " in shown else "").split(", "):
+                if " — " in part:
+                    c, n = part.rsplit(" — ", 1)
+                    shown_counts[c.strip()] = int("".join(ch for ch in n if ch.isdigit()) or 0)
+            cat_of = {n: c for c, ns in by.items() for n in ns}
+            saved_counts = {}
+            for n in names:
+                saved_counts[cat_of.get(n, "?")] = saved_counts.get(cat_of.get(n, "?"), 0) + 1
+            check(f"расчёт «{A}» → «{A} + {B}» ({tag}): сохранённый заказ — ровно показанный план",
+                  len(orders) == 1 and expect and names == expect and saved_counts == shown_counts,
+                  f"orders={len(orders)} saved={saved_counts} shown={shown_counts}")
+            check(f"расчёт ({tag}): ни одного запроса наружу и ошибок страницы",
+                  not log["outside"] and not log["errors"], str(log["outside"] + log["errors"])[:200])
+        except Exception as exc:  # noqa: BLE001
+            check(f"расчёт ({key}): сценарий выполнился без исключений", False, f"{type(exc).__name__}: {exc}"[:200])
+        finally:
+            ctx.close()
+            cl.close()
+
+    run("reorder", True)
+    run("control", False)
+
+    # Excel: все имена категорий по одной — не «Все категории».
+    cl, cookies = _cat_user(base, "r5-excel")
+    rep = cl.get("/api/replenish").json()
+    need_names = sorted(it["base_name"] for it in rep.get("items", []) if (it.get("need") or 0) > 0)
+    ctx, page, log = _cat_page(browser, cookies)
+    try:
+        page.goto(f"{base}/replenish")
+        page.wait_for_function("() => document.querySelectorAll('#tbody .row-check').length > 3", timeout=45000)
+        page.wait_for_timeout(600)
+        names = page.evaluate("() => Array.from(document.querySelectorAll('#scope-btns .scope-btn[data-scope]'))"
+                              ".map(b => b.getAttribute('data-scope'))")
+        for n in names:
+            page.locator(f'#scope-btns .scope-btn[data-scope="{n}"]').click()
+        all_btn = page.locator('#scope-btns .scope-btn[data-scope-action="all"]')
+        all_pressed = all_btn.get_attribute("aria-pressed") == "true"
+        page.locator("#btn-export-xlsx").click()
+        page.wait_for_timeout(1500)
+        ex = (_posts(log, "api/export/replenish.xlsx") or [None])[-1]
+        check("Excel: выбраны все имена категорий по одной — «Все» не нажата, в запросе список позиций, не {}",
+              len(names) >= 3 and not all_pressed and isinstance(ex, dict)
+              and sorted(ex.get("base_names") or []) == need_names,
+              f"names={len(names)} all_pressed={all_pressed} body={'{}' if ex == {} else len((ex or {}).get('base_names') or [])}"
+              f"/{len(need_names)}")
+        all_btn.click()
+        page.wait_for_timeout(300)
+        page.locator("#btn-export-xlsx").click()
+        page.wait_for_timeout(1500)
+        ex = (_posts(log, "api/export/replenish.xlsx") or [None])[-1]
+        check("Excel [контроль]: явное «Все категории» — прежний короткий запрос {}", ex == {}, str(ex)[:80])
+        check("Excel: ни одного запроса наружу и ошибок страницы", not log["outside"] and not log["errors"],
+              str(log["outside"] + log["errors"])[:200])
+    except Exception as exc:  # noqa: BLE001
+        check("Excel по именам: сценарий выполнился без исключений", False, f"{type(exc).__name__}: {exc}"[:200])
+    finally:
+        ctx.close()
+        cl.close()
 
 
 

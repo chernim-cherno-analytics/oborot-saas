@@ -310,6 +310,10 @@
                 // "repeat" — «Повторить» из истории), прошлый состав для
                 // подсказки и позиции «Взять», снятые из-за выбора категорий.
                 scopeChosen: false, scopeOrigin: null, allCats: [], lastScope: null, userSel: null,
+                // Номер последнего расчёта плана: ответ (и проверка каталога) от
+                // более раннего расчёта — устаревший и состояние не трогает;
+                // planSeq — номер расчёта, чей план сейчас на экране.
+                previewSeq: 0, planSeq: -1,
                 mustDropped: [], dropRetry: false };
 
   // Правки количеств переживают не только возврат к анкете, но и обновление
@@ -721,10 +725,11 @@
   function partialSel(){
     return STATE.scopeOrigin === "user" && STATE.userSel && !STATE.userSel.all;
   }
-  function revalidateScope(){
+  function revalidateScope(seq){
     var empty = STATE.scopeOrigin === "empty";
     if(!empty && !partialSel()) return Promise.resolve(true);
     return api("/api/order-plan/options").then(function(opt){
+      if(seq !== STATE.previewSeq) return false;      // устарело: состояние не трогаем
       var cats = catNames(opt && opt.categories);
       if(empty){
         if(!cats.length) return true;
@@ -739,6 +744,7 @@
       renderCats();
       return true;
     }, function(){
+      if(seq !== STATE.previewSeq) return false;
       endScope(null, true);
       return false;
     });
@@ -754,11 +760,11 @@
     var sel = STATE.userSel.cats;
     return rows.filter(function(i){ return sel.indexOf(i.category || "Без категории") < 0; }).length;
   }
-  function rejectRaced(){
+  function rejectRaced(seq){
     STATE.dropRetry = false;
     api("/api/order-plan/options").then(function(opt){
-      endScope(catNames(opt && opt.categories), false);
-    }, function(){ endScope(null, true); });
+      if(seq === STATE.previewSeq) endScope(catNames(opt && opt.categories), false);
+    }, function(){ if(seq === STATE.previewSeq) endScope(null, true); });
     backToCats();
   }
   function backToCats(){
@@ -786,6 +792,7 @@
       : '<span class="muted" style="font-size:12px">категории не найдены</span>';
     Array.prototype.forEach.call(box.querySelectorAll(".chip"), function(el){
       el.addEventListener("click", function(){
+        STATE.previewSeq++;          // смена состава: идущий расчёт устарел
         STATE.catsChanged = false;
         STATE.catsGone = [];
         if(el.dataset.all){
@@ -834,6 +841,7 @@
         (STATE.must.length ? (" · отмечено «Взять» вручную: " + STATE.must.length) : "") +
         '<button type="button" class="chip-btn" id="catReuse">Как в прошлый раз</button>';
       document.getElementById("catReuse").addEventListener("click", function(){
+        STATE.previewSeq++;
         STATE.offcats = STATE.lastScope.exclude.slice();
         STATE.scopeChosen = true;
         STATE.scopeOrigin = "last";
@@ -844,6 +852,11 @@
   }
 
   window.preview = function(step, keepEdits){
+    // Каждый расчёт получает номер; принимается только ответ последнего.
+    // Иначе ответ на прежний состав (например, «только A»), пришедший позже
+    // ответа на новый («A + B»), подменял бы план на экране, а создание заказа
+    // брало бы уже новый состав — в заказ ушло бы то, чего на экране не было.
+    var my = ++STATE.previewSeq;
     // Без явного выбора категорий план не считается — иначе первый же клик
     // «Сразу показать план» молча означал бы «все категории».
     if(!STATE.scopeChosen){
@@ -854,7 +867,8 @@
       return;
     }
     if((STATE.scopeOrigin === "empty" || partialSel()) && !STATE.scopeRechecked){
-      revalidateScope().then(function(ok){
+      revalidateScope(my).then(function(ok){
+        if(my !== STATE.previewSeq) return;
         if(!ok){ backToCats(); return; }
         STATE.scopeRechecked = true;
         try { window.preview(step, keepEdits); } finally { STATE.scopeRechecked = false; }
@@ -875,8 +889,11 @@
     // шагу «3», F5) молча терял добавленную позицию — а потом она так же
     // молча возвращалась при следующей правке из savedEdits. Из двух зол
     // «то пропадает, то воскресает» хуже всего.
-    var pendingEdits = Object.assign({}, STATE.savedEdits || {}, STATE.edits);
+    var savedBefore = STATE.savedEdits || {};
+    var pendingEdits = Object.assign({}, savedBefore, STATE.edits);
     STATE.edits = {};
+    // Правки не теряются, если этот расчёт перебьёт следующий.
+    STATE.savedEdits = pendingEdits;
     document.getElementById("planBox").innerHTML = '<div class="loading">Считаю план…</div>';
     STATE.createdOrder = null;
     var previewBody = brief();
@@ -885,6 +902,7 @@
       api("/api/order-plan/preview", previewBody),
       loadSideData()
     ]).then(function(rr){
+      if(my !== STATE.previewSeq) return;            // ответ устарел
       var p = rr[0];
       // Планировщик ставит must_have ВЫШЕ исключения категории (решение
       // человека сильнее). Но «Взять», восстановленное из черновика или прошлой
@@ -914,13 +932,14 @@
       // после проверки: план не показываем, выбор заново.
       if(unexpectedRows(p, false)){
         STATE.edits = pendingEdits;
-        rejectRaced();
+        rejectRaced(my);
         return;
       }
       STATE.dropRetry = false;
       STATE.plan = p;
+      STATE.planSeq = my;
       // Возвращаем сохранённые правки тем строкам, которые остались в плане.
-      var saved = STATE.savedEdits || {};
+      var saved = savedBefore;
       var alive = {};
       (p.items||[]).forEach(function(i){
         if(saved[i.base_name] !== undefined){
@@ -937,6 +956,7 @@
       STATE.savedEdits = alive;
       renderPlan();
     }).catch(function(e){
+      if(my !== STATE.previewSeq) return;
       STATE.dropRetry = false;
       document.getElementById("planBox").innerHTML =
         '<div class="err">Не удалось посчитать план: '+esc(e.message)+'</div>';
@@ -1520,8 +1540,18 @@
     btn.disabled = true; hint.textContent = "сохраняю…";
     var flags = {force:false, confirm_partial:false};
     var stale = new Error("Пока страница была открыта, каталог изменился — заказ не создан. Выберите категории на шаге 1.");
+    // Заказ — только из плана последнего расчёта: после смены состава или
+    // нового расчёта план на экране уже не тот, что будет сохранён.
+    var mySeq = STATE.previewSeq;
+    var outdated = new Error("План устарел: состав или расчёт изменились — нажмите «Пересчитать».");
+    if(STATE.planSeq !== mySeq){
+      hint.innerHTML = '<span style="color:#8a0003">'+esc(outdated.message)+'</span>';
+      btn.disabled = false;
+      return;
+    }
     // Бриф собирается ПОСЛЕ проверки: exclude_categories — по свежему каталогу.
-    revalidateScope().then(function(ok){
+    revalidateScope(mySeq).then(function(ok){
+      if(mySeq !== STATE.previewSeq) throw outdated;
       if(!ok){ backToCats(); throw stale; }
       var b = brief(); b.overrides = STATE.edits;
       return api("/api/order-plan", b);
@@ -1530,7 +1560,7 @@
       // нём быть не должно, иначе снимок изменился между проверкой и
       // сохранением — применять такой план нельзя.
       if(unexpectedRows(res.plan, true)){
-        rejectRaced();
+        rejectRaced(mySeq);
         throw stale;
       }
       hint.textContent = "создаю черновик…";

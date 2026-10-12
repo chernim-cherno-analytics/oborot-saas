@@ -2063,7 +2063,11 @@
     // истёкшей сессии человека уносило со страницы на голый JSON
     // {"detail":"Не авторизован"}, вместе со всей несохранённой работой.
     // Один путь на оба случая: качаем blob'ом и остаёмся на странице.
-    var allChecked = !items.length || checked.length===items.length;
+    // Короткий {} — это «все отмеченные по живому каталогу на сервере»; так
+    // можно только при явном «Все категории». Выбор по именам категорий — даже
+    // если отмечены все загруженные строки — уходит списком позиций: иначе в
+    // файл попали бы позиции, которых на экране не было.
+    var allChecked = !!(SCOPE&&SCOPE.all) && (!items.length || checked.length===items.length);
     btn.disabled=true;
     fetch("/api/export/replenish.xlsx",{method:"POST",
       headers:{"Content-Type":"application/json","X-Oborot-CSRF":"1"},
