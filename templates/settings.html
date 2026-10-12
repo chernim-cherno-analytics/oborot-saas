@@ -312,7 +312,16 @@ document.addEventListener("DOMContentLoaded", function () {
     document.getElementById("lead-time").value = settings.lead_time_days != null ? settings.lead_time_days : 45;
     document.getElementById("overhead").value = settings.overhead_pct != null ? settings.overhead_pct : 0;
     renderWarehouses(settings.warehouses || []);
-    renderConnection(settings.connection || null, settings.role === "owner");
+    // Ответ без поля connection или с подключением неожиданной формы — статус
+    // НЕИЗВЕСТЕН, а не «не подключён»: иначе сбой выглядел бы потерей подключения.
+    var connField = settings.connection;
+    if (!("connection" in settings) ||
+        (connField !== null && (typeof connField !== "object" || typeof connField.kind !== "string"))) {
+      document.getElementById("conn-box").innerHTML =
+        '<p class="muted" style="margin:0;">Статус подключения сейчас неизвестен — обновите страницу позже.</p>';
+    } else {
+      renderConnection(connField, settings.role === "owner");
+    }
     renderTeam(settings.members || []);
     renderPriceTypes(settings);
     loadChannels(settings.role === "owner");
@@ -892,12 +901,23 @@ document.addEventListener("DOMContentLoaded", function () {
     } else {
       html += '<p style="margin:0 0 14px; font-size:12px; color:var(--text-soft);">Источник данных не подключён.</p>';
     }
+    // Сохранённое подключение МойСклада — НЕ приглашение вводить токен заново:
+    // токен хранится на сервере, поле ниже нужно только для замены. Подпись
+    // говорит о сохранённой записи, а не о том, что токен сейчас действителен
+    // или что синхронизация прошла: про это — строка статуса синхронизации.
+    var saved = !!(conn && conn.kind === "moysklad");
+    if (saved) {
+      html += '<p style="margin:0 0 14px; font-size:12px; color:var(--text-soft);">Подключение к МойСкладу сохранено, токен хранится в зашифрованном виде. ' +
+        "Вводить его при каждом входе не нужно — поле ниже только для замены токена.</p>";
+    }
     html += '<div class="form-row" style="align-items:flex-end; max-width:520px;">' +
       '<div class="field" style="flex:1; margin-bottom:0;">' +
-      '<label for="ms-token">API-токен МойСклад</label>' +
-      '<input class="input" type="password" id="ms-token" placeholder="Вставьте токен доступа" autocomplete="off">' +
+      '<label for="ms-token">' + (saved ? "Заменить API-токен МойСклад (необязательно)" : "API-токен МойСклад") + "</label>" +
+      '<input class="input" type="password" id="ms-token" placeholder="' +
+      (saved ? "Новый токен — только для замены" : "Вставьте токен доступа") + '" autocomplete="off">' +
       "</div>" +
-      '<button class="btn" type="button" id="btn-connect-ms" style="margin-bottom:1px;">Подключить</button></div>' +
+      '<button class="btn" type="button" id="btn-connect-ms" style="margin-bottom:1px;">' +
+      (saved ? "Заменить токен" : (conn && conn.kind === "demo" ? "Подключить МойСклад" : "Подключить")) + "</button></div>" +
       '<div class="hint" style="margin-top:6px;">Токен хранится в зашифрованном виде. МойСклад → Настройки → Обмен данными → Токены API.</div>';
     if (conn && conn.kind === "moysklad" && isOwner) {
       // Инцидент 21.08: после смены токена пользователю негде было запустить
