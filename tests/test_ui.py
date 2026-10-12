@@ -723,6 +723,7 @@ def run() -> int:  # noqa: C901 — сценарный тест: шагов мн
             _connection_state_clarity(browser, base)
             _order_category_scope(browser, base)
             _order_category_p1(browser, base)
+            _order_category_star(browser, base)
         except Exception as exc:  # noqa: BLE001 — падение пути обязано стать
             # отчётом и ненулевым кодом, а не трассировкой без отчёта (D-42).
             check("сквозной путь в браузере дошёл до конца", False,
@@ -2095,7 +2096,7 @@ def _connection_state_clarity(browser, base: str) -> None:
 # новом коде без выбора «Оформить»/план недоступны, так что пропажа элемента
 # не спрячется — прежние проверки сами упадут.
 def _replenish_all_categories(page) -> None:
-    btn = page.locator('#scope-btns .scope-btn[data-scope="*"]')
+    btn = page.locator('#scope-btns .scope-btn[data-scope-action="all"]')
     try:
         btn.wait_for(state="visible", timeout=8000)
     except Exception:  # noqa: BLE001
@@ -2263,7 +2264,7 @@ def _order_category_scope(browser, base: str) -> None:
         check(f"заказ: Excel по выбору «{A}» + «{C}» — только эти категории",
               isinstance(ex, dict) and ex.get("base_names") and cats_of(ex["base_names"]) == sorted([A, C]),
               str(ex)[:160])
-        allb = page.locator('#scope-btns .scope-btn[data-scope="*"]')
+        allb = page.locator('#scope-btns .scope-btn[data-scope-action="all"]')
         if allb.count():
             allb.click()
         page.locator("#btn-export-xlsx").click()
@@ -2686,6 +2687,116 @@ def _order_category_p1(browser, base: str) -> None:
               str(log["outside"] + log["errors"])[:200])
     except Exception as exc:  # noqa: BLE001
         check("имена-ключи: сценарий выполнился без исключений", False, f"{type(exc).__name__}: {exc}"[:200])
+    finally:
+        ctx.close()
+    cl.close()
+
+
+# Корректив ревью PR #77 (раунд 2): категория с именем «*» — это данные, а не
+# кнопка «Все категории». Действия различаются отдельным атрибутом.
+def _order_category_star(browser, base: str) -> None:
+    print("\n== PILOT-ORDER-CATEGORY-SCOPE-1: категория «*» ≠ «Все категории» ==")
+    cl, cookies = _cat_user(base, "star")
+    rep = cl.get("/api/replenish").json()
+    need_cats = sorted({(it.get("category") or "Без категории") for it in rep.get("items", [])
+                        if (it.get("need") or 0) > 0} - {"Без категории"})
+    merged = cl.post("/api/categories/merge", json={"from_category": need_cats[0], "to_category": "*"}).status_code
+    rep = cl.get("/api/replenish").json()
+    cat_of = {it["base_name"]: (it.get("category") or "Без категории") for it in rep.get("items", [])}
+    need_by_cat: dict = {}
+    for it in rep.get("items", []):
+        if (it.get("need") or 0) > 0:
+            need_by_cat.setdefault(cat_of[it["base_name"]], []).append(it["base_name"])
+    star = sorted(need_by_cat.get("*") or [])
+    others = sorted(c for c in need_by_cat if c != "*")
+    check("«*»: категория «*» существует как обычное имя с потребностью, есть и другие категории",
+          merged == 200 and star and len(others) >= 2, f"merge={merged} star={len(star)} others={len(others)}")
+    P = others[0] if others else ""
+
+    def cats_of(names):
+        return sorted({cat_of.get(n, "?") for n in names})
+
+    # Сгенерированная кнопка категории «*» (не кнопка «Все категории» с классом all).
+    star_btn = lambda page: page.locator('#scope-btns .scope-btn:not(.all)[data-scope="*"]')  # noqa: E731
+    all_btn = lambda page: page.locator('#scope-btns .scope-btn[data-scope-action="all"]')  # noqa: E731
+
+    def pressed(loc):
+        return loc.count() == 1 and loc.get_attribute("aria-pressed") == "true"
+
+    def last_export(log):
+        ex = _posts(log, "api/export/replenish.xlsx")
+        return ex[-1] if ex else None
+
+    ctx, page, log = _cat_page(browser, cookies)
+    try:
+        page.goto(f"{base}/replenish")
+        page.wait_for_function("() => document.querySelectorAll('#tbody .row-check').length > 3", timeout=45000)
+        page.wait_for_timeout(600)
+        check("«*»: кнопка категории «*» и кнопка «Все категории» — разные элементы",
+              star_btn(page).count() == 1 and all_btn(page).count() == 1
+              and "Все категории" in (all_btn(page).text_content() or "")
+              and "Все категории" not in (star_btn(page).text_content() or ""),
+              f"star={star_btn(page).count()} all={all_btn(page).count()}")
+        star_btn(page).first.click()
+        page.wait_for_timeout(300)
+        note = page.locator("#scope-note").text_content() or ""
+        check("«*»: щелчок по категории «*» выбирает только её, «Все категории» не нажата",
+              pressed(star_btn(page)) and not pressed(all_btn(page)) and "все категории" not in note.lower(),
+              note[:160])
+        page.locator("#btn-export-xlsx").click()
+        page.wait_for_timeout(1500)
+        ex = last_export(log)
+        check("«*»: Excel — ровно позиции категории «*»",
+              isinstance(ex, dict) and sorted(ex.get("base_names") or []) == star,
+              str(ex and cats_of(ex.get("base_names") or [])))
+        page.locator("#btn-create-order").click()
+        page.wait_for_timeout(400)
+        page.locator("#btn-order-submit").click()
+        page.wait_for_timeout(2500)
+        orders = _posts(log, "api/orders")
+        names = sorted(i["base_name"] for i in (orders[0] if orders else {}).get("items", []))
+        check(f"«*»: тело заказа — ровно {len(star)} позиций «*», без других категорий",
+              names == star, f"{len(names)} {cats_of(names)}")
+        saved = cl.get("/api/orders").json().get("orders") or []
+        latest = max(saved, key=lambda o: o.get("id") or 0) if saved else {}
+        saved_names = sorted(i.get("base_name") for i in latest.get("items") or [])
+        check("«*»: сохранённый заказ — только «*»", saved_names == star,
+              f"{len(saved_names)} {cats_of(saved_names)}")
+        page.wait_for_function("() => !document.getElementById('order-modal').classList.contains('open')",
+                               timeout=15000)
+        star_btn(page).first.click()
+        page.wait_for_timeout(300)
+        check("«*»: повторный щелчок снимает «*» — выбора нет, «Оформить» недоступно",
+              not pressed(star_btn(page)) and not pressed(all_btn(page))
+              and page.locator("#btn-create-order").is_disabled())
+        # Контроль: обычная категория и явное «Все категории» — прежний смысл.
+        page.locator(f'#scope-btns .scope-btn[data-scope="{P}"]').click()
+        page.locator("#btn-export-xlsx").click()
+        page.wait_for_timeout(1500)
+        ex = last_export(log)
+        check(f"«*» [контроль]: обычная категория «{P}» — Excel ровно из неё",
+              isinstance(ex, dict) and sorted(ex.get("base_names") or []) == sorted(need_by_cat[P]),
+              str(ex and cats_of(ex.get("base_names") or [])))
+        all_btn(page).click()
+        page.wait_for_timeout(300)
+        page.locator("#btn-export-xlsx").click()
+        page.wait_for_timeout(1500)
+        ex = last_export(log)
+        page.locator("#btn-create-order").click()
+        page.wait_for_timeout(400)
+        summary = page.locator("#order-modal-summary").text_content() or ""
+        check("«*» [контроль]: явное «Все категории» — все категории (Excel {}), «*» в составе наравне с другими",
+              pressed(all_btn(page)) and not pressed(star_btn(page)) and ex == {}
+              and "* — " in summary and f"{P} — " in summary, f"{ex} {summary[:160]}")
+        page.locator("#btn-order-cancel").click()
+        all_btn(page).click()
+        page.wait_for_timeout(300)
+        check("«*» [контроль]: повторное «Все категории» снимает выбор",
+              not pressed(all_btn(page)) and page.locator("#btn-create-order").is_disabled())
+        check("«*»: ни одного запроса наружу и ошибок страницы", not log["outside"] and not log["errors"],
+              str(log["outside"] + log["errors"])[:200])
+    except Exception as exc:  # noqa: BLE001
+        check("«*»: сценарий выполнился без исключений", False, f"{type(exc).__name__}: {exc}"[:200])
     finally:
         ctx.close()
     cl.close()

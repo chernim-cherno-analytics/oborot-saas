@@ -1903,22 +1903,24 @@
     var counts=dict();
     arr.forEach(function(it){ var c=catName(it); counts[c]=(counts[c]||0)+1; });
     var cats=Object.keys(counts).sort(function(a,b){ return a.localeCompare(b,"ru"); });
-    var btns='<button type="button" class="scope-btn all'+(SCOPE&&SCOPE.all?' on':'')+'" data-scope="*" aria-pressed="'+
+    var btns='<button type="button" class="scope-btn all'+(SCOPE&&SCOPE.all?' on':'')+'" data-scope-action="all" aria-pressed="'+
       (SCOPE&&SCOPE.all?'true':'false')+'">Все категории</button>'+
       cats.map(function(c){
         var on=!!(SCOPE&&!SCOPE.all&&hasKey(SCOPE.cats,c));
         return '<button type="button" class="scope-btn'+(on?' on':'')+'" data-scope="'+esc(c)+'" aria-pressed="'+(on?'true':'false')+'">'+
           esc(c)+' <span class="cnt">'+counts[c]+'</span></button>';
       }).join("")+
-      (SCOPE?'<button type="button" class="scope-btn clear" data-scope="">Сбросить выбор</button>':'');
+      (SCOPE?'<button type="button" class="scope-btn clear" data-scope-action="clear">Сбросить выбор</button>':'');
     var box=document.getElementById("scope-btns");
     box.innerHTML=btns;
     box.querySelectorAll(".scope-btn").forEach(function(b){
       b.addEventListener("click",function(){
-        var c=b.getAttribute("data-scope");
-        if(c===""){ SCOPE=null; }
-        else if(c==="*"){ SCOPE=(SCOPE&&SCOPE.all)?null:{all:true}; }
-        else {
+        // Действие («все», «сбросить») — отдельным атрибутом, а не значением
+        // data-scope: имя категории — свободная строка, бывает и «*».
+        var act=b.getAttribute("data-scope-action"), c=b.getAttribute("data-scope");
+        if(act==="clear"){ SCOPE=null; }
+        else if(act==="all"){ SCOPE=(SCOPE&&SCOPE.all)?null:{all:true}; }
+        else if(c!==null){
           // Из «все категории» щелчок по одной — это выбор именно её, а не «все, кроме».
           if(!SCOPE||SCOPE.all) SCOPE={all:false,cats:dict()};
           if(hasKey(SCOPE.cats,c)) delete SCOPE.cats[c]; else SCOPE.cats[c]=true;

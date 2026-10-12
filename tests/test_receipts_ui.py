@@ -1331,7 +1331,7 @@ def _create_order(page, name: str, tap: bool) -> tuple:
     # PILOT-ORDER-CATEGORY-SCOPE-1: состав по категориям теперь выбирается явно
     # (при открытии не выбрано ничего). Прежний путь заказывал отмеченное во
     # всех категориях — ровно это и выбираем, смысл проверки не меняется.
-    all_btn = page.locator('#scope-btns .scope-btn[data-scope="*"]')
+    all_btn = page.locator('#scope-btns .scope-btn[data-scope-action="all"]')
     if all_btn.count() and all_btn.get_attribute("aria-pressed") != "true":
         all_btn.scroll_into_view_if_needed()
         act(all_btn)
