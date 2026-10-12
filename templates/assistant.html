@@ -721,7 +721,13 @@
       });
     });
     var note = document.getElementById("catNote");
-    if(!STATE.scopeChosen){
+    if(!cats.length && STATE.catsFailed){
+      note.className = "hint need";
+      note.textContent = "Не удалось загрузить категории — обновите страницу: без выбора категорий план не считается.";
+    } else if(!cats.length && STATE.scopeOrigin === "empty"){
+      note.className = "hint";
+      note.textContent = "В каталоге нет позиций — выбирать категории не из чего: в заказ войдут только новинки, вписанные вручную на шаге 2.";
+    } else if(!STATE.scopeChosen){
       note.className = "hint need";
       note.textContent = "Категории не выбраны — выберите одну, несколько или «Все категории»: без этого план не считается.";
     } else {
@@ -1132,9 +1138,11 @@
 
     // Состав по категориям — первой строкой плана: что в него вошло, видно
     // до кнопки «Создать заказ», а снятые «Взять» названы поимённо.
-    var inPlan = {};
+    // Без прототипа: название категории — свободная строка («constructor» и т.п.).
+    var inPlan = Object.create(null);
     (p.items||[]).forEach(function(i){ var c = i.category || "Без категории"; inPlan[c] = (inPlan[c]||0) + 1; });
-    var scopeHtml = '<div class="peak" id="planScope">Категории в заказе: <b>' + esc(scopeText(STATE.offcats)) + '</b>' +
+    var scopeHtml = '<div class="peak" id="planScope">Категории в заказе: <b>' +
+      esc(STATE.scopeOrigin === "empty" ? "каталог пуст — только новинки" : scopeText(STATE.offcats)) + '</b>' +
       (Object.keys(inPlan).length ? (' · в плане: ' + Object.keys(inPlan).sort().map(function(c){
         return esc(c) + ' — ' + inPlan[c]; }).join(", ")) : '') + '</div>' +
       (STATE.mustDropped.length ? ('<div class="warn" id="planMustDropped">Не включены позиции, отмеченные «Взять» раньше, ' +
@@ -1458,7 +1466,8 @@
     api("/api/productions"),
     api("/api/settings"),
     api("/api/order-plan/last").catch(function(){ return {brief:null}; }),
-    api("/api/order-plan/options").catch(function(){ return {categories:[]}; }),
+    // Сбой загрузки помечается: пустой список из-за ошибки — не «каталог пуст».
+    api("/api/order-plan/options").catch(function(){ return {categories:[], _failed:true}; }),
     api("/api/order-plan/history").catch(function(){ return {plans:[]}; })
   ]).then(function(r){
     STATE.prods = r[0].productions || [];
@@ -1518,6 +1527,15 @@
     STATE.allCats = cats.map(function(c){
       return (typeof c === "string") ? c : (c.name || c.category || "");
     }).filter(function(c){ return c; });
+    // Каталог действительно пуст (ответ получен, категорий нет): выбирать нечего,
+    // а заказ из одних новинок — существующий путь (A01). Состав «выбран»
+    // без исключений; при непустом каталоге и при сбое загрузки — выбор обязателен.
+    STATE.catsFailed = !!opt._failed;
+    if(!STATE.catsFailed && !STATE.allCats.length){
+      STATE.scopeChosen = true;
+      STATE.scopeOrigin = "empty";
+      STATE.offcats = [];
+    }
     renderCats();
   }).catch(function(e){
     document.getElementById("prodTiles").innerHTML =

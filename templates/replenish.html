@@ -1880,9 +1880,15 @@
      «Без категории». */
   var SCOPE=null;
   function catName(it){ return it.category||"Без категории"; }
+  // Название категории — свободная строка (слияние категорий задаёт любое имя),
+  // в том числе «constructor» или «toString». Поэтому словари здесь — без
+  // прототипа, а членство проверяется только по собственным ключам: иначе
+  // унаследованное свойство обычного {} выглядело бы как выбранная категория.
+  function dict(){ return Object.create(null); }
+  function hasKey(o,k){ return Object.prototype.hasOwnProperty.call(o,k); }
   function inScope(it){
     if(!SCOPE) return false;
-    return SCOPE.all||!!SCOPE.cats[catName(it)];
+    return SCOPE.all||hasKey(SCOPE.cats,catName(it));
   }
   function scopeLabel(){
     if(!SCOPE) return "";
@@ -1894,13 +1900,13 @@
     var arr=prodItems(ACTIVE_PROD);
     if(!items.length){ bar.style.display="none"; return; }
     bar.style.display="";
-    var counts={};
+    var counts=dict();
     arr.forEach(function(it){ var c=catName(it); counts[c]=(counts[c]||0)+1; });
     var cats=Object.keys(counts).sort(function(a,b){ return a.localeCompare(b,"ru"); });
     var btns='<button type="button" class="scope-btn all'+(SCOPE&&SCOPE.all?' on':'')+'" data-scope="*" aria-pressed="'+
       (SCOPE&&SCOPE.all?'true':'false')+'">Все категории</button>'+
       cats.map(function(c){
-        var on=!!(SCOPE&&!SCOPE.all&&SCOPE.cats[c]);
+        var on=!!(SCOPE&&!SCOPE.all&&hasKey(SCOPE.cats,c));
         return '<button type="button" class="scope-btn'+(on?' on':'')+'" data-scope="'+esc(c)+'" aria-pressed="'+(on?'true':'false')+'">'+
           esc(c)+' <span class="cnt">'+counts[c]+'</span></button>';
       }).join("")+
@@ -1914,8 +1920,8 @@
         else if(c==="*"){ SCOPE=(SCOPE&&SCOPE.all)?null:{all:true}; }
         else {
           // Из «все категории» щелчок по одной — это выбор именно её, а не «все, кроме».
-          if(!SCOPE||SCOPE.all) SCOPE={all:false,cats:{}};
-          if(SCOPE.cats[c]) delete SCOPE.cats[c]; else SCOPE.cats[c]=true;
+          if(!SCOPE||SCOPE.all) SCOPE={all:false,cats:dict()};
+          if(hasKey(SCOPE.cats,c)) delete SCOPE.cats[c]; else SCOPE.cats[c]=true;
           if(!Object.keys(SCOPE.cats).length) SCOPE=null;
         }
         renderScope(); renderTable(); updateSummary();
@@ -2100,7 +2106,7 @@
     var noCost=sel.filter(function(it){ return !(it.cost_price>0); }).length;
     var moqN=sel.filter(function(it){ return it.moq_applied; }).length;
     // Состав называется по категориям: что войдёт, видно до кнопки, а не после.
-    var byCat={};
+    var byCat=dict();
     sel.forEach(function(it){ var c=catName(it); byCat[c]=(byCat[c]||0)+1; });
     var catLine=Object.keys(byCat).sort(function(a,b){ return a.localeCompare(b,"ru"); })
       .map(function(c){ return c+" — "+fmt(byCat[c]); }).join(", ");
