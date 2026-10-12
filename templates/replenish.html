@@ -127,6 +127,19 @@
   .cat-btn:hover { background: rgba(31,31,31,.09); color: #1f1f1f; }
   .cat-btn.active { background: rgba(31,31,31,.16); color: #1f1f1f; border-color: rgba(31,31,31,.45); }
   .cat-btn .cnt { font-size: 10px; opacity: .6; margin-left: 3px; }
+  .cat-lbl { font-size: 11px; color: rgba(31,31,31,.6); align-self: center; }
+  .scope-bar { position: relative; z-index: 10; margin: 0 0 10px; padding: 10px 12px; border-radius: 12px;
+    border: 1px solid rgba(31,31,31,.16); background: rgba(255,255,255,.6); }
+  .scope-head { font-size: 13px; margin-bottom: 8px; }
+  .scope-note { font-size: 12px; color: #434446; }
+  .scope-note.need { color: #8a0003; font-weight: 600; }
+  .scope-btns { display: flex; gap: 8px; flex-wrap: wrap; }
+  .scope-btn { font-size: 12px; font-weight: 500; padding: 6px 14px; border-radius: 20px; min-height: 32px;
+    border: 1px solid rgba(31,31,31,.22); background: rgba(255,255,255,.7); color: #434446; cursor: pointer; }
+  .scope-btn.on { background: #1f1f1f; color: #f3e9e0; border-color: #1f1f1f; }
+  .scope-btn.all { font-weight: 700; }
+  .scope-btn.clear { border-style: dashed; }
+  tr.out-scope td { opacity: .45; }
 
   .table-outer { background: rgba(255,255,255,.55); backdrop-filter: blur(10px);
     border: 1px solid rgba(31,31,31,.09); border-radius: 12px; overflow: auto; max-height: calc(100vh - 200px); }
@@ -394,6 +407,16 @@
     <button class="abtn" id="btn-reset-drafts" type="button" style="display:none">↺ Сбросить правки</button>
     <button class="abtn" type="button" id="btn-export-xlsx" title="Выгрузить в Excel отмеченные галочкой позиции">⬇ Excel</button>
     <button class="abtn primary" id="btn-create-order" type="button" disabled>+ Оформить размещение</button>
+  </div>
+
+  {# PILOT-ORDER-CATEGORY-SCOPE-1. Состав заказа по категориям — отдельно от
+     фильтров таблицы ниже: чипы «Показать в таблице», поиск и «Срочно/Скоро»
+     меняют только то, что ВИДНО, а в заказ и в Excel идут отмеченные строки
+     ВЫБРАННЫХ здесь категорий. При открытии страницы ничего не выбрано —
+     «все категории» тоже надо выбрать явно. #}
+  <div class="scope-bar" id="scope-bar" style="display:none">
+    <div class="scope-head"><b>Категории в заказе</b> <span class="scope-note" id="scope-note"></span></div>
+    <div class="scope-btns" id="scope-btns"></div>
   </div>
 
   <div class="cat-bar" id="cat-bar" style="display:none"></div>
@@ -878,6 +901,7 @@
     renderDraftBar();
     renderTabs();
     renderChips();
+    renderScope();
     syncSegUI();
     renderTable();
     renderOrders();
@@ -1622,7 +1646,8 @@
     bar.style.display="";
     if(state.cat&&cats.indexOf(state.cat)<0) state.cat="";
     var total=prodItems(ACTIVE_PROD).length;
-    bar.innerHTML='<button class="cat-btn'+(state.cat?'':' active')+'" data-cat="">Все<span class="cnt">'+total+'</span></button>'+
+    bar.innerHTML='<span class="cat-lbl">Показать в таблице:</span>'+
+      '<button class="cat-btn'+(state.cat?'':' active')+'" data-cat="">Все<span class="cnt">'+total+'</span></button>'+
       cats.map(function(c){
         return '<button class="cat-btn'+(c===state.cat?' active':'')+'" data-cat="'+esc(c)+'">'+esc(c)+'<span class="cnt">'+counts[c]+'</span></button>';
       }).join("");
@@ -1769,7 +1794,9 @@
     }
     tbody.innerHTML=arr.map(function(it){
       var open=!!openRows[it.base_name];
-      return '<tr class="'+rowTint(it)+'" data-base="'+esc(it.base_name)+'">'+
+      var out=SCOPE&&!inScope(it);   // видна, но в заказ не входит — категория не выбрана
+      return '<tr class="'+rowTint(it)+(out?' out-scope':'')+'" data-base="'+esc(it.base_name)+'"'+
+        (out?' title="Категория «'+esc(catName(it))+'» не выбрана в составе заказа"':'')+'>'+
         '<td><input type="checkbox" class="row-check" data-base="'+esc(it.base_name)+'"'+(it._checked?" checked":"")+'></td>'+
         '<td><button class="expander" data-base="'+esc(it.base_name)+'" title="Размерная сетка и формула расчёта">'+(open?"▾":"▸")+'</button></td>'+
         '<td class="name">'+esc(it.base_name)+
@@ -1843,8 +1870,79 @@
   }
 
   function findItem(base){ return items.find(function(x){ return x.base_name===base; }); }
+
+  /* ── PILOT-ORDER-CATEGORY-SCOPE-1: категории в заказе ──
+     SCOPE=null — ещё не выбрано (так при каждом открытии: молча «все» не
+     выбираются); {all:true} — явно «все категории»; {all:false,cats:{…}} —
+     явный набор. Выбор не трогает галочки строк, ручную ростовку, черновики,
+     производства и уже созданные заказы — он только ограничивает, ЧТО из
+     отмеченного уйдёт в заказ и в Excel. Пустая категория — существующая
+     «Без категории». */
+  var SCOPE=null;
+  function catName(it){ return it.category||"Без категории"; }
+  // Название категории — свободная строка (слияние категорий задаёт любое имя),
+  // в том числе «constructor» или «toString». Поэтому словари здесь — без
+  // прототипа, а членство проверяется только по собственным ключам: иначе
+  // унаследованное свойство обычного {} выглядело бы как выбранная категория.
+  function dict(){ return Object.create(null); }
+  function hasKey(o,k){ return Object.prototype.hasOwnProperty.call(o,k); }
+  function inScope(it){
+    if(!SCOPE) return false;
+    return SCOPE.all||hasKey(SCOPE.cats,catName(it));
+  }
+  function scopeLabel(){
+    if(!SCOPE) return "";
+    if(SCOPE.all) return "все категории";
+    return Object.keys(SCOPE.cats).sort(function(a,b){ return a.localeCompare(b,"ru"); }).join(", ");
+  }
+  function renderScope(){
+    var bar=document.getElementById("scope-bar");
+    var arr=prodItems(ACTIVE_PROD);
+    if(!items.length){ bar.style.display="none"; return; }
+    bar.style.display="";
+    var counts=dict();
+    arr.forEach(function(it){ var c=catName(it); counts[c]=(counts[c]||0)+1; });
+    var cats=Object.keys(counts).sort(function(a,b){ return a.localeCompare(b,"ru"); });
+    var btns='<button type="button" class="scope-btn all'+(SCOPE&&SCOPE.all?' on':'')+'" data-scope-action="all" aria-pressed="'+
+      (SCOPE&&SCOPE.all?'true':'false')+'">Все категории</button>'+
+      cats.map(function(c){
+        var on=!!(SCOPE&&!SCOPE.all&&hasKey(SCOPE.cats,c));
+        return '<button type="button" class="scope-btn'+(on?' on':'')+'" data-scope="'+esc(c)+'" aria-pressed="'+(on?'true':'false')+'">'+
+          esc(c)+' <span class="cnt">'+counts[c]+'</span></button>';
+      }).join("")+
+      (SCOPE?'<button type="button" class="scope-btn clear" data-scope-action="clear">Сбросить выбор</button>':'');
+    var box=document.getElementById("scope-btns");
+    box.innerHTML=btns;
+    box.querySelectorAll(".scope-btn").forEach(function(b){
+      b.addEventListener("click",function(){
+        // Действие («все», «сбросить») — отдельным атрибутом, а не значением
+        // data-scope: имя категории — свободная строка, бывает и «*».
+        var act=b.getAttribute("data-scope-action"), c=b.getAttribute("data-scope");
+        if(act==="clear"){ SCOPE=null; }
+        else if(act==="all"){ SCOPE=(SCOPE&&SCOPE.all)?null:{all:true}; }
+        else if(c!==null){
+          // Из «все категории» щелчок по одной — это выбор именно её, а не «все, кроме».
+          if(!SCOPE||SCOPE.all) SCOPE={all:false,cats:dict()};
+          if(hasKey(SCOPE.cats,c)) delete SCOPE.cats[c]; else SCOPE.cats[c]=true;
+          if(!Object.keys(SCOPE.cats).length) SCOPE=null;
+        }
+        renderScope(); renderTable(); updateSummary();
+      });
+    });
+    var note=document.getElementById("scope-note");
+    if(!SCOPE){
+      note.className="scope-note need";
+      note.textContent="не выбраны — выберите одну, несколько или «Все категории», чтобы оформить заказ или выгрузить Excel";
+    }else{
+      var n=arr.filter(inScope).length;
+      note.className="scope-note";
+      note.textContent="в заказ идут отмеченные строки: "+scopeLabel()+
+        (n?"":" — на этой вкладке таких позиций нет");
+    }
+  }
+
   function checkedItems(){
-    return prodItems(ACTIVE_PROD).filter(function(it){ return it._checked&&it._need>0; });
+    return prodItems(ACTIVE_PROD).filter(function(it){ return it._checked&&it._need>0&&inScope(it); });
   }
 
   function renderKpis(){
@@ -1877,7 +1975,9 @@
       cost+=Math.round(it._need*it.cost_price);
     });
     document.getElementById("s-pos").textContent=fmt(sel.length);
-    document.getElementById("s-pos-sub").textContent="из "+fmt(prodItems(ACTIVE_PROD).length)+" на вкладке";
+    document.getElementById("s-pos-sub").textContent=SCOPE
+      ? ("из "+fmt(prodItems(ACTIVE_PROD).length)+" на вкладке · "+scopeLabel())
+      : "категории заказа не выбраны";
     document.getElementById("s-qty").textContent=fmt(qty);
     document.getElementById("s-cost").textContent=fmtMoneyShort(cost);
     document.getElementById("s-cost-sub").textContent = noCost
@@ -1947,7 +2047,14 @@
   }
   document.getElementById("btn-export-xlsx").addEventListener("click",function(){
     var btn=this;
-    var checked=items.filter(function(it){ return it._checked; });
+    // Excel — тот же состав, что и заказ: отмеченные строки ВЫБРАННЫХ категорий
+    // (по-прежнему по всем производствам). Без выбора категорий не выгружаем —
+    // иначе в файл молча ушли бы строки категорий, которые человек не выбирал.
+    if(!SCOPE){
+      alert("Сначала выберите категории заказа (блок «Категории в заказе») — одну, несколько или «Все категории».");
+      return;
+    }
+    var checked=items.filter(function(it){ return it._checked&&inScope(it); });
     if(!checked.length){
       alert("Отметьте хотя бы одну позицию — выгружать в Excel пока нечего.");
       return;
@@ -1956,7 +2063,11 @@
     // истёкшей сессии человека уносило со страницы на голый JSON
     // {"detail":"Не авторизован"}, вместе со всей несохранённой работой.
     // Один путь на оба случая: качаем blob'ом и остаёмся на странице.
-    var allChecked = !items.length || checked.length===items.length;
+    // Короткий {} — это «все отмеченные по живому каталогу на сервере»; так
+    // можно только при явном «Все категории». Выбор по именам категорий — даже
+    // если отмечены все загруженные строки — уходит списком позиций: иначе в
+    // файл попали бы позиции, которых на экране не было.
+    var allChecked = !!(SCOPE&&SCOPE.all) && (!items.length || checked.length===items.length);
     btn.disabled=true;
     fetch("/api/export/replenish.xlsx",{method:"POST",
       headers:{"Content-Type":"application/json","X-Oborot-CSRF":"1"},
@@ -2000,8 +2111,14 @@
     var cost=sel.reduce(function(s,it){ return s+(it.cost_price>0?it._need*it.cost_price:0); },0);
     var noCost=sel.filter(function(it){ return !(it.cost_price>0); }).length;
     var moqN=sel.filter(function(it){ return it.moq_applied; }).length;
+    // Состав называется по категориям: что войдёт, видно до кнопки, а не после.
+    var byCat=dict();
+    sel.forEach(function(it){ var c=catName(it); byCat[c]=(byCat[c]||0)+1; });
+    var catLine=Object.keys(byCat).sort(function(a,b){ return a.localeCompare(b,"ru"); })
+      .map(function(c){ return c+" — "+fmt(byCat[c]); }).join(", ");
     document.getElementById("order-modal-summary").textContent=
       (p?("Производство: "+p.name+", срок "+fmt(lead)+" "+plural(lead,"день","дня","дней")+". "):"")+
+      "Категории в заказе: "+catLine+". "+
       "В заказ войдут "+fmt(sel.length)+" "+plural(sel.length,"позиция","позиции","позиций")+", "+fmt(qty)+" шт, себестоимость ~"+fmtMoneyShort(cost)+"."+
       (noCost?(" Сумма НЕПОЛНАЯ: у "+fmt(noCost)+" "+plural(noCost,"позиции","позиций","позиций")+" себестоимость не заполнена."):"")+
       (moqN?(" У "+fmt(moqN)+" "+plural(moqN,"позиции","позиций","позиций")+" количество поднято до минимальной партии."):"");
