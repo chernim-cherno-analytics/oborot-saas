@@ -724,6 +724,7 @@ def run() -> int:  # noqa: C901 — сценарный тест: шагов мн
             _order_category_scope(browser, base)
             _order_category_p1(browser, base)
             _order_category_star(browser, base)
+            _order_category_stale_empty(browser, base)
         except Exception as exc:  # noqa: BLE001 — падение пути обязано стать
             # отчётом и ненулевым кодом, а не трассировкой без отчёта (D-42).
             check("сквозной путь в браузере дошёл до конца", False,
@@ -2800,6 +2801,173 @@ def _order_category_star(browser, base: str) -> None:
     finally:
         ctx.close()
     cl.close()
+
+
+# Корректив ревью PR #77 (раунд 3): исключение «каталог пуст» выдано по снимку
+# при открытии страницы и не должно пережить пополнение каталога — ни до
+# расчёта, ни между расчётом и сохранением; сбой проверки — блок.
+def _order_category_stale_empty(browser, base: str) -> None:
+    print("\n== PILOT-ORDER-CATEGORY-SCOPE-1: «каталог пуст» не переживает пополнения ==")
+
+    def empty_user(key):
+        cl = httpx.Client(headers={"X-Oborot-CSRF": "1"}, base_url=base, timeout=120.0)
+        cl.post("/register", data={"name": "Пусто", "email": f"catscope-stale-{key}@test.io",
+                                   "password": "secret123", "org_name": "Бренд-Пусто-" + key})
+        for page_name in ("replenish", "assistant"):
+            cl.post("/api/hints/seen", json={"page": page_name})
+        cookies = [{"name": k, "value": v, "domain": "127.0.0.1", "path": "/"} for k, v in cl.cookies.items()]
+        return cl, cookies
+
+    def open_wizard(page):
+        page.goto(f"{base}/assistant")
+        page.wait_for_function("() => !document.getElementById('prodTiles').textContent.includes('загрузка')",
+                               timeout=45000)
+        page.wait_for_timeout(800)
+
+    def wait_plan(page):
+        page.wait_for_function("() => document.getElementById('s3').style.display !== 'none' && "
+                               "!document.getElementById('planBox').textContent.includes('Считаю план')",
+                               timeout=45000)
+        page.wait_for_timeout(400)
+
+    def note(page):
+        return page.locator("#catNote").text_content() or "" if page.locator("#catNote").count() else ""
+
+    def applies(log):
+        return [p for p, _ in log["posts"] if p.startswith("api/order-plan/") and p.endswith("/apply")]
+
+    shortcut = lambda page: page.get_by_role("button", name="Сразу показать план").click()  # noqa: E731
+    chips = lambda page: page.locator("#catChips .chip[data-c]").count()  # noqa: E731
+
+    # A: каталог пополнился ДО расчёта.
+    cl, cookies = empty_user("before")
+    ctx, page, log = _cat_page(browser, cookies)
+    try:
+        open_wizard(page)
+        first = note(page)
+        check("пополнение до расчёта: при открытии каталог пуст", "нет позиций" in first, first[:100])
+        cl.post("/api/connect/demo")
+        page.evaluate("() => addNew('Новинка-А', 2, 1000)")
+        shortcut(page)
+        page.wait_for_timeout(2500)
+        pv = _posts(log, "api/order-plan/preview")
+        check("пополнение до расчёта: план НЕ считается, мастер просит выбрать категории, они показаны",
+              not pv and "появились позиции" in note(page) and chips(page) > 0 and page.locator("#s1").is_visible(),
+              f"previews={len(pv)} chips={chips(page)} note={note(page)[:90]}")
+        cats = cl.get("/api/order-plan/options").json().get("categories") or []
+        one = cats[0] if cats and isinstance(cats[0], str) else (cats[0].get("name") if cats else "")
+        page.locator(f'#catChips .chip[data-c="{one}"]').click()
+        shortcut(page)
+        wait_plan(page)
+        pv = _posts(log, "api/order-plan/preview")
+        plan = log["plans"][-1] if log["plans"] else {}
+        check(f"пополнение до расчёта: после явного выбора «{one}» план — только из неё (обычный путь)",
+              pv and len(pv[-1].get("exclude_categories") or []) == len(cats) - 1
+              and {i["category"] for i in plan.get("items") or []} <= {one},
+              f"{len(pv)} {sorted({i['category'] for i in plan.get('items') or []})}")
+        check("пополнение до расчёта: ни одного запроса наружу и ошибок страницы",
+              not log["outside"] and not log["errors"], str(log["outside"] + log["errors"])[:200])
+    except Exception as exc:  # noqa: BLE001
+        check("пополнение до расчёта: сценарий выполнился без исключений", False, f"{type(exc).__name__}: {exc}"[:200])
+    finally:
+        ctx.close()
+        cl.close()
+
+    # B: каталог пополнился МЕЖДУ расчётом и сохранением.
+    cl, cookies = empty_user("between")
+    ctx, page, log = _cat_page(browser, cookies)
+    try:
+        open_wizard(page)
+        page.evaluate("() => addNew('Новинка-Б', 2, 1000)")
+        shortcut(page)
+        wait_plan(page)
+        ok_plan = page.locator("#mkOrder").count() == 1
+        cl.post("/api/connect/demo")
+        if ok_plan:
+            page.locator("#mkOrder").click()
+        page.wait_for_timeout(3000)
+        orders = cl.get("/api/orders").json().get("orders") or []
+        check("пополнение между расчётом и сохранением: заказ НЕ создан, план не сохранён и не применён",
+              ok_plan and not orders and not _posts(log, "api/order-plan") and not applies(log),
+              f"plan={ok_plan} orders={len(orders)} saves={len(_posts(log, 'api/order-plan'))} applies={len(applies(log))} "
+              f"items={[len(o.get('items') or []) for o in orders]}")
+        check("пополнение между расчётом и сохранением: мастер вернулся к выбору категорий",
+              page.locator("#s1").is_visible() and "появились позиции" in note(page) and chips(page) > 0,
+              note(page)[:100])
+    except Exception as exc:  # noqa: BLE001
+        check("пополнение между расчётом и сохранением: сценарий выполнился без исключений", False,
+              f"{type(exc).__name__}: {exc}"[:200])
+    finally:
+        ctx.close()
+        cl.close()
+
+    # C: проверка перед сохранением «опоздала» (ответ о категориях устарел) —
+    # последний рубеж: сохранённый план со строками каталога не применяется.
+    cl, cookies = empty_user("sink")
+    ctx, page, log = _cat_page(browser, cookies)
+    try:
+        page.route("**/api/order-plan/options",
+                   lambda route: route.fulfill(status=200, content_type="application/json",
+                                               body=json.dumps({"categories": []})))
+        open_wizard(page)
+        page.evaluate("() => addNew('Новинка-В', 2, 1000)")
+        shortcut(page)
+        wait_plan(page)
+        cl.post("/api/connect/demo")
+        if page.locator("#mkOrder").count():
+            page.locator("#mkOrder").click()
+        page.wait_for_timeout(3000)
+        orders = cl.get("/api/orders").json().get("orders") or []
+        check("устаревшая проверка: план со строками каталога сохранён сервером, но НЕ применён — заказа нет",
+              len(_posts(log, "api/order-plan")) == 1 and not applies(log) and not orders
+              and page.locator("#s1").is_visible(),
+              f"saves={len(_posts(log, 'api/order-plan'))} applies={len(applies(log))} orders={len(orders)}")
+    except Exception as exc:  # noqa: BLE001
+        check("устаревшая проверка: сценарий выполнился без исключений", False, f"{type(exc).__name__}: {exc}"[:200])
+    finally:
+        ctx.close()
+        cl.close()
+
+    # D: сбой повторной проверки — блок, а не «пусто».
+    cl, cookies = empty_user("fail")
+    ctx, page, log = _cat_page(browser, cookies)
+    try:
+        open_wizard(page)
+        page.route("**/api/order-plan/options", lambda route: route.fulfill(status=500, body="{}"))
+        page.evaluate("() => addNew('Новинка-Г', 2, 1000)")
+        shortcut(page)
+        page.wait_for_timeout(2000)
+        check("сбой повторной проверки: план не считается, мастер просит обновить страницу",
+              not _posts(log, "api/order-plan/preview") and "Не удалось загрузить категории" in note(page),
+              f"previews={len(_posts(log, 'api/order-plan/preview'))} {note(page)[:90]}")
+    except Exception as exc:  # noqa: BLE001
+        check("сбой повторной проверки: сценарий выполнился без исключений", False, f"{type(exc).__name__}: {exc}"[:200])
+    finally:
+        ctx.close()
+        cl.close()
+
+    # E: каталог по-прежнему пуст — заказ из одной новинки, как раньше.
+    cl, cookies = empty_user("still")
+    ctx, page, log = _cat_page(browser, cookies)
+    try:
+        open_wizard(page)
+        page.evaluate("() => addNew('Новинка-Д', 2, 1000)")
+        shortcut(page)
+        wait_plan(page)
+        if page.locator("#mkOrder").count():
+            page.locator("#mkOrder").click()
+            page.wait_for_function("() => !document.getElementById('mkOrder') || "
+                                   "document.getElementById('mkHint').textContent === ''", timeout=45000)
+            page.wait_for_timeout(1500)
+        orders = cl.get("/api/orders").json().get("orders") or []
+        items = [i.get("base_name") for i in (orders[0].get("items") or [])] if orders else []
+        check("каталог по-прежнему пуст [контроль]: заказ создан ровно из одной новинки",
+              len(orders) == 1 and items == ["Новинка-Д"] and len(applies(log)) == 1, f"{len(orders)} {items}")
+    except Exception as exc:  # noqa: BLE001
+        check("каталог по-прежнему пуст: сценарий выполнился без исключений", False, f"{type(exc).__name__}: {exc}"[:200])
+    finally:
+        ctx.close()
+        cl.close()
 
 
 

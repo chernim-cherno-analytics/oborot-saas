@@ -691,6 +691,48 @@
     if(inc.length && inc.length <= exclude.length) return "только " + inc.join(", ");
     return "все, кроме " + exclude.join(", ");
   }
+  function catNames(list){
+    return (list || []).map(function(c){
+      return (typeof c === "string") ? c : (c.name || c.category || "");
+    }).filter(function(c){ return c; });
+  }
+  // Исключение «каталог пуст» выдано по снимку при открытии страницы. Пока
+  // вкладка открыта, каталог может пополниться (подключение в другой вкладке),
+  // а пустой exclude_categories для сервера — это «все категории». Поэтому
+  // перед расчётом и перед сохранением пустота проверяется заново; сбой
+  // проверки — блок, а не «пусто». Не пусто — выбор категорий обязателен.
+  function endEmptyScope(cats, failed){
+    STATE.scopeChosen = false;
+    STATE.scopeOrigin = null;
+    STATE.offcats = [];
+    STATE.catsFailed = !!failed;
+    STATE.catsChanged = !failed;
+    if(!failed) STATE.allCats = cats;
+    renderCats();
+  }
+  function recheckEmpty(){
+    if(STATE.scopeOrigin !== "empty") return Promise.resolve(true);
+    return api("/api/order-plan/options").then(function(opt){
+      var cats = catNames(opt && opt.categories);
+      if(!cats.length) return true;
+      endEmptyScope(cats, false);
+      return false;
+    }, function(){
+      STATE.allCats = [];
+      endEmptyScope([], true);
+      return false;
+    });
+  }
+  // Строки каталога в ответе (новинки идут отдельно, в new_items).
+  function catalogRows(p){
+    return ((p && p.items) || []).filter(function(i){ return (i.qty || 0) > 0; }).length;
+  }
+  function backToCats(){
+    go(1);
+    var fld = document.getElementById("catFld");
+    if(fld && fld.scrollIntoView) fld.scrollIntoView({block: "center"});
+  }
+
   function renderCats(){
     var box = document.getElementById("catChips");
     var cats = STATE.allCats;
@@ -727,6 +769,9 @@
     } else if(!cats.length && STATE.scopeOrigin === "empty"){
       note.className = "hint";
       note.textContent = "В каталоге нет позиций — выбирать категории не из чего: в заказ войдут только новинки, вписанные вручную на шаге 2.";
+    } else if(!STATE.scopeChosen && STATE.catsChanged){
+      note.className = "hint need";
+      note.textContent = "Пока страница была открыта, в каталоге появились позиции — выберите категории: без этого план не считается.";
     } else if(!STATE.scopeChosen){
       note.className = "hint need";
       note.textContent = "Категории не выбраны — выберите одну, несколько или «Все категории»: без этого план не считается.";
@@ -759,6 +804,14 @@
       if(fld && fld.scrollIntoView) fld.scrollIntoView({block: "center"});
       return;
     }
+    if(STATE.scopeOrigin === "empty" && !STATE.emptyRechecked){
+      recheckEmpty().then(function(ok){
+        if(!ok){ backToCats(); return; }
+        STATE.emptyRechecked = true;
+        try { window.preview(step, keepEdits); } finally { STATE.emptyRechecked = false; }
+      });
+      return;
+    }
     if(!STATE.dropRetry) STATE.mustDropped = [];
     go(step||3);
     // Правки количеств переживают пересчёт: раньше любой возврат к анкете
@@ -784,6 +837,13 @@
       loadSideData()
     ]).then(function(rr){
       var p = rr[0];
+      // Ответ на «пустой» состав пришёл со строками каталога — снимок
+      // успел измениться после проверки: план не показываем.
+      if(previewBody.exclude_categories.length === 0 && STATE.scopeOrigin === "empty" && catalogRows(p)){
+        STATE.edits = pendingEdits;
+        recheckEmpty().then(function(ok){ if(ok) endEmptyScope(STATE.allCats, true); backToCats(); });
+        return;
+      }
       // Планировщик ставит must_have ВЫШЕ исключения категории (решение
       // человека сильнее). Но «Взять», восстановленное из черновика или прошлой
       // анкеты, — не решение про ЭТОТ состав: если человек здесь выбрал
@@ -1411,7 +1471,22 @@
     btn.disabled = true; hint.textContent = "сохраняю…";
     var b = brief(); b.overrides = STATE.edits;
     var flags = {force:false, confirm_partial:false};
-    api("/api/order-plan", b).then(function(res){
+    var emptyScope = STATE.scopeOrigin === "empty";
+    var stale = new Error("Пока страница была открыта, в каталоге появились позиции — заказ не создан. Выберите категории на шаге 1.");
+    recheckEmpty().then(function(ok){
+      if(!ok){ backToCats(); throw stale; }
+      return api("/api/order-plan", b);
+    }).then(function(res){
+      // Заказ создаётся из сохранённого плана (res.plan). При «пустом»
+      // составе в нём не должно быть строк каталога: иначе снимок изменился
+      // между проверкой и сохранением — применять такой план нельзя.
+      if(emptyScope && catalogRows(res.plan)){
+        return recheckEmpty().then(function(ok){
+          if(ok) endEmptyScope(STATE.allCats, true);
+          backToCats();
+          throw stale;
+        });
+      }
       hint.textContent = "создаю черновик…";
       var pr = curProd();
       var name = (pr ? pr.name : "Заказ") + " · " + dstr(STATE.plan.eta_date);
@@ -1524,9 +1599,7 @@
       document.querySelector("#s1 .panel").prepend(w);
     }
     renderDataFacts(opt.data_quality);
-    STATE.allCats = cats.map(function(c){
-      return (typeof c === "string") ? c : (c.name || c.category || "");
-    }).filter(function(c){ return c; });
+    STATE.allCats = catNames(cats);
     // Каталог действительно пуст (ответ получен, категорий нет): выбирать нечего,
     // а заказ из одних новинок — существующий путь (A01). Состав «выбран»
     // без исключений; при непустом каталоге и при сбое загрузки — выбор обязателен.
