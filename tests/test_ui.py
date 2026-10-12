@@ -715,6 +715,7 @@ def run() -> int:  # noqa: C901 — сценарный тест: шагов мн
             _copy_consistency(browser, base)
             _loss_width(browser, base)
             _assistant_sync_time(browser, base)
+            _connection_state_clarity(browser, base)
         except Exception as exc:  # noqa: BLE001 — падение пути обязано стать
             # отчётом и ненулевым кодом, а не трассировкой без отчёта (D-42).
             check("сквозной путь в браузере дошёл до конца", False,
@@ -1858,6 +1859,220 @@ def _assistant_sync_time(browser, base: str) -> None:
                 ctx.close()
     finally:
         cl.close()
+
+
+# ── PILOT-CONNECTION-STATE-CLARITY-1: сбой запроса ≠ потерянное подключение ──
+
+_CONN_STATE_JS = """() => {
+  const t = id => { const e = document.getElementById(id); return e ? e.textContent.replace(/\\s+/g, ' ').trim() : null; };
+  const pill = document.getElementById('live-pill');
+  const tok = document.getElementById('ms-token');
+  const btn = document.getElementById('btn-connect-ms');
+  const lab = tok && tok.labels && tok.labels[0] ? tok.labels[0].textContent : null;
+  return {side: t('side-sync'), pill: !!pill && pill.style.display !== 'none',
+          conn: t('conn-box'), token_value: tok ? tok.value : null, token_type: tok ? tok.type : null,
+          token_label: lab, button: btn ? btn.textContent : null,
+          v1: sessionStorage.getItem('hq_conn_v1'), v2: sessionStorage.getItem('hq_conn_v2'),
+          docw: document.documentElement.scrollWidth};
+}"""
+_CONN_MS = {"connection": {"kind": "moysklad", "status": "active", "last_sync_at": "2026-10-12T09:00:00"},
+            "role": "owner"}
+
+
+def _side_shows(page, text: str, timeout_ms: int) -> bool:
+    """Дождаться текста в строке источника; таймаут — это провал проверки, а не
+    обрыв всего прохода (иначе на старом коде не видно остальных сценариев)."""
+    try:
+        page.wait_for_function(
+            "(t) => (document.getElementById('side-sync') || {textContent: ''}).textContent.includes(t)",
+            arg=text, timeout=timeout_ms)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _connection_state_clarity(browser, base: str) -> None:
+    print("\n== PILOT-CONNECTION-STATE-CLARITY-1: статус источника и сохранённое подключение ==")
+    users = {}
+    for key, demo in (("demo", True), ("none", False)):
+        cl = httpx.Client(headers={"X-Oborot-CSRF": "1"}, base_url=base, timeout=120.0)
+        cl.post("/register", data={"name": "Связь", "email": f"connstate-{key}@test.io",
+                                   "password": "secret123", "org_name": "Бренд-Связь-" + key})
+        if demo:
+            check("связь: демо-данные загружены", cl.post("/api/connect/demo").status_code == 200)
+        # Подсказки первого визита — не предмет проверки; отмечены до браузера.
+        for page_name in ("settings", "account"):
+            cl.post("/api/hints/seen", json={"page": page_name})
+        users[key] = [{"name": k, "value": v, "domain": "127.0.0.1", "path": "/"} for k, v in cl.cookies.items()]
+        cl.close()
+
+    def open_page(label, who, path, *, width=1440, fail_first=0, stub=None, stale_v1=False, wait=2500):
+        mobile = width < 760
+        ctx = browser.new_context(viewport={"width": width, "height": 844 if mobile else 900},
+                                  has_touch=mobile, is_mobile=mobile, locale="ru-RU")
+        ctx.add_cookies(users[who])
+        if stale_v1:   # запись прежней версии кэша: сбой, сохранённый как «подключения нет»
+            ctx.add_init_script(
+                "sessionStorage.setItem('hq_conn_v1', JSON.stringify({t: Date.now(), v: null}));")
+        page = ctx.new_page()
+        log = {"calls": 0, "writes": [], "errors": [], "outside": []}
+        page.on("pageerror", lambda e: log["errors"].append(str(e)))
+        page.on("request", lambda r: (log["writes"].append(r.method + " " + r.url.split("?")[0])
+                                      if r.method != "GET" else None,
+                                      log["outside"].append(r.url) if "127.0.0.1" not in r.url else None))
+
+        # Playwright вызывает обработчик как (route, request): параметры случая —
+        # только именованными аргументами.
+        def _settings(route, request=None, *, fail_first=fail_first, stub=stub):
+            log["calls"] += 1
+            if log["calls"] <= fail_first:
+                route.abort()
+            elif stub is None:
+                route.continue_()
+            elif stub[0] == "status":
+                route.fulfill(status=stub[1], content_type="application/json", body='{"detail":"x"}')
+            elif stub[0] == "raw":
+                route.fulfill(status=200, content_type="application/json", body=stub[1])
+            else:
+                resp = route.fetch()
+                data = resp.json()
+                data.update(stub[1])
+                route.fulfill(status=200, content_type="application/json", body=json.dumps(data))
+
+        page.route("**/api/settings", _settings)
+        page.goto(f"{base}{path}")
+        page.wait_for_timeout(wait)
+        return ctx, page, log
+
+    def clean(label, log):
+        check(f"связь [{label}]: ни одной записи, запросов наружу и ошибок",
+              not log["writes"] and not log["outside"] and not log["errors"],
+              str(log["writes"] + log["outside"] + log["errors"])[:200])
+
+    UNAVAIL = "Статус источника недоступен"
+    # 1. Сбой первого запроса → «недоступен», не «не подключён»; сбой не кэшируется;
+    #    ограниченный автоповтор возвращает настоящее состояние на той же странице.
+    ctx, page, log = open_page("сбой→восстановление", "demo", "/account", fail_first=1)
+    try:
+        s = page.evaluate(_CONN_STATE_JS)
+        check("связь [сбой]: «статус недоступен», не «не подключён», пилюли нет, сбой не закэширован",
+              UNAVAIL in (s["side"] or "") and "не подключён" not in (s["side"] or "")
+              and not s["pill"] and s["v2"] is None and s["v1"] is None, str(s)[:240])
+        recovered = _side_shows(page, "Демо-данные", 15000)
+        s = page.evaluate(_CONN_STATE_JS)
+        check("связь [сбой→восстановление]: та же страница без перезагрузки показывает демо, пилюля есть",
+              recovered and "Демо-данные" in (s["side"] or "") and s["pill"] and s["v2"] is not None, str(s)[:240])
+        page.goto(f"{base}/account"); page.wait_for_timeout(2000)
+        s = page.evaluate(_CONN_STATE_JS)
+        check("связь [сбой→переход в той же сессии]: демо", "Демо-данные" in (s["side"] or ""), str(s)[:200])
+        clean("сбой→восстановление", log)
+    finally:
+        ctx.close()
+    # 2. Ограниченный автоповтор и явное «повторить».
+    ctx, page, log = open_page("повтор", "demo", "/account", fail_first=3, wait=16000)
+    try:
+        s = page.evaluate(_CONN_STATE_JS)
+        calls_before = log["calls"]
+        check("связь [повтор]: три неудачи — исходная и два автоповтора, больше запросов нет, статус недоступен",
+              calls_before == 3 and UNAVAIL in (s["side"] or "") and not s["pill"], f"{calls_before} {s['side']}")
+        page.wait_for_timeout(4000)
+        check("связь [повтор]: бесконечного опроса нет", log["calls"] == calls_before, str(log["calls"]))
+        retry = page.locator("#side-sync-retry")
+        has_retry = retry.count() == 1
+        if has_retry:
+            retry.click()
+        check("связь [повтор]: есть «повторить», и оно вернуло демо",
+              has_retry and _side_shows(page, "Демо-данные", 10000), str(log["calls"]))
+        clean("повтор", log)
+    finally:
+        ctx.close()
+    # 3. Устаревший кэш прежней версии не подавляет настоящее состояние.
+    ctx, page, log = open_page("старый кэш", "demo", "/account", stale_v1=True)
+    try:
+        s = page.evaluate(_CONN_STATE_JS)
+        check("связь [старый кэш hq_conn_v1=null]: показано демо, старая запись удалена",
+              "Демо-данные" in (s["side"] or "") and s["v1"] is None and log["calls"] == 1, str(s)[:200])
+        clean("старый кэш", log)
+    finally:
+        ctx.close()
+    # 4. Успешный ответ без подключения — по-прежнему «не подключён»; демо и МойСклад — как раньше.
+    for label, who, stub, want in (("нет подключения", "none", None, "Источник не подключён"),
+                                   ("демо", "demo", None, "Демо-данные"),
+                                   ("МойСклад", "demo", ("merge", _CONN_MS), "МойСклад")):
+        ctx, page, log = open_page(label, who, "/account", stub=stub)
+        try:
+            s = page.evaluate(_CONN_STATE_JS)
+            check(f"связь [{label}]: сайдбар «{want}», пилюля {'нет' if who == 'none' else 'есть'}",
+                  want in (s["side"] or "") and s["pill"] == (who != "none"), str(s)[:200])
+            clean(label, log)
+        finally:
+            ctx.close()
+    # 5. Не-2xx, не JSON, неожиданная форма — «недоступен», без ложно-зелёной пилюли и без кэша.
+    for label, stub in (("HTTP 500", ("status", 500)), ("не JSON", ("raw", "{not json")),
+                        ("нет поля connection", ("raw", '{"thresholds": {}}')),
+                        ("connection не объект", ("raw", '{"connection": "yes"}'))):
+        ctx, page, log = open_page(label, "demo", "/account", stub=stub)
+        try:
+            s = page.evaluate(_CONN_STATE_JS)
+            check(f"связь [{label}]: «статус недоступен», пилюли нет, в кэш не попало",
+                  UNAVAIL in (s["side"] or "") and not s["pill"] and s["v2"] is None, str(s)[:200])
+            clean(label, log)
+        finally:
+            ctx.close()
+    # 6. 390: тот же честный статус.
+    ctx, page, log = open_page("390 сбой", "demo", "/account", width=MOBILE_WIDTH, fail_first=1)
+    try:
+        s = page.evaluate(_CONN_STATE_JS)
+        check("связь [390, сбой]: «статус недоступен», пилюли нет, страница не шире окна",
+              UNAVAIL in (s["side"] or "") and not s["pill"] and s["docw"] <= MOBILE_WIDTH + 1, str(s)[:200])
+        clean("390 сбой", log)
+    finally:
+        ctx.close()
+    # 7. «Настройки»: сохранённый МойСклад — замена, а не обязательный ввод; токен не подставлен.
+    for label, width, path in (("МойСклад 1440", 1440, "/settings"), ("МойСклад 390", MOBILE_WIDTH, "/settings"),
+                               ("МойСклад встроенный", 1440, "/settings?embed=1")):
+        ctx, page, log = open_page(label, "demo", path, width=width, stub=("merge", _CONN_MS))
+        try:
+            s = page.evaluate(_CONN_STATE_JS)
+            check(f"связь [{label}]: «подключение сохранено», ввод при каждом входе не нужен, поле — только замена",
+                  "Подключение к МойСкладу сохранено" in (s["conn"] or "")
+                  and "Вводить его при каждом входе не нужно" in (s["conn"] or "")
+                  and (s["token_label"] or "").startswith("Заменить API-токен")
+                  and s["button"] == "Заменить токен", str(s)[:260])
+            check(f"связь [{label}]: токен не подставлен (пустое поле password)",
+                  s["token_value"] == "" and s["token_type"] == "password", str(s)[:120])
+            clean(label, log)
+        finally:
+            ctx.close()
+    for label, who, button, text in (("демо", "demo", "Подключить МойСклад", "синтетические данные"),
+                                     ("нет подключения", "none", "Подключить", "Источник данных не подключён")):
+        ctx, page, log = open_page("Настройки " + label, who, "/settings")
+        try:
+            s = page.evaluate(_CONN_STATE_JS)
+            check(f"связь [Настройки, {label}]: путь подключения «{button}», без «сохранено»",
+                  s["button"] == button and text in (s["conn"] or "")
+                  and "сохранено" not in (s["conn"] or ""), str(s)[:220])
+            clean("Настройки " + label, log)
+        finally:
+            ctx.close()
+    ctx, page, log = open_page("Настройки форма", "demo", "/settings", stub=("raw", '{"thresholds": {}}'))
+    try:
+        s = page.evaluate(_CONN_STATE_JS)
+        check("связь [Настройки, неожиданная форма ответа]: «статус неизвестен», а не «не подключён», формы нет",
+              "Статус подключения сейчас неизвестен" in (s["conn"] or "")
+              and "не подключён" not in (s["conn"] or "") and s["button"] is None, str(s)[:200])
+        clean("Настройки форма", log)
+    finally:
+        ctx.close()
+    # 8. Встроенный режим со сбоем: страница работает, ложного статуса нет.
+    ctx, page, log = open_page("встроенный сбой", "demo", "/account?embed=1", fail_first=1)
+    try:
+        s = page.evaluate(_CONN_STATE_JS)
+        check("связь [встроенный, сбой]: ни «не подключён», ни пилюли",
+              "не подключён" not in (s["side"] or "") and not s["pill"], str(s)[:200])
+        clean("встроенный сбой", log)
+    finally:
+        ctx.close()
 
 
 # ── PILOT-SYNC-TRUTH-1: экран не обещает того, чего не знает ────────────────

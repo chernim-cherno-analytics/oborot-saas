@@ -419,16 +419,41 @@ function hqBootShell() {
   // Бейдж срочных в меню
   hqUrgentStats().then(function (s) { if (s) setNavPip(s.urgent); });
 
-  // Статус источника: пилюля в шапке + строка внизу сайдбара
-  hqCached("hq_conn_v1", 60000, function () {
-    return hqFetchJson("/api/settings").then(function (d) {
-      return d && d.connection ? d.connection : null;
-    });
-  }).then(function (conn) {
-    var side = document.getElementById("side-sync");
-    var pill = document.getElementById("live-pill");
-    var pillText = document.getElementById("live-pill-text");
+  hqShellConnection(0);
+}
+
+/** Запрос подключения для оболочки. Отличает «подключения нет» (успешный ответ
+ *  с connection:null) от «статус неизвестен» (нет связи, не-2xx, не JSON,
+ *  неожиданная форма) — второе отклоняется и НЕ кэшируется. Прежде любой сбой
+ *  превращался в null, кэшировался на минуту как успешный ответ и показывался
+ *  «Источник не подключён». */
+function hqFetchShellConnection() {
+  return fetch("/api/settings", { credentials: "same-origin" }).then(function (r) {
+    if (!r.ok) throw new Error("http " + r.status);
+    return r.json();
+  }).then(function (d) {
+    if (!d || typeof d !== "object" || !("connection" in d)) throw new Error("shape");
+    var c = d.connection;
+    if (c === null) return { conn: null };
+    if (typeof c !== "object" || typeof c.kind !== "string") throw new Error("shape");
+    return { conn: c };
+  });
+}
+
+/** Статус источника: пилюля в шапке + строка внизу сайдбара. `attempt` — номер
+ *  попытки: после сбоя не больше двух автоповторов (только /api/settings, без
+ *  обращений к источнику), дальше — кнопка «повторить». Бесконечного опроса нет. */
+function hqShellConnection(attempt) {
+  // Записи прежней версии кэша могли хранить сбой как «подключения нет» —
+  // такую запись не читаем никогда.
+  try { sessionStorage.removeItem("hq_conn_v1"); } catch (e) { /* ignore */ }
+  var side = document.getElementById("side-sync");
+  var pill = document.getElementById("live-pill");
+  var pillText = document.getElementById("live-pill-text");
+  hqCached("hq_conn_v2", 60000, hqFetchShellConnection).then(function (res) {
+    var conn = res && res.conn;
     if (!conn) {
+      if (pill) pill.style.display = "none";
       if (side) side.innerHTML = '<span style="color:#e89312;">●</span> Источник не подключён';
       return;
     }
@@ -457,6 +482,15 @@ function hqBootShell() {
       pill.classList.toggle("stale", !fresh);
       pill.style.display = "";
     }
+  }, function () {
+    // Статус неизвестен: это не «не подключён» и не «актуально».
+    if (pill) pill.style.display = "none";
+    if (!side) return;
+    side.innerHTML = '<span style="color:#9aa0a6;">●</span> Статус источника недоступен' +
+      ' · <a href="#" id="side-sync-retry">повторить</a>';
+    var retry = document.getElementById("side-sync-retry");
+    if (retry) retry.addEventListener("click", function (e) { e.preventDefault(); hqShellConnection(0); });
+    if (attempt < 2) setTimeout(function () { hqShellConnection(attempt + 1); }, attempt === 0 ? 3000 : 10000);
   });
 }
 
