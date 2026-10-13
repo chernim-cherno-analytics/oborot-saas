@@ -727,6 +727,7 @@ def run() -> int:  # noqa: C901 — сценарный тест: шагов мн
             _order_category_stale_empty(browser, base)
             _order_category_stale_sel(browser, base)
             _order_category_round5(browser, base)
+            _settings_compact_lists(browser, base)
         except Exception as exc:  # noqa: BLE001 — падение пути обязано стать
             # отчётом и ненулевым кодом, а не трассировкой без отчёта (D-42).
             check("сквозной путь в браузере дошёл до конца", False,
@@ -3360,6 +3361,334 @@ def _order_category_round5(browser, base: str) -> None:
     finally:
         ctx.close()
         cl.close()
+
+
+# ── PILOT-SETTINGS-COMPACT-LISTS-1: длинные списки «Настроек» ─────────────────
+# Поиск, короткий показ и «показать ещё» в трёх списках: исключённые позиции,
+# карточки производств, распределение по поставщику. Всё — по уже загруженному,
+# без запросов; правки в скрытых карточках и выбор в скрытых строках не
+# теряются; «Сохранить» отправляет ровно задуманное.
+def _settings_compact_lists(browser, base: str) -> None:
+    print("\n== PILOT-SETTINGS-COMPACT-LISTS-1: длинные списки в настройках ==")
+    import sqlite3
+    SPECIAL_P = 'Ателье <b>&"кавычки\'</b>'
+    SPECIAL_S = 'Фабрика <i>"Ёлка"</i> & Co'
+    cl = httpx.Client(headers={"X-Oborot-CSRF": "1"}, base_url=base, timeout=120.0)
+    email = "settings-compact@test.io"
+    cl.post("/register", data={"name": "Настройки", "email": email, "password": "secret123",
+                               "org_name": "Бренд-Длинные-Списки"})
+    check("настройки: демо-данные загружены", cl.post("/api/connect/demo").status_code == 200)
+    cl.post("/api/hints/seen", json={"page": "settings"})
+    with sqlite3.connect(DB_PATH) as con:
+        org_id = con.execute("SELECT m.org_id FROM memberships m JOIN users u ON u.id=m.user_id"
+                             " WHERE u.email=?", (email,)).fetchone()[0]
+    prods = {}
+    for i in range(1, 11):
+        r = cl.post("/api/productions", json={"name": f"Цех {i:02d}"}).json()
+        prods[f"Цех {i:02d}"] = r.get("id") or (r.get("production") or {}).get("id")
+    r = cl.post("/api/productions", json={"name": SPECIAL_P}).json()
+    prods[SPECIAL_P] = r.get("id") or (r.get("production") or {}).get("id")
+    all_prods = cl.get("/api/productions").json()["productions"]
+    rep = cl.get("/api/replenish").json()
+    bases = sorted({it["base_name"] for it in rep.get("items", [])})
+    for b in bases[:25]:
+        cl.post("/api/exclusions", json={"base_name": b, "excluded": True})
+    excl = cl.get("/api/exclusions").json().get("excluded") or []
+    # Фикстура набора (как тариф в других проверках): у каждой оставшейся
+    # позиции свой поставщик — длинный список значений для распределения.
+    left = bases[25:]
+    with sqlite3.connect(DB_PATH) as con:
+        for i, b in enumerate(left):
+            con.execute("UPDATE products SET supplier=? WHERE org_id=? AND base_name=?",
+                        (SPECIAL_S if i == len(left) - 1 else f"Поставщик {i + 1:02d}", org_id, b))
+    src = cl.get("/api/productions/assign-sources").json()
+    sup_values = [v["value"] for v in (src.get("sources") or {}).get("supplier", {}).get("values", [])]
+    check("настройки: синтетика — 12 производств, 25 исключённых, у каждой позиции свой поставщик",
+          len(all_prods) == 12 and len(excl) >= 25 and SPECIAL_S in sup_values and len(sup_values) == len(left)
+          and len(left) > 15, f"prods={len(all_prods)} excl={len(excl)} sup={len(sup_values)}/{len(left)}")
+    cookies = [{"name": k, "value": v, "domain": "127.0.0.1", "path": "/"} for k, v in cl.cookies.items()]
+
+    def page_for(cookies, width=1440):
+        mobile = width < 760
+        ctx = browser.new_context(viewport={"width": width, "height": 844 if mobile else 900},
+                                  has_touch=mobile, is_mobile=mobile, locale="ru-RU")
+        ctx.add_cookies(cookies)
+        page = ctx.new_page()
+        log = {"req": [], "posts": [], "errors": [], "outside": []}
+        page.on("pageerror", lambda e: log["errors"].append(str(e)))
+
+        def _req(r):
+            if "127.0.0.1" not in r.url:
+                log["outside"].append(r.url)
+            path = r.url.split("127.0.0.1", 1)[-1].split("/", 1)[-1]
+            log["req"].append((r.method, path))
+            if r.method == "POST":
+                try:
+                    log["posts"].append((path, json.loads(r.post_data or "{}")))
+                except ValueError:
+                    log["posts"].append((path, None))
+        page.on("request", _req)
+        page.on("dialog", lambda d: d.accept())
+        page.goto(f"{base}/settings")
+        page.wait_for_function("() => !document.querySelector('#excl-box .loading-stub') && "
+                               "!document.querySelector('#chan-box .loading-stub') && "
+                               "!document.querySelector('#assign-box .loading-stub')", timeout=45000)
+        page.wait_for_timeout(500)
+        return ctx, page, log
+
+    def txt(page, sel):
+        loc = page.locator(sel)
+        return (loc.first.text_content() or "") if loc.count() else ""
+
+    def visible_count(page, sel):
+        return page.evaluate("s => Array.from(document.querySelectorAll(s)).filter(e => e.offsetParent !== null).length", sel)
+
+    def mark(log):
+        return len(log["req"])
+
+    def requests_since(log, n):
+        return [r for r in log["req"][n:] if "/api/hints/seen" not in r[1]]
+
+    ctx, page, log = page_for(cookies)
+    try:
+        # ── Исключённые ──
+        n0 = mark(log)
+        rows = visible_count(page, "#excl-box .excl-return")
+        status = txt(page, "#excl-status")
+        labels = page.evaluate("() => [document.querySelector('label[for=excl-search]'), "
+                               "document.querySelector('label[for=excl-filter]')].map(l => l && l.textContent.trim())")
+        check("исключённые: при открытии короткий список (10), итог «всего / системой / вручную»",
+              rows == 10 and f"Исключено {len(excl)} поз." in status and "вручную — " in status
+              and "показано 10 из" in status, f"rows={rows} status={status[:120]}")
+        check("исключённые: поиск среди исключённых и поиск «исключить ещё» подписаны по-разному",
+              labels == ["Исключить ещё позицию", "Найти среди исключённых"], str(labels))
+        page.locator("#excl-box [data-more='excl']").click()
+        more = visible_count(page, "#excl-box .excl-return")
+        page.locator("#excl-box [data-all='excl']").click()
+        everything = visible_count(page, "#excl-box .excl-return")
+        check(f"исключённые: «Показать ещё» → 20, «Показать все» → все {len(excl)}",
+              more == 20 and everything == len(excl), f"{more} {everything}")
+        last = excl[-1]["base_name"]
+        page.locator("#excl-filter").fill(last)
+        page.wait_for_timeout(200)
+        names = page.evaluate("() => Array.from(document.querySelectorAll('#excl-box .excl-return'))"
+                              ".filter(b => b.offsetParent !== null).map(b => b.dataset.base)")
+        check("исключённые: поиск находит последнюю позицию списка", names == [last], f"{names[:3]}")
+        page.locator("#excl-filter").fill("zzz-нет-такого")
+        page.wait_for_timeout(200)
+        nomatch = page.locator("#excl-box").text_content() or ""
+        check("исключённые: «нет совпадений» — не то же, что «ничего не исключено»",
+              "ничего нет" in nomatch and "Ничего не исключено" not in nomatch
+              and page.locator("#excl-filter-clear").is_visible(), nomatch[:100])
+        page.locator("#excl-filter-clear").click()
+        page.wait_for_timeout(200)
+        check("исключённые: «Сбросить поиск» возвращает список, фокус — в поле поиска",
+              visible_count(page, "#excl-box .excl-return") == 10
+              and page.evaluate("() => document.activeElement && document.activeElement.id") == "excl-filter")
+        check("исключённые: поиск, «показать ещё» и сброс — ни одного запроса", not requests_since(log, n0),
+              str(requests_since(log, n0))[:160])
+        page.locator("#excl-filter").fill(last)
+        page.wait_for_timeout(200)
+        page.locator(f'#excl-box .excl-return[data-base="{last}"]').click()
+        page.wait_for_timeout(1500)
+        posts = [b for p, b in log["posts"] if p == "api/exclusions"]
+        still = {e["base_name"] for e in cl.get("/api/exclusions").json().get("excluded") or []}
+        check("исключённые: «Вернуть в аналитику» по найденной — ровно эта позиция, только в аналитику",
+              posts == [{"base_name": last, "excluded": False}] and last not in still
+              and page.locator("#excl-filter").input_value() == last,
+              f"posts={posts} still_excluded={last in still}")
+        page.locator("#excl-filter-clear").click()
+
+        # ── Производства ──
+        n0 = mark(log)
+        cards = visible_count(page, "#chan-box .chan")
+        bodies = visible_count(page, "#chan-box .chan-body")
+        cstatus = txt(page, "#chan-status")
+        check("производства: при открытии 8 свёрнутых карточек из 12, итог назван",
+              cards == 8 and bodies == 0 and "Производств: 12" in cstatus and "показано 8 из 12" in cstatus,
+              f"cards={cards} bodies={bodies} {cstatus}")
+        page.locator("#chan-box [data-more='chan']").click()
+        check("производства: «Показать ещё» показывает остальные", visible_count(page, "#chan-box .chan") == 12)
+        X, Y = prods["Цех 03"], prods["Цех 07"]
+
+        def card(pid):
+            return page.locator(f'#chan-box .chan[data-p="{pid}"]')
+        page.locator("#chan-filter").fill("цех 03")
+        t = card(X).locator(".ch-toggle")
+        t.focus()
+        page.keyboard.press("Enter")
+        page.wait_for_timeout(150)
+        check("производства: карточка раскрывается с клавиатуры (Enter), aria-expanded",
+              t.get_attribute("aria-expanded") == "true" and card(X).locator(".chan-body").is_visible())
+        card(X).locator(".ch-cad").fill("21")
+        card(X).locator(".ch-moq").fill("50")
+        page.locator("#chan-filter").fill("цех 07")
+        card(Y).locator(".ch-toggle").click()
+        card(Y).locator(".ch-cad").fill("14")
+        page.locator("#chan-filter-clear").click()
+        card(X).locator(".ch-toggle").focus()
+        page.keyboard.press("Space")
+        page.locator("#chan-filter").fill("ателье")
+        page.wait_for_timeout(150)
+        sp = card(prods[SPECIAL_P])
+        check("производства: имя со спецсимволами найдено и показано текстом, не разметкой",
+              sp.is_visible() and SPECIAL_P in (sp.locator("b").first.text_content() or "")
+              and visible_count(page, "#chan-box .chan") == 1)
+        page.locator("#chan-filter").fill("zzz")
+        page.wait_for_timeout(150)
+        check("производства: нет совпадений — сказано", "ничего нет" in (page.locator("#chan-box").text_content() or ""))
+        page.locator("#chan-filter-clear").click()
+        card(X).locator(".ch-toggle").click()
+        vals = (card(X).locator(".ch-cad").input_value(), card(X).locator(".ch-moq").input_value(),
+                card(Y).locator(".ch-cad").input_value())
+        check("производства: правки двух карточек пережили поиск, свёртку и раскрытие",
+              vals == ("21", "50", "14"), str(vals))
+        check("производства: поиск, свёртка, «показать ещё» — ни одного запроса", not requests_since(log, n0),
+              str(requests_since(log, n0))[:160])
+        card(X).locator(".ch-save").click()
+        page.wait_for_timeout(1500)
+        saves = [(p, b) for p, b in log["posts"] if p.endswith("/setup")]
+        srv = {p["id"]: p for p in cl.get("/api/productions").json()["productions"]}
+        check("производства: «Сохранить» отправляет ровно эту карточку и её значения, сервер их хранит",
+              len(saves) == 1 and saves[0][0] == f"api/productions/{X}/setup"
+              and saves[0][1].get("cadence_days") == 21 and saves[0][1].get("moq_units") == 50
+              and srv[X].get("cadence_days") == 21 and srv[X].get("moq_units") == 50
+              and srv[Y].get("cadence_days") != 14,
+              f"saves={[s[0] for s in saves]} X={srv[X].get('cadence_days')}/{srv[X].get('moq_units')}")
+        y_after = card(Y).locator(".ch-cad").input_value()
+        print(f"  NOTE производства: после успешного сохранения X карточки пересобраны (как и до пакета); "
+              f"несохранённое значение Y после этого: {y_after!r}")
+        # Неуспешное сохранение (ответ подменён — фикстура) не называется успехом.
+        page.route(f"**/api/productions/{Y}/setup",
+                   lambda route: route.fulfill(status=500, content_type="application/json",
+                                               body=json.dumps({"detail": "Синтетический сбой"})))
+        card(Y).locator(".ch-toggle").click() if card(Y).locator(".ch-toggle").get_attribute("aria-expanded") != "true" else None
+        card(Y).locator(".ch-save").click()
+        page.wait_for_timeout(1200)
+        toasts = page.evaluate("() => Array.from(document.querySelectorAll('#toast-root *')).map(e => e.textContent).join(' | ')")
+        check("производства: сбой сохранения показан ошибкой, не «сохранён»",
+              "Синтетический сбой" in toasts and f"«Цех 07» сохранён" not in toasts, toasts[:160])
+        page.unroute(f"**/api/productions/{Y}/setup")
+
+        # ── Распределение по поставщику ──
+        page.select_option("#assign-source", "supplier")
+        page.wait_for_timeout(200)
+        n0 = mark(log)
+        astatus = txt(page, "#assign-status")
+        check(f"распределение: короткий список 15 из {len(sup_values)}, итог назван",
+              visible_count(page, "#assign-box .assign-pick") == 15
+              and f"Значений: {len(sup_values)}" in astatus, astatus[:120])
+        page.locator("#assign-filter").fill("ёлка")
+        page.wait_for_timeout(150)
+        picks = page.locator("#assign-box .assign-pick")
+        check("распределение: поиск находит последнее значение со спецсимволами (ё/е, <, &)",
+              picks.count() == 1 and picks.first.get_attribute("data-v") == SPECIAL_S
+              and SPECIAL_S in (page.locator("#assign-box td").first.text_content() or ""))
+        picks.first.select_option(str(X))
+        page.locator("#assign-filter").fill("поставщик 01")
+        page.wait_for_timeout(150)
+        page.locator("#assign-box .assign-pick").first.select_option(str(Y))
+        page.locator("#assign-filter").fill("zzz")
+        page.wait_for_timeout(150)
+        no_a = page.locator("#assign-box").text_content() or ""
+        page.locator("#assign-filter-clear").click()
+        page.locator("#assign-box [data-all='assign']").click()
+        page.wait_for_timeout(150)
+        held = page.evaluate("() => Object.fromEntries(Array.from(document.querySelectorAll('#assign-box .assign-pick'))"
+                             ".filter(s => s.value).map(s => [s.dataset.v, s.value]))")
+        check("распределение: выбор в скрытых поиском строках сохранился, «нет совпадений» сказано",
+              held == {SPECIAL_S: str(X), "Поставщик 01": str(Y)} and "ничего нет" in no_a
+              and visible_count(page, "#assign-box .assign-pick") == len(sup_values), str(held))
+        check("распределение: поиск и «показать все» — ни одного запроса", not requests_since(log, n0),
+              str(requests_since(log, n0))[:160])
+        page.locator("#assign-filter").fill("поставщик 02")
+        page.locator("#btn-save-assign").click()
+        page.wait_for_timeout(1500)
+        rules = [b for p, b in log["posts"] if p == "api/productions/assign-rule"]
+        cur = (cl.get("/api/productions/assign-sources").json().get("current") or {})
+        check("распределение: «Сохранить» при активном поиске отправляет всю карту, сервер её хранит",
+              rules and rules[-1] == {"assign_source": "supplier",
+                                      "assign_map": {SPECIAL_S: X, "Поставщик 01": Y}}
+              and cur.get("assign_map") == {SPECIAL_S: X, "Поставщик 01": Y},
+              f"{rules[-1:]} {cur.get('assign_map')}")
+        check("настройки: ни одного запроса наружу и ошибок страницы", not log["outside"] and not log["errors"],
+              str(log["outside"] + log["errors"])[:200])
+    except Exception as exc:  # noqa: BLE001
+        check("настройки: сценарий владельца выполнился без исключений", False, f"{type(exc).__name__}: {exc}"[:200])
+    finally:
+        ctx.close()
+
+    # ── 390: блоки помещаются, раскрытая карточка доступна касанием ──
+    ctx, page, log = page_for(cookies, width=MOBILE_WIDTH)
+    try:
+        page.locator("#chan-box .ch-toggle").first.tap()
+        page.wait_for_timeout(200)
+        widths = page.evaluate("() => ['excl-tools','chan-tools','assign-tools'].map(id => {"
+                               "const e = document.getElementById(id); return e.hidden ? null : e.getBoundingClientRect().right; })")
+        check("настройки [390]: поиск в списках не шире окна, карточка раскрывается касанием",
+              all(w is None or w <= MOBILE_WIDTH + 1 for w in widths)
+              and visible_count(page, "#chan-box .chan-body") == 1, str(widths))
+    except Exception as exc:  # noqa: BLE001
+        check("настройки [390]: сценарий выполнился без исключений", False, f"{type(exc).__name__}: {exc}"[:200])
+    finally:
+        ctx.close()
+
+    # ── Сотрудник (не владелец): смотреть и искать можно, менять нельзя ──
+    import bcrypt
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.execute("INSERT INTO users (email, pw_hash, name, created_at) VALUES (?, ?, ?, datetime('now'))",
+                          ("settings-member@test.io", bcrypt.hashpw(b"secret123", bcrypt.gensalt()).decode(), "Сотрудник"))
+        con.execute("INSERT INTO memberships (user_id, org_id, role) VALUES (?, ?, 'member')", (cur.lastrowid, org_id))
+    mcl = httpx.Client(headers={"X-Oborot-CSRF": "1"}, base_url=base, timeout=60.0)
+    mcl.post("/login", data={"email": "settings-member@test.io", "password": "secret123"})
+    mcl.post("/api/hints/seen", json={"page": "settings"})
+    mcookies = [{"name": k, "value": v, "domain": "127.0.0.1", "path": "/"} for k, v in mcl.cookies.items()]
+    ctx, page, log = page_for(mcookies)
+    try:
+        page.locator("#chan-filter").fill("цех 03")
+        page.locator(f'#chan-box .chan[data-p="{X}"] .ch-toggle').click()
+        body = page.locator(f'#chan-box .chan[data-p="{X}"] .chan-body')
+        check("сотрудник: поиск и раскрытие работают, поля недоступны, кнопок сохранения нет",
+              body.is_visible() and body.locator(".ch-cad").is_disabled()
+              and page.locator("#chan-box .ch-save").count() == 0
+              and "только владелец" in (page.locator("#chan-box").text_content() or ""))
+        check("сотрудник: ни одного запроса записи", not log["posts"] or all("hints" in p for p, _ in log["posts"]),
+              str(log["posts"])[:120])
+    except Exception as exc:  # noqa: BLE001
+        check("сотрудник: сценарий выполнился без исключений", False, f"{type(exc).__name__}: {exc}"[:200])
+    finally:
+        ctx.close()
+        mcl.close()
+
+    # ── Пусто и ошибка ──
+    ecl = httpx.Client(headers={"X-Oborot-CSRF": "1"}, base_url=base, timeout=60.0)
+    ecl.post("/register", data={"name": "Пусто", "email": "settings-empty@test.io", "password": "secret123",
+                                "org_name": "Бренд-Пустые-Настройки"})
+    ecl.post("/api/hints/seen", json={"page": "settings"})
+    ecookies = [{"name": k, "value": v, "domain": "127.0.0.1", "path": "/"} for k, v in ecl.cookies.items()]
+    ctx, page, log = page_for(ecookies)
+    try:
+        check("пусто: «Ничего не исключено», поиск среди исключённых не показан",
+              "Ничего не исключено" in (page.locator("#excl-box").text_content() or "")
+              and not page.locator("#excl-tools").is_visible())
+    finally:
+        ctx.close()
+    ctx = browser.new_context(viewport={"width": 1440, "height": 900}, locale="ru-RU")
+    ctx.add_cookies(ecookies)
+    page = ctx.new_page()
+    try:
+        page.route("**/api/exclusions", lambda route: route.fulfill(status=500, body="{}"))
+        page.goto(f"{base}/settings")
+        page.wait_for_function("() => !document.querySelector('#excl-box .loading-stub')", timeout=45000)
+        check("ошибка загрузки исключённых: сказано, поиск не показан",
+              "Не удалось загрузить" in (page.locator("#excl-box").text_content() or "")
+              and not page.locator("#excl-tools").is_visible())
+    except Exception as exc:  # noqa: BLE001
+        check("ошибка загрузки: сценарий выполнился без исключений", False, f"{type(exc).__name__}: {exc}"[:200])
+    finally:
+        ctx.close()
+        ecl.close()
+    cl.close()
 
 
 
