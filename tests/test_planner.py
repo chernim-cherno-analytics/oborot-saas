@@ -357,20 +357,82 @@ def main() -> int:
     share_ctx = dict(mk_ctx(share_snap), pack_multiple=6)
     share_plan = op.plan_order(share_snap, mk_brief(budget=1000, max_share_pct=25),
                                share_ctx, ONE_STAGE)
-    check("A03 воспроизведено округление выше лимита: 30 вместо максимум 25",
-          share_plan["items"][0]["qty"] == 30)
-    check("A03 автоматический перерасход доли запрещает создание",
-          not share_plan["can_create"]
-          and "share_limit" in [s["code"] for s in share_plan["stop"]])
+    # NIGHT-PLANNER-PACK-BUDGET (14.11.2026): распределитель больше не
+    # округляет короб выше лимита доли. Раньше здесь было 30 при максимуме 25
+    # и стоп `share_limit` на готовом плане; теперь ближайший вниз полный
+    # короб 24, и план можно создавать.
+    check("A03 короб округляется вниз до лимита доли: 24 при максимуме 25",
+          share_plan["items"][0]["qty"] == 24, str(share_plan["items"][0]["qty"]))
+    check("A03 план в пределах лимита создаётся без стопа",
+          share_plan["can_create"]
+          and "share_limit" not in [s["code"] for s in share_plan["stop"]],
+          str(share_plan["stop"]))
+    # Сторож `share_limit` остаётся: план, сохранённый ДО исправления, несёт
+    # рекомендацию 30. Воспроизводим его строку и проверяем прежние правила.
+    legacy_plan = copy.deepcopy(share_plan)
+    legacy_plan["items"][0]["qty"] = 30
+    legacy_plan["items"][0]["qty_recommended"] = 30
     for label, edits, allowed in (
         ("посторонняя правка", {"неизвестная позиция": 0}, False),
         ("то же количество", {"A03": 30}, False),
         ("исправлено до 24", {"A03": 24}, True),
         ("явное ручное решение 36", {"A03": 36}, True),
     ):
-        edited = copy.deepcopy(share_plan)
+        edited = copy.deepcopy(legacy_plan)
         _apply_overrides(edited, edits, share_snap)
         check(f"A03 {label}", edited["can_create"] == allowed, str(edited["stop"]))
+    one_box = op.plan_order(share_snap, mk_brief(budget=1000, max_share_pct=5),
+                            share_ctx, ONE_STAGE)
+    check("A03 короб дороже лимита: позиция не заказывается и цена короба названа",
+          not one_box["items"]
+          and one_box["not_included"][0].get("moq_cost") == 60,
+          str(one_box["not_included"][:1]))
+    moq_box = op.plan_order(share_snap, mk_brief(budget=110, max_share_pct=100,
+                                                  moq_units=10), share_ctx, ONE_STAGE)
+    check("A03 партия 10 при коробе 6 стоит 12 штук: не влезает в бюджет 110",
+          not moq_box["items"] and moq_box["can_create"] is False
+          and "over_budget" not in [s["code"] for s in moq_box["stop"]],
+          str([(i["base_name"], i["qty"]) for i in moq_box["items"]]) + str(moq_box["stop"]))
+    # Инвариант распределителя (NIGHT-PLANNER-PACK-BUDGET, 14.11.2026):
+    # на случайных условиях, включая кратность короба и минимальную партию,
+    # автоматический план не выходит ни за бюджет, ни за лимит доли на
+    # позицию. До исправления фазз на 20 000 планах давал 374 плана сверх
+    # бюджета (до +280 000 ₽) и 10 534 строки сверх лимита доли.
+    import random as _inv_random
+    _rng = _inv_random.Random(20261114)
+    inv_budget = inv_share = 0
+    for _ in range(3000):
+        _pack = _rng.choice([0, 1, 5, 6, 10, 12, 50])
+        _stages = op.normalize_stages(
+            [{"name": "a", "days": 30, "prepay_pct": _rng.choice([30, 50, 100])}], 45)
+        _cands = [{"base_name": f"p{i}", "category": "c",
+                   "cost_price": _rng.choice([300, 900, 2500, 4029, 8000]),
+                   "need": _rng.randint(3, 200),
+                   "rate_cover": _rng.choice([0.05, 0.2, 0.5, 1, 3]),
+                   "gap_days": _rng.choice([0, 0, 5]),
+                   "must_have": _rng.random() < 0.1, "turnover": _rng.random()}
+                  for i in range(_rng.randint(1, 25))]
+        _brief = {"moq_units": _rng.choice([0, 0, 10, 30, 50, 60, 100]),
+                  "width_days": _rng.choice([0, 14, 30]),
+                  "budget": _rng.choice([100000, 300000, 700000, 1500000]),
+                  "reserve_new_pct": 0, "max_share_pct": _rng.choice([10, 20, 30, 50, 100]),
+                  "budget_scope": _rng.choice(["full", "now"]), "new_items": []}
+        _res = op._allocate(_cands, _brief, {"pack_multiple": _pack}, _stages)
+        _unit = lambda c: max(1.0, c["cost_price"] * _res["pay_share"])
+        _spent = sum(_res["alloc"].get(c["base_name"], 0) * _unit(c) for c in _cands)
+        if _spent > _res["money"] + 1:
+            inv_budget += 1
+        for c in _cands:
+            q = _res["alloc"].get(c["base_name"], 0)
+            if (q and not c["must_have"] and _res["cap_per_item"] > 0
+                    and q * _unit(c) > _res["cap_per_item"] + 1):
+                inv_share += 1
+            if q and _pack > 1 and q % _pack:
+                inv_share += 1  # кратность короба тоже обещание
+    check("инвариант: 3000 случайных планов не выходят за бюджет", inv_budget == 0,
+          str(inv_budget))
+    check("инвариант: автоматические строки не выходят за лимит доли и кратны коробу",
+          inv_share == 0, str(inv_share))
     must_plan = op.plan_order(share_snap, mk_brief(
         budget=1000, max_share_pct=25, must_have=["A03"]), share_ctx, ONE_STAGE)
     check("A03 явное must-have сохраняет исключение лимита доли", must_plan["can_create"])
@@ -1402,9 +1464,20 @@ def api_checks() -> None:
         share_saved = c.post("/api/order-plan", json={
             "production_id": lab["id"], "eta_date": eta, "budget": 300000,
             "budget_scope": "full", "max_share_pct": 1}).json()
-        check("A03 сохранённый план с нарушением доли запрещён",
-              "share_limit" in [s["code"] for s in share_saved["plan"]["stop"]]
-              and not share_saved["plan"]["can_create"])
+        check("A03 сохранённый план при лимите доли 1% этот лимит соблюдает",
+              "share_limit" not in [s["code"] for s in share_saved["plan"]["stop"]]
+              and all(i["qty"] <= (i.get("share_limit_qty") or i["qty"])
+                      for i in share_saved["plan"]["items"]),
+              str([(i["qty"], i.get("share_limit_qty")) for i in share_saved["plan"]["items"]][:5]))
+        import json as _gate_json
+        # План, сохранённый до исправления, может нести нарушение доли.
+        # Воспроизводим такую запись в базе: применить её force не должен.
+        legacy_result = _gate_json.loads(_sql(
+            "SELECT result_json FROM order_plans WHERE id=?", share_saved["id"])[0][0])
+        legacy_result["can_create"] = False
+        legacy_result["stop"] = [{"code": "share_limit", "text": "legacy"}]
+        _sql("UPDATE order_plans SET result_json=? WHERE id=?",
+             _gate_json.dumps(legacy_result), share_saved["id"])
         count_share = _sql("SELECT COUNT(*) FROM production_orders")[0][0]
         share_denied = c.post(f"/api/order-plan/{share_saved['id']}/apply",
                               json={"force": True, "confirm_partial": True})

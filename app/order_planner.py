@@ -827,8 +827,25 @@ def _allocate(cands: list[dict], brief: dict, ctx: dict, stages: list[dict]) -> 
         # поэтому цель округляем ВВЕРХ до кратного и деньги считаем уже по ней.
         # Округлять постфактум нельзя — заказ вылезал бы за бюджет после того,
         # как план показан.
+        #
+        # Лимит доли — тоже обещание (A03, TECH_DEBT): округление вверх не
+        # имеет права его перешагнуть. Раньше здесь округлялось вверх всегда,
+        # а перерасход ловил только стоп `share_limit` уже на готовом плане:
+        # человек получал заблокированный план и правил количество руками.
+        # Теперь, если короб вверх не влезает в лимит, берём ближайший вниз
+        # полный короб, а когда не влезает даже один, позиция не заказывается
+        # и в плане названа цена короба (как у минимальной партии дороже
+        # лимита). Стоп `share_limit` остаётся сторожем для ручных правок.
         if pack > 1:
             target = -(-target // pack) * pack
+            if limit is not None and limit > 0 and target > by_cap:
+                target = (by_cap // pack) * pack
+                if target <= 0:
+                    if cap is not None and cap < 0 and cap_per_item > 0:
+                        moq_over_cap[base] = int(round(pack * unit))
+                    return
+            if target <= have:
+                return
         rest = money - spent
         afford = int(math.floor(rest / unit))
         add = min(target - have, afford)
@@ -857,12 +874,18 @@ def _allocate(cands: list[dict], brief: dict, ctx: dict, stages: list[dict]) -> 
             # лимите 30%). Проверяем ДО денег: иначе дорогая партия молча
             # уходила в «не по карману» и человек не понимал, что упёрся
             # в собственный лимит, а не в бюджет.
-            if cap_per_item > 0 and moq * unit > cap_per_item + 1:
-                moq_over_cap[base] = int(round(moq * unit))
+            #
+            # Кратность применяется к партии ДО обеих проверок (A03): партию
+            # 10 при коробе 6 производство отгрузит как 12, и платить за 12.
+            # Раньше лимит и деньги проверялись по 10, а в план шли 12, и план
+            # выходил за бюджет или за лимит доли.
+            moq_qty = -(-moq // pack) * pack if pack > 1 else moq
+            if cap_per_item > 0 and moq_qty * unit > cap_per_item + 1:
+                moq_over_cap[base] = int(round(moq_qty * unit))
                 return
-            if (moq - have) * unit > rest:
+            if (moq_qty - have) * unit > rest:
                 return  # партия не по карману
-            qty = -(-moq // pack) * pack if pack > 1 else moq
+            qty = moq_qty
             reasons.setdefault(base, []).append("moq")
         spent += (qty - have) * unit
         alloc[base] = qty
