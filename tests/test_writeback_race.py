@@ -266,7 +266,23 @@ def make_order(c: httpx.Client, name: str) -> tuple:
                                         "items": [item], "allow_duplicate": True})
         assert r.status_code == 200, (name, r.status_code, r.text[:200])
         return int(r.json()["id"]), item
-    raise RuntimeError("нет позиции с рекомендацией для тестового заказа")
+    # D-65 (14.11.2026): отправленные заказы закрывают потребность честно, и
+    # к концу набора рекомендаций может не остаться. Тестовому заказу нужна
+    # любая позиция каталога: 2 шт в первый размер.
+    stock_items = (c.get("/api/active-stock").json() or {}).get("items") or []
+    for it in list(items) + list(stock_items):
+        sz = it.get("sizes") or {}
+        grid = list(sz.keys()) if isinstance(sz, dict) else [x.get("size") for x in sz if isinstance(x, dict)]
+        grid = [g for g in grid if g is not None]
+        if not grid:
+            continue
+        item = {"base_name": it["base_name"], "qty": 2,
+                "sizes": {grid[0]: 2}, "cost": it.get("cost_price") or 0}
+        r = c.post("/api/orders", json={"name": name, "eta_date": None,
+                                        "items": [item], "allow_duplicate": True})
+        assert r.status_code == 200, (name, r.status_code, r.text[:200])
+        return int(r.json()["id"]), item
+    raise RuntimeError("нет позиции для тестового заказа")
 
 
 def make_two_distinct_orders(c: httpx.Client, name1: str, name2: str) -> tuple:
