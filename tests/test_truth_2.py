@@ -88,6 +88,13 @@ with TestClient(app, headers={"X-Oborot-CSRF": "1"}) as c:
     by = {p["base_name"]: p for p in prods}
     check("в списке позиций есть рекомендация «Заказа»",
           base in by and by[base].get("need") == row.get("need"), f"{by.get(base)} need={row.get('need')}")
+    # Ревью Codex #93: рекомендация с партией канала, как на «Заказе».
+    c.post(f"/api/productions/{pid}", json={"name": "Ткань и пошив", "moq": 300, "pack_multiple": 12})
+    rep2 = {i["base_name"]: i for i in c.get("/api/replenish").json()["items"]}
+    by2 = {p["base_name"]: p for p in c.get("/api/sizes/products").json()["products"]}
+    check("рекомендация в «Заказе позиции» = «Заказ» с партией 300 канала",
+          rep2[base]["need"] >= 300 and by2[base]["need"] == rep2[base]["need"],
+          f"Заказ {rep2[base]['need']} позиция {by2[base].get('need')}")
 
 print("\n3. Партия дороже лимита названа с ценой")
 stages = op.normalize_stages([{"name": "a", "days": 30, "prepay_pct": 100}], 45)

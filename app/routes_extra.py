@@ -328,7 +328,16 @@ def api_sync_progress(ctx: AuthContext = Depends(require_auth_api)):
 def api_sizes_products(ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)):
     """Список позиций для поиска на странице «Размеры»."""
     snap = analytics.get_snapshot(db, ctx.org)
-    return analytics_extra.sizes_products(db, ctx.org.id, snap)
+    data = analytics_extra.sizes_products(db, ctx.org.id, snap)
+    # Рекомендация — ровно то число, что на «Заказе»: с партией и коробом
+    # канала (ревью Codex #93, P1: без правил канала поле предлагало 17 шт
+    # при минимальной партии 300).
+    rep = analytics.build_replenish(snap)
+    apply_production_rules(db, ctx.org.id, rep)
+    need_by = {i["base_name"]: int(i.get("need") or 0) for i in rep.get("items") or []}
+    for p in data.get("products") or []:
+        p["need"] = need_by.get(p["base_name"], 0)
+    return data
 
 
 @router.get("/api/sizes/calc")
