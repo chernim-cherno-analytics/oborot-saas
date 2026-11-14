@@ -74,6 +74,13 @@ with TestClient(app, headers={"X-Oborot-CSRF": "1"}) as c:
           all(sum(v["rec"] for v in i["sizes"].values()) == i["need"] for i in with_sizes))
     item = with_sizes[0]
     recomputed = analytics.size_split(item["sizes"], item["need"])
+    calc = c.get("/api/sizes/calc", params={"product": item["base_name"], "qty": item["need"],
+                                            "period": "12m"}).json()
+    calc_split = {r["size"]: r["order_pure"] for r in calc.get("sizes", [])}
+    want = analytics.size_split({s: dict(v) for s, v in item["sizes"].items()}, item["need"])
+    check("калькулятор «Заказа позиции» (12 мес) делит так же, как «Заказ» (ревью Codex #95)",
+          calc.get("split_matches_order_page") and all(calc_split.get(s, 0) == q for s, q in want.items()),
+          f"{calc_split} {want}")
     check("пересборка сетки по ответу API даёт ту же сетку (после партии не расходится)",
           recomputed == {s: v["rec"] for s, v in item["sizes"].items()},
           f"{recomputed} {item['sizes']}")

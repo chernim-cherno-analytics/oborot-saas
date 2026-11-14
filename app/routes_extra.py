@@ -381,6 +381,13 @@ def api_sizes_calc(
             bucket = common_sizes.setdefault(key, {"stock": 0, "sold365": 0})
             bucket["stock"] += int(rec.get("stock") or 0)
             bucket["sold365"] += float(rec.get("sold365") or 0)
+            # D-68: дни наличия переносятся, иначе калькулятор делил бы по
+            # голым продажам, а «Заказ» и мастер по темпу (ревью Codex #95).
+            # Один размер под двумя написаниями: дни наличия не складываются
+            # (это одни и те же календарные дни), берём наибольшее.
+            if "days365" in rec:
+                bucket["days365"] = max(int(bucket.get("days365") or 0), int(rec.get("days365") or 0))
+                bucket["hist365"] = max(int(bucket.get("hist365") or 0), int(rec.get("hist365") or 0))
         common_split = analytics.size_split(common_sizes, qty) if common_sizes else {}
         if common_split:
             for row in result["sizes"]:
