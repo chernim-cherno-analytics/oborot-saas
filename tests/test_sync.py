@@ -2187,12 +2187,15 @@ def run_scenario() -> int:
           f"status={r.status_code} body={r.text[:140]}")
     r = client.post("/api/replenish-draft",
                     json={"base_name": "Худи «Скетч»", "sizes": {"S": 60, "ZZZ": 4}})
-    check("правка с несуществующим размером принята запросом", r.status_code == 200)
+    # QA 14.11: несуществующий размер теперь отклоняется ДО записи (422), как
+    # и несуществующая позиция: раньше отвечало 200, а GET молча его вычищал.
+    check("правка с несуществующим размером отклонена (422)",
+          r.status_code == 422 and "ZZZ" in r.text, f"status={r.status_code} body={r.text[:140]}")
     drafts = client.get("/api/replenish-draft").json()["drafts"]
     check("черновик по несуществующей позиции в базу не попал",
           "Позиции такой нет" not in drafts, f"got={list(drafts)[:5]}")
-    check("черновик по исчезнувшему размеру убран, живой размер цел",
-          drafts.get("Худи «Скетч»") == {"S": 60}, f"got={drafts}")
+    check("отклонённая правка не тронула сохранённое",
+          drafts.get("Худи «Скетч»") == {"S": 61}, f"got={drafts}")
     r = client.post("/api/replenish-draft", json={"base_name": "Худи «Скетч»", "sizes": {}})
     check("пустой набор размеров = правок нет", r.status_code == 200
           and client.get("/api/replenish-draft").json()["drafts"] == {},

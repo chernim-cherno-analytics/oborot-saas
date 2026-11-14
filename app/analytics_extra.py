@@ -320,7 +320,9 @@ def build_forecast(snap: dict) -> dict:
                 "sellout_days": sellout_days,
                 "sellout_date": (
                     (today + timedelta(days=sellout_days)).isoformat()
-                    if sellout_days is not None
+                    # Дата дальше 100 лет не дата: огромное «Едет» при малом темпе
+                    # раньше роняло страницу OverflowError (QA 14.11, P2).
+                    if sellout_days is not None and sellout_days <= 36500
                     else None
                 ),
             }

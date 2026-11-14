@@ -39,7 +39,7 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import (APIRouter, Body, Depends, File, HTTPException, Query,
+from fastapi import (APIRouter, Body, Depends, File, HTTPException, Path, Query,
                      Request, UploadFile)
 from fastapi.responses import Response
 from sqlalchemy.exc import IntegrityError
@@ -49,6 +49,10 @@ from app import export_xlsx
 from app import supply_planning as sp
 from app.auth import AuthContext, require_auth_api, require_owner_api
 from app.db import get_db
+
+# Граница id как у app.api._id_path: число больше INTEGER SQLite давало 500
+# (OverflowError) вместо 422 (QA 14.11, P2).
+_MAX_ID = 2_147_483_647
 
 router = APIRouter(prefix="/api/supply/planning", tags=["supply-planning"])
 
@@ -163,7 +167,7 @@ def api_planning_catalog(
 @router.get("/events")
 def api_planning_events(
     entity: str = Query(..., max_length=16),
-    id: int = Query(...),
+    id: int = Query(..., ge=1, le=_MAX_ID),
     ctx: AuthContext = Depends(require_auth_api),
     db: Session = Depends(get_db),
 ):
@@ -207,7 +211,7 @@ def api_planning_material_create(
 
 @router.post("/materials/{material_id}/update")
 def api_planning_material_update(
-    material_id: int,
+    material_id: int = Path(ge=1, le=_MAX_ID),
     payload: dict = Body(...),
     ctx: AuthContext = Depends(require_owner_api),
     db: Session = Depends(get_db),
@@ -226,7 +230,7 @@ def api_planning_material_update(
 
 @router.post("/materials/{material_id}/archive")
 def api_planning_material_archive(
-    material_id: int,
+    material_id: int = Path(ge=1, le=_MAX_ID),
     payload: dict = Body(default={}),
     ctx: AuthContext = Depends(require_owner_api),
     db: Session = Depends(get_db),
@@ -251,7 +255,7 @@ def api_planning_material_archive(
 
 @router.post("/materials/{material_id}/restore")
 def api_planning_material_restore(
-    material_id: int,
+    material_id: int = Path(ge=1, le=_MAX_ID),
     payload: dict = Body(default={}),
     ctx: AuthContext = Depends(require_owner_api),
     db: Session = Depends(get_db),
@@ -271,7 +275,7 @@ def api_planning_material_restore(
 
 @router.post("/items/{item_id}/update")
 def api_planning_item_update(
-    item_id: int,
+    item_id: int = Path(ge=1, le=_MAX_ID),
     payload: dict = Body(...),
     ctx: AuthContext = Depends(require_owner_api),
     db: Session = Depends(get_db),
@@ -295,7 +299,7 @@ def api_planning_item_update(
 
 @router.post("/items/{item_id}/archive")
 def api_planning_item_archive(
-    item_id: int,
+    item_id: int = Path(ge=1, le=_MAX_ID),
     payload: dict = Body(default={}),
     ctx: AuthContext = Depends(require_owner_api),
     db: Session = Depends(get_db),
@@ -320,7 +324,7 @@ def api_planning_item_archive(
 
 @router.post("/items/{item_id}/restore")
 def api_planning_item_restore(
-    item_id: int,
+    item_id: int = Path(ge=1, le=_MAX_ID),
     payload: dict = Body(default={}),
     ctx: AuthContext = Depends(require_owner_api),
     db: Session = Depends(get_db),
@@ -412,7 +416,7 @@ def api_planning_batch_create(
 
 @router.post("/batches/{batch_id}/update")
 def api_planning_batch_update(
-    batch_id: int,
+    batch_id: int = Path(ge=1, le=_MAX_ID),
     payload: dict = Body(...),
     ctx: AuthContext = Depends(require_owner_api),
     db: Session = Depends(get_db),
@@ -431,7 +435,7 @@ def api_planning_batch_update(
 
 @router.post("/batches/{batch_id}/archive")
 def api_planning_batch_archive(
-    batch_id: int,
+    batch_id: int = Path(ge=1, le=_MAX_ID),
     payload: dict = Body(default={}),
     ctx: AuthContext = Depends(require_owner_api),
     db: Session = Depends(get_db),
@@ -459,7 +463,7 @@ def api_planning_batch_archive(
 
 @router.post("/batches/{batch_id}/restore")
 def api_planning_batch_restore(
-    batch_id: int,
+    batch_id: int = Path(ge=1, le=_MAX_ID),
     payload: dict = Body(default={}),
     ctx: AuthContext = Depends(require_owner_api),
     db: Session = Depends(get_db),
@@ -523,7 +527,7 @@ def api_planning_assignment_move(
 
 @router.post("/assignments/{assignment_id}/update")
 def api_planning_assignment_update(
-    assignment_id: int,
+    assignment_id: int = Path(ge=1, le=_MAX_ID),
     payload: dict = Body(...),
     ctx: AuthContext = Depends(require_owner_api),
     db: Session = Depends(get_db),
@@ -542,7 +546,7 @@ def api_planning_assignment_update(
 
 @router.post("/assignments/{assignment_id}/delete")
 def api_planning_assignment_delete(
-    assignment_id: int,
+    assignment_id: int = Path(ge=1, le=_MAX_ID),
     payload: dict = Body(default={}),
     ctx: AuthContext = Depends(require_owner_api),
     db: Session = Depends(get_db),
@@ -712,7 +716,7 @@ async def api_planning_sketch_upload(
 
 @router.post("/items/{item_id}/sketch")
 async def api_planning_item_sketch(
-    item_id: int,
+    item_id: int = Path(ge=1, le=_MAX_ID),
     file: UploadFile = File(...),
     thumb: UploadFile | None = File(None),
     ctx: AuthContext = Depends(require_owner_api),
@@ -755,8 +759,8 @@ async def api_planning_item_sketch(
 
 @router.get("/sketches/{sketch_id}")
 def api_planning_sketch_read(
-    sketch_id: int,
     request: Request,
+    sketch_id: int = Path(ge=1, le=_MAX_ID),
     ctx: AuthContext = Depends(require_auth_api),
     db: Session = Depends(get_db),
 ):
@@ -772,8 +776,8 @@ def api_planning_sketch_read(
 
 @router.get("/sketches/{sketch_id}/thumb")
 def api_planning_sketch_thumb(
-    sketch_id: int,
     request: Request,
+    sketch_id: int = Path(ge=1, le=_MAX_ID),
     ctx: AuthContext = Depends(require_auth_api),
     db: Session = Depends(get_db),
 ):

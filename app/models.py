@@ -502,7 +502,9 @@ class Production(Base):
         for st in self.stages:
             if isinstance(st, dict):
                 try:
-                    total += max(0, int(st.get("lead_days") or 0))
+                    # Тот же коридор 0..365 на этап, что у order_planner.normalize_stages:
+                    # старые записи вне коридора не должны давать «Заказу» другой срок.
+                    total += max(0, min(365, int(st.get("lead_days") or 0)))
                 except (TypeError, ValueError):
                     pass
         return total or int(self.lead_time_days or 0)

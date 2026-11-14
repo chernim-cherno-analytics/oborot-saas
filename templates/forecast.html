@@ -322,10 +322,13 @@
     document.getElementById("c-pace").textContent=fmtM(c.pace_rub)+"/день";
     document.getElementById("c-pace-s").textContent="≈ "+fmtM(c.pace_rub*30)+" в месяц при текущем темпе, "
       +(mb.pace_rub||basisStock);
-    document.getElementById("c-until").textContent=c.until_date
+    // Ноль на складе не «хватает надолго» (QA 14.11, пустая организация).
+    var noStock=!(+c.stock_units>0);
+    document.getElementById("c-until").textContent=noStock ? "0 дн" : c.until_date
       ? "до "+new Date(c.until_date).toLocaleDateString("ru-RU",{day:"numeric",month:"long"})
       : "> 6 месяцев";
-    document.getElementById("c-until-s").textContent=c.until_weeks
+    document.getElementById("c-until-s").textContent=noStock ? "стока нет"
+      : c.until_weeks
       ? "90% продаваемого стока распродастся за "+c.until_weeks+" нед"
       : "текущего стока хватает надолго";
     renderPulse(pulse, d.months||[]);
