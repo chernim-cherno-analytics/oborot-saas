@@ -199,6 +199,8 @@ SUITES = [
     ("wizard_labels", "test_wizard_labels.py", False, False),
     # XLSX-TRUTH-1: Excel «Что заказать» не выдаёт неполную сумму за полную.
     ("xlsx_truth", "test_xlsx_truth.py",       False, False),
+    # WIZARD-MOQ-1: пустое поле партии в мастере = партия канала, 0 = без партии.
+    ("wizard_moq", "test_wizard_moq.py",       False, False),
     ("deps",        "test_dependencies.py",    False, False),
 ]
 

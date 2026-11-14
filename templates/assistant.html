@@ -261,8 +261,8 @@
         </div>
         <div>
           <span class="lbl">Мин. партия, шт</span>
-          <input class="binp sm" id="moq" type="number" min="0" max="10000" value="0">
-          <div class="hint" id="moqHint">0 — берётся из настроек производства</div>
+          <input class="binp sm" id="moq" type="number" min="0" max="10000" value="" placeholder="из канала">
+          <div class="hint" id="moqHint">Пусто: берётся из настроек производства</div>
         </div>
         <div>
           <span class="lbl">Резерв на новинки, %</span>
@@ -439,9 +439,14 @@
         : p.staged ? ("Сейчас платится только первый этап — это " + share + "% себестоимости.")
                    : "Один этап: платится весь заказ.") +
       ' <a href="/settings">Изменить условия канала</a>';
+    // WIZARD-MOQ-1 (прогон пользователем 14.11): поле «0» уходило на сервер
+    // явным «партии нет», и план молча нарушал минимальную партию фабрики,
+    // хотя подпись обещала обратное. Теперь пусто = партия канала, 0 = без
+    // партии на этот заказ, и подпись говорит ровно это.
+    document.getElementById("moq").placeholder = p.moq_units ? String(p.moq_units) : "из канала";
     document.getElementById("moqHint").textContent = p.moq_units
-      ? ("0 — берётся минимальная партия производства: " + p.moq_units + " шт")
-      : "0 — минимальные партии берутся из этапов производства";
+      ? ("Пусто: партия производства " + p.moq_units + " шт. 0: без минимальной партии на этот заказ.")
+      : "Пусто: минимальные партии из этапов производства. 0: без партии на этот заказ.";
     document.getElementById("scopeWrap").style.display = p.staged ? "" : "none";
     if(!p.staged){ STATE.scope = "full"; }
     updHints();
@@ -585,7 +590,8 @@
       horizon_days_fixed: STATE.horizon_days_fixed || null,
       strategy: STATE.strategy,
       max_share_pct: parseNum("capPct") || null,
-      moq_units: parseNum("moq"),
+      // Пусто = не задано (сервер возьмёт партию канала), 0 = явно без партии.
+      moq_units: (String(document.getElementById("moq").value).trim() === "") ? null : parseNum("moq"),
       reserve_new_pct: parseNum("reserve"),
       overhead_pct: parseNum("overhead"),
       exclude_categories: STATE.offcats,
@@ -666,7 +672,7 @@
     STATE.must = last.must_have || [];
     document.getElementById("budget").value = fmt(last.budget||200000);
     document.getElementById("capPct").value = last.max_share_pct || 30;
-    document.getElementById("moq").value = last.moq_units || 0;
+    document.getElementById("moq").value = last.moq_explicit ? (last.moq_units || 0) : "";
     document.getElementById("reserve").value = last.reserve_new_pct || 0;
     document.getElementById("overhead").value = last.overhead_pct || 0;
     STATE.newItems = [];
@@ -1675,7 +1681,8 @@
     // заменить прошлый план или канал, и подсказка обязана это назвать
     // (прогон пользователем: в Настройках 60, а мастер молча «раз в месяц»).
     STATE.settingsCadence = st.order_cadence_days || null;
-    document.getElementById("moq").value = st.moq_units || 0;
+    // Пусто: сервер возьмёт партию канала, а без неё общую из Настроек.
+    document.getElementById("moq").value = "";
     document.getElementById("reserve").value = st.reserve_new_pct || 0;
     document.getElementById("overhead").value = st.overhead_pct || 0;
     STATE.production_id = (STATE.prods[0]||{}).id;
