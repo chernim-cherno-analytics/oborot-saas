@@ -129,6 +129,15 @@ with TestClient(app, headers={"X-Oborot-CSRF": "1"}) as c:
     check("после отказов заявка не изменилась",
           sql("SELECT status FROM billing_requests WHERE id=?", req_id)[0][0] == "new")
 
+    # Ревью Codex: мусор в колонке «оплачено до» ORM превращает в None, и инструмент
+    # молча перезаписывал его. Теперь читается сырое значение и операция отказывает.
+    sql("UPDATE orgs SET paid_until='not-a-date' WHERE id=?", other_id)
+    code, out, err = run("paid", "--org", str(other_id), "--until", D(30), "--operator", "t")
+    check("мусор в «оплачено до»: отказ, значение не потеряно",
+          code == 2 and "не дата" in err
+          and sql("SELECT paid_until FROM orgs WHERE id=?", other_id)[0][0] == "not-a-date", err + out)
+    sql("UPDATE orgs SET paid_until=NULL WHERE id=?", other_id)
+
     print("\n3. Инструмент оплаты: счёт, оплата, продление")
     code, out, _ = run("invoiced", "--request", str(req_id), "--operator", "vlad")
     st, inv = sql("SELECT status, invoiced_at FROM billing_requests WHERE id=?", req_id)[0]
@@ -181,6 +190,47 @@ with TestClient(app, headers={"X-Oborot-CSRF": "1"}) as c:
     check("gate-preview отвечает числами", code == 0 and "Если включить" in out, out)
     check("list и gate-preview ничего не пишут",
           snapshot == (sql("SELECT * FROM orgs ORDER BY id"), sql("SELECT * FROM billing_requests ORDER BY id")))
+
+    print("\n6. Один грейс на 30 дней (В3, 14.11.2026)")
+    from app import subscription
+    from app.db import SessionLocal
+
+    def _req(org, status, invoiced_days_ago):
+        sql("INSERT INTO billing_requests (org_id,user_id,plan,period,amount,company,inn,email,phone,"
+            "comment,status,created_at,invoiced_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            org, 1, "brand", "month", 9900, "ООО", "7700000000", "a@b.c", "", "", status,
+            datetime.utcnow(), datetime.utcnow() - timedelta(days=invoiced_days_ago))
+
+    def _grace(org):
+        db = SessionLocal()
+        try:
+            return subscription._grace_until(db, org, date.today())
+        finally:
+            db.close()
+
+    sql("DELETE FROM billing_requests WHERE org_id=?", other_id)
+    _req(other_id, "invoiced", 0)
+    g1 = _grace(other_id)
+    check("первый счёт: грейс 5 дней от счёта", g1 == date.today() + timedelta(days=5), str(g1))
+    sql("DELETE FROM billing_requests WHERE org_id=?", other_id)
+    _req(other_id, "invoiced", 12)
+    _req(other_id, "invoiced", 0)
+    g2 = _grace(other_id)
+    check("неоплаченный счёт 12 дней назад: новый счёт грейс не начинает заново",
+          g2 == date.today() - timedelta(days=7), str(g2))
+    sql("DELETE FROM billing_requests WHERE org_id=?", other_id)
+    _req(other_id, "paid", 25)
+    _req(other_id, "invoiced", 0)
+    g3 = _grace(other_id)
+    check("оплаченный прошлый счёт грейс не расходует",
+          g3 == date.today() + timedelta(days=5), str(g3))
+    sql("DELETE FROM billing_requests WHERE org_id=?", other_id)
+    _req(other_id, "invoiced", 40)
+    _req(other_id, "invoiced", 0)
+    g4 = _grace(other_id)
+    check("счёт старше 30 дней не мешает новому грейсу",
+          g4 == date.today() + timedelta(days=5), str(g4))
+    sql("DELETE FROM billing_requests WHERE org_id=?", other_id)
 
 for suffix in ("", "-wal", "-shm"):
     p = Path(str(DB_PATH) + suffix)
