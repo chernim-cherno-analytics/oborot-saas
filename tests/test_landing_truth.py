@@ -72,6 +72,9 @@ with TestClient(app) as c:
     offer = c2.get("/legal/offer").text
     check("D-71: оферта называет тот же тариф и настройку",
           "19 900" not in offer and not re.search(r"(?<![\d ])4 900", offer) and "24 900" in offer)
+    ph = (Path(__file__).resolve().parents[1] / "templates" / "plans.html").read_text(encoding="utf-8")
+    check("D-71: настройка заказывается галочкой в заявке и уходит явной строкой",
+          'id="req-setup"' in ph and "[Нужна настройка " in ph)
     check("D-71: каждая позиция тарифа на лендинге есть в приложении",
           all(f in html for f in feats), str([f for f in feats if f not in html]))
 

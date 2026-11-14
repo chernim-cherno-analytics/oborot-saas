@@ -147,7 +147,7 @@ document.addEventListener("DOMContentLoaded", function () {
       '<p class="for">Разово, по желанию' + (st.credited ? ": стоимость засчитывается в оплату подписки" : "") + "</p>" +
       '<div class="price">' + money(st.price) + "<span> разово</span></div>" +
       "<ul>" + (st.includes || []).map(function (f) { return "<li>" + esc(f) + "</li>"; }).join("") + "</ul>" +
-      '<div class="hint">Укажите «нужна настройка» в комментарии к заявке на счёт.</div>' +
+      '<div class="hint">Отметьте «Нужна настройка» в заявке на счёт ниже.</div>' +
       "</div>";
   }
 
@@ -253,6 +253,9 @@ document.addEventListener("DOMContentLoaded", function () {
         '<div class="field"><label for="req-phone">Телефон (по желанию)</label>' +
         '<input class="input" type="text" id="req-phone" placeholder="+7 ..." autocomplete="tel"></div>' +
       "</div>" +
+      (data.setup ? ('<label class="hint" style="display:flex;gap:8px;align-items:center;margin:0 0 10px;">' +
+        '<input type="checkbox" id="req-setup"> Нужна настройка вместе с вами: ' + money(data.setup.price) +
+        ' разово, засчитывается в оплату подписки</label>') : "") +
       '<div class="field" style="max-width:620px;"><label for="req-comment">Комментарий (по желанию)</label>' +
       '<input class="input" type="text" id="req-comment" placeholder="Например: счёт нужен до конца месяца"></div>' +
       '<div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">' +
@@ -269,7 +272,11 @@ document.addEventListener("DOMContentLoaded", function () {
         inn: document.getElementById("req-inn").value,
         email: document.getElementById("req-email").value,
         phone: document.getElementById("req-phone").value,
-        comment: document.getElementById("req-comment").value
+        // Настройка (D-71) идёт в заявку явной строкой, чтобы оператор её не
+        // пропустил в свободном комментарии (ревью критика 14.11, P3).
+        comment: ((document.getElementById("req-setup") || {}).checked
+                  ? ("[Нужна настройка " + money(data.setup.price) + "] ") : "") +
+                 document.getElementById("req-comment").value
       }}).then(function (res) {
         data.request = res.request;
         toast("Заявка отправлена — счёт придёт на " + res.request.email, "success");
