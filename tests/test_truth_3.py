@@ -98,6 +98,11 @@ check("«Бюджет» объясняет отличие от мастера и
       "Мастер заказа распределяет те же деньги иначе" in b_html and "− остаток − «едет»" not in b_html)
 check("«Заказ» на телефоне прячет справочные колонки, «Заказать» остаётся на экране",
       "@media (max-width: 480px)" in rep_html and "td:nth-child(7):not([colspan])" in rep_html)
+check("мастер на телефоне: таблица плана без справочных колонок, «Нужно» по D-65",
+      "#planTable th:nth-child(2)" in a_html and 'id="planTable"' in a_html
+      and "− остаток − едет" not in a_html)
+check("«Заказ позиции»: новая позиция стартует с её рекомендации, а не с числа прошлой",
+      'delete document.getElementById("qty").dataset.touched;' in sz_html)
 p_html = (ROOT / "templates" / "plans.html").read_text(encoding="utf-8")
 check("значок «Популярный» только когда тарифов больше одного",
       "p.popular && (data.plans || []).length > 1" in p_html)
