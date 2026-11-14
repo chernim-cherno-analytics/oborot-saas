@@ -296,6 +296,12 @@ def run_catchup_job() -> dict:
 
 # ── Жизненный цикл ───────────────────────────────────────────────────────────
 
+def run_ops_watch_job() -> dict:
+    """Почасовое наблюдение оператора (app.ops_watch). Ошибки глотает сам."""
+    from app import ops_watch
+    return ops_watch.run_once()
+
+
 def start() -> None:
     """Поднимает BackgroundScheduler с ежедневным джобом (идемпотентно)."""
     global _scheduler, _started
@@ -323,9 +329,21 @@ def start() -> None:
         max_instances=1,
         misfire_grace_time=1800,
     )
+    # OPS-WATCH-1: наблюдение оператора (падающие синки клиентов, ошибки
+    # сервера) в служебный канал. В :50, а не вместе с догоном в :30, чтобы
+    # видеть его результат, а не гоняться с ним.
+    _scheduler.add_job(
+        run_ops_watch_job,
+        CronTrigger(minute=50, timezone=MOSCOW_TZ),
+        id="hourly-ops-watch",
+        name="Наблюдение оператора: падающие синки и ошибки сервера",
+        coalesce=True,
+        max_instances=1,
+        misfire_grace_time=1800,
+    )
     _scheduler.start()
     _started = True
-    log.info("планировщик запущен: ежедневно в %02d:00 МСК + почасовой догон", DAILY_HOUR)
+    log.info("планировщик запущен: ежедневно в %02d:00 МСК + почасовой догон + наблюдение оператора", DAILY_HOUR)
 
 
 def shutdown() -> None:

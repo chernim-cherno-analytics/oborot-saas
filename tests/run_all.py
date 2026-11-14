@@ -177,6 +177,9 @@ SUITES = [
     # учения — только в чат сервиса, фиксированный текст, без секретов.
     # Нужен порт mock-Telegram (четвёртое поле), наружу набор не ходит.
     ("ops_alert",   "test_ops_alert.py",       False, True),
+    # OPS-WATCH-1: наблюдение оператора (падающие синки клиентов, ошибки
+    # сервера) в служебный канал; отчёт оператора. Синтетическая база.
+    ("ops_watch",   "test_ops_watch.py",       False, False),
     ("deps",        "test_dependencies.py",    False, False),
 ]
 
