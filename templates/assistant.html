@@ -155,7 +155,9 @@
   .fold[open] summary::before { content: '▾ '; }
   .fold .body { padding: 0 16px 14px; }
   .loading { text-align: center; padding: 50px; color: rgba(31,31,31,.45); font-size: 13px; }
-  .nirow { display: flex; gap: 8px; margin-bottom: 7px; align-items: center; }
+  .nirow { display: flex; gap: 8px; margin-bottom: 7px; align-items: center; flex-wrap: wrap; }
+  /* Прогон 14.11 (390 px): поле «себес» новинки уходило за край экрана. */
+  @media (max-width: 560px) { .nirow input:first-child { width: 100% !important; } }
   .peak { font-size: 12px; color: #434446; padding: 4px 0; }
   .peak b { color: #1f1f1f; }
   .peak.late { color: #8a0003; }
@@ -272,7 +274,7 @@
         <div>
           <span class="lbl">Макс. на позицию, %</span>
           <input class="binp sm" id="capPct" type="number" min="5" max="100" value="30">
-          <div class="hint">Чтобы один бестселлер не съел весь бюджет</div>
+          <div class="hint">Чтобы один бестселлер не съел весь бюджет. Считается в тех же деньгах, что бюджет: при «деньгах на сейчас» по сегодняшнему платежу</div>
         </div>
         <div>
           <span class="lbl">Мин. партия, шт</span>
@@ -1350,6 +1352,16 @@
       '</div></details></div>';
 
     var openHtml = '<div id="openBanner">' + openBannerHtml() + '</div>';
+    // Прогон 14.11 (P1): при сезонной поправке темпа мастер и «Заказ» дают
+    // разные числа, а объяснение было только во всплывающей подсказке
+    // заголовка. Говорим это строкой над планом. Формула не меняется
+    // (вопрос 2 спецификации «один поток», решение владельца).
+    if((p.coverage||{}).seasonal_rates){
+      openHtml += '<div class="peak" style="margin-bottom:12px">Темп здесь с поправкой на сезон окна, когда партия будет продаваться '+
+        '(тот же период год назад). «Заказ» и «Бюджет» считают без этой поправки, поэтому числа по позициям могут отличаться, '+
+        'и после размещения рекомендации «Заказа» мастер может предложить ещё. Выбрать один способ для всех экранов: '+
+        'вопрос к владельцу в спецификации «один поток».</div>';
+    }
     // Маленький бюджет на широкой стратегии: строки получают меньше цели
     // ширины, и выходит по 1-2 шт на модель, которые цеху не отшить (прогон
     // 14.11: 200 000 ₽, «Баланс», 30 позиций, 75 шт). Говорим это прямо и
