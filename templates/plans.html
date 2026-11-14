@@ -139,6 +139,18 @@ document.addEventListener("DOMContentLoaded", function () {
     }
   }
 
+  // D-71: платная настройка рядом с тарифом, разово и с зачётом.
+  function setupCard(st) {
+    if (!st) return "";
+    return '<div class="pcard">' +
+      "<h3>" + esc(st.title) + "</h3>" +
+      '<p class="for">Разово, по желанию' + (st.credited ? ": стоимость засчитывается в оплату подписки" : "") + "</p>" +
+      '<div class="price">' + money(st.price) + "<span> разово</span></div>" +
+      "<ul>" + (st.includes || []).map(function (f) { return "<li>" + esc(f) + "</li>"; }).join("") + "</ul>" +
+      '<div class="hint">Укажите «нужна настройка» в комментарии к заявке на счёт.</div>' +
+      "</div>";
+  }
+
   function renderCards() {
     var box = document.getElementById("plan-cards");
     var cur = data.current || "trial";
@@ -158,7 +170,7 @@ document.addEventListener("DOMContentLoaded", function () {
           : '<button class="btn' + (p.popular ? " primary" : "") + ' pick-plan" type="button" data-code="' +
             esc(p.code) + '">Выбрать «' + esc(p.name) + "»</button>") +
         "</div>";
-    }).join("");
+    }).join("") + setupCard(data.setup);
     box.querySelectorAll(".pick-plan").forEach(function (b) {
       b.addEventListener("click", function () {
         var sel = document.getElementById("req-plan");
