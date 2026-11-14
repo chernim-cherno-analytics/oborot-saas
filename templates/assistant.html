@@ -67,6 +67,19 @@
 
   .losstag { display: inline-block; margin-left: 6px; padding: 1px 7px; border-radius: 8px;
     background: rgba(221,0,4,.16); color: #a00003; font-size: 9px; font-weight: 700; white-space: nowrap; }
+  /* Прогон 14.11 (390 px): «Заказать» видна только после прокрутки вбок,
+     первая колонка из длинных причин. На телефоне остаются позиция, «Нужно»,
+     «Заказать» и себестоимость; причина строки в две строки текста. */
+  @media (max-width: 560px) {
+    #planTable th:nth-child(2), #planTable td:nth-child(2):not([colspan]),
+    #planTable th:nth-child(3), #planTable td:nth-child(3):not([colspan]),
+    #planTable th:nth-child(4), #planTable td:nth-child(4):not([colspan]),
+    #planTable th:nth-child(5), #planTable td:nth-child(5):not([colspan]),
+    #planTable th:nth-child(9), #planTable td:nth-child(9):not([colspan]),
+    #planTable th:nth-child(10), #planTable td:nth-child(10):not([colspan]) { display: none; }
+    #planTable td:first-child .why { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+    #planTable th, #planTable td:not([colspan]) { padding-left: 6px; padding-right: 6px; }
+  }
   .go-btn { font-size: 12.5px; font-weight: 600; padding: 10px 20px; border-radius: 10px;
     border: 1px solid #1f1f1f; background: #1f1f1f; color: #f3e9e0; cursor: pointer; }
   .go-btn:hover { background: #434446; }
@@ -1220,7 +1233,9 @@
         esc(i.base_name)+'</label><span class="why">'+esc(i.category)+
         (i.moq_cost ? (' · партия стоит '+fmtR(i.moq_full_cost||i.moq_cost)+
           ((i.moq_full_cost && i.moq_full_cost !== i.moq_cost) ? ' (в день размещения '+fmtR(i.moq_cost)+')' : '')+
-          ' — дороже лимита на позицию') : '')+'</span></td>'+
+          ' — дороже лимита на позицию') : '')+
+        (i.moq_skip_days ? (' · минимальная партия разошлась бы за '+fmt(i.moq_skip_days)+' дн: не взята, потому что залежится, а не из-за денег') : '')+
+        '</span></td>'+
         '<td class="nb">'+fmt(i.turnover)+'</td><td class="nb">'+fmt(i.need)+'</td>'+
         '<td class="nb">'+fmtR(i.need_rub)+'</td><td class="nb">'+fmtR(i.lost_margin)+'</td></tr>';
     }).join("");
@@ -1422,7 +1437,7 @@
         '<label style="font-size:12px;cursor:pointer"><input type="checkbox" id="plangrp"> группировать по категориям</label>'+
         '<span class="hint" id="plancount" style="margin:0"></span>'+
       '</div>'+
-      '<div class="table-outer"><table><thead><tr>'+
+      '<div class="table-outer"><table id="planTable"><thead><tr>'+
         '<th class="sortable" data-k="base_name">Позиция</th>'+
         '<th class="sortable nb" data-k="turnover" title="Нетто-выручка ÷ дни, когда позиция была в наличии">Оборач. ₽/день</th>'+
         /* TRUTH-LABELS-1: мастер берёт темп с сезонным индексом окна прихода
@@ -1435,7 +1450,7 @@
           : '<th class="sortable nb" data-k="rate" title="Темп продаж, штук в день — по нему считается «Нужно»">Темп, шт/дн</th>')+
         '<th class="sortable nb" data-k="cs">Остаток</th>'+
         '<th class="sortable nb" data-k="ordered" title="уже заказано и едет к нам">Едет</th>'+
-        '<th class="sortable nb" data-k="need" title="темп × горизонт − остаток − едет">Нужно</th>'+
+        '<th class="sortable nb" data-k="need" title="темп × горизонт − прогнозный остаток к приходу (остаток минус продажи до прихода, плюс «едет», D-65)">Нужно</th>'+
         '<th class="sortable nb" data-k="qty">Заказать</th>'+
         '<th class="sortable nb" data-k="cost_total">Себестоимость</th>'+
         '<th>Размеры</th>'+

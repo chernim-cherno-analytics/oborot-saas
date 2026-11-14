@@ -161,11 +161,16 @@
   .mneg { color: #a00003; font-weight: 700; }
   .mnone { opacity: .4; font-size: 11px; }
   .msub2 { display: block; font-size: 9px; opacity: .55; margin-top: 2px; }
+  /* SEC-2 (D-69): действия только владельца участнику не показываем. */
+  body[data-role="member"] .owner-only, body[data-role="member"] .arch-btn,
+  body[data-role="member"] .unarch-btn, body[data-role="member"] .ord-del,
+  body[data-role="member"] #send-btn { display: none !important; }
+  body[data-role="member"] .ordin, body[data-role="member"] .catsel { pointer-events: none; opacity: .6; }
 </style>
 {% include "_mobile.html" %}
 {% include "_app_shell_head.html" %}
 </head>
-<body>
+<body data-role="{{ role|default('owner') }}">
 {% include "_embed.html" %}
 <div class="gradient-bg"></div>
 {% with nav_primary = true %}{% include "_app_shell.html" %}{% endwith %}

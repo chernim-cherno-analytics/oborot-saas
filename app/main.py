@@ -761,6 +761,9 @@ def _page(request: Request, ctx: auth.AuthContext, template: str, active: str, p
             # BILLING-OPS-1: полоса состояния подписки (_subscription_strip.html).
             "subscription": (_subscription.state_info(org, db) if db is not None else None),
             "active": active,
+            # SEC-2 (D-69): роль для интерфейса. Закрытые владельцу действия
+            # участнику не показываются; сервер всё равно отвечает 403.
+            "role": ctx.role,
             "page_title": page_title,
             "embedded": embedded,
             # Состояние подписки в контекст страницы. Нужно ровно для одного:

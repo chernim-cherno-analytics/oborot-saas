@@ -85,11 +85,16 @@
   .warn { font-size: 12px; color: #a15c00; background: rgba(255,204,0,.15);
     border: 1px solid rgba(255,204,0,.4); border-radius: 10px; padding: 9px 14px; margin-bottom: 14px; }
   .modecol { background: rgba(76,187,23,.10); }
+  /* SEC-2 (D-69): действия только владельца участнику не показываем. */
+  body[data-role="member"] .owner-only, body[data-role="member"] .arch-btn,
+  body[data-role="member"] .unarch-btn, body[data-role="member"] .ord-del,
+  body[data-role="member"] #send-btn { display: none !important; }
+  body[data-role="member"] .ordin, body[data-role="member"] .catsel { pointer-events: none; opacity: .6; }
 </style>
 {% include "_mobile.html" %}
 {% include "_app_shell_head.html" %}
 </head>
-<body>
+<body data-role="{{ role|default('owner') }}">
 {% include "_embed.html" %}
 <div class="gradient-bg"></div>
 {% include "_app_shell.html" %}
@@ -280,6 +285,9 @@
   }
   function pick(base){
     SEL=base; inp.value=base; dd.style.display="none";
+    // Своё число относится к позиции, для которой его вписали: новая позиция
+    // стартует с её рекомендации (критик #103, P3: «рекомендует 120» при поле 13).
+    delete document.getElementById("qty").dataset.touched;
     // новая позиция — дата прихода пересчитывается под срок ЕЁ производства,
     // а не остаётся от предыдущего товара (см. calc(): пустое поле подставит
     // дату по сроку, дальше пользователь может поправить сам)
@@ -290,7 +298,10 @@
     var pr=PRODUCTS.find(function(x){ return x.base_name===base; });
     var qEl=document.getElementById("qty"), nn=document.getElementById("need-note");
     if(pr && typeof pr.need==="number"){
-      if(!qEl.dataset.touched && pr.need>0) qEl.value=pr.need;
+      // Нулевая рекомендация тоже ставится: иначе поле наследовало число
+      // предыдущей позиции (прогон 14.11: «дозаказ не рекомендует» и 19 шт
+      // от Ветровки). Своё число человек вписывает сам.
+      if(!qEl.dataset.touched) qEl.value=pr.need;
       nn.textContent=pr.need>0?("«Заказ» рекомендует "+pr.need+" шт"):"«Заказ» дозаказ не рекомендует";
       nn.style.display="";
     } else { nn.style.display="none"; }
@@ -422,8 +433,8 @@
     var onWay=(d.totals&&d.totals.already_ordered)||0;
     warn.innerHTML=(d.warning?'<div class="warn">'+esc(d.warning)+'</div>':"")+
       (onWay>0?'<div class="warn">По этой позиции уже едет '+fmt(onWay)+' шт (заказы «В производстве», отметки «Заказано» и заказы поставщику в МойСкладе). '+
-        'Калькулятор раскладывает по размерам то количество, которое вы ввели, и эти штуки не вычитает: '+
-        'сколько заказывать с их учётом, показывает страница «Заказ».</div>':"");
+        'Они входят в «остаток к приходу»; раскладку по размерам не меняют, потому что делятся теми же долями темпа. '+
+        'Количество для заказа, учитывающее их, стоит в поле по рекомендации «Заказа».</div>':"");
 
     if(!d.sizes.length){
       document.getElementById("thead").innerHTML="";

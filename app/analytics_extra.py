@@ -773,9 +773,17 @@ def build_sizes_calc(
         rates.append(sold / denom if sold > 0 and denom > 0 else 0.0)
     tot_rate = sum(rates)
 
-    # Прогнозный остаток каждого размера на дату прихода.
+    # Прогнозный остаток каждого размера на дату прихода (D-65, 14.11.2026):
+    # max(0, остаток − темп × дни) + «едет». Партия в пути приходит к дате
+    # прихода; по размерам её делим долями темпа (у ручной отметки «Заказано»
+    # размеров нет), как «Заказ» делит потребность. Раньше «Остаток к приходу»
+    # был без едущих штук (прогон 14.11: «≈ 1 шт» при 54 шт в пути).
+    incoming = max(0.0, float(((snap.get("items") or {}).get(product) or {}).get("ordered") or 0))
+    in_shares = [r / sum(rates) for r in rates] if sum(rates) > 0 else (
+        [1.0 / len(sizes)] * len(sizes) if sizes else [])
     stock_proj = [
-        max(0.0, stock.get(s, 0) - rates[i] * days_to_arrival) for i, s in enumerate(sizes)
+        max(0.0, stock.get(s, 0) - rates[i] * days_to_arrival) + incoming * (in_shares[i] if in_shares else 0)
+        for i, s in enumerate(sizes)
     ]
     tot_stock_proj = sum(stock_proj)
 
@@ -830,11 +838,8 @@ def build_sizes_calc(
             "stock": tot_stock,
             "stock_at_arrival": round(tot_stock_proj),
             "order": qty,
-            # TRUTH-LABELS-1: калькулятор раскладывает введённое количество по
-            # размерам и «Едет» не учитывает (формула не меняется). Но молчать
-            # о том, что по позиции уже едет партия, нельзя: прогон
-            # пользователем ввёл 30 шт поверх 30 шт «в производстве», а
-            # «Заказ» по той же позиции показывал, что заказ не нужен.
+            # Сколько уже едет: с D-65 эти штуки входят в «остаток к приходу»
+            # (stock_at_arrival), здесь число для подписи.
             "already_ordered": int(round(float(
                 ((snap.get("items") or {}).get(product) or {}).get("ordered") or 0))),
         },

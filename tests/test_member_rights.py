@@ -82,6 +82,13 @@ with TestClient(app, headers={"X-Oborot-CSRF": "1"}) as owner, \
     for path in ("/api/turnover", "/api/replenish", "/api/budget", "/api/export/turnover.xlsx"):
         check(f"участник читает {path}", member.get(path).status_code == 200, path)
 
+    print("\n0. Интерфейс знает роль (SEC-2, D-69)")
+    for path in ("/stocks", "/turnover", "/sizes", "/replenish"):
+        h = member.get(path).text
+        check(f"участник: {path} помечен data-role=member и прячет действия владельца",
+              'data-role="member"' in h and 'body[data-role="member"] .ord-del' in h, path)
+        check(f"владелец: {path} помечен data-role=owner", 'data-role="owner"' in owner.get(path).text, path)
+
     print("\n1-3. Действия на всю организацию")
     ordered_before = sql("SELECT qty FROM ordered_qty WHERE org_id=? AND base_name=?", org_id, base)
     cases = [

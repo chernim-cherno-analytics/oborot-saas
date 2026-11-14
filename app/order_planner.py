@@ -1072,8 +1072,15 @@ def plan_order(snap: dict, brief: dict, ctx: dict, stages: list[dict],
         qty = alloc.get(c["base_name"], 0)
         unmet = max(0, c["need"] - qty)
         if qty <= 0:
+            skip_days = res["moq_skipped"].get(c["base_name"])
+            # Партия залежится (MOQ_MAX_COVER_DAYS): строка помечена, чтобы её
+            # не читали как «не хватило денег» (прогон 14.11, P3). Сумма
+            # «упущено» не меняется: исключать такие позиции из неё значит
+            # менять аналитическую величину, это решение владельца (D-35,
+            # ревью Codex #104); вопрос записан в реестре NIGHT-14-11.
             lost_missing += unmet * c["margin"]
             not_included.append({
+                "moq_skip_days": skip_days,
                 "base_name": c["base_name"], "category": c["category"], "cls": c["cls"],
                 "turnover": round(c["turnover"]), "need": c["need"],
                 "cost_price": c["cost_price"], "need_rub": c["need"] * c["cost_price"],
