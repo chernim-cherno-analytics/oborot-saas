@@ -698,6 +698,25 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
             .group_by(Product.base_name, Product.size)
         ).all()
 
+    # D-68 (решение владельца 14.11.2026): дни НАЛИЧИЯ каждого размера за год
+    # (остаток размера >= 1) и число дат истории остатков позиции за год. Доля
+    # размера в заказе считается от темпа в днях наличия, а не от голых
+    # продаж: размер, которого долго не было, иначе получал меньше нужного.
+    size_days_rows = db.execute(
+        select(Product.base_name, Product.size, func.count())
+        .select_from(StockDay)
+        .join(Product, join_products)
+        .where(StockDay.org_id == org.id, StockDay.date >= cutoff365, StockDay.qty >= 1)
+        .group_by(Product.base_name, Product.size)
+    ).all()
+    hist_days_rows = db.execute(
+        select(Product.base_name, func.count(func.distinct(StockDay.date)))
+        .select_from(StockDay)
+        .join(Product, join_products)
+        .where(StockDay.org_id == org.id, StockDay.date >= cutoff365)
+        .group_by(Product.base_name)
+    ).all()
+
     # Нетто-продажи за ГОД, по размерам (nq/nr и «продано» размеров).
     # Денежный слой (выручка, средняя цена, маржа, «без продаж») остаётся
     # годовым, как подписан на страницах: канон D-35 меняет ТОЛЬКО расчёт
@@ -1005,6 +1024,18 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
         item["nq"] += float(nq or 0)
         item["nr"] += float(nr or 0)
         _size_rec(item, size)["sold365"] = float(nq or 0)
+
+    hist365 = {base: int(n or 0) for base, n in hist_days_rows}
+    for base, size, n in size_days_rows:
+        item = items.get(base)
+        if item is None:
+            continue
+        _size_rec(item, size)["days365"] = int(n or 0)
+    for base, item in items.items():
+        h = hist365.get(base, 0)
+        for rec in item["sizes"].values():
+            rec.setdefault("days365", 0)
+            rec["hist365"] = h
 
     for base, size, wh_id, qty in wh_rows:
         item = items.get(base)
@@ -1314,16 +1345,35 @@ def classify(turnover: float, thresholds: dict) -> str:
     return "best"
 
 
+def size_weight(rec: dict) -> float:
+    """Вес размера в заказе (D-68, 14.11.2026): темп в днях наличия за год.
+
+    Продажи размера делятся на дни, когда он был в наличии, как на странице
+    «Заказ позиции» (методика 04.08). Если продажи есть, а дней наличия в
+    истории остатков нет (история остатков короче года), делим на все даты
+    истории позиции. Без сведений о днях (записи старого формата, суммы по
+    нескольким позициям) вес остаётся прежним: продажи за год.
+    """
+    sold = max(0.0, float(rec.get("sold365") or 0))
+    if "days365" not in rec:
+        return sold
+    if sold <= 0:
+        return 0.0
+    denom = int(rec.get("days365") or 0) or int(rec.get("hist365") or 0)
+    return sold / denom if denom > 0 else sold / 365.0
+
+
 def size_split(sizes: dict[str, dict], total: int) -> dict[str, int]:
-    """Разбивка заказа по размерам пропорционально нетто-продажам (largest remainder).
+    """Разбивка заказа по размерам пропорционально темпу размера (largest remainder).
 
     Сетка = union(размеры стока, размеры продаж) — распроданные размеры не выпадают.
-    Если продаж по размерам нет вовсе, делим поровну.
+    Вес размера: см. size_weight (D-68). Если продаж по размерам нет вовсе,
+    делим поровну.
     """
     grid = list(sizes.keys())
     if not grid or total <= 0:
         return {}
-    weights = [max(0.0, float(sizes[s].get("sold365") or 0)) for s in grid]
+    weights = [size_weight(sizes[s]) for s in grid]
     if sum(weights) <= 0:
         weights = [1.0] * len(grid)
     wsum = sum(weights)
@@ -1854,6 +1904,10 @@ def build_replenish(snap: dict) -> dict:
                     s: {
                         "stock": v["stock"],
                         "sold365": round(v["sold365"]),
+                        # D-68: дни наличия размера за год, нужны для
+                        # пересборки сетки после партии (api.apply_production_rules).
+                        "days365": int(v.get("days365") or 0),
+                        "hist365": int(v.get("hist365") or 0),
                         "rec": rec.get(s, 0),
                     }
                     for s, v in sorted(it["sizes"].items(), key=lambda kv: _size_order(kv[0]))
