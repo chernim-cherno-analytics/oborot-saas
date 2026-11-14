@@ -73,6 +73,17 @@ with TestClient(app, headers={"X-Oborot-CSRF": "1"}) as c:
     below = [(i["base_name"], i["need"]) for i in rep if 0 < (i.get("need") or 0) < 30]
     check("ни одной строки «Заказа» ниже партии пошива 30", not below, str(below[:5]))
     check("строки, поднятые до партии, помечены", any(i.get("moq_applied") for i in rep))
+    # Ревью Codex #102: пол партии позиции по её категории, и у позиций без потребности.
+    stages_cat = [dict(stages[0]), dict(stages[1], min_units=0, min_by_category={"Футболки": 100})]
+    c.post(f"/api/productions/{main['id']}/setup", json={"stages": stages_cat})
+    prods = {p["base_name"]: p for p in c.get("/api/sizes/products").json()["products"]}
+    shirts = [p for p in prods.values() if p.get("category") == "Футболки"]
+    others = [p for p in prods.values() if p.get("category") not in ("Футболки", None)]
+    check("«Заказ позиции»: пол 100 только у категории «Футболки», у остальных 0",
+          shirts and others and all(p.get("moq") == 100 for p in shirts)
+          and all(p.get("moq") == 0 for p in others),
+          str([(p["base_name"], p.get("category"), p.get("moq")) for p in (shirts[:2] + others[:2])]))
+    c.post(f"/api/productions/{main['id']}/setup", json={"stages": stages})
     plan = c.post("/api/order-plan/preview", json={"budget": 50_000_000, "strategy": "grow",
                                                    "max_share_pct": 100, "production_id": main["id"]}).json()
     pb = [(i["base_name"], i["qty"]) for i in plan["items"] if 0 < (i.get("qty") or 0) < 30]
