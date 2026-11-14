@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Оборот — что дошить, что уценить, что не повторять. Аналитика для брендов одежды и украшений</title>
-<meta name="description" content="«Оборот» подключается к МойСклад и каждое утро отвечает: что дошить и в каких размерах, что уценить, что не повторять. Аналитика запасов для брендов одежды, украшений, обуви и аксессуаров — от 4 900 ₽/мес, 14 дней бесплатно.">
+<meta name="description" content="«Оборот» подключается к МойСклад и каждое утро отвечает: что дошить и в каких размерах, что уценить, что не повторять. Аналитика запасов для брендов одежды, украшений, обуви и аксессуаров — 9 900 ₽/мес, 14 дней бесплатно.">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Ccircle cx='12' cy='12' r='11' fill='%232563eb'/%3E%3Cpath d='M12 5a7 7 0 1 0 7 7' fill='none' stroke='white' stroke-width='2.4' stroke-linecap='round'/%3E%3Cpath d='M16 2.6l3.4 2.8-4.1 1.8z' fill='white'/%3E%3C/svg%3E">
 <style>
   :root{
@@ -227,6 +227,7 @@
   /* ── Тарифы ─────────────────────────────── */
   .pricing-sec{background:var(--bg)}
   .plans{display:grid;grid-template-columns:repeat(3,1fr);gap:24px;align-items:stretch}
+  .plans.plans-two{grid-template-columns:repeat(2,minmax(0,420px));justify-content:center}
   .plan{background:#fff;border:1px solid var(--line);border-radius:20px;padding:34px 30px;box-shadow:var(--shadow-card);
     display:flex;flex-direction:column;position:relative}
   .plan.hot{border:2px solid var(--blue);box-shadow:0 12px 40px -8px rgba(37,99,235,.28)}
@@ -287,6 +288,7 @@
   }
   @media (max-width:640px){
     .steps,.features,.plans{grid-template-columns:1fr}
+    .plans.plans-two{grid-template-columns:1fr}
     .plan.hot{order:-1}
     h1{font-size:32px}
     .hero-sub{font-size:17px}
@@ -628,7 +630,7 @@
             <td class="num">79 800 ₽ разово</td>
             <td class="num">20–40 000 ₽/мес</td>
             <td>Бесплатно — платите вечерами</td>
-            <td class="ob num">от 4 900 ₽/мес</td>
+            <td class="ob num">9 900 ₽/мес</td>
           </tr>
           <tr>
             <td>Кто считает</td>
@@ -710,51 +712,39 @@
     <div class="sec-head">
       <div class="sec-eyebrow">Тарифы</div>
       <h2>Дешевле одной ошибки в заказе на производство</h2>
-      <p class="sec-sub">Каждый тариф — 14 дней бесплатно, без карты. Оплата за год — минус 20%.</p>
+      <p class="sec-sub">Один тариф: 14 дней бесплатно, без карты. Оплата за год — минус 20%.</p>
     </div>
-    <div class="plans">
-
-      <div class="plan">
-        <h3>Старт</h3>
-        <p class="plan-for">Навести порядок в остатках</p>
-        <div class="price"><b class="num">4 900 ₽</b><span>/мес</span></div>
-        <p class="price-note num">3 920 ₽/мес при оплате за год</p>
-        <ul>
-          <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span>1 организация МойСклад</span></li>
-          <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span>Остатки по складам с историей</span></li>
-          <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span>Оборачиваемость по каждой позиции</span></li>
-          <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span>Что уценить: неликвид и контроль 70/20/10</span></li>
-        </ul>
-        <a class="btn btn-ghost" href="/register">Попробовать бесплатно</a>
-      </div>
+    <div class="plans plans-two">
 
       <div class="plan hot">
-        <div class="plan-badge">Популярный</div>
         <h3>Бренд</h3>
-        <p class="plan-for">Ваш товарный аналитик на полную ставку</p>
+        <p class="plan-for">Производственный дозаказ под бюджет, сроки и размерную сетку</p>
         <div class="price"><b class="num">9 900 ₽</b><span>/мес</span></div>
         <p class="price-note num">7 920 ₽/мес при оплате за год</p>
         <ul>
-          <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span>Всё из тарифа «Старт»</span></li>
+          <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span>1 организация МойСклад</span></li>
           <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span>Что заказать: расчёт с размерными сетками</span></li>
+          <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span>Мастер заказа под бюджет, этапы и минимальные партии</span></li>
           <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span>Сезонность и срок производства в прогнозе</span></li>
-          <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span>Заказ в один клик в МойСклад</span></li>
-          <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span>Telegram-дайджест каждое утро</span></li>
+          <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span>Остатки, оборачиваемость, что уценить</span></li>
+          <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span>Заказ поставщику в МойСклад по вашей кнопке</span></li>
+          <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span>Excel заказа для цеха</span></li>
         </ul>
         <a class="btn btn-primary" href="/register">Попробовать бесплатно</a>
       </div>
 
       <div class="plan">
-        <h3>Про</h3>
-        <p class="plan-for">Для растущих и мультиканальных</p>
-        <div class="price"><b class="num">19 900 ₽</b><span>/мес</span></div>
-        <p class="price-note num">15 920 ₽/мес при оплате за год</p>
+        <h3>Настройка вместе с вами</h3>
+        <p class="plan-for">Разово, по желанию: стоимость засчитывается в оплату подписки</p>
+        <div class="price"><b class="num">24 900 ₽</b><span> разово</span></div>
+        <p class="price-note">Созвон и настройка на ваших данных</p>
         <ul>
-          <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span>Всё из тарифа «Бренд»</span></li>
-          <li class="soon"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span>Маркетплейсы и Shopify<span class="soon-tag">скоро</span></span></li>
-          <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span>Приоритетная поддержка</span></li>
+          <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span>Подключение МойСклада и проверка данных</span></li>
+          <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span>Производства: сроки, этапы, минимальные партии</span></li>
+          <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span>Проверка себестоимости</span></li>
+          <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span>Первый заказ вместе</span></li>
         </ul>
-        <a class="btn btn-ghost" href="/register">Попробовать бесплатно</a>
+        <a class="btn btn-ghost" href="/register">Начать с пробного периода</a>
       </div>
 
     </div>
