@@ -45,6 +45,8 @@ log = logging.getLogger("oborot.subscription")
 # Сколько календарных дней клиент работает после отметки «счёт выставлен».
 # Календарных, а не рабочих: решение владельца, 5 дней (D-24).
 GRACE_DAYS = 5
+# Не больше одного грейса за это число дней (В3, 14.11.2026).
+GRACE_WINDOW_DAYS = 30
 
 GATE_ENV = "OBOROT_SUBSCRIPTION_GATE"
 
@@ -156,6 +158,24 @@ def _grace_until(
             )
             db.commit()
         marked = today
+    # В3 (решение владельца 14.11.2026): один грейс на 30 дней. Новая заявка
+    # на счёт не начинает пять дней заново, если в предыдущие 30 дней уже был
+    # выставлен и НЕ оплачен другой счёт: грейс считается от первого из них.
+    # Оплаченные счета грейс не расходуют, иначе ежемесячный плательщик,
+    # выставивший следующий счёт до конца периода, остался бы без грейса.
+    earlier = db.execute(
+        text(
+            "SELECT invoiced_at FROM billing_requests "
+            "WHERE org_id = :org AND id <> :id AND invoiced_at IS NOT NULL "
+            "AND lower(trim(status)) = 'invoiced'"
+        ),
+        {"org": org_id, "id": row_id},
+    ).fetchall()
+    window_start = marked - timedelta(days=GRACE_WINDOW_DAYS)
+    for (raw,) in earlier:
+        d = _as_date(raw)
+        if d is not None and window_start < d < marked:
+            marked = d
     return marked + timedelta(days=GRACE_DAYS)
 
 

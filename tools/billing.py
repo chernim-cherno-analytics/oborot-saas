@@ -217,12 +217,22 @@ def cmd_invoiced(db, request_id: int, operator: str) -> int:
     return 0
 
 
+def _raw_column(db, org_id: int, column: str):
+    """Значение колонки orgs как есть в базе, до нормализации типов ORM."""
+    from sqlalchemy import text
+
+    assert column in ("paid_until", "trial_ends_at")
+    return db.execute(text(f"SELECT {column} FROM orgs WHERE id = :i"), {"i": org_id}).scalar()
+
+
 def cmd_paid(db, org_id: int, until: str, operator: str, request_id: int | None) -> int:
     from app import subscription
 
     org = _org(db, org_id)
     new = _parse_date(until)
-    raw = getattr(org, "paid_until", None)
+    # Сырое значение колонки, а не атрибут ORM: TolerantDate молча превращает
+    # мусор в None, и отказ ниже никогда бы не сработал (ревью Codex, PR #82).
+    raw = _raw_column(db, org.id, "paid_until")
     current = subscription._as_date(raw)
     if raw not in (None, "") and current is None:
         raise Refused(f"У организации {org.id} в «оплачено до» не дата: «{raw}». "
@@ -256,7 +266,11 @@ def cmd_trial(db, org_id: int, until: str, operator: str) -> int:
 
     org = _org(db, org_id)
     new = _parse_date(until)
-    current = subscription._as_date(org.trial_ends_at)
+    raw = _raw_column(db, org.id, "trial_ends_at")
+    current = subscription._as_date(raw)
+    if raw not in (None, "") and current is None:
+        raise Refused(f"У организации {org.id} в «пробный период до» не дата: «{raw}». "
+                      "Исправьте вручную")
     _check_forward(new, current, subscription._today(), "Пробный период до")
     org.trial_ends_at = datetime.combine(new, datetime.max.time().replace(microsecond=0))
     db.commit()
