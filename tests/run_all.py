@@ -191,6 +191,8 @@ SUITES = [
     ("truth_labels", "test_truth_labels.py",   False, False),
     # LANDING-TRUTH-1: лендинг и тарифы не обещают того, чего нет.
     ("landing", "test_landing_truth.py",       False, False),
+    # ЧЕРНОВИК D-65: «едет» не закрывает продажи до прихода партии.
+    ("incoming", "test_incoming_formula.py",   False, False),
     ("deps",        "test_dependencies.py",    False, False),
 ]
 
