@@ -935,6 +935,7 @@ def order_workbook(org_name: str, order: dict, production_name: str,
     row = 3
     total_qty, total_sum, no_cost = 0, 0.0, []
     no_grid: list[str] = []
+    bad_grid: list[str] = []
     for it in items:
         qty = _units(it.get("qty")) or 0
         try:
@@ -950,8 +951,13 @@ def order_workbook(org_name: str, order: dict, production_name: str,
         if cost <= 0:
             no_cost.append(str(it.get("base_name") or ""))
         # Новинка без размерной сетки: цеху нечего кроить (прогон 14.11, P2).
-        if qty > 0 and not any(_units(by_size.get(s)) for s in sizes):
+        grid_sum = sum(_units(by_size.get(s)) or 0 for s in sizes)
+        if qty > 0 and not grid_sum:
             no_grid.append(f"{it.get('base_name') or ''} ({qty} шт)")
+        elif qty > 0 and grid_sum != qty:
+            # Частичная сетка: сумма по размерам не равна количеству строки,
+            # цех раскроит не то число (реестр NIGHT-14-11).
+            bad_grid.append(f"{it.get('base_name') or ''} (по размерам {grid_sum} из {qty} шт)")
         total_qty += qty
         # Итог считается тем же способом, что карточка заказа и платежи
         # (api._order_totals: round(sum(cost*qty))), без округления по строкам:
@@ -982,6 +988,10 @@ def order_workbook(org_name: str, order: dict, production_name: str,
         info.append(("Без размерной сетки", "; ".join(no_grid[:40])
                      + (f" и ещё {len(no_grid) - 40}" if len(no_grid) > 40 else "")
                      + ": распишите размеры перед кроем"))
+    if bad_grid:
+        info.append(("Сетка не сходится", "; ".join(bad_grid[:40])
+                     + (f" и ещё {len(bad_grid) - 40}" if len(bad_grid) > 40 else "")
+                     + ": сверьте размеры с количеством перед кроем"))
     for k, v in info:
         _cell(ws, row, 1, k, font=_TOTAL_FONT)
         _cell(ws, row, 2, v)

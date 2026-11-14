@@ -211,6 +211,8 @@ SUITES = [
     ("new_items_basis", "test_new_items_basis.py", False, False),
     # D-68: размерная сетка по темпу в днях наличия.
     ("size_presence", "test_size_presence.py", False, False),
+    # Файл для цеха: частичная сетка называется; срок этапов в коридоре.
+    ("grid_mismatch", "test_grid_mismatch.py", False, False),
     ("deps",        "test_dependencies.py",    False, False),
 ]
 
