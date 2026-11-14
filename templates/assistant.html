@@ -1175,7 +1175,7 @@
 
     var overCap = (p.moq_over_cap||[]).length ? ('<div class="fold"><details><summary>'+
       'Партия дороже лимита на позицию ('+p.moq_over_cap.length+')</summary><div class="body">'+
-      '<div class="peak">Минимальная партия этих позиций стоит больше, чем вы разрешили тратить '+
+      '<div class="peak">Минимальная партия или один короб этих позиций стоит больше, чем вы разрешили тратить '+
       'на одну позицию. Поднимите лимит на шаге 2 или закажите их отдельно.</div>'+
       p.moq_over_cap.map(function(m){
         return '<div class="peak">'+esc(m.base_name)+' — партия '+fmtR(m.batch_cost)+
