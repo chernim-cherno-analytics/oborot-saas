@@ -201,6 +201,10 @@ SUITES = [
     ("xlsx_truth", "test_xlsx_truth.py",       False, False),
     # WIZARD-MOQ-1: пустое поле партии в мастере = партия канала, 0 = без партии.
     ("wizard_moq", "test_wizard_moq.py",       False, False),
+    # TRUTH-2: повторный прогон пользователями 14.11, экраны говорят одно.
+    ("truth_2", "test_truth_2.py",             False, False),
+    # D-72, шаг 1: при окне «сезон» «Заказ» и мастер дают одно число.
+    ("one_number", "test_one_number.py",       False, False),
     ("deps",        "test_dependencies.py",    False, False),
 ]
 
