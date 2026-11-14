@@ -101,6 +101,22 @@ def _fresh_bases(db: Session, org_id: int, days: int = FRESH_DAYS) -> set[str]:
     return {base for base, q in rows if (q or 0) > 0}
 
 
+def sold_out_with_demand(it: dict) -> bool:
+    """D-67 (решение владельца 14.11.2026, вариант B): распроданная позиция
+    со спросом до стокаута не «мёртвая».
+
+    Отсев «без продаж за FRESH_DAYS» отсеивал и распроданные бестселлеры: продаж
+    нет, потому что остаток 0. На «Заказе» они при этом «Срочно» (демо: Куртка
+    «Ветровка», 5 126 ₽/день). Признак «был спрос»: годовой темп по дням
+    наличия > 0, то есть позиция была в наличии и продавалась в последний год;
+    давно снятая с продажи сюда не попадает. Темп из одной-двух продаж
+    (low_data) остаётся решением человека.
+    """
+    return (float(it.get("cs") or 0) <= 0
+            and float(it.get("rate_year") or 0) > 0
+            and not it.get("low_data"))
+
+
 def build_budget(
     db: Session,
     org_id: int,
@@ -144,7 +160,7 @@ def build_budget(
         all_categories.add(category)
         if category in exclude_cats:
             continue
-        if it["base_name"] not in fresh:
+        if it["base_name"] not in fresh and not sold_out_with_demand(it):
             excluded_fresh += 1  # нет продаж за FRESH_DAYS — неактуально
             # TRUTH-LABELS-1: имя и остаток, чтобы распроданную позицию было
             # видно (отсев не меняется: политика FRESH за владельцем).

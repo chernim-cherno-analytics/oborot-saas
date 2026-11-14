@@ -575,10 +575,20 @@ def main() -> int:
     check("сезонность в темпах заявляется только когда она посчитана",
           p_full["coverage"]["seasonal_rates"] is True
           and p_part["coverage"]["seasonal_rates"] is False)
-    ctx_clamped = mk_ctx(snap_part)
+    # D-67: распроданная позиция со спросом свежей считается, поэтому для
+    # проверки отсева позиции здесь лежат на складе (остаток 1 шт).
+    snap_part_st = mk_snap([dict(it, cs=1) for it in cov_items], cov_start=cov_days_ago(30))
+    ctx_clamped = mk_ctx(snap_part_st)
     ctx_clamped["fresh"] = {"Топ A"}          # окно свежести сжалось до покрытия
     ctx_clamped["fresh_clamped"] = True
-    p_hidden = op.plan_order(snap_part, mk_brief(budget=100000), ctx_clamped, ONE_STAGE)
+    p_hidden = op.plan_order(snap_part_st, mk_brief(budget=100000), ctx_clamped, ONE_STAGE)
+    ctx_sold = mk_ctx(snap_part)
+    ctx_sold["fresh"] = {"Топ A"}
+    ctx_sold["fresh_clamped"] = True
+    p_sold = op.plan_order(snap_part, mk_brief(budget=100000), ctx_sold, ONE_STAGE)
+    check("D-67: распроданные со спросом не отсеиваются даже сжатым окном",
+          p_sold["review"]["hidden_by_coverage"] == 0 and not p_sold["review"]["stale"],
+          str(p_sold["review"]))
     check("позиции, отсеянные сжатым окном свежести, посчитаны отдельно",
           p_hidden["review"]["hidden_by_coverage"] == 2,
           str(p_hidden["review"]))

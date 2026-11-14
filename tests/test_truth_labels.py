@@ -97,15 +97,24 @@ with TestClient(app, headers={"X-Oborot-CSRF": "1"}) as c:
     body = {"production_id": pid, "eta_date": (_d.today() + _td(days=45)).isoformat(),
             "budget": 3000000, "budget_scope": "full"}
     plan = c.post("/api/order-plan/preview", json=body).json()
-    sold = [r for r in (plan.get("review") or {}).get("stale", []) if r.get("sold_out")]
-    if sold:
-        name = sold[0]["base_name"]
-        plan2 = c.post("/api/order-plan/preview", json={**body, "must_have": [name]}).json()
-        row = next((i for i in plan2.get("items", []) if i["base_name"] == name), None)
-        check("отмеченная распроданная позиция входит в план как решение человека",
-              row is not None and row.get("forced_by_user") is True, str(row)[:200])
-    else:
-        check("в демо есть распроданная отсеянная позиция", False, str(plan.get("review", {}))[:300])
+    # D-67 (решение владельца 14.11.2026, вариант B): распроданная позиция со
+    # спросом до стокаута больше не отсеивается как «без продаж».
+    rep_all = c.get("/api/replenish").json()["items"]
+    soldout = [i for i in rep_all if (i.get("cs") or 0) <= 0 and (i.get("rate_year") or 0) > 0
+               and not i.get("low_data") and (i.get("need") or 0) > 0]
+    stale_names = {r["base_name"] for r in (plan.get("review") or {}).get("stale", [])}
+    plan_names = {i["base_name"] for i in plan.get("items", [])}
+    check("в демо есть распроданные позиции со спросом", bool(soldout), str(len(soldout)))
+    check("D-67: ни одна из них не отсеяна как «без продаж»",
+          not ({i["base_name"] for i in soldout} & stale_names),
+          str(sorted({i["base_name"] for i in soldout} & stale_names)))
+    check("D-67: распроданные со спросом входят в план мастера",
+          {i["base_name"] for i in soldout} <= plan_names,
+          str(sorted({i["base_name"] for i in soldout} - plan_names)))
+    bud = c.get("/api/budget", params={"amount": 3000000, "max_share": 30}).json()
+    bud_ex = {r["base_name"] for r in bud.get("excluded_fresh") or []}
+    check("D-67: «Бюджет» их тоже не отсеивает",
+          not ({i["base_name"] for i in soldout} & bud_ex), str(sorted(bud_ex)[:5]))
 
     print("\n4. Мастер: подписи на странице")
     html = c.get("/assistant").text

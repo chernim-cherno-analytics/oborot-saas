@@ -39,6 +39,12 @@ from app import analytics
 from app.analytics import size_split, window_dis, window_nq
 from app.models import Org, Production
 
+
+def sold_out_with_demand(it: dict) -> bool:
+    """См. analytics_extra.sold_out_with_demand (D-67); импорт ленивый из-за цикла."""
+    from app.analytics_extra import sold_out_with_demand as _f
+    return _f(it)
+
 # ── Константы ────────────────────────────────────────────────────────────────
 
 NEED_MIN = 3            # потребность меньше — не заказываем (как в «Бюджете»)
@@ -558,7 +564,7 @@ def _seasonal_rates(
 
 def collect_context(db: Session, org: Org, snap: dict, brief: dict) -> dict:
     """Всё, что планировщику нужно из БД: сезонные темпы, свежесть, привязка к производству."""
-    from app.analytics_extra import _fresh_bases
+    from app.analytics_extra import _fresh_bases  # noqa: F401
 
     today = date.fromisoformat(snap["today"])
     eta = date.fromisoformat(brief["eta_date"])
@@ -687,9 +693,11 @@ def _candidates(snap: dict, brief: dict, ctx: dict) -> tuple[list[dict], dict]:
         if category in exclude and base not in must:
             skipped["excluded_category"].append(base)
             continue
-        if base not in ctx["fresh"] and base in must:
+        # D-67: распроданная позиция со спросом до стокаута свежей считается.
+        stale = base not in ctx["fresh"] and not sold_out_with_demand(it)
+        if stale and base in must:
             forced = True
-        if base not in ctx["fresh"] and base not in must:
+        if stale and base not in must:
             skipped["stale"].append(base)
             continue
 
