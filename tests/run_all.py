@@ -193,6 +193,8 @@ SUITES = [
     ("landing", "test_landing_truth.py",       False, False),
     # ЧЕРНОВИК D-65: «едет» не закрывает продажи до прихода партии.
     ("incoming", "test_incoming_formula.py",   False, False),
+    # ЧЕРНОВИК D-66: при окне «сезон» сезонность учитывается один раз.
+    ("season_once", "test_season_once.py",     False, False),
     ("deps",        "test_dependencies.py",    False, False),
 ]
 
