@@ -433,6 +433,39 @@ def main() -> int:
           str(inv_budget))
     check("инвариант: автоматические строки не выходят за лимит доли и кратны коробу",
           inv_share == 0, str(inv_share))
+    # Ревью критика 14.11 (P1-1): короб над ВНУТРЕННИМ потолком стартовой
+    # волны, но в пределах лимита доли, это законная стартовая партия.
+    # Ассортимент не схлопывается: 6 моделей по коробу, а не 3 по два.
+    _wave = [{"base_name": f"w{i}", "category": "c", "cost_price": 2500, "need": 40,
+              "rate_cover": 1, "gap_days": 0, "must_have": False, "turnover": 10 - i}
+             for i in range(10)]
+    _wres = op._allocate(_wave, {"moq_units": 0, "width_days": 30, "budget": 100000,
+                                 "reserve_new_pct": 0, "max_share_pct": 30,
+                                 "budget_scope": "full", "new_items": []},
+                         {"pack_multiple": 6}, ONE_STAGE)
+    check("A03 короб над потолком стартовой волны не схлопывает ассортимент",
+          _wres["alloc"] == {f"w{i}": 6 for i in range(6)}, str(_wres["alloc"]))
+    # P1-2: must-have, чья партия проходила лимит до округления до короба,
+    # не выпадает из плана (исключение must-have из лимита доли сохранено).
+    _mh = [{"base_name": "MH", "category": "c", "cost_price": 10, "need": 5,
+            "rate_cover": 1, "gap_days": 0, "must_have": True, "turnover": 1}]
+    _mres = op._allocate(_mh, {"moq_units": 10, "width_days": 0, "budget": 1000,
+                               "reserve_new_pct": 0, "max_share_pct": 11,
+                               "budget_scope": "full", "new_items": []},
+                         {"pack_multiple": 6}, ONE_STAGE)
+    check("A03 must-have с партией и коробом остаётся в плане", _mres["alloc"] == {"MH": 12},
+          str(_mres["alloc"]) + str(_mres["moq_over_cap"]))
+    # P2: цена партии при коробе меньше партии называется полностью.
+    _big = [{"base_name": "B", "category": "c", "cost_price": 1000, "need": 50,
+             "rate_cover": 1, "gap_days": 0, "must_have": False, "turnover": 1}]
+    _bres = op._allocate(_big, {"moq_units": 30, "width_days": 0, "budget": 100000,
+                                "reserve_new_pct": 0, "max_share_pct": 5,
+                                "budget_scope": "full", "new_items": []},
+                         {"pack_multiple": 6}, ONE_STAGE)
+    check("A03 цена партии дороже лимита называется целиком (30 шт, а не короб 6)",
+          _bres["moq_over_cap"].get("B") == 30000, str(_bres["moq_over_cap"]))
+    check("A03 строка 24 из 25 при коробе 6 подписана лимитом доли, а не бюджетом",
+          "capped_share" in share_plan["items"][0]["why"], str(share_plan["items"][0]["why"]))
     must_plan = op.plan_order(share_snap, mk_brief(
         budget=1000, max_share_pct=25, must_have=["A03"]), share_ctx, ONE_STAGE)
     check("A03 явное must-have сохраняет исключение лимита доли", must_plan["can_create"])
@@ -1466,7 +1499,9 @@ def api_checks() -> None:
             "budget_scope": "full", "max_share_pct": 1}).json()
         check("A03 сохранённый план при лимите доли 1% этот лимит соблюдает",
               "share_limit" not in [s["code"] for s in share_saved["plan"]["stop"]]
-              and all(i["qty"] <= (i.get("share_limit_qty") or i["qty"])
+              and share_saved["plan"]["items"]
+              and all(i.get("share_limit_qty") is not None
+                      and i["qty"] <= i["share_limit_qty"]
                       for i in share_saved["plan"]["items"]),
               str([(i["qty"], i.get("share_limit_qty")) for i in share_saved["plan"]["items"]][:5]))
         import json as _gate_json
