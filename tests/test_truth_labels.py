@@ -89,6 +89,8 @@ with TestClient(app, headers={"X-Oborot-CSRF": "1"}) as c:
           f'{before["totals"]["stock_at_arrival"]} -> {after["totals"]["stock_at_arrival"]}')
     check("D-65: раскладка «чистая» (без учёта остатков) не изменилась",
           [s.get("order_pure") for s in before["sizes"]] == [s.get("order_pure") for s in after["sizes"]])
+    check("D-65: раскладка «с учётом остатков» тоже не изменилась (едет делится теми же долями)",
+          [s.get("order_stock") for s in before["sizes"]] == [s.get("order_stock") for s in after["sizes"]])
     page = c.get("/sizes").text
     check("страница говорит про уже едущую партию", "уже едет" in page)
 
