@@ -199,6 +199,8 @@ SUITES = [
     ("wizard_labels", "test_wizard_labels.py", False, False),
     # XLSX-TRUTH-1: Excel «Что заказать» не выдаёт неполную сумму за полную.
     ("xlsx_truth", "test_xlsx_truth.py",       False, False),
+    # D-68: размерная сетка по темпу в днях наличия.
+    ("size_presence", "test_size_presence.py", False, False),
     ("deps",        "test_dependencies.py",    False, False),
 ]
 
