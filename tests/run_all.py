@@ -177,6 +177,8 @@ SUITES = [
     # учения — только в чат сервиса, фиксированный текст, без секретов.
     # Нужен порт mock-Telegram (четвёртое поле), наружу набор не ходит.
     ("ops_alert",   "test_ops_alert.py",       False, True),
+    # BILLING-OPS-1: инструмент оплаты оператора и полоса подписки.
+    ("billing_ops", "test_billing_ops.py",     False, False),
     ("deps",        "test_dependencies.py",    False, False),
 ]
 

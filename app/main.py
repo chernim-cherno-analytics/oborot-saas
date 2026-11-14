@@ -719,7 +719,13 @@ def _page(request: Request, ctx: auth.AuthContext, template: str, active: str, p
                 "source": getattr(org, "source", "saas"),
                 "demo": is_demo,
                 "trial_ends_at": org.trial_ends_at.date().isoformat() if org.trial_ends_at else None,
+                # Триал ещё идёт: «Триал до 13.08» в ноябре вводит в заблуждение
+                # (BILLING-OPS-1). Что делать после, говорит полоса подписки.
+                "trial_active": bool(org.trial_ends_at
+                                     and org.trial_ends_at.date() >= datetime.utcnow().date()),
             },
+            # BILLING-OPS-1: полоса состояния подписки (_subscription_strip.html).
+            "subscription": (_subscription.state_info(org, db) if db is not None else None),
             "active": active,
             "page_title": page_title,
             "embedded": embedded,

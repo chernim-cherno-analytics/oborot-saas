@@ -156,3 +156,14 @@
 
   .app-demo { padding: 7px 14px; }
 }
+
+/* --- Состояние подписки (BILLING-OPS-1), та же разметка, что в base.html --- */
+.sub-strip {
+  position: relative; z-index: 150;
+  background: #eef3fb; border-bottom: 1px solid #cfdcf0; color: #1f3a63;
+  padding: 7px 28px; font-size: 12.5px; line-height: 1.45;
+}
+.sub-strip a { color: inherit; font-weight: 600; text-decoration: underline; margin-left: 6px; }
+.sub-strip.sub-blocked { background: #fdecec; border-bottom-color: #f2c4c4; color: #7a1f1f; }
+.sub-strip strong { font-weight: 700; }
+@media (max-width: 720px) { .sub-strip { padding: 7px 14px; } }
