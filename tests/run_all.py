@@ -177,7 +177,7 @@ SUITES = [
     # учения — только в чат сервиса, фиксированный текст, без секретов.
     # Нужен порт mock-Telegram (четвёртое поле), наружу набор не ходит.
     ("ops_alert",   "test_ops_alert.py",       False, True),
-    # ЧЕРНОВИК D-66: при окне «сезон» сезонность учитывается один раз.
+    # D-66: при окне «сезон» сезонность учитывается один раз.
     ("season_once", "test_season_once.py",     False, False),
     ("deps",        "test_dependencies.py",    False, False),
 ]
