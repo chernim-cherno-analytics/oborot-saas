@@ -118,8 +118,29 @@ check("Норд не заказан и стоит в «партия дороже
 
 print("\n4, 5, 7. Шаблоны и Excel")
 html = (ROOT / "templates" / "assistant.html").read_text(encoding="utf-8")
-check("мастер: после создания заказа его платежи не прибавляются второй раз",
-      "if(STATE.createdOrder){ payments = []; }" in html and "уже в открытых" in html)
+# Ревью Codex #97: исполняем саму функцию выбора платежей (node), а не ищем строку.
+import json as _json  # noqa: E402
+import re as _re  # noqa: E402
+import subprocess as _sp  # noqa: E402
+fn = _re.search(r"// @@cashPayments.*?(function cashPayments\(.*?)\n  // @@end", html, _re.S)
+cases = [
+    ("обычный план до создания", {"payments": [{"amount": 1000}], "cost_total": 1000}, None, 1000, False),
+    ("после создания: платежи не повторяются", {"payments": [{"amount": 1000}], "cost_total": 1000}, 42, 1000, False),
+    ("с новинками до создания: платежи заказа", {"payments": [{"amount": 900}], "cost_total": 900,
+     "new_items": [{"name": "Н"}], "order_payments": [{"amount": 1000}]}, None, 900, False),
+    ("с новинками после создания: тоже не повторяются", {"payments": [{"amount": 900}], "cost_total": 900,
+     "new_items": [{"name": "Н"}], "order_payments": [{"amount": 1000}]}, 42, 900, True),
+]
+js = (fn.group(1) if fn else "function cashPayments(){return null}") + "\nconst cases=" + _json.dumps(
+    [[c[1], c[2], c[3], c[4]] for c in cases]) + ";\nconsole.log(JSON.stringify(cases.map(c=>cashPayments(...c))));"
+out = _sp.run(["node", "-e", js], capture_output=True, text=True, timeout=30)
+res = _json.loads(out.stdout or "[]") if out.returncode == 0 else []
+sums = [sum(x["amount"] for x in r["payments"]) * r["share"] if r and not r["blocked"] else None for r in res]
+check("функция выбора платежей найдена и исполнилась", fn is not None and len(res) == 4, out.stderr[:200])
+check("до создания заказа платежи плана в календаре", sums[:1] == [1000] and sums[2:3] == [1000], str(sums))
+check("после создания заказа «Этот заказ» = 0 и с новинками тоже (раньше 2 000 вместо 1 000)",
+      sums[1:2] == [0] and sums[3:4] == [0], str(sums))
+check("мастер подписывает колонку «уже в открытых»", "уже в открытых" in html)
 check("мастер: плашка канала перерисовывается после создания",
       "function refreshAfterCreate" in html and 'id="openBanner"' in html)
 xl = (ROOT / "app" / "export_xlsx.py").read_text(encoding="utf-8")
