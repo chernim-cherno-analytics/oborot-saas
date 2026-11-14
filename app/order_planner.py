@@ -1073,11 +1073,12 @@ def plan_order(snap: dict, brief: dict, ctx: dict, stages: list[dict],
         unmet = max(0, c["need"] - qty)
         if qty <= 0:
             skip_days = res["moq_skipped"].get(c["base_name"])
-            # Партия залежится (MOQ_MAX_COVER_DAYS): заказать её разумно нельзя,
-            # и «недополученная маржа» по ней не упущена бюджетом. В сумму
-            # «упущено» не входит, строка помечена (прогон 14.11, P3).
-            if skip_days is None:
-                lost_missing += unmet * c["margin"]
+            # Партия залежится (MOQ_MAX_COVER_DAYS): строка помечена, чтобы её
+            # не читали как «не хватило денег» (прогон 14.11, P3). Сумма
+            # «упущено» не меняется: исключать такие позиции из неё значит
+            # менять аналитическую величину, это решение владельца (D-35,
+            # ревью Codex #104); вопрос записан в реестре NIGHT-14-11.
+            lost_missing += unmet * c["margin"]
             not_included.append({
                 "moq_skip_days": skip_days,
                 "base_name": c["base_name"], "category": c["category"], "cls": c["cls"],

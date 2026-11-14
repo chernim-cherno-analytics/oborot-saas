@@ -1234,10 +1234,10 @@
         (i.moq_cost ? (' · партия стоит '+fmtR(i.moq_full_cost||i.moq_cost)+
           ((i.moq_full_cost && i.moq_full_cost !== i.moq_cost) ? ' (в день размещения '+fmtR(i.moq_cost)+')' : '')+
           ' — дороже лимита на позицию') : '')+
-        (i.moq_skip_days ? (' · минимальная партия разошлась бы за '+fmt(i.moq_skip_days)+' дн, в «упущено» не входит') : '')+
+        (i.moq_skip_days ? (' · минимальная партия разошлась бы за '+fmt(i.moq_skip_days)+' дн: не взята, потому что залежится, а не из-за денег') : '')+
         '</span></td>'+
         '<td class="nb">'+fmt(i.turnover)+'</td><td class="nb">'+fmt(i.need)+'</td>'+
-        '<td class="nb">'+fmtR(i.need_rub)+'</td><td class="nb">'+(i.moq_skip_days ? '<span class="muted">не учтено</span>' : fmtR(i.lost_margin))+'</td></tr>';
+        '<td class="nb">'+fmtR(i.need_rub)+'</td><td class="nb">'+fmtR(i.lost_margin)+'</td></tr>';
     }).join("");
 
     var sens = (p.sensitivity||[]).map(function(s){
