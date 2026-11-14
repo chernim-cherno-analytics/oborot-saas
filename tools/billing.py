@@ -34,8 +34,9 @@
     возврат денег это отдельное решение, а не опечатка;
   * организации из каталога МойСклада платят в МойСкладе, команды оплаты
     для них отказывают;
-  * каждое изменение печатает «было → стало» и пишется в журнал приложения
-    (логгер oborot.billing) с именем оператора.
+  * каждое изменение печатает «было → стало» и дописывает строку в журнал
+    оплат `billing_audit.log` рядом с файлом базы (время UTC, оператор, что
+    изменено); журнал только пополняется. Имя оператора обязательно.
 
 Код выхода: 0 сделано, 2 отказ (текст объясняет почему).
 """
@@ -56,11 +57,27 @@ class Refused(Exception):
     pass
 
 
+AUDIT_PATH: Path | None = None
+
+
+def _audit(line: str, operator: str) -> None:
+    """Строка в журнал оплат рядом с базой. CLI живёт отдельным процессом, и
+    журнал приложения (journalctl) его логгер не видит: след «кто и когда
+    продлил» должен лежать на диске (ревью 14.11, P2-2)."""
+    if AUDIT_PATH is None:
+        return
+    stamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    with open(AUDIT_PATH, "a", encoding="utf-8") as fh:
+        fh.write(f"{stamp} UTC\t{operator}\t{line}\n")
+
+
 def _connect(db_path: str):
+    global AUDIT_PATH
     path = Path(db_path)
     if not path.is_file():
         print(f"Базы нет: {path}", file=sys.stderr)
         raise SystemExit(2)
+    AUDIT_PATH = path.parent / "billing_audit.log"
     os.environ["DATABASE_URL"] = f"sqlite:///{path}"
     os.environ.setdefault("SCHEDULER_ENABLED", "0")
     sys.path.insert(0, str(ROOT))
@@ -114,7 +131,13 @@ def _stamp_invoiced(db, request_id: int) -> datetime:
     current = db.execute(text("SELECT invoiced_at FROM billing_requests WHERE id = :id"),
                          {"id": request_id}).scalar()
     if current:
-        return current if isinstance(current, datetime) else datetime.fromisoformat(str(current)[:19])
+        if isinstance(current, datetime):
+            return current
+        try:
+            return datetime.fromisoformat(str(current)[:19])
+        except ValueError:
+            raise Refused(f"У заявки {request_id} в отметке счёта не дата: «{current}». "
+                          "Исправьте её до продолжения")
     now = datetime.utcnow().replace(microsecond=0)
     db.execute(text("UPDATE billing_requests SET invoiced_at = :ts WHERE id = :id"),
                {"ts": now, "id": request_id})
@@ -186,6 +209,7 @@ def cmd_invoiced(db, request_id: int, operator: str) -> int:
     db.commit()
     log.warning("billing: заявка %s (орг %s) счёт выставлен оператором %s",
                 request_id, org.id, operator)
+    _audit(f"invoiced\trequest={request_id}\torg={org.id}\tstatus {before}→invoiced", operator)
     print(f"Заявка #{request_id}: {before} → invoiced; отметка счёта "
           f"{stamped:%Y-%m-%d %H:%M} UTC.")
     print(f"Состояние организации {org.id}: {subscription.subscription_state(org, db)} "
@@ -198,7 +222,11 @@ def cmd_paid(db, org_id: int, until: str, operator: str, request_id: int | None)
 
     org = _org(db, org_id)
     new = _parse_date(until)
-    current = subscription._as_date(getattr(org, "paid_until", None))
+    raw = getattr(org, "paid_until", None)
+    current = subscription._as_date(raw)
+    if raw not in (None, "") and current is None:
+        raise Refused(f"У организации {org.id} в «оплачено до» не дата: «{raw}». "
+                      "Исправьте вручную, проверив, что было оплачено")
     _check_forward(new, current, subscription._today(), "Оплачено до")
     row = None
     if request_id is not None:
@@ -215,6 +243,7 @@ def cmd_paid(db, org_id: int, until: str, operator: str, request_id: int | None)
     db.commit()
     log.warning("billing: орг %s оплачено до %s (было %s), оператор %s, заявка %s",
                 org.id, new, current, operator, request_id)
+    _audit(f"paid\torg={org.id}\tpaid_until {current or '-'}→{new}\trequest={request_id or '-'}", operator)
     print(f"Организация {org.id} «{org.name}»: оплачено до {current or '—'} → {new}.")
     if row is not None:
         print(f"Заявка #{row.id}: → paid.")
@@ -233,6 +262,7 @@ def cmd_trial(db, org_id: int, until: str, operator: str) -> int:
     db.commit()
     log.warning("billing: орг %s пробный период до %s (было %s), оператор %s",
                 org.id, new, current, operator)
+    _audit(f"trial\torg={org.id}\ttrial_ends {current or '-'}→{new}", operator)
     print(f"Организация {org.id} «{org.name}»: пробный период {current or '—'} → {new}.")
     print(f"Состояние: {subscription.subscription_state(org, db)}.")
     return 0
@@ -261,6 +291,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
+    if hasattr(args, "operator") and not (args.operator or "").strip():
+        print("Отказ: укажите оператора (--operator), без имени изменение не делается",
+              file=sys.stderr)
+        return 2
     db = _connect(args.db)
     try:
         if args.cmd == "list":

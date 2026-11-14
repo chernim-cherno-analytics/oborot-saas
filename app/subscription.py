@@ -243,7 +243,8 @@ def subscription_state(org, db: Session, *, stamp: bool = False) -> str:
             "организация %s помечена оплаченной (billing_requests.status='paid'), "
             "но orgs.paid_until не проставлен — доступ ЗАКРЫТ, потому что срок "
             "оплаты определяется только paid_until. Проставьте: "
-            "UPDATE orgs SET paid_until='ГГГГ-ММ-ДД' WHERE id=%s", org.id, org.id,
+            "python tools/billing.py --db … paid --org %s --until ГГГГ-ММ-ДД --operator …",
+            org.id, org.id,
         )
 
     return READONLY

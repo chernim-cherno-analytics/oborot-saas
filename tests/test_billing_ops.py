@@ -154,13 +154,24 @@ with TestClient(app, headers={"X-Oborot-CSRF": "1"}) as c:
     check("trial: пробный период продлён вперёд", code == 0
           and str(sql("SELECT trial_ends_at FROM orgs WHERE id=?", other_id)[0][0]).startswith(D(20)), out)
 
+    audit = (DB_PATH.parent / "billing_audit.log")
+    log_text = audit.read_text(encoding="utf-8") if audit.exists() else ""
+    check("журнал оплат на диске: invoiced, paid и trial с оператором",
+          "invoiced" in log_text and "paid\torg=" in log_text and "trial\torg=" in log_text
+          and "\tvlad\t" in log_text, log_text[-300:])
+    code, out, err = run("paid", "--org", str(org_id), "--until", D(90), "--operator", "  ")
+    check("без имени оператора изменение не делается", code == 2 and "оператора" in err, err)
+
     print("\n4. Каталог МойСклада и только чтение")
     sql("UPDATE orgs SET source='ms_app', trial_ends_at=? WHERE id=?", f"{D(-30)} 12:00:00", other_id)
     code, out, err = run("paid", "--org", str(other_id), "--until", D(30), "--operator", "t")
     check("каталог МойСклада: оплата здесь отказывает", code == 2 and "каталога" in err, err)
     os.environ["OBOROT_SUBSCRIPTION_GATE"] = "1"
+    sql("UPDATE orgs SET status='suspended' WHERE id=?", other_id)
     h = c2.get("/settings").text
-    check("каталог МойСклада: своей полосы подписки нет", "sub-strip" not in h)
+    check("каталог МойСклада, приостановлена, гейт включён: своей полосы нет "
+          "(подписку показывает МойСклад)", "sub-strip" not in h)
+    sql("UPDATE orgs SET status='active' WHERE id=?", other_id)
     os.environ.pop("OBOROT_SUBSCRIPTION_GATE")
     snapshot = sql("SELECT * FROM orgs ORDER BY id"), sql("SELECT * FROM billing_requests ORDER BY id")
     code, out, _ = run("list")
@@ -175,5 +186,8 @@ for suffix in ("", "-wal", "-shm"):
     p = Path(str(DB_PATH) + suffix)
     if p.exists():
         p.unlink()
+_audit_file = DB_PATH.parent / "billing_audit.log"
+if _audit_file.exists():
+    _audit_file.unlink()
 print(f"\nИТОГО: {OK} OK, {FAIL} FAIL")
 sys.exit(1 if FAIL else 0)
