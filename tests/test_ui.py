@@ -4345,8 +4345,9 @@ def _browser_journey(browser, base: str, shots: list) -> None:  # noqa: C901
     # планом заказа значило бы закрыть пробел на бумаге.
     order_exports = [p for p in surface
                      if p.startswith("/api/order-plan") or p.startswith("/api/orders")]
-    check("а выгрузки сохранённого плана заказа нет — существующий пробел продукта",
-          not order_exports, f"выгрузки: {surface}")
+    # NIGHT-ORDER-EXPORT (14.11): пробел закрыт выгрузкой заказа в Excel.
+    check("у сохранённого заказа есть выгрузка в Excel для цеха",
+          "/api/orders/{order_id}/export.xlsx" in order_exports, f"выгрузки: {surface}")
 
     check("ни одной ошибки в консоли за весь путь", not errors, str(errors[:2]))
     ctx.close()
