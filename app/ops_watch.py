@@ -86,12 +86,17 @@ def failing_syncs(db: Session, now: datetime | None = None) -> list[dict]:
             continue
         # Те же правила, что у планировщика (ревью критика 14.11, P2): кого
         # планировщик НАМЕРЕННО не синкает, тот не «падает».
-        #  * pending: подключение не доведено (склады не выбраны, первичная
-        #    загрузка не запускалась). Это брошенный онбординг, а не сбой;
+        #  * pending без единого провала: подключение не доведено (склады не
+        #    выбраны, загрузка не запускалась). Брошенный онбординг, не сбой;
         #  * гейт подписки закрыл запись (readonly): синк остановлен нами;
         #  * идёт первичная загрузка: старый аккаунт, только что подключивший
         #    МойСклад, иначе помечался бы сразу (у подключения нет своей даты).
-        if conn.status == "pending":
+        streak = int(getattr(state, "fail_streak", 0) or 0) if state else 0
+        # Pending пропускаем, только пока не было ни одного провала: первичная
+        # загрузка, упавшая после фазы «сегодня», остаётся pending, а почасовой
+        # догон её ретраит (ms_sync.orgs_with_resume_point) и каждый час
+        # роняет. Это самый ценный клиент, первая неделя (ревью 14.11, P1).
+        if conn.status == "pending" and streak == 0:
             continue
         if subscription.gate_enabled():
             try:
@@ -99,9 +104,10 @@ def failing_syncs(db: Session, now: datetime | None = None) -> list[dict]:
                     continue
             except Exception:  # noqa: BLE001 — сомнение трактуем как «смотреть»
                 pass
+        # Зазор: продолжение, запущенное догоном в :30, может ещё идти в :50.
+        # Он временный: при следующем провале серия вырастет, и алерт придёт.
         if state is not None and state.state == "running" and (state.mode or "") == "initial":
             continue
-        streak = int(getattr(state, "fail_streak", 0) or 0) if state else 0
         last_ok = conn.last_sync_at
         if last_ok is None:
             # Ни одного успешного синка у активного подключения: тревога,

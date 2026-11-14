@@ -93,6 +93,9 @@ ids = {
     "initial_running": mk(db, "Старый Аккаунт Грузит Историю", last_ok=None,
                           created=NOW - timedelta(days=90)),
     "readonly": mk(db, "Просроченный Триал", last_ok=NOW - timedelta(days=5)),
+    "pending_failing": mk(db, "Новый Клиент Упала Первичная", conn_status="pending",
+                          last_ok=None, streak=40, created=NOW - timedelta(days=3),
+                          error="МойСклад не принял токен доступа."),
 }
 st_run = db.get(SyncState, ids["initial_running"])
 st_run.state, st_run.mode = "running", "initial"
@@ -102,8 +105,9 @@ db.commit()
 
 print("\n1. Кто считается падающим")
 failing = {f["org_id"] for f in ops_watch.failing_syncs(db, NOW)}
-check("гейт выключен: серия провалов, давний успех, активное без успеха и просроченный триал — падающие",
-      failing == {ids["streak"], ids["stale"], ids["never_ok"], ids["readonly"]}, str(failing))
+check("гейт выключен: серия провалов, давний успех, активное без успеха, просроченный триал и упавшая первичная (pending с провалами) — падающие",
+      failing == {ids["streak"], ids["stale"], ids["never_ok"], ids["readonly"],
+                  ids["pending_failing"]}, str(failing))
 check("здоровый, приостановленный, демо, незавершённое подключение и идущая первичная загрузка — нет",
       not failing & {ids["healthy"], ids["suspended"], ids["demo"], ids["fresh_pending"],
                      ids["old_pending"], ids["initial_running"]})
@@ -126,7 +130,7 @@ def fake_send(kind, unit=None):
 
 ops_watch.reset_for_tests()
 r1 = ops_watch.run_once(NOW, send=fake_send)
-check("первый проход: одно оповещение с числом 4", SENT == [("sync-failing", "4")], str(SENT))
+check("первый проход: одно оповещение с числом 5", SENT == [("sync-failing", "5")], str(SENT))
 r2 = ops_watch.run_once(NOW + timedelta(hours=1), send=fake_send)
 check("тот же набор через час: тишина", len(SENT) == 1 and not r2["sync_sent"], str(SENT))
 r3 = ops_watch.run_once(NOW + timedelta(hours=25), send=fake_send)
@@ -138,7 +142,7 @@ db.commit()
 db.close()
 ops_watch.run_once(NOW + timedelta(hours=26), send=fake_send)
 check("новая падающая организация: сразу, с новым числом",
-      SENT[-1] == ("sync-failing", "5") and len(SENT) == 3, str(SENT))
+      SENT[-1] == ("sync-failing", "6") and len(SENT) == 3, str(SENT))
 
 db = SessionLocal()
 for o in db.query(Connection).all():
