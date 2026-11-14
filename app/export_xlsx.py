@@ -883,9 +883,24 @@ def order_workbook(org_name: str, order: dict, production_name: str,
     сумма пустая, итог подписан «без N позиций». Лист «Платежи»: календарь
     платежей заказа, тот же, что на экране.
     """
-    items = list(order.get("items") or [])
-    sizes = sorted({str(s) for i in items for s in (i.get("sizes") or {})}, key=size_key)
-    headers = ["Модель", *sizes, "Итого, шт", "Себестоимость, ₽/шт", "Сумма, ₽"]
+    items = [i for i in (order.get("items") or []) if isinstance(i, dict)]
+
+    def _sizes_of(it: dict) -> dict:
+        raw = it.get("sizes")
+        return raw if isinstance(raw, dict) else {}
+
+    def _units(value) -> int | None:
+        # Повреждённое значение размера не роняет файл (ревью 14.11, P2):
+        # пустая ячейка честнее, чем 500 у человека, который несёт файл в цех.
+        try:
+            n = int(round(float(value)))
+        except (TypeError, ValueError):
+            return None
+        return n or None
+
+    sizes = sorted({str(s) for i in items for s in _sizes_of(i)}, key=size_key)
+    size_titles = [s if s.strip() else "б/р" for s in sizes]
+    headers = ["Модель", *size_titles, "Итого, шт", "Себестоимость, ₽/шт", "Сумма, ₽"]
     ncols = len(headers)
     batch = order.get("cc_batch_id") or ""
     subtitle = f"заказ №{order.get('id')}" + (f" · партия {batch}" if batch else "")
@@ -893,24 +908,30 @@ def order_workbook(org_name: str, order: dict, production_name: str,
     ws = _new_sheet(wb, "Заказ", org_name, ncols, subtitle=subtitle)
     _write_header(ws, headers)
     fmts = {i: FMT_INT for i in range(2, ncols - 1)}
-    fmts[ncols - 1] = FMT_MONEY
+    # Цена с копейками: сумма строки считается от неё, и в файле
+    # «цена × штуки» обязана совпадать с «Суммой» (ревью 14.11, P2).
+    fmts[ncols - 1] = '#,##0.00" ₽"'
     fmts[ncols] = FMT_MONEY
     row = 3
     total_qty, total_sum, no_cost = 0, 0.0, []
     for it in items:
-        qty = int(it.get("qty") or 0)
-        cost = float(it.get("cost") or 0)
-        by_size = it.get("sizes") or {}
+        qty = _units(it.get("qty")) or 0
+        try:
+            cost = float(it.get("cost") or 0)
+        except (TypeError, ValueError):
+            cost = 0.0
+        by_size = _sizes_of(it)
         values = [str(it.get("base_name") or "")]
-        values += [int(by_size[s]) if by_size.get(s) else None for s in sizes]
-        values += [qty, round(cost) if cost > 0 else None, round(cost * qty) if cost > 0 else None]
+        values += [_units(by_size.get(s)) for s in sizes]
+        cost_c = round(cost, 2)
+        values += [qty, cost_c if cost > 0 else None, round(cost_c * qty) if cost > 0 else None]
         _write_row(ws, row, values, fmts)
         if cost <= 0:
             no_cost.append(str(it.get("base_name") or ""))
         total_qty += qty
-        total_sum += cost * qty if cost > 0 else 0
+        total_sum += round(cost_c * qty) if cost > 0 else 0
         row += 1
-    label = "Итого" if not no_cost else f"Итого без {len(no_cost)} поз. без себестоимости"
+    label = "Итого" if not no_cost else f"Итого (сумма без {len(no_cost)} поз. без себестоимости)"
     _write_total(ws, row, ncols, {ncols - 2: total_qty, ncols: round(total_sum)}, fmts, label=label)
     row += 2
     info = [
@@ -923,7 +944,15 @@ def order_workbook(org_name: str, order: dict, production_name: str,
     if batch:
         info.append(("ID партии", batch))
     if no_cost:
-        info.append(("Без себестоимости", ", ".join(no_cost)))
+        # Ячейка Excel держит не больше 32 767 знаков: список обрезаем словами.
+        shown, length = [], 0
+        for name in no_cost:
+            if length + len(name) + 2 > 2000:
+                break
+            shown.append(name)
+            length += len(name) + 2
+        rest = len(no_cost) - len(shown)
+        info.append(("Без себестоимости", ", ".join(shown) + (f" и ещё {rest}" if rest else "")))
     for k, v in info:
         _cell(ws, row, 1, k, font=_TOTAL_FONT)
         _cell(ws, row, 2, v)
@@ -942,5 +971,8 @@ def order_workbook(org_name: str, order: dict, production_name: str,
     else:
         _write_total(ps, prow, 3, {3: round(sum(float(p.get("amount") or 0) for p in payments))},
                      {3: FMT_MONEY})
+        if no_cost:
+            _cell(ps, prow + 2, 1, f"Позиции без себестоимости ({len(no_cost)}) в платежи не вошли: "
+                  "сумма по ним неизвестна.", font=_TITLE_FONT)
     _autofit(ps)
     return wb

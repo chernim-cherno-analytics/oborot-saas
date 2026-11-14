@@ -164,6 +164,24 @@ with TestClient(app, headers={"X-Oborot-CSRF": "1"}) as a, \
     anon = TestClient(app).get(f"/api/orders/{order_id}/export.xlsx")
     check("без входа: не отдаётся", anon.status_code in (401, 403), str(anon.status_code))
 
+    print("\n5а. Повреждённые и копеечные данные (ревью 14.11)")
+    raw = _json.loads(sql("SELECT items_json FROM production_orders WHERE id=?", order_id)[0][0])
+    lst = raw if isinstance(raw, list) else raw["items"]
+    lst.append({"base_name": "Копейки", "qty": 4, "sizes": {"S": "2.5", "M": {"rec": 2}, "": 1},
+                "cost": 12.5})
+    lst.append({"base_name": "Размеры списком", "qty": 2, "sizes": ["S", "M"], "cost": 10})
+    sql("UPDATE production_orders SET items_json=? WHERE id=?",
+        _json.dumps(raw, ensure_ascii=False), order_id)
+    bad = a.get(f"/api/orders/{order_id}/export.xlsx")
+    check("повреждённые размеры не роняют файл", bad.status_code == 200, str(bad.status_code))
+    if bad.status_code == 200:
+        _, brows = sheet_rows(bad.content, "Заказ")
+        hdr = brows[1]
+        kop = next(r for r in brows if r[0] == "Копейки")
+        check("цена с копейками: 12,50 × 4 = 50 в той же строке",
+              kop[-2] == 12.5 and kop[-1] == 50, str(kop))
+        check("безразмерная колонка названа «б/р»", "б/р" in hdr, str(hdr))
+
     print("\n6. Кнопки в интерфейсе")
     page = a.get("/replenish").text
     check("на «Заказе» есть кнопка «Excel для цеха»", "Excel для цеха" in page

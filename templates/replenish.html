@@ -1070,7 +1070,9 @@
         '<td class="nb" data-label="Шт">'+fmt(o.total_qty)+'</td>'+
         '<td><span class="stbadge g">'+ordStatusText(o.status)+'</span></td>'+
         '<td class="ord-actions"><button class="mvbtn ord-receipts" data-id="'+o.id+'" '+
-            'title="Что фактически принято по заказу">Приёмка</button>'+ORD_HELP_RECEIVED+'</td></tr>';
+            'title="Что фактически принято по заказу">Приёмка</button> '+
+            '<a class="mvbtn ord-xlsx" href="/api/orders/'+o.id+'/export.xlsx" title="Excel заказа: модели по размерам, суммы и платежи">⬇ Excel</a>'+
+            ORD_HELP_RECEIVED+'</td></tr>';
     }).join("");
     bindReceiptButtons();
   }
