@@ -205,6 +205,8 @@ SUITES = [
     ("truth_2", "test_truth_2.py",             False, False),
     # D-72, шаг 1: при окне «сезон» «Заказ» и мастер дают одно число.
     ("one_number", "test_one_number.py",       False, False),
+    # TRUTH-3: прогон на собранном main 14.11 (срок и партия этапов, новинки).
+    ("truth_3", "test_truth_3.py",             False, False),
     # D-68: размерная сетка по темпу в днях наличия.
     ("size_presence", "test_size_presence.py", False, False),
     ("deps",        "test_dependencies.py",    False, False),

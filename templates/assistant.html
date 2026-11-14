@@ -684,7 +684,10 @@
     document.getElementById("overhead").value = last.overhead_pct || 0;
     STATE.newItems = [];
     document.getElementById("newRows").innerHTML = "";
-    (last.new_items||[]).forEach(function(nn){ addNew(nn.name, nn.qty, nn.cost); });
+    // Новинки прошлого плана подставляются только по явному «Повторить».
+    // При автоматическом открытии мастера они молча возвращались в следующий
+    // план и в календарь денег: риск повторно отшить новинку (прогон 14.11, P1).
+    if(!auto){ (last.new_items||[]).forEach(function(nn){ addNew(nn.name, nn.qty, nn.cost); }); }
     Array.prototype.forEach.call(document.querySelectorAll("#stratTiles .tile"), function(x){
       x.className = "tile" + (x.dataset.v===STATE.strategy ? " on" : ""); });
     segInitValue("cadSeg", STATE.cadence);
