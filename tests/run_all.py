@@ -197,6 +197,8 @@ SUITES = [
     ("season_once", "test_season_once.py",     False, False),
     # WIZARD-LABELS-1: мастер называет базу сумм и источник ритма.
     ("wizard_labels", "test_wizard_labels.py", False, False),
+    # XLSX-TRUTH-1: Excel «Что заказать» не выдаёт неполную сумму за полную.
+    ("xlsx_truth", "test_xlsx_truth.py",       False, False),
     ("deps",        "test_dependencies.py",    False, False),
 ]
 
