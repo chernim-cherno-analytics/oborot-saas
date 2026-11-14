@@ -689,7 +689,7 @@ def _candidates(snap: dict, brief: dict, ctx: dict) -> tuple[list[dict], dict]:
         r_cover = float(ctx["rate_cover"].get(base) or 0)
         cs = float(it.get("cs") or 0)
         ordered = max(0.0, float(it.get("ordered") or 0))
-        # ЧЕРНОВИК D-65: «едет» не закрывает продажи до прихода (см. analytics).
+        # D-65: «едет» не закрывает продажи до прихода (см. analytics).
         proj_stock = max(0.0, cs - r_lead * days_to_eta) + ordered
         need = max(0, int(round(r_cover * cover - proj_stock)))
         # Дыра: остатка не хватит дожить до прихода заказа.
