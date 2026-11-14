@@ -116,6 +116,7 @@ def build_budget(
 
     candidates, no_cost = [], []
     excluded_fresh = 0
+    excluded_fresh_items: list[dict] = []
     all_categories: set[str] = set()
 
     for it in snap["items"].values():
@@ -145,6 +146,9 @@ def build_budget(
             continue
         if it["base_name"] not in fresh:
             excluded_fresh += 1  # нет продаж за FRESH_DAYS — неактуально
+            # TRUTH-LABELS-1: имя и остаток, чтобы распроданную позицию было
+            # видно (отсев не меняется: политика FRESH за владельцем).
+            excluded_fresh_items.append({"base_name": it["base_name"], "cs": int(it["cs"] or 0)})
             continue
         cost = float(it["cost_price"] or 0)
         entry = {
@@ -244,6 +248,8 @@ def build_budget(
             {k: v for k, v in x.items() if k != "margin"} for x in no_cost
         ],
         "excluded_fresh_count": excluded_fresh,
+        "excluded_fresh": sorted(excluded_fresh_items,
+                                 key=lambda r: (r["cs"] > 0, r["base_name"]))[:50],
         "categories": sorted(all_categories),
         "totals": {
             "positions": len(items),
@@ -805,6 +811,13 @@ def build_sizes_calc(
             "stock": tot_stock,
             "stock_at_arrival": round(tot_stock_proj),
             "order": qty,
+            # TRUTH-LABELS-1: калькулятор раскладывает введённое количество по
+            # размерам и «Едет» не учитывает (формула не меняется). Но молчать
+            # о том, что по позиции уже едет партия, нельзя: прогон
+            # пользователем ввёл 30 шт поверх 30 шт «в производстве», а
+            # «Заказ» по той же позиции показывал, что заказ не нужен.
+            "already_ordered": int(round(float(
+                ((snap.get("items") or {}).get(product) or {}).get("ordered") or 0))),
         },
         "sizes": [
             {

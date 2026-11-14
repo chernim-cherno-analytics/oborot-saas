@@ -360,8 +360,14 @@
         d.fresh_days+" дн · горизонт "+d.horizon_days+" дней";
       document.getElementById("placeholder").style.display="none";
       // предупреждение о свежести
+      /* TRUTH-LABELS-1: исключённые названы; распроданные (остаток 0)
+         первыми, потому что «без продаж» у них значит «нечего было продать». */
+      var stale=d.excluded_fresh||[], soldOut=stale.filter(function(r){ return !r.cs; }).length;
       document.getElementById("warnBox").innerHTML=d.excluded_fresh_count
-        ? '<div class="warn">'+fmt(d.excluded_fresh_count)+' позиций без продаж за '+d.fresh_days+' дней исключены из распределения (неактуальны).</div>':"";
+        ? '<div class="warn">'+fmt(d.excluded_fresh_count)+' поз. без продаж за '+d.fresh_days+' дней исключены из распределения'+
+          (soldOut?', из них '+soldOut+' с остатком 0 (возможно, просто распроданы; в «Мастере заказа» их можно отметить и взять в расчёт)':'')+': '+
+          stale.map(function(r){ return esc(r.base_name)+(r.cs?'':' (остаток 0)'); }).join(", ")+
+          (d.excluded_fresh_count>stale.length?' и ещё '+(d.excluded_fresh_count-stale.length):'')+'.</div>':"";
       // карточки
       var t=d.totals||{};
       document.getElementById("cards").style.display="";

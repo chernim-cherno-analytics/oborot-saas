@@ -177,6 +177,9 @@ SUITES = [
     # учения — только в чат сервиса, фиксированный текст, без секретов.
     # Нужен порт mock-Telegram (четвёртое поле), наружу набор не ходит.
     ("ops_alert",   "test_ops_alert.py",       False, True),
+    # TRUTH-LABELS-1: экран называет отсеянные позиции, едущую партию и
+    # сезонную базу темпа. Синтетическая база, демо-данные.
+    ("truth_labels", "test_truth_labels.py",   False, False),
     ("deps",        "test_dependencies.py",    False, False),
 ]
 

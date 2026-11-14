@@ -400,7 +400,13 @@
 
   function render(d){
     var warn=document.getElementById("warn-box");
-    warn.innerHTML=d.warning?'<div class="warn">'+esc(d.warning)+'</div>':"";
+    /* TRUTH-LABELS-1: по позиции уже едет партия — сказать до того, как
+       человек отправит ещё одну. Количество калькулятор не меняет. */
+    var onWay=(d.totals&&d.totals.already_ordered)||0;
+    warn.innerHTML=(d.warning?'<div class="warn">'+esc(d.warning)+'</div>':"")+
+      (onWay>0?'<div class="warn">По этой позиции уже едет '+fmt(onWay)+' шт (открытые заказы, отметки «Заказано» и заказы поставщику в МойСкладе). '+
+        'Калькулятор раскладывает по размерам то количество, которое вы ввели, и эти штуки не вычитает: '+
+        'сколько заказывать с их учётом, показывает страница «Заказ».</div>':"");
 
     if(!d.sizes.length){
       document.getElementById("thead").innerHTML="";
