@@ -594,6 +594,7 @@
       max_share_pct: parseNum("capPct") || null,
       // Пусто = не задано (сервер возьмёт партию канала), 0 = явно без партии.
       moq_units: (String(document.getElementById("moq").value).trim() === "") ? null : parseNum("moq"),
+      moq_ui: 2,
       reserve_new_pct: parseNum("reserve"),
       overhead_pct: parseNum("overhead"),
       exclude_categories: STATE.offcats,
@@ -674,7 +675,11 @@
     STATE.must = last.must_have || [];
     document.getElementById("budget").value = fmt(last.budget||200000);
     document.getElementById("capPct").value = last.max_share_pct || 30;
-    document.getElementById("moq").value = last.moq_explicit ? (last.moq_units || 0) : "";
+    // План, сохранённый до WIZARD-MOQ-1 (без метки moq_ui), всегда нёс число:
+    // его 0 был значением поля по умолчанию, а не выбором «без партии», и при
+    // повторе такой 0 молча отключал бы партию фабрики (ревью критика 14.11).
+    var moqChosen = last.moq_explicit && (last.moq_ui === 2 || (last.moq_units || 0) > 0);
+    document.getElementById("moq").value = moqChosen ? (last.moq_units || 0) : "";
     document.getElementById("reserve").value = last.reserve_new_pct || 0;
     document.getElementById("overhead").value = last.overhead_pct || 0;
     STATE.newItems = [];
