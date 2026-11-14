@@ -39,8 +39,9 @@ AGENTS.md. История вопроса: в legacy-проекте агентс�
   помечены no_cost, их маржинальные поля = None и в агрегаты они не входят;
 - below_cost/loss_* — «торгуем в минус»: средняя фактическая цена продажи ниже
   себестоимости; порог значимости — тот же low_data (MIN_SIGNIF_*);
-- need = rate*horizon − proj_stock, где proj_stock = max(0, cs + ordered −
-  rate*lead) — ПРОГНОЗ остатка на дату прихода заказа (правило legacy
+- need = rate*horizon − proj_stock, где proj_stock = max(0, cs − rate*lead)
+  + ordered (черновик D-65; было max(0, cs + ordered − rate*lead)) — ПРОГНОЗ
+  остатка на дату прихода заказа (правило legacy
   /order: за срок производства часть стока продастся; считать потребность от
   сегодняшнего остатка — значит систематически занижать заказ на rate×lead).
 
@@ -1263,7 +1264,13 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
         # Прогноз остатка к дате прихода заказа (правило legacy /order): за
         # срок производства часть стока продастся; «едет» приходуется к той
         # же дате. Срок — свой у каждого подрядчика (lead выше).
-        proj_stock = max(0.0, cs + float(item["ordered"]) - rate * lead)
+        # ЧЕРНОВИК D-65 (НЕ СЛИВАТЬ без решения владельца): «едет» приходит
+        # к дате прихода и продажи ДО неё закрыть не может. Раньше бралось
+        # max(0, cs + ordered − rate·lead): уже заказанные штуки «съедали»
+        # продажи срока производства, которых при стокауте не будет, и после
+        # размещения ровно рекомендованного заказа система просила дошить
+        # ещё rate·lead штук той же позиции.
+        proj_stock = max(0.0, cs - rate * lead) + max(0.0, float(item["ordered"]))
         item["proj_stock"] = round(proj_stock)
         item["need"] = max(0, round(rate * horizon) - round(proj_stock))
         item["nq"] = round(nq)

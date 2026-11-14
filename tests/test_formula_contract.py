@@ -16,13 +16,13 @@
 ЧТО ЗАКРЕПЛЕНО (и где живёт оригинал):
 
   1. Аналитика, `app/analytics.py`:
-         proj_stock = max(0.0, cs + ordered − rate × lead)
+         proj_stock = max(0.0, cs − rate × lead) + ordered        (черновик D-65)
          need       = max(0, round(rate × horizon) − round(proj_stock))
      Проверяется НА ЖИВОМ ПУТИ: `analytics.get_snapshot` (то есть
      `_compute_snapshot`) → `analytics.build_replenish`, на настоящей БД.
 
   2. Мастер заказа, `app/order_planner.py`:
-         proj_stock = max(0.0, cs + ordered − r_lead × days_to_eta)
+         proj_stock = max(0.0, cs − r_lead × days_to_eta) + ordered  (черновик D-65)
          need       = max(0, int(round(r_cover × cover − proj_stock)))
      Проверяется через настоящий `order_planner.plan_order`.
 
@@ -176,9 +176,10 @@ PLANNER_PY = Path(op.__file__).resolve()
 # номер поедет от любой правки выше по файлу, а замок обязан переживать правки,
 # которые его не касаются.
 NEED_LINE_ANALYTICS = 'item["need"] = max(0, round(rate * horizon) - round(proj_stock))'
-PROJ_LINE_ANALYTICS = 'proj_stock = max(0.0, cs + float(item["ordered"]) - rate * lead)'
+# ЧЕРНОВИК D-65: «едет» не закрывает продажи до прихода.
+PROJ_LINE_ANALYTICS = 'proj_stock = max(0.0, cs - rate * lead) + max(0.0, float(item["ordered"]))'
 NEED_LINE_PLANNER = "need = max(0, int(round(r_cover * cover - proj_stock)))"
-PROJ_LINE_PLANNER = "proj_stock = max(0.0, cs + ordered - r_lead * days_to_eta)"
+PROJ_LINE_PLANNER = "proj_stock = max(0.0, cs - r_lead * days_to_eta) + ordered"
 
 
 # ── Сцена для аналитики: настоящая БД, настоящий снапшот ─────────────────────

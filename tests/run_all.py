@@ -177,6 +177,8 @@ SUITES = [
     # учения — только в чат сервиса, фиксированный текст, без секретов.
     # Нужен порт mock-Telegram (четвёртое поле), наружу набор не ходит.
     ("ops_alert",   "test_ops_alert.py",       False, True),
+    # ЧЕРНОВИК D-65: «едет» не закрывает продажи до прихода партии.
+    ("incoming", "test_incoming_formula.py",   False, False),
     ("deps",        "test_dependencies.py",    False, False),
 ]
 
