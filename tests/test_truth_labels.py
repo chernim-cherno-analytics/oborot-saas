@@ -83,8 +83,12 @@ with TestClient(app, headers={"X-Oborot-CSRF": "1"}) as c:
     after = c.get("/api/sizes/calc", params={"product": product, "qty": 30}).json()
     check("отметка «Заказано» видна калькулятору", after["totals"].get("already_ordered", 0) >= 30,
           str(after["totals"]))
-    check("раскладка по размерам не изменилась (формула калькулятора та же)",
-          [s["order_stock"] for s in before["sizes"]] == [s["order_stock"] for s in after["sizes"]])
+    # D-65 в калькуляторе (TRUTH-4): едущие штуки входят в остаток к приходу.
+    check("D-65: «остаток к приходу» вырос ровно на едущие 30 шт",
+          after["totals"]["stock_at_arrival"] - before["totals"]["stock_at_arrival"] in (29, 30, 31),
+          f'{before["totals"]["stock_at_arrival"]} -> {after["totals"]["stock_at_arrival"]}')
+    check("D-65: раскладка «чистая» (без учёта остатков) не изменилась",
+          [s.get("order_pure") for s in before["sizes"]] == [s.get("order_pure") for s in after["sizes"]])
     page = c.get("/sizes").text
     check("страница говорит про уже едущую партию", "уже едет" in page)
 

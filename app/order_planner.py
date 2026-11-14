@@ -1072,8 +1072,14 @@ def plan_order(snap: dict, brief: dict, ctx: dict, stages: list[dict],
         qty = alloc.get(c["base_name"], 0)
         unmet = max(0, c["need"] - qty)
         if qty <= 0:
-            lost_missing += unmet * c["margin"]
+            skip_days = res["moq_skipped"].get(c["base_name"])
+            # Партия залежится (MOQ_MAX_COVER_DAYS): заказать её разумно нельзя,
+            # и «недополученная маржа» по ней не упущена бюджетом. В сумму
+            # «упущено» не входит, строка помечена (прогон 14.11, P3).
+            if skip_days is None:
+                lost_missing += unmet * c["margin"]
             not_included.append({
+                "moq_skip_days": skip_days,
                 "base_name": c["base_name"], "category": c["category"], "cls": c["cls"],
                 "turnover": round(c["turnover"]), "need": c["need"],
                 "cost_price": c["cost_price"], "need_rub": c["need"] * c["cost_price"],

@@ -290,7 +290,10 @@
     var pr=PRODUCTS.find(function(x){ return x.base_name===base; });
     var qEl=document.getElementById("qty"), nn=document.getElementById("need-note");
     if(pr && typeof pr.need==="number"){
-      if(!qEl.dataset.touched && pr.need>0) qEl.value=pr.need;
+      // Нулевая рекомендация тоже ставится: иначе поле наследовало число
+      // предыдущей позиции (прогон 14.11: «дозаказ не рекомендует» и 19 шт
+      // от Ветровки). Своё число человек вписывает сам.
+      if(!qEl.dataset.touched) qEl.value=pr.need;
       nn.textContent=pr.need>0?("«Заказ» рекомендует "+pr.need+" шт"):"«Заказ» дозаказ не рекомендует";
       nn.style.display="";
     } else { nn.style.display="none"; }
@@ -422,8 +425,8 @@
     var onWay=(d.totals&&d.totals.already_ordered)||0;
     warn.innerHTML=(d.warning?'<div class="warn">'+esc(d.warning)+'</div>':"")+
       (onWay>0?'<div class="warn">По этой позиции уже едет '+fmt(onWay)+' шт (заказы «В производстве», отметки «Заказано» и заказы поставщику в МойСкладе). '+
-        'Калькулятор раскладывает по размерам то количество, которое вы ввели, и эти штуки не вычитает: '+
-        'сколько заказывать с их учётом, показывает страница «Заказ».</div>':"");
+        'Они входят в «остаток к приходу» и в раскладку «с учётом остатков» (по размерам долями темпа). '+
+        'Количество для заказа, учитывающее их, стоит в поле по рекомендации «Заказа».</div>':"");
 
     if(!d.sizes.length){
       document.getElementById("thead").innerHTML="";

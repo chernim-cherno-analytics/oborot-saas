@@ -1110,7 +1110,11 @@ def _actions_clarity(browser, base: str, c) -> None:
     try:
         # 1. «Заказ позиции»: честная подпись, та же ручная отметка, заказа нет.
         prods = c.get("/api/sizes/products").json()["products"]
-        name = prods[0]["base_name"] if isinstance(prods[0], dict) else prods[0]
+        # Поле количества стартует с рекомендации «Заказа» (TRUTH-2/4): для
+        # проверки кнопки нужна позиция с ненулевой рекомендацией.
+        withneed = [p for p in prods if isinstance(p, dict) and (p.get("need") or 0) > 0]
+        first = withneed[0] if withneed else prods[0]
+        name = first["base_name"] if isinstance(first, dict) else first
         page.goto(f"{base}/sizes")
         _close_hint(page)
         page.fill("#prod-search", name)
