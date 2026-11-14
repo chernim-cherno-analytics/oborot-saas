@@ -601,6 +601,8 @@ def run_all() -> None:
         ("/api/orders/{order_id}/status",         "POST",   {"order_id": order_b}, {"status": "sent"}),
         ("/api/orders/{order_id}",                "DELETE", {"order_id": order_b}, None),
         ("/api/orders/{order_id}/ms-doc",         "GET",    {"order_id": order_b}, None),
+        # ORDER-EXPORT-1: файл для цеха по чужому заказу — тот же отказ.
+        ("/api/orders/{order_id}/export.xlsx",    "GET",    {"order_id": order_b}, None),
         ("/api/orders/{order_id}/push-to-ms",     "POST",   {"order_id": order_b}, {}),
         ("/api/orders/{order_id}/receipts",       "GET",    {"order_id": order_b}, None),
         ("/api/orders/{order_id}/receipts",       "POST",   {"order_id": order_b},
@@ -673,7 +675,8 @@ def run_all() -> None:
     # строку, — это порча данных. Проверяются оба следствия отдельно.
     print("\n== 1а. Отказ по чужому id: без раскрытия и без записи ==")
     markers = [SECRET, "СЕКРЕТНЫЙ ЭТАП B", RECEIPT_B, "Заказ B"]
-    for route, method in (("/api/orders/{order_id}/receipts", "GET"),
+    for route, method in (("/api/orders/{order_id}/export.xlsx", "GET"),
+                          ("/api/orders/{order_id}/receipts", "GET"),
                           ("/api/orders/{order_id}/receipts", "POST"),
                           ("/api/order-plan/{plan_id}/outcome", "GET"),
                           ("/api/order-plan/{plan_id}/brief", "GET")):

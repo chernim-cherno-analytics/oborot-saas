@@ -1516,6 +1516,7 @@
     var act = btn.parentNode;
     act.innerHTML =
       '<a class="go-btn" style="text-decoration:none" href="/replenish#orders">Заказ №'+id+' создан → открыть</a>'+
+      ' <a class="go-btn" style="text-decoration:none" href="/api/orders/'+id+'/export.xlsx" title="Сетка размеров, суммы и платежи этого заказа">⬇ Excel для цеха</a>'+
       '<button class="go-btn ghost" id="toProd">Отправить в производство</button>'+
       '<button class="go-btn ghost" onclick="go(1)">← Новый заказ</button>'+
       '<span class="hint" id="mkHint"></span>';

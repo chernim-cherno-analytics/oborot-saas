@@ -860,3 +860,87 @@ def supply_workbook(org_name: str, data: dict) -> Workbook:
         _cell(ws, row, 1, "Назначений пока нет", font=_TITLE_FONT)
     _autofit(ws)
     return wb
+
+
+# ── Зафиксированный заказ: файл для цеха (ORDER-EXPORT-1) ─────────────────────
+
+_STATUS_RU = {"draft": "Черновик", "sent": "В производстве", "received": "Принят на склад"}
+
+
+def order_workbook(org_name: str, order: dict, production_name: str,
+                   payments: list[dict], size_key) -> Workbook:
+    """Книга одного ЗАФИКСИРОВАННОГО заказа: что отдать в цех и когда платить.
+
+    ЗАЧЕМ (ORDER-EXPORT-1, 14.11.2026). До этого Excel был только у текущей
+    РЕКОМЕНДАЦИИ («Заказ»), а рекомендация после размещения уже другая: в ней
+    учтено то, что заказали. Отдать цеху именно то, что зафиксировано в заказе,
+    было нечем (находка прогона пользователем-владелицей бренда). Здесь только
+    состав заказа, как он сохранён, без пересчёта: ни темпа, ни потребности,
+    ни новых чисел.
+
+    Лист «Заказ»: модель × размеры (сетка заказа), итого штук, себестоимость за
+    штуку из заказа, сумма. Строка без себестоимости не считается бесплатной:
+    сумма пустая, итог подписан «без N позиций». Лист «Платежи»: календарь
+    платежей заказа, тот же, что на экране.
+    """
+    items = list(order.get("items") or [])
+    sizes = sorted({str(s) for i in items for s in (i.get("sizes") or {})}, key=size_key)
+    headers = ["Модель", *sizes, "Итого, шт", "Себестоимость, ₽/шт", "Сумма, ₽"]
+    ncols = len(headers)
+    batch = order.get("cc_batch_id") or ""
+    subtitle = f"заказ №{order.get('id')}" + (f" · партия {batch}" if batch else "")
+    wb = Workbook()
+    ws = _new_sheet(wb, "Заказ", org_name, ncols, subtitle=subtitle)
+    _write_header(ws, headers)
+    fmts = {i: FMT_INT for i in range(2, ncols - 1)}
+    fmts[ncols - 1] = FMT_MONEY
+    fmts[ncols] = FMT_MONEY
+    row = 3
+    total_qty, total_sum, no_cost = 0, 0.0, []
+    for it in items:
+        qty = int(it.get("qty") or 0)
+        cost = float(it.get("cost") or 0)
+        by_size = it.get("sizes") or {}
+        values = [str(it.get("base_name") or "")]
+        values += [int(by_size[s]) if by_size.get(s) else None for s in sizes]
+        values += [qty, round(cost) if cost > 0 else None, round(cost * qty) if cost > 0 else None]
+        _write_row(ws, row, values, fmts)
+        if cost <= 0:
+            no_cost.append(str(it.get("base_name") or ""))
+        total_qty += qty
+        total_sum += cost * qty if cost > 0 else 0
+        row += 1
+    label = "Итого" if not no_cost else f"Итого без {len(no_cost)} поз. без себестоимости"
+    _write_total(ws, row, ncols, {ncols - 2: total_qty, ncols: round(total_sum)}, fmts, label=label)
+    row += 2
+    info = [
+        ("Заказ", f"№{order.get('id')} · {order.get('name') or ''}"),
+        ("Статус", _STATUS_RU.get(order.get("status") or "", order.get("status") or "")),
+        ("Создан", _fmt_date_ru((order.get("created_at") or "")[:10])),
+        ("Производство", production_name or "не указано"),
+        ("Плановая дата прихода", _fmt_date_ru(order.get("eta_date")) if order.get("eta_date") else "не указана"),
+    ]
+    if batch:
+        info.append(("ID партии", batch))
+    if no_cost:
+        info.append(("Без себестоимости", ", ".join(no_cost)))
+    for k, v in info:
+        _cell(ws, row, 1, k, font=_TOTAL_FONT)
+        _cell(ws, row, 2, v)
+        row += 1
+    _autofit(ws)
+
+    ps = _new_sheet(wb, "Платежи", org_name, 3, subtitle=subtitle, first=False)
+    _write_header(ps, ["Дата", "Платёж", "Сумма, ₽"])
+    prow = 3
+    for p in payments or []:
+        _write_row(ps, prow, [_fmt_date_ru(p.get("date")), str(p.get("label") or ""),
+                              round(float(p.get("amount") or 0))], {3: FMT_MONEY})
+        prow += 1
+    if prow == 3:
+        _cell(ps, prow, 1, "Календарь платежей у заказа не задан", font=_TITLE_FONT)
+    else:
+        _write_total(ps, prow, 3, {3: round(sum(float(p.get("amount") or 0) for p in payments))},
+                     {3: FMT_MONEY})
+    _autofit(ps)
+    return wb

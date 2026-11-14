@@ -177,6 +177,8 @@ SUITES = [
     # учения — только в чат сервиса, фиксированный текст, без секретов.
     # Нужен порт mock-Telegram (четвёртое поле), наружу набор не ходит.
     ("ops_alert",   "test_ops_alert.py",       False, True),
+    # ORDER-EXPORT-1: Excel зафиксированного заказа для цеха.
+    ("order_export", "test_order_export.py",   False, False),
     ("deps",        "test_dependencies.py",    False, False),
 ]
 
