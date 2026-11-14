@@ -915,8 +915,9 @@ def order_workbook(org_name: str, order: dict, production_name: str,
     size_titles = [s if s.strip() else "б/р" for s in sizes]
     headers = ["Модель", *size_titles, "Итого, шт", "Себестоимость, ₽/шт", "Сумма, ₽"]
     ncols = len(headers)
-    batch = order.get("cc_batch_id") or ""
-    subtitle = f"заказ №{order.get('id')}" + (f" · партия {batch}" if batch else "")
+    # Идентификатор партии (CCB-…) в файл не пишем: по D-50 первый слой
+    # только вводит имя партии, внешние выгрузки с ним решаются отдельно.
+    subtitle = f"заказ №{order.get('id')}"
     wb = Workbook()
     ws = _new_sheet(wb, "Заказ", org_name, ncols, subtitle=subtitle)
     _write_header(ws, headers)
@@ -959,8 +960,6 @@ def order_workbook(org_name: str, order: dict, production_name: str,
         ("Производство", production_name or "не указано"),
         ("Плановая дата прихода", _fmt_date_ru(order.get("eta_date")) if order.get("eta_date") else "не указана"),
     ]
-    if batch:
-        info.append(("ID партии", batch))
     if no_cost:
         # Ячейка Excel держит не больше 32 767 знаков: список обрезаем словами.
         shown, length = [], 0
