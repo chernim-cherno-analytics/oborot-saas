@@ -1196,6 +1196,30 @@
          L.next_order_days+' дн — без покрытия остаётся примерно <b>'+fmtR(L.at_risk)+'</b>.</div>')
       : '';
     var rev = p.review||{};
+    // TRUTH-LABELS-1: отсеянные «без продаж» названы по именам. Распроданная
+    // в ноль позиция не продаётся потому, что её нет, а не потому, что не
+    // нужна: такие стоят первыми и помечены, галочка берёт позицию в расчёт
+    // как решение человека (тот же must_have, что у «мало данных»).
+    function staleBlock(rev){
+      var n = rev.stale_count||0, days = rev.fresh_days||90;
+      if(!n) return '<div class="peak">Без продаж '+days+' дней — 0 поз.</div>';
+      var rows = rev.stale||[], soldOut = rows.filter(function(r){ return r.sold_out; }).length;
+      return '<div class="peak"><b>Без продаж '+days+' дней — '+n+' поз.</b> Система их не заказывает.'+
+        (soldOut ? ' Из них '+soldOut+' с остатком 0: возможно, они не перестали продаваться, а просто распроданы. '+
+          'Если так, отметьте, и позиция войдёт в расчёт.' : '')+'</div>'+
+        rows.map(function(r){
+          /* Галочка только у распроданных: у позиции с остатком и без
+             продаж темп за окно нулевой, и взятая галочкой она всё равно
+             ушла бы в «не вошло» с потребностью 0 (ревью 14.11, P2). */
+          return '<div class="peak">'+(r.sold_out
+            ? '<label style="cursor:pointer"><input type="checkbox" class="takebox" data-b="'+esc(r.base_name)+'"'+
+              (STATE.must.indexOf(r.base_name)>=0?' checked':'')+'> '+esc(r.base_name)+'</label>'
+            : esc(r.base_name))+
+            ' — '+esc(r.category)+', на складе '+fmt(r.cs)+' шт'+
+            (r.sold_out?' · <b>распродана</b>':' · лежит без продаж')+'</div>';
+        }).join("")+
+        (n > rows.length ? '<div class="peak">…и ещё '+(n-rows.length)+' поз.</div>' : '');
+    }
     function revList(rows, note, action){
       if(!rows || !rows.length) return '';
       return rows.map(function(r){
@@ -1234,7 +1258,8 @@
         'Но решение за вами: впишите штуки — позиция попадёт в заказ как ваше решение, '+
         'а сумма заказа будет помечена как неполная.</div>'+
         noCostList(rev.no_cost)) : '')+
-      '<div class="peak">Без продаж 90 дней — '+(rev.stale_count||0)+' поз. · потребность меньше 3 шт — '+(rev.small_need_count||0)+' поз.</div>'+
+      staleBlock(rev)+
+      '<div class="peak">Потребность меньше 3 шт — '+(rev.small_need_count||0)+' поз.</div>'+
       (rev.other_production_count ? '<div class="peak">На других производствах — '+rev.other_production_count+' поз.: закажите отдельным заказом.</div>' : "")+
       '</div></details></div>';
 
@@ -1314,7 +1339,14 @@
       '<div class="table-outer"><table><thead><tr>'+
         '<th class="sortable" data-k="base_name">Позиция</th>'+
         '<th class="sortable nb" data-k="turnover" title="Нетто-выручка ÷ дни, когда позиция была в наличии">Оборач. ₽/день</th>'+
-        '<th class="sortable nb" data-k="rate" title="Темп продаж, штук в день — по нему считается «Нужно»">Темп, шт/дн</th>'+
+        /* TRUTH-LABELS-1: мастер берёт темп с сезонным индексом окна прихода
+           и покрытия, а «Заказ» и «Бюджет» без него. Прогон пользователями:
+           «Скетч» 57 на «Заказе» и 101 здесь, и на экране ни слова почему.
+           Формулу не трогаем (D-35, решение владельца), но называем базу
+           (D-29: экран обязан называть ту базу, по которой посчитан). */
+        ((p.coverage||{}).seasonal_rates
+          ? '<th class="sortable nb" data-k="rate" title="Темп продаж с поправкой на сезон того окна, когда партия будет продаваться (тот же период год назад). Поэтому число может отличаться от страниц «Заказ» и «Бюджет», где сезонной поправки нет.">Темп с сезоном, шт/дн</th>'
+          : '<th class="sortable nb" data-k="rate" title="Темп продаж, штук в день — по нему считается «Нужно»">Темп, шт/дн</th>')+
         '<th class="sortable nb" data-k="cs">Остаток</th>'+
         '<th class="sortable nb" data-k="ordered" title="уже заказано и едет к нам">Едет</th>'+
         '<th class="sortable nb" data-k="need" title="темп × горизонт − остаток − едет">Нужно</th>'+

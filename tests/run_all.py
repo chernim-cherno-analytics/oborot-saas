@@ -186,6 +186,9 @@ SUITES = [
     ("billing_ops", "test_billing_ops.py",     False, False),
     # SEC-2 (предложение 14.11): права участника на действия всей организации.
     ("member_rights", "test_member_rights.py", False, False),
+    # TRUTH-LABELS-1: экран называет отсеянные позиции, едущую партию и
+    # сезонную базу темпа. Синтетическая база, демо-данные.
+    ("truth_labels", "test_truth_labels.py",   False, False),
     ("deps",        "test_dependencies.py",    False, False),
 ]
 

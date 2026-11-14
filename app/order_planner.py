@@ -1203,6 +1203,13 @@ def plan_order(snap: dict, brief: dict, ctx: dict, stages: list[dict],
             "no_cost_count": len(skipped["no_cost"]),
             "low_data_count": len(skipped["low_data"]),
             "stale_count": len(skipped["stale"]),
+            # TRUTH-LABELS-1 (14.11.2026): раньше здесь было только число, и
+            # распроданный в ноль бестселлер исчезал из мастера без имени, хотя
+            # на «Заказе» он «Срочно» (находка прогона пользователем). Отсев не
+            # меняется (политика FRESH ждёт решения владельца), но позиции
+            # названы, распроданные стоят первыми, и галочкой их можно взять.
+            "stale": _stale_rows(snap, skipped["stale"])[:LIST_CAP],
+            "fresh_days": int(ctx.get("fresh_days") or FRESH_DAYS),
             "small_need_count": len(skipped["small_need"]),
             "other_production_count": len(skipped["other_production"]),
             # Сколько позиций скрыто самим фактом недогруженной истории:
@@ -1305,6 +1312,28 @@ def _short(row: dict) -> dict:
         # решать не из чего.
         "cs": int(row.get("cs") or 0),
     }
+
+
+def _stale_rows(snap: dict, bases: list[str]) -> list[dict]:
+    """Отсеянные «без продаж за окно свежести»: имя, класс, остаток.
+
+    Только показ: ни одного нового числа. Распроданные (остаток 0) первыми,
+    внутри по оборачиваемости, как весь планировщик.
+    """
+    rows = []
+    for base in bases:
+        it = snap["items"].get(base) or {}
+        cs = float(it.get("cs") or 0)
+        rows.append({
+            "base_name": base,
+            "category": it.get("category") or "Без категории",
+            "cls": it.get("cls"),
+            "turnover": round(float(it.get("turnover") or 0)),
+            "cs": int(cs),
+            "sold_out": cs <= 0,
+        })
+    rows.sort(key=lambda r: (not r["sold_out"], -r["turnover"], r["base_name"]))
+    return rows
 
 
 def _by_category(items: list[dict]) -> list[dict]:
