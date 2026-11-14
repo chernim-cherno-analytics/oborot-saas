@@ -242,6 +242,40 @@ async def _log_org_context(request: Request, call_next):
     return await call_next(request)
 
 
+# OPS-WATCH-1 (14.11.2026): необработанная ошибка видна оператору.
+# Раньше 500 оставлял след только в журнале сервера, а журнал никто не читает,
+# пока клиент не напишет сам. Теперь каждая такая ошибка считается в памяти
+# (app.ops_watch), и почасовой наблюдатель шлёт в служебный канал их число.
+# Наружу по-прежнему уходит только общий текст: ни трассировки, ни типа.
+_SERVER_ERROR_TEXT = "Что-то пошло не так на нашей стороне. Мы уже видим ошибку; попробуйте ещё раз через минуту."
+
+
+@app.exception_handler(Exception)
+async def _unhandled_error(request: Request, exc: Exception):
+    import logging as _logging
+
+    from app import ops_watch
+
+    route = request.scope.get("route")
+    where = getattr(route, "path", None) or "?"
+    _logging.getLogger("oborot.errors").error(
+        "необработанная ошибка: %s %s (%s)", request.method, where,
+        type(exc).__name__, exc_info=exc,
+    )
+    ops_watch.record_server_error()
+    headers = {"Content-Security-Policy": "frame-ancestors 'self' https://online.moysklad.ru"}
+    if request.url.path.startswith("/api/"):
+        return JSONResponse(status_code=500, content={"detail": _SERVER_ERROR_TEXT},
+                            headers=headers)
+    return HTMLResponse(
+        "<!doctype html><html lang='ru'><head><meta charset='utf-8'><title>Оборот</title></head>"
+        "<body style=\"font-family:-apple-system,'Segoe UI',Roboto,sans-serif;padding:80px 24px;"
+        "text-align:center;color:#374151\"><h1 style='font-size:20px'>Ошибка на нашей стороне</h1>"
+        f"<p>{_SERVER_ERROR_TEXT}</p><p><a href='/'>На главную</a></p></body></html>",
+        status_code=500, headers=headers,
+    )
+
+
 # ТЗ F-25: сжатие ответов. Ответ доски планирования — это весь экран одним
 # документом (порядка двухсот килобайт у бренда с сотней строк), и передавать
 # его несжатым на мобильной сети значило платить временем человека за то, что
