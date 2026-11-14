@@ -1013,3 +1013,12 @@ tr.rt-weak:hover > td { background: rgba(229, 72, 77, 0.13); }
 @media (max-width: 640px) {
   #toast-root { bottom: 72px; }
 }
+
+/* --- Состояние подписки (BILLING-OPS-1) --- */
+.sub-strip {
+  background: #eef3fb; border-bottom: 1px solid #cfdcf0; color: #1f3a63;
+  padding: 6px 22px; font-size: 12.5px; line-height: 1.45;
+}
+.sub-strip a { color: inherit; font-weight: 600; text-decoration: underline; margin-left: 6px; }
+.sub-strip.sub-blocked { background: #fdecec; border-bottom-color: #f2c4c4; color: #7a1f1f; }
+.sub-strip strong { font-weight: 700; }

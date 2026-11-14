@@ -246,7 +246,13 @@ function fmtMoney(n){ n=n||0;
 function esc(s){ return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/"/g,"&quot;"); }
 async function api(url,opts){ const o=opts||{};
   const r=await fetch(url,{method:o.method||"GET",headers:{"Content-Type":"application/json","X-Oborot-CSRF":"1"},body:o.body?JSON.stringify(o.body):undefined});
-  if(!r.ok) throw new Error("HTTP "+r.status); return r.json(); }
+  if(!r.ok){
+    /* SEC-2: показать текст сервера («Доступно только владельцу…»), а не голый код. */
+    let msg="HTTP "+r.status;
+    try{ const j=await r.json(); if(j&&typeof j.detail==="string") msg=j.detail; }catch(_){}
+    throw new Error(msg);
+  }
+  return r.json(); }
 
 function gradeKey(it){
   if(it.group!=="rank") return "bad";  // как в legacy: none → слабые
@@ -681,7 +687,13 @@ document.addEventListener("change", async e=>{
       await api("/api/ordered",{method:"POST",body:{base_name:base,qty:v}});
       ITEMS.forEach(it=>{ if(it.base_name===base) it.ordered_manual=v; });
       renderSummary(); renderSummaryCat();
-    }catch(err){ alert("Не удалось сохранить «Заказано»: "+err.message); }
+    }catch(err){
+      /* Вернуть в поле сохранённое значение: несохранённая цифра не должна висеть. */
+      const it=ITEMS.find(x=>x.base_name===base);
+      const prev=it?(it.ordered_manual||0):0;
+      t.value=prev; t.classList.toggle("has",prev>0);
+      alert("Не удалось сохранить «Заказано»: "+err.message);
+    }
   }
   if(t.classList&&t.classList.contains("catsel")){
     const base=t.getAttribute("data-base");
@@ -690,7 +702,7 @@ document.addEventListener("change", async e=>{
     try{
       await api("/api/categories/override",{method:"POST",body:{base_name:base,category:cat}});
       await load();
-    }catch(err){ alert("Не сохранилось: "+err.message); }
+    }catch(err){ render(); alert("Не сохранилось: "+err.message); }
   }
 });
 document.getElementById("search").addEventListener("input",()=>{ saveView(); render(); });

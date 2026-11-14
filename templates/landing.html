@@ -131,6 +131,15 @@
   .demo-step{font-size:12.5px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;
     color:var(--blue);margin-bottom:14px}
   table.demo-t{width:100%;border-collapse:collapse;font-size:14px;margin-bottom:12px}
+  /* На 390 px таблица демо была шире экрана (горизонтальный скролл всей
+     страницы, scrollWidth 568). Прокручивается сама карточка. */
+  .demo-card{overflow-x:auto;-webkit-overflow-scrolling:touch}
+  .vsms{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+  .vsms-card{background:#fff;border:1px solid var(--line);border-radius:var(--radius);padding:22px 24px;box-shadow:var(--shadow-card)}
+  .vsms-card h3{font-size:16px;margin-bottom:8px}
+  .vsms-card p{font-size:14.5px;color:var(--muted)}
+  .vsms-note{font-size:13px;color:var(--muted);margin-top:16px}
+  @media (max-width:640px){ .vsms{grid-template-columns:1fr} .demo-cols{grid-template-columns:1fr} }
   .demo-t th{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);
     font-weight:600;text-align:left;padding:8px 10px;border-bottom:1px solid var(--line)}
   .demo-t td{padding:9px 10px;border-bottom:1px solid #eef2f7}
@@ -415,7 +424,7 @@
         <p class="pain-q">«В МойСкладе всё есть, кроме ответа: что и сколько заказывать в цех»</p>
         <div class="f-solves"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>Что делает «Оборот»</div>
         <h3>Заказ в один клик в МойСклад</h3>
-        <p>Рекомендация превращается в готовый заказ на производство прямо в вашем МойСклад: позиции, размеры, количества. Ничего не нужно перебивать руками из таблицы в учётку.</p>
+        <p>Рекомендация превращается в готовый документ «Заказ поставщику» прямо в вашем МойСклад: позиции, размеры, количества. Ничего не нужно перебивать руками из таблицы в учётку, а цеху уходит Excel с сеткой размеров.</p>
         <div class="f-demo">
           <div class="mini-rows">
             <div><span>Рекомендация системы</span><b class="num">14 позиций · 312 шт</b></div>
@@ -533,7 +542,7 @@
       <p class="demo-verdict"><b>Кто будет считать все эти цифры по сотням позиций — каждый день?</b> Мы. Именно для этого и существует «Оборот»: он находит и лидеров, и скрытых аутсайдеров — те прячутся за большой выручкой просто потому, что вечно лежат на складе.</p>
       <div style="display:flex; gap:14px; flex-wrap:wrap; margin-top:22px;">
         <a class="btn btn-primary" href="/register">Посчитать по моим товарам — 14 дней бесплатно</a>
-        <a class="btn btn-ghost" href="/register">Посмотреть на демо-данных</a>
+        <a class="btn btn-ghost" href="/register" title="После регистрации нажмите «Демо-данные»: синтетический бренд, МойСклад подключать не нужно">Посмотреть на демо-данных (после регистрации, без МойСклада)</a>
       </div>
     </div>
   </div>
@@ -551,7 +560,7 @@
       <div class="step">
         <div class="step-n">1</div>
         <h3>Вставьте токен МойСклад</h3>
-        <p>Токен с доступом только на чтение — создаётся в настройках МойСклад за пару минут. Ничего не устанавливается, ваши процессы не меняются.</p>
+        <p>Токен создаётся в настройках МойСклад за пару минут. «Оборот» только читает данные; единственная запись в ваш МойСклад — заказ поставщику по вашей кнопке. Ничего не устанавливается, ваши процессы не меняются.</p>
         <span class="step-time">≈ 2 минуты</span>
       </div>
       <div class="step">
@@ -567,6 +576,30 @@
         <span class="step-time">Каждый день, без вашего участия</span>
       </div>
     </div>
+  </div>
+</section>
+
+<!-- ═══ Чем отличается от «Управления закупками» МойСклада ═══
+     Главное возражение клиента: «чем это лучше встроенных Закупок». Каждое
+     утверждение ниже проверяемо по справке МойСклада («Закупки →
+     Управление закупками»: продаж в день = продажи за период ÷ дни периода;
+     заказать = дни прогноза × продаж в день − доступно). Нельзя писать
+     «единственный» и «точнее»: учёт дней без остатка есть у ряда приложений
+     каталога (разбор: claude/SRAVNENIE_Oborot_vs_Zakupki_MS_2026-11-14.md). -->
+<section id="vs-moysklad">
+  <div class="wrap">
+    <div class="sec-head">
+      <div class="sec-eyebrow">Если у вас уже есть МойСклад</div>
+      <h2>Чем это отличается от «Управления закупками» в МойСкладе</h2>
+      <p class="sec-sub">Встроенный отчёт отвечает «сколько не хватает на N дней». Для бренда, который шьёт партиями под бюджет, этого мало.</p>
+    </div>
+    <div class="vsms">
+      <div class="vsms-card"><h3>Темп по дням, когда вещь была</h3><p>В МойСкладе скорость продаж делится на все дни периода, включая дни, когда вещи не было на складе. «Оборот» делит только на дни в наличии, поэтому распроданный хит не выглядит медленным.</p></div>
+      <div class="vsms-card"><h3>Бюджет и лимит на модель</h3><p>Во встроенном расчёте бюджета нет. В «Обороте» вы задаёте сумму и лимит на одну модель, и план в них укладывается, с минимальной партией и коробом цеха.</p></div>
+      <div class="vsms-card"><h3>Срок производства и транши</h3><p>Вместо одного горизонта «на N дней» «Оборот» учитывает дату прихода партии с производства и раскладывает оплату на транши предоплаты по датам.</p></div>
+      <div class="vsms-card"><h3>Честный отказ</h3><p>Если нет себестоимости или истории мало, «Оборот» не выдумывает число, а говорит, чего не хватает. На выходе тот же документ в вашем МойСкладе: заказ поставщику по размерам, плюс Excel для цеха.</p></div>
+    </div>
+    <p class="vsms-note">Сравнение по справке МойСклада о разделе «Закупки → Управление закупками».</p>
   </div>
 </section>
 
@@ -619,11 +652,11 @@
             <td class="ob">По продажам каждой модели</td>
           </tr>
           <tr>
-            <td>Заказ в производство</td>
+            <td>Заказ поставщику / в цех</td>
             <td>—</td>
             <td>Таблицей на почту</td>
             <td>Переносить в учётку руками</td>
-            <td class="ob">В один клик в МойСклад</td>
+            <td class="ob">Документ в МойСклад в один клик и Excel для цеха</td>
           </tr>
           <tr>
             <td>Отпуска и увольнения</td>
@@ -719,7 +752,6 @@
         <ul>
           <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span>Всё из тарифа «Бренд»</span></li>
           <li class="soon"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span>Маркетплейсы и Shopify<span class="soon-tag">скоро</span></span></li>
-          <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span>Доступ к API</span></li>
           <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span>Приоритетная поддержка</span></li>
         </ul>
         <a class="btn btn-ghost" href="/register">Попробовать бесплатно</a>
@@ -740,7 +772,7 @@
     <div class="faq">
       <details>
         <summary>Насколько безопасно передавать токен МойСклад?<span class="pl">+</span></summary>
-        <div class="a">Токен хранится в зашифрованном виде и используется в режиме «только чтение». «Оборот» ничего не меняет в вашем МойСклад без вашей команды: единственная запись — заказ на производство, и он создаётся только когда вы сами нажимаете кнопку. Токен можно отозвать в настройках МойСклад в любой момент — доступ прекратится сразу.</div>
+        <div class="a">Токен хранится в зашифрованном виде. «Оборот» только читает данные и ничего не меняет в вашем МойСклад без вашей команды: единственная запись — документ «Заказ поставщику», и он создаётся только когда вы сами нажимаете кнопку. Токен можно отозвать в настройках МойСклад в любой момент — доступ прекратится сразу.</div>
       </details>
       <details>
         <summary>Какие данные вы видите?<span class="pl">+</span></summary>
@@ -760,7 +792,7 @@
       </details>
       <details>
         <summary>Что будет после 14 дней бесплатного периода?<span class="pl">+</span></summary>
-        <div class="a">Вы выбираете тариф и оплачиваете — или просто ничего не делаете, и доступ приостановится. Никаких автосписаний нет: карта при регистрации не запрашивается, скрытых платежей не бывает. Данные сохраняются, вернуться можно в любой момент.</div>
+        <div class="a">Вы выбираете тариф и оплачиваете — или просто ничего не делаете, и «Оборот» перейдёт в режим просмотра: ваши данные и расчёты видны и выгружаются, а синхронизация, новые расчёты заказа и отправка в МойСклад останавливаются до оплаты. Никаких автосписаний нет: карта при регистрации не запрашивается, скрытых платежей не бывает. Данные сохраняются, вернуться можно в любой момент.</div>
       </details>
       <details>
         <summary>Можно ли отменить подписку?<span class="pl">+</span></summary>

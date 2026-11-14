@@ -9,6 +9,7 @@ from datetime import date, datetime
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import Path as PathParam
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Mapped, Session, mapped_column
@@ -200,7 +201,7 @@ def api_discount_overrides(
 @router.post("/api/discount-overrides")
 def api_set_discount_override(
     body: DiscountIn,
-    ctx: AuthContext = Depends(require_auth_api),
+    ctx: AuthContext = Depends(require_owner_api),
     db: Session = Depends(get_db),
 ):
     """Установить/снять ручную скидку позиции (0 = снять).
@@ -413,7 +414,7 @@ def api_hidden(ctx: AuthContext = Depends(require_auth_api), db: Session = Depen
 
 @router.post("/api/hidden")
 def api_set_hidden(
-    body: HiddenIn, ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)
+    body: HiddenIn, ctx: AuthContext = Depends(require_owner_api), db: Session = Depends(get_db)
 ):
     """Убрать в архив / вернуть из архива.
 
@@ -460,7 +461,7 @@ def api_categories(ctx: AuthContext = Depends(require_auth_api), db: Session = D
 @router.post("/api/categories/override")
 def api_category_override(
     body: CategoryOverrideIn,
-    ctx: AuthContext = Depends(require_auth_api),
+    ctx: AuthContext = Depends(require_owner_api),
     db: Session = Depends(get_db),
 ):
     """Перенести отдельную позицию в другую категорию ('' = сбросить).
@@ -488,7 +489,7 @@ def api_category_override(
 @router.post("/api/categories/merge")
 def api_category_merge(
     body: CategoryMergeIn,
-    ctx: AuthContext = Depends(require_auth_api),
+    ctx: AuthContext = Depends(require_owner_api),
     db: Session = Depends(get_db),
 ):
     """Влить категорию в другую ('' = отменить слияние этой категории)."""
@@ -894,6 +895,36 @@ def export_budget_xlsx(
     return export_xlsx.xlsx_response(wb, "Бюджет закупки.xlsx", "budget.xlsx")
 
 
+@router.get("/api/orders/{order_id}/export.xlsx")
+def export_order_xlsx(
+    order_id: int = PathParam(..., ge=1, le=2_147_483_647),
+    ctx: AuthContext = Depends(require_auth_api),
+    db: Session = Depends(get_db),
+):
+    """Зафиксированный заказ в Excel: сетка для цеха и календарь платежей.
+
+    ORDER-EXPORT-1. Только чтение: состав берётся из сохранённого заказа как
+    есть, ничего не пересчитывается. Чужой и несуществующий заказ отвечают
+    одинаково (404), чтобы перебором номеров нельзя было узнать чужие.
+    """
+    from app import api as _api
+    from app.analytics_extra import _size_sort_key
+    from app.models import Production, ProductionOrder
+
+    order = db.get(ProductionOrder, order_id)
+    if order is None or order.org_id != ctx.org.id:
+        raise HTTPException(status_code=404, detail="Заказ не найден")
+    production_name = ""
+    if order.production_id:
+        prod = db.get(Production, order.production_id)
+        if prod is not None and prod.org_id == ctx.org.id:
+            production_name = prod.name or ""
+    payments = _api._order_payments(db, order, analytics.extra_settings(ctx.org))
+    wb = export_xlsx.order_workbook(ctx.org.name, _api._order_out(order), production_name,
+                                    payments, _size_sort_key)
+    return export_xlsx.xlsx_response(wb, f"Заказ №{order.id}.xlsx", f"order-{order.id}.xlsx")
+
+
 # ── Тарифы и заявка на счёт ──────────────────────────────────────────────────
 # ВАЖНО: PLANS — ЕДИНСТВЕННОЕ место в коде, где задан состав тарифной сетки.
 # Чтобы убрать тариф, добавить новый или переписать состав — правится только
@@ -941,7 +972,6 @@ PLANS = [
         "features": [
             "Всё из тарифа «Бренд»",
             "Маркетплейсы и Shopify — скоро",
-            "Доступ к API",
             "Приоритетная поддержка",
         ],
     },

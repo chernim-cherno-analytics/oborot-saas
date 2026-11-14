@@ -177,6 +177,28 @@ SUITES = [
     # учения — только в чат сервиса, фиксированный текст, без секретов.
     # Нужен порт mock-Telegram (четвёртое поле), наружу набор не ходит.
     ("ops_alert",   "test_ops_alert.py",       False, True),
+    # OPS-WATCH-1: наблюдение оператора (падающие синки клиентов, ошибки
+    # сервера) в служебный канал; отчёт оператора. Синтетическая база.
+    ("ops_watch",   "test_ops_watch.py",       False, False),
+    # ORDER-EXPORT-1: Excel зафиксированного заказа для цеха.
+    ("order_export", "test_order_export.py",   False, False),
+    # BILLING-OPS-1: инструмент оплаты оператора и полоса подписки.
+    ("billing_ops", "test_billing_ops.py",     False, False),
+    # SEC-2 (решение владельца 14.11): права участника на действия всей организации.
+    ("member_rights", "test_member_rights.py", False, False),
+    # TRUTH-LABELS-1: экран называет отсеянные позиции, едущую партию и
+    # сезонную базу темпа. Синтетическая база, демо-данные.
+    ("truth_labels", "test_truth_labels.py",   False, False),
+    # LANDING-TRUTH-1: лендинг и тарифы не обещают того, чего нет.
+    ("landing", "test_landing_truth.py",       False, False),
+    # D-65: «едет» не закрывает продажи до прихода партии.
+    ("incoming", "test_incoming_formula.py",   False, False),
+    # D-66: при окне «сезон» сезонность учитывается один раз.
+    ("season_once", "test_season_once.py",     False, False),
+    # WIZARD-LABELS-1: мастер называет базу сумм и источник ритма.
+    ("wizard_labels", "test_wizard_labels.py", False, False),
+    # XLSX-TRUTH-1: Excel «Что заказать» не выдаёт неполную сумму за полную.
+    ("xlsx_truth", "test_xlsx_truth.py",       False, False),
     ("deps",        "test_dependencies.py",    False, False),
 ]
 

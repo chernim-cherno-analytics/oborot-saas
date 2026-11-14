@@ -408,18 +408,29 @@ def _replenish_sheet(wb: Workbook, org_name: str, sheet_title: str, name: str,
     row = 3
     total_need = 0
     total_sum = 0.0
+    no_cost = 0
     for it in items:
         cost = float(it.get("cost_price") or 0)
-        order_sum = round(it["need"] * cost)
+        # XLSX-TRUTH-1: позиция без себестоимости не бесплатна. Раньше в
+        # колонке «Сумма заказа» стоял 0, а итог не говорил, что он неполный
+        # (на экране «СУММА НЕПОЛНАЯ», в файле ничего: находка прогона).
+        order_sum = round(it["need"] * cost) if cost > 0 else None
         sold_year = sum(round(s.get("sold365") or 0) for s in it.get("sizes", {}).values())
         total_need += it["need"]
-        total_sum += order_sum
+        if order_sum is None:
+            if int(it["need"] or 0) > 0:
+                no_cost += 1
+        else:
+            total_sum += order_sum
+        note = _replenish_note(it, window_ru)
+        if cost <= 0:
+            note = "себестоимость не указана: сумма неизвестна" + (f"; {note}" if note else "")
         _write_row(ws, row, [
             it["base_name"], it.get("category") or "", CLS_RU.get(it["cls"], it["cls"]),
             it["turnover"], it["rate"], sold_year, it["cs"], it.get("ordered") or 0,
             it.get("wos"), _fmt_date_ru(it.get("stockout_date")), it["need"],
             cost if cost > 0 else None, order_sum,
-            it.get("production_name") or "", _replenish_note(it, window_ru),
+            it.get("production_name") or "", note,
         ], formats)
         row += 1
         # Размерная сетка: сток / продано за год / рекомендация — отступом.
@@ -437,6 +448,8 @@ def _replenish_sheet(wb: Workbook, org_name: str, sheet_title: str, name: str,
             row += 1
 
     label = f"Итого по «{name}»: {len(items)} поз." if name else f"Итого: {len(items)} поз."
+    if no_cost:
+        label += f" (сумма неполная: {no_cost} поз. без себестоимости)"
     _write_total(ws, row, len(headers),
                  {11: total_need, 13: round(total_sum)}, formats, label=label)
     note_row = row + 2
@@ -451,7 +464,7 @@ def _replenish_sheet(wb: Workbook, org_name: str, sheet_title: str, name: str,
     excluded = data.get("excluded") or []
     _cell(ws, note_row, 1,
           f"Позиции, не попавшие в заказ, — на листе «{_EXCLUDED_SHEET}» "
-          f"({len(excluded)} шт). Числа посчитаны по темпу «{window_ru}».",
+          f"({len(excluded)} поз.). Числа посчитаны по темпу «{window_ru}».",
           font=_TITLE_FONT)
     _autofit(ws)
     return ws
@@ -859,4 +872,124 @@ def supply_workbook(org_name: str, data: dict) -> Workbook:
     if row == 3:
         _cell(ws, row, 1, "Назначений пока нет", font=_TITLE_FONT)
     _autofit(ws)
+    return wb
+
+
+# ── Зафиксированный заказ: файл для цеха (ORDER-EXPORT-1) ─────────────────────
+
+_STATUS_RU = {"draft": "Черновик", "sent": "В производстве", "received": "Принят на склад"}
+
+
+def order_workbook(org_name: str, order: dict, production_name: str,
+                   payments: list[dict], size_key) -> Workbook:
+    """Книга одного ЗАФИКСИРОВАННОГО заказа: что отдать в цех и когда платить.
+
+    ЗАЧЕМ (ORDER-EXPORT-1, 14.11.2026). До этого Excel был только у текущей
+    РЕКОМЕНДАЦИИ («Заказ»), а рекомендация после размещения уже другая: в ней
+    учтено то, что заказали. Отдать цеху именно то, что зафиксировано в заказе,
+    было нечем (находка прогона пользователем-владелицей бренда). Здесь только
+    состав заказа, как он сохранён, без пересчёта: ни темпа, ни потребности,
+    ни новых чисел.
+
+    Лист «Заказ»: модель × размеры (сетка заказа), итого штук, себестоимость за
+    штуку из заказа, сумма. Строка без себестоимости не считается бесплатной:
+    сумма пустая, итог подписан «без N позиций». Лист «Платежи»: календарь
+    платежей заказа, тот же, что на экране.
+    """
+    items = [i for i in (order.get("items") or []) if isinstance(i, dict)]
+
+    def _sizes_of(it: dict) -> dict:
+        raw = it.get("sizes")
+        return raw if isinstance(raw, dict) else {}
+
+    def _units(value) -> int | None:
+        # Повреждённое значение размера не роняет файл (ревью 14.11, P2):
+        # пустая ячейка честнее, чем 500 у человека, который несёт файл в цех.
+        try:
+            n = int(round(float(value)))
+        except (TypeError, ValueError):
+            return None
+        return n or None
+
+    sizes = sorted({str(s) for i in items for s in _sizes_of(i)}, key=size_key)
+    size_titles = [s if s.strip() else "б/р" for s in sizes]
+    headers = ["Модель", *size_titles, "Итого, шт", "Себестоимость, ₽/шт", "Сумма, ₽"]
+    ncols = len(headers)
+    # Идентификатор партии (CCB-…) в файл не пишем: по D-50 первый слой
+    # только вводит имя партии, внешние выгрузки с ним решаются отдельно.
+    subtitle = f"заказ №{order.get('id')}"
+    wb = Workbook()
+    ws = _new_sheet(wb, "Заказ", org_name, ncols, subtitle=subtitle)
+    _write_header(ws, headers)
+    fmts = {i: FMT_INT for i in range(2, ncols - 1)}
+    # Цена с копейками: сумма строки считается от неё, и в файле
+    # «цена × штуки» обязана совпадать с «Суммой» (ревью 14.11, P2).
+    fmts[ncols - 1] = '#,##0.00" ₽"'
+    fmts[ncols] = '#,##0.00" ₽"'
+    total_fmts = dict(fmts)
+    total_fmts[ncols] = FMT_MONEY
+    row = 3
+    total_qty, total_sum, no_cost = 0, 0.0, []
+    for it in items:
+        qty = _units(it.get("qty")) or 0
+        try:
+            cost = float(it.get("cost") or 0)
+        except (TypeError, ValueError):
+            cost = 0.0
+        by_size = _sizes_of(it)
+        values = [str(it.get("base_name") or "")]
+        values += [_units(by_size.get(s)) for s in sizes]
+        values += [qty, round(cost, 2) if cost > 0 else None,
+                   round(cost * qty, 2) if cost > 0 else None]
+        _write_row(ws, row, values, fmts)
+        if cost <= 0:
+            no_cost.append(str(it.get("base_name") or ""))
+        total_qty += qty
+        # Итог считается тем же способом, что карточка заказа и платежи
+        # (api._order_totals: round(sum(cost*qty))), без округления по строкам:
+        # итог файла обязан совпадать с экраном (ревью 14.11, раунд 2, P1).
+        total_sum += cost * qty if cost > 0 else 0
+        row += 1
+    label = "Итого" if not no_cost else f"Итого (сумма без {len(no_cost)} поз. без себестоимости)"
+    _write_total(ws, row, ncols, {ncols - 2: total_qty, ncols: round(total_sum)}, total_fmts, label=label)
+    row += 2
+    info = [
+        ("Заказ", f"№{order.get('id')} · {order.get('name') or ''}"),
+        ("Статус", _STATUS_RU.get(order.get("status") or "", order.get("status") or "")),
+        ("Создан", _fmt_date_ru((order.get("created_at") or "")[:10])),
+        ("Производство", production_name or "не указано"),
+        ("Плановая дата прихода", _fmt_date_ru(order.get("eta_date")) if order.get("eta_date") else "не указана"),
+    ]
+    if no_cost:
+        # Ячейка Excel держит не больше 32 767 знаков: список обрезаем словами.
+        shown, length = [], 0
+        for name in no_cost:
+            if length + len(name) + 2 > 2000:
+                break
+            shown.append(name)
+            length += len(name) + 2
+        rest = len(no_cost) - len(shown)
+        info.append(("Без себестоимости", ", ".join(shown) + (f" и ещё {rest}" if rest else "")))
+    for k, v in info:
+        _cell(ws, row, 1, k, font=_TOTAL_FONT)
+        _cell(ws, row, 2, v)
+        row += 1
+    _autofit(ws)
+
+    ps = _new_sheet(wb, "Платежи", org_name, 3, subtitle=subtitle, first=False)
+    _write_header(ps, ["Дата", "Платёж", "Сумма, ₽"])
+    prow = 3
+    for p in payments or []:
+        _write_row(ps, prow, [_fmt_date_ru(p.get("date")), str(p.get("label") or ""),
+                              round(float(p.get("amount") or 0))], {3: FMT_MONEY})
+        prow += 1
+    if prow == 3:
+        _cell(ps, prow, 1, "Календарь платежей у заказа не задан", font=_TITLE_FONT)
+    else:
+        _write_total(ps, prow, 3, {3: round(sum(float(p.get("amount") or 0) for p in payments))},
+                     {3: FMT_MONEY})
+        if no_cost:
+            _cell(ps, prow + 2, 1, f"Позиции без себестоимости ({len(no_cost)}) в платежи не вошли: "
+                  "сумма по ним неизвестна.", font=_TITLE_FONT)
+    _autofit(ps)
     return wb

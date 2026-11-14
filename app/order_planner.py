@@ -505,6 +505,14 @@ def _seasonal_rates(
 
     Возвращает (темпы по базам, сезонные индексы категорий).
     """
+    # D-66 (решение владельца 14.11.2026, вариант A): при окне темпа
+    # «сезон» базовый темп rate_active УЖЕ сезонный (то же окно прошлого
+    # года), и умножение на сезонный индекс учитывало сезон дважды: на
+    # демо мастер просил 1 435 шт против 1 123 на «Заказе», «Скетч» 179
+    # против 101. Вариант: при окне «сезон» индекс не применяется.
+    if (snap.get("settings") or {}).get("rate_window") == "season":
+        return ({base: max(0.0, float(it.get("rate_active") or it.get("rate_year") or 0))
+                 for base, it in snap["items"].items()}, {})
     w_from = (date_from - timedelta(days=365)).isoformat()
     w_to = (date_to - timedelta(days=365)).isoformat()
     dis_w = window_dis(db, org.id, min_stock, w_from, w_to)
@@ -689,7 +697,8 @@ def _candidates(snap: dict, brief: dict, ctx: dict) -> tuple[list[dict], dict]:
         r_cover = float(ctx["rate_cover"].get(base) or 0)
         cs = float(it.get("cs") or 0)
         ordered = max(0.0, float(it.get("ordered") or 0))
-        proj_stock = max(0.0, cs + ordered - r_lead * days_to_eta)
+        # D-65: «едет» не закрывает продажи до прихода (см. analytics).
+        proj_stock = max(0.0, cs - r_lead * days_to_eta) + ordered
         need = max(0, int(round(r_cover * cover - proj_stock)))
         # Дыра: остатка не хватит дожить до прихода заказа.
         gap_days = 0
@@ -798,7 +807,12 @@ def _allocate(cands: list[dict], brief: dict, ctx: dict, stages: list[dict]) -> 
     # достигли потолка доли — значит лимит, не достигли — значит деньги.
     cap_units: dict[str, int] = {}
     moq_skipped: dict[str, int] = {}   # позиция → на сколько дней хватило бы партии
-    moq_over_cap: dict[str, int] = {}  # позиция → во сколько ₽ обходится партия
+    moq_over_cap: dict[str, int] = {}  # позиция → во сколько ₽ (база бюджета) обходится партия
+    # OVERCAP-FULL-COST-1: сколько ШТУК в этой партии. Нужно, чтобы назвать
+    # полную цену партии: moq_over_cap считается в деньгах базы бюджета
+    # («на сейчас» = доля предоплаты), и прогон пользователем увидел
+    # «партия 166 036 ₽» при настоящих 368 970 ₽ (предоплата 45 %).
+    moq_over_cap_qty: dict[str, int] = {}
     spent = 0.0
 
     def unit_pay(c: dict) -> float:
@@ -854,6 +868,7 @@ def _allocate(cands: list[dict], brief: dict, ctx: dict, stages: list[dict]) -> 
                             moq = moq_of(c)
                             first = max(pack, -(-moq // pack) * pack if moq > 0 else pack)
                             moq_over_cap[base] = int(round(first * unit))
+                            moq_over_cap_qty[base] = int(first)
                         return
             if target <= have:
                 return
@@ -897,6 +912,7 @@ def _allocate(cands: list[dict], brief: dict, ctx: dict, stages: list[dict]) -> 
             checked = moq if cap is None else moq_qty
             if cap_per_item > 0 and checked * unit > cap_per_item + 1:
                 moq_over_cap[base] = int(round(moq_qty * unit))
+                moq_over_cap_qty[base] = int(moq_qty)
                 return
             if (moq_qty - have) * unit > rest:
                 return  # партия не по карману
@@ -944,7 +960,8 @@ def _allocate(cands: list[dict], brief: dict, ctx: dict, stages: list[dict]) -> 
 
     return {
         "alloc": alloc, "reasons": reasons, "cap_units": cap_units,
-        "moq_skipped": moq_skipped, "moq_over_cap": moq_over_cap, "spent": spent,
+        "moq_skipped": moq_skipped, "moq_over_cap": moq_over_cap,
+        "moq_over_cap_qty": moq_over_cap_qty, "spent": spent,
         "reserve": reserve, "new_cost": new_cost, "new_over_budget": over_budget,
         "money": money, "pay_share": pay_share, "budget_basis": budget_basis,
         "cap_per_item": cap_per_item,
@@ -1007,6 +1024,7 @@ def plan_order(snap: dict, brief: dict, ctx: dict, stages: list[dict],
     res = _allocate(cands, brief, ctx, stages)
     alloc, reasons = res["alloc"], res["reasons"]
 
+    _cost_by_base = {c["base_name"]: float(c["cost_price"] or 0) for c in cands}
     items, not_included = [], []
     # Аудит 22.08: «упущено» складывало недобор по позициям, которые В ЗАКАЗЕ,
     # и показывалось над таблицей, где их нет (4,6 млн над таблицей на 671 тыс).
@@ -1024,6 +1042,10 @@ def plan_order(snap: dict, brief: dict, ctx: dict, stages: list[dict],
                 "cost_price": c["cost_price"], "need_rub": c["need"] * c["cost_price"],
                 "lost_margin": round(unmet * c["margin"]),
                 "moq_cost": res["moq_over_cap"].get(c["base_name"]),
+                # Полная цена той же партии (себестоимость × штуки), когда
+                # бюджет считается «на сейчас», moq_cost это только доля.
+                "moq_full_cost": (round(res["moq_over_cap_qty"][c["base_name"]] * c["cost_price"])
+                                  if c["base_name"] in res["moq_over_cap_qty"] else None),
                 "gap_days": c["gap_days"],
             })
             continue
@@ -1194,7 +1216,13 @@ def plan_order(snap: dict, brief: dict, ctx: dict, stages: list[dict],
         # его нарушала (80,6% бюджета при лимите 30%), теперь позиция уходит
         # сюда с ценой партии, и человек решает сам.
         "moq_over_cap": [
-            {"base_name": b, "batch_cost": v, "limit": round(res["cap_per_item"])}
+            {"base_name": b, "batch_cost": v, "limit": round(res["cap_per_item"]),
+             "batch_qty": res["moq_over_cap_qty"].get(b),
+             "batch_full_cost": (round(res["moq_over_cap_qty"][b] * _cost_by_base.get(b, 0))
+                                 if b in res["moq_over_cap_qty"] else None),
+             # База денег бюджета: «now» — то, что платится в день
+             # размещения; лимит доли меряется в ней же.
+             "budget_basis": res["budget_basis"]}
             for b, v in sorted(res["moq_over_cap"].items(), key=lambda kv: -kv[1])[:LIST_CAP]
         ],
         "review": {  # то, что система считать не берётся — решает человек
@@ -1203,6 +1231,13 @@ def plan_order(snap: dict, brief: dict, ctx: dict, stages: list[dict],
             "no_cost_count": len(skipped["no_cost"]),
             "low_data_count": len(skipped["low_data"]),
             "stale_count": len(skipped["stale"]),
+            # TRUTH-LABELS-1 (14.11.2026): раньше здесь было только число, и
+            # распроданный в ноль бестселлер исчезал из мастера без имени, хотя
+            # на «Заказе» он «Срочно» (находка прогона пользователем). Отсев не
+            # меняется (политика FRESH ждёт решения владельца), но позиции
+            # названы, распроданные стоят первыми, и галочкой их можно взять.
+            "stale": _stale_rows(snap, skipped["stale"])[:LIST_CAP],
+            "fresh_days": int(ctx.get("fresh_days") or FRESH_DAYS),
             "small_need_count": len(skipped["small_need"]),
             "other_production_count": len(skipped["other_production"]),
             # Сколько позиций скрыто самим фактом недогруженной истории:
@@ -1305,6 +1340,28 @@ def _short(row: dict) -> dict:
         # решать не из чего.
         "cs": int(row.get("cs") or 0),
     }
+
+
+def _stale_rows(snap: dict, bases: list[str]) -> list[dict]:
+    """Отсеянные «без продаж за окно свежести»: имя, класс, остаток.
+
+    Только показ: ни одного нового числа. Распроданные (остаток 0) первыми,
+    внутри по оборачиваемости, как весь планировщик.
+    """
+    rows = []
+    for base in bases:
+        it = snap["items"].get(base) or {}
+        cs = float(it.get("cs") or 0)
+        rows.append({
+            "base_name": base,
+            "category": it.get("category") or "Без категории",
+            "cls": it.get("cls"),
+            "turnover": round(float(it.get("turnover") or 0)),
+            "cs": int(cs),
+            "sold_out": cs <= 0,
+        })
+    rows.sort(key=lambda r: (not r["sold_out"], -r["turnover"], r["base_name"]))
+    return rows
 
 
 def _by_category(items: list[dict]) -> list[dict]:

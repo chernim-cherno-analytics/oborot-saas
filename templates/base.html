@@ -42,13 +42,14 @@
      подписке (PILOT-UX-SHELL-1): он виден при `org.demo` независимо от тарифа.
      Прежде слова про демо жили внутри триальной полоски, и демо-организация на
      платном тарифе не видела их нигде. #}
-  {% set show_trial = org.plan == 'trial' and org.source != 'ms_app' %}
+  {% set show_trial = org.plan == 'trial' and org.source != 'ms_app' and org.trial_active %}
   {% if show_trial or org.demo %}
   <div class="trial-strip">
     {% if org.demo %}<strong>Демо-режим:</strong> показаны синтетические данные.
     {% endif %}{% if show_trial %}Триал до <span data-fmt-date="{{ org.trial_ends_at }}">{{ org.trial_ends_at }}</span>.{% endif %}
   </div>
   {% endif %}
+  {% set nudge = true %}{% include "_subscription_strip.html" %}
 
   <main class="content embed-content">
     {{ self.content() }}
@@ -140,12 +141,14 @@
 
     {# Демо — при `org.demo` на любом тарифе; триал — как и прежде, только у
        триала. Одна полоска на оба факта, но ни один не выводится из другого. #}
-    {% if org.plan == 'trial' or org.demo %}
+    {% set show_trial_main = org.plan == 'trial' and org.trial_active %}
+    {% if show_trial_main or org.demo %}
     <div class="trial-strip">
       {% if org.demo %}<strong>Демо-режим:</strong> показаны синтетические данные.
-      {% endif %}{% if org.plan == 'trial' %}Триал до <span data-fmt-date="{{ org.trial_ends_at }}">{{ org.trial_ends_at }}</span>.{% endif %}
+      {% endif %}{% if show_trial_main %}Триал до <span data-fmt-date="{{ org.trial_ends_at }}">{{ org.trial_ends_at }}</span>.{% endif %}
     </div>
     {% endif %}
+    {% set nudge = true %}{% include "_subscription_strip.html" %}
 
     <main class="content">
       {% block content %}{% endblock %}

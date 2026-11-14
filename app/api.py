@@ -1245,7 +1245,7 @@ def api_order_receipts_add(
 
 @router.delete("/orders/{order_id}")
 def api_order_delete(
-    order_id: int = _id_path(), ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)
+    order_id: int = _id_path(), ctx: AuthContext = Depends(require_owner_api), db: Session = Depends(get_db)
 ):
     """Удаление заказа: draft — свободно; sent — с вычетом из «едет»; received — нельзя."""
     order = db.get(ProductionOrder, order_id)
@@ -1362,7 +1362,7 @@ class OrderedIn(BaseModel):
 
 @router.post("/ordered")
 def api_set_ordered(
-    body: OrderedIn, ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)
+    body: OrderedIn, ctx: AuthContext = Depends(require_owner_api), db: Session = Depends(get_db)
 ):
     """Ручная правка «едет к нам» (перезапись значения по базовому имени)."""
     _require_known_base(db, ctx.org.id, body.base_name)
@@ -2337,11 +2337,15 @@ def api_production_delete(
 
 @router.post("/ordered/add")
 def api_add_ordered(
-    body: OrderedIn, ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)
+    body: OrderedIn, ctx: AuthContext = Depends(require_owner_api), db: Session = Depends(get_db)
 ):
     """«Заказ отправлен» со страницы «Заказ отдельной позиции»: ПРИБАВЛЯЕТ
     количество к «едет к нам» (в отличие от /ordered, который перезаписывает).
-    Приёмка в МойСкладе или received-статус заказа спишут это количество."""
+    Приёмка в МойСкладе или received-статус заказа спишут это количество.
+
+    SEC-2: только владелец, как и /ordered. Прибавка меняет «Едет» и рекомендацию
+    для всей организации, а откатить её можно только перезаписью через /ordered,
+    которая участнику закрыта: иначе участник мог бы ошибиться и не исправить."""
     _require_known_base(db, ctx.org.id, body.base_name)
     row = db.get(OrderedQty, (ctx.org.id, body.base_name))
     if row is None:

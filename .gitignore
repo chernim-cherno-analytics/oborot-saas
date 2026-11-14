@@ -32,3 +32,4 @@ ci_*.db-shm
 test_backup_work_*/
 test_deploy_work_*/
 test_offsite_work_*/
+billing_audit.log
