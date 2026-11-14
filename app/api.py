@@ -2337,11 +2337,15 @@ def api_production_delete(
 
 @router.post("/ordered/add")
 def api_add_ordered(
-    body: OrderedIn, ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)
+    body: OrderedIn, ctx: AuthContext = Depends(require_owner_api), db: Session = Depends(get_db)
 ):
     """«Заказ отправлен» со страницы «Заказ отдельной позиции»: ПРИБАВЛЯЕТ
     количество к «едет к нам» (в отличие от /ordered, который перезаписывает).
-    Приёмка в МойСкладе или received-статус заказа спишут это количество."""
+    Приёмка в МойСкладе или received-статус заказа спишут это количество.
+
+    SEC-2: только владелец, как и /ordered. Прибавка меняет «Едет» и рекомендацию
+    для всей организации, а откатить её можно только перезаписью через /ordered,
+    которая участнику закрыта: иначе участник мог бы ошибиться и не исправить."""
     _require_known_base(db, ctx.org.id, body.base_name)
     row = db.get(OrderedQty, (ctx.org.id, body.base_name))
     if row is None:
