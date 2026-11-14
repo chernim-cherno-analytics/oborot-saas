@@ -189,6 +189,8 @@ SUITES = [
     # TRUTH-LABELS-1: экран называет отсеянные позиции, едущую партию и
     # сезонную базу темпа. Синтетическая база, демо-данные.
     ("truth_labels", "test_truth_labels.py",   False, False),
+    # LANDING-TRUTH-1: лендинг и тарифы не обещают того, чего нет.
+    ("landing", "test_landing_truth.py",       False, False),
     ("deps",        "test_dependencies.py",    False, False),
 ]
 
