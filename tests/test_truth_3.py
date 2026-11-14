@@ -85,6 +85,8 @@ check("мастер: новинки прошлого плана только п�
 b_html = (ROOT / "templates" / "budget.html").read_text(encoding="utf-8")
 check("«Бюджет» объясняет отличие от мастера и формулу по D-65",
       "Мастер заказа распределяет те же деньги иначе" in b_html and "− остаток − «едет»" not in b_html)
+check("«Заказ» на телефоне прячет справочные колонки, «Заказать» остаётся на экране",
+      "@media (max-width: 480px)" in rep_html and "td:nth-child(7):not([colspan])" in rep_html)
 p_html = (ROOT / "templates" / "plans.html").read_text(encoding="utf-8")
 check("значок «Популярный» только когда тарифов больше одного",
       "p.popular && (data.plans || []).length > 1" in p_html)

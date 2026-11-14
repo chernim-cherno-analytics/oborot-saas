@@ -317,6 +317,25 @@
      их просто не видел. Здесь всё в одну колонку, подписи из data-label,
      кнопки — отдельным рядом не ниже 40 px. Ширина окна у всего раздела та
      же, что и была: прокрутки вбок нет ни у страницы, ни у списка. */
+  /* Прогон 14.11 (390 px): колонка «Заказать» была видна только после
+     прокрутки таблицы вбок. На телефоне прячем справочные колонки
+     (оборачиваемость, темп, покрытие, производство): они есть в раскрытой
+     строке (▸), а главное число строки остаётся на экране. */
+  @media (max-width: 640px) {
+    #tbl-wrap > table > thead > tr > th:nth-child(5), #tbl-wrap > table > tbody > tr > td:nth-child(5):not([colspan]),
+    #tbl-wrap > table > thead > tr > th:nth-child(6), #tbl-wrap > table > tbody > tr > td:nth-child(6):not([colspan]),
+    #tbl-wrap > table > thead > tr > th:nth-child(9), #tbl-wrap > table > tbody > tr > td:nth-child(9):not([colspan]),
+    #tbl-wrap > table > thead > tr > th:nth-child(12), #tbl-wrap > table > tbody > tr > td:nth-child(12):not([colspan]) {
+      display: none; }
+  }
+  /* Телефон: остаются позиция, статус и «Заказать»; остаток, «едет» и
+     стокаут видны в раскрытой строке (▸). */
+  @media (max-width: 480px) {
+    #tbl-wrap > table > thead > tr > th:nth-child(7), #tbl-wrap > table > tbody > tr > td:nth-child(7):not([colspan]),
+    #tbl-wrap > table > thead > tr > th:nth-child(8), #tbl-wrap > table > tbody > tr > td:nth-child(8):not([colspan]),
+    #tbl-wrap > table > thead > tr > th:nth-child(10), #tbl-wrap > table > tbody > tr > td:nth-child(10):not([colspan]) {
+      display: none; }
+  }
   @media (max-width: 640px) {
     #orders-wrap, #orders-done-wrap { max-height: none !important; overflow: visible; }
     #orders-wrap thead, #orders-done-wrap thead { display: none; }
