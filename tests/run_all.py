@@ -205,6 +205,8 @@ SUITES = [
     ("truth_2", "test_truth_2.py",             False, False),
     # D-72, шаг 1: при окне «сезон» «Заказ» и мастер дают одно число.
     ("one_number", "test_one_number.py",       False, False),
+    # Новинки в базе бюджета («на сейчас» = доля предоплаты), прогон 14.11.
+    ("new_items_basis", "test_new_items_basis.py", False, False),
     # D-68: размерная сетка по темпу в днях наличия.
     ("size_presence", "test_size_presence.py", False, False),
     ("deps",        "test_dependencies.py",    False, False),
