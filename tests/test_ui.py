@@ -2768,11 +2768,23 @@ def _order_category_star(browser, base: str) -> None:
               f"{len(saved_names)} {cats_of(saved_names)}")
         page.wait_for_function("() => !document.getElementById('order-modal').classList.contains('open')",
                                timeout=15000)
-        star_btn(page).first.click()
-        page.wait_for_timeout(300)
-        check("«*»: повторный щелчок снимает «*» — выбора нет, «Оформить» недоступно",
-              not pressed(star_btn(page)) and not pressed(all_btn(page))
-              and page.locator("#btn-create-order").is_disabled())
+        page.wait_for_timeout(800)
+        star_closed = star_btn(page).count() == 0
+        if star_closed:
+            # D-65 (14.11.2026): отправленный заказ закрыл потребность «*»
+            # честно, категория без потребности кнопки не получает. Раньше
+            # кнопка оставалась, потому что «едет» съедало продажи до прихода.
+            left = [it["base_name"] for it in cl.get("/api/replenish").json().get("items", [])
+                    if (it.get("need") or 0) > 0 and (it.get("category") or "") == "*"]
+            check("«*»: после заказа потребность «*» закрыта (D-65), кнопки категории нет, выбор снят",
+                  not left and not pressed(all_btn(page))
+                  and page.locator("#btn-create-order").is_disabled(), str(left[:3]))
+        else:
+            star_btn(page).first.click()
+            page.wait_for_timeout(300)
+            check("«*»: повторный щелчок снимает «*» — выбора нет, «Оформить» недоступно",
+                  not pressed(star_btn(page)) and not pressed(all_btn(page))
+                  and page.locator("#btn-create-order").is_disabled())
         # Контроль: обычная категория и явное «Все категории» — прежний смысл.
         page.locator(f'#scope-btns .scope-btn[data-scope="{P}"]').click()
         page.locator("#btn-export-xlsx").click()
@@ -2791,7 +2803,8 @@ def _order_category_star(browser, base: str) -> None:
         summary = page.locator("#order-modal-summary").text_content() or ""
         check("«*» [контроль]: явное «Все категории» — все категории (Excel {}), «*» в составе наравне с другими",
               pressed(all_btn(page)) and not pressed(star_btn(page)) and ex == {}
-              and "* — " in summary and f"{P} — " in summary, f"{ex} {summary[:160]}")
+              and (("* — " not in summary) if star_closed else ("* — " in summary))
+              and f"{P} — " in summary, f"{ex} {summary[:160]}")
         page.locator("#btn-order-cancel").click()
         all_btn(page).click()
         page.wait_for_timeout(300)
