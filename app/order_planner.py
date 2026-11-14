@@ -505,6 +505,14 @@ def _seasonal_rates(
 
     Возвращает (темпы по базам, сезонные индексы категорий).
     """
+    # ЧЕРНОВИК D-66 (НЕ СЛИВАТЬ без решения владельца): при окне темпа
+    # «сезон» базовый темп rate_active УЖЕ сезонный (то же окно прошлого
+    # года), и умножение на сезонный индекс учитывало сезон дважды: на
+    # демо мастер просил 1 435 шт против 1 123 на «Заказе», «Скетч» 179
+    # против 101. Вариант: при окне «сезон» индекс не применяется.
+    if (snap.get("settings") or {}).get("rate_window") == "season":
+        return ({base: max(0.0, float(it.get("rate_active") or it.get("rate_year") or 0))
+                 for base, it in snap["items"].items()}, {})
     w_from = (date_from - timedelta(days=365)).isoformat()
     w_to = (date_to - timedelta(days=365)).isoformat()
     dis_w = window_dis(db, org.id, min_stock, w_from, w_to)
