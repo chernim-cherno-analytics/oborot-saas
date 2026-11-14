@@ -669,6 +669,19 @@ def main() -> int:
     check("такая позиция уходит в отсев с ценой партии",
           any(x["base_name"] == "Дорогой" and x["batch_cost"] == 240000
               for x in p_moq["moq_over_cap"]), str(p_moq["moq_over_cap"]))
+    # OVERCAP-FULL-COST-1: при бюджете «на сейчас» по двухэтапному каналу
+    # цена партии в отсеве — полная, а доля дня размещения названа отдельно.
+    p_now = op.plan_order(snap_moq, mk_brief(budget=200000, moq_units=20, max_share_pct=30,
+                                             budget_scope="now"), mk_ctx(snap_moq), TWO_STAGE)
+    dor = next((x for x in p_now["moq_over_cap"] if x["base_name"] == "Дорогой"), None)
+    share = op.prepay_share_total(TWO_STAGE)
+    check("партия дороже лимита «на сейчас»: полная цена 20 × 12 000 и доля дня размещения",
+          dor is not None and dor["batch_full_cost"] == 240000 and dor["batch_qty"] == 20
+          and dor["batch_cost"] == round(240000 * share) and dor["budget_basis"] == "now",
+          str(dor) + f" share={share}")
+    ni = next((x for x in p_now["not_included"] if x["base_name"] == "Дорогой"), None)
+    check("в «не вошло» у той же позиции полная цена партии",
+          ni is not None and ni.get("moq_full_cost") == 240000, str(ni))
     # Ложная подпись (аудит 22.08: 11 строк из 20 говорили «срезано лимитом»,
     # хотя упирались в деньги). Причина теперь определяется по факту: достигли
     # потолка доли — лимит, не достигли — деньги.
