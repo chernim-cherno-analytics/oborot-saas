@@ -63,7 +63,7 @@ SECRET = "gAAAA-SYNTHETIC-ENCRYPTED-TOKEN-DO-NOT-PRINT"
 
 def mk(db, name, *, kind="moysklad", status="active", conn_status="active",
        last_ok=None, streak=0, created=None, error=""):
-    org = Org(name=name, plan="trial", status=status,
+    org = Org(name=name, plan="trial", status=status, trial_ends_at=NOW + timedelta(days=30),
               created_at=created or NOW - timedelta(days=60))
     db.add(org)
     db.flush()
@@ -86,17 +86,32 @@ ids = {
     "demo": mk(db, "Демо Бренд", kind="demo", last_ok=None),
     "fresh_pending": mk(db, "Только Подключился", conn_status="pending", last_ok=None,
                         created=NOW - timedelta(hours=2)),
-    "old_pending": mk(db, "Застрял На Первичной", conn_status="pending", last_ok=None,
+    "old_pending": mk(db, "Брошенный Онбординг", conn_status="pending", last_ok=None,
                       created=NOW - timedelta(days=3)),
+    "never_ok": mk(db, "Активно Без Единого Успеха", last_ok=None,
+                   created=NOW - timedelta(days=3)),
+    "initial_running": mk(db, "Старый Аккаунт Грузит Историю", last_ok=None,
+                          created=NOW - timedelta(days=90)),
+    "readonly": mk(db, "Просроченный Триал", last_ok=NOW - timedelta(days=5)),
 }
+st_run = db.get(SyncState, ids["initial_running"])
+st_run.state, st_run.mode = "running", "initial"
+ro = db.get(Org, ids["readonly"])
+ro.trial_ends_at = NOW - timedelta(days=10)
 db.commit()
 
 print("\n1. Кто считается падающим")
 failing = {f["org_id"] for f in ops_watch.failing_syncs(db, NOW)}
-check("серия провалов, давний успех и застрявшая первичная — падающие",
-      failing == {ids["streak"], ids["stale"], ids["old_pending"]}, str(failing))
-check("здоровый, приостановленный, демо и свежеподключённый — нет",
-      not failing & {ids["healthy"], ids["suspended"], ids["demo"], ids["fresh_pending"]})
+check("гейт выключен: серия провалов, давний успех, активное без успеха и просроченный триал — падающие",
+      failing == {ids["streak"], ids["stale"], ids["never_ok"], ids["readonly"]}, str(failing))
+check("здоровый, приостановленный, демо, незавершённое подключение и идущая первичная загрузка — нет",
+      not failing & {ids["healthy"], ids["suspended"], ids["demo"], ids["fresh_pending"],
+                     ids["old_pending"], ids["initial_running"]})
+os.environ["OBOROT_SUBSCRIPTION_GATE"] = "1"
+failing_gate = {f["org_id"] for f in ops_watch.failing_syncs(db, NOW)}
+os.environ.pop("OBOROT_SUBSCRIPTION_GATE")
+check("гейт включён: организацию в readonly планировщик не синкает, она не «падает»",
+      ids["readonly"] not in failing_gate and ids["streak"] in failing_gate, str(failing_gate))
 db.close()
 
 print("\n2. Когда уходит служебное оповещение")
@@ -111,7 +126,7 @@ def fake_send(kind, unit=None):
 
 ops_watch.reset_for_tests()
 r1 = ops_watch.run_once(NOW, send=fake_send)
-check("первый проход: одно оповещение с числом 3", SENT == [("sync-failing", "3")], str(SENT))
+check("первый проход: одно оповещение с числом 4", SENT == [("sync-failing", "4")], str(SENT))
 r2 = ops_watch.run_once(NOW + timedelta(hours=1), send=fake_send)
 check("тот же набор через час: тишина", len(SENT) == 1 and not r2["sync_sent"], str(SENT))
 r3 = ops_watch.run_once(NOW + timedelta(hours=25), send=fake_send)
@@ -123,7 +138,7 @@ db.commit()
 db.close()
 ops_watch.run_once(NOW + timedelta(hours=26), send=fake_send)
 check("новая падающая организация: сразу, с новым числом",
-      SENT[-1] == ("sync-failing", "4") and len(SENT) == 3, str(SENT))
+      SENT[-1] == ("sync-failing", "5") and len(SENT) == 3, str(SENT))
 
 db = SessionLocal()
 for o in db.query(Connection).all():

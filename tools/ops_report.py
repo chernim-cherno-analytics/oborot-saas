@@ -60,8 +60,12 @@ def collect(db, now: datetime | None = None) -> list[dict]:
     failing = {f["org_id"]: f for f in ops_watch.failing_syncs(db, now)}
     rows = []
     for org in db.execute(select(Org).order_by(Org.id)).scalars():
-        conn = db.execute(select(Connection).where(Connection.org_id == org.id)
-                          .order_by(Connection.id.desc())).scalars().first()
+        # Подключение МойСклада важнее демо: синк и его время — про него.
+        conn = (db.execute(select(Connection).where(Connection.org_id == org.id,
+                                                    Connection.kind == "moysklad")
+                           .order_by(Connection.id.desc())).scalars().first()
+                or db.execute(select(Connection).where(Connection.org_id == org.id)
+                              .order_by(Connection.id.desc())).scalars().first())
         state = db.get(SyncState, org.id)
         owner = db.execute(
             select(User.email).join(Membership, Membership.user_id == User.id)

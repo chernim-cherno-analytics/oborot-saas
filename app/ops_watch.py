@@ -19,7 +19,9 @@
   * `sync_state.fail_streak >= FAIL_STREAK_MIN` (несколько провалов подряд), или
   * последний успешный синк (`connections.last_sync_at`) старше STALE_HOURS.
 Демо-подключения и организации без МойСклада не считаются: им нечего
-синхронизировать.
+синхронизировать. Не считаются и те, кого планировщик не синкает намеренно:
+незавершённое подключение (pending), организация в readonly при включённом
+гейте, идущая первичная загрузка.
 
 КОГДА ШЛЁМ. Не чаще одного раза на один и тот же набор падающих организаций
 в REMIND_HOURS. Новый набор (кто-то добавился) — сразу. Пустой набор —
@@ -77,14 +79,33 @@ def failing_syncs(db: Session, now: datetime | None = None) -> list[dict]:
         .outerjoin(SyncState, SyncState.org_id == Org.id)
     ).all()
     out = []
+    from app import subscription
+
     for org, conn, state in rows:
         if (org.status or "active") != "active":
+            continue
+        # Те же правила, что у планировщика (ревью критика 14.11, P2): кого
+        # планировщик НАМЕРЕННО не синкает, тот не «падает».
+        #  * pending: подключение не доведено (склады не выбраны, первичная
+        #    загрузка не запускалась). Это брошенный онбординг, а не сбой;
+        #  * гейт подписки закрыл запись (readonly): синк остановлен нами;
+        #  * идёт первичная загрузка: старый аккаунт, только что подключивший
+        #    МойСклад, иначе помечался бы сразу (у подключения нет своей даты).
+        if conn.status == "pending":
+            continue
+        if subscription.gate_enabled():
+            try:
+                if subscription.subscription_state(org, db) == subscription.READONLY:
+                    continue
+            except Exception:  # noqa: BLE001 — сомнение трактуем как «смотреть»
+                pass
+        if state is not None and state.state == "running" and (state.mode or "") == "initial":
             continue
         streak = int(getattr(state, "fail_streak", 0) or 0) if state else 0
         last_ok = conn.last_sync_at
         if last_ok is None:
-            # Ни одного успешного синка: тревога, только если организация
-            # подключилась давно (первичная загрузка идёт часами, не сутками).
+            # Ни одного успешного синка у активного подключения: тревога,
+            # только если организация подключилась давно.
             created = org.created_at
             stale = created is not None and created < stale_before
         else:
