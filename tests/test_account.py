@@ -746,9 +746,11 @@ def run_scenario() -> int:
     check("тарифы приходят из единого списка PLANS",
           [p["code"] for p in j["plans"]] == [p["code"] for p in PLANS]
           and len(j["plans"]) == len(PLANS), f"plans={[p['code'] for p in j['plans']]}")
-    check("цены совпадают с лендингом (4900 / 9900 / 19900)",
-          [p["price_month"] for p in j["plans"]] == [4900, 9900, 19900],
-          f"prices={[p['price_month'] for p in j['plans']]}")
+    # D-71 (14.11.2026): на пилоте один тариф 9 900 и платная настройка 24 900.
+    check("один тариф 9 900, как на лендинге, и настройка 24 900 с зачётом",
+          [p["price_month"] for p in j["plans"]] == [9900]
+          and (j.get("setup") or {}).get("price") == 24900 and j["setup"].get("credited") is True,
+          f"prices={[p['price_month'] for p in j['plans']]} setup={j.get('setup')}")
     check("годовая цена — минус 20%",
           all(p["price_year_month"] == round(p["price_month"] * 0.8) for p in j["plans"]))
     check("виден текущий тариф и остаток триала",
@@ -799,12 +801,13 @@ def run_scenario() -> int:
           "уже отправлена" in msg and "тариф" in msg, f"msg={msg[:120]}")
     check("в базе по-прежнему одна заявка", sql(
         "SELECT COUNT(*) FROM billing_requests") == [(1,)])
-    # Передумал — прислал другой тариф: должно пройти и не завести вторую строку.
-    st, res = request_plan(plan="start", period="month")
-    check("другой тариф после спама — принят (200), не заблокирован окном",
-          st == 200 and res["request"]["plan"] == "start", f"{st} {res}")
+    # Передумал — прислал другой период (D-71: тариф один): должно пройти и
+    # не завести вторую строку.
+    st, res = request_plan(plan="brand", period="month")
+    check("другой период после спама — принят (200), не заблокирован окном",
+          st == 200 and res["request"]["period"] == "month", f"{st} {res}")
     check("это обновило ТУ ЖЕ заявку, а не завело вторую", sql(
-        "SELECT plan, period, status FROM billing_requests") == [("start", "month", "new")])
+        "SELECT plan, period, status FROM billing_requests") == [("brand", "month", "new")])
 
     # Организация из каталога МойСклад платит через МС — счёт от нас ей не нужен.
     exec_sql("UPDATE orgs SET source = 'ms_app', ms_tariff_name = 'Расширенный' WHERE id = ?",

@@ -2050,7 +2050,7 @@ def apply_production_rules(db: Session, org_id: int, data: dict) -> dict:
         step = int(getattr(prod, "pack_multiple", 0) or 0)
         item["production_id"] = prod.id if prod else None
         item["production_name"] = prod.name if prod else ""
-        item["lead_time_days"] = int(getattr(prod, "lead_time_days", 0) or 0) or default_lead
+        item["lead_time_days"] = (prod.effective_lead_days() if prod is not None else 0) or default_lead
         item["moq"] = moq
         item["pack_multiple"] = step
         need_raw = int(item["need"])
@@ -2403,7 +2403,7 @@ class OrderPlanIn(BaseModel):
 
 
 _EXCLUDED_KEEP = ("base_name", "category", "cls", "turnover", "need",
-                  "cost_price", "need_rub", "lost_margin", "moq_cost", "gap_days")
+                  "cost_price", "need_rub", "lost_margin", "moq_cost", "moq_full_cost", "gap_days")
 
 
 def _slim_excluded(rows) -> list:

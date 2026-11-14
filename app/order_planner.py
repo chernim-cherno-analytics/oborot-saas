@@ -39,6 +39,12 @@ from app import analytics
 from app.analytics import size_split, window_dis, window_nq
 from app.models import Org, Production
 
+
+def sold_out_with_demand(it: dict) -> bool:
+    """См. analytics_extra.sold_out_with_demand (D-67); импорт ленивый из-за цикла."""
+    from app.analytics_extra import sold_out_with_demand as _f
+    return _f(it)
+
 # ── Константы ────────────────────────────────────────────────────────────────
 
 NEED_MIN = 3            # потребность меньше — не заказываем (как в «Бюджете»)
@@ -558,7 +564,7 @@ def _seasonal_rates(
 
 def collect_context(db: Session, org: Org, snap: dict, brief: dict) -> dict:
     """Всё, что планировщику нужно из БД: сезонные темпы, свежесть, привязка к производству."""
-    from app.analytics_extra import _fresh_bases
+    from app.analytics_extra import _fresh_bases  # noqa: F401
 
     today = date.fromisoformat(snap["today"])
     eta = date.fromisoformat(brief["eta_date"])
@@ -687,9 +693,11 @@ def _candidates(snap: dict, brief: dict, ctx: dict) -> tuple[list[dict], dict]:
         if category in exclude and base not in must:
             skipped["excluded_category"].append(base)
             continue
-        if base not in ctx["fresh"] and base in must:
+        # D-67: распроданная позиция со спросом до стокаута свежей считается.
+        stale = base not in ctx["fresh"] and not sold_out_with_demand(it)
+        if stale and base in must:
             forced = True
-        if base not in ctx["fresh"] and base not in must:
+        if stale and base not in must:
             skipped["stale"].append(base)
             continue
 
@@ -722,6 +730,11 @@ def _candidates(snap: dict, brief: dict, ctx: dict) -> tuple[list[dict], dict]:
             "category": category,
             "cls": it.get("cls"),
             "low_data": bool(it.get("low_data")),
+            # «Торгуем в минус» из аналитики: только пометка, количество не
+            # меняет (прогон 14.11: мастер молча клал в заказ позиции, которые
+            # «Оборачиваемость» называет убыточными).
+            "below_cost": bool(it.get("below_cost")) and not it.get("low_data"),
+            "loss_unit": it.get("loss_unit"),
             "turnover": float(it.get("turnover") or 0),
             "rate_cover": round(r_cover, 4),
             "rate_lead": round(r_lead, 4),
@@ -830,6 +843,21 @@ def _allocate(cands: list[dict], brief: dict, ctx: dict, stages: list[dict]) -> 
         unit = unit_pay(c)
         if cap_per_item > 0:
             cap_units[base] = int(math.floor(cap_per_item / unit))
+        # Партия дороже лимита доли называется ДО ограничений волны и денег
+        # (прогон 14.11, N4): раньше бестселлер с партией 24 × 12 299 ₽ при
+        # лимите 90 000 ₽ уходил в «не вошло» без цены партии, если потолок
+        # волны или остаток денег обрезал его раньше, чем дело доходило до
+        # проверки партии. Штук это не меняет: такая партия не прошла бы и
+        # позже, ниже стоит та же проверка; меняется только названная причина.
+        moq0 = moq_of(c)
+        if (cap is not None and not c["must_have"] and have == 0 and moq0 > 0
+                and cap_per_item > 0 and c["rate_cover"] > 0
+                and moq0 / c["rate_cover"] <= MOQ_MAX_COVER_DAYS):
+            moq_qty0 = -(-moq0 // pack) * pack if pack > 1 else moq0
+            if moq_qty0 * unit > cap_per_item + 1:
+                moq_over_cap[base] = int(round(moq_qty0 * unit))
+                moq_over_cap_qty[base] = int(moq_qty0)
+                return
         limit = cap_per_item if (cap is not None and cap < 0) else cap
         if limit is not None and limit > 0:
             by_cap = int(math.floor(limit / unit))
@@ -1071,6 +1099,8 @@ def plan_order(snap: dict, brief: dict, ctx: dict, stages: list[dict],
             "base_name": c["base_name"],
             "category": c["category"],
             "cls": c["cls"],
+            "below_cost": c.get("below_cost", False),
+            "loss_unit": c.get("loss_unit") if c.get("below_cost") else None,
             "turnover": round(c["turnover"]),
             "rate": rate,
             "cs": c["cs"],

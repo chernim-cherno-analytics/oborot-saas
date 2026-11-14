@@ -444,7 +444,7 @@ def main() -> int:
             check(f"чтение работает, а не просто «не 402»: {path}",
                   resp.status_code == 200, f"status={resp.status_code}")
         r = c.post("/api/plans/request", json={
-            "plan": "start", "period": "month", "company": "ООО Тест",
+            "plan": "brand", "period": "month", "company": "ООО Тест",
             "inn": "7700000000", "email": "a@b.io", "phone": "+70000000000",
         })
         check("заявка на счёт проходит (иначе платить нечем)",
@@ -830,7 +830,7 @@ def operator_journey() -> None:  # noqa: C901 — один связный пут
 
         # ── Шаг 1. Заявка на счёт настоящей ручкой ───────────────────────
         r = c.post("/api/plans/request", json={
-            "plan": "start", "period": "month", "company": "ООО Путь-бренд",
+            "plan": "brand", "period": "month", "company": "ООО Путь-бренд",
             "inn": "7701234567", "email": "journey@test.io",
             "phone": "+70000000001",
         })
@@ -849,7 +849,7 @@ def operator_journey() -> None:  # noqa: C901 — один связный пут
               req_org == org and req_org != neighbour,
               f"req.org_id={req_org} org={org} neighbour={neighbour}")
         check("   и несёт согласованные тариф и период",
-              (req_plan, req_period) == ("start", "month"),
+              (req_plan, req_period) == ("brand", "month"),
               f"{req_plan}/{req_period}")
         check("   новая заявка ещё не даёт ни дня доступа",
               req_status == "new" and state_of(org) == subscription.READONLY,
@@ -932,7 +932,7 @@ def operator_journey() -> None:  # noqa: C901 — один связный пут
                 check(f"   чтение остаётся открытым: {path}",
                       resp.status_code == 200, f"status={resp.status_code}")
             again = c.post("/api/plans/request", json={
-                "plan": "start", "period": "month", "company": "ООО Путь-бренд",
+                "plan": "brand", "period": "month", "company": "ООО Путь-бренд",
                 "inn": "7701234567", "email": "journey@test.io",
                 "phone": "+70000000001",
             })

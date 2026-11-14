@@ -65,6 +65,8 @@
   .chip-btn { font: inherit; font-size: 12px; padding: 5px 13px; border-radius: 20px; cursor: pointer;
     border: 1px solid rgba(31,31,31,.3); background: rgba(255,255,255,.75); margin-left: 6px; }
 
+  .losstag { display: inline-block; margin-left: 6px; padding: 1px 7px; border-radius: 8px;
+    background: rgba(221,0,4,.16); color: #a00003; font-size: 9px; font-weight: 700; white-space: nowrap; }
   .go-btn { font-size: 12.5px; font-weight: 600; padding: 10px 20px; border-radius: 10px;
     border: 1px solid #1f1f1f; background: #1f1f1f; color: #f3e9e0; cursor: pointer; }
   .go-btn:hover { background: #434446; }
@@ -241,10 +243,10 @@
         <span class="lbl">Стратегия</span>
         <div class="tiles" id="stratTiles">
           <div class="tile" data-v="protect"><div class="t">Шире ассортимент</div>
-            <div class="d">Каждая строка закрывает неделю продаж, лимит на позицию 20% —
+            <div class="d">Цель: каждая строка закрывает неделю продаж, лимит на позицию 20% —
               больше моделей понемногу, меньше дыр на полке</div></div>
           <div class="tile on" data-v="balance"><div class="t">Баланс</div>
-            <div class="d">Каждая строка закрывает три недели, лимит 30% — потом добор
+            <div class="d">Цель: каждая строка закрывает три недели, лимит 30% — потом добор
               по оборачиваемости</div></div>
           <div class="tile" data-v="grow"><div class="t">Глубже в топ</div>
             <div class="d">Сразу до полной потребности, начиная с самых оборачиваемых,
@@ -261,8 +263,8 @@
         </div>
         <div>
           <span class="lbl">Мин. партия, шт</span>
-          <input class="binp sm" id="moq" type="number" min="0" max="10000" value="0">
-          <div class="hint" id="moqHint">0 — берётся из настроек производства</div>
+          <input class="binp sm" id="moq" type="number" min="0" max="10000" value="" placeholder="из канала">
+          <div class="hint" id="moqHint">Пусто: берётся из настроек производства</div>
         </div>
         <div>
           <span class="lbl">Резерв на новинки, %</span>
@@ -439,9 +441,14 @@
         : p.staged ? ("Сейчас платится только первый этап — это " + share + "% себестоимости.")
                    : "Один этап: платится весь заказ.") +
       ' <a href="/settings">Изменить условия канала</a>';
+    // WIZARD-MOQ-1 (прогон пользователем 14.11): поле «0» уходило на сервер
+    // явным «партии нет», и план молча нарушал минимальную партию фабрики,
+    // хотя подпись обещала обратное. Теперь пусто = партия канала, 0 = без
+    // партии на этот заказ, и подпись говорит ровно это.
+    document.getElementById("moq").placeholder = p.moq_units ? String(p.moq_units) : "из канала";
     document.getElementById("moqHint").textContent = p.moq_units
-      ? ("0 — берётся минимальная партия производства: " + p.moq_units + " шт")
-      : "0 — минимальные партии берутся из этапов производства";
+      ? ("Пусто: партия производства " + p.moq_units + " шт. 0: без минимальной партии на этот заказ.")
+      : "Пусто: минимальные партии из этапов производства. 0: без партии на этот заказ.";
     document.getElementById("scopeWrap").style.display = p.staged ? "" : "none";
     if(!p.staged){ STATE.scope = "full"; }
     updHints();
@@ -488,7 +495,7 @@
     row(noc === 0, noc === 0
         ? ("Себестоимость есть у всех " + total + " " + plural(total, "позиции", "позиций", "позиций"))
         : ("Себестоимости нет у " + noc + " из " + total +
-           " — эти позиции в заказ не попадают и в деньгах не участвуют"));
+           ": сами в план не попадают; в плане их можно вписать вручную, сумма заказа тогда помечается неполной"));
     var full = dq.positions_cost_full;
     if(total && full != null && full < total){
       row(false, "Полная себестоимость задана у " + full + " из " + total +
@@ -585,7 +592,8 @@
       horizon_days_fixed: STATE.horizon_days_fixed || null,
       strategy: STATE.strategy,
       max_share_pct: parseNum("capPct") || null,
-      moq_units: parseNum("moq"),
+      // Пусто = не задано (сервер возьмёт партию канала), 0 = явно без партии.
+      moq_units: (String(document.getElementById("moq").value).trim() === "") ? null : parseNum("moq"),
       reserve_new_pct: parseNum("reserve"),
       overhead_pct: parseNum("overhead"),
       exclude_categories: STATE.offcats,
@@ -666,7 +674,7 @@
     STATE.must = last.must_have || [];
     document.getElementById("budget").value = fmt(last.budget||200000);
     document.getElementById("capPct").value = last.max_share_pct || 30;
-    document.getElementById("moq").value = last.moq_units || 0;
+    document.getElementById("moq").value = last.moq_explicit ? (last.moq_units || 0) : "";
     document.getElementById("reserve").value = last.reserve_new_pct || 0;
     document.getElementById("overhead").value = last.overhead_pct || 0;
     STATE.newItems = [];
@@ -1072,17 +1080,56 @@
     }
   }
 
+  // Плашка открытых заказов канала. Отдельной функцией: после создания
+  // заказа из мастера её надо перерисовать, иначе она называет устаревший
+  // последний заказ и сумму без только что созданного (прогон 14.11, N1).
+  function openBannerHtml(){
+    var op = STATE.open || {orders:[], count:0};
+    if (!op.count) return "";
+    var first = op.orders[0];
+    return '<div class="warn" style="margin-bottom:12px">По этому каналу '+
+      (op.count === 1 ? 'открыт заказ' : ('открыто заказов: '+op.count+', последний')) + ' ' +
+      '<b>№'+first.id+' «'+esc(first.name)+'»</b> от '+dstr((first.created_at||"").slice(0,10))+
+      ' — '+fmt(first.total_qty)+' шт'+
+      (op.left_to_pay ? (', по открытым заказам этого канала на сегодня и будущие даты запланировано <b>'+fmtR(op.left_to_pay)+'</b>'+
+        ' (календарь денег ниже считает все каналы)') : '')+
+      '. Фактические оплаты нужно проверить отдельно. <a href="/replenish#orders">Посмотреть заказы</a></div>';
+  }
+  function refreshAfterCreate(){
+    return loadSideData().then(function(){
+      var b = document.getElementById("openBanner");
+      if(b) b.innerHTML = openBannerHtml();
+      renderCash();
+    });
+  }
+
+  // @@cashPayments: какие платежи «этого заказа» кладём в календарь. Отдельная
+  // чистая функция, чтобы тест исполнял её, а не искал строки (ревью Codex #97).
+  // Заказ из этого плана уже создан: его платежи теперь в «Открытых заказах»,
+  // и прибавлять их ещё раз как «Этот заказ» значит считать одни деньги
+  // дважды (прогон 14.11: 1 709 548 + 1 499 380 = 3 208 928). Проверка идёт
+  // ПОСЛЕ выбора источника: ветка новинок раньше перезаписывала очищенный список.
+  function cashPayments(p, createdOrder, liveCost, pendingEdits){
+    var share = p.cost_total ? (liveCost / p.cost_total) : 1;
+    var payments = p.payments || [];
+    if((p.new_items||[]).length && p.order_payments){
+      if(pendingEdits && !createdOrder) return {blocked: true, payments: [], share: 1};
+      payments = p.order_payments; share = 1;
+    }
+    if(createdOrder){ payments = []; }
+    return {blocked: false, payments: payments, share: share};
+  }
+  // @@end
+
   function renderCash(){
     var box = document.getElementById("cash");
     if(!box) return;
     var c = STATE.cash, p = STATE.plan;
     if(!c || !c.weeks){ box.innerHTML = '<div class="muted" style="font-size:12px">нет данных</div>'; return; }
-    var t = liveTotals(), share = p.cost_total ? (t.cost / p.cost_total) : 1;
-    var payments = p.payments||[];
-    if((p.new_items||[]).length && p.order_payments){
-      if(pendingOrderEdits()){ box.textContent = "Пересчитайте план для полного календаря с новинками."; return; }
-      payments = p.order_payments; share = 1;
-    }
+    var t = liveTotals();
+    var sel = cashPayments(p, STATE.createdOrder, t.cost, pendingOrderEdits());
+    if(sel.blocked){ box.textContent = "Пересчитайте план для полного календаря с новинками."; return; }
+    var payments = sel.payments, share = sel.share;
     var start = new Date(c.week_start+"T00:00:00");
     // Текущий (ещё не созданный) заказ кладём в ту же сетку — иначе календарь
     // показывает вчерашние обязательства и молчит про то, что решается сейчас.
@@ -1116,7 +1163,7 @@
         '<td class="nb">'+fmtR(run)+'</td></tr>');
     }
     box.innerHTML = '<div class="table-outer"><table><thead><tr>'+
-      '<th>Неделя с</th><th title="Платежи по всем открытым заказам организации, всех каналов, включая черновики">Открытые заказы (все каналы)</th><th>Этот заказ</th><th>Итого за неделю</th><th>Накопительно</th>'+
+      '<th>Неделя с</th><th title="Платежи по всем открытым заказам организации, всех каналов, включая черновики">Открытые заказы (все каналы)</th><th>'+(STATE.createdOrder ? ('Этот заказ (№'+STATE.createdOrder+' уже в открытых)') : 'Этот заказ')+'</th><th>Итого за неделю</th><th>Накопительно</th>'+
       '</tr></thead><tbody>'+
       ((c.overdue && c.overdue.amount) ? ('<tr class="muted"><td>Раньше (даты платежей прошли)</td><td class="nb">'+
         fmtR(c.overdue.amount)+'</td><td class="nb">—</td><td class="nb">'+fmtR(c.overdue.amount)+
@@ -1275,18 +1322,32 @@
       (rev.other_production_count ? '<div class="peak">На других производствах — '+rev.other_production_count+' поз.: закажите отдельным заказом.</div>' : "")+
       '</div></details></div>';
 
-    var op = STATE.open || {orders:[], count:0};
-    var openHtml = "";
-    // Обработчик вешается после вставки HTML (см. ниже, после innerHTML).
-    if (op.count) {
-      var first = op.orders[0];
-      openHtml = '<div class="warn" style="margin-bottom:12px">По этому каналу '+
-        (op.count === 1 ? 'открыт заказ' : ('открыто заказов: '+op.count+', последний')) + ' ' +
-        '<b>№'+first.id+' «'+esc(first.name)+'»</b> от '+dstr((first.created_at||"").slice(0,10))+
-        ' — '+fmt(first.total_qty)+' шт'+
-        (op.left_to_pay ? (', по открытым заказам этого канала на сегодня и будущие даты запланировано <b>'+fmtR(op.left_to_pay)+'</b>'+
-          ' (календарь денег ниже считает все каналы)') : '')+
-        '. Фактические оплаты нужно проверить отдельно. <a href="/replenish#orders">Посмотреть заказы</a></div>';
+    var openHtml = '<div id="openBanner">' + openBannerHtml() + '</div>';
+    // Маленький бюджет на широкой стратегии: строки получают меньше цели
+    // ширины, и выходит по 1-2 шт на модель, которые цеху не отшить (прогон
+    // 14.11: 200 000 ₽, «Баланс», 30 позиций, 75 шт). Говорим это прямо и
+    // предлагаем «Глубже в топ». Количества не меняются.
+    var wd = (p.brief && p.brief.width_days) || 0;
+    if(wd > 0 && p.brief.strategy !== "grow"){
+      var took = (p.items||[]).filter(function(i){ return (i.qty||0) > 0 && !i.is_new; });
+      var shortL = took.filter(function(i){ return i.days_to_sell != null && i.days_to_sell < wd; });
+      if(took.length >= 4 && shortL.length * 2 >= took.length){
+        var qs = took.map(function(i){ return i.qty; }).sort(function(a,b){ return a-b; });
+        var med = qs[Math.floor(qs.length/2)];
+        openHtml += '<div class="warn" style="margin-bottom:12px">Бюджета не хватает на цель стратегии: '+
+          'у '+shortL.length+' из '+took.length+' позиций заказ закрывает меньше '+wd+' дн продаж '+
+          '(в середине списка '+fmt(med)+' шт на модель). Если цеху нужны партии побольше, выберите '+
+          '«Глубже в топ»: меньше моделей, но закрыты целиком.</div>';
+      }
+    }
+    // Позиции «в минус» в плане называются до таблицы, а не только значком
+    // в строке: владелец должен решить про них осознанно (прогон 14.11, N3).
+    var lossItems = (p.items||[]).filter(function(i){ return i.below_cost && (i.qty||0) > 0; });
+    if(lossItems.length){
+      openHtml += '<div class="warn" style="margin-bottom:12px">В плане '+lossItems.length+' поз. «в минус» '+
+        '(средняя цена продажи ниже себестоимости): '+lossItems.slice(0,6).map(function(i){ return esc(i.base_name); }).join(", ")+
+        (lossItems.length>6?' и ещё '+(lossItems.length-6):'')+
+        '. Каждая проданная штука уменьшает деньги. Количество система не меняет: впишите 0 в строке, если не хотите их дошивать.</div>';
     }
 
     // Решение владельца D-23: нельзя молча показывать общий бюджет как полный,
@@ -1444,7 +1505,7 @@
     var inOpen = openBase[i.base_name] || 0;
     var q = planQty(i);
     return '<tr class="'+rowCls(i.turnover)+'" data-b="'+esc(i.base_name)+'">'+
-      '<td>'+esc(i.base_name)+'<span class="why">'+esc(i.category)+' · '+esc(i.why_text)+
+      '<td>'+esc(i.base_name)+(i.below_cost?' <span class="losstag" title="Средняя цена продажи ниже себестоимости: каждая проданная штука уменьшает деньги. Количество система не меняет, решение за вами">в минус'+(i.loss_unit?(' '+fmt(i.loss_unit)+' ₽/шт'):'')+'</span>':'')+'<span class="why">'+esc(i.category)+' · '+esc(i.why_text)+
       (i.over_need ? ' · <b>'+i.over_need+' шт сверх потребности</b>' : '')+
       (inOpen ? ' · <b>уже в открытом заказе: '+fmt(inOpen)+' шт</b>' : '')+
       (i.no_supplier ? ' · <b>нет поставщика в МойСкладе</b>' : '')+'</span></td>'+
@@ -1556,6 +1617,7 @@
   function orderCreated(id){
     STATE.createdOrder = id;
     dropDraft();
+    refreshAfterCreate();
     var btn = document.getElementById("mkOrder");
     if(!btn) return;
     var act = btn.parentNode;
@@ -1573,7 +1635,7 @@
       api("/api/orders/"+id+"/status", {status:"sent"}).then(function(){
         b2.outerHTML = '<span class="hint" style="color:#2b6b12">Заказ №'+id+' в производстве</span>';
         h2.textContent = "";
-        loadSideData().then(function(){ renderCash(); });
+        refreshAfterCreate();
       }).catch(function(e){
         b2.disabled = false;
         h2.innerHTML = '<span style="color:#8a0003">'+esc(e.message)+'</span>';
@@ -1675,7 +1737,8 @@
     // заменить прошлый план или канал, и подсказка обязана это назвать
     // (прогон пользователем: в Настройках 60, а мастер молча «раз в месяц»).
     STATE.settingsCadence = st.order_cadence_days || null;
-    document.getElementById("moq").value = st.moq_units || 0;
+    // Пусто: сервер возьмёт партию канала, а без неё общую из Настроек.
+    document.getElementById("moq").value = "";
     document.getElementById("reserve").value = st.reserve_new_pct || 0;
     document.getElementById("overhead").value = st.overhead_pct || 0;
     STATE.production_id = (STATE.prods[0]||{}).id;

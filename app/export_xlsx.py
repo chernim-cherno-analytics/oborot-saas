@@ -425,6 +425,10 @@ def _replenish_sheet(wb: Workbook, org_name: str, sheet_title: str, name: str,
         note = _replenish_note(it, window_ru)
         if cost <= 0:
             note = "себестоимость не указана: сумма неизвестна" + (f"; {note}" if note else "")
+        if it.get("below_cost"):
+            loss = it.get("loss_unit")
+            mark = "в минус: цена продажи ниже себестоимости" + (f" на {loss} ₽/шт" if loss else "")
+            note = mark + (f"; {note}" if note else "")
         _write_row(ws, row, [
             it["base_name"], it.get("category") or "", CLS_RU.get(it["cls"], it["cls"]),
             it["turnover"], it["rate"], sold_year, it["cs"], it.get("ordered") or 0,
@@ -699,7 +703,7 @@ def budget_workbook(org_name: str, data: dict) -> Workbook:
             note = ""
         _write_row(ws, row, [
             it["base_name"], it.get("category") or "", CLS_RU.get(it["cls"], it["cls"]),
-            it["turnover"], round(it["rate"] * 30, 1), it["stock_eff"],
+            it["turnover"], round(it["rate"] * 30.44, 1), it["stock_eff"],
             it.get("days_left"), it["need"], it["qty"], it["cost_price"], it["total"],
             it["expected_profit"], note,
         ], formats)

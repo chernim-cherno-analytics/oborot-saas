@@ -196,6 +196,8 @@
   .need-pill.r { color: #a30003; }
   .muted { color: rgba(31,31,31,.42); }
   .txt-red { color: #a30003; }
+  .losstag { display: inline-block; margin-left: 6px; padding: 1px 7px; border-radius: 8px;
+    background: rgba(221,0,4,.16); color: #a00003; font-size: 9px; font-weight: 700; white-space: nowrap; }
   .stbadge { display: inline-block; font-size: 10px; font-weight: 700; padding: 2px 9px; border-radius: 10px; white-space: nowrap; }
   .stbadge.r { background: rgba(221,0,4,.16); color: #a30003; }
   .stbadge.y { background: rgba(255,204,0,.35); color: #7a5c00; }
@@ -929,7 +931,13 @@
        в неё входит вся графа «Заказано» (ручные отметки на «Активном стоке» и
        «Заказ позиции», заказы из МойСклада). Прежний заголовок «учитываются в
        колонке «Едет»» читался как «Едет = сумма этих заказов». */
-    t.innerHTML='Заказы в производстве ('+ORDERS.length+') — входят в колонку «Едет» вместе с ручными отметками «Заказано» и заказами из МойСклада';
+    /* Прогон 14.11: черновики в «Едет» не входят (входят только отправленные
+       в производство), а заголовок называл все заказы «в производстве». */
+    var nSent=ORDERS.filter(function(o){ return o.status==="sent"; }).length;
+    var nDraft=ORDERS.filter(function(o){ return o.status==="draft"; }).length;
+    t.innerHTML='Открытые заказы ('+ORDERS.length+')'+
+      (nSent?(': в производстве '+nSent+', их штуки входят в колонку «Едет» вместе с ручными отметками «Заказано» и заказами из МойСклада'):'')+
+      (nDraft?((nSent?'; ':': ')+'черновиков '+nDraft+', в «Едет» не входят, пока не отправлены в производство'):'');
     /* Пока висит сообщение «заказ создан … выделен ниже», выделение
        переживает перерисовку списка (после приёмки, смены статуса и т. п.). */
     var note=document.getElementById("order-created");
@@ -1808,6 +1816,7 @@
         '<td><button class="expander" data-base="'+esc(it.base_name)+'" title="Размерная сетка и формула расчёта">'+(open?"▾":"▸")+'</button></td>'+
         '<td class="name">'+esc(it.base_name)+
           (it.low_data?' <span style="font-size:9px;font-weight:700;padding:1px 6px;border-radius:8px;background:rgba(31,31,31,.08);color:rgba(31,31,31,.55)" title="Мало данных — темп оценочный, проверьте количество вручную">мало данных</span>':"")+
+          (it.below_cost?' <span class="losstag" title="Средняя цена продажи ниже себестоимости: каждая проданная штука уменьшает деньги. Количество система не меняет, решение за вами">в минус'+(it.loss_unit?(' '+fmt(it.loss_unit)+' ₽/шт'):'')+'</span>':"")+
           '<span class="csub">'+esc(it.category||"")+'</span></td>'+
         '<td>'+stBadge(it.wos)+'</td>'+
         '<td class="nb">'+fmt(it.turnover)+'</td>'+

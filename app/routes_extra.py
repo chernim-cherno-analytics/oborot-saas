@@ -328,7 +328,16 @@ def api_sync_progress(ctx: AuthContext = Depends(require_auth_api)):
 def api_sizes_products(ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)):
     """Список позиций для поиска на странице «Размеры»."""
     snap = analytics.get_snapshot(db, ctx.org)
-    return analytics_extra.sizes_products(db, ctx.org.id, snap)
+    data = analytics_extra.sizes_products(db, ctx.org.id, snap)
+    # Рекомендация — ровно то число, что на «Заказе»: с партией и коробом
+    # канала (ревью Codex #93, P1: без правил канала поле предлагало 17 шт
+    # при минимальной партии 300).
+    rep = analytics.build_replenish(snap)
+    apply_production_rules(db, ctx.org.id, rep)
+    need_by = {i["base_name"]: int(i.get("need") or 0) for i in rep.get("items") or []}
+    for p in data.get("products") or []:
+        p["need"] = need_by.get(p["base_name"], 0)
+    return data
 
 
 @router.get("/api/sizes/calc")
@@ -361,7 +370,7 @@ def api_sizes_calc(
     default_lead = analytics.extra_settings(ctx.org)["lead_time_days"]
     cond = production_conditions(db, ctx.org.id)
     prod = cond["by_id"].get(cond["assign"].get(product, cond["main_id"]))
-    lead = int(getattr(prod, "lead_time_days", 0) or 0) or default_lead
+    lead = (prod.effective_lead_days() if prod is not None else 0) or default_lead
     result = analytics_extra.build_sizes_calc(
         db, ctx.org.id, snap, product, qty, period, mode,
         arrival=arrival or None, lead_time_days=lead,
@@ -381,6 +390,13 @@ def api_sizes_calc(
             bucket = common_sizes.setdefault(key, {"stock": 0, "sold365": 0})
             bucket["stock"] += int(rec.get("stock") or 0)
             bucket["sold365"] += float(rec.get("sold365") or 0)
+            # D-68: дни наличия переносятся, иначе калькулятор делил бы по
+            # голым продажам, а «Заказ» и мастер по темпу (ревью Codex #95).
+            # Один размер под двумя написаниями: дни наличия не складываются
+            # (это одни и те же календарные дни), берём наибольшее.
+            if "days365" in rec:
+                bucket["days365"] = max(int(bucket.get("days365") or 0), int(rec.get("days365") or 0))
+                bucket["hist365"] = max(int(bucket.get("hist365") or 0), int(rec.get("hist365") or 0))
         common_split = analytics.size_split(common_sizes, qty) if common_sizes else {}
         if common_split:
             for row in result["sizes"]:
@@ -933,49 +949,41 @@ def export_order_xlsx(
 # (templates/landing.html, секция «Тарифы») — при правке меняйте оба места.
 
 PLANS = [
-    {
-        "code": "start",
-        "name": "Старт",
-        "tagline": "Навести порядок в остатках",
-        "price_month": 4900,
-        "price_year_month": 3920,  # ₽/мес при оплате за год (−20%)
-        "popular": False,
-        "features": [
-            "1 организация МойСклад",
-            "Остатки по складам с историей",
-            "Оборачиваемость по каждой позиции",
-            "Что уценить: неликвид и контроль 70/20/10",
-        ],
-    },
+    # D-71 (решение владельца 14.11.2026): на пилоте один тариф и платная
+    # настройка. «Старт» вырезал ядро (что заказать), «Про» держался на «скоро».
+    # Коды start/pro больше не продаются; у организаций, где они записаны,
+    # бейдж и Настройки по-прежнему их называют (PLAN_TITLES в шаблонах).
     {
         "code": "brand",
         "name": "Бренд",
-        "tagline": "Ваш товарный аналитик на полную ставку",
+        "tagline": "Производственный дозаказ под бюджет, сроки и размерную сетку",
         "price_month": 9900,
-        "price_year_month": 7920,
+        "price_year_month": 7920,  # ₽/мес при оплате за год (−20%)
         "popular": True,
         "features": [
-            "Всё из тарифа «Старт»",
+            "1 организация МойСклад",
             "Что заказать: расчёт с размерными сетками",
+            "Мастер заказа под бюджет, этапы и минимальные партии",
             "Сезонность и срок производства в прогнозе",
-            "Заказ в один клик в МойСклад",
-            "Telegram-дайджест каждое утро",
-        ],
-    },
-    {
-        "code": "pro",
-        "name": "Про",
-        "tagline": "Для растущих и мультиканальных",
-        "price_month": 19900,
-        "price_year_month": 15920,
-        "popular": False,
-        "features": [
-            "Всё из тарифа «Бренд»",
-            "Маркетплейсы и Shopify — скоро",
-            "Приоритетная поддержка",
+            "Остатки, оборачиваемость, что уценить",
+            "Заказ поставщику в МойСклад по вашей кнопке",
+            "Excel заказа для цеха",
         ],
     },
 ]
+
+# Платная настройка (D-71): разово, засчитывается в оплату подписки.
+SETUP = {
+    "price": 24900,
+    "title": "Настройка вместе с вами",
+    "credited": True,
+    "includes": [
+        "подключение МойСклада и проверка данных",
+        "производства: сроки, этапы, минимальные партии",
+        "проверка себестоимости",
+        "первый заказ вместе",
+    ],
+}
 
 PLAN_CODES = {p["code"] for p in PLANS}
 # Сколько рабочих дней мы обещаем на выставление счёта — показывается на
@@ -1073,6 +1081,7 @@ def api_plans(ctx: AuthContext = Depends(require_auth_api), db: Session = Depend
     ).scalars().first()
     return {
         "plans": PLANS,
+        "setup": SETUP,
         "current": ctx.org.plan,
         "trial_ends_at": ctx.org.trial_ends_at.date().isoformat() if ctx.org.trial_ends_at else None,
         "trial_days_left": _trial_days_left(ctx.org),
