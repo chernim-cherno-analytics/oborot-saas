@@ -244,7 +244,7 @@
     /* Партия канала или наибольший минимум этапов (ткань, пошив): тот же
        пол, что на «Заказе» и в мастере (прогон 14.11). */
     var pr=PRODUCTS.find(function(x){ return x.base_name===SEL; });
-    var mq=(pr && typeof pr.moq==="number") ? pr.moq : (prod?Math.max(prod.moq||0, prod.stage_moq_max||0):0);
+    var mq=(pr && typeof pr.moq==="number") ? pr.moq : (prod ? (prod.moq||0) : 0);
     if(!mq||!prod){ moqNote.style.display="none"; return; }
     var q=Math.max(0,parseInt(document.getElementById("qty").value,10)||0);
     var extra=prod.pack_multiple>1?(" · кратно "+prod.pack_multiple+" шт"):"";
