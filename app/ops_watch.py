@@ -176,6 +176,8 @@ def run_once(now: datetime | None = None, send=None) -> dict:
     now = now or _now()
     send = send or notify.send_ops
     result = {"failing": 0, "sync_sent": False, "errors": 0, "errors_sent": False}
+    # Две ветки независимы (ревью Codex, PR #80): если база недоступна,
+    # ошибки сервера, скорее всего, ровно из-за этого, и молчать о них нельзя.
     try:
         db = SessionLocal()
         try:
@@ -191,6 +193,9 @@ def run_once(now: datetime | None = None, send=None) -> dict:
                 _sync_alerted = (ids, now)
             else:
                 log.warning("оповещение о падающих синках не отправлено: %s", reason)
+    except Exception:  # noqa: BLE001 — наблюдатель никогда не роняет планировщик
+        log.exception("наблюдение оператора: проверка синков не прошла")
+    try:
         unseen = _unseen_errors(now)
         result["errors"] = unseen
         if unseen:
@@ -200,8 +205,8 @@ def run_once(now: datetime | None = None, send=None) -> dict:
                 _errors_alerted_until = now
             else:
                 log.warning("оповещение об ошибках сервера не отправлено: %s", reason)
-    except Exception:  # noqa: BLE001 — наблюдатель никогда не роняет планировщик
-        log.exception("наблюдение оператора: необработанная ошибка")
+    except Exception:  # noqa: BLE001
+        log.exception("наблюдение оператора: оповещение об ошибках не прошло")
     return result
 
 
