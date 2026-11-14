@@ -335,8 +335,13 @@ def api_sizes_products(ctx: AuthContext = Depends(require_auth_api), db: Session
     rep = analytics.build_replenish(snap)
     apply_production_rules(db, ctx.org.id, rep)
     need_by = {i["base_name"]: int(i.get("need") or 0) for i in rep.get("items") or []}
+    moq_by = {i["base_name"]: int(i.get("moq") or 0) for i in rep.get("items") or []}
     for p in data.get("products") or []:
         p["need"] = need_by.get(p["base_name"], 0)
+        # Пол партии ЭТОЙ позиции (канал или этап по её категории): подсказка
+        # «не примет меньше N» говорит число позиции, а не канала (критик #102).
+        if p["base_name"] in moq_by:
+            p["moq"] = moq_by[p["base_name"]]
     return data
 
 
