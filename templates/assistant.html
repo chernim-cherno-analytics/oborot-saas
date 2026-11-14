@@ -536,8 +536,8 @@
       : ("Заказ должен закрыть " + cover + " дн продаж — до прихода следующего "
          + "заказа плюс страховой запас."
          + ((STATE.settingsCadence && +STATE.settingsCadence !== +STATE.cadence)
-            ? (" В Настройках указан заказ раз в " + STATE.settingsCadence + " дн; здесь "
-               + STATE.cadence + " дн из прошлого плана или канала. Выберите нужное выше.")
+            ? (" В Настройках указан заказ раз в " + STATE.settingsCadence + " дн, здесь выбрано "
+               + STATE.cadence + " дн: план считается по выбранному здесь.")
             : ""));
     document.getElementById("scopeHint").textContent = (p && p.staged && STATE.scope==="now")
       ? "Считаем, что этих денег хватит на первый этап; остальное платится позже — покажу календарём."
