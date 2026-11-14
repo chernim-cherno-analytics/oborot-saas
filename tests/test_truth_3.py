@@ -103,6 +103,12 @@ check("мастер на телефоне: таблица плана без сп
       and "− остаток − едет" not in a_html)
 check("«Заказ позиции»: новая позиция стартует с её рекомендации, а не с числа прошлой",
       'delete document.getElementById("qty").dataset.touched;' in sz_html)
+check("мастер: сезонная поправка темпа названа строкой над планом, не только подсказкой",
+      "Темп здесь с поправкой на сезон окна" in a_html)
+check("мастер на телефоне: новинка не уходит за край (строка переносится)",
+      ".nirow { display: flex; gap: 8px; margin-bottom: 7px; align-items: center; flex-wrap: wrap; }" in a_html)
+h_html = (ROOT / "templates" / "_hints.html").read_text(encoding="utf-8")
+check("подсказка «Бюджета» по D-65", "− остаток − «едет»" not in h_html and "прогнозный остаток к приходу" in h_html)
 p_html = (ROOT / "templates" / "plans.html").read_text(encoding="utf-8")
 check("значок «Популярный» только когда тарифов больше одного",
       "p.popular && (data.plans || []).length > 1" in p_html)
