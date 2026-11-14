@@ -182,10 +182,33 @@ with TestClient(app, headers={"X-Oborot-CSRF": "1"}) as a, \
               kop[-2] == 12.5 and kop[-1] == 50, str(kop))
         check("безразмерная колонка названа «б/р»", "б/р" in hdr, str(hdr))
 
+    # Раунд 2 ревью: итог с копейками совпадает с карточкой и платежами.
+    raw2 = _json.loads(sql("SELECT items_json FROM production_orders WHERE id=?", order_id)[0][0])
+    lst2 = raw2 if isinstance(raw2, list) else raw2["items"]
+    lst2[:] = [i for i in lst2 if i.get("base_name") != "Размеры списком"]
+    for k in range(3):
+        lst2.append({"base_name": f"Полтинник {k}", "qty": 1, "sizes": {"M": 1}, "cost": 10.5})
+    sql("UPDATE production_orders SET items_json=? WHERE id=?",
+        _json.dumps(raw2, ensure_ascii=False), order_id)
+    card2 = a.get(f"/api/orders/{order_id}").json()
+    kop2 = a.get(f"/api/orders/{order_id}/export.xlsx")
+    _, krows = sheet_rows(kop2.content, "Заказ")
+    ktotal = next(r for r in krows if r[0] and str(r[0]).startswith("Итого"))
+    _, kpay = sheet_rows(kop2.content, "Платежи")
+    kpaid = next((r[2] for r in kpay if r[0] == "Итого"), None)
+    check("копейки: «Итого» файла = total_cost карточки",
+          int(ktotal[-1]) == int(card2["total_cost"]), f"{ktotal[-1]} против {card2['total_cost']}")
+    open2 = next(o for o in a.get("/api/orders/open").json()["orders"] if o["id"] == order_id)
+    check("копейки: итог платежей в файле = сумме платежей на экране",
+          kpaid is None or int(kpaid) == round(sum(p["amount"] for p in open2["payments"])),
+          f"{kpaid}")
+    pol = next(r for r in krows if r[0] == "Полтинник 0")
+    check("копейки: сумма строки 10,50 × 1 = 10,50, а не 10", pol[-1] == 10.5, str(pol))
+
     print("\n6. Кнопки в интерфейсе")
     page = a.get("/replenish").text
-    check("на «Заказе» есть кнопка «Excel для цеха»", "Excel для цеха" in page
-          and "/export.xlsx" in page)
+    check("на «Заказе» есть кнопка «Excel для цеха» у открытых и «Excel» у принятых",
+          "Excel для цеха" in page and page.count("/export.xlsx") >= 2)
     check("в мастере после создания заказа есть ссылка на файл",
           "Excel для цеха" in a.get("/assistant").text)
 

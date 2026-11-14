@@ -911,7 +911,9 @@ def order_workbook(org_name: str, order: dict, production_name: str,
     # Цена с копейками: сумма строки считается от неё, и в файле
     # «цена × штуки» обязана совпадать с «Суммой» (ревью 14.11, P2).
     fmts[ncols - 1] = '#,##0.00" ₽"'
-    fmts[ncols] = FMT_MONEY
+    fmts[ncols] = '#,##0.00" ₽"'
+    total_fmts = dict(fmts)
+    total_fmts[ncols] = FMT_MONEY
     row = 3
     total_qty, total_sum, no_cost = 0, 0.0, []
     for it in items:
@@ -923,16 +925,19 @@ def order_workbook(org_name: str, order: dict, production_name: str,
         by_size = _sizes_of(it)
         values = [str(it.get("base_name") or "")]
         values += [_units(by_size.get(s)) for s in sizes]
-        cost_c = round(cost, 2)
-        values += [qty, cost_c if cost > 0 else None, round(cost_c * qty) if cost > 0 else None]
+        values += [qty, round(cost, 2) if cost > 0 else None,
+                   round(cost * qty, 2) if cost > 0 else None]
         _write_row(ws, row, values, fmts)
         if cost <= 0:
             no_cost.append(str(it.get("base_name") or ""))
         total_qty += qty
-        total_sum += round(cost_c * qty) if cost > 0 else 0
+        # Итог считается тем же способом, что карточка заказа и платежи
+        # (api._order_totals: round(sum(cost*qty))), без округления по строкам:
+        # итог файла обязан совпадать с экраном (ревью 14.11, раунд 2, P1).
+        total_sum += cost * qty if cost > 0 else 0
         row += 1
     label = "Итого" if not no_cost else f"Итого (сумма без {len(no_cost)} поз. без себестоимости)"
-    _write_total(ws, row, ncols, {ncols - 2: total_qty, ncols: round(total_sum)}, fmts, label=label)
+    _write_total(ws, row, ncols, {ncols - 2: total_qty, ncols: round(total_sum)}, total_fmts, label=label)
     row += 2
     info = [
         ("Заказ", f"№{order.get('id')} · {order.get('name') or ''}"),
