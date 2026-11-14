@@ -177,6 +177,8 @@ SUITES = [
     # учения — только в чат сервиса, фиксированный текст, без секретов.
     # Нужен порт mock-Telegram (четвёртое поле), наружу набор не ходит.
     ("ops_alert",   "test_ops_alert.py",       False, True),
+    # WIZARD-LABELS-1: мастер называет базу сумм и источник ритма.
+    ("wizard_labels", "test_wizard_labels.py", False, False),
     ("deps",        "test_dependencies.py",    False, False),
 ]
 
