@@ -319,13 +319,14 @@
      же, что и была: прокрутки вбок нет ни у страницы, ни у списка. */
   /* Прогон 14.11 (390 px): колонка «Заказать» была видна только после
      прокрутки таблицы вбок. На телефоне прячем справочные колонки
-     (оборачиваемость, темп, покрытие, производство): они есть в раскрытой
-     строке (▸), а главное число строки остаётся на экране. */
+     (оборачиваемость, темп, покрытие): темп и формула есть в раскрытой
+     строке (▸), а главное число строки остаётся на экране. Колонка
+     производства остаётся последней: перенос позиции на другое производство
+     есть только в ней (ревью Codex #100), до неё можно докрутить вбок. */
   @media (max-width: 640px) {
     #tbl-wrap > table > thead > tr > th:nth-child(5), #tbl-wrap > table > tbody > tr > td:nth-child(5):not([colspan]),
     #tbl-wrap > table > thead > tr > th:nth-child(6), #tbl-wrap > table > tbody > tr > td:nth-child(6):not([colspan]),
-    #tbl-wrap > table > thead > tr > th:nth-child(9), #tbl-wrap > table > tbody > tr > td:nth-child(9):not([colspan]),
-    #tbl-wrap > table > thead > tr > th:nth-child(12), #tbl-wrap > table > tbody > tr > td:nth-child(12):not([colspan]) {
+    #tbl-wrap > table > thead > tr > th:nth-child(9), #tbl-wrap > table > tbody > tr > td:nth-child(9):not([colspan]) {
       display: none; }
   }
   /* Телефон: остаются позиция, статус и «Заказать»; остаток, «едет» и
