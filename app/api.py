@@ -2403,7 +2403,7 @@ class OrderPlanIn(BaseModel):
 
 
 _EXCLUDED_KEEP = ("base_name", "category", "cls", "turnover", "need",
-                  "cost_price", "need_rub", "lost_margin", "moq_cost", "gap_days")
+                  "cost_price", "need_rub", "lost_margin", "moq_cost", "moq_full_cost", "gap_days")
 
 
 def _slim_excluded(rows) -> list:
