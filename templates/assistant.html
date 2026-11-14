@@ -1157,7 +1157,9 @@
       return '<tr><td><label style="cursor:pointer"><input type="checkbox" class="takebox" '+
         'data-b="'+esc(i.base_name)+'"'+(STATE.must.indexOf(i.base_name)>=0?' checked':'')+'> '+
         esc(i.base_name)+'</label><span class="why">'+esc(i.category)+
-        (i.moq_cost ? ' · партия стоит '+fmtR(i.moq_cost)+' — дороже лимита на позицию' : '')+'</span></td>'+
+        (i.moq_cost ? (' · партия стоит '+fmtR(i.moq_full_cost||i.moq_cost)+
+          ((i.moq_full_cost && i.moq_full_cost !== i.moq_cost) ? ' (в день размещения '+fmtR(i.moq_cost)+')' : '')+
+          ' — дороже лимита на позицию') : '')+'</span></td>'+
         '<td class="nb">'+fmt(i.turnover)+'</td><td class="nb">'+fmt(i.need)+'</td>'+
         '<td class="nb">'+fmtR(i.need_rub)+'</td><td class="nb">'+fmtR(i.lost_margin)+'</td></tr>';
     }).join("");
@@ -1178,8 +1180,14 @@
       '<div class="peak">Минимальная партия или один короб этих позиций стоит больше, чем вы разрешили тратить '+
       'на одну позицию. Поднимите лимит на шаге 2 или закажите их отдельно.</div>'+
       p.moq_over_cap.map(function(m){
-        return '<div class="peak">'+esc(m.base_name)+' — партия '+fmtR(m.batch_cost)+
-          ' при лимите '+fmtR(m.limit)+'</div>'; }).join("")+
+        /* OVERCAP-FULL-COST-1: полная цена партии и, если бюджет «на сейчас»,
+           та её часть, что платится в день размещения: лимит доли меряется
+           именно в ней, и это сказано словами. */
+        var now = m.budget_basis === "now" && m.batch_full_cost && m.batch_full_cost !== m.batch_cost;
+        return '<div class="peak">'+esc(m.base_name)+' — партия'+(m.batch_qty?' '+fmt(m.batch_qty)+' шт':'')+
+          ' стоит '+fmtR(m.batch_full_cost||m.batch_cost)+
+          (now ? ', в день размещения '+fmtR(m.batch_cost)+' при лимите '+fmtR(m.limit)+' (лимит считается в деньгах на сейчас)'
+               : ' при лимите '+fmtR(m.limit))+'</div>'; }).join("")+
       '</div></details></div>') : "";
     var moqHtml = (p.moq_skipped||[]).length ? ('<div class="fold"><details><summary>Не набирают минимальную партию ('+
       p.moq_skipped.length+')</summary><div class="body">'+
