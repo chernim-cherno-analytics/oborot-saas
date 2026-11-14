@@ -243,10 +243,10 @@
         <span class="lbl">Стратегия</span>
         <div class="tiles" id="stratTiles">
           <div class="tile" data-v="protect"><div class="t">Шире ассортимент</div>
-            <div class="d">Каждая строка закрывает неделю продаж, лимит на позицию 20% —
+            <div class="d">Цель: каждая строка закрывает неделю продаж, лимит на позицию 20% —
               больше моделей понемногу, меньше дыр на полке</div></div>
           <div class="tile on" data-v="balance"><div class="t">Баланс</div>
-            <div class="d">Каждая строка закрывает три недели, лимит 30% — потом добор
+            <div class="d">Цель: каждая строка закрывает три недели, лимит 30% — потом добор
               по оборачиваемости</div></div>
           <div class="tile" data-v="grow"><div class="t">Глубже в топ</div>
             <div class="d">Сразу до полной потребности, начиная с самых оборачиваемых,
@@ -1305,6 +1305,23 @@
       '</div></details></div>';
 
     var openHtml = '<div id="openBanner">' + openBannerHtml() + '</div>';
+    // Маленький бюджет на широкой стратегии: строки получают меньше цели
+    // ширины, и выходит по 1-2 шт на модель, которые цеху не отшить (прогон
+    // 14.11: 200 000 ₽, «Баланс», 30 позиций, 75 шт). Говорим это прямо и
+    // предлагаем «Глубже в топ». Количества не меняются.
+    var wd = (p.brief && p.brief.width_days) || 0;
+    if(wd > 0 && p.brief.strategy !== "grow"){
+      var took = (p.items||[]).filter(function(i){ return (i.qty||0) > 0 && !i.is_new; });
+      var shortL = took.filter(function(i){ return i.days_to_sell != null && i.days_to_sell < wd; });
+      if(took.length >= 4 && shortL.length * 2 >= took.length){
+        var qs = took.map(function(i){ return i.qty; }).sort(function(a,b){ return a-b; });
+        var med = qs[Math.floor(qs.length/2)];
+        openHtml += '<div class="warn" style="margin-bottom:12px">Бюджета не хватает на цель стратегии: '+
+          'у '+shortL.length+' из '+took.length+' позиций заказ закрывает меньше '+wd+' дн продаж '+
+          '(в середине списка '+fmt(med)+' шт на модель). Если цеху нужны партии побольше, выберите '+
+          '«Глубже в топ»: меньше моделей, но закрыты целиком.</div>';
+      }
+    }
     // Позиции «в минус» в плане называются до таблицы, а не только значком
     // в строке: владелец должен решить про них осознанно (прогон 14.11, N3).
     var lossItems = (p.items||[]).filter(function(i){ return i.below_cost && (i.qty||0) > 0; });
