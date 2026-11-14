@@ -48,7 +48,7 @@ check("у строк без себестоимости сумма пустая, 
       by["Пробник «Аромат»"][12] is None and by["Значок"][12] is None)
 check("примечание называет причину", "себестоимость не указана" in (by["Значок"][14] or ""))
 total = next(r for r in rows if isinstance(r[0], str) and r[0].startswith("Итого"))
-check("итог подписан как неполный", "сумма неполная: без 2 поз." in total[0], total[0])
+check("итог подписан как неполный", "сумма неполная: 2 поз. без себестоимости" in total[0], total[0])
 check("итог суммы только по строкам с ценой", total[12] == 5000, str(total[12]))
 note = next((r[0] for r in rows if isinstance(r[0], str) and "не попавшие в заказ" in r[0]), "")
 check("«не вошло» считается в позициях", "(19 поз.)" in note, note)

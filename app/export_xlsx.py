@@ -453,7 +453,7 @@ def _replenish_sheet(wb: Workbook, org_name: str, sheet_title: str, name: str,
 
     label = f"Итого по «{name}»: {len(items)} поз." if name else f"Итого: {len(items)} поз."
     if no_cost:
-        label += f" (сумма неполная: без {no_cost} поз. без себестоимости)"
+        label += f" (сумма неполная: {no_cost} поз. без себестоимости)"
     _write_total(ws, row, len(headers),
                  {11: total_need, 13: round(total_sum)}, formats, label=label)
     note_row = row + 2

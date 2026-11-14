@@ -2337,9 +2337,11 @@ def run_scenario() -> int:
           not (names90 - xl_names), f"нет в файле={sorted(names90 - xl_names)[:3]}")
     # 14 — «Производство» (добавлена, чтобы разложить файл по цехам), 15 — «Примечание»
     notes = [wsx.cell(row=i, column=15).value for i in range(3, wsx.max_row + 1)]
+    # Считаем именно пометку фолбэка: с 14.11 в примечании бывают и другие
+    # честные пометки («себестоимость не указана», «в минус»).
+    fb_notes = sum(1 for n in notes if n and "темп посчитан за год" in n)
     check("позиции по фолбэку помечены в основном листе",
-          sum(1 for n in notes if n) == len(fb),
-          f"пометок={sum(1 for n in notes if n)} ожидалось={len(fb)}")
+          fb_notes == len(fb), f"пометок={fb_notes} ожидалось={len(fb)}")
     wsx2 = wbx["Не вошло и почему"]
     xl_excl = {wsx2.cell(row=i, column=1).value for i in range(3, wsx2.max_row + 1)}
     check("лист «Не вошло и почему» содержит все исключённые позиции",
