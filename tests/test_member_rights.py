@@ -83,12 +83,11 @@ with TestClient(app, headers={"X-Oborot-CSRF": "1"}) as owner, \
         check(f"участник читает {path}", member.get(path).status_code == 200, path)
 
     print("\n1-3. Действия на всю организацию")
-    before = (sql("SELECT COUNT(*) FROM production_orders WHERE org_id=?", org_id),
-              sql("SELECT COUNT(*) FROM hidden_items") if sql(
-                  "SELECT name FROM sqlite_master WHERE name='hidden_items'") else [])
+    ordered_before = sql("SELECT qty FROM ordered_qty WHERE org_id=? AND base_name=?", org_id, base)
     cases = [
         ("DELETE", f"/api/orders/{order_id}", None),
         ("POST", "/api/ordered", {"base_name": base, "qty": 999}),
+        ("POST", "/api/ordered/add", {"base_name": base, "qty": 500}),
         ("POST", "/api/hidden", {"base_name": base, "hidden": True}),
         ("POST", "/api/categories/override", {"base_name": base, "category": "Захвачено"}),
         ("POST", "/api/categories/merge", {"from_category": cat, "to_category": "Захвачено"}),
@@ -100,14 +99,15 @@ with TestClient(app, headers={"X-Oborot-CSRF": "1"}) as owner, \
               r.status_code == 403 and "владельцу" in r.text, f"{r.status_code} {r.text[:120]}")
     check("отказы ничего не изменили: заказ на месте",
           sql("SELECT COUNT(*) FROM production_orders WHERE id=?", order_id)[0][0] == 1)
-    check("отказы ничего не изменили: «Едет» не перезаписано",
-          not sql("SELECT 1 FROM ordered_qty WHERE org_id=? AND base_name=? AND qty=999", org_id, base))
+    check("отказы ничего не изменили: «Едет» ни перезаписано, ни прибавлено",
+          sql("SELECT qty FROM ordered_qty WHERE org_id=? AND base_name=?", org_id, base) == ordered_before,
+          sql("SELECT qty FROM ordered_qty WHERE org_id=? AND base_name=?", org_id, base))
     after_rep = owner.get("/api/replenish").json()
     check("отказы ничего не изменили: категория позиции прежняя",
           next(i for i in after_rep["items"] if i["base_name"] == base).get("category") == item.get("category"))
     for method, path, body in cases[1:]:
         r = owner.request(method, path, json=body)
-        check(f"владелец: {method} {path} проходит", r.status_code != 403, f"{r.status_code} {r.text[:120]}")
+        check(f"владелец: {method} {path} проходит", r.status_code == 200, f"{r.status_code} {r.text[:120]}")
     r = owner.delete(f"/api/orders/{order_id}")
     check("владелец удаляет заказ (отправленный, не принятый)", r.status_code == 200, r.text[:200])
 
