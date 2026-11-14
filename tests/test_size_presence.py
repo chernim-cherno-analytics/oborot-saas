@@ -72,6 +72,33 @@ with TestClient(app, headers={"X-Oborot-CSRF": "1"}) as c:
           with_sizes and all("days365" in v for i in with_sizes for v in i["sizes"].values()))
     check("сетка «Заказа» сходится с потребностью",
           all(sum(v["rec"] for v in i["sizes"].values()) == i["need"] for i in with_sizes))
+    check("дни наличия размера не больше дат истории позиции",
+          all(v["days365"] <= v["hist365"] for i in with_sizes for v in i["sizes"].values()))
+    # Ревью Codex #97: второй вариант (другой цвет) того же размера в те же
+    # даты не должен удваивать дни наличия.
+    import sqlite3
+    item0 = with_sizes[0]
+    size0 = next(s for s, v in item0["sizes"].items() if v["days365"] > 0)
+    with sqlite3.connect(DB_PATH) as con:
+        org_id, pid, ext = con.execute(
+            "SELECT org_id, id, ext_id FROM products WHERE base_name=? AND size=? LIMIT 1",
+            (item0["base_name"], size0)).fetchone()
+        cols = [r[1] for r in con.execute("PRAGMA table_info(products)")]
+        row = con.execute(f"SELECT {', '.join(cols)} FROM products WHERE id=?", (pid,)).fetchone()
+        data = dict(zip(cols, row))
+        data.pop("id")
+        data["ext_id"] = (ext or "") + "-color2"
+        con.execute(f"INSERT INTO products ({', '.join(data)}) VALUES ({', '.join('?' * len(data))})",
+                    list(data.values()))
+        new_pid = con.execute("SELECT last_insert_rowid()").fetchone()[0]
+        con.execute("INSERT INTO stock_days (org_id, product_id, date, qty) "
+                    "SELECT org_id, ?, date, qty FROM stock_days WHERE product_id=?", (new_pid, pid))
+    from app import analytics as _an
+    _an.invalidate(org_id)
+    rep2 = {i["base_name"]: i for i in c.get("/api/replenish").json()["items"]}
+    d_after = rep2[item0["base_name"]]["sizes"][size0]["days365"]
+    check("второй вариант того же размера в те же даты не удваивает дни наличия",
+          d_after == item0["sizes"][size0]["days365"], f"{item0['sizes'][size0]['days365']} -> {d_after}")
     item = with_sizes[0]
     recomputed = analytics.size_split(item["sizes"], item["need"])
     calc = c.get("/api/sizes/calc", params={"product": item["base_name"], "qty": item["need"],

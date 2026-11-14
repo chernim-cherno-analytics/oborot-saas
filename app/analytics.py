@@ -702,8 +702,11 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
     # (остаток размера >= 1) и число дат истории остатков позиции за год. Доля
     # размера в заказе считается от темпа в днях наличия, а не от голых
     # продаж: размер, которого долго не было, иначе получал меньше нужного.
+    # Различные даты, а не строки: у размера может быть несколько вариантов
+    # (цвета) с одним base_name и размером, и count() строк завышал бы дни
+    # наличия, разбавляя спрос (ревью Codex #97).
     size_days_rows = db.execute(
-        select(Product.base_name, Product.size, func.count())
+        select(Product.base_name, Product.size, func.count(func.distinct(StockDay.date)))
         .select_from(StockDay)
         .join(Product, join_products)
         .where(StockDay.org_id == org.id, StockDay.date >= cutoff365, StockDay.qty >= 1)
