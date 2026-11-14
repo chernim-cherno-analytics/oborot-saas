@@ -241,11 +241,15 @@
   }
   function renderMoqNote(){
     var prod=SEL?prodFor(SEL):null;
-    if(!prod||!prod.moq){ moqNote.style.display="none"; return; }
+    /* Партия канала или наибольший минимум этапов (ткань, пошив): тот же
+       пол, что на «Заказе» и в мастере (прогон 14.11). */
+    var mq=prod?Math.max(prod.moq||0, prod.stage_moq_max||0):0;
+    if(!mq){ moqNote.style.display="none"; return; }
     var q=Math.max(0,parseInt(document.getElementById("qty").value,10)||0);
     var extra=prod.pack_multiple>1?(" · кратно "+prod.pack_multiple+" шт"):"";
-    moqNote.textContent="⚠ «"+prod.name+"» не примет меньше "+prod.moq+" шт"+extra+
-      (q&&q<prod.moq?" — сейчас введено "+q:"");
+    moqNote.textContent="⚠ «"+prod.name+"» не примет меньше "+mq+" шт"+extra+
+      (prod.stage_moq_max>(prod.moq||0)?" (минимум этапа; по категориям может отличаться)":"")+
+      (q&&q<mq?" — сейчас введено "+q:"");
     moqNote.style.display="";
   }
 
@@ -343,7 +347,7 @@
         // позиции. Пользователь всегда может поправить дату руками дальше.
         if(wasEmpty&&d.arrival_date){
           var prod=prodFor(SEL);
-          var prodLead=prod?(prod.lead_time_days||DEFAULT_LEAD):null;
+          var prodLead=prod?(prod.lead_effective||prod.lead_time_days||DEFAULT_LEAD):null;
           var delta=(prodLead!=null)?(prodLead-d.days_to_arrival):0;
           if(delta){
             arrInput.value=addDays(d.arrival_date,delta);

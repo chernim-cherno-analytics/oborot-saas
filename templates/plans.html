@@ -158,7 +158,7 @@ document.addEventListener("DOMContentLoaded", function () {
       var isCur = p.code === cur;
       var cls = "pcard" + (isCur ? " current" : (p.popular ? " hot" : ""));
       var tag = isCur ? '<span class="tag cur">Ваш тариф</span>'
-                      : (p.popular ? '<span class="tag hot">Популярный</span>' : "");
+                      : (p.popular && (data.plans || []).length > 1 ? '<span class="tag hot">Популярный</span>' : "");
       return '<div class="' + cls + '">' + tag +
         "<h3>" + esc(p.name) + "</h3>" +
         '<p class="for">' + esc(p.tagline) + "</p>" +

@@ -109,8 +109,14 @@ with TestClient(app, headers={"X-Oborot-CSRF": "1"}) as a, \
     size_cols = header[1:total_idx]
     by_name = {str(r[0]): r for r in rows[2:] if r[0] and not str(r[0]).startswith("Итого")
                and r[0] not in ("Заказ", "Статус", "Создан", "Производство",
-                                "Плановая дата прихода", "ID партии", "Без себестоимости")}
+                                "Плановая дата прихода", "ID партии", "Без себестоимости",
+                                "Без размерной сетки")}
     saved = {i["base_name"]: i for i in card["items"]}
+    grid_row = next((r for r in rows if r[0] == "Без размерной сетки"), None)
+    no_grid_saved = [i["base_name"] for i in card["items"] if not any((i.get("sizes") or {}).values())]
+    check("позиции без размерной сетки названы отдельной строкой (прогон 14.11)",
+          (grid_row is not None and all(n in str(grid_row[1]) for n in no_grid_saved)) if no_grid_saved
+          else grid_row is None, str(grid_row))
     check("в файле ровно модели заказа", set(by_name) == set(saved),
           f"{sorted(by_name)} против {sorted(saved)}")
     sizes_ok = all(

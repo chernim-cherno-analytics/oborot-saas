@@ -1401,12 +1401,14 @@
     return items.filter(function(it){ return prodOf(it.base_name)===pid; });
   }
   /* Срок производства вкладки: свой или общий из настроек. */
-  function leadOf(p){ return (p&&p.lead_time_days)||DEFAULT_LEAD; }
+  /* Срок канала тот же, что в расчёте (сумма этапов, иначе поле срока). */
+  function leadOf(p){ return (p&&(p.lead_effective||p.lead_time_days))||DEFAULT_LEAD; }
   /* Подпись условий подрядчика под названием вкладки. */
   function condText(p){
     var out=["срок "+fmt(leadOf(p))+" "+plural(leadOf(p),"день","дня","дней")
-      +(p&&p.lead_time_days?"":" (общий)")];
+      +(p&&p.lead_from_stages?" (сумма этапов)":(p&&(p.lead_effective||p.lead_time_days)?"":" (общий)"))];
     if(p&&p.moq) out.push("партия от "+fmt(p.moq)+" шт");
+    if(p&&p.stage_moq_max>(p.moq||0)) out.push("партия этапов до "+fmt(p.stage_moq_max)+" шт");
     if(p&&p.pack_multiple>1) out.push("кратно "+fmt(p.pack_multiple));
     return out.join(" · ");
   }
