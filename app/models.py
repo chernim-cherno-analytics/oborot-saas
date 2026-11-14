@@ -490,6 +490,23 @@ class Production(Base):
             return []
         return data if isinstance(data, list) else []
 
+    def effective_lead_days(self) -> int:
+        """Срок канала, одинаковый для всех экранов (D-72, 14.11.2026).
+
+        Заданные этапы главнее поля срока: мастер считает срок суммой этапов,
+        и «Заказ», «Заказ позиции» и Excel обязаны брать то же число (прогон
+        14.11: «Заказ» 45 дн, мастер 65 дн для одного канала «ткань → пошив»).
+        0 = не задано (берётся общая настройка организации).
+        """
+        total = 0
+        for st in self.stages:
+            if isinstance(st, dict):
+                try:
+                    total += max(0, int(st.get("lead_days") or 0))
+                except (TypeError, ValueError):
+                    pass
+        return total or int(self.lead_time_days or 0)
+
 
 class ProductionAssign(Base):
     """Позиция, закреплённая за ДОПОЛНИТЕЛЬНЫМ производством.

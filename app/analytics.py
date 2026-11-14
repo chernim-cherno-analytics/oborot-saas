@@ -876,12 +876,13 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
     # импорта api → analytics → api. Правило выбора срока то же, что в
     # app/api.py:apply_production_rules, иначе страница «Заказ» показала бы
     # один срок, а расчёт шёл бы по другому.
-    prod_rows = db.execute(
-        select(Production.id, Production.lead_time_days, Production.is_main)
-        .where(Production.org_id == org.id)
-    ).all()
-    prod_lead_by_id = {int(pid): int(lead or 0) for pid, lead, _m in prod_rows}
-    main_prod_id = next((int(pid) for pid, _l, is_main in prod_rows if is_main), None)
+    prod_objs = db.execute(
+        select(Production).where(Production.org_id == org.id)
+    ).scalars().all()
+    # Срок канала: сумма этапов, если они заданы, иначе поле срока (D-72):
+    # то же число, что считает мастер.
+    prod_lead_by_id = {int(p.id): p.effective_lead_days() for p in prod_objs}
+    main_prod_id = next((int(p.id) for p in prod_objs if p.is_main), None)
     # Позиция без записи в production_assign — на основном производстве;
     # пустой срок у производства = «как в общих настройках».
     default_lead = prod_lead_by_id.get(main_prod_id) or lead_time
@@ -1824,6 +1825,9 @@ def build_replenish(snap: dict) -> dict:
                 "category": it["category"],
                 "cls": it["cls"],
                 "low_data": it.get("low_data", False),
+                # Пометка «в минус» на «Заказе» (прогон 14.11): количество не меняет.
+                "below_cost": bool(it.get("below_cost")) and not it.get("low_data", False),
+                "loss_unit": it.get("loss_unit"),
                 "turnover": it["turnover"],
                 "rate": it["rate_active"],
                 "rate_year": it["rate_year"],

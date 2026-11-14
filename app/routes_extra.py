@@ -361,7 +361,7 @@ def api_sizes_calc(
     default_lead = analytics.extra_settings(ctx.org)["lead_time_days"]
     cond = production_conditions(db, ctx.org.id)
     prod = cond["by_id"].get(cond["assign"].get(product, cond["main_id"]))
-    lead = int(getattr(prod, "lead_time_days", 0) or 0) or default_lead
+    lead = (prod.effective_lead_days() if prod is not None else 0) or default_lead
     result = analytics_extra.build_sizes_calc(
         db, ctx.org.id, snap, product, qty, period, mode,
         arrival=arrival or None, lead_time_days=lead,

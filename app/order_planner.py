@@ -722,6 +722,11 @@ def _candidates(snap: dict, brief: dict, ctx: dict) -> tuple[list[dict], dict]:
             "category": category,
             "cls": it.get("cls"),
             "low_data": bool(it.get("low_data")),
+            # «Торгуем в минус» из аналитики: только пометка, количество не
+            # меняет (прогон 14.11: мастер молча клал в заказ позиции, которые
+            # «Оборачиваемость» называет убыточными).
+            "below_cost": bool(it.get("below_cost")) and not it.get("low_data"),
+            "loss_unit": it.get("loss_unit"),
             "turnover": float(it.get("turnover") or 0),
             "rate_cover": round(r_cover, 4),
             "rate_lead": round(r_lead, 4),
@@ -830,6 +835,21 @@ def _allocate(cands: list[dict], brief: dict, ctx: dict, stages: list[dict]) -> 
         unit = unit_pay(c)
         if cap_per_item > 0:
             cap_units[base] = int(math.floor(cap_per_item / unit))
+        # Партия дороже лимита доли называется ДО ограничений волны и денег
+        # (прогон 14.11, N4): раньше бестселлер с партией 24 × 12 299 ₽ при
+        # лимите 90 000 ₽ уходил в «не вошло» без цены партии, если потолок
+        # волны или остаток денег обрезал его раньше, чем дело доходило до
+        # проверки партии. Штук это не меняет: такая партия не прошла бы и
+        # позже, ниже стоит та же проверка; меняется только названная причина.
+        moq0 = moq_of(c)
+        if (cap is not None and not c["must_have"] and have == 0 and moq0 > 0
+                and cap_per_item > 0 and c["rate_cover"] > 0
+                and moq0 / c["rate_cover"] <= MOQ_MAX_COVER_DAYS):
+            moq_qty0 = -(-moq0 // pack) * pack if pack > 1 else moq0
+            if moq_qty0 * unit > cap_per_item + 1:
+                moq_over_cap[base] = int(round(moq_qty0 * unit))
+                moq_over_cap_qty[base] = int(moq_qty0)
+                return
         limit = cap_per_item if (cap is not None and cap < 0) else cap
         if limit is not None and limit > 0:
             by_cap = int(math.floor(limit / unit))
@@ -1071,6 +1091,8 @@ def plan_order(snap: dict, brief: dict, ctx: dict, stages: list[dict],
             "base_name": c["base_name"],
             "category": c["category"],
             "cls": c["cls"],
+            "below_cost": c.get("below_cost", False),
+            "loss_unit": c.get("loss_unit") if c.get("below_cost") else None,
             "turnover": round(c["turnover"]),
             "rate": rate,
             "cs": c["cs"],

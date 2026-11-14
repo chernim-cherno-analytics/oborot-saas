@@ -536,6 +536,9 @@ def sizes_products(db: Session, org_id: int, snap: dict) -> dict:
                 "category": it["category"],
                 "sold": sold,
                 "in_stock": it["cs"],
+                # Рекомендация «Заказа» по этой позиции: стартовое количество
+                # страницы вместо постоянных 30 шт (прогон 14.11).
+                "need": int(it.get("need") or 0),
             }
         )
     products.sort(key=lambda p: -p["sold"])

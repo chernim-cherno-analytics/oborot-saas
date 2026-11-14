@@ -199,6 +199,8 @@ SUITES = [
     ("wizard_labels", "test_wizard_labels.py", False, False),
     # XLSX-TRUTH-1: Excel «Что заказать» не выдаёт неполную сумму за полную.
     ("xlsx_truth", "test_xlsx_truth.py",       False, False),
+    # TRUTH-2: повторный прогон пользователями 14.11, экраны говорят одно.
+    ("truth_2", "test_truth_2.py",             False, False),
     ("deps",        "test_dependencies.py",    False, False),
 ]
 
