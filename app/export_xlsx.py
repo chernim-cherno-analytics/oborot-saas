@@ -408,18 +408,29 @@ def _replenish_sheet(wb: Workbook, org_name: str, sheet_title: str, name: str,
     row = 3
     total_need = 0
     total_sum = 0.0
+    no_cost = 0
     for it in items:
         cost = float(it.get("cost_price") or 0)
-        order_sum = round(it["need"] * cost)
+        # XLSX-TRUTH-1: позиция без себестоимости не бесплатна. Раньше в
+        # колонке «Сумма заказа» стоял 0, а итог не говорил, что он неполный
+        # (на экране «СУММА НЕПОЛНАЯ», в файле ничего: находка прогона).
+        order_sum = round(it["need"] * cost) if cost > 0 else None
         sold_year = sum(round(s.get("sold365") or 0) for s in it.get("sizes", {}).values())
         total_need += it["need"]
-        total_sum += order_sum
+        if order_sum is None:
+            if int(it["need"] or 0) > 0:
+                no_cost += 1
+        else:
+            total_sum += order_sum
+        note = _replenish_note(it, window_ru)
+        if cost <= 0:
+            note = "себестоимость не указана: сумма неизвестна" + (f"; {note}" if note else "")
         _write_row(ws, row, [
             it["base_name"], it.get("category") or "", CLS_RU.get(it["cls"], it["cls"]),
             it["turnover"], it["rate"], sold_year, it["cs"], it.get("ordered") or 0,
             it.get("wos"), _fmt_date_ru(it.get("stockout_date")), it["need"],
             cost if cost > 0 else None, order_sum,
-            it.get("production_name") or "", _replenish_note(it, window_ru),
+            it.get("production_name") or "", note,
         ], formats)
         row += 1
         # Размерная сетка: сток / продано за год / рекомендация — отступом.
@@ -437,6 +448,8 @@ def _replenish_sheet(wb: Workbook, org_name: str, sheet_title: str, name: str,
             row += 1
 
     label = f"Итого по «{name}»: {len(items)} поз." if name else f"Итого: {len(items)} поз."
+    if no_cost:
+        label += f" (сумма неполная: без {no_cost} поз. без себестоимости)"
     _write_total(ws, row, len(headers),
                  {11: total_need, 13: round(total_sum)}, formats, label=label)
     note_row = row + 2
@@ -451,7 +464,7 @@ def _replenish_sheet(wb: Workbook, org_name: str, sheet_title: str, name: str,
     excluded = data.get("excluded") or []
     _cell(ws, note_row, 1,
           f"Позиции, не попавшие в заказ, — на листе «{_EXCLUDED_SHEET}» "
-          f"({len(excluded)} шт). Числа посчитаны по темпу «{window_ru}».",
+          f"({len(excluded)} поз.). Числа посчитаны по темпу «{window_ru}».",
           font=_TITLE_FONT)
     _autofit(ws)
     return ws

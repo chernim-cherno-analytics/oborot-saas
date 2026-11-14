@@ -177,6 +177,8 @@ SUITES = [
     # учения — только в чат сервиса, фиксированный текст, без секретов.
     # Нужен порт mock-Telegram (четвёртое поле), наружу набор не ходит.
     ("ops_alert",   "test_ops_alert.py",       False, True),
+    # XLSX-TRUTH-1: Excel «Что заказать» не выдаёт неполную сумму за полную.
+    ("xlsx_truth", "test_xlsx_truth.py",       False, False),
     ("deps",        "test_dependencies.py",    False, False),
 ]
 
