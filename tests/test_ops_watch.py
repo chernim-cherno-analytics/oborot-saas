@@ -219,6 +219,17 @@ check("оператор получил число ошибок один раз",
 SENT.clear()
 ops_watch.run_once(now + timedelta(minutes=5), send=fake_send)
 check("те же ошибки второй раз не шлются", not any(k == "server-errors" for k, _ in SENT), str(SENT))
+# Ревью Codex: база недоступна, а ошибки сервера всё равно доходят до оператора.
+ops_watch.record_server_error(now + timedelta(minutes=6))
+_orig_failing = ops_watch.failing_syncs
+ops_watch.failing_syncs = lambda db, n: (_ for _ in ()).throw(RuntimeError("database is locked"))
+SENT.clear()
+try:
+    res = ops_watch.run_once(now + timedelta(minutes=7), send=fake_send)
+finally:
+    ops_watch.failing_syncs = _orig_failing
+check("база недоступна: оповещение об ошибках всё равно уходит",
+      ("server-errors", "1") in SENT and res["errors"] == 1, f"{SENT} {res}")
 ok_resp = client.get("/health/live")
 check("обычные запросы не задеты", ok_resp.status_code == 200, str(ok_resp.status_code))
 
