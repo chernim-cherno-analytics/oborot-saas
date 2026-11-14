@@ -177,6 +177,8 @@ SUITES = [
     # учения — только в чат сервиса, фиксированный текст, без секретов.
     # Нужен порт mock-Telegram (четвёртое поле), наружу набор не ходит.
     ("ops_alert",   "test_ops_alert.py",       False, True),
+    # LANDING-TRUTH-1: лендинг и тарифы не обещают того, чего нет.
+    ("landing", "test_landing_truth.py",       False, False),
     ("deps",        "test_dependencies.py",    False, False),
 ]
 
