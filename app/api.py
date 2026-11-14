@@ -2105,9 +2105,12 @@ def _production_out(p, fallback_lead: int) -> dict:
         # Клиент брал lead_time_days (0 при этапах) и сдвигал дату прихода
         # на 20 дней раньше расчёта (прогон пользователями 14.11, P1).
         "lead_effective": p.effective_lead_days(),
-        "lead_from_stages": bool((p.stages_json or "").strip()) and bool(p.stages),
-        "stage_moq_max": max((int((st or {}).get("min_units") or 0) for st in (p.stages or [])
-                              if isinstance(st, dict)), default=0),
+        "lead_from_stages": sum(int(st.get("lead_days") or 0) for st in stages) > 0
+                            and bool((p.stages_json or "").strip()),
+        # Из нормализованных этапов: мусор в старых данных не роняет ответ.
+        "stage_moq_max": max([int(st.get("min_units") or 0) for st in stages]
+                             + [int(v or 0) for st in stages for v in (st.get("min_by_category") or {}).values()],
+                             default=0),
         "moq_units": order_planner.production_moq(p),
         "cadence_days": int(p.cadence_days or 0),
         "prepay_now_share": round(order_planner.prepay_share_total(stages), 4),

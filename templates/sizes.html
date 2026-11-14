@@ -243,12 +243,13 @@
     var prod=SEL?prodFor(SEL):null;
     /* Партия канала или наибольший минимум этапов (ткань, пошив): тот же
        пол, что на «Заказе» и в мастере (прогон 14.11). */
-    var mq=prod?Math.max(prod.moq||0, prod.stage_moq_max||0):0;
-    if(!mq){ moqNote.style.display="none"; return; }
+    var pr=PRODUCTS.find(function(x){ return x.base_name===SEL; });
+    var mq=(pr && typeof pr.moq==="number") ? pr.moq : (prod?Math.max(prod.moq||0, prod.stage_moq_max||0):0);
+    if(!mq||!prod){ moqNote.style.display="none"; return; }
     var q=Math.max(0,parseInt(document.getElementById("qty").value,10)||0);
     var extra=prod.pack_multiple>1?(" · кратно "+prod.pack_multiple+" шт"):"";
     moqNote.textContent="⚠ «"+prod.name+"» не примет меньше "+mq+" шт"+extra+
-      (prod.stage_moq_max>(prod.moq||0)?" (минимум этапа; по категориям может отличаться)":"")+
+      (mq>(prod.moq||0)?" (минимум этапа для этой позиции)":"")+
       (q&&q<mq?" — сейчас введено "+q:"");
     moqNote.style.display="";
   }

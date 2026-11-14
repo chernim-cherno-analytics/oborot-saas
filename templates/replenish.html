@@ -1430,7 +1430,7 @@
     var out=["срок "+fmt(leadOf(p))+" "+plural(leadOf(p),"день","дня","дней")
       +(p&&p.lead_from_stages?" (сумма этапов)":(p&&(p.lead_effective||p.lead_time_days)?"":" (общий)"))];
     if(p&&p.moq) out.push("партия от "+fmt(p.moq)+" шт");
-    if(p&&p.stage_moq_max>(p.moq||0)) out.push("партия этапов до "+fmt(p.stage_moq_max)+" шт");
+    if(p&&p.stage_moq_max>(p.moq||0)) out.push("у этапов свои минимумы, до "+fmt(p.stage_moq_max)+" шт (по категориям может отличаться)");
     if(p&&p.pack_multiple>1) out.push("кратно "+fmt(p.pack_multiple));
     return out.join(" · ");
   }
