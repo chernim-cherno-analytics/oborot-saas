@@ -177,6 +177,8 @@ SUITES = [
     # учения — только в чат сервиса, фиксированный текст, без секретов.
     # Нужен порт mock-Telegram (четвёртое поле), наружу набор не ходит.
     ("ops_alert",   "test_ops_alert.py",       False, True),
+    # SEC-2 (предложение 14.11): права участника на действия всей организации.
+    ("member_rights", "test_member_rights.py", False, False),
     ("deps",        "test_dependencies.py",    False, False),
 ]
 

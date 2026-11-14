@@ -200,7 +200,7 @@ def api_discount_overrides(
 @router.post("/api/discount-overrides")
 def api_set_discount_override(
     body: DiscountIn,
-    ctx: AuthContext = Depends(require_auth_api),
+    ctx: AuthContext = Depends(require_owner_api),
     db: Session = Depends(get_db),
 ):
     """Установить/снять ручную скидку позиции (0 = снять).
@@ -413,7 +413,7 @@ def api_hidden(ctx: AuthContext = Depends(require_auth_api), db: Session = Depen
 
 @router.post("/api/hidden")
 def api_set_hidden(
-    body: HiddenIn, ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)
+    body: HiddenIn, ctx: AuthContext = Depends(require_owner_api), db: Session = Depends(get_db)
 ):
     """Убрать в архив / вернуть из архива.
 
@@ -460,7 +460,7 @@ def api_categories(ctx: AuthContext = Depends(require_auth_api), db: Session = D
 @router.post("/api/categories/override")
 def api_category_override(
     body: CategoryOverrideIn,
-    ctx: AuthContext = Depends(require_auth_api),
+    ctx: AuthContext = Depends(require_owner_api),
     db: Session = Depends(get_db),
 ):
     """Перенести отдельную позицию в другую категорию ('' = сбросить).
@@ -488,7 +488,7 @@ def api_category_override(
 @router.post("/api/categories/merge")
 def api_category_merge(
     body: CategoryMergeIn,
-    ctx: AuthContext = Depends(require_auth_api),
+    ctx: AuthContext = Depends(require_owner_api),
     db: Session = Depends(get_db),
 ):
     """Влить категорию в другую ('' = отменить слияние этой категории)."""

@@ -1245,7 +1245,7 @@ def api_order_receipts_add(
 
 @router.delete("/orders/{order_id}")
 def api_order_delete(
-    order_id: int = _id_path(), ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)
+    order_id: int = _id_path(), ctx: AuthContext = Depends(require_owner_api), db: Session = Depends(get_db)
 ):
     """Удаление заказа: draft — свободно; sent — с вычетом из «едет»; received — нельзя."""
     order = db.get(ProductionOrder, order_id)
@@ -1362,7 +1362,7 @@ class OrderedIn(BaseModel):
 
 @router.post("/ordered")
 def api_set_ordered(
-    body: OrderedIn, ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)
+    body: OrderedIn, ctx: AuthContext = Depends(require_owner_api), db: Session = Depends(get_db)
 ):
     """Ручная правка «едет к нам» (перезапись значения по базовому имени)."""
     _require_known_base(db, ctx.org.id, body.base_name)
