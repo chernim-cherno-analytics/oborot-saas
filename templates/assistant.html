@@ -684,7 +684,10 @@
     document.getElementById("overhead").value = last.overhead_pct || 0;
     STATE.newItems = [];
     document.getElementById("newRows").innerHTML = "";
-    (last.new_items||[]).forEach(function(nn){ addNew(nn.name, nn.qty, nn.cost); });
+    // Новинки прошлого плана подставляются только по явному «Повторить».
+    // При автоматическом открытии мастера они молча возвращались в следующий
+    // план и в календарь денег: риск повторно отшить новинку (прогон 14.11, P1).
+    if(!auto){ (last.new_items||[]).forEach(function(nn){ addNew(nn.name, nn.qty, nn.cost); }); }
     Array.prototype.forEach.call(document.querySelectorAll("#stratTiles .tile"), function(x){
       x.className = "tile" + (x.dataset.v===STATE.strategy ? " on" : ""); });
     segInitValue("cadSeg", STATE.cadence);
@@ -1035,7 +1038,9 @@
           ? ('Первый платёж '+dstr((p.payments||[])[0] && p.payments[0].date))
           : 'Заплатить сейчас')+(hasNew ? ' · каталожные позиции' : '')+'</div><div class="v">'+fmtR(t.pay_now)+'</div>'+
         '<div class="s">из бюджета '+fmtR(budget)+
-        (p.reserve_new? (" · новинки "+fmtR(p.reserve_new)) : "")+
+        (p.reserve_new? ((hasNew && p.reserve_new === p.new_items_cost
+                          ? (p.budget_basis === "now" ? " · новинки сегодня " : " · новинки ")
+                          : " · резерв на новинки ")+fmtR(p.reserve_new)) : "")+
         ' · свободно '+fmtR(left)+'</div></div>'+
       '<div class="card"'+(t.pay_later>0?' style="background:rgba(255,204,0,.16)"':'')+'>'+
         '<div class="l">'+(hasNew ? 'Обязательство по каталожным позициям' : 'Полное обязательство')+'</div><div class="v">'+fmtR(t.cost)+'</div>'+
@@ -1062,7 +1067,7 @@
         fmt(p.order_totals.positions)+' позиций · '+fmt(p.order_totals.units)+' шт · '+
         fmtR(p.order_totals.cost)+'. Новинки включены в календарь платежей. '+
         'Карточки выше относятся к каталожным позициям.</div>') :
-        (hasNew ? '<div class="warn">Новинки на '+fmtR(p.new_items_cost)+
+        (hasNew ? '<div class="warn">Новинки на '+fmtR(p.new_items_cost_full != null ? p.new_items_cost_full : p.new_items_cost)+
         ' показаны отдельно ниже. Итоговые суммы, количество и календарь этого плана их пока не учитывают.</div>' : '')) +
       (p.budget_note ? '<div class="warn">'+esc(p.budget_note)+'</div>' : "") +
       (left < 0
@@ -1225,8 +1230,10 @@
         ' позиц. ('+esc((s.added||[]).slice(0,4).join(", "))+')</div>';
     }).join("");
 
+    var nFull = (p.new_items_cost_full != null) ? p.new_items_cost_full : p.new_items_cost;
     var newHtml = (p.new_items||[]).length ? ('<div class="fold" open><details open><summary>Новинки — ваше решение ('+
-      fmtR(p.new_items_cost)+')</summary><div class="body">'+
+      fmtR(nFull)+(p.budget_basis === "now" && p.new_items_cost !== nFull ? (', сегодня '+fmtR(p.new_items_cost)) : '')+
+      ')</summary><div class="body">'+
       (p.new_items||[]).map(function(n){ return '<div class="peak">'+esc(n.name)+' — '+n.qty+' шт × '+fmtR(n.cost)+' = <b>'+fmtR(n.total)+'</b></div>'; }).join("")+
       (p.new_items_over_budget ? '<div class="warn" style="margin-top:9px">Новинки выходят за бюджет на '+fmtR(p.new_items_over_budget)+'.</div>' : "")+
       '</div></details></div>') : "";

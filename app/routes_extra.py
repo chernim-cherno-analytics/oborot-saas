@@ -334,9 +334,27 @@ def api_sizes_products(ctx: AuthContext = Depends(require_auth_api), db: Session
     # при минимальной партии 300).
     rep = analytics.build_replenish(snap)
     apply_production_rules(db, ctx.org.id, rep)
+    from app import order_planner
+    cond = production_conditions(db, ctx.org.id)
+    default_lead = analytics.extra_settings(ctx.org)["lead_time_days"]
     need_by = {i["base_name"]: int(i.get("need") or 0) for i in rep.get("items") or []}
+    moq_by = {i["base_name"]: int(i.get("moq") or 0) for i in rep.get("items") or []}
     for p in data.get("products") or []:
         p["need"] = need_by.get(p["base_name"], 0)
+        # Пол партии ЭТОЙ позиции (канал или этап по её категории): подсказка
+        # «не примет меньше N» говорит число позиции, а не канала (критик #102).
+        if p["base_name"] in moq_by:
+            p["moq"] = moq_by[p["base_name"]]
+        else:
+            # Позиции без потребности на «Заказе» нет: считаем тот же пол сами,
+            # по каналу и категории позиции (ревью Codex #102: иначе брался
+            # наибольший минимум чужой категории).
+            prod = cond["by_id"].get(cond["assign"].get(p["base_name"], cond["main_id"]))
+            mq = order_planner.production_moq(prod) if prod is not None else 0
+            if prod is not None and (prod.stages_json or "").strip():
+                st = order_planner.normalize_stages(prod.stages, default_lead)
+                mq = max(mq, order_planner.stage_moq(st, p.get("category") or "Без категории"))
+            p["moq"] = mq
     return data
 
 

@@ -786,17 +786,6 @@ def _allocate(cands: list[dict], brief: dict, ctx: dict, stages: list[dict]) -> 
 
     pack = max(0, int(ctx.get("pack_multiple") or 0))
     budget = float(brief["budget"])
-    # Резерв на новинки: либо процент от бюджета, либо сумма вписанных вручную
-    # новинок — что больше. Эти деньги планировщик не распределяет.
-    new_cost = sum(i["total"] for i in brief.get("new_items") or [])
-    reserve = int(max(round(budget * brief["reserve_new_pct"] / 100.0), new_cost))
-    # Новинки могут не влезать в бюджет — это не повод молча съесть все деньги:
-    # режем резерв по бюджету и отдельно сообщаем, на сколько вышли за него.
-    over_budget = max(0, reserve - int(budget))
-    reserve = min(reserve, int(budget))
-    money = budget - reserve
-    cap_per_item = money * brief["max_share_pct"] / 100.0
-
     # Цена единицы для БЮДЖЕТА: 'now' — только то, что платится в день
     # размещения (предоплата первого этапа: у своего производства это ткань,
     # пошив оплачивается после её прихода), 'full' — весь заказ целиком.
@@ -811,6 +800,24 @@ def _allocate(cands: list[dict], brief: dict, ctx: dict, stages: list[dict]) -> 
     if brief["budget_scope"] == "now" and pay_share <= 1e-9:
         pay_share = 1.0
         budget_basis = "full_no_prepay"
+    # Резерв на новинки: либо процент от бюджета, либо сумма вписанных вручную
+    # новинок — что больше. Эти деньги планировщик не распределяет.
+    # Новинки меряются в той же базе, что и бюджет (прогон 14.11, P2): при
+    # «деньгах на сейчас» сегодня платится доля предоплаты, а не вся
+    # стоимость. Раньше новинка 180 000 ₽ занимала 180 000 «сегодняшних»
+    # денег, хотя платёж сегодня 81 000, и мастер писал «свободно 184 ₽» при
+    # реальных 99 184 ₽. Полная стоимость новинок остаётся в new_cost_full.
+    new_cost_full = sum(i["total"] for i in brief.get("new_items") or [])
+    # Потолок, а не округление: доля в копейках не должна выпускать первый
+    # транш на рубль выше бюджета (критик #102, P3).
+    new_cost = int(math.ceil(new_cost_full * pay_share - 1e-9))
+    reserve = int(max(round(budget * brief["reserve_new_pct"] / 100.0), new_cost))
+    # Новинки могут не влезать в бюджет — это не повод молча съесть все деньги:
+    # режем резерв по бюджету и отдельно сообщаем, на сколько вышли за него.
+    over_budget = max(0, reserve - int(budget))
+    reserve = min(reserve, int(budget))
+    money = budget - reserve
+    cap_per_item = money * brief["max_share_pct"] / 100.0
 
     alloc: dict[str, int] = {}
     reasons: dict[str, list[str]] = {}
@@ -991,7 +998,8 @@ def _allocate(cands: list[dict], brief: dict, ctx: dict, stages: list[dict]) -> 
         "alloc": alloc, "reasons": reasons, "cap_units": cap_units,
         "moq_skipped": moq_skipped, "moq_over_cap": moq_over_cap,
         "moq_over_cap_qty": moq_over_cap_qty, "spent": spent,
-        "reserve": reserve, "new_cost": new_cost, "new_over_budget": over_budget,
+        "reserve": reserve, "new_cost": new_cost, "new_cost_full": new_cost_full,
+        "new_over_budget": over_budget,
         "money": money, "pay_share": pay_share, "budget_basis": budget_basis,
         "cap_per_item": cap_per_item,
     }
@@ -1209,6 +1217,8 @@ def plan_order(snap: dict, brief: dict, ctx: dict, stages: list[dict],
         "payments": payments,
         "new_items": list(brief.get("new_items") or []),
         "new_items_cost": res["new_cost"],
+        # Полная стоимость новинок; new_items_cost — в базе бюджета (на сейчас).
+        "new_items_cost_full": res["new_cost_full"],
         "new_items_over_budget": res["new_over_budget"],
         "reserve_unassigned": max(0, res["reserve"] - res["new_cost"]),
         "peaks": peak_hints(ctx.get("peak_periods"), today, lead_days(stages)),

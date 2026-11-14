@@ -2047,6 +2047,12 @@ def apply_production_rules(db: Session, org_id: int, data: dict) -> dict:
         # (см. order_planner.production_moq): страница «Заказ» и «Мастер»
         # обязаны считать по одному и тому же полу.
         moq = order_planner.production_moq(prod) if prod is not None else 0
+        # Минимумы этапов (ткань, пошив, по категориям) — тот же пол, что в
+        # мастере (order_planner._allocate.moq_of, D-72): прогон 14.11 нашёл
+        # «Заказ» 13 шт при партии пошива 30, а мастер 30.
+        if prod is not None and (prod.stages_json or "").strip():
+            st_norm = order_planner.normalize_stages(prod.stages, default_lead)
+            moq = max(moq, order_planner.stage_moq(st_norm, item.get("category") or "Без категории"))
         step = int(getattr(prod, "pack_multiple", 0) or 0)
         item["production_id"] = prod.id if prod else None
         item["production_name"] = prod.name if prod else ""
@@ -2094,6 +2100,17 @@ def _production_out(p, fallback_lead: int) -> dict:
         "pack_multiple": int(p.pack_multiple or 0),
         "stages": stages,
         "lead_days": order_planner.lead_days(stages),
+        # Срок канала, по которому считают «Заказ», «Заказ позиции» и мастер
+        # (D-72): сумма заданных этапов, иначе поле срока; 0 = общий срок.
+        # Клиент брал lead_time_days (0 при этапах) и сдвигал дату прихода
+        # на 20 дней раньше расчёта (прогон пользователями 14.11, P1).
+        "lead_effective": p.effective_lead_days(),
+        "lead_from_stages": sum(int(st.get("lead_days") or 0) for st in stages) > 0
+                            and bool((p.stages_json or "").strip()),
+        # Из нормализованных этапов: мусор в старых данных не роняет ответ.
+        "stage_moq_max": max([int(st.get("min_units") or 0) for st in stages]
+                             + [int(v or 0) for st in stages for v in (st.get("min_by_category") or {}).values()],
+                             default=0),
         "moq_units": order_planner.production_moq(p),
         "cadence_days": int(p.cadence_days or 0),
         "prepay_now_share": round(order_planner.prepay_share_total(stages), 4),

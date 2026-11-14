@@ -992,9 +992,9 @@ def api_checks() -> None:
             ("over_budget", {"overrides": {plan["items"][0]["base_name"]: 1000000}}),
             ("empty", {"budget": 0}),
             ("new_items_over_budget", {"budget": 100000, "new_items": [
-                {"name": "A01 новинка", "qty": 150, "cost": 1000}]}),
+                {"name": "A01 новинка", "qty": 400, "cost": 1000}]}),  # «на сейчас»: 400 000 × доля предоплаты > 100 000
             ("new_items_over_budget", {"budget": 100000, "new_items": [
-                {"name": "A01 новинка с ручной правкой", "qty": 150, "cost": 1000}],
+                {"name": "A01 новинка с ручной правкой", "qty": 400, "cost": 1000}],
                 "overrides": {plan["items"][0]["base_name"]: 0}}),
         ):
             gate_body = {"production_id": lab["id"], "eta_date": eta,

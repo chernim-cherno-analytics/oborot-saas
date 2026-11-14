@@ -934,6 +934,7 @@ def order_workbook(org_name: str, order: dict, production_name: str,
     total_fmts[ncols] = FMT_MONEY
     row = 3
     total_qty, total_sum, no_cost = 0, 0.0, []
+    no_grid: list[str] = []
     for it in items:
         qty = _units(it.get("qty")) or 0
         try:
@@ -948,6 +949,9 @@ def order_workbook(org_name: str, order: dict, production_name: str,
         _write_row(ws, row, values, fmts)
         if cost <= 0:
             no_cost.append(str(it.get("base_name") or ""))
+        # Новинка без размерной сетки: цеху нечего кроить (прогон 14.11, P2).
+        if qty > 0 and not any(_units(by_size.get(s)) for s in sizes):
+            no_grid.append(f"{it.get('base_name') or ''} ({qty} шт)")
         total_qty += qty
         # Итог считается тем же способом, что карточка заказа и платежи
         # (api._order_totals: round(sum(cost*qty))), без округления по строкам:
@@ -974,6 +978,10 @@ def order_workbook(org_name: str, order: dict, production_name: str,
             length += len(name) + 2
         rest = len(no_cost) - len(shown)
         info.append(("Без себестоимости", ", ".join(shown) + (f" и ещё {rest}" if rest else "")))
+    if no_grid:
+        info.append(("Без размерной сетки", "; ".join(no_grid[:40])
+                     + (f" и ещё {len(no_grid) - 40}" if len(no_grid) > 40 else "")
+                     + ": распишите размеры перед кроем"))
     for k, v in info:
         _cell(ws, row, 1, k, font=_TOTAL_FONT)
         _cell(ws, row, 2, v)

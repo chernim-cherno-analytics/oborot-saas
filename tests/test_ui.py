@@ -2576,9 +2576,14 @@ def _order_category_p1(browser, base: str) -> None:
         except Exception:  # noqa: BLE001
             pass
         pv = _posts(log, "api/order-plan/preview")
-        check("пустой каталог [повторное открытие]: план из сохранённой новинки считается снова",
-              pv and [n.get("name") for n in pv[-1].get("new_items") or []] == ["Новинка-1"]
-              and page.locator("#mkOrder").count() == 1, f"previews={len(pv)}")
+        # TRUTH-3 (прогон 14.11, P1): при автоматическом открытии новинки
+        # прошлого плана больше не подставляются (их уже заказали, повтор
+        # молча удваивал бы новинку в плане и календаре); только по явному
+        # «Повторить» в истории планов.
+        check("пустой каталог [повторное открытие]: новинка прошлого плана не подставлена молча",
+              (not pv or not (pv[-1].get("new_items") or []))
+              and page.locator("#newRows .newrow, #newRows input").count() == 0,
+              f"previews={len(pv)} new={[n.get('name') for n in (pv[-1].get('new_items') or [])] if pv else []}")
     except Exception as exc:  # noqa: BLE001
         check("пустой каталог [повтор]: сценарий выполнился без исключений", False, f"{type(exc).__name__}: {exc}"[:200])
     finally:
