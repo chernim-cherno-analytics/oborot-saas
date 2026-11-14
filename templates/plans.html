@@ -257,7 +257,7 @@ document.addEventListener("DOMContentLoaded", function () {
         '<input type="checkbox" id="req-setup"> Нужна настройка вместе с вами: ' + money(data.setup.price) +
         ' разово, засчитывается в оплату подписки</label>') : "") +
       '<div class="field" style="max-width:620px;"><label for="req-comment">Комментарий (по желанию)</label>' +
-      '<input class="input" type="text" id="req-comment" placeholder="Например: счёт нужен до конца месяца"></div>' +
+      '<input class="input" type="text" id="req-comment" maxlength="1950" placeholder="Например: счёт нужен до конца месяца"></div>' +
       '<div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">' +
       '<button class="btn primary" type="button" id="req-send">Запросить счёт</button>' +
       '<span class="hint">Мы ответим в течение одного рабочего дня.</span></div>';
