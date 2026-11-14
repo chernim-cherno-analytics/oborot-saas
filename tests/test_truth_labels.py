@@ -88,6 +88,25 @@ with TestClient(app, headers={"X-Oborot-CSRF": "1"}) as c:
     page = c.get("/sizes").text
     check("страница говорит про уже едущую партию", "уже едет" in page)
 
+    print("\n3а. Галочка у распроданной берёт её в расчёт")
+    import json as _json
+    prods = c.get("/api/productions").json()
+    plist = prods if isinstance(prods, list) else prods.get("productions", [])
+    pid = plist[0]["id"] if plist else None
+    from datetime import date as _d, timedelta as _td
+    body = {"production_id": pid, "eta_date": (_d.today() + _td(days=45)).isoformat(),
+            "budget": 3000000, "budget_scope": "full"}
+    plan = c.post("/api/order-plan/preview", json=body).json()
+    sold = [r for r in (plan.get("review") or {}).get("stale", []) if r.get("sold_out")]
+    if sold:
+        name = sold[0]["base_name"]
+        plan2 = c.post("/api/order-plan/preview", json={**body, "must_have": [name]}).json()
+        row = next((i for i in plan2.get("items", []) if i["base_name"] == name), None)
+        check("отмеченная распроданная позиция входит в план как решение человека",
+              row is not None and row.get("forced_by_user") is True, str(row)[:200])
+    else:
+        check("в демо есть распроданная отсеянная позиция", False, str(plan.get("review", {}))[:300])
+
     print("\n4. Мастер: подписи на странице")
     html = c.get("/assistant").text
     check("колонка «Темп с сезоном» предусмотрена", "Темп с сезоном, шт/дн" in html)

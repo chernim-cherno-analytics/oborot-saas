@@ -1208,11 +1208,15 @@
         (soldOut ? ' Из них '+soldOut+' с остатком 0: возможно, они не перестали продаваться, а просто распроданы. '+
           'Если так, отметьте, и позиция войдёт в расчёт.' : '')+'</div>'+
         rows.map(function(r){
-          return '<div class="peak"><label style="cursor:pointer">'+
-            '<input type="checkbox" class="takebox" data-b="'+esc(r.base_name)+'"'+
-            (STATE.must.indexOf(r.base_name)>=0?' checked':'')+'> '+esc(r.base_name)+'</label>'+
+          /* Галочка только у распроданных: у позиции с остатком и без
+             продаж темп за окно нулевой, и взятая галочкой она всё равно
+             ушла бы в «не вошло» с потребностью 0 (ревью 14.11, P2). */
+          return '<div class="peak">'+(r.sold_out
+            ? '<label style="cursor:pointer"><input type="checkbox" class="takebox" data-b="'+esc(r.base_name)+'"'+
+              (STATE.must.indexOf(r.base_name)>=0?' checked':'')+'> '+esc(r.base_name)+'</label>'
+            : esc(r.base_name))+
             ' — '+esc(r.category)+', на складе '+fmt(r.cs)+' шт'+
-            (r.sold_out?' · <b>распродана</b>':'')+'</div>';
+            (r.sold_out?' · <b>распродана</b>':' · лежит без продаж')+'</div>';
         }).join("")+
         (n > rows.length ? '<div class="peak">…и ещё '+(n-rows.length)+' поз.</div>' : '');
     }
