@@ -195,6 +195,8 @@ SUITES = [
     ("incoming", "test_incoming_formula.py",   False, False),
     # ЧЕРНОВИК D-66: при окне «сезон» сезонность учитывается один раз.
     ("season_once", "test_season_once.py",     False, False),
+    # WIZARD-LABELS-1: мастер называет базу сумм и источник ритма.
+    ("wizard_labels", "test_wizard_labels.py", False, False),
     ("deps",        "test_dependencies.py",    False, False),
 ]
 

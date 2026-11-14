@@ -534,7 +534,11 @@
       ? ("Заказ считается на " + cover + " дн продаж — горизонт задан фиксированно "
          + "в Настройках, ритм заказов на это число не влияет.")
       : ("Заказ должен закрыть " + cover + " дн продаж — до прихода следующего "
-         + "заказа плюс страховой запас.");
+         + "заказа плюс страховой запас."
+         + ((STATE.settingsCadence && +STATE.settingsCadence !== +STATE.cadence)
+            ? (" В Настройках указан заказ раз в " + STATE.settingsCadence + " дн; здесь "
+               + STATE.cadence + " дн из прошлого плана или канала. Выберите нужное выше.")
+            : ""));
     document.getElementById("scopeHint").textContent = (p && p.staged && STATE.scope==="now")
       ? "Считаем, что этих денег хватит на первый этап; остальное платится позже — покажу календарём."
       : "Считаем, что эта сумма покрывает весь заказ целиком.";
@@ -1112,7 +1116,7 @@
         '<td class="nb">'+fmtR(run)+'</td></tr>');
     }
     box.innerHTML = '<div class="table-outer"><table><thead><tr>'+
-      '<th>Неделя с</th><th>Открытые заказы</th><th>Этот заказ</th><th>Итого за неделю</th><th>Накопительно</th>'+
+      '<th>Неделя с</th><th title="Платежи по всем открытым заказам организации, всех каналов, включая черновики">Открытые заказы (все каналы)</th><th>Этот заказ</th><th>Итого за неделю</th><th>Накопительно</th>'+
       '</tr></thead><tbody>'+
       ((c.overdue && c.overdue.amount) ? ('<tr class="muted"><td>Раньше (даты платежей прошли)</td><td class="nb">'+
         fmtR(c.overdue.amount)+'</td><td class="nb">—</td><td class="nb">'+fmtR(c.overdue.amount)+
@@ -1272,7 +1276,8 @@
         (op.count === 1 ? 'открыт заказ' : ('открыто заказов: '+op.count+', последний')) + ' ' +
         '<b>№'+first.id+' «'+esc(first.name)+'»</b> от '+dstr((first.created_at||"").slice(0,10))+
         ' — '+fmt(first.total_qty)+' шт'+
-        (op.left_to_pay ? (', по открытым заказам на сегодня и будущие даты запланировано <b>'+fmtR(op.left_to_pay)+'</b>') : '')+
+        (op.left_to_pay ? (', по открытым заказам этого канала на сегодня и будущие даты запланировано <b>'+fmtR(op.left_to_pay)+'</b>'+
+          ' (календарь денег ниже считает все каналы)') : '')+
         '. Фактические оплаты нужно проверить отдельно. <a href="/replenish#orders">Посмотреть заказы</a></div>';
     }
 
@@ -1658,6 +1663,10 @@
     var st = r[1] || {};
     STATE.safety = (st.safety_days != null) ? st.safety_days : 14;
     STATE.cadence = st.order_cadence_days || 30;
+    // WIZARD-LABELS-1: ритм из Настроек помним отдельно. Ниже его может
+    // заменить прошлый план или канал, и подсказка обязана это назвать
+    // (прогон пользователем: в Настройках 60, а мастер молча «раз в месяц»).
+    STATE.settingsCadence = st.order_cadence_days || null;
     document.getElementById("moq").value = st.moq_units || 0;
     document.getElementById("reserve").value = st.reserve_new_pct || 0;
     document.getElementById("overhead").value = st.overhead_pct || 0;
