@@ -184,6 +184,8 @@ SUITES = [
     ("order_export", "test_order_export.py",   False, False),
     # BILLING-OPS-1: инструмент оплаты оператора и полоса подписки.
     ("billing_ops", "test_billing_ops.py",     False, False),
+    # SEC-2 (предложение 14.11): права участника на действия всей организации.
+    ("member_rights", "test_member_rights.py", False, False),
     ("deps",        "test_dependencies.py",    False, False),
 ]
 
