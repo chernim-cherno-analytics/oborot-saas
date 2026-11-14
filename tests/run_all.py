@@ -182,6 +182,8 @@ SUITES = [
     ("ops_watch",   "test_ops_watch.py",       False, False),
     # ORDER-EXPORT-1: Excel зафиксированного заказа для цеха.
     ("order_export", "test_order_export.py",   False, False),
+    # BILLING-OPS-1: инструмент оплаты оператора и полоса подписки.
+    ("billing_ops", "test_billing_ops.py",     False, False),
     ("deps",        "test_dependencies.py",    False, False),
 ]
 
