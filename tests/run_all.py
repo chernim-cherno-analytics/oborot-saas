@@ -213,6 +213,8 @@ SUITES = [
     ("size_presence", "test_size_presence.py", False, False),
     # Файл для цеха: частичная сетка называется; срок этапов в коридоре.
     ("grid_mismatch", "test_grid_mismatch.py", False, False),
+    # QA 14.11: краевые входы API отклоняются 422, а не 500 или молча.
+    ("qa_inputs", "test_qa_inputs.py", False, False),
     ("deps",        "test_dependencies.py",    False, False),
 ]
 

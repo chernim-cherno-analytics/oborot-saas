@@ -151,10 +151,28 @@ class OrderItemIn(BaseModel):
         return self
 
 
+def _eta_in_range(v: str) -> str:
+    """Дата прихода: формат ГГГГ-ММ-ДД и разумный диапазон (QA 14.11).
+
+    9999-12-31 раньше проходил и ронял мастер (OverflowError в датах), а
+    1901-01-01 сохранялся в заказ. Прошлое до 2000 года и будущее дальше пяти
+    лет от сегодня считаем опечаткой. Прошедшая дата в пределах диапазона
+    допустима: заказ могут вносить задним числом, мастер сам двигает её на завтра.
+    """
+    try:
+        d = datetime.strptime(v, "%Y-%m-%d").date()
+    except ValueError:
+        raise ValueError("Дата прихода должна быть в формате ГГГГ-ММ-ДД")
+    today = date.today()
+    if d.year < 2000 or d > today + timedelta(days=5 * 366):
+        raise ValueError("Дата прихода вне разумного диапазона: проверьте год")
+    return v
+
+
 class OrderIn(BaseModel):
     name: str = Field(default="", max_length=120)
     eta_date: str | None = None
-    production_id: int | None = Field(default=None, ge=1, le=2_147_483_647)
+    production_id: int | None = Field(default=None, ge=0, le=2_147_483_647)
     items: list[OrderItemIn]
     # «да, второй такой же заказ нужен» — осознанное повторение состава
     # в обход защиты от случайного дубля (см. api_create_order).
@@ -165,11 +183,7 @@ class OrderIn(BaseModel):
     def _eta_date_valid(cls, v: str | None) -> str | None:
         if v is None or v == "":
             return None
-        try:
-            datetime.strptime(v, "%Y-%m-%d")
-        except ValueError:
-            raise ValueError("Дата прихода должна быть в формате ГГГГ-ММ-ДД")
-        return v
+        return _eta_in_range(v)
 
 
 def _order_totals(items: list[dict]) -> dict:
@@ -1357,7 +1371,9 @@ def api_order_detail(
 
 class OrderedIn(BaseModel):
     base_name: str
-    qty: float = Field(ge=0)
+    # Верхняя граница: опечатка в «Едет» (лишние нули) не должна сохраняться
+    # и ломать «Прогноз» у всей организации (QA 14.11, P2).
+    qty: float = Field(ge=0, le=1_000_000)
 
 
 @router.post("/ordered")
@@ -1946,12 +1962,20 @@ class ProductionIn(BaseModel):
     preset: str | None = None
     moq_units: int | None = Field(default=None, ge=0, le=10000)
 
+    @field_validator("name")
+    @classmethod
+    def _name_not_blank(cls, v: str) -> str:
+        # «   » проходил min_length и сохранялся пустым именем (QA 14.11).
+        if not v.strip():
+            raise ValueError("Название производства не может быть пустым")
+        return v
+
 
 class ProductionAssignIn(BaseModel):
     base_name: str = Field(min_length=1, max_length=255)
     # None = вернуть на основное производство; границы — как у id в пути,
     # иначе слишком большое число валит SQLite (OverflowError) вместо 422
-    production_id: int | None = Field(default=None, ge=1, le=2_147_483_647)
+    production_id: int | None = Field(default=None, ge=0, le=2_147_483_647)
 
 
 # Потребность ниже этой доли минимальной партии — «заказывать невыгодно»:
@@ -2381,7 +2405,7 @@ def api_add_ordered(
 # app/order_planner.py; здесь только транспорт и сохранение.
 
 class OrderPlanIn(BaseModel):
-    production_id: int | None = None
+    production_id: int | None = Field(default=None, ge=0, le=2_147_483_647)
     eta_date: str | None = None            # когда товар нужен на складе
     budget: int = Field(default=0, ge=0)   # деньги на этот заказ, ₽
     budget_scope: str | None = None        # now (первый этап) | full (весь заказ)
@@ -2414,6 +2438,13 @@ class OrderPlanIn(BaseModel):
     # Ручные правки количеств в готовом плане: {base_name: qty}. Применяются
     # ПОСЛЕ расчёта — владелец всегда сильнее алгоритма.
     overrides: dict[str, int] = Field(default_factory=dict)
+
+    @field_validator("eta_date")
+    @classmethod
+    def _plan_eta_valid(cls, v: str | None) -> str | None:
+        if v is None or v == "":
+            return None
+        return _eta_in_range(v)
 
     @field_validator("cover_mode")
     @classmethod
@@ -3226,7 +3257,7 @@ def _find_duplicate_order(db: Session, org_id: int, production_id, bases: set) -
 
 @router.post("/order-plan/{plan_id}/apply")
 def api_order_plan_apply(
-    plan_id: int, body: PlanApplyIn,
+    body: PlanApplyIn, plan_id: int = _id_path(),
     ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db),
 ):
     """План → «Заказ на производство» (дальше существующий путь: в МойСклад, Excel)."""

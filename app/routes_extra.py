@@ -251,6 +251,12 @@ def api_revenue(
     db: Session = Depends(get_db),
 ):
     """«Оборот» за период: выручка, категории, помесячный ряд, топ позиций."""
+    # Регэксп пропускал 2026-02-30 и 2026-13-01 (QA 14.11): проверяем календарём.
+    for value in (date_from, date_to):
+        try:
+            date.fromisoformat(value)
+        except ValueError:
+            raise HTTPException(status_code=422, detail=f"Неверная дата: {value}") from None
     if date_from > date_to:
         raise HTTPException(status_code=422, detail="Дата начала позже даты конца")
     return analytics_extra.build_revenue(db, ctx.org.id, date_from, date_to)
@@ -363,7 +369,7 @@ def api_sizes_calc(
     product: str = Query(..., min_length=1),
     qty: int = Query(30, ge=0, le=1_000_000),
     period: str = Query("12m"),
-    mode: str = Query("stock"),
+    mode: str = Query("stock", pattern=r"^(stock|pure)$"),
     arrival: str = Query("", pattern=r"^(\d{4}-\d{2}-\d{2})?$"),
     ctx: AuthContext = Depends(require_auth_api),
     db: Session = Depends(get_db),
@@ -383,6 +389,15 @@ def api_sizes_calc(
     там весь остаток закрывается ДО расчёта, раскладка чисто по весам), так
     что расхождение с «Заказом» здесь ожидаемо и осмысленно.
     """
+    # Несуществующая дата (2026-02-30) раньше молча заменялась датой по сроку
+    # производства, 1900 год давал «0 дней до прихода» (QA 14.11).
+    if arrival:
+        try:
+            arrival_d = date.fromisoformat(arrival)
+        except ValueError:
+            raise HTTPException(status_code=422, detail=f"Неверная дата прихода: {arrival}") from None
+        if arrival_d.year < 2000 or (arrival_d - date.today()).days > 5 * 366:
+            raise HTTPException(status_code=422, detail="Дата прихода вне разумного диапазона: проверьте год")
     snap = analytics.get_snapshot(db, ctx.org)
     item = snap["items"].get(product)
     default_lead = analytics.extra_settings(ctx.org)["lead_time_days"]
@@ -533,6 +548,29 @@ def api_category_merge(
         if row is not None:
             db.delete(row)
         to = ""
+    else:
+        # Слияние одноступенчатое: цель не может сама быть влита, а влитая
+        # категория не может быть целью. Иначе пара «Брюки → Платья» и
+        # «Платья → Брюки» молча меняла категории местами (QA 14.11, P2).
+        merges = dict(db.execute(
+            select(CategoryMerge.from_category, CategoryMerge.to_category)
+            .where(CategoryMerge.org_id == ctx.org.id)
+        ).all())
+        if to in merges:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Категория «{to}» уже влита в «{merges[to]}»: выберите её как цель",
+            )
+        sources = sorted(f for f, t in merges.items()
+                         if t == body.from_category and f != body.from_category)
+        if sources:
+            raise HTTPException(
+                status_code=422,
+                detail=(f"В «{body.from_category}» уже влиты: {', '.join(sources[:5])}. "
+                        f"Сначала перенесите их в «{to}» или отмените их слияние"),
+            )
+    if not to:
+        pass
     elif row is None:
         db.add(CategoryMerge(org_id=ctx.org.id, from_category=body.from_category, to_category=to))
     else:
@@ -674,6 +712,18 @@ def api_save_replenish_draft(
                 detail=f"Количество по размеру — целое от 0 до {MAX_DRAFT_QTY} шт",
             )
         clean[size] = int(qty)
+    # Размер, которого у позиции нет, раньше отвечал «сохранено», а следующий
+    # GET его вычищал (_drop_orphan_drafts): та же ложная запись, что была
+    # у несуществующей позиции (QA 14.11).
+    known_sizes = {str(sz or "") for sz in db.execute(
+        select(Product.size).where(Product.org_id == ctx.org.id, Product.base_name == base_name)
+    ).scalars().all()}
+    unknown = [sz for sz in clean if sz not in known_sizes]
+    if known_sizes and unknown:
+        raise HTTPException(
+            status_code=422,
+            detail=f"У позиции нет размера: {', '.join(unknown[:5])}",
+        )
     db.execute(
         delete(ReplenishDraft).where(
             ReplenishDraft.org_id == ctx.org.id, ReplenishDraft.base_name == base_name
