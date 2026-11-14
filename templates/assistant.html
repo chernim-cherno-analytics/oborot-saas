@@ -1035,7 +1035,9 @@
           ? ('Первый платёж '+dstr((p.payments||[])[0] && p.payments[0].date))
           : 'Заплатить сейчас')+(hasNew ? ' · каталожные позиции' : '')+'</div><div class="v">'+fmtR(t.pay_now)+'</div>'+
         '<div class="s">из бюджета '+fmtR(budget)+
-        (p.reserve_new? ((p.budget_basis === "now" && hasNew ? " · новинки сегодня " : " · новинки ")+fmtR(p.reserve_new)) : "")+
+        (p.reserve_new? ((hasNew && p.reserve_new === p.new_items_cost
+                          ? (p.budget_basis === "now" ? " · новинки сегодня " : " · новинки ")
+                          : " · резерв на новинки ")+fmtR(p.reserve_new)) : "")+
         ' · свободно '+fmtR(left)+'</div></div>'+
       '<div class="card"'+(t.pay_later>0?' style="background:rgba(255,204,0,.16)"':'')+'>'+
         '<div class="l">'+(hasNew ? 'Обязательство по каталожным позициям' : 'Полное обязательство')+'</div><div class="v">'+fmtR(t.cost)+'</div>'+

@@ -808,7 +808,9 @@ def _allocate(cands: list[dict], brief: dict, ctx: dict, stages: list[dict]) -> 
     # денег, хотя платёж сегодня 81 000, и мастер писал «свободно 184 ₽» при
     # реальных 99 184 ₽. Полная стоимость новинок остаётся в new_cost_full.
     new_cost_full = sum(i["total"] for i in brief.get("new_items") or [])
-    new_cost = int(round(new_cost_full * pay_share))
+    # Потолок, а не округление: доля в копейках не должна выпускать первый
+    # транш на рубль выше бюджета (критик #102, P3).
+    new_cost = int(math.ceil(new_cost_full * pay_share - 1e-9))
     reserve = int(max(round(budget * brief["reserve_new_pct"] / 100.0), new_cost))
     # Новинки могут не влезать в бюджет — это не повод молча съесть все деньги:
     # режем резерв по бюджету и отдельно сообщаем, на сколько вышли за него.
