@@ -71,6 +71,12 @@ with TestClient(app, headers={"X-Oborot-CSRF": "1"}) as c:
     check("явный 0 остаётся явным выбором", plan0["brief"]["moq_units"] == 0
           and plan0["brief"]["moq_explicit"], str(plan0["brief"].get("moq_units")))
 
+    print("\n2а. Метка версии поля сохраняется в брифе (для повтора старых планов)")
+    plan2 = c.post("/api/order-plan/preview", json={"budget": 300000, "moq_units": None, "moq_ui": 2,
+                                                    "production_id": prod["id"]}).json()
+    check("новый мастер помечает бриф moq_ui=2", plan2["brief"].get("moq_ui") == 2, str(plan2["brief"].get("moq_ui")))
+    check("старый бриф без метки: moq_ui пусто", plan0["brief"].get("moq_ui") is None)
+
 print("\n3. Шаблон мастера")
 html = (ROOT / "templates" / "assistant.html").read_text(encoding="utf-8")
 check("поле партии по умолчанию пустое",
@@ -80,7 +86,8 @@ check("пустое поле уходит как null, а не 0",
 check("подпись называет оба смысла: пусто = партия канала, 0 = без партии",
       "Пусто: партия производства" in html and "0: без минимальной партии на этот заказ" in html)
 check("повтор прошлого плана сохраняет явный выбор и не превращает партию канала в явную",
-      'last.moq_explicit ? (last.moq_units || 0) : ""' in html)
+      'var moqChosen = last.moq_explicit && (last.moq_ui === 2 || (last.moq_units || 0) > 0);' in html
+      and 'moq_ui: 2,' in html)
 
 for suffix in ("", "-wal", "-shm"):
     p = Path(str(DB_PATH) + suffix)

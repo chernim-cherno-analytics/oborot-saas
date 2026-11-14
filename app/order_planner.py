@@ -454,6 +454,7 @@ def normalize_brief(raw: dict | None, settings: dict, stages: list[dict], today:
         # раньше он считался отсутствием значения и подменялся минимумом канала.
         "moq_units": _int("moq_units", settings.get("moq_units", 0), 0, 10000),
         "moq_explicit": raw.get("moq_units") is not None and raw.get("moq_units") != "",
+        "moq_ui": raw.get("moq_ui") if isinstance(raw.get("moq_ui"), int) else None,
         "reserve_new_pct": _int("reserve_new_pct", settings.get("reserve_new_pct", 0), 0, 90),
         # Накладные расходы к себестоимости: дефолт — настройка организации,
         # но на конкретный заказ (растаможка, срочная доставка) их можно
