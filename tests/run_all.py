@@ -180,6 +180,8 @@ SUITES = [
     # OPS-WATCH-1: наблюдение оператора (падающие синки клиентов, ошибки
     # сервера) в служебный канал; отчёт оператора. Синтетическая база.
     ("ops_watch",   "test_ops_watch.py",       False, False),
+    # ORDER-EXPORT-1: Excel зафиксированного заказа для цеха.
+    ("order_export", "test_order_export.py",   False, False),
     ("deps",        "test_dependencies.py",    False, False),
 ]
 

@@ -9,6 +9,7 @@ from datetime import date, datetime
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import Path as PathParam
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Mapped, Session, mapped_column
@@ -892,6 +893,36 @@ def export_budget_xlsx(
     data = analytics_extra.build_budget(db, ctx.org.id, snap, amount, max_share, excluded)
     wb = export_xlsx.budget_workbook(ctx.org.name, data)
     return export_xlsx.xlsx_response(wb, "Бюджет закупки.xlsx", "budget.xlsx")
+
+
+@router.get("/api/orders/{order_id}/export.xlsx")
+def export_order_xlsx(
+    order_id: int = PathParam(..., ge=1, le=2_147_483_647),
+    ctx: AuthContext = Depends(require_auth_api),
+    db: Session = Depends(get_db),
+):
+    """Зафиксированный заказ в Excel: сетка для цеха и календарь платежей.
+
+    ORDER-EXPORT-1. Только чтение: состав берётся из сохранённого заказа как
+    есть, ничего не пересчитывается. Чужой и несуществующий заказ отвечают
+    одинаково (404), чтобы перебором номеров нельзя было узнать чужие.
+    """
+    from app import api as _api
+    from app.analytics_extra import _size_sort_key
+    from app.models import Production, ProductionOrder
+
+    order = db.get(ProductionOrder, order_id)
+    if order is None or order.org_id != ctx.org.id:
+        raise HTTPException(status_code=404, detail="Заказ не найден")
+    production_name = ""
+    if order.production_id:
+        prod = db.get(Production, order.production_id)
+        if prod is not None and prod.org_id == ctx.org.id:
+            production_name = prod.name or ""
+    payments = _api._order_payments(db, order, analytics.extra_settings(ctx.org))
+    wb = export_xlsx.order_workbook(ctx.org.name, _api._order_out(order), production_name,
+                                    payments, _size_sort_key)
+    return export_xlsx.xlsx_response(wb, f"Заказ №{order.id}.xlsx", f"order-{order.id}.xlsx")
 
 
 # ── Тарифы и заявка на счёт ──────────────────────────────────────────────────
