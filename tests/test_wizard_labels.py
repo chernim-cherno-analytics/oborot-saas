@@ -47,6 +47,8 @@ with TestClient(app, headers={"X-Oborot-CSRF": "1"}) as c:
     check("колонка календаря «Открытые заказы (все каналы)»", "Открытые заказы (все каналы)" in html)
     check("подсказка ритма сравнивает с Настройками", "В Настройках указан заказ раз в" in html
           and "STATE.settingsCadence" in html)
+    check("подсказка не угадывает источник ритма (его мог выбрать сам пользователь)",
+          "из прошлого плана или канала" not in html and "план считается по выбранному здесь" in html)
 
 for suffix in ("", "-wal", "-shm"):
     p = Path(str(DB_PATH) + suffix)
