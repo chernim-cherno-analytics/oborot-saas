@@ -631,6 +631,8 @@ def collect_context(db: Session, org: Org, snap: dict, brief: dict) -> dict:
         "rate_lead": rate_lead,
         "rate_cover": rate_cover,
         "fresh": _fresh_bases(db, org.id, fresh_days),
+        # D-85: штуки в черновиках заказов по моделям.
+        "drafts": analytics.drafts_by_base(db, org.id),
         "fresh_days": fresh_days,
         "fresh_clamped": fresh_days < FRESH_DAYS,
         # сезонность в темпах реально участвовала (окно «год назад» загружено)
@@ -725,10 +727,19 @@ def _candidates(snap: dict, brief: dict, ctx: dict) -> tuple[list[dict], dict]:
         # D-65: «едет» не закрывает продажи до прихода (см. analytics).
         proj_stock = max(0.0, cs - r_lead * days_to_eta) + ordered
         need = max(0, int(round(r_cover * cover - proj_stock)))
+        # D-85: черновики заказов уменьшают потребность (в «Едет» не входят).
+        in_drafts = int((ctx.get("drafts") or {}).get(base, 0) or 0)
+        if in_drafts and need > 0 and need <= in_drafts and base not in must:
+            skipped.setdefault("in_drafts", []).append(base)
+            continue
+        need = max(0, need - in_drafts)
         # Дыра: остатка не хватит дожить до прихода заказа.
+        # D-87: дни до стокаута усекаются, как на «Заказе»
+        # (analytics._stockout_by_rate), а не округляются: «дыра» одна и та же
+        # на обоих экранах.
         gap_days = 0
         if r_lead > 0 and cs + ordered < r_lead * days_to_eta:
-            gap_days = int(round(days_to_eta - (cs + ordered) / r_lead))
+            gap_days = max(0, days_to_eta - min(int((cs + ordered) / r_lead), 3650))
         if need < NEED_MIN and base in must:
             forced = True
         if need < NEED_MIN and base not in must:
@@ -760,6 +771,7 @@ def _candidates(snap: dict, brief: dict, ctx: dict) -> tuple[list[dict], dict]:
             "proj_stock": int(round(proj_stock)),
             "gap_days": gap_days,
             "need": need,
+            "in_drafts": in_drafts,
             "cost_price": round(cost),
             "avg_price": round(price),
             "margin": max(0.0, price - cost),
@@ -1146,6 +1158,7 @@ def plan_order(snap: dict, brief: dict, ctx: dict, stages: list[dict],
             "rate": rate,
             "cs": c["cs"],
             "ordered": c["ordered"],
+            "in_drafts": int(c.get("in_drafts") or 0),
             "proj_stock": c["proj_stock"],
             "gap_days": c["gap_days"],
             "need": c["need"],
@@ -1315,6 +1328,7 @@ def plan_order(snap: dict, brief: dict, ctx: dict, stages: list[dict],
             "stale": _stale_rows(snap, skipped["stale"])[:LIST_CAP],
             "fresh_days": int(ctx.get("fresh_days") or FRESH_DAYS),
             "small_need_count": len(skipped["small_need"]),
+            "in_drafts_count": len(skipped.get("in_drafts") or []),
             "other_production_count": len(skipped["other_production"]),
             # Сколько позиций скрыто самим фактом недогруженной истории:
             # окно свежести сжалось до покрытия, и позиции без продаж внутри
