@@ -643,10 +643,13 @@ def api_create_order(
         ).all()
     }
     supplier_prices = ms_writeback.supplier_prices_snapshot(db, ctx.org.id)
+    # D-88 (ревью #135): заказ хранит себестоимость с накладными, ровно ту, что
+    # «Заказ» показал в окне оформления (и мастер кладёт в свой заказ).
+    org_extra = analytics.extra_settings(ctx.org)
     payload = []
     for i in items:
         d = i.model_dump()
-        d["cost"] = cost_by_base.get(i.base_name, 0.0)
+        d["cost"] = float(analytics._with_overhead(cost_by_base.get(i.base_name, 0.0), org_extra))
         d["supplier_prices"] = supplier_prices.get(i.base_name, {})
         payload.append(d)
     fingerprint = _order_fingerprint(name, body.eta_date, payload)
