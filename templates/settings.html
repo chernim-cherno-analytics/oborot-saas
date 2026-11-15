@@ -1267,7 +1267,13 @@ document.addEventListener("DOMContentLoaded", function () {
   }
 
   // ── Уведомления (Telegram) ────────────────────────────────────────────────
-  api("/api/notify/settings").then(function (n) {
+  // QA 15.11: без права «settings» ручка отвечает 403, и страница сразу
+  // показывала красный тост «Недостаточно прав», хотя человек ничего не нажимал.
+  var notifyAllowed = (" " + (document.body.getAttribute("data-perms") || "") + " ").indexOf(" settings ") >= 0;
+  if (!notifyAllowed) {
+    document.getElementById("notify-hint").textContent = "Уведомления настраивает тот, у кого есть право менять настройки.";
+  }
+  (notifyAllowed ? api("/api/notify/settings") : new Promise(function () {})).then(function (n) {
     n = n || {};
     document.getElementById("notify-chat-id").value = n.tg_chat_id || "";
     document.getElementById("notify-enabled").checked = !!n.tg_enabled;
