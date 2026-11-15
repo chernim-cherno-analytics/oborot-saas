@@ -1078,6 +1078,38 @@ def orgs_with_resume_point() -> list[int]:
         db.close()
 
 
+def orgs_interrupted_transient(max_age_hours: int = 48) -> list[int]:
+    """org_id, чей последний синк прервался временной причиной (transient).
+
+    Прод 15.11: перезапуск сервера при каждой выкладке прерывает идущий синк
+    (reset_stale_running ставит error с причиной transient), а почасовой
+    догон брал только организации, чей успешный синк старше 26 часов: данные
+    стояли до утреннего запуска. Повторяем такие синки в ближайший час;
+    старше max_age_hours не трогаем (это уже не «прервался», а что-то другое,
+    и про него говорит алерт).
+    """
+    cutoff = datetime.utcnow() - timedelta(hours=max_age_hours)
+    db = SessionLocal()
+    try:
+        rows = db.execute(
+            select(SyncState.org_id, SyncState.stats_json, SyncState.finished_at)
+            .where(SyncState.state == "error")
+        ).all()
+    finally:
+        db.close()
+    out = []
+    for org_id, raw, finished in rows:
+        if finished is not None and finished < cutoff:
+            continue
+        try:
+            cause = (json.loads(raw or "{}") or {}).get("error_cause")
+        except (TypeError, ValueError):
+            continue
+        if cause == "transient":
+            out.append(org_id)
+    return out
+
+
 def _subscription_allows_sync(org_id: int) -> bool:
     """False — организация в readonly и гейт включён (см. start_sync)."""
     from app import subscription

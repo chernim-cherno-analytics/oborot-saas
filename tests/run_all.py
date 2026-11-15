@@ -224,6 +224,8 @@ SUITES = [
     ("order_modal_cash", "test_order_modal_cash.py", False, False),
     # Плашка свежести: перезапуск при выкладке не «падение» (прод 15.11).
     ("sync_chip", "test_sync_chip.py", False, False),
+    # Почасовой догон повторяет синк, прерванный перезапуском (прод 15.11).
+    ("sync_resume", "test_sync_resume.py", False, False),
     ("deps",        "test_dependencies.py",    False, False),
 ]
 
