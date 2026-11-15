@@ -1521,4 +1521,9 @@ def build_plan(db: Session, org: Org, snap: dict, raw_brief: dict) -> dict:
         {"id": prod.id, "name": prod.name, "is_main": prod.is_main} if prod else None
     )
     plan["lead_days"] = lead_days(stages)
+    # Прогон 15.11: мастер не называл окно темпа, хотя переключатель общий
+    # (на «Заказе») и меняет и мастер, и «Бюджет».
+    plan["rate_window"] = settings.get("rate_window", "year")
+    plan["rate_window_label"] = analytics.RATE_WINDOW_RU.get(
+        plan["rate_window"], analytics.RATE_WINDOW_RU["year"])
     return plan
