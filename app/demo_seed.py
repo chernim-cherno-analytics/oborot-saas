@@ -293,10 +293,12 @@ def simulate_receipt(db: Session, org_id: int, qty_by_base: dict[str, dict[str, 
             continue
         stock = {p.id: float(db.get(StockDay, (org_id, p.id, latest)).qty)
                  if db.get(StockDay, (org_id, p.id, latest)) else 0.0 for p in prods}
-        if isinstance(spec, dict) and any(float(v or 0) > 0 for v in spec.values()):
+        if isinstance(spec, dict) and any(float(v or 0) != 0 for v in spec.values()):
+            # По размерам: плюс кладёт, минус снимает ровно с этого размера
+            # (обратный ход ранее положенного, ревью #131).
             by_size = {p.size: p for p in prods}
             plan = {by_size[sz].id: int(round(float(q))) for sz, q in spec.items()
-                    if sz in by_size and float(q or 0) > 0}
+                    if sz in by_size and float(q or 0) != 0}
         else:
             total = int(round(float(spec if not isinstance(spec, dict) else 0)))
             if total < 0:
