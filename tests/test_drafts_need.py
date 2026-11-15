@@ -125,6 +125,14 @@ with TestClient(app, headers={"X-Oborot-CSRF": "1"}) as c:
     diff = [(i["base_name"], i["cost_price"], mas4[i["base_name"]]["cost_price"]) for i in withc
             if i["base_name"] in mas4 and abs(i["cost_price"] - mas4[i["base_name"]]["cost_price"]) > 1]
     check("на «Заказе» и в мастере одна себестоимость штуки", not diff, str(diff[:3]))
+    pick = withc[0]
+    r = c.post("/api/orders", json={"name": "Накладные", "allow_duplicate": True,
+                                    "items": [{"base_name": pick["base_name"], "qty": 10}]})
+    saved = next(o for o in c.get("/api/orders").json()["orders"] if o["id"] == r.json()["id"])
+    cost_saved = float(saved["items"][0].get("cost") or 0)
+    check("заказ хранит себестоимость с накладными, как в окне оформления (ревью #135)",
+          abs(cost_saved - pick["cost_price"]) <= 1, f"{cost_saved} vs {pick['cost_price']}")
+    c.delete(f"/api/orders/{r.json()['id']}")
     c.post("/api/settings", json={"overhead_pct": 0})
 
     print("\n5. D-87: «дыра поставки» одна на «Заказе» и в мастере")
