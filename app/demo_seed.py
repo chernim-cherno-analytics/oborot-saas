@@ -299,22 +299,31 @@ def simulate_receipt(db: Session, org_id: int, qty_by_base: dict[str, dict[str, 
                     if sz in by_size and float(q or 0) > 0}
         else:
             total = int(round(float(spec if not isinstance(spec, dict) else 0)))
-            weights = [stock[p.id] or 1.0 for p in prods] if any(stock.values()) else [1.0] * len(prods)
-            plan = dict(zip([p.id for p in prods], _largest_remainder(total, weights)))
+            if total < 0:
+                # Исправление вниз (ревью #131): снимаем пропорционально остатку,
+                # не уходя ниже нуля ни по одному размеру.
+                weights = [stock[p.id] for p in prods]
+                if not any(weights):
+                    continue
+                take = _largest_remainder(-total, weights)
+                plan = {p.id: -min(int(t), int(stock[p.id])) for p, t in zip(prods, take)}
+            else:
+                weights = [stock[p.id] or 1.0 for p in prods] if any(stock.values()) else [1.0] * len(prods)
+                plan = dict(zip([p.id for p in prods], _largest_remainder(total, weights)))
         for pid, q in plan.items():
-            if q <= 0:
+            if q == 0:
                 continue
             row = db.get(StockDay, (org_id, pid, latest))
             if row is None:
-                db.add(StockDay(org_id=org_id, product_id=pid, date=latest, qty=float(q)))
+                db.add(StockDay(org_id=org_id, product_id=pid, date=latest, qty=float(max(0, q))))
             else:
-                row.qty = float(row.qty or 0) + q
+                row.qty = max(0.0, float(row.qty or 0) + q)
             if wh is not None:
                 ws = db.get(WarehouseStock, (org_id, pid, wh))
                 if ws is None:
-                    db.add(WarehouseStock(org_id=org_id, product_id=pid, warehouse_id=wh, qty=float(q)))
+                    db.add(WarehouseStock(org_id=org_id, product_id=pid, warehouse_id=wh, qty=float(max(0, q))))
                 else:
-                    ws.qty = float(ws.qty or 0) + q
+                    ws.qty = max(0.0, float(ws.qty or 0) + q)
             added += q
     return added
 

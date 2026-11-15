@@ -93,6 +93,21 @@ with TestClient(app, headers={"X-Oborot-CSRF": "1"}) as c:
     check("подтверждённый ноль не кладёт заказанное (ревью #131)", cs_of("Демо-приёмка", base4) == cs40,
           f"{cs40} -> {cs_of('Демо-приёмка', base4)}")
 
+    print("\n2б. Приёмку поправили после закрытия: остаток двигается на разницу (ревью #131)")
+    c.post(f"/api/orders/{o2['id']}/receipts", json={"lines": [{"base_name": base2, "qty": -5}]})
+    check("исправление −5: остаток +8 от исходного", cs_of("Демо-приёмка", base2) == cs20 + 8,
+          f"{cs20} -> {cs_of('Демо-приёмка', base2)}")
+    base5 = items[3]["base_name"]
+    cs50 = cs_of("Демо-приёмка", base5)
+    o5 = c.post("/api/orders", json={"name": "Без количеств", "allow_duplicate": True,
+                                     "items": [{"base_name": base5, "qty": 20}]}).json()
+    c.post(f"/api/orders/{o5['id']}/status", json={"status": "sent"})
+    c.post(f"/api/orders/{o5['id']}/status", json={"status": "received"})
+    check("закрыли без количеств: +20", cs_of("Демо-приёмка", base5) == cs50 + 20)
+    c.post(f"/api/orders/{o5['id']}/receipts", json={"lines": [{"base_name": base5, "qty": 13}]})
+    check("назвали 13 позже: остаток +13, а не +20", cs_of("Демо-приёмка", base5) == cs50 + 13,
+          f"{cs50} -> {cs_of('Демо-приёмка', base5)}")
+
     print("\n3. Живая организация (МойСклад подключён) не трогается")
     c2 = TestClient(app, headers={"X-Oborot-CSRF": "1"})
     c2.post("/register", data={"name": "L", "email": "live-rcv@test.io", "password": "secret123", "org_name": "Живая"})
