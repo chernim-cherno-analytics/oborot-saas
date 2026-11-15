@@ -128,6 +128,24 @@ with TestClient(app, headers={"X-Oborot-CSRF": "1"}, raise_server_exceptions=Fal
     print("\n8. Производство с пустым именем")
     r = a.post("/api/productions", json={"name": "   "})
     check("имя из пробелов: 422", r.status_code == 422, str(r.status_code))
+    pid = a.post("/api/productions", json={"name": "Нулевой срок"}).json().get("id")
+    r = a.post(f"/api/productions/{pid}/setup", json={"stages": [
+        {"name": "Ткань", "lead_days": 0, "cost_share": 0.5, "prepay_share": 0.5},
+        {"name": "Пошив", "lead_days": 0, "cost_share": 0.5, "prepay_share": 0.5}]})
+    check("все этапы со сроком 0: 422 (QA 15.11)", r.status_code == 422 and "срок" in r.text,
+          f"{r.status_code} {r.text[:200]}")
+    r = a.post(f"/api/productions/{pid}/setup", json={"stages": [
+        {"name": "Ткань", "lead_days": 0, "cost_share": 0.5, "prepay_share": 0.5},
+        {"name": "Пошив", "lead_days": 20, "cost_share": 0.5, "prepay_share": 0.5}]})
+    check("этап 0 + этап 20: принимается", r.status_code == 200, f"{r.status_code} {r.text[:200]}")
+
+    print("\n8б. Excel «Заказа» называет сезонную поправку (D-79)")
+    import io as _io
+    from openpyxl import load_workbook as _lw
+    a.post("/api/settings", json={"rate_window": "year"})
+    wb = _lw(_io.BytesIO(a.get("/api/export/replenish.xlsx").content))
+    head = " ".join(str(c.value or "") for ws in wb.worksheets for row in ws.iter_rows(max_row=3) for c in row)
+    check("окно «год»: в шапке «с поправкой на сезон»", "поправкой на сезон" in head, head[:300])
 
     print("\n9. Черновик ростовки")
     r = a.post("/api/replenish-draft", json={"base_name": base, "sizes": {"НЕТРАЗМЕРА": 5}})

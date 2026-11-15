@@ -1113,7 +1113,11 @@ def api_account(
         "can_manage_team": ctx.can("users_manage"),
         "org": {"name": ctx.org.name, "plan": ctx.org.plan},
         "others": [
-            {"name": u.name, "email": u.email, "role": m.role} for u, m in others
+            # QA 15.11: e-mail коллег только тому, кто управляет сотрудниками;
+            # e-mail владельца виден всем (к кому обращаться за доступом).
+            {"name": u.name or "Сотрудник",
+             "email": u.email if (ctx.can("users_manage") or m.role == "owner") else None,
+             "role": m.role} for u, m in others
         ],
         "connection": (
             {"kind": conn.kind, "status": conn.status, "has_token": bool(conn.token_enc)}

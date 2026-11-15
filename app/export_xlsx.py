@@ -75,6 +75,15 @@ def _rate_window_ru(data: dict) -> str:
     )
 
 
+def _need_rate_ru(data: dict, window_ru: str) -> str:
+    """Подпись темпа, которым посчитано «Заказать»: с D-79 при окнах «год» и
+    «90 дней» это темп с поправкой на сезон (QA 15.11: файл «Заказа» писал
+    «темп за год», «Бюджет» уже говорил про поправку)."""
+    if (data.get("rate_window") or "year") == "season" or "сезон" in window_ru:
+        return window_ru
+    return window_ru + ", с поправкой на сезон"
+
+
 def _fmt_date_ru(iso: str | None) -> str:
     """ISO-дата → дд.мм.гггг ('' если None)."""
     if not iso:
@@ -373,7 +382,7 @@ def _production_subtitle(name: str, items: list[dict], data: dict, window_ru: st
     if len(step) == 1 and (st := step.pop()) > 1:
         parts.append(f"кратно {st} шт")
     parts.append(f"горизонт {data.get('horizon_days', 90)} дней")
-    parts.append(window_ru)
+    parts.append(_need_rate_ru(data, window_ru))
     where = f"вкладке «{name}»" if name else "странице «Заказ»"
     # Раньше шапка честно предупреждала, что галочки на состав файла не
     # влияют, — это было объяснение проблемы, а не решение. Теперь выгрузка
@@ -468,7 +477,7 @@ def _replenish_sheet(wb: Workbook, org_name: str, sheet_title: str, name: str,
     excluded = data.get("excluded") or []
     _cell(ws, note_row, 1,
           f"Позиции, не попавшие в заказ, — на листе «{_EXCLUDED_SHEET}» "
-          f"({len(excluded)} поз.). Числа посчитаны по темпу «{window_ru}».",
+          f"({len(excluded)} поз.). Числа посчитаны по темпу «{_need_rate_ru(data, window_ru)}».",
           font=_TITLE_FONT)
     _autofit(ws)
     return ws
@@ -522,7 +531,7 @@ def _excluded_sheet(wb: Workbook, org_name: str, data: dict, window_ru: str) -> 
     headers = ["Позиция", "Почему не вошло"]
     ws = _new_sheet(
         wb, _EXCLUDED_SHEET, org_name, len(headers), first=False,
-        subtitle=f"{window_ru} · горизонт {data.get('horizon_days', 90)} дней",
+        subtitle=f"{_need_rate_ru(data, window_ru)} · горизонт {data.get('horizon_days', 90)} дней",
     )
     _write_header(ws, headers)
     row = 3

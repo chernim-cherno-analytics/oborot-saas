@@ -320,6 +320,16 @@ with client() as owner, client() as ownerB:
         login(viewer, "viewer@roles.io")
         perms, rname = perms_of(viewer)
         check("у наблюдателя нет прав", perms == set() and rname == "Наблюдатель", f"{perms} {rname}")
+        mem = viewer.get("/api/settings").json()["members"]
+        check("наблюдатель не видит e-mail коллег в «Настройках» (QA 15.11)",
+              all(m["email"] is None or m["email"] == "viewer@roles.io" or m["role"] == "owner" for m in mem)
+              and any(m["email"] is None for m in mem)
+              and any(m["email"] == "viewer@roles.io" for m in mem), str(mem)[:300])
+        oth = viewer.get("/api/account").json()["others"]
+        check("и в «Аккаунте» (кроме владельца)", oth and all((o["email"] is None) != (o["role"] == "owner") for o in oth),
+              str(oth)[:300])
+        omem = owner.get("/api/settings").json()["members"]
+        check("владелец e-mail сотрудников видит", all(m["email"] for m in omem), str(omem)[:300])
         bad = []
         for method, path, perm in PERM_ROUTES:
             rr = call(viewer, method, path)
