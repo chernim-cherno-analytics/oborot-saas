@@ -1803,8 +1803,10 @@
     if(draft && draft.pid === STATE.production_id){
       STATE.edits = draft.edits || {};
       STATE.must = draft.must || [];
+      // Бюджет только своего канала (id канала у каждой организации свой),
+      // чужой организации в том же браузере он не достаётся (ревью Codex #112).
+      if(draft.budget > 0) document.getElementById("budget").value = fmt(draft.budget);
     }
-    if(draft && draft.budget > 0) document.getElementById("budget").value = fmt(draft.budget);
     segInitValue("cadSeg", STATE.cadence);
     segInitValue("scopeSeg", STATE.scope);
     renderProds();
