@@ -60,7 +60,6 @@ from app import api as _api  # noqa: E402
 # сдвигается в прошлое, а отдельная сцена проверяет старый заказ.
 _REAL_SINCE = _api.DEMO_RECEIPT_SINCE
 _api.DEMO_RECEIPT_SINCE = _dt(2000, 1, 1)
-_REAL_PARTIAL = _api.DEMO_PARTIAL_SINCE
 _api.DEMO_PARTIAL_SINCE = _dt(2000, 1, 1)
 
 with TestClient(app, headers={"X-Oborot-CSRF": "1"}) as c:
@@ -181,11 +180,12 @@ with TestClient(app, headers={"X-Oborot-CSRF": "1"}) as c:
     o8 = c.post("/api/orders", json={"name": "До выкладки", "allow_duplicate": True,
                                      "items": [{"base_name": base8, "qty": 30}]}).json()
     c.post(f"/api/orders/{o8['id']}/status", json={"status": "sent"})
-    _api.DEMO_PARTIAL_SINCE = _REAL_PARTIAL
+    # Граница выкладки «в будущем»: строка приёмки, записанная сейчас,
+    # ведёт себя как записанная до выкладки, независимо от часов (ревью #130).
+    _api.DEMO_PARTIAL_SINCE = _dt(2100, 1, 1)
     c.post(f"/api/orders/{o8['id']}/receipts", json={"lines": [{"base_name": base8, "qty": 18}]})
-    with sqlite3.connect(DB_PATH) as con:
-        con.execute("UPDATE order_receipts SET at='2026-11-15 18:00:00' WHERE order_id=?", (o8["id"],))
-        con.commit()
+    check("до выкладки приёмка частями остаток не двигала", cs_of("Демо-приёмка", base8) == cs80,
+          f"{cs80} -> {cs_of('Демо-приёмка', base8)}")
     c.post(f"/api/orders/{o8['id']}/status", json={"status": "received"})
     check("закрыли без новых строк: принятые до выкладки 18 легли на остаток при закрытии",
           cs_of("Демо-приёмка", base8) == cs80 + 18, f"{cs80} -> {cs_of('Демо-приёмка', base8)}")
