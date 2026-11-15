@@ -222,6 +222,12 @@ SUITES = [
     ("decisions_1511", "test_decisions_15_11.py", False, False),
     # Окно оформления «Заказа»: календарь платежей и черновик (прогон 14.11).
     ("order_modal_cash", "test_order_modal_cash.py", False, False),
+    # Плашка свежести: перезапуск при выкладке не «падение» (прод 15.11).
+    ("sync_chip", "test_sync_chip.py", False, False),
+    # Почасовой догон повторяет синк, прерванный перезапуском (прод 15.11).
+    ("sync_retry_job", "test_sync_resume.py", False, False),
+    # «Сотрудники и роли» для не-владельца: активно только то, что разрешит сервер.
+    ("team_ui", "test_team_ui.py", False, False),
     ("deps",        "test_dependencies.py",    False, False),
 ]
 

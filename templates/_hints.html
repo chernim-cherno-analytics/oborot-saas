@@ -554,9 +554,14 @@
         var last = [d.last_sale_date, d.last_stock_date].filter(Boolean).sort().pop() || null;
         var stale = Math.min(ageDays(d.last_sale_date), ageDays(d.last_stock_date));
         var txt = "Данные: продажи по " + dm(d.last_sale_date) + " · склад по " + dm(d.last_stock_date);
-        if (d.sync_state === "error" && !barTalks) {
+        if (d.sync_state === "error" && !barTalks && d.sync_error_cause === "transient" && stale < 2) {
+          // Временный сбой (перезапуск сервера при выкладке, сеть, 429): данные
+          // свежие, синк продолжится сам при плановом запуске. Не красная тревога.
+          chip.classList.add("warn");
+          txt = txt + " · синхронизация прервалась и продолжится при следующем плановом запуске";
+        } else if (d.sync_state === "error" && !barTalks) {
           chip.classList.add("bad");
-          txt = "⚠ Синхронизация падает — " + (d.sync_error || "ошибка") + " · " + txt +
+          txt = "⚠ Синхронизация падает: " + (d.sync_error || "ошибка") + " · " + txt +
             " · нажмите, чтобы исправить в настройках";
         } else if (stale >= 2) {
           chip.classList.add("warn");
