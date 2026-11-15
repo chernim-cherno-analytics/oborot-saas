@@ -883,6 +883,38 @@ class ReplenishExportIn(BaseModel):
     отмечено) по-прежнему простой GET без тела — адрес остаётся коротким.
     """
     base_names: list[str] = Field(default_factory=list, max_length=5000)
+    # D-89 (ревью #136): под бюджетом в файл идут количества плана, а не полная
+    # потребность. База → {qty, sizes}; ровно то, что на экране.
+    quantities: dict[str, "ReplenishQtyIn"] | None = Field(default=None, max_length=5000)
+
+
+class ReplenishQtyIn(BaseModel):
+    qty: int = Field(ge=0, le=100000)
+    sizes: dict[str, int] = Field(default_factory=dict, max_length=200)
+
+
+ReplenishExportIn.model_rebuild()
+
+
+def _apply_export_quantities(data: dict, quantities: dict | None) -> None:
+    """Количества плана под бюджет поверх расчёта и ручной ростовки (D-89)."""
+    if not quantities:
+        return
+    for it in data.get("items") or []:
+        q = quantities.get(it["base_name"])
+        if q is None:
+            continue
+        sizes = it.get("sizes") or {}
+        given = {k: int(v) for k, v in (q.sizes or {}).items() if k in sizes and 0 <= int(v) <= 100000}
+        if sizes and given and sum(given.values()) == q.qty:
+            rec = {k: given.get(k, 0) for k in sizes}
+        else:
+            rec = analytics.size_split(sizes, q.qty) if sizes else {}
+        for size, cell in sizes.items():
+            cell["rec"] = int(rec.get(size, 0))
+        it["need"] = int(q.qty)
+        it["profit_potential"] = round(max(0, (it.get("avg_price") or 0) - (it.get("cost_price") or 0)) * it["need"])
+    data["budget_plan"] = True
 
 
 def _replenish_export_data(db: Session, org, selected: list[str] | None) -> dict:
@@ -965,6 +997,7 @@ def export_replenish_xlsx_selected(
     # человека уносило со страницы на голый JSON вместе с несохранённой
     # работой. Теперь оба случая идут одним путём — через тело POST.
     data = _replenish_export_data(db, ctx.org, body.base_names or None)
+    _apply_export_quantities(data, body.quantities)
     wb = export_xlsx.replenish_workbook(ctx.org.name, data)
     return export_xlsx.xlsx_response(wb, "Что заказать.xlsx", "replenish.xlsx")
 

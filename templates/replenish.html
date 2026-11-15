@@ -1540,7 +1540,9 @@
         if(e.target.closest(".bt-tools")) return;
         ACTIVE_PROD=Number(el.getAttribute("data-id"));
         renderAll();
-        if(PLAN) applyPlan();
+        // План (или его первый, ещё не пришедший расчёт) пересчитывается для
+        // новой вкладки; ответ по прежней вкладке отбрасывается (ревью #136).
+        if(PLAN||PLAN_PENDING) applyPlan();
       });
     });
     box.querySelectorAll(".bt-tools button").forEach(function(b){
@@ -2099,7 +2101,7 @@
      активного производства и выбранных категорий. Позиции плана получают его
      количество и ростовку, остальные с потребностью помечаются «не вошло в
      бюджет» и снимаются с галочки. «Вся потребность» возвращает расчёт. */
-  var PLAN=null, PLAN_SEQ=0, PB={strategy:"balance"}, PLAN_BOOTED=false;
+  var PLAN=null, PLAN_SEQ=0, PB={strategy:"balance"}, PLAN_BOOTED=false, PLAN_PENDING=false;
   try{
     var pbSaved=JSON.parse(localStorage.getItem("oborot.planbar")||"null");
     if(pbSaved&&typeof pbSaved==="object") PB=Object.assign(PB,pbSaved);
@@ -2140,13 +2142,16 @@
     pbSave();
     if(!PB.budget){ clearPlan(); return; }
     var seq=++PLAN_SEQ, pid=ACTIVE_PROD;
+    PLAN_PENDING=true;
     planNote("Считаю план под бюджет…");
     document.getElementById("pb-apply").disabled=true;
     api("/api/order-plan/preview",{method:"POST",body:{
       production_id:pid, budget:PB.budget, budget_scope:PB.scope, strategy:PB.strategy,
       max_share_pct:PB.cap, exclude_categories:excludedCats()}}).then(function(p){
       if(seq!==PLAN_SEQ) return;
+      PLAN_PENDING=false;
       document.getElementById("pb-apply").disabled=false;
+      if(pid!==ACTIVE_PROD){ applyPlan(); return; }
       var by={}, why={};
       (p.items||[]).forEach(function(i){ if((i.qty||0)>0) by[i.base_name]=i; });
       // Почему позиция с потребностью не в плане: бюджет, нет свежих продаж,
@@ -2190,12 +2195,14 @@
       pbSync(); renderAll();
     }).catch(function(e){
       if(seq!==PLAN_SEQ) return;
+      PLAN_PENDING=false;
       document.getElementById("pb-apply").disabled=false;
       planNote('<span class="warn">План не посчитан: '+esc(e.message)+'</span>');
     });
   }
   function clearPlan(){
-    PLAN_SEQ++;
+    PLAN_SEQ++; PLAN_PENDING=false;
+    document.getElementById("pb-apply").disabled=false;
     PLAN=null; PB.budget=0; pbSave();
     clearPlanMarks();
     planNote("");
@@ -2221,6 +2228,19 @@
     document.getElementById("first-card").style.display="none";
   });
 
+  // D-89 (ревью #136): под бюджетом в файл идут количества и ростовка с
+  // экрана (план), а не полная потребность.
+  function exportBody(checked){
+    var body={base_names:checked.map(function(it){ return it.base_name; })};
+    if(PLAN){
+      body.quantities={};
+      checked.forEach(function(it){
+        var sz={}; Object.keys(it._recs||{}).forEach(function(k){ sz[k]=Number(it._recs[k])||0; });
+        body.quantities[it.base_name]={qty:it._need||0, sizes:sz};
+      });
+    }
+    return body;
+  }
   function checkedItems(){
     return prodItems(ACTIVE_PROD).filter(function(it){ return it._checked&&it._need>0&&inScope(it); });
   }
@@ -2354,7 +2374,7 @@
     fetch("/api/export/replenish.xlsx",{method:"POST",
       headers:{"Content-Type":"application/json","X-Oborot-CSRF":"1"},
       body:JSON.stringify(allChecked ? {} :
-        {base_names:checked.map(function(it){ return it.base_name; })}),
+        exportBody(checked)),
       credentials:"same-origin"
     }).then(function(r){
       if(!r.ok) return r.text().then(function(t){

@@ -154,6 +154,33 @@ try:
         check("не хватившие бюджета так и подписаны",
               not budget_names or any("не вошло в бюджет" in t for t in tags), str(tags[:5]))
         page.click('#band-seg button[data-band=""]')
+        print("\n3б. Excel под бюджетом: количества плана, а не полная потребность (ревью #136)")
+        bodies = []
+        page.on("request", lambda r: bodies.append(r.post_data_json) if r.method == "POST"
+                and r.url.endswith("/api/export/replenish.xlsx") else None)
+        page.click("#btn-export-xlsx")
+        page.wait_for_timeout(2500)
+        body = bodies[-1] if bodies else {}
+        q = (body or {}).get("quantities") or {}
+        top = next(iter(sorted(plan["items"], key=lambda i: -i["need"])), None)
+        planned = {i["base_name"]: i["qty"] for i in plan["items"] if i["qty"] > 0}
+        check("запрос выгрузки несёт количества плана",
+              q and all(q[b]["qty"] == planned[b] for b in planned if b in q), str(list(q.items())[:2]))
+        import io
+        from openpyxl import load_workbook
+        r = own.post("/api/export/replenish.xlsx", json={
+            "base_names": list(planned), "quantities": {b: {"qty": v, "sizes": {}} for b, v in planned.items()}})
+        wb = load_workbook(io.BytesIO(r.content))
+        ws = wb.worksheets[0]
+        rows = list(ws.iter_rows(values_only=True))
+        hdr_i = next(i for i, row in enumerate(rows) if row and "Заказать, шт" in [str(x) for x in row])
+        col = [str(x) for x in rows[hdr_i]].index("Заказать, шт")
+        name_col = 0
+        got = {row[name_col]: row[col] for row in rows[hdr_i + 1:] if row and row[name_col] in planned}
+        bad = {b: (got.get(b), v) for b, v in planned.items() if b in got and got[b] != v}
+        check("в файле количества плана (строки позиций)", got and not bad, str(list(bad.items())[:3]))
+        check("шапка файла говорит «по плану под бюджет»",
+              any("по плану под бюджет" in str(c) for row in rows[:hdr_i] for c in row if c))
         check("«Вся потребность» видна", page.is_visible("#pb-clear"))
         page.click("#pb-clear")
         page.wait_for_timeout(300)

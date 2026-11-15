@@ -385,6 +385,8 @@ def _production_subtitle(name: str, items: list[dict], data: dict, window_ru: st
     hz = hzs.pop() if len(hzs) == 1 else data.get('horizon_days', 90)
     parts.append(f"горизонт {hz} дней")
     parts.append(_need_rate_ru(data, window_ru))
+    if data.get("budget_plan"):
+        parts.append("количества по плану под бюджет")
     oh = float(data.get("overhead_pct") or 0)
     if oh > 0:
         parts.append(f"себестоимость с накладными {oh:g} %")
