@@ -2143,6 +2143,7 @@
 
   /* ── создание заказа (из активной вкладки) ── */
   var orderModal=document.getElementById("order-modal");
+  var PAY_GEN=0;
   document.getElementById("btn-create-order").addEventListener("click",function(){
     var sel=checkedItems();
     if(!sel.length) return;
@@ -2187,9 +2188,13 @@
     // создания, плюс что уже причитается по открытым заказам в эти даты.
     var payEl=document.getElementById("order-modal-pay");
     payEl.style.display="none"; payEl.textContent="";
+    // Ревью Codex #109: ответ от прошлого открытия окна не должен перезаписать
+    // календарь текущего заказа. Каждое открытие получает свой номер.
+    var payGen=++PAY_GEN;
     if(cost>0){
       api("/api/orders/payment-preview?cost="+Math.round(cost)+(ACTIVE_PROD?("&production_id="+ACTIVE_PROD):""))
         .then(function(d){
+          if(payGen!==PAY_GEN) return;
           var ps=d.payments||[];
           if(!ps.length) return;
           var lines=ps.map(function(x){
@@ -2203,7 +2208,7 @@
     }
     orderModal.classList.add("open");
   });
-  document.getElementById("btn-order-cancel").addEventListener("click",function(){ orderModal.classList.remove("open"); });
+  document.getElementById("btn-order-cancel").addEventListener("click",function(){ PAY_GEN++; orderModal.classList.remove("open"); });
   orderModal.addEventListener("click",function(e){ if(e.target===orderModal) orderModal.classList.remove("open"); });
   document.getElementById("btn-order-submit").addEventListener("click",function(){ submitOrder(this,true); });
   document.getElementById("btn-order-draft").addEventListener("click",function(){ submitOrder(this,false); });
