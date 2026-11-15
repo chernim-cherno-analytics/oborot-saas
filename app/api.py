@@ -1550,7 +1550,13 @@ def api_settings(ctx: AuthContext = Depends(require_auth_api), db: Session = Dep
             if conn
             else None
         ),
-        "members": [{"name": n, "email": e, "role": m.role,
+        # QA 15.11: e-mail коллег видит тот, кто управляет сотрудниками
+        # (как /api/team); остальные: имя и роль, свой e-mail и e-mail
+        # владельца (к кому обращаться за доступом).
+        "members": [{"name": n,
+                     "email": e if (ctx.can("users_manage") or m.user_id == ctx.user.id
+                                    or m.role == "owner") else None,
+                     "role": m.role,
                      "role_name": _roles.member_perms(db, m)[1]} for n, e, m in members],
         "role": ctx.role,
         # Роли (15.11.2026): фронт прячет действия, на которые нет прав.
@@ -3470,6 +3476,12 @@ def api_production_setup(
         stages = order_planner.normalize_stages(
             raw, analytics.extra_settings(ctx.org)["lead_time_days"]
         )
+        # QA 15.11 (P3): все этапы с нулевым сроком давали мастеру срок 1 день
+        # (order_planner.lead_days), а «Заказу» поле срока канала: числа
+        # расходились у всех позиций канала. Экран такого не даёт (min=1).
+        if stages and sum(int(st.get("lead_days") or 0) for st in stages) <= 0:
+            raise HTTPException(422, "Укажите срок хотя бы у одного этапа: "
+                                     "у всех этапов срок 0 дней")
         p.stages_json = json.dumps(stages, ensure_ascii=False)
     if body.moq_units is not None:
         p.moq_units = int(body.moq_units)
