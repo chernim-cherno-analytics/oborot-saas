@@ -2328,6 +2328,33 @@ def material_view(db: Session, org_id: int, row: SupplyMaterial,
     }
 
 
+TRASH_DAYS = 30
+TRASH_LIMIT = 50
+
+
+def trash(db: Session, org_id: int) -> list[dict]:
+    """Удалённые (убранные с доски) материалы, вещи и партии за TRASH_DAYS
+    дней: что это, когда убрано и куда слать «Вернуть». Только чтение."""
+    since = datetime.utcnow() - timedelta(days=TRASH_DAYS)
+    out: list[dict] = []
+    for kind, model in (("material", SupplyMaterial), ("item", SupplyItem), ("batch", SupplyBatch)):
+        rows = db.execute(
+            select(model).where(model.org_id == org_id, model.archived_at.is_not(None),
+                                model.archived_at >= since)
+            .order_by(model.archived_at.desc()).limit(TRASH_LIMIT)
+        ).scalars().all()
+        for r in rows:
+            if kind == "batch":
+                item = db.get(SupplyItem, r.item_id)
+                title = batch_label(r.title, item.title if item is not None else "", r.id)
+            else:
+                title = r.title
+            out.append({"kind": kind, "id": r.id, "title": title,
+                        "archived_at": r.archived_at.isoformat()})
+    out.sort(key=lambda x: x["archived_at"], reverse=True)
+    return out[:TRASH_LIMIT]
+
+
 def board(db: Session, org_id: int, role: str) -> dict:
     """Весь экран планирования одним чтением. Ни одной записи.
 
@@ -2465,6 +2492,9 @@ def board(db: Session, org_id: int, role: str) -> dict:
             "rev": i.rev,
         } for i in items],
         "batches": batch_views,
+        # QA 15.11: удалённое возвращалось только из тоста за 6 секунд, хотя
+        # ручки restore есть. Последние 30 дней удалённого, новые сверху.
+        "trash": trash(db, org_id),
         "summary": summary(mat_views, batch_views),
         "next_step": next_step(mat_views, items, batch_views, role),
         "limits": {

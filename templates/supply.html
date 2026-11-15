@@ -457,6 +457,10 @@
         <form class="pl-form" id="pl-batch-form" hidden></form>
       </div>
     </section>
+    <details class="pl-trash" id="pl-trash" hidden style="margin-top:14px;">
+      <summary id="pl-trash-sum">Удалённые за 30 дней</summary>
+      <div class="pl-list" id="pl-trash-list" style="margin-top:8px;"></div>
+    </details>
 
   </div>
 
@@ -3934,6 +3938,8 @@ document.addEventListener("DOMContentLoaded", function () {
     paintFind("batch", batchRows, shownLonely.length + shownBatches.length,
               batchQuery);
 
+    renderTrash(data);
+
     restoreInline(openInline);
     // Курсор возвращается туда, где он был, — если это место пережило
     // перерисовку. Форма верхнего уровня её переживает всегда, инлайн-форму
@@ -3945,6 +3951,40 @@ document.addEventListener("DOMContentLoaded", function () {
         try { wasActive.setSelectionRange(wasCaret, wasCaret); } catch (e) { /* нечисловое поле */ }
       }
     }
+  }
+
+  // QA 15.11: удалённое возвращалось только из тоста за 6 секунд, хотя
+  // сервер умеет возвращать. Список последних 30 дней с «Вернуть».
+  var TRASH_KIND = {material: "Материал", item: "Вещь", batch: "Партия"};
+  var TRASH_URL = {material: "materials", item: "items", batch: "batches"};
+  function renderTrash(data) {
+    var box = byId("pl-trash");
+    var list = byId("pl-trash-list");
+    if (!box || !list) return;
+    var rows = data.trash || [];
+    box.hidden = !rows.length;
+    byId("pl-trash-sum").textContent = "Удалённые за 30 дней (" + rows.length + ")";
+    clear(list);
+    rows.forEach(function (r) {
+      var row = el("div", "pl-trash-row");
+      row.style.cssText = "display:flex;gap:10px;align-items:center;padding:4px 0;flex-wrap:wrap;";
+      row.appendChild(el("span", "hint", TRASH_KIND[r.kind] || r.kind));
+      row.appendChild(el("b", null, r.title || "без названия"));
+      var d = new Date(r.archived_at + "Z");
+      row.appendChild(el("span", "hint", "удалено " + (isNaN(d) ? "" : d.toLocaleDateString("ru-RU"))));
+      if (data.can_write) {
+        var btn = el("button", "btn sm", "Вернуть");
+        btn.type = "button";
+        btn.addEventListener("click", function () {
+          send("/api/supply/planning/" + TRASH_URL[r.kind] + "/" + r.id + "/restore",
+               {op_id: opId()}, null,
+               function (ok) { if (ok) plToast("Вернули: " + (r.title || ""), {ms: 3000}); },
+               {kind: r.kind, id: r.id, quiet: true});
+        });
+        row.appendChild(btn);
+      }
+      list.appendChild(row);
+    });
   }
 
   function loadBoard() {
