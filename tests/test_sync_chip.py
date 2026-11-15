@@ -64,7 +64,7 @@ with TestClient(app, headers={"X-Oborot-CSRF": "1"}) as a:
 html = (ROOT / "templates" / "_hints.html").read_text(encoding="utf-8")
 check("плашка: transient при свежих данных жёлтая, без «падает»",
       'd.sync_error_cause === "transient" && stale < 2' in html
-      and "продолжится автоматически в течение часа" in html)
+      and "продолжится при следующем плановом запуске" in html)
 
 print(f"\nИТОГО: {OK} OK, {FAIL} FAIL")
 for suffix in ("", "-wal", "-shm"):
