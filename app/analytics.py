@@ -221,8 +221,21 @@ def _season_coverage(cutoff365: str, today: date,
     return {s: bool(total[s]) and loaded[s] >= total[s] * SEASON_COVERED_SHARE
             for s in SEASONS}
 
-_cache: dict[int, tuple[float, dict]] = {}
+# Кэш снапшота: org_id -> (истекает_monotonic, снапшот, дата расчёта).
+_cache: dict[int, tuple[float, dict, date]] = {}
 _cache_lock = threading.Lock()
+# Поколение данных организации: растёт на каждом invalidate(). Расчёт,
+# начатый до записи, в кэш не кладётся (иначе запись «потерялась» бы на
+# 10 минут: снапшот по старым данным лёг бы поверх сброса).
+_gen: dict[int, int] = {}
+# Расчёт, который идёт прямо сейчас (один на организацию): параллельные
+# запросы ждут его, а не считают то же самое вторым и третьим потоком.
+_inflight: dict[int, threading.Event] = {}
+# Сколько после истечения TTL можно отдать прежний снапшот, пока свежий
+# считается в фоне. Только если данные не менялись (invalidate снимает
+# снапшот целиком) и день тот же.
+STALE_GRACE = 3600
+INFLIGHT_WAIT = 180
 
 
 def _plural_ru(n: int, one: str, few: str, many: str) -> str:
@@ -253,19 +266,106 @@ def invalidate(org_id: int) -> None:
     """Сбрасывает кэш аналитики организации (вызывать при любой записи данных)."""
     with _cache_lock:
         _cache.pop(org_id, None)
+        _gen[org_id] = _gen.get(org_id, 0) + 1
+
+
+def _store(org_id: int, gen: int, snap: dict, day: date) -> None:
+    with _cache_lock:
+        if _gen.get(org_id, 0) == gen:
+            _cache[org_id] = (time.monotonic() + CACHE_TTL, snap, day)
+
+
+def _finish(org_id: int, ev: threading.Event) -> None:
+    with _cache_lock:
+        if _inflight.get(org_id) is ev:
+            _inflight.pop(org_id, None)
+    ev.set()
+
+
+def _refresh_in_background(org_id: int, gen: int, ev: threading.Event) -> None:
+    """Пересчёт истёкшего снапшота в своём потоке и со своей сессией."""
+    from app.db import SessionLocal
+    db = SessionLocal()
+    try:
+        org = db.get(Org, org_id)
+        if org is not None:
+            day = date.today()
+            _store(org_id, gen, _compute_snapshot(db, org), day)
+    except Exception:  # noqa: BLE001 — фон не роняет приложение; следующий запрос посчитает сам
+        import logging
+        logging.getLogger("oborot.analytics").exception("фоновый пересчёт снапшота упал")
+    finally:
+        db.close()
+        _finish(org_id, ev)
 
 
 def get_snapshot(db: Session, org: Org) -> dict:
-    """Возвращает аналитический снапшот организации (из кэша или пересчётом)."""
-    now = time.monotonic()
+    """Возвращает аналитический снапшот организации (из кэша или пересчётом).
+
+    Прод 15.11: холодный расчёт у живой организации занимает секунды (до 15 с
+    после выкладки), а TTL 10 минут, поэтому каждый, кто открывал страницу
+    после паузы, ждал полный пересчёт, а две вкладки считали его дважды.
+    Теперь: (1) расчёт один на организацию, параллельные запросы ждут его;
+    (2) истёкший по времени снапшот (данные не менялись, день тот же)
+    отдаётся сразу, а свежий считается в фоне. После любой записи
+    (invalidate) старый снапшот не отдаётся никогда: запрос ждёт новый.
+    """
+    org_id = org.id
+    today = date.today()
     with _cache_lock:
-        hit = _cache.get(org.id)
-        if hit and hit[0] > now:
+        now = time.monotonic()
+        hit = _cache.get(org_id)
+        if hit and hit[0] > now and hit[2] == today:
             return hit[1]
-    snap = _compute_snapshot(db, org)
-    with _cache_lock:
-        _cache[org.id] = (time.monotonic() + CACHE_TTL, snap)
-    return snap
+        stale = (hit[1] if hit and hit[2] == today and now - hit[0] < STALE_GRACE
+                 else None)
+        ev = _inflight.get(org_id)
+        leader = ev is None
+        if leader:
+            ev = threading.Event()
+            _inflight[org_id] = ev
+        gen = _gen.get(org_id, 0)
+    if leader and stale is not None:
+        threading.Thread(target=_refresh_in_background, args=(org_id, gen, ev),
+                         name=f"snapshot-refresh-{org_id}", daemon=True).start()
+        return stale
+    if not leader:
+        if stale is not None:
+            return stale
+        ev.wait(INFLIGHT_WAIT)
+        with _cache_lock:
+            hit = _cache.get(org_id)
+            if hit and hit[2] == today and _gen.get(org_id, 0) == gen:
+                return hit[1]
+        # Расчёт лидера начат до записи или упал: считаем сами.
+        snap = _compute_snapshot(db, org)
+        _store(org_id, gen, snap, today)
+        return snap
+    try:
+        snap = _compute_snapshot(db, org)
+        _store(org_id, gen, snap, today)
+        return snap
+    finally:
+        _finish(org_id, ev)
+
+
+def warm(org_ids) -> int:
+    """Считает снапшоты заранее (после старта сервера). Возвращает число."""
+    from app.db import SessionLocal
+    done = 0
+    for org_id in org_ids:
+        db = SessionLocal()
+        try:
+            org = db.get(Org, org_id)
+            if org is not None:
+                get_snapshot(db, org)
+                done += 1
+        except Exception:  # noqa: BLE001 — прогрев не обязателен
+            import logging
+            logging.getLogger("oborot.analytics").exception("прогрев снапшота упал")
+        finally:
+            db.close()
+    return done
 
 
 def season_bounds(today: date) -> tuple[date, str]:

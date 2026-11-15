@@ -37,6 +37,7 @@ from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.date import DateTrigger
 from sqlalchemy import select
 
 from app import logging_conf, ms_sync, notify, subscription
@@ -308,6 +309,38 @@ def run_ops_watch_job() -> dict:
     return ops_watch.run_once()
 
 
+WARM_DELAY_SECONDS = 20
+
+
+def _warm_org_ids() -> list[int]:
+    """Организации, которым прогреваем снапшот после старта: живое подключение."""
+    db = SessionLocal()
+    try:
+        return [r[0] for r in db.execute(
+            select(Connection.org_id)
+            .join(Org, Org.id == Connection.org_id)
+            .where(Connection.status == "active", Org.status != "suspended")
+            .distinct()
+            .order_by(Connection.org_id)
+        ).all()]
+    finally:
+        db.close()
+
+
+def run_warm_job() -> int:
+    """Прогрев снапшотов после старта (прод 15.11): первый после выкладки
+    не ждёт 15 секунд холодного расчёта. Ничего не пишет в базу."""
+    from app import analytics
+    try:
+        ids = _warm_org_ids()
+        t0 = time.monotonic()
+        n = analytics.warm(ids)
+        log.info("прогрев снапшотов: %d организаций за %.1f с", n, time.monotonic() - t0)
+        return n
+    finally:
+        logging_conf.set_org(None)
+
+
 def start() -> None:
     """Поднимает BackgroundScheduler с ежедневным джобом (идемпотентно)."""
     global _scheduler, _started
@@ -346,6 +379,14 @@ def start() -> None:
         coalesce=True,
         max_instances=1,
         misfire_grace_time=1800,
+    )
+    _scheduler.add_job(
+        run_warm_job,
+        DateTrigger(run_date=datetime.now(MOSCOW_TZ) + timedelta(seconds=WARM_DELAY_SECONDS)),
+        id="startup-snapshot-warm",
+        name="Прогрев снапшотов после старта",
+        max_instances=1,
+        misfire_grace_time=600,
     )
     _scheduler.start()
     _started = True
