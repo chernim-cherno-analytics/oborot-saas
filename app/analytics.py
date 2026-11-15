@@ -882,14 +882,26 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
     # join к day_totals по (база, дата). Оборачиваемость = nris/dis, числитель
     # и знаменатель покрывают одни и те же дни. Именно отсутствие этого
     # выравнивания в legacy делало turn гибридом «вся выручка ÷ часть дней».
-    instock_sales_rows = db.execute(
-        select(Product.base_name, func.sum(sign_qty), func.sum(sign_rev))
+    # Сначала продажи свёрнуты по (база, дата), потом join к day_totals.
+    # Прямой join строк продаж к подзапросу SQLite планировал как «каждая
+    # позиция × все продажи окна»: на 480 позициях и двух годах истории
+    # 130 секунд из 150 на снапшот (замер 15.11). Сумма та же: сначала по дню,
+    # потом по дням «в стоке».
+    sales_by_day = (
+        select(Product.base_name.label("base"), Sale.date.label("d"),
+               func.sum(sign_qty).label("q"), func.sum(sign_rev).label("r"))
         .select_from(Sale)
         .join(Product, join_sales)
-        .join(day_totals, and_(day_totals.c.base == Product.base_name,
-                               day_totals.c.d == Sale.date))
         .where(Sale.org_id == org.id, Sale.date >= cutoff_turn)
-        .group_by(Product.base_name)
+        .group_by(Product.base_name, Sale.date)
+        .subquery()
+    )
+    instock_sales_rows = db.execute(
+        select(sales_by_day.c.base, func.sum(sales_by_day.c.q), func.sum(sales_by_day.c.r))
+        .select_from(sales_by_day)
+        .join(day_totals, and_(day_totals.c.base == sales_by_day.c.base,
+                               day_totals.c.d == sales_by_day.c.d))
+        .group_by(sales_by_day.c.base)
     ).all()
     nqis_by_base = {b: float(q or 0) for b, q, _r in instock_sales_rows}
     nris_by_base = {b: float(r or 0) for b, _q, r in instock_sales_rows}
@@ -911,16 +923,14 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
     # ₽/день — среднее по загруженным дням «в стоке» и от частичной загрузки
     # второго года не становится ложным; страница при частичной истории
     # уже подписывает фактическое окно.
-    sale_month = func.substr(Sale.date, 6, 2)
+    sale_month = func.substr(sales_by_day.c.d, 6, 2)
     sea_rev_by_base: dict[str, dict[str, float]] = {}
     for base, mm, rev in db.execute(
-        select(Product.base_name, sale_month, func.sum(sign_rev))
-        .select_from(Sale)
-        .join(Product, join_sales)
-        .join(day_totals, and_(day_totals.c.base == Product.base_name,
-                               day_totals.c.d == Sale.date))
-        .where(Sale.org_id == org.id, Sale.date >= cutoff_turn)
-        .group_by(Product.base_name, sale_month)
+        select(sales_by_day.c.base, sale_month, func.sum(sales_by_day.c.r))
+        .select_from(sales_by_day)
+        .join(day_totals, and_(day_totals.c.base == sales_by_day.c.base,
+                               day_totals.c.d == sales_by_day.c.d))
+        .group_by(sales_by_day.c.base, sale_month)
     ).all():
         season = _SEASON_OF_MONTH.get(mm)
         if season:
