@@ -218,6 +218,8 @@ SUITES = [
     ("grid_mismatch", "test_grid_mismatch.py", False, False),
     # QA 14.11: краевые входы API отклоняются 422, а не 500 или молча.
     ("qa_inputs", "test_qa_inputs.py", False, False),
+    # Решения 15.11: «в минус» вне рекомендации (D-76), порог 14 дней (D-77).
+    ("decisions_1511", "test_decisions_15_11.py", False, False),
     ("deps",        "test_dependencies.py",    False, False),
 ]
 

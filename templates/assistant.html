@@ -1324,6 +1324,16 @@
           (r.cost_price?(', себестоимость '+fmtR(r.cost_price)):'')+'. '+note+'</div>';
       }).join("");
     }
+    // D-76: позиции в минус; галочка берёт позицию как решение человека.
+    function lossList(rows){
+      if(!rows || !rows.length) return '';
+      return rows.map(function(r){
+        return '<div class="peak"><label style="cursor:pointer">'+
+          '<input type="checkbox" class="takebox" data-b="'+esc(r.base_name)+'"'+
+          (STATE.must.indexOf(r.base_name)>=0?' checked':'')+'> '+
+          esc(r.base_name)+'</label>: убыток '+fmtR(r.loss_unit||0)+' на штуке, расчёт дал бы '+fmt(r.need)+' шт.</div>';
+      }).join("");
+    }
     // D-23: отказ системы считать НЕ запрещает человеку действовать. Поле
     // количества здесь — единственный способ заказать позицию, по которой
     // «Оборот» сознательно не даёт рекомендацию. Значение уходит в overrides
@@ -1343,7 +1353,11 @@
       }).join("");
     }
     var revHtml = '<div class="fold"><details><summary>Что система считать не берётся ('+
-      ((rev.low_data_count||0)+(rev.no_cost_count||0))+' поз. решаете вы)</summary><div class="body">'+
+      ((rev.low_data_count||0)+(rev.no_cost_count||0)+(rev.below_cost_count||0))+' поз. решаете вы)</summary><div class="body">'+
+      (rev.below_cost_count ? ('<div class="peak"><b>Продаются в минус: '+rev.below_cost_count+
+        ' поз.</b> Средняя цена продажи ниже себестоимости, поэтому в рекомендацию не входят. '+
+        'Отметьте, если всё равно нужно заказать.</div>'+
+        lossList(rev.below_cost)) : '')+
       (rev.low_data_count ? ('<div class="peak"><b>Мало данных — '+rev.low_data_count+
         ' поз.</b> Темп из одной-двух продаж: считать по нему нельзя, но отметьте — возьмём как есть.</div>'+
         revList(rev.low_data, 'Отметьте, чтобы включить в заказ.', true)) : '')+

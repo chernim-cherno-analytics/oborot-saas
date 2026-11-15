@@ -36,7 +36,7 @@ from datetime import date, timedelta
 from sqlalchemy import and_, case, func, select
 from sqlalchemy.orm import Session
 
-from app.analytics import BASIS_AVG_SALE, RATE_WINDOW_RU
+from app.analytics import BASIS_AVG_SALE, RATE_WINDOW_RU, SIZE_MIN_DAYS
 from app.categories import ru_category
 from app.models import (
     CategoryMerge,
@@ -133,6 +133,7 @@ def build_budget(
     candidates, no_cost = [], []
     excluded_fresh = 0
     excluded_fresh_items: list[dict] = []
+    excluded_loss_items: list[dict] = []
     all_categories: set[str] = set()
 
     for it in snap["items"].values():
@@ -165,6 +166,11 @@ def build_budget(
             # TRUTH-LABELS-1: имя и остаток, чтобы распроданную позицию было
             # видно (отсев не меняется: политика FRESH за владельцем).
             excluded_fresh_items.append({"base_name": it["base_name"], "cs": int(it["cs"] or 0)})
+            continue
+        # D-76: продаётся в минус, из распределения исключено (как «Заказ» и мастер).
+        if it.get("below_cost") and not it.get("low_data", False):
+            excluded_loss_items.append({"base_name": it["base_name"],
+                                        "loss_unit": int(it.get("loss_unit") or 0)})
             continue
         cost = float(it["cost_price"] or 0)
         entry = {
@@ -266,6 +272,8 @@ def build_budget(
         "excluded_fresh_count": excluded_fresh,
         "excluded_fresh": sorted(excluded_fresh_items,
                                  key=lambda r: (r["cs"] > 0, r["base_name"]))[:50],
+        "excluded_loss": sorted(excluded_loss_items, key=lambda r: -r["loss_unit"])[:50],
+        "excluded_loss_count": len(excluded_loss_items),
         "categories": sorted(all_categories),
         "totals": {
             "positions": len(items),
@@ -772,6 +780,9 @@ def build_sizes_calc(
         p_days = pres.get(s, 0)
         pres_days_list.append(p_days)
         denom = p_days if p_days > 0 else hist_window_days
+        # D-77: тот же порог 14 дней, что в сетке «Заказа» и мастера.
+        if denom > 0:
+            denom = max(denom, SIZE_MIN_DAYS)
         rates.append(sold / denom if sold > 0 and denom > 0 else 0.0)
     tot_rate = sum(rates)
 

@@ -78,9 +78,17 @@ with TestClient(app, headers={"X-Oborot-CSRF": "1"}) as c:
     check("в демо есть позиции «в минус»", bool(loss_names), str(len(loss_names)))
     check("«Заказ» помечает ровно позиции «в минус» из аналитики (среди своих строк)",
           rep_loss == loss_names & {i["base_name"] for i in rep["items"]}, f"{rep_loss} {loss_names}")
+    # D-76 (15.11): «в минус» больше не в рекомендации ни на «Заказе», ни в
+    # мастере; мастер называет их в review, галочкой их можно взять с флагом.
     plan_main = c.post("/api/order-plan/preview", json={"budget": 3000000}).json()
-    plan_loss = {i["base_name"] for i in plan_main["items"] if i.get("below_cost")}
-    check("строки мастера несут тот же флаг",
+    rev_loss = {r["base_name"] for r in plan_main["review"].get("below_cost", [])}
+    check("мастер называет те же позиции «в минус» (D-76: вне рекомендации)",
+          rev_loss and rev_loss <= loss_names
+          and not any(i.get("below_cost") for i in plan_main["items"]), f"{rev_loss} {loss_names}")
+    forced = c.post("/api/order-plan/preview",
+                    json={"budget": 3000000, "must_have": sorted(rev_loss)[:1]}).json()
+    plan_loss = {i["base_name"] for i in forced["items"] if i.get("below_cost")}
+    check("взятая галочкой позиция несёт тот же флаг",
           plan_loss and plan_loss <= loss_names, f"{plan_loss} {loss_names}")
 
     print("\n6. «Заказ позиции» стартует с рекомендации")

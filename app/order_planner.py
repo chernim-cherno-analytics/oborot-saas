@@ -668,6 +668,7 @@ def _candidates(snap: dict, brief: dict, ctx: dict) -> tuple[list[dict], dict]:
     rows, skipped = [], {
         "archived": [], "hidden": [], "stale": [], "small_need": [],
         "no_cost": [], "low_data": [], "other_production": [], "excluded_category": [],
+        "below_cost": [],
     }
     for base, it in snap["items"].items():
         if it.get("archived"):
@@ -767,6 +768,12 @@ def _candidates(snap: dict, brief: dict, ctx: dict) -> tuple[list[dict], dict]:
             row["forced_by_user"] = True
         if row["low_data"] and base not in must:
             skipped["low_data"].append(row)  # темп из 1–2 продаж — решает человек
+            continue
+        # D-76: «в минус» не рекомендуем; галочка «Взять» берёт как решение человека.
+        if row["below_cost"] and base in must:
+            row["forced_by_user"] = True
+        if row["below_cost"] and base not in must:
+            skipped["below_cost"].append(row)
             continue
         rows.append(row)
     # Порядок один на весь планировщик: оборачиваемость ₽/день (правило legacy).
@@ -1278,6 +1285,9 @@ def plan_order(snap: dict, brief: dict, ctx: dict, stages: list[dict],
             "no_cost": [_short(r) for r in skipped["no_cost"]][:LIST_CAP],
             "no_cost_count": len(skipped["no_cost"]),
             "low_data_count": len(skipped["low_data"]),
+            # D-76: продаётся в минус, из рекомендации исключено.
+            "below_cost": [_short(r) for r in skipped["below_cost"]][:LIST_CAP],
+            "below_cost_count": len(skipped["below_cost"]),
             "stale_count": len(skipped["stale"]),
             # TRUTH-LABELS-1 (14.11.2026): раньше здесь было только число, и
             # распроданный в ноль бестселлер исчезал из мастера без имени, хотя
@@ -1387,6 +1397,7 @@ def _short(row: dict) -> dict:
         # (D-23): человек решает за систему, и без сегодняшнего остатка
         # решать не из чего.
         "cs": int(row.get("cs") or 0),
+        "loss_unit": row.get("loss_unit") if row.get("below_cost") else None,
     }
 
 
