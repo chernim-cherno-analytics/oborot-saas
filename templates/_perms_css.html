@@ -23,7 +23,19 @@
   body:not([data-perms~="settings"]) .wh-toggle,
   body:not([data-perms~="settings"]) .switch,
   body:not([data-perms~="settings"]) #excl-search,
-  body:not([data-perms~="settings"]) #ms-token { pointer-events: none; opacity: .6; }
+  body:not([data-perms~="settings"]) #ms-token,
+  /* QA 15.11: поля «Настроек» менялись на экране без права их сохранить.
+     Только внутри страницы настроек: #overhead есть и в мастере (ревью #126). */
+  body:not([data-perms~="settings"]) .settings-grid #th-weak,
+  body:not([data-perms~="settings"]) .settings-grid #th-dull,
+  body:not([data-perms~="settings"]) .settings-grid #th-good,
+  body:not([data-perms~="settings"]) .settings-grid #th-minstock,
+  body:not([data-perms~="settings"]) .settings-grid #horizon-mode,
+  body:not([data-perms~="settings"]) .settings-grid #cadence,
+  body:not([data-perms~="settings"]) .settings-grid #safety,
+  body:not([data-perms~="settings"]) .settings-grid #horizon,
+  body:not([data-perms~="settings"]) .settings-grid #lead-time,
+  body:not([data-perms~="settings"]) .settings-grid #overhead { pointer-events: none; opacity: .6; }
   body:not([data-perms~="settings"]) #btn-save-thresholds,
   body:not([data-perms~="settings"]) #btn-save-horizon,
   body:not([data-perms~="settings"]) #minstock-save,

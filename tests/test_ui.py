@@ -1849,6 +1849,7 @@ def _assistant_sync_time(browser, base: str) -> None:
                 dq = data.get("data_quality") or {}
                 dq["last_sync_at"] = raw
                 dq["sync_state"] = "done"
+                dq["is_demo"] = False  # сцена про организацию с МойСкладом
                 dq["coverage_start"] = _SYNC_COV
                 data["data_quality"] = dq
                 route.fulfill(status=200, content_type="application/json", body=json.dumps(data))
@@ -3679,6 +3680,11 @@ def _settings_compact_lists(browser, base: str) -> None:
               and "правом «Настройки»" in (page.locator("#chan-box").text_content() or ""))
         check("сотрудник: ни одного запроса записи", not log["posts"] or all("hints" in p for p, _ in log["posts"]),
               str(log["posts"])[:120])
+        check("сотрудник: пояснение «для справки» видно, поле порога не принимает клик (QA 15.11)",
+              page.locator(".lack-settings").first.is_visible()
+              and page.locator("#th-weak").evaluate("e => getComputedStyle(e).pointerEvents") == "none")
+        check("сотрудник: при открытии не запрашиваются настройки уведомлений (без 403-тоста, QA 15.11)",
+              not any("/api/notify/settings" in p_ for _m, p_ in log["req"]), str(log["req"])[:200])
     except Exception as exc:  # noqa: BLE001
         check("сотрудник: сценарий выполнился без исключений", False, f"{type(exc).__name__}: {exc}"[:200])
     finally:
