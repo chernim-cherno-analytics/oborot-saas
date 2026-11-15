@@ -1252,15 +1252,18 @@ def _demo_stock_on_receive(db: Session, org_id: int, order_id: int, items: list[
         return
     db.flush()
     got: dict[str, float] = {}
-    for base, qty in db.execute(
+    rows = db.execute(
         select(OrderReceipt.base_name, func.sum(OrderReceipt.qty))
         .where(OrderReceipt.org_id == org_id, OrderReceipt.order_id == order_id)
         .group_by(OrderReceipt.base_name)
-    ).all():
+    ).all()
+    for base, qty in rows:
         if float(qty or 0) > 0:
             got[base] = float(qty)
     spec: dict = {}
-    if got:
+    if rows:
+        # Строки приёмки есть: кладём ровно названное, даже если это ноль
+        # (подтверждённое «не пришло» не превращается в заказанное; ревью #131).
         spec = dict(got)
     else:
         for it in items:

@@ -83,6 +83,16 @@ with TestClient(app, headers={"X-Oborot-CSRF": "1"}) as c:
     check("остаток вырос на принятые 13, а не на заказанные 20", cs_of("Демо-приёмка", base2) == cs20 + 13,
           f"{cs20} -> {cs_of('Демо-приёмка', base2)}")
 
+    base4 = items[2]["base_name"]
+    cs40 = cs_of("Демо-приёмка", base4)
+    o4 = c.post("/api/orders", json={"name": "Не пришло", "allow_duplicate": True,
+                                     "items": [{"base_name": base4, "qty": 20}]}).json()
+    c.post(f"/api/orders/{o4['id']}/status", json={"status": "sent"})
+    c.post(f"/api/orders/{o4['id']}/status", json={"status": "received",
+                                                   "received": [{"base_name": base4, "qty": 0}]})
+    check("подтверждённый ноль не кладёт заказанное (ревью #131)", cs_of("Демо-приёмка", base4) == cs40,
+          f"{cs40} -> {cs_of('Демо-приёмка', base4)}")
+
     print("\n3. Живая организация (МойСклад подключён) не трогается")
     c2 = TestClient(app, headers={"X-Oborot-CSRF": "1"})
     c2.post("/register", data={"name": "L", "email": "live-rcv@test.io", "password": "secret123", "org_name": "Живая"})
