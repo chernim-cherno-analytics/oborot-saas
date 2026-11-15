@@ -197,6 +197,10 @@ with TestClient(app, headers={"X-Oborot-CSRF": "1"}, raise_server_exceptions=Fal
     plan = a.post("/api/order-plan/preview", json={"budget": 1_000_000, "production_id": pid90}).json()
     check("план мастера считает те же 90 дней", plan.get("lead_days") == 90, str(plan.get("lead_days")))
 
+    print("\n8г. Мастер на демо не пишет «синхронизация ещё не завершалась» (QA 15.11)")
+    dq = a.get("/api/order-plan/options").json().get("data_quality") or {}
+    check("демо: data_quality.is_demo", dq.get("is_demo") is True, str(dq)[:200])
+
     print("\n9. Черновик ростовки")
     r = a.post("/api/replenish-draft", json={"base_name": base, "sizes": {"НЕТРАЗМЕРА": 5}})
     check("несуществующий размер: 422", r.status_code == 422, str(r.status_code))

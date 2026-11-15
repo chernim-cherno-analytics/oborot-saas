@@ -526,10 +526,11 @@
           " — у остальных считаем по закупочной цене МойСклада");
     }
     var st = dq.sync_state, fresh = dq.last_sync_at;
-    row(st === "done" && !!fresh, fresh
+    if(dq.is_demo) row(true, "Демо-данные: МойСклад не подключён, синхронизации нет");
+    else row(st === "done" && !!fresh, fresh
         ? ("Данные из МойСклада на " + fmtDateTime(fresh) +
            (st === "done" ? "" : " (последняя синхронизация: " + esc(st || "?") + ")"))
-        : "Синхронизация с МойСкладом ещё не завершалась — считаем по тому, что есть");
+        : "Синхронизация с МойСкладом ещё не завершалась: считаем по тому, что есть");
     box.innerHTML = '<div class="df-head">Что известно о данных этого расчёта</div>' +
                     '<ul class="df-list">' + rows.join("") + "</ul>";
     box.style.display = "";
@@ -1574,7 +1575,7 @@
       (inOpen ? ' · <b>уже в открытом заказе: '+fmt(inOpen)+' шт</b>' : '')+
       (i.no_supplier ? ' · <b>нет поставщика в МойСкладе</b>' : '')+'</span></td>'+
       '<td class="nb">'+fmt(i.turnover)+'</td>'+
-      '<td class="nb">'+(i.rate!=null?(Math.round(i.rate*100)/100):'—')+'</td>'+
+      '<td class="nb">'+(i.rate!=null?String(Math.round(i.rate*100)/100).replace(".",","):'—')+'</td>'+
       '<td class="nb">'+fmt(i.cs)+'</td>'+
       '<td class="nb'+(i.ordered?'':' muted')+'">'+fmt(i.ordered)+'</td>'+
       '<td class="nb">'+fmt(i.need)+'</td>'+
