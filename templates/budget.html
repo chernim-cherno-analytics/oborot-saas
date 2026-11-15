@@ -371,6 +371,14 @@
           (soldOut?', из них '+soldOut+' с остатком 0 (возможно, просто распроданы; в «Мастере заказа» их можно отметить и взять в расчёт)':'')+': '+
           stale.map(function(r){ return esc(r.base_name)+((r.cs||0)>0?'':' (остаток 0)'); }).join(", ")+
           (d.excluded_fresh_count>stale.length?' и ещё '+(d.excluded_fresh_count-stale.length):'')+'.</div>':"";
+      // D-76: позиции в минус в распределение не входят.
+      var loss=d.excluded_loss||[];
+      if(d.excluded_loss_count){
+        document.getElementById("warnBox").innerHTML+='<div class="warn">'+fmt(d.excluded_loss_count)+
+          ' поз. продаются в минус (средняя цена ниже себестоимости) и в распределение не входят: '+
+          loss.map(function(r){ return esc(r.base_name)+' (убыток '+fmt(r.loss_unit)+' ₽/шт)'; }).join(", ")+
+          (d.excluded_loss_count>loss.length?' и ещё '+(d.excluded_loss_count-loss.length):'')+'.</div>';
+      }
       // карточки
       var t=d.totals||{};
       document.getElementById("cards").style.display="";
