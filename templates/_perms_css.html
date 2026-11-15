@@ -20,9 +20,17 @@
   body:not([data-perms~="catalog_edit"]) .disc-in,
   body:not([data-perms~="catalog_edit"]) .merge-sel,
   body:not([data-perms~="settings"]) #rate-seg,
-  body:not([data-perms~="settings"]) .settings-grid button,
-  body:not([data-perms~="settings"]) .settings-grid input,
-  body:not([data-perms~="settings"]) .settings-grid select { pointer-events: none; opacity: .6; }
+  body:not([data-perms~="settings"]) .wh-toggle,
+  body:not([data-perms~="settings"]) .switch,
+  body:not([data-perms~="settings"]) #excl-search,
+  body:not([data-perms~="settings"]) #ms-token { pointer-events: none; opacity: .6; }
+  body:not([data-perms~="settings"]) #btn-save-thresholds,
+  body:not([data-perms~="settings"]) #btn-save-horizon,
+  body:not([data-perms~="settings"]) #minstock-save,
+  body:not([data-perms~="settings"]) #btn-save-assign,
+  body:not([data-perms~="settings"]) #wh-refresh,
+  body:not([data-perms~="settings"]) #btn-save-notify,
+  body:not([data-perms~="settings"]) #btn-connect-ms { display: none !important; }
 {%- for key in perm_keys %}
   body:not([data-perms~="{{ key }}"]) .need-{{ key }} { display: none !important; }
   body[data-perms~="{{ key }}"] .lack-{{ key }} { display: none !important; }
