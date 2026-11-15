@@ -450,7 +450,8 @@
   <div class="tbl-badges" id="tbl-badges"></div>
   <div class="tbl-legend" id="tbl-legend"><b>⚠</b> в колонке «Стокаут» — дыра поставки: остаток кончится
     раньше, чем придёт новый заказ. Это не то же, что статус «Срочно» (покрытие меньше 2 недель):
-    ⚠ бывает и у позиций «Скоро» и «План».</div>
+    ⚠ бывает и у позиций «Скоро» и «План». Дата стокаута здесь посчитана темпом до прихода (при окнах «год» и
+    «90 дней» с поправкой на сезон), поэтому может отличаться от «Оборачиваемости» и «Прогноза».</div>
 
   <div class="table-outer" id="tbl-wrap">
     <table>
@@ -465,7 +466,7 @@
           <th>Остаток</th>
           <th title="Уже заказано и ещё не принято на склад">Едет</th>
           <th title="На сколько недель хватит остатка при текущем темпе">Покрытие, нед</th>
-          <th title="Прогнозная дата, когда остаток кончится; ⚠ — кончится раньше прихода заказа">Стокаут</th>
+          <th title="Прогнозная дата, когда остаток кончится, по темпу до прихода заказа (при окнах «год» и «90 дней» с поправкой на сезон, поэтому может отличаться от «Оборачиваемости» и «Прогноза», где темп без поправки); ⚠ — кончится раньше прихода заказа">Стокаут</th>
           <th title="Темп (с поправкой на сезон, как в мастере) × горизонт − прогнозный остаток к приходу заказа. Правится в размерной сетке (▸)">Заказать</th>
           <th id="th-prod" style="width:120px;" title="Перенос позиции на другое производство">Произв-во</th>
         </tr>
@@ -733,8 +734,13 @@
     SEASON_FROM=d.season_from||null; SEASON_TO=d.season_to||null;
     SENT_ORDERS=d.orders_in_production||[];
     syncRateSeg();
+    // QA 15.11: после оформления (и любой перезагрузки данных) отметки строк
+    // сохраняются; раньше все оставшиеся строки снова становились отмеченными
+    // и «Оформить размещение» предлагало заказать всё остальное.
+    var prevChecked={};
+    (items||[]).forEach(function(it){ prevChecked[it.base_name]=it._checked; });
     items=(d.items||[]).map(function(it){
-      it._checked=true;
+      it._checked=Object.prototype.hasOwnProperty.call(prevChecked,it.base_name)?prevChecked[it.base_name]:true;
       it._band=wosBand(it.wos);
       it._recs={};
       it._sizeNote="";
@@ -2197,13 +2203,28 @@
     // Прогон 14.11 (финдир): окно ставило заказ в производство, не показав,
     // когда и сколько платить. Календарь тот же, что заказ получит после
     // создания, плюс что уже причитается по открытым заказам в эти даты.
+    PAY_COST=cost;
+    refreshOrderPay();
+    orderModal.classList.add("open");
+  });
+  var PAY_COST=0;
+  // Ревью #129: черновик с датой прихода платит с плановой даты размещения,
+  // а «Зафиксировать размещение» сегодня. Окно показывает оба варианта и
+  // пересчитывается при смене даты прихода.
+  document.getElementById("order-eta").addEventListener("change",function(){
+    if(orderModal.classList.contains("open")) refreshOrderPay();
+  });
+  function refreshOrderPay(){
+    var cost=PAY_COST;
     var payEl=document.getElementById("order-modal-pay");
     payEl.style.display="none"; payEl.textContent="";
     // Ревью Codex #109: ответ от прошлого открытия окна не должен перезаписать
     // календарь текущего заказа. Каждое открытие получает свой номер.
     var payGen=++PAY_GEN;
+    var etaV=document.getElementById("order-eta").value||"";
     if(cost>0){
-      api("/api/orders/payment-preview?cost="+Math.round(cost)+(ACTIVE_PROD?("&production_id="+ACTIVE_PROD):""))
+      api("/api/orders/payment-preview?cost="+Math.round(cost)+(ACTIVE_PROD?("&production_id="+ACTIVE_PROD):"")+
+          (etaV?("&eta_date="+encodeURIComponent(etaV)):""))
         .then(function(d){
           if(payGen!==PAY_GEN) return;
           var ps=d.payments||[];
@@ -2215,14 +2236,17 @@
             return new Date(+p[0],(+p[1])-1,+p[2]).toLocaleDateString("ru-RU",{day:"numeric",month:"short"});
           }
           var lines=ps.map(function(x){ return dd(x.date)+": "+x.label+", "+fmtMoneyShort(x.amount); });
-          payEl.innerHTML="<b>Платежи по этому заказу</b> (по условиям производства): "+esc(lines.join("; "))+"."+
+          var dl=(d.draft_payments||[]).map(function(x){ return dd(x.date)+": "+x.label+", "+fmtMoneyShort(x.amount); });
+          payEl.innerHTML="<b>Платежи по этому заказу</b>"+(dl.length?", если зафиксировать размещение сейчас":"")+
+            " (по условиям производства): "+esc(lines.join("; "))+"."+
+            (dl.length?("<br><b>Если сохранить черновиком</b>, платежи пойдут с плановой даты размещения "+
+              esc(dd(d.draft_start))+" (дата прихода минус срок производства): "+esc(dl.join("; "))+"."):"")+
             (d.open_due>0?(" По уже открытым заказам до "+dd(d.until)+
               " причитается ещё "+esc(fmtMoneyShort(d.open_due))+"."):"");
           payEl.style.display="block";
         }).catch(function(){});
     }
-    orderModal.classList.add("open");
-  });
+  }
   document.getElementById("btn-order-cancel").addEventListener("click",function(){ PAY_GEN++; orderModal.classList.remove("open"); });
   orderModal.addEventListener("click",function(e){ if(e.target===orderModal) orderModal.classList.remove("open"); });
   document.getElementById("btn-order-submit").addEventListener("click",function(){ submitOrder(this,true); });
