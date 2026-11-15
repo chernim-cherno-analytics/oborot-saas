@@ -3627,8 +3627,8 @@ document.addEventListener("DOMContentLoaded", function () {
       // умалчивает главное.
       var live = (b.assignments || []).length;
       var ask = live
-        ? ("Удалить? " + live + " " + plural(live, "назначение", "назначения",
-                                             "назначений") + " снимется")
+        ? ("Удалить? " + live + " " + plural(live, "назначение снимется", "назначения снимутся",
+                                             "назначений снимется"))
         : "Удалить?";
       var drop = el("button", "btn sm", "Удалить");
       drop.type = "button";
@@ -3641,7 +3641,7 @@ document.addEventListener("DOMContentLoaded", function () {
                  resetToken(drop);
                  var off = (data && data.archived) || {};
                  var said = off.assignments
-                   ? ("Партия удалена · " + fmt(off.qty) + " вернулось в свободный остаток")
+                   ? ("Партия удалена · " + (off.qty_text || fmt(off.qty)) + " " + (/,/.test(off.qty_text || "") ? "вернулись" : "вернулось") + " в свободный остаток")
                    : "Партия удалена";
                  plToast(said, {ms: 6000, action: {
                    label: "Вернуть",

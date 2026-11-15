@@ -318,8 +318,31 @@ def _order_payments(db: Session, order: ProductionOrder, settings: dict) -> list
     cost = sum(float(i.get("cost") or 0) * int(i.get("qty") or 0) for i in order.items)
     if cost <= 0:
         return []
-    started = (order.created_at or datetime.utcnow()).date()
-    return order_planner.payment_plan(started, _order_stages(db, order, settings), cost)
+    stages = _order_stages(db, order, settings)
+    return order_planner.payment_plan(_order_start_date(order, stages), stages, cost)
+
+
+def _order_start_date(order: ProductionOrder, stages: list[dict]) -> date:
+    """С какой даты идут платежи заказа (QA 15.11, P2).
+
+    Раньше всегда с даты создания. Мастер же показывал платежи от даты
+    размещения (приход минус срок): при приходе через 100 дней план обещал
+    первый платёж в январе, а созданный черновик ставил те же деньги на эту
+    неделю. Теперь: отправленный заказ платит с даты отправки (факт
+    размещения); черновик с датой прихода с плановой даты размещения, но не
+    раньше дня создания; иначе с даты создания, как было.
+    """
+    created = (order.created_at or datetime.utcnow()).date()
+    if order.status != "draft" and order.sent_at:
+        return order.sent_at.date()
+    if order.status == "draft" and order.eta_date:
+        try:
+            planned = date.fromisoformat(order.eta_date) - timedelta(
+                days=order_planner.lead_days(stages))
+        except ValueError:
+            return created
+        return max(created, planned)
+    return created
 
 
 def _open_orders(db: Session, org_id: int) -> list[ProductionOrder]:

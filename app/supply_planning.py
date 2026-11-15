@@ -1659,6 +1659,7 @@ def archive_batch(db: Session, org_id: int, batch_id: int, payload: dict,
         .order_by(SupplyAssignment.id.asc())
     ).scalars().all()
     stamp = datetime.utcnow()
+    by_unit: dict[str, float] = {}
     for a in live:
         a.archived_at = stamp
         _touch(a)
@@ -1675,12 +1676,18 @@ def archive_batch(db: Session, org_id: int, batch_id: int, payload: dict,
         _journal_allocation(db, org_id, mat, row, "unassign",
                             _qty_text(a.qty, mat.unit if mat else ""), author,
                             tail=" — вместе с самой партией", sides="material")
+        unit = (mat.unit if mat else "") or ""
+        by_unit[unit] = by_unit.get(unit, 0.0) + float(a.qty)
     row.archived_at = stamp
     _touch(row)
     _journal(db, org_id, "batch", row.id, "archive", field="archived",
              old="", new=stamp.isoformat(), author=author, op_id=op_id)
+    # QA 15.11: «215 вернулось» складывало метры со штуками. Количество по
+    # единицам («95 м, 120 шт») отдаётся отдельно, сумма оставлена для
+    # совместимости.
     return {"batch_id": row.id, "assignments": len(live),
-            "qty": round(sum(float(a.qty) for a in live), 3)}
+            "qty": round(sum(float(a.qty) for a in live), 3),
+            "qty_text": ", ".join(_qty_text(q, u) for u, q in sorted(by_unit.items()))}
 
 
 def restore_batch(db: Session, org_id: int, batch_id: int, payload: dict,

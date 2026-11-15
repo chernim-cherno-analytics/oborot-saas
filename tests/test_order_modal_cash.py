@@ -90,6 +90,24 @@ with TestClient(app, headers={"X-Oborot-CSRF": "1"}) as a, \
     check("черновик не попал в «Едет»", after.get(base3) == before.get(base3),
           f"{before.get(base3)} -> {after.get(base3)}")
 
+    print("\n4. Черновик с поздней датой прихода платит с плановой даты размещения (QA 15.11)")
+    from datetime import date as _d, timedelta as _td
+    eta = (_d.today() + _td(days=150)).isoformat()
+    base4 = a.get("/api/replenish").json()["items"][4]["base_name"]
+    o4 = a.post("/api/orders", json={"name": "Поздний", "production_id": pid, "eta_date": eta,
+                                     "allow_duplicate": True,
+                                     "items": [{"base_name": base4, "qty": 9}]}).json()
+    lead = next(p_ for p_ in a.get("/api/productions").json()["productions"] if p_["id"] == pid)["lead_days"]
+    planned = (_d.fromisoformat(eta) - _td(days=lead)).isoformat()
+    op = next((x for x in a.get("/api/orders/open").json()["orders"] if x["id"] == o4.get("id")), None)
+    first = min((p_["date"] for p_ in (op or {}).get("payments", [])), default=None)
+    check("первый платёж черновика = плановая дата размещения (приход минус срок)",
+          first == planned, f"{first} против {planned}")
+    a.post(f"/api/orders/{o4['id']}/status", json={"status": "sent"})
+    op = next((x for x in a.get("/api/orders/open").json()["orders"] if x["id"] == o4.get("id")), None)
+    first = min((p_["date"] for p_ in (op or {}).get("payments", [])), default=None)
+    check("после отправки платежи идут с даты отправки (сегодня)", first == _d.today().isoformat(), str(first))
+
 print(f"\nИТОГО: {OK} OK, {FAIL} FAIL")
 for suffix in ("", "-wal", "-shm"):
     p = Path(str(DB_PATH) + suffix)
