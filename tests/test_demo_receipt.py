@@ -159,6 +159,20 @@ with TestClient(app, headers={"X-Oborot-CSRF": "1"}) as c:
           f"{before_old} -> {cs_of('Демо-приёмка', base5)}")
     _api.DEMO_RECEIPT_SINCE = _dt(2000, 1, 1)
 
+    print("\n2д. D-83 в демо: приёмка частями по открытому заказу сразу кладёт на остаток")
+    base7 = items[5]["base_name"]
+    cs70 = cs_of("Демо-приёмка", base7)
+    o7 = c.post("/api/orders", json={"name": "Частями", "allow_duplicate": True,
+                                     "items": [{"base_name": base7, "qty": 30}]}).json()
+    c.post(f"/api/orders/{o7['id']}/status", json={"status": "sent"})
+    c.post(f"/api/orders/{o7['id']}/receipts", json={"lines": [{"base_name": base7, "qty": 18}]})
+    check("приехало 18 из 30: остаток +18 сразу", cs_of("Демо-приёмка", base7) == cs70 + 18,
+          f"{cs70} -> {cs_of('Демо-приёмка', base7)}")
+    c.post(f"/api/orders/{o7['id']}/status", json={"status": "received",
+                                                   "received": [{"base_name": base7, "qty": 12}]})
+    check("закрыли с остатком 12: итого +30, без двойного счёта", cs_of("Демо-приёмка", base7) == cs70 + 30,
+          f"{cs70} -> {cs_of('Демо-приёмка', base7)}")
+
     print("\n3. Живая организация (МойСклад подключён) не трогается")
     c2 = TestClient(app, headers={"X-Oborot-CSRF": "1"})
     c2.post("/register", data={"name": "L", "email": "live-rcv@test.io", "password": "secret123", "org_name": "Живая"})
