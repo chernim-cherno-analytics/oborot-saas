@@ -1159,8 +1159,9 @@ def api_checks() -> None:
               page.status_code == 200 and "Мастер заказа" in page.text
               and "Как часто вы размещаете заказы" in page.text,
               f"status={page.status_code}")
-        check("пункт меню «Мастер заказа» появился на других страницах",
-              '/assistant' in c.get("/budget").text and '/assistant' in c.get("/replenish").text)
+        # D-89 (15.11.2026): мастер не пункт меню, а кнопка «Собрать по шагам» на «Заказе».
+        check("«Заказ» ведёт в мастер кнопкой «Собрать по шагам»",
+              'href="/assistant"' in c.get("/replenish").text and "Собрать по шагам" in c.get("/replenish").text)
         ov = c.post("/api/order-plan", json={
             "production_id": lab["id"], "eta_date": eta, "budget": 300000,
             "budget_scope": "now", "strategy": "balance",
@@ -1912,10 +1913,11 @@ def api_checks() -> None:
         c.get("/turnover?embed=0")  # снимаем куку, дальше обычный режим
         check("активный раздел подсвечен в ленте табов",
               '<a href="/turnover" class="active">Оборачиваемость</a>' in emb_t)
-        check("в ленте есть все десять разделов",
+        # D-89: «Мастер заказа», «Заказ позиции» и «Бюджет» открываются с «Заказа».
+        check("в ленте есть все восемь разделов",
               all(('href="%s"' % u) in emb_t for u in
-                  ("/turnover", "/stocks", "/assistant", "/replenish", "/sizes",
-                   "/budget", "/forecast", "/revenue", "/lessons", "/settings")))
+                  ("/turnover", "/stocks", "/replenish", "/supply",
+                   "/forecast", "/revenue", "/lessons", "/settings")))
 
         print("\n14h. Настройка «окно темпа» действует везде, где обещает (DATA-11)")
         # `item["rate"]` в снапшоте — синоним ГОДОВОГО темпа, оставленный для

@@ -2320,7 +2320,7 @@ def apply_production_rules(db: Session, org_id: int, data: dict) -> dict:
     data["lead_time_by_production"] = bool(items) and any(
         int(it.get("lead_time_days") or 0) != default_lead for it in items
     )
-    # D-84: черновики заказов уменьшают потребность (тот же вычет в мастере,
+    # D-85: черновики заказов уменьшают потребность (тот же вычет в мастере,
     # order_planner._candidates). Позиция, целиком закрытая черновиком, уходит
     # в «не к заказу» с причиной, а не висит в списке.
     drafts = analytics.drafts_by_base(db, org_id)

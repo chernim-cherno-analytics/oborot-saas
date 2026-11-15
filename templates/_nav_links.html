@@ -35,11 +35,10 @@
       ~ ('active' if active == 'turnover' else '')) | trim -%}
 <a href="/turnover"{% if turnover_cls %} class="{{ turnover_cls }}"{% endif %}>Оборачиваемость</a>
 <a href="/stocks"{% if active == 'stocks' %} class="active"{% endif %}>Активный сток</a>
-<a href="/assistant"{% if active == 'assistant' %} class="active"{% endif %}>Мастер заказа</a>
-<a href="/replenish"{% if active == 'replenish' %} class="active"{% endif %}>Заказ</a>
-<a href="/sizes"{% if active == 'sizes' %} class="active"{% endif %}>Заказ позиции</a>
+{# D-89 (решение владельца 15.11.2026): один пункт «Заказ». Мастер (шаги),
+   «Заказ позиции» и «Бюджет» открываются с «Заказа» и подсвечивают его. #}
+<a href="/replenish"{% if active in ['replenish', 'assistant', 'sizes', 'budget'] %} class="active"{% endif %}>Заказ</a>
 <a href="/supply"{% if active == 'supply' %} class="active"{% endif %}>Поставки</a>
-<a href="/budget"{% if active == 'budget' %} class="active"{% endif %}>Бюджет</a>
 <a href="/forecast"{% if active == 'forecast' %} class="active"{% endif %}>Прогноз</a>
 <a href="/revenue"{% if active == 'revenue' %} class="active"{% endif %}>Оборот</a>
 <a href="/lessons"{% if active == 'lessons' %} class="active"{% endif %}>Обучение</a>

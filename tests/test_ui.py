@@ -755,8 +755,9 @@ def run() -> int:  # noqa: C901 — сценарный тест: шагов мн
 # прежняя лента меню на 390 px не расширяла страницу, но прятала 8–10 из 11
 # разделов за краем своей прокрутки без намёка, что их можно докрутить.
 
-SHELL_LINKS = ("/turnover", "/stocks", "/assistant", "/replenish", "/sizes", "/supply",
-               "/budget", "/forecast", "/revenue", "/lessons", "/settings")
+# D-89: «Мастер заказа», «Заказ позиции» и «Бюджет» открываются с «Заказа».
+SHELL_LINKS = ("/turnover", "/stocks", "/replenish", "/supply",
+               "/forecast", "/revenue", "/lessons", "/settings")
 
 
 def _shell_btn(page):
@@ -811,11 +812,11 @@ def _shell_script_failure(browser, base: str, cookies: list) -> None:
     Прежде класс `shell-js` ставила строка в <head> ДО загрузки скрипта, и при
     его сбое меню на 390 px было свёрнуто, а кнопка мертва — ни одной видимой
     ссылки. Здесь браузер сам обрывает запрос /static/shell.js, и проверяется,
-    что все 11 разделов видны и переход по ним работает. Контроль — та же
+    что все 8 разделов видны и переход по ним работает. Контроль — та же
     страница с доставленным скриптом: меню свёрнуто и раскрывается касанием.
     """
     print("\n== PILOT-UX-SHELL-1: shell.js не загрузился — навигация жива ==")
-    for path, target in (("/replenish", "/budget"), ("/settings", "/turnover")):
+    for path, target in (("/replenish", "/forecast"), ("/settings", "/turnover")):
         for failed in (True, False):
             tag = f"390 {path} ({'shell.js оборван' if failed else 'контроль: shell.js есть'})"
             ctx = browser.new_context(viewport={"width": MOBILE_WIDTH, "height": 844},
@@ -846,7 +847,7 @@ def _shell_script_failure(browser, base: str, cookies: list) -> None:
                     bad = [h for h in SHELL_LINKS if not (
                         h in boxes and boxes[h]["shown"] and boxes[h]["h"] >= 40
                         and boxes[h]["left"] >= -0.5 and boxes[h]["right"] <= boxes[h]["vw"] + 0.5)]
-                    check(f"{tag}: все 11 разделов видны целиком по ширине и ≥ 40 px",
+                    check(f"{tag}: все 8 разделов видны целиком по ширине и ≥ 40 px",
                           not bad, str(bad))
                     nav_id = "app-nav" if path != "/settings" else "side-nav"
                     if bad:
@@ -870,7 +871,7 @@ def _shell_script_failure(browser, base: str, cookies: list) -> None:
                         " document.getElementById('side-nav');"
                         " return !!n && n.classList.contains('open'); }", timeout=10000)
                     opened = [h for h, b in _shell_nav_boxes_map(page).items() if b["shown"]]
-                    check(f"{tag}: касание раскрывает все 11 разделов",
+                    check(f"{tag}: касание раскрывает все 8 разделов",
                           btn.get_attribute("aria-expanded") == "true"
                           and all(h in opened for h in SHELL_LINKS), str(len(opened)))
             finally:
@@ -891,7 +892,7 @@ def _shell_mobile(browser, base: str, cookies: list) -> None:
     page.on("pageerror", lambda e: errors.append(str(e)))
     try:
         for path, label, target, target_label in (
-                ("/replenish", "Заказ", "/budget", "Бюджет"),
+                ("/replenish", "Заказ", "/forecast", "Прогноз"),
                 ("/settings", "Настройки", "/turnover", "Оборачиваемость")):
             tag = f"390 {path}"
             page.goto(base + path)
@@ -914,7 +915,7 @@ def _shell_mobile(browser, base: str, cookies: list) -> None:
                   btn.get_attribute("aria-expanded") == "true")
             boxes = {b["href"]: b for b in _shell_nav_boxes(page)}
             missing = [h for h in SHELL_LINKS if h not in boxes]
-            check(f"{tag}: в открытом меню все 11 разделов", not missing, str(missing))
+            check(f"{tag}: в открытом меню все 8 разделов", not missing, str(missing))
             bad = [h for h, b in boxes.items()
                    if not (b["shown"] and b["h"] >= 40 and b["left"] >= -0.5
                            and b["right"] <= b["vw"] + 0.5)]
@@ -989,7 +990,7 @@ def _shell_desktop_and_logout(browser, base: str, cookies: list) -> None:
             hidden = [h for h in SHELL_LINKS if not (h in boxes and boxes[h]["shown"]
                       and boxes[h]["right"] <= boxes[h]["vw"] + 0.5 and boxes[h]["top"] >= 0
                       and boxes[h]["bottom"] <= boxes[h]["vh"])]
-            check(f"1440 {path}: все 11 разделов видны без раскрытия меню", not hidden,
+            check(f"1440 {path}: все 8 разделов видны без раскрытия меню", not hidden,
                   str(hidden))
             check(f"1440 {path}: кнопка мобильного меню скрыта",
                   not _shell_btn(page).is_visible())
@@ -2213,14 +2214,23 @@ def _order_category_scope(browser, base: str) -> None:
         page.wait_for_timeout(600)
         bar = page.locator("#scope-bar")
         has_bar = bar.count() == 1 and bar.is_visible()
+        # D-89 (решение владельца 15.11.2026): «Заказ» открывается сразу по
+        # всем категориям; выбор сужается кнопками, «Сбросить выбор» даёт
+        # прежнее «не выбрано».
+        allp = page.locator('#scope-btns .scope-btn[data-scope-action="all"]')
+        check("заказ: при открытии выбраны все категории (D-89) — есть блок выбора, «Оформить» доступно",
+              has_bar and allp.get_attribute("aria-pressed") == "true"
+              and not page.locator("#btn-create-order").is_disabled(),
+              f"bar={has_bar} all={allp.get_attribute('aria-pressed')}")
+        page.locator('#scope-btns .scope-btn[data-scope-action="clear"]').click()
+        page.wait_for_timeout(200)
         page.locator("#btn-export-xlsx").click()
         page.wait_for_timeout(500)
-        check("заказ: при открытии категории в заказе НЕ выбраны — есть блок выбора, «Оформить» недоступно, "
-              "Excel без выбора не уходит",
-              has_bar and page.locator("#btn-create-order").is_disabled()
+        check("заказ: «Сбросить выбор» — «Оформить» недоступно, Excel без выбора не уходит",
+              page.locator("#btn-create-order").is_disabled()
               and not _posts(log, "api/export/replenish.xlsx")
               and any("выберите категории" in d for d in log["dialogs"]),
-              f"bar={has_bar} dialogs={log['dialogs'][:1]} exports={len(_posts(log, 'api/export/replenish.xlsx'))}")
+              f"dialogs={log['dialogs'][:1]} exports={len(_posts(log, 'api/export/replenish.xlsx'))}")
         btn_a = page.locator(f'#scope-btns .scope-btn[data-scope="{A}"]')
         if btn_a.count():
             btn_a.click()

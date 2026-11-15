@@ -631,7 +631,7 @@ def collect_context(db: Session, org: Org, snap: dict, brief: dict) -> dict:
         "rate_lead": rate_lead,
         "rate_cover": rate_cover,
         "fresh": _fresh_bases(db, org.id, fresh_days),
-        # D-84: штуки в черновиках заказов по моделям.
+        # D-85: штуки в черновиках заказов по моделям.
         "drafts": analytics.drafts_by_base(db, org.id),
         "fresh_days": fresh_days,
         "fresh_clamped": fresh_days < FRESH_DAYS,
@@ -727,14 +727,14 @@ def _candidates(snap: dict, brief: dict, ctx: dict) -> tuple[list[dict], dict]:
         # D-65: «едет» не закрывает продажи до прихода (см. analytics).
         proj_stock = max(0.0, cs - r_lead * days_to_eta) + ordered
         need = max(0, int(round(r_cover * cover - proj_stock)))
-        # D-84: черновики заказов уменьшают потребность (в «Едет» не входят).
+        # D-85: черновики заказов уменьшают потребность (в «Едет» не входят).
         in_drafts = int((ctx.get("drafts") or {}).get(base, 0) or 0)
         if in_drafts and need > 0 and need <= in_drafts and base not in must:
             skipped.setdefault("in_drafts", []).append(base)
             continue
         need = max(0, need - in_drafts)
         # Дыра: остатка не хватит дожить до прихода заказа.
-        # D-86: дни до стокаута усекаются, как на «Заказе»
+        # D-87: дни до стокаута усекаются, как на «Заказе»
         # (analytics._stockout_by_rate), а не округляются: «дыра» одна и та же
         # на обоих экранах.
         gap_days = 0

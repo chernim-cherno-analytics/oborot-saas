@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""D-84..D-87 (решения владельца 15.11.2026 23:28). Было: «Одно число на позицию (D-72, шаг 1 спецификации «один поток», 14.11.2026).
+"""D-85..D-88 (решения владельца 15.11.2026 23:28). Было: «Одно число на позицию (D-72, шаг 1 спецификации «один поток», 14.11.2026).
 
 Контракт: при окне темпа «сезон» потребность позиции на «Заказе» и в мастере
 (бюджет без ограничения, «Глубже в топ», лимит доли 100%) совпадает для каждой
@@ -61,7 +61,7 @@ with TestClient(app, headers={"X-Oborot-CSRF": "1"}) as c:
     check("демо подключено", c.post("/api/connect/demo").status_code == 200)
     c.post("/api/settings", json={"rate_window": "season"})
 
-    print("\n1. D-84: черновик уменьшает потребность на «Заказе» и в мастере одинаково")
+    print("\n1. D-85: черновик уменьшает потребность на «Заказе» и в мастере одинаково")
     rep0 = rep_items(c)
     mas0, _ = plan_items(c)
     both = [b for b in rep0 if b in mas0 and rep0[b].get("need_raw", rep0[b]["need"]) >= 10]
@@ -113,7 +113,7 @@ with TestClient(app, headers={"X-Oborot-CSRF": "1"}) as c:
           not any(e["base_name"] == b and "черновике" in e["reason"] for e in rep3.get("excluded") or []))
     c.delete(f"/api/orders/{oid2}")
 
-    print("\n4. D-87: накладные на «Заказе», как в мастере")
+    print("\n4. D-88: накладные на «Заказе», как в мастере")
     check("накладные 20 %", c.post("/api/settings", json={"overhead_pct": 20}).status_code == 200)
     rep4 = rep_full(c)
     mas4, _ = plan_items(c)
@@ -127,7 +127,7 @@ with TestClient(app, headers={"X-Oborot-CSRF": "1"}) as c:
     check("на «Заказе» и в мастере одна себестоимость штуки", not diff, str(diff[:3]))
     c.post("/api/settings", json={"overhead_pct": 0})
 
-    print("\n5. D-86: «дыра поставки» одна на «Заказе» и в мастере")
+    print("\n5. D-87: «дыра поставки» одна на «Заказе» и в мастере")
     rep5 = rep_items(c)
     mas5, _ = plan_items(c)
     common = [x for x in rep5 if x in mas5 and not rep5[x]["ordered"]]
