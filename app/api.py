@@ -643,10 +643,13 @@ def api_create_order(
         ).all()
     }
     supplier_prices = ms_writeback.supplier_prices_snapshot(db, ctx.org.id)
+    # D-88 (ревью #135): заказ хранит себестоимость с накладными, ровно ту, что
+    # «Заказ» показал в окне оформления (и мастер кладёт в свой заказ).
+    org_extra = analytics.extra_settings(ctx.org)
     payload = []
     for i in items:
         d = i.model_dump()
-        d["cost"] = cost_by_base.get(i.base_name, 0.0)
+        d["cost"] = float(analytics._with_overhead(cost_by_base.get(i.base_name, 0.0), org_extra))
         d["supplier_prices"] = supplier_prices.get(i.base_name, {})
         payload.append(d)
     fingerprint = _order_fingerprint(name, body.eta_date, payload)
@@ -2320,6 +2323,32 @@ def apply_production_rules(db: Session, org_id: int, data: dict) -> dict:
     data["lead_time_by_production"] = bool(items) and any(
         int(it.get("lead_time_days") or 0) != default_lead for it in items
     )
+    # D-85: черновики заказов уменьшают потребность (тот же вычет в мастере,
+    # order_planner._candidates). Позиция, целиком закрытая черновиком, уходит
+    # в «не к заказу» с причиной, а не висит в списке.
+    drafts = analytics.drafts_by_base(db, org_id)
+    if drafts:
+        kept = []
+        for item in items:
+            d = int(drafts.get(item["base_name"], 0) or 0)
+            n0 = int(item.get("need") or 0)
+            if d and n0 > 0:
+                item["in_drafts"] = d
+                item["need_before_drafts"] = n0
+                if n0 <= d:
+                    data.setdefault("excluded", []).append({
+                        "base_name": item["base_name"],
+                        "reason": f"уже в черновике заказа: {d} шт",
+                    })
+                    continue
+                item["need"] = n0 - d
+                item["profit_potential"] = round(
+                    max(0, (item.get("avg_price") or 0) - (item.get("cost_price") or 0)) * item["need"])
+                rec = analytics.size_split(item.get("sizes") or {}, item["need"])
+                for size, cell in (item.get("sizes") or {}).items():
+                    cell["rec"] = rec.get(size, 0)
+            kept.append(item)
+        items[:] = kept
     for item in items:
         prod = cond["by_id"].get(cond["assign"].get(item["base_name"], cond["main_id"]))
         # Минимальная партия — одно эффективное число из двух полей канала
