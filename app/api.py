@@ -1484,8 +1484,9 @@ def api_order_receipts_add(
                           source_ref=ref, keep_zeros=True)
     if demo_before is not None:
         _demo_reconcile_receipts(db, ctx.org.id, order, demo_before)
-        analytics.invalidate(ctx.org.id)
     db.commit()
+    # D-83: приёмка теперь сразу меняет «Едет» (ревью #130), расчёт пересчитать.
+    analytics.invalidate(ctx.org.id)
     return {"ok": True, "added": added, **_receipts_out(db, order)}
 
 
@@ -1614,11 +1615,17 @@ def api_set_ordered(
 ):
     """Ручная правка «едет к нам» (перезапись значения по базовому имени)."""
     _require_known_base(db, ctx.org.id, body.base_name)
+    # D-83 (ревью #130): экран показывает «Едет» уже за вычетом принятого
+    # частями по открытым заказам, а хранится валовое значение. Число, которое
+    # человек ввёл, это то, что он хочет видеть, поэтому к хранимому
+    # прибавляется вычет, иначе принятое вычлось бы второй раз.
+    received_open = analytics._received_on_open_local_orders(db, ctx.org.id).get(body.base_name, 0.0)
+    gross = body.qty + received_open
     row = db.get(OrderedQty, (ctx.org.id, body.base_name))
     if row is None:
-        db.add(OrderedQty(org_id=ctx.org.id, base_name=body.base_name, qty=body.qty))
+        db.add(OrderedQty(org_id=ctx.org.id, base_name=body.base_name, qty=gross))
     else:
-        row.qty = body.qty
+        row.qty = gross
     db.commit()
     analytics.invalidate(ctx.org.id)
     return {"ok": True}

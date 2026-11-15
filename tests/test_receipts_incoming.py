@@ -38,16 +38,16 @@ def check(name, cond, detail=""):
         print(f"  FAIL {name}  {detail}")
 
 
-def ordered(c, base):
-    """«Едет» позиции из снапшота (то, чем считают «Заказ», мастер и «Бюджет»)."""
+def ordered(c, base, field="ordered"):
+    """«Едет» позиции из снапшота (то, чем считают «Заказ», мастер и «Бюджет»).
+    Кэш не сбрасывается: изменения обязаны сбрасывать его сами (ревью #130)."""
     from app import analytics
     from app.db import SessionLocal
     from app.models import Org
     db = SessionLocal()
     try:
         org = db.query(Org).filter(Org.name == "Приёмка").first()
-        analytics.invalidate(org.id)
-        return float(analytics.get_snapshot(db, org)["items"][base]["ordered"])
+        return float(analytics.get_snapshot(db, org)["items"][base][field])
     finally:
         db.close()
 
@@ -94,6 +94,18 @@ with TestClient(app, headers={"X-Oborot-CSRF": "1"}) as c:
     r = c.post(f"/api/orders/{o3['id']}/receipts", json={"lines": [{"base_name": base, "qty": 5}]})
     check("приёмка черновика: 422", r.status_code == 422, str(r.status_code))
     check("«Едет» не изменился", ordered(c, base) == b0, f"{ordered(c, base)}")
+
+    print("\n5. Ручная правка «Едет» при открытом заказе с приёмкой (ревью #130)")
+    o4 = c.post("/api/orders", json={"name": "Правка", "allow_duplicate": True,
+                                     "items": [{"base_name": base2, "qty": 104}]}).json()
+    c.post(f"/api/orders/{o4['id']}/status", json={"status": "sent"})
+    c.post(f"/api/orders/{o4['id']}/receipts", json={"lines": [{"base_name": base2, "qty": 60}]})
+    m0 = ordered(c, base2, "ordered_manual")
+    check("на экране «Едет» уже за вычетом принятого", m0 == b20 + 44, f"{m0}")
+    r = c.post("/api/ordered", json={"base_name": base2, "qty": 50})
+    check("правка принята", r.status_code == 200, r.text[:160])
+    check("после правки на экране ровно введённое 50, а не 50 − 60", ordered(c, base2, "ordered_manual") == 50,
+          f"{ordered(c, base2, 'ordered_manual')}")
 
 for suffix in ("", "-wal", "-shm"):
     p = Path(str(DB_PATH) + suffix)
