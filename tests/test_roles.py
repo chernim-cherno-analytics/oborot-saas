@@ -656,6 +656,41 @@ with client() as owner, client() as ownerB:
               sql("SELECT COUNT(*) FROM org_roles WHERE org_id=?", solo_org)[0][0] == 0
               and sql("SELECT COUNT(*) FROM org_invites WHERE org_id=?", solo_org)[0][0] == 0)
 
+print("\n== Ревью Codex #110: владелец другой организации и гонка владельцев ==")
+with client() as ha, client() as hb:
+    ha.post("/register", data={"name": "Альфа", "email": "alpha@roles.io",
+                               "password": PW, "org_name": "Альфа"})
+    hb.post("/register", data={"name": "Бета", "email": "beta@roles.io",
+                               "password": PW, "org_name": "Бета"})
+    a_owner = next(r["id"] for r in ha.get("/api/team").json()["roles"] if r["builtin"] == "owner")
+    tok = ha.post("/api/team/invites", json={"role_id": a_owner}).json()["link_path"].split("t=", 1)[1]
+    r = hb.post("/api/invite/accept", json={"token": tok, "mode": "join"})
+    check("владелец Беты принял приглашение владельцем в Альфу", r.status_code == 200, r.text[:200])
+    in_alpha = hb.get("/api/team").json()
+    r = hb.post("/api/account/delete", json={"password": PW, "confirm": "УДАЛИТЬ"})
+    check("удаление аккаунта отказано: он единственный владелец Беты",
+          r.status_code == 422 and "Бета" in r.text, f"{r.status_code} {r.text[:200]}")
+    beta_id = sql("SELECT id FROM orgs WHERE name='Бета'")[0][0]
+    check("Бета осталась с владельцем",
+          sql("SELECT COUNT(*) FROM memberships WHERE org_id=? AND role='owner'", beta_id)[0][0] == 1)
+
+    import threading as _th
+    alpha_id = sql("SELECT id FROM orgs WHERE name='Альфа'")[0][0]
+    beta_uid = sql("SELECT id FROM users WHERE email='beta@roles.io'")[0][0]
+    alpha_uid = sql("SELECT id FROM users WHERE email='alpha@roles.io'")[0][0]
+    emp = next(r["id"] for r in ha.get("/api/team").json()["roles"] if r["builtin"] == "employee")
+    results = []
+
+    def demote(c, uid):
+        results.append(c.post(f"/api/team/members/{uid}/role", json={"role_id": emp}).status_code)
+
+    t1 = _th.Thread(target=demote, args=(ha, alpha_uid))
+    t2 = _th.Thread(target=demote, args=(hb, beta_uid))
+    t1.start(); t2.start(); t1.join(); t2.join()
+    owners_left = sql("SELECT COUNT(*) FROM memberships WHERE org_id=? AND role='owner'", alpha_id)[0][0]
+    check("два владельца снимают себя одновременно: владелец остаётся",
+          owners_left >= 1 and sorted(results).count(422) >= 1, f"{results} владельцев={owners_left}")
+
 for base in (DB_PATH, OLD_DB_PATH):
     for suffix in ("", "-wal", "-shm"):
         p = Path(str(base) + suffix)

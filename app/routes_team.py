@@ -22,6 +22,7 @@ app/roles.py, здесь только ручки и страницы.
 from __future__ import annotations
 
 import secrets
+import threading
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Request
@@ -36,6 +37,9 @@ from app.account_recovery import token_hash
 from app.auth import AuthContext, require_perm
 from app.db import get_db
 from app.models import Membership, Org, OrgInvite, OrgRole, User
+
+# Прод работает одним процессом (run.py), поэтому замка процесса достаточно.
+_OWNER_LOCK = threading.Lock()
 
 router = APIRouter()
 
@@ -253,24 +257,28 @@ def api_team_member_role(
     body: MemberRoleIn, user_id: int = _id_path(),
     ctx: AuthContext = Depends(_TEAM), db: Session = Depends(get_db),
 ):
-    roles.ensure_builtin_roles(db, ctx.org.id)
-    member = _org_member(db, ctx.org.id, user_id)
-    role = _org_role(db, ctx.org.id, body.role_id)
-    if role.builtin == roles.OWNER or member.role == "owner":
-        _require_owner_for_owner_role(ctx)
-    current, _name = roles.member_perms(db, member)
-    _forbid_unless_subset(ctx, current, "Нельзя менять роль сотрудника, у которого прав больше, чем у вас")
-    _forbid_unless_subset(ctx, roles.role_perms(role), "Нельзя выдать права, которых нет у вас самих")
-    if (member.role == "owner" and role.builtin != roles.OWNER
-            and roles.owner_count(db, ctx.org.id) <= 1):
-        raise HTTPException(
-            status_code=422,
-            detail="В организации должен остаться хотя бы один владелец. "
-                   "Сначала назначьте владельцем другого сотрудника.",
-        )
-    roles.apply_role(member, role)
-    db.commit()
-    return team_state(db, ctx)
+    # Ревью Codex #110 (P1): проверка «последний владелец» и изменение
+    # выполняются под одним замком, иначе два одновременных запроса оба
+    # видят двух владельцев и оставляют организацию без хозяина.
+    with _OWNER_LOCK:
+        roles.ensure_builtin_roles(db, ctx.org.id)
+        member = _org_member(db, ctx.org.id, user_id)
+        role = _org_role(db, ctx.org.id, body.role_id)
+        if role.builtin == roles.OWNER or member.role == "owner":
+            _require_owner_for_owner_role(ctx)
+        current, _name = roles.member_perms(db, member)
+        _forbid_unless_subset(ctx, current, "Нельзя менять роль сотрудника, у которого прав больше, чем у вас")
+        _forbid_unless_subset(ctx, roles.role_perms(role), "Нельзя выдать права, которых нет у вас самих")
+        if (member.role == "owner" and role.builtin != roles.OWNER
+                and roles.owner_count(db, ctx.org.id) <= 1):
+            raise HTTPException(
+                status_code=422,
+                detail="В организации должен остаться хотя бы один владелец. "
+                       "Сначала назначьте владельцем другого сотрудника.",
+            )
+        roles.apply_role(member, role)
+        db.commit()
+        return team_state(db, ctx)
 
 
 @router.post("/api/team/members/{user_id}/remove")
@@ -278,22 +286,26 @@ def api_team_member_remove(
     user_id: int = _id_path(),
     ctx: AuthContext = Depends(_TEAM), db: Session = Depends(get_db),
 ):
-    member = _org_member(db, ctx.org.id, user_id)
-    if user_id == ctx.user.id:
-        raise HTTPException(
-            status_code=422,
-            detail="Себя убрать нельзя. Уйти из организации можно на странице «Аккаунт».",
-        )
-    if member.role == "owner":
-        _require_owner_for_owner_role(ctx)
-        if roles.owner_count(db, ctx.org.id) <= 1:
-            raise HTTPException(status_code=422,
-                                detail="Нельзя убрать последнего владельца организации")
-    current, _name = roles.member_perms(db, member)
-    _forbid_unless_subset(ctx, current, "Нельзя убрать сотрудника, у которого прав больше, чем у вас")
-    db.delete(member)
-    db.commit()
-    return team_state(db, ctx)
+    # Ревью Codex #110 (P1): проверка «последний владелец» и изменение
+    # выполняются под одним замком, иначе два одновременных запроса оба
+    # видят двух владельцев и оставляют организацию без хозяина.
+    with _OWNER_LOCK:
+        member = _org_member(db, ctx.org.id, user_id)
+        if user_id == ctx.user.id:
+            raise HTTPException(
+                status_code=422,
+                detail="Себя убрать нельзя. Уйти из организации можно на странице «Аккаунт».",
+            )
+        if member.role == "owner":
+            _require_owner_for_owner_role(ctx)
+            if roles.owner_count(db, ctx.org.id) <= 1:
+                raise HTTPException(status_code=422,
+                                    detail="Нельзя убрать последнего владельца организации")
+        current, _name = roles.member_perms(db, member)
+        _forbid_unless_subset(ctx, current, "Нельзя убрать сотрудника, у которого прав больше, чем у вас")
+        db.delete(member)
+        db.commit()
+        return team_state(db, ctx)
 
 
 class RoleIn(BaseModel):

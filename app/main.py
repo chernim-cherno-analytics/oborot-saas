@@ -1319,6 +1319,14 @@ def api_delete_account(
     ctx: auth.AuthContext = Depends(auth.require_auth_api),
     db: Session = Depends(get_db),
 ):
+    """Удаление аккаунта под замком владельцев (ревью Codex #110, P1): два
+    владельца, удаляющие себя одновременно, не оставят организацию без хозяина."""
+    from app import routes_team
+    with routes_team._OWNER_LOCK:
+        return _delete_account_impl(body, ctx, db)
+
+
+def _delete_account_impl(body: AccountDeleteIn, ctx: auth.AuthContext, db: Session):
     """Удаление аккаунта. Подтверждение — пароль + слово «УДАЛИТЬ».
 
     Три разных случая, и они правда разные:
@@ -1347,6 +1355,26 @@ def api_delete_account(
     members = _org_members(db, ctx.org.id)
     others = [(u, m) for u, m in members if u.id != ctx.user.id]
     org_id, user_id = ctx.org.id, ctx.user.id
+
+    # Удаление аккаунта снимает человека из ВСЕХ организаций (_purge_user).
+    # Если в другой организации он единственный владелец, она осталась бы
+    # без хозяина и без доступа к данным (ревью Codex #110, P1). Сначала
+    # передайте её или удалите, находясь в ней.
+    orphaned = []
+    for m in db.execute(select(Membership).where(
+            Membership.user_id == user_id, Membership.org_id != org_id,
+            Membership.role == "owner")).scalars().all():
+        owners = db.execute(select(func.count()).select_from(Membership).where(
+            Membership.org_id == m.org_id, Membership.role == "owner")).scalar() or 0
+        if owners <= 1:
+            o = db.get(Org, m.org_id)
+            orphaned.append(o.name if o else f"№{m.org_id}")
+    if orphaned:
+        raise HTTPException(
+            status_code=422,
+            detail="Вы единственный владелец в другой организации: " + ", ".join(orphaned[:5])
+                   + ". Передайте её коллеге или удалите, находясь в ней, затем удаляйте аккаунт.",
+        )
 
     # Участник (не владелец): уходит только он. Так же уходит владелец, у
     # которого в организации есть ещё один владелец (роли, 15.11.2026):
