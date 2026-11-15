@@ -475,7 +475,7 @@
       <button type="button" data-band="r">Срочно <span class="c" id="seg-r">0</span></button>
       <button type="button" data-band="y">Скоро <span class="c" id="seg-y">0</span></button>
       <button type="button" data-band="g">План <span class="c" id="seg-g">0</span></button>
-      <button type="button" data-band="out" id="seg-out-btn" style="display:none" title="Позиции с потребностью, которые не вошли в бюджет">Не вошло в бюджет <span class="c" id="seg-out">0</span></button>
+      <button type="button" data-band="out" id="seg-out-btn" style="display:none" title="Позиции с потребностью, которые не вошли в план под бюджет">Не вошло в план <span class="c" id="seg-out">0</span></button>
     </div>
     <div class="seg" id="rate-seg" title="Окно расчёта темпа продаж: по нему считаются покрытие, стокаут и рекомендация «Заказать»">
       <span class="seg-lbl">Темп:</span>
@@ -1947,7 +1947,7 @@
         '<td class="name">'+esc(it.base_name)+
           (it.low_data?' <span style="font-size:9px;font-weight:700;padding:1px 6px;border-radius:8px;background:rgba(31,31,31,.08);color:rgba(31,31,31,.55)" title="Мало данных — темп оценочный, проверьте количество вручную">мало данных</span>':"")+
           (it.below_cost?' <span class="losstag" title="Средняя цена продажи ниже себестоимости: каждая проданная штука уменьшает деньги. Количество система не меняет, решение за вами">в минус'+(it.loss_unit?(' '+fmt(it.loss_unit)+' ₽/шт'):'')+'</span>':"")+
-          (it._plan_out?' <span class="out-tag" title="Потребность есть, но в бюджет плана позиция не вошла. Отметьте галочку, чтобы взять её в заказ сверх плана">не вошло в бюджет</span>':"")+
+          (it._plan_out?' <span class="out-tag" title="Потребность есть, но в план под бюджет позиция не вошла. Отметьте галочку, чтобы взять её в заказ сверх плана">'+esc(it._planOutWhy||"вне плана")+'</span>':"")+
           '<span class="csub">'+esc(it.category||"")+
           (it.in_drafts?' · в черновике заказа '+fmt(it.in_drafts)+' шт, вычтено':"")+
           (it._planWhy?' · план: '+esc(it._planWhy):"")+'</span></td>'+
@@ -2123,7 +2123,7 @@
   function clearPlanMarks(){
     items.forEach(function(it){
       if(it._plan_out) it._checked=true;
-      delete it._plan_out; delete it._planQty; delete it._planWhy; delete it._planRecs;
+      delete it._plan_out; delete it._planQty; delete it._planWhy; delete it._planRecs; delete it._planOutWhy;
       it._recs={};
       var draft=DRAFTS[it.base_name]||{};
       Object.keys(it.sizes||{}).forEach(function(sz){
@@ -2147,8 +2147,14 @@
       max_share_pct:PB.cap, exclude_categories:excludedCats()}}).then(function(p){
       if(seq!==PLAN_SEQ) return;
       document.getElementById("pb-apply").disabled=false;
-      var by={};
+      var by={}, why={};
       (p.items||[]).forEach(function(i){ if((i.qty||0)>0) by[i.base_name]=i; });
+      // Почему позиция с потребностью не в плане: бюджет, нет свежих продаж,
+      // партия не влезла в лимит. Списки мастера урезаны, остальное «вне плана».
+      (p.not_included||[]).forEach(function(x){ why[x.base_name]="не вошло в бюджет"; });
+      ((p.review||{}).stale||[]).forEach(function(x){ why[x.base_name]="нет свежих продаж: мастер не берёт"; });
+      (p.moq_skipped||[]).forEach(function(x){ why[x.base_name||x]="партия не влезла в бюджет"; });
+      (p.moq_over_cap||[]).forEach(function(x){ why[x.base_name||x]="партия дороже лимита на модель"; });
       clearPlanMarks();
       PLAN={pid:pid, data:p};
       prodItems(pid).forEach(function(it){
@@ -2164,7 +2170,7 @@
           }else it._recs={};
           recalcNeed(it);
         }else if((it.need||0)>0){
-          it._plan_out=true; it._checked=false;
+          it._plan_out=true; it._checked=false; it._planOutWhy=why[it.base_name]||"вне плана под бюджет";
         }
       });
       var t=p.totals||{}, outN=prodItems(pid).filter(function(it){ return it._plan_out; }).length;
@@ -2177,8 +2183,8 @@
       planNote("План под бюджет "+fmtMoneyShort(PB.budget)+(PB.scope==="now"?" (деньги на сейчас)":"")+
         " · «"+esc(p.strategy_title||"")+"», лимит "+PB.cap+" %: <b>"+fmt(t.positions||0)+" поз., "+fmt(t.units||0)+" шт, "+
         fmtMoneyShort(t.cost||0)+"</b>"+(p.rest>0?(", остаток "+fmtMoneyShort(p.rest)):"")+"."+
-        (outN?(" Не вошло в бюджет: "+fmt(outN)+" поз."+(outRub?(" на "+fmtMoneyShort(outRub)+" потребности"):"")+
-          ' (фильтр «Не вошло в бюджет»).'):"")+
+        (outN?(" Не вошло в план: "+fmt(outN)+" поз."+(outRub?(", из них не хватило бюджета на "+fmtMoneyShort(outRub)+" потребности"):"")+
+          ' (фильтр «Не вошло в план»).'):"")+
         (warn.length?' <span class="warn">'+warn.join(" · ")+'</span>':"")+
         ' <a href="/assistant">Подробно с траншами и упущенными продажами</a>');
       pbSync(); renderAll();

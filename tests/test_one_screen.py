@@ -5,7 +5,7 @@
    «Бюджета»; на их страницах подсвечен «Заказ».
 2) «Заказ» открывается сразу по всем категориям (оформление доступно).
 3) Полоса «Под бюджет»: бюджет задан = план мастера тем же движком, итог
-   карточки «Себестоимость» = итог плана, «Не вошло в бюджет» отдельным
+   карточки «Себестоимость» = итог плана, «Не вошло в план» отдельным
    фильтром; «Вся потребность» возвращает расчёт.
 4) Шаги мастера заканчиваются на таблице: «Открыть в «Заказе»» переносит
    бюджет и стратегию, план считается сам.
@@ -139,7 +139,7 @@ try:
         cost_card = money(page.inner_text("#s-cost"))
         check("карточка «Себестоимость» = себестоимость плана (до тысячи из-за краткой записи)",
               abs(cost_card - t["cost"]) <= max(1000, t["cost"] * 0.01), f"{cost_card} vs {t['cost']}")
-        check("«Не вошло в бюджет» видно отдельным фильтром", page.is_visible("#seg-out-btn"))
+        check("«Не вошло в план» видно отдельным фильтром", page.is_visible("#seg-out-btn"))
         outn = int(page.inner_text("#seg-out") or 0)
         check("и в нём есть позиции", outn > 0, str(outn))
         page.click("#seg-out-btn")
@@ -148,6 +148,11 @@ try:
               and page.locator("#tbody tr.plan-out").count() == outn, f"{rows.count()} / {outn}")
         check("и они сняты с галочки",
               page.locator("#tbody tr.plan-out input.row-check:checked").count() == 0)
+        tags = page.eval_on_selector_all("#tbody tr.plan-out .out-tag", "els => els.map(e => e.textContent)")
+        budget_names = {x["base_name"] for x in plan.get("not_included") or []}
+        check("у каждой не вошедшей названа причина", tags and all(t.strip() for t in tags), str(tags[:5]))
+        check("не хватившие бюджета так и подписаны",
+              not budget_names or any("не вошло в бюджет" in t for t in tags), str(tags[:5]))
         page.click('#band-seg button[data-band=""]')
         check("«Вся потребность» видна", page.is_visible("#pb-clear"))
         page.click("#pb-clear")
