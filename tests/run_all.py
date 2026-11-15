@@ -223,7 +223,7 @@ SUITES = [
     # Окно оформления «Заказа»: календарь платежей и черновик (прогон 14.11).
     ("order_modal_cash", "test_order_modal_cash.py", False, False),
     # Почасовой догон повторяет синк, прерванный перезапуском (прод 15.11).
-    ("sync_resume", "test_sync_resume.py", False, False),
+    ("sync_retry_job", "test_sync_resume.py", False, False),
     ("deps",        "test_dependencies.py",    False, False),
 ]
 
