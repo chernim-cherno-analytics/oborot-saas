@@ -339,8 +339,11 @@
   var LSKEY = "oborot.assistant.draft";
   function saveDraft(){
     try {
+      // Прогон 15.11: бюджет тоже помним (раньше при каждом открытии 200 000).
+      var bEl = document.getElementById("budget");
       localStorage.setItem(LSKEY, JSON.stringify({
-        pid: STATE.production_id, edits: STATE.edits, must: STATE.must, ts: Date.now() }));
+        pid: STATE.production_id, edits: STATE.edits, must: STATE.must,
+        budget: bEl ? parseNum("budget") : null, ts: Date.now() }));
     } catch(e){}
   }
   function loadDraft(){
@@ -1758,7 +1761,7 @@
   document.getElementById("eta").addEventListener("input", function(){
     this.dataset.touched = "1"; updHints(); });
   document.getElementById("budget").addEventListener("blur", function(){
-    this.value = fmt(parseNum("budget")); });
+    this.value = fmt(parseNum("budget")); saveDraft(); });
 
   segInit("cadSeg", 30, function(v){ STATE.cadence = +v; updHints(); });
   segInit("scopeSeg", "now", function(v){ STATE.scope = v; updHints(); });
@@ -1801,6 +1804,7 @@
       STATE.edits = draft.edits || {};
       STATE.must = draft.must || [];
     }
+    if(draft && draft.budget > 0) document.getElementById("budget").value = fmt(draft.budget);
     segInitValue("cadSeg", STATE.cadence);
     segInitValue("scopeSeg", STATE.scope);
     renderProds();
