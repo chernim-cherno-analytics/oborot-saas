@@ -210,6 +210,7 @@ SUITES = [
     ("one_number", "test_one_number.py",       False, False),
     ("snapshot_cache", "test_snapshot_cache.py", False, False),
     ("receipts_incoming", "test_receipts_incoming.py", False, False),
+    ("drafts_need", "test_drafts_need.py", False, False),
     ("demo_receipt", "test_demo_receipt.py", False, False),
     ("supply_trash", "test_supply_trash.py", False, False),
     # TRUTH-3: прогон на собранном main 14.11 (срок и партия этапов, новинки).

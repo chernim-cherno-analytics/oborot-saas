@@ -1384,6 +1384,7 @@
         noCostList(rev.no_cost)) : '')+
       staleBlock(rev)+
       '<div class="peak">Потребность меньше 3 шт — '+(rev.small_need_count||0)+' поз.</div>'+
+      (rev.in_drafts_count ? '<div class="peak">Уже целиком в черновиках заказов — '+rev.in_drafts_count+' поз.</div>' : '')+
       (rev.other_production_count ? '<div class="peak">На других производствах — '+rev.other_production_count+' поз.: закажите отдельным заказом.</div>' : "")+
       '</div></details></div>';
 
@@ -1414,7 +1415,8 @@
         openHtml += '<div class="warn" style="margin-bottom:12px">Бюджета не хватает на цель стратегии: '+
           'у '+shortL.length+' из '+took.length+' позиций заказ закрывает меньше '+wd+' дн продаж '+
           '(в середине списка '+fmt(med)+' шт на модель). Если цеху нужны партии побольше, выберите '+
-          '«Глубже в топ»: меньше моделей, но каждая закрыта глубже.</div>';
+          '«Глубже в топ»: меньше моделей, но каждая закрыта глубже. '+
+          '<button type="button" id="goDeep" style="border:0;background:none;color:inherit;text-decoration:underline;font:inherit;font-weight:700;cursor:pointer;padding:0">Пересчитать «Глубже в топ»</button></div>';
       }
     }
     // Позиции «в минус» в плане называются до таблицы, а не только значком
@@ -1598,7 +1600,8 @@
     return '<tr class="'+rowCls(i.turnover)+'" data-b="'+esc(i.base_name)+'">'+
       '<td>'+esc(i.base_name)+(i.below_cost?' <span class="losstag" title="Средняя цена продажи ниже себестоимости: каждая проданная штука уменьшает деньги. Количество система не меняет, решение за вами">в минус'+(i.loss_unit?(' '+fmt(i.loss_unit)+' ₽/шт'):'')+'</span>':'')+'<span class="why">'+esc(i.category)+' · '+esc(i.why_text)+
       (i.over_need ? ' · <b>'+i.over_need+' шт сверх потребности</b>' : '')+
-      (inOpen ? ' · <b>уже в открытом заказе: '+fmt(inOpen)+' шт</b>' : '')+
+      (i.in_drafts ? ' · <b>в черновике заказа '+fmt(i.in_drafts)+' шт, вычтено из потребности</b>'
+        : (inOpen ? ' · <b>уже в открытом заказе: '+fmt(inOpen)+' шт</b>' : ''))+
       (i.no_supplier ? ' · <b>нет поставщика в МойСкладе</b>' : '')+'</span></td>'+
       '<td class="nb">'+fmt(i.turnover)+'</td>'+
       '<td class="nb">'+(i.rate!=null?String(Math.round(i.rate*100)/100).replace(".",","):'—')+'</td>'+
@@ -1800,6 +1803,13 @@
   document.getElementById("budget").addEventListener("blur", function(){
     this.value = fmt(parseNum("budget")); saveDraft(); });
 
+  // Пункт 1 решений 15.11: при маленьком бюджете на широкой стратегии
+  // предупреждение сразу предлагает «Глубже в топ» одной кнопкой.
+  document.addEventListener("click", function(e){
+    if(!e.target || e.target.id !== "goDeep") return;
+    var t = document.querySelector('#stratTiles .tile[data-v="grow"]');
+    if(t){ t.click(); saveDraft(); preview(3); }
+  });
   segInit("cadSeg", 30, function(v){ STATE.cadence = +v; updHints(); });
   segInit("scopeSeg", "now", function(v){ STATE.scope = v; updHints(); });
   Array.prototype.forEach.call(document.querySelectorAll("#stratTiles .tile"), function(el){

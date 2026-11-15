@@ -385,6 +385,9 @@ def _production_subtitle(name: str, items: list[dict], data: dict, window_ru: st
     hz = hzs.pop() if len(hzs) == 1 else data.get('horizon_days', 90)
     parts.append(f"горизонт {hz} дней")
     parts.append(_need_rate_ru(data, window_ru))
+    oh = float(data.get("overhead_pct") or 0)
+    if oh > 0:
+        parts.append(f"себестоимость с накладными {oh:g} %")
     where = f"вкладке «{name}»" if name else "странице «Заказ»"
     # Раньше шапка честно предупреждала, что галочки на состав файла не
     # влияют, — это было объяснение проблемы, а не решение. Теперь выгрузка

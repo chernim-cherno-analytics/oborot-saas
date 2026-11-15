@@ -736,6 +736,36 @@ def _received_on_open_local_orders(db: Session, org_id: int) -> dict[str, float]
     return out
 
 
+def drafts_by_base(db: Session, org_id: int) -> dict[str, int]:
+    """D-84 (решение владельца 15.11.2026): сколько штук каждой модели лежит в
+    черновиках заказов. Черновик не обязательство, поэтому в «Едет» он не
+    входит, но потребность на «Заказе», в мастере и «Бюджете» уменьшает, с
+    пометкой в строке: иначе после «Оформить» тот же экран снова просил дошить
+    то же самое. Читается при каждом запросе, снапшот не трогает (черновик не
+    меняет ни остатков, ни продаж)."""
+    from app.models import ProductionOrder, parse_items_payload
+    out: dict[str, int] = {}
+    for items in db.execute(
+        select(ProductionOrder.items_json).where(ProductionOrder.org_id == org_id,
+                                                 ProductionOrder.status == "draft")
+    ).scalars().all():
+        try:
+            rows, _marker = parse_items_payload(items or "[]")
+        except (TypeError, ValueError):
+            continue
+        for it in rows or []:
+            if not isinstance(it, dict):
+                continue
+            b = str(it.get("base_name") or "")
+            try:
+                q = int(it.get("qty") or 0)
+            except (TypeError, ValueError):
+                q = 0
+            if b and q > 0:
+                out[b] = out.get(b, 0) + q
+    return out
+
+
 def _compute_snapshot(db: Session, org: Org) -> dict:
     settings = dict(org.settings)
     settings.update(extra_settings(org))
@@ -2063,6 +2093,15 @@ _NO_HISTORY_REASON = {
 }
 
 
+def _with_overhead(cost, settings: dict) -> int:
+    """Себестоимость с накладными % (D-87), то же правило, что в мастере."""
+    c = float(cost or 0)
+    oh = float(settings.get("overhead_pct") or 0)
+    if c > 0 and oh > 0:
+        c = c * (1.0 + oh / 100.0)
+    return round(c)
+
+
 def build_replenish(snap: dict) -> dict:
     """GET /api/replenish — потребность в заказе, сортировка по turnover desc.
 
@@ -2199,8 +2238,13 @@ def build_replenish(snap: dict) -> dict:
                     for s, v in sorted(it["sizes"].items(), key=lambda kv: _size_order(kv[0]))
                 },
                 "avg_price": avg_price,
-                "cost_price": it["cost_price"],
-                "profit_potential": round(max(0, avg_price - it["cost_price"]) * it["need"]),
+                # D-87 (решение владельца 15.11.2026): деньги «Заказа» с
+                # накладными из настроек, как в мастере и «Бюджете»
+                # (order_planner._candidates). Без них одна и та же штука
+                # стоила 4 029 ₽ на «Заказе» и 4 835 ₽ в мастере.
+                "cost_price": _with_overhead(it["cost_price"], settings),
+                "cost_base": it["cost_price"],
+                "profit_potential": round(max(0, avg_price - _with_overhead(it["cost_price"], settings)) * it["need"]),
             }
         )
     return {
@@ -2211,6 +2255,8 @@ def build_replenish(snap: dict) -> dict:
         # сколько позиций в заказе посчитаны по годовому темпу вместо окна
         "fallback_count": sum(1 for x in result if x["rate_fallback"]),
         "lead_time_days": lead_time,
+        # D-87: накладные, которые уже сидят в cost_price строк.
+        "overhead_pct": float(settings.get("overhead_pct") or 0),
         "season_from": snap.get("season_from"),
         "season_to": snap.get("season_to"),
         # Загружена ли история на всё окно активного темпа (деплой П1). False —
