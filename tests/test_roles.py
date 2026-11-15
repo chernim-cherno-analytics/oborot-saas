@@ -649,6 +649,18 @@ with client() as owner, client() as ownerB:
         login(vb2, "viewer@b.io")
         check("убранный больше не видит организацию",
               vb2.get("/api/settings").json()["org"]["name"] == "Чужая")
+    open_uid = add_user("open@roles.io", org_id)
+    with client() as op:
+        login(op, "open@roles.io")
+        owner.post(f"/api/team/members/{open_uid}/remove")
+        r = op.get("/replenish", follow_redirects=False)
+        page = op.get("/login?removed=1").text
+        check("убранный с открытой вкладкой: вход объясняет причину (QA 15.11)",
+              r.status_code == 302 and r.headers.get("location") == "/login?removed=1"
+              and "убрал ваш доступ" in page, f"{r.status_code} {r.headers.get('location')}")
+    with client() as anon_r:
+        r = anon_r.get("/replenish", follow_redirects=False)
+        check("без сессии: обычный вход без пометки", r.headers.get("location") == "/login")
     solo_uid = add_user("gone@roles.io", org_id)
     owner.post(f"/api/team/members/{solo_uid}/remove")
     with client() as so:

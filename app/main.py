@@ -849,6 +849,8 @@ def _authed_page(request: Request, db: Session, template: str, active: str, page
     """Страница под сессией: без авторизации — redirect /login."""
     ctx = auth.resolve_auth(request, db)
     if ctx is None:
+        if auth.session_lost_membership(request, db):
+            return RedirectResponse("/login?removed=1", status_code=302)
         return RedirectResponse("/login", status_code=302)
     return _page(request, ctx, template, active, page_title, db=db)
 
@@ -879,8 +881,14 @@ _DELETED_NOTICES = {
 
 
 @app.get("/login", response_class=HTMLResponse)
-def login_page(request: Request, deleted: str = ""):
-    return _render_auth(request, "login.html", notice=_DELETED_NOTICES.get(deleted))
+def login_page(request: Request, deleted: str = "", removed: str = ""):
+    notice = _DELETED_NOTICES.get(deleted)
+    if removed and not notice:
+        # QA 15.11: убранный сотрудник с открытой вкладкой попадал на вход молча.
+        notice = ("Владелец организации убрал ваш доступ. Если у вас есть другие "
+                  "организации, войдите снова. Чтобы вернуться в эту, попросите "
+                  "у владельца новую ссылку-приглашение.")
+    return _render_auth(request, "login.html", notice=notice)
 
 
 # Почта поддержки: пока нет восстановления пароля, это единственный способ
