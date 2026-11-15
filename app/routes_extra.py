@@ -305,6 +305,10 @@ def api_freshness(ctx: AuthContext = Depends(require_auth_api), db: Session = De
         "last_stock_date": last_stock,
         "sync_state": st.get("state"),
         "sync_error": st.get("error"),
+        # Класс причины (token | settings | transient | internal): прерывание
+        # перезапуском сервера (каждая выкладка) не «падение», а пауза до
+        # следующего часового запуска (прод 15.11: красная плашка после выкладки).
+        "sync_error_cause": (st.get("stats") or {}).get("error_cause"),
         "sync_finished_at": st.get("finished_at"),
         # Деплой П1: сколько дней истории уже на диске (прогрессивная загрузка)
         # и с какой даты она начинается — фронт подписывает колонки «за N дн.»

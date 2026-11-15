@@ -222,6 +222,8 @@ SUITES = [
     ("decisions_1511", "test_decisions_15_11.py", False, False),
     # Окно оформления «Заказа»: календарь платежей и черновик (прогон 14.11).
     ("order_modal_cash", "test_order_modal_cash.py", False, False),
+    # Плашка свежести: перезапуск при выкладке не «падение» (прод 15.11).
+    ("sync_chip", "test_sync_chip.py", False, False),
     ("deps",        "test_dependencies.py",    False, False),
 ]
 
