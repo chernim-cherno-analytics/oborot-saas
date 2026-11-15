@@ -256,6 +256,16 @@ class MemberRoleIn(BaseModel):
     role_id: int = Field(ge=1, le=2_147_483_647)
 
 
+def _revoke_invites_by(db: Session, org_id: int, user_id: int) -> None:
+    """Отозвать неиспользованные приглашения, выпущенные этим человеком (ревью #110)."""
+    db.execute(
+        update(OrgInvite).where(
+            OrgInvite.org_id == org_id, OrgInvite.created_by == user_id,
+            OrgInvite.used_at.is_(None), OrgInvite.revoked_at.is_(None),
+        ).values(revoked_at=datetime.utcnow()).execution_options(synchronize_session=False)
+    )
+
+
 @router.post("/api/team/members/{user_id}/role")
 def api_team_member_role(
     body: MemberRoleIn, user_id: int = _id_path(),
@@ -280,7 +290,11 @@ def api_team_member_role(
                 detail="В организации должен остаться хотя бы один владелец. "
                        "Сначала назначьте владельцем другого сотрудника.",
             )
+        demoted = not (set(current) <= set(roles.role_perms(role))) and role.builtin != roles.OWNER
         roles.apply_role(member, role)
+        # Понижение: ссылки, которые человек выпустил по старым правам, гаснут.
+        if demoted:
+            _revoke_invites_by(db, ctx.org.id, user_id)
         db.commit()
         return team_state(db, ctx)
 
@@ -298,7 +312,7 @@ def api_team_member_remove(
         if user_id == ctx.user.id:
             raise HTTPException(
                 status_code=422,
-                detail="Себя убрать нельзя. Уйти из организации можно на странице «Аккаунт».",
+                detail="Себя убрать нельзя. Попросите об этом владельца или другого сотрудника с правом «Сотрудники и роли».",
             )
         if member.role == "owner":
             _require_owner_for_owner_role(ctx)
@@ -308,6 +322,7 @@ def api_team_member_remove(
         current, _name = roles.member_perms(db, member)
         _forbid_unless_subset(ctx, current, "Нельзя убрать сотрудника, у которого прав больше, чем у вас")
         db.delete(member)
+        _revoke_invites_by(db, ctx.org.id, user_id)
         # Вход из МойСклада не должен вернуть убранного сотрудника (ревью #110).
         if db.get(OrgRemoval, (ctx.org.id, user_id)) is None:
             db.add(OrgRemoval(org_id=ctx.org.id, user_id=user_id, removed_at=datetime.utcnow()))
@@ -475,6 +490,28 @@ def _limit_ip(request: Request) -> tuple[str, bool]:
     return key, trusted
 
 
+def _creator_may_grant(db: Session, inv: OrgInvite, role: OrgRole) -> bool:
+    """Ссылка действует, только пока её автор вправе выдать эту роль СЕЙЧАС.
+
+    Ревью #110 (P1): убранный или пониженный сотрудник с правом «Сотрудники
+    и роли» возвращал себе доступ по ссылке, которую заготовил заранее.
+    Автор обязан оставаться участником организации: владелец выдаёт любую
+    роль, остальные только с users_manage и не шире своих прав, «Владельца»
+    никогда. Ссылки без автора (старые записи) действуют как раньше.
+    """
+    if not inv.created_by:
+        return True
+    member = db.get(Membership, (inv.created_by, inv.org_id))
+    if member is None:
+        return False
+    if member.role == "owner":
+        return True
+    if role.builtin == roles.OWNER:
+        return False
+    perms, _name = roles.member_perms(db, member)
+    return "users_manage" in perms and set(roles.role_perms(role)) <= set(perms)
+
+
 def _valid_invite(db: Session, token: str, ip_key: str, trusted: bool,
                   now: datetime) -> tuple[OrgInvite, OrgRole, Org]:
     inv = None
@@ -486,7 +523,7 @@ def _valid_invite(db: Session, token: str, ip_key: str, trusted: bool,
     org = db.get(Org, inv.org_id) if inv else None
     if (inv is None or inv.used_at is not None or inv.revoked_at is not None
             or inv.expires_at <= now or role is None or role.org_id != inv.org_id
-            or org is None):
+            or org is None or not _creator_may_grant(db, inv, role)):
         if trusted:
             invite_ip_limiter.hit(ip_key)
         raise HTTPException(status_code=400, detail=INVITE_INVALID)
@@ -536,10 +573,15 @@ def api_invite_accept(body: InviteAcceptIn, request: Request, db: Session = Depe
     elif body.mode == "login":
         acc_key = f"acc:{email_norm}"
         acc_retry = auth.login_limiter.retry_after(acc_key)
+        # Тот же лимит по адресу, что у /login (ревью #110, P2): иначе по
+        # приглашению можно было бы распылять пароль по многим аккаунтам.
+        ip_retry = auth.ip_login_limiter.retry_after(ip_key) if trusted else 0
         user = db.execute(select(User).where(User.email == email_norm)).scalars().first()
         if user is None or not auth.verify_password(body.password, user.pw_hash):
             auth.login_limiter.hit(acc_key)
-            if acc_retry:
+            if trusted:
+                auth.ip_login_limiter.hit(ip_key)
+            if acc_retry or ip_retry:
                 raise HTTPException(
                     status_code=429,
                     detail="Слишком много неудачных попыток входа в этот аккаунт. "
@@ -547,6 +589,8 @@ def api_invite_accept(body: InviteAcceptIn, request: Request, db: Session = Depe
                 )
             raise HTTPException(status_code=403, detail="Неверный e-mail или пароль")
         auth.login_limiter.reset(acc_key)
+        if trusted:
+            auth.ip_login_limiter.reset(ip_key)
     elif body.mode == "register":
         if not email_norm or "@" not in email_norm:
             raise HTTPException(status_code=422, detail="Укажите корректный e-mail")
