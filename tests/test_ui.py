@@ -1764,6 +1764,16 @@ def _loss_width(browser, base: str) -> None:
                 page.wait_for_function("() => document.querySelectorAll('#tb tr').length > 1",
                                        timeout=45000)
                 page.wait_for_timeout(800)
+                # UI2 (D-84): блок переехал из верха страницы в свёрнутый раздел
+                # «Деньги в товаре и маржа» внизу. Раскрываем его так, как это
+                # делает человек, и дальше проверяем ту же геометрию, что прежде.
+                fold = page.locator("#money-fold > summary")
+                fold.scroll_into_view_if_needed()
+                closed = page.evaluate("() => !document.getElementById('money-fold').open")
+                check(f"{tag} /turnover [{mode}]: раздел «Деньги в товаре и маржа» по умолчанию свёрнут",
+                      closed is True, str(closed))
+                (fold.tap if touch else fold.click)(timeout=5000)
+                page.wait_for_timeout(300)
                 g = page.evaluate(_LOSS_GEOM_JS, vw)
                 label = f"{tag} /turnover [{mode}]"
                 check(f"{label}: блок «Торгуете в минус» показан, в нём есть позиции",

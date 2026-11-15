@@ -235,6 +235,8 @@ SUITES = [
     # «Сотрудники и роли» для не-владельца: активно только то, что разрешит сервер.
     ("team_ui", "test_team_ui.py", False, False),
     ("ui_day_15_11", "test_ui_day_15_11.py", False, False),
+    # UI2 (D-84): «Оборачиваемость» в новом виде и подсказки по клику. Браузерный.
+    ("ui2_turnover", "test_ui2_turnover.py", False, False),
     ("deps",        "test_dependencies.py",    False, False),
 ]
 
