@@ -1231,11 +1231,52 @@ def api_order_status(
         _apply_remainder_to_incoming(db, ctx.org.id, items_at_change, pushed_at_change, -1)
     if body.status == "received":
         _record_execution(db, ctx, order, body.received, now)
+        _demo_stock_on_receive(db, ctx.org.id, order.id, items_at_change)
     db.commit()
     db.expire(order)
     analytics.invalidate(ctx.org.id)
     return {"ok": True, "status": body.status,
             "received_at": now.isoformat() if body.status == "received" else None}
+
+
+def _demo_stock_on_receive(db: Session, org_id: int, order_id: int, items: list[dict]) -> None:
+    """Демо-организация: «Принят на склад» кладёт пришедшее на остаток.
+
+    Живые данные не трогаются (demo_seed.is_demo_org). Сколько класть: принятое
+    по строкам приёмки, если его назвали (в том числе частями раньше), иначе
+    заказанное по строкам заказа с размерами.
+    """
+    from app import demo_seed
+    from app.models import OrderReceipt
+    if not demo_seed.is_demo_org(db, org_id):
+        return
+    db.flush()
+    got: dict[str, float] = {}
+    for base, qty in db.execute(
+        select(OrderReceipt.base_name, func.sum(OrderReceipt.qty))
+        .where(OrderReceipt.org_id == org_id, OrderReceipt.order_id == order_id)
+        .group_by(OrderReceipt.base_name)
+    ).all():
+        if float(qty or 0) > 0:
+            got[base] = float(qty)
+    spec: dict = {}
+    if got:
+        spec = dict(got)
+    else:
+        for it in items:
+            base = str(it.get("base_name") or "")
+            if not base or int(it.get("qty") or 0) <= 0:
+                continue
+            sizes = {k: float(v or 0) for k, v in (it.get("sizes") or {}).items() if float(v or 0) > 0}
+            if sizes and sum(sizes.values()) == int(it.get("qty") or 0):
+                cur = spec.get(base) if isinstance(spec.get(base), dict) else {}
+                for k, v in sizes.items():
+                    cur[k] = cur.get(k, 0.0) + v
+                spec[base] = cur
+            else:
+                spec[base] = float(spec.get(base, 0) if not isinstance(spec.get(base), dict) else 0) + int(it["qty"])
+    if spec:
+        demo_seed.simulate_receipt(db, org_id, spec)
 
 
 def _record_execution(db: Session, ctx: AuthContext, order: ProductionOrder,

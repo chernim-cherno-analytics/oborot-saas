@@ -22,6 +22,7 @@ from sqlalchemy import delete, func, insert, select
 from sqlalchemy.orm import Session
 
 from app.models import (
+    Connection,
     Org,
     OrderedQty,
     Product,
@@ -257,6 +258,65 @@ def _largest_remainder(total: int, weights: list[float]) -> list[int]:
     for i in range(total - sum(alloc)):
         alloc[order[i % len(order)]] += 1
     return alloc
+
+
+def is_demo_org(db: Session, org_id: int) -> bool:
+    """Организация на демо-данных: демо-подключение есть, МойСклада нет."""
+    kinds = {k for (k,) in db.execute(
+        select(Connection.kind).where(Connection.org_id == org_id)).all()}
+    return "demo" in kinds and "moysklad" not in kinds
+
+
+def simulate_receipt(db: Session, org_id: int, qty_by_base: dict[str, dict[str, float] | float]) -> int:
+    """Демо: «Принят на склад» кладёт штуки на последний день остатков.
+
+    На живой организации остаток после приёмки привозит синк из МойСклада. В
+    демо синка нет, и после закрытия заказа остаток не рос, а «Заказ» снова
+    просил те же штуки (QA 15.11: на показе пилоту читается как «заказ не
+    помог»). Только для демо-организации; живые данные эта функция не трогает
+    (вызывающий проверяет is_demo_org).
+
+    qty_by_base: база -> {размер: штук} или общее число (тогда делится по
+    размерам пропорционально текущему остатку, при нулевом остатке поровну).
+    Возвращает, сколько штук положено.
+    """
+    latest = db.execute(select(func.max(StockDay.date)).where(StockDay.org_id == org_id)).scalar()
+    if not latest:
+        return 0
+    wh = db.execute(select(Warehouse.id).where(Warehouse.org_id == org_id, Warehouse.active.is_(True))
+                    .order_by(Warehouse.id)).scalars().first()
+    added = 0
+    for base, spec in qty_by_base.items():
+        prods = db.execute(select(Product).where(Product.org_id == org_id, Product.base_name == base)
+                           .order_by(Product.id)).scalars().all()
+        if not prods:
+            continue
+        stock = {p.id: float(db.get(StockDay, (org_id, p.id, latest)).qty)
+                 if db.get(StockDay, (org_id, p.id, latest)) else 0.0 for p in prods}
+        if isinstance(spec, dict) and any(float(v or 0) > 0 for v in spec.values()):
+            by_size = {p.size: p for p in prods}
+            plan = {by_size[sz].id: int(round(float(q))) for sz, q in spec.items()
+                    if sz in by_size and float(q or 0) > 0}
+        else:
+            total = int(round(float(spec if not isinstance(spec, dict) else 0)))
+            weights = [stock[p.id] or 1.0 for p in prods] if any(stock.values()) else [1.0] * len(prods)
+            plan = dict(zip([p.id for p in prods], _largest_remainder(total, weights)))
+        for pid, q in plan.items():
+            if q <= 0:
+                continue
+            row = db.get(StockDay, (org_id, pid, latest))
+            if row is None:
+                db.add(StockDay(org_id=org_id, product_id=pid, date=latest, qty=float(q)))
+            else:
+                row.qty = float(row.qty or 0) + q
+            if wh is not None:
+                ws = db.get(WarehouseStock, (org_id, pid, wh))
+                if ws is None:
+                    db.add(WarehouseStock(org_id=org_id, product_id=pid, warehouse_id=wh, qty=float(q)))
+                else:
+                    ws.qty = float(ws.qty or 0) + q
+            added += q
+    return added
 
 
 #: Таблицы слоя «Поставки» в порядке удаления — от ссылающихся к тем, на кого
