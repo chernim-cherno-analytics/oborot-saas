@@ -83,6 +83,10 @@ with TestClient(app, headers={"X-Oborot-CSRF": "1"}) as a:
         row = next((i for i in forced["items"] if i["base_name"] == one), None)
         check("галочка «Взять» возвращает позицию как решение человека",
               row is not None and row.get("forced_by_user") is True, str(row)[:200])
+        check("взятая позиция остаётся в списке «в минус», чтобы снять галочку там же",
+              one in {r["base_name"] for r in forced["review"].get("below_cost", [])})
+        html = (ROOT / "templates" / "assistant.html").read_text(encoding="utf-8")
+        check("мастер помнит бюджет в черновике", 'budget: bEl ? parseNum("budget") : null' in html)
 
     bud = a.get("/api/budget?amount=500000").json()
     bud_names = {r["base_name"] for r in bud.get("excluded_loss", [])}

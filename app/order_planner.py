@@ -787,6 +787,9 @@ def _candidates(snap: dict, brief: dict, ctx: dict) -> tuple[list[dict], dict]:
         # D-76: «в минус» не рекомендуем; галочка «Взять» берёт как решение человека.
         if row["below_cost"] and base in must:
             row["forced_by_user"] = True
+            # Прогон 15.11: взятая галочкой позиция остаётся в списке «в минус»
+            # (с отмеченной галочкой), чтобы её можно было снять там же.
+            skipped["below_cost"].append(row)
         if row["below_cost"] and base not in must:
             skipped["below_cost"].append(row)
             continue
