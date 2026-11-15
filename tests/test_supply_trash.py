@@ -57,6 +57,24 @@ with TestClient(app, headers={"X-Oborot-CSRF": "1"}) as c, TestClient(app, heade
     check("возврат работает", r.status_code == 200 and any(x["id"] == m["id"] for x in r.json()["materials"]),
           r.text[:160])
     check("после возврата корзина пуста", r.json()["trash"] == [], str(r.json()["trash"]))
+    print("партия с назначением")
+    it = [i for i in c.post(P + "/items", json={"title": "Куртка", "kind": "draft", "op_id": "t-i1"}).json()["items"]
+          if i["title"] == "Куртка"][0]
+    bt = [b for b in c.post(P + "/batches", json={"item_id": it["id"], "title": "Осень", "plan_qty": 10,
+                                                  "op_id": "t-b1"}).json()["batches"] if b["title"] == "Осень"][0]
+    m2 = [m for m in c.post(P + "/materials", json={"title": "Подклад", "qty": "30", "unit": "м",
+                                                    "op_id": "t-m2"}).json()["materials"] if m["title"] == "Подклад"][0]
+    r = c.post(P + "/assignments", json={"material_id": m2["id"], "batch_id": bt["id"], "qty": 12, "op_id": "t-as1"})
+    check("назначение создано", r.status_code == 200, r.text[:160])
+    bt = next(x for x in r.json()["batches"] if x["id"] == bt["id"])
+    c.post(P + f"/batches/{bt['id']}/archive", json={"rev": bt["rev"], "op_id": "t-ab1"})
+    tr = c.get(P).json()["trash"]
+    check("партия в корзине", any(x["kind"] == "batch" and x["id"] == bt["id"] for x in tr), str(tr))
+    r = c.post(P + f"/batches/{bt['id']}/restore", json={"op_id": "t-rb1"})
+    rs = r.json().get("restored") or {}
+    check("возврат партии сообщает, сколько снова в распределении", r.status_code == 200 and rs.get("assignments") == 1
+          and float(rs.get("qty") or 0) == 12, str(rs))
+    check("страница показывает это число в тосте", "снова в распределении" in c.get("/supply").text)
     page = c.get("/supply").text
     check("на странице есть блок «Удалённые за 30 дней»", 'id="pl-trash"' in page and "renderTrash" in page)
 

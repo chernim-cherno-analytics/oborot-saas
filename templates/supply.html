@@ -3978,7 +3978,16 @@ document.addEventListener("DOMContentLoaded", function () {
         btn.addEventListener("click", function () {
           send("/api/supply/planning/" + TRASH_URL[r.kind] + "/" + r.id + "/restore",
                {op_id: opId()}, null,
-               function (ok) { if (ok) plToast("Вернули: " + (r.title || ""), {ms: 3000}); },
+               function (ok, data2) {
+                 if (!ok) return;
+                 // Партия возвращается вместе с назначениями (решение
+                 // владельца): говорим числом, сколько снова в распределении,
+                 // как тост «Вернуть» сразу после удаления (ревью #133).
+                 var on = (data2 && data2.restored) || {};
+                 plToast(on.assignments
+                   ? ("Партия вернулась · " + fmt(on.qty) + " снова в распределении")
+                   : ("Вернули: " + (r.title || "")), {ms: 4000});
+               },
                {kind: r.kind, id: r.id, quiet: true});
         });
         row.appendChild(btn);
