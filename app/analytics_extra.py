@@ -134,7 +134,7 @@ def build_budget(
     партий, кратности и этапов, и на 200 000 ₽ давал 5 позиций / 42 шт, когда
     мастер давал 30 позиций / 75 шт, и клал в заказ позиции ниже минимальной
     партии фабрики. Теперь это `order_planner.build_plan` со стратегией
-    «Заработать максимум» (ширина до полной потребности, начиная с топов по
+    «Глубже в топ» (grow: ширина до полной потребности, начиная с топов по
     оборачиваемости), лимитом доли из страницы и бюджетом «весь заказ
     целиком» (сумма = полная себестоимость, как всегда на этой странице).
     Канал: выбранный на странице или основной; позиции других каналов
@@ -233,7 +233,10 @@ def build_budget(
         "max_share": max_share,
         "horizon_days": horizon,
         "rate_window": rate_window,
-        "rate_window_label": RATE_WINDOW_RU.get(rate_window, RATE_WINDOW_RU["year"]),
+        # D-79: при окнах «год» и «90 дней» темп с поправкой на сезон
+        # (прогон 15.11: подпись «темп за год» при сезонном темпе в колонке).
+        "rate_window_label": RATE_WINDOW_RU.get(rate_window, RATE_WINDOW_RU["year"])
+        + ("" if rate_window == "season" else ", с поправкой на сезон"),
         "fresh_days": int(review.get("fresh_days") or FRESH_DAYS),
         "used": used,
         "rest": max(0, int(amount) - used),

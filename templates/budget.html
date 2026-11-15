@@ -115,7 +115,7 @@
       «Заказ» отвечает «сколько нужно, чтобы хватило на горизонт» и не смотрит на деньги.
       «Бюджет» отвечает «есть N рублей: на что их потратить, чтобы они отработали лучше всего».
       Деньги идут строго по оборачиваемости: сначала каждой позиции-лидеру до полной потребности, потом
-      следующим, пока деньги не кончатся (стратегия мастера «Заработать максимум»).</p>
+      следующим, пока деньги не кончатся (стратегия мастера «Глубже в топ» с лимитом «Макс. на позицию» с этой страницы; в мастере у неё свой лимит по умолчанию 60%).</p>
       <p>Потребность та же, что на «Заказе» и в мастере: темп продаж (с поправкой на сезон того периода, когда
       партия будет продаваться) × горизонт − прогнозный остаток к приходу (остаток минус продажи за срок
       производства, плюс «едет»). Условия производства применяются: минимальная партия, кратность упаковки
@@ -417,7 +417,7 @@
         '<div class="card"><div class="l">Бюджет</div><div class="v">'+fmtR(d.amount)+'</div><div class="s">макс. на позицию '+d.max_share+'%</div></div>'+
         '<div class="card"><div class="l">Использовано</div><div class="v">'+fmtR(d.used)+'</div><div class="s">остаток '+fmtR(d.rest)+'</div></div>'+
         '<div class="card"><div class="l">Позиций / штук</div><div class="v">'+fmt(t.positions)+' / '+fmt(t.units)+'</div><div class="s">в заказ от бюджета</div></div>'+
-        '<div class="card" style="background:rgba(76,187,23,0.2)"><div class="l">Ожидаемая прибыль</div><div class="v">'+fmtR(t.expected_profit)+'</div><div class="s">при продаже по средней цене</div></div>';
+        '<div class="card" style="background:rgba(76,187,23,0.2)"><div class="l">Валовая маржа</div><div class="v">'+fmtR(t.expected_profit)+'</div><div class="s">до налогов и логистики, если партия разойдётся по средней цене</div></div>';
       // таблица
       var rows=(d.items||[]).map(function(x){
         return '<tr class="'+rowCls(x.turnover)+'"><td>'+esc(x.base_name)+
@@ -463,7 +463,7 @@
       var nc=d.no_cost||[];
       var ncF=document.getElementById("nocostFold");
       ncF.style.display=nc.length?"":"none";
-      document.getElementById("nocostCnt").textContent=nc.length+" позиций — проставь себес в МойСкладе";
+      document.getElementById("nocostCnt").textContent="Без себестоимости: "+nc.length+" поз. Заполните себестоимость в МойСкладе";
       document.getElementById("nocostBody").innerHTML='<table><tbody>'+nc.map(function(x){
         return '<tr><td style="text-align:left;padding-left:14px">'+esc(x.base_name)+'</td>'+
           '<td class="nb">оборач. '+fmt(x.turnover)+'</td><td class="nb">потребность '+fmt(x.need)+' шт</td></tr>';
