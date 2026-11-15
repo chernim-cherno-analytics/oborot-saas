@@ -634,6 +634,23 @@ def resolve_auth(request: Request, db: Session) -> AuthContext | None:
                        perms=perms, role_name=role_name)
 
 
+def session_lost_membership(request: Request, db: Session) -> bool:
+    """Сессия живая (пользователь и версия сходятся), но членства в её
+    организации больше нет: владелец убрал человека. Нужна только для текста
+    на странице входа (QA 15.11), доступ по-прежнему не выдаётся."""
+    sess = read_session(request)
+    if not sess:
+        return False
+    user = db.get(User, sess.get("user_id"))
+    if not user:
+        return False
+    v = sess.get("v", 0)
+    if type(v) is not int or v != user.session_version:
+        return False
+    org_id = sess.get("org_id")
+    return bool(org_id) and db.get(Membership, (user.id, org_id)) is None
+
+
 def require_auth_api(request: Request, db: Session = Depends(get_db)) -> AuthContext:
     """Зависимость для JSON API: 401 без валидной сессии."""
     ctx = resolve_auth(request, db)

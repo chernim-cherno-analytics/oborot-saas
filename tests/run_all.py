@@ -229,6 +229,7 @@ SUITES = [
     ("sync_retry_job", "test_sync_resume.py", False, False),
     # «Сотрудники и роли» для не-владельца: активно только то, что разрешит сервер.
     ("team_ui", "test_team_ui.py", False, False),
+    ("ui_day_15_11", "test_ui_day_15_11.py", False, False),
     ("deps",        "test_dependencies.py",    False, False),
 ]
 

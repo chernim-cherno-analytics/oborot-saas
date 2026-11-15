@@ -19,6 +19,8 @@
   body:not([data-perms~="catalog_edit"]) .catsel,
   body:not([data-perms~="catalog_edit"]) .disc-in,
   body:not([data-perms~="catalog_edit"]) .merge-sel,
+  /* QA 15.11: наблюдатель правил ростовку на экране, сервер отказывал. */
+  body:not([data-perms~="drafts_edit"]) input.size-rec,
   body:not([data-perms~="settings"]) #rate-seg,
   body:not([data-perms~="settings"]) .wh-toggle,
   body:not([data-perms~="settings"]) .switch,
