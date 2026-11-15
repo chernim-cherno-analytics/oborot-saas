@@ -202,6 +202,7 @@ def build_budget(
             "expected_profit": int(i.get("expected_profit") or 0),
         })
     not_included = []
+    over_cap = {r["base_name"]: r for r in (plan.get("moq_over_cap") or [])}
     for r in plan.get("not_included") or []:
         not_included.append({
             "base_name": r["base_name"],
@@ -213,6 +214,11 @@ def build_budget(
             "need_rub": r.get("need_rub"),
             "days_left": None,
             "moq_skip_days": r.get("moq_skip_days"),
+            # Почему не вошла: партия залежится, партия дороже лимита доли или
+            # деньги кончились (ревью Codex #108: не всё «деньги кончились»).
+            "reason": ("moq_skip" if r.get("moq_skip_days")
+                       else "over_cap" if r["base_name"] in over_cap else "budget"),
+            "batch_cost": (over_cap.get(r["base_name"]) or {}).get("batch_full_cost"),
         })
     review = plan.get("review") or {}
     used = int((plan.get("totals") or {}).get("cost") or 0)

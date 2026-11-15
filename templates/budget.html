@@ -443,15 +443,21 @@
       skF.style.display=sk.length?"":"none";
       // Ревью Codex #108: позиция могла не войти не из-за денег, а потому что
       // минимальная партия разошлась бы слишком долго. Причину называем.
-      var skMoq=sk.filter(function(x){ return x.moq_skip_days; }).length;
-      document.getElementById("skippedCnt").textContent=sk.length+" позиций не вошли"+
-        (skMoq===sk.length?": партия разошлась бы слишком долго":
-         (skMoq?(": деньги кончились раньше, у "+skMoq+" партия разошлась бы слишком долго"):": деньги кончились раньше"));
+      var nBud=sk.filter(function(x){ return (x.reason||"budget")==="budget"; }).length;
+      var nMoq=sk.filter(function(x){ return x.reason==="moq_skip"; }).length;
+      var nCap=sk.filter(function(x){ return x.reason==="over_cap"; }).length;
+      var why=[];
+      if(nBud) why.push("деньги кончились: "+nBud);
+      if(nMoq) why.push("партия разошлась бы слишком долго: "+nMoq);
+      if(nCap) why.push("партия дороже лимита на позицию: "+nCap);
+      document.getElementById("skippedCnt").textContent=sk.length+" позиций не вошли ("+why.join("; ")+")";
       document.getElementById("skippedBody").innerHTML='<table><tbody>'+sk.map(function(x){
         return '<tr><td style="text-align:left;padding-left:14px">'+esc(x.base_name)+'</td>'+
           '<td class="nb">оборач. '+fmt(x.turnover)+'</td><td class="nb">потребность '+fmt(x.need)+' шт</td>'+
           '<td class="nb">себес '+fmtR(x.cost_price)+'</td>'+
-          '<td class="nb">'+(x.moq_skip_days?('партия разошлась бы за '+fmt(x.moq_skip_days)+' дн'):'деньги кончились')+'</td></tr>';
+          '<td class="nb">'+(x.reason==="moq_skip"?('партия разошлась бы за '+fmt(x.moq_skip_days)+' дн')
+            :x.reason==="over_cap"?('партия дороже лимита'+(x.batch_cost?(': '+fmtR(x.batch_cost)):''))
+            :'деньги кончились')+'</td></tr>';
       }).join("")+'</tbody></table>';
       var nc=d.no_cost||[];
       var ncF=document.getElementById("nocostFold");
