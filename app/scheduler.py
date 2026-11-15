@@ -243,6 +243,12 @@ def _run_catchup_job() -> dict:
     for org_id in ms_sync.orgs_with_resume_point():
         if org_id not in stale:
             stale.append(org_id)
+    # Прод 15.11: синк, прерванный перезапуском сервера (выкладка) или иной
+    # временной причиной, повторяем в ближайший час, а не на следующее утро.
+    active = {org_id for org_id, _ts in rows}
+    for org_id in ms_sync.orgs_interrupted_transient():
+        if org_id in active and org_id not in stale:
+            stale.append(org_id)
     stale = _paid_only(stale)
     if not stale:
         return results
