@@ -1302,8 +1302,12 @@ def _demo_reconcile_receipts(db: Session, org_id: int, order: ProductionOrder,
         if was == now:
             continue
         if not isinstance(was, dict) and not isinstance(now, dict):
-            if abs(now - was) >= 0.5:
-                demo_seed.simulate_receipt(db, org_id, {b: now - was})
+            # Сравниваются округлённые накопленные итоги, а не каждая правка
+            # отдельно: пять довозов по 0,4 дают +2, а не пять раз по нулю
+            # (ревью #133).
+            d = int(round(float(now))) - int(round(float(was)))
+            if d:
+                demo_seed.simulate_receipt(db, org_id, {b: d})
             continue
         undo = {k: -v for k, v in was.items()} if isinstance(was, dict) else -float(was)
         if undo:

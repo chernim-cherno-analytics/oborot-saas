@@ -118,6 +118,13 @@ with TestClient(app, headers={"X-Oborot-CSRF": "1"}) as c:
     check("назвали 13 позже: остаток +13, а не +20", cs_of("Демо-приёмка", base5) == cs50 + 13,
           f"{cs50} -> {cs_of('Демо-приёмка', base5)}")
 
+    cs_f = cs_of("Демо-приёмка", base2)
+    for k in range(5):
+        c.post(f"/api/orders/{o2['id']}/receipts", json={"lines": [{"base_name": base2, "qty": 0.4}],
+                                                        "idempotency_key": f"frac-{k}"})
+    check("пять довозов по 0,4: остаток +2 (ревью #133)", cs_of("Демо-приёмка", base2) == cs_f + 2,
+          f"{cs_f} -> {cs_of('Демо-приёмка', base2)}")
+
     print("\n2в. Заказ с разбивкой по размерам: исправление снимает ровно с этих размеров (ревью #131)")
     def sizes_of(org_name, base):
         with sqlite3.connect(DB_PATH) as con:
