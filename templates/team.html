@@ -102,16 +102,29 @@ document.addEventListener("DOMContentLoaded", function () {
   }
 
   // ── Сотрудники ─────────────────────────────────────────────────────────────
+  // Ревью #110 (Fable, P3): не-владелец видит активными только то, что сервер
+  // ему разрешит: роли и права не шире своих.
+  function within(perms) {
+    var me = STATE.me;
+    if (me.is_owner) return true;
+    var mine = me.perms || [];
+    return (perms || []).every(function (p) { return mine.indexOf(p) >= 0; });
+  }
+  function rolePerms(roleId) {
+    var r = STATE.roles.filter(function (x) { return x.id === roleId; })[0];
+    if (!r) r = STATE.roles.filter(function (x) { return x.builtin === "employee"; })[0];
+    return r ? r.perms : [];
+  }
   function renderMembers() {
     var me = STATE.me;
     var rows = STATE.members.map(function (m) {
       var opts = STATE.roles.map(function (r) {
-        var dis = (r.builtin === "owner" && !me.is_owner) ? " disabled" : "";
+        var dis = ((r.builtin === "owner" && !me.is_owner) || !within(r.perms)) ? " disabled" : "";
         return '<option value="' + r.id + '"' + (r.id === m.role_id ? " selected" : "") + dis + ">" +
           esc(r.name) + "</option>";
       }).join("");
       if (m.role_id === null) opts = '<option value="" selected>Без роли</option>' + opts;
-      var lockOwner = m.is_owner && !me.is_owner;
+      var lockOwner = (m.is_owner && !me.is_owner) || (!m.is_self && !within(rolePerms(m.role_id)));
       return "<tr><td>" + esc(m.name || "") + (m.is_self ? ' <span class="muted-sm">(вы)</span>' : "") + "</td>" +
         "<td>" + esc(m.email || "") + "</td>" +
         '<td><select class="input m-role" data-uid="' + m.user_id + '"' + (lockOwner ? " disabled" : "") + ">" + opts + "</select></td>" +
@@ -202,7 +215,7 @@ document.addEventListener("DOMContentLoaded", function () {
     var rolesList = STATE.roles;
     var head = "<tr><th>Право</th>" + rolesList.map(function (r) {
       var cnt = '<div class="muted-sm">сотрудников: ' + r.members_count + "</div>";
-      if (!r.editable) return '<th class="role-head">' + esc(r.name) + cnt + "</th>";
+      if (!r.editable || !within(r.perms)) return '<th class="role-head">' + esc(r.name) + cnt + "</th>";
       return '<th class="role-head"><input class="input r-name" data-id="' + r.id + '" value="' + esc(r.name) +
         '" maxlength="64">' + cnt + '<div class="role-actions">' +
         '<button class="btn sm r-save" type="button" data-id="' + r.id + '">Сохранить</button>' +
@@ -218,7 +231,8 @@ document.addEventListener("DOMContentLoaded", function () {
       body += "<tr><td>" + esc(p.title) + "</td>" + rolesList.map(function (r) {
         var on = r.perms.indexOf(p.key) >= 0;
         return '<td><input type="checkbox" class="r-perm" data-id="' + r.id + '" data-key="' + p.key + '"' +
-          (on ? " checked" : "") + (r.editable ? "" : " disabled") + ' aria-label="' + esc(r.name + ": " + p.title) + '"></td>';
+          (on ? " checked" : "") + ((r.editable && within(r.perms) && within([p.key])) ? "" : " disabled") +
+          ' aria-label="' + esc(r.name + ": " + p.title) + '"></td>';
       }).join("") + "</tr>";
     });
     document.getElementById("roles-box").innerHTML =
