@@ -379,16 +379,12 @@
   .modal .warn { font-size: 12px; color: #a15c00; background: rgba(255,204,0,.15);
     border: 1px solid rgba(255,204,0,.4); border-radius: 10px; padding: 8px 12px; margin-top: 10px; display: none; }
   .modal .actions { display: flex; gap: 10px; margin-top: 18px; justify-content: flex-end; }
-  /* SEC-2 (D-69): действия только владельца участнику не показываем. */
-  body[data-role="member"] .owner-only, body[data-role="member"] .arch-btn,
-  body[data-role="member"] .unarch-btn, body[data-role="member"] .ord-del,
-  body[data-role="member"] #send-btn { display: none !important; }
-  body[data-role="member"] .ordin, body[data-role="member"] .catsel { pointer-events: none; opacity: .6; }
 </style>
 {% include "_mobile.html" %}
 {% include "_app_shell_head.html" %}
+{% include "_perms_css.html" %}
 </head>
-<body data-role="{{ role|default('owner') }}">
+<body data-role="{{ role|default('owner') }}" data-perms="{{ (perms if perms is defined else perm_keys)|join(' ') }}">
 {% include "_embed.html" %}
 <div class="gradient-bg"></div>
 {% include "_app_shell.html" %}
@@ -434,9 +430,9 @@
     </div>
     <input class="search" id="search" placeholder="Поиск по названию..." autocomplete="off">
     <span class="draft-note" id="draft-note"></span>
-    <button class="abtn" id="btn-reset-drafts" type="button" style="display:none">↺ Сбросить правки</button>
+    <button class="abtn need-drafts_reset_all" id="btn-reset-drafts" type="button" style="display:none">↺ Сбросить правки</button>
     <button class="abtn" type="button" id="btn-export-xlsx" title="Выгрузить в Excel отмеченные галочкой позиции">⬇ Excel</button>
-    <button class="abtn primary" id="btn-create-order" type="button" disabled>+ Оформить размещение</button>
+    <button class="abtn primary need-orders_create" id="btn-create-order" type="button" disabled>+ Оформить размещение</button>
   </div>
 
   {# PILOT-ORDER-CATEGORY-SCOPE-1. Состав заказа по категориям — отдельно от
@@ -973,14 +969,14 @@
       var st=ordStatusText(o.status);
       var btns='';
       if(o.status==="draft")
-        btns='<button class="mvbtn ord-send" data-id="'+o.id+'">▶ В производство</button> ';
+        btns='<button class="mvbtn ord-send need-orders_manage" data-id="'+o.id+'">▶ В производство</button> ';
       if(o.status==="sent")
-        btns='<button class="mvbtn ord-recv" data-id="'+o.id+'" title="Заказ приехал: снимет количество из «Едет», остатки подтянет синхронизация">✓ Принят на склад</button> ';
+        btns='<button class="mvbtn ord-recv need-orders_manage" data-id="'+o.id+'" title="Заказ приехал: снимет количество из «Едет», остатки подтянет синхронизация">✓ Принят на склад</button> ';
       /* Приёмка — только у отправленного: черновику сервер отвечает 422
          («принимать нечего»), и кнопка, которая всегда получает отказ, врала
          бы о доступном действии. */
       if(o.status!=="draft")
-        btns+='<button class="mvbtn ord-receipts" data-id="'+o.id+'" title="Что фактически принято по заказу">Приёмка</button> ';
+        btns+='<button class="mvbtn ord-receipts need-orders_manage" data-id="'+o.id+'" title="Что фактически принято по заказу">Приёмка</button> ';
       /* ORDER-EXPORT-1: файл для цеха — состав заказа как он сохранён,
          с сеткой размеров и календарём платежей. Обычная ссылка: браузер
          скачает файл, сессия и гейт те же, что у всех выгрузок. */
@@ -1104,7 +1100,7 @@
         '<td class="nb" data-label="Позиций">'+fmt(o.positions)+'</td>'+
         '<td class="nb" data-label="Шт">'+fmt(o.total_qty)+'</td>'+
         '<td><span class="stbadge g">'+ordStatusText(o.status)+'</span></td>'+
-        '<td class="ord-actions"><button class="mvbtn ord-receipts" data-id="'+o.id+'" '+
+        '<td class="ord-actions"><button class="mvbtn ord-receipts need-orders_manage" data-id="'+o.id+'" '+
             'title="Что фактически принято по заказу">Приёмка</button> '+
             '<a class="mvbtn ord-xlsx" href="/api/orders/'+o.id+'/export.xlsx" title="Excel заказа: модели по размерам, суммы и платежи">⬇ Excel</a>'+
             ORD_HELP_RECEIVED+'</td></tr>';
@@ -1732,8 +1728,8 @@
     var ex=extraProds();
     if(!ex.length) return '<span class="muted" style="font-size:10px">—</span>';
     if(!IS_OWNER){
-      // Перенос позиции между производствами — тоже owner-only
-      // (require_owner_api у /api/productions/assign): участнику показываем
+      // Перенос позиции между производствами под правом settings
+      // (require_perm у /api/productions/assign): без права показываем
       // текущее производство текстом, без кнопки, которой он не сможет воспользоваться.
       if(prodOf(it.base_name)!==MAIN_ID){
         var cur=PRODS.find(function(x){ return x.id===prodOf(it.base_name); });
@@ -2245,7 +2241,8 @@
   // того, прятать ли owner-only управление производствами (см. renderTabs,
   // prodCell). Как эту роль отдаёт /api/settings — см. templates/settings.html.
   api("/api/settings").then(function(s){
-    IS_OWNER=s.role==="owner";
+    // Роли (15.11.2026): управление производствами под правом settings.
+    IS_OWNER=!!(s.perms&&s.perms.indexOf("settings")>=0);
     renderTabs();
   }).catch(function(){ /* не удалось узнать роль — оставляем как есть */ });
   load();

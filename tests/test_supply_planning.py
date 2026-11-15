@@ -988,7 +988,7 @@ def run() -> int:
     # ── 18. Миграция: аддитивна, идемпотентна, прежние шаги сохранены ────────
     print("\n== Миграция: новый шаг сверху, старые четырнадцать не тронуты ==")
     from app.main import STARTUP_SCHEMA_STEPS
-    check("шагов старта семнадцать", len(STARTUP_SCHEMA_STEPS) == 17,
+    check("шагов старта восемнадцать", len(STARTUP_SCHEMA_STEPS) == 18,
           str(len(STARTUP_SCHEMA_STEPS)))
     check("первые десять пар (id, позиция) не изменились",
           STARTUP_SCHEMA_STEPS[:10] == (
@@ -1035,8 +1035,12 @@ def run() -> int:
     # номера 15 и 16 заняли шаги чужого пакета, и они уже выпущены. Свой,
     # ещё не выпущенный номер подвинуть можно; чужой выпущенный — нет.
     check("миниатюра эскиза дописана в конец с новым id и позицией 17",
-          STARTUP_SCHEMA_STEPS[16:] == (("models.ensure_supply_sketch_thumb_schema", 17),),
-          str(STARTUP_SCHEMA_STEPS[16:]))
+          STARTUP_SCHEMA_STEPS[16:17] == (("models.ensure_supply_sketch_thumb_schema", 17),),
+          str(STARTUP_SCHEMA_STEPS[16:17]))
+    # Роли сотрудников (15.11.2026): следующий append-only шаг, позиция 18.
+    check("роли дописаны в конец с новым id и позицией 18",
+          STARTUP_SCHEMA_STEPS[17:] == (("models.ensure_roles_schema", 18),),
+          str(STARTUP_SCHEMA_STEPS[17:]))
 
     # «Старая» база: таблиц слоя нет вовсе — шаг обязан их создать и не упасть
     # при повторном вызове.

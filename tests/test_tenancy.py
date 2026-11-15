@@ -282,6 +282,12 @@ def _sample_value(column):
         return 1.0
     if "BOOL" in kind:
         return False
+    # Обязательная DATETIME без значения по умолчанию (впервые у приглашений
+    # в организацию, роли 15.11.2026): SQLite-диалект принимает только объект
+    # datetime, строка уронила бы засев раньше первой проверки.
+    if "DATETIME" in kind or "TIMESTAMP" in kind:
+        from datetime import datetime as _dt
+        return _dt(2026, 1, 1)
     return "2026-01-01" if column.name == "date" else "x"
 
 
@@ -332,7 +338,13 @@ def _seed_org(session, org_name: str, email: str) -> tuple[int, int]:
             if (column.nullable or column.default is not None
                     or column.server_default is not None):
                 continue
-            setattr(row, column.name, _sample_value(column))
+            value = _sample_value(column)
+            if column.unique and isinstance(value, str):
+                # Уникальная строка (впервые: отпечаток токена приглашения,
+                # роли 15.11.2026): засев двух организаций не должен упасть
+                # на собственной заглушке.
+                value = f"{value}-{org_name}"
+            setattr(row, column.name, value)
         session.add(row)
         session.flush()
         made.setdefault(model.__tablename__, getattr(row, "id", None))

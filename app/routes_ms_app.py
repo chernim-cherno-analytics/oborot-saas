@@ -119,6 +119,17 @@ async def ms_app_entry(
             user_id=user.id, org_id=org.id,
             role="member" if has_owner else "owner",
         ))
+        db.commit()
+        if has_owner:
+            # Роли (15.11.2026): сотрудник аккаунта МойСклада получает роль
+            # «Сотрудник», то есть ровно прежние права участника. Отдельным
+            # коммитом после членства: ленивое создание встроенных ролей само
+            # коммитит и при гонке откатывает только свою вставку.
+            from app import roles as _roles
+            builtin = _roles.ensure_builtin_roles(db, org.id)
+            member = db.get(Membership, (user.id, org.id))
+            if member is not None and member.role == "member" and member.role_id is None:
+                member.role_id = builtin[_roles.EMPLOYEE].id
     db.commit()
 
     response = RedirectResponse("/", status_code=302)

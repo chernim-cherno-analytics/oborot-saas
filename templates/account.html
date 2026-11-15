@@ -30,13 +30,16 @@
         <span class="avatar">{{ (user.name or user.email)[:1]|upper }}</span>
         <div>
           <div class="nm">{{ user.name or user.email }}</div>
-          <div class="em">{{ user.email }} · <span id="acc-role">…</span> организации «{{ org.name }}»</div>
+          <div class="em">{{ user.email }} · роль <span id="acc-role">…</span> в организации «{{ org.name }}»</div>
         </div>
       </div>
       <div class="hint" style="margin-top:12px;">
         Здесь можно сменить пароль и удалить аккаунт. Настройки аналитики, склады и
         подключение к данным — на странице <a href="/settings">Настройки</a>,
         тарифы и оплата — на странице <a href="/plans">Тарифы</a>.
+      </div>
+      <div class="hint need-users_manage" style="margin-top:8px;">
+        Сотрудники, их роли и приглашения: <a href="/team">Сотрудники и роли</a>.
       </div>
     </div>
   </div>
@@ -90,7 +93,7 @@ document.addEventListener("DOMContentLoaded", function () {
   api("/api/account").then(function (d) {
     acc = d || {};
     document.getElementById("acc-role").textContent =
-      acc.role === "owner" ? "владелец" : "участник";
+      "«" + (acc.role_name || (acc.role === "owner" ? "Владелец" : "Сотрудник")) + "»";
     renderDelete();
   }).catch(function () {
     document.getElementById("del-box").innerHTML =
@@ -152,7 +155,9 @@ document.addEventListener("DOMContentLoaded", function () {
     var others = acc.others || [];
     var html = "";
 
-    if (acc.role !== "owner") {
+    // Владелец при втором владельце уходит сам, организация остаётся (роли).
+    var otherOwner = others.some(function (o) { return o.role === "owner"; });
+    if (acc.role !== "owner" || otherOwner) {
       html += '<p style="margin:0 0 6px; font-size:13px;">Будет удалён <b>только ваш аккаунт</b>: ' +
         "вход в «Оборот» под " + esc(acc.user.email) + " перестанет работать.</p>" +
         '<p style="margin:0 0 10px; font-size:13px;">Данные организации «' + esc(acc.org.name) +

@@ -12,7 +12,7 @@ GET  /api/notify/settings           — Telegram-настройки + имя б�
 POST /api/notify/settings           — сохранить chat_id и флаги уведомлений
 POST /api/notify/test               — тестовое сообщение «Оборот подключён»
 
-Все ручки — только для владельца организации (require_owner_api).
+Все ручки закрыты правами ролей (require_perm, app/roles.py): подключение и синк под правом settings, отправка заказа в МойСклад под orders_push_ms.
 """
 import html
 import time as _time
@@ -25,7 +25,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app import ms_sync, ms_writeback, notify, subscription
-from app.auth import AuthContext, require_auth_api, require_owner_api
+from app.auth import AuthContext, require_auth_api, require_perm
 from app.crypto import decrypt_token, encrypt_token
 from app.db import get_db
 from app.models import Connection, ProductionOrder, Warehouse
@@ -104,7 +104,7 @@ class MoyskladConnectIn(BaseModel):
 @router.post("/connect/moysklad")
 async def api_connect_moysklad(
     body: MoyskladConnectIn,
-    ctx: AuthContext = Depends(require_owner_api),
+    ctx: AuthContext = Depends(require_perm("settings")),
     db: Session = Depends(get_db),
 ):
     """Проверяет токен живым запросом к МойСклад и сохраняет шифрованным."""
@@ -170,7 +170,7 @@ async def api_connect_moysklad(
 
 @router.get("/connect/moysklad/stores")
 async def api_moysklad_stores(
-    ctx: AuthContext = Depends(require_owner_api), db: Session = Depends(get_db)
+    ctx: AuthContext = Depends(require_perm("settings")), db: Session = Depends(get_db)
 ):
     """Список складов аккаунта МойСклад + текущий выбор (если был)."""
     token = _require_token(db, ctx.org.id)
@@ -215,7 +215,7 @@ class StoresSelectIn(BaseModel):
 @router.post("/connect/moysklad/stores")
 async def api_moysklad_stores_select(
     body: StoresSelectIn,
-    ctx: AuthContext = Depends(require_owner_api),
+    ctx: AuthContext = Depends(require_perm("settings")),
     db: Session = Depends(get_db),
 ):
     """Сохраняет выбор складов: Warehouse на каждый склад МС, выбранные active=1."""
@@ -260,7 +260,7 @@ async def api_moysklad_stores_select(
 
 @router.post("/sync/initial")
 def api_sync_initial(
-    ctx: AuthContext = Depends(require_owner_api), db: Session = Depends(get_db)
+    ctx: AuthContext = Depends(require_perm("settings")), db: Session = Depends(get_db)
 ):
     """Фоновый запуск первичной синхронизации.
 
@@ -289,7 +289,7 @@ def api_sync_initial(
 
 @router.post("/sync/run")
 def api_sync_run(
-    ctx: AuthContext = Depends(require_owner_api), db: Session = Depends(get_db)
+    ctx: AuthContext = Depends(require_perm("settings")), db: Session = Depends(get_db)
 ):
     """Инкрементальный синк: остатки на сегодня, цены, продажи за 3 дня."""
     _require_token(db, ctx.org.id)
@@ -308,7 +308,7 @@ def api_sync_run(
 
 
 @router.get("/sync/status")
-def api_sync_status(ctx: AuthContext = Depends(require_owner_api)):
+def api_sync_status(ctx: AuthContext = Depends(require_perm("settings"))):
     """Состояние синхронизации для онбординга (поллинг раз в 1–2 секунды)."""
     return ms_sync.get_status(ctx.org.id)
 
@@ -401,7 +401,7 @@ def api_order_ms_doc(
 @router.post("/orders/{order_id}/push-to-ms")
 async def api_order_push_to_ms(
     order_id: int = _id_path(),
-    ctx: AuthContext = Depends(require_owner_api),
+    ctx: AuthContext = Depends(require_perm("orders_push_ms")),
     db: Session = Depends(get_db),
 ):
     """Создаёт в МойСклад документ «Заказ поставщику» из позиций заказа.
@@ -698,7 +698,7 @@ def _notify_settings_out(row) -> dict:
 
 @router.get("/notify/settings")
 def api_notify_settings_get(
-    ctx: AuthContext = Depends(require_owner_api), db: Session = Depends(get_db)
+    ctx: AuthContext = Depends(require_perm("settings")), db: Session = Depends(get_db)
 ):
     """Текущие Telegram-настройки организации (создаёт дефолтные при первом заходе)."""
     return _notify_settings_out(notify.get_settings(db, ctx.org.id))
@@ -715,7 +715,7 @@ class NotifySettingsIn(BaseModel):
 @router.post("/notify/settings")
 def api_notify_settings_save(
     body: NotifySettingsIn,
-    ctx: AuthContext = Depends(require_owner_api),
+    ctx: AuthContext = Depends(require_perm("settings")),
     db: Session = Depends(get_db),
 ):
     """Сохраняет chat_id и флаги уведомлений."""
@@ -743,7 +743,7 @@ class NotifyTestIn(BaseModel):
 @router.post("/notify/test")
 def api_notify_test(
     body: NotifyTestIn | None = None,
-    ctx: AuthContext = Depends(require_owner_api),
+    ctx: AuthContext = Depends(require_perm("settings")),
     db: Session = Depends(get_db),
 ):
     """Шлёт тестовое сообщение «Оборот подключён» в указанный/сохранённый чат."""

@@ -209,8 +209,8 @@ document.addEventListener("DOMContentLoaded", function () {
         "МойСклада. Счёт от нас для этого не нужен.</p>";
       return;
     }
-    if (data.role !== "owner") {
-      box.innerHTML = '<p class="hint" style="margin:0;">Счёт запрашивает владелец организации. ' +
+    if (!data.can_billing) {
+      box.innerHTML = '<p class="hint" style="margin:0;">Счёт запрашивает владелец организации или сотрудник с правом «Тариф и оплата». ' +
         "Попросите его открыть эту страницу — или напишите нам, поможем.</p>";
       return;
     }

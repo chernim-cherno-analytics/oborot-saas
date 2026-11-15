@@ -13,8 +13,9 @@
      REVIEW_REJECT r1, см. _app_shell_head.html): не загрузился скрипт —
      список разделов остаётся развёрнутым и рабочим. #}
   <script src="/static/shell.js" defer></script>
+  {% if perms is defined %}{% include "_perms_css.html" %}{% endif %}
 </head>
-<body class="{% if embedded %}embed {% endif %}{% block bodyclass %}{% endblock %}">
+<body class="{% if embedded %}embed {% endif %}{% block bodyclass %}{% endblock %}"{% if perms is defined %} data-perms="{{ perms|join(' ') }}"{% endif %}>
 {% block body %}
 {% if embedded %}
 {# ── Встроенный режим: внутри iframe раздела «Приложения» МойСклад. ──────────
@@ -131,6 +132,7 @@
             <div class="up-mail">{{ user.email }}</div>
           </div>
           <a class="up-item" href="/settings">Настройки</a>
+          {% if perms is defined and 'users_manage' in perms %}<a class="up-item" href="/team">Сотрудники и роли</a>{% endif %}
           <form method="post" action="/logout">
             <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
             <button type="submit">Выйти</button>

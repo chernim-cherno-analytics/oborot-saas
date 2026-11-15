@@ -1,0 +1,276 @@
+{% extends "base.html" %}
+{% block content %}
+{# «Сотрудники и роли» (решение владельца 15.11.2026). Данные и все действия
+   через /api/team*: под правом users_manage, сервер проверяет каждое действие
+   сам (app/routes_team.py), интерфейс только показывает. #}
+<style>
+  .team-grid { display: grid; gap: 18px; }
+  .team-table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  .team-table th, .team-table td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line, rgba(0,0,0,.08)); vertical-align: middle; }
+  .team-table th { font-size: 12px; font-weight: 600; color: var(--text-soft); }
+  .team-table select { max-width: 220px; }
+  .perm-wrap { overflow-x: auto; }
+  .perm-table { border-collapse: collapse; font-size: 13px; min-width: 100%; }
+  .perm-table th, .perm-table td { padding: 6px 10px; border-bottom: 1px solid var(--line, rgba(0,0,0,.08)); text-align: center; }
+  .perm-table th:first-child, .perm-table td:first-child { text-align: left; min-width: 260px; }
+  .perm-table .grp td { background: rgba(0,0,0,.03); font-weight: 600; font-size: 12px; text-align: left; }
+  .perm-table .role-head input { width: 140px; font-size: 12.5px; }
+  .perm-table .role-actions { display: flex; gap: 6px; justify-content: center; flex-wrap: wrap; margin-top: 6px; }
+  .invite-out { display: none; margin-top: 12px; padding: 12px 14px; border-radius: 10px; background: rgba(22,163,74,.08); }
+  .invite-out .row { display: flex; gap: 8px; }
+  .invite-out .row .input { flex: 1; min-width: 0; font-family: monospace; font-size: 12px; }
+  .muted-sm { font-size: 12px; color: var(--text-soft); }
+</style>
+
+<div class="team-grid">
+
+  <div class="card">
+    <div class="card-head"><h2>Сотрудники</h2></div>
+    <div class="card-body" id="members-box"><div class="loading-stub">Загрузка…</div></div>
+  </div>
+
+  <div class="card" id="invite">
+    <div class="card-head"><h2>Пригласить по ссылке</h2></div>
+    <div class="card-body">
+      <div class="hint" style="margin:0 0 10px;">
+        Выберите роль и создайте ссылку. Отправьте её человеку любым способом.
+        Ссылка одноразовая, действует 7 дней и показывается только один раз:
+        мы храним не саму ссылку, а её отпечаток. Потерялась, создайте новую.
+      </div>
+      <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+        <select class="input" id="invite-role" style="max-width:260px;"></select>
+        <button class="btn primary" type="button" id="invite-create">Создать ссылку</button>
+      </div>
+      <div class="invite-out" id="invite-out">
+        <div style="font-size:13px; margin-bottom:8px;" id="invite-out-title"></div>
+        <div class="row">
+          <input class="input" id="invite-link" readonly>
+          <button class="btn" type="button" id="invite-copy">Скопировать</button>
+        </div>
+      </div>
+      <div style="margin-top:16px;" id="invites-box"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-head"><h2>Роли и права</h2></div>
+    <div class="card-body">
+      <div class="hint" style="margin:0 0 10px;">
+        Просмотр данных и выгрузки в Excel доступны любой роли. Галочки ниже
+        решают, что роль может менять. Встроенные роли («Владелец», «Сотрудник»,
+        «Наблюдатель») не редактируются: для другого набора прав создайте свою.
+      </div>
+      <div class="perm-wrap" id="roles-box"><div class="loading-stub">Загрузка…</div></div>
+      <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-top:14px;">
+        <input class="input" id="new-role-name" placeholder="Название новой роли" maxlength="64" style="max-width:240px;">
+        <select class="input" id="new-role-base" style="max-width:220px;"></select>
+        <button class="btn" type="button" id="new-role-create">Создать роль</button>
+      </div>
+    </div>
+  </div>
+
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+  var STATE = null;
+
+  function load() {
+    return api("/api/team").then(render).catch(function () {
+      document.getElementById("members-box").innerHTML =
+        '<p class="muted" style="margin:0;">Не удалось загрузить.</p>';
+    });
+  }
+
+  function roleById(id) {
+    return (STATE.roles || []).filter(function (r) { return r.id === id; })[0] || null;
+  }
+
+  function fmtDate(iso) {
+    if (!iso) return "";
+    var d = new Date(iso + (iso.indexOf("Z") < 0 ? "Z" : ""));
+    return d.toLocaleDateString("ru-RU", { day: "2-digit", month: "2-digit", year: "numeric" });
+  }
+
+  function render(state) {
+    STATE = state;
+    renderMembers();
+    renderInvites();
+    renderRoles();
+  }
+
+  // ── Сотрудники ─────────────────────────────────────────────────────────────
+  function renderMembers() {
+    var me = STATE.me;
+    var rows = STATE.members.map(function (m) {
+      var opts = STATE.roles.map(function (r) {
+        var dis = (r.builtin === "owner" && !me.is_owner) ? " disabled" : "";
+        return '<option value="' + r.id + '"' + (r.id === m.role_id ? " selected" : "") + dis + ">" +
+          esc(r.name) + "</option>";
+      }).join("");
+      if (m.role_id === null) opts = '<option value="" selected>Без роли</option>' + opts;
+      var lockOwner = m.is_owner && !me.is_owner;
+      return "<tr><td>" + esc(m.name || "") + (m.is_self ? ' <span class="muted-sm">(вы)</span>' : "") + "</td>" +
+        "<td>" + esc(m.email || "") + "</td>" +
+        '<td><select class="input m-role" data-uid="' + m.user_id + '"' + (lockOwner ? " disabled" : "") + ">" + opts + "</select></td>" +
+        "<td>" + (m.is_self || lockOwner ? "" :
+          '<button class="btn sm m-remove" type="button" data-uid="' + m.user_id + '" data-name="' +
+          esc(m.name || m.email || "") + '">Убрать</button>') + "</td></tr>";
+    }).join("");
+    document.getElementById("members-box").innerHTML =
+      '<table class="team-table"><thead><tr><th>Имя</th><th>E-mail</th><th>Роль</th><th></th></tr></thead><tbody>' +
+      rows + "</tbody></table>";
+    document.querySelectorAll(".m-role").forEach(function (sel) {
+      sel.addEventListener("change", function () {
+        var uid = sel.getAttribute("data-uid");
+        api("/api/team/members/" + uid + "/role", { method: "POST", body: { role_id: Number(sel.value) } })
+          .then(function (st) { render(st); toast("Роль изменена"); })
+          .catch(function () { render(STATE); });
+      });
+    });
+    document.querySelectorAll(".m-remove").forEach(function (b) {
+      b.addEventListener("click", function () {
+        if (!confirm("Убрать «" + b.getAttribute("data-name") + "» из организации? Войти в неё он больше не сможет.")) return;
+        api("/api/team/members/" + b.getAttribute("data-uid") + "/remove", { method: "POST", body: {} })
+          .then(function (st) { render(st); toast("Сотрудник убран из организации"); });
+      });
+    });
+  }
+
+  // ── Приглашения ────────────────────────────────────────────────────────────
+  function renderInvites() {
+    var me = STATE.me;
+    var sel = document.getElementById("invite-role");
+    var keep = sel.value;
+    sel.innerHTML = STATE.roles.filter(function (r) {
+      return r.builtin !== "owner" || me.is_owner;
+    }).map(function (r) {
+      return '<option value="' + r.id + '"' + (r.builtin === "employee" ? " selected" : "") + ">" + esc(r.name) + "</option>";
+    }).join("");
+    if (keep && sel.querySelector('option[value="' + keep + '"]')) sel.value = keep;
+
+    var box = document.getElementById("invites-box");
+    if (!STATE.invites.length) {
+      box.innerHTML = '<p class="muted-sm" style="margin:0;">Активных приглашений нет.</p>';
+      return;
+    }
+    box.innerHTML = '<div class="muted-sm" style="margin-bottom:6px;">Активные приглашения</div>' +
+      '<table class="team-table"><thead><tr><th>Роль</th><th>Создал</th><th>Действует до</th><th></th></tr></thead><tbody>' +
+      STATE.invites.map(function (i) {
+        return "<tr><td>" + esc(i.role_name) + "</td><td>" + esc(i.created_by || "") + "</td><td>" +
+          fmtDate(i.expires_at) + '</td><td><button class="btn sm i-revoke" type="button" data-id="' + i.id +
+          '">Отозвать</button></td></tr>';
+      }).join("") + "</tbody></table>";
+    document.querySelectorAll(".i-revoke").forEach(function (b) {
+      b.addEventListener("click", function () {
+        api("/api/team/invites/" + b.getAttribute("data-id") + "/revoke", { method: "POST", body: {} })
+          .then(function (st) { render(st); toast("Приглашение отозвано"); });
+      });
+    });
+  }
+
+  document.getElementById("invite-create").addEventListener("click", function () {
+    var roleId = Number(document.getElementById("invite-role").value);
+    api("/api/team/invites", { method: "POST", body: { role_id: roleId } }).then(function (res) {
+      var out = document.getElementById("invite-out");
+      document.getElementById("invite-out-title").textContent =
+        "Ссылка для роли «" + res.role_name + "», действует до " + fmtDate(res.expires_at) +
+        ". Скопируйте её сейчас: второй раз мы её не покажем.";
+      document.getElementById("invite-link").value = location.origin + res.link_path;
+      out.style.display = "block";
+      load();
+    });
+  });
+
+  document.getElementById("invite-copy").addEventListener("click", function () {
+    var inp = document.getElementById("invite-link");
+    inp.select();
+    var done = function () { toast("Ссылка скопирована"); };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(inp.value).then(done, function () { document.execCommand("copy"); done(); });
+    } else {
+      document.execCommand("copy");
+      done();
+    }
+  });
+
+  // ── Роли и права ───────────────────────────────────────────────────────────
+  function renderRoles() {
+    var cat = STATE.perms_catalog;
+    var rolesList = STATE.roles;
+    var head = "<tr><th>Право</th>" + rolesList.map(function (r) {
+      var cnt = '<div class="muted-sm">сотрудников: ' + r.members_count + "</div>";
+      if (!r.editable) return '<th class="role-head">' + esc(r.name) + cnt + "</th>";
+      return '<th class="role-head"><input class="input r-name" data-id="' + r.id + '" value="' + esc(r.name) +
+        '" maxlength="64">' + cnt + '<div class="role-actions">' +
+        '<button class="btn sm r-save" type="button" data-id="' + r.id + '">Сохранить</button>' +
+        '<button class="btn sm r-del" type="button" data-id="' + r.id + '">Удалить</button></div></th>';
+    }).join("") + "</tr>";
+    var body = "";
+    var lastGroup = "";
+    cat.forEach(function (p) {
+      if (p.group !== lastGroup) {
+        body += '<tr class="grp"><td colspan="' + (rolesList.length + 1) + '">' + esc(p.group) + "</td></tr>";
+        lastGroup = p.group;
+      }
+      body += "<tr><td>" + esc(p.title) + "</td>" + rolesList.map(function (r) {
+        var on = r.perms.indexOf(p.key) >= 0;
+        return '<td><input type="checkbox" class="r-perm" data-id="' + r.id + '" data-key="' + p.key + '"' +
+          (on ? " checked" : "") + (r.editable ? "" : " disabled") + ' aria-label="' + esc(r.name + ": " + p.title) + '"></td>';
+      }).join("") + "</tr>";
+    });
+    document.getElementById("roles-box").innerHTML =
+      '<table class="perm-table"><thead>' + head + "</thead><tbody>" + body + "</tbody></table>";
+
+    var base = document.getElementById("new-role-base");
+    var keep = base.value;
+    base.innerHTML = '<option value="">Без прав (только просмотр)</option>' + rolesList.map(function (r) {
+      return '<option value="' + r.id + '">На основе «' + esc(r.name) + "»</option>";
+    }).join("");
+    if (keep && base.querySelector('option[value="' + keep + '"]')) base.value = keep;
+
+    document.querySelectorAll(".r-save").forEach(function (b) {
+      b.addEventListener("click", function () {
+        var id = b.getAttribute("data-id");
+        var perms = [];
+        document.querySelectorAll('.r-perm[data-id="' + id + '"]').forEach(function (c) {
+          if (c.checked) perms.push(c.getAttribute("data-key"));
+        });
+        var name = document.querySelector('.r-name[data-id="' + id + '"]').value;
+        api("/api/team/roles/" + id, { method: "POST", body: { name: name, perms: perms } })
+          .then(function (st) { render(st); toast("Роль сохранена"); });
+      });
+    });
+    document.querySelectorAll(".r-del").forEach(function (b) {
+      b.addEventListener("click", function () {
+        var r = roleById(Number(b.getAttribute("data-id")));
+        if (!confirm("Удалить роль «" + (r ? r.name : "") + "»?")) return;
+        api("/api/team/roles/" + b.getAttribute("data-id") + "/delete", { method: "POST", body: {} })
+          .then(function (st) { render(st); toast("Роль удалена"); });
+      });
+    });
+  }
+
+  document.getElementById("new-role-create").addEventListener("click", function () {
+    var name = document.getElementById("new-role-name").value;
+    var baseId = Number(document.getElementById("new-role-base").value || 0);
+    var baseRole = baseId ? roleById(baseId) : null;
+    var perms = baseRole ? baseRole.perms.slice() : [];
+    api("/api/team/roles", { method: "POST", body: { name: name, perms: perms } }).then(function (st) {
+      document.getElementById("new-role-name").value = "";
+      render(st);
+      toast("Роль создана: отметьте права и нажмите «Сохранить»");
+    });
+  });
+
+  load().then(function () {
+    if (location.hash === "#invite") {
+      var el = document.getElementById("invite");
+      if (el) el.scrollIntoView({ block: "start" });
+    }
+  });
+});
+</script>
+{% endblock %}

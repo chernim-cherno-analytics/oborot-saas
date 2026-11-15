@@ -62,6 +62,8 @@ def org_purge_models() -> tuple:
         Connection,
         Membership,
         NotifySettings,
+        OrgInvite,
+        OrgRole,
         OrderedQty,
         OrderPlan,
         OrderReceipt,
@@ -101,6 +103,9 @@ def org_purge_models() -> tuple:
         SkuHidden, SkuCategoryOverride, CategoryMerge, SkuDiscount,
         NotifySettings, SyncState, BillingRequest,
         Product, Warehouse, Connection, Membership,
+        # Роли (15.11.2026): приглашения ссылаются на роль, членство тоже
+        # (memberships.role_id), поэтому роли стираются последними.
+        OrgInvite, OrgRole,
     )
 
 
@@ -162,6 +167,11 @@ NON_OWNING_USER_REFERENCES: dict[tuple[str, str], str] = {
         "авторство приёмки; строка org-owned. Колонка объявлена без внешнего "
         "ключа на users.id — сторож видит её по имени, см. USER_REF_COLUMN_NAMES. "
         "Осиротевший идентификатор после удаления автора — SEC-8"
+    ),
+    ("org_invites", "created_by"): (
+        "кто выпустил приглашение; строка принадлежит организации и удаляется "
+        "в её потоке. Колонка без внешнего ключа, сторож видит её по имени. "
+        "Осиротевший идентификатор после удаления автора, как у SEC-8"
     ),
     ("billing_requests", "user_id"): (
         "кто подал заявку на счёт; заявка принадлежит организации и читается "

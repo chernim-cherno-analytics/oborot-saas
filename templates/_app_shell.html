@@ -39,6 +39,7 @@
         <div class="app-up-mail">{{ user.email or "" }}</div>
       </div>
       <a class="app-up-item" href="/settings">Настройки</a>
+      {% if perms is defined and 'users_manage' in perms %}<a class="app-up-item" href="/team">Сотрудники и роли</a>{% endif %}
       <form method="post" action="/logout">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <button class="app-up-item" type="submit">Выйти</button>

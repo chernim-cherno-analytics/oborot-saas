@@ -164,13 +164,19 @@
 </style>
 {% include "_mobile.html" %}
 {% include "_app_shell_head.html" %}
+{% include "_perms_css.html" %}
 </head>
-<body>
+<body data-perms="{{ (perms if perms is defined else perm_keys)|join(' ') }}">
 {% include "_embed.html" %}
 <div class="gradient-bg"></div>
 {% include "_app_shell.html" %}
 
 <div class="main">
+  {# Роли (15.11.2026): без права plan расчёт плана отвечает 403, говорим об этом заранее. #}
+  <div class="lack-plan" role="note" style="margin:0 0 14px; padding:10px 14px; border-radius:10px; background:rgba(234,179,8,.12); font-size:13px;">
+    У вашей роли нет права «Считать и сохранять планы заказа»: мастер покажет вопросы,
+    но расчёт плана недоступен. Попросите владельца организации выдать роль с этим правом.
+  </div>
   <div class="steps" id="steps">
     <div class="stp on" data-s="1"><span class="n">1</span> Когда и сколько</div>
     <div class="stp" data-s="2"><span class="n">2</span> Как заказываем</div>

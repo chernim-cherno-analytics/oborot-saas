@@ -1,0 +1,22 @@
+{# Роли (решение владельца 15.11.2026): интерфейс прячет действия, на которые у
+   роли нет прав. На <body> печатается data-perms="plan orders_create ..."
+   (app.main._page кладёт perms в контекст), правила ниже читают его через
+   [data-perms~="ключ"]. Сервер всё равно отвечает 403 (auth.require_perm):
+   это удобство, а не защита.
+
+   Классы, которые были до ролей (SEC-2, D-69), сохранены и привязаны к своим
+   правам. Для нового кода есть общие классы: need-<право> (показать только
+   с правом) и lack-<право> (показать только без него, например пояснение). #}
+<style>
+  body:not([data-perms~="catalog_edit"]) .arch-btn,
+  body:not([data-perms~="catalog_edit"]) .unarch-btn,
+  body:not([data-perms~="orders_delete"]) .ord-del,
+  body:not([data-perms~="ordered_edit"]) #send-btn,
+  body:not([data-perms~="users_manage"]) .owner-only { display: none !important; }
+  body:not([data-perms~="ordered_edit"]) .ordin,
+  body:not([data-perms~="catalog_edit"]) .catsel { pointer-events: none; opacity: .6; }
+{%- for key in perm_keys %}
+  body:not([data-perms~="{{ key }}"]) .need-{{ key }} { display: none !important; }
+  body[data-perms~="{{ key }}"] .lack-{{ key }} { display: none !important; }
+{%- endfor %}
+</style>

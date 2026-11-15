@@ -7,7 +7,7 @@
 идентификаторов владельца контракт не принимает вовсе — не «игнорирует», а не
 имеет: параметр, который можно прислать, рано или поздно кто-нибудь прочитает.
 
-Чтение — владелец и участник. Запись — только владелец (`require_owner_api`),
+Чтение: любая роль. Запись: право supply_edit (`require_perm`, app/roles.py),
 поверх этого работает общий гейт подписки (`subscription.gate_dependency`,
 повешен на приложение) и общий CSRF на изменяющие `/api/*`
 (`main._security_headers_and_csrf`). Исключений из readonly здесь нет ни одного:
@@ -47,7 +47,7 @@ from sqlalchemy.orm import Session
 
 from app import export_xlsx
 from app import supply_planning as sp
-from app.auth import AuthContext, require_auth_api, require_owner_api
+from app.auth import AuthContext, require_auth_api, require_perm
 from app.db import get_db
 
 # Граница id как у app.api._id_path: число больше INTEGER SQLite давало 500
@@ -139,13 +139,19 @@ def _commit(db: Session, org_id: int, role: str) -> dict:
     return sp.board(db, org_id, role)
 
 
+
+def _sp_role(ctx: AuthContext) -> str:
+    """Строка роли для слоя планирования: "owner" = есть право supply_edit."""
+    from app import roles as _roles
+    return _roles.ui_role(ctx, "supply_edit")
+
 @router.get("")
 def api_planning_board(
     ctx: AuthContext = Depends(require_auth_api),
     db: Session = Depends(get_db),
 ):
     """Всё состояние планирования своей организации. Только чтение."""
-    return sp.board(db, ctx.org.id, ctx.role)
+    return sp.board(db, ctx.org.id, _sp_role(ctx))
 
 
 @router.get("/catalog")
@@ -177,7 +183,7 @@ def api_planning_events(
     (`require_auth_api`). Ничего нового о чужой организации ручка не
     рассказывает: строка сначала ищется обычным способом в СВОЕЙ организации, и
     чужой идентификатор даёт тот же 404 и тот же текст, что и несуществующий.
-    Записи здесь нет вовсе, поэтому и `require_owner_api` тут был бы не защитой,
+    Записи здесь нет вовсе, поэтому и право записи (`require_perm`) тут было бы не защитой,
     а запретом участнику видеть то, что он и так видит на карточке.
 
     Имя параметра `id` совпадает со встроенным именем Python и выбрано не по
@@ -194,45 +200,45 @@ def api_planning_events(
 @router.post("/materials")
 def api_planning_material_create(
     payload: dict = Body(...),
-    ctx: AuthContext = Depends(require_owner_api),
+    ctx: AuthContext = Depends(require_perm("supply_edit")),
     db: Session = Depends(get_db),
 ):
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Ожидался объект JSON.")
     try:
         if sp.check_op(db, ctx.org.id, sp.parse_op_id(payload)):
-            return sp.board(db, ctx.org.id, ctx.role)
+            return sp.board(db, ctx.org.id, _sp_role(ctx))
         sp.create_material(db, ctx.org.id, payload, _author(ctx))
     except (sp.PlanningError, IntegrityError) as exc:
         db.rollback()
         raise _fail(exc) from None
-    return _commit(db, ctx.org.id, ctx.role)
+    return _commit(db, ctx.org.id, _sp_role(ctx))
 
 
 @router.post("/materials/{material_id}/update")
 def api_planning_material_update(
     material_id: int = Path(ge=1, le=_MAX_ID),
     payload: dict = Body(...),
-    ctx: AuthContext = Depends(require_owner_api),
+    ctx: AuthContext = Depends(require_perm("supply_edit")),
     db: Session = Depends(get_db),
 ):
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Ожидался объект JSON.")
     try:
         if sp.check_op(db, ctx.org.id, sp.parse_op_id(payload)):
-            return sp.board(db, ctx.org.id, ctx.role)
+            return sp.board(db, ctx.org.id, _sp_role(ctx))
         sp.update_material(db, ctx.org.id, material_id, payload, _author(ctx))
     except (sp.PlanningError, IntegrityError) as exc:
         db.rollback()
         raise _fail(exc) from None
-    return _commit(db, ctx.org.id, ctx.role)
+    return _commit(db, ctx.org.id, _sp_role(ctx))
 
 
 @router.post("/materials/{material_id}/archive")
 def api_planning_material_archive(
     material_id: int = Path(ge=1, le=_MAX_ID),
     payload: dict = Body(default={}),
-    ctx: AuthContext = Depends(require_owner_api),
+    ctx: AuthContext = Depends(require_perm("supply_edit")),
     db: Session = Depends(get_db),
 ):
     """Убрать материал с доски (F-12). Строка остаётся, отметка проставляется.
@@ -245,19 +251,19 @@ def api_planning_material_archive(
         raise HTTPException(status_code=400, detail="Ожидался объект JSON.")
     try:
         if sp.check_op(db, ctx.org.id, sp.parse_op_id(payload)):
-            return sp.board(db, ctx.org.id, ctx.role)
+            return sp.board(db, ctx.org.id, _sp_role(ctx))
         sp.archive_material(db, ctx.org.id, material_id, payload, _author(ctx))
     except (sp.PlanningError, IntegrityError) as exc:
         db.rollback()
         raise _fail(exc) from None
-    return _commit(db, ctx.org.id, ctx.role)
+    return _commit(db, ctx.org.id, _sp_role(ctx))
 
 
 @router.post("/materials/{material_id}/restore")
 def api_planning_material_restore(
     material_id: int = Path(ge=1, le=_MAX_ID),
     payload: dict = Body(default={}),
-    ctx: AuthContext = Depends(require_owner_api),
+    ctx: AuthContext = Depends(require_perm("supply_edit")),
     db: Session = Depends(get_db),
 ):
     """Вернуть материал на доску. Возвращается ровно то, что убрали."""
@@ -265,19 +271,19 @@ def api_planning_material_restore(
         raise HTTPException(status_code=400, detail="Ожидался объект JSON.")
     try:
         if sp.check_op(db, ctx.org.id, sp.parse_op_id(payload)):
-            return sp.board(db, ctx.org.id, ctx.role)
+            return sp.board(db, ctx.org.id, _sp_role(ctx))
         sp.restore_material(db, ctx.org.id, material_id, payload, _author(ctx))
     except (sp.PlanningError, IntegrityError) as exc:
         db.rollback()
         raise _fail(exc) from None
-    return _commit(db, ctx.org.id, ctx.role)
+    return _commit(db, ctx.org.id, _sp_role(ctx))
 
 
 @router.post("/items/{item_id}/update")
 def api_planning_item_update(
     item_id: int = Path(ge=1, le=_MAX_ID),
     payload: dict = Body(...),
-    ctx: AuthContext = Depends(require_owner_api),
+    ctx: AuthContext = Depends(require_perm("supply_edit")),
     db: Session = Depends(get_db),
 ):
     """Правка вещи: имя новинки, заметка, замена эскиза (F-13в).
@@ -289,19 +295,19 @@ def api_planning_item_update(
         raise HTTPException(status_code=400, detail="Ожидался объект JSON.")
     try:
         if sp.check_op(db, ctx.org.id, sp.parse_op_id(payload)):
-            return sp.board(db, ctx.org.id, ctx.role)
+            return sp.board(db, ctx.org.id, _sp_role(ctx))
         sp.update_item(db, ctx.org.id, item_id, payload, _author(ctx))
     except (sp.PlanningError, IntegrityError) as exc:
         db.rollback()
         raise _fail(exc) from None
-    return _commit(db, ctx.org.id, ctx.role)
+    return _commit(db, ctx.org.id, _sp_role(ctx))
 
 
 @router.post("/items/{item_id}/archive")
 def api_planning_item_archive(
     item_id: int = Path(ge=1, le=_MAX_ID),
     payload: dict = Body(default={}),
-    ctx: AuthContext = Depends(require_owner_api),
+    ctx: AuthContext = Depends(require_perm("supply_edit")),
     db: Session = Depends(get_db),
 ):
     """Убрать вещь с доски (F-12). В этом пакете — только новинку.
@@ -314,19 +320,19 @@ def api_planning_item_archive(
         raise HTTPException(status_code=400, detail="Ожидался объект JSON.")
     try:
         if sp.check_op(db, ctx.org.id, sp.parse_op_id(payload)):
-            return sp.board(db, ctx.org.id, ctx.role)
+            return sp.board(db, ctx.org.id, _sp_role(ctx))
         sp.archive_item(db, ctx.org.id, item_id, payload, _author(ctx))
     except (sp.PlanningError, IntegrityError) as exc:
         db.rollback()
         raise _fail(exc) from None
-    return _commit(db, ctx.org.id, ctx.role)
+    return _commit(db, ctx.org.id, _sp_role(ctx))
 
 
 @router.post("/items/{item_id}/restore")
 def api_planning_item_restore(
     item_id: int = Path(ge=1, le=_MAX_ID),
     payload: dict = Body(default={}),
-    ctx: AuthContext = Depends(require_owner_api),
+    ctx: AuthContext = Depends(require_perm("supply_edit")),
     db: Session = Depends(get_db),
 ):
     """Вернуть вещь на доску — ровно ту же, ничего не воссоздавая."""
@@ -334,18 +340,18 @@ def api_planning_item_restore(
         raise HTTPException(status_code=400, detail="Ожидался объект JSON.")
     try:
         if sp.check_op(db, ctx.org.id, sp.parse_op_id(payload)):
-            return sp.board(db, ctx.org.id, ctx.role)
+            return sp.board(db, ctx.org.id, _sp_role(ctx))
         sp.restore_item(db, ctx.org.id, item_id, payload, _author(ctx))
     except (sp.PlanningError, IntegrityError) as exc:
         db.rollback()
         raise _fail(exc) from None
-    return _commit(db, ctx.org.id, ctx.role)
+    return _commit(db, ctx.org.id, _sp_role(ctx))
 
 
 @router.post("/items")
 def api_planning_item_create(
     payload: dict = Body(...),
-    ctx: AuthContext = Depends(require_owner_api),
+    ctx: AuthContext = Depends(require_perm("supply_edit")),
     db: Session = Depends(get_db),
 ):
     """Вещь каталога или полноценная новинка с эскизом.
@@ -366,7 +372,7 @@ def api_planning_item_create(
             # держащая в руках выбранный файл, не смогла бы прикрепить эскиз к
             # уже созданной новинке — то есть идемпотентность первого запроса
             # ломала бы второй (ТЗ F-23а).
-            replay = sp.board(db, ctx.org.id, ctx.role)
+            replay = sp.board(db, ctx.org.id, _sp_role(ctx))
             known = sp.find_op_entity(db, ctx.org.id, op_id, "item")
             if known is not None:
                 replay["item_id"] = known
@@ -379,7 +385,7 @@ def api_planning_item_create(
     except (sp.PlanningError, IntegrityError) as exc:
         db.rollback()
         raise _fail(exc) from None
-    board = _commit(db, ctx.org.id, ctx.role)
+    board = _commit(db, ctx.org.id, _sp_role(ctx))
     # НОМЕР СОХРАНЁННОЙ ВЕЩИ В ОТВЕТЕ. Ответ этой ручки — вся доска, и до сих
     # пор из неё нельзя было понять, какая строка только что появилась: экран
     # вычислял это разностью списков. Для эскиза такой догадки мало — файл
@@ -398,7 +404,7 @@ def api_planning_item_create(
 @router.post("/batches")
 def api_planning_batch_create(
     payload: dict = Body(...),
-    ctx: AuthContext = Depends(require_owner_api),
+    ctx: AuthContext = Depends(require_perm("supply_edit")),
     db: Session = Depends(get_db),
 ):
     """Плановая партия. Партией «Оборота» она не становится и номера не получает."""
@@ -406,38 +412,38 @@ def api_planning_batch_create(
         raise HTTPException(status_code=400, detail="Ожидался объект JSON.")
     try:
         if sp.check_op(db, ctx.org.id, sp.parse_op_id(payload)):
-            return sp.board(db, ctx.org.id, ctx.role)
+            return sp.board(db, ctx.org.id, _sp_role(ctx))
         sp.create_batch(db, ctx.org.id, payload, _author(ctx))
     except (sp.PlanningError, IntegrityError) as exc:
         db.rollback()
         raise _fail(exc) from None
-    return _commit(db, ctx.org.id, ctx.role)
+    return _commit(db, ctx.org.id, _sp_role(ctx))
 
 
 @router.post("/batches/{batch_id}/update")
 def api_planning_batch_update(
     batch_id: int = Path(ge=1, le=_MAX_ID),
     payload: dict = Body(...),
-    ctx: AuthContext = Depends(require_owner_api),
+    ctx: AuthContext = Depends(require_perm("supply_edit")),
     db: Session = Depends(get_db),
 ):
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Ожидался объект JSON.")
     try:
         if sp.check_op(db, ctx.org.id, sp.parse_op_id(payload)):
-            return sp.board(db, ctx.org.id, ctx.role)
+            return sp.board(db, ctx.org.id, _sp_role(ctx))
         sp.update_batch(db, ctx.org.id, batch_id, payload, _author(ctx))
     except (sp.PlanningError, IntegrityError) as exc:
         db.rollback()
         raise _fail(exc) from None
-    return _commit(db, ctx.org.id, ctx.role)
+    return _commit(db, ctx.org.id, _sp_role(ctx))
 
 
 @router.post("/batches/{batch_id}/archive")
 def api_planning_batch_archive(
     batch_id: int = Path(ge=1, le=_MAX_ID),
     payload: dict = Body(default={}),
-    ctx: AuthContext = Depends(require_owner_api),
+    ctx: AuthContext = Depends(require_perm("supply_edit")),
     db: Session = Depends(get_db),
 ):
     """Убрать партию вместе с её назначениями (F-12, решение владельца).
@@ -451,12 +457,12 @@ def api_planning_batch_archive(
         raise HTTPException(status_code=400, detail="Ожидался объект JSON.")
     try:
         if sp.check_op(db, ctx.org.id, sp.parse_op_id(payload)):
-            return sp.board(db, ctx.org.id, ctx.role)
+            return sp.board(db, ctx.org.id, _sp_role(ctx))
         done = sp.archive_batch(db, ctx.org.id, batch_id, payload, _author(ctx))
     except (sp.PlanningError, IntegrityError) as exc:
         db.rollback()
         raise _fail(exc) from None
-    board = _commit(db, ctx.org.id, ctx.role)
+    board = _commit(db, ctx.org.id, _sp_role(ctx))
     board["archived"] = done
     return board
 
@@ -465,7 +471,7 @@ def api_planning_batch_archive(
 def api_planning_batch_restore(
     batch_id: int = Path(ge=1, le=_MAX_ID),
     payload: dict = Body(default={}),
-    ctx: AuthContext = Depends(require_owner_api),
+    ctx: AuthContext = Depends(require_perm("supply_edit")),
     db: Session = Depends(get_db),
 ):
     """Вернуть партию ВМЕСТЕ с прежними назначениями и заметками.
@@ -478,12 +484,12 @@ def api_planning_batch_restore(
         raise HTTPException(status_code=400, detail="Ожидался объект JSON.")
     try:
         if sp.check_op(db, ctx.org.id, sp.parse_op_id(payload)):
-            return sp.board(db, ctx.org.id, ctx.role)
+            return sp.board(db, ctx.org.id, _sp_role(ctx))
         done = sp.restore_batch(db, ctx.org.id, batch_id, payload, _author(ctx))
     except (sp.PlanningError, IntegrityError) as exc:
         db.rollback()
         raise _fail(exc) from None
-    board = _commit(db, ctx.org.id, ctx.role)
+    board = _commit(db, ctx.org.id, _sp_role(ctx))
     board["restored"] = done
     return board
 
@@ -491,25 +497,25 @@ def api_planning_batch_restore(
 @router.post("/assignments")
 def api_planning_assignment_create(
     payload: dict = Body(...),
-    ctx: AuthContext = Depends(require_owner_api),
+    ctx: AuthContext = Depends(require_perm("supply_edit")),
     db: Session = Depends(get_db),
 ):
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Ожидался объект JSON.")
     try:
         if sp.check_op(db, ctx.org.id, sp.parse_op_id(payload)):
-            return sp.board(db, ctx.org.id, ctx.role)
+            return sp.board(db, ctx.org.id, _sp_role(ctx))
         sp.create_assignment(db, ctx.org.id, payload, _author(ctx))
     except (sp.PlanningError, IntegrityError) as exc:
         db.rollback()
         raise _fail(exc) from None
-    return _commit(db, ctx.org.id, ctx.role)
+    return _commit(db, ctx.org.id, _sp_role(ctx))
 
 
 @router.post("/assignments/move")
 def api_planning_assignment_move(
     payload: dict = Body(...),
-    ctx: AuthContext = Depends(require_owner_api),
+    ctx: AuthContext = Depends(require_perm("supply_edit")),
     db: Session = Depends(get_db),
 ):
     """Перенос метража между плановыми партиями — одной транзакцией."""
@@ -517,50 +523,50 @@ def api_planning_assignment_move(
         raise HTTPException(status_code=400, detail="Ожидался объект JSON.")
     try:
         if sp.check_op(db, ctx.org.id, sp.parse_op_id(payload)):
-            return sp.board(db, ctx.org.id, ctx.role)
+            return sp.board(db, ctx.org.id, _sp_role(ctx))
         sp.move_assignment(db, ctx.org.id, payload, _author(ctx))
     except (sp.PlanningError, IntegrityError) as exc:
         db.rollback()
         raise _fail(exc) from None
-    return _commit(db, ctx.org.id, ctx.role)
+    return _commit(db, ctx.org.id, _sp_role(ctx))
 
 
 @router.post("/assignments/{assignment_id}/update")
 def api_planning_assignment_update(
     assignment_id: int = Path(ge=1, le=_MAX_ID),
     payload: dict = Body(...),
-    ctx: AuthContext = Depends(require_owner_api),
+    ctx: AuthContext = Depends(require_perm("supply_edit")),
     db: Session = Depends(get_db),
 ):
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Ожидался объект JSON.")
     try:
         if sp.check_op(db, ctx.org.id, sp.parse_op_id(payload)):
-            return sp.board(db, ctx.org.id, ctx.role)
+            return sp.board(db, ctx.org.id, _sp_role(ctx))
         sp.update_assignment(db, ctx.org.id, assignment_id, payload, _author(ctx))
     except (sp.PlanningError, IntegrityError) as exc:
         db.rollback()
         raise _fail(exc) from None
-    return _commit(db, ctx.org.id, ctx.role)
+    return _commit(db, ctx.org.id, _sp_role(ctx))
 
 
 @router.post("/assignments/{assignment_id}/delete")
 def api_planning_assignment_delete(
     assignment_id: int = Path(ge=1, le=_MAX_ID),
     payload: dict = Body(default={}),
-    ctx: AuthContext = Depends(require_owner_api),
+    ctx: AuthContext = Depends(require_perm("supply_edit")),
     db: Session = Depends(get_db),
 ):
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Ожидался объект JSON.")
     try:
         if sp.check_op(db, ctx.org.id, sp.parse_op_id(payload)):
-            return sp.board(db, ctx.org.id, ctx.role)
+            return sp.board(db, ctx.org.id, _sp_role(ctx))
         sp.delete_assignment(db, ctx.org.id, assignment_id, payload, _author(ctx))
     except (sp.PlanningError, IntegrityError) as exc:
         db.rollback()
         raise _fail(exc) from None
-    return _commit(db, ctx.org.id, ctx.role)
+    return _commit(db, ctx.org.id, _sp_role(ctx))
 
 
 async def _read_upload(file: UploadFile, limit: int, too_big: str) -> bytes:
@@ -669,7 +675,7 @@ def _etag_matches(header: str | None, etag: str) -> bool:
 async def api_planning_sketch_upload(
     file: UploadFile = File(...),
     thumb: UploadFile | None = File(None),
-    ctx: AuthContext = Depends(require_owner_api),
+    ctx: AuthContext = Depends(require_perm("supply_edit")),
     db: Session = Depends(get_db),
 ):
     """СТАРЫЙ путь загрузки эскиза: файл отдельно, вещь потом.
@@ -719,7 +725,7 @@ async def api_planning_item_sketch(
     item_id: int = Path(ge=1, le=_MAX_ID),
     file: UploadFile = File(...),
     thumb: UploadFile | None = File(None),
-    ctx: AuthContext = Depends(require_owner_api),
+    ctx: AuthContext = Depends(require_perm("supply_edit")),
     db: Session = Depends(get_db),
 ):
     """ШТАТНЫЙ путь (ТЗ F-23а): файл прикрепляется к уже созданной новинке.
@@ -752,7 +758,7 @@ async def api_planning_item_sketch(
     except (sp.PlanningError, IntegrityError) as exc:
         db.rollback()
         raise _fail(exc) from None
-    board = _commit(db, ctx.org.id, ctx.role)
+    board = _commit(db, ctx.org.id, _sp_role(ctx))
     board["sketch_id"] = sketch_id
     return board
 
@@ -830,7 +836,7 @@ def api_planning_export_xlsx(
     пользовательский текст (названия материалов, вещей, партий, заметки) уходит
     в ячейку через `_cell`, где стоит защита от формульной инъекции.
     """
-    data = sp.board(db, ctx.org.id, ctx.role)
+    data = sp.board(db, ctx.org.id, _sp_role(ctx))
     wb = export_xlsx.supply_workbook(ctx.org.name, data)
     return export_xlsx.xlsx_response(wb, "План производства.xlsx",
                                      "supply-plan.xlsx")

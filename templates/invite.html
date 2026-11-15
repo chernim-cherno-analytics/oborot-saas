@@ -1,0 +1,161 @@
+{% extends "base.html" %}
+{% block bodyclass %}auth-page{% endblock %}
+{% block body %}
+{# Вход по приглашению в организацию (роли, 15.11.2026). Токен живёт во
+   ФРАГМЕНТЕ ссылки (#t=...), как у сброса пароля (D-63): сервер получает его
+   только в теле POST, в журнал доступа и Referer он не попадает. #}
+<div class="auth-wrap">
+  <div class="auth-logo">
+    <span style="width:34px;height:34px;min-width:34px;border-radius:9px;background:var(--blue);display:inline-flex;align-items:center;justify-content:center;color:#fff;font-weight:800;font-size:17px;">О</span>
+    <span class="logo-text">Оборот</span>
+  </div>
+
+  <div class="auth-card">
+    <h1>Приглашение в команду</h1>
+    <p class="auth-sub" id="iv-sub">Проверяем приглашение…</p>
+
+    <div class="form-error" id="iv-error" role="alert" style="display:none"></div>
+
+    <div id="iv-join" style="display:none">
+      <p style="font-size:13.5px; margin:0 0 12px;">Вы вошли как <b id="iv-me"></b>.</p>
+      <button class="btn primary" type="button" id="iv-join-btn" style="width:100%">Присоединиться</button>
+      <div class="auth-alt">Это не вы? <a href="#" id="iv-other">Войти под другим аккаунтом</a></div>
+    </div>
+
+    <form id="iv-register" novalidate style="display:none">
+      <div class="field">
+        <label for="iv-name">Ваше имя</label>
+        <input class="input" type="text" id="iv-name" autocomplete="name" placeholder="Анна Смирнова">
+      </div>
+      <div class="field">
+        <label for="iv-email">Электронная почта</label>
+        <input class="input" type="email" id="iv-email" autocomplete="email" placeholder="you@brand.ru">
+      </div>
+      <div class="field">
+        <label for="iv-password">Пароль</label>
+        <input class="input" type="password" id="iv-password" autocomplete="new-password" minlength="8" placeholder="Не менее 8 символов">
+      </div>
+      <label style="display:flex; gap:8px; align-items:flex-start; font-size:12.5px; margin:4px 0 12px; cursor:pointer;">
+        <input type="checkbox" id="iv-agree" style="margin-top:3px;">
+        <span>Я принимаю <a href="/legal/offer" target="_blank">договор-оферту</a> и даю согласие на обработку персональных данных в соответствии с <a href="/legal/privacy" target="_blank">политикой</a></span>
+      </label>
+      <button class="btn primary" type="submit" style="width:100%">Создать аккаунт и присоединиться</button>
+      <div class="auth-alt">Уже есть аккаунт в «Обороте»? <a href="#" id="iv-to-login">Войти</a></div>
+    </form>
+
+    <form id="iv-login" novalidate style="display:none">
+      <div class="field">
+        <label for="iv-l-email">Электронная почта</label>
+        <input class="input" type="email" id="iv-l-email" autocomplete="email">
+      </div>
+      <div class="field">
+        <label for="iv-l-password">Пароль</label>
+        <input class="input" type="password" id="iv-l-password" autocomplete="current-password">
+      </div>
+      <button class="btn primary" type="submit" style="width:100%">Войти и присоединиться</button>
+      <div class="auth-alt">Нет аккаунта? <a href="#" id="iv-to-register">Зарегистрироваться</a></div>
+    </form>
+  </div>
+</div>
+<script>
+(function () {
+  var m = /(?:^#|&)t=([^&]+)/.exec(location.hash || "");
+  var token = m ? decodeURIComponent(m[1]) : "";
+  if (location.hash) history.replaceState(null, "", location.pathname);
+
+  var sub = document.getElementById("iv-sub");
+  var errBox = document.getElementById("iv-error");
+  var join = document.getElementById("iv-join");
+  var reg = document.getElementById("iv-register");
+  var login = document.getElementById("iv-login");
+
+  function show(el) {
+    [join, reg, login].forEach(function (x) { x.style.display = (x === el) ? "" : "none"; });
+  }
+  function fail(text) {
+    token = "";
+    show(null);
+    errBox.textContent = text;
+    errBox.style.display = "";
+  }
+  function showError(text) { errBox.textContent = text; errBox.style.display = ""; }
+
+  function post(url, body) {
+    return fetch(url, {
+      method: "POST", credentials: "same-origin", referrerPolicy: "no-referrer",
+      headers: { "Content-Type": "application/json", "X-Oborot-CSRF": "1" },
+      body: JSON.stringify(body)
+    }).then(function (r) {
+      return r.json().catch(function () { return {}; }).then(function (j) {
+        return { ok: r.ok, status: r.status, data: j || {},
+                 detail: (j && typeof j.detail === "string") ? j.detail : "" };
+      });
+    });
+  }
+
+  if (!token) {
+    fail("Ссылка неполная. Откройте её целиком или попросите владельца организации прислать новую.");
+    return;
+  }
+
+  post("/api/invite/info", { token: token }).then(function (res) {
+    if (!res.ok) { fail(res.detail || "Приглашение недействительно."); return; }
+    var d = res.data;
+    sub.textContent = "Вас приглашают в организацию «" + d.org_name + "» с ролью «" + d.role_name + "».";
+    if (d.signed_in) {
+      document.getElementById("iv-me").textContent = d.signed_in.email;
+      if (d.already_member) {
+        fail("Вы уже участник организации «" + d.org_name + "». Приглашение не понадобилось.");
+        return;
+      }
+      show(join);
+    } else {
+      show(reg);
+    }
+  }).catch(function () { fail("Не удалось проверить приглашение: проверьте связь и обновите страницу."); });
+
+  function accept(body, btn) {
+    errBox.style.display = "none";
+    if (btn) btn.disabled = true;
+    body.token = token;
+    post("/api/invite/accept", body).then(function (res) {
+      if (res.ok) { location.href = res.data.redirect || "/"; return; }
+      if (res.status === 400) { fail(res.detail || "Приглашение недействительно."); return; }
+      showError(res.detail || ("Не получилось (" + res.status + ")."));
+    }).catch(function () {
+      showError("Не удалось отправить: проверьте связь и попробуйте ещё раз.");
+    }).then(function () { if (btn) btn.disabled = false; });
+  }
+
+  document.getElementById("iv-join-btn").addEventListener("click", function () {
+    accept({ mode: "join" }, this);
+  });
+  document.getElementById("iv-other").addEventListener("click", function (ev) {
+    ev.preventDefault(); errBox.style.display = "none"; show(login);
+  });
+  document.getElementById("iv-to-login").addEventListener("click", function (ev) {
+    ev.preventDefault(); errBox.style.display = "none"; show(login);
+  });
+  document.getElementById("iv-to-register").addEventListener("click", function (ev) {
+    ev.preventDefault(); errBox.style.display = "none"; show(reg);
+  });
+  reg.addEventListener("submit", function (ev) {
+    ev.preventDefault();
+    if (!document.getElementById("iv-agree").checked) {
+      showError("Отметьте согласие с офертой и политикой обработки данных.");
+      return;
+    }
+    accept({ mode: "register", name: document.getElementById("iv-name").value,
+             email: document.getElementById("iv-email").value,
+             password: document.getElementById("iv-password").value },
+           reg.querySelector("button[type=submit]"));
+  });
+  login.addEventListener("submit", function (ev) {
+    ev.preventDefault();
+    accept({ mode: "login", email: document.getElementById("iv-l-email").value,
+             password: document.getElementById("iv-l-password").value },
+           login.querySelector("button[type=submit]"));
+  });
+})();
+</script>
+{% endblock %}

@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 
 from app import auth
 from app import logging_conf
+from app import roles
 from app import subscription
 
 # Настраиваем логирование ДО создания приложения и до первого вызова
@@ -32,6 +33,7 @@ from app.routes_ms_app import router as ms_app_router
 from app.routes_ms_vendor import router as ms_vendor_router
 from app.routes_supply import router as supply_router
 from app.routes_supply_planning import router as supply_planning_router
+from app.routes_team import router as team_router
 from app.db import get_db, init_db, record_migration_step, validate_migration_step
 from app.models import Connection, Membership, Org, Product, ProductionOrder, Sale, User
 
@@ -58,6 +60,8 @@ app.include_router(ms_app_router)
 # «Едет» и формулы, и физическая отдельность делает это проверяемым.
 app.include_router(supply_router)
 app.include_router(supply_planning_router)
+# Роли сотрудников и приглашения (решение владельца 15.11.2026).
+app.include_router(team_router)
 
 
 #: Потолок тела JSON для пишущих ручек «Поставок» (ТЗ F-25). Один мегабайт —
@@ -292,6 +296,10 @@ app.add_middleware(GZipMiddleware, minimum_size=1024)
 from app import scheduler as _scheduler  # noqa: E402
 _scheduler.attach(app)
 templates = Jinja2Templates(directory=[str(d) for d in TEMPLATE_DIRS])
+# Роли (15.11.2026): полный список прав для _perms_css.html. Страница, в
+# контекст которой права не положили, считается страницей со всеми правами
+# (как прежний default('owner')); сервер всё равно проверяет каждое действие.
+templates.env.globals["perm_keys"] = roles.PERM_KEYS
 
 if STATIC_DIR.is_dir():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
@@ -409,6 +417,10 @@ STARTUP_SCHEMA_STEPS: tuple[tuple[str, int], ...] = (
     # любой базе, где те шаги записаны. Собственный, ещё не выпущенный номер
     # подвинуть можно; чужой выпущенный — нет.
     ("models.ensure_supply_sketch_thumb_schema", 17),
+    # Роли сотрудников (решение владельца 15.11.2026): две новые таблицы и
+    # нуллируемая колонка memberships.role_id. Append-only, позиция 18 новая,
+    # семнадцать прежних пар не тронуты.
+    ("models.ensure_roles_schema", 18),
 )
 _STARTUP_STEP_ORDER = dict(STARTUP_SCHEMA_STEPS)
 
@@ -622,6 +634,9 @@ def _startup() -> None:
     # пакета — в том же порядке, в каком они объявлены выше.
     _startup_step("models.ensure_supply_sketch_thumb_schema",
                   _models.ensure_supply_sketch_thumb_schema)
+    # Роли сотрудников: таблицы org_roles, org_invites и колонка
+    # memberships.role_id. Ничего не читает и не переписывает.
+    _startup_step("models.ensure_roles_schema", _models.ensure_roles_schema)
     # Замок на пропуск: все объявленные шаги выполнены, и ровно они.
     _finish_startup_steps()
     global _STARTUP_DONE
@@ -764,6 +779,11 @@ def _page(request: Request, ctx: auth.AuthContext, template: str, active: str, p
             # SEC-2 (D-69): роль для интерфейса. Закрытые владельцу действия
             # участнику не показываются; сервер всё равно отвечает 403.
             "role": ctx.role,
+            # Роли (15.11.2026): права для интерфейса. На body печатается
+            # data-perms, и _perms_css.html прячет действия, на которые прав
+            # нет. Сервер всё равно отвечает 403 (auth.require_perm).
+            "perms": sorted(ctx.perms),
+            "role_name": ctx.role_name,
             "page_title": page_title,
             "embedded": embedded,
             # Состояние подписки в контекст страницы. Нужно ровно для одного:
@@ -1088,6 +1108,9 @@ def api_account(
     return {
         "user": {"name": ctx.user.name, "email": ctx.user.email},
         "role": ctx.role,
+        # Роли (15.11.2026): название роли и доступ к разделу «Сотрудники и роли».
+        "role_name": ctx.role_name,
+        "can_manage_team": ctx.can("users_manage"),
         "org": {"name": ctx.org.name, "plan": ctx.org.plan},
         "others": [
             {"name": u.name, "email": u.email, "role": m.role} for u, m in others
@@ -1325,8 +1348,10 @@ def api_delete_account(
     others = [(u, m) for u, m in members if u.id != ctx.user.id]
     org_id, user_id = ctx.org.id, ctx.user.id
 
-    # Участник (не владелец): уходит только он.
-    if ctx.role != "owner":
+    # Участник (не владелец): уходит только он. Так же уходит владелец, у
+    # которого в организации есть ещё один владелец (роли, 15.11.2026):
+    # организация остаётся под управлением второго владельца.
+    if ctx.role != "owner" or any(m.role == "owner" for _u, m in others):
         _purge_user(db, user_id)
         db.commit()
         return _deleted_response("account", 0)
@@ -1352,6 +1377,9 @@ def api_delete_account(
                     detail="Выберите, кому передать организацию — из списка её участников",
                 )
             target[1].role = "owner"
+            # Роль «Владелец» решает memberships.role; ссылка на прежнюю роль
+            # сотрудника ему больше не нужна (app/roles.py).
+            target[1].role_id = None
             _purge_user(db, user_id)
             db.commit()
             return _deleted_response("account", 0)
@@ -1455,7 +1483,7 @@ def onboarding_preview_page(request: Request, db: Session = Depends(get_db)):
     ctx = auth.resolve_auth(request, db)
     if ctx is None:
         return RedirectResponse("/login", status_code=302)
-    if ctx.role != "owner":
+    if not ctx.can("settings"):
         return RedirectResponse(ONBOARDING_PREVIEW_DENY_REDIRECT, status_code=302)
     return _page(request, ctx, "onboarding_preview.html", "onboarding",
                  "Предпросмотр онбординга", db=db)
@@ -1483,7 +1511,7 @@ def supply_page(request: Request, db: Session = Depends(get_db)):
     # вкладку, а потом потерять её после ответа API, которого для него нет.
     from app import routes_supply as _routes_supply
     return _page(request, ctx, "supply.html", "supply", "Поставки", db=db,
-                 extra={"role": ctx.role,
+                 extra={"role": roles.ui_role(ctx, "supply_edit"),
                         "sheets_preview":
                             _routes_supply.preview_enabled(ctx.org)})
 

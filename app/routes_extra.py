@@ -22,7 +22,7 @@ import os
 
 from app import analytics, analytics_extra, analytics_markdown, auth
 from app.api import _require_known_base, apply_production_rules, production_conditions
-from app.auth import AuthContext, require_auth_api, require_owner_api
+from app.auth import AuthContext, require_auth_api, require_perm
 from app.db import Base, get_db
 from app.models import (
     CategoryMerge,
@@ -39,6 +39,8 @@ router = APIRouter()
 _BASE_DIR = Path(__file__).resolve().parent.parent
 # Тот же путь поиска, что в main.py: только templates/ (MAINT-4).
 _templates = Jinja2Templates(directory=str(_BASE_DIR / "templates"))
+from app import roles as _roles  # noqa: E402
+_templates.env.globals["perm_keys"] = _roles.PERM_KEYS
 
 
 def _authed_page(request: Request, db: Session, template: str, active: str, page_title: str,
@@ -201,7 +203,7 @@ def api_discount_overrides(
 @router.post("/api/discount-overrides")
 def api_set_discount_override(
     body: DiscountIn,
-    ctx: AuthContext = Depends(require_owner_api),
+    ctx: AuthContext = Depends(require_perm("catalog_edit")),
     db: Session = Depends(get_db),
 ):
     """Установить/снять ручную скидку позиции (0 = снять).
@@ -227,7 +229,7 @@ def api_set_discount_override(
 
 @router.post("/api/discount-overrides/defaults")
 def api_apply_default_discounts(
-    ctx: AuthContext = Depends(require_owner_api), db: Session = Depends(get_db)
+    ctx: AuthContext = Depends(require_perm("catalog_edit")), db: Session = Depends(get_db)
 ):
     """Кнопка «Дефолтные скидки» (правило legacy, только владелец).
 
@@ -326,7 +328,8 @@ def api_sync_progress(ctx: AuthContext = Depends(require_auth_api)):
     from app import ms_sync
 
     out = ms_sync.get_progress(ctx.org.id)
-    out["can_manage"] = ctx.role == "owner"  # кнопки «Повторить»/«Исправить» — владельцу
+    # Кнопки «Повторить»/«Исправить» синка: у кого есть право settings.
+    out["can_manage"] = ctx.can("settings")
     return out
 
 
@@ -463,7 +466,7 @@ def api_hidden(ctx: AuthContext = Depends(require_auth_api), db: Session = Depen
 
 @router.post("/api/hidden")
 def api_set_hidden(
-    body: HiddenIn, ctx: AuthContext = Depends(require_owner_api), db: Session = Depends(get_db)
+    body: HiddenIn, ctx: AuthContext = Depends(require_perm("catalog_edit")), db: Session = Depends(get_db)
 ):
     """Убрать в архив / вернуть из архива.
 
@@ -510,7 +513,7 @@ def api_categories(ctx: AuthContext = Depends(require_auth_api), db: Session = D
 @router.post("/api/categories/override")
 def api_category_override(
     body: CategoryOverrideIn,
-    ctx: AuthContext = Depends(require_owner_api),
+    ctx: AuthContext = Depends(require_perm("catalog_edit")),
     db: Session = Depends(get_db),
 ):
     """Перенести отдельную позицию в другую категорию ('' = сбросить).
@@ -538,7 +541,7 @@ def api_category_override(
 @router.post("/api/categories/merge")
 def api_category_merge(
     body: CategoryMergeIn,
-    ctx: AuthContext = Depends(require_owner_api),
+    ctx: AuthContext = Depends(require_perm("catalog_edit")),
     db: Session = Depends(get_db),
 ):
     """Влить категорию в другую ('' = отменить слияние этой категории)."""
@@ -606,7 +609,7 @@ def api_discount_rule(ctx: AuthContext = Depends(require_auth_api), db: Session 
 @router.post("/api/discount-rule")
 def api_set_discount_rule(
     body: DiscountRuleIn,
-    ctx: AuthContext = Depends(require_owner_api),
+    ctx: AuthContext = Depends(require_perm("catalog_edit")),
     db: Session = Depends(get_db),
 ):
     """Сохранить правило дефолтных скидок (только владелец)."""
@@ -690,7 +693,7 @@ def api_replenish_draft(
 @router.post("/api/replenish-draft")
 def api_save_replenish_draft(
     body: ReplenishDraftIn,
-    ctx: AuthContext = Depends(require_auth_api),
+    ctx: AuthContext = Depends(require_perm("drafts_edit")),
     db: Session = Depends(get_db),
 ):
     """Сохранить ручную ростовку одной позиции (заменяет прежнюю целиком)."""
@@ -738,10 +741,17 @@ def api_save_replenish_draft(
 @router.post("/api/replenish-draft/reset")
 def api_reset_replenish_draft(
     body: ReplenishDraftResetIn,
-    ctx: AuthContext = Depends(require_auth_api),
+    ctx: AuthContext = Depends(require_perm("drafts_edit")),
     db: Session = Depends(get_db),
 ):
-    """Вернуть ростовку к расчёту: одной позиции или всей таблицы ('')."""
+    """Вернуть ростовку к расчёту: одной позиции или всей таблицы ('').
+
+    Позиция: право drafts_edit (зависимость). Вся таблица стирает и чужие
+    правки, поэтому это отдельное право drafts_reset_all.
+    """
+    if not body.base_name and not ctx.can("drafts_reset_all"):
+        from app import roles as _roles
+        raise HTTPException(status_code=403, detail=_roles.denied_detail("drafts_reset_all"))
     stmt = delete(ReplenishDraft).where(ReplenishDraft.org_id == ctx.org.id)
     if body.base_name:
         stmt = stmt.where(ReplenishDraft.base_name == body.base_name)
@@ -1155,6 +1165,8 @@ def api_plans(ctx: AuthContext = Depends(require_auth_api), db: Session = Depend
         "trial_days_left": _trial_days_left(ctx.org),
         "invoice_days": INVOICE_DAYS,
         "role": ctx.role,
+        # Роли (15.11.2026): заявку на счёт подаёт тот, у кого право billing.
+        "can_billing": ctx.can("billing"),
         # Организация, пришедшая из каталога МойСклад (source='ms_app'), платит
         # через МС — счёт от нас ей выставлять нельзя, форму заявки прячем.
         "source": getattr(ctx.org, "source", "saas"),
@@ -1176,7 +1188,7 @@ class PlanRequestIn(BaseModel):
 @router.post("/api/plans/request")
 def api_plan_request(
     body: PlanRequestIn,
-    ctx: AuthContext = Depends(require_owner_api),
+    ctx: AuthContext = Depends(require_perm("billing")),
     db: Session = Depends(get_db),
 ):
     """Заявка на счёт по выбранному тарифу (обрабатываем руками, без биллинга).
