@@ -41,6 +41,7 @@
       <div class="hint need-users_manage" style="margin-top:8px;">
         Сотрудники, их роли и приглашения: <a href="/team">Сотрудники и роли</a>.
       </div>
+      <div id="orgs-box" style="display:none;margin-top:12px;"></div>
     </div>
   </div>
 
@@ -99,6 +100,30 @@ document.addEventListener("DOMContentLoaded", function () {
     document.getElementById("del-box").innerHTML =
       '<p class="hint" style="margin:0;">Не удалось загрузить данные аккаунта.</p>';
   });
+
+  // ── Мои организации (ревью Codex #110): переключение между членствами ──
+  api("/api/account/orgs").then(function (d) {
+    var list = (d && d.orgs) || [];
+    if (list.length < 2) return;
+    var box = document.getElementById("orgs-box");
+    function e(s){ return String(s==null?"":s).replace(/[&<>"']/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c];}); }
+    box.innerHTML = '<div class="hint" style="margin-bottom:6px;">Вы состоите в нескольких организациях:</div>' +
+      list.map(function (o) {
+        return '<div style="display:flex;gap:8px;align-items:center;margin:4px 0;">' +
+          '<span style="flex:1">«' + e(o.name) + '», роль «' + e(o.role_name) + '»</span>' +
+          (o.current ? '<span class="hint">сейчас здесь</span>'
+            : '<button class="btn" type="button" data-org="' + o.org_id + '">Перейти</button>') + '</div>';
+      }).join("");
+    box.style.display = "";
+    box.addEventListener("click", function (ev) {
+      var b = ev.target.closest("[data-org]");
+      if (!b) return;
+      b.disabled = true;
+      api("/api/account/switch-org", {method: "POST", body: {org_id: +b.getAttribute("data-org")}})
+        .then(function (r) { location.href = (r && r.redirect) || "/"; })
+        .catch(function (err) { b.disabled = false; toast("Не удалось перейти: " + err.message, "error"); });
+    });
+  }).catch(function () {});
 
   // ── Смена пароля ──────────────────────────────────────────────────────────
   document.getElementById("btn-pw").addEventListener("click", function () {

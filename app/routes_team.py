@@ -28,7 +28,7 @@ from datetime import datetime, timedelta
 from fastapi import APIRouter, Depends, HTTPException, Path, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -36,7 +36,7 @@ from app import auth, roles
 from app.account_recovery import token_hash
 from app.auth import AuthContext, require_perm
 from app.db import get_db
-from app.models import Membership, Org, OrgInvite, OrgRole, User
+from app.models import Membership, Org, OrgInvite, OrgRemoval, OrgRole, User
 
 # Прод работает одним процессом (run.py), поэтому замка процесса достаточно.
 _OWNER_LOCK = threading.Lock()
@@ -308,6 +308,9 @@ def api_team_member_remove(
         current, _name = roles.member_perms(db, member)
         _forbid_unless_subset(ctx, current, "Нельзя убрать сотрудника, у которого прав больше, чем у вас")
         db.delete(member)
+        # Вход из МойСклада не должен вернуть убранного сотрудника (ревью #110).
+        if db.get(OrgRemoval, (ctx.org.id, user_id)) is None:
+            db.add(OrgRemoval(org_id=ctx.org.id, user_id=user_id, removed_at=datetime.utcnow()))
         db.commit()
         return team_state(db, ctx)
 
@@ -593,6 +596,10 @@ def api_invite_accept(body: InviteAcceptIn, request: Request, db: Session = Depe
         member = Membership(user_id=user.id, org_id=inv.org_id, role="member")
         roles.apply_role(member, db.get(OrgRole, inv.role_id))
         db.add(member)
+        # Новое приглашение снимает отметку «убран» (вход из МойСклада снова
+        # работает): решение вернуть человека принял тот, кто выдал ссылку.
+        db.execute(delete(OrgRemoval).where(OrgRemoval.org_id == inv.org_id,
+                                            OrgRemoval.user_id == user.id))
         db.commit()
     except HTTPException:
         raise

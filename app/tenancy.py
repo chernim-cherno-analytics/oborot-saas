@@ -63,6 +63,7 @@ def org_purge_models() -> tuple:
         Membership,
         NotifySettings,
         OrgInvite,
+        OrgRemoval,
         OrgRole,
         OrderedQty,
         OrderPlan,
@@ -105,7 +106,7 @@ def org_purge_models() -> tuple:
         Product, Warehouse, Connection, Membership,
         # Роли (15.11.2026): приглашения ссылаются на роль, членство тоже
         # (memberships.role_id), поэтому роли стираются последними.
-        OrgInvite, OrgRole,
+        OrgInvite, OrgRole, OrgRemoval,
     )
 
 
@@ -117,14 +118,14 @@ def user_purge_models() -> tuple:
     в обоих потоках. Саму строку `users` стирает отдельный DELETE после цикла.
     """
     from app.models import (
-        AccountEvent, Membership, PasswordReset, RecoveryContact,
+        AccountEvent, Membership, OrgRemoval, PasswordReset, RecoveryContact,
         UserHintSeen, UserLesson, UserPrefs,
     )
 
     # Контакты восстановления — телефон и Telegram человека (D-63): с
     # удалённым аккаунтом они уходят, а не остаются осиротевшими личными данными.
     return (UserHintSeen, UserLesson, UserPrefs,
-            RecoveryContact, PasswordReset, AccountEvent, Membership)
+            RecoveryContact, PasswordReset, AccountEvent, Membership, OrgRemoval)
 
 
 # ── Ссылки, которые владением не являются ────────────────────────────────────

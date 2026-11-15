@@ -110,6 +110,16 @@ async def ms_app_entry(
 
     member = db.get(Membership, (user.id, org.id))
     if member is None:
+        # Владелец убрал этого сотрудника на странице «Сотрудники и роли»:
+        # вход из МойСклада не возвращает его сам (ревью Codex #110, P1).
+        from app.models import OrgRemoval
+        if db.get(OrgRemoval, (org.id, user.id)) is not None:
+            db.commit()
+            return _error_page(
+                403, "Доступ закрыт",
+                "Владелец убрал вас из организации в «Обороте». "
+                "Чтобы вернуться, попросите у него приглашение.",
+            )
         has_owner = db.execute(
             select(Membership.user_id).where(
                 Membership.org_id == org.id, Membership.role == "owner"

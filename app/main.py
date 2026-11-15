@@ -1313,6 +1313,48 @@ def _purge_user(db: Session, user_id: int) -> None:
     db.execute(delete(User).where(User.id == user_id))
 
 
+class SwitchOrgIn(BaseModel):
+    org_id: int = Field(ge=1, le=2_147_483_647)
+
+
+@app.get("/api/account/orgs")
+def api_account_orgs(
+    ctx: auth.AuthContext = Depends(auth.require_auth_api), db: Session = Depends(get_db)
+):
+    """Организации, в которых человек состоит (роли, ревью Codex #110).
+
+    Приглашение во вторую организацию добавляет членство, а вход по паролю
+    берёт первое: без переключателя после выхода вернуться во вторую было
+    нельзя. Здесь список, переключение ниже.
+    """
+    from app import roles as _roles
+    rows = db.execute(
+        select(Membership, Org).join(Org, Org.id == Membership.org_id)
+        .where(Membership.user_id == ctx.user.id).order_by(Org.name)
+    ).all()
+    out = []
+    for m, o in rows:
+        _p, role_name = _roles.member_perms(db, m)
+        out.append({"org_id": o.id, "name": o.name, "role_name": role_name,
+                    "current": o.id == ctx.org.id})
+    return {"orgs": out}
+
+
+@app.post("/api/account/switch-org")
+def api_account_switch_org(
+    body: SwitchOrgIn, request: Request,
+    ctx: auth.AuthContext = Depends(auth.require_auth_api), db: Session = Depends(get_db),
+):
+    """Перейти в другую свою организацию: только по существующему членству."""
+    member = db.get(Membership, (ctx.user.id, body.org_id))
+    if member is None:
+        raise HTTPException(status_code=404, detail="Организация не найдена")
+    response = JSONResponse({"ok": True, "redirect": "/"})
+    samesite = "none" if (auth.read_embed(request) and is_prod()) else "lax"
+    auth.set_session(response, ctx.user.id, body.org_id, ctx.user.session_version, samesite=samesite)
+    return response
+
+
 @app.post("/api/account/delete")
 def api_delete_account(
     body: AccountDeleteIn,

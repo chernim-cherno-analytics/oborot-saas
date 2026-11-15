@@ -271,6 +271,23 @@ class OrgInvite(Base):
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
+class OrgRemoval(Base):
+    """Сотрудник, которого убрали из организации (роли, 15.11.2026).
+
+    Нужна для входа из каталога МойСклада: каждый пользователь аккаунта МС,
+    открывший приложение, становится участником автоматически, и простое
+    удаление членства через минуту отменялось бы следующим входом (ревью
+    Codex #110, P1). Пока запись есть, вход из МС участника не создаёт;
+    вернуть человека можно только приглашением, которое запись снимает.
+    """
+
+    __tablename__ = "org_removals"
+
+    org_id: Mapped[int] = mapped_column(ForeignKey("orgs.id"), primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), primary_key=True)
+    removed_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
 # ── Восстановление доступа (PILOT-MANUAL-RECOVERY-1, D-63) ───────────────────
 # Три аддитивные таблицы; существующие не меняются. Откат кода оставляет их
 # неиспользуемыми, а отзыв сессий живёт только в users.session_version,
@@ -2195,7 +2212,8 @@ def ensure_roles_schema(bind=None) -> None:
     ни в одну сторону.
     """
     eng = bind or engine
-    Base.metadata.create_all(bind=eng, tables=[OrgRole.__table__, OrgInvite.__table__])
+    Base.metadata.create_all(bind=eng, tables=[OrgRole.__table__, OrgInvite.__table__,
+                                                OrgRemoval.__table__])
     insp = inspect(eng)
     if not insp.has_table("memberships"):
         return

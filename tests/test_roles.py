@@ -123,7 +123,7 @@ MUTATING = {"POST", "PUT", "PATCH", "DELETE"}
 PERSONAL = {
     "/api/hints/seen", "/api/lessons/{key}/done", "/api/lessons/reset",
     "/api/lessons/{key}/reset", "/api/prefs/hints", "/api/account/password",
-    "/api/account/delete", "/api/export/replenish.xlsx",
+    "/api/account/delete", "/api/export/replenish.xlsx", "/api/account/switch-org",
 }
 
 def all_routes(node=None) -> list:
@@ -722,6 +722,57 @@ with client() as hc:
     check("автор не в организации: имя автора приглашения не показывается",
           invs and all(i.get("created_by") == "" for i in invs if i.get("created_by") != "Гамма"),
           str(invs)[:300])
+
+print("\n== Ревью Codex #110: убранный из МойСклада не возвращается сам; переключение организаций ==")
+from app import ms_vendor as _msv_mod
+_orig_ctx = _msv_mod.get_context
+
+
+async def _fake_ctx(key):
+    return {"accountId": "acc-roles-ms", "uid": "emp@roles-ms", "fullName": "Сотрудник МС"}
+
+_msv_mod.get_context = _fake_ctx
+try:
+    with client() as hd:
+        hd.post("/register", data={"name": "Дельта", "email": "delta@roles.io",
+                                   "password": PW, "org_name": "Дельта"})
+        d_org = sql("SELECT id FROM orgs WHERE name='Дельта'")[0][0]
+        sql("UPDATE orgs SET ms_account_id='acc-roles-ms' WHERE id=?", d_org)
+        with client() as hm:
+            r = hm.get("/ms/app", params={"contextKey": "k"}, follow_redirects=False)
+            check("сотрудник МС входит и становится участником", r.status_code == 302, str(r.status_code))
+        ms_uid = sql("SELECT id FROM users WHERE ms_uid='emp@roles-ms'")[0][0]
+        r = hd.post(f"/api/team/members/{ms_uid}/remove")
+        check("владелец убирает сотрудника МС", r.status_code == 200, r.text[:200])
+        with client() as hm2:
+            r = hm2.get("/ms/app", params={"contextKey": "k"}, follow_redirects=False)
+            check("повторный вход из МС не возвращает убранного", r.status_code == 403
+                  and not sql("SELECT 1 FROM memberships WHERE user_id=? AND org_id=?", ms_uid, d_org),
+                  f"{r.status_code}")
+finally:
+    _msv_mod.get_context = _orig_ctx
+
+with client() as h1, client() as h2:
+    h1.post("/register", data={"name": "Эпсилон", "email": "eps@roles.io",
+                               "password": PW, "org_name": "Эпсилон"})
+    h2.post("/register", data={"name": "Зета", "email": "zeta@roles.io",
+                               "password": PW, "org_name": "Зета"})
+    viewer = next(r["id"] for r in h2.get("/api/team").json()["roles"] if r["builtin"] == "viewer")
+    tok = h2.post("/api/team/invites", json={"role_id": viewer}).json()["link_path"].split("t=", 1)[1]
+    r = h1.post("/api/invite/accept", json={"token": tok, "mode": "join"})
+    check("Эпсилон принял приглашение в Зету", r.status_code == 200, r.text[:200])
+with client() as h3:
+    login(h3, "eps@roles.io")
+    orgs = h3.get("/api/account/orgs").json()["orgs"]
+    check("в списке две организации", sorted(o["name"] for o in orgs) == ["Зета", "Эпсилон"], str(orgs))
+    other = next(o for o in orgs if not o["current"])
+    r = h3.post("/api/account/switch-org", json={"org_id": other["org_id"]})
+    now = next(o for o in h3.get("/api/account/orgs").json()["orgs"] if o["current"])
+    check("переключение в другую свою организацию", r.status_code == 200 and now["org_id"] == other["org_id"],
+          f"{r.status_code} {now}")
+    foreign = sql("SELECT id FROM orgs WHERE name='Дельта'")[0][0]
+    r = h3.post("/api/account/switch-org", json={"org_id": foreign})
+    check("в чужую организацию переключиться нельзя (404)", r.status_code == 404, str(r.status_code))
 
 for base in (DB_PATH, OLD_DB_PATH):
     for suffix in ("", "-wal", "-shm"):
