@@ -164,6 +164,9 @@ def build_budget(
         "exclude_categories": sorted(exclude_cats),
         "production_id": pid,
         "moq_ui": 2,  # пусто = партия канала (WIZARD-MOQ-1)
+        # Резерв под новинки (настройка мастера) здесь не держим: страница
+        # распределяет названную сумму целиком (ревью #108, P2).
+        "reserve_new_pct": 0,
     }
     plan = order_planner.build_plan(db, org, snap, brief)
     # Горизонт тот, по которому мастер реально считал (ритм канала мог его
@@ -243,6 +246,11 @@ def build_budget(
         "excluded_loss": [{"base_name": r["base_name"], "loss_unit": int(r.get("loss_unit") or 0)}
                           for r in (review.get("below_cost") or [])][:50],
         "excluded_loss_count": int(review.get("below_cost_count") or 0),
+        # Мало данных (темп из 1-2 продаж): мастер их не советует, решает
+        # человек галочкой. Называем, чтобы позиция не пропадала без следа.
+        "low_data": [{"base_name": r["base_name"], "need": r.get("need"), "cs": int(r.get("cs") or 0)}
+                     for r in (review.get("low_data") or [])][:50],
+        "low_data_count": int(review.get("low_data_count") or 0),
         "other_production_count": int(review.get("other_production_count") or 0),
         "production": prod,
         "productions": [{"id": p.id, "name": p.name, "is_main": bool(p.is_main)} for p in productions],

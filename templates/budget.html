@@ -158,7 +158,7 @@
       <thead><tr>
         <th style="text-align:left">Позиция</th>
         <th title="Оборачиваемость: нетто-выручка ₽/день за дни в стоке — приоритет распределения">Оборач., ₽/день</th>
-        <th title="Честный темп продаж">Темп, шт/мес</th>
+        <th title="Темп, которым посчитана потребность: с поправкой на сезон того периода, когда партия будет продаваться (как в мастере)">Темп, шт/мес</th>
         <th title="Остаток + едет к нам">Остаток+едет</th>
         <th title="На сколько дней хватит текущего запаса">Запас, дн</th>
         <th title="Как на «Заказе» и в мастере: темп × горизонт − прогнозный остаток к приходу (остаток − темп × срок производства, плюс «едет»)">Потребность</th>
@@ -384,6 +384,19 @@
           (soldOut?', из них '+soldOut+' с остатком 0 (возможно, просто распроданы; в «Мастере заказа» их можно отметить и взять в расчёт)':'')+': '+
           stale.map(function(r){ return esc(r.base_name)+((r.cs||0)>0?'':' (остаток 0)'); }).join(", ")+
           (d.excluded_fresh_count>stale.length?' и ещё '+(d.excluded_fresh_count-stale.length):'')+'.</div>':"";
+      // Ревью #108: партия дороже лимита доли на позицию, и позиции с
+      // темпом из одной-двух продаж: в распределение не вошли, называем.
+      var oc=d.moq_over_cap||[];
+      if(oc.length){
+        document.getElementById("warnBox").innerHTML+='<div class="warn">Минимальная партия дороже лимита на позицию, не вошли: '+
+          oc.map(function(r){ return esc(r.base_name)+' (партия '+fmt(r.batch_qty||0)+' шт, '+fmt(r.batch_full_cost||r.batch_cost||0)+' ₽)'; }).join(", ")+
+          '. Поднимите «Макс. на позицию» или решите в мастере.</div>';
+      }
+      if(d.low_data_count){
+        document.getElementById("warnBox").innerHTML+='<div class="warn">'+fmt(d.low_data_count)+
+          ' поз. с темпом из одной-двух продаж не распределяются (решаете вы в мастере заказа галочкой): '+
+          (d.low_data||[]).map(function(r){ return esc(r.base_name); }).join(", ")+'.</div>';
+      }
       if(d.other_production_count){
         document.getElementById("warnBox").innerHTML+='<div class="warn">'+fmt(d.other_production_count)+
           ' поз. закреплены за другими производствами и считаются при их выборе.</div>';

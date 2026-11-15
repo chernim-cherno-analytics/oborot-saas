@@ -76,6 +76,33 @@ with TestClient(app, headers={"X-Oborot-CSRF": "1"}) as c:
         check(f"потребность «Заказа» и мастера совпадает у каждой общей позиции ({label})",
               not diff, f"{len(diff)} из {len(both)}: {diff[:5]}")
 
+    print("\n4. Нулевой темп окна не подменяется годовым (ревью #108, P1)")
+    import sqlite3 as _sq
+    from datetime import date as _d, timedelta as _td
+    c.post("/api/settings", json={"rate_window": "season"})
+    snapd = c.get("/api/replenish").json()
+    sf, st = snapd.get("season_from"), snapd.get("season_to")
+    tgt = next((i["base_name"] for i in snapd["items"]
+                if i.get("cs", 0) > 0 and not i.get("low_data") and i.get("rate_year", 0) > 0.3), None)
+    if tgt and sf and st:
+        with _sq.connect(DB_PATH) as con:
+            ids = [r[0] for r in con.execute("SELECT id FROM products WHERE base_name=?", (tgt,))]
+            for pid in ids:
+                con.execute("DELETE FROM sales WHERE product_id=? AND date>=? AND date<=?", (pid, sf, st))
+            con.commit()
+        c.post("/api/settings", json={"rate_window": "season"})
+        rep4 = c.get("/api/replenish").json()
+        excl = {e["base_name"] for e in rep4["excluded"]}
+        plan4 = c.post("/api/order-plan/preview", json={
+            "budget": 50_000_000, "strategy": "grow", "max_share_pct": 100}).json()
+        bud4 = c.get("/api/budget", params={"amount": 50_000_000, "max_share": 100}).json()
+        check("позиция без продаж в сезонном окне исключена «Заказом»", tgt in excl, tgt)
+        check("мастер её не заказывает годовым темпом",
+              tgt not in {i["base_name"] for i in plan4["items"]}, tgt)
+        check("«Бюджет» тоже", tgt not in {i["base_name"] for i in bud4["items"]}, tgt)
+    else:
+        check("нашлась позиция для сцены нулевого темпа", False, f"{tgt} {sf} {st}")
+
     print("\n3. «Бюджет» = мастер с теми же условиями (D-79, 1A)")
     bud = c.get("/api/budget", params={"amount": 300000, "max_share": 30}).json()
     plan = c.post("/api/order-plan/preview", json={

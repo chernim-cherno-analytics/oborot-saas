@@ -109,7 +109,8 @@ check("мастер на телефоне: новинка не уходит за
       ".nirow { display: flex; gap: 8px; margin-bottom: 7px; align-items: center; flex-wrap: wrap; }" in a_html)
 h_html = (ROOT / "templates" / "_hints.html").read_text(encoding="utf-8")
 check("подсказка «Бюджета» по D-65 и D-79 (вид мастера)",
-      "− остаток − «едет»" not in h_html and "Это вид мастера заказа" in h_html)
+      "− остаток − «едет»" not in h_html and "Это вид мастера заказа" in h_html
+      and "прогнозный остаток к приходу" in h_html)
 p_html = (ROOT / "templates" / "plans.html").read_text(encoding="utf-8")
 check("значок «Популярный» только когда тарифов больше одного",
       "p.popular && (data.plans || []).length > 1" in p_html)
