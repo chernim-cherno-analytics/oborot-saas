@@ -981,7 +981,15 @@ def login_submit(
         select(Membership).where(Membership.user_id == user.id)
     ).scalars().first()
     if member is None:
-        return _render_auth(request, "login.html", email=email_norm, error="У пользователя нет организации")
+        # QA 15.11: так выглядит вход сотрудника, которого владелец убрал из
+        # единственной организации. Раньше «нет организации» без выхода:
+        # регистрация занята, удаление аккаунта требует входа. Вернуться можно
+        # по новой ссылке-приглашению (вход по ней этим же паролем).
+        return _render_auth(
+            request, "login.html", email=email_norm,
+            error="Вы не состоите ни в одной организации: владелец убрал доступ. "
+                  "Чтобы вернуться, попросите у него новую ссылку-приглашение и "
+                  "войдите по ней этим же e-mail и паролем.")
     response = RedirectResponse("/", status_code=303)
     auth.set_session(response, user.id, member.org_id, user.session_version)
     return response

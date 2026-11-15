@@ -649,6 +649,13 @@ with client() as owner, client() as ownerB:
         login(vb2, "viewer@b.io")
         check("убранный больше не видит организацию",
               vb2.get("/api/settings").json()["org"]["name"] == "Чужая")
+    solo_uid = add_user("gone@roles.io", org_id)
+    owner.post(f"/api/team/members/{solo_uid}/remove")
+    with client() as so:
+        r = so.post("/login", data={"email": "gone@roles.io", "password": PW}, follow_redirects=False)
+        check("убранный без других организаций: вход объясняет, как вернуться (QA 15.11)",
+              r.status_code == 200 and "приглашение" in r.text and "oborot_session" not in r.headers.get("set-cookie", ""),
+              f"{r.status_code} {r.headers.get('set-cookie')} {'приглашение' in r.text}")
 
     print("\n9. МойСклад: участник из каталога получает «Сотрудника»")
     from app import routes_ms_app
