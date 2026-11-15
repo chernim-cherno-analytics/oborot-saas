@@ -268,14 +268,20 @@
   /* Данные таблицы могут ещё грузиться (на большом каталоге это секунды, а
      карточка первого визита появляется раньше): тогда ждём загрузку, а не
      объявляем таблицу пустой (ревью PR #134). */
+  function lessonOn(){ var c = document.querySelector(".tour-card"); return !!(c && c.getClientRects().length); }
   function start(){
     var T = window.OborotTurnover;
     if (active || pending || !T) return;
+    // Поверх идущего урока подсказки не запускаются ни из меню, ни из
+    // карточки первого визита: два слоя объяснений сразу хуже, чем ни одного.
+    if (lessonOn()) { toast("Сначала закончите урок, потом откройте подсказки через знак вопроса"); return; }
     if (T.loaded && !T.loaded()) {
       pending = true;
       toast("Загружаем таблицу. Подсказки начнутся сразу после этого.");
-      var fin = function(){ pending = false; begin(); };
-      T.whenReady().then(fin, fin);
+      T.whenReady().then(function(){ pending = false; begin(); }, function(){
+        pending = false;
+        toast("Таблица не загрузилась. Обновите страницу и откройте подсказки ещё раз.");
+      });
       return;
     }
     begin();

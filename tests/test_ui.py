@@ -3427,12 +3427,17 @@ def _settings_compact_lists(browser, base: str) -> None:
     # каталоге они есть и распределяются по каналам так же.
     bases = sorted({it["base_name"] for it in rep.get("items", [])}
                    | {e["base_name"] for e in rep.get("excluded", []) if e.get("below_cost")})
-    for b in bases[:25]:
+    # Сколько позиций в рекомендации демо, зависит от дня запуска (сезонность):
+    # 15.11.2026 их было 39, 16.11 стало 38, и при жёстких «25 исключить»
+    # оставалось 13 значений вместо нужных «больше 15». Исключаем столько,
+    # чтобы хватило и на «Показать ещё» (больше 20), и на длинный список.
+    n_excl = max(21, min(25, len(bases) - 17))
+    for b in bases[:n_excl]:
         cl.post("/api/exclusions", json={"base_name": b, "excluded": True})
     excl = cl.get("/api/exclusions").json().get("excluded") or []
     # Фикстура набора (как тариф в других проверках): у каждой оставшейся
     # позиции свой поставщик — длинный список значений для распределения.
-    left = bases[25:]
+    left = bases[n_excl:]
     with sqlite3.connect(DB_PATH) as con:
         for i, b in enumerate(left):
             con.execute("UPDATE products SET supplier=? WHERE org_id=? AND base_name=?",
@@ -3440,7 +3445,7 @@ def _settings_compact_lists(browser, base: str) -> None:
     src = cl.get("/api/productions/assign-sources").json()
     sup_values = [v["value"] for v in (src.get("sources") or {}).get("supplier", {}).get("values", [])]
     check("настройки: синтетика — 12 производств, 25 исключённых, у каждой позиции свой поставщик",
-          len(all_prods) == 12 and len(excl) >= 25 and SPECIAL_S in sup_values and len(sup_values) == len(left)
+          len(all_prods) == 12 and len(excl) >= n_excl and SPECIAL_S in sup_values and len(sup_values) == len(left)
           and len(left) > 15, f"prods={len(all_prods)} excl={len(excl)} sup={len(sup_values)}/{len(left)}")
     cookies = [{"name": k, "value": v, "domain": "127.0.0.1", "path": "/"} for k, v in cl.cookies.items()]
 

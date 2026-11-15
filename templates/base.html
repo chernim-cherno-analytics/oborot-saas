@@ -1,10 +1,13 @@
 <!DOCTYPE html>
-<html lang="ru">
+<html lang="ru" class="ui2">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{ page_title or "Оборот" }} — Оборот</title>
   <link rel="stylesheet" href="/static/app.css">
+  {# UI2-3 (D-84): общий новый вид. Только стили: разметка каркаса прежняя. #}
+  <link rel="stylesheet" href="/static/ui2.css?v=2">
+  <link rel="stylesheet" href="/static/ui2-pages.css?v=1">
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='6' fill='%231554d1'/%3E%3Ctext x='12' y='17' font-family='Arial,sans-serif' font-size='14' font-weight='800' fill='white' text-anchor='middle'%3E%D0%9E%3C/text%3E%3C/svg%3E">
   <script src="/static/app.js" defer></script>
   {# PILOT-UX-SHELL-1: мобильное меню сайдбара ведёт тот же static/shell.js,
@@ -16,6 +19,7 @@
   {% if perms is defined %}{% include "_perms_css.html" %}{% endif %}
 </head>
 <body class="{% if embedded %}embed {% endif %}{% block bodyclass %}{% endblock %}"{% if perms is defined %} data-perms="{{ perms|join(' ') }}"{% endif %}>
+<div class="gradient-bg" aria-hidden="true"></div>
 {% block body %}
 {% if embedded %}
 {# ── Встроенный режим: внутри iframe раздела «Приложения» МойСклад. ──────────

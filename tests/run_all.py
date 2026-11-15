@@ -235,6 +235,8 @@ SUITES = [
     ("ui_day_15_11", "test_ui_day_15_11.py", False, False),
     # UI2 (D-84): «Оборачиваемость» в новом виде и подсказки по клику. Браузерный.
     ("ui2_turnover", "test_ui2_turnover.py", False, False),
+    # UI2-3 (D-84): остальные страницы в новом виде. Браузерный.
+    ("ui2_pages", "test_ui2_pages.py", False, False),
     ("deps",        "test_dependencies.py",    False, False),
 ]
 
