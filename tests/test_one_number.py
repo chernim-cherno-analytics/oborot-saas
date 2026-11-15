@@ -76,6 +76,16 @@ with TestClient(app, headers={"X-Oborot-CSRF": "1"}) as c:
         check(f"потребность «Заказа» и мастера совпадает у каждой общей позиции ({label})",
               not diff, f"{len(diff)} из {len(both)}: {diff[:5]}")
 
+    print("\n3. Окно «сезон», фиксированный горизонт: одно число при любом округлении темпа (QA 15.11)")
+    bad = []
+    for lead, horizon in ((7, 212), (7, 150), (7, 300), (30, 120), (30, 250), (60, 180)):
+        c.post("/api/settings", json={"rate_window": "season", "cover_mode": "fixed",
+                                      "lead_time_days": lead, "horizon_days": horizon})
+        rep, mas = needs(c)
+        bad += [(lead, horizon, b, rep[b], mas[b]) for b in set(rep) & set(mas) if rep[b] != mas[b]]
+    check("срок × горизонт: «Заказ» и мастер совпадают у всех общих позиций", not bad, str(bad[:5]))
+    c.post("/api/settings", json={"cover_mode": "cadence"})
+
     print("\n4. Нулевой темп окна не подменяется годовым (ревью #108, P1)")
     import sqlite3 as _sq
     from datetime import date as _d, timedelta as _td
