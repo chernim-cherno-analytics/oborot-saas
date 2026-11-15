@@ -1786,8 +1786,10 @@
     var rc=(it.rate_cover!==undefined?it.rate_cover:it.rate), rl=(it.rate_lead!==undefined?it.rate_lead:it.rate);
     var seas=(it.season_factor&&Math.abs(it.season_factor-1)>0.005)
       ?', с поправкой на сезон того периода, когда партия будет продаваться (×'+fmtNum(it.season_factor,2)+')':"";
-    return '<p class="formula">Расчёт (окно темпа: '+winTxt+seas+'): '+fmtNum(rc,2)+' шт/день × '+fmt(HORIZON)+
-      ' дн ≈ '+fmtNum(rc*HORIZON,1)+' − прогнозный остаток к приходу '+fmt(proj)+
+    var hz=it.horizon_days||HORIZON;
+    var hzNote=(hz!==HORIZON)?' (горизонт по ритму заказов канала «'+esc(it.production_name||"")+'»)':"";
+    return '<p class="formula">Расчёт (окно темпа: '+winTxt+seas+'): '+fmtNum(rc,2)+' шт/день × '+fmt(hz)+
+      ' дн'+hzNote+' ≈ '+fmtNum(rc*hz,1)+' − прогнозный остаток к приходу '+fmt(proj)+
       ' (остаток '+fmt(it.cs)+' минус продажи за '+fmt(lead)+' дн производства по '+fmtNum(rl,2)+' шт/день, плюс едет '+fmt(it.ordered||0)+')'+
       ' = <b>'+fmt(it.need_raw!==undefined?it.need_raw:it.need)+' шт</b>.'+leadNote+moq+manual+
       ' Темпы: год '+fmtNum(it.rate_year,2)+' · 90 дн '+fmtNum(it.rate_90,2)+

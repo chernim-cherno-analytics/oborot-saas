@@ -175,7 +175,7 @@ PLANNER_PY = Path(op.__file__).resolve()
 # Ровно те строки, которые набор и запирает. Ищутся по тексту, а не по номеру:
 # номер поедет от любой правки выше по файлу, а замок обязан переживать правки,
 # которые его не касаются.
-NEED_LINE_ANALYTICS = 'item["need"] = max(0, int(round(r_cover * horizon - proj_stock)))'
+NEED_LINE_ANALYTICS = 'item["need"] = max(0, int(round(r_cover * hz - proj_stock)))'
 # D-65: «едет» не закрывает продажи до прихода.
 PROJ_LINE_ANALYTICS = 'proj_stock = max(0.0, cs - r_lead * lead) + max(0.0, float(item["ordered"]))'
 NEED_LINE_PLANNER = "need = max(0, int(round(r_cover * cover - proj_stock)))"
