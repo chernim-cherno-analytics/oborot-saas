@@ -2049,7 +2049,7 @@
       : "категории заказа не выбраны";
     document.getElementById("s-qty").textContent=fmt(qty);
     document.getElementById("s-cost").textContent=fmtMoneyShort(cost);
-    // D-87: себестоимость с накладными из настроек, как в мастере и «Бюджете».
+    // D-88: себестоимость с накладными из настроек, как в мастере и «Бюджете».
     var ohTxt=(OVERHEAD_PCT>0)?(" (с накладными "+fmtNum(OVERHEAD_PCT,0)+" %)"):"";
     document.getElementById("s-cost-sub").textContent = noCost
       ? "СУММА НЕПОЛНАЯ: "+fmt(noCost)+" поз. ("+fmt(noCostQty)+" шт) без себестоимости"

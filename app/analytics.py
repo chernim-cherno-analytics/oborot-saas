@@ -737,7 +737,7 @@ def _received_on_open_local_orders(db: Session, org_id: int) -> dict[str, float]
 
 
 def drafts_by_base(db: Session, org_id: int) -> dict[str, int]:
-    """D-84 (решение владельца 15.11.2026): сколько штук каждой модели лежит в
+    """D-85 (решение владельца 15.11.2026): сколько штук каждой модели лежит в
     черновиках заказов. Черновик не обязательство, поэтому в «Едет» он не
     входит, но потребность на «Заказе», в мастере и «Бюджете» уменьшает, с
     пометкой в строке: иначе после «Оформить» тот же экран снова просил дошить
@@ -2094,7 +2094,7 @@ _NO_HISTORY_REASON = {
 
 
 def _with_overhead(cost, settings: dict) -> int:
-    """Себестоимость с накладными % (D-87), то же правило, что в мастере."""
+    """Себестоимость с накладными % (D-88), то же правило, что в мастере."""
     c = float(cost or 0)
     oh = float(settings.get("overhead_pct") or 0)
     if c > 0 and oh > 0:
@@ -2238,7 +2238,7 @@ def build_replenish(snap: dict) -> dict:
                     for s, v in sorted(it["sizes"].items(), key=lambda kv: _size_order(kv[0]))
                 },
                 "avg_price": avg_price,
-                # D-87 (решение владельца 15.11.2026): деньги «Заказа» с
+                # D-88 (решение владельца 15.11.2026): деньги «Заказа» с
                 # накладными из настроек, как в мастере и «Бюджете»
                 # (order_planner._candidates). Без них одна и та же штука
                 # стоила 4 029 ₽ на «Заказе» и 4 835 ₽ в мастере.
@@ -2255,7 +2255,7 @@ def build_replenish(snap: dict) -> dict:
         # сколько позиций в заказе посчитаны по годовому темпу вместо окна
         "fallback_count": sum(1 for x in result if x["rate_fallback"]),
         "lead_time_days": lead_time,
-        # D-87: накладные, которые уже сидят в cost_price строк.
+        # D-88: накладные, которые уже сидят в cost_price строк.
         "overhead_pct": float(settings.get("overhead_pct") or 0),
         "season_from": snap.get("season_from"),
         "season_to": snap.get("season_to"),
