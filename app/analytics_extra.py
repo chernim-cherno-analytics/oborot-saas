@@ -41,6 +41,7 @@ from app.categories import ru_category
 from app.models import (
     CategoryMerge,
     Product,
+    Production,
     Sale,
     SkuCategoryOverride,
     SkuHidden,
@@ -119,162 +120,131 @@ def sold_out_with_demand(it: dict) -> bool:
 
 def build_budget(
     db: Session,
-    org_id: int,
+    org,
     snap: dict,
     amount: int,
     max_share: int,
     exclude_cats: set[str],
+    production_id: int | None = None,
 ) -> dict:
-    """GET /api/budget — распределение бюджета закупки по оборачиваемости."""
-    horizon = snap["settings"]["horizon_days"]
+    """GET /api/budget: распределение бюджета закупки, вид мастера «Глубина».
+
+    D-79 (решение владельца 15.11.2026, вариант 1A): «Бюджет» больше не
+    отдельный расчёт. Раньше он раскладывал сумму своим жадным циклом без
+    партий, кратности и этапов, и на 200 000 ₽ давал 5 позиций / 42 шт, когда
+    мастер давал 30 позиций / 75 шт, и клал в заказ позиции ниже минимальной
+    партии фабрики. Теперь это `order_planner.build_plan` со стратегией
+    «Заработать максимум» (ширина до полной потребности, начиная с топов по
+    оборачиваемости), лимитом доли из страницы и бюджетом «весь заказ
+    целиком» (сумма = полная себестоимость, как всегда на этой странице).
+    Канал: выбранный на странице или основной; позиции других каналов
+    считаются отдельно (`other_production_count`).
+
+    Форма ответа прежняя (страница и Excel читают те же поля), плюс
+    `production`, `productions` и `engine`.
+    """
+    from app import order_planner  # локально: order_planner импортирует analytics
+
     max_share = max(5, min(100, int(max_share)))
-    fresh = _fresh_bases(db, org_id)
+    productions = (
+        db.query(Production).filter(Production.org_id == org.id)
+        .order_by(Production.is_main.desc(), Production.id).all()
+    )
+    pid = None
+    if production_id is not None and any(p.id == production_id for p in productions):
+        pid = production_id
+    elif productions:
+        pid = next((p.id for p in productions if p.is_main), productions[0].id)
+    brief = {
+        "budget": int(amount),
+        "budget_scope": "full",
+        "strategy": "grow",
+        "width_days": 0,
+        "max_share_pct": max_share,
+        "exclude_categories": sorted(exclude_cats),
+        "production_id": pid,
+        "moq_ui": 2,  # пусто = партия канала (WIZARD-MOQ-1)
+    }
+    plan = order_planner.build_plan(db, org, snap, brief)
+    horizon = int((plan.get("brief") or {}).get("cover_days") or snap["settings"]["horizon_days"])
 
-    candidates, no_cost = [], []
-    excluded_fresh = 0
-    excluded_fresh_items: list[dict] = []
-    excluded_loss_items: list[dict] = []
-    all_categories: set[str] = set()
-
-    for it in snap["items"].values():
-        if it["archived"] or it.get("hidden"):
-            continue
-        dis, nq = it["dis"], it["nq"]
-        if dis <= 0 or nq <= 0:
-            continue  # нет продаж вообще
-        # Аудит 18.08 (GAP №1 оригинала воспроизводился здесь): бюджет считал
-        # need по-своему — годовой темп без учёта rate_window и БЕЗ вычета
-        # продаж за срок производства → потребность топ-позиций систематически
-        # занижалась. Теперь берём готовые need/rate_active из снапшота —
-        # ровно та же формула, что на «Заказе» (см. analytics.py:611-613),
-        # как и обещает подпись на самой странице бюджета.
-        rate = float(it.get("rate_active") or 0)
-        if rate <= 0:
-            # Фолбэк — годовой темп (nq365/dis365), как и раньше: nq/dis с
-            # ревизии 23.08 (D-35) — окно канона (2 года), это не темп.
-            rate = float(it.get("rate_year") or 0)
-        stock_eff = it["cs"] + max(0, int(it["ordered"]))
-        need = int(it.get("need") or 0)
-        if need < NEED_MIN:
-            continue  # потребность мизерная
-        category = it["category"] or "Без категории"
-        all_categories.add(category)
-        if category in exclude_cats:
-            continue
-        if it["base_name"] not in fresh and not sold_out_with_demand(it):
-            excluded_fresh += 1  # нет продаж за FRESH_DAYS — неактуально
-            # TRUTH-LABELS-1: имя и остаток, чтобы распроданную позицию было
-            # видно (отсев не меняется: политика FRESH за владельцем).
-            excluded_fresh_items.append({"base_name": it["base_name"], "cs": int(it["cs"] or 0)})
-            continue
-        # D-76: продаётся в минус, из распределения исключено (как «Заказ» и мастер).
-        if it.get("below_cost") and not it.get("low_data", False):
-            excluded_loss_items.append({"base_name": it["base_name"],
-                                        "loss_unit": int(it.get("loss_unit") or 0)})
-            continue
-        cost = float(it["cost_price"] or 0)
-        entry = {
-            "base_name": it["base_name"],
-            "category": category,
-            "cls": it["cls"],
-            "turnover": it["turnover"],
+    items = []
+    for i in plan.get("items") or []:
+        rate = float(i.get("rate") or 0)
+        stock_eff = int(i.get("cs") or 0) + int(i.get("ordered") or 0)
+        why = i.get("why") or []
+        cap_reason = ("share" if "capped_share" in why
+                      else "budget" if "capped_budget" in why else None)
+        items.append({
+            "base_name": i["base_name"],
+            "category": i["category"],
+            "cls": i.get("cls"),
+            "turnover": i.get("turnover"),
             "rate": round(rate, 4),
             "stock_eff": stock_eff,
-            "ordered": int(it["ordered"]),
+            "ordered": int(i.get("ordered") or 0),
             "days_left": round(stock_eff / rate) if rate > 0 else None,
-            "need": need,
-            "cost_price": round(cost),
-        }
-        if cost <= 0:
-            # НЕ считаем по нулю — отдельным списком
-            no_cost.append(entry)
-            continue
-        price = _item_price(it)
-        entry["margin"] = price - cost
-        candidates.append(entry)
-
-    # Приоритет — строго оборачиваемость (₽/день), как на /turnover.
-    candidates.sort(key=lambda x: -x["turnover"])
-    no_cost.sort(key=lambda x: -x["turnover"])
-
-    cap_sum = amount * max_share / 100.0
-    rest = float(amount)
-    items, not_included = [], []
-    for c in candidates:
-        cost = c["cost_price"]
-        by_cap = int(cap_sum // cost)
-        by_rest = int(rest // cost)
-        qty = min(c["need"], by_rest, by_cap)
-        over_limit = False
-        if qty < 1 and by_cap < 1 and by_rest >= 1:
-            # 1 штука дороже лимита на позицию — не выкидываем, берём минимум 1
-            qty = 1
-            over_limit = True
-        if qty < 1:
-            not_included.append(
-                {
-                    "base_name": c["base_name"],
-                    "category": c["category"],
-                    "cls": c["cls"],
-                    "turnover": c["turnover"],
-                    "need": c["need"],
-                    "cost_price": cost,
-                    "need_rub": c["need"] * cost,
-                    "days_left": c["days_left"],
-                }
-            )
-            continue
-        total = qty * cost
-        rest -= total
-        capped = qty < c["need"]
-        cap_reason = None
-        if capped:
-            cap_reason = "share" if (qty == by_cap and by_cap <= by_rest) else "budget"
-        items.append(
-            {
-                "base_name": c["base_name"],
-                "category": c["category"],
-                "cls": c["cls"],
-                "turnover": c["turnover"],
-                "rate": c["rate"],
-                "stock_eff": c["stock_eff"],
-                "ordered": c["ordered"],
-                "days_left": c["days_left"],
-                "need": c["need"],
-                "qty": qty,
-                "cost_price": cost,
-                "total": round(total),
-                "capped": capped,
-                "cap_reason": cap_reason,
-                "over_limit": over_limit,
-                "expected_profit": round(c["margin"] * qty),
-            }
-        )
-
-    used = amount - rest
-    # Потребность (need) берётся из снапшота и зависит от активного окна темпа —
-    # отдаём окно и его подпись, чтобы страница и выгрузка не молчали об этом.
+            "need": int(i.get("need") or 0),
+            "qty": int(i.get("qty") or 0),
+            "cost_price": i.get("cost_price"),
+            "total": int(i.get("cost_total") or 0),
+            "capped": int(i.get("unmet") or 0) > 0,
+            "cap_reason": cap_reason,
+            # Партия или короб подняли количество сверх потребности.
+            "over_limit": bool(i.get("over_need")),
+            "over_need": int(i.get("over_need") or 0),
+            "why_text": i.get("why_text") or "",
+            "expected_profit": int(i.get("expected_profit") or 0),
+        })
+    not_included = []
+    for r in plan.get("not_included") or []:
+        not_included.append({
+            "base_name": r["base_name"],
+            "category": r.get("category"),
+            "cls": r.get("cls"),
+            "turnover": r.get("turnover"),
+            "need": r.get("need"),
+            "cost_price": r.get("cost_price"),
+            "need_rub": r.get("need_rub"),
+            "days_left": None,
+            "moq_skip_days": r.get("moq_skip_days"),
+        })
+    review = plan.get("review") or {}
+    used = int((plan.get("totals") or {}).get("cost") or 0)
+    categories = sorted({(it.get("category") or "Без категории")
+                         for it in snap["items"].values()
+                         if not it.get("archived") and not it.get("hidden")})
     rate_window = snap["settings"].get("rate_window", "year")
+    prod = plan.get("production")
     return {
+        "engine": "master",
         "amount": amount,
         "max_share": max_share,
         "horizon_days": horizon,
         "rate_window": rate_window,
         "rate_window_label": RATE_WINDOW_RU.get(rate_window, RATE_WINDOW_RU["year"]),
-        "fresh_days": FRESH_DAYS,
-        "used": round(used),
-        "rest": round(rest),
+        "fresh_days": int(review.get("fresh_days") or FRESH_DAYS),
+        "used": used,
+        "rest": max(0, int(amount) - used),
         "items": items,
         "not_included": not_included,
+        "moq_over_cap": plan.get("moq_over_cap") or [],
         "no_cost": [
-            {k: v for k, v in x.items() if k != "margin"} for x in no_cost
+            {"base_name": r["base_name"], "category": r.get("category"),
+             "turnover": r.get("turnover"), "need": r.get("need"), "cost_price": 0,
+             "stock_eff": int(r.get("cs") or 0)}
+            for r in review.get("no_cost") or []
         ],
-        "excluded_fresh_count": excluded_fresh,
-        "excluded_fresh": sorted(excluded_fresh_items,
-                                 key=lambda r: (r["cs"] > 0, r["base_name"]))[:50],
-        "excluded_loss": sorted(excluded_loss_items, key=lambda r: -r["loss_unit"])[:50],
-        "excluded_loss_count": len(excluded_loss_items),
-        "categories": sorted(all_categories),
+        "excluded_fresh_count": int(review.get("stale_count") or 0),
+        "excluded_fresh": [{"base_name": r["base_name"], "cs": int(r.get("cs") or 0)}
+                           for r in (review.get("stale") or [])][:50],
+        "excluded_loss": [{"base_name": r["base_name"], "loss_unit": int(r.get("loss_unit") or 0)}
+                          for r in (review.get("below_cost") or [])][:50],
+        "excluded_loss_count": int(review.get("below_cost_count") or 0),
+        "other_production_count": int(review.get("other_production_count") or 0),
+        "production": prod,
+        "productions": [{"id": p.id, "name": p.name, "is_main": bool(p.is_main)} for p in productions],
+        "categories": categories,
         "totals": {
             "positions": len(items),
             "units": sum(i["qty"] for i in items),

@@ -146,13 +146,15 @@ def api_budget(
     amount: int = Query(200_000, ge=1, le=1_000_000_000),
     max_share: int = Query(30, ge=5, le=100),
     exclude_cats: str = Query(""),
+    production_id: int | None = Query(None, ge=1, le=2_147_483_647),
     ctx: AuthContext = Depends(require_auth_api),
     db: Session = Depends(get_db),
 ):
-    """Бюджет закупки: жадное распределение по оборачиваемости (см. analytics_extra)."""
+    """Бюджет закупки: вид мастера «Глубина» (D-79, см. analytics_extra.build_budget)."""
     snap = analytics.get_snapshot(db, ctx.org)
     excluded = {c.strip() for c in exclude_cats.split(",") if c.strip()}
-    return analytics_extra.build_budget(db, ctx.org.id, snap, amount, max_share, excluded)
+    return analytics_extra.build_budget(db, ctx.org, snap, amount, max_share, excluded,
+                                        production_id)
 
 
 @router.get("/api/forecast")
@@ -968,13 +970,15 @@ def export_budget_xlsx(
     amount: int = Query(200_000, ge=1, le=1_000_000_000),
     max_share: int = Query(30, ge=5, le=100),
     exclude_cats: str = Query(""),
+    production_id: int | None = Query(None, ge=1, le=2_147_483_647),
     ctx: AuthContext = Depends(require_auth_api),
     db: Session = Depends(get_db),
 ):
-    """Распределение бюджета закупки в Excel (параметры — как у /api/budget)."""
+    """Распределение бюджета закупки в Excel (параметры как у /api/budget)."""
     snap = analytics.get_snapshot(db, ctx.org)
     excluded = {c.strip() for c in exclude_cats.split(",") if c.strip()}
-    data = analytics_extra.build_budget(db, ctx.org.id, snap, amount, max_share, excluded)
+    data = analytics_extra.build_budget(db, ctx.org, snap, amount, max_share, excluded,
+                                        production_id)
     wb = export_xlsx.budget_workbook(ctx.org.name, data)
     return export_xlsx.xlsx_response(wb, "Бюджет закупки.xlsx", "budget.xlsx")
 

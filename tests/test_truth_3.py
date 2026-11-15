@@ -94,8 +94,8 @@ a_html = (ROOT / "templates" / "assistant.html").read_text(encoding="utf-8")
 check("мастер: новинки прошлого плана только по явному «Повторить»",
       "if(!auto){ (last.new_items||[]).forEach(function(nn){ addNew(nn.name, nn.qty, nn.cost); }); }" in a_html)
 b_html = (ROOT / "templates" / "budget.html").read_text(encoding="utf-8")
-check("«Бюджет» объясняет отличие от мастера и формулу по D-65",
-      "Мастер заказа распределяет те же деньги иначе" in b_html and "− остаток − «едет»" not in b_html)
+check("«Бюджет» объясняет, что он вид мастера (D-79), и формулу по D-65",
+      "Это вид мастера заказа" in b_html and "− остаток − «едет»" not in b_html)
 check("«Заказ» на телефоне прячет справочные колонки, «Заказать» остаётся на экране",
       "@media (max-width: 480px)" in rep_html and "td:nth-child(7):not([colspan])" in rep_html)
 check("мастер на телефоне: таблица плана без справочных колонок, «Нужно» по D-65",

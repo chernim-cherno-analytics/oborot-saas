@@ -693,8 +693,8 @@ def budget_workbook(org_name: str, data: dict) -> Workbook:
 
     row = 3
     for it in data.get("items", []):
-        if it.get("over_limit"):
-            note = "дорогая позиция — 1 шт сверх лимита доли"
+        if it.get("over_need"):
+            note = f"поднято до партии: на {it['over_need']} шт больше потребности"
         elif it.get("capped") and it.get("cap_reason") == "share":
             note = f"лимит доли; потребность {it['need']} шт"
         elif it.get("capped"):
