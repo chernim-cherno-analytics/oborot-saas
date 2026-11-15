@@ -180,7 +180,7 @@ document.addEventListener("DOMContentLoaded", function () {
           var c = document.getElementById("req-company");
           if (c) setTimeout(function () { c.focus(); }, 350);
         } else {
-          toast("Счёт может запросить только владелец организации", "error");
+          toast("Счёт может запросить сотрудник с правом «Тариф и оплата»", "error");
         }
       });
     });

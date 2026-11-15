@@ -728,7 +728,7 @@ document.addEventListener("DOMContentLoaded", function () {
     document.getElementById("chan-tools").hidden = false;
     box.innerHTML = CHAN.map(chanCard).join("") +
       '<div id="chan-nomatch"></div><div id="chan-more"></div>' +
-      (CHAN_OWNER ? "" : '<div class="hint">Менять условия производства может только владелец.</div>');
+      (CHAN_OWNER ? "" : '<div class="hint">Менять условия производства может сотрудник с правом «Настройки».</div>');
     chanWire();
     CHAN.forEach(function (p) { chanRecalc(p.id); });
     chanApplyView();

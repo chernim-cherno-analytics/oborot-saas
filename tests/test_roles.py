@@ -774,6 +774,34 @@ with client() as h3:
     r = h3.post("/api/account/switch-org", json={"org_id": foreign})
     check("в чужую организацию переключиться нельзя (404)", r.status_code == 404, str(r.status_code))
 
+print("\n== Ревью #110 (Fable): ссылка убранного или пониженного кадровика гаснет ==")
+with client() as ho:
+    ho.post("/register", data={"name": "Тета", "email": "theta@roles.io",
+                               "password": PW, "org_name": "Тета"})
+    t_org = sql("SELECT id FROM orgs WHERE name='Тета'")[0][0]
+    rr = ho.post("/api/team/roles", json={"name": "Кадровик", "perms": ["plan", "users_manage"]})
+    hr_role = rr.json().get("id") or next(r["id"] for r in ho.get("/api/team").json()["roles"]
+                                          if r["name"] == "Кадровик")
+    viewer_t = next(r["id"] for r in ho.get("/api/team").json()["roles"] if r["builtin"] == "viewer")
+    hr_uid = add_user("hr@theta.io", t_org, role_id=hr_role)
+    with client() as hh:
+        login(hh, "hr@theta.io")
+        own = hh.post("/api/team/invites", json={"role_id": hr_role}).json()["link_path"].split("t=", 1)[1]
+        own2 = hh.post("/api/team/invites", json={"role_id": hr_role}).json()["link_path"].split("t=", 1)[1]
+    r = ho.post(f"/api/team/members/{hr_uid}/role", json={"role_id": viewer_t})
+    with client() as anon:
+        r = anon.post("/api/invite/accept", json={"token": own, "mode": "register", "name": "Двойник",
+                                                  "email": "twin@theta.io", "password": PW})
+        check("пониженный кадровик: его ссылка не действует", r.status_code == 400, f"{r.status_code} {r.text[:120]}")
+    ho.post(f"/api/team/members/{hr_uid}/remove")
+    sql("UPDATE org_invites SET revoked_at=NULL WHERE created_by=?", hr_uid)  # даже если отзыв пропустили
+    with client() as anon2:
+        r = anon2.post("/api/invite/accept", json={"token": own2, "mode": "login",
+                                                   "email": "hr@theta.io", "password": PW})
+        check("убранный кадровик не возвращается по своей ссылке (автор больше не участник)",
+              r.status_code == 400 and not sql("SELECT 1 FROM memberships WHERE user_id=? AND org_id=?", hr_uid, t_org),
+              f"{r.status_code} {r.text[:120]}")
+
 for base in (DB_PATH, OLD_DB_PATH):
     for suffix in ("", "-wal", "-shm"):
         p = Path(str(base) + suffix)

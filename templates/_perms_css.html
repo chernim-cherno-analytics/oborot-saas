@@ -13,8 +13,16 @@
   body:not([data-perms~="orders_delete"]) .ord-del,
   body:not([data-perms~="ordered_edit"]) #send-btn,
   body:not([data-perms~="users_manage"]) .owner-only { display: none !important; }
+  body:not([data-perms~="catalog_edit"]) #defDiscBtn,
+  body:not([data-perms~="catalog_edit"]) #ruleBtn { display: none !important; }
   body:not([data-perms~="ordered_edit"]) .ordin,
-  body:not([data-perms~="catalog_edit"]) .catsel { pointer-events: none; opacity: .6; }
+  body:not([data-perms~="catalog_edit"]) .catsel,
+  body:not([data-perms~="catalog_edit"]) .disc-in,
+  body:not([data-perms~="catalog_edit"]) .merge-sel,
+  body:not([data-perms~="settings"]) #rate-seg,
+  body:not([data-perms~="settings"]) .settings-grid button,
+  body:not([data-perms~="settings"]) .settings-grid input,
+  body:not([data-perms~="settings"]) .settings-grid select { pointer-events: none; opacity: .6; }
 {%- for key in perm_keys %}
   body:not([data-perms~="{{ key }}"]) .need-{{ key }} { display: none !important; }
   body[data-perms~="{{ key }}"] .lack-{{ key }} { display: none !important; }
