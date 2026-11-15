@@ -680,14 +680,15 @@ def _apply_seasonal_rates(db: Session, org: Org, settings: dict, items: dict,
     from app import order_planner  # локально: order_planner импортирует analytics
 
     pseudo = {"settings": settings, "items": items}
-    by_lead: dict[int, list[dict]] = {}
+    by_lead: dict[tuple[int, int], list[dict]] = {}
     for item in items.values():
-        by_lead.setdefault(int(item.get("lead_time_days") or 0), []).append(item)
-    for lead, group in by_lead.items():
+        key = (int(item.get("lead_time_days") or 0), int(item.get("horizon_days") or horizon))
+        by_lead.setdefault(key, []).append(item)
+    for (lead, hz), group in by_lead.items():
         eta = today + timedelta(days=lead)
         rate_lead, _ = order_planner._seasonal_rates(db, org, pseudo, min_stock, today, eta)
         rate_cover, _ = order_planner._seasonal_rates(
-            db, org, pseudo, min_stock, eta, eta + timedelta(days=horizon))
+            db, org, pseudo, min_stock, eta, eta + timedelta(days=hz))
         for item in group:
             base_rate = float(item.get("rate_cover") or 0)
             if base_rate <= 0:
@@ -1069,6 +1070,21 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
         for base, pid in assign_rules.effective_assign(db, org).items()
         if int(pid) in prod_lead_by_id  # запись на удалённый цех = основное
     }
+    # Горизонт покрытия по ритму КАНАЛА (решение владельца, см. DECISIONS):
+    # мастер и «Бюджет» берут ритм заказов канала (Production.cadence_days),
+    # «Заказ» брал общий. Только для режима «по ритму»; фиксированный горизонт
+    # один для всех. 0 у канала = общая настройка.
+    def _channel_horizon(cad: int) -> int:
+        if cad <= 0 or settings.get("cover_mode") == "fixed":
+            return horizon
+        return cover_days({**settings, "order_cadence_days": cad})
+    prod_hz_by_id = {int(p.id): _channel_horizon(int(p.cadence_days or 0)) for p in prod_objs}
+    default_hz = prod_hz_by_id.get(main_prod_id) or horizon
+    hz_by_base = {
+        base: prod_hz_by_id[int(pid)]
+        for base, pid in assign_rules.effective_assign(db, org).items()
+        if int(pid) in prod_hz_by_id
+    }
 
     # Архив («в архив» на Оборачиваемости) и пользовательские категории.
     hidden_set = {
@@ -1208,6 +1224,7 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
         lead = lead_by_base.get(base, default_lead)
         arrival = today + timedelta(days=lead)
         item["lead_time_days"] = lead
+        item["horizon_days"] = hz_by_base.get(base, default_hz)
         dis, cs, nq, nr = item["dis"], item["cs"], item["nq"], item["nr"]
         # Годовой ТЕМП планировщика — по годовому окну (nq за год /
         # dis365), как и обещает настройка «Год». Окно канона оборачиваемости
@@ -1472,6 +1489,7 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
         lead = int(item["lead_time_days"])
         r_lead = float(item["rate_lead"])
         r_cover = float(item["rate_cover"])
+        hz = int(item.get("horizon_days") or horizon)
         cs = float(item["cs"])
         proj_stock = max(0.0, cs - r_lead * lead) + max(0.0, float(item["ordered"]))
         item["proj_stock"] = round(proj_stock)
@@ -1479,7 +1497,7 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
         # включая порядок округления. Раньше round(темп × горизонт) −
         # round(остаток) расходился с мастером ровно на 1 шт на входах «.5»
         # (BUSINESS_LOGIC §9.4).
-        item["need"] = max(0, int(round(r_cover * horizon - proj_stock)))
+        item["need"] = max(0, int(round(r_cover * hz - proj_stock)))
         # Прогон 15.11 (финдир, P1): дата стокаута, недели запаса и «дыра
         # поставки» считались темпом окна, а прогнозный остаток в той же строке
         # сезонным r_lead: «кончится до прихода» и «Стокаут после прихода»
@@ -2120,6 +2138,8 @@ def build_replenish(snap: dict) -> dict:
                 # подписи. Значение совпадает с тем, что подставит
                 # app/api.py:apply_production_rules — правило выбора одно.
                 "lead_time_days": it.get("lead_time_days", lead_time),
+                # Горизонт покрытия ЭТОЙ позиции: ритм её канала (мастер так же).
+                "horizon_days": it.get("horizon_days", horizon),
                 "need": it["need"],
                 "sizes": {
                     s: {
