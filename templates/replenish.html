@@ -1672,7 +1672,7 @@
       fmt(shown)+' из '+fmt(total)+' '+plural(total,"позиции","позиций","позиций")+'</span>';
     if(excluded.length){
       html+='<span class="bdg act" id="bdg-excl" title="Показать список позиций, которым заказ не нужен, и причину по каждой">'+
-        fmt(excluded.length)+' не требуют заказа — посмотреть</span>';
+        fmt(excluded.length)+' не в рекомендации, посмотреть</span>';
     }else{
       html+='<span class="bdg" title="Каждая разобранная позиция попала в таблицу">ничего не отсеяно</span>';
     }
@@ -2059,7 +2059,7 @@
     var w=document.getElementById("excluded-wrap");
     if(!excluded.length){ t.style.display="none"; w.style.display="none"; return; }
     t.style.display="";
-    t.innerHTML='<span id="excl-arrow">'+(w.style.display==="none"?"▸":"▾")+'</span> Не требуют заказа ('+excluded.length+')';
+    t.innerHTML='<span id="excl-arrow">'+(w.style.display==="none"?"▸":"▾")+'</span> Не в рекомендации ('+excluded.length+')';
     t.onclick=function(){ toggleExcluded(); };
     document.getElementById("excluded-tb").innerHTML=excluded.map(function(e){
       return '<tr><td class="name">'+esc(e.base_name)+'</td><td class="muted" style="text-align:left">'+esc(e.reason)+'</td></tr>';

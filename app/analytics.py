@@ -1348,6 +1348,10 @@ def classify(turnover: float, thresholds: dict) -> str:
     return "best"
 
 
+# D-77: дни наличия размера меньше порога считаются как порог (короткая история).
+SIZE_MIN_DAYS = 14
+
+
 def size_weight(rec: dict) -> float:
     """Вес размера в заказе (D-68, 14.11.2026): темп в днях наличия за год.
 
@@ -1363,7 +1367,12 @@ def size_weight(rec: dict) -> float:
     if sold <= 0:
         return 0.0
     denom = int(rec.get("days365") or 0) or int(rec.get("hist365") or 0)
-    return sold / denom if denom > 0 else sold / 365.0
+    if denom <= 0:
+        return sold / 365.0
+    # D-77 (решение владельца 15.11.2026): нижний порог 14 дней наличия.
+    # Размер с 3 продажами за 2 дня иначе получал темп 1,5 шт/день и
+    # забирал большую долю сетки по случайности.
+    return sold / max(denom, SIZE_MIN_DAYS)
 
 
 def size_split(sizes: dict[str, dict], total: int) -> dict[str, int]:
@@ -1869,6 +1878,25 @@ def build_replenish(snap: dict) -> dict:
             if it.get("rate_no_history") and it["rate_active"] <= 0:
                 row["no_history"] = True
             excluded.append(row)
+            continue
+        # D-76 (решение владельца 15.11.2026): позиция, которая продаётся в
+        # минус (средняя фактическая цена ниже себестоимости), из рекомендации
+        # исключена. Потребность посчитана, но строка уходит в «Не в
+        # рекомендации» с причиной и суммой убытка; заказать её можно вручную
+        # («Заказ позиции», галочка в мастере). Мало данных: пометка ненадёжна,
+        # такие строки не исключаем (как и раньше не помечали).
+        if it.get("below_cost") and not it.get("low_data", False):
+            loss = int(it.get("loss_unit") or 0)
+            excluded.append({
+                "base_name": base,
+                "reason": ("продаётся в минус: средняя цена продажи ниже себестоимости на "
+                           f"{loss:,} ₽/шт".replace(",", " ")
+                           + f", расчёт дал бы {int(it['need'])} шт; заказать можно вручную "
+                           "через «Заказ позиции»"),
+                "below_cost": True,
+                "loss_unit": loss,
+                "need": int(it["need"]),
+            })
             continue
         rec = size_split(it["sizes"], it["need"])
         avg_price = it["avg_price"] or it["sale_price"]
