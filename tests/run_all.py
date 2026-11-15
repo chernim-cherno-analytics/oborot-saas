@@ -186,6 +186,9 @@ SUITES = [
     ("billing_ops", "test_billing_ops.py",     False, False),
     # SEC-2 (решение владельца 14.11): права участника на действия всей организации.
     ("member_rights", "test_member_rights.py", False, False),
+    # Роли сотрудников (решение владельца 15.11.2026): встроенные и свои роли,
+    # права на каждой пишущей ручке, приглашения по ссылке.
+    ("roles", "test_roles.py",               False, False),
     # TRUTH-LABELS-1: экран называет отсеянные позиции, едущую партию и
     # сезонную базу темпа. Синтетическая база, демо-данные.
     ("truth_labels", "test_truth_labels.py",   False, False),

@@ -82,12 +82,23 @@ with TestClient(app, headers={"X-Oborot-CSRF": "1"}) as owner, \
     for path in ("/api/turnover", "/api/replenish", "/api/budget", "/api/export/turnover.xlsx"):
         check(f"участник читает {path}", member.get(path).status_code == 200, path)
 
-    print("\n0. Интерфейс знает роль (SEC-2, D-69)")
+    print("\n0. Интерфейс знает роль и права (SEC-2, D-69; роли 15.11.2026)")
+    # После ролей скрытие решают права (data-perms на body, _perms_css.html),
+    # а не data-role: своя роль с правом удаления заказов тоже «member».
+    import re as _re
     for path in ("/stocks", "/turnover", "/sizes", "/replenish"):
         h = member.get(path).text
+        attr = _re.search(r'data-perms="([^"]*)"', h)
+        perms_on_page = set(attr.group(1).split()) if attr else None
         check(f"участник: {path} помечен data-role=member и прячет действия владельца",
-              'data-role="member"' in h and 'body[data-role="member"] .ord-del' in h, path)
-        check(f"владелец: {path} помечен data-role=owner", 'data-role="owner"' in owner.get(path).text, path)
+              'data-role="member"' in h
+              and 'body:not([data-perms~="orders_delete"]) .ord-del' in h
+              and perms_on_page is not None and "orders_delete" not in perms_on_page
+              and "ordered_edit" not in perms_on_page and "catalog_edit" not in perms_on_page,
+              f"{path} {perms_on_page}")
+        oh = owner.get(path).text
+        check(f"владелец: {path} помечен data-role=owner", 'data-role="owner"' in oh
+              and 'orders_delete' in (_re.search(r'data-perms="([^"]*)"', oh) or [None, ""])[1], path)
 
     print("\n1-3. Действия на всю организацию")
     ordered_before = sql("SELECT qty FROM ordered_qty WHERE org_id=? AND base_name=?", org_id, base)
@@ -102,8 +113,10 @@ with TestClient(app, headers={"X-Oborot-CSRF": "1"}) as owner, \
     ]
     for method, path, body in cases:
         r = member.request(method, path, json=body) if body is not None else member.request(method, path)
+        # Текст отказа после ролей: какого права не хватает и к кому идти.
         check(f"участник: {method} {path} → 403 с объяснением",
-              r.status_code == 403 and "владельцу" in r.text, f"{r.status_code} {r.text[:120]}")
+              r.status_code == 403 and "Недостаточно прав" in r.text and "владельца" in r.text,
+              f"{r.status_code} {r.text[:120]}")
     check("отказы ничего не изменили: заказ на месте",
           sql("SELECT COUNT(*) FROM production_orders WHERE id=?", order_id)[0][0] == 1)
     check("отказы ничего не изменили: «Едет» ни перезаписано, ни прибавлено",

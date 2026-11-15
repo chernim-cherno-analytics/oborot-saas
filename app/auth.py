@@ -9,7 +9,7 @@ import os
 import secrets
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import bcrypt
 from fastapi import Depends, HTTPException, Request
@@ -586,11 +586,21 @@ def verify_csrf_form(request: Request, form_token) -> bool:
 
 @dataclass
 class AuthContext:
-    """Аутентифицированный пользователь, его организация и роль в ней."""
+    """Аутентифицированный пользователь, его организация и роль в ней.
+
+    role: "owner" или "member" (владение, memberships.role). perms: права
+    роли (app/roles.py), по ним решают ручки (require_perm) и интерфейс.
+    role_name: название роли для показа человеку.
+    """
 
     user: User
     org: Org
     role: str = "member"
+    perms: frozenset = field(default_factory=frozenset)
+    role_name: str = ""
+
+    def can(self, perm: str) -> bool:
+        return perm in self.perms
 
 
 def resolve_auth(request: Request, db: Session) -> AuthContext | None:
@@ -618,7 +628,10 @@ def resolve_auth(request: Request, db: Session) -> AuthContext | None:
     org = db.get(Org, org_id)
     if not org:
         return None
-    return AuthContext(user=user, org=org, role=member.role or "member")
+    from app import roles as _roles
+    perms, role_name = _roles.member_perms(db, member)
+    return AuthContext(user=user, org=org, role=member.role or "member",
+                       perms=perms, role_name=role_name)
 
 
 def require_auth_api(request: Request, db: Session = Depends(get_db)) -> AuthContext:
@@ -629,20 +642,40 @@ def require_auth_api(request: Request, db: Session = Depends(get_db)) -> AuthCon
     return ctx
 
 
-def require_owner_api(ctx: AuthContext = Depends(require_auth_api)) -> AuthContext:
-    """Зависимость для чувствительных ручек: только owner.
+def require_perm(perm: str):
+    """Зависимость: 403, если у роли пользователя нет права `perm`.
 
-    Кому что (SEC-2, решение владельца 14.11.2026, вариант A):
-    владелец меняет то, что действует на всю организацию и не возвращается
-    одним кликом: настройки и подключения, производства, удаление заказа,
-    ручная правка «Едет» (перезапись и прибавка), архив позиций, категории
-    (переименование и слияние), ручные скидки. Участник работает: смотрит,
-    выгружает, считает планы, создаёт заказы, переводит их по статусам, вносит
-    приёмку. Черновик ростовки общий на организацию: участник его правит и
-    сбрасывает (сброс стирает и правки владельца), это осознанно оставлено
-    открытым до решения владельца. Участники появляются прежде всего из каталога
-    МойСклада: каждый пользователь аккаунта МС, открывший приложение после
-    владельца, становится участником (routes_ms_app).
+    Роли и права (решение владельца 15.11.2026) описаны в app/roles.py.
+    Ключ права проверяется при импорте: опечатка в имени права роняет старт,
+    а не тихо закрывает (или открывает) ручку.
+    """
+    from app import roles as _roles
+
+    if perm not in _roles.PERM_KEYS:
+        raise ValueError(f"неизвестное право: {perm!r}")
+
+    def _dep(ctx: AuthContext = Depends(require_auth_api)) -> AuthContext:
+        if perm not in ctx.perms:
+            raise HTTPException(status_code=403, detail=_roles.denied_detail(perm))
+        return ctx
+
+    _dep.__name__ = f"require_perm_{perm}"
+    _dep.oborot_perm = perm  # для сторожа в tests/test_roles.py
+    return _dep
+
+
+def require_owner_api(ctx: AuthContext = Depends(require_auth_api)) -> AuthContext:
+    """Только владелец организации (memberships.role == "owner").
+
+    После ролей (15.11.2026) пишущие ручки закрываются правами
+    (require_perm), а не этой зависимостью. Она оставлена для совместимости
+    и для действий, которые по смыслу принадлежат только владельцу.
+
+    История (SEC-2, D-69, вариант A): участник смотрел, выгружал, считал
+    планы, создавал заказы, переводил их по статусам, вносил приёмку и правил
+    общий черновик ростовки. Ровно эти права теперь у встроенной роли
+    «Сотрудник» (app/roles.py, EMPLOYEE_PERMS), и её получают все прежние
+    участники, в том числе созданные из каталога МойСклада (routes_ms_app).
     """
     if ctx.role != "owner":
         raise HTTPException(status_code=403, detail="Доступно только владельцу организации")

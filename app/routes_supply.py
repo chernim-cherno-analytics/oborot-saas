@@ -28,7 +28,8 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from app import supply_sheets
-from app.auth import AuthContext, require_auth_api, require_owner_api
+from app import roles as _roles
+from app.auth import AuthContext, require_auth_api, require_perm
 from app.db import get_db
 
 router = APIRouter(prefix="/api/supply", tags=["supply"])
@@ -102,7 +103,7 @@ def api_supply_sheets(
     _require_preview(ctx)
     try:
         return supply_sheets.preview(
-            db, ctx.org.id, role=ctx.role, sheet=sheet or None,
+            db, ctx.org.id, role=_roles.ui_role(ctx, "supply_edit"), sheet=sheet or None,
             queue=queue, offset=offset, limit=limit, q=q,
         )
     except supply_sheets.ValidationError as exc:
@@ -114,7 +115,7 @@ def api_supply_sheets(
 @router.post("/sheets/refresh")
 def api_supply_sheets_refresh(
     payload: dict = Body(...),
-    ctx: AuthContext = Depends(require_owner_api),
+    ctx: AuthContext = Depends(require_perm("supply_edit")),
     db: Session = Depends(get_db),
 ):
     """Прочитать оба листа заново и записать один последний снимок.

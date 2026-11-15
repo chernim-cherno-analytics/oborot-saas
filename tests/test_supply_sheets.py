@@ -2471,8 +2471,8 @@ def structural_checks(owner) -> None:
     # растёт. Замок стоит на неизменности выпущенного, а не на длине списка.
     print("\n== Схема не тронута: те же десять выпущенных шагов старта ==")
     from app import main as _main
-    check("шагов семнадцать: десять выпущенных плюс семь дописанных сверху",
-          len(_main.STARTUP_SCHEMA_STEPS) == 17,
+    check("шагов восемнадцать: десять выпущенных плюс восемь дописанных сверху",
+          len(_main.STARTUP_SCHEMA_STEPS) == 18,
           str(len(_main.STARTUP_SCHEMA_STEPS)))
     check("и первые десять — ровно прежние пары (id, позиция)",
           list(_main.STARTUP_SCHEMA_STEPS)[:10] == [
@@ -2482,7 +2482,7 @@ def structural_checks(owner) -> None:
               ("ms_vendor.ensure_schema", 7), ("subscription.ensure_schema", 8),
               ("subscription.log_preview", 9), ("models.ensure_supply_schema", 10)],
           str(_main.STARTUP_SCHEMA_STEPS))
-    check("следующие семь сохраняют точные id и позиции 11–17",
+    check("следующие восемь сохраняют точные id и позиции 11-18",
           list(_main.STARTUP_SCHEMA_STEPS)[10:] == [
               ("models.ensure_supply_planning_schema", 11),
               ("models.ensure_supply_planning_unique_schema", 12),
@@ -2493,7 +2493,9 @@ def structural_checks(owner) -> None:
               # SUPPLY-FIX-4: миниатюра эскиза. Дописана В КОНЕЦ с позицией 17;
               # шестнадцать пар выше не тронуты ни буквой — в том числе 15 и 16,
               # занятые чужим пакетом, пока этот писался.
-              ("models.ensure_supply_sketch_thumb_schema", 17)],
+              ("models.ensure_supply_sketch_thumb_schema", 17),
+              # Роли сотрудников (15.11.2026): дописаны в конец, позиция 18.
+              ("models.ensure_roles_schema", 18)],
           str(_main.STARTUP_SCHEMA_STEPS))
     for name in ("models.py", "db.py", "tenancy.py"):
         text = (ROOT / "app" / name).read_text(encoding="utf-8")

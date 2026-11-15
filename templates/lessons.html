@@ -84,8 +84,9 @@
 </style>
 {% include "_mobile.html" %}
 {% include "_app_shell_head.html" %}
+{% include "_perms_css.html" %}
 </head>
-<body>
+<body data-perms="{{ (perms if perms is defined else perm_keys)|join(' ') }}">
 {% include "_embed.html" %}
 <div class="gradient-bg"></div>
 {% include "_app_shell.html" %}

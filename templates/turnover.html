@@ -201,16 +201,12 @@
   .modal .row2 input { width: 70px; padding: 5px 7px; text-align: center; font-weight: 600;
     border: 1px solid rgba(31,31,31,.18); border-radius: 8px; }
   .modal .actions { display: flex; gap: 10px; margin-top: 18px; justify-content: flex-end; }
-  /* SEC-2 (D-69): действия только владельца участнику не показываем. */
-  body[data-role="member"] .owner-only, body[data-role="member"] .arch-btn,
-  body[data-role="member"] .unarch-btn, body[data-role="member"] .ord-del,
-  body[data-role="member"] #send-btn { display: none !important; }
-  body[data-role="member"] .ordin, body[data-role="member"] .catsel { pointer-events: none; opacity: .6; }
 </style>
 {% include "_mobile.html" %}
 {% include "_app_shell_head.html" %}
+{% include "_perms_css.html" %}
 </head>
-<body data-role="{{ role|default('owner') }}">
+<body data-role="{{ role|default('owner') }}" data-perms="{{ (perms if perms is defined else perm_keys)|join(' ') }}">
 {% include "_embed.html" %}
 <div class="gradient-bg"></div>
 {% with nav_primary = true %}{% include "_app_shell.html" %}{% endwith %}
