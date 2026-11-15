@@ -51,6 +51,16 @@ def cs_of(org_name, base):
             "WHERE s.org_id=? AND s.date=? AND p.base_name=?", (oid, latest, base)).fetchone()[0]
 
 
+from datetime import datetime as _dt  # noqa: E402
+
+from app import api as _api  # noqa: E402
+
+# Заказы, принятые до появления демо-приёмки, правки на остаток не двигают
+# (граница DEMO_RECEIPT_SINCE). В тесте заказы принимаются «сейчас»: граница
+# сдвигается в прошлое, а отдельная сцена проверяет старый заказ.
+_REAL_SINCE = _api.DEMO_RECEIPT_SINCE
+_api.DEMO_RECEIPT_SINCE = _dt(2000, 1, 1)
+
 with TestClient(app, headers={"X-Oborot-CSRF": "1"}) as c:
     c.post("/register", data={"name": "D", "email": "demo-rcv@test.io", "password": "secret123", "org_name": "Демо-приёмка"})
     check("демо", c.post("/api/connect/demo").status_code == 200)
@@ -107,6 +117,40 @@ with TestClient(app, headers={"X-Oborot-CSRF": "1"}) as c:
     c.post(f"/api/orders/{o5['id']}/receipts", json={"lines": [{"base_name": base5, "qty": 13}]})
     check("назвали 13 позже: остаток +13, а не +20", cs_of("Демо-приёмка", base5) == cs50 + 13,
           f"{cs50} -> {cs_of('Демо-приёмка', base5)}")
+
+    print("\n2в. Заказ с разбивкой по размерам: исправление снимает ровно с этих размеров (ревью #131)")
+    def sizes_of(org_name, base):
+        with sqlite3.connect(DB_PATH) as con:
+            oid = con.execute("SELECT id FROM orgs WHERE name=?", (org_name,)).fetchone()[0]
+            latest = con.execute("SELECT max(date) FROM stock_days WHERE org_id=?", (oid,)).fetchone()[0]
+            return dict(con.execute(
+                "SELECT p.size, s.qty FROM stock_days s JOIN products p ON p.id=s.product_id "
+                "WHERE s.org_id=? AND s.date=? AND p.base_name=?", (oid, latest, base)).fetchall())
+    cand = next(i for i in c.get("/api/replenish").json()["items"][4:] if len(i.get("sizes") or {}) >= 2)
+    base6 = cand["base_name"]
+    sz = sorted(cand["sizes"])[0]
+    s0 = sizes_of("Демо-приёмка", base6)
+    o6 = c.post("/api/orders", json={"name": "Размер", "allow_duplicate": True,
+                                     "items": [{"base_name": base6, "qty": 20, "sizes": {sz: 20}}]}).json()
+    c.post(f"/api/orders/{o6['id']}/status", json={"status": "sent"})
+    c.post(f"/api/orders/{o6['id']}/status", json={"status": "received"})
+    s1 = sizes_of("Демо-приёмка", base6)
+    check("закрытие кладёт 20 ровно в заказанный размер",
+          s1[sz] == s0[sz] + 20 and all(s1[k] == s0[k] for k in s0 if k != sz), f"{s0} -> {s1}")
+    c.post(f"/api/orders/{o6['id']}/receipts", json={"lines": [{"base_name": base6, "qty": 0}]})
+    s2 = sizes_of("Демо-приёмка", base6)
+    check("подтверждённый ноль после закрытия возвращает размеры как были", s2 == s0, f"{s0} -> {s2}")
+
+    print("\n2г. Заказ, принятый до демо-приёмки, правки на остаток не двигают (ревью #133)")
+    _api.DEMO_RECEIPT_SINCE = _REAL_SINCE
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute("UPDATE production_orders SET received_at='2026-11-01 10:00:00' WHERE id=?", (o5["id"],))
+        con.commit()
+    before_old = cs_of("Демо-приёмка", base5)
+    c.post(f"/api/orders/{o5['id']}/receipts", json={"lines": [{"base_name": base5, "qty": 2}]})
+    check("старый заказ: остаток не изменился", cs_of("Демо-приёмка", base5) == before_old,
+          f"{before_old} -> {cs_of('Демо-приёмка', base5)}")
+    _api.DEMO_RECEIPT_SINCE = _dt(2000, 1, 1)
 
     print("\n3. Живая организация (МойСклад подключён) не трогается")
     c2 = TestClient(app, headers={"X-Oborot-CSRF": "1"})
