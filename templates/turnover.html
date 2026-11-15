@@ -27,7 +27,7 @@
     cursor: pointer; white-space: nowrap; }
   .cat-btn:hover, .chip-tg:hover { background: #fff; color: var(--u-ink); }
   .cat-btn.active { background: var(--u-ink); color: #fff; border-color: var(--u-ink); }
-  .cat-btn .cnt { font-size: 11.5px; margin-left: 5px; opacity: .62; font-variant-numeric: tabular-nums; }
+  .cat-btn .cnt { font-size: 11.5px; margin-left: 5px; opacity: .86; font-variant-numeric: tabular-nums; }
   .chip-tg { display: inline-flex; align-items: center; gap: 7px; }
   .chip-tg .ck { margin: 0; opacity: .45; }
   .chip-tg[aria-pressed="true"] { background: #fff; color: var(--u-ink); border-color: rgba(47,180,87,.65);
@@ -52,7 +52,9 @@
   .reset-view:hover { background: #ffe6ad; }
 
   /* ── таблица ── */
-  .table-outer { border-radius: 22px; overflow: auto; max-height: calc(100vh - 196px); padding: 0 10px 8px;
+  {# Левого поля у рамки нет, оно у самой таблицы: иначе при горизонтальной
+     прокрутке в поле слева от залипшей колонки видны обрезки уехавших цифр. #}
+  .table-outer { border-radius: 22px; overflow: auto; max-height: calc(100vh - 196px); padding: 0 10px 8px 0;
     background: var(--u-glass); border: 1px solid rgba(255,255,255,.75);
     -webkit-backdrop-filter: blur(24px) saturate(160%); backdrop-filter: blur(24px) saturate(160%);
     box-shadow: inset 0 1px 0 rgba(255,255,255,.85), 0 16px 50px rgba(46,46,96,.1); }
@@ -64,6 +66,7 @@
   {# Высоты строк целые (line-height в px): при дробной высоте залипшая первая
      ячейка рисуется со сдвигом в пиксель относительно остальной строки. #}
   table { width: 100%; border-collapse: separate; border-spacing: 0 4px; font-size: 13.5px; line-height: 20px; }
+  .table-outer > table { width: calc(100% - 10px); margin-left: 10px; }
   {# Шапка непрозрачная: под ней проезжают строки. Залипающая первая колонка
      (название): left:0 добавлен К sticky-по-верху ячейке шапки, угол прилипает
      к обеим кромкам. Фон у неё сплошной: полупрозрачная заливка пропускала бы
@@ -122,11 +125,13 @@
   .ztrack { display: block; width: 60px; height: 8px; border-radius: 8px; overflow: hidden; background: rgba(255,255,255,.85);
     box-shadow: inset 0 0 0 1px rgba(0,0,0,.07); }
   .zfill { display: block; height: 100%; border-radius: 8px; background: #2fb457; }
-  .zbar.z-low .zfill { background: #f0443a; }
+  {# Красный здесь означает одно: затоварка (как говорит урок). Скорый дефицит
+     (до 30% нормы) тёмный, а не красный: это не «плохо продаётся». #}
+  .zbar.z-low .zfill { background: #1d1d1f; }
   .zbar.z-high .zfill { background: #f08c00; }
   .zbar.z-over .zfill { background: #f0443a; }
   .ztxt { min-width: 46px; text-align: right; font-weight: 600; font-variant-numeric: tabular-nums; }
-  .zbar.z-low .ztxt, .zbar.z-over .ztxt { color: #b3261e; }
+  .zbar.z-over .ztxt { color: #b3261e; }
   .disc-in { width: 58px; height: 30px; padding: 0 4px; text-align: center; font-size: 13.5px; font-weight: 600;
     border: 1px solid rgba(0,0,0,.12); border-radius: 9px; background: rgba(255,255,255,.82); color: var(--u-ink); outline: none; }
   .disc-in::placeholder { color: var(--u-ink3); font-weight: 400; }
@@ -865,7 +870,12 @@ document.getElementById("defDiscBtn").addEventListener("click", async function()
 /* ── правило скидок ── */
 const RULE_FIELDS=["new_days","new_pct","top_turnover","top_pct","top_over_pct","mid_turnover","mid_pct","mid_over_pct","weak_pct","weak_over_pct","overstock_days"];
 function fillRule(r){ RULE_FIELDS.forEach(f=>{ document.getElementById("r-"+f).value=r[f]; }); }
-document.getElementById("ruleBtn").addEventListener("click",()=>{ if(RULE) fillRule(RULE); document.getElementById("rule-modal").classList.add("open"); });
+document.getElementById("ruleBtn").addEventListener("click",()=>{ if(RULE) fillRule(RULE); document.getElementById("rule-modal").classList.add("open");
+  const f=document.getElementById("r-new_days"); if(f) f.focus(); });
+document.addEventListener("keydown",e=>{
+  const m=document.getElementById("rule-modal");
+  if((e.key==="Escape"||e.key==="Esc") && m.classList.contains("open")){ m.classList.remove("open"); document.getElementById("ruleBtn").focus(); }
+});
 document.getElementById("rule-cancel").addEventListener("click",()=>document.getElementById("rule-modal").classList.remove("open"));
 document.getElementById("rule-reset").addEventListener("click",()=>{ if(RULE_DEFAULTS) fillRule(RULE_DEFAULTS); });
 document.getElementById("rule-save").addEventListener("click", async ()=>{
@@ -912,13 +922,19 @@ async function load(){
 /* Мост для подсказок (_ui2_tour.html). Подсказки показываются на строке из
    середины списка: у верхних строк цифры часто случайные (мало дней в стоке).
    prepare() возвращает таблицу к исходному виду и отдаёт строку-пример. */
+let LOADED = false, TOUR_VIEW = null;
 window.OborotTurnover = {
   norm: () => NORM,
+  loaded: () => LOADED,
+  whenReady: () => READY,
   prepare(){
-    if(SORT||ONLY_OK||document.getElementById("search").value||(CATS.length&&currentCat!==CATS[0])){
-      SORT=null; ONLY_OK=false; paintOk(); currentCat=CATS[0]||null;
-      document.getElementById("search").value="";
-      paintSort(); buildTabs(); saveView(); render();
+    const s=document.getElementById("search");
+    // Вид человека запоминаем и НЕ сохраняем: подсказки показываются на
+    // исходном виде, а после них restore() возвращает всё как было.
+    TOUR_VIEW={sort:SORT, ok:ONLY_OK, cat:currentCat, q:s.value};
+    if(SORT||ONLY_OK||s.value||(CATS.length&&currentCat!==CATS[0])){
+      SORT=null; ONLY_OK=false; paintOk(); currentCat=CATS[0]||null; s.value="";
+      paintSort(); buildTabs(); paintReset(); render();
     }
     const cat=currentCat;
     const pool=ITEMS.filter(it=>!it.hidden && it.group==="rank" && (cat===ALL_CAT||it.category===cat));
@@ -930,9 +946,18 @@ window.OborotTurnover = {
     for(const r of rows){ if(r.getAttribute("data-base")===it.base_name) return {row:r, item:it}; }
     return null;
   },
+  restore(){
+    const v=TOUR_VIEW, s=document.getElementById("search");
+    TOUR_VIEW=null;
+    if(!v) return;
+    if(v.sort===SORT && v.ok===ONLY_OK && v.cat===currentCat && v.q===s.value) return;
+    SORT=v.sort; ONLY_OK=v.ok; currentCat=v.cat; s.value=v.q;
+    paintOk(); paintSort(); buildTabs(); paintReset(); render();
+  },
 };
 applyView(); setupSort();
-load().catch(e=>{ document.getElementById("tb").innerHTML='<tr><td colspan="'+ncols()+'" class="loading">Ошибка загрузки: '+e.message+'</td></tr>'; });
+const READY = load().then(()=>{ LOADED=true; });
+READY.catch(e=>{ document.getElementById("tb").innerHTML='<tr><td colspan="'+ncols()+'" class="loading">Ошибка загрузки: '+e.message+'</td></tr>'; });
 </script>
 <script>
 // Деплой П1: подпись периода и подсказки колонок говорят ОДНО И ТО ЖЕ про

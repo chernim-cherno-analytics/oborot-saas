@@ -107,11 +107,11 @@ def tour(page):
 _STEP_JS = """(sel) => {
   const box = e => { const r = e.getBoundingClientRect(); return {l: r.left, t: r.top, r: r.right, b: r.bottom}; };
   const g = document.getElementById('u-glow'), tip = document.getElementById('u-tip'), veil = document.getElementById('u-veil');
-  const name = (document.querySelector('#u-tip p') || {}).textContent || '';
+  const base = window.OborotTour.state().base;
   let target = null, rowIdx = -1, hasCk = false;
   const rows = [...document.querySelectorAll('#tb tr[data-base]')];
-  const row = rows.find(r => name.indexOf('«' + r.getAttribute('data-base') + '»') >= 0) || window.__exRow;
-  if (row) { window.__exRow = row; rowIdx = rows.indexOf(row); hasCk = !!row.querySelector('.ck');
+  const row = rows.find(r => r.getAttribute('data-base') === base);
+  if (row) { rowIdx = rows.indexOf(row); hasCk = !!row.querySelector('.ck');
     if (sel) { const c = sel === 'row' ? row : row.querySelector(sel); if (c) target = box(c); } }
   return {glowOn: g.classList.contains('on'), glow: box(g), tip: box(tip), tipOn: tip.classList.contains('on'),
           veil: !veil.hidden && veil.classList.contains('on'), clip: veil.style.clipPath || veil.style.webkitClipPath || '',
@@ -130,7 +130,7 @@ def walk_tour(page, label, expect_keys, tap=False):
     page.wait_for_timeout(700)
     st = tour(page)
     check(f"{label}: шагов {len(expect_keys)}", st["total"] == len(expect_keys), str(st))
-    keys, bad_geo, bad_tip, bad_cnt = [], [], [], []
+    keys, bad_geo, bad_tip, bad_cnt, bad_view = [], [], [], [], []
     ex = None
     for i in range(st["total"]):
         cur = tour(page)
@@ -139,6 +139,13 @@ def walk_tour(page, label, expect_keys, tap=False):
         g = page.evaluate(_STEP_JS, sel)
         if i == 0:
             ex = g
+        if cur["key"] == "row":
+            # Ревью Codex PR #134: цвет строки это класс по ВЫРУЧКЕ в день, а не
+            # по прибыли (убыточная вещь может быть бестселлером). Текст обязан
+            # говорить именно это.
+            txt = page.evaluate("() => document.querySelector('#u-tip p').textContent")
+            check(f"{label}: подсказка про цвет говорит о выручке и не обещает прибыльность",
+                  "выручк" in txt and "не прибыль" in txt and "прибыльн" not in txt, txt)
         if cur["key"] == "auto":
             btn = page.evaluate("() => { const r = document.getElementById('defDiscBtn').getBoundingClientRect();"
                                 " return {l: r.left, t: r.top, r: r.right, b: r.bottom}; }")
@@ -146,6 +153,11 @@ def walk_tour(page, label, expect_keys, tap=False):
                 bad_geo.append(cur["key"])
         elif not (g["glowOn"] and g["veil"] and overlap(g["glow"], g["target"])):
             bad_geo.append(cur["key"])
+        # Сама цель обязана быть на экране, а не только карточка со стрелкой
+        # (ревью PR #134: телефон боком, строка уезжала под нижний край).
+        gl = g["glow"]
+        if not (gl["t"] >= 0 and gl["b"] <= g["vh"] + 0.5 and gl["r"] > 0 and gl["l"] < g["vw"]):
+            bad_view.append((cur["key"], gl))
         t = g["tip"]
         if not (g["tipOn"] and t["l"] >= 0 and t["r"] <= g["vw"] + 0.5 and t["t"] >= 0 and t["b"] <= g["vh"] + 0.5):
             bad_tip.append((cur["key"], t))
@@ -156,6 +168,7 @@ def walk_tour(page, label, expect_keys, tap=False):
         page.wait_for_timeout(650)
     check(f"{label}: порядок шагов", keys == expect_keys, str(keys))
     check(f"{label}: на каждом шаге контур лежит на своей цели, фон затемнён", not bad_geo, str(bad_geo))
+    check(f"{label}: цель подсказки на экране на каждом шаге", not bad_view, str(bad_view)[:200])
     check(f"{label}: карточка подсказки целиком в окне на каждом шаге", not bad_tip, str(bad_tip)[:200])
     check(f"{label}: счётчик «N из M» верный", not bad_cnt, str(bad_cnt)[:160])
     page.wait_for_timeout(600)
@@ -348,6 +361,91 @@ try:
         check("ошибок на странице не было", not errs, str(errs[:2])[:240])
         ctx.close()
 
+        print("\n6а. Замечания ревью PR #134")
+        ctx = b.new_context(viewport={"width": 1440, "height": 900})
+        ctx.add_cookies(cookies(own))
+        page = ctx.new_page()
+        rerr: list[str] = []
+        page.on("pageerror", lambda e: rerr.append(str(e)))
+        writes: list[str] = []
+        page.on("request", lambda r: writes.append(r.url.split("?")[0]) if r.method != "GET" else None)
+        page.goto(f"{BASE}/turnover")
+        wait_rows(page)
+        page.wait_for_timeout(800)
+        # Вид человека: вторая категория и сортировка по остатку.
+        page.locator("#cat-bar .cat-btn[data-cat]").nth(1).click()
+        page.locator('#mt thead th[data-sk="stock"]').click()
+        page.wait_for_timeout(300)
+        view_js = """() => ({cat: (document.querySelector('#cat-bar .cat-btn.active') || {}).getAttribute
+          ? document.querySelector('#cat-bar .cat-btn.active').getAttribute('data-cat') : null,
+          sort: (document.querySelector('#mt thead th.sorted') || {getAttribute: () => null}).getAttribute('data-sk')})"""
+        before = page.evaluate(view_js)
+        check("вид задан: категория и сортировка по остатку", before["cat"] and before["sort"] == "stock", str(before))
+        n_rows = len(own.get("/api/turnover").json()["items"])
+        page.evaluate("() => window.OborotTour.start()")
+        page.wait_for_function("() => window.OborotTour.state().step === 0", timeout=10000)
+        page.wait_for_timeout(500)
+        during = page.evaluate(view_js)
+        check("подсказки идут на исходном виде (первая категория, без сортировки)",
+              during["sort"] is None and during["cat"] != before["cat"], str(during))
+        # Enter на «Назад» нажимает «Назад», а не листает вперёд.
+        page.keyboard.press("ArrowRight")
+        page.wait_for_timeout(450)
+        page.keyboard.press("ArrowRight")
+        page.wait_for_timeout(450)
+        page.locator("#u-tip .u-back").focus()
+        page.keyboard.press("Enter")
+        page.wait_for_timeout(450)
+        check("Enter на кнопке «Назад» возвращает на шаг назад", tour(page)["step"] == 1, str(tour(page)))
+        # Клик по подсвеченной кнопке архива не архивирует вещь.
+        for _ in range(9):
+            page.keyboard.press("ArrowRight")
+            page.wait_for_timeout(380)
+        last = tour(page)
+        check("дошли до шага про архив", last["key"] == "arch" and last["step"] == last["total"] - 1, str(last))
+        pos = page.evaluate("""() => { const b = window.OborotTour.state().base;
+          const r = [...document.querySelectorAll('#tb tr[data-base]')].find(x => x.getAttribute('data-base') === b)
+            .querySelector('.arch-btn').getBoundingClientRect(); return {x: r.left + r.width / 2, y: r.top + r.height / 2}; }""")
+        writes.clear()
+        page.mouse.click(pos["x"], pos["y"])
+        page.wait_for_timeout(900)
+        still = own.get("/api/turnover").json()["items"]
+        check("клик по подсвеченной кнопке архива во время подсказок ничего не архивирует",
+              not any(u.endswith("/api/hidden") for u in writes) and not any(it["hidden"] for it in still)
+              and len(still) == n_rows, str(writes))
+        check("этот клик листает подсказку (последний шаг закрывает их)", tour(page)["active"] is False)
+        after = page.evaluate(view_js)
+        check("после подсказок вид человека вернулся", after == before, f"{before} -> {after}")
+        page.reload()
+        wait_rows(page)
+        check("и он же сохранён: подсказки вид не стёрли", page.evaluate(view_js) == before, str(page.evaluate(view_js)))
+        page.click("#resetView")
+        # Данные ещё грузятся: подсказки ждут загрузку, а не объявляют таблицу пустой.
+        held = {"go": False}
+
+        def slow(route):
+            deadline = time.time() + 20
+            while not held["go"] and time.time() < deadline:
+                page.wait_for_timeout(100)
+            route.continue_()
+
+        page.route("**/api/turnover", slow)
+        page.goto(f"{BASE}/turnover")
+        page.wait_for_timeout(1200)
+        page.evaluate("() => window.OborotTour.start()")
+        page.wait_for_timeout(400)
+        st = tour(page)
+        toast = page.evaluate("() => document.getElementById('u-toast').textContent")
+        check("пока таблица грузится, подсказки ждут и говорят об этом",
+              st["pending"] is True and st["active"] is False and "Загружаем таблицу" in toast, f"{st} {toast}")
+        held["go"] = True
+        page.wait_for_function("() => window.OborotTour.state().step === 0", timeout=30000)
+        check("после загрузки подсказки стартуют сами", tour(page)["active"] is True)
+        page.keyboard.press("Escape")
+        page.unroute("**/api/turnover")
+        check("в этих сценариях ошибок страницы нет", not rerr, str(rerr[:2]))
+        ctx.close()
+
         print("\n7. Урок находит свои цели в новой раскладке")
         ctx = b.new_context(viewport={"width": 1440, "height": 900})
         ctx.add_cookies(cookies(own))
@@ -401,7 +499,9 @@ try:
         vis = page.evaluate("""() => ({btn: getComputedStyle(document.getElementById('defDiscBtn')).display,
           arch: getComputedStyle(document.querySelector('.arch-btn')).display})""")
         check("у наблюдателя кнопки скидок и архива скрыты", vis == {"btn": "none", "arch": "none"}, str(vis))
-        walk_tour(page, "наблюдатель", [k for k in ALL_STEPS if k not in ("auto", "arch")])
+        check("поле скидки наблюдатель видит, но менять не может",
+              page.evaluate("() => getComputedStyle(document.querySelector('.disc-in')).pointerEvents") == "none")
+        walk_tour(page, "наблюдатель", [k for k in ALL_STEPS if k not in ("disc", "auto", "arch")])
         ctx.close()
 
         print("\n10. Телефон 390")
@@ -419,6 +519,17 @@ try:
         page.evaluate("() => window.OborotTour.start()")
         walk_tour(page, "390", ALL_STEPS, tap=True)
         check("390: ошибок страницы нет", not merr, str(merr[:2]))
+        ctx.close()
+
+        print("\n11. Телефон боком 844×390")
+        ctx = b.new_context(viewport={"width": 844, "height": MOBILE}, has_touch=True, is_mobile=True)
+        ctx.add_cookies(cookies(own))
+        page = ctx.new_page()
+        page.goto(f"{BASE}/turnover")
+        wait_rows(page)
+        page.wait_for_timeout(1200)
+        page.evaluate("() => window.OborotTour.start()")
+        walk_tour(page, "844×390", ALL_STEPS, tap=True)
         ctx.close()
         b.close()
 finally:

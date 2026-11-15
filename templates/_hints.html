@@ -1173,7 +1173,11 @@
     if (HELP.tour) itCols.querySelector("span").textContent = "Подсказки к таблице";
     itCols.addEventListener("click", function(){
       closeMenu(false);
-      if (HELP.tour && window.OborotTour) window.OborotTour.start(); else HELP.openModal();
+      // Пока идёт урок (карточка шага на экране), подсказки поверх него не
+      // запускаем: два слоя объяснений сразу хуже, чем ни одного.
+      var card = document.querySelector(".tour-card");
+      var lessonOn = !!(card && card.getClientRects().length);
+      if (HELP.tour && window.OborotTour && !lessonOn) window.OborotTour.start(); else HELP.openModal();
     });
   }
 

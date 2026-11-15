@@ -12,13 +12,18 @@
 
    Слой выше меню «?» (901) и бегунка уроков (950), но ниже подсказки первого
    визита (1000). Прокрутка не блокируется: при любой прокрутке и изменении
-   окна положение пересчитывается. #}
+   окна положение пересчитывается.
+
+   Пока подсказки идут, страница под ними не нажимается: в «окне» размытого
+   слоя лежит прозрачный щит (.u-shield), и клик по подсвеченной кнопке
+   листает подсказку, а не архивирует вещь (ревью PR #134). #}
 <style>
   .u-veil { position: fixed; inset: 0; z-index: 960; cursor: pointer; opacity: 0; transition: opacity .45s;
     background: rgba(236,236,244,.42);
     -webkit-backdrop-filter: blur(7px) saturate(115%); backdrop-filter: blur(7px) saturate(115%); }
   .u-veil.on { opacity: 1; }
-  .u-veil[hidden], .u-glow[hidden], .u-tip[hidden], .u-toast[hidden] { display: none; }
+  .u-shield { position: fixed; inset: 0; z-index: 955; cursor: pointer; background: transparent; }
+  .u-veil[hidden], .u-glow[hidden], .u-tip[hidden], .u-toast[hidden], .u-shield[hidden] { display: none; }
   @property --u-ang { syntax: "<angle>"; initial-value: 0deg; inherits: false; }
   .u-glow { position: fixed; z-index: 970; pointer-events: none; border-radius: 16px; opacity: 0;
     transition: left .5s var(--u-ease), top .5s var(--u-ease), width .5s var(--u-ease), height .5s var(--u-ease),
@@ -45,7 +50,7 @@
     font: 13.5px/1.45 var(--u-font); opacity: 0; transform: translateY(8px) scale(.97);
     transition: opacity .3s var(--u-ease), transform .3s var(--u-ease); }
   .u-tip.on { opacity: 1; transform: none; }
-  .u-tip:focus { outline: none; }
+  .u-tip:focus, html.ui2 .u-tip:focus-visible { outline: none; }
   .u-tip h3 { margin: 0 28px 4px 0; font-size: 16px; font-weight: 700; letter-spacing: -.015em; }
   .u-tip p { margin: 0; color: var(--u-ink2); }
   .u-tip .u-lg { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 9px; }
@@ -69,6 +74,7 @@
     box-shadow: 0 16px 40px rgba(46,46,96,.22); opacity: 0; transition: opacity .35s, transform .35s var(--u-ease); }
   .u-toast.on { opacity: 1; transform: translate(-50%, 0); }
 </style>
+<div class="u-shield" id="u-shield" hidden></div>
 <div class="u-veil" id="u-veil" hidden></div>
 <div class="u-glow" id="u-glow" hidden></div>
 <div class="u-tip" id="u-tip" role="dialog" aria-label="Подсказка к таблице" aria-live="polite" tabindex="-1" hidden></div>
@@ -77,8 +83,9 @@
 (function(){
   "use strict";
   var veil = document.getElementById("u-veil"), glow = document.getElementById("u-glow"),
-      tip = document.getElementById("u-tip"), toastEl = document.getElementById("u-toast");
-  var STEPS = [], ex = null, idx = -1, active = false, raf = 0, toastT = 0;
+      tip = document.getElementById("u-tip"), toastEl = document.getElementById("u-toast"),
+      shield = document.getElementById("u-shield");
+  var STEPS = [], ex = null, idx = -1, active = false, pending = false, raf = 0, toastT = 0;
 
   function fmt(n){ return Math.round(n).toLocaleString("ru-RU"); }
   function plDays(n){ n = Math.abs(Math.round(n)); var a = n % 10, b = n % 100;
@@ -95,22 +102,22 @@
     var it = ex.item, norm = (window.OborotTurnover && window.OborotTurnover.norm()) || 90;
     var all = [
       {k: "turn", els: function(){ return [inner("turn", ".pill")]; }, pad: 5, rad: 999, t: "Оборачиваемость",
-       p: "Столько вещь приносила в день, пока была в стоке. «" + it.base_name + "»: " + fmt(it.turnover) + " ₽ в день."},
+       p: "Столько вещь приносила в день, пока была в стоке. У этой вещи " + fmt(it.turnover) + " ₽ в день."},
       {k: "row", row: true, pad: 1, rad: 15, t: "Цвет строки", legend: true,
-       p: "Цвет показывает, насколько вещь прибыльная."},
+       p: "Цвет показывает, сколько выручки вещь приносит в день. Это выручка, а не прибыль: себестоимость здесь не вычитается."},
       {k: "price", els: function(){ return [cell("price")]; }, pad: 2, rad: 14, cls: "sunset", t: "Цена",
        p: "Сверху реальная цена продажи с учётом скидок и акций: за сколько вещь на самом деле брали. Ниже цена по прайсу."},
       {k: "seasons", els: function(){ return [cell("winter"), cell("autumn")]; }, pad: 1, rad: 14, t: "Сезоны",
        p: "Средняя оборачиваемость вещи в каждом сезоне. Ноль значит, что продаж в сезоне не было. Прочерк значит, что сезон ещё не загружен."},
-      {k: "dis", els: function(){ return [cell("dis")]; }, pad: 1, rad: 14, t: "Дней в стоке",
+      {k: "dis", els: function(){ return [cell("dis")]; }, pad: 1, rad: 14, t: "В стоке, дней",
        p: "Сколько дней вещь была в наличии. Галочка значит, что дней достаточно и цифрам можно верить. Вещи без галочки можно скрыть кнопкой «Только с галочкой»."},
       {k: "stock", els: function(){ return [cell("stock"), cell("supply")]; }, pad: 1, rad: 14, t: "Остаток и запас",
        p: "Остаток: сколько штук лежит сейчас. Запас: на сколько дней их хватит при нынешних продажах."},
       {k: "norm", els: function(){ return [cell("zat"), cell("defq")]; }, pad: 1, rad: 14, t: "Хватит ли стока",
        p: "Норма запаса сейчас " + plDays(norm) + ". Полоска показывает, какая часть нормы уже закрыта, а рядом видно, сколько штук до неё не хватает."},
-      {k: "fdisc", els: function(){ return [cell("fdisc")]; }, pad: 1, rad: 14, t: "Фактическая скидка",
+      {k: "fdisc", els: function(){ return [cell("fdisc")]; }, pad: 1, rad: 14, t: "Скидка была",
        p: "Реальная средняя скидка, с которой вещь продаётся."},
-      {k: "disc", els: function(){ return [inner("disc", ".disc-in")]; }, pad: 5, rad: 14, t: "Ваша скидка",
+      {k: "disc", act: true, els: function(){ return [inner("disc", ".disc-in")]; }, pad: 5, rad: 14, t: "Ваша скидка",
        p: "Сюда можно вписать скидку на время распродажи. Она сохранится и попадёт в отчёт «Скидки» и в печатный прайс для команды."},
       {k: "auto", ext: "#defDiscBtn", pad: 5, rad: 999, t: "Расставить скидки",
        p: "Расставим скидки за вас: смотрим, как вещь продаётся и сколько её лежит. Ручные скидки при этом заменятся, а после можно поправить любую позицию. Само правило настраивается кнопкой «Правило» рядом."},
@@ -118,11 +125,14 @@
        p: "Не хотите видеть вещь в аналитике? Лимитка, сэмпл, ошибка складской программы: отправьте её в архив. Вернуть можно под таблицей, в разделе «Архив»."}
     ];
     // Чего на экране нет (кнопки, скрытые ролью без права на каталог), о том
-    // и не рассказываем.
+    // и не рассказываем. Поле, которое роль видит, но менять не может
+    // (pointer-events: none из _perms_css.html), тоже: «сюда можно вписать»
+    // было бы неправдой.
     return all.filter(function(s){
       if (s.row) return true;
       var els = s.ext ? [document.querySelector(s.ext)] : s.els();
-      return els.length && els.every(shown);
+      if (!(els.length && els.every(shown))) return false;
+      return !s.act || els.every(function(e){ return getComputedStyle(e).pointerEvents !== "none"; });
     });
   }
 
@@ -159,14 +169,28 @@
   function ensureX(els){
     var o = outerEl(), w = o.getBoundingClientRect(), first = ex.row.firstElementChild.getBoundingClientRect(), u = union(els);
     var leftEdge = first.right + 8, rightEdge = w.right - 12;
-    if (u.r > rightEdge) o.scrollLeft += u.r - rightEdge;
+    // Цель шире свободного места (телефон): показываем её левый край, а не
+    // прячем его под залипшей колонкой.
+    if (u.r - u.l > rightEdge - leftEdge) { if (Math.abs(u.l - leftEdge) > 1) o.scrollLeft += u.l - leftEdge; }
+    else if (u.r > rightEdge) o.scrollLeft += u.r - rightEdge;
     else if (u.l < leftEdge) o.scrollLeft -= leftEdge - u.l;
+  }
+  /* Цель должна быть видна и по вертикали: ниже липкой шапки и с местом под
+     карточку. На низком окне (телефон боком) таблица целиком не помещается. */
+  function ensureY(e){
+    var r = e.getBoundingClientRect();
+    if (r.top < 76 || r.bottom > innerHeight - 40) window.scrollBy(0, r.top - Math.max(84, innerHeight * 0.3));
   }
   function rowRect(){ return clamp(union([ex.row.firstElementChild, ex.row.lastElementChild])); }
 
   function layout(){
     if (!active || idx < 0 || !ex) return;
-    var st = STEPS[idx], target, holes, row = st.ext ? null : rowRect();
+    // Таблицу перерисовали (смена категории с клавиатуры, перезагрузка данных):
+    // строки-примера больше нет, показывать не на чем.
+    if (!document.documentElement.contains(ex.row)) { stop(true); return; }
+    var st = STEPS[idx], target, holes;
+    if (!st.ext && !st.row) ensureX(st.els());
+    var row = st.ext ? null : rowRect();
     if (st.ext) { target = union([document.querySelector(st.ext)]);
       holes = [{l: target.l - st.pad, t: target.t - st.pad, r: target.r + st.pad, b: target.b + st.pad}]; }
     else if (st.row) { target = row; holes = [row]; }
@@ -226,7 +250,8 @@
     function show(){
       if (!active || idx !== n) return;
       var st = STEPS[n];
-      if (!st.ext && !st.row) ensureX(st.els());
+      if (st.ext) ensureY(document.querySelector(st.ext));
+      else { var o = outerEl(); o.scrollTop = Math.max(0, ex.row.offsetTop - o.clientHeight / 2 + 23); ensureY(ex.row); }
       paintTip(); layout();
       requestAnimationFrame(function(){ layout(); tip.classList.add("on"); });
     }
@@ -239,17 +264,35 @@
     toastT = setTimeout(function(){ toastEl.classList.remove("on"); setTimeout(function(){ toastEl.hidden = true; }, 380); }, 5200);
   }
 
+  function hideToast(){ clearTimeout(toastT); toastEl.classList.remove("on"); toastEl.hidden = true; }
+  /* Данные таблицы могут ещё грузиться (на большом каталоге это секунды, а
+     карточка первого визита появляется раньше): тогда ждём загрузку, а не
+     объявляем таблицу пустой (ревью PR #134). */
   function start(){
-    if (active || !window.OborotTurnover) return;
-    ex = window.OborotTurnover.prepare();
-    if (!ex) { toast("Подсказки появятся, когда в таблице будут вещи с продажами"); return; }
+    var T = window.OborotTurnover;
+    if (active || pending || !T) return;
+    if (T.loaded && !T.loaded()) {
+      pending = true;
+      toast("Загружаем таблицу. Подсказки начнутся сразу после этого.");
+      var fin = function(){ pending = false; begin(); };
+      T.whenReady().then(fin, fin);
+      return;
+    }
+    begin();
+  }
+  function begin(){
+    var T = window.OborotTurnover;
+    if (active) return;
+    ex = T.prepare();
+    if (!ex) { if (T.restore) T.restore();
+      toast("В таблице пока нет вещей с продажами: подсказки показать не на чем"); return; }
+    hideToast();
     var o = outerEl();
     window.scrollTo(0, 0);
     o.scrollLeft = 0;
-    o.scrollTop = Math.max(0, ex.row.offsetTop - o.clientHeight / 2 + 23);
     STEPS = buildSteps();
     active = true; idx = -1;
-    veil.hidden = false; glow.hidden = false; tip.hidden = false;
+    shield.hidden = false; veil.hidden = false; glow.hidden = false; tip.hidden = false;
     setHoles([]); void veil.offsetWidth; veil.classList.add("on");
     setTimeout(function(){ go(0); try { tip.focus({preventScroll: true}); } catch(e){} }, 220);
   }
@@ -257,7 +300,12 @@
     if (!active) return;
     active = false; idx = -1;
     tip.classList.remove("on"); glow.classList.remove("on"); veil.classList.remove("on");
+    shield.hidden = true;
     setTimeout(function(){ if (active) return; tip.hidden = true; glow.hidden = true; veil.hidden = true; }, 460);
+    // Вид таблицы, который был до подсказок (категория, поиск, сортировка),
+    // возвращается: подсказки его не сохраняли и не должны стирать.
+    if (window.OborotTurnover && window.OborotTurnover.restore) window.OborotTurnover.restore();
+    ex = null;
     if (silent) return;
     var fab = document.getElementById("hint-fab");
     if (fab && fab.style.display !== "none") {
@@ -268,17 +316,21 @@
   }
 
   veil.addEventListener("click", function(){ go(idx + 1); });
+  shield.addEventListener("click", function(){ go(idx + 1); });
   window.addEventListener("resize", relayout);
   // capture: прокрутка самой таблицы не всплывает до окна.
   window.addEventListener("scroll", relayout, true);
   document.addEventListener("keydown", function(e){
     if (!active) return;
+    // Enter на кнопке внутри карточки («Назад», крестик) нажимает именно её.
+    var onBtn = e.target && e.target.closest && e.target.closest("#u-tip button");
     if (e.key === "Escape" || e.key === "Esc") { e.preventDefault(); stop(); }
-    else if (e.key === "ArrowRight" || e.key === "Enter") { e.preventDefault(); go(idx + 1); }
+    else if (e.key === "ArrowRight" || (e.key === "Enter" && !onBtn)) { e.preventDefault(); go(idx + 1); }
     else if (e.key === "ArrowLeft") { e.preventDefault(); go(idx - 1); }
   });
 
   window.OborotTour = {start: start, stop: stop, isActive: function(){ return active; },
-    state: function(){ return {active: active, step: idx, total: STEPS.length, key: idx >= 0 ? STEPS[idx].k : null}; }};
+    state: function(){ return {active: active, pending: pending, step: idx, total: STEPS.length,
+      key: idx >= 0 ? STEPS[idx].k : null, base: ex ? ex.item.base_name : null}; }};
 })();
 </script>
