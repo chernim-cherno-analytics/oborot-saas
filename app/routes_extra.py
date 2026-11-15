@@ -738,20 +738,31 @@ def api_save_replenish_draft(
     return {"ok": True, "base_name": base_name, "sizes": clean}
 
 
+def _draft_reset_ctx(ctx: AuthContext = Depends(require_auth_api)) -> AuthContext:
+    """Вход в сброс ростовки: какое право нужно, решает сама ручка по телу
+    запроса (позиция или вся таблица). Ревью Codex #110: роль только с
+    drafts_reset_all раньше получала 403 на зависимости drafts_edit."""
+    return ctx
+
+
+_draft_reset_ctx.oborot_perm = "drafts_edit"  # для сторожа в tests/test_roles.py
+
+
 @router.post("/api/replenish-draft/reset")
 def api_reset_replenish_draft(
     body: ReplenishDraftResetIn,
-    ctx: AuthContext = Depends(require_perm("drafts_edit")),
+    ctx: AuthContext = Depends(_draft_reset_ctx),
     db: Session = Depends(get_db),
 ):
     """Вернуть ростовку к расчёту: одной позиции или всей таблицы ('').
 
-    Позиция: право drafts_edit (зависимость). Вся таблица стирает и чужие
-    правки, поэтому это отдельное право drafts_reset_all.
+    Позиция: право drafts_edit. Вся таблица стирает и чужие правки,
+    поэтому это отдельное право drafts_reset_all.
     """
-    if not body.base_name and not ctx.can("drafts_reset_all"):
+    need = "drafts_edit" if body.base_name else "drafts_reset_all"
+    if not ctx.can(need):
         from app import roles as _roles
-        raise HTTPException(status_code=403, detail=_roles.denied_detail("drafts_reset_all"))
+        raise HTTPException(status_code=403, detail=_roles.denied_detail(need))
     stmt = delete(ReplenishDraft).where(ReplenishDraft.org_id == ctx.org.id)
     if body.base_name:
         stmt = stmt.where(ReplenishDraft.base_name == body.base_name)

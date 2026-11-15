@@ -373,6 +373,10 @@ with client() as owner, client() as ownerB:
             for method, path, p in PERM_ROUTES:
                 if p == perm:
                     continue
+                # Сброс ростовки обслуживает два права: позиция (drafts_edit,
+                # метка ручки) и вся таблица (drafts_reset_all, пустое тело).
+                if path == "/api/replenish-draft/reset" and perm == "drafts_reset_all":
+                    continue
                 rr = call(one, method, path)
                 if rr.status_code != 403:
                     leaked.append((method, path, rr.status_code))
@@ -690,6 +694,34 @@ with client() as ha, client() as hb:
     owners_left = sql("SELECT COUNT(*) FROM memberships WHERE org_id=? AND role='owner'", alpha_id)[0][0]
     check("два владельца снимают себя одновременно: владелец остаётся",
           owners_left >= 1 and sorted(results).count(422) >= 1, f"{results} владельцев={owners_left}")
+
+print("\n== Ревью Codex #110: сброс всей ростовки отдельным правом, автор приглашения ==")
+with client() as hc:
+    hc.post("/register", data={"name": "Гамма", "email": "gamma@roles.io",
+                               "password": PW, "org_name": "Гамма"})
+    hc.post("/api/connect/demo")
+    g_org = sql("SELECT id FROM orgs WHERE name='Гамма'")[0][0]
+    rr = hc.post("/api/team/roles", json={"name": "Только сброс", "perms": ["drafts_reset_all"]})
+    rid = rr.json().get("id") or next(r["id"] for r in hc.get("/api/team").json()["roles"]
+                                      if r["name"] == "Только сброс")
+    uid = add_user("reset@roles.io", g_org, role_id=rid)
+    with client() as hr:
+        login(hr, "reset@roles.io")
+        r_all = hr.post("/api/replenish-draft/reset", json={"base_name": ""})
+        r_one = hr.post("/api/replenish-draft/reset", json={"base_name": "Худи «Скетч»"})
+        check("роль только с drafts_reset_all сбрасывает всю таблицу, но не позицию",
+              r_all.status_code == 200 and r_one.status_code == 403, f"{r_all.status_code} {r_one.status_code}")
+    mgr = next(r["id"] for r in hc.get("/api/team").json()["roles"] if r["builtin"] == "owner")
+    uid2 = add_user("creator@roles.io", g_org, role="owner", role_id=mgr, name="Автор Приглашения")
+    with client() as hm:
+        login(hm, "creator@roles.io")
+        emp = next(r["id"] for r in hm.get("/api/team").json()["roles"] if r["builtin"] == "employee")
+        hm.post("/api/team/invites", json={"role_id": emp})
+    sql("DELETE FROM memberships WHERE user_id=? AND org_id=?", uid2, g_org)
+    invs = hc.get("/api/team").json().get("invites") or []
+    check("автор не в организации: имя автора приглашения не показывается",
+          invs and all(i.get("created_by") == "" for i in invs if i.get("created_by") != "Гамма"),
+          str(invs)[:300])
 
 for base in (DB_PATH, OLD_DB_PATH):
     for suffix in ("", "-wal", "-shm"):

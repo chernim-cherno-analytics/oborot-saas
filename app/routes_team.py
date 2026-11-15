@@ -174,8 +174,12 @@ def team_state(db: Session, ctx: AuthContext) -> dict:
     for inv in _active_invites(db, org_id, now):
         role = by_id.get(inv.role_id)
         if inv.created_by and inv.created_by not in creators:
+            # Автора показываем, только если он сейчас в ЭТОЙ организации:
+            # id удалённого пользователя SQLite может отдать новому человеку
+            # из чужой организации (ревью Codex #110, P1).
             u = db.get(User, inv.created_by)
-            creators[inv.created_by] = (u.name or u.email) if u else ""
+            in_org = u is not None and db.get(Membership, (u.id, org_id)) is not None
+            creators[inv.created_by] = (u.name or u.email) if in_org else ""
         invites.append({
             "id": inv.id,
             "role_id": inv.role_id,
