@@ -1,0 +1,284 @@
+{# ── UI2 (D-84): подсказки к таблице «Оборачиваемости» ──────────────────────
+   Одиннадцать коротких подсказок по клику: фон размыт, видна одна строка из
+   середины списка, вокруг того, о чём речь, мягко светится контур. Запускаются
+   кнопкой «Показать, что есть что» в подсказке первого визита (_hints.html) и
+   пунктом «Подсказки к таблице» в меню «?». Отдельного состояния на сервере у
+   них нет: «просмотрено» отмечает та же подсказка первого визита.
+
+   Подключается ПЕРЕД _hints.html: тот при разборе спрашивает window.OborotTour.
+   Страница отдаёт строку-пример через window.OborotTurnover.prepare() и метит
+   ячейки атрибутом data-k (turnover.html, rowHtml). Названия товаров попадают
+   в текст только через textContent.
+
+   Слой выше меню «?» (901) и бегунка уроков (950), но ниже подсказки первого
+   визита (1000). Прокрутка не блокируется: при любой прокрутке и изменении
+   окна положение пересчитывается. #}
+<style>
+  .u-veil { position: fixed; inset: 0; z-index: 960; cursor: pointer; opacity: 0; transition: opacity .45s;
+    background: rgba(236,236,244,.42);
+    -webkit-backdrop-filter: blur(7px) saturate(115%); backdrop-filter: blur(7px) saturate(115%); }
+  .u-veil.on { opacity: 1; }
+  .u-veil[hidden], .u-glow[hidden], .u-tip[hidden], .u-toast[hidden] { display: none; }
+  @property --u-ang { syntax: "<angle>"; initial-value: 0deg; inherits: false; }
+  .u-glow { position: fixed; z-index: 970; pointer-events: none; border-radius: 16px; opacity: 0;
+    transition: left .5s var(--u-ease), top .5s var(--u-ease), width .5s var(--u-ease), height .5s var(--u-ease),
+      opacity .4s, border-radius .4s; }
+  .u-glow.on { opacity: 1; }
+  .u-glow::before, .u-glow::after { content: ""; position: absolute; inset: -3px; border-radius: inherit; padding: 2.5px;
+    background: conic-gradient(from var(--u-ang), #ff7ac6, #ffb85c, #7ef0c8, #5eb0ff, #b693ff, #ff7ac6);
+    -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0); -webkit-mask-composite: xor;
+    mask: linear-gradient(#000 0 0) content-box exclude, linear-gradient(#000 0 0);
+    animation: u-spin 5s linear infinite; }
+  .u-glow::after { inset: -9px; padding: 9px; filter: blur(11px); opacity: .8;
+    animation: u-spin 5s linear infinite, u-breathe 3.2s ease-in-out infinite; }
+  @keyframes u-spin { to { --u-ang: 360deg; } }
+  @keyframes u-breathe { 50% { opacity: .45; } }
+  /* Цена: тёплая подсветка, «как закат за ней». */
+  .u-glow.sunset { background: radial-gradient(120% 140% at 50% 110%, rgba(255,150,60,.3), rgba(255,95,130,.14) 55%, transparent 75%);
+    box-shadow: 0 18px 60px 8px rgba(255,140,60,.46), 0 0 110px 30px rgba(255,90,130,.26); }
+  .u-glow.sunset::before, .u-glow.sunset::after {
+    background: conic-gradient(from var(--u-ang), #ffd35c, #ff9a3c, #ff5e7e, #ffb85c, #ffe9a8, #ffd35c); }
+  .u-tip { position: fixed; z-index: 980; width: 340px; max-width: calc(100vw - 24px); border-radius: 20px; padding: 16px 16px 12px;
+    background: var(--u-glass-hi); border: 1px solid rgba(255,255,255,.85); color: var(--u-ink);
+    -webkit-backdrop-filter: blur(30px) saturate(180%); backdrop-filter: blur(30px) saturate(180%);
+    box-shadow: 0 24px 60px rgba(46,46,96,.26), inset 0 1px 0 rgba(255,255,255,.9);
+    font: 13.5px/1.45 var(--u-font); opacity: 0; transform: translateY(8px) scale(.97);
+    transition: opacity .3s var(--u-ease), transform .3s var(--u-ease); }
+  .u-tip.on { opacity: 1; transform: none; }
+  .u-tip:focus { outline: none; }
+  .u-tip h3 { margin: 0 28px 4px 0; font-size: 16px; font-weight: 700; letter-spacing: -.015em; }
+  .u-tip p { margin: 0; color: var(--u-ink2); }
+  .u-tip .u-lg { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 9px; }
+  .u-tip .u-lg span { font-size: 11.5px; font-weight: 600; padding: 3px 9px; border-radius: 999px; color: var(--u-ink); }
+  .u-tip .u-row { display: flex; align-items: center; gap: 6px; margin-top: 12px; }
+  .u-tip .u-cnt { font-size: 12px; color: var(--u-ink2); margin-right: auto; font-variant-numeric: tabular-nums; }
+  .u-tip button { font: 600 13px var(--u-font); cursor: pointer; border: 0; }
+  .u-tip .u-next { height: 32px; padding: 0 16px; border-radius: 999px; background: var(--u-accent); color: #fff;
+    box-shadow: 0 6px 16px rgba(10,102,214,.28); }
+  .u-tip .u-next:hover { background: #0b72ee; }
+  .u-tip .u-back { height: 32px; padding: 0 10px; border-radius: 999px; background: none; color: var(--u-accent); }
+  .u-tip .u-back:hover { background: var(--u-accent-soft); }
+  .u-tip .u-x { position: absolute; top: 10px; right: 10px; width: 26px; height: 26px; border-radius: 50%;
+    background: rgba(120,120,128,.16); color: var(--u-ink2); font-size: 13px; line-height: 1; display: grid; place-items: center; }
+  .u-tip .u-x:hover { background: rgba(120,120,128,.26); color: var(--u-ink); }
+  .u-tip .u-arrow { position: absolute; width: 14px; height: 14px; background: rgba(255,255,255,.95); transform: rotate(45deg); border-radius: 3px; }
+  .u-toast { position: fixed; z-index: 990; left: 50%; bottom: 26px; transform: translate(-50%, 20px); max-width: calc(100vw - 96px);
+    border-radius: 999px; padding: 10px 18px; font: 13.5px/1.35 var(--u-font); color: var(--u-ink);
+    background: var(--u-glass-hi); border: 1px solid rgba(255,255,255,.85);
+    -webkit-backdrop-filter: blur(30px) saturate(180%); backdrop-filter: blur(30px) saturate(180%);
+    box-shadow: 0 16px 40px rgba(46,46,96,.22); opacity: 0; transition: opacity .35s, transform .35s var(--u-ease); }
+  .u-toast.on { opacity: 1; transform: translate(-50%, 0); }
+</style>
+<div class="u-veil" id="u-veil" hidden></div>
+<div class="u-glow" id="u-glow" hidden></div>
+<div class="u-tip" id="u-tip" role="dialog" aria-label="Подсказка к таблице" aria-live="polite" tabindex="-1" hidden></div>
+<div class="u-toast" id="u-toast" role="status" hidden></div>
+<script>
+(function(){
+  "use strict";
+  var veil = document.getElementById("u-veil"), glow = document.getElementById("u-glow"),
+      tip = document.getElementById("u-tip"), toastEl = document.getElementById("u-toast");
+  var STEPS = [], ex = null, idx = -1, active = false, raf = 0, toastT = 0;
+
+  function fmt(n){ return Math.round(n).toLocaleString("ru-RU"); }
+  function plDays(n){ n = Math.abs(Math.round(n)); var a = n % 10, b = n % 100;
+    if (a === 1 && b !== 11) return n + " день";
+    if (a >= 2 && a <= 4 && (b < 10 || b >= 20)) return n + " дня";
+    return n + " дней"; }
+  function cell(k){ return ex.row.querySelector('[data-k="' + k + '"]'); }
+  function inner(k, sel){ var c = cell(k); return c ? (c.querySelector(sel) || c) : null; }
+  function shown(el){ return !!el && el.getClientRects().length > 0 && getComputedStyle(el).visibility !== "hidden"; }
+
+  /* Тексты: одна мысль на подсказку. els возвращает элементы цели (их общий
+     прямоугольник подсвечивается); ext — цель вне строки-примера. */
+  function buildSteps(){
+    var it = ex.item, norm = (window.OborotTurnover && window.OborotTurnover.norm()) || 90;
+    var all = [
+      {k: "turn", els: function(){ return [inner("turn", ".pill")]; }, pad: 5, rad: 999, t: "Оборачиваемость",
+       p: "Столько вещь приносила в день, пока была в стоке. «" + it.base_name + "»: " + fmt(it.turnover) + " ₽ в день."},
+      {k: "row", row: true, pad: 1, rad: 15, t: "Цвет строки", legend: true,
+       p: "Цвет показывает, насколько вещь прибыльная."},
+      {k: "price", els: function(){ return [cell("price")]; }, pad: 2, rad: 14, cls: "sunset", t: "Цена",
+       p: "Сверху реальная цена продажи с учётом скидок и акций: за сколько вещь на самом деле брали. Ниже цена по прайсу."},
+      {k: "seasons", els: function(){ return [cell("winter"), cell("autumn")]; }, pad: 1, rad: 14, t: "Сезоны",
+       p: "Средняя оборачиваемость вещи в каждом сезоне. Ноль значит, что продаж в сезоне не было. Прочерк значит, что сезон ещё не загружен."},
+      {k: "dis", els: function(){ return [cell("dis")]; }, pad: 1, rad: 14, t: "Дней в стоке",
+       p: "Сколько дней вещь была в наличии. Галочка значит, что дней достаточно и цифрам можно верить. Вещи без галочки можно скрыть кнопкой «Только с галочкой»."},
+      {k: "stock", els: function(){ return [cell("stock"), cell("supply")]; }, pad: 1, rad: 14, t: "Остаток и запас",
+       p: "Остаток: сколько штук лежит сейчас. Запас: на сколько дней их хватит при нынешних продажах."},
+      {k: "norm", els: function(){ return [cell("zat"), cell("defq")]; }, pad: 1, rad: 14, t: "Хватит ли стока",
+       p: "Норма запаса сейчас " + plDays(norm) + ". Полоска показывает, какая часть нормы уже закрыта, а рядом видно, сколько штук до неё не хватает."},
+      {k: "fdisc", els: function(){ return [cell("fdisc")]; }, pad: 1, rad: 14, t: "Фактическая скидка",
+       p: "Реальная средняя скидка, с которой вещь продаётся."},
+      {k: "disc", els: function(){ return [inner("disc", ".disc-in")]; }, pad: 5, rad: 14, t: "Ваша скидка",
+       p: "Сюда можно вписать скидку на время распродажи. Она сохранится и попадёт в отчёт «Скидки» и в печатный прайс для команды."},
+      {k: "auto", ext: "#defDiscBtn", pad: 5, rad: 999, t: "Расставить скидки",
+       p: "Расставим скидки за вас: смотрим, как вещь продаётся и сколько её лежит. Ручные скидки при этом заменятся, а после можно поправить любую позицию. Само правило настраивается кнопкой «Правило» рядом."},
+      {k: "arch", els: function(){ return [inner("arch", ".arch-btn")]; }, pad: 5, rad: 14, t: "В архив",
+       p: "Не хотите видеть вещь в аналитике? Лимитка, сэмпл, ошибка складской программы: отправьте её в архив. Вернуть можно под таблицей, в разделе «Архив»."}
+    ];
+    // Чего на экране нет (кнопки, скрытые ролью без права на каталог), о том
+    // и не рассказываем.
+    return all.filter(function(s){
+      if (s.row) return true;
+      var els = s.ext ? [document.querySelector(s.ext)] : s.els();
+      return els.length && els.every(shown);
+    });
+  }
+
+  function union(els){
+    var L = 1e9, T = 1e9, R = -1e9, B = -1e9;
+    els.forEach(function(e){ var q = e.getBoundingClientRect();
+      L = Math.min(L, q.left); T = Math.min(T, q.top); R = Math.max(R, q.right); B = Math.max(B, q.bottom); });
+    return {l: L, t: T, r: R, b: B};
+  }
+  function outerEl(){ return document.getElementById("table-outer"); }
+  /* Видимая часть таблицы: её рамка минус залипшая шапка. */
+  function viewRect(){
+    var w = outerEl().getBoundingClientRect(), th = document.querySelector("#mt thead");
+    var hb = th ? th.getBoundingClientRect().bottom : w.top;
+    return {l: w.left + 2, t: Math.max(w.top, hb), r: w.right - 2, b: w.bottom};
+  }
+  function clamp(r){ var v = viewRect();
+    return {l: Math.max(r.l, v.l), t: Math.max(r.t, v.t), r: Math.min(r.r, v.r), b: Math.min(r.b, v.b)}; }
+  function ok(r){ return r.r - r.l > 4 && r.b - r.t > 4; }
+  function rr(h, rad){
+    var x = h.l, y = h.t, w = h.r - h.l, hh = h.b - h.t, r = Math.min(rad, w / 2, hh / 2);
+    return "M" + (x + r) + " " + y + "H" + (x + w - r) + "A" + r + " " + r + " 0 0 1 " + (x + w) + " " + (y + r) +
+      "V" + (y + hh - r) + "A" + r + " " + r + " 0 0 1 " + (x + w - r) + " " + (y + hh) +
+      "H" + (x + r) + "A" + r + " " + r + " 0 0 1 " + x + " " + (y + hh - r) + "V" + (y + r) +
+      "A" + r + " " + r + " 0 0 1 " + (x + r) + " " + y + "Z";
+  }
+  function setHoles(holes){
+    var d = "M0 0H" + innerWidth + "V" + innerHeight + "H0Z";
+    holes.forEach(function(h){ if (ok(h)) d += rr(h, 13); });
+    var v = 'path(evenodd,"' + d + '")';
+    veil.style.clipPath = v; veil.style.webkitClipPath = v;
+  }
+  /* Цель должна быть видна по горизонтали: правее залипшей колонки названия. */
+  function ensureX(els){
+    var o = outerEl(), w = o.getBoundingClientRect(), first = ex.row.firstElementChild.getBoundingClientRect(), u = union(els);
+    var leftEdge = first.right + 8, rightEdge = w.right - 12;
+    if (u.r > rightEdge) o.scrollLeft += u.r - rightEdge;
+    else if (u.l < leftEdge) o.scrollLeft -= leftEdge - u.l;
+  }
+  function rowRect(){ return clamp(union([ex.row.firstElementChild, ex.row.lastElementChild])); }
+
+  function layout(){
+    if (!active || idx < 0 || !ex) return;
+    var st = STEPS[idx], target, holes, row = st.ext ? null : rowRect();
+    if (st.ext) { target = union([document.querySelector(st.ext)]);
+      holes = [{l: target.l - st.pad, t: target.t - st.pad, r: target.r + st.pad, b: target.b + st.pad}]; }
+    else if (st.row) { target = row; holes = [row]; }
+    else { target = clamp(union(st.els())); holes = [row]; }
+    setHoles(holes);
+    var vis = ok(target);
+    var g = {l: target.l - st.pad, t: target.t - st.pad, r: target.r + st.pad, b: target.b + st.pad};
+    glow.style.left = g.l + "px"; glow.style.top = g.t + "px";
+    glow.style.width = Math.max(0, g.r - g.l) + "px"; glow.style.height = Math.max(0, g.b - g.t) + "px";
+    glow.style.borderRadius = st.rad + "px";
+    glow.className = "u-glow" + (vis ? " on" : "") + (st.cls ? " " + st.cls : "");
+    var tw = tip.offsetWidth, th = tip.offsetHeight, cx = vis ? (g.l + g.r) / 2 : innerWidth / 2;
+    var top, below = true, ar = tip.querySelector(".u-arrow");
+    if (!vis) { top = (innerHeight - th) / 2; ar.style.display = "none"; }
+    else {
+      var a = st.ext || !ok(row) ? g : {t: Math.min(g.t, row.t), b: Math.max(g.b, row.b)};
+      top = a.b + 18; if (top + th > innerHeight - 12) { top = a.t - 18 - th; below = false; }
+      ar.style.display = "";
+    }
+    var left = Math.max(12, Math.min(innerWidth - tw - 12, cx - tw / 2));
+    tip.style.left = left + "px"; tip.style.top = Math.max(12, top) + "px";
+    ar.style.left = Math.max(18, Math.min(tw - 32, cx - left - 7)) + "px";
+    ar.style.top = below ? "-6px" : ""; ar.style.bottom = below ? "" : "-6px";
+  }
+  function relayout(){ if (raf) return; raf = requestAnimationFrame(function(){ raf = 0; layout(); }); }
+
+  function el(tag, cls, text){ var e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
+  function paintTip(){
+    var st = STEPS[idx], n = STEPS.length;
+    tip.textContent = "";
+    tip.appendChild(el("span", "u-arrow"));
+    var x = el("button", "u-x", "✕"); x.type = "button"; x.setAttribute("aria-label", "Закрыть подсказки");
+    x.addEventListener("click", function(e){ e.stopPropagation(); stop(); });
+    tip.appendChild(x);
+    tip.appendChild(el("h3", "", st.t));
+    tip.appendChild(el("p", "", st.p));
+    if (st.legend) {
+      var lg = el("div", "u-lg");
+      [["Бестселлер", "--u-row-best"], ["Хороший", "--u-row-good"], ["Медленный", "--u-row-slow"], ["Слабый", "--u-row-out"]]
+        .forEach(function(x){ var s = el("span", "", x[0]); s.style.background = "var(" + x[1] + ")"; lg.appendChild(s); });
+      tip.appendChild(lg);
+    }
+    var row = el("div", "u-row");
+    row.appendChild(el("span", "u-cnt", (idx + 1) + " из " + n));
+    if (idx > 0) { var b = el("button", "u-back", "Назад"); b.type = "button";
+      b.addEventListener("click", function(e){ e.stopPropagation(); go(idx - 1); }); row.appendChild(b); }
+    var nx = el("button", "u-next", idx === n - 1 ? "Готово" : "Дальше"); nx.type = "button"; nx.id = "u-next";
+    nx.addEventListener("click", function(e){ e.stopPropagation(); go(idx + 1); });
+    row.appendChild(nx);
+    tip.appendChild(row);
+  }
+  function go(n){
+    if (!active) return;
+    if (n >= STEPS.length) { stop(); return; }
+    if (n < 0) return;
+    var first = idx < 0; idx = n;
+    function show(){
+      if (!active || idx !== n) return;
+      var st = STEPS[n];
+      if (!st.ext && !st.row) ensureX(st.els());
+      paintTip(); layout();
+      requestAnimationFrame(function(){ layout(); tip.classList.add("on"); });
+    }
+    if (first) show(); else { tip.classList.remove("on"); setTimeout(show, 150); }
+  }
+
+  function toast(text){
+    toastEl.textContent = text; toastEl.hidden = false; void toastEl.offsetWidth; toastEl.classList.add("on");
+    clearTimeout(toastT);
+    toastT = setTimeout(function(){ toastEl.classList.remove("on"); setTimeout(function(){ toastEl.hidden = true; }, 380); }, 5200);
+  }
+
+  function start(){
+    if (active || !window.OborotTurnover) return;
+    ex = window.OborotTurnover.prepare();
+    if (!ex) { toast("Подсказки появятся, когда в таблице будут вещи с продажами"); return; }
+    var o = outerEl();
+    window.scrollTo(0, 0);
+    o.scrollLeft = 0;
+    o.scrollTop = Math.max(0, ex.row.offsetTop - o.clientHeight / 2 + 23);
+    STEPS = buildSteps();
+    active = true; idx = -1;
+    veil.hidden = false; glow.hidden = false; tip.hidden = false;
+    setHoles([]); void veil.offsetWidth; veil.classList.add("on");
+    setTimeout(function(){ go(0); try { tip.focus({preventScroll: true}); } catch(e){} }, 220);
+  }
+  function stop(silent){
+    if (!active) return;
+    active = false; idx = -1;
+    tip.classList.remove("on"); glow.classList.remove("on"); veil.classList.remove("on");
+    setTimeout(function(){ if (active) return; tip.hidden = true; glow.hidden = true; veil.hidden = true; }, 460);
+    if (silent) return;
+    var fab = document.getElementById("hint-fab");
+    if (fab && fab.style.display !== "none") {
+      fab.classList.remove("ping"); void fab.offsetWidth; fab.classList.add("ping");
+      toast("Подсказки можно вернуть в любой момент: знак вопроса в углу");
+      try { fab.focus({preventScroll: true}); } catch(e){}
+    }
+  }
+
+  veil.addEventListener("click", function(){ go(idx + 1); });
+  window.addEventListener("resize", relayout);
+  // capture: прокрутка самой таблицы не всплывает до окна.
+  window.addEventListener("scroll", relayout, true);
+  document.addEventListener("keydown", function(e){
+    if (!active) return;
+    if (e.key === "Escape" || e.key === "Esc") { e.preventDefault(); stop(); }
+    else if (e.key === "ArrowRight" || e.key === "Enter") { e.preventDefault(); go(idx + 1); }
+    else if (e.key === "ArrowLeft") { e.preventDefault(); go(idx - 1); }
+  });
+
+  window.OborotTour = {start: start, stop: stop, isActive: function(){ return active; },
+    state: function(){ return {active: active, step: idx, total: STEPS.length, key: idx >= 0 ? STEPS[idx].k : null}; }};
+})();
+</script>

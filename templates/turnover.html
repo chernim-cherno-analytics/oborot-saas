@@ -1,206 +1,239 @@
 <!DOCTYPE html>
-<html lang="ru">
+<html lang="ru" class="ui2">
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
 <title>{{ org.name }} · Оборачиваемость — Оборот</title>
+{# UI2 (D-84): общий визуальный язык — static/ui2.css, включается классом ui2
+   на <html>. Здесь только раскладка самой страницы. Что изменилось по
+   сравнению с прежней «Оборачиваемостью» и почему:
+     • над таблицей остались только категории, поиск и действия. Справка
+       «Как читать таблицу», деньги в товаре, «Торгуете в минус» и галочка
+       «себестоимость и маржа» не удалены: они свёрнуты внизу страницы, пока
+       владелец не решил, куда им переехать (вопрос 3.11 разбора 15.11);
+     • колонки идут в порядке чтения: оборачиваемость, цена, сезоны, дни в
+       стоке, остаток и запас, сток к норме и нехватка, скидки, архив;
+     • цвет строки по-прежнему класс позиции, пороги и формулы не менялись. #}
+<link rel="stylesheet" href="/static/ui2.css?v=1">
 <style>
-  /* ── Стиль первой таблицы (legacy CC) ── */
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0 }
-  body { font-family: Helvetica, 'Helvetica Neue', Arial, sans-serif; min-height: 100vh; background: #f3e9e0; color: #1f1f1f; }
-  .gradient-bg { position: fixed; inset: 0; z-index: 0; overflow: hidden; background: #f3e9e0; }
-  .gradient-bg::before, .gradient-bg::after { position: absolute; border-radius: 50%; filter: blur(90px); opacity: .9; content: ''; }
-  .gradient-bg::before { width: 70vw; height: 70vw; background: radial-gradient(circle,#efe5db,transparent 70%); top: -20%; left: -10%; }
-  .gradient-bg::after { width: 60vw; height: 60vw; background: radial-gradient(circle,#e2d8cf,transparent 70%); bottom: -15%; right: -10%; }
-  .header { position: sticky; top: 0; z-index: 200; padding: 0 28px; height: 56px; background: rgba(243,233,224,.85); backdrop-filter: blur(10px);
-    display: flex; align-items: center; justify-content: space-between; }
-  .logo { text-decoration: none; font-size: 15px; font-weight: 700; letter-spacing: .12em; color: #1f1f1f; }
-  .nav { display: flex; gap: 18px; flex-wrap: wrap; }
-  .nav a { font-size: 13px; color: rgba(31,31,31,.45); text-decoration: none; }
-  .nav a:hover { color: #434446 }
-  .nav a.active { color: #1f1f1f; font-weight: 700; }
-  .nav a.primary-page { font-weight: 700; }
-  .main { padding: 8px 28px 24px; max-width: 1560px; margin: 0 auto; position: relative; z-index: 3; }
+  body { min-height: 100vh; }
+  .main { position: relative; z-index: 3; max-width: 1640px; margin: 0 auto; padding: 12px 16px 28px; }
 
-  /* пояснительная записка */
-  details.note { margin: 10px 0 14px; border-radius: 12px; background: rgba(255,255,255,.6);
-    border: 1px solid rgba(31,31,31,.09); backdrop-filter: blur(10px); }
-  details.note summary { cursor: pointer; padding: 10px 16px; font-size: 12.5px; font-weight: 600; color: #434446; list-style: none; }
-  details.note summary::before { content: '▸ '; }
-  details.note[open] summary::before { content: '▾ '; }
-  details.note .body { padding: 0 18px 14px; font-size: 12.5px; color: #434446; line-height: 1.6; }
-  details.note .body p { margin: 6px 0; }
-  details.note .body b { color: #1f1f1f; }
+  /* ── категории и инструменты ── */
+  .cat-bar { display: flex; gap: 6px; flex-wrap: wrap; margin: 0 0 8px; min-height: 32px; }
+  .cat-btn, .chip-tg { height: 32px; padding: 0 13px; border-radius: 999px; border: 1px solid var(--u-hair);
+    background: rgba(255,255,255,.58); color: var(--u-ink2); font-size: 13px; font-weight: 500;
+    cursor: pointer; white-space: nowrap; }
+  .cat-btn:hover, .chip-tg:hover { background: #fff; color: var(--u-ink); }
+  .cat-btn.active { background: var(--u-ink); color: #fff; border-color: var(--u-ink); }
+  .cat-btn .cnt { font-size: 11.5px; margin-left: 5px; opacity: .62; font-variant-numeric: tabular-nums; }
+  .chip-tg { display: inline-flex; align-items: center; gap: 7px; }
+  .chip-tg .ck { margin: 0; opacity: .45; }
+  .chip-tg[aria-pressed="true"] { background: #fff; color: var(--u-ink); border-color: rgba(47,180,87,.65);
+    box-shadow: 0 0 0 3px rgba(47,180,87,.14); }
+  .chip-tg[aria-pressed="true"] .ck { opacity: 1; }
+  .tools { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 0 0 10px; }
+  .tools .sp { flex: 1 1 auto; }
+  .search { flex: 0 1 230px; min-width: 150px; height: 32px; padding: 0 14px; border-radius: 999px; font-size: 13px;
+    border: 1px solid var(--u-hair); background: rgba(255,255,255,.62); color: var(--u-ink); outline: none; }
+  .search::placeholder { color: var(--u-ink3); }
+  .search:focus { background: #fff; border-color: var(--u-accent); box-shadow: 0 0 0 3px var(--u-accent-soft); }
+  .rule-btn, .def-disc-btn { height: 32px; padding: 0 15px; border-radius: 999px; font-size: 13px; font-weight: 600;
+    cursor: pointer; white-space: nowrap; border: 1px solid var(--u-hair); background: rgba(255,255,255,.7); color: var(--u-ink); }
+  .rule-btn:hover { background: #fff; }
+  .def-disc-btn { border-color: transparent; background: var(--u-accent); color: #fff; box-shadow: 0 6px 16px rgba(10,102,214,.26); }
+  .def-disc-btn:hover { background: #0b72ee; }
+  .def-disc-btn:disabled { opacity: .6; cursor: default; }
+  /* «Вид изменён»: таблица показана не в исходном виде, и как это отменить */
+  .reset-view { height: 32px; padding: 0 13px; border-radius: 999px; font-size: 12.5px; font-weight: 600; cursor: pointer;
+    border: 1px solid rgba(240,140,0,.45); background: #fff1cf; color: #6b4e0e; white-space: nowrap;
+    max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
+  .reset-view:hover { background: #ffe6ad; }
 
-  .cat-bar { position: relative; z-index: 10; padding: 12px 28px 0; display: flex; gap: 8px; flex-wrap: wrap; }
-  .cat-btn { font-size: 12px; font-weight: 500; padding: 5px 14px; border-radius: 20px;
-    border: 1px solid rgba(31,31,31,.09); background: rgba(255,255,255,.55); color: #434446; cursor: pointer; white-space: nowrap; }
-  .cat-btn:hover { background: rgba(31,31,31,.09); color: #1f1f1f }
-  .cat-btn.active { background: rgba(31,31,31,.16); color: #1f1f1f; border-color: rgba(31,31,31,.45) }
-  .cat-btn .cnt { font-size: 10px; opacity: .6; margin-left: 3px }
-
-  .tools { position: relative; z-index: 10; padding: 10px 0; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
-  .def-disc-btn, .rule-btn { font-size: 12px; font-weight: 600; padding: 7px 14px; border-radius: 10px;
-    border: 1px solid rgba(31,31,31,.22); background: rgba(255,255,255,.6); color: #1f1f1f; cursor: pointer; }
-  .def-disc-btn:hover, .rule-btn:hover { background: rgba(31,31,31,.09); }
-  .tools .hint { font-size: 11px; color: rgba(31,31,31,.62); }
-  .search { flex: 0 0 300px; margin-left: auto; padding: 8px 14px; border-radius: 10px; font-size: 13px;
-    border: 1px solid rgba(31,31,31,.16); background: rgba(255,255,255,.7); color: #1f1f1f; outline: none; }
-  .search:focus { border-color: rgba(31,31,31,.45) }
-
-  .table-outer { background: rgba(255,255,255,.55); backdrop-filter: blur(10px);
-    border: 1px solid rgba(31,31,31,.09); border-radius: 12px; overflow: auto; max-height: calc(100vh - 210px); }
+  /* ── таблица ── */
+  .table-outer { border-radius: 22px; overflow: auto; max-height: calc(100vh - 196px); padding: 0 10px 8px;
+    background: var(--u-glass); border: 1px solid rgba(255,255,255,.75);
+    -webkit-backdrop-filter: blur(24px) saturate(160%); backdrop-filter: blur(24px) saturate(160%);
+    box-shadow: inset 0 1px 0 rgba(255,255,255,.85), 0 16px 50px rgba(46,46,96,.1); }
   {# На узком экране плашка свежести данных и кнопка «?» (_hints.html) лежат
-     внизу поверх страницы — без запаса таблица со своим внутренним скроллом
-     упирается в них нижним краем, и последняя строка наполовину прячется под
-     ними. 76px — тот же запас, что и «хвост» под футером в _hints.html. #}
-  @media (max-width: 640px) {
-    .table-outer { max-height: calc(100vh - 210px - 76px); }
-  }
-  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
-  thead th { background: rgba(255,255,255,.9); backdrop-filter: blur(16px); padding: 9px 8px; text-align: center;
-    font-size: 10px; font-weight: 500; color: rgba(31,31,31,.62); letter-spacing: .07em; text-transform: uppercase;
-    white-space: nowrap; position: sticky; top: 0; z-index: 10; border-bottom: 1px solid rgba(31,31,31,.09); cursor: help; }
-  {# Залипающая первая колонка (название товара): при горизонтальном скролле
-     таблицы остаётся видна, к чему относится строка. left:0 добавлен К
-     существующей sticky-по-верху ячейке шапки — угол «прилипает» сразу к
-     обеим кромкам. Фон — сплошной (не полупрозрачный rgba построчной
-     подсветки): полупрозрачная заливка пропускала бы сквозь себя цифры
-     колонок, уехавших под неё при скролле — при проверке это было видно
-     буквально (цифры «Дней в стоке» читались сквозь название). #}
-  thead th:first-child { text-align: left; padding-left: 14px; left: 0; z-index: 20; background: #f7f1ea; }
-  thead th .sub { display: block; font-size: 9px; font-weight: 400; letter-spacing: 0; text-transform: none; opacity: .45; margin-top: 2px; }
-  {# Сортируемые заголовки. Бледная стрелка-подсказка (колонка неактивна, но
-     на неё навели) лежит АБСОЛЮТНО в правом паддинге ячейки и ширины не
-     занимает: если бы место резервировали все 15 колонок, таблица выросла бы
-     на ~150px и перестала помещаться в 1440 без горизонтального скролла.
-     Стрелка АКТИВНОЙ колонки — обычная, строчная, сразу за подписью: так
-     видно, по какой колонке отсортировано. Растёт при этом одна колонка.
-     position в этом правиле НЕ задаём: у thead th уже sticky (шапка липнет
-     сверху, а первая колонка ещё и слева), и position:relative отменил бы
-     обеих — шапка уезжала бы вместе со строками. sticky и сам задаёт систему
-     координат для абсолютной стрелки. #}
-  thead th[data-sk] { cursor: pointer; user-select: none; }
-  thead th[data-sk]:hover { color: #1f1f1f; }
-  thead th .sarr { position: absolute; right: 2px; top: 50%; transform: translateY(-50%);
-    font-size: 9px; line-height: 1; opacity: 0; }
-  thead th[data-sk]:hover .sarr, thead th[data-sk]:focus .sarr { opacity: .45; }
-  thead th.sorted { color: #1f1f1f; font-weight: 700; background: #eee3d7; }
-  thead th.sorted:first-child { background: #eee3d7; }
-  thead th.sorted .sarr { position: static; transform: none; margin-left: 4px; opacity: 1; font-size: 10px; }
-  thead th[data-sk]:focus-visible { outline: 2px solid #1f1f1f; outline-offset: -2px; }
-  /* «Вид изменён» — плашка о том, что таблица показана не в исходном виде */
-  .reset-view { font-size: 11.5px; font-weight: 600; padding: 6px 12px; border-radius: 10px;
-    border: 1px solid rgba(184,140,0,.55); background: rgba(255,204,0,.3); color: #6b5200; cursor: pointer; }
-  .reset-view:hover { background: rgba(255,204,0,.5); }
-  tbody td { padding: 8px 8px; border-bottom: 1px solid rgba(31,31,31,.07); text-align: center; vertical-align: middle; color: #1f1f1f; }
-  tbody td:first-child { text-align: left; padding-left: 14px; font-weight: 500;
-    position: sticky; left: 0; z-index: 5; box-shadow: 1px 0 0 rgba(31,31,31,.09); }
-  .rg2 td { background: rgba(143,233,0,.35) } .rg1 td { background: rgba(76,187,23,.3) }
-  .ro td { background: rgba(255,204,0,.32) } .rr td { background: rgba(221,0,4,.1) }
-  .rgr td { background: rgba(255,255,255,.55); opacity: .5 }
-  .rld td { background: rgba(255,255,255,.6); opacity: .72 }
-  .rg2:hover td { background: rgba(143,233,0,.5) } .rg1:hover td { background: rgba(76,187,23,.42) }
-  .ro:hover td { background: rgba(255,204,0,.44) } .rr:hover td { background: rgba(221,0,4,.16) }
-  tr.grp td { background: rgba(255,255,255,.8); font-size: 10.5px; font-weight: 600; letter-spacing: .07em;
-    text-transform: uppercase; color: rgba(31,31,31,.55); text-align: left; padding: 9px 14px; }
-  {# Тот же цвет подсветки строки, что и выше, но НАД сплошной подложкой —
-     только в залипающей колонке, чтобы не просвечивали уехавшие под неё
-     цифры. Сам тон не меняется: это та же rgba, просто с непрозрачным
-     фоном под ней. #}
-  .rg2 td:first-child { background: linear-gradient(rgba(143,233,0,.35),rgba(143,233,0,.35)),#f7f1ea; }
-  .rg1 td:first-child { background: linear-gradient(rgba(76,187,23,.3),rgba(76,187,23,.3)),#f7f1ea; }
-  .ro td:first-child { background: linear-gradient(rgba(255,204,0,.32),rgba(255,204,0,.32)),#f7f1ea; }
-  .rr td:first-child { background: linear-gradient(rgba(221,0,4,.1),rgba(221,0,4,.1)),#f7f1ea; }
-  .rgr td:first-child { background: linear-gradient(rgba(255,255,255,.55),rgba(255,255,255,.55)),#f7f1ea; }
-  .rld td:first-child { background: linear-gradient(rgba(255,255,255,.6),rgba(255,255,255,.6)),#f7f1ea; }
-  .rg2:hover td:first-child { background: linear-gradient(rgba(143,233,0,.5),rgba(143,233,0,.5)),#f7f1ea; }
-  .rg1:hover td:first-child { background: linear-gradient(rgba(76,187,23,.42),rgba(76,187,23,.42)),#f7f1ea; }
-  .ro:hover td:first-child { background: linear-gradient(rgba(255,204,0,.44),rgba(255,204,0,.44)),#f7f1ea; }
-  .rr:hover td:first-child { background: linear-gradient(rgba(221,0,4,.16),rgba(221,0,4,.16)),#f7f1ea; }
-  tr.grp td:first-child { background: linear-gradient(rgba(255,255,255,.8),rgba(255,255,255,.8)),#f7f1ea; }
-  .nb { font-variant-numeric: tabular-nums; white-space: nowrap; }
-  .nbig { font-weight: 700; font-size: 13px; }
-  .retail { font-size: 9px; opacity: .55; margin-top: 2px; }
-  .subdate { font-size: 9px; opacity: .55; margin-top: 2px; }
-  .zbar { position: relative; width: 84px; height: 20px; border-radius: 4px; overflow: hidden; background: rgba(255,255,255,.7); margin: 0 auto }
-  .zfill { position: absolute; left: 0; top: 0; height: 100%; border-radius: 4px }
-  .ztxt { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 10px; font-weight: 700 }
-  .disc-in { width: 54px; padding: 4px 5px; text-align: center; font-size: 12px; font-weight: 600;
-    border: 1px solid rgba(31,31,31,.16); border-radius: 8px; background: rgba(255,255,255,.7); outline: none; }
-  .disc-in:focus { border-color: rgba(31,31,31,.45); }
-  .disc-in.has { background: rgba(143,233,0,.3); }
-  .arch-btn, .unarch-btn { font-size: 10px; font-weight: 600; padding: 3px 9px; border-radius: 9px;
-    border: 1px solid rgba(31,31,31,.22); background: rgba(255,255,255,.6); color: #434446; cursor: pointer; white-space: nowrap; }
-  .arch-btn:hover { background: rgba(221,0,4,.12); }
-  .unarch-btn:hover { background: rgba(76,187,23,.25); }
-  .arch-title { font-size: 12px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase;
-    color: rgba(31,31,31,.5); margin: 22px 0 8px; cursor: pointer; user-select: none; }
-  .loading { text-align: center; padding: 60px; color: rgba(31,31,31,.45); font-size: 13px }
-  .lowtag { display: inline-block; margin-left: 8px; padding: 1px 8px; border-radius: 10px;
-    background: rgba(31,31,31,.08); color: rgba(31,31,31,.6); font-size: 10px; font-weight: 700; }
-  /* Сезон вне загруженного окна истории: не «0», а честный прочерк. */
-  .sea-na { opacity: .4; cursor: help; }
+     внизу поверх страницы: без запаса таблица со своим внутренним скроллом
+     упирается в них нижним краем. 76px — тот же запас, что и «хвост» под
+     футером в _hints.html. #}
+  @media (max-width: 640px) { .table-outer { max-height: calc(100vh - 196px - 76px); } }
+  {# Высоты строк целые (line-height в px): при дробной высоте залипшая первая
+     ячейка рисуется со сдвигом в пиксель относительно остальной строки. #}
+  table { width: 100%; border-collapse: separate; border-spacing: 0 4px; font-size: 13.5px; line-height: 20px; }
+  {# Шапка непрозрачная: под ней проезжают строки. Залипающая первая колонка
+     (название): left:0 добавлен К sticky-по-верху ячейке шапки, угол прилипает
+     к обеим кромкам. Фон у неё сплошной: полупрозрачная заливка пропускала бы
+     сквозь себя цифры колонок, уехавших под неё при горизонтальной прокрутке. #}
+  thead th { position: sticky; top: 0; z-index: 10; background: #f5f5fa; padding: 12px 8px 7px; text-align: right;
+    font-size: 11.5px; font-weight: 600; line-height: 15px; color: var(--u-ink2); white-space: nowrap;
+    vertical-align: bottom; cursor: help; }
+  thead th.c { text-align: center; }
+  thead th:first-child { text-align: left; padding-left: 14px; left: 0; z-index: 20; }
+  thead th .sub { display: block; font-size: 10.5px; font-weight: 400; line-height: 13px; margin-top: 1px; }
+  {# Сортируемые заголовки. Бледная стрелка-подсказка лежит АБСОЛЮТНО в правом
+     паддинге ячейки и ширины не занимает; стрелка активной колонки строчная,
+     сразу за подписью. position в этом правиле не задаём: у thead th уже
+     sticky, и position:relative отменил бы и верхнюю, и левую «липкость». #}
+  thead th[data-sk] { cursor: pointer; user-select: none; -webkit-user-select: none; }
+  thead th[data-sk]:hover { color: var(--u-ink); }
+  thead th .sarr { position: absolute; right: 0; top: 14px; font-size: 9px; line-height: 1; opacity: 0; }
+  thead th[data-sk]:hover .sarr, thead th[data-sk]:focus .sarr { opacity: .5; }
+  thead th.sorted { color: var(--u-ink); }
+  thead th.sorted .sarr { position: static; margin-left: 4px; opacity: 1; font-size: 9.5px; }
+  thead th[data-sk]:focus-visible { outline: 3px solid rgba(10,102,214,.55); outline-offset: -3px; border-radius: 8px; }
 
-  /* полоса «деньги»: себестоимость и валовая маржа */
-  .money-bar { display: grid; grid-template-columns: repeat(auto-fit,minmax(240px,1fr)); gap: 12px; margin: 0 0 10px; }
-  .mb-card { border-radius: 12px; padding: 12px 16px; background: rgba(255,255,255,.62);
-    border: 1px solid rgba(31,31,31,.09); backdrop-filter: blur(10px); }
-  .mb-card.accent { background: rgba(76,187,23,.22); border-color: rgba(76,187,23,.35); }
-  .mb-card .lbl { font-size: 10px; font-weight: 700; letter-spacing: .07em; text-transform: uppercase; color: rgba(31,31,31,.55); }
-  .mb-card .val { font-size: 21px; font-weight: 700; line-height: 1.15; margin-top: 4px; font-variant-numeric: tabular-nums; }
-  .mb-card .sub { font-size: 10.5px; color: rgba(31,31,31,.6); margin-top: 5px; line-height: 1.45; }
-  .mb-cat { font-size: 11.5px; color: #434446; margin: 0 0 12px; padding: 8px 14px; border-radius: 10px;
-    background: rgba(255,255,255,.5); border: 1px solid rgba(31,31,31,.07); }
-  .mb-cat b { font-variant-numeric: tabular-nums; }
-  .mtoggle { font-size: 11.5px; color: #434446; display: flex; align-items: center; gap: 5px; cursor: pointer; }
+  tbody td { height: 46px; padding: 3px 8px; text-align: right; vertical-align: middle; white-space: nowrap;
+    color: var(--u-ink); background: var(--row, var(--u-row-mute)); }
+  tbody td.c { text-align: center; }
+  tbody td:first-child { text-align: left; padding-left: 14px; font-weight: 500; white-space: normal;
+    min-width: 200px; max-width: 300px; border-radius: 13px 0 0 13px; position: sticky; left: 0; z-index: 5; }
+  tbody td:last-child { border-radius: 0 13px 13px 0; }
+  tr.rg2 { --row: var(--u-row-best); --ring: var(--u-best); }
+  tr.rg1 { --row: var(--u-row-good); --ring: var(--u-good); }
+  tr.ro  { --row: var(--u-row-slow); --ring: var(--u-slow); }
+  tr.rr  { --row: var(--u-row-out);  --ring: var(--u-out); }
+  tr.rgr, tr.rld { --row: var(--u-row-mute); --ring: rgba(29,29,31,.18); }
+  tr.rgr td, tr.rld td { color: var(--u-ink2); }
+  tr.rg2:hover { --row: #d5ec8f; } tr.rg1:hover { --row: #cdebd6; }
+  tr.ro:hover { --row: #ffe4bd; } tr.rr:hover { --row: #ffd9d6; }
+  tr.grp td { height: auto; background: none; padding: 14px 14px 4px; text-align: left; white-space: normal;
+    font-size: 12px; line-height: 16px; font-weight: 600; color: var(--u-ink2); border-radius: 0; }
+  td.loading { background: none; text-align: center; padding: 60px 20px; color: var(--u-ink2); font-size: 13.5px;
+    height: auto; white-space: normal; border-radius: 0; }
+  #atb td.loading { padding: 16px 14px; text-align: left; }
+  .nb { font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .pill { display: inline-block; min-width: 74px; padding: 4px 10px; border-radius: 999px; text-align: center;
+    font-weight: 700; font-size: 14.5px; background: rgba(255,255,255,.74); box-shadow: inset 0 0 0 1.5px var(--ring); }
+  .pill.na { font-weight: 500; color: var(--u-ink3); box-shadow: inset 0 0 0 1.5px rgba(29,29,31,.1); }
+  .price b { display: block; font-weight: 600; line-height: 18px; }
+  .retail, .subdate, .costline { display: block; font-size: 11px; line-height: 14px; color: var(--u-ink2); }
+  .zero { color: var(--u-ink3); }
+  .strong { font-weight: 700; }
+  .ck { display: inline-grid; place-items: center; width: 15px; height: 15px; border-radius: 50%; background: #2fb457;
+    margin-left: 5px; vertical-align: -2px; }
+  .ck::after { content: ""; width: 6px; height: 3px; border-left: 1.6px solid #fff; border-bottom: 1.6px solid #fff;
+    transform: rotate(-45deg) translate(.5px,-.5px); }
+  .nock { display: inline-block; width: 15px; margin-left: 5px; }
+  .zbar { display: inline-flex; align-items: center; gap: 7px; }
+  .ztrack { display: block; width: 60px; height: 8px; border-radius: 8px; overflow: hidden; background: rgba(255,255,255,.85);
+    box-shadow: inset 0 0 0 1px rgba(0,0,0,.07); }
+  .zfill { display: block; height: 100%; border-radius: 8px; background: #2fb457; }
+  .zbar.z-low .zfill { background: #f0443a; }
+  .zbar.z-high .zfill { background: #f08c00; }
+  .zbar.z-over .zfill { background: #f0443a; }
+  .ztxt { min-width: 46px; text-align: right; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .zbar.z-low .ztxt, .zbar.z-over .ztxt { color: #b3261e; }
+  .disc-in { width: 58px; height: 30px; padding: 0 4px; text-align: center; font-size: 13.5px; font-weight: 600;
+    border: 1px solid rgba(0,0,0,.12); border-radius: 9px; background: rgba(255,255,255,.82); color: var(--u-ink); outline: none; }
+  .disc-in::placeholder { color: var(--u-ink3); font-weight: 400; }
+  .disc-in:focus { border-color: var(--u-accent); box-shadow: 0 0 0 3px var(--u-accent-soft); background: #fff; }
+  .disc-in.has { background: #fff; border-color: rgba(10,102,214,.45); color: #0a56b4; }
+  .arch-btn { width: 30px; height: 30px; border-radius: 9px; border: 0; cursor: pointer; display: inline-grid; place-items: center;
+    background: rgba(255,255,255,.55); color: var(--u-ink2); }
+  .arch-btn:hover { background: #fff; color: var(--u-ink); }
+  .arch-btn svg { width: 16px; height: 16px; pointer-events: none; }
+  .unarch-btn { height: 30px; padding: 0 12px; border-radius: 999px; border: 1px solid var(--u-hair); cursor: pointer;
+    background: rgba(255,255,255,.8); color: var(--u-accent); font-size: 12.5px; font-weight: 600; white-space: nowrap; }
+  .unarch-btn:hover { background: #fff; }
+  .lowtag, .losstag { display: inline-block; margin-left: 8px; padding: 1px 8px; border-radius: 999px; font-size: 11px;
+    font-weight: 600; white-space: nowrap; background: rgba(29,29,31,.08); color: var(--u-ink2); }
+  .losstag { background: rgba(240,68,58,.16); color: #a3241c; }
+  /* Сезон вне загруженного окна истории: не «0», а честный прочерк. */
+  .sea-na { color: var(--u-ink3); cursor: help; }
+  .mneg { color: #b3261e; font-weight: 700; }
+  .mnone { color: var(--u-ink3); font-size: 12px; }
+
+  /* ── низ страницы: архив, деньги, справка ── */
+  .arch-title { display: inline-block; margin: 16px 0 6px 4px; padding: 6px 10px; border-radius: 10px; cursor: pointer;
+    user-select: none; -webkit-user-select: none; font-size: 13px; font-weight: 600; color: var(--u-ink2); }
+  .arch-title:hover { background: rgba(120,120,128,.12); }
+  .arch-hint { margin: 0 0 8px 14px; font-size: 12.5px; color: var(--u-ink2); }
+  details.fold, details.note { margin: 10px 0 0; border-radius: 18px; background: rgba(255,255,255,.55);
+    border: 1px solid rgba(255,255,255,.75); box-shadow: 0 6px 24px rgba(46,46,96,.06); }
+  details.fold > summary, details.note > summary { cursor: pointer; padding: 12px 18px; font-size: 13px; font-weight: 600;
+    color: var(--u-ink2); list-style: none; }
+  details.fold > summary::-webkit-details-marker, details.note > summary::-webkit-details-marker { display: none; }
+  details.fold > summary::before, details.note > summary::before { content: '▸ '; }
+  details.fold[open] > summary::before, details.note[open] > summary::before { content: '▾ '; }
+  details.fold > summary:hover, details.note > summary:hover { color: var(--u-ink); }
+  details.fold .fbody { padding: 0 18px 16px; }
+  details.note .body { padding: 0 20px 16px; font-size: 13px; color: var(--u-ink2); line-height: 1.6; max-width: 980px; }
+  details.note .body p { margin: 7px 0; }
+  details.note .body b { color: var(--u-ink); }
+  details.note .body a { color: var(--u-accent); }
+  .minstock-in { width: 56px; height: 26px; padding: 0 5px; border: 1px solid rgba(0,0,0,.16); border-radius: 8px;
+    text-align: center; font-weight: 600; background: #fff; color: var(--u-ink); }
+  .mini-btn { height: 26px; padding: 0 11px; font-size: 12px; }
+
+  /* деньги: себестоимость и валовая маржа */
+  .money-bar { display: grid; grid-template-columns: repeat(auto-fit,minmax(240px,1fr)); gap: 10px; margin: 0 0 10px; }
+  .mb-card { border-radius: 14px; padding: 12px 16px; background: rgba(255,255,255,.8); border: 1px solid var(--u-hair); }
+  .mb-card.accent { background: #e9f6ec; border-color: rgba(47,180,87,.3); }
+  .mb-card .lbl { font-size: 12px; font-weight: 600; color: var(--u-ink2); }
+  .mb-card .val { font-size: 22px; font-weight: 700; letter-spacing: -.02em; line-height: 1.15; margin-top: 3px; font-variant-numeric: tabular-nums; }
+  .mb-card .sub { font-size: 11.5px; color: var(--u-ink2); margin-top: 5px; line-height: 1.45; }
+  .mb-cat { font-size: 12.5px; color: var(--u-ink2); margin: 0 0 10px; padding: 9px 14px; border-radius: 12px;
+    background: rgba(255,255,255,.6); border: 1px solid var(--u-hair); }
+  .mb-cat b { color: var(--u-ink); font-variant-numeric: tabular-nums; }
+  .mtoggle { font-size: 13px; color: var(--u-ink); display: inline-flex; align-items: center; gap: 7px; cursor: pointer; margin: 4px 0 0; }
 
   /* «Торгуете в минус» */
-  .loss-box { margin: 0 0 12px; border-radius: 12px; border: 1px solid rgba(221,0,4,.35);
-    background: rgba(221,0,4,.09); }
-  .loss-box summary { cursor: pointer; padding: 10px 16px; font-size: 12.5px; font-weight: 700; color: #a00003; list-style: none; }
+  .loss-box { margin: 0 0 10px; border-radius: 14px; border: 1px solid rgba(240,68,58,.3); background: #ffeceb; }
+  .loss-box summary { cursor: pointer; padding: 10px 16px; font-size: 13px; font-weight: 700; color: #a3241c; list-style: none; }
+  .loss-box summary::-webkit-details-marker { display: none; }
   .loss-box summary::before { content: '▸ '; }
   .loss-box[open] summary::before { content: '▾ '; }
-  .loss-box .body { padding: 0 16px 12px; font-size: 12px; color: #434446; line-height: 1.55; }
-  .loss-box table { font-size: 12px; margin: 6px 0 4px; }
-  .loss-box td { padding: 5px 8px; border-bottom: 1px solid rgba(221,0,4,.14); text-align: right; }
-  .loss-box td:first-child { text-align: left; font-weight: 600; }
-  .loss-box .lred { color: #a00003; font-weight: 700; }
+  .loss-box .body { padding: 0 16px 12px; font-size: 12.5px; color: var(--u-ink2); line-height: 1.55; }
+  .loss-box table { font-size: 12.5px; margin: 6px 0 4px; border-spacing: 0; }
+  .loss-box td { height: auto; background: none; padding: 5px 8px; border-bottom: 1px solid rgba(240,68,58,.16);
+    text-align: right; white-space: normal; position: static; border-radius: 0; min-width: 0; max-width: none; }
+  .loss-box td:first-child { text-align: left; font-weight: 600; padding-left: 0; position: static; border-radius: 0;
+    min-width: 0; max-width: none; }
+  .loss-box .lred { color: #a3241c; font-weight: 700; }
   {# На телефоне семь ячеек строки в одну линию не помещались: таблица вылезала
-     за блок, и вся страница становилась шире экрана (415 px на 390, а с длинным
-     названием — за 1000). Каждая ячейка и так подписана сама («цена …»,
-     «с/с …», «… шт за год»), поэтому строка раскладывается блоком: название на
-     своей строке, остальные ячейки переносятся под ним. Ничего не прячется и
-     не обрезается; длинные названия и категории переносятся по буквам. На
-     десктопе таблица прежняя. #}
+     за блок, и вся страница становилась шире экрана. Каждая ячейка и так
+     подписана сама («цена …», «с/с …», «… шт за год»), поэтому строка
+     раскладывается блоком: название на своей строке, остальные ячейки
+     переносятся под ним. Ничего не прячется и не обрезается. #}
   @media (max-width: 760px) {
     .loss-box .body { overflow-wrap: anywhere; }
     .loss-box table, .loss-box tbody { display: block; width: 100%; }
     .loss-box tr { display: flex; flex-wrap: wrap; column-gap: 12px; padding: 6px 0;
-      border-bottom: 1px solid rgba(221,0,4,.14); }
+      border-bottom: 1px solid rgba(240,68,58,.16); }
     .loss-box td { display: block; padding: 1px 0; border-bottom: 0; text-align: left; min-width: 0; max-width: 100%; }
     .loss-box td:first-child { flex: 0 0 100%; }
   }
-  .costline { font-size: 9px; opacity: .55; margin-top: 2px; }
-  .mneg { color: #a00003; font-weight: 700; }
-  .mnone { opacity: .4; font-size: 11px; }
-  .losstag { display: inline-block; margin-left: 8px; padding: 1px 8px; border-radius: 10px;
-    background: rgba(221,0,4,.16); color: #a00003; font-size: 10px; font-weight: 700; }
 
   /* модалка правила скидок */
-  .modal-bg { position: fixed; inset: 0; z-index: 300; background: rgba(31,31,31,.35); display: none; align-items: center; justify-content: center; }
+  .modal-bg { position: fixed; inset: 0; z-index: 300; display: none; align-items: center; justify-content: center; padding: 16px;
+    background: rgba(30,30,50,.22); -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px); }
   .modal-bg.open { display: flex; }
-  .modal { background: #f7f0e9; border-radius: 14px; padding: 22px 26px; width: 560px; max-width: 94vw; max-height: 90vh; overflow: auto; }
-  .modal h3 { font-size: 15px; margin-bottom: 4px; }
-  .modal .msub { font-size: 11.5px; color: rgba(31,31,31,.6); margin-bottom: 14px; line-height: 1.5; }
-  .rule-grid { display: grid; grid-template-columns: 1fr 86px 86px; gap: 6px 10px; align-items: center; font-size: 12.5px; }
-  .rule-grid .hd { font-size: 10px; text-transform: uppercase; letter-spacing: .06em; color: rgba(31,31,31,.5); font-weight: 600; text-align: center; }
-  .rule-grid input { width: 100%; padding: 5px 7px; text-align: center; font-size: 12.5px; font-weight: 600;
-    border: 1px solid rgba(31,31,31,.18); border-radius: 8px; background: #fff; outline: none; }
-  .modal .row2 { display: flex; gap: 10px; align-items: center; margin-top: 14px; font-size: 12.5px; flex-wrap: wrap; }
-  .modal .row2 input { width: 70px; padding: 5px 7px; text-align: center; font-weight: 600;
-    border: 1px solid rgba(31,31,31,.18); border-radius: 8px; }
-  .modal .actions { display: flex; gap: 10px; margin-top: 18px; justify-content: flex-end; }
+  .modal { background: rgba(255,255,255,.94); border-radius: 24px; padding: 26px 28px 22px; width: 580px; max-width: 100%;
+    max-height: 90vh; overflow: auto; box-shadow: 0 30px 80px rgba(46,46,96,.28); }
+  .modal h3 { font-size: 20px; letter-spacing: -.015em; margin-bottom: 6px; }
+  .modal .msub { font-size: 13px; color: var(--u-ink2); margin-bottom: 16px; line-height: 1.5; }
+  .rule-grid { display: grid; grid-template-columns: 1fr 92px 92px; gap: 8px 10px; align-items: center; font-size: 13.5px; }
+  .rule-grid .hd { font-size: 11.5px; color: var(--u-ink2); font-weight: 600; text-align: center; }
+  .rule-grid input, .modal .row2 input { height: 32px; padding: 0 7px; text-align: center; font-size: 13.5px; font-weight: 600;
+    border: 1px solid rgba(0,0,0,.14); border-radius: 9px; background: #fff; color: var(--u-ink); outline: none; }
+  .rule-grid input { width: 100%; }
+  .rule-grid input:focus, .modal .row2 input:focus { border-color: var(--u-accent); box-shadow: 0 0 0 3px var(--u-accent-soft); }
+  .rule-grid input:disabled { background: rgba(120,120,128,.1); color: var(--u-ink2); }
+  .modal .row2 { display: flex; gap: 8px; align-items: center; margin-top: 16px; font-size: 13.5px; flex-wrap: wrap; }
+  .modal .row2 input { width: 70px; }
+  .modal .actions { display: flex; gap: 8px; margin-top: 20px; justify-content: flex-end; flex-wrap: wrap; }
+
+  @media (max-width: 760px) {
+    .main { padding: 8px 8px 24px; }
+    tbody td:first-child { min-width: 130px; max-width: 170px; }
+    .search { flex: 1 1 100%; }
+    .modal { padding: 22px 18px 18px; }
+    .rule-grid { grid-template-columns: 1fr 64px 64px; }
+  }
 </style>
 {% include "_mobile.html" %}
 {% include "_app_shell_head.html" %}
@@ -211,65 +244,38 @@
 <div class="gradient-bg"></div>
 {% with nav_primary = true %}{% include "_app_shell.html" %}{% endwith %}
 
-<div class="cat-bar" id="cat-bar"><span style="font-size:12px;color:rgba(31,31,31,.4)">Загрузка...</span></div>
-
 <div class="main">
-  <details class="note">
-    <summary>Как читать эту таблицу и что означают колонки</summary>
-    <div class="body">
-      <p><b>Оборачиваемость</b> — главный показатель успешности вещи: сколько рублей она приносит в день, когда есть в наличии (канон: нетто-выручка дней «в стоке» за 2 года ÷ эти же дни — продажи и дни считаются по одним и тем же датам). По ней отсортирована таблица и раскрашены строки: <b>тёмно-зелёный</b> — бестселлер (≥ 5 000 ₽/день), <b>зелёный</b> — хороший (2 000–5 000), <b>жёлтый</b> — медленный (1 000–2 000), <b>красный</b> — слабый (&lt; 1 000). Пороги настраиваются в <a href="/settings">Настройках</a>.</p>
-      <p><b>Дней в стоке</b> — сколько дней вещь реально была в наличии за 2 года (остаток базы не меньше порога, день за днём). Это индикатор доверия: статистике вещи, пробывшей в стоке больше полугода, можно верить; вещь, распроданная за 15 дней, не показательна.
-      Днём «в стоке» считается день с остатком не меньше <input id="minstock-in" type="number" min="0" max="100" style="width:52px;padding:2px 5px;border:1px solid rgba(31,31,31,.25);border-radius:6px;text-align:center;font-weight:600;"> шт
-      <button class="rule-btn" id="minstock-save" style="padding:3px 10px;font-size:11px;">сохранить</button>.
-      Отсекая дни с последними парой штук, вы видите честный темп: «хвост» из одного размера продаётся медленно и занижал бы показатель. Поставьте 0, чтобы считать любой день наличия.</p>
-      <p><b>Ср. цена продажи</b> — реальная средняя цена (после всех скидок), под ней серым номинал и себестоимость («с/с» — закупочная цена из МойСклада). <b>Факт. скидка</b> — насколько реальная цена ниже номинала: видно, продаётся ли вещь без скидок.</p>
-      <p><b>Маржа</b> — сколько вы зарабатываете на одной штуке: средняя цена продажи минус себестоимость, и то же в процентах от цены. Под ней — валовая маржа за год: вся выручка позиции минус себестоимость проданного. Красная маржа означает, что вещь продаётся дешевле, чем обошлась: такие позиции собраны в отдельное предупреждение над таблицей. Если себестоимости в МойСкладе нет, в колонке стоит «нет с/с» — ноль там не рисуется и в итоги такая позиция не входит.</p>
-      <p><b>Карточки над таблицей.</b> «Заморожено по себестоимости» — сколько ваших денег реально лежит на складе; «Если продать» — за сколько этот же остаток уйдёт по текущим ценам. Разница между ними и есть будущая маржа, а не прибыль, которая уже у вас в кассе. Все три суммы — про одни и те же штуки, просто в разных ценах, поэтому под каждой подписано, по какой цене она посчитана.</p>
-      <p><b>Про слово «оборачиваемость».</b> В этой таблице оборачиваемость — это <i>скорость продаж</i>: сколько рублей выручки вещь приносит за день наличия. Это не бухгалтерская оборачиваемость капитала (себестоимость проданного ÷ сегодняшний сток по себестоимости — истории себестоимости у нас нет, поэтому не средний запас за период) — её вы найдёте в карточке «Капитал оборачивается» над таблицей.</p>
-      <p><b>Зима/Весна/Лето/Осень</b> — оборачиваемость по сезонам (выручка сезонных месяцев ÷ дни в стоке в них). <b>0</b> — сезон загружен, но продаж в нём не было; <b>«—»</b> — сезон ещё не загружен, истории за эти месяцы пока нет. Идёт ли загрузка прямо сейчас — сказано в подписи периода над таблицей. Так видно, сезонная вещь или круглогодичная.</p>
-      <p><b>Запас</b> — на сколько дней хватит остатка при текущем темпе, и дата, когда он кончится. <b>Сток на N дней</b> — запас в процентах от нормы запаса (сейчас <span id="norm-hint">90</span> дн.): около 100% — идеально, сильно больше — затоварка, меньше 30% — скоро дефицит. Норма задаётся в блоке «Затоварка — это запас от … дней» ниже на этой же странице. <b>Не хватает до нормы</b> — сколько штук не хватает <i>сегодня</i>, чтобы догнать сток до этой нормы: ответ на вопрос «каким должен быть склад сегодня». «Заказать» на странице «Заказ» отвечает на другой вопрос — на сколько дней продаж должен хватить заказ до следующего: у него свой горизонт покрытия и свой расчёт на дату прихода (окно темпа, выбранное на «Заказе», товар в пути, продажи за срок производства, минимальная партия и кратность). Поэтому эти два числа напрямую не сравнивают: любое из них может оказаться больше.</p>
-      <p><b>Скидка, %</b> — ручная скидка для распродажи: сохраняется, попадает в отчёт «Скидки» и в печатный прайс. Кнопка <b>«Дефолтные скидки»</b> сбрасывает все ручные и расставляет по правилу (настраивается кнопкой «Правило…»). <b>«в архив»</b> — для вещей, которые больше никогда не переразместятся: они исчезают из рекомендаций заказа, бюджета и прогноза.</p>
-      <p>Позиции с <b>малой статистикой</b> (мало дней в стоке или единичные продажи) и <b>без продаж за год</b> показаны отдельными блоками внизу — их цифры не рейтинг, а справка.</p>
-    </div>
-  </details>
-
-  <div class="money-bar" id="money-bar"></div>
-  <div class="mb-cat" id="money-cat"></div>
-  <details class="loss-box" id="loss-box" style="display:none" open>
-    <summary id="loss-sum"></summary>
-    <div class="body" id="loss-body"></div>
-  </details>
+  <div class="cat-bar" id="cat-bar"><span style="font-size:13px;color:var(--u-ink2);padding:6px 4px">Загрузка...</span></div>
 
   <div class="tools">
-    <button class="def-disc-btn" id="defDiscBtn">Дефолтные скидки</button>
-    <button class="rule-btn" id="ruleBtn" title="Изменить проценты и пороги правила дефолтных скидок">Правило…</button>
-    <span class="hint">сбросит ручные скидки и расставит по правилу от текущей оборачиваемости</span>
-    <label class="mtoggle" title="Колонка «Маржа» и себестоимость под ценой. Снимите галочку, если таблица кажется перегруженной">
-      <input type="checkbox" id="marginToggle" checked> себестоимость и маржа
-    </label>
+    <button class="chip-tg" id="relToggle" type="button" aria-pressed="false"
+            title="Показывать только вещи, которые были в стоке больше полугода: их цифрам можно верить"><span class="ck" aria-hidden="true"></span>Только с галочкой</button>
     <button class="reset-view" id="resetView" style="display:none"></button>
-    <input class="search" id="search" placeholder="Поиск по всем категориям...">
+    <span class="sp"></span>
+    <input class="search" id="search" placeholder="Поиск по всем категориям" aria-label="Поиск по названию">
+    <button class="rule-btn" id="ruleBtn" title="Изменить проценты и пороги правила, по которому расставляются скидки">Правило</button>
+    <button class="def-disc-btn" id="defDiscBtn" title="Сбросит ручные скидки и расставит их по правилу: от того, как вещь продаётся и сколько её лежит">Расставить скидки</button>
   </div>
 
-  <div class="table-outer">
+  <div class="table-outer" id="table-outer">
     <table id="mt">
       <thead>
         <tr>
           <th data-sk="name" title="Название позиции. Поиск пословный: «худи скетч» найдёт все худи «Скетч»">Название</th>
-          <th data-sk="dis" id="th-dis" title="Сколько дней вещь была в наличии за 2 года (с остатком не меньше порога). Больше полугода — данным можно доверять">Дней<br><span class="sub">в стоке</span></th>
-          <th data-sk="price" title="Средняя реальная цена продажи после скидок; серым — номинальная розничная цена и себестоимость из МойСклада">Ср. цена<br><span class="sub">продажи</span></th>
-          <th class="mcol" data-sk="margin" title="Валовая маржа: средняя цена продажи − себестоимость. Крупно — на одной штуке и в процентах от цены, ниже — за год по всей позиции (выручка − себестоимость проданного). «нет с/с» — себестоимости в МойСкладе нет, ноль вместо неё не рисуем">Маржа<br><span class="sub">₽/шт и %</span></th>
-          <th data-sk="turn" id="th-turnover" title="Главный показатель: нетто-выручка дней «в стоке» за 2 года ÷ эти же дни, ₽/день. Это скорость продаж, а не бухгалтерская оборачиваемость капитала — её смотрите в карточке «Капитал оборачивается» над таблицей">Оборач.,&nbsp;<span class="th-unit">₽/день</span><br><span class="sub" id="th-turnover-period">за 2 года</span></th>
+          <th class="c" data-sk="turn" id="th-turnover" title="Главный показатель: нетто-выручка дней «в стоке» за 2 года ÷ эти же дни, ₽/день. Это скорость продаж, а не бухгалтерская оборачиваемость капитала: её смотрите в разделе «Деньги в товаре и маржа» внизу страницы">Оборачиваемость<br><span class="sub"><span class="th-unit">₽/день</span> · <span id="th-turnover-period">за 2 года</span></span></th>
+          <th data-sk="price" title="Средняя реальная цена продажи после скидок; ниже серым номинальная розничная цена">Цена<br><span class="sub">продажи и прайс</span></th>
+          <th class="mcol" data-sk="margin" style="display:none" title="Валовая маржа: средняя цена продажи − себестоимость. Крупно на одной штуке и в процентах от цены, ниже за год по всей позиции (выручка − себестоимость проданного). «нет с/с»: себестоимости в МойСкладе нет, ноль вместо неё не рисуем">Маржа<br><span class="sub">₽/шт и %</span></th>
           <th data-sk="winter" title="Оборачиваемость в декабре–феврале. 0 — продаж в сезоне не было, «—» — сезон ещё не загружен">Зима<br><span class="sub">₽/день</span></th>
           <th data-sk="spring" title="Оборачиваемость в марте–мае. 0 — продаж в сезоне не было, «—» — сезон ещё не загружен">Весна<br><span class="sub">₽/день</span></th>
           <th data-sk="summer" title="Оборачиваемость в июне–августе. 0 — продаж в сезоне не было, «—» — сезон ещё не загружен">Лето<br><span class="sub">₽/день</span></th>
           <th data-sk="autumn" title="Оборачиваемость в сентябре–ноябре. 0 — продаж в сезоне не было, «—» — сезон ещё не загружен">Осень<br><span class="sub">₽/день</span></th>
+          <th data-sk="dis" id="th-dis" title="Сколько дней вещь была в наличии за 2 года (с остатком не меньше порога). Больше полугода — данным можно доверять">В стоке<br><span class="sub">дней</span></th>
           <th data-sk="stock" title="Текущий остаток по всем складам, шт">Остаток<br><span class="sub">шт</span></th>
-          <th data-sk="supply" title="На сколько дней хватит остатка при текущем темпе, и дата окончания">Запас<br><span class="sub">дней</span></th>
-          <th data-sk="zat" id="th-zat" title="Запас в процентах от нормы запаса: ~100% идеально, больше — затоварка">Сток на<br><span class="sub" id="th-zat-sub">90 дней</span></th>
+          <th data-sk="supply" id="th-supply" title="На сколько дней хватит остатка при текущем темпе, и дата окончания">Запас<br><span class="sub">дней</span></th>
+          <th class="c" data-sk="zat" id="th-zat" title="Запас в процентах от нормы запаса: ~100% идеально, больше — затоварка">Сток на<br><span class="sub" id="th-zat-sub">90 дней</span></th>
           <th data-sk="defq" id="th-defq" title="Сколько штук не хватает СЕГОДНЯ, чтобы догнать сток до нормы запаса. Это не колонка «Заказать» со страницы «Заказ»: у неё другой вопрос и свой горизонт, числа напрямую не сравнивают">Не хватает<br><span class="sub">до нормы, шт</span></th>
-          <th data-sk="fdisc" title="Насколько средняя реальная цена ниже номинала — продаётся ли вещь без скидок">Факт. скидка<br><span class="sub">от розницы</span></th>
-          <th data-sk="disc" title="Ручная скидка для распродажи. Сохраняется и попадает в отчёт «Скидки»">Скидка<br><span class="sub">%</span></th>
+          <th data-sk="fdisc" title="Насколько средняя реальная цена ниже номинала: продаётся ли вещь без скидок">Скидка была<br><span class="sub">от прайса</span></th>
+          <th class="c" data-sk="disc" title="Ручная скидка для распродажи. Сохраняется и попадает в отчёт «Скидки»">Скидка<br><span class="sub">ваша, %</span></th>
           <th></th>
         </tr>
       </thead>
@@ -277,28 +283,63 @@
     </table>
   </div>
 
-  <div class="arch-title" onclick="var w=document.getElementById('archwrap');var o=w.style.display==='none';w.style.display=o?'':'none';document.getElementById('archarrow').textContent=o?'▾':'▸';"><span id="archarrow">▸</span> Архив <span id="acnt" style="opacity:.6"></span></div>
+  <div class="arch-title" role="button" tabindex="0" id="arch-title"><span id="archarrow">▸</span> Архив <span id="acnt" style="font-weight:400"></span></div>
   <div id="archwrap" style="display:none">
+    <p class="arch-hint">Вещи, которые вы убрали из аналитики: лимитки, сэмплы, ошибки складской программы. Вернуть можно в любой момент.</p>
     <div class="table-outer" style="max-height:50vh">
       <table><tbody id="atb"><tr><td class="loading">Архив пуст</td></tr></tbody></table>
     </div>
   </div>
+
+  <details class="fold" id="money-fold">
+    <summary>Деньги в товаре и маржа</summary>
+    <div class="fbody">
+      <div class="money-bar" id="money-bar"></div>
+      <div class="mb-cat" id="money-cat"></div>
+      <details class="loss-box" id="loss-box" style="display:none" open>
+        <summary id="loss-sum"></summary>
+        <div class="body" id="loss-body"></div>
+      </details>
+      <label class="mtoggle" title="Колонка «Маржа» и себестоимость под ценой">
+        <input type="checkbox" id="marginToggle"> Показывать в таблице себестоимость и маржу
+      </label>
+    </div>
+  </details>
+
+  <details class="note">
+    <summary>Как читать эту таблицу и что означают колонки</summary>
+    <div class="body">
+      <p><b>Оборачиваемость</b> — главный показатель успешности вещи: сколько рублей она приносит в день, когда есть в наличии (канон: нетто-выручка дней «в стоке» за 2 года ÷ эти же дни — продажи и дни считаются по одним и тем же датам). По ней отсортирована таблица и раскрашены строки: <b>салатовый</b> — бестселлер (≥ 5 000 ₽/день), <b>зелёный</b> — хороший (2 000–5 000), <b>оранжевый</b> — медленный (1 000–2 000), <b>красный</b> — слабый (&lt; 1 000). Пороги настраиваются в <a href="/settings">Настройках</a>.</p>
+      <p><b>В стоке, дней</b> — сколько дней вещь реально была в наличии за 2 года (остаток базы не меньше порога, день за днём). Это индикатор доверия: статистике вещи, пробывшей в стоке больше полугода, можно верить (у неё стоит галочка); вещь, распроданная за 15 дней, не показательна. Кнопка «Только с галочкой» оставляет в таблице только такие вещи.
+      Днём «в стоке» считается день с остатком не меньше <input id="minstock-in" class="minstock-in" type="number" min="0" max="100"> шт
+      <button class="rule-btn mini-btn" id="minstock-save">сохранить</button>.
+      Отсекая дни с последними парой штук, вы видите честный темп: «хвост» из одного размера продаётся медленно и занижал бы показатель. Поставьте 0, чтобы считать любой день наличия.</p>
+      <p><b>Цена</b> — реальная средняя цена продажи (после всех скидок), под ней серым цена по прайсу. <b>Скидка была</b> — насколько реальная цена ниже прайса: видно, продаётся ли вещь без скидок.</p>
+      <p><b>Маржа и себестоимость</b> в таблице по умолчанию скрыты. Они включаются галочкой в разделе «Деньги в товаре и маржа» внизу страницы: появляется колонка «Маржа» (средняя цена продажи минус себестоимость, и то же в процентах от цены; под ней валовая маржа за год) и себестоимость под ценой («с/с» — закупочная цена из МойСклада). Красная маржа означает, что вещь продаётся дешевле, чем обошлась: такие позиции собраны в том же разделе в предупреждении «Торгуете в минус». Если себестоимости в МойСкладе нет, в колонке стоит «нет с/с» — ноль там не рисуется и в итоги такая позиция не входит.</p>
+      <p><b>Карточки в разделе «Деньги в товаре и маржа».</b> «Заморожено по себестоимости» — сколько ваших денег реально лежит на складе; «Если продать» — за сколько этот же остаток уйдёт по текущим ценам. Разница между ними и есть будущая маржа, а не прибыль, которая уже у вас в кассе. Все три суммы — про одни и те же штуки, просто в разных ценах, поэтому под каждой подписано, по какой цене она посчитана.</p>
+      <p><b>Про слово «оборачиваемость».</b> В этой таблице оборачиваемость — это <i>скорость продаж</i>: сколько рублей выручки вещь приносит за день наличия. Это не бухгалтерская оборачиваемость капитала (себестоимость проданного ÷ сегодняшний сток по себестоимости — истории себестоимости у нас нет, поэтому не средний запас за период) — её вы найдёте в карточке «Капитал оборачивается» в разделе «Деньги в товаре и маржа».</p>
+      <p><b>Зима/Весна/Лето/Осень</b> — оборачиваемость по сезонам (выручка сезонных месяцев ÷ дни в стоке в них). <b>0</b> — сезон загружен, но продаж в нём не было; <b>«—»</b> — сезон ещё не загружен, истории за эти месяцы пока нет. Идёт ли загрузка прямо сейчас — сказано в подписи периода под заголовком «Оборачиваемость». Так видно, сезонная вещь или круглогодичная.</p>
+      <p><b>Запас</b> — на сколько дней хватит остатка при текущем темпе, и дата, когда он кончится. <b>Сток на N дней</b> — запас в процентах от нормы запаса (сейчас <span id="norm-hint">90</span> дн.): около 100% — идеально, сильно больше — затоварка, меньше 30% — скоро дефицит. Норма задаётся в правиле скидок (кнопка «Правило»): «Затоварка — это запас от … дней». <b>Не хватает до нормы</b> — сколько штук не хватает <i>сегодня</i>, чтобы догнать сток до этой нормы: ответ на вопрос «каким должен быть склад сегодня». «Заказать» на странице «Заказ» отвечает на другой вопрос — на сколько дней продаж должен хватить заказ до следующего: у него свой горизонт покрытия и свой расчёт на дату прихода (окно темпа, выбранное на «Заказе», товар в пути, продажи за срок производства, минимальная партия и кратность). Поэтому эти два числа напрямую не сравнивают: любое из них может оказаться больше.</p>
+      <p><b>Скидка, %</b> — ручная скидка для распродажи: сохраняется, попадает в отчёт «Скидки» и в печатный прайс. Кнопка <b>«Расставить скидки»</b> сбрасывает все ручные и расставляет по правилу (настраивается кнопкой «Правило»). <b>Кнопка архива</b> в конце строки — для вещей, которые больше никогда не переразместятся: они исчезают из рекомендаций заказа, бюджета и прогноза.</p>
+      <p>Позиции с <b>малой статистикой</b> (мало дней в стоке или единичные продажи) и <b>без продаж за год</b> показаны отдельными блоками внизу таблицы — их цифры не рейтинг, а справка.</p>
+    </div>
+  </details>
 </div>
 
 <!-- Модалка «Правило скидок» -->
 <div class="modal-bg" id="rule-modal">
-  <div class="modal">
-    <h3>Правило дефолтных скидок</h3>
-    <div class="msub">Скидка зависит от успешности вещи (оборачиваемость) и от затоварки (запас в днях). Кнопка «Дефолтные скидки» расставляет проценты по этому правилу. Логика: чем хуже продаётся и чем больше запас — тем глубже скидка. Новинки без затоварки и бестселлеры с малым запасом скидку не получают — они продадутся сами.</div>
+  <div class="modal" role="dialog" aria-modal="true" aria-label="Правило скидок">
+    <h3>Правило скидок</h3>
+    <div class="msub">Скидка зависит от успешности вещи (оборачиваемость) и от затоварки (запас в днях). Кнопка «Расставить скидки» расставляет проценты по этому правилу. Логика: чем хуже продаётся и чем больше запас, тем глубже скидка. Новинки без затоварки и бестселлеры с малым запасом скидку не получают: они продадутся сами.</div>
     <div class="rule-grid" id="rule-grid">
       <div></div><div class="hd">запас меньше</div><div class="hd">затоварка</div>
-      <div>Новинка (в стоке меньше <input id="r-new_days" style="width:52px;display:inline-block;"> дн)</div>
+      <div>Новинка (в стоке меньше <input id="r-new_days" style="width:56px;display:inline-block;"> дн)</div>
       <div><input id="r-new_pct_zero" value="0" disabled title="Новинка без затоварки не уценяется"></div>
       <div><input id="r-new_pct"></div>
-      <div>Топ продаж (оборач. больше <input id="r-top_turnover" style="width:64px;display:inline-block;"> ₽/день)</div>
+      <div>Топ продаж (оборач. больше <input id="r-top_turnover" style="width:68px;display:inline-block;"> ₽/день)</div>
       <div><input id="r-top_pct"></div>
       <div><input id="r-top_over_pct"></div>
-      <div>Средние (от <input id="r-mid_turnover" style="width:64px;display:inline-block;"> ₽/день)</div>
+      <div>Средние (от <input id="r-mid_turnover" style="width:68px;display:inline-block;"> ₽/день)</div>
       <div><input id="r-mid_pct"></div>
       <div><input id="r-mid_over_pct"></div>
       <div>Слабые и без продаж</div>
@@ -322,7 +363,12 @@ let currentCat = null, CATS = [];
    ассортименту: пришлось бы обходить все девять вкладок, как и раньше.
    Значение заведомо не совпадает с названием реальной категории. */
 const ALL_CAT = "\u0000all";
-let MONEY = null, CATMONEY = [], BELOW = null, SHOW_MARGIN = true;
+/* UI2 (D-84): себестоимость и маржа в таблице по умолчанию скрыты, включаются
+   галочкой в разделе «Деньги в товаре и маржа» внизу страницы. ONLY_OK —
+   кнопка «Только с галочкой»: оставить вещи, пробывшие в стоке не меньше
+   OK_DAYS дней (тот же порог, что у галочки в колонке «В стоке»). */
+let MONEY = null, CATMONEY = [], BELOW = null, SHOW_MARGIN = false, ONLY_OK = false;
+const OK_DAYS = 183;
 
 function mw(name,q){ if(!q) return true; const nl=name.toLowerCase(); return q.toLowerCase().split(/\s+/).every(w=>nl.includes(w)); }
 function fmt(n){ if(!n&&n!==0) return "—"; return Math.round(n).toLocaleString("ru-RU") }
@@ -392,35 +438,40 @@ function rowCls(it){
   if(it.group==="low_data") return "rld";
   return {best:"rg2",good:"rg1",dull:"ro",weak:"rr"}[it.cls]||"rr";
 }
+/* Полоска «Сток на N дней». Пороги прежние: до 30% скоро дефицит, до 100%
+   норма, до 150% много, выше затоварка. Возвращает [класс, подпись]. */
 function zatStyle(p){
-  if(p===null) return ["rgba(31,31,31,0.08)","—","rgba(31,31,31,0.4)"];
-  if(p<=30) return ["rgba(221,0,4,0.5)",p+"%","#7a0002"];
-  if(p<=100) return ["#4b7a00",p+"%","#f3e9e0"];
-  if(p<=150) return ["#b99a00",p+"%","#f3e9e0"];
-  return ["#dd0004",p+"%","#f3e9e0"];
+  if(p===null) return ["z-none","—"];
+  const t=p+"\u00a0%";
+  if(p<=30) return ["z-low",t];
+  if(p<=100) return ["z-ok",t];
+  if(p<=150) return ["z-high",t];
+  return ["z-over",t];
 }
+/* «Скидка была»: насколько средняя реальная цена ниже прайса. Знак минуса не
+   пишем: колонка и так называется скидкой; цена выше прайса идёт с плюсом. */
 function realDisc(it){
-  if(it.discount_fact===null||it.discount_fact===undefined) return '<span style="opacity:.3">—</span>';
+  if(it.discount_fact===null||it.discount_fact===undefined) return '<span class="zero">—</span>';
   const p=Math.round(it.discount_fact*100);
-  let c='#434446'; if(p>=30)c='#a00003'; else if(p>=15)c='#7a6400'; else if(p<=0)c='#2a5c10';
-  return '<span style="font-weight:700;color:'+c+'">'+(p>0?('−'+p+'%'):(p===0?'0%':('+'+(-p)+'%')))+'</span>';
+  if(p===0) return '<span class="zero">0\u00a0%</span>';
+  return p>0 ? p+'\u00a0%' : '+'+(-p)+'\u00a0%';
 }
 function esc(s){ return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/"/g,"&quot;"); }
 
 /* Ячейка «Маржа»: ₽/шт и % от цены, ниже — валовая маржа за год.
    Себестоимости нет — пишем «нет с/с», а не ноль: ноль здесь был бы враньём. */
 function marginCell(it){
-  if(it.no_cost) return '<td class="nb"><span class="mnone" title="Себестоимости нет в МойСкладе — маржу посчитать не из чего. Заполните закупочную цену в карточке товара">нет с/с</span></td>';
+  if(it.no_cost) return '<td class="nb" data-k="margin"><span class="mnone" title="Себестоимости нет в МойСкладе — маржу посчитать не из чего. Заполните закупочную цену в карточке товара">нет с/с</span></td>';
   const neg = it.margin_unit<0;
   const pct = it.margin_pct===null||it.margin_pct===undefined ? "" : Math.round(it.margin_pct*100)+"%";
   // Продаж не было — маржа посчитана от прайса, а не от факта: говорим об этом.
   const nofact = !it.avg_price;
   const year = (it.nr>0 && it.gross_margin!==null && it.gross_margin!==undefined)
-    ? '<div class="retail">за год '+fmtMoney(it.gross_margin)+'</div>'
-    : (nofact?'<div class="retail">продаж не было</div>':'');
+    ? '<span class="retail">за год '+fmtMoney(it.gross_margin)+'</span>'
+    : (nofact?'<span class="retail">продаж не было</span>':'');
   const t = nofact ? ' title="Продаж не было — маржа посчитана от розничной цены из карточки, а не от фактической"' : '';
-  return '<td class="nb"'+t+'><span class="nbig'+(neg?' mneg':'')+(nofact?'" style="opacity:.55':'')+'">'+fmt(it.margin_unit)+' ₽</span>'+
-    (pct?'<span style="font-size:10px;opacity:.6"> · '+pct+'</span>':'')+year+'</td>';
+  return '<td class="nb" data-k="margin"'+t+'><span class="strong'+(neg?' mneg':'')+(nofact?'" style="opacity:.55':'')+'">'+fmt(it.margin_unit)+' ₽</span>'+
+    (pct?'<span style="font-size:11px;color:var(--u-ink2)"> · '+pct+'</span>':'')+year+'</td>';
 }
 
 /* ── Сортировка колонок ──
@@ -519,7 +570,7 @@ function saveView(){
   try{
     localStorage.setItem(VIEW_KEY, JSON.stringify({
       cat: currentCat, q: document.getElementById("search").value||"",
-      sort: SORT, margin: SHOW_MARGIN,
+      sort: SORT, money: SHOW_MARGIN, ok: ONLY_OK,
     }));
   }catch(e){ /* нет места или запрещено — работаем без памяти */ }
   paintReset();
@@ -531,8 +582,17 @@ function applyView(){
   if(v.cat) currentCat=v.cat;
   if(typeof v.q==="string") document.getElementById("search").value=v.q;
   if(v.sort && COLS[v.sort.k] && (v.sort.d===1||v.sort.d===-1)) SORT={k:v.sort.k,d:v.sort.d};
-  if(v.margin===false){ SHOW_MARGIN=false; document.getElementById("marginToggle").checked=false;
-    document.querySelectorAll("th.mcol").forEach(th=>{ th.style.display="none"; }); }
+  // Прежний ключ `margin` не читаем намеренно: раньше маржа была включена по
+  // умолчанию и сохранялась как true у каждого, кто хоть раз менял вид. Новый
+  // ключ `money` означает явный выбор человека уже в новой раскладке.
+  if(v.money===true){ SHOW_MARGIN=true; document.getElementById("marginToggle").checked=true;
+    document.querySelectorAll("th.mcol").forEach(th=>{ th.style.display=""; }); }
+  if(v.ok===true) ONLY_OK=true;
+  paintOk();
+}
+function paintOk(){
+  const b=document.getElementById("relToggle");
+  if(b) b.setAttribute("aria-pressed", ONLY_OK?"true":"false");
 }
 /* Видно ли, что таблица показана не в исходном виде, и как это отменить. */
 function paintReset(){
@@ -542,7 +602,8 @@ function paintReset(){
     full.push(currentCat===ALL_CAT?"показаны все категории сразу":"выбрана категория «"+currentCat+"»"); }
   if(q){ parts.push("поиск"); full.push("включён поиск «"+q+"»"); }
   if(SORT&&COLS[SORT.k]){ parts.push("сортировка"); full.push("сортировка по "+sortLabel()); }
-  if(!SHOW_MARGIN){ parts.push("без маржи"); full.push("скрыты себестоимость и маржа"); }
+  if(ONLY_OK){ parts.push("только с галочкой"); full.push("показаны только вещи с галочкой"); }
+  if(SHOW_MARGIN){ parts.push("с маржой"); full.push("показаны себестоимость и маржа"); }
   if(!parts.length){ b.style.display="none"; return; }
   b.style.display="";
   b.textContent="↺ Сбросить вид · "+parts.join(", ");
@@ -551,8 +612,9 @@ function paintReset(){
 function resetView(){
   SORT=null; currentCat=CATS[0]||null;
   document.getElementById("search").value="";
-  SHOW_MARGIN=true; document.getElementById("marginToggle").checked=true;
-  document.querySelectorAll("th.mcol").forEach(th=>{ th.style.display=""; });
+  SHOW_MARGIN=false; document.getElementById("marginToggle").checked=false;
+  document.querySelectorAll("th.mcol").forEach(th=>{ th.style.display="none"; });
+  ONLY_OK=false; paintOk();
   paintSort(); buildTabs(); saveView(); render();
 }
 
@@ -567,11 +629,11 @@ function resetView(){
 // действительно прочитано.
 const SEA_NA = "Сезон ещё не загружен: истории за эти месяцы пока нет";
 function seaCell(it, key, showTurn){
-  if(!showTurn) return '<td class="nb">—</td>';
+  if(!showTurn) return '<td class="nb" data-k="'+key+'"><span class="zero">—</span></td>';
   const v = (it.sea||{})[key];
   if(v===null||v===undefined)
-    return '<td class="nb"><span class="sea-na" title="'+SEA_NA+'">—</span></td>';
-  return '<td class="nb">'+fmt(v)+'</td>';
+    return '<td class="nb" data-k="'+key+'"><span class="sea-na" title="'+SEA_NA+'">—</span></td>';
+  return '<td class="nb" data-k="'+key+'">'+(v?fmt(v):'<span class="zero">0</span>')+'</td>';
 }
 
 function buildTabs(){
@@ -597,34 +659,41 @@ function buildTabs(){
   }));
 }
 
+const ARCH_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="5" rx="1.5"/><path d="M5 9v9a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V9M10 13h4"/></svg>';
+/* Порядок ячеек = порядок <thead>. data-k — якоря подсказок (_ui2_tour.html):
+   по ним подсказка находит ячейку строки-примера, поэтому имена здесь и там
+   обязаны совпадать (проверяется tests/test_ui2_turnover.py). */
 function rowHtml(it, arch){
   const cls=rowCls(it);
-  const [zc,zl,zt]=zatStyle(it.zat);
+  const [zc,zl]=zatStyle(it.zat);
   const low = it.group==="low_data";
   let name = esc(it.base_name) + (low?'<span class="lowtag" title="Меньше '+14+' дней в стоке или меньше 3 продаж — цифрам пока нельзя доверять">мало данных</span>':'');
-  if(it.below_cost) name += '<span class="losstag" title="Средняя цена продажи ниже себестоимости — каждая проданная штука приносит убыток">в минус</span>';
+  if(it.below_cost && SHOW_MARGIN) name += '<span class="losstag" title="Средняя цена продажи ниже себестоимости — каждая проданная штука приносит убыток">в минус</span>';
   const showTurn = it.group==="rank";
   const sellDate = it.sup!==null&&it.sup>0&&it.stockout_date
-    ? '<div class="subdate">до '+new Date(it.stockout_date).toLocaleDateString("ru-RU",{day:"numeric",month:"long",year:"numeric"})+'</div>' : '';
+    ? '<span class="subdate">до '+new Date(it.stockout_date).toLocaleDateString("ru-RU",{day:"numeric",month:"long",year:"numeric"})+'</span>' : '';
   const dv = DISC[it.base_name];
-  return '<tr class="'+cls+'">'+
-    '<td>'+name+'</td>'+
-    '<td class="nb">'+it.dis+(it.dis>=183?' <span title="Больше полугода в стоке — данным можно доверять" style="opacity:.55;font-size:10px;">✓</span>':'')+'</td>'+
-    '<td class="nb">'+(it.avg_price?fmt(it.avg_price)+' ₽':'—')+'<div class="retail">розн. '+fmt(it.sale_price)+' ₽</div>'+
-      (SHOW_MARGIN?'<div class="costline'+(it.below_cost?' mneg':'')+'">'+(it.no_cost?'с/с не указана':'с/с '+fmt(it.cost_price)+' ₽')+'</div>':'')+'</td>'+
+  return '<tr class="'+cls+'" data-base="'+esc(it.base_name)+'">'+
+    '<td data-k="name">'+name+'</td>'+
+    '<td class="c" data-k="turn">'+(showTurn?'<span class="pill nb">'+fmt(it.turnover)+'</span>'
+      :'<span class="pill na" title="Мало статистики — оборачиваемость была бы шумом">—</span>')+'</td>'+
+    '<td class="nb price" data-k="price"><b>'+(it.avg_price?fmt(it.avg_price)+' ₽':'<span class="zero">—</span>')+'</b><span class="retail">прайс '+fmt(it.sale_price)+' ₽</span>'+
+      (SHOW_MARGIN?'<span class="costline'+(it.below_cost?' mneg':'')+'">'+(it.no_cost?'с/с не указана':'с/с '+fmt(it.cost_price)+' ₽')+'</span>':'')+'</td>'+
     (SHOW_MARGIN?marginCell(it):'')+
-    '<td class="nb nbig">'+(showTurn?fmt(it.turnover):'<span title="Мало статистики — оборачиваемость была бы шумом" style="opacity:.4">—</span>')+'</td>'+
     seaCell(it,"winter",showTurn)+
     seaCell(it,"spring",showTurn)+
     seaCell(it,"summer",showTurn)+
     seaCell(it,"autumn",showTurn)+
-    '<td class="nb nbig">'+it.cs+'</td>'+
-    '<td class="nb">'+(it.sup!==null?it.sup+' дн'+sellDate:'—')+'</td>'+
-    '<td><div class="zbar"><div class="zfill" style="width:'+Math.min(it.zat||0,100)+'%;background:'+zc+'"></div><div class="ztxt" style="color:'+zt+'">'+zl+'</div></div></td>'+
-    '<td class="nb"><span style="font-size:11px;font-weight:600">'+it.defq+'</span></td>'+
-    '<td>'+realDisc(it)+'</td>'+
-    '<td><input class="disc-in'+(dv?' has':'')+'" data-base="'+esc(it.base_name)+'" value="'+(dv?Math.round(dv):'')+'" placeholder="—" inputmode="numeric"></td>'+
-    '<td><button class="'+(arch?'unarch-btn':'arch-btn')+'" data-base="'+esc(it.base_name)+'">'+(arch?'вернуть':'в архив')+'</button></td>'+
+    '<td class="nb" data-k="dis">'+it.dis+(it.dis>=OK_DAYS?'<span class="ck" title="Больше полугода в стоке — данным можно доверять"></span>':'<span class="nock"></span>')+'</td>'+
+    '<td class="nb strong" data-k="stock">'+(it.cs?it.cs:'<span class="zero">0</span>')+'</td>'+
+    '<td class="nb" data-k="supply">'+(it.sup!==null?it.sup+' дн'+sellDate:'<span class="zero">—</span>')+'</td>'+
+    '<td class="c" data-k="zat"><div class="zbar '+zc+'"><i class="ztrack"><u class="zfill" style="width:'+Math.min(it.zat||0,100)+'%"></u></i><span class="ztxt">'+zl+'</span></div></td>'+
+    '<td class="nb" data-k="defq">'+(it.defq?it.defq:'<span class="zero">0</span>')+'</td>'+
+    '<td class="nb" data-k="fdisc">'+realDisc(it)+'</td>'+
+    '<td class="c" data-k="disc"><input class="disc-in'+(dv?' has':'')+'" data-base="'+esc(it.base_name)+'" value="'+(dv?Math.round(dv):'')+'" placeholder="%" inputmode="numeric" aria-label="Скидка, процентов"></td>'+
+    '<td class="c" data-k="arch">'+(arch
+      ? '<button class="unarch-btn" data-base="'+esc(it.base_name)+'">Вернуть</button>'
+      : '<button class="arch-btn" data-base="'+esc(it.base_name)+'" title="В архив: убрать вещь из аналитики и рекомендаций" aria-label="В архив">'+ARCH_ICON+'</button>')+'</td>'+
     '</tr>';
 }
 
@@ -692,8 +761,12 @@ function render(){
   const q=(document.getElementById("search").value||"").toLowerCase();
   const tb=document.getElementById("tb");
   renderMoney();
-  const items = ITEMS.filter(it=>!it.hidden && (q?mw(it.base_name,q):(currentCat===ALL_CAT||it.category===currentCat)));
-  if(!items.length){ tb.innerHTML='<tr><td colspan="'+ncols()+'" class="loading">Нет данных</td></tr>'; return; }
+  const items = ITEMS.filter(it=>!it.hidden && (q?mw(it.base_name,q):(currentCat===ALL_CAT||it.category===currentCat))
+    && (!ONLY_OK || it.dis>=OK_DAYS));
+  if(!items.length){
+    tb.innerHTML='<tr><td colspan="'+ncols()+'" class="loading">'+(ONLY_OK
+      ? 'Вещей с галочкой здесь нет. Отключите «Только с галочкой», чтобы увидеть остальные.' : 'Нет данных')+'</td></tr>';
+    renderArchive(q); return; }
   const groups = [
     ["rank", null],
     ["low_data", "Мало данных — новинки и единичные продажи: цифры справочные"],
@@ -720,8 +793,8 @@ function renderArchive(q){
 
 /* ── события таблицы ── */
 document.addEventListener("click", async e=>{
-  const t=e.target;
-  if(t.classList&&(t.classList.contains("arch-btn")||t.classList.contains("unarch-btn"))){
+  const t=e.target.closest ? e.target.closest(".arch-btn, .unarch-btn") : null;
+  if(t){
     const base=t.getAttribute("data-base"), hide=t.classList.contains("arch-btn");
     try{ await api("/api/hidden",{method:"POST",body:{base_name:base,hidden:hide}});
       ITEMS.forEach(it=>{ if(it.base_name===base) it.hidden=hide; });
@@ -750,10 +823,21 @@ document.addEventListener("change", async e=>{
   }
 });
 document.getElementById("search").addEventListener("input",()=>{ saveView(); render(); });
+document.getElementById("relToggle").addEventListener("click",()=>{ ONLY_OK=!ONLY_OK; paintOk(); saveView(); render(); });
+(function(){
+  const t=document.getElementById("arch-title");
+  function toggle(){ const w=document.getElementById("archwrap"); const o=w.style.display==="none";
+    w.style.display=o?"":"none"; document.getElementById("archarrow").textContent=o?"▾":"▸";
+    t.setAttribute("aria-expanded", o?"true":"false"); }
+  t.setAttribute("aria-expanded","false");
+  t.addEventListener("click",toggle);
+  t.addEventListener("keydown",e=>{ if(e.key==="Enter"||e.key===" "){ e.preventDefault(); toggle(); } });
+})();
 
 /* ── переключатель «себестоимость и маржа» ──
-   Таблица и без того плотная: галочка убирает две денежные детали, если
-   товароведу они мешают. По умолчанию включено — ради этого слоя всё и делалось. */
+   По умолчанию выключено (UI2, D-84): таблица про оборачиваемость. Галочка в
+   разделе «Деньги в товаре и маржа» возвращает колонку «Маржа», себестоимость
+   под ценой и метку «в минус» у названия. */
 document.getElementById("marginToggle").addEventListener("change", function(){
   SHOW_MARGIN=this.checked;
   document.querySelectorAll("th.mcol").forEach(th=>{ th.style.display=SHOW_MARGIN?"":"none"; });
@@ -771,10 +855,10 @@ document.getElementById("defDiscBtn").addEventListener("click", async function()
     DISC = await api("/api/discount-overrides");
     render();
     btn.textContent="✓ Скидки расставлены";
-    setTimeout(()=>{btn.textContent="Дефолтные скидки"; btn.disabled=false;},2000);
+    setTimeout(()=>{btn.textContent="Расставить скидки"; btn.disabled=false;},2000);
   }catch(err){
     alert("Не получилось. "+errText(err));
-    btn.textContent="Дефолтные скидки"; btn.disabled=false;
+    btn.textContent="Расставить скидки"; btn.disabled=false;
   }
 });
 
@@ -825,6 +909,28 @@ async function load(){
   if(s&&s.min_stock_days!==undefined){ MIN_STOCK=s.min_stock_days; document.getElementById("minstock-in").value=MIN_STOCK; }
   buildTabs(); render(); paintReset();
 }
+/* Мост для подсказок (_ui2_tour.html). Подсказки показываются на строке из
+   середины списка: у верхних строк цифры часто случайные (мало дней в стоке).
+   prepare() возвращает таблицу к исходному виду и отдаёт строку-пример. */
+window.OborotTurnover = {
+  norm: () => NORM,
+  prepare(){
+    if(SORT||ONLY_OK||document.getElementById("search").value||(CATS.length&&currentCat!==CATS[0])){
+      SORT=null; ONLY_OK=false; paintOk(); currentCat=CATS[0]||null;
+      document.getElementById("search").value="";
+      paintSort(); buildTabs(); saveView(); render();
+    }
+    const cat=currentCat;
+    const pool=ITEMS.filter(it=>!it.hidden && it.group==="rank" && (cat===ALL_CAT||it.category===cat));
+    if(!pool.length) return null;
+    const good=pool.filter(it=>it.dis>=OK_DAYS && it.cs>0 && it.avg_price && it.sup!==null);
+    const list=good.length?good:pool;
+    const it=list[Math.floor(list.length/2)];
+    const rows=document.querySelectorAll("#tb tr[data-base]");
+    for(const r of rows){ if(r.getAttribute("data-base")===it.base_name) return {row:r, item:it}; }
+    return null;
+  },
+};
 applyView(); setupSort();
 load().catch(e=>{ document.getElementById("tb").innerHTML='<tr><td colspan="'+ncols()+'" class="loading">Ошибка загрузки: '+e.message+'</td></tr>'; });
 </script>
@@ -932,6 +1038,7 @@ load().catch(e=>{ document.getElementById("tb").innerHTML='<tr><td colspan="'+nc
   refresh();
 })();
 </script>
+{% include "_ui2_tour.html" %}
 {% include "_hints.html" %}
 </body>
 </html>

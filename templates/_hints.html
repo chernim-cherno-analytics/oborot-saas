@@ -175,14 +175,14 @@
 (function(){
   var PAGE = "{{ active }}";
   var HINTS = {
+    // UI2 (D-84): на «Оборачиваемости» вместо длинной справки короткая аннотация
+    // и кнопка, которая запускает подсказки по клику (_ui2_tour.html). Подробная
+    // справка по колонкам осталась на самой странице, внизу.
     turnover: {
-      t: "Оборачиваемость",
-      h: "<div class='hm-sub'>Главная таблица</div>"
-        +"<p><b>Оборачиваемость</b> — сколько рублей в день приносит позиция, пока лежит на складе. Считается честно: выручка делится только на дни, когда товар <b>реально был в наличии</b> — распроданная вещь не выглядит «мёртвой», а залежавшаяся не прячется за старыми продажами.</p>"
-        +"<h3>Как читать таблицу</h3>"
-        +"<p>Строки подсвечены классами: зелёные — бестселлеры (переразмещайте), жёлтые — середина, красные — слабые (кандидаты на уценку). «Запас, дней» — на сколько хватит остатка при текущем темпе; рядом дата, когда позиция кончится.</p>"
-        +"<h3>Что делать</h3>"
-        +"<p>Сильное и заканчивающееся — в «Заказ». Слабое — уценка или архив (кнопка «в архив» убирает позицию из всех рекомендаций). Порог «дня в стоке» и правило скидок настраиваются прямо на странице.</p>"
+      t: "Это страница оборачиваемости",
+      tour: true,
+      ico: "<div class='hm-ico' aria-hidden='true'><svg width='30' height='30' viewBox='0 0 32 32' fill='none' stroke='currentColor' stroke-width='2.6' stroke-linecap='round'><path d='M6 26V17M13 26V11M20 26v-7M27 26V6'/></svg></div>",
+      h: "<p>Оборачиваемость показывает, сколько денег приносила вещь за каждый день, пока была на складе. Это главная метрика Оборота: по ней строится ваша товарная матрица.</p>"
     },
     stocks: {
       t: "Активный сток",
@@ -304,7 +304,22 @@
   var overlay = document.getElementById("hint-overlay");
   var body = document.getElementById("hint-body");
   var closeBtn = document.getElementById("hint-close");
-  body.innerHTML = "<h2>" + hint.t + "</h2>" + hint.h;
+  body.innerHTML = (hint.ico || "") + "<h2>" + hint.t + "</h2>" + hint.h;
+  // UI2: страница с подсказками по клику. Главная кнопка запускает их, прежняя
+  // кнопка закрытия остаётся (её id знают тесты и помощники других наборов) и
+  // становится второстепенной. OborotTour объявляет _ui2_tour.html, который
+  // подключается ПЕРЕД этим файлом; без него кнопки нет и подсказка прежняя.
+  var tourOn = !!(hint.tour && window.OborotTour);
+  window.OborotHelp.tour = tourOn;
+  if (tourOn) {
+    var goBtn = document.createElement("button");
+    goBtn.type = "button"; goBtn.className = "hm-go"; goBtn.id = "hint-tour";
+    goBtn.textContent = "Показать, что есть что";
+    closeBtn.parentNode.insertBefore(goBtn, closeBtn);
+    closeBtn.parentNode.classList.add("has-go");
+    closeBtn.textContent = "Посмотрю сам";
+    goBtn.addEventListener("click", function(){ close(true); window.OborotTour.start(); });
+  }
 
   // На страницах с ещё не адаптированной вёрсткой (широкая нескроллящаяся
   // таблица и т.п.) документ шире экрана телефона, и `position:fixed;inset:0`
@@ -1152,7 +1167,14 @@
   // «Что означают колонки» — ровно та же модалка, что открывалась по «?» раньше.
   if (HELP.hasHint && HELP.openModal) {
     itCols.hidden = false;
-    itCols.addEventListener("click", function(){ closeMenu(false); HELP.openModal(); });
+    // UI2: на странице с подсказками по клику пункт запускает их сразу, без
+    // вступительной карточки: человек, который пришёл за ними второй раз, уже
+    // знает, что это за страница.
+    if (HELP.tour) itCols.querySelector("span").textContent = "Подсказки к таблице";
+    itCols.addEventListener("click", function(){
+      closeMenu(false);
+      if (HELP.tour && window.OborotTour) window.OborotTour.start(); else HELP.openModal();
+    });
   }
 
   // Тумблер подсказок. Значение приходит из /api/lessons (hints_enabled),
