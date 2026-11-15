@@ -533,6 +533,19 @@ def api_create_order(
     items = [i for i in body.items if i.qty > 0]
     if not items:
         raise HTTPException(status_code=422, detail="В заказе нет позиций с количеством > 0")
+    # Одна модель одной строкой (QA 14.11, P3): две строки одной позиции
+    # давали в файле для цеха две строки и два раскроя. Складываем штуки и
+    # размеры в первую строку модели, порядок строк сохраняется.
+    merged: dict[str, OrderItemIn] = {}
+    for i in items:
+        prev = merged.get(i.base_name)
+        if prev is None:
+            merged[i.base_name] = i.model_copy(deep=True)
+            continue
+        prev.qty = min(100_000, prev.qty + i.qty)
+        for size, q in i.sizes.items():
+            prev.sizes[size] = min(100_000, int(prev.sizes.get(size, 0)) + int(q))
+    items = list(merged.values())
     if body.production_id is not None:
         production = db.get(Production, body.production_id)
         if production is None or production.org_id != ctx.org.id:

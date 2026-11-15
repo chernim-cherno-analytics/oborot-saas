@@ -111,6 +111,14 @@ with TestClient(app, headers={"X-Oborot-CSRF": "1"}, raise_server_exceptions=Fal
                                          "items": [{"base_name": base, "qty": 1}]})
         check(f"дата прихода {bad}: 422", r.status_code == 422, str(r.status_code))
 
+    print("\n5б. Одна модель одной строкой")
+    r = a.post("/api/orders", json={"name": "дубль строк", "allow_duplicate": True, "items": [
+        {"base_name": base, "qty": 3, "sizes": {"S": 3}}, {"base_name": base, "qty": 4, "sizes": {"M": 4}}]})
+    card = a.get(f"/api/orders/{r.json().get('id')}").json() if r.status_code == 200 else {}
+    rows = [i for i in card.get("items", []) if i["base_name"] == base]
+    check("две строки одной модели склеены в одну: 7 шт, S3 M4",
+          len(rows) == 1 and rows[0]["qty"] == 7 and rows[0].get("sizes") == {"S": 3, "M": 4}, str(rows)[:200])
+
     print("\n6. «Оборот за период»")
     r = a.get("/api/revenue?date_from=2026-02-30&date_to=2026-03-01")
     check("30 февраля: 422", r.status_code == 422, str(r.status_code))
