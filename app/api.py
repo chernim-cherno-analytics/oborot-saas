@@ -533,6 +533,39 @@ def api_create_order(
     items = [i for i in body.items if i.qty > 0]
     if not items:
         raise HTTPException(status_code=422, detail="В заказе нет позиций с количеством > 0")
+    # Одна модель одной строкой (QA 14.11, P3): две строки одной позиции
+    # давали в файле для цеха две строки и два раскроя. Складываем штуки и
+    # размеры в первую строку модели, порядок строк сохраняется.
+    # Склейка не меняет заказ молча (ревью #117): сумма сверх лимита строки и
+    # смесь строки с размерами и строки без размеров отклоняются 422, а не
+    # обрезаются и не теряют безразмерные штуки.
+    def _has_split(it: OrderItemIn) -> bool:
+        return any(int(q) > 0 for q in it.sizes.values())
+
+    merged: dict[str, OrderItemIn] = {}
+    for i in items:
+        prev = merged.get(i.base_name)
+        if prev is None:
+            merged[i.base_name] = i.model_copy(deep=True)
+            continue
+        if _has_split(prev) != _has_split(i):
+            raise HTTPException(
+                status_code=422,
+                detail=f"Позиция «{i.base_name}» встречается дважды: в одной строке "
+                       "есть разбивка по размерам, в другой нет. Сведите её в одну "
+                       "строку с размерами.")
+        total = prev.qty + i.qty
+        sizes = dict(prev.sizes)
+        for size, q in i.sizes.items():
+            sizes[size] = int(sizes.get(size, 0)) + int(q)
+        if total > 100_000 or any(q > 100_000 for q in sizes.values()):
+            raise HTTPException(
+                status_code=422,
+                detail=f"Позиция «{i.base_name}»: вместе по строкам больше 100 000 штук. "
+                       "Проверьте количество.")
+        prev.qty = total
+        prev.sizes = sizes
+    items = list(merged.values())
     if body.production_id is not None:
         production = db.get(Production, body.production_id)
         if production is None or production.org_id != ctx.org.id:
