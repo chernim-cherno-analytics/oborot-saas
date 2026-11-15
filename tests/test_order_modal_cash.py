@@ -103,6 +103,15 @@ with TestClient(app, headers={"X-Oborot-CSRF": "1"}) as a, \
     first = min((p_["date"] for p_ in (op or {}).get("payments", [])), default=None)
     check("первый платёж черновика = плановая дата размещения (приход минус срок)",
           first == planned, f"{first} против {planned}")
+    pv = a.get("/api/orders/payment-preview", params={"cost": 100000, "production_id": pid, "eta_date": eta}).json()
+    check("окно показывает плановую дату черновика (ревью #129)",
+          pv.get("draft_start") == planned and min(p_["date"] for p_ in pv.get("draft_payments", [{"date": "x"}])) == planned
+          and min(p_["date"] for p_ in pv["payments"]) == _d.today().isoformat(), str({k: pv.get(k) for k in ("draft_start", "today")}))
+    pv0 = a.get("/api/orders/payment-preview", params={"cost": 100000, "production_id": pid,
+                                                       "eta_date": _d.today().isoformat()}).json()
+    check("приход сегодня: отдельного варианта черновика нет", "draft_start" not in pv0, str(pv0.get("draft_start")))
+    r = a.get("/api/orders/payment-preview", params={"cost": 100000, "eta_date": "9999-12-31"})
+    check("дата прихода вне диапазона не роняет окно", r.status_code == 200 and "draft_start" not in r.json(), str(r.status_code))
     a.post(f"/api/orders/{o4['id']}/status", json={"status": "sent"})
     op = next((x for x in a.get("/api/orders/open").json()["orders"] if x["id"] == o4.get("id")), None)
     first = min((p_["date"] for p_ in (op or {}).get("payments", [])), default=None)

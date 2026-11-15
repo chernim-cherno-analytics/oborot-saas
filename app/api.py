@@ -390,9 +390,15 @@ def _week_start(d: date) -> date:
 def api_order_payment_preview(
     cost: int = Query(..., ge=0, le=10_000_000_000),
     production_id: int | None = Query(None, ge=1, le=2_147_483_647),
+    eta_date: str | None = Query(None, max_length=10),
     ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db),
 ):
     """Календарь платежей заказа ДО оформления (окно «Заказа», прогон 14.11).
+
+    eta_date (ревью #129): черновик с датой прихода платит с плановой даты
+    размещения (`_order_start_date`), а «Зафиксировать размещение» сегодня.
+    payments всегда «если разместить сейчас»; draft_start и draft_payments
+    приходят, только когда плановая дата позже сегодняшней.
 
     Финдир в прогоне: окно оформления ставило 4,47 млн в производство, не
     показав, когда и сколько платить. Здесь ровно тот календарь, который
@@ -420,9 +426,19 @@ def api_order_payment_preview(
             d = date.fromisoformat(p["date"])
             if today <= d <= last:
                 open_due += int(p["amount"])
-    return {"payments": payments, "open_due": open_due,
-            "until": last.isoformat(), "today": today.isoformat(),
-            "now": sum(int(p["amount"]) for p in payments if p["date"] == today.isoformat())}
+    out = {"payments": payments, "open_due": open_due,
+           "until": last.isoformat(), "today": today.isoformat(),
+           "now": sum(int(p["amount"]) for p in payments if p["date"] == today.isoformat())}
+    if eta_date and cost > 0:
+        try:
+            planned = date.fromisoformat(_eta_in_range(eta_date)) - timedelta(
+                days=order_planner.lead_days(stages))
+        except (ValueError, HTTPException):
+            planned = today
+        if planned > today:
+            out["draft_start"] = planned.isoformat()
+            out["draft_payments"] = order_planner.payment_plan(planned, stages, float(cost))
+    return out
 
 
 @router.get("/cash-calendar")
