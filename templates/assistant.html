@@ -939,7 +939,19 @@
     STATE.edits = {};
     // Правки не теряются, если этот расчёт перебьёт следующий.
     STATE.savedEdits = pendingEdits;
-    document.getElementById("planBox").innerHTML = '<div class="loading">Считаю план…</div>';
+    // QA 15.11: запоминаем раскрытые блоки до заглушки «Считаю план…»,
+    // иначе после пересчёта они сворачиваются (см. отрисовку плана).
+    var pbPrev = document.getElementById("planBox");
+    var prevDetails = pbPrev.querySelectorAll("details");
+    if(prevDetails.length){
+      STATE.openFolds = {};
+      Array.prototype.forEach.call(prevDetails, function(d){
+        var sm = d.querySelector("summary");
+        if(sm) STATE.openFolds[sm.textContent.split("(")[0].trim()] = d.open;
+      });
+      STATE.keepScroll = window.scrollY;
+    }
+    pbPrev.innerHTML = '<div class="loading">Считаю план…</div>';
     STATE.createdOrder = null;
     var previewBody = brief();
     if(Object.keys(pendingEdits).length) previewBody.overrides = pendingEdits;
@@ -1440,7 +1452,16 @@
         return esc(c) + ' — ' + inPlan[c]; }).join(", ")) : '') + '</div>' +
       (STATE.mustDropped.length ? ('<div class="warn" id="planMustDropped">Не включены позиции, отмеченные «Взять» раньше, ' +
         'из невыбранных категорий: ' + esc(STATE.mustDropped.join(", ")) + '. Чтобы заказать их, выберите их категорию на шаге 1.</div>') : '');
-    document.getElementById("planBox").innerHTML =
+    // QA 15.11: галочка в раскрытом блоке пересчитывает план, и блок
+    // сворачивался после каждой отметки. Раскрытые блоки запомнены в
+    // preview() (по заголовку без числа в скобках), раскрываем их снова.
+    var planBoxEl = document.getElementById("planBox");
+    var foldKey = function(d){ var sm = d.querySelector("summary");
+      return sm ? sm.textContent.split("(")[0].trim() : ""; };
+    var openFolds = STATE.openFolds || {};
+    var keepScroll = STATE.keepScroll || 0;
+    STATE.openFolds = null; STATE.keepScroll = 0;
+    planBoxEl.innerHTML =
       scopeHtml+
       openHtml+
       incHtml+
@@ -1507,6 +1528,11 @@
         '<th>Позиция</th><th>Оборач.</th><th>Нужно, шт</th><th>Нужно, ₽</th><th>Недополученная маржа</th>'+
         '</tr></thead><tbody>'+notIn+'</tbody></table></div></div></details></div>') : "")+
       overCap + moqHtml + revHtml;
+    Array.prototype.forEach.call(planBoxEl.querySelectorAll("details"), function(d){
+      var k = foldKey(d);
+      if(Object.prototype.hasOwnProperty.call(openFolds, k)) d.open = openFolds[k];
+    });
+    if(Object.keys(openFolds).length) window.scrollTo(0, keepScroll);
 
     renderRows();
     var qbox = document.getElementById("planq");
