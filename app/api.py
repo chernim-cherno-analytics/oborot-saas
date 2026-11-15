@@ -1246,6 +1246,11 @@ def api_order_status(
 # трогали, и сверять их правки не с чем (ревью #133). Граница с запасом
 # после выкладки; заказ, принятый до неё, правки приёмки на остаток не двигают.
 DEMO_RECEIPT_SINCE = datetime(2026, 11, 15, 15, 0)
+# D-83 в демо: с какого момента приёмка частями по открытому заказу сразу
+# кладёт на остаток. Раньше выкладки этого правила (ревью #130) строки приёмки
+# остаток не двигали, поэтому считаются не положенными и уйдут на остаток при
+# закрытии заказа.
+DEMO_PARTIAL_SINCE = datetime(2026, 11, 15, 23, 0)
 
 
 def _demo_spec(db: Session, org_id: int, order_id: int, items: list[dict]) -> dict:
@@ -1289,7 +1294,7 @@ def _demo_sent_applied(db: Session, org_id: int, order_id: int) -> dict:
     return {b: max(0.0, float(q or 0)) for b, q in db.execute(
         select(OrderReceipt.base_name, func.sum(OrderReceipt.qty))
         .where(OrderReceipt.org_id == org_id, OrderReceipt.order_id == order_id,
-               OrderReceipt.at >= DEMO_RECEIPT_SINCE)
+               OrderReceipt.at >= DEMO_PARTIAL_SINCE)
         .group_by(OrderReceipt.base_name)
     ).all()}
 
