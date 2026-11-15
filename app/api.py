@@ -1239,6 +1239,46 @@ def api_order_status(
             "received_at": now.isoformat() if body.status == "received" else None}
 
 
+def _demo_applied_by_base(db: Session, org_id: int, order: ProductionOrder) -> dict[str, float] | None:
+    """Сколько демо уже положило на остаток по принятому заказу, по базам.
+
+    То же правило, что в _demo_stock_on_receive: есть строки приёмки, значит
+    названное (не ниже нуля), нет строк, значит заказанное. None, если это не
+    демо или заказ ещё не принят (тогда остаток не трогался).
+    """
+    from app import demo_seed
+    from app.models import OrderReceipt
+    if order.status != "received" or not demo_seed.is_demo_org(db, org_id):
+        return None
+    rows = db.execute(
+        select(OrderReceipt.base_name, func.sum(OrderReceipt.qty))
+        .where(OrderReceipt.org_id == org_id, OrderReceipt.order_id == order.id)
+        .group_by(OrderReceipt.base_name)
+    ).all()
+    if rows:
+        return {b: max(0.0, float(q or 0)) for b, q in rows}
+    out: dict[str, float] = {}
+    for it in order.items:
+        b = str(it.get("base_name") or "")
+        if b:
+            out[b] = out.get(b, 0.0) + float(it.get("qty") or 0)
+    return out
+
+
+def _demo_reconcile_receipts(db: Session, org_id: int, order: ProductionOrder,
+                             before: dict[str, float]) -> None:
+    """Ревью #131: приёмку по уже принятому демо-заказу поправили (довоз,
+    исправление, количества названы позже). Остаток двигается на разницу между
+    тем, что положено раньше, и тем, что названо теперь."""
+    from app import demo_seed
+    db.flush()
+    after = _demo_applied_by_base(db, org_id, order) or {}
+    delta = {b: after.get(b, 0.0) - before.get(b, 0.0) for b in set(before) | set(after)}
+    delta = {b: d for b, d in delta.items() if abs(d) >= 0.5}
+    if delta:
+        demo_seed.simulate_receipt(db, org_id, delta)
+
+
 def _demo_stock_on_receive(db: Session, org_id: int, order_id: int, items: list[dict]) -> None:
     """Демо-организация: «Принят на склад» кладёт пришедшее на остаток.
 
@@ -1409,9 +1449,13 @@ def api_order_receipts_add(
     # исчезало — заказ оставался «неизвестно» вместо «подтверждённый ноль».
     # Соседний путь (перевод в «на складе» с количествами) нули писал, и две
     # ручки отвечали об одном и том же по-разному.
+    demo_before = _demo_applied_by_base(db, ctx.org.id, order)
     added = _add_receipts(db, order, lines, source="manual",
                           precision="by_position", user_id=ctx.user.id,
                           source_ref=ref, keep_zeros=True)
+    if demo_before is not None:
+        _demo_reconcile_receipts(db, ctx.org.id, order, demo_before)
+        analytics.invalidate(ctx.org.id)
     db.commit()
     return {"ok": True, "added": added, **_receipts_out(db, order)}
 
