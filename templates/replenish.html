@@ -578,10 +578,13 @@
     <div class="fieldhint">Все расчёты уже сделаны на дату прихода: из остатков вычтено то, что продастся
       за время производства.</div>
     <div class="warn" id="order-modal-warning"></div>
-    <div class="fieldhint">Заказ будет отмечен «в производстве», а количество появится в «Едет».
+    <div id="order-modal-pay" class="fieldhint" style="display:none"></div>
+    <div class="fieldhint">«Зафиксировать»: заказ отмечается «в производстве», количество появится в «Едет».
+      «Черновиком»: заказ сохраняется без отправки и на «Едет» не влияет, отправить можно из списка заказов.
       Документ в МойСкладе создаётся отдельным действием.</div>
     <div class="actions">
       <button class="abtn" type="button" id="btn-order-cancel">Отмена</button>
+      <button class="abtn" type="button" id="btn-order-draft">Сохранить черновиком</button>
       <button class="abtn primary" type="button" id="btn-order-submit">Зафиксировать размещение</button>
     </div>
   </div>
@@ -2179,12 +2182,32 @@
       warnEl.textContent="⚠ У "+fmt(lowN)+" "+plural(lowN,"позиции","позиций","позиций")+
         " спрос заметно ниже минимальной партии — такой заказ может пролежать на складе. Снимите галочку, если он не нужен.";
     }else warnEl.style.display="none";
+    // Прогон 14.11 (финдир): окно ставило заказ в производство, не показав,
+    // когда и сколько платить. Календарь тот же, что заказ получит после
+    // создания, плюс что уже причитается по открытым заказам в эти даты.
+    var payEl=document.getElementById("order-modal-pay");
+    payEl.style.display="none"; payEl.textContent="";
+    if(cost>0){
+      api("/api/orders/payment-preview?cost="+Math.round(cost)+(ACTIVE_PROD?("&production_id="+ACTIVE_PROD):""))
+        .then(function(d){
+          var ps=d.payments||[];
+          if(!ps.length) return;
+          var lines=ps.map(function(x){
+            return new Date(x.date).toLocaleDateString("ru-RU",{day:"numeric",month:"short"})+": "+x.label+", "+fmtMoneyShort(x.amount);
+          });
+          payEl.innerHTML="<b>Платежи по этому заказу</b> (по условиям производства): "+esc(lines.join("; "))+"."+
+            (d.open_due>0?(" По уже открытым заказам до "+new Date(d.until).toLocaleDateString("ru-RU",{day:"numeric",month:"short"})+
+              " причитается ещё "+esc(fmtMoneyShort(d.open_due))+"."):"");
+          payEl.style.display="block";
+        }).catch(function(){});
+    }
     orderModal.classList.add("open");
   });
   document.getElementById("btn-order-cancel").addEventListener("click",function(){ orderModal.classList.remove("open"); });
   orderModal.addEventListener("click",function(e){ if(e.target===orderModal) orderModal.classList.remove("open"); });
-  document.getElementById("btn-order-submit").addEventListener("click",function(){
-    var btn=this;
+  document.getElementById("btn-order-submit").addEventListener("click",function(){ submitOrder(this,true); });
+  document.getElementById("btn-order-draft").addEventListener("click",function(){ submitOrder(this,false); });
+  function submitOrder(btn, send){
     var name=document.getElementById("order-name").value.trim()||"Заказ на производство";
     var eta=document.getElementById("order-eta").value||null;
     var payload={name:name,eta_date:eta,production_id:ACTIVE_PROD,items:checkedItems().map(function(it){
@@ -2200,7 +2223,8 @@
       // Заказ склеен с уже существующим (защита от случайного повтора) —
       // об этом надо сказать словами, а не молча показать чужой заказ.
       if(r.duplicate) alert(r.message);
-      created={id:r.id,name:name,duplicate:!!r.duplicate};
+      created={id:r.id,name:name,duplicate:!!r.duplicate,draft:!send};
+      if(!send) return null;
       return api("/api/orders/"+r.id+"/status",{method:"POST",body:{status:"sent"}});
     }).then(function(){
       orderModal.classList.remove("open");
@@ -2209,7 +2233,7 @@
     }).then(function(){
       if(created) announceCreated(created);
     }).catch(function(e){ btn.disabled=false; alert("Не удалось создать заказ: "+e.message); });
-  });
+  }
 
   /* Отзыв после создания: словами — что создано, и глазами — где оно.
      Новый заказ подсвечивается и прокручивается в окно; если сообщение и
@@ -2225,6 +2249,8 @@
     var where=row?" Он выделен в списке ниже":"";
     el.textContent=c.duplicate
       ? "Такой заказ уже есть: «"+nm+"»."+where+(where?".":"")
+      : c.draft
+      ? "Черновик «"+nm+"» сохранён, в «Едет» он не учтён."+where+(where?".":"")
       : "Заказ «"+nm+"» создан и отправлен в производство."+where+
         (where?", его количество учтено в колонке «Едет».":"");
     el.dataset.order=String(c.id);
