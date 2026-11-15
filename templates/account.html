@@ -30,7 +30,7 @@
         <span class="avatar">{{ (user.name or user.email)[:1]|upper }}</span>
         <div>
           <div class="nm">{{ user.name or user.email }}</div>
-          <div class="em">{{ user.email }} · <span id="acc-role">…</span> организации «{{ org.name }}»</div>
+          <div class="em">{{ user.email }} · роль <span id="acc-role">…</span> в организации «{{ org.name }}»</div>
         </div>
       </div>
       <div class="hint" style="margin-top:12px;">
@@ -38,6 +38,10 @@
         подключение к данным — на странице <a href="/settings">Настройки</a>,
         тарифы и оплата — на странице <a href="/plans">Тарифы</a>.
       </div>
+      <div class="hint need-users_manage" style="margin-top:8px;">
+        Сотрудники, их роли и приглашения: <a href="/team">Сотрудники и роли</a>.
+      </div>
+      <div id="orgs-box" style="display:none;margin-top:12px;"></div>
     </div>
   </div>
 
@@ -90,12 +94,36 @@ document.addEventListener("DOMContentLoaded", function () {
   api("/api/account").then(function (d) {
     acc = d || {};
     document.getElementById("acc-role").textContent =
-      acc.role === "owner" ? "владелец" : "участник";
+      "«" + (acc.role_name || (acc.role === "owner" ? "Владелец" : "Сотрудник")) + "»";
     renderDelete();
   }).catch(function () {
     document.getElementById("del-box").innerHTML =
       '<p class="hint" style="margin:0;">Не удалось загрузить данные аккаунта.</p>';
   });
+
+  // ── Мои организации (ревью Codex #110): переключение между членствами ──
+  api("/api/account/orgs").then(function (d) {
+    var list = (d && d.orgs) || [];
+    if (list.length < 2) return;
+    var box = document.getElementById("orgs-box");
+    function e(s){ return String(s==null?"":s).replace(/[&<>"']/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c];}); }
+    box.innerHTML = '<div class="hint" style="margin-bottom:6px;">Вы состоите в нескольких организациях:</div>' +
+      list.map(function (o) {
+        return '<div style="display:flex;gap:8px;align-items:center;margin:4px 0;">' +
+          '<span style="flex:1">«' + e(o.name) + '», роль «' + e(o.role_name) + '»</span>' +
+          (o.current ? '<span class="hint">сейчас здесь</span>'
+            : '<button class="btn" type="button" data-org="' + o.org_id + '">Перейти</button>') + '</div>';
+      }).join("");
+    box.style.display = "";
+    box.addEventListener("click", function (ev) {
+      var b = ev.target.closest("[data-org]");
+      if (!b) return;
+      b.disabled = true;
+      api("/api/account/switch-org", {method: "POST", body: {org_id: +b.getAttribute("data-org")}})
+        .then(function (r) { location.href = (r && r.redirect) || "/"; })
+        .catch(function (err) { b.disabled = false; toast("Не удалось перейти: " + err.message, "error"); });
+    });
+  }).catch(function () {});
 
   // ── Смена пароля ──────────────────────────────────────────────────────────
   document.getElementById("btn-pw").addEventListener("click", function () {
@@ -152,7 +180,9 @@ document.addEventListener("DOMContentLoaded", function () {
     var others = acc.others || [];
     var html = "";
 
-    if (acc.role !== "owner") {
+    // Владелец при втором владельце уходит сам, организация остаётся (роли).
+    var otherOwner = others.some(function (o) { return o.role === "owner"; });
+    if (acc.role !== "owner" || otherOwner) {
       html += '<p style="margin:0 0 6px; font-size:13px;">Будет удалён <b>только ваш аккаунт</b>: ' +
         "вход в «Оборот» под " + esc(acc.user.email) + " перестанет работать.</p>" +
         '<p style="margin:0 0 10px; font-size:13px;">Данные организации «' + esc(acc.org.name) +

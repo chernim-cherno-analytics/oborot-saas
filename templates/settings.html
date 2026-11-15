@@ -318,7 +318,7 @@
     <div class="card-head">
       <h2>Команда</h2>
       <div class="spacer"></div>
-      <button class="btn sm" type="button" id="btn-invite">Пригласить</button>
+      <button class="btn sm need-users_manage" type="button" id="btn-invite">Пригласить</button>
     </div>
     <div class="card-body" id="team-box"><div class="loading-stub">Загрузка…</div></div>
   </div>
@@ -331,6 +331,13 @@
 <script>
 document.addEventListener("DOMContentLoaded", function () {
   var settings = null;
+  // Роли (15.11.2026): решает право settings, а не «владелец или нет».
+  function canSettings(st) {
+    return !!(st && st.perms && st.perms.indexOf("settings") >= 0);
+  }
+  function canTeam(st) {
+    return !!(st && st.perms && st.perms.indexOf("users_manage") >= 0);
+  }
 
   api("/api/settings").then(function (d) {
     settings = d || {};
@@ -362,11 +369,11 @@ document.addEventListener("DOMContentLoaded", function () {
       document.getElementById("conn-box").innerHTML =
         '<p class="muted" style="margin:0;">Статус подключения сейчас неизвестен — обновите страницу позже.</p>';
     } else {
-      renderConnection(connField, settings.role === "owner");
+      renderConnection(connField, canSettings(settings));
     }
-    renderTeam(settings.members || []);
+    renderTeam(settings.members || [], canTeam(settings));
     renderPriceTypes(settings);
-    loadChannels(settings.role === "owner");
+    loadChannels(canSettings(settings));
     loadExclusions();
   }).catch(function () {
     document.getElementById("wh-box").innerHTML = '<p class="muted" style="margin:0;">Не удалось загрузить.</p>';
@@ -466,7 +473,7 @@ document.addEventListener("DOMContentLoaded", function () {
   // ── Цены из МойСклада ──────────────────────────────────────────────────────
   function renderPriceTypes(st) {
     var types = st.price_types || [];
-    var isOwner = st.role === "owner";
+    var isOwner = canSettings(st);
     function fill(id, cur) {
       var sel = document.getElementById(id);
       var opts = ['<option value="">— угадывать по названию —</option>'];
@@ -721,7 +728,7 @@ document.addEventListener("DOMContentLoaded", function () {
     document.getElementById("chan-tools").hidden = false;
     box.innerHTML = CHAN.map(chanCard).join("") +
       '<div id="chan-nomatch"></div><div id="chan-more"></div>' +
-      (CHAN_OWNER ? "" : '<div class="hint">Менять условия производства может только владелец.</div>');
+      (CHAN_OWNER ? "" : '<div class="hint">Менять условия производства может сотрудник с правом «Настройки».</div>');
     chanWire();
     CHAN.forEach(function (p) { chanRecalc(p.id); });
     chanApplyView();
@@ -1103,7 +1110,7 @@ document.addEventListener("DOMContentLoaded", function () {
     if (conn && conn.kind === "moysklad" && isOwner) {
       // Инцидент 21.08: после смены токена пользователю негде было запустить
       // синхронизацию — теперь кнопка здесь же, со строкой прогресса.
-      // Только владельцу: ручки /api/sync/* owner-only, участнику они дали бы 403.
+      // Только с правом settings: без него ручки /api/sync/* дали бы 403.
       html += '<div style="display:flex; align-items:center; gap:10px; margin-top:16px; flex-wrap:wrap;">' +
         '<button class="btn" type="button" id="btn-sync-now">Синхронизировать сейчас</button>' +
         '<button class="btn" type="button" id="btn-sync-rebuild" style="font-size:12px;">Полная пересборка истории</button>' +
@@ -1236,22 +1243,27 @@ document.addEventListener("DOMContentLoaded", function () {
     }
   }
 
-  function renderTeam(members) {
+  function renderTeam(members, canManage) {
     var box = document.getElementById("team-box");
-    var ROLE = { owner: "Владелец", member: "Участник" };
+    var inv = document.getElementById("btn-invite");
+    if (inv) inv.style.display = canManage ? "" : "none";
+    var manage = canManage
+      ? '<div style="margin-top:10px;"><a href="/team">Сотрудники и роли: роли, права и приглашения</a></div>'
+      : "";
     if (!members.length) {
       box.innerHTML = '<div class="member-row"><span class="avatar">{{ (user.name or user.email)[:1]|upper }}</span>' +
         '<div style="flex:1;"><div style="font-weight:500;">{{ user.name }}</div>' +
         '<div style="font-size:12px; color:var(--text-soft);">{{ user.email }}</div></div>' +
-        '<span class="badge blue">Владелец</span></div>';
+        '<span class="badge blue">Владелец</span></div>' + manage;
       return;
     }
     box.innerHTML = members.map(function (m) {
+      var label = m.role_name || (m.role === "owner" ? "Владелец" : "Сотрудник");
       return '<div class="member-row"><span class="avatar">' + esc((m.name || m.email || "?")[0].toUpperCase()) + "</span>" +
         '<div style="flex:1;"><div style="font-weight:500;">' + esc(m.name || "") + "</div>" +
         '<div style="font-size:12px; color:var(--text-soft);">' + esc(m.email || "") + "</div></div>" +
-        '<span class="badge ' + (m.role === "owner" ? "blue" : "gray") + '">' + (ROLE[m.role] || esc(m.role || "")) + "</span></div>";
-    }).join("");
+        '<span class="badge ' + (m.role === "owner" ? "blue" : "gray") + '">' + esc(label) + "</span></div>";
+    }).join("") + manage;
   }
 
   // ── Уведомления (Telegram) ────────────────────────────────────────────────
@@ -1274,7 +1286,7 @@ document.addEventListener("DOMContentLoaded", function () {
     }
   }).catch(function () {
     document.getElementById("notify-box").innerHTML =
-      '<p class="muted" style="margin:0;">Настройки уведомлений доступны только владельцу организации.</p>';
+      '<p class="muted" style="margin:0;">Настройки уведомлений доступны роли с правом «Настройки».</p>';
   });
 
   document.getElementById("btn-save-notify").addEventListener("click", function () {
@@ -1319,7 +1331,7 @@ document.addEventListener("DOMContentLoaded", function () {
     }
   }).catch(function () { /* тариф не критичен для страницы — молчим */ });
   document.getElementById("btn-invite").addEventListener("click", function () {
-    toast("Приглашения в команду скоро появятся. Пока напишите в поддержку — добавим коллег вручную.");
+    location.href = "/team#invite";
   });
 });
 </script>

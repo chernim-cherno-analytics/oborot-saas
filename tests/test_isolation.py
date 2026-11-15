@@ -587,6 +587,15 @@ def run_all() -> None:
     check("в организации B есть план заказа для проверок", plan_b is not None,
           f"status={rb.status_code} {rb.text[:120]}")
 
+    # Роли сотрудников (15.11.2026): своя роль, приглашение и человек B.
+    rrole = b.post("/api/team/roles", json={"name": SECRET[:60], "perms": ["plan"]})
+    role_b = rrole.json().get("created_role_id") if rrole.status_code == 200 else None
+    rinv = b.post("/api/team/invites", json={"role_id": role_b}) if role_b else None
+    invite_b = rinv.json().get("id") if rinv is not None and rinv.status_code == 200 else None
+    user_b = sql("SELECT user_id FROM memberships WHERE org_id=? LIMIT 1", org_b)[0][0]
+    check("в организации B есть роль и приглашение для проверок",
+          role_b is not None and invite_b is not None, f"role={role_b} invite={invite_b}")
+
     # ── 1. Прямой доступ по чужому идентификатору ────────────────────────────
     print("\n== 1. Чужой идентификатор в пути: ожидаем 403/404, никогда 200 и никогда 5xx ==")
     # Первый столбец — ЗАРЕГИСТРИРОВАННЫЙ шаблон маршрута, третий — значения
@@ -648,6 +657,13 @@ def run_all() -> None:
          {"batch_id": batch_b}, {"op_id": "iso-x10"}),
         ("/api/supply/planning/batches/{batch_id}/restore", "POST",
          {"batch_id": batch_b}, {"op_id": "iso-x11"}),
+        # Роли сотрудников (15.11.2026): чужой человек, чужая роль, чужое
+        # приглашение неотличимы от несуществующих.
+        ("/api/team/members/{user_id}/role", "POST", {"user_id": user_b}, {"role_id": role_b or 1}),
+        ("/api/team/members/{user_id}/remove", "POST", {"user_id": user_b}, {}),
+        ("/api/team/roles/{role_id}", "POST", {"role_id": role_b}, {"name": "Захвачено"}),
+        ("/api/team/roles/{role_id}/delete", "POST", {"role_id": role_b}, {}),
+        ("/api/team/invites/{invite_id}/revoke", "POST", {"invite_id": invite_b}, {}),
     ]
     answers = {}
     for route, method, params, body in cases:

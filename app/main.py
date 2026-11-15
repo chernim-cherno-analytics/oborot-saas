@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 
 from app import auth
 from app import logging_conf
+from app import roles
 from app import subscription
 
 # Настраиваем логирование ДО создания приложения и до первого вызова
@@ -32,6 +33,7 @@ from app.routes_ms_app import router as ms_app_router
 from app.routes_ms_vendor import router as ms_vendor_router
 from app.routes_supply import router as supply_router
 from app.routes_supply_planning import router as supply_planning_router
+from app.routes_team import router as team_router
 from app.db import get_db, init_db, record_migration_step, validate_migration_step
 from app.models import Connection, Membership, Org, Product, ProductionOrder, Sale, User
 
@@ -58,6 +60,8 @@ app.include_router(ms_app_router)
 # «Едет» и формулы, и физическая отдельность делает это проверяемым.
 app.include_router(supply_router)
 app.include_router(supply_planning_router)
+# Роли сотрудников и приглашения (решение владельца 15.11.2026).
+app.include_router(team_router)
 
 
 #: Потолок тела JSON для пишущих ручек «Поставок» (ТЗ F-25). Один мегабайт —
@@ -292,6 +296,10 @@ app.add_middleware(GZipMiddleware, minimum_size=1024)
 from app import scheduler as _scheduler  # noqa: E402
 _scheduler.attach(app)
 templates = Jinja2Templates(directory=[str(d) for d in TEMPLATE_DIRS])
+# Роли (15.11.2026): полный список прав для _perms_css.html. Страница, в
+# контекст которой права не положили, считается страницей со всеми правами
+# (как прежний default('owner')); сервер всё равно проверяет каждое действие.
+templates.env.globals["perm_keys"] = roles.PERM_KEYS
 
 if STATIC_DIR.is_dir():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
@@ -409,6 +417,10 @@ STARTUP_SCHEMA_STEPS: tuple[tuple[str, int], ...] = (
     # любой базе, где те шаги записаны. Собственный, ещё не выпущенный номер
     # подвинуть можно; чужой выпущенный — нет.
     ("models.ensure_supply_sketch_thumb_schema", 17),
+    # Роли сотрудников (решение владельца 15.11.2026): две новые таблицы и
+    # нуллируемая колонка memberships.role_id. Append-only, позиция 18 новая,
+    # семнадцать прежних пар не тронуты.
+    ("models.ensure_roles_schema", 18),
 )
 _STARTUP_STEP_ORDER = dict(STARTUP_SCHEMA_STEPS)
 
@@ -622,6 +634,9 @@ def _startup() -> None:
     # пакета — в том же порядке, в каком они объявлены выше.
     _startup_step("models.ensure_supply_sketch_thumb_schema",
                   _models.ensure_supply_sketch_thumb_schema)
+    # Роли сотрудников: таблицы org_roles, org_invites и колонка
+    # memberships.role_id. Ничего не читает и не переписывает.
+    _startup_step("models.ensure_roles_schema", _models.ensure_roles_schema)
     # Замок на пропуск: все объявленные шаги выполнены, и ровно они.
     _finish_startup_steps()
     global _STARTUP_DONE
@@ -764,6 +779,11 @@ def _page(request: Request, ctx: auth.AuthContext, template: str, active: str, p
             # SEC-2 (D-69): роль для интерфейса. Закрытые владельцу действия
             # участнику не показываются; сервер всё равно отвечает 403.
             "role": ctx.role,
+            # Роли (15.11.2026): права для интерфейса. На body печатается
+            # data-perms, и _perms_css.html прячет действия, на которые прав
+            # нет. Сервер всё равно отвечает 403 (auth.require_perm).
+            "perms": sorted(ctx.perms),
+            "role_name": ctx.role_name,
             "page_title": page_title,
             "embedded": embedded,
             # Состояние подписки в контекст страницы. Нужно ровно для одного:
@@ -1088,6 +1108,9 @@ def api_account(
     return {
         "user": {"name": ctx.user.name, "email": ctx.user.email},
         "role": ctx.role,
+        # Роли (15.11.2026): название роли и доступ к разделу «Сотрудники и роли».
+        "role_name": ctx.role_name,
+        "can_manage_team": ctx.can("users_manage"),
         "org": {"name": ctx.org.name, "plan": ctx.org.plan},
         "others": [
             {"name": u.name, "email": u.email, "role": m.role} for u, m in others
@@ -1290,12 +1313,62 @@ def _purge_user(db: Session, user_id: int) -> None:
     db.execute(delete(User).where(User.id == user_id))
 
 
+class SwitchOrgIn(BaseModel):
+    org_id: int = Field(ge=1, le=2_147_483_647)
+
+
+@app.get("/api/account/orgs")
+def api_account_orgs(
+    ctx: auth.AuthContext = Depends(auth.require_auth_api), db: Session = Depends(get_db)
+):
+    """Организации, в которых человек состоит (роли, ревью Codex #110).
+
+    Приглашение во вторую организацию добавляет членство, а вход по паролю
+    берёт первое: без переключателя после выхода вернуться во вторую было
+    нельзя. Здесь список, переключение ниже.
+    """
+    from app import roles as _roles
+    rows = db.execute(
+        select(Membership, Org).join(Org, Org.id == Membership.org_id)
+        .where(Membership.user_id == ctx.user.id).order_by(Org.name)
+    ).all()
+    out = []
+    for m, o in rows:
+        _p, role_name = _roles.member_perms(db, m)
+        out.append({"org_id": o.id, "name": o.name, "role_name": role_name,
+                    "current": o.id == ctx.org.id})
+    return {"orgs": out}
+
+
+@app.post("/api/account/switch-org")
+def api_account_switch_org(
+    body: SwitchOrgIn, request: Request,
+    ctx: auth.AuthContext = Depends(auth.require_auth_api), db: Session = Depends(get_db),
+):
+    """Перейти в другую свою организацию: только по существующему членству."""
+    member = db.get(Membership, (ctx.user.id, body.org_id))
+    if member is None:
+        raise HTTPException(status_code=404, detail="Организация не найдена")
+    response = JSONResponse({"ok": True, "redirect": "/"})
+    samesite = "none" if (auth.read_embed(request) and is_prod()) else "lax"
+    auth.set_session(response, ctx.user.id, body.org_id, ctx.user.session_version, samesite=samesite)
+    return response
+
+
 @app.post("/api/account/delete")
 def api_delete_account(
     body: AccountDeleteIn,
     ctx: auth.AuthContext = Depends(auth.require_auth_api),
     db: Session = Depends(get_db),
 ):
+    """Удаление аккаунта под замком владельцев (ревью Codex #110, P1): два
+    владельца, удаляющие себя одновременно, не оставят организацию без хозяина."""
+    from app import routes_team
+    with routes_team._OWNER_LOCK:
+        return _delete_account_impl(body, ctx, db)
+
+
+def _delete_account_impl(body: AccountDeleteIn, ctx: auth.AuthContext, db: Session):
     """Удаление аккаунта. Подтверждение — пароль + слово «УДАЛИТЬ».
 
     Три разных случая, и они правда разные:
@@ -1325,8 +1398,30 @@ def api_delete_account(
     others = [(u, m) for u, m in members if u.id != ctx.user.id]
     org_id, user_id = ctx.org.id, ctx.user.id
 
-    # Участник (не владелец): уходит только он.
-    if ctx.role != "owner":
+    # Удаление аккаунта снимает человека из ВСЕХ организаций (_purge_user).
+    # Если в другой организации он единственный владелец, она осталась бы
+    # без хозяина и без доступа к данным (ревью Codex #110, P1). Сначала
+    # передайте её или удалите, находясь в ней.
+    orphaned = []
+    for m in db.execute(select(Membership).where(
+            Membership.user_id == user_id, Membership.org_id != org_id,
+            Membership.role == "owner")).scalars().all():
+        owners = db.execute(select(func.count()).select_from(Membership).where(
+            Membership.org_id == m.org_id, Membership.role == "owner")).scalar() or 0
+        if owners <= 1:
+            o = db.get(Org, m.org_id)
+            orphaned.append(o.name if o else f"№{m.org_id}")
+    if orphaned:
+        raise HTTPException(
+            status_code=422,
+            detail="Вы единственный владелец в другой организации: " + ", ".join(orphaned[:5])
+                   + ". Передайте её коллеге или удалите, находясь в ней, затем удаляйте аккаунт.",
+        )
+
+    # Участник (не владелец): уходит только он. Так же уходит владелец, у
+    # которого в организации есть ещё один владелец (роли, 15.11.2026):
+    # организация остаётся под управлением второго владельца.
+    if ctx.role != "owner" or any(m.role == "owner" for _u, m in others):
         _purge_user(db, user_id)
         db.commit()
         return _deleted_response("account", 0)
@@ -1352,6 +1447,9 @@ def api_delete_account(
                     detail="Выберите, кому передать организацию — из списка её участников",
                 )
             target[1].role = "owner"
+            # Роль «Владелец» решает memberships.role; ссылка на прежнюю роль
+            # сотрудника ему больше не нужна (app/roles.py).
+            target[1].role_id = None
             _purge_user(db, user_id)
             db.commit()
             return _deleted_response("account", 0)
@@ -1455,7 +1553,7 @@ def onboarding_preview_page(request: Request, db: Session = Depends(get_db)):
     ctx = auth.resolve_auth(request, db)
     if ctx is None:
         return RedirectResponse("/login", status_code=302)
-    if ctx.role != "owner":
+    if not ctx.can("settings"):
         return RedirectResponse(ONBOARDING_PREVIEW_DENY_REDIRECT, status_code=302)
     return _page(request, ctx, "onboarding_preview.html", "onboarding",
                  "Предпросмотр онбординга", db=db)
@@ -1483,7 +1581,7 @@ def supply_page(request: Request, db: Session = Depends(get_db)):
     # вкладку, а потом потерять её после ответа API, которого для него нет.
     from app import routes_supply as _routes_supply
     return _page(request, ctx, "supply.html", "supply", "Поставки", db=db,
-                 extra={"role": ctx.role,
+                 extra={"role": roles.ui_role(ctx, "supply_edit"),
                         "sheets_preview":
                             _routes_supply.preview_enabled(ctx.org)})
 

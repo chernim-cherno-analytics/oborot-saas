@@ -10,7 +10,7 @@ from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session
 
 from app import analytics, lessons, ms_writeback, order_planner, subscription
-from app.auth import AuthContext, require_auth_api, require_owner_api
+from app.auth import AuthContext, require_auth_api, require_perm
 from app.crypto import encrypt_token
 from app.db import get_db
 from app.demo_seed import seed_demo
@@ -522,7 +522,7 @@ def _find_twin_order(db: Session, org_id: int, fingerprint: str, before_id: int 
 
 @router.post("/orders")
 def api_create_order(
-    body: OrderIn, ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)
+    body: OrderIn, ctx: AuthContext = Depends(require_perm("orders_create")), db: Session = Depends(get_db)
 ):
     """Создаёт заказ на производство. Повторная отправка того же заказа в
     течение пары минут не плодит дубли: возвращается уже созданный заказ.
@@ -1038,7 +1038,7 @@ class OrderStatusIn(BaseModel):
 def api_order_status(
     body: OrderStatusIn,
     order_id: int = _id_path(),
-    ctx: AuthContext = Depends(require_auth_api),
+    ctx: AuthContext = Depends(require_perm("orders_manage")),
     db: Session = Depends(get_db),
 ):
     """Переходы статуса: draft → sent («В производстве») → received («Принят на склад»).
@@ -1215,7 +1215,7 @@ def api_order_receipts(
 def api_order_receipts_add(
     body: ReceiptsIn,
     order_id: int = _id_path(),
-    ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db),
+    ctx: AuthContext = Depends(require_perm("orders_manage")), db: Session = Depends(get_db),
 ):
     """Дописать факт приёмки (частичный приход, довоз, исправление минусом).
 
@@ -1295,7 +1295,7 @@ def api_order_receipts_add(
 
 @router.delete("/orders/{order_id}")
 def api_order_delete(
-    order_id: int = _id_path(), ctx: AuthContext = Depends(require_owner_api), db: Session = Depends(get_db)
+    order_id: int = _id_path(), ctx: AuthContext = Depends(require_perm("orders_delete")), db: Session = Depends(get_db)
 ):
     """Удаление заказа: draft — свободно; sent — с вычетом из «едет»; received — нельзя."""
     order = db.get(ProductionOrder, order_id)
@@ -1414,7 +1414,7 @@ class OrderedIn(BaseModel):
 
 @router.post("/ordered")
 def api_set_ordered(
-    body: OrderedIn, ctx: AuthContext = Depends(require_owner_api), db: Session = Depends(get_db)
+    body: OrderedIn, ctx: AuthContext = Depends(require_perm("ordered_edit")), db: Session = Depends(get_db)
 ):
     """Ручная правка «едет к нам» (перезапись значения по базовому имени)."""
     _require_known_base(db, ctx.org.id, body.base_name)
@@ -1462,10 +1462,11 @@ def api_settings(ctx: AuthContext = Depends(require_auth_api), db: Session = Dep
         select(Connection).where(Connection.org_id == org.id).order_by(Connection.id.desc())
     ).scalars().first()
     members = db.execute(
-        select(User.name, User.email, Membership.role)
+        select(User.name, User.email, Membership)
         .join(Membership, Membership.user_id == User.id)
         .where(Membership.org_id == org.id)
     ).all()
+    from app import roles as _roles
     settings = org.settings
     extra = analytics.extra_settings(org)
     return {
@@ -1516,8 +1517,12 @@ def api_settings(ctx: AuthContext = Depends(require_auth_api), db: Session = Dep
             if conn
             else None
         ),
-        "members": [{"name": n, "email": e, "role": r} for n, e, r in members],
-        "role": ctx.role,  # фронт прячет owner-only кнопки (синк) от участников
+        "members": [{"name": n, "email": e, "role": m.role,
+                     "role_name": _roles.member_perms(db, m)[1]} for n, e, m in members],
+        "role": ctx.role,
+        # Роли (15.11.2026): фронт прячет действия, на которые нет прав.
+        "perms": sorted(ctx.perms),
+        "role_name": ctx.role_name,
     }
 
 
@@ -1560,7 +1565,7 @@ class SettingsIn(BaseModel):
 
 @router.post("/settings")
 def api_update_settings(
-    body: SettingsIn, ctx: AuthContext = Depends(require_owner_api), db: Session = Depends(get_db)
+    body: SettingsIn, ctx: AuthContext = Depends(require_perm("settings")), db: Session = Depends(get_db)
 ):
     org = db.merge(ctx.org)
     # Поверх сырых настроек, а не только известных ключей: Org.settings отдаёт
@@ -1651,7 +1656,7 @@ class ExclusionIn(BaseModel):
 
 @router.post("/exclusions")
 def api_set_exclusion(
-    body: ExclusionIn, ctx: AuthContext = Depends(require_owner_api), db: Session = Depends(get_db)
+    body: ExclusionIn, ctx: AuthContext = Depends(require_perm("catalog_edit")), db: Session = Depends(get_db)
 ):
     """Включить/исключить базовую позицию (все размеры разом)."""
     rows = db.execute(
@@ -1670,7 +1675,7 @@ def api_set_exclusion(
 
 @router.post("/warehouses/{warehouse_id}/toggle")
 def api_toggle_warehouse(
-    warehouse_id: int = _id_path(), ctx: AuthContext = Depends(require_owner_api), db: Session = Depends(get_db)
+    warehouse_id: int = _id_path(), ctx: AuthContext = Depends(require_perm("settings")), db: Session = Depends(get_db)
 ):
     wh = db.get(Warehouse, warehouse_id)
     if wh is None or wh.org_id != ctx.org.id:
@@ -1707,7 +1712,7 @@ def api_toggle_warehouse(
 # Демо-данные закрыты гейтом (как и всё пишущее): seed_demo начинается с
 # полного стирания данных организации.
 @router.post("/connect/demo")
-def api_connect_demo(ctx: AuthContext = Depends(require_owner_api), db: Session = Depends(get_db)):
+def api_connect_demo(ctx: AuthContext = Depends(require_perm("settings")), db: Session = Depends(get_db)):
     """Создаёт demo-подключение и сеет синтетические данные (детерминированно)."""
     org = ctx.org
     # Аудит 18.08: seed_demo начинается с clear_org_data — раньше кнопка демо
@@ -1806,7 +1811,7 @@ class MoyskladConnectIn(BaseModel):
 @router.post("/connect/moysklad")
 def api_connect_moysklad(
     body: MoyskladConnectIn,
-    ctx: AuthContext = Depends(require_owner_api),
+    ctx: AuthContext = Depends(require_perm("settings")),
     db: Session = Depends(get_db),
 ):
     """Сохраняет шифрованный токен МойСклад; синхронизация — вне демо-скоупа."""
@@ -2241,7 +2246,7 @@ def api_productions(ctx: AuthContext = Depends(require_auth_api), db: Session = 
 
 @router.post("/productions")
 def api_production_create(
-    body: ProductionIn, ctx: AuthContext = Depends(require_owner_api), db: Session = Depends(get_db)
+    body: ProductionIn, ctx: AuthContext = Depends(require_perm("settings")), db: Session = Depends(get_db)
 ):
     """Добавить дополнительное производство (если заказами занимается другой отдел).
 
@@ -2300,7 +2305,7 @@ class AssignRuleIn(BaseModel):
 @router.post("/productions/assign-rule")
 def api_assign_rule(
     body: AssignRuleIn,
-    ctx: AuthContext = Depends(require_owner_api), db: Session = Depends(get_db),
+    ctx: AuthContext = Depends(require_perm("settings")), db: Session = Depends(get_db),
 ):
     """Правило распределения позиций по производствам."""
     from app import assign_rules
@@ -2332,7 +2337,7 @@ def api_assign_rule(
 @router.post("/productions/assign")
 def api_production_assign(
     body: ProductionAssignIn,
-    ctx: AuthContext = Depends(require_owner_api), db: Session = Depends(get_db),
+    ctx: AuthContext = Depends(require_perm("settings")), db: Session = Depends(get_db),
 ):
     """Перенести позицию на производство (production_id=null — на основное).
 
@@ -2369,7 +2374,7 @@ def api_production_assign(
 def api_production_rename(
     body: ProductionIn,
     pid: int = _id_path(),
-    ctx: AuthContext = Depends(require_owner_api), db: Session = Depends(get_db),
+    ctx: AuthContext = Depends(require_perm("settings")), db: Session = Depends(get_db),
 ):
     """Переименовать производство и задать его условия (основное — тоже можно).
 
@@ -2390,7 +2395,7 @@ def api_production_rename(
 
 @router.delete("/productions/{pid}")
 def api_production_delete(
-    pid: int = _id_path(), ctx: AuthContext = Depends(require_owner_api), db: Session = Depends(get_db)
+    pid: int = _id_path(), ctx: AuthContext = Depends(require_perm("settings")), db: Session = Depends(get_db)
 ):
     """Удалить дополнительное производство; его позиции возвращаются на основное.
 
@@ -2414,7 +2419,7 @@ def api_production_delete(
 
 @router.post("/ordered/add")
 def api_add_ordered(
-    body: OrderedIn, ctx: AuthContext = Depends(require_owner_api), db: Session = Depends(get_db)
+    body: OrderedIn, ctx: AuthContext = Depends(require_perm("ordered_edit")), db: Session = Depends(get_db)
 ):
     """«Заказ отправлен» со страницы «Заказ отдельной позиции»: ПРИБАВЛЯЕТ
     количество к «едет к нам» (в отличие от /ordered, который перезаписывает).
@@ -2933,7 +2938,7 @@ def api_order_plan_options(
 
 @router.post("/order-plan/preview")
 def api_order_plan_preview(
-    body: OrderPlanIn, ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)
+    body: OrderPlanIn, ctx: AuthContext = Depends(require_perm("plan")), db: Session = Depends(get_db)
 ):
     """Предпросмотр плана: ничего не сохраняет, дергается на каждое изменение анкеты."""
     return _plan(db, ctx, body)
@@ -2941,7 +2946,7 @@ def api_order_plan_preview(
 
 @router.post("/order-plan")
 def api_order_plan_save(
-    body: OrderPlanIn, ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db)
+    body: OrderPlanIn, ctx: AuthContext = Depends(require_perm("plan")), db: Session = Depends(get_db)
 ):
     """Сохранить план (бриф + вывод системы + результат) для истории и предзаполнения."""
     from app.models import OrderPlan
@@ -3294,7 +3299,7 @@ def _find_duplicate_order(db: Session, org_id: int, production_id, bases: set) -
 @router.post("/order-plan/{plan_id}/apply")
 def api_order_plan_apply(
     body: PlanApplyIn, plan_id: int = _id_path(),
-    ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db),
+    ctx: AuthContext = Depends(require_perm("orders_create")), db: Session = Depends(get_db),
 ):
     """План → «Заказ на производство» (дальше существующий путь: в МойСклад, Excel)."""
     from app.models import OrderPlan
@@ -3405,7 +3410,7 @@ def api_production_setup(
     pid: int = _id_path(),
     # Этапы, сроки и минимальная партия — это деньги и обязательства перед
     # подрядчиком: менять их может владелец, как и переименование с удалением.
-    ctx: AuthContext = Depends(require_owner_api), db: Session = Depends(get_db),
+    ctx: AuthContext = Depends(require_perm("settings")), db: Session = Depends(get_db),
 ):
     from app import order_planner
     from app.models import Production

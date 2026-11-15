@@ -110,6 +110,16 @@ async def ms_app_entry(
 
     member = db.get(Membership, (user.id, org.id))
     if member is None:
+        # Владелец убрал этого сотрудника на странице «Сотрудники и роли»:
+        # вход из МойСклада не возвращает его сам (ревью Codex #110, P1).
+        from app.models import OrgRemoval
+        if db.get(OrgRemoval, (org.id, user.id)) is not None:
+            db.commit()
+            return _error_page(
+                403, "Доступ закрыт",
+                "Владелец убрал вас из организации в «Обороте». "
+                "Чтобы вернуться, попросите у него приглашение.",
+            )
         has_owner = db.execute(
             select(Membership.user_id).where(
                 Membership.org_id == org.id, Membership.role == "owner"
@@ -119,6 +129,17 @@ async def ms_app_entry(
             user_id=user.id, org_id=org.id,
             role="member" if has_owner else "owner",
         ))
+        db.commit()
+        if has_owner:
+            # Роли (15.11.2026): сотрудник аккаунта МойСклада получает роль
+            # «Сотрудник», то есть ровно прежние права участника. Отдельным
+            # коммитом после членства: ленивое создание встроенных ролей само
+            # коммитит и при гонке откатывает только свою вставку.
+            from app import roles as _roles
+            builtin = _roles.ensure_builtin_roles(db, org.id)
+            member = db.get(Membership, (user.id, org.id))
+            if member is not None and member.role == "member" and member.role_id is None:
+                member.role_id = builtin[_roles.EMPLOYEE].id
     db.commit()
 
     response = RedirectResponse("/", status_code=302)

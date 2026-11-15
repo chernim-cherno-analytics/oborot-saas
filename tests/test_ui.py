@@ -3676,7 +3676,7 @@ def _settings_compact_lists(browser, base: str) -> None:
         check("сотрудник: поиск и раскрытие работают, поля недоступны, кнопок сохранения нет",
               body.is_visible() and body.locator(".ch-cad").is_disabled()
               and page.locator("#chan-box .ch-save").count() == 0
-              and "только владелец" in (page.locator("#chan-box").text_content() or ""))
+              and "правом «Настройки»" in (page.locator("#chan-box").text_content() or ""))
         check("сотрудник: ни одного запроса записи", not log["posts"] or all("hints" in p for p, _ in log["posts"]),
               str(log["posts"])[:120])
     except Exception as exc:  # noqa: BLE001

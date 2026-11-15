@@ -217,6 +217,75 @@ class Membership(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), primary_key=True)
     org_id: Mapped[int] = mapped_column(ForeignKey("orgs.id"), primary_key=True)
     role: Mapped[str] = mapped_column(String(16), nullable=False, default="owner")  # owner|member
+    # Роли (решение владельца 15.11.2026, app/roles.py): ссылка на роль
+    # организации. Пустая у владельцев до ролей и у участников до ролей
+    # (их права = «Сотрудник»). Владение по-прежнему решает колонка role.
+    # Без внешнего ключа намеренно: принадлежность роли организации
+    # проверяет код (roles.member_perms), а аддитивный ALTER с REFERENCES
+    # ведёт себя по-разному в SQLite и Postgres. Колонка добавляется шагом
+    # старта 18 (models.ensure_roles_schema).
+    role_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+
+class OrgRole(Base):
+    """Роль организации: имя и набор прав (app/roles.py).
+
+    builtin: "" у своей роли, иначе код встроенной (owner, employee, viewer).
+    Встроенные создаются лениво (roles.ensure_builtin_roles); частичный
+    уникальный индекс не даёт двум одновременным запросам создать их дважды.
+    """
+
+    __tablename__ = "org_roles"
+    __table_args__ = (
+        Index("ux_org_roles_builtin", "org_id", "builtin", unique=True,
+              sqlite_where=text("builtin <> ''"), postgresql_where=text("builtin <> ''")),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    org_id: Mapped[int] = mapped_column(ForeignKey("orgs.id"), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(64), nullable=False)
+    perms_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    builtin: Mapped[str] = mapped_column(String(16), nullable=False, default="", server_default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+
+
+class OrgInvite(Base):
+    """Одноразовое приглашение в организацию по ссылке. Хранится ТОЛЬКО хеш токена.
+
+    Тот же подход, что у сброса пароля (D-63, PasswordReset): сам токен
+    показывается владельцу один раз, в базе остаётся sha256. Ссылка гаснет
+    при первом использовании, по сроку (7 дней) и при отзыве.
+    """
+
+    __tablename__ = "org_invites"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    org_id: Mapped[int] = mapped_column(ForeignKey("orgs.id"), nullable=False, index=True)
+    role_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    # Кто выпустил: авторство org-owned строки, не владение (tenancy).
+    created_by: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class OrgRemoval(Base):
+    """Сотрудник, которого убрали из организации (роли, 15.11.2026).
+
+    Нужна для входа из каталога МойСклада: каждый пользователь аккаунта МС,
+    открывший приложение, становится участником автоматически, и простое
+    удаление членства через минуту отменялось бы следующим входом (ревью
+    Codex #110, P1). Пока запись есть, вход из МС участника не создаёт;
+    вернуть человека можно только приглашением, которое запись снимает.
+    """
+
+    __tablename__ = "org_removals"
+
+    org_id: Mapped[int] = mapped_column(ForeignKey("orgs.id"), primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), primary_key=True)
+    removed_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
 
 
 # ── Восстановление доступа (PILOT-MANUAL-RECOVERY-1, D-63) ───────────────────
@@ -2116,3 +2185,38 @@ def ensure_supply_sketch_thumb_schema(bind=None) -> None:
     if "thumb" not in cols:
         run_migration_step(
             "ALTER TABLE supply_sketches ADD COLUMN thumb BLOB", bind=eng)
+
+
+def ensure_roles_schema(bind=None) -> None:
+    """Роли сотрудников (решение владельца 15.11.2026). Шаг старта 18.
+
+    ПОЧЕМУ ОТДЕЛЬНЫЙ ШАГ. То же правило, что у шагов 10-17 (`AGENTS.md` §1,
+    «только новая миграция сверху»): выпущенные пары (id, позиция) не
+    трогаются, у новой работы своя пара.
+
+    ЧТО ЗДЕСЬ ДЕЛАЕТСЯ. Две новые таблицы (`org_roles`, `org_invites`) с их
+    индексами и одна нуллируемая колонка `memberships.role_id`. Ни одной
+    строки шаг не читает и не переписывает: встроенные роли создаются лениво
+    (app/roles.py), а участник с пустым role_id получает права «Сотрудника»,
+    то есть ровно прежние права участника.
+
+    ИДЕМПОТЕНТЕН: `create_all` создаёт только отсутствующие таблицы, колонка
+    добавляется только если её нет. На свежей базе всё приходит из моделей
+    через `create_all` шага 1, и шаг не делает ничего.
+
+    ОТКАТ. Старый код о новых таблицах не знает; колонка нуллируема и без
+    `server_default`, старый `INSERT` в memberships её не называет и проходит.
+    Права после отката снова решает только memberships.role: владельцы
+    остаются владельцами, все прочие получают права прежнего участника
+    (включая «Наблюдателя», это записано в TECH_DEBT.md). Данные не теряются
+    ни в одну сторону.
+    """
+    eng = bind or engine
+    Base.metadata.create_all(bind=eng, tables=[OrgRole.__table__, OrgInvite.__table__,
+                                                OrgRemoval.__table__])
+    insp = inspect(eng)
+    if not insp.has_table("memberships"):
+        return
+    cols = {c["name"] for c in insp.get_columns("memberships")}
+    if "role_id" not in cols:
+        run_migration_step("ALTER TABLE memberships ADD COLUMN role_id INTEGER", bind=eng)
