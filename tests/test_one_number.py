@@ -126,6 +126,33 @@ with TestClient(app, headers={"X-Oborot-CSRF": "1"}) as c:
     check("сумма «Бюджета» = себестоимость плана мастера",
           bud["used"] == plan["totals"]["cost"], f"{bud['used']} {plan['totals']['cost']}")
 
+    print("\n5. Канал со своим ритмом заказов: одно число (решение владельца, ритм канала)")
+    c.post("/api/settings", json={"rate_window": "year", "cover_mode": "cadence",
+                                  "order_cadence_days": 7, "safety_days": 14, "lead_time_days": 45})
+    cn = c.post("/api/productions", json={"name": "Китай ритм", "lead_time_days": 45}).json()["id"]
+    check("ритм канала 90 сохранён",
+          c.post(f"/api/productions/{cn}/setup", json={"cadence_days": 90}).status_code == 200)
+    rep0 = c.get("/api/replenish").json()["items"]
+    moved = [i["base_name"] for i in rep0 if i["need"] > 0][:8]
+    for b in moved:
+        c.post("/api/productions/assign", json={"base_name": b, "production_id": cn})
+    rep = {i["base_name"]: i for i in c.get("/api/replenish").json()["items"]}
+    plan5 = c.post("/api/order-plan/preview", json={
+        "budget": 50_000_000, "strategy": "grow", "max_share_pct": 100, "width_days": 0,
+        "production_id": cn}).json()
+    mas5 = {i["base_name"]: i["need"] for i in plan5["items"]}
+    both5 = [b for b in moved if b in rep and b in mas5]
+    diff5 = [(b, rep[b].get("need_raw", rep[b]["need"]), mas5[b]) for b in both5
+             if rep[b].get("need_raw", rep[b]["need"]) != mas5[b]]
+    check("горизонт позиции канала = горизонт мастера (104)",
+          all(rep[b].get("horizon_days") == plan5.get("cover_days") == 104 for b in both5) and both5,
+          f"{[rep[b].get('horizon_days') for b in both5]} мастер {plan5.get('cover_days')}")
+    check("потребность «Заказа» = мастер на канале с ритмом 90", not diff5 and len(both5) >= 3,
+          f"{len(both5)} общих, {diff5[:4]}")
+    other = next((i for i in rep.values() if i["base_name"] not in moved), None)
+    check("позиции основного канала остаются на общем горизонте (21)",
+          other is not None and other.get("horizon_days") == 21, str(other and other.get("horizon_days")))
+
 for suffix in ("", "-wal", "-shm"):
     p = Path(str(DB_PATH) + suffix)
     if p.exists():

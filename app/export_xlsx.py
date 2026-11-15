@@ -381,7 +381,9 @@ def _production_subtitle(name: str, items: list[dict], data: dict, window_ru: st
     step = {int(it.get("pack_multiple") or 0) for it in items}
     if len(step) == 1 and (st := step.pop()) > 1:
         parts.append(f"кратно {st} шт")
-    parts.append(f"горизонт {data.get('horizon_days', 90)} дней")
+    hzs = {int(it.get("horizon_days") or 0) for it in items if it.get("horizon_days")}
+    hz = hzs.pop() if len(hzs) == 1 else data.get('horizon_days', 90)
+    parts.append(f"горизонт {hz} дней")
     parts.append(_need_rate_ru(data, window_ru))
     where = f"вкладке «{name}»" if name else "странице «Заказ»"
     # Раньше шапка честно предупреждала, что галочки на состав файла не
