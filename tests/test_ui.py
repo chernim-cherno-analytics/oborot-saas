@@ -3412,7 +3412,10 @@ def _settings_compact_lists(browser, base: str) -> None:
     prods[SPECIAL_P] = r.get("id") or (r.get("production") or {}).get("id")
     all_prods = cl.get("/api/productions").json()["productions"]
     rep = cl.get("/api/replenish").json()
-    bases = sorted({it["base_name"] for it in rep.get("items", [])})
+    # D-76: позиции «в минус» ушли из таблицы в «Не в рекомендации», но в
+    # каталоге они есть и распределяются по каналам так же.
+    bases = sorted({it["base_name"] for it in rep.get("items", [])}
+                   | {e["base_name"] for e in rep.get("excluded", []) if e.get("below_cost")})
     for b in bases[:25]:
         cl.post("/api/exclusions", json={"base_name": b, "excluded": True})
     excl = cl.get("/api/exclusions").json().get("excluded") or []

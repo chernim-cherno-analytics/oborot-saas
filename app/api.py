@@ -3,7 +3,7 @@ import hashlib
 import json
 from datetime import date, datetime, timedelta
 
-from fastapi import APIRouter, Depends, HTTPException, Path
+from fastapi import APIRouter, Depends, HTTPException, Path, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import delete, func, select, update
@@ -357,6 +357,42 @@ def api_orders_open(
 
 def _week_start(d: date) -> date:
     return d - timedelta(days=d.weekday())
+
+
+@router.get("/orders/payment-preview")
+def api_order_payment_preview(
+    cost: int = Query(..., ge=0, le=10_000_000_000),
+    production_id: int | None = Query(None, ge=1, le=2_147_483_647),
+    ctx: AuthContext = Depends(require_auth_api), db: Session = Depends(get_db),
+):
+    """Календарь платежей заказа ДО оформления (окно «Заказа», прогон 14.11).
+
+    Финдир в прогоне: окно оформления ставило 4,47 млн в производство, не
+    показав, когда и сколько платить. Здесь ровно тот календарь, который
+    заказ получит после создания (`_order_payments`: этапы канала, старт
+    сегодня), плюс сколько уже причитается по открытым заказам в те же даты.
+    Только показ: ни одного нового правила денег.
+    """
+    from app.models import Production
+    settings = analytics.extra_settings(ctx.org)
+    raw = None
+    if production_id is not None:
+        prod = db.get(Production, production_id)
+        if prod is not None and prod.org_id == ctx.org.id:
+            raw = prod.stages
+    stages = order_planner.normalize_stages(raw, int(settings.get("lead_time_days") or 45))
+    today = date.today()
+    payments = order_planner.payment_plan(today, stages, float(cost)) if cost > 0 else []
+    last = max((date.fromisoformat(p["date"]) for p in payments), default=today)
+    open_due = 0
+    for o in _open_orders(db, ctx.org.id):
+        for p in _order_payments(db, o, settings):
+            d = date.fromisoformat(p["date"])
+            if today <= d <= last:
+                open_due += int(p["amount"])
+    return {"payments": payments, "open_due": open_due,
+            "until": last.isoformat(), "today": today.isoformat(),
+            "now": sum(int(p["amount"]) for p in payments if p["date"] == today.isoformat())}
 
 
 @router.get("/cash-calendar")

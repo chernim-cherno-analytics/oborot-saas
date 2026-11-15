@@ -393,7 +393,7 @@
   <details class="note">
     <summary>Как работает заказ и что означают колонки</summary>
     <div class="body">
-      <p><b>Заказ создаётся на день его прихода.</b> «Заказать» = темп продаж × горизонт покрытия − прогнозный остаток к приходу заказа (остаток + едет − продажи за срок производства). Пока заказ шьётся, часть стока продастся — считать от сегодняшнего остатка значило бы занизить заказ.</p>
+      <p><b>Заказ создаётся на день его прихода.</b> «Заказать» = темп продаж × горизонт покрытия − прогнозный остаток к приходу заказа (остаток минус продажи за срок производства, плюс «едет»). При окнах «год» и «90 дней» темп с поправкой на сезон того периода, когда партия будет продаваться (тот же период год назад), как в мастере заказа. Пока заказ шьётся, часть стока продастся: считать от сегодняшнего остатка значило бы занизить заказ.</p>
       <p><b>Темп</b> считается по методике оборачиваемости: продано штук ÷ дни, когда вещь была в наличии. Переключатель окна: <b>Год</b> сглаживает сезонность, <b>90 дней</b> ловит текущий тренд, <b>Сезон</b> берёт то же окно прошлого года — период, НА который приедет заказ. Срок производства и горизонт — в <a href="/settings">Настройках</a>.</p>
       <p><b>Производства.</b> Вкладки над таблицей — ваши производства. Основное — одно, его можно переименовать (✎). Если шьёте у разных подрядчиков (свой цех, Иваново, Бишкек) — добавьте производства и перенесите на них позиции кнопкой в последней колонке; вернуть обратно можно так же. Заказ создаётся из активной вкладки.</p>
       <p><b>Условия подрядчика</b> задаются на вкладке (✎): свой <b>срок производства</b>, <b>минимальная партия</b> и <b>кратность</b>. Количество по таким позициям округляется вверх до партии и кратности — в колонке «Заказать» видно, сколько было по расчёту. Если расчётная потребность сильно ниже партии, строка помечена «невыгодно»: решение остаётся за вами.</p>
@@ -466,7 +466,7 @@
           <th title="Уже заказано и ещё не принято на склад">Едет</th>
           <th title="На сколько недель хватит остатка при текущем темпе">Покрытие, нед</th>
           <th title="Прогнозная дата, когда остаток кончится; ⚠ — кончится раньше прихода заказа">Стокаут</th>
-          <th title="Темп × горизонт − прогнозный остаток к приходу заказа. Правится в размерной сетке (▸)">Заказать</th>
+          <th title="Темп (с поправкой на сезон, как в мастере) × горизонт − прогнозный остаток к приходу заказа. Правится в размерной сетке (▸)">Заказать</th>
           <th id="th-prod" style="width:120px;" title="Перенос позиции на другое производство">Произв-во</th>
         </tr>
       </thead>
@@ -574,10 +574,13 @@
     <div class="fieldhint">Все расчёты уже сделаны на дату прихода: из остатков вычтено то, что продастся
       за время производства.</div>
     <div class="warn" id="order-modal-warning"></div>
-    <div class="fieldhint">Заказ будет отмечен «в производстве», а количество появится в «Едет».
+    <div id="order-modal-pay" class="fieldhint" style="display:none"></div>
+    <div class="fieldhint">«Зафиксировать»: заказ отмечается «в производстве», количество появится в «Едет».
+      «Черновиком»: заказ сохраняется без отправки и на «Едет» не влияет, отправить можно из списка заказов.
       Документ в МойСкладе создаётся отдельным действием.</div>
     <div class="actions">
       <button class="abtn" type="button" id="btn-order-cancel">Отмена</button>
+      <button class="abtn" type="button" id="btn-order-draft">Сохранить черновиком</button>
       <button class="abtn primary" type="button" id="btn-order-submit">Зафиксировать размещение</button>
     </div>
   </div>
@@ -1770,9 +1773,16 @@
     var manual=hasEdits(it)
       ?' Ростовка правлена вручную: <b>'+fmt(it._need)+' шт</b> — это число уходит в заказ и в выгрузку.'
       :"";
-    return '<p class="formula">Расчёт (окно темпа: '+winTxt+'): '+fmtNum(it.rate,2)+' шт/день × '+fmt(HORIZON)+
-      ' дн = '+fmt(Math.round(it.rate*HORIZON))+' − прогнозный остаток к приходу '+fmt(proj)+
-      ' (остаток '+fmt(it.cs)+' + едет '+fmt(it.ordered||0)+' − продажи за '+fmt(lead)+' дн производства)'+
+    // D-79: потребность посчитана темпом после прихода (r_cover), остаток к
+    // приходу темпом до прихода (r_lead); при окнах «год» и «90 дней» это
+    // сезонный темп мастера. Показываем ровно те числа, которыми считали
+    // (ревью Codex #108), а темп окна остаётся в строке «Темпы».
+    var rc=(it.rate_cover!==undefined?it.rate_cover:it.rate), rl=(it.rate_lead!==undefined?it.rate_lead:it.rate);
+    var seas=(it.season_factor&&Math.abs(it.season_factor-1)>0.005)
+      ?', с поправкой на сезон того периода, когда партия будет продаваться (×'+fmtNum(it.season_factor,2)+')':"";
+    return '<p class="formula">Расчёт (окно темпа: '+winTxt+seas+'): '+fmtNum(rc,2)+' шт/день × '+fmt(HORIZON)+
+      ' дн ≈ '+fmtNum(rc*HORIZON,1)+' − прогнозный остаток к приходу '+fmt(proj)+
+      ' (остаток '+fmt(it.cs)+' минус продажи за '+fmt(lead)+' дн производства по '+fmtNum(rl,2)+' шт/день, плюс едет '+fmt(it.ordered||0)+')'+
       ' = <b>'+fmt(it.need_raw!==undefined?it.need_raw:it.need)+' шт</b>.'+leadNote+moq+manual+
       ' Темпы: год '+fmtNum(it.rate_year,2)+' · 90 дн '+fmtNum(it.rate_90,2)+
       ' · сезон '+fmtNum(it.rate_season,2)+'.'+gap+'</p>';
@@ -2136,6 +2146,7 @@
 
   /* ── создание заказа (из активной вкладки) ── */
   var orderModal=document.getElementById("order-modal");
+  var PAY_GEN=0;
   document.getElementById("btn-create-order").addEventListener("click",function(){
     var sel=checkedItems();
     if(!sel.length) return;
@@ -2175,12 +2186,40 @@
       warnEl.textContent="⚠ У "+fmt(lowN)+" "+plural(lowN,"позиции","позиций","позиций")+
         " спрос заметно ниже минимальной партии — такой заказ может пролежать на складе. Снимите галочку, если он не нужен.";
     }else warnEl.style.display="none";
+    // Прогон 14.11 (финдир): окно ставило заказ в производство, не показав,
+    // когда и сколько платить. Календарь тот же, что заказ получит после
+    // создания, плюс что уже причитается по открытым заказам в эти даты.
+    var payEl=document.getElementById("order-modal-pay");
+    payEl.style.display="none"; payEl.textContent="";
+    // Ревью Codex #109: ответ от прошлого открытия окна не должен перезаписать
+    // календарь текущего заказа. Каждое открытие получает свой номер.
+    var payGen=++PAY_GEN;
+    if(cost>0){
+      api("/api/orders/payment-preview?cost="+Math.round(cost)+(ACTIVE_PROD?("&production_id="+ACTIVE_PROD):""))
+        .then(function(d){
+          if(payGen!==PAY_GEN) return;
+          var ps=d.payments||[];
+          if(!ps.length) return;
+          // Даты календаря без часового пояса: new Date("ГГГГ-ММ-ДД") это
+          // полночь UTC, и западнее UTC день съезжал на вчера (ревью Codex #109).
+          function dd(iso){
+            var p=String(iso||"").split("-");
+            return new Date(+p[0],(+p[1])-1,+p[2]).toLocaleDateString("ru-RU",{day:"numeric",month:"short"});
+          }
+          var lines=ps.map(function(x){ return dd(x.date)+": "+x.label+", "+fmtMoneyShort(x.amount); });
+          payEl.innerHTML="<b>Платежи по этому заказу</b> (по условиям производства): "+esc(lines.join("; "))+"."+
+            (d.open_due>0?(" По уже открытым заказам до "+dd(d.until)+
+              " причитается ещё "+esc(fmtMoneyShort(d.open_due))+"."):"");
+          payEl.style.display="block";
+        }).catch(function(){});
+    }
     orderModal.classList.add("open");
   });
-  document.getElementById("btn-order-cancel").addEventListener("click",function(){ orderModal.classList.remove("open"); });
+  document.getElementById("btn-order-cancel").addEventListener("click",function(){ PAY_GEN++; orderModal.classList.remove("open"); });
   orderModal.addEventListener("click",function(e){ if(e.target===orderModal) orderModal.classList.remove("open"); });
-  document.getElementById("btn-order-submit").addEventListener("click",function(){
-    var btn=this;
+  document.getElementById("btn-order-submit").addEventListener("click",function(){ submitOrder(this,true); });
+  document.getElementById("btn-order-draft").addEventListener("click",function(){ submitOrder(this,false); });
+  function submitOrder(btn, send){
     var name=document.getElementById("order-name").value.trim()||"Заказ на производство";
     var eta=document.getElementById("order-eta").value||null;
     var payload={name:name,eta_date:eta,production_id:ACTIVE_PROD,items:checkedItems().map(function(it){
@@ -2196,7 +2235,8 @@
       // Заказ склеен с уже существующим (защита от случайного повтора) —
       // об этом надо сказать словами, а не молча показать чужой заказ.
       if(r.duplicate) alert(r.message);
-      created={id:r.id,name:name,duplicate:!!r.duplicate};
+      created={id:r.id,name:name,duplicate:!!r.duplicate,draft:!send};
+      if(!send) return null;
       return api("/api/orders/"+r.id+"/status",{method:"POST",body:{status:"sent"}});
     }).then(function(){
       orderModal.classList.remove("open");
@@ -2205,7 +2245,7 @@
     }).then(function(){
       if(created) announceCreated(created);
     }).catch(function(e){ btn.disabled=false; alert("Не удалось создать заказ: "+e.message); });
-  });
+  }
 
   /* Отзыв после создания: словами — что создано, и глазами — где оно.
      Новый заказ подсвечивается и прокручивается в окно; если сообщение и
@@ -2221,6 +2261,8 @@
     var where=row?" Он выделен в списке ниже":"";
     el.textContent=c.duplicate
       ? "Такой заказ уже есть: «"+nm+"»."+where+(where?".":"")
+      : c.draft
+      ? "Черновик «"+nm+"» сохранён, в «Едет» он не учтён."+where+(where?".":"")
       : "Заказ «"+nm+"» создан и отправлен в производство."+where+
         (where?", его количество учтено в колонке «Едет».":"");
     el.dataset.order=String(c.id);

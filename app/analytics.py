@@ -559,6 +559,45 @@ def window_nq(
 
 # ── Расчёт снапшота ───────────────────────────────────────────────────────────
 
+def _apply_seasonal_rates(db: Session, org: Org, settings: dict, items: dict,
+                          today: date, horizon: int, min_stock: float) -> None:
+    """D-79 (решение владельца 15.11.2026, вариант 2A): сезонный темп везде.
+
+    Мастер считает потребность темпом с сезонным индексом окна (то же время
+    год назад, `order_planner._seasonal_rates`): один темп на срок
+    производства (продажи до прихода, r_lead) и один на горизонт после
+    прихода (r_cover). «Заказ» и «Бюджет» брали голый темп окна, и при окне
+    «год» потребность расходилась у 30 из 30 позиций демо. Теперь снапшот
+    берёт те же темпы по сроку канала каждой позиции. При окне «сезон» темп
+    уже сезонный (D-66): ничего не меняется. Позиция с нулевым темпом окна
+    (нет продаж в окне) остаётся с нулём: мастер такие отсеивает свежестью,
+    и годовой темп подставлять ей нельзя.
+    Подписи «сегодня» (недели запаса, дата стокаута, дыра поставки) остаются
+    на темпе окна: это факт текущих продаж, а не прогноз на сезон заказа.
+    """
+    if settings.get("rate_window") == "season" or not items:
+        return
+    from app import order_planner  # локально: order_planner импортирует analytics
+
+    pseudo = {"settings": settings, "items": items}
+    by_lead: dict[int, list[dict]] = {}
+    for item in items.values():
+        by_lead.setdefault(int(item.get("lead_time_days") or 0), []).append(item)
+    for lead, group in by_lead.items():
+        eta = today + timedelta(days=lead)
+        rate_lead, _ = order_planner._seasonal_rates(db, org, pseudo, min_stock, today, eta)
+        rate_cover, _ = order_planner._seasonal_rates(
+            db, org, pseudo, min_stock, eta, eta + timedelta(days=horizon))
+        for item in group:
+            base_rate = float(item.get("rate_cover") or 0)
+            if base_rate <= 0:
+                continue
+            base = item["base_name"]
+            item["rate_lead"] = float(rate_lead.get(base) or 0)
+            item["rate_cover"] = float(rate_cover.get(base) or 0)
+            item["season_factor"] = round(item["rate_cover"] / base_rate, 3)
+
+
 def _compute_snapshot(db: Session, org: Org) -> dict:
     settings = dict(org.settings)
     settings.update(extra_settings(org))
@@ -1305,11 +1344,28 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
         # продажи срока производства, которых при стокауте не будет, и после
         # размещения ровно рекомендованного заказа система просила дошить
         # ещё rate·lead штук той же позиции.
-        proj_stock = max(0.0, cs - rate * lead) + max(0.0, float(item["ordered"]))
-        item["proj_stock"] = round(proj_stock)
-        item["need"] = max(0, round(rate * horizon) - round(proj_stock))
+        # Темпы для потребности: до прихода (r_lead) и после (r_cover). Здесь
+        # темп окна; при окнах «год» и «90 дней» их заменяет сезонный темп
+        # (_apply_seasonal_rates, D-79). Сама потребность считается одной
+        # формулой ниже, после всех позиций.
+        item["rate_lead"] = rate
+        item["rate_cover"] = rate
         item["nq"] = round(nq)
         item["nr"] = round(nr)
+
+    _apply_seasonal_rates(db, org, settings, items, today, horizon, min_stock)
+    for item in items.values():
+        lead = int(item["lead_time_days"])
+        r_lead = float(item["rate_lead"])
+        r_cover = float(item["rate_cover"])
+        cs = float(item["cs"])
+        proj_stock = max(0.0, cs - r_lead * lead) + max(0.0, float(item["ordered"]))
+        item["proj_stock"] = round(proj_stock)
+        # D-79 (15.11.2026): одна формула с мастером (order_planner._candidates),
+        # включая порядок округления. Раньше round(темп × горизонт) −
+        # round(остаток) расходился с мастером ровно на 1 шт на входах «.5»
+        # (BUSINESS_LOGIC §9.4).
+        item["need"] = max(0, int(round(r_cover * horizon - proj_stock)))
 
     return {
         "generated_at": time.time(),
@@ -1920,6 +1976,13 @@ def build_replenish(snap: dict) -> dict:
                 "cs": it["cs"],
                 "ordered": int(it["ordered"]),
                 "proj_stock": int(it.get("proj_stock", it["cs"])),
+                # D-79: во сколько раз темп горизонта отличается от темпа окна
+                # из-за сезонной поправки (None: поправки нет, окно «сезон»).
+                "season_factor": it.get("season_factor"),
+                # Темпы, которыми реально посчитаны proj_stock и need (D-79):
+                # до прихода и после прихода. Страница показывает их в формуле.
+                "rate_lead": round(float(it.get("rate_lead") or 0), 4),
+                "rate_cover": round(float(it.get("rate_cover") or 0), 4),
                 "wos": it["wos"],
                 "stockout_date": it["stockout_date"],
                 "gap_days": it["gap_days"],

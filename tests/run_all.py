@@ -220,6 +220,8 @@ SUITES = [
     ("qa_inputs", "test_qa_inputs.py", False, False),
     # Решения 15.11: «в минус» вне рекомендации (D-76), порог 14 дней (D-77).
     ("decisions_1511", "test_decisions_15_11.py", False, False),
+    # Окно оформления «Заказа»: календарь платежей и черновик (прогон 14.11).
+    ("order_modal_cash", "test_order_modal_cash.py", False, False),
     ("deps",        "test_dependencies.py",    False, False),
 ]
 

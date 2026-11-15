@@ -487,6 +487,22 @@ def coverage_days(snap: dict) -> int:
     return max(1, (today - first).days + 1)
 
 
+def _base_rate(it: dict) -> float:
+    """Темп окна позиции, к которому применяется сезонный индекс.
+
+    D-79 (один поток): берём `rate_active` снапшота как есть, включая ноль.
+    Снапшот сам решает, когда темп окна пуст и когда дать фолбэк на год
+    (rate_fallback, «сезонное эхо», D-67). Раньше `rate_active or rate_year`
+    подменял осознанный ноль годовым темпом: позицию, которую «Заказ»
+    исключал («нет продаж в сезонном окне»), мастер и «Бюджет» заказывали
+    (ревью #108, P1). Годовой темп остаётся только для записей без
+    `rate_active` (старые снапшоты, синтетика тестов).
+    """
+    if "rate_active" in it and it.get("rate_active") is not None:
+        return float(it.get("rate_active") or 0)
+    return float(it.get("rate_year") or 0)
+
+
 def _seasonal_rates(
     db: Session, org: Org, snap: dict, min_stock: float,
     date_from: date, date_to: date,
@@ -518,8 +534,7 @@ def _seasonal_rates(
     # демо мастер просил 1 435 шт против 1 123 на «Заказе», «Скетч» 179
     # против 101. Вариант: при окне «сезон» индекс не применяется.
     if (snap.get("settings") or {}).get("rate_window") == "season":
-        return ({base: max(0.0, float(it.get("rate_active") or it.get("rate_year") or 0))
-                 for base, it in snap["items"].items()}, {})
+        return ({base: max(0.0, _base_rate(it)) for base, it in snap["items"].items()}, {})
     w_from = (date_from - timedelta(days=365)).isoformat()
     w_to = (date_to - timedelta(days=365)).isoformat()
     dis_w = window_dis(db, org.id, min_stock, w_from, w_to)
@@ -550,7 +565,7 @@ def _seasonal_rates(
 
     rates: dict[str, float] = {}
     for base, it in snap["items"].items():
-        base_rate = float(it.get("rate_active") or it.get("rate_year") or 0)
+        base_rate = _base_rate(it)
         rate_year = float(it.get("rate_year") or 0)
         dis_b = float(dis_w.get(base) or 0)
         nq_b = float(nq_w.get(base) or 0)
