@@ -225,7 +225,9 @@ SUITES = [
     # Плашка свежести: перезапуск при выкладке не «падение» (прод 15.11).
     ("sync_chip", "test_sync_chip.py", False, False),
     # Почасовой догон повторяет синк, прерванный перезапуском (прод 15.11).
-    ("sync_resume", "test_sync_resume.py", False, False),
+    ("sync_retry_job", "test_sync_resume.py", False, False),
+    # «Сотрудники и роли» для не-владельца: активно только то, что разрешит сервер.
+    ("team_ui", "test_team_ui.py", False, False),
     ("deps",        "test_dependencies.py",    False, False),
 ]
 
