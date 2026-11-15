@@ -1774,9 +1774,16 @@
     var manual=hasEdits(it)
       ?' Ростовка правлена вручную: <b>'+fmt(it._need)+' шт</b> — это число уходит в заказ и в выгрузку.'
       :"";
-    return '<p class="formula">Расчёт (окно темпа: '+winTxt+'): '+fmtNum(it.rate,2)+' шт/день × '+fmt(HORIZON)+
-      ' дн = '+fmt(Math.round(it.rate*HORIZON))+' − прогнозный остаток к приходу '+fmt(proj)+
-      ' (остаток '+fmt(it.cs)+' + едет '+fmt(it.ordered||0)+' − продажи за '+fmt(lead)+' дн производства)'+
+    // D-79: потребность посчитана темпом после прихода (r_cover), остаток к
+    // приходу темпом до прихода (r_lead); при окнах «год» и «90 дней» это
+    // сезонный темп мастера. Показываем ровно те числа, которыми считали
+    // (ревью Codex #108), а темп окна остаётся в строке «Темпы».
+    var rc=(it.rate_cover!==undefined?it.rate_cover:it.rate), rl=(it.rate_lead!==undefined?it.rate_lead:it.rate);
+    var seas=(it.season_factor&&Math.abs(it.season_factor-1)>0.005)
+      ?', с поправкой на сезон того периода, когда партия будет продаваться (×'+fmtNum(it.season_factor,2)+')':"";
+    return '<p class="formula">Расчёт (окно темпа: '+winTxt+seas+'): '+fmtNum(rc,2)+' шт/день × '+fmt(HORIZON)+
+      ' дн ≈ '+fmtNum(rc*HORIZON,1)+' − прогнозный остаток к приходу '+fmt(proj)+
+      ' (остаток '+fmt(it.cs)+' минус продажи за '+fmt(lead)+' дн производства по '+fmtNum(rl,2)+' шт/день, плюс едет '+fmt(it.ordered||0)+')'+
       ' = <b>'+fmt(it.need_raw!==undefined?it.need_raw:it.need)+' шт</b>.'+leadNote+moq+manual+
       ' Темпы: год '+fmtNum(it.rate_year,2)+' · 90 дн '+fmtNum(it.rate_90,2)+
       ' · сезон '+fmtNum(it.rate_season,2)+'.'+gap+'</p>';

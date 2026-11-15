@@ -1979,6 +1979,10 @@ def build_replenish(snap: dict) -> dict:
                 # D-79: во сколько раз темп горизонта отличается от темпа окна
                 # из-за сезонной поправки (None: поправки нет, окно «сезон»).
                 "season_factor": it.get("season_factor"),
+                # Темпы, которыми реально посчитаны proj_stock и need (D-79):
+                # до прихода и после прихода. Страница показывает их в формуле.
+                "rate_lead": round(float(it.get("rate_lead") or 0), 4),
+                "rate_cover": round(float(it.get("rate_cover") or 0), 4),
                 "wos": it["wos"],
                 "stockout_date": it["stockout_date"],
                 "gap_days": it["gap_days"],
