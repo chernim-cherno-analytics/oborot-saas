@@ -1231,11 +1231,104 @@ def api_order_status(
         _apply_remainder_to_incoming(db, ctx.org.id, items_at_change, pushed_at_change, -1)
     if body.status == "received":
         _record_execution(db, ctx, order, body.received, now)
+        _demo_stock_on_receive(db, ctx.org.id, order.id, items_at_change)
     db.commit()
     db.expire(order)
     analytics.invalidate(ctx.org.id)
     return {"ok": True, "status": body.status,
             "received_at": now.isoformat() if body.status == "received" else None}
+
+
+# Демо-приёмка появилась 15.11.2026: заказы, принятые раньше, остаток не
+# трогали, и сверять их правки не с чем (ревью #133). Граница с запасом
+# после выкладки; заказ, принятый до неё, правки приёмки на остаток не двигают.
+DEMO_RECEIPT_SINCE = datetime(2026, 11, 15, 15, 0)
+
+
+def _demo_spec(db: Session, org_id: int, order_id: int, items: list[dict]) -> dict:
+    """Что демо кладёт на остаток по принятому заказу: база -> {размер: штук}
+    (по разбивке заказа) или общее число. Есть строки приёмки: названное (не
+    ниже нуля, без размеров); нет строк: заказанное по строкам заказа."""
+    from app.models import OrderReceipt
+    db.flush()
+    rows = db.execute(
+        select(OrderReceipt.base_name, func.sum(OrderReceipt.qty))
+        .where(OrderReceipt.org_id == org_id, OrderReceipt.order_id == order_id)
+        .group_by(OrderReceipt.base_name)
+    ).all()
+    if rows:
+        # Подтверждённый ноль остаётся нулём (ревью #131).
+        return {b: max(0.0, float(q or 0)) for b, q in rows}
+    spec: dict = {}
+    for it in items:
+        base = str(it.get("base_name") or "")
+        qty = int(it.get("qty") or 0)
+        if not base or qty <= 0:
+            continue
+        sizes = {k: float(v or 0) for k, v in (it.get("sizes") or {}).items() if float(v or 0) > 0}
+        prev = spec.get(base)
+        if sizes and sum(sizes.values()) == qty and (prev is None or isinstance(prev, dict)):
+            cur = dict(prev or {})
+            for k, v in sizes.items():
+                cur[k] = cur.get(k, 0.0) + v
+            spec[base] = cur
+        else:
+            total = sum(prev.values()) if isinstance(prev, dict) else float(prev or 0)
+            spec[base] = total + qty
+    return spec
+
+
+def _demo_applied(db: Session, org_id: int, order: ProductionOrder) -> dict | None:
+    """Что демо уже положило по принятому заказу (None: не демо, не принят или
+    принят до появления демо-приёмки)."""
+    from app import demo_seed
+    if order.status != "received" or not demo_seed.is_demo_org(db, org_id):
+        return None
+    if order.received_at is None or order.received_at < DEMO_RECEIPT_SINCE:
+        return None
+    return _demo_spec(db, org_id, order.id, order.items)
+
+
+def _demo_reconcile_receipts(db: Session, org_id: int, order: ProductionOrder,
+                             before: dict) -> None:
+    """Ревью #131/#133: приёмку по уже принятому демо-заказу поправили (довоз,
+    исправление, количества названы позже). Положенное раньше снимается тем же
+    раскладом по размерам, каким клали, и кладётся названное теперь; при двух
+    общих числах двигается только разница."""
+    from app import demo_seed
+    after = _demo_spec(db, org_id, order.id, order.items)
+    for b in set(before) | set(after):
+        was, now = before.get(b, 0.0), after.get(b, 0.0)
+        if was == now:
+            continue
+        if not isinstance(was, dict) and not isinstance(now, dict):
+            # Сравниваются округлённые накопленные итоги, а не каждая правка
+            # отдельно: пять довозов по 0,4 дают +2, а не пять раз по нулю
+            # (ревью #133).
+            d = int(round(float(now))) - int(round(float(was)))
+            if d:
+                demo_seed.simulate_receipt(db, org_id, {b: d})
+            continue
+        undo = {k: -v for k, v in was.items()} if isinstance(was, dict) else -float(was)
+        if undo:
+            demo_seed.simulate_receipt(db, org_id, {b: undo})
+        if now:
+            demo_seed.simulate_receipt(db, org_id, {b: now})
+
+
+def _demo_stock_on_receive(db: Session, org_id: int, order_id: int, items: list[dict]) -> None:
+    """Демо-организация: «Принят на склад» кладёт пришедшее на остаток.
+
+    Живые данные не трогаются (demo_seed.is_demo_org). Сколько класть: см.
+    _demo_spec.
+    """
+    from app import demo_seed
+    if not demo_seed.is_demo_org(db, org_id):
+        return
+    spec = _demo_spec(db, org_id, order_id, items)
+    spec = {b: v for b, v in spec.items() if v}
+    if spec:
+        demo_seed.simulate_receipt(db, org_id, spec)
 
 
 def _record_execution(db: Session, ctx: AuthContext, order: ProductionOrder,
@@ -1365,9 +1458,13 @@ def api_order_receipts_add(
     # исчезало — заказ оставался «неизвестно» вместо «подтверждённый ноль».
     # Соседний путь (перевод в «на складе» с количествами) нули писал, и две
     # ручки отвечали об одном и том же по-разному.
+    demo_before = _demo_applied(db, ctx.org.id, order)
     added = _add_receipts(db, order, lines, source="manual",
                           precision="by_position", user_id=ctx.user.id,
                           source_ref=ref, keep_zeros=True)
+    if demo_before is not None:
+        _demo_reconcile_receipts(db, ctx.org.id, order, demo_before)
+        analytics.invalidate(ctx.org.id)
     db.commit()
     return {"ok": True, "added": added, **_receipts_out(db, order)}
 

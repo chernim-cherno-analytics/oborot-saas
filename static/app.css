@@ -1013,6 +1013,9 @@ tr.rt-weak:hover > td { background: rgba(229, 72, 77, 0.13); }
 @media (max-width: 640px) {
   #toast-root { bottom: 72px; }
 }
+/* QA 15.11: на широком экране «?» тоже перекрывал правый край тоста
+   («Сохран»). Где кнопка есть, тост стоит над ней всегда. */
+body:has(.hint-fab) #toast-root { bottom: 72px; }
 
 /* --- Состояние подписки (BILLING-OPS-1) --- */
 .sub-strip {
