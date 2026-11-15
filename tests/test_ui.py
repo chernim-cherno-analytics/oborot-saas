@@ -1345,8 +1345,10 @@ def _focus_urgent(browser, base: str) -> None:
                   has_rg and rg.is_visible() and "Показать «Срочно» в таблице" in label
                   and st["segR"] in label and "с учётом поиска и категории" in label, label)
             if touch:
+                # Скрытая кнопка «Не вошло в бюджет» (D-89, видна только под
+                # бюджетом) не меряется: её нет на экране.
                 g = page.evaluate("""() => [...document.querySelectorAll('#band-seg button, #rate-seg button,'
-                  + ' #risk-go')].map(b => { const r = b.getBoundingClientRect();
+                  + ' #risk-go')].filter(b => b.offsetParent !== null).map(b => { const r = b.getBoundingClientRect();
                   return {t: b.textContent.trim().slice(0, 12), h: r.height, l: r.left, r: r.right}; })""")
                 small = [x for x in g if x["h"] < 44]
                 check("390: кнопки статуса, темпа и «Показать «Срочно»» — не ниже 44 px", not small, str(small))
@@ -2676,9 +2678,11 @@ def _order_category_p1(browser, base: str) -> None:
         check("имена-ключи: кнопки этих категорий показывают число позиций, а не код функции",
               all(lbl and "function" not in lbl and any(ch.isdigit() for ch in lbl) for lbl in labels.values()),
               str(labels)[:200])
-        check("имена-ключи: при открытии ни одна из них не считается выбранной",
+        # D-89: «Заказ» открывается с «Все категории»; имя-ключ отдельной
+        # кнопкой при этом не нажато.
+        check("имена-ключи: при открытии ни одна из них не считается выбранной отдельно",
               all(scope_btn(page, k).count() == 1 and not pressed(page, k) for k in keys)
-              and page.locator("#btn-create-order").is_disabled())
+              and page.locator('#scope-btns .scope-btn[data-scope-action="all"]').get_attribute("aria-pressed") == "true")
         toggle(page, P)
         page.locator("#btn-export-xlsx").click()
         page.wait_for_timeout(1500)
