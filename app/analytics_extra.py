@@ -166,7 +166,9 @@ def build_budget(
         "moq_ui": 2,  # пусто = партия канала (WIZARD-MOQ-1)
     }
     plan = order_planner.build_plan(db, org, snap, brief)
-    horizon = int((plan.get("brief") or {}).get("cover_days") or snap["settings"]["horizon_days"])
+    # Горизонт тот, по которому мастер реально считал (ритм канала мог его
+    # поменять), а не общий горизонт снапшота (ревью Codex #108).
+    horizon = int(plan.get("cover_days") or snap["settings"]["horizon_days"])
 
     items = []
     for i in plan.get("items") or []:
