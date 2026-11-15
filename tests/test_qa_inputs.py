@@ -118,6 +118,22 @@ with TestClient(app, headers={"X-Oborot-CSRF": "1"}, raise_server_exceptions=Fal
     rows = [i for i in card.get("items", []) if i["base_name"] == base]
     check("две строки одной модели склеены в одну: 7 шт, S3 M4",
           len(rows) == 1 and rows[0]["qty"] == 7 and rows[0].get("sizes") == {"S": 3, "M": 4}, str(rows)[:200])
+    r = a.post("/api/orders", json={"name": "дубль без размеров", "allow_duplicate": True, "items": [
+        {"base_name": base, "qty": 3}, {"base_name": base, "qty": 4}]})
+    card = a.get(f"/api/orders/{r.json().get('id')}").json() if r.status_code == 200 else {}
+    rows = [i for i in card.get("items", []) if i["base_name"] == base]
+    check("две безразмерные строки: одна строка 7 шт", len(rows) == 1 and rows[0]["qty"] == 7, str(rows)[:200])
+    r = a.post("/api/orders", json={"name": "смесь", "allow_duplicate": True, "items": [
+        {"base_name": base, "qty": 3, "sizes": {}}, {"base_name": base, "qty": 4, "sizes": {"M": 4}}]})
+    check("строка без размеров + строка с размерами: 422, а не потеря 3 шт",
+          r.status_code == 422 and "разбивка" in r.text, f"{r.status_code} {r.text[:200]}")
+    r = a.post("/api/orders", json={"name": "лимит", "allow_duplicate": True, "items": [
+        {"base_name": base, "qty": 60000}, {"base_name": base, "qty": 60000}]})
+    check("60000+60000 одной модели: 422, а не молча 100000", r.status_code == 422, f"{r.status_code} {r.text[:200]}")
+    r = a.post("/api/orders", json={"name": "лимит размеры", "allow_duplicate": True, "items": [
+        {"base_name": base, "qty": 60000, "sizes": {"S": 60000}},
+        {"base_name": base, "qty": 60000, "sizes": {"M": 60000}}]})
+    check("размеры 60000+60000: 422", r.status_code == 422, f"{r.status_code} {r.text[:200]}")
 
     print("\n6. «Оборот за период»")
     r = a.get("/api/revenue?date_from=2026-02-30&date_to=2026-03-01")
