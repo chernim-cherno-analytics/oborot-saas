@@ -1,0 +1,204 @@
+/* ============================================================
+   UI2: новый визуальный язык «Оборота» (решение владельца 15.11.2026, D-84).
+
+   Включается классом `ui2` на <html> страницы. Пока класс стоит только на
+   «Оборачиваемости»: остальные страницы этого файла не подключают и
+   выглядят как раньше. Здесь только общее для будущих страниц: токены,
+   фон, шапка (templates/_app_shell.html), подсказки и меню «?»
+   (templates/_hints.html). Раскладка самой страницы живёт в её шаблоне.
+
+   Правила:
+     • стекло (blur) только у шапки, меню и всплывающих карточек; строки
+       таблиц непрозрачные, иначе цифры плохо читаются и тормозит прокрутка;
+     • вторичный текст не светлее --u-ink2 (контраст ≥ 4,5:1 на белом);
+       --u-ink3 только для нулей, прочерков и подсказок в пустых полях:
+       они нарочно приглушены, смысла не несут;
+     • цвета строк заданы готовыми значениями, без color-mix(): он есть не
+       во всех браузерах клиентов;
+     • шрифт системный: SF на Mac и iPhone, Segoe UI на Windows.
+   ============================================================ */
+
+html.ui2 {
+  --u-paper: #f1f0f6;
+  --u-ink: #1d1d1f;
+  --u-ink2: rgba(29, 29, 31, .68);
+  --u-ink3: rgba(29, 29, 31, .56);
+  --u-hair: rgba(20, 20, 60, .1);
+  --u-accent: #0a66d6;
+  --u-accent-soft: rgba(10, 102, 214, .13);
+  --u-glass: rgba(255, 255, 255, .66);
+  --u-glass-hi: rgba(255, 255, 255, .9);
+  --u-best: #8cc400;
+  --u-good: #2fb457;
+  --u-slow: #f08c00;
+  --u-out: #f0443a;
+  --u-row-best: #e0f3a8;
+  --u-row-good: #dcf2e2;
+  --u-row-slow: #ffeed5;
+  --u-row-out: #ffe7e5;
+  --u-row-mute: #f3f3f7;
+  --u-font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --u-ease: cubic-bezier(.22, .8, .24, 1);
+  color-scheme: light;
+}
+
+html.ui2 body {
+  font-family: var(--u-font); color: var(--u-ink); background: var(--u-paper);
+  font-size: 14px; line-height: 1.45;
+}
+html.ui2 button, html.ui2 input, html.ui2 select { font-family: inherit; }
+
+/* Фон: спокойные цветные пятна, как обои рабочего стола. Неподвижный:
+   анимация под таблицей на 500 строк стоила бы прокрутки. Во встроенном
+   режиме МойСклада _embed.html прячет .gradient-bg целиком. */
+html.ui2 .gradient-bg {
+  position: fixed; inset: 0; z-index: 0; overflow: hidden;
+  background:
+    radial-gradient(38% 42% at 16% 18%, #cfe0ff 0, transparent 70%),
+    radial-gradient(40% 44% at 84% 14%, #e3d4ff 0, transparent 70%),
+    radial-gradient(46% 46% at 80% 88%, #ffdccb 0, transparent 70%),
+    radial-gradient(42% 46% at 14% 90%, #cff3e6 0, transparent 70%),
+    var(--u-paper);
+}
+html.ui2 .gradient-bg::before, html.ui2 .gradient-bg::after { content: none; }
+
+html.ui2 :focus-visible { outline: 3px solid rgba(10, 102, 214, .55); outline-offset: 2px; }
+
+/* ---------- Шапка ---------- */
+html.ui2 .header.app-top {
+  margin: 10px 16px 0; padding: 7px 10px 7px 18px; min-height: 54px; gap: 16px;
+  top: 10px; border-radius: 18px;
+  background: var(--u-glass);
+  -webkit-backdrop-filter: blur(30px) saturate(180%); backdrop-filter: blur(30px) saturate(180%);
+  border: 1px solid rgba(255, 255, 255, .75);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .85), 0 8px 30px rgba(46, 46, 96, .09);
+}
+html.ui2 .header.app-top .app-logo { color: var(--u-ink); font-size: 13px; letter-spacing: .2em; }
+html.ui2 .header.app-top .app-nav { gap: 2px; }
+html.ui2 .header.app-top .app-nav a {
+  padding: 7px 11px; border-radius: 10px; font-size: 13px; font-weight: 500; color: var(--u-ink2);
+}
+html.ui2 .header.app-top .app-nav a:hover { background: rgba(120, 120, 128, .14); color: var(--u-ink); }
+html.ui2 .header.app-top .app-nav a.active {
+  background: #fff; color: var(--u-ink); font-weight: 600;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, .12), 0 0 0 1px rgba(0, 0, 0, .04);
+}
+html.ui2 .header.app-top a:focus-visible, html.ui2 .header.app-top button:focus-visible,
+html.ui2 .app-user-pop a:focus-visible, html.ui2 .app-user-pop button:focus-visible {
+  outline: 3px solid rgba(10, 102, 214, .55); outline-offset: 2px;
+}
+html.ui2 .header.app-top .app-user-btn {
+  border: 1px solid var(--u-hair); background: rgba(255, 255, 255, .7); color: var(--u-ink);
+}
+html.ui2 .header.app-top .app-avatar { background: var(--u-ink); }
+html.ui2 .header.app-top .app-caret { color: var(--u-ink2); }
+html.ui2 .app-user-pop {
+  border-radius: 16px; border: 1px solid rgba(255, 255, 255, .8); background: var(--u-glass-hi);
+  -webkit-backdrop-filter: blur(30px) saturate(180%); backdrop-filter: blur(30px) saturate(180%);
+  box-shadow: 0 20px 50px rgba(46, 46, 96, .22);
+}
+html.ui2 .app-user-pop .app-up-mail { color: var(--u-ink2); }
+html.ui2 .app-user-pop .app-up-item:hover { background: rgba(120, 120, 128, .12); }
+
+html.ui2 .app-demo, html.ui2 .sub-strip {
+  margin: 8px 16px 0; padding: 8px 16px; border-radius: 12px; border: 1px solid var(--u-hair);
+  background: rgba(255, 255, 255, .6); color: var(--u-ink2); font-size: 12.5px; line-height: 18px;
+}
+html.ui2 .sub-strip.sub-blocked { background: #ffe7e5; border-color: rgba(240, 68, 58, .35); color: #8a1c15; }
+
+@media (max-width: 1360px) and (min-width: 761px) {
+  html.ui2 .header.app-top { padding-left: 16px; padding-right: 10px; gap: 10px; }
+  html.ui2 .header.app-top .app-nav a { padding: 7px 8px; }
+}
+@media (max-width: 760px) {
+  html.ui2 .header.app-top { margin: 8px 8px 0; top: 8px; padding: 6px 8px 6px 12px; border-radius: 16px; }
+  html.ui2 .header.app-top .app-menu-btn {
+    border: 1px solid var(--u-hair); border-radius: 12px; background: rgba(255, 255, 255, .7); color: var(--u-ink);
+  }
+  html.ui2 .header.app-top .app-menu-lbl,
+  html.ui2 .header.app-top .app-menu-cur:not(:empty)::before { color: var(--u-ink2); }
+  html.ui2.shell-js .header.app-top .app-nav {
+    margin-top: 8px; border-radius: 16px; border: 1px solid rgba(255, 255, 255, .8);
+    background: rgba(250, 250, 253, .97); box-shadow: 0 20px 50px rgba(46, 46, 96, .22);
+  }
+  html.ui2 .header.app-top .app-nav a { border-radius: 12px; }
+  html.ui2 .app-demo, html.ui2 .sub-strip { margin: 8px 8px 0; }
+}
+
+/* ---------- Кнопка «?» и меню помощи (_hints.html) ---------- */
+html.ui2 .hint-fab {
+  border: 1px solid rgba(255, 255, 255, .8); background: var(--u-glass-hi); color: var(--u-ink2);
+  -webkit-backdrop-filter: blur(20px) saturate(180%); backdrop-filter: blur(20px) saturate(180%);
+  box-shadow: 0 8px 24px rgba(46, 46, 96, .2); font-family: var(--u-font);
+}
+html.ui2 .hint-fab:hover { background: #fff; color: var(--u-ink); }
+html.ui2 .hint-fab.ping::after {
+  content: ""; position: absolute; inset: -5px; border-radius: 50%;
+  border: 2px solid var(--u-accent); animation: u-ping 1.4s var(--u-ease) 2;
+}
+@keyframes u-ping { from { opacity: .9; transform: scale(.8); } to { opacity: 0; transform: scale(1.7); } }
+html.ui2 .help-menu {
+  border-radius: 16px; border: 1px solid rgba(255, 255, 255, .8); background: var(--u-glass-hi);
+  -webkit-backdrop-filter: blur(30px) saturate(180%); backdrop-filter: blur(30px) saturate(180%);
+  box-shadow: 0 20px 50px rgba(46, 46, 96, .24); font: 13px/1.45 var(--u-font); color: var(--u-ink);
+}
+html.ui2 .help-menu .hmi { color: var(--u-ink); border-radius: 10px; }
+html.ui2 .help-menu .hmi:hover { background: rgba(120, 120, 128, .13); }
+html.ui2 .help-menu .hmi:focus-visible { outline: 3px solid rgba(10, 102, 214, .55); }
+html.ui2 .help-menu .hmi.on .hm-sw { background: #34c759; }
+html.ui2 .help-menu .hm-cnt { color: var(--u-ink2); }
+
+/* ---------- Подсказка первого визита (_hints.html) ---------- */
+html.ui2 .hint-overlay {
+  background: rgba(236, 236, 244, .45);
+  -webkit-backdrop-filter: blur(8px) saturate(115%); backdrop-filter: blur(8px) saturate(115%);
+}
+html.ui2 .hint-modal {
+  max-width: 470px; border-radius: 26px; background: var(--u-glass-hi); color: var(--u-ink);
+  border: 1px solid rgba(255, 255, 255, .85);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .9), 0 30px 80px rgba(46, 46, 96, .26);
+  font: 15px/1.5 var(--u-font); text-align: center;
+}
+html.ui2 .hint-modal .hm-scroll { padding: 32px 34px 8px; }
+html.ui2 .hint-modal h2 { font-size: 25px; line-height: 1.2; font-weight: 700; letter-spacing: -.02em; margin: 0 0 10px; }
+html.ui2 .hint-modal p { color: var(--u-ink2); margin: 0 0 8px; }
+html.ui2 .hint-modal .hm-ico {
+  width: 60px; height: 60px; border-radius: 17px; margin: 0 auto 16px; display: grid; place-items: center; color: #fff;
+  background: linear-gradient(150deg, #b8e23a, #3fbf6b);
+  box-shadow: 0 10px 24px rgba(63, 191, 107, .3), inset 0 1px 0 rgba(255, 255, 255, .5);
+}
+html.ui2 .hint-modal .hm-foot { border-top: 0; padding: 10px 34px 26px; display: grid; gap: 4px; justify-items: center; }
+html.ui2 .hint-modal .hm-go {
+  min-height: 40px; padding: 0 22px; border-radius: 999px; border: 0; cursor: pointer;
+  background: var(--u-accent); color: #fff; font: 600 14px var(--u-font);
+  box-shadow: 0 6px 16px rgba(10, 102, 214, .28);
+}
+html.ui2 .hint-modal .hm-go:hover { background: #0b72ee; }
+html.ui2 .hint-modal .hm-close {
+  width: auto; min-height: 40px; padding: 0 16px; border-radius: 999px;
+  background: none; color: var(--u-accent); font: 600 14px var(--u-font);
+}
+html.ui2 .hint-modal .hm-close:hover { background: var(--u-accent-soft); }
+/* Без кнопки тура (нет подсказок или они ещё не готовы) «закрыть» остаётся
+   главной кнопкой. */
+html.ui2 .hint-modal .hm-foot:not(.has-go) .hm-close {
+  background: var(--u-accent); color: #fff; padding: 0 22px; box-shadow: 0 6px 16px rgba(10, 102, 214, .28);
+}
+
+/* ---------- Плашка свежести данных ---------- */
+html.ui2 .fresh-chip {
+  border-radius: 999px; border: 1px solid var(--u-hair); background: rgba(255, 255, 255, .6);
+  color: var(--u-ink2); font: 12px/16px var(--u-font); box-shadow: none;
+}
+html.ui2 .fresh-chip .fd { background: #2fb457; }
+html.ui2 .fresh-chip.warn { background: #fff1cf; color: #6b4e0e; border-color: rgba(240, 140, 0, .4); }
+html.ui2 .fresh-chip.warn .fd { background: #f08c00; }
+html.ui2 .fresh-chip.bad { background: #f0443a; color: #fff; border-color: transparent; }
+html.ui2 .fresh-chip.fresh-inflow { margin: 10px 16px 0; }
+@media (max-width: 640px) { html.ui2 .fresh-chip.fresh-inflow { margin: 8px 8px 0; } }
+
+@media (prefers-reduced-motion: reduce) {
+  html.ui2 *, html.ui2 *::before, html.ui2 *::after {
+    animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important;
+  }
+}
