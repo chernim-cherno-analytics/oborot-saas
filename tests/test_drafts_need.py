@@ -104,6 +104,23 @@ with TestClient(app, headers={"X-Oborot-CSRF": "1"}) as c:
     check("мастер считает такие позиции", (plan2.get("review") or {}).get("in_drafts_count", 0) >= 1,
           str((plan2.get("review") or {}).get("in_drafts_count")))
 
+    print("\n2б. Черновик старше 30 дней потребность не уменьшает (прод 16.11)")
+    import sqlite3
+    r = c.post("/api/orders", json={"name": "Август", "allow_duplicate": True,
+                                    "items": [{"base_name": b, "qty": 3}]})
+    old_id = r.json()["id"]
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute("UPDATE production_orders SET created_at=datetime('now','-40 days') WHERE id=?", (old_id,))
+        con.commit()
+    full_old = rep_full(c)
+    check("старый черновик назван на «Заказе»",
+          any(x["id"] == old_id and x["positions"] == 1 for x in full_old.get("stale_drafts") or []),
+          str(full_old.get("stale_drafts")))
+    check("и в вычет не входит: позиция по-прежнему целиком закрыта свежим черновиком, без +3",
+          any(e["base_name"] == b and f"{n0 + 5} шт" in e["reason"] for e in full_old.get("excluded") or []),
+          str([e for e in full_old.get("excluded") or [] if e["base_name"] == b]))
+    c.delete(f"/api/orders/{old_id}")
+
     print("\n3. Отправленный в производство заказ уже не черновик")
     c.post(f"/api/orders/{oid2}/status", json={"status": "sent"})
     rep3 = rep_full(c)

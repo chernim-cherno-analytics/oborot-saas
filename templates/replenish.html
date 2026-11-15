@@ -401,6 +401,11 @@
     </div>
   </details>
 
+  {# D-85: черновики старше месяца планом не считаются и потребность не
+     уменьшают; их нужно удалить или отправить в производство. #}
+  <div id="stale-drafts" role="status" style="display:none;background:#fff8e1;border:1px solid rgba(255,204,0,.5);
+    border-radius:10px;padding:9px 14px;margin:0 0 12px;font-size:12.5px;line-height:1.5"></div>
+
   <div class="sumbar" id="sumbar" style="display:none">
     <div class="scard" id="risk-card"><div class="sl">Риск стокаута</div><div class="sv" id="k-risk">0</div><div class="ss" id="k-risk-sub">покрытие меньше 2 недель</div>
       <button type="button" class="risk-go" id="risk-go" aria-controls="tbl-wrap" aria-pressed="false">Показать «Срочно» в таблице</button></div>
@@ -734,6 +739,12 @@
     FALLBACK_COUNT=d.fallback_count||0;
     SEASON_FROM=d.season_from||null; SEASON_TO=d.season_to||null;
     SENT_ORDERS=d.orders_in_production||[];
+    var sd=d.stale_drafts||[], sdBox=document.getElementById("stale-drafts");
+    sdBox.style.display=sd.length?"":"none";
+    sdBox.innerHTML=sd.length?("<b>"+(sd.length===1?"Черновик":"Черновики")+" старше "+fmt(d.draft_fresh_days||30)+" дней</b> "+
+      sd.map(function(x){ return "«"+esc(x.name)+"» ("+(x.created?fmtDate(x.created):"")+", "+fmt(x.positions)+" поз.)"; }).join(", ")+
+      " в расчёте не учитываются: свежий черновик уменьшает потребность, старый считается брошенным. "+
+      "Удалите или отправьте в производство в блоке заказов под таблицей."):"";
     syncRateSeg();
     // QA 15.11: после оформления (и любой перезагрузки данных) отметки строк
     // сохраняются; раньше все оставшиеся строки снова становились отмеченными
