@@ -2197,11 +2197,15 @@
           if(payGen!==PAY_GEN) return;
           var ps=d.payments||[];
           if(!ps.length) return;
-          var lines=ps.map(function(x){
-            return new Date(x.date).toLocaleDateString("ru-RU",{day:"numeric",month:"short"})+": "+x.label+", "+fmtMoneyShort(x.amount);
-          });
+          // Даты календаря без часового пояса: new Date("ГГГГ-ММ-ДД") это
+          // полночь UTC, и западнее UTC день съезжал на вчера (ревью Codex #109).
+          function dd(iso){
+            var p=String(iso||"").split("-");
+            return new Date(+p[0],(+p[1])-1,+p[2]).toLocaleDateString("ru-RU",{day:"numeric",month:"short"});
+          }
+          var lines=ps.map(function(x){ return dd(x.date)+": "+x.label+", "+fmtMoneyShort(x.amount); });
           payEl.innerHTML="<b>Платежи по этому заказу</b> (по условиям производства): "+esc(lines.join("; "))+"."+
-            (d.open_due>0?(" По уже открытым заказам до "+new Date(d.until).toLocaleDateString("ru-RU",{day:"numeric",month:"short"})+
+            (d.open_due>0?(" По уже открытым заказам до "+dd(d.until)+
               " причитается ещё "+esc(fmtMoneyShort(d.open_due))+"."):"");
           payEl.style.display="block";
         }).catch(function(){});
