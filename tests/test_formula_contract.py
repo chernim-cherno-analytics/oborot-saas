@@ -16,8 +16,9 @@
 ЧТО ЗАКРЕПЛЕНО (и где живёт оригинал):
 
   1. Аналитика, `app/analytics.py`:
-         proj_stock = max(0.0, cs − rate × lead) + ordered        (D-65)
-         need       = max(0, round(rate × horizon) − round(proj_stock))
+         proj_stock = max(0.0, cs − r_lead × lead) + ordered      (D-65)
+         need       = max(0, int(round(r_cover × horizon − proj_stock)))   (D-79)
+     r_lead = r_cover = темп окна; при окнах «год» и «90 дней» сезонный темп мастера.
      Проверяется НА ЖИВОМ ПУТИ: `analytics.get_snapshot` (то есть
      `_compute_snapshot`) → `analytics.build_replenish`, на настоящей БД.
 
@@ -32,12 +33,11 @@
   4. `analytics_extra._largest_remainder` — при нулевых весах отдаёт НУЛИ,
      тай-брейк по ОДНОМУ ключу (остаток).
 
-ПРО РАЗНИЦУ НА 1. На одном и том же входе две формулы потребности дают 14 и 15.
-Это НЕ «правильное» и «неправильное» число: это известное текущее поведение,
-описанное в BUSINESS_LOGIC §9.4 («сам порядок округления расходится на
-2 позициях из 42 и ровно на 1 шт»). Набор закрепляет его как факт кода, чтобы
-разница не выросла и не исчезла незаметно. Каким темпом мастер обязан считать
-заказ — вопрос владельца, а не этого набора.
+ПРО РАЗНИЦУ НА 1. До 15.11.2026 на одном и том же входе две формулы
+потребности давали 14 и 15 (BUSINESS_LOGIC §9.4: «сам порядок округления
+расходится на 2 позициях из 42 и ровно на 1 шт»). Решением владельца D-79
+(«один поток», одно число) аналитика считает в порядке мастера; набор
+закрепляет, что на том же входе обе дают 15 и разница не вернётся незаметно.
 
 ЧЕГО ЗДЕСЬ НЕТ НАМЕРЕННО. Поведение при `None`/отсутствующем значении не
 закрепляется: планировщик приводит `None` к нулю (`float(… or 0)`), а D-34
@@ -175,9 +175,9 @@ PLANNER_PY = Path(op.__file__).resolve()
 # Ровно те строки, которые набор и запирает. Ищутся по тексту, а не по номеру:
 # номер поедет от любой правки выше по файлу, а замок обязан переживать правки,
 # которые его не касаются.
-NEED_LINE_ANALYTICS = 'item["need"] = max(0, round(rate * horizon) - round(proj_stock))'
+NEED_LINE_ANALYTICS = 'item["need"] = max(0, int(round(r_cover * horizon - proj_stock)))'
 # D-65: «едет» не закрывает продажи до прихода.
-PROJ_LINE_ANALYTICS = 'proj_stock = max(0.0, cs - rate * lead) + max(0.0, float(item["ordered"]))'
+PROJ_LINE_ANALYTICS = 'proj_stock = max(0.0, cs - r_lead * lead) + max(0.0, float(item["ordered"]))'
 NEED_LINE_PLANNER = "need = max(0, int(round(r_cover * cover - proj_stock)))"
 PROJ_LINE_PLANNER = "proj_stock = max(0.0, cs - r_lead * days_to_eta) + ordered"
 
@@ -310,10 +310,10 @@ def main() -> int:
     #
     # Сцена: темп 0,5 шт/день, горизонт 45, срок 45, остаток 30.
     #   proj_stock = max(0, 30 − 0,5×45) = 7,5
-    #   need       = max(0, round(22,5) − round(7,5)) = 22 − 8 = 14
+    #   need       = max(0, int(round(22,5 − 7,5))) = 15   (D-79, порядок мастера)
     # Обе половины попадают ровно на «.5», где round() в Python округляет
-    # к чётному: 22,5 → 22, но 7,5 → 8. Ровно поэтому порядок округления
-    # здесь виден, а на «обычных» входах — нет.
+    # к чётному: 22,5 → 22, но 7,5 → 8. Раздельное округление дало бы 14:
+    # ровно поэтому порядок округления здесь виден, а на «обычных» входах нет.
     org_a = make_org(db, "contract-tie", cs=30, sold=1)
 
     def _snapshot():
@@ -349,8 +349,8 @@ def main() -> int:
               item_a["rate_year"] == 0.5, f"rate_year={item_a['rate_year']}")
         check("прогнозный остаток = max(0, cs + ordered − темп×срок) = 8 (7,5)",
               item_a["proj_stock"] == 8, f"proj_stock={item_a['proj_stock']}")
-        check("потребность = round(темп×горизонт) − round(остаток) = 22 − 8 = 14",
-              item_a["need"] == 14, f"need={item_a['need']}")
+        check("потребность = round(темп×горизонт − остаток) = round(15,0) = 15 (D-79)",
+              item_a["need"] == 15, f"need={item_a['need']}")
         check("потребность — целое, а не float",
               type(item_a["need"]) is int, f"тип {type(item_a['need']).__name__}")
 
@@ -361,7 +361,7 @@ def main() -> int:
         row = next((r for r in rep["items"] if r["base_name"] == BASE), None)
         check("позиция дошла до ответа /api/replenish", row is not None)
         check("страница «Заказ» показывает ТУ ЖЕ потребность, что и снапшот",
-              row is not None and row["need"] == item_a["need"] == 14,
+              row is not None and row["need"] == item_a["need"] == 15,
               f"row={row['need'] if row else None} snap={item_a['need']}")
         check("горизонт ответа — эффективный горизонт покрытия (45)",
               rep["horizon_days"] == HORIZON, f"horizon={rep['horizon_days']}")
@@ -499,14 +499,11 @@ def main() -> int:
         # владельца (D-35), а не правки этого файла.
         need_analytics = item_a["need"]
         need_master = plan_need(plan_m)
-        check("на одном входе аналитика даёт 14, мастер — 15",
-              (need_analytics, need_master) == (14, 15),
+        check("на одном входе аналитика и мастер дают 15 (D-79, одно число)",
+              (need_analytics, need_master) == (15, 15),
               f"аналитика={need_analytics} мастер={need_master}")
-        check("разница ровно 1 — известное поведение (BUSINESS_LOGIC §9.4)",
-              need_master - need_analytics == 1,
-              f"разница={need_master - need_analytics if need_master is not None else None}")
 
-    block("9. Известное расхождение двух формул (BUSINESS_LOGIC §9.4)", _known_gap)
+    block("9. Порядок округления один у аналитики и мастера (D-79, бывший §9.4)", _known_gap)
 
     def _size_split():
         # Нулевые веса: продаж по размерам нет вовсе → делим ПОРОВНУ.

@@ -2790,7 +2790,10 @@ def run_scenario() -> int:
           b_it["need_raw"] >= big["need"],
           f"{big['need']} → {b_it['need_raw']} (срок 45 → 70 дн)")
     check("потребность сильно ниже партии помечена «заказывать невыгодно»",
-          s_it["moq_low"] is (small["need"] < 15), f"need={small['need']} moq_low={s_it['moq_low']}")
+          # Признак считается от потребности ПОСЛЕ переноса (need_raw по сроку
+          # «Бишкека»), а не от прежней: с D-79 сезонный темп на 70 днях другой.
+          s_it["moq_low"] is (s_it["need_raw"] < 15),
+          f"need_raw={s_it['need_raw']} moq_low={s_it['moq_low']}")
     check("крупная позиция округлена вверх до кратности",
           b_it["need"] % 6 == 0 and b_it["need"] >= b_it["need_raw"] > 0
           and b_it["need"] - b_it["need_raw"] < 6,

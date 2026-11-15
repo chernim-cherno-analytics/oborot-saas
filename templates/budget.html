@@ -108,22 +108,20 @@
 
 <div class="main">
   <details class="note">
-    <summary>Чем «Бюджет» отличается от страницы «Заказ»</summary>
+    <summary>Как считает «Бюджет»</summary>
     <div class="body">
-      <p><b>Это та же страница «Заказ», только исходя из бюджета, а не из того, что надо.</b>
-      «Заказ» отвечает на вопрос «сколько нужно, чтобы хватило на горизонт» — и не смотрит на деньги.
-      «Бюджет» отвечает на вопрос «есть N рублей — на что их потратить, чтобы они отработали лучше всего».
-      Деньги распределяются строго по оборачиваемости: сначала бюджет получают бестселлеры, потом хорошие
-      и так далее, пока деньги не кончатся.</p>
-      <p>Потребность каждой позиции считается как на «Заказе»: темп продаж × горизонт − прогнозный остаток
-      к приходу (остаток минус продажи за срок производства, плюс «едет»), и деньги здесь полная себестоимость,
-      без этапов и предоплат. Мастер заказа распределяет те же деньги иначе: волнами, в деньгах «на сейчас»,
-      с этапами и минимальными партиями, поэтому при той же сумме состав будет другим. Здесь же
-      <b>без условий производства</b> — минимальная партия и кратность подрядчика здесь не применяются: бюджет
-      делит деньги и берёт ровно столько, на сколько их хватает, а поднимать до партии, которую всё равно не
-      выкупить, нечестно. Довести заказ до партии для фабрики — на странице «Заказ», её выгрузка и есть заказ.
-      В расчёте позиции с продажами за последние 90 дней и распроданные, у которых был спрос до стокаута (D-67). «Макс. на позицию» не даёт одному
-      бестселлеру съесть весь бюджет. Категории выключаются кнопками — бюджет пересчитается.</p>
+      <p><b>Это вид мастера заказа: тот же расчёт, только вопрос другой.</b>
+      «Заказ» отвечает «сколько нужно, чтобы хватило на горизонт» и не смотрит на деньги.
+      «Бюджет» отвечает «есть N рублей: на что их потратить, чтобы они отработали лучше всего».
+      Деньги идут строго по оборачиваемости: сначала каждой позиции-лидеру до полной потребности, потом
+      следующим, пока деньги не кончатся (стратегия мастера «Заработать максимум»).</p>
+      <p>Потребность та же, что на «Заказе» и в мастере: темп продаж (с поправкой на сезон того периода, когда
+      партия будет продаваться) × горизонт − прогнозный остаток к приходу (остаток минус продажи за срок
+      производства, плюс «едет»). Условия производства применяются: минимальная партия, кратность упаковки
+      и минимумы этапов, как в мастере. Сумма здесь полная себестоимость заказа (с накладными из настроек), без деления
+      на «сейчас» и «потом»: календарь платежей и этапы смотрите в мастере. «Макс. на позицию» не даёт одному
+      бестселлеру съесть весь бюджет. Категории выключаются кнопками, бюджет пересчитается. Позиции,
+      которые продаются в минус, в распределение не входят (D-76).</p>
     </div>
   </details>
 
@@ -138,6 +136,8 @@
              title="Доля бюджета, больше которой не получит одна позиция. От 5 до 100 %">
       <span class="lbl" style="text-transform:none">%</span>
       <span class="hint">от 5 до 100</span>
+      <span class="lbl" id="prodLbl" style="display:none">Производство</span>
+      <select class="binp" id="prodSel" style="display:none;width:auto" title="Позиции других производств считаются отдельно"></select>
       <button class="go-btn" id="calcBtn" onclick="calc()">Распределить</button>
       <span class="hint" id="statusHint"></span>
       <a class="go-btn" id="xlsxBtn" style="margin-left:auto;text-decoration:none;background:rgba(255,255,255,.6);color:#1f1f1f;border-color:rgba(31,31,31,.25)"
@@ -158,10 +158,10 @@
       <thead><tr>
         <th style="text-align:left">Позиция</th>
         <th title="Оборачиваемость: нетто-выручка ₽/день за дни в стоке — приоритет распределения">Оборач., ₽/день</th>
-        <th title="Честный темп продаж">Темп, шт/мес</th>
+        <th title="Темп, которым посчитана потребность: с поправкой на сезон того периода, когда партия будет продаваться (как в мастере)">Темп, шт/мес</th>
         <th title="Остаток + едет к нам">Остаток+едет</th>
         <th title="На сколько дней хватит текущего запаса">Запас, дн</th>
-        <th title="Как на «Заказе»: темп × горизонт − прогнозный остаток к приходу (остаток − темп × срок производства, плюс «едет»), но без округления до минимальной партии подрядчика — оно применяется на «Заказе»">Потребность</th>
+        <th title="Как на «Заказе» и в мастере: темп × горизонт − прогнозный остаток к приходу (остаток − темп × срок производства, плюс «едет»)">Потребность</th>
         <th>Заказать</th>
         <th>Себес/шт</th>
         <th>Сумма</th>
@@ -249,7 +249,9 @@
   }
 
   function catQS(){
-    return OFFCATS.size?("&exclude_cats="+encodeURIComponent([...OFFCATS].join(","))):"";
+    var ps=document.getElementById("prodSel");
+    var pq=(ps && ps.value)?("&production_id="+encodeURIComponent(ps.value)):"";
+    return pq+(OFFCATS.size?("&exclude_cats="+encodeURIComponent([...OFFCATS].join(","))):"");
   }
   function xlsxHref(){
     return "/api/export/budget.xlsx?amount="+applied.amount+"&max_share="+applied.cap+catQS();
@@ -348,6 +350,17 @@
     }).then(function(d){
       ALLCATS=d.categories||[];
       renderCatBar();
+      // D-79: «Бюджет» считает мастером по одному производству; при нескольких
+      // каналах показываем выбор, позиции других каналов считаются отдельно.
+      var ps=document.getElementById("prodSel"), prods=d.productions||[];
+      if(prods.length>1){
+        var cur=(d.production||{}).id;
+        ps.innerHTML=prods.map(function(p){
+          return '<option value="'+p.id+'"'+(p.id===cur?' selected':'')+'>'+esc(p.name)+'</option>';
+        }).join("");
+        ps.style.display=""; document.getElementById("prodLbl").style.display="";
+        ps.onchange=function(){ calc(); };
+      }
       applied={amount:amount, cap:cap};   // теперь таблица соответствует полям
       hasResult=true;
       document.getElementById("xlsxBtn").setAttribute("href",xlsxHref());
@@ -371,6 +384,23 @@
           (soldOut?', из них '+soldOut+' с остатком 0 (возможно, просто распроданы; в «Мастере заказа» их можно отметить и взять в расчёт)':'')+': '+
           stale.map(function(r){ return esc(r.base_name)+((r.cs||0)>0?'':' (остаток 0)'); }).join(", ")+
           (d.excluded_fresh_count>stale.length?' и ещё '+(d.excluded_fresh_count-stale.length):'')+'.</div>':"";
+      // Ревью #108: партия дороже лимита доли на позицию, и позиции с
+      // темпом из одной-двух продаж: в распределение не вошли, называем.
+      var oc=d.moq_over_cap||[];
+      if(oc.length){
+        document.getElementById("warnBox").innerHTML+='<div class="warn">Минимальная партия дороже лимита на позицию, не вошли: '+
+          oc.map(function(r){ return esc(r.base_name)+' (партия '+fmt(r.batch_qty||0)+' шт, '+fmt(r.batch_full_cost||r.batch_cost||0)+' ₽)'; }).join(", ")+
+          '. Поднимите «Макс. на позицию» или решите в мастере.</div>';
+      }
+      if(d.low_data_count){
+        document.getElementById("warnBox").innerHTML+='<div class="warn">'+fmt(d.low_data_count)+
+          ' поз. с темпом из одной-двух продаж не распределяются (решаете вы в мастере заказа галочкой): '+
+          (d.low_data||[]).map(function(r){ return esc(r.base_name); }).join(", ")+'.</div>';
+      }
+      if(d.other_production_count){
+        document.getElementById("warnBox").innerHTML+='<div class="warn">'+fmt(d.other_production_count)+
+          ' поз. закреплены за другими производствами и считаются при их выборе.</div>';
+      }
       // D-76: позиции в минус в распределение не входят.
       var loss=d.excluded_loss||[];
       if(d.excluded_loss_count){
@@ -390,8 +420,8 @@
       // таблица
       var rows=(d.items||[]).map(function(x){
         return '<tr class="'+rowCls(x.turnover)+'"><td>'+esc(x.base_name)+
-          (x.capped?' <span class="muted" style="font-size:10px" title="'+esc(x.cap_reason||"урезано лимитом")+'">✂</span>':"")+
-          (x.over_limit?' <span class="muted" style="font-size:10px" title="дороже лимита — вошла одной штукой">1!</span>':"")+
+          (x.capped?' <span class="muted" style="font-size:10px" title="'+esc(x.why_text||(x.cap_reason==="share"?"срезано лимитом на позицию":"дальше деньги закончились"))+'">✂</span>':"")+
+          (x.over_need?' <span class="muted" style="font-size:10px" title="поднято до минимальной партии или кратности: на '+x.over_need+' шт больше потребности">партия</span>':"")+
           '<span class="muted" style="display:block;font-size:10px;font-weight:400">'+esc(x.category)+'</span></td>'+
           '<td class="nb">'+fmt(x.turnover)+'</td>'+
           '<td class="nb">'+fmt(x.rate*30.44)+'</td>'+
@@ -411,11 +441,23 @@
       var sk=d.not_included||[];
       var skF=document.getElementById("skippedFold");
       skF.style.display=sk.length?"":"none";
-      document.getElementById("skippedCnt").textContent=sk.length+" позиций — деньги кончились раньше";
+      // Ревью Codex #108: позиция могла не войти не из-за денег, а потому что
+      // минимальная партия разошлась бы слишком долго. Причину называем.
+      var nBud=sk.filter(function(x){ return (x.reason||"budget")==="budget"; }).length;
+      var nMoq=sk.filter(function(x){ return x.reason==="moq_skip"; }).length;
+      var nCap=sk.filter(function(x){ return x.reason==="over_cap"; }).length;
+      var why=[];
+      if(nBud) why.push("деньги кончились: "+nBud);
+      if(nMoq) why.push("партия разошлась бы слишком долго: "+nMoq);
+      if(nCap) why.push("партия дороже лимита на позицию: "+nCap);
+      document.getElementById("skippedCnt").textContent=sk.length+" позиций не вошли ("+why.join("; ")+")";
       document.getElementById("skippedBody").innerHTML='<table><tbody>'+sk.map(function(x){
         return '<tr><td style="text-align:left;padding-left:14px">'+esc(x.base_name)+'</td>'+
           '<td class="nb">оборач. '+fmt(x.turnover)+'</td><td class="nb">потребность '+fmt(x.need)+' шт</td>'+
-          '<td class="nb">себес '+fmtR(x.cost_price)+'</td></tr>';
+          '<td class="nb">себес '+fmtR(x.cost_price)+'</td>'+
+          '<td class="nb">'+(x.reason==="moq_skip"?('партия разошлась бы за '+fmt(x.moq_skip_days)+' дн')
+            :x.reason==="over_cap"?('партия дороже лимита'+(x.batch_cost?(': '+fmtR(x.batch_cost)):''))
+            :'деньги кончились')+'</td></tr>';
       }).join("")+'</tbody></table>';
       var nc=d.no_cost||[];
       var ncF=document.getElementById("nocostFold");

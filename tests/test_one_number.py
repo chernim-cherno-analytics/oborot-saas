@@ -5,8 +5,8 @@
 (бюджет без ограничения, «Глубже в топ», лимит доли 100%) совпадает для каждой
 общей позиции. Это стало правдой после D-65 («едет»), D-66 (сезон один раз),
 D-67 (распроданные) и TRUTH-2 (срок канала). При окне «год» мастер применяет
-сезонный индекс категории, а «Заказ» нет: расхождение печатается для
-сведения, но не проверяется, пока владелец не решит вопрос 2 спецификации.
+сезонный индекс; с D-79 (15.11.2026) «Заказ» тоже, и контракт держится при
+любом окне.
 
 Синтетическая база, демо-данные.
 """
@@ -63,12 +63,58 @@ with TestClient(app, headers={"X-Oborot-CSRF": "1"}) as c:
     check("общих позиций достаточно для вывода", len(both) >= 20, str(len(both)))
     check("потребность «Заказа» и мастера совпадает у каждой общей позиции", not diff, str(diff[:5]))
 
-    print("\n2. Окно «год»: для сведения (ждёт решения владельца, вопрос 2)")
-    c.post("/api/settings", json={"rate_window": "year"})
-    rep, mas = needs(c)
-    both = sorted(set(rep) & set(mas))
-    diff = [(b, rep[b], mas[b]) for b in both if rep[b] != mas[b]]
-    print(f"  ИНФО окно «год»: расходятся {len(diff)} из {len(both)}, примеры {diff[:3]}")
+    # D-79 (решение владельца 15.11.2026, 2A): сезонный темп везде, поэтому
+    # одно число держится и при окнах «год» и «90 дней».
+    for window, label in (("year", "год"), ("d90", "90 дней")):
+        print(f"\n2. Окно «{label}»: одно число (D-79)")
+        check(f"окно «{label}» выставлено",
+              c.post("/api/settings", json={"rate_window": window}).status_code == 200)
+        rep, mas = needs(c)
+        both = sorted(set(rep) & set(mas))
+        diff = [(b, rep[b], mas[b]) for b in both if rep[b] != mas[b]]
+        check(f"общих позиций достаточно ({label})", len(both) >= 20, str(len(both)))
+        check(f"потребность «Заказа» и мастера совпадает у каждой общей позиции ({label})",
+              not diff, f"{len(diff)} из {len(both)}: {diff[:5]}")
+
+    print("\n4. Нулевой темп окна не подменяется годовым (ревью #108, P1)")
+    import sqlite3 as _sq
+    from datetime import date as _d, timedelta as _td
+    c.post("/api/settings", json={"rate_window": "season"})
+    snapd = c.get("/api/replenish").json()
+    sf, st = snapd.get("season_from"), snapd.get("season_to")
+    tgt = next((i["base_name"] for i in snapd["items"]
+                if i.get("cs", 0) > 0 and not i.get("low_data") and i.get("rate_year", 0) > 0.3), None)
+    if tgt and sf and st:
+        with _sq.connect(DB_PATH) as con:
+            ids = [r[0] for r in con.execute("SELECT id FROM products WHERE base_name=?", (tgt,))]
+            for pid in ids:
+                con.execute("DELETE FROM sales WHERE product_id=? AND date>=? AND date<=?", (pid, sf, st))
+            con.commit()
+        c.post("/api/settings", json={"rate_window": "season"})
+        rep4 = c.get("/api/replenish").json()
+        excl = {e["base_name"] for e in rep4["excluded"]}
+        plan4 = c.post("/api/order-plan/preview", json={
+            "budget": 50_000_000, "strategy": "grow", "max_share_pct": 100}).json()
+        bud4 = c.get("/api/budget", params={"amount": 50_000_000, "max_share": 100}).json()
+        check("позиция без продаж в сезонном окне исключена «Заказом»", tgt in excl, tgt)
+        check("мастер её не заказывает годовым темпом",
+              tgt not in {i["base_name"] for i in plan4["items"]}, tgt)
+        check("«Бюджет» тоже", tgt not in {i["base_name"] for i in bud4["items"]}, tgt)
+    else:
+        check("нашлась позиция для сцены нулевого темпа", False, f"{tgt} {sf} {st}")
+
+    print("\n3. «Бюджет» = мастер с теми же условиями (D-79, 1A)")
+    bud = c.get("/api/budget", params={"amount": 300000, "max_share": 30}).json()
+    plan = c.post("/api/order-plan/preview", json={
+        "budget": 300000, "budget_scope": "full", "strategy": "grow", "width_days": 0,
+        "max_share_pct": 30, "production_id": (bud.get("production") or {}).get("id")}).json()
+    b_q = {i["base_name"]: i["qty"] for i in bud["items"]}
+    m_q = {i["base_name"]: i["qty"] for i in plan["items"]}
+    check("«Бюджет» считает движком мастера", bud.get("engine") == "master", str(bud.get("engine")))
+    check("состав и количества «Бюджета» совпадают с мастером", b_q == m_q and b_q,
+          f"бюджет={sorted(b_q.items())[:4]} мастер={sorted(m_q.items())[:4]}")
+    check("сумма «Бюджета» = себестоимость плана мастера",
+          bud["used"] == plan["totals"]["cost"], f"{bud['used']} {plan['totals']['cost']}")
 
 for suffix in ("", "-wal", "-shm"):
     p = Path(str(DB_PATH) + suffix)

@@ -64,11 +64,11 @@ PLANNER = "app/order_planner.py"
 MUTATIONS: list[tuple[str, str, str, str, str, tuple[str, ...]]] = [
     (
         "1",
-        "аналитика: порядок округления сведён к мастеру round(итог − остаток)",
+        "аналитика: порядок округления снова раздельный (до D-79)",
         ANALYTICS,
-        'item["need"] = max(0, round(rate * horizon) - round(proj_stock))',
-        'item["need"] = max(0, round(rate * horizon - proj_stock))',
-        ("потребность = round(темп×горизонт) − round(остаток) = 22 − 8 = 14",),
+        'item["need"] = max(0, int(round(r_cover * horizon - proj_stock)))',
+        'item["need"] = max(0, round(r_cover * horizon) - round(proj_stock))',
+        ("потребность = round(темп×горизонт − остаток) = round(15,0) = 15 (D-79)",),
     ),
     (
         "2",
@@ -90,8 +90,8 @@ MUTATIONS: list[tuple[str, str, str, str, str, tuple[str, ...]]] = [
         "4a",
         "аналитика: снят пол max(0, …) — потребность уходит в минус",
         ANALYTICS,
-        'item["need"] = max(0, round(rate * horizon) - round(proj_stock))',
-        'item["need"] = round(rate * horizon) - round(proj_stock)',
+        'item["need"] = max(0, int(round(r_cover * horizon - proj_stock)))',
+        'item["need"] = int(round(r_cover * horizon - proj_stock))',
         ("затоварка: пол max(0, …) держит потребность на нуле",
          "нет продаж → потребность 0, а не отрицательная"),
     ),
@@ -139,7 +139,7 @@ MUTATIONS: list[tuple[str, str, str, str, str, tuple[str, ...]]] = [
         "8",
         "size_split объявлен алиасом _largest_remainder (функции «свели»)",
         ANALYTICS,
-        '    weights = [max(0.0, float(sizes[s].get("sold365") or 0)) for s in grid]\n'
+        "    weights = [size_weight(sizes[s]) for s in grid]\n"
         "    if sum(weights) <= 0:\n"
         "        weights = [1.0] * len(grid)\n"
         "    wsum = sum(weights)\n"
