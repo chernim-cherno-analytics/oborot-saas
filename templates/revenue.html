@@ -289,7 +289,7 @@
   });
   document.getElementById("applyCustom").addEventListener("click",function(){
     var f=document.getElementById("d-from").value, t=document.getElementById("d-to").value;
-    if(!f||!t){ alert("Укажи обе даты"); return; }
+    if(!f||!t){ alert("Укажите обе даты"); return; }
     document.querySelectorAll(".preset").forEach(function(x){ x.classList.remove("active"); });
     this.classList.add("active");
     applyPeriod(f,t);

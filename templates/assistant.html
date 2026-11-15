@@ -1088,7 +1088,7 @@
       (hasNew && p.order_totals ? (pendingOrderEdits() ?
         '<div class="warn">Пересчитайте план, чтобы обновить полный состав и календарь с новинками.</div>' :
         '<div class="panel" id="completeOrderSummary"><b>Полный состав заказа, включая новинки</b>: '+
-        fmt(p.order_totals.positions)+' позиций · '+fmt(p.order_totals.units)+' шт · '+
+        fmt(p.order_totals.positions)+' '+plural(p.order_totals.positions,'позиция','позиции','позиций')+' · '+fmt(p.order_totals.units)+' шт · '+
         fmtR(p.order_totals.cost)+'. Новинки включены в календарь платежей. '+
         'Карточки выше относятся к каталожным позициям.</div>') :
         (hasNew ? '<div class="warn">Новинки на '+fmtR(p.new_items_cost_full != null ? p.new_items_cost_full : p.new_items_cost)+
@@ -1299,9 +1299,9 @@
     // как решение человека (тот же must_have, что у «мало данных»).
     function staleBlock(rev){
       var n = rev.stale_count||0, days = rev.fresh_days||90;
-      if(!n) return '<div class="peak">Без продаж '+days+' дней — 0 поз.</div>';
+      if(!n) return '<div class="peak">Без продаж '+days+' '+plural(days,'дня','дней','дней')+' — 0 поз.</div>';
       var rows = rev.stale||[], soldOut = rows.filter(function(r){ return r.sold_out; }).length;
-      return '<div class="peak"><b>Без продаж '+days+' дней — '+n+' поз.</b> Система их не заказывает.'+
+      return '<div class="peak"><b>Без продаж '+days+' '+plural(days,'дня','дней','дней')+' — '+n+' поз.</b> Система их не заказывает.'+
         (soldOut ? ' Из них '+soldOut+' с остатком 0: возможно, они не перестали продаваться, а просто распроданы. '+
           'Если так, отметьте, и позиция войдёт в расчёт.' : '')+'</div>'+
         rows.map(function(r){
@@ -1466,7 +1466,7 @@
         ? '<div class="hint" style="margin:14px 0 0">'+
           (p.overhead_pct ? 'В себестоимость добавлены накладные <b>'+p.overhead_pct+'%</b>. ' : '')+
           (p.pack_multiple > 1 ? 'Количества округлены до кратности упаковки <b>'+p.pack_multiple+' шт</b>. ' : '')+
-          (p.no_supplier_count ? ('У '+p.no_supplier_count+' позиций в МойСкладе не заполнен поставщик — '+
+          (p.no_supplier_count ? ('У '+p.no_supplier_count+' '+plural(p.no_supplier_count,'позиции','позиций','позиций')+' в МойСкладе не заполнен поставщик — '+
             'в этот канал они попали по умолчанию. ') : '')+
           '</div>' : '')+
       '<div class="ptools" style="display:flex;gap:9px;align-items:center;flex-wrap:wrap;margin:14px 0 6px">'+
@@ -1840,12 +1840,12 @@
     // есть кнопка «сразу показать план», и владелец проходил мимо него.
     var money = [];
     if(opt.positions && opt.cost_source_full < opt.positions){
-      money.push("Полная себестоимость задана у " + (opt.cost_source_full||0) + " позиций из " +
+      money.push("Полная себестоимость задана у " + (opt.cost_source_full||0) + " " + plural(opt.cost_source_full||0, "позиции", "позиций", "позиций") + " из " +
         opt.positions + " — у остальных считаем по закупочной цене МойСклада. " +
         "Если ткань закупается отдельно, в закупочной цене её нет, и заказ выйдет дешевле, чем на самом деле.");
     }
     if(opt.no_cost_count){
-      money.push("У " + opt.no_cost_count + " позиций себестоимости нет совсем — в деньгах заказа они не участвуют.");
+      money.push("У " + opt.no_cost_count + " " + plural(opt.no_cost_count, "позиции", "позиций", "позиций") + " себестоимости нет совсем — в деньгах заказа они не участвуют.");
     }
     if(money.length){
       var w = document.createElement("div");

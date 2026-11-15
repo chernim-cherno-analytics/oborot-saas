@@ -170,6 +170,32 @@ with TestClient(app, headers={"X-Oborot-CSRF": "1"}, raise_server_exceptions=Fal
     wb = _lw(_io.BytesIO(a.get("/api/export/replenish.xlsx").content))
     head = " ".join(str(c.value or "") for ws in wb.worksheets for row in ws.iter_rows(max_row=3) for c in row)
     check("окно «год»: в шапке «с поправкой на сезон»", "поправкой на сезон" in head, head[:300])
+    rep = {i["base_name"]: i for i in a.get("/api/replenish").json()["items"]}
+    bad, seen = [], 0
+    for ws in wb.worksheets:
+        hdr = None
+        for row in ws.iter_rows(values_only=True):
+            if hdr is None:
+                if row and any(str(v or "").startswith("Темп") for v in row):
+                    hdr = list(row)
+                    ti = next(i for i, v in enumerate(hdr) if str(v or "").startswith("Темп"))
+                continue
+            name = str(row[0] or "").strip()
+            if name in rep and isinstance(row[ti], (int, float)):
+                want = rep[name].get("rate_cover", rep[name]["rate"])
+                seen += 1
+                if abs(float(row[ti]) - float(want)) > 1e-6:
+                    bad.append((name, row[ti], want))
+    check("Excel: темп тот же, что на экране (rate_cover, QA 15.11)", seen >= 5 and not bad, f"{seen} {bad[:3]}")
+
+    print("\n8в. Канал без этапов со своим сроком: мастер видит его срок (QA 15.11, P1)")
+    pid90 = a.post("/api/productions", json={"name": "Срок 90", "lead_time_days": 90}).json().get("id")
+    prods = {p["id"]: p for p in a.get("/api/productions").json()["productions"]}
+    p90 = prods.get(pid90) or {}
+    check("lead_days = 90 и этап на 90 дней", p90.get("lead_days") == 90
+          and [s_["lead_days"] for s_ in p90.get("stages", [])] == [90] and p90.get("lead_effective") == 90, str(p90)[:300])
+    plan = a.post("/api/order-plan/preview", json={"budget": 1_000_000, "production_id": pid90}).json()
+    check("план мастера считает те же 90 дней", plan.get("lead_days") == 90, str(plan.get("lead_days")))
 
     print("\n9. Черновик ростовки")
     r = a.post("/api/replenish-draft", json={"base_name": base, "sizes": {"НЕТРАЗМЕРА": 5}})

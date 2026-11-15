@@ -440,7 +440,8 @@ def _replenish_sheet(wb: Workbook, org_name: str, sheet_title: str, name: str,
             note = mark + (f"; {note}" if note else "")
         _write_row(ws, row, [
             it["base_name"], it.get("category") or "", CLS_RU.get(it["cls"], it["cls"]),
-            it["turnover"], it["rate"], sold_year, it["cs"], it.get("ordered") or 0,
+            # QA 15.11: темп тот, которым посчитано «Заказать» (как на экране).
+            it["turnover"], it.get("rate_cover", it["rate"]), sold_year, it["cs"], it.get("ordered") or 0,
             it.get("wos"), _fmt_date_ru(it.get("stockout_date")), it["need"],
             cost if cost > 0 else None, order_sum,
             it.get("production_name") or "", note,

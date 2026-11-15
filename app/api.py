@@ -298,6 +298,7 @@ def _order_stages(db: Session, order: ProductionOrder, settings: dict) -> list[d
     if _valid_payment_terms(stages):
         return stages
     raw = None
+    channel_lead = 0
     if order.production_id:
         prod = db.get(Production, order.production_id)
         # Сверка организации обязательна: это единственное место, где
@@ -306,7 +307,10 @@ def _order_stages(db: Session, order: ProductionOrder, settings: dict) -> list[d
         # организации утекли бы в календарь платежей.
         if prod is not None and prod.org_id == order.org_id:
             raw = prod.stages
-    return order_planner.normalize_stages(raw, int(settings.get("lead_time_days") or 45))
+            channel_lead = int(prod.lead_time_days or 0)
+    # Канал без этапов: его собственный срок, как в мастере (QA 15.11).
+    return order_planner.normalize_stages(
+        raw, channel_lead or int(settings.get("lead_time_days") or 45))
 
 
 def _order_payments(db: Session, order: ProductionOrder, settings: dict) -> list[dict]:
@@ -376,11 +380,14 @@ def api_order_payment_preview(
     from app.models import Production
     settings = analytics.extra_settings(ctx.org)
     raw = None
+    channel_lead = 0
     if production_id is not None:
         prod = db.get(Production, production_id)
         if prod is not None and prod.org_id == ctx.org.id:
             raw = prod.stages
-    stages = order_planner.normalize_stages(raw, int(settings.get("lead_time_days") or 45))
+            channel_lead = int(prod.lead_time_days or 0)
+    stages = order_planner.normalize_stages(
+        raw, channel_lead or int(settings.get("lead_time_days") or 45))
     today = date.today()
     payments = order_planner.payment_plan(today, stages, float(cost)) if cost > 0 else []
     last = max((date.fromisoformat(p["date"]) for p in payments), default=today)
@@ -2194,7 +2201,12 @@ def _production_out(p, fallback_lead: int) -> dict:
     lead_days — суммарный срок по этапам, уже с подставленным fallback_lead.
     """
     from app import order_planner
-    stages = order_planner.normalize_stages(p.stages, fallback_lead)
+    # QA 15.11 (P1): без этапов срок канала берётся из его поля срока, как в
+    # order_planner.build_plan (channel_lead or общий срок). Раньше здесь шёл
+    # общий срок: мастер показывал «срок 45 дн» и дату прихода +45 для канала
+    # со сроком 90, а план считал по 90 и отказывал «дата уже прошла».
+    stages = order_planner.normalize_stages(
+        p.stages, int(p.lead_time_days or 0) or fallback_lead)
     return {
         "id": p.id,
         "name": p.name,

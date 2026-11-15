@@ -8,7 +8,10 @@
   .team-table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
   .team-table th, .team-table td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line, rgba(0,0,0,.08)); vertical-align: middle; }
   .team-table th { font-size: 12px; font-weight: 600; color: var(--text-soft); }
-  .team-table select { max-width: 220px; }
+  .team-table select { max-width: 220px; min-width: 150px; }
+  /* QA 15.11: на 390 колонка роли сжималась до стрелки (33 px). */
+  .members-wrap { overflow-x: auto; }
+  @media (max-width: 600px) { .team-table td:nth-child(2) { word-break: break-all; min-width: 120px; } }
   .perm-wrap { overflow-x: auto; }
   .perm-table { border-collapse: collapse; font-size: 13px; min-width: 100%; }
   .perm-table th, .perm-table td { padding: 6px 10px; border-bottom: 1px solid var(--line, rgba(0,0,0,.08)); text-align: center; }
@@ -133,8 +136,8 @@ document.addEventListener("DOMContentLoaded", function () {
           esc(m.name || m.email || "") + '">Убрать</button>') + "</td></tr>";
     }).join("");
     document.getElementById("members-box").innerHTML =
-      '<table class="team-table"><thead><tr><th>Имя</th><th>E-mail</th><th>Роль</th><th></th></tr></thead><tbody>' +
-      rows + "</tbody></table>";
+      '<div class="members-wrap"><table class="team-table"><thead><tr><th>Имя</th><th>E-mail</th><th>Роль</th><th></th></tr></thead><tbody>' +
+      rows + "</tbody></table></div>";
     document.querySelectorAll(".m-role").forEach(function (sel) {
       sel.addEventListener("change", function () {
         var uid = sel.getAttribute("data-uid");
@@ -147,7 +150,8 @@ document.addEventListener("DOMContentLoaded", function () {
       b.addEventListener("click", function () {
         if (!confirm("Убрать «" + b.getAttribute("data-name") + "» из организации? Войти в неё он больше не сможет.")) return;
         api("/api/team/members/" + b.getAttribute("data-uid") + "/remove", { method: "POST", body: {} })
-          .then(function (st) { render(st); toast("Сотрудник убран из организации"); });
+          .then(function (st) { render(st); toast("Сотрудник убран из организации"); })
+          .catch(function () {});  /* api() уже показал понятный тост (QA 15.11) */
       });
     });
   }
@@ -179,7 +183,8 @@ document.addEventListener("DOMContentLoaded", function () {
     document.querySelectorAll(".i-revoke").forEach(function (b) {
       b.addEventListener("click", function () {
         api("/api/team/invites/" + b.getAttribute("data-id") + "/revoke", { method: "POST", body: {} })
-          .then(function (st) { render(st); toast("Приглашение отозвано"); });
+          .then(function (st) { render(st); toast("Приглашение отозвано"); })
+          .catch(function () {});  /* api() уже показал понятный тост (QA 15.11) */
       });
     });
   }
@@ -194,7 +199,7 @@ document.addEventListener("DOMContentLoaded", function () {
       document.getElementById("invite-link").value = location.origin + res.link_path;
       out.style.display = "block";
       load();
-    });
+    }).catch(function () {});
   });
 
   document.getElementById("invite-copy").addEventListener("click", function () {
@@ -254,7 +259,8 @@ document.addEventListener("DOMContentLoaded", function () {
         });
         var name = document.querySelector('.r-name[data-id="' + id + '"]').value;
         api("/api/team/roles/" + id, { method: "POST", body: { name: name, perms: perms } })
-          .then(function (st) { render(st); toast("Роль сохранена"); });
+          .then(function (st) { render(st); toast("Роль сохранена"); })
+          .catch(function () {});  /* api() уже показал понятный тост (QA 15.11) */
       });
     });
     document.querySelectorAll(".r-del").forEach(function (b) {
@@ -262,7 +268,8 @@ document.addEventListener("DOMContentLoaded", function () {
         var r = roleById(Number(b.getAttribute("data-id")));
         if (!confirm("Удалить роль «" + (r ? r.name : "") + "»?")) return;
         api("/api/team/roles/" + b.getAttribute("data-id") + "/delete", { method: "POST", body: {} })
-          .then(function (st) { render(st); toast("Роль удалена"); });
+          .then(function (st) { render(st); toast("Роль удалена"); })
+          .catch(function () {});  /* api() уже показал понятный тост (QA 15.11) */
       });
     });
   }
@@ -276,7 +283,7 @@ document.addEventListener("DOMContentLoaded", function () {
       document.getElementById("new-role-name").value = "";
       render(st);
       toast("Роль создана: отметьте права и нажмите «Сохранить»");
-    });
+    }).catch(function () {});
   });
 
   load().then(function () {
