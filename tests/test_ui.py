@@ -1849,6 +1849,7 @@ def _assistant_sync_time(browser, base: str) -> None:
                 dq = data.get("data_quality") or {}
                 dq["last_sync_at"] = raw
                 dq["sync_state"] = "done"
+                dq["is_demo"] = False  # сцена про организацию с МойСкладом
                 dq["coverage_start"] = _SYNC_COV
                 data["data_quality"] = dq
                 route.fulfill(status=200, content_type="application/json", body=json.dumps(data))

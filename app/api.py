@@ -2682,6 +2682,12 @@ def _data_quality(db: Session, ctx: AuthContext, snap: dict) -> dict:
         "last_sync_at": (st.finished_at.isoformat()
                          if st is not None and st.finished_at else None),
         "sync_state": (st.state if st is not None else None),
+        # QA 15.11: на демо писалось «синхронизация ещё не завершалась» рядом
+        # с датой данных; у демо синхронизации нет вовсе.
+        "is_demo": bool(db.execute(select(Connection.id).where(
+            Connection.org_id == ctx.org.id, Connection.kind == "demo")).first())
+            and not db.execute(select(Connection.id).where(
+                Connection.org_id == ctx.org.id, Connection.kind == "moysklad")).first(),
     }
 
 
