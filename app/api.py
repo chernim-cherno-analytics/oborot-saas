@@ -1230,8 +1230,11 @@ def api_order_status(
         # снимается только unmatched-остаток, который push не тронул.
         _apply_remainder_to_incoming(db, ctx.org.id, items_at_change, pushed_at_change, -1)
     if body.status == "received":
+        from app import demo_seed as _demo
+        demo_before = (_demo_sent_applied(db, ctx.org.id, order.id)
+                       if _demo.is_demo_org(db, ctx.org.id) else None)
         _record_execution(db, ctx, order, body.received, now)
-        _demo_stock_on_receive(db, ctx.org.id, order.id, items_at_change)
+        _demo_stock_on_receive(db, ctx.org.id, order, items_at_change, demo_before)
     db.commit()
     db.expire(order)
     analytics.invalidate(ctx.org.id)
@@ -1243,6 +1246,11 @@ def api_order_status(
 # трогали, и сверять их правки не с чем (ревью #133). Граница с запасом
 # после выкладки; заказ, принятый до неё, правки приёмки на остаток не двигают.
 DEMO_RECEIPT_SINCE = datetime(2026, 11, 15, 15, 0)
+# D-83 в демо: с какого момента приёмка частями по открытому заказу сразу
+# кладёт на остаток. Раньше выкладки этого правила (ревью #130) строки приёмки
+# остаток не двигали, поэтому считаются не положенными и уйдут на остаток при
+# закрытии заказа.
+DEMO_PARTIAL_SINCE = datetime(2026, 11, 15, 23, 0)
 
 
 def _demo_spec(db: Session, org_id: int, order_id: int, items: list[dict]) -> dict:
@@ -1278,25 +1286,43 @@ def _demo_spec(db: Session, org_id: int, order_id: int, items: list[dict]) -> di
     return spec
 
 
+def _demo_sent_applied(db: Session, org_id: int, order_id: int) -> dict:
+    """D-83 в демо: по открытому заказу на остаток уже положено принятое
+    частями (строки приёмки, записанные после появления демо-приёмки)."""
+    from app.models import OrderReceipt
+    db.flush()
+    return {b: max(0.0, float(q or 0)) for b, q in db.execute(
+        select(OrderReceipt.base_name, func.sum(OrderReceipt.qty))
+        .where(OrderReceipt.org_id == org_id, OrderReceipt.order_id == order_id,
+               OrderReceipt.at >= DEMO_PARTIAL_SINCE)
+        .group_by(OrderReceipt.base_name)
+    ).all()}
+
+
 def _demo_applied(db: Session, org_id: int, order: ProductionOrder) -> dict | None:
-    """Что демо уже положило по принятому заказу (None: не демо, не принят или
-    принят до появления демо-приёмки)."""
+    """Что демо уже положило по заказу (None: не демо, черновик или принят до
+    появления демо-приёмки). Открытый заказ: принятое частями (D-83, «Едет»
+    уменьшается сразу, значит и остаток должен вырасти сразу); принятый:
+    названное или заказанное (_demo_spec)."""
     from app import demo_seed
-    if order.status != "received" or not demo_seed.is_demo_org(db, org_id):
+    if order.status not in ("sent", "received") or not demo_seed.is_demo_org(db, org_id):
         return None
+    if order.status == "sent":
+        return _demo_sent_applied(db, org_id, order.id)
     if order.received_at is None or order.received_at < DEMO_RECEIPT_SINCE:
         return None
     return _demo_spec(db, org_id, order.id, order.items)
 
 
 def _demo_reconcile_receipts(db: Session, org_id: int, order: ProductionOrder,
-                             before: dict) -> None:
+                             before: dict, after: dict | None = None) -> None:
     """Ревью #131/#133: приёмку по уже принятому демо-заказу поправили (довоз,
     исправление, количества названы позже). Положенное раньше снимается тем же
     раскладом по размерам, каким клали, и кладётся названное теперь; при двух
     общих числах двигается только разница."""
     from app import demo_seed
-    after = _demo_spec(db, org_id, order.id, order.items)
+    if after is None:
+        after = _demo_applied(db, org_id, order) or {}
     for b in set(before) | set(after):
         was, now = before.get(b, 0.0), after.get(b, 0.0)
         if was == now:
@@ -1316,19 +1342,18 @@ def _demo_reconcile_receipts(db: Session, org_id: int, order: ProductionOrder,
             demo_seed.simulate_receipt(db, org_id, {b: now})
 
 
-def _demo_stock_on_receive(db: Session, org_id: int, order_id: int, items: list[dict]) -> None:
+def _demo_stock_on_receive(db: Session, org_id: int, order: ProductionOrder,
+                           items: list[dict], before: dict | None) -> None:
     """Демо-организация: «Принят на склад» кладёт пришедшее на остаток.
 
     Живые данные не трогаются (demo_seed.is_demo_org). Сколько класть: см.
-    _demo_spec.
+    _demo_spec, минус уже положенное частями, пока заказ был открыт (D-83).
     """
     from app import demo_seed
-    if not demo_seed.is_demo_org(db, org_id):
+    if before is None:
         return
-    spec = _demo_spec(db, org_id, order_id, items)
-    spec = {b: v for b, v in spec.items() if v}
-    if spec:
-        demo_seed.simulate_receipt(db, org_id, spec)
+    _demo_reconcile_receipts(db, org_id, order, before,
+                             after=_demo_spec(db, org_id, order.id, items))
 
 
 def _record_execution(db: Session, ctx: AuthContext, order: ProductionOrder,
@@ -1464,8 +1489,9 @@ def api_order_receipts_add(
                           source_ref=ref, keep_zeros=True)
     if demo_before is not None:
         _demo_reconcile_receipts(db, ctx.org.id, order, demo_before)
-        analytics.invalidate(ctx.org.id)
     db.commit()
+    # D-83: приёмка теперь сразу меняет «Едет» (ревью #130), расчёт пересчитать.
+    analytics.invalidate(ctx.org.id)
     return {"ok": True, "added": added, **_receipts_out(db, order)}
 
 
@@ -1594,11 +1620,17 @@ def api_set_ordered(
 ):
     """Ручная правка «едет к нам» (перезапись значения по базовому имени)."""
     _require_known_base(db, ctx.org.id, body.base_name)
+    # D-83 (ревью #130): экран показывает «Едет» уже за вычетом принятого
+    # частями по открытым заказам, а хранится валовое значение. Число, которое
+    # человек ввёл, это то, что он хочет видеть, поэтому к хранимому
+    # прибавляется вычет, иначе принятое вычлось бы второй раз.
+    received_open = analytics._received_on_open_local_orders(db, ctx.org.id).get(body.base_name, 0.0)
+    gross = body.qty + received_open
     row = db.get(OrderedQty, (ctx.org.id, body.base_name))
     if row is None:
-        db.add(OrderedQty(org_id=ctx.org.id, base_name=body.base_name, qty=body.qty))
+        db.add(OrderedQty(org_id=ctx.org.id, base_name=body.base_name, qty=gross))
     else:
-        row.qty = body.qty
+        row.qty = gross
     db.commit()
     analytics.invalidate(ctx.org.id)
     return {"ok": True}

@@ -699,6 +699,43 @@ def _apply_seasonal_rates(db: Session, org: Org, settings: dict, items: dict,
             item["season_factor"] = round(item["rate_cover"] / base_rate, 3)
 
 
+def _received_on_open_local_orders(db: Session, org_id: int) -> dict[str, float]:
+    """Сколько уже принято по открытым («в производстве») заказам, которые не
+    ушли в МойСклад, по базам: не больше заказанного в каждом заказе.
+
+    Отрицательная (исправляющая) строка приёмки уменьшает принятое; итог по
+    заказу не уходит ниже нуля. Заказы, отправленные в МойСклад, сюда не
+    входят: их «Едет» ведёт синк (ms_qty = заказано минус отгружено).
+    """
+    from app import ms_writeback  # локально: ms_writeback импортирует analytics
+    from app.models import OrderReceipt, ProductionOrder
+    orders = db.execute(
+        select(ProductionOrder).where(ProductionOrder.org_id == org_id,
+                                      ProductionOrder.status == "sent")
+    ).scalars().all()
+    local = {o.id: o for o in orders if not ms_writeback.is_pushed(str(o.ms_doc_href or ""))}
+    if not local:
+        return {}
+    rec: dict[tuple[int, str], float] = {}
+    for oid, base, qty in db.execute(
+        select(OrderReceipt.order_id, OrderReceipt.base_name, OrderReceipt.qty)
+        .where(OrderReceipt.org_id == org_id, OrderReceipt.order_id.in_(list(local)))
+    ).all():
+        rec[(oid, base)] = rec.get((oid, base), 0.0) + float(qty or 0)
+    out: dict[str, float] = {}
+    for oid, o in local.items():
+        ordered: dict[str, float] = {}
+        for it in o.items:
+            b = str(it.get("base_name") or "")
+            if b:
+                ordered[b] = ordered.get(b, 0.0) + float(it.get("qty") or 0)
+        for b, q in ordered.items():
+            got = min(max(0.0, rec.get((oid, b), 0.0)), q)
+            if got > 0:
+                out[b] = out.get(b, 0.0) + got
+    return out
+
+
 def _compute_snapshot(db: Session, org: Org) -> dict:
     settings = dict(org.settings)
     settings.update(extra_settings(org))
@@ -1036,6 +1073,14 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
             OrderedQty.qty + OrderedQty.ms_qty > 0,
         )
     ).all()
+    # D-83 (15.11.2026): частичная приёмка по открытому заказу, не ушедшему в
+    # МойСклад, уменьшает «Едет» сразу, а не при «Принят на склад»: иначе
+    # пришедшие штуки посчитаны дважды (остаток и «Едет»). Для заказов из
+    # МойСклада «Едет» уже «заказано минус принято». Хранимое ordered_qty не
+    # меняется: вычитание считается при чтении, переходы статусов как были.
+    received_open = _received_on_open_local_orders(db, org.id)
+    ordered_rows = [(b, max(0.0, float(q or 0) - received_open.get(b, 0.0)), m)
+                    for b, q, m in ordered_rows]
     ordered_by_base = {b: float(q or 0) + float(m or 0) for b, q, m in ordered_rows}
     ordered_manual = {b: float(q or 0) for b, q, m in ordered_rows}
     ordered_ms = {b: float(m or 0) for b, q, m in ordered_rows}
