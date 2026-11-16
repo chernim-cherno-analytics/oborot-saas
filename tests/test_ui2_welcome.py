@@ -257,6 +257,25 @@ try:
                  own.get("/api/productions").json()["productions"])
         own_writes = [w for w in writes if "/api/hints" not in w and "/api/lessons" not in w and "/api/sync" not in w and "/api/prefs" not in w]
         check("пролистать первый запуск без правок: ни одной записи настроек", not own_writes and before == after, str(own_writes[:4]))
+
+        print("\n5а. «Мой бизнес» в настройках показывает те же ответы")
+        own.post("/api/hints/seen", json={"page": "settings"})   # карточка первого визита перехватила бы клик
+        page.goto(f"{BASE}/settings")
+        page.wait_for_function("() => { const e = document.getElementById('biz-thr'); return e && /\\d/.test(e.textContent); }", timeout=20000)
+        page.wait_for_timeout(600)
+        biz = page.evaluate("""() => { const t = id => document.getElementById(id).textContent.replace(/\\s+/g, ' ').trim();
+          return {days: t('biz-days'), disc: t('biz-disc'), prod: t('biz-prod'), thr: t('biz-thr').replace(/ /g, ''),
+                  best: t('biz-g-b').replace(/ /g, ''),
+                  links: [...document.querySelectorAll('#biz-rows a')].map(a => a.getAttribute('href')), rerun: !!document.getElementById('biz-rerun')}; }""")
+        check("срок, скидки, производства и границы совпадают с настройками организации",
+              biz["days"] == "60 дн." and biz["disc"] == "от 10 до 50 %" and "Китай" in biz["prod"]
+              and biz["thr"] == f"{calc['weak']}/{calc['dull']}/{calc['good']}" and biz["best"] == f"от{calc['good']}", str(biz))
+        check("у владельца каждая строка ведёт на свой вопрос первого запуска",
+              biz["links"] == ["/welcome#days", "/welcome#disc", "/welcome#prod", "/welcome#bar"] and biz["rerun"], str(biz["links"]))
+        page.click('#biz-rows a[href="/welcome#prod"]')
+        wait_step(page, "prod")
+        check("ссылка «Изменить» открывает первый запуск на нужном вопросе",
+              "шьёте" in page.evaluate("() => document.getElementById('w-title').textContent"))
         ctx.close()
 
         print("\n6. Участник без права на настройки и телефон")
@@ -283,6 +302,10 @@ try:
         vpage.wait_for_function("() => document.querySelectorAll('#tb tr[data-base]').length > 0", timeout=60000)
         check("у него в меню «?» пункта «Первый запуск заново» нет",
               vpage.evaluate("() => !document.getElementById('hm-first')"))
+        vpage.goto(f"{BASE}/settings")
+        vpage.wait_for_function("() => { const e = document.getElementById('biz-thr'); return e && /\\d/.test(e.textContent); }", timeout=20000)
+        check("наблюдатель видит «Мой бизнес» без ссылок на изменение",
+              vpage.evaluate("() => document.querySelectorAll('#biz-rows a').length === 0 && !document.getElementById('biz-rerun')"))
         vctx.close()
 
         mctx = b.new_context(viewport={"width": 390, "height": 844}, has_touch=True, is_mobile=True)
