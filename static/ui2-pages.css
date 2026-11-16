@@ -418,6 +418,107 @@ html.ui2 .source-opt { border-radius: 18px; }
   html.ui2 .content { padding: 10px 8px 32px; }
 }
 
+/* ================= Правки по обходу критиков 16.11 =================
+   Каждое правило ниже критик подставлял в страницу и перемерял. */
+
+/* --- Самостоятельные страницы, компьютер (критик вёрстки A) --- */
+html.ui2 .rc-box{background:#fbfbfd;border-radius:22px;box-shadow:0 30px 80px rgba(46,46,96,.28)}
+html.ui2 .rc-box input{height:34px;padding:0 12px;border:1px solid var(--u-hair);border-radius:12px;font:inherit;font-size:13px}
+/* Только на компьютере: на телефоне у этих кнопок свои 40 px под палец. */
+@media (min-width: 761px) { html.ui2 .rc-box .mvbtn,html.ui2 .ord-actions .mvbtn,html.ui2 .batchid .mvbtn{min-height:30px;padding:5px 13px;font-size:12.5px} }
+html.ui2 .rc-box .mvbtn,html.ui2 .ord-actions .mvbtn,html.ui2 .batchid .mvbtn{font-size:12.5px}
+html.ui2 .twrap .rg2:hover td{background:#d5ec8f}html.ui2 .twrap .rg1:hover td{background:#cdebd6}html.ui2 .twrap .ro:hover td{background:#ffe4bd}html.ui2 .twrap .rr:hover td{background:#ffd9d6}
+html.ui2 .twrap tr.sr td,html.ui2 .twrap tr.sr td:first-child{background:#fafafc}
+html.ui2 .twrap .rgr td,html.ui2 .twrap .rgr td:first-child{background:var(--u-row-mute)}
+html.ui2 .twrap thead th[data-sk]:focus-visible{outline:3px solid rgba(10,102,214,.55);outline-offset:-3px}
+html.ui2 .gradient-bg ~ .cat-bar{padding:12px 16px 0}
+html.ui2 .gradient-bg ~ .main > :first-child{margin-top:0}
+html.ui2 .modal label{text-transform:none;letter-spacing:0;font-size:12.5px;color:var(--u-ink2)}
+html.ui2 .modal input{border:1px solid var(--u-hair);border-radius:12px}
+html.ui2 .modal input:focus{border-color:var(--u-accent);box-shadow:0 0 0 3px var(--u-accent-soft);outline:none}
+html.ui2 .modal .abtn{white-space:nowrap}
+html.ui2 .gradient-bg ~ .main .card[style*="76,187,23"]{background:var(--u-row-good)!important;border-color:rgba(47,180,87,.25)}
+html.ui2 #tblWrap{margin-bottom:12px}
+html.ui2 .panel table th{font-size:11.5px;font-weight:600;color:var(--u-ink2)}
+html.ui2 .panel .table-outer,html.ui2 .fold .table-outer,html.ui2 .rc-box .table-outer,html.ui2 .panel .datafacts{border-radius:12px;box-shadow:none;border:1px solid var(--u-hair)}
+html.ui2 .panel .pay,html.ui2 .panel .tile{border-radius:12px}
+html.ui2 .panel .pay,html.ui2 .panel .tile:not(.on){box-shadow:none}
+html.ui2 .gradient-bg ~ .main input.search{border-radius:999px;height:32px;padding:0 14px}
+html.ui2 .csub,html.ui2 .why,html.ui2 .msub2,html.ui2 .twrap thead th .sub{font-size:11.5px;opacity:1;color:var(--u-ink2)}
+html.ui2 .stbadge,html.ui2 .panel .pill{font-size:11.5px}
+html.ui2 .lesson a.go-btn{background:rgba(255,255,255,.75);color:var(--u-ink);border-color:var(--u-hair)}
+html.ui2 .panel .row input,html.ui2 .toolbar input,html.ui2 .toolbar .preset{height:36px}
+html.ui2 .steps { margin-top: 0; }
+html.ui2 .modal-bg .modal { width: 560px; max-width: calc(100vw - 24px); }
+/* Синей остаётся одна кнопка: у первого непройденного урока. */
+html.ui2 .lesson:not(.done):not(.lesson:not(.done) ~ .lesson) a.go-btn { background: var(--u-accent); color: #fff; border-color: var(--u-accent); }
+/* Шапка помещается в одну строку и на 1100. */
+@media (min-width: 761px) and (max-width: 1240px) {
+  html.ui2 .header.app-top .app-logo { letter-spacing: .08em; }
+  html.ui2 .header.app-top .app-nav a { padding: 7px 5px; font-size: 12px; }
+}
+
+/* --- Телефон и планшет (критик C) --- */
+@media(max-width:480px){html.ui2 #tfoot td:nth-child(n+2):nth-child(-n+7){display:none}}
+@media(max-width:760px){html.ui2 .catrow{flex-wrap:wrap}html.ui2 .catbar-wrap{flex:0 0 100%;order:3}}
+@media(max-width:760px){html.ui2 .cat-btn,html.ui2 .chip-tg,html.ui2 .rule-btn,html.ui2 .def-disc-btn,html.ui2 .search{height:40px}}
+@media(pointer:coarse){html.ui2 .btn,html.ui2 .abtn,html.ui2 .seg button{min-height:40px}}
+html.ui2 .u-tip button{min-height:40px}html.ui2 .u-tip .u-x{width:40px;height:40px;top:4px;right:4px}
+@media(max-width:760px){html.ui2 .ordin,html.ui2 .size-rec{height:40px}html.ui2 #tbody input[type=checkbox]{width:22px;height:22px}}
+@media(max-width:760px){html.ui2 .sidebar{position:sticky;top:8px}}
+@media(min-width:761px) and (max-width:1360px){html.ui2 .sidebar{padding-right:60px}html.ui2 .user-chip>span:nth-child(2){display:none}}
+@media(max-width:480px){html.ui2 #tbl-wrap :is(th,td):nth-child(2){left:25px}html.ui2 #tbl-wrap :is(th,td.name):nth-child(3){left:54px}}
+@media(max-width:760px){html.ui2 .gradient-bg~.main .seg,html.ui2 .risk-go{border-radius:20px}}
+html.ui2 #tblWrap td:first-child{position:sticky;left:0;z-index:5}html.ui2 #tblWrap tr.total td{position:sticky;bottom:0}
+@media (max-width: 760px) {
+  html.ui2 .tour-bar .tb-chip:not(.cur) { display: none; }
+  html.ui2 .gradient-bg ~ .main .panel td { white-space: nowrap; }
+  html.ui2 .gradient-bg ~ .main .panel td:nth-child(-n+2) { white-space: normal; }
+  html.ui2 .gradient-bg ~ .cat-bar { padding: 10px 8px 0; }
+}
+
+/* --- Страницы base.html: панель один в один с панелью остальных страниц
+   (критик B: высота 56, чип 40, аватар 30, полоса демо под панелью) --- */
+/* Чип пользователя стоит поверх панели (position: fixed), поэтому место под
+   него резервируется по самой длинной допустимой ширине чипа (160 px). */
+html.ui2 .sidebar { min-height: 56px; padding-right: 180px; }
+html.ui2 .sidebar .nav { justify-content: flex-end; }
+html.ui2 .sidebar .nav a { line-height: 1.2; gap: 0; }
+html.ui2 .user-chip { min-height: 40px; padding: 4px 10px 4px 4px; font-size: 13px; font-weight: 400; }
+html.ui2 .topbar .user-menu { top: 18px; right: 27px; }
+html.ui2 .user-chip .avatar { width: 30px; height: 30px; font-size: 12px; font-weight: 700; }
+html.ui2 .shell > .main { display: flex; flex-direction: column; }
+html.ui2 .trial-strip { order: -1; margin-top: 8px; }
+html.ui2 .topbar { padding-left: 16px; }
+@media (max-width: 1360px) and (min-width: 761px) {
+  html.ui2 .sidebar { padding: 7px 62px 7px 16px; gap: 4px 10px; }
+  html.ui2 .sidebar .nav a { padding: 7px 8px; }
+  html.ui2 .user-chip { padding: 4px; }
+  html.ui2 .user-chip > span + span { display: none; }
+}
+@media (max-width: 760px) {
+  html.ui2 .sidebar { padding: 6px 8px 6px 12px; min-height: 0; }
+  html.ui2 .sidebar .nav { justify-content: flex-start; }
+  html.ui2 .topbar .user-menu { top: auto; right: auto; }
+  html.ui2 .topbar { padding-left: 10px; }
+}
+
+/* --- Кнопки, поля, таблицы и вложенные блоки base.html (критик B) --- */
+html.ui2 .btn { padding: 8px 16px; font-size: 13px; }
+html.ui2 .btn.sm { padding: 6px 12px; font-size: 12.5px; }
+html.ui2 .input:not(textarea) { min-height: 36px; }
+html.ui2 .input.num, html.ui2 .invite-out .row .input { font-family: inherit; }
+html.ui2 #horizon-mode { flex-wrap: nowrap !important; }
+html.ui2 #horizon-mode .btn.primary { background: #fff; color: var(--u-ink); border-color: transparent; box-shadow: 0 1px 3px rgba(0, 0, 0, .12); }
+html.ui2 .tbl th { text-transform: none; letter-spacing: 0; font-size: 12px; font-weight: 600; color: var(--u-ink2); background: none; }
+html.ui2 .toast { border-radius: 14px; }
+html.ui2 .toast.error { background: #ffe7e5; color: #8a1c15; }
+html.ui2 .toast.success { background: #dcf2e2; color: #14692f; }
+html.ui2 .chan, html.ui2 .pl-card, html.ui2 .pcard, html.ui2 .pl-next { border-radius: 14px !important; border-color: var(--u-hair) !important; }
+html.ui2 .pl-form { max-width: 640px; }
+html.ui2 .pl-field .btn { align-self: flex-start; }
+html.ui2 .pl-field input, html.ui2 .pl-field select { min-height: 36px; border-radius: 12px; }
+
 /* Печать: как было до нового вида. Панели и обои на бумаге не нужны. */
 @media print {
   html.ui2 .gradient-bg, html.ui2 .sidebar { display: none; }
