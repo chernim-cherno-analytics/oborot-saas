@@ -741,6 +741,22 @@
       measure();
       window.addEventListener("resize", measure);
     }
+    // UI2-3: в новом виде к верху окна липнет панель с отступом (у страниц
+    // base.html это .sidebar, а не якорь выше), и она бывает в две строки.
+    // Полоса встаёт под её фактический низ и следит за её высотой: меню
+    // сворачивается и переносится (ревью #137).
+    var panel = document.documentElement.classList.contains("ui2")
+      ? (document.querySelector(".header.app-top") || document.querySelector(".sidebar")) : null;
+    if (panel) {
+      var under = function(){
+        var cs = window.getComputedStyle(panel);
+        if (cs.position !== "sticky" && cs.position !== "fixed") { bar.style.top = "0px"; return; }
+        bar.style.top = Math.round(panel.getBoundingClientRect().height + (parseFloat(cs.top) || 0) + 6) + "px";
+      };
+      under();
+      window.addEventListener("resize", under);
+      if (window.ResizeObserver) { try { new ResizeObserver(under).observe(panel); } catch (e) {} }
+    }
   } else {
     bar.style.position = "fixed"; bar.style.top = "0"; bar.style.left = "0"; bar.style.right = "0";
     document.body.insertBefore(bar, document.body.firstChild);

@@ -180,6 +180,22 @@ try:
         check("при прокрутке панель и меню пользователя остаются вместе у верха",
               m2["bar"]["t"] < 30 and m2["chip"]["t"] >= m2["bar"]["t"] - 1 and m2["chip"]["b"] <= m2["bar"]["b"] + 1,
               f"bar={m2['bar']} chip={m2['chip']}")
+        # Ревью #137: полоса синхронизации липнет под панелью, в том числе когда
+        # панель в две строки (1100, 900) и на самостоятельной странице.
+        bad_bar = []
+        for path in ("/settings", "/stocks"):
+            for w in (1440, 1100, 900):
+                page.set_viewport_size({"width": w, "height": 800})
+                page.goto(f"{BASE}{path}")
+                settle(page)
+                g = page.evaluate("""async () => { const bar = document.getElementById('syncbar');
+                  const panel = document.querySelector('.header.app-top') || document.querySelector('.sidebar');
+                  bar.classList.add('show'); window.scrollTo(0, 600); await new Promise(r => setTimeout(r, 350));
+                  const b = bar.getBoundingClientRect(), p = panel.getBoundingClientRect();
+                  return {barTop: b.top, barH: b.height, panelBottom: p.bottom, sy: scrollY}; }""")
+                if not (g["sy"] > 100 and g["barH"] > 0 and g["barTop"] >= g["panelBottom"] - 1 and g["barTop"] <= g["panelBottom"] + 16):
+                    bad_bar.append((path, w, g))
+        check("полоса синхронизации при прокрутке стоит сразу под панелью на 1440, 1100 и 900", not bad_bar, str(bad_bar)[:300])
         ctx.close()
 
         print("\n3. Телефон 390")
