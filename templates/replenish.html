@@ -462,7 +462,7 @@
       <select id="pb-scope" class="pb-sel" aria-label="Что считать бюджетом"
         title="«Весь заказ»: себестоимость всего заказа. «Деньги на сейчас»: только то, что платить сегодня по этапам производства (предоплаты)">
         <option value="full">на весь заказ</option><option value="now">деньги на сейчас</option></select>
-      <label class="pb-f" title="Чтобы одна модель не съела весь бюджет">Макс. на модель, %
+      <label class="pb-f" title="Чтобы одна модель не съела весь бюджет">Макс. на позицию, %
         <input id="pb-cap" class="pb-in sm" type="number" min="5" max="100" value="30"></label>
       <div class="seg pb-strat" id="pb-strat" role="group" aria-label="Стратегия">
         <button type="button" data-v="protect" title="Каждая строка закрывает неделю продаж, лимит 20%: больше моделей понемногу">Шире</button>
@@ -688,7 +688,7 @@
   function fmtNum(n,d){ if(n===null||n===undefined||isNaN(n)) return "—"; return Number(n).toLocaleString("ru-RU",{maximumFractionDigits:d===undefined?2:d}); }
   function fmtMoneyShort(n){
     if(n===null||n===undefined||isNaN(n)) return "—";
-    if(Math.abs(n)>=1e6) return fmtNum(n/1e6,2)+" млн ₽";
+    if(Math.abs(n)>=999500) return fmtNum(n/1e6,2)+" млн ₽";
     if(Math.abs(n)>=1e4) return fmt(n/1e3)+" тыс ₽";
     return fmt(n)+" ₽";
   }
@@ -819,7 +819,7 @@
     sdBox.style.display=sd.length?"":"none";
     sdBox.innerHTML=sd.length?("<b>"+(sd.length===1?"Черновик":"Черновики")+" старше "+fmt(d.draft_fresh_days||30)+" дней</b> "+
       sd.map(function(x){ return "«"+esc(x.name)+"» ("+(x.created?fmtDate(x.created):"")+", "+fmt(x.positions)+" поз.)"; }).join(", ")+
-      " в расчёте не учитываются: свежий черновик уменьшает потребность, старый считается брошенным. "+
+      (sd.length===1?" в расчёте не учитывается":" в расчёте не учитываются")+": свежий черновик уменьшает потребность, старый считается брошенным. "+
       "Удалите или отправьте в производство в блоке заказов под таблицей."):"";
     syncRateSeg();
     // QA 15.11: после оформления (и любой перезагрузки данных) отметки строк
@@ -905,7 +905,7 @@
     // D-89: под бюджетом ростовка это план, а не расчёт. Правка действует в
     // этом плане; сохранять её как ручную ростовку значило бы закрепить
     // числа плана поверх расчёта навсегда.
-    if(PLAN){ setDraftNote("Правка действует в плане под бюджет; чтобы сохранить ростовку, нажмите «Вся потребность»"); return Promise.resolve(); }
+    if(PLAN){ setDraftNote("Правка действует только в этом плане под бюджет и не сохраняется: пересчёт плана её заменит"); return Promise.resolve(); }
     var d=draftOf(it);
     return api("/api/replenish-draft",{method:"POST",body:{base_name:it.base_name,sizes:d}})
       .then(function(){
@@ -1140,7 +1140,8 @@
           .then(function(d){ return d.receipts_total; },function(){ return null; })
           .then(function(n){
             b.disabled=false;
-            if(!confirm(deleteQuestion(b.getAttribute("data-name"),n))) return;
+            var od=ORDERS.find(function(x){ return String(x.id)===String(id); });
+            if(!confirm(deleteQuestion(b.getAttribute("data-name"),n,!!(od&&od.status==="draft")))) return;
             return api("/api/orders/"+id,{method:"DELETE"}).then(load);
           })
           .catch(function(e){ b.disabled=false; alert("Не удалось: "+e.message); });
@@ -1155,8 +1156,10 @@
      заказом (api_order_delete: rowid в SQLite переиспользуется, и чужие
      факты приёмки иначе достались бы следующему заказу). Прежний текст
      говорил только про «Едет», и история приёмки исчезала без предупреждения. */
-  function deleteQuestion(name,n){
-    var q="Удалить заказ «"+name+"»? Его количество будет снято из «Едет».";
+  function deleteQuestion(name,n,isDraft){
+    // Черновик в «Едет» не входил (D-85): после удаления его штуки снова в потребности.
+    var q=isDraft?("Удалить черновик «"+name+"»? Его штуки снова появятся в потребности.")
+                 :("Удалить заказ «"+name+"»? Его количество будет снято из «Едет».");
     if(n===null||n===undefined||isNaN(n))
       return q+" Вместе с заказом будут удалены и все записанные по нему приёмки — "+
         "восстановить их будет нельзя.";
@@ -1978,7 +1981,8 @@
           (it._plan_out?' <span class="out-tag" title="Потребность есть, но в план под бюджет позиция не вошла. Отметьте галочку, чтобы взять её в заказ сверх плана">'+esc(it._planOutWhy||"вне плана")+'</span>':"")+
           '<span class="csub">'+esc(it.category||"")+
           (it.in_drafts?' · в черновике заказа '+fmt(it.in_drafts)+' шт, вычтено':"")+
-          (it._planWhy?' · план: '+esc(it._planWhy):"")+'</span></td>'+
+          (it._planWhy?' · план: '+esc(it._planWhy):"")+
+          (it._planOverDraft?' · <b>ваша ростовка заменена планом</b>, вернётся с «Вся потребность»':"")+'</span></td>'+
         '<td>'+stBadge(it.wos)+'</td>'+
         '<td class="nb">'+fmt(it.turnover)+'</td>'+
         '<td class="nb muted">'+rateCell(it)+'</td>'+
@@ -2153,7 +2157,7 @@
   function clearPlanMarks(){
     items.forEach(function(it){
       if(it._plan_out) it._checked=true;
-      delete it._plan_out; delete it._planQty; delete it._planWhy; delete it._planRecs; delete it._planOutWhy;
+      delete it._plan_out; delete it._planQty; delete it._planWhy; delete it._planRecs; delete it._planOutWhy; delete it._planOverDraft;
       it._recs={};
       var draft=DRAFTS[it.base_name]||{};
       Object.keys(it.sizes||{}).forEach(function(sz){
@@ -2162,7 +2166,10 @@
     });
   }
   function planNote(html){ document.getElementById("pb-note").innerHTML=html||""; }
+  function canPlan(){ return (" "+(document.body.getAttribute("data-perms")||"")+" ").indexOf(" plan ")>=0; }
   function applyPlan(){
+    // Без права «plan» полоса скрыта, расчёт не запрашивается (QA 16.11: 403).
+    if(!canPlan()) return;
     PB.budget=pbNum(document.getElementById("pb-budget").value);
     PB.scope=document.getElementById("pb-scope").value;
     PB.cap=Math.max(5,Math.min(100,pbNum(document.getElementById("pb-cap").value)||30));
@@ -2186,8 +2193,11 @@
       (p.items||[]).forEach(function(i){ if((i.qty||0)>0) by[i.base_name]=i; });
       // Почему позиция с потребностью не в плане: бюджет, нет свежих продаж,
       // партия не влезла в лимит. Списки мастера урезаны, остальное «вне плана».
-      (p.not_included||[]).forEach(function(x){ why[x.base_name]="не вошло в бюджет"; });
-      ((p.review||{}).stale||[]).forEach(function(x){ why[x.base_name]="нет свежих продаж: мастер не берёт"; });
+      // Деньги остались, а штука дороже лимита на модель: это лимит, не бюджет (QA 16.11).
+      (p.not_included||[]).forEach(function(x){
+        why[x.base_name]=((p.rest||0)>=(x.cost_price||0)&&(x.cost_price||0)>0)?"не влезло в лимит на модель":"не вошло в бюджет"; });
+      ((p.review||{}).stale||[]).forEach(function(x){ why[x.base_name]="нет свежих продаж"; });
+      ((p.review||{}).no_cost||[]).forEach(function(x){ why[x.base_name]="нет себестоимости: в деньгах плана её нет"; });
       (p.moq_skipped||[]).forEach(function(x){ why[x.base_name||x]="партия не влезла в бюджет"; });
       (p.moq_over_cap||[]).forEach(function(x){ why[x.base_name||x]="партия дороже лимита на модель"; });
       clearPlanMarks();
@@ -2197,6 +2207,9 @@
         if(!inScope(it)&&SCOPE) return;
         if(pi){
           it._plan_out=false; it._checked=true; it._planQty=pi.qty; it._planWhy=pi.why_text||"";
+          // Сохранённая ручная ростовка под бюджетом заменена планом: говорим
+          // это в строке, правка вернётся с «Вся потребность» (QA 16.11).
+          it._planOverDraft=hasKey(DRAFTS,it.base_name);
           var ks=Object.keys(it.sizes||{}), sum=0;
           ks.forEach(function(sz){ sum+=Number((pi.sizes||{})[sz]||0); });
           if(ks.length&&sum===pi.qty){
@@ -2215,12 +2228,28 @@
       if(p.budget_note) warn.push(esc(p.budget_note));
       if(rv.no_cost_count) warn.push(rv.no_cost_count+" поз. без себестоимости: в деньгах плана их нет");
       if((p.stop||[]).length) warn.push(esc((p.stop||[]).map(function(x){ return x.text||x; }).join("; ")));
+      var stratName={protect:"Шире",balance:"Баланс",grow:"Глубже в топ"}[PB.strategy]||"";
+      // D-86 на «Заказе» (QA 16.11): маленький бюджет на широкой стратегии.
+      var wd=(p.brief&&p.brief.width_days)||0, thin="";
+      if(wd>0&&PB.strategy!=="grow"){
+        var took=(p.items||[]).filter(function(i){ return (i.qty||0)>0&&!i.is_new; });
+        var shortL=took.filter(function(i){ return i.days_to_sell!=null&&i.days_to_sell<wd; });
+        if(took.length>=4&&shortL.length*2>=took.length){
+          thin=' <span class="warn">Бюджета не хватает на цель стратегии: у '+shortL.length+' из '+took.length+
+            ' позиций заказ закрывает меньше '+wd+' дн продаж.</span> <button type="button" class="abtn" id="pb-deep">Пересчитать «Глубже в топ»</button>';
+        }
+      }
+      PLAN.cost=t.cost||0;
       planNote("План под бюджет "+fmtMoneyShort(PB.budget)+(PB.scope==="now"?" (деньги на сейчас)":"")+
-        " · «"+esc(p.strategy_title||"")+"», лимит "+PB.cap+" %: <b>"+fmt(t.positions||0)+" поз., "+fmt(t.units||0)+" шт, "+
-        fmtMoneyShort(t.cost||0)+"</b>"+(p.rest>0?(", остаток "+fmtMoneyShort(p.rest)):"")+"."+
+        " · «"+esc(stratName)+"», лимит "+PB.cap+" %: <b>"+fmt(t.positions||0)+" поз., "+fmt(t.units||0)+" шт, "+
+        (PB.scope==="now"
+          ? ("сейчас "+fmtMoneyShort(p.pay_now||0)+" из "+fmtMoneyShort(PB.budget)+", весь заказ "+fmtMoneyShort(t.cost||0))
+          : fmtMoneyShort(t.cost||0))+"</b>"+
+        (PB.scope!=="now"&&p.rest>0?(", остаток "+fmtMoneyShort(p.rest)):"")+"."+
         (outN?(" Не вошло в план: "+fmt(outN)+" поз."+(outRub?(", из них не хватило бюджета на "+fmtMoneyShort(outRub)+" потребности"):"")+
           ' (фильтр «Не вошло в план»).'):"")+
-        (warn.length?' <span class="warn">'+warn.join(" · ")+'</span>':"")+
+        (warn.length?' <span class="warn">'+warn.join(" · ")+'</span>':"")+thin+
+        ' <span id="pb-over" class="warn"></span>'+
         ' <a href="/assistant">Подробно с траншами и упущенными продажами</a>');
       pbSync(); renderAll();
     }).catch(function(e){
@@ -2244,6 +2273,10 @@
     pbSync(); renderAll();
   }
   document.getElementById("pb-apply").addEventListener("click",applyPlan);
+  document.addEventListener("click",function(e){
+    if(!e.target||e.target.id!=="pb-deep") return;
+    var g=document.querySelector('#pb-strat button[data-v="grow"]'); if(g) g.click();
+  });
   document.getElementById("pb-clear").addEventListener("click",function(){
     document.getElementById("pb-budget").value=""; clearPlan(); });
   document.getElementById("pb-budget").addEventListener("keydown",function(e){ if(e.key==="Enter") applyPlan(); });
@@ -2276,9 +2309,14 @@
     var body={base_names:checked.map(function(it){ return it.base_name; })};
     if(PLAN){
       body.quantities={};
+      body.plan_production_id=PLAN.pid;
+      body.out_reasons={};
       checked.forEach(function(it){
         var sz={}; Object.keys(it._recs||{}).forEach(function(k){ sz[k]=Number(it._recs[k])||0; });
         body.quantities[it.base_name]={qty:it._need||0, sizes:sz};
+      });
+      prodItems(PLAN.pid).forEach(function(it){
+        if(it._plan_out&&!it._checked) body.out_reasons[it.base_name]="План под бюджет: "+(it._planOutWhy||"вне плана");
       });
     }
     return body;
@@ -2322,6 +2360,13 @@
       : "категории заказа не выбраны";
     document.getElementById("s-qty").textContent=fmt(qty);
     document.getElementById("s-cost").textContent=fmtMoneyShort(cost);
+    // QA 16.11: под бюджетом отмеченное сверх плана называется числом.
+    var over=document.getElementById("pb-over");
+    if(over){
+      var extra=(PLAN&&PLAN.pid===ACTIVE_PROD)?Math.round(cost-(PLAN.cost||0)):0;
+      over.textContent=extra>Math.max(1000,(PLAN&&PLAN.cost||0)*0.005)
+        ?("Сейчас отмечено на "+fmtMoneyShort(cost)+": сверх плана на "+fmtMoneyShort(extra)+" (правки ростовки или позиции сверх плана)."):"";
+    }
     // D-88: себестоимость с накладными из настроек, как в мастере и «Бюджете».
     var ohTxt=(OVERHEAD_PCT>0)?(" (с накладными "+fmtNum(OVERHEAD_PCT,0)+" %)"):"";
     document.getElementById("s-cost-sub").textContent = noCost
@@ -2399,6 +2444,9 @@
       return;
     }
     var checked=items.filter(function(it){ return it._checked&&inScope(it); });
+    // QA 16.11 (P1): план под бюджет считается для одной вкладки, в файл под
+    // бюджетом идёт только она.
+    if(PLAN) checked=checked.filter(function(it){ return prodOf(it.base_name)===PLAN.pid; });
     if(!checked.length){
       alert("Отметьте хотя бы одну позицию — выгружать в Excel пока нечего.");
       return;
@@ -2411,7 +2459,7 @@
     // можно только при явном «Все категории». Выбор по именам категорий — даже
     // если отмечены все загруженные строки — уходит списком позиций: иначе в
     // файл попали бы позиции, которых на экране не было.
-    var allChecked = !!(SCOPE&&SCOPE.all) && (!items.length || checked.length===items.length);
+    var allChecked = !PLAN && !!(SCOPE&&SCOPE.all) && (!items.length || checked.length===items.length);
     btn.disabled=true;
     fetch("/api/export/replenish.xlsx",{method:"POST",
       headers:{"Content-Type":"application/json","X-Oborot-CSRF":"1"},
@@ -2466,7 +2514,9 @@
       "Категории в заказе: "+catLine+". "+
       "В заказ войдут "+fmt(sel.length)+" "+plural(sel.length,"позиция","позиции","позиций")+", "+fmt(qty)+" шт, себестоимость ~"+fmtMoneyShort(cost)+"."+
       (noCost?(" Сумма НЕПОЛНАЯ: у "+fmt(noCost)+" "+plural(noCost,"позиции","позиций","позиций")+" себестоимость не заполнена."):"")+
-      (moqN?(" У "+fmt(moqN)+" "+plural(moqN,"позиции","позиций","позиций")+" количество поднято до минимальной партии."):"");
+      (moqN?(" У "+fmt(moqN)+" "+plural(moqN,"позиции","позиций","позиций")+" количество поднято до минимальной партии."):"")+
+      ((PLAN&&PLAN.pid===ACTIVE_PROD&&cost-(PLAN.cost||0)>Math.max(1000,(PLAN.cost||0)*0.005))
+        ?(" Это сверх плана под бюджет на "+fmtMoneyShort(cost-(PLAN.cost||0))+"."):"");
     var warnEl=document.getElementById("order-modal-warning");
     var lowN=sel.filter(function(it){ return it.moq_low; }).length;
     // .warn скрыт в CSS (display:none) — показываем явным block, иначе
