@@ -23,7 +23,7 @@
   {# UI2-4 (D-90): ответы первого запуска одним блоком. Только чтение: каждое
      значение лежит в своей прежней настройке, блок их собирает и ведёт на
      нужный вопрос. Числа приходят с сервера и ставятся через textContent. #}
-  {% set can_set = perms is defined and 'settings' in perms %}
+  {% set can_set = perms is defined and 'settings' in perms and 'catalog_edit' in perms %}
   <style>
     #biz-card { margin-bottom: 14px; }
     .biz-lead { font-size: 13px; color: var(--ink-2); margin: 0 0 12px; }

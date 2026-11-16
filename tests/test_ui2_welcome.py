@@ -191,8 +191,8 @@ try:
         print("\n4. Границы классов: справка сходится с данными, сохраняется подтверждённое")
         next_ready(page)
         items = own.get("/api/turnover").json()["items"]
-        rev = sum(it["turnover"] * it["dis"] for it in items if not it.get("hidden") and it["group"] == "rank" and it["dis"] > 0)
-        days = sum(it["dis"] for it in items if not it.get("hidden") and it["group"] == "rank" and it["dis"] > 0)
+        rev = sum(it["turnover"] * it["dis"] for it in items if not it.get("hidden") and not it.get("archived") and it["group"] == "rank" and it["dis"] > 0)
+        days = sum(it["dis"] for it in items if not it.get("hidden") and not it.get("archived") and it["group"] == "rank" and it["dis"] > 0)
         b_avg = rev / days
         t_bar = b_avg * 1.5
         calc = {"weak": round(t_bar / 3), "dull": round(2 * t_bar / 3), "good": round(5 * t_bar / 3)}

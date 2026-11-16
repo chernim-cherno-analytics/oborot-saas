@@ -1551,7 +1551,9 @@ def welcome_page(request: Request, db: Session = Depends(get_db)):
         return RedirectResponse("/login", status_code=302)
     if not _has_active_connection(db, ctx.org.id) and not _data_is_loading(ctx.org.id):
         return RedirectResponse("/onboarding", status_code=302)
-    if not ctx.can("settings"):
+    # Вопросы пишут и настройки (settings), и правило скидок (catalog_edit).
+    # Роль с одним из двух прав упёрлась бы в 403 посреди пути (ревью #137).
+    if not (ctx.can("settings") and ctx.can("catalog_edit")):
         return RedirectResponse("/turnover", status_code=302)
     return _page(request, ctx, "welcome.html", "welcome", "Первый запуск", db=db)
 

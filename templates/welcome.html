@@ -326,12 +326,14 @@
          '<li>Границы ваши: впишите круглые числа, если так удобнее.</li>' +
          '</ol></details>';
        function read(){
+         S.thrTouched = true;
          ["weak", "dull", "good"].forEach(function(k){ var v = parseInt($("b-" + k).value, 10); if (!isNaN(v)) S.thr[k] = v; });
          $("b-best").textContent = fmt(S.thr.good);
        }
        ["weak", "dull", "good"].forEach(function(k){ $("b-" + k).addEventListener("change", read); });
        var use = $("b-use");
        if (use) use.addEventListener("click", function(){
+         S.thrTouched = true;
          S.thr = {weak: c.weak, dull: c.dull, good: c.good};
          ["weak", "dull", "good"].forEach(function(k){ $("b-" + k).value = S.thr[k]; });
          $("b-best").textContent = fmt(S.thr.good); use.remove();
@@ -340,7 +342,7 @@
      },
      save: function(){
        if (!S.loaded) return Promise.resolve();
-       this.read();
+       var touched = S.thrTouched; this.read(); S.thrTouched = touched;
        var t = S.thr, o = S.thr0;
        if (!(t.weak > 0 && t.weak < t.dull && t.dull < t.good)) return Promise.reject(new Error("Границы должны расти слева направо: слабые, медленные, хорошие."));
        if (t.good > 10000000) return Promise.reject(new Error("Слишком большое число. Граница не может быть больше 10 000 000 ₽ в день."));
@@ -411,7 +413,7 @@
   function calcFrom(items, thr){
     var rev = 0, days = 0;
     (items || []).forEach(function(it){
-      if (it.hidden || it.group !== "rank" || !(it.dis > 0)) return;
+      if (it.hidden || it.archived || it.group !== "rank" || !(it.dis > 0)) return;
       rev += it.turnover * it.dis; days += it.dis;
     });
     if (!(days > 0) || !(rev > 0)) return null;
@@ -420,27 +422,26 @@
     c.same = c.weak === thr.weak && c.dull === thr.dull && c.good === thr.good;
     return c;
   }
-  var empties = 0;
+  /* Данные грузятся частями: пока загрузка идёт, ответ /api/turnover может
+     быть пустым или неполным. Поэтому состояние загрузки читается всегда, а
+     расчёт-справка обновляется до конца загрузки (ревью #137). Пустой ответ
+     считается окончательным только когда загрузка не идёт. */
   function pollData(){
-    api("/api/turnover").then(function(d){
-      var items = (d && d.items) || [];
-      if (items.length) {
-        S.loaded = true; S.calc = calcFrom(items, S.thr); syncEl.textContent = "";
-        if (STEPS[idx].k === "bar") show(idx, true);
-        return;
-      }
-      // Пустой ответ бывает и законченным: каталог пуст или всё без продаж.
-      // Тогда загрузка окончена, просто считать не из чего.
-      empties++;
-      return api("/api/sync/progress").catch(function(){ return {}; }).then(function(p){
-        if ((p && p.state && p.state !== "running") || empties >= 8) {
-          S.loaded = true; S.calc = null; S.syncError = !!(p && p.state === "error"); syncEl.textContent = "";
-          if (STEPS[idx].k === "bar") show(idx, true);
-          return;
-        }
+    Promise.all([api("/api/turnover"), api("/api/sync/progress").catch(function(){ return {}; })]).then(function(r){
+      var items = (r[0] && r[0].items) || [], running = !!(r[1] && r[1].state === "running");
+      var onBar = STEPS[idx].k === "bar", was = S.loaded, prev = S.calc;
+      if (items.length || !running) {
+        S.loaded = true; S.calc = calcFrom(items, S.thr);
+        S.syncError = !items.length && !!(r[1] && r[1].state === "error");
+        syncEl.textContent = running ? "Данные ещё догружаются, расчёт уточнится." : "";
+        // Шаг перерисовывается, когда он открылся впервые или расчёт изменился,
+        // но не поверх того, что человек уже вписал руками.
+        var changed = !was || (!!prev !== !!S.calc) || (prev && S.calc && Math.round(prev.b) !== Math.round(S.calc.b));
+        if (onBar && changed && !S.thrTouched) show(idx, true);
+      } else {
         syncEl.textContent = "Данные загружаются в фоне. Отвечать можно уже сейчас.";
-        setTimeout(pollData, 4000);
-      });
+      }
+      if (running) setTimeout(pollData, 5000);
     }).catch(function(){ setTimeout(pollData, 6000); });
   }
   Promise.all([api("/api/discount-rule"), api("/api/productions"), api("/api/settings")]).then(function(r){
