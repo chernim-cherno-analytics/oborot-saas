@@ -62,6 +62,9 @@ def api_replenish(ctx: AuthContext = Depends(require_auth_api), db: Session = De
         .order_by(ProductionOrder.created_at.desc())
     ).all()
     data["orders_in_production"] = [{"id": o.id, "name": o.name} for o in sent]
+    # D-85: старые черновики потребность не уменьшают, страница их называет.
+    data["stale_drafts"] = analytics.stale_drafts(db, ctx.org.id)
+    data["draft_fresh_days"] = analytics.DRAFT_FRESH_DAYS
     return data
 
 
