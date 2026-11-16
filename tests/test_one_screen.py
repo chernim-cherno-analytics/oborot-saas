@@ -199,6 +199,22 @@ try:
               "лимит 60 %" in page.inner_text("#pb-note").replace("\xa0", " ")
               and page.locator('#pb-strat button.on[data-v="grow"]').count() == 1, page.inner_text("#pb-note"))
         check("бюджет в поле", money(page.input_value("#pb-budget")) == 200000, page.input_value("#pb-budget"))
+        cats = sorted({(i.get("category") or "Без категории") for i in own.get("/api/replenish").json()["items"]})
+        keep = cats[0]
+        page.evaluate("""(ex) => localStorage.setItem('oborot.planbar', JSON.stringify(
+            {budget: 200000, scope: 'full', strategy: 'balance', cap: 30, excl: ex}))""",
+                      [c for c in cats if c != keep])
+        page.goto(BASE + "/replenish")
+        page.wait_for_function("document.getElementById('pb-note').textContent.indexOf('План под бюджет')>=0",
+                               timeout=60000)
+        note2 = page.inner_text("#scope-note")
+        in_plan = page.eval_on_selector_all(
+            "#tbody tr[data-base]:not(.plan-out):not(.out-scope) input.row-check:checked",
+            "els => els.map(e => e.closest('tr').querySelector('.csub').textContent)")
+        check("категории из шагов перенесены: выбрана только одна",
+              keep in note2 and all(c not in note2 for c in cats if c != keep), note2)
+        check("в плане только позиции этой категории",
+              in_plan and all(t.startswith(keep) for t in in_plan), str(in_plan[:3]))
         src = own.get("/assistant").text
         check("в мастере есть кнопка «Открыть в «Заказе»»", 'id="toTable"' in src)
         check("ошибок JS нет", not errs, str(errs[:3]))

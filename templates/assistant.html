@@ -1594,7 +1594,9 @@
         localStorage.setItem("oborot.planbar", JSON.stringify({
           budget: b.budget || 0, scope: b.budget_scope === "now" ? "now" : "full",
           strategy: b.strategy || "balance", cap: b.max_share_pct || 30,
-          pid: b.production_id || null}));
+          pid: b.production_id || null,
+          // Ревью #136: состав по категориям едет вместе с бюджетом.
+          excl: (b.exclude_categories || []).slice()}));
       }catch(e){}
       location.href = "/replenish";
     });
