@@ -2081,7 +2081,9 @@
           if(!Object.keys(SCOPE.cats).length) SCOPE=null;
         }
         renderScope(); renderTable(); updateSummary();
-        if(PLAN) applyPlan();
+        // Ревью #136: и при ещё не пришедшем первом расчёте; ответ по старому
+        // набору категорий отбрасывается (PLAN_SEQ).
+        if(PLAN||PLAN_PENDING) applyPlan();
       });
     });
     var note=document.getElementById("scope-note");
