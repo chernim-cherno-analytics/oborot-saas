@@ -452,11 +452,6 @@ html.ui2 .steps { margin-top: 0; }
 html.ui2 .modal-bg .modal { width: 560px; max-width: calc(100vw - 24px); }
 /* Синей остаётся одна кнопка: у первого непройденного урока. */
 html.ui2 .lesson:not(.done):not(.lesson:not(.done) ~ .lesson) a.go-btn { background: var(--u-accent); color: #fff; border-color: var(--u-accent); }
-/* Шапка помещается в одну строку и на 1100. */
-@media (min-width: 761px) and (max-width: 1240px) {
-  html.ui2 .header.app-top .app-logo { letter-spacing: .08em; }
-  html.ui2 .header.app-top .app-nav a { padding: 7px 5px; font-size: 12px; }
-}
 
 /* --- Телефон и планшет (критик C) --- */
 @media(max-width:480px){html.ui2 #tfoot td:nth-child(n+2):nth-child(-n+7){display:none}}
@@ -518,6 +513,115 @@ html.ui2 .chan, html.ui2 .pl-card, html.ui2 .pcard, html.ui2 .pl-next { border-r
 html.ui2 .pl-form { max-width: 640px; }
 html.ui2 .pl-field .btn { align-self: flex-start; }
 html.ui2 .pl-field input, html.ui2 .pl-field select { min-height: 36px; border-radius: 12px; }
+
+/* ================= Второй круг: арт-директор и судья приёмки (16.11) =================
+   Правила арт-директора (перемерены на 1440 и 390 после слияния D-89). */
+/* 1. Меню и чип пользователя на страницах base.html стоят там же, где на остальных */
+html.ui2 .sidebar .nav a{position:relative}
+html.ui2 .sidebar .nav a .pip{position:absolute;top:-5px;right:-8px;margin:0}
+@media (max-width:760px){
+  html.ui2 .topbar .user-menu{position:fixed;top:15px;right:17px;z-index:210}
+  html.ui2 .user-chip{padding:6px;min-height:44px}
+  html.ui2 .user-chip>span+span{display:none}
+  html.ui2 .sidebar{padding-right:62px}
+}
+
+/* 2. Таблицы: строки капсулами и числа по правому краю, как на «Оборачиваемости» */
+html.ui2 :is(.twrap,#tbl-wrap,#tblWrap){border-radius:22px;padding:0 8px 0 0}
+html.ui2 :is(.twrap,#tbl-wrap,#tblWrap)>table{border-collapse:separate;border-spacing:0 4px;width:calc(100% - 10px);margin-left:10px;font-size:13.5px}
+html.ui2 :is(.twrap,#tbl-wrap,#tblWrap) thead th{background:#fff;border-bottom:0;font-weight:600}
+html.ui2 :is(.twrap,#tbl-wrap,#tblWrap) tbody td{border:0;box-shadow:none;font-size:13.5px;font-variant-numeric:tabular-nums}
+html.ui2 :is(.twrap,#tbl-wrap,#tblWrap) tbody td:first-child{border-radius:13px 0 0 13px}
+html.ui2 :is(.twrap,#tbl-wrap,#tblWrap) tbody td:last-child{border-radius:0 13px 13px 0}
+html.ui2 :is(.twrap,#tblWrap) :is(th,td):nth-child(n+2),html.ui2 #tbl-wrap :is(th,td):nth-child(n+4){text-align:right;padding-right:18px}
+html.ui2 #tbl-wrap tfoot td,html.ui2 #tblWrap tr.total td{box-shadow:0 4px 0 #fff,0 -4px 0 #fff}
+html.ui2 .panel table td{font-variant-numeric:tabular-nums}
+
+/* 3. «Заказ» после D-89: одна синяя кнопка, новые блоки той же панелью, одна высота в строке */
+html.ui2 #pb-apply,html.ui2 .first-card .abtn.primary{background:rgba(255,255,255,.72);border-color:var(--u-hair);color:var(--u-ink)}
+html.ui2 .first-card,html.ui2 .plan-bar{border-radius:18px;background:rgba(255,255,255,.86);border:1px solid rgba(255,255,255,.9);box-shadow:inset 0 1px 0 rgba(255,255,255,.9),0 6px 24px rgba(46,46,96,.07);padding:12px 18px}
+html.ui2 .plan-bar .pb-in,html.ui2 .plan-bar .pb-sel{border-radius:12px;border-color:var(--u-hair)}
+@media (min-width:761px){html.ui2 .plan-bar .pb-in,html.ui2 .plan-bar .pb-sel{height:34px}}
+html.ui2 .plan-bar .pb-f{color:var(--u-ink2)}
+
+/* 4. Статусы, красный текст, полоски и галочки: палитра эталона */
+html.ui2 .stbadge,html.ui2 .panel .pill,html.ui2 .losstag{border-radius:999px;font-size:11.5px;padding:3px 10px}
+html.ui2 .stbadge{background:rgba(255,255,255,.74);color:var(--u-ink)}
+html.ui2 .stbadge.g{box-shadow:inset 0 0 0 1.5px var(--u-good)}
+html.ui2 .stbadge.y{box-shadow:inset 0 0 0 1.5px var(--u-slow)}
+html.ui2 .stbadge.r{box-shadow:inset 0 0 0 1.5px var(--u-out)}
+html.ui2 .txt-red,html.ui2 .need-pill.r,html.ui2 .risk-go,html.ui2 .tbl-legend b,html.ui2 .scope-note.need,html.ui2 .mneg,html.ui2 .losstag,html.ui2 .pb-note .warn{color:#a3241c}
+html.ui2 .ss[style*="160, 0, 3"],html.ui2 .sub[style*="a00003"]{color:#a3241c!important}
+html.ui2 .losstag{background:rgba(240,68,58,.16)}
+html.ui2 .risk-go{border-color:rgba(240,68,58,.4)}
+html.ui2 .pill[style*="76,187,23"]{background:#dcf2e2!important;color:#14692f!important}
+html.ui2 .pill[style*="221,0,4"]{background:#ffe7e5!important;color:#a3241c!important}
+html.ui2 .zfill[style*="4b7a00"]{background:#2fb457!important}
+html.ui2 .zfill[style*="b99a00"]{background:#f08c00!important}
+html.ui2 .zfill[style*="dd0004"],html.ui2 .zfill[style*="221,0,4"]{background:#f0443a!important}
+html.ui2 .zbar .zfill{opacity:.5}
+html.ui2 input[type=checkbox],html.ui2 input[type=radio]{accent-color:var(--u-accent)}
+
+/* 5. Заголовок страницы: один размер, без дублей статуса */
+html.ui2 .head-row h1{font-size:24px;letter-spacing:-.02em}
+html.ui2 .topbar{padding-top:12px}
+html.ui2 .topbar .live,html.ui2 .topbar .plan-badge{display:none}
+
+/* 6. Колонка и шапки карточек на страницах base.html */
+html.ui2 .settings-grid,html.ui2 .acc-wrap,html.ui2 .plans-wrap{max-width:980px}
+html.ui2 .sup-wrap{max-width:none}
+html.ui2 .team-grid{gap:0}
+html.ui2 .card-head{min-height:55px}
+
+/* 7. Карточки показателей: одна цифра, одна подпись, одни поля */
+html.ui2 .ms-card,html.ui2 .scard{padding:14px 18px}
+html.ui2 .ms-card .val,html.ui2 .scard .sv{font-size:22px}
+html.ui2 .scard .ss{font-size:12px;color:var(--u-ink2)}
+
+/* 8. Кнопки одного смысла одной высоты и вида */
+@media (min-width:761px){html.ui2 .go-btn,html.ui2 .abtn{display:inline-flex;align-items:center;height:34px;padding:0 16px;font-size:13px;line-height:1}}
+html.ui2 #xlsxBtn{background:rgba(255,255,255,.72)!important;border-color:var(--u-hair)!important;color:var(--u-ink2)!important}
+
+/* 9. Чипы категорий и периодов одного размера */
+html.ui2 .scope-btn,html.ui2 .gradient-bg ~ .main .chip,html.ui2 .toolbar .preset{padding:5px 13px;font-size:13px;font-weight:500}
+@media (min-width:761px){html.ui2 .scope-btn,html.ui2 .gradient-bg ~ .main .chip,html.ui2 .toolbar .preset{height:32px;min-height:32px}}
+html.ui2 .cat-btn .cnt{font-size:11.5px;opacity:.86;margin-left:5px}
+
+/* 10. Бледный и мелкий текст */
+html.ui2 :is(.bt-sub,.prod-note,.seg-lbl,.cat-lbl,#fc-window,.pbasis,.pmonths,.pmonths *,.catmeta,.head-row .sub,.allrow .s,.panel .sub,.pinfo .k,.fold-head .c,.pcenter .sub){color:var(--u-ink2)}
+html.ui2 tbody td.name .csub,html.ui2 .pmini .val,html.ui2 .pbasis,html.ui2 .pcenter .sub,html.ui2 .pinfo h3{font-size:11.5px;color:var(--u-ink2)}
+html.ui2 #tblWrap td .muted{font-size:11.5px!important;color:var(--u-ink2)}
+html.ui2 .pmonths{font-size:12px}
+html.ui2 .pmini-row>div[style*="font-size:10px"]{font-size:12px!important;color:var(--u-ink2)!important}
+
+/* 11. Вертикальный ритм: 12 px между блоками (эталон не затронут) */
+html.ui2 .gradient-bg ~ .main > :is(.panel,.cards,.summary,.money-strip,.sumbar,.bigtabs,.toolbar,.warn,.twrap,.steps,.loss-line,.scope-bar,.pbar,.head-row,.first-card,.plan-bar,.prod-note,#tbl-wrap,#tblWrap,#catBar){margin-top:0;margin-bottom:12px}
+
+/* 12. Поля в одной строке одной высоты и формы */
+html.ui2 .gradient-bg ~ .main input#prod-search{height:36px;border-radius:12px}
+@media (min-width:761px){html.ui2 .toolbar input{height:32px}}
+html.ui2 .toolbar #search{border-radius:999px;padding:0 14px}
+html.ui2 .binp{height:40px}
+
+/* 13. Старые цвета на страницах base.html: синяя тень, бежевая рамка, красный и зелёный фон */
+html.ui2 .btn.primary{box-shadow:none}
+html.ui2{--red-bg:#ffe7e5;--red-line:rgba(240,68,58,.28);--amber-bg:#ffeed5;--amber-line:rgba(240,140,0,.28);--green-bg:#dcf2e2;--green-line:rgba(47,180,87,.25);--green-fill:#2fb457;--amber-fill:#f08c00}
+
+/* 14. Вход и подключение: окно как у первого запуска */
+html.ui2 .auth-card,html.ui2 .onb-card{border-radius:28px;box-shadow:inset 0 1px 0 rgba(255,255,255,.9),0 40px 100px rgba(46,46,96,.2)}
+html.ui2 .auth-card h1{font-size:26px}
+
+
+/* --- Судья приёмки: что не легло с первого раза и что сломали правки --- */
+html.ui2 .user-pop { background: #fff; }
+@media (min-width: 1361px) { html.ui2 .user-chip { max-width: 220px; } html.ui2 .sidebar { padding-right: 240px; } }
+@media (max-width: 560px) {
+  html.ui2 #rc-lines td[data-label]::before { text-transform: none; letter-spacing: 0; font-size: 12px; color: var(--u-ink2); }
+  html.ui2 #rc-save, html.ui2 #rc-close { border-radius: 999px; }
+}
+html.ui2 #btn-all { background: rgba(255, 255, 255, .75); color: var(--u-ink); border-color: var(--u-hair); }
+@media (max-width: 760px) { html.ui2 .gradient-bg ~ .main input.search, html.ui2 .scope-btn { height: 40px; } }
+@media (min-width: 761px) { html.ui2 #orders-wrap thead th:last-child { width: 300px !important; } }
 
 /* Печать: как было до нового вида. Панели и обои на бумаге не нужны. */
 @media print {

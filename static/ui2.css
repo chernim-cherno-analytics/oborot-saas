@@ -248,3 +248,11 @@ html.ui2 .tour-card .tc-next, html.ui2 .tour-card .tc-link {
   border-radius: 999px; background: var(--u-accent); color: #fff; font-size: 13px; font-weight: 600; padding: 8px 18px;
 }
 html.ui2 .tour-card .tc-next:hover, html.ui2 .tour-card .tc-link:hover { background: #0857b8; }
+
+/* Под палец (судья приёмки): «Оборачиваемость» подключает только этот файл. */
+@media (max-width: 760px) {
+  html.ui2 .cat-btn, html.ui2 .chip-tg, html.ui2 .rule-btn, html.ui2 .def-disc-btn, html.ui2 input.search { height: 40px; }
+}
+html.ui2 .u-tip button { min-height: 40px; }
+html.ui2 .u-tip .u-x { width: 40px; height: 40px; top: 4px; right: 4px; }
+html.ui2 input[type=checkbox], html.ui2 input[type=radio] { accent-color: var(--u-accent); }
