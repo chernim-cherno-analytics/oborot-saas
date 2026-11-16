@@ -2242,6 +2242,9 @@
     b.addEventListener("click",function(){
       PB.strategy=b.getAttribute("data-v");
       PB.cap={protect:20,balance:30,grow:60}[PB.strategy];
+      // Введённый, но ещё не применённый бюджет не теряется (ревью #136).
+      PB.budget=pbNum(document.getElementById("pb-budget").value);
+      PB.scope=document.getElementById("pb-scope").value;
       pbSave(); pbSync();
       if(PLAN||PLAN_PENDING) applyPlan();
     });
