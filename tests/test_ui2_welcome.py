@@ -320,6 +320,41 @@ try:
               vpage.evaluate("() => document.querySelectorAll('#biz-rows a').length === 0 && !document.getElementById('biz-rerun')"))
         vctx.close()
 
+        # Ревью #137 (Codex, P1): пустой каталог после законченной загрузки не
+        # запирает человека на последнем шаге; пока загрузка идёт, шаг можно не ждать.
+        ectx = b.new_context(viewport={"width": 1280, "height": 800})
+        ectx.add_cookies(cookies(own))
+        epage = ectx.new_page()
+        prog = {"state": "running"}
+        epage.route("**/api/turnover", lambda r: r.fulfill(status=200, content_type="application/json", body='{"items": []}'))
+        epage.route("**/api/sync/progress", lambda r: r.fulfill(status=200, content_type="application/json",
+                                                               body='{"state": "%s"}' % prog["state"]))
+        epage.goto(f"{BASE}/welcome#bar")
+        wait_step(epage, "bar")
+        epage.wait_for_selector("#b-skip", timeout=10000)
+        check("пока данные грузятся, «Открыть таблицу» ждёт, но есть «Не ждать и открыть таблицу»",
+              epage.evaluate("() => document.getElementById('w-next').disabled === true"))
+        prog["state"] = "idle"
+        epage.wait_for_function("() => !!document.getElementById('b-weak') && !document.getElementById('w-next').disabled", timeout=30000)
+        fact = epage.evaluate("() => document.getElementById('b-fact').textContent")
+        check("загрузка закончилась пустой: шаг открыт, честно сказано, что считать не из чего",
+              "нет вещей с продажами" in fact and not epage.evaluate("() => !!document.getElementById('b-use')"), fact[:120])
+        thr_before = own.get("/api/settings").json()["thresholds"]
+        with epage.expect_navigation(url=lambda u: "/welcome" not in u, timeout=30000):
+            epage.click("#w-next")
+        prog["state"] = "error"
+        epage2 = ectx.new_page()
+        epage2.route("**/api/turnover", lambda r: r.fulfill(status=200, content_type="application/json", body='{"items": []}'))
+        epage2.route("**/api/sync/progress", lambda r: r.fulfill(status=200, content_type="application/json", body='{"state": "error"}'))
+        epage2.goto(f"{BASE}/welcome#bar")
+        epage2.wait_for_function("() => !!document.getElementById('b-fact') && !document.getElementById('w-next').disabled", timeout=30000)
+        check("сбой загрузки назван сбоем, шаг не заперт",
+              "не загрузились" in epage2.evaluate("() => document.getElementById('b-fact').textContent"))
+        epage2.close()
+        check("с пустым каталогом последний шаг ведёт в таблицу и границы не трогает",
+              epage.url.rstrip("/").endswith("/turnover") and own.get("/api/settings").json()["thresholds"] == thr_before, epage.url)
+        ectx.close()
+
         mctx = b.new_context(viewport={"width": 390, "height": 844}, has_touch=True, is_mobile=True)
         mctx.add_cookies(cookies(own))
         mpage = mctx.new_page()

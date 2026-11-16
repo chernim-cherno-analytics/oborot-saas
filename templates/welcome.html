@@ -226,6 +226,9 @@
            '<span>Продаётся слабо</span>' + cell(r.weak_pct) + cell(r.weak_over_pct);
        }
        function change(){
+         var was = S.bounds || ruleBounds(S.rule);
+         if (isNaN(parseInt($("k-lo").value, 10))) $("k-lo").value = was[0];
+         if (isNaN(parseInt($("k-hi").value, 10))) $("k-hi").value = was[1];
          var lo = round5(clamp($("k-lo").value, 5, 90)), hi = round5(clamp($("k-hi").value, 10, 95));
          if (hi <= lo) hi = Math.min(95, lo + 5);
          if (hi <= lo) lo = hi - 5;
@@ -244,15 +247,20 @@
        function row(p, i){
          return '<div class="prow" data-i="' + i + '"><input class="txt" type="text" maxlength="120" value="' + esc(p.name) +
            '" aria-label="Название производства" placeholder="Например, Китай">' +
-           '<input class="num" type="number" min="1" max="365" inputmode="numeric" value="' + (p.lead_time_days || "") +
-           '" placeholder="' + (S.defLead || 45) + '" aria-label="Срок производства, дней"><span class="d">дней шьют</span></div>';
+           (p.staged
+             ? '<input class="num" type="number" value="' + (p.lead_eff || "") + '" disabled title="Срок складывается из этапов производства, меняется в настройках" aria-label="Срок производства по этапам, дней">'
+             : '<input class="num" type="number" min="1" max="365" inputmode="numeric" value="' + (p.lead_time_days || "") +
+               '" placeholder="' + (S.defLead || 45) + '" aria-label="Срок производства, дней">') +
+           '<span class="d">дней шьют</span></div>';
        }
        body.innerHTML = '<div class="plist" id="p-list">' + S.prods.map(row).join("") + '</div>' +
          '<button class="btn addp" type="button" id="p-add">Добавить производство</button>';
        function read(){
          [].forEach.call(document.querySelectorAll("#p-list .prow"), function(r){
            var p = S.prods[+r.getAttribute("data-i")], v = r.querySelector(".num").value;
-           p.name = r.querySelector(".txt").value; p.lead_time_days = v === "" ? null : clamp(v, 1, 365);
+           if (!p) return;
+           p.name = r.querySelector(".txt").value;
+           if (!p.staged) p.lead_time_days = v === "" ? null : clamp(v, 1, 365);
          });
        }
        $("p-list").addEventListener("change", read);
@@ -266,7 +274,6 @@
      save: function(){
        this.read();
        var jobs = [];
-       S.prods = S.prods.filter(function(p){ return p.id || p.name.trim(); });
        S.prods.forEach(function(p){
          var name = p.name.trim(), was = p.id ? S.prods0[p.id] : null;
          if (!name) { if (was) p.name = was.name; return; }
@@ -289,7 +296,11 @@
      next: "Открыть таблицу",
      draw: function(){
        if (!S.loaded) {
-         body.innerHTML = '<div class="wait"><span class="spin" aria-hidden="true"></span><span>Считаем по вашим продажам. Обычно это меньше минуты.</span></div>';
+         // Ждать не обязательно: границы можно задать позже в настройках
+         // (ревью #137: пустой каталог не должен запирать человека на шаге).
+         body.innerHTML = '<div class="wait"><span class="spin" aria-hidden="true"></span><span>Считаем по вашим продажам. Обычно это меньше минуты.</span></div>' +
+           '<p style="margin-top:14px"><button class="btn ghost" type="button" id="b-skip" style="padding:0">Не ждать и открыть таблицу</button></p>';
+         $("b-skip").addEventListener("click", finish);
          next.disabled = true;
          return;
        }
@@ -298,7 +309,9 @@
        var fact = c
          ? 'Сейчас одна вещь приносит в среднем <b>' + fmt(c.b) + ' ₽</b> в день, пока лежит на складе. Ориентир в полтора раза выше: <b>' + fmt(c.t) + ' ₽</b>. От него считаем границы групп.' +
            (c.same ? '' : ' <button class="btn ghost" type="button" id="b-use">Подставить расчёт</button>')
-         : 'Продаж пока мало, чтобы посчитать среднее. Границы можно оставить как есть и поменять позже.';
+         : (S.syncError
+             ? 'Данные не загрузились. Откройте таблицу: там видно, что случилось, и можно повторить загрузку. Границы можно оставить как есть и поменять позже.'
+             : 'В таблице пока нет вещей с продажами, посчитать среднее не из чего. Границы можно оставить как есть и поменять позже.');
        body.innerHTML = '<div class="fact" id="b-fact">' + fact + '</div>' +
          '<div class="grp">' +
          '<div class="g weak"><div class="n">Слабые</div><div class="r">меньше, ₽ в день</div><input class="num" id="b-weak" type="number" min="1" inputmode="numeric" value="' + t.weak + '" aria-label="Слабые: меньше, рублей в день"></div>' +
@@ -330,6 +343,7 @@
        this.read();
        var t = S.thr, o = S.thr0;
        if (!(t.weak > 0 && t.weak < t.dull && t.dull < t.good)) return Promise.reject(new Error("Границы должны расти слева направо: слабые, медленные, хорошие."));
+       if (t.good > 10000000) return Promise.reject(new Error("Слишком большое число. Граница не может быть больше 10 000 000 ₽ в день."));
        if (o && o.weak === t.weak && o.dull === t.dull && o.good === t.good) return Promise.resolve();
        return api("/api/settings", {method: "POST", body: {thresholds: t}}).then(function(){ S.thr0 = {weak: t.weak, dull: t.dull, good: t.good}; });
      }}
@@ -406,6 +420,7 @@
     c.same = c.weak === thr.weak && c.dull === thr.dull && c.good === thr.good;
     return c;
   }
+  var empties = 0;
   function pollData(){
     api("/api/turnover").then(function(d){
       var items = (d && d.items) || [];
@@ -414,8 +429,18 @@
         if (STEPS[idx].k === "bar") show(idx, true);
         return;
       }
-      syncEl.textContent = "Данные загружаются в фоне. Отвечать можно уже сейчас.";
-      setTimeout(pollData, 4000);
+      // Пустой ответ бывает и законченным: каталог пуст или всё без продаж.
+      // Тогда загрузка окончена, просто считать не из чего.
+      empties++;
+      return api("/api/sync/progress").catch(function(){ return {}; }).then(function(p){
+        if ((p && p.state && p.state !== "running") || empties >= 8) {
+          S.loaded = true; S.calc = null; S.syncError = !!(p && p.state === "error"); syncEl.textContent = "";
+          if (STEPS[idx].k === "bar") show(idx, true);
+          return;
+        }
+        syncEl.textContent = "Данные загружаются в фоне. Отвечать можно уже сейчас.";
+        setTimeout(pollData, 4000);
+      });
     }).catch(function(){ setTimeout(pollData, 6000); });
   }
   Promise.all([api("/api/discount-rule"), api("/api/productions"), api("/api/settings")]).then(function(r){
@@ -423,7 +448,8 @@
     S.defLead = r[1].default_lead_time_days;
     S.prods = (r[1].productions || []).map(function(p){
       S.prods0[p.id] = {name: p.name, lead_time_days: p.lead_time_days || null};
-      return {id: p.id, name: p.name, lead_time_days: p.lead_time_days || null};
+      return {id: p.id, name: p.name, lead_time_days: p.lead_time_days || null,
+              staged: !!p.lead_from_stages, lead_eff: p.lead_effective || p.lead_days || null};
     });
     var t = r[2].thresholds;
     S.thr = {weak: t.weak, dull: t.dull, good: t.good}; S.thr0 = {weak: t.weak, dull: t.dull, good: t.good};
