@@ -379,6 +379,24 @@
   .modal .warn { font-size: 12px; color: #a15c00; background: rgba(255,204,0,.15);
     border: 1px solid rgba(255,204,0,.4); border-radius: 10px; padding: 8px 12px; margin-top: 10px; display: none; }
   .modal .actions { display: flex; gap: 10px; margin-top: 18px; justify-content: flex-end; }
+  .plan-bar { background: rgba(255,255,255,.72); border: 1px solid rgba(31,31,31,.1); border-radius: 12px;
+    padding: 10px 14px; margin: 10px 0 12px; }
+  .plan-bar .pb-row { display: flex; gap: 10px 14px; align-items: center; flex-wrap: wrap; }
+  .plan-bar .pb-title { font-weight: 700; font-size: 13px; }
+  .plan-bar .pb-f { font-size: 12px; color: rgba(31,31,31,.6); display: inline-flex; gap: 6px; align-items: center; }
+  .plan-bar .pb-in { width: 150px; padding: 6px 9px; border: 1px solid rgba(31,31,31,.18); border-radius: 8px; font: inherit; font-size: 13px; }
+  .plan-bar .pb-in.sm { width: 64px; }
+  .plan-bar .pb-sel { padding: 6px 8px; border: 1px solid rgba(31,31,31,.18); border-radius: 8px; font: inherit; font-size: 12.5px; background: #fff; }
+  .plan-bar .pb-steps { margin-left: auto; text-decoration: none; }
+  .plan-bar .pb-note { font-size: 12.5px; margin-top: 6px; line-height: 1.5; }
+  .plan-bar .pb-note:empty { display: none; }
+  .plan-bar .pb-note .warn { color: #a00003; }
+  .first-card { display: flex; gap: 14px; align-items: center; justify-content: space-between; flex-wrap: wrap;
+    background: rgba(255,255,255,.85); border: 1px solid rgba(31,31,31,.14); border-radius: 12px; padding: 12px 16px;
+    margin: 0 0 12px; font-size: 13px; line-height: 1.5; }
+  .first-card .fc-act { display: flex; gap: 8px; }
+  .out-tag { font-size: 9px; font-weight: 700; padding: 1px 6px; border-radius: 8px; background: rgba(31,31,31,.08); color: rgba(31,31,31,.6); }
+  tr.plan-out td { opacity: .55; }
 </style>
 {% include "_mobile.html" %}
 {% include "_app_shell_head.html" %}
@@ -401,6 +419,21 @@
     </div>
   </details>
 
+  {# D-89: первый заказ предлагается собрать по шагам (срок, бюджет, транши,
+     новинки). Карточка показывается, пока у организации нет ни одного заказа,
+     и закрывается навсегда для этого браузера. #}
+  <div class="first-card need-plan" id="first-card" style="display:none">
+    <div><b>Первый заказ?</b> Соберите его по шагам: когда нужен приход, сколько денег, как платите
+      производству, новинки. В конце откроется эта же таблица с планом под бюджет.</div>
+    <div class="fc-act"><a class="abtn primary" href="/assistant" style="text-decoration:none">Собрать по шагам</a>
+      <button type="button" class="abtn" id="first-card-x">Сразу к таблице</button></div>
+  </div>
+
+  {# D-85: черновики старше месяца планом не считаются и потребность не
+     уменьшают; их нужно удалить или отправить в производство. #}
+  <div id="stale-drafts" role="status" style="display:none;background:#fff8e1;border:1px solid rgba(255,204,0,.5);
+    border-radius:10px;padding:9px 14px;margin:0 0 12px;font-size:12.5px;line-height:1.5"></div>
+
   <div class="sumbar" id="sumbar" style="display:none">
     <div class="scard" id="risk-card"><div class="sl">Риск стокаута</div><div class="sv" id="k-risk">0</div><div class="ss" id="k-risk-sub">покрытие меньше 2 недель</div>
       <button type="button" class="risk-go" id="risk-go" aria-controls="tbl-wrap" aria-pressed="false">Показать «Срочно» в таблице</button></div>
@@ -415,12 +448,39 @@
     производства, минимальная партия и кратность (✎ на вкладке). Позиции переносятся между производствами
     кнопкой в последней колонке таблицы. Заказ создаётся из активной вкладки — по её условиям.</div>
 
+  {# D-89 (решение владельца 15.11.2026): условия мастера на «Заказе». Бюджет
+     пуст = вся потребность (как было); бюджет задан = план мастера тем же
+     движком (/api/order-plan/preview) для активного производства и выбранных
+     категорий. Таблица, ростовка и «Оформить» те же. #}
+  <div class="plan-bar need-plan" id="plan-bar">
+    <div class="pb-row">
+      <span class="pb-title">Под бюджет</span>
+      <label class="pb-f">Бюджет, ₽ <input id="pb-budget" class="pb-in" inputmode="numeric" autocomplete="off"
+        placeholder="пусто = вся потребность" aria-label="Бюджет заказа, рублей"></label>
+      <select id="pb-scope" class="pb-sel" aria-label="Что считать бюджетом"
+        title="«Весь заказ»: себестоимость всего заказа. «Деньги на сейчас»: только то, что платить сегодня по этапам производства (предоплаты)">
+        <option value="full">на весь заказ</option><option value="now">деньги на сейчас</option></select>
+      <label class="pb-f" title="Чтобы одна модель не съела весь бюджет">Макс. на модель, %
+        <input id="pb-cap" class="pb-in sm" type="number" min="5" max="100" value="30"></label>
+      <div class="seg pb-strat" id="pb-strat" role="group" aria-label="Стратегия">
+        <button type="button" data-v="protect" title="Каждая строка закрывает неделю продаж, лимит 20%: больше моделей понемногу">Шире</button>
+        <button type="button" data-v="balance" class="on" title="Каждая строка закрывает три недели, лимит 30%, потом добор по оборачиваемости">Баланс</button>
+        <button type="button" data-v="grow" title="До полной потребности с самых оборачиваемых, лимит 60%: меньше моделей, каждая глубже">Глубже в топ</button>
+      </div>
+      <button type="button" class="abtn primary" id="pb-apply">Рассчитать</button>
+      <button type="button" class="abtn" id="pb-clear" style="display:none">Вся потребность</button>
+      <a class="abtn pb-steps" href="/assistant" title="Тот же расчёт по шагам: срок, бюджет, транши, новинки">Собрать по шагам</a>
+    </div>
+    <div class="pb-note" id="pb-note" role="status" aria-live="polite"></div>
+  </div>
+
   <div class="tools">
     <div class="seg" id="band-seg">
       <button type="button" data-band="" class="on">Все <span class="c" id="seg-all">0</span></button>
       <button type="button" data-band="r">Срочно <span class="c" id="seg-r">0</span></button>
       <button type="button" data-band="y">Скоро <span class="c" id="seg-y">0</span></button>
       <button type="button" data-band="g">План <span class="c" id="seg-g">0</span></button>
+      <button type="button" data-band="out" id="seg-out-btn" style="display:none" title="Позиции с потребностью, которые не вошли в план под бюджет">Не вошло в план <span class="c" id="seg-out">0</span></button>
     </div>
     <div class="seg" id="rate-seg" title="Окно расчёта темпа продаж: по нему считаются покрытие, стокаут и рекомендация «Заказать»">
       <span class="seg-lbl">Темп:</span>
@@ -431,6 +491,7 @@
     <input class="search" id="search" placeholder="Поиск по названию..." autocomplete="off">
     <span class="draft-note" id="draft-note"></span>
     <button class="abtn need-drafts_reset_all" id="btn-reset-drafts" type="button" style="display:none">↺ Сбросить правки</button>
+    <a class="abtn" href="/sizes" style="text-decoration:none" title="Ростовка любой позиции каталога, в том числе без рекомендации">Заказ позиции</a>
     <button class="abtn" type="button" id="btn-export-xlsx" title="Выгрузить в Excel отмеченные галочкой позиции">⬇ Excel</button>
     <button class="abtn primary need-orders_create" id="btn-create-order" type="button" disabled>+ Оформить размещение</button>
   </div>
@@ -708,7 +769,25 @@
       ORDERS=all.filter(function(o){ return o.status!=="received"; });
       RECEIVED=all.filter(function(o){ return o.status==="received"; });
       DRAFTS=res[3].drafts||{};
+      var fcOff=false; try{ fcOff=localStorage.getItem("oborot.firstcard")==="off"; }catch(e){}
+      document.getElementById("first-card").style.display=(!all.length&&!fcOff)?"":"none";
+      if(!PLAN_BOOTED&&PB.pid&&PRODS.some(function(p){ return p.id===PB.pid; })){
+        ACTIVE_PROD=PB.pid;
+      }
+      // Ревью #136: шаги мастера с выбранными категориями переносят и их
+      // (исключённые из мастера = не выбранные здесь).
+      if(!PLAN_BOOTED&&Array.isArray(PB.excl)&&PB.excl.length){
+        var exSet=dict(); PB.excl.forEach(function(c){ exSet[c]=true; });
+        var inc=dict(); (res[0].items||[]).forEach(function(it){
+          var c=it.category||"Без категории"; if(!hasKey(exSet,c)) inc[c]=true; });
+        if(Object.keys(inc).length) SCOPE={all:false,cats:inc};
+        delete PB.excl; pbSave();
+      }
       applyData(res[0]);
+      // Перезагрузка данных (окно темпа, заказ, перенос позиции) пересчитывает
+      // и ещё не пришедший план: старый ответ отбрасывается (ревью #136).
+      if(PLAN||PLAN_PENDING||(!PLAN_BOOTED&&PB.budget)) applyPlan();
+      PLAN_BOOTED=true;
     }).catch(function(e){
       tbody.innerHTML='<tr><td colspan="'+NCOLS+'"><div class="empty-note">Не удалось загрузить данные — обновите страницу.<br>'+esc(e.message)+'</div></td></tr>';
     });
@@ -734,6 +813,12 @@
     FALLBACK_COUNT=d.fallback_count||0;
     SEASON_FROM=d.season_from||null; SEASON_TO=d.season_to||null;
     SENT_ORDERS=d.orders_in_production||[];
+    var sd=d.stale_drafts||[], sdBox=document.getElementById("stale-drafts");
+    sdBox.style.display=sd.length?"":"none";
+    sdBox.innerHTML=sd.length?("<b>"+(sd.length===1?"Черновик":"Черновики")+" старше "+fmt(d.draft_fresh_days||30)+" дней</b> "+
+      sd.map(function(x){ return "«"+esc(x.name)+"» ("+(x.created?fmtDate(x.created):"")+", "+fmt(x.positions)+" поз.)"; }).join(", ")+
+      " в расчёте не учитываются: свежий черновик уменьшает потребность, старый считается брошенным. "+
+      "Удалите или отправьте в производство в блоке заказов под таблицей."):"";
     syncRateSeg();
     // QA 15.11: после оформления (и любой перезагрузки данных) отметки строк
     // сохраняются; раньше все оставшиеся строки снова становились отмеченными
@@ -763,7 +848,7 @@
     var ks=Object.keys(it._recs);
     it._need=ks.length
       ? ks.reduce(function(s,k){ return s+(Number(it._recs[k])||0); },0)
-      : (it.need||0);
+      : (it._planQty!=null ? it._planQty : (it.need||0));
   }
 
   /* ── ручная ростовка: правка полей по размерам ───────────────────────────
@@ -775,8 +860,10 @@
   function recOf(it,sz){ return (it.sizes&&it.sizes[sz]&&it.sizes[sz].rec)||0; }
   function draftOf(it){
     var d={};
+    // Под бюджетом (D-89) правкой считается отличие от плана, а не от расчёта.
     Object.keys(it._recs||{}).forEach(function(sz){
-      if(Number(it._recs[sz])!==recOf(it,sz)) d[sz]=Number(it._recs[sz]);
+      var base=(it._planRecs&&Object.prototype.hasOwnProperty.call(it._planRecs,sz))?it._planRecs[sz]:recOf(it,sz);
+      if(Number(it._recs[sz])!==base) d[sz]=Number(it._recs[sz]);
     });
     return d;
   }
@@ -813,6 +900,10 @@
   }
   function saveDraft(it){
     clearTimeout(saveTimers[it.base_name]);
+    // D-89: под бюджетом ростовка это план, а не расчёт. Правка действует в
+    // этом плане; сохранять её как ручную ростовку значило бы закрепить
+    // числа плана поверх расчёта навсегда.
+    if(PLAN){ setDraftNote("Правка действует в плане под бюджет; чтобы сохранить ростовку, нажмите «Вся потребность»"); return Promise.resolve(); }
     var d=draftOf(it);
     return api("/api/replenish-draft",{method:"POST",body:{base_name:it.base_name,sizes:d}})
       .then(function(){
@@ -828,7 +919,9 @@
       delete DRAFTS[base];
       if(it){
         it._sizeNote="";
-        Object.keys(it._recs).forEach(function(sz){ it._recs[sz]=recOf(it,sz); });
+        // Под бюджетом «вернуть» значит вернуть план, а не полную потребность.
+        Object.keys(it._recs).forEach(function(sz){
+          it._recs[sz]=(it._planRecs&&hasKey(it._planRecs,sz))?it._planRecs[sz]:recOf(it,sz); });
         recalcNeed(it);
       }
       setDraftNote("Вернули расчёт");
@@ -918,7 +1011,9 @@
         fmt(it.moq)+" шт). Заказывать столько ради такого спроса скорее невыгодно: решайте сами — снимите галочку или уменьшите количество в размерной сетке.")+
         '">заказывать невыгодно</span>':"";
     var conflict=moqConflict(it);
-    return '<span class="need-pill'+(it._band==="r"?" r":"")+'">'+fmt(it._need)+' шт</span>'+
+    var ofNeed=(PLAN&&!it._plan_out&&it._planQty!=null&&it._need<(it.need||0))
+      ?' <span class="muted" title="Под бюджет взято меньше полной потребности">из '+fmt(it.need)+'</span>':"";
+    return '<span class="need-pill'+(it._band==="r"?" r":"")+'">'+fmt(it._need)+' шт</span>'+ofNeed+
       (hasEdits(it)?' <span class="editmark" title="Ростовка правлена вручную — сохранена в вашем аккаунте">✎</span>':"")+
       moqNote(it)+(conflict?'<br>'+conflict:"")+(low?'<br>'+low:"");
   }
@@ -1469,6 +1564,9 @@
         if(e.target.closest(".bt-tools")) return;
         ACTIVE_PROD=Number(el.getAttribute("data-id"));
         renderAll();
+        // План (или его первый, ещё не пришедший расчёт) пересчитывается для
+        // новой вкладки; ответ по прежней вкладке отбрасывается (ревью #136).
+        if(PLAN||PLAN_PENDING) applyPlan();
       });
     });
     box.querySelectorAll(".bt-tools button").forEach(function(b){
@@ -1560,7 +1658,9 @@
     });
   }
   function visibleItems(){
-    return baseFiltered().filter(function(it){ return !state.band||it._band===state.band; })
+    return baseFiltered().filter(function(it){
+        if(state.band==="out") return !!it._plan_out;
+        return !state.band||it._band===state.band; })
       .sort(function(a,b){ return (b.turnover||0)-(a.turnover||0); });
   }
 
@@ -1579,6 +1679,10 @@
     document.getElementById("seg-r").textContent=cnt.r;
     document.getElementById("seg-y").textContent=cnt.y;
     document.getElementById("seg-g").textContent=cnt.g;
+    var outN=base.filter(function(it){ return it._plan_out; }).length;
+    document.getElementById("seg-out").textContent=outN;
+    document.getElementById("seg-out-btn").style.display=PLAN?"":"none";
+    if(!PLAN&&state.band==="out") state.band="";
     segBox.querySelectorAll("button").forEach(function(b){
       var on=b.getAttribute("data-band")===state.band;
       b.classList.toggle("on",on);
@@ -1862,15 +1966,17 @@
     tbody.innerHTML=arr.map(function(it){
       var open=!!openRows[it.base_name];
       var out=SCOPE&&!inScope(it);   // видна, но в заказ не входит — категория не выбрана
-      return '<tr class="'+rowTint(it)+(out?' out-scope':'')+'" data-base="'+esc(it.base_name)+'"'+
+      return '<tr class="'+rowTint(it)+(out?' out-scope':'')+(it._plan_out?' plan-out':'')+'" data-base="'+esc(it.base_name)+'"'+
         (out?' title="Категория «'+esc(catName(it))+'» не выбрана в составе заказа"':'')+'>'+
         '<td><input type="checkbox" class="row-check" data-base="'+esc(it.base_name)+'"'+(it._checked?" checked":"")+'></td>'+
         '<td><button class="expander" data-base="'+esc(it.base_name)+'" title="Размерная сетка и формула расчёта">'+(open?"▾":"▸")+'</button></td>'+
         '<td class="name">'+esc(it.base_name)+
           (it.low_data?' <span style="font-size:9px;font-weight:700;padding:1px 6px;border-radius:8px;background:rgba(31,31,31,.08);color:rgba(31,31,31,.55)" title="Мало данных — темп оценочный, проверьте количество вручную">мало данных</span>':"")+
           (it.below_cost?' <span class="losstag" title="Средняя цена продажи ниже себестоимости: каждая проданная штука уменьшает деньги. Количество система не меняет, решение за вами">в минус'+(it.loss_unit?(' '+fmt(it.loss_unit)+' ₽/шт'):'')+'</span>':"")+
+          (it._plan_out?' <span class="out-tag" title="Потребность есть, но в план под бюджет позиция не вошла. Отметьте галочку, чтобы взять её в заказ сверх плана">'+esc(it._planOutWhy||"вне плана")+'</span>':"")+
           '<span class="csub">'+esc(it.category||"")+
-          (it.in_drafts?' · в черновике заказа '+fmt(it.in_drafts)+' шт, вычтено':"")+'</span></td>'+
+          (it.in_drafts?' · в черновике заказа '+fmt(it.in_drafts)+' шт, вычтено':"")+
+          (it._planWhy?' · план: '+esc(it._planWhy):"")+'</span></td>'+
         '<td>'+stBadge(it.wos)+'</td>'+
         '<td class="nb">'+fmt(it.turnover)+'</td>'+
         '<td class="nb muted">'+rateCell(it)+'</td>'+
@@ -1947,7 +2053,10 @@
      производства и уже созданные заказы — он только ограничивает, ЧТО из
      отмеченного уйдёт в заказ и в Excel. Пустая категория — существующая
      «Без категории». */
-  var SCOPE=null;
+  // D-89 (решение владельца 15.11.2026): первый экран сразу по всем
+  // категориям, выбор сужается кнопками. «Сбросить выбор» по-прежнему даёт
+  // «не выбрано».
+  var SCOPE={all:true};
   function catName(it){ return it.category||"Без категории"; }
   // Название категории — свободная строка (слияние категорий задаёт любое имя),
   // в том числе «constructor» или «toString». Поэтому словари здесь — без
@@ -1996,6 +2105,9 @@
           if(!Object.keys(SCOPE.cats).length) SCOPE=null;
         }
         renderScope(); renderTable(); updateSummary();
+        // Ревью #136: и при ещё не пришедшем первом расчёте; ответ по старому
+        // набору категорий отбрасывается (PLAN_SEQ).
+        if(PLAN||PLAN_PENDING) applyPlan();
       });
     });
     var note=document.getElementById("scope-note");
@@ -2010,6 +2122,165 @@
     }
   }
 
+  /* ── D-89: план под бюджет на «Заказе» ─────────────────────────────────
+     Тот же движок, что мастер и «Бюджет» (/api/order-plan/preview): для
+     активного производства и выбранных категорий. Позиции плана получают его
+     количество и ростовку, остальные с потребностью помечаются «не вошло в
+     бюджет» и снимаются с галочки. «Вся потребность» возвращает расчёт. */
+  var PLAN=null, PLAN_SEQ=0, PB={strategy:"balance"}, PLAN_BOOTED=false, PLAN_PENDING=false;
+  try{
+    var pbSaved=JSON.parse(localStorage.getItem("oborot.planbar")||"null");
+    if(pbSaved&&typeof pbSaved==="object") PB=Object.assign(PB,pbSaved);
+  }catch(e){}
+  function pbSave(){ try{ localStorage.setItem("oborot.planbar",JSON.stringify(PB)); }catch(e){} }
+  function pbNum(v){ var n=Number(String(v||"").replace(/[^0-9]/g,"")); return isFinite(n)?n:0; }
+  function pbSync(){
+    var b=document.getElementById("pb-budget");
+    if(document.activeElement!==b) b.value=PB.budget?fmt(PB.budget):"";
+    document.getElementById("pb-scope").value=PB.scope==="now"?"now":"full";
+    document.getElementById("pb-cap").value=PB.cap||({protect:20,balance:30,grow:60}[PB.strategy]||30);
+    document.querySelectorAll("#pb-strat button").forEach(function(x){
+      var on=x.getAttribute("data-v")===PB.strategy; x.classList.toggle("on",on); x.setAttribute("aria-pressed",on?"true":"false"); });
+    document.getElementById("pb-clear").style.display=PLAN?"":"none";
+  }
+  function excludedCats(){
+    if(!SCOPE||SCOPE.all) return [];
+    var all=dict(); prodItems(ACTIVE_PROD).forEach(function(it){ all[catName(it)]=true; });
+    return Object.keys(all).filter(function(c){ return !hasKey(SCOPE.cats,c); });
+  }
+  function clearPlanMarks(){
+    items.forEach(function(it){
+      if(it._plan_out) it._checked=true;
+      delete it._plan_out; delete it._planQty; delete it._planWhy; delete it._planRecs; delete it._planOutWhy;
+      it._recs={};
+      var draft=DRAFTS[it.base_name]||{};
+      Object.keys(it.sizes||{}).forEach(function(sz){
+        it._recs[sz]=Object.prototype.hasOwnProperty.call(draft,sz)?draft[sz]:recOf(it,sz); });
+      recalcNeed(it);
+    });
+  }
+  function planNote(html){ document.getElementById("pb-note").innerHTML=html||""; }
+  function applyPlan(){
+    PB.budget=pbNum(document.getElementById("pb-budget").value);
+    PB.scope=document.getElementById("pb-scope").value;
+    PB.cap=Math.max(5,Math.min(100,pbNum(document.getElementById("pb-cap").value)||30));
+    PB.pid=ACTIVE_PROD;
+    pbSave();
+    if(!PB.budget){ clearPlan(); return; }
+    var seq=++PLAN_SEQ, pid=ACTIVE_PROD;
+    PLAN_PENDING=true;
+    planNote("Считаю план под бюджет…");
+    document.getElementById("pb-apply").disabled=true;
+    api("/api/order-plan/preview",{method:"POST",body:{
+      production_id:pid, budget:PB.budget, budget_scope:PB.scope, strategy:PB.strategy,
+      max_share_pct:PB.cap, exclude_categories:excludedCats()}}).then(function(p){
+      if(seq!==PLAN_SEQ) return;
+      PLAN_PENDING=false;
+      document.getElementById("pb-apply").disabled=false;
+      if(pid!==ACTIVE_PROD){ applyPlan(); return; }
+      // Словари без прототипа: модель «constructor» не должна считаться
+      // вошедшей в план (ревью #136).
+      var by=dict(), why=dict();
+      (p.items||[]).forEach(function(i){ if((i.qty||0)>0) by[i.base_name]=i; });
+      // Почему позиция с потребностью не в плане: бюджет, нет свежих продаж,
+      // партия не влезла в лимит. Списки мастера урезаны, остальное «вне плана».
+      (p.not_included||[]).forEach(function(x){ why[x.base_name]="не вошло в бюджет"; });
+      ((p.review||{}).stale||[]).forEach(function(x){ why[x.base_name]="нет свежих продаж: мастер не берёт"; });
+      (p.moq_skipped||[]).forEach(function(x){ why[x.base_name||x]="партия не влезла в бюджет"; });
+      (p.moq_over_cap||[]).forEach(function(x){ why[x.base_name||x]="партия дороже лимита на модель"; });
+      clearPlanMarks();
+      PLAN={pid:pid, data:p};
+      prodItems(pid).forEach(function(it){
+        var pi=hasKey(by,it.base_name)?by[it.base_name]:null;
+        if(!inScope(it)&&SCOPE) return;
+        if(pi){
+          it._plan_out=false; it._checked=true; it._planQty=pi.qty; it._planWhy=pi.why_text||"";
+          var ks=Object.keys(it.sizes||{}), sum=0;
+          ks.forEach(function(sz){ sum+=Number((pi.sizes||{})[sz]||0); });
+          if(ks.length&&sum===pi.qty){
+            it._planRecs={};
+            ks.forEach(function(sz){ it._recs[sz]=it._planRecs[sz]=Number((pi.sizes||{})[sz]||0); });
+          }else it._recs={};
+          recalcNeed(it);
+        }else if((it.need||0)>0){
+          it._plan_out=true; it._checked=false; it._planOutWhy=(hasKey(why,it.base_name)&&why[it.base_name])||"вне плана под бюджет";
+        }
+      });
+      var t=p.totals||{}, outN=prodItems(pid).filter(function(it){ return it._plan_out; }).length;
+      var outRub=(p.not_included||[]).reduce(function(s,x){ return s+(x.need_rub||0); },0);
+      var rv=p.review||{};
+      var warn=[];
+      if(p.budget_note) warn.push(esc(p.budget_note));
+      if(rv.no_cost_count) warn.push(rv.no_cost_count+" поз. без себестоимости: в деньгах плана их нет");
+      if((p.stop||[]).length) warn.push(esc((p.stop||[]).map(function(x){ return x.text||x; }).join("; ")));
+      planNote("План под бюджет "+fmtMoneyShort(PB.budget)+(PB.scope==="now"?" (деньги на сейчас)":"")+
+        " · «"+esc(p.strategy_title||"")+"», лимит "+PB.cap+" %: <b>"+fmt(t.positions||0)+" поз., "+fmt(t.units||0)+" шт, "+
+        fmtMoneyShort(t.cost||0)+"</b>"+(p.rest>0?(", остаток "+fmtMoneyShort(p.rest)):"")+"."+
+        (outN?(" Не вошло в план: "+fmt(outN)+" поз."+(outRub?(", из них не хватило бюджета на "+fmtMoneyShort(outRub)+" потребности"):"")+
+          ' (фильтр «Не вошло в план»).'):"")+
+        (warn.length?' <span class="warn">'+warn.join(" · ")+'</span>':"")+
+        ' <a href="/assistant">Подробно с траншами и упущенными продажами</a>');
+      pbSync(); renderAll();
+    }).catch(function(e){
+      if(seq!==PLAN_SEQ) return;
+      PLAN_PENDING=false;
+      document.getElementById("pb-apply").disabled=false;
+      planNote('<span class="warn">План не посчитан: '+esc(e.message)+'</span>');
+    });
+  }
+  // Отмена ещё не пришедшего расчёта: его ответ отбрасывается, кнопка
+  // «Рассчитать» снова доступна (ревью #136: иначе она залипала).
+  function cancelPlanRequest(){
+    PLAN_SEQ++; PLAN_PENDING=false;
+    document.getElementById("pb-apply").disabled=false;
+  }
+  function clearPlan(){
+    cancelPlanRequest();
+    PLAN=null; PB.budget=0; pbSave();
+    clearPlanMarks();
+    planNote("");
+    pbSync(); renderAll();
+  }
+  document.getElementById("pb-apply").addEventListener("click",applyPlan);
+  document.getElementById("pb-clear").addEventListener("click",function(){
+    document.getElementById("pb-budget").value=""; clearPlan(); });
+  document.getElementById("pb-budget").addEventListener("keydown",function(e){ if(e.key==="Enter") applyPlan(); });
+  // Под действующим планом смена «весь заказ / на сейчас» и лимита сразу
+  // пересчитывает его, как смена стратегии.
+  document.getElementById("pb-scope").addEventListener("change",function(){ if(PLAN||PLAN_PENDING) applyPlan(); });
+  document.getElementById("pb-cap").addEventListener("change",function(){ if(PLAN||PLAN_PENDING) applyPlan(); });
+  document.getElementById("pb-budget").addEventListener("blur",function(){
+    var n=pbNum(this.value); this.value=n?fmt(n):""; });
+  document.querySelectorAll("#pb-strat button").forEach(function(b){
+    b.addEventListener("click",function(){
+      PB.strategy=b.getAttribute("data-v");
+      PB.cap={protect:20,balance:30,grow:60}[PB.strategy];
+      // Введённый, но ещё не применённый бюджет не теряется (ревью #136).
+      PB.budget=pbNum(document.getElementById("pb-budget").value);
+      PB.scope=document.getElementById("pb-scope").value;
+      pbSave(); pbSync();
+      if(PLAN||PLAN_PENDING) applyPlan();
+    });
+  });
+  pbSync();
+  document.getElementById("first-card-x").addEventListener("click",function(){
+    try{ localStorage.setItem("oborot.firstcard","off"); }catch(e){}
+    document.getElementById("first-card").style.display="none";
+  });
+
+  // D-89 (ревью #136): под бюджетом в файл идут количества и ростовка с
+  // экрана (план), а не полная потребность.
+  function exportBody(checked){
+    var body={base_names:checked.map(function(it){ return it.base_name; })};
+    if(PLAN){
+      body.quantities={};
+      checked.forEach(function(it){
+        var sz={}; Object.keys(it._recs||{}).forEach(function(k){ sz[k]=Number(it._recs[k])||0; });
+        body.quantities[it.base_name]={qty:it._need||0, sizes:sz};
+      });
+    }
+    return body;
+  }
   function checkedItems(){
     return prodItems(ACTIVE_PROD).filter(function(it){ return it._checked&&it._need>0&&inScope(it); });
   }
@@ -2143,7 +2414,7 @@
     fetch("/api/export/replenish.xlsx",{method:"POST",
       headers:{"Content-Type":"application/json","X-Oborot-CSRF":"1"},
       body:JSON.stringify(allChecked ? {} :
-        {base_names:checked.map(function(it){ return it.base_name; })}),
+        exportBody(checked)),
       credentials:"same-origin"
     }).then(function(r){
       if(!r.ok) return r.text().then(function(t){
@@ -2279,6 +2550,15 @@
     }).then(function(){
       orderModal.classList.remove("open");
       btn.disabled=false;
+      // D-89: бюджет плана потрачен этим заказом. Пересчитывать тот же бюджет
+      // по оставшимся позициям значило бы предложить второй заказ на те же
+      // деньги; полоса возвращается к «вся потребность».
+      if(PLAN||PLAN_PENDING){
+        cancelPlanRequest(); clearPlanMarks(); PLAN=null; PB.budget=0; pbSave();
+        document.getElementById("pb-budget").value="";
+        planNote("Заказ оформлен по плану под бюджет. Чтобы собрать следующий, впишите новый бюджет.");
+        pbSync();
+      }
       return load();
     }).then(function(){
       if(created) announceCreated(created);

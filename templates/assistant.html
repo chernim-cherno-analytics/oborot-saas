@@ -1523,6 +1523,7 @@
         '<button class="go-btn" id="mkOrder">Создать черновик</button>'+
         '<button class="go-btn ghost" id="recalcPlan" onclick="preview(3,true)">Пересчитать</button>'+
         '<button class="go-btn ghost" onclick="go(1)">← Изменить условия</button>'+
+        '<button class="go-btn ghost" id="toTable" title="Те же бюджет, стратегия и лимит на таблице «Заказа»: правка строк, ростовка, оформление">Открыть в «Заказе»</button>'+
         '<span class="hint" id="mkHint"></span></div>'+
       (notIn ? ('<div class="fold"><details><summary>'+lostTitle+
         '</summary><div class="body">'+lostNote+sens+
@@ -1583,6 +1584,22 @@
       });
     });
     document.getElementById("mkOrder").addEventListener("click", createOrder);
+    // D-89: шаги заканчиваются на таблице «Заказа». Условия переносятся в
+    // полосу «Под бюджет» (localStorage, ключ общий со страницей «Заказ»).
+    // Дата прихода и ритм там берутся из канала, поэтому при своей дате
+    // числа могут отличаться: это сказано в подсказке.
+    document.getElementById("toTable").addEventListener("click", function(){
+      var b = brief();
+      try{
+        localStorage.setItem("oborot.planbar", JSON.stringify({
+          budget: b.budget || 0, scope: b.budget_scope === "now" ? "now" : "full",
+          strategy: b.strategy || "balance", cap: b.max_share_pct || 30,
+          pid: b.production_id || null,
+          // Ревью #136: состав по категориям едет вместе с бюджетом.
+          excl: (b.exclude_categories || []).slice()}));
+      }catch(e){}
+      location.href = "/replenish";
+    });
   }
 
   // Таблица плана: вид (поиск/сортировка/группировка) отделён от расчёта.

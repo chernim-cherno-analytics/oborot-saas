@@ -87,7 +87,7 @@ proj_stock, need и gap_days. gap_days — «дыра поставки»: на �
 import json
 import threading
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 from sqlalchemy import and_, case, func, select
 from sqlalchemy.orm import Session
@@ -564,7 +564,9 @@ def _stockout_by_rate(today_iso: str, cs: float, rate: float) -> str | None:
     """
     if rate <= 0:
         return None
-    days = min(int(cs / rate), 3650)
+    # 1e-3 дня: шум плавающей точки (44,99998 при ровных 45 днях) не должен
+    # сдвигать дату на день; мастер считает «дыру» тем же правилом (D-87).
+    days = min(int(cs / rate + 1e-3), 3650)
     return (date.fromisoformat(today_iso) + timedelta(days=days)).isoformat()
 
 
@@ -736,6 +738,24 @@ def _received_on_open_local_orders(db: Session, org_id: int) -> dict[str, float]
     return out
 
 
+DRAFT_FRESH_DAYS = 30
+
+
+def stale_drafts(db: Session, org_id: int) -> list[dict]:
+    """Черновики старше DRAFT_FRESH_DAYS: потребность они не уменьшают (D-85)."""
+    from app.models import ProductionOrder
+    border = datetime.utcnow() - timedelta(days=DRAFT_FRESH_DAYS)
+    rows = db.execute(
+        select(ProductionOrder).where(ProductionOrder.org_id == org_id,
+                                      ProductionOrder.status == "draft",
+                                      ProductionOrder.created_at < border)
+        .order_by(ProductionOrder.created_at)
+    ).scalars().all()
+    return [{"id": o.id, "name": o.name,
+             "created": o.created_at.date().isoformat() if o.created_at else None,
+             "positions": len(o.items or [])} for o in rows]
+
+
 def drafts_by_base(db: Session, org_id: int) -> dict[str, int]:
     """D-85 (решение владельца 15.11.2026): сколько штук каждой модели лежит в
     черновиках заказов. Черновик не обязательство, поэтому в «Едет» он не
@@ -745,9 +765,15 @@ def drafts_by_base(db: Session, org_id: int) -> dict[str, int]:
     меняет ни остатков, ни продаж)."""
     from app.models import ProductionOrder, parse_items_payload
     out: dict[str, int] = {}
+    # Прод 16.11: брошенный черновик августа (149 позиций) снимал потребность
+    # с 82 позиций. Черновик старше DRAFT_FRESH_DAYS планом не считается:
+    # «Заказ» называет его отдельно (stale_drafts) и просит удалить или
+    # отправить.
+    fresh_from = datetime.utcnow() - timedelta(days=DRAFT_FRESH_DAYS)
     for items in db.execute(
         select(ProductionOrder.items_json).where(ProductionOrder.org_id == org_id,
-                                                 ProductionOrder.status == "draft")
+                                                 ProductionOrder.status == "draft",
+                                                 ProductionOrder.created_at >= fresh_from)
     ).scalars().all():
         try:
             rows, _marker = parse_items_payload(items or "[]")
@@ -1578,14 +1604,16 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
         # сезонным r_lead: «кончится до прихода» и «Стокаут после прихода»
         # одновременно. С D-79 подписи «до прихода» считаются тем же r_lead,
         # что и остаток к приходу (и мастер). При окне «сезон» r_lead = темп окна.
-        if r_lead != float(item.get("rate_active") or 0):
-            arrival = today + timedelta(days=lead)
-            item["wos"] = _wos_by_rate(cs, r_lead)
-            item["stockout_date"] = _stockout_by_rate(today.isoformat(), cs, r_lead)
-            item["gap_days"] = (
-                max(0, (arrival - date.fromisoformat(item["stockout_date"])).days)
-                if item["stockout_date"] else 0
-            )
+        # D-87 (16.11): всегда по r_lead, даже когда он равен темпу окна:
+        # «дыра» и дата стокаута считаются тем же (округлённым до 4 знаков)
+        # темпом, что и в мастере, иначе на границе дня они расходились на 1.
+        arrival = today + timedelta(days=lead)
+        item["wos"] = _wos_by_rate(cs, r_lead)
+        item["stockout_date"] = _stockout_by_rate(today.isoformat(), cs, r_lead)
+        item["gap_days"] = (
+            max(0, (arrival - date.fromisoformat(item["stockout_date"])).days)
+            if item["stockout_date"] else 0
+        )
 
     return {
         "generated_at": time.time(),
