@@ -201,6 +201,12 @@ html.ui2 .gradient-bg ~ * .modal, html.ui2 .gradient-bg ~ .modal {
 }
 html.ui2 .ctip { border-radius: 10px; background: rgba(29, 29, 31, .92); }
 
+/* Полоса синхронизации (_hints.html) липнет к верху окна. Верх теперь занят
+   панелью, поэтому полоса липнет под ней: иначе при прокрутке «Повторить»
+   оказывалось под панелью (ревью #137). */
+html.ui2 .syncbar { top: 72px; }
+@media (max-width: 760px) { html.ui2 .syncbar { top: 68px; } }
+
 /* ============ B. Страницы на base.html ============ */
 
 html.ui2 {
@@ -287,7 +293,7 @@ html.ui2 .user-chip {
 }
 html.ui2 .user-chip:hover { background: #fff; }
 html.ui2 .user-chip > span:nth-child(2) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-html.ui2 .user-chip .avatar { background: var(--u-ink); color: #fff; }
+html.ui2 .user-chip .avatar { background: var(--u-ink); color: #fff; flex: 0 0 auto; }
 html.ui2 .user-pop {
   border-radius: 16px; border: 1px solid rgba(255, 255, 255, .8); background: var(--u-glass-hi);
   -webkit-backdrop-filter: blur(30px) saturate(180%); backdrop-filter: blur(30px) saturate(180%);
@@ -328,6 +334,17 @@ html.ui2 .auth-card, html.ui2 .onb-card {
   box-shadow: 0 30px 80px rgba(46, 46, 96, .18);
 }
 
+/* Страницы без каркаса (вход, регистрация, подключение) лежат поверх обоев:
+   без своего слоя логотип и строка «выйти» оказывались под фоном (ревью #137). */
+html.ui2 .auth-wrap { position: relative; z-index: 1; }
+html.ui2 .auth-logo, html.ui2 .auth-logo .logo-text { color: var(--u-ink); }
+html.ui2 .auth-card { padding: 30px 32px 26px; }
+html.ui2 .auth-card h1 { font-size: 24px; line-height: 1.2; letter-spacing: -.02em; margin-bottom: 8px; }
+html.ui2 .auth-card .auth-sub { font-size: 14px; line-height: 1.5; color: var(--u-ink2); }
+html.ui2 .auth-note { color: var(--u-ink2); }
+html.ui2 .auth-note a { color: var(--u-accent); }
+html.ui2 .source-opt { border-radius: 18px; }
+
 @media (max-width: 760px) {
   html.ui2 .gradient-bg ~ .main { padding: 10px 8px 28px; }
   html.ui2 .sidebar {
@@ -349,4 +366,12 @@ html.ui2 .auth-card, html.ui2 .onb-card {
   html.ui2 .topbar .user-menu { position: relative; top: auto; right: auto; }
   html.ui2 .trial-strip { margin: 8px 8px 0; }
   html.ui2 .content { padding: 10px 8px 32px; }
+}
+
+/* Печать: как было до нового вида. Панели и обои на бумаге не нужны. */
+@media print {
+  html.ui2 .gradient-bg, html.ui2 .sidebar { display: none; }
+  html.ui2 .shell .card, html.ui2 .embed-shell .card { border: none; box-shadow: none; border-radius: 0; background: #fff; }
+  html.ui2 .content { padding: 0; }
+  html.ui2 .card-head, html.ui2 .card-body { padding-left: 0; padding-right: 0; }
 }

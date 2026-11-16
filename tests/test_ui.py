@@ -3444,7 +3444,7 @@ def _settings_compact_lists(browser, base: str) -> None:
                         (SPECIAL_S if i == len(left) - 1 else f"Поставщик {i + 1:02d}", org_id, b))
     src = cl.get("/api/productions/assign-sources").json()
     sup_values = [v["value"] for v in (src.get("sources") or {}).get("supplier", {}).get("values", [])]
-    check("настройки: синтетика — 12 производств, 25 исключённых, у каждой позиции свой поставщик",
+    check("настройки: синтетика — 12 производств, больше 20 исключённых, у каждой позиции свой поставщик",
           len(all_prods) == 12 and len(excl) >= n_excl and SPECIAL_S in sup_values and len(sup_values) == len(left)
           and len(left) > 15, f"prods={len(all_prods)} excl={len(excl)} sup={len(sup_values)}/{len(left)}")
     cookies = [{"name": k, "value": v, "domain": "127.0.0.1", "path": "/"} for k, v in cl.cookies.items()]
