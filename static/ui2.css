@@ -202,3 +202,57 @@ html.ui2 .fresh-chip.fresh-inflow { margin: 10px 16px 0; }
     animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important;
   }
 }
+
+/* ---------- Полировка по обходу критиков 16.11 ---------- */
+
+/* Меню пользователя непрозрачное: сквозь стекло читались кнопки страницы. */
+html.ui2 .app-user-pop, html.ui2 .user-pop { background: #fff; }
+
+/* Справка первого визита: подзаголовок обычным регистром, длинный текст
+   по левому краю (по центру остаётся только короткая карточка с кнопкой
+   подсказок), прокрутка видна. */
+html.ui2 .hint-modal .hm-sub { text-transform: none; letter-spacing: 0; font-size: 13px; color: var(--u-ink2); }
+html.ui2 .hint-modal h3 { font-size: 14px; color: var(--u-ink); }
+html.ui2 .hint-modal .hm-scroll { scrollbar-width: thin; }
+html.ui2 .hint-modal:not(:has(.has-go)) .hm-scroll { text-align: left; }
+html.ui2 .hint-modal:not(:has(.has-go)) h2 { font-size: 21px; }
+
+/* Урок на данных (бегунок из «Обучения»): тот же вид, что у подсказок. */
+html.ui2 .tour-bar {
+  font-family: var(--u-font); background: rgba(255, 255, 255, .86); border-bottom: 1px solid var(--u-hair);
+  -webkit-backdrop-filter: blur(20px); backdrop-filter: blur(20px);
+}
+html.ui2 .tour-bar .tb-kick { text-transform: none; letter-spacing: 0; font-size: 12.5px; font-weight: 600; color: var(--u-ink2); }
+html.ui2 .tour-bar .tb-chip { border-radius: 999px; border-color: var(--u-hair); background: rgba(255, 255, 255, .8); color: var(--u-ink2); }
+html.ui2 .tour-bar .tb-chip.cur { background: var(--u-ink); border-color: var(--u-ink); color: #fff; }
+html.ui2 .tour-bar .tb-x {
+  padding: 6px 13px; border: 1px solid var(--u-hair); border-radius: 999px; background: rgba(255, 255, 255, .8);
+  color: var(--u-ink); font-size: 12.5px; font-weight: 600; text-decoration: none;
+}
+html.ui2 .tour-bar .tb-x:hover { background: #fff; }
+html.ui2 .tour-ring { border-radius: 14px; }
+html.ui2 .tour-card {
+  font-family: var(--u-font); border-radius: 20px; padding: 18px 20px 16px; color: var(--u-ink);
+  background: var(--u-glass-hi); border: 1px solid rgba(255, 255, 255, .85);
+  -webkit-backdrop-filter: blur(30px) saturate(180%); backdrop-filter: blur(30px) saturate(180%);
+  box-shadow: 0 24px 60px rgba(46, 46, 96, .26);
+}
+html.ui2 .tour-card:focus-visible { outline: 3px solid rgba(10, 102, 214, .55); }
+html.ui2 .tour-card .tc-arrow { background: #fbfbfe; }
+html.ui2 .tour-card .tc-kick { text-transform: none; letter-spacing: 0; font-size: 12px; font-weight: 600; color: var(--u-ink2); }
+html.ui2 .tour-card .tc-title { font-size: 16px; color: var(--u-ink); }
+html.ui2 .tour-card .tc-text { font-size: 13.5px; line-height: 1.5; color: var(--u-ink2); }
+html.ui2 .tour-card .tc-skip { color: var(--u-ink2); font-size: 12.5px; text-decoration: none; }
+html.ui2 .tour-card .tc-skip:hover { color: var(--u-ink); }
+html.ui2 .tour-card .tc-next, html.ui2 .tour-card .tc-link {
+  border-radius: 999px; background: var(--u-accent); color: #fff; font-size: 13px; font-weight: 600; padding: 8px 18px;
+}
+html.ui2 .tour-card .tc-next:hover, html.ui2 .tour-card .tc-link:hover { background: #0857b8; }
+
+/* Под палец (судья приёмки): «Оборачиваемость» подключает только этот файл. */
+@media (max-width: 760px) {
+  html.ui2 .cat-btn, html.ui2 .chip-tg, html.ui2 .rule-btn, html.ui2 .def-disc-btn, html.ui2 input.search { height: 40px; }
+}
+html.ui2 .u-tip button { min-height: 40px; }
+html.ui2 .u-tip .u-x { width: 40px; height: 40px; top: 4px; right: 4px; }
+html.ui2 input[type=checkbox], html.ui2 input[type=radio] { accent-color: var(--u-accent); }

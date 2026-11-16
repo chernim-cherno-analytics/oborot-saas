@@ -9,8 +9,17 @@
 
   <div class="auth-card onb-card">
 
+    {# UI2-4 (D-90): первый запуск открывается окном-приветствием. Экрана с
+       крупным «Привет» нет (решение владельца 15.11.2026). #}
+    <div id="step-0">
+      <h1>Добро пожаловать в Оборот</h1>
+      <p class="auth-sub onb-lead">Вы в приложении, которое поможет собрать вашу товарную матрицу: что продаётся хорошо, что лежит и что пора заказывать.</p>
+      <p class="auth-sub onb-lead">Сначала подключим данные, потом зададим четыре коротких вопроса. Ответы можно будет поменять в настройках.</p>
+      <button class="btn primary onb-go" type="button" id="btn-hello">Начать</button>
+    </div>
+
     <!-- Шаг 1: выбор источника -->
-    <div id="step-1">
+    <div id="step-1" style="display:none;">
       <h1>Подключите источник данных</h1>
       <p class="auth-sub">Откуда «Обороту» брать остатки и продажи организации «{{ org.name }}»</p>
 
@@ -95,12 +104,17 @@ document.addEventListener("DOMContentLoaded", function () {
     });
   });
   select("demo"); // демо — путь по умолчанию
+  document.getElementById("btn-hello").addEventListener("click", function () {
+    showStep("step-1");
+    var h = document.querySelector("#step-1 h1");
+    if (h) { h.setAttribute("tabindex", "-1"); h.focus(); }
+  });
 
   var fill = document.getElementById("progress-fill");
   var note = document.getElementById("progress-note");
 
   function showStep(id) {
-    ["step-1", "step-stores", "step-2"].forEach(function (s) {
+    ["step-0", "step-1", "step-stores", "step-2"].forEach(function (s) {
       document.getElementById(s).style.display = s === id ? "block" : "none";
     });
   }
@@ -134,7 +148,8 @@ document.addEventListener("DOMContentLoaded", function () {
         ["Считаем оборачиваемость…", 95],
         ["Готово!", 100]
       ], function () {
-        window.location.href = "/";
+        // UI2-4: после подключения человек отвечает на вопросы первого запуска.
+        window.location.href = "/welcome";
       });
     }).catch(function () { btn.disabled = false; });
   });
@@ -190,7 +205,9 @@ document.addEventListener("DOMContentLoaded", function () {
     }).then(function () {
       // Деплой П1: прогрессивная загрузка — сервис открывается сразу, прогресс
       // показывает полоска под шапкой на любой странице (templates/_hints.html).
-      window.location.href = "/turnover";
+      // UI2-4: пока данные грузятся фоном, человек отвечает на вопросы первого
+      // запуска; последний из них (границы классов) ждёт загрузку сам.
+      window.location.href = "/welcome";
     }).catch(function () { btn.disabled = false; });
   });
 });

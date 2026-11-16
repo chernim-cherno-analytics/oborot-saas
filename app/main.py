@@ -1535,6 +1535,29 @@ def onboarding_page(request: Request, db: Session = Depends(get_db)):
     return _page(request, ctx, "onboarding.html", "onboarding", "Подключение данных", db=db)
 
 
+@app.get("/welcome", response_class=HTMLResponse)
+def welcome_page(request: Request, db: Session = Depends(get_db)):
+    """Первый запуск (UI2-4, D-90): четыре вопроса, по одному на окно.
+
+    Сюда приводит подключение данных (`onboarding.html`) и пункт «Первый
+    запуск заново» в меню «?». Страница только читает и пишет существующие
+    настройки существующим API, поэтому доступ тот же, что у «Настроек»:
+    аноним уходит на вход, организация без подключения на подключение,
+    участник без права на настройки на обычную рабочую страницу. Пока данные
+    грузятся фоном, страница открывается: ждать умеет последний вопрос.
+    """
+    ctx = auth.resolve_auth(request, db)
+    if ctx is None:
+        return RedirectResponse("/login", status_code=302)
+    if not _has_active_connection(db, ctx.org.id) and not _data_is_loading(ctx.org.id):
+        return RedirectResponse("/onboarding", status_code=302)
+    # Вопросы пишут и настройки (settings), и правило скидок (catalog_edit).
+    # Роль с одним из двух прав упёрлась бы в 403 посреди пути (ревью #137).
+    if not (ctx.can("settings") and ctx.can("catalog_edit")):
+        return RedirectResponse("/turnover", status_code=302)
+    return _page(request, ctx, "welcome.html", "welcome", "Первый запуск", db=db)
+
+
 # Куда уходит участник (не владелец) с owner-only предпросмотра. Безопасный
 # отказ, а не 500 и не пустая страница: человек попадает на обычный рабочий
 # экран своей организации. Вынесено в константу, потому что на это значение

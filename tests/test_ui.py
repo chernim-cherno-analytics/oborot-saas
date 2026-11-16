@@ -3447,20 +3447,25 @@ def _settings_compact_lists(browser, base: str) -> None:
                     if not it.get("archived")}
                    | {it["base_name"] for it in rep.get("items", [])}
                    | {e["base_name"] for e in rep.get("excluded", []) if e.get("below_cost")})
-    for b in bases[:25]:
+    # Сколько позиций в рекомендации демо, зависит от дня запуска (сезонность):
+    # 15.11.2026 их было 39, 16.11 стало 38, и при жёстких «25 исключить»
+    # оставалось 13 значений вместо нужных «больше 15». Исключаем столько,
+    # чтобы хватило и на «Показать ещё» (больше 20), и на длинный список.
+    n_excl = max(21, min(25, len(bases) - 17))
+    for b in bases[:n_excl]:
         cl.post("/api/exclusions", json={"base_name": b, "excluded": True})
     excl = cl.get("/api/exclusions").json().get("excluded") or []
     # Фикстура набора (как тариф в других проверках): у каждой оставшейся
     # позиции свой поставщик — длинный список значений для распределения.
-    left = bases[25:]
+    left = bases[n_excl:]
     with sqlite3.connect(DB_PATH) as con:
         for i, b in enumerate(left):
             con.execute("UPDATE products SET supplier=? WHERE org_id=? AND base_name=?",
                         (SPECIAL_S if i == len(left) - 1 else f"Поставщик {i + 1:02d}", org_id, b))
     src = cl.get("/api/productions/assign-sources").json()
     sup_values = [v["value"] for v in (src.get("sources") or {}).get("supplier", {}).get("values", [])]
-    check("настройки: синтетика — 12 производств, 25 исключённых, у каждой позиции свой поставщик",
-          len(all_prods) == 12 and len(excl) >= 25 and SPECIAL_S in sup_values and len(sup_values) == len(left)
+    check("настройки: синтетика — 12 производств, больше 20 исключённых, у каждой позиции свой поставщик",
+          len(all_prods) == 12 and len(excl) >= n_excl and SPECIAL_S in sup_values and len(sup_values) == len(left)
           and len(left) > 15, f"prods={len(all_prods)} excl={len(excl)} sup={len(sup_values)}/{len(left)}")
     cookies = [{"name": k, "value": v, "domain": "127.0.0.1", "path": "/"} for k, v in cl.cookies.items()]
 
@@ -4276,9 +4281,27 @@ def _browser_journey(browser, base: str, shots: list) -> None:  # noqa: C901
     _shot(page, adir, shots, "01-onboarding-1400")
 
     print("\n== Путь в браузере: демо-данные кнопкой ==")
+    # UI2-4 (D-90): подключение открывается окном-приветствием, источник
+    # данных выбирается после «Начать».
+    _click_through_hint(page, "#btn-hello")
+    page.wait_for_selector("#btn-connect-demo", state="visible", timeout=10000)
     with page.expect_navigation(url=lambda u: "/onboarding" not in u, timeout=60000):
         _click_through_hint(page, "#btn-connect-demo")
-    check("после демо-подключения продукт увёл на «Оборачиваемость»",
+    # UI2-4 (D-90): после подключения человек отвечает на четыре вопроса
+    # первого запуска и только потом попадает в таблицу.
+    check("после демо-подключения продукт увёл на первый запуск",
+          page.url.split("#")[0].rstrip("/").endswith("/welcome"), page.url)
+    for _ in range(3):
+        page.wait_for_function("() => { const n = document.getElementById('w-next'); return n && !n.disabled; }",
+                               timeout=30000)
+        page.click("#w-next")
+        page.wait_for_timeout(500)
+    page.wait_for_function("() => { const n = document.getElementById('w-next');"
+                           " return n && !n.disabled && n.textContent.includes('Открыть таблицу')"
+                           " && !!document.getElementById('b-weak'); }", timeout=60000)
+    with page.expect_navigation(url=lambda u: "/welcome" not in u, timeout=60000):
+        page.click("#w-next")
+    check("после вопросов первого запуска продукт увёл на «Оборачиваемость»",
           page.url.rstrip("/").endswith("/turnover"), page.url)
     _close_hint(page)
     _shot(page, adir, shots, "02-turnover-1400")

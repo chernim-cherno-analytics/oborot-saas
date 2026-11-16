@@ -741,6 +741,22 @@
       measure();
       window.addEventListener("resize", measure);
     }
+    // UI2-3: в новом виде к верху окна липнет панель с отступом (у страниц
+    // base.html это .sidebar, а не якорь выше), и она бывает в две строки.
+    // Полоса встаёт под её фактический низ и следит за её высотой: меню
+    // сворачивается и переносится (ревью #137).
+    var panel = document.documentElement.classList.contains("ui2")
+      ? (document.querySelector(".header.app-top") || document.querySelector(".sidebar")) : null;
+    if (panel) {
+      var under = function(){
+        var cs = window.getComputedStyle(panel);
+        if (cs.position !== "sticky" && cs.position !== "fixed") { bar.style.top = "0px"; return; }
+        bar.style.top = Math.round(panel.getBoundingClientRect().height + (parseFloat(cs.top) || 0) + 6) + "px";
+      };
+      under();
+      window.addEventListener("resize", under);
+      if (window.ResizeObserver) { try { new ResizeObserver(under).observe(panel); } catch (e) {} }
+    }
   } else {
     bar.style.position = "fixed"; bar.style.top = "0"; bar.style.left = "0"; bar.style.right = "0";
     document.body.insertBefore(bar, document.body.firstChild);
@@ -1099,6 +1115,14 @@
     <span>Показывать подсказки</span>
     <span class="hm-sw" aria-hidden="true"><i></i></span>
   </button>
+  {# UI2-4: вопросы первого запуска можно пройти ещё раз. Только тому, кто
+     вправе менять настройки: остальных маршрут всё равно уведёт обратно. #}
+  {% if perms is defined and 'settings' in perms and 'catalog_edit' in perms %}
+  <a class="hmi" role="menuitem" href="/welcome" id="hm-first">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 4v5h5"/></svg>
+    <span>Первый запуск заново</span>
+  </a>
+  {% endif %}
   <a class="hmi" role="menuitem" href="/lessons" id="hm-all">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7h18M3 12h18M3 17h11"/></svg>
     <span>Все уроки</span><span class="hm-cnt" id="hm-cnt"></span>

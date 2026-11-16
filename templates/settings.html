@@ -20,6 +20,96 @@
     </div>
   </div>
 
+  {# UI2-4 (D-90): ответы первого запуска одним блоком. Только чтение: каждое
+     значение лежит в своей прежней настройке, блок их собирает и ведёт на
+     нужный вопрос. Числа приходят с сервера и ставятся через textContent. #}
+  {% set can_set = perms is defined and 'settings' in perms and 'catalog_edit' in perms %}
+  <style>
+    #biz-card { margin-bottom: 14px; }
+    .biz-lead { font-size: 13px; color: var(--ink-2); margin: 0 0 12px; }
+    .biz-rows { display: grid; grid-template-columns: minmax(150px, 220px) 1fr auto; gap: 0 14px; align-items: center; }
+    .biz-rows > * { padding: 10px 0; border-top: 1px solid var(--line-soft); min-width: 0; }
+    .biz-rows > :nth-child(-n+3) { border-top: none; }
+    .biz-k { font-size: 13px; color: var(--ink-2); }
+    .biz-v { font-size: 14px; font-weight: 600; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+    .biz-e a { font-size: 13px; }
+    .biz-how { margin-top: 14px; font-size: 13px; line-height: 1.55; color: var(--ink-2); }
+    .biz-how summary { cursor: pointer; font-weight: 600; color: var(--blue); }
+    .biz-how ol { margin: 8px 0 10px 18px; }
+    .biz-grp { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+    .biz-g { border-radius: 14px; padding: 10px 12px; }
+    .biz-g b { display: block; font-size: 13px; color: var(--ink); }
+    .biz-g span { font-size: 12.5px; font-variant-numeric: tabular-nums; }
+    .biz-g.w { background: #ffe7e5; } .biz-g.d { background: #ffeed5; } .biz-g.g { background: #dcf2e2; } .biz-g.b { background: #e0f3a8; }
+    @media (max-width: 640px) {
+      .biz-rows { grid-template-columns: 1fr auto; }
+      .biz-k { grid-column: 1 / -1; padding-bottom: 0; }
+      .biz-rows > .biz-v { border-top: none; padding-top: 2px; }
+      .biz-rows > .biz-e { border-top: none; padding-top: 2px; }
+      .biz-rows > .biz-k:first-child { border-top: none; }
+      .biz-rows > :nth-child(-n+3) { border-top: 1px solid var(--line-soft); }
+      .biz-rows > :first-child { border-top: none; }
+      .biz-grp { grid-template-columns: repeat(2, 1fr); }
+    }
+  </style>
+  <div class="card" id="biz-card">
+    <div class="card-head"><h2>Мой бизнес</h2><div class="spacer"></div>
+      {% if can_set %}<a class="btn sm" href="/welcome" id="biz-rerun">Пройти вопросы заново</a>{% endif %}
+    </div>
+    <div class="card-body">
+      <p class="biz-lead">Ответы из первого запуска. По ним считаются запас, скидки и цвета в таблице оборачиваемости.</p>
+      <div class="biz-rows" id="biz-rows">
+        <div class="biz-k">Товара должно хватать</div><div class="biz-v" id="biz-days">…</div>
+        <div class="biz-e">{% if can_set %}<a href="/welcome?one=1#days">Изменить</a>{% endif %}</div>
+        <div class="biz-k">Скидки</div><div class="biz-v" id="biz-disc">…</div>
+        <div class="biz-e">{% if can_set %}<a href="/welcome?one=1#disc">Изменить</a>{% endif %}</div>
+        <div class="biz-k">Где шьёте</div><div class="biz-v" id="biz-prod">…</div>
+        <div class="biz-e">{% if can_set %}<a href="/welcome?one=1#prod">Изменить</a>{% endif %}</div>
+        <div class="biz-k">Границы групп, ₽ в день</div><div class="biz-v" id="biz-thr">…</div>
+        <div class="biz-e">{% if can_set %}<a href="/welcome?one=1#bar">Изменить</a>{% endif %}</div>
+      </div>
+      <details class="biz-how" id="biz-how">
+        <summary>Как считаются группы</summary>
+        <ol>
+          <li>Берём выручку вещи и дни, когда она была в наличии. Делим выручку на дни: получаем рубли в день.</li>
+          <li>Среднее по каталогу умножаем на полтора: это ориентир.</li>
+          <li>Границы групп: треть ориентира, две трети и пять третей. Вы можете вписать свои числа.</li>
+        </ol>
+        <div class="biz-grp">
+          <div class="biz-g w"><b>Слабые</b><span id="biz-g-w">…</span></div>
+          <div class="biz-g d"><b>Медленные</b><span id="biz-g-d">…</span></div>
+          <div class="biz-g g"><b>Хорошие</b><span id="biz-g-g">…</span></div>
+          <div class="biz-g b"><b>Бестселлеры</b><span id="biz-g-b">…</span></div>
+        </div>
+      </details>
+    </div>
+  </div>
+  <script>
+  (function(){
+    function $(id){ return document.getElementById(id); }
+    function fmt(n){ return Math.round(n).toLocaleString("ru-RU").replace(/\u00a0|\u202f/g, " "); }
+    function get(u){ return fetch(u, {credentials: "same-origin"}).then(function(r){ if (!r.ok) throw new Error(u); return r.json(); }); }
+    function fail(ids){ ids.forEach(function(i){ $(i).textContent = "не удалось загрузить"; }); }
+    get("/api/discount-rule").then(function(d){
+      var r = d.rule, vs = ["new_pct", "top_pct", "top_over_pct", "mid_pct", "mid_over_pct", "weak_pct", "weak_over_pct"]
+        .map(function(k){ return r[k]; }).filter(function(v){ return v > 0; });
+      $("biz-days").textContent = r.overstock_days + " дн.";
+      $("biz-disc").textContent = vs.length ? "от " + Math.min.apply(null, vs) + " до " + Math.max.apply(null, vs) + " %" : "не заданы";
+    }).catch(function(){ fail(["biz-days", "biz-disc"]); });
+    get("/api/productions").then(function(d){
+      $("biz-prod").textContent = (d.productions || []).map(function(p){ return p.name; }).join(", ") || "не задано";
+    }).catch(function(){ fail(["biz-prod"]); });
+    get("/api/settings").then(function(d){
+      var t = d.thresholds;
+      $("biz-thr").textContent = fmt(t.weak) + " / " + fmt(t.dull) + " / " + fmt(t.good);
+      $("biz-g-w").textContent = "меньше " + fmt(t.weak);
+      $("biz-g-d").textContent = "от " + fmt(t.weak) + " до " + fmt(t.dull);
+      $("biz-g-g").textContent = "от " + fmt(t.dull) + " до " + fmt(t.good);
+      $("biz-g-b").textContent = "от " + fmt(t.good);
+    }).catch(function(){ fail(["biz-thr", "biz-g-w", "biz-g-d", "biz-g-g", "biz-g-b"]); });
+  })();
+  </script>
+
   <div class="card">
     <div class="card-head"><h2>Организация</h2></div>
     <div class="card-body">

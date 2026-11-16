@@ -1,0 +1,632 @@
+/* ============================================================
+   UI2-3: остальные страницы приложения в новом виде (D-84).
+
+   Подключается вместе с static/ui2.css на страницах с классом `ui2` на
+   <html>, кроме «Оборачиваемости» (у неё раскладка своя, в шаблоне).
+   Файл только перекрашивает и перескругляет то, что уже есть: разметка,
+   id, тексты и поведение страниц не меняются.
+
+   Две семьи страниц:
+     A. самостоятельные (stocks, assistant, replenish, sizes, budget,
+        forecast, revenue, lessons): у каждой свой <style>, но общий
+        словарь классов (.panel, .card, .lbl, .cat-btn, .table-outer...);
+     B. страницы на base.html и static/app.css (settings, supply, orders,
+        account, team, plans, discounts, вход и регистрация): там всё на
+        переменных, поэтому хватает переопределить переменные и превратить
+        боковое меню в верхнюю панель. DOM сайдбара прежний: на него
+        опираются static/app.js, static/shell.js и тесты.
+
+   Правила те же, что в ui2.css: стекло только у шапки и всплывающих
+   карточек, панели с цифрами непрозрачные, подписи обычным регистром.
+   ============================================================ */
+
+/* ============ A. Самостоятельные страницы ============ */
+
+html.ui2 .gradient-bg ~ .main { padding: 12px 16px 32px; max-width: 1560px; }
+
+/* Панели, карточки, справка, рамка таблицы */
+html.ui2 .panel,
+html.ui2 .gradient-bg ~ .main .card,
+html.ui2 details.note,
+html.ui2 .table-outer,
+html.ui2 .fold {
+  background: rgba(255, 255, 255, .86);
+  border: 1px solid rgba(255, 255, 255, .9);
+  border-radius: 18px;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .9), 0 6px 24px rgba(46, 46, 96, .07);
+  -webkit-backdrop-filter: none; backdrop-filter: none;
+}
+html.ui2 .gradient-bg ~ .main .card { padding: 14px 18px; }
+html.ui2 details.note { margin: 10px 0 12px; }
+html.ui2 details.note > summary { padding: 12px 18px; font-size: 13px; font-weight: 600; color: var(--u-ink2); }
+html.ui2 details.note > summary:hover { color: var(--u-ink); }
+html.ui2 details.note .body { padding: 0 20px 16px; font-size: 13px; line-height: 1.6; color: var(--u-ink2); max-width: 980px; }
+html.ui2 details.note .body b { color: var(--u-ink); }
+html.ui2 details.note .body a { color: var(--u-accent); }
+
+/* Подписи: обычный регистр, без разрядки */
+html.ui2 .lbl,
+html.ui2 .gradient-bg ~ .main .card .l,
+html.ui2 .fold-head .t {
+  text-transform: none; letter-spacing: 0; font-size: 12.5px; font-weight: 600; color: var(--u-ink2);
+}
+html.ui2 .gradient-bg ~ .main .card .v { font-size: 22px; font-weight: 700; letter-spacing: -.01em; color: var(--u-ink); }
+html.ui2 .gradient-bg ~ .main .card .s,
+html.ui2 .hint { font-size: 12px; color: var(--u-ink2); }
+html.ui2 .muted { color: var(--u-ink3); }
+html.ui2 .loading { color: var(--u-ink2); }
+
+/* Чипы категорий и переключатели */
+html.ui2 .cat-btn {
+  min-height: 32px; padding: 5px 13px; border-radius: 999px; border: 1px solid var(--u-hair);
+  background: rgba(255, 255, 255, .72); color: var(--u-ink2); font-size: 13px; font-weight: 500;
+}
+html.ui2 .cat-btn:hover { background: #fff; color: var(--u-ink); }
+html.ui2 .cat-btn.active { background: var(--u-ink); color: #fff; border-color: var(--u-ink); }
+
+/* Поля и кнопки */
+html.ui2 .gradient-bg ~ .main input[type="text"],
+html.ui2 .gradient-bg ~ .main input[type="number"],
+html.ui2 .gradient-bg ~ .main input[type="date"],
+html.ui2 .gradient-bg ~ .main input[type="search"],
+html.ui2 .gradient-bg ~ .main input:not([type]),
+html.ui2 .gradient-bg ~ .main select {
+  border: 1px solid var(--u-hair); border-radius: 12px; background: #fff; color: var(--u-ink);
+}
+html.ui2 .gradient-bg ~ .main input:focus,
+html.ui2 .gradient-bg ~ .main select:focus {
+  outline: none; border-color: var(--u-accent); box-shadow: 0 0 0 3px var(--u-accent-soft);
+}
+html.ui2 .gradient-bg ~ .main input::placeholder { color: var(--u-ink3); }
+html.ui2 .go-btn {
+  border-radius: 999px; border: 1px solid var(--u-accent); background: var(--u-accent); color: #fff;
+  font-size: 13px; font-weight: 600; padding: 8px 18px;
+}
+html.ui2 .go-btn:hover { background: #0857b8; border-color: #0857b8; }
+
+/* Таблицы */
+html.ui2 .table-outer { padding: 0; }
+html.ui2 .table-outer table { font-size: 13px; }
+html.ui2 .table-outer thead th {
+  background: rgba(255, 255, 255, .97); text-transform: none; letter-spacing: 0;
+  font-size: 12px; font-weight: 600; color: var(--u-ink2); border-bottom: 1px solid var(--u-hair);
+  padding-top: 11px; padding-bottom: 10px;
+}
+html.ui2 .table-outer tbody td { border-bottom: 1px solid rgba(20, 20, 60, .06); }
+html.ui2 .table-outer tr.total td { background: var(--u-row-mute); }
+html.ui2 .rg2 td { background: var(--u-row-best); }
+html.ui2 .rg1 td { background: var(--u-row-good); }
+html.ui2 .ro td { background: var(--u-row-slow); }
+html.ui2 .rr td { background: var(--u-row-out); }
+
+/* Предупреждения */
+html.ui2 .gradient-bg ~ .main .warn,
+html.ui2 .stale {
+  border-radius: 14px; background: #fff6e3; border: 1px solid rgba(240, 140, 0, .28); color: #6f4300;
+  font-size: 13px; padding: 10px 16px;
+}
+
+/* Подписи капсом на этих страницах заданы десятком разных классов. Капс и
+   разрядка сняты разом: это решение о языке всего интерфейса (подписи
+   обычным регистром), а не о конкретном блоке. */
+html.ui2 .gradient-bg ~ .main * { text-transform: none !important; letter-spacing: 0 !important; }
+
+/* Блоки страниц: те же панели */
+html.ui2 .ms-card, html.ui2 .twrap, html.ui2 .stp, html.ui2 .tile, html.ui2 .pay, html.ui2 .datafacts,
+html.ui2 .scard, html.ui2 .bigtab, html.ui2 .scope-bar, html.ui2 .rc-box, html.ui2 .lesson {
+  background: rgba(255, 255, 255, .86); border: 1px solid rgba(255, 255, 255, .9); border-radius: 18px;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .9), 0 6px 24px rgba(46, 46, 96, .07);
+  -webkit-backdrop-filter: none; backdrop-filter: none;
+}
+html.ui2 .ms-card .lbl, html.ui2 .sum-card .lbl, html.ui2 .scard .sl, html.ui2 .datafacts .df-head,
+html.ui2 .cat-sum-title, html.ui2 .ptitle, html.ui2 .lesson .st, html.ui2 .arch-title {
+  font-size: 12.5px; font-weight: 600; color: var(--u-ink2);
+}
+html.ui2 .ms-card.accent { background: var(--u-row-good); border-color: rgba(47, 180, 87, .25); }
+html.ui2 .ms-card .sub, html.ui2 .sum-card .sub, html.ui2 .sum-card .cond, html.ui2 .sum-card .cost {
+  font-size: 12px; color: var(--u-ink2); opacity: 1;
+}
+
+/* Четыре класса оборачиваемости: те же пастельные тона, что у строк */
+html.ui2 .sum-card {
+  border-radius: 18px; border: 1px solid rgba(255, 255, 255, .7); -webkit-backdrop-filter: none; backdrop-filter: none;
+  box-shadow: 0 6px 24px rgba(46, 46, 96, .06);
+}
+html.ui2 .sc-best { background: var(--u-row-best); }
+html.ui2 .sc-good { background: var(--u-row-good); }
+html.ui2 .sc-mid { background: var(--u-row-slow); }
+html.ui2 .sc-bad { background: var(--u-row-out); }
+html.ui2 .sc-best .lbl, html.ui2 .sc-best .money { color: #3c6300; }
+html.ui2 .sc-good .lbl, html.ui2 .sc-good .money { color: #14692f; }
+html.ui2 .sc-mid .lbl, html.ui2 .sc-mid .money { color: #7a4a00; }
+html.ui2 .sc-bad .lbl, html.ui2 .sc-bad .money { color: #a3221a; }
+
+/* Сообщения */
+html.ui2 .loss-line, html.ui2 .gradient-bg ~ .main .err {
+  border-radius: 14px; background: var(--u-row-out); border: 1px solid rgba(240, 68, 58, .28); color: #8a1c15;
+}
+html.ui2 .loss-line a { color: #8a1c15; }
+html.ui2 .gradient-bg ~ .main .ok, html.ui2 .ord-created {
+  border-radius: 14px; background: var(--u-row-good); border: 1px solid rgba(47, 180, 87, .25);
+}
+
+/* Капсулы: чипы, переключатели, второстепенные кнопки */
+html.ui2 .gradient-bg ~ .main .chip, html.ui2 .chip-btn, html.ui2 .bdg, html.ui2 .scope-btn, html.ui2 .preset, html.ui2 .abtn,
+html.ui2 .mvbtn, html.ui2 .gradient-bg ~ .main .search {
+  border-radius: 999px; border: 1px solid var(--u-hair); background: rgba(255, 255, 255, .72); color: var(--u-ink2);
+}
+html.ui2 .gradient-bg ~ .main .chip:hover, html.ui2 .chip-btn:hover, html.ui2 .scope-btn:hover, html.ui2 .preset:hover,
+html.ui2 .abtn:hover, html.ui2 .mvbtn:hover { background: #fff; color: var(--u-ink); }
+html.ui2 .gradient-bg ~ .main .chip.on, html.ui2 .scope-btn.on, html.ui2 .preset.active {
+  background: var(--u-ink); color: #fff; border-color: var(--u-ink);
+}
+html.ui2 .gradient-bg ~ .main .search { padding-left: 14px; padding-right: 14px; color: var(--u-ink); }
+html.ui2 .gradient-bg ~ .main .seg {
+  border-radius: 999px; border: 1px solid var(--u-hair); background: rgba(120, 120, 128, .12); padding: 2px;
+}
+html.ui2 .gradient-bg ~ .main .seg button { border-radius: 999px; color: var(--u-ink2); }
+html.ui2 .gradient-bg ~ .main .seg button.on, html.ui2 .gradient-bg ~ .main .seg button.active {
+  background: #fff; color: var(--u-ink); font-weight: 600; box-shadow: 0 1px 3px rgba(0, 0, 0, .12);
+}
+/* Главное действие экрана: синяя кнопка */
+html.ui2 .abtn.primary, html.ui2 .mvbtn.primary, html.ui2 .dl-btn {
+  background: var(--u-accent); border-color: var(--u-accent); color: #fff; font-weight: 600;
+}
+html.ui2 .abtn.primary:hover, html.ui2 .mvbtn.primary:hover, html.ui2 .dl-btn:hover {
+  background: #0857b8; border-color: #0857b8; color: #fff;
+}
+html.ui2 .reset-view { border-radius: 999px; background: #fff1d6; border: 1px solid rgba(240, 140, 0, .3); color: #6f4300; }
+
+/* Выбранное и состояния блоков */
+html.ui2 .tile.on, html.ui2 .bigtab.active {
+  background: #fff; border-color: var(--u-accent); box-shadow: 0 0 0 2px var(--u-accent-soft), 0 6px 24px rgba(46, 46, 96, .07);
+}
+html.ui2 .bigtab.addtab { border: 1px dashed rgba(20, 20, 60, .28); background: rgba(255, 255, 255, .45); box-shadow: none; }
+html.ui2 .scard.alert { background: var(--u-row-out); border-color: rgba(240, 68, 58, .28); }
+html.ui2 .scard.calm { background: var(--u-row-good); border-color: rgba(47, 180, 87, .25); }
+html.ui2 .pay.now { background: #fff6e3; border-color: rgba(240, 140, 0, .28); }
+html.ui2 .bdg.warn { background: #fff1d6; border-color: rgba(240, 140, 0, .3); color: #6f4300; }
+html.ui2 .stp.done .n { background: var(--u-good); color: #fff; }
+html.ui2 .risk-go { border-radius: 999px; }
+
+/* Шаги мастера, уроки, прогресс */
+html.ui2 .stp.on { background: #fff; box-shadow: 0 1px 3px rgba(0, 0, 0, .12), 0 0 0 1px rgba(0, 0, 0, .04); }
+html.ui2 .stp.on .n, html.ui2 .lesson.done .num { background: var(--u-ink); color: #fff; }
+html.ui2 .pbar i { background: var(--u-accent); }
+html.ui2 .gradient-bg ~ .main .toggle input:checked + .sw { background: var(--u-good); }
+html.ui2 .bigtab { border-radius: 18px; }
+html.ui2 .gradient-bg ~ * .modal, html.ui2 .gradient-bg ~ .modal {
+  border-radius: 22px; background: rgba(250, 250, 253, .98); border: 1px solid rgba(255, 255, 255, .8);
+  box-shadow: 0 30px 80px rgba(46, 46, 96, .28);
+}
+html.ui2 .ctip { border-radius: 10px; background: rgba(29, 29, 31, .92); }
+
+/* ---- Полировка по обходу критиков 16.11 (самостоятельные страницы) ---- */
+
+/* Второстепенные кнопки не синие: на экране одна главная. */
+html.ui2 .go-btn.ghost, html.ui2 .go-btn.sec {
+  background: rgba(255, 255, 255, .75); color: var(--u-ink); border: 1px solid var(--u-hair);
+}
+html.ui2 .go-btn.ghost:hover, html.ui2 .go-btn.sec:hover { background: #fff; border-color: var(--u-hair); }
+
+/* Ссылки в тексте панелей: цвет акцента, а не браузерный синий. */
+html.ui2 .gradient-bg ~ .main .panel a:not([class]), html.ui2 .gradient-bg ~ .main .warn a,
+html.ui2 .gradient-bg ~ .main .hint a, html.ui2 .gradient-bg ~ .main .datafacts a,
+html.ui2 .gradient-bg ~ .main details.note a { color: var(--u-accent); text-decoration: none; }
+html.ui2 .gradient-bg ~ .main .panel a:not([class]):hover, html.ui2 .gradient-bg ~ .main .hint a:hover { text-decoration: underline; }
+
+/* Шаги мастера: пройти по клику нельзя, значит и выглядеть кнопкой не должны. */
+html.ui2 .stp:not(.on) { cursor: default; box-shadow: none; background: rgba(255, 255, 255, .5); }
+html.ui2 .tile .d { font-size: 12.5px; color: var(--u-ink2); }
+
+/* «Активный сток»: процент в полоске запаса читается на любом фоне. */
+html.ui2 .zbar { border-radius: 999px; background: rgba(120, 120, 128, .16); height: 18px; }
+html.ui2 .zbar .zfill { opacity: .38; }
+html.ui2 .zbar .ztxt { color: var(--u-ink) !important; font-size: 11px; }
+
+/* Мелкие бледные пояснения до принятого вторичного текста. */
+html.ui2 .psub, html.ui2 .note-inline, html.ui2 #seg-basis, html.ui2 .lesson .pg {
+  font-size: 12.5px; color: var(--u-ink2);
+}
+html.ui2 .table-outer thead th, html.ui2 .twrap thead th { font-size: 11.5px; }
+html.ui2 .twrap thead th { text-transform: none; letter-spacing: 0; color: var(--u-ink2); background: rgba(255, 255, 255, .97); }
+
+/* «Заказ»: залипшие первые колонки того же тона, что вся строка. */
+html.ui2 #tbl-wrap thead th:nth-child(1), html.ui2 #tbl-wrap thead th:nth-child(2), html.ui2 #tbl-wrap thead th:nth-child(3) { background: #fff; }
+html.ui2 #tbl-wrap tbody td:nth-child(1), html.ui2 #tbl-wrap tbody td:nth-child(2), html.ui2 #tbl-wrap tbody td.name { background: #fff; }
+html.ui2 #tbl-wrap .rg2 td:nth-child(1), html.ui2 #tbl-wrap .rg2 td:nth-child(2), html.ui2 #tbl-wrap .rg2 td.name { background: var(--u-row-best); }
+html.ui2 #tbl-wrap .rg1 td:nth-child(1), html.ui2 #tbl-wrap .rg1 td:nth-child(2), html.ui2 #tbl-wrap .rg1 td.name { background: var(--u-row-good); }
+html.ui2 #tbl-wrap .ro td:nth-child(1), html.ui2 #tbl-wrap .ro td:nth-child(2), html.ui2 #tbl-wrap .ro td.name { background: var(--u-row-slow); }
+html.ui2 #tbl-wrap .rr td:nth-child(1), html.ui2 #tbl-wrap .rr td:nth-child(2), html.ui2 #tbl-wrap .rr td.name { background: var(--u-row-out); }
+html.ui2 #tbl-wrap tfoot td { background: var(--u-row-mute); font-size: 12px; }
+
+/* Полоса синхронизации (_hints.html) липнет к верху окна. Верх теперь занят
+   панелью, поэтому полоса липнет под ней: иначе при прокрутке «Повторить»
+   оказывалось под панелью (ревью #137). */
+html.ui2 .syncbar { top: 72px; }
+@media (max-width: 760px) { html.ui2 .syncbar { top: 68px; } }
+
+/* ============ B. Страницы на base.html ============ */
+
+html.ui2 {
+  --bg: var(--u-paper);
+  --surface: #ffffff;
+  --line: rgba(20, 20, 60, .14);
+  --line-soft: rgba(20, 20, 60, .08);
+  --ink: #1d1d1f;
+  --ink-2: rgba(29, 29, 31, .68);
+  --ink-3: rgba(29, 29, 31, .56);
+  --blue: #0a66d6;
+  --blue-hover: #0857b8;
+  --blue-soft: rgba(10, 102, 214, .12);
+  --accent-soft: rgba(10, 102, 214, .1);
+}
+html.ui2 .shell { position: relative; z-index: 1; display: block; min-height: 0; }
+html.ui2 body.embed .gradient-bg { display: none; }
+
+/* Боковое меню становится верхней панелью. Только вид: разметка прежняя. */
+html.ui2 .sidebar {
+  position: sticky; top: 10px; inset: 10px auto auto auto; z-index: 200;
+  width: auto; min-width: 0; margin: 10px 16px 0; padding: 7px 176px 7px 18px; min-height: 54px;
+  flex-direction: row; align-items: center; flex-wrap: wrap; gap: 4px 16px;
+  border-radius: 18px; color: var(--u-ink);
+  background: var(--u-glass);
+  -webkit-backdrop-filter: blur(30px) saturate(180%); backdrop-filter: blur(30px) saturate(180%);
+  border: 1px solid rgba(255, 255, 255, .75);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .85), 0 8px 30px rgba(46, 46, 96, .09);
+}
+html.ui2 .sidebar .brand { padding: 0; border-bottom: none; gap: 0; }
+html.ui2 .sidebar .brand .mark, html.ui2 .sidebar .brand .b-org { display: none; }
+html.ui2 .sidebar .brand .b-name {
+  color: var(--u-ink); font-size: 13px; font-weight: 700; letter-spacing: .2em; text-transform: uppercase;
+}
+html.ui2 .sidebar .brand { flex: 0 0 auto; }
+html.ui2 .sidebar .nav {
+  flex: 1 1 0; min-width: 0; display: flex; flex-wrap: wrap; align-items: center; gap: 2px;
+  padding: 0; overflow: visible;
+}
+html.ui2 .sidebar .nav .nav-grp { display: none; }
+html.ui2 .sidebar .nav a {
+  margin: 0; padding: 7px 11px; border-radius: 10px; font-size: 13px; font-weight: 500; color: var(--u-ink2);
+}
+html.ui2 .sidebar .nav a:hover { background: rgba(120, 120, 128, .14); color: var(--u-ink); }
+html.ui2 .sidebar .nav a.active {
+  background: #fff; color: var(--u-ink); font-weight: 600;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, .12), 0 0 0 1px rgba(0, 0, 0, .04);
+}
+html.ui2 .sidebar .nav a .pip { margin-left: 6px; background: var(--u-out); font-family: inherit; }
+/* Состояние синхронизации продублировано чипом свежести и плашкой в строке
+   заголовка. В панели оно остаётся только когда в нём есть действие
+   («повторить»): тогда его нельзя прятать. Браузер без :has() показывает
+   строку всегда. */
+html.ui2 .sidebar .side-status {
+  flex: 0 1 auto; padding: 0; border-top: none; font-size: 11.5px; line-height: 1.35; color: var(--u-ink2);
+  max-width: 230px;
+}
+html.ui2 .sidebar .side-status a { color: var(--u-accent); }
+@supports selector(:has(a)) {
+  html.ui2 .sidebar .side-status:not(:has(a, button)) { display: none; }
+}
+html.ui2 .shell > .main { margin-left: 0; display: block; }
+
+/* Строка заголовка страницы */
+html.ui2 .topbar {
+  background: transparent; border-bottom: none; height: auto; min-height: 0;
+  padding: 18px 20px 2px; gap: 10px; flex-wrap: wrap;
+}
+html.ui2 .topbar h1 { font-size: 24px; font-weight: 700; letter-spacing: -.02em; color: var(--u-ink); }
+html.ui2 .topbar .date { display: none; }
+html.ui2 .live { background: rgba(47, 180, 87, .14); color: #14692f; font-size: 12px; padding: 4px 11px; }
+html.ui2 .live.stale { background: #fff1d6; color: #7a4a00; }
+html.ui2 .plan-badge {
+  text-transform: none; letter-spacing: 0; font-size: 12px; font-weight: 600; padding: 3px 10px;
+  background: var(--u-accent-soft); color: var(--u-accent);
+}
+html.ui2 .plan-badge.trial { background: #fff1d6; color: #7a4a00; }
+
+/* Меню пользователя встаёт в верхнюю панель, как на самостоятельных страницах */
+html.ui2 .topbar .user-menu { position: fixed; top: 19px; right: 26px; z-index: 210; }
+html.ui2 .user-chip {
+  border: 1px solid var(--u-hair); border-radius: 999px; background: rgba(255, 255, 255, .7); color: var(--u-ink);
+  max-width: 160px;
+}
+html.ui2 .user-chip:hover { background: #fff; }
+html.ui2 .user-chip > span:nth-child(2) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+html.ui2 .user-chip .avatar { background: var(--u-ink); color: #fff; flex: 0 0 auto; }
+html.ui2 .user-pop {
+  border-radius: 16px; border: 1px solid rgba(255, 255, 255, .8); background: var(--u-glass-hi);
+  -webkit-backdrop-filter: blur(30px) saturate(180%); backdrop-filter: blur(30px) saturate(180%);
+  box-shadow: 0 20px 50px rgba(46, 46, 96, .22); overflow: hidden;
+}
+html.ui2 .user-pop button:hover, html.ui2 .user-pop a.up-item:hover { background: rgba(120, 120, 128, .12); }
+
+html.ui2 .trial-strip {
+  margin: 10px 16px 0; padding: 8px 16px; border-radius: 12px; border: 1px solid var(--u-hair);
+  background: rgba(255, 255, 255, .6); color: var(--u-ink2); font-size: 12.5px;
+}
+html.ui2 .content { padding: 12px 16px 40px; }
+
+/* Карточки, кнопки, поля, таблицы на переменных app.css */
+html.ui2 .shell .card, html.ui2 .embed-shell .card {
+  border: 1px solid rgba(255, 255, 255, .9); border-radius: 18px; background: rgba(255, 255, 255, .9);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .9), 0 6px 24px rgba(46, 46, 96, .07);
+}
+html.ui2 .card-head { border-bottom-color: var(--line-soft); padding-left: 18px; padding-right: 18px; }
+html.ui2 .card-head h2 { font-size: 15px; letter-spacing: -.01em; }
+html.ui2 .card-body { padding-left: 18px; padding-right: 18px; }
+html.ui2 .card-body.flush { padding: 0; }
+html.ui2 .btn { border-radius: 999px; border-color: var(--u-hair); font-weight: 600; }
+html.ui2 .btn:hover { background: rgba(120, 120, 128, .1); }
+html.ui2 .btn.primary { border-color: var(--u-accent); }
+html.ui2 .btn.primary:hover { background: var(--blue-hover); }
+html.ui2 .input, html.ui2 select.input, html.ui2 textarea.input { border-radius: 12px; }
+/* Числа в полях системным шрифтом, а не моноширинным. */
+html.ui2 { --mono: var(--u-font); }
+html.ui2 .input { font-variant-numeric: tabular-nums; }
+/* Точки групп в «Настройках» тех же тонов, что строки таблицы. */
+html.ui2 .dot.weak { background: #ff9d95; }
+html.ui2 .dot.dull { background: #ffc978; }
+html.ui2 .dot.good { background: #8fd3a4; }
+html.ui2 .dot.best { background: #b9dc4e; }
+html.ui2 .auth-card .btn.primary { min-height: 40px; font-size: 14px; }
+html.ui2 .shell .seg { border-radius: 12px; background: rgba(120, 120, 128, .12); }
+html.ui2 .shell .seg button { border-radius: 10px; }
+html.ui2 .input:focus, html.ui2 select.input:focus, html.ui2 textarea.input:focus {
+  outline: none; border-color: var(--u-accent); box-shadow: 0 0 0 3px var(--u-accent-soft);
+}
+
+/* Вход, регистрация, подключение: одна стеклянная карточка на обоях */
+html.ui2 .auth-card, html.ui2 .onb-card {
+  border-radius: 26px; border: 1px solid rgba(255, 255, 255, .8); background: var(--u-glass-hi);
+  -webkit-backdrop-filter: blur(30px) saturate(180%); backdrop-filter: blur(30px) saturate(180%);
+  box-shadow: 0 30px 80px rgba(46, 46, 96, .18);
+}
+
+/* Страницы без каркаса (вход, регистрация, подключение) лежат поверх обоев:
+   без своего слоя логотип и строка «выйти» оказывались под фоном (ревью #137). */
+html.ui2 .auth-wrap { position: relative; z-index: 1; }
+html.ui2 .auth-logo, html.ui2 .auth-logo .logo-text { color: var(--u-ink); }
+html.ui2 .auth-card { padding: 30px 32px 26px; }
+html.ui2 .auth-card h1 { font-size: 24px; line-height: 1.2; letter-spacing: -.02em; margin-bottom: 8px; }
+html.ui2 .auth-card .auth-sub { font-size: 14px; line-height: 1.5; color: var(--u-ink2); }
+html.ui2 .auth-card .onb-lead { font-size: 15px; margin-bottom: 12px; max-width: 46ch; }
+html.ui2 .auth-card .onb-go { margin-top: 12px; height: 40px; padding: 0 22px; font-size: 14px; }
+html.ui2 .auth-note { color: var(--u-ink2); }
+html.ui2 .auth-note a { color: var(--u-accent); }
+html.ui2 .source-opt { border-radius: 18px; }
+
+@media (max-width: 760px) {
+  html.ui2 .gradient-bg ~ .main { padding: 10px 8px 28px; }
+  html.ui2 .sidebar {
+    position: relative; top: auto; inset: auto; margin: 8px 8px 0; padding: 6px 8px 6px 12px; border-radius: 16px;
+    gap: 8px;
+  }
+  html.ui2 .sidebar .side-menu-btn {
+    border: 1px solid var(--u-hair); border-radius: 12px; background: rgba(255, 255, 255, .7); color: var(--u-ink);
+  }
+  html.ui2 .sidebar .side-menu-lbl,
+  html.ui2 .sidebar .side-menu-cur:not(:empty)::before { color: var(--u-ink2); }
+  html.ui2 .sidebar .nav { flex: 1 1 100%; display: block; }
+  html.ui2.shell-js .sidebar .nav { display: none; }
+  html.ui2.shell-js .sidebar .nav.open { display: block; }
+  html.ui2 .sidebar .nav a { border-radius: 12px; }
+  html.ui2 .sidebar .side-status { display: none; }
+  html.ui2 .topbar { padding: 12px 10px 0; }
+  html.ui2 .topbar h1 { font-size: 20px; }
+  html.ui2 .topbar .user-menu { position: relative; top: auto; right: auto; }
+  html.ui2 .trial-strip { margin: 8px 8px 0; }
+  html.ui2 .content { padding: 10px 8px 32px; }
+}
+
+/* ================= Правки по обходу критиков 16.11 =================
+   Каждое правило ниже критик подставлял в страницу и перемерял. */
+
+/* --- Самостоятельные страницы, компьютер (критик вёрстки A) --- */
+html.ui2 .rc-box{background:#fbfbfd;border-radius:22px;box-shadow:0 30px 80px rgba(46,46,96,.28)}
+html.ui2 .rc-box input{height:34px;padding:0 12px;border:1px solid var(--u-hair);border-radius:12px;font:inherit;font-size:13px}
+/* Только на компьютере: на телефоне у этих кнопок свои 40 px под палец. */
+@media (min-width: 761px) { html.ui2 .rc-box .mvbtn,html.ui2 .ord-actions .mvbtn,html.ui2 .batchid .mvbtn{min-height:30px;padding:5px 13px;font-size:12.5px} }
+html.ui2 .rc-box .mvbtn,html.ui2 .ord-actions .mvbtn,html.ui2 .batchid .mvbtn{font-size:12.5px}
+html.ui2 .twrap .rg2:hover td{background:#d5ec8f}html.ui2 .twrap .rg1:hover td{background:#cdebd6}html.ui2 .twrap .ro:hover td{background:#ffe4bd}html.ui2 .twrap .rr:hover td{background:#ffd9d6}
+html.ui2 .twrap tr.sr td,html.ui2 .twrap tr.sr td:first-child{background:#fafafc}
+html.ui2 .twrap .rgr td,html.ui2 .twrap .rgr td:first-child{background:var(--u-row-mute)}
+html.ui2 .twrap thead th[data-sk]:focus-visible{outline:3px solid rgba(10,102,214,.55);outline-offset:-3px}
+html.ui2 .gradient-bg ~ .cat-bar{padding:12px 16px 0}
+html.ui2 .gradient-bg ~ .main > :first-child{margin-top:0}
+html.ui2 .modal label{text-transform:none;letter-spacing:0;font-size:12.5px;color:var(--u-ink2)}
+html.ui2 .modal input{border:1px solid var(--u-hair);border-radius:12px}
+html.ui2 .modal input:focus{border-color:var(--u-accent);box-shadow:0 0 0 3px var(--u-accent-soft);outline:none}
+html.ui2 .modal .abtn{white-space:nowrap}
+html.ui2 .gradient-bg ~ .main .card[style*="76,187,23"]{background:var(--u-row-good)!important;border-color:rgba(47,180,87,.25)}
+html.ui2 #tblWrap{margin-bottom:12px}
+html.ui2 .panel table th{font-size:11.5px;font-weight:600;color:var(--u-ink2)}
+html.ui2 .panel .table-outer,html.ui2 .fold .table-outer,html.ui2 .rc-box .table-outer,html.ui2 .panel .datafacts{border-radius:12px;box-shadow:none;border:1px solid var(--u-hair)}
+html.ui2 .panel .pay,html.ui2 .panel .tile{border-radius:12px}
+html.ui2 .panel .pay,html.ui2 .panel .tile:not(.on){box-shadow:none}
+html.ui2 .gradient-bg ~ .main input.search{border-radius:999px;height:32px;padding:0 14px}
+html.ui2 .csub,html.ui2 .why,html.ui2 .msub2,html.ui2 .twrap thead th .sub{font-size:11.5px;opacity:1;color:var(--u-ink2)}
+html.ui2 .stbadge,html.ui2 .panel .pill{font-size:11.5px}
+html.ui2 .lesson a.go-btn{background:rgba(255,255,255,.75);color:var(--u-ink);border-color:var(--u-hair)}
+html.ui2 .panel .row input,html.ui2 .toolbar input,html.ui2 .toolbar .preset{height:36px}
+html.ui2 .steps { margin-top: 0; }
+html.ui2 .modal-bg .modal { width: 560px; max-width: calc(100vw - 24px); }
+/* Синей остаётся одна кнопка: у первого непройденного урока. */
+html.ui2 .lesson:not(.done):not(.lesson:not(.done) ~ .lesson) a.go-btn { background: var(--u-accent); color: #fff; border-color: var(--u-accent); }
+
+/* --- Телефон и планшет (критик C) --- */
+@media(max-width:480px){html.ui2 #tfoot td:nth-child(n+2):nth-child(-n+7){display:none}}
+@media(max-width:760px){html.ui2 .catrow{flex-wrap:wrap}html.ui2 .catbar-wrap{flex:0 0 100%;order:3}}
+@media(max-width:760px){html.ui2 .cat-btn,html.ui2 .chip-tg,html.ui2 .rule-btn,html.ui2 .def-disc-btn,html.ui2 .search{height:40px}}
+@media(pointer:coarse){html.ui2 .btn,html.ui2 .abtn,html.ui2 .seg button{min-height:40px}}
+html.ui2 .u-tip button{min-height:40px}html.ui2 .u-tip .u-x{width:40px;height:40px;top:4px;right:4px}
+@media(max-width:760px){html.ui2 .ordin,html.ui2 .size-rec{height:40px}html.ui2 #tbody input[type=checkbox]{width:22px;height:22px}}
+@media(max-width:760px){html.ui2 .sidebar{position:sticky;top:8px}}
+@media(min-width:761px) and (max-width:1360px){html.ui2 .sidebar{padding-right:60px}html.ui2 .user-chip>span:nth-child(2){display:none}}
+@media(max-width:480px){html.ui2 #tbl-wrap :is(th,td):nth-child(2){left:25px}html.ui2 #tbl-wrap :is(th,td.name):nth-child(3){left:54px}}
+@media(max-width:760px){html.ui2 .gradient-bg~.main .seg,html.ui2 .risk-go{border-radius:20px}}
+html.ui2 #tblWrap td:first-child{position:sticky;left:0;z-index:5}html.ui2 #tblWrap tr.total td{position:sticky;bottom:0}
+@media (max-width: 760px) {
+  html.ui2 .tour-bar .tb-chip:not(.cur) { display: none; }
+  html.ui2 .gradient-bg ~ .main .panel td { white-space: nowrap; }
+  html.ui2 .gradient-bg ~ .main .panel td:nth-child(-n+2) { white-space: normal; }
+  html.ui2 .gradient-bg ~ .cat-bar { padding: 10px 8px 0; }
+}
+
+/* --- Страницы base.html: панель один в один с панелью остальных страниц
+   (критик B: высота 56, чип 40, аватар 30, полоса демо под панелью) --- */
+/* Чип пользователя стоит поверх панели (position: fixed), поэтому место под
+   него резервируется по самой длинной допустимой ширине чипа (160 px). */
+html.ui2 .sidebar { min-height: 56px; padding-right: 180px; }
+html.ui2 .sidebar .nav { justify-content: flex-end; }
+html.ui2 .sidebar .nav a { line-height: 1.2; gap: 0; }
+html.ui2 .user-chip { min-height: 40px; padding: 4px 10px 4px 4px; font-size: 13px; font-weight: 400; }
+html.ui2 .topbar .user-menu { top: 18px; right: 27px; }
+html.ui2 .user-chip .avatar { width: 30px; height: 30px; font-size: 12px; font-weight: 700; }
+html.ui2 .shell > .main { display: flex; flex-direction: column; }
+html.ui2 .trial-strip { order: -1; margin-top: 8px; }
+html.ui2 .topbar { padding-left: 16px; }
+@media (max-width: 1360px) and (min-width: 761px) {
+  html.ui2 .sidebar { padding: 7px 62px 7px 16px; gap: 4px 10px; }
+  html.ui2 .sidebar .nav a { padding: 7px 8px; }
+  html.ui2 .user-chip { padding: 4px; }
+  html.ui2 .user-chip > span + span { display: none; }
+}
+@media (max-width: 760px) {
+  html.ui2 .sidebar { padding: 6px 8px 6px 12px; min-height: 0; }
+  html.ui2 .sidebar .nav { justify-content: flex-start; }
+  html.ui2 .topbar .user-menu { top: auto; right: auto; }
+  html.ui2 .topbar { padding-left: 10px; }
+}
+
+/* --- Кнопки, поля, таблицы и вложенные блоки base.html (критик B) --- */
+html.ui2 .btn { padding: 8px 16px; font-size: 13px; }
+html.ui2 .btn.sm { padding: 6px 12px; font-size: 12.5px; }
+html.ui2 .input:not(textarea) { min-height: 36px; }
+html.ui2 .input.num, html.ui2 .invite-out .row .input { font-family: inherit; }
+html.ui2 #horizon-mode { flex-wrap: nowrap !important; }
+html.ui2 #horizon-mode .btn.primary { background: #fff; color: var(--u-ink); border-color: transparent; box-shadow: 0 1px 3px rgba(0, 0, 0, .12); }
+html.ui2 .tbl th { text-transform: none; letter-spacing: 0; font-size: 12px; font-weight: 600; color: var(--u-ink2); background: none; }
+html.ui2 .toast { border-radius: 14px; }
+html.ui2 .toast.error { background: #ffe7e5; color: #8a1c15; }
+html.ui2 .toast.success { background: #dcf2e2; color: #14692f; }
+html.ui2 .chan, html.ui2 .pl-card, html.ui2 .pcard, html.ui2 .pl-next { border-radius: 14px !important; border-color: var(--u-hair) !important; }
+html.ui2 .pl-form { max-width: 640px; }
+html.ui2 .pl-field .btn { align-self: flex-start; }
+html.ui2 .pl-field input, html.ui2 .pl-field select { min-height: 36px; border-radius: 12px; }
+
+/* ================= Второй круг: арт-директор и судья приёмки (16.11) =================
+   Правила арт-директора (перемерены на 1440 и 390 после слияния D-89). */
+/* 1. Меню и чип пользователя на страницах base.html стоят там же, где на остальных */
+html.ui2 .sidebar .nav a{position:relative}
+html.ui2 .sidebar .nav a .pip{position:absolute;top:-5px;right:-8px;margin:0}
+@media (max-width:760px){
+  html.ui2 .topbar .user-menu{position:fixed;top:15px;right:17px;z-index:210}
+  html.ui2 .user-chip{padding:6px;min-height:44px}
+  html.ui2 .user-chip>span+span{display:none}
+  html.ui2 .sidebar{padding-right:62px}
+}
+
+/* 2. Таблицы: строки капсулами и числа по правому краю, как на «Оборачиваемости» */
+html.ui2 :is(.twrap,#tbl-wrap,#tblWrap){border-radius:22px;padding:0 8px 0 0}
+html.ui2 :is(.twrap,#tbl-wrap,#tblWrap)>table{border-collapse:separate;border-spacing:0 4px;width:calc(100% - 10px);margin-left:10px;font-size:13.5px}
+html.ui2 :is(.twrap,#tbl-wrap,#tblWrap) thead th{background:#fff;border-bottom:0;font-weight:600}
+html.ui2 :is(.twrap,#tbl-wrap,#tblWrap) tbody td{border:0;box-shadow:none;font-size:13.5px;font-variant-numeric:tabular-nums}
+html.ui2 :is(.twrap,#tbl-wrap,#tblWrap) tbody td:first-child{border-radius:13px 0 0 13px}
+html.ui2 :is(.twrap,#tbl-wrap,#tblWrap) tbody td:last-child{border-radius:0 13px 13px 0}
+html.ui2 :is(.twrap,#tblWrap) :is(th,td):nth-child(n+2),html.ui2 #tbl-wrap :is(th,td):nth-child(n+4){text-align:right;padding-right:18px}
+html.ui2 #tbl-wrap tfoot td,html.ui2 #tblWrap tr.total td{box-shadow:0 4px 0 #fff,0 -4px 0 #fff}
+html.ui2 .panel table td{font-variant-numeric:tabular-nums}
+
+/* 3. «Заказ» после D-89: одна синяя кнопка, новые блоки той же панелью, одна высота в строке */
+html.ui2 #pb-apply,html.ui2 .first-card .abtn.primary{background:rgba(255,255,255,.72);border-color:var(--u-hair);color:var(--u-ink)}
+html.ui2 .first-card,html.ui2 .plan-bar{border-radius:18px;background:rgba(255,255,255,.86);border:1px solid rgba(255,255,255,.9);box-shadow:inset 0 1px 0 rgba(255,255,255,.9),0 6px 24px rgba(46,46,96,.07);padding:12px 18px}
+html.ui2 .plan-bar .pb-in,html.ui2 .plan-bar .pb-sel{border-radius:12px;border-color:var(--u-hair)}
+@media (min-width:761px){html.ui2 .plan-bar .pb-in,html.ui2 .plan-bar .pb-sel{height:34px}}
+html.ui2 .plan-bar .pb-f{color:var(--u-ink2)}
+
+/* 4. Статусы, красный текст, полоски и галочки: палитра эталона */
+html.ui2 .stbadge,html.ui2 .panel .pill,html.ui2 .losstag{border-radius:999px;font-size:11.5px;padding:3px 10px}
+html.ui2 .stbadge{background:rgba(255,255,255,.74);color:var(--u-ink)}
+html.ui2 .stbadge.g{box-shadow:inset 0 0 0 1.5px var(--u-good)}
+html.ui2 .stbadge.y{box-shadow:inset 0 0 0 1.5px var(--u-slow)}
+html.ui2 .stbadge.r{box-shadow:inset 0 0 0 1.5px var(--u-out)}
+html.ui2 .txt-red,html.ui2 .need-pill.r,html.ui2 .risk-go,html.ui2 .tbl-legend b,html.ui2 .scope-note.need,html.ui2 .mneg,html.ui2 .losstag,html.ui2 .pb-note .warn{color:#a3241c}
+html.ui2 .ss[style*="160, 0, 3"],html.ui2 .sub[style*="a00003"]{color:#a3241c!important}
+html.ui2 .losstag{background:rgba(240,68,58,.16)}
+html.ui2 .risk-go{border-color:rgba(240,68,58,.4)}
+html.ui2 .pill[style*="76,187,23"]{background:#dcf2e2!important;color:#14692f!important}
+html.ui2 .pill[style*="221,0,4"]{background:#ffe7e5!important;color:#a3241c!important}
+html.ui2 .zfill[style*="4b7a00"]{background:#2fb457!important}
+html.ui2 .zfill[style*="b99a00"]{background:#f08c00!important}
+html.ui2 .zfill[style*="dd0004"],html.ui2 .zfill[style*="221,0,4"]{background:#f0443a!important}
+html.ui2 .zbar .zfill{opacity:.5}
+html.ui2 input[type=checkbox],html.ui2 input[type=radio]{accent-color:var(--u-accent)}
+
+/* 5. Заголовок страницы: один размер, без дублей статуса */
+html.ui2 .head-row h1{font-size:24px;letter-spacing:-.02em}
+html.ui2 .topbar{padding-top:12px}
+html.ui2 .topbar .live,html.ui2 .topbar .plan-badge{display:none}
+
+/* 6. Колонка и шапки карточек на страницах base.html */
+html.ui2 .settings-grid,html.ui2 .acc-wrap,html.ui2 .plans-wrap{max-width:980px}
+html.ui2 .sup-wrap{max-width:none}
+html.ui2 .team-grid{gap:0}
+html.ui2 .card-head{min-height:55px}
+
+/* 7. Карточки показателей: одна цифра, одна подпись, одни поля */
+html.ui2 .ms-card,html.ui2 .scard{padding:14px 18px}
+html.ui2 .ms-card .val,html.ui2 .scard .sv{font-size:22px}
+html.ui2 .scard .ss{font-size:12px;color:var(--u-ink2)}
+
+/* 8. Кнопки одного смысла одной высоты и вида */
+@media (min-width:761px){html.ui2 .go-btn,html.ui2 .abtn{display:inline-flex;align-items:center;height:34px;padding:0 16px;font-size:13px;line-height:1}}
+html.ui2 #xlsxBtn{background:rgba(255,255,255,.72)!important;border-color:var(--u-hair)!important;color:var(--u-ink2)!important}
+
+/* 9. Чипы категорий и периодов одного размера */
+html.ui2 .scope-btn,html.ui2 .gradient-bg ~ .main .chip,html.ui2 .toolbar .preset{padding:5px 13px;font-size:13px;font-weight:500}
+@media (min-width:761px){html.ui2 .scope-btn,html.ui2 .gradient-bg ~ .main .chip,html.ui2 .toolbar .preset{height:32px;min-height:32px}}
+html.ui2 .cat-btn .cnt{font-size:11.5px;opacity:.86;margin-left:5px}
+
+/* 10. Бледный и мелкий текст */
+html.ui2 :is(.bt-sub,.prod-note,.seg-lbl,.cat-lbl,#fc-window,.pbasis,.pmonths,.pmonths *,.catmeta,.head-row .sub,.allrow .s,.panel .sub,.pinfo .k,.fold-head .c,.pcenter .sub){color:var(--u-ink2)}
+html.ui2 tbody td.name .csub,html.ui2 .pmini .val,html.ui2 .pbasis,html.ui2 .pcenter .sub,html.ui2 .pinfo h3{font-size:11.5px;color:var(--u-ink2)}
+html.ui2 #tblWrap td .muted{font-size:11.5px!important;color:var(--u-ink2)}
+html.ui2 .pmonths{font-size:12px}
+html.ui2 .pmini-row>div[style*="font-size:10px"]{font-size:12px!important;color:var(--u-ink2)!important}
+
+/* 11. Вертикальный ритм: 12 px между блоками (эталон не затронут) */
+html.ui2 .gradient-bg ~ .main > :is(.panel,.cards,.summary,.money-strip,.sumbar,.bigtabs,.toolbar,.warn,.twrap,.steps,.loss-line,.scope-bar,.pbar,.head-row,.first-card,.plan-bar,.prod-note,#tbl-wrap,#tblWrap,#catBar){margin-top:0;margin-bottom:12px}
+
+/* 12. Поля в одной строке одной высоты и формы */
+html.ui2 .gradient-bg ~ .main input#prod-search{height:36px;border-radius:12px}
+@media (min-width:761px){html.ui2 .toolbar input{height:32px}}
+html.ui2 .toolbar #search{border-radius:999px;padding:0 14px}
+html.ui2 .binp{height:40px}
+
+/* 13. Старые цвета на страницах base.html: синяя тень, бежевая рамка, красный и зелёный фон */
+html.ui2 .btn.primary{box-shadow:none}
+html.ui2{--red-bg:#ffe7e5;--red-line:rgba(240,68,58,.28);--amber-bg:#ffeed5;--amber-line:rgba(240,140,0,.28);--green-bg:#dcf2e2;--green-line:rgba(47,180,87,.25);--green-fill:#2fb457;--amber-fill:#f08c00}
+
+/* 14. Вход и подключение: окно как у первого запуска */
+html.ui2 .auth-card,html.ui2 .onb-card{border-radius:28px;box-shadow:inset 0 1px 0 rgba(255,255,255,.9),0 40px 100px rgba(46,46,96,.2)}
+html.ui2 .auth-card h1{font-size:26px}
+
+
+/* --- Судья приёмки: что не легло с первого раза и что сломали правки --- */
+html.ui2 .user-pop { background: #fff; }
+@media (min-width: 1361px) { html.ui2 .user-chip { max-width: 220px; } html.ui2 .sidebar { padding-right: 240px; } }
+@media (max-width: 560px) {
+  html.ui2 #rc-lines td[data-label]::before { text-transform: none; letter-spacing: 0; font-size: 12px; color: var(--u-ink2); }
+  html.ui2 #rc-save, html.ui2 #rc-close { border-radius: 999px; }
+}
+html.ui2 #btn-all { background: rgba(255, 255, 255, .75); color: var(--u-ink); border-color: var(--u-hair); }
+@media (max-width: 760px) { html.ui2 .gradient-bg ~ .main input.search, html.ui2 .scope-btn { height: 40px; } }
+@media (min-width: 761px) { html.ui2 #orders-wrap thead th:last-child { width: 300px !important; } }
+
+/* Печать: как было до нового вида. Панели и обои на бумаге не нужны. */
+@media print {
+  html.ui2 .gradient-bg, html.ui2 .sidebar { display: none; }
+  html.ui2 .shell .card, html.ui2 .embed-shell .card { border: none; box-shadow: none; border-radius: 0; background: #fff; }
+  html.ui2 .content { padding: 0; }
+  html.ui2 .card-head, html.ui2 .card-body { padding-left: 0; padding-right: 0; }
+}
