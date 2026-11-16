@@ -2228,9 +2228,14 @@
       planNote('<span class="warn">План не посчитан: '+esc(e.message)+'</span>');
     });
   }
-  function clearPlan(){
+  // Отмена ещё не пришедшего расчёта: его ответ отбрасывается, кнопка
+  // «Рассчитать» снова доступна (ревью #136: иначе она залипала).
+  function cancelPlanRequest(){
     PLAN_SEQ++; PLAN_PENDING=false;
     document.getElementById("pb-apply").disabled=false;
+  }
+  function clearPlan(){
+    cancelPlanRequest();
     PLAN=null; PB.budget=0; pbSave();
     clearPlanMarks();
     planNote("");
@@ -2549,7 +2554,7 @@
       // по оставшимся позициям значило бы предложить второй заказ на те же
       // деньги; полоса возвращается к «вся потребность».
       if(PLAN||PLAN_PENDING){
-        PLAN_SEQ++; clearPlanMarks(); PLAN=null; PLAN_PENDING=false; PB.budget=0; pbSave();
+        cancelPlanRequest(); clearPlanMarks(); PLAN=null; PB.budget=0; pbSave();
         document.getElementById("pb-budget").value="";
         planNote("Заказ оформлен по плану под бюджет. Чтобы собрать следующий, впишите новый бюджет.");
         pbSync();
