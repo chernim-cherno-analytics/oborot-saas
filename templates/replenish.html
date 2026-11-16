@@ -917,7 +917,9 @@
       delete DRAFTS[base];
       if(it){
         it._sizeNote="";
-        Object.keys(it._recs).forEach(function(sz){ it._recs[sz]=recOf(it,sz); });
+        // Под бюджетом «вернуть» значит вернуть план, а не полную потребность.
+        Object.keys(it._recs).forEach(function(sz){
+          it._recs[sz]=(it._planRecs&&hasKey(it._planRecs,sz))?it._planRecs[sz]:recOf(it,sz); });
         recalcNeed(it);
       }
       setDraftNote("Вернули расчёт");
@@ -2236,6 +2238,10 @@
   document.getElementById("pb-clear").addEventListener("click",function(){
     document.getElementById("pb-budget").value=""; clearPlan(); });
   document.getElementById("pb-budget").addEventListener("keydown",function(e){ if(e.key==="Enter") applyPlan(); });
+  // Под действующим планом смена «весь заказ / на сейчас» и лимита сразу
+  // пересчитывает его, как смена стратегии.
+  document.getElementById("pb-scope").addEventListener("change",function(){ if(PLAN||PLAN_PENDING) applyPlan(); });
+  document.getElementById("pb-cap").addEventListener("change",function(){ if(PLAN||PLAN_PENDING) applyPlan(); });
   document.getElementById("pb-budget").addEventListener("blur",function(){
     var n=pbNum(this.value); this.value=n?fmt(n):""; });
   document.querySelectorAll("#pb-strat button").forEach(function(b){
@@ -2537,6 +2543,15 @@
     }).then(function(){
       orderModal.classList.remove("open");
       btn.disabled=false;
+      // D-89: бюджет плана потрачен этим заказом. Пересчитывать тот же бюджет
+      // по оставшимся позициям значило бы предложить второй заказ на те же
+      // деньги; полоса возвращается к «вся потребность».
+      if(PLAN||PLAN_PENDING){
+        PLAN_SEQ++; clearPlanMarks(); PLAN=null; PLAN_PENDING=false; PB.budget=0; pbSave();
+        document.getElementById("pb-budget").value="";
+        planNote("Заказ оформлен по плану под бюджет. Чтобы собрать следующий, впишите новый бюджет.");
+        pbSync();
+      }
       return load();
     }).then(function(){
       if(created) announceCreated(created);

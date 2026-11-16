@@ -215,6 +215,27 @@ try:
               keep in note2 and all(c not in note2 for c in cats if c != keep), note2)
         check("в плане только позиции этой категории",
               in_plan and all(t.startswith(keep) for t in in_plan), str(in_plan[:3]))
+
+        print("\n6. Заказ по плану: бюджет потрачен, полоса не предлагает второй заказ на те же деньги")
+        planned_n = page.locator("#tbody tr[data-base]:not(.plan-out):not(.out-scope) input.row-check:checked").count()
+        page.click("#btn-create-order")
+        page.wait_for_selector("#order-modal.open", timeout=10000)
+        with page.expect_response(lambda r: r.request.method == "POST" and r.url.endswith("/api/orders")) as cr:
+            page.click("#btn-order-draft")
+        oid = cr.value.json().get("id")
+        page.wait_for_function("document.getElementById('pb-note').textContent.indexOf('Заказ оформлен')>=0",
+                               timeout=30000)
+        try:
+            page.wait_for_function("document.getElementById('seg-out-btn').style.display==='none'", timeout=30000)
+        except Exception:  # noqa: BLE001 — итог скажет проверка ниже
+            pass
+        check("после оформления бюджет снят, полоса говорит об этом",
+              page.input_value("#pb-budget") == "" and not page.is_visible("#seg-out-btn"),
+              f"budget={page.input_value('#pb-budget')!r} out={page.is_visible('#seg-out-btn')}")
+        saved = next(o for o in own.get("/api/orders").json()["orders"] if o["id"] == oid)
+        check("в черновике столько позиций, сколько было в плане", len(saved["items"]) == planned_n,
+              f"{len(saved['items'])} vs {planned_n}")
+        own.delete(f"/api/orders/{oid}")
         src = own.get("/assistant").text
         check("в мастере есть кнопка «Открыть в «Заказе»»", 'id="toTable"' in src)
         check("ошибок JS нет", not errs, str(errs[:3]))
