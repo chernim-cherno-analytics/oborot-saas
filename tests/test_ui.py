@@ -3439,7 +3439,13 @@ def _settings_compact_lists(browser, base: str) -> None:
     rep = cl.get("/api/replenish").json()
     # D-76: позиции «в минус» ушли из таблицы в «Не в рекомендации», но в
     # каталоге они есть и распределяются по каналам так же.
-    bases = sorted({it["base_name"] for it in rep.get("items", [])}
+    # 16.11: список берётся из всего каталога («Оборачиваемость»), а не из
+    # позиций с потребностью: их число зависит от даты демо-данных и от
+    # черновиков (D-85), а фикстуре нужно больше 40 моделей.
+    turn = cl.get("/api/turnover").json()
+    bases = sorted({it["base_name"] for it in (turn.get("items") or turn.get("rows") or [])
+                    if not it.get("archived")}
+                   | {it["base_name"] for it in rep.get("items", [])}
                    | {e["base_name"] for e in rep.get("excluded", []) if e.get("below_cost")})
     for b in bases[:25]:
         cl.post("/api/exclusions", json={"base_name": b, "excluded": True})
