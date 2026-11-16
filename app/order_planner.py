@@ -1146,8 +1146,9 @@ def plan_order(snap: dict, brief: dict, ctx: dict, stages: list[dict],
         # даты брались из rate_cover, и полоса покрытия противоречила подписи
         # строки в 17 случаях из 19.
         rate_now = c.get("rate_lead") or rate
-        days_now = int((c["cs"] + c["ordered"]) / rate_now) if rate_now > 0 else None
-        days_after = int((c["proj_stock"] + qty) / rate) if rate > 0 else None
+        # +1e-3 дня, как analytics._stockout_by_rate (QA 16.11: 8 дек. против 9 дек.).
+        days_now = int((c["cs"] + c["ordered"]) / rate_now + 1e-3) if rate_now > 0 else None
+        days_after = int((c["proj_stock"] + qty) / rate + 1e-3) if rate > 0 else None
         items.append({
             "base_name": c["base_name"],
             "category": c["category"],

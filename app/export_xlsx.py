@@ -397,7 +397,13 @@ def _production_subtitle(name: str, items: list[dict], data: dict, window_ru: st
     # говорит правду о том, что реально попало в лист.
     included = len(items)
     total_here = (data.get("selection_totals_by_production") or {}).get(name, included)
-    if data.get("selection_partial") and total_here != included:
+    if data.get("budget_plan") and total_here != included:
+        parts.append(
+            f"количества — как на {where}: план под бюджет. В лист входят позиции плана:"
+            f" {included} из {total_here} на вкладке, остальные в план не вошли, причины на листе"
+            f" «{_EXCLUDED_SHEET}»"
+        )
+    elif data.get("selection_partial") and total_here != included:
         parts.append(
             f"количества — как на {where}: с условиями производства и вашими правками"
             f" ростовки. В лист входят отмеченные позиции: {included} из {total_here}"
