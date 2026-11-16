@@ -271,11 +271,23 @@ try:
               biz["days"] == "60 дн." and biz["disc"] == "от 10 до 50 %" and "Китай" in biz["prod"]
               and biz["thr"] == f"{calc['weak']}/{calc['dull']}/{calc['good']}" and biz["best"] == f"от{calc['good']}", str(biz))
         check("у владельца каждая строка ведёт на свой вопрос первого запуска",
-              biz["links"] == ["/welcome#days", "/welcome#disc", "/welcome#prod", "/welcome#bar"] and biz["rerun"], str(biz["links"]))
-        page.click('#biz-rows a[href="/welcome#prod"]')
-        wait_step(page, "prod")
-        check("ссылка «Изменить» открывает первый запуск на нужном вопросе",
-              "шьёте" in page.evaluate("() => document.getElementById('w-title').textContent"))
+              biz["links"] == [f"/welcome?one=1#{k}" for k in ("days", "disc", "prod", "bar")] and biz["rerun"], str(biz["links"]))
+        page.click('#biz-rows a[href="/welcome?one=1#days"]')
+        wait_step(page, "days")
+        one = page.evaluate("""() => ({title: document.getElementById('w-title').textContent, next: document.getElementById('w-next').textContent,
+          back: getComputedStyle(document.getElementById('w-back')).visibility, dots: document.querySelectorAll('#w-dots i').length,
+          later: getComputedStyle(document.getElementById('w-later')).visibility})""")
+        check("«Изменить» открывает один вопрос: кнопка «Сохранить», без «Назад», точек и строки про настройки",
+              "дней" in one["title"] and one["next"] == "Сохранить" and one["back"] == "hidden" and one["dots"] == 0
+              and one["later"] == "hidden", str(one))
+        page.click('#d-tiles .tile[data-d="90"]')
+        with page.expect_navigation(url=lambda u: "/welcome" not in u, timeout=30000):
+            page.click("#w-next")
+        page.wait_for_function("() => { const e = document.getElementById('biz-days'); return e && /\\d/.test(e.textContent); }", timeout=20000)
+        check("после «Сохранить» человек снова в настройках и видит новое значение",
+              page.url.rstrip("/").endswith("/settings")
+              and page.evaluate("() => document.getElementById('biz-days').textContent.trim()") == "90 дн."
+              and own.get("/api/discount-rule").json()["rule"]["overstock_days"] == 90, page.url)
         ctx.close()
 
         print("\n6. Участник без права на настройки и телефон")

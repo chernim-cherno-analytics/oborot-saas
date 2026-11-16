@@ -201,6 +201,45 @@ html.ui2 .gradient-bg ~ * .modal, html.ui2 .gradient-bg ~ .modal {
 }
 html.ui2 .ctip { border-radius: 10px; background: rgba(29, 29, 31, .92); }
 
+/* ---- Полировка по обходу критиков 16.11 (самостоятельные страницы) ---- */
+
+/* Второстепенные кнопки не синие: на экране одна главная. */
+html.ui2 .go-btn.ghost, html.ui2 .go-btn.sec {
+  background: rgba(255, 255, 255, .75); color: var(--u-ink); border: 1px solid var(--u-hair);
+}
+html.ui2 .go-btn.ghost:hover, html.ui2 .go-btn.sec:hover { background: #fff; border-color: var(--u-hair); }
+
+/* Ссылки в тексте панелей: цвет акцента, а не браузерный синий. */
+html.ui2 .gradient-bg ~ .main .panel a:not([class]), html.ui2 .gradient-bg ~ .main .warn a,
+html.ui2 .gradient-bg ~ .main .hint a, html.ui2 .gradient-bg ~ .main .datafacts a,
+html.ui2 .gradient-bg ~ .main details.note a { color: var(--u-accent); text-decoration: none; }
+html.ui2 .gradient-bg ~ .main .panel a:not([class]):hover, html.ui2 .gradient-bg ~ .main .hint a:hover { text-decoration: underline; }
+
+/* Шаги мастера: пройти по клику нельзя, значит и выглядеть кнопкой не должны. */
+html.ui2 .stp:not(.on) { cursor: default; box-shadow: none; background: rgba(255, 255, 255, .5); }
+html.ui2 .tile .d { font-size: 12.5px; color: var(--u-ink2); }
+
+/* «Активный сток»: процент в полоске запаса читается на любом фоне. */
+html.ui2 .zbar { border-radius: 999px; background: rgba(120, 120, 128, .16); height: 18px; }
+html.ui2 .zbar .zfill { opacity: .38; }
+html.ui2 .zbar .ztxt { color: var(--u-ink) !important; font-size: 11px; }
+
+/* Мелкие бледные пояснения до принятого вторичного текста. */
+html.ui2 .psub, html.ui2 .note-inline, html.ui2 #seg-basis, html.ui2 .lesson .pg {
+  font-size: 12.5px; color: var(--u-ink2);
+}
+html.ui2 .table-outer thead th, html.ui2 .twrap thead th { font-size: 11.5px; }
+html.ui2 .twrap thead th { text-transform: none; letter-spacing: 0; color: var(--u-ink2); background: rgba(255, 255, 255, .97); }
+
+/* «Заказ»: залипшие первые колонки того же тона, что вся строка. */
+html.ui2 #tbl-wrap thead th:nth-child(1), html.ui2 #tbl-wrap thead th:nth-child(2), html.ui2 #tbl-wrap thead th:nth-child(3) { background: #fff; }
+html.ui2 #tbl-wrap tbody td:nth-child(1), html.ui2 #tbl-wrap tbody td:nth-child(2), html.ui2 #tbl-wrap tbody td.name { background: #fff; }
+html.ui2 #tbl-wrap .rg2 td:nth-child(1), html.ui2 #tbl-wrap .rg2 td:nth-child(2), html.ui2 #tbl-wrap .rg2 td.name { background: var(--u-row-best); }
+html.ui2 #tbl-wrap .rg1 td:nth-child(1), html.ui2 #tbl-wrap .rg1 td:nth-child(2), html.ui2 #tbl-wrap .rg1 td.name { background: var(--u-row-good); }
+html.ui2 #tbl-wrap .ro td:nth-child(1), html.ui2 #tbl-wrap .ro td:nth-child(2), html.ui2 #tbl-wrap .ro td.name { background: var(--u-row-slow); }
+html.ui2 #tbl-wrap .rr td:nth-child(1), html.ui2 #tbl-wrap .rr td:nth-child(2), html.ui2 #tbl-wrap .rr td.name { background: var(--u-row-out); }
+html.ui2 #tbl-wrap tfoot td { background: var(--u-row-mute); font-size: 12px; }
+
 /* Полоса синхронизации (_hints.html) липнет к верху окна. Верх теперь занят
    панелью, поэтому полоса липнет под ней: иначе при прокрутке «Повторить»
    оказывалось под панелью (ревью #137). */
@@ -321,6 +360,15 @@ html.ui2 .btn:hover { background: rgba(120, 120, 128, .1); }
 html.ui2 .btn.primary { border-color: var(--u-accent); }
 html.ui2 .btn.primary:hover { background: var(--blue-hover); }
 html.ui2 .input, html.ui2 select.input, html.ui2 textarea.input { border-radius: 12px; }
+/* Числа в полях системным шрифтом, а не моноширинным. */
+html.ui2 { --mono: var(--u-font); }
+html.ui2 .input { font-variant-numeric: tabular-nums; }
+/* Точки групп в «Настройках» тех же тонов, что строки таблицы. */
+html.ui2 .dot.weak { background: #ff9d95; }
+html.ui2 .dot.dull { background: #ffc978; }
+html.ui2 .dot.good { background: #8fd3a4; }
+html.ui2 .dot.best { background: #b9dc4e; }
+html.ui2 .auth-card .btn.primary { min-height: 40px; font-size: 14px; }
 html.ui2 .shell .seg { border-radius: 12px; background: rgba(120, 120, 128, .12); }
 html.ui2 .shell .seg button { border-radius: 10px; }
 html.ui2 .input:focus, html.ui2 select.input:focus, html.ui2 textarea.input:focus {
