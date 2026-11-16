@@ -90,6 +90,9 @@ _PAGE_JS = """() => {
   const bar = document.querySelector('.header.app-top') || document.querySelector('.sidebar');
   const nav = document.getElementById('app-nav') || document.getElementById('side-nav');
   const links = nav ? [...nav.querySelectorAll('a')].filter(shown) : [];
+  // Ссылка считается нажимаемой, если в её центре лежит она сама, а не что-то поверх.
+  const hitOk = a => { const r = a.getBoundingClientRect(); const t = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+    return !!t && (t === a || a.contains(t)); };
   const cs = bar ? getComputedStyle(bar) : null;
   const sheets = [...document.styleSheets].map(s => s.href || '');
   const main = document.querySelector('.gradient-bg ~ .main');
@@ -101,7 +104,7 @@ _PAGE_JS = """() => {
           sw: document.documentElement.scrollWidth, iw: innerWidth,
           bar: bar ? box(bar) : null, glass: cs ? (cs.backdropFilter || cs.webkitBackdropFilter || '') : '',
           barBg: cs ? cs.backgroundColor : '',
-          links: links.map(a => ({t: Math.round(box(a).t), l: box(a).l, r: box(a).r, b: box(a).b, active: a.classList.contains('active')})),
+          links: links.map(a => ({t: Math.round(box(a).t), l: box(a).l, r: box(a).r, b: box(a).b, active: a.classList.contains('active'), hit: hitOk(a)})),
           chip: shown(chip) ? box(chip) : null, upper, bodyBg: getComputedStyle(document.body).backgroundColor,
           sideSync: !!document.getElementById('side-sync'), sideNav: !!document.getElementById('side-nav')};
 }"""
@@ -142,8 +145,9 @@ try:
                   bool(bar) and bar["t"] < 30 and bar["h"] < 80 and bar["w"] > 1200 and "blur" in m["glass"],
                   f"{bar} {m['glass']}")
             tops = {ln["t"] for ln in m["links"]}
-            check(f"{path}: все {NAV_COUNT} разделов видны в одну строку",
-                  len(m["links"]) == NAV_COUNT and max(tops) - min(tops) <= 6, f"{len(m['links'])} {sorted(tops)}")
+            check(f"{path}: все {NAV_COUNT} разделов видны в одну строку и нажимаются",
+                  len(m["links"]) == NAV_COUNT and max(tops) - min(tops) <= 6 and all(ln["hit"] for ln in m["links"]),
+                  f"{len(m['links'])} {sorted(tops)} hit={sum(1 for ln in m['links'] if ln['hit'])}")
             if path not in ("/account", "/team", "/plans"):
                 check(f"{path}: текущий раздел отмечен один", sum(1 for ln in m["links"] if ln["active"]) == 1)
             chip = m["chip"]
@@ -211,6 +215,13 @@ try:
           return {ui2: document.documentElement.classList.contains('ui2'), card: !!r && r.width > 200,
                   form: !!document.querySelector('form input[type="password"]'), sw: document.documentElement.scrollWidth}; }""")
         check("вход: карточка и форма на месте, страница в новом виде", lg["ui2"] and lg["card"] and lg["form"] and lg["sw"] <= 1440, str(lg))
+        # Ревью #137: содержимое вне карточки (логотип, строка под ней) лежало под обоями.
+        top = page.evaluate("""() => { const hit = sel => { const e = document.querySelector(sel); if (!e) return null;
+            const r = e.getBoundingClientRect(); const t = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+            return !!t && (t === e || e.contains(t) || t.contains(e)) && !t.classList.contains('gradient-bg'); };
+          return {logo: hit('.auth-logo .logo-text'), card: hit('.auth-card h1'), link: hit('.auth-card a, .auth-note a')}; }""")
+        check("вход: логотип, карточка и ссылки лежат поверх обоев и нажимаются",
+              top["logo"] is True and top["card"] is True and top["link"] is not False, str(top))
         ctx.close()
         ctx = b.new_context(viewport={"width": 1200, "height": 800})
         ctx.add_cookies(cookies(own))

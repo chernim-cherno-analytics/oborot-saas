@@ -671,7 +671,7 @@
   var items=[], excluded=[];
   var state={ query:"", cat:"", band:"" };
   var openRows={};
-  var HORIZON=90, LEAD_TIME=45, RATE_WINDOW="year", SEASON_FROM=null, SEASON_TO=null;
+  var HORIZON=90, LEAD_TIME=45, RATE_WINDOW="year", SEASON_FROM=null, SEASON_TO=null, OVERHEAD_PCT=0;
   var RATE_WINDOW_LABEL="темп за год", FALLBACK_COUNT=0, DEFAULT_LEAD=45;
   var WINDOW_COVERED=true, NO_HISTORY_COUNT=0;
   var SENT_ORDERS=[];
@@ -728,6 +728,7 @@
   function applyData(d){
     HORIZON=d.horizon_days||90;
     LEAD_TIME=d.lead_time_days||45;
+    OVERHEAD_PCT=+d.overhead_pct||0;
     RATE_WINDOW=d.rate_window||"year";
     RATE_WINDOW_LABEL=d.rate_window_label||"темп за год";
     WINDOW_COVERED=(d.window_covered===undefined)?true:!!d.window_covered;
@@ -1799,7 +1800,9 @@
     return '<p class="formula">Расчёт (окно темпа: '+winTxt+seas+'): '+fmtNum(rc,2)+' шт/день × '+fmt(hz)+
       ' дн'+hzNote+' ≈ '+fmtNum(rc*hz,1)+' − прогнозный остаток к приходу '+fmt(proj)+
       ' (остаток '+fmt(it.cs)+' минус продажи за '+fmt(lead)+' дн производства по '+fmtNum(rl,2)+' шт/день, плюс едет '+fmt(it.ordered||0)+')'+
-      ' = <b>'+fmt(it.need_raw!==undefined?it.need_raw:it.need)+' шт</b>.'+leadNote+moq+manual+
+      (it.in_drafts
+        ? ' = '+fmt(it.need_before_drafts)+', минус уже в черновике заказа '+fmt(it.in_drafts)+' = <b>'+fmt(it.need_raw!==undefined?it.need_raw:it.need)+' шт</b>.'
+        : ' = <b>'+fmt(it.need_raw!==undefined?it.need_raw:it.need)+' шт</b>.')+leadNote+moq+manual+
       ' Темпы: год '+fmtNum(it.rate_year,2)+' · 90 дн '+fmtNum(it.rate_90,2)+
       ' · сезон '+fmtNum(it.rate_season,2)+'.'+gap+'</p>';
   }
@@ -1868,7 +1871,8 @@
         '<td class="name">'+esc(it.base_name)+
           (it.low_data?' <span style="font-size:9px;font-weight:700;padding:1px 6px;border-radius:8px;background:rgba(31,31,31,.08);color:rgba(31,31,31,.55)" title="Мало данных — темп оценочный, проверьте количество вручную">мало данных</span>':"")+
           (it.below_cost?' <span class="losstag" title="Средняя цена продажи ниже себестоимости: каждая проданная штука уменьшает деньги. Количество система не меняет, решение за вами">в минус'+(it.loss_unit?(' '+fmt(it.loss_unit)+' ₽/шт'):'')+'</span>':"")+
-          '<span class="csub">'+esc(it.category||"")+'</span></td>'+
+          '<span class="csub">'+esc(it.category||"")+
+          (it.in_drafts?' · в черновике заказа '+fmt(it.in_drafts)+' шт, вычтено':"")+'</span></td>'+
         '<td>'+stBadge(it.wos)+'</td>'+
         '<td class="nb">'+fmt(it.turnover)+'</td>'+
         '<td class="nb muted">'+rateCell(it)+'</td>'+
@@ -2047,9 +2051,11 @@
       : "категории заказа не выбраны";
     document.getElementById("s-qty").textContent=fmt(qty);
     document.getElementById("s-cost").textContent=fmtMoneyShort(cost);
+    // D-88: себестоимость с накладными из настроек, как в мастере и «Бюджете».
+    var ohTxt=(OVERHEAD_PCT>0)?(" (с накладными "+fmtNum(OVERHEAD_PCT,0)+" %)"):"";
     document.getElementById("s-cost-sub").textContent = noCost
       ? "СУММА НЕПОЛНАЯ: "+fmt(noCost)+" поз. ("+fmt(noCostQty)+" шт) без себестоимости"
-      : "затраты на производство заказа";
+      : "затраты на производство заказа"+ohTxt;
     document.getElementById("s-cost-sub").style.color = noCost ? "#a00003" : "";
     document.getElementById("s-rev").textContent=fmtMoneyShort(rev);
     document.getElementById("s-rev-sub").textContent=cost>0?("×"+fmtNum(rev/cost,1)+" к себестоимости"):"при продаже по средней цене";

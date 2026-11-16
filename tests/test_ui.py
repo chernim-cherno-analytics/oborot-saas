@@ -3444,7 +3444,7 @@ def _settings_compact_lists(browser, base: str) -> None:
                         (SPECIAL_S if i == len(left) - 1 else f"Поставщик {i + 1:02d}", org_id, b))
     src = cl.get("/api/productions/assign-sources").json()
     sup_values = [v["value"] for v in (src.get("sources") or {}).get("supplier", {}).get("values", [])]
-    check("настройки: синтетика — 12 производств, 25 исключённых, у каждой позиции свой поставщик",
+    check("настройки: синтетика — 12 производств, больше 20 исключённых, у каждой позиции свой поставщик",
           len(all_prods) == 12 and len(excl) >= n_excl and SPECIAL_S in sup_values and len(sup_values) == len(left)
           and len(left) > 15, f"prods={len(all_prods)} excl={len(excl)} sup={len(sup_values)}/{len(left)}")
     cookies = [{"name": k, "value": v, "domain": "127.0.0.1", "path": "/"} for k, v in cl.cookies.items()]
@@ -4261,13 +4261,13 @@ def _browser_journey(browser, base: str, shots: list) -> None:  # noqa: C901
     _shot(page, adir, shots, "01-onboarding-1400")
 
     print("\n== Путь в браузере: демо-данные кнопкой ==")
-    # UI2-4 (D-85): подключение открывается окном-приветствием, источник
+    # UI2-4 (D-90): подключение открывается окном-приветствием, источник
     # данных выбирается после «Начать».
     _click_through_hint(page, "#btn-hello")
     page.wait_for_selector("#btn-connect-demo", state="visible", timeout=10000)
     with page.expect_navigation(url=lambda u: "/onboarding" not in u, timeout=60000):
         _click_through_hint(page, "#btn-connect-demo")
-    # UI2-4 (D-85): после подключения человек отвечает на четыре вопроса
+    # UI2-4 (D-90): после подключения человек отвечает на четыре вопроса
     # первого запуска и только потом попадает в таблицу.
     check("после демо-подключения продукт увёл на первый запуск",
           page.url.split("#")[0].rstrip("/").endswith("/welcome"), page.url)

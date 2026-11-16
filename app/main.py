@@ -1537,7 +1537,7 @@ def onboarding_page(request: Request, db: Session = Depends(get_db)):
 
 @app.get("/welcome", response_class=HTMLResponse)
 def welcome_page(request: Request, db: Session = Depends(get_db)):
-    """Первый запуск (UI2-4, D-85): четыре вопроса, по одному на окно.
+    """Первый запуск (UI2-4, D-90): четыре вопроса, по одному на окно.
 
     Сюда приводит подключение данных (`onboarding.html`) и пункт «Первый
     запуск заново» в меню «?». Страница только читает и пишет существующие
