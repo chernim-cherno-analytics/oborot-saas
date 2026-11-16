@@ -1099,6 +1099,14 @@
     <span>Показывать подсказки</span>
     <span class="hm-sw" aria-hidden="true"><i></i></span>
   </button>
+  {# UI2-4: вопросы первого запуска можно пройти ещё раз. Только тому, кто
+     вправе менять настройки: остальных маршрут всё равно уведёт обратно. #}
+  {% if perms is defined and 'settings' in perms %}
+  <a class="hmi" role="menuitem" href="/welcome" id="hm-first">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 4v5h5"/></svg>
+    <span>Первый запуск заново</span>
+  </a>
+  {% endif %}
   <a class="hmi" role="menuitem" href="/lessons" id="hm-all">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7h18M3 12h18M3 17h11"/></svg>
     <span>Все уроки</span><span class="hm-cnt" id="hm-cnt"></span>

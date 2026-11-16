@@ -1,0 +1,433 @@
+<!DOCTYPE html>
+<html lang="ru" class="ui2">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Первый запуск | Оборот</title>
+{# UI2-4 (D-84, D-85): первый запуск. Одно окно, один вопрос, мягкая смена.
+   Страница ничего не считает сама для расчётов: каждый ответ уходит в уже
+   существующую настройку организации тем же API, что и «Настройки»:
+     срок      → overstock_days правила скидок (норма запаса «Оборачиваемости»);
+     скидки    → проценты правила скидок (POST /api/discount-rule);
+     где шьёте → производства (POST /api/productions[/id]);
+     планка    → пороги классов (POST /api/settings, thresholds).
+   Ответ сохраняется только если человек его менял: открыть первый запуск
+   повторно и пролистать ничего не перезаписывает. Формул здесь нет (D-35):
+   среднее по каталогу и ×1,5 показываются как справка к полям порогов. #}
+<link rel="stylesheet" href="/static/ui2.css?v=2">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body { min-height: 100vh; }
+  .stage { position: relative; z-index: 2; min-height: 100vh; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; padding: 28px 16px 40px; }
+  .win { width: 100%; max-width: 580px; border-radius: 28px; padding: 34px 36px 26px;
+    background: var(--u-glass-hi); border: 1px solid rgba(255,255,255,.85);
+    -webkit-backdrop-filter: blur(34px) saturate(180%); backdrop-filter: blur(34px) saturate(180%);
+    box-shadow: inset 0 1px 0 rgba(255,255,255,.9), 0 40px 100px rgba(46,46,96,.2); }
+  .pane { transition: opacity .3s var(--u-ease), filter .3s var(--u-ease), transform .3s var(--u-ease); }
+  .pane.out { opacity: 0; filter: blur(6px); transform: translateY(6px); }
+  .pane[hidden] { display: none; }
+  h1 { font-size: 26px; line-height: 1.2; font-weight: 700; letter-spacing: -.02em; color: var(--u-ink); }
+  .sub { margin-top: 10px; font-size: 15px; line-height: 1.5; color: var(--u-ink2); max-width: 46ch; }
+  .body { margin-top: 24px; }
+  .foot { margin-top: 28px; display: flex; align-items: center; gap: 12px; }
+  .foot .sp { flex: 1 1 auto; }
+  .later { font-size: 12.5px; color: var(--u-ink2); }
+  .btn { height: 40px; padding: 0 20px; border-radius: 999px; border: 1px solid var(--u-hair); cursor: pointer;
+    background: rgba(255,255,255,.75); color: var(--u-ink); font-size: 14px; font-weight: 600; }
+  .btn:hover { background: #fff; }
+  .btn.pri { background: var(--u-accent); border-color: var(--u-accent); color: #fff; }
+  .btn.pri:hover { background: #0857b8; }
+  .btn.ghost { background: transparent; border-color: transparent; color: var(--u-accent); padding: 0 10px; }
+  .btn:disabled { opacity: .5; cursor: default; }
+  .dots { display: flex; gap: 6px; justify-content: center; margin-top: 18px; }
+  .dots i { width: 6px; height: 6px; border-radius: 50%; background: rgba(29,29,31,.18); transition: background .3s, width .3s; }
+  .dots i.on { width: 18px; border-radius: 3px; background: var(--u-ink); }
+  .err { margin-top: 14px; font-size: 13px; line-height: 1.45; color: #a3221a; min-height: 0; }
+  .err:empty { display: none; }
+
+  /* срок */
+  .tiles { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+  .tile { height: 78px; border-radius: 18px; border: 1px solid var(--u-hair); background: rgba(255,255,255,.7);
+    cursor: pointer; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px;
+    color: var(--u-ink); font-family: inherit; }
+  .tile b { font-size: 24px; font-weight: 700; letter-spacing: -.02em; }
+  .tile span { font-size: 12px; color: var(--u-ink2); }
+  .tile:hover { background: #fff; }
+  .tile.on { background: #fff; border-color: var(--u-accent); box-shadow: 0 0 0 3px var(--u-accent-soft); }
+  .own { margin-top: 14px; display: flex; align-items: center; gap: 12px; }
+  .own label { font-size: 13px; color: var(--u-ink2); white-space: nowrap; }
+  .own input[type=range] { flex: 1 1 auto; accent-color: var(--u-accent); }
+  .num { width: 76px; height: 38px; border-radius: 12px; border: 1px solid var(--u-hair); background: #fff;
+    text-align: center; font-size: 15px; font-weight: 600; color: var(--u-ink); }
+  .num:focus, .txt:focus { outline: none; border-color: var(--u-accent); box-shadow: 0 0 0 3px var(--u-accent-soft); }
+
+  /* скидки */
+  .pair { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .fld { border-radius: 18px; border: 1px solid var(--u-hair); background: rgba(255,255,255,.7); padding: 12px 16px; }
+  .fld label { display: block; font-size: 12.5px; color: var(--u-ink2); margin-bottom: 6px; }
+  .fld .row { display: flex; align-items: baseline; gap: 6px; }
+  .fld .num { width: 84px; font-size: 22px; height: 44px; }
+  .fld .u { font-size: 16px; color: var(--u-ink2); }
+  .scale { margin-top: 16px; display: grid; grid-template-columns: 1.3fr 1fr 1fr; gap: 6px 10px; font-size: 13px; }
+  .scale .h { font-size: 12px; color: var(--u-ink2); }
+  .scale .v { font-weight: 600; font-variant-numeric: tabular-nums; }
+  .scale .z { color: var(--u-ink3); font-weight: 500; }
+
+  /* где шьёте */
+  .plist { display: flex; flex-direction: column; gap: 8px; }
+  .prow { display: flex; align-items: center; gap: 8px; }
+  .txt { flex: 1 1 auto; min-width: 0; height: 42px; border-radius: 12px; border: 1px solid var(--u-hair); background: #fff;
+    padding: 0 14px; font-size: 14px; color: var(--u-ink); }
+  .prow .num { width: 70px; height: 42px; }
+  .prow .d { font-size: 12.5px; color: var(--u-ink2); white-space: nowrap; }
+  .addp { margin-top: 10px; }
+
+  /* планка */
+  .fact { border-radius: 18px; background: rgba(255,255,255,.7); border: 1px solid var(--u-hair); padding: 14px 16px;
+    font-size: 14px; line-height: 1.5; color: var(--u-ink2); }
+  .fact b { color: var(--u-ink); font-variant-numeric: tabular-nums; }
+  .grp { margin-top: 14px; display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+  .g { border-radius: 16px; padding: 10px 12px 12px; min-height: 92px; }
+  .g .n { font-size: 13px; font-weight: 600; }
+  .g .r { margin-top: 4px; font-size: 12px; color: var(--u-ink2); }
+  .g .num { margin-top: 8px; width: 100%; height: 36px; font-size: 14px; }
+  .g.weak { background: var(--u-row-out); } .g.dull { background: var(--u-row-slow); }
+  .g.good { background: var(--u-row-good); } .g.best { background: var(--u-row-best); }
+  .g .top { margin-top: 8px; height: 36px; display: flex; align-items: center; font-size: 13px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  details.how { margin-top: 12px; font-size: 13px; color: var(--u-ink2); line-height: 1.55; }
+  details.how summary { cursor: pointer; color: var(--u-accent); font-weight: 600; list-style: none; }
+  details.how summary::-webkit-details-marker { display: none; }
+  details.how ol { margin: 8px 0 0 18px; }
+  .wait { display: flex; align-items: center; gap: 12px; font-size: 14px; color: var(--u-ink2); }
+  .spin { width: 18px; height: 18px; border-radius: 50%; border: 2px solid rgba(29,29,31,.15); border-top-color: var(--u-accent);
+    animation: spin .9s linear infinite; flex: 0 0 auto; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .sync { margin-top: 16px; font-size: 12.5px; color: var(--u-ink2); min-height: 18px; text-align: center; }
+
+  @media (max-width: 560px) {
+    .win { padding: 26px 20px 20px; border-radius: 24px; }
+    h1 { font-size: 22px; }
+    .tiles { grid-template-columns: repeat(2, 1fr); }
+    .grp { grid-template-columns: repeat(2, 1fr); }
+    .foot { flex-wrap: wrap; }
+    .later { flex: 1 1 100%; order: 3; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .pane { transition: none; } .spin { animation-duration: 2.4s; }
+  }
+</style>
+</head>
+<body>
+<div class="gradient-bg" aria-hidden="true"></div>
+<main class="stage">
+  <div class="win" id="win" role="group" aria-labelledby="w-title">
+    <div class="pane" id="pane">
+      <h1 id="w-title" tabindex="-1"></h1>
+      <p class="sub" id="w-sub"></p>
+      <div class="body" id="w-body"></div>
+      <div class="err" id="w-err" role="alert"></div>
+      <div class="foot">
+        <button class="btn ghost" type="button" id="w-back">Назад</button>
+        <span class="later" id="w-later">Это можно поменять в настройках</span>
+        <span class="sp"></span>
+        <button class="btn pri" type="button" id="w-next">Дальше</button>
+      </div>
+    </div>
+  </div>
+  <div class="dots" id="w-dots" aria-hidden="true"></div>
+  <div class="sync" id="w-sync" role="status"></div>
+</main>
+
+<script>
+(function(){
+  "use strict";
+  var $ = function(id){ return document.getElementById(id); };
+  var pane = $("pane"), title = $("w-title"), sub = $("w-sub"), body = $("w-body"), errEl = $("w-err"),
+      back = $("w-back"), next = $("w-next"), later = $("w-later"), dots = $("w-dots"), syncEl = $("w-sync");
+  function api(url, opt){
+    opt = opt || {};
+    var init = {method: opt.method || "GET", credentials: "same-origin", headers: {"X-Oborot-CSRF": "1"}};
+    if (opt.body !== undefined) { init.headers["Content-Type"] = "application/json"; init.body = JSON.stringify(opt.body); }
+    return fetch(url, init).then(function(r){
+      return r.json().catch(function(){ return {}; }).then(function(d){
+        if (!r.ok) { var e = new Error(typeof d.detail === "string" ? d.detail : "Не получилось сохранить. Попробуйте ещё раз."); e.status = r.status; throw e; }
+        return d;
+      });
+    });
+  }
+  function fmt(n){ return Math.round(n).toLocaleString("ru-RU").replace(/ | /g, " "); }
+  function esc(s){ return String(s == null ? "" : s).replace(/[&<>"']/g, function(c){ return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]; }); }
+  function clamp(v, lo, hi){ v = parseInt(v, 10); if (isNaN(v)) v = lo; return Math.min(hi, Math.max(lo, v)); }
+  function round5(v){ return Math.round(v / 5) * 5; }
+
+  /* ---- состояние ---- */
+  var S = {rule: null, rule0: null, prods: [], prods0: {}, thr: null, thr0: null, calc: null, loaded: false};
+
+  /* Ступени скидок между «от» и «до»: семь ненулевых ячеек правила,
+     равный шаг, округление до 5 %. Ячейка «новинка без затоварки» в
+     правиле не хранится: новинке без затоварки скидка не ставится. */
+  var CELLS = ["new_pct", "top_pct", "top_over_pct", "mid_pct", "mid_over_pct", "weak_pct", "weak_over_pct"];
+  function ladder(lo, hi){
+    var out = {};
+    CELLS.forEach(function(k, i){ out[k] = round5(lo + (hi - lo) * i / (CELLS.length - 1)); });
+    out.new_pct = lo; out.weak_over_pct = hi;
+    return out;
+  }
+  function ruleBounds(r){
+    var vs = CELLS.map(function(k){ return r[k]; }).filter(function(v){ return v > 0; });
+    return vs.length ? [Math.min.apply(null, vs), Math.max.apply(null, vs)] : [10, 50];
+  }
+
+  /* ---- шаги ---- */
+  var STEPS = [
+    {k: "days", t: "На сколько дней должен хватать товар?",
+     s: "От этого срока считаем запас и нехватку по каждой вещи.",
+     draw: function(){
+       var d = S.rule.overstock_days, presets = [30, 60, 90, 120];
+       body.innerHTML = '<div class="tiles" id="d-tiles">' + presets.map(function(p){
+           return '<button type="button" class="tile' + (p === d ? " on" : "") + '" data-d="' + p + '"><b>' + p + '</b><span>дней</span></button>';
+         }).join("") + '</div>' +
+         '<div class="own"><label for="d-range">Свой срок</label>' +
+         '<input type="range" id="d-range" min="7" max="365" step="1" value="' + d + '">' +
+         '<input class="num" id="d-num" type="number" min="7" max="365" inputmode="numeric" value="' + d + '" aria-label="Срок в днях"></div>';
+       function set(v, from){
+         v = clamp(v, 7, 365); S.rule.overstock_days = v;
+         if (from !== "range") $("d-range").value = v;
+         if (from !== "num") $("d-num").value = v;
+         [].forEach.call(document.querySelectorAll("#d-tiles .tile"), function(t){ t.classList.toggle("on", +t.getAttribute("data-d") === v); });
+       }
+       $("d-tiles").addEventListener("click", function(e){ var t = e.target.closest(".tile"); if (t) set(t.getAttribute("data-d")); });
+       $("d-range").addEventListener("input", function(){ set(this.value, "range"); });
+       $("d-num").addEventListener("change", function(){ set(this.value); });
+     },
+     save: saveRule},
+
+    {k: "disc", t: "Какие скидки вы готовы давать?",
+     s: "Назовите самую маленькую и самую большую. Ступени между ними расставим сами, с шагом 5 %.",
+     draw: function(){
+       var b = S.bounds || ruleBounds(S.rule);
+       body.innerHTML = '<div class="pair">' +
+         '<div class="fld"><label for="k-lo">Самая маленькая</label><div class="row"><input class="num" id="k-lo" type="number" min="5" max="90" step="5" inputmode="numeric" value="' + b[0] + '"><span class="u">%</span></div></div>' +
+         '<div class="fld"><label for="k-hi">Самая большая</label><div class="row"><input class="num" id="k-hi" type="number" min="10" max="95" step="5" inputmode="numeric" value="' + b[1] + '"><span class="u">%</span></div></div>' +
+         '</div><div class="scale" id="k-scale"></div>';
+       function paint(){
+         var r = S.rule, cell = function(v){ return v > 0 ? '<span class="v">' + v + ' %</span>' : '<span class="v z">без скидки</span>'; };
+         $("k-scale").innerHTML = '<span class="h">Вещь</span><span class="h">Запас в норме</span><span class="h">Лежит дольше ' + r.overstock_days + ' дн.</span>' +
+           '<span>Новинка</span>' + cell(0) + cell(r.new_pct) +
+           '<span>Продаётся хорошо</span>' + cell(r.top_pct) + cell(r.top_over_pct) +
+           '<span>Продаётся средне</span>' + cell(r.mid_pct) + cell(r.mid_over_pct) +
+           '<span>Продаётся слабо</span>' + cell(r.weak_pct) + cell(r.weak_over_pct);
+       }
+       function change(){
+         var lo = round5(clamp($("k-lo").value, 5, 90)), hi = round5(clamp($("k-hi").value, 10, 95));
+         if (hi <= lo) hi = Math.min(95, lo + 5);
+         if (hi <= lo) lo = hi - 5;
+         $("k-lo").value = lo; $("k-hi").value = hi; S.bounds = [lo, hi];
+         var l = ladder(lo, hi); for (var k in l) S.rule[k] = l[k];
+         paint();
+       }
+       $("k-lo").addEventListener("change", change); $("k-hi").addEventListener("change", change);
+       paint();
+     },
+     save: saveRule},
+
+    {k: "prod", t: "Где вы шьёте?",
+     s: "Если заказы уходят на разные производства, заведите группу для каждого: заказ будет собираться по ним отдельно. Одно производство тоже нормально.",
+     draw: function(){
+       function row(p, i){
+         return '<div class="prow" data-i="' + i + '"><input class="txt" type="text" maxlength="120" value="' + esc(p.name) +
+           '" aria-label="Название производства" placeholder="Например, Китай">' +
+           '<input class="num" type="number" min="1" max="365" inputmode="numeric" value="' + (p.lead_time_days || "") +
+           '" placeholder="' + (S.defLead || 45) + '" aria-label="Срок производства, дней"><span class="d">дней шьют</span></div>';
+       }
+       body.innerHTML = '<div class="plist" id="p-list">' + S.prods.map(row).join("") + '</div>' +
+         '<button class="btn addp" type="button" id="p-add">Добавить производство</button>';
+       function read(){
+         [].forEach.call(document.querySelectorAll("#p-list .prow"), function(r){
+           var p = S.prods[+r.getAttribute("data-i")], v = r.querySelector(".num").value;
+           p.name = r.querySelector(".txt").value; p.lead_time_days = v === "" ? null : clamp(v, 1, 365);
+         });
+       }
+       $("p-list").addEventListener("change", read);
+       $("p-add").addEventListener("click", function(){
+         read(); S.prods.push({id: null, name: "", lead_time_days: null});
+         $("p-list").insertAdjacentHTML("beforeend", row(S.prods[S.prods.length - 1], S.prods.length - 1));
+         var ins = document.querySelectorAll("#p-list .txt"); ins[ins.length - 1].focus();
+       });
+       this.read = read;
+     },
+     save: function(){
+       this.read();
+       var jobs = [];
+       S.prods = S.prods.filter(function(p){ return p.id || p.name.trim(); });
+       S.prods.forEach(function(p){
+         var name = p.name.trim(), was = p.id ? S.prods0[p.id] : null;
+         if (!name) { if (was) p.name = was.name; return; }
+         // Срок уходит на сервер только когда его меняли: у производства с
+         // этапами срок считается по этапам, и лишний ключ его бы сбросил.
+         var leadNew = p.lead_time_days || null, leadWas = was ? (was.lead_time_days || null) : null;
+         var bodyIn = {name: name};
+         if (leadNew !== leadWas) bodyIn.lead_time_days = leadNew;
+         if (!p.id) jobs.push(api("/api/productions", {method: "POST", body: bodyIn}).then(function(d){
+             p.id = d.id; S.prods0[d.id] = {name: name, lead_time_days: p.lead_time_days}; }));
+         else if (was.name !== name || leadNew !== leadWas)
+           jobs.push(api("/api/productions/" + p.id, {method: "POST", body: bodyIn}).then(function(){
+             S.prods0[p.id] = {name: name, lead_time_days: p.lead_time_days}; }));
+       });
+       return Promise.all(jobs);
+     }},
+
+    {k: "bar", t: "Сколько должна приносить вещь в день?",
+     s: "По этим границам таблица красит вещи: бестселлеры, хорошие, медленные и слабые.",
+     next: "Открыть таблицу",
+     draw: function(){
+       if (!S.loaded) {
+         body.innerHTML = '<div class="wait"><span class="spin" aria-hidden="true"></span><span>Считаем по вашим продажам. Обычно это меньше минуты.</span></div>';
+         next.disabled = true;
+         return;
+       }
+       next.disabled = false;
+       var t = S.thr, c = S.calc;
+       var fact = c
+         ? 'Сейчас одна вещь приносит в среднем <b>' + fmt(c.b) + ' ₽</b> в день, пока лежит на складе. Ориентир в полтора раза выше: <b>' + fmt(c.t) + ' ₽</b>. От него считаем границы групп.' +
+           (c.same ? '' : ' <button class="btn ghost" type="button" id="b-use">Подставить расчёт</button>')
+         : 'Продаж пока мало, чтобы посчитать среднее. Границы можно оставить как есть и поменять позже.';
+       body.innerHTML = '<div class="fact" id="b-fact">' + fact + '</div>' +
+         '<div class="grp">' +
+         '<div class="g weak"><div class="n">Слабые</div><div class="r">меньше, ₽ в день</div><input class="num" id="b-weak" type="number" min="1" inputmode="numeric" value="' + t.weak + '" aria-label="Слабые: меньше, рублей в день"></div>' +
+         '<div class="g dull"><div class="n">Медленные</div><div class="r">меньше, ₽ в день</div><input class="num" id="b-dull" type="number" min="2" inputmode="numeric" value="' + t.dull + '" aria-label="Медленные: меньше, рублей в день"></div>' +
+         '<div class="g good"><div class="n">Хорошие</div><div class="r">меньше, ₽ в день</div><input class="num" id="b-good" type="number" min="3" inputmode="numeric" value="' + t.good + '" aria-label="Хорошие: меньше, рублей в день"></div>' +
+         '<div class="g best"><div class="n">Бестселлеры</div><div class="r">от, ₽ в день</div><div class="top" id="b-best">' + fmt(t.good) + '</div></div>' +
+         '</div>' +
+         '<details class="how"><summary>Как мы это считаем</summary><ol>' +
+         '<li>Берём выручку каждой вещи и дни, когда она была в наличии. Делим выручку на дни: получаем рубли в день.</li>' +
+         '<li>Среднее по вещам с достаточной историей умножаем на полтора: это ориентир.</li>' +
+         '<li>Слабые приносят меньше трети ориентира, медленные меньше двух третей, бестселлеры больше ориентира в 1,67 раза.</li>' +
+         '<li>Границы ваши: впишите круглые числа, если так удобнее.</li>' +
+         '</ol></details>';
+       function read(){
+         ["weak", "dull", "good"].forEach(function(k){ var v = parseInt($("b-" + k).value, 10); if (!isNaN(v)) S.thr[k] = v; });
+         $("b-best").textContent = fmt(S.thr.good);
+       }
+       ["weak", "dull", "good"].forEach(function(k){ $("b-" + k).addEventListener("change", read); });
+       var use = $("b-use");
+       if (use) use.addEventListener("click", function(){
+         S.thr = {weak: c.weak, dull: c.dull, good: c.good};
+         ["weak", "dull", "good"].forEach(function(k){ $("b-" + k).value = S.thr[k]; });
+         $("b-best").textContent = fmt(S.thr.good); use.remove();
+       });
+       this.read = read;
+     },
+     save: function(){
+       if (!S.loaded) return Promise.resolve();
+       this.read();
+       var t = S.thr, o = S.thr0;
+       if (!(t.weak > 0 && t.weak < t.dull && t.dull < t.good)) return Promise.reject(new Error("Границы должны расти слева направо: слабые, медленные, хорошие."));
+       if (o && o.weak === t.weak && o.dull === t.dull && o.good === t.good) return Promise.resolve();
+       return api("/api/settings", {method: "POST", body: {thresholds: t}}).then(function(){ S.thr0 = {weak: t.weak, dull: t.dull, good: t.good}; });
+     }}
+  ];
+
+  function sameRule(a, b){ for (var k in a) if (a[k] !== b[k]) return false; return true; }
+  function saveRule(){
+    if (sameRule(S.rule, S.rule0)) return Promise.resolve();
+    return api("/api/discount-rule", {method: "POST", body: S.rule}).then(function(d){
+      S.rule = d.rule; S.rule0 = JSON.parse(JSON.stringify(d.rule)); });
+  }
+
+  /* ---- показ шага ---- */
+  var idx = 0, busy = false;
+  function paintDots(){
+    dots.innerHTML = STEPS.map(function(_, i){ return '<i' + (i === idx ? ' class="on"' : '') + '></i>'; }).join("");
+  }
+  function show(i, instant){
+    idx = i; var st = STEPS[i];
+    function fill(){
+      title.textContent = st.t; sub.textContent = st.s; errEl.textContent = "";
+      next.textContent = st.next || "Дальше"; next.disabled = false;
+      back.style.visibility = i === 0 ? "hidden" : "visible";
+      later.style.visibility = st.noLater ? "hidden" : "visible";
+      st.draw(); paintDots();
+      pane.classList.remove("out");
+      try { history.replaceState(null, "", "#" + st.k); } catch (e) {}
+      if (!instant) title.focus({preventScroll: true});
+    }
+    if (instant) { fill(); return; }
+    pane.classList.add("out");
+    setTimeout(fill, 300);
+  }
+  function go(dir){
+    if (busy) return;
+    var st = STEPS[idx];
+    if (dir < 0) { if (idx > 0) show(idx - 1); return; }
+    busy = true; next.disabled = true; errEl.textContent = "";
+    Promise.resolve().then(function(){ return st.save ? st.save.call(st) : null; }).then(function(){
+      busy = false;
+      if (idx === STEPS.length - 1) { finish(); return; }
+      show(idx + 1);
+    }).catch(function(e){
+      busy = false; next.disabled = false;
+      errEl.textContent = e && e.status === 403 ? "Менять настройки может только владелец." : (e && e.message) || "Не получилось сохранить. Попробуйте ещё раз.";
+    });
+  }
+  function finish(){
+    title.textContent = "Собираем вашу матрицу"; sub.textContent = "Открываем таблицу оборачиваемости.";
+    body.innerHTML = '<div class="wait"><span class="spin" aria-hidden="true"></span><span>Ещё секунду.</span></div>';
+    back.style.visibility = "hidden"; later.style.visibility = "hidden"; next.style.visibility = "hidden"; dots.innerHTML = "";
+    setTimeout(function(){ window.location.href = "/turnover"; }, 700);
+  }
+  next.addEventListener("click", function(){ go(1); });
+  back.addEventListener("click", function(){ go(-1); });
+  document.addEventListener("keydown", function(e){
+    if (e.key === "Enter" && e.target && e.target.tagName === "INPUT") { e.target.blur(); go(1); }
+  });
+
+  /* ---- данные ---- */
+  function calcFrom(items, thr){
+    var rev = 0, days = 0;
+    (items || []).forEach(function(it){
+      if (it.hidden || it.group !== "rank" || !(it.dis > 0)) return;
+      rev += it.turnover * it.dis; days += it.dis;
+    });
+    if (!(days > 0) || !(rev > 0)) return null;
+    var b = rev / days, t = b * 1.5;
+    var c = {b: b, t: t, weak: Math.max(1, Math.round(t / 3)), dull: Math.max(2, Math.round(2 * t / 3)), good: Math.max(3, Math.round(5 * t / 3))};
+    c.same = c.weak === thr.weak && c.dull === thr.dull && c.good === thr.good;
+    return c;
+  }
+  function pollData(){
+    api("/api/turnover").then(function(d){
+      var items = (d && d.items) || [];
+      if (items.length) {
+        S.loaded = true; S.calc = calcFrom(items, S.thr); syncEl.textContent = "";
+        if (STEPS[idx].k === "bar") show(idx, true);
+        return;
+      }
+      syncEl.textContent = "Данные загружаются в фоне. Отвечать можно уже сейчас.";
+      setTimeout(pollData, 4000);
+    }).catch(function(){ setTimeout(pollData, 6000); });
+  }
+  Promise.all([api("/api/discount-rule"), api("/api/productions"), api("/api/settings")]).then(function(r){
+    S.rule = r[0].rule; S.rule0 = JSON.parse(JSON.stringify(S.rule));
+    S.defLead = r[1].default_lead_time_days;
+    S.prods = (r[1].productions || []).map(function(p){
+      S.prods0[p.id] = {name: p.name, lead_time_days: p.lead_time_days || null};
+      return {id: p.id, name: p.name, lead_time_days: p.lead_time_days || null};
+    });
+    var t = r[2].thresholds;
+    S.thr = {weak: t.weak, dull: t.dull, good: t.good}; S.thr0 = {weak: t.weak, dull: t.dull, good: t.good};
+    var start = 0, h = (location.hash || "").slice(1);
+    STEPS.forEach(function(s, i){ if (s.k === h) start = i; });
+    show(start, true);
+    pollData();
+  }).catch(function(e){
+    title.textContent = "Не получилось открыть первый запуск";
+    sub.textContent = e && e.status === 403 ? "Эти настройки доступны только владельцу." : "Обновите страницу. Если не поможет, откройте таблицу: настройки можно задать позже.";
+    body.innerHTML = '<a class="btn" href="/turnover" style="display:inline-flex;align-items:center;text-decoration:none">Открыть таблицу</a>';
+    back.style.visibility = "hidden"; later.style.visibility = "hidden"; next.style.visibility = "hidden";
+  });
+})();
+</script>
+</body>
+</html>

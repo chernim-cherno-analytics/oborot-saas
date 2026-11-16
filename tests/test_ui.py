@@ -4261,9 +4261,27 @@ def _browser_journey(browser, base: str, shots: list) -> None:  # noqa: C901
     _shot(page, adir, shots, "01-onboarding-1400")
 
     print("\n== Путь в браузере: демо-данные кнопкой ==")
+    # UI2-4 (D-85): подключение открывается окном-приветствием, источник
+    # данных выбирается после «Начать».
+    _click_through_hint(page, "#btn-hello")
+    page.wait_for_selector("#btn-connect-demo", state="visible", timeout=10000)
     with page.expect_navigation(url=lambda u: "/onboarding" not in u, timeout=60000):
         _click_through_hint(page, "#btn-connect-demo")
-    check("после демо-подключения продукт увёл на «Оборачиваемость»",
+    # UI2-4 (D-85): после подключения человек отвечает на четыре вопроса
+    # первого запуска и только потом попадает в таблицу.
+    check("после демо-подключения продукт увёл на первый запуск",
+          page.url.split("#")[0].rstrip("/").endswith("/welcome"), page.url)
+    for _ in range(3):
+        page.wait_for_function("() => { const n = document.getElementById('w-next'); return n && !n.disabled; }",
+                               timeout=30000)
+        page.click("#w-next")
+        page.wait_for_timeout(500)
+    page.wait_for_function("() => { const n = document.getElementById('w-next');"
+                           " return n && !n.disabled && n.textContent.includes('Открыть таблицу')"
+                           " && !!document.getElementById('b-weak'); }", timeout=60000)
+    with page.expect_navigation(url=lambda u: "/welcome" not in u, timeout=60000):
+        page.click("#w-next")
+    check("после вопросов первого запуска продукт увёл на «Оборачиваемость»",
           page.url.rstrip("/").endswith("/turnover"), page.url)
     _close_hint(page)
     _shot(page, adir, shots, "02-turnover-1400")
