@@ -784,7 +784,9 @@
         delete PB.excl; pbSave();
       }
       applyData(res[0]);
-      if(PLAN||(!PLAN_BOOTED&&PB.budget)) applyPlan();
+      // Перезагрузка данных (окно темпа, заказ, перенос позиции) пересчитывает
+      // и ещё не пришедший план: старый ответ отбрасывается (ревью #136).
+      if(PLAN||PLAN_PENDING||(!PLAN_BOOTED&&PB.budget)) applyPlan();
       PLAN_BOOTED=true;
     }).catch(function(e){
       tbody.innerHTML='<tr><td colspan="'+NCOLS+'"><div class="empty-note">Не удалось загрузить данные — обновите страницу.<br>'+esc(e.message)+'</div></td></tr>';
