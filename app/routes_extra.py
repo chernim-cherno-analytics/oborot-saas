@@ -886,6 +886,10 @@ class ReplenishExportIn(BaseModel):
     # D-89 (ревью #136): под бюджетом в файл идут количества плана, а не полная
     # потребность. База → {qty, sizes}; ровно то, что на экране.
     quantities: dict[str, "ReplenishQtyIn"] | None = Field(default=None, max_length=5000)
+    # QA 16.11: план под бюджет считается для одной вкладки; файл под бюджетом
+    # содержит только её, а у не вошедших в план своя причина, не «снята вручную».
+    plan_production_id: int | None = Field(default=None, ge=1, le=2_147_483_647)
+    out_reasons: dict[str, str] | None = Field(default=None, max_length=5000)
 
 
 class ReplenishQtyIn(BaseModel):
@@ -896,10 +900,24 @@ class ReplenishQtyIn(BaseModel):
 ReplenishExportIn.model_rebuild()
 
 
-def _apply_export_quantities(data: dict, quantities: dict | None) -> None:
+def _apply_export_quantities(data: dict, quantities: dict | None,
+                             plan_pid: int | None = None, out_reasons: dict | None = None) -> None:
     """Количества плана под бюджет поверх расчёта и ручной ростовки (D-89)."""
     if not quantities:
         return
+    if plan_pid is not None:
+        # Под бюджетом в файл идёт только вкладка, для которой считался план:
+        # лист другого производства с полной потребностью и пометкой «по плану»
+        # врал бы цеху (QA 16.11, P1).
+        data["items"] = [it for it in data.get("items") or [] if it.get("production_id") == plan_pid]
+        plan_names = {it.get("production_name") or "" for it in data["items"]}
+        data["excluded"] = [e for e in data.get("excluded") or []
+                            if not e.get("production_name") or e.get("production_name") in plan_names]
+    if out_reasons:
+        for e in data.get("excluded") or []:
+            r = out_reasons.get(e.get("base_name"))
+            if r:
+                e["reason"] = str(r)[:200]
     for it in data.get("items") or []:
         q = quantities.get(it["base_name"])
         if q is None:
@@ -949,6 +967,7 @@ def _replenish_export_data(db: Session, org, selected: list[str] | None) -> dict
                 "base_name": it["base_name"],
                 "reason": "Галочка снята вручную на странице «Заказ» — "
                           "в эту партию позиция не идёт",
+                "production_name": it.get("production_name") or "",
             }
             for it in dropped
         ]
@@ -997,7 +1016,7 @@ def export_replenish_xlsx_selected(
     # человека уносило со страницы на голый JSON вместе с несохранённой
     # работой. Теперь оба случая идут одним путём — через тело POST.
     data = _replenish_export_data(db, ctx.org, body.base_names or None)
-    _apply_export_quantities(data, body.quantities)
+    _apply_export_quantities(data, body.quantities, body.plan_production_id, body.out_reasons)
     wb = export_xlsx.replenish_workbook(ctx.org.name, data)
     return export_xlsx.xlsx_response(wb, "Что заказать.xlsx", "replenish.xlsx")
 

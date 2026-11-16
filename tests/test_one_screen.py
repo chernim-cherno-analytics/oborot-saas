@@ -236,6 +236,23 @@ try:
         check("в черновике столько позиций, сколько было в плане", len(saved["items"]) == planned_n,
               f"{len(saved['items'])} vs {planned_n}")
         own.delete(f"/api/orders/{oid}")
+        print("\n7. Excel под бюджетом при двух производствах: только вкладка плана (QA 16.11, P1)")
+        main_id = own.get("/api/productions").json()["productions"][0]["id"]
+        p2 = own.post("/api/productions", json={"name": "Второй цех"}).json()
+        p2_id = p2.get("id") or (p2.get("production") or {}).get("id")
+        rep_items = own.get("/api/replenish").json()["items"]
+        for it in rep_items[:3]:
+            own.post("/api/productions/assign", json={"base_name": it["base_name"], "production_id": p2_id})
+        rep_items = own.get("/api/replenish").json()["items"]
+        names = [i["base_name"] for i in rep_items]
+        main_names = [i["base_name"] for i in rep_items if i.get("production_id") == main_id]
+        r = own.post("/api/export/replenish.xlsx", json={
+            "base_names": names, "plan_production_id": main_id,
+            "quantities": {b: {"qty": 1, "sizes": {}} for b in main_names},
+            "out_reasons": {}})
+        wb2 = load_workbook(io.BytesIO(r.content))
+        check("в файле нет листа второго цеха", all("Второй" not in ws_.title for ws_ in wb2.worksheets),
+              str([ws_.title for ws_ in wb2.worksheets]))
         src = own.get("/assistant").text
         check("в мастере есть кнопка «Открыть в «Заказе»»", 'id="toTable"' in src)
         check("ошибок JS нет", not errs, str(errs[:3]))
