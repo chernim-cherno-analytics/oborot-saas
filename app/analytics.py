@@ -564,7 +564,9 @@ def _stockout_by_rate(today_iso: str, cs: float, rate: float) -> str | None:
     """
     if rate <= 0:
         return None
-    days = min(int(cs / rate), 3650)
+    # 1e-3 дня: шум плавающей точки (44,99998 при ровных 45 днях) не должен
+    # сдвигать дату на день; мастер считает «дыру» тем же правилом (D-87).
+    days = min(int(cs / rate + 1e-3), 3650)
     return (date.fromisoformat(today_iso) + timedelta(days=days)).isoformat()
 
 
@@ -1602,14 +1604,16 @@ def _compute_snapshot(db: Session, org: Org) -> dict:
         # сезонным r_lead: «кончится до прихода» и «Стокаут после прихода»
         # одновременно. С D-79 подписи «до прихода» считаются тем же r_lead,
         # что и остаток к приходу (и мастер). При окне «сезон» r_lead = темп окна.
-        if r_lead != float(item.get("rate_active") or 0):
-            arrival = today + timedelta(days=lead)
-            item["wos"] = _wos_by_rate(cs, r_lead)
-            item["stockout_date"] = _stockout_by_rate(today.isoformat(), cs, r_lead)
-            item["gap_days"] = (
-                max(0, (arrival - date.fromisoformat(item["stockout_date"])).days)
-                if item["stockout_date"] else 0
-            )
+        # D-87 (16.11): всегда по r_lead, даже когда он равен темпу окна:
+        # «дыра» и дата стокаута считаются тем же (округлённым до 4 знаков)
+        # темпом, что и в мастере, иначе на границе дня они расходились на 1.
+        arrival = today + timedelta(days=lead)
+        item["wos"] = _wos_by_rate(cs, r_lead)
+        item["stockout_date"] = _stockout_by_rate(today.isoformat(), cs, r_lead)
+        item["gap_days"] = (
+            max(0, (arrival - date.fromisoformat(item["stockout_date"])).days)
+            if item["stockout_date"] else 0
+        )
 
     return {
         "generated_at": time.time(),
