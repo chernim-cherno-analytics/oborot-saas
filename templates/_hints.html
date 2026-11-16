@@ -1238,8 +1238,10 @@
     // страниц переменная active приходит не всегда.
     var path = window.location.pathname.replace(/\/+$/, "") || "/";
     var mine = null;
+    // На одной странице бывает несколько уроков (на «Заказе» основной и
+    // «Под бюджет», D-89): контекстным берём первый по каталогу, основной.
     (d.lessons || []).forEach(function(l){
-      if (String(l.url).replace(/\/+$/, "") === path) mine = l;
+      if (!mine && String(l.url).replace(/\/+$/, "") === path) mine = l;
     });
     if (!mine) return;
     itLesson.hidden = false;
