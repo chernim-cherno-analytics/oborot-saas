@@ -738,8 +738,8 @@ def _candidates(snap: dict, brief: dict, ctx: dict) -> tuple[list[dict], dict]:
         # (analytics._stockout_by_rate), а не округляются: «дыра» одна и та же
         # на обоих экранах.
         gap_days = 0
-        if r_lead > 0 and cs + ordered < r_lead * days_to_eta:
-            gap_days = max(0, days_to_eta - min(int((cs + ordered) / r_lead), 3650))
+        if r_lead > 0:
+            gap_days = max(0, days_to_eta - min(int((cs + ordered) / r_lead + 1e-3), 3650))
         if need < NEED_MIN and base in must:
             forced = True
         if need < NEED_MIN and base not in must:

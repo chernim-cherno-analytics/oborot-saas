@@ -2619,13 +2619,14 @@ def _fix1_f01(page, base) -> None:
                 or info["width"] <= 0 or info["height"] <= 0
                 or not info["clickable"]):
             invisible.append((name, info))
-        if not (info.get("after") == "/sizes" and info.get("before") == "/budget"):
+        # D-89: «Заказ позиции» и «Бюджет» ушли из меню, «Поставки» сразу за «Заказом».
+        if not (info.get("after") == "/replenish" and info.get("before") == "/forecast"):
             misplaced.append((name, info.get("after"), info.get("before")))
     check("ссылка «Поставки» есть в навигации всех десяти страниц",
           not missing, f"нет на: {missing}")
     check("и она действительно видима и принимает нажатие мышью",
           not invisible, str(invisible)[:200])
-    check("и стоит между «Заказ позиции» и «Бюджет»",
+    check("и стоит между «Заказом» и «Прогнозом»",
           not misplaced, str(misplaced)[:200])
 
     page.goto(f"{base}/supply")
