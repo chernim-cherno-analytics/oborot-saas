@@ -113,7 +113,7 @@ def org_id_of(email: str) -> int:
 
 def catalog(org_id: int) -> list[str]:
     return [r[0] for r in sql("SELECT DISTINCT base_name FROM products WHERE org_id=? "
-                              "AND excluded=0 ORDER BY base_name LIMIT 12", org_id)]
+                              "AND excluded=0 ORDER BY base_name LIMIT 20", org_id)]
 
 
 def make_order(c, name, base, qty, production_id=None, eta=None, send=True):
@@ -161,7 +161,7 @@ def run() -> int:  # noqa: C901 — сценарный набор
     register(c, "prod@test.io", "Бренд-П")
     org = org_id_of("prod@test.io")
     bases = catalog(org)
-    check("в демо-каталоге есть позиции", len(bases) >= 6, str(bases))
+    check("в демо-каталоге есть позиции", len(bases) >= 14, str(bases))
 
     print("\n== Страница и меню ==")
     r = c.get("/production")
@@ -206,7 +206,6 @@ def run() -> int:  # noqa: C901 — сценарный набор
     check("отправленный заказ в «Заказано»", x is not None and x["phase"] == "ordered", str(x)[:200])
     check("следующий этап первый по порядку", x and x["next"]["name"] == "Ткань у цеха", str(x and x["next"]))
     check("цех подписан", x and x["channel_name"] == "Цех Москва")
-    ordered_qty_before = sql("SELECT COALESCE(SUM(qty),0), COALESCE(SUM(ms_qty),0) FROM ordered_qty WHERE org_id=?", org)
 
     print("\n== Отметки этапов ==")
     r = c.post(f"/api/production/orders/{o1}/marks", json={"stage_key": x["next"]["key"]})
@@ -248,6 +247,10 @@ def run() -> int:  # noqa: C901 — сценарный набор
     check("следующая сдача без количества: 422", r.status_code == 422, f"{r.status_code} {r.text[:200]}")
     r = c.post(f"/api/production/orders/{o1}/marks", json={"stage_key": keys[3], "qty": 2.5})
     check("дробные штуки: 422", r.status_code == 422, f"{r.status_code}")
+    r = c.post(f"/api/production/orders/{o1}/marks", json={"stage_key": keys[3], "qty": True})
+    check("логическое значение вместо штук: 422", r.status_code == 422, f"{r.status_code}")
+    r = c.post(f"/api/production/orders/{o1}/marks", json={"stage_key": keys[3], "qty": 5, "at": "20261117"})
+    check("дата не в формате ГГГГ-ММ-ДД: 422", r.status_code == 422, f"{r.status_code}")
     x, _ = card(c, o1)
     check("сдано 50, колонка «Сдано, едет»", x["handed_qty"] == 50 and x["phase"] == "shipped",
           f"{x['handed_qty']} {x['phase']}")
@@ -258,11 +261,8 @@ def run() -> int:  # noqa: C901 — сценарный набор
     check("частичная приёмка существующей ручкой", r.status_code == 200, r.text[:200])
     x, _ = card(c, o1)
     check("пришло 20 из 58, запуск ещё не принят", x["received_qty"] == 20 and x["phase"] == "shipped"
-          and x["arrived_at"] == iso(TODAY), str(x)[:300])
-    ordered_qty_after = sql("SELECT COALESCE(SUM(qty),0), COALESCE(SUM(ms_qty),0) FROM ordered_qty WHERE org_id=?", org)
-    # Приёмка сама по себе «Едет» уменьшает (D-83); проверяем, что отметки
-    # этапов к этому ничего не добавили: до приёмки числа были те же.
-    check("отметки этапов не тронули «Едет»", ordered_qty_before is not None and ordered_qty_after is not None)
+          # Приёмка пишется по UTC сервера: около полуночи это может быть вчерашний день.
+          and x["arrived_at"] in (iso(TODAY), iso(TODAY - timedelta(days=1))), str(x)[:300])
     r = c.post(f"/api/orders/{o1}/status", json={"status": "received",
                                                  "received": [{"base_name": bases[1], "qty": 38}]})
     check("приняли остаток и закрыли", r.status_code == 200, r.text[:200])
@@ -281,14 +281,14 @@ def run() -> int:  # noqa: C901 — сценарный набор
     status = sql("SELECT status, eta_date FROM production_orders WHERE id=?", o_e)[0]
     check("и не меняет статус и плановую дату заказа", status == ("sent", None), str(status))
 
-    print("\n== Дата «на складе» ==")
+    print("\n== Срок и опоздание ==")
     sql("UPDATE productions SET lead_time_days=30, stages_json='' WHERE id=?", moscow)
     o2 = make_order(c, "По сроку цеха", bases[3], 10, production_id=moscow)
     backdate_sent(o2, 5)
     x, _ = card(c, o2)
-    check("без истории и плана: отправка + срок цеха",
-          x["forecast"]["basis"] == "lead" and x["forecast"]["date"] == iso(TODAY + timedelta(days=25)),
-          str(x["forecast"]))
+    check("без плана и срока от цеха: отправка + срок цеха",
+          x["forecast"]["basis"] == "lead" and x["forecast"]["date"] == iso(TODAY + timedelta(days=25))
+          and not x["forecast"]["late_days"], str(x["forecast"]))
     plan = iso(TODAY + timedelta(days=12))
     o3 = make_order(c, "По плану", bases[4], 10, production_id=china, eta=plan)
     x, _ = card(c, o3)
@@ -299,8 +299,43 @@ def run() -> int:  # noqa: C901 — сценарный набор
     x, b = card(c, o4)
     check("план прошёл, прихода нет: опаздывает на 4 дн", x["forecast"]["late_days"] == 4, str(x["forecast"]))
     check("опоздание в сводке", b["summary"]["late"] >= 1, str(b["summary"]))
+    check("опоздавший не входит в «ждём за 14 дней»",
+          b["summary"]["waiting_qty"] == sum(max(0, o["total_qty"] - o["received_qty"]) for o in b["orders"]
+                                             if o["phase"] != "done" and not o["forecast"]["late_days"]
+                                             and o["forecast"]["date"]
+                                             and iso(TODAY) <= o["forecast"]["date"] <= iso(TODAY + timedelta(days=14))),
+          str(b["summary"]))
 
-    # История Китая: два пришедших запуска, «Отправлено» за 10 и 14 дней до прихода,
+    print("\n== Срок от цеха ==")
+    new_due = iso(TODAY + timedelta(days=6))
+    r = c.post(f"/api/production/orders/{o4}/due", json={"due": new_due, "note": "ждут фурнитуру"})
+    check("цех назвал новый срок", r.status_code == 200, r.text[:200])
+    x, _ = card(c, o4)
+    check("опоздания больше нет, действует срок от цеха",
+          not x["forecast"]["late_days"] and x["forecast"]["basis"] == "due"
+          and x["forecast"]["date"] == new_due and x["forecast"]["plan_date"] == late_plan, str(x["forecast"]))
+    r = c.post(f"/api/production/orders/{o4}/due", json={"due": new_due, "note": "ждут фурнитуру"})
+    check("повтор того же срока не пишет второй строки", r.json().get("repeat") is True, r.text[:200])
+    r2 = c.post(f"/api/production/orders/{o4}/due", json={"due": iso(TODAY - timedelta(days=1))})
+    x, _ = card(c, o4)
+    check("перенос: последний срок действует, переносов 1, снова опаздывает",
+          x["forecast"]["due_moves"] == 1 and x["forecast"]["late_days"] == 1, str(x["forecast"]))
+    d = c.get(f"/api/production/orders/{o4}").json()
+    check("история сроков в окне", [z["due"] for z in d["dues"]] == [new_due, iso(TODAY - timedelta(days=1))]
+          and d["dues"][0]["note"] == "ждут фурнитуру", str(d.get("dues")))
+    r = c.delete(f"/api/production/due/{r2.json()['id']}")
+    x, _ = card(c, o4)
+    check("удалённый срок: снова действует предыдущий", r.status_code == 200
+          and x["forecast"]["date"] == new_due, str(x["forecast"]))
+    r = c.post(f"/api/production/orders/{o4}/due", json={"due": iso(TODAY - timedelta(days=400))})
+    check("срок раньше отправки: 422", r.status_code == 422, str(r.status_code))
+    r = c.post(f"/api/production/orders/{o4}/due", json={"due": "20261201"})
+    check("срок не в формате ГГГГ-ММ-ДД: 422", r.status_code == 422, str(r.status_code))
+    status = sql("SELECT eta_date FROM production_orders WHERE id=?", o4)[0][0]
+    check("срок от цеха не трогает плановую дату заказа", status == late_plan, str(status))
+
+    print("\n== Оценка по истории цеха ==")
+    # История Китая: два закрытых заказа, «Отправлено» за 10 и 14 дней до прихода,
     # оба пришли больше 30 дней назад (на доске их уже нет, в истории есть).
     ch_keys = [s["key"] for s in chs[china]["stages"]]
     for i, (sent_ago, shipped_ago, arrived_ago) in enumerate(((90, 50, 40), (80, 49, 35))):
@@ -318,17 +353,38 @@ def run() -> int:  # noqa: C901 — сценарный набор
     c.post(f"/api/production/orders/{o5}/marks",
            json={"stage_key": ch_keys[2], "at": iso(TODAY - timedelta(days=2))})
     x, b = card(c, o5)
-    # медиана (10, 14) = 12; отправлено 2 дня назад → через 10 дней.
-    check("по истории цеха: точка + медиана",
-          x["forecast"]["basis"] == "history" and x["forecast"]["n"] == 2
-          and x["forecast"]["date"] == iso(TODAY + timedelta(days=10)), str(x["forecast"]))
-    check("отклонение от плана: позже на 7 дн", x["forecast"]["vs_plan_days"] == 7, str(x["forecast"]))
+    # медиана (10, 14) = 12; отправлено 2 дня назад, значит через 10 дней.
+    est = x["forecast"]["estimate"]
+    check("оценка по истории: точка + медиана",
+          est and est["n"] == 2 and est["date"] == iso(TODAY + timedelta(days=10)), str(x["forecast"]))
+    check("срок остаётся плановым, оценка позже срока на 7 дн, но это не опоздание",
+          x["forecast"]["basis"] == "plan" and x["forecast"]["risk_days"] == 7
+          and not x["forecast"]["late_days"], str(x["forecast"]))
+    o5b = make_order(c, "Китай без отметок", bases[11], 3, production_id=china)
+    x, _ = card(c, o5b)
+    c.post(f"/api/production/orders/{o5b}/marks", json={"stage_key": ch_keys[0]})
+    y, _ = card(c, o5b)
+    check("отметка этапа без истории не теряет оценку по прошлой точке",
+          x["forecast"]["estimate"] and y["forecast"]["estimate"]
+          and y["forecast"]["estimate"]["date"] == x["forecast"]["estimate"]["date"],
+          f"{x['forecast'].get('estimate')} {y['forecast'].get('estimate')}")
     sp = next(s for s in b["speed"] if s["channel_id"] == china)
     check("скорость цеха: два пришедших, медиана от «Отправлено» 12 дн",
           sp["done"] == 2 and next(s for s in sp["stages"] if s["key"] == ch_keys[2])["median_to_arrival"] == 12,
           str(sp))
     check("старые принятые не на доске, но в истории",
           not any(o["name"].startswith("Китай история") for o in b["orders"]), "")
+
+    print("\n== Приход построчно ==")
+    two = c.post("/api/orders", json={"name": "Две позиции", "production_id": moscow, "allow_duplicate": True,
+                                      "items": [{"base_name": bases[12], "qty": 10, "sizes": {}},
+                                                {"base_name": bases[13], "qty": 10, "sizes": {}}]}).json()["id"]
+    c.post(f"/api/orders/{two}/status", json={"status": "sent"})
+    c.post(f"/api/orders/{two}/receipts", json={"lines": [{"base_name": bases[12], "qty": 20},
+                                                         {"base_name": "Не из заказа", "qty": 10}]})
+    x, _ = card(c, two)
+    check("перебор по одной позиции и чужая позиция не закрывают недостачу по другой",
+          x["phase"] == "shipped" and x["received_qty"] == 10, f"{x['phase']} {x['received_qty']}")
 
     print("\n== Этапы цеха ==")
     stages = [{"key": s["key"], "name": s["name"]} for s in chs[moscow]["stages"]]
@@ -418,10 +474,37 @@ def run() -> int:  # noqa: C901 — сценарный набор
     check("заказ удалён", r.status_code == 200, r.text[:200])
     o7 = make_order(c, "Новый", bases[10], 4, production_id=moscow)
     x, _ = card(c, o7)
-    check("новый заказ (id " + str(o7) + ") не унаследовал отметок", x and x["reached"] == -1
+    check("id действительно переиспользован (иначе проверка ниже ничего не доказывает)", o7 == o6,
+          f"{o6} -> {o7}")
+    check("новый заказ с тем же id не унаследовал отметок", x and x["reached"] == -1
           and x["phase"] == "ordered", str(x and x["stages"]))
-    if o7 == o6:
-        check("id действительно переиспользован (проверка содержательна)", True)
+
+    print("\n== Замок от одновременных отметок ==")
+    row = sql("SELECT org_id, order_id, order_batch, stage_key FROM order_stage_marks "
+              "WHERE qty IS NULL LIMIT 1")[0]
+    dup_err = ""
+    try:
+        sql("INSERT INTO order_stage_marks (org_id, order_id, order_batch, stage_key, stage_name, at, "
+            "note, created_at) VALUES (?,?,?,?,'x','2026-01-01','',datetime('now'))", *row)
+    except sqlite3.IntegrityError as exc:
+        dup_err = str(exc)
+    check("второй такой же этап без количества база не принимает", "UNIQUE" in dup_err, dup_err)
+
+    print("\n== Удалённый цех ==")
+    tmp = c.post("/api/productions", json={"name": "Временный цех"}).json()["id"]
+    o8 = make_order(c, "У временного цеха", bases[14], 3, production_id=tmp)
+    k0 = card(c, o8)[0]["next"]["key"]
+    c.post(f"/api/production/orders/{o8}/marks", json={"stage_key": k0})
+    r = c.delete(f"/api/productions/{tmp}")
+    x, _ = card(c, o8)
+    check("заказ удалённого цеха относится к «Без цеха»", r.status_code == 200 and x["channel_id"] == 0
+          and x["reached"] == 0, f"{r.status_code} {x['channel_id']} {x['reached']}")
+    zero = c.get("/api/production/board").json()
+    st0 = next(ch for ch in zero["channels"] if ch["id"] == 0)["stages"]
+    r = c.put("/api/production/stages", json={"production_id": 0, "preset": "custom",
+                                              "stages": [s_ for s_ in st0 if s_["key"] != k0]})
+    check("убрать этап с отметками у «Без цеха» нельзя и после удаления цеха: 409",
+          r.status_code == 409, f"{r.status_code} {r.text[:150]}")
 
     print("\n== Окно запуска ==")
     d = c.get(f"/api/production/orders/{o1}").json()
@@ -437,7 +520,7 @@ def run() -> int:  # noqa: C901 — сценарный набор
     if not names:
         names = {m.__tablename__ for m in tenancy.purge_models()} if hasattr(tenancy, "purge_models") else set()
     check("отметки и этапы входят в удаление организации",
-          {"order_stage_marks", "production_tracks"} <= names, str(sorted(names))[:300])
+          {"order_stage_marks", "production_tracks", "order_due_dates"} <= names, str(sorted(names))[:300])
 
     print(f"\nИТОГО: {len(PASS)} OK, {len(FAIL)} FAIL")
     return 0 if not FAIL else 1

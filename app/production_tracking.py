@@ -1,18 +1,20 @@
-"""PROD-1 «Производство»: где каждый запуск и когда он будет на складе.
+"""PROD-1 «Производство»: где каждый заказ и когда он будет на складе.
 
 Решение Влада 17.11.2026 (спецификация docs/SPEC_PRODUCTION_TRACKING.md):
 запуск это заказ на производство (`ProductionOrder`), отдельной сущности
-«партия» нет. Слой только ЧИТАЕТ заказы и приёмки и пишет свои отметки
-этапов. «Едет», рекомендации, бюджет, плановая дата и статус заказа здесь не
-меняются ни при каких действиях, формулы D-35 не затронуты.
+«партия» нет. Слой только ЧИТАЕТ заказы и приёмки и пишет свои записи: отметки
+этапов и сроки от цеха. «Едет», рекомендации, бюджет, плановая дата и статус
+заказа здесь не меняются, формулы D-35 не затронуты.
 
-Дата «на складе» считается детерминированно, без модели:
-  1) по истории цеха: дата последней достигнутой точки + медиана дней от этой
-     точки до прибытия у прошлых запусков того же цеха (не меньше 2 запусков
-     за 365 дней);
-  2) иначе плановая дата прихода заказа;
-  3) иначе дата отправки + срок цеха.
-Прошедшая дата без прибытия не сдвигается: показывается «опаздывает на N дн».
+Две даты, и они не смешиваются (итог прогона критиков 17.11):
+  * СРОК это договорённость: последний срок, который назвал цех, иначе
+    плановая дата заказа, иначе отправка + срок цеха. Только от него
+    считается «опаздывает» (красное).
+  * ОЦЕНКА это расчёт по истории цеха: дата последней отмеченной точки +
+    медиана дней от этой точки до прихода у закрытых заказов того же цеха
+    (не меньше 2 за 365 дней). Она подсказка: красным не бывает, а если
+    выходит позже срока, показывается предупреждение.
+Прошедший срок без прихода не сдвигается: «опаздывает на N дн».
 """
 from __future__ import annotations
 
@@ -26,6 +28,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models import (
+    OrderDueDate,
     OrderReceipt,
     OrderStageMark,
     Production,
@@ -50,9 +53,11 @@ HISTORY_DAYS = 365
 MIN_HISTORY = 2
 RECEIVED_SHOW_DAYS = 30
 ARRIVING_WINDOW_DAYS = 14
+DUE_AHEAD_DAYS = 730
 SENT_POINT = "_sent"
-# Двойной тап или повтор запроса: та же отметка за эти секунды не пишется второй раз.
+# Двойной тап или повтор запроса: та же запись за эти секунды не пишется второй раз.
 REPEAT_WINDOW_SEC = 15
+_ISO_DAY = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 
 class TrackingError(ValueError):
@@ -61,6 +66,36 @@ class TrackingError(ValueError):
     def __init__(self, message: str, status: int = 422):
         super().__init__(message)
         self.status = status
+
+
+# ── Даты ─────────────────────────────────────────────────────────────────────
+
+def _d(value) -> date | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except ValueError:
+        return None
+
+
+def parse_day(value, what: str = "Дата") -> date:
+    """Строго ГГГГ-ММ-ДД: «2026-W47-1» и «20261117» не принимаются."""
+    text = str(value or "").strip()
+    if not _ISO_DAY.fullmatch(text):
+        raise TrackingError(f"{what}: нужен формат ГГГГ-ММ-ДД")
+    try:
+        return date.fromisoformat(text)
+    except ValueError:
+        raise TrackingError(f"{what} задана неверно")
+
+
+def _median_days(values: list[int]) -> int:
+    return int(math.ceil(statistics.median(values)))
 
 
 # ── Этапы цеха ───────────────────────────────────────────────────────────────
@@ -73,9 +108,8 @@ def _preset_stages(preset: str) -> list[dict]:
 def default_preset(production: Production | None) -> str:
     """Шаблон этапов для цеха, у которого их ещё не задавали.
 
-    Не догадка о цехе, а чтение его же настроек: если в условиях канала
-    (`Production.stages`) один этап на весь срок, это фабрика «под ключ»;
-    если этапов несколько (ткань, потом пошив) или их нет, это пошив.
+    Не догадка о цехе, а чтение его же условий: один этап на весь срок
+    (`Production.stages`) это фабрика «под ключ», иначе пошив.
     """
     if production is not None:
         planning = [s for s in production.stages if isinstance(s, dict)]
@@ -100,30 +134,35 @@ def _clean_stages(raw) -> list[dict]:
     return out[:MAX_STAGES]
 
 
-def org_tracks(db: Session, org_id: int) -> tuple[dict, list[dict]]:
+def _productions(db: Session, org_id: int) -> dict[int, Production]:
+    return {p.id: p for p in db.execute(
+        select(Production).where(Production.org_id == org_id).order_by(Production.id)
+    ).scalars()}
+
+
+def org_tracks(db: Session, org_id: int, prods: dict | None = None) -> tuple[dict, list[dict]]:
     """Этапы всех цехов организации.
 
-    Возвращает (tracks, channels): tracks[production_id или 0] =
-    {"preset", "stages"}; channels это список цехов для экрана, включая
-    «Без цеха» (id 0), если такие заказы бывают. Строки в базе нет, значит
-    этапы по шаблону (`default_preset`), и они ничего не записывают.
+    tracks[id цеха или 0] = {"preset", "stages"}; 0 это заказы без цеха и
+    заказы удалённого цеха. Строки нет, значит этапы по шаблону.
+    Строка этапов, записанная раньше, чем создан цех с этим id, принадлежала
+    удалённому цеху (SQLite переиспользует id) и новому цеху не передаётся.
     """
-    prods = list(db.execute(
-        select(Production).where(Production.org_id == org_id).order_by(Production.id)
-    ).scalars())
-    rows = {
-        (r.production_id or 0): r
-        for r in db.execute(
-            select(ProductionTrack).where(ProductionTrack.org_id == org_id)
-            .order_by(ProductionTrack.id)
-        ).scalars()
-    }
+    prods = prods if prods is not None else _productions(db, org_id)
+    rows: dict[int, ProductionTrack] = {}
+    for r in db.execute(select(ProductionTrack).where(ProductionTrack.org_id == org_id)
+                        .order_by(ProductionTrack.id)).scalars():
+        pid = r.production_id or 0
+        p = prods.get(pid)
+        if pid and (p is None or (p.created_at and r.updated_at and r.updated_at < p.created_at)):
+            continue
+        rows[pid] = r
     tracks: dict[int, dict] = {}
     channels: list[dict] = []
-    for p in [None, *prods]:
+    for p in [None, *prods.values()]:
         pid = p.id if p is not None else 0
         row = rows.get(pid)
-        stages = []
+        stages: list[dict] = []
         preset = default_preset(p)
         if row is not None:
             try:
@@ -140,6 +179,11 @@ def org_tracks(db: Session, org_id: int) -> tuple[dict, list[dict]]:
     return tracks, channels
 
 
+def _channel_of(order: ProductionOrder, tracks: dict) -> int:
+    pid = order.production_id or 0
+    return pid if pid in tracks else 0
+
+
 def set_track(db: Session, org_id: int, production_id: int, preset: str,
               stages_in: list) -> dict:
     """Сохранить этапы цеха. 0 = заказы без цеха.
@@ -148,23 +192,21 @@ def set_track(db: Session, org_id: int, production_id: int, preset: str,
     отметки), новым выдаются свободные. Этап, по которому уже есть отметки,
     удалить нельзя: история перестала бы читаться.
     """
-    if production_id:
-        p = db.get(Production, production_id)
-        if p is None or p.org_id != org_id:
-            raise TrackingError("Цех не найден", 404)
+    prods = _productions(db, org_id)
+    if production_id and production_id not in prods:
+        raise TrackingError("Цех не найден", 404)
     if preset not in PRESET_LABELS:
         raise TrackingError("Неизвестный шаблон этапов")
-    tracks, _ = org_tracks(db, org_id)
+    tracks, _ = org_tracks(db, org_id, prods)
     current = tracks.get(production_id) or {"stages": []}
     if preset in PRESETS and not stages_in:
-        names = PRESETS[preset]
-        stages_in = [{"name": n} for n in names]
+        stages_in = [{"key": s["key"], "name": n}
+                     for s, n in zip(current["stages"] + [{"key": ""}] * MAX_STAGES, PRESETS[preset])]
     if not isinstance(stages_in, list) or not stages_in:
         raise TrackingError("Нужен хотя бы один этап")
     if len(stages_in) > MAX_STAGES:
         raise TrackingError(f"Этапов не больше {MAX_STAGES}")
-    used = {s["key"] for s in current["stages"]}
-    known_keys = set(used)
+    known_keys = {s["key"] for s in current["stages"]}
     taken: set[str] = set()
     result = []
     for st in stages_in:
@@ -189,7 +231,7 @@ def set_track(db: Session, org_id: int, production_id: int, preset: str,
         result.append({"key": key, "name": name})
     removed = known_keys - taken
     if removed:
-        marked = _keys_with_marks(db, org_id, production_id, removed)
+        marked = _keys_with_marks(db, org_id, production_id, removed, prods)
         if marked:
             names = [s["name"] for s in current["stages"] if s["key"] in marked]
             raise TrackingError(
@@ -201,7 +243,7 @@ def set_track(db: Session, org_id: int, production_id: int, preset: str,
             ProductionTrack.org_id == org_id,
             (ProductionTrack.production_id == production_id) if production_id
             else ProductionTrack.production_id.is_(None),
-        ).order_by(ProductionTrack.id).limit(1)
+        ).order_by(ProductionTrack.id.desc()).limit(1)
     ).scalar_one_or_none()
     if row is None:
         row = ProductionTrack(org_id=org_id, production_id=production_id or None)
@@ -212,49 +254,33 @@ def set_track(db: Session, org_id: int, production_id: int, preset: str,
     return {"preset": preset, "stages": result}
 
 
-def _keys_with_marks(db: Session, org_id: int, production_id: int, keys: set[str]) -> set[str]:
-    q = (select(OrderStageMark.stage_key, OrderStageMark.order_batch, ProductionOrder.cc_batch_id)
+def _keys_with_marks(db: Session, org_id: int, production_id: int, keys: set[str],
+                     prods: dict) -> set[str]:
+    """Ключи этапов, по которым у заказов ЭТОГО цеха есть отметки.
+
+    Заказы удалённого цеха относятся к «Без цеха» (0), как и на доске:
+    иначе защиту можно было обойти, удалив цех.
+    """
+    q = (select(OrderStageMark.stage_key, OrderStageMark.order_batch,
+                ProductionOrder.cc_batch_id, ProductionOrder.production_id)
          .join(ProductionOrder, ProductionOrder.id == OrderStageMark.order_id)
          .where(OrderStageMark.org_id == org_id, ProductionOrder.org_id == org_id,
                 OrderStageMark.stage_key.in_(keys)))
-    if production_id:
-        q = q.where(ProductionOrder.production_id == production_id)
-    else:
-        q = q.where(ProductionOrder.production_id.is_(None))
-    return {k for k, mb, ob in db.execute(q).all() if _same_batch(mb, ob)}
+    out = set()
+    for k, mb, ob, pid in db.execute(q).all():
+        channel = (pid or 0) if (pid or 0) in prods else 0
+        if channel == production_id and _same_batch(mb, ob):
+            out.add(k)
+    return out
 
 
 def _same_batch(mark_batch: str, order_batch: str) -> bool:
-    """Отметка принадлежит заказу, только если совпадает и партия (D-50).
+    """Запись принадлежит заказу, только если совпадает и партия (D-50).
 
-    Пустой идентификатор у отметки или у заказа бывает только у строк,
-    созданных откатившимся старым кодом; тогда сверяемся по id, как раньше.
+    Пустой идентификатор бывает только у строк, созданных откатившимся
+    старым кодом; тогда сверяемся по id, как раньше.
     """
     return not mark_batch or not order_batch or mark_batch == order_batch
-
-
-# ── Даты ─────────────────────────────────────────────────────────────────────
-
-def _d(value) -> date | None:
-    if value is None:
-        return None
-    if isinstance(value, datetime):
-        return value.date()
-    if isinstance(value, date):
-        return value
-    try:
-        return date.fromisoformat(str(value)[:10])
-    except ValueError:
-        return None
-
-
-def _median_days(values: list[int]) -> int:
-    return int(math.ceil(statistics.median(values)))
-
-
-def _channel_of(order: ProductionOrder, tracks: dict) -> int:
-    pid = order.production_id or 0
-    return pid if pid in tracks else 0
 
 
 def _lead_days(order: ProductionOrder, prods: dict, org_lead: int) -> int:
@@ -265,26 +291,43 @@ def _lead_days(order: ProductionOrder, prods: dict, org_lead: int) -> int:
 
 # ── Заказ целиком ────────────────────────────────────────────────────────────
 
-def _receipt_facts(rows: list[OrderReceipt]) -> dict:
+def _ordered_by_base(order: ProductionOrder) -> dict[str, float]:
+    out: dict[str, float] = {}
+    for i in order.items:
+        base = str(i.get("base_name") or "").strip()
+        if base:
+            out[base] = out.get(base, 0.0) + float(i.get("qty") or 0)
+    return out
+
+
+def _receipt_facts(order: ProductionOrder, rows: list[OrderReceipt]) -> dict:
     """Что известно о приходе по строкам приёмки.
 
     Источники не складываются (тот же приоритет, что у сверки приёмки,
-    `api._received_by_base`): два свидетельства об одном приходе это не
-    двойная поставка. Позиции со спором источников в сумму не входят, а
-    флаг `conflict` говорит, что разбор нужен человеку.
+    `api._received_by_base`). Пришедшее считается ПОСТРОЧНО по позициям заказа
+    и не больше заказанного: лишнее по одной позиции не закрывает недостачу
+    по другой, а позиция не из заказа в «пришло» не идёт. Заказ пришёл
+    целиком, только если каждая позиция пришла полностью и источники не спорят.
     """
     from app import api as _api
     received = _api._received_by_base(rows)
     conflicts = {c["base_name"] for c in _api._source_conflicts(rows)}
-    total = sum(v for b, v in received.items() if b not in conflicts and v > 0)
+    ordered = _ordered_by_base(order)
+    got = 0.0
+    complete = bool(ordered) and not conflicts
+    for base, need in ordered.items():
+        have = received.get(base, 0.0) if base not in conflicts else 0.0
+        got += max(0.0, min(have, need))
+        if have + 1e-9 < need:
+            complete = False
     first = None
     for r in rows:
         if float(r.qty or 0) > 0 and r.at is not None:
             d = _d(r.at)
             if d is not None and (first is None or d < first):
                 first = d
-    return {"qty": round(total, 3), "first_at": first, "conflict": bool(conflicts),
-            "from_ms": any(r.source != "manual" for r in rows)}
+    return {"qty": round(got, 3), "complete": complete, "first_at": first,
+            "conflict": bool(conflicts), "from_ms": any(r.source != "manual" for r in rows)}
 
 
 def _order_total(order: ProductionOrder) -> float:
@@ -308,8 +351,10 @@ def _load(db: Session, org_id: int):
         ).order_by(ProductionOrder.id)
     ).scalars())
     ids = [o.id for o in orders]
+    batch = {o.id: o.cc_batch_id or "" for o in orders}
     receipts: dict[int, list[OrderReceipt]] = {}
     marks: dict[int, list[OrderStageMark]] = {}
+    dues: dict[int, list[OrderDueDate]] = {}
     if ids:
         for r in db.execute(
             select(OrderReceipt).where(OrderReceipt.org_id == org_id,
@@ -317,37 +362,48 @@ def _load(db: Session, org_id: int):
             .order_by(OrderReceipt.id)
         ).scalars():
             receipts.setdefault(r.order_id, []).append(r)
-        batch = {o.id: o.cc_batch_id or "" for o in orders}
         for m in db.execute(
             select(OrderStageMark).where(OrderStageMark.org_id == org_id,
                                          OrderStageMark.order_id.in_(ids))
             .order_by(OrderStageMark.at, OrderStageMark.id)
         ).scalars():
-            if m.at is not None and _same_batch(m.order_batch, batch.get(m.order_id, "")):
+            if _d(m.at) is not None and _same_batch(m.order_batch, batch.get(m.order_id, "")):
                 marks.setdefault(m.order_id, []).append(m)
-    return orders, receipts, marks
+        for d in db.execute(
+            select(OrderDueDate).where(OrderDueDate.org_id == org_id,
+                                       OrderDueDate.order_id.in_(ids))
+            .order_by(OrderDueDate.id)
+        ).scalars():
+            if _d(d.due) is not None and _same_batch(d.order_batch, batch.get(d.order_id, "")):
+                dues.setdefault(d.order_id, []).append(d)
+    return orders, receipts, marks, dues
+
+
+def _first_marks(stages: list[dict], marks: list[OrderStageMark]) -> dict[str, date]:
+    keys = {s["key"] for s in stages}
+    first: dict[str, date] = {}
+    for m in marks:
+        d = _d(m.at)
+        if m.stage_key in keys and d is not None and (m.stage_key not in first or d < first[m.stage_key]):
+            first[m.stage_key] = d
+    return first
 
 
 def _progress(order: ProductionOrder, stages: list[dict], marks: list[OrderStageMark],
               facts: dict) -> dict:
     keys = [s["key"] for s in stages]
-    first_at: dict[str, date] = {}
-    for m in marks:
-        if m.stage_key in keys:
-            d = _d(m.at)
-            if d is not None and (m.stage_key not in first_at or d < first_at[m.stage_key]):
-                first_at[m.stage_key] = d
+    first_at = _first_marks(stages, marks)
     reached = -1
     for idx, k in enumerate(keys):
         if k in first_at:
             reached = idx
     last_key = keys[-1] if keys else ""
     last_marks = [m for m in marks if m.stage_key == last_key]
-    handed_all = any(m.qty is None for m in last_marks)
-    handed_qty = round(sum(float(m.qty or 0) for m in last_marks if m.qty is not None), 3)
     total = _order_total(order)
-    done = order.status == "received" or (total > 0 and not facts["conflict"]
-                                          and facts["qty"] >= total - 1e-9)
+    handed_qty = round(sum(float(m.qty or 0) for m in last_marks if m.qty is not None), 3)
+    # Сдано всё: отметка «целиком» или сумма сдач не меньше заказанного.
+    handed_all = any(m.qty is None for m in last_marks) or (total > 0 and handed_qty >= total - 1e-9)
+    done = order.status == "received" or facts["complete"]
     if done:
         phase = "done"
     elif (keys and last_key in first_at) or facts["qty"] > 0:
@@ -357,21 +413,15 @@ def _progress(order: ProductionOrder, stages: list[dict], marks: list[OrderStage
     else:
         phase = "ordered"
     sent = _d(order.sent_at) or _d(order.created_at)
-    if reached >= 0:
-        point_key, point_at = keys[reached], first_at[keys[reached]]
-    else:
-        point_key, point_at = SENT_POINT, sent
+    points = [(SENT_POINT, sent)] + [(k, first_at[k]) for k in keys[:reached + 1] if k in first_at]
     nxt = None
     if not done and reached + 1 < len(stages):
         nxt = stages[reached + 1]
     elif not done and stages and last_key in first_at and not handed_all:
-        # Сдача частями: последний этап можно отмечать ещё раз, с количеством.
-        nxt = stages[-1]
-    return {
-        "first_at": first_at, "reached": reached, "phase": phase, "done": done,
-        "point_key": point_key, "point_at": point_at, "sent": sent, "next": nxt,
-        "handed_all": handed_all, "handed_qty": handed_qty, "total": total,
-    }
+        nxt = stages[-1]   # сдача частями: последний этап отмечается ещё раз, с количеством
+    return {"first_at": first_at, "reached": reached, "phase": phase, "done": done,
+            "points": points, "sent": sent, "next": nxt,
+            "handed_all": handed_all, "handed_qty": handed_qty, "total": total}
 
 
 def _arrival(order: ProductionOrder, facts: dict) -> date | None:
@@ -379,10 +429,17 @@ def _arrival(order: ProductionOrder, facts: dict) -> date | None:
 
 
 def _history(orders, receipts, marks, tracks, today: date) -> dict:
-    """Медианы «точка → прибытие» по цехам из прошлых запусков."""
+    """Дни «точка → прибытие» по цехам, только по ЗАКРЫТЫМ заказам за 365 дней.
+
+    Незакрытый заказ с частичным приходом в историю не идёт: иначе он
+    прогнозировал бы сам себя, а счётчик «по N заказам» расходился бы с
+    таблицей скорости цехов.
+    """
     samples: dict[int, dict[str, list[int]]] = {}
     for o in orders:
-        facts = _receipt_facts(receipts.get(o.id, []))
+        facts = _receipt_facts(o, receipts.get(o.id, []))
+        if not (o.status == "received" or facts["complete"]):
+            continue
         arrived = _arrival(o, facts)
         if arrived is None or (today - arrived).days > HISTORY_DAYS:
             continue
@@ -391,48 +448,65 @@ def _history(orders, receipts, marks, tracks, today: date) -> dict:
         sent = _d(o.sent_at)
         if sent is not None and arrived >= sent:
             bucket.setdefault(SENT_POINT, []).append((arrived - sent).days)
-        keys = {s["key"] for s in tracks[ch]["stages"]}
-        first: dict[str, date] = {}
-        for m in marks.get(o.id, []):
-            d = _d(m.at)
-            if m.stage_key in keys and d is not None and (m.stage_key not in first or d < first[m.stage_key]):
-                first[m.stage_key] = d
-        for k, d in first.items():
+        for k, d in _first_marks(tracks[ch]["stages"], marks.get(o.id, [])).items():
             if arrived >= d:
                 bucket.setdefault(k, []).append((arrived - d).days)
     return samples
 
 
-def _forecast(order, prog, samples, tracks, prods, org_lead, today) -> dict:
+def _dates(order, prog, dues, samples, tracks, prods, org_lead, today) -> dict:
+    """Срок (договорённость) и оценка по истории цеха. См. докстринг модуля."""
     ch = _channel_of(order, tracks)
+    stage_names = {s["key"]: s["name"] for s in tracks[ch]["stages"]}
     plan = _d(order.eta_date)
-    hist = samples.get(ch, {}).get(prog["point_key"], [])
-    basis, n, when = "none", 0, None
-    if prog["point_at"] is not None and len(hist) >= MIN_HISTORY:
-        when = prog["point_at"] + timedelta(days=_median_days(hist))
-        basis, n = "history", len(hist)
+    due_rows = [d for d in dues if _d(d.due) is not None]
+    agreed = _d(due_rows[-1].due) if due_rows else None
+    lead = _lead_days(order, prods, org_lead)
+    if agreed is not None:
+        expected, basis = agreed, "due"
     elif plan is not None:
-        when, basis = plan, "plan"
-    elif prog["sent"] is not None:
-        lead = _lead_days(order, prods, org_lead)
-        if lead > 0:
-            when, basis = prog["sent"] + timedelta(days=lead), "lead"
-    late = None
-    if when is not None and not prog["done"] and when < today:
-        late = (today - when).days
-    vs_plan = (when - plan).days if (when is not None and plan is not None and basis != "plan") else None
-    return {"date": when.isoformat() if when else None, "basis": basis, "n": n,
-            "late_days": late, "vs_plan_days": vs_plan,
-            "plan_date": plan.isoformat() if plan else None}
+        expected, basis = plan, "plan"
+    elif prog["sent"] is not None and lead > 0:
+        expected, basis = prog["sent"] + timedelta(days=lead), "lead"
+    else:
+        expected, basis = None, "none"
+
+    est = None
+    hist = samples.get(ch, {})
+    # С самой поздней точки назад: если по последнему этапу истории мало,
+    # берётся предыдущий, по которому она есть (отметка не ухудшает оценку).
+    for key, at in reversed(prog["points"]):
+        vals = hist.get(key, [])
+        if at is not None and len(vals) >= MIN_HISTORY:
+            est = {"date": (at + timedelta(days=_median_days(vals))).isoformat(), "n": len(vals),
+                   "from": "отправки" if key == SENT_POINT else f"«{stage_names.get(key, key)}»"}
+            break
+    done = prog["done"]
+    late = (today - expected).days if (expected is not None and not done and expected < today) else None
+    risk = None
+    est_overdue = False
+    if est is not None and not done and not late:
+        ed = date.fromisoformat(est["date"])
+        if expected is not None and ed > expected:
+            risk = (ed - expected).days
+        if ed < today:
+            est_overdue = True
+    main = expected.isoformat() if expected else (est["date"] if est else None)
+    return {
+        "date": main, "basis": basis if expected else ("history" if est else "none"),
+        "late_days": late, "plan_date": plan.isoformat() if plan else None,
+        "due_date": agreed.isoformat() if agreed else None, "due_moves": max(0, len(due_rows) - 1),
+        "estimate": est, "risk_days": risk, "estimate_overdue": est_overdue,
+    }
 
 
-def _order_out(order, stages, prog, facts, fc, channel_name, marks, authors=None) -> dict:
+def _order_out(order, stages, prog, facts, fc, channel_id, channel_name) -> dict:
     arrived = _arrival(order, facts)
-    out = {
+    return {
         "id": order.id,
         "name": order.name,
         "status": order.status,
-        "channel_id": order.production_id or 0,
+        "channel_id": channel_id,
         "channel_name": channel_name,
         "items": _items_out(order),
         "total_qty": prog["total"],
@@ -452,55 +526,60 @@ def _order_out(order, stages, prog, facts, fc, channel_name, marks, authors=None
         "in_ms": bool(order.ms_doc_href),
         "forecast": fc,
     }
-    if authors is not None:
-        out["marks"] = [{
-            "id": m.id, "stage_key": m.stage_key, "stage_name": m.stage_name,
-            "at": _d(m.at).isoformat() if _d(m.at) else None,
-            "qty": m.qty, "note": m.note,
-            "by": authors.get(m.created_by, "") if m.created_by else "",
-            "created_at": m.created_at.isoformat() if m.created_at else None,
-        } for m in marks]
-    return out
+
+
+def _context(db: Session, org, today: date):
+    from app import analytics
+    prods = _productions(db, org.id)
+    tracks, channels = org_tracks(db, org.id, prods)
+    org_lead = int(analytics.extra_settings(org).get("lead_time_days") or 0)
+    orders, receipts, marks, dues = _load(db, org.id)
+    samples = _history(orders, receipts, marks, tracks, today)
+    return prods, tracks, channels, org_lead, orders, receipts, marks, dues, samples
+
+
+def _card(o, tracks, channels, prods, org_lead, receipts, marks, dues, samples, today):
+    ch = _channel_of(o, tracks)
+    stages = tracks[ch]["stages"]
+    facts = _receipt_facts(o, receipts.get(o.id, []))
+    prog = _progress(o, stages, marks.get(o.id, []), facts)
+    fc = _dates(o, prog, dues.get(o.id, []), samples, tracks, prods, org_lead, today)
+    name = next((c["name"] for c in channels if c["id"] == ch), "")
+    return _order_out(o, stages, prog, facts, fc, ch, name), prog, facts
 
 
 def board(db: Session, org, today: date | None = None) -> dict:
     """Всё для экрана «Производство» одним ответом."""
-    from app import analytics
     today = today or date.today()
-    tracks, channels = org_tracks(db, org.id)
-    prods = {p.id: p for p in db.execute(
-        select(Production).where(Production.org_id == org.id)).scalars()}
-    org_lead = int(analytics.extra_settings(org).get("lead_time_days") or 0)
-    orders, receipts, marks = _load(db, org.id)
-    samples = _history(orders, receipts, marks, tracks, today)
-    names = {c["id"]: c["name"] for c in channels}
+    prods, tracks, channels, org_lead, orders, receipts, marks, dues, samples = _context(db, org, today)
     out, used_channels = [], set()
     speed_acc: dict[int, dict] = {}
     for o in orders:
-        ch = _channel_of(o, tracks)
-        stages = tracks[ch]["stages"]
-        facts = _receipt_facts(receipts.get(o.id, []))
-        prog = _progress(o, stages, marks.get(o.id, []), facts)
-        fc = _forecast(o, prog, samples, tracks, prods, org_lead, today)
-        arrived = _arrival(o, facts)
+        card, prog, facts = _card(o, tracks, channels, prods, org_lead, receipts, marks, dues,
+                                  samples, today)
+        ch = card["channel_id"]
         acc = speed_acc.setdefault(ch, {"done": [], "on_time": [], "in_work": 0, "late": 0})
+        arrived = _arrival(o, facts)
         if prog["done"]:
             sent = _d(o.sent_at)
             if arrived is not None and (today - arrived).days <= HISTORY_DAYS:
                 if sent is not None and arrived >= sent:
                     acc["done"].append((arrived - sent).days)
-                plan = _d(o.eta_date)
-                if plan is not None:
-                    acc["on_time"].append(arrived <= plan)
-            # Принятое показываем 30 дней, дальше это история (она в скорости цеха).
+                # «Вовремя» против первой договорённости: первый срок от цеха,
+                # иначе плановая дата заказа.
+                first_due = next((_d(d.due) for d in dues.get(o.id, []) if _d(d.due)), None)
+                promise = first_due or _d(o.eta_date)
+                if promise is not None:
+                    acc["on_time"].append(arrived <= promise)
+            # Принятое на доске 30 дней, дальше это история (она в скорости цеха).
             if arrived is None or (today - arrived).days > RECEIVED_SHOW_DAYS:
                 continue
         else:
             acc["in_work"] += 1
-            if fc["late_days"]:
+            if card["forecast"]["late_days"]:
                 acc["late"] += 1
         used_channels.add(ch)
-        out.append(_order_out(o, stages, prog, facts, fc, names.get(ch, ""), []))
+        out.append(card)
     out.sort(key=lambda x: (x["forecast"]["date"] or "9999-99-99", x["id"]))
 
     speed = []
@@ -525,7 +604,7 @@ def board(db: Session, org, today: date | None = None) -> dict:
         })
 
     active = [x for x in out if x["phase"] != "done"]
-    horizon = today + timedelta(days=ARRIVING_WINDOW_DAYS)
+    horizon = (today + timedelta(days=ARRIVING_WINDOW_DAYS)).isoformat()
 
     def _left(x):
         return max(0.0, x["total_qty"] - x["received_qty"])
@@ -534,9 +613,12 @@ def board(db: Session, org, today: date | None = None) -> dict:
         "in_work": len(active),
         "in_work_qty": round(sum(_left(x) for x in active)),
         "late": sum(1 for x in active if x["forecast"]["late_days"]),
-        "arriving_qty": round(sum(
+        # Только то, что ждём в ближайшие 14 дней по сроку: опоздавшие сюда не
+        # входят, у них нового срока нет, и обещать их нельзя.
+        "waiting_qty": round(sum(
             _left(x) for x in active
-            if x["forecast"]["date"] and x["forecast"]["date"] <= horizon.isoformat())),
+            if not x["forecast"]["late_days"] and x["forecast"]["date"]
+            and today.isoformat() <= x["forecast"]["date"] <= horizon)),
         "received_qty": round(sum(x["received_qty"] or x["total_qty"]
                                   for x in out if x["phase"] == "done")),
     }
@@ -558,38 +640,32 @@ def board(db: Session, org, today: date | None = None) -> dict:
 
 
 def order_detail(db: Session, org, order_id: int, today: date | None = None) -> dict:
-    """Окно запуска: то же, что на доске, плюс история отметок с авторами."""
+    """Окно заказа: то же, что на доске, плюс история отметок и сроков с авторами."""
+    today = today or date.today()
     order = _own_order(db, org.id, order_id)
-    data = board(db, org, today)
-    card = next((x for x in data["orders"] if x["id"] == order.id), None)
-    tracks, channels = org_tracks(db, org.id)
-    ch = _channel_of(order, tracks)
-    marks = [m for m in db.execute(
-        select(OrderStageMark).where(OrderStageMark.org_id == org.id,
-                                     OrderStageMark.order_id == order.id)
-        .order_by(OrderStageMark.at, OrderStageMark.id)
-    ).scalars() if m.at is not None and _same_batch(m.order_batch, order.cc_batch_id or "")]
-    ids = {m.created_by for m in marks if m.created_by}
+    if order.status not in ("sent", "received"):
+        raise TrackingError("Заказ не найден", 404)
+    prods, tracks, channels, org_lead, orders, receipts, marks, dues, samples = _context(db, org, today)
+    card, _, _ = _card(order, tracks, channels, prods, org_lead, receipts, marks, dues, samples, today)
+    my_marks = marks.get(order.id, [])
+    my_dues = dues.get(order.id, [])
+    ids = {m.created_by for m in my_marks if m.created_by} | {d.created_by for d in my_dues if d.created_by}
     authors = {}
     if ids:
         authors = {uid: (name or email or "") for uid, name, email in db.execute(
             select(User.id, User.name, User.email).where(User.id.in_(ids))).all()}
-    if card is None:
-        # Принят давно (вне 30 дней доски): собираем карточку отдельно.
-        _, receipts, mk = _load(db, org.id)
-        facts = _receipt_facts(receipts.get(order.id, []))
-        prog = _progress(order, tracks[ch]["stages"], mk.get(order.id, []), facts)
-        fc = {"date": None, "basis": "none", "n": 0, "late_days": None,
-              "vs_plan_days": None, "plan_date": order.eta_date}
-        card = _order_out(order, tracks[ch]["stages"], prog, facts, fc,
-                          next((c["name"] for c in channels if c["id"] == ch), ""), [])
     card = dict(card)
-    card["marks"] = _order_out(order, [], {"total": 0, "sent": None, "phase": "", "first_at": {},
-                                          "reached": -1, "next": None, "handed_qty": 0,
-                                          "handed_all": False},
-                               {"qty": 0, "conflict": False, "from_ms": False, "first_at": None},
-                               {}, "", marks, authors)["marks"]
-    card["today"] = data["today"]
+    card["marks"] = [{
+        "id": m.id, "stage_key": m.stage_key, "stage_name": m.stage_name,
+        "at": _d(m.at).isoformat(), "qty": m.qty, "note": m.note,
+        "by": authors.get(m.created_by, "") if m.created_by else "",
+    } for m in my_marks]
+    card["dues"] = [{
+        "id": d.id, "due": _d(d.due).isoformat(), "note": d.note,
+        "by": authors.get(d.created_by, "") if d.created_by else "",
+        "at": d.created_at.date().isoformat() if d.created_at else None,
+    } for d in my_dues]
+    card["today"] = today.isoformat()
     return card
 
 
@@ -600,10 +676,17 @@ def _own_order(db: Session, org_id: int, order_id: int) -> ProductionOrder:
     return order
 
 
-# ── Отметки ──────────────────────────────────────────────────────────────────
+def _clean_note(note) -> str:
+    note = re.sub(r"\s+", " ", str(note or "")).strip()
+    if len(note) > NOTE_MAX:
+        raise TrackingError(f"Заметка не длиннее {NOTE_MAX} знаков")
+    return note
+
+
+# ── Отметки этапов ───────────────────────────────────────────────────────────
 
 def add_mark(db: Session, org, user_id: int | None, order_id: int, stage_key: str,
-             at: str | None, qty: float | None, note: str, today: date | None = None) -> dict:
+             at: str | None, qty, note: str, today: date | None = None) -> dict:
     today = today or date.today()
     order = _own_order(db, org.id, order_id)
     if order.status not in ("sent", "received"):
@@ -613,29 +696,26 @@ def add_mark(db: Session, org, user_id: int | None, order_id: int, stage_key: st
     stage = next((s for s in stages if s["key"] == stage_key), None)
     if stage is None:
         raise TrackingError("У этого цеха нет такого этапа. Обновите страницу.")
-    when = _d(at) if at else today
-    if when is None:
-        raise TrackingError("Дата задана неверно")
+    # Дату присылает страница по календарю человека: у сервера свой пояс, и
+    # ночью «сегодня» сервера бывает вчерашним днём пользователя.
+    when = parse_day(at) if at else today
     if when > today + timedelta(days=1):
         raise TrackingError("Этап нельзя отметить будущей датой")
     floor = (_d(order.created_at) or today) - timedelta(days=HISTORY_DAYS)
     if when < floor:
         raise TrackingError("Дата слишком ранняя для этого заказа")
-    note = re.sub(r"\s+", " ", str(note or "")).strip()
-    if len(note) > NOTE_MAX:
-        raise TrackingError(f"Заметка не длиннее {NOTE_MAX} знаков")
+    note = _clean_note(note)
     is_last = stage["key"] == stages[-1]["key"]
     if qty is not None:
         if not is_last:
             raise TrackingError("Количество отмечается только на последнем этапе (сдача частями)")
-        try:
-            qty = float(qty)
-        except (TypeError, ValueError):
+        if isinstance(qty, bool) or not isinstance(qty, (int, float)):
             raise TrackingError("Количество задано неверно")
-        if not (qty > 0) or qty > QTY_MAX or not math.isfinite(qty):
-            raise TrackingError(f"Количество от 1 до {QTY_MAX}")
-        if abs(qty - round(qty)) > 1e-9:
+        if not math.isfinite(qty) or qty != int(qty):
             raise TrackingError("Количество целым числом штук")
+        qty = int(qty)
+        if not (0 < qty <= QTY_MAX):
+            raise TrackingError(f"Количество от 1 до {QTY_MAX}")
     existing = [m for m in db.execute(
         select(OrderStageMark).where(OrderStageMark.org_id == org.id,
                                      OrderStageMark.order_id == order.id,
@@ -648,10 +728,11 @@ def add_mark(db: Session, org, user_id: int | None, order_id: int, stage_key: st
                 and (m.qty or None) == (qty or None) and (m.note or "") == note):
             return {"ok": True, "id": m.id, "repeat": True}
     if existing:
+        dates = [d for d in (_d(m.at) for m in existing) if d]
         if not is_last:
-            first = min(_d(m.at) for m in existing if _d(m.at))
+            when_txt = f" {min(dates):%d.%m.%Y}" if dates else ""
             raise TrackingError(
-                f"«{stage['name']}» уже отмечен {first:%d.%m.%Y}. Чтобы поменять дату, "
+                f"«{stage['name']}» уже отмечен{when_txt}. Чтобы поменять дату, "
                 "отмените прежнюю отметку.", 409)
         if any(m.qty is None for m in existing):
             raise TrackingError(
@@ -666,7 +747,13 @@ def add_mark(db: Session, org, user_id: int | None, order_id: int, stage_key: st
     )
     db.add(mark)
     db.flush()
-    return {"ok": True, "id": mark.id}
+    warn = ""
+    if is_last and qty is not None:
+        handed = sum(float(m.qty or 0) for m in existing if m.qty is not None) + qty
+        total = _order_total(order)
+        if total > 0 and handed > total + 1e-9:
+            warn = f"Сдано больше заказанного: {int(handed)} из {int(total)} шт"
+    return {"ok": True, "id": mark.id, "warning": warn}
 
 
 def delete_mark(db: Session, org_id: int, mark_id: int) -> dict:
@@ -677,4 +764,44 @@ def delete_mark(db: Session, org_id: int, mark_id: int) -> dict:
     if order is None or order.org_id != org_id or not _same_batch(mark.order_batch, order.cc_batch_id or ""):
         raise TrackingError("Отметка не найдена", 404)
     db.delete(mark)
+    return {"ok": True, "order_id": order.id}
+
+
+# ── Срок от цеха ─────────────────────────────────────────────────────────────
+
+def add_due(db: Session, org, user_id: int | None, order_id: int, due: str, note: str,
+            today: date | None = None) -> dict:
+    """Записать срок, который назвал цех. Новый срок не стирает прежний."""
+    today = today or date.today()
+    order = _own_order(db, org.id, order_id)
+    if order.status != "sent":
+        raise TrackingError("Срок записывается у заказа в производстве")
+    when = parse_day(due, "Срок")
+    sent = _d(order.sent_at) or _d(order.created_at) or today
+    if when < sent:
+        raise TrackingError("Срок не может быть раньше отправки заказа в производство")
+    if when > today + timedelta(days=DUE_AHEAD_DAYS):
+        raise TrackingError("Срок дальше двух лет, проверьте дату")
+    note = _clean_note(note)
+    rows = [d for d in db.execute(
+        select(OrderDueDate).where(OrderDueDate.org_id == org.id, OrderDueDate.order_id == order.id)
+        .order_by(OrderDueDate.id)
+    ).scalars() if _same_batch(d.order_batch, order.cc_batch_id or "")]
+    if rows and _d(rows[-1].due) == when and (rows[-1].note or "") == note:
+        return {"ok": True, "id": rows[-1].id, "repeat": True}
+    row = OrderDueDate(org_id=org.id, order_id=order.id, order_batch=order.cc_batch_id or "",
+                       due=when, note=note, created_by=user_id)
+    db.add(row)
+    db.flush()
+    return {"ok": True, "id": row.id}
+
+
+def delete_due(db: Session, org_id: int, due_id: int) -> dict:
+    row = db.get(OrderDueDate, due_id)
+    if row is None or row.org_id != org_id:
+        raise TrackingError("Срок не найден", 404)
+    order = db.get(ProductionOrder, row.order_id)
+    if order is None or order.org_id != org_id or not _same_batch(row.order_batch, order.cc_batch_id or ""):
+        raise TrackingError("Срок не найден", 404)
+    db.delete(row)
     return {"ok": True, "order_id": order.id}

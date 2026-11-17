@@ -18,7 +18,7 @@
     box-shadow: inset 0 1px 0 rgba(255,255,255,.85), 0 8px 30px rgba(46,46,96,.07); }
 
   /* ── сводка ── */
-  .pr-sum { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: 10px; margin-bottom: 12px; }
+  .pr-sum { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 10px; margin-bottom: 12px; }
   .pr-sum .t { padding: 12px 16px; }
   .pr-sum .v { font-size: 22px; font-weight: 700; letter-spacing: -.01em; font-variant-numeric: tabular-nums; }
   .pr-sum .l { font-size: 12.5px; color: var(--u-ink2); margin-top: 2px; }
@@ -31,7 +31,8 @@
   .pr-tools { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 0 0 10px; }
   .pr-tools .sp { flex: 1 1 auto; }
   .pr-chip { min-height: 34px; padding: 0 14px; border-radius: 999px; border: 1px solid var(--u-hair);
-    background: rgba(255,255,255,.6); color: var(--u-ink2); font-size: 13px; font-weight: 500; cursor: pointer; white-space: nowrap; }
+    background: rgba(255,255,255,.6); color: var(--u-ink2); font-size: 13px; font-weight: 500; cursor: pointer; white-space: nowrap;
+    max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
   .pr-chip:hover { background: #fff; color: var(--u-ink); }
   .pr-chip.on { background: var(--u-ink); color: #fff; border-color: var(--u-ink); }
   .pr-chip .n { margin-left: 5px; opacity: .8; font-variant-numeric: tabular-nums; }
@@ -77,6 +78,15 @@
   .pr-when .sub { font-weight: 400; color: var(--u-ink2); font-size: 12px; }
   .pr-when.late { color: #c4271d; }
   .pr-when.done { color: #1e7a3c; }
+  .pr-risk { font-size: 12px; color: #8a5a00; }
+  .pr-card.flash { box-shadow: 0 0 0 3px rgba(47,180,87,.55), 0 6px 18px rgba(46,46,96,.13); }
+  .pr-ro { font-size: 12.5px; color: var(--u-ink2); margin: -4px 2px 10px; }
+  .pr-link { border: 0; background: none; color: var(--u-accent); font: inherit; font-size: 12.5px; cursor: pointer; padding: 6px 0; text-decoration: underline; }
+  .pr-spd-m { display: none; }
+  .pr-spd-m .row { padding: 10px 0; border-bottom: 1px solid rgba(20,20,60,.06); font-size: 13px; }
+  .pr-spd-m .row b { display: block; margin-bottom: 2px; }
+  .pr-spd-m .row span { color: var(--u-ink2); }
+  body.pr-modal .hint-fab { display: none !important; }
   .pr-qty { font-size: 12.5px; color: var(--u-ink2); }
   .pr-qty b { color: var(--u-ink); font-weight: 600; }
   .pr-warn { font-size: 12px; color: #8a5a00; }
@@ -113,7 +123,7 @@
   .pr-dlg header .sub { font-size: 12.5px; color: var(--u-ink2); font-weight: 400; margin-top: 2px; }
   .pr-x { width: 40px; height: 40px; flex: 0 0 40px; border-radius: 50%; border: 0; background: rgba(120,120,128,.14); cursor: pointer; font-size: 18px; color: var(--u-ink2); }
   .pr-x:hover { background: rgba(120,120,128,.24); color: var(--u-ink); }
-  .pr-body { padding: 14px 18px 22px; overflow-y: auto; display: grid; gap: 16px; align-content: start; }
+  .pr-body { padding: 14px 18px 90px; overflow-y: auto; display: grid; gap: 16px; align-content: start; }
   .pr-sec h3 { font-size: 13px; font-weight: 700; margin-bottom: 8px; }
   .pr-big { font-size: 20px; font-weight: 700; }
   .pr-big.late { color: #c4271d; }
@@ -161,8 +171,8 @@
   }
   @media (max-width: 760px) {
     .main { padding: 10px 8px 40px; }
-    .pr-sum { grid-template-columns: repeat(2, minmax(0,1fr)); gap: 8px; }
-    .pr-sum .v { font-size: 19px; }
+    .pr-sum { grid-template-columns: repeat(3, minmax(0,1fr)); gap: 6px; }
+    .pr-sum .v { font-size: 18px; }
     .pr-board { grid-template-columns: 1fr; }
     .pr-board.as-list .pr-list { grid-template-columns: 1fr; }
     .pr-chip, .pr-btn, .pr-seg button { min-height: 44px; }
@@ -172,6 +182,14 @@
     .pr-in.w-date, .pr-in.w-num { width: 100%; }
     .pr-form .row > label { flex: 1 1 130px; }
     .pr-hist button { min-height: 44px; min-width: 44px; }
+    .pr-x, .pr-icon { min-width: 44px; min-height: 44px; width: 44px; height: 44px; flex-basis: 44px; }
+    .pr-toast button { min-height: 44px; }
+    .pr-note a { display: inline-block; padding: 12px 0; }
+    .pr-seg { display: none; }
+    .pr-speed table { display: none; }
+    .pr-spd-m { display: block; }
+    .pr-sum .t { padding: 9px 10px; }
+    .pr-sum .l { font-size: 11.5px; line-height: 1.3; }
   }
 </style>
 {% include "_mobile.html" %}
@@ -186,10 +204,9 @@
 <div class="main" id="pr-main" data-can-mark="{{ 1 if can_mark else 0 }}">
   <section class="pr-sum" id="pr-summary" aria-label="Сводка производства">
     <div class="t pr-glass"><div class="v" id="s-work">…</div><div class="l" id="s-work-l">в работе</div></div>
-    <button type="button" class="t pr-glass" id="s-late-btn" aria-pressed="false" title="Показать только опаздывающие">
-      <div class="v" id="s-late">…</div><div class="l">опаздывают</div></button>
-    <div class="t pr-glass"><div class="v" id="s-soon">…</div><div class="l">шт приедет за 14 дней</div></div>
-    <div class="t pr-glass"><div class="v" id="s-done">…</div><div class="l">шт принято за 30 дней</div></div>
+    <button type="button" class="t pr-glass" id="s-late-btn" aria-pressed="false">
+      <div class="v" id="s-late">…</div><div class="l" id="s-late-l">опаздывают</div></button>
+    <div class="t pr-glass"><div class="v" id="s-soon">…</div><div class="l">шт ждём в ближайшие 14 дней</div></div>
   </section>
 
   <div class="pr-tools">
@@ -201,6 +218,7 @@
     </div>
     <button type="button" class="pr-btn need-orders_manage" id="pr-stages-open">Этапы цехов</button>
   </div>
+  <div class="pr-ro" id="pr-ro" style="display:none">Только просмотр: отмечать этапы и приход может сотрудник с правом «Вести заказы».</div>
   <div class="pr-note" id="pr-drafts" style="display:none"></div>
 
   <div id="pr-board" class="pr-board" aria-live="polite"><div class="pr-loading">Загружаю…</div></div>
@@ -212,6 +230,7 @@
       <th>Цех</th><th class="r">Пришло за год</th><th class="r">Заказ → склад</th><th class="r">Вовремя</th>
       <th>От этапа до склада</th><th class="r">В работе</th><th class="r">Опаздывают</th>
     </tr></thead><tbody id="pr-speed-tb"></tbody></table>
+    <div class="pr-spd-m" id="pr-speed-m"></div>
   </section>
 </div>
 
@@ -224,7 +243,7 @@
 
 <aside class="pr-dlg" id="pr-stg" role="dialog" aria-modal="true" aria-labelledby="pr-stg-title">
   <header><div style="flex:1 1 auto"><h2 id="pr-stg-title">Этапы цехов</h2>
-    <div class="sub">По этим этапам цех ведёт запуск. На сроки и деньги «Заказа» они не влияют.</div></div>
+    <div class="sub">Этапы, которые вы отмечаете на доске. Срок и платежи на «Заказе» от них не зависят. Последний этап особый: после него заказ считается сданным цехом и едет на склад, его можно отмечать частями.</div></div>
     <button type="button" class="pr-x" data-close aria-label="Закрыть">✕</button></header>
   <div class="pr-body">
     <label style="display:grid;gap:4px;font-size:12.5px;color:var(--u-ink2)">Цех
@@ -244,19 +263,22 @@
 (function(){
   "use strict";
   var CAN = document.getElementById("pr-main").getAttribute("data-can-mark") === "1";
-  var DATA = null, CH = "all", VIEW = (window.innerWidth <= 760 ? "list" : "board"), ONLY_LATE = false;
-  var OPEN_ID = null, LAST_FOCUS = null, TOAST_TIMER = null;
+  var MOBILE = window.matchMedia("(max-width: 760px)");
+  var DATA = null, CH = "all", VIEW = "board", ONLY_LATE = false;
+  var OPEN_ID = null, LAST_FOCUS_ID = null, LAST_FOCUS = null, TOAST_TIMER = null;
 
   function esc(s){ return String(s==null?"":s).replace(/[&<>"']/g,function(c){ return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]; }); }
   function n0(v){ return Math.round(Number(v)||0).toLocaleString("ru-RU"); }
   function qtyTxt(v){ v=Number(v)||0; return (Math.abs(v-Math.round(v))<1e-9? Math.round(v) : v).toLocaleString("ru-RU"); }
   function plural(n,a,b,c){ n=Math.abs(n)%100; var m=n%10; if(n>10&&n<20) return c; if(m>1&&m<5) return b; if(m===1) return a; return c; }
+  function days(n){ return n+" "+plural(n,"день","дня","дней"); }
   function dmy(iso, full){
     if(!iso) return "";
     var p=String(iso).slice(0,10).split("-"); if(p.length<3) return iso;
     var thisYear = DATA && DATA.today ? DATA.today.slice(0,4) : String(new Date().getFullYear());
     return p[2]+"."+p[1]+((full||p[0]!==thisYear)?"."+p[0]:"");
   }
+  /* Дата по календарю человека, а не сервера: у сервера свой часовой пояс. */
   function todayIso(){ var d=new Date(); return d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+String(d.getDate()).padStart(2,"0"); }
 
   async function api(url, opts){
@@ -266,7 +288,11 @@
       body:o.body?JSON.stringify(o.body):undefined});
     if(!r.ok){
       var msg="Не получилось ("+r.status+")";
-      try{ var j=await r.json(); if(j&&typeof j.detail==="string") msg=j.detail; }catch(_){}
+      try{
+        var j=await r.json();
+        if(j&&typeof j.detail==="string") msg=j.detail;
+        else if(j&&Array.isArray(j.detail)) msg="Проверьте введённое: "+j.detail.map(function(x){ return x.msg||""; }).join("; ");
+      }catch(_){}
       if(r.status===401) msg="Сессия закончилась. Войдите снова.";
       throw new Error(msg);
     }
@@ -278,72 +304,75 @@
     var it=(o.items||[]).filter(function(i){ return i.qty>0; });
     if(!it.length) return "";
     var first=it.slice(0,2).map(function(i){ return esc(i.base_name)+" · "+qtyTxt(i.qty)+" шт"; }).join("<br>");
-    var more=it.length>2 ? "<br>и ещё "+(it.length-2)+" "+plural(it.length-2,"модель","модели","моделей") : "";
+    var more=it.length>2 ? "<br>и ещё "+(it.length-2)+" "+plural(it.length-2,"позиция","позиции","позиций") : "";
     var tot = it.length>1 ? '<br><b style="color:var(--u-ink);font-weight:600">всего '+qtyTxt(o.total_qty)+' шт</b>' : "";
     return first+more+tot;
   }
   function stageLine(o){
     if(o.phase==="done") return "";
-    if(o.reached<0) return '<span class="pr-stage">Заказано'+(o.sent_at?" "+dmy(o.sent_at):"")+'</span>';
+    if(o.reached<0) return '<span class="pr-stage">Отправлен в производство'+(o.sent_at?" "+dmy(o.sent_at):"")+'</span>';
     var s=o.stages[o.reached];
     return '<span class="pr-stage"><b>'+esc(s.name)+'</b>'+(s.at?" · "+dmy(s.at):"")+'</span>';
   }
-  var BASIS = {history:"по прошлым запускам цеха", plan:"по плану заказа", lead:"по сроку цеха", none:""};
+  var BASIS = {due:"срок от цеха", plan:"план заказа", lead:"по сроку цеха из настроек", history:"оценка по истории цеха", none:""};
+  function estText(f){
+    var e=f.estimate; if(!e) return "";
+    return "по истории цеха ≈ "+dmy(e.date)+" (от "+e.from+", "+e.n+" "+plural(e.n,"заказ","заказа","заказов")+")";
+  }
+  /* big=true для окна заказа. Красное только «опаздывает» от срока; оценка по
+     истории это подсказка и красной не бывает. */
   function whenHtml(o, big){
     var f=o.forecast||{};
-    if(o.phase==="done"){
-      return '<div class="'+(big?"pr-big":"pr-when done")+'">Принято'+(o.arrived_at?" "+dmy(o.arrived_at):"")+'</div>';
+    var main = big ? "pr-big" : "pr-when", sub = big ? "pr-why" : "pr-qty";
+    if(o.phase==="done") return '<div class="'+main+(big?"":" done")+'">Принято'+(o.arrived_at?" "+dmy(o.arrived_at):"")+'</div>';
+    if(f.late_days){
+      return '<div class="'+main+' late pr-when-late">Опаздывает на '+days(f.late_days)+'</div>'+
+        '<div class="'+sub+'">'+esc(BASIS[f.basis])+' '+dmy(f.date)+(f.due_moves?", срок переносили "+f.due_moves+" "+plural(f.due_moves,"раз","раза","раз"):"")+'</div>'+
+        (f.estimate?'<div class="'+sub+'">'+esc(estText(f))+'</div>':"")+
+        (big?"":"");
     }
     if(!f.date){
-      return '<div class="'+(big?"pr-big":"pr-when")+'">Дата неизвестна</div>'+
-        (big?'<div class="pr-why">Нет плановой даты, срока цеха и истории. Укажите срок цеха в настройках производства.</div>':"");
+      return '<div class="'+main+'">Срока нет</div><div class="'+sub+'">'+(CAN?"Запишите срок, который назвал цех":"Срок цеху не назначен")+'</div>';
     }
-    var cls=big?"pr-big":"pr-when";
-    if(f.late_days){
-      return '<div class="'+cls+' late pr-when-late">Опаздывает на '+f.late_days+' '+plural(f.late_days,"день","дня","дней")+
-        '</div><div class="'+(big?"pr-why":"pr-qty")+'">'+(f.basis==="plan"?"по плану":"ждали")+' к '+dmy(f.date)+
-        (big&&BASIS[f.basis]?", "+BASIS[f.basis]+(f.n?" ("+f.n+")":""):"")+'</div>';
-    }
-    var approx = f.basis==="plan" ? "" : "≈ ";
-    var sub = f.basis==="history" ? "по "+f.n+" "+plural(f.n,"прошлому запуску","прошлым запускам","прошлым запускам")
-            : f.basis==="plan" ? "по плану" : "по сроку цеха";
-    var dev = (f.vs_plan_days && f.vs_plan_days>0) ? ', позже плана на '+f.vs_plan_days+' дн' :
-              (f.vs_plan_days && f.vs_plan_days<0) ? ', раньше плана на '+(-f.vs_plan_days)+' дн' : "";
-    if(big){
-      return '<div class="pr-big">На складе '+approx+dmy(f.date)+'</div><div class="pr-why">'+esc(sub)+dev+
-        (f.plan_date && f.basis!=="plan" ? ' · план '+dmy(f.plan_date) : '')+'</div>';
-    }
-    return '<div class="pr-when">На складе '+approx+dmy(f.date)+' <span class="sub">'+esc(sub)+esc(dev)+'</span></div>';
+    var head = f.basis==="history" ? "На складе ≈ "+dmy(f.date) : "Срок "+dmy(f.date);
+    var html='<div class="'+main+'">'+head+(big?"":' <span class="sub">'+esc(BASIS[f.basis])+'</span>')+'</div>';
+    if(big) html+='<div class="pr-why">'+esc(BASIS[f.basis])+(f.basis==="history"&&f.estimate?" ("+f.estimate.n+" "+plural(f.estimate.n,"заказ","заказа","заказов")+")":"")+
+      (f.plan_date && f.basis==="due" ? " · план заказа был "+dmy(f.plan_date) : "")+
+      (f.due_moves?" · срок переносили "+f.due_moves+" "+plural(f.due_moves,"раз","раза","раз"):"")+'</div>';
+    if(f.risk_days) html+='<div class="pr-risk">'+esc(estText(f))+', на '+days(f.risk_days)+' позже срока</div>';
+    else if(f.estimate_overdue) html+='<div class="pr-risk">По истории цеха уже должен был прийти ('+dmy(f.estimate.date)+'). Стоит уточнить у цеха.</div>';
+    else if(big && f.estimate && f.basis!=="history") html+='<div class="pr-why">'+esc(estText(f))+'</div>';
+    return html;
   }
   function qtyHtml(o){
     var parts=[];
-    if(o.handed_qty>0 && !o.handed_all) parts.push('сдано <b>'+qtyTxt(o.handed_qty)+'</b> из '+qtyTxt(o.total_qty));
-    if(o.received_qty>0 && o.phase!=="done") parts.push('пришло <b>'+qtyTxt(o.received_qty)+'</b> из '+qtyTxt(o.total_qty));
-    if(o.phase==="done" && o.received_qty>0 && o.received_qty < o.total_qty - 1e-9)
-      parts.push('пришло <b>'+qtyTxt(o.received_qty)+'</b> из '+qtyTxt(o.total_qty));
+    if(o.handed_qty>0 && !(o.handed_all && o.handed_qty>=o.total_qty && o.phase==="done")) parts.push('сдано <b>'+qtyTxt(o.handed_qty)+'</b> из '+qtyTxt(o.total_qty));
+    if(o.received_qty>0 && (o.phase!=="done" || o.received_qty < o.total_qty - 1e-9)) parts.push('пришло <b>'+qtyTxt(o.received_qty)+'</b> из '+qtyTxt(o.total_qty));
     var html = parts.length ? '<div class="pr-qty">'+parts.join(" · ")+'</div>' : "";
     if(o.receipt_conflict) html += '<div class="pr-warn">Приёмка расходится между МойСкладом и ручной отметкой</div>';
     return html;
   }
+  function isLastNext(o){ return o.next && o.stages.length && o.next.key===o.stages[o.stages.length-1].key; }
   function nextLabel(o){
     if(!o.next) return "";
-    var last = o.stages.length && o.next.key===o.stages[o.stages.length-1].key;
-    if(last && o.stages[o.stages.length-1].at) return "+ ещё сдача…";
-    return "→ "+o.next.name+(last?"…":"");
+    if(isLastNext(o) && o.stages[o.stages.length-1].at) return "+ ещё сдача";
+    return "→ "+o.next.name;
   }
   function cardHtml(o){
     var late = o.forecast && o.forecast.late_days;
     var dots = o.phase==="done" ? "" : '<div class="pr-steps" aria-hidden="true">'+o.stages.map(function(s,i){
       return '<span class="pr-dot'+(i<=o.reached?" on":"")+'" title="'+esc(s.name)+'"></span>'; }).join("")+'</div>';
     var nb = (CAN && o.next && o.phase!=="done")
-      ? '<button type="button" class="pr-next" data-next="'+o.id+'">'+esc(nextLabel(o))+'</button>' : "";
-    return '<div class="pr-card'+(late?" late":"")+'" tabindex="0" role="button" data-open="'+o.id+'" aria-label="'+esc(o.name)+'">'+
+      ? '<button type="button" class="pr-next" data-next="'+o.id+'" aria-label="'+esc(o.name)+': '+esc(nextLabel(o))+'">'+esc(nextLabel(o))+'</button>' : "";
+    var stageTxt = o.phase==="done" ? "принят" : (o.reached>=0 ? o.stages[o.reached].name : "отправлен в производство");
+    return '<div class="pr-card'+(late?" late":"")+'" tabindex="0" role="button" data-open="'+o.id+'" aria-label="'+
+      esc(o.name+", "+o.channel_name+", "+stageTxt+(late?", опаздывает на "+days(late):""))+'">'+
       '<div class="pr-c-top"><span class="pr-c-name">'+esc(o.name)+'</span><span class="pr-c-ch">'+esc(o.channel_name)+'</span></div>'+
       '<div class="pr-c-items">'+itemsLine(o)+'</div>'+dots+stageLine(o)+whenHtml(o,false)+qtyHtml(o)+nb+'</div>';
   }
 
   /* ── экран ── */
-  var COLS=[["ordered","Заказано"],["work","В работе"],["shipped","Сдано, едет"],["done","Принято за 30 дней"]];
+  var COLS=[["ordered","Отправлено в цех"],["work","В работе"],["shipped","Сдано, едет"],["done","Принято за 30 дней"]];
   function visible(){
     return (DATA.orders||[]).filter(function(o){
       if(CH!=="all" && String(o.channel_id)!==CH) return false;
@@ -352,49 +381,56 @@
     });
   }
   function render(){
-    var s=DATA.summary;
+    var s=DATA.summary, empty=!(DATA.orders||[]).length;
+    document.getElementById("pr-summary").style.display = empty ? "none" : "";
+    document.querySelector(".pr-tools").style.display = empty ? "none" : "";
     document.getElementById("s-work").textContent=n0(s.in_work);
-    document.getElementById("s-work-l").textContent=plural(s.in_work,"запуск","запуска","запусков")+" в работе, "+n0(s.in_work_qty)+" шт";
+    document.getElementById("s-work-l").textContent=plural(s.in_work,"заказ","заказа","заказов")+" в работе, "+n0(s.in_work_qty)+" шт";
     document.getElementById("s-late").textContent=n0(s.late);
+    document.getElementById("s-late-l").textContent=(ONLY_LATE?"показаны только они, нажмите, чтобы показать все":"опаздывают");
     document.getElementById("s-late-btn").classList.toggle("bad", s.late>0);
     document.getElementById("s-late-btn").setAttribute("aria-pressed", ONLY_LATE?"true":"false");
-    document.getElementById("s-soon").textContent=n0(s.arriving_qty);
-    document.getElementById("s-done").textContent=n0(s.received_qty);
+    document.getElementById("s-late-btn").setAttribute("aria-label", "Опаздывают: "+s.late+". "+(ONLY_LATE?"Показать все заказы":"Показать только опаздывающие"));
+    document.getElementById("s-soon").textContent=n0(s.waiting_qty);
+    document.getElementById("pr-ro").style.display = (!CAN && !empty) ? "" : "none";
+    document.getElementById("pr-stages-open").style.display = (CAN && (DATA.channels||[]).length) ? "" : "none";
 
-    var counts={}; (DATA.orders||[]).forEach(function(o){ counts[o.channel_id]=(counts[o.channel_id]||0)+1; });
-    var chs=(DATA.channels||[]).filter(function(c){ return counts[c.id]; });
+    var counts={}; (DATA.orders||[]).forEach(function(o){ if(o.phase!=="done") counts[o.channel_id]=(counts[o.channel_id]||0)+1; });
+    var present={}; (DATA.orders||[]).forEach(function(o){ present[o.channel_id]=1; });
+    var chs=(DATA.channels||[]).filter(function(c){ return present[c.id]; });
     var chipHtml = chs.length>1 ? ['<button type="button" class="pr-chip'+(CH==="all"?" on":"")+'" data-ch="all">Все цеха</button>']
-      .concat(chs.map(function(c){ return '<button type="button" class="pr-chip'+(CH===String(c.id)?" on":"")+'" data-ch="'+c.id+'">'+
-        esc(c.name)+'<span class="n">'+counts[c.id]+'</span></button>'; })).join("") : "";
+      .concat(chs.map(function(c){ return '<button type="button" class="pr-chip'+(CH===String(c.id)?" on":"")+'" data-ch="'+c.id+'" title="'+esc(c.name)+'">'+
+        esc(c.name)+(counts[c.id]?'<span class="n">'+counts[c.id]+'</span>':'')+'</button>'; })).join("") : "";
     document.getElementById("pr-chips").innerHTML=chipHtml;
 
     var dn=document.getElementById("pr-drafts");
     if(DATA.drafts>0){
       dn.style.display="";
-      dn.innerHTML='Черновиков на «Заказе»: '+DATA.drafts+'. Они появятся здесь, когда вы отправите их в производство. <a href="/replenish">Открыть «Заказ»</a>';
+      dn.innerHTML='Черновиков на «Заказе»: '+DATA.drafts+'. Здесь они появятся после отправки в производство. <a href="/replenish">Открыть «Заказ»</a>';
     } else dn.style.display="none";
 
-    document.querySelectorAll(".pr-seg button").forEach(function(b){ b.classList.toggle("on", b.getAttribute("data-view")===VIEW); });
+    var view = MOBILE.matches ? "list" : VIEW;
+    document.querySelectorAll(".pr-seg button").forEach(function(b){ b.classList.toggle("on", b.getAttribute("data-view")===view); });
     var board=document.getElementById("pr-board");
     var list=visible();
-    if(!(DATA.orders||[]).length){
+    if(empty){
       board.className="pr-board as-list";
       board.innerHTML='<div class="pr-empty pr-glass"><h2>Здесь будет ход производства</h2>'+
-        '<p>Отправьте заказ в производство на странице «Заказ», и он сам появится здесь в колонке «Заказано». '+
-        'Дальше отмечайте этапы цеха одним нажатием, а дата «на складе» посчитается сама.</p>'+
-        '<a class="pr-btn primary" style="display:inline-flex;align-items:center" href="/replenish">Открыть «Заказ»</a></div>';
-    } else if(VIEW==="list"){
+        '<p>Отправьте заказ в производство на странице «Заказ», и он сам появится здесь. Дальше отмечайте этапы цеха одним нажатием и записывайте срок, который назвал цех: опоздания будут видны сразу.</p>'+
+        '<p style="font-size:12.5px">Заказы поставщику, заведённые прямо в МойСкладе, сюда пока не попадают: здесь видны заказы, созданные в «Обороте».</p>'+
+        '<a class="pr-btn primary" style="display:inline-flex;align-items:center;text-decoration:none" href="/replenish">Открыть «Заказ»</a></div>';
+    } else if(view==="list"){
       board.className="pr-board as-list";
       var act=list.filter(function(o){ return o.phase!=="done"; }), dn2=list.filter(function(o){ return o.phase==="done"; });
       board.innerHTML='<section class="pr-col pr-glass"><h2>Что впереди <span class="n">'+act.length+'</span></h2><div class="pr-list">'+
         (act.length?act.map(cardHtml).join(""):'<div class="empty">'+(ONLY_LATE?"Опаздывающих нет.":"Ничего в работе.")+'</div>')+'</div></section>'+
-        (dn2.length?'<section class="pr-col pr-glass"><h2>Принято за 30 дней <span class="n">'+dn2.length+'</span></h2><div class="pr-list">'+dn2.map(cardHtml).join("")+'</div></section>':"");
+        (dn2.length?'<section class="pr-col pr-glass"><h2>Принято за 30 дней <span class="n">'+dn2.length+'</span></h2><div class="pr-list">'+dn2.slice().reverse().map(cardHtml).join("")+'</div></section>':"");
     } else {
       board.className="pr-board";
       board.innerHTML=COLS.map(function(c){
         var items=list.filter(function(o){ return o.phase===c[0]; });
         if(c[0]==="done") items=items.slice().reverse();
-        var q=items.reduce(function(a,o){ return a+(Number(o.total_qty)||0); },0);
+        var q=items.reduce(function(a,o){ return a+(c[0]==="done"?(Number(o.received_qty)||Number(o.total_qty)||0):Math.max(0,(Number(o.total_qty)||0)-(Number(o.received_qty)||0))); },0);
         return '<section class="pr-col pr-glass" data-col="'+c[0]+'"><h2>'+c[1]+' <span class="n">'+items.length+(items.length?' · '+n0(q)+' шт':'')+'</span></h2>'+
           '<div class="pr-list">'+(items.length?items.map(cardHtml).join(""):'<div class="empty">Пусто</div>')+'</div></section>';
       }).join("");
@@ -406,16 +442,21 @@
     var box=document.getElementById("pr-speed");
     if(!sp.length){ box.style.display="none"; return; }
     box.style.display="";
-    document.getElementById("pr-speed-lead").textContent="По запускам, пришедшим за последний год. Медиана: половина запусков быстрее, половина дольше. "+
-      "Дата «на складе» считается по этим числам, когда у цеха есть хотя бы "+DATA.min_history+" "+plural(DATA.min_history,"пришедший запуск","пришедших запуска","пришедших запусков")+".";
+    sp=sp.slice().sort(function(a,b){ return (b.median_days||0)-(a.median_days||0); });
+    document.getElementById("pr-speed-lead").textContent="По заказам, пришедшим за последний год, медленные сверху. Медиана: половина заказов быстрее, половина дольше.";
+    function stTxt(r){ return r.stages.filter(function(s){ return s.median_to_arrival!=null; })
+        .map(function(s){ return esc(s.name)+" → "+s.median_to_arrival+" дн"; }); }
     document.getElementById("pr-speed-tb").innerHTML=sp.map(function(r){
-      var st=r.stages.filter(function(s){ return s.median_to_arrival!=null; })
-        .map(function(s){ return esc(s.name)+" → "+s.median_to_arrival+" дн"; }).join("<br>");
       return '<tr><td><b>'+esc(r.channel_name)+'</b></td><td class="r">'+r.done+'</td>'+
         '<td class="r">'+(r.median_days!=null?r.median_days+" дн":"нет данных")+'</td>'+
-        '<td class="r">'+(r.on_time_share!=null?Math.round(r.on_time_share*100)+" %"+'<div class="st">из '+r.on_time_n+'</div>':"нет плана")+'</td>'+
-        '<td class="st">'+(st||"мало отметок этапов")+'</td><td class="r">'+r.in_work+'</td>'+
+        '<td class="r">'+(r.on_time_share!=null?Math.round(r.on_time_share*100)+" %"+'<div class="st">из '+r.on_time_n+'</div>':"нет срока")+'</td>'+
+        '<td class="st">'+(stTxt(r).join("<br>")||"мало отметок этапов")+'</td><td class="r">'+r.in_work+'</td>'+
         '<td class="r'+(r.late?" bad":"")+'">'+r.late+'</td></tr>';
+    }).join("");
+    document.getElementById("pr-speed-m").innerHTML=sp.map(function(r){
+      return '<div class="row"><b>'+esc(r.channel_name)+'</b><span>заказ → склад '+(r.median_days!=null?r.median_days+" дн":"нет данных")+
+        ' · вовремя '+(r.on_time_share!=null?Math.round(r.on_time_share*100)+" %":"нет срока")+
+        ' · в работе '+r.in_work+(r.late?' · <b style="display:inline;color:#c4271d">опаздывают '+r.late+'</b>':'')+'</span></div>';
     }).join("");
   }
 
@@ -431,17 +472,25 @@
     }
   }
   function byId(id){ return (DATA.orders||[]).find(function(o){ return o.id===id; }); }
+  function focusCard(id, flash){
+    var c=document.querySelector('#pr-board [data-open="'+id+'"]');
+    if(!c) return;
+    c.scrollIntoView({block:"center", behavior:"smooth"});
+    c.focus({preventScroll:true});
+    if(flash){ c.classList.add("flash"); setTimeout(function(){ c.classList.remove("flash"); }, 1600); }
+  }
 
   /* ── быстрая отметка ── */
   async function quickNext(id, btn){
     var o=byId(id); if(!o||!o.next) return;
-    var last = o.stages.length && o.next.key===o.stages[o.stages.length-1].key;
-    if(last){ openOrder(id, false, true); return; }
+    if(isLastNext(o)){ openOrder(id, false, true); return; }
     btn.disabled=true;
     try{
-      var r=await api("/api/production/orders/"+id+"/marks",{method:"POST",body:{stage_key:o.next.key}});
-      toast("«"+o.next.name+"» отмечен сегодня", r.id);
+      var r=await api("/api/production/orders/"+id+"/marks",{method:"POST",body:{stage_key:o.next.key, at:todayIso()}});
+      toast(o.name+": «"+o.next.name+"» "+dmy(todayIso()), r.id);
       await load();
+      /* Карточка могла переехать: показываем, где она теперь, и держим на ней фокус. */
+      focusCard(id, true);
     }catch(e){ btn.disabled=false; alert(e.message); }
   }
   function toast(text, markId){
@@ -456,22 +505,40 @@
       u.disabled=false;
     };
     t.classList.add("open");
-    clearTimeout(TOAST_TIMER); TOAST_TIMER=setTimeout(function(){ t.classList.remove("open"); }, 7000);
+    clearTimeout(TOAST_TIMER); TOAST_TIMER=setTimeout(function(){ t.classList.remove("open"); }, 8000);
   }
 
-  /* ── окно запуска ── */
+  /* ── окна ── */
   function openDlg(el){
     LAST_FOCUS=document.activeElement;
+    var c=LAST_FOCUS && LAST_FOCUS.closest && LAST_FOCUS.closest("[data-open]");
+    LAST_FOCUS_ID = c ? c.getAttribute("data-open") : null;
     document.getElementById("pr-ovl").classList.add("open");
+    document.body.classList.add("pr-modal");
     el.classList.add("open");
     var f=el.querySelector(".pr-x"); if(f) f.focus();
   }
   function closeDlg(){
     document.querySelectorAll(".pr-dlg.open").forEach(function(d){ d.classList.remove("open"); });
     document.getElementById("pr-ovl").classList.remove("open");
+    document.body.classList.remove("pr-modal");
     OPEN_ID=null;
     if(LAST_FOCUS && document.body.contains(LAST_FOCUS)) LAST_FOCUS.focus();
+    else if(LAST_FOCUS_ID) focusCard(LAST_FOCUS_ID, false);
   }
+  /* Tab не уходит из открытого окна на страницу за ним. */
+  document.addEventListener("keydown",function(e){
+    var dlg=document.querySelector(".pr-dlg.open");
+    if(!dlg) return;
+    if(e.key==="Escape"){ closeDlg(); return; }
+    if(e.key!=="Tab") return;
+    var f=[].slice.call(dlg.querySelectorAll("button,input,select,a[href],[tabindex]")).filter(function(x){ return !x.disabled && x.offsetParent!==null; });
+    if(!f.length) return;
+    if(e.shiftKey && document.activeElement===f[0]){ e.preventDefault(); f[f.length-1].focus(); }
+    else if(!e.shiftKey && document.activeElement===f[f.length-1]){ e.preventDefault(); f[0].focus(); }
+  });
+
+  /* ── окно заказа ── */
   async function openOrder(id, refresh, focusQty){
     OPEN_ID=id;
     var dlg=document.getElementById("pr-dlg"), body=document.getElementById("pr-dlg-body");
@@ -486,87 +553,144 @@
     var tl=d.stages.map(function(s,i){
       return '<li class="'+(s.at?"on":"")+(i===d.reached?" cur":"")+'"><span class="b"></span><span class="nm">'+esc(s.name)+'</span><span class="dt">'+(s.at?dmy(s.at,true):"")+'</span></li>';
     }).join("");
+    var open = d.phase!=="done";
     var form="";
-    if(d.can_mark && d.phase!=="done"){
+    if(d.can_mark && open){
       var opts=d.stages.filter(function(s){ return !s.at || (last && s.key===last.key && !d.handed_all); });
       var def = d.next ? d.next.key : (opts.length?opts[0].key:"");
       if(opts.length){
         form='<div class="pr-form" id="mk-form"><div class="row">'+
           '<label>Этап<select class="pr-in" id="mk-stage">'+opts.map(function(s){ return '<option value="'+esc(s.key)+'"'+(s.key===def?" selected":"")+'>'+esc(s.name)+'</option>'; }).join("")+'</select></label>'+
           '<label>Дата<input class="pr-in w-date" type="date" id="mk-at" value="'+todayIso()+'" max="'+todayIso()+'"></label>'+
-          '<label id="mk-qty-l">Сколько сдали, шт<input class="pr-in w-num" type="number" min="1" step="1" inputmode="numeric" id="mk-qty" placeholder="все"></label></div>'+
+          '<label id="mk-qty-l">Сколько штук<input class="pr-in w-num" type="number" min="1" step="1" inputmode="numeric" id="mk-qty"></label></div>'+
           '<div class="row"><label style="flex:1 1 220px">Заметка<input class="pr-in w-note" id="mk-note" maxlength="300" placeholder="например: брак 2 шт, остаток в пятницу"></label>'+
-          '<button type="button" class="pr-btn primary" id="mk-save">Отметить</button></div>'+
+          '<button type="button" class="pr-btn primary" id="mk-save">Отметить этап</button></div>'+
           '<div class="pr-err" id="mk-err" role="alert"></div></div>';
       }
     }
     var hist=(d.marks||[]).map(function(m){
       return '<li><span class="t">'+dmy(m.at,true)+' · '+esc(m.stage_name)+(m.qty!=null?" · "+qtyTxt(m.qty)+" шт":"")+
         (m.note?" · "+esc(m.note):"")+(m.by?' <span style="opacity:.75">('+esc(m.by)+')</span>':"")+'</span>'+
-        (d.can_mark?'<button type="button" data-del="'+m.id+'" aria-label="Отменить отметку">Отменить</button>':"")+'</li>';
+        (d.can_mark?'<button type="button" data-del="'+m.id+'" data-what="'+esc(m.stage_name+" от "+dmy(m.at,true))+'" aria-label="Удалить отметку">Удалить</button>':"")+'</li>';
     }).join("");
+    /* Срок от цеха: последний действует, прежние видны как переносы. */
+    var dues=(d.dues||[]);
+    var dueHtml='<div class="pr-sec"><h3>Срок от цеха</h3>';
+    if(dues.length){
+      dueHtml+='<ul class="pr-hist">'+dues.slice().reverse().map(function(x,i){
+        return '<li><span class="t">'+(i===0?'<b style="color:var(--u-ink)">'+dmy(x.due,true)+'</b>':'<s>'+dmy(x.due,true)+'</s>')+
+          (x.note?" · "+esc(x.note):"")+' <span style="opacity:.75">(записано '+dmy(x.at)+(x.by?", "+esc(x.by):"")+')</span></span>'+
+          (d.can_mark&&i===0?'<button type="button" data-deldue="'+x.id+'" aria-label="Удалить срок">Удалить</button>':"")+'</li>';
+      }).join("")+'</ul>';
+    } else {
+      dueHtml+='<div class="pr-why">Цех срок не называл'+(d.forecast.plan_date?", пока действует план заказа "+dmy(d.forecast.plan_date,true):"")+'.</div>';
+    }
+    if(d.can_mark && d.status==="sent"){
+      dueHtml+='<div class="pr-form" style="margin-top:8px"><div class="row">'+
+        '<label>'+(dues.length?"Новый срок":"Срок")+'<input class="pr-in w-date" type="date" id="due-at"></label>'+
+        '<label style="flex:1 1 200px">Что сказал цех<input class="pr-in w-note" id="due-note" maxlength="300" placeholder="например: ждут фурнитуру"></label>'+
+        '<button type="button" class="pr-btn" id="due-save">Записать срок</button></div><div class="pr-err" id="due-err" role="alert"></div></div>';
+    }
+    dueHtml+='</div>';
+    var rc='<div class="pr-qty">Пришло на склад: <b>'+qtyTxt(d.received_qty)+'</b> из '+qtyTxt(d.total_qty)+' шт'+
+      (d.receipts_from_ms?' · есть приёмки из МойСклада':'')+'</div>';
+    if(d.receipt_conflict) rc+='<div class="pr-warn">По части позиций МойСклад и ручная отметка говорят разное. Разберите на «Заказе», кнопка «Приёмка».</div>';
+    if(d.in_ms && open) rc+='<div class="pr-why">Заказ отправлен в МойСклад: приход подтянется сам при синхронизации.</div>';
+    if(d.can_mark && open) rc+='<div><button type="button" class="pr-btn" id="rc-open">Записать приход</button></div><div id="rc-box"></div>';
+    rc+='<div id="rc-hist"></div>';
     var items=(d.items||[]).map(function(i){
       var sz=Object.keys(i.sizes||{}).map(function(k){ return esc(k)+" "+i.sizes[k]; }).join(" · ");
       return '<tr><td>'+esc(i.base_name)+(sz?'<div class="sz">'+sz+'</div>':"")+'</td><td class="r">'+qtyTxt(i.qty)+' шт</td></tr>';
     }).join("");
-    var rc='<div class="pr-qty">Пришло на склад: <b>'+qtyTxt(d.received_qty)+'</b> из '+qtyTxt(d.total_qty)+' шт'+
-      (d.receipts_from_ms?' · есть приёмки из МойСклада':'')+'</div>';
-    if(d.receipt_conflict) rc+='<div class="pr-warn">По части позиций МойСклад и ручная отметка говорят разное. Разберите на «Заказе», кнопка «Приёмка».</div>';
-    if(d.in_ms && d.phase!=="done") rc+='<div class="pr-why">Заказ отправлен в МойСклад: приход подтянется сам при синхронизации.</div>';
-    if(d.can_mark && d.phase!=="done"){
-      rc+='<div><button type="button" class="pr-btn" id="rc-open">Отметить приход</button></div><div id="rc-box"></div>';
-    }
-    body.innerHTML=
-      '<div class="pr-sec">'+whenHtml(d,true)+qtyHtml(d)+'</div>'+
-      '<div class="pr-sec"><h3>Этапы</h3><ul class="pr-tl">'+tl+'</ul></div>'+form+
-      (hist?'<div class="pr-sec"><h3>Отметки</h3><ul class="pr-hist">'+hist+'</ul></div>':"")+
-      '<div class="pr-sec"><h3>Приход</h3><div class="pr-rc">'+rc+'</div></div>'+
-      '<div class="pr-sec"><h3>Состав</h3><table class="pr-items">'+items+'</table></div>';
+    var secStatus='<div class="pr-sec">'+whenHtml(d,true)+qtyHtml(d)+'</div>';
+    var secStages='<div class="pr-sec"><h3>Этапы</h3><ul class="pr-tl">'+tl+'</ul></div>'+form+
+      (hist?'<div class="pr-sec"><h3>История отметок</h3><ul class="pr-hist">'+hist+'</ul></div>':"");
+    var secRc='<div class="pr-sec"><h3>Приход</h3><div class="pr-rc">'+rc+'</div></div>';
+    var secItems='<div class="pr-sec"><h3>Состав</h3><table class="pr-items">'+items+'</table></div>';
+    /* Когда цех уже сдал, главное действие это приход: он идёт сразу после статуса. */
+    body.innerHTML = d.forecast.late_days ? secStatus+dueHtml+(d.phase==="shipped"?secRc+secStages:secStages+secRc)+secItems
+                   : d.phase==="shipped" ? secStatus+secRc+dueHtml+secStages+secItems
+                                         : secStatus+secStages+dueHtml+secRc+secItems;
     wireForm(d, focusQty);
+    loadReceiptHistory(d);
+  }
+  async function loadReceiptHistory(d){
+    var box=document.getElementById("rc-hist"); if(!box) return;
+    try{
+      var rc=await api("/api/orders/"+d.id+"/receipts");
+      var rows=(rc.receipts||[]).filter(function(r){ return Math.abs(r.qty)>0; });
+      if(!rows.length) return;
+      var SRC={manual:"вручную", ms_order_shipped:"МойСклад", ms_supply:"МойСклад"};
+      box.innerHTML='<ul class="pr-hist" style="margin-top:6px">'+rows.slice().reverse().map(function(r){
+        return '<li><span class="t">'+dmy(r.at,true)+' · '+esc(r.base_name)+' · '+(r.qty>0?"+":"")+qtyTxt(r.qty)+' шт · '+esc(SRC[r.source]||r.source)+'</span></li>';
+      }).join("")+'</ul>'+(rc.receipts_hidden?'<div class="pr-why">Показаны последние '+rc.receipts.length+' из '+rc.receipts_total+'.</div>':"");
+    }catch(_){}
   }
   function wireForm(d, focusQty){
     var last=d.stages.length?d.stages[d.stages.length-1]:null;
     var sel=document.getElementById("mk-stage");
+    var left=Math.max(0,(Number(d.total_qty)||0)-(Number(d.handed_qty)||0));
     function syncQty(){
       var isLast = sel && last && sel.value===last.key;
       var l=document.getElementById("mk-qty-l"); if(l) l.style.display=isLast?"":"none";
       var q=document.getElementById("mk-qty");
-      if(q && isLast){
-        var left=Math.max(0,(Number(d.total_qty)||0)-(Number(d.handed_qty)||0));
-        q.placeholder = last.at ? "сколько ещё" : "все "+qtyTxt(d.total_qty);
-        if(last.at && !q.value && left>0) q.value=Math.round(left);
-      }
+      /* Остаток подсказкой, а не значением: иначе набранное «16» становится «816». */
+      if(q && isLast) q.placeholder = last.at ? "осталось "+qtyTxt(left) : "все "+qtyTxt(d.total_qty);
     }
     if(sel){ sel.onchange=syncQty; syncQty(); }
-    if(focusQty){ var q=document.getElementById("mk-qty"); if(q) setTimeout(function(){ q.focus(); }, 50); }
+    if(focusQty){ var q=document.getElementById("mk-qty"); if(q) setTimeout(function(){ q.focus(); }, 60); }
     var save=document.getElementById("mk-save");
-    if(save) save.onclick=async function(){
+    function submitMark(){
       var err=document.getElementById("mk-err"); err.textContent="";
       var isLast = last && sel.value===last.key;
       var qv=document.getElementById("mk-qty").value.trim();
-      var body={stage_key:sel.value, at:document.getElementById("mk-at").value||null,
+      var body={stage_key:sel.value, at:document.getElementById("mk-at").value||todayIso(),
                 note:document.getElementById("mk-note").value};
       if(isLast && qv!==""){
         var q=Number(qv);
         if(!(q>0) || Math.round(q)!==q){ err.textContent="Количество целым числом больше нуля"; return; }
+        if(q>left && !confirm("Сдано будет больше заказанного: "+qtyTxt((Number(d.handed_qty)||0)+q)+" из "+qtyTxt(d.total_qty)+" шт. Записать?")) return;
         body.qty=q;
-      }
+      } else if(isLast && last.at){ err.textContent="Впишите, сколько штук сдали на этот раз"; return; }
       save.disabled=true;
-      try{
-        var r=await api("/api/production/orders/"+d.id+"/marks",{method:"POST",body:body});
-        var nm=sel.options[sel.selectedIndex].text;
-        toast("«"+nm+"» отмечен "+dmy(body.at||todayIso()), r.id);
+      var nm=sel.options[sel.selectedIndex].text;
+      api("/api/production/orders/"+d.id+"/marks",{method:"POST",body:body}).then(async function(r){
+        toast(d.name+": «"+nm+"» "+dmy(body.at)+(r.warning?". "+r.warning:""), r.id);
         await load(); await openOrder(d.id, true);
-      }catch(e){ err.textContent=e.message; save.disabled=false; }
-    };
+      },function(e){ err.textContent=e.message; save.disabled=false; });
+    }
+    if(save){
+      save.onclick=submitMark;
+      document.getElementById("mk-form").addEventListener("keydown",function(e){ if(e.key==="Enter" && e.target.tagName==="INPUT"){ e.preventDefault(); submitMark(); } });
+    }
     document.querySelectorAll("#pr-dlg-body [data-del]").forEach(function(b){
       b.onclick=async function(){
-        if(!confirm("Отменить эту отметку?")) return;
+        if(!confirm("Удалить отметку «"+b.getAttribute("data-what")+"»?")) return;
         b.disabled=true;
         try{ await api("/api/production/marks/"+b.getAttribute("data-del"),{method:"DELETE"}); await load(); await openOrder(d.id, true); }
         catch(e){ alert(e.message); b.disabled=false; }
       };
     });
+    document.querySelectorAll("#pr-dlg-body [data-deldue]").forEach(function(b){
+      b.onclick=async function(){
+        if(!confirm("Удалить последний записанный срок? Будет действовать предыдущий.")) return;
+        b.disabled=true;
+        try{ await api("/api/production/due/"+b.getAttribute("data-deldue"),{method:"DELETE"}); await load(); await openOrder(d.id, true); }
+        catch(e){ alert(e.message); b.disabled=false; }
+      };
+    });
+    var ds=document.getElementById("due-save");
+    if(ds) ds.onclick=async function(){
+      var err=document.getElementById("due-err"); err.textContent="";
+      var v=document.getElementById("due-at").value;
+      if(!v){ err.textContent="Выберите дату"; return; }
+      ds.disabled=true;
+      try{
+        await api("/api/production/orders/"+d.id+"/due",{method:"POST",body:{due:v, note:document.getElementById("due-note").value}});
+        toast(d.name+": срок "+dmy(v), null);
+        await load(); await openOrder(d.id, true);
+      }catch(e){ err.textContent=e.message; ds.disabled=false; }
+    };
     var ro=document.getElementById("rc-open");
     if(ro) ro.onclick=function(){ receiptForm(d); };
   }
@@ -576,64 +700,79 @@
     var rc;
     try{ rc=await api("/api/orders/"+d.id+"/receipts"); }catch(e){ box.innerHTML='<div class="pr-err">'+esc(e.message)+'</div>'; return; }
     var lines=(rc.lines||[]).filter(function(l){ return l.ordered_qty>0; });
-    box.innerHTML='<div class="pr-form"><div class="pr-why">Сколько пришло сейчас. Это добавится к уже принятому, прежние приёмки не меняются.</div>'+
+    box.innerHTML='<div class="pr-form"><div class="pr-why">Сколько пришло сейчас по каждой позиции. Это добавится к уже принятому.'+
+      ' <button type="button" class="pr-link" id="rc-fill">Вписать весь остаток</button></div>'+
       lines.map(function(l,i){
         return '<div class="line"><span>'+esc(l.base_name)+'</span><span class="got">было '+(l.received_qty==null?"0":qtyTxt(l.received_qty))+' из '+qtyTxt(l.ordered_qty)+'</span>'+
           '<input class="pr-in w-num" type="number" min="0" step="1" inputmode="numeric" data-rc="'+i+'" aria-label="Пришло сейчас: '+esc(l.base_name)+'"></div>';
       }).join("")+
       '<div class="row"><button type="button" class="pr-btn primary" id="rc-save">Записать приход</button>'+
-      (d.in_ms?'':'<button type="button" class="pr-btn" id="rc-all">Пришло всё</button>')+
-      '</div><div class="pr-err" id="rc-err" role="alert"></div></div>';
-    document.getElementById("rc-save").onclick=async function(){
+      '<button type="button" class="pr-btn" id="rc-close">Записать и закрыть заказ</button></div>'+
+      '<div class="pr-why">«Закрыть» значит, что больше по заказу ничего не придёт: чего не хватило, останется недостачей.</div>'+
+      '<div class="pr-err" id="rc-err" role="alert"></div></div>';
+    document.getElementById("rc-fill").onclick=function(){
+      document.querySelectorAll("#rc-box [data-rc]").forEach(function(inp){
+        var l=lines[+inp.getAttribute("data-rc")];
+        var rest=Math.max(0,Math.round((l.ordered_qty||0)-(l.received_qty||0)));
+        inp.value = rest>0 ? rest : "";
+      });
+    };
+    function collect(){
       var err=document.getElementById("rc-err"); err.textContent="";
-      var out=[];
+      var out=[], bad=false;
       document.querySelectorAll("#rc-box [data-rc]").forEach(function(inp){
         var v=inp.value.trim(); if(v==="") return;
-        var q=Number(v); if(!(q>=0)||Math.round(q)!==q){ err.textContent="Только целые числа"; out=null; return; }
-        if(out&&q>0) out.push({base_name:lines[+inp.getAttribute("data-rc")].base_name, qty:q});
+        var q=Number(v); if(!(q>=0)||Math.round(q)!==q){ bad=true; return; }
+        if(q>0) out.push({base_name:lines[+inp.getAttribute("data-rc")].base_name, qty:q});
       });
-      if(out===null) return;
-      if(!out.length){ err.textContent="Впишите, сколько пришло"; return; }
+      if(bad){ err.textContent="Только целые числа"; return null; }
+      return out;
+    }
+    document.getElementById("rc-save").onclick=async function(){
+      var out=collect(); if(out===null) return;
+      if(!out.length){ document.getElementById("rc-err").textContent="Впишите, сколько пришло"; return; }
       this.disabled=true;
       try{
         await api("/api/orders/"+d.id+"/receipts",{method:"POST",body:{lines:out,
           idempotency_key:"prod-"+d.id+"-"+Date.now()}});
-        toast("Приход записан", null);
+        toast(d.name+": приход записан", null);
         await load(); await openOrder(d.id, true);
-      }catch(e){ err.textContent=e.message; this.disabled=false; }
+      }catch(e){ document.getElementById("rc-err").textContent=e.message; this.disabled=false; }
     };
-    var allBtn=document.getElementById("rc-all");
-    if(allBtn) allBtn.onclick=async function(){
-      /* «Пришло всё» это слова человека о количестве: записываем остаток по
-         каждой позиции как его подтверждение и закрываем заказ. */
-      var rest=lines.map(function(l){ return {base_name:l.base_name,
-        qty:Math.max(0,Math.round((l.ordered_qty||0)-(l.received_qty||0)))}; });
-      var sum=rest.reduce(function(a,l){ return a+l.qty; },0);
-      if(!confirm("Записать, что пришло всё оставшееся ("+qtyTxt(sum)+" шт), и закрыть заказ?")) return;
-      var err=document.getElementById("rc-err"); err.textContent="";
+    document.getElementById("rc-close").onclick=async function(){
+      var out=collect(); if(out===null) return;
+      var sum=out.reduce(function(a,l){ return a+l.qty; },0);
+      var after=(Number(d.received_qty)||0)+sum, short=Math.max(0,(Number(d.total_qty)||0)-after);
+      var msg = out.length ? "Записать приход "+qtyTxt(sum)+" шт и закрыть заказ?" : "Закрыть заказ без новых количеств?";
+      if(short>0) msg+=" Не хватит "+qtyTxt(short)+" шт, это останется недостачей.";
+      if(!confirm(msg)) return;
       this.disabled=true;
       try{
-        await api("/api/orders/"+d.id+"/status",{method:"POST",body:{status:"received",
-          received:rest.filter(function(l){ return l.qty>0; })}});
-        toast("Заказ принят на склад", null);
+        await api("/api/orders/"+d.id+"/status",{method:"POST",body:{status:"received", received:out.length?out:null}});
+        toast(d.name+": заказ закрыт", null);
         await load(); await openOrder(d.id, true);
-      }catch(e){ err.textContent=e.message; this.disabled=false; }
+      }catch(e){ document.getElementById("rc-err").textContent=e.message; this.disabled=false; }
     };
   }
 
   /* ── этапы цехов ── */
   var STG=null;
+  function chMarked(chId){ return (DATA.orders||[]).some(function(o){ return String(o.channel_id)===String(chId) && o.reached>=0; }); }
   function stgRender(){
-    var ch=DATA.channels.find(function(c){ return String(c.id)===String(document.getElementById("stg-ch").value); });
-    if(!STG || STG.id!==ch.id) STG={id:ch.id, preset:ch.preset, stages:ch.stages.map(function(s){ return {key:s.key,name:s.name}; })};
+    var sel=document.getElementById("stg-ch");
+    var ch=(DATA.channels||[]).find(function(c){ return String(c.id)===String(sel.value); });
+    if(!ch) return;
+    if(!STG || STG.id!==ch.id) STG={id:ch.id, preset:ch.preset, orig:ch.stages.map(function(s){ return s.key; }),
+      stages:ch.stages.map(function(s){ return {key:s.key,name:s.name}; })};
     document.getElementById("stg-presets").innerHTML=DATA.presets.map(function(p){
       return '<button type="button" class="pr-chip'+(STG.preset===p.key?" on":"")+'" data-preset="'+p.key+'" title="'+esc(p.stages.join(", "))+'">'+esc(p.label)+'</button>';
     }).join("");
     document.getElementById("stg-list").innerHTML=STG.stages.map(function(s,i){
-      return '<div class="pr-stg-row"><span style="width:20px;color:var(--u-ink2);font-size:12.5px">'+(i+1)+'</span>'+
+      var lastHint = i===STG.stages.length-1 ? '<div style="font-size:11.5px;color:var(--u-ink2);margin:2px 0 0 26px">последний: после него заказ едет на склад</div>' : "";
+      return '<div><div class="pr-stg-row"><span style="width:20px;color:var(--u-ink2);font-size:12.5px">'+(i+1)+'</span>'+
         '<input class="pr-in" maxlength="40" data-stg="'+i+'" value="'+esc(s.name)+'" aria-label="Этап '+(i+1)+'">'+
         '<button type="button" class="pr-icon" data-up="'+i+'" aria-label="Выше"'+(i===0?" disabled":"")+'>↑</button>'+
-        '<button type="button" class="pr-icon" data-rm="'+i+'" aria-label="Убрать этап"'+(STG.stages.length<2?" disabled":"")+'>✕</button></div>';
+        '<button type="button" class="pr-icon" data-rm="'+i+'" aria-label="Убрать этап"'+(STG.stages.length<2?" disabled":"")+'>✕</button></div>'+lastHint+'</div>';
     }).join("");
     document.getElementById("stg-add").disabled = STG.stages.length>=8;
   }
@@ -641,7 +780,7 @@
     document.querySelectorAll("#stg-list [data-stg]").forEach(function(inp){ STG.stages[+inp.getAttribute("data-stg")].name=inp.value; });
   }
   document.getElementById("pr-stages-open").onclick=function(){
-    if(!DATA) return;
+    if(!DATA || !(DATA.channels||[]).length) return;
     var sel=document.getElementById("stg-ch");
     sel.innerHTML=DATA.channels.map(function(c){ return '<option value="'+c.id+'">'+esc(c.name)+'</option>'; }).join("");
     if(CH!=="all") sel.value=CH;
@@ -653,8 +792,7 @@
     var b=e.target.closest("[data-preset]"); if(!b) return;
     var p=DATA.presets.find(function(x){ return x.key===b.getAttribute("data-preset"); });
     stgCollect();
-    /* Шаблон заменяет названия, но ключи существующих этапов по порядку сохраняются:
-       отметки не теряются. */
+    if(chMarked(STG.id) && !confirm("У заказов этого цеха уже есть отметки. Шаблон переименует этапы по порядку, отметки останутся на своих местах под новыми названиями. Продолжить?")) return;
     STG.preset=p.key;
     STG.stages=p.stages.map(function(n,i){ return {key:(STG.stages[i]||{}).key||"", name:n}; });
     stgRender();
@@ -666,12 +804,18 @@
     if(rm){ STG.stages.splice(+rm.getAttribute("data-rm"),1); STG.preset="custom"; stgRender(); }
   };
   document.getElementById("stg-list").oninput=function(){ STG.preset="custom";
-    document.querySelectorAll("#stg-presets .pr-chip").forEach(function(b){ b.classList.toggle("on", b.getAttribute("data-preset")==="custom"); }); };
+    document.querySelectorAll("#stg-presets .pr-chip").forEach(function(b){ b.classList.toggle("on", false); }); };
   document.getElementById("stg-add").onclick=function(){ stgCollect(); STG.stages.push({key:"",name:""}); STG.preset="custom"; stgRender();
     var ins=document.querySelectorAll("#stg-list [data-stg]"); if(ins.length) ins[ins.length-1].focus(); };
   document.getElementById("stg-save").onclick=async function(){
     stgCollect();
     var err=document.getElementById("stg-err"); err.textContent="";
+    /* Последний этап особый: если он сменился, сданные заказы цеха вернутся в «В работе». */
+    var oldLast=STG.orig[STG.orig.length-1], newLast=(STG.stages[STG.stages.length-1]||{}).key;
+    if(oldLast!==newLast){
+      var n=(DATA.orders||[]).filter(function(o){ return String(o.channel_id)===String(STG.id) && o.phase==="shipped"; }).length;
+      if(n && !confirm("Последний этап меняется. "+n+" "+plural(n,"заказ","заказа","заказов")+" из колонки «Сдано, едет» вернутся в «В работе», пока не отметите новый последний этап. Сохранить?")) return;
+    }
     this.disabled=true;
     try{
       await api("/api/production/stages",{method:"PUT",body:{production_id:STG.id, preset:STG.preset,
@@ -696,7 +840,7 @@
   });
   document.getElementById("pr-ovl").onclick=closeDlg;
   document.querySelectorAll(".pr-dlg [data-close]").forEach(function(b){ b.onclick=closeDlg; });
-  document.addEventListener("keydown",function(e){ if(e.key==="Escape" && document.querySelector(".pr-dlg.open")) closeDlg(); });
+  if(MOBILE.addEventListener) MOBILE.addEventListener("change", function(){ if(DATA) render(); });
 
   load();
 })();

@@ -67,6 +67,7 @@ def org_purge_models() -> tuple:
         OrgRole,
         OrderedQty,
         OrderPlan,
+        OrderDueDate,
         OrderReceipt,
         OrderStageMark,
         Product,
@@ -101,7 +102,7 @@ def org_purge_models() -> tuple:
     return (
         Sale, StockDay, WarehouseStock, OrderedQty, ReplenishDraft,
         # PROD-1: отметки этапов ссылаются на заказ, этапы цеха на цех.
-        ProductionAssign, OrderPlan, OrderReceipt, OrderStageMark, ProductionOrder,
+        ProductionAssign, OrderPlan, OrderReceipt, OrderStageMark, OrderDueDate, ProductionOrder,
         ProductionTrack, Production,
         SupplyEvent, SupplyAssignment, SupplyBatch, SupplyItem,
         SupplyMaterial, SupplySketch,
@@ -177,6 +178,10 @@ NON_OWNING_USER_REFERENCES: dict[tuple[str, str], str] = {
         "кто отметил этап запуска (PROD-1); строка org-owned и удаляется в потоке "
         "организации. Колонка без внешнего ключа, сторож видит её по имени. "
         "Осиротевший идентификатор после удаления автора показывается пустым, как у SEC-8"
+    ),
+    ("order_due_dates", "created_by"): (
+        "кто записал срок от цеха (PROD-1); строка org-owned, удаляется в потоке "
+        "организации. Без внешнего ключа, сторож видит её по имени, как order_stage_marks"
     ),
     ("org_invites", "created_by"): (
         "кто выпустил приглашение; строка принадлежит организации и удаляется "

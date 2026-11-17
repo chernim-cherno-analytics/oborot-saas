@@ -9,7 +9,8 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Path
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictFloat, StrictInt
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app import production_tracking as pt
@@ -28,7 +29,12 @@ def _fail(err: pt.TrackingError):
 class MarkIn(BaseModel):
     stage_key: str = Field(..., min_length=1, max_length=16)
     at: str | None = Field(None, max_length=10)
-    qty: float | None = None
+    qty: StrictInt | StrictFloat | None = None
+    note: str = Field("", max_length=600)
+
+
+class DueIn(BaseModel):
+    due: str = Field(..., min_length=1, max_length=10)
     note: str = Field("", max_length=600)
 
 
@@ -68,10 +74,15 @@ def api_add_mark(body: MarkIn, order_id: int = Path(..., ge=1, le=_MAX_ID),
     try:
         res = pt.add_mark(db, ctx.org, ctx.user.id, order_id, body.stage_key.strip(),
                           body.at, body.qty, body.note)
+        db.commit()
     except pt.TrackingError as err:
         db.rollback()
         _fail(err)
-    db.commit()
+    except IntegrityError:
+        # Два одновременных запроса одной отметки: второй упёрся в частичный
+        # уникальный индекс (models._ORDER_STAGE_ONCE_DDL).
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Этот этап уже отметили. Обновите окно.")
     return res
 
 
@@ -95,6 +106,33 @@ def api_set_stages(body: StagesIn,
     try:
         res = pt.set_track(db, ctx.org.id, body.production_id, body.preset,
                            [s.model_dump() for s in body.stages])
+    except pt.TrackingError as err:
+        db.rollback()
+        _fail(err)
+    db.commit()
+    return res
+
+
+@router.post("/orders/{order_id}/due")
+def api_add_due(body: DueIn, order_id: int = Path(..., ge=1, le=_MAX_ID),
+                ctx: AuthContext = Depends(require_perm("orders_manage")),
+                db: Session = Depends(get_db)):
+    """Срок, который назвал цех. Плановую дату заказа (и деньги «Заказа») не меняет."""
+    try:
+        res = pt.add_due(db, ctx.org, ctx.user.id, order_id, body.due, body.note)
+    except pt.TrackingError as err:
+        db.rollback()
+        _fail(err)
+    db.commit()
+    return res
+
+
+@router.delete("/due/{due_id}")
+def api_delete_due(due_id: int = Path(..., ge=1, le=_MAX_ID),
+                   ctx: AuthContext = Depends(require_perm("orders_manage")),
+                   db: Session = Depends(get_db)):
+    try:
+        res = pt.delete_due(db, ctx.org.id, due_id)
     except pt.TrackingError as err:
         db.rollback()
         _fail(err)

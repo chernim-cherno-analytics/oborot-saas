@@ -1522,6 +1522,38 @@ class OrderStageMark(Base):
                                                  default=datetime.utcnow)
 
 
+class OrderDueDate(Base):
+    """PROD-1: срок, который назвал цех («сдадим к 25.11»), с историей переносов.
+
+    Отдельно от `ProductionOrder.eta_date`: плановая дата заказа считается при
+    оформлении и питает календарь платежей и «Едет», её этот слой не трогает.
+    Срок от цеха это слова подрядчика; новый срок дописывается новой строкой,
+    действует последний, прежние остаются историей переносов.
+    `order_batch` по той же причине, что у `OrderStageMark`.
+    """
+
+    __tablename__ = "order_due_dates"
+    __table_args__ = (Index("ix_order_due_dates_org_order", "org_id", "order_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    org_id: Mapped[int] = mapped_column(ForeignKey("orgs.id"), nullable=False, index=True)
+    order_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    order_batch: Mapped[str] = mapped_column(String(CC_BATCH_ID_MAX_LEN), nullable=False, default="")
+    due: Mapped[date] = mapped_column(TolerantDate, nullable=False)
+    note: Mapped[str] = mapped_column(String(300), nullable=False, default="")
+    created_by: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(TolerantDateTime, nullable=False,
+                                                 default=datetime.utcnow)
+
+
+#: PROD-1: этап без количества отмечается у заказа один раз. Частичный индекс:
+#: сдачи частями (qty не NULL) на последнем этапе законно повторяются.
+_ORDER_STAGE_ONCE_DDL = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_order_stage_marks_once "
+    "ON order_stage_marks (org_id, order_id, order_batch, stage_key) WHERE qty IS NULL"
+)
+
+
 #: Замок повторного поступка. ЧАСТИЧНЫЙ по той же причине, по какой частичен
 #: индекс `CC_BATCH_ID` (D-50): пустой `op_id` — это «поступок без имени»
 #: (запись, сделанная не из формы), и таких строк законно много. Обычный UNIQUE
@@ -2289,8 +2321,9 @@ def ensure_production_tracking_schema(bind=None) -> None:
     ПОЧЕМУ ОТДЕЛЬНЫЙ ШАГ. То же правило, что у шагов 10-18 (`AGENTS.md` §1,
     «только новая миграция сверху»): выпущенные пары (id, позиция) не трогаются.
 
-    ЧТО ЗДЕСЬ ДЕЛАЕТСЯ. Только `create_all` двух новых таблиц с их индексами.
-    Ни одной существующей строки и ни одной существующей таблицы шаг не трогает.
+    ЧТО ЗДЕСЬ ДЕЛАЕТСЯ. `create_all` трёх новых таблиц (этапы цеха, отметки,
+    сроки от цеха) и частичный уникальный индекс отметок. Ни одной
+    существующей строки и ни одной существующей таблицы шаг не трогает.
 
     ИДЕМПОТЕНТЕН: `create_all` создаёт только отсутствующие таблицы. На свежей
     базе они приходят через `create_all` шага 1, и шаг не делает ничего.
@@ -2300,4 +2333,6 @@ def ensure_production_tracking_schema(bind=None) -> None:
     """
     eng = bind or engine
     Base.metadata.create_all(bind=eng, tables=[ProductionTrack.__table__,
-                                                OrderStageMark.__table__])
+                                                OrderStageMark.__table__,
+                                                OrderDueDate.__table__])
+    run_migration_step(_ORDER_STAGE_ONCE_DDL, bind=eng)
