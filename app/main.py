@@ -33,6 +33,7 @@ from app.routes_ms_app import router as ms_app_router
 from app.routes_ms_vendor import router as ms_vendor_router
 from app.routes_supply import router as supply_router
 from app.routes_supply_planning import router as supply_planning_router
+from app.routes_production import router as production_router
 from app.routes_team import router as team_router
 from app.db import get_db, init_db, record_migration_step, validate_migration_step
 from app.models import Connection, Membership, Org, Product, ProductionOrder, Sale, User
@@ -60,6 +61,7 @@ app.include_router(ms_app_router)
 # «Едет» и формулы, и физическая отдельность делает это проверяемым.
 app.include_router(supply_router)
 app.include_router(supply_planning_router)
+app.include_router(production_router)
 # Роли сотрудников и приглашения (решение владельца 15.11.2026).
 app.include_router(team_router)
 
@@ -421,6 +423,10 @@ STARTUP_SCHEMA_STEPS: tuple[tuple[str, int], ...] = (
     # нуллируемая колонка memberships.role_id. Append-only, позиция 18 новая,
     # семнадцать прежних пар не тронуты.
     ("models.ensure_roles_schema", 18),
+    # PROD-1 «Производство» (решение Влада 17.11.2026): две новые таблицы,
+    # этапы цеха и отметки запусков. Append-only, позиция 19 новая,
+    # восемнадцать прежних пар не тронуты. Только create_all.
+    ("models.ensure_production_tracking_schema", 19),
 )
 _STARTUP_STEP_ORDER = dict(STARTUP_SCHEMA_STEPS)
 
@@ -637,6 +643,10 @@ def _startup() -> None:
     # Роли сотрудников: таблицы org_roles, org_invites и колонка
     # memberships.role_id. Ничего не читает и не переписывает.
     _startup_step("models.ensure_roles_schema", _models.ensure_roles_schema)
+    # PROD-1: таблицы этапов цеха и отметок. Только create_all, ничего не
+    # читает и не переписывает.
+    _startup_step("models.ensure_production_tracking_schema",
+                  _models.ensure_production_tracking_schema)
     # Замок на пропуск: все объявленные шаги выполнены, и ровно они.
     _finish_startup_steps()
     global _STARTUP_DONE
@@ -1607,26 +1617,27 @@ def replenish_page(request: Request, db: Session = Depends(get_db)):
     return _authed_page(request, db, "replenish.html", "replenish", "Что заказать")
 
 
-@app.get("/supply", response_class=HTMLResponse)
-def supply_page(request: Request, db: Session = Depends(get_db)):
-    """«Поставки» — предпросмотр внешней таблицы (SUPPLY-2, D-51).
+@app.get("/supply")
+def supply_page(request: Request):
+    """Прежний адрес «Поставок» (решение Влада 17.11.2026: раздел заменён
+    «Производством»). Закладки и ссылки из старых писем ведут на новый раздел,
+    а не в 404. Параметры адреса не переносятся: у нового раздела их нет."""
+    return RedirectResponse("/production", status_code=302)
 
-    Роль кладётся в контекст страницы, а не выясняется отдельным запросом с
-    фронта: форма обновления существует только у владельца, и участник не
-    должен сначала увидеть её, а потом потерять после ответа API.
+
+@app.get("/production", response_class=HTMLResponse)
+def production_page(request: Request, db: Session = Depends(get_db)):
+    """«Производство» (PROD-1): где каждый запуск и когда он будет на складе.
+
+    Право на отметки кладётся в контекст страницы, как роль у прежних
+    «Поставок»: кнопки «следующий этап» не должны появляться и пропадать
+    после ответа API.
     """
     ctx = auth.resolve_auth(request, db)
     if ctx is None:
         return RedirectResponse("/login", status_code=302)
-    # SUPPLY-FIX-1 (F-08): вкладка предпросмотра рисуется только организации с
-    # флагом. Признак кладётся в контекст страницы, а не выясняется запросом с
-    # фронта, по той же причине, что и роль: человек не должен сначала увидеть
-    # вкладку, а потом потерять её после ответа API, которого для него нет.
-    from app import routes_supply as _routes_supply
-    return _page(request, ctx, "supply.html", "supply", "Поставки", db=db,
-                 extra={"role": roles.ui_role(ctx, "supply_edit"),
-                        "sheets_preview":
-                            _routes_supply.preview_enabled(ctx.org)})
+    return _page(request, ctx, "production.html", "production", "Производство", db=db,
+                 extra={"can_mark": bool(ctx.can("orders_manage"))})
 
 
 @app.get("/turnover", response_class=HTMLResponse)

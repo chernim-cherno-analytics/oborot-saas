@@ -121,7 +121,7 @@ def run_scenario() -> int:
     check("в каталоге ровно 7 уроков", len(cat) == 7, f"n={len(cat)}")
     check("порядок ключей зафиксирован",
           [l["key"] for l in cat] == ["turnover", "settings", "replenish", "budget",
-                                      "forecast", "trust", "supply"],
+                                      "forecast", "trust", "production"],
           f"keys={[l['key'] for l in cat]}")
     check("ключи уникальны", len({l["key"] for l in cat}) == 7)
     check("lessons.KEYS/TOTAL согласованы с каталогом",
@@ -154,7 +154,7 @@ def run_scenario() -> int:
     # Селекторы обязаны существовать на своих страницах (иначе тур подсветит пустоту).
     tpl = {"/turnover": "turnover.html", "/replenish": "replenish.html",
            "/budget": "budget.html", "/forecast": "forecast.html",
-           "/settings": "settings.html", "/supply": "supply.html"}
+           "/settings": "settings.html", "/production": "production.html"}
     missing = []
     for l in cat:
         html = (ROOT / "templates" / tpl[l["url"]]).read_text(encoding="utf-8")

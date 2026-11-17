@@ -1461,6 +1461,67 @@ class SupplyEvent(Base):
                                                  default=datetime.utcnow)
 
 
+class ProductionTrack(Base):
+    """PROD-1: этапы, по которым цех ведёт запуск (решение Влада 17.11.2026).
+
+    Отдельная таблица, а не колонка `productions`: шаг старта тогда только
+    создаёт таблицы (`create_all`) и не делает ни одного ALTER, а откат на
+    старый код ничего не ломает, потому что старый код таблицу не читает.
+
+    Это НЕ `Production.stages_json`. Те этапы планируют срок и деньги заказа
+    (ткань 40 дней, пошив 25), эти описывают, как человек отмечает ход работы
+    (ткань у цеха, крой, пошив, сдано). Сливать их нельзя: правка названия
+    этапа на доске сдвинула бы срок и платежи «Заказа».
+
+    `production_id IS NULL` хранит этапы для заказов без цеха.
+    """
+
+    __tablename__ = "production_tracks"
+    __table_args__ = (Index("ix_production_tracks_org", "org_id", "production_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    org_id: Mapped[int] = mapped_column(ForeignKey("orgs.id"), nullable=False, index=True)
+    production_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    preset: Mapped[str] = mapped_column(String(16), nullable=False, default="sewing")
+    # [{"key": "s1", "name": "Ткань у цеха"}, ...] по порядку работы.
+    stages_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    updated_at: Mapped[datetime] = mapped_column(TolerantDateTime, nullable=False,
+                                                 default=datetime.utcnow)
+
+
+class OrderStageMark(Base):
+    """PROD-1: отметка «запуск дошёл до этапа» с датой.
+
+    Пополняется; удаляется только отметка, поставленная по ошибке. Заказ и
+    приёмки этот слой не меняет вовсе.
+
+    `order_batch` хранит CC_BATCH_ID заказа (D-50) на момент отметки. Заказ
+    можно удалить, а id в SQLite переиспользуется: без второго ключа новый
+    заказ с тем же id унаследовал бы чужие этапы. Отметка считается своей,
+    только если совпадают и id, и идентификатор партии.
+
+    `stage_name` это снимок названия на момент отметки: этап могут
+    переименовать, а история должна читаться так, как её записали.
+    `qty` заполняется у последнего этапа (сдача частями), иначе NULL.
+    """
+
+    __tablename__ = "order_stage_marks"
+    __table_args__ = (Index("ix_order_stage_marks_org_order", "org_id", "order_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    org_id: Mapped[int] = mapped_column(ForeignKey("orgs.id"), nullable=False, index=True)
+    order_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    order_batch: Mapped[str] = mapped_column(String(CC_BATCH_ID_MAX_LEN), nullable=False, default="")
+    stage_key: Mapped[str] = mapped_column(String(16), nullable=False)
+    stage_name: Mapped[str] = mapped_column(String(60), nullable=False, default="")
+    at: Mapped[date] = mapped_column(TolerantDate, nullable=False)
+    qty: Mapped[float | None] = mapped_column(Float, nullable=True)
+    note: Mapped[str] = mapped_column(String(300), nullable=False, default="")
+    created_by: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(TolerantDateTime, nullable=False,
+                                                 default=datetime.utcnow)
+
+
 #: Замок повторного поступка. ЧАСТИЧНЫЙ по той же причине, по какой частичен
 #: индекс `CC_BATCH_ID` (D-50): пустой `op_id` — это «поступок без имени»
 #: (запись, сделанная не из формы), и таких строк законно много. Обычный UNIQUE
@@ -2220,3 +2281,23 @@ def ensure_roles_schema(bind=None) -> None:
     cols = {c["name"] for c in insp.get_columns("memberships")}
     if "role_id" not in cols:
         run_migration_step("ALTER TABLE memberships ADD COLUMN role_id INTEGER", bind=eng)
+
+
+def ensure_production_tracking_schema(bind=None) -> None:
+    """PROD-1 (решение Влада 17.11.2026): этапы цеха и отметки запусков. Шаг 19.
+
+    ПОЧЕМУ ОТДЕЛЬНЫЙ ШАГ. То же правило, что у шагов 10-18 (`AGENTS.md` §1,
+    «только новая миграция сверху»): выпущенные пары (id, позиция) не трогаются.
+
+    ЧТО ЗДЕСЬ ДЕЛАЕТСЯ. Только `create_all` двух новых таблиц с их индексами.
+    Ни одной существующей строки и ни одной существующей таблицы шаг не трогает.
+
+    ИДЕМПОТЕНТЕН: `create_all` создаёт только отсутствующие таблицы. На свежей
+    базе они приходят через `create_all` шага 1, и шаг не делает ничего.
+
+    ОТКАТ. Старый код о таблицах не знает и их не читает; отметки остаются
+    лежать и снова видны, когда код вернётся. Данные не теряются.
+    """
+    eng = bind or engine
+    Base.metadata.create_all(bind=eng, tables=[ProductionTrack.__table__,
+                                                OrderStageMark.__table__])

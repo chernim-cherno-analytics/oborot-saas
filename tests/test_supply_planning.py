@@ -988,7 +988,7 @@ def run() -> int:
     # ── 18. Миграция: аддитивна, идемпотентна, прежние шаги сохранены ────────
     print("\n== Миграция: новый шаг сверху, старые четырнадцать не тронуты ==")
     from app.main import STARTUP_SCHEMA_STEPS
-    check("шагов старта восемнадцать", len(STARTUP_SCHEMA_STEPS) == 18,
+    check("шагов старта девятнадцать", len(STARTUP_SCHEMA_STEPS) == 19,
           str(len(STARTUP_SCHEMA_STEPS)))
     check("первые десять пар (id, позиция) не изменились",
           STARTUP_SCHEMA_STEPS[:10] == (
@@ -1039,8 +1039,12 @@ def run() -> int:
           str(STARTUP_SCHEMA_STEPS[16:17]))
     # Роли сотрудников (15.11.2026): следующий append-only шаг, позиция 18.
     check("роли дописаны в конец с новым id и позицией 18",
-          STARTUP_SCHEMA_STEPS[17:] == (("models.ensure_roles_schema", 18),),
-          str(STARTUP_SCHEMA_STEPS[17:]))
+          STARTUP_SCHEMA_STEPS[17:18] == (("models.ensure_roles_schema", 18),),
+          str(STARTUP_SCHEMA_STEPS[17:18]))
+    # PROD-1 «Производство» (17.11.2026): следующий append-only шаг, позиция 19.
+    check("«Производство» дописано в конец с новым id и позицией 19",
+          STARTUP_SCHEMA_STEPS[18:] == (("models.ensure_production_tracking_schema", 19),),
+          str(STARTUP_SCHEMA_STEPS[18:]))
 
     # «Старая» база: таблиц слоя нет вовсе — шаг обязан их создать и не упасть
     # при повторном вызове.
@@ -1525,17 +1529,13 @@ def supply_fix_1_checks() -> None:  # noqa: C901 — сценарный блок
 
     # ── F-08: предпросмотр за флагом организации ────────────────────────────
     print("\n== F-08: вкладка предпросмотра — только организациям с флагом ==")
-    page = c.get("/supply")
-    # Ищем РАЗМЕТКУ элемента (`id="…"`), а не имя идентификатора: имя есть и в
-    # скрипте плана — `byId("sup-tab-preview")`, — и поиск по нему зеленел бы
-    # или краснел по чужой причине.
-    check("без флага вкладки предпросмотра на странице нет",
-          page.status_code == 200 and 'id="sup-tab-preview"' not in page.text,
+    # Страница «Поставки» заменена «Производством» (PROD-1, решение Влада
+    # 17.11.2026): разметки вкладок больше нет, адрес ведёт на /production.
+    # Флаг организации по-прежнему решает судьбу ручек снимка, это ниже.
+    page = c.get("/supply", follow_redirects=False)
+    check("прежний адрес ведёт на «Производство»",
+          page.status_code == 302 and page.headers.get("location") == "/production",
           str(page.status_code))
-    check("и панели предпросмотра тоже нет",
-          'id="sup-view-preview"' not in page.text, "панель осталась в разметке")
-    check("раздел плана при этом на месте",
-          'id="sup-view-plan"' in page.text, "план пропал вместе с предпросмотром")
     gone = c.get("/api/supply/sheets")
     check("ручка чтения снимка отвечает 404", gone.status_code == 404,
           str(gone.status_code))
@@ -1550,9 +1550,6 @@ def supply_fix_1_checks() -> None:  # noqa: C901 — сценарный блок
         "SELECT settings_json FROM orgs WHERE id = ?", (tool_org,)).fetchone()[0])
     rc = run_preview_tool(["--org-id", str(tool_org), "--on"])
     check("штатный инструмент включает флаг и завершается успешно", rc == 0, str(rc))
-    page = c.get("/supply")
-    check("с флагом вкладка предпросмотра появилась",
-          'id="sup-tab-preview"' in page.text, "вкладки нет")
     on = c.get("/api/supply/sheets")
     check("и ручка снимка отвечает по-настоящему, а не 404",
           on.status_code == 200, str(on.status_code))

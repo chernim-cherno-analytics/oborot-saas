@@ -1310,7 +1310,7 @@ def isolation_checks(owner, member, org_id: int) -> None:
               anon.post("/api/supply/sheets/refresh",
                         json={"spreadsheet_url": SHEET_URL,
                               "sheet_names": [SHEET_CURRENT, SHEET_NEXT]}).status_code == 401)
-        page = anon.get("/supply", follow_redirects=False)
+        page = anon.get("/production", follow_redirects=False)
         check("страница анонима уводит на вход",
               page.status_code == 302 and "/login" in page.headers.get("location", ""),
               str(page.status_code))
@@ -2232,217 +2232,12 @@ def structural_checks(owner) -> None:
         check("и в цвете тоже",
               row["color_raw"] == "\"><script>alert(2)</script>", row["color_raw"])
 
-    page = owner.get("/supply").text
-    template = (ROOT / "templates" / "supply.html").read_text(encoding="utf-8")
-    check("страница «Поставки» отдаётся владельцу", "sup-rows" in page, page[:120])
-    check("таблица строится DOM-API, а не сборкой разметки",
-          "textContent" in page and "createElement" in page)
-    # Проверяется САМ шаблон, а не собранная страница: в общий каркас входит
-    # `_hints.html`, у которого свой давний код, и его упоминания innerHTML к
-    # этому пакету отношения не имеют. Здесь важно одно — внешние данные не
-    # попадают в разметку строкой, и это свойство именно этой страницы.
-    check("innerHTML для внешних данных не используется вовсе",
-          not re.search(r"\.innerHTML\s*=", template),
-          "в шаблоне есть присваивание innerHTML")
-    check("и разметка строкой не вставляется никаким другим способом",
-          not any(bad in template for bad in
-                  ("insertAdjacentHTML", ".outerHTML", "document.write")))
-    check("честная подпись есть в самой разметке, а не только в ответе API",
-          "не партия «Оборота»" in page and "не учитывается в «Едет»" in page)
-    check("исходная таблица — ссылка, а не iframe",
-          "<iframe" not in page and 'rel = "noopener noreferrer"' in page.replace('rel="', 'rel = "'))
-    print("\n== Страница: ошибка первого сбоя и восстановленный ввод ==")
-    # Регрессия по ревью PR #47. Раньше отрисовка состояния выходила раньше
-    # блока ошибки, когда успешного снимка ещё нет, и человек видел только
-    # тост. Проверяется структура шаблона: блок ошибки живёт СВОЕЙ функцией,
-    # которая вызывается безусловно, а не внутри ветки «источник настроен».
-    check("блок ошибки вынесен в отдельную функцию",
-          "function renderError(data)" in template)
-    # Именно БЕЗУСЛОВНО. Проверка на подстроку «renderError(data);» этого не
-    # доказывает: `if (data.configured) renderError(data);` содержит её тоже —
-    # и это ровно тот дефект, который ревью и нашло. Поэтому требуется строка,
-    # которая целиком является вызовом.
-    call_lines = [ln.strip() for ln in template.splitlines()
-                  if "renderError(data)" in ln and "function" not in ln]
-    check("и вызывается безусловно, рядом с остальной отрисовкой",
-          "renderError(data);" in call_lines,
-          f"вызов условный: {call_lines}")
-    check("внутри renderState блока ошибки больше нет",
-          "sup-error" not in template.split("function renderState(data)")[1]
-          .split("function tile(")[0],
-          "renderState всё ещё сам рисует ошибку")
-    check("текст для случая «удачного чтения ещё не было» есть",
-          "Удачного чтения ещё не было" in template)
-    check("форма восстанавливает ссылку последней попытки",
-          "attempt.spreadsheet_url" in template)
-    check("и имена листов последней попытки",
-          "attempt.sheet_names" in template)
-    check("устаревший разбор проговаривается словами",
-          "parser_stale" in template and "прежней версией разбора" in template)
-
-    # Корректив по ревью PR #47. Ниже — структурные замки на три правки,
-    # ПОВЕДЕНИЕ которых проверяет браузерный набор `tests/test_supply_ui.py`.
-    # Здесь они стоят не вместо него, а рядом: этот набор офлайновый и
-    # выполняется даже там, где Chromium не поднялся, — и тогда возврат
-    # дефекта хотя бы не пройдёт молча.
-    print("\n== Страница: замки на корректив по ревью ==")
-    check("состояние подписки доезжает до страницы, а не вычисляется на глаз",
-          "writes_blocked" in template and "WRITES_BLOCKED" in template)
-    check("read-only состояние ветвится ДО отрисовки формы владельца",
-          template.index("if (WRITES_BLOCKED)") < template.index('var form = el("div", "sup-form")'))
-    check("общий offset не двигается по клику — позиция запроса локальная",
-          "state.offset += state.limit" not in template
-          and "var requested = state.offset + state.limit" in template)
-    check("позиция фиксируется только после успешного ответа",
-          "state.offset = offset;" in template)
-    check("у догрузки есть замок «один запрос в полёте»",
-          "inflightGen" in template and "moreBtn.disabled = true" in template)
-    check("и поколение состояния, чтобы поздний ответ не дописался",
-          "myGen !== gen" in template and "function resetView()" in template)
-    check("успешное обновление сбрасывает фильтр листа",
-          'state.sheet = "";' in template.split("function refresh()")[1]
-          .split("function renderError")[0])
-
-    # Корректив по UX-аудиту: оба замка перестали быть привязаны к тому, что
-    # живёт не столько же, сколько они сами. Поведение проверяет браузерный
-    # набор; здесь стоят структурные замки — офлайн и без Chromium.
-    check("замок догрузки принадлежит поколению, а не странице",
-          "var inflightGen = -1;" in template
-          and "if (inflightGen === gen) return;" in template
-          and "if (inflightGen !== myGen) return;" in template)
-    check("и общего булева замка догрузки больше нет вовсе",
-          "var inflight = false" not in template
-          and "inflight = true;" not in template)
-    check("финализатор догрузки трогает кнопку только своего поколения",
-          "if (gen === myGen) moreBtn.disabled = false;" in template)
-    check("замок обновления живёт ВНЕ DOM и переживает пересборку формы",
-          "var refreshBusy = false;" in template
-          and "if (refreshBusy) return;" in template
-          and "function paintRefreshButton()" in template)
-    check("и кнопка рождается в текущем состоянии обновления",
-          "btn.disabled = refreshBusy;" in template
-          and "REFRESH_LABELS[refreshBusy ? 1 : 0]" in template)
-
-    # Корректив по ревью на HEAD `5e21ba1`. Поведение обоих исправлений
-    # проверяет браузерный набор; здесь — только структурные замки, и они
-    # стоят РЯДОМ с ним, а не вместо: этот набор офлайновый и отработает даже
-    # там, где Chromium не поднялся.
-    check("нет носителя — ветка стоит ДО построения формы, а не после",
-          "if (!data.carrier_present) {" in template
-          and template.index("if (!data.carrier_present) {")
-          < template.index('var form = el("div", "sup-form")'))
-    check("и она ведёт в «Настройки», а не в никуда",
-          'slink.href = "/settings";' in template)
-    check("поля формы предпочитают ввод последней НЕУДАЧНОЙ попытки",
-          "var failedNow = !!(data.last_error);" in template
-          and "var srcUrl = triple ? triple.url" in template)
-    check("а имена листов берутся парой либо не берутся вовсе",
-          "names.length !== 2" in template
-          and "var names = triple ? triple.names" in template)
-    check("ссылка «открыть исходник» осталась на УСПЕШНОМ снимке",
-          "a.href = data.spreadsheet_url;" in template)
-
-    # Корректив по ревью на HEAD `6a3cabd`. Поведение всех трёх проверяет
-    # браузерный набор; здесь — офлайновые структурные замки рядом с ним.
-    check("тройка попытки проверяется целиком, одной функцией",
-          "function attemptTriple(attempt)" in template
-          and "var triple = failedNow ? attemptTriple(attempt) : null;" in template)
-    check("и адрес попытки сверяется с КАНОНИЧЕСКОЙ формой",
-          "CANONICAL_SOURCE_URL" in template
-          and "docs\\.google\\.com" in template)
-    check("половины тройки не берутся по отдельности",
-          "var srcUrl = triple ? triple.url" in template
-          and "var names = triple ? triple.names" in template)
-    check("догрузка сверяет версию снимка, а не только поколение вида",
-          "var viewHash = null;" in template
-          and 'if (append && hash !== (viewHash || "")) {' in template)
-    check("и при расхождении перезапускает вид с начала, а не дописывает",
-          "switchView(null);" in template.split("if (append && hash !==")[1]
-          .split("return STALE;")[0])
-    # ЦЕНА ИСТОЧНИКА ПЕРЕЕХАЛА В ПОДРОБНОСТИ СТРОКИ, А НЕ ИСЧЕЗЛА (SUPPLY-UX-1.1).
-    # Свойство, которое защищает эта проверка, прежнее и не ослаблено: то, что
-    # человек написал в колонке цены, обязано быть ВИДНО и обязано остаться
-    # СЫРЫМ текстом — без числа, валюты и перевода в рубли или в цену за штуку.
-    # Изменилось только место: в плотной строке свободный текст источника не
-    # живёт вовсе, иначе строка снова вырастет до трёхсот пикселей.
-    check("цена источника выводится сырым текстом в подробностях строки",
-          'def(dl, "Цена источника",' in template
-          and "r.price_raw" in template.split('def(dl, "Цена источника",')[1][:400])
-    # И НАЗЫВАЕТСЯ ВСЕГДА, даже когда в источнике пусто: прочерк отличает
-    # «в таблице цены нет» от «предпросмотр её потерял». Ровно потерей цены и
-    # было замечание ревью PR #47 (thread r3903352252).
-    check("и поле цены названо даже тогда, когда цены в источнике нет",
-          '"—"' in template.split('def(dl, "Цена источника",')[1][:400])
-    check("и рядом сказано, что это не рубли и не цена за штуку",
-          "без валюты и без "
-          in template.split('def(dl, "Цена источника",')[1][:400]
-          and "в цену за штуку" in template)
-    check("а в плотной строке свободного текста источника нет вовсе",
-          all(field not in template.split("function rowNode(")[1]
-              .split("function renderRows(")[0]
-              for field in ("comments_raw", "price_raw", "components_raw",
-                            "production_raw", "unknown_raw")),
-          "свободный текст вернулся в плотную строку")
-    check("ширина «широких» строк не выписана числом в трёх местах",
-          "colSpan = 13" not in template and "colSpan = 12" not in template
-          and template.count("SUP_COLUMNS") >= 4)
-    check("кнопка обновления восстанавливается при ЛЮБОМ исходе",
-          ".then(restore, restore);" in template)
-    check("неполный итог штук называется словами, а не числом",
-          "Прочитано не всё" in template
-          and "Это не весь объём поставки." in template
-          and "quantity_complete" in template)
-    check("а полный итог не называется объёмом поставки",
-          "Сумма распознанных размеров." in template)
-    # `static/app.js` подключён с `defer`: его `api()` появляется ПОСЛЕ разбора
-    # блока `scripts`. Запуск без ожидания `DOMContentLoaded` означал не
-    # «иногда медленнее», а «страница мертва всегда»: она падала на
-    # `api is not defined` и не показывала ни строк, ни формы, ни ошибки.
-    # Найдено запуском страницы в браузере (tests/test_supply_ui.py) — на
-    # уровне разметки дефект не виден вовсе, поэтому здесь стоит замок.
-    check("страница ждёт DOMContentLoaded, а не зовёт api() при разборе",
-          'document.addEventListener("DOMContentLoaded"' in template,
-          "скрипт страницы запускается до загрузки app.js")
-    check("и app.js по-прежнему подключён отложенно — это не догадка",
-          'src="/static/app.js" defer' in
-          (ROOT / "templates" / "base.html").read_text(encoding="utf-8"))
-
-    check("на странице есть три фильтра очереди",
-          "Требуют разбора" in page and "Ошибки" in page and "Все" in page)
-    check("и одна кнопка обновления",
-          page.count("Обновить предпросмотр") >= 1 and "sup-refresh" in page)
-    check("поля источника подписаны по-человечески",
-          "Текущий лист" in page and "Следующий лист" in page)
-    check("страница верстается общим каркасом (мобильный и встроенный режимы)",
-          '{% extends "base.html" %}' in Path(ROOT / "templates" / "supply.html")
-          .read_text(encoding="utf-8"))
-    check("в шаблоне есть мобильная раскладка",
-          "@media (max-width: 760px)" in
-          Path(ROOT / "templates" / "supply.html").read_text(encoding="utf-8"))
-
-    print("\n== Раздел обнаружим в навигации ==")
-    # SUPPLY-FIX-1 (F-01): девять самостоятельных страниц держали по СОБСТВЕННОЙ
-    # копии списка ссылок; теперь список один — `_nav_links.html`. Проверка идёт
-    # за включением на один уровень, иначе она краснела бы от де-дупликации,
-    # ничего не говоря про саму ссылку. Что ссылка ЕСТЬ и работает на всех
-    # десяти страницах, доказывает браузерная проверка F-01 в test_supply_ui.py;
-    # здесь — структурная страховка на случай, если фрагмент отвяжут.
-    fragment = (ROOT / "templates" / "_nav_links.html").read_text(encoding="utf-8")
-    # PILOT-UX-SHELL-1: самостоятельные страницы включают список не напрямую,
-    # а через общую шапку `_app_shell.html`; идём и по этой цепочке, иначе
-    # проверка краснела бы от переезда шапки, ничего не говоря про ссылку.
-    shell = (ROOT / "templates" / "_app_shell.html").read_text(encoding="utf-8")
-    for name in ("base.html", "_embed.html", "replenish.html"):
-        text = (ROOT / "templates" / name).read_text(encoding="utf-8")
-        if '{% include "_app_shell.html" %}' in text:
-            text += shell
-        if '{% include "_nav_links.html" %}' in text:
-            text += fragment
-        check(f"ссылка «Поставки» есть в {name}",
-              'href="/supply"' in text and "Поставки" in text)
-    base = (ROOT / "templates" / "base.html").read_text(encoding="utf-8")
-    check("в base.html ссылка и в обычной навигации, и во встроенной",
-          base.count('href="/supply"') == 2, str(base.count('href="/supply"')))
+    # Страница «Поставки» заменена «Производством» (PROD-1, решение Влада
+    # 17.11.2026): /supply ведёт на /production, а пункта «Поставки» больше нет
+    # ни в одном меню. Проверки разметки старой страницы и её ссылок в меню
+    # сняты вместе с ней; ручки предпросмотра и их проверки выше и ниже на месте.
+    check("прежняя страница больше не отдаётся, адрес ведёт на «Производство»",
+          owner.get("/supply", follow_redirects=False).headers.get("location") == "/production")
 
     print("\n== Слой не касается заказов, синка, планировщика и формул ==")
     supply_sources = {
@@ -2471,8 +2266,8 @@ def structural_checks(owner) -> None:
     # растёт. Замок стоит на неизменности выпущенного, а не на длине списка.
     print("\n== Схема не тронута: те же десять выпущенных шагов старта ==")
     from app import main as _main
-    check("шагов восемнадцать: десять выпущенных плюс восемь дописанных сверху",
-          len(_main.STARTUP_SCHEMA_STEPS) == 18,
+    check("шагов девятнадцать: десять выпущенных плюс девять дописанных сверху",
+          len(_main.STARTUP_SCHEMA_STEPS) == 19,
           str(len(_main.STARTUP_SCHEMA_STEPS)))
     check("и первые десять — ровно прежние пары (id, позиция)",
           list(_main.STARTUP_SCHEMA_STEPS)[:10] == [
@@ -2495,7 +2290,9 @@ def structural_checks(owner) -> None:
               # занятые чужим пакетом, пока этот писался.
               ("models.ensure_supply_sketch_thumb_schema", 17),
               # Роли сотрудников (15.11.2026): дописаны в конец, позиция 18.
-              ("models.ensure_roles_schema", 18)],
+              ("models.ensure_roles_schema", 18),
+              # PROD-1 «Производство» (17.11.2026): позиция 19.
+              ("models.ensure_production_tracking_schema", 19)],
           str(_main.STARTUP_SCHEMA_STEPS))
     for name in ("models.py", "db.py", "tenancy.py"):
         text = (ROOT / "app" / name).read_text(encoding="utf-8")

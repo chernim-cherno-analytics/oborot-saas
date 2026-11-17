@@ -534,7 +534,10 @@ def api_checks() -> None:  # noqa: C901 — сценарный тест: шаг�
     external = sorted(
         p.name for p in (ROOT / "app").glob("*.py")
         if "cc_batch_id" in p.read_text(encoding="utf-8")
-        and p.name not in ("models.py", "api.py")
+        # production_tracking.py (PROD-1) читает идентификатор только чтобы
+        # привязать отметку этапа к своему заказу (защита от переиспользованного
+        # id) и наружу его не отдаёт: модуль не ходит ни в МойСклад, ни в Sheets.
+        and p.name not in ("models.py", "api.py", "production_tracking.py")
     )
     check("ни один модуль интеграций не упоминает cc_batch_id",
           not external, f"упоминают: {external}")

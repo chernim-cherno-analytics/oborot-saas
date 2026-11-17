@@ -68,10 +68,12 @@ def org_purge_models() -> tuple:
         OrderedQty,
         OrderPlan,
         OrderReceipt,
+        OrderStageMark,
         Product,
         Production,
         ProductionAssign,
         ProductionOrder,
+        ProductionTrack,
         ReplenishDraft,
         Sale,
         SkuCategoryOverride,
@@ -98,7 +100,9 @@ def org_purge_models() -> tuple:
     # строки, которых после удаления не будет.
     return (
         Sale, StockDay, WarehouseStock, OrderedQty, ReplenishDraft,
-        ProductionAssign, OrderPlan, OrderReceipt, ProductionOrder, Production,
+        # PROD-1: отметки этапов ссылаются на заказ, этапы цеха на цех.
+        ProductionAssign, OrderPlan, OrderReceipt, OrderStageMark, ProductionOrder,
+        ProductionTrack, Production,
         SupplyEvent, SupplyAssignment, SupplyBatch, SupplyItem,
         SupplyMaterial, SupplySketch,
         SkuHidden, SkuCategoryOverride, CategoryMerge, SkuDiscount,
@@ -168,6 +172,11 @@ NON_OWNING_USER_REFERENCES: dict[tuple[str, str], str] = {
         "авторство приёмки; строка org-owned. Колонка объявлена без внешнего "
         "ключа на users.id — сторож видит её по имени, см. USER_REF_COLUMN_NAMES. "
         "Осиротевший идентификатор после удаления автора — SEC-8"
+    ),
+    ("order_stage_marks", "created_by"): (
+        "кто отметил этап запуска (PROD-1); строка org-owned и удаляется в потоке "
+        "организации. Колонка без внешнего ключа, сторож видит её по имени. "
+        "Осиротевший идентификатор после удаления автора показывается пустым, как у SEC-8"
     ),
     ("org_invites", "created_by"): (
         "кто выпустил приглашение; строка принадлежит организации и удаляется "
