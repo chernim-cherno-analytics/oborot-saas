@@ -74,9 +74,8 @@ with TestClient(app, headers={"X-Oborot-CSRF": "1"}) as c, TestClient(app, heade
     rs = r.json().get("restored") or {}
     check("возврат партии сообщает, сколько снова в распределении", r.status_code == 200 and rs.get("assignments") == 1
           and float(rs.get("qty") or 0) == 12, str(rs))
-    check("страница показывает это число в тосте", "снова в распределении" in c.get("/supply").text)
-    page = c.get("/supply").text
-    check("на странице есть блок «Удалённые за 30 дней»", 'id="pl-trash"' in page and "renderTrash" in page)
+    # Страница «Поставки» заменена «Производством» (PROD-1, D-91): проверки её
+    # разметки сняты, ручки корзины выше проверяются по-прежнему.
 
 for suffix in ("", "-wal", "-shm"):
     p = Path(str(DB_PATH) + suffix)

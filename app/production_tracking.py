@@ -91,7 +91,7 @@ def parse_day(value, what: str = "Дата") -> date:
     try:
         return date.fromisoformat(text)
     except ValueError:
-        raise TrackingError(f"{what} задана неверно")
+        raise TrackingError(f"{what}: такой даты нет")
 
 
 def _median_days(values: list[int]) -> int:
@@ -425,7 +425,25 @@ def _progress(order: ProductionOrder, stages: list[dict], marks: list[OrderStage
 
 
 def _arrival(order: ProductionOrder, facts: dict) -> date | None:
-    return facts["first_at"] or _d(order.received_at)
+    """Дата прихода для сроков и статистики: первая приёмка с количеством.
+
+    Заказ, закрытый без единой записанной приёмки, датой прихода не обладает:
+    дата закрытия говорит, когда нажали кнопку, а не когда приехал товар, и
+    в историю цеха и долю «вовремя» такой заказ не идёт.
+    """
+    return facts["first_at"]
+
+
+def _closed_at(order: ProductionOrder, facts: dict, rows: list[OrderReceipt]) -> date | None:
+    """Когда заказ принят: дата закрытия, иначе последняя приёмка с количеством."""
+    if order.status == "received" and order.received_at:
+        return _d(order.received_at)
+    last = None
+    for r in rows:
+        d = _d(r.at)
+        if float(r.qty or 0) > 0 and d is not None and (last is None or d > last):
+            last = d
+    return last
 
 
 def _history(orders, receipts, marks, tracks, today: date) -> dict:
@@ -500,9 +518,11 @@ def _dates(order, prog, dues, samples, tracks, prods, org_lead, today) -> dict:
     }
 
 
-def _order_out(order, stages, prog, facts, fc, channel_id, channel_name) -> dict:
+def _order_out(order, stages, prog, facts, fc, channel_id, channel_name, closed=None) -> dict:
     arrived = _arrival(order, facts)
     return {
+        "closed": order.status == "received",
+        "closed_at": closed.isoformat() if closed else None,
         "id": order.id,
         "name": order.name,
         "status": order.status,
@@ -545,7 +565,8 @@ def _card(o, tracks, channels, prods, org_lead, receipts, marks, dues, samples, 
     prog = _progress(o, stages, marks.get(o.id, []), facts)
     fc = _dates(o, prog, dues.get(o.id, []), samples, tracks, prods, org_lead, today)
     name = next((c["name"] for c in channels if c["id"] == ch), "")
-    return _order_out(o, stages, prog, facts, fc, ch, name), prog, facts
+    closed = _closed_at(o, facts, receipts.get(o.id, [])) if prog["done"] else None
+    return _order_out(o, stages, prog, facts, fc, ch, name, closed), prog, facts
 
 
 def board(db: Session, org, today: date | None = None) -> dict:
@@ -565,14 +586,19 @@ def board(db: Session, org, today: date | None = None) -> dict:
             if arrived is not None and (today - arrived).days <= HISTORY_DAYS:
                 if sent is not None and arrived >= sent:
                     acc["done"].append((arrived - sent).days)
-                # «Вовремя» против первой договорённости: первый срок от цеха,
-                # иначе плановая дата заказа.
-                first_due = next((_d(d.due) for d in dues.get(o.id, []) if _d(d.due)), None)
-                promise = first_due or _d(o.eta_date)
+                # «Вовремя» против первой договорённости: плановая дата заказа,
+                # а без неё первый срок от цеха, записанный ДО прихода. Срок,
+                # записанный после срыва плана или после прихода, договорённостью
+                # не считается: иначе долю «вовремя» правили бы одной кнопкой.
+                promise = _d(o.eta_date)
+                if promise is None:
+                    promise = next((_d(d.due) for d in dues.get(o.id, [])
+                                    if _d(d.due) and (_d(d.created_at) or arrived) <= arrived), None)
                 if promise is not None:
                     acc["on_time"].append(arrived <= promise)
             # Принятое на доске 30 дней, дальше это история (она в скорости цеха).
-            if arrived is None or (today - arrived).days > RECEIVED_SHOW_DAYS:
+            shown = card["closed_at"]
+            if shown is None or (today - date.fromisoformat(shown)).days > RECEIVED_SHOW_DAYS:
                 continue
         else:
             acc["in_work"] += 1
@@ -619,8 +645,7 @@ def board(db: Session, org, today: date | None = None) -> dict:
             _left(x) for x in active
             if not x["forecast"]["late_days"] and x["forecast"]["date"]
             and today.isoformat() <= x["forecast"]["date"] <= horizon)),
-        "received_qty": round(sum(x["received_qty"] or x["total_qty"]
-                                  for x in out if x["phase"] == "done")),
+        "received_qty": round(sum(x["received_qty"] for x in out if x["phase"] == "done")),
     }
     drafts = len(list(db.execute(
         select(ProductionOrder.id).where(ProductionOrder.org_id == org.id,

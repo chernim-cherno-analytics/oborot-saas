@@ -288,6 +288,12 @@ def _sample_value(column):
     if "DATETIME" in kind or "TIMESTAMP" in kind:
         from datetime import datetime as _dt
         return _dt(2026, 1, 1)
+    # Обязательная DATE (впервые у отметок этапов и сроков от цеха, PROD-1):
+    # TolerantDate превращает нераспознанную строку в NULL, и NOT NULL уронил
+    # бы засев.
+    if kind == "DATE":
+        from datetime import date as _d
+        return _d(2026, 1, 1)
     return "2026-01-01" if column.name == "date" else "x"
 
 

@@ -113,7 +113,7 @@ def org_id_of(email: str) -> int:
 
 def catalog(org_id: int) -> list[str]:
     return [r[0] for r in sql("SELECT DISTINCT base_name FROM products WHERE org_id=? "
-                              "AND excluded=0 ORDER BY base_name LIMIT 20", org_id)]
+                              "AND excluded=0 ORDER BY base_name LIMIT 24", org_id)]
 
 
 def make_order(c, name, base, qty, production_id=None, eta=None, send=True):
@@ -385,6 +385,29 @@ def run() -> int:  # noqa: C901 — сценарный набор
     x, _ = card(c, two)
     check("перебор по одной позиции и чужая позиция не закрывают недостачу по другой",
           x["phase"] == "shipped" and x["received_qty"] == 10, f"{x['phase']} {x['received_qty']}")
+
+    print("\n== Закрыт без записанного прихода ==")
+    ivan = c.post("/api/productions", json={"name": "Цех без истории"}).json()["id"]
+    o9 = make_order(c, "Закрыт без количеств", bases[15], 21, production_id=ivan,
+                    eta=iso(TODAY + timedelta(days=5)))
+    r = c.post(f"/api/orders/{o9}/status", json={"status": "received"})
+    x, b = card(c, o9)
+    check("закрытый без количеств: принят, пришло 0, дата закрытия есть",
+          r.status_code == 200 and x and x["phase"] == "done" and x["received_qty"] == 0
+          and x["closed"] is True and x["closed_at"] and x["arrived_at"] is None, str(x)[:300])
+    sp = next((s_ for s_ in b["speed"] if s_["channel_id"] == ivan), None)
+    check("в историю и «вовремя» такой заказ не идёт (даты прихода нет)",
+          sp is not None and sp["done"] == 0 and sp["on_time_share"] is None, str(sp))
+    o10 = make_order(c, "Срок записан после прихода", bases[16], 2, production_id=ivan)
+    backdate_sent(o10, 10)
+    c.post(f"/api/orders/{o10}/receipts", json={"lines": [{"base_name": bases[16], "qty": 2}]})
+    sql("UPDATE order_receipts SET at=? WHERE order_id=?", f"{iso(TODAY - timedelta(days=3))} 12:00:00", o10)
+    r = c.post(f"/api/production/orders/{o10}/due", json={"due": iso(TODAY - timedelta(days=2))})
+    assert r.status_code == 200, r.text
+    _, b = card(c, o10)
+    sp = next((s_ for s_ in b["speed"] if s_["channel_id"] == ivan), None)
+    check("срок, записанный после прихода, долю «вовремя» не делает",
+          sp is not None and sp["done"] == 1 and sp["on_time_share"] is None, str(sp))
 
     print("\n== Этапы цеха ==")
     stages = [{"key": s["key"], "name": s["name"]} for s in chs[moscow]["stages"]]
