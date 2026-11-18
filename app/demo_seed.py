@@ -376,6 +376,11 @@ def clear_org_data(db: Session, org_id: int) -> None:
     держит партию и материал, партия — вещь, вещь — эскиз. Журнал (`supply_
     events`) ссылок не имеет и снимается первым вместе с замком поступков.
     """
+    # PROD-1: отметки этапов уходят вместе с заказами демо, иначе пересозданный
+    # заказ с тем же id унаследовал бы чужой ход производства.
+    from app.models import OrderDueDate, OrderStageMark
+    db.execute(delete(OrderStageMark).where(OrderStageMark.org_id == org_id))
+    db.execute(delete(OrderDueDate).where(OrderDueDate.org_id == org_id))
     for model in (Sale, StockDay, WarehouseStock, OrderedQty, ProductionOrder, Product, Warehouse):
         db.execute(delete(model).where(model.org_id == org_id))
     for model in SUPPLY_MODELS:

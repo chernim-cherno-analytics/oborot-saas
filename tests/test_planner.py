@@ -1916,7 +1916,7 @@ def api_checks() -> None:
         # D-89: «Мастер заказа», «Заказ позиции» и «Бюджет» открываются с «Заказа».
         check("в ленте есть все восемь разделов",
               all(('href="%s"' % u) in emb_t for u in
-                  ("/turnover", "/stocks", "/replenish", "/supply",
+                  ("/turnover", "/stocks", "/replenish", "/production",
                    "/forecast", "/revenue", "/lessons", "/settings")))
 
         print("\n14h. Настройка «окно темпа» действует везде, где обещает (DATA-11)")

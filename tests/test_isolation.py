@@ -576,6 +576,16 @@ def run_all() -> None:
         b.post(f"/api/orders/{order_b}/status", json={"status": "sent"})
         b.post(f"/api/orders/{order_b}/receipts",
                json={"lines": [{"base_name": RECEIPT_B, "qty": 4}]})
+    # PROD-1: отметка этапа и срок от цеха у заказа B — цели проб §1.
+    mark_b = due_b = None
+    if order_b:
+        rm = b.post(f"/api/production/orders/{order_b}/marks", json={"stage_key": "s1"})
+        mark_b = rm.json().get("id") if rm.status_code == 200 else None
+        rd = b.post(f"/api/production/orders/{order_b}/due",
+                    json={"due": "2027-06-01", "note": SECRET[:40]})
+        due_b = rd.json().get("id") if rd.status_code == 200 else None
+    check("в организации B есть отметка этапа и срок от цеха для проверок",
+          mark_b is not None and due_b is not None, f"mark={mark_b} due={due_b}")
     rows_a = sql("SELECT COUNT(*) FROM order_receipts WHERE org_id=?", org_a)[0][0]
     rows_b = sql("SELECT COUNT(*) FROM order_receipts WHERE org_id=?", org_b)[0][0]
     check("у обеих организаций есть живые строки приёмки — базовая линия «не изменилось»",
@@ -664,6 +674,15 @@ def run_all() -> None:
         ("/api/team/roles/{role_id}", "POST", {"role_id": role_b}, {"name": "Захвачено"}),
         ("/api/team/roles/{role_id}/delete", "POST", {"role_id": role_b}, {}),
         ("/api/team/invites/{invite_id}/revoke", "POST", {"invite_id": invite_b}, {}),
+        # PROD-1 «Производство»: чужой заказ, отметка и срок неотличимы от
+        # несуществующих.
+        ("/api/production/orders/{order_id}", "GET", {"order_id": order_b}, None),
+        ("/api/production/orders/{order_id}/marks", "POST", {"order_id": order_b},
+         {"stage_key": "s2"}),
+        ("/api/production/orders/{order_id}/due", "POST", {"order_id": order_b},
+         {"due": "2027-07-01"}),
+        ("/api/production/marks/{mark_id}", "DELETE", {"mark_id": mark_b}, None),
+        ("/api/production/due/{due_id}", "DELETE", {"due_id": due_b}, None),
     ]
     answers = {}
     for route, method, params, body in cases:

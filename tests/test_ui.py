@@ -756,7 +756,7 @@ def run() -> int:  # noqa: C901 — сценарный тест: шагов мн
 # разделов за краем своей прокрутки без намёка, что их можно докрутить.
 
 # D-89: «Мастер заказа», «Заказ позиции» и «Бюджет» открываются с «Заказа».
-SHELL_LINKS = ("/turnover", "/stocks", "/replenish", "/supply",
+SHELL_LINKS = ("/turnover", "/stocks", "/replenish", "/production",
                "/forecast", "/revenue", "/lessons", "/settings")
 
 

@@ -46,8 +46,9 @@ OK = FAIL = 0
 PW = "secret123"
 
 # Самостоятельные страницы (своя шапка _app_shell.html) и страницы base.html.
-STANDALONE = ["/stocks", "/assistant", "/replenish", "/sizes", "/budget", "/forecast", "/revenue", "/lessons"]
-BASED = ["/settings", "/supply", "/account", "/team", "/plans"]
+STANDALONE = ["/stocks", "/assistant", "/replenish", "/sizes", "/budget", "/forecast", "/revenue", "/lessons",
+              "/production"]
+BASED = ["/settings", "/account", "/team", "/plans"]
 NAV_COUNT = 8   # D-89: один экран заказа, в меню восемь разделов
 
 
